@@ -1,7 +1,7 @@
 //! Fixed-width integers under the backend: that a compiled body answers what the interpreter
 //! answers at each width, and that a signature naming one is declined rather than answered wrongly.
 
-use crate::fragment::{call, unit, whole};
+use crate::fragment::{call, call_whole, unit, whole};
 use ply_eval::Value;
 
 /// What the interpreter answers, which is the only thing the compiled answer is checked against:
@@ -208,7 +208,7 @@ fn the_two_emitters_answer_the_same_at_each_width() {
         );
         assert_eq!(
             got,
-            call(whole_unit, name, args),
+            call_whole(whole_unit, name, args),
             "`{name}{args:?}`: the two engines disagree"
         );
     }
@@ -225,7 +225,7 @@ fn the_two_emitters_answer_the_same_at_each_width() {
         assert!(got.is_some(), "`{name}` was declined");
         assert_eq!(
             got,
-            call(whole_unit, name, &args),
+            call_whole(whole_unit, name, &args),
             "`{name}{args:?}`: the two engines disagree"
         );
     }

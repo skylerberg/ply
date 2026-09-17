@@ -234,6 +234,14 @@ pub fn call(unit: &'static Unit, name: &str, args: &[Value]) -> Option<Value> {
     backend.enter(&Symbol::new(name), args, 10_000)
 }
 
+/// The same, for a unit `whole` built: it is entered under the installed producer, because that is
+/// the emitter it is a unit of. Pairing this with `call` is what makes a test that runs both a
+/// comparison of two emitters rather than of one with itself.
+pub fn call_whole(unit: &'static Unit, name: &str, args: &[Value]) -> Option<Value> {
+    let backend = unit.attach(&ply_eval::BackendSpec::honest());
+    backend.enter(&Symbol::new(name), args, 10_000)
+}
+
 /// Closures and the callbacks that take them: a lambda capturing a parameter, nested lambdas, a
 /// named function and a constructor and a builtin used as values, a call through a parameter and
 /// through a `let`, `iterate` stopping and running out, `map_fold` over a map built in place, and
@@ -709,7 +717,10 @@ fn the_compiled_set_is_closed_under_calls() {
     let (loaded, unit) = unit(ARITHMETIC);
     let source = ply_codegen::Source::new(loaded.program, loaded.resolved, loaded.check);
     let source: &'static ply_codegen::Source = Box::leak(Box::new(source));
-    let (_, refusals) = ply_codegen::closure(source, unit.compiled()).expect("the set compiles");
+    // `closure` asks the current producer for every body too, and this unit is the reference's.
+    let (_, refusals) =
+        ply_codegen::c::producer::reference_only(|| ply_codegen::closure(source, unit.compiled()))
+            .expect("the set compiles");
     assert!(
         refusals.is_empty(),
         "the fixpoint returned a set that still refuses: {refusals:?}"

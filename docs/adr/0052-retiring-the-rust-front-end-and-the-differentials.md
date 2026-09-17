@@ -1331,19 +1331,32 @@ over inside `emit_with` and installs nothing; `ensure_default` at the check is
 then free to answer without deciding which emitter the test runs. The
 restructure this entry named as a path is the one that was taken.
 
-Migrating it costs six sites a word, and the word is `reference_only`. A check
-the port answers needs a producer installed, and `Unit::over`, `Unit::bodies`
-and `Provider::attach` all ask whatever producer is current for every body --
-so installing one to answer the check also hands the emitting to it. Where the
-source carries no texts the port cannot answer at all: `bodies_of` returns an
-empty map rather than failing, every root is refused as unanswered, and the unit
-is empty. That is the shape of `the enterable fragment over the parser fell to
-0` and of `the unit has no emit.emit_unit_all`. `Unit::bodies` is not memoised,
-so a unit built under the reference and entered later through `attach` is built
-again under whatever is current then -- which is how a test that forced its
-bodies inside `reference_only` still got an empty tier. The rule the crate now
-follows: the port answers the check, and a site that reads the reference
-emitter's own output asks for it by name.
+Migrating it costs a word at every site that reads the reference emitter's own
+output, and the word is `reference_only`. A check the port answers needs a
+producer installed, and `Unit::over`, `Unit::bodies`, `Provider::attach` and
+`closure` all ask whatever producer is current for every body -- so installing
+one to answer the check also hands the emitting to it. Where the source carries
+no texts the port cannot answer at all: `bodies_of` returns an empty map rather
+than failing, every root is refused as unanswered, and the unit is empty. That
+is the shape of `the enterable fragment over the parser fell to 0` and of `the
+unit has no emit.emit_unit_all`. `Unit::bodies` is not memoised, so a unit built
+under the reference and entered later through `attach` is built again under
+whatever is current then -- which is how a test that forced its bodies inside
+`reference_only` still got an empty tier. The rule the crate now follows: the
+port answers the check, and a site that reads the reference emitter's own output
+asks for it by name.
+
+The trap in applying that rule is a helper two arms share, and it is worth the
+note because the shape recurs wherever one is added. `fragment::call` enters a
+unit and almost every caller hands it the reference's, so wrapping the helper
+itself reads as the tidy move. `number_types` hands it both -- one arm from
+`unit`, one from `whole` -- and that test *is* the comparison of the two
+emitters. Wrapped, the port's arm entered under the reference, whose build holds
+no body for the port's wider membership, so that arm answered nothing and the
+two engines were reported as disagreeing. The entry is split by which emitter
+built the unit, `call` beside `call_whole`: a helper that serves both arms of a
+comparison cannot be handed one arm's answer. Checking who calls a `pub` helper
+inside its own file is not checking who calls it.
 
 **Read, 2026-09-17: the hazards harness has never run the whole emitter.**
 `hazards.rs` builds two tiers over one program, calls them `reference` and
