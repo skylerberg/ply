@@ -106,8 +106,9 @@ the checker's output shape (`CheckOutput` and what it names); it depends
 on `ply-span` alone. `ply-core` re-exports all of it and keeps the
 checker. `ply-hash`, `ply-store`, `ply-host` and `ply-test` do not depend on
 `ply-core` at all, and the prelude's tables have since joined `ply-ty`, which
-takes the runtime and the prover off it too. What still calls `ply-core` is the
-checker's three callers, and nothing else.
+takes the runtime and the prover off it too. No production crate calls
+`ply-core` any more: what still calls the checker is the test crates, and
+nothing else.
 
 **Built, 2026-09-16: the message channel.** The port's diagnostics carried
 a code, spans, a label count and a note count; they now carry the
@@ -339,12 +340,13 @@ the emitter the tier needs and which only the reference needed. Reading
 `producer.rs` says otherwise, and this supersedes it.
 
 **There is no reference half.** The path that makes the emitter "the reference"
-is a closure in `build_from`, reached when `PLY_C_BOOTSTRAP=off`, when no bundle
-is present, or when a bundle's helper table is not a prefix of the runtime's. It
-calls `front_end(src)` and then the same `super::build` the tier calls. So it is
-not a second emitter: it is *this* emitter, reached with the port's own sources
-instead of a prebuilt bundle, and what makes it the reference is that the front
-end running over those sources is the Rust chain.
+is a closure in `build_from`, reached when no bundle is present or when a
+bundle's helper table is not a prefix of the runtime's. It calls `front_end(src)`
+and then the same `super::build` the tier calls. So it is not a second emitter:
+it is *this* emitter, reached with the port's own sources instead of a prebuilt
+bundle. What made it the reference was that the front end running over those
+sources was the Rust chain; since the handover it is the committed emitter, and
+only the Rust *emitter* half is left in the path.
 
 So `c/emit.rs` and `opt.rs` are the tier's emitter, and this record's own
 exclusion keeps them: the runtime half of `ply-codegen` stays until a C runtime
@@ -932,12 +934,13 @@ the first to start from a bundle emitted against an older table. A helper
 *changed or removed* is the other case, and `Exports::unserved` names the first
 position that differs. There the recovery is a textual migration of the bundle,
 and that migration does not exist yet: today `build_from` falls back to
-`from_reference()`, the Rust chain, which ADR 0050 §1a chose deliberately — "the
-producer and the fixpoint test build the emitter with the reference on it". So
-the seed path is load-bearing for exactly this case, and §2 cannot delete it
-before the migration is built. So the order §2 gives — the bundle becomes the
-only way, then the Rust emitter goes — has a step inside it that this record had
-not named: the migration comes first, or the seed path stays.
+`from_committed()`, which stands where the Rust chain stood — ADR 0050 §1a chose
+that fallback deliberately, "the producer and the fixpoint test build the emitter
+with the reference on it". So the seed path is load-bearing for exactly this
+case, and §2 cannot delete it before the migration is built. So the order §2
+gives — the bundle becomes the only way, then the Rust emitter goes — has a step
+inside it that this record had not named: the migration comes first, or the seed
+path stays.
 
 **Read, 2026-09-17: three comments in the port name oracles that are gone, and
 fixing them costs more than they are worth today.** `emit.ply:4` and `code.ply:8`
@@ -1018,10 +1021,12 @@ fixtures — so the edge is gone from the runtime halves and alive as a
 dev-dependency. Those are different claims and this says both, because "`ply-eval`
 no longer depends on `ply-core`" on its own would be false of the package.
 
-The readers in `ply-codegen`, `ply-cli` and the test crates were deliberately left
-pointing at `ply_core::prelude`: the crate's `pub use ply_ty::*` re-exports the
-moved module, so they keep resolving, and re-pointing them would churn three more
-crates to prove a point §2 will settle by deleting the name outright. That the
+The readers in the test crates were deliberately left pointing at
+`ply_core::prelude`: the crate's `pub use ply_ty::*` re-exports the moved module,
+so they keep resolving, and re-pointing them would churn more crates to prove a
+point §2 will settle by deleting the name outright. `ply-codegen` is no longer
+among them -- the handover below took its last reach off the crate -- and
+`ply-cli` now names `ply_core` only in a comment. That the
 glob carries a `pub mod`, and that `crate::prelude` still resolves from a sibling
 module through a root-level `use`, were both things this record believed; a
 throwaway two-crate workspace settled them before the change was written, and the
@@ -1082,10 +1087,11 @@ longer links the checker's crate, and `ply-cli-tests` still declares it, calling
 called `ply_core::check_program` since `6aca8591` (2026-09-06). Every survey behind
 the caller counts in this record was rooted at `crates/`, so every one of those
 counts was short by one from the day it was written -- not stale, wrong when
-published. A repo-rooted sweep gives the real figures: **three** non-test callers
-of the checker, the seed path in `ply-codegen`, `pipeline.rs` in `ply-corpus`, and
-the benchmark's Ply arm; and **two** of the hasher, because the arm calls the
-checker alone. The sentences above are corrected in place rather than annotated.
+published. The sentences above are corrected in place rather than annotated, and
+a repo-rooted sweep is what every figure here now rests on. Where they ended is
+the terminal position below: **no** non-test caller of the checker, the handover
+having taken the last one, and **two** of the hasher, in `ply-codegen` and
+`ply-corpus`.
 
 The defect was the method, and its general form is bounded: `cargo metadata`
 reports thirty-two members and exactly one outside `crates/`, so this is a single
@@ -1181,33 +1187,36 @@ This record has said, more than once, that the seed path cannot go before a
 textual migration of an unserved bundle exists. That is true and it is not the
 binding constraint, which matters because the two imply different work.
 
-`build_from` falls back to `from_reference()` in two cases: `PLY_C_BOOTSTRAP=off`
-or no bundle for these sources, and a bundle whose helper table this runtime's
-does not start with -- `Exports::unserved` walks the unit's helpers by position
-and names the first one that differs in name, arity or whether it answers. And
-`from_reference()` is not only the Rust front end. It is `front_end(src)`
+`build_from` falls back to `from_committed()` in two cases: no bundle for these
+sources, and a bundle whose helper table this runtime's does not start with --
+`Exports::unserved` walks the unit's helpers by position and names the first one
+that differs in name, arity or whether it answers. And
+the seed path was never one thing. It was `front_end(src)`
 *followed by* `super::build`, which is `c/build.rs`, which imports
-`super::emit::{Emit, Unit, mangle}` and calls `crate::opt::optimize`. The seed
-path needs the Rust **emitter**.
+`super::emit::{Emit, Unit, mangle}` and calls `crate::opt::optimize` -- and only
+the first half was `ply-core`'s. The second needs the Rust **emitter**.
 
 `crates/ply-codegen/src/c/emit.rs` and `crates/ply-codegen/src/opt.rs` are what
-this record's closing exclusion keeps until a C runtime exists. So `ply-core`
-cannot leave while the seed path stands, the seed path cannot stand without the
-emitter, and the emitter is deferred by this record's own terms. Building the
-bundle migration would not change that: the migrated bundle would still be built
-by the emitter the exclusion keeps. The migration is worth building for what §2
-promised a reader -- how a broken bundle is recovered -- and not as a way to reach
-a deletion.
+this record's closing exclusion keeps until a C runtime exists. This record
+argued from that to "`ply-core` cannot leave while the seed path stands", and the
+inference was wrong because it read the seed path as one thing. The handover
+below replaced `from_reference` with `from_committed`, which takes the front end
+from the committed emitter and leaves `super::build` where it was: so `ply-core`
+left while the seed path still stands, built by the very emitter the exclusion
+keeps. Building the bundle migration would not change that either: the migrated
+bundle would still be built by that emitter. The migration is worth building for
+what §2 promised a reader -- how a broken bundle is recovered -- and not as a way
+to reach a deletion.
 
-**So the terminal position, stated once.** The checker has three non-test callers.
-The seed path is bounded by the emitter exclusion above. `pipeline.rs` times the
-chain that §4's front-end figures are summed from, so it retires *with* its
-subject rather than standing before it -- pointing it at the port would report the
-port's cost under the chain's name. `benches/value-model/ply-arm` parses, resolves
-and checks to build a `Source`, then compiles it through the tier's own emitter and
-times the kernel entry; its front end is setup, so it too retires with the chain.
-Two of the three are not obstacles at all, and the third is one the goal already
-defers.
+**So the terminal position, stated once.** The checker has no non-test callers
+left. The seed path was the last and the handover took it; `pipeline.rs` and
+`benches/value-model/ply-arm` read `ply-ty` directly now. Both still time the
+chain that §4's front-end figures are summed from, so they retire *with* their
+subject rather than standing before it -- pointing them at the port would report
+the port's cost under the chain's name -- but neither holds the checker's crate
+any more. What holds `ply-core` is the eleven test crates that check their
+fixtures through it: every one calls `check_program` or `check_module`, and
+nothing else in the workspace does.
 
 `ply-syntax` and `ply-derive` are held by a different thing again: `Program` and
 `Resolved` stand in the public signatures of the crates that survive, which is the
@@ -1221,22 +1230,22 @@ What §2 therefore finished is the part that was reachable, stated without
 flattering it: every package that held a front-end crate *only* for vocabulary has
 dropped the dependency. `ply-eval`, `ply-prove` and `ply-cli` read `ply-ty`
 directly; `ply-compiler-diff` declared two crates it had stopped using at all.
-`ply-codegen` and `ply-corpus` keep theirs for work -- the seed path and the
-marginal-change bench -- and still spell some vocabulary through the older name:
-two `ply_core::prelude` sites in the first and twenty-one type uses in the second.
-Those are left deliberately. Re-pointing them would drop no edge, since the seed
-path and `pipeline.rs` hold both crates regardless, and this record has declined
-that same trade twice already -- for `ply_core::prelude`'s other readers, and for
-the sixty-eight type-only `ply_hash` sites across five crates. The older name goes
-when the crate does.
+`ply-codegen` and `ply-corpus` kept theirs for work -- the seed path and the
+marginal-change bench -- and both have since dropped it: the handover took
+`ply-codegen`'s last reach off the crate, and `ply-corpus` reads `ply-ty`
+directly. What still spells vocabulary through an older name is the test crates,
+left deliberately: re-pointing them would drop no edge while they call the
+checker regardless, and this record has declined that same trade twice already --
+for `ply_core::prelude`'s other readers, and for the sixty-eight type-only
+`ply_hash` sites across five crates. The older name goes when the crate does.
 
 **What §2 moved, measured.** `cargo metadata` over the workspace: the checker's
-crate fell from seven packages declaring it as a dependency to three -- `ply-arm`,
-`ply-codegen`, `ply-corpus` -- with its eleven dev-dependents unchanged, because the
-test crates still check their fixtures and that is not vocabulary. The hasher's fell
-from seven to five, and its dev-dependents from six to five. `ply-syntax` and
-`ply-derive` did not move at all, at twelve and six, which is the paragraph above
-restated as a number: nothing here touched the object model.
+crate fell from seven packages declaring it as a dependency to none, with its
+eleven dev-dependents unchanged, because the test crates still check their
+fixtures and that is not vocabulary. The hasher's fell from seven to five, and its
+dev-dependents from six to five. `ply-syntax` and `ply-derive` did not move at
+all, at twelve and six, which is the paragraph above restated as a number: nothing
+here touched the object model.
 
 What remains is held by three things this record names and defers: the emitter, the
 object model, and the harnesses that time the chain.
@@ -1466,29 +1475,37 @@ producer to use. That reaches `reference_only`, `reset_thread` and every
 dependency on `ply-core`, and it is an architecture decision rather than a
 deletion -- which is why this record names it instead of attempting it twice.
 
-**Read, 2026-09-17: the handover was attempted, and the canary threw away the
-evidence.** The entry above names what taking the seed path out would require, and
-it was built: `with_producer` hands an emitter over, consulted before the
-`BUILDING` and `REFERENCE_ONLY` guards, carrying the identity its bodies key
-under, so the committed emitter could stand up a working copy. It compiled, it
-took `ply-core` to no production dependent, and it failed in CI twice on the same
-test -- `lang_fixtures`, in four partitions each time.
+**Built, 2026-09-17: the handover, and what three red runs were hiding.** The
+entry above names what taking the seed path out would require, and it was built:
+`with_producer` hands an emitter over, consulted before the `BUILDING` and
+`REFERENCE_ONLY` guards, carrying the identity its bodies key under, so the
+committed emitter stands up a working copy. It took `ply-core` to no production
+dependent, and it went red three times on one test -- `lang_fixtures`, in four
+partitions each time.
 
-What the log rules out is worth keeping, because both were the obvious guesses.
+What the log ruled out is worth keeping, because both were the obvious guesses.
 **Not thread crossing**: the handover is a `thread_local!`, but `build.rs` spawns
 nothing and uses no rayon -- the only mentions of workers are comments on why
 `ply_eval::Value` holding `Rc` keeps emission off it. **Not a missing bundle**:
 `bundle::of(&Sources::Embedded)` returns an ungated `include_str!` constant, so
-there is always a committed bundle to start from. And the child printed none of
-the producer's error strings, so the emitter built. The panic is at
-`.expect("a failures array")`, *after* the line above it parsed the JSON, so
-`ply test --json` ran and answered an error shape. The cause is downstream of the
-emitter and this record cannot name it.
+there is always a committed bundle to start from.
 
-It cannot name it because the canary discarded it: `cmd.output()` read `stdout`
-and dropped `stderr`, and the `expect` threw away the report it did get. That is
-fixed here, and it is the thing to do *before* attempting the handover a third
-time. Two attempts were spent learning what one readable failure would have said.
+It was neither, and it was not a refusal either. `Source::from_front` leaves
+`texts` empty, and `bodies_of` answers `Ok` with an empty map -- not an error --
+when a module has no text. So the handed-over emitter served every request and
+answered none: every root refused as "which the Ply emitter did not answer", with
+nothing recorded in `failed` for `failure()` to report. The shape that hides a
+missing input is the shape that reports its absence as unanimous.
+
+The reference path never reached it. There `BUILDING` makes `mode()` "ref", so
+`produced` is false and the port is never asked for a body; handing an emitter
+over makes `mode()` "ply" and asks it for every one, which is the point of the
+change and the reason this seam had never run. `with_texts` attaches them.
+
+Two attempts were spent before the canary printed anything -- `cmd.output()` read
+`stdout` and dropped `stderr`, and the `expect` threw away the report it did get.
+The third printed the root count, whether the entry was among the roots, and the
+refusals, and named the cause on one run.
 
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
@@ -1752,11 +1769,42 @@ reached for once and had to withdraw: re-measured from `run_started_at` rather
 than `createdAt`, two of the three excursions then in hand had no competitor at
 all.
 
-Seven excursions now share one shape -- a job that does not *start* -- and four
-are measured quiet. The bound holds on a quiet runner: 139 s, partitions at 27 s.
-What varies is the scheduling around it, and the tree is in none of it. That is
-the whole of what these readings say, and §3 asks that they be read and recorded
-rather than that a number be moved.
+Seven excursions shared one shape -- a job that does not *start* -- and four were
+measured quiet. The bound holds on a quiet runner: 139 s, partitions at 27 s.
+What varied across those seven is the scheduling around them, and the tree was in
+none of it. The entry below is the first to break that shape, so "the tree is in
+none of it" is a statement about those seven and not a standing property of this
+section.
+
+**Read, 2026-09-17: an excursion of a different shape, and this one is the tree.**
+Main read 219 s after the handover merged. The partitions began at **+39 s** --
+against 27 s in the quiet run and 24 s and 38 s on the two merges before it, not
+the 97 s of a late fan-out -- so nothing was waiting to be scheduled. The pole was
+`test 5/8` at **171 s**, which ran 108 s and 102 s on those same two merges, and
+the aggregate followed three seconds behind it. The wall is over because the
+longest job grew by about a minute, not because the start slipped.
+
+This is the first excursion here the tree accounts for, and the mechanism is the
+handover §2 records. `from_reference` left `produced` false, so the *reference*
+emitted every body when an emitter was stood up from a working copy;
+`from_committed` hands an emitter over, which makes `mode()` "ply" and `produced`
+true, so the port emits them instead.
+
+One test names the whole of it.
+`lang_fixtures::the_shift_and_overflow_raises_are_the_same_on_both_engines` ran
+**8.468 s** on the merge before and **99.104 s** here, crossing nextest's slow
+threshold it had never approached. It is one of four that pass
+`PLY_C_EMITTER=ply:<dir>`, which has no bundle by construction, so each stands an
+emitter up from the committed bundle and emits the port's own sources through it;
+there is one in each of partitions 1, 3, 4 and 5, and three of the four longest
+jobs are among them. The shape of the cost is eager: `bodies_of` asks
+`emit_unit_all` for the whole unit, where the reference emitted one body at a
+time as `emit_one` asked for it. `--no-cache` is not the lever -- it points `ply
+test`'s store at a scratch directory and never reaches the C unit cache.
+
+The work did not appear -- it moved to the implementation this record exists to
+reach. So this is a cost to place, not a regression to revert, and by §3's own
+rule placing it is the next item before any other.
 
 **Why each of these got written at all.** The scripts that append a reading assert
 `wall < 173`; an over-bound one fails them and takes a different entry point that
