@@ -2,7 +2,6 @@
 
 use crate::pipeline::{Front, front};
 use anyhow::{Context, Result, bail};
-use ply_core::Footprint;
 use ply_eval::arena::Slot;
 use ply_eval::cont::{Frame, Prompt, Stack};
 use ply_eval::{Evaluator, Fixture, Value};
@@ -10,6 +9,7 @@ use ply_span::{SourceId, SourceMap, Span};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
 use ply_syntax::resolve::{Resolved, resolve};
+use ply_ty::Footprint;
 use serde::Serialize;
 use std::hint::black_box;
 use std::path::Path;
@@ -292,10 +292,7 @@ test "the shapes all evaluate" {
 }
 "#;
 
-fn load(
-    name: &str,
-    src: &str,
-) -> Result<(Program, Resolved, ply_core::Front, ply_span::SourceMap)> {
+fn load(name: &str, src: &str) -> Result<(Program, Resolved, ply_ty::Front, ply_span::SourceMap)> {
     let mut map = SourceMap::new();
     let id: SourceId = map.add(format!("{name}.ply"), src.to_string());
     let mut program = parse_program([(id, ModuleName::from_dotted(name), src)])

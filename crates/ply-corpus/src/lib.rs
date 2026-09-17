@@ -46,10 +46,7 @@ pub(crate) fn honest() -> ply_eval::BackendSpec {
 ///
 /// `texts` is in the program's module order, because the protocol writes a span's module as its
 /// position in this very list.
-pub fn port_front(
-    texts: &[(String, String)],
-    ids: &[ply_span::SourceId],
-) -> Result<ply_core::Front> {
+pub fn port_front(texts: &[(String, String)], ids: &[ply_span::SourceId]) -> Result<ply_ty::Front> {
     ply_codegen::c::producer::ensure_default();
     let front = ply_codegen::c::producer::front(texts, ids)?;
     if let Some(d) = front
@@ -67,7 +64,7 @@ pub fn port_front(
 pub fn tier_machine<'a>(
     program: &'a ply_syntax::ast::Program,
     resolved: &'a ply_syntax::resolve::Resolved,
-    port: &'a ply_core::Front,
+    port: &'a ply_ty::Front,
     sources: &ply_span::SourceMap,
 ) -> ply_eval::Machine<'a> {
     ply_codegen::c::producer::ensure_default();
