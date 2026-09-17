@@ -1553,7 +1553,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s, 153 s, 199 s, 381 s, 139 s, 168 s and 167 s, each reusing by tree the same way and for the same reason. Seven of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, the sixth 199 s and the seventh 381 s, which the entries closing this section take. None of those five was caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s, 153 s, 199 s, 381 s, 139 s, 168 s, 167 s and 211 s, each reusing by tree the same way and for the same reason. Eight of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, the sixth 199 s, the seventh 381 s and the eighth 211 s, which the entries closing this section take. None of those six was caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
@@ -1738,6 +1738,30 @@ honest statement is narrower than the tidy one: these runners usually schedule a
 fan-out within half a minute and sometimes do not, and the tree is in none of it --
 the merges under those three runs changed one line of a test helper, one document
 and one ADR.
+
+**Read, 2026-09-17: the seventh excursion of one shape, and by now that is the
+finding.** Main read 211 s after a merge that changed one test helper and one
+document. The partitions did not begin until **97 s**, against 27 s in the quiet
+run this section measured; once begun, the longest ran 107 s, inside the band
+recorded above; the aggregate followed three seconds after the last job. So again
+nothing ran long -- the fan-out started seventy seconds late.
+
+It was **uncontended**: no other run overlapped its window, measured rather than
+assumed. That matters because contention was the tidy explanation this record
+reached for once and had to withdraw: re-measured from `run_started_at` rather
+than `createdAt`, two of the three excursions then in hand had no competitor at
+all.
+
+Seven excursions now share one shape -- a job that does not *start* -- and four
+are measured quiet. The bound holds on a quiet runner: 139 s, partitions at 27 s.
+What varies is the scheduling around it, and the tree is in none of it. That is
+the whole of what these readings say, and §3 asks that they be read and recorded
+rather than that a number be moved.
+
+**Why each of these got written at all.** The scripts that append a reading assert
+`wall < 173`; an over-bound one fails them and takes a different entry point that
+asserts the opposite. The guard is the reason eight excursions were each written
+consciously instead of accumulating into a series nobody read.
 
 ## 4. The loop that is O(the change)
 
