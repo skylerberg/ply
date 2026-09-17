@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 use ply_ty::*;
 use std::collections::BTreeSet;
@@ -138,7 +139,7 @@ fn sample() -> Front {
         footprint: Footprint::empty(),
         span: span(1, 61, 90),
     });
-    let mut ops = indexmap::IndexMap::new();
+    let mut ops = IndexMap::new();
     ops.insert(
         sym("query"),
         OpInfo {
@@ -295,6 +296,69 @@ fn sample() -> Front {
             (sym("m.count"), vec![1, 0, 0, 0, 0, 16]),
         ],
         test_bodies: vec![vec![0, 7, 7]],
+        defs_written: IndexMap::from([
+            (
+                sym("m.count"),
+                DefWritten {
+                    vis: Visibility::Public,
+                    reuse: true,
+                    params: vec![WrittenParam {
+                        name: sym("xs"),
+                        span: span(1, 8, 10),
+                    }],
+                },
+            ),
+            (
+                sym("std.db.query"),
+                DefWritten {
+                    vis: Visibility::Private,
+                    reuse: false,
+                    params: vec![WrittenParam {
+                        name: sym("sql"),
+                        span: span(0, 11, 14),
+                    }],
+                },
+            ),
+        ]),
+        types: IndexMap::from([
+            (
+                sym("std.db.Db"),
+                TypeDecl {
+                    name: sym("std.db.Db"),
+                    module: ModuleName::from_dotted("std.db"),
+                    simple_name: sym("Db"),
+                    vis: Visibility::Public,
+                    arity: 0,
+                    span: span(0, 0, 4),
+                },
+            ),
+            (
+                sym("m.Shape"),
+                TypeDecl {
+                    name: sym("m.Shape"),
+                    module: ModuleName::from_dotted("m"),
+                    simple_name: sym("Shape"),
+                    vis: Visibility::Private,
+                    arity: 2,
+                    span: span(1, 80, 99),
+                },
+            ),
+        ]),
+        effects_written: IndexMap::from([(sym("std.db"), Visibility::Public)]),
+        test_name_spans: vec![span(1, 46, 60)],
+        law_literals: vec![vec![
+            Literal::Int(-3),
+            Literal::Str("hi there".to_string()),
+            Literal::Bytes(vec![0, 255]),
+        ]],
+        effect_sets: IndexMap::from([(
+            sym("m"),
+            vec![EffectSet {
+                name: sym("io"),
+                includes: vec![sym("store")],
+                atoms: Footprint::from_atoms([db, net]),
+            }],
+        )]),
     }
 }
 
@@ -312,6 +376,12 @@ fn a_front_writes_reads_and_writes_to_the_same_text() {
     assert_eq!(back.ordinals, front.ordinals);
     assert_eq!(back.bodies, front.bodies);
     assert_eq!(back.test_bodies, front.test_bodies);
+    assert_eq!(back.defs_written, front.defs_written);
+    assert_eq!(back.types, front.types);
+    assert_eq!(back.effects_written, front.effects_written);
+    assert_eq!(back.test_name_spans, front.test_name_spans);
+    assert_eq!(back.law_literals, front.law_literals);
+    assert_eq!(back.effect_sets, front.effect_sets);
     assert_eq!(back.diagnostics.len(), 1);
     assert_eq!(back.check.modules[&sym("m")].source, SourceId(1));
     assert_eq!(
@@ -348,6 +418,22 @@ fn a_front_writes_reads_and_writes_to_the_same_text() {
     );
     assert!(text.contains("binder 20\nxs 1 62 70\nList<Int>"), "{text}");
     assert!(text.contains("testhash 0 "), "{text}");
+    // The fields the syntax tree carries, which `front.ply` pins the same way.
+    assert!(text.contains("public 1\n1reuse 1\n1"), "{text}");
+    assert!(text.contains("param 9\nxs 1 8 10"), "{text}");
+    assert!(text.contains("type m.Shape "), "{text}");
+    assert!(
+        text.contains("simple_name 5\nShapepublic 1\n0arity 1\n2"),
+        "{text}"
+    );
+    assert!(text.contains("name_span 7\n1 46 60"), "{text}");
+    assert!(text.contains("literal 6\nint -3"), "{text}");
+    assert!(text.contains("literal 12\nstr hi there"), "{text}");
+    assert!(text.contains("literal 10\nbytes 00ff"), "{text}");
+    assert!(
+        text.contains("effect_set 41\nio store std.db.read[users],std.net.write"),
+        "{text}"
+    );
     let test = &back.check.tests[0];
     assert_eq!(test.name, "counts the users");
     assert_eq!(test.key, sym("m.counts the users"));
@@ -470,6 +556,79 @@ fn the_reader_names_what_it_refuses() {
 
     let err = read_front(&text, &[SourceId(0)]).unwrap_err();
     assert!(err.contains("only 1 sources were handed over"), "{err}");
+
+    let err = read_front(&text.replace("type m.Shape ", "typ3 m.Shape "), &SOURCES).unwrap_err();
+    assert!(err.contains("unknown frame kind `typ3`"), "{err}");
+
+    let err = read_front(
+        &text.replace("public 1\n1reuse", "public 1\n2reuse"),
+        &SOURCES,
+    )
+    .unwrap_err();
+    assert!(err.contains("`public` is `2`, not 0 or 1"), "{err}");
+
+    let err = read_front(&text.replace("reuse 1\n1", "reuse 1\n2"), &SOURCES).unwrap_err();
+    assert!(err.contains("`reuse` is `2`, not 0 or 1"), "{err}");
+
+    let err = read_front(&text.replace("name_span 7\n", "xame_span 7\n"), &SOURCES).unwrap_err();
+    assert!(err.contains("test `0`: unknown field `xame_span`"), "{err}");
+
+    let err = read_front(
+        &text.replace("literal 6\nint -3", "literal 6\nrat -3"),
+        &SOURCES,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("`rat` is not `int`, `str` or `bytes`"),
+        "{err}"
+    );
+
+    // Same length, so the frame's own length still holds and only the field's shape is wrong.
+    let err = read_front(
+        &text.replace("\nio store std.db", "\nio,store std.db"),
+        &SOURCES,
+    )
+    .unwrap_err();
+    assert!(err.contains("is not `<name> <includes> <atoms>`"), "{err}");
+
+    let err = read_front(
+        &text.replace("param 9\nxs 1 8 10", "param 9\nxs1810abc"),
+        &SOURCES,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("def `m.count`: param `xs1810abc` is not `<name> <span>`"),
+        "{err}"
+    );
+}
+
+#[test]
+fn the_writer_refuses_a_front_whose_syntax_tables_are_missing() {
+    let mut front = sample();
+    front.defs_written.shift_remove(&sym("m.count"));
+    let err = write_front(&front, &SOURCES).unwrap_err();
+    assert!(
+        err.contains("def `m.count` has no record of what its source wrote"),
+        "{err}"
+    );
+
+    let mut front = sample();
+    front.effects_written.clear();
+    let err = write_front(&front, &SOURCES).unwrap_err();
+    assert!(
+        err.contains("effect `std.db` is declared in `std.db`"),
+        "{err}"
+    );
+
+    let mut front = sample();
+    front.test_name_spans.clear();
+    let err = write_front(&front, &SOURCES).unwrap_err();
+    assert!(err.contains("0 test name spans beside 1 tests"), "{err}");
+
+    let mut front = sample();
+    front.law_literals.clear();
+    let err = write_front(&front, &SOURCES).unwrap_err();
+    assert!(err.contains("0 law literal lists beside 1 laws"), "{err}");
 }
 
 #[test]

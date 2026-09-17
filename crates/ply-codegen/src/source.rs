@@ -12,11 +12,14 @@ use ply_hash::HashOutput;
 use ply_hash::body::BodySet;
 use ply_span::{SourceId, Span, Symbol};
 use ply_syntax::ast::{
-    Expr, FnDef, Generics, Ident, Item, Param, Program, QName, SpecKind, TestDef, TypeExpr,
-    Visibility,
+    AtomExpr, Expr, ExprKind, FnDef, Generics, Ident, Item, Lit, Param, Program, QName, SpecKind,
+    Stmt, TestDef, TypeExpr, UnOp, Visibility,
 };
-use ply_syntax::resolve::Resolved;
-use ply_ty::{CheckOutput, Front, Hashed, LawInfo, Ordinal, Type};
+use ply_syntax::resolve::{Namespace, Resolved};
+use ply_ty::{
+    CheckOutput, DefWritten, EffectAtom, EffectSet, Footprint, Front, Hashed, LawInfo, Literal,
+    Ordinal, Resource, Type, TypeDecl, WrittenParam,
+};
 use std::collections::{HashMap, HashSet};
 
 /// A checked program, borrowed for as long as the unit compiled from it lives.
@@ -284,11 +287,218 @@ pub fn front_of(
         ordinals,
         bodies: Vec::new(),
         test_bodies: Vec::new(),
+        ..Front::default()
     };
     if let Some(bodies) = bodies {
         fill_bodies(&mut front, program, bodies);
     }
+    fill_written(&mut front, program, resolved);
     front
+}
+
+/// The builtin effect `cell`, which is written bare and resolves to itself.
+const CELL: &str = "cell";
+
+/// What the syntax tree carries and [`CheckOutput`] does not: each `fn`'s visibility, its `reuse`
+/// marker and its parameters as written; every `type`, which no table of the checker's holds; each
+/// `effect`'s visibility; every test's label span; the literals each law's guard mentions; and each
+/// module's `effect set`s, resolved the way a row that names one is.
+///
+/// Every assembler of a [`Front`] from the Rust chain calls this, so that a dump written from one
+/// carries what the port's dump carries and the differential compares the two.
+pub fn fill_written(front: &mut Front, program: &Program, resolved: &Resolved) {
+    let mut defs_written = std::mem::take(&mut front.defs_written);
+    let mut types = std::mem::take(&mut front.types);
+    let mut effects_written = std::mem::take(&mut front.effects_written);
+    let mut effect_sets = std::mem::take(&mut front.effect_sets);
+    let (mut test_name_spans, mut law_literals) = (Vec::new(), Vec::new());
+    {
+        let check = &front.check;
+        for (index, module) in program.modules.iter().enumerate() {
+            let mut sets = Vec::new();
+            for item in &module.items {
+                match item {
+                    Item::Fn(d) => {
+                        defs_written.insert(
+                            module.name.qualify(&d.name.name),
+                            DefWritten {
+                                vis: d.vis,
+                                reuse: d.reuse.is_some(),
+                                params: d
+                                    .params
+                                    .iter()
+                                    .map(|p| WrittenParam {
+                                        name: p.name.name.clone(),
+                                        span: p.span,
+                                    })
+                                    .collect(),
+                            },
+                        );
+                    }
+                    Item::Type(d) => {
+                        let name = module.name.qualify(&d.name.name);
+                        types.insert(
+                            name.clone(),
+                            TypeDecl {
+                                name,
+                                module: module.name.clone(),
+                                simple_name: d.name.name.clone(),
+                                vis: d.vis,
+                                arity: d.params.len(),
+                                span: d.span,
+                            },
+                        );
+                    }
+                    Item::Effect(d) => {
+                        effects_written.insert(module.name.qualify(&d.name.name), d.vis);
+                    }
+                    Item::Test(d) => test_name_spans.push(d.name_span),
+                    Item::Law(d) => {
+                        let mut literals = Vec::new();
+                        if let Some(guard) = &d.guard {
+                            collect_literals(guard, &mut literals);
+                        }
+                        law_literals.push(literals);
+                    }
+                    Item::EffectSet(d) => sets.push(EffectSet {
+                        name: d.name.name.clone(),
+                        includes: d.includes.iter().map(|q| q.symbol().clone()).collect(),
+                        atoms: Footprint::from_atoms(
+                            d.expansion
+                                .iter()
+                                .filter_map(|a| set_atom(a, resolved, check, index)),
+                        ),
+                    }),
+                    Item::Derive(_) => {}
+                }
+            }
+            if !sets.is_empty() {
+                effect_sets.insert(module.name.as_symbol().clone(), sets);
+            }
+        }
+    }
+    front.defs_written = defs_written;
+    front.types = types;
+    front.effects_written = effects_written;
+    front.effect_sets = effect_sets;
+    front.test_name_spans = test_name_spans;
+    front.law_literals = law_literals;
+}
+
+/// A written atom as the program-wide atom a row would carry, exactly as `ply-cli`'s
+/// `signature::atom_of` resolves one: an effect that resolves to nothing drops its atom.
+fn set_atom(
+    atom: &AtomExpr,
+    resolved: &Resolved,
+    check: &CheckOutput,
+    module: usize,
+) -> Option<EffectAtom> {
+    let effect = set_effect(&atom.effect, resolved, check, module)?;
+    let resource = match &atom.resource {
+        Some(r) => Resource::Named(r.name.clone()),
+        None => Resource::Singleton,
+    };
+    Some(EffectAtom::new(effect, resource, atom.mode))
+}
+
+fn set_effect(
+    q: &QName,
+    resolved: &Resolved,
+    check: &CheckOutput,
+    module: usize,
+) -> Option<Symbol> {
+    if q.is_bare() && q.symbol().as_str() == CELL {
+        return Some(Symbol::new(CELL));
+    }
+    match resolved.lookup(module, Namespace::Effect, q) {
+        Ok(binding) if check.effects.contains_key(&binding.qualified) => {
+            Some(binding.qualified.clone())
+        }
+        _ if q.is_bare() && ply_core::prelude::is_prelude_effect(q.symbol()) => {
+            Some(q.symbol().clone())
+        }
+        _ => None,
+    }
+}
+
+/// The literals a guard is written in terms of, in the order `ply-cli`'s witness search walks it:
+/// a stack, children pushed in source order and taken last-first, each value kept the first time it
+/// is reached. That order seeds a search rather than deciding an answer, which is why it is pinned
+/// here rather than sorted.
+fn collect_literals(expr: &Expr, out: &mut Vec<Literal>) {
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        match &e.kind {
+            ExprKind::Lit(Lit::Int(k)) => keep(out, Literal::Int(*k)),
+            ExprKind::Lit(Lit::Str(s)) => keep(out, Literal::Str(s.clone())),
+            ExprKind::Lit(Lit::Bytes(b)) => keep(out, Literal::Bytes(b.clone())),
+            ExprKind::Lit(_) | ExprKind::Var(_) => {}
+            ExprKind::Binary { lhs, rhs, .. } => {
+                stack.push(lhs);
+                stack.push(rhs);
+            }
+            ExprKind::Unary { op, operand } => {
+                // `-1000000` is a negation of a literal in the tree and a bound in the guard, so
+                // the value the search wants is the negated one — and the literal under it is
+                // still reached, as the walk goes on to the operand either way.
+                if let (UnOp::Neg, ExprKind::Lit(Lit::Int(k))) = (op, &operand.kind) {
+                    keep(out, Literal::Int(k.saturating_neg()));
+                }
+                stack.push(operand);
+            }
+            ExprKind::App { func, args, .. } => {
+                stack.push(func);
+                stack.extend(args);
+            }
+            ExprKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                stack.push(cond);
+                stack.push(then_branch);
+                stack.push(else_branch);
+            }
+            ExprKind::Lambda { body, .. } => stack.push(body),
+            ExprKind::Match { scrutinee, arms } => {
+                stack.push(scrutinee);
+                for arm in arms {
+                    stack.extend(arm.guard.iter());
+                    stack.push(&arm.body);
+                }
+            }
+            ExprKind::Block { stmts, tail } => {
+                for stmt in stmts {
+                    match stmt {
+                        Stmt::Let { value, .. } => stack.push(value),
+                        Stmt::Expr(e) => stack.push(e),
+                    }
+                }
+                stack.extend(tail.as_deref());
+            }
+            ExprKind::Record { fields } => stack.extend(fields.iter().map(|(_, v)| v)),
+            ExprKind::RecordUpdate { base, fields } => {
+                stack.push(base);
+                stack.extend(fields.iter().map(|(_, v)| v));
+            }
+            ExprKind::Field { base, .. } => stack.push(base),
+            ExprKind::Try { operand } => stack.push(operand),
+            ExprKind::List { items } => stack.extend(items),
+            ExprKind::Perform { args, .. } => stack.extend(args),
+            ExprKind::Handle { body, .. } => stack.push(body),
+            ExprKind::WithCell { init, body, .. } => {
+                stack.push(init);
+                stack.push(body);
+            }
+            ExprKind::WithRegion { body, .. } | ExprKind::Simulate { body } => stack.push(body),
+        }
+    }
+}
+
+fn keep(out: &mut Vec<Literal>, literal: Literal) {
+    if !out.contains(&literal) {
+        out.push(literal);
+    }
 }
 
 /// The hasher's item order and the body it stored for each name: every module in program order,
