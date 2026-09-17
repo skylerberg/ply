@@ -24,8 +24,8 @@ fn pair(x: Int) -> List<Int> = [x, x]
 
 fn label(x: Int) -> String = "n"
 
-// A carried argument and an answer the seam does not carry: offered to every backend and declined
-// by the reference one's registry, which is the registry-miss path `wrong:unoffered` corrupts.
+// A carried argument and an answer the seam does not carry: the registry-miss path
+// `wrong:unoffered` corrupts.
 fn grade(x: Int) -> Float = 1.5
 
 // Outside the fragment — a `Float` literal has no path in it — so its name is one the registry
@@ -106,17 +106,6 @@ fn u64_at(report: &Value, path: &[&str]) -> u64 {
         .unwrap_or_else(|| panic!("`{}` is not a number: {node}", path.join(".")))
 }
 
-/// Every corruption is exercised on the C tier: the corpus performs effects the `reference`
-/// fragment declines, and under tier-only there is no machine behind a decline, so a bare
-/// `wrong:...` — which names `reference` — could not run the corpus at all.
-fn on_c_tier(spec: &str) -> String {
-    if spec.starts_with("wrong:") {
-        format!("c:{spec}")
-    } else {
-        spec.to_string()
-    }
-}
-
 /// The keys of every test the run failed. A corrupt backend declines every test body it is handed
 /// and no machine picks the body up, so the whole corpus goes red; a specific corruption is caught
 /// by its test being among these.
@@ -131,7 +120,7 @@ fn caught(report: &Value) -> Vec<String> {
 
 #[track_caller]
 fn fires_and_is_caught(dir: &Path, backend: &str) -> Vec<String> {
-    let report = run(dir, Some(&on_c_tier(backend)));
+    let report = run(dir, Some(backend));
     let failed = u64_at(&report, &["summary", "failed"]);
     assert!(
         failed > 0,
@@ -181,9 +170,8 @@ fn a_bool_where_an_int_belongs_crosses_the_seam_and_is_caught_by_ply_test() {
     );
 }
 
-/// `grade` is offered — its argument is carried — and declined by the reference registry, whose
-/// members are the carried *signatures*; an answer for it is an answer for a name the backend has
-/// no body for.
+/// `grade` is offered — its argument is carried — and its answer is not; an answer for it is an
+/// answer for a name the backend has no body for.
 #[test]
 fn an_answer_for_a_definition_the_backend_has_no_body_for_is_caught_by_ply_test() {
     let dir = project(CORPUS);
@@ -311,12 +299,6 @@ fn the_honest_code_generator_agrees_over_the_corpus_and_enters_it() {
         "no unit was compiled, so `c` installed something that is not a code generator: {}",
         report["backend"]
     );
-    let plain = run(dir.path(), Some("reference"));
-    assert!(
-        plain["backend"]["units"].is_null(),
-        "`reference` reported a compilation, and it compiles nothing: {}",
-        plain["backend"]
-    );
 }
 
 #[test]
@@ -414,8 +396,6 @@ fn run_attaches_a_backend_to_main_and_refuses_a_spec_it_cannot_parse() {
     let dir = project(
         "fn double(x: Int) -> Int = x * 2\nfn main() -> Int = fold(range(0, 10), 0, |acc: Int, i: Int| acc + double(i))\n",
     );
-    // Only the C tier is offered here: under tier-only `reference` is a fragment with no machine
-    // behind it, so it declines `main` and cannot run the program at all (ADR 0048).
     let out = ply(dir.path())
         .arg("run")
         .arg("--json")
@@ -484,14 +464,12 @@ fn a_backed_run_that_selects_nothing_compiles_nothing() {
 
 // --- The grammar -------------------------------------------------------------
 
-/// A corruption may name the backend it wraps, and a bare `wrong:` still means `reference`.
+/// A corruption may name the backend it wraps, and a bare `wrong:` wraps `c`.
 #[test]
-fn a_bare_wrong_prefix_still_names_the_reference_backend() {
+fn a_bare_wrong_prefix_names_the_c_backend() {
     let dir = project(CORPUS);
     let bare = run(dir.path(), Some("wrong:off-by-one"));
-    assert_eq!(bare["backend"]["name"], "reference", "{bare}");
-    let named = run(dir.path(), Some("reference:wrong:off-by-one"));
-    assert_eq!(named["backend"]["name"], "reference", "{named}");
+    assert_eq!(bare["backend"]["name"], "c", "{bare}");
     let generated = run(dir.path(), Some("c:wrong:off-by-one"));
     assert_eq!(generated["backend"]["name"], "c", "{generated}");
 }
@@ -551,9 +529,6 @@ test "wrong" { assert_eq(double(21), 41) }
 // The following tests are deleted because their premise is the interpreter-vs-backend separation
 // that tier-only removes:
 //
-// * `the_honest_backend_agrees_over_the_corpus_and_enters_it` — `reference` is a fragment with no
-//   machine behind it, so it declines the corpus's effects and runs it red rather than green; the
-//   honest-`c` control above is now the only honest backend that runs the corpus.
 // * `the_corpus_is_green_with_no_backend` — the C tier is always the evaluator, so there is no
 //   "no backend" run and `report["backend"]` is never null.
 // * `a_backend_run_reads_no_pass_the_evaluator_earned`,
