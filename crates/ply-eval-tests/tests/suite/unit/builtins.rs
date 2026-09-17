@@ -1237,6 +1237,7 @@ fn builtin_all_is_complete_and_lists_each_name_once() {
             "filter",
             "float_of_bits",
             "float_of_decimal",
+            "float_of_string",
             "fold",
             "i16_of_int",
             "i32_of_int",
