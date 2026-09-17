@@ -143,8 +143,13 @@ if process:
         if fe:
             ph = fe["phases"]
             line += (f"   front end {ph['total']:.1f}ms"
-                     f" (hash {ph['hash']:.1f} parse {ph['parse']:.1f}"
-                     f" restore {ph['restore']:.1f} write-back {ph['write_back']:.1f})"
+                     + " ("
+                     + " ".join(
+                         f"{k.replace('_', '-')} {v:.1f}"
+                         for k, v in ph.items()
+                         if k != "total"
+                     )
+                     + ")"
                      f"   rechecked {fe['rechecked']}, cached {fe['cached']}")
         print(line)
     fits = [(definitions(r["size"]), r["warm_front_end"]["phases"]["total"])
