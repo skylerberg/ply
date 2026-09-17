@@ -215,6 +215,19 @@ infinity where the lexer saturates. It lands before anything written in
 Ply calls it, because the bundle must know a builtin before the
 compiler's own sources may use it, and the hasher calls it now.
 
+**Built, 2026-09-17: the frames the switch still needed.** The dump carries
+what the driver reads from the tree and the tables did not hold: each
+item's visibility and a `fn`'s reuse marker, a definition's parameter
+names and their spans, a type's own frame with its arity and span, a
+test's name span, each module's effect sets with the atoms they expand
+to, and the literals a law's guard mentions, in the order and with the
+negation folded as the prover's own walk collects them. A type needed a
+frame of its own, because no table of the checker's output holds one: a
+sum type reaches it through its constructors and an alias reaches it not
+at all. Nothing is rewired onto them yet, and the writer refuses a front
+whose syntax tables are missing, so the Rust chain's assembler cannot
+answer empty ones where the port answers real ones.
+
 **What the driver loses.** Its gates decided per file not to parse and
 per definition not to re-infer, keyed on the store's fingerprints; a run
 that enters the port whole parses and checks every module every time.
