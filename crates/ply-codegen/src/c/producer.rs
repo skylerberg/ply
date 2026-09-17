@@ -20,6 +20,7 @@ use ply_span::{Severity, SourceId, Symbol};
 use ply_ty::{Front, read_front};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// How a thread builds its producer.
@@ -29,6 +30,14 @@ static RECIPE: OnceLock<Recipe> = OnceLock::new();
 /// A digest of the emitter's own sources, folded into every cache key a produced body or unit
 /// is kept under: a body the last version of the emitter wrote is not this version's.
 static IDENTITY: OnceLock<String> = OnceLock::new();
+
+/// Whether the reference emits for the whole process, whatever thread asks. This is not the
+/// switch a test reaches for -- [`reference_only`] is, and it is per-thread. This one exists
+/// because the thread that asks is sometimes not the thread that decides: `ply-test`'s
+/// `execute_group` puts every group through `rayon::broadcast`, so the `attach` that builds a
+/// unit runs on a pool worker a per-thread switch never reaches (ADR 0052 §2). A handover still
+/// wins over both, because [`with_current`] reads `HANDED` first.
+static REFERENCE_EVERYWHERE: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static MINE: RefCell<Option<Result<PlyProducer, String>>> = const { RefCell::new(None) };
@@ -284,7 +293,11 @@ pub fn mode() -> &'static str {
     if HANDED.with(|h| h.borrow().is_some()) {
         return "ply";
     }
-    if !installed() || BUILDING.with(Cell::get) || REFERENCE_ONLY.with(Cell::get) {
+    if !installed()
+        || BUILDING.with(Cell::get)
+        || REFERENCE_ONLY.with(Cell::get)
+        || REFERENCE_EVERYWHERE.load(Ordering::Relaxed)
+    {
         "ref"
     } else {
         "ply"
@@ -295,6 +308,10 @@ pub fn mode() -> &'static str {
 /// `ref` and the producer is not consulted or built. This is for the checks that hold the
 /// fragment against the whole emitter -- the differentials, and the emitter's own tests -- which
 /// need a unit the fragment emitted while the whole emitter is the default everywhere else.
+///
+/// Per-thread, which is what a test binary needs: `cargo test` runs this crate's tests over one
+/// process, and making this switch process-wide made them clobber each other's guard -- eighteen
+/// of `fragment`'s nineteen failed at two threads and all nineteen passed serially.
 pub fn reference_only<R>(f: impl FnOnce() -> R) -> R {
     struct Guard(bool);
     impl Drop for Guard {
@@ -303,6 +320,24 @@ pub fn reference_only<R>(f: impl FnOnce() -> R) -> R {
         }
     }
     let _guard = Guard(REFERENCE_ONLY.with(|c| c.replace(true)));
+    f()
+}
+
+/// [`reference_only`] for every thread, for a harness whose work runs where it cannot reach:
+/// `ply-test` builds its tier inside `rayon::broadcast`, so the thread that sets a per-thread
+/// switch is never the thread that reads it.
+///
+/// Two of these on different threads at once would restore each other's value, which is the fault
+/// that kept the switch above per-thread. So this is for a caller that owns its process, which is
+/// what `cargo nextest` gives a test.
+pub fn reference_only_everywhere<R>(f: impl FnOnce() -> R) -> R {
+    struct Guard(bool);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            REFERENCE_EVERYWHERE.store(self.0, Ordering::Relaxed);
+        }
+    }
+    let _guard = Guard(REFERENCE_EVERYWHERE.swap(true, Ordering::Relaxed));
     f()
 }
 
@@ -356,7 +391,10 @@ pub fn with_current<T>(f: impl FnOnce(&PlyProducer) -> T) -> Option<T> {
         return HANDED.with(|h| h.borrow().as_ref().map(|(p, _)| f(p)));
     }
     let recipe = RECIPE.get()?;
-    if BUILDING.with(Cell::get) || REFERENCE_ONLY.with(Cell::get) {
+    if BUILDING.with(Cell::get)
+        || REFERENCE_ONLY.with(Cell::get)
+        || REFERENCE_EVERYWHERE.load(Ordering::Relaxed)
+    {
         return None;
     }
     MINE.with(|mine| {
