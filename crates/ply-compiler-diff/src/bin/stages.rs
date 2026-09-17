@@ -8,16 +8,27 @@
 //! tables. Their differences are what a stage costs. `hash.hash_dump` is printed beside them and
 //! not subtracted, because it is the hasher's own dump rather than a prefix of the front entry.
 //!
+//! **A program is handed to the port on top of the standard library.** A generated corpus imports
+//! `std.json` and friends, and a program passed without them resolves nothing, so every entry
+//! returns diagnostics instead of a dump. That is fast, so it reads as four wonderfully quick
+//! stages: the first run of this probe timed exactly that, and the tell was three phases returning
+//! byte-identical dumps. Hence the head of every dump is printed, not just a flag on one entry.
+//!
 //! Read the raw columns, not only the differences: the nesting is a claim about the port's
 //! sources, and an entry that short-circuits would make every subtraction wrong while still
 //! printing a plausible number.
-//!
-//! A dump beginning `diag ` is a program the port refused. It is fast for the wrong reason, so the
-//! probe says so instead of reporting a time for it.
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Every `.ply` under `dir`, as the `(module name, source)` pairs a whole-program entry takes.
+/// The shipped standard library, as the `(module name, source)` pairs a whole-program entry takes.
+fn std_modules() -> Vec<(String, String)> {
+    ply_std::MODULES
+        .iter()
+        .map(|(name, src)| ((*name).to_string(), (*src).to_string()))
+        .collect()
+}
+
+/// Every `.ply` under `dir`, in the same shape.
 fn modules_of(dir: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -45,12 +56,20 @@ fn modules_of(dir: &Path) -> Vec<(String, String)> {
     out
 }
 
-/// One reading: the wall clock in milliseconds, the dump's size, and whether it is a refusal.
-fn reading(entry: &str, modules: &[(String, String)]) -> (f64, usize, bool) {
+/// The start of a dump on one line, which is what says whether it is a dump at all.
+fn head(dump: &str) -> String {
+    dump.chars()
+        .take(52)
+        .collect::<String>()
+        .replace('\n', "\\n")
+}
+
+/// One reading: the wall clock in milliseconds, the dump's size, and its head.
+fn reading(entry: &str, modules: &[(String, String)]) -> (f64, usize, String) {
     let began = Instant::now();
     let dump = ply_compiler_diff::port::dump_program(entry, modules);
     let millis = began.elapsed().as_secs_f64() * 1e3;
-    (millis, dump.len(), dump.starts_with("diag "))
+    (millis, dump.len(), head(&dump))
 }
 
 fn main() {
@@ -59,13 +78,20 @@ fn main() {
         eprintln!("usage: stages <corpus dir> [<corpus dir> ...]");
         std::process::exit(2);
     }
+    let library = std_modules();
     for dir in &dirs {
-        let modules = modules_of(Path::new(dir));
-        println!("STAGES {dir} modules {}", modules.len());
-        if modules.is_empty() {
-            println!("  no .ply under it; nothing to time");
+        let own = modules_of(Path::new(dir));
+        if own.is_empty() {
+            println!("STAGES {dir} no .ply under it; nothing to time");
             continue;
         }
+        let mut modules = library.clone();
+        modules.extend(own.iter().cloned());
+        println!(
+            "STAGES {dir} modules {} ({} of them the standard library)",
+            modules.len(),
+            library.len()
+        );
         for entry in [
             "resolve.resolve_dump",
             "infer.check_dump",
@@ -74,15 +100,9 @@ fn main() {
         ] {
             // Once to settle whatever the first call into the unit pays for, then two readings.
             let _ = reading(entry, &modules);
-            let (first, bytes, refused) = reading(entry, &modules);
+            let (first, bytes, head) = reading(entry, &modules);
             let (second, _, _) = reading(entry, &modules);
-            if refused {
-                println!(
-                    "  {entry:<22} REFUSED: the dump is diagnostics, so its clock means nothing"
-                );
-            } else {
-                println!("  {entry:<22} {first:9.1} ms {second:9.1} ms   dump {bytes} bytes");
-            }
+            println!("  {entry:<22} {first:9.1} ms {second:9.1} ms   {bytes:>9} bytes   {head}");
         }
     }
 }
