@@ -98,9 +98,17 @@ fn a_config_schema_that_is_not_a_qualified_name_is_refused() {
 
 // --- resolving the schema function ------------------------------------------
 
-fn check(source: &str) -> ply_core::CheckOutput {
-    let module = ply_syntax::parse(SourceId(0), source).expect("the fixture parses");
-    ply_core::check_module(&module).expect("the fixture typechecks")
+fn check(source: &str) -> ply_ty::CheckOutput {
+    ply_codegen::c::producer::ensure_default();
+    let modules = [("m".to_string(), source.to_string())];
+    let front = ply_codegen::c::producer::front(&modules, &[SourceId(0)])
+        .expect("the port answers for the fixture");
+    assert!(
+        front.diagnostics.is_empty(),
+        "the fixture typechecks: {:?}",
+        front.diagnostics
+    );
+    front.check
 }
 
 const SPEC_SOURCE: &str = "\
@@ -116,10 +124,10 @@ fn number() -> Int = 1
 fn a_nullary_pure_function_returning_a_spec_resolves() {
     let program = check(SPEC_SOURCE);
     assert_eq!(
-        schema::resolve(&program, "config")
+        schema::resolve(&program, "m.config")
             .expect("it is a schema function")
             .as_str(),
-        "config"
+        "m.config"
     );
 }
 
@@ -129,8 +137,8 @@ fn a_nullary_pure_function_returning_a_spec_resolves() {
 fn a_schema_function_that_is_not_one_is_refused_with_the_reason() {
     let program = check(SPEC_SOURCE);
     for (name, why) in [
-        ("two", "argument"),
-        ("number", "rather than a `ConfigSpec`"),
+        ("m.two", "argument"),
+        ("m.number", "rather than a `ConfigSpec`"),
     ] {
         let error = schema::resolve(&program, name).expect_err("`{name}` is not a schema function");
         assert_eq!(error.code, codes::CONFIG_UNAVAILABLE, "{name}");
