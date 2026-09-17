@@ -37,11 +37,23 @@ fn load_dir(dir: &str) -> Loaded {
         let id = sources.add(ply_std::pseudo_path(module), (*text).to_string());
         inputs.push((id, module.clone(), *text));
     }
+    let named: Vec<(String, String)> = inputs
+        .iter()
+        .map(|(_, m, t)| (m.to_string(), (*t).to_string()))
+        .collect();
+    let ids: Vec<_> = inputs.iter().map(|(id, _, _)| *id).collect();
     let mut ast = ply_syntax::parse_program(inputs).expect("the corpus parses");
     let expanded = ply_derive::expand_program(&mut ast);
     assert!(expanded.is_empty(), "{expanded:?}");
     let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the corpus resolves");
-    let check = ply_core::check_program(&ast, &resolved).expect("the corpus checks");
+    ply_codegen::c::producer::ensure_default();
+    let front = ply_codegen::c::producer::front(&named, &ids).expect("the port answers");
+    assert!(
+        front.diagnostics.is_empty(),
+        "the corpus checks: {:?}",
+        front.diagnostics
+    );
+    let check = front.check;
     Loaded {
         program: Box::leak(Box::new(ast)),
         resolved: Box::leak(Box::new(resolved)),

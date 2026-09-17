@@ -33,10 +33,22 @@ fn kernel() -> (&'static Program, &'static Unit) {
         let id = sources.add(path.clone(), text.to_string());
         inputs.push((id, ModuleName::from_dotted(stem), text));
     }
+    let named: Vec<(String, String)> = inputs
+        .iter()
+        .map(|(_, m, t)| (m.to_string(), (*t).to_string()))
+        .collect();
+    let ids: Vec<_> = inputs.iter().map(|(id, _, _)| *id).collect();
     let mut ast = ply_syntax::parse_program(inputs).expect("the kernel parses");
     assert!(ply_derive::expand_program(&mut ast).is_empty());
     let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the kernel resolves");
-    let check = ply_core::check_program(&ast, &resolved).expect("the kernel checks");
+    ply_codegen::c::producer::ensure_default();
+    let front = ply_codegen::c::producer::front(&named, &ids).expect("the port answers");
+    assert!(
+        front.diagnostics.is_empty(),
+        "the kernel checks: {:?}",
+        front.diagnostics
+    );
+    let check = front.check;
     let ast: &'static Program = Box::leak(Box::new(ast));
     let unit = Unit::over(
         ast,

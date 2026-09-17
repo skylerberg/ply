@@ -68,11 +68,21 @@ fn load(dir: &Path) -> Result<Loaded, Vec<ply_span::Diagnostic>> {
         .iter()
         .map(|(_, module, text)| (module.to_string(), (*text).to_string()))
         .collect();
+    let named: Vec<(String, String)> = inputs
+        .iter()
+        .map(|(_, module, text)| (module.to_string(), (*text).to_string()))
+        .collect();
+    let ids: Vec<_> = inputs.iter().map(|(id, _, _)| *id).collect();
     let mut ast = ply_syntax::parse_program(inputs).map_err(|d| d.to_vec())?;
     let expanded = ply_derive::expand_program(&mut ast);
     assert!(expanded.is_empty(), "{expanded:?}");
     let resolved = ply_syntax::resolve::resolve(&mut ast).map_err(|d| d.to_vec())?;
-    let check = ply_core::check_program(&ast, &resolved).map_err(|d| d.to_vec())?;
+    ply_codegen::c::producer::ensure_default();
+    let front = ply_codegen::c::producer::front(&named, &ids).expect("the port answers");
+    if !front.diagnostics.is_empty() {
+        return Err(front.diagnostics);
+    }
+    let check = front.check;
     Ok(Loaded {
         program: Box::leak(Box::new(ast)),
         resolved: Box::leak(Box::new(resolved)),
