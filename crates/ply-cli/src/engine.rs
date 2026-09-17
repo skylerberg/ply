@@ -19,42 +19,24 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// The discharger this build drives, and what the reader has to be told about it.
+/// The discharger this build drives.
+///
+/// Every clause and every law body is an AST this run has to hold — a claim is discharged by
+/// reasoning about the expression that states it, and there is no cached form of one. Every load
+/// parses every module, so that is always true and there is no second answer to give.
 pub fn of<'a>(
     program: &'a Program,
     resolved: &'a Resolved,
     check: &'a CheckOutput,
-    complete: bool,
-    obligations: usize,
     hosting: Option<Hosting<'a>>,
     backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
-) -> (
-    Box<dyn ply_test::obligation::Discharger + 'a>,
-    Option<Diagnostic>,
-) {
-    // Every clause and every law body is an AST this run has to hold: a claim is discharged by
-    // reasoning about the expression that states it, and there is no cached form of one.
-    if !complete {
-        return (
-            Box::new(ply_test::obligation::Undecided),
-            (obligations > 0).then(incomplete),
-        );
-    }
+) -> Box<dyn ply_test::obligation::Discharger + 'a> {
     let prover = Prover::new(program, resolved, check);
     let prover = match hosting {
         Some(hosting) => prover.with_hosting(hosting),
         None => prover,
     };
-    (Box::new(prover.with_backend(backend)), None)
-}
-
-fn incomplete() -> Diagnostic {
-    Diagnostic::warning(
-        codes::OBLIGATION_NOT_DISCHARGED,
-        "not every module was parsed, so no obligation was attempted",
-    )
-    .note("every obligation is reported `unattempted`: no tier is claimed for any of them")
-    .note("run again with `--no-incremental`")
+    Box::new(prover.with_backend(backend))
 }
 
 /// Where an obligation's claim is written, found once per run.

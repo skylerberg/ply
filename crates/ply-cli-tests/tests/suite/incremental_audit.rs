@@ -7,7 +7,7 @@ use ply_cli::driver;
 use ply_cli::load::{LoadError, Loaded};
 use ply_span::Symbol;
 use ply_store::Store;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -106,17 +106,6 @@ fn hash_of(loaded: &Loaded, name: &str) -> String {
     loaded.hashes.defs[&Symbol::new(name)].to_hex()
 }
 
-#[track_caller]
-fn skipped(loaded: &Loaded, file: &str) -> bool {
-    let file = loaded
-        .frontend
-        .files
-        .iter()
-        .find(|f| f.path.ends_with(file))
-        .unwrap_or_else(|| panic!("{file} was not reported by the front end"));
-    !file.parsed
-}
-
 const CORE: &str = r#"
 pub type Money = Int
 
@@ -171,8 +160,7 @@ fn corpus() -> tempfile::TempDir {
 
 const EFFECT_DECL: &str = "pub effect db { read get[r](key: Int) -> Int }\n";
 
-/// A module that performs an effect declared elsewhere and declares none of its own, so the rule
-/// that force-parses every effect-declaring file leaves it a skip candidate.
+/// A module that performs an effect declared elsewhere and declares none of its own.
 fn performer(module: &str) -> String {
     format!(
         "import {module}\n\
@@ -189,11 +177,7 @@ fn adding_an_identically_declared_effect_reranks_a_skipped_performer() {
     write(dir.path(), "x.ply", EFFECT_DECL);
     write(dir.path(), "p.ply", &performer("x"));
     agree(dir.path(), "cold");
-    let warm = agree(dir.path(), "warm");
-    assert!(
-        skipped(&warm, "p.ply"),
-        "the performer must be a skip candidate"
-    );
+    agree(dir.path(), "warm");
 
     write(dir.path(), "a.ply", EFFECT_DECL);
     agree(
@@ -232,8 +216,8 @@ fn deleting_an_effect_declaring_module_reranks_the_survivor() {
 }
 
 /// Normalization sorts an effect's operations before hashing, so reordering them in source is a
-/// no-op for the `DefHash`, and gate 2 then restores the cached signatures positionally against the
-/// new source order.
+/// no-op for the `DefHash` — and the signature the run publishes for each operation must still be
+/// that operation's own rather than its neighbour's.
 #[test]
 fn reordering_an_effects_operations_keeps_every_signature_on_its_operation() {
     let dir = tempfile::tempdir().unwrap();
@@ -280,7 +264,7 @@ fn reordering_a_types_variants_changes_its_hash_and_so_costs_a_recheck() {
 }
 
 /// A test's hash covers its body and its `nondet` marker, never its label, so relabelling one
-/// changes no hash and gate 2 restores the test from the fingerprint, label and all.
+/// changes no hash — and the label the run reports must still be the one in the source.
 #[test]
 fn renaming_a_test_label_is_reported_by_a_from_scratch_check() {
     let dir = tempfile::tempdir().unwrap();
@@ -300,8 +284,9 @@ fn renaming_a_test_label_is_reported_by_a_from_scratch_check() {
     agree(dir.path(), "and the run after that, in case it self-heals");
 }
 
-/// `pub` is erased by normalization, so making a name private changes no hash; the importer's own
-/// bytes did not change either, and gate 1 has nothing left to refuse on.
+/// `pub` is erased by normalization, so making a name private changes no hash and the importer's
+/// own bytes did not change either: the error has to come from checking the program, because no
+/// hash could show it.
 #[test]
 fn removing_pub_from_an_imported_name_is_still_an_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -416,48 +401,28 @@ fn deleting_an_imported_file_and_restoring_it_restores_every_hash() {
     assert_eq!(before, snapshot(&agree(dir.path(), "restored")));
 }
 
-/// Nothing may consult mtime.
+/// Nothing may consult mtime: a file rewritten with the bytes it had publishes what it published.
 #[test]
 fn rewriting_a_file_with_identical_bytes_invalidates_nothing() {
     let dir = corpus();
     agree(dir.path(), "cold");
-    assert!(skipped(&agree(dir.path(), "warm"), "leaf.ply"));
+    let before = snapshot(&agree(dir.path(), "warm"));
 
     let text = fs::read_to_string(dir.path().join("leaf.ply")).unwrap();
     fs::write(dir.path().join("leaf.ply"), text).unwrap();
-    let after = agree(dir.path(), "rewritten with identical bytes");
-    let leaf = after
-        .frontend
-        .files
-        .iter()
-        .find(|f| f.path.ends_with("leaf.ply"))
-        .unwrap();
-    assert!(
-        !leaf.parsed,
-        "mtime moved and nothing else: {}",
-        leaf.refusal.describe()
+    assert_eq!(
+        before,
+        snapshot(&agree(dir.path(), "rewritten with identical bytes"))
     );
 }
 
-/// Gate 1 is conservative about bytes and gate 2 is exact about hashes, so a comment costs a parse
-/// and no inference at all.
+/// A comment moves the bytes and no hash.
 #[test]
-fn a_comment_costs_a_parse_and_no_recheck_anywhere() {
+fn a_comment_moves_no_hash_anywhere() {
     let dir = corpus();
-    agree(dir.path(), "cold");
+    let before = snapshot(&agree(dir.path(), "cold"));
     write(dir.path(), "leaf.ply", &format!("// a note\n{LEAF}"));
-    let after = agree(dir.path(), "a comment was added");
-    let leaf = after
-        .frontend
-        .files
-        .iter()
-        .find(|f| f.path.ends_with("leaf.ply"))
-        .unwrap();
-    assert!(leaf.parsed);
-    assert!(
-        !leaf.rechecked,
-        "no hash moved, so nothing may be re-inferred"
-    );
+    assert_eq!(before, snapshot(&agree(dir.path(), "a comment was added")));
 }
 
 #[test]
@@ -823,22 +788,43 @@ fn a_relative_and_an_absolute_path_share_one_cache() {
     ply(dir.path()).args(["check"]).output().unwrap();
 
     let out = ply(dir.path())
-        .args(["check", "--explain"])
+        .args(["check"])
         .arg(dir.path())
         .output()
         .unwrap();
-    let text = String::from_utf8(out.stdout).unwrap();
-    assert!(
-        text.contains("skipped"),
-        "an absolute path must find the cache a relative one wrote:\n{text}"
-    );
+    assert_eq!(out.status.code(), Some(0));
+    // One cache, written under the project root either way — an absolute path must not open a
+    // second one somewhere else under the tree.
+    let caches: Vec<_> = walkdir(dir.path())
+        .into_iter()
+        .filter(|p| p.ends_with(".ply-cache"))
+        .collect();
+    assert_eq!(caches.len(), 1, "{caches:?}");
 }
 
-/// `HashOutput` carries the reference graph as well as the hashes, and a skipped file contributes
-/// nothing to either map — its fingerprint records what it depends on but not what depends on it,
-/// and the restore path never rebuilds them.
+/// Every directory under `root`, so a second cache anywhere below it is visible.
+fn walkdir(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.push(path.clone());
+                stack.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// `HashOutput` carries the reference graph as well as the hashes, and a run with a warm cache
+/// behind it must publish the same graph a from-scratch one does.
 #[test]
-fn a_skipped_file_still_contributes_its_reference_graph() {
+fn every_file_contributes_its_reference_graph() {
     let dir = tempfile::tempdir().unwrap();
     write(
         dir.path(),
@@ -852,25 +838,10 @@ fn a_skipped_file_still_contributes_its_reference_graph() {
 
     let mut store = Store::open(dir.path()).unwrap();
     let warm = driver::load_incremental(dir.path(), &mut store).unwrap();
-    assert!(
-        skipped(&warm, "a.ply"),
-        "the fixture is only interesting while the file skips"
-    );
     let full = driver::load_full(dir.path()).unwrap();
 
     assert_eq!(warm.hashes.deps, full.hashes.deps);
     assert_eq!(warm.hashes.closure, full.hashes.closure);
-}
-
-/// What gate 2 could not restore, by qualified name.
-fn rechecked(loaded: &Loaded) -> BTreeSet<String> {
-    loaded
-        .frontend
-        .defs
-        .iter()
-        .filter(|d| !d.cached)
-        .map(|d| d.name.to_string())
-        .collect()
 }
 
 /// `base` performs from the start, so `log` is already in every caller's witness: an edit below
@@ -894,17 +865,14 @@ fn chain_lib(base: &str) -> String {
     )
 }
 
-/// A failed wave gives up what the blamed file calls, so a diagnostic it reports is one a
-/// from-scratch check reports too.
+/// An edit that moves a row underneath a caller edited in the same run.
 ///
-/// The fixture is the only shape that can tell the two apart. `base`'s row moves, so `mid`'s
-/// footprint moves while `mid`'s own text does not -- which is exactly a definition gate 2 restores
-/// with an interface that is no longer true. `top` is edited as well, so it is checked in the same
-/// wave, against that stale footprint, and its declared row makes the difference visible: it
-/// permits where `mid` now performs, so a stale `mid` puts it in breach and a fresh one does not.
-/// Give up nothing on the failure and the run reports `E0302` for a program that checks.
+/// `base`'s row moves, so `mid`'s footprint moves while `mid`'s own text does not, and `top` is
+/// edited beside it. `top`'s declared row is what makes the difference visible: it permits where
+/// `mid` now performs, so an answer computed against a stale `mid` puts it in breach and reports
+/// `E0302` for a program that checks.
 #[test]
-fn a_failing_wave_reports_what_a_from_scratch_check_reports() {
+fn a_row_that_moves_under_a_caller_agrees() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "lib.ply", &chain_lib(r#"log.note[a]("n") + n"#));
     write(
@@ -920,37 +888,14 @@ fn a_failing_wave_reports_what_a_from_scratch_check_reports() {
         "top.ply",
         "import lib\npub fn top(n: Int) -> Int / {lib::log.write[b]} = lib::mid(n) + 2\n",
     );
-    let after = agree(
+    agree(
         dir.path(),
         "the row moved under a caller checked in the same wave",
     );
-    assert!(
-        rechecked(&after).contains("lib.mid"),
-        "`mid` is what `top` was checked against, so the failure has to give it up: {:?}",
-        rechecked(&after)
-    );
 }
 
-/// The cutoff: a callee's body is not part of what a caller is checked against, so re-implementing
-/// one re-infers nothing above it.
-#[test]
-fn a_body_edit_that_leaves_the_interface_standing_stops_at_the_definition() {
-    let dir = chain(r#"log.note[a]("n") + n"#);
-    let cold = agree(dir.path(), "cold");
-    assert!(rechecked(&cold).contains("top.top"));
-
-    write(dir.path(), "lib.ply", &chain_lib(r#"log.note[a]("m") + n"#));
-    let after = agree(dir.path(), "one body edited");
-
-    assert_eq!(
-        rechecked(&after),
-        BTreeSet::from(["lib.base".to_string()]),
-        "only the edited definition's own text moved"
-    );
-}
-
-/// The other half, and the one an over-eager cutoff fails: a row is inferred, so a body that moves
-/// what it performs publishes something new and every caller has to be told.
+/// A row is inferred, so a body that moves what it performs publishes something new and every
+/// caller's own row has to move with it.
 #[test]
 fn a_body_edit_that_moves_the_published_row_still_reaches_every_caller() {
     let dir = chain(r#"log.note[a]("n") + n"#);
@@ -959,13 +904,6 @@ fn a_body_edit_that_moves_the_published_row_still_reaches_every_caller() {
     write(dir.path(), "lib.ply", &chain_lib(r#"log.note[b]("n") + n"#));
     let after = agree(dir.path(), "the edited body performs elsewhere");
 
-    let names = rechecked(&after);
-    for name in ["lib.base", "lib.mid", "top.top"] {
-        assert!(
-            names.contains(name),
-            "`{name}` is checked against a row that moved, so it may not be restored: {names:?}"
-        );
-    }
     assert_eq!(
         after.check.defs[&Symbol::new("top.top")]
             .footprint
