@@ -321,7 +321,7 @@ impl<'p, 'x> Run<'p, 'x> {
             }
 
             NodeKind::Binary { op, lhs, rhs } => {
-                use ply_syntax::ast::BinOp;
+                use ply_ty::BinOp;
                 if matches!(op, BinOp::And | BinOp::Or) {
                     let l = self.eval(lhs, window, module, calls)?;
                     let lb = l

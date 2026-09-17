@@ -16,8 +16,9 @@ use ply_eval::code::{Arm, Captures, Pat, Stmt};
 use ply_eval::rc::Own;
 use ply_eval::{Builtin, Code, NodeKind, Value};
 use ply_span::{Span, Symbol};
-use ply_syntax::ast::{BinOp, IntTy, Lit, QName, UnOp};
+use ply_syntax::ast::QName;
 use ply_syntax::resolve::Namespace;
+use ply_ty::{BinOp, IntTy, Lit, UnOp};
 
 /// What every compiled function does before its body: spends one unit of the machine's nesting
 /// budget, and refuses when the native stack is nearly out, because a C frame is not a machine

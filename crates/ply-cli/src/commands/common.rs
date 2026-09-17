@@ -59,7 +59,6 @@ pub fn engine_of(spec: Option<&ply_eval::BackendSpec>) -> ply_test::Engine {
         return ply_test::Engine::Evaluator;
     };
     let (name, variant) = match spec.kind {
-        ply_eval::BackendKind::Reference => ("reference", ""),
         ply_eval::BackendKind::C => ("c", ply_codegen::backend::registry_width()),
     };
     ply_test::Engine::of_backend(name, variant, spec)
@@ -147,7 +146,6 @@ pub fn build_backend(
 ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
     ply_codegen::c::producer::ensure_default();
     match spec.kind {
-        ply_eval::BackendKind::Reference => Ok(ply_eval::Fragment::over(program, resolved, check)),
         ply_eval::BackendKind::C => {
             ply_codegen::Unit::over_with_texts(program, resolved, check, texts)
                 .map(|unit| unit as &'static dyn ply_eval::Provider)
@@ -161,7 +159,6 @@ pub fn build_backend(
                      refused rather than reported green over a seam nothing reached",
                     )
                     .note("this tier shells out to `cc`; `PLY_CC` names another compiler")
-                    .note("`--backend reference` needs no code generator and runs anywhere")
                 })
         }
     }

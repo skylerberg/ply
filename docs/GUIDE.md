@@ -1765,22 +1765,7 @@ and the replay command.
 
 `--backend` attaches a compiled backend (§17).
 
-The flag takes a value. `reference` is a nested machine over the same fragment,
-which is what the seam is checked against rather than a way to go faster.
-`interp` is the interpreted front end (ADR 0047): it walks the same lowered
-code the `c` tier compiles, over the same runtime, with no C compiler in the
-path, and answers what the machine answers on every body it reaches. It
-carries the first-order language, `with_cell`, and a `handle`/`perform` whose
-clauses are tail-resumptive (the common case), recording each performed atom
-so its footprint matches; it declines — for the machine to run — a clause that
-binds `resume`, `simulate` and a region's tasks, whose continuations live on
-the tier's stacks and are its next increment. `combined` is the two front
-ends together: it interprets what `interp` carries and compiles — through
-`c` — what `interp` declines, so between them they answer every body with no
-machine, which is what makes the machine deletable; `PLY_COMBINED_AUDIT=1` runs a body
-both ways and fails on any disagreement, the oracle that replaces pairing
-against the machine once the machine is gone. `c` is the code
-generator: it emits the fragment as C,
+`c`, the one value the flag takes, is the code generator: it emits the fragment as C,
 hands it to `cc`, and loads the result. Its bodies carry symbols, so a sampling
 profiler and a disassembler can both read what a definition became.
 `PLY_C_KEEP=1` leaves the `.c` and the shared object behind for that;
@@ -3109,7 +3094,7 @@ is `E0127` with exit code 2 (§6.7).
 | `--bisect auto\|always\|never` | attribute a failure to the change that caused it |
 | `--bisect-budget N` | hybrid programs a bisection may evaluate (default 64) |
 | `--trace auto\|always\|never` | record which definitions a failing test entered |
-| `--backend BACKEND` | attach a compiled backend: `reference`, `interp`, `c` or `combined` (§9.7), or `<backend>:wrong:<mutation>` to corrupt it on purpose |
+| `--backend BACKEND` | the code generator, `c` (§9.7), or `c:wrong:<mutation>` to corrupt it on purpose |
 | `--profile PROFILE` | which toolchain the C tier compiles with: `development` (the default — the fastest compiler on the machine, inlining off) or `release` (`cc -O2`, inlining on). Requires `--backend`; the two profiles are required to answer identically, so this decides what a run costs and not what it means |
 | `--host` | bind the real host handlers |
 | `--std` | also select the tests the shipped modules declare |
