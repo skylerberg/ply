@@ -637,6 +637,32 @@ spends 10.0 s in the port where the chain it replaces spends 0.093 s. Two
 quadratics have been found and removed, and what remains is a hundredfold gap
 rather than a fixed one.
 
+**Read, 2026-09-17: the third scan, in the hasher.** A profile taken at two
+project sizes is what found it, after a single-size profile localised nothing
+and reading the source guessed wrong twice. Between 250 and 4,000 definitions
+the allocator's share *falls*, 11.1% to 8.8%, while three of the hasher's own
+bodies appear from nowhere and the list primitives climb with them,
+`rt_list_lookup` to 4.1% and `list::get` from 1.6% to 3.5%. `record` searched
+the accumulated dependency list and the accumulated closure list for the name
+it was recording, and `assemble` calls it once per definition, test and law.
+
+The lists stay, because `dump_hashes` maps over both in order and that order is
+the specification; what is added is where each name sits in them, carried in
+`assemble`'s own accumulator rather than in the public `HashOutput`. The hash
+golden not moving is the proof that neither which entry wins nor where it lands
+changed.
+
+The criterion, set before the reading, was the hasher's own growth: its last
+doubling falls from 2.31 to 1.77, below linear, and the whole front end's from
+2.16 to 1.75.
+
+**Ratios, not clocks, because the machine moved.** The resolver's entry is
+untouched by this change and reads about 30% higher at every size than in the
+run before it, which makes it an accidental control and means absolute figures
+from different runs are not comparable. A uniformly slower machine scales
+everything, so the doubling ratios survive it and the wall clocks do not. That
+is why the criterion was a ratio.
+
 The lesson for the instrument is worth keeping: a flat profile is evidence
 about where time goes, not about whether an algorithm is quadratic, and
 this one was taken at a single size over a single program, which is the
