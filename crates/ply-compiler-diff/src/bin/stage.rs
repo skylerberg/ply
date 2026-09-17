@@ -55,14 +55,23 @@ fn main() {
         refused::<()>(expanded);
     }
     let resolved = ply_syntax::resolve::resolve(&mut ast).unwrap_or_else(refused);
-    let check = ply_core::check_program(&ast, &resolved).unwrap_or_else(refused);
     let program: &'static ply_syntax::ast::Program = Box::leak(Box::new(ast));
     let resolved = Box::leak(Box::new(resolved));
-    let check = Box::leak(Box::new(check));
-    let hashes = ply_hash::hash_program(program, resolved, check).unwrap_or_else(refused);
-    let front = Box::leak(Box::new(ply_codegen::front_of(
-        program, resolved, check, hashes, None,
-    )));
+    // The port's answer over these very texts (ADR 0052 §1), rather than a second front end
+    // assembled from the chain. This binary installed the emitter above, and the ids run in the
+    // order the `SourceMap` assigned them, which is the order the protocol reads a span's module
+    // as a position in.
+    let ids: Vec<ply_span::SourceId> = (0..modules.len())
+        .map(|i| ply_span::SourceId(i as u32))
+        .collect();
+    let front = Box::leak(Box::new(
+        ply_codegen::c::producer::front(&modules, &ids).unwrap_or_else(|e| {
+            fail(&format!(
+                "the port could not answer for {}: {e:#}",
+                dir.display()
+            ))
+        }),
+    ));
     let keys = ply_codegen::emit_keys(front);
     let source: &'static ply_codegen::Source = Box::leak(Box::new(
         ply_codegen::Source::from_front(program, resolved, front, keys).with_texts(texts),
