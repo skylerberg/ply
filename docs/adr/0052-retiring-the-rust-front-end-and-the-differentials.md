@@ -688,6 +688,42 @@ front-end one: either this record widens to take the heap on, or the switch
 waits for the record that does. That is a decision about scope, so it is put
 here rather than taken here.
 
+**Read, 2026-09-17: what one edit to `emit.ply` costs, before and after.** Two
+edits, because one would answer half the question. The leaf is a string in
+`emit.covers()`, which nothing in the tree calls, so it propagates nowhere. The
+hub is the refusal message in `emit.expr`, which has forty-nine call sites. Both
+are message text, so neither can change a byte of emitted C. Over the compiler's
+own 187 tests, on a runner, from the tool's own output:
+
+| | warm, nothing changed | the leaf edit | the hub edit |
+| --- | --- | --- | --- |
+| the Rust chain and its gates | 343 ms | 1,001 ms | 20,675 ms |
+| the port as the front end | 17,197 ms | 17,291 ms | 38,377 ms |
+| tests re-run | 0 | 0 | 2 |
+
+**Selection is identical on both sides.** An edit that reaches nothing re-runs
+nothing; an edit at the emitter's centre re-runs exactly the two tests that
+depend on it. ADR 0042's promise that `ply test` re-runs only what an edit
+touched holds, and the switch neither improves nor harms it.
+
+**What the switch moves is the floor, not the slope.** Asking an unchanged
+project whether it is still good costs fifty times more. The marginal cost of
+an edit that propagates nowhere is seven times *less*, 94 ms against 658, for
+the reason the floor is high: everything is checked every run, so one more
+changed definition is nearly free. And an edit that propagates everywhere costs
+the same either way, 21.2 s against 20.3, because that cost is re-emitting what
+depends on it and both sides pay it alike.
+
+So §4's loop is not what the switch is waiting on. The loop works. The floor is
+the constant factor §1 has run out of front-end ways to lower, which is the same
+conclusion the curve reached from the other direction.
+
+**One half of this is missing and is not going to be taken here.** The record
+asked for the cost locally as well as in CI. Running the compiler's own suite is
+exactly the heavy local load this machine is not to be given, so these are
+runner figures only, and the record says which half it has rather than passing
+one off as both.
+
 The lesson for the instrument is worth keeping: a flat profile is evidence
 about where time goes, not about whether an algorithm is quadratic, and
 this one was taken at a single size over a single program, which is the
