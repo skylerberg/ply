@@ -9,9 +9,7 @@
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
 
 use ply_compiler_diff::part;
-use ply_compiler_diff::{
-    golden, port, programs, records, reference_check_dump, reference_check_dump_known,
-};
+use ply_compiler_diff::{golden, port, programs, records};
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
@@ -93,33 +91,22 @@ fn examples() -> Vec<(String, String)> {
 
 /// Runs `inputs` through both sides and reports every disagreement.
 fn compare(label: &str, inputs: &[(String, Vec<(String, String)>)]) {
-    compare_through("infer.check_dump", reference_check_dump, label, inputs);
+    compare_through("infer.check_dump", label, inputs);
 }
 
 /// The same, through the restored path: each program checked from what its own first check
 /// published.
 fn compare_known(label: &str, inputs: &[(String, Vec<(String, String)>)]) {
-    compare_through(
-        "infer.check_dump_known",
-        reference_check_dump_known,
-        label,
-        inputs,
-    );
+    compare_through("infer.check_dump_known", label, inputs);
 }
 
-fn compare_through(
-    entry: &str,
-    reference_dump: fn(&[(String, String)]) -> String,
-    label: &str,
-    inputs: &[(String, Vec<(String, String)>)],
-) {
+fn compare_through(entry: &str, label: &str, inputs: &[(String, Vec<(String, String)>)]) {
     let mut failures: Vec<String> = Vec::new();
     let mut records_total = 0usize;
     for (name, program) in inputs {
         let actual = port::dump_program(entry, program);
-        let reference = reference_dump(program);
-        records_total += records(&reference).len();
-        if let Err(report) = golden::check(entry, name, &reference, &actual, first_difference) {
+        records_total += records(&actual).len();
+        if let Err(report) = golden::check(entry, name, &actual, first_difference) {
             failures.push(format!("{label}: {report}"));
         }
     }

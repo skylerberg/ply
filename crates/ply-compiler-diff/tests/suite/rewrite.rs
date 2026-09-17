@@ -5,7 +5,7 @@
 //! The port is entered in-process through `port`: the bundle the binary carries is the compiler
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
 
-use ply_compiler_diff::{bundle, golden, port, records, reference_dump_expanded};
+use ply_compiler_diff::{bundle, golden, port, records};
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
@@ -63,9 +63,8 @@ fn compare(label: &str, inputs: &[(String, Vec<u8>)]) {
     let mut total = 0usize;
     for (name, text) in inputs {
         let actual = port::dump("rewrite.dump_expanded", text);
-        let reference = reference_dump_expanded(&String::from_utf8_lossy(text));
-        total += records(&reference).len();
-        if let Err(report) = golden::check("rewrite", name, &reference, &actual, first_difference) {
+        total += records(&actual).len();
+        if let Err(report) = golden::check("rewrite", name, &actual, first_difference) {
             failures.push(format!("{label}: {report}"));
         }
     }
