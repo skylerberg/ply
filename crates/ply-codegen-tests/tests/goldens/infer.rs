@@ -8,8 +8,8 @@
 //! The port is entered in-process through `port`: the bundle the binary carries is the compiler
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
 
-use ply_compiler_diff::part;
-use ply_compiler_diff::{golden, port, programs, records};
+use crate::harness::part;
+use crate::harness::{golden, port, programs, records};
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
@@ -216,7 +216,7 @@ fn the_ply_checker_restored_from_its_own_interfaces_agrees_with_ply_core_on_the_
     }
     let text = std::fs::read_to_string(here().join("fixtures/reference-checks.corpus"))
         .expect("the mined checker inputs; run mine-checks.py");
-    for (i, f) in ply_compiler_diff::bundle(&text).into_iter().enumerate() {
+    for (i, f) in crate::harness::bundle(&text).into_iter().enumerate() {
         inputs.push((
             format!("reference-checks.corpus#{i}"),
             vec![("m".to_string(), f)],
@@ -249,7 +249,7 @@ fn the_ply_checker_agrees_with_ply_core_on_the_checkers_hand_written_programs() 
 fn the_ply_checker_agrees_with_ply_core_on_the_references_own_inputs() {
     let text = std::fs::read_to_string(here().join("fixtures/reference-checks.corpus"))
         .expect("the mined checker inputs; run mine-checks.py");
-    let inputs: Vec<(String, Vec<(String, String)>)> = ply_compiler_diff::bundle(&text)
+    let inputs: Vec<(String, Vec<(String, String)>)> = crate::harness::bundle(&text)
         .into_iter()
         .enumerate()
         .map(|(i, f)| {

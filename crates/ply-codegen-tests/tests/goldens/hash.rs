@@ -5,8 +5,8 @@
 //! The port is entered in-process through `port`: the bundle the binary carries is the compiler
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
 
-use ply_compiler_diff::part;
-use ply_compiler_diff::{golden, port, programs, records};
+use crate::harness::part;
+use crate::harness::{golden, port, programs, records};
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
@@ -126,7 +126,7 @@ fn the_ply_hasher_agrees_with_ply_hash_on_every_example_with_the_standard_librar
     // program as it is hashed once per program (ADR 0051 §2).
     let lines: usize = std_modules().iter().map(|(_, t)| t.lines().count()).sum();
     if let Err(report) =
-        ply_compiler_diff::census::hold("hasher-over-std-and-examples-part-1", lines)
+        crate::harness::census::hold("hasher-over-std-and-examples-part-1", lines)
     {
         panic!("{report}");
     }
@@ -157,7 +157,7 @@ fn the_ply_hasher_agrees_with_ply_hash_on_the_bundles() {
         let Ok(text) = std::fs::read_to_string(here().join(file)) else {
             continue;
         };
-        for (i, f) in ply_compiler_diff::bundle(&text).into_iter().enumerate() {
+        for (i, f) in crate::harness::bundle(&text).into_iter().enumerate() {
             inputs.push((format!("{label}.corpus#{i}"), vec![(module.to_string(), f)]));
         }
     }
