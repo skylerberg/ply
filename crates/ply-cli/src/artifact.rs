@@ -3,7 +3,7 @@
 
 use crate::load::Loaded;
 use ply_core::{CheckOutput, DefInfo};
-use ply_hash::body::{BodySet, Namespace, StoredBody, reconstruct_named};
+use ply_hash::body::StoredBody;
 use ply_hash::{DefHash, HashOutput, hash_program_with_bodies};
 use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
 use ply_syntax::ast::{ModuleName, Program};
@@ -232,7 +232,6 @@ pub fn build(
     loaded: &Loaded,
     entry: &DefInfo,
     startup: &[&DefInfo],
-    sources: bool,
 ) -> Result<Built, Vec<Diagnostic>> {
     // The front end's whole answer over the program: the hashes the artifact is keyed by and the
     // bodies it carries. The load already obtained it from the port, so a build asks nothing
@@ -310,9 +309,7 @@ pub fn build(
     out.names.sort();
     out.names.dedup();
 
-    if sources {
-        out.sources = embedded_sources(loaded);
-    }
+    out.sources = embedded_sources(loaded);
     let names: Vec<&str> = out.names.iter().map(|(n, _)| n.as_str()).collect();
     let (unit, warnings) = embedded_unit(loaded, &names);
     out.unit = unit;
@@ -326,7 +323,6 @@ pub fn build(
     })
 }
 
-/// Every project file, keyed by its path relative to the project root.
 /// The whole unit over the artifact's definitions, produced by the Ply emitter and embedded so
 /// that `ply run` enters the program as it was built rather than rebuilding what it can from
 /// bodies alone, which costs an emit and a C compile at every run. A production that fails leaves
@@ -394,6 +390,7 @@ fn stale_unit() -> Diagnostic {
     .note("rebuild the artifact with this `ply` to carry a unit it can enter")
 }
 
+/// Every project file, keyed by its path relative to the project root.
 fn embedded_sources(loaded: &Loaded) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for file in loaded.sources.files() {
@@ -722,53 +719,22 @@ pub struct Opened {
     pub check: CheckOutput,
     /// The name the entry point answers to *in this program*.
     pub entry: Symbol,
-    /// Whether spans point into real text.
-    pub located: bool,
 }
 
-/// Turns an artifact into something runnable.
+/// Turns an artifact into something runnable. An artifact carries its sources and they are the
+/// only thing it is opened from: the path that rebuilt a program from the stored bodies alone is
+/// the case ADR 0052 §2 removes rather than keeps working.
 pub fn open(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnostic>> {
-    if artifact.has_sources() {
-        return open_sources(artifact, path);
-    }
-    let mut set = BodySet::default();
-    for (hash, body) in &artifact.bodies {
-        set.insert(*hash, body.clone());
-    }
-    let mut namespace = Namespace::new();
-    for (name, hash) in &artifact.names {
-        namespace.entry(*hash).or_insert_with(|| Symbol::new(name));
-    }
-    // `reconstruct_named` is where the reference closure is checked: a body naming a hash the
-    // artifact does not hold has no name the program could give it.
-    let mut rebuilt = reconstruct_named(&set, &namespace).map_err(|diags| {
-        vec![
-            invalid(
+    if !artifact.has_sources() {
+        return Err(vec![
+            version(
                 path,
-                "the artifact's definitions do not form a whole program",
+                "the artifact carries no source text, and a program is opened from its sources",
             )
-            .note(first_note(&diags)),
-        ]
-    })?;
-    // Mutable because `resolve` also fills defaults.
-    let resolved = ply_syntax::resolve(&mut rebuilt.program).map_err(|diags| {
-        vec![invalid(path, "the artifact's definitions do not resolve").note(first_note(&diags))]
-    })?;
-    let check = ply_core::check_program(&rebuilt.program, &resolved).map_err(|diags| {
-        vec![invalid(path, "the artifact's definitions do not typecheck").note(first_note(&diags))]
-    })?;
-    let entry = rebuilt
-        .name_of(artifact.entry)
-        .cloned()
-        .ok_or_else(|| vec![invalid(path, "the artifact's entry point was not rebuilt")])?;
-    Ok(Opened {
-        sources: SourceMap::new(),
-        program: rebuilt.program,
-        resolved,
-        check,
-        entry,
-        located: false,
-    })
+            .note("an artifact written before sources were carried has none to open"),
+        ]);
+    }
+    open_sources(artifact, path)
 }
 
 fn open_sources(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnostic>> {
@@ -864,7 +830,6 @@ fn open_sources(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnost
         resolved,
         check,
         entry,
-        located: true,
     })
 }
 
@@ -874,13 +839,6 @@ fn parse(inputs: &[(ply_span::SourceId, ModuleName, String)]) -> Result<Program,
             .iter()
             .map(|(id, name, text)| (*id, name.clone(), text.as_str())),
     )
-}
-
-fn first_note(diags: &[Diagnostic]) -> String {
-    diags
-        .first()
-        .map(|d| d.message.clone())
-        .unwrap_or_else(|| "no reason was given".to_string())
 }
 
 // --- the difference between two artifacts ------------------------------------
@@ -1050,14 +1008,9 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         println!(
             "{IND}{}",
             style.dim(&format!(
-                "program {} · {} definitions · {} · {}",
+                "program {} · {} definitions · {}",
                 artifact.digest_short(),
                 artifact.bodies.len(),
-                if opened.located {
-                    "sources embedded"
-                } else {
-                    "no sources: failures carry no line number"
-                },
                 if unit.is_some() {
                     "compiled unit embedded"
                 } else {
@@ -1126,7 +1079,6 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
                     "digest": artifact.digest_short(),
                     "entry": artifact.entry_name(),
                     "definitions": artifact.bodies.len(),
-                    "located": opened.located,
                     "binding": hosts.label(),
                     "hosts": hosts.summary_json(),
                     "value": rendered,
@@ -1156,7 +1108,6 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
                     "artifact": args.path.display().to_string(),
                     "digest": artifact.digest_short(),
                     "entry": artifact.entry_name(),
-                    "located": opened.located,
                     "binding": hosts.label(),
                     "configuration": hosts.configuration().to_json(),
                     "value": serde_json::Value::Null,
@@ -1212,8 +1163,8 @@ fn evaluate(
         configure(&mut machine);
         return machine.call(name, Vec::new(), span);
     }
-    // Without a unit, a decoded artifact is an AST with no source text, and the whole Ply emitter
-    // is a front end that reads text: it is handed the program printed back to source.
+    // Without a unit, the whole Ply emitter is a front end that reads text, and it is handed the
+    // program printed back to source rather than the artifact's own files.
     let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.check);
     if let Some(spec) = crate::commands::common::backend_spec(backend)? {
         // No hashes here, so nothing is kept between runs: an artefact is opened once and the
@@ -1236,8 +1187,8 @@ fn evaluate(
 
 // --- diagnostics -------------------------------------------------------------
 
-/// An artifact has no source text, so there is no span to point at and inventing one would send a
-/// reader to a file that has nothing to do with the failure.
+/// A container failure is about the file rather than a point in the program, so it carries no
+/// span: inventing one would send a reader to a definition that has nothing to do with it.
 fn invalid(path: &Path, message: impl Into<String>) -> Diagnostic {
     Diagnostic::error(codes::ARTIFACT_INVALID, message.into())
         .primary(Span::DUMMY, format!("in `{}`", path.display()))

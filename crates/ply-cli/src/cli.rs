@@ -673,11 +673,6 @@ pub struct BuildArgs {
     #[arg(long = "db-schema", value_name = "MODULE.FN")]
     pub db_schema: Option<String>,
 
-    /// Embed the project's source text, so a diagnostic raised in production
-    /// carries a line number.
-    #[arg(long)]
-    pub sources: bool,
-
     /// Print `b3:...` and nothing else: the one line a deployment pins. Writes
     /// no file.
     #[arg(long, conflicts_with_all = ["json", "diff", "output"])]
