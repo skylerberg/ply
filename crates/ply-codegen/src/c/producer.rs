@@ -34,6 +34,10 @@ thread_local! {
     static MINE: RefCell<Option<Result<PlyProducer, String>>> = const { RefCell::new(None) };
     static BUILDING: Cell<bool> = const { Cell::new(false) };
     static REFERENCE_ONLY: Cell<bool> = const { Cell::new(false) };
+    /// A producer handed over for the duration of a call, with the identity the caches must key
+    /// its bodies under. This is how one emitter emits another's sources: the thread-locals above
+    /// carry one emitter per run, and a nested ask would otherwise fall back to the reference.
+    static HANDED: RefCell<Option<(PlyProducer, String)>> = const { RefCell::new(None) };
 }
 
 /// Installs the recipe every thread's producer is built from. The first installation wins; a
@@ -125,46 +129,60 @@ fn modules_of(src: &Sources) -> Vec<(String, String)> {
     modules
 }
 
-/// Build the emitter as a producer: the native emitter from the bootstrap bundle, which reads none
-/// of its sources -- or, when these sources have no bundle or it does not serve, parsed and
-/// checked and emitted by the reference emitter, which is how a bundle is refreshed.
+/// Build the emitter as a producer: the native emitter from these sources' own bundle, which
+/// reads none of them -- or, when they have no bundle or it does not serve, emitted by the
+/// **committed** emitter this binary carries, handed over for the build. A working copy is the
+/// ordinary case: `PLY_C_EMITTER=ply:<dir>` names one before a bundle is bootstrapped for it, and
+/// what stands it up is the emitter already in hand, not the Rust chain (ADR 0052 §2).
 fn build_from(src: &Sources) -> Result<PlyProducer, String> {
-    let bundle = super::bundle::of(src);
-    let from_reference = || -> Result<(super::Native, Vec<super::Refused>), String> {
-        let source = front_end(src)?;
-        let names: Vec<String> = source.functions();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        super::build(source, &refs).map_err(|e| format!("{e:#}"))
+    let from_committed = || -> Result<(super::Native, Vec<super::Refused>), String> {
+        let carried = super::bundle::of(&Sources::Embedded)
+            .ok_or_else(|| "this binary carries no bootstrap bundle".to_string())?;
+        let (native, _) = super::bundle::build(&carried).map_err(|e| {
+            format!(
+                "the committed bundle does not serve this runtime either: {e:#}. Refresh it with \
+                 `PLY_C_BOOTSTRAP_REFRESH=1 cargo nextest run -p ply-codegen-tests --test bootstrap`"
+            )
+        })?;
+        let first = PlyProducer::new(native).map_err(|e| format!("{e:#}"))?;
+        let identity = digest_of(&modules_of(&Sources::Embedded));
+        with_producer(first, identity, || {
+            let source = front_end(src)?;
+            let names: Vec<String> = source.functions();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            super::build(source, &refs).map_err(|e| format!("{e:#}"))
+        })
     };
-    let (native, _refused) = match bundle {
+    let (native, _refused) = match super::bundle::of(src) {
         Some(bundle) => match super::bundle::build(&bundle) {
             Ok(built) => built,
-            // A bundle emitted against a helper table this runtime's does not start with is
-            // the one thing the reference still builds the emitter for, so a refresh can start.
             Err(e) if e.downcast_ref::<super::exports::Unserved>().is_some() => {
                 eprintln!(
-                    "the bootstrap bundle does not serve: {e:#}; the reference builds the emitter"
+                    "the bootstrap bundle does not serve: {e:#}; the committed emitter builds it"
                 );
-                from_reference()?
+                from_committed()?
             }
             Err(e) => return Err(format!("{e:#}")),
         },
-        None => from_reference()?,
+        None => from_committed()?,
     };
     PlyProducer::new(native).map_err(|e| format!("{e:#}"))
 }
 
 /// The emitter's own program through the front end, keyed as the cache keys it, with the modules
-/// as `SourceId(0..n)` in `modules_of`'s order.
+/// as `SourceId(0..n)` in `modules_of`'s order. The check and the hashes come from the emitter
+/// handed over by [`build_from`]: the port answers for the program it is about to become.
 fn front_end(src: &Sources) -> Result<&'static Source, String> {
-    let inputs: Vec<_> = modules_of(src)
-        .into_iter()
+    let modules = modules_of(src);
+    let ids: Vec<SourceId> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
+    let inputs: Vec<_> = modules
+        .iter()
         .enumerate()
         .map(|(i, (module, text))| {
-            let text: &'static str = Box::leak(text.into_boxed_str());
+            let text: &'static str = Box::leak(text.clone().into_boxed_str());
             (
                 SourceId(i as u32),
-                ply_syntax::ast::ModuleName::from_dotted(&module),
+                ply_syntax::ast::ModuleName::from_dotted(module),
                 text,
             )
         })
@@ -180,16 +198,14 @@ fn front_end(src: &Sources) -> Result<&'static Source, String> {
         return Err(first(expanded));
     }
     let resolved = ply_syntax::resolve::resolve(&mut ast).map_err(first)?;
-    let check = ply_core::check_program(&ast, &resolved).map_err(first)?;
     let program: &'static ply_syntax::ast::Program = Box::leak(Box::new(ast));
     let resolved = Box::leak(Box::new(resolved));
-    let check = Box::leak(Box::new(check));
-    // The Rust chain's answer, because this runs *while* the producer is being built: the port
-    // cannot answer for the program it is itself compiled from.
-    let hashes = ply_hash::hash_program(program, resolved, check).unwrap_or_default();
-    let front = Box::leak(Box::new(crate::source::front_of(
-        program, resolved, check, hashes, None,
-    )));
+    // The handed-over emitter's answer. This used to be the Rust chain's, on the argument that
+    // the port cannot answer for the program it is itself compiled from -- true of the emitter
+    // being built, and not of the one already in hand.
+    let front = Box::leak(Box::new(
+        front(&modules, &ids).map_err(|e| format!("{e:#}"))?,
+    ));
     let keys = crate::source::emit_keys(front);
     Ok(Box::leak(Box::new(Source::from_front(
         program, resolved, front, keys,
@@ -200,8 +216,10 @@ pub fn reset_thread() {
     MINE.with(|mine| *mine.borrow_mut() = None);
 }
 
-pub fn identity() -> &'static str {
-    IDENTITY.get().map_or("", String::as_str)
+pub fn identity() -> String {
+    HANDED
+        .with(|h| h.borrow().as_ref().map(|(_, id)| id.clone()))
+        .unwrap_or_else(|| IDENTITY.get().map_or(String::new(), String::clone))
 }
 
 /// The identity of an emitter given as its modules' sources, in any order.
@@ -231,6 +249,9 @@ pub fn installed() -> bool {
 /// `perform`, so body-by-body could only ever offer what the fragment already covered -- less
 /// than the fragment alone, since it added no body and could refuse one. The unit is the mode.
 pub fn mode() -> &'static str {
+    if HANDED.with(|h| h.borrow().is_some()) {
+        return "ply";
+    }
     if !installed() || BUILDING.with(Cell::get) || REFERENCE_ONLY.with(Cell::get) {
         "ref"
     } else {
@@ -253,6 +274,21 @@ pub fn reference_only<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Runs `f` with `p` as this thread's producer and `identity` as the digest its emissions key
+/// under, whatever is installed. `with_current` answers `p` and [`identity`] answers the string,
+/// so a body emitted here is filed under the emitter that emitted it rather than the one being
+/// built (ADR 0052 §2).
+pub fn with_producer<R>(p: PlyProducer, identity: String, f: impl FnOnce() -> R) -> R {
+    struct Guard(Option<(PlyProducer, String)>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HANDED.with(|h| *h.borrow_mut() = self.0.take());
+        }
+    }
+    let _guard = Guard(HANDED.with(|h| h.borrow_mut().replace((p, identity))));
+    f()
+}
+
 /// The mode with the emitter's identity, as the caches key on it.
 pub fn who() -> String {
     let mode = mode();
@@ -272,6 +308,11 @@ pub fn building() -> bool {
 }
 
 pub fn with_current<T>(f: impl FnOnce(&PlyProducer) -> T) -> Option<T> {
+    // An emitter handed over serves before anything else, and before the flags below: this is
+    // how one emitter emits another's sources, which a nested ask could not otherwise do.
+    if HANDED.with(|h| h.borrow().is_some()) {
+        return HANDED.with(|h| h.borrow().as_ref().map(|(p, _)| f(p)));
+    }
     let recipe = RECIPE.get()?;
     if BUILDING.with(Cell::get) || REFERENCE_ONLY.with(Cell::get) {
         return None;
