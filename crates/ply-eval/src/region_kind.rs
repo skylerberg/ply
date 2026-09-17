@@ -282,7 +282,7 @@ impl<'a> Analysis<'a> {
             resolved,
             definitions,
             locals: Vec::new(),
-            prelude_ctors: ply_core::prelude::ctor_arities()
+            prelude_ctors: ply_ty::prelude::ctor_arities()
                 .into_iter()
                 .map(|(name, _)| name)
                 .collect(),

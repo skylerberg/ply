@@ -6,11 +6,11 @@ use crate::{
     Binding, CaseReport, Counterexample, Discharge, Evidence, GEN_DEPTH, Gap, ProvePlan, Vacuity,
     VacuityKind,
 };
-use ply_core::prelude;
 use ply_eval::{Closure, ClosureKind, Decimal, Fixed, Value};
 use ply_hash::DefHash;
 use ply_span::{Diagnostic, Span, Symbol};
 use ply_syntax::ast::{Expr, ExprKind, Ident, QName};
+use ply_ty::prelude;
 use ply_ty::{BinOp, CtorInfo, IntTy, LawBinder, Row, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
