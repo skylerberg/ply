@@ -240,11 +240,14 @@ the clock.
 
 ## 2. Delete the Rust front end, its test crates and the differentials
 
-In the order the goldens allow: `ply-derive`; `ply-syntax`'s rewrites,
-resolver, parser, lexer and printer; `ply-core`; `ply-hash`; then
-`ply-eval`'s lowering with `opt.rs` and `c/emit.rs` last; with `ply-derive-tests`,
-`ply-syntax-tests`, `ply-core-tests`, `ply-hash-tests`,
-`ply-compiler-diff` and the `tools/mine-*.py` scripts. Before each
+In the order the goldens and the crates together allow: `ply-derive`;
+`ply-core`; `ply-hash`; `ply-syntax`'s rewrites, resolver, parser, lexer
+and printer; then `ply-eval`'s lowering with `opt.rs` and `c/emit.rs`
+last; with `ply-derive-tests`, `ply-syntax-tests`, `ply-core-tests`,
+`ply-hash-tests`, `ply-compiler-diff` and the `tools/mine-*.py` scripts.
+`ply-hash` goes ahead of `ply-syntax`, not after it: its normalizer, its
+body store and its graph all read the parser's syntax tree, so a deletion
+of `ply-syntax` first is not a deletion that can be carried out. Before each
 deletion its differential retires into what survives: `golden::check`
 drops its reference arm and holds the port to the golden alone; the
 digested goldens are re-blessed as text first, since a digest mismatch
@@ -276,6 +279,31 @@ fixpoint), and how a helper-table or object-layout change is carried across
 it: ADR 0050 §1a's prefix rule where a helper is appended, a bundle
 migration by textual transformation where it is not. ADR 0042 step 6 stands
 corrected in place by what this finds.
+
+**Read, 2026-09-17: what the four crates actually hold.** A survey of every
+non-test reference to them says where the cost is, and it is not where the
+names suggest. `ply-derive` is clean: every use outside it is
+`expand_program`, `expand_module` or the derivability table, all of it work
+the port takes over, and `ply-eval` declares the crate without a single
+file naming it. `ply-core` is nearly all vocabulary: nothing outside it
+reads `infer`, `env`, `unify`, `scc` or `derivable`, so the checker's
+internals have no external reader at all, and most of what is written
+`ply_core::` is `ply-ty` wearing the older name. Two real holdings remain
+there, `check_program` itself and `ply_core::prelude`, which six surviving
+crates read for constructor arities and the prelude effects and which
+imports nothing from the parser, so it can move to `ply-ty` whenever it
+suits. `ply-hash`'s consumers almost all want `DefHash`, another `ply-ty`
+re-export; `ply-store`'s body reconstruction and `ply test`'s bisection
+renormalizer are the only readers of hasher internals. `ply-syntax` is the
+hard one, and not for its parser: `resolve::Resolved` is threaded through
+the public signatures of six crates that survive, which makes it a
+front-end product rather than vocabulary or value model, and it is the
+reason that crate cannot leave in one move. Nothing in the workspace
+depends on `ply-compiler-diff`, so it leaves with its wiring — a nextest
+override, two of the four solo rows, `bless.yml`, and the profiler's
+default target — and the `tools/mine-*.py` scripts leave with it, run by
+nothing in the tree, three of the four writing to a directory that does
+not exist.
 
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
