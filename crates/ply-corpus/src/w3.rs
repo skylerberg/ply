@@ -302,6 +302,9 @@ pub struct Loaded {
     pub program: ply_syntax::ast::Program,
     pub resolved: ply_syntax::resolve::Resolved,
     pub check: CheckOutput,
+    /// The port's whole answer, so the tier is built from it rather than from a second front end
+    /// derived inside `over_with_texts` (ADR 0052 §2).
+    pub port: ply_core::Front,
     /// This program's region kinds, shared by every machine below rather than inferred once per
     /// machine.
     region_kinds: ply_eval::region_kind::Kinds,
@@ -343,12 +346,13 @@ impl Loaded {
         }
         let resolved = ply_syntax::resolve::resolve(&mut program)
             .map_err(|d| diagnostics("resolving the service", &d))?;
-        let check = crate::port_check(&ordered, &ids)
+        let port = crate::port_front(&ordered, &ids)
             .map_err(|e| anyhow::anyhow!("checking the service: {e}"))?;
         Ok(Loaded {
             program,
             resolved,
-            check,
+            check: port.check.clone(),
+            port,
             region_kinds: ply_eval::region_kind::Kinds::default(),
             texts,
             unit: std::sync::OnceLock::new(),
@@ -373,10 +377,10 @@ impl Loaded {
         let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
         machine.share_region_kinds(ply_eval::region_kind::Kinds::clone(&self.region_kinds));
         let unit = *self.unit.get_or_init(|| {
-            ply_codegen::Unit::over_with_texts(
+            ply_codegen::Unit::over_front(
                 &self.program,
                 &self.resolved,
-                &self.check,
+                &self.port,
                 self.texts.clone(),
             )
             .expect("this host has a C compiler")

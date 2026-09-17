@@ -330,6 +330,7 @@ fn once(root: &Path, backend: Option<&str>) -> Result<(Timings, Shape)> {
         resolved,
         check,
         hashes,
+        port,
         sources,
         mut timings,
         ..
@@ -387,7 +388,7 @@ fn once(root: &Path, backend: Option<&str>) -> Result<(Timings, Shape)> {
         _ => {
             ply_codegen::c::producer::ensure_default();
             let texts = ply_cli::commands::common::module_texts(&program, &sources);
-            let unit = ply_codegen::Unit::over_with_texts(&program, &resolved, &check, texts)
+            let unit = ply_codegen::Unit::over_front(&program, &resolved, &port, texts)
                 .map_err(|e| anyhow::anyhow!("building the default tier: {e:#}"))?;
             let executor = ply_test::InterpExecutor::new(&program, &resolved, &check)
                 .with_search(ply_test::Search::of(&selection))
