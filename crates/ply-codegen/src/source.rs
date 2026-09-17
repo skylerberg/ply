@@ -197,15 +197,16 @@ pub fn is_spec_root(name: &str) -> bool {
     name.contains(".law#") || local.contains("#requires#") || local.contains("#ensures#")
 }
 
-/// The front end's answer over `program`: the port's when it can serve one, the Rust chain's when
-/// it cannot.
+/// The front end's answer over `program`: the Rust chain's while it still runs, and the port's
+/// where it is asked for.
 ///
-/// The port *is* a front end — it reads text — so it answers whenever the caller holds every
-/// module's source and a producer is installed and not itself being built. What is left to the
-/// Rust chain is the reference's own build, `ply bootstrap`, which installs no producer, and a
-/// program rebuilt from an artifact's definitions, which has no text to hand over. The
-/// differentials hold the two answers to each other byte for byte, which is what lets a unit be
-/// built from either.
+/// The port *is* a front end — it reads text — so asking it is a second front end over the
+/// program and the standard library, for every unit. That is the suite's time rather than a
+/// rounding error: asking it everywhere took a quiet run of `main` from 144 s to 254 s. So the
+/// chain answers while it exists, `PLY_FRONT=port` asks the port instead, and one CI gate runs
+/// with it set so that path stays exercised end to end. The differentials hold the two answers
+/// to each other byte for byte, which is what lets a unit be built from either, and the port
+/// becomes the only answer when the chain goes (ADR 0052 §1).
 pub fn front_for(
     program: &Program,
     resolved: &Resolved,
@@ -220,7 +221,8 @@ pub fn front_for(
             texts.get(&name).map(|text| (name, text.clone()))
         })
         .collect();
-    if let Some(sources) = sources
+    if std::env::var("PLY_FRONT").as_deref() == Ok("port")
+        && let Some(sources) = sources
         && !sources.is_empty()
         && crate::c::producer::mode() != "ref"
     {
