@@ -1,5 +1,5 @@
 //! The third comparison: `rewrite.ply` — the effect-set, record-update and try-operator rewrites
-//! `Parser::run` applies after the grammar — against `ply_syntax::parse_recovering`, tree and
+//! `Parser::run` applies after the grammar — against a blessed golden, tree and
 //! diagnostics, over every input the parser differential reads.
 //!
 //! The port is entered in-process through `port`: the bundle the binary carries is the compiler
