@@ -1,12 +1,12 @@
 //! How `ply check --types` renders a signature, and the effect-set provenance `--explain` adds to
 //! it.
 
-use ply_core::print::Printer;
-use ply_core::ty::{EffectAtom, Footprint, Resource, Row, Scheme, Type};
-use ply_core::{CheckOutput, DefInfo};
 use ply_span::Symbol;
 use ply_syntax::ast::{AtomExpr, Item, ModuleName, Program, QName};
 use ply_syntax::resolve::{Namespace, Resolved};
+use ply_ty::print::Printer;
+use ply_ty::ty::{EffectAtom, Footprint, Resource, Row, Scheme, Type};
+use ply_ty::{CheckOutput, DefInfo};
 use std::collections::{BTreeSet, HashMap};
 
 /// The column a wrapped line may reach, counted from the left edge of the terminal — so every
@@ -341,7 +341,7 @@ fn effect_name(
         Ok(binding) if check.effects.contains_key(&binding.qualified) => {
             Some(binding.qualified.clone())
         }
-        _ if q.is_bare() && ply_core::prelude::is_prelude_effect(q.symbol()) => {
+        _ if q.is_bare() && ply_ty::prelude::is_prelude_effect(q.symbol()) => {
             Some(q.symbol().clone())
         }
         _ => None,

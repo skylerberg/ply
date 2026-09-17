@@ -8,11 +8,11 @@ use crate::hosts::Hosts;
 use crate::load::{Loaded, load};
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_DRAIN_INCOMPLETE, EXIT_FAILED, EXIT_OK};
-use ply_core::DefInfo;
-use ply_core::ty::Footprint;
 use ply_eval::{Machine, Plan, Value as PlyValue};
 use ply_host::signal::{self, Shutdown};
 use ply_span::{Diagnostic, SourceId, Span, codes};
+use ply_ty::DefInfo;
+use ply_ty::ty::Footprint;
 use serde_json::{Value, json};
 use std::sync::Arc;
 

@@ -1,6 +1,5 @@
 //! Which prover a run drives.
 
-use ply_core::{CheckOutput, LawBinder};
 use ply_eval::host::{HostBinding, HostRuntime};
 use ply_eval::{DEFAULT_MAX_CALLS, Machine, Seed, Value};
 use ply_prove::concurrency::{self, BodyRun, LawSearch, ValueDomain};
@@ -14,6 +13,7 @@ use ply_prove::{
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{Expr, ExprKind, FnDef, Item, LawDef, Program, SpecKind};
 use ply_syntax::resolve::Resolved;
+use ply_ty::{CheckOutput, LawBinder};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -502,8 +502,8 @@ impl<'a> Prover<'a> {
     }
 
     /// The values one binder is tried at, smallest and most literal first.
-    fn candidates(&self, ty: &ply_core::Type, literals: &Literals) -> Option<Vec<Value>> {
-        let ply_core::Type::Con(name, args) = ty else {
+    fn candidates(&self, ty: &ply_ty::Type, literals: &Literals) -> Option<Vec<Value>> {
+        let ply_ty::Type::Con(name, args) = ty else {
             return None;
         };
         if !args.is_empty() {
@@ -567,7 +567,7 @@ impl<'a> Prover<'a> {
     }
 
     /// The owner's footprint, when it is one no obligation can supply handlers for.
-    fn unhandled(&self, obligation: &Obligation) -> Option<ply_core::Footprint> {
+    fn unhandled(&self, obligation: &Obligation) -> Option<ply_ty::Footprint> {
         let ObligationKind::Ensures { .. } = obligation.kind else {
             return None;
         };
@@ -744,7 +744,7 @@ impl<'a> Prover<'a> {
         }
 
         let plan = plan.clone().normalized();
-        let types: Vec<ply_core::Type> = binders.iter().map(|b| b.ty.clone()).collect();
+        let types: Vec<ply_ty::Type> = binders.iter().map(|b| b.ty.clone()).collect();
         let mut generated = 0u32;
         for &root in &plan.roots {
             let mut stream = GenStream::new(root, obligation.key);
