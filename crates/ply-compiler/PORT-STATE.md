@@ -4,21 +4,25 @@ Written at the end of a long working session. `README.md` says what the spike is
 this says what the *port of the C emitter* has and has not, so the next pass
 starts from the findings rather than rediscovering them.
 
-## The two instruments, and what they say
+## What holds the port, and what it says
 
-Both are in `crates/ply-compiler-diff/tests/suite/`, both run from `./run.sh`, both ratchet.
+**Corrected 2026-09-17, under ADR 0052 §2.** This section named two differentials,
+`lower_diff.rs` and `emit_diff.rs`, both in `crates/ply-compiler-diff/tests/suite/`
+and run from a `./run.sh`. All three are gone: §2 retired both differentials, that
+directory now holds the parser and lexer suites alone, and there is no `run.sh`. A
+reader starting here was being sent to files that do not exist.
+
+What holds the port is no longer a comparison against the Rust chain, because for
+every phase but the parser and the lexer there is no longer a Rust answer to
+compare against.
 
 | | |
 | --- | --- |
-| `lower_diff.rs` | the port reaches **1179 of 1200** bodies, **1179 compared** |
-| `emit_diff.rs` | 48 of 48 hand-written bodies; **every one of the 1282** shipped bodies the reference emits, each resolving to the reference's C |
-
-`reached` and `compared` were apart for most of this work, by the record updates
-the lowering excluded. They now meet: the exclusion is gone.
-
-The emitter differential pins the reference's inlining at **zero** and passes it
-explicitly. What is compared is the *emitter*; the inliner is a stage of its own
-and this port does not have it.
+| the bootstrap fixpoint | a solo CI row: the emitter built from the bundle emits its own sources refusing **nothing**, and the generation built from that emission agrees byte for byte |
+| the goldens | five suites in `crates/ply-codegen-tests/tests/goldens/` -- derive, hash, infer, resolve, rewrite -- holding the port to stored text, with no reference arm |
+| the parser and the lexer | `agreement.rs` and `lexer_agreement.rs`, the two comparisons still held to `ply-syntax` |
+| the behavioural gates | the compiler's own tests on the tier, the corpus sessions, the archive round trip, and `same-tests` |
+| the arm scripts | five mutation harnesses under `crates/ply-compiler-diff/tools/`, which are what prove a golden can still go red |
 
 ## Nothing is switched off
 
@@ -50,7 +54,11 @@ Ownership and ordering:
 
 ## The disagreements
 
-`emit_diff.rs` compares each shipped body on the C it *resolves* to -- every table placeholder
+**This section describes an instrument ADR 0052 §2 retired.** It is kept because
+the rules it found are still the port's, and re-deriving them would cost more than
+reading them here.
+
+`emit_diff.rs` compared each shipped body on the C it *resolves* to -- every table placeholder
 replaced by its entry -- and holds two floors and a ceiling: bodies reached, bodies agreeing,
 bodies disagreeing. It no longer asserts the disagreeing names; the test prints them, and
 `PLY_EMIT_DIFF_LIST=1` marks each reached body `agrees` or `differs` so two runs diff. A body
@@ -205,8 +213,11 @@ the named gaps.
 **A refusal carries its reason now.** `Em.refused` holds the first reason a body was refused;
 a refusal poisons the state and emission runs out, so no signature changed. `emit_fn_why`
 reads the reason, `emit_refusals_all` lists every refused body of a program, and the census
-test in `crates/ply-compiler-diff/tests/suite/emit_diff.rs` aggregates them by reason over the bodies the reference
-emits. Read that census before choosing what to build next: as this was written it put a
+test in the emit differential aggregated them by reason over the bodies the reference
+emitted. **That differential is retired and its census went with it** (ADR 0052 §2), and
+nothing on the port's side replaced it -- which is why that record names a port-side
+refusal census as the gap to close before `c/emit.rs` can go. What it put first when this
+was written: a
 nullary call of a definition first (the constant table wants the purity the checker
 publishes), then a field read over a shape the port cannot see, then a pattern it cannot
 test, then an operator it does not emit, then a parameter with no written type.
@@ -222,7 +233,7 @@ emitter sees. That closed `std.http.check_limits` (a default argument's constant
 opened the **test roots**: a test is a nullary body named `test#<n>`, and the port emits
 them as the reference does. With an expression statement's value discarded and two `Int`
 literals under an operator folded as the reference folds them, the port went from 487 to
-605 shipped bodies. The census in `emit_diff.rs` says what keeps it out of the rest: field
+605 shipped bodies. The census in the emit differential said what kept it out of the rest: field
 reads over shapes it cannot see, lambdas, and updates, in that order.
 
 The port is the C tier's **producer** now, behind `PLY_C_EMITTER=ply:<dir>`
@@ -282,8 +293,8 @@ The port's output is now built as lines joined once per body and frames joined o
 which the measurement in ADR 0045 §"What the fixpoint measured" showed was not where the
 memory went: the tier released nothing within an entry. ADR 0046 built the release: `emit.ply`
 carries the machine's ownership rule under `Em.release`, on for everything the producer emits
-and off for `emit_bodies_reference`, which is the text `emit_diff.rs` still compares against
-the reference. The three places release departs from the reference's order, and the two the
+and off for `emit_bodies_reference`, which is the text the emit differential compared
+against the reference before §2 retired it. The three places release departs from the reference's order, and the two the
 reference had wrong, are in that record. `emit_module` also emits a program's laws and spec
 clauses as roots, named as `crates/ply-codegen/src/source.rs` names them, which is what
 `ply prove --backend` enters.
