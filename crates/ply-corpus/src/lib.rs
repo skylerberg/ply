@@ -38,6 +38,30 @@ pub(crate) fn honest() -> ply_eval::BackendSpec {
     }
 }
 
+/// The port's check over these very texts (ADR 0052 §1).
+///
+/// The harnesses here need a checked program in order to measure what it *does*; what checking
+/// costs is `pipeline.rs`'s subject, and that one keeps the Rust chain because timing its phases
+/// is the whole of what it reports.
+///
+/// `texts` is in the program's module order, because the protocol writes a span's module as its
+/// position in this very list.
+pub fn port_check(
+    texts: &[(String, String)],
+    ids: &[ply_span::SourceId],
+) -> Result<ply_core::CheckOutput> {
+    ply_codegen::c::producer::ensure_default();
+    let front = ply_codegen::c::producer::front(texts, ids)?;
+    if let Some(d) = front
+        .diagnostics
+        .iter()
+        .find(|d| d.severity == ply_span::Severity::Error)
+    {
+        bail!("the port refuses this program: {} [{}]", d.message, d.code);
+    }
+    Ok(front.check)
+}
+
 /// A machine over the program with the default tier attached, produced from the module texts
 /// `sources` holds.
 pub fn tier_machine<'a>(

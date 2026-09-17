@@ -327,10 +327,14 @@ impl Loaded {
             let id = sources.add(ply_std::pseudo_path(module), source.to_string());
             inputs.push((id, module.clone(), source));
         }
-        let texts = inputs
+        // `texts` below is a map, for `Unit::over_with_texts`. The port needs the same pairs
+        // in the program's order, because that order is how a span names its module.
+        let ordered: Vec<(String, String)> = inputs
             .iter()
             .map(|(_, name, source)| (name.to_string(), (*source).to_string()))
             .collect();
+        let ids: Vec<ply_span::SourceId> = inputs.iter().map(|(id, _, _)| *id).collect();
+        let texts = ordered.iter().cloned().collect();
         let mut program = ply_syntax::parse_program(inputs)
             .map_err(|d| diagnostics("parsing the service", &d))?;
         let expanded = ply_derive::expand_program(&mut program);
@@ -339,8 +343,8 @@ impl Loaded {
         }
         let resolved = ply_syntax::resolve::resolve(&mut program)
             .map_err(|d| diagnostics("resolving the service", &d))?;
-        let check = ply_core::check_program(&program, &resolved)
-            .map_err(|d| diagnostics("checking the service", &d))?;
+        let check = crate::port_check(&ordered, &ids)
+            .map_err(|e| anyhow::anyhow!("checking the service: {e}"))?;
         Ok(Loaded {
             program,
             resolved,
