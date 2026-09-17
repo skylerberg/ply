@@ -126,12 +126,10 @@ fn modules_of(src: &Sources) -> Vec<(String, String)> {
 }
 
 /// Build the emitter as a producer: the native emitter from the bootstrap bundle, which reads none
-/// of its sources -- or, when `PLY_C_BOOTSTRAP=off` or the bundle does not serve, parsed and
+/// of its sources -- or, when these sources have no bundle or it does not serve, parsed and
 /// checked and emitted by the reference emitter, which is how a bundle is refreshed.
 fn build_from(src: &Sources) -> Result<PlyProducer, String> {
-    let bundle = (std::env::var("PLY_C_BOOTSTRAP").as_deref() != Ok("off"))
-        .then(|| super::bundle::of(src))
-        .flatten();
+    let bundle = super::bundle::of(src);
     let from_reference = || -> Result<(super::Native, Vec<super::Refused>), String> {
         let source = front_end(src)?;
         let names: Vec<String> = source.functions();
