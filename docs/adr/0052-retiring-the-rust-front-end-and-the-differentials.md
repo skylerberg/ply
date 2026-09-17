@@ -269,7 +269,8 @@ In the order the goldens and the crates together allow: `ply-core`'s
 checker; `ply-hash`'s hasher; `ply-derive`; `ply-syntax`'s rewrites,
 resolver, parser, lexer and printer; then `ply-eval`'s lowering with `opt.rs` and `c/emit.rs`
 last; with `ply-derive-tests`, `ply-syntax-tests`, `ply-core-tests`,
-`ply-hash-tests`, `ply-compiler-diff` and the `tools/mine-*.py` scripts.
+`ply-hash-tests` and `ply-compiler-diff`; the `tools/mine-*.py` scripts stay,
+because the corpora they mine are read by crates that survive.
 `ply-hash` goes ahead of `ply-syntax`, not after it: its normalizer, its
 body store and its graph all read the parser's syntax tree, so a deletion
 of `ply-syntax` first is not a deletion that can be carried out. The same
@@ -425,11 +426,21 @@ hard one, and not for its parser: `resolve::Resolved` is threaded through
 the public signatures of six crates that survive, which makes it a
 front-end product rather than vocabulary or value model, and it is the
 reason that crate cannot leave in one move. Nothing in the workspace
-depends on `ply-compiler-diff`, so it leaves with its wiring — a nextest
-override, two of the four solo rows, `bless.yml`, and the profiler's
-default target — and the `tools/mine-*.py` scripts leave with it, run by
-nothing in the tree, three of the four writing to a directory that does
-not exist.
+depends on `ply-compiler-diff`, so it leaves with what still names it:
+`bless.yml` and `profile.yml`. Its nextest override and both of its solo rows
+are already gone, with the differentials they protected.
+
+**The `tools/mine-*.py` scripts do not leave with it**, and an earlier reading
+of them here was wrong twice. All four write into `tools/fixtures/`, not three,
+and that directory does not exist — so the corpora they mine have not been
+regenerated in a long time and are frozen artifacts. And they are not run by
+nothing: they are named as the way to regenerate those corpora in
+`crates/ply-compiler`'s `README.md`, `GAPS.md` and `GAPS-harness.md`, and in the
+expect messages of four test files that survive — `ply-codegen-tests`'s
+`infer.rs` and `resolve.rs`, `ply-compiler-diff`'s `agreement.rs`, and
+`ply-syntax-tests`'s `parser.rs`. The corpora are read from two crates now, so
+the scripts outlive the differential and their broken output path is a thing to
+fix rather than to delete.
 
 **Read, 2026-09-17: the checker and the hasher are already off the load path.**
 The driver says so itself. It parses and resolves with the Rust chain because
@@ -675,8 +686,17 @@ through it. What is left of the Rust chain on a live path is one thing:
 `ply_hash::hash_program_with_bodies` unless `PLY_FRONT=port` is set, and one solo
 row sets it. Every remaining caller of the checker and the hasher sits behind
 that door — three in `ply-codegen`, five in `ply-compiler-diff` and nine in
-`ply-corpus`, which runs in no CI job at all — so retiring the default is what
-would take them, and retiring it means asking the port for a front end per unit.
+`ply-corpus` — so retiring the default is what would take them, and retiring it
+means asking the port for a front end per unit.
+
+A draft of that sentence said `ply-corpus` runs in no CI job. It does, and the
+correction sharpens the point rather than weakening it. `w3`'s service loader
+parses, expands, resolves and checks, and `ply-corpus-tests` reaches it through
+`w3::Loaded` and through `constant_memo_service`, which `.config/nextest.toml`
+names in its long-test filter and which runs in a partition on every push,
+selected by package rather than by name. Those harnesses hand their own tests a
+`CheckOutput`, so porting them is the per-unit cost again: every remaining caller
+really is behind the one door.
 
 §4 has priced that from the other side, with the instruments this record trusts
 rather than a differential's clock. Three quadratics are out, the front end is
@@ -758,9 +778,27 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s and 139 s, each reusing by tree the same way and for the same reason. Three of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the third is 324 s, which the paragraph after it takes and which the tree did not cause. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s and 223 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
+
+**Read, 2026-09-17: a second run over the bound, and the same kind of cause.**
+The merge recording where §1 and §2 stop read 223 s, on a records-only change.
+Not the tree, and not the reuse: both build legs took their artifacts back and
+do not appear among the twelve slowest jobs, the run was created and started in
+the same second, and every test job finished by +142 s against +129 s on the
+merge before it — thirteen seconds of ordinary variance. The whole difference is
+the `CI` aggregate job, which computed nothing: its log spans **0.3 seconds**,
+set-up to "Every job succeeded" to complete, and the API bills it at 72 s, ending
+at +218 s. The same job took 3 s on the run before.
+
+So both of today's over-bound readings are the runner platform rather than this
+repository — that one and the 324 s below it. Worth one note rather than two
+mysteries. And worth saying how it was found: three causes were guessed first —
+the tree-reuse fallback, the runners' arrival staircase, and the aggregate job
+doing real work — and the data refuted all three before the per-job timestamps
+settled it. The staircase was the closest and still wrong: jobs started at +38
+to +58 s in both runs.
 
 **Read, 2026-09-17: a run over the bound that the tree did not cause.** The
 merge retiring the `diag` and `front` differentials read 324 s. §3's rule is that
