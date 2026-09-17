@@ -582,6 +582,26 @@ superlinearly or only the clock does: the first would put it back in the
 port's own code, the second in the runtime beneath it. That is the next
 measurement, and the census already exists to take it.
 
+**Read, 2026-09-17: it is the runtime, not the compiler's allocation count.**
+The census beside the clock, over parse and resolve at 250, 1,000 and 4,000
+definitions: 4.38 M, 8.29 M and 22.16 M objects allocated; 66 MB, 133 MB and
+267 MB of chunks; 1,355 ms, 3,145 ms and 15,688 ms. Over the last step the
+project quadruples, allocations grow 2.67-fold, chunk bytes grow 2.01-fold,
+and the clock grows 4.99-fold. Time per allocation is 0.31 µs, 0.38 µs and
+0.71 µs.
+
+The port is not allocating quadratically. Each allocation is getting more
+expensive as the heap grows, and that is a property of the runtime beneath
+the compiler rather than of anything the compiler does. It also explains why
+the name index bought a fifth: removing work helps, and it cannot help with
+what the remaining work costs per object.
+
+Two limits on this reading, both worth keeping. The census is the parse and
+resolve entry rather than the whole front end, because the run kept only the
+first block at each size; parse and resolve grow at the same rate as the rest,
+which is why it stands in for them. And chunk bytes are a high-water mark, not
+live bytes, so they bound the heap rather than describe it.
+
 The lesson for the instrument is worth keeping: a flat profile is evidence
 about where time goes, not about whether an algorithm is quadratic, and
 this one was taken at a single size over a single program, which is the
