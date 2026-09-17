@@ -1419,7 +1419,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s and 140 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s and 203 s, each reusing by tree the same way and for the same reason. Five of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, which the entry closing this section takes. None of those three was caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
@@ -1496,6 +1496,43 @@ That said, the clock is still set by what one `ply` invocation costs, because
 every test in this list drives the real command repeatedly. That is §1's front
 end, and the two parts do converge on it — by the size of the work rather than
 by the shard tables running out.
+
+**Read, 2026-09-17: the run that went over, and where the 203 s went.** §3 says a
+run over the bound is the next item before any other. This is that item, and the
+tree is not in it: #356 changed one markdown file.
+
+Against the run before it, which read 140 s over the same shape of tree:
+
+| | the 140 s run | the 203 s run |
+| --- | --- | --- |
+| partitions start | 36 s | 35 s |
+| longest partition | 97 s, ending 133 s | 123 s, ending 159 s |
+| every job finished by | 133 s | 159 s |
+| the `CI` aggregate starts | 136 s | 198 s |
+
+Two things, and neither is the tree. The fan-out started on time. The longest
+partition grew from 97 s to 123 s -- against 108, 107, 107 and 103 over the four
+main runs before that, so 123 is a new high by fifteen seconds, and one reading.
+And after all twenty-three jobs had finished at 159 s, the aggregate did not start
+until 198 s: **thirty-nine seconds with nothing running at all**. Every one of the
+twenty-three was listed and checked before that sentence was written, because a
+truncated list would have hidden a slow job and read as scheduling -- the same
+mistake in a smaller place.
+
+So 203 s is 140 s plus twenty-six seconds of slower work and thirty-six of a job
+waiting to be scheduled. The larger half is entirely the platform's. It is the
+fifth platform-side reading this record has taken, after `EHOSTUNREACH` on a cache
+download, `getaddrinfo EAI_AGAIN` retries, `sccache-action` answering HTTP 500,
+and an artifact download that took 27 s where the run before it took 6.
+
+**What this does not license.** The band above cites nine longest partitions from
+88 to 120 s, taken when the question was whether 173 s was a drift. The five
+before this run are 97, 108, 107, 107 and 103, so the band has crept up and 123
+sits above it. One reading is not a trend -- that paragraph's own draft was
+corrected for exactly that error, calling one from four partitions in a single
+run -- and the next merge's longest partition is the reading that would say
+otherwise. What §3 asks for here is that the run be read and recorded, not that a
+number be moved.
 
 ## 4. The loop that is O(the change)
 
