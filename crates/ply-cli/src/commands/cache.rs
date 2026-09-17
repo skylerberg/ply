@@ -2,12 +2,12 @@ use super::common::{IND, diagnostic_json, emit_json, millis, plural, print_warni
 use crate::cli::{CacheScope, InspectArgs};
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_OK};
-use ply_core::{Footprint, print_scheme, print_type};
 use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
 use ply_store::{
     CacheStats, CachedDecl, DeclBody, DefKind, FRONTEND_VERSION, FileSpan, Found, FoundDef,
     FoundTest, NameRef, Outcome, RUNTIME_VERSION, Store,
 };
+use ply_ty::{Footprint, print_scheme, print_type};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;

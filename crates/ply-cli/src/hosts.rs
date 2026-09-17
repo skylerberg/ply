@@ -3,11 +3,11 @@
 use crate::commands::common::plural;
 use crate::config::Configuration;
 use crate::db::{self, Database, DbConfig};
-use ply_core::CheckOutput;
-use ply_core::ty::Footprint;
 use ply_eval::host::{HostBinding, HostListing, HostRegistry, HostRow, HostRuntime};
 use ply_host::tls;
 use ply_span::{Diagnostic, Span};
+use ply_ty::CheckOutput;
+use ply_ty::ty::Footprint;
 use serde_json::{Value, json};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -789,8 +789,8 @@ impl Observability {
             .iter()
             .filter(|row| row.effect.as_str() == ply_host::trace::EFFECT)
             .filter_map(|row| match &row.resource {
-                ply_core::ty::Resource::Named(name) => Some(name.as_str().to_string()),
-                ply_core::ty::Resource::Singleton => None,
+                ply_ty::ty::Resource::Named(name) => Some(name.as_str().to_string()),
+                ply_ty::ty::Resource::Singleton => None,
             })
             .collect();
         channels.sort();
@@ -1203,8 +1203,8 @@ pub fn row_json(row: &HostRow) -> Value {
         // Null for an operation declared without `[r]`: that is one singleton resource, not a
         // resource named "singleton".
         "resource": match &row.resource {
-            ply_core::ty::Resource::Named(name) => json!(name.as_str()),
-            ply_core::ty::Resource::Singleton => Value::Null,
+            ply_ty::ty::Resource::Named(name) => json!(name.as_str()),
+            ply_ty::ty::Resource::Singleton => Value::Null,
         },
         "triple": row.to_string(),
         "atom": row.atom.to_string(),

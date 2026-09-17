@@ -1,10 +1,10 @@
 //! Building the list of claims a run has to discharge.
 
-use ply_core::{CheckOutput, LawBinder, Type};
 use ply_hash::HashOutput;
 use ply_prove::{Frame, Obligation, ObligationKind, frame_of};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{Item, Program, SpecKind};
+use ply_ty::{CheckOutput, LawBinder, Type};
 use std::collections::HashMap;
 
 pub struct Collected {
@@ -108,7 +108,7 @@ pub fn collect(program: &Program, check: &CheckOutput, hashes: &HashOutput) -> C
 }
 
 /// The owner's parameters, then `result`.
-fn clause_binders(def: &ply_syntax::ast::FnDef, info: &ply_core::DefInfo) -> Vec<LawBinder> {
+fn clause_binders(def: &ply_syntax::ast::FnDef, info: &ply_ty::DefInfo) -> Vec<LawBinder> {
     let (params, ret) = match &info.scheme.ty {
         Type::Fn { params, ret, .. } => (params.as_slice(), (**ret).clone()),
         // A definition with no parameters is still a function of nothing whose `ensures` speaks

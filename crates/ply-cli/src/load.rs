@@ -1,11 +1,11 @@
 //! Turning a path into a checked [`Program`].
 
 use crate::driver::FrontEnd;
-use ply_core::{CheckOutput, DefInfo, Front, ModuleInfo, TestInfo};
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::Resolved;
+use ply_ty::{CheckOutput, DefInfo, Front, ModuleInfo, TestInfo};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]

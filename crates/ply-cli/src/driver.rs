@@ -15,7 +15,6 @@
 //! project *and* the standard library, which is the cost this shape exists to pay exactly once.
 
 use crate::load::{Discovered, LoadError, Loaded, anchor, discover, unreadable};
-use ply_core::{DefInfo, Front};
 use ply_hash::body::StoredBody;
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
@@ -26,6 +25,7 @@ use ply_store::{
 };
 use ply_syntax::ast::{Module, ModuleName, Program};
 use ply_syntax::resolve::resolve;
+use ply_ty::{DefInfo, Front};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -639,12 +639,12 @@ enum Interface {
 /// The checker's output with its definitions in the order a reader can predict: the run's files
 /// in load order, then each file's items as written. The port answers them in the checker's own
 /// order, which is dependency-first, and `ply check --json` publishes this one.
-fn published_order(front: &Front) -> ply_core::CheckOutput {
+fn published_order(front: &Front) -> ply_ty::CheckOutput {
     let mut check = front.check.clone();
     let mut defs = indexmap::IndexMap::with_capacity(check.defs.len());
     for (_, items) in &front.ordinals {
         for item in items {
-            if let ply_core::Ordinal::Fn(name, _) = item
+            if let ply_ty::Ordinal::Fn(name, _) = item
                 && let Some(info) = check.defs.shift_remove(name)
             {
                 defs.insert(name.clone(), info);
@@ -687,7 +687,7 @@ fn export_table(front: &Front) -> BTreeMap<Symbol, Vec<NameRef>> {
 }
 
 /// Every top-level name a module mentions but does not declare.
-fn free_names(front: &Front, module: &Symbol, info: &ply_core::ModuleInfo) -> BTreeSet<Symbol> {
+fn free_names(front: &Front, module: &Symbol, info: &ply_ty::ModuleInfo) -> BTreeSet<Symbol> {
     let mut declared: BTreeSet<Symbol> = BTreeSet::new();
     let mut keys: Vec<Symbol> = Vec::new();
     for name in &info.items {
@@ -772,8 +772,8 @@ fn def_entries(front: &Front, name: &Symbol, ifaces: &BTreeMap<Symbol, DefHash>)
 }
 
 /// A sum type's constructors in declaration order; an alias has none.
-fn ctors_of<'a>(front: &'a Front, type_name: &Symbol) -> Vec<&'a ply_core::CtorInfo> {
-    let mut out: Vec<&ply_core::CtorInfo> = front
+fn ctors_of<'a>(front: &'a Front, type_name: &Symbol) -> Vec<&'a ply_ty::CtorInfo> {
+    let mut out: Vec<&ply_ty::CtorInfo> = front
         .check
         .ctors
         .values()

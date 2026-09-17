@@ -1,8 +1,8 @@
 //! How a run is told which database to talk to, and what it may say about it afterwards.
 
-use ply_core::CheckOutput;
-use ply_core::ty::Type;
 use ply_span::{Diagnostic, Symbol, codes};
+use ply_ty::CheckOutput;
+use ply_ty::ty::Type;
 use std::collections::BTreeMap;
 use std::fmt;
 
