@@ -430,17 +430,26 @@ depends on `ply-compiler-diff`, so it leaves with what still names it:
 `bless.yml` and `profile.yml`. Its nextest override and both of its solo rows
 are already gone, with the differentials they protected.
 
-**The `tools/mine-*.py` scripts do not leave with it**, and an earlier reading
-of them here was wrong twice. All four write into `tools/fixtures/`, not three,
-and that directory does not exist — so the corpora they mine have not been
-regenerated in a long time and are frozen artifacts. And they are not run by
-nothing: they are named as the way to regenerate those corpora in
-`crates/ply-compiler`'s `README.md`, `GAPS.md` and `GAPS-harness.md`, and in the
-expect messages of four test files that survive — `ply-codegen-tests`'s
-`infer.rs` and `resolve.rs`, `ply-compiler-diff`'s `agreement.rs`, and
-`ply-syntax-tests`'s `parser.rs`. The corpora are read from two crates now, so
-the scripts outlive the differential and their broken output path is a thing to
-fix rather than to delete.
+**The `tools/mine-*.py` scripts do not leave with it.** One half of the sentence
+above is right and the other is not, and a draft of this paragraph got the wrong
+half. **Three** of the four do write into a `tools/fixtures/` that does not
+exist — `mine-checks`, `mine-fixtures` and `mine-programs`, each building the
+path from `__file__`'s own directory — while `mine-hashes` joins `..` on the way
+and lands in the crate's `fixtures/`, which exists. The original count was
+correct; the draft that raised it to four was not, and the difference is one
+`".."`.
+
+What is wrong is "run by nothing in the tree". They are named as the way to
+regenerate those corpora in `crates/ply-compiler`'s `README.md`, `GAPS.md` and
+`GAPS-harness.md`, and in the expect messages of four surviving test files —
+`ply-codegen-tests`'s `infer.rs` and `resolve.rs`, `ply-compiler-diff`'s
+`agreement.rs`, and `ply-syntax-tests`'s `parser.rs`. Nor is it only the mine
+scripts: `arm-*.sh` is cited from `BOOTSTRAP-PATH.md` and `GAPS.md`, `arm.sh`
+from six places including `ci.yml`, `CONTRIBUTING.md` and source in
+`ply-eval-tests` and `ply-prove`, and `measure-multiplier.sh` from three. Only
+`diff-items.py` is cited nowhere at all. So the directory outlives the
+differential, and the three broken paths are a thing to fix rather than to
+delete.
 
 **Read, 2026-09-17: the checker and the hasher are already off the load path.**
 The driver says so itself. It parses and resolves with the Rust chain because
