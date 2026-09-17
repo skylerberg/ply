@@ -15,7 +15,9 @@ use super::build::Native;
 use super::emit::Tables;
 use crate::source::Source;
 use anyhow::{Context, Result, anyhow, bail};
-use ply_eval::Value;
+use ply_eval::{Fields, Value};
+use ply_span::{Severity, SourceId, Symbol};
+use ply_ty::{Front, read_front};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -157,7 +159,6 @@ fn build_from(src: &Sources) -> Result<PlyProducer, String> {
 /// The emitter's own program through the front end, keyed as the cache keys it, with the modules
 /// as `SourceId(0..n)` in `modules_of`'s order.
 fn front_end(src: &Sources) -> Result<&'static Source, String> {
-    use ply_span::SourceId;
     let inputs: Vec<_> = modules_of(src)
         .into_iter()
         .enumerate()
@@ -185,11 +186,15 @@ fn front_end(src: &Sources) -> Result<&'static Source, String> {
     let program: &'static ply_syntax::ast::Program = Box::leak(Box::new(ast));
     let resolved = Box::leak(Box::new(resolved));
     let check = Box::leak(Box::new(check));
-    let keys = ply_hash::hash_program(program, resolved, check)
-        .map(|h| crate::source::emit_keys(program, &h))
-        .unwrap_or_default();
-    Ok(Box::leak(Box::new(Source::keyed(
-        program, resolved, check, keys,
+    // The Rust chain's answer, because this runs *while* the producer is being built: the port
+    // cannot answer for the program it is itself compiled from.
+    let hashes = ply_hash::hash_program(program, resolved, check).unwrap_or_default();
+    let front = Box::leak(Box::new(crate::source::front_of(
+        program, resolved, check, hashes, None,
+    )));
+    let keys = crate::source::emit_keys(front);
+    Ok(Box::leak(Box::new(Source::from_front(
+        program, resolved, front, keys,
     ))))
 }
 
@@ -350,7 +355,9 @@ impl PlyProducer {
     /// source texts to hand the emitter.
     pub fn body(&self, loaded: &Source, name: &str, module_index: usize) -> Option<Answer> {
         self.asked.set(self.asked.get() + 1);
-        loaded.program.modules.get(module_index)?;
+        if module_index >= loaded.module_count() {
+            return None;
+        }
         let program = std::ptr::from_ref(loaded) as usize;
         if !self.modules.borrow().contains_key(&program) {
             let bodies = match self.bodies_of(loaded) {
@@ -379,8 +386,8 @@ impl PlyProducer {
     fn bodies_of(&self, loaded: &Source) -> Result<Bodies> {
         let mut names = Vec::new();
         let mut srcs = Vec::new();
-        for m in &loaded.program.modules {
-            let name = m.name.to_string();
+        for module in loaded.module_names() {
+            let name = module.to_string();
             let Some(text) = loaded.texts.get(&name) else {
                 return Ok(HashMap::new());
             };
@@ -477,6 +484,56 @@ pub fn reset_census() {
 
 pub fn census() -> Census {
     CENSUS.with(|c| c.get())
+}
+
+/// The entry the whole front end answers through: the diagnostics, the load order, the checker's
+/// output, the hashes, the item ordinals and the stored bodies, as `ply_ty::front` reads them.
+const FRONT: &str = "front.front_dump";
+
+/// The port's whole answer over a program — `ids` naming the source each module's spans point
+/// into, in the same order the modules are handed over.
+///
+/// **An error here is a disagreement, not a user's diagnostic.** The driver has already run the
+/// Rust chain over this program and accepted it, so a refusal from the port is two front ends
+/// differing, and it is raised rather than reported as the program's fault.
+pub fn front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
+    if sources.len() != ids.len() {
+        bail!(
+            "{} module(s) handed over with {} source id(s)",
+            sources.len(),
+            ids.len()
+        );
+    }
+    let records: Vec<Value> = sources
+        .iter()
+        .map(|(name, src)| {
+            Value::Record(Arc::new(Fields::from_unsorted(vec![
+                (Symbol::new("name"), Value::bytes(name.as_bytes())),
+                (Symbol::new("src"), Value::bytes(src.as_bytes())),
+            ])))
+        })
+        .collect();
+    let answer = call(FRONT, &[Value::list(records)])?;
+    let Value::Str(dump) = &answer else {
+        bail!(
+            "`{FRONT}` answered a {} rather than a string",
+            answer.type_name()
+        );
+    };
+    let front =
+        read_front(dump, ids).map_err(|e| anyhow!("the front end's answer does not read: {e}"))?;
+    if let Some(d) = front
+        .diagnostics
+        .iter()
+        .find(|d| d.severity == Severity::Error)
+    {
+        bail!(
+            "the port's front end refuses a program the driver accepted: {} [{}]",
+            d.message,
+            d.code
+        );
+    }
+    Ok(front)
 }
 
 /// Enters `name` in this thread's compiled emitter, building it first when the thread has none.

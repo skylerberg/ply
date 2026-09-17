@@ -234,7 +234,54 @@ pub fn build(
     startup: &[&DefInfo],
     sources: bool,
 ) -> Result<Built, Vec<Diagnostic>> {
-    let (hashes, bodies) = hash_program_with_bodies(&loaded.program, &loaded.resolved)?;
+    // The front end's whole answer over the program: the hashes the artifact is keyed by and the
+    // bodies it carries, from the port wherever it can serve one (ADR 0052 §1).
+    let front = ply_codegen::front_for(
+        &loaded.program,
+        &loaded.resolved,
+        &loaded.check,
+        &crate::commands::common::module_texts(&loaded.program, &loaded.sources),
+    )
+    .map_err(|e| {
+        vec![
+            Diagnostic::error(
+                codes::ARTIFACT_INVALID,
+                format!("the front end answered nothing for this program: {e:#}"),
+            )
+            .primary(
+                Span::DUMMY,
+                "nothing could be hashed, so nothing could be built",
+            ),
+        ]
+    })?;
+    let hashes = &front.hashes;
+    // The bytes are the envelope the hasher wrote, so they are wrapped rather than re-hashed. Only
+    // a name declared in two namespaces — a `fn` and a `type` of one name — has two bodies, and
+    // that is the one case a body has to say which of the two hashes it is filed under.
+    let bodies: BTreeMap<DefHash, StoredBody> = {
+        let mut by_name: BTreeMap<&Symbol, Vec<StoredBody>> = BTreeMap::new();
+        for (name, bytes) in &front.bodies {
+            if let Some(body) = StoredBody::from_bytes(bytes.clone()) {
+                by_name.entry(name).or_default().push(body);
+            }
+        }
+        let mut out = BTreeMap::new();
+        for (name, stored) in by_name {
+            for hash in [hashes.defs.get(name), hashes.decls.get(name)]
+                .into_iter()
+                .flatten()
+            {
+                let found = match stored.as_slice() {
+                    [only] => Some(only),
+                    many => many.iter().find(|b| b.verify(*hash)),
+                };
+                if let Some(body) = found {
+                    out.insert(*hash, body.clone());
+                }
+            }
+        }
+        out
+    };
     let Some(entry_hash) = hashes.defs.get(&entry.name).copied() else {
         return Err(vec![missing_entry(&entry.name)]);
     };
@@ -264,7 +311,7 @@ pub fn build(
             .into_iter()
             .flatten()
         {
-            match bodies.get(*hash) {
+            match bodies.get(hash) {
                 Some(body) => {
                     out.bodies.insert(*hash, body.clone());
                     out.names.push((name.to_string(), *hash));
@@ -290,7 +337,7 @@ pub fn build(
         artifact: out,
         entry_name: entry.name.clone(),
         startup: startup.iter().map(|d| d.name.clone()).collect(),
-        closure: restricted_closure(&hashes, &reachable),
+        closure: restricted_closure(hashes, &reachable),
         warnings,
     })
 }
@@ -1195,7 +1242,6 @@ fn evaluate(
             &opened.program,
             &opened.resolved,
             &opened.check,
-            &Default::default(),
             texts,
         )?;
         machine.set_compiled(provider.attach(&spec));

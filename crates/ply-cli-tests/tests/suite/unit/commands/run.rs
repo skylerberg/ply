@@ -30,7 +30,6 @@ fn attach_tier(machine: &mut Machine<'_>, loaded: &Loaded) -> Result<(), Diagnos
         &loaded.program,
         &loaded.resolved,
         &loaded.check,
-        &loaded.hashes,
         texts,
     )?;
     machine.set_compiled(provider.attach(&spec));
