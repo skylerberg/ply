@@ -107,7 +107,7 @@ on `ply-span` alone. `ply-core` re-exports all of it and keeps the
 checker. `ply-hash`, `ply-store`, `ply-host` and `ply-test` do not depend on
 `ply-core` at all, and the prelude's tables have since joined `ply-ty`, which
 takes the runtime and the prover off it too. What still calls `ply-core` is the
-checker's two callers, and nothing else.
+checker's three callers, and nothing else.
 
 **Built, 2026-09-16: the message channel.** The port's diagnostics carried
 a code, spans, a label count and a note count; they now carry the
@@ -784,8 +784,10 @@ should have run when the differential went.
 What it costs the chain is the point. `ply-compiler-diff` held five calls to
 `check_program` and three to `hash_program`; it now holds neither. The last of
 each was `stage.rs`'s, the binary that bootstraps a working copy, which the entry
-below takes. Tree-wide the checker had eight non-test callers at that point: the
-seed path in `ply-codegen`, `stage.rs`, and six in `ply-corpus`.
+below takes. Tree-wide the checker had nine non-test callers at that point: the
+seed path in `ply-codegen`, `stage.rs`, six in `ply-corpus`, and the value-model
+benchmark's arm, which sits outside `crates/` and which every survey behind these
+counts was rooted too narrowly to see.
 
 **So the paragraph above overstated the bound, and this corrects it.** It says
 every remaining caller sits behind `front_for`'s per-unit default and that the
@@ -814,9 +816,9 @@ position in the list handed over, and `w3`'s existing `texts` is a map for
 it retires with its subject rather than moving to the port. That is the rule the
 differentials retired under, and it applies here unchanged.
 
-So `check_program` falls from eight non-test callers to three, and none of the
-three is a program a user runs: the seed path in `ply-codegen`, `stage.rs` in
-`ply-compiler-diff`, and `pipeline.rs`. Two of them are the bootstrap paths §2
+So `check_program` falls from nine non-test callers to four, and none of the
+four is a program a user runs: the seed path in `ply-codegen`, `stage.rs` in
+`ply-compiler-diff`, `pipeline.rs`, and the value-model benchmark's arm. Two of them are the bootstrap paths §2
 already means to retire when the bundle becomes the only way to build the
 language, and the third retires with the chain it times.
 
@@ -921,7 +923,7 @@ emitter change that refreshes the bundle anyway, and until then this paragraph i
 where a reader learns the comments are wrong.
 
 **Built, 2026-09-17: the staging binary asks the port, and the checker is down
-to two callers.** `stage.rs` bootstraps a working copy of the emitter, and it was
+to three callers.** `stage.rs` bootstraps a working copy of the emitter, and it was
 never blocked — only unexamined. It already installs the emitter at the top with
 `producer::ensure_default()`, already holds its modules as `(name, text)` pairs in
 exactly the shape `producer::front` takes, and its `SourceMap` hands out ids
@@ -936,15 +938,16 @@ It asks the port now. The parse, the expansion and the resolve stay, because
 its answers. Nothing else in the binary read the `CheckOutput`, so the three calls
 came out whole.
 
-That leaves `check_program` with two non-test callers in the tree and
-`hash_program` with the same two: the seed path in `ply-codegen` and
-`pipeline.rs` in `ply-corpus`. Neither is a program a user runs. The seed path is
+That leaves `check_program` with three non-test callers and `hash_program` with
+two. The seed path in `ply-codegen` and `pipeline.rs` in `ply-corpus` call both;
+`benches/value-model/ply-arm`, the value-model benchmark's Ply arm, calls the
+checker alone. None of the three is a program a user runs. The seed path is
 the one §2 cannot delete before the bundle migration exists, for the reason given
 above — `build_from` falls back to `from_reference()` when a unit is unserved, and
 ADR 0050 §1a chose that deliberately.
 
-`pipeline.rs` is deliberately not a third, and the reason is worth stating because
-it would otherwise read as an oversight. Its `check_program` sits in
+`pipeline.rs` was deliberately not moved onto the port with the others, and the
+reason is worth stating because it would otherwise read as an oversight. Its `check_program` sits in
 `Phase::Typecheck` and its `hash_program` in `Phase::Hash`, and those rows are
 what the marginal-change bench sums into the front-end figures §4 cites. Pointing
 them at the port would move numbers this record depends on without saying so: it
@@ -1019,6 +1022,58 @@ aggregate's summary, and before touching the tree at all. The aggregate names
 which leg failed, never why, and "why" is the whole question when the answer might
 be that nothing is wrong.
 
+**Built, 2026-09-17: the CLI comes off the checker's crate, and a caller every
+survey here had missed.** `ply-cli` never checks a program. The only
+`check_program` string in the crate is `driver.rs`'s own doc line, which exists to
+record that the checker is *not* called on a command path. Everything else written
+`ply_core::` there was a name that lives in `ply-ty` -- `CheckOutput`, `DefInfo`,
+`Front`, `ModuleInfo`, `TestInfo`, `CtorInfo`, `LawBinder`, `Footprint`, `Type`,
+`Ordinal`, `print::Printer`, `print_scheme`, `print_type`, and since #348
+`prelude`. Forty-eight uses are re-pointed and the manifest trades `ply-core` for
+`ply-ty`. Every distinct head was checked against `ply-ty`'s exports first; the one
+that came back missing was `check_program`, the doc line, which is kept exactly as
+it was, because a sentence recording what is not called must keep naming the thing
+that is not called.
+
+Two claims, as before, because either alone would mislead: the CLI's **library** no
+longer links the checker's crate, and `ply-cli-tests` still declares it, calling
+`check_module` at two sites to typecheck its fixtures.
+
+**And the caller none of this record's surveys could see.**
+`benches/value-model/ply-arm` is a workspace member outside `crates/`, and it has
+called `ply_core::check_program` since `6aca8591` (2026-09-06). Every survey behind
+the caller counts in this record was rooted at `crates/`, so every one of those
+counts was short by one from the day it was written -- not stale, wrong when
+published. A repo-rooted sweep gives the real figures: **three** non-test callers
+of the checker, the seed path in `ply-codegen`, `pipeline.rs` in `ply-corpus`, and
+the benchmark's Ply arm; and **two** of the hasher, because the arm calls the
+checker alone. The sentences above are corrected in place rather than annotated.
+
+The defect was the method, and its general form is bounded: `cargo metadata`
+reports thirty-two members and exactly one outside `crates/`, so this is a single
+hole and not a systemic one. It is recorded because the shape recurs -- a search
+root chosen once, then trusted by everything downstream, is invisible precisely
+where it is wrong.
+
+**What the arm is, and why it is not what blocks the deletion.** It loads a
+project, parses, resolves and checks in order to build a `Source`, and then
+compiles that through `ply_codegen::c::build` -- the tier's own emitter -- and
+times the kernel entry. The front end is setup; the gate reads the call. So it
+retires with the chain, exactly as `pipeline.rs` does, and moving it to the port
+would remove a caller without unblocking anything: what stands between §2 and the
+checker's deletion is the seed path, and behind it the bundle migration that does
+not exist yet.
+
+**One thing worth arming, stated as unarmed.** `.github/ci-shards.sh`'s `members()`
+reads the workspace list with a `"crates/NAME"` pattern, so it extracts thirty-one
+of the thirty-two members and has never seen `ply-arm`. That file's own comment
+says a crate in neither `KNOWN_OUTSIDE` nor `members` is an accident, "nothing
+builds it and no job tests it" -- and the second half does not follow here, because
+`cargo clippy --locked --workspace --all-targets` compiles the arm on every push.
+So the coverage is real and the accounting is blind, which is the smaller defect
+and still a defect: the guard cannot say what it claims to say. Per §"Do not state
+a guarantee you have not armed": **not enforced.**
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -1082,7 +1137,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s and 147 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s and 166 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 

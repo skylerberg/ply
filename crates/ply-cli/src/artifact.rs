@@ -2,12 +2,12 @@
 //! content-addressed store already holds.
 
 use crate::load::Loaded;
-use ply_core::{DefInfo, Front};
 use ply_hash::body::StoredBody;
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Severity, SourceMap, Span, Symbol, codes};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::Resolved;
+use ply_ty::{DefInfo, Front};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -1176,7 +1176,7 @@ fn evaluate(
     span: Span,
     plan: &ply_eval::Plan,
     hosts: &crate::hosts::Hosts,
-    declared: Option<&ply_core::ty::Footprint>,
+    declared: Option<&ply_ty::ty::Footprint>,
     backend: Option<&String>,
     unit: Option<&EmbeddedUnit>,
 ) -> Result<ply_eval::Value, Diagnostic> {

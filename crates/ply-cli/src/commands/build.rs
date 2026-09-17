@@ -9,8 +9,8 @@ use crate::cli::BuildArgs;
 use crate::load::{Loaded, load};
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_OK};
-use ply_core::DefInfo;
 use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
+use ply_ty::DefInfo;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -339,7 +339,7 @@ fn schema_root<'a>(loaded: &'a Loaded, flag: &str, named: &str) -> Result<&'a De
 
 fn arity(def: &DefInfo) -> usize {
     match &def.scheme.ty {
-        ply_core::ty::Type::Fn { params, .. } => params.len(),
+        ply_ty::ty::Type::Fn { params, .. } => params.len(),
         _ => 0,
     }
 }

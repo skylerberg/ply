@@ -5,10 +5,10 @@ use crate::driver;
 use crate::load::{Loaded, load, project_root};
 use crate::signature;
 use crate::style::Style;
-use ply_core::print_scheme;
 use ply_span::{Diagnostic, Symbol};
 use ply_store::Store;
 use ply_syntax::ast::ModuleName;
+use ply_ty::print_scheme;
 use serde_json::{Value, json};
 
 /// What every line of the `--types` block is printed at: `IND` plus the two spaces that put a
@@ -147,13 +147,13 @@ fn print_types(loaded: &Loaded, explain: bool, style: Style) {
             );
             for op in effect.ops.values() {
                 let resource = if op.resource_param { "[r]" } else { "" };
-                let params: Vec<String> = op.params.iter().map(ply_core::print_type).collect();
+                let params: Vec<String> = op.params.iter().map(ply_ty::print_type).collect();
                 println!(
                     "{IND}    {} {}{resource}({}) -> {}",
                     style.dim(op.mode.as_str()),
                     op.name,
                     params.join(", "),
-                    ply_core::print_type(&op.ret),
+                    ply_ty::print_type(&op.ret),
                 );
             }
         }
@@ -324,8 +324,8 @@ pub fn report_json(loaded: &Loaded, warnings: &[Diagnostic]) -> Value {
                     "name": op.name,
                     "mode": op.mode,
                     "resource_param": op.resource_param,
-                    "params": op.params.iter().map(ply_core::print_type).collect::<Vec<_>>(),
-                    "returns": ply_core::print_type(&op.ret),
+                    "params": op.params.iter().map(ply_ty::print_type).collect::<Vec<_>>(),
+                    "returns": ply_ty::print_type(&op.ret),
                 })).collect::<Vec<_>>(),
             })
         })

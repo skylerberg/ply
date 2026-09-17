@@ -145,7 +145,7 @@ pub fn build_backend_over(
     spec: &ply_eval::BackendSpec,
     program: &ply_syntax::ast::Program,
     resolved: &ply_syntax::resolve::Resolved,
-    front: &ply_core::Front,
+    front: &ply_ty::Front,
     texts: std::collections::HashMap<String, String>,
 ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
     ply_codegen::c::producer::ensure_default();
@@ -165,7 +165,7 @@ pub fn build_backend(
     spec: &ply_eval::BackendSpec,
     program: &ply_syntax::ast::Program,
     resolved: &ply_syntax::resolve::Resolved,
-    check: &ply_core::CheckOutput,
+    check: &ply_ty::CheckOutput,
     texts: std::collections::HashMap<String, String>,
 ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
     ply_codegen::c::producer::ensure_default();
