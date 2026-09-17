@@ -110,11 +110,17 @@ fn call(
 fn load(dir: &str) -> &'static Source {
     let mut sources = ply_span::SourceMap::new();
     let mut units: Vec<(ply_span::SourceId, ModuleName, &'static str)> = Vec::new();
+    // The same texts the port is handed, in the same order: the protocol reads a span's module as
+    // its position in this list (ADR 0052 §1).
+    let mut modules: Vec<(String, String)> = Vec::new();
+    let mut ids: Vec<ply_span::SourceId> = Vec::new();
     // The whole standard library, under the names it ships with -- the kernels import `std.hash`,
     // and that module imports others.
     for name in ply_std::modules() {
         let text = ply_std::source(&name).expect("a listed std module has a source");
         let id = sources.add(ply_std::pseudo_path(&name), text.to_string());
+        modules.push((name.to_string(), text.to_string()));
+        ids.push(id);
         units.push((id, name, text));
     }
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
@@ -135,14 +141,23 @@ fn load(dir: &str) -> &'static Source {
                 .into_boxed_str(),
         );
         let id = sources.add(path.to_string_lossy().as_ref(), text.to_string());
+        modules.push((stem.clone(), text.to_string()));
+        ids.push(id);
         units.push((id, ModuleName::from_dotted(&stem), text));
     }
     let mut ast = ply_syntax::parse_program(units).expect("the project parses");
     let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the project resolves");
-    let check = ply_core::check_program(&ast, &resolved).expect("the project checks");
-    Box::leak(Box::new(Source::new(
-        Box::leak(Box::new(ast)),
-        Box::leak(Box::new(resolved)),
-        Box::leak(Box::new(check)),
-    )))
+    // The port answers the front end here, as the driver does: the gate times the kernel entry,
+    // and which front end built the `Source` is setup rather than what it reads (ADR 0052 §2).
+    ply_codegen::c::producer::ensure_default();
+    let front = Box::leak(Box::new(
+        ply_codegen::c::producer::front(&modules, &ids).expect("the port answers for this project"),
+    ));
+    let texts: std::collections::HashMap<String, String> = modules.into_iter().collect();
+    let program = Box::leak(Box::new(ast));
+    let resolved = Box::leak(Box::new(resolved));
+    let keys = ply_codegen::emit_keys(front);
+    Box::leak(Box::new(
+        Source::from_front(program, resolved, front, keys).with_texts(texts),
+    ))
 }

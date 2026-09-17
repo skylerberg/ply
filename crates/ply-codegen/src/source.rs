@@ -414,7 +414,7 @@ fn set_effect(
         Ok(binding) if check.effects.contains_key(&binding.qualified) => {
             Some(binding.qualified.clone())
         }
-        _ if q.is_bare() && ply_core::prelude::is_prelude_effect(q.symbol()) => {
+        _ if q.is_bare() && ply_ty::prelude::is_prelude_effect(q.symbol()) => {
             Some(q.symbol().clone())
         }
         _ => None,
@@ -670,7 +670,7 @@ impl Tables {
 /// with the import graph would be a different unit for the same program. Within one module that
 /// order is source order, which is what this keeps.
 fn ctors_of(front: &Front) -> Vec<(Symbol, usize)> {
-    let mut out: Vec<(Symbol, usize)> = ply_core::prelude::ctor_arities();
+    let mut out: Vec<(Symbol, usize)> = ply_ty::prelude::ctor_arities();
     let prelude: HashSet<Symbol> = out.iter().map(|(name, _)| name.clone()).collect();
     for (module, _) in &front.ordinals {
         out.extend(

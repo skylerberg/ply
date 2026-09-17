@@ -1,13 +1,13 @@
 //! What a database costs, on both sides of the effect boundary.
 
 use anyhow::{Context, Result, bail};
-use ply_core::CheckOutput;
-use ply_core::ty::Footprint;
 use ply_eval::host::HostRegistry;
 use ply_eval::{Machine, Value};
 use ply_host::db::{PoolConfig, value as dbvalue};
 use ply_span::{Diagnostic, Span};
 use ply_syntax::ast::ModuleName;
+use ply_ty::CheckOutput;
+use ply_ty::ty::Footprint;
 use serde::Serialize;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -47,7 +47,7 @@ pub struct Program {
     check: CheckOutput,
     /// The port's whole answer, so the tier is built from it rather than from a second front end
     /// derived inside `over_with_texts` (ADR 0052 §2).
-    port: ply_core::Front,
+    port: ply_ty::Front,
     sources: ply_span::SourceMap,
 }
 
