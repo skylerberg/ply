@@ -318,9 +318,17 @@ record's survey calls `ply-codegen` "a runtime beside a reference emitter
 (`c/emit.rs`, `opt.rs`)", which describes a separation the code does not have at
 the seam that matters. `c/build.rs` is the tier's own unit builder — it decides
 which bodies the tier takes, emits their C, and builds the tables the runtime
-reads them against — and it imports `super::emit` directly and calls
-`crate::opt::optimize` for every body it admits. So the emitter is not something
-only the differential reached; it is what the runtime's own builder calls.
+reads them against — and it imports `super::emit` directly. So the emitter is not something only the
+differential reached; it is what the runtime's own builder calls.
+
+**Corrected, same day: the optimiser is narrower than the sentence above said.**
+`crate::opt::optimize` has exactly one call site, in `emit_one`, and it sits
+*after* the early return that hands back the port's answer -- so a body the port
+answers is never optimised by `opt.rs`. What is on every path is `emit.rs` itself:
+`Tables` is the type the port's answer carries, `CTy` types the declared
+parameters, `PROLOGUE` goes into every unit's head, and `resolve` reads the tables
+back. The conclusion stands; its reason is the types and the unit structure, not
+the optimiser.
 
 That makes this deletion a split rather than a removal, and it is the third time
 today that planning a step from this record's prose has mis-sized it. The order
@@ -1270,6 +1278,54 @@ And the summary line now reports members under `crates/` plus however many sit
 outside, rather than calling the first number "workspace members". That was the
 smaller half of the defect and the one a reader would have believed.
 
+**Built, 2026-09-17: the census §2 asks for, and what it turns out to be.** §2
+says that before `c/emit.rs` goes, this record names the bodies the port still
+emits differently and why each is a missing fast path rather than a wrong rule.
+That clause was written while the emit differential ran both emitters over the
+same bodies and compared their C. The differential is retired, and its premise
+with it: on a build the port serves, `emit_one` returns the port's answer and
+`c/build.rs` says so in its own comment -- "the chain entered whole: the port's
+answer is the unit's, and the reference is not run". **There are no bodies both
+emit.** So the census is not a diff. It is the port's refusals.
+
+**The vocabulary, counted.** `emit.ply` raises a refusal at seventeen call sites
+with fifteen distinct reasons; `code.ply` raises none. They are: `iterate` with no
+`Stop` and `Continue` in the program; a capture the port has not bound; a local it
+has not bound; a global, a name, or an effect it cannot resolve; a constructor not
+in the table; a fixed-width literal of no known width; a literal it does not pool;
+a scalar parameter read outside its window; an operator it does not emit; a
+callback or inline builtin outside its fused shape; an effect construct or another
+node it does not emit; a `handle` this tier cannot carry; and a shift over a value
+whose type the fragment does not fix.
+
+**What a refusal does is not a fallback.** `emit_one` turns
+`Answer::Refused(why, _)` into the tier's own `Refused { function, construct: why }`,
+which joins the fixpoint's refusal list and drops the function from the compiled
+unit -- it stays interpreted. A construct the port does not emit costs a function
+its place in the tier; it does not produce a different emission.
+
+**Why each is a missing fast path and not a wrong rule -- armed, not argued.**
+`the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds` installs the
+producer, builds the emitter from the bundle, has it emit its own sources, and
+asserts `p1.refused.is_empty()`; on a refresh it asserts the same of the
+generation built from that emission. It is a `SOLO` row, so every push asserts
+that the port emits **all of itself, refusing nothing**. That is the goal's own
+argument made checkable: a wrong rule would not appear as a refusal, it would
+appear as a fixpoint that does not close, and that is the property this test
+watches.
+
+**What is not armed, and is the real precondition for deleting the emitter.**
+Nothing asserts the port answers every body it is asked for. The producer's counts
+are read in one place, `ply-codegen-tests/tests/producer.rs`, and asserted only
+`answered > 0` -- "the Ply emitter answered nothing of {asked} asked, so nothing
+below is about it", which is a liveness check. `parser_census.rs` and
+`fragment.rs`'s census over the standard library print refusals by construct and
+assert nothing about how many. So the port's coverage over std and the corpus is
+printed nowhere a gate reads. **Arming `answered == asked` over a named corpus is
+what would let §2 delete `c/emit.rs`**; until that exists the deletion would rest
+on prose, and this record has spent the day learning what prose-sized estimates
+are worth.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -1333,7 +1389,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s and 145 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s and 140 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
