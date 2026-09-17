@@ -5,7 +5,7 @@ use ply_eval::{HostAnswer, HostRequest, HostRuntime, Linearity};
 use ply_host::tcp::*;
 use ply_span::SourceId;
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::{Mode, ModuleName};
+use ply_syntax::ast::Mode;
 use ply_ty::CheckOutput;
 use ply_ty::{EffectAtom, Resource};
 use std::io::{Read, Write};
@@ -43,9 +43,18 @@ fn fixture() -> String {
 }
 
 fn check(source: &str) -> CheckOutput {
-    let module = ply_syntax::parse_module(SourceId(0), ModuleName::from_dotted(MODULE), source)
-        .expect("the declaration parses");
-    ply_core::check_module(&module).expect("the declaration typechecks")
+    ply_codegen::c::producer::ensure_default();
+    let front = ply_codegen::c::producer::front(
+        &[(MODULE.to_string(), source.to_string())],
+        &[SourceId(0)],
+    )
+    .expect("the port answers for the declaration");
+    assert!(
+        front.diagnostics.is_empty(),
+        "the declaration typechecks: {:?}",
+        front.diagnostics
+    );
+    front.check
 }
 
 fn bind(net: Arc<dyn Net>) -> HostBinding {

@@ -284,8 +284,16 @@ fn refused<T>(outcome: Result<T, Diagnostic>, why: &str) -> Diagnostic {
 }
 
 fn check(source: &str) -> ply_ty::CheckOutput {
-    let module = ply_syntax::parse(SourceId(0), source).expect("the fixture parses");
-    ply_core::check_module(&module).expect("the fixture typechecks")
+    ply_codegen::c::producer::ensure_default();
+    let front =
+        ply_codegen::c::producer::front(&[("m".to_string(), source.to_string())], &[SourceId(0)])
+            .expect("the port answers for the fixture");
+    assert!(
+        front.diagnostics.is_empty(),
+        "the fixture typechecks: {:?}",
+        front.diagnostics
+    );
+    front.check
 }
 
 /// A program whose footprint contains `task.write`, so the `Any` registrations have an atom to
