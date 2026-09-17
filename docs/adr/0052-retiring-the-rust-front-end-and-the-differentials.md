@@ -1453,7 +1453,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s and 153 s, each reusing by tree the same way and for the same reason. Five of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, which the entry closing this section takes. None of those three was caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s, 153 s and 199 s, each reusing by tree the same way and for the same reason. Six of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s and the sixth 199 s, which the two entries closing this section take. None of those four was caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
@@ -1572,6 +1572,48 @@ number be moved.
 203 s was variance and not a step, which is what the paragraph above said the next
 reading would settle. The bound holds without anything being done to the tree,
 which is the outcome a diagnosis pointing entirely at the platform predicts.
+
+**Read, 2026-09-17: main went red, and the job that caused it reported success.**
+Not a reading over the bound but a failure, recorded because the shape is worth
+knowing. Sixteen test jobs failed inside eighty seconds, every one with the same
+line: `Failed to restore cache entry. Exiting as fail-on-cache-miss is set. Input
+key: nextest-archive-<run id>`. No test ran.
+
+The cause was in none of the sixteen. `cargo nextest archive` **succeeded** -- it
+reused the archive an earlier run built for this tree, the mechanism §3's series
+describes -- and then hit `You've hit a rate limit, your rate limit will reset in
+13 seconds` and never saved the entry under this run's key. So the job that broke
+the run is green in the run's own summary, and the sixteen that are red name a
+cache key rather than a cause. The aggregate says which leg failed and never why,
+which is the procedure this record wrote down after an `sccache` HTTP 500: read
+the failing job's log, then read the log of the job it was waiting on.
+
+**The remedy follows from the shape, and getting it wrong costs a cycle.**
+Re-running only the failed jobs would have failed again: the key still would not
+exist, because nothing among those sixteen writes it. The whole run had to be
+re-run so the archive job's save step executed again. It did, and logged `Cache
+saved with key: nextest-archive-<run id>`.
+
+**And `fail-on-cache-miss` is vindicated by its own failure.** Without it each
+consumer would have rebuilt the archive quietly, turning a lost cache entry into
+sixteen slow green jobs and a wall clock this record would have spent an afternoon
+attributing to the tree. It failed loudly instead, and the loud failure took ten
+minutes to read.
+
+**Read, 2026-09-17: and that re-run went over, at 199 s, on one partition
+scheduled forty seconds late.** The figure is not an artifact of re-running:
+`run_started_at` is reset to the second attempt's start, and the job span reads
+191 s independently, the eight seconds between them being the run object's own
+bookkeeping. Where it went is narrow. Every partition started at 29 or 30 seconds
+except `test 4/8`, which started at **70** and ran 114 s to end at 184 -- thirty-
+nine seconds after the next-latest job, with nothing waiting on it. It was
+scheduled late.
+
+So the sixth over-bound reading is the same shape as the fifth: a job that did not
+*start*, not a job that ran long. The fifth was the aggregate waiting thirty-nine
+seconds after every job had finished; this one is a partition waiting forty before
+beginning. Both are the platform, and the tree is in neither -- the merge under
+this one changed one line of a test helper and one document.
 
 ## 4. The loop that is O(the change)
 
