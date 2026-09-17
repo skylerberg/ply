@@ -2,9 +2,9 @@
 //! definitions M5 has to check and evaluate, and refusing bytes that are not the ones their key
 //! names.
 
-use ply_hash::DefHash;
 use ply_hash::body::{BodySet, Reconstruction, StoredBody, reconstruct};
 use ply_span::Diagnostic;
+use ply_ty::DefHash;
 
 use crate::{BODY_ENCODING, DefBody, Store};
 

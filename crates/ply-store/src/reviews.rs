@@ -1,6 +1,6 @@
 //! What a human last accepted, per definition.
 
-use ply_hash::DefHash;
+use ply_ty::DefHash;
 use serde::{Deserialize, Serialize};
 
 /// The definition and the claims about it, as they stood when they were accepted.

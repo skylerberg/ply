@@ -8,6 +8,7 @@ mod effects;
 mod emit;
 mod emit_diff;
 mod fields;
+mod front;
 mod hash;
 mod infer;
 mod lexer_agreement;

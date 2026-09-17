@@ -48,19 +48,23 @@ import derive (Why, WFunction, WHandle, WFloatIsNotOrdered, WUnconstrained, WNul
 
 // --- What the checker keeps ----------------------------------------------------------
 
-type Loc = { module: Int, span: Span }
+// A prelude item's `at` is `{ module: 0, span: dummy_span() }`, the reference's `Span::DUMMY`.
+pub type Loc = { module: Int, span: Span }
 type TypeDecl = { params: List<Bytes>, alias: Option<TypeExpr>, owner: Int, span: Span }
-type OpInfo = { name: Bytes, mode: Mode, resource_param: Bool, params: List<Type>, ret: Type,
-                at: Loc, scheme: Option<Scheme> }
-type EffectInfo = { name: Bytes, module: Bytes, simple_name: Bytes, nondet: Bool, ops: List<OpInfo>, at: Loc }
-type CtorInfo = { name: Bytes, module: Bytes, simple_name: Bytes, type_name: Bytes, index: Int,
-                  arity: Int, fields: List<Type>, scheme: Scheme, at: Loc }
-type DefConstraint = { deriver: Deriver, param: Int }
-type DefInfo = { name: Bytes, module: Bytes, simple_name: Bytes, scheme: Scheme, footprint: List<Atom>,
-                 performed: List<Atom>, constraints: List<DefConstraint>, internally_effectful: Bool, at: Loc }
-type TestInfo = { key: Bytes, nondet: Bool, footprint: List<Atom> }
-type LawBinder = { name: Bytes, ty: Type }
-type LawInfo = { key: Bytes, binders: List<LawBinder>, has_guard: Bool, host: Bool, footprint: List<Atom> }
+pub type OpInfo = { name: Bytes, mode: Mode, resource_param: Bool, params: List<Type>, ret: Type,
+                    at: Loc, scheme: Option<Scheme> }
+pub type EffectInfo = { name: Bytes, module: Bytes, simple_name: Bytes, nondet: Bool, ops: List<OpInfo>, at: Loc }
+pub type CtorInfo = { name: Bytes, module: Bytes, simple_name: Bytes, type_name: Bytes, index: Int,
+                      arity: Int, fields: List<Type>, scheme: Scheme, at: Loc }
+pub type DefConstraint = { deriver: Deriver, param: Int }
+pub type SpecInfo = { kind: SpecKind, index: Int, footprint: List<Atom>, span: Span }
+pub type DefInfo = { name: Bytes, module: Bytes, simple_name: Bytes, scheme: Scheme, footprint: List<Atom>,
+                     performed: List<Atom>, row_aliases: List<Bytes>, constraints: List<DefConstraint>, spec: List<SpecInfo>,
+                     internally_effectful: Bool, at: Loc }
+pub type TestInfo = { name: Bytes, module: Bytes, key: Bytes, index: Int, nondet: Bool, footprint: List<Atom>, at: Loc }
+pub type LawBinder = { name: Bytes, ty: Type, span: Span }
+pub type LawInfo = { name: Bytes, module: Bytes, key: Bytes, index: Int, binders: List<LawBinder>, has_guard: Bool, host: Bool,
+                     footprint: List<Atom>, at: Loc }
 type PerformSite = { atom: Atom, module: Int, span: Span, direct: Bool }
 type Numeric = { span: Span, op: Bytes, ty: Type }
 // A bit operator's or an integer builtin's operand, kept until its type is known (ADR 0039).
@@ -187,7 +191,11 @@ fn deriver_tag(d: Deriver) -> Int = match d { DJson -> 0, DEq -> 1, DOrd -> 2 }
 
 fn same_deriver(a: Deriver, b: Deriver) -> Bool = deriver_tag(a) == deriver_tag(b)
 
-fn deriver_text(d: Deriver) -> Bytes = match d { DJson -> b"json", DEq -> b"eq", DOrd -> b"ord" }
+pub fn deriver_text(d: Deriver) -> Bytes = match d { DJson -> b"json", DEq -> b"eq", DOrd -> b"ord" }
+
+// The `effect set` names a row was written with, in source order.
+fn row_aliases(def: FnDef) -> List<Bytes> =
+  match def.effects { Some(r) -> map(r.aliases, |q: QName| q.name.name), None -> [] }
 
 // --- Fresh variables, threaded ---------------------------------------------------------
 
@@ -2183,7 +2191,8 @@ fn publish_known(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>, qualified: L
     let c3: Cx = recovered.cx;
     let bound: Cx = {..c3, env: env_bind_global(c3.env, name, a.sc), constraints: map_insert(c3.constraints, name, recovered.cs)};
     set_def(bound, { name: name, module: m.name, simple_name: def.name.name, scheme: a.sc, footprint: entry.footprint,
-                     performed: entry.performed, constraints: recovered.cs, internally_effectful: true, at: here(bound, def.span) })
+                     performed: entry.performed, row_aliases: row_aliases(def), constraints: recovered.cs, spec: [],
+                     internally_effectful: true, at: here(bound, def.span) })
   })
 
 fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
@@ -2219,7 +2228,8 @@ fn check_component_walked(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>, qua
     let performed = resolve_r(bound, at(bodies.rows, slot));
     set_def({..bound, ty_params: map_new(), constraints: map_insert(bound.constraints, at(qualified, slot), constraints)},
             { name: at(qualified, slot), module: m.name, simple_name: def.name.name, scheme: g.sc, footprint: row.atoms,
-              performed: performed.atoms, constraints: constraints, internally_effectful: true, at: here(bound, def.span) })
+              performed: performed.atoms, row_aliases: row_aliases(def), constraints: constraints, spec: [],
+              internally_effectful: true, at: here(bound, def.span) })
   })
 }
 
@@ -2419,7 +2429,8 @@ fn check_tests(cx: Cx, m: Mod) -> Cx = {
           },
         };
         let checked: Cx = footprint.cx;
-        { cx: {..checked, tests: push(checked.tests, { key: qualify(m.name, def.name), nondet: def.is_nondet, footprint: footprint.atoms })},
+        { cx: {..checked, tests: push(checked.tests, { name: def.name, module: m.name, key: qualify(m.name, def.name), index: len(checked.tests),
+                                                       nondet: def.is_nondet, footprint: footprint.atoms, at: here(checked, def.span) })},
           position: acc.position + 1 }
       },
       _ -> acc,
@@ -2517,10 +2528,14 @@ fn check_law(cx0: Cx, m: Mod, def: LawDef) -> Cx = {
   let row = resolve_r(c2, body.row);
   let c3: Cx = if def.host { c2 } else { check_spec_purity(c2, SSLawBody, [seed_atom()], expr_span(def.body), row) };
   let popped: Cx = {..c3, env: env_pop(c3.env)};
-  let binders = map(range(0, len(def.binders)), |i: Int| { name: at(def.binders, i).name.name, ty: resolve(popped, at(types.ts, i)) });
+  let binders = map(range(0, len(def.binders)), |i: Int| {
+    let b = at(def.binders, i);
+    { name: b.name.name, ty: resolve(popped, at(types.ts, i)), span: b.span }
+  });
   {..popped, ty_params: map_new(), row_params: map_new(),
-    laws: push(popped.laws, { key: qualify(m.name, def.name), binders: binders, has_guard: match def.guard { Some(_) -> true, None -> false },
-                              host: def.host, footprint: row.atoms })}
+    laws: push(popped.laws, { name: def.name, module: m.name, key: qualify(m.name, def.name), index: len(popped.laws), binders: binders,
+                              has_guard: match def.guard { Some(_) -> true, None -> false },
+                              host: def.host, footprint: row.atoms, at: here(popped, def.span) })}
 }
 
 // A binder's type has to be one the generator can inhabit: a handler is syntax, a written row
@@ -2675,11 +2690,20 @@ fn check_specs(cx: Cx, m: Mod) -> Cx = {
     match it {
       IFn(def) ->
         if len(def.spec) == 0 { c } else {
-          match spec_env_of(c, qualify(m.name, def.name.name)) {
+          let name = qualify(m.name, def.name.name);
+          match spec_env_of(c, name) {
             None -> c,
             Some(env) -> {
               let shadowed: Cx = check_result_shadow(c, def);
-              fold(def.spec, shadowed, |cc: Cx, clause: SpecClause| check_clause(cc, def, clause, env))
+              let walked = fold(range(0, len(def.spec)), { cx: shadowed, specs: [] }, |acc: { cx: Cx, specs: List<SpecInfo> }, i: Int| {
+                let clause = at(def.spec, i);
+                let o: WithAtoms = check_clause(acc.cx, def, clause, env);
+                { cx: o.cx, specs: push(acc.specs, { kind: clause.kind, index: i, footprint: o.atoms, span: clause.span }) }
+              });
+              match def_of(walked.cx, name) {
+                Some(d) -> { let info: DefInfo = d; set_def(walked.cx, {..info, spec: walked.specs}) },
+                None -> walked.cx,
+              }
             },
           }
         },
@@ -2688,7 +2712,7 @@ fn check_specs(cx: Cx, m: Mod) -> Cx = {
   {..walked, ty_params: map_new(), row_params: map_new()}
 }
 
-fn check_clause(cx: Cx, def: FnDef, clause: SpecClause, env: SpecEnv) -> Cx = {
+fn check_clause(cx: Cx, def: FnDef, clause: SpecClause, env: SpecEnv) -> WithAtoms = {
   let c0: Cx = {..cx, ty_params: env.ty_params, row_params: env.row_params, performs: []};
   let pushed: Cx = {..c0, env: env_push(c0.env)};
   let bound: Cx = fold(range(0, len(def.params)), pushed, |c: Cx, i: Int|
@@ -2701,7 +2725,8 @@ fn check_clause(cx: Cx, def: FnDef, clause: SpecClause, env: SpecEnv) -> Cx = {
   let o: Inferred = infer({..with_result, spec_kind: Some(clause.kind)}, clause.expr);
   let popped: Cx = {..o.cx, spec_kind: outer, env: env_pop(o.cx.env)};
   let c1: Cx = expect(popped, expr_span(clause.expr), t_bool(), o.ty, b"a spec clause states a proposition").cx;
-  check_spec_purity(c1, match clause.kind { SRequires -> SSRequires, SEnsures -> SSEnsures }, [], clause.span, resolve_r(c1, o.row))
+  let row = resolve_r(c1, o.row);
+  { cx: check_spec_purity(c1, match clause.kind { SRequires -> SSRequires, SEnsures -> SSEnsures }, [], clause.span, row), atoms: row.atoms }
 }
 
 // `result` is introduced beside the parameters, so a definition that has both is reported.
@@ -3194,8 +3219,7 @@ fn mark_internal_effects(cx: Cx) -> Cx = {
   let c: Cx = seeded.cx;
   fold(range(0, n), c, |cc: Cx, i: Int|
     match def_of(cc, at(names, i)) {
-      Some(d) -> set_def(cc, { name: d.name, module: d.module, simple_name: d.simple_name, scheme: d.scheme, footprint: d.footprint,
-                                performed: d.performed, constraints: d.constraints, internally_effectful: at(propagated, i), at: d.at }),
+      Some(d) -> { let info: DefInfo = d; set_def(cc, {..info, internally_effectful: at(propagated, i)}) },
       None -> cc,
     })
 }
@@ -3219,6 +3243,18 @@ pub fn check_program(r: Resolved, mods: List<Mod>) -> Checked = check_program_wi
 pub fn check_diagnostics(r: Resolved, mods: List<Mod>) -> List<Diag> = {
   let out = check_program(r, mods);
   if fold(out.cx.diags, false, |b: Bool, d: Diag| b || d.severity == b"error") { dedup_diags(out.cx.diags) } else { [] }
+}
+
+// What `check_program` publishes, for `front.ply`: the tables `CheckOutput` holds, prelude
+// entries included as the reference includes them, or the driver's `Err` when any is an error.
+pub type Front = { ok: Bool, diags: List<Diag>, defs: List<DefInfo>, tests: List<TestInfo>, laws: List<LawInfo>,
+                   effects: List<EffectInfo>, ctors: List<CtorInfo> }
+
+pub fn check_front(r: Resolved, mods: List<Mod>) -> Front = {
+  let out = check_program(r, mods);
+  let failed = fold(out.cx.diags, false, |b: Bool, d: Diag| b || d.severity == b"error");
+  { ok: !failed, diags: if failed { dedup_diags(out.cx.diags) } else { [] },
+    defs: out.cx.defs, tests: out.cx.tests, laws: out.cx.laws, effects: out.cx.effects, ctors: out.cx.ctors }
 }
 
 // The program-wide names of the definitions the checker publishes as pure -- an empty footprint
