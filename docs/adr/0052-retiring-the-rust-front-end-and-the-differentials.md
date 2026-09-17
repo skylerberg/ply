@@ -1278,6 +1278,39 @@ the 28 s object-cache restore rather than the tests, and the largest single
 movement was 40 s of provisioning that no change here touches. Neither is the
 lever §3 assumed, which is that the deletions shrink the shards.
 
+**Built, 2026-09-17: the excursion is one test, and it is this record's own
+doing.** `29f0dbc0` ran 187 s, the second reading over the bound, so the entry
+above was a plateau and not a bad draw. The eight partitions ran 430 tests each
+and took 65.5, 65.2, 69.0, 72.9, 102.7, 48.3, 64.9 and 58.6 s: equal counts, and
+one slice half again as long as any other.
+
+5/8's 102.7 s is two tests. `parser_census::the_census_over_the_parser_spike`
+took 52.150 s and a `ply-corpus-tests` `w3` test 20.489 s; the other 428 ran in
+hundredths. Before #387 the same census took 9.626 s in the same slice. It asks
+`producer::front` for its check now rather than `ply_core::check_program`, so it
+reads the standard library and the spike through the bundle: 42.5 s more,
+against a wall that moved 45 s. That is the whole excursion, and it is §1's cost
+arriving in §3.
+
+It hid because `nextest` marks a test slow at 60 s and this one is 52.
+
+So the question the entry above left open is closed, and neither of its
+candidates was the answer. The 28 s object-cache restore is real work on the
+path the tests read -- `cache_dir` falls back to `temp_dir()/ply-c-cache`, which
+is the directory the action restores -- and the 40 s of provisioning explained
+that run's pole rather than this one's.
+
+The census gets a runner. One line in `SOLO`, and no override in
+`.config/nextest.toml`: it needs a runner rather than the whole pool, unlike the
+bootstrap fixpoint and the tier test above it. `verify` counts seven solo tests
+now, and `exclude-filter` keeps it out of the partitions. That should leave 4/8
+the pole near 73 s and the wall near 155 s.
+
+What it does not do is make the work cheaper. Entering the port is what §1 asked
+for and the census still pays it; its own runner only stops it setting the wall.
+When §2 shrinks what the spike compiles, this is the entry to come back to and
+ask whether the job is still worth a runner.
+
 **Read, 2026-09-17: where §2 ends, and why it is not the bundle migration.**
 This record has said, more than once, that the seed path cannot go before a
 textual migration of an unserved bundle exists. That is true and it is not the
