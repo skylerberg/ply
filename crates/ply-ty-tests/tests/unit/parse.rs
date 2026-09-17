@@ -269,8 +269,20 @@ fn std_check() -> CheckOutput {
         assert!(expansion.is_empty(), "{name}: {expansion:?}");
         program.modules.push(module);
     }
-    let resolved = ply_syntax::resolve(&mut program).expect("the standard library resolves");
-    ply_core::check_program(&program, &resolved).expect("the standard library checks")
+    ply_syntax::resolve(&mut program).expect("the standard library resolves");
+    let modules: Vec<(String, String)> = ply_std::sources()
+        .map(|(n, t)| (n.to_string(), t.to_string()))
+        .collect();
+    let ids: Vec<SourceId> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
+    ply_codegen::c::producer::ensure_default();
+    let front = ply_codegen::c::producer::front(&modules, &ids)
+        .expect("the port answers for the standard library");
+    assert!(
+        front.diagnostics.is_empty(),
+        "the standard library checks: {:?}",
+        front.diagnostics
+    );
+    front.check
 }
 
 #[test]
