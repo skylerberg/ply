@@ -229,9 +229,12 @@ fn front_end(src: &Sources) -> Result<&'static Source, String> {
         front(&modules, &ids).map_err(|e| format!("{e:#}"))?,
     ));
     let keys = crate::source::emit_keys(front);
-    Ok(Box::leak(Box::new(Source::from_front(
-        program, resolved, front, keys,
-    ))))
+    // `bodies_of` hands the emitter each module's text and answers an empty map without them, so
+    // an unattached `texts` refuses every root as unanswered rather than failing once.
+    let texts: HashMap<String, String> = modules.iter().cloned().collect();
+    Ok(Box::leak(Box::new(
+        Source::from_front(program, resolved, front, keys).with_texts(texts),
+    )))
 }
 
 pub fn reset_thread() {
