@@ -99,6 +99,10 @@ pub struct Front {
     pub resolved: Resolved,
     pub check: CheckOutput,
     pub hashes: HashOutput,
+    /// The port's whole answer, for the tier this program is run on. `check` and `hashes` above
+    /// stay the Rust chain's, because timing their phases is what this harness reports — the two
+    /// answer different questions and only one of them is a measurement (ADR 0052 §2).
+    pub port: ply_core::Front,
     pub timings: Timings,
     /// This program's region kinds.
     region_kinds: ply_eval::region_kind::Kinds,
@@ -108,7 +112,7 @@ impl Front {
     /// A machine over the program with the default tier attached.
     pub fn machine(&self) -> ply_eval::Machine<'_> {
         let mut machine =
-            crate::tier_machine(&self.program, &self.resolved, &self.check, &self.sources);
+            crate::tier_machine(&self.program, &self.resolved, &self.port, &self.sources);
         machine.share_region_kinds(self.shared_region_kinds());
         machine
     }
@@ -162,6 +166,20 @@ pub fn front(root: &Path) -> Result<Front> {
     let hashes = ply_hash::hash_program(&program, &resolved, &check).map_err(|d| report(&d))?;
     timings.record(Phase::Hash, started.elapsed());
 
+    // Outside the clock: the rows above are the chain's, and this is only what the tier is
+    // built from.
+    let ordered: Vec<(String, String)> = ids
+        .iter()
+        .zip(&names)
+        .map(|(&id, name)| {
+            (
+                name.to_string(),
+                sources.get(id).map_or(String::new(), |f| f.text.to_string()),
+            )
+        })
+        .collect();
+    let port = crate::port_front(&ordered, &ids)?;
+
     Ok(Front {
         root: root.to_path_buf(),
         files,
@@ -170,6 +188,7 @@ pub fn front(root: &Path) -> Result<Front> {
         resolved,
         check,
         hashes,
+        port,
         timings,
         region_kinds: ply_eval::region_kind::Kinds::default(),
     })

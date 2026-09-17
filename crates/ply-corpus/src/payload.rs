@@ -60,7 +60,7 @@ impl Checked {
         crate::tier_machine(
             &self.loaded.program,
             &self.loaded.resolved,
-            &self.loaded.check,
+            &self.loaded.front,
             &self.loaded.sources,
         )
     }

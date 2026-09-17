@@ -386,7 +386,7 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
             std::hint::black_box(crate::tier_machine(
                 &loaded.program,
                 &loaded.resolved,
-                &loaded.check,
+                &loaded.front,
                 &loaded.sources,
             ));
             started.elapsed()
