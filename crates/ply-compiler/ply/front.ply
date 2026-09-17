@@ -8,15 +8,22 @@
 // resolve, and stop; index for the hasher, and stop; check, and stop on an error. The tables
 // follow only when no stage raised.
 
-import spine (Span, Ident, num)
+import spine (Span, Ident, QName, num)
 import lexer (byte_of)
-import items (Item, IFn, IType, IEffect, ITest, ILaw, TDSum, VariantDef, SpecClause, SpecKind, SRequires, SEnsures, ImportDecl)
-import types (Mode, MRead, MWrite, MBad)
-import tycore (Atom, Type, atom_text, scheme_text, type_text, at, append)
-import resolve (Source, Mod, Diag, Resolved_, Failed, resolve_modules, qualify)
+import items (Item, IFn, IType, IEffect, ITest, ILaw, IEffectSet, EffectSetDef, TDSum, VariantDef, SpecClause,
+              SpecKind, SRequires, SEnsures, ImportDecl, Vis, VPub, VPriv)
+import types (Mode, MRead, MWrite, MBad, AtomExpr)
+import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord, ERecordUpdate,
+              ETry, EField, EList, EPerform, EHandle, EWithCell, EWithRegion, ESimulate, EBad,
+              Param, Stmt, SLet, SExpr, MatchArm, RecField)
+import patterns (Lit, LInt, LStr, LBytes)
+import tycore (Atom, Resource, RNamed, RSingleton, Type, atom_text, atoms_insert, scheme_text, type_text,
+               at, append, take, contains_bytes)
+import resolve (Source, Mod, Diag, Resolved, Resolved_, Failed, Ns, NEffect, resolve_modules, qualify,
+                lookup, find, is_bare)
 import hash (Index, Entry, EDef, ETest, ELaw, HashOutput, build_index, hash_index, hex)
 import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder, EffectInfo, OpInfo, CtorInfo,
-              check_front, deriver_text)
+              check_front, deriver_text, is_prelude_effect)
 import diag (Parsed, parse_all, outside_every_module, frame, field, flag)
 import std.hash (blake3)
 
@@ -40,6 +47,174 @@ fn span_text(module: Int, s: Span) -> Bytes =
 
 fn loc_text(l: Loc) -> Bytes = span_text(l.module, l.span)
 
+// --- What the source wrote ----------------------------------------------------
+//
+// The visibilities, the `reuse` markers, the parameters as written, the types, each test label's
+// span, the literals each guard mentions and the effect sets: what the driver's consumers read
+// from the tree and the checker's tables do not keep. Read off `Mod` here rather than threaded
+// through the checker, as the reference reads them off `Program`.
+
+fn vis_public(v: Vis) -> Bool = match v { VPub -> true, VPriv -> false }
+
+type Written = { public: Bool, reuse: Bool, params: List<Param> }
+
+fn no_written() -> Written = { public: false, reuse: false, params: [] }
+
+fn fn_written(mods: List<Mod>) -> Map<Bytes, Written> =
+  fold(mods, map_new(), |acc: Map<Bytes, Written>, m: Mod|
+    fold(m.module.items, acc, |a: Map<Bytes, Written>, it: Item|
+      match it {
+        IFn(d) -> map_insert(a, qualify(m.name, d.name.name),
+                             { public: vis_public(d.vis),
+                               reuse: match d.reuse { Some(_) -> true, None -> false },
+                               params: d.params }),
+        _ -> a,
+      }))
+
+fn written_of(m: Map<Bytes, Written>, name: Bytes) -> Written =
+  match map_get(m, name) { Some(w) -> w, None -> no_written() }
+
+fn effect_written(mods: List<Mod>) -> Map<Bytes, Bool> =
+  fold(mods, map_new(), |acc: Map<Bytes, Bool>, m: Mod|
+    fold(m.module.items, acc, |a: Map<Bytes, Bool>, it: Item|
+      match it { IEffect(d) -> map_insert(a, qualify(m.name, d.name.name), vis_public(d.vis)), _ -> a }))
+
+// A prelude effect is declared by no source, so it has no entry and is public.
+fn effect_public_of(m: Map<Bytes, Bool>, e: EffectInfo) -> Bool =
+  match map_get(m, e.name) { Some(b) -> b, None -> true }
+
+// A `type` is the one declaration no table of the checker's holds: a sum type reaches them through
+// its constructors and an alias reaches them not at all.
+type TypeRow = { name: Bytes, module: Bytes, simple_name: Bytes, public: Bool, arity: Int, at: Loc }
+
+fn type_rows(mods: List<Mod>) -> List<TypeRow> =
+  fold(range(0, len(mods)), [], |acc: List<TypeRow>, i: Int| {
+    let m = at(mods, i);
+    fold(m.module.items, acc, |a: List<TypeRow>, it: Item|
+      match it {
+        IType(d) -> push(a, { name: qualify(m.name, d.name.name), module: m.name,
+                              simple_name: d.name.name, public: vis_public(d.vis),
+                              arity: len(d.params), at: { module: i, span: d.span } }),
+        _ -> a,
+      })
+  })
+
+fn test_name_spans(mods: List<Mod>) -> List<Loc> =
+  fold(range(0, len(mods)), [], |acc: List<Loc>, i: Int| {
+    let m = at(mods, i);
+    fold(m.module.items, acc, |a: List<Loc>, it: Item|
+      match it { ITest(d) -> push(a, { module: i, span: d.name_span }), _ -> a })
+  })
+
+// --- A guard's literals -------------------------------------------------------
+//
+// `ply-cli`'s `Literals::collect`: a stack, children pushed in source order and taken last-first,
+// each value kept the first time it is reached. The order seeds the prover's witness search rather
+// than deciding an answer, which is why it is pinned here rather than sorted.
+
+fn keep(acc: List<Bytes>, x: Bytes) -> List<Bytes> = if contains_bytes(acc, x) { acc } else { push(acc, x) }
+
+fn int_lit(k: Int) -> Bytes = bytes_concat(b"int ", num(k))
+
+fn lit_text(acc: List<Bytes>, l: Lit) -> List<Bytes> =
+  match l {
+    LInt(k) -> keep(acc, int_lit(k)),
+    LStr(s) -> keep(acc, bytes_concat(b"str ", s)),
+    LBytes(b) -> keep(acc, bytes_concat(b"bytes ", hex(b))),
+    _ -> acc,
+  }
+
+// `-1000000` is a negation of a literal in the tree and a bound in the guard, so the value the
+// search wants is the negated one. The literal under it is still reached: the walk goes on to the
+// operand either way. A literal is never negative, so negating one cannot overflow.
+fn neg_lit(acc: List<Bytes>, e: Expr) -> List<Bytes> =
+  match e { ELit(v) -> match v.lit { LInt(k) -> keep(acc, int_lit(0 - k)), _ -> acc }, _ -> acc }
+
+type Walk = { stack: List<Expr>, acc: List<Bytes> }
+
+fn arm_exprs(s: List<Expr>, arm: MatchArm) -> List<Expr> =
+  push(match arm.guard { Some(g) -> push(s, g), None -> s }, arm.body)
+
+fn stmt_exprs(s: List<Expr>, st: Stmt) -> List<Expr> =
+  match st { SLet(x) -> push(s, x.value), SExpr(x) -> push(s, x) }
+
+fn field_exprs(s: List<Expr>, f: RecField) -> List<Expr> = push(s, f.value)
+
+fn collect_lits(stack: List<Expr>, acc: List<Bytes>) -> List<Bytes> =
+  if len(stack) == 0 { acc } else {
+    let e = at(stack, len(stack) - 1);
+    let rest = take(stack, len(stack) - 1);
+    let step: Walk = match e {
+      ELit(v) -> { stack: rest, acc: lit_text(acc, v.lit) },
+      EVar(_) -> { stack: rest, acc: acc },
+      EBad(_) -> { stack: rest, acc: acc },
+      EBinary(v) -> { stack: push(push(rest, v.lhs), v.rhs), acc: acc },
+      EUnary(v) -> { stack: push(rest, v.operand),
+                     acc: if v.op == b"neg" { neg_lit(acc, v.operand) } else { acc } },
+      ELambda(v) -> { stack: push(rest, v.body), acc: acc },
+      EApp(v) -> { stack: append(push(rest, v.func), v.args), acc: acc },
+      EIf(v) -> { stack: push(push(push(rest, v.cond), v.then_branch), v.else_branch), acc: acc },
+      EMatch(v) -> { stack: fold(v.arms, push(rest, v.scrutinee), arm_exprs), acc: acc },
+      EBlock(v) -> { stack: match v.tail { Some(t) -> push(fold(v.stmts, rest, stmt_exprs), t),
+                                           None -> fold(v.stmts, rest, stmt_exprs) },
+                     acc: acc },
+      ERecord(v) -> { stack: fold(v.fields, rest, field_exprs), acc: acc },
+      ERecordUpdate(v) -> { stack: fold(v.fields, push(rest, v.base), field_exprs), acc: acc },
+      EField(v) -> { stack: push(rest, v.base), acc: acc },
+      ETry(v) -> { stack: push(rest, v.operand), acc: acc },
+      EList(v) -> { stack: append(rest, v.items), acc: acc },
+      EPerform(v) -> { stack: append(rest, v.args), acc: acc },
+      EHandle(v) -> { stack: push(rest, v.body), acc: acc },
+      EWithCell(v) -> { stack: push(push(rest, v.init), v.body), acc: acc },
+      EWithRegion(v) -> { stack: push(rest, v.body), acc: acc },
+      ESimulate(v) -> { stack: push(rest, v.body), acc: acc },
+    };
+    collect_lits(step.stack, step.acc)
+  }
+
+fn law_literals(mods: List<Mod>) -> List<List<Bytes>> =
+  fold(mods, [], |acc: List<List<Bytes>>, m: Mod|
+    fold(m.module.items, acc, |a: List<List<Bytes>>, it: Item|
+      match it {
+        ILaw(d) -> push(a, match d.guard { Some(g) -> collect_lits([g], []), None -> [] }),
+        _ -> a,
+      }))
+
+// --- A module's effect sets ---------------------------------------------------
+//
+// `ply-cli`'s `signature::atom_of`: an atom whose effect resolves to nothing is dropped, as the
+// row that named it dropped it. `cell` is written bare and resolves to itself.
+
+fn has_effect(effects: List<EffectInfo>, name: Bytes) -> Bool =
+  fold(effects, false, |acc: Bool, e: EffectInfo| acc || e.name == name)
+
+fn bare_prelude(q: QName) -> Option<Bytes> =
+  if is_bare(q) && is_prelude_effect(q.name.name) { Some(q.name.name) } else { None }
+
+fn set_effect(r: Resolved, effects: List<EffectInfo>, module: Int, q: QName) -> Option<Bytes> =
+  if is_bare(q) && q.name.name == b"cell" { Some(b"cell") } else {
+    let found = if is_bare(q) { lookup(at(r.scopes, module).bound, NEffect, q.name.name) }
+                else { find(r, module, NEffect, q) };
+    match found {
+      Some(b) -> if has_effect(effects, b.qualified) { Some(b.qualified) } else { bare_prelude(q) },
+      None -> bare_prelude(q),
+    }
+  }
+
+fn set_atoms(r: Resolved, effects: List<EffectInfo>, module: Int, xs: List<AtomExpr>) -> List<Atom> =
+  fold(xs, [], |acc: List<Atom>, a: AtomExpr|
+    match set_effect(r, effects, module, a.eff) {
+      Some(eff) -> atoms_insert(acc, { effect: eff,
+                                       resource: match a.resource { Some(x) -> RNamed(x.name), None -> RSingleton },
+                                       mode: a.mode }),
+      None -> acc,
+    })
+
+fn set_field(r: Resolved, effects: List<EffectInfo>, module: Int, d: EffectSetDef) -> Bytes =
+  field(b"effect_set", bytes_concat_all([d.name.name, b" ",
+                                         join(map(d.includes, |q: QName| q.name.name), b","), b" ",
+                                         atoms_text(set_atoms(r, effects, module, d.expansion))]))
+
 // --- The frames -------------------------------------------------------------
 //
 //   <kind> <name> <payload length>\n<payload>
@@ -61,7 +236,7 @@ fn order_frame(order: List<Int>, mods: List<Mod>) -> Bytes =
 
 // `module <name>`: `index`, then `ModuleInfo.items` — the program-wide name of every item that
 // has one, a sum type's variants after the type — and the imports, each module once.
-fn module_frame(i: Int, m: Mod) -> Bytes = {
+fn module_frame(i: Int, m: Mod, r: Resolved, effects: List<EffectInfo>) -> Bytes = {
   let items = fold(m.module.items, [], |acc: List<Bytes>, it: Item|
     match it {
       IFn(d) -> push(acc, field(b"item", qualify(m.name, d.name.name))),
@@ -79,30 +254,42 @@ fn module_frame(i: Int, m: Mod) -> Bytes = {
     let name = join(map(d.path, |x: Ident| x.name), b".");
     if fold(acc, false, |b: Bool, x: Bytes| b || x == name) { acc } else { push(acc, name) }
   });
-  framed(b"module", m.name, cat([[field(b"index", num(i))], items, map(imports, |n: Bytes| field(b"import", n))]))
+  let sets = fold(m.module.items, [], |acc: List<Bytes>, it: Item|
+    match it { IEffectSet(d) -> push(acc, set_field(r, effects, i, d)), _ -> acc });
+  framed(b"module", m.name, cat([[field(b"index", num(i))], items,
+                                 map(imports, |n: Bytes| field(b"import", n)), sets]))
 }
 
-fn def_frame(d: DefInfo) -> Bytes =
+fn def_frame(d: DefInfo, w: Written) -> Bytes =
   framed(b"def", d.name, cat([
-    [field(b"module", d.module), field(b"simple_name", d.simple_name), field(b"scheme", scheme_text(d.scheme)),
+    [field(b"module", d.module), field(b"simple_name", d.simple_name),
+     field(b"public", flag(w.public)), field(b"reuse", flag(w.reuse)), field(b"scheme", scheme_text(d.scheme)),
      field(b"footprint", atoms_text(d.footprint)), field(b"performed", atoms_text(d.performed))],
     map(d.constraints, |c: DefConstraint| field(b"constraint", bytes_concat_all([deriver_text(c.deriver), b" ", num(c.param)]))),
     [field(b"internally_effectful", flag(d.internally_effectful))],
     map(d.row_aliases, |a: Bytes| field(b"row_alias", a)),
+    map(w.params, |p: Param| field(b"param", bytes_concat_all([p.name.name, b" ", span_text(d.at.module, p.span)]))),
     map(d.spec, |s: SpecInfo| field(b"spec", bytes_concat_all([kind_text(s.kind), b" ", num(s.index), b" ", atoms_text(s.footprint), b"\n", span_text(d.at.module, s.span)]))),
     [field(b"span", loc_text(d.at))]]))
 
-fn test_frame(t: TestInfo) -> Bytes =
+fn type_frame(t: TypeRow) -> Bytes =
+  framed(b"type", t.name,
+    [field(b"module", t.module), field(b"simple_name", t.simple_name), field(b"public", flag(t.public)),
+     field(b"arity", num(t.arity)), field(b"span", loc_text(t.at))])
+
+fn test_frame(t: TestInfo, name_at: Loc) -> Bytes =
   framed(b"test", num(t.index),
     [field(b"key", t.key), field(b"name", t.name), field(b"module", t.module), field(b"index", num(t.index)),
-     field(b"nondet", flag(t.nondet)), field(b"footprint", atoms_text(t.footprint)), field(b"span", loc_text(t.at))])
+     field(b"nondet", flag(t.nondet)), field(b"footprint", atoms_text(t.footprint)), field(b"span", loc_text(t.at)),
+     field(b"name_span", loc_text(name_at))])
 
-fn law_frame(l: LawInfo) -> Bytes =
+fn law_frame(l: LawInfo, lits: List<Bytes>) -> Bytes =
   framed(b"law", num(l.index), cat([
     [field(b"key", l.key), field(b"name", l.name), field(b"module", l.module), field(b"index", num(l.index))],
     map(l.binders, |b: LawBinder| field(b"binder", bytes_concat_all([b.name, b" ", span_text(l.at.module, b.span), b"\n", type_text(b.ty)]))),
     [field(b"has_guard", flag(l.has_guard)), field(b"host", flag(l.host)), field(b"footprint", atoms_text(l.footprint)),
-     field(b"span", loc_text(l.at))]]))
+     field(b"span", loc_text(l.at))],
+    map(lits, |x: Bytes| field(b"literal", x))]))
 
 // An operation: one line of `<name> <mode> <resource param> <param count> <has scheme> <span>`,
 // one line per parameter type, the return type's line, and the scheme's when it has one.
@@ -115,9 +302,10 @@ fn op_text(module: Int, o: OpInfo) -> Bytes = {
                     match o.scheme { Some(sc) -> bytes_concat(scheme_text(sc), b"\n"), None -> b"" }])
 }
 
-fn effect_frame(e: EffectInfo) -> Bytes =
+fn effect_frame(e: EffectInfo, public: Bool) -> Bytes =
   framed(b"effect", e.name, cat([
-    [field(b"module", e.module), field(b"simple_name", e.simple_name), field(b"nondet", flag(e.nondet))],
+    [field(b"module", e.module), field(b"simple_name", e.simple_name), field(b"public", flag(public)),
+     field(b"nondet", flag(e.nondet))],
     map(e.ops, |o: OpInfo| field(b"op", op_text(e.at.module, o))),
     [field(b"span", loc_text(e.at))]]))
 
@@ -216,15 +404,24 @@ fn ordinal_frame(m: Mod) -> Bytes =
       _ -> acc,
     }))
 
-fn tables(mods: List<Mod>, order: List<Int>, c: Front, index: Index, h: HashOutput) -> List<Bytes> =
-  cat([[order_frame(order, mods)],
-       map(range(0, len(mods)), |i: Int| module_frame(i, at(mods, i))),
-       map(c.defs, def_frame), map(c.tests, test_frame), map(c.laws, law_frame),
-       map(c.effects, effect_frame), map(c.ctors, ctor_frame),
+fn tables(mods: List<Mod>, r: Resolved, c: Front, index: Index, h: HashOutput) -> List<Bytes> = {
+  let fns = fn_written(mods);
+  let effs = effect_written(mods);
+  let names = test_name_spans(mods);
+  let lits = law_literals(mods);
+  cat([[order_frame(r.order, mods)],
+       map(range(0, len(mods)), |i: Int| module_frame(i, at(mods, i), r, c.effects)),
+       map(c.defs, |d: DefInfo| def_frame(d, written_of(fns, d.name))),
+       map(type_rows(mods), type_frame),
+       map(range(0, len(c.tests)), |i: Int| test_frame(at(c.tests, i), at(names, i))),
+       map(range(0, len(c.laws)), |i: Int| law_frame(at(c.laws, i), at(lits, i))),
+       map(c.effects, |e: EffectInfo| effect_frame(e, effect_public_of(effs, e))),
+       map(c.ctors, ctor_frame),
        hash_frames(index, h),
        map(mods, ordinal_frame),
        map(h.bodies, |b: { name: Bytes, body: Bytes }| framed(b"body", b.name, [hex(b.body)])),
        map(range(0, len(h.test_bodies)), |i: Int| framed(b"testbody", num(i), [hex(at(h.test_bodies, i))]))])
+}
 
 fn front(sources: List<Source>) -> List<Bytes> = {
   let parsed = parse_all(sources);
@@ -237,7 +434,7 @@ fn front(sources: List<Source>) -> List<Bytes> = {
         if len(built.diags) > 0 { diag_frames(map(built.diags, outside_every_module)) } else {
           let checked: Front = check_front(x.r, x.mods);
           if !checked.ok { diag_frames(map(checked.diags, outside_every_module)) }
-          else { tables(x.mods, x.r.order, checked, built.index, hash_index(built.index)) }
+          else { tables(x.mods, x.r, checked, built.index, hash_index(built.index)) }
         }
       },
     }
@@ -273,22 +470,22 @@ test "the order and the module frame come first" {
 
 test "a definition frames its scheme, footprint and span" {
   assert(holds(front_dump(program()),
-    b"def m.say 155\nmodule 1\nmsimple_name 3\nsayscheme 31\n(Bytes) -> Unit / {m.log.write}footprint 11\nm.log.writeperformed 11\nm.log.writeinternally_effectful 1\n1span 8\n0 72 126"))
+    b"def m.say 191\nmodule 1\nmsimple_name 3\nsaypublic 1\n0reuse 1\n0scheme 31\n(Bytes) -> Unit / {m.log.write}footprint 11\nm.log.writeperformed 11\nm.log.writeinternally_effectful 1\n1param 9\nb 0 79 87span 8\n0 72 126"))
 }
 
 test "a test is framed by its index and carries its key" {
   assert(holds(front_dump(program()),
-    b"test 0 92\nkey 6\nm.saysname 4\nsaysmodule 1\nmindex 1\n0nondet 1\n0footprint 11\nm.log.writespan 9\n0 127 152"))
+    b"test 0 113\nkey 6\nm.saysname 4\nsaysmodule 1\nmindex 1\n0nondet 1\n0footprint 11\nm.log.writespan 9\n0 127 152name_span 9\n0 132 138"))
 }
 
 test "an effect frames each operation on its own lines" {
   assert(holds(front_dump(program()),
-    b"effect m.log 92\nmodule 1\nmsimple_name 3\nlognondet 1\n0op 36\nemit write 0 1 0 0 13 38\nBytes\nUnit\nspan 6\n0 0 40"))
+    b"effect m.log 102\nmodule 1\nmsimple_name 3\nlogpublic 1\n0nondet 1\n0op 36\nemit write 0 1 0 0 13 38\nBytes\nUnit\nspan 6\n0 0 40"))
 }
 
 test "a prelude effect is placed outside every module and its operations carry a scheme" {
   assert(holds(front_dump(program()),
-    b"effect sim 109\nmodule 0\nsimple_name 3\nsimnondet 1\n0op 45\nseed read 0 0 1 4294967295 0 0\nInt\n() -> Int\nspan 14\n4294967295 0 0"))
+    b"effect sim 119\nmodule 0\nsimple_name 3\nsimpublic 1\n1nondet 1\n0op 45\nseed read 0 0 1 4294967295 0 0\nInt\n() -> Int\nspan 14\n4294967295 0 0"))
 }
 
 test "a constructor frames its fields and its scheme" {
@@ -325,14 +522,38 @@ fn specified() -> List<Source> =
 
 test "a definition frames its row aliases and each clause with its kind, index and span" {
   let out = front_dump(specified());
-  assert(holds(out, b"internally_effectful 1\n1row_alias 2\nIospan 8\n0 69 114"));
-  assert(holds(out, b"def m.inc 170\nmodule 1\nmsimple_name 3\nincscheme 12\n(Int) -> Intfootprint 0\nperformed 0\ninternally_effectful 1\n0spec 21\nrequires 0 \n0 137 151spec 20\nensures 1 \n0 152 170span 9\n0 115 178"));
+  assert(holds(out, b"internally_effectful 1\n1row_alias 2\nIoparam 9\nb 0 76 84span 8\n0 69 114"));
+  assert(holds(out, b"def m.inc 209\nmodule 1\nmsimple_name 3\nincpublic 1\n0reuse 1\n0scheme 12\n(Int) -> Intfootprint 0\nperformed 0\ninternally_effectful 1\n0param 11\nx 0 122 128spec 21\nrequires 0 \n0 137 151spec 20\nensures 1 \n0 152 170span 9\n0 115 178"));
   assert(holds(out, b"ordinal m 71\nitem 8\nfn m.sayitem 25\nfn m.inc requires,ensuresitem 15\nlaw m.inc grows"))
+}
+
+// What the checker's tables do not keep: a `pub` and a `reuse` marker, a type's arity, and the
+// literals a guard mentions — including a negation, which is folded and whose literal is still
+// reached.
+fn written() -> List<Source> =
+  [{ name: b"m", src: b"pub type Pair<a, b> = { fst: a, snd: b }\npub effect log { write emit(Bytes) -> Unit }\npub reuse fn keep(xs: List<Int>) -> List<Int> = push(xs, 1)\nlaw \"bounds\" forall (n: Int) where n > -3 && n < 7 { n == n }" }]
+
+test "a definition frames its visibility, its reuse marker and its parameters as written" {
+  let out = front_dump(written());
+  assert(holds(out, b"simple_name 4\nkeeppublic 1\n1reuse 1\n1scheme "));
+  assert(holds(out, b"internally_effectful 1\n0param 12\nxs 0 104 117span"))
+}
+
+// An alias reaches no table of the checker's -- it has no constructors -- so this frame is the
+// only place its arity, its visibility and its span travel.
+test "a type frames its arity and its visibility" {
+  assert(holds(front_dump(written()), b"module 1\nmsimple_name 4\nPairpublic 1\n1arity 1\n2span "))
+}
+
+test "a guard's literals are framed in the search's order, a negation folded" {
+  assert(holds(front_dump(written()), b"literal 5\nint 7literal 6\nint -3literal 5\nint 3"))
 }
 
 test "a law frames its binders with their spans and types, and its hashes carry the sentence" {
   let out = front_dump(specified());
-  assert(holds(out, b"law 0 127\nkey 11\nm.inc growsname 9\ninc growsmodule 1\nmindex 1\n0binder 15\nx 0 203 209\nInthas_guard 1\n1host 1\n0footprint 0\nspan 9\n0 179 237"));
+  assert(holds(out, b"law 0 142\nkey 11\nm.inc growsname 9\ninc growsmodule 1\nmindex 1\n0binder 15\nx 0 203 209\nInthas_guard 1\n1host 1\n0footprint 0\nspan 9\n0 179 237literal 5\nint 0"));
+  // The `effect set` the module declares, with its (empty) includes and its expansion.
+  assert(holds(out, b"effect_set 15\nIo  m.log.write"));
   let d = bytes_of_string(out);
   let hash_at = past(d, b"lawhash 0 210\nkey 11\nm.inc growshash 64\n");
   assert_eq(bytes_slice(d, hash_at + 64, hash_at + 72), b"text 64\n");

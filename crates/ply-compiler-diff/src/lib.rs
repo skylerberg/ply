@@ -376,7 +376,7 @@ fn reference_front(modules: &[(String, String)]) -> ply_ty::Front {
             stored_bodies.push(stored(&name, *hash));
         }
     }
-    ply_ty::Front {
+    let mut front = ply_ty::Front {
         diagnostics: Vec::new(),
         order,
         hash_order,
@@ -389,7 +389,14 @@ fn reference_front(modules: &[(String, String)]) -> ply_ty::Front {
         check,
         hashes,
         ordinals,
-    }
+        ..ply_ty::Front::default()
+    };
+    // What the checker's tables do not keep and the driver's consumers read from the tree: the
+    // visibilities, the `reuse` markers, the written parameters, the types, the label spans, the
+    // guards' literals and the effect sets. One filler serves every Rust-chain assembler, so the
+    // reference cannot carry a field the port is not held to.
+    ply_codegen::fill_written(&mut front, &program, &resolved);
+    front
 }
 
 /// Every definition's interface and every test's footprint, as the driver would restore them.
