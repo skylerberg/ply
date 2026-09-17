@@ -201,7 +201,7 @@ measurement is confounded until the earlier one has moved.
 6. **The other four phases, behind the differential.** Resolve, inference,
    effect inference and hashing, each ported the way the parser was: a reference
    dumper on the Rust side, a corpus, and mutations that prove the comparison
-   can go red (`crates/ply-compiler/arm-*.sh`). **Resolve is ported**
+   can go red (`crates/ply-compiler-diff/tools/arm-*.sh`). **Resolve is ported**
    (`crates/ply-compiler/ply/resolve.ply`, `GAPS.md` §15): the tables, the load
    order, the diagnostics and the whole defaults pass agree with the reference
    over the standard library, every example with it, every program the
