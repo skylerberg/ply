@@ -27,10 +27,14 @@ path is for, and §"The loop, which is what the path is for" carries them.
 - **Expressiveness.** A lexer and a recursive-descent parser written in Ply agree
   with `crates/ply-syntax` on the reference corpus, tree and diagnostics, byte
   for byte; the inputs they disagree on are the ones written in syntax that
-  postdates the port (`crates/ply-compiler/GAPS.md` §11R). CI runs the differential
-  on every push (`cargo test -p ply-compiler-diff`, in the `compiler` shard), every
-  phase of it under the compiled backend through `ply run --backend`, which is
-  what keeps that job at the build's length rather than the interpreter's.
+  postdates the port (`crates/ply-compiler/GAPS.md` §11R). CI runs what is left of
+  that comparison on every push, inside the eight test partitions rather than a
+  shard of its own. **Re-read 2026-09-17, under ADR 0052 §2:** only the parser and
+  the lexer are still held to the Rust chain. The phases that were —
+  diagnostics, the whole front-end answer, derive, resolve, inference, hashing and
+  the rewrites — are held to goldens or to the behavioural gates now, and the five
+  golden suites live in `ply-codegen-tests` so that deleting `ply-compiler-diff`
+  with the parser does not delete them.
 - **The call ceiling.** `iterate` gives a parser the reference's own shape —
   loops for sequences, recursion only for grammar nesting — at depth one (ADR
   0022). A raisable ceiling is refused there, with the reason.
@@ -228,7 +232,10 @@ measurement is confounded until the earlier one has moved.
    agree over the standard library, every example, every bundle and the
    hasher's own mined inputs, with BLAKE3 from `std.hash` over the same bytes;
    `arm-hash.sh` arms it. The one surface it needed, `bits_of_float`, landed
-   first. Every phase step 6 names is now behind a differential. The syntax
+   first. Every phase step 6 names was then behind a differential; ADR 0052 §2
+   retired the ones that read the Rust front end, and the rest are behind
+   goldens, which hold the port to a stored answer rather than to a second
+   implementation. The syntax
    the parser spike predated went in before any of them, so the parser's own
    differential was green before anything was built on it: the bit operators
    (with the shift join and the lambda-parameter pipe guard) and keyword
@@ -268,8 +275,8 @@ measurement is confounded until the earlier one has moved.
    and 3.7. What was left was not a growth term but a constant: over the
    compiler's own sources a warm run with nothing changed costs 343 ms through
    the Rust chain and its gates against 17.2 s through the port. So the distance
-   is a factor, not a curve, and the lever this step already names — the
-   runtime's cost per value on the callback path — is the one that remains. What is: the runtime's cost per value on the callback path. A
+   is a factor, not a curve, and what remains is not a front-end algorithm: it
+   is the runtime's cost per value on the callback path. A
    profile of the compiled check row
    (`benches/front-end-whole/profile-check-wide.txt`) puts its time under the
    runtime's callback loops — `fold`, `map`, `iterate` calling the compiled
