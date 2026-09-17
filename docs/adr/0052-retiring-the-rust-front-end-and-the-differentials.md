@@ -175,6 +175,24 @@ operator, literal and visibility vocabulary leaves `ply-syntax`'s tree
 for `ply-ty`, so the runtime and the tools stop naming the parser's
 crate.
 
+**Built, 2026-09-16: the backend's tables.** A unit takes a `Front` and
+derives from it what it read from the tree: the constructor table, the
+root list, the cache keys, each root's arity, the module count, and the
+arguments the producer hands the port. `ply bootstrap`'s source digest
+and the artifact's stored bodies come from it too. The port answers it
+wherever a unit has its module texts and a producer is installed, and the
+Rust chain answers it otherwise, because the producer is built before it
+can be asked and `ply bootstrap` installs none. The tree is still read
+for the reference emitter's bodies, which §2 deletes. Two things this
+found. The checker fills its constructor table in load order where the
+tree walk filled it in program order, and a unit names its tags by
+position in that table, so taking the checker's order would have made a
+unit's C a function of the import graph; the table is rebuilt in program
+order from the ordinals. And the narrow register offer reads the checked
+scheme now rather than the written type, so an alias for `Int` counts as
+scalar where the written form did not, which changes what that offer
+holds and not what a body computes.
+
 **What the driver loses.** Its gates decided per file not to parse and
 per definition not to re-infer, keyed on the store's fingerprints; a run
 that enters the port whole parses and checks every module every time.
