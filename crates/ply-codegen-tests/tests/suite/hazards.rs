@@ -107,12 +107,20 @@ struct Harness {
 }
 
 fn harness(loaded: &'static Loaded) -> Harness {
-    let unit: &'static Unit = Unit::over_with_texts(
-        loaded.program,
-        loaded.resolved,
-        loaded.check,
-        loaded.texts.clone(),
-    )
+    // This arm is named `whole` and has always been the reference: nothing in this binary
+    // installed a producer, so `mode()` answered `ref` and `over_with_texts` built the fragment.
+    // `load` installs one now, to answer the check, so the reference is asked for here explicitly
+    // rather than by accident. Dropping this makes the comparison real, and the first thing it
+    // reports is that the port carries no body for `raced.raced` -- a `simulate` region over two
+    // spawned tasks, which §2 has not reached.
+    let unit: &'static Unit = ply_codegen::c::producer::reference_only(|| {
+        Unit::over_with_texts(
+            loaded.program,
+            loaded.resolved,
+            loaded.check,
+            loaded.texts.clone(),
+        )
+    })
     .expect("this host has a C compiler");
     let bodies = unit.bodies().expect("the unit builds");
     let oracle = ply_codegen::c::producer::reference_only(|| {

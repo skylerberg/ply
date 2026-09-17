@@ -871,14 +871,19 @@ pub fn wrap(n: Int) -> List<Bytes> = [byte_of_int(n)]
     let digest = ply_codegen::c::cache::ctors_digest(&ctors);
     let mut unit = ply_codegen::c::emit::Unit::new(ctors, vec!["m.wrap".to_string()]);
     let inlining = ply_codegen::opt::Inlining::EMITTED;
-    let (text, _) = emit_one(
-        loaded,
-        &mut unit,
-        "m.wrap",
-        &digest,
-        (inlining.budget, inlining.depth),
-        "",
-    )
+    // This test reads the reference emitter's own C. `keyed` installs the default producer so the
+    // check can be answered, and without this that producer is asked for the body and answers
+    // none, since the source it was keyed from carries no texts.
+    let (text, _) = ply_codegen::c::producer::reference_only(|| {
+        emit_one(
+            loaded,
+            &mut unit,
+            "m.wrap",
+            &digest,
+            (inlining.budget, inlining.depth),
+            "",
+        )
+    })
     .expect("`wrap` emits");
     assert!(
         text.contains("rt_byte_of_int_p") && text.contains("rt_list_p"),

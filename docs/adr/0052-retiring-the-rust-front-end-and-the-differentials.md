@@ -1310,6 +1310,42 @@ over inside `emit_with` and installs nothing; `ensure_default` at the check is
 then free to answer without deciding which emitter the test runs. The
 restructure this entry named as a path is the one that was taken.
 
+Migrating it costs six sites a word, and the word is `reference_only`. A check
+the port answers needs a producer installed, and `Unit::over`, `Unit::bodies`
+and `Provider::attach` all ask whatever producer is current for every body --
+so installing one to answer the check also hands the emitting to it. Where the
+source carries no texts the port cannot answer at all: `bodies_of` returns an
+empty map rather than failing, every root is refused as unanswered, and the unit
+is empty. That is the shape of `the enterable fragment over the parser fell to
+0` and of `the unit has no emit.emit_unit_all`. `Unit::bodies` is not memoised,
+so a unit built under the reference and entered later through `attach` is built
+again under whatever is current then -- which is how a test that forced its
+bodies inside `reference_only` still got an empty tier. The rule the crate now
+follows: the port answers the check, and a site that reads the reference
+emitter's own output asks for it by name.
+
+**Read, 2026-09-17: the hazards harness has never run the whole emitter.**
+`hazards.rs` builds two tiers over one program, calls them `reference` and
+`whole`, and every test there is a claim that the two agree. The `whole` arm
+built through `Unit::over_with_texts`, which asks whatever producer is
+installed -- and nothing in that binary installed one, so `mode()` answered
+`ref` and both arms were the reference emitter. A comparison of a thing with
+itself cannot fail, and none of those tests ever could. `fragment.rs` had the
+same bug and fixed it in place, with a comment saying why; this one was missed.
+
+Installing a producer to answer the check makes the comparison real for the
+first time, and the first thing it reports is that the port holds no body for
+`raced.raced`, which the interpreter also declines inside a `simulate` region,
+so the call arrives as `E0502` rather than as a wrong answer. `raced.ply` names
+the construct: a `simulate` region holding two spawned tasks over a shared cell,
+under `/ {sim.read}`.
+
+That is a gap in the port, not in this migration, so the arm stays on the
+reference -- explicitly now, where it sat by accident before -- and the
+comparison becomes real when the port carries that body. The entry is here
+because a test that cannot fail is worse than a missing one, and this one would
+otherwise be found a second time.
+
 **`ply-eval-tests` cannot go either, and its reason is a second kind.** Thirteen
 of its fourteen sites are ordinary: the two corpus harnesses need only the `load`
 above to return the texts it already reads, and the rest parse from source under

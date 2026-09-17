@@ -145,7 +145,11 @@ fn emitter() -> Result<PlyProducer, String> {
     )));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, _refused) = ply_codegen::c::build(source, &refs).map_err(|e| format!("{e:#}"))?;
+    // The emitter under test is compiled by the reference, as this binary's header says. `load`
+    // installs the default producer to answer the check, and without this that producer would be
+    // asked to emit itself from a source carrying no texts, and would answer nothing.
+    let (native, _refused) = producer::reference_only(|| ply_codegen::c::build(source, &refs))
+        .map_err(|e| format!("{e:#}"))?;
     PlyProducer::new(native).map_err(|e| format!("{e:#}"))
 }
 

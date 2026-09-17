@@ -65,8 +65,12 @@ fn load_dir(dir: &str) -> Loaded {
 fn the_census_over_the_parser_spike() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../ply-compiler/ply");
     let loaded = load_dir(dir);
-    let unit = ply_codegen::Unit::over(loaded.program, loaded.resolved, loaded.check)
-        .expect("this host has a C compiler");
+    // The census is of the reference emitter's fragment, so the reference emits here whatever the
+    // check came from; the installed producer would answer no body at all for a text-less source.
+    let unit = ply_codegen::c::producer::reference_only(|| {
+        ply_codegen::Unit::over(loaded.program, loaded.resolved, loaded.check)
+    })
+    .expect("this host has a C compiler");
     let functions = ply_codegen::Source::new(loaded.program, loaded.resolved, loaded.check)
         .functions()
         .len();
