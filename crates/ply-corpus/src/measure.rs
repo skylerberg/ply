@@ -295,25 +295,20 @@ test "the shapes all evaluate" {
 fn load(
     name: &str,
     src: &str,
-) -> Result<(
-    Program,
-    Resolved,
-    ply_core::CheckOutput,
-    ply_span::SourceMap,
-)> {
+) -> Result<(Program, Resolved, ply_core::Front, ply_span::SourceMap)> {
     let mut map = SourceMap::new();
     let id: SourceId = map.add(format!("{name}.ply"), src.to_string());
     let mut program = parse_program([(id, ModuleName::from_dotted(name), src)])
         .map_err(|ds| anyhow::anyhow!("the measurement program must parse: {ds:#?}"))?;
     let resolved =
         resolve(&mut program).map_err(|ds| anyhow::anyhow!("it must also resolve: {ds:#?}"))?;
-    let check = crate::port_check(&[(name.to_string(), src.to_string())], &[id])?;
-    Ok((program, resolved, check, map))
+    let port = crate::port_front(&[(name.to_string(), src.to_string())], &[id])?;
+    Ok((program, resolved, port, map))
 }
 
 pub fn multi_shot(repeats: usize) -> Result<MultiShot> {
-    let (program, resolved, check, sources) = load("multishot", MULTISHOT_SRC)?;
-    let mut machine = crate::tier_machine(&program, &resolved, &check, &sources);
+    let (program, resolved, port, sources) = load("multishot", MULTISHOT_SRC)?;
+    let mut machine = crate::tier_machine(&program, &resolved, &port, &sources);
 
     let mut rows: Vec<Resumptions> = Vec::new();
     for (count, name) in [(0usize, "r0"), (1, "r1"), (2, "r2"), (4, "r4")] {

@@ -419,6 +419,9 @@ pub struct Program {
     program: ply_syntax::ast::Program,
     resolved: ply_syntax::resolve::Resolved,
     check: CheckOutput,
+    /// The port's whole answer, so the tier is built from it rather than from a second front end
+    /// derived inside `over_with_texts` (ADR 0052 §2).
+    port: ply_core::Front,
     /// One answer about this program's regions for every rung below, rather than one per rung's
     /// machine.
     region_kinds: ply_eval::region_kind::Kinds,
@@ -455,12 +458,13 @@ impl Program {
         }
         let resolved = ply_syntax::resolve::resolve(&mut program)
             .map_err(|d| diagnostics("resolving the endpoint", &d))?;
-        let check = crate::port_check(&ordered, &ids)
+        let port = crate::port_front(&ordered, &ids)
             .map_err(|e| anyhow::anyhow!("checking the endpoint: {e}"))?;
         Ok(Program {
             program,
             resolved,
-            check,
+            check: port.check.clone(),
+            port,
             region_kinds: ply_eval::region_kind::Kinds::default(),
             sources,
         })
@@ -468,7 +472,7 @@ impl Program {
 
     fn machine(&self) -> Machine<'_> {
         let mut machine =
-            crate::tier_machine(&self.program, &self.resolved, &self.check, &self.sources);
+            crate::tier_machine(&self.program, &self.resolved, &self.port, &self.sources);
         machine.share_region_kinds(ply_eval::region_kind::Kinds::clone(&self.region_kinds));
         machine
     }
