@@ -9,7 +9,6 @@ use crate::hosts::Hosts;
 use crate::load::{Loaded, load, project_root};
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_FAILED, EXIT_OK, driver};
-use ply_core::CheckOutput;
 use ply_prove::{
     Binding, CaseReport, Certificate, Counterexample, Coverage, Discharge, Evidence, Frame, Gap,
     Obligation, ObligationKind, ProvePlan, ProveReport, Rule, Tier, Vacuity, VacuityKind,
@@ -17,6 +16,7 @@ use ply_prove::{
 use ply_span::{Diagnostic, SourceMap, Symbol, codes};
 use ply_store::Store;
 use ply_test::obligation::{self, Laws, Reason};
+use ply_ty::CheckOutput;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -75,7 +75,7 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
     // The row a `law/host` will enter, which is what decides whether this run needs a database at
     // all: a file whose laws are all hermetic binds nothing, exactly as `ply test` binds nothing
     // for a suite that installs the twin.
-    let reach = ply_core::ty::Footprint::from_atoms(
+    let reach = ply_ty::ty::Footprint::from_atoms(
         scoped
             .laws
             .iter()

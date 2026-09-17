@@ -1,12 +1,12 @@
 //! How a run is told what its configuration is, and what it refuses before it starts.
 
 use clap::Args;
-use ply_core::CheckOutput;
-use ply_core::ty::Type;
 use ply_host::config::{Key, Shape, Snapshot, Sources, Spec};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::Program;
 use ply_syntax::resolve::Resolved;
+use ply_ty::CheckOutput;
+use ply_ty::ty::Type;
 use serde_json::{Value as Json, json};
 use std::path::PathBuf;
 use std::sync::Arc;

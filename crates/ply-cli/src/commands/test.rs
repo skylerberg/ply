@@ -10,7 +10,6 @@ use crate::driver;
 use crate::hosts::{self, Hosts, hosting};
 use crate::load::{Loaded, load, project_root};
 use crate::style::Style;
-use ply_core::{CheckOutput, Footprint};
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceMap, Span, codes};
 use ply_store::Store;
@@ -18,6 +17,7 @@ use ply_test::{
     Bisection, Failure, Isolation, Reason, Record, RunReport, Selection, Skipped, Status, Suspect,
     TestResult, Verdict,
 };
+use ply_ty::{CheckOutput, Footprint};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -165,7 +165,7 @@ fn iterate(
         }
     };
     // Every row this run can enter, which is the union of the tests'.
-    let reach = ply_core::ty::Footprint::from_atoms(
+    let reach = ply_ty::ty::Footprint::from_atoms(
         loaded
             .check
             .tests
@@ -619,11 +619,11 @@ impl Plan {
         std_tests: bool,
     ) -> Plan {
         // Two separate questions.
-        let in_scope = |t: &ply_core::TestInfo| std_tests || !ply_std::is_std(&t.module);
+        let in_scope = |t: &ply_ty::TestInfo| std_tests || !ply_std::is_std(&t.module);
         // Matched against `<module>.<label>` rather than the label alone, so `--filter store.`
         // narrows to a module without a second flag, and a label substring still matches because
         // the key contains the label.
-        let matches = |t: &ply_core::TestInfo| filter.is_none_or(|n| t.key.as_str().contains(n));
+        let matches = |t: &ply_ty::TestInfo| filter.is_none_or(|n| t.key.as_str().contains(n));
 
         let scoped = check.tests.iter().filter(|t| in_scope(t)).count();
         let out_of_scope: BTreeSet<usize> = check
