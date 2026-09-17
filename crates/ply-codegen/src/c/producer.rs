@@ -138,12 +138,19 @@ fn build_from(src: &Sources) -> Result<PlyProducer, String> {
     let from_committed = || -> Result<(super::Native, Vec<super::Refused>), String> {
         let carried = super::bundle::of(&Sources::Embedded)
             .ok_or_else(|| "this binary carries no bootstrap bundle".to_string())?;
-        let (native, _) = super::bundle::build(&carried).map_err(|e| {
+        let (native, refused) = super::bundle::build(&carried).map_err(|e| {
             format!(
                 "the committed bundle does not serve this runtime either: {e:#}. Refresh it with \
                  `PLY_C_BOOTSTRAP_REFRESH=1 cargo nextest run -p ply-codegen-tests --test bootstrap`"
             )
         })?;
+        // A working copy holding the sources the bundle was emitted from *is* that bundle, which
+        // the fixpoint test asserts, so emitting them again answers the same unit for a minute of
+        // work. Only a working copy that differs is worth standing an emitter up for.
+        let theirs = digest_of(&modules_of(src));
+        if carried.sources_digest() == Some(theirs.as_str()) {
+            return Ok((native, refused));
+        }
         let first = PlyProducer::new(native).map_err(|e| format!("{e:#}"))?;
         let identity = digest_of(&modules_of(&Sources::Embedded));
         with_producer(first, identity, || {
