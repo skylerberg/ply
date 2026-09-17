@@ -46,10 +46,10 @@ pub(crate) fn honest() -> ply_eval::BackendSpec {
 ///
 /// `texts` is in the program's module order, because the protocol writes a span's module as its
 /// position in this very list.
-pub fn port_check(
+pub fn port_front(
     texts: &[(String, String)],
     ids: &[ply_span::SourceId],
-) -> Result<ply_core::CheckOutput> {
+) -> Result<ply_core::Front> {
     ply_codegen::c::producer::ensure_default();
     let front = ply_codegen::c::producer::front(texts, ids)?;
     if let Some(d) = front
@@ -59,7 +59,7 @@ pub fn port_check(
     {
         bail!("the port refuses this program: {} [{}]", d.message, d.code);
     }
-    Ok(front.check)
+    Ok(front)
 }
 
 /// A machine over the program with the default tier attached, produced from the module texts
@@ -67,14 +67,14 @@ pub fn port_check(
 pub fn tier_machine<'a>(
     program: &'a ply_syntax::ast::Program,
     resolved: &'a ply_syntax::resolve::Resolved,
-    check: &'a ply_core::CheckOutput,
+    port: &'a ply_core::Front,
     sources: &ply_span::SourceMap,
 ) -> ply_eval::Machine<'a> {
     ply_codegen::c::producer::ensure_default();
     let texts = ply_cli::commands::common::module_texts(program, sources);
-    let unit = ply_codegen::Unit::over_with_texts(program, resolved, check, texts)
+    let unit = ply_codegen::Unit::over_front(program, resolved, port, texts)
         .expect("this host has a C compiler");
-    let mut machine = ply_eval::Machine::new(program, resolved, check);
+    let mut machine = ply_eval::Machine::new(program, resolved, &port.check);
     machine.set_compiled(ply_eval::Provider::attach(unit, &honest()));
     machine
 }
@@ -89,9 +89,8 @@ pub fn run_on_tier(
 ) -> ply_test::RunReport {
     ply_codegen::c::producer::ensure_default();
     let texts = ply_cli::commands::common::module_texts(&front.program, &front.sources);
-    let unit =
-        ply_codegen::Unit::over_with_texts(&front.program, &front.resolved, &front.check, texts)
-            .expect("this host has a C compiler");
+    let unit = ply_codegen::Unit::over_front(&front.program, &front.resolved, &front.port, texts)
+        .expect("this host has a C compiler");
     let executor = ply_test::InterpExecutor::new(&front.program, &front.resolved, &front.check)
         .with_backend(unit, honest())
         .with_search(search)
