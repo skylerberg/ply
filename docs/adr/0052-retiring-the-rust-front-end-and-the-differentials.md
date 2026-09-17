@@ -452,8 +452,8 @@ What is deletable now is the checker and the hasher themselves, and their caller
 are fewer than the survey above suggests. Of twenty-one non-test calls to
 `check_program` and thirteen to `hash_program*`, six die with
 `ply-compiler-diff`, two are the seed path that retires with the front end, one
-is `ply-codegen`'s own `"ref"`-mode fallback sitting beneath an existing port
-call, and six are `ply-corpus`'s cost harnesses, which check a program because
+is the arm `ply-codegen` takes by default, and six are `ply-corpus`'s cost
+harnesses, which check a program because
 they need a runnable one to measure and so move to the port's door rather than
 being deleted. Three are genuine: opening an artifact, `ply test`'s fresh bodies,
 and the hybrid's trial. `ply-store`'s `Bodies::reconstruct` has no non-test
@@ -475,6 +475,41 @@ helper both use. Sources that are not the artifact's are still refused, and now
 it is the port that checked them. Opening a `.plyx` pays a whole front end where
 it paid the checker and the hasher before, which is the trade every other command
 took at the switch.
+
+**Read, 2026-09-17: parts 2 and 3 meet at the per-unit front end, and that is
+the last hold.** A draft of the paragraph above had `ply-codegen`'s
+`hash_program_with_bodies` as a `"ref"`-mode fallback beneath a port call, which
+is the opposite of what it is, and the shape of that error is worth keeping
+because it is the same one four earlier sizings made: a name that reads as an
+exceptional branch is the ordinary one. `front_for` asks
+the port only when `PLY_FRONT=port` is set, and otherwise answers from the Rust
+chain, so that arm is what every caller holding no `Front` of its own takes. The
+driver holds one and hands it to `Unit::over_front`; the six callers of
+`over_with_texts` do not.
+
+The reason is in `front_for`'s own doc and it is a measurement this record already
+carries from the other side: asking the port for every unit's tables took a quiet
+main run from 144 s to 254 s, because it is a second front end *per unit*. So the
+chain answers while it exists, and exactly one solo CI row —
+`compiler-on-the-tier`, running the compiler's own tests as the only engine —
+sets `PLY_FRONT=port` and proves the port can answer that path at all.
+
+This is the real gate on deleting the hasher, and it is not a caller that can be
+ported away one file at a time. Either the callers come to hold a `Front` the way
+the driver does, or the port answers per unit at a cost §3's bound can absorb.
+The change below takes the first of those for the one caller that could already
+have had it.
+
+**Built, 2026-09-17: opening a `.plyx` asks one front end, not two.** `Opened`
+kept the `CheckOutput` out of the port's answer and dropped the rest, so a run
+that wanted a backend derived a second front end through `over_with_texts` —
+Rust-chain by default — over the program printed back to source. It carries the
+whole `Front` now and hands it to `build_backend_over`. The unit's emit cache
+keys are this program's rather than absent, which a comment there had conceded,
+and the cost the paragraph above added to opening an artifact is paid back in the
+same place it was spent. `build_backend` survives for `ply-corpus`'s bench, which
+calls it while timing the compile phase and holds only its own chain-derived
+check: another of this record's "deletions" that is a split.
 
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
@@ -539,7 +574,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s and 140 s, each reusing by tree the same way and for the same reason. Two of those went over, both on the merge that made the port the only front end and the first attempt to answer it, and the paragraph below takes them. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's 38 MB of text goldens landed. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s and 147 s, each reusing by tree the same way and for the same reason. Two of those went over, both on the merge that made the port the only front end and the first attempt to answer it, and the paragraph below takes them. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's 38 MB of text goldens landed. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
