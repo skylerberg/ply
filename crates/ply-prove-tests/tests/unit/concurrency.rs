@@ -4,7 +4,6 @@ use ply_eval::{
     Access, Domain, Interleaving, Plan, Seed, SimId, SimMode, Simulation, StepFootprint, Stream,
     TaskId, explore,
 };
-use ply_hash::DefHash;
 use ply_prove::concurrency::{
     BodyRun, LawSearch, Searched, ValueDomain, audit_interleaving_proof, discharge, refutation,
     replay_command,
@@ -15,6 +14,7 @@ use ply_prove::{
     Rule, Tier, Vacuity, VacuityKind, interleaving_proves,
 };
 use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_ty::DefHash;
 use ply_ty::Mode;
 use ply_ty::{EffectAtom, Footprint, LawBinder, Resource, Type};
 

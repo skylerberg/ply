@@ -1,6 +1,6 @@
-use ply_hash::DefHash;
 use ply_prove::key::{prove_key, result_key};
 use ply_prove::{ProvePlan, Tier};
+use ply_ty::DefHash;
 
 fn key() -> DefHash {
     DefHash([7; 32])

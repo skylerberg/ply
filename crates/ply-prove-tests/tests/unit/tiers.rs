@@ -1,11 +1,11 @@
 use ply_eval::{Exploration, Plan, Seed, SimMode};
-use ply_hash::DefHash;
 use ply_prove::{
     CaseReport, Certificate, Counterexample, Coverage, Discharge, Evidence, Frame, Gap,
     MIN_PROPERTY_CASES, Obligation, ObligationKind, ProvePlan, ProveReport, Rule, Tier, Vacuity,
     VacuityKind, frame_of, interleaving_proves,
 };
 use ply_span::Span;
+use ply_ty::DefHash;
 use ply_ty::Mode;
 use ply_ty::{EffectAtom, Footprint, Resource};
 use std::time::Duration;
