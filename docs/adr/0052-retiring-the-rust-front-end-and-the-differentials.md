@@ -1338,11 +1338,27 @@ The work itself is unchanged, as that entry said it would be: the partitions
 summed 547.1 s before the census moved and 520.5 s after, with the census's
 24.6 s beside them.
 
-So the readings say a run without a straggler is about 26 s of archive, a 129 s
-pole and a four-second gate: near 159 s, under the bound with twenty seconds to
-spare. Three of the last four excursions were the runner rather than the tree --
-188 s from a pre-suite that went from 5 s to 45 s, and 190 s from a 35 s late
-start -- against 187 s, which was the census and is fixed.
+So the readings say a run without a straggler is about 28 s to the first start,
+a 136 s pole and a three-second gate: `5abaf569` ran 174 s, under the bound with
+six seconds to spare rather than the twenty this entry first guessed. Three of
+the last four excursions were the runner rather than the tree -- 188 s from a
+pre-suite that went from 5 s to 45 s, and 190 s from a 35 s late start --
+against 187 s, which was the census and is fixed.
+
+**Built, 2026-09-17: the bound is met, and the margin is six seconds.**
+`5abaf569` ran 174 s. Every job started within two seconds of 28 s except 7/8 at
+40 s, which cost nothing; 3/8 ended last at 166 s and the gate closed at 173 s.
+
+The partitions ran 66.0, 62.3, 77.4, 84.1, 70.9, 60.1, 61.4 and 66.2 s of
+`nextest`, with the census alone at 28.5 s. Against 48.3 to 102.7 s before the
+census moved, the slices are flat: the fix rebalanced them, and the spread is
+24 s rather than 54 s.
+
+What the wall is made of has changed with it. 3/8 set it with a 136 s job over
+77.4 s of tests, so some 59 s of that job was setup, the archive restore and the
+object-cache restore; 4/8 ran the longest tests, 84.1 s, in a shorter job. The
+overhead a job pays now rivals the work inside it, and that is what six seconds
+of margin will be spent on next. The deletions §3 counts on do not shrink it.
 
 **Read, 2026-09-17: where §2 ends, and why it is not the bundle migration.**
 This record has said, more than once, that the seed path cannot go before a
