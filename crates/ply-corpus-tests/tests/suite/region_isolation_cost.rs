@@ -1,7 +1,7 @@
 //! Region isolation's number, taken against real projects rather than against footprints somebody typed.
 
-use ply_core::Footprint;
 use ply_corpus::regions::{self, Corpus, Hypothetical};
+use ply_ty::Footprint;
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
