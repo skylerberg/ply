@@ -447,9 +447,9 @@ fn write_json_field(out: &mut String, field: &Field) {
         // JSON has no `NaN` and no infinity, and a writer that emitted one would produce a document
         // no parser accepts.
         Field::Float(f) if f.is_finite() => {
-            let _ = write!(out, "{}", ply_syntax::ast::render_float(*f));
+            let _ = write!(out, "{}", ply_ty::render_float(*f));
         }
-        Field::Float(f) => write_string(out, &ply_syntax::ast::render_float(*f)),
+        Field::Float(f) => write_string(out, &ply_ty::render_float(*f)),
         Field::Decimal(d) => write_string(out, &d.to_string()),
         // Lowercase hex.
         Field::Bytes(bytes) => {

@@ -12,7 +12,8 @@ use crate::pool::{self, Free, Link, Pooled};
 use crate::value::{List, Value};
 use crate::window::SlotVal;
 use ply_span::{Span, Symbol};
-use ply_syntax::ast::{BinOp, Ident, UnOp};
+use ply_syntax::ast::Ident;
+use ply_ty::{BinOp, UnOp};
 use std::cell::Cell;
 use std::rc::Rc;
 

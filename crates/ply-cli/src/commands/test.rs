@@ -399,7 +399,7 @@ fn iterate(
 
 pub struct BackendView {
     spec: Option<String>,
-    /// Which backend answered — `reference` or `c`.
+    /// Which backend answered, as `--backend` names it.
     name: &'static str,
     /// Definitions the backend had a body for.
     fragment: usize,
