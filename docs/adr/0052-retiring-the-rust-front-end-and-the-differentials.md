@@ -362,7 +362,8 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised.
+and not yet exercised. The merge after it, carrying §2's first deletion,
+read 126 s and reused by tree the same way, for the same reason.
 
 ## 4. The loop that is O(the change)
 
@@ -440,6 +441,41 @@ sixty by 4,000 definitions. The candidate for the second is the one ADR
 0049's profile already named in the emitter, a linear scan standing where
 a lookup belongs, and the next reading is a flat profile of the port's
 own front end rather than another point on this curve.
+
+**Read, 2026-09-17: the profile is flat, which is the answer.** A CPU
+profile of the port's front end over the compiler's own sources finds no
+hotspot to remove. Reference counting and allocation lead it — `heap::inc`
+at 5.7%, `dismantle` at 4.6%, `raw_alloc` at 3.4%, `dec` at 1.8%,
+`offset_by_index` at 1.7% — so about a sixth of the time is spent keeping
+objects rather than computing anything. `list::get`, the linear scan the
+paragraph above nominated, is 2.8%: present, and not the reason. Nothing
+the port itself compiles reaches 2%; its largest body is `infer`'s
+`position_bytes` at 1.8%, then `tycore.at` at 1.3% and `resolve.find_sig`
+at 1.3%.
+
+This is the shape ADR 0049 found for the emitter, now found again for the
+front end, and for the constant factor it says what the fix is: the object
+model, by ADR 0051's levers, fewer allocations for the same work, rather
+than one hot rule.
+
+**It does not say that about the term that grows, and reading the source
+does.** `infer.position_bytes` folds over a whole `List<Bytes>` to return
+the index of one name, carrying the answer forward instead of stopping at
+it, and the checker's call-graph seeding calls it once for every function
+definition and again for every edge out of one, against `names`, which
+holds every qualified function name in the program. The list it scans is
+itself built by pushing each name after a `contains_bytes` over what is
+already there, so it is quadratic before anything reads it, and
+`hash.position_bytes` is the same fold without even the early answer. That
+is the term the curve shows and the profile hides, because its cost lands
+in `list::get`, `heap::inc` and `raw_alloc` rather than in a body of its
+own. A name index built once, which the port already has the map for, is
+the first thing to try, with the marginal-change bench either side of it.
+
+The lesson for the instrument is worth keeping: a flat profile is evidence
+about where time goes, not about whether an algorithm is quadratic, and
+this one was taken at a single size over a single program, which is the
+reading it could least afford to be.
 
 ## The order, and why
 
