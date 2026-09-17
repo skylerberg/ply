@@ -3,10 +3,8 @@
 
 mod agreement;
 mod derive;
-mod diag;
 mod effects;
 mod fields;
-mod front;
 mod hash;
 mod infer;
 mod lexer_agreement;
