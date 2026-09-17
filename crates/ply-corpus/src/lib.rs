@@ -40,9 +40,9 @@ pub(crate) fn honest() -> ply_eval::BackendSpec {
 
 /// The port's check over these very texts (ADR 0052 §1).
 ///
-/// The harnesses here need a checked program in order to measure what it *does*; what checking
-/// costs is `pipeline.rs`'s subject, and that one keeps the Rust chain because timing its phases
-/// is the whole of what it reports.
+/// The harnesses here need a checked program in order to measure what it *does*, and `pipeline.rs`
+/// asks through this too: what it times is the parse, the resolve and the compile, and the front
+/// end's own cost is not one of its rows.
 ///
 /// `texts` is in the program's module order, because the protocol writes a span's module as its
 /// position in this very list.
