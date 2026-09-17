@@ -30,11 +30,23 @@ fn load(source: &str) -> Loaded {
         let id = sources.add(ply_std::pseudo_path(module), (*text).to_string());
         inputs.push((id, module.clone(), *text));
     }
+    let named: Vec<(String, String)> = inputs
+        .iter()
+        .map(|(_, m, t)| (m.to_string(), (*t).to_string()))
+        .collect();
+    let ids: Vec<_> = inputs.iter().map(|(id, _, _)| *id).collect();
     let mut ast = ply_syntax::parse_program(inputs).expect("the corpus parses");
     let expanded = ply_derive::expand_program(&mut ast);
     assert!(expanded.is_empty(), "{expanded:?}");
     let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the corpus resolves");
-    let check = ply_core::check_program(&ast, &resolved).expect("the corpus checks");
+    ply_codegen::c::producer::ensure_default();
+    let front = ply_codegen::c::producer::front(&named, &ids).expect("the port answers");
+    assert!(
+        front.diagnostics.is_empty(),
+        "the corpus checks: {:?}",
+        front.diagnostics
+    );
+    let check = front.check;
     Loaded {
         program: Box::leak(Box::new(ast)),
         resolved: Box::leak(Box::new(resolved)),
@@ -212,6 +224,20 @@ fn lent_to_a_step(n: Int) -> Int = { let p = {x: n, y: 0}; fold(range(0, 3), 0, 
 "#;
 
 pub fn call(unit: &'static Unit, name: &str, args: &[Value]) -> Option<Value> {
+    // `attach` builds again -- `Unit::bodies` is not memoised -- so what answers here is whatever
+    // emitter is current now, not the one `unit` was built under. Every unit entered through this
+    // helper came from `unit`, which is the reference fragment, so the reference has to be current
+    // again; otherwise the installed producer is asked for a text-less source, answers nothing, and
+    // the members no longer match the code.
+    let backend =
+        ply_codegen::c::producer::reference_only(|| unit.attach(&ply_eval::BackendSpec::honest()));
+    backend.enter(&Symbol::new(name), args, 10_000)
+}
+
+/// The same, for a unit `whole` built: it is entered under the installed producer, because that is
+/// the emitter it is a unit of. Pairing this with `call` is what makes a test that runs both a
+/// comparison of two emitters rather than of one with itself.
+pub fn call_whole(unit: &'static Unit, name: &str, args: &[Value]) -> Option<Value> {
     let backend = unit.attach(&ply_eval::BackendSpec::honest());
     backend.enter(&Symbol::new(name), args, 10_000)
 }
@@ -646,7 +672,9 @@ fn a_call_of_the_wrong_arity_is_declined() {
 #[test]
 fn a_recursion_past_the_budget_declines_rather_than_running_it() {
     let (_, unit) = unit(ARITHMETIC);
-    let backend = unit.attach(&ply_eval::BackendSpec::honest());
+    // As `call`: `attach` builds again, under whatever emitter is current.
+    let backend =
+        ply_codegen::c::producer::reference_only(|| unit.attach(&ply_eval::BackendSpec::honest()));
     let ladder = Symbol::new("m.ladder");
     assert_eq!(
         backend.enter(&ladder, &[Value::Int(100)], 8),
@@ -674,7 +702,9 @@ fn an_overflow_declines_rather_than_wrapping() {
 fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
     let (loaded, unit) = unit(ARITHMETIC);
     let other = load(ARITHMETIC);
-    let backend = unit.attach(&ply_eval::BackendSpec::honest());
+    // As `call`: `attach` builds again, under whatever emitter is current.
+    let backend =
+        ply_codegen::c::producer::reference_only(|| unit.attach(&ply_eval::BackendSpec::honest()));
     assert!(backend.describes(loaded.program));
     assert!(!backend.describes(other.program));
 }
@@ -687,7 +717,10 @@ fn the_compiled_set_is_closed_under_calls() {
     let (loaded, unit) = unit(ARITHMETIC);
     let source = ply_codegen::Source::new(loaded.program, loaded.resolved, loaded.check);
     let source: &'static ply_codegen::Source = Box::leak(Box::new(source));
-    let (_, refusals) = ply_codegen::closure(source, unit.compiled()).expect("the set compiles");
+    // `closure` asks the current producer for every body too, and this unit is the reference's.
+    let (_, refusals) =
+        ply_codegen::c::producer::reference_only(|| ply_codegen::closure(source, unit.compiled()))
+            .expect("the set compiles");
     assert!(
         refusals.is_empty(),
         "the fixpoint returned a set that still refuses: {refusals:?}"

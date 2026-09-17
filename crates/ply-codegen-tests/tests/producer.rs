@@ -56,10 +56,25 @@ fn load(modules: &[(&str, &str)], with_std: bool) -> &'static Loaded {
         texts.insert(name.to_string(), text.to_string());
         inputs.push((id, ModuleName::from_dotted(name), text));
     }
+    let named: Vec<(String, String)> = inputs
+        .iter()
+        .map(|(_, m, t)| (m.to_string(), (*t).to_string()))
+        .collect();
+    let ids: Vec<_> = inputs.iter().map(|(id, _, _)| *id).collect();
     let mut ast = ply_syntax::parse_program(inputs).expect("parses");
     assert!(ply_derive::expand_program(&mut ast).is_empty());
     let resolved = ply_syntax::resolve::resolve(&mut ast).expect("resolves");
-    let check = ply_core::check_program(&ast, &resolved).expect("checks");
+    // `emitter` calls this before its own handover takes effect, so the committed bundle answers
+    // here while the emitter under test is handed over around each test's `build`. That is the
+    // circularity a `OnceLock` could not express and a `Drop`-scoped handover can.
+    producer::ensure_default();
+    let front = producer::front(&named, &ids).expect("the port answers for these modules");
+    assert!(
+        front.diagnostics.is_empty(),
+        "checks: {:?}",
+        front.diagnostics
+    );
+    let check = front.check;
     Box::leak(Box::new(Loaded {
         program: Box::leak(Box::new(ast)),
         resolved: Box::leak(Box::new(resolved)),
@@ -130,7 +145,11 @@ fn emitter() -> Result<PlyProducer, String> {
     )));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, _refused) = ply_codegen::c::build(source, &refs).map_err(|e| format!("{e:#}"))?;
+    // The emitter under test is compiled by the reference, as this binary's header says. `load`
+    // installs the default producer to answer the check, and without this that producer would be
+    // asked to emit itself from a source carrying no texts, and would answer nothing.
+    let (native, _refused) = producer::reference_only(|| ply_codegen::c::build(source, &refs))
+        .map_err(|e| format!("{e:#}"))?;
     PlyProducer::new(native).map_err(|e| format!("{e:#}"))
 }
 

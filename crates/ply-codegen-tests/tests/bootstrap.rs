@@ -59,7 +59,20 @@ fn emitter_source() -> (&'static Source, String) {
     let expanded = ply_derive::expand_program(&mut ast);
     assert!(expanded.is_empty(), "{expanded:?}");
     let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the emitter resolves");
-    let check = ply_core::check_program(&ast, &resolved).expect("the emitter checks");
+    // Nothing installs a recipe here since the fixpoint test began handing its emitter over, so
+    // the committed bundle answers for these sources; the emitter each round tests is handed
+    // over inside `emit_with`, and `with_current` prefers a handover to anything installed.
+    producer::ensure_default();
+    let ids: Vec<_> = (0..modules.len())
+        .map(|i| ply_span::SourceId(i as u32))
+        .collect();
+    let front = producer::front(&modules, &ids).expect("the port answers for the emitter");
+    assert!(
+        front.diagnostics.is_empty(),
+        "the emitter checks: {:?}",
+        front.diagnostics
+    );
+    let check = front.check;
     let program: &'static ply_syntax::ast::Program = Box::leak(Box::new(ast));
     let resolved = Box::leak(Box::new(resolved));
     let check = Box::leak(Box::new(check));

@@ -1303,7 +1303,7 @@ this record. Where `ply-ty` was already present nothing re-points, because it
 owns `CheckOutput`, `DefInfo` and `ty` outright and `ply-core` only re-exported
 them.
 
-**`ply-store-tests` cannot go, and it is one of four.** Its second
+**`ply-store-tests` cannot go, and it is one of three.** Its second
 site typechecks a program *reconstructed from the store*: `reconstruct` hands
 back a syntax tree and there is no source text anywhere, which is the crate's
 whole thesis -- what a run writes comes back out as a program that checks,
@@ -1315,24 +1315,72 @@ remaining site parses from source first. The corpus harnesses in
 programs through a `load` that reads files, so the text exists and the loader
 need only hand it back. This one has no text to hand.
 
-**`ply-codegen-tests` cannot go either, for an unrelated reason.** Seven of its
-nine `check_program` sites migrate like any other. The two that do not are
-`bootstrap.rs`'s `emitter_source` and the loader in `tests/producer.rs`, whose
-tests install their own recipe through `producer::install` -- a `OnceLock`, where
-the first installation wins and a second is ignored -- and whose check runs
-*before* that install. Adding `ensure_default` there would claim the lock first
-and leave the fixpoint test exercising an emitter it did not choose; omitting it
-leaves `front` with no emitter to ask. Either way the test stops testing what it
-says, which is why seven of nine is not a migration: the dependency stays
-standing.
+**`ply-codegen-tests` has gone, and the handover is why.** All nine of its
+`check_program` sites ask `producer::front`. Seven were ordinary. The two that
+were not are `bootstrap.rs`'s `emitter_source` and the loader in
+`tests/producer.rs`, whose tests install their own recipe through
+`producer::install` -- a `OnceLock`, where the first installation wins and a
+second is ignored -- and whose check runs *before* that install. That ordering
+is the trap worth keeping: adding `ensure_default` there would have claimed the
+lock first and left the fixpoint test exercising an emitter it did not choose,
+and omitting it left `front` with no emitter to ask.
 
-This one has a path, unlike the store's. `with_producer` is scoped by `Drop`
-rather than by a `OnceLock` -- that is what let the handover stand one emitter up
-inside another -- and the same mechanism could replace `install` in those two
-harnesses. That is a restructure of the fixpoint test rather than a migration, so
-it is named here instead of attempted alongside the others.
+The handover dissolved it rather than working around it. `with_current` consults
+a handover before anything installed, so the fixpoint test hands its emitter
+over inside `emit_with` and installs nothing; `ensure_default` at the check is
+then free to answer without deciding which emitter the test runs. The
+restructure this entry named as a path is the one that was taken.
 
-**`ply-eval-tests` cannot go either, and its reason is a third kind.** Thirteen
+Migrating it costs a word at every site that reads the reference emitter's own
+output, and the word is `reference_only`. A check the port answers needs a
+producer installed, and `Unit::over`, `Unit::bodies`, `Provider::attach` and
+`closure` all ask whatever producer is current for every body -- so installing
+one to answer the check also hands the emitting to it. Where the source carries
+no texts the port cannot answer at all: `bodies_of` returns an empty map rather
+than failing, every root is refused as unanswered, and the unit is empty. That
+is the shape of `the enterable fragment over the parser fell to 0` and of `the
+unit has no emit.emit_unit_all`. `Unit::bodies` is not memoised, so a unit built
+under the reference and entered later through `attach` is built again under
+whatever is current then -- which is how a test that forced its bodies inside
+`reference_only` still got an empty tier. The rule the crate now follows: the
+port answers the check, and a site that reads the reference emitter's own output
+asks for it by name.
+
+The trap in applying that rule is a helper two arms share, and it is worth the
+note because the shape recurs wherever one is added. `fragment::call` enters a
+unit and almost every caller hands it the reference's, so wrapping the helper
+itself reads as the tidy move. `number_types` hands it both -- one arm from
+`unit`, one from `whole` -- and that test *is* the comparison of the two
+emitters. Wrapped, the port's arm entered under the reference, whose build holds
+no body for the port's wider membership, so that arm answered nothing and the
+two engines were reported as disagreeing. The entry is split by which emitter
+built the unit, `call` beside `call_whole`: a helper that serves both arms of a
+comparison cannot be handed one arm's answer. Checking who calls a `pub` helper
+inside its own file is not checking who calls it.
+
+**Read, 2026-09-17: the hazards harness has never run the whole emitter.**
+`hazards.rs` builds two tiers over one program, calls them `reference` and
+`whole`, and every test there is a claim that the two agree. The `whole` arm
+built through `Unit::over_with_texts`, which asks whatever producer is
+installed -- and nothing in that binary installed one, so `mode()` answered
+`ref` and both arms were the reference emitter. A comparison of a thing with
+itself cannot fail, and none of those tests ever could. `fragment.rs` had the
+same bug and fixed it in place, with a comment saying why; this one was missed.
+
+Installing a producer to answer the check makes the comparison real for the
+first time, and the first thing it reports is that the port holds no body for
+`raced.raced`, which the interpreter also declines inside a `simulate` region,
+so the call arrives as `E0502` rather than as a wrong answer. `raced.ply` names
+the construct: a `simulate` region holding two spawned tasks over a shared cell,
+under `/ {sim.read}`.
+
+That is a gap in the port, not in this migration, so the arm stays on the
+reference -- explicitly now, where it sat by accident before -- and the
+comparison becomes real when the port carries that body. The entry is here
+because a test that cannot fail is worse than a missing one, and this one would
+otherwise be found a second time.
+
+**`ply-eval-tests` cannot go either, and its reason is a second kind.** Thirteen
 of its fourteen sites are ordinary: the two corpus harnesses need only the `load`
 above to return the texts it already reads, and the rest parse from source under
 names of their own. The one that stops the crate is `unit/builtins.rs`'s
@@ -1365,7 +1413,7 @@ saw the shape and stopped at the fact -- `prelude_arity` stays with the checker
 -- without the consequence, which is that one test stays with it until one of
 those two moves is made.
 
-**`ply-test-tests` cannot go either, and the fourth reason is a correspondence.**
+**`ply-test-tests` cannot go either, and the third reason is a correspondence.**
 Its seven sites migrate cleanly under the rule above -- three keep the names they
 gave `from_dotted`, four keep the empty name -- and `ply-test`'s own obligation
 API is indifferent to which, because it takes its names from `check.defs.keys()`
