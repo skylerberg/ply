@@ -856,6 +856,49 @@ fn what_the_fragment_refuses_the_standard_library_for() {
     );
 }
 
+/// The port's side of the census above: the same standard library, emitted by the compiler
+/// written in Ply rather than by the reference, refusing no more of it.
+///
+/// This is the gate ADR 0052 §2 names before `c/emit.rs` can go, and it is a *comparison* rather
+/// than a blessed ceiling on purpose. The ceilings above are the reference's; what matters here is
+/// that the emitter replacing it does not cost the tier a definition the one it replaces kept. A
+/// construct the port refuses and the reference emits is named by the failure, which is the census
+/// §2 asks the record to carry.
+///
+/// `unit` builds under `reference_only`; `whole` installs the producer, so the two units are the
+/// same program under the two emitters. Before the producer was installed in `whole`, both were
+/// the reference and a comparison like this one could not fail.
+#[test]
+fn the_port_refuses_no_more_of_the_standard_library_than_the_reference() {
+    let (loaded, reference) = unit("pub fn nothing() -> Int = 1\n");
+    let port = whole(loaded);
+    let definitions = |u: &Unit| -> Vec<String> {
+        u.refusals()
+            .iter()
+            .filter(|(f, _)| !f.contains("test#"))
+            .map(|(f, _)| f.clone())
+            .collect()
+    };
+    let reference_refuses = definitions(reference);
+    let port_refuses = definitions(port);
+    println!(
+        "  the reference refuses {} definition(s), the port {}",
+        reference_refuses.len(),
+        port_refuses.len()
+    );
+    let only_the_port: Vec<(&String, &String)> = port
+        .refusals()
+        .iter()
+        .filter(|(f, _)| !f.contains("test#") && !reference_refuses.contains(f))
+        .map(|(f, why)| (f, why))
+        .collect();
+    assert!(
+        only_the_port.is_empty(),
+        "the port refuses {} definition(s) the reference emits: {only_the_port:?}",
+        only_the_port.len()
+    );
+}
+
 /// The criterion ADR 0041's stage 2 rests on: whether a `perform` could find a handler on the
 /// stack rather than the host.
 ///

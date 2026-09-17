@@ -1390,6 +1390,25 @@ emitters agree at every width in the test. If it is red, the failure names the
 width construct the port refuses, and that is the empirical census §2 asked for
 and that this record has said no test measures.
 
+**Built, 2026-09-17: the port refuses no more of the standard library than the
+reference.** §2 asks this record to name the bodies the port still emits differently
+before `c/emit.rs` goes, and the entries above say twice that nothing measures it.
+Something does now.
+
+The gate is a *comparison*, not a blessed ceiling, and that is the point. The
+ceilings a few paragraphs up are the reference's, and they ratchet down as
+constructs land. What matters before the reference can be deleted is narrower: that
+the emitter replacing it does not cost the tier a definition the one it replaces
+kept. So the test builds the same loaded standard library twice -- `unit` under
+`reference_only`, `whole` under the producer -- and asserts the port refuses nothing
+the reference emits. A construct only the port refuses is named by the failure, with
+the reason the port itself gave, which is the census §2 asks the record to carry.
+
+It needs no number blessed from a run, which is why it can be written under the
+constraint this record works within. And it could not have been written a day ago:
+`whole` did not install a producer, so both units were the reference, and a
+comparison like this one could not have failed.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -1453,7 +1472,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s, 153 s and 199 s, each reusing by tree the same way and for the same reason. Six of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s and the sixth 199 s, which the two entries closing this section take. None of those four was caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s, 153 s, 199 s, 381 s and 139 s, each reusing by tree the same way and for the same reason. Seven of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, the sixth 199 s and the seventh 381 s, which the entries closing this section take. None of those five was caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
@@ -1614,6 +1633,30 @@ So the sixth over-bound reading is the same shape as the fifth: a job that did n
 seconds after every job had finished; this one is a partition waiting forty before
 beginning. Both are the platform, and the tree is in neither -- the merge under
 this one changed one line of a test helper and one document.
+
+**Read, 2026-09-17: a quiet main run reads 139 s, and every excursion was a job that
+did not start.** §3 asks for a quiet main run under 180 s. This one was taken with
+nothing else of this session's in flight, and *measured* rather than assumed: the
+reading listed every run overlapping its window and found none. It reads **139 s**,
+its partitions beginning at 27 s and the longest running 105 s.
+
+Against that baseline the three over-bound runs are one shape. At 203 s every job
+had finished by 159 s and the aggregate did not begin until 198. At 199 s every
+partition began at 29 or 30 except one, which began at 70. At 381 s no partition
+began until 245. None of the three is work taking longer; all three are a job that
+did not start.
+
+**And contention explains less than it first appeared -- the first measurement of it
+was wrong.** An overlap table built from each run's `createdAt` suggested two of the
+three had a competitor in flight. Taken again from `run_started_at` -- `createdAt` on
+a re-run spans the attempt that failed -- the 199 s run's second attempt began
+fifty-one seconds *after* its supposed competitor ended, and the 203 s run had no
+concurrent run at all. Only 381 s overlaps one, and there the competitor started
+139 seconds into a 245-second wait, so it cannot account for the first 139. The
+honest statement is narrower than the tidy one: these runners usually schedule a
+fan-out within half a minute and sometimes do not, and the tree is in none of it --
+the merges under those three runs changed one line of a test helper, one document
+and one ADR.
 
 ## 4. The loop that is O(the change)
 
