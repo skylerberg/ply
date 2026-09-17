@@ -295,7 +295,6 @@ fn iterate(
                 run_program,
                 run_resolved,
                 &loaded.check,
-                &hashes,
                 super::common::module_texts(run_program, &loaded.sources),
             )
         }) {

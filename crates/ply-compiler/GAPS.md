@@ -2189,10 +2189,12 @@ rather than built as trees); `arm-hash.sh` arms it.
 
 **What the port needed of the language.** A float literal is hashed by its
 IEEE bit pattern, and the parser spike carries a literal's text. The text
-reaches a correctly rounded `Float` through `decimal_of_string` and
-`float_of_decimal`, which read it as the reference's lexer does; what the
-language could not do was read the bits back, so `bits_of_float` and
-`float_of_bits` were added first, on their own. A `Decimal` literal's mantissa
+reaches a correctly rounded `Float` through `float_of_string`, which reads it as
+the reference's lexer reads it and saturates where that saturates; the route
+before it ran through `Decimal`, which holds neither end of the range, so the
+hasher gave up on the literals a shipped test writes (ADR 0052 §1). Reading the
+pattern back is `bits_of_float` and `float_of_bits`, added earlier and on their
+own. A `Decimal` literal's mantissa
 has up to 96 bits, more than an `Int`, so it is accumulated a byte at a time
 into the sixteen little-endian bytes the reference writes.
 

@@ -60,9 +60,12 @@ fn main() {
     let resolved = Box::leak(Box::new(resolved));
     let check = Box::leak(Box::new(check));
     let hashes = ply_hash::hash_program(program, resolved, check).unwrap_or_else(refused);
-    let keys = ply_codegen::source::emit_keys(program, &hashes);
+    let front = Box::leak(Box::new(ply_codegen::front_of(
+        program, resolved, check, hashes, None,
+    )));
+    let keys = ply_codegen::emit_keys(front);
     let source: &'static ply_codegen::Source = Box::leak(Box::new(
-        ply_codegen::Source::keyed(program, resolved, check, keys).with_texts(texts),
+        ply_codegen::Source::from_front(program, resolved, front, keys).with_texts(texts),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();

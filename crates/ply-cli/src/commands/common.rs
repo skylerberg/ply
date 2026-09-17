@@ -130,7 +130,6 @@ pub fn prover_backend(
         &loaded.program,
         &loaded.resolved,
         &loaded.check,
-        &loaded.hashes,
         module_texts(&loaded.program, &loaded.sources),
     )?;
     Ok(Some((provider, spec)))
@@ -143,13 +142,12 @@ pub fn build_backend(
     program: &ply_syntax::ast::Program,
     resolved: &ply_syntax::resolve::Resolved,
     check: &ply_core::CheckOutput,
-    hashes: &ply_hash::HashOutput,
     texts: std::collections::HashMap<String, String>,
 ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
     ply_codegen::c::producer::ensure_default();
     match spec.kind {
         ply_eval::BackendKind::C => {
-            ply_codegen::Unit::keyed(program, resolved, check, emit_keys(program, hashes), texts)
+            ply_codegen::Unit::over_with_texts(program, resolved, check, texts)
                 .map(|unit| unit as &'static dyn ply_eval::Provider)
                 .map_err(|error| {
                     Diagnostic::error(

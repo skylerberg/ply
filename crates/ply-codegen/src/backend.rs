@@ -5,7 +5,7 @@ use crate::source::Source;
 use anyhow::{Context, Result, bail};
 use ply_eval::{Compilation, Counters, Entered, Policed, Provider, Value};
 use ply_span::{Diagnostic, Symbol};
-use ply_syntax::ast::{Program, TypeExpr};
+use ply_syntax::ast::Program;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
@@ -98,31 +98,22 @@ impl Unit {
         check: &ply_ty::CheckOutput,
         texts: HashMap<String, String>,
     ) -> Result<&'static Unit> {
-        let keys = ply_hash::hash_program(program, resolved, check)
-            .map(|hashes| crate::source::emit_keys(program, &hashes))
-            .unwrap_or_default();
-        Unit::keyed(program, resolved, check, keys, texts)
-    }
-
-    /// The same, told what each definition's code is a function of, so that emitted bodies and
-    /// the built unit can be kept between runs. Without the keys nothing is kept and everything
-    /// is emitted afresh.
-    pub fn keyed(
-        program: &Program,
-        resolved: &ply_syntax::resolve::Resolved,
-        check: &ply_ty::CheckOutput,
-        keys: HashMap<String, String>,
-        texts: HashMap<String, String>,
-    ) -> Result<&'static Unit> {
+        // The front end's answer, once for the whole unit: every table the emitter is offered is
+        // read from it, and so are the keys that make a test or a law a root (ADR 0052 §1). The
+        // port answers it where it can, which is why this is not free and is not paid twice.
+        let front = Box::leak(Box::new(
+            crate::source::front_for(program, resolved, check, &texts)
+                .context("the front end's answer over this program")?,
+        ));
+        let keys = crate::source::emit_keys(front);
         // The copy is what the compiled bodies are generated from, so a unit shares no state at all
         // with the machine's program.
         let origin = std::ptr::from_ref(program) as usize;
         let program: &'static Program = Box::leak(Box::new(program.clone()));
         let resolved: &'static ply_syntax::resolve::Resolved =
             Box::leak(Box::new(resolved.clone()));
-        let check: &'static ply_ty::CheckOutput = Box::leak(Box::new(check.clone()));
         let source: &'static Source = Box::leak(Box::new(
-            Source::keyed(program, resolved, check, keys).with_texts(texts),
+            Source::from_front(program, resolved, front, keys).with_texts(texts),
         ));
         let candidates = source.functions();
         let started = std::time::Instant::now();
@@ -237,14 +228,7 @@ impl Unit {
         let started = std::time::Instant::now();
         let native = match &self.embedded {
             Some(text) => {
-                let modules = self
-                    .source
-                    .program
-                    .modules
-                    .iter()
-                    .map(|m| m.source)
-                    .collect();
-                crate::c::load_unit(text, Some(modules), "artifact")?.0
+                crate::c::load_unit(text, Some(self.source.module_sources()), "artifact")?.0
             }
             // Offered the same set the pre-flight was, so the unit's key is the pre-flight's and a
             // worker reads that unit back rather than emitting it again.
@@ -729,7 +713,7 @@ impl Policed for Bodies {
 /// the wide registry enters at the parse root and beats no backend on the front-end row
 /// (`benches/front-end`). `PLY_CODEGEN_REGISTER=narrow` keeps the arm that record measured.
 fn registers(source: &Source, name: &str) -> bool {
-    !narrow_registry() || scalar_signature(source, name)
+    !narrow_registry() || source.scalar_signature(name)
 }
 
 /// Read once per process, and read here rather than at each site so that the knob has one
@@ -742,20 +726,6 @@ pub fn narrow_registry() -> bool {
     static NARROW: OnceLock<bool> = OnceLock::new();
     *NARROW
         .get_or_init(|| std::env::var("PLY_CODEGEN_REGISTER").is_ok_and(|v| v.trim() == "narrow"))
-}
-
-/// Whether every parameter and the return type are written `Int` or `Bool`.
-fn scalar_signature(source: &Source, name: &str) -> bool {
-    let Some((def, _)) = source.definition(name) else {
-        return false;
-    };
-    let scalar = |t: Option<&TypeExpr>| match t {
-        Some(TypeExpr::Con { name, args, .. }) => {
-            args.is_empty() && matches!(name.symbol().as_str(), "Int" | "Bool")
-        }
-        _ => false,
-    };
-    def.params.iter().all(|p| scalar(p.ty.as_ref())) && scalar(def.ret.as_ref())
 }
 
 /// The largest subset of `candidates` the emitter compiles **as one unit**, and every function
