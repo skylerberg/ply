@@ -1282,7 +1282,7 @@ this record. Where `ply-ty` was already present nothing re-points, because it
 owns `CheckOutput`, `DefInfo` and `ty` outright and `ply-core` only re-exported
 them.
 
-**`ply-store-tests` cannot go, and it is one of two.** Its second
+**`ply-store-tests` cannot go, and it is one of three.** Its second
 site typechecks a program *reconstructed from the store*: `reconstruct` hands
 back a syntax tree and there is no source text anywhere, which is the crate's
 whole thesis -- what a run writes comes back out as a program that checks,
@@ -1310,6 +1310,30 @@ rather than by a `OnceLock` -- that is what let the handover stand one emitter u
 inside another -- and the same mechanism could replace `install` in those two
 harnesses. That is a restructure of the fixpoint test rather than a migration, so
 it is named here instead of attempted alongside the others.
+
+**`ply-eval-tests` cannot go either, and its reason is a third kind.** Thirteen
+of its fourteen sites are ordinary: the two corpus harnesses need only the `load`
+above to return the texts it already reads, and the rest parse from source under
+names of their own. The one that stops the crate is `unit/builtins.rs`'s
+`ply_core::prelude_arity`, which is not a check at all.
+
+It reads the checker's prelude environment -- `infer::prelude_arity` builds an
+empty `Checker` and looks the name up in `c.env` -- and that table is
+`install_prelude`'s, which lives in `infer.rs` and goes when the checker goes.
+`ply-ty`'s `prelude.rs` carries the ADTs, the effect names, `ctors` and
+`ctor_arities`, but no builtin schemes, so nothing that survives can answer it.
+
+Nor can the test answer it from what it already holds. It exists to check the
+evaluator's builtin arity table against the *type system's*, on the stated ground
+that a builtin the prelude does not type cannot be called at all, so the two
+tables have to cover the same set. Sourcing both sides from `ply-eval` would
+leave it comparing a table with itself, which is a green that tests nothing.
+
+The path is the move this record already made for the rest of the prelude: the
+builtin schemes join `ply-ty` as the ADTs, the effects and the constructor
+arities did. The note above saw the shape of this and stopped at the fact --
+`prelude_arity` stays with the checker -- without the consequence, which is that
+one test stays with it until the schemes move.
 
 **Built, 2026-09-17: `verify` sees the member it could not see, and the count
 says what it counts.** This record described the gap twice and fixed it neither
