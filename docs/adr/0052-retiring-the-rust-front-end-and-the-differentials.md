@@ -1258,15 +1258,23 @@ the job the old `.expect("... typechecks")` did, since `front` answers `Ok` with
 diagnostics rather than erroring. `ply-cli-tests` and `ply-host-tests` went
 first.
 
-Two rules travel with it. The port keys program-wide, so a fixture's definitions
-and the effects it *declares* gain their module: `config` became `m.config`, and
-`db.get[orders]` became `m.db.get[orders]` in the host listing. An effect a
-fixture does not declare keeps its bare name -- `clock` comes from the prelude
-and `task` from the simulation, not from the source -- so only what a fixture
-declares moves. And the module name is an argument rather than an accident:
-`tcp.rs` must pass `ply_host::tcp::MODULE`, because `std.net` is what qualifies
-its `EFFECT` as `std.net.net`, while a fixture under no such constraint can be
-handed any name.
+Two rules travel with it, and the first is the one that matters: **hand `front`
+the module name the site already gave the parser.** `ply_syntax::parse` names a
+module `ModuleName::anonymous()`, which is `Symbol::new("")`, and an anonymous
+module qualifies nothing -- `ModuleName::qualify` returns the bare name, and
+`resolve.ply`'s `qualify` returns it for a zero-length module, the two
+implementations agreeing independently. Pass that name through and no key moves;
+invent one and every key gains it. `ply-cli-tests` was migrated with an invented
+`"m"`, so `config` became `m.config` and `db.get[orders]` became
+`m.db.get[orders]` in the host listing: churn that was avoidable rather than
+inherent. `ply-prove-tests` then failed across four files for the same reason,
+and passed with every assertion untouched once the anonymous name was preserved.
+
+The second rule is that where a site names its module deliberately, the name is
+load-bearing: `tcp.rs` must pass `ply_host::tcp::MODULE`, because `std.net` is
+what qualifies its `EFFECT` as `std.net.net`. An effect a fixture does not
+declare keeps its bare name either way -- `clock` comes from the prelude and
+`task` from the simulation, not from the source.
 
 The cost is a dependency rather than a deletion for the crates that lacked
 `ply-codegen`: they trade the checker for the code generator, which survives
@@ -1274,7 +1282,7 @@ this record. Where `ply-ty` was already present nothing re-points, because it
 owns `CheckOutput`, `DefInfo` and `ty` outright and `ply-core` only re-exported
 them.
 
-**`ply-store-tests` cannot go, and a sweep says it is the only one.** Its second
+**`ply-store-tests` cannot go, and it is one of two.** Its second
 site typechecks a program *reconstructed from the store*: `reconstruct` hands
 back a syntax tree and there is no source text anywhere, which is the crate's
 whole thesis -- what a run writes comes back out as a program that checks,
@@ -1285,6 +1293,23 @@ remaining site parses from source first. The corpus harnesses in
 `ply-eval-tests` looked like a second case and are not: they reach their
 programs through a `load` that reads files, so the text exists and the loader
 need only hand it back. This one has no text to hand.
+
+**`ply-codegen-tests` cannot go either, for an unrelated reason.** Seven of its
+nine `check_program` sites migrate like any other. The two that do not are
+`bootstrap.rs`'s `emitter_source` and the loader in `tests/producer.rs`, whose
+tests install their own recipe through `producer::install` -- a `OnceLock`, where
+the first installation wins and a second is ignored -- and whose check runs
+*before* that install. Adding `ensure_default` there would claim the lock first
+and leave the fixpoint test exercising an emitter it did not choose; omitting it
+leaves `front` with no emitter to ask. Either way the test stops testing what it
+says, which is why seven of nine is not a migration: the dependency stays
+standing.
+
+This one has a path, unlike the store's. `with_producer` is scoped by `Drop`
+rather than by a `OnceLock` -- that is what let the handover stand one emitter up
+inside another -- and the same mechanism could replace `install` in those two
+harnesses. That is a restructure of the fixpoint test rather than a migration, so
+it is named here instead of attempted alongside the others.
 
 **Built, 2026-09-17: `verify` sees the member it could not see, and the count
 says what it counts.** This record described the gap twice and fixed it neither
