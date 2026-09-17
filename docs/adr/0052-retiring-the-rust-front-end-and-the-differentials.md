@@ -348,6 +348,22 @@ saving its object cache, and of those 69 s one comparison of the port's
 tables over the compiler's own sources took 51. It runs alone now, as
 this tree's three other heavy tests do, so no partition waits on it.
 
+**Built, 2026-09-17: a merge takes the pull request's build.** Reuse looks
+the build up by the tree it is standing on, and a merge stands on a tree
+no run has built whenever main moved under the pull request between its
+last run and its merge, which is every second merge of a pair. A
+records-only merge paid for exactly that: 370 s wall, 266 s of it
+archiving the tests and 165 s linking the binary, for a change no
+compiler reads. The lookup now falls back to the second parent's tree
+when every file the comparison names is a record, a bench or a workflow,
+and refuses a comparison of three hundred files or more, where GitHub
+stops listing them and the file that reaches the compiler would be the
+one left off the end. The run that merged the fallback read 145 s: both
+build legs took their artifacts back, in 21 s and 18 s, and the longest
+jobs are four test partitions at 75–80 s. That run hit the lookup
+directly, main not having moved under it, so the fallback is built here
+and not yet exercised.
+
 ## 4. The loop that is O(the change)
 
 Once the compiler's tests are Ply tests, `ply test`'s content addressing
@@ -372,6 +388,37 @@ leaf or a hub much the same — and far smaller under the code generator:
 leaf, 53 ms, 18 ms and 210 ms for a hub. The switch replaces the restore
 with the port checking and hashing every module every run, so the warm
 front-end row is the one to read again beside it.
+
+**Read, 2026-09-17: what it costs after the switch, and why this does not
+merge yet.** Two runners agree to within one percent, both at a load under
+the gate. A warm `ply test` with nothing changed now takes 0.93 s, 5.2 s
+and 39.6 s at the three sizes, against 0.01 s, 0.09 s and 0.41 s before
+it; the front end is 923 ms, 5,094 ms and 39,713 ms against 2.7 ms, 22.5
+ms and 92.6 ms. Reading, parsing, resolving and writing back are
+unchanged and account for 211 ms of the largest figure. The port's own
+answer is the rest: 39,502 ms.
+
+Two different things are inside that number and reading them as one would
+misplace the work. The gates are gone, so where the reference rechecked
+nothing the port checks and hashes every definition on every run. The
+in-process rows price that full work for the reference at the same size:
+141.8 ms to typecheck and 100.8 ms to hash. So the port is charging about
+a hundred and sixty times what the reference charges for the same
+checking and hashing, and the deleted gates account for about three of
+the four hundred and twenty-seven-fold rise in the warm row. The port's
+own speed is the term that matters.
+
+That is why this record holds the switch rather than merging it green.
+The commonest act in the loop is asking a project that has not changed
+whether it is still good, and the switch makes that act a hundred times
+slower at the smallest size and a hundred times slower at the largest.
+§4's subject is precisely that loop. The port needs either the gates'
+answer — an incremental front end, which is what §4 says falls out of
+content addressing — or its own speed, before the reference stops
+running. A 39-second no-op is not a front end a person can develop
+against, and no CI reading catches it, because CI's programs are the
+compiler's own sources and the corpora, not a four-thousand-definition
+project asked the same question twice.
 
 ## The order, and why
 
