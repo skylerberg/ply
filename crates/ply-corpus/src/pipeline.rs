@@ -15,8 +15,6 @@ pub enum Phase {
     Read,
     Parse,
     Resolve,
-    Typecheck,
-    Hash,
     CacheOpen,
     Select,
     /// Building the run's compiled unit, which is nothing at all without a backend. Its own phase
@@ -33,8 +31,6 @@ impl Phase {
             Phase::Read => "read",
             Phase::Parse => "parse",
             Phase::Resolve => "resolve",
-            Phase::Typecheck => "typecheck",
-            Phase::Hash => "hash",
             Phase::Compile => "compile",
             Phase::CacheOpen => "cache open",
             Phase::Select => "select",
@@ -42,14 +38,12 @@ impl Phase {
         }
     }
 
-    pub fn all() -> [Phase; 10] {
+    pub fn all() -> [Phase; 8] {
         [
             Phase::Discover,
             Phase::Read,
             Phase::Parse,
             Phase::Resolve,
-            Phase::Typecheck,
-            Phase::Hash,
             Phase::CacheOpen,
             Phase::Select,
             Phase::Compile,
@@ -100,8 +94,8 @@ pub struct Front {
     pub check: CheckOutput,
     pub hashes: HashOutput,
     /// The port's whole answer, for the tier this program is run on. `check` and `hashes` above
-    /// stay the Rust chain's, because timing their phases is what this harness reports — the two
-    /// answer different questions and only one of them is a measurement (ADR 0052 §2).
+    /// are taken from it: the Rust chain no longer runs here, so there are no chain phases left to
+    /// time and no second answer to disagree with (ADR 0052 §2).
     pub port: ply_ty::Front,
     pub timings: Timings,
     /// This program's region kinds.
@@ -158,16 +152,8 @@ pub fn front(root: &Path) -> Result<Front> {
     let resolved = resolve(&mut program).map_err(|d| report(&d))?;
     timings.record(Phase::Resolve, started.elapsed());
 
-    let started = Instant::now();
-    let check = ply_core::check_program(&program, &resolved).map_err(|d| report(&d))?;
-    timings.record(Phase::Typecheck, started.elapsed());
-
-    let started = Instant::now();
-    let hashes = ply_hash::hash_program(&program, &resolved, &check).map_err(|d| report(&d))?;
-    timings.record(Phase::Hash, started.elapsed());
-
-    // Outside the clock: the rows above are the chain's, and this is only what the tier is
-    // built from.
+    // The port answers the check and the hashes, as it does for every command (ADR 0052 §1).
+    // Outside the clock: what this harness times is the phases it still runs itself.
     let ordered: Vec<(String, String)> = ids
         .iter()
         .zip(&names)
@@ -188,8 +174,8 @@ pub fn front(root: &Path) -> Result<Front> {
         sources,
         program,
         resolved,
-        check,
-        hashes,
+        check: port.check.clone(),
+        hashes: port.hashes.clone(),
         port,
         timings,
         region_kinds: ply_eval::region_kind::Kinds::default(),
