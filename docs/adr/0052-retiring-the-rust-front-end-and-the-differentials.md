@@ -877,11 +877,13 @@ build the tier from it through `Unit::over_front`, so one ask serves both. Six
 sites in all, `bench`'s default tier included; `ply-corpus` no longer calls
 `over_with_texts` anywhere.
 
-`pipeline` holds **both** answers on purpose. Its `check` and `hashes` stay the
-Rust chain's, wrapped in `Phase::Typecheck` and `Phase::Hash`, because timing
-those phases is the whole of what that harness reports; the port's answer sits
-beside them, asked outside every timed region, and is only what the tier is built
-from. Two answers to two questions, and only one of them is a measurement.
+`pipeline` asks the port as well, and the paragraph that said otherwise was
+describing a tree that has since moved rather than getting it wrong.
+`Phase::Typecheck` and `Phase::Hash` were real rows once; `dd6c3da7` took the
+marginal-change bench onto the port and removed them, leaving eight -- discover,
+read, parse, resolve, cache-open, select, compile and execute. `front` takes
+both answers from `crate::port_front` now, so `check` and `hashes` are the
+port's, and what this harness times is the parse, the resolve and the compile.
 
 **What this does not do, against what an earlier paragraph implied.** That
 paragraph said `front_for`'s Rust arm is reached from five places and all five
@@ -963,8 +965,8 @@ total at 2.12 MB each. Three comment lines do not buy that. They go with the nex
 emitter change that refreshes the bundle anyway, and until then this paragraph is
 where a reader learns the comments are wrong.
 
-**Built, 2026-09-17: the staging binary asks the port, and the checker is down
-to three callers.** `stage.rs` bootstraps a working copy of the emitter, and it was
+**Built, 2026-09-17: the staging binary asks the port.** `stage.rs` bootstraps a
+working copy of the emitter, and it was
 never blocked — only unexamined. It already installs the emitter at the top with
 `producer::ensure_default()`, already holds its modules as `(name, text)` pairs in
 exactly the shape `producer::front` takes, and its `SourceMap` hands out ids
@@ -979,21 +981,26 @@ It asks the port now. The parse, the expansion and the resolve stay, because
 its answers. Nothing else in the binary read the `CheckOutput`, so the three calls
 came out whole.
 
-That leaves `check_program` with three non-test callers and `hash_program` with
-two. The seed path in `ply-codegen` and `pipeline.rs` in `ply-corpus` call both;
-`benches/value-model/ply-arm`, the value-model benchmark's Ply arm, calls the
-checker alone. None of the three is a program a user runs. The seed path is
-the one §2 cannot delete before the bundle migration exists, for the reason given
-above — `build_from` falls back to `from_reference()` when a unit is unserved, and
-ADR 0050 §1a chose that deliberately.
+That leaves `check_program` with no non-test caller at all, and this record was
+the last thing still saying otherwise. The three it named went one at a time:
+`stage.rs` above; `pipeline.rs` in `ply-corpus`, which takes both answers from
+`crate::port_front`; and `benches/value-model/ply-arm`, which asks
+`producer::front` and does not declare `ply-core`. The only mention left outside
+the test crates is a line of `ply-cli`'s `driver.rs` saying the checker is not
+called on a user's path, which is now true of every path. What holds `ply-core`
+up is the test crates alone, which the terminal position below states once and
+this entry does not restate.
 
-`pipeline.rs` was deliberately not moved onto the port with the others, and the
-reason is worth stating because it would otherwise read as an oversight. Its `check_program` sits in
-`Phase::Typecheck` and its `hash_program` in `Phase::Hash`, and those rows are
-what the marginal-change bench sums into the front-end figures §4 cites. Pointing
-them at the port would move numbers this record depends on without saying so: it
-would report the port's cost under the chain's name. It retires with the chain it
-times, which is the rule the differentials retired under.
+The hasher is the one that still has callers, and they are not the pair this
+record named. `hash_program_with_bodies` is reached from `ply-codegen`'s
+`front_for` -- the seed path, which takes the `CheckOutput` as a parameter
+rather than deriving one -- and twice from `ply-corpus`'s `w3.rs`.
+`hash_program` has no non-test caller. The seed path is still the one §2 cannot
+delete before the bundle migration exists, for the reason given above:
+`build_from` falls back when a unit is unserved, and ADR 0050 §1a chose that
+deliberately. That
+constraint was always the hasher's and the emitter's; attaching it to the
+checker was what made the checker look harder to retire than it is.
 
 **Built, 2026-09-17: the prelude moves to `ply-ty`, and the runtime halves come
 off the checker's crate.** §2 deletes `ply-core`, and the crate was held for two
@@ -1202,6 +1209,13 @@ So it asks both now, the pull request's first and main's after, and a merge that
 adds only a record takes main's build rather than standing a compiler up. The
 cost when neither answers is one extra pair of API calls, on a merge that was
 going to rebuild anyway.
+
+The two merges since ran 142 s and 151 s against the bound of 180, each taking
+the archive its own pull request's run built. That is the *first* lookup, not
+the parent fallback added here, so those readings say the ordinary warm path
+still works rather than that the fallback does. The fallback's own demonstration
+is the one above: run against the cold merge with the first lookup removed, the
+old script finds nothing and this one returns main's archive and its binary.
 
 **Read, 2026-09-17: where §2 ends, and why it is not the bundle migration.**
 This record has said, more than once, that the seed path cannot go before a
