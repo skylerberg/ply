@@ -2,21 +2,22 @@ use self::fixture::{op, receives_secrets, registry};
 use ply_cli::config::Configuration;
 use ply_cli::db::DbConfig;
 use ply_cli::hosts::*;
-use ply_core::CheckOutput;
-use ply_core::ty::{Footprint, Resource};
+use ply_codegen::c::producer;
 use ply_eval::host::{HostListing, HostRegistry, HostResource, Linearity};
 use ply_host::tls;
 use ply_span::{SourceId, Symbol};
+use ply_ty::CheckOutput;
+use ply_ty::ty::{Footprint, Resource};
 use serde_json::Value;
 
 /// A registry whose handlers must never be called, for the tests that only report on a binding.
 pub mod fixture {
-    use ply_core::ty::Resource;
     use ply_eval::host::{
         Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
         HostRuntime, Linearity,
     };
     use ply_span::{Diagnostic, Symbol, codes};
+    use ply_ty::ty::Resource;
     use std::sync::Arc;
 
     struct Never;
@@ -96,8 +97,16 @@ fn stamp() -> Int / {clock.read} = clock.now()
 "#;
 
 fn check(source: &str) -> CheckOutput {
-    let module = ply_syntax::parse(SourceId(0), source).expect("the fixture parses");
-    ply_core::check_module(&module).expect("the fixture typechecks")
+    producer::ensure_default();
+    let modules = [("m".to_string(), source.to_string())];
+    let front =
+        producer::front(&modules, &[SourceId(0)]).expect("the port answers for the fixture");
+    assert!(
+        front.diagnostics.is_empty(),
+        "the fixture typechecks: {:?}",
+        front.diagnostics
+    );
+    front.check
 }
 
 fn full() -> HostRegistry {
@@ -143,9 +152,9 @@ fn the_listing_names_every_resource_an_any_handler_got() {
         triples,
         [
             "clock.now",
-            "db.get[orders]",
-            "db.get[users]",
-            "db.put[orders]"
+            "m.db.get[orders]",
+            "m.db.get[users]",
+            "m.db.put[orders]"
         ]
     );
     assert_eq!(listing.handlers, 3);
@@ -163,11 +172,11 @@ fn the_table_is_exactly_the_shape_the_contract_specifies() {
         "\
 3 host handlers · 4 operations · trusted computing base
 
-OPERATION       ATOM              HANDLER                    DET  LINEAR        BLOCKING  SECRETS
-clock.now       clock.read        ply_host::clock::now       no   repeatable    no        no
-db.get[orders]  db.read[orders]   ply_host::postgres::read   no   at-most-once  yes       no
-db.get[users]   db.read[users]    ply_host::postgres::read   no   at-most-once  yes       no
-db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  yes       no
+OPERATION         ATOM                HANDLER                    DET  LINEAR        BLOCKING  SECRETS
+clock.now         clock.read          ply_host::clock::now       no   repeatable    no        no
+m.db.get[orders]  m.db.read[orders]   ply_host::postgres::read   no   at-most-once  yes       no
+m.db.get[users]   m.db.read[users]    ply_host::postgres::read   no   at-most-once  yes       no
+m.db.put[orders]  m.db.write[orders]  ply_host::postgres::write  no   at-most-once  yes       no
 "
     );
     assert!(digest[0].starts_with("digest: b3:"), "{digest:?}");
