@@ -3,7 +3,6 @@
 use ply_cli::driver;
 use ply_cli::load::Loaded;
 use ply_store::Store;
-use ply_syntax::ast::ModuleName;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -56,8 +55,7 @@ fn snapshot(loaded: &Loaded) -> BTreeMap<String, String> {
 }
 
 /// The incremental run goes first so it sees the store as an edit-test loop would, and its result
-/// is returned so a caller can assert that a gate actually fired — an equivalence that holds
-/// because nothing was skipped proves nothing.
+/// is returned so a caller can go on to assert what the run published.
 #[track_caller]
 fn agree(dir: &Path, what: &str) -> Loaded {
     let mut store = Store::open(dir).expect("the cache directory must be creatable");
@@ -85,61 +83,6 @@ fn agree(dir: &Path, what: &str) -> Loaded {
         differences.join("\n")
     );
     incremental
-}
-
-/// The same equivalence one axis over, and the safety argument for a **resumable** front end:
-/// a load that reuses the syntax trees this process already parsed must answer what a load that
-/// parsed everything answers. `resume` carries across calls the way a warm process carries it.
-///
-/// `needed` names the modules the load must parse whatever the gates would have said, which is the
-/// shape `load_to_evaluate` has and the only one where reuse can pay: a run that skips a file does
-/// not parse it, so it has nothing to reuse for it.
-#[track_caller]
-fn agree_resumed(
-    dir: &Path,
-    resume: &mut driver::Resume,
-    needed: &[ModuleName],
-    what: &str,
-) -> Loaded {
-    let mut store = Store::open(dir).expect("the cache directory must be creatable");
-    let resumed = driver::run_resumed(
-        dir,
-        driver::Mode::Incremental,
-        Some(&mut store),
-        needed,
-        Some(resume),
-    )
-    .unwrap_or_else(|e| panic!("{what}: the resumed path failed: {:?}", codes(&e)));
-    let full = driver::load_full(dir)
-        .unwrap_or_else(|e| panic!("{what}: the full path failed: {:?}", codes(&e)));
-
-    let a = snapshot(&full);
-    let b = snapshot(&resumed);
-    let mut differences = Vec::new();
-    for key in a.keys().chain(b.keys()) {
-        if a.get(key) != b.get(key) {
-            differences.push(format!(
-                "  {key}\n    full    {:?}\n    resumed {:?}",
-                a.get(key),
-                b.get(key)
-            ));
-        }
-    }
-    differences.dedup();
-    assert!(
-        differences.is_empty(),
-        "{what}: the resumed path disagreed with a from-scratch check:\n{}",
-        differences.join("\n")
-    );
-    resumed
-}
-
-fn fixture_modules() -> Vec<ModuleName> {
-    ["core", "shop", "leaf"]
-        .iter()
-        .copied()
-        .map(ModuleName::from_dotted)
-        .collect()
 }
 
 fn codes(e: &ply_cli::load::LoadError) -> Vec<String> {
@@ -240,27 +183,17 @@ fn examples() -> tempfile::TempDir {
 }
 
 #[test]
-fn a_cold_run_and_a_warm_run_agree_and_the_warm_one_skips() {
+fn a_cold_run_and_a_warm_run_agree() {
     let dir = corpus();
     agree(dir.path(), "cold");
-    let warm = agree(dir.path(), "warm");
-    assert!(
-        warm.frontend.skipped() > 0,
-        "gate 1 never fired, so the equivalence proves nothing: {:?}",
-        warm.frontend.files
-    );
-    assert!(warm.frontend.cached() > 0, "gate 2 never fired");
+    agree(dir.path(), "warm");
 }
 
 #[test]
 fn the_example_corpus_agrees_cold_and_warm() {
     let dir = examples();
     agree(dir.path(), "cold");
-    let warm = agree(dir.path(), "warm");
-    assert!(
-        warm.frontend.skipped() > 0,
-        "gate 1 never fired on the examples"
-    );
+    agree(dir.path(), "warm");
 }
 
 #[test]
@@ -268,8 +201,7 @@ fn editing_a_body_agrees() {
     let dir = corpus();
     agree(dir.path(), "cold");
     edit(dir.path(), "leaf.ply", "one() + one()", "one() + one() + 0");
-    let after = agree(dir.path(), "body edit");
-    assert!(after.frontend.parsed() > 0);
+    agree(dir.path(), "body edit");
 }
 
 #[test]
@@ -412,10 +344,9 @@ fn adding_and_removing_an_import_agrees() {
     agree(dir.path(), "import removed");
 }
 
-/// Gate 1 is conservative about formatting and gate 2 is exact, so a reformat must cost a parse and
-/// no inference at all.
+/// A reformat moves the bytes and no hash, so what the run publishes may not move either.
 #[test]
-fn reformatting_costs_a_parse_and_no_recheck() {
+fn reformatting_agrees() {
     let dir = corpus();
     agree(dir.path(), "cold");
     edit(
@@ -424,19 +355,7 @@ fn reformatting_costs_a_parse_and_no_recheck() {
         "pub fn one()",
         "// a comment\npub fn  one()",
     );
-    let after = agree(dir.path(), "reformatted");
-
-    let leaf = after
-        .frontend
-        .files
-        .iter()
-        .find(|f| f.path.ends_with("leaf.ply"))
-        .expect("leaf.ply must be reported");
-    assert!(leaf.parsed, "a changed file must be parsed");
-    assert!(
-        !leaf.rechecked,
-        "an unchanged set of hashes must not be rechecked"
-    );
+    agree(dir.path(), "reformatted");
 }
 
 #[test]
@@ -449,17 +368,7 @@ fn a_dependencys_change_reaches_its_dependents() {
         "pub fn price(i: Item) -> Money =",
         "pub fn price(i: Item) -> Int =",
     );
-    let after = agree(dir.path(), "dependency changed");
-    let shop = after
-        .frontend
-        .files
-        .iter()
-        .find(|f| f.path.ends_with("shop.ply"))
-        .expect("shop.ply must be reported");
-    assert!(
-        shop.parsed,
-        "an importer of a changed module must be parsed"
-    );
+    agree(dir.path(), "dependency changed");
 }
 
 /// `--no-incremental` must neither read nor write the front-end cache, so a run under it can never
@@ -485,12 +394,7 @@ fn a_corrupt_front_end_cache_degrades_to_the_full_path() {
         "not an index at all",
     )
     .unwrap();
-    let after = agree(dir.path(), "corrupt cache");
-    assert_eq!(
-        after.frontend.skipped(),
-        0,
-        "nothing may be skipped on the evidence of a corrupt cache"
-    );
+    agree(dir.path(), "corrupt cache");
 }
 
 #[test]
@@ -579,19 +483,6 @@ fn two_definitions_that_share_a_hash_each_keep_their_own_interface() {
         ),
         "each definition's scheme must name its own module's type"
     );
-    for name in ["a.ply", "b.ply"] {
-        let file = warm
-            .frontend
-            .files
-            .iter()
-            .find(|f| f.path.ends_with(name))
-            .unwrap();
-        assert!(
-            !file.parsed,
-            "{name} was refused ({}); a shared hash must not cost a recheck",
-            file.refusal.describe()
-        );
-    }
 }
 
 /// Two byte-identical effect declarations are two capabilities, and `x.look` and `y.look` are still
@@ -637,7 +528,7 @@ fn identically_declared_effects_in_two_modules_agree() {
 /// A `type` alias has no constructors, so nothing about it survives in a cached declaration beyond
 /// its arity.
 #[test]
-fn a_module_declaring_a_type_alias_can_still_be_skipped() {
+fn a_module_declaring_a_type_alias_agrees() {
     let dir = tempfile::tempdir().unwrap();
     write(
         dir.path(),
@@ -652,31 +543,16 @@ fn a_module_declaring_a_type_alias_can_still_be_skipped() {
     write(dir.path(), "lone.ply", "fn lone() -> Int = 1\n");
 
     agree(dir.path(), "cold");
-    let warm = agree(dir.path(), "warm");
-    assert!(
-        warm.frontend
-            .files
-            .iter()
-            .any(|f| f.path.ends_with("alias.ply") && !f.parsed)
-    );
+    agree(dir.path(), "warm");
 
     write(dir.path(), "lone.ply", "fn lone() -> Int = 2\n");
-    let after = agree(dir.path(), "an unrelated edit");
-    assert!(
-        after
-            .frontend
-            .files
-            .iter()
-            .any(|f| f.path.ends_with("alias.ply") && !f.parsed),
-        "an edit elsewhere must not disturb a module nothing parsed imports"
-    );
+    agree(dir.path(), "an unrelated edit");
 }
 
-/// A test's footprint is written in effect names that its hash erases, and a `CachedTest` carries
-/// no witness, so a test whose hash the fingerprint does not already hold has to be checked rather
-/// than restored.
+/// A test added to a file the run already holds: its own hash is new and everything else is where
+/// it was.
 #[test]
-fn a_file_whose_tests_changed_is_checked_rather_than_restored() {
+fn a_file_whose_tests_changed_agrees() {
     let dir = tempfile::tempdir().unwrap();
     let base = "fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n";
     write(dir.path(), "m.ply", base);
@@ -687,24 +563,17 @@ fn a_file_whose_tests_changed_is_checked_rather_than_restored() {
         "m.ply",
         &format!("{base}test \"twice\" {{ assert_eq(f() + f(), 2) }}\n"),
     );
-    let after = agree(dir.path(), "a test added");
-    let m = after
-        .frontend
-        .files
-        .iter()
-        .find(|f| f.path.ends_with("m.ply"))
-        .unwrap();
-    assert!(m.rechecked, "a file with a new test must be checked");
+    agree(dir.path(), "a test added");
 }
 
-/// A test's footprint is a function of its body, so a test added with a body the file already holds
-/// is a test whose footprint the file already holds.
+/// A test's hash is a function of its body, so a test added with a body the file already holds
+/// hashes to what that body already hashed to.
 #[test]
-fn a_test_added_with_a_body_already_present_costs_no_recheck() {
+fn a_test_added_with_a_body_already_present_agrees() {
     let dir = tempfile::tempdir().unwrap();
     let base = "fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n";
     write(dir.path(), "m.ply", base);
-    agree(dir.path(), "cold");
+    let cold = agree(dir.path(), "cold");
 
     write(
         dir.path(),
@@ -712,13 +581,14 @@ fn a_test_added_with_a_body_already_present_costs_no_recheck() {
         &format!("{base}test \"still one\" {{ assert_eq(f(), 1) }}\n"),
     );
     let after = agree(dir.path(), "a duplicate test added");
-    let m = after
-        .frontend
-        .files
-        .iter()
-        .find(|f| f.path.ends_with("m.ply"))
-        .unwrap();
-    assert!(!m.rechecked, "the added test's body was already checked");
+    assert_eq!(
+        cold.hashes.tests[0], after.hashes.tests[0],
+        "the first test's body did not move, so its hash may not either"
+    );
+    assert_eq!(
+        after.hashes.tests[0], after.hashes.tests[1],
+        "two tests with one body are one computation"
+    );
 }
 
 /// The mutations again on real code, which exercises handlers, regions, `nondet` effects and
@@ -842,7 +712,7 @@ test "the default crosses the module boundary" {
 /// **The stale-expansion hazard record update refused record update over, checked where defaults do
 /// cross the boundary.**
 #[test]
-fn editing_a_cross_module_default_agrees_and_refuses_the_importer() {
+fn editing_a_cross_module_default_agrees_and_moves_the_importer() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "palette.ply", PALETTE);
     write(dir.path(), "wall.ply", WALL);
@@ -859,12 +729,6 @@ fn editing_a_cross_module_default_agrees_and_refuses_the_importer() {
     );
 
     let after = agree(dir.path(), "default edit");
-    assert!(
-        after.frontend.parsed() > 1,
-        "only {} file(s) were parsed: the importer skipped, and its call still \
-         carries the old default",
-        after.frontend.parsed()
-    );
     assert_ne!(
         before,
         after.hashes.defs[&ply_span::Symbol::new("wall.wall")],
@@ -901,11 +765,10 @@ pub fn different() -> String = greet("ada", "hi")
     );
 }
 
-/// A `reuse fn` is checked whole-program, so gate 1 has to know a skipped module holds one: the
-/// second run parses nothing and still reports the promise, and completing the parse for it finds
-/// the copy the promise forbids.
+/// A `reuse fn` is checked whole-program, so every load has to know the module holds one and have
+/// the body the promise is checked against.
 #[test]
-fn a_promise_in_a_module_gate_one_skips_is_still_known_and_still_refused() {
+fn a_promise_is_known_on_every_run_and_still_refused() {
     let dir = tempfile::tempdir().unwrap();
     let dir = dir.path();
     write(
@@ -920,92 +783,9 @@ fn a_promise_in_a_module_gate_one_skips_is_still_known_and_still_refused() {
     assert!(first.promised);
 
     let second = agree(dir, "second run");
-    assert!(
-        !second.complete,
-        "gate 1 parsed the unchanged file, so this proves nothing"
-    );
-    assert!(second.promised, "the promise was lost with the parse");
+    assert!(second.promised, "the promise was lost on the second run");
 
-    let mut store = Store::open(dir).unwrap();
-    let full =
-        driver::load_to_evaluate(dir, &mut store, &[ModuleName::from_dotted("grow")]).unwrap();
-    let broken = ply_cli::costs::promises(&full.program, &full.resolved);
+    let broken = ply_cli::costs::promises(&second.program, &second.resolved);
     assert_eq!(broken.len(), 1, "{broken:#?}");
     assert_eq!(broken[0].code, ply_span::codes::REUSE_BROKEN);
-}
-
-// --- The resumable front end ------------------------------------------------
-
-/// The gate ADR 0038 puts ahead of every measurement: what a resumed load produces must be what a
-/// from-scratch load produces, through a sequence of edits rather than once. Each step asserts the
-/// reuse actually happened, because an equivalence that holds when nothing was reused is an
-/// equivalence about nothing.
-#[test]
-fn a_resumed_load_answers_what_a_full_one_answers_through_a_sequence_of_edits() {
-    let dir = corpus();
-    let dir = dir.path();
-    let mut resume = driver::Resume::default();
-
-    let all = fixture_modules();
-    let first = agree_resumed(dir, &mut resume, &all, "cold");
-    assert_eq!(
-        first.frontend.reused, 0,
-        "the first load had nothing to resume from and claimed it did"
-    );
-    assert!(
-        !resume.is_empty(),
-        "the first load left no trees, so nothing below can resume"
-    );
-
-    // A body in a leaf module, which moves one definition's hash and its dependents'.
-    edit(
-        dir,
-        "leaf.ply",
-        "pub fn one() -> Int = 1",
-        "pub fn one() -> Int = 11",
-    );
-    let second = agree_resumed(dir, &mut resume, &all, "after a body edit");
-    assert!(
-        second.frontend.reused > 0,
-        "nothing was reused after a one-file edit, so the equivalence above is vacuous"
-    );
-
-    // A body in an imported module, which moves what its importers were checked against.
-    edit(dir, "core.ply", "Note(_) -> 0", "Note(_) -> 1");
-    let third = agree_resumed(dir, &mut resume, &all, "after editing an imported module");
-    assert!(third.frontend.reused > 0, "nothing was reused");
-
-    // And back again: an edit that restores the original bytes must not be special.
-    edit(
-        dir,
-        "leaf.ply",
-        "pub fn one() -> Int = 11",
-        "pub fn one() -> Int = 1",
-    );
-    let fourth = agree_resumed(dir, &mut resume, &all, "after reverting the body");
-    assert!(fourth.frontend.reused > 0, "nothing was reused");
-}
-
-/// A file appearing shifts every source id after it, and a tree carries the id its spans resolve
-/// through. The resumed path must notice and parse rather than reuse a tree whose spans would
-/// point into the wrong file.
-#[test]
-fn a_new_file_is_not_resumed_over() {
-    let dir = corpus();
-    let dir = dir.path();
-    let mut resume = driver::Resume::default();
-    agree_resumed(dir, &mut resume, &fixture_modules(), "cold");
-
-    // `aaa` sorts before every fixture module, so every id after it moves.
-    write(dir, "aaa.ply", "pub fn zero() -> Int = 0\n");
-    let after = agree_resumed(
-        dir,
-        &mut resume,
-        &fixture_modules(),
-        "after a file appeared",
-    );
-    assert_eq!(
-        after.frontend.reused, 0,
-        "a tree was reused under a source id it was not parsed with"
-    );
 }

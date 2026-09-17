@@ -1534,10 +1534,9 @@ fn a_corrupt_cache_degrades_to_an_empty_one_rather_than_crashing() {
     );
 }
 
-/// Attribution re-normalizes against the loaded AST, and gate 1 leaves no AST for a file it
-/// skipped.
+/// Attribution re-normalizes against the loaded AST, which every module of a load has.
 #[test]
-fn a_skipped_earlier_module_does_not_lose_the_attribution() {
+fn an_earlier_module_does_not_lose_the_attribution() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("a.ply"),
@@ -1557,17 +1556,6 @@ fn a_skipped_earlier_module_does_not_lose_the_attribution() {
         "fn two() -> Int = 2\n\ntest \"b holds\" { assert_eq(two(), 3) }\n",
     )
     .unwrap();
-    let explain = stdout_of(
-        &ply(dir.path())
-            .args(["test", "--explain"])
-            .output()
-            .unwrap(),
-    );
-    assert!(
-        explain.contains("skipped") && explain.contains("a.ply"),
-        "the earlier module has to be the skipped one, or this proves nothing:\n{explain}"
-    );
-
     let v = json_of(&ply(dir.path()).args(["test", "--json"]).output().unwrap());
     let culprit = &v["failures"][0]["culprit"];
     assert_eq!(
@@ -2016,69 +2004,6 @@ fn an_unknown_subcommand_is_rejected() {
 }
 
 #[test]
-fn check_explain_names_the_reason_a_file_was_parsed() {
-    let dir = project("fn f() -> Int = 1\n");
-    std::fs::write(dir.path().join("g.ply"), "fn g() -> Int = 2\n").unwrap();
-    ply(dir.path()).arg("check").assert().success();
-
-    let out = ply(dir.path())
-        .args(["check", "--explain"])
-        .output()
-        .unwrap();
-    let text = stdout_of(&out);
-    assert!(
-        text.contains("skipped"),
-        "a warm run must skip something:\n{text}"
-    );
-    assert!(
-        text.contains("unchanged"),
-        "a skip must say why it was allowed:\n{text}"
-    );
-
-    std::fs::write(dir.path().join("m.ply"), "fn f() -> Int = 3\n").unwrap();
-    let out = ply(dir.path())
-        .args(["check", "--explain"])
-        .output()
-        .unwrap();
-    let text = stdout_of(&out);
-    assert!(
-        text.contains("content changed"),
-        "a refusal must say why:\n{text}"
-    );
-}
-
-/// `--no-incremental` has to be observable, or nobody can use it to decide whether a wrong answer
-/// came from the cache.
-#[test]
-fn no_incremental_parses_everything_and_leaves_the_cache_alone() {
-    let dir = project("fn f() -> Int = 1\n");
-    ply(dir.path()).arg("check").assert().success();
-
-    let out = ply(dir.path())
-        .args(["check", "--explain", "--no-incremental"])
-        .output()
-        .unwrap();
-    let text = stdout_of(&out);
-    assert!(
-        !text.contains("skipped"),
-        "--no-incremental must parse every file:\n{text}"
-    );
-    assert!(
-        text.contains("--no-incremental"),
-        "the reason must name the flag:\n{text}"
-    );
-
-    let out = ply(dir.path())
-        .args(["check", "--explain"])
-        .output()
-        .unwrap();
-    assert!(
-        stdout_of(&out).contains("skipped"),
-        "a --no-incremental run must not have discarded the cache"
-    );
-}
-
-#[test]
 fn test_no_incremental_still_selects_the_same_tests() {
     let dir = project(
         "fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n\
@@ -2097,8 +2022,8 @@ fn test_no_incremental_still_selects_the_same_tests() {
     );
 }
 
-/// A warm run has to be observably cheaper, not just observably skipping, so the phase breakdown is
-/// part of the reported interface.
+/// Where a run's front end went is part of the reported interface: `front` is the one question put
+/// to the port, and the parse beside it is the Rust chain the tools still read.
 #[test]
 fn the_front_end_reports_where_its_time_went() {
     let dir = project("fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n");
@@ -2106,34 +2031,15 @@ fn the_front_end_reports_where_its_time_went() {
 
     let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
     let phases = json_of(&out)["front_end"]["phases"].clone();
-    for name in [
-        "read",
-        "parse",
-        "resolve",
-        "hash",
-        "check",
-        "restore",
-        "write_back",
-        "total",
-    ] {
+    const PARTS: [&str; 5] = ["read", "parse", "resolve", "front", "write_back"];
+    for name in PARTS.iter().chain(["total"].iter()) {
         assert!(
             phases[name].is_number(),
             "`{name}` is missing from {phases}"
         );
     }
     let total = phases["total"].as_f64().unwrap();
-    let sum: f64 = [
-        "read",
-        "parse",
-        "resolve",
-        "hash",
-        "check",
-        "restore",
-        "write_back",
-    ]
-    .iter()
-    .map(|n| phases[n].as_f64().unwrap())
-    .sum();
+    let sum: f64 = PARTS.iter().map(|n| phases[n].as_f64().unwrap()).sum();
     assert!(
         (total - sum).abs() < 0.5,
         "the total must account for the parts: {phases}"
@@ -2149,9 +2055,9 @@ fn the_front_end_reports_where_its_time_went() {
     );
 }
 
-/// A selected test needs a body, so its module and everything it imports have to be parsed.
+/// An edit to one test's module selects that test and no other.
 #[test]
-fn one_selected_test_reparses_its_module_and_not_the_project() {
+fn one_edited_test_is_the_only_one_selected() {
     let dir = tempfile::tempdir().unwrap();
     let write = |name: &str, text: &str| std::fs::write(dir.path().join(name), text).unwrap();
     write("leaf.ply", "pub fn one() -> Int = 1\n");
@@ -2182,34 +2088,6 @@ fn one_selected_test_reparses_its_module_and_not_the_project() {
     assert!(
         text.contains("selected 1 of 5"),
         "one test must be selected:\n{text}"
-    );
-    for i in 0..4 {
-        let line = text
-            .lines()
-            .find(|l| l.contains(&format!("far{i}.ply")))
-            .unwrap_or_else(|| panic!("far{i}.ply is missing from the report:\n{text}"));
-        assert!(line.trim_start().starts_with("skipped"), "{line}");
-    }
-}
-
-#[test]
-fn test_explain_reports_the_front_end_before_the_selection() {
-    let dir = project("fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n");
-    ply(dir.path()).arg("test").assert().success();
-    let out = ply(dir.path())
-        .args(["test", "--explain"])
-        .output()
-        .unwrap();
-    let text = stdout_of(&out);
-    let front = text
-        .find("m.ply")
-        .expect("the front-end block names each file");
-    let selection = text
-        .find("f is one")
-        .expect("the selection block explains each test");
-    assert!(
-        front < selection,
-        "the front-end block comes first:\n{text}"
     );
 }
 
@@ -2265,9 +2143,9 @@ fn two_candidate_edits_are_narrowed_to_the_culprit_by_running_the_mixture() {
     assert_eq!(failure["suspects"][1]["culprit"], false);
 }
 
-/// The same narrowing, in a project where the incremental front end skips a file.
+/// The same narrowing, in a project of more than one file with a warm cache behind it.
 #[test]
-fn a_skipped_file_does_not_cost_the_failure_its_culprit() {
+fn an_earlier_file_does_not_cost_the_failure_its_culprit() {
     let dir = project(LEDGER);
     // Sorts before `m.ply`, so its tests take the indices the fresh body set would otherwise line
     // `m`'s up against.
@@ -2292,11 +2170,6 @@ fn a_skipped_file_does_not_cost_the_failure_its_culprit() {
     .unwrap();
 
     let v = json_of(&ply(dir.path()).args(["test", "--json"]).output().unwrap());
-    assert_eq!(
-        v["front_end"]["skipped"], 1,
-        "the point of the fixture is that a file was skipped: {}",
-        v["front_end"]
-    );
     let culprit = &v["failures"][0]["culprit"];
     assert_eq!(culprit["verdict"], "bisected", "{culprit}");
     assert_eq!(culprit["definitions"], serde_json::json!(["m.normal_sign"]));
@@ -2441,20 +2314,6 @@ fn a_multi_shot_program_runs_and_caches_with_no_flags_at_all() {
         "{}",
         stdout_of(&warm)
     );
-}
-
-/// Gate 1 skips a file whose bytes did not change, and a second `ply check` over
-/// untouched source must not start parsing everything again.
-#[test]
-fn an_unchanged_file_is_skipped_on_the_second_check() {
-    let dir = project(GREEN);
-    ply(dir.path()).arg("check").assert().success();
-    let out = ply(dir.path())
-        .args(["check", "--explain"])
-        .output()
-        .unwrap();
-    let text = stdout_of(&out);
-    assert!(text.contains("skipped   m.ply"), "{text}");
 }
 
 /// One unreadable file is found by more than one read — a lazy consult and a flush that re-reads to

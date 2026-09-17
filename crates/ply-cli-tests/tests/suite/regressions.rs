@@ -21,17 +21,6 @@ fn incremental(dir: &Path) -> Loaded {
     driver::load_incremental(dir, &mut store).expect("the corpus checks")
 }
 
-#[track_caller]
-fn file_report(loaded: &Loaded, name: &str) -> ply_cli::driver::FileReport {
-    loaded
-        .frontend
-        .files
-        .iter()
-        .find(|f| f.path.ends_with(name))
-        .unwrap_or_else(|| panic!("{name} was not reported"))
-        .clone()
-}
-
 /// A name a file imports but never uses appears in no `deps` entry — nothing references it — so
 /// deleting it downstream leaves the importer's bytes and every hash it names untouched.
 #[test]
@@ -49,11 +38,7 @@ fn deleting_an_unused_selectively_imported_name_is_reported_not_skipped_past() {
     );
 
     incremental(dir.path());
-    let warm = incremental(dir.path());
-    assert!(
-        !file_report(&warm, "app.ply").parsed,
-        "the fixture is only interesting while the importer skips"
-    );
+    incremental(dir.path());
 
     write(dir.path(), "lib.ply", "pub fn used() -> Int = 1\n");
     let mut store = Store::open(dir.path()).unwrap();
@@ -68,61 +53,7 @@ fn deleting_an_unused_selectively_imported_name_is_reported_not_skipped_past() {
     );
 }
 
-/// The mechanism on its own, with the program still compiling either way: a new export in `lib`
-/// reaches nothing in `app`, so every other gate-1 condition still holds and only the digest can
-/// refuse the skip.
-#[test]
-fn a_changed_export_set_refuses_an_importers_skip_by_digest() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "lib.ply", "pub fn used() -> Int = 1\n");
-    write(
-        dir.path(),
-        "app.ply",
-        "import lib\nfn go() -> Int = lib::used()\n",
-    );
-
-    incremental(dir.path());
-    let warm = incremental(dir.path());
-    assert!(!file_report(&warm, "app.ply").parsed);
-
-    write(
-        dir.path(),
-        "lib.ply",
-        "pub fn used() -> Int = 1\npub fn extra() -> Int = 9\n",
-    );
-    let after = incremental(dir.path());
-    let app = file_report(&after, "app.ply");
-    assert!(app.parsed, "the importer must be re-parsed");
-    assert_eq!(
-        app.refusal.describe(),
-        "import `lib` changed",
-        "the digest is what refused it, not some other condition"
-    );
-}
-
-/// A module nothing parsed touches keeps skipping: the digest may not be a licence to re-parse the
-/// world on any edit anywhere.
-#[test]
-fn an_edit_in_an_unimported_module_leaves_the_digest_alone() {
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "lib.ply", "pub fn used() -> Int = 1\n");
-    write(
-        dir.path(),
-        "app.ply",
-        "import lib\nfn go() -> Int = lib::used()\n",
-    );
-    write(dir.path(), "lone.ply", "fn lone() -> Int = 1\n");
-
-    incremental(dir.path());
-    incremental(dir.path());
-
-    write(dir.path(), "lone.ply", "fn lone() -> Int = 2\n");
-    let after = incremental(dir.path());
-    assert!(!file_report(&after, "app.ply").parsed);
-    assert!(!file_report(&after, "lib.ply").parsed);
-}
-
-/// Inference walks modules dependency-first and never walks a skipped one at all, so a
+/// Inference walks modules dependency-first, so a
 /// `CheckOutput` assembled in check order lists a project's definitions differently depending on
 /// what the cache held.
 #[test]
@@ -147,7 +78,6 @@ fn the_published_order_is_the_same_warm_as_cold() {
 
     incremental(dir.path());
     let warm = incremental(dir.path());
-    assert!(warm.frontend.skipped() > 0, "gate 1 never fired");
 
     let full = load(dir.path()).unwrap();
     let keys = |l: &Loaded| {

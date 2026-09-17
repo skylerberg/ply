@@ -142,10 +142,18 @@ if process:
         fe = r.get("warm_front_end")
         if fe:
             ph = fe["phases"]
-            line += (f"   front end {ph['total']:.1f}ms"
-                     f" (hash {ph['hash']:.1f} parse {ph['parse']:.1f}"
-                     f" restore {ph['restore']:.1f} write-back {ph['write_back']:.1f})"
-                     f"   rechecked {fe['rechecked']}, cached {fe['cached']}")
+            line += f"   front end {ph['total']:.1f}ms"
+            line += (
+                " ("
+                + " ".join(
+                    f"{k.replace('_', '-')} {v:.1f}"
+                    for k, v in ph.items()
+                    if k != "total"
+                )
+                + ")"
+            )
+            if "rechecked" in fe and "cached" in fe:
+                line += f"   rechecked {fe['rechecked']}, cached {fe['cached']}"
         print(line)
     fits = [(definitions(r["size"]), r["warm_front_end"]["phases"]["total"])
             for r in process if r.get("warm_front_end")]
@@ -157,8 +165,8 @@ if process:
             ratios.append((t1 / t0, n1 / n0))
         print("\n  the fixed cost, each adjacent step: " + "   ".join(parts))
         print(f"  {verdict_of(ratios)}")
-        print("  Nothing was rechecked at any size, so this is the cost of establishing that,")
-        print("  paid again by every invocation. It is what a warm process would not pay.")
+        print("  This is what a run pays before it can say that nothing changed, and it pays it")
+        print("  again on every invocation. It is what a warm process would not pay.")
 
 backed = [r for r in process if r.get("backend")]
 if backed:

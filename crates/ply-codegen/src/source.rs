@@ -227,7 +227,7 @@ pub fn front_for(
         && crate::c::producer::mode() != "ref"
     {
         let ids: Vec<SourceId> = program.modules.iter().map(|m| m.source).collect();
-        return crate::c::producer::front(&sources, &ids);
+        return crate::c::producer::front_agreeing(&sources, &ids);
     }
     // A program that does not hash is one nothing is kept between runs for: the roots and the
     // tables are still this program's and every cache key is simply absent, which is what the
