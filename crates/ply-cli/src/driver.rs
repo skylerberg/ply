@@ -245,7 +245,7 @@ impl<'s> Driver<'s> {
             sources: self.sources,
             program,
             resolved,
-            check: front.check.clone(),
+            check: published_order(&front),
             hashes: front.hashes.clone(),
             front,
             frontend: FrontEnd {
@@ -636,6 +636,26 @@ enum Interface {
 }
 
 /// Program-wide name -> current hash.
+/// The checker's output with its definitions in the order a reader can predict: the run's files
+/// in load order, then each file's items as written. The port answers them in the checker's own
+/// order, which is dependency-first, and `ply check --json` publishes this one.
+fn published_order(front: &Front) -> ply_core::CheckOutput {
+    let mut check = front.check.clone();
+    let mut defs = indexmap::IndexMap::with_capacity(check.defs.len());
+    for (_, items) in &front.ordinals {
+        for item in items {
+            if let ply_core::Ordinal::Fn(name, _) = item
+                && let Some(info) = check.defs.shift_remove(name)
+            {
+                defs.insert(name.clone(), info);
+            }
+        }
+    }
+    defs.extend(check.defs.drain(..));
+    check.defs = defs;
+    check
+}
+
 fn hash_table(hashes: &HashOutput) -> BTreeMap<Symbol, DefHash> {
     hashes
         .defs
