@@ -344,14 +344,15 @@ what makes it lintable. The trap is not gone.
 
 ---
 
-## §3 Ply cannot build a `Float`, so the lexer does not produce one
+## §3 The lexer carries a float's text, and the hasher reads it
 
-`TokenKind::Float(f64)` is what the Rust lexer emits. There is no
-`float_of_string`, no `float_to_string`, and no `parse`. The only route in is
-`float_of_decimal`, and it is not one: `Decimal` is 28 significant digits and a
-bounded exponent, so `1e400` — which `lexer.rs` deliberately lets saturate to
-`inf`, because that is what IEEE says decimal-to-binary conversion does — has no
-path through it at all.
+`TokenKind::Float(f64)` is what the Rust lexer emits. Ply's only route to a
+double was `float_of_decimal`, and it was not one: `Decimal` is 28 significant
+digits and a bounded exponent, so `1e400` — which `lexer.rs` deliberately lets
+saturate to `inf`, because that is what IEEE says decimal-to-binary conversion
+does — had no path through it at all. `float_of_string` is that route now
+(ADR 0052 §1), reading a literal's text as the lexer reads it, saturating where
+the lexer saturates; the hasher calls it, and the token still carries text.
 
 So `lexer.ply`'s token type carries `TFloat(Bytes)`: the literal's **normalised
 text**, digit for digit the string `lexer.rs` hands to `f64::from_str`. The

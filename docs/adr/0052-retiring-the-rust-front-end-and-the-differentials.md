@@ -175,6 +175,32 @@ operator, literal and visibility vocabulary leaves `ply-syntax`'s tree
 for `ply-ty`, so the runtime and the tools stop naming the parser's
 crate.
 
+**Built, 2026-09-16: the backend's tables.** A unit takes a `Front` and
+derives from it what it read from the tree: the constructor table, the
+root list, the cache keys, each root's arity, the module count, and the
+arguments the producer hands the port. `ply bootstrap`'s source digest
+and the artifact's stored bodies come from it too. The port answers it
+wherever a unit has its module texts and a producer is installed, and the
+Rust chain answers it otherwise, because the producer is built before it
+can be asked and `ply bootstrap` installs none. The tree is still read
+for the reference emitter's bodies, which §2 deletes. Two things this
+found. The checker fills its constructor table in load order where the
+tree walk filled it in program order, and a unit names its tags by
+position in that table, so taking the checker's order would have made a
+unit's C a function of the import graph; the table is rebuilt in program
+order from the ordinals. And the narrow register offer reads the checked
+scheme now rather than the written type, so an alias for `Int` counts as
+scalar where the written form did not, which changes what that offer
+holds and not what a body computes. The request path's shipped allocation
+figures moved with the stage and were re-taken from the command that
+writes them: a `/health` request allocates 328 objects where it allocated
+343. The count is reset after one warm request, but a fixed cost outlives
+that: read at twenty requests and at two hundred, a request's marginal
+cost is about 178 allocations on both sides, and what differs is some
+three thousand allocations the window counts once. The offered set is the
+same on both, 1066 definitions and every one answered by the port, so
+what the service computes per request did not change.
+
 **Built, 2026-09-17: a float literal's text.** The port carries a float
 literal as its text, and had no way to the double the reference's lexer
 produced: it went through `Decimal`, which cannot hold `1.0e-30` or
@@ -185,7 +211,7 @@ one, published as `(String) -> Option<Float>` beside `decimal_of_string`,
 answering nothing for any text a literal cannot spell and saturating to
 infinity where the lexer saturates. It lands before anything written in
 Ply calls it, because the bundle must know a builtin before the
-compiler's own sources may use it; the hasher moves onto it next.
+compiler's own sources may use it, and the hasher calls it now.
 
 **What the driver loses.** Its gates decided per file not to parse and
 per definition not to re-infer, keyed on the store's fingerprints; a run
@@ -261,6 +287,17 @@ read 127 s wall against 282 s: both build jobs 18 s, the longest
 partition 94 s and the postgres job 88 s, which are the poles now. A pull
 request's run pays the upload, nine seconds, and stays near four minutes
 with its own release build as its pole.
+
+**Read, 2026-09-16: where the time went.** With the message and the table
+differentials in, a quiet main run reads 153 s. The build is no longer
+the pole: the archive takes 14 s and the release binary 27 s, against a
+longest partition of 113 s. Inside that partition, one comparison of the
+port's diagnostics over the compiler's own sources takes 48 s and one of
+its tables over half the examples 37 s; the same comparison of the tables
+over the compiler's own sources takes 43 s in the next partition. The two
+most expensive tests in the suite are now the two that hold the port to
+the reference, which is what §2 retires, so the bound and the deletions
+pull the same way.
 
 ## 4. The loop that is O(the change)
 

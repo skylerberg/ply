@@ -314,10 +314,7 @@ fn describe(
 ) -> Exports {
     let arities: Vec<(String, usize)> = taken
         .iter()
-        .map(|n| {
-            let arity = loaded.definition(n).map_or(0, |(d, _)| d.params.len());
-            (n.clone(), arity)
-        })
+        .map(|n| (n.clone(), loaded.arity_of(n).unwrap_or(0)))
         .collect();
     // A nullary function whose published row says it is pure answers the same thing every time,
     // so the seam remembers it rather than running it. Without this the gate's kernel rebuilds a
@@ -325,9 +322,7 @@ fn describe(
     let constants: Vec<String> = taken
         .iter()
         .filter(|n| {
-            loaded
-                .definition(n)
-                .is_some_and(|(d, _)| d.params.is_empty())
+            loaded.arity_of(n) == Some(0)
                 && ply_eval::memo::pure_by_published_row(Some(loaded.check), &Symbol::new(n))
         })
         .cloned()
@@ -340,7 +335,7 @@ fn describe(
         ctors: ctors.to_vec(),
         taken: arities,
         constants,
-        modules: loaded.program.modules.len(),
+        modules: loaded.module_count(),
         refusals: refusals
             .iter()
             .map(|r| (r.function.clone(), r.construct.clone()))
@@ -392,10 +387,6 @@ fn refused_of(exports: &Exports) -> Vec<Refused> {
         .collect()
 }
 
-fn sources_of(loaded: &Source) -> Vec<SourceId> {
-    loaded.program.modules.iter().map(|m| m.source).collect()
-}
-
 pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Refused>)> {
     // Before the build rather than after it, and once in the process: what this bounds is what the
     // cache is left holding, and a build that starts by making room needs no second pass over a
@@ -429,7 +420,7 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
         && let Ok(exports) = Exports::read(&lib)
     {
         let refused = refused_of(&exports);
-        if let Ok(native) = finish(lib, exports, Some(sources_of(loaded))) {
+        if let Ok(native) = finish(lib, exports, Some(loaded.module_sources())) {
             super::cache::UNITS_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if std::env::var("PLY_C_PHASES").is_ok() {
                 eprintln!(
@@ -455,7 +446,7 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
     // Read back from the object rather than kept from the emit, so the two doors are one path: a
     // unit whose table will not read back fails every test rather than only a warm one.
     let exports = Exports::read(&lib)?;
-    let native = finish(lib, exports, Some(sources_of(loaded)))?;
+    let native = finish(lib, exports, Some(loaded.module_sources()))?;
     if std::env::var("PLY_C_PHASES").is_ok() {
         eprintln!(
             "phases: emit+resolve {}ms, assemble {}ms, cc+load {}ms, tables {}ms, source {}MB",
