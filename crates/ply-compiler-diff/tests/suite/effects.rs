@@ -15,6 +15,10 @@
 //! What this test arms is the corpus, not the tier: if the last `handle` or the last `with cell`
 //! left the shipped corpus, effect work in either tier would have nothing to be checked against
 //! and nothing here would notice.
+//!
+//! The census is taken from the port's own lowering (`code.lower_dump`), which `code.ply` writes
+//! byte for byte as the reference's did. Counting the surface text instead would answer a
+//! different question: `with cell` reaches a `cell(` node its spelling does not contain.
 use std::collections::BTreeMap;
 
 fn repo_root() -> std::path::PathBuf {
@@ -42,8 +46,7 @@ fn the_corpus_still_exercises_every_effect_construct_a_tier_would_have_to_carry(
         files.sort();
         for f in files {
             let text = std::fs::read_to_string(&f).unwrap();
-            let name = f.file_stem().unwrap().to_string_lossy().to_string();
-            let dump = ply_compiler_diff::reference_lower_dump(&[(name, text)]);
+            let dump = ply_compiler_diff::port::dump("code.lower_dump", text.as_bytes());
             for body in dump.split("f:").skip(1) {
                 bodies += 1;
                 let mut hit = false;

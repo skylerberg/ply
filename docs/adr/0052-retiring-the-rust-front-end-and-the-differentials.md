@@ -676,9 +676,32 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s and 164 s, each reusing by tree the same way and for the same reason. Two of those went over, both on the merge that made the port the only front end and the first attempt to answer it, and the paragraph below takes them. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s and 324 s, each reusing by tree the same way and for the same reason. Three of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the third is 324 s, which the paragraph after it takes and which the tree did not cause. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
+
+**Read, 2026-09-17: a run over the bound that the tree did not cause.** The
+merge retiring the `diag` and `front` differentials read 324 s. §3's rule is that
+such a run is the next item before any other, so it was taken before anything
+else, and the cause is not this repository's. One partition of eight took 295 s
+where the other seven took 68–105 s and where the same job had taken 80 s on the
+previous merge. Inside it, nextest reports 45.7 s of tests: roughly 250 s of that
+job was not testing.
+
+The job's log names what it was. The per-slot object cache failed to restore
+(`GetCacheEntryDownloadURL: EHOSTUNREACH`), so tcc rebuilt every fixture from
+scratch — which is why its tests read 45.7 s against the control's 32.4 s. Four
+retries against `results-receiver.actions.githubusercontent.com` failed with
+`getaddrinfo EAI_AGAIN`, about 65 s. The cache then failed to save, about 21 s
+more. A disk-cleanup step took 36 s. The same infrastructure had already left an
+earlier run unregistered for an hour, with no run existing for a pushed head
+until a poller had nearly spent its budget.
+
+Re-running the identical SHA is the controlled experiment, and it read 125 s.
+So the tree is where it was and the reading stands as an outlier with a named
+cause. Recorded rather than dropped, because a bound that only keeps its
+favourable readings is not a bound — and because the next unexplained run over it
+should not have to rediscover that this one was the network.
 
 **Read, 2026-09-17: the switch put the clock over, and what brought it back.**
 The merge that made the port the only front end read 224 s. Both build legs

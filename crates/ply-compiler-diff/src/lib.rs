@@ -947,32 +947,6 @@ pub fn byte_literal(bytes: &[u8]) -> String {
     out
 }
 
-/// `Dumper::diags` with each label's module in front of its span, since a program has many.
-fn resolve_diags(out: &mut String, ds: &[Diagnostic]) {
-    out.push_str(&format!("D;{};", ds.len()));
-    for d in ds {
-        let s = d.primary_span().unwrap_or(Span::DUMMY);
-        out.push_str(&format!(
-            "!{}:{}:{}:{}:{}:{};",
-            d.code,
-            s.source.0,
-            s.start,
-            s.end,
-            d.labels.len(),
-            d.notes.len()
-        ));
-        for l in &d.labels {
-            out.push_str(&format!(
-                "={}:{}:{}:{};",
-                l.span.source.0,
-                l.span.start,
-                l.span.end,
-                if l.primary { 1 } else { 0 }
-            ));
-        }
-    }
-}
-
 /// A program bundle: programs separated by a line holding exactly `%%%`, modules within one by a
 /// line holding exactly `%%`, and each module's first line its dotted name.
 pub fn programs(text: &str) -> Vec<Vec<(String, String)>> {
@@ -1009,49 +983,6 @@ pub fn programs(text: &str) -> Vec<Vec<(String, String)>> {
 // bit in the tree, and the one three separate defects in the C tier have turned on. Spans are
 // **not** here: the emitter reads none, and including them would make this an AST dump wearing a
 // different name.
-
-/// One lowered function body as a canonical string: `params;size;code`.
-pub fn reference_lower_dump(modules: &[(String, String)]) -> String {
-    let mut program = Program {
-        modules: Vec::new(),
-    };
-    for (i, (name, text)) in modules.iter().enumerate() {
-        let (module, _) =
-            ply_syntax::parse_recovering(SourceId(i as u32), ModuleName::from_dotted(name), text);
-        program.modules.push(module);
-    }
-    let mut out = String::new();
-    out.push_str(&format!("L;{};", modules.len()));
-    let expansion = ply_derive::expand_program(&mut program);
-    if !expansion.is_empty() {
-        out.push_str("E;");
-        resolve_diags(&mut out, &expansion);
-        return out;
-    }
-    // Deliberately no `resolve`. Lowering reads a body and the binders in it -- `slots::resolve`
-    // is local to a function -- so a module that does not resolve because its imports are absent
-    // still lowers, and refusing here would make the oracle silent on nine of the ten standard
-    // library modules when they are dumped one at a time.
-    // Every function of every module, in load order, so the dump moves when a definition does and
-    // a port cannot pass by lowering a different set.
-    for module in &program.modules {
-        for item in &module.items {
-            let Item::Fn(def) = item else { continue };
-            let params: Vec<ply_span::Symbol> =
-                def.params.iter().map(|p| p.name.name.clone()).collect();
-            let lowered = ply_eval::code::lower_fn(&params, &def.body);
-            out.push_str(&format!(
-                "f:{}:{}:{};",
-                module.name.qualify(&def.name.name),
-                params.len(),
-                lowered.size
-            ));
-            dump_code(&mut out, &lowered.code);
-            out.push(';');
-        }
-    }
-    out
-}
 
 fn dump_own(out: &mut String, own: ply_eval::rc::Own) {
     out.push(match own {
