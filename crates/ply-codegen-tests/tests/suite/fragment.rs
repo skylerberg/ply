@@ -61,6 +61,10 @@ pub fn unit(source: &str) -> (&'static Loaded, &'static Unit) {
 
 /// The same program under the whole Ply emitter, which re-parses the module texts to produce.
 pub fn whole(loaded: &'static Loaded) -> &'static Unit {
+    // Without this the producer is not installed, `producer::mode()` answers "ref", and this
+    // helper builds under the reference emitter while claiming the Ply one. Under nextest --
+    // one process per test -- no other test's `ensure_default` can reach here.
+    ply_codegen::c::producer::ensure_default();
     let unit = Unit::over_with_texts(
         loaded.program,
         loaded.resolved,
