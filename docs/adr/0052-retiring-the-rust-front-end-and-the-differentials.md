@@ -420,11 +420,11 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s and 129 s, each reusing by tree the same way and for the same reason. The last is twelve seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's 38 MB of text goldens landed. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Seven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s and 148 s, each reusing by tree the same way and for the same reason. Two of those went over, both on the merge that made the port the only front end and the first attempt to answer it, and the paragraph below takes them. The last is twelve seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's 38 MB of text goldens landed. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
-**Read, 2026-09-17: the switch put the clock over, and the tables are spent.**
+**Read, 2026-09-17: the switch put the clock over, and what brought it back.**
 The merge that made the port the only front end read 224 s. Both build legs
 still reused by tree, so the cost was tests, and the per-test figures named it:
 two archive tests at 135 s and 90 s, two incremental sessions at 86 s and 78 s,
