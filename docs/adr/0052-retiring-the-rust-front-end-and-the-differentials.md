@@ -1600,20 +1600,38 @@ tier on the *first* run, not a cache miss on the second, which is what the
 ran-to-skipped counts were really showing.
 
 The tier is empty because of *where* it is built. `RECIPE` and `IDENTITY` are
-`OnceLock`s, so an installation is process-wide, while `MINE`, `BUILDING`,
-`REFERENCE_ONLY` and `HANDED` are thread-locals. `execute_group` puts every
-group through `rayon::broadcast`, so `Executor::worker` -- and the `attach` that
-builds the unit -- runs on pool threads. Instrumented, the guard reads `ref` on
-the test thread and `ply` on all three workers at the same moment. So
-`reference_only` at the call site cannot reach the emitter that answers, and a
-handover could not either: both are per-thread by construction, and that is the
-difference from `ply-codegen-tests`, whose bodies attach on the thread that
-guards them.
+`OnceLock`s, so an installation is process-wide, while `MINE`, `BUILDING` and
+`HANDED` are thread-locals, and `REFERENCE_ONLY` was one until this record
+changed it. `execute_group` puts every group through `rayon::broadcast`, so
+`Executor::worker` -- and the `attach` that builds the unit -- runs on pool
+threads. Instrumented at the time, the guard read `ref` on the test thread and
+`ply` on all three workers at the same moment: a per-thread switch set by the
+test could not reach the emitter that answered, which is the difference from
+`ply-codegen-tests`, whose bodies attach on the thread that guards them.
 
-That leaves three ways out, and this record does not pick one: make the
-reference switch process-wide, teach the port to emit what this fixture needs,
-or give the harness its check without installing a producer. Until one of them
-exists the attempt stays withdrawn whole rather than halved.
+Three ways out were named here: make the reference switch process-wide, teach
+the port to emit what this fixture needs, or give the harness its check without
+installing a producer. The first is taken, and not the way it first reads.
+
+Making `REFERENCE_ONLY` itself process-wide breaks the callers it already has.
+`cargo test` runs this crate's tests over one process, so two `reference_only`
+guards overlap and the first to drop restores `false` under the second: at two
+threads eighteen of `fragment`'s nineteen failed, and serially all nineteen
+passed. That is how it was found, and it is worth knowing that CI would not have
+found it -- `cargo nextest` gives each test its own process.
+
+So the per-thread switch stays as it was, and a second sits beside it.
+`reference_only_everywhere` sets an `AtomicBool` that `mode` and `with_current`
+read alongside the thread-local, for a harness whose work runs where it cannot
+reach: `ply-test` builds its tier inside `rayon::broadcast`. It carries the same
+hazard the first attempt tripped over, so it is for a caller that owns its
+process. A handover still wins over both, since `with_current` reads `HANDED`
+first.
+
+What this does not do is migrate the crate, and this entry does not claim it.
+The mechanism lands against `ply-codegen-tests`' nineteen `reference_only`
+sites, which are its regression surface and which caught the first attempt; the
+migration that shows the workers reading `ref` is the next step.
 
 **Built, 2026-09-17: `verify` sees the member it could not see, and the count
 says what it counts.** This record described the gap twice and fixed it neither
