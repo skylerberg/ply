@@ -228,6 +228,28 @@ at all. Nothing is rewired onto them yet, and the writer refuses a front
 whose syntax tables are missing, so the Rust chain's assembler cannot
 answer empty ones where the port answers real ones.
 
+**Built, 2026-09-17: the driver asks the port.** A load reads the files,
+parses and expands them with the Rust parser, resolves them, and asks the
+port once for everything else: the diagnostics it reports, the checker's
+output, the hashes, the load order, the ordinals, and the bodies the
+store writes. The Rust checker and the Rust hasher no longer run on a
+user's program. Both gates went with them, and with the gates the refusal
+report, the restored interfaces, the trees a warm process resumed,
+`Loaded`'s second program, and the reloads that existed because a gate
+might have skipped a file. `ply check --explain` loses the per-file
+skipped-and-parsed block and the per-definition cached-and-rechecked
+list; it keeps its time breakdown and, with `--types`, the effect sets
+and the provenance. The backend builds over the driver's answer rather
+than deriving one of its own, so an invocation runs one front end. One
+order had to be put back: the port answers definitions in the checker's
+own order, which is dependency-first, where a reader of `ply check
+--json` is promised the run's files and each file's items as written, so
+the driver publishes that order from the ordinals it was given. What
+still runs the Rust chain is an artifact opened without its sources,
+which rebuilds a program from stored bodies and has no text to hand over;
+§2 decides it. `CONTRACTS.md` describes the gates still, and is pinned by
+its own header, so that description is historical now.
+
 **What the driver loses.** Its gates decided per file not to parse and
 per definition not to re-infer, keyed on the store's fingerprints; a run
 that enters the port whole parses and checks every module every time.
