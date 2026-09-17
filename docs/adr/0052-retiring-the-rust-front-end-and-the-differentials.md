@@ -303,11 +303,15 @@ pull the same way.
 
 **Read, 2026-09-17: the bound, and what crossed it.** The stage's first
 shape asked the port for every unit's tables, which is a second front end
-per unit: a quiet main run read 254 s against 144 s, every partition
-grown and one of them 218 s, with the build reused in 12 s and no test
-slower for any other reason. The chain answers by default now and a gate
-keeps the port's own path exercised, which is the bound and the proof
-kept together rather than traded.
+per unit: a main run read 254 s against 144 s, every partition grown and
+one of them 218 s, with the build reused in 12 s and no test slower for
+any other reason. The chain answers by default now and a gate keeps the
+port's own path exercised, which is the bound and the proof kept together
+rather than traded. That left 190 s, still over, and the next reading
+said where: the longest job was 44 s of setup, 69 s of tests and 35 s
+saving its object cache, and of those 69 s one comparison of the port's
+tables over the compiler's own sources took 51. It runs alone now, as
+this tree's three other heavy tests do, so no partition waits on it.
 
 ## 4. The loop that is O(the change)
 
