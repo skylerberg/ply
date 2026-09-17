@@ -1,7 +1,7 @@
 //! What an obligation's result is cached under.
 
 use crate::{ProvePlan, Tier};
-use ply_hash::DefHash;
+use ply_ty::DefHash;
 
 /// Domain tag, so a plan-keyed result cannot collide with the bare obligation key, which is itself
 /// a `blake3` over normalized bytes.

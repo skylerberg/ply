@@ -1,9 +1,9 @@
 //! Drawing and shrinking `Float` and `Decimal`.
 
 use ply_eval::{Decimal, Value};
-use ply_hash::DefHash;
 use ply_prove::property::{EDGE_CASES, GenStream, TypeWorld, generatable, generate};
 use ply_prove::shrink::{candidates, minimal, size};
+use ply_ty::DefHash;
 use ply_ty::Type;
 
 fn world() -> TypeWorld {

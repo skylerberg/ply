@@ -986,6 +986,39 @@ module through a root-level `use`, were both things this record believed; a
 throwaway two-crate workspace settled them before the change was written, and the
 nine-package check confirmed it against the tree.
 
+**Built, 2026-09-17: the prover comes off the hasher's crate.** `ply-hash`
+re-exports `DefHash` from `ply-ty` by name, and the prover reads nothing else in
+it: three sites in the library and five in its test crate, every one of them
+`use ply_hash::DefHash;`. Both packages held a dependency on the hasher for a
+type that lives somewhere else, and both drop it.
+
+Only the prover was in that shape, which is why this goes no further. `ply-store`
+reads `body::BODY_ENCODING`, `ply test`'s bisection reads `graph::`, `normalize::`
+and `component_hashes`, and `ply-codegen` and `ply-corpus` call `hash_program*`.
+Sixty-eight type-only sites remain across those crates, and re-pointing them would
+churn five crates to drop no edge at all; they keep resolving through the same
+named re-export. That is the judgement this record already made for
+`ply_core::prelude`, applied again: the older name goes when the crate does, not
+before.
+
+Stated as the two claims it is, because either alone would mislead: the prover's
+**library** now depends on neither the checker's crate nor the hasher's, and
+`ply-prove-tests` still declares `ply-core` -- it calls `check_program` at two
+sites to check its fixtures -- while no longer declaring `ply-hash`.
+
+**And a note on part 3's instrument, after the third platform-side failure.**
+#348's first run went red with `cargo build --release -p ply-cli` failing, and the
+aggregate job reported `build-ply = failure` and nothing else, which reads exactly
+like a compile error in the change under review. The failing job's own log showed
+`mozilla-actions/sccache-action` returning HTTP 500 during setup, before cargo ran
+at all; a re-run of the same head was green with no edit to the tree. With the
+`EHOSTUNREACH` cache download and the `getaddrinfo EAI_AGAIN` retries recorded
+above, that is three, which is enough to stop treating each as a surprise. The
+procedure is cheap and worth naming: read the failing job's log before the
+aggregate's summary, and before touching the tree at all. The aggregate names
+which leg failed, never why, and "why" is the whole question when the answer might
+be that nothing is wrong.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -1049,7 +1082,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s and 150 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s and 147 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
