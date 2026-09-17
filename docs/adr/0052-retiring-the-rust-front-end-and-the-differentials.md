@@ -179,10 +179,12 @@ crate.
 derives from it what it read from the tree: the constructor table, the
 root list, the cache keys, each root's arity, the module count, and the
 arguments the producer hands the port. `ply bootstrap`'s source digest
-and the artifact's stored bodies come from it too. The port answers it
-wherever a unit has its module texts and a producer is installed, and the
-Rust chain answers it otherwise, because the producer is built before it
-can be asked and `ply bootstrap` installs none. The tree is still read
+and the artifact's stored bodies come from it too. The Rust chain answers it
+while it still runs, because asking the port is a second front end over
+the program and the standard library for every unit; `PLY_FRONT=port`
+asks the port instead, one gate runs with it set, and the port becomes
+the only answer when the chain goes. The producer is also built before it
+can be asked, and `ply bootstrap` installs none. The tree is still read
 for the reference emitter's bodies, which §2 deletes. Two things this
 found. The checker fills its constructor table in load order where the
 tree walk filled it in program order, and a unit names its tags by
@@ -298,6 +300,14 @@ over the compiler's own sources takes 43 s in the next partition. The two
 most expensive tests in the suite are now the two that hold the port to
 the reference, which is what §2 retires, so the bound and the deletions
 pull the same way.
+
+**Read, 2026-09-17: the bound, and what crossed it.** The stage's first
+shape asked the port for every unit's tables, which is a second front end
+per unit: a quiet main run read 254 s against 144 s, every partition
+grown and one of them 218 s, with the build reused in 12 s and no test
+slower for any other reason. The chain answers by default now and a gate
+keeps the port's own path exercised, which is the bound and the proof
+kept together rather than traded.
 
 ## 4. The loop that is O(the change)
 
