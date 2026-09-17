@@ -1344,28 +1344,39 @@ saw the shape and stopped at the fact -- `prelude_arity` stays with the checker
 -- without the consequence, which is that one test stays with it until one of
 those two moves is made.
 
-**`ply-test-tests` cannot go either, and the fourth reason is the hasher.** Its
-seven sites migrate cleanly under the rule above -- three keep the names they
+**`ply-test-tests` cannot go either, and the fourth reason is a correspondence.**
+Its seven sites migrate cleanly under the rule above -- three keep the names they
 gave `from_dotted`, four keep the empty name -- and `ply-test`'s own obligation
 API is indifferent to which, because it takes its names from `check.defs.keys()`
 and looks them up in `hashes.defs`, both from the same front end. That is not
 where it breaks.
 
-`unit/runner.rs` computes `ply_hash::hash_program(&program, &resolved, &check)`:
-a Rust-parsed program and resolve together with the port's check. Those hashes
-are what the store keys on and what selection reads, so any difference between
-the two front ends' answers -- an ordering in `check.tests`, a footprint, a
-definition one records and the other does not -- moves a hash, and a warm cache
-stops being warm. The run said so plainly: `a_warm_cache_selects_nothing`
-selected three, `renaming_a_definition_selects_nothing` selected three, and a
-ran-to-skipped count came back `(0, 4)` where `(4, 0)` was expected, which is
-what shifted test indices look like.
+An earlier draft of this entry said the hasher was where, and that was wrong.
+`hash_program`'s check parameter is `_check`: unused, delegating to
+`hash_program_ast(program, resolved)`, because a hash is a function of resolved
+source structure alone. Handing it the port's check changes nothing it computes,
+so no hash moves and the store's keys are not what failed.
 
-So the port's check is safe to hand a machine, a binding or an assertion, and not
-yet safe to hand the hasher beside an AST that hasher also reads. *Which* of the
-two answers differs is not established here, and this record does not guess: the
-attempt was withdrawn whole rather than halved, because reverting the one file
-would leave the dependency standing anyway.
+The *symptom* is a pairing. `TestInfo::index` is the position in
+`CheckOutput::tests`, `hashes.tests` is built by the AST walk, and
+`unit/runner.rs` reads the two together by index -- so `check.tests[i]` ceasing
+to name `hashes.tests[i]` is what `a_warm_cache_selects_nothing` selecting three
+looks like, and what a ran-to-skipped count of `(0, 4)` where `(4, 0)` was
+expected looks like.
+
+The obvious cause of that is an ordering divergence, and the evidence is against
+it. The checker appends `index: self.tests.len()` as it walks modules and their
+items. `front.ply` emits `map(range(0, len(c.tests)), ...)`, pairing each test
+with a name span from `test_name_spans`, which folds the same modules in the same
+order; so both lists are indexed by one walk, and `read_front` rejects a sequence
+that is not dense and ascending in any case.
+
+So this entry says what the failure is *not*: not the hasher, and not, on this
+evidence, the order of `CheckOutput::tests`. What it is has not been established.
+Two mechanisms have now been named here and withdrawn -- which is the note worth
+keeping, because the third guess is cheaper to write than to check. The attempt
+stays withdrawn whole rather than halved until the cause is found rather than
+named.
 
 **Built, 2026-09-17: `verify` sees the member it could not see, and the count
 says what it counts.** This record described the gap twice and fixed it neither
