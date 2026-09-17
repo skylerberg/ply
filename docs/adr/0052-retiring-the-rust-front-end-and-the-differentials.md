@@ -448,8 +448,28 @@ scripts: `arm-*.sh` is cited from `BOOTSTRAP-PATH.md` and `GAPS.md`, `arm.sh`
 from six places including `ci.yml`, `CONTRIBUTING.md` and source in
 `ply-eval-tests` and `ply-prove`, and `measure-multiplier.sh` from three. Only
 `diff-items.py` is cited nowhere at all. So the directory outlives the
-differential, and the three broken paths are a thing to fix rather than to
-delete.
+differential, and the broken paths are a thing to fix rather than to delete.
+
+**Read, 2026-09-17: the blessing path works, and a dispatch is what says so.**
+Moving the golden suites broke `bless.yml` — it cleared and re-blessed only the
+differential crate's tree, so the five moved phases could not be blessed at all,
+and blessing is how a golden moves when the port's answer legitimately changes.
+Nothing in CI catches that: the workflow runs by hand. The fix was dispatched
+against `main` and its answer is both trees whole —
+`ply-compiler-diff/fixtures/goldens` at 6.3 MB over 93 files, `lexer` and
+`parser`; `ply-codegen-tests/fixtures/goldens` at 45 MB over 138 files, `derive`,
+`infer.check_dump_known`, `infer.check_dump`, `rewrite`, `hash` and `resolve`.
+An instrument that only the author ever runs is one to run after moving anything
+it reads.
+
+**Built, 2026-09-17: each corpus is written to both crates.** Fixing the three
+was the smaller half. `mine-hashes` was the one that resolved correctly, and it
+wrote to `ply-compiler-diff/fixtures/` — the crate that no longer reads
+`reference-hashes.corpus`, since the `hash` suite moved. So the working script
+was wrong in a subtler way than the broken three, and pointing it at the new
+reader alone would only move the problem. Each of the four now writes both
+copies, derived from the repo root each already computed, because both crates
+hold these corpora and a pair kept in step by hand is a pair that drifts.
 
 **Read, 2026-09-17: the checker and the hasher are already off the load path.**
 The driver says so itself. It parses and resolves with the Rust chain because
@@ -787,7 +807,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s and 223 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s and 140 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
