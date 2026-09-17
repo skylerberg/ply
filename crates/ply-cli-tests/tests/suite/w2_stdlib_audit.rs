@@ -242,7 +242,7 @@ fn age_the_shipped_fingerprint(dir: &Path, mut mutate: impl FnMut(&mut DefEntry)
     assert_eq!(
         fingerprint.content_hash,
         ContentHash::of(ply_std::NET.as_bytes()),
-        "gate 1 is not keyed on the embedded bytes, so an upgrade cannot refuse a skip"
+        "the fingerprint is not keyed on the embedded bytes, so an upgrade would leave no trace"
     );
     fingerprint.content_hash = ContentHash::of(b"what the last compiler shipped");
     for entry in &mut fingerprint.defs {
@@ -262,32 +262,7 @@ fn an_upgrade_that_moves_no_definition_re_runs_nothing() {
 
     age_the_shipped_fingerprint(dir.path(), |_| {});
 
-    let mut store = Store::open(dir.path()).unwrap();
-    let loaded = driver::load_incremental(dir.path(), &mut store).unwrap();
-    let shipped = loaded
-        .frontend
-        .files
-        .iter()
-        .find(|f| f.module == std_net())
-        .expect("the shipped module is in the run");
-    assert!(
-        shipped.parsed,
-        "the embedded bytes moved and gate 1 skipped anyway: {:?}",
-        shipped.refusal
-    );
-    let app = loaded
-        .frontend
-        .files
-        .iter()
-        .find(|f| f.module.as_str() == "app")
-        .expect("the project module is in the run");
-    assert!(
-        !app.parsed,
-        "a stdlib edit that moved no definition dragged the project in: {:?}",
-        app.refusal
-    );
-
-    // And the test the project owns is unchanged, so `ply test` selects nothing.
+    // The test the project owns is unchanged, so `ply test` selects nothing.
     let out = ply(dir.path()).arg("test").output().unwrap();
     let text = output(&out);
     assert!(
@@ -344,27 +319,9 @@ fn an_upgrade_that_moved_a_definition_invalidates_exactly_its_dependents() {
 
     let mut store = Store::open(dir.path()).unwrap();
     let loaded = driver::load_incremental(dir.path(), &mut store).unwrap();
-    let parsed = |module: &str| {
-        loaded
-            .frontend
-            .files
-            .iter()
-            .find(|f| f.module.as_str() == module)
-            .unwrap_or_else(|| panic!("`{module}` is not in the run"))
-            .parsed
-    };
-    assert!(parsed("std.net"), "the changed shipped module was skipped");
-    assert!(
-        parsed("app"),
-        "the dependent module was skipped, so it carries a hash the sources do not produce"
-    );
-    assert!(
-        !parsed("elsewhere"),
-        "a module reaching nothing in `std` was invalidated by a stdlib upgrade"
-    );
 
-    // The published hashes are what a from-scratch run computes — the assertion that "too few were
-    // invalidated" would actually fail on.
+    // The published hashes are what a from-scratch run computes — a cache written under an older
+    // `std.net` may be believed by none of them.
     let scratch = load(dir.path()).unwrap();
     for name in ["app.read_all", "std.net.drain", "elsewhere.untouched"] {
         assert_eq!(
@@ -467,46 +424,5 @@ fn renaming_a_shipped_definition_moves_no_hash() {
         before.hashes.tests[0].to_hex(),
         after.hashes.tests[0].to_hex(),
         "renaming a shipped definition re-selected a test"
-    );
-}
-
-/// The invariant the driver's one documented constraint hazard rests on.
-#[test]
-fn a_parsed_module_never_reaches_a_skipped_one() {
-    let dir = tempfile::tempdir().unwrap();
-    write(
-        dir.path(),
-        "lib.ply",
-        "pub fn needs<a>(x: a) -> Int where derivable(ord, a) = 1\n",
-    );
-    write(
-        dir.path(),
-        "app.ply",
-        "import lib\npub fn go() -> Int = lib::needs(1)\n",
-    );
-    ply(dir.path()).arg("check").output().unwrap();
-
-    // Only the importer changes, which is the case where skipping the callee would be most
-    // tempting.
-    write(
-        dir.path(),
-        "app.ply",
-        "import lib\npub fn go() -> Int = lib::needs(2)\n",
-    );
-    let mut store = Store::open(dir.path()).unwrap();
-    let loaded = driver::load_incremental(dir.path(), &mut store).unwrap();
-
-    let by_module = |name: &str| {
-        loaded
-            .frontend
-            .files
-            .iter()
-            .find(|f| f.module.as_str() == name)
-            .unwrap_or_else(|| panic!("`{name}` is not in the run"))
-    };
-    assert!(by_module("app").parsed, "the edited module was skipped");
-    assert!(
-        by_module("lib").parsed,
-        "a parsed module reached a skipped callee, so its `where` clauses are absent"
     );
 }

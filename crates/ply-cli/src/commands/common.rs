@@ -84,9 +84,9 @@ pub fn run_on_tier(
     store: &mut ply_store::Store,
 ) -> ply_test::RunReport {
     ply_codegen::c::producer::ensure_default();
-    let (program, resolved) = loaded.to_run();
+    let (program, resolved) = (&loaded.program, &loaded.resolved);
     let texts = module_texts(program, &loaded.sources);
-    let unit = ply_codegen::Unit::over_with_texts(program, resolved, &loaded.check, texts)
+    let unit = ply_codegen::Unit::over_front(program, resolved, &loaded.front, texts)
         .expect("this host has a C compiler");
     let spec = ply_eval::BackendSpec {
         kind: ply_eval::BackendKind::C,
@@ -125,18 +125,42 @@ pub fn prover_backend(
     let Some(spec) = backend_spec(flag)? else {
         return Ok(None);
     };
-    let provider = build_backend(
+    let provider = build_backend_over(
         &spec,
         &loaded.program,
         &loaded.resolved,
-        &loaded.check,
+        &loaded.front,
         module_texts(&loaded.program, &loaded.sources),
     )?;
     Ok(Some((provider, spec)))
 }
 
+/// [`build_backend`] over the front end's answer this run already holds.
+///
+/// **Every command that loaded a program uses this one.** The driver enters the port once per load
+/// (ADR 0052 §1) and the answer is what the unit is built from, so an invocation runs one front
+/// end rather than one per unit — a second is a whole front end over the project and the standard
+/// library.
+pub fn build_backend_over(
+    spec: &ply_eval::BackendSpec,
+    program: &ply_syntax::ast::Program,
+    resolved: &ply_syntax::resolve::Resolved,
+    front: &ply_core::Front,
+    texts: std::collections::HashMap<String, String>,
+) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
+    ply_codegen::c::producer::ensure_default();
+    match spec.kind {
+        ply_eval::BackendKind::C => ply_codegen::Unit::over_front(program, resolved, front, texts)
+            .map(|unit| unit as &'static dyn ply_eval::Provider)
+            .map_err(unbuilt),
+    }
+}
+
 /// The operations a binding would answer, as the producer keys them: a compiled `perform` of
 /// one stays the machine's until the tier has a route to the host.
+///
+/// For a program no load answered for — an artifact's, rebuilt from its stored bodies — which is
+/// why this one derives a front end of its own.
 pub fn build_backend(
     spec: &ply_eval::BackendSpec,
     program: &ply_syntax::ast::Program,
@@ -149,19 +173,21 @@ pub fn build_backend(
         ply_eval::BackendKind::C => {
             ply_codegen::Unit::over_with_texts(program, resolved, check, texts)
                 .map(|unit| unit as &'static dyn ply_eval::Provider)
-                .map_err(|error| {
-                    Diagnostic::error(
-                        codes::BACKEND_UNAVAILABLE,
-                        format!("the C backend could not be built: {error:#}"),
-                    )
-                    .note(
-                        "a backend that failed to build would decline every call, so the run is \
-                     refused rather than reported green over a seam nothing reached",
-                    )
-                    .note("this tier shells out to `cc`; `PLY_CC` names another compiler")
-                })
+                .map_err(unbuilt)
         }
     }
+}
+
+fn unbuilt(error: impl std::fmt::Display) -> Diagnostic {
+    Diagnostic::error(
+        codes::BACKEND_UNAVAILABLE,
+        format!("the C backend could not be built: {error:#}"),
+    )
+    .note(
+        "a backend that failed to build would decline every call, so the run is refused rather \
+         than reported green over a seam nothing reached",
+    )
+    .note("this tier shells out to `cc`; `PLY_CC` names another compiler")
 }
 
 pub fn diagnostic_json(diagnostic: &Diagnostic, sources: &SourceMap) -> Value {

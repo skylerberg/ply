@@ -220,35 +220,18 @@ fn an_included_set_counts_the_definitions_that_reach_it() {
     );
 }
 
-/// The cost of an over-broad alias: `--explain` must print the same bytes for a warm run and a cold one, or the
-/// reviewing command's output is a function of what the cache held.
+/// The cost of an over-broad alias: `--explain` must print the same bytes for a warm run, a cold
+/// one and a run that keeps no cache at all, or the reviewing command's output is a function of
+/// what the cache held.
 #[test]
-fn explain_prints_the_same_bytes_whether_gate_one_parsed_the_file_or_skipped_it() {
+fn explain_prints_the_same_bytes_warm_cold_and_uncached() {
     let dir = project(SERVICE);
     let cold = types(dir.path(), &["--explain"]);
     let warm = types(dir.path(), &["--explain"]);
     let fresh = types(dir.path(), &["--explain", "--no-incremental"]);
 
-    assert!(
-        warm.contains("skipped"),
-        "the second run must have skipped the file, or this proves nothing:\n{warm}"
-    );
     assert_eq!(module_block(&cold), module_block(&warm));
     assert_eq!(module_block(&cold), module_block(&fresh));
-}
-
-/// The front-end report says what the gates actually decided.
-#[test]
-fn completing_the_parse_does_not_rewrite_the_report_of_what_the_gates_decided() {
-    let dir = project(SERVICE);
-    types(dir.path(), &["--explain"]);
-    let warm = types(dir.path(), &["--explain"]);
-    let front_end = warm
-        .split("front-end time")
-        .next()
-        .expect("a front-end block");
-    assert!(front_end.contains("skipped"), "{warm}");
-    assert!(!front_end.contains("checked   "), "{warm}");
 }
 
 // --- --json -----------------------------------------------------------------
@@ -265,8 +248,7 @@ fn json_types(dir: &Path, extra: &[&str]) -> Value {
 }
 
 /// The provenance an agent reads, and the rule that keeps it honest: present only under
-/// `--explain`, where the parse is completed first, so the object either carries these fields or
-/// does not — and never carries a subset that depends on which files gate 1 skipped.
+/// `--explain`, so the object either carries these fields or does not, and never a subset.
 #[test]
 fn the_json_report_carries_the_provenance_only_under_explain() {
     let dir = project(SERVICE);

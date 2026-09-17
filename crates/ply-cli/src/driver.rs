@@ -1,21 +1,30 @@
-//! The incremental front end: two gates decide how much of a run has to be redone.
+//! The front end: the Rust chain that still has to run, and the port that answers for the rest.
+//!
+//! The driver reads the project, parses it and resolves it with the Rust chain — `Program` and
+//! `Resolved` are still what the prover, `ply check --costs`, the artifact path, `Pure` and the
+//! interpreter read — and then asks the **port** for the whole front end's answer over the same
+//! module texts. What it takes from that answer is everything it used to derive a second time:
+//! the diagnostics it reports, the `CheckOutput` it hands downstream, the `HashOutput` everything
+//! keys on, the module load order, the item ordinals and the normalized bodies the store files
+//! (ADR 0052 §1). `ply_core::check_program` and `ply_hash::hash_program` are not called on a
+//! user's program from here.
+//!
+//! **Asking costs a whole front end, so it is asked once per load and the answer travels.** A
+//! command that builds a backend builds it over this run's [`Front`] rather than over one of its
+//! own; `ply_codegen::Unit::over_front` is that door. A second ask is a second front end over the
+//! project *and* the standard library, which is the cost this shape exists to pay exactly once.
 
 use crate::load::{Discovered, LoadError, Loaded, anchor, discover, unreadable};
-use indexmap::IndexMap;
-use ply_core::{
-    CheckOutput, CtorInfo, DefInfo, EffectInfo, Footprint, Known, KnownDef, KnownTest, LawInfo,
-    ModuleInfo, OpInfo, TestInfo, check_program_with,
-};
-use ply_hash::body::BodySet;
-use ply_hash::graph::NodeId;
-use ply_hash::{DefHash, HashOutput, hash_program_with_bodies};
+use ply_core::{DefInfo, Front};
+use ply_hash::body::StoredBody;
+use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
 use ply_store::{
     CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, ContentHash, DeclBody, DefBody,
     DefEntry, DefKind, FileSpan, ImportEdge, Member, NameRef, SourceFingerprint, Store,
-    canonicalize_decl_body, canonicalize_scheme, exports_digest, witness_holds,
+    exports_digest,
 };
-use ply_syntax::ast::{Item, Module, ModuleName, Program, TypeDefBody, Visibility};
+use ply_syntax::ast::{Module, ModuleName, Program};
 use ply_syntax::resolve::resolve;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -29,246 +38,60 @@ pub enum Mode {
     Incremental,
 }
 
-/// Why a file could not take the fast path.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Refusal {
-    None,
-    NotIncremental,
-    NoFingerprint,
-    ContentChanged,
-    Dependency(Symbol),
-    Import(Symbol),
-    /// The fingerprint survived but the interface it points at did not.
-    InterfaceMissing,
-    /// A name this file reaches lost its `pub`.
-    Private(Symbol),
-    /// Something that had to be parsed imports this file, so its interface has to be derived rather
-    /// than restored.
-    ImportedByParsed(Symbol),
-    /// A test that has to run lives here, or is reachable from one.
-    NeededToEvaluate,
-}
-
-impl Refusal {
-    pub fn describe(&self) -> String {
-        match self {
-            Refusal::None => "unchanged".to_string(),
-            Refusal::NotIncremental => "--no-incremental".to_string(),
-            Refusal::NoFingerprint => "no fingerprint".to_string(),
-            Refusal::ContentChanged => "content changed".to_string(),
-            Refusal::Dependency(name) => format!("dependency `{name}` changed"),
-            Refusal::Import(module) => format!("import `{module}` changed"),
-            Refusal::InterfaceMissing => "cached interface missing".to_string(),
-            Refusal::Private(name) => format!("`{name}` is no longer public"),
-            Refusal::ImportedByParsed(m) => format!("imported by `{m}`, which was parsed"),
-            Refusal::NeededToEvaluate => "a selected test needs its body".to_string(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct FileReport {
-    pub path: PathBuf,
-    pub module: ModuleName,
-    pub parsed: bool,
-    pub rechecked: bool,
-    pub refusal: Refusal,
-}
-
-#[derive(Clone, Debug)]
-pub struct DefReport {
-    pub name: Symbol,
-    pub cached: bool,
-}
-
 /// Where a front-end run's time went.
+///
+/// Five phases, and the shape of the answer is the point: `read`, `parse` and `resolve` are the
+/// Rust chain that still runs because `Program` and `Resolved` are still read downstream, `front`
+/// is the one question put to the port, and `write_back` is the store. A run's cost is `front`
+/// plus a parse of the same text — which is what ADR 0052 §2 exists to remove.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Phases {
     pub read: Duration,
     pub parse: Duration,
-    /// Copying the parsed modules into the `Program` the rest of the round runs on. Its own phase
-    /// because it is not analysis and it was in no phase at all: gate 1 runs to a fixed point and
-    /// every round copies every parsed module, so a cost proportional to the program was
-    /// invisible in a report that accounts for everything else.
-    pub assemble: Duration,
     pub resolve: Duration,
-    pub hash: Duration,
-    pub check: Duration,
-    /// Rebuilding types and spans from the store for everything not rechecked.
-    pub restore: Duration,
+    /// The port's whole front end over this program, asked once.
+    pub front: Duration,
     pub write_back: Duration,
 }
 
 impl Phases {
     pub fn total(&self) -> Duration {
-        self.read
-            + self.parse
-            + self.assemble
-            + self.resolve
-            + self.hash
-            + self.check
-            + self.restore
-            + self.write_back
+        self.read + self.parse + self.resolve + self.front + self.write_back
     }
 
-    pub fn labelled(&self) -> [(&'static str, Duration); 8] {
+    pub fn labelled(&self) -> [(&'static str, Duration); 5] {
         [
             ("read", self.read),
             ("parse", self.parse),
-            ("assemble", self.assemble),
             ("resolve", self.resolve),
-            ("hash", self.hash),
-            ("check", self.check),
-            ("restore", self.restore),
+            ("front", self.front),
             ("write back", self.write_back),
         ]
     }
 }
 
-/// What the two gates decided, for `--explain` and for the tests that assert the gates actually
-/// fired.
+/// What one load has to say about itself.
 #[derive(Clone, Debug, Default)]
 pub struct FrontEnd {
     pub incremental: bool,
-    pub files: Vec<FileReport>,
-    pub defs: Vec<DefReport>,
     pub phases: Phases,
     pub warnings: Vec<Diagnostic>,
-    /// Files whose syntax tree came from the process's own last load rather than from a parse.
-    /// Reported because an equivalence that holds when nothing was reused proves nothing, and a
-    /// test asserting the resumed path agrees has to be able to say the path was taken.
-    pub reused: usize,
-}
-
-impl FrontEnd {
-    pub fn parsed(&self) -> usize {
-        self.files.iter().filter(|f| f.parsed).count()
-    }
-
-    pub fn skipped(&self) -> usize {
-        self.files.iter().filter(|f| !f.parsed).count()
-    }
-
-    pub fn rechecked(&self) -> usize {
-        self.defs.iter().filter(|d| !d.cached).count()
-    }
-
-    pub fn cached(&self) -> usize {
-        self.defs.iter().filter(|d| d.cached).count()
-    }
-}
-
-/// What one load leaves behind for the next one in the same process.
-///
-/// A syntax tree is a pure function of a file's bytes, so a file that still says what it said has
-/// the tree it had. `crates/ply-cli/src/driver.rs` assigns a `FileState`'s tree once and never
-/// mutates it — name resolution runs on the copy assembled into the `Program` — so what is held
-/// here is what a parse would produce again, not a tree some later pass has been over.
-///
-/// **A tree is only reusable under the source id it was parsed with**, because its spans carry
-/// that id and a report resolves them through it. Discovery sorts, so a file's id is stable while
-/// the file set is; when a file appears or disappears the ids after it shift, the check below
-/// fails, and the run parses. That is the safe direction and it is why the id is part of the key
-/// rather than an incidental field.
-#[derive(Default)]
-pub struct Resume {
-    trees: BTreeMap<PathBuf, (ContentHash, SourceId, Module)>,
-}
-
-impl Resume {
-    /// The tree for `path` if it was parsed from these bytes under this id, taken out: the load
-    /// that receives it owns it, and hands it back with [`Resume::keep`] when it finishes.
-    fn take(&mut self, path: &Path, content: ContentHash, source: SourceId) -> Option<Module> {
-        match self.trees.get(path) {
-            Some((had, id, _)) if *had == content && *id == source => {
-                self.trees.remove(path).map(|(_, _, ast)| ast)
-            }
-            _ => None,
-        }
-    }
-
-    fn keep(&mut self, path: PathBuf, content: ContentHash, source: SourceId, ast: Module) {
-        self.trees.insert(path, (content, source, ast));
-    }
-
-    /// How many trees are held, which is what a test asserting the reuse happened reads.
-    pub fn len(&self) -> usize {
-        self.trees.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.trees.is_empty()
-    }
 }
 
 pub fn load_full(path: &Path) -> Result<Loaded, LoadError> {
-    run(path, Mode::Full, None, &[])
+    run(path, Mode::Full, None)
 }
 
 pub fn load_incremental(path: &Path, store: &mut Store) -> Result<Loaded, LoadError> {
-    run(path, Mode::Incremental, Some(store), &[])
+    run(path, Mode::Incremental, Some(store))
 }
 
-/// The incremental path, with `needed` and everything they import parsed whatever the gates would
-/// have said.
-pub fn load_to_evaluate(
-    path: &Path,
-    store: &mut Store,
-    needed: &[ModuleName],
-) -> Result<Loaded, LoadError> {
-    run(path, Mode::Incremental, Some(store), needed)
-}
-
-pub fn run(
-    path: &Path,
-    mode: Mode,
-    store: Option<&mut Store>,
-    needed: &[ModuleName],
-) -> Result<Loaded, LoadError> {
-    run_resumed(path, mode, store, needed, None)
-}
-
-/// [`run`], reusing the syntax trees `resume` holds for files that still say what they said, and
-/// leaving this run's trees in it. A load that fails leaves it as it found it, so the next one
-/// parses rather than trusting a state no load finished with.
-pub fn run_resumed(
-    path: &Path,
-    mode: Mode,
-    store: Option<&mut Store>,
-    needed: &[ModuleName],
-    resume: Option<&mut Resume>,
-) -> Result<Loaded, LoadError> {
-    run_with(path, mode, store, needed, &[], resume)
-}
-
-/// [`run_resumed`], and `bodies` names modules whose bodies are wanted without asking for anything
-/// about them to be re-derived — what a test runner needs, and what a command that *reports* on a
-/// module does not. See `Driver::bodies`.
-pub fn run_with(
-    path: &Path,
-    mode: Mode,
-    store: Option<&mut Store>,
-    needed: &[ModuleName],
-    bodies: &[ModuleName],
-    resume: Option<&mut Resume>,
-) -> Result<Loaded, LoadError> {
+pub fn run(path: &Path, mode: Mode, store: Option<&mut Store>) -> Result<Loaded, LoadError> {
     let (root, discovered) = discover(path).map_err(LoadError::bare)?;
     // Pruning deletes every fingerprint the run did not see, which is only correct when the run saw
     // everything.
     let whole_project = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
-    let needed = needed.iter().map(|m| m.as_symbol().clone()).collect();
-    let bodies = bodies.iter().map(|m| m.as_symbol().clone()).collect();
-    Driver::new(
-        root,
-        discovered,
-        mode,
-        store,
-        whole_project,
-        needed,
-        bodies,
-        resume,
-    )?
-    .finish()
+    Driver::new(root, discovered, mode, store, whole_project)?.finish()
 }
 
 struct FileState {
@@ -277,59 +100,18 @@ struct FileState {
     source: SourceId,
     text: Arc<str>,
     content: ContentHash,
-    fingerprint: Option<Arc<SourceFingerprint>>,
+    /// Taken when the program is assembled: nothing after that reads a tree through this.
     ast: Option<Module>,
-    /// Whether this module's *bodies* are wanted so that a selected test can run, without anything
-    /// about it being re-derived.
-    ///
-    /// A test that must run every time — a nondeterministic one — needs the bodies of every module
-    /// it reaches, and the only way the driver had to obtain a tree was to mark the file parsed,
-    /// which is the treatment a *changed* file gets: hashed, walked by the checker, written back,
-    /// to arrive at what its fingerprint already said. `benches/marginal-change/warm-loop.sh`
-    /// measured what that costs, and ADR 0038 carries the reading.
-    ///
-    /// A file wanted only to run is restored like any other unchanged file, and its tree is added
-    /// to the program the evaluator gets. That is sound because the parsed set is closed under
-    /// imports (`close_over_imports`), so nothing that *is* re-derived can reference a definition
-    /// in a file that is only wanted to run.
-    for_eval: bool,
-    /// A tree this process parsed from these very bytes on an earlier load, waiting to be used
-    /// *if* this run decides to parse the file.
-    ///
-    /// Separate from `ast` because `ast.is_some()` means "parsed this run" and half the driver
-    /// reads it that way: a file with a tree publishes its exports from the tree, reports its
-    /// imports from the tree, and contributes its module to the program. A seed placed directly
-    /// in `ast` for a file gate 1 then skipped made that file publish *no* exports — it had a tree,
-    /// so the cached list was not consulted, and its definitions were not in the program to be
-    /// looked up — which refused its importers' skips and pulled a third of the project back into
-    /// every round.
-    seed: Option<Module>,
-    parse: bool,
-    recheck: bool,
-    refusal: Refusal,
     /// Embedded in the binary rather than discovered on disk.
     shipped: bool,
 }
 
 impl FileState {
-    /// The definitions this file publishes, as gate 1 knows them without a parse.
-    fn cached_defs(&self) -> &[DefEntry] {
-        self.fingerprint
-            .as_ref()
-            .map(|f| f.defs.as_slice())
-            .unwrap_or(&[])
-    }
-
-    /// Every module this file imports, whether or not it was parsed.
+    /// Every module this file imports.
     fn imports(&self) -> Vec<ModuleName> {
         match &self.ast {
             Some(ast) => ast.imports.iter().map(|i| i.module_name()).collect(),
-            None => self
-                .fingerprint
-                .iter()
-                .flat_map(|f| f.imports.iter())
-                .map(|edge| ModuleName::from_dotted(edge.module.as_str()))
-                .collect(),
+            None => Vec::new(),
         }
     }
 }
@@ -338,23 +120,10 @@ struct Driver<'s> {
     root: PathBuf,
     mode: Mode,
     store: Option<&'s mut Store>,
-    /// Trees held by the process that ran the last load, and where this one leaves its own.
-    resume: Option<&'s mut Resume>,
-    /// How many of this run's trees came from `resume`.
-    reused: usize,
     whole_project: bool,
-    needed: BTreeSet<Symbol>,
-    /// Modules whose *bodies* a caller needs, without asking for anything about them to be
-    /// re-derived. `needed` is the stronger request and the two are separate because most callers
-    /// that name a module also report on it: `prove` discharges its obligations, the effect-set
-    /// report prints its rows, and both read what this run checked. Only the test runner is content
-    /// with bodies alone.
-    bodies: BTreeSet<Symbol>,
     sources: SourceMap,
     files: Vec<FileState>,
-    by_module: IndexMap<Symbol, usize>,
-    /// Definitions an earlier wave proved cannot be restored whatever gate 2 otherwise says.
-    widened: BTreeSet<Symbol>,
+    by_module: BTreeMap<Symbol, usize>,
     phases: Phases,
 }
 
@@ -366,16 +135,12 @@ fn timed<T>(slot: &mut Duration, f: impl FnOnce() -> T) -> T {
 }
 
 impl<'s> Driver<'s> {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         root: PathBuf,
         discovered: Vec<Discovered>,
         mode: Mode,
         store: Option<&'s mut Store>,
         whole_project: bool,
-        needed: BTreeSet<Symbol>,
-        bodies: BTreeSet<Symbol>,
-        mut resume: Option<&'s mut Resume>,
     ) -> Result<Driver<'s>, LoadError> {
         let mut phases = Phases::default();
         let mut sources = SourceMap::new();
@@ -404,7 +169,6 @@ impl<'s> Driver<'s> {
         // Naming is checked with the text already on hand so an unusable path is reported against
         // the file itself rather than against nowhere.
         let mut files = Vec::with_capacity(discovered.len());
-        let reused = 0usize;
         for (file, &(source, content)) in discovered.iter().zip(&read) {
             match ModuleName::from_relative_path(&file.relative) {
                 // `std` is reserved before anything else looks at the file.
@@ -421,15 +185,7 @@ impl<'s> Driver<'s> {
                         .map(|f| f.text.clone())
                         .unwrap_or_else(|| "".into()),
                     content,
-                    fingerprint: None,
                     ast: None,
-                    for_eval: false,
-                    seed: resume
-                        .as_mut()
-                        .and_then(|r| r.take(&file.path, content, source)),
-                    parse: false,
-                    recheck: false,
-                    refusal: Refusal::None,
                     shipped: false,
                 }),
                 Err(diagnostic) => diagnostics.push(anchor(diagnostic, &sources, source)),
@@ -442,319 +198,122 @@ impl<'s> Driver<'s> {
             });
         }
 
-        let mut by_module = IndexMap::new();
+        let mut by_module = BTreeMap::new();
         for (i, file) in files.iter().enumerate() {
             by_module.insert(file.module.as_symbol().clone(), i);
         }
 
-        let mut driver = Driver {
+        Ok(Driver {
             root,
             mode,
             store,
-            resume,
-            reused,
             whole_project,
-            needed,
-            bodies,
             sources,
             files,
             by_module,
-            widened: BTreeSet::new(),
             phases,
-        };
-        driver.load_fingerprints();
-        Ok(driver)
-    }
-
-    fn load_fingerprints(&mut self) {
-        let Some(store) = self.store.as_deref() else {
-            return;
-        };
-        if self.mode == Mode::Full {
-            return;
-        }
-        for file in &mut self.files {
-            file.fingerprint = store.fingerprint(&file.path);
-        }
-    }
-
-    /// Gate 1's first condition, plus the two reasons a run can have that have nothing to do with
-    /// whether the file changed.
-    fn forced(&mut self) {
-        for i in 0..self.files.len() {
-            let refusal = self.forced_refusal(&self.files[i]);
-            let file = &mut self.files[i];
-            file.parse = refusal != Refusal::None;
-            file.refusal = refusal;
-        }
-    }
-
-    /// The files whose bodies a selected test needs, closed over imports.
-    ///
-    /// Separate from `parse` and closed separately: a module a test reaches imports others, and the
-    /// evaluator needs those bodies too. Closing this set through `parse` instead would drag every
-    /// one of them back into the round, which is the cost this exists to remove.
-    ///
-    /// Run after the gates have settled, and it seeds itself here rather than earlier so that a
-    /// shipped module — which `add_shipped` files during gate 1, after any earlier pass would have
-    /// looked — is marked like any other.
-    fn close_over_run_imports(&mut self) -> Result<(), LoadError> {
-        for i in 0..self.files.len() {
-            if !self.files[i].parse && self.bodies.contains(self.files[i].module.as_symbol()) {
-                self.files[i].for_eval = true;
-            }
-        }
-        loop {
-            self.parse_pending()?;
-            let mut added = false;
-            for i in 0..self.files.len() {
-                if !self.files[i].for_eval && !self.files[i].parse {
-                    continue;
-                }
-                let Some(ast) = &self.files[i].ast else {
-                    continue;
-                };
-                let imports: Vec<Symbol> = ast
-                    .imports
-                    .iter()
-                    .map(|d| d.module_name().as_symbol().clone())
-                    .collect();
-                for name in imports {
-                    let Some(&j) = self.by_module.get(&name) else {
-                        continue;
-                    };
-                    if !self.files[j].parse && !self.files[j].for_eval {
-                        self.files[j].for_eval = true;
-                        added = true;
-                    }
-                }
-            }
-            if !added {
-                return Ok(());
-            }
-        }
-    }
-
-    /// The same decision for one file, so that a stdlib module pulled in after [`forced`] has run
-    /// reaches it by the same route rather than by a second copy of the rule.
-    fn forced_refusal(&self, file: &FileState) -> Refusal {
-        match &file.fingerprint {
-            _ if self.mode == Mode::Full => Refusal::NotIncremental,
-            _ if self.needed.contains(file.module.as_symbol()) => Refusal::NeededToEvaluate,
-            // A file with nothing cached has to be parsed whatever it is wanted for.
-            None if self.bodies.contains(file.module.as_symbol()) => Refusal::NeededToEvaluate,
-            None => Refusal::NoFingerprint,
-            Some(f) if f.content_hash != file.content => Refusal::ContentChanged,
-            Some(_) => Refusal::None,
-        }
+        })
     }
 
     fn finish(mut self) -> Result<Loaded, LoadError> {
-        self.forced();
+        self.parse_all()?;
+        let (program, resolved) = self.assemble()?;
+        let front = self.ask_the_port()?;
+        if front.has_error() {
+            return Err(LoadError {
+                sources: self.sources.clone(),
+                diagnostics: front.diagnostics,
+            });
+        }
 
-        // Gate 1 runs to a fixed point: parsing a file can change what its importers see, and
-        // refusing a file can pull in the files it imports.
-        let (program, resolved, hashes, bodies) = loop {
-            self.close_over_imports()?;
-            let (program, resolved, hashes, bodies) = self.parse_and_hash()?;
-            let gate = self.gate_one(&hashes);
-            if !self.refuse_candidates(&gate) {
-                break (program, resolved, hashes, bodies);
-            }
-        };
+        let stdlib = self.stdlib_notice(&front.hashes);
+        let writing = Instant::now();
+        let cache = self.write_back(&front);
+        self.phases.write_back += writing.elapsed();
 
-        // Gate 2 keys on a definition's own text, which a callee's edit does not move, so a wave
-        // can hand a caller an interface its callee no longer has. Whether it did is only knowable
-        // once the callee has been checked, so the run widens and repeats: only the wave that
-        // widens to nothing was checked against interfaces this run would produce, and only its
-        // output and its diagnostics may escape.
-        let (check, cached) = loop {
-            let gate = self.decide_rechecks(&hashes);
-            let started = Instant::now();
-            let outcome = check_program_with(&program, &resolved, &gate.known);
-            self.phases.check += started.elapsed();
-            let more = match &outcome {
-                Ok(check) => self.callers_of_moved(check, &gate, &hashes),
-                Err(diagnostics) => self.restored_under(diagnostics, &gate, &hashes),
-            };
-            if more.is_empty() {
-                let check = outcome.map_err(|diagnostics| LoadError {
-                    sources: self.sources.clone(),
-                    diagnostics,
-                })?;
-                break (check, gate.cached);
-            }
-            // Every wave has to give up something it had not already given up, or it will run
-            // forever: a name gate 2 restores on a path that does not consult `widened` comes back
-            // unchanged however many times it is handed over. Spinning is the worst way to learn
-            // that, so it is an assertion rather than a hang.
-            let before = self.widened.len();
-            self.widened.extend(more);
-            assert!(
-                self.widened.len() > before,
-                "a wave gave up only names it had already given up, so it cannot make progress"
-            );
-        };
-        // After the gates have settled, so that a file which ended up parsed is never also carried
-        // here, and its trees come from the same seeded parse the rest did.
-        self.close_over_run_imports()?;
-        self.merge(program, resolved, hashes, bodies, check, cached)
+        let mut warnings = stdlib;
+        warnings.extend(front.diagnostics.iter().cloned());
+        warnings.extend(cache);
+
+        let files = self.files.iter().map(|f| f.path.clone()).collect();
+        // A `reuse fn` anywhere in the program, which is what decides whether the whole-program
+        // promise check has anything to check.
+        let promised = front.defs_written.values().any(|w| w.reuse);
+        Ok(Loaded {
+            root: self.root,
+            files,
+            sources: self.sources,
+            program,
+            resolved,
+            check: front.check.clone(),
+            hashes: front.hashes.clone(),
+            front,
+            frontend: FrontEnd {
+                incremental: self.mode == Mode::Incremental,
+                phases: self.phases,
+                warnings,
+            },
+            promised,
+        })
     }
 
-    /// The program the evaluator gets: everything that was re-derived, plus the modules wanted only
-    /// so that a selected test can run.
+    /// The port's whole answer over this program: the one front end a load runs.
     ///
-    /// Built and resolved separately from the one that was hashed and checked, because those two
-    /// answer different questions. Returns `None` when nothing is wanted only to run, which is
-    /// every command that is not running tests — there is then one program and no second resolve.
-    fn evaluation_program(
-        &self,
-    ) -> Result<Option<(Program, ply_syntax::resolve::Resolved)>, LoadError> {
-        if !self.files.iter().any(|f| f.for_eval) {
-            return Ok(None);
-        }
-        let modules: Vec<Module> = self
+    /// The module texts are handed over in the order `self.files` holds them, which is the order
+    /// the program's modules are in, so a span's module index in the answer is a position in this
+    /// very list and reads back as the `SourceId` the file was read under.
+    fn ask_the_port(&mut self) -> Result<Front, LoadError> {
+        ply_codegen::c::producer::ensure_default();
+        let sources: Vec<(String, String)> = self
             .files
             .iter()
-            .filter(|f| f.parse || f.for_eval)
-            .filter_map(|f| f.ast.clone())
+            .map(|f| (f.module.to_string(), f.text.to_string()))
             .collect();
-        let mut program = Program { modules };
-        let resolved = resolve(&mut program).map_err(|diagnostics| LoadError {
+        let ids: Vec<SourceId> = self.files.iter().map(|f| f.source).collect();
+        let started = Instant::now();
+        let answer = ply_codegen::c::producer::front(&sources, &ids);
+        self.phases.front += started.elapsed();
+        answer.map_err(|e| self.seam_failed(&format!("{e:#}")))
+    }
+
+    /// The front end could not be *asked*, which is this compiler failing rather than the program.
+    fn seam_failed(&self, why: &str) -> LoadError {
+        LoadError {
             sources: self.sources.clone(),
-            diagnostics,
-        })?;
-        Ok(Some((program, resolved)))
+            diagnostics: vec![
+                Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    format!("the front end could not answer for this program: {why}"),
+                )
+                .primary(Span::DUMMY, "nothing was checked, so nothing is claimed")
+                .note("this is Ply's fault: the compiler's own front end is what failed here")
+                .note("`PLY_C_BOOTSTRAP=off` builds it from source instead of from the bundle"),
+            ],
+        }
     }
 
-    /// Definitions gate 2 restored that call one whose published interface turned out to have
-    /// moved. Empty means the fixed point: nothing was checked against a stale interface.
-    /// What the definitions a failed wave reported against were checked against, and that this
-    /// wave restored.
-    ///
-    /// A diagnostic can be an artefact of a restored interface, but only for a definition that
-    /// reached one, so the whole cache does not have to be given up: re-checking a suspect's own
-    /// callees is what produces a fresh interface for it to be judged against, and if any of those
-    /// then move, `callers_of_moved` carries it from there. Empty means the report was produced
-    /// against interfaces this run computed, and it is the answer.
-    ///
-    /// A diagnostic that names no file widens everything, because there is nothing to narrow to.
-    fn restored_under(
-        &self,
-        diagnostics: &[Diagnostic],
-        gate: &GateTwo,
-        hashes: &HashOutput,
-    ) -> BTreeSet<Symbol> {
-        let every = || -> BTreeSet<Symbol> {
-            hashes
-                .defs
-                .keys()
-                .filter(|name| gate.cached.contains(*name))
-                .cloned()
-                .collect()
-        };
-        let mut blamed: BTreeSet<SourceId> = BTreeSet::new();
-        for d in diagnostics {
-            for label in &d.labels {
-                if label.span.is_dummy() {
-                    return every();
+    /// The program the rest of the round runs on. The trees are **moved** out of the files: the
+    /// port reads the text, not a tree, and nothing here consults one again.
+    fn assemble(&mut self) -> Result<(Program, ply_syntax::resolve::Resolved), LoadError> {
+        let modules: Vec<Module> = self.files.iter_mut().filter_map(|f| f.ast.take()).collect();
+        // Mutable because `resolve` fills every call's defaults and places its named arguments.
+        let mut program = Program { modules };
+        let resolved =
+            timed(&mut self.phases.resolve, || resolve(&mut program)).map_err(|diagnostics| {
+                LoadError {
+                    sources: self.sources.clone(),
+                    diagnostics,
                 }
-                blamed.insert(label.span.source);
-            }
-        }
-        if blamed.is_empty() {
-            return every();
-        }
-        let mut out = BTreeSet::new();
-        for file in self.files.iter().filter(|f| blamed.contains(&f.source)) {
-            let Some(ast) = file.ast.as_ref() else {
-                return every();
-            };
-            for item in &ast.items {
-                let Some(ident) = item.name() else { continue };
-                let name = file.module.qualify(&ident.name);
-                for dep in hashes.deps.get(&name).into_iter().flatten() {
-                    // Definitions only. A `type` or `effect` is restored on a path that does not
-                    // consult `widened`, so returning one would hand back a name the next wave
-                    // still calls cached, and the loop would never grow its way out.
-                    if gate.cached.contains(dep) && hashes.defs.contains_key(dep) {
-                        out.insert(dep.clone());
-                    }
-                }
-            }
-        }
-        out
+            })?;
+        Ok((program, resolved))
     }
 
-    fn callers_of_moved(
-        &self,
-        check: &CheckOutput,
-        gate: &GateTwo,
-        hashes: &HashOutput,
-    ) -> BTreeSet<Symbol> {
-        let mut stored: BTreeMap<&Symbol, DefHash> = BTreeMap::new();
-        for file in &self.files {
-            for entry in file.cached_defs() {
-                stored.insert(&entry.name, entry.iface);
-            }
-        }
-        let mut moved = BTreeSet::new();
-        for (name, info) in &check.defs {
-            if gate.cached.contains(name) {
-                continue;
-            }
-            let fresh = iface_of(info);
-            if stored.get(name) != Some(&fresh) {
-                moved.insert(name.clone());
-            }
-        }
-        if moved.is_empty() {
-            return BTreeSet::new();
-        }
-        gate.cached
-            .iter()
-            .filter(|name| hashes.defs.contains_key(*name))
-            .filter(|name| {
-                hashes
-                    .deps
-                    .get(*name)
-                    .is_some_and(|deps| deps.iter().any(|dep| moved.contains(dep)))
-            })
-            .cloned()
-            .collect()
-    }
-
-    /// A parsed module's imports must be parsed too: `resolve` needs every module a reference can
-    /// name, and inference needs the imported definitions' types.
-    fn close_over_imports(&mut self) -> Result<(), LoadError> {
+    /// Every file parsed, and every shipped module something imports pulled in and parsed too —
+    /// to a fixed point, because a shipped module may import another.
+    fn parse_all(&mut self) -> Result<(), LoadError> {
         loop {
             self.parse_pending()?;
-            let mut added = self.pull_stdlib()?;
-            for i in 0..self.files.len() {
-                if !self.files[i].parse {
-                    continue;
-                }
-                let Some(ast) = &self.files[i].ast else {
-                    continue;
-                };
-                let imports: Vec<Symbol> = ast
-                    .imports
-                    .iter()
-                    .map(|d| d.module_name().as_symbol().clone())
-                    .collect();
-                let importer = self.files[i].module.as_symbol().clone();
-                for name in imports {
-                    let Some(&j) = self.by_module.get(&name) else {
-                        continue;
-                    };
-                    if !self.files[j].parse {
-                        self.files[j].parse = true;
-                        self.files[j].refusal = Refusal::ImportedByParsed(importer.clone());
-                        added = true;
-                    }
-                }
-            }
-            if !added {
+            if !self.pull_stdlib()? {
                 return Ok(());
             }
         }
@@ -765,9 +324,8 @@ impl<'s> Driver<'s> {
     fn pull_stdlib(&mut self) -> Result<bool, LoadError> {
         let mut diagnostics = Vec::new();
         let mut wanted: BTreeSet<Symbol> = BTreeSet::new();
-        let mut stale: Vec<(usize, Symbol)> = Vec::new();
 
-        for (i, file) in self.files.iter().enumerate() {
+        for file in &self.files {
             for imported in file.imports() {
                 // A shipped module may import only `std.*`
                 if file.shipped && !ply_std::is_std(&imported) {
@@ -778,20 +336,12 @@ impl<'s> Driver<'s> {
                 {
                     continue;
                 }
-                match (
-                    ply_std::source(&imported).is_some(),
-                    file.shipped,
-                    file.parse,
-                ) {
-                    (true, _, _) => {
+                match (ply_std::source(&imported).is_some(), file.shipped) {
+                    (true, _) => {
                         wanted.insert(imported.as_symbol().clone());
                     }
-                    (false, true, _) => {
-                        diagnostics.push(self.foreign_import(file, &imported));
-                    }
-                    (false, _, true) => diagnostics.push(self.unknown_std(file, &imported)),
-                    // A skipped file naming a module this build no longer ships.
-                    (false, _, false) => stale.push((i, imported.as_symbol().clone())),
+                    (false, true) => diagnostics.push(self.foreign_import(file, &imported)),
+                    (false, false) => diagnostics.push(self.unknown_std(file, &imported)),
                 }
             }
         }
@@ -801,10 +351,6 @@ impl<'s> Driver<'s> {
                 diagnostics,
             });
         }
-        for (i, imported) in stale {
-            self.files[i].parse = true;
-            self.files[i].refusal = Refusal::Import(imported);
-        }
 
         let added = !wanted.is_empty();
         for name in wanted {
@@ -813,9 +359,8 @@ impl<'s> Driver<'s> {
         Ok(added)
     }
 
-    /// An embedded module, filed under its pseudo-path so that gate 1 needs no new mechanism: its
-    /// `content_hash` is over the embedded bytes, and a compiler upgrade that changes those bytes
-    /// refuses the skip exactly as an edited file would.
+    /// An embedded module, filed under its pseudo-path so that the store needs no new mechanism:
+    /// its fingerprint is keyed by that path like any other file's.
     fn add_shipped(&mut self, module: ModuleName) {
         let Some(source) = ply_std::source(&module) else {
             return;
@@ -827,39 +372,20 @@ impl<'s> Driver<'s> {
             .get(id)
             .map(|f| f.text.clone())
             .unwrap_or_else(|| "".into());
-        let fingerprint = match (self.mode, self.store.as_deref()) {
-            (Mode::Incremental, Some(store)) => store.fingerprint(&path),
-            _ => None,
-        };
-        let content = ContentHash::of(source.as_bytes());
-        let seed = self
-            .resume
-            .as_mut()
-            .and_then(|r| r.take(&path, content, id));
-        let mut file = FileState {
+        self.by_module
+            .insert(module.as_symbol().clone(), self.files.len());
+        self.files.push(FileState {
             ast: None,
-            for_eval: false,
-            seed,
             path,
             module,
             source: id,
             text,
-            content,
-            fingerprint,
-            parse: false,
-            recheck: false,
-            refusal: Refusal::None,
+            content: ContentHash::of(source.as_bytes()),
             shipped: true,
-        };
-        file.refusal = self.forced_refusal(&file);
-        file.parse = file.refusal != Refusal::None;
-        self.by_module
-            .insert(file.module.as_symbol().clone(), self.files.len());
-        self.files.push(file);
+        });
     }
 
-    /// Where a file writes an import, or nothing when the file was skipped and its import list came
-    /// from a fingerprint.
+    /// Where a file writes an import.
     fn import_span(&self, file: &FileState, imported: &ModuleName) -> Span {
         file.ast
             .as_ref()
@@ -893,24 +419,14 @@ impl<'s> Driver<'s> {
     fn parse_pending(&mut self) -> Result<(), LoadError> {
         let mut diagnostics = Vec::new();
         let files = &mut self.files;
-        let reused = &mut self.reused;
         timed(&mut self.phases.parse, || {
             for file in files {
-                if (!file.parse && !file.for_eval) || file.ast.is_some() {
-                    continue;
-                }
-                // A tree this process already parsed from these bytes, under this source id, is
-                // the tree a parse would produce. Taken only here, so that a file the run skips
-                // never looks parsed.
-                if let Some(seed) = file.seed.take() {
-                    file.ast = Some(seed);
-                    *reused += 1;
+                if file.ast.is_some() {
                     continue;
                 }
                 match ply_syntax::parse_module(file.source, file.module.clone(), &file.text) {
                     // Expansion is part of parsing a file: it reads that file's own type
-                    // declarations and nothing else, which is what lets gate 1 key on raw file
-                    // content and still be right about a generated definition.
+                    // declarations and nothing else.
                     Ok(mut module) => {
                         diagnostics.append(&mut ply_derive::expand_module(&mut module));
                         file.ast = Some(module);
@@ -929,800 +445,8 @@ impl<'s> Driver<'s> {
         }
     }
 
-    /// The `BodySet` is the normalizer's own byte stream, which the hash is taken over — collecting
-    /// it costs a copy, and recomputing it later would mean re-normalizing the whole program.
-    fn parse_and_hash(
-        &mut self,
-    ) -> Result<(Program, ply_syntax::resolve::Resolved, HashOutput, BodySet), LoadError> {
-        // `parse` and not merely "has a tree": before trees could be seeded from a previous load,
-        // holding one meant having been parsed this run, and every gate downstream reads the
-        // program as the set of parsed modules. A seeded tree for a file gate 1 skipped would put
-        // that module back into the program, which is not wrong — the hashes agree — but it is
-        // work about a file the run decided not to look at, and it grew every phase after this one.
-        let modules: Vec<Module> = timed(&mut self.phases.assemble, || {
-            self.files.iter().filter_map(|f| f.ast.clone()).collect()
-        });
-        // Mutable because `resolve` fills every call's defaults and places its named arguments.
-        let mut program = Program { modules };
-        let resolved =
-            timed(&mut self.phases.resolve, || resolve(&mut program)).map_err(|diagnostics| {
-                LoadError {
-                    sources: self.sources.clone(),
-                    diagnostics,
-                }
-            })?;
-        let (hashes, bodies) = timed(&mut self.phases.hash, || {
-            hash_program_with_bodies(&program, &resolved)
-        })
-        .map_err(|diagnostics| LoadError {
-            sources: self.sources.clone(),
-            diagnostics,
-        })?;
-        Ok((program, resolved, hashes, bodies))
-    }
-
-    /// Program-wide name -> current hash, over parsed and skipped files alike.
-    fn hash_table(&self, hashes: &HashOutput) -> BTreeMap<Symbol, DefHash> {
-        let mut table: BTreeMap<Symbol, DefHash> = BTreeMap::new();
-        for (name, hash) in hashes.defs.iter().chain(hashes.decls.iter()) {
-            table.insert(name.clone(), *hash);
-        }
-        for file in &self.files {
-            if file.parse {
-                continue;
-            }
-            for entry in file.cached_defs() {
-                table.insert(entry.name.clone(), entry.hash);
-            }
-        }
-        table
-    }
-
-    /// Everything gate 1 measures a skip candidate against, gathered once per round: what every
-    /// name in the program denotes now, and one digest per module over what that module publishes.
-    fn gate_one(&self, hashes: &HashOutput) -> Gate1 {
-        Gate1 {
-            table: self.hash_table(hashes),
-            exports: self
-                .export_table(hashes)
-                .into_iter()
-                .map(|(module, names)| (module, exports_digest(&names)))
-                .collect(),
-        }
-    }
-
-    /// Gate 1's second condition, evaluated for every file still hoping to skip.
-    fn refuse_candidates(&mut self, gate: &Gate1) -> bool {
-        let mut demoted = false;
-        let private = self.private_names();
-        for i in 0..self.files.len() {
-            if self.files[i].parse {
-                continue;
-            }
-            if let Some(refusal) = self.gate_one_refusal(i, gate, &private) {
-                self.files[i].parse = true;
-                self.files[i].refusal = refusal;
-                demoted = true;
-            }
-        }
-        demoted
-    }
-
-    /// Qualified names a *parsed* module declares without `pub`.
-    fn private_names(&self) -> BTreeSet<Symbol> {
-        let mut out = BTreeSet::new();
-        for file in &self.files {
-            let Some(ast) = &file.ast else { continue };
-            for item in &ast.items {
-                let Some(ident) = item.name() else { continue };
-                if item.visibility() == Visibility::Private {
-                    out.insert(file.module.qualify(&ident.name));
-                }
-            }
-        }
-        out
-    }
-
-    fn gate_one_refusal(
-        &self,
-        i: usize,
-        gate: &Gate1,
-        private: &BTreeSet<Symbol>,
-    ) -> Option<Refusal> {
-        let file = &self.files[i];
-        // Written to fail closed.
-        let Some(fingerprint) = file.fingerprint.as_ref() else {
-            return Some(Refusal::NoFingerprint);
-        };
-        let Some(store) = self.store.as_deref() else {
-            return Some(Refusal::NotIncremental);
-        };
-
-        // The module-granular check, and the only one that sees a name this file *imports without
-        // using*.
-        for edge in &fingerprint.imports {
-            if gate.exports.get(&edge.module) != Some(&edge.exports) {
-                return Some(Refusal::Import(edge.module.clone()));
-            }
-        }
-
-        // The exact condition: every free name still denotes what it denoted.
-        for dep in &fingerprint.deps {
-            if gate.table.get(&dep.name) != Some(&dep.hash) {
-                return Some(Refusal::Dependency(dep.name.clone()));
-            }
-            // Every entry here crossed a module boundary to get in, so every one of them had to be
-            // `pub` for this file to have compiled.
-            if private.contains(&dep.name) {
-                return Some(Refusal::Private(dep.name.clone()));
-            }
-        }
-
-        let resolve = |name: &Symbol| gate.table.get(name).copied();
-        for entry in &fingerprint.defs {
-            // Asked for by name, not by hash alone: several definitions can share a hash, and a
-            // `Scheme` written in another one's names is not this one's interface.
-            let holds = match entry.kind {
-                DefKind::Fn => store
-                    .def_of(entry.hash, &entry.name)
-                    .map(|d| witness_holds(&d.names, resolve)),
-                _ => store
-                    .decl_of(entry.hash, &entry.name)
-                    .map(|d| witness_holds(&d.names, resolve)),
-            };
-            if holds != Some(true) {
-                return Some(Refusal::InterfaceMissing);
-            }
-        }
-        None
-    }
-
-    /// Gate 2, decided one definition at a time.
-    fn decide_rechecks(&mut self, hashes: &HashOutput) -> GateTwo {
-        let witnesses = self.witnesses(hashes);
-        let private = self.private_names();
-        let one = self.gate_one(hashes);
-        let mut gate = GateTwo::default();
-        let mut rechecked = vec![false; self.files.len()];
-
-        for (i, flag) in rechecked.iter_mut().enumerate() {
-            if !self.files[i].parse {
-                continue;
-            }
-            *flag = self.gather(i, hashes, &witnesses, &one, &private, &mut gate);
-        }
-        for (i, flag) in rechecked.into_iter().enumerate() {
-            self.files[i].recheck = flag;
-        }
-        gate
-    }
-
-    /// Fills in what gate 2 accepted for one parsed file.
-    fn gather(
-        &self,
-        i: usize,
-        hashes: &HashOutput,
-        witnesses: &BTreeMap<Symbol, Vec<NameRef>>,
-        one: &Gate1,
-        private: &BTreeSet<Symbol>,
-        gate: &mut GateTwo,
-    ) -> bool {
-        let file = &self.files[i];
-        let (Some(store), Some(ast)) = (self.store.as_deref(), file.ast.as_ref()) else {
-            return true;
-        };
-        // A referent that stopped being `pub` moves no hash and fails no witness, so nothing below
-        // would notice; the body has to be walked again for the error to be reported against the
-        // reference.
-        if self
-            .free_names(i, hashes)
-            .iter()
-            .any(|n| private.contains(n))
-        {
-            return true;
-        }
-
-        let stored: BTreeMap<&Symbol, &DefEntry> = file
-            .fingerprint
-            .iter()
-            .flat_map(|f| f.defs.iter())
-            .map(|entry| (&entry.name, entry))
-            .collect();
-
-        let mut rechecked = false;
-        for item in &ast.items {
-            let Some(ident) = item.name() else { continue };
-            let name = file.module.qualify(&ident.name);
-            let Some((&hash, witness)) = hashes
-                .defs
-                .get(&name)
-                .or_else(|| hashes.decls.get(&name))
-                .zip(witnesses.get(&name))
-            else {
-                rechecked = true;
-                continue;
-            };
-            let held = match item {
-                Item::Fn(_) => stored
-                    .get(&name)
-                    .filter(|_| !self.widened.contains(&name))
-                    .filter(|entry| hashes.own.get(&name) == Some(&entry.own))
-                    .and_then(|entry| {
-                        // By the stored hash, not this run's: the point of the gate is that this
-                        // run's has been allowed to move.
-                        let cached = store.def_of(entry.hash, &name)?;
-                        let witness = restated(witness, &name, hash, entry.hash);
-                        same_witness(&cached.names, &witness).then(|| KnownDef {
-                            scheme: cached.scheme.clone(),
-                            footprint: cached.footprint.clone(),
-                            performed: cached.performed.clone(),
-                        })
-                    }),
-                _ => {
-                    let unmoved = store
-                        .decl_of(hash, &name)
-                        .is_some_and(|cached| same_witness(&cached.names, witness));
-                    if unmoved {
-                        gate.cached.insert(name.clone());
-                    } else {
-                        rechecked = true;
-                    }
-                    continue;
-                }
-            };
-            match held {
-                Some(entry) => {
-                    gate.cached.insert(name.clone());
-                    gate.known.defs.insert(name, entry);
-                }
-                None => rechecked = true,
-            }
-        }
-
-        rechecked | self.gather_tests(i, hashes, one, private, gate)
-    }
-
-    /// A test's footprint is written in effect *names*, which a hash erases, and `CachedTest`
-    /// carries no witness of its own.
-    fn gather_tests(
-        &self,
-        i: usize,
-        hashes: &HashOutput,
-        one: &Gate1,
-        private: &BTreeSet<Symbol>,
-        gate: &mut GateTwo,
-    ) -> bool {
-        let file = &self.files[i];
-        let Some(ast) = &file.ast else { return true };
-        let count = ast
-            .items
-            .iter()
-            .filter(|i| matches!(i, Item::Test(_)))
-            .count();
-        if count == 0 {
-            return false;
-        }
-        if self.gate_one_refusal(i, one, private).is_some() {
-            return true;
-        }
-        let Some(fingerprint) = &file.fingerprint else {
-            return true;
-        };
-
-        let mut by_hash: BTreeMap<DefHash, Option<&Footprint>> = BTreeMap::new();
-        for test in &fingerprint.tests {
-            match by_hash.entry(test.hash) {
-                std::collections::btree_map::Entry::Vacant(slot) => {
-                    slot.insert(Some(&test.footprint));
-                }
-                std::collections::btree_map::Entry::Occupied(mut slot) => {
-                    if slot.get() != &Some(&test.footprint) {
-                        slot.insert(None);
-                    }
-                }
-            }
-        }
-
-        let mut slots = Vec::with_capacity(count);
-        let mut rechecked = false;
-        for hash in self.test_hashes_of(i, hashes) {
-            match by_hash.get(&hash).copied().flatten() {
-                Some(footprint) => slots.push(Some(KnownTest {
-                    footprint: footprint.clone(),
-                })),
-                None => {
-                    slots.push(None);
-                    rechecked = true;
-                }
-            }
-        }
-        if slots.len() == count {
-            gate.known
-                .tests
-                .insert(file.module.as_symbol().clone(), slots);
-        } else {
-            rechecked = true;
-        }
-        rechecked
-    }
-
-    /// Every top-level name this file mentions but does not declare.
-    fn free_names(&self, i: usize, hashes: &HashOutput) -> BTreeSet<Symbol> {
-        let file = &self.files[i];
-        let Some(ast) = &file.ast else {
-            return BTreeSet::new();
-        };
-        let mut declared = BTreeSet::new();
-        let mut keys: Vec<Symbol> = Vec::new();
-        for item in &ast.items {
-            match item {
-                Item::Test(def) => keys.push(file.module.qualify(&Symbol::new(&def.name))),
-                _ => {
-                    let Some(ident) = item.name() else { continue };
-                    let name = file.module.qualify(&ident.name);
-                    declared.insert(name.clone());
-                    keys.push(name);
-                }
-            }
-        }
-        let mut out = BTreeSet::new();
-        for key in &keys {
-            for dep in hashes.deps.get(key).into_iter().flatten() {
-                if !declared.contains(dep) {
-                    out.insert(dep.clone());
-                }
-            }
-        }
-        out
-    }
-
-    /// `HashOutput::tests` is parallel to the program's tests walked module by module in load
-    /// order, and the parsed program holds the parsed files in that same order, so the offsets line
-    /// up by counting.
-    fn test_hashes_of(&self, i: usize, hashes: &HashOutput) -> Vec<DefHash> {
-        self.item_hashes_of(i, &hashes.tests, |item| matches!(item, Item::Test(_)))
-    }
-
-    /// `HashOutput::laws` is parallel in the same way, and for the same reason.
-    fn law_hashes_of(&self, i: usize, hashes: &HashOutput) -> Vec<DefHash> {
-        self.item_hashes_of(i, &hashes.laws, |item| matches!(item, Item::Law(_)))
-    }
-
-    /// `HashOutput::law_texts` is parallel to `HashOutput::laws`.
-    fn law_texts_of(&self, i: usize, hashes: &HashOutput) -> Vec<DefHash> {
-        self.item_hashes_of(i, &hashes.law_texts, |item| matches!(item, Item::Law(_)))
-    }
-
-    fn item_hashes_of(
-        &self,
-        i: usize,
-        all: &[DefHash],
-        wanted: impl Fn(&Item) -> bool,
-    ) -> Vec<DefHash> {
-        let mut offset = 0;
-        for (j, file) in self.files.iter().enumerate() {
-            let Some(ast) = &file.ast else { continue };
-            let count = ast.items.iter().filter(|item| wanted(item)).count();
-            if j == i {
-                return all.iter().skip(offset).take(count).copied().collect();
-            }
-            offset += count;
-        }
-        Vec::new()
-    }
-
-    /// The witness this run would write for every parsed definition and test.
-    fn witnesses(&self, hashes: &HashOutput) -> BTreeMap<Symbol, Vec<NameRef>> {
-        let mut out = BTreeMap::new();
-        let named = |name: &Symbol| -> Option<NameRef> {
-            hashes
-                .defs
-                .get(name)
-                .or_else(|| hashes.decls.get(name))
-                .map(|hash| NameRef::new(name.clone(), *hash))
-        };
-        let is_decl = |name: &Symbol| hashes.decls.contains_key(name);
-
-        for (name, hash) in hashes.defs.iter().chain(hashes.decls.iter()) {
-            let mut witness = vec![NameRef::new(name.clone(), *hash)];
-            if let Some(deps) = hashes.deps.get(name) {
-                witness.extend(deps.iter().filter(|d| is_decl(d)).filter_map(&named));
-            }
-            if let Some(closure) = hashes.closure.get(name) {
-                witness.extend(closure.iter().filter(|d| is_decl(d)).filter_map(&named));
-            }
-            out.insert(name.clone(), witness);
-        }
-        out
-    }
-
-    fn merge(
-        mut self,
-        program: Program,
-        resolved: ply_syntax::resolve::Resolved,
-        hashes: HashOutput,
-        bodies: BodySet,
-        checked: CheckOutput,
-        cached: BTreeSet<Symbol>,
-    ) -> Result<Loaded, LoadError> {
-        let hashes = &hashes;
-        // Inference walks modules in dependency order and a skipped module is not walked at all, so
-        // taking either map's order from the check would make the published order a function of
-        // what the cache happened to hold.
-        let checked = CheckOutput {
-            defs: canonical_defs(&checked.defs),
-            effects: canonical_effects(&checked.effects),
-            ctors: canonical_ctors(&checked.ctors),
-            ..checked
-        };
-        let out = CheckOutput {
-            defs: IndexMap::new(),
-            tests: Vec::new(),
-            laws: Vec::new(),
-            // The maps below are rebuilt file by file, and no file declares the prelude's effects
-            // or ADTs, so they have to be seeded here or a run's `CheckOutput` would answer that
-            // `clock` is not `nondet` and that no value of `Option<Int>` can be generated.
-            effects: ply_core::prelude::effects(),
-            ctors: ply_core::prelude::ctors(),
-            modules: IndexMap::new(),
-        };
-        let merged = HashOutput {
-            defs: hashes.defs.clone(),
-            own: hashes.own.clone(),
-            decls: hashes.decls.clone(),
-            tests: Vec::new(),
-            laws: Vec::new(),
-            specs: hashes.specs.clone(),
-            spec_texts: hashes.spec_texts.clone(),
-            law_texts: Vec::new(),
-            deps: hashes.deps.clone(),
-            closure: hashes.closure.clone(),
-        };
-        let report = FrontEnd {
-            incremental: self.mode == Mode::Incremental,
-            ..Default::default()
-        };
-        let restoring = Instant::now();
-
-        let mut into = Merged {
-            out,
-            merged,
-            report,
-        };
-        for i in 0..self.files.len() {
-            if self.files[i].parse {
-                self.restate_checked(i, &checked, hashes, &cached, &mut into);
-            } else {
-                self.restore_skipped(i, &mut into)?;
-            }
-            into.report.files.push(FileReport {
-                path: self.files[i].path.clone(),
-                module: self.files[i].module.clone(),
-                parsed: self.files[i].parse,
-                rechecked: self.files[i].recheck,
-                refusal: self.files[i].refusal.clone(),
-            });
-        }
-        let Merged {
-            out,
-            mut merged,
-            mut report,
-        } = into;
-
-        merged.closure = closure_of(&merged.deps);
-        self.phases.restore += restoring.elapsed();
-
-        let stdlib = self.stdlib_notice(&merged);
-        let writing = Instant::now();
-        report.warnings = self.write_back(hashes, &bodies, &out);
-        report.warnings.splice(0..0, stdlib);
-        self.phases.write_back += writing.elapsed();
-        report.phases = self.phases;
-        report.reused = self.reused;
-
-        // Before the trees are handed back to the resume below, which takes them.
-        let evaluation = self.evaluation_program()?;
-
-        let files = self.files.iter().map(|f| f.path.clone()).collect();
-        let complete = self.files.iter().all(|f| f.parse);
-        let promised = self.files.iter().any(|f| match &f.ast {
-            Some(ast) => ast
-                .items
-                .iter()
-                .any(|item| matches!(item, Item::Fn(def) if def.reuse.is_some())),
-            None => f.cached_defs().iter().any(|d| d.reuse),
-        });
-        // Only here, on the path that produced a `Loaded`: a run that failed part way leaves the
-        // trees it was given where it found them, so the next one parses rather than resuming from
-        // a state no load finished with.
-        if let Some(resume) = self.resume.as_deref_mut() {
-            for file in &mut self.files {
-                // The seed too, and not only what was parsed: a file this run skipped still has the
-                // tree the run before it parsed, and dropping it would make the next run parse a
-                // file neither of them looked at.
-                if let Some(ast) = file.ast.take().or_else(|| file.seed.take()) {
-                    resume.keep(file.path.clone(), file.content, file.source, ast);
-                }
-            }
-        }
-        Ok(Loaded {
-            root: self.root,
-            run: evaluation,
-            files,
-            sources: self.sources,
-            program,
-            resolved,
-            check: out,
-            hashes: merged,
-            complete,
-            frontend: report,
-            promised,
-        })
-    }
-
-    fn restate_checked(
-        &self,
-        i: usize,
-        checked: &CheckOutput,
-        hashes: &HashOutput,
-        cached: &BTreeSet<Symbol>,
-        into: &mut Merged,
-    ) {
-        let Merged {
-            out,
-            merged,
-            report,
-        } = into;
-        let file = &self.files[i];
-        let Some(ast) = &file.ast else { return };
-        out.modules.insert(
-            file.module.as_symbol().clone(),
-            module_info(ast, file.source),
-        );
-        for item in &ast.items {
-            let Some(ident) = item.name() else { continue };
-            let name = file.module.qualify(&ident.name);
-            report.defs.push(DefReport {
-                cached: cached.contains(&name),
-                name: name.clone(),
-            });
-            match item {
-                Item::Fn(_) => {
-                    if let Some(def) = checked.defs.get(&name) {
-                        out.defs.insert(name, def.clone());
-                    }
-                }
-                Item::Effect(_) => {
-                    if let Some(effect) = checked.effects.get(&name) {
-                        out.effects.insert(name, effect.clone());
-                    }
-                }
-                Item::Type(def) => {
-                    let TypeDefBody::Sum(variants) = &def.body else {
-                        continue;
-                    };
-                    for variant in variants {
-                        let ctor = file.module.qualify(&variant.name.name);
-                        if let Some(info) = checked.ctors.get(&ctor) {
-                            out.ctors.insert(ctor, info.clone());
-                        }
-                    }
-                }
-                // None declares a name, so none is reached: all four are filtered out by
-                // `item.name()` above.
-                Item::Test(_) | Item::Law(_) | Item::Derive(_) | Item::EffectSet(_) => {}
-            }
-        }
-        for test in checked.tests.iter().filter(|t| t.module == file.module) {
-            let index = out.tests.len();
-            out.tests.push(TestInfo {
-                index,
-                ..test.clone()
-            });
-        }
-        // A law declares no name, so the loop above never reaches it, and its obligation would be
-        // silently absent from a run that read it — a claim nobody checked and nobody was told
-        // about.
-        for law in checked.laws.iter().filter(|l| l.module == file.module) {
-            let index = out.laws.len();
-            out.laws.push(LawInfo {
-                index,
-                ..law.clone()
-            });
-        }
-        merged.tests.extend(self.test_hashes_of(i, hashes));
-        merged.laws.extend(self.law_hashes_of(i, hashes));
-        merged.law_texts.extend(self.law_texts_of(i, hashes));
-    }
-
-    /// A module gate 1 skipped.
-    fn restore_skipped(&self, i: usize, into: &mut Merged) -> Result<(), LoadError> {
-        let Merged {
-            out,
-            merged,
-            report,
-        } = into;
-        let file = &self.files[i];
-        let Some(store) = self.store.as_deref() else {
-            return Err(self.corrupt(file.module.as_symbol()));
-        };
-        let Some(fingerprint) = &file.fingerprint else {
-            return Err(self.corrupt(file.module.as_symbol()));
-        };
-        let source = file.source;
-
-        let mut items = Vec::new();
-        for entry in &fingerprint.defs {
-            items.push(entry.name.clone());
-            if entry.kind == DefKind::Type {
-                items.extend(entry.members.iter().map(|m| file.module.qualify(&m.name)));
-            }
-        }
-        out.modules.insert(
-            file.module.as_symbol().clone(),
-            ModuleInfo {
-                name: file.module.clone(),
-                source,
-                items,
-                imports: fingerprint
-                    .imports
-                    .iter()
-                    .map(|e| ModuleName::from_dotted(e.module.as_str()))
-                    .collect(),
-            },
-        );
-
-        for entry in &fingerprint.defs {
-            report.defs.push(DefReport {
-                name: entry.name.clone(),
-                cached: true,
-            });
-            record_deps(merged, &entry.name, &entry.deps);
-            let simple = simple_name(&file.module, &entry.name);
-            match entry.kind {
-                DefKind::Fn => {
-                    let Some(cached) = store.def_of(entry.hash, &entry.name) else {
-                        return Err(self.corrupt(&entry.name));
-                    };
-                    merged.defs.insert(entry.name.clone(), entry.hash);
-                    out.defs.insert(
-                        entry.name.clone(),
-                        DefInfo {
-                            name: entry.name.clone(),
-                            module: file.module.clone(),
-                            simple_name: simple,
-                            scheme: cached.scheme.clone(),
-                            footprint: cached.footprint.clone(),
-                            performed: cached.performed.clone(),
-                            row_aliases: cached.row_aliases.clone(),
-                            // Restored from `SourceFingerprint::specs` once the store carries it;
-                            // see CONTRACTS.md's Specs section.
-                            spec: Vec::new(),
-                            // Needs `CachedDef` to carry them, which it does not yet.
-                            constraints: Vec::new(),
-                            // The answer the run that checked it computed, carried in the cached
-                            // definition. It was the conservative `true` on the ground that a
-                            // skipped module contributes no AST — which stopped being true once a
-                            // module could be kept for its bodies alone, and cost the backend every
-                            // entry into one.
-                            internally_effectful: cached.internally_effectful,
-                            span: entry.span.rebase(source),
-                        },
-                    );
-                }
-                DefKind::Type => {
-                    let Some(cached) = store.decl_of(entry.hash, &entry.name) else {
-                        return Err(self.corrupt(&entry.name));
-                    };
-                    let DeclBody::Type { ctors, .. } = &cached.body else {
-                        return Err(self.corrupt(&entry.name));
-                    };
-                    merged.decls.insert(entry.name.clone(), entry.hash);
-                    if entry.members.len() != ctors.len() {
-                        return Err(self.corrupt(&entry.name));
-                    }
-                    for (index, (member, cached)) in entry.members.iter().zip(ctors).enumerate() {
-                        let ctor = file.module.qualify(&member.name);
-                        out.ctors.insert(
-                            ctor.clone(),
-                            CtorInfo {
-                                name: ctor,
-                                module: file.module.clone(),
-                                simple_name: member.name.clone(),
-                                type_name: entry.name.clone(),
-                                index,
-                                arity: cached.fields.len(),
-                                fields: cached.fields.clone(),
-                                scheme: cached.scheme.clone(),
-                                span: member.span.rebase(source),
-                            },
-                        );
-                    }
-                }
-                DefKind::Effect => {
-                    let Some(cached) = store.decl_of(entry.hash, &entry.name) else {
-                        return Err(self.corrupt(&entry.name));
-                    };
-                    let DeclBody::Effect { nondet, ops } = &cached.body else {
-                        return Err(self.corrupt(&entry.name));
-                    };
-                    merged.decls.insert(entry.name.clone(), entry.hash);
-                    if entry.members.len() != ops.len() {
-                        return Err(self.corrupt(&entry.name));
-                    }
-                    // By name, never by position: normalization sorts an effect's operations away,
-                    // so their source order is not part of the hash the signatures were stored
-                    // under.
-                    let by_name: BTreeMap<&Symbol, &CachedOp> =
-                        ops.iter().map(|op| (&op.name, op)).collect();
-                    let mut infos = IndexMap::new();
-                    for member in &entry.members {
-                        let Some(cached) = by_name.get(&member.name) else {
-                            return Err(self.corrupt(&entry.name));
-                        };
-                        infos.insert(
-                            member.name.clone(),
-                            OpInfo {
-                                name: member.name.clone(),
-                                mode: cached.mode,
-                                resource_param: cached.resource_param,
-                                params: cached.params.clone(),
-                                ret: cached.ret.clone(),
-                                span: member.span.rebase(source),
-                                scheme: None,
-                            },
-                        );
-                    }
-                    out.effects.insert(
-                        entry.name.clone(),
-                        EffectInfo {
-                            name: entry.name.clone(),
-                            module: file.module.clone(),
-                            simple_name: simple,
-                            nondet: *nondet,
-                            ops: infos,
-                            span: entry.span.rebase(source),
-                        },
-                    );
-                }
-            }
-        }
-
-        for test in &fingerprint.tests {
-            let index = out.tests.len();
-            let key = file.module.qualify(&Symbol::new(&test.name));
-            record_deps(merged, &key, &test.deps);
-            out.tests.push(TestInfo {
-                name: test.name.clone(),
-                module: file.module.clone(),
-                key,
-                index,
-                nondet: test.nondet,
-                footprint: test.footprint.clone(),
-                span: test.span.rebase(source),
-            });
-            merged.tests.push(test.hash);
-        }
-        Ok(())
-    }
-
-    /// The cache promised an interface it does not hold.
-    fn corrupt(&self, name: &Symbol) -> LoadError {
-        LoadError {
-            sources: self.sources.clone(),
-            diagnostics: vec![
-                Diagnostic::error(
-                    codes::CACHE_CORRUPT,
-                    format!("the front-end cache has no interface for `{name}`"),
-                )
-                .primary(Span::DUMMY, "this definition was supposed to be cached")
-                .note("run `ply cache clear`, or pass `--no-incremental` to bypass the cache"),
-            ],
-        }
-    }
-
     /// What a compiler upgrade did to this project, said once.
-    fn stdlib_notice(&self, merged: &HashOutput) -> Vec<Diagnostic> {
+    fn stdlib_notice(&self, hashes: &HashOutput) -> Vec<Diagnostic> {
         if self.mode != Mode::Incremental {
             return Vec::new();
         }
@@ -1747,22 +471,22 @@ impl<'s> Driver<'s> {
                 continue;
             };
             for entry in &fingerprint.defs {
-                let now = merged
+                let now = hashes
                     .defs
                     .get(&entry.name)
-                    .or_else(|| merged.decls.get(&entry.name));
+                    .or_else(|| hashes.decls.get(&entry.name));
                 if now != Some(&entry.hash) {
                     moved.insert(entry.name.clone());
                 }
             }
         }
 
-        let reached = merged
+        let reached = hashes
             .defs
             .keys()
-            .chain(merged.decls.keys())
+            .chain(hashes.decls.keys())
             .filter(|name| {
-                merged
+                hashes
                     .closure
                     .get(*name)
                     .is_some_and(|closure| closure.iter().any(|n| moved.contains(n)))
@@ -1785,41 +509,31 @@ impl<'s> Driver<'s> {
         ]
     }
 
-    fn write_back(
-        &mut self,
-        hashes: &HashOutput,
-        bodies: &BodySet,
-        check: &CheckOutput,
-    ) -> Vec<Diagnostic> {
+    /// Everything the store keeps about this run, all of it read out of the front end's answer.
+    fn write_back(&mut self, front: &Front) -> Vec<Diagnostic> {
         if self.mode != Mode::Incremental {
             return Vec::new();
         }
-        let witnesses = self.witnesses(hashes);
-        // The same call gate 1 makes, so that what is written now is exactly what a later run will
-        // compare against.
-        let exports = self.export_table(hashes);
-        let table = self.hash_table(hashes);
-        let paths: Vec<PathBuf> = self.files.iter().map(|f| f.path.clone()).collect();
-        let whole_project = self.whole_project;
-
-        let footprints: BTreeMap<Symbol, Footprint> = check
-            .tests
-            .iter()
-            .map(|t| (t.key.clone(), t.footprint.clone()))
-            .collect();
-        let ifaces: BTreeMap<Symbol, DefHash> = check
+        let witnesses = witnesses(&front.hashes);
+        let exports = export_table(front);
+        let table = hash_table(&front.hashes);
+        let ifaces: BTreeMap<Symbol, DefHash> = front
+            .check
             .defs
             .iter()
             .map(|(name, info)| (name.clone(), iface_of(info)))
             .collect();
+        let paths: Vec<PathBuf> = self.files.iter().map(|f| f.path.clone()).collect();
+        let whole_project = self.whole_project;
+
         let fingerprints: Vec<(usize, SourceFingerprint)> = (0..self.files.len())
-            .filter(|&i| self.files[i].parse)
             .filter_map(|i| {
-                self.fingerprint_of(i, hashes, &table, &exports, &footprints, &ifaces)
+                self.fingerprint_of(i, front, &table, &exports, &ifaces)
                     .map(|f| (i, f))
             })
             .collect();
-        let interfaces = self.interfaces(hashes, check, &witnesses);
+        let interfaces = interfaces(front, &witnesses);
+        let bodies = stored_bodies(front);
 
         let Some(store) = self.store.as_deref_mut() else {
             return Vec::new();
@@ -1830,9 +544,8 @@ impl<'s> Driver<'s> {
                 Interface::Decl(decl) => store.put_decl(hash, decl),
             }
         }
-        // Only the definitions this run normalized.
-        for (hash, body) in bodies.defs() {
-            store.put_body(hash, DefBody::of(body.clone()));
+        for (hash, body) in bodies {
+            store.put_body(hash, body);
         }
         for (i, fingerprint) in fingerprints {
             store.put_source(&paths[i], fingerprint);
@@ -1858,236 +571,62 @@ impl<'s> Driver<'s> {
         }
     }
 
-    /// Every module's `(name, hash)` pairs, which is what an importer's `ImportEdge` digest is
-    /// taken over.
-    fn export_table(&self, hashes: &HashOutput) -> BTreeMap<Symbol, Vec<NameRef>> {
-        let mut out: BTreeMap<Symbol, Vec<NameRef>> = BTreeMap::new();
-        for file in &self.files {
-            let mut names: Vec<NameRef> = Vec::new();
-            match &file.ast {
-                Some(ast) => {
-                    for item in &ast.items {
-                        let Some(ident) = item.name() else { continue };
-                        let name = file.module.qualify(&ident.name);
-                        if let Some(hash) =
-                            hashes.defs.get(&name).or_else(|| hashes.decls.get(&name))
-                        {
-                            names.push(NameRef::new(name, *hash));
-                        }
-                    }
-                }
-                None => {
-                    names.extend(
-                        file.cached_defs()
-                            .iter()
-                            .map(|d| NameRef::new(d.name.clone(), d.hash)),
-                    );
-                }
-            }
-            out.insert(file.module.as_symbol().clone(), names);
-        }
-        out
-    }
-
     fn fingerprint_of(
         &self,
         i: usize,
-        hashes: &HashOutput,
+        front: &Front,
         table: &BTreeMap<Symbol, DefHash>,
         exports: &BTreeMap<Symbol, Vec<NameRef>>,
-        footprints: &BTreeMap<Symbol, Footprint>,
         ifaces: &BTreeMap<Symbol, DefHash>,
     ) -> Option<SourceFingerprint> {
         let file = &self.files[i];
-        let ast = file.ast.as_ref()?;
+        let module = file.module.as_symbol();
+        let info = front.check.modules.get(module)?;
+        let hashes = &front.hashes;
         let mut fingerprint = SourceFingerprint::new(file.content);
 
-        let mut seen = BTreeSet::new();
-        for import in &ast.imports {
-            let module = import.module_name().as_symbol().clone();
-            if !seen.insert(module.clone()) {
-                continue;
-            }
-            let digest = exports_digest(exports.get(&module).map(Vec::as_slice).unwrap_or(&[]));
+        // `ModuleInfo::imports` is this module's imports, deduplicated, in source order.
+        for import in &info.imports {
+            let name = import.as_symbol().clone();
+            let digest = exports_digest(exports.get(&name).map(Vec::as_slice).unwrap_or(&[]));
             fingerprint.imports.push(ImportEdge {
-                module,
+                module: name,
                 exports: digest,
             });
         }
 
-        // Free names, and what each resolved to: gate 1's exact condition.
-        fingerprint.deps = self
-            .free_names(i, hashes)
+        fingerprint.deps = free_names(front, module, info)
             .into_iter()
             .filter_map(|name| table.get(&name).map(|hash| NameRef::new(name, *hash)))
             .collect();
 
-        for item in &ast.items {
-            let Some(ident) = item.name() else { continue };
-            let name = file.module.qualify(&ident.name);
-            let hash = *hashes.defs.get(&name).or_else(|| hashes.decls.get(&name))?;
-            let (kind, members) = match item {
-                Item::Fn(_) => (DefKind::Fn, Vec::new()),
-                Item::Type(def) => (
-                    DefKind::Type,
-                    match &def.body {
-                        TypeDefBody::Sum(variants) => variants
-                            .iter()
-                            .map(|v| Member {
-                                name: v.name.name.clone(),
-                                span: FileSpan::of(v.span),
-                            })
-                            .collect(),
-                        TypeDefBody::Alias(_) => Vec::new(),
-                    },
-                ),
-                Item::Effect(def) => (
-                    DefKind::Effect,
-                    def.ops
-                        .iter()
-                        .map(|op| Member {
-                            name: op.name.name.clone(),
-                            span: FileSpan::of(op.span),
-                        })
-                        .collect(),
-                ),
-                Item::Test(_) | Item::Law(_) | Item::Derive(_) | Item::EffectSet(_) => continue,
-            };
-            let deps = hashes.deps.get(&name).cloned().unwrap_or_default();
-            // A `type` or `effect` is in neither map: its signature comes from
-            // its own text and reaches no body, so its hash already answers
-            // both questions. Gate 2 re-derives declarations anyway.
-            let own = hashes.own.get(&name).copied().unwrap_or(hash);
-            let iface = ifaces.get(&name).copied().unwrap_or(hash);
-            fingerprint.defs.push(DefEntry {
-                name,
-                hash,
-                own,
-                iface,
-                span: FileSpan::of(item.span()),
-                kind,
-                members,
-                deps,
-                reuse: matches!(item, Item::Fn(def) if def.reuse.is_some()),
-            });
+        // A name declared in two namespaces — a `fn` and a `type` of one name — is in `items`
+        // twice and gets one entry per namespace, once.
+        let mut seen: BTreeSet<&Symbol> = BTreeSet::new();
+        for name in &info.items {
+            if seen.insert(name) {
+                fingerprint.defs.extend(def_entries(front, name, ifaces));
+            }
         }
 
-        let test_hashes = self.test_hashes_of(i, hashes);
-        let tests: Vec<&ply_syntax::ast::TestDef> = ast
-            .items
+        for (index, test) in front
+            .check
+            .tests
             .iter()
-            .filter_map(|i| match i {
-                Item::Test(def) => Some(def.as_ref()),
-                _ => None,
-            })
-            .collect();
-        if tests.len() != test_hashes.len() {
-            return None;
-        }
-        for (def, hash) in tests.iter().zip(&test_hashes) {
-            let key = file.module.qualify(&Symbol::new(&def.name));
+            .enumerate()
+            .filter(|(_, t)| t.module == file.module)
+        {
             fingerprint.tests.push(CachedTest {
-                name: def.name.clone(),
-                hash: *hash,
-                nondet: def.nondet,
-                footprint: footprints.get(&key)?.clone(),
-                span: FileSpan::of(def.span),
-                name_span: FileSpan::of(def.name_span),
-                deps: hashes.deps.get(&key).cloned().unwrap_or_default(),
+                name: test.name.clone(),
+                hash: *hashes.tests.get(index)?,
+                nondet: test.nondet,
+                footprint: test.footprint.clone(),
+                span: FileSpan::of(test.span),
+                name_span: FileSpan::of(*front.test_name_spans.get(index)?),
+                deps: hashes.deps.get(&test.key).cloned().unwrap_or_default(),
             });
         }
         Some(fingerprint)
-    }
-
-    /// Only parsed files contribute: a skipped file's entries are already in the store and were the
-    /// very thing that let it skip.
-    fn interfaces(
-        &self,
-        hashes: &HashOutput,
-        check: &CheckOutput,
-        witnesses: &BTreeMap<Symbol, Vec<NameRef>>,
-    ) -> Vec<(DefHash, Interface)> {
-        let mut out = Vec::new();
-        for file in self.files.iter().filter(|f| f.parse) {
-            let Some(ast) = &file.ast else { continue };
-            for item in &ast.items {
-                let Some(ident) = item.name() else { continue };
-                let name = file.module.qualify(&ident.name);
-                let Some(hash) = hashes.defs.get(&name).or_else(|| hashes.decls.get(&name)) else {
-                    continue;
-                };
-                let Some(names) = witnesses.get(&name).cloned() else {
-                    continue;
-                };
-                let entry = match item {
-                    Item::Fn(_) => check.defs.get(&name).map(|d| {
-                        Interface::Def(
-                            CachedDef::new(d.scheme.clone(), d.footprint.clone())
-                                .performing(d.performed.clone())
-                                .written_as(d.row_aliases.clone())
-                                .witnessed_by(names)
-                                .performing_internally(d.internally_effectful),
-                        )
-                    }),
-                    Item::Type(def) => {
-                        let variants = match &def.body {
-                            TypeDefBody::Sum(variants) => variants.as_slice(),
-                            TypeDefBody::Alias(_) => &[],
-                        };
-                        let ctors: Option<Vec<CachedCtor>> = variants
-                            .iter()
-                            .map(|v| {
-                                check
-                                    .ctors
-                                    .get(&file.module.qualify(&v.name.name))
-                                    .map(|c| CachedCtor {
-                                        fields: c.fields.clone(),
-                                        scheme: c.scheme.clone(),
-                                    })
-                            })
-                            .collect();
-                        ctors.map(|ctors| {
-                            Interface::Decl(
-                                CachedDecl::new(DeclBody::Type {
-                                    arity: def.params.len(),
-                                    ctors,
-                                })
-                                .witnessed_by(names),
-                            )
-                        })
-                    }
-                    Item::Effect(def) => check.effects.get(&name).and_then(|info| {
-                        let ops: Option<Vec<CachedOp>> = def
-                            .ops
-                            .iter()
-                            .map(|op| {
-                                info.ops.get(&op.name.name).map(|o| CachedOp {
-                                    name: op.name.name.clone(),
-                                    mode: o.mode,
-                                    resource_param: o.resource_param,
-                                    params: o.params.clone(),
-                                    ret: o.ret.clone(),
-                                })
-                            })
-                            .collect();
-                        ops.map(|ops| {
-                            Interface::Decl(
-                                CachedDecl::new(DeclBody::Effect {
-                                    nondet: info.nondet,
-                                    ops,
-                                })
-                                .witnessed_by(names),
-                            )
-                        })
-                    }),
-                    Item::Test(_) | Item::Law(_) | Item::Derive(_) | Item::EffectSet(_) => None,
-                };
-                if let Some(entry) = entry {
-                    out.push((*hash, entry));
-                }
-            }
-        }
-        out
     }
 }
 
@@ -2096,248 +635,287 @@ enum Interface {
     Decl(CachedDecl),
 }
 
-/// The three maps every file contributes to, whichever way it got here.
-struct Merged {
-    out: CheckOutput,
-    merged: HashOutput,
-    report: FrontEnd,
-}
-
-/// What gate 1 measures a skip candidate against.
-struct Gate1 {
-    table: BTreeMap<Symbol, DefHash>,
-    exports: BTreeMap<Symbol, ContentHash>,
-}
-
-/// What gate 2 decided: the interfaces inference may publish without walking a body, and every name
-/// it accepted, which is what `--explain` reports.
-#[derive(Default)]
-struct GateTwo {
-    known: Known,
-    cached: BTreeSet<Symbol>,
-}
-
-/// Merges rather than overwrites, because two entries can share a name — a `type` and a `fn` may,
-/// as may two tests.
-fn record_deps(merged: &mut HashOutput, name: &Symbol, deps: &[Symbol]) {
-    match merged.deps.get_mut(name) {
-        Some(existing) => {
-            for d in deps {
-                if !existing.contains(d) {
-                    existing.push(d.clone());
-                }
-            }
-        }
-        None => {
-            merged.deps.insert(name.clone(), deps.to_vec());
-        }
-    }
-}
-
-/// The transitive closure of the reference graph, each name included in its own.
-fn closure_of(deps: &IndexMap<Symbol, Vec<Symbol>>) -> IndexMap<Symbol, BTreeSet<Symbol>> {
-    let names: Vec<&Symbol> = deps.keys().collect();
-    let index: BTreeMap<&Symbol, usize> = names
+/// Program-wide name -> current hash.
+fn hash_table(hashes: &HashOutput) -> BTreeMap<Symbol, DefHash> {
+    hashes
+        .defs
         .iter()
-        .enumerate()
-        .map(|(i, name)| (*name, i))
-        .collect();
-    let edges: Vec<Vec<NodeId>> = deps
-        .values()
-        .map(|ds| {
-            ds.iter()
-                .filter_map(|d| index.get(d).map(|&i| NodeId(i)))
-                .collect()
-        })
-        .collect();
-
-    let components = ply_hash::graph::tarjan(names.len(), &edges);
-    let mut component_of = vec![usize::MAX; names.len()];
-    for (ci, component) in components.iter().enumerate() {
-        for &v in component {
-            component_of[v] = ci;
-        }
-    }
-
-    // Dependency-first, so every closure a component splices in is already built.
-    let mut closures: Vec<BTreeSet<Symbol>> = Vec::with_capacity(components.len());
-    for (ci, component) in components.iter().enumerate() {
-        let mut closure: BTreeSet<Symbol> = component.iter().map(|&v| names[v].clone()).collect();
-        for &v in component {
-            for r in &edges[v] {
-                if component_of[r.0] != ci
-                    && let Some(inner) = closures.get(component_of[r.0])
-                {
-                    closure.extend(inner.iter().cloned());
-                }
-            }
-        }
-        closures.push(closure);
-    }
-
-    names
-        .iter()
-        .enumerate()
-        .map(|(v, name)| ((*name).clone(), closures[component_of[v]].clone()))
+        .chain(hashes.decls.iter())
+        .map(|(name, hash)| (name.clone(), *hash))
         .collect()
 }
 
-fn module_info(module: &Module, source: SourceId) -> ModuleInfo {
-    let mut items = Vec::new();
-    for item in &module.items {
-        let Some(ident) = item.name() else { continue };
-        items.push(module.name.qualify(&ident.name));
-        if let Item::Type(def) = item
-            && let TypeDefBody::Sum(variants) = &def.body
-        {
-            items.extend(variants.iter().map(|v| module.name.qualify(&v.name.name)));
+/// Every module's `(name, hash)` pairs, which is what an importer's [`ImportEdge`] digest is taken
+/// over.
+fn export_table(front: &Front) -> BTreeMap<Symbol, Vec<NameRef>> {
+    let hashes = &front.hashes;
+    let mut out: BTreeMap<Symbol, Vec<NameRef>> = BTreeMap::new();
+    for (module, info) in &front.check.modules {
+        let mut names: Vec<NameRef> = Vec::new();
+        let mut seen: BTreeSet<&Symbol> = BTreeSet::new();
+        for name in &info.items {
+            if !seen.insert(name) {
+                continue;
+            }
+            if let Some(hash) = hashes.defs.get(name).or_else(|| hashes.decls.get(name)) {
+                names.push(NameRef::new(name.clone(), *hash));
+            }
         }
+        out.insert(module.clone(), names);
     }
-    let mut imports: Vec<ModuleName> = Vec::new();
-    for import in &module.imports {
-        let name = import.module_name();
-        if !imports.contains(&name) {
-            imports.push(name);
-        }
-    }
-    ModuleInfo {
-        name: module.name.clone(),
-        source,
-        items,
-        imports,
-    }
+    out
 }
 
-fn simple_name(module: &ModuleName, qualified: &Symbol) -> Symbol {
-    let prefix = format!("{}.", module.as_str());
-    match qualified.as_str().strip_prefix(&prefix) {
-        Some(rest) => Symbol::new(rest),
-        None => qualified.clone(),
+/// Every top-level name a module mentions but does not declare.
+fn free_names(front: &Front, module: &Symbol, info: &ply_core::ModuleInfo) -> BTreeSet<Symbol> {
+    let mut declared: BTreeSet<Symbol> = BTreeSet::new();
+    let mut keys: Vec<Symbol> = Vec::new();
+    for name in &info.items {
+        // Everything this module declares under a name a reference could reach — which is what
+        // `items` holds beside each sum type's constructors, and those are reached through the
+        // type.
+        if (front.check.defs.contains_key(name)
+            || front.types.contains_key(name)
+            || front.check.effects.contains_key(name))
+            && declared.insert(name.clone())
+        {
+            keys.push(name.clone());
+        }
     }
+    for test in front
+        .check
+        .tests
+        .iter()
+        .filter(|t| t.module.as_symbol() == module)
+    {
+        keys.push(test.key.clone());
+    }
+
+    let mut out = BTreeSet::new();
+    for key in &keys {
+        for dep in front.hashes.deps.get(key).into_iter().flatten() {
+            if !declared.contains(dep) {
+                out.insert(dep.clone());
+            }
+        }
+    }
+    out
+}
+
+/// What one program-wide name declares: a `fn`, a `type`, an `effect`, or two of them when the
+/// source spells one name in two namespaces.
+fn def_entries(front: &Front, name: &Symbol, ifaces: &BTreeMap<Symbol, DefHash>) -> Vec<DefEntry> {
+    let hashes = &front.hashes;
+    let mut out = Vec::new();
+    let mut entry =
+        |kind: DefKind, hash: DefHash, span: Span, members: Vec<Member>, reuse: bool| {
+            out.push(DefEntry {
+                name: name.clone(),
+                hash,
+                // A `type` or `effect` is in neither map: its signature comes from its own text and
+                // reaches no body, so its hash already answers both questions.
+                own: hashes.own.get(name).copied().unwrap_or(hash),
+                iface: ifaces.get(name).copied().unwrap_or(hash),
+                span: FileSpan::of(span),
+                kind,
+                members,
+                deps: hashes.deps.get(name).cloned().unwrap_or_default(),
+                reuse,
+            });
+        };
+
+    if let (Some(def), Some(&hash)) = (front.check.defs.get(name), hashes.defs.get(name)) {
+        let reuse = front.defs_written.get(name).is_some_and(|w| w.reuse);
+        entry(DefKind::Fn, hash, def.span, Vec::new(), reuse);
+    }
+    if let (Some(ty), Some(&hash)) = (front.types.get(name), hashes.decls.get(name)) {
+        entry(
+            DefKind::Type,
+            hash,
+            ty.span,
+            ctor_members(front, name),
+            false,
+        );
+    }
+    if let (Some(effect), Some(&hash)) = (front.check.effects.get(name), hashes.decls.get(name)) {
+        let ops = effect
+            .ops
+            .values()
+            .map(|op| Member {
+                name: op.name.clone(),
+                span: FileSpan::of(op.span),
+            })
+            .collect();
+        entry(DefKind::Effect, hash, effect.span, ops, false);
+    }
+    out
+}
+
+/// A sum type's constructors in declaration order; an alias has none.
+fn ctors_of<'a>(front: &'a Front, type_name: &Symbol) -> Vec<&'a ply_core::CtorInfo> {
+    let mut out: Vec<&ply_core::CtorInfo> = front
+        .check
+        .ctors
+        .values()
+        .filter(|c| &c.type_name == type_name)
+        .collect();
+    out.sort_by_key(|c| c.index);
+    out
+}
+
+fn ctor_members(front: &Front, type_name: &Symbol) -> Vec<Member> {
+    ctors_of(front, type_name)
+        .into_iter()
+        .map(|c| Member {
+            name: c.simple_name.clone(),
+            span: FileSpan::of(c.span),
+        })
+        .collect()
+}
+
+/// The witness this run writes for every definition and declaration.
+///
+/// Still written now that no gate reads it back: [`ply_store`] keys an interface's slot by the
+/// name its witness says it was written for, so two definitions that share a hash keep their own
+/// entries — and `ply cache inspect` reads it. It is a function of the hashes alone.
+fn witnesses(hashes: &HashOutput) -> BTreeMap<Symbol, Vec<NameRef>> {
+    let mut out = BTreeMap::new();
+    let named = |name: &Symbol| -> Option<NameRef> {
+        hashes
+            .defs
+            .get(name)
+            .or_else(|| hashes.decls.get(name))
+            .map(|hash| NameRef::new(name.clone(), *hash))
+    };
+    let is_decl = |name: &Symbol| hashes.decls.contains_key(name);
+
+    for (name, hash) in hashes.defs.iter().chain(hashes.decls.iter()) {
+        let mut witness = vec![NameRef::new(name.clone(), *hash)];
+        if let Some(deps) = hashes.deps.get(name) {
+            witness.extend(deps.iter().filter(|d| is_decl(d)).filter_map(&named));
+        }
+        if let Some(closure) = hashes.closure.get(name) {
+            witness.extend(closure.iter().filter(|d| is_decl(d)).filter_map(&named));
+        }
+        out.insert(name.clone(), witness);
+    }
+    out
+}
+
+/// The published interface of every definition and declaration in the program.
+fn interfaces(
+    front: &Front,
+    witnesses: &BTreeMap<Symbol, Vec<NameRef>>,
+) -> Vec<(DefHash, Interface)> {
+    let hashes = &front.hashes;
+    let mut out = Vec::new();
+
+    for (name, d) in &front.check.defs {
+        let (Some(&hash), Some(names)) = (hashes.defs.get(name), witnesses.get(name)) else {
+            continue;
+        };
+        out.push((
+            hash,
+            Interface::Def(
+                CachedDef::new(d.scheme.clone(), d.footprint.clone())
+                    .performing(d.performed.clone())
+                    .written_as(d.row_aliases.clone())
+                    .witnessed_by(names.clone())
+                    .performing_internally(d.internally_effectful),
+            ),
+        ));
+    }
+
+    for (name, t) in &front.types {
+        let (Some(&hash), Some(names)) = (hashes.decls.get(name), witnesses.get(name)) else {
+            continue;
+        };
+        let ctors = ctors_of(front, name)
+            .into_iter()
+            .map(|c| CachedCtor {
+                fields: c.fields.clone(),
+                scheme: c.scheme.clone(),
+            })
+            .collect();
+        out.push((
+            hash,
+            Interface::Decl(
+                CachedDecl::new(DeclBody::Type {
+                    arity: t.arity,
+                    ctors,
+                })
+                .witnessed_by(names.clone()),
+            ),
+        ));
+    }
+
+    // A prelude effect is declared by no source and hashed by nothing, so it has no `decls` entry
+    // and contributes no interface.
+    for (name, e) in &front.check.effects {
+        let (Some(&hash), Some(names)) = (hashes.decls.get(name), witnesses.get(name)) else {
+            continue;
+        };
+        let ops = e
+            .ops
+            .values()
+            .map(|o| CachedOp {
+                name: o.name.clone(),
+                mode: o.mode,
+                resource_param: o.resource_param,
+                params: o.params.clone(),
+                ret: o.ret.clone(),
+            })
+            .collect();
+        out.push((
+            hash,
+            Interface::Decl(
+                CachedDecl::new(DeclBody::Effect {
+                    nondet: e.nondet,
+                    ops,
+                })
+                .witnessed_by(names.clone()),
+            ),
+        ));
+    }
+    out
+}
+
+/// The normalized body of every definition, keyed by the hash it is filed under.
+///
+/// A name declared in two namespaces has two bodies and one entry per hash, so the body is matched
+/// to its hash rather than assumed: the envelope carries enough to verify which it is.
+fn stored_bodies(front: &Front) -> Vec<(DefHash, DefBody)> {
+    let hashes = &front.hashes;
+    let mut by_name: BTreeMap<&Symbol, Vec<StoredBody>> = BTreeMap::new();
+    for (name, bytes) in &front.bodies {
+        if let Some(body) = StoredBody::from_bytes(bytes.clone()) {
+            by_name.entry(name).or_default().push(body);
+        }
+    }
+    let mut out = Vec::new();
+    for (name, stored) in by_name {
+        for hash in [hashes.defs.get(name), hashes.decls.get(name)]
+            .into_iter()
+            .flatten()
+        {
+            let found = match stored.as_slice() {
+                [only] => Some(only),
+                many => many.iter().find(|b| b.verify(*hash)),
+            };
+            if let Some(body) = found {
+                out.push((*hash, DefBody::of(body.clone())));
+            }
+        }
+    }
+    out
 }
 
 /// Everything a caller can observe of a definition, taken over exactly the `DefInfo`
-/// [`Driver::write_back`] stores, so a wave's fresh key and a stored one are comparable.
+/// [`Driver::write_back`] stores.
 ///
 /// All three parts come from one `DefInfo`: `DefConstraint::param` indexes that scheme's `ty_vars`.
 fn iface_of(info: &DefInfo) -> DefHash {
     // As published, not canonicalized: a `DefConstraint::param` indexes this
     // scheme's `ty_vars`, and `canonicalize_scheme` sorts them.
     ply_hash::interface_hash(&info.scheme, &info.footprint, &info.constraints)
-}
-
-/// The witness this run would write, with the definition's own hash put back to the one the stored
-/// interface was written under: gate 2 keys on `own`, so that entry is the one a callee's edit is
-/// allowed to have moved, and every other entry is not.
-fn restated(witness: &[NameRef], name: &Symbol, fresh: DefHash, stored: DefHash) -> Vec<NameRef> {
-    witness
-        .iter()
-        .map(|n| {
-            if n.name == *name && n.hash == fresh {
-                NameRef::new(name.clone(), stored)
-            } else {
-                n.clone()
-            }
-        })
-        .collect()
-}
-
-/// Two witnesses agree when they name the same declarations with the same hashes.
-fn same_witness(stored: &[NameRef], fresh: &[NameRef]) -> bool {
-    let mut a = stored.to_vec();
-    let mut b = fresh.to_vec();
-    let key = |n: &NameRef| (n.name.clone(), n.hash);
-    a.sort_by_key(key);
-    a.dedup();
-    b.sort_by_key(key);
-    b.dedup();
-    a == b
-}
-
-fn canonical_defs(defs: &IndexMap<Symbol, DefInfo>) -> IndexMap<Symbol, DefInfo> {
-    let mut out = IndexMap::with_capacity(defs.len());
-    for (name, def) in defs {
-        out.insert(
-            name.clone(),
-            DefInfo {
-                scheme: canonicalize_scheme(&def.scheme),
-                ..def.clone()
-            },
-        );
-    }
-    out
-}
-
-/// Constructors are renumbered per *type*, not per constructor: a type's parameters are shared by
-/// every variant, and numbering each alone would make `P(a)` and `Q(b)` of `type Pair<a, b>` both
-/// mention `t0`.
-fn canonical_ctors(ctors: &IndexMap<Symbol, CtorInfo>) -> IndexMap<Symbol, CtorInfo> {
-    let mut owners: IndexMap<Symbol, Vec<Symbol>> = IndexMap::new();
-    for (name, ctor) in ctors {
-        owners
-            .entry(ctor.type_name.clone())
-            .or_default()
-            .push(name.clone());
-    }
-    let mut out = ctors.clone();
-    for (_, mut names) in owners {
-        names.sort_by_key(|n| ctors[n].index);
-        let body = DeclBody::Type {
-            arity: 0,
-            ctors: names
-                .iter()
-                .map(|n| CachedCtor {
-                    fields: ctors[n].fields.clone(),
-                    scheme: ctors[n].scheme.clone(),
-                })
-                .collect(),
-        };
-        let DeclBody::Type {
-            ctors: canonical, ..
-        } = canonicalize_decl_body(&body)
-        else {
-            continue;
-        };
-        for (name, cached) in names.iter().zip(canonical) {
-            let entry = &mut out[name];
-            entry.fields = cached.fields;
-            entry.scheme = cached.scheme;
-        }
-    }
-    out
-}
-
-fn canonical_effects(effects: &IndexMap<Symbol, EffectInfo>) -> IndexMap<Symbol, EffectInfo> {
-    let mut out = IndexMap::with_capacity(effects.len());
-    for (name, effect) in effects {
-        let body = DeclBody::Effect {
-            nondet: effect.nondet,
-            ops: effect
-                .ops
-                .values()
-                .map(|op| CachedOp {
-                    name: op.name.clone(),
-                    mode: op.mode,
-                    resource_param: op.resource_param,
-                    params: op.params.clone(),
-                    ret: op.ret.clone(),
-                })
-                .collect(),
-        };
-        let mut ops = effect.ops.clone();
-        if let DeclBody::Effect { ops: canonical, .. } = canonicalize_decl_body(&body) {
-            for (info, cached) in ops.values_mut().zip(canonical) {
-                info.params = cached.params;
-                info.ret = cached.ret;
-            }
-        }
-        out.insert(
-            name.clone(),
-            EffectInfo {
-                ops,
-                ..effect.clone()
-            },
-        );
-    }
-    out
 }
