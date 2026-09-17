@@ -1,6 +1,6 @@
 //! The fourth comparison: `infer.ply`'s check of a whole program — every definition's scheme,
 //! footprint and constraints, every test's and law's footprint, every effect and constructor, or
-//! the diagnostics — against `ply_core::check_program`'s, over the standard library, the standard
+//! the diagnostics — against a blessed golden, over the standard library, the standard
 //! library with each example, the programs the resolve comparison reads and the reference
 //! checker's own inputs; and the same through the restored path, each program checked from what
 //! its own first check published.

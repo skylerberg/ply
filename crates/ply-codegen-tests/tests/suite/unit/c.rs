@@ -179,7 +179,15 @@ pub mod tests_support {
         let mut ast =
             ply_syntax::parse_program([(id, ModuleName::from_dotted("m"), owned)]).expect("parses");
         let resolved = ply_syntax::resolve::resolve(&mut ast).expect("resolves");
-        let check = ply_core::check_program(&ast, &resolved).expect("checks");
+        ply_codegen::c::producer::ensure_default();
+        let front = ply_codegen::c::producer::front(&[("m".to_string(), owned.to_string())], &[id])
+            .expect("the port answers");
+        assert!(
+            front.diagnostics.is_empty(),
+            "checks: {:?}",
+            front.diagnostics
+        );
+        let check = front.check;
         let bare = Source::new(
             Box::leak(Box::new(ast)),
             Box::leak(Box::new(resolved)),
@@ -208,7 +216,15 @@ pub mod tests_support {
         let mut ast =
             ply_syntax::parse_program([(id, ModuleName::from_dotted("m"), owned)]).expect("parses");
         let resolved = ply_syntax::resolve::resolve(&mut ast).expect("resolves");
-        let check = ply_core::check_program(&ast, &resolved).expect("checks");
+        ply_codegen::c::producer::ensure_default();
+        let front = ply_codegen::c::producer::front(&[("m".to_string(), owned.to_string())], &[id])
+            .expect("the port answers");
+        assert!(
+            front.diagnostics.is_empty(),
+            "checks: {:?}",
+            front.diagnostics
+        );
+        let check = front.check;
         let source: &'static Source = Box::leak(Box::new(Source::new(
             Box::leak(Box::new(ast)),
             Box::leak(Box::new(resolved)),
