@@ -80,11 +80,8 @@ fn check_all(inputs: &[(String, Vec<u8>)]) -> Tally {
     let mut failures: Vec<String> = Vec::new();
     for (name, bytes) in inputs {
         let got = port::dump("items.dump", bytes);
-        let text =
-            String::from_utf8(bytes.clone()).unwrap_or_else(|e| panic!("{name} is not UTF-8: {e}"));
-        let want = reference_dump(&text);
-        match golden::check("parser", name, &want, &got, first_difference) {
-            Ok(()) => tally.add(bytes, &want),
+        match golden::check("parser", name, &got, first_difference) {
+            Ok(()) => tally.add(bytes, &got),
             Err(report) => failures.push(report),
         }
     }
@@ -242,9 +239,8 @@ fn the_one_file_that_used_to_need_a_projection_is_now_compared_whole() {
 
     // Not merely that it is compared: that comparing it works.
     let desk = std::fs::read(&using[0]).expect("desk.ply");
-    let want = reference_dump(&String::from_utf8(desk.clone()).expect("UTF-8"));
     let got = port::dump("items.dump", &desk);
-    if let Err(report) = golden::check("parser", "desk", &want, &got, first_difference) {
+    if let Err(report) = golden::check("parser", "desk", &got, first_difference) {
         panic!("{report}");
     }
 }
