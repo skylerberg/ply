@@ -224,7 +224,13 @@ fn lent_to_a_step(n: Int) -> Int = { let p = {x: n, y: 0}; fold(range(0, 3), 0, 
 "#;
 
 pub fn call(unit: &'static Unit, name: &str, args: &[Value]) -> Option<Value> {
-    let backend = unit.attach(&ply_eval::BackendSpec::honest());
+    // `attach` builds again -- `Unit::bodies` is not memoised -- so what answers here is whatever
+    // emitter is current now, not the one `unit` was built under. Every unit entered through this
+    // helper came from `unit`, which is the reference fragment, so the reference has to be current
+    // again; otherwise the installed producer is asked for a text-less source, answers nothing, and
+    // the members no longer match the code.
+    let backend =
+        ply_codegen::c::producer::reference_only(|| unit.attach(&ply_eval::BackendSpec::honest()));
     backend.enter(&Symbol::new(name), args, 10_000)
 }
 
@@ -658,7 +664,9 @@ fn a_call_of_the_wrong_arity_is_declined() {
 #[test]
 fn a_recursion_past_the_budget_declines_rather_than_running_it() {
     let (_, unit) = unit(ARITHMETIC);
-    let backend = unit.attach(&ply_eval::BackendSpec::honest());
+    // As `call`: `attach` builds again, under whatever emitter is current.
+    let backend =
+        ply_codegen::c::producer::reference_only(|| unit.attach(&ply_eval::BackendSpec::honest()));
     let ladder = Symbol::new("m.ladder");
     assert_eq!(
         backend.enter(&ladder, &[Value::Int(100)], 8),
@@ -686,7 +694,9 @@ fn an_overflow_declines_rather_than_wrapping() {
 fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
     let (loaded, unit) = unit(ARITHMETIC);
     let other = load(ARITHMETIC);
-    let backend = unit.attach(&ply_eval::BackendSpec::honest());
+    // As `call`: `attach` builds again, under whatever emitter is current.
+    let backend =
+        ply_codegen::c::producer::reference_only(|| unit.attach(&ply_eval::BackendSpec::honest()));
     assert!(backend.describes(loaded.program));
     assert!(!backend.describes(other.program));
 }

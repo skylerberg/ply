@@ -50,11 +50,16 @@ fn kernel() -> (&'static Program, &'static Unit) {
     );
     let check = front.check;
     let ast: &'static Program = Box::leak(Box::new(ast));
-    let unit = Unit::over(
-        ast,
-        Box::leak(Box::new(resolved)),
-        Box::leak(Box::new(check)),
-    )
+    // The port answers the check; the reference emitter still emits, which is the fragment this
+    // kernel is measured against. Without this the installed producer is asked for every body and
+    // answers none, since this source carries no texts.
+    let unit = ply_codegen::c::producer::reference_only(|| {
+        Unit::over(
+            ast,
+            Box::leak(Box::new(resolved)),
+            Box::leak(Box::new(check)),
+        )
+    })
     .expect("this host has a C compiler");
     (ast, unit)
 }
@@ -85,7 +90,9 @@ fn the_whole_kernel_is_inside_the_fragment() {
 #[test]
 fn the_search_answers_through_compiled_code() {
     let (program, unit) = kernel();
-    let backend = unit.attach(&ply_eval::BackendSpec::honest());
+    // `attach` builds again, under whatever emitter is current, and this unit is the reference's.
+    let backend =
+        ply_codegen::c::producer::reference_only(|| unit.attach(&ply_eval::BackendSpec::honest()));
     assert!(backend.describes(program));
     let answer = backend.enter(&Symbol::new("mcts.plan_753"), &[Value::Int(200)], 10_000);
     assert!(
