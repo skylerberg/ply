@@ -5,7 +5,7 @@
 //! The port is entered in-process through `port`: the bundle the binary carries is the compiler
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
 
-use ply_compiler_diff::{golden, port};
+use crate::harness::{golden, port};
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
@@ -91,7 +91,7 @@ fn ply_files(dir: &Path, prefix: &str) -> Vec<(String, String)> {
 fn the_ply_deriver_agrees_with_ply_derive_on_the_hand_written_modules() {
     let text = std::fs::read_to_string(here().join("fixtures/derive-programs.corpus"))
         .expect("the hand-written derive modules");
-    let inputs: Vec<(String, Vec<(String, String)>)> = ply_compiler_diff::bundle(&text)
+    let inputs: Vec<(String, Vec<(String, String)>)> = crate::harness::bundle(&text)
         .into_iter()
         .enumerate()
         .map(|(i, f)| {
