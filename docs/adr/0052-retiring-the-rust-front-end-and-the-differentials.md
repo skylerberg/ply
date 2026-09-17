@@ -104,10 +104,10 @@ the effect rows and atoms, the footprints and schemes, the printer, the
 integer widths and the declaration kinds that were `ply-syntax`'s, and
 the checker's output shape (`CheckOutput` and what it names); it depends
 on `ply-span` alone. `ply-core` re-exports all of it and keeps the
-checker. `ply-hash`, `ply-store` and `ply-host` no longer depend on
-`ply-core`; the runtime, the prover and the test runner read `ply-ty` and
-call `ply-core` only for the checker itself and the prelude's constructor
-table, which move when the port answers them.
+checker. `ply-hash`, `ply-store`, `ply-host` and `ply-test` do not depend on
+`ply-core` at all, and the prelude's tables have since joined `ply-ty`, which
+takes the runtime and the prover off it too. What still calls `ply-core` is the
+checker's two callers, and nothing else.
 
 **Built, 2026-09-16: the message channel.** The port's diagnostics carried
 a code, spans, a label count and a note count; they now carry the
@@ -415,11 +415,14 @@ the port takes over, and `ply-eval` declares the crate without a single
 file naming it. `ply-core` is nearly all vocabulary: nothing outside it
 reads `infer`, `env`, `unify`, `scc` or `derivable`, so the checker's
 internals have no external reader at all, and most of what is written
-`ply_core::` is `ply-ty` wearing the older name. Two real holdings remain
-there, `check_program` itself and `ply_core::prelude`, which six surviving
-crates read for constructor arities and the prelude effects and which
-imports nothing from the parser, so it can move to `ply-ty` whenever it
-suits. `ply-hash`'s consumers almost all want `DefHash`, another `ply-ty`
+`ply_core::` is `ply-ty` wearing the older name. One real holding remains
+there, `check_program` itself. The other was `ply_core::prelude`, which six
+surviving crates read for constructor arities and the prelude effects, and it
+has since moved to `ply-ty`. The reason given here for why it could was wrong
+while its conclusion was right: the prelude did import from the parser —
+`ply_syntax::ast::{Mode, ModuleName}` — but both of those are `ply-ty`'s own
+types that `ply-syntax` re-exports, so the move rewrote one `use` line and
+needed no cycle broken. `ply-hash`'s consumers almost all want `DefHash`, another `ply-ty`
 re-export; `ply-store`'s body reconstruction and `ply test`'s bisection
 renormalizer are the only readers of hasher internals. `ply-syntax` is the
 hard one, and not for its parser: `resolve::Resolved` is threaded through
@@ -499,7 +502,8 @@ artifact path, `Pure` and the interpreter read, and then asks the port for
 everything else, so `ply_core::check_program` and `ply_hash::hash_program` are
 not called on a user's program from there at all. What the four names hold is
 therefore not four deletions but three splits and a crate that cannot leave yet:
-`ply-core` keeps `ty`, `prelude`, `DefInfo` and `Front` while its checker goes;
+`ply-core` keeps nothing of its own — `ty`, `DefInfo` and `Front` were always
+`ply-ty`'s and the prelude has joined them, leaving the checker alone;
 `ply-hash` keeps `DefHash` and the body envelope while its hash-from-tree half
 goes; `ply-derive` expands *inside* `parse_module`, so it leaves with the parser
 at the end rather than first, and the order above is corrected to match; and
@@ -947,6 +951,41 @@ them at the port would move numbers this record depends on without saying so: it
 would report the port's cost under the chain's name. It retires with the chain it
 times, which is the rule the differentials retired under.
 
+**Built, 2026-09-17: the prelude moves to `ply-ty`, and the runtime halves come
+off the checker's crate.** §2 deletes `ply-core`, and the crate was held for two
+unrelated reasons: two calls to `check_program`, and the prelude tables — the ADT
+list, the effect names, the constructor arities — which have nothing to do with
+checking. The second was the larger hold. `ply-eval` and `ply-prove` read
+`ply_core` for the prelude and for nothing else, so a table of constructor
+arities was what kept the runtime and the prover depending on the crate this
+record means to delete.
+
+The move cost one `use` line. `prelude.rs`'s only `crate::` reaches were
+`crate::ty` and `crate::{CtorInfo, EffectInfo, OpInfo}`, every one of them
+`ply-ty`'s own, so inside `ply-ty` those paths resolve unchanged. Its single
+outward reach was `ply_syntax::ast::{Mode, ModuleName}` — and `ModuleName` is
+defined in `ply-ty`'s `decl.rs` and `Mode` in its `ty.rs`, so the parser crate was
+re-exporting `ply-ty`'s own types back at it. There was no cycle to break, only an
+import pointing the long way round. `prelude_arity` stays with the checker,
+because it delegates to `infer::prelude_arity`, which is the checker.
+
+**What came off, stated as two different things.** `ply-eval` and `ply-prove` no
+longer declare `ply-core`; `ply-hash`, `ply-store`, `ply-host` and `ply-test`
+never did. Their *test* crates still do — `ply-eval-tests` and `ply-prove-tests`
+call `check_program` and `check_module` at ten sites between them to check their
+fixtures — so the edge is gone from the runtime halves and alive as a
+dev-dependency. Those are different claims and this says both, because "`ply-eval`
+no longer depends on `ply-core`" on its own would be false of the package.
+
+The readers in `ply-codegen`, `ply-cli` and the test crates were deliberately left
+pointing at `ply_core::prelude`: the crate's `pub use ply_ty::*` re-exports the
+moved module, so they keep resolving, and re-pointing them would churn three more
+crates to prove a point §2 will settle by deleting the name outright. That the
+glob carries a `pub mod`, and that `crate::prelude` still resolves from a sibling
+module through a root-level `use`, were both things this record believed; a
+throwaway two-crate workspace settled them before the change was written, and the
+nine-package check confirmed it against the tree.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -1010,7 +1049,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s and 153 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s and 150 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 

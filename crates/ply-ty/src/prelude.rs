@@ -1,10 +1,11 @@
 //! The effects the language declares rather than a module.
 
+use crate::decl::ModuleName;
+use crate::ty::Mode;
 use crate::ty::{EffectAtom, Resource, Row, RowVar, Scheme, TyVar, Type};
 use crate::{CtorInfo, EffectInfo, OpInfo};
 use indexmap::IndexMap;
 use ply_span::{Span, Symbol};
-use ply_syntax::ast::{Mode, ModuleName};
 use std::collections::BTreeSet;
 
 pub const TASK: &str = "task";

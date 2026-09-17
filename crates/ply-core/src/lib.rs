@@ -1,7 +1,6 @@
 pub mod derivable;
 pub mod env;
 pub mod infer;
-pub mod prelude;
 pub mod scc;
 pub mod unify;
 
