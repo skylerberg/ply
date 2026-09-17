@@ -1233,6 +1233,43 @@ restated as a number: nothing here touched the object model.
 What remains is held by three things this record names and defers: the emitter, the
 object model, and the harnesses that time the chain.
 
+**Built, 2026-09-17: `verify` sees the member it could not see, and the count
+says what it counts.** This record described the gap twice and fixed it neither
+time, which is the ritual `CLAUDE.md` warns about standing in for the rigour.
+
+`members()` reads the workspace list with a `"crates/NAME"` pattern and returns
+thirty-one of the thirty-two members; the one it never saw is
+`benches/value-model/ply-arm`. The pattern stays, because four checks below it are
+`crates/`-shaped -- the `-tests` loop reading `crates/$member/src` and its
+`[profile.dev.package]` override, the accident sweep walking `crates/*/`, the
+`KNOWN_OUTSIDE` validation, and `check_test_exists`. Widening it would feed a
+member from elsewhere into loops that then demand a `src/` and an override which
+must not exist, turning a narrow gap into a failing guard. So this adds a second
+reader over the same block and leaves the first alone.
+
+**What it asserts is the coverage that actually exists.** No partition names a
+member outside `crates/`, and nothing below `members()` is shaped for one. What
+keeps the arm compiling is the workspace-wide lint leg -- which the root manifest
+already argues for in its own comment: the arm is a member rather than a workspace
+of its own so that `cargo clippy --workspace --all-targets` and `cargo fmt --all`
+keep it building when `ply-codegen`'s surface moves, and "outside, it would rot
+until somebody ran the gate by hand". The workflow header then records that `fmt`
+and `clippy` deliberately do *not* gate the expensive jobs and that the `ci`
+aggregate is where lint is required. So that one `needs` entry is the whole of the
+coverage for a member no partition mentions, and nothing checked it was still
+there.
+
+**The guard was watched to go red**, which is what this file asks of its own
+checks -- the probe check records being watched to fail on 2026-08-30 by naming a
+wrong directory. Against the workflow as it stands the predicate finds
+`--workspace --all-targets` and passes; against a copy with that string removed it
+fails. A check that cannot fail proves nothing, and the version of this fix that
+merely counted members would have been exactly that.
+
+And the summary line now reports members under `crates/` plus however many sit
+outside, rather than calling the first number "workspace members". That was the
+smaller half of the defect and the one a reader would have believed.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -1296,7 +1333,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s and 143 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s and 145 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 

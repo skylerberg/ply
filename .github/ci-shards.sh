@@ -272,6 +272,16 @@ members() {
   printf '%s\n' "$found"
 }
 
+# Workspace members that do not live under `crates/`, read out of the same block.
+# `members` deliberately returns only the `crates/` ones; nothing below it is
+# shaped for a member elsewhere, so they are checked separately rather than by
+# widening that pattern.
+members_outside_crates() {
+  sed -n '/^members = \[/,/^]/p' "$root/Cargo.toml" |
+    sed -n 's#.*"\([^"]*\)".*#\1#p' |
+    grep -v '^crates/' || true
+}
+
 # Whether a `package target test` triple names a test that exists; prints the problem otherwise.
 check_test_exists() {
   local what=$1 package=$2 target=$3 test=$4 leaf file
@@ -303,6 +313,7 @@ cmd_verify() {
   if ! members >/dev/null; then
     return 1
   fi
+  local workflow_early="$root/.github/workflows/ci.yml"
   local -a all_members=()
   while read -r member; do all_members+=("$member"); done < <(members)
 
@@ -362,6 +373,27 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
+
+  # --- members outside `crates/` --------------------------------------------
+  #
+  # Nothing below `members` is shaped for one, and no partition names one, so what
+  # keeps such a member compiling is a workspace-wide lint leg. The workflow header
+  # records that lint does not gate the expensive jobs and that the `ci` aggregate
+  # is where it is required -- so that `needs` entry is the whole of the coverage,
+  # and this is the check that it is still there.
+  local outside
+  while read -r outside; do
+    [[ -n $outside ]] || continue
+    if [[ ! -f "$root/$outside/Cargo.toml" ]]; then
+      echo "FAIL: the workspace names '$outside', which has no Cargo.toml" >&2
+      failures=$((failures + 1))
+      continue
+    fi
+    if ! grep -q -- "--workspace --all-targets" "$workflow_early"; then
+      echo "FAIL: '$outside' is a member outside crates/, and no job runs '--workspace --all-targets', so nothing in CI compiles it" >&2
+      failures=$((failures + 1))
+    fi
+  done < <(members_outside_crates)
 
   # --- tests named by a table ----------------------------------------------
   while read -r package target test; do
@@ -466,7 +498,7 @@ cmd_verify() {
     echo "$failures problem(s) in the CI tables" >&2
     return 1
   fi
-  echo "${#all_members[@]} workspace members; ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#SOLO[@]} solo tests, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $PARTITIONS partitions"
+  echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#SOLO[@]} solo tests, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $PARTITIONS partitions"
 }
 
 case "${1:-}" in
