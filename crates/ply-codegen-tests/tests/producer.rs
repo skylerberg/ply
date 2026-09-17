@@ -150,7 +150,7 @@ static MODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn built_and_checked() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", PROGRAM)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -250,7 +250,7 @@ fn guarded(n: Int) -> Int =
 #[test]
 fn the_chain_entered_whole_carries_handlers_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", EFFECTS)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -344,7 +344,7 @@ fn lonely(n: Int) -> Int / {orphan.write} = orphan.poke(n)
 #[test]
 fn a_performer_keeps_compiling_when_its_handler_is_dropped() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", DROPPED)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -407,7 +407,7 @@ impl ply_eval::HostHandler for Doubler {
 #[test]
 fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", HOSTED)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -518,7 +518,7 @@ fn ordered(a: Int, b: Int) -> Bool = decimal_of_int(a) < decimal_of_int(b)
 #[test]
 fn the_chain_entered_whole_holds_float_and_decimal_literals_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", NUMERIC)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -609,7 +609,7 @@ fn racing(n: Int) -> Int =
 #[test]
 fn the_chain_entered_whole_schedules_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", SIMULATED)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -733,7 +733,7 @@ fn mixed(seed: Int) -> Int =
 #[test]
 fn the_chain_entered_whole_resumes_off_the_tail_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", RESUMED)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -852,7 +852,7 @@ fn across(seed: Int) -> Int =
 #[test]
 fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", MULTISHOT)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -970,7 +970,7 @@ impl ply_eval::HostRuntime for Reactor {
 #[test]
 fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", PRODUCTION)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -1096,7 +1096,7 @@ law "zero moves nothing" forall (account: Account) where account.balance > 0 {
 #[allow(clippy::arc_with_non_send_sync)]
 fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
-    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("m", PROPOSITIONS)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
