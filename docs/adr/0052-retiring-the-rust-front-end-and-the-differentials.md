@@ -1217,6 +1217,14 @@ still works rather than that the fallback does. The fallback's own demonstration
 is the one above: run against the cold merge with the first lookup removed, the
 old script finds nothing and this one returns main's archive and its binary.
 
+Two merges later the bound is close, and nothing in the tree explains it.
+`3de13147` moved a doc comment and this record and nothing else, so its test
+code is `ac5876c1`'s exactly -- and the two ran 151 s and 178 s, both warm, both
+taking the archive. Every job grew with it, partition 6/8 from 87 s to 126 s and
+`bootstrap` from 58 s to 86 s, which is the machine rather than the tree. So the
+headroom at 180 s is about two seconds on a bad draw, and the next reading over
+it may have no change to blame.
+
 **Read, 2026-09-17: where §2 ends, and why it is not the bundle migration.**
 This record has said, more than once, that the seed path cannot go before a
 textual migration of an unserved bundle exists. That is true and it is not the
@@ -1427,39 +1435,50 @@ saw the shape and stopped at the fact -- `prelude_arity` stays with the checker
 -- without the consequence, which is that one test stays with it until one of
 those two moves is made.
 
-**`ply-test-tests` cannot go either, and the third reason is a correspondence.**
+**`ply-test-tests` cannot go either, and the third reason is the producer.**
 Its seven sites migrate cleanly under the rule above -- three keep the names they
 gave `from_dotted`, four keep the empty name -- and `ply-test`'s own obligation
 API is indifferent to which, because it takes its names from `check.defs.keys()`
 and looks them up in `hashes.defs`, both from the same front end. That is not
 where it breaks.
 
-An earlier draft of this entry said the hasher was where, and that was wrong.
-`hash_program`'s check parameter is `_check`: unused, delegating to
-`hash_program_ast(program, resolved)`, because a hash is a function of resolved
-source structure alone. Handing it the port's check changes nothing it computes,
-so no hash moves and the store's keys are not what failed.
+Two mechanisms were named here and withdrawn, and they are kept because the
+third guess is cheaper to write than to check. The first was the hasher:
+`hash_program`'s check parameter is `_check`, unused, delegating to
+`hash_program_ast(program, resolved)`, so handing it the port's check changes
+nothing it computes. The second was an ordering divergence between
+`CheckOutput::tests` and `hashes.tests`, which the shared walk and
+`read_front`'s dense-and-ascending requirement already rule out.
 
-The *symptom* is a pairing. `TestInfo::index` is the position in
-`CheckOutput::tests`, `hashes.tests` is built by the AST walk, and
-`unit/runner.rs` reads the two together by index -- so `check.tests[i]` ceasing
-to name `hashes.tests[i]` is what `a_warm_cache_selects_nothing` selecting three
-looks like, and what a ran-to-skipped count of `(0, 4)` where `(4, 0)` was
-expected looks like.
+A third is struck off by measurement rather than argument. Over
+`unit/runner.rs`'s own fixture the port and the checker agree exactly: the same
+three `TestInfo` values, name for name, key for key, index, `nondet`, footprint
+and span, the same three test hashes byte for byte, and no diagnostics at all.
+Whatever breaks this crate, it is not the port's answer, so the pairing an
+earlier draft of this entry blamed is not where it goes wrong either.
 
-The obvious cause of that is an ordering divergence, and the evidence is against
-it. The checker appends `index: self.tests.len()` as it walks modules and their
-items. `front.ply` emits `map(range(0, len(c.tests)), ...)`, pairing each test
-with a name span from `test_name_spans`, which folds the same modules in the same
-order; so both lists are indexed by one walk, and `read_front` rejects a sequence
-that is not dense and ascending in any case.
+What breaks it is installing the producer at all. With no `front` call and no
+guards, adding `producer::ensure_default()` to the fixture's `compile` turns
+`(3, 0)` into `(0, 3)`; take that one line away and the test passes. The
+failures are `E0502`, "neither front end holds a body for `test#0`" -- an empty
+tier on the *first* run, not a cache miss on the second, which is what the
+ran-to-skipped counts were really showing.
 
-So this entry says what the failure is *not*: not the hasher, and not, on this
-evidence, the order of `CheckOutput::tests`. What it is has not been established.
-Two mechanisms have now been named here and withdrawn -- which is the note worth
-keeping, because the third guess is cheaper to write than to check. The attempt
-stays withdrawn whole rather than halved until the cause is found rather than
-named.
+The tier is empty because of *where* it is built. `RECIPE` and `IDENTITY` are
+`OnceLock`s, so an installation is process-wide, while `MINE`, `BUILDING`,
+`REFERENCE_ONLY` and `HANDED` are thread-locals. `execute_group` puts every
+group through `rayon::broadcast`, so `Executor::worker` -- and the `attach` that
+builds the unit -- runs on pool threads. Instrumented, the guard reads `ref` on
+the test thread and `ply` on all three workers at the same moment. So
+`reference_only` at the call site cannot reach the emitter that answers, and a
+handover could not either: both are per-thread by construction, and that is the
+difference from `ply-codegen-tests`, whose bodies attach on the thread that
+guards them.
+
+That leaves three ways out, and this record does not pick one: make the
+reference switch process-wide, teach the port to emit what this fixture needs,
+or give the harness its check without installing a producer. Until one of them
+exists the attempt stays withdrawn whole rather than halved.
 
 **Built, 2026-09-17: `verify` sees the member it could not see, and the count
 says what it counts.** This record described the gap twice and fixed it neither
