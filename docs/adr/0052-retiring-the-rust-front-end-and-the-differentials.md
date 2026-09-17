@@ -393,9 +393,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s and
-142 s, each reusing by tree the same way and for the same reason. Four
-running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s and 168 s, each reusing by tree the same way and for the same reason. The last is twelve seconds under the bound and the trend is the wrong way: the build legs are seconds, so what grew is the test partitions, 96–110 s where they were 75–80 s four merges ago. Five running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
