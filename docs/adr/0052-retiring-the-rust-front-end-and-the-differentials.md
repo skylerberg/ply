@@ -1466,6 +1466,32 @@ producer to use. That reaches `reference_only`, `reset_thread` and every
 dependency on `ply-core`, and it is an architecture decision rather than a
 deletion -- which is why this record names it instead of attempting it twice.
 
+**Built, 2026-09-17: a producer can be handed over, and `ply-core` leaves every
+build path.** The entry above called this an architecture decision rather than a
+deletion, and named what it would take. This is the decision.
+
+`with_producer(p, identity, f)` hands an emitter over for the duration of a call.
+`with_current` consults it **before** the `BUILDING` and `REFERENCE_ONLY` guards,
+so a nested ask gets the emitter supplied rather than falling back to the
+reference -- which is what made a two-stage build impossible. `mode()` answers
+`"ply"` under it, and `identity()` answers the handed digest, so a body emitted
+here is filed under the emitter that emitted it rather than the one being built.
+That last part is the whole of the cache question the previous entry left open:
+the key is `\0ply\0<identity>`, and the override moves what `identity` means.
+
+So `build_from` no longer has a reference arm. Sources with no bundle -- a working
+copy, which `PLY_C_EMITTER=ply:<dir>` names before one is bootstrapped for it --
+are stood up by the **committed** emitter this binary carries, handed over while
+the front end answers and the bodies are emitted. `front_end` takes its check and
+its hashes from it. The comment that used to sit there, that the port cannot
+answer for the program it is compiled from, was true of the emitter being built
+and not of the one already in hand.
+
+`ply-core` now has **no production dependent at all**. Eleven test crates still
+declare it, for fixtures they check with `check_program`; that is the next piece
+and it is a different one, because routing those through the port costs an emitter
+build per test process under nextest, which trades §2 against §3.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -1529,7 +1555,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s, 153 s, 199 s, 381 s, 139 s and 168 s, each reusing by tree the same way and for the same reason. Seven of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, the sixth 199 s and the seventh 381 s, which the entries closing this section take. None of those five was caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s, 153 s, 199 s, 381 s, 139 s, 168 s and 167 s, each reusing by tree the same way and for the same reason. Seven of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, the sixth 199 s and the seventh 381 s, which the entries closing this section take. None of those five was caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
