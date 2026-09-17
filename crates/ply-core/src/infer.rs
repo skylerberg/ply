@@ -1258,6 +1258,10 @@ impl<'a> Checker<'a> {
                 mono(vec![Type::string()], Type::option(Type::decimal())),
             ),
             (
+                "float_of_string",
+                mono(vec![Type::string()], Type::option(Type::float())),
+            ),
+            (
                 "decimal_to_string",
                 mono(vec![Type::decimal()], Type::string()),
             ),

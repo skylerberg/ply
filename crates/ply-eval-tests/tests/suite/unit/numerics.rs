@@ -383,6 +383,74 @@ fn the_float_bit_pattern_round_trips_every_value_including_nan() {
     );
 }
 
+/// What the lexer makes of `text` written as a literal — taken from the lexer itself, so that the
+/// agreement below is against the parse a program's own literals go through and not against
+/// Rust's parser called twice.
+#[track_caller]
+fn lexed_float(text: &str) -> f64 {
+    let (tokens, diags) = ply_syntax::lexer::lex(ply_span::SourceId(0), text);
+    assert!(diags.is_empty(), "`{text}` does not lex: {diags:#?}");
+    match tokens.first().map(|t| &t.kind) {
+        Some(ply_syntax::lexer::TokenKind::Float(v)) => *v,
+        other => panic!("`{text}` does not lex as a float literal: {other:?}"),
+    }
+}
+
+/// **The parse a front end carrying a literal's text needs.** The lexer hands the literal's digits
+/// to Rust's parser and the hasher writes `f.to_bits()`, so a front end that has the text and not
+/// the value hashes a float literal correctly exactly when this builtin is that same parse —
+/// including where the route through `Decimal` cannot follow.
+#[test]
+fn float_of_string_is_the_parse_the_lexer_makes_of_the_same_literal() {
+    for text in [
+        "1.5", "0.1", "1e9", "2.5e-1", "1_000.5", "1.0e-30", "1.0e300", "1e400",
+    ] {
+        let read = ok(callv(
+            "bits_of_float",
+            vec![unwrap_some(callv("float_of_string", vec![string(text)]))],
+        ));
+        let literal = ok(callv("bits_of_float", vec![float(lexed_float(text))]));
+        assert_eq!(read, literal, "`{text}`");
+    }
+
+    // Two spellings the lexer reads as something other than one float literal, which the builtin
+    // still reads as the number: an integer, as `decimal_of_string("0")` reads one, and a sign.
+    assert_eq!(
+        ok_float(unwrap_some(callv("float_of_string", vec![string("1")]))),
+        1.0
+    );
+    assert_eq!(
+        ok_float(unwrap_some(callv("float_of_string", vec![string("-2.5")]))),
+        -2.5
+    );
+
+    // The two extremes are ordinary `Float`s and have no `Decimal` between them and their text,
+    // which is why this is a builtin rather than two calls.
+    for f in [1.0e-30, 1.0e300] {
+        assert_eq!(
+            ok(callv("decimal_of_float", vec![float(f)])),
+            Value::ctor("None", Vec::new()),
+            "{f} has no Decimal"
+        );
+    }
+}
+
+/// What no literal spells is absent rather than guessed — `inf` and `NaN` above all, which Rust's
+/// `f64::from_str` accepts and Ply has no way to write.
+#[test]
+fn float_of_string_answers_none_rather_than_guessing() {
+    for text in [
+        "", "abc", "inf", "-inf", "infinity", "NaN", "nan", "1.", ".5", "1e", "1e+", "1.2.3",
+        "0x10", " 1.5", "1,5", "1.5f",
+    ] {
+        assert_eq!(
+            ok(callv("float_of_string", vec![string(text)])),
+            Value::ctor("None", Vec::new()),
+            "`{text}` is not a float literal"
+        );
+    }
+}
+
 #[test]
 fn the_int_and_float_conversions_are_total_where_they_claim_to_be() {
     assert_eq!(ok_decimal(callv("decimal_of_int", vec![int(-7)])), d(-7, 0));

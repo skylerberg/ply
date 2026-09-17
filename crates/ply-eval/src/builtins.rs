@@ -131,6 +131,9 @@ pub enum Builtin {
     FloatOfDecimal,
     DecimalOfFloat,
     DecimalOfString,
+    /// The lexer's own float parse, over text: what a front end carrying a literal's text needs
+    /// to reach the `Float` that literal denotes, which no route through `Decimal` reaches.
+    FloatOfString,
     DecimalToString,
     /// The IEEE 754 bit pattern, as the signed 64-bit `Int` it fits in.
     BitsOfFloat,
@@ -232,6 +235,7 @@ impl Builtin {
             "float_of_decimal" => Builtin::FloatOfDecimal,
             "decimal_of_float" => Builtin::DecimalOfFloat,
             "decimal_of_string" => Builtin::DecimalOfString,
+            "float_of_string" => Builtin::FloatOfString,
             "decimal_to_string" => Builtin::DecimalToString,
             "bits_of_float" => Builtin::BitsOfFloat,
             "float_of_bits" => Builtin::FloatOfBits,
@@ -336,6 +340,7 @@ impl Builtin {
             Builtin::FloatOfDecimal => "float_of_decimal",
             Builtin::DecimalOfFloat => "decimal_of_float",
             Builtin::DecimalOfString => "decimal_of_string",
+            Builtin::FloatOfString => "float_of_string",
             Builtin::DecimalToString => "decimal_to_string",
             Builtin::BitsOfFloat => "bits_of_float",
             Builtin::FloatOfBits => "float_of_bits",
@@ -379,6 +384,7 @@ impl Builtin {
             | Builtin::FloatOfDecimal
             | Builtin::DecimalOfFloat
             | Builtin::DecimalOfString
+            | Builtin::FloatOfString
             | Builtin::DecimalToString
             | Builtin::BitsOfFloat
             | Builtin::FloatOfBits
@@ -595,6 +601,7 @@ impl Builtin {
             Builtin::FloatOfDecimal,
             Builtin::DecimalOfFloat,
             Builtin::DecimalOfString,
+            Builtin::FloatOfString,
             Builtin::DecimalToString,
             Builtin::BitsOfFloat,
             Builtin::FloatOfBits,
@@ -1310,6 +1317,11 @@ fn call_with(
             Ok(Step::Done(option(parse_decimal(s).map(Value::Decimal))))
         }
 
+        Builtin::FloatOfString => {
+            let s = args[0].as_str(span, "`float_of_string`")?;
+            Ok(Step::Done(option(parse_float(s).map(Value::Float))))
+        }
+
         // Round-trips `decimal_of_string` exactly, scale included: `1.50m` renders `1.50`, because
         // the trailing zero is what the value carries.
         Builtin::DecimalToString => {
@@ -1463,6 +1475,42 @@ fn parse_decimal(text: &str) -> Option<Decimal> {
     } else {
         Decimal::from_str_exact(text).ok()
     }
+}
+
+/// The lexer's float grammar, over text: digits, an optional `.` fraction, an optional `e`
+/// exponent, an `_` anywhere `ply_syntax`'s lexer would drop one, and a leading sign no literal
+/// can spell but a caller can pass, as `decimal_of_string` takes one. **Anything else is `None`**
+/// — an empty text, `inf`, `NaN`, `1.`, `.5`, a hex spelling, a stray space — although Rust's
+/// `f64::from_str` accepts several of them: a builtin that answered where no literal could be
+/// written would be a second float grammar for the language to keep in step with the first.
+///
+/// What the grammar admits always parses, so `None` means exactly "not a literal's spelling".
+/// `f64::from_str` is correctly rounded and saturates to an infinity rather than failing — which
+/// is what the lexer relies on — so `1e400` is `Some` of an infinity where `decimal_of_string`
+/// has nothing to answer at all. `"1"` is `Some(1.0)` though the lexer reads that spelling as an
+/// `Int`: the question here is what number the text denotes, which is the question
+/// `decimal_of_string("0")` answers too.
+fn parse_float(text: &str) -> Option<f64> {
+    let body = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let (mantissa, exponent) = match body.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e)),
+        None => (body, None),
+    };
+    let (whole, fraction) = match mantissa.split_once('.') {
+        Some((w, f)) => (w, Some(f)),
+        None => (mantissa, None),
+    };
+    let digits = |s: &str| {
+        s.starts_with(|c: char| c.is_ascii_digit())
+            && s.bytes().all(|b| b.is_ascii_digit() || b == b'_')
+    };
+    if !digits(whole)
+        || fraction.is_some_and(|f| !digits(f))
+        || exponent.is_some_and(|e| !digits(e.strip_prefix(['+', '-']).unwrap_or(e)))
+    {
+        return None;
+    }
+    text.replace('_', "").parse().ok()
 }
 
 /// Resumes a higher-order builtin: `answer` is what the user code the frame was waiting on
