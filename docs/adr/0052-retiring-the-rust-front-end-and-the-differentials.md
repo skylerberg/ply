@@ -1570,7 +1570,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s, 153 s, 199 s, 381 s, 139 s, 168 s, 167 s and 211 s, each reusing by tree the same way and for the same reason. Eight of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, the sixth 199 s, the seventh 381 s and the eighth 211 s, which the entries closing this section take. None of those six was caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s, 153 s, 199 s, 381 s, 139 s, 168 s, 167 s, 211 s, 219 s, 193 s and 167 s, each reusing by tree the same way and for the same reason. Ten of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, the sixth 199 s, the seventh 381 s and the eighth 211 s, which the entries closing this section take. None of those six was caused by the tree. The ninth and tenth, 219 s and 193 s, were: they are the handover's own cost, and the two entries closing this section take them together with the reading that placed it. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
@@ -1805,6 +1805,27 @@ test`'s store at a scratch directory and never reaches the C unit cache.
 The work did not appear -- it moved to the implementation this record exists to
 reach. So this is a cost to place, not a regression to revert, and by §3's own
 rule placing it is the next item before any other.
+
+**Read, 2026-09-17: the cost is placed, and the bound is back.** A working copy
+holding the sources the bundle was emitted from *is* that bundle, which the
+fixpoint test already asserts by comparing `sources_digest()` against
+`digest_of` over those modules. So `from_committed` hands the carried native
+back rather than emitting the same unit again. The four fixtures read 0.169 s,
+0.199 s, 0.220 s and 0.254 s, where two of them had read 86.339 s and 99.104 s.
+That is faster than the 6.628 s and 8.468 s they cost *before* the handover,
+and for a reason worth keeping: the early return is taken ahead of
+`front_end`, so it skips the emission and the front end both, where the old
+path still ran a Rust front end over every definition to emit on demand. Main
+read 219 s, then 193 s on the record-only merge that changed no code, then
+**167 s**, the longest job falling from 171 s to 131 s.
+
+What it gives up is written down because it would not be rediscovered
+otherwise. `from_committed`'s own plumbing -- `with_producer`, `HANDED`, and the
+`texts` whose absence took three red runs to find -- now runs only when a
+working copy differs from the bundle, which is the first pull request of an
+emitter change and not every one. `test bootstrap` does not stand in for it: it
+emits the same unit through a `build_from` of its own and never enters this one.
+That is the right place for the exercise, and it is less of it.
 
 **Why each of these got written at all.** The scripts that append a reading assert
 `wall < 173`; an over-bound one fails them and takes a different entry point that
