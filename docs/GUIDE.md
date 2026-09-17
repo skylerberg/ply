@@ -3034,10 +3034,12 @@ $ ply build . --diff old.plyx       # added, changed, dropped, unchanged
 $ ply run app.plyx --host           # run it out of its own definitions
 ```
 
-`--sources` embeds the project's source text so a diagnostic raised in production
-carries a line number. It is off, and a flag, because it is a disclosure
-decision — and it changes the digest, so "was this built with sources" is
-answerable from the digest alone.
+An artifact always carries the project's source text, covered by its digest, and
+it is opened from that text: a diagnostic raised in production carries a line
+number, and the sources are re-checked and re-hashed on open, so they cannot be a
+different program than the digest names. The disclosure is not optional — whoever
+receives the artifact receives the sources — which is the price of a deployed
+failure that can be located.
 
 An artifact always carries the compiled unit the Ply emitter produced over its
 definitions — the C and the record the runtime rebuilds its tables from — so
@@ -3141,8 +3143,8 @@ prove and simulation flags, `--json`. §11.6.
 
 ### `ply build [path]`
 
-`--entry NAME`, `-o FILE`, `--config-schema`, `--db-schema`, `--sources`,
-`--digest`, `--diff OLD.plyx`, `--json`. §16.
+`--entry NAME`, `-o FILE`, `--config-schema`, `--db-schema`, `--digest`,
+`--diff OLD.plyx`, `--json`. §16.
 
 ### `ply hosts [path]`
 

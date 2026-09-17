@@ -37,7 +37,7 @@ pub fn execute(args: &BuildArgs, style: Style) -> i32 {
             Err(diagnostic) => return refuse(&loaded.sources, diagnostic, args.json, style),
         }
     }
-    let built = match artifact::build(&loaded, entry, &startup, args.sources) {
+    let built = match artifact::build(&loaded, entry, &startup) {
         Ok(built) => built,
         Err(diagnostics) => {
             return refuse_all(&loaded.sources, &diagnostics, args.json, style);
@@ -84,7 +84,7 @@ pub fn execute(args: &BuildArgs, style: Style) -> i32 {
             "format": artifact::ARTIFACT_FORMAT,
             "definitions": built.artifact.bodies.len(),
             "names": built.artifact.names.len(),
-            "sources": built.artifact.has_sources(),
+            "sources": built.artifact.sources.len(),
             "unit": built.artifact.has_unit(),
             "artifact_bytes": bytes.len(),
             "binary_bytes": binary_bytes(),
@@ -139,14 +139,12 @@ pub fn execute(args: &BuildArgs, style: Style) -> i32 {
                 .join(" · ")
         ),
     }
-    if built.artifact.has_sources() {
-        println!(
-            "{IND}{} {} {} embedded",
-            style.bold("sources"),
-            built.artifact.sources.len(),
-            plural(built.artifact.sources.len(), "file"),
-        );
-    }
+    println!(
+        "{IND}{} {} {} embedded",
+        style.bold("sources"),
+        built.artifact.sources.len(),
+        plural(built.artifact.sources.len(), "file"),
+    );
     EXIT_OK
 }
 
