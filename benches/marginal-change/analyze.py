@@ -150,7 +150,7 @@ if process:
                          if k != "total"
                      )
                      + ")"
-                     f"   rechecked {fe['rechecked']}, cached {fe['cached']}")
+                     ("   rechecked %s, cached %s" % (fe["rechecked"], fe["cached"]) if "rechecked" in fe else ""))
         print(line)
     fits = [(definitions(r["size"]), r["warm_front_end"]["phases"]["total"])
             for r in process if r.get("warm_front_end")]
