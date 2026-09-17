@@ -465,12 +465,22 @@ it, and the checker's call-graph seeding calls it once for every function
 definition and again for every edge out of one, against `names`, which
 holds every qualified function name in the program. The list it scans is
 itself built by pushing each name after a `contains_bytes` over what is
-already there, so it is quadratic before anything reads it, and
-`hash.position_bytes` is the same fold without even the early answer. That
-is the term the curve shows and the profile hides, because its cost lands
-in `list::get`, `heap::inc` and `raw_alloc` rather than in a body of its
-own. A name index built once, which the port already has the map for, is
-the first thing to try, with the marginal-change bench either side of it.
+already there, so it is quadratic before anything reads it. That is the
+term the curve shows and the profile hides, because its cost lands in
+`list::get`, `heap::inc` and `raw_alloc` rather than in a body of its own.
+
+`hash.ply` holds a fold of the same shape and it is **not** the same
+finding: it scans the deduplicated encodings of one cyclic component,
+which is small, not a list the size of the program. Saying the two
+together, as an earlier draft of this paragraph did, overstates what was
+found. The checker's is the quadratic; the hasher's is a scan.
+
+A name index built once is the first thing to try, and it is a small
+change rather than a new mechanism: the port already keys maps by `Bytes`
+throughout `front.ply`, and `map_new`, `map_insert` and `map_get` are used
+in the hundreds across its sources. The same accumulate-then-test idiom
+appears elsewhere in `infer.ply`, which is a candidate and not yet a
+finding, since nothing has measured those. The bench goes either side.
 
 The lesson for the instrument is worth keeping: a flat profile is evidence
 about where time goes, not about whether an algorithm is quadratic, and
