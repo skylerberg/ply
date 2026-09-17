@@ -847,6 +847,54 @@ caller in `ply-cli-tests` beside the corpus bench's. So the Rust arm keeps a
 constituency, the hasher is not unblocked by this, and what this buys is one
 fewer front end derived per harness rather than a door closed.
 
+**Read, 2026-09-17: the three things §2 promised about the bundle, said.** The
+paragraph above says this record *says* how a fresh clone builds the language,
+how a broken or unserved bundle is recovered with no Rust emitter, and how a
+helper-table or layout change is carried across. It had not said any of them.
+
+**Two artifacts, not one, and conflating them is the easy mistake.**
+`crates/ply-compiler/bootstrap/` holds `unit.c.gz` and `SOURCES.digest` — the
+emitter's own unit, 2.3 MB compressed — and that is what builds the *emitter*
+without a Rust emitter. `ply bootstrap --out <dir>` writes `frontend.c` and
+`manifest.json` — the *front end* emitted as standalone C — and that is what
+answers "what does a fresh clone read the language with" for someone who does not
+have this repository's Rust driver. Its own module doc argues the case: keeping
+the Rust front end is not dropping it, and committing a built object is a binary
+per platform per version in the history, while C is text, it diffs, it needs only
+a C compiler, and git already archives every version of it.
+
+**The emitter, from the bundle.** `bundle::build` unpacks the gzip and calls
+`load_unit(text, None, "bootstrap")`, which compiles and loads the unit against
+the tables it carries rather than against any program's: the runtime helper
+table, the constructor table its tags are positions in, its functions and their
+arities all travel inside the C, so **no source is parsed** and the modules are
+numbered from zero. Underneath, `compile_and_load` writes `unit.c`, runs the C
+compiler with `-fPIC -shared -fno-strict-aliasing`, and moves the object into a
+cache keyed on the source by a rename — which is what makes two workers
+compiling the same unit at once safe, since both write the same bytes.
+
+**The archive is gated, not aspirational.** Two solo rows run it on every push:
+one writes an archive and checks `--verify` accepts it, the other adds a
+definition and checks `--verify` refuses. Two digests, because they answer
+different questions — the source digest is over every definition's content hash
+and names *which* front end this is; the artifact digest is over the C and says
+whether this file is the one that version produces.
+
+**Recovery, and where it stops.** A unit binds helpers by position and reads no
+further, so it serves any runtime whose table *starts with* its own: an appended
+helper leaves every older bundle serving, and history plus the fixpoint's refresh
+is a real recovery. ADR 0050 §1a records the precedent — `list_set`'s refresh was
+the first to start from a bundle emitted against an older table. A helper
+*changed or removed* is the other case, and `Exports::unserved` names the first
+position that differs. There the recovery is a textual migration of the bundle,
+and that migration does not exist yet: today `build_from` falls back to
+`from_reference()`, the Rust chain, which ADR 0050 §1a chose deliberately — "the
+producer and the fixpoint test build the emitter with the reference on it". So
+the seed path is load-bearing for exactly this case, and §2 cannot delete it
+before the migration is built. So the order §2 gives — the bundle becomes the
+only way, then the Rust emitter goes — has a step inside it that this record had
+not named: the migration comes first, or the seed path stays.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -910,7 +958,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s and 142 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s and 138 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
