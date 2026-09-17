@@ -5,7 +5,7 @@
 //! The port is entered in-process through `port`: the bundle the binary carries is the compiler
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
 
-use ply_compiler_diff::{bundle, golden, port, records};
+use crate::harness::{bundle, golden, port, records};
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
