@@ -1074,6 +1074,59 @@ So the coverage is real and the accounting is blind, which is the smaller defect
 and still a defect: the guard cannot say what it claims to say. Per §"Do not state
 a guarantee you have not armed": **not enforced.**
 
+**Built, 2026-09-17: the differential crate's dead edges, and the arm scripts
+that lost their tests.** Two unrelated pieces of staleness in one crate, both left
+by earlier merges in this record.
+
+`ply-compiler-diff` declared `ply-core` and `ply-hash` and used neither. The
+reference dumpers went with the dead-oracle sweep and `stage.rs` stopped calling
+`check_program` and `hash_program` when it moved onto the port. Both edges are
+dropped. The check behind that claim is worth naming, because the first attempt at
+it lied: `grep --include=*.rs` written unquoted lets the shell expand the glob
+before grep sees it, and the filter silently stops filtering -- the output arrived
+full of `.sh` files and would have read as proof the crate was clean. Quoted, over
+the whole crate including its tests and the `refdump` bin, the count is zero.
+
+The same promotion left a third thing behind. `ca0a0ccf` moved this crate into the
+workspace, which made its own `Cargo.lock` inert -- cargo resolves a member from
+the root lockfile -- and the file stayed, still naming the two dependencies dropped
+here. It is deleted. The two other nested lockfiles, under `benches/value-model/`,
+are deliberately left: those crates sit outside the workspace, so theirs are the
+lockfiles cargo actually reads.
+
+The five arm scripts are the second. `arm-derive`, `arm-resolve`, `arm-rewrite`,
+`arm-hash` and `arm-infer` are mutation harnesses: each applies a semantic mutation
+to a `.ply` source, rebuilds through `stage`, and asserts the suite goes red. They
+are the instrument that makes §2's retirement sound, because a golden that cannot
+go red retires nothing -- "the signature defect here is a green result over
+unexplored space", as `arm-harness.sh`'s own header puts it. Their tests moved to
+`ply-codegen-tests/tests/goldens/` in `d761a80c`, two days after `eab318a7` last
+touched them, and every one still ran `-p ply-compiler-diff --test suite` and still
+named a header path under `crates/ply-compiler-diff/tests/suite/`. They have been
+broken since, loudly rather than silently -- the "green before any mutation" guard
+exits 1 -- and no CI job runs them, so nobody met the failure. They now point at
+the package that holds the goldens. `arm-harness.sh` is deliberately left alone: it
+filters `agreement::`, and `agreement.rs` is still in this crate.
+
+**Read, 2026-09-17: where the 166 s went, and the explanation that did not survive
+checking.** That run is the highest reading since the 173 s the paragraph above
+anchors on, against a recent band of 138 to 153. It was not the tree. The longest
+partition was 112 s against the previous run's 110 s, inside the 88-to-120 band
+recorded above; the partitions simply started 18 s later, at 47 s rather than 29 s,
+and the wall grew 19 s. All of it sat in one step: the archive reuse, 6 s in the
+run before and 27 s in this one, with the partitions waiting on it.
+
+The obvious explanation was that both merges edited `Cargo.toml` files, changing
+the dependency graph and invalidating the cache the archive restores from. That is
+wrong, and the step's own log says so. Both runs took the identical successful
+path -- `artifact-for-this-tree.sh` found the pull request's archive for the same
+tree, `gh run download` fetched it, both printed "came back from run" -- and
+neither rebuilt or missed a key. The whole difference is one download of
+`nextest.tar.zst` taking 27 s instead of 6 s. It is the artifact transfer, which is
+platform-side, and it is the fourth such observation here. The alternative is kept
+because it is the one a reader would reach for next, and the reason it fails is the
+evidence: the reuse succeeded in both runs.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -1137,7 +1190,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s and 166 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s and 133 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The checker differential, armed: each mutation below is applied to a copy of
-# `infer.ply` or `tycore.ply` and the fast half of `crates/ply-compiler-diff/tests/suite/infer.rs` (the
+# `infer.ply` or `tycore.ply` and the fast half of `crates/ply-codegen-tests/tests/goldens/infer.rs` (the
 # hand-written programs, the resolver's programs, the standard library and the
 # reference checker's own inputs) must go red.
 #
@@ -21,7 +21,7 @@ run_suite() {
   ( cd "$root" \
     && cargo run --offline -q -p ply-compiler-diff --bin stage -- "$work" >/dev/null \
     && PLY_C_EMITTER="ply:$work" \
-       cargo test --offline --test suite -- --test-threads=2 \
+       cargo test --offline -p ply-codegen-tests --test goldens -- --test-threads=2 \
          infer::the_ply_checker_agrees_with_ply_core_on_the_resolvers_hand_written_programs \
          infer::the_ply_checker_agrees_with_ply_core_on_the_checkers_hand_written_programs \
          infer::the_ply_checker_agrees_with_ply_core_on_the_resolvers_reference_programs \
