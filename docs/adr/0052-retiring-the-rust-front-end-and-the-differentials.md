@@ -280,7 +280,24 @@ backend reads the parsed program and the resolver's output in exactly one
 place of its own, `region_kind::infer`. So the emitter and the optimiser go
 *before* `ply-syntax` as well, and the order this record first wrote, which
 put them last of all, would have left the parser's trees with a live reader at
-the moment it deleted them. Before each
+the moment it deleted them.
+
+**Read, 2026-09-17: and the emitter is not a reference implementation.** This
+record's survey calls `ply-codegen` "a runtime beside a reference emitter
+(`c/emit.rs`, `opt.rs`)", which describes a separation the code does not have at
+the seam that matters. `c/build.rs` is the tier's own unit builder — it decides
+which bodies the tier takes, emits their C, and builds the tables the runtime
+reads them against — and it imports `super::emit` directly and calls
+`crate::opt::optimize` for every body it admits. So the emitter is not something
+only the differential reached; it is what the runtime's own builder calls.
+
+That makes this deletion a split rather than a removal, and it is the third time
+today that planning a step from this record's prose has mis-sized it. The order
+above stands: the emitter still goes before `ply-syntax`, because it is what
+holds the parser's trees open. What changes is the shape of the work — deciding
+which of the emitter the tier needs and which only the reference needed — and
+that decision has to be read out of `c/build.rs` rather than taken from the
+sentence above. Before each
 deletion its differential retires into what survives: `golden::check`
 drops its reference arm and holds the port to the golden alone; the
 digested goldens are re-blessed as text first, since a digest mismatch
@@ -458,7 +475,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s and 149 s, each reusing by tree the same way and for the same reason. Two of those went over, both on the merge that made the port the only front end and the first attempt to answer it, and the paragraph below takes them. The last is twelve seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's 38 MB of text goldens landed. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s and 156 s, each reusing by tree the same way and for the same reason. Two of those went over, both on the merge that made the port the only front end and the first attempt to answer it, and the paragraph below takes them. The last is twelve seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's 38 MB of text goldens landed. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
