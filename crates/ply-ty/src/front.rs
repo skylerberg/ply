@@ -14,17 +14,22 @@
 //! module <name> <n>         index <n>\n<position in the source list>      in source-list order
 //!                           item <n>\n<program-wide name>                  ModuleInfo::items
 //!                           import <n>\n<module name>
-//! def <name> <n>            module, simple_name, scheme (print_scheme), footprint, performed
+//!                           effect_set <n>\n<name> <includes> <atoms>      source order
+//! def <name> <n>            module, simple_name, public 0|1, reuse 0|1, scheme (print_scheme),
+//!                           footprint, performed
 //!                           constraint <n>\n<deriver> <ty_vars index>
 //!                           internally_effectful <n>\n0|1
 //!                           row_alias <n>\n<effect set's simple name>     source order
+//!                           param <n>\n<name> <span>                      source order
 //!                           spec <n>\n<requires|ensures> <index> <footprint>\n<span>
 //!                           span <n>\n<span>
-//! test <i> <n>              key, name, module, index, nondet 0|1, footprint, span
+//! type <name> <n>           module, simple_name, public 0|1, arity, span   program order
+//! test <i> <n>              key, name, module, index, nondet 0|1, footprint, span, name_span
 //! law <i> <n>               key, name, module, index
 //!                           binder <n>\n<name> <span>\n<print_type>
 //!                           has_guard 0|1, host 0|1, footprint, span
-//! effect <name> <n>         module, simple_name, nondet 0|1
+//!                           literal <n>\n<int|str|bytes> <value>          the guard's, in order
+//! effect <name> <n>         module, simple_name, public 0|1, nondet 0|1
 //!                           op <n>\n<name> <read|write> <resource_param 0|1> <param count>
 //!                                        <has_scheme 0|1> <span>\n
 //!                                 <print_type>\n        one line per parameter
@@ -57,6 +62,21 @@
 //! index and requires each index once. The bodies follow the same walk, one per declaration, so
 //! a name in two namespaces has two. A fn's ordinal names its clauses' kinds in source order, so
 //! a clause root can be numbered without the source.
+//!
+//! The rest is what the syntax tree carries and the checker's tables do not. `public` is 1 when the
+//! source wrote `pub`; a prelude effect, which no source declares, is public and has no `type`
+//! frame of its own. `reuse` is 1 when a `fn` carries ADR 0034's marker. A `param` field is `<name>
+//! <span>`, one per parameter as written, in source order — what a clause's binders are named and
+//! placed by. A `type` frame is the one declaration no table of `CheckOutput` holds: a type reaches
+//! them through its constructors and an alias reaches them not at all, so its arity, its visibility
+//! and its own span travel nowhere else. A test's `name_span` is its label's, beside the whole
+//! item's `span`. A law's `literal` fields are the literals its guard mentions, each `int
+//! <decimal>`, `str <text>` or `bytes <lowercase hex>`, in the order the witness search walks the
+//! guard and first-occurrence within a kind — that order seeds a search, so a difference in it is a
+//! different search rather than a different answer. A module's `effect_set` field is `<name>
+//! <includes> <atoms>`: the set's simple name, the sets it includes by simple name comma-joined,
+//! and its expansion resolved to program-wide atoms and written the way a footprint is. Either list
+//! may be empty, so the field is three space-separated words whichever way.
 
 use crate::hash::{DefHash, HashOutput};
 use crate::parse::{parse_footprint, parse_scheme, parse_type};
@@ -64,6 +84,7 @@ use crate::print::{print_scheme, print_type};
 use crate::{
     CheckOutput, CtorInfo, DefConstraint, DefInfo, Deriver, EffectInfo, Footprint, LawBinder,
     LawInfo, Mode, ModuleInfo, ModuleName, OpInfo, Scheme, SpecInfo, SpecKind, TestInfo, Type,
+    Visibility,
 };
 use indexmap::IndexMap;
 use ply_span::frames::{Cursor, read_diagnostics, write_diagnostics};
@@ -96,6 +117,58 @@ pub enum Hashed {
     Law(usize),
 }
 
+/// A parameter as the source wrote it: what a `requires` / `ensures` clause's binders are named
+/// and placed by, zipped against the checked scheme's parameter types.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct WrittenParam {
+    pub name: Symbol,
+    pub span: Span,
+}
+
+/// What a `fn`'s source says and [`DefInfo`] does not.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct DefWritten {
+    pub vis: Visibility,
+    /// A `reuse fn`: ADR 0034's callee-side promise, which a gate has to know without a parse.
+    pub reuse: bool,
+    /// In source order.
+    pub params: Vec<WrittenParam>,
+}
+
+/// A `type`, which no table of [`CheckOutput`] holds — a sum type reaches them through its
+/// constructors and an alias reaches them not at all — so its arity, its visibility and its own
+/// span travel nowhere else.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TypeDecl {
+    pub name: Symbol,
+    pub module: ModuleName,
+    pub simple_name: Symbol,
+    pub vis: Visibility,
+    /// Type parameters, by count: their names are binders and never escape.
+    pub arity: usize,
+    pub span: Span,
+}
+
+/// One `effect set` of a module.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct EffectSet {
+    /// The simple name, which is what a row writes.
+    pub name: Symbol,
+    /// The sets this one includes, by simple name, in source order.
+    pub includes: Vec<Symbol>,
+    /// The expansion as program-wide atoms. An atom naming an effect that resolves to nothing is
+    /// dropped, as the row that named it dropped it.
+    pub atoms: Footprint,
+}
+
+/// A literal a law's guard mentions, which is where the witness search looks for a domain.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Literal {
+    Int(i64),
+    Str(String),
+    Bytes(Vec<u8>),
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Front {
     pub diagnostics: Vec<Diagnostic>,
@@ -112,6 +185,20 @@ pub struct Front {
     pub bodies: Vec<(Symbol, Vec<u8>)>,
     /// Parallel to `CheckOutput::tests`.
     pub test_bodies: Vec<Vec<u8>>,
+    /// What each `fn`'s source wrote, by program-wide name: one entry per `CheckOutput::defs`.
+    pub defs_written: IndexMap<Symbol, DefWritten>,
+    /// Every `type` the source declares, by program-wide name, in program order.
+    pub types: IndexMap<Symbol, TypeDecl>,
+    /// Whether each `effect` was written `pub`, by program-wide name. A prelude effect is declared
+    /// by no source, so it has no entry and is public.
+    pub effects_written: IndexMap<Symbol, Visibility>,
+    /// Parallel to `CheckOutput::tests`: the span of each test's label.
+    pub test_name_spans: Vec<Span>,
+    /// Parallel to `CheckOutput::laws`: the literals each law's guard mentions, in walk order.
+    pub law_literals: Vec<Vec<Literal>>,
+    /// Every module's `effect set`s, by module name, in source order. A module that declares none
+    /// has no entry.
+    pub effect_sets: IndexMap<Symbol, Vec<EffectSet>>,
 }
 
 impl Front {
@@ -130,6 +217,25 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
         return Ok(out);
     }
     let w = Writer { sources };
+    let parallel = |what: &str, len: usize, of: &str, want: usize| {
+        if len == want {
+            Ok(())
+        } else {
+            Err(format!("{len} {what} beside {want} {of}"))
+        }
+    };
+    parallel(
+        "test name spans",
+        front.test_name_spans.len(),
+        "tests",
+        front.check.tests.len(),
+    )?;
+    parallel(
+        "law literal lists",
+        front.law_literals.len(),
+        "laws",
+        front.check.laws.len(),
+    )?;
 
     let mut p = Payload::default();
     for m in &front.order {
@@ -153,14 +259,23 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
         for import in &m.imports {
             p.field("import", import.as_str());
         }
+        for set in front.effect_sets.get(name).into_iter().flatten() {
+            p.field("effect_set", &effect_set_text(set));
+        }
         p.frame(&mut out, "module", name.as_str());
     }
 
     for (name, d) in &front.check.defs {
         let what = format!("def `{name}`");
+        let written = front
+            .defs_written
+            .get(name)
+            .ok_or_else(|| format!("{what} has no record of what its source wrote"))?;
         let mut p = Payload::default();
         p.field("module", d.module.as_str());
         p.field("simple_name", d.simple_name.as_str());
+        p.field("public", flag(written.vis.is_public()));
+        p.field("reuse", flag(written.reuse));
         p.field("scheme", &print_scheme(&d.scheme));
         p.field("footprint", &footprint_text(&d.footprint));
         p.field("performed", &footprint_text(&d.performed));
@@ -170,6 +285,12 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
         p.field("internally_effectful", flag(d.internally_effectful));
         for a in &d.row_aliases {
             p.field("row_alias", a.as_str());
+        }
+        for param in &written.params {
+            p.field(
+                "param",
+                &format!("{} {}", param.name, w.span(param.span, &what)?),
+            );
         }
         for s in &d.spec {
             p.field(
@@ -187,6 +308,17 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
         p.frame(&mut out, "def", name.as_str());
     }
 
+    for (name, t) in &front.types {
+        let what = format!("type `{name}`");
+        let mut p = Payload::default();
+        p.field("module", t.module.as_str());
+        p.field("simple_name", t.simple_name.as_str());
+        p.field("public", flag(t.vis.is_public()));
+        p.field("arity", &t.arity.to_string());
+        p.field("span", &w.span(t.span, &what)?);
+        p.frame(&mut out, "type", name.as_str());
+    }
+
     for (i, t) in front.check.tests.iter().enumerate() {
         let what = format!("test {i}");
         let mut p = Payload::default();
@@ -197,6 +329,7 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
         p.field("nondet", flag(t.nondet));
         p.field("footprint", &footprint_text(&t.footprint));
         p.field("span", &w.span(t.span, &what)?);
+        p.field("name_span", &w.span(front.test_name_spans[i], &what)?);
         p.frame(&mut out, "test", &i.to_string());
     }
 
@@ -222,6 +355,9 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
         p.field("host", flag(l.host));
         p.field("footprint", &footprint_text(&l.footprint));
         p.field("span", &w.span(l.span, &what)?);
+        for literal in &front.law_literals[i] {
+            p.field("literal", &literal_text(literal));
+        }
         p.frame(&mut out, "law", &i.to_string());
     }
 
@@ -230,6 +366,7 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
         let mut p = Payload::default();
         p.field("module", e.module.as_str());
         p.field("simple_name", e.simple_name.as_str());
+        p.field("public", flag(effect_public(front, name, e)?));
         p.field("nondet", flag(e.nondet));
         for o in e.ops.values() {
             let mut text = format!(
@@ -474,6 +611,37 @@ fn flag(b: bool) -> &'static str {
     if b { "1" } else { "0" }
 }
 
+/// A prelude effect is declared by no source, so it has no entry and is public; a `pub` one a
+/// module declares and the syntax tables missed is an error rather than a guess.
+fn effect_public(front: &Front, name: &Symbol, e: &EffectInfo) -> Result<bool, String> {
+    match front.effects_written.get(name) {
+        Some(vis) => Ok(vis.is_public()),
+        None if e.module.is_anonymous() => Ok(true),
+        None => Err(format!(
+            "effect `{name}` is declared in `{}` and has no record of what its source wrote",
+            e.module.as_str()
+        )),
+    }
+}
+
+fn literal_text(literal: &Literal) -> String {
+    match literal {
+        Literal::Int(k) => format!("int {k}"),
+        Literal::Str(s) => format!("str {s}"),
+        Literal::Bytes(b) => format!("bytes {}", hex(b)),
+    }
+}
+
+fn effect_set_text(set: &EffectSet) -> String {
+    let includes: Vec<&str> = set.includes.iter().map(|i| i.as_str()).collect();
+    format!(
+        "{} {} {}",
+        set.name,
+        includes.join(","),
+        footprint_text(&set.atoms)
+    )
+}
+
 fn footprint_text(f: &Footprint) -> String {
     f.atoms()
         .map(|a| a.to_string())
@@ -550,13 +718,18 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
                 let fields = Fields::of(payload, &what)?;
                 let mut source = None;
                 let (mut items, mut imports) = (Vec::new(), Vec::new());
+                let mut sets = Vec::new();
                 for (key, text) in fields.all() {
                     match key {
                         "index" => fields.once(&mut source, key, text)?,
                         "item" => items.push(Symbol::new(text)),
                         "import" => imports.push(ModuleName::from_dotted(text)),
+                        "effect_set" => sets.push(effect_set_of(text, &what)?),
                         other => return Err(unknown_field(&what, other)),
                     }
+                }
+                if !sets.is_empty() {
+                    front.effect_sets.insert(Symbol::new(name), sets);
                 }
                 let source: usize = fields.number(fields.required(source, "index")?, "index")?;
                 let source = *sources.get(source).ok_or_else(|| {
@@ -576,22 +749,30 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
                 );
             }
             "def" => {
-                let def = r.def(name, payload, &what)?;
+                let (def, written) = r.def(name, payload, &what)?;
                 front.check.defs.insert(Symbol::new(name), def);
+                front.defs_written.insert(Symbol::new(name), written);
+            }
+            "type" => {
+                let decl = r.type_decl(name, payload, &what)?;
+                front.types.insert(Symbol::new(name), decl);
             }
             "test" => {
                 r.numbered(name, front.check.tests.len(), &what)?;
-                let test = r.test(front.check.tests.len(), payload, &what)?;
+                let (test, name_span) = r.test(front.check.tests.len(), payload, &what)?;
                 front.check.tests.push(test);
+                front.test_name_spans.push(name_span);
             }
             "law" => {
                 r.numbered(name, front.check.laws.len(), &what)?;
-                let law = r.law(front.check.laws.len(), payload, &what)?;
+                let (law, literals) = r.law(front.check.laws.len(), payload, &what)?;
                 front.check.laws.push(law);
+                front.law_literals.push(literals);
             }
             "effect" => {
-                let effect = r.effect(name, payload, &what)?;
+                let (effect, vis) = r.effect(name, payload, &what)?;
                 front.check.effects.insert(Symbol::new(name), effect);
+                front.effects_written.insert(Symbol::new(name), vis);
             }
             "ctor" => {
                 let ctor = r.ctor(name, payload, &what)?;
@@ -678,6 +859,52 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
 
 fn unknown_field(what: &str, key: &str) -> String {
     format!("{what}: unknown field `{key}`")
+}
+
+fn visibility(public: bool) -> Visibility {
+    if public {
+        Visibility::Public
+    } else {
+        Visibility::Private
+    }
+}
+
+fn literal_of(text: &str, what: &str) -> Result<Literal, String> {
+    let Some((kind, value)) = text.split_once(' ') else {
+        return Err(format!(
+            "{what}: literal `{text}` is not `<int|str|bytes> <value>`"
+        ));
+    };
+    Ok(match kind {
+        "int" => Literal::Int(
+            value
+                .parse()
+                .map_err(|_| format!("{what}: literal `{value}` is not an integer"))?,
+        ),
+        "str" => Literal::Str(value.to_string()),
+        "bytes" => Literal::Bytes(unhex(value.as_bytes(), what)?),
+        other => {
+            return Err(format!("{what}: `{other}` is not `int`, `str` or `bytes`"));
+        }
+    })
+}
+
+fn effect_set_of(text: &str, what: &str) -> Result<EffectSet, String> {
+    let words: Vec<&str> = text.split(' ').collect();
+    let [name, includes, atoms] = words[..] else {
+        return Err(format!(
+            "{what}: effect set `{text}` is not `<name> <includes> <atoms>`"
+        ));
+    };
+    Ok(EffectSet {
+        name: Symbol::new(name),
+        includes: includes
+            .split(',')
+            .filter(|i| !i.is_empty())
+            .map(Symbol::new)
+            .collect(),
+        atoms: parse_footprint(atoms).map_err(|e| format!("{what}: effect set: {e}"))?,
+    })
 }
 
 fn spec_kind(text: &str, what: &str) -> Result<SpecKind, String> {
@@ -867,21 +1094,34 @@ impl Reader<'_> {
         parse_type(text).map_err(|e| format!("{what}: type: {e}"))
     }
 
-    fn def(&self, name: &str, payload: &[u8], what: &str) -> Result<DefInfo, String> {
+    fn def(&self, name: &str, payload: &[u8], what: &str) -> Result<(DefInfo, DefWritten), String> {
         let f = Fields::of(payload, what)?;
         let (mut module, mut simple, mut scheme, mut footprint, mut performed) =
             (None, None, None, None, None);
         let (mut effectful, mut span) = (None, None);
+        let (mut public, mut reuse) = (None, None);
         let (mut constraints, mut aliases, mut spec) = (Vec::new(), Vec::new(), Vec::new());
+        let mut params = Vec::new();
         for (key, text) in f.all() {
             match key {
                 "module" => f.once(&mut module, key, text)?,
                 "simple_name" => f.once(&mut simple, key, text)?,
+                "public" => f.once(&mut public, key, text)?,
+                "reuse" => f.once(&mut reuse, key, text)?,
                 "scheme" => f.once(&mut scheme, key, text)?,
                 "footprint" => f.once(&mut footprint, key, text)?,
                 "performed" => f.once(&mut performed, key, text)?,
                 "internally_effectful" => f.once(&mut effectful, key, text)?,
                 "span" => f.once(&mut span, key, text)?,
+                "param" => {
+                    let Some((name, at)) = text.split_once(' ') else {
+                        return Err(format!("{what}: param `{text}` is not `<name> <span>`"));
+                    };
+                    params.push(WrittenParam {
+                        name: Symbol::new(name),
+                        span: self.span(at, what)?,
+                    });
+                }
                 "constraint" => {
                     let Some((deriver, param)) = text.split_once(' ') else {
                         return Err(format!(
@@ -916,7 +1156,12 @@ impl Reader<'_> {
                 other => return Err(unknown_field(what, other)),
             }
         }
-        Ok(DefInfo {
+        let written = DefWritten {
+            vis: visibility(f.flag(f.required(public, "public")?, "public")?),
+            reuse: f.flag(f.required(reuse, "reuse")?, "reuse")?,
+            params,
+        };
+        let def = DefInfo {
             name: Symbol::new(name),
             module: ModuleName::from_dotted(f.required(module, "module")?),
             simple_name: Symbol::new(f.required(simple, "simple_name")?),
@@ -931,13 +1176,39 @@ impl Reader<'_> {
                 "internally_effectful",
             )?,
             span: self.span(f.required(span, "span")?, what)?,
+        };
+        Ok((def, written))
+    }
+
+    fn type_decl(&self, name: &str, payload: &[u8], what: &str) -> Result<TypeDecl, String> {
+        let f = Fields::of(payload, what)?;
+        let (mut module, mut simple, mut public, mut arity, mut span) =
+            (None, None, None, None, None);
+        for (key, text) in f.all() {
+            match key {
+                "module" => f.once(&mut module, key, text)?,
+                "simple_name" => f.once(&mut simple, key, text)?,
+                "public" => f.once(&mut public, key, text)?,
+                "arity" => f.once(&mut arity, key, text)?,
+                "span" => f.once(&mut span, key, text)?,
+                other => return Err(unknown_field(what, other)),
+            }
+        }
+        Ok(TypeDecl {
+            name: Symbol::new(name),
+            module: ModuleName::from_dotted(f.required(module, "module")?),
+            simple_name: Symbol::new(f.required(simple, "simple_name")?),
+            vis: visibility(f.flag(f.required(public, "public")?, "public")?),
+            arity: f.number(f.required(arity, "arity")?, "arity")?,
+            span: self.span(f.required(span, "span")?, what)?,
         })
     }
 
-    fn test(&self, index: usize, payload: &[u8], what: &str) -> Result<TestInfo, String> {
+    fn test(&self, index: usize, payload: &[u8], what: &str) -> Result<(TestInfo, Span), String> {
         let f = Fields::of(payload, what)?;
         let (mut key, mut name, mut module, mut at, mut nondet, mut footprint, mut span) =
             (None, None, None, None, None, None, None);
+        let mut name_span = None;
         for (k, text) in f.all() {
             match k {
                 "key" => f.once(&mut key, k, text)?,
@@ -947,10 +1218,12 @@ impl Reader<'_> {
                 "nondet" => f.once(&mut nondet, k, text)?,
                 "footprint" => f.once(&mut footprint, k, text)?,
                 "span" => f.once(&mut span, k, text)?,
+                "name_span" => f.once(&mut name_span, k, text)?,
                 other => return Err(unknown_field(what, other)),
             }
         }
-        Ok(TestInfo {
+        let name_span = self.span(f.required(name_span, "name_span")?, what)?;
+        let test = TestInfo {
             name: f.required(name, "name")?.to_string(),
             module: ModuleName::from_dotted(f.required(module, "module")?),
             key: Symbol::new(f.required(key, "key")?),
@@ -958,16 +1231,24 @@ impl Reader<'_> {
             nondet: f.flag(f.required(nondet, "nondet")?, "nondet")?,
             footprint: f.footprint(f.required(footprint, "footprint")?, "footprint")?,
             span: self.span(f.required(span, "span")?, what)?,
-        })
+        };
+        Ok((test, name_span))
     }
 
-    fn law(&self, index: usize, payload: &[u8], what: &str) -> Result<LawInfo, String> {
+    fn law(
+        &self,
+        index: usize,
+        payload: &[u8],
+        what: &str,
+    ) -> Result<(LawInfo, Vec<Literal>), String> {
         let f = Fields::of(payload, what)?;
         let (mut key, mut name, mut module, mut at) = (None, None, None, None);
         let (mut has_guard, mut host, mut footprint, mut span) = (None, None, None, None);
         let mut binders = Vec::new();
+        let mut literals = Vec::new();
         for (k, text) in f.all() {
             match k {
+                "literal" => literals.push(literal_of(text, what)?),
                 "key" => f.once(&mut key, k, text)?,
                 "name" => f.once(&mut name, k, text)?,
                 "module" => f.once(&mut module, k, text)?,
@@ -992,7 +1273,7 @@ impl Reader<'_> {
                 other => return Err(unknown_field(what, other)),
             }
         }
-        Ok(LawInfo {
+        let law = LawInfo {
             name: f.required(name, "name")?.to_string(),
             module: ModuleName::from_dotted(f.required(module, "module")?),
             key: Symbol::new(f.required(key, "key")?),
@@ -1002,17 +1283,25 @@ impl Reader<'_> {
             host: f.flag(f.required(host, "host")?, "host")?,
             footprint: f.footprint(f.required(footprint, "footprint")?, "footprint")?,
             span: self.span(f.required(span, "span")?, what)?,
-        })
+        };
+        Ok((law, literals))
     }
 
-    fn effect(&self, name: &str, payload: &[u8], what: &str) -> Result<EffectInfo, String> {
+    fn effect(
+        &self,
+        name: &str,
+        payload: &[u8],
+        what: &str,
+    ) -> Result<(EffectInfo, Visibility), String> {
         let f = Fields::of(payload, what)?;
         let (mut module, mut simple, mut nondet, mut span) = (None, None, None, None);
+        let mut public = None;
         let mut ops = IndexMap::new();
         for (key, text) in f.all() {
             match key {
                 "module" => f.once(&mut module, key, text)?,
                 "simple_name" => f.once(&mut simple, key, text)?,
+                "public" => f.once(&mut public, key, text)?,
                 "nondet" => f.once(&mut nondet, key, text)?,
                 "span" => f.once(&mut span, key, text)?,
                 "op" => {
@@ -1024,14 +1313,16 @@ impl Reader<'_> {
                 other => return Err(unknown_field(what, other)),
             }
         }
-        Ok(EffectInfo {
+        let vis = visibility(f.flag(f.required(public, "public")?, "public")?);
+        let effect = EffectInfo {
             name: Symbol::new(name),
             module: ModuleName::from_dotted(f.required(module, "module")?),
             simple_name: Symbol::new(f.required(simple, "simple_name")?),
             nondet: f.flag(f.required(nondet, "nondet")?, "nondet")?,
             ops,
             span: self.span(f.required(span, "span")?, what)?,
-        })
+        };
+        Ok((effect, vis))
     }
 
     fn op(&self, f: &Fields<'_>, text: &str, what: &str) -> Result<OpInfo, String> {
