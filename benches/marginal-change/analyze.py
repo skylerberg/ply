@@ -165,8 +165,8 @@ if process:
             ratios.append((t1 / t0, n1 / n0))
         print("\n  the fixed cost, each adjacent step: " + "   ".join(parts))
         print(f"  {verdict_of(ratios)}")
-        print("  Nothing was rechecked at any size, so this is the cost of establishing that,")
-        print("  paid again by every invocation. It is what a warm process would not pay.")
+        print("  This is what a run pays before it can say that nothing changed, and it pays it")
+        print("  again on every invocation. It is what a warm process would not pay.")
 
 backed = [r for r in process if r.get("backend")]
 if backed:
