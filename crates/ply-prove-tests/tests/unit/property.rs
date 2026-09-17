@@ -1,4 +1,3 @@
-use ply_core::prelude;
 use ply_eval::interp::Pure;
 use ply_eval::{DEFAULT_MAX_CALLS, Value};
 use ply_prove::property::{
@@ -13,6 +12,7 @@ use ply_span::{Diagnostic, SourceId, Span, Symbol};
 use ply_syntax::ast::{Mode, Program};
 use ply_syntax::resolve::Resolved;
 use ply_ty::DefHash;
+use ply_ty::prelude;
 use ply_ty::{CheckOutput, EffectAtom, LawBinder, Resource, Row, RowVar, TyVar, Type};
 use std::collections::BTreeSet;
 
@@ -30,8 +30,16 @@ impl Fixture {
         let mut program = Program::single(module);
         let resolved = ply_syntax::resolve(&mut program)
             .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = ply_core::check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
+        ply_codegen::c::producer::ensure_default();
+        let front =
+            ply_codegen::c::producer::front(&[("m".to_string(), src.to_string())], &[SourceId(0)])
+                .unwrap_or_else(|e| panic!("the port answers for the fixture: {e:#}"));
+        assert!(
+            front.diagnostics.is_empty(),
+            "the fixture must typecheck: {:#?}",
+            front.diagnostics
+        );
+        let check = front.check;
         Fixture {
             program,
             resolved,
