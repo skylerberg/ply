@@ -136,6 +136,44 @@ impl StoredBody {
     }
 }
 
+/// The bodies out of a front end's answer, keyed the way the store files them.
+///
+/// The inverse of `ply_codegen::source`'s `fill_bodies`, which writes each body as
+/// [`StoredBody::as_bytes`]; `from_bytes` reads that envelope back, so `key()` re-derives the
+/// hash the definition is filed under rather than being told it. A name declared in two
+/// namespaces has two bodies and one entry per hash, which is the case `verify` settles.
+pub fn of_front(front: &ply_ty::Front) -> BodySet {
+    let hashes = &front.hashes;
+    let mut by_name: std::collections::BTreeMap<&Symbol, Vec<StoredBody>> = Default::default();
+    for (name, bytes) in &front.bodies {
+        if let Some(body) = StoredBody::from_bytes(bytes.clone()) {
+            by_name.entry(name).or_default().push(body);
+        }
+    }
+    let mut out = BodySet::default();
+    for (name, stored) in by_name {
+        for hash in [hashes.defs.get(name), hashes.decls.get(name)]
+            .into_iter()
+            .flatten()
+        {
+            let found = match stored.as_slice() {
+                [only] => Some(only),
+                many => many.iter().find(|b| b.verify(*hash)),
+            };
+            if let Some(body) = found {
+                out.insert(*hash, body.clone());
+            }
+        }
+    }
+    // Parallel to `CheckOutput::tests`, which the protocol checks when it decodes the frames.
+    for bytes in &front.test_bodies {
+        if let Some(body) = StoredBody::from_bytes(bytes.clone()) {
+            out.push_test(body);
+        }
+    }
+    out
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BodySet {
     defs: IndexMap<DefHash, StoredBody>,

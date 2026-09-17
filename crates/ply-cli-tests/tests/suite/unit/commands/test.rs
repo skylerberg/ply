@@ -609,8 +609,7 @@ fn bisect_never_reports_that_nothing_was_attempted_and_evaluates_nothing() {
         &mut report,
         &loaded.program,
         &loaded.resolved,
-        &loaded.check,
-        &hashes,
+        &loaded.front,
         &mut Store::open(_dir.path()).unwrap(),
         &diagnosis_options(&args),
     );
