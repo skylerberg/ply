@@ -9,8 +9,8 @@
 //! These came from `ply-compiler-diff` with their fixtures, so that deleting that crate with
 //! the parser does not delete the gate.
 
-mod harness;
 mod derive;
+mod harness;
 mod hash;
 mod infer;
 mod resolve;
