@@ -49,11 +49,14 @@ tier-only already cannot emit the compiler whole.
 **The differentials.** `crates/ply-compiler-diff` compares the port
 against the Rust reference at every phase. Seven of them are held to
 goldens under `fixtures/goldens/` — lexer, parser, rewrite, resolve,
-derive, infer, hash — and `golden::check` asserts three things: the golden
-exists, the reference still agrees with it, the port agrees with it. The
-last is what survives the reference. The resolve and hash goldens are
-digests, and a digest that mismatches is explained by diffing against the
-reference's dump *while there is one*. The lowering and emit differentials
+derive, infer, hash — and `golden::check` asserts two things: the golden
+exists, and the port agrees with it. The reference arm is gone, and with
+it the last reader of the Rust front end in those seven; blessing writes
+the port's answer now, which makes blessing a deliberate act of moving the
+specification rather than of taking the reference's. Every golden is text.
+The resolve and hash goldens were digests and were re-blessed before the
+arm went, because a digest reports only *that* something differs and the
+difference itself used to be read off the reference's dump. The lowering and emit differentials
 have no goldens: ADR 0050 said the bundle is theirs, and the own-sources
 emit differential holds the port to a floor of agreeing bodies with the
 rest printed, some two hundred and forty bodies where the port lacks a fast

@@ -5,7 +5,7 @@
 //! The port is entered in-process through `port`: the bundle the binary carries is the compiler
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
 
-use ply_compiler_diff::{golden, port, reference_derive_dump};
+use ply_compiler_diff::{golden, port};
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
@@ -49,9 +49,8 @@ fn compare(label: &str, inputs: &[(String, Vec<(String, String)>)]) {
     let mut generated = 0usize;
     for (name, program) in inputs {
         let actual = port::dump_program("derive.derive_dump", program);
-        let reference = reference_derive_dump(program);
-        generated += reference.matches("S;").count();
-        if let Err(report) = golden::check("derive", name, &reference, &actual, first_difference) {
+        generated += actual.matches("S;").count();
+        if let Err(report) = golden::check("derive", name, &actual, first_difference) {
             failures.push(format!("{label}: {report}"));
         }
     }
