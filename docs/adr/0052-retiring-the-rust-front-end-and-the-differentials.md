@@ -265,9 +265,9 @@ the clock.
 
 ## 2. Delete the Rust front end, its test crates and the differentials
 
-In the order the goldens and the crates together allow: `ply-derive`;
-`ply-core`; `ply-hash`; `ply-syntax`'s rewrites, resolver, parser, lexer
-and printer; then `ply-eval`'s lowering with `opt.rs` and `c/emit.rs`
+In the order the goldens and the crates together allow: `ply-core`'s
+checker; `ply-hash`'s hasher; `ply-derive`; `ply-syntax`'s rewrites,
+resolver, parser, lexer and printer; then `ply-eval`'s lowering with `opt.rs` and `c/emit.rs`
 last; with `ply-derive-tests`, `ply-syntax-tests`, `ply-core-tests`,
 `ply-hash-tests`, `ply-compiler-diff` and the `tools/mine-*.py` scripts.
 `ply-hash` goes ahead of `ply-syntax`, not after it: its normalizer, its
@@ -431,6 +431,51 @@ default target — and the `tools/mine-*.py` scripts leave with it, run by
 nothing in the tree, three of the four writing to a directory that does
 not exist.
 
+**Read, 2026-09-17: the checker and the hasher are already off the load path.**
+The driver says so itself. It parses and resolves with the Rust chain because
+`Program` and `Resolved` are still what the prover, `ply check --costs`, the
+artifact path, `Pure` and the interpreter read, and then asks the port for
+everything else, so `ply_core::check_program` and `ply_hash::hash_program` are
+not called on a user's program from there at all. What the four names hold is
+therefore not four deletions but three splits and a crate that cannot leave yet:
+`ply-core` keeps `ty`, `prelude`, `DefInfo` and `Front` while its checker goes;
+`ply-hash` keeps `DefHash` and the body envelope while its hash-from-tree half
+goes; `ply-derive` expands *inside* `parse_module`, so it leaves with the parser
+at the end rather than first, and the order above is corrected to match; and
+`ply-syntax` cannot leave while those five consumers read the tree, which this
+record's own exclusion defers to the C runtime. This is the fifth time sizing a
+step from this record's prose has been wrong, and each time the correction has
+been the same shape: a name that reads as a component is a layer two things
+share.
+
+What is deletable now is the checker and the hasher themselves, and their callers
+are fewer than the survey above suggests. Of twenty-one non-test calls to
+`check_program` and thirteen to `hash_program*`, six die with
+`ply-compiler-diff`, two are the seed path that retires with the front end, one
+is `ply-codegen`'s own `"ref"`-mode fallback sitting beneath an existing port
+call, and six are `ply-corpus`'s cost harnesses, which check a program because
+they need a runnable one to measure and so move to the port's door rather than
+being deleted. Three are genuine: opening an artifact, `ply test`'s fresh bodies,
+and the hybrid's trial. `ply-store`'s `Bodies::reconstruct` has no non-test
+caller at all.
+
+**And the bisection does not print.** A paragraph above says both paths that
+rebuild a program from stored bodies print it as source and hand the text to the
+port. Opening an artifact did; the bisection does not. `hybrid.rs` reconstructs
+the tree, then resolves, hashes and checks it with the Rust chain, which is why
+it holds all three crates open at once. Printing is the bridge available to it —
+`ply_syntax::print` exists — not what it does today.
+
+**Built, 2026-09-17: opening an artifact asks the port.** `open_sources` took its
+`CheckOutput` from `ply_core::check_program` and its hashes and bodies from
+`ply_hash::hash_program_with_bodies`, over a tree it had just parsed. It takes
+all three from the port's one answer over the same texts instead, and the
+name-to-hash body conversion that `build` already carried inline becomes the
+helper both use. Sources that are not the artifact's are still refused, and now
+it is the port that checked them. Opening a `.plyx` pays a whole front end where
+it paid the checker and the hasher before, which is the trade every other command
+took at the switch.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -494,7 +539,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s and 173 s, each reusing by tree the same way and for the same reason. Two of those went over, both on the merge that made the port the only front end and the first attempt to answer it, and the paragraph below takes them. The last is twelve seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's 38 MB of text goldens landed. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s and 140 s, each reusing by tree the same way and for the same reason. Two of those went over, both on the merge that made the port the only front end and the first attempt to answer it, and the paragraph below takes them. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's 38 MB of text goldens landed. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
