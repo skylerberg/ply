@@ -7,9 +7,9 @@ use crate::{
     VacuityKind,
 };
 use ply_eval::{Closure, ClosureKind, Decimal, Fixed, Value};
-use ply_hash::DefHash;
 use ply_span::{Diagnostic, Span, Symbol};
 use ply_syntax::ast::{Expr, ExprKind, Ident, QName};
+use ply_ty::DefHash;
 use ply_ty::prelude;
 use ply_ty::{BinOp, CtorInfo, IntTy, LawBinder, Row, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet};
