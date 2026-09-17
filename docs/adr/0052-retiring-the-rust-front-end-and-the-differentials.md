@@ -1214,9 +1214,10 @@ left. The seed path was the last and the handover took it; `pipeline.rs` and
 chain that §4's front-end figures are summed from, so they retire *with* their
 subject rather than standing before it -- pointing them at the port would report
 the port's cost under the chain's name -- but neither holds the checker's crate
-any more. What holds `ply-core` is the eleven test crates that check their
-fixtures through it: every one calls `check_program` or `check_module`, and
-nothing else in the workspace does.
+any more. What holds `ply-core` is the test crates that check their fixtures
+through it: every one calls `check_program` or `check_module`, and nothing else
+in the workspace does. They are being moved onto the port one crate at a time,
+which the entry below takes.
 
 `ply-syntax` and `ply-derive` are held by a different thing again: `Program` and
 `Resolved` stand in the public signatures of the crates that survive, which is the
@@ -1249,6 +1250,41 @@ here touched the object model.
 
 What remains is held by three things this record names and defers: the emitter, the
 object model, and the harnesses that time the chain.
+
+**Built, 2026-09-17: the test crates begin asking the port, and one cannot.** A
+migrated crate replaces `check_program` or `check_module` with `producer::front`
+over the fixture's own source, and asserts the answer carries no diagnostics --
+the job the old `.expect("... typechecks")` did, since `front` answers `Ok` with
+diagnostics rather than erroring. `ply-cli-tests` and `ply-host-tests` went
+first.
+
+Two rules travel with it. The port keys program-wide, so a fixture's definitions
+and the effects it *declares* gain their module: `config` became `m.config`, and
+`db.get[orders]` became `m.db.get[orders]` in the host listing. An effect a
+fixture does not declare keeps its bare name -- `clock` comes from the prelude
+and `task` from the simulation, not from the source -- so only what a fixture
+declares moves. And the module name is an argument rather than an accident:
+`tcp.rs` must pass `ply_host::tcp::MODULE`, because `std.net` is what qualifies
+its `EFFECT` as `std.net.net`, while a fixture under no such constraint can be
+handed any name.
+
+The cost is a dependency rather than a deletion for the crates that lacked
+`ply-codegen`: they trade the checker for the code generator, which survives
+this record. Where `ply-ty` was already present nothing re-points, because it
+owns `CheckOutput`, `DefInfo` and `ty` outright and `ply-core` only re-exported
+them.
+
+**`ply-store-tests` cannot go, and a sweep says it is the only one.** Its second
+site typechecks a program *reconstructed from the store*: `reconstruct` hands
+back a syntax tree and there is no source text anywhere, which is the crate's
+whole thesis -- what a run writes comes back out as a program that checks,
+without the source. The port's interface is source bytes in, so `front` cannot
+answer it, and migrating the crate's other site alone would leave the dependency
+in place, which is why the attempt was withdrawn rather than halved. Every other
+remaining site parses from source first. The corpus harnesses in
+`ply-eval-tests` looked like a second case and are not: they reach their
+programs through a `load` that reads files, so the text exists and the loader
+need only hand it back. This one has no text to hand.
 
 **Built, 2026-09-17: `verify` sees the member it could not see, and the count
 says what it counts.** This record described the gap twice and fixed it neither
