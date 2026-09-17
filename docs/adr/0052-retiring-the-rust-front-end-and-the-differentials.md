@@ -420,6 +420,27 @@ against, and no CI reading catches it, because CI's programs are the
 compiler's own sources and the corpora, not a four-thousand-definition
 project asked the same question twice.
 
+**Read, 2026-09-17: the shape of it, at five sizes.** `ply check` over
+generated projects of 250, 500, 1,000, 2,000 and 4,000 definitions, two
+passes agreeing within half a percent, puts the port's answer at 855 ms,
+1,761 ms, 4,804 ms, 12,163 ms and 38,213 ms. Reading, parsing, resolving
+and writing back stay linear and stay small: 98 ms of parsing at the
+largest size against 38 seconds of answering. The standard library
+checked alone as a project is 4,653 ms.
+
+Per definition that is 3.4 ms, 3.5 ms, 4.8 ms, 6.1 ms and 9.6 ms, so the
+cost of one definition nearly triples across the range, and doubling the
+project multiplies the answer by 2.1, 2.7, 2.5 and 3.1 where linear would
+be 2. Two separate faults are in that, and a fix for either alone leaves
+the other. There is a constant factor: at the smallest size, where the
+superlinear term has barely started, the port already charges about
+fifty-five times the reference per definition. And there is a term that
+grows with the project, which is what turns fifty-five into a hundred and
+sixty by 4,000 definitions. The candidate for the second is the one ADR
+0049's profile already named in the emitter, a linear scan standing where
+a lookup belongs, and the next reading is a flat profile of the port's
+own front end rather than another point on this curve.
+
 ## The order, and why
 
 3 first, because every pull request of this record is read by its run's
