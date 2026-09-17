@@ -858,6 +858,12 @@ pub type HashOutput = { defs: List<{ name: Bytes, hash: Bytes }>, own: List<{ na
                         law_texts: List<Bytes>, deps: List<{ name: Bytes, names: List<Bytes> }>, closure: List<{ name: Bytes, names: Names }>,
                         bodies: List<{ name: Bytes, body: Bytes }>, test_bodies: List<Bytes> }
 
+// `assemble`'s accumulator. `deps` and `closure` are association lists the dump writes in order,
+// so they stay lists; what is added is where each name sits in them. Without that, recording a
+// definition searched both lists for its own name, once per definition, which is quadratic in the
+// program. The output type itself is public and crosses into Rust, so the positions ride here.
+type Recording = { out: HashOutput, deps_at: Map<Bytes, Int>, closure_at: Map<Bytes, Int> }
+
 // `StoredBody::solo`: a kind byte, then the normalized bytes `blake3` keys the body by.
 fn solo_body(encoding: Bytes) -> Bytes = bytes_concat(b"\x00", encoding)
 
@@ -1061,13 +1067,13 @@ fn assemble(index: Index, components: List<List<Int>>, edges: List<List<Int>>, h
   });
   let empty: HashOutput = { defs: [], own: h.own, decls: [], tests: h.tests, laws: h.laws, specs: h.specs, spec_texts: h.spec_texts, law_texts: h.law_texts, deps: [], closure: [],
                             bodies: [], test_bodies: h.test_bodies };
-  fold(index.order, empty, |out: HashOutput, e: Entry|
+  (fold(index.order, { out: empty, deps_at: map_new(), closure_at: map_new() }, |acc: Recording, e: Entry|
     match e {
       EDef(v) -> {
         let node = at(index.nodes, v);
         let bodied: HashOutput = match map_get(h.bodies, v) {
-          None -> out,
-          Some(body) -> {..out, bodies: push(out.bodies, { name: node.name, body: body })},
+          None -> acc.out,
+          Some(body) -> {..acc.out, bodies: push(acc.out.bodies, { name: node.name, body: body })},
         };
         let keyed: HashOutput = match map_get(h.hashes, v) {
           None -> bodied,
@@ -1078,20 +1084,20 @@ fn assemble(index: Index, components: List<List<Int>>, edges: List<List<Int>>, h
         };
         let deps = map(at(edges, v), |r: Int| at(index.nodes, r).name);
         let closure = { let ci = at(component_of, v); if ci >= 0 && ci < len(closures) { at(closures, ci) } else { map_new() } };
-        record(keyed, node.name, deps, closure)
+        record({..acc, out: keyed}, node.name, deps, closure)
       },
       ETest(t) -> {
         let key = at(index.tests, t).key;
         let r = reached(at(h.test_refs, t), index, component_of, closures, key);
-        record(out, key, r.deps, r.closure)
+        record(acc, key, r.deps, r.closure)
       },
       // A law's references are what it is a claim about.
       ELaw(l) -> {
         let key = at(index.laws, l).key;
         let r = reached(at(h.law_refs, l), index, component_of, closures, key);
-        record(out, key, r.deps, r.closure)
+        record(acc, key, r.deps, r.closure)
       },
-    })
+    })).out
 }
 
 fn reached(refs: List<Int>, index: Index, component_of: List<Int>, closures: List<Names>, own: Bytes) -> { deps: List<Bytes>, closure: Names } = {
@@ -1101,16 +1107,19 @@ fn reached(refs: List<Int>, index: Index, component_of: List<Int>, closures: Lis
 }
 
 // Names collide across namespaces, so entries are merged rather than replaced.
-fn record(out: HashOutput, name: Bytes, deps: List<Bytes>, closure: Names) -> HashOutput = {
-  let deps_ = match fold(range(0, len(out.deps)), None, |acc: Option<Int>, i: Int| match acc { Some(_) -> acc, None -> if at(out.deps, i).name == name { Some(i) } else { None } }) {
-    Some(i) -> { let existing = at(out.deps, i); set_at(out.deps, i, { name: name, names: fold(deps, existing.names, |acc: List<Bytes>, d: Bytes| if contains_bytes(acc, d) { acc } else { push(acc, d) }) }) },
-    None -> push(out.deps, { name: name, names: deps }),
+fn record(a: Recording, name: Bytes, deps: List<Bytes>, closure: Names) -> Recording = {
+  let out = a.out;
+  let deps_ = match map_get(a.deps_at, name) {
+    Some(i) -> { let existing = at(out.deps, i);
+                 { xs: set_at(out.deps, i, { name: name, names: fold(deps, existing.names, |acc: List<Bytes>, d: Bytes| if contains_bytes(acc, d) { acc } else { push(acc, d) }) }), at: a.deps_at } },
+    None -> { xs: push(out.deps, { name: name, names: deps }), at: map_insert(a.deps_at, name, len(out.deps)) },
   };
-  let closure_ = match fold(range(0, len(out.closure)), None, |acc: Option<Int>, i: Int| match acc { Some(_) -> acc, None -> if at(out.closure, i).name == name { Some(i) } else { None } }) {
-    Some(i) -> { let existing = at(out.closure, i); set_at(out.closure, i, { name: name, names: names_union(existing.names, closure) }) },
-    None -> push(out.closure, { name: name, names: closure }),
+  let closure_ = match map_get(a.closure_at, name) {
+    Some(i) -> { let existing = at(out.closure, i);
+                 { xs: set_at(out.closure, i, { name: name, names: names_union(existing.names, closure) }), at: a.closure_at } },
+    None -> { xs: push(out.closure, { name: name, names: closure }), at: map_insert(a.closure_at, name, len(out.closure)) },
   };
-  {..out, deps: deps_, closure: closure_}
+  { out: {..out, deps: deps_.xs, closure: closure_.xs}, deps_at: deps_.at, closure_at: closure_.at }
 }
 
 // --- The dump -------------------------------------------------------------------------------------------
