@@ -688,7 +688,7 @@ fn the_entry_point_keeps_its_program_wide_name() {
     assert_eq!(artifact.entry_name(), Some("m.main"));
     let opened = artifact::open(&artifact, Path::new("t.plyx")).unwrap();
     assert_eq!(opened.entry.as_str(), "m.main");
-    assert!(opened.check.defs.contains_key(&opened.entry));
+    assert!(opened.front.check.defs.contains_key(&opened.entry));
 }
 
 /// An artifact is started by calling its entry point with nothing, so an entry point that takes an
