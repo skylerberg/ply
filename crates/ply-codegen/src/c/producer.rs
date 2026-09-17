@@ -150,7 +150,29 @@ fn build_from(src: &Sources) -> Result<PlyProducer, String> {
             let source = front_end(src)?;
             let names: Vec<String> = source.functions();
             let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            super::build(source, &refs).map_err(|e| format!("{e:#}"))
+            let (native, refused) = super::build(source, &refs).map_err(|e| format!("{e:#}"))?;
+            // `PlyProducer::new` would say only that the entry is missing, which does not say
+            // whether the front end never offered it or the fragment refused its body.
+            if native.entry(ENTRY).is_none() {
+                let head: Vec<String> = refused.iter().take(5).map(|r| r.to_string()).collect();
+                return Err(format!(
+                    "the committed emitter emitted no `{ENTRY}`: {} roots offered, `{ENTRY}` \
+                     {} among them, {} refused in all{}",
+                    names.len(),
+                    if names.iter().any(|n| n == ENTRY) {
+                        "was"
+                    } else {
+                        "was NOT"
+                    },
+                    refused.len(),
+                    if head.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; first refusals: {}", head.join(" | "))
+                    },
+                ));
+            }
+            Ok((native, refused))
         })
     };
     let (native, _refused) = match super::bundle::of(src) {
