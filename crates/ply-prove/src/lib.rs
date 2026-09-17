@@ -12,8 +12,8 @@ pub mod prove;
 pub mod shrink;
 
 use ply_eval::{Plan, Race, Seed};
-use ply_hash::DefHash;
 use ply_span::{Diagnostic, Span, Symbol};
+use ply_ty::DefHash;
 use ply_ty::{Footprint, LawBinder, Resource, Type};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
