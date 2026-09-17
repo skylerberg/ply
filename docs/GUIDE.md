@@ -621,7 +621,8 @@ pins it.
 
 Conversions are explicit: `decimal_of_int`, `int_of_decimal` (takes a rounding
 mode, answers `Option`), `float_of_decimal`, `decimal_of_float` (`Option`),
-`decimal_of_string` (`Option`), `decimal_to_string`, `int_to_string`, and the
+`decimal_of_string` (`Option`), `float_of_string` (`Option`),
+`decimal_to_string`, `int_to_string`, and the
 IEEE 754 bit pattern both ways, `bits_of_float` and `float_of_bits`, which are
 total: every pattern is a `Float`, NaNs included.
 
@@ -2433,6 +2434,7 @@ int_of_decimal(d, mode: Rounding) -> Option<Int>
 float_of_decimal(d) -> Float
 decimal_of_float(f) -> Option<Decimal>
 decimal_of_string(s) -> Option<Decimal>
+float_of_string(s) -> Option<Float>
 decimal_to_string(d) -> String
 bits_of_float(f) -> Int
 float_of_bits(n) -> Float
@@ -2442,6 +2444,16 @@ The scale and the rounding mode are arguments because `/` on `Decimal` is
 `E0209`: naming the rounding is the whole point. `bits_of_float` is the IEEE 754
 pattern as the signed 64-bit `Int` it fits in, and `float_of_bits` is its
 inverse; both are total, so a NaN round-trips bit for bit.
+
+`float_of_string` reads a `Float` literal's text the way the lexer reads that
+literal — digits, an optional `.` fraction, an optional `e` exponent,
+underscores where a literal may carry them, and a leading sign — so a program
+holding the text reaches the same value and the same `bits_of_float`. It answers
+`None` for everything else, `inf` and `NaN` among them: no literal spells those.
+It is not `decimal_of_string` with a conversion after it, and the difference is
+the whole reason it exists — `1.0e-30`, `1.0e300` and every other float outside
+`Decimal`'s 28 digits have no `Decimal` to go through, and an exponent past the
+range saturates, so `float_of_string("1e400")` is `Some` of an infinity.
 
 ### 13.8 Cells
 
