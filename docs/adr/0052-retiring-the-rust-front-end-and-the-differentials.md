@@ -393,12 +393,11 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merge after it, carrying §2's first deletion,
-read 126 s and reused by tree the same way, for the same reason, and the one
-after that 130 s. Three merges running have hit the lookup directly, because
-none of them moved main while another pull request sat behind it, so the
-fallback this paragraph describes is still unproven in the case it was
-written for.
+and not yet exercised. The merges after it read 126 s, 130 s and
+142 s, each reusing by tree the same way and for the same reason. Four
+running have hit the lookup directly, because none of them moved main while
+another pull request sat behind it, so the fallback this paragraph describes
+is still unproven in the case it was written for.
 
 ## 4. The loop that is O(the change)
 
@@ -551,6 +550,17 @@ whole-unit `tcc` compile sits inside the timed region on a contended runner.
 Read it for the profile's shares and never for its clock. The five-size
 curve is the fit instrument: two passes inside one run agree to half a
 percent, and two runs on different runners agreed to one.
+
+**And the port cannot time itself.** The obvious next instrument is the curve
+with the port's five stages resolved, since `front` is one number covering
+parse, resolve, index, check, and hash with the tables. It cannot be built
+inside the port. The language does declare a clock, as a prelude effect whose
+`now` is nondeterministic, so reading it inside `front` would put that effect
+in the front end's row and carry it up every signature above — contaminating
+the purity the differentials and the bootstrap fixpoint rest on, to measure
+them. The stage breakdown therefore comes from outside, timing the separate
+entries the differentials already call, which needs no change to the port and
+no bundle refresh.
 
 The lesson for the instrument is worth keeping: a flat profile is evidence
 about where time goes, not about whether an algorithm is quadratic, and
