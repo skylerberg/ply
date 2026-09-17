@@ -191,7 +191,15 @@ unit's C a function of the import graph; the table is rebuilt in program
 order from the ordinals. And the narrow register offer reads the checked
 scheme now rather than the written type, so an alias for `Int` counts as
 scalar where the written form did not, which changes what that offer
-holds and not what a body computes.
+holds and not what a body computes. The request path's shipped allocation
+figures moved with the stage and were re-taken from the command that
+writes them: a `/health` request allocates 328 objects where it allocated
+343. The count is reset after one warm request, but a fixed cost outlives
+that: read at twenty requests and at two hundred, a request's marginal
+cost is about 178 allocations on both sides, and what differs is some
+three thousand allocations the window counts once. The offered set is the
+same on both, 1066 definitions and every one answered by the port, so
+what the service computes per request did not change.
 
 **What the driver loses.** Its gates decided per file not to parse and
 per definition not to re-infer, keyed on the store's fingerprints; a run
