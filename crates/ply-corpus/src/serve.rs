@@ -440,6 +440,12 @@ impl Program {
             let id = sources.add(ply_std::pseudo_path(&module), source.to_string());
             inputs.push((id, module, source));
         }
+        // Built before `parse_program` takes `inputs`, and in its order.
+        let ordered: Vec<(String, String)> = inputs
+            .iter()
+            .map(|(_, m, s)| (m.to_string(), s.to_string()))
+            .collect();
+        let ids: Vec<ply_span::SourceId> = inputs.iter().map(|(id, _, _)| *id).collect();
         let mut program = ply_syntax::parse_program(inputs)
             .map_err(|d| diagnostics("parsing the endpoint", &d))?;
         // Before resolution, as the driver does: what resolution sees is ordinary definitions.
@@ -449,8 +455,8 @@ impl Program {
         }
         let resolved = ply_syntax::resolve::resolve(&mut program)
             .map_err(|d| diagnostics("resolving the endpoint", &d))?;
-        let check = ply_core::check_program(&program, &resolved)
-            .map_err(|d| diagnostics("checking the endpoint", &d))?;
+        let check = crate::port_check(&ordered, &ids)
+            .map_err(|e| anyhow::anyhow!("checking the endpoint: {e}"))?;
         Ok(Program {
             program,
             resolved,

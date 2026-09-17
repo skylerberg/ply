@@ -797,6 +797,32 @@ already means to retire when the bundle becomes the only way to build the
 language. The object model bounds how *fast* the port answers, not whether these
 callers can stop asking the chain.
 
+**Built, 2026-09-17: five of the corpus's six harnesses take their check from
+the port.** `w3`, `w4`, `w5`, `serve` and `measure` each needed a checked program
+in order to measure what it *does* at run time, and none of them cared who
+checked it. They ask the port now, over the same texts and in the program's
+module order — which matters, because the protocol writes a span's module as its
+position in the list handed over, and `w3`'s existing `texts` is a map for
+`Unit::over_with_texts` rather than an ordered list.
+
+`pipeline.rs` is the sixth and keeps the Rust chain. Its call sits inside
+`Phase::Typecheck`: what it reports *is* the chain's own per-phase breakdown, so
+it retires with its subject rather than moving to the port. That is the rule the
+differentials retired under, and it applies here unchanged.
+
+So `check_program` falls from eight non-test callers to three, and none of the
+three is a program a user runs: the seed path in `ply-codegen`, `stage.rs` in
+`ply-compiler-diff`, and `pipeline.rs`. Two of them are the bootstrap paths §2
+already means to retire when the bundle becomes the only way to build the
+language, and the third retires with the chain it times.
+
+**What this does not do** is touch `front_for`'s Rust arm. That is reached
+through `over_with_texts`, whose five remaining callers are all in this same
+crate: those harnesses build a *unit*, and to stop deriving a front end they
+would have to hold a `Front` the way the driver and the artifact path now do.
+That is the change after this one, and it is what stands between the hasher and
+its deletion.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -860,7 +886,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s and 127 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s and 145 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
