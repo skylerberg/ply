@@ -67,6 +67,12 @@ SOLO=(
   "archive-tree-moved:ply-cli-tests:suite:bootstrap_archive::an_archive_stops_describing_a_tree_that_moved"
   "corpus-session:ply-cli-tests:suite:incremental::the_example_corpus_agrees_across_a_session"
   "corpus-session-audit:ply-cli-tests:suite:incremental_audit::a_long_session_over_the_example_corpus_agrees_at_every_step"
+  # 9.6 s when it checked with `ply_core`, 52 s once it asked the port (ADR 0052
+  # §1), which is the front end it now measures rather than a regression. That
+  # put it 42 s above every other test in its partition and made whichever slice
+  # held it the run's pole. It needs a runner, not the threads: no override in
+  # `.config/nextest.toml`, unlike the two above it that hold the whole pool.
+  "parser-census:ply-codegen-tests:suite:parser_census::the_census_over_the_parser_spike"
 )
 
 # The packages whose tests need a postgres server and cluster binaries. They
