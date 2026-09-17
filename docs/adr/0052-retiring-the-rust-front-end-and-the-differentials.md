@@ -498,9 +498,14 @@ the change was for.
 The doubling ratios fall at every step — 2.1, 2.7, 2.5 and 3.1 become 2.0,
 2.6, 2.3 and 2.9 — and they do not fall to two. Across the range the
 exponent moves from about 1.37 to about 1.27. One quadratic is gone and the
-curve is still superlinear, so the other accumulate-then-test sites this
-record named as candidates are where to look next, and they are candidates
-still: nothing has measured them.
+curve is still superlinear.
+
+The two candidates this record named are **not** it, and reading them costs
+less than measuring them. One folds over a single effect's operations; the
+other over a single module's items, so it is quadratic in functions per
+module rather than per program. Both are the shape without the size, which
+is the same test that kept the hasher's fold out of this. The record says so
+rather than leaving a reader to rediscover it.
 
 **The switch stays held on this.** A warm run over a four-thousand-definition
 project with nothing changed now spends 27 seconds in the port rather than
