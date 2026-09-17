@@ -49,177 +49,6 @@ pub fn reference_dump_expanded(text: &str) -> String {
     dump_of(text, &module, &diags)
 }
 
-/// The reference's derive expansion of each module on its own, for the fifth differential: the
-/// source every derivation generates, byte for byte, and the diagnostics expansion raises.
-pub fn reference_derive_dump(modules: &[(String, String)]) -> String {
-    let mut out = String::new();
-    for (i, (name, text)) in modules.iter().enumerate() {
-        let (mut module, _) =
-            ply_syntax::parse_recovering(SourceId(i as u32), ModuleName::from_dotted(name), text);
-        let sources = ply_derive::preview(&module);
-        let diags = ply_derive::expand_module(&mut module);
-        out.push_str(&format!("M;{};", sources.len()));
-        for s in &sources {
-            out.push_str(&format!("S;{};{s}", s.len()));
-        }
-        resolve_diags(&mut out, &diags);
-    }
-    out
-}
-
-/// The reference's check of a program given as `(module name, source)` pairs: the rewrites, the
-/// derive expansion, the resolver and `check_program` in the driver's order, dumped for the
-/// fourth differential.
-pub fn reference_check_dump(modules: &[(String, String)]) -> String {
-    let mut program = Program {
-        modules: Vec::new(),
-    };
-    for (i, (name, text)) in modules.iter().enumerate() {
-        let (module, _) =
-            ply_syntax::parse_recovering(SourceId(i as u32), ModuleName::from_dotted(name), text);
-        program.modules.push(module);
-    }
-    let mut out = String::new();
-    out.push_str(&format!("K;{};", modules.len()));
-    // Before anything is resolved, as the driver and `check_module` expand: what resolution
-    // and inference see is ordinary definitions.
-    let expansion = ply_derive::expand_program(&mut program);
-    if !expansion.is_empty() {
-        out.push_str("X;");
-        resolve_diags(&mut out, &expansion);
-        return out;
-    }
-    let resolved = match ply_syntax::resolve::resolve(&mut program) {
-        Ok(r) => r,
-        Err(diags) => {
-            out.push_str("X;");
-            resolve_diags(&mut out, &diags);
-            return out;
-        }
-    };
-    write_outcome(&mut out, ply_core::check_program(&program, &resolved));
-    out
-}
-
-/// The restored path: the program checked, what it published handed back as `Known`, and the
-/// program checked again from those interfaces — the fourth differential's dump of the second
-/// check. A program whose first check fails dumps that failure.
-pub fn reference_check_dump_known(modules: &[(String, String)]) -> String {
-    let mut program = Program {
-        modules: Vec::new(),
-    };
-    for (i, (name, text)) in modules.iter().enumerate() {
-        let (module, _) =
-            ply_syntax::parse_recovering(SourceId(i as u32), ModuleName::from_dotted(name), text);
-        program.modules.push(module);
-    }
-    let mut out = String::new();
-    out.push_str(&format!("K;{};", modules.len()));
-    let expansion = ply_derive::expand_program(&mut program);
-    if !expansion.is_empty() {
-        out.push_str("X;");
-        resolve_diags(&mut out, &expansion);
-        return out;
-    }
-    let resolved = match ply_syntax::resolve::resolve(&mut program) {
-        Ok(r) => r,
-        Err(diags) => {
-            out.push_str("X;");
-            resolve_diags(&mut out, &diags);
-            return out;
-        }
-    };
-    let first = match ply_core::check_program(&program, &resolved) {
-        Ok(check) => check,
-        Err(diags) => {
-            write_outcome(&mut out, Err(diags));
-            return out;
-        }
-    };
-    let known = known_of(&first);
-    write_outcome(
-        &mut out,
-        ply_core::check_program_with(&program, &resolved, &known),
-    );
-    out
-}
-
-/// The reference's content addressing of a program, for the sixth differential: every hash
-/// `hash_program_ast` publishes, keyed as it keys them, and the reference graph beside them.
-pub fn reference_hash_dump(modules: &[(String, String)]) -> String {
-    let mut program = Program {
-        modules: Vec::new(),
-    };
-    for (i, (name, text)) in modules.iter().enumerate() {
-        let (module, _) =
-            ply_syntax::parse_recovering(SourceId(i as u32), ModuleName::from_dotted(name), text);
-        program.modules.push(module);
-    }
-    let mut out = String::new();
-    out.push_str(&format!("K;{};", modules.len()));
-    let expansion = ply_derive::expand_program(&mut program);
-    if !expansion.is_empty() {
-        out.push_str("E;");
-        resolve_diags(&mut out, &expansion);
-        return out;
-    }
-    let resolved = match ply_syntax::resolve::resolve(&mut program) {
-        Ok(r) => r,
-        Err(diags) => {
-            out.push_str("E;");
-            resolve_diags(&mut out, &diags);
-            return out;
-        }
-    };
-    let hashes = match ply_hash::hash_program_ast(&program, &resolved) {
-        Ok(h) => h,
-        Err(diags) => {
-            out.push_str("E;");
-            resolve_diags(&mut out, &diags);
-            return out;
-        }
-    };
-    let hexes = |hs: &[ply_hash::DefHash]| {
-        hs.iter()
-            .map(ply_hash::DefHash::to_hex)
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    for (name, h) in &hashes.defs {
-        out.push_str(&format!("H;{name};{};", h.to_hex()));
-    }
-    for (name, h) in &hashes.decls {
-        out.push_str(&format!("Y;{name};{};", h.to_hex()));
-    }
-    for h in &hashes.tests {
-        out.push_str(&format!("T;{};", h.to_hex()));
-    }
-    for h in &hashes.laws {
-        out.push_str(&format!("L;{};", h.to_hex()));
-    }
-    for h in &hashes.law_texts {
-        out.push_str(&format!("W;{};", h.to_hex()));
-    }
-    for (name, h) in &hashes.own {
-        out.push_str(&format!("O;{name};{};", h.to_hex()));
-    }
-    for (name, hs) in &hashes.specs {
-        out.push_str(&format!("S;{name};{};", hexes(hs)));
-    }
-    for (name, hs) in &hashes.spec_texts {
-        out.push_str(&format!("X;{name};{};", hexes(hs)));
-    }
-    for (name, deps) in &hashes.deps {
-        let names: Vec<String> = deps.iter().map(|d| d.to_string()).collect();
-        out.push_str(&format!("D;{name};{};", names.join(",")));
-    }
-    for (name, closure) in &hashes.closure {
-        let names: Vec<String> = closure.iter().map(|d| d.to_string()).collect();
-        out.push_str(&format!("C;{name};{};", names.join(",")));
-    }
-    out
-}
-
 /// The reference's diagnostics over a program, for the differential ADR 0052 §1 opens with: the
 /// chain the CLI driver runs, stopping where it stops -- every module parsed and its derives
 /// expanded, and nothing past a module that raised; then the resolver, the hasher and the checker,
@@ -397,125 +226,6 @@ fn reference_front(modules: &[(String, String)]) -> ply_ty::Front {
     // reference cannot carry a field the port is not held to.
     ply_codegen::fill_written(&mut front, &program, &resolved);
     front
-}
-
-/// Every definition's interface and every test's footprint, as the driver would restore them.
-fn known_of(check: &ply_core::CheckOutput) -> ply_core::Known {
-    let mut known = ply_core::Known::default();
-    for (name, def) in &check.defs {
-        known.defs.insert(
-            name.clone(),
-            ply_core::KnownDef {
-                scheme: def.scheme.clone(),
-                footprint: def.footprint.clone(),
-                performed: def.performed.clone(),
-            },
-        );
-    }
-    for t in &check.tests {
-        known
-            .tests
-            .entry(t.module.as_symbol().clone())
-            .or_default()
-            .push(Some(ply_core::KnownTest {
-                footprint: t.footprint.clone(),
-            }));
-    }
-    known
-}
-
-fn write_outcome(out: &mut String, outcome: Result<ply_core::CheckOutput, Vec<Diagnostic>>) {
-    match outcome {
-        Ok(check) => write_check(out, &check),
-        Err(diags) => {
-            out.push_str("X;");
-            resolve_diags(out, &diags);
-        }
-    }
-}
-
-fn write_check(out: &mut String, check: &ply_core::CheckOutput) {
-    for (name, def) in &check.defs {
-        out.push_str(&format!(
-            "F;{name};{};{};{};{};{};",
-            ply_core::print_scheme(&def.scheme),
-            footprint_text(&def.footprint),
-            footprint_text(&def.performed),
-            def.constraints
-                .iter()
-                .map(|c| format!("{}{}", c.deriver, c.param))
-                .collect::<Vec<_>>()
-                .join(","),
-            if def.internally_effectful { 1 } else { 0 }
-        ));
-    }
-    for t in &check.tests {
-        out.push_str(&format!(
-            "T;{};{};{};",
-            t.key,
-            if t.nondet { 1 } else { 0 },
-            footprint_text(&t.footprint)
-        ));
-    }
-    for l in &check.laws {
-        let binders: Vec<String> = l
-            .binders
-            .iter()
-            .map(|b| format!("{}:{}", b.name, ply_core::print_type(&b.ty)))
-            .collect();
-        out.push_str(&format!(
-            "L;{};{};{};{};{};",
-            l.key,
-            binders.join(","),
-            if l.has_guard { 1 } else { 0 },
-            if l.host { 1 } else { 0 },
-            footprint_text(&l.footprint)
-        ));
-    }
-    for (name, e) in &check.effects {
-        if e.module.is_anonymous() {
-            continue;
-        }
-        let ops: Vec<String> = e
-            .ops
-            .values()
-            .map(|o| {
-                let params: Vec<String> = o.params.iter().map(ply_core::print_type).collect();
-                format!(
-                    "{}:{}:{}:{}:{}",
-                    o.name,
-                    o.mode.as_str(),
-                    if o.resource_param { 1 } else { 0 },
-                    params.join("+"),
-                    ply_core::print_type(&o.ret)
-                )
-            })
-            .collect();
-        out.push_str(&format!(
-            "E;{name};{};{};",
-            if e.nondet { 1 } else { 0 },
-            ops.join(",")
-        ));
-    }
-    for (name, c) in &check.ctors {
-        if c.module.is_anonymous() {
-            continue;
-        }
-        out.push_str(&format!(
-            "C;{name};{};{};{};{};",
-            c.type_name,
-            c.index,
-            c.arity,
-            ply_core::print_scheme(&c.scheme)
-        ));
-    }
-}
-
-fn footprint_text(f: &ply_core::Footprint) -> String {
-    f.atoms()
-        .map(|a| a.to_string())
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 /// **The tree half of the same cost: how many nodes the three rewrites add.** Signed, because
@@ -1416,64 +1126,6 @@ pub fn byte_literal(bytes: &[u8]) -> String {
     out
 }
 
-// --- The resolve phase -------------------------------------------------------
-//
-// The second phase under comparison: `ply_syntax::resolve` over a whole program, and the
-// `defaults` pass it ends with. One record-based dump of the resolved tables, the load order, the
-// diagnostics with their module index, and the post-defaults trees — the same encoding the Ply
-// port's `resolve.ply` writes.
-
-/// The reference's resolution of a program given as `(module name, source)` pairs, in the same
-/// order and with the same `SourceId`s the harness hands the Ply side.
-pub fn reference_resolve_dump(modules: &[(String, String)]) -> String {
-    let mut program = Program {
-        modules: Vec::new(),
-    };
-    for (i, (name, text)) in modules.iter().enumerate() {
-        let (module, _) = parse_unexpanded(SourceId(i as u32), ModuleName::from_dotted(name), text);
-        program.modules.push(module);
-    }
-    let mut out = String::new();
-    out.push_str(&format!("R;{};", modules.len()));
-    match ply_syntax::resolve::resolve(&mut program) {
-        Ok(resolved) => {
-            for (i, scope) in resolved.scopes.iter().enumerate() {
-                out.push_str(&format!("M;{i};{};", scope.module));
-                for (binder, (target, span)) in &scope.modules {
-                    out.push_str(&format!("B;{binder};{target};{}:{};", span.start, span.end));
-                }
-                for (binder, (target, span)) in &scope.selective {
-                    out.push_str(&format!("S;{binder};{target};{}:{};", span.start, span.end));
-                }
-                for (tag, space) in [
-                    ("V", &scope.values),
-                    ("T", &scope.types),
-                    ("E", &scope.effects),
-                ] {
-                    for (name, b) in space {
-                        out.push_str(&format!(
-                            "{tag};{name};{};{};{}:{};",
-                            b.qualified, b.owner, b.span.start, b.span.end
-                        ));
-                    }
-                }
-            }
-            let order: Vec<String> = resolved.order.iter().map(|i| i.to_string()).collect();
-            out.push_str(&format!("O;{};", order.join(",")));
-            resolve_diags(&mut out, &[]);
-            for (i, module) in program.modules.iter().enumerate() {
-                out.push_str(&format!("P;{i};"));
-                out.push_str(&dump_of(&modules[i].1, module, &[]));
-            }
-        }
-        Err(diags) => {
-            out.push_str("X;");
-            resolve_diags(&mut out, &diags);
-        }
-    }
-    out
-}
-
 /// `Dumper::diags` with each label's module in front of its span, since a program has many.
 fn resolve_diags(out: &mut String, ds: &[Diagnostic]) {
     out.push_str(&format!("D;{};", ds.len()));
@@ -2294,14 +1946,15 @@ pub fn part<T: Clone>(items: &[T], index: usize, of: usize) -> Vec<T> {
         .collect()
 }
 
-/// The reference's dump beside every input, as files under `fixtures/goldens/<phase>/`, so that
-/// the day the Rust reference retires the specification the port is held to is already in the
-/// tree (ADR 0050 §2).
+/// One dump beside every input, as files under `fixtures/goldens/<phase>/`: the specification the
+/// port is held to, in the tree, so that it survives the Rust reference's retirement
+/// (ADR 0050 §2).
 ///
-/// With `PLY_DIFF_BLESS` set, [`golden::check`] writes the reference's dump as the golden and
-/// still compares the port against it. Without it, the golden has to exist, the reference has to
-/// agree with it -- a golden that drifts from the reference is red, not silently rewritten -- and
-/// the port has to agree with it. The last of the three is what survives the reference.
+/// The golden has to exist and the port has to agree with it. That is the whole check: nothing
+/// recomputes a reference dump to compare against, so the goldens are what the phase means.
+/// With `PLY_DIFF_BLESS` set, [`golden::check`] rewrites the golden from the **port's** answer --
+/// it used to take the reference's -- which makes blessing a deliberate act of moving the
+/// specification rather than of re-deriving it from a second implementation.
 pub mod golden {
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -2341,37 +1994,25 @@ pub mod golden {
         }
     }
 
-    /// Holds `reference` and `port` to the golden, or writes it when blessing. `diff` is the
+    /// Holds `port` to the golden, or rewrites the golden from it when blessing. `diff` is the
     /// phase's own first-difference report, `diff(want, got)`.
     pub fn check(
         phase: &str,
         name: &str,
-        reference: &str,
         port: &str,
         diff: impl Fn(&str, &str) -> Option<String>,
     ) -> Result<(), String> {
         let (path, index) = place(phase, name);
         if blessing() {
-            write(&path, index, reference);
-            return match diff(reference, port) {
-                Some(report) => Err(format!(
-                    "the port disagrees with the reference on {name}:\n{report}"
-                )),
-                None => Ok(()),
-            };
+            write(&path, index, port);
+            return Ok(());
         }
         let Some(golden) = read(&path, index) else {
             return Err(format!(
-                "no golden for {name} at {}; run this test with PLY_DIFF_BLESS=1 to write it from the reference",
+                "no golden for {name} at {}; run this test with PLY_DIFF_BLESS=1 to write it",
                 path.display()
             ));
         };
-        if let Some(report) = diff(&golden, reference) {
-            return Err(format!(
-                "the reference has drifted from the golden for {name} at {}; bless it deliberately with PLY_DIFF_BLESS=1 if the change is meant:\n{report}",
-                path.display()
-            ));
-        }
         if let Some(report) = diff(&golden, port) {
             return Err(format!(
                 "the port disagrees with the golden on {name}:\n{report}"

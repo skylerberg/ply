@@ -58,16 +58,13 @@ fn first_difference(reference: &str, actual: &str) -> Option<String> {
 fn check_agreement(path: &Path) {
     let began = std::time::Instant::now();
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let text = String::from_utf8(bytes.clone())
-        .unwrap_or_else(|e| panic!("{} is not UTF-8: {e}", path.display()));
-    let reference = reference_dump(&text);
     let actual = floats_to_bits(&ply_dump(&bytes));
     let name = path
         .strip_prefix(repo_root())
         .unwrap_or(path)
         .display()
         .to_string();
-    if let Err(report) = golden::check("lexer", &name, &reference, &actual, first_difference) {
+    if let Err(report) = golden::check("lexer", &name, &actual, first_difference) {
         panic!("{report}");
     }
     // Printed under `--nocapture` so that a file the loop silently skipped is visible: a comparison
@@ -81,7 +78,7 @@ fn check_agreement(path: &Path) {
             .collect::<Vec<_>>()
             .join("/"),
         bytes.len(),
-        records(&reference).len(),
+        records(&actual).len(),
         began.elapsed().as_secs_f64()
     );
 }

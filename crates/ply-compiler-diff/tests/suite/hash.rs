@@ -6,7 +6,7 @@
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
 
 use ply_compiler_diff::part;
-use ply_compiler_diff::{golden, port, programs, records, reference_hash_dump};
+use ply_compiler_diff::{golden, port, programs, records};
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
@@ -52,9 +52,8 @@ fn compare(label: &str, inputs: &[(String, Vec<(String, String)>)]) {
     let mut records_total = 0usize;
     for (name, program) in inputs {
         let actual = port::dump_program("hash.hash_dump", program);
-        let reference = reference_hash_dump(program);
-        records_total += records(&reference).len();
-        if let Err(report) = golden::check("hash", name, &reference, &actual, first_difference) {
+        records_total += records(&actual).len();
+        if let Err(report) = golden::check("hash", name, &actual, first_difference) {
             failures.push(format!("{label}: {report}"));
         }
     }
