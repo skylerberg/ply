@@ -668,6 +668,33 @@ it is a property of the goldens, not of the move. Worth a note beside the claim
 because the first reaction to a red `rewrite` run is to look for a regression that
 is not there.
 
+**Read, 2026-09-17: §1 and §2 end where §4 does, and for the same reason.** The
+driver enters the port once and takes everything back, and every command goes
+through it. What is left of the Rust chain on a live path is one thing:
+`front_for`'s default. `ply_codegen::source` answers a unit's tables from
+`ply_hash::hash_program_with_bodies` unless `PLY_FRONT=port` is set, and one solo
+row sets it. Every remaining caller of the checker and the hasher sits behind
+that door — three in `ply-codegen`, five in `ply-compiler-diff` and nine in
+`ply-corpus`, which runs in no CI job at all — so retiring the default is what
+would take them, and retiring it means asking the port for a front end per unit.
+
+§4 has priced that from the other side, with the instruments this record trusts
+rather than a differential's clock. Three quadratics are out, the front end is
+proportional, and what stands between 13.14 s and 0.41 s over four thousand
+definitions is a constant factor of about a hundred and forty. A constant factor
+is the object model, and this record says in its opening that it does not decide
+the runtime.
+
+So the parts do not finish independently, and it is worth saying where they
+stop rather than leaving it to be rediscovered. §2's deletion of `ply-core`'s
+checker and `ply-hash`'s hasher waits on §1's last callers; those wait on the
+per-unit cost; and that is ADR 0051's levers and the C runtime — BOOTSTRAP-PATH
+step 4, the record after this. What §2 could finish without them is finished:
+every differential that read the Rust front end is retired, the goldens that
+outlive them have moved to a crate that survives, and what remains —
+`agreement`, `lexer_agreement`, `fields` — holds the *parser*, which this record
+defers for the same reason it defers the checker's last mile.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -731,7 +758,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s and 130 s, each reusing by tree the same way and for the same reason. Three of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the third is 324 s, which the paragraph after it takes and which the tree did not cause. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s and 139 s, each reusing by tree the same way and for the same reason. Three of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the third is 324 s, which the paragraph after it takes and which the tree did not cause. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
