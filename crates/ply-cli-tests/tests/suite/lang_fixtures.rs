@@ -38,10 +38,22 @@ fn failures(dir: &Path, tier_only: bool) -> Vec<Value> {
     }
     let out = cmd.output().unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
-    let report: Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
+    // What the child said, kept for when it fails. Two attempts at ADR 0052 §2's seed path were
+    // diagnosed blind because this dropped it twice over: `ply test` answered an error shape, and
+    // the reason was on a stderr nobody read. A canary that reports only *that* something broke
+    // costs more than it saves.
+    let said = || {
+        format!(
+            "exit {:?}\nstdout: {text}\nstderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let report: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("the report does not parse: {e}\n{}", said()));
     report["failures"]
         .as_array()
-        .expect("a failures array")
+        .unwrap_or_else(|| panic!("the report has no `failures` array\n{}", said()))
         .clone()
 }
 
