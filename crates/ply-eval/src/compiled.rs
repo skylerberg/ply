@@ -267,7 +267,7 @@ impl CarriedTypes {
                 // before this table is asked; keeping them out here keeps the leaf set honest.
                 "Float" | "Decimal" => false,
                 // A world handle and a credential are `Type::Con`s like any other.
-                "Cell" | ply_core::prelude::TASK_TYPE | SECRET => false,
+                "Cell" | ply_ty::prelude::TASK_TYPE | SECRET => false,
                 // The fixed-width integer types, explicitly rather than by falling through to the
                 // undeclared arm below. Compiled code holds one as a tagged immediate, which is
                 // what an `Int` is held as, so a value crossing back would arrive as an `Int` and

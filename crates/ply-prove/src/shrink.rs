@@ -3,11 +3,11 @@
 use crate::property::{
     HARD_GEN_DEPTH, Judge, Outcome, TypeWorld, Ungeneratable, const_fn, fn_size, judge_case,
 };
-use ply_core::prelude;
 use ply_eval::{Decimal, Fixed, List, Value};
 use ply_span::{Diagnostic, Symbol};
 use ply_ty::IntTy;
 use ply_ty::Type;
+use ply_ty::prelude;
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
 use std::collections::BTreeMap;

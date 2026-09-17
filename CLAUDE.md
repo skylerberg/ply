@@ -53,7 +53,7 @@ claims §"The one rule" enumerates were all noticed years late.
 | `crates/ply-core/src/infer.rs` — `require_written_signature`, `settle_numerics`, `infer_stmt`'s `let` | §5.9, which states what is written and what is inferred, and §5.2's numeric rule |
 | `crates/ply-core/src/infer.rs` — `install_prelude` | §13, the builtin tables, **with the signature as inference publishes it** |
 | `crates/ply-core/src/infer.rs` — `BUILTIN_TYPE_CONS` | §5.1 scalars, §5.7 |
-| `crates/ply-core/src/prelude.rs` — `ADTS`, the prelude effects | §5.7, §10.2 |
+| `crates/ply-ty/src/prelude.rs` — `ADTS`, the prelude effects | §5.7, §10.2 |
 | `crates/ply-derive/src/rules.rs` — `Shape`, `Refusal`, `Deriver` | §12.1, §12.4 |
 | `crates/ply-eval/src/limit.rs` — `DEFAULT_MAX_CALLS`, `MAX_VALUE_DEPTH` | §6.9, §19.1 |
 | `crates/ply-span/src/lib.rs` — `codes` | §18, which is **total over `codes`** |
