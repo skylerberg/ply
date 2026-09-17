@@ -1863,6 +1863,34 @@ emitter change and not every one. `test bootstrap` does not stand in for it: it
 emits the same unit through a `build_from` of its own and never enters this one.
 That is the right place for the exercise, and it is less of it.
 
+**Read, 2026-09-17: a cancelled run costs the next one, and has no wall clock of
+its own.** Main read 288 s after a merge that changed one document and no code.
+That is the largest excursion this section holds and the first of a third shape:
+not a job that failed to start, and not the tree.
+
+The time is in the build rather than the fan-out. `cargo nextest archive` ran
+**156 s** against 32 s on the run measured above, and `cargo build --release -p
+ply-cli` **124 s** against 17 s. The partitions began at +164 s, which reads like
+the late fan-out of the seven excursions above and is not one: the archive ended
+at +161 s and the partitions wait on it. Once begun they ran 88 s to 116 s, which
+is the ordinary band.
+
+The cache was cold because the run before it never finished. Landing two merges
+back to back cancels the first merge's run, and a cancelled run writes no cache,
+so the next one rebuilds from nothing. One event, two symptoms: that cancelled
+run also left this section no reading to take.
+
+**A cancelled run still has a duration, and it is not a wall clock.** The figure
+first taken for that merge was "134 s, under the bound" -- the length of a run
+killed part-way, not the length of a run that did the work. A reading counts only
+when its conclusion is `success`, and a watcher that prints a bound against
+anything else is reporting a pass it did not measure.
+
+**So the cadence is part of the bound.** A merge lands after the previous merge's
+run has finished, or the next run pays the build from cold. No deletion in §2
+moves that, and the largest excursion in this section came from spacing two
+merges too closely rather than from anything in the tree.
+
 **Why each of these got written at all.** The scripts that append a reading assert
 `wall < 173`; an over-bound one fails them and takes a different entry point that
 asserts the opposite. The guard is the reason eight excursions were each written
