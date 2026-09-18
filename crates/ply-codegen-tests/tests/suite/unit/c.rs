@@ -4,9 +4,7 @@ mod cache;
 mod sweep;
 mod toolchain;
 
-use ply_codegen::c::{
-    HELPERS, Native, PRELUDE, compile_and_load, emit_one, helper_addresses, runtime_decls,
-};
+use ply_codegen::c::{HELPERS, Native, PRELUDE, compile_and_load, helper_addresses, runtime_decls};
 
 /// Every helper the prelude declares has an address, and the two tables are the same length: a
 /// declaration with no address is a null call at run time, which is a crash rather than a decline.
@@ -143,27 +141,10 @@ pub mod tests_support {
     use ply_codegen::c::Native;
     use ply_codegen::source::Source;
     use ply_syntax::ast::ModuleName;
+    use std::collections::HashMap;
 
     pub fn unit(text: &str) -> Option<(&'static Source, Native)> {
         with_refusals(text).map(|(s, n, _)| (s, n))
-    }
-
-    /// A machine over `source` with the default tier attached, so what the reference fragment
-    /// answers is checked against what the whole emitter answers.
-    pub fn machine(source: &'static Source, text: &str) -> ply_eval::Machine<'static> {
-        let texts = std::collections::HashMap::from([("m".to_string(), text.to_string())]);
-        let unit = {
-            let _config = super::CONFIG.read().unwrap_or_else(|e| e.into_inner());
-            ply_codegen::Unit::over_with_texts(source.program, source.resolved, source.check, texts)
-                .expect("this host has a C compiler")
-        };
-        let mut machine = ply_eval::Machine::new(source.program, source.resolved, source.check);
-        let spec = ply_eval::BackendSpec {
-            kind: ply_eval::BackendKind::C,
-            ..Default::default()
-        };
-        machine.set_compiled(ply_eval::Provider::attach(unit, &spec));
-        machine
     }
 
     /// The same, with a key per definition so the emit cache is live.
@@ -196,9 +177,9 @@ pub mod tests_support {
         let program = bare.program;
         let resolved = bare.resolved;
         let check = bare.check;
-        Some(Box::leak(Box::new(Source::keyed(
-            program, resolved, check, keys,
-        ))))
+        Some(Box::leak(Box::new(
+            Source::keyed(program, resolved, check, keys).with_texts(texts(text)),
+        )))
     }
 
     pub fn with_refusals(
@@ -214,27 +195,46 @@ pub mod tests_support {
             ply_codegen::c::producer::checked_front(&[("m".to_string(), owned.to_string())], &[id])
                 .expect("checks")
                 .check;
-        let source: &'static Source = Box::leak(Box::new(Source::new(
-            Box::leak(Box::new(ast)),
-            Box::leak(Box::new(resolved)),
-            Box::leak(Box::new(check)),
-        )));
+        let source: &'static Source = Box::leak(Box::new(
+            Source::new(
+                Box::leak(Box::new(ast)),
+                Box::leak(Box::new(resolved)),
+                Box::leak(Box::new(check)),
+            )
+            .with_texts(texts(text)),
+        ));
         let names = source.functions();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let _config = super::CONFIG.read().unwrap_or_else(|e| e.into_inner());
-        match ply_codegen::c::producer::reference_only(|| ply_codegen::c::build(source, &refs)) {
+        match ply_codegen::c::build(source, &refs) {
             Ok((native, refused)) => Some((source, native, refused)),
             Err(e) if e.to_string().contains("could not run") => None,
             Err(e) => panic!("{e}"),
         }
     }
+
+    /// What the interpreter answers, which is the oracle the tier is held to.
+    pub fn interpreted(
+        source: &'static Source,
+        name: &str,
+        args: &[ply_eval::Value],
+    ) -> Result<ply_eval::Value, ply_span::Diagnostic> {
+        ply_eval::interp::Pure::new(source.program, source.resolved).call(
+            name,
+            args.to_vec(),
+            ply_span::Span::DUMMY,
+            100_000,
+        )
+    }
+
+    fn texts(text: &str) -> HashMap<String, String> {
+        HashMap::from([("m".to_string(), text.to_string())])
+    }
 }
 
-/// The two tiers answer the same thing over the constructs the fragment carries. This is the
-/// property that matters: a second code generator is a second chance to be wrong, and the only
-/// defence is that it is checked against the first and against the machine.
+/// The tier answers what the interpreter answers over widths, loops, bytes, shifts and matches.
 #[test]
-fn the_two_tiers_agree() {
+fn the_tier_agrees_with_the_interpreter() {
     let source = r#"
 type Quad = { a: U32, b: U32, c: U32, d: U32 }
 fn g(q: Quad, mx: U32) -> Quad = {
@@ -266,7 +266,6 @@ pub fn looped(n: Int) -> Int =
     let Some((loaded, native)) = tests_support::unit(source) else {
         return;
     };
-    let mut machine = tests_support::machine(loaded, source);
     let cases: &[(&str, Vec<ply_eval::Value>)] = &[
         ("m.mixed", vec![ply_eval::Value::Int(0xDEAD_BEEF)]),
         ("m.mixed", vec![ply_eval::Value::Int(0)]),
@@ -290,9 +289,8 @@ pub fn looped(n: Int) -> Int =
         ("m.matched", vec![ply_eval::Value::Int(7)]),
     ];
     for (name, args) in cases {
-        let want = machine
-            .call(name, args.clone(), ply_span::Span::DUMMY)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+        let want = tests_support::interpreted(loaded, name, args)
+            .unwrap_or_else(|d| panic!("`{name}` raised in the interpreter: {}", d.message));
         let entry: ply_codegen::rt::Entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -306,7 +304,10 @@ pub fn looped(n: Int) -> Int =
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
-        assert_eq!(got, want, "`{name}{args:?}`: the tiers disagree");
+        assert_eq!(
+            got, want,
+            "`{name}{args:?}`: the tier and the interpreter disagree"
+        );
     }
 }
 
@@ -329,7 +330,6 @@ pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 265443576
     let Some((loaded, native, _)) = tests_support::with_refusals(source) else {
         return;
     };
-    let mut machine = tests_support::machine(loaded, source);
     for name in ["m.wide", "m.narrow"] {
         let entry: ply_codegen::rt::Entry = native
             .entry(name)
@@ -337,7 +337,7 @@ pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 265443576
         // `-7` is the machine raising -- `u64_of_int` refuses a negative -- and the tier has to
         // raise with it rather than answer.
         for n in [0i64, 1, 12_345, 1 << 40, -7] {
-            let want = machine.call(name, vec![ply_eval::Value::Int(n)], ply_span::Span::DUMMY);
+            let want = tests_support::interpreted(loaded, name, &[ply_eval::Value::Int(n)]);
             let mut ctx = native.context();
             ctx.fuel = 1_000;
             let layouts_ptr: *const ply_codegen::heap::Layouts = &native.tables().layouts;
@@ -351,12 +351,12 @@ pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 265443576
                     let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
                     assert_eq!(
                         got, want,
-                        "`{name}({n})`: the tier and the machine disagree"
+                        "`{name}({n})`: the tier and the interpreter disagree"
                     );
                 }
                 Err(d) => assert_ne!(
                     ctx.failed, 0,
-                    "`{name}({n})` answered where the machine raised: {}",
+                    "`{name}({n})` answered where the interpreter raised: {}",
                     d.message
                 ),
             }
@@ -401,11 +401,9 @@ fn noted(p: P, x: Int) -> P = {{ pos: p.pos, depth: p.depth, diags: push(p.diags
         let Some((loaded, native)) = tests_support::unit(&source) else {
             return;
         };
-        let mut machine = tests_support::machine(loaded, &source);
         let args = vec![ply_eval::Value::Int(4)];
-        let want = machine
-            .call("m.probe", args.clone(), ply_span::Span::DUMMY)
-            .unwrap_or_else(|d| panic!("`{which}` raised in the machine: {}", d.message));
+        let want = tests_support::interpreted(loaded, "m.probe", &args)
+            .unwrap_or_else(|d| panic!("`{which}` raised in the interpreter: {}", d.message));
         let entry: ply_codegen::rt::Entry = native.entry("m.probe").expect("compiled");
         let mut ctx = native.context();
         ctx.fuel = 100_000;
@@ -417,7 +415,10 @@ fn noted(p: P, x: Int) -> P = {{ pos: p.pos, depth: p.depth, diags: push(p.diags
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{which}` raised in the C tier");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
-        assert_eq!(got, want, "`{which}`: the tiers disagree");
+        assert_eq!(
+            got, want,
+            "`{which}`: the tier and the interpreter disagree"
+        );
     }
 }
 
@@ -468,16 +469,14 @@ pub fn named(b: Bytes) -> Int = code(TName(b))
         refused.is_empty(),
         "nothing here is outside the fragment: {refused:?}"
     );
-    let mut machine = tests_support::machine(loaded, source);
     let cases: &[(&str, Vec<ply_eval::Value>)] = &[
         ("m.round", vec![ply_eval::Value::Int(7)]),
         ("m.eof", vec![]),
         ("m.named", vec![ply_eval::Value::bytes(b"abcd")]),
     ];
     for (name, args) in cases {
-        let want = machine
-            .call(name, args.clone(), ply_span::Span::DUMMY)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+        let want = tests_support::interpreted(loaded, name, args)
+            .unwrap_or_else(|d| panic!("`{name}` raised in the interpreter: {}", d.message));
         let entry: ply_codegen::rt::Entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -491,7 +490,10 @@ pub fn named(b: Bytes) -> Int = code(TName(b))
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
-        assert_eq!(got, want, "`{name}{args:?}`: the tiers disagree");
+        assert_eq!(
+            got, want,
+            "`{name}{args:?}`: the tier and the interpreter disagree"
+        );
     }
 }
 
@@ -530,7 +532,6 @@ pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
     );
     let list =
         |xs: &[i64]| ply_eval::Value::list(xs.iter().map(|n| ply_eval::Value::Int(*n)).collect());
-    let mut machine = tests_support::machine(loaded, source);
     let cases: &[(&str, Vec<ply_eval::Value>)] = &[
         ("m.twice", vec![list(&[1, 2, 3])]),
         ("m.and_len", vec![list(&[1, 2, 3])]),
@@ -546,9 +547,8 @@ pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
         ),
     ];
     for (name, args) in cases {
-        let want = machine
-            .call(name, args.clone(), ply_span::Span::DUMMY)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+        let want = tests_support::interpreted(loaded, name, args)
+            .unwrap_or_else(|d| panic!("`{name}` raised in the interpreter: {}", d.message));
         let entry: ply_codegen::rt::Entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -562,7 +562,10 @@ pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
-        assert_eq!(got, want, "`{name}{args:?}`: the tiers disagree");
+        assert_eq!(
+            got, want,
+            "`{name}{args:?}`: the tier and the interpreter disagree"
+        );
     }
 }
 
@@ -609,9 +612,7 @@ pub fn alone(n: Int) -> Int = twice(n)
         Some(ply_codegen::heap::imm_value(w))
     };
 
-    let (wide, _) =
-        ply_codegen::c::producer::reference_only(|| ply_codegen::c::build(loaded, &all))
-            .expect("builds");
+    let (wide, _) = ply_codegen::c::build(loaded, &all).expect("builds");
     assert_eq!(answer(&wide, "m.both", 5), Some(25));
     drop(wide);
 
@@ -619,9 +620,7 @@ pub fn alone(n: Int) -> Int = twice(n)
     // path the digest has to follow: `names` is unchanged, so a digest taken before the filter is
     // the same digest, and the refusals below land under the wider run's key.
     unsafe { std::env::set_var("PLY_C_SKIP", "m.thrice") };
-    let (narrowed, refused) =
-        ply_codegen::c::producer::reference_only(|| ply_codegen::c::build(loaded, &all))
-            .expect("builds");
+    let (narrowed, refused) = ply_codegen::c::build(loaded, &all).expect("builds");
     assert!(
         refused.iter().any(|r| r.function == "m.both"),
         "`m.both` calls a definition this build was not offered: {refused:?}"
@@ -631,9 +630,7 @@ pub fn alone(n: Int) -> Int = twice(n)
 
     unsafe { std::env::remove_var("PLY_C_SKIP") };
     // The one that used to come back wrong.
-    let (again, refused) =
-        ply_codegen::c::producer::reference_only(|| ply_codegen::c::build(loaded, &all))
-            .expect("builds");
+    let (again, refused) = ply_codegen::c::build(loaded, &all).expect("builds");
     assert!(
         refused.is_empty(),
         "the wider build was served the narrower one's refusals: {refused:?}"
@@ -705,9 +702,7 @@ pub fn tagged(n: Int) -> Int = label(if n > 0 {{ TB(n) }} else {{ TA }})
 
     // Writing: `UNITS_REUSED` below counts every build in the process, not just these two.
     let _config = CONFIG.write().unwrap_or_else(|e| e.into_inner());
-    let (built, _) =
-        ply_codegen::c::producer::reference_only(|| ply_codegen::c::build(loaded, &names))
-            .expect("the first build");
+    let (built, _) = ply_codegen::c::build(loaded, &names).expect("the first build");
     let first = (
         ask(&built, "m.both", &[3, 4]),
         ask(&built, "m.tagged", &[7]),
@@ -721,9 +716,7 @@ pub fn tagged(n: Int) -> Int = label(if n > 0 {{ TB(n) }} else {{ TA }})
     drop(built);
 
     let reused = ply_codegen::c::cache::UNITS_REUSED.load(std::sync::atomic::Ordering::Relaxed);
-    let (again, _) =
-        ply_codegen::c::producer::reference_only(|| ply_codegen::c::build(loaded, &names))
-            .expect("the second build");
+    let (again, _) = ply_codegen::c::build(loaded, &names).expect("the second build");
     assert_eq!(
         ply_codegen::c::cache::UNITS_REUSED.load(std::sync::atomic::Ordering::Relaxed),
         reused + 1,
@@ -856,24 +849,16 @@ pub fn wrap(n: Int) -> List<Bytes> = [byte_of_int(n)]
     let Some(loaded) = tests_support::keyed(source) else {
         return;
     };
-    let ctors = loaded.ctors();
-    let digest = ply_codegen::c::cache::ctors_digest(&ctors);
-    let mut unit = ply_codegen::c::emit::Unit::new(ctors, vec!["m.wrap".to_string()]);
-    let inlining = ply_codegen::opt::Inlining::EMITTED;
-    // This test reads the reference emitter's own C. `keyed` installs the default producer so the
-    // check can be answered, and without this that producer is asked for the body and answers
-    // none, since the source it was keyed from carries no texts.
-    let (text, _) = ply_codegen::c::producer::reference_only(|| {
-        emit_one(
-            loaded,
-            &mut unit,
-            "m.wrap",
-            &digest,
-            (inlining.budget, inlining.depth),
-            "",
-        )
-    })
-    .expect("`wrap` emits");
+    let produced = {
+        let _config = CONFIG.read().unwrap_or_else(|e| e.into_inner());
+        ply_codegen::c::produce(loaded, &["m.wrap"]).expect("`wrap` emits")
+    };
+    let body = produced
+        .text
+        .find("Word ply_m_wrap(PlyCtx *ctx")
+        .map(|at| &produced.text[at..])
+        .expect("the unit has a body for `wrap`");
+    let text = &body[..body.find("\n}\n").map_or(body.len(), |end| end + 3)];
     assert!(
         text.contains("rt_byte_of_int_p") && text.contains("rt_list_p"),
         "the body no longer has the shape this test is about:\n{text}"

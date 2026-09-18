@@ -7,8 +7,9 @@
 //! builds the new one with, but what it emits is the old emitter's C and the caches would key it
 //! as the new one's. `PLY_C_BOOTSTRAP_REFRESH=1` rewrites `crates/ply-compiler/bootstrap` with the
 //! fixpoint's own emission; CI does the same when this test goes red and hands the result back as
-//! the `bootstrap-bundle` artifact. With no bundle at all, the refresh builds the first emitter
-//! with the reference, which under tier-only can no longer emit it whole.
+//! the `bootstrap-bundle` artifact. The emitter is only ever built from a bundle, so one this
+//! runtime does not serve is recovered by checking out an older one from git history, then
+//! refreshing.
 
 use ply_codegen::Source;
 use ply_codegen::c::Produced;
@@ -83,36 +84,27 @@ fn emitter_source() -> (&'static Source, String) {
     (source, identity)
 }
 
-fn build_from(source: &'static Source, from: Option<&Path>) -> Result<PlyProducer, String> {
-    let from_reference = || {
-        let names: Vec<String> = source.functions();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        ply_codegen::c::build(source, &refs).map_err(|e| format!("{e:#}"))
-    };
-    let (native, _) = match from.and_then(ply_codegen::c::bundle::from_dir) {
-        Some(bundle) => match ply_codegen::c::bundle::build(&bundle) {
-            Ok(built) => built,
-            // The one thing the reference still builds the emitter for: a bundle whose helper
-            // table this runtime's does not start with, which is how such a refresh begins.
-            Err(e) if e.downcast_ref::<ply_codegen::c::Unserved>().is_some() => {
-                eprintln!("{e:#}; the reference builds the emitter");
-                from_reference()?
-            }
-            Err(e) => return Err(format!("{e:#}")),
-        },
-        None => from_reference()?,
-    };
+fn build_from(dir: &Path) -> Result<PlyProducer, String> {
+    let bundle = ply_codegen::c::bundle::from_dir(dir)
+        .ok_or_else(|| format!("no bootstrap bundle at {}", dir.display()))?;
+    let (native, _) = ply_codegen::c::bundle::build(&bundle).map_err(|e| {
+        if e.downcast_ref::<ply_codegen::c::Unserved>().is_some() {
+            format!(
+                "{e:#}; this runtime cannot build the emitter from the bundle at {}: check out an \
+                 older bundle it serves from git history, then refresh it with \
+                 PLY_C_BOOTSTRAP_REFRESH=1",
+                dir.display()
+            )
+        } else {
+            format!("{e:#}")
+        }
+    })?;
     PlyProducer::new(native).map_err(|e| format!("{e:#}"))
 }
 
 /// Emits the emitter's own unit with the producer built from `from`, into a cache of its own so
 /// nothing an earlier emission wrote is read back.
-fn emit_with(
-    source: &'static Source,
-    from: Option<&Path>,
-    scratch: &Path,
-    identity: &str,
-) -> Produced {
+fn emit_with(source: &'static Source, from: &Path, scratch: &Path, identity: &str) -> Produced {
     producer::reset_thread();
     let cache = scratch.join(format!("cache-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&cache);
@@ -123,7 +115,7 @@ fn emit_with(
     // first round's emitter for the second, and the difference between those two emissions is
     // the whole of what the fixpoint compares.
     let _held = producer::hand_over(
-        build_from(source, from).expect("the emitter builds"),
+        build_from(from).expect("the emitter builds"),
         identity.to_string(),
     );
     ply_codegen::c::produce(source, &refs).expect("the emitter's unit emits")
@@ -136,13 +128,12 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
     let (source, identity) = emitter_source();
     let bundle = PathBuf::from(ply_compiler::bootstrap::DIR);
     let refresh = std::env::var("PLY_C_BOOTSTRAP_REFRESH").is_ok();
-    let have = ply_codegen::c::bundle::exists(&bundle);
     assert!(
-        have || refresh,
-        "no bootstrap bundle at {}; run this test with PLY_C_BOOTSTRAP_REFRESH=1 to write one from the reference",
+        ply_codegen::c::bundle::exists(&bundle),
+        "no bootstrap bundle at {}; check one out from git history, then refresh it with PLY_C_BOOTSTRAP_REFRESH=1",
         bundle.display()
     );
-    if have && !refresh {
+    if !refresh {
         let current = ply_codegen::c::bundle::from_dir(&bundle).expect("the bundle serves");
         assert_eq!(
             current.sources_digest(),
@@ -153,9 +144,7 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
     }
     let scratch = std::env::temp_dir().join(format!("ply-bootstrap-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
-    // The emitter built from the bundle, or from the reference when there is none, emits itself.
-    let first = have.then(|| bundle.clone());
-    let p1 = emit_with(source, first.as_deref(), &scratch, &identity);
+    let p1 = emit_with(source, &bundle, &scratch, &identity);
     assert!(
         p1.refused.is_empty(),
         "the emitter refuses part of itself: {:?}",
@@ -181,7 +170,7 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
         for round in 1..=3 {
             let stage = scratch.join(format!("stage{round}"));
             ply_codegen::c::bundle::write(&stage, &last.text, &identity).unwrap();
-            let next = emit_with(source, Some(&stage), &scratch, &identity);
+            let next = emit_with(source, &stage, &scratch, &identity);
             assert!(
                 next.refused.is_empty(),
                 "the emitter built from its own emission refuses part of itself: {:?}",

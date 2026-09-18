@@ -28,7 +28,7 @@
 //! | `PLY_CC_OPT` | the optimisation flag it is given, overriding the profile's | `load.rs` |
 //! | `PLY_INLINE_BUDGET` | the most syntax nodes a callee may have to be inlined | `../opt.rs` |
 //! | `PLY_C_EMITTER` | `ply:<dir>` produces with the Ply emitter in `<dir>` rather than the one beside the binary: a working copy, for an emitter change not yet bootstrapped | `producer.rs` |
-//! | `PLY_C_BOOTSTRAP_REFRESH` | `1` on the fixpoint test in `crates/ply-codegen-tests` rewrites `crates/ply-compiler/bootstrap` from the emission that test proves is a fixpoint. Sources with no bundle, or one that does not serve, are built by the reference emitter instead | `bundle.rs` |
+//! | `PLY_C_BOOTSTRAP_REFRESH` | `1` on the fixpoint test in `crates/ply-codegen-tests` rewrites `crates/ply-compiler/bootstrap` from the emission that test proves is a fixpoint. It starts from the bundle there, so one this runtime does not serve is first replaced by an older one from git history | `bundle.rs` |
 //! | `PLY_TIER_ONLY` | `1` makes this backend the only engine: a test or an entry it does not hold fails with `E0505`, and the machine evaluates nothing (ADR 0045) | `backend.rs` |
 //! | `PLY_INLINE_DEPTH` | how many times a callee's own calls are inlined in turn. This is what the unit's size follows; the budget barely moves it | `../opt.rs` |
 //!

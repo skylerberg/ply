@@ -1,12 +1,9 @@
 //! Fixed-width integers under the backend: that a compiled body answers what the interpreter
 //! answers at each width, and that a signature naming one is declined rather than answered wrongly.
 
-use crate::fragment::{call, call_whole, unit, whole};
+use crate::fragment::{call, unit};
 use ply_eval::Value;
 
-/// What the interpreter answers, which is the only thing the compiled answer is checked against:
-/// a constant written here by hand would be checking my arithmetic rather than the two engines'
-/// agreement.
 /// Every operation the family has, wrapped so the *signature* is `Int`: a fixed width may not
 /// cross the seam (ADR 0039), so the widths live inside the bodies and the answers come back as
 /// `Int`s. That is exactly the shape `std.hash` has.
@@ -81,9 +78,8 @@ fn boxed(n: Int) -> Word = {w: u32_of_int(n)}
 "#;
 
 #[test]
-fn the_two_emitters_answer_the_same_at_each_width() {
+fn each_width_answers_what_the_interpreter_answers() {
     let (loaded, unit) = unit(WIDTHS);
-    let whole_unit = whole(loaded);
     let cases: &[(&str, Vec<Value>, Value)] = &[
         // Checked at the type's own width, and the sum is the type's.
         (
@@ -206,27 +202,23 @@ fn the_two_emitters_answer_the_same_at_each_width() {
             Some(want),
             "`{name}{args:?}` answered {got:?}, not {want:?}"
         );
-        assert_eq!(
-            got,
-            call_whole(whole_unit, name, args),
-            "`{name}{args:?}`: the two engines disagree"
-        );
     }
     // Two whose answers are not worth writing out by hand — a record of widths threaded through a
-    // body, and a loop over them — checked against the whole emitter alone, which is the property
-    // that matters for both.
+    // body, and a loop over them — checked against the interpreter.
+    let mut oracle = ply_eval::interp::Pure::new(loaded.program, loaded.resolved);
     for (name, args) in [
         ("m.round_trip", vec![Value::Int(0xDEAD_BEEF)]),
         ("m.round_trip", vec![Value::Int(0)]),
         ("m.mixed", vec![Value::Int(16)]),
         ("m.mixed", vec![Value::Int(0)]),
     ] {
-        let got = call(unit, name, &args);
-        assert!(got.is_some(), "`{name}` was declined");
+        let want = oracle
+            .call(name, args.clone(), ply_span::Span::DUMMY, 10_000)
+            .unwrap_or_else(|d| panic!("`{name}` raised in the interpreter: {}", d.message));
         assert_eq!(
-            got,
-            call_whole(whole_unit, name, &args),
-            "`{name}{args:?}`: the two engines disagree"
+            call(unit, name, &args),
+            Some(want),
+            "`{name}{args:?}`: the tier and the interpreter disagree"
         );
     }
 }
