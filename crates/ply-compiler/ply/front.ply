@@ -1,6 +1,6 @@
 // The front end's answer for the driver: the diagnostics, or else every table it reads, in `diag.ply`'s framing.
 
-import spine (Span, Ident, QName, num)
+import spine (Span, Ident, QName, dummy_span, num)
 import lexer (byte_of)
 import items (Item, IFn, IType, IEffect, ITest, ILaw, IEffectSet, EffectSetDef, TDSum, VariantDef, SpecClause,
               SpecKind, SRequires, SEnsures, ImportDecl, Vis, VPub, VPriv)
@@ -12,11 +12,11 @@ import patterns (Lit, LInt, LStr, LBytes)
 import tycore (Atom, Resource, RNamed, RSingleton, Type, atom_text, atoms_insert, scheme_text, type_text,
                at, append, take, contains_bytes)
 import resolve (Source, Mod, Diag, Resolved, Resolved_, Failed, Ns, NEffect, resolve_modules, qualify,
-                lookup, find, is_bare)
+                lookup, find, is_bare, diag1, backticked, import_module_name, path_span)
 import hash (Index, Entry, EDef, ETest, ELaw, HashOutput, build_index, hash_index, hex)
 import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder, EffectInfo, OpInfo, CtorInfo,
               check_front, deriver_text, is_prelude_effect)
-import diag (Parsed, parse_all, outside_every_module, frame, field, flag)
+import diag (Parsed, parse_all, parse_at, outside_every_module, frame, field, flag)
 import std.hash (blake3)
 
 fn cat(parts: List<List<Bytes>>) -> List<Bytes> = fold(parts, [], |acc: List<Bytes>, p: List<Bytes>| append(acc, p))
@@ -383,8 +383,7 @@ fn tables(mods: List<Mod>, r: Resolved, c: Front, index: Index, h: HashOutput) -
        map(range(0, len(h.test_bodies)), |i: Int| framed(b"testbody", num(i), [hex(at(h.test_bodies, i))]))])
 }
 
-fn front(sources: List<Source>) -> List<Bytes> = {
-  let parsed = parse_all(sources);
+fn front(parsed: List<Parsed>) -> List<Bytes> = {
   let early = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
   if len(early) > 0 { diag_frames(early) } else {
     match resolve_modules(map(parsed, |p: Parsed| p.module)) {
@@ -402,7 +401,76 @@ fn front(sources: List<Source>) -> List<Bytes> = {
 }
 
 // One concatenation over the finished frames; appending per frame is quadratic.
-pub fn front_dump(sources: List<Source>) -> String = string_of_bytes(bytes_concat_all(front(sources)))
+pub fn front_dump(sources: List<Source>) -> String = string_of_bytes(bytes_concat_all(front(parse_all(sources))))
+
+// --- Pulling in the shipped modules --------------------------------------------
+// As the driver places them: after the program's own modules, a round of new imports at a time, each round in byte order.
+
+fn is_std(name: Bytes) -> Bool = name == b"std" || bytes_starts_with(name, b"std.")
+
+fn import_at(imports: List<ImportDecl>, name: Bytes) -> Span = {
+  let found = fold(imports, None, |acc: Option<Span>, d: ImportDecl|
+    match acc { Some(_) -> acc, None -> if import_module_name(d) == name { Some(path_span(d)) } else { None } });
+  match found { Some(s) -> s, None -> dummy_span() }
+}
+
+fn unknown_shipped(m: Int, at_: Span, name: Bytes, listed: List<Bytes>) -> Diag =
+  diag1(b"E0106", m, at_, bytes_concat_all([b"no module named `", name, b"` ships with this compiler"]), b"not found",
+        [bytes_concat(b"the stdlib holds: ", backticked(listed, b", ")),
+         b"`ply std` lists them with the digest this binary was built from"])
+
+fn foreign_import(m: Int, at_: Span, importer: Bytes, name: Bytes) -> Diag =
+  diag1(b"E0505", m, at_,
+        bytes_concat_all([b"the shipped module `", importer, b"` imports `", name, b"`, which this build does not ship"]),
+        b"a stdlib module may import only modules that ship with it",
+        [b"this is a defect in the compiler's own sources, not in this program",
+         b"please report it with the version of `ply` that produced it"])
+
+type Round = { wanted: Map<Bytes, Bytes>, diags: List<Diag> }
+
+fn pull_round(users: Int, shipped: Map<Bytes, Bytes>, listed: List<Bytes>, parsed: List<Parsed>) -> Round = {
+  let present = fold(parsed, map_new(), |acc: Map<Bytes, Bool>, p: Parsed| map_insert(acc, p.name, true));
+  fold(range(0, len(parsed)), { wanted: map_new(), diags: [] }, |acc: Round, i: Int| {
+    let p = at(parsed, i);
+    let imports = p.module.module.imports;
+    let ships = i >= users;
+    fold(imports, acc, |r: Round, d: ImportDecl| {
+      let name = import_module_name(d);
+      if is_std(name) && !map_contains(present, name) {
+        match map_get(shipped, name) {
+          Some(src) -> {..r, wanted: map_insert(r.wanted, name, src)},
+          None -> {..r, diags: push(r.diags, if ships { foreign_import(i, import_at(imports, name), p.name, name) }
+                                             else { unknown_shipped(i, import_at(imports, name), name, listed) })},
+        }
+      } else if ships && !is_std(name) { {..r, diags: push(r.diags, foreign_import(i, import_at(imports, name), p.name, name))} }
+      else { r }
+    })
+  })
+}
+
+type Pull = { parsed: List<Parsed>, pulled: List<Bytes>, diags: List<Diag> }
+
+fn pulling(users: Int, shipped: Map<Bytes, Bytes>, listed: List<Bytes>, x: Pull) -> Pull = {
+  let early = fold(x.parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
+  if len(early) > 0 { {..x, diags: early} } else {
+    let r = pull_round(users, shipped, listed, x.parsed);
+    if len(r.diags) > 0 { {..x, diags: r.diags} }
+    else if map_len(r.wanted) == 0 { x }
+    else {
+      pulling(users, shipped, listed, map_fold(r.wanted, x, |acc: Pull, name: Bytes, src: Bytes|
+        {..acc, parsed: push(acc.parsed, parse_at(len(acc.parsed), { name: name, src: src })), pulled: push(acc.pulled, name)}))
+    }
+  }
+}
+
+// `front_dump` over `user` and the modules of `shipped` it imports, led by a `pulled` frame naming those in order.
+pub fn front_pulling_std(user: List<Source>, shipped: List<Source>) -> String = {
+  let texts = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source| map_insert(acc, s.name, s.src));
+  let x = pulling(len(user), texts, map(shipped, |s: Source| s.name), { parsed: parse_all(user), pulled: [], diags: [] });
+  let head = framed(b"pulled", b"_", map(x.pulled, |n: Bytes| field(b"module", n)));
+  let body = if len(x.diags) > 0 { diag_frames(x.diags) } else { front(x.parsed) };
+  string_of_bytes(bytes_concat_all(cat([[head], body])))
+}
 
 // --- Tests ------------------------------------------------------------------
 
@@ -517,4 +585,25 @@ test "a law frames its binders with their spans and types, and its hashes carry 
   assert_eq(bytes_slice(d, spec_at + 135, spec_at + 143), b"spec 64\n");
   assert_eq(bytes_slice(d, spec_at + 207, spec_at + 215), b"spec 64\n");
   assert_eq(bytes_slice(d, spec_at + 279, spec_at + 292), b"spec_text 64\n")
+}
+
+fn shelf() -> List<Source> =
+  [{ name: b"std.a", src: b"import std.c\npub fn a() -> Int = 1" }, { name: b"std.b", src: b"pub fn b() -> Int = 2" },
+   { name: b"std.c", src: b"pub fn c() -> Int = 3" }, { name: b"std.d", src: b"pub fn d() -> Int = 4" }]
+
+test "the shipped modules a program imports follow it a round at a time, each round in byte order" {
+  let out = front_pulling_std([{ name: b"m", src: b"import std.b\nimport std.a\nfn f() -> Int = 1" }], shelf());
+  assert(bytes_starts_with(bytes_of_string(out), b"pulled _ 42\nmodule 5\nstd.amodule 5\nstd.bmodule 5\nstd.corder _ "))
+}
+
+test "an import of a module that does not ship is reported at the import, listing the ones that do" {
+  assert_eq(front_pulling_std([{ name: b"m", src: b"import std.e\nfn f() -> Int = 1" }], shelf()),
+            "pulled _ 0\ndiag 0 245\ncode 5\nE0106severity 5\nerrormessage 48\nno module named `std.e` ships with this compilerlabel 18\n0 7 12 1\nnot foundnote 52\nthe stdlib holds: `std.a`, `std.b`, `std.c`, `std.d`note 63\n`ply std` lists them with the digest this binary was built from")
+}
+
+test "a shipped module importing outside the shipped ones is placed in that module, which the answer names" {
+  let out = front_pulling_std([{ name: b"m", src: b"import std.x\nfn f() -> Int = 1" }],
+                              [{ name: b"std.x", src: b"import m\npub fn x() -> Int = 1" }]);
+  assert(bytes_starts_with(bytes_of_string(out), b"pulled _ 14\nmodule 5\nstd.xdiag 0 "));
+  assert(holds(out, b"message 70\nthe shipped module `std.x` imports `m`, which this build does not shiplabel 65\n1 7 8 1\na stdlib module may import only modules that ship with it"))
 }
