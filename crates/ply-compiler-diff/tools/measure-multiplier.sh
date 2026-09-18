@@ -1,23 +1,12 @@
 #!/usr/bin/env bash
+# The lexer-to-parser cost multiplier (P-Z)/(L-Z), from minimum user CPU per probe.
 #
-# M1 and M2 of /tmp/ply-parser-spike/PREREGISTRATION-INTEGRATION.md: the
-# lexer-to-parser cost multiplier that the self-hosting spike assumes at 5-10x and that
-# only writing the parser could settle.
-#
-#   ./crates/ply-compiler-diff/tools/measure-multiplier.sh            # the five registered files
+#   ./crates/ply-compiler-diff/tools/measure-multiplier.sh            # the default files
 #   ./crates/ply-compiler-diff/tools/measure-multiplier.sh <file>...  # others
-#
-# Three probes per file, each a whole Ply program whose only difference is what
-# it does with the source:
 #
 #   Z  bytes_len(source())                  process start, typecheck, the literal
 #   L  len(lexer::lex(source()).toks)       and the lexer
 #   P  len(items::parse(source()).node.items) and the parser on top
-#
-# The multiplier is (P-Z)/(L-Z). Minimum user CPU over N runs, N=5 under two
-# seconds and N=3 otherwise; every run printed; `uptime` before and after; no
-# run discarded. The binary is checked before the series, not after, because a
-# rebuild half way through would invalidate what came before it.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,9 +28,7 @@ fi
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-# `python3` writes the probe because the source has to become a `b"..."` literal
-# and there is no file-reading host handler: a Ply program holds its input as a
-# literal or never sees it.
+# The source becomes a `b"..."` literal: a Ply program has no host handler to read a file.
 write_probe() {                  # $1 file, $2 probe kind, $3 out dir
   mkdir -p "$3"
   cp "$here"/{lexer,spine,types,patterns,exprs,items}.ply "$3/"

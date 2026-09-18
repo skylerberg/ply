@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# The derive differential, armed: each mutation below is applied to a copy of
-# `derive.ply` and `crates/ply-codegen-tests/tests/goldens/derive.rs` must go red.
+# Each mutation is applied to a copy of derive.ply, and the derive goldens must go red.
 #
 #   ./crates/ply-compiler-diff/tools/arm-derive.sh
 set -uo pipefail

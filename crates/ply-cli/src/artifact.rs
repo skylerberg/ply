@@ -11,16 +11,13 @@ use ply_ty::{DefInfo, Front};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// The generation of the container below.
 pub const ARTIFACT_FORMAT: u32 = 4;
 
-/// The extension `ply run` recognises, and the reason it does not have to guess.
 pub const EXTENSION: &str = "plyx";
 
 const MAGIC: &[u8; 8] = b"PLYPROG1";
 
-/// Domain tag, so a program digest can never be confused with a definition hash or with `ply hosts
-/// --digest`.
+/// So a program digest is never confused with a definition hash or `ply hosts --digest`.
 const DIGEST_DOMAIN: &[u8] = b"ply.program.2";
 
 const FLAG_CLOSURE: u32 = 1;
@@ -36,7 +33,7 @@ const OFF_BODY_ENC: usize = 80;
 const OFF_STD: usize = 84;
 const OFF_ENTRY: usize = 116;
 const OFF_DIGEST: usize = 148;
-/// Where the digest's coverage begins: every byte of the file from here on, and the entry point.
+/// The digest covers every byte of the file from here on, plus the entry point.
 pub const OFF_SECTIONS: usize = 180;
 const OFF_RESERVED: usize = 184;
 
@@ -46,16 +43,11 @@ const KIND_STRINGS: u32 = 3;
 const KIND_CLOSURE: u32 = 4;
 const KIND_UNIT: u32 = 5;
 
-/// The compiled unit the Ply emitter produced over an artifact's definitions: its C, compressed,
-/// which carries its own tables, its constructor table and the runtime helper table it was
-/// emitted against (`ply_codegen::c::Exports`). A unit whose helpers this runtime's table does
-/// not start with is left aside.
+/// The emitted C, compressed; left aside when its helper table is not a prefix of this runtime's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmbeddedUnit {
     pub text: Vec<u8>,
 }
-
-/// A checked program, identified by a digest.
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Artifact {
@@ -64,13 +56,11 @@ pub struct Artifact {
     pub body_encoding: u32,
     pub std: [u8; 32],
     pub entry: DefHash,
-    /// Sorted by hash, which is what makes two builds byte-identical.
+    /// Sorted by hash, which makes two builds byte-identical.
     pub bodies: BTreeMap<DefHash, StoredBody>,
-    /// The namespace: program-wide name to hash, sorted.
     pub names: Vec<(String, DefHash)>,
     /// The closure printed back to source, per module path; shipped modules are the target's own.
     pub closure: Vec<(String, String)>,
-    /// The compiled unit over these definitions, when the emitter produced one at build.
     pub unit: Option<EmbeddedUnit>,
 }
 
@@ -107,8 +97,7 @@ impl Artifact {
         }
         sections.push((KIND_BODIES, self.bodies.len() as u32, bodies));
 
-        // One string per distinct name, appended in the order the records are written, so the blob
-        // is a function of the record list and of nothing else.
+        // In record order, so the blob is a function of the record list alone.
         let mut strings: Vec<u8> = Vec::new();
         let mut offsets: BTreeMap<&str, u32> = BTreeMap::new();
         let mut names = Vec::new();
@@ -185,9 +174,7 @@ impl Artifact {
     }
 }
 
-/// The digest of an encoded artifact, read out of the bytes rather than out of the structure — so
-/// the writer and the reader compute it over the same thing by construction rather than by two
-/// functions agreeing.
+/// Read out of the bytes, so the writer and the reader digest the same thing by construction.
 pub fn digest_of(bytes: &[u8]) -> Option<[u8; 32]> {
     if bytes.len() < OFF_SECTIONS {
         return None;
@@ -199,8 +186,7 @@ pub fn digest_of(bytes: &[u8]) -> Option<[u8; 32]> {
     Some(*hasher.finalize().as_bytes())
 }
 
-/// `b3:` plus twelve hex characters, the shape `ply hosts --digest` and `ply std --digest` already
-/// print.
+/// `b3:` plus twelve hex characters, as `ply hosts --digest` and `ply std --digest` print.
 pub fn short(digest: &[u8; 32]) -> String {
     let mut out = String::from("b3:");
     for byte in &digest[..6] {
@@ -209,30 +195,21 @@ pub fn short(digest: &[u8; 32]) -> String {
     out
 }
 
-// --- building ---------------------------------------------------------------
-
-/// What a build produced, and the facts a report needs that the artifact itself does not carry.
 pub struct Built {
     pub artifact: Artifact,
     pub entry_name: Symbol,
-    /// The start-up definitions shipped beside the entry point, in the order they were named.
+    /// In the order they were named.
     pub startup: Vec<Symbol>,
-    /// Definition name to everything it reaches, restricted to the artifact.
     pub closure: BTreeMap<String, BTreeSet<String>>,
-    /// What the build could not do and did without, the compiled unit first among them.
     pub warnings: Vec<Diagnostic>,
 }
 
-/// The transitive closure of the entry point **and of the run's start-up definitions**, and nothing
-/// else.
+/// The transitive closure of the entry point and of the run's start-up definitions.
 pub fn build(
     loaded: &Loaded,
     entry: &DefInfo,
     startup: &[&DefInfo],
 ) -> Result<Built, Vec<Diagnostic>> {
-    // The front end's whole answer over the program: the hashes the artifact is keyed by and the
-    // bodies it carries. The load already obtained it from the port, so a build asks nothing
-    // again (ADR 0052 §1).
     let front = &loaded.front;
     let hashes = &front.hashes;
     let bodies = ply_hash::body::of_front(front);
@@ -317,14 +294,10 @@ fn closure_texts(artifact: &Artifact) -> Result<Vec<(String, String)>, Vec<Diagn
         .collect())
 }
 
-/// The whole unit over the artifact's definitions, produced by the Ply emitter and embedded so
-/// that `ply run` enters the program as it was built rather than rebuilding what it can from
-/// bodies alone, which costs an emit and a C compile at every run. A production that fails leaves
-/// the artifact without one, and says so.
+/// Embedded so `ply run` need not emit and compile C at every run; a failed production is reported.
 fn embedded_unit(opened: &Opened, names: &[&str]) -> (Option<EmbeddedUnit>, Vec<Diagnostic>) {
     ply_codegen::c::producer::ensure_default();
-    // Definitions only: the closure also names the effect and resource declarations it reaches,
-    // which no emitter is offered.
+    // Definitions only: no emitter is offered effect or resource declarations.
     let names: Vec<&str> = names
         .iter()
         .copied()
@@ -374,7 +347,6 @@ fn embedded_unit(opened: &Opened, names: &[&str]) -> (Option<EmbeddedUnit>, Vec<
     }
 }
 
-/// The artifact's unit was emitted for another runtime's helper table.
 fn stale_unit() -> Diagnostic {
     Diagnostic::warning(
         codes::ARTIFACT_VERSION,
@@ -406,8 +378,6 @@ fn restricted_closure(
         .collect()
 }
 
-// --- reading ----------------------------------------------------------------
-
 struct Reader<'a> {
     bytes: &'a [u8],
     path: &'a Path,
@@ -433,7 +403,6 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// What a target checks, and each check answers a different question.
 pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), Diagnostic> {
     let r = Reader { bytes, path };
     if bytes.len() < HEADER_LEN {
@@ -462,8 +431,7 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
     let stated = r.hash32(OFF_DIGEST)?;
     let count = r.u32(OFF_SECTIONS)? as usize;
 
-    // Bound before it is multiplied: a section count read out of a corrupt header is otherwise one
-    // allocation away from taking the process down.
+    // Bound before multiplying: a corrupt header's section count could otherwise abort the process.
     let table = HEADER_LEN.saturating_add(DESCRIPTOR_LEN.saturating_mul(count));
     if table > bytes.len() {
         return Err(truncated(path, HEADER_LEN, table - HEADER_LEN, bytes.len()));
@@ -683,16 +651,12 @@ pub fn read(path: &Path) -> Result<(Artifact, Vec<Diagnostic>), Diagnostic> {
     decode(&bytes, path)
 }
 
-// --- loading a program out of one -------------------------------------------
-
-/// A program an artifact decoded into, and everything an evaluator needs.
 pub struct Opened {
     pub sources: SourceMap,
     pub program: Program,
     pub resolved: Resolved,
-    /// A run's unit is built from this rather than from a front end derived a second time.
     pub front: Front,
-    /// The name the entry point answers to *in this program*.
+    /// The name the entry point answers to in this program.
     pub entry: Symbol,
 }
 
@@ -715,7 +679,6 @@ pub fn open(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnostic>>
     })
 }
 
-/// The port's whole answer over these module texts: the one front end opening an artifact runs.
 fn ask_the_port(
     inputs: &[(ply_span::SourceId, ModuleName, String)],
 ) -> Result<Front, Vec<Diagnostic>> {
@@ -747,7 +710,6 @@ fn ask_the_port(
     }
 }
 
-/// [`open`], with its refusals as the parser, the checker or the comparison raised them.
 fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
     let mut sources = SourceMap::new();
     let mut inputs: Vec<(ply_span::SourceId, ModuleName, String)> = Vec::new();
@@ -763,9 +725,7 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
         inputs.push((id, name, text.clone()));
     }
 
-    // The shipped modules are not in the artifact — they are in this binary, and the header's
-    // `ply_std::digest()` is what pins them — so they are pulled in here by the same rule the
-    // driver uses, to a fixed point because a shipped module may import another.
+    // Shipped modules live in this binary, pinned by the header's `ply_std::digest()`.
     let mut program = parse(&inputs)?;
     loop {
         let mut added = false;
@@ -803,8 +763,6 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
     }
     let resolved = ply_syntax::resolve(&mut program)?;
 
-    // The whole front end's answer over these very texts: the check the evaluator runs on and the
-    // hashes the artifact is keyed by both come from the one ask (ADR 0052 §1).
     let front = ask_the_port(&inputs)?;
 
     let hashes = &front.hashes;
@@ -867,16 +825,12 @@ fn parse(inputs: &[(ply_span::SourceId, ModuleName, String)]) -> Result<Program,
     )
 }
 
-// --- the difference between two artifacts ------------------------------------
-
-/// What is actually going out, in the language's own terms.
 #[derive(Default, Debug)]
 pub struct Diff {
     pub added: Vec<String>,
     pub changed: Vec<String>,
     pub dropped: Vec<String>,
     pub unchanged: usize,
-    /// Definitions in the new artifact that reach a changed or added one.
     pub reached: Vec<String>,
 }
 
@@ -917,9 +871,6 @@ fn group(names: &[(String, DefHash)]) -> BTreeMap<&str, BTreeSet<DefHash>> {
     out
 }
 
-// --- running one -------------------------------------------------------------
-
-/// `ply run FILE.plyx` — the target's side of a deploy.
 pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     use crate::commands::common::{
         IND, diagnostic_json, diagnostics_json, emit_json, print_diagnostics, print_warnings,
@@ -927,7 +878,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     };
     use crate::{EXIT_COMPILE_ERROR, EXIT_FAILED, EXIT_OK};
 
-    // A closure's positions are in text printed at build, which is nothing a reader wrote.
+    // A closure's positions are in text printed at build, which no reader wrote.
     let empty = SourceMap::new();
     let refuse = |diagnostics: &[Diagnostic]| -> i32 {
         if args.json {
@@ -952,9 +903,8 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         Ok(opened) => opened,
         Err(diagnostics) => return refuse(&diagnostics),
     };
-    // Whether the unit serves this runtime is its own answer, given once it is compiled and its
-    // table read; the object is cached, so `evaluate` loading it again costs nothing. A unit that
-    // is broken rather than foreign is passed on, and refused loudly there.
+    // The object is cached, so `evaluate` loading it again costs nothing. A broken, rather than
+    // foreign, unit is passed on and refused loudly there.
     let unit = match &artifact.unit {
         Some(unit) => {
             let served = ply_codegen::c::bundle::unpack(&unit.text)
@@ -982,8 +932,6 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         .defs
         .get(&opened.entry)
         .map(|d| d.footprint.clone());
-    // An artifact is configured exactly as a source tree is, which is the point: the thing that
-    // differs between two deployments is the command line, not the program.
     let (configuration, config_warnings) = match crate::config::Configuration::open(
         &opened.program,
         &opened.resolved,
@@ -999,7 +947,6 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     if !args.json {
         print_diagnostics(&config_warnings, &empty, style);
     }
-    // A deployed artifact drains exactly as a source tree does.
     let shutdown = args
         .host
         .then(|| ply_host::signal::Shutdown::new(args.shutdown.bounds()));
@@ -1082,8 +1029,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         unit,
     );
 
-    // the teardown order's pinned order, on the machine's own thread and never from a signal handler:
-    // roll every open transaction back, close every open span, flush the sink, close the pool.
+    // On the machine's own thread, never from a signal handler.
     let teardown =
         crate::commands::run::teardown(&hosts, shutdown.as_ref(), args.shutdown.drain_ms);
     let teardown_json =
@@ -1121,9 +1067,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
             EXIT_OK
         }
         Err(diagnostic) => {
-            // A drain that expired is the run's configuration at fault rather than the artifact's,
-            // and the exit code is what carries it: a deployment that sees `3` knows it lost
-            // requests.
+            // An expired drain is the configuration's fault; exit `3` says requests were lost.
             let code = if ply_eval::is_drain_incomplete(&diagnostic) {
                 crate::EXIT_DRAIN_INCOMPLETE
             } else {
@@ -1151,7 +1095,6 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     }
 }
 
-/// The same evaluation `ply run` gives source, over a decoded artifact.
 fn evaluate(
     opened: &Opened,
     span: Span,
@@ -1174,8 +1117,7 @@ fn evaluate(
         }
         ply_test::sim::seed_run(machine, &plan.seeds()[0], plan.steps);
     };
-    // The unit the artifact carries is entered as it was built: no producer is asked, and a
-    // `perform` in it runs.
+    // Entered as built: no producer is asked.
     if let (Some(unit), Some(spec)) = (unit, crate::commands::common::backend_spec(backend)?) {
         let unit_error = |e: &dyn std::fmt::Display| {
             Diagnostic::error(
@@ -1212,10 +1154,7 @@ fn evaluate(
     machine.call(name, Vec::new(), span)
 }
 
-// --- diagnostics -------------------------------------------------------------
-
-/// A container failure is about the file rather than a point in the program, so it carries no
-/// span: inventing one would send a reader to a definition that has nothing to do with it.
+/// No span: a container failure is about the file, not a point in the program.
 fn invalid(path: &Path, message: impl Into<String>) -> Diagnostic {
     Diagnostic::error(codes::ARTIFACT_INVALID, message.into())
         .primary(Span::DUMMY, format!("in `{}`", path.display()))

@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// The request every rung answers.
 pub const REQUEST: &[u8] =
     b"GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: ply-bench\r\n\r\n";
 
@@ -36,9 +35,9 @@ fn micros(d: Duration) -> f64 {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Parser {
-    /// `bytes_index_of`, `bytes_scan` and `bytes_scan_until` — what W2 ships.
+    /// `bytes_index_of`, `bytes_scan` and `bytes_scan_until`.
     Native,
-    /// The `fold`-over-`range` scans W1 shipped.
+    /// `fold`-over-`range` scans.
     W1Folds,
 }
 
@@ -55,7 +54,7 @@ impl Parser {
     }
 }
 
-/// The three scans, and what W1 wrote in their place.
+/// Each native scan paired with its fold replacement.
 const W1_SCANS: [(&str, &str); 3] = [
     (
         "\
@@ -100,10 +99,10 @@ fn all_upper(b: Bytes) -> Bool =
     ),
 ];
 
-/// `examples/hello.ply`, and the two definitions a measurement has to choose.
+/// `examples/hello.ply`.
 pub struct Endpoint {
     source: String,
-    /// The example with everything from the simulated-socket section onwards removed.
+    /// The example cut at `TESTS_MARKER`.
     server_only: String,
 }
 
@@ -134,7 +133,6 @@ impl Endpoint {
         Ok(format!("{}{PLY_HANDLER_DRIVER}", self.scans(parser)?))
     }
 
-    /// The example's whole source with the chosen scans in it, tests included.
     pub fn whole(&self, parser: Parser) -> Result<String> {
         Self::retarget(&self.source, parser)
     }
@@ -169,9 +167,7 @@ fn serve(server: Int, count: Int) -> Int / {net.write[listener], net.write[conn]
     serve_one(net.accept[listener](server));
     1 + serve(server, count - 1)
   }";
-        // Accept, spawn, and go straight back to accepting: the joins unwind at the end, so up to
-        // `count` handlers are in flight at once and the accept loop is never waiting on one of
-        // them.
+        // The joins unwind at the end, so up to `count` handlers are in flight at once.
         const NEW: &str = "\
 fn serve(server: Int, count: Int) -> Int
   / {task.write, net.write[listener], net.write[conn]} =
@@ -236,12 +232,10 @@ pub struct Rung {
     pub adds: &'static str,
     pub requests: u32,
     pub per_request_micros: f64,
-    /// Requests per second one thread sustains at this rung.
     pub per_second: f64,
-    /// What this rung costs above the previous one — the layer's own price.
+    /// Cost above the previous rung.
     pub layer_micros: f64,
-    /// That layer as a share of the top rung, which is what decides where a speedup would have to
-    /// come from.
+    /// That layer as a share of the top rung.
     pub layer_share: f64,
 }
 
@@ -250,15 +244,12 @@ pub struct Ladder {
     pub parser: &'static str,
     pub head_bytes: usize,
     pub rungs: Vec<Rung>,
-    /// `host-tcp` over `rust-floor`: how many times a Ply request costs what the same syscalls cost
-    /// with no interpreter under them.
+    /// `host-tcp` over `rust-floor`.
     pub over_floor: f64,
-    /// Everything below `host-tcp` that is not the socket — the share of a request a faster
-    /// interpreter could address.
+    /// The share of a request that is not the socket.
     pub interpreter_share: f64,
 }
 
-/// The in-process ladder.
 pub fn ladder(repo: &Path, parser: Parser, requests: u32, repeats: usize) -> Result<Ladder> {
     let endpoint = Endpoint::open(repo)?;
     let dir = tempfile::tempdir().context("a temp dir for the benchmark project")?;
@@ -304,8 +295,7 @@ pub fn ladder(repo: &Path, parser: Parser, requests: u32, repeats: usize) -> Res
     let mut previous = 0.0;
     for (name, adds, taken) in names {
         let per = micros(taken) / requests as f64;
-        // `rust-floor` is not a rung above `host-tcp`; it is the denominator, so it contributes no
-        // layer.
+        // `rust-floor` is the denominator, not a rung, so it adds no layer.
         let layer = if name == "rust-floor" {
             0.0
         } else {
@@ -348,8 +338,7 @@ pub struct HeadPoint {
     pub per_second: f64,
 }
 
-/// The exit criterion the byte builtins states: whether a request's cost is a function of how many bytes
-/// the head is or of how many fields were parsed.
+/// Whether a request's cost scales with head bytes or with fields parsed.
 pub fn head_sweep(
     repo: &Path,
     parser: Parser,
@@ -364,14 +353,11 @@ pub fn head_sweep(
     let mut out = Vec::new();
     for headers in [0usize, 1, 2, 4, 8, 16, 32] {
         let head = padded_head(headers);
-        // The endpoint refuses a head over `max_head`, and a sweep that measured the refusal path
-        // would be measuring a different program.
+        // Past `max_head` the endpoint refuses, which would measure a different path.
         if head.len() > 2048 {
             break;
         }
-        // The fold parser is two orders of magnitude slower on a long head, so a sweep that gave it
-        // the native parser's request count would spend minutes proving something one tenth of them
-        // says.
+        // The fold parser is far slower on a long head; fewer requests say the same.
         let requests = match parser {
             Parser::Native => requests,
             Parser::W1Folds => (requests / 10).max(50),
@@ -419,11 +405,9 @@ pub struct Program {
     program: ply_syntax::ast::Program,
     resolved: ply_syntax::resolve::Resolved,
     check: CheckOutput,
-    /// The port's whole answer, so the tier is built from it rather than from a second front end
-    /// derived inside `over_with_texts` (ADR 0052 §2).
+    /// The tier is built from this rather than from a second front end.
     port: ply_ty::Front,
-    /// One answer about this program's regions for every rung below, rather than one per rung's
-    /// machine.
+    /// Shared by every rung's machine.
     region_kinds: ply_eval::region_kind::Kinds,
     sources: ply_span::SourceMap,
 }
@@ -451,7 +435,7 @@ impl Program {
         let ids: Vec<ply_span::SourceId> = inputs.iter().map(|(id, _, _)| *id).collect();
         let mut program = ply_syntax::parse_program(inputs)
             .map_err(|d| diagnostics("parsing the endpoint", &d))?;
-        // Before resolution, as the driver does: what resolution sees is ordinary definitions.
+        // Expanded before resolution, as the driver does.
         let expanded = ply_derive::expand_program(&mut program);
         if !expanded.is_empty() {
             return Err(diagnostics("expanding a `derive`", &expanded));
@@ -485,8 +469,7 @@ impl Program {
             .map(|d| d.footprint.clone())
     }
 
-    /// `Machine::call` takes the program-wide name, so a simple one has to be looked up rather than
-    /// guessed at from the file name.
+    /// The program-wide name `Machine::call` takes.
     fn full(&self, simple: &str) -> Result<String> {
         self.check
             .defs
@@ -496,12 +479,10 @@ impl Program {
             .with_context(|| format!("the endpoint declares no `{simple}`"))
     }
 
-    /// Rung 1.
     fn answer_only(&self, requests: u32) -> Result<Duration> {
         self.answer_over(REQUEST, requests)
     }
 
-    /// The same rung over a chosen head, which is what the length sweep varies.
     fn answer_over(&self, head: &[u8], requests: u32) -> Result<Duration> {
         let name = self.full("answer")?;
         let mut machine = self.machine();
@@ -515,7 +496,6 @@ impl Program {
         Ok(started.elapsed())
     }
 
-    /// Rung 2.
     fn through_ply_handler(&self, requests: u32) -> Result<Duration> {
         let name = self.full("bench_ply_handler")?;
         let mut machine = self.machine();
@@ -528,7 +508,6 @@ impl Program {
         Ok(taken)
     }
 
-    /// Rung 3.
     fn through_host(&self, requests: u32) -> Result<Duration> {
         let script: Vec<Vec<Vec<u8>>> = (0..requests).map(|_| vec![REQUEST.to_vec()]).collect();
         let net: Arc<dyn Net> = Arc::new(SimNet::new(script));
@@ -555,7 +534,6 @@ impl Program {
         Ok(taken)
     }
 
-    /// Rung 4.
     fn through_socket(&self, requests: u32) -> Result<Duration> {
         let port = reserve_port()?;
         let host = Arc::new(ply_host::Host::new());
@@ -650,8 +628,7 @@ pub fn rust_floor(requests: u32) -> Result<Duration> {
     Ok(taken)
 }
 
-/// Byte-identical to what the endpoint answers, so the two are writing the same number of bytes to
-/// the same kind of socket.
+/// Byte-identical to the endpoint's response.
 fn floor_response() -> Vec<u8> {
     let body = "hello from ply\n";
     format!(
@@ -661,7 +638,6 @@ fn floor_response() -> Vec<u8> {
     .into_bytes()
 }
 
-/// Every request one client thread completed, with the latency of each.
 #[derive(Clone, Debug, Default)]
 pub struct Sample {
     pub latencies: Vec<Duration>,
@@ -675,8 +651,7 @@ impl Sample {
         self
     }
 
-    /// A benchmark over a server that answered half the requests is not a benchmark, so a shortfall
-    /// is an error rather than a smaller denominator.
+    /// A shortfall is an error, not a smaller denominator.
     pub fn require(&self, requests: u32) -> Result<()> {
         if self.latencies.len() as u32 != requests {
             bail!(
@@ -703,7 +678,6 @@ impl Sample {
     }
 }
 
-/// Client threads, running until they have made their requests.
 struct Client {
     threads: Vec<std::thread::JoinHandle<Sample>>,
 }
@@ -715,8 +689,7 @@ impl Client {
         let concurrency = concurrency.max(1);
         let threads = (0..concurrency)
             .map(|i| {
-                // The remainder goes to the low-numbered threads, so the total is exact whatever
-                // the two numbers are.
+                // The remainder goes to the low-numbered threads, so the total is exact.
                 let mine = requests / concurrency + u32::from(i < requests % concurrency);
                 let head = Arc::clone(&head);
                 std::thread::spawn(move || one_client(addr, &head, mine))
@@ -761,8 +734,7 @@ fn exchange(addr: SocketAddr, head: &[u8]) -> Result<()> {
     stream.set_nodelay(true)?;
     stream.write_all(head)?;
     stream.flush()?;
-    // Sized up front: `read_to_end` over an empty `Vec` probes and grows, which is three or four
-    // extra reads per request charged to a server that sent one response.
+    // Sized up front: `read_to_end` into an empty `Vec` costs extra reads per request.
     let mut response = Vec::with_capacity(512);
     stream.read_to_end(&mut response)?;
     if !response.starts_with(b"HTTP/1.1 200 OK\r\n") {
@@ -812,7 +784,6 @@ pub struct LoadPoint {
     pub server: &'static str,
     /// Which scans the served endpoint uses.
     pub parser: &'static str,
-    /// What the client sent.
     pub head_bytes: usize,
     pub concurrency: u32,
     pub requests: u32,
@@ -836,9 +807,7 @@ pub fn load(
 ) -> Result<LoadPoint> {
     let endpoint = Endpoint::open(repo)?;
     let port = reserve_port()?;
-    // One more connection than the load: the probe below spends it proving the server is listening
-    // and answering, so the timed window starts at a warm server rather than at a race with its
-    // typecheck.
+    // One extra connection for the probe, so timing starts at a warm server.
     let source = match shape {
         Shape::Sequential => endpoint.sequential(parser, port, requests + 1)?,
         Shape::Concurrent => endpoint.concurrent(parser, port, requests + 1)?,
@@ -873,16 +842,14 @@ pub fn load(
     })
 }
 
-/// The same load against the Rust floor, so a concurrency sweep has a shape to be compared with
-/// rather than only a slope.
+/// The same load against the Rust floor.
 pub fn load_floor(headers: usize, concurrency: u32, requests: u32) -> Result<LoadPoint> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     let response = floor_response();
     let stop = Arc::new(AtomicBool::new(false));
 
-    // One accept loop, one thread per connection: the floor is allowed to be concurrent, because
-    // what it prices is the socket and not a serving strategy.
+    // A thread per connection: the floor prices the socket, not a serving strategy.
     let server = {
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
@@ -919,8 +886,7 @@ pub fn load_floor(headers: usize, concurrency: u32, requests: u32) -> Result<Loa
     let sample = client.join()?;
     let seconds = started.elapsed().as_secs_f64();
     stop.store(true, Ordering::Relaxed);
-    // One more connection so the accept loop observes the flag rather than blocking on a peer that
-    // will never arrive.
+    // One more connection so the accept loop observes the flag.
     let _ = TcpStream::connect_timeout(
         &SocketAddr::from(([127, 0, 0, 1], port)),
         Duration::from_millis(250),
@@ -950,7 +916,7 @@ pub struct Server {
 }
 
 impl Server {
-    /// `extra` is appended to the fixed arguments — `--tls NAME=CERT,KEY` and nothing else so far.
+    /// `extra` is appended to the fixed arguments.
     pub fn start(ply: &Path, dir: &Path, extra: &[&str]) -> Result<Server> {
         Server::start_with(ply, dir, extra, Stdio::piped())
     }
@@ -968,7 +934,6 @@ impl Server {
         Ok(Server { child: Some(child) })
     }
 
-    /// The process id, so a harness can deliver a signal to it.
     pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().map(|c| c.id())
     }
@@ -988,8 +953,6 @@ impl Server {
         }
     }
 
-    /// The status if the server has already exited, which is what a probe loop checks before
-    /// waiting again on a process that is gone.
     pub fn exited(&mut self) -> Result<Option<std::process::ExitStatus>> {
         let child = self.child.as_mut().expect("the server has not been reaped");
         Ok(child.try_wait()?)
@@ -1000,8 +963,7 @@ impl Server {
         self.take()
     }
 
-    /// The server's output when it has died, and a note when it is still up — so a failure message
-    /// never blocks on a pipe belonging to a live process.
+    /// The output if the server has died; never blocks on a live process's pipe.
     pub fn output_if_exited(&mut self) -> String {
         match self.exited() {
             Ok(Some(status)) => format!("the server exited {status}:\n{}", self.take()),
@@ -1010,8 +972,7 @@ impl Server {
         }
     }
 
-    /// One real request, so the timed window starts at a server that has already answered rather
-    /// than at a race with its typecheck.
+    /// One real request, so timing starts at a server that has already answered.
     fn probe(&mut self, port: u16, head: &[u8]) -> Result<()> {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let deadline = Instant::now() + STARTUP;
@@ -1033,8 +994,7 @@ impl Server {
         }
     }
 
-    /// The server was asked for a fixed number of connections and has been given them, so it must
-    /// return on its own.
+    /// The server was given its fixed connection count, so it must exit on its own.
     pub fn finish(mut self) -> Result<()> {
         let deadline = Instant::now() + STARTUP;
         loop {
@@ -1092,8 +1052,6 @@ pub fn ply_binary() -> Result<PathBuf> {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Measurements {
-    /// One per parser measured, so the byte builtins' before and after sit on one table taken on
-    /// one machine in one run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ladders: Vec<Ladder>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

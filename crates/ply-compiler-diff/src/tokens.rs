@@ -28,10 +28,7 @@ fn body(kind: &TokenKind) -> String {
     match kind {
         TokenKind::Ident(name) => format!("i:{name}"),
         TokenKind::Int(v) => format!("n:{v}"),
-        // The **pattern**, as a signed sixty-four-bit word, rather than the value: `lexer.ply`
-        // holds a width's bits in an `Int` and cannot render an unsigned sixty-four-bit value at
-        // all, so the value would make the largest `U64` incomparable where the pattern is the
-        // same on both sides. Every narrower width renders identically either way.
+        // The bit pattern as i64, not the value: `lexer.ply` cannot render a u64 above i64::MAX.
         TokenKind::Fixed { ty, bits } => format!("w:{ty}:{}", *bits as i64),
         TokenKind::Float(v) => format!("f:{:016x}", v.to_bits()),
         TokenKind::Decimal { mantissa, scale } => format!("d:{mantissa}:{scale}"),
@@ -101,8 +98,7 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// The one substitution the comparison makes, and the reason it is named here rather than buried in
-/// the test.
+/// Rewrites every float record's decimal text to its bit pattern.
 pub fn floats_to_bits(dump: &str) -> String {
     let mut out = String::new();
     for record in dump.split_terminator(';') {
@@ -123,8 +119,7 @@ fn convert(record: &str) -> String {
     }
 }
 
-/// The dump as a list of records, for a diff that names the first disagreement instead of printing
-/// two 300-kilobyte strings.
+/// The dump split into records, so a diff can name the first disagreement.
 pub fn records(dump: &str) -> Vec<&str> {
     dump.split_terminator(';').collect()
 }

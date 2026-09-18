@@ -13,8 +13,7 @@ pub struct Collected {
     pub warnings: Vec<Diagnostic>,
 }
 
-/// A project's own view of a checked program: the definitions and laws declared by the modules that
-/// ship with the compiler removed.
+/// The checked program without the shipped modules' definitions and laws, unless `std`.
 pub fn project_view(check: &CheckOutput, std: bool) -> std::borrow::Cow<'_, CheckOutput> {
     if std {
         return std::borrow::Cow::Borrowed(check);
@@ -41,9 +40,7 @@ pub fn collect(program: &Program, check: &CheckOutput, hashes: &HashOutput) -> C
     };
 
     for (name, info) in &check.defs {
-        // A definition carrying only `requires` has no obligation: a precondition is a filter on
-        // the domain of the `ensures` clauses beside it, and on its own it claims nothing to
-        // discharge.
+        // A `requires` alone claims nothing to discharge.
         if !info.spec.iter().any(|s| s.kind == SpecKind::Ensures) {
             continue;
         }
@@ -56,9 +53,7 @@ pub fn collect(program: &Program, check: &CheckOutput, hashes: &HashOutput) -> C
         let binders = clause_binders(def, info);
         let frame = frame_of(&info.footprint);
 
-        // The key is looked up by the clause's position among **all** of the owner's clauses,
-        // because that is what `spec_hash` covers — so reordering a `requires` past an `ensures`
-        // re-opens it.
+        // Keyed by position among all the owner's clauses, as `spec_hash` covers them.
         for (ordinal, clause) in info
             .spec
             .iter()
@@ -93,9 +88,7 @@ pub fn collect(program: &Program, check: &CheckOutput, hashes: &HashOutput) -> C
             owner: law.key.clone(),
             kind: ObligationKind::Law,
             span: law.span,
-            // A law is a claim about the definitions it names rather than about one definition's
-            // effects, and its own row is `{}` or `{sim.read}` — a read of an input no program can
-            // write.
+            // A law's own row is `{}` or `{sim.read}`, a read no program can write.
             frame: Frame::Pure,
             binders: law.binders.clone(),
             guarded: law.has_guard,
@@ -111,8 +104,6 @@ pub fn collect(program: &Program, check: &CheckOutput, hashes: &HashOutput) -> C
 fn clause_binders(def: &ply_syntax::ast::FnDef, info: &ply_ty::DefInfo) -> Vec<LawBinder> {
     let (params, ret) = match &info.scheme.ty {
         Type::Fn { params, ret, .. } => (params.as_slice(), (**ret).clone()),
-        // A definition with no parameters is still a function of nothing whose `ensures` speaks
-        // about its value.
         other => (&[][..], other.clone()),
     };
     let mut binders: Vec<LawBinder> = def

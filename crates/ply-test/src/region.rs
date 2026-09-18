@@ -2,15 +2,13 @@
 
 use ply_eval::{Arena, Fixture, TaskRegions, Value};
 
-/// The live region a group's tests share: the fixture, and the mark that separates it from whatever
-/// a test allocates on top.
+/// A group's shared fixture, and the mark separating it from what each test allocates on top.
 #[derive(Clone, Debug, Default)]
 pub struct GroupRegion {
     fixture: Fixture,
 }
 
 impl GroupRegion {
-    /// No fixture.
     pub fn empty() -> GroupRegion {
         GroupRegion {
             fixture: Fixture::empty(),
@@ -24,7 +22,6 @@ impl GroupRegion {
         }
     }
 
-    /// The boundary.
     pub fn mark(&self) -> usize {
         self.fixture.len()
     }
@@ -33,15 +30,13 @@ impl GroupRegion {
         self.fixture.is_empty()
     }
 
-    /// What a test runs against: a region stack seeded from the group's fixture, sealed at the
-    /// mark, and the handle that reaches it.
+    /// A region stack seeded from the fixture and sealed at the mark, and the handle reaching it.
     #[must_use = "opening a region builds a stack; dropping it discards the seed"]
     pub fn open(&self) -> (TaskRegions, Value) {
         self.fixture.open()
     }
 
-    /// Closes the test's region: what it allocated is discarded and what it wrote to the fixture is
-    /// kept.
+    /// Discards what the test allocated and keeps what it wrote to the fixture.
     pub fn close(&mut self, after: &Arena) -> bool {
         let mark = self.fixture.len();
         if mark == 0 {
@@ -62,7 +57,6 @@ impl GroupRegion {
         true
     }
 
-    /// The group's own state, for a caller that wants to look at it rather than run against it.
     pub fn fixture(&self) -> &Fixture {
         &self.fixture
     }

@@ -10,8 +10,7 @@ pub struct CorpusSpec {
     pub tests: usize,
     /// Layers in the module DAG.
     pub depth: usize,
-    /// Distinct `db` resource labels, shared across every module — this is what makes the conflict
-    /// graph non-trivial rather than one clique per file.
+    /// Distinct `db` resource labels, shared across modules so conflicts span files.
     pub tables: usize,
     /// Distinct `cache` resource labels.
     pub regions: usize,
@@ -29,16 +28,13 @@ pub struct CorpusSpec {
     /// `counter.bump` calls per task, separated by a `task.yield()`.
     #[serde(default)]
     pub steps_per_task: usize,
-    /// How much the tasks contend, from 0.0 — one shard each, so no two steps conflict and the
-    /// search collapses to a single interleaving — to 1.0, one shard for everybody, where every
-    /// pair of steps is dependent and the reduction has nothing to prune.
+    /// Task contention, from 0.0 (a shard each, one interleaving) to 1.0 (one shared shard).
     #[serde(default)]
     pub conflict_density: f64,
     /// Fraction of generated definitions carrying a `requires`/`ensures` pair.
     #[serde(default)]
     pub spec_fraction: f64,
-    /// Definitions per module written for their obligation rather than for their call graph, so
-    /// that the tier distribution spans the table instead of landing in one bucket.
+    /// Definitions per module written for their obligation, so tiers spread across the table.
     #[serde(default)]
     pub specimens_per_module: usize,
 }
@@ -115,16 +111,14 @@ impl CorpusSpec {
         Ok(())
     }
 
-    /// Shards a test of this shape spreads its tasks over: every task its own at density 0, one
-    /// between all of them at density 1.
+    /// Shards a test spreads its tasks over: one each at density 0, one shared at density 1.
     pub fn shards_per_test(&self) -> usize {
         let tasks = self.tasks_per_test.max(1);
         let spread = (1.0 - self.conflict_density) * (tasks - 1) as f64;
         1 + spread.round() as usize
     }
 
-    /// Generated `fn`s only: the two hand-written core modules and the per-module `stage` helpers
-    /// are counted separately by the manifest.
+    /// Generated `fn`s only; core modules and `stage` helpers are counted separately.
     pub fn generated_defs(&self) -> usize {
         self.modules * self.defs_per_module
     }

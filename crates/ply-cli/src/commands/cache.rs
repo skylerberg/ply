@@ -12,7 +12,6 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// A store and how long it took to open it.
 struct Opened {
     store: Store,
     took: Duration,
@@ -116,8 +115,7 @@ pub fn stats(scope: &CacheScope, style: Style) -> i32 {
             style.yellow("more than half the data file is unreachable; run `ply cache compact`")
         );
     }
-    // A hybrid program is a real configuration with a real hash, so it earns a real cache entry —
-    // and a reader counting tests would otherwise read the surplus as corruption.
+    // A hybrid program earns a real cache entry, which a reader could mistake for corruption.
     if stats.results > 0 {
         println!(
             "{IND}  {}",
@@ -136,11 +134,9 @@ pub fn compact(scope: &CacheScope, style: Style) -> i32 {
     let notice = crate::migrate::notice(&store, &warnings);
     warnings.extend(notice);
 
-    // Compaction drops whatever the surviving files do not name, so a walk that saw less than the
-    // whole project would delete work no error would report.
+    // Compaction drops what surviving files do not name, so a partial walk would delete silently.
     let keep = match crate::load::ply_files(store.root()) {
-        // A shipped module has no file on disk, so the walk cannot see it, and its entry is live:
-        // this binary still ships it.
+        // A shipped module has no file on disk, but its entry is live.
         Ok(mut keep) => {
             keep.extend(
                 store
@@ -224,9 +220,7 @@ pub fn compact(scope: &CacheScope, style: Style) -> i32 {
         style.green("compacted"),
         style.dim(&store.dir().display().to_string())
     );
-    // Only when something was actually pruned: a compaction that reclaimed superseded records
-    // without dropping a live one is the common case, and four zeroes above the byte counts read as
-    // though it had done nothing.
+    // Only when something live was dropped; four zeroes would read as though nothing happened.
     if dropped.sources + dropped.defs + dropped.decls + dropped.bodies > 0 {
         println!(
             "{IND}  dropped {} {} · {} {} · {} {} · {} {}",
@@ -332,10 +326,7 @@ pub fn inspect(args: &InspectArgs, style: Style) -> i32 {
     EXIT_OK
 }
 
-// --- one inspected entry ----------------------------------------------------
-
-/// What `inspect` prints, gathered before anything is written so that the human and JSON forms
-/// cannot drift into disagreeing about what was found.
+/// Gathered before anything is written, so the human and JSON forms cannot disagree.
 pub struct Entry {
     pub title: String,
     hash: String,
@@ -348,13 +339,10 @@ pub struct Entry {
     witness: Vec<NameRef>,
     body: Option<(u32, usize)>,
     outcome: Option<Outcome>,
-    /// Held once, as atoms: the human form renders it and the JSON form lists it, and a second copy
-    /// of the rendering is a second thing to keep true.
     footprint: Option<Footprint>,
 }
 
-/// One variant per kind rather than a bag of labelled strings, so that a JSON consumer reading
-/// `interface.variants` always finds an array and `interface.type` always finds a string.
+/// So `interface.variants` is always an array and `interface.type` always a string.
 pub enum Interface {
     Fn {
         ty: String,
@@ -370,8 +358,7 @@ pub enum Interface {
     Test {
         nondet: bool,
     },
-    /// The fingerprint names a definition whose interface is not in the store — a half-pruned
-    /// cache, or a hash whose slots were written for other names.
+    /// The interface is not in the store: a half-pruned cache, or slots written for other names.
     Absent,
 }
 
@@ -480,8 +467,7 @@ impl Entry {
         println!("{IND}  {:<10} {}", "result", self.result_line());
     }
 
-    /// The label is blank on a continuation line so a multi-variant type reads as one block rather
-    /// than as repeated keys.
+    /// The label is blank on continuation lines, so a multi-variant type reads as one block.
     pub fn rows(&self) -> Vec<(&'static str, String)> {
         let listed = |label: &'static str, values: &[String]| {
             values
@@ -570,9 +556,7 @@ impl Entry {
     }
 }
 
-/// A constructor's *name* is not in the interface a hash is keyed by — two types that differ only
-/// by their variants' names are one computation — so it comes from the declaring file's
-/// fingerprint, where variants are aligned by position.
+/// Variant names are not in the hashed interface, so they come from the file's fingerprint.
 fn variant_names(store: &Store, def: &FoundDef) -> Vec<Symbol> {
     let Some(fingerprint) = store.fingerprint(&def.path) else {
         return Vec::new();
@@ -585,9 +569,6 @@ fn variant_names(store: &Store, def: &FoundDef) -> Vec<Symbol> {
         .unwrap_or_default()
 }
 
-/// Rendered here rather than by `Display` on the stored shapes: an operation's `[r]` and a
-/// variant's field list are presentation, and the store has no business knowing how a person likes
-/// to read them.
 fn declaration(cached: &CachedDecl, variants: &[Symbol]) -> Interface {
     match &cached.body {
         DeclBody::Type { arity, ctors } => Interface::Type {
@@ -641,8 +622,7 @@ fn kind_of(kind: DefKind) -> &'static str {
     }
 }
 
-/// A stored span is a byte range into the file *as it was cached*, so a line and column are only
-/// meaningful while the file still holds those bytes.
+/// A stored span is a byte range into the file as cached, valid only while those bytes are.
 fn locate(store: &Store, path: &Path, span: FileSpan) -> (Option<String>, bool) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return (None, true);
@@ -662,8 +642,7 @@ fn locate(store: &Store, path: &Path, span: FileSpan) -> (Option<String>, bool) 
     (Some(format!("{}:{line}:{column}", path.display())), false)
 }
 
-/// Total and independent of the store's iteration order, so two runs over one cache print the same
-/// entries in the same order.
+/// Independent of the store's iteration order, so output is deterministic.
 pub fn order_key(found: &Found) -> (String, String, String) {
     let (name, hash) = match found {
         Found::Def(d) => (d.name.to_string(), d.hash),
@@ -671,8 +650,6 @@ pub fn order_key(found: &Found) -> (String, String, String) {
     };
     (name, hash.to_hex(), found.path().display().to_string())
 }
-
-// --- shared -----------------------------------------------------------------
 
 pub fn clear(scope: &CacheScope, style: Style) -> i32 {
     let Opened { mut store, .. } = match open(scope, "clear", style) {
@@ -722,8 +699,7 @@ pub fn clear(scope: &CacheScope, style: Style) -> i32 {
     EXIT_OK
 }
 
-/// Every failure inside a cache command reports the same way, so an agent can key off `action` and
-/// `exit_code` without knowing which one it asked for.
+/// One shape for every cache command, so an agent can key off `action` and `exit_code`.
 fn fail(
     json: bool,
     action: &str,
@@ -797,9 +773,7 @@ pub fn garbage_ratio(stats: &CacheStats) -> Option<f64> {
     Some(garbage as f64 / stats.data_bytes as f64)
 }
 
-/// Suggested, never done: dropping an interface costs a recheck, and the definitions most likely to
-/// be garbage — a commented-out function, the other side of a branch — are the ones most likely to
-/// come back.
+/// Suggested, never done: dropping an interface costs a recheck, and dead code tends to come back.
 pub fn compact_suggested(stats: &CacheStats) -> bool {
     garbage_ratio(stats).is_some_and(|ratio| ratio > 0.5)
 }

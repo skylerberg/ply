@@ -8,7 +8,6 @@ use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
 use ply_syntax::ast::ModuleName;
 use serde_json::{Value, json};
 
-/// The `--json` object's shape.
 pub const SCHEMA_VERSION: u32 = 1;
 
 pub struct Row {
@@ -84,10 +83,7 @@ fn report(diagnostics: &[Diagnostic], json: bool, style: Style) -> i32 {
     EXIT_COMPILE_ERROR
 }
 
-/// Counting definitions needs a front end, so this command goes through the same one every other
-/// does — the port, asked once over the shipped modules together (ADR 0052 §1). A shipped module
-/// the compiler's own front end refuses is Ply's fault: the user cannot have caused it and cannot
-/// fix it.
+/// A shipped module the front end refuses is Ply's fault, never the user's.
 pub fn rows() -> Result<Vec<Row>, Vec<Diagnostic>> {
     let sources: Vec<(String, String)> = ply_std::sources()
         .map(|(name, source)| (name.to_string(), source.to_string()))
@@ -100,9 +96,7 @@ pub fn rows() -> Result<Vec<Row>, Vec<Diagnostic>> {
         .iter()
         .map(|(name, source)| {
             let module = Symbol::new(name);
-            // `ModuleInfo::items` names every declaration a reference could reach and, for a sum
-            // type, its constructors beside it — and a constructor is reached through its type
-            // rather than declared on its own.
+            // A constructor is reached through its type rather than declared on its own.
             let items = front
                 .check
                 .modules

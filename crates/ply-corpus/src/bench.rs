@@ -41,12 +41,9 @@ pub struct Report {
 }
 
 pub struct Options {
-    /// Repetitions per scenario; the fastest is reported, because a slower run only ever means the
-    /// machine did something else as well.
+    /// Repetitions per scenario; the fastest is reported.
     pub repeats: usize,
     /// The backend to attach, as `ply test --backend` spells it, or `None` for the evaluator.
-    /// Every scenario is measured under whichever this names, so a row is one engine and two rows
-    /// are the comparison.
     pub backend: Option<String>,
 }
 
@@ -139,8 +136,7 @@ enum Reset {
     Restore,
 }
 
-/// A copy of the cache directory, kept in memory so restoring it cannot itself be measured as disk
-/// work in the run that follows.
+/// A copy of the cache directory, held in memory so restoring it is not measured as disk work.
 struct CacheSnapshot {
     dir: PathBuf,
     files: Vec<(PathBuf, Vec<u8>)>,
@@ -179,8 +175,7 @@ pub enum Mutation {
     Edit(EditSite),
 }
 
-/// A mutation is applied before the measurement and undone after it, so every scenario starts from
-/// the same tree and the order they run in does not leak into the numbers.
+/// Applied before the measurement and undone after, so every scenario starts from the same tree.
 #[derive(Debug)]
 pub struct Applied {
     pub files: Vec<(PathBuf, String)>,
@@ -245,8 +240,7 @@ fn measure(
     let applied = mutation.as_ref().map(|m| apply(root, m)).transpose()?;
     let result = measure_inner(root, options, name, note, reset, snapshot.as_ref());
 
-    // The tree and the cache are both put back, or the next scenario starts from a state no one
-    // chose.
+    // Restore both, or the next scenario starts from a state no one chose.
     if let Some(applied) = applied {
         applied.undo()?;
     }
@@ -353,12 +347,7 @@ fn once(root: &Path, backend: Option<&str>) -> Result<(Timings, Shape)> {
     let selection = ply_test::select(&check, &hashes, &store, &Plan::default(), &engine);
     timings.record(Phase::Select, started.elapsed());
 
-    // Timed apart from the run, because it is the phase an edit shrinks only as far as the emit
-    // cache reaches: the unit closes over every function the fragment compiles whatever moved, and
-    // the link and the load are per run.
-    // Skipped when the selection is empty, exactly as `ply test` skips it: a unit compiled to enter
-    // nothing would put the whole project's compile into a scenario that runs no test, and the row
-    // would report a cost the command does not pay.
+    // Timed apart from the run; skipped on an empty selection, as `ply test` skips it.
     let started = Instant::now();
     let provider = match &spec {
         Some(spec) if !selection.to_run.is_empty() => Some(
@@ -384,7 +373,7 @@ fn once(root: &Path, backend: Option<&str>) -> Result<(Timings, Shape)> {
                 .with_backend(provider, spec);
             ply_test::run_with(&selection, &check, &hashes, &mut store, &executor)
         }
-        // No backend named: the default tier, which under tier-only is the evaluator.
+        // No backend named: the default tier.
         _ => {
             ply_codegen::c::producer::ensure_default();
             let texts = ply_cli::commands::common::module_texts(&program, &sources);

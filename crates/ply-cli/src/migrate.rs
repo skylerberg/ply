@@ -3,11 +3,10 @@
 use ply_span::{Diagnostic, codes};
 use ply_store::Store;
 
-/// The name the front-end cache had while it was a single JSON document.
+/// The superseded single-document front-end cache.
 pub const LEGACY_FRONTEND_FILE: &str = "frontend.json";
 
-/// `warnings` is what the store collected while opening; a caller that has already drained them
-/// must pass what it drained, because a store reports each degradation once.
+/// Pass back any `warnings` already drained: a store reports each degradation once.
 pub fn notice(store: &Store, warnings: &[Diagnostic]) -> Option<Diagnostic> {
     let legacy = store.dir().join(LEGACY_FRONTEND_FILE);
     let superseded = legacy != store.frontend_path() && legacy.is_file();
@@ -31,8 +30,7 @@ pub fn notice(store: &Store, warnings: &[Diagnostic]) -> Option<Diagnostic> {
     )
 }
 
-/// Both caches degrade with the same three codes, so the file a warning names is the only thing
-/// that tells them apart — and only the front-end one costs a recompile worth explaining.
+/// Both caches share these codes; only the path in the message tells them apart.
 fn frontend_refused(store: &Store, warnings: &[Diagnostic]) -> bool {
     let path = store.frontend_path().display().to_string();
     warnings.iter().any(|w| {

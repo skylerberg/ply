@@ -5,7 +5,6 @@ use ply_eval::sim::{DEFAULT_BUDGET, DEFAULT_RANDOM_ROOTS, DEFAULT_STEPS};
 use ply_eval::{Plan, Seed, SimMode};
 use ply_prove::{DEFAULT_CASES, DEFAULT_PROVE_BUDGET, DEFAULT_SHRINK_BUDGET, ProvePlan};
 
-/// The seeds a plan starts from, when the user did not say.
 fn default_seeds(mode: SimMode) -> u32 {
     match mode {
         SimMode::Random => DEFAULT_RANDOM_ROOTS,
@@ -28,8 +27,6 @@ pub fn plan(options: &SimOptions) -> Plan {
         mode,
         roots: (0..u64::from(seeds)).collect(),
         budget: match mode {
-            // `random` is one interleaving per seed by definition, and `once` is the one the seed
-            // names.
             SimMode::Random | SimMode::Once => 1,
             SimMode::Dpor => options.sim_budget.unwrap_or(DEFAULT_BUDGET),
         },
@@ -39,7 +36,7 @@ pub fn plan(options: &SimOptions) -> Plan {
     .normalized()
 }
 
-/// What an obligation weaker than a proof is discharged against, and therefore cached under.
+/// What an obligation weaker than a proof is discharged against and cached under.
 pub fn prove_plan(options: &ProveOptions, simulation: &SimOptions) -> ProvePlan {
     let roots = options.prove_roots.unwrap_or(1);
     ProvePlan {
@@ -52,7 +49,7 @@ pub fn prove_plan(options: &ProveOptions, simulation: &SimOptions) -> ProvePlan 
     .normalized()
 }
 
-/// The plan `ply run` evaluates under: exactly one interleaving, the one the seed names.
+/// Exactly one interleaving, the one the seed names.
 pub fn run_plan(seed: Option<&Seed>) -> Plan {
     Plan::once(seed.cloned().unwrap_or_default())
 }

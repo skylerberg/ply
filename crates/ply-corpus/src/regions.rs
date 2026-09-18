@@ -12,8 +12,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Instant;
 
-/// The atoms the scheduler let contend under the forkable world: the ambient ones dropped, and the
-/// region-scoped ones dropped too because every test ran against its own fork.
+/// The atoms that contended under the forkable world: neither ambient nor region-scoped.
 pub fn forked_footprint(f: &Footprint) -> Footprint {
     Footprint::from_atoms(
         f.atoms()
@@ -22,27 +21,22 @@ pub fn forked_footprint(f: &Footprint) -> Footprint {
     )
 }
 
-/// The atoms that contend once a test no longer gets its own world — which is what
-/// `ply_test::shared_footprint` now is.
+/// The atoms that contend once a test no longer gets its own world.
 pub fn region_footprint(f: &Footprint) -> Footprint {
     ply_test::shared_footprint(f)
 }
 
-/// Whether this test was isolated under the forkable world only because its state was forked: it
-/// carries an atom the world-backed exemption hid.
+/// Isolated under the forkable world only because its region-scoped state was forked.
 pub fn isolated_by_forking(f: &Footprint) -> bool {
     forked_footprint(f).is_empty() && f.atoms().any(ply_test::is_region_scoped)
 }
 
-/// Isolated under the forkable world: the classification `isolated n of m` counted before the region model
-/// Region isolation, kept here because the counterfactual's baseline is that number and `ply-test` no longer
-/// computes it.
+/// Isolated under the forkable world: the counterfactual's baseline.
 fn was_world_isolated(f: &Footprint) -> bool {
     forked_footprint(f).is_empty()
 }
 
-/// `ply_test::group_by_conflict` with the projection lifted out, so the baseline and the
-/// counterfactual are coloured by one function.
+/// `ply_test::group_by_conflict` with the projection lifted out, so both sides share one colouring.
 pub fn colour(tests: &[(usize, Footprint)], projected: &[Footprint]) -> Vec<Vec<usize>> {
     assert_eq!(tests.len(), projected.len());
 
@@ -79,9 +73,7 @@ pub fn colour(tests: &[(usize, Footprint)], projected: &[Footprint]) -> Vec<Vec<
         .collect()
 }
 
-/// Wall clock for a schedule, in the shape `ply_test::run` actually executes it: one group at a
-/// time, and within a group `jobs` workers each taking the next index off a shared counter as they
-/// come free.
+/// Wall clock for a schedule as `ply_test::run` executes it: groups in turn, `jobs` workers each.
 pub fn makespan(groups: &[Vec<usize>], millis: &[f64], jobs: usize, setup_millis: f64) -> f64 {
     let mut total = 0.0;
     for group in groups {
@@ -140,8 +132,7 @@ fn split(groups: &[Vec<usize>], millis: &[f64], jobs: usize, setup: f64) -> Spli
     }
 }
 
-/// A test that changes classification, named rather than counted, because a count nobody can check
-/// is the shape of claim this project keeps finding wrong.
+/// A test that changes classification.
 #[derive(Clone, Debug, Serialize)]
 pub struct NewlySerialized {
     pub index: usize,
@@ -160,13 +151,11 @@ pub struct IsolationCost {
     /// `isolated n of m`, as `ply test` prints it.
     pub isolated_today: usize,
     pub shared_today: usize,
-    /// Of the isolated: how many have an empty footprint and therefore conflict with nothing
-    /// whatever the memory model is.
+    /// Of the isolated: empty footprints, which conflict with nothing.
     pub pure: usize,
     /// Of the isolated: how many carry only `sim.read`, which the region model does not touch.
     pub seeded_only: usize,
-    /// Of the isolated: how many carry a `cell` atom — the exemption forking pays for, and the only
-    /// population that can lose anything here.
+    /// Of the isolated: those carrying a `cell` atom, the only ones that can lose anything.
     pub world_backed: usize,
 
     pub newly_serialized: usize,
@@ -177,8 +166,7 @@ pub struct IsolationCost {
 
     /// Measured, at `jobs`, over the whole suite.
     pub measured_suite_millis: Option<f64>,
-    /// The same suite measured at one worker: the denominator the parallel run is actually buying
-    /// against.
+    /// The same suite measured at one worker.
     pub measured_sequential_millis: Option<f64>,
     pub worker_setup_millis: f64,
     /// `modelled / measured − 1` for today's schedule.
@@ -292,9 +280,7 @@ pub fn analyse(corpus: &Corpus, jobs: usize) -> IsolationCost {
     }
 }
 
-/// Loads a project the way `ply` does — shipped modules resolve, which `crate::pipeline::front`
-/// deliberately does not arrange — runs every test once at one job, and returns the per-test
-/// durations the runner itself measured.
+/// Loads a project as `ply` does (std resolves, unlike `pipeline::front`) and times every test.
 pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
     let loaded = ply_cli::load::load(root).map_err(|e| {
         anyhow::anyhow!(
@@ -375,8 +361,7 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
         Ok((visible.iter().map(|&i| by_index[i]).collect(), wall))
     };
 
-    // Per-test costs come from a one-job pass, where a test's duration is its own work rather than
-    // its share of a contended machine.
+    // Per-test costs come from a one-job pass, free of contention.
     let (millis, sequential) = run(1)?;
     let (_, measured) = run(jobs)?;
 
@@ -407,15 +392,14 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
     })
 }
 
-/// A corpus that does not exist, so that the risk can be priced rather than asserted away.
+/// A synthetic corpus, so the risk can be priced.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Hypothetical {
     /// Tests carrying a `cell` atom.
     pub cell_tests: usize,
     /// Distinct region labels they spread over.
     pub labels: usize,
-    /// Tests carrying a real, contending resource atom, so the counterfactual is read against a
-    /// graph that already has edges.
+    /// Tests carrying a contending resource atom, so the graph already has edges.
     pub shared_tests: usize,
     /// Distinct labels those spread over.
     pub shared_labels: usize,
@@ -537,8 +521,7 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-/// Effects that appear in a test footprint anywhere in the corpus, which is how a claim about
-/// `cell` is checked rather than believed.
+/// Effects present in any test footprint of the corpus.
 pub fn effects_present(footprints: &[Footprint]) -> BTreeSet<String> {
     footprints
         .iter()

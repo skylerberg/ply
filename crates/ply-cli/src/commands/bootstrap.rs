@@ -1,20 +1,5 @@
-//! The front end, written out as the C that builds it.
-//!
-//! A self-hosted compiler has to answer one question before it can drop the compiler it was
-//! written in: what does a fresh clone read the language *with*? Three answers are available and
-//! two are bad. Keeping the Rust front end as the first stage is not dropping it. Committing a
-//! built object is a binary per platform, per version, in the history.
-//!
-//! The third is this. The emitted tier already turns the whole front end into one C file; that
-//! file is text, it diffs, it needs nothing but a C compiler, and git already archives every
-//! version of it. So the artifact this writes *is* the compiler, in the only form that is neither
-//! a binary nor a dependency on what it replaces.
-//!
-//! Two digests, because they answer different questions. The **source** digest is over every
-//! definition's content hash: it names which version of the front end this is, and two trees with
-//! the same one hold the same compiler however differently they emit it. The **artifact** digest is
-//! over the C: it says whether this file is the one that version produces, which is what `--verify`
-//! checks and what makes the archive worth keeping.
+//! The front end, written out as the C that builds it. The source digest names the version;
+//! the artifact digest is what `--verify` checks.
 
 use super::common::{diagnostics_json, emit_json, emit_keys, print_diagnostics, report_load_error};
 use crate::cli::BootstrapArgs;
@@ -23,7 +8,7 @@ use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_OK};
 use serde_json::json;
 
-/// What the archive records. Written beside the C and read back by `--verify`.
+/// Written beside the C and read back by `--verify`.
 fn manifest(source: &str, artifact: &str, definitions: usize, refused: usize) -> serde_json::Value {
     json!({
         "source": source,
@@ -42,8 +27,7 @@ pub fn execute(args: &BootstrapArgs, style: Style) -> i32 {
         Ok(loaded) => loaded,
         Err(err) => return report_load_error("bootstrap", &err, args.json, style),
     };
-    // The call is the guard: it reports the hashing's diagnostics and stops, and the archive
-    // reads its hashes from the load's own answer below.
+    // The call is the guard: it reports the hashing's diagnostics and stops.
     let _hashes = match loaded.hashes() {
         Ok(hashes) => hashes,
         Err(diagnostics) => {
@@ -62,13 +46,10 @@ pub fn execute(args: &BootstrapArgs, style: Style) -> i32 {
     };
     let program = Box::leak(Box::new(loaded.program.clone()));
     let resolved = Box::leak(Box::new(loaded.resolved.clone()));
-    // The load's own answer, which is the port's: asking for another would be a second front end
-    // in one invocation, and the emitter that answers for the archive is the one the load
-    // installed.
+    // The load's own answer: asking again would run a second front end.
     let front = Box::leak(Box::new(loaded.front.clone()));
 
-    // The definition hashes, in name order, are the version. Sorted rather than in load order so
-    // that moving a definition between files does not rename the compiler.
+    // Sorted by name, so moving a definition between files does not rename the compiler.
     let mut pairs: Vec<(String, String)> = front
         .hashes
         .defs
@@ -85,8 +66,7 @@ pub fn execute(args: &BootstrapArgs, style: Style) -> i32 {
     }
     let source_digest = h.finalize().to_hex().to_string();
 
-    // The port is a front end: it reads the module texts, and a source without them is one it
-    // answers no body for, which is an archive holding none of the program it was made from.
+    // Without the module texts the port answers no bodies, and the archive would be empty.
     let src: &'static ply_codegen::Source = Box::leak(Box::new(
         ply_codegen::Source::from_front(program, resolved, front, emit_keys(front)).with_texts(
             crate::commands::common::module_texts(&loaded.program, &loaded.sources),
@@ -150,7 +130,7 @@ pub fn execute(args: &BootstrapArgs, style: Style) -> i32 {
         eprintln!("{}: {e}", dir.display());
         return EXIT_COMPILE_ERROR;
     }
-    // The C first, so a manifest is never on disk describing an artifact that is not.
+    // The C first, so a manifest never describes an artifact that is not on disk.
     if let Err(e) = std::fs::write(&c_path, &text) {
         eprintln!("{}: {e}", c_path.display());
         return EXIT_COMPILE_ERROR;
