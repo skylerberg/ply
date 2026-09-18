@@ -32,19 +32,16 @@ pub struct Node<'a> {
 
 #[derive(Clone, Debug)]
 pub struct TestNode<'a> {
-    /// `<module>.<label>`, which is what keeps two identically-labelled tests in different modules
-    /// distinct.
+    /// `<module>.<label>`, so identically-labelled tests in different modules stay distinct.
     pub key: Symbol,
     pub module: usize,
     pub def: &'a TestDef,
 }
 
-/// A `law`, which is an item with a body and no name a reference could reach — so it is indexed
-/// beside the tests rather than among the definitions.
+/// A `law` has no name a reference could reach, so it is indexed beside the tests.
 #[derive(Clone, Debug)]
 pub struct LawNode<'a> {
-    /// `<module>.<label>`, which is what keeps two identically-labelled laws in different modules
-    /// distinct.
+    /// `<module>.<label>`, as for [`TestNode::key`].
     pub key: Symbol,
     pub module: usize,
     pub def: &'a LawDef,
@@ -61,8 +58,7 @@ pub enum Entry {
 #[derive(Clone, Debug)]
 pub enum ValueTarget {
     Fn(NodeId),
-    /// The type that declares the variant, plus the variant's own name — a constructor has no node
-    /// of its own.
+    /// The declaring type plus the variant's name: a constructor has no node of its own.
     Ctor {
         owner: NodeId,
         name: Symbol,
@@ -103,8 +99,7 @@ pub struct ProgramIndex<'a> {
     effect_sketches: FxHashMap<usize, Vec<u8>>,
 }
 
-/// Each effect declaration's own normalized bytes, written against empty tables so that they are a
-/// function of that declaration and of nothing else in the program.
+/// Each effect declaration's bytes, written against empty tables so they depend on nothing else.
 fn sketch_effects(index: &ProgramIndex<'_>) -> FxHashMap<usize, Vec<u8>> {
     let no_hashes = crate::normalize::HashTable::default();
     let no_component = crate::normalize::ComponentIndices::default();
@@ -151,8 +146,7 @@ impl<'a> ProgramIndex<'a> {
         ProgramIndex::build(vec![module], None)
     }
 
-    /// Without a [`Resolved`] there is no module namespace, so an imported name would be written
-    /// into the hash as the name the file spelled it with.
+    /// Without a [`Resolved`] an imported name would be hashed as spelled, so imports are refused.
     fn imports_need_a_program(modules: &[&'a Module]) -> Vec<Diagnostic> {
         let mut diags = Vec::new();
         for module in modules {
@@ -266,8 +260,6 @@ impl<'a> ProgramIndex<'a> {
                             def: d,
                         });
                     }
-                    // A law hashes like a test: an item with a body, its own discriminant, its
-                    // binder types and guard and body normalized together.
                     Item::Law(d) => {
                         order.push(Entry::Law(laws.len()));
                         laws.push(LawNode {
@@ -276,8 +268,7 @@ impl<'a> ProgramIndex<'a> {
                             def: d,
                         });
                     }
-                    // Expansion has already appended this derive's generated definitions as
-                    // `Item::Fn`, and those are the nodes.
+                    // Expansion has already appended a derive's definitions as `Item::Fn`.
                     Item::Derive(_) | Item::EffectSet(_) => {}
                 }
             }
@@ -304,8 +295,7 @@ impl<'a> ProgramIndex<'a> {
         Ok(index)
     }
 
-    /// The declaration bytes an effect reference is *ordered* by when the atom bytes cannot
-    /// separate two effects.
+    /// The bytes an effect reference is ordered by when atom bytes cannot separate two effects.
     pub fn effect_sketch(&self, node: NodeId) -> Option<&[u8]> {
         self.effect_sketches.get(&node.0).map(Vec::as_slice)
     }
@@ -347,8 +337,7 @@ impl<'a> ProgramIndex<'a> {
         self.items.get(owner)?.effects.get(&name).copied()
     }
 
-    /// A qualified name consults only the named module's declarations and never the current scope;
-    /// a bare one consults only the current scope.
+    /// A qualified name consults only the named module; a bare one only the current scope.
     fn target(
         &self,
         module: usize,

@@ -12,12 +12,9 @@ pub type Aliases<'a> = IndexMap<Symbol, &'a TypeExpr>;
 
 pub struct Emitter<'a> {
     deriver: Deriver,
-    /// How a name from the deriver's runtime module is written in the module being expanded:
-    /// `json::`, or empty when the deriver needs no module at all.
+    /// The runtime module's qualifier as written here (`json::`), or empty when there is none.
     runtime: String,
-    /// Prefix for every binder this emitter introduces, chosen so that none of them can shadow a
-    /// dictionary parameter — which is named after a type parameter, and a type parameter may be
-    /// called anything.
+    /// A prefix no type parameter starts with, so no binder shadows a dictionary parameter.
     binder: String,
     aliases: &'a Aliases<'a>,
 }
@@ -83,8 +80,7 @@ impl<'a> Emitter<'a> {
         out
     }
 
-    /// `JsonCodec<a>` is nominal and ships with `std.json`; `EqDict` and `OrdDict` are written
-    /// structurally instead.
+    /// `JsonCodec<a>` is nominal in `std.json`; the `eq` and `ord` dictionaries are structural.
     fn dict_type(&self, arg: &str) -> String {
         match self.deriver {
             Deriver::Json => {
@@ -98,7 +94,6 @@ impl<'a> Emitter<'a> {
     fn dictionary(&self, def: &TypeDef, target: &str) -> String {
         let b = &self.binder;
         match self.deriver {
-            // Ply's `==` is structural equality over every value that is not a function, and
             // `compare_values` is the total order `Map` iterates in.
             Deriver::Eq => format!("{{eq: |{b}a: {target}, {b}b: {target}| {b}a == {b}b}}"),
             Deriver::Ord => {
@@ -115,8 +110,7 @@ impl<'a> Emitter<'a> {
     fn json_codec(&self, te: &TypeExpr, annotation: &str) -> String {
         let rt = &self.runtime;
         match te {
-            // The dictionary parameter for this type parameter, which the signature bound under the
-            // parameter's own name.
+            // The signature binds each dictionary under its type parameter's name.
             TypeExpr::Var(p) => p.name.to_string(),
             TypeExpr::Unit { .. } => format!("{rt}unit_json()"),
             TypeExpr::Record { fields, .. } => self.json_record(fields, annotation),
@@ -126,16 +120,14 @@ impl<'a> Emitter<'a> {
                     .iter()
                     .map(|a| self.json_codec(a, &render_type(a)))
                     .collect();
-                // A JSON object's keys are strings, so a `Map<String, v>` has an object form and
-                // nothing else does.
+                // JSON object keys are strings, so only `Map<String, v>` has an object form.
                 if simple == rules::MAP && args.len() == 2 && self.is_string(&args[0]) {
                     return format!("{rt}string_map_json({})", codecs[1]);
                 }
                 let call = format!("{}_json({})", rules::snake_case(simple), codecs.join(", "));
                 match rules::shape(self.deriver, simple) {
-                    // A named type is composed through by name, never inlined: `order_json`'s body
-                    // then depends on `user_json`'s *hash*, which is what makes a change to `User`
-                    // re-select exactly the tests that reach an `Order`.
+                    // Called by name, never inlined, so a change to the named type re-selects
+                    // exactly the tests that reach this one.
                     Shape::Nominal => match &name.module {
                         Some(m) => format!("{}::{call}", m.name),
                         None => call,
@@ -151,8 +143,7 @@ impl<'a> Emitter<'a> {
     /// Whether a written type *is* `String`, following this module's own parameterless aliases.
     fn is_string(&self, te: &TypeExpr) -> bool {
         let mut current = te;
-        // A cyclic alias is `E0102` where it is declared; bounded so that expansion answers rather
-        // than spins on the way there.
+        // Bounded: a cyclic alias is reported where it is declared, not here.
         for _ in 0..64 {
             let TypeExpr::Con { name, args, .. } = current else {
                 return false;
@@ -202,9 +193,7 @@ impl<'a> Emitter<'a> {
         format!("{{encode: {encode}, decode: |{b}j: {rt}Json| {decode}}}")
     }
 
-    /// A variant is encoded by its declared name and its fields in order, so renaming a variant
-    /// changes the generated body and re-selects the tests that reach it — which is correct,
-    /// because the tag is what a client sees.
+    /// A variant encodes as its declared name and its fields in order.
     fn json_sum(&self, variants: &[VariantDef], target: &str) -> String {
         let (rt, b) = (&self.runtime, &self.binder);
 
