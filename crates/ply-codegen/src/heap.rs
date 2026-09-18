@@ -104,10 +104,12 @@ static FALSE_OBJ: Obj = Obj {
     layout: 0,
 };
 
+#[inline]
 pub fn unit() -> Word {
     &raw const UNIT_OBJ as Word
 }
 
+#[inline]
 pub fn bool(b: bool) -> Word {
     if b {
         &raw const TRUE_OBJ as Word
@@ -116,24 +118,29 @@ pub fn bool(b: bool) -> Word {
     }
 }
 
+#[inline]
 pub fn is_imm(w: Word) -> bool {
     w & 1 == 1
 }
 
 /// Whether `v` fits the sixty-three bits an immediate carries.
+#[inline]
 pub fn fits_imm(v: i64) -> bool {
     (v << 1) >> 1 == v
 }
 
+#[inline]
 pub fn imm(v: i64) -> Word {
     debug_assert!(fits_imm(v));
     (v << 1) | 1
 }
 
+#[inline]
 pub fn imm_value(w: Word) -> i64 {
     w >> 1
 }
 
+#[inline]
 pub fn obj(w: Word) -> *mut Obj {
     debug_assert!(!is_imm(w) && w != 0);
     if poisoning() {
@@ -146,6 +153,7 @@ pub fn obj(w: Word) -> *mut Obj {
 /// poisoned at release, and a read of it through the runtime, before the block is taken again,
 /// fails at the body's site. `PLY_HEAP_POISON=1` turns it on for a process; nothing ships with
 /// it.
+#[inline]
 pub fn poisoning() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("PLY_HEAP_POISON").is_some())
@@ -283,14 +291,17 @@ pub mod poison {
 }
 
 /// The payload words after a header.
+#[inline]
 pub unsafe fn words(o: *mut Obj) -> *mut Word {
     unsafe { (o as *mut u8).add(HEADER) as *mut Word }
 }
 
+#[inline]
 pub unsafe fn word_at(o: *mut Obj, i: usize) -> Word {
     unsafe { *words(o).add(i) }
 }
 
+#[inline]
 pub unsafe fn set_word(o: *mut Obj, i: usize, w: Word) {
     unsafe { *words(o).add(i) = w }
 }
@@ -313,11 +324,13 @@ pub unsafe fn bridged_mut<'a>(o: *mut Obj) -> &'a mut Value {
 }
 
 /// Where a string's or a bytes value's payload starts.
+#[inline]
 pub unsafe fn bytes_ptr(o: *mut Obj) -> *mut u8 {
     unsafe { (o as *mut u8).add(HEADER) }
 }
 
 /// The bytes a string or a bytes value holds, borrowed.
+#[inline]
 pub unsafe fn bytes_of<'a>(o: *mut Obj) -> &'a [u8] {
     unsafe { std::slice::from_raw_parts(bytes_ptr(o), (*o).len as usize) }
 }
@@ -363,9 +376,10 @@ pub struct Layouts {
     pub less: Option<u32>,
     pub equal: Option<u32>,
     pub greater: Option<u32>,
-    /// Per shape, the offset of each field name the compiled unit reads by index, filled on the
-    /// shape's first such read so a lookup is a load rather than a search over symbols.
-    offsets: RefCell<Vec<Option<Box<[u16]>>>>,
+    /// Per shape interned before [`Layouts::index_fields`], the offset of each field name the
+    /// compiled unit reads by index, `width` to a row, so a lookup is a load rather than a search.
+    rows: Box<[u16]>,
+    width: usize,
     /// The shape of a `{key, value}` entry, interned once.
     entry_shape: u32,
 }
@@ -396,7 +410,8 @@ impl Layouts {
             less,
             equal,
             greater,
-            offsets: RefCell::new(Vec::new()),
+            rows: Box::default(),
+            width: 0,
             entry_shape,
         }
     }
@@ -409,28 +424,30 @@ impl Layouts {
         self.entry_shape
     }
 
-    /// The offset of the field named at `index` in `names`, in `shape`: cached per shape over
-    /// every name the unit reads, so that after the first read it is one load.
-    pub fn offset_by_index(&self, shape: u32, index: usize, names: &[Symbol]) -> Option<usize> {
-        {
-            let offsets = self.offsets.borrow();
-            if let Some(Some(row)) = offsets.get(shape as usize)
-                && let Some(at) = row.get(index)
-            {
-                return (*at != NO_FIELD).then_some(*at as usize);
-            }
-        }
-        let row: Box<[u16]> = names
+    pub fn index_fields(&mut self, names: &[Symbol]) {
+        let rows: Box<[u16]> = self
+            .shapes
+            .get_mut()
+            .names
             .iter()
-            .map(|name| self.offset(shape, name).map_or(NO_FIELD, |at| at as u16))
+            .flat_map(|shape| {
+                names
+                    .iter()
+                    .map(move |name| shape.binary_search(name).map_or(NO_FIELD, |at| at as u16))
+            })
             .collect();
-        let at = row.get(index).copied();
-        let mut offsets = self.offsets.borrow_mut();
-        if offsets.len() <= shape as usize {
-            offsets.resize(shape as usize + 1, None);
+        self.rows = rows;
+        self.width = names.len();
+    }
+
+    /// The offset of the field named at `index` in `names`, in `shape`: one load for a shape the
+    /// rows cover, and a search for one interned since.
+    #[inline]
+    pub fn offset_by_index(&self, shape: u32, index: usize, names: &[Symbol]) -> Option<usize> {
+        match self.rows.get(shape as usize * self.width + index) {
+            Some(&at) => (at != NO_FIELD).then_some(at as usize),
+            None => self.offset(shape, &names[index]),
         }
-        offsets[shape as usize] = Some(row);
-        at.and_then(|at| (at != NO_FIELD).then_some(at as usize))
     }
 
     /// The id of the shape with exactly these fields, in any order.
@@ -501,6 +518,9 @@ pub struct Heap {
     large: Vec<Vec<*mut Obj>>,
     /// Dead blocks not yet on a free list, oldest first, under `delay()`.
     delayed: std::collections::VecDeque<(*mut Obj, usize)>,
+    poison: bool,
+    delay: usize,
+    census: bool,
 }
 
 /// The size classes a dead object is kept in, in words; anything larger goes back only at the
@@ -558,13 +578,13 @@ unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
         // Poisoned and still reused: a heap that kept every dead block over the emitter's own
         // sources needed more memory than a runner has, so the net is the poison a stale read
         // meets until the block is taken again, not the block waiting.
-        if poisoning() {
+        if (*heap).poison {
             let words = (object - HEADER) / 8;
             for i in 0..words {
                 set_word(o, i, poison::word());
             }
         }
-        let delay = delay();
+        let delay = (*heap).delay;
         if delay == 0 {
             (*heap).free_list(object).push(o);
             return;
@@ -608,6 +628,9 @@ impl Heap {
             free: Vec::new(),
             large: Vec::new(),
             delayed: std::collections::VecDeque::new(),
+            poison: poisoning(),
+            delay: delay(),
+            census: census_by_layout(),
         }
     }
 
@@ -770,6 +793,7 @@ impl Heap {
             None => self.free.get_mut(size / 8).and_then(Vec::pop),
         };
         let p = match recycled {
+            // Its start bit is still set: only `end` clears bits, and it empties every free list.
             Some(p) => {
                 self.recycled += 1;
                 p
@@ -780,6 +804,8 @@ impl Heap {
                     self.grow(size);
                 }
                 let p = self.cur as *mut Obj;
+                let bit = (p as usize - self.chunks[self.chunk].0 as usize) / 8;
+                self.starts[self.chunk][bit / 64] |= 1 << (bit % 64);
                 self.cur = unsafe { self.cur.add(size) };
                 p
             }
@@ -794,10 +820,9 @@ impl Heap {
                 layout,
             });
         }
-        self.mark_start(p as usize);
         self.count += 1;
         self.by_kind[kind as usize & 15] += 1;
-        if census_by_layout() {
+        if self.census {
             let key = match kind {
                 KIND_CTOR | KIND_RECORD => Some(layout),
                 // Bytes arrive with `len` zero and the room in the payload; the class is the room.
@@ -809,17 +834,6 @@ impl Heap {
             }
         }
         p
-    }
-
-    fn mark_start(&mut self, address: usize) {
-        for (i, (base, cap)) in self.chunks.iter().enumerate() {
-            let base = *base as usize;
-            if address >= base && address < base + *cap {
-                let bit = (address - base) / 8;
-                self.starts[i][bit / 64] |= 1 << (bit % 64);
-                return;
-            }
-        }
     }
 
     /// Whether `w` is the address of an object this heap allocated in the entry now running and
@@ -1039,6 +1053,7 @@ impl Heap {
         for class in &mut self.large {
             class.clear();
         }
+        self.delayed.clear();
         for bits in &mut self.starts {
             bits.fill(0);
         }
@@ -1218,9 +1233,10 @@ impl Drop for Heap {
 
 // --- Counts ------------------------------------------------------------------------------------
 
-/// One more holder of `w`.
+/// One more holder of `w`. Zero is no object, as `ply_inc` and `ply_dec` read it.
+#[inline]
 pub fn inc(w: Word) {
-    if is_imm(w) {
+    if is_imm(w) || w == 0 {
         return;
     }
     let o = obj(w);
@@ -1233,8 +1249,9 @@ pub fn inc(w: Word) {
 }
 
 /// One holder fewer; the last one dismantles the object, children and all.
+#[inline]
 pub fn dec(w: Word) {
-    if is_imm(w) {
+    if is_imm(w) || w == 0 {
         return;
     }
     let o = obj(w);
@@ -1504,10 +1521,12 @@ pub fn reaches_cell(w: Word, slot: ply_eval::arena::Slot) -> bool {
 }
 
 /// Whether one holder alone has `w`: what lets an update write in place.
+#[inline]
 pub fn is_unique(w: Word) -> bool {
     !is_imm(w) && unsafe { (*obj(w)).rc == 1 }
 }
 
+#[inline]
 pub fn kind(w: Word) -> u8 {
     if is_imm(w) {
         KIND_INT
@@ -1523,9 +1542,13 @@ pub fn kind(w: Word) -> u8 {
 }
 
 /// The `Int` a word carries, if it is one.
+#[inline]
 pub fn as_int(w: Word) -> Option<i64> {
     if is_imm(w) {
         return Some(imm_value(w));
+    }
+    if w == 0 {
+        return None;
     }
     let o = obj(w);
     unsafe {
@@ -1537,8 +1560,9 @@ pub fn as_int(w: Word) -> Option<i64> {
     }
 }
 
+#[inline]
 pub fn as_bool(w: Word) -> Option<bool> {
-    if is_imm(w) {
+    if is_imm(w) || w == 0 {
         return None;
     }
     let o = obj(w);

@@ -122,7 +122,7 @@ fn mentioned() -> Vec<&'static str> {
 }
 
 /// The digest of the shapes this build stores.
-const PINNED: &str = "4b9a638dc981d58852e5d7a7ad30e1d129c49f0deb292e2033e228a7b56f4f32";
+const PINNED: &str = "ec625d46135fe36307cb13dfe7c563fabe50497cae7713feccd5a365eea30315";
 
 #[test]
 fn the_stored_schema_is_pinned() {

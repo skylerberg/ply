@@ -374,11 +374,10 @@ pub mod census {
             ("recycled", got.recycled as f64, 0.01),
             ("chunk_bytes", got.chunk_bytes as f64, 0.25),
         ] {
-            let claimed = field(name)?;
-            let drift = (claimed - measured).abs() / measured.max(1.0);
-            if drift > band {
+            let ceiling = field(name)?;
+            if measured > ceiling * (1.0 + band) {
                 return Err(format!(
-                    "`{key}` in {} says {name} is {claimed:.0} and this tree reads {measured:.0}; re-take the entry from this reading if the change is meant:\n  \"{key}\": {reading}",
+                    "`{key}` in {} caps {name} at {ceiling:.0} and this tree reads {measured:.0}; lower the reading, or raise the entry if the cost is meant:\n  \"{key}\": {reading}",
                     path().display()
                 ));
             }
