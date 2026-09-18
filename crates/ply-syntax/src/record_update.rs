@@ -5,7 +5,6 @@ use crate::effect_set::grow;
 use indexmap::IndexMap;
 use ply_span::{Diagnostic, Symbol, codes};
 
-/// How deep an alias chain may be followed before the pass gives up.
 const MAX_ALIAS_DEPTH: u32 = 16;
 
 /// Rewrites every `{..b, f: e}` in the module into the record literal it stands for.
@@ -23,7 +22,7 @@ pub(crate) fn expand(module: &mut Module, diags: &mut Vec<Diagnostic>) {
     module.items = items;
 }
 
-/// The same expansion for an expression parsed with no module around it ([`crate::parse_expr`]).
+/// [`expand`] for an expression parsed with no module around it ([`crate::parse_expr`]).
 pub(crate) fn expand_bare(e: &mut Expr, diags: &mut Vec<Diagnostic>) {
     let types = IndexMap::new();
     let mut cx = Cx {
@@ -34,8 +33,7 @@ pub(crate) fn expand_bare(e: &mut Expr, diags: &mut Vec<Diagnostic>) {
     cx.expr(e);
 }
 
-/// This module's own `type` items, by simple name, cloned so that the walk can hold the module
-/// mutably.
+/// This module's own `type` items by simple name, cloned so the walk can mutate the module.
 fn collect_types(module: &Module) -> IndexMap<Symbol, TypeDef> {
     let mut out = IndexMap::new();
     for item in &module.items {
@@ -49,9 +47,7 @@ fn collect_types(module: &Module) -> IndexMap<Symbol, TypeDef> {
 
 /// Why a base has no shape this pass can name.
 enum Why {
-    /// In scope, but nothing wrote its type.
     Unannotated(Symbol),
-    /// Not a local binder at all — a function, an import, a prelude name.
     NotALocal(Symbol),
     /// `m::T`, or a base written `m::x`.
     CrossModule,
@@ -59,13 +55,9 @@ enum Why {
     Foreign(Symbol),
     /// A generic alias, or a type parameter.
     Generic,
-    /// A sum type; there is nothing to copy field-wise.
     Sum(Symbol),
-    /// A function type, `Unit`, or an inline non-record.
     NotARecord,
-    /// `state.nosuch`.
     NoSuchField(Symbol, Vec<Symbol>),
-    /// An alias chain longer than [`MAX_ALIAS_DEPTH`].
     TooDeep,
 }
 
@@ -107,7 +99,6 @@ impl Why {
     }
 }
 
-/// What the innermost binding for a name says about its type.
 enum Bound<'a> {
     Typed(&'a TypeExpr),
     Untyped,
@@ -126,8 +117,7 @@ impl Cx<'_> {
         self.scope.push((name.name.clone(), ty));
     }
 
-    /// Every binder a pattern introduces, all untyped: a pattern's binders take their types from
-    /// the scrutinee, which this pass does not infer.
+    /// Untyped: a pattern binder's type comes from the scrutinee, which this pass does not infer.
     fn bind_pattern(&mut self, p: &Pattern) {
         match &p.kind {
             PatternKind::Wildcard | PatternKind::Lit(_) => {}
@@ -173,22 +163,17 @@ impl Cx<'_> {
                     )),
                 }
             }
-            // The parser admits only `x` and `x.f...` as a base, so this is unreachable from
-            // source; it is written out rather than `unreachable!` because a refusal is the safe
-            // answer either way.
+            // Unreachable from source (a base is only `x` or `x.f...`), but refusing is safe.
             _ => Err(Why::NotARecord),
         }
     }
 
-    /// The fields of `ty`, following this module's own aliases to a record.
     fn record_of(&self, ty: &TypeExpr, depth: u32) -> Result<Vec<(Ident, TypeExpr)>, Why> {
         if depth > MAX_ALIAS_DEPTH {
             return Err(Why::TooDeep);
         }
         match ty {
             TypeExpr::Record { fields, .. } => Ok(fields.clone()),
-            // A lowercase bare name is a type parameter bound by an enclosing `<..>`, never a
-            // declared type.
             TypeExpr::Var(_) => Err(Why::Generic),
             TypeExpr::Con { name, args, .. } => {
                 if !name.is_bare() {
@@ -313,8 +298,7 @@ impl Cx<'_> {
         }
     }
 
-    /// Children first, then this node: an update nested in another's field value is expanded before
-    /// the outer one copies it.
+    /// Children first, so a nested update is expanded before the outer one copies it.
     fn expr(&mut self, e: &mut Expr) {
         grow(|| {
             match &mut e.kind {
@@ -364,8 +348,7 @@ impl Cx<'_> {
                     for stmt in stmts {
                         match stmt {
                             Stmt::Let { pat, ty, value, .. } => {
-                                // The value is elaborated before the binder exists: `let s = {..s,
-                                // a: 1}` updates the outer `s`.
+                                // Value first: `let s = {..s, a: 1}` updates the outer `s`.
                                 self.expr(value);
                                 match (&pat.kind, ty) {
                                     (PatternKind::Var(n), Some(t)) => {
@@ -389,8 +372,7 @@ impl Cx<'_> {
                     fields.iter_mut().for_each(|(_, v)| self.expr(v));
                 }
                 ExprKind::Field { base, .. } => self.expr(base),
-                // `try_op::expand` runs *after* this pass, so the sugar is still here and this walk
-                // goes through it.
+                // `try_op::expand` runs after this pass, so `?` is still here.
                 ExprKind::Try { operand } => self.expr(operand),
                 ExprKind::List { items } => items.iter_mut().for_each(|i| self.expr(i)),
                 ExprKind::Perform { args, .. } => args.iter_mut().for_each(|a| self.expr(a)),
