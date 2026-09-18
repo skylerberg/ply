@@ -125,8 +125,8 @@ impl Front {
 
     /// The part no module declares, then one per module; `Err` when `join` could not rebuild it.
     pub fn split(&self) -> Result<(Front, Vec<Front>), String> {
-        if !self.diagnostics.is_empty() {
-            return Err("an answer with diagnostics does not split".to_string());
+        if self.has_error() {
+            return Err("an answer with an error does not split".to_string());
         }
         let h = &self.hashes;
         let (tests, laws) = (self.check.tests.len(), self.check.laws.len());
@@ -141,9 +141,11 @@ impl Front {
         }
 
         let mut place: BTreeMap<&Symbol, usize> = BTreeMap::new();
+        let mut by_source: BTreeMap<SourceId, usize> = BTreeMap::new();
         let mut parts = Vec::with_capacity(self.check.modules.len());
         for (name, info) in &self.check.modules {
             place.insert(name, parts.len());
+            by_source.insert(info.source, parts.len());
             let mut part = Front::default();
             part.check.modules.insert(name.clone(), info.clone());
             parts.push(part);
@@ -161,6 +163,39 @@ impl Front {
         }
         if self.order.len() != parts.len() || rank.contains(&0) {
             return Err("the order does not name every module once".to_string());
+        }
+
+        // A part is keyed by its module and what that imports: a warning must not depend on importers.
+        let mut laid = Laid::new("diagnostics");
+        for d in &self.diagnostics {
+            let mut named = d
+                .labels
+                .iter()
+                .filter(|l| !l.span.is_dummy())
+                .map(|l| l.span.source)
+                .collect::<BTreeSet<SourceId>>()
+                .into_iter();
+            let source = match (named.next(), named.next()) {
+                (Some(source), None) => source,
+                (None, _) => {
+                    return Err(format!(
+                        "diagnostic `{}` names no module, and the part no module declares is keyed \
+                         by the import graph alone",
+                        d.code
+                    ));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(format!("diagnostic `{}` labels two modules", d.code));
+                }
+            };
+            let i = by_source.get(&source).copied().ok_or_else(|| {
+                format!(
+                    "diagnostic `{}` labels source {}, which no module is",
+                    d.code, source.0
+                )
+            })?;
+            laid.next(i)?;
+            parts[i].diagnostics.push(d.clone());
         }
 
         for (module, sets) in &self.effect_sets {
@@ -365,6 +400,7 @@ impl Front {
             .collect::<Result<Vec<usize>, String>>()?;
 
         let mut out = Front {
+            diagnostics: program.diagnostics,
             order: program.order,
             check: CheckOutput {
                 effects: program.check.effects,
@@ -398,6 +434,7 @@ impl Front {
                 return Err(format!("`{name}` is hashed in two parts"));
             }
             let (tests, laws) = (out.check.tests.len(), out.check.laws.len());
+            out.diagnostics.extend(part.diagnostics);
             out.check.modules.extend(part.check.modules);
             out.effect_sets.extend(part.effect_sets);
             out.types.extend(part.types);
