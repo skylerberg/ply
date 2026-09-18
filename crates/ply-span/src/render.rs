@@ -33,7 +33,7 @@ pub fn to_json(diag: &Diagnostic, sources: &SourceMap) -> JsonDiagnostic {
         .labels
         .iter()
         .filter_map(|l| {
-            let file = sources.get(l.span.source)?;
+            let file = sources.containing(l.span)?;
             let (sl, sc) = file.line_col(l.span.start);
             let (el, ec) = file.line_col(l.span.end);
             Some(JsonLabel {
@@ -64,7 +64,8 @@ pub fn to_json(diag: &Diagnostic, sources: &SourceMap) -> JsonDiagnostic {
     }
 }
 
-/// All-dummy spans still print a header, so a builtin's error is never silently dropped.
+/// All-dummy spans, or spans outside their text, still print a header, so a builtin's error is
+/// never silently dropped.
 pub fn to_terminal(diag: &Diagnostic, sources: &SourceMap) -> String {
     let kind = match diag.severity {
         Severity::Error => ReportKind::Error,
@@ -72,11 +73,11 @@ pub fn to_terminal(diag: &Diagnostic, sources: &SourceMap) -> String {
         Severity::Note => ReportKind::Advice,
     };
 
-    let Some(anchor) = diag
+    let Some((anchor, anchor_file)) = diag
         .labels
         .iter()
-        .map(|l| l.span)
-        .find(|s| !s.is_dummy() && sources.get(s.source).is_some())
+        .filter(|l| !l.span.is_dummy())
+        .find_map(|l| Some((l.span, sources.containing(l.span)?)))
     else {
         let notes = diag
             .notes
@@ -89,19 +90,14 @@ pub fn to_terminal(diag: &Diagnostic, sources: &SourceMap) -> String {
         );
     };
 
-    let anchor_path = sources
-        .get(anchor.source)
-        .unwrap()
-        .path
-        .display()
-        .to_string();
+    let anchor_path = anchor_file.path.display().to_string();
     let mut report = Report::build(kind, (anchor_path.clone(), anchor.range()))
         .with_code(diag.code)
         .with_message(&diag.message)
         .with_config(Config::default().with_index_type(ariadne::IndexType::Byte));
 
     for l in &diag.labels {
-        let Some(file) = sources.get(l.span.source) else {
+        let Some(file) = sources.containing(l.span) else {
             continue;
         };
         let path = file.path.display().to_string();
@@ -169,6 +165,26 @@ mod tests {
         assert_eq!(v["labels"][0]["start"]["col"], 14);
         assert_eq!(v["labels"][0]["snippet"], "true");
         assert_eq!(v["labels"][0]["primary"], true);
+    }
+
+    #[test]
+    fn a_span_outside_its_text_renders_without_its_label() {
+        let mut sm = SourceMap::new();
+        let id = sm.add("t.ply", "fn f() = \"é\"\n");
+        for span in [
+            Span::new(id, 21, 26),
+            Span::new(id, 10, 12),
+            Span::new(id, 5, 2),
+        ] {
+            assert_eq!(sm.snippet(span), "");
+            let d = Diagnostic::error(codes::RUNTIME_ERROR, "boom").primary(span, "here");
+            let v = serde_json::to_value(to_json(&d, &sm)).unwrap();
+            assert_eq!(v["labels"].as_array().map(Vec::len), Some(0), "{v}");
+            let out = to_terminal(&d, &sm);
+            assert!(out.contains("E0502") && out.contains("boom"), "{out}");
+            let file = sm.get(id).unwrap();
+            let _ = (file.line_col(span.start), file.line_col(span.end));
+        }
     }
 
     #[test]

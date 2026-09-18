@@ -5,9 +5,11 @@
 //! the smaller half and it already has a cache of its own; the larger half is the inliner, and the
 //! only artefact that holds its work is the C it produced.
 //!
-//! So this caches the C, one body at a time, keyed on what the body is a function of. Per body
-//! rather than per unit because that is what makes an edit cost the edit: one definition moving
-//! re-emits one definition, not a project.
+//! So this caches the C, one body at a time, keyed on what the body is a function of: its
+//! definition's hash and the texts its sites are byte offsets into (`Source::with_texts`). Per
+//! body rather than per unit so that commands offering different roots over the same texts share
+//! every body they have in common. An edit to any text re-emits every body, because a site can
+//! move under a definition whose hash did not.
 //!
 //! A body's text names the unit's tables by its own positions -- `@@c3@@`, resolved when the body
 //! goes into a unit -- so what is kept here is a function of the body alone and can be read back
