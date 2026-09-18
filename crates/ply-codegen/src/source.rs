@@ -38,8 +38,9 @@ pub struct Source {
     definitions: HashMap<String, (&'static FnDef, usize)>,
     tables: Tables,
     /// What each definition's emitted code is a function of, when the caller knows: its hash over
-    /// its own text and everything it references. Empty when nobody supplied any, and then nothing
-    /// is kept between runs.
+    /// its own text and everything it references, and, once texts are attached, the texts its
+    /// spans are offsets into. Empty when nobody supplied any, and then nothing is kept between
+    /// runs.
     pub keys: HashMap<String, String>,
     /// Each module's source text, by module name, when the caller has it: what a second emitter
     /// is handed, since it reads the program from its text. Empty otherwise.
@@ -175,6 +176,21 @@ pub fn emit_keys(front: &Front) -> HashMap<String, String> {
         }
     }
     keys
+}
+
+fn layout_digest<'a>(
+    modules: impl Iterator<Item = &'a Symbol>,
+    texts: &HashMap<String, String>,
+) -> String {
+    let mut h = blake3::Hasher::new();
+    for module in modules {
+        let text = texts.get(module.as_str()).map_or("", String::as_str);
+        for part in [module.as_str(), text] {
+            h.update(&(part.len() as u64).to_le_bytes());
+            h.update(part.as_bytes());
+        }
+    }
+    h.finalize().to_hex()[..32].to_string()
 }
 
 /// A program-wide name in `module`, as `ModuleName::qualify` spells it.
@@ -876,6 +892,12 @@ fn synthesized(program: &'static Program) -> HashMap<String, (&'static FnDef, us
 impl Source {
     /// The same source, with each module's text.
     pub fn with_texts(mut self, texts: HashMap<String, String>) -> Source {
+        // A body's C bakes in byte offsets and module indices, which no definition hash covers.
+        let layout = layout_digest(self.module_names(), &texts);
+        for key in self.keys.values_mut() {
+            key.push('@');
+            key.push_str(&layout);
+        }
         self.texts = texts;
         self
     }
