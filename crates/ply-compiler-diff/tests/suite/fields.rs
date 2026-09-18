@@ -1,14 +1,9 @@
 //! The one thing the differential structurally cannot see.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
 
 fn read(rel: &str) -> String {
-    let p: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("<root>/crates/ply-compiler-diff")
-        .join(rel);
+    let p = ply_compiler_diff::repo_root().join(rel);
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
 }
 

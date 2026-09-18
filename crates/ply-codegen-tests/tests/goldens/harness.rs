@@ -1,11 +1,20 @@
 //! What holds the port without the reference: the goldens, and the door into the port.
-//!
-//! These moved out of `ply-compiler-diff` with the five suites that use them (ADR 0052 §2).
-//! That crate still holds the parser and lexer differentials, which read the Rust chain and
-//! retire with `ply-syntax`; nothing here does. `golden::dir()` resolves against this crate's
-//! own manifest directory, so the goldens sit beside the suites that read them.
 
 #![allow(dead_code)]
+
+use std::path::{Path, PathBuf};
+
+pub fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("this crate sits at <root>/crates/ply-codegen-tests")
+        .to_path_buf()
+}
+
+pub fn fixtures() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+}
 
 /// One dump beside every input, as files under `fixtures/goldens/<phase>/`: the specification the
 /// port is held to, in the tree, so that it survives the Rust reference's retirement
@@ -22,7 +31,7 @@ pub mod golden {
     use std::sync::Mutex;
 
     pub fn dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/goldens")
+        super::fixtures().join("goldens")
     }
 
     pub fn blessing() -> bool {
@@ -218,6 +227,76 @@ pub fn programs(text: &str) -> Vec<Vec<(String, String)>> {
     out
 }
 
+/// A whole-program dump cut to its last module's records; a failed program's is kept whole.
+pub mod own {
+    pub fn resolved(dump: &str) -> String {
+        let t: Vec<&str> = dump.split_terminator(';').collect();
+        let last = match t.get(1).and_then(|n| n.parse::<usize>().ok()) {
+            Some(n) if n > 0 && t[0] == "R" && t.get(2) == Some(&"M") => (n - 1).to_string(),
+            _ => return dump.to_string(),
+        };
+        let mut out = t[..2].to_vec();
+        let mut i = 2;
+        while t.get(i) == Some(&"M") {
+            let mut j = i + 3;
+            while let Some(width) = t.get(j).and_then(|tag| match *tag {
+                "B" | "S" => Some(4),
+                "V" | "T" | "E" => Some(5),
+                _ => None,
+            }) {
+                j += width;
+            }
+            if t.get(i + 1) == Some(&last.as_str()) {
+                out.extend_from_slice(&t[i..j.min(t.len())]);
+            }
+            i = j;
+        }
+        let i = i.min(t.len());
+        let trees = (i..t.len()).find(|&k| t[k] == "P").unwrap_or(t.len());
+        let own = (trees..t.len())
+            .rev()
+            .find(|&k| t[k] == "P")
+            .unwrap_or(t.len());
+        out.extend_from_slice(&t[i..trees]);
+        out.extend_from_slice(&t[own..]);
+        out.join(";") + ";"
+    }
+
+    /// A test's name can hold a `;`, so a record starts only where a tag is followed by a key.
+    pub fn keyed(
+        dump: &str,
+        program: &[(String, String)],
+        tags: &[&str],
+        hashed: &[&str],
+    ) -> String {
+        let t: Vec<&str> = dump.split_terminator(';').collect();
+        let Some((module, _)) = program.last() else {
+            return dump.to_string();
+        };
+        if !t.get(2).is_some_and(|tag| tags.contains(tag)) {
+            return dump.to_string();
+        }
+        let under = |key: &str, m: &str| key.strip_prefix(m).is_some_and(|k| k.starts_with('.'));
+        let mut keep = true;
+        let mut out = String::new();
+        for (i, &token) in t.iter().enumerate() {
+            let next = t.get(i + 1).copied().unwrap_or("");
+            if i >= 2 && tags.contains(&token) {
+                if hashed.contains(&token) {
+                    keep |= next.len() == 64 && next.bytes().all(|b| b.is_ascii_hexdigit());
+                } else if program.iter().any(|(m, _)| under(next, m.as_str())) {
+                    keep = under(next, module.as_str());
+                }
+            }
+            if keep {
+                out.push_str(token);
+                out.push(';');
+            }
+        }
+        out
+    }
+}
+
 /// The dump as a list of records, for a diff that names the first disagreement instead of printing
 /// two multi-megabyte strings.
 pub fn records(dump: &str) -> Vec<&str> {
@@ -260,11 +339,7 @@ pub mod census {
     pub const FILE: &str = "benches/compiled-compiler.json";
 
     fn path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("the crate lives two levels below the repository root")
-            .join(FILE)
+        super::repo_root().join(FILE)
     }
 
     /// Holds the thread's census since the last reset to the file's entry for `key`, within one

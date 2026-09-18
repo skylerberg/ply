@@ -5,22 +5,8 @@
 //! The port is entered in-process through `port`: the bundle the binary carries is the compiler
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
 
-use crate::harness::part;
-use crate::harness::{golden, port, programs, records};
+use crate::harness::{bundle, fixtures, golden, own, part, port, programs, records, repo_root};
 use std::path::{Path, PathBuf};
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("this crate sits at <root>/crates/ply-compiler-diff")
-        .to_path_buf()
-}
-
-/// This crate's own directory, which is where the mined corpora live.
-fn here() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
 
 fn first_difference(reference: &str, actual: &str) -> Option<String> {
     let want = records(reference);
@@ -47,11 +33,15 @@ fn first_difference(reference: &str, actual: &str) -> Option<String> {
     None
 }
 
-fn compare(label: &str, inputs: &[(String, Vec<(String, String)>)]) {
+fn compare(
+    label: &str,
+    inputs: &[(String, Vec<(String, String)>)],
+    view: fn(String, &[(String, String)]) -> String,
+) {
     let mut failures: Vec<String> = Vec::new();
     let mut records_total = 0usize;
     for (name, program) in inputs {
-        let actual = port::dump_program("hash.hash_dump", program);
+        let actual = view(port::dump_program("hash.hash_dump", program), program);
         records_total += records(&actual).len();
         if let Err(report) = golden::check("hash", name, &actual, first_difference) {
             failures.push(format!("{label}: {report}"));
@@ -99,6 +89,7 @@ fn the_ply_hasher_matches_its_golden_on_the_standard_library() {
     compare(
         "std",
         &[("the standard library".to_string(), std_modules())],
+        |d, _| d,
     );
 }
 
@@ -115,7 +106,14 @@ fn the_ply_hasher_matches_its_golden_on_every_example_with_the_standard_library(
             (format!("std + examples/{name}.ply"), program)
         })
         .collect();
-    compare("examples", &part(&inputs, index, of));
+    compare("examples", &part(&inputs, index, of), |d, p| {
+        own::keyed(
+            &d,
+            p,
+            &["H", "Y", "T", "L", "W", "O", "S", "X", "D", "C"],
+            &["T", "L", "W"],
+        )
+    });
 }
 
 #[test]
@@ -140,26 +138,26 @@ fn the_ply_hasher_matches_its_golden_on_every_example_with_the_standard_library_
 fn the_ply_hasher_matches_its_golden_on_the_bundles() {
     let mut inputs: Vec<(String, Vec<(String, String)>)> = Vec::new();
     for (file, label) in [
-        ("fixtures/resolve-programs.corpus", "resolve-programs"),
-        ("fixtures/check-programs.corpus", "check-programs"),
-        ("fixtures/reference-programs.corpus", "reference-programs"),
+        ("resolve-programs.corpus", "resolve-programs"),
+        ("check-programs.corpus", "check-programs"),
+        ("reference-programs.corpus", "reference-programs"),
     ] {
-        let text = std::fs::read_to_string(here().join(file)).expect("a bundle");
+        let text = std::fs::read_to_string(fixtures().join(file)).expect("a bundle");
         for (i, p) in programs(&text).into_iter().enumerate() {
             inputs.push((format!("{label}.corpus#{i}"), p));
         }
     }
     for (file, label, module) in [
-        ("fixtures/reference-checks.corpus", "reference-checks", "m"),
-        ("fixtures/reference-hashes.corpus", "reference-hashes", "m"),
+        ("reference-checks.corpus", "reference-checks", "m"),
+        ("reference-hashes.corpus", "reference-hashes", "m"),
     ] {
-        let Ok(text) = std::fs::read_to_string(here().join(file)) else {
+        let Ok(text) = std::fs::read_to_string(fixtures().join(file)) else {
             continue;
         };
-        for (i, f) in crate::harness::bundle(&text).into_iter().enumerate() {
+        for (i, f) in bundle(&text).into_iter().enumerate() {
             inputs.push((format!("{label}.corpus#{i}"), vec![(module.to_string(), f)]));
         }
     }
     assert!(!inputs.is_empty());
-    compare("bundles", &inputs);
+    compare("bundles", &inputs, |d, _| d);
 }

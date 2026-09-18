@@ -5,21 +5,8 @@
 //! The port is entered in-process through `port`: the bundle the binary carries is the compiler
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
 
-use crate::harness::{golden, port};
+use crate::harness::{bundle, fixtures, golden, port, repo_root};
 use std::path::{Path, PathBuf};
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("this crate sits at <root>/crates/ply-compiler-diff")
-        .to_path_buf()
-}
-
-/// This crate's own directory, which is where the mined corpora live.
-fn here() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
 
 fn first_difference(reference: &str, actual: &str) -> Option<String> {
     if reference == actual {
@@ -89,9 +76,9 @@ fn ply_files(dir: &Path, prefix: &str) -> Vec<(String, String)> {
 
 #[test]
 fn the_ply_deriver_matches_its_golden_on_the_hand_written_modules() {
-    let text = std::fs::read_to_string(here().join("fixtures/derive-programs.corpus"))
+    let text = std::fs::read_to_string(fixtures().join("derive-programs.corpus"))
         .expect("the hand-written derive modules");
-    let inputs: Vec<(String, Vec<(String, String)>)> = crate::harness::bundle(&text)
+    let inputs: Vec<(String, Vec<(String, String)>)> = bundle(&text)
         .into_iter()
         .enumerate()
         .map(|(i, f)| {

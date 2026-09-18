@@ -19,15 +19,8 @@
 //! The census is taken from the port's own lowering (`code.lower_dump`), which `code.ply` writes
 //! byte for byte as the reference's did. Counting the surface text instead would answer a
 //! different question: `with cell` reaches a `cell(` node its spelling does not contain.
+use ply_compiler_diff::{fixtures, repo_root};
 use std::collections::BTreeMap;
-
-fn repo_root() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .unwrap()
-        .to_path_buf()
-}
 
 #[test]
 fn the_corpus_still_exercises_every_effect_construct_a_tier_would_have_to_carry() {
@@ -36,7 +29,7 @@ fn the_corpus_still_exercises_every_effect_construct_a_tier_would_have_to_carry(
     for dir in [
         repo_root().join("crates/ply-std/ply"),
         repo_root().join("examples"),
-        repo_root().join("crates/ply-compiler-diff/fixtures"),
+        fixtures(),
     ] {
         let mut files: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
