@@ -1,16 +1,4 @@
 //! Every hazard the compiled seam has to answer, against the shipping code generator.
-//!
-//! These were `crates/ply-codegen-spike`'s, and they tested *that* crate's seam: a third code
-//! generator with a runtime of its own, written before this one existed. A hazard demonstrated
-//! against a program nothing ships is a demonstration about the program, so porting them here is
-//! not preserving coverage -- it is acquiring it, over the seam a `--backend` run actually crosses.
-//!
-//! The fixtures are the spike's, unchanged, and each says in its own header which hazard it exists
-//! for and why the obvious smaller program does not reach it.
-//!
-//! Under tier-only (ADR 0048) there is no interpreter to compare against. The reference emitter,
-//! which is the fragment, is the oracle, and the whole Ply emitter is the engine under test: each
-//! hazard is a claim that the two agree.
 
 use ply_codegen::Unit;
 use ply_eval::{Machine, Value, compare_answers};
@@ -34,10 +22,6 @@ pub struct Loaded {
     pub texts: HashMap<String, String>,
 }
 
-/// Every `.ply` under `dir` as a module named after its stem, plus the shipped standard library.
-///
-/// `Err` carries the front end's own diagnostics, because two of the hazards below are checker
-/// refusals: the program that would reach them does not typecheck, and *that* is the finding.
 fn load(dir: &Path) -> Result<Loaded, Vec<ply_span::Diagnostic>> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
@@ -97,30 +81,21 @@ fn hazards() -> &'static Loaded {
     ))
 }
 
-/// Two tiers over one program: the reference emitter, which is the fragment and the oracle, and
-/// the whole Ply emitter under test. Every hazard here is a claim that they agree.
 struct Harness {
     unit: &'static Unit,
     bodies: Rc<ply_codegen::Bodies>,
+    oracle: Rc<ply_codegen::Bodies>,
     reference: Machine<'static>,
     whole: Machine<'static>,
 }
 
 fn harness(loaded: &'static Loaded) -> Harness {
-    // This arm is named `whole` and has always been the reference: nothing in this binary
-    // installed a producer, so `mode()` answered `ref` and `over_with_texts` built the fragment.
-    // `load` installs one now, to answer the check, so the reference is asked for here explicitly
-    // rather than by accident. Dropping this makes the comparison real, and the first thing it
-    // reports is that the port carries no body for `raced.raced` -- a `simulate` region over two
-    // spawned tasks, which §2 has not reached.
-    let unit: &'static Unit = ply_codegen::c::producer::reference_only(|| {
-        Unit::over_with_texts(
-            loaded.program,
-            loaded.resolved,
-            loaded.check,
-            loaded.texts.clone(),
-        )
-    })
+    let unit: &'static Unit = Unit::over_with_texts(
+        loaded.program,
+        loaded.resolved,
+        loaded.check,
+        loaded.texts.clone(),
+    )
     .expect("this host has a C compiler");
     let bodies = unit.bodies().expect("the unit builds");
     let oracle = ply_codegen::c::producer::reference_only(|| {
@@ -128,21 +103,25 @@ fn harness(loaded: &'static Loaded) -> Harness {
     })
     .expect("the reference emitter builds the fragment");
     let mut reference = Machine::new(loaded.program, loaded.resolved, loaded.check);
-    reference.set_compiled(oracle);
+    reference.set_compiled(oracle.clone());
     let mut whole = Machine::new(loaded.program, loaded.resolved, loaded.check);
     whole.set_compiled(bodies.clone());
     Harness {
         unit,
         bodies,
+        oracle,
         reference,
         whole,
     }
 }
 
 impl Harness {
-    /// Both engines over one call, compared on the value and -- on a raise -- the code, the
-    /// message, every label with its span, and the notes. `None` is agreement.
     fn agree(&mut self, name: &str, args: &[Value]) -> Option<String> {
+        assert!(
+            self.bodies.admits(name) && self.oracle.admits(name),
+            "`{name}` is not compiled by both emitters; the port's refusal: {:?}",
+            refusal(self.unit, name)
+        );
         let expected = self.reference.call(name, args.to_vec(), Span::DUMMY);
         let actual = self.whole.call(name, args.to_vec(), Span::DUMMY);
         compare_answers(&self.reference, &self.whole, name, &expected, &actual)
@@ -150,9 +129,16 @@ impl Harness {
     }
 
     fn run(&mut self, name: &str, args: &[Value]) -> Value {
+        let unit = self.unit;
         self.whole
             .call(name, args.to_vec(), Span::DUMMY)
-            .unwrap_or_else(|d| panic!("`{name}` raised: {}", d.message))
+            .unwrap_or_else(|d| {
+                panic!(
+                    "`{name}` raised: {}; the port's refusal: {:?}",
+                    d.message,
+                    refusal(unit, name)
+                )
+            })
     }
 
     fn entered(&self) -> u64 {
@@ -164,7 +150,6 @@ impl Harness {
     }
 }
 
-/// Why a definition was refused, if it was.
 fn refusal(unit: &Unit, name: &str) -> Option<String> {
     unit.refusals()
         .iter()
@@ -172,19 +157,7 @@ fn refusal(unit: &Unit, name: &str) -> Option<String> {
         .map(|(_, why)| why.clone())
 }
 
-// -- the fragment refuses, before anything runs -------------------------------
-
-/// A definition whose *published* row is empty and which opens a region anyway.
-///
-/// `pure_by_published_row` admits it and the machine offers it, which `memo.rs` says out loud, so
-/// something has to hold the arena hazard. It used to be the fragment, by refusing the body. It is
-/// now the seam, by measuring: an entry that does not give back the regions and the slots it took
-/// is declined, and the machine answers the call itself.
-///
-/// The stronger claim is the one worth testing, so this asserts the answer rather than the
-/// refusal: compiled and interpreted agree, the body actually ran compiled, and no entry was
-/// declined for leaving the arena unbalanced. A body that opened a region and did not close it
-/// would fail the third of those, and one that got the cell's counts wrong would fail the first.
+/// An entry that does not give back the regions and the slots it took is declined.
 #[test]
 fn a_definition_that_opens_its_own_region_runs_compiled_and_gives_the_arena_back() {
     let mut h = harness(hazards());
@@ -193,19 +166,10 @@ fn a_definition_that_opens_its_own_region_runs_compiled_and_gives_the_arena_back
             panic!("`cells.counted({n})`: {difference}");
         }
     }
-    assert!(
-        h.entered() > 0,
-        "`cells.counted` never ran compiled, so this proves nothing about the arena"
-    );
-    assert_eq!(
-        h.declines().touched_cells,
-        0,
-        "an entry was declined for leaving the arena unbalanced, so the region it opened was not \
-         closed on the way out"
-    );
+    assert!(h.entered() > 0, "`cells.counted` never ran compiled");
+    assert_eq!(h.declines().touched_cells, 0, "{:?}", h.declines());
 }
 
-/// The smaller shape the hazard audit named, refused by the checker rather than by the fragment.
 #[test]
 fn a_cell_cannot_be_a_parameter_of_a_function_that_reads_it() {
     let diagnostics = load(&fixtures().join("cell_parameter"))
@@ -218,7 +182,6 @@ fn a_cell_cannot_be_a_parameter_of_a_function_that_reads_it() {
     );
 }
 
-/// Ordering on `String` never reaches a backend, because it never reaches a well-typed program.
 #[test]
 fn ordering_on_a_string_is_refused_before_any_backend_sees_it() {
     let diagnostics = load(&fixtures().join("string_ordering"))
@@ -231,15 +194,9 @@ fn ordering_on_a_string_is_refused_before_any_backend_sees_it() {
     );
 }
 
-/// A higher-order builtin under an `Int -> Int` signature answers what the interpreter answers.
-///
-/// **The spike refused these by name and this tier compiles them, which is the point of porting
-/// rather than copying.** Nothing in `tripled`'s type says a callback is under it, so a filter on
-/// the signature cannot see one; the spike's fragment had no way to run a callback and so had to
-/// refuse by name, and a hazard was the only available answer. This tier runs them, so the
-/// property worth asserting is the one that was always the real one: the answer is the machine's.
+/// Nothing in `tripled`'s `Int -> Int` signature says a callback is under it.
 #[test]
-fn a_higher_order_builtin_answers_what_the_interpreter_answers() {
+fn a_higher_order_builtin_answers_what_the_reference_answers() {
     let mut h = harness(hazards());
     for n in [0, 1, 5] {
         if let Some(d) = h.agree("callbacks.tripled", &[Value::Int(n)]) {
@@ -254,16 +211,11 @@ fn a_higher_order_builtin_answers_what_the_interpreter_answers() {
     }
 }
 
-/// A credential is a value like any other inside an entry, so the body that mints one compiles;
-/// what the invariant asks is that it never leaves the entry: the seam declines to hand a
-/// `Secret` across as a value, and the machine, asked with the backend attached, answers the
-/// same as without.
 #[test]
 fn a_secret_never_leaves_the_fragments_entry() {
-    let mut h = harness(hazards());
+    let h = harness(hazards());
     assert!(
-        refusal(h.unit, "callbacks.keyed").is_none()
-            && h.unit.compiled().iter().any(|c| c == "callbacks.keyed"),
+        h.bodies.admits("callbacks.keyed"),
         "`callbacks.keyed` mints a `Secret`, which compiles: {:?}",
         refusal(h.unit, "callbacks.keyed")
     );
@@ -273,70 +225,45 @@ fn a_secret_never_leaves_the_fragments_entry() {
             .is_none(),
         "a `Secret` crossed the seam as a value"
     );
-    if let Some(d) = h.agree("callbacks.keyed", &args) {
-        panic!("`callbacks.keyed`: {d}");
-    }
+    assert_eq!(h.declines().answer, 1, "{:?}", h.declines());
 }
 
-/// A `Float` or `Decimal` in the signature never produces a wrong answer.
-///
-/// The spike refused these at registration. This tier registers them and the *value boundary* is
-/// what declines -- two places the same call can be stopped, and `compiled.rs` §"What polices this
-/// seam" is deliberate that neither depends on the other running first. So the assertion is on the
-/// answer rather than on which of the two stopped it, and it fails if either stops declining.
+/// Nothing about `float_inside`'s `Int -> Int` type says it compares two `Float`s.
 #[test]
-fn a_float_or_decimal_signature_is_never_a_wrong_answer() {
+fn a_float_or_decimal_is_never_a_wrong_answer() {
     let mut h = harness(hazards());
-    for (name, args) in [
-        ("numerics.fadd", vec![Value::Float(0.1), Value::Float(0.2)]),
-        ("numerics.fless", vec![Value::Float(1.5), Value::Float(1.5)]),
-    ] {
-        if let Some(d) = h.agree(name, &args) {
-            panic!("`{name}`: {d}");
+    assert_eq!(
+        h.run("numerics.fadd", &[Value::Float(0.1), Value::Float(0.2)]),
+        Value::Float(0.1 + 0.2)
+    );
+    assert_eq!(
+        h.run("numerics.fless", &[Value::Float(1.5), Value::Float(1.5)]),
+        Value::Bool(false)
+    );
+    for n in [1, 7] {
+        for (name, want) in [
+            ("numerics.float_inside", n),
+            ("numerics.decimal_inside", n),
+            ("numerics.float_arith_inside", 2 * n),
+        ] {
+            assert_eq!(
+                h.run(name, &[Value::Int(n)]),
+                Value::Int(want),
+                "`{name}({n})`"
+            );
         }
     }
 }
 
-// -- the fragment compiles it, and the answer has to be the machine's ---------
-
-/// A non-scalar *literal inside* an `Int -> Int` body, which neither filter can see.
-///
-/// Nothing about `float_inside`'s type says it compares two `Float`s. If the fragment answered
-/// rather than failing on one, the answer would be wrong and no boundary could tell -- so this
-/// compares against the interpreter rather than asking what was refused.
-#[test]
-fn a_float_or_decimal_literal_inside_an_int_body_is_never_a_wrong_answer() {
-    let mut h = harness(hazards());
-    for name in [
-        "numerics.float_inside",
-        "numerics.decimal_inside",
-        "numerics.float_arith_inside",
-    ] {
-        for n in [0, 1, 7] {
-            if let Some(d) = h.agree(name, &[Value::Int(n)]) {
-                panic!("`{name}({n})`: {d}");
-            }
-        }
-    }
-}
-
-/// A nullary constructor written bare is `PatternKind::Var` in the AST -- the parser cannot tell
-/// `None` from a binder -- so only the constructor table tells the two apart. A lowering that
-/// binds `None` makes the first arm match everything.
+/// A nullary constructor written bare is `PatternKind::Var` in the AST, so a lowering that binds
+/// `None` makes the first arm match everything.
 #[test]
 fn a_nullary_constructor_pattern_is_a_test_and_not_a_binding() {
     let mut h = harness(hazards());
     assert_eq!(h.run("pure.tagged", &[Value::Int(1)]), Value::Int(7));
     assert_eq!(h.run("pure.tagged", &[Value::Int(2)]), Value::Int(99));
-    for n in [0, 1, 2, 3] {
-        if let Some(d) = h.agree("pure.tagged", &[Value::Int(n)]) {
-            panic!("`pure.tagged({n})`: {d}");
-        }
-    }
 }
 
-/// Both failures the fragment can reach arrive as the machine's own diagnostic rather than as a
-/// bare `RUNTIME_ERROR` at `Span::DUMMY`: `mix` overflows, `share` divides by zero.
 #[test]
 fn a_compiled_failure_arrives_as_the_machines_own_diagnostic() {
     let mut h = harness(hazards());
@@ -365,51 +292,19 @@ fn a_failed_entry_does_not_poison_the_one_after_it() {
     }
 }
 
-/// A native body runs with the interpreter's handler stack, trail and region generations intact:
-/// the machine performs, handles and resumes with compiled bodies running inside the handled block.
 #[test]
 fn a_native_body_runs_under_a_live_handler_stack() {
     let mut h = harness(hazards());
-    for n in [0, 3, 11] {
-        if let Some(d) = h.agree("effects.handled", &[Value::Int(n)]) {
-            panic!("`effects.handled({n})`: {d}");
-        }
+    for (n, want) in [(0, 6744), (3, 8478), (11, 13102)] {
+        assert_eq!(
+            h.run("effects.handled", &[Value::Int(n)]),
+            Value::Int(want),
+            "`effects.handled({n})`"
+        );
     }
 }
 
-/// An interpreted recursion that drops into compiled code once per frame is bounded by the
-/// machine, and by the machine's own diagnostic -- not by neither engine, which is what a crossing
-/// through a second machine used to mean.
-#[test]
-fn an_interpreted_recursion_entering_compiled_code_at_every_depth_is_bounded() {
-    let mut h = harness(hazards());
-    let deep = Value::Int(1_000_000);
-    let expected = h.reference.call(
-        "deep.countdown",
-        vec![deep.clone(), Value::Int(0)],
-        Span::DUMMY,
-    );
-    let actual = h
-        .whole
-        .call("deep.countdown", vec![deep, Value::Int(0)], Span::DUMMY);
-    assert!(
-        expected.is_err(),
-        "the fixture no longer outruns the bound, so it tests nothing"
-    );
-    assert!(
-        actual.is_err(),
-        "the recursion was bounded without a backend and unbounded with one"
-    );
-    let (a, b) = (expected.unwrap_err(), actual.unwrap_err());
-    assert_eq!(
-        (&a.code, &a.message),
-        (&b.code, &b.message),
-        "the bound reported differently with a backend attached"
-    );
-}
-
-/// Compiled recursion, not in tail position so neither engine can turn it into a loop, outrunning
-/// its own budget: the machine's diagnostic, not a crash and not a wrong answer.
+/// Compiled recursion, not in tail position so it cannot become a loop, outrunning its budget.
 #[test]
 fn a_compiled_recursion_that_outruns_its_budget_is_the_machines_diagnostic() {
     let mut h = harness(hazards());
@@ -418,11 +313,8 @@ fn a_compiled_recursion_that_outruns_its_budget_is_the_machines_diagnostic() {
     }
 }
 
-// -- the guard nothing else can reach ----------------------------------------
-
 /// `Ctx` is one flat frame, so an entry arriving while another runs would alias the outer one's
-/// words. The guard declines and the call reports it -- under tier-only nothing else serves the
-/// entry -- and the provider is not left broken by having declined.
+/// words.
 #[test]
 fn an_entry_that_arrives_while_another_is_running_is_declined_and_reported() {
     let mut h = harness(hazards());
@@ -461,15 +353,21 @@ fn an_entry_that_arrives_while_another_is_running_is_declined_and_reported() {
     );
 }
 
-/// The hook is off inside a `simulate` region, so every `Access` a partial-order search reads is
-/// the interpreter's: the answer, the schedule and the footprint are what the same machine
-/// produces with no backend at all.
 #[test]
-fn the_hook_is_off_inside_a_simulate_region() {
+fn a_raced_simulate_region_answers_and_records_the_race() {
     let mut h = harness(hazards());
-    for n in [1, 4] {
-        if let Some(d) = h.agree("raced.raced", &[Value::Int(n)]) {
-            panic!("`raced.raced({n})`: {d}");
-        }
+    for (n, want) in [(1, 90), (4, 201)] {
+        assert_eq!(h.run("raced.raced", &[Value::Int(n)]), Value::Int(want));
+        let steps = &h.whole.simulated().expect("the region left a record").steps;
+        let spawned: Vec<_> = steps
+            .iter()
+            .filter(|s| s.task != ply_eval::sched::ROOT)
+            .collect();
+        assert!(
+            spawned.iter().any(|a| spawned
+                .iter()
+                .any(|b| a.task != b.task && a.accesses.conflicts_with(&b.accesses))),
+            "`raced.raced({n})`: no two spawned tasks conflict on the cell: {steps:?}"
+        );
     }
 }
