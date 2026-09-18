@@ -119,21 +119,31 @@ impl SourceFile {
             .partition_point(|&s| s <= offset)
             .saturating_sub(1);
         let line_start = self.line_starts[line] as usize;
-        let col = self.text[line_start..(offset as usize).min(self.text.len())]
-            .chars()
+        let end = offset as usize;
+        let col = self
+            .text
+            .get(line_start..)
+            .unwrap_or("")
+            .char_indices()
+            .take_while(|&(i, _)| line_start + i < end)
             .count();
         (line as u32 + 1, col as u32 + 1)
     }
 
     pub fn line_text(&self, line: u32) -> &str {
         let idx = (line.saturating_sub(1)) as usize;
-        let start = self.line_starts.get(idx).copied().unwrap_or(0) as usize;
+        let Some(&start) = self.line_starts.get(idx) else {
+            return "";
+        };
         let end = self
             .line_starts
             .get(idx + 1)
             .map(|&e| e as usize)
             .unwrap_or(self.text.len());
-        self.text[start..end].trim_end_matches(['\n', '\r'])
+        self.text
+            .get(start as usize..end)
+            .unwrap_or("")
+            .trim_end_matches(['\n', '\r'])
     }
 }
 
@@ -175,8 +185,13 @@ impl SourceMap {
 
     pub fn snippet(&self, span: Span) -> &str {
         self.get(span.source)
-            .map(|f| &f.text[span.range()])
+            .and_then(|f| f.text.get(span.range()))
             .unwrap_or("")
+    }
+
+    pub fn containing(&self, span: Span) -> Option<&SourceFile> {
+        self.get(span.source)
+            .filter(|f| f.text.get(span.range()).is_some())
     }
 }
 
