@@ -81,7 +81,6 @@ pub enum Frame {
     },
 }
 
-/// The `handle` expression a [`Delimiter::Ply`] stands for.
 pub struct Prompt {
     pub span: Span,
 }
@@ -326,7 +325,6 @@ impl Stack {
             .map(|depth| depth + 1)
     }
 
-    /// The whole stack as one task's control.
     pub fn into_task(mut self, region: SimId, born: u64) -> Continuation {
         let (frames, calls) = (self.frames, self.calls);
         let mut taken = Vec::with_capacity(self.segments());

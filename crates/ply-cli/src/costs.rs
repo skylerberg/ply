@@ -1,5 +1,4 @@
-//! `ply check --costs` and the `reuse fn` promise: where an append copies, as the compiler's
-//! `costs.ply` reads it off the lowering the emitter compiles.
+//! `ply check --costs`: where an append copies, before the program runs.
 
 use crate::load::Loaded;
 use crate::style::Style;
@@ -32,7 +31,6 @@ struct Definition {
     kind: String,
     name: String,
     label: String,
-    /// The `reuse` marker.
     promise: Option<Span>,
     sites: Vec<Site>,
 }
@@ -179,7 +177,6 @@ fn report(loaded: &Loaded) -> Result<Report, Diagnostic> {
     read(dump, &sources).map_err(|e| failed(&e))
 }
 
-/// This compiler failing, rather than the program.
 fn failed(why: &str) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
@@ -192,8 +189,6 @@ fn failed(why: &str) -> Diagnostic {
     .note("this is Ply's fault: the compiler's own `costs.ply` is what failed here")
 }
 
-/// `rounds <n>\n`, then `def` frames each followed by its `site` frames; every text is
-/// length-prefixed in its header, so no byte of one is a delimiter.
 fn read(dump: &str, sources: &HashMap<String, SourceId>) -> Result<Report, String> {
     let (head, mut rest) = dump
         .split_once('\n')
@@ -266,7 +261,6 @@ fn read(dump: &str, sources: &HashMap<String, SourceId>) -> Result<Report, Strin
     Ok(Report { defs, rounds })
 }
 
-/// The first `n` bytes of `text`, and the rest.
 fn take<'a>(text: &'a str, n: &str) -> Result<(&'a str, &'a str), String> {
     let n: usize = n.parse().map_err(|_| format!("a length {n:?}"))?;
     match (text.get(..n), text.get(n..)) {

@@ -119,7 +119,6 @@ fn a_result_cache_write_failure_is_not_blamed_on_the_front_end() {
     );
 }
 
-/// A handler selects a clause by `(effect, operation, resource)`.
 #[test]
 fn three_operations_sharing_one_atom_are_three_reachable_clauses() {
     let dir = tempfile::tempdir().unwrap();
