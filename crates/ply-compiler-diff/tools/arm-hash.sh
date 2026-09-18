@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# The hash differential, armed: each mutation below is applied to a copy of
-# `hash.ply` and the fast half of `crates/ply-codegen-tests/tests/goldens/hash.rs` (the bundles and the
-# standard library) must go red.
+# Each mutation is applied to a copy of hash.ply, and the fast half of the hash goldens must go red.
 #
 #   ./crates/ply-compiler-diff/tools/arm-hash.sh
 set -uo pipefail

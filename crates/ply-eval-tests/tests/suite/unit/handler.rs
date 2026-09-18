@@ -1,5 +1,3 @@
-//! Effect handlers end to end, on the machine that runs them.
-
 use crate::unit::build;
 use crate::unit::build::{bin, block, callv, int, letv, list, var};
 use ply_eval::Value;
@@ -9,8 +7,7 @@ use ply_span::{Diagnostic, Span, codes};
 use ply_span::{SourceId, Symbol};
 use ply_syntax::ast::{BinOp, Expr, HandleClause, Item, Mode};
 
-// The programs are built as AST and lowered by the real lowering, so every variable occurrence
-// gets the slot the machine will read.
+// Lowered by the real lowering, so every variable gets the slot the machine will read.
 
 fn sp() -> Span {
     Span::new(SourceId(0), 0, 1)
@@ -49,11 +46,9 @@ fn cell_get(cell: Expr) -> Expr {
     callv("cell_get", vec![cell])
 }
 
-/// Every test below runs on the real machine.
 struct Outcome {
     result: Result<Value, Diagnostic>,
-    /// The run's cells, ascending by slot index — the order `Arena::slots` hands them out, so two
-    /// runs of one program compare byte for byte.
+    /// Ascending by slot index, so two runs of one program compare byte for byte.
     cells: Vec<Value>,
 }
 
@@ -102,7 +97,6 @@ impl Outcome {
     }
 }
 
-/// An expression in a program of its own, evaluated to whatever it answers.
 #[track_caller]
 fn standalone(items: Vec<Item>, e: &ply_syntax::ast::Expr) -> Result<Value, Diagnostic> {
     let (program, resolved) = build::standalone(items);

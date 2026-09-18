@@ -1,5 +1,5 @@
-//! The reference side of the parser spike's differential: `ply_syntax`'s tree, written out in the
-//! same flat dump grammar `crates/ply-compiler/ply/*.ply` emits.
+//! The reference side of the parser differential: `ply_syntax`'s tree in the flat dump grammar
+//! the Ply port emits.
 
 pub mod tokens;
 
@@ -8,13 +8,10 @@ use ply_syntax::ast::*;
 use ply_syntax::parse_unexpanded;
 use std::path::{Path, PathBuf};
 
-/// The whole answer for one file: the tree, then every diagnostic in the order the parser raised
-/// them.
+/// The tree, then every diagnostic in the order the parser raised them.
 pub fn reference_dump(text: &str) -> String {
     let (module, diags) = parse_unexpanded(SourceId(0), ModuleName::anonymous(), text);
-    // The one observable difference between the two entry points that is a *field* rather than a
-    // node: `effect_set::expand`'s `write_back` fills this in, so an empty one is evidence the pass
-    // did not run.
+    // A filled `expansion` means `effect_set::expand` ran, which this entry point must not do.
     for item in &module.items {
         if let Item::EffectSet(d) = item {
             assert!(
@@ -40,17 +37,13 @@ fn dump_of(text: &str, module: &Module, diags: &[Diagnostic]) -> String {
     d.out
 }
 
-/// The reference dump of `text` **after** the three rewrites — `parse_recovering`'s tree — for
-/// the third differential, against `rewrite.ply`.
+/// The dump of `parse_recovering`'s tree, after the three rewrites.
 pub fn reference_dump_expanded(text: &str) -> String {
     let (module, diags) = ply_syntax::parse_recovering(SourceId(0), ModuleName::anonymous(), text);
     dump_of(text, &module, &diags)
 }
 
-/// **The tree half of the same cost: how many nodes the three rewrites add.** Signed, because
-/// two rewrites remove nodes: `try_op` unwraps a `?` it refused (one node fewer, and a
-/// diagnostic the other half counts), and `record_update` drops the base of an update that
-/// writes every field, since nothing is left to copy from it.
+/// Nodes the three rewrites add; signed because `try_op` and `record_update` can remove nodes.
 pub fn nodes_the_rewrites_add(text: &str) -> isize {
     let (before, bd) = parse_unexpanded(SourceId(0), ModuleName::anonymous(), text);
     let (after, ad) = ply_syntax::parse_recovering(SourceId(0), ModuleName::anonymous(), text);
@@ -59,7 +52,7 @@ pub fn nodes_the_rewrites_add(text: &str) -> isize {
     a as isize - b as isize
 }
 
-/// **What the pre-expansion comparison gives up, as data rather than as prose.**
+/// Codes of the diagnostics the rewrites raise beyond the parser's own.
 pub fn diagnostics_the_rewrites_add(text: &str) -> Vec<String> {
     let (_, before) = parse_unexpanded(SourceId(0), ModuleName::anonymous(), text);
     let (_, after) = ply_syntax::parse_recovering(SourceId(0), ModuleName::anonymous(), text);
@@ -75,8 +68,7 @@ pub fn diagnostics_the_rewrites_add(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether this file would have had `effect_set::expand` run over it, had the comparison entered at
-/// `parse_recovering`.
+/// Whether `effect_set::expand` would change this file.
 pub fn uses_effect_sets(text: &str) -> bool {
     let (module, _) = parse_unexpanded(SourceId(0), ModuleName::anonymous(), text);
     let mut found = module.items.iter().any(|i| matches!(i, Item::EffectSet(_)));
@@ -103,8 +95,6 @@ struct Dumper<'a> {
 }
 
 impl<'a> Dumper<'a> {
-    // --- the encoder's five terminals ---------------------------------------
-
     fn rec(&mut self, span: Span, tag: &str) {
         self.out
             .push_str(&format!("{}:{}:{};", span.start, span.end, tag));
@@ -149,13 +139,9 @@ impl<'a> Dumper<'a> {
         }
     }
 
-    /// The bytes of the source under a node's own span, which is what the Ply side's `src_over`
-    /// answers.
     fn src_over(&self, span: Span) -> &'a str {
         &self.text[span.start as usize..span.end as usize]
     }
-
-    // --- leaves -------------------------------------------------------------
 
     fn ident(&mut self, i: &Ident) {
         self.rec(i.span, "ident");
@@ -201,18 +187,14 @@ impl<'a> Dumper<'a> {
         }
     }
 
-    /// `span` is the *literal node's* span, not the token's: a negative literal in a pattern is one
-    /// `PatternKind::Lit` covering the `-` as well, and `patterns.ply` dumps the source over that
-    /// wider span.
+    /// `span` is the literal node's, which covers a pattern literal's leading `-`.
     fn lit(&mut self, l: &Lit, span: Span) {
         match l {
             Lit::Int(v) => {
                 self.word("int");
                 self.payload(v.to_string().as_bytes());
             }
-            // `parser.ply` has no width suffix yet, so no corpus input carries one and the two
-            // never compare here; the arm exists so this dumper builds. GAPS.md carries the
-            // divergence.
+            // `parser.ply` has no width suffix yet, so this arm is never compared.
             Lit::Fixed { ty, bits } => {
                 self.word("fixed");
                 self.payload(format!("{ty}:{bits}").as_bytes());
@@ -242,8 +224,6 @@ impl<'a> Dumper<'a> {
             Lit::Unit => self.word("unit"),
         }
     }
-
-    // --- types --------------------------------------------------------------
 
     fn ty(&mut self, t: &TypeExpr) {
         match t {
@@ -278,8 +258,7 @@ impl<'a> Dumper<'a> {
         }
     }
 
-    /// Every atom the row **wrote**, which is every atom it holds: no set has been spliced into it,
-    /// because `effect_set::expand` did not run.
+    /// Only the atoms the row wrote: `effect_set::expand` has not spliced any set in.
     fn row(&mut self, r: &RowExpr) {
         self.rec(r.span, "row");
         self.list(&r.atoms, Self::atom);
@@ -294,24 +273,19 @@ impl<'a> Dumper<'a> {
         self.opt(a.resource.as_ref(), Self::ident);
     }
 
-    /// `Generics` carries no span in `ast.rs`, so this leads with a word rather than a record.
+    /// `Generics` has no span, so this leads with a word rather than a record.
     fn generics(&mut self, g: &Generics) {
         self.word("gen");
         self.list(&g.types, Self::ident);
         self.list(&g.effects, Self::ident);
     }
 
-    /// The fallback expression is dumped like any other `Option`, and that is a change: it arrived
-    /// with default arguments and nothing emitted it until `../GAPS.md` §11R.D moved this comparison to the
-    /// pre-rewrite tree.
     fn param(&mut self, p: &Param) {
         self.rec(p.span, "prm");
         self.ident(&p.name);
         self.opt(p.ty.as_ref(), Self::ty);
         self.opt(p.default.as_ref(), Self::expr);
     }
-
-    // --- patterns -----------------------------------------------------------
 
     fn pattern(&mut self, p: &Pattern) {
         match &p.kind {
@@ -345,8 +319,6 @@ impl<'a> Dumper<'a> {
         }
     }
 
-    // --- expressions --------------------------------------------------------
-
     fn expr(&mut self, e: &Expr) {
         match &e.kind {
             ExprKind::Lit(l) => {
@@ -374,8 +346,6 @@ impl<'a> Dumper<'a> {
                 self.opt(ret.as_ref(), Self::ty);
                 self.expr(body);
             }
-            // Every `name: value` argument, with its own span, its name and its value — and the
-            // list's length, so a call that dropped one could not be absorbed.
             ExprKind::App { func, args, named } => {
                 self.rec(e.span, "eapp");
                 self.expr(func);
@@ -497,8 +467,7 @@ impl<'a> Dumper<'a> {
         }
     }
 
-    /// A named argument carries **its own span** as well as its name and its value: `E0123` and
-    /// `E0124` both point at exactly that span, and nothing else in the dump would pin it.
+    /// Records the argument's own span: `E0123` and `E0124` point at it.
     fn named_arg(&mut self, n: &NamedArg) {
         self.rec(n.span, "narg");
         self.ident(&n.name);
@@ -527,8 +496,6 @@ impl<'a> Dumper<'a> {
         self.ident(&r.binder);
         self.expr(&r.body);
     }
-
-    // --- items --------------------------------------------------------------
 
     fn import(&mut self, d: &ImportDecl) {
         self.rec(d.span, "imp");
@@ -560,8 +527,7 @@ impl<'a> Dumper<'a> {
     }
 
     fn fn_def(&mut self, d: &FnDef) {
-        // `FnDef::derived` is written `None` at `parser.rs:723` and nothing in the parser can
-        // produce anything else, so `items.ply` does not carry it.
+        // The parser never fills `derived`, so the dump grammar does not carry it.
         assert!(
             d.derived.is_none(),
             "the parser filled in `FnDef::derived`, which the Ply port does not carry; \
@@ -651,8 +617,7 @@ impl<'a> Dumper<'a> {
         self.ident(&d.target);
     }
 
-    /// The `expansion` list is `effect_set::expand`'s own output, written back into the tree by
-    /// `write_back`, so entering at `parse_unexpanded` makes it always empty.
+    /// `expansion` is always empty here: it is `effect_set::expand`'s output.
     fn effect_set(&mut self, d: &EffectSetDef) {
         self.rec(d.span, "set");
         self.ident(&d.name);
@@ -672,8 +637,6 @@ impl<'a> Dumper<'a> {
             Item::EffectSet(d) => self.effect_set(d),
         }
     }
-
-    // --- diagnostics --------------------------------------------------------
 
     fn diags(&mut self, ds: &[Diagnostic]) {
         self.nlist(ds.len());
@@ -697,8 +660,6 @@ impl<'a> Dumper<'a> {
             }
         }
     }
-
-    // --- the row walk, for `uses_effect_sets` --------------------------------
 
     fn rows_of_module(&mut self, m: &Module, f: &mut impl FnMut(&RowExpr)) {
         for i in &m.items {
@@ -803,14 +764,12 @@ fn un_op_name(op: UnOp) -> &'static str {
     }
 }
 
-/// The dump as a list of records, for a diff that names the first disagreement instead of printing
-/// two multi-megabyte strings.
+/// The dump split into records, so a diff can name the first disagreement.
 pub fn records(dump: &str) -> Vec<&str> {
     dump.split_terminator(';').collect()
 }
 
-/// How many `S:E:TAG;` records the dump holds — the node count, which is what a corpus figure has
-/// to state alongside the byte count.
+/// How many `S:E:TAG;` records, i.e. nodes, the dump holds.
 pub fn node_count(dump: &str) -> usize {
     records(dump)
         .iter()
@@ -818,9 +777,7 @@ pub fn node_count(dump: &str) -> usize {
         .count()
 }
 
-/// Every distinct node tag the dump reached, sorted — the tag-coverage statistic, so "agrees on the
-/// corpus" can be read next to "and the corpus reaches these 30 of the 44 tags this grammar can
-/// emit".
+/// Every distinct node tag the dump reached, sorted.
 pub fn tags(dump: &str) -> Vec<String> {
     let mut v: Vec<String> = records(dump)
         .iter()
@@ -930,8 +887,7 @@ mod tests {
 
     #[test]
     fn a_bundle_gives_back_exactly_the_fixtures_that_were_written() {
-        // The three cases the separator rule exists for: no trailing newline, one trailing newline,
-        // and empty.
+        // No trailing newline, one trailing newline, and empty.
         let text = "header\nlines\n%%\nfn f() = 1\n%%\nfn g() = 2\n\n%%\n\n";
         assert_eq!(bundle(text), vec!["fn f() = 1", "fn g() = 2\n", ""]);
     }
@@ -940,9 +896,7 @@ mod tests {
 pub mod port {
     use ply_eval::Value;
 
-    /// Enters `name` -- `module.function`, as the sources spell it -- and answers the string it
-    /// returned. A raise, a missing entry or a non-string answer is the harness's own failure and
-    /// panics with the reason.
+    /// Calls `module.function` `name` and returns its string; panics on anything else.
     pub fn call(name: &str, args: &[Value]) -> String {
         ply_codegen::c::producer::ensure_default();
         match ply_codegen::c::producer::call(name, args) {
@@ -986,10 +940,8 @@ pub mod golden {
         std::env::var_os("PLY_DIFF_BLESS").is_some()
     }
 
-    /// Where `phase`'s golden for `name` lives, and which record of it: a bundle's records,
-    /// named `<bundle>#<i>`, share one file, `<phase>/<bundle>.dumps`, one record per `%%% <i>`
-    /// line; every other input has `<phase>/<name>.dump` to itself. Characters a file name cannot
-    /// carry portably are written as `_`.
+    /// The golden's file and record: `<bundle>#<i>` is record `%%% <i>` of
+    /// `<phase>/<bundle>.dumps`, anything else is `<phase>/<name>.dump`.
     pub fn place(phase: &str, name: &str) -> (PathBuf, Option<usize>) {
         let safe = |s: &str| -> String {
             s.chars()
@@ -1012,8 +964,7 @@ pub mod golden {
         }
     }
 
-    /// Holds `port` to the golden, or rewrites the golden from it when blessing. `diff` is the
-    /// phase's own first-difference report, `diff(want, got)`.
+    /// Compares `port` to the golden via `diff(want, got)`, or rewrites the golden when blessing.
     pub fn check(
         phase: &str,
         name: &str,
@@ -1065,8 +1016,7 @@ pub mod golden {
         })
     }
 
-    /// The first record a bless writes to a bundle's file in this process starts it afresh, and
-    /// the rest append, so a bless is the run's own order and nothing older survives in it.
+    /// A bless truncates a bundle's file on its first write in this process and appends after.
     fn write(path: &Path, index: Option<usize>, text: &str) {
         static STARTED: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
         if let Some(parent) = path.parent() {

@@ -30,7 +30,6 @@ law "masking commutes" forall (x: Int, y: Int) { x & y == y & x }
 law "a complement is an involution" forall (x: Int) { ~(~x) == x }
 "#;
 
-/// The wrong `proved`s: the laws that would pass if an operator folded into the arithmetic.
 #[test]
 fn no_bit_operator_folds_into_the_arithmetic() {
     let f = fixture(BITS);
@@ -44,7 +43,6 @@ fn no_bit_operator_folds_into_the_arithmetic() {
     }
 }
 
-/// Seven operators, seven symbols.
 #[test]
 fn the_bit_operators_are_seven_functions_and_not_one() {
     let f = fixture(BITS);
@@ -53,7 +51,6 @@ fn the_bit_operators_are_seven_functions_and_not_one() {
     not_proved(&f, "the right shifts agree");
 }
 
-/// Uninterpreted is not unknown: congruence still decides that a function equals itself.
 #[test]
 fn a_bit_operator_is_a_function_of_its_operands() {
     let f = fixture(BITS);
@@ -62,9 +59,6 @@ fn a_bit_operator_is_a_function_of_its_operands() {
     proof(&f, "a masked value is a value");
 }
 
-/// A shift count outside `0..=63` raises (the shift semantics), so a shift is a value only where its
-/// count is a bit position — and the fragment decides that condition, so the guarded restatement is
-/// back in reach.
 #[test]
 fn a_shift_is_a_value_only_where_its_count_is_a_bit_position() {
     let f = fixture(BITS);
@@ -76,8 +70,6 @@ fn a_shift_is_a_value_only_where_its_count_is_a_bit_position() {
     not_proved(&f, "a shift by a negative is a function");
 }
 
-/// True of every `Int` and still `property`, which is the cost side of the decision and belongs in
-/// the record beside the benefit.
 #[test]
 fn a_true_law_about_the_bit_pattern_is_property_and_not_proved() {
     let f = fixture(BITS);

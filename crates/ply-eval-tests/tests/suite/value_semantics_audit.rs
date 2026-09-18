@@ -1,7 +1,4 @@
-//! An adversarial audit of what a `Value` *means* after the argument-vector pool and the constant-value memo.
-
-// A `Value::Record` holds `Arc<BTreeMap<Symbol, Value>>` and a `Value` is not `Send`; the same
-// allow `secrets.rs` carries, for the same reason.
+// `Value`'s `Arc` payloads are deliberately not `Send`.
 #![allow(clippy::arc_with_non_send_sync)]
 
 use crate::fixture::Compiled;
@@ -24,10 +21,6 @@ impl Compiled {
         self.machine().call(name, args, Span::DUMMY)
     }
 }
-
-// --- 1. the argument vector under multi-shot resumption ---------------------
-
-// --- 2. a credential in an argument vector ----------------------------------
 
 const SECRET_ARGUMENTS: &str = r#"
 fn keep1(s: Secret<String>) -> Bool = secret_is_empty(s)
@@ -54,7 +47,6 @@ pub fn deep(s: Secret<String>) -> Int = descend(2000, s)
 pub fn after4(a: Int, b: Int, c: Int, d: Int) -> Int = a * 1000 + b * 100 + c * 10 + d
 "#;
 
-/// The secret containment claim as a bound on the free list, measured through the machine.
 #[test]
 fn a_credential_passed_as_an_argument_is_unreachable_once_the_call_returns() {
     let compiled = Compiled::new(SECRET_ARGUMENTS);
@@ -74,7 +66,6 @@ fn a_credential_passed_as_an_argument_is_unreachable_once_the_call_returns() {
     }
 }
 
-/// The same, past the free list's bound and back.
 #[test]
 fn a_recursion_deeper_than_the_free_lists_bound_leaves_no_credential_behind() {
     let compiled = Compiled::new(SECRET_ARGUMENTS);
@@ -91,7 +82,6 @@ fn a_recursion_deeper_than_the_free_lists_bound_leaves_no_credential_behind() {
     );
 }
 
-/// A buffer that carried a credential is handed to the next call of that arity.
 #[test]
 fn a_call_made_after_one_that_carried_a_credential_sees_only_its_own_arguments() {
     let compiled = Compiled::new(SECRET_ARGUMENTS);
@@ -115,11 +105,7 @@ fn a_call_made_after_one_that_carried_a_credential_sees_only_its_own_arguments()
     }
 }
 
-// --- 3. rendering paths other than `Value::write` ---------------------------
-
-/// `first_difference` is a second structural walk over a value and it builds text that is
-/// **stored** — `builtins::assert_failure` puts it in the note of a failing assertion and
-/// `ply-store` caches that as `Outcome::Fail { message }`.
+/// `first_difference` builds text that `ply-store` caches in a failing outcome.
 #[test]
 fn the_assertion_differ_never_descends_into_a_credential() {
     let hidden = "hunter2";
@@ -182,8 +168,6 @@ fn the_assertion_differ_never_descends_into_a_credential() {
     }
 }
 
-// --- 5. equal values that do not render alike -------------------------------
-
 /// Every value shape this evaluator can hold, in pairs, for the scan below.
 fn probe_values() -> Vec<(&'static str, Value)> {
     let dec = |m: i128, s: u32| {
@@ -235,8 +219,6 @@ fn probe_values() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// The language's `==` and the `Map`'s order, checked against each other over every pair of the
-/// probe corpus.
 #[test]
 fn the_order_and_the_language_equality_part_at_a_nan_and_also_at_negative_zero() {
     let mut disagreements = Vec::new();
@@ -265,7 +247,6 @@ fn the_order_and_the_language_equality_part_at_a_nan_and_also_at_negative_zero()
     );
 }
 
-/// **The defect this test pinned is fixed; it now asserts the fix.**
 #[test]
 fn two_decimals_that_are_one_map_key_render_two_strings_and_build_one_map() {
     let short = Value::Decimal(Decimal::try_from_i128_with_scale(15, 1).expect("1.5"));
@@ -305,8 +286,6 @@ fn two_decimals_that_are_one_map_key_render_two_strings_and_build_one_map() {
     );
 }
 
-/// The same claim where a program meets it: `map_insert` with a key equal to one already present
-/// replaces the value, and the key a program reads back is the canonical spelling either way.
 #[test]
 fn map_insert_over_an_equal_decimal_key_reads_back_one_canonical_spelling() {
     let compiled = Compiled::new(
@@ -343,15 +322,6 @@ test "the two maps are equal" {
     );
 }
 
-// --- 6. a shared constant inside a seeded simulation ------------------------
-
-// --- 7. one memo, many programs ---------------------------------------------
-
-// --- 8. the width the refusal to narrow `Value` rejected narrowing at -------------------------
-
-/// The refusal to narrow `Value` names, among the things that would make it wrong, *"if a build
-/// agent has to widen `Value` past 32 bytes to land any of this"* as one of five conditions that
-/// would sink the document.
 #[test]
 fn a_value_is_still_thirty_two_bytes_wide_and_an_optional_one_costs_nothing() {
     assert_eq!(
@@ -368,8 +338,6 @@ fn a_value_is_still_thirty_two_bytes_wide_and_an_optional_one_costs_nothing() {
     );
 }
 
-/// The blast radius the defect had, now the blast radius the fix has to cover: it was never only
-/// `Map<Decimal, _>`.
 #[test]
 fn a_record_key_holding_a_decimal_is_canonical_in_the_compound_key_too() {
     let compiled = Compiled::new(
@@ -412,8 +380,6 @@ test "one line, either way" {
     );
 }
 
-/// A credential under a key the canonical form rebuilds is **not** descended into and **not**
-/// rebuilt.
 #[test]
 fn canonicalizing_a_key_clones_a_credential_rather_than_rebuilding_it() {
     let payload = Arc::new(Value::str("hunter2"));

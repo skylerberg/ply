@@ -22,8 +22,6 @@ fn enter(spans: &mut Spans, owner: Owner, at: &str, what: &str) -> i64 {
     spans.enter(owner, channel(at), name(what), None).id
 }
 
-/// The shape every request has: one span inside another, closed innermost first, with the inner
-/// one's `parent` naming the outer.
 #[test]
 fn a_span_opened_inside_another_names_it_as_its_parent() {
     let mut spans = Spans::new();
@@ -48,7 +46,6 @@ fn a_span_opened_inside_another_names_it_as_its_parent() {
     assert_eq!(spans.abandoned(), 0);
 }
 
-/// The rollback case, and the reason `exit` closes more than one span.
 #[test]
 fn closing_an_outer_span_abandons_every_span_above_it_innermost_first() {
     let mut spans = Spans::new();
@@ -77,7 +74,6 @@ fn closing_an_outer_span_abandons_every_span_above_it_innermost_first() {
     assert_eq!(spans.depth(owner), 0);
 }
 
-/// The defect this whole key exists to prevent.
 #[test]
 fn two_tasks_of_one_machine_keep_separate_stacks() {
     let mut spans = Spans::new();
@@ -104,7 +100,6 @@ fn two_tasks_of_one_machine_keep_separate_stacks() {
     assert_eq!(spans.abandoned(), 0);
 }
 
-/// A span opened in one task must not close in another, and the refusal names both.
 #[test]
 fn a_span_opened_by_one_task_cannot_be_closed_by_another() {
     let mut spans = Spans::new();
@@ -156,7 +151,6 @@ fn the_three_ways_an_exit_names_a_span_that_is_not_open_are_told_apart() {
     assert_eq!(spans.depth(owner), 1, "a refusal closes nothing");
 }
 
-/// The fourth exit, the one no clause can catch: the entry point ended.
 #[test]
 fn teardown_closes_this_machines_spans_and_leaves_every_other_machines_alone() {
     let mut spans = Spans::new();
@@ -179,8 +173,7 @@ fn teardown_closes_this_machines_spans_and_leaves_every_other_machines_alone() {
     assert!(warning.message.contains('2'), "{}", warning.message);
 }
 
-/// Innermost first inside one task, so the warning names the span the computation was actually
-/// inside when it stopped.
+/// Innermost first, so the warning names the span the computation was actually inside.
 #[test]
 fn teardown_reports_the_innermost_span_first() {
     let mut spans = Spans::new();
@@ -197,8 +190,7 @@ fn teardown_reports_the_innermost_span_first() {
     );
 }
 
-/// Ids are the correlation key a log is read by, so a reused one is two requests' records that
-/// cannot be told apart.
+/// Ids correlate a log's records, so a reused one merges two requests.
 #[test]
 fn ids_ascend_from_one_and_are_never_reused() {
     let mut spans = Spans::new();

@@ -1,6 +1,3 @@
-//! The hybrid engine on real programs: assembling a mixed definition graph from stored bodies,
-//! checking it, and running the failing test against it.
-
 use ply_eval::Provider;
 use ply_hash::HashOutput;
 use ply_hash::body::BodySet;
@@ -26,7 +23,6 @@ struct Compiled {
     check: CheckOutput,
     hashes: HashOutput,
     bodies: BodySet,
-    /// The module source text, keyed by name — what the whole Ply emitter re-parses into bodies.
     texts: std::collections::HashMap<String, String>,
 }
 
@@ -88,8 +84,7 @@ impl Compiled {
         Baseline::with_decls(self.hashes.tests[index], closure, decls)
     }
 
-    /// What the failing test actually reports now, which is the signature every hybrid is judged
-    /// against.
+    /// The signature every hybrid is judged against.
     fn failure(&self, key: &str) -> ply_span::Diagnostic {
         let index = self.test_index(key);
         let mut machine = ply_eval::Machine::new(&self.program, &self.resolved, &self.check);
@@ -130,8 +125,7 @@ impl Drop for TempRoot {
     }
 }
 
-/// The store a passing run would have left behind: every body it normalized, every published
-/// interface, and the pass record naming the closure.
+/// The store a passing run leaves: normalized bodies, published interfaces, and the pass record.
 fn passed(before: &Compiled, key: &str) -> (TempRoot, Store) {
     let root = TempRoot::new("store");
     let mut store = Store::open(&root.0).expect("open store");
@@ -229,8 +223,6 @@ fn two_independent_edits_are_narrowed_to_the_one_that_broke_it() {
     assert!(out.search.evaluated > 0, "{:?}", out.search);
 }
 
-/// A body is hash-linked, so the whole question is whether flipping a *leaf* actually reaches the
-/// caller that was kept at its baseline.
 #[test]
 fn flipping_a_leaf_reaches_the_callers_kept_at_their_baseline() {
     let before = Compiled::new(LEDGER);
@@ -255,8 +247,6 @@ fn all(n: Int) -> Int = a(n) + b(n) + c(n) + d(n) + e(n)
 test "sums" { assert_eq(all(0), 15) }
 "#;
 
-/// The failure artifact's required test 2: five edits, one culprit, named exactly and inside `2·log2(5)`
-/// evaluations.
 #[test]
 fn one_culprit_among_five_edits_is_named_within_the_logarithmic_budget() {
     let before = Compiled::new(FIVE);
@@ -284,9 +274,6 @@ fn total(n: Int) -> Int = countdown(guard(n))
 test "terminates" { assert_eq(total(3), 0) }
 "#;
 
-/// A runaway recursion is a *regression* like any other: something used to terminate and now does
-/// not, and the definition that stopped it terminating is exactly what a hybrid can find by running
-/// one.
 #[test]
 fn a_regression_that_introduces_runaway_recursion_is_bisected_to_its_culprit() {
     let before = Compiled::new(RECURSION);
@@ -382,9 +369,7 @@ fn a_bisection_records_no_definition_as_seen() {
     }
 }
 
-/// A hybrid that goes green may be cached under its own test hash, but `H(all)` *is* the current
-/// program: caching that one would record a `Pass` for the test this run just watched fail, and a
-/// red test has to re-run until it is green.
+/// `H(all)` *is* the current program, so caching its green replay would pass a red test.
 #[test]
 fn a_replay_that_goes_green_never_caches_a_pass_for_the_failing_test() {
     let src = r#"
@@ -440,8 +425,6 @@ test "doubles" { assert_eq(scale(2) + other(0), 5) }
     );
 }
 
-/// A store with no bodies is a different thing to report than a build that cannot mix eras: one is
-/// fixed by not pruning, the other cannot be fixed from outside.
 #[test]
 fn a_pruned_body_store_is_reported_rather_than_guessed_around() {
     let before = Compiled::new(LEDGER);
@@ -462,8 +445,6 @@ fn a_pruned_body_store_is_reported_rather_than_guessed_around() {
     );
 }
 
-/// Two runs over one failure must render the same bytes, and a bisection that evaluates programs is
-/// the part most likely to drift: the trial order has to be a function of the delta alone.
 #[test]
 fn two_bisections_of_one_failure_agree() {
     let before = Compiled::new(FIVE);

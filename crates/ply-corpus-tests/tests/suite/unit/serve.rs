@@ -6,8 +6,7 @@ fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The example's code with its `//` comments removed, so that a claim about which builtins a
-/// variant *calls* is not answered by prose describing them.
+/// Comments stripped, so which builtins a variant calls is not answered by prose.
 fn code_only(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     for line in source.lines() {
@@ -33,8 +32,6 @@ fn code_only(source: &str) -> String {
     out
 }
 
-/// The harness rewrites the example, and a rewrite that silently matched nothing would measure
-/// a server on the example's own port.
 #[test]
 fn the_w1_reconstruction_replaces_every_scan_and_nothing_else() {
     let endpoint = Endpoint::open(&repo()).unwrap();
@@ -76,9 +73,7 @@ fn the_w1_reconstruction_replaces_every_scan_and_nothing_else() {
 #[test]
 fn both_shapes_are_produced_from_the_example_and_typecheck() {
     let endpoint = Endpoint::open(&repo()).expect("the example is where it was");
-    // Both parsers, because the load table serves the reconstruction too: W2's claim about
-    // requests per second needs a before taken the same way as its after, not a before quoted
-    // from a milestone ago.
+    // Both parsers: the load table serves the reconstruction too.
     for parser in Parser::all() {
         for source in [
             endpoint.sequential(parser, 19000, 3).unwrap(),
@@ -92,9 +87,6 @@ fn both_shapes_are_produced_from_the_example_and_typecheck() {
     }
 }
 
-/// The concurrent variant must differ from the sequential one in `serve` and in the three rows
-/// above it, and nowhere else: if it changed `serve_one` or the parser, the two would not be
-/// measuring one endpoint.
 #[test]
 fn the_concurrent_variant_changes_only_the_accept_loop() {
     let endpoint = Endpoint::open(&repo()).unwrap();
@@ -111,8 +103,6 @@ fn the_concurrent_variant_changes_only_the_accept_loop() {
     }
 }
 
-/// Nearest-rank, and the tail is the number this milestone reports, so an off-by-one here is an
-/// off-by-one in the answer.
 #[test]
 fn percentiles_are_nearest_rank_over_the_sample() {
     let sample = Sample {
@@ -132,8 +122,6 @@ fn percentiles_are_nearest_rank_over_the_sample() {
     assert_eq!(Sample::default().percentile(0.5), Duration::ZERO);
 }
 
-/// A server that answered some of the requests is not a slower server, it is a different
-/// measurement, so the shortfall has to stop the run.
 #[test]
 fn a_short_sample_is_an_error_rather_than_a_smaller_denominator() {
     let sample = Sample {
@@ -146,8 +134,6 @@ fn a_short_sample_is_an_error_rather_than_a_smaller_denominator() {
     assert!(sample.require(3).is_ok());
 }
 
-/// The floor is the denominator every interpreter number is read against, so it has to actually
-/// serve.
 #[test]
 fn the_rust_floor_answers_every_request() {
     assert!(rust_floor(8).unwrap() > Duration::ZERO);

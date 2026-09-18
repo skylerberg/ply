@@ -1,5 +1,4 @@
-//! The dumper at the bottom exists so a test asserts the *whole* shape of a parse rather than
-//! poking at one field; a wrong nesting anywhere shows up as a string diff.
+//! Tests assert the whole dumped shape of a parse, so any wrong nesting shows as a string diff.
 
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 use ply_syntax::ast::*;
@@ -203,9 +202,6 @@ fn unary_binds_tighter_than_arithmetic_and_nests() {
     assert_eq!(expr("!f(x)"), "(not (call f x))");
 }
 
-/// operator precedence opened four levels between the comparisons and `++`. The
-/// numbers in `bin_op` all moved; what these assert is the thing that made that
-/// safe, which is the *order* — and the order of the bit operators is Rust's.
 #[test]
 fn the_bit_operators_sit_between_comparison_and_concatenation() {
     assert_eq!(expr("a | b ^ c"), "(| a (^ b c))");
@@ -222,31 +218,22 @@ fn the_bit_operators_sit_between_comparison_and_concatenation() {
     assert_eq!(expr("a >> b >> c"), "(>> (>> a b) c)");
 }
 
-/// A lambda's parameters end in a `|` and a parameter may carry a default, so the default's
-/// expression must not read that closing pipe as bit-or and swallow the body.
-///
-/// The parser spike's differential is what caught this: making `|` infix changed the recovery on
-/// `fixtures/35-err-named-arguments-and-updates.ply` from ten items to seven.
 #[test]
 fn a_lambda_parameter_default_does_not_swallow_the_closing_pipe() {
-    // A default is refused (`E0120`) and parsed anyway, so the closing `|` is what the parser
-    // meets next. Reading it as bit-or consumed the body and the errors multiplied.
+    // A default is refused (`E0120`) but parsed anyway, so the parser meets the closing `|` next.
     let d = errs("fn t() = (|x = 1| x)(2)");
     assert_eq!(
         d.iter().map(|d| d.code.to_string()).collect::<Vec<_>>(),
         vec!["E0120".to_string()],
         "the closing pipe was read as an operator: {d:#?}"
     );
-    // And a `|` in the body is still bit-or, because the flag ends with the parameter list.
+    // A `|` in the body is still bit-or: the flag ends with the parameter list.
     assert_eq!(
         expr("(|a: Int| a | 1)(2)"),
         "(call (lam ((a Int)) (| a 1)) 2)"
     );
 }
 
-/// `>>` is not a token: it is two `Gt` the *expression* parser reads as
-/// adjacent. So the join has to be exactly as tight as the spans are, and
-/// `a > > b` — the same two tokens, written apart — stays the error it was.
 #[test]
 fn a_shift_is_adjacent_angle_brackets_and_a_space_still_separates_them() {
     assert_eq!(expr("a >> b"), "(>> a b)");
@@ -259,8 +246,6 @@ fn a_shift_is_adjacent_angle_brackets_and_a_space_still_separates_them() {
     }
 }
 
-/// The reason `>>` is not lexed. A type's arguments close on `>` tokens that
-/// have to stay separate, and the join lives in a parser the types never enter.
 #[test]
 fn joining_angle_brackets_leaves_nested_type_arguments_alone() {
     assert_eq!(
@@ -275,8 +260,7 @@ fn joining_angle_brackets_leaves_nested_type_arguments_alone() {
         dump("fn f(x: List<List<List<Int>>>) -> Int = 1"),
         "(fn f ((x List<List<List<Int>>>)) -> Int 1)"
     );
-    // The `>>=` that `expect_gt` splits, behind a second `>`: still three
-    // separate closings and an `=`, and never a shift.
+    // The `>>=` `expect_gt` splits, behind a second `>`: three closings and an `=`, never a shift.
     assert_eq!(
         dump("fn f() -> Map<Int, List<Int>>= 1"),
         "(fn f () -> Map<Int, List<Int>> 1)"
@@ -292,10 +276,6 @@ fn bitwise_not_is_a_prefix_operator_like_the_other_two() {
     assert_eq!(expr("~(a | b)"), "(bnot (| a b))");
 }
 
-/// An infix `|` is read only where an operator can appear, and none of the
-/// other three `|` — a lambda's parameters, a sum type's variants, a row's tail
-/// — can reach that position. `||` still munches first, so a nullary lambda is
-/// untouched.
 #[test]
 fn an_infix_pipe_disturbs_none_of_the_other_pipes() {
     assert_eq!(expr("|x| x | 1"), "(lam ((x _)) (| x 1))");
@@ -478,7 +458,6 @@ fn a_clause_may_bind_its_continuation() {
     );
 }
 
-/// `resume` is a keyword only between a clause's `)` and its `->`.
 #[test]
 fn resume_is_contextual_and_stays_an_ordinary_identifier_elsewhere() {
     assert!(ply_syntax::lexer::is_ident("resume"));
@@ -546,8 +525,6 @@ fn regions_nest() {
     );
 }
 
-/// Contextual exactly as `with_cell` is, so a program that already binds `with_region` as an
-/// ordinary name is unaffected.
 #[test]
 fn with_region_is_only_special_before_a_bracket() {
     assert_eq!(expr("with_region"), "with_region");
@@ -555,8 +532,6 @@ fn with_region_is_only_special_before_a_bracket() {
     assert_eq!(expr("with_region + 1"), "(+ with_region 1)");
 }
 
-/// The body is a block, and `{` after `]` opens it even where a bare `{` would have opened the
-/// enclosing construct's.
 #[test]
 fn a_region_body_is_a_block_in_no_brace_position() {
     assert_eq!(
@@ -580,8 +555,7 @@ fn simulate_is_only_special_before_a_brace() {
     assert_eq!(expr("simulate.now()"), "(perform simulate.now)");
 }
 
-/// Where a `{` opens the enclosing construct rather than an expression, `simulate` is an ordinary
-/// name — otherwise a variable of that name would silently swallow the `if`'s branch.
+/// Otherwise a variable named `simulate` would silently swallow the `if`'s branch.
 #[test]
 fn simulate_is_a_name_again_where_a_brace_cannot_start_an_expression() {
     assert_eq!(
@@ -1092,8 +1066,6 @@ fn derive_is_contextual_and_a_function_may_still_be_named_derive() {
     assert_eq!(dump("fn derive(x) = x"), "(fn derive ((x _)) x)");
 }
 
-/// A comma inside parentheses makes a tuple, which is the record `{_0: a, _1: b}` in every
-/// position; without one the parentheses group, and `()` stays `Unit`.
 #[test]
 fn a_tuple_is_a_positional_record_in_types_expressions_and_patterns() {
     let d = dump("fn f(p: (Int, Bool)) -> Int = match p { (x, true) -> x, (_, false) -> 0 }");
@@ -1140,8 +1112,7 @@ fn a_try_inside_a_lambda_reads_the_lambda_s_written_return_type() {
                    }";
     let d = errs(without);
     assert_eq!(d[0].code, codes::TRY_SCOPE, "{d:#?}");
-    // The mode is read off the written head, as it is for a `fn`; the type checker is what
-    // refuses the `Result` operand under an `Option` lambda.
+    // The mode is read off the written head; the type checker is what refuses the `Result` operand.
     let option = dump("fn f() = |x: Result<Int, String>| -> Option<Int> { Some(x? + 1) }");
     assert!(option.contains("None"), "{option}");
 }
@@ -1328,8 +1299,7 @@ fn dump_item_body(i: &Item) -> String {
             format!("{s} {})", dump_expr(&l.body))
         }
         Item::Derive(d) => format!("(derive {} {})", d.deriver, d.target.name),
-        // The expansion, not the members as written: the expansion is what every row naming this
-        // set was given, and the members are a way of spelling it.
+        // The expansion, not the members as written: it is what every naming row was given.
         Item::EffectSet(d) => format!("(effect-set {} {})", d.name.name, dump_atoms(&d.expansion)),
     }
 }
@@ -1536,8 +1506,7 @@ fn dump_expr(e: &Expr) -> String {
                 .collect();
             format!("(rec {})", fs.join(" "))
         }
-        // Only reachable from `dump_expr` on a tree taken before `record_update::expand` ran, which
-        // the parser's own tests do on purpose to check what was parsed rather than what it became.
+        // Only reachable on a tree taken before `record_update::expand`, as these tests do.
         ExprKind::RecordUpdate { base, fields } => {
             let fs: Vec<_> = fields
                 .iter()
@@ -1546,8 +1515,6 @@ fn dump_expr(e: &Expr) -> String {
             format!("(update {} {})", dump_expr(base), fs.join(" "))
         }
         ExprKind::Field { base, field } => format!("(field {} {})", dump_expr(base), field.name),
-        // Only reachable on a tree taken before `try_op::expand` ran, which the parser's own tests
-        // do on purpose.
         ExprKind::Try { operand } => format!("(try {})", dump_expr(operand)),
         ExprKind::List { items } => {
             let is: Vec<_> = items.iter().map(dump_expr).collect();
@@ -1657,8 +1624,6 @@ fn dump_pat(p: &Pattern) -> String {
     }
 }
 
-// --- Modules ----------------------------------------------------------------
-
 #[test]
 fn a_module_name_is_its_path_with_separators_turned_into_dots() {
     let name = ModuleName::from_relative_path(Path::new("store/orders.ply")).unwrap();
@@ -1700,8 +1665,7 @@ fn the_anonymous_module_leaves_names_bare() {
 
 #[test]
 fn a_qualified_name_never_collides_with_one_a_module_could_declare() {
-    // `.` cannot be lexed inside an identifier, so no source-writable name can equal a qualified
-    // one.
+    // `.` cannot be lexed inside an identifier, so no source-writable name equals a qualified one.
     let qualified = ModuleName::from_dotted("store.orders").qualify(&Symbol::new("place"));
     assert!(!ply_syntax::lexer::is_ident(qualified.as_str()));
 }
@@ -2344,8 +2308,6 @@ fn a_row_written_with_a_set_carries_the_sets_atoms() {
     );
 }
 
-/// The alias survives beside the atoms it stood for: erased by normalization, so it moves no hash,
-/// and kept so `--explain` can say how the row was written.
 #[test]
 fn a_row_keeps_the_set_names_it_was_written_with() {
     let m = ok("effect set Web = {log.write}\nfn f() -> Int / {Web, clock.read} = 1");
@@ -2372,8 +2334,6 @@ fn a_set_may_name_another_set() {
     );
 }
 
-/// Declaration order is not dependency order, and expansion is a fixed point rather than a fold
-/// over the file.
 #[test]
 fn a_set_may_name_one_declared_after_it() {
     assert_eq!(
@@ -2431,8 +2391,6 @@ fn a_set_expands_inside_a_let_annotation() {
     assert!(dumped.contains("(fn () -> Int / {log.write})"), "{dumped}");
 }
 
-/// `effect set` is only a set when a name follows `set`; `effect set { .. }` is still an ordinary
-/// effect that happens to be called `set`.
 #[test]
 fn an_effect_may_still_be_named_set() {
     assert_eq!(
@@ -2441,7 +2399,6 @@ fn an_effect_may_still_be_named_set() {
     );
 }
 
-/// A whole row that is a bare name is a row variable, as it always was.
 #[test]
 fn a_bare_row_is_still_a_row_variable() {
     assert_eq!(
@@ -2477,8 +2434,6 @@ fn a_pub_effect_set_is_refused() {
     assert!(ds[0].message.contains("cannot be `pub`"), "{ds:#?}");
 }
 
-/// A member is an atom or another set, never a whole effect: "every atom of `db`" is every resource
-/// label anywhere in the program.
 #[test]
 fn a_set_naming_a_whole_effect_is_refused_with_the_reason() {
     let ds = errs(
@@ -2545,8 +2500,6 @@ fn two_sets_with_one_name_are_a_duplicate_definition() {
     assert!(ds[0].message.contains("effect set `Web`"), "{ds:#?}");
 }
 
-/// A set name lives in no namespace `resolve` knows about — expansion has erased it before
-/// `resolve` runs — so it collides with nothing.
 #[test]
 fn a_set_name_may_be_reused_by_a_type() {
     let m = ok("type Web = Int\neffect set Web = {log.write}\nfn f() -> Int / {Web} = 1");
@@ -2599,9 +2552,6 @@ fn collect_ply(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-// --- The `?` operator --------------------------------------------------------
-
-/// Whether an unexpanded [`ExprKind::Try`] is anywhere in the tree.
 fn has_try(m: &Module) -> bool {
     fn e(x: &Expr) -> bool {
         match &x.kind {
@@ -2655,7 +2605,6 @@ fn has_try(m: &Module) -> bool {
     })
 }
 
-/// The body of the only `fn` in a module that parsed clean, dumped.
 fn body_of(src: &str) -> String {
     let m = ok(src);
     let Some(Item::Fn(f)) = m.items.iter().rev().find(|i| matches!(i, Item::Fn(_))) else {
@@ -2668,8 +2617,7 @@ fn codes_of(src: &str) -> Vec<&'static str> {
     errs(src).iter().map(|d| d.code).collect()
 }
 
-/// A `fn` returning `Result` whose body is `f(x)?`, and a mode-establishing preamble every fixture
-/// below shares.
+/// A mode-establishing preamble every fixture below shares.
 const PRE: &str = "type E = {msg: String}\nfn g(n: Int) -> Result<Int, E> = Ok(n)\n";
 
 #[test]
@@ -2680,7 +2628,6 @@ fn try_expands_to_a_match_with_the_failure_arm_first() {
     );
 }
 
-/// `None` carries no payload, so its arm is a bare constructor on both sides.
 #[test]
 fn an_option_returning_function_gets_the_option_constructors() {
     assert_eq!(
@@ -2689,9 +2636,6 @@ fn an_option_returning_function_gets_the_option_constructors() {
     );
 }
 
-/// The shape every conversion in the corpus takes: the `let`'s own pattern becomes the success
-/// arm's binder and the `let` itself is gone, so the sugar and the hand-written `match` are one
-/// definition.
 #[test]
 fn a_let_bound_try_puts_its_own_pattern_on_the_success_arm() {
     assert_eq!(
@@ -2703,7 +2647,6 @@ fn a_let_bound_try_puts_its_own_pattern_on_the_success_arm() {
     );
 }
 
-/// The parser spike's §3 "pair" shape, spelled without a tuple.
 #[test]
 fn a_try_composes_with_record_destructuring() {
     assert_eq!(
@@ -2717,8 +2660,6 @@ fn a_try_composes_with_record_destructuring() {
     );
 }
 
-/// The block splits at the statement carrying the `?`, and everything after it — statements *and*
-/// tail — becomes the success arm's body.
 #[test]
 fn a_block_splits_at_the_statement_carrying_the_try() {
     assert_eq!(
@@ -2730,8 +2671,6 @@ fn a_block_splits_at_the_statement_carrying_the_try() {
     );
 }
 
-/// Two `?`s in one run nest, outer first, and each success arm's body is itself a return position —
-/// which is what keeps the continuation in tail position.
 #[test]
 fn two_tries_in_a_row_nest_in_the_order_written() {
     assert_eq!(
@@ -2744,8 +2683,6 @@ fn two_tries_in_a_row_nest_in_the_order_written() {
     );
 }
 
-/// `parse_or(ts)?` in the argument of a call whose function is a bare name: the prefix is one
-/// `Var`, which is pure, so the lift is admitted and the continuation stays a tail call.
 #[test]
 fn a_try_in_a_call_argument_with_a_pure_prefix_is_lifted() {
     assert_eq!(
@@ -2754,8 +2691,6 @@ fn a_try_in_a_call_argument_with_a_pure_prefix_is_lifted() {
     );
 }
 
-/// A branch of an `if` in return position is a return position of its own, so a `?` there stays
-/// inside the branch and is never lifted across the condition.
 #[test]
 fn a_try_in_a_return_position_branch_stays_in_the_branch() {
     assert_eq!(
@@ -2767,8 +2702,6 @@ fn a_try_in_a_return_position_branch_stays_in_the_branch() {
     );
 }
 
-/// The condition, by contrast, runs unconditionally, so the `if` node itself is the region root and
-/// the whole `if` moves into the success arm.
 #[test]
 fn a_try_in_a_condition_wraps_the_whole_if() {
     assert_eq!(
@@ -2780,8 +2713,6 @@ fn a_try_in_a_condition_wraps_the_whole_if() {
     );
 }
 
-/// Postfix, in the tightest tier alongside `f(x)` and `r.field`: `g(n)?.msg` is `(g(n)?).msg`,
-/// `-x?` is `-(x?)` and `a == b?` is `a == (b?)`
 #[test]
 fn question_binds_tighter_than_field_access_and_unary_minus() {
     let pre = "type E = {msg: Int}\n\
@@ -2819,10 +2750,6 @@ fn question_binds_tighter_than_field_access_and_unary_minus() {
     }
 }
 
-// --- What `?` refuses, and with which code ----------------------------------
-
-/// `?` reads the mode off the enclosing function's **written** return type, because the parser has
-/// no types.
 #[test]
 fn a_try_with_no_readable_return_type_is_e0118() {
     for (what, src) in [
@@ -2873,9 +2800,6 @@ fn a_try_with_no_readable_return_type_is_e0118() {
     }
 }
 
-/// An alias chain in this file is followed; one that leaves it is not, for `record_update`'s reason
-/// — gate 1 skips a file whose bytes are unchanged, so a meaning read across a module boundary
-/// could go stale in a file that never moved.
 #[test]
 fn a_local_alias_to_result_is_followed_and_a_foreign_one_is_not() {
     assert_eq!(
@@ -2892,8 +2816,7 @@ fn a_local_alias_to_result_is_followed_and_a_foreign_one_is_not() {
     );
 }
 
-/// GUIDE §5.7: constructor names are not reserved, so a module may declare its own `Ok` — and
-/// expanding a `?` in one would build a `match` naming *that* constructor.
+/// A `?` expanded here would build a `match` naming the module's own `Ok`.
 #[test]
 fn a_module_that_declares_its_own_ok_refuses_every_try() {
     assert_eq!(
@@ -2904,9 +2827,7 @@ fn a_module_that_declares_its_own_ok_refuses_every_try() {
     );
 }
 
-/// The four names the expansion emits are not reserved, and a `type` is not the only way to bind
-/// one: `import m (Err)` binds `Err` **unqualified**, in the same `Namespace::Value` a declared
-/// constructor lives in.
+/// `import m (Err)` binds `Err` unqualified, in the namespace a declared constructor lives in.
 #[test]
 fn a_module_that_imports_ok_or_err_unqualified_refuses_every_try() {
     let lib = "pub type Weird<a, e> = Err(e) | Fine(a)\n";
@@ -2932,8 +2853,6 @@ fn a_module_that_imports_ok_or_err_unqualified_refuses_every_try() {
     .expect("an unqualified import binds nothing the expansion emits");
 }
 
-/// A statement whose whole value is a `?` binds nothing, so the success arm takes a **wildcard**
-/// and the statement itself is gone.
 #[test]
 fn a_bare_try_statement_binds_nothing_and_keeps_the_wildcard() {
     assert_eq!(
@@ -2945,9 +2864,6 @@ fn a_bare_try_statement_binds_nothing_and_keeps_the_wildcard() {
     );
 }
 
-/// `sequence` walks a call's parts **left to right**, and that direction is the whole of the
-/// impure-prefix rule for the one shape GUIDE §6.10 spells out: "`g(h(x), k(x)?)` is `E0119` —
-/// `h(x)` is written before the `?` and the expansion would evaluate it after."
 #[test]
 fn a_call_argument_scan_stops_at_an_impure_argument_and_not_before_one() {
     let pre =
@@ -2959,8 +2875,7 @@ fn a_call_argument_scan_stops_at_an_impure_argument_and_not_before_one() {
         )),
         vec![codes::TRY_POSITION]
     );
-    // Impure to the *right* of it: lifted, because nothing moves across anything — `g(n)` already
-    // runs first.
+    // Impure to the *right* of it: lifted, because `g(n)` already runs first.
     assert_eq!(
         body_of(&format!(
             "{pre}fn f(n: Int) -> Result<Int, E> = Ok(two(g(n)?, side(n)))"
@@ -2970,7 +2885,6 @@ fn a_call_argument_scan_stops_at_an_impure_argument_and_not_before_one() {
     );
 }
 
-/// GUIDE §6.10 names six barriers a `?` may not cross and says every one is `E0118`.
 #[test]
 fn a_try_inside_a_handler_or_a_cell_is_e0118() {
     let eff = "effect ctr { write bump() -> Int }\n";
@@ -3011,9 +2925,6 @@ fn a_try_inside_a_handler_or_a_cell_is_e0118() {
     }
 }
 
-/// The float is the whole risk, and this is the rule that closes it: expansion lifts the operand to
-/// the head of its region, so anything evaluated before it must be reorderable — which is
-/// `is_pure`, the predicate normalization already uses to license reordering a run of `let`s.
 #[test]
 fn a_try_with_an_impure_prefix_is_e0119() {
     let eff = "effect ctr { read now() -> Int }\n";
@@ -3066,7 +2977,6 @@ fn a_try_with_an_impure_prefix_is_e0119() {
     }
 }
 
-/// Nothing conditional may sit between the region root and the `?`
 #[test]
 fn a_try_behind_a_conditional_is_e0119() {
     for src in [
@@ -3088,8 +2998,6 @@ fn a_try_behind_a_conditional_is_e0119() {
     }
 }
 
-/// The expansion has no `let` left to carry the annotation on, and a written annotation must not
-/// evaporate.
 #[test]
 fn a_try_that_is_the_whole_value_of_an_annotated_let_is_e0119() {
     assert_eq!(
@@ -3172,7 +3080,6 @@ law \"l\" forall (n: Int) { g(n)? == n }
     );
 }
 
-/// `parse_expr` has no `fn` around it and so no written return type.
 #[test]
 fn parse_expr_refuses_a_try_rather_than_leaking_one() {
     let d = ply_syntax::parser::parse_expr(SRC, "g(1)?")
@@ -3180,9 +3087,6 @@ fn parse_expr_refuses_a_try_rather_than_leaking_one() {
     assert!(d.iter().any(|d| d.code == codes::TRY_SCOPE), "{d:#?}");
 }
 
-// --- Record update -----------------------------------------------------------
-
-/// Whether an unexpanded [`ExprKind::RecordUpdate`] is anywhere in the tree.
 fn has_record_update(m: &Module) -> bool {
     fn e(x: &Expr) -> bool {
         match &x.kind {
@@ -3252,9 +3156,7 @@ fn no_record_update_survives_parse_module_anywhere_in_the_tree() {
         root.display()
     );
 
-    // The corpus does not yet use the syntax everywhere, so a file that does is appended: a guard
-    // that only ever saw programs without record updates would pass whether or not expansion ran at
-    // all.
+    // Appended: a guard that never saw a record update would pass whether or not expansion ran.
     const USES_IT: &str = "\
 type L = {a: Int, b: Int}
 type W = {lim: L, n: Int}
@@ -3302,7 +3204,6 @@ law \"c\" forall (l: L) where g({..l, a: 1}).a == 1 { g({..l, b: 2}).b == 2 }
     );
 }
 
-/// `parse_expr` has no module around it and so no shape to resolve.
 #[test]
 fn parse_expr_refuses_a_record_update_rather_than_leaking_one() {
     let d = ply_syntax::parser::parse_expr(SRC, "{..s, a: 1}")
@@ -3325,9 +3226,7 @@ fn a_record_update_parses_as_copies_then_writes() {
     );
 }
 
-/// The copies are sorted **by name**, and `a`/`b`/`c` cannot say so: every one-character field set
-/// orders identically under any comparator that compares length first and name second, so a suite
-/// written only in single letters passes whichever of the two ran.
+/// Single-letter fields order the same under length-then-name, so only longer names can tell.
 #[test]
 fn copies_are_sorted_by_name_and_not_by_length() {
     for (src, want, wrong) in [
@@ -3364,7 +3263,6 @@ fn a_record_update_with_no_written_fields_copies_every_field() {
     assert_eq!(dump_expr(&f.body), "(rec (a (field s a)) (b (field s b)))");
 }
 
-/// The sharpest trap in the pass.
 #[test]
 fn a_shadowing_binder_refuses_rather_than_using_the_outer_type() {
     for src in [
@@ -3380,8 +3278,6 @@ fn a_shadowing_binder_refuses_rather_than_using_the_outer_type() {
     }
 }
 
-/// The outer binder is still the one in scope while the *value* of a `let` is elaborated, so `let s
-/// = {..s, a: 1}` updates the record it shadows.
 #[test]
 fn a_let_value_sees_the_binder_it_shadows() {
     let m = ok("type R = {a: Int, b: Int}\nfn f(s: R) -> R = { let s: R = {..s, a: 1}; s }");
@@ -3444,8 +3340,6 @@ fn a_second_base_and_a_three_dot_spelling_are_parse_errors() {
     }
 }
 
-/// `{x}` is still a block and `{x: e}` is still a record: adding `..` to the lookahead must not
-/// have moved either.
 #[test]
 fn the_brace_disambiguation_is_unchanged() {
     assert_eq!(expr("{x}"), "(block x)");
@@ -3453,8 +3347,7 @@ fn the_brace_disambiguation_is_unchanged() {
     assert_eq!(expr("{x, y}"), "(rec (x x) (y y))");
 }
 
-/// Whether any call in the module still carries a named argument, or any parameter a default that
-/// was never matched against a call.
+/// Whether any call still carries a named argument, or any parameter an unmatched default.
 fn has_named_argument(m: &Module) -> bool {
     fn e(x: &Expr) -> bool {
         ply_syntax::effect_set::grow(|| match &x.kind {
@@ -3509,7 +3402,6 @@ fn has_named_argument(m: &Module) -> bool {
     })
 }
 
-/// **The invariant four other crates are built on.**
 #[test]
 fn no_named_argument_survives_resolve_anywhere_in_the_tree() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3573,8 +3465,6 @@ test \"t\" { assert_eq(a(), \"helloada!\") }
     );
 }
 
-/// The other half: a call that omitted an argument really did gain the default, rather than being
-/// left short for someone else to trip over.
 #[test]
 fn an_omitted_argument_is_filled_with_the_default() {
     let module = parse(
@@ -3598,7 +3488,6 @@ fn an_omitted_argument_is_filled_with_the_default() {
     assert_eq!(dump_expr(&b.body), "(call greet \"ada\" \"hey\")");
 }
 
-/// **`parse_unexpanded` is for one caller, and this is what keeps it there.**
 #[test]
 fn parse_unexpanded_is_reached_by_no_shipping_caller() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3607,13 +3496,7 @@ fn parse_unexpanded_is_reached_by_no_shipping_caller() {
         .expect("the crate lives two levels below the repository root");
     let crates = root.join("crates");
 
-    // Where the name is allowed: the definition, this test, and the one caller it exists for --
-    // the differential, which compares the self-hosted parser's tree against this one before the
-    // rewrites run, and so must be handed the tree that still holds `Try` and `RecordUpdate`.
-    //
-    // That caller was outside `crates/` while it was a spike, so this walk did not see it and the
-    // list did not have to name it. It is `crates/ply-compiler-diff` now, and naming it is the
-    // point: the rule is one caller, not none.
+    // The one caller: the differential, which must see the tree still holding `Try`/`RecordUpdate`.
     let allowed = [
         crates.join("ply-syntax/src/parser.rs"),
         crates.join("ply-syntax/src/lib.rs"),
@@ -3665,9 +3548,7 @@ fn parse_unexpanded_is_reached_by_no_shipping_caller() {
     }
     assert!(
         saw_the_definition,
-        // ASCII only, and not by preference: `crates/ply-compiler-diff/tools/mine-fixtures.py` mines every
-        // string literal in this file into its fixture bundle and asserts each is printable ASCII,
-        // so an em dash here stops the corpus generator with a bare `AssertionError`.
+        // ASCII only: `mine-fixtures.py` mines every string literal here and asserts it is ASCII.
         "no file under {} names `parse_unexpanded`, so either it has been renamed or this \
          walk stopped reaching the crate that defines it; either way the check below is \
          vacuous",
@@ -3682,9 +3563,6 @@ fn parse_unexpanded_is_reached_by_no_shipping_caller() {
     );
 }
 
-/// A field position has no other reading, so a keyword names a field in a type, a literal, a
-/// pattern, after `.` and in an update — `{ nondet: Bool }` is the AST this compiler's own
-/// parser is a port of (`crates/ply-compiler/GAPS-items.md` §P3).
 #[test]
 fn a_keyword_names_a_field_wherever_a_field_is_named() {
     assert_eq!(
@@ -3709,7 +3587,6 @@ fn a_keyword_names_a_field_wherever_a_field_is_named() {
     }
 }
 
-/// The punned forms bind a variable of the field's name, and a keyword cannot be one.
 #[test]
 fn a_keyword_field_cannot_be_punned() {
     for src in [
@@ -3726,11 +3603,7 @@ fn a_keyword_field_cannot_be_punned() {
     }
 }
 
-/// What the printer writes, the parser reads back to the same tree: every surface file in the
-/// tree, through the unexpanded entry, since an expanded tree carries names -- `?0` -- that are
-/// not identifiers. Compared by the dumper, and then as a fixpoint of the printer's own output,
-/// which is what covers the fields the dumper leaves out: a default, a named argument,
-/// `law/host`, an effect set's members, a row's aliases.
+/// Unexpanded, as expansion's `?0` names are not identifiers; the fixpoint covers what dumps omit.
 #[test]
 fn printing_a_module_reads_back_to_the_same_tree() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

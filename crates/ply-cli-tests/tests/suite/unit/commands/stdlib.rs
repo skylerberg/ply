@@ -13,8 +13,7 @@ fn the_flags_parse_and_default_to_the_listing() {
     assert_eq!(args.show, None);
 }
 
-/// `--digest` is the one-line form a CI check pins, so it may not also carry a table for a
-/// machine.
+/// `--digest` is the one-line form a CI check pins.
 #[test]
 fn digest_and_json_cannot_both_be_asked_for() {
     assert!(Cli::try_parse_from(["ply", "std", "--digest", "--json"]).is_err());
@@ -35,8 +34,6 @@ fn the_listing_names_every_shipped_module_and_ends_with_the_digest() {
     assert!(rows.iter().all(|r| r.definitions > 0), "a module is empty");
 }
 
-/// Two runs of one binary have to agree byte for byte, or pinning the digest in CI pins
-/// nothing.
 #[test]
 fn the_listing_is_stable_across_runs() {
     let once = lines(&rows().unwrap());

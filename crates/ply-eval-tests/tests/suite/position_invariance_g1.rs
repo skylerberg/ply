@@ -1,17 +1,11 @@
-//! **the gate G1 — position invariance, registered before the measurement.**
-
 /// One shape, written the two ways.
 struct Pair {
-    /// What the pair is about, printed in the table.
     name: &'static str,
     canonical: &'static str,
     pessimal: &'static str,
 }
 
-/// the ownership design rows 1 and 2 — `go(i + 1, push(acc, i))` at 200 / 200
-/// against `go(push(acc, i), i + 1)` at 0 / 200. The two functions differ in
-/// parameter order because that is the shape: the growing argument moves, and
-/// nothing else about the computation does.
+/// The members differ only in parameter order: the growing argument moves and nothing else does.
 const CALL_ARG_CANONICAL: &str = r#"
 fn go(i: Int, acc: List<Int>) -> List<Int> =
   if i >= 200 { acc } else { go(i + 1, push(acc, i)) }
@@ -30,9 +24,6 @@ test "the growing argument is first in the call" {
 }
 "#;
 
-/// the ownership design rows 3 and 4 — the same loop with the accumulator inside a
-/// record, the growing field last against first in the literal. This is the
-/// rule as `docs/GUIDE.md` §6.7 states it.
 const RECORD_FIELD_CANONICAL: &str = r#"
 fn go(i: Int, s: {k: Int, out: List<Int>}) -> {k: Int, out: List<Int>} =
   if i >= 200 { s } else { go(i + 1, {k: s.k + 1, out: push(s.out, i)}) }
@@ -53,12 +44,7 @@ test "the growing field is first in its literal" {
 }
 "#;
 
-/// the ownership design row **five**, which is the finding: the growing field is
-/// last in its literal — the documented rule, applied correctly — and the
-/// record is not last in the enclosing call, so the program is quadratic
-/// anyway. The rule compounds at every enclosing node on the path from the
-/// `push` up, and this is the pair that says so: its canonical member is
-/// byte-identical to [`RECORD_FIELD_CANONICAL`] and only the *outer* node moved.
+/// Field last, record first: the position rule compounds at every enclosing node.
 const COMPOUNDING_PESSIMAL: &str = r#"
 fn go(s: {k: Int, out: List<Int>}, i: Int) -> {k: Int, out: List<Int>} =
   if i >= 200 { s } else { go({k: s.k + 1, out: push(s.out, i)}, i + 1) }
@@ -69,14 +55,7 @@ test "the growing field is last and its record is first in the call" {
 }
 "#;
 
-/// the ownership design cause 1 — *"an accumulator threaded as a `let` binding is
-/// reused; the identical accumulator threaded as a parameter is not"*, measured
-/// there as 1 of 1 against 0 of 1 on
-/// `{ let t = push(xs, 1); let u = 7; len(t) + u }`. Those three statements are
-/// reproduced verbatim in both members — with the binding that produces `xs`
-/// added ahead of them, since the ownership design's fragment does not say where `xs` comes
-/// from and that is the whole of what this pair varies: a statement binder here,
-/// a parameter there.
+/// The members differ only in how `xs` arrives: a statement binder here, a parameter there.
 const PARAM_VS_LET_CANONICAL: &str = r#"
 fn probe(n: Int) -> Int = {
   let xs = range(0, n);
@@ -110,8 +89,6 @@ test "the accumulator arrives as a parameter" {
 }
 "#;
 
-/// the ownership design row 6 — the `fold` accumulator, which is the shape the
-/// standard library is written in, at 200 / 200.
 const FOLD_CLOSURE_CANONICAL: &str = r#"
 fn keep_last(i: Int, a: List<Int>) -> List<Int> = a
 
@@ -132,8 +109,6 @@ test "a fold accumulator appended in first position" {
 }
 "#;
 
-/// How many pairs the corpus has, and therefore how many shapes G1 is taken
-/// over.
 const EXPECTED_PAIRS: usize = 5;
 
 fn corpus() -> Vec<Pair> {
@@ -166,13 +141,10 @@ fn corpus() -> Vec<Pair> {
     ]
 }
 
-/// A member's identity, as twelve hex characters of BLAKE3 over its source.
 fn digest(src: &str) -> String {
     format!("b3:{}", &blake3::hash(src.as_bytes()).to_hex()[..12])
 }
 
-/// The corpus is five shapes, each pair is two different programs, and each is
-/// the program it was pinned as.
 #[test]
 fn the_corpus_is_the_five_shapes_it_says_it_is() {
     let pairs = corpus();
@@ -213,10 +185,7 @@ fn the_corpus_is_the_five_shapes_it_says_it_is() {
         .map(|(p, d)| (p.name, d.0.as_str(), d.1.as_str()))
         .collect();
 
-    // Taken on this tree 2026-08-31. The second and third rows share a
-    // canonical digest on purpose: the compounding pair is the record-field
-    // canonical with only the *outer* node moved, which is the whole of what
-    // the ownership design row five says.
+    // The second and third rows share a canonical digest on purpose: only the outer node moved.
     let expected: [(&str, &str, &str); EXPECTED_PAIRS] = [
         ("call argument", "b3:2a168234d2a1", "b3:dc587bf7bfb2"),
         ("record field", "b3:031f75989bca", "b3:a52314fd4b69"),

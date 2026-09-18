@@ -1,13 +1,9 @@
-//! The deliberately wrong backends, caught under tier-only (ADR 0048) by the corpus's own tests
-//! going red — a corrupt backend declines every test body it is handed and, with no machine behind
-//! the decline, the whole corpus fails.
-
 use assert_cmd::Command;
 use serde_json::Value;
 use std::path::Path;
 use tempfile::TempDir;
 
-/// Five definitions and five tests, chosen so that each corruption has something to bite.
+/// Chosen so that each corruption has something to bite.
 const CORPUS: &str = r#"
 effect tally {
   read  base[log]() -> Int
@@ -60,8 +56,7 @@ test "a grade is a float" { assert(grade(7) == 1.5) }
 test "a self handled effect still answers" { assert_eq(handled(1), 10) }
 "#;
 
-/// One definition whose recursion outruns the machine's own bound, so that `budget` is a number the
-/// backend has to honour rather than a hint.
+/// Recursion that outruns the machine's own bound, so `budget` is a number the backend must honour.
 const DEEP: &str = r#"
 fn ladder(n: Int) -> Int = if n <= 0 { 0 } else { 1 + ladder(n - 1) }
 
@@ -80,9 +75,6 @@ fn ply(dir: &Path) -> Command {
     cmd
 }
 
-/// One `ply test --backend .. -j 1 --json` run. There is no pairing flag: under tier-only
-/// (ADR 0048) its oracle arm would be an evaluator-less machine that disagrees with every honest
-/// answer, so a corruption is caught by the corpus's own tests going red instead.
 fn run(dir: &Path, backend: Option<&str>) -> Value {
     let mut cmd = ply(dir);
     cmd.arg("test").arg("-j").arg("1").arg("--json");
@@ -106,9 +98,7 @@ fn u64_at(report: &Value, path: &[&str]) -> u64 {
         .unwrap_or_else(|| panic!("`{}` is not a number: {node}", path.join(".")))
 }
 
-/// The keys of every test the run failed. A corrupt backend declines every test body it is handed
-/// and no machine picks the body up, so the whole corpus goes red; a specific corruption is caught
-/// by its test being among these.
+/// The failed tests' keys: a corrupt backend is caught by its test being among them.
 fn caught(report: &Value) -> Vec<String> {
     report["failures"]
         .as_array()
@@ -129,8 +119,6 @@ fn fires_and_is_caught(dir: &Path, backend: &str) -> Vec<String> {
     );
     caught(&report)
 }
-
-// --- The eight --------------------------------------------------------------
 
 #[test]
 fn an_off_by_one_in_a_compiled_answer_is_caught_by_ply_test() {
@@ -170,8 +158,7 @@ fn a_bool_where_an_int_belongs_crosses_the_seam_and_is_caught_by_ply_test() {
     );
 }
 
-/// `grade` is offered — its argument is carried — and its answer is not; an answer for it is an
-/// answer for a name the backend has no body for.
+/// `grade`'s argument is carried and its answer is not, so the backend has no body for it.
 #[test]
 fn an_answer_for_a_definition_the_backend_has_no_body_for_is_caught_by_ply_test() {
     let dir = project(CORPUS);
@@ -195,8 +182,7 @@ fn a_forged_handle_inside_a_container_answer_is_caught_by_ply_test() {
 #[test]
 fn a_backend_that_runs_past_its_budget_is_caught_by_ply_test() {
     let dir = project(DEEP);
-    // The corpus outruns the recursion bound on its own, so a red control here is the stage the
-    // budget mutation needs — not a backend being blamed for it.
+    // The corpus outruns the recursion bound on its own, so a red control is expected here.
     let control = run(dir.path(), None);
     assert_eq!(u64_at(&control, &["summary", "failed"]), 1, "{control}");
     assert!(
@@ -218,10 +204,6 @@ fn a_backend_that_ignores_its_budget_is_caught_where_the_body_terminates() {
     assert_eq!(caught, vec!["m.a ladder past the machine's bound"]);
 }
 
-/// The `answers=` mutation forges an `Int` for a named definition. Its old subject — that the
-/// machine never *offers* a self-handled definition to a backend — was a two-tier seam distinction
-/// tier-only removes (ADR 0048); the corruption is now caught the way the others are, by the run
-/// going red with the test that reaches `handled` among the failures.
 #[test]
 fn a_forged_answer_for_a_self_handled_definition_is_caught_by_ply_test() {
     let dir = project(CORPUS);
@@ -247,10 +229,6 @@ fn an_unknown_backend_is_refused_rather_than_ignored() {
     assert_eq!(report["diagnostics"][0]["code"], "E0450", "{report}");
 }
 
-// --- The eight, over the code generator -------------------------------------
-
-/// The control for everything below: the honest code generator is green, changes no answer, and
-/// **enters bodies**.
 #[test]
 fn the_honest_code_generator_agrees_over_the_corpus_and_enters_it() {
     let dir = project(CORPUS);
@@ -265,8 +243,7 @@ fn the_honest_code_generator_agrees_over_the_corpus_and_enters_it() {
         "the code generator entered nothing, so the seam was never reached: {}",
         report["backend"]
     );
-    // Under tier-only the C tier carries the whole language, so it declines nothing — the
-    // registry-miss path the two-tier world exercised here is gone (ADR 0048).
+    // The C tier carries the whole language, so it declines nothing.
     assert_eq!(
         u64_at(&report, &["backend", "declined"]),
         0,
@@ -278,9 +255,7 @@ fn the_honest_code_generator_agrees_over_the_corpus_and_enters_it() {
         "{}",
         report["backend"]
     );
-    // The seam's census counted what the entries converted: this corpus hands in only `Int`s,
-    // which are immediates and build nothing, and answers a list and a string, which are read
-    // back out.
+    // Only `Int`s go in, which are immediates and build nothing; a list and a string are read back out.
     assert_eq!(
         u64_at(&report, &["backend", "converted_in"]),
         0,
@@ -338,8 +313,7 @@ fn a_wrong_kind_from_compiled_code_is_caught_by_ply_test() {
     );
 }
 
-/// The registry-miss path: every compiled definition is registered, so the name the mutation
-/// answers for is one the fragment refused.
+/// Every compiled definition is registered, so the name the mutation answers for is one the fragment refused.
 #[test]
 fn an_answer_from_compiled_code_for_a_body_it_lacks_is_caught_by_ply_test() {
     let dir = project(CORPUS);
@@ -350,8 +324,6 @@ fn an_answer_from_compiled_code_for_a_body_it_lacks_is_caught_by_ply_test() {
     );
 }
 
-/// The fuel prologue is four instructions in every compiled body — load, subtract, branch, store —
-/// and this is what says they are load-bearing.
 #[test]
 fn compiled_code_that_runs_past_its_budget_is_caught_by_ply_test() {
     let dir = project(DEEP);
@@ -377,8 +349,6 @@ fn compiled_code_that_ignores_its_budget_is_caught_where_the_body_terminates() {
     assert_eq!(caught, vec!["m.a ladder past the machine's bound"]);
 }
 
-/// The compiled counterpart of the forged-answer mutation; its old offer-protection subject is a
-/// two-tier distinction tier-only removes (ADR 0048), so it too is caught by the run going red.
 #[test]
 fn compiled_code_forging_an_answer_for_a_self_handled_definition_is_caught_by_ply_test() {
     let dir = project(CORPUS);
@@ -389,8 +359,6 @@ fn compiled_code_forging_an_answer_for_a_self_handled_definition_is_caught_by_pl
     );
 }
 
-/// `ply run --backend` attaches the backend to the program's `main` as `ply test` does to a test,
-/// and a spec the grammar refuses is the same diagnostic there.
 #[test]
 fn run_attaches_a_backend_to_main_and_refuses_a_spec_it_cannot_parse() {
     let dir = project(
@@ -422,11 +390,6 @@ fn run_attaches_a_backend_to_main_and_refuses_a_spec_it_cannot_parse() {
     );
 }
 
-// --- The compile laziness ---------------------------------------------------
-
-/// A unit compiled to enter nothing is the whole project's compile spent on an empty selection,
-/// and `benches/marginal-change/` prices that at about half of a backed run. A run that selected no
-/// test builds none.
 #[test]
 fn a_backed_run_that_selects_nothing_compiles_nothing() {
     let dir = project(CORPUS);
@@ -462,9 +425,6 @@ fn a_backed_run_that_selects_nothing_compiles_nothing() {
     );
 }
 
-// --- The grammar -------------------------------------------------------------
-
-/// A corruption may name the backend it wraps, and a bare `wrong:` wraps `c`.
 #[test]
 fn a_bare_wrong_prefix_names_the_c_backend() {
     let dir = project(CORPUS);
@@ -474,7 +434,6 @@ fn a_bare_wrong_prefix_names_the_c_backend() {
     assert_eq!(generated["backend"]["name"], "c", "{generated}");
 }
 
-/// A misspelled backend is refused rather than falling back to one that works.
 #[test]
 fn a_backend_name_that_is_not_a_spelling_of_anything_is_refused() {
     let dir = project(CORPUS);
@@ -495,8 +454,6 @@ fn a_backend_name_that_is_not_a_spelling_of_anything_is_refused() {
     }
 }
 
-/// A test body is a root the code generator enters whole, and a failing one is still a failure:
-/// the tier raises the diagnostic, which is an entry and not a decline.
 #[test]
 fn a_test_body_is_entered_whole_and_a_failing_one_still_fails() {
     let dir = project(
@@ -523,20 +480,3 @@ test "wrong" { assert_eq(double(21), 41) }
         report["backend"]
     );
 }
-
-// --- Removed under tier-only (ADR 0048) -------------------------------------
-//
-// The following tests are deleted because their premise is the interpreter-vs-backend separation
-// that tier-only removes:
-//
-// * `the_corpus_is_green_with_no_backend` — the C tier is always the evaluator, so there is no
-//   "no backend" run and `report["backend"]` is never null.
-// * `a_backend_run_reads_no_pass_the_evaluator_earned`,
-//   `a_backend_run_writes_no_pass_the_evaluator_will_read`,
-//   `a_code_generator_run_reads_no_pass_the_evaluator_earned`,
-//   `a_code_generator_run_writes_no_pass` — the result cache is no longer namespaced by engine;
-//   the backend IS the evaluator, so there is no evaluator-earned pass a backend run must refuse.
-// * `the_unbounded_runaway_is_stopped_under_a_code_generator_and_hangs_under_a_tree_walker` — there
-//   is no tree-walker arm to contrast, and a corrupt backend now declines the test body outright
-//   (no body) rather than running past its budget over native frames, so the stack-floor vs
-//   heap-frame contrast no longer exists.

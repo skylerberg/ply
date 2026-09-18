@@ -136,8 +136,6 @@ fn an_added_definition_drags_in_everything_that_mentions_it() {
     assert_eq!(delta.clusters[0].reason, FusionReason::Existence);
 }
 
-/// A removed definition is only reachable through the *baseline* edges, so the current
-/// program's graph alone would leave a dangling reference.
 #[test]
 fn a_removed_definition_fuses_through_baseline_edges() {
     let mut changes = independent_changes(&["keeper"]);
@@ -213,9 +211,6 @@ fn a_fused_group_is_reported_as_fused_rather_than_as_two_answers() {
     assert_eq!(out.groups, vec![vec![sym("callee"), sym("x")]]);
 }
 
-/// The case that is common: a mixture that does not typecheck is not evidence, so
-/// the search walks around it, keeps the pair it could not separate, and refuses to call the
-/// result minimal.
 #[test]
 fn hybrids_that_do_not_typecheck_are_not_evidence() {
     let delta = Delta::new(
@@ -351,8 +346,6 @@ fn the_search_never_asks_the_same_question_twice() {
     assert_eq!(seen.len(), before, "a subset was evaluated twice");
 }
 
-/// The artifact is diffed against yesterday's, so the same inputs have to produce the same
-/// bytes — including the order of the culprit groups.
 #[test]
 fn the_same_inputs_produce_the_same_answer_every_time() {
     let names: Vec<String> = (0..9).map(|i| format!("d{i}")).collect();

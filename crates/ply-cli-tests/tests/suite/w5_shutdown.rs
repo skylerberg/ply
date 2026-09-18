@@ -1,5 +1,3 @@
-//! What a client sees when a service is asked to stop.
-
 #![cfg(unix)]
 
 use assert_cmd::cargo::CommandCargoExt;
@@ -9,7 +7,6 @@ use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-/// A sequential accept loop that reads one request, answers it, and closes.
 const SERVER: &str = r#"
 import std.net
 import std.net (net)
@@ -48,10 +45,8 @@ fn main() -> Int / {net.write[listener], net.write[conn], signal.read} = {
 }
 "#;
 
-/// How many ports [`Server::start_with`] will try before it gives up.
 const PORT_ATTEMPTS: usize = 3;
 
-/// A port nothing is listening on right now.
 fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
     let port = listener.local_addr().expect("an address").port();
@@ -59,8 +54,7 @@ fn free_port() -> u16 {
     port
 }
 
-/// A running `ply run --host`, killed when this is dropped — including while a panic unwinds, which
-/// is the case that would otherwise leak a server per failing test.
+/// Killed on drop, including during a panic, so a failing test does not leak a server.
 struct Server {
     child: Child,
     port: u16,
@@ -79,8 +73,7 @@ impl Server {
         Server::start_with(SERVER, flags)
     }
 
-    /// Starts the server, retrying on a fresh port if the one `free_port` handed over was taken
-    /// before `ply run` could claim it.
+    /// Retries on a fresh port if the one `free_port` handed over was taken before `ply run` could claim it.
     fn start_with(source: &str, flags: &[&str]) -> Server {
         let mut refused = Vec::new();
         for _ in 0..PORT_ATTEMPTS {
@@ -142,7 +135,6 @@ impl Server {
         ))
     }
 
-    /// What the child said before it exited.
     fn epitaph(&mut self, status: ExitStatus) -> String {
         let mut out = String::new();
         let mut err = String::new();
@@ -185,8 +177,7 @@ impl Server {
         assert!(status.success(), "`kill -{name}` failed");
     }
 
-    /// The exit code and everything the run wrote, which is where `W0608` and the shutdown banner
-    /// land.
+    /// The exit code and everything the run wrote, where `W0608` and the shutdown banner land.
     fn finish(mut self) -> (i32, String) {
         let until = Instant::now() + Duration::from_secs(60);
         loop {
@@ -210,8 +201,7 @@ impl Server {
         if let Some(stderr) = self.child.stderr.as_mut() {
             let _ = stderr.read_to_string(&mut err);
         }
-        // `None` is a signal that killed the process rather than an exit code, and a run that was
-        // killed is a run that did not drain.
+        // `None` means a signal killed the process, and a killed run did not drain.
         (status.code().unwrap_or(-1), format!("{out}{err}"))
     }
 }
@@ -220,7 +210,6 @@ fn write(dir: &Path, source: &str) {
     std::fs::write(dir.join("main.ply"), source).unwrap();
 }
 
-/// One request and one response over an already-open connection.
 fn request(stream: &mut TcpStream) -> String {
     stream
         .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -230,16 +219,12 @@ fn request(stream: &mut TcpStream) -> String {
     String::from_utf8_lossy(&answer).to_string()
 }
 
-/// The exit criterion of the drain, end to end and with the source unchanged: a request in
-/// flight when the signal arrives gets its response, the accept loop then ends because `accept`
-/// answered `0`, and the run exits `0`.
 #[test]
 fn a_request_in_flight_at_the_signal_gets_its_response_and_the_run_exits_zero() {
     let server = Server::start(&["--drain-ms", "30000"]);
     let mut held = server.connect();
 
-    // The server is inside `net.recv` on this connection with a 20s deadline, so the signal lands
-    // with a request genuinely in flight.
+    // The server is inside `net.recv` with a 20s deadline, so the signal lands with a request in flight.
     std::thread::sleep(Duration::from_millis(200));
     server.signal("TERM");
     std::thread::sleep(Duration::from_millis(200));
@@ -265,7 +250,6 @@ fn a_request_in_flight_at_the_signal_gets_its_response_and_the_run_exits_zero() 
         output.contains("stopping"),
         "a stopping service prints what it is doing\n\n{output}"
     );
-    // what an operator sees: every number an operator reads is a fact the run already holds.
     assert!(
         output.contains("1 listener(s) closed"),
         "the banner reports the listener the run actually closed\n\n{output}"
@@ -276,7 +260,6 @@ fn a_request_in_flight_at_the_signal_gets_its_response_and_the_run_exits_zero() 
     );
 }
 
-/// A connection the run stopped accepting on is refused rather than half-served.
 #[test]
 fn a_connection_opened_after_the_stop_gets_no_response() {
     let server = Server::start(&["--drain-ms", "30000"]);
@@ -284,8 +267,7 @@ fn a_connection_opened_after_the_stop_gets_no_response() {
     assert!(request(&mut first).contains("200 OK"));
 
     server.signal("TERM");
-    // The accept loop is parked in `accept`; phase 2 dials it awake and it answers `0`, so this
-    // connection is either refused outright or accepted and closed.
+    // Phase 2 dials the parked `accept` awake and it answers `0`, so this connection is refused or accepted and closed.
     std::thread::sleep(Duration::from_millis(400));
     if let Ok(mut late) = TcpStream::connect_timeout(&server.address(), Duration::from_millis(500))
     {
@@ -304,14 +286,12 @@ fn a_connection_opened_after_the_stop_gets_no_response() {
     assert_eq!(code, 0, "{output}");
 }
 
-/// The drain deadline, and the honest answer W5 has for it: there is no cancellation, so the task
-/// is not unwound and is not handed a `503`.
+/// There is no cancellation, so the task is not unwound and is not handed a `503`.
 #[test]
 fn a_drain_that_expires_reports_w0608_and_exits_three() {
     let server = Server::start(&["--drain-ms", "300"]);
     let mut held = server.connect();
-    // Held open and silent: the server is inside `net.recv` with a 20s deadline, so this request
-    // cannot finish inside a 300ms drain.
+    // Held open and silent inside a 20s `net.recv`, so this request cannot finish inside a 300ms drain.
     std::thread::sleep(Duration::from_millis(200));
     server.signal("TERM");
 
@@ -340,7 +320,6 @@ fn a_drain_that_expires_reports_w0608_and_exits_three() {
     );
 }
 
-/// A second signal means a person has decided to stop waiting.
 #[test]
 fn a_second_signal_exits_immediately_and_says_what_it_abandoned() {
     let server = Server::start(&["--drain-ms", "60000"]);
@@ -365,8 +344,6 @@ fn a_second_signal_exits_immediately_and_says_what_it_abandoned() {
     let _ = held.shutdown(Shutdown::Both);
 }
 
-/// The lead phase: accept keeps running so a readiness route can answer `503` and a load balancer
-/// can take the instance out.
 #[test]
 fn during_the_lead_the_run_still_accepts_and_already_says_it_is_stopping() {
     let server = Server::start(&["--drain-ms", "30000", "--drain-lead-ms", "2000"]);
@@ -376,8 +353,7 @@ fn during_the_lead_the_run_still_accepts_and_already_says_it_is_stopping() {
     server.signal("TERM");
     std::thread::sleep(Duration::from_millis(300));
 
-    // Inside the lead: a *new* connection is still accepted, and the route reads the flag and
-    // sheds.
+    // Inside the lead a new connection is still accepted, and the route reads the flag and sheds.
     let mut during = server.connect();
     let answer = request(&mut during);
     assert!(
@@ -395,9 +371,7 @@ fn during_the_lead_the_run_still_accepts_and_already_says_it_is_stopping() {
     assert!(output.contains("signals INT TERM"), "{output}");
 }
 
-/// `signal` binds under `ply run --host` and is withheld under `ply test`, with or without `--host`
-/// — a stop requested once ends every test after it, and a suite whose verdicts depend on the
-/// terminal is the coupling the footprint graph cannot see.
+/// A stop requested once would end every test after it: a coupling the footprint graph cannot see.
 #[test]
 fn signal_is_withheld_under_ply_test_and_names_the_twin() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -413,8 +387,7 @@ test/nondet "a stop reaches the program" {
 }
 "#,
     );
-    // `--json` because the code is what a consumer acts on, and the human projection renders the
-    // message rather than the number.
+    // `--json` because the human projection renders the message rather than the code.
     for flags in [vec!["test", "--json"], vec!["test", "--host", "--json"]] {
         let out = Command::cargo_bin("ply")
             .expect("the binary is built")
@@ -446,10 +419,7 @@ test/nondet "a stop reaches the program" {
     }
 }
 
-/// The same service with a task per connection, which is the shape a real one has
-/// and the shape the drain's unfinished-request case is about: `desk.ply`'s
-/// in-flight count at a signal is exactly one, and a service that
-/// spawns per connection has N.
+/// A task per connection: the shape the drain's unfinished-request case is about.
 const CONCURRENT: &str = r#"
 import std.net
 import std.net (net)
@@ -487,9 +457,6 @@ fn main() -> Int / {net.write[listener], net.write[conn], signal.read, task.writ
 }
 "#;
 
-/// Under the production scheduler, with a task per connection: a request in flight at the signal
-/// finishes, the accept loop ends on `accept` answering `0`, the root joins the task that was still
-/// running, and the run exits `0`.
 #[test]
 fn a_spawned_task_still_serving_at_the_signal_finishes_and_the_run_exits_zero() {
     let server = Server::start_with(CONCURRENT, &["--drain-ms", "30000"]);
@@ -510,7 +477,6 @@ fn a_spawned_task_still_serving_at_the_signal_finishes_and_the_run_exits_zero() 
     assert!(!output.contains("W0608"), "{output}");
 }
 
-/// **A task blocked on a host handler at shutdown must not hang the drain.**
 #[test]
 fn a_task_blocked_on_a_host_handler_does_not_outlast_the_drain() {
     let server = Server::start_with(CONCURRENT, &["--drain-ms", "400"]);

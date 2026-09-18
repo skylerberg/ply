@@ -9,8 +9,7 @@ fn nested(levels: usize, bottom: Value) -> Value {
     })
 }
 
-/// A parsed program is a constant far deeper than any recursion budget; the walk must
-/// reach its bottom either way, since what is there decides the answer.
+/// A parsed program is a constant deeper than any recursion budget.
 #[test]
 fn a_constant_is_judged_by_its_leaves_however_deep_they_lie() {
     assert!(world_independent(&nested(2_000, Value::Unit)));

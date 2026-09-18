@@ -72,8 +72,6 @@ fn a_concurrent_test_needs_two_tasks_and_a_step() {
     );
 }
 
-/// A manifest written before M8 has no `spec_fraction`, and deserializing one must produce a
-/// corpus with no obligations rather than a default density nobody asked for.
 #[test]
 fn a_spec_written_before_m8_deserializes_to_a_corpus_with_no_obligations() {
     let spec: CorpusSpec = serde_json::from_str(

@@ -1,4 +1,4 @@
-//! Turning one failure into the artifact of the failure artifact.
+//! Turning one failure into its failure artifact.
 
 use crate::bisect::{
     Baseline, Bisection, Budget, Classify, Delta, DepEdges, Diff, Gate, Hybrid, Mode, NoHybrid,
@@ -34,8 +34,7 @@ pub struct Evidence<'a> {
     pub nondet: bool,
     /// The evaluator failed rather than the program — a defect in Ply, not a change to attribute.
     pub defect: bool,
-    /// The failing run reached a host handler, read off what the runtime did rather than off the
-    /// prediction selection made.
+    /// The failing run reached a host handler, as observed rather than predicted by selection.
     pub host: bool,
     /// The raw closure ∩ changed intersection, by name.
     pub suspects: &'a [Symbol],
@@ -55,9 +54,7 @@ pub fn diagnose(
 ) -> Attribution {
     let mut attribution = Attribution::from_suspects(evidence.suspects, evidence.hashes);
 
-    // The delta is worth building whatever happens to the search: which suspects anybody actually
-    // edited is the field that shrinks an agent's reading list, and it needs a baseline rather than
-    // a hybrid.
+    // Built whatever the search does: it needs only a baseline, and it shrinks the reading list.
     let gate = precheck(
         Gate::new(
             options.bisect,
@@ -97,8 +94,7 @@ pub fn diagnose(
     attribution
 }
 
-/// One cluster and an unedited test is the overwhelmingly common case — one edit — and it is
-/// decided by counting, not by evaluating.
+/// One cluster and an unedited test is the common case, decided by counting, not evaluating.
 fn needs_a_hybrid(delta: &Delta) -> bool {
     match delta.clusters.len() {
         0 => false,
@@ -128,7 +124,6 @@ fn search(diff: &Diff, hybrid: &mut dyn Hybrid, budget: Budget) -> Bisection {
 }
 
 impl Attribution {
-    /// Fills in what the two configurations disagreed about.
     pub fn annotate(&mut self, delta: &Delta) {
         for suspect in &mut self.suspects {
             if let Some(change) = delta.change(&suspect.name) {
@@ -136,8 +131,7 @@ impl Attribution {
                 suspect.change = Some(change.kind);
             }
         }
-        // A candidate the search names has to be in the list it is ranked against, or `suspects[0]`
-        // is not the best guess.
+        // A candidate the search names must be ranked too, or `suspects[0]` is not the best guess.
         for change in &delta.changes {
             if !self.suspects.iter().any(|s| s.name == change.name) {
                 let mut extra = Suspect::new(change.name.clone(), change.after);

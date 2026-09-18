@@ -1,5 +1,3 @@
-//! The equivalence property, which is the whole safety argument for the incremental front end.
-
 use ply_cli::driver;
 use ply_cli::load::Loaded;
 use ply_store::Store;
@@ -7,9 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// `{:?}` rather than a printed signature: `print_scheme` renames variables per item, which would
-/// paper over exactly the numbering divergence that made canonicalization necessary in the first
-/// place.
+/// `{:?}`, not a printed signature: `print_scheme` renames variables per item and would hide a numbering divergence.
 fn snapshot(loaded: &Loaded) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for (name, hash) in &loaded.hashes.defs {
@@ -54,8 +50,7 @@ fn snapshot(loaded: &Loaded) -> BTreeMap<String, String> {
     out
 }
 
-/// The incremental run goes first so it sees the store as an edit-test loop would, and its result
-/// is returned so a caller can go on to assert what the run published.
+/// The incremental run goes first so it sees the store as an edit-test loop would.
 #[track_caller]
 fn agree(dir: &Path, what: &str) -> Loaded {
     let mut store = Store::open(dir).expect("the cache directory must be creatable");
@@ -231,9 +226,7 @@ fn renaming_a_definition_agrees() {
     agree(dir.path(), "rename a function");
 }
 
-/// The case the resolution witness exists for: a `type` rename changes no hash at all, so nothing
-/// but the witness can tell the front end that every scheme mentioning it is now written in a
-/// different name.
+/// A `type` rename changes no hash, so only the resolution witness can tell the front end.
 #[test]
 fn renaming_a_type_agrees() {
     let dir = corpus();
@@ -290,8 +283,7 @@ fn adding_a_file_agrees() {
     agree(dir.path(), "file added");
 }
 
-/// The case a content-only gate would get wrong: the *referencing* file did not change, so nothing
-/// about its bytes says its dependency is gone.
+/// The referencing file did not change, so nothing about its bytes says its dependency is gone.
 #[test]
 fn deleting_a_file_is_reported_rather_than_skipped_past() {
     let dir = corpus();
@@ -344,7 +336,6 @@ fn adding_and_removing_an_import_agrees() {
     agree(dir.path(), "import removed");
 }
 
-/// A reformat moves the bytes and no hash, so what the run publishes may not move either.
 #[test]
 fn reformatting_agrees() {
     let dir = corpus();
@@ -371,8 +362,6 @@ fn a_dependencys_change_reaches_its_dependents() {
     agree(dir.path(), "dependency changed");
 }
 
-/// A load over texts the store already has the answer for enters the port not at all, and an edit
-/// to one module sends the next load back to it.
 #[test]
 fn an_unchanged_project_is_answered_from_the_store_and_an_edit_asks_again() {
     use ply_codegen::c::producer;
@@ -411,8 +400,6 @@ fn an_unchanged_project_is_answered_from_the_store_and_an_edit_asks_again() {
     assert_eq!(snapshot(&again), snapshot(&edited));
 }
 
-/// `--no-incremental` must neither read nor write the front-end cache, so a run under it can never
-/// be the reason a later run skips something.
 #[test]
 fn the_full_path_writes_no_front_end_cache() {
     let dir = corpus();
@@ -424,7 +411,6 @@ fn the_full_path_writes_no_front_end_cache() {
     );
 }
 
-/// A cache the run cannot believe is a slower run, never a wrong one.
 #[test]
 fn a_corrupt_front_end_cache_degrades_to_the_full_path() {
     let dir = corpus();
@@ -456,8 +442,7 @@ fn a_definition_removed_outright_agrees() {
     agree(dir.path(), "definition removed");
 }
 
-/// Every mutation in sequence against one store, which is what an editing session actually looks
-/// like: each step's fingerprints are whatever the step before it left behind.
+/// One store for every step: each step's fingerprints are whatever the step before left behind.
 #[test]
 fn a_whole_editing_session_agrees_at_every_step() {
     let dir = corpus();
@@ -495,8 +480,7 @@ fn a_whole_editing_session_agrees_at_every_step() {
     agree(dir.path(), "step 7: rename an effect");
 }
 
-/// Two structurally identical definitions in different modules share a `DefHash` while their
-/// schemes name different types.
+/// Structurally identical definitions in two modules share a `DefHash` while their schemes name different types.
 #[test]
 fn two_definitions_that_share_a_hash_each_keep_their_own_interface() {
     let dir = tempfile::tempdir().unwrap();
@@ -525,8 +509,7 @@ fn two_definitions_that_share_a_hash_each_keep_their_own_interface() {
     );
 }
 
-/// Two byte-identical effect declarations are two capabilities, and `x.look` and `y.look` are still
-/// one definition: they differ only by which of the two they name, which no context can observe.
+/// `x.look` and `y.look` are one definition: they differ only by which of two identical effects they name.
 #[test]
 fn identically_declared_effects_in_two_modules_agree() {
     let dir = tempfile::tempdir().unwrap();
@@ -565,8 +548,7 @@ fn identically_declared_effects_in_two_modules_agree() {
     agree(dir.path(), "an unrelated edit");
 }
 
-/// A `type` alias has no constructors, so nothing about it survives in a cached declaration beyond
-/// its arity.
+/// A `type` alias has no constructors, so nothing about it survives in a cached declaration beyond its arity.
 #[test]
 fn a_module_declaring_a_type_alias_agrees() {
     let dir = tempfile::tempdir().unwrap();
@@ -589,8 +571,6 @@ fn a_module_declaring_a_type_alias_agrees() {
     agree(dir.path(), "an unrelated edit");
 }
 
-/// A test added to a file the run already holds: its own hash is new and everything else is where
-/// it was.
 #[test]
 fn a_file_whose_tests_changed_agrees() {
     let dir = tempfile::tempdir().unwrap();
@@ -606,8 +586,6 @@ fn a_file_whose_tests_changed_agrees() {
     agree(dir.path(), "a test added");
 }
 
-/// A test's hash is a function of its body, so a test added with a body the file already holds
-/// hashes to what that body already hashed to.
 #[test]
 fn a_test_added_with_a_body_already_present_agrees() {
     let dir = tempfile::tempdir().unwrap();
@@ -631,8 +609,7 @@ fn a_test_added_with_a_body_already_present_agrees() {
     );
 }
 
-/// The mutations again on real code, which exercises handlers, regions, `nondet` effects and
-/// cross-module types that the synthetic corpus does not.
+/// Real code exercises handlers, regions, `nondet` effects and cross-module types the synthetic corpus does not.
 #[test]
 fn the_example_corpus_agrees_across_a_session() {
     let dir = examples();
@@ -664,13 +641,9 @@ fn the_example_corpus_agrees_across_a_session() {
     agree(dir.path(), "step 4: add a definition");
 }
 
-/// A long shuffle through states that all compile, because the failures worth finding are the ones
-/// nobody thought to write a case for: an invalidation is wrong only in some *sequence* of edits,
-/// and a hand-written case only ever exercises the sequence its author imagined.
 #[test]
 fn a_long_shuffle_of_compiling_states_agrees_at_every_step() {
-    // Each file's variants differ in a way the gates must notice: a body, a signature, a name, a
-    // declaration's shape, an import.
+    // Each file's variants differ in a body, a signature, a name, a declaration's shape, or an import.
     let variants: [(&str, [&str; 3]); 3] = [
         (
             "leaf.ply",
@@ -721,8 +694,7 @@ fn a_long_shuffle_of_compiling_states_agrees_at_every_step() {
     }
 }
 
-/// `str::replace` is not `const`, and the variants above want to be written as edits of the corpus
-/// rather than as three copies that can drift apart.
+/// `str::replace` is not `const`, and the variants are edits of the corpus rather than copies that can drift.
 fn const_str_replace(text: &str, from: &str, to: &str) -> String {
     assert!(text.contains(from), "`{from}` is not in the fixture");
     text.replace(from, to)
@@ -749,8 +721,6 @@ test "the default crosses the module boundary" {
 }
 "#;
 
-/// **The stale-expansion hazard record update refused record update over, checked where defaults do
-/// cross the boundary.**
 #[test]
 fn editing_a_cross_module_default_agrees_and_moves_the_importer() {
     let dir = tempfile::tempdir().unwrap();
@@ -776,8 +746,6 @@ fn editing_a_cross_module_default_agrees_and_moves_the_importer() {
     );
 }
 
-/// The identity the whole design rests on, at the level a user sees: three spellings of one call
-/// are one definition with one hash, so adopting a default or a name re-runs nothing.
 #[test]
 fn the_three_spellings_of_one_call_are_one_definition() {
     let dir = tempfile::tempdir().unwrap();
@@ -805,8 +773,7 @@ pub fn different() -> String = greet("ada", "hi")
     );
 }
 
-/// A `reuse fn` is checked whole-program, so every load has to know the module holds one and have
-/// the body the promise is checked against.
+/// A `reuse fn` is checked whole-program, so every load must know the module holds one and have its body.
 #[test]
 fn a_promise_is_known_on_every_run_and_still_refused() {
     let dir = tempfile::tempdir().unwrap();

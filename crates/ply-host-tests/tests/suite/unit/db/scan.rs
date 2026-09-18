@@ -19,7 +19,6 @@ fn refused(sql: &str) -> Diagnostic {
     }
 }
 
-/// Every refusal has to say where, or a reader is left bisecting their own SQL.
 fn refused_at(sql: &str, byte: usize) -> Diagnostic {
     let d = refused(sql);
     let rendered = format!("{} {}", d.message, d.notes.join(" "));
@@ -37,7 +36,6 @@ fn a_select_names_the_table_it_reads() {
     assert_eq!(ok("select sku from items").tables.written.len(), 0);
 }
 
-/// The hole the milestone exists to close: one label, two tables.
 #[test]
 fn a_join_names_both_tables() {
     assert_eq!(
@@ -94,7 +92,6 @@ fn a_subquery_is_followed_rather_than_ignored() {
     );
 }
 
-/// A CTE name is not a relation, and the relations it read are.
 #[test]
 fn a_cte_resolves_to_its_own_sources() {
     assert_eq!(
@@ -113,8 +110,7 @@ fn a_cte_resolves_to_its_own_sources() {
     );
 }
 
-/// A data-modifying CTE writes, and the write has to reach the footprint or a `db.query[items]`
-/// could insert into `orders` with a read atom recorded.
+/// Otherwise a `db.query[items]` could insert into `orders` with a read atom recorded.
 #[test]
 fn a_data_modifying_cte_reports_its_write() {
     let s = ok("with gone as (delete from stale returning id) select id from gone");
@@ -168,8 +164,7 @@ fn a_delete_writes_its_target_and_reads_its_using_list() {
     assert_eq!(s.tables.read.iter().cloned().collect::<Vec<_>>(), ["items"]);
 }
 
-/// A relation that is both read and written is written: the conflict graph has to serialise it
-/// against every reader, and calling it a read would not.
+/// The conflict graph has to serialise it against every reader.
 #[test]
 fn a_table_read_and_written_by_one_statement_is_a_write() {
     let s = ok("update items set n = n + 1 where sku in (select sku from items where n < 3)");
@@ -186,16 +181,13 @@ fn a_schema_qualified_name_is_its_last_segment() {
     assert_eq!(tables("insert into public.items values ($1)"), ["items"]);
 }
 
-/// Postgres folds an unquoted identifier to lower case and keeps a quoted one, so a scanner that
-/// folded both would give `"Items"` the label `items` and schedule two different relations as one.
+/// Postgres folds only unquoted identifiers, so `"Items"` and `items` are two relations.
 #[test]
 fn case_folding_follows_postgres_rather_than_the_scanner() {
     assert_eq!(tables("SELECT * FROM Items"), ["items"]);
     assert_eq!(tables("select * from \"Items\""), ["Items"]);
     assert_eq!(tables("select * from \"has space\""), ["has space"]);
 }
-
-// --- refusals ---------------------------------------------------------------
 
 #[test]
 fn a_second_statement_is_refused_and_named() {
@@ -208,8 +200,6 @@ fn a_second_statement_is_refused_and_named() {
     refused("insert into items values (1); delete from items");
 }
 
-/// The whole reason the payload class matters: the same bytes are ordinary text inside a literal
-/// and a stacked statement outside one.
 #[test]
 fn a_semicolon_inside_a_literal_is_text() {
     assert_eq!(
@@ -293,14 +283,11 @@ fn constructs_the_scanner_cannot_account_for_are_named_refusals() {
     refused("select * from items limit 1 for share");
     // An upsert's outcome is not reproducible by the engine.
     refused("insert into items values ($1) on conflict do nothing");
-    // Window definitions.
     refused("select rank() over w from items window w as (order by sku)");
-    // A parenthesised join.
     refused("select * from (items join orders on true)");
 }
 
-/// `AS` is a clause boundary everywhere else in the grammar and an output column name in the select
-/// list.
+/// `AS` is a clause boundary everywhere else in the grammar.
 #[test]
 fn an_alias_in_the_select_list_is_a_name_and_not_a_clause() {
     assert_eq!(tables("select id as ident from items"), ["items"]);
@@ -314,14 +301,12 @@ fn an_alias_in_the_select_list_is_a_name_and_not_a_clause() {
         tables("select (select max(n) from orders) as top, sku from items"),
         ["items", "orders"]
     );
-    // And the clauses after it are still clauses.
     assert_eq!(
         tables("select n as v from items where n > $1 order by n limit 3"),
         ["items"]
     );
 }
 
-/// The second half of where the table set comes from.
 #[test]
 fn a_function_the_scanner_will_not_vouch_for_is_refused() {
     for sql in [
@@ -354,7 +339,7 @@ fn a_function_the_scanner_will_not_vouch_for_is_refused() {
     ] {
         ok(sql);
     }
-    // Quoted, it is a name and not a call the scanner has an opinion about.
+    // Quoted, it is a name and not a call.
     assert_eq!(tables("select \"pg_sleep\" from items"), ["items"]);
 }
 
@@ -387,8 +372,7 @@ fn nesting_is_bounded_rather_than_a_stack_overflow() {
     refused(&sql);
 }
 
-/// The scanner is handed a `String` a program can build with `++`, so it is handed adversarial
-/// input by construction.
+/// Programs build statement text with `++`, so the scanner gets adversarial input by construction.
 #[test]
 fn malformed_input_is_a_diagnostic_and_never_a_panic() {
     for sql in [
@@ -424,20 +408,15 @@ fn malformed_input_is_a_diagnostic_and_never_a_panic() {
     }
 }
 
-/// Not a proof, and the design says so: a value is structurally safe because it crosses in a `Bind`,
-/// and statement text is the program's own to get right.
 #[test]
 fn the_injection_payloads_that_change_a_statements_shape_are_refusals() {
     refused("select * from items where sku = '' ; drop table items --'");
-    // Not a refusal, and it does not need to be: the injected arm is a table the scan names, so the
-    // footprint check refuses it against a row that never declared `pg_shadow`.
+    // Not refused here: the injected table is in the scan, so the footprint check refuses it.
     assert_eq!(
         tables("select * from items where sku = '' union select * from pg_shadow --'"),
         ["items", "pg_shadow"]
     );
-    // This one is *not* a refusal either, and pretending otherwise would be the lie: the fragment
-    // is a legal `or`, it reads no new table, and the defence against it is that a parameter never
-    // becomes syntax in the first place.
+    // Not refused: a legal `or` reading no new table; parameters never becoming syntax defends it.
     assert_eq!(
         tables("select * from items where sku = '' or 1=1"),
         ["items"]

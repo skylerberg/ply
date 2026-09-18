@@ -1,5 +1,3 @@
-//! A simulated run is a pure function of its definition set and its seed.
-
 use crate::fixture::Compiled;
 use ply_eval::explore::{Interleaving, Step};
 use ply_eval::{Machine, Plan, Seed, SimMode, explore};
@@ -28,7 +26,6 @@ fn render_step(step: &Step) -> String {
 }
 
 impl Compiled {
-    /// One interleaving of test `index`, at `seed`, with everything it produced.
     fn transcript_of(&self, index: usize, seed: &Seed) -> Transcript {
         let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
         machine.set_seed(seed.clone(), 100_000);
@@ -58,14 +55,11 @@ impl Compiled {
         self.transcript_of(0, seed)
     }
 
-    /// The interleaving as [`explore`] consumes it, for the tests that drive a whole search rather
-    /// than one run.
     fn interleaving_at(&self, index: usize, seed: &Seed) -> Interleaving {
         self.run_at(index, seed).0
     }
 
-    /// One run, with both of the things a search wants from it: what it interleaved, and the world
-    /// it left behind.
+    /// What the run interleaved, and the world it left behind.
     fn run_at(&self, index: usize, seed: &Seed) -> (Interleaving, Vec<String>) {
         let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
         machine.set_seed(seed.clone(), 100_000);
@@ -93,7 +87,6 @@ fn dpor(budget: u32) -> Plan {
     }
 }
 
-/// The lost update.
 const LOST_UPDATE: &str = r#"
 effect counter {
   read  get[r]() -> Int
@@ -124,9 +117,7 @@ test "two increments" {
 }
 "#;
 
-/// Every shape that could plausibly reach something the seed does not name: a three-deep spawn
-/// tree, a task that fails half way through, two tasks woken by one timer, and two tasks drawing
-/// from one `random` stream.
+/// Shapes that could plausibly reach something the seed does not name.
 const SHAPES: &str = r#"
 effect counter {
   read  get[r]() -> Int
@@ -215,7 +206,6 @@ test "two tasks drawing from one stream" {
 }
 "#;
 
-/// Every test in [`SHAPES`], by index, with a name for the failure message.
 const SHAPE_NAMES: [&str; 4] = [
     "a deep task tree",
     "a task that fails part way through an interleaving",
@@ -223,8 +213,6 @@ const SHAPE_NAMES: [&str; 4] = [
     "two tasks drawing from one stream",
 ];
 
-/// The same, over a wide seed range and every fixture shape, so that a dependence on something the
-/// seed does not name has many chances to show.
 #[test]
 fn every_shape_reproduces_itself_at_every_seed_in_a_range() {
     let compiled = Compiled::named("t", SHAPES);
@@ -238,7 +226,6 @@ fn every_shape_reproduces_itself_at_every_seed_in_a_range() {
     }
 }
 
-/// A run must be a function of the *definition set*, not of the source text.
 #[test]
 fn an_edit_that_changes_no_hash_changes_no_interleaving() {
     let plain = Compiled::named("t", LOST_UPDATE);
@@ -262,8 +249,6 @@ fn an_edit_that_changes_no_hash_changes_no_interleaving() {
     }
 }
 
-/// The search is itself part of the run's determinism: which interleaving comes next is as much a
-/// function of the seed as which task comes next.
 #[test]
 fn the_whole_search_is_a_function_of_its_plan() {
     let compiled = Compiled::named("t", SHAPES);
@@ -284,8 +269,6 @@ fn the_whole_search_is_a_function_of_its_plan() {
     }
 }
 
-/// A budget is a search parameter and not a semantics: the value and the world a region delivers
-/// are those of the interleaving its seed names, whatever else the search went on to explore.
 #[test]
 fn the_budget_and_the_mode_do_not_change_what_the_seed_names() {
     let compiled = Compiled::named("t", SHAPES);
@@ -319,7 +302,6 @@ fn the_budget_and_the_mode_do_not_change_what_the_seed_names() {
     }
 }
 
-/// Two `simulate` regions in one test, in sequence.
 const TWO_REGIONS: &str = r#"
 effect counter {
   read  get[r]() -> Int
@@ -356,8 +338,6 @@ test "a race in the first region and a quiet second one" {
 }
 "#;
 
-/// A `simulate` region reached twice through an ordinary call, which is the same shape without the
-/// syntax pointing at it.
 const REGION_IN_A_HELPER: &str = r#"
 effect counter {
   read  get[r]() -> Int
@@ -393,7 +373,6 @@ test "the same region twice through a call" {
 }
 "#;
 
-/// **BLOCKER.**
 #[test]
 fn a_second_simulate_region_does_not_hide_the_first_regions_race() {
     for (source, name) in [
@@ -408,7 +387,6 @@ fn a_second_simulate_region_does_not_hide_the_first_regions_race() {
             compiled.interleaving_at(0, seed)
         });
 
-        // The race is real: a sample finds it.
         let sampled = explore(&Plan::random(64), &mut |seed: &Seed| {
             compiled.interleaving_at(0, seed)
         });
@@ -432,7 +410,6 @@ fn a_second_simulate_region_does_not_hide_the_first_regions_race() {
     }
 }
 
-/// **BLOCKER.**
 #[test]
 fn a_legal_program_is_never_reported_as_a_simulation_divergence() {
     let compiled = Compiled::named(
@@ -504,8 +481,6 @@ test "the second region's shape depends on what the first raced to" {
     }
 }
 
-/// The rule `ply-eval::sim`, `sched`, `explore` and `region` each enforce on themselves, enforced
-/// across the seam that binds them instead.
 #[test]
 fn the_machines_simulated_seam_reads_nothing_a_seed_does_not_name() {
     let source = concat!(
@@ -516,8 +491,7 @@ fn the_machines_simulated_seam_reads_nothing_a_seed_does_not_name() {
         .split_once("mod tests")
         .map(|(body, _)| body)
         .unwrap_or(source);
-    // The machine legitimately holds hash maps for its name tables, which are looked up by key and
-    // never iterated.
+    // Not `HashMap`: the machine's name tables use it, looked up by key and never iterated.
     for banned in [
         "SystemTime",
         "Instant",

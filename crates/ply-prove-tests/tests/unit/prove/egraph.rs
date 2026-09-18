@@ -23,7 +23,6 @@ fn an_asserted_disequality_between_equal_terms_contradicts() {
     assert!(classes.contradiction);
 }
 
-/// Shapes of different kinds never conflict.
 #[test]
 fn shapes_of_different_kinds_conclude_nothing() {
     assert_eq!(conflict(&Shape::Int(1), &Shape::Bool(true)), None);

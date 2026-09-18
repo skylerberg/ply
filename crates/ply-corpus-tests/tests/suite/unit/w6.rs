@@ -6,16 +6,14 @@ fn point(layer: Layer, with: f64, without: f64) -> Point {
         taken_on: "/items".to_string(),
         with_micros: with,
         without_micros: without,
-        // A 1% spread on every rung, so a band exists to be reasoned about and no test depends
-        // on one having been taken once.
+        // A 1% spread, so every rung has a band.
         with_worst_micros: Some(with * 1.01),
         without_worst_micros: Some(without * 1.01),
         requests: 1000,
     }
 }
 
-/// One rung per layer, summing to 100µs of a 120µs request: 60µs of interpreter (50%), 40µs of
-/// host, 20µs of residue.
+/// One rung per layer: 100µs of a 120µs request, 60µs interpreter, 40µs host, 20µs residue.
 fn full_points() -> Vec<Point> {
     vec![
         point(Layer::Call, 5.0, 0.0),
@@ -97,8 +95,6 @@ fn every_layer_is_in_the_order_and_carries_its_prose() {
     );
 }
 
-/// The residue is the whole point of the table: a ladder that attributed everything would be
-/// hiding what it did not separate.
 #[test]
 fn a_ladder_reports_its_layers_its_residue_and_a_lower_bound_share() {
     let ladder = Ladder::assemble(4.0, 120.0, &full_points()).unwrap();
@@ -149,7 +145,6 @@ fn a_ladder_refuses_what_a_share_cannot_be_read_off() {
     assert!(err.contains("names no route"), "{err}");
 }
 
-/// Two rungs on two routes have a difference that is not one layer.
 #[test]
 fn a_route_change_between_two_rungs_is_an_audit_finding() {
     let mut points = full_points();
@@ -173,8 +168,6 @@ fn a_negative_layer_is_reported_rather_than_clamped() {
     assert!((ladder.worst_negative_share - 6.0 / 120.0).abs() < 1e-9);
 }
 
-/// A layer whose repeats span zero has not measured its own sign, and two decimals of it are
-/// two decimals of the machine it ran on.
 #[test]
 fn a_layer_narrower_than_its_own_repeats_is_named_rather_than_printed() {
     let mut points = full_points();
@@ -201,8 +194,6 @@ fn a_layer_narrower_than_its_own_repeats_is_named_rather_than_printed() {
     );
 }
 
-/// A negative residue is the layers summing to more than the request they were read against,
-/// which can only be the in-process arena over-counting.
 #[test]
 fn a_negative_residue_is_charged_to_the_share_the_decision_reads() {
     let mut points = full_points();
@@ -231,15 +222,12 @@ fn a_negative_residue_is_charged_to_the_share_the_decision_reads() {
         ladder.conservative_share
     );
 
-    // And the other direction: a positive residue is credited to nobody, so the share stays
-    // exactly what the rungs attributed.
+    // A positive residue is credited to nobody, so the share stays what the rungs attributed.
     let positive = Ladder::assemble(4.0, 120.0, &full_points()).unwrap();
     assert!(positive.residue_micros > 0.0);
     assert!((positive.conservative_share - positive.interpreter_share).abs() < 1e-9);
 }
 
-/// The share is one number read off one run, and M9's whole case is on which side of 50% it
-/// falls.
 #[test]
 fn a_share_whose_repeats_straddle_the_bar_decides_nothing() {
     let mut points = full_points();
@@ -273,8 +261,7 @@ fn a_share_whose_repeats_straddle_the_bar_decides_nothing() {
     );
     assert!(decision.reopens_at.contains("repeat the ladder"));
 
-    // C3 is checked before it, because C3 reads no share: an unpriced lever defers whatever the
-    // band does.
+    // C3 is checked first: an unpriced lever defers whatever the band does.
     let deferred = decide(&straddling, Some(&spike(3.0)), &[], &Criteria::default());
     assert_eq!(deferred.verdict, Verdict::Defer);
 }
@@ -289,8 +276,6 @@ fn amdahl_is_the_projection_and_the_ceiling_is_its_limit() {
     assert!((ceiling(0.35) - 1.5384615).abs() < 1e-6);
 }
 
-/// A speedup is the weakest input's, and a disagreement or an overlap is not a slower speedup —
-/// it is no measurement at all.
 #[test]
 fn a_spike_is_evidence_only_when_it_agreed_and_separated_on_enough_inputs() {
     let good = spike(4.0);
@@ -341,7 +326,6 @@ fn a_missing_rung_or_a_missing_spike_is_undecided_rather_than_deferred() {
     assert!(decision.reasons[0].contains("negative"));
 }
 
-/// The withdrawal of the ladder, in code: the ladder answers about what it measured.
 #[test]
 fn a_verdict_names_the_workload_it_was_taken_on_and_never_names_a_milestone() {
     let full = report(full_points());
@@ -394,8 +378,7 @@ fn an_unpriced_alternative_defers_whatever_the_share_says() {
         "{:?}",
         decision.reasons
     );
-    // The share and the spike both clear their bars here, so what reopens M9 is the pricing and
-    // not either of them: 1 + (1.80 − 1)/2.
+    // Share and spike both clear their bars, so the pricing is what reopens M9: 1 + (1.80 − 1)/2.
     assert!(
         decision.reopens_at.contains("1.40x end to end"),
         "{}",
@@ -434,7 +417,6 @@ fn an_unpriced_alternative_under_a_small_share_still_names_the_share() {
     );
 }
 
-/// **C3 is checked against the cheaper levers, not against the file.**
 #[test]
 fn a_report_that_prices_no_lever_at_all_defers_and_names_all_seven() {
     let ladder = Ladder::assemble(4.0, 120.0, &full_points()).unwrap();
@@ -456,8 +438,6 @@ fn a_report_that_prices_no_lever_at_all_defers_and_names_all_seven() {
     assert_eq!(c3_gaps(&[]).len(), LEVERS.len());
 }
 
-/// The same hole through the values rather than through the field: a lever may be claimed as
-/// priced, but a claim with nothing behind it is not a measurement and does not answer C3.
 #[test]
 fn a_lever_priced_without_evidence_is_not_priced() {
     let ladder = Ladder::assemble(4.0, 120.0, &full_points()).unwrap();
@@ -614,8 +594,6 @@ fn report(points: Vec<Point>) -> Report {
     }
 }
 
-/// The audit is what makes the honest account a requirement rather than an intention: a report
-/// missing a section says so above its own tables.
 #[test]
 fn the_audit_names_every_section_the_report_owes() {
     let complete = report(full_points());
@@ -651,8 +629,6 @@ fn the_audit_names_every_section_the_report_owes() {
     );
 }
 
-/// A measurement file may not carry the bar it is about to clear, so the rendered verdict is
-/// recomputed from `Criteria::default` every time.
 #[test]
 fn a_report_renders_its_tables_and_recomputes_its_verdict() {
     let out = render(&report(full_points()));
@@ -677,8 +653,6 @@ fn a_report_renders_its_tables_and_recomputes_its_verdict() {
     assert!(rendered.spike.unwrap().evidence);
 }
 
-/// A report round-trips as JSON: the two measuring agents produce the halves separately and the
-/// decision is taken over the merged file.
 #[test]
 fn a_report_round_trips_through_json_without_carrying_a_verdict() {
     let original = report(full_points());

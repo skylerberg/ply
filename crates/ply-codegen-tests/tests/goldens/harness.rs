@@ -1,5 +1,3 @@
-//! What holds the port without the reference: the goldens, and the door into the port.
-
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -16,15 +14,7 @@ pub fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
-/// One dump beside every input, as files under `fixtures/goldens/<phase>/`: the specification the
-/// port is held to, in the tree, so that it survives the Rust reference's retirement
-/// (ADR 0050 §2).
-///
-/// The golden has to exist and the port has to agree with it. That is the whole check: nothing
-/// recomputes a reference dump to compare against, so the goldens are what the phase means.
-/// With `PLY_DIFF_BLESS` set, [`golden::check`] rewrites the golden from the **port's** answer --
-/// it used to take the reference's -- which makes blessing a deliberate act of moving the
-/// specification rather than of re-deriving it from a second implementation.
+/// One golden dump per input under `fixtures/goldens/<phase>/`; `PLY_DIFF_BLESS` rewrites them from the port's answer.
 pub mod golden {
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -38,10 +28,7 @@ pub mod golden {
         std::env::var_os("PLY_DIFF_BLESS").is_some()
     }
 
-    /// Where `phase`'s golden for `name` lives, and which record of it: a bundle's records,
-    /// named `<bundle>#<i>`, share one file, `<phase>/<bundle>.dumps`, one record per `%%% <i>`
-    /// line; every other input has `<phase>/<name>.dump` to itself. Characters a file name cannot
-    /// carry portably are written as `_`.
+    /// A bundle's records, `<bundle>#<i>`, share `<phase>/<bundle>.dumps`; every other input has `<phase>/<name>.dump`.
     pub fn place(phase: &str, name: &str) -> (PathBuf, Option<usize>) {
         let safe = |s: &str| -> String {
             s.chars()
@@ -64,8 +51,7 @@ pub mod golden {
         }
     }
 
-    /// Holds `port` to the golden, or rewrites the golden from it when blessing. `diff` is the
-    /// phase's own first-difference report, `diff(want, got)`.
+    /// `diff(want, got)` is the phase's own first-difference report.
     pub fn check(
         phase: &str,
         name: &str,
@@ -117,8 +103,7 @@ pub mod golden {
         })
     }
 
-    /// The first record a bless writes to a bundle's file in this process starts it afresh, and
-    /// the rest append, so a bless is the run's own order and nothing older survives in it.
+    /// The first record a bless writes to a bundle's file in this process truncates it; the rest append.
     fn write(path: &Path, index: Option<usize>, text: &str) {
         static STARTED: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
         if let Some(parent) = path.parent() {
@@ -144,20 +129,13 @@ pub mod golden {
     }
 }
 
-/// The port, entered in-process: the self-hosted compiler as the binary carries it, compiled,
-/// each phase called with its input and answering the dump the reference side is compared to.
-///
-/// The bundle is the compiler, and the fixpoint test in `crates/ply-codegen-tests` is what says
-/// it was emitted from the sources in the tree; a working copy is entered through
-/// `PLY_C_EMITTER=ply:<dir>` once `stage` has bootstrapped it.
+/// The self-hosted compiler the binary carries; `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
 pub mod port {
     use ply_eval::{Fields, Value};
     use ply_span::Symbol;
     use std::sync::Arc;
 
-    /// Enters `name` -- `module.function`, as the sources spell it -- and answers the string it
-    /// returned. A raise, a missing entry or a non-string answer is the harness's own failure and
-    /// panics with the reason.
+    /// `name` is `module.function`; a raise, a missing entry or a non-string answer panics.
     pub fn call(name: &str, args: &[Value]) -> String {
         ply_codegen::c::producer::ensure_default();
         match ply_codegen::c::producer::call(name, args) {
@@ -195,9 +173,7 @@ pub mod port {
     }
 }
 
-/// The items at positions `index`, `index + of`, `index + 2·of`, …: one round-robin part of a
-/// corpus, for a differential too long to be one test. CI's partitions are bounded by their
-/// slowest single test, and dealing a corpus this way keeps every part the same shape.
+/// The items at `index`, `index + of`, …: dealing round-robin keeps every CI partition the same shape.
 pub fn part<T: Clone>(items: &[T], index: usize, of: usize) -> Vec<T> {
     items
         .iter()
@@ -207,8 +183,7 @@ pub fn part<T: Clone>(items: &[T], index: usize, of: usize) -> Vec<T> {
         .collect()
 }
 
-/// A program bundle: programs separated by a line holding exactly `%%%`, modules within one by a
-/// line holding exactly `%%`, and each module's first line its dotted name.
+/// Programs separated by a `%%%` line, modules by a `%%` line, each module's first line its dotted name.
 pub fn programs(text: &str) -> Vec<Vec<(String, String)>> {
     let mut out = Vec::new();
     // Everything before the first separator is the bundle's header, not a program.
@@ -297,13 +272,10 @@ pub mod own {
     }
 }
 
-/// The dump as a list of records, for a diff that names the first disagreement instead of printing
-/// two multi-megabyte strings.
 pub fn records(dump: &str) -> Vec<&str> {
     dump.split_terminator(';').collect()
 }
 
-/// The fixtures in a bundle file, in order.
 pub fn bundle(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur: Option<String> = None;
@@ -330,9 +302,7 @@ fn strip_one_newline(mut s: String) -> String {
     s
 }
 
-/// The compiled compiler's cost, held to `benches/compiled-compiler.json` (ADR 0051 §2): what
-/// its entries allocated and recycled, which do not vary with a machine, and the most chunk
-/// bytes one held, which varies with how the chunks grew.
+/// The compiled compiler's cost, held to `benches/compiled-compiler.json`.
 pub mod census {
     use std::path::PathBuf;
 
@@ -342,9 +312,7 @@ pub mod census {
         super::repo_root().join(FILE)
     }
 
-    /// Holds the thread's census since the last reset to the file's entry for `key`, within one
-    /// per cent on the counts and a quarter on the chunk bytes. A missing entry fails with the
-    /// reading, which is what the file is written from.
+    /// A missing entry fails with the reading, which is what the file is written from.
     pub fn hold(key: &str, lines: usize) -> Result<(), String> {
         let got = ply_codegen::c::producer::census();
         let reading = serde_json::json!({

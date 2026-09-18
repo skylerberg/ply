@@ -1,5 +1,3 @@
-//! Adversarial probes for the one property the region model may not break.
-
 use ply_core::check_program;
 use ply_span::{SourceId, SourceMap};
 use ply_syntax::ast::{ModuleName, Program};
@@ -17,7 +15,7 @@ fn load(src: &str) -> (Program, Resolved) {
     (program, resolved)
 }
 
-/// **A route out of a region that the escape brand says is closed, and is not.**
+/// A route out of a region that the escape brand says is closed, and is not.
 #[test]
 fn a_general_clause_inside_a_region_carries_that_regions_atoms_out_of_it() {
     let src = r#"

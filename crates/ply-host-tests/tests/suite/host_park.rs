@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 
 const ALONE: Owner = (MachineId(0), None);
 
-/// How long the query is given once the socket is also outstanding.
 const PATIENCE: Duration = Duration::from_secs(10);
 
 fn free_port() -> u16 {
@@ -53,7 +52,6 @@ fn open(cluster: &Cluster) -> Host {
     .expect("the pool opens")
 }
 
-/// A `select` through the driver, left outstanding.
 fn query(db: &Postgres) -> Pending {
     const SQL: &str = "select id from ledger";
     let scan = db::scan::scan(SQL, Span::DUMMY).expect("the statement scans");
@@ -92,7 +90,7 @@ fn a_query_resolves_while_an_accept_nobody_will_answer_is_outstanding() {
     let host = open(&cluster);
     let runtime = host.runtime();
 
-    // The socket half: a listener nobody will ever connect to, with an `accept` parked on it.
+    // A listener nobody connects to, with an `accept` parked on it.
     let at = Resource::Named(Symbol::new("listener"));
     let listener = value(
         host.net().listen(&at, free_port(), Span::DUMMY),
@@ -103,8 +101,7 @@ fn a_query_resolves_while_an_accept_nobody_will_answer_is_outstanding() {
     };
     let accept = pending(host.net().accept(&at, listener, Span::DUMMY), "the accept");
 
-    // The database half, issued after the accept is already parked, which is the order a spawned
-    // task would produce.
+    // Issued after the accept is parked, the order a spawned task produces.
     let db = host.database().expect("a database").clone();
     let answer = query(&db);
 
@@ -125,16 +122,12 @@ fn a_query_resolves_while_an_accept_nobody_will_answer_is_outstanding() {
         "the query answered {resolved}"
     );
 
-    // And the socket is still waiting, which is what makes the assertion above about the park
-    // rather than about an accept that happened to return.
     assert!(
         runtime.poll(&accept).expect("the token is ours").is_none(),
         "the accept resolved, so the park had a socket event to wake on and this proved nothing"
     );
 }
 
-/// And the reason it resolves: the two facilities mint from disjoint ranges, so "did you mint this
-/// token" has one answer.
 #[test]
 fn the_two_facilities_mint_tokens_that_cannot_collide() {
     if !cluster::available() {

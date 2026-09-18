@@ -1,6 +1,3 @@
-//! What a frame push and a scope binding cost the allocator once the machine is warm, and that
-//! reusing a link cannot make two owners disagree.
-
 use crate::counting::charge;
 use ply_eval::{Frame, Next, Stack, Value};
 use ply_span::Span;
@@ -10,8 +7,7 @@ fn counted<T>(f: impl FnOnce() -> T) -> (T, usize) {
     (out, allocs)
 }
 
-/// A frame that carries a value the test can read back, so a recycled link is checked for what it
-/// holds rather than only for how many it holds.
+/// Carries a readable value, so a recycled link is checked for its contents and not just its count.
 fn marker(n: i64) -> Frame {
     Frame::BinaryApply {
         op: ply_syntax::ast::BinOp::Add,
@@ -22,8 +18,7 @@ fn marker(n: i64) -> Frame {
     }
 }
 
-/// Pops the whole stack into `out`, which the caller supplies so that a measured region does not
-/// pay for the test's own bookkeeping.
+/// The caller supplies `out` so a measured region does not pay for the test's bookkeeping.
 fn drain_into(mut stack: Stack, out: &mut Vec<i64>) {
     loop {
         match stack.into_next() {
@@ -69,11 +64,6 @@ fn a_warm_frame_push_allocates_nothing() {
     );
 }
 
-// The scope-binding twin of the frame test above died with the persistent chain: a binding is a
-// slot write into the machine-owned window, which allocates only when the window vector grows.
-
-/// The hazard a free list introduces, and the only one: a link two owners hold must not be recycled
-/// when the first of them lets go.
 #[test]
 fn a_chain_two_owners_hold_survives_the_first_letting_go() {
     let mut shared = Stack::new();
@@ -82,11 +72,9 @@ fn a_chain_two_owners_hold_survives_the_first_letting_go() {
     }
     let survivor = shared.clone();
 
-    // The first owner retires every link and offers each to the pool.
     assert_eq!(drain(shared).len(), DEPTH as usize);
 
-    // Enough pushes to hand out every link the pool could have taken, each carrying a marker that
-    // would be visible if a shared link were reused.
+    // Enough pushes to empty the pool; a reused shared link would show up as a wrong marker.
     let mut later = Stack::new();
     for n in 0..DEPTH * 4 {
         later = later.pushed(marker(-1 - n));
@@ -101,7 +89,6 @@ fn a_chain_two_owners_hold_survives_the_first_letting_go() {
     assert_eq!(drain(later).len(), (DEPTH * 4) as usize);
 }
 
-/// What the free list can hold, so its memory cost is a number rather than a hope.
 #[test]
 fn the_pools_upper_bound_is_stated_in_bytes() {
     let frame = std::mem::size_of::<Frame>();

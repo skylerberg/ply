@@ -26,8 +26,7 @@ fn run_task() {
     unsafe { switch(&mut *main, task) };
 }
 
-/// The address of a sixteen-byte-aligned local, which is aligned only if the frame was
-/// entered as the ABI requires; a trampoline that enters off by a word is caught here.
+/// Aligned only if the frame was entered as the ABI requires, so a trampoline off by a word is caught.
 #[inline(never)]
 fn aligned_local() -> usize {
     #[repr(align(16))]

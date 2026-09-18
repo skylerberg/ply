@@ -1,4 +1,4 @@
-//! The three numbers M7 spends and, before this module, never priced.
+//! Prices the simulation search: reduction, race-finding power and seed rate.
 
 use crate::pipeline::{Front, front};
 use anyhow::{Context, Result, bail};
@@ -9,12 +9,10 @@ use serde::Serialize;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// A test the search has something to say about: its footprint carries `sim.read`, so its outcome
-/// is a function of its definitions *and* a seed.
+/// A test whose footprint carries `sim.read`, so its outcome depends on a seed.
 struct Seeded {
     key: String,
-    /// Where the machine finds it, which is not its index in `CheckOutput`: the incremental front
-    /// end reports tests from modules it never parsed.
+    /// Not its `CheckOutput` index, which counts tests from modules the front end never parsed.
     module: Symbol,
     ordinal: usize,
 }
@@ -39,18 +37,14 @@ fn seeded_tests(front: &Front) -> Vec<Seeded> {
         .collect()
 }
 
-/// Whole-test replay at one seed, which is what `ply_test::InterpExecutor` does and this repeats
-/// rather than reuses: the runner drives a whole suite through a thread pool and a cache, and a
-/// measurement of the search must not be a measurement of those.
+/// Whole-test replay at one seed, without the runner's thread pool and cache.
 struct Driver<'a> {
     front: &'a Front,
     test: &'a Seeded,
     steps: u32,
     /// Interleavings run.
     runs: u32,
-    /// Hand the search a recording with no vector clocks on it, which is
-    /// [`ply_eval::sched::happens_before`]'s documented "no synchronization known" case and
-    /// therefore exactly the search as it behaved before clocks existed.
+    /// Withhold vector clocks, so the search sees no synchronization.
     blind: bool,
 }
 
@@ -99,17 +93,14 @@ pub struct TestReduction {
     pub key: String,
     /// Interleavings the footprint-guided search ran.
     pub pruned: u32,
-    /// The same search with the recording's vector clocks withheld, so a pair the join graph
-    /// already ordered is queued as though it were a race.
+    /// The same search with vector clocks withheld.
     pub unsynchronized: u32,
     pub unsynchronized_bounded: bool,
-    /// Interleavings the same search ran with the dependence relation forced to `true`, which is
-    /// exhaustive enumeration of every schedule respecting per-task order and enabledness.
+    /// The same search with dependence forced to `true`: exhaustive enumeration.
     pub naive: u32,
     /// The naive search spent its budget, so `naive` is a lower bound and the ratio is one too.
     pub naive_bounded: bool,
-    /// The pruned search spent its budget, so it proved nothing about the interleavings it did not
-    /// reach and the ratio understates both sides.
+    /// The pruned search spent its budget, so the ratio understates both sides.
     pub pruned_bounded: bool,
     pub pruned_exhaustive: bool,
     pub reduction: f64,
@@ -170,8 +161,7 @@ pub fn reduction(root: &Path, budget: u32, steps: u32) -> Result<Vec<TestReducti
         .collect()
 }
 
-/// One trial: a search started from one root, and what it cost to reach the failure — or that it
-/// did not reach one.
+/// One search from one root, and the interleavings it took to reach the failure, if it did.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Trial {
     pub root: u64,
@@ -297,12 +287,10 @@ pub fn summarize(trials: &[Trial]) -> (Option<f64>, Option<u32>, usize) {
 pub struct SeedRate {
     pub key: String,
     pub definitions: usize,
-    /// Interleavings run, which is what the wall clock was spent on.
     pub interleavings: u32,
     pub millis: f64,
     pub seeds_per_second: f64,
-    /// Scheduling steps across the run, so a rate can be read against the size of what it was
-    /// scheduling rather than only against the program's.
+    /// Scheduling steps across the run.
     pub steps: u64,
     /// The sample hit a failing interleaving and stopped, so fewer seeds ran than were asked for.
     pub stopped_early: bool,
@@ -428,8 +416,7 @@ pub fn render(m: &SimMeasurements) -> String {
     out
 }
 
-/// A statistic over trials that did not all find the failure is reported with the misses attached,
-/// never as a bare number.
+/// A statistic over trials with misses carries the miss count.
 pub fn stat(value: Option<f64>, misses: usize) -> String {
     match (value, misses) {
         (None, _) => "never".to_string(),
@@ -438,8 +425,7 @@ pub fn stat(value: Option<f64>, misses: usize) -> String {
     }
 }
 
-/// A count whose search stopped at its budget is a lower bound and prints as one; a count nobody
-/// bounded prints bare.
+/// A count whose search hit its budget is a lower bound and prints as one.
 fn bound(count: u32, bounded: bool) -> String {
     if bounded {
         format!(">={count}")
@@ -448,8 +434,7 @@ fn bound(count: u32, bounded: bool) -> String {
     }
 }
 
-/// A ratio over a bounded numerator is bounded too, and printing it bare is the one place this
-/// table could claim a number nobody observed.
+/// A ratio over a bounded numerator is bounded too.
 fn ratio(reduction: f64, bounded: bool) -> String {
     if bounded {
         format!(">={reduction:.1}×")
@@ -466,7 +451,6 @@ fn clip(s: &str, width: usize) -> String {
     format!("{head}…")
 }
 
-/// Everything, against one corpus.
 pub fn measure(
     root: &Path,
     trials: u32,

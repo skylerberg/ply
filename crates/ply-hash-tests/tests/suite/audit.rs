@@ -32,8 +32,6 @@ fn unchanged(what: &str, before: &str, after: &str, name: &str) {
     assert_eq!(def(before, name), def(after, name), "{what}: hash changed");
 }
 
-// False negatives: a real change that must move the hash.
-
 #[test]
 fn swapping_two_arguments_at_a_call_site_changes_the_hash() {
     changed(
@@ -352,8 +350,6 @@ fn a_match_binder_that_captures_a_parameter_changes_the_hash() {
     );
 }
 
-/// `db` and `audit` declare the same operations, so performing one and performing the other differ
-/// by a consistent renaming and by nothing a hash may see.
 #[test]
 fn a_definition_that_chooses_between_look_alike_effects_is_distinguishable() {
     let source = |handled: &str| {
@@ -374,8 +370,7 @@ fn a_definition_that_chooses_between_look_alike_effects_is_distinguishable() {
     );
 }
 
-/// Aliases are expanded by the checker, so `Meters` and `Feet` below are both literally `Int` and
-/// swapping one for the other is genuinely a no-op.
+/// Aliases expand to `Int`, so swapping them is genuinely a no-op.
 #[test]
 fn swapping_two_transparent_type_aliases_is_free() {
     let source = |ty: &str| {
@@ -460,8 +455,6 @@ fn editing_a_body_moves_every_transitive_dependent_and_the_test() {
     }
     assert_ne!(before.tests, after.tests, "the test hash did not move");
 }
-
-// False positives: a no-op edit that must not move the hash.
 
 #[test]
 fn renaming_a_top_level_definition_through_several_callers_is_free() {
@@ -684,8 +677,6 @@ fn renaming_a_test_is_free_but_its_body_is_not() {
     );
 }
 
-// Determinism and structural sanity.
-
 #[test]
 fn hashing_is_stable_across_repeated_runs() {
     let source = include_str!("../../../../examples/ledger.ply");
@@ -709,7 +700,6 @@ fn every_definition_in_a_realistic_module_gets_a_distinct_hash_unless_identical(
     );
 }
 
-/// Normalization walks the expression tree recursively.
 #[test]
 fn a_long_operator_chain_does_not_overflow_the_stack() {
     let chain = std::iter::repeat_n("a", 20_000)
@@ -732,9 +722,7 @@ fn next(state: &mut u64) -> u64 {
     *state
 }
 
-/// Definitions are hashed in the order Tarjan emits components, and a reference is written as the
-/// referent's hash, so a component emitted before one it depends on would silently fall back to an
-/// opaque self-marker and collapse distinct references onto the same bytes.
+/// A component hashed before one it depends on would fall back to an opaque self-marker.
 #[test]
 fn randomized_acyclic_modules_hash_independently_of_item_order() {
     let mut seed = 0x5eed_1234_u64;
@@ -818,10 +806,6 @@ fn randomized_graphs_are_emitted_in_reverse_topological_order() {
     }
 }
 
-// --- `law/host` -------------------------------------------------------------
-
-/// A law that may reach the world: `law/host` is part of the law's own hash, written after `tag::LAW` exactly as
-/// `TestDef::nondet` is written after `tag::TEST`.
 #[test]
 fn declaring_a_law_host_changes_the_law_and_no_definition() {
     const PLAIN: &str = "\
@@ -856,9 +840,6 @@ law/host \"f grows\"
     );
 }
 
-// Record update.
-
-/// **The record-update invariant.**
 #[test]
 fn record_update_hashes_as_its_expansion() {
     const SIG: &str = "fn f(s: {a: Int, b: Int, c: Int}) -> {a: Int, b: Int, c: Int} = ";
@@ -879,8 +860,7 @@ fn record_update_hashes_as_its_expansion() {
          proves nothing about which expansion was emitted"
     );
 
-    // Names of *differing length*, because `a`/`b`/`c` cannot tell lexicographic order apart from
-    // any comparator that ties-breaks on length first — and a longhand a reader writes from the canonical expansion has to match the emitted order for real field names, not just short ones.
+    // Names of differing length, so the emitted order is told apart from a length-first comparator.
     const WIDE: &str = "type R = {aa: Int, z: Int, k: Int}\nfn f(s: R) -> R = ";
     unchanged(
         "record update with field names of differing length",
@@ -897,9 +877,7 @@ fn record_update_hashes_as_its_expansion() {
     );
 }
 
-/// The copies are sorted by field name rather than emitted in the type's declaration order, so that
-/// `reordering_the_fields_of_a_record_type_is_free` keeps holding for a definition written with the
-/// sugar.
+/// Copies are sorted by field name, not declaration order.
 #[test]
 fn reordering_the_updated_type_is_still_free() {
     unchanged(
@@ -910,8 +888,6 @@ fn reordering_the_updated_type_is_still_free() {
     );
 }
 
-/// The shape is found by following this module's alias chain, and what comes out is the same
-/// expansion the reader would have written.
 #[test]
 fn updating_through_a_type_alias_hashes_as_its_expansion() {
     const DECLS: &str = "type R = {a: Int, b: Int}\ntype S = R\n";
@@ -923,7 +899,6 @@ fn updating_through_a_type_alias_hashes_as_its_expansion() {
     );
 }
 
-/// A projected base is copied as written, once per field, exactly as the longhand copies it.
 #[test]
 fn a_projected_base_hashes_as_its_expansion() {
     const DECLS: &str = "type L = {pp: Int, q: Int, r: Int}\ntype W = {lim: L, tag: Int}\n";
@@ -942,7 +917,6 @@ fn a_projected_base_hashes_as_its_expansion() {
     );
 }
 
-/// Changing which field an update replaces is a real change and must move the hash.
 #[test]
 fn changing_the_updated_field_changes_the_hash() {
     changed(
@@ -953,9 +927,6 @@ fn changing_the_updated_field_changes_the_hash() {
     );
 }
 
-// The `?` operator.
-
-/// **The `?` invariant.**
 #[test]
 fn try_hashes_as_its_longhand() {
     const DECLS: &str = "type E = {msg: Int}\nfn g(n: Int) -> Result<Int, E> = Ok(n)\n";
@@ -972,8 +943,7 @@ fn try_hashes_as_its_longhand() {
          proves nothing about which order was emitted"
     );
 
-    // The `let`-bound shape, which is what every corpus conversion is: the `let`'s own pattern
-    // becomes the success arm's binder and the `let` is gone.
+    // The `let`'s own pattern becomes the success arm's binder and the `let` is gone.
     let bound = format!("{DECLS}{SIG}{{ let a = g(n)?; let b = g(a)?; Ok(a + b) }}");
     let bound_long = format!(
         "{DECLS}{SIG}match g(n) {{\n\
@@ -983,8 +953,7 @@ fn try_hashes_as_its_longhand() {
     );
     unchanged("two `?`s in a run", &bound, &bound_long, "f");
 
-    // `db.ply:1000`, verbatim in shape: the continuation is a tail call and the expansion leaves it
-    // in tail position.
+    // The continuation is a tail call and the expansion leaves it in tail position.
     let tail = format!("{DECLS}{SIG}g(g(n)?)");
     let tail_long = format!("{DECLS}{SIG}match g(n) {{ Err(er) -> Err(er), Ok(c) -> g(c) }}");
     unchanged("`?` in a tail-call argument", &tail, &tail_long, "f");
@@ -1006,8 +975,7 @@ fn try_hashes_as_its_longhand() {
     );
 }
 
-/// Without this the invariance above could be satisfied by a hash that ignored what the `?` was
-/// applied to.
+/// Otherwise the invariance above holds for a hash that ignores what `?` was applied to.
 #[test]
 fn changing_what_a_try_unwraps_changes_the_hash() {
     const DECLS: &str = "type E = {msg: Int}\n\
@@ -1021,8 +989,6 @@ fn changing_what_a_try_unwraps_changes_the_hash() {
     );
 }
 
-/// `is_pure` moved out of `normalize.rs` into `ply_syntax::ast` so that `?` expansion and
-/// `commutable_run` ask one implementation whether an expression may be reordered.
 #[test]
 fn a_run_of_pure_lets_still_commutes_after_the_predicate_moved() {
     unchanged(

@@ -1,6 +1,3 @@
-//! The frame protocol `ply_span::frames` reads and writes: a dump round-trips through both, and
-//! what the reader does not know it refuses by name.
-
 use ply_span::frames::{read_diagnostics, write_diagnostics};
 use ply_span::{Diagnostic, Severity, SourceId, Span, codes};
 
@@ -52,7 +49,6 @@ fn a_dump_round_trips_with_its_spans_labels_notes_and_severity() {
     assert_eq!(read[1].labels[0].span, Span::DUMMY);
     assert!(read[1].notes.is_empty());
 
-    // The text the reader read is the text the writer writes for what it read.
     assert_eq!(
         write_diagnostics(&read, &sources()).expect("encodes again"),
         written

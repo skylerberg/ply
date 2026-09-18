@@ -46,8 +46,6 @@ fn a_record_keeps_its_fields_in_source_order() {
     assert_eq!(names, ["b", "a"]);
 }
 
-/// The whole mechanism in one shape: a free variable of a lambda takes a slot of the lambda's
-/// own window, copied in at the capture.
 #[test]
 fn a_lambda_captures_its_free_variable_into_its_own_window() {
     let e = block(
@@ -90,8 +88,7 @@ fn a_body_lowered_twice_is_lowered_once() {
     assert_eq!(lowering.len(), 1, "one body, {} entries", lowering.len());
 }
 
-/// The parameter list is what makes a name ownable inside the body, so a cache that answered
-/// for one from the other would hand out a liveness analysis of a different function.
+/// A cache that answered for one parameter list from the other would hand out the wrong liveness.
 #[test]
 fn one_body_under_two_parameter_lists_is_lowered_twice() {
     let (program, _) = standalone(vec![fn_def("f", &["x"], var("x"))]);

@@ -1,5 +1,3 @@
-//! An adversarial audit of the one thing this milestone cannot get wrong.
-
 use ply_cli::engine::Prover;
 use ply_cli::load::load;
 use ply_cli::obligations;
@@ -89,8 +87,6 @@ impl Run {
     }
 }
 
-/// The whole file in one assertion: whatever else happened, this claim is not carrying a
-/// certificate.
 #[track_caller]
 fn never_proved(source: &str, needle: &str) -> Discharge {
     let run = Run::of(source);
@@ -103,14 +99,10 @@ fn never_proved(source: &str, needle: &str) -> Discharge {
     discharge
 }
 
-// --- Soundness pins: nothing false is ever proved ---------------------------
-
-/// A battery of claims that are **false** over Ply's own semantics.
 #[test]
 fn no_false_claim_is_ever_proved() {
     let false_claims: &[(&str, &str)] = &[
-        // Division is uninterpreted, so nothing may be concluded from it — not even by a literal
-        // divisor, where the arithmetic is tempting and wrong.
+        // Division is uninterpreted: nothing follows from it, not even with a literal divisor.
         (
             "halving",
             "law \"halving\" forall (x: Int) { x / 2 * 2 == x }",
@@ -119,22 +111,19 @@ fn no_false_claim_is_ever_proved() {
         ("modulo", "law \"modulo\" forall (x: Int) { x % 1 == 0 }"),
         // `x * y` with both factors symbolic is not linear arithmetic.
         ("square", "law \"square\" forall (x: Int) { x * x >= x }"),
-        // Two distinct uninterpreted symbols are not equal, and are also not provably distinct:
-        // neither direction may be claimed.
+        // Two distinct uninterpreted symbols are neither provably equal nor provably distinct.
         (
             "two functions",
             "law \"two functions\" forall (f: (Int) -> Int, g: (Int) -> Int, x: Int) { f(x) == g(x) }",
         ),
-        // A case analysis that reaches every constructor still has to evaluate each arm, and one of
-        // them is 3.
+        // A case analysis over every constructor still evaluates each arm, and one of them is 3.
         (
             "under three",
             "type Color = Red | Green | Blue\n\
              fn score(c: Color) -> Int = match c { Red -> 1, Green -> 2, Blue -> 3 }\n\
              law \"under three\" forall (c: Color) { score(c) < 3 }",
         ),
-        // A nested constructor pattern is not split, so the `match` stays uninterpreted rather than
-        // being guessed at.
+        // A nested constructor pattern is not split, so the `match` stays uninterpreted.
         (
             "always two",
             "type Color = Red | Green | Blue\n\
@@ -147,8 +136,7 @@ fn no_false_claim_is_ever_proved() {
             "concat commutes",
             "law \"concat commutes\" forall (s: String, t: String) { s ++ t == t ++ s }",
         ),
-        // List literals are injective in their elements, which is exactly why this is false rather
-        // than unknown.
+        // List literals are injective in their elements, which is why this is false rather than unknown.
         (
             "one element",
             "law \"one element\" forall (x: Int, y: Int) { [x] == [y] }",
@@ -178,8 +166,7 @@ fn no_false_claim_is_ever_proved() {
     }
 }
 
-/// Two calls to a definition that performs may answer differently, so they may not share a term:
-/// `f() - f() == 0` reported `proved` is the shape of that mistake.
+/// Two calls to a definition that performs may answer differently, so they may not share a term.
 #[test]
 fn an_effectful_call_is_not_a_function_of_its_arguments() {
     const SOURCE: &str = "\
@@ -200,8 +187,7 @@ fn difference(k: Int) -> Int / {db.read[main]}
     );
 }
 
-/// The other half of the same rule, and the one the type system owns: a spec expression's row must
-/// be empty, so a clause cannot call an effectful definition at all.
+/// A spec expression's row must be empty, so a clause cannot call an effectful definition at all.
 #[test]
 fn a_clause_that_performs_is_rejected_before_the_prover_sees_it() {
     const SOURCE: &str = "\
@@ -254,8 +240,6 @@ fn an_unsatisfiable_guard_is_vacuous_and_never_proved() {
     }
 }
 
-/// `guard ⟹ body` over a domain with no values is valid and says nothing, so a binder of an
-/// uninhabited type may not carry a proof however trivial the body is.
 #[test]
 fn a_binder_of_an_uninhabited_type_never_carries_a_proof() {
     const SOURCE: &str = "\
@@ -270,8 +254,6 @@ law \"a claim about nothing\" forall (b: Bad) { b == b }
     );
 }
 
-/// A member of a recursive component is never unfolded, so nothing about its behaviour over
-/// unbounded data is decided.
 #[test]
 fn recursion_stops_the_unfolding_and_the_bound_is_named() {
     const SOURCE: &str = "\
@@ -303,8 +285,6 @@ law \"twice is doubling\" forall (x: Int) where x > -1000 && x < 1000
     );
 }
 
-/// A `proved` obligation is a claim about every plan, so the two tiers must never disagree in the
-/// direction that matters.
 #[test]
 fn nothing_proved_here_is_refutable_by_sampling() {
     let sources: &[&str] = &[
@@ -315,8 +295,7 @@ fn nothing_proved_here_is_refutable_by_sampling() {
          law \"score is positive\" forall (c: Color) { score(c) > 0 }",
         "law \"records are their fields\" forall (x: Int, y: Int) \
            { { a: x, b: y } == { b: y, a: x } }",
-        // The prelude's `Option`, not a local one: declaring a second would be `E0105`, and a
-        // language with two `Option`s is worse than one with none.
+        // The prelude's `Option`: declaring a second would be `E0105`.
         "fn or_else(o: Option<Int>, d: Int) -> Int = match o { None -> d, Some(v) -> v }\n\
          law \"or_else is a function\" forall (o: Option<Int>, d: Int) \
            { or_else(o, d) == or_else(o, d) }",
@@ -374,8 +353,6 @@ fn nothing_proved_here_is_refutable_by_sampling() {
     assert_eq!(audited, sources.len(), "every source above is a proof");
 }
 
-// --- Soundness pins: concurrency --------------------------------------------
-
 /// A `simulate` region reached by two tasks, with a handler standing in for the resource.
 fn concurrency_law(header: &str, spawned: &str) -> String {
     format!(
@@ -408,7 +385,6 @@ law \"two writers land twice\"{header} {{
     )
 }
 
-/// The concurrency-law conditions's five conditions plus the sixth, one case each.
 #[test]
 fn a_concurrency_law_is_proved_only_when_both_domains_were_covered() {
     let ground = Run::of(&concurrency_law("", "1"));
@@ -448,7 +424,6 @@ fn an_int_binder_drops_a_concurrency_law_to_property() {
     assert_eq!(run.tier("no interleaving"), Some(Tier::Property));
 }
 
-/// A sampled schedule search has no exhaustiveness to claim, whatever it reports.
 #[test]
 fn a_sampled_schedule_search_never_proves() {
     let source = concurrency_law("", "1");
@@ -466,9 +441,7 @@ fn a_sampled_schedule_search_never_proves() {
     }
 }
 
-/// The sixth condition, which no signature over an `Exploration` can express: a body that entered
-/// no `simulate` region emptied a frontier it never filled, and `exhaustive: true` over it is a
-/// claim about nothing.
+/// A body that entered no `simulate` region emptied a frontier it never filled, so `exhaustive: true` is about nothing.
 #[test]
 fn a_search_that_reached_no_region_never_proves() {
     const SOURCE: &str = "\
@@ -504,11 +477,7 @@ law \"sometimes concurrent\" forall (flip: Bool) {
     never_proved(SOURCE, "sometimes concurrent");
 }
 
-// --- Soundness pins: a cached proof is never a stale one --------------------
-
-/// A proof written under the bare obligation key survives every widening of the plan, so the *only*
-/// thing standing between a cached `proved` and a proof of something no longer true is the key
-/// covering the implementation's whole transitive closure.
+/// A cached proof survives every plan widening, so only a key over the whole transitive closure keeps it current.
 #[test]
 fn editing_what_a_proof_rests_on_re_opens_it() {
     use assert_cmd::Command;
@@ -539,8 +508,7 @@ fn editing_what_a_proof_rests_on_re_opens_it() {
             .collect()
     }
 
-    // Two links between the claim and the value it is about, so the second edit tests the
-    // transitive half rather than the direct one.
+    // Two links between the claim and its value, so the second edit tests the transitive half.
     let good = "\
 fn leaf() -> Int = 1
 
@@ -597,9 +565,6 @@ law \"shift agrees with base\" forall (x: Int) where x > 0 && x < 1000
     }
 }
 
-// --- Characterizations: where the tier label over-claims ---------------------
-
-/// **Closed.**
 #[test]
 fn gap_a_proved_obligation_may_raise_at_the_int_boundary() {
     const SOURCE: &str = "\
@@ -620,12 +585,10 @@ fn bounded_inc(x: Int) -> Int
         "`x + 1 > x` has no answer at `i64::MAX`, so no tier covers every input: {discharge:?}"
     );
 
-    // The reach is recovered by a guard rather than by a disclosure: the same claim over a domain
-    // the arithmetic fits in is decided outright.
+    // A guard recovers the reach: the same claim over a domain the arithmetic fits in is decided outright.
     assert_eq!(run.tier("bounded_inc"), Some(Tier::Proved));
 }
 
-/// **Closed.**
 #[test]
 fn gap_a_definition_that_never_returns_still_carries_a_proof() {
     const SOURCE: &str = "\
@@ -678,7 +641,6 @@ law \"a divisor is a function\" forall (a: Int, b: Int) { a / b == a / b }
     assert!(coverage.uncovered.iter().any(|n| n.as_str() == "m.go"));
 }
 
-/// **Closed.**
 #[test]
 fn gap_a_guard_outside_the_generators_range_is_called_vacuous() {
     const SOURCE: &str =
@@ -691,8 +653,7 @@ fn gap_a_guard_outside_the_generators_range_is_called_vacuous() {
         "the guard admits nine values and the body is decided over all of them: {discharge:?}"
     );
 
-    // The same window over a body nothing decides: not a proof, and still not a claim that the
-    // guard admits nothing.
+    // A body nothing decides: not a proof, and still not a claim that the guard admits nothing.
     const UNDECIDED: &str = "\
 fn seen(xs: List<Int>, x: Int) -> Bool =
   match xs {
@@ -715,7 +676,6 @@ law \"a narrow window nobody samples\" forall (xs: List<Int>, x: Int)
     );
 }
 
-/// **Closed.**
 #[test]
 fn gap_a_one_point_domain_fails_the_interleaving_audit() {
     let run = Run::of(&concurrency_law(" forall (u: Unit)", "1"));
@@ -735,8 +695,7 @@ fn gap_a_one_point_domain_fails_the_interleaving_audit() {
         Ok(())
     );
 
-    // The ground law next door still names the interleaving search and nothing else: there is no
-    // value domain to have covered.
+    // The ground law has no value domain, so it names only the interleaving search.
     let ground = Run::of(&concurrency_law("", "1"));
     assert!(
         ground

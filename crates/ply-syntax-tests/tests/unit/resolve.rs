@@ -455,8 +455,7 @@ fn two_items_of_one_name_leave_the_first_binding_for_inference_to_report() {
     assert_eq!(first.qualified.as_str(), "app.f");
 }
 
-/// The graph walk is iterative for the same reason the definition-level SCC pass is: a
-/// generated project can be deeper than the native stack.
+/// A generated project can be deeper than the native stack.
 #[test]
 fn a_deep_import_chain_does_not_overflow_the_stack() {
     let depth = 20_000;

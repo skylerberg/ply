@@ -1,11 +1,8 @@
-//! A nullary pure definition is a constant, and the evaluator remembers it.
-
 use crate::fixture::Compiled;
 use ply_eval::{Machine, Value};
 use ply_span::{Span, codes};
 
-/// `deep` costs 700 pending calls and `nest` costs one per step, so a budget of 1000 admits either
-/// alone and refuses `nest(400)` with a second `deep` under it.
+/// Admits `deep` (700 pending calls) or `nest` alone, not `nest(400)` with a `deep` under it.
 const BUDGET: usize = 1000;
 
 const SOURCE: &str = r#"
@@ -38,7 +35,6 @@ pub fn probe_over_declared(n: Int) -> Int / {store.read} =
   over_declared() + nest_over_declared(n)
 "#;
 
-/// One budget, one entry point.
 fn probe(c: &Compiled, name: &str) -> Result<Value, ply_span::Diagnostic> {
     let mut machine = Machine::new(&c.program, &c.resolved, &c.check).with_max_calls(BUDGET);
     machine.call(name, vec![Value::Int(400)], Span::DUMMY)

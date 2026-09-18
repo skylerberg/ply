@@ -1,5 +1,3 @@
-//! An adversarial audit of `derive` and of `where derivable(D, a)`.
-
 use assert_cmd::prelude::*;
 use ply_span::codes;
 use std::path::Path;
@@ -23,7 +21,6 @@ fn output(out: &std::process::Output) -> String {
     )
 }
 
-/// `ply run` over a one-module project, returning what `main` printed.
 fn run_main(source: &str) -> String {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "m.ply", source);
@@ -47,11 +44,7 @@ fn codes_of(source: &str) -> Vec<String> {
     }
 }
 
-// --- Constraints: does the boundary hold? -----------------------------------
-
-/// The claim in one table: every one of these instantiates a constraint with a type that does not
-/// satisfy it, and every one must be `E0206` — at the call site or at the signature, but
-/// *statically*, and never as something that checks here and fails deeper.
+/// Each must be `E0206` statically, at the call site or the signature, never something that checks and fails deeper.
 #[test]
 fn no_unsatisfiable_constraint_is_accepted_at_a_boundary() {
     let attempts: &[&str] = &[
@@ -61,16 +54,14 @@ fn no_unsatisfiable_constraint_is_accepted_at_a_boundary() {
         // Under a container the signature writes.
         "fn needs<a>(xs: List<a>) -> Int where derivable(ord, a) = 1\n\
          fn go() -> Int = needs([1.5])",
-        // Through a first-class use, where the constraint could have been lost with the function's
-        // name.
+        // Through a first-class use, where the constraint could be lost with the function's name.
         "fn needs<a>(x: a) -> Int where derivable(ord, a) = 1\n\
          fn apply(f: (Float) -> Int, x: Float) -> Int = f(x)\n\
          fn go() -> Int = apply(needs, 1.5)",
         // Through a lambda, same question with a different binder.
         "fn needs<a>(x: a) -> Int where derivable(ord, a) = 1\n\
          fn go() -> Int = { let f = |x: Float| needs(x); f(1.5) }",
-        // A body that assumes one constraint and calls something needing another: the error belongs
-        // in the body, against the inner call.
+        // A body assuming one constraint that calls something needing another: the error is the inner call's.
         "fn needs<a>(x: a) -> Int where derivable(ord, a) = 1\n\
          fn caller<a>(x: a) -> Int where derivable(json, a) = needs(x)",
         // A `Float` behind a nominal declaration.
@@ -100,8 +91,6 @@ fn no_unsatisfiable_constraint_is_accepted_at_a_boundary() {
     }
 }
 
-/// The other half: a constraint that *is* satisfiable must not be reported, and a body must be able
-/// to assume its own.
 #[test]
 fn a_satisfiable_constraint_is_assumed_inside_the_body() {
     for source in [
@@ -123,8 +112,7 @@ fn a_satisfiable_constraint_is_assumed_inside_the_body() {
     }
 }
 
-/// A `Map` key is checked wherever the type is inferred rather than written, which is where a check
-/// hung off the surface syntax would miss it.
+/// Checked wherever the key type is inferred, where a check on the surface syntax would miss it.
 #[test]
 fn an_inferred_map_key_is_checked_like_a_written_one() {
     for source in [
@@ -149,9 +137,7 @@ fn an_inferred_map_key_is_checked_like_a_written_one() {
     );
 }
 
-/// Adding a `where` clause narrows what a signature admits, so it must move the definition's hash —
-/// otherwise a caller already checked against the unconstrained form is never rechecked and stays
-/// accepted.
+/// A `where` clause narrows what a signature admits; if the hash ignored it, a caller would never be rechecked.
 #[test]
 fn a_constraint_is_in_the_hash_and_its_spelling_is_not() {
     let hashes = |source: &str| -> Vec<String> {
@@ -175,10 +161,7 @@ fn a_constraint_is_in_the_hash_and_its_spelling_is_not() {
     );
 }
 
-// --- Derivation: is a derived dictionary canonical? -------------------------
-
-/// A control, so the two failures below are about hijacking rather than about derivation being
-/// broken.
+/// A control, so the two failures below are about hijacking rather than broken derivation.
 #[test]
 fn a_derivation_composed_through_the_module_binder_is_canonical() {
     let printed = run_main(
@@ -193,8 +176,7 @@ fn a_derivation_composed_through_the_module_binder_is_canonical() {
     );
 }
 
-/// `derive ord for T` emits `compare(a, b)` as a **bare** name, and the module rules says a module's own
-/// items shadow the prelude.
+/// `derive ord` emits `compare(a, b)` as a bare name, and a module's own items shadow the prelude.
 #[test]
 fn a_derived_ord_is_the_languages_order_and_not_the_modules() {
     let printed = run_main(
@@ -210,8 +192,6 @@ fn a_derived_ord_is_the_languages_order_and_not_the_modules() {
     );
 }
 
-/// The same hazard on the `json` deriver, reached through the import form rather than through the
-/// prelude.
 #[test]
 fn a_derived_json_codec_cannot_be_supplied_by_the_deriving_module() {
     let printed = run_main(
@@ -234,9 +214,7 @@ fn a_derived_json_codec_cannot_be_supplied_by_the_deriving_module() {
     );
 }
 
-/// `derive eq` is the shape that is safe, and knowing why is what says how the two above should be
-/// fixed: it emits the `==` **operator**, which is a token rather than a name, so nothing in scope
-/// can stand in for it.
+/// It emits the `==` operator, a token rather than a name, so nothing in scope can stand in for it.
 #[test]
 fn a_derived_eq_uses_an_operator_and_so_cannot_be_shadowed() {
     let printed = run_main(

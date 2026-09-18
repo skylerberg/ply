@@ -2,8 +2,7 @@ use ply_eval::arena::Slot;
 use ply_eval::{TaskRegions, Value};
 use ply_test::region::GroupRegion;
 
-/// A fixture of `cells` integer cells, reached through a list of handles — the shape the control-stack design
-/// The `Fixture` names and the only way a test can get at group state at all.
+/// `cells` integer cells behind a list of handles: the only way a test reaches group state.
 fn seeded(cells: usize) -> impl FnOnce(&mut TaskRegions) -> Value {
     move |regions| {
         Value::list(
@@ -40,8 +39,6 @@ fn an_empty_region_has_no_fixture_and_no_mark() {
     assert_eq!(stack.live(), 0);
 }
 
-/// The half that replaces the fork: a write a test makes to the fixture is there for the next
-/// test on this worker.
 #[test]
 fn a_write_to_the_fixture_survives_the_test_that_made_it() {
     let mut region = GroupRegion::build(seeded(3));
@@ -55,8 +52,6 @@ fn a_write_to_the_fixture_survives_the_test_that_made_it() {
     assert_eq!(region.mark(), 3, "a write allocates nothing");
 }
 
-/// The half that keeps tests from observing each other: what a test allocated is gone when it
-/// ends, and the next test allocates at the same slot rather than after it.
 #[test]
 fn what_a_test_allocated_is_gone_when_the_region_closes() {
     let mut region = GroupRegion::build(seeded(2));
@@ -81,8 +76,7 @@ fn what_a_test_allocated_is_gone_when_the_region_closes() {
     );
 }
 
-/// Both halves at once, which is where an implementation that kept the whole post-test stack
-/// would pass the first two tests and fail this one.
+/// Keeping the whole post-test stack would pass the two tests above and fail this one.
 #[test]
 fn a_test_that_writes_and_allocates_leaves_only_the_write() {
     let mut region = GroupRegion::build(seeded(4));
@@ -100,7 +94,6 @@ fn a_test_that_writes_and_allocates_leaves_only_the_write() {
     assert_eq!(int_of(&next, cell(&next_handle, 3)), 3);
 }
 
-/// A hundred tests in a group leave a fixture the size of the fixture.
 #[test]
 fn a_long_group_does_not_grow_the_region() {
     let mut region = GroupRegion::build(seeded(8));
@@ -118,9 +111,7 @@ fn a_long_group_does_not_grow_the_region() {
     assert_eq!(int_of(&last, cell(&handle, 7)), 99);
 }
 
-/// A stack holding less than the mark cannot be one this region opened, and shrinking the
-/// fixture to it would leave the next test allocating inside the fixture's own range — where
-/// the following close would keep its cells as group state.
+/// Shrinking to a stack below the mark would let the next test allocate inside the fixture.
 #[test]
 fn closing_over_a_stack_this_region_did_not_open_is_refused() {
     let mut region = GroupRegion::build(seeded(4));
@@ -141,8 +132,6 @@ fn closing_over_a_stack_this_region_did_not_open_is_refused() {
     );
 }
 
-/// Opening does not disturb the region, so two tests that ran against it out of order see the
-/// same thing.
 #[test]
 fn opening_twice_gives_two_stacks_that_cannot_see_each_other() {
     let region = GroupRegion::build(seeded(2));

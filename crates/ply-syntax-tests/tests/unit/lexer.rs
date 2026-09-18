@@ -116,8 +116,6 @@ fn a_byte_literal_takes_the_string_escapes_plus_hex() {
     );
 }
 
-/// The `b` prefix binds only when the quote is the very next character, so an ordinary
-/// identifier called `b` keeps working.
 #[test]
 fn b_is_a_prefix_only_when_the_quote_follows_immediately() {
     assert_eq!(
@@ -138,8 +136,6 @@ fn b_is_a_prefix_only_when_the_quote_follows_immediately() {
     );
 }
 
-/// The bytes of a literal may not depend on how the file was saved, so the diagnostic hands
-/// back the exact escapes the author should have written.
 #[test]
 fn a_non_ascii_character_in_a_byte_literal_is_refused_with_its_escapes() {
     let (toks, diags) = lex(SourceId(0), "b\"é\"");
@@ -210,9 +206,7 @@ fn operators_use_maximal_munch() {
     );
 }
 
-/// The one munch the lexer deliberately does *not* do. `Map<Int, List<Int>>`
-/// closes with two `>` that must stay two tokens, so a shift is assembled by
-/// the expression parser out of adjacent ones (the operator decision) and never here.
+/// `Map<Int, List<Int>>` closes with two `>`, so the parser assembles a shift, never the lexer.
 #[test]
 fn angle_brackets_never_munch_into_a_shift() {
     assert_eq!(
@@ -237,9 +231,6 @@ fn angle_brackets_never_munch_into_a_shift() {
     );
 }
 
-/// Was `a_lone_ampersand_is_reported_and_skipped`. the operator decision makes the
-/// character real, so the diagnostic that said Ply has no bitwise `&` is
-/// gone and this is the assertion that it is gone.
 #[test]
 fn a_lone_ampersand_is_a_token_of_its_own() {
     assert_eq!(

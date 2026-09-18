@@ -1,5 +1,3 @@
-//! A second golden pin, over the shapes the first one does not reach.
-
 use ply_derive::preview;
 use ply_span::SourceId;
 use ply_syntax::ast::ModuleName;
@@ -27,8 +25,7 @@ const MOVED: &str = "the deriver's output moved. If that is intended, update thi
                      file whose generated definition changed would be skipped and the stale one \
                      reused.";
 
-/// `Map<String, v>` is a JSON object and anything else is an array of pairs, and the deriver
-/// decides that syntactically.
+/// `Map<String, v>` is a JSON object; any other map is an array of pairs.
 #[test]
 fn the_two_map_encodings_are_pinned() {
     let g = one(&format!(
@@ -39,8 +36,6 @@ fn the_two_map_encodings_are_pinned() {
     assert_eq!(g, expected, "{MOVED}");
 }
 
-/// One dictionary parameter per type parameter, in declaration order, with the `where
-/// derivable(json, ·)` clauses that make the body's use of them sound.
 #[test]
 fn a_parameterized_types_dictionary_form_is_pinned() {
     let g = one(&format!(
@@ -50,8 +45,6 @@ fn a_parameterized_types_dictionary_form_is_pinned() {
     assert_eq!(g, expected, "{MOVED}");
 }
 
-/// A type parameter called `d` collides with the prefix the emitter reaches for first, so it walks
-/// to `d_` and every binder in the body moves with it.
 #[test]
 fn a_type_parameter_that_shadows_the_binder_prefix_is_pinned() {
     let g = one(&format!(
@@ -67,7 +60,6 @@ fn a_type_parameter_that_shadows_the_binder_prefix_is_pinned() {
     );
 }
 
-/// A recursive type composes through itself by name.
 #[test]
 fn a_recursive_types_self_reference_is_pinned() {
     let g = one(&format!(
@@ -77,8 +69,6 @@ fn a_recursive_types_self_reference_is_pinned() {
     assert_eq!(g, expected, "{MOVED}");
 }
 
-/// An alias is transparent to the checker, so a key spelled through one is the same type and must
-/// reach the same codec.
 #[test]
 fn a_map_key_is_classified_by_its_type_and_not_by_its_spelling() {
     let g = one(&format!(
@@ -93,9 +83,6 @@ fn a_map_key_is_classified_by_its_type_and_not_by_its_spelling() {
     );
 }
 
-/// `Option` and `Result` are structural, so they compose through the codecs `std.json` ships rather
-/// than through a generated one — and an `Option` whose payload also writes `null` is **refused**
-/// rather than emitted, because `option_json` would write `Some` and `None` as the same document.
 #[test]
 fn the_structural_codecs_are_composed_by_name() {
     let g = one(&format!(
@@ -120,8 +107,6 @@ fn the_structural_codecs_are_composed_by_name() {
     }
 }
 
-/// Byte-identical across repeated expansions of one declaration, and across two declarations that
-/// differ only in a name the encoding does not contain.
 #[test]
 fn expansion_is_a_function_of_the_declaration() {
     let of = |name: &str| {

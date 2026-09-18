@@ -20,10 +20,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 /// The discharger this build drives.
-///
-/// Every clause and every law body is an AST this run has to hold — a claim is discharged by
-/// reasoning about the expression that states it, and there is no cached form of one. Every load
-/// parses every module, so that is always true and there is no second answer to give.
 pub fn of<'a>(
     program: &'a Program,
     resolved: &'a Resolved,
@@ -93,17 +89,15 @@ pub struct Prover<'a> {
     resolved: &'a Resolved,
     check: &'a CheckOutput,
     world: TypeWorld,
-    /// Built once.
+    /// Built once; `machine()` runs per obligation.
     ctx: prove::Context<'a>,
     defs: HashMap<Symbol, (usize, &'a FnDef)>,
     laws: HashMap<Symbol, (usize, usize, &'a LawDef)>,
     /// What a `law/host` is discharged against.
     hosting: Option<Hosting<'a>>,
-    /// A compiled unit holding the laws' and clauses' roots (ADR 0045 §"The facade"): a
-    /// proposition it holds is entered there rather than evaluated.
+    /// A compiled unit holding the laws' and clauses' roots, where those propositions are entered.
     backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
-    /// This program's region kinds, for the reason `ctx` is built once: the analysis behind them is
-    /// whole-program, and `machine()` is called per obligation.
+    /// Whole-program, so computed once like `ctx`.
     region_kinds: ply_eval::region_kind::Kinds,
 }
 
@@ -157,8 +151,7 @@ impl<'a> Prover<'a> {
         self
     }
 
-    /// The unit attached on this thread, once: an obligation is discharged on a pool thread, and
-    /// attaching reads the unit back rather than emitting it again.
+    /// The unit, attached once per thread: obligations are discharged on pool threads.
     fn compiled(&self) -> Option<Rc<dyn ply_eval::Compiled>> {
         thread_local! {
             static ATTACHED: RefCell<Vec<(usize, Rc<dyn ply_eval::Compiled>)>> =
@@ -196,9 +189,7 @@ impl<'a> Prover<'a> {
         }
     }
 
-    /// Each guard's own compiled root, in the order [`Claim::guards`] returns them: a law's
-    /// `where` clause, or a definition's `requires` clauses. `source.rs` numbers them the same
-    /// way, so the two lists line up position by position.
+    /// Each guard's compiled root, in [`Claim::guards`] order, which `source.rs` numbers alike.
     fn guard_roots(&self, claim: &Claim<'a>) -> Vec<Option<Symbol>> {
         let module = &self.program.modules[claim.module()].name;
         match claim {
@@ -256,17 +247,15 @@ impl<'a> Prover<'a> {
         let mut machine =
             Machine::new(self.program, self.resolved, self.check).with_max_calls(DEFAULT_MAX_CALLS);
         machine.share_region_kinds(ply_eval::region_kind::Kinds::clone(&self.region_kinds));
-        // The compiled tier is the evaluator (ADR 0048): an obligation's owner is called through
-        // the machine to produce the `result` its `ensures` speaks of, so the machine must hold the
-        // same tier its propositions are entered on, or that call declines with no body.
+        // An owner is called through the machine to produce `result`, so the machine must hold the
+        // tier its propositions are entered on, or that call declines with no body.
         if let Some((provider, spec)) = self.backend.as_ref() {
             machine.set_compiled(provider.attach(spec));
         }
         machine
     }
 
-    /// The machine a `law/host`'s body runs on: the run's binding, and a reactor minted for this
-    /// thread.
+    /// The machine a `law/host`'s body runs on: the run's binding and a reactor for this thread.
     fn host_machine(&self, hosting: &Hosting<'a>) -> Machine<'a> {
         let mut machine = self.machine();
         machine.set_host_binding(Arc::clone(&hosting.binding));
@@ -339,8 +328,7 @@ impl<'a> Prover<'a> {
     }
 }
 
-/// What the static tier answered for one obligation, and the fragment boundaries it crossed getting
-/// there.
+/// What the static tier answered, and the fragment boundaries it crossed.
 pub struct Reach {
     pub decision: Decision,
     pub blockers: Vec<Blocker>,
@@ -388,8 +376,7 @@ impl<'a> Prover<'a> {
             Static::Inconclusive => None,
         };
 
-        // Checking an `ensures` at either running tier means *calling* the definition, and a
-        // definition that performs needs a handler nothing supplies.
+        // Checking an `ensures` calls the definition, which needs handlers nothing supplies.
         if let Some(footprint) = self.unhandled(obligation) {
             return Discharge::Unattempted(Gap::UnhandledEffect(footprint));
         }
@@ -412,8 +399,7 @@ impl<'a> Prover<'a> {
             &mut cases,
         );
         match discharge {
-            // A sampled run that kept nothing has **not** established that the guard admits
-            // nothing: it has established that the generator drew nothing the guard wanted.
+            // Keeping no sample means the generator missed the guard, not that it admits nothing.
             Discharge::Vacuous(Vacuity {
                 kind: VacuityKind::NoCaseKept { generated },
                 ..
@@ -456,8 +442,7 @@ impl<'a> Prover<'a> {
         )
     }
 
-    /// A tuple of binder values the guard admits, found by evaluating the guard at points the
-    /// guard's own literals name.
+    /// Binder values the guard admits, tried at points named by the guard's own literals.
     fn witness(
         &self,
         obligation: &Obligation,
@@ -474,8 +459,7 @@ impl<'a> Prover<'a> {
         for binder in &cases.binders {
             let column = match self.candidates(&binder.ty, &literals) {
                 Some(column) => column,
-                // A shape whose candidates the guard's literals do not name — a list, a record, an
-                // ADT, a function.
+                // A shape the guard's literals cannot name: a list, record, ADT or function.
                 None => vec![property::generate(&binder.ty, &self.world, &mut stream, 0).ok()?],
             };
             points = points.checked_mul(column.len())?;
@@ -492,8 +476,7 @@ impl<'a> Prover<'a> {
                 values.push(column[rest % column.len()].clone());
                 rest /= column.len();
             }
-            // A point the guard raises at is not a point it admits, and a raise here is the
-            // property tier's business rather than this one's.
+            // A point the guard raises at is not admitted; the property tier reports the raise.
             if cases.guard(&values).unwrap_or(false) {
                 return Some(values);
             }
@@ -523,8 +506,7 @@ impl<'a> Prover<'a> {
                 out
             }
             "Int" => {
-                // A bound and the two integers beside it: `x > 1000000` is satisfied by `1000001`
-                // and by nothing the literal itself names.
+                // Each literal and its neighbours: `x > 1000000` is satisfied by `1000001`.
                 let mut out = vec![0i64, 1, -1];
                 for &k in &literals.ints {
                     for candidate in [k, k.saturating_add(1), k.saturating_sub(1)] {
@@ -615,9 +597,7 @@ impl<'a> Prover<'a> {
     ) -> Discharge {
         let mut kept = 0u64;
         for point in 0..finite.points {
-            // A domain that cannot produce one of its own points is not one this tier may claim to
-            // have covered, and reporting anything but a gap for it would be claiming coverage
-            // nothing established.
+            // A domain that cannot produce its own point has not been covered.
             let Some(values) = finite.point(&self.world, point) else {
                 return Discharge::Unattempted(Gap::Ungeneratable {
                     param: obligation.generated()[0].name.clone(),
@@ -628,9 +608,7 @@ impl<'a> Prover<'a> {
                 Outcome::Rejected => {}
                 Outcome::Held => kept += 1,
                 Outcome::Failed => {
-                    // No shrinking: the point is already a member of a domain enumerated in a fixed
-                    // order, so it is the same value on every run and there is nothing smaller to
-                    // find.
+                    // No shrinking: the enumeration order is fixed.
                     let bindings = bindings_of(obligation.generated(), &values);
                     return Discharge::Refuted(Counterexample {
                         original: bindings.clone(),
@@ -652,16 +630,14 @@ impl<'a> Prover<'a> {
         }
 
         if kept == 0 {
-            // Enumerating a finite domain and keeping nothing *decides* the guard unsatisfiable —
-            // exhaustive enumeration applied to the guard rather than to the body.
+            // A finite domain enumerated with nothing kept decides the guard unsatisfiable.
             return Discharge::Vacuous(Vacuity {
                 guard: claim.guard_span(obligation.span),
                 kind: VacuityKind::ProvedUnsatisfiable,
             });
         }
 
-        // A kept point witnesses the domain, so a static argument the prover could not vouch for is
-        // now vouched for — by a value that actually ran.
+        // A kept point witnesses the domain, so the static argument can now be certified.
         if let Some(proof) = witness
             && let Some(certificate) = proof.certify(true)
         {
@@ -684,8 +660,7 @@ impl<'a> Prover<'a> {
         }))
     }
 
-    /// A law whose body reaches a `simulate` region: discharged by execution, and the only place in
-    /// this milestone a `proved` does not come from a static argument.
+    /// A law whose body reaches a `simulate` region, discharged by searching interleavings.
     fn search_interleavings(
         &self,
         obligation: &Obligation,
@@ -824,8 +799,7 @@ impl Literals {
                     stack.push(rhs);
                 }
                 ExprKind::Unary { op, operand } => {
-                    // `-1000000` is a negation of a literal in the AST and a bound in the guard, so
-                    // the value the search wants is the negated one.
+                    // `-1000000` is a negation in the AST; the search wants the negated value.
                     if let (
                         ply_syntax::ast::UnOp::Neg,
                         ExprKind::Lit(ply_syntax::ast::Lit::Int(k)),
@@ -888,8 +862,7 @@ impl Literals {
     }
 }
 
-/// A static argument the prover made but could not vouch for the domain of, upgraded by a run that
-/// kept a case.
+/// Certifies a static argument the prover could not vouch for, once a run kept a case.
 fn upgrade(discharge: Discharge, witness: Option<Proof>) -> Discharge {
     let Some(proof) = witness else {
         return discharge;
@@ -935,18 +908,8 @@ struct Cases<'a> {
 }
 
 impl Cases<'_> {
-    /// The proposition entered on the tier, or `None` for the Core to answer.
-    ///
-    /// `None` covers three cases and treats them alike, because the Core is the answer to all
-    /// three: no backend, no compiled root, and a root the tier declined. That last is the one
-    /// that matters -- a proposition may apply a closure the property generator made, and the
-    /// tier compiles named bodies ahead and has nothing to run a synthesized closure on.
-    ///
-    /// Trying the tier first is not an optimisation. The Core is the pure applier of ADR 0048: it
-    /// declines a handler clause that binds `resume`, so a law reaching one -- `std.db`'s
-    /// `transaction`, whose `db.rollback` clause is the zero-shot case -- is *unattempted* rather
-    /// than judged. `desk`'s "a placement the shelf cannot cover leaves no row behind" is that
-    /// law, and it was being reported as a gap.
+    /// The proposition entered on the tier, or `None` for the Core to answer. The tier goes first
+    /// because the Core declines handler clauses that bind `resume`, as `std.db`'s `transaction`.
     fn on_tier(&self, root: &Option<Symbol>, args: &[Value]) -> Option<Result<Value, Diagnostic>> {
         let (compiled, root) = (self.compiled.as_ref()?, root.as_ref()?);
         if args.iter().any(carries_a_closure) {
@@ -1005,8 +968,7 @@ impl Judge for Cases<'_> {
                 .call(name.as_str(), values.to_vec(), self.span)?;
             scope.push((result.clone(), returned));
         }
-        // The compiled root takes the scope in the order it was built: a law's binders, or an
-        // owner's parameters and then `result`, which is how `source.rs` gives it its parameters.
+        // A law's binders, or an owner's parameters then `result`: the order `source.rs` expects.
         let args: Vec<Value> = scope.iter().map(|(_, v)| v.clone()).collect();
         let value = match self.on_tier(&self.body_root, &args) {
             Some(answered) => answered?,
@@ -1016,12 +978,7 @@ impl Judge for Cases<'_> {
     }
 }
 
-/// Whether a generated value holds a closure anywhere inside it.
-///
-/// A closure the property generator synthesized has no compiled body, so the tier cannot apply
-/// it -- and unlike a construct it has never seen, it does not *decline* one: the word it makes
-/// of a bridged closure is a word, and what comes back is not the answer the proposition asked
-/// for. So the check is on the way in, not on the way out.
+/// Whether a value holds a closure; the tier would misapply a synthesized one, not decline it.
 fn carries_a_closure(v: &Value) -> bool {
     match v {
         Value::Closure(_) | Value::Continuation(_) => true,

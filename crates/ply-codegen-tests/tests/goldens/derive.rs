@@ -1,10 +1,3 @@
-//! The fifth comparison: `derive.ply`'s expansion of every module on its own — the source
-//! each derivation generates, byte for byte, with the diagnostics expansion raises — against
-//! a blessed golden.
-//!
-//! The port is entered in-process through `port`: the bundle the binary carries is the compiler
-//! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
-
 use crate::harness::{bundle, fixtures, golden, port, repo_root};
 use std::path::{Path, PathBuf};
 
