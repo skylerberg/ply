@@ -1,6 +1,6 @@
 use ply_eval::differential::compare_tests;
 use ply_eval::{Fixture, Machine};
-use ply_span::SourceMap;
+use ply_span::{SourceId, SourceMap};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
 use ply_syntax::resolve::{Resolved, resolve};
@@ -41,7 +41,7 @@ fn subdirectories(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn std_imports(id: ply_span::SourceId, name: &ModuleName, text: &str) -> Vec<ModuleName> {
+fn std_imports(id: SourceId, name: &ModuleName, text: &str) -> Vec<ModuleName> {
     let Ok(module) = ply_syntax::parse_module(id, name.clone(), text) else {
         return Vec::new();
     };
@@ -53,8 +53,10 @@ fn std_imports(id: ply_span::SourceId, name: &ModuleName, text: &str) -> Vec<Mod
         .collect()
 }
 
+type Parsed = (Program, Resolved, Vec<(String, String)>, Vec<SourceId>);
+
 /// `None` for a fixture that does not parse or resolve: many are deliberately broken.
-fn load(root: &Path, files: &[PathBuf]) -> Option<(Program, Resolved)> {
+fn load(root: &Path, files: &[PathBuf]) -> Option<Parsed> {
     let mut map = SourceMap::new();
     let mut loaded = Vec::new();
     for path in files {
@@ -91,7 +93,12 @@ fn load(root: &Path, files: &[PathBuf]) -> Option<(Program, Resolved)> {
         return None;
     }
     let resolved = resolve(&mut program).ok()?;
-    Some((program, resolved))
+    let named = loaded
+        .iter()
+        .map(|(_, name, text)| (name.to_string(), text.clone()))
+        .collect();
+    let ids = loaded.iter().map(|(id, _, _)| *id).collect();
+    Some((program, resolved, named, ids))
 }
 
 const EXAMPLES: &str = "examples";
@@ -159,10 +166,12 @@ impl Entry {
     /// Requires the check: without the published row the purity hook is inert and passes vacuously.
     fn loaded(&self) -> Option<Loaded> {
         *self.loaded.get_or_init(|| {
-            let (program, resolved) = load(&self.corpus.dir, &self.corpus.files)?;
+            let (program, resolved, named, ids) = load(&self.corpus.dir, &self.corpus.files)?;
+            let check = ply_codegen::c::producer::checked_front(&named, &ids)
+                .ok()?
+                .check;
             let program: &'static Program = Box::leak(Box::new(program));
             let resolved: &'static Resolved = Box::leak(Box::new(resolved));
-            let check = ply_core::check_program(program, resolved).ok()?;
             Some((program, resolved, Box::leak(Box::new(check))))
         })
     }
