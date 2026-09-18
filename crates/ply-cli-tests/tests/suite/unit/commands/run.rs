@@ -24,14 +24,8 @@ fn attach_tier(machine: &mut Machine<'_>, loaded: &Loaded) -> Result<(), Diagnos
     let Some(spec) = backend_spec(None)? else {
         return Ok(());
     };
-    let texts = module_texts(&loaded.program, &loaded.sources);
-    let provider = build_backend_over(
-        &spec,
-        &loaded.program,
-        &loaded.resolved,
-        &loaded.front,
-        texts,
-    )?;
+    let texts = module_texts(&loaded.check, &loaded.sources);
+    let provider = build_backend_over(&spec, &loaded.tree()?.program, &loaded.front, texts)?;
     machine.set_compiled(provider.attach(&spec));
     Ok(())
 }
@@ -39,7 +33,8 @@ fn attach_tier(machine: &mut Machine<'_>, loaded: &Loaded) -> Result<(), Diagnos
 fn eval(l: &Loaded) -> Result<String, Diagnostic> {
     let entry = entry_point(l)?;
     let (name, span) = (entry.name.clone(), entry.span);
-    let mut machine = Machine::new(&l.program, &l.resolved, &l.check);
+    let tree = l.tree()?;
+    let mut machine = Machine::new(&tree.program, &tree.resolved, &l.check);
     attach_tier(&mut machine, l)?;
     machine
         .call(name.as_str(), Vec::new(), span)
@@ -74,11 +69,7 @@ fn a_missing_main_never_points_at_an_unrelated_definition() {
     );
     assert_eq!(span.start as usize, text.len());
 
-    let items: Vec<Span> = l.program.modules[0]
-        .items
-        .iter()
-        .map(|i| i.span())
-        .collect();
+    let items: Vec<Span> = l.check.defs.values().map(|d| d.span).collect();
     assert!(
         items.iter().all(|i| span.start >= i.end),
         "the anchor landed inside `{}`",

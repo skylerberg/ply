@@ -52,9 +52,7 @@ fn main() {
     if !expanded.is_empty() {
         refused::<()>(expanded);
     }
-    let resolved = ply_syntax::resolve::resolve(&mut ast).unwrap_or_else(refused);
-    let program: &'static ply_syntax::ast::Program = Box::leak(Box::new(ast));
-    let resolved = Box::leak(Box::new(resolved));
+    ply_syntax::resolve::resolve(&mut ast).unwrap_or_else(refused);
     // Ids follow `SourceMap` order, which is how the protocol indexes a span's module.
     let ids: Vec<ply_span::SourceId> = (0..modules.len())
         .map(|i| ply_span::SourceId(i as u32))
@@ -69,7 +67,7 @@ fn main() {
     ));
     let keys = ply_codegen::emit_keys(front);
     let source: &'static ply_codegen::Source = Box::leak(Box::new(
-        ply_codegen::Source::from_front(program, resolved, front, keys).with_texts(texts),
+        ply_codegen::Source::from_front(front, keys).with_texts(texts),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();

@@ -36,16 +36,15 @@ pub fn of<'a>(
 }
 
 fn claims_of(loaded: &Loaded) -> Result<Claims, LoadError> {
-    let failed = |why: String| LoadError {
-        sources: loaded.sources.clone(),
-        diagnostics: vec![
+    let failed = |why: String| {
+        loaded.refused(
             Diagnostic::error(
                 codes::INTERNAL_ERROR,
                 format!("the front end could not lower this program's claims: {why}"),
             )
             .primary(Span::DUMMY, "nothing was proved, so nothing is claimed")
             .note("this is Ply's fault: the compiler's own front end is what failed here"),
-        ],
+        )
     };
     let mut sources = Vec::with_capacity(loaded.check.modules.len());
     let mut ids: Vec<SourceId> = Vec::with_capacity(loaded.check.modules.len());
@@ -132,6 +131,7 @@ pub struct Hosting<'a> {
 impl<'a> Prover<'a> {
     pub fn new(loaded: &'a Loaded) -> Result<Prover<'a>, LoadError> {
         let check = &loaded.check;
+        let tree = loaded.tree().map_err(|d| loaded.refused(d))?;
         let mut laws = HashMap::new();
         let mut ordinals: HashMap<&Symbol, usize> = HashMap::new();
         for law in &check.laws {
@@ -140,8 +140,8 @@ impl<'a> Prover<'a> {
             *ordinal += 1;
         }
         Ok(Prover {
-            program: &loaded.program,
-            resolved: &loaded.resolved,
+            program: &tree.program,
+            resolved: &tree.resolved,
             check,
             front: &loaded.front,
             world: TypeWorld::new(check.ctors.values()),

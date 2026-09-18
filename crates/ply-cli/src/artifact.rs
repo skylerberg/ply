@@ -303,14 +303,13 @@ fn embedded_unit(opened: &Opened, names: &[&str]) -> (Option<EmbeddedUnit>, Vec<
         .copied()
         .filter(|name| opened.front.check.defs.contains_key(&Symbol::new(name)))
         .collect();
-    let texts = crate::commands::common::module_texts(&opened.program, &opened.sources);
-    let produced =
-        ply_codegen::Unit::over_front(&opened.program, &opened.resolved, &opened.front, texts)
-            .and_then(|unit| unit.produce(&names))
-            .and_then(|produced| {
-                let text = ply_codegen::c::bundle::pack(&produced.text)?;
-                Ok((produced, text))
-            });
+    let texts = crate::commands::common::module_texts(&opened.front.check, &opened.sources);
+    let produced = ply_codegen::Unit::over_front(&opened.program, &opened.front, texts)
+        .and_then(|unit| unit.produce(&names))
+        .and_then(|produced| {
+            let text = ply_codegen::c::bundle::pack(&produced.text)?;
+            Ok((produced, text))
+        });
     match produced {
         Ok((produced, text)) => {
             let mut warnings = Vec::new();
@@ -1123,14 +1122,9 @@ fn tier(
         .map_err(|e| unit_error(&e))?;
         return Ok(Some((provider, spec)));
     }
-    let texts = crate::commands::common::module_texts(&opened.program, &opened.sources);
-    let provider = crate::commands::common::build_backend_over(
-        &spec,
-        &opened.program,
-        &opened.resolved,
-        &opened.front,
-        texts,
-    )?;
+    let texts = crate::commands::common::module_texts(&opened.front.check, &opened.sources);
+    let provider =
+        crate::commands::common::build_backend_over(&spec, &opened.program, &opened.front, texts)?;
     Ok(Some((provider, spec)))
 }
 

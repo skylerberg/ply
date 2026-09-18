@@ -2,7 +2,6 @@
 //! Usage: `ply-arm <project-dir> c`; prints the Rust arm's line plus `profile=`.
 
 use ply_codegen::source::Source;
-use ply_syntax::ast::ModuleName;
 use std::time::Instant;
 
 /// k1 is far shorter than k2, so it needs more repeats for its minimum to settle.
@@ -85,18 +84,12 @@ fn call(
 
 /// The project's own modules and the standard library's, checked together.
 fn load(dir: &str) -> &'static Source {
-    let mut sources = ply_span::SourceMap::new();
-    let mut units: Vec<(ply_span::SourceId, ModuleName, &'static str)> = Vec::new();
     // The protocol reads a span's module as its position in this list.
     let mut modules: Vec<(String, String)> = Vec::new();
-    let mut ids: Vec<ply_span::SourceId> = Vec::new();
     // The whole standard library: the kernels import `std.hash`, which imports others.
     for name in ply_std::modules() {
         let text = ply_std::source(&name).expect("a listed std module has a source");
-        let id = sources.add(ply_std::pseudo_path(&name), text.to_string());
         modules.push((name.to_string(), text.to_string()));
-        ids.push(id);
-        units.push((id, name, text));
     }
     let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
         .expect("the project directory is readable")
@@ -110,26 +103,15 @@ fn load(dir: &str) -> &'static Source {
             .and_then(|s| s.to_str())
             .expect("a module file has a name")
             .to_string();
-        let text: &'static str = Box::leak(
-            std::fs::read_to_string(&path)
-                .expect("readable")
-                .into_boxed_str(),
-        );
-        let id = sources.add(path.to_string_lossy().as_ref(), text.to_string());
-        modules.push((stem.clone(), text.to_string()));
-        ids.push(id);
-        units.push((id, ModuleName::from_dotted(&stem), text));
+        modules.push((stem, std::fs::read_to_string(&path).expect("readable")));
     }
-    let mut ast = ply_syntax::parse_program(units).expect("the project parses");
-    let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the project resolves");
+    let ids: Vec<ply_span::SourceId> = (0..modules.len())
+        .map(|i| ply_span::SourceId(i as u32))
+        .collect();
     let front = Box::leak(Box::new(
         ply_codegen::c::producer::checked_front(&modules, &ids).expect("the project checks"),
     ));
     let texts: std::collections::HashMap<String, String> = modules.into_iter().collect();
-    let program = Box::leak(Box::new(ast));
-    let resolved = Box::leak(Box::new(resolved));
     let keys = ply_codegen::emit_keys(front);
-    Box::leak(Box::new(
-        Source::from_front(program, resolved, front, keys).with_texts(texts),
-    ))
+    Box::leak(Box::new(Source::from_front(front, keys).with_texts(texts)))
 }

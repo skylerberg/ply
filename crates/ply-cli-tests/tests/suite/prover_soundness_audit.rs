@@ -42,7 +42,7 @@ impl Run {
             )
         });
         let hashes = loaded.hashes.clone();
-        let collected = obligations::collect(&loaded.program, &loaded.check, &hashes);
+        let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
         let prover = Prover::new(&loaded)
             .expect("the port lowers the claims")
             .with_backend(
@@ -312,7 +312,7 @@ fn nothing_proved_here_is_refutable_by_sampling() {
         let dir = project(source);
         let loaded = load(dir.path()).expect("the fixture compiles");
         let hashes = loaded.hashes.clone();
-        let collected = obligations::collect(&loaded.program, &loaded.check, &hashes);
+        let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
         let prover = Prover::new(&loaded)
             .expect("the port lowers the claims")
             .with_backend(
@@ -626,7 +626,7 @@ law \"a divisor is a function\" forall (a: Int, b: Int) { a / b == a / b }
     let loaded = load(dir.path()).expect("the fixture compiles");
     let hashes = loaded.hashes.clone();
     let laws = ply_test::obligation::Laws::of(&loaded.check, &hashes);
-    let collected = obligations::collect(&loaded.program, &loaded.check, &hashes);
+    let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
     let prover = Prover::new(&loaded)
         .expect("the port lowers the claims")
         .with_backend(

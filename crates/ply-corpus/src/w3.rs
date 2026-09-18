@@ -357,13 +357,8 @@ impl Loaded {
         let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
         machine.share_region_kinds(ply_eval::region_kind::Kinds::clone(&self.region_kinds));
         let unit = *self.unit.get_or_init(|| {
-            ply_codegen::Unit::over_front(
-                &self.program,
-                &self.resolved,
-                &self.port,
-                self.texts.clone(),
-            )
-            .expect("this host has a C compiler")
+            ply_codegen::Unit::over_front(&self.program, &self.port, self.texts.clone())
+                .expect("this host has a C compiler")
         });
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,

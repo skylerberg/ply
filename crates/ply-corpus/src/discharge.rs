@@ -76,11 +76,11 @@ pub fn discharge(path: &Path, plan: &ProvePlan) -> Result<Discharged> {
             e.diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
         ),
     };
-    let collected = obligations::collect(&loaded.program, &loaded.check, &loaded.hashes);
+    let collected = obligations::collect(&loaded.front, &loaded.check, &loaded.hashes);
     let prover = match Prover::new(&loaded) {
         Ok(prover) => prover,
         Err(e) => bail!(
-            "`{}`'s claims did not lower: {:?}",
+            "`{}`: {:?}",
             path.display(),
             e.diagnostics
                 .iter()
