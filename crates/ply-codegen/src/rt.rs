@@ -11,7 +11,7 @@ use crate::map;
 use ply_eval::arena::Slot;
 use ply_eval::builtins::{cell_in_update, no_such_cell};
 use ply_eval::{Builtin, Closure, ClosureKind, Step, Value, values_equal};
-use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
+use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_ty::{BinOp, EffectAtom, Mode, Resource};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -48,8 +48,9 @@ pub struct Tables {
     pub memo_words: RefCell<HashMap<Identity, Word>>,
     /// Answers of roots called with only memo words, up to [`CALL_MEMO_LIMIT`].
     pub calls: RefCell<HashMap<(Symbol, Vec<Word>), Word>>,
-    /// Each module's source by site index; never cached, since a `SourceId` is per load.
-    pub sources: Vec<SourceId>,
+    /// Each root's definition span in the text the unit runs over, by its place in
+    /// `Exports::taken`: a site is an offset from its start. Never cached: definitions move.
+    pub roots: Vec<Span>,
 }
 
 /// How many calls of roots over memo words a unit remembers.
@@ -380,8 +381,9 @@ pub struct Ctx {
     pub fuel: i64,
     /// The lowest address a compiled frame may begin at: C frames can overflow within the fuel.
     pub stack_floor: usize,
-    /// The site the body stored before a fallible call; the module is `-1` until one is.
-    pub site_module: i64,
+    /// The site the body stored before a fallible call, as bytes from its root's start; the root
+    /// is `-1` until one is.
+    pub site_root: i64,
     pub site_start: i64,
     pub site_end: i64,
     /// The cells, holding heap words: declared before the heap, so their counts go back first.
@@ -441,7 +443,7 @@ impl Ctx {
             failed: 0,
             fuel: 0,
             stack_floor: 0,
-            site_module: -1,
+            site_root: -1,
             site_start: 0,
             site_end: 0,
             heap: Heap::new(),
@@ -485,7 +487,7 @@ impl Ctx {
         self.failed = 0;
         self.fuel = fuel;
         self.stack_floor = stack_floor();
-        self.site_module = -1;
+        self.site_root = -1;
         self.last_linear = None;
         self.diagnostic = None;
         self.stacks.clear();
@@ -506,7 +508,7 @@ impl Ctx {
             self.end();
         }
         heap::enter(&mut self.heap);
-        heap::poison::enter(&raw const self.site_module);
+        heap::poison::enter(&raw const self.site_root);
     }
 
     /// The other end of [`Ctx::begin`]: the entry gives back what it used.
@@ -619,12 +621,22 @@ impl Ctx {
 
     /// The span the body last stored, or `Span::DUMMY` before any has.
     pub fn site(&self) -> Span {
-        usize::try_from(self.site_module)
+        let Some(root) = usize::try_from(self.site_root)
             .ok()
-            .and_then(|m| self.tables.sources.get(m))
-            .map_or(Span::DUMMY, |s| {
-                Span::new(*s, self.site_start as u32, self.site_end as u32)
-            })
+            .and_then(|r| self.tables.roots.get(r))
+            .filter(|r| !r.is_dummy())
+        else {
+            return Span::DUMMY;
+        };
+        let at = |offset: i64| {
+            i64::from(root.start)
+                .checked_add(offset)
+                .and_then(|o| u32::try_from(o).ok())
+        };
+        match (at(self.site_start), at(self.site_end)) {
+            (Some(start), Some(end)) => Span::new(root.source, start, end),
+            _ => Span::DUMMY,
+        }
     }
 
     /// `d` anchored at the body's stored site when it names no place of its own.
