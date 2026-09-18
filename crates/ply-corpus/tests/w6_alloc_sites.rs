@@ -296,9 +296,7 @@ fn the_two_allocation_harnesses_are_one_measurement_read_at_two_windows() {
         );
     }
 
-    // The candidate R3 was planned against, rolled up over every chain a frame of it appears in:
-    // it is a whole-program compile-time analysis and a per-site row understates it by splitting
-    // one pass across its recursion depths.
+    // A whole-program analysis: a per-site row understates it by splitting one pass across its recursion depths.
     println!("\n== the hoist candidate, over every site its frames appear in");
     println!(
         "  {:>9} {:>10} {:>9} {:>9}  family",
@@ -364,7 +362,6 @@ fn the_two_allocation_harnesses_are_one_measurement_read_at_two_windows() {
     );
 }
 
-/// The compile-time analysis R3 proposes to hoist off the request path.
 const HOIST: &str = "ply_eval::region_kind";
 
 fn family_count(family: &str, window: &Window) -> f64 {

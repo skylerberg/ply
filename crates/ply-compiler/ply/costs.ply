@@ -1,5 +1,4 @@
-// Whether an append copies: exactly when something else still owns the list when it runs.
-// Read off the lowering the emitter compiles, so a move here is a move there.
+// Whether an append copies, read off the lowering the emitter compiles so a move here is a move there.
 
 import spine (Span, QName, num, dummy_span)
 import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform, NCell,
@@ -23,7 +22,6 @@ type PState = | PSole | PUnsure(Why) | PShared(Why)
 
 type RState = | RFresh | RParam(Int) | RShared(Why) | RUnsure(Why)
 
-// Indexed as `Prog.defs` is.
 type Tables = { params: List<List<PState>>, rets: List<RState> }
 
 type Bind = { slot: Int, owner: Owner }
@@ -67,8 +65,6 @@ fn fresh(st: St) -> W = { st: st, owner: OFresh }
 fn element() -> Owner = blocked(CElement, b"an element the list being walked still holds")
 
 fn owner_at(xs: List<Owner>, i: Int) -> Owner = match list_at(xs, i) { Some(o) -> o, None -> OFresh }
-
-// --- the walk ---------------------------------------------------------------
 
 fn owner_of(st: St, slot: Int) -> Option<Owner> =
   fold(st.chain, None, |acc: Option<Owner>, b: Bind| if b.slot == slot { Some(b.owner) } else { acc })
@@ -122,7 +118,6 @@ fn walk(env: Env, c: Code, st: St) -> W =
     },
     NRecord(r) -> fresh(fold(r.fields, st, |acc: St, f: CField| walk(env, f.value, acc).st)),
     NUpd(u) -> fresh(walk(env, u.base, fold(u.sets, st, |acc: St, f: CField| walk(env, f.value, acc).st)).st),
-    // A field moves out of a record held once and is cloned out of one held twice.
     NField(f) -> {
       let b = walk(env, f.base, st);
       match b.owner {
@@ -134,7 +129,6 @@ fn walk(env: Env, c: Code, st: St) -> W =
     NList(l) -> fresh(fold(l.items, st, |acc: St, x: Code| walk(env, x, acc).st)),
     NPerform(p) -> { st: fold(p.args, st, |acc: St, x: Code| walk(env, x, acc).st),
                      owner: unknown(CHandler, b"the value a handler answered, which the handler may still hold") },
-    // Clause captures are copied at handle entry, before the body runs.
     NHandle(h) -> {
       let caught = fold(h.clauses, st, |acc: St, cl: CClause| poison(acc, cl.caps, cl.body));
       let armed = match h.ret { Some(r) -> poison(caught, r.caps, r.body), None -> caught };
@@ -190,7 +184,6 @@ fn poison(st: St, caps: List<Cap>, body: Code) -> St =
       }
     })
 
-// The name `slot` is read by in `c`, through any barrier that captures it.
 fn first_name(c: Code, slot: Int) -> Option<Bytes> =
   match c.node {
     NVar(v) -> if v.slot == Some(slot) { Some(v.name) } else { None },
@@ -208,7 +201,6 @@ fn through(caps: List<Cap>, body: Code, slot: Int) -> Option<Bytes> =
   fold(caps, None, |acc: Option<Bytes>, cp: Cap|
     match acc { Some(_) -> acc, None -> if cp.src == slot { first_name(body, cp.dst) } else { None } })
 
-// What `c` reads in its own barrier.
 fn children(c: Code) -> List<Code> =
   match c.node {
     NUnary(u) -> [u.operand],
@@ -237,12 +229,10 @@ fn free(name: Bytes) -> Owner =
 fn var_owner(env: Env, name: Bytes, slot: Option<Int>, own: Own, st: St) -> W =
   match slot {
     Some(s) -> match owner_of(st, s) {
-      // A move keeps the binding's other owners; a clone is itself a second owner.
       Some(o) -> { st: st, owner: if own == Owned { o } else {
         blocked(CReadAgain, bytes_concat_all([b"`", name, b"` is read again after this point, so this use clones it"])) } },
       None -> { st: st, owner: free(name) },
     },
-    // Named outside callee position, a definition is applied by callers this cannot see.
     None -> match def_of(env, name) {
       Some(d) -> { st: add_escaped(st, d), owner: blocked(CProgram, b"a top-level definition, which the program holds") },
       None -> { st: st, owner: if sep_at(name) >= 0 { blocked(CProgram, b"a module-qualified name denotes something the program holds") }
@@ -250,7 +240,6 @@ fn var_owner(env: Env, name: Bytes, slot: Option<Int>, own: Own, st: St) -> W =
     },
   }
 
-// Where a lowered name's `::` starts, or -1 for a bare name.
 fn sep_at(text: Bytes) -> Int =
   fold(range(0, bytes_len(text) - 1), 0 - 1, |acc: Int, i: Int|
     if acc < 0 && bytes_at(text, i) == 58 && bytes_at(text, i + 1) == 58 { i } else { acc })
@@ -268,7 +257,6 @@ fn def_of(env: Env, name: Bytes) -> Option<Int> =
     Some(b) -> map_get(env.prog.index, b.qualified),
   }
 
-// A builtin is a bare name no definition in scope shadows.
 fn builtin_of(env: Env, func: Code) -> Option<Bytes> =
   match func.node {
     NVar(v) -> if v.slot != None || sep_at(v.name) >= 0 || def_of(env, v.name) != None { None }
@@ -335,22 +323,17 @@ fn callback_owners(builtin: Option<Bytes>, at_: Int, arity: Int, done: List<Owne
       Some(b) ->
         if b == b"fold" { Some([match list_at(done, 1) { Some(o) -> o, None -> unknown(CCall, b"the seed of this fold") }, element()]) }
         else if b == b"map" || b == b"filter" { Some([element()]) }
-        // The contents leave the arena for the call, so the function gets them uniquely owned.
         else if b == b"cell_update" { Some([OFresh]) }
-        // The entry leaves the map, so it is uniquely owned exactly when the map was.
         else if b == b"map_update" { Some([match list_at(done, 0) { Some(o) -> o, None -> unknown(CMapEntry, b"the map being updated") }]) }
         else { None },
     }
   }
 
-// A callback written at the call site gets the owners the builtin is known to hand it.
 fn callback(env: Env, owners: List<Owner>, arg: Code, st: St) -> W =
   match arg.node {
     NLambda(l) -> fresh(poison(barrier(env, l.params, owners, l.body, st), l.caps, l.body)),
     _ -> walk(env, arg, st),
   }
-
-// --- the fixpoint over callers ----------------------------------------------
 
 fn rank(p: PState) -> Int = match p { PSole -> 2, PUnsure(_) -> 1, PShared(_) -> 0 }
 
@@ -397,7 +380,6 @@ fn start_tables(defs: List<Def>) -> Tables =
 
 fn walk_body(env: Env, b: Body) -> Found =
   match b.code {
-    // Not lowered, so not emitted: none of it runs.
     None -> { sites: [], demands: [], escaped: [], ret: unknown(CCall, b"the value a call answered, which the callee may also hold") },
     Some(c) -> {
       let chain = map(range(0, b.arity), |k: Int| { slot: k, owner: if b.def < 0 { OFresh } else { OParam(k) } });
@@ -421,13 +403,10 @@ fn settle(p: Prog, found: List<Found>, t: Tables) -> Tables =
     if b.def < 0 { demanded } else { with_ret(demanded, b.def, ret_of(f.ret)) }
   })
 
-// Verdicts come from a walk under the settled tables, not the round that produced them.
 fn fixpoint(p: Prog, t: Tables, rounds: Int) -> Settled = {
   let next = settle(p, round(p, t), t);
   if next == t || rounds + 1 >= 24 { { tables: next, rounds: rounds + 1 } } else { fixpoint(p, next, rounds + 1) }
 }
-
-// --- the answer -------------------------------------------------------------
 
 fn fix(c: Option<Cause>) -> Bytes =
   match c {
@@ -439,7 +418,6 @@ fn fix(c: Option<Cause>) -> Bytes =
     _ -> b"",
   }
 
-// `site <start> <end> <verdict> <parameter or -> <n> <m>\n`, then the reason's `n` bytes and the fix's `m`.
 fn site_frame(s: Span, verdict: Bytes, reason: Bytes, cause: Option<Cause>, param: Int) -> Bytes = {
   let f = fix(cause);
   bytes_concat_all([b"site ", num(s.start), b" ", num(s.end), b" ", verdict, b" ",
@@ -463,14 +441,12 @@ fn finish(raw: Raw, def: Int, t: Tables) -> Bytes =
     },
   }
 
-// `def <kind> <promise start> <promise end> <a> <b> <c>\n`, then the module, the name and the label; `- -` for no `reuse`.
 fn def_frame(b: Body) -> Bytes =
   bytes_concat_all([b"def ", b.kind, b" ",
                     match b.reuse { Some(s) -> bytes_concat_all([num(s.start), b" ", num(s.end)]), None -> b"- -" },
                     b" ", num(bytes_len(b.module_name)), b" ", num(bytes_len(b.name)), b" ", num(bytes_len(b.label)), b"\n",
                     b.module_name, b.name, b.label])
 
-// A test or a law is labelled by its name, quoted and escaped.
 fn quoted(s: Bytes) -> Bytes =
   bytes_concat_all([b"\"", bytes_concat_all(map(range(0, bytes_len(s)), |i: Int| {
     let c = bytes_at(s, i);
@@ -505,7 +481,6 @@ fn bodies_of(mods: List<Mod>, index: Map<Bytes, Int>) -> List<Body> =
     })
   })
 
-// Parsed, rewritten, derived and resolved together, as the emitter takes a program.
 fn program_of(names: List<Bytes>, srcs: List<Bytes>, builtins: List<Bytes>) -> Option<Prog> = {
   let parsed = map(range(0, len(names)), |i: Int| {
     let r = parse(at(srcs, i));
@@ -527,13 +502,13 @@ fn program_of(names: List<Bytes>, srcs: List<Bytes>, builtins: List<Bytes>) -> O
   }
 }
 
-// Every append in the program, under the definition it is written in: `rounds <n>\n`, then each
-// definition with an append as a `def` frame followed by its `site` frames. Empty when the program does not resolve.
+// `rounds <n>\n`, then per definition with an append a `def` frame and its `site` frames, each text length-prefixed in its header.
 pub fn costs_dump(names: List<Bytes>, srcs: List<Bytes>, builtins: List<Bytes>) -> String =
   match program_of(names, srcs, builtins) {
     None -> string_of_bytes(b""),
     Some(p) -> {
       let settled = fixpoint(p, start_tables(p.defs), 0);
+      // Verdicts come from a walk under the settled tables, not the round that produced them.
       let found = round(p, settled.tables);
       string_of_bytes(bytes_concat_all(fold(range(0, len(p.bodies)), [bytes_concat_all([b"rounds ", num(settled.rounds), b"\n"])],
         |acc: List<Bytes>, i: Int| {
