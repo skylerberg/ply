@@ -1,19 +1,13 @@
-//! The program a unit compiles out of: the front end's answer over it, and the tree the reference
-//! emitter still reads bodies from.
+//! The program a unit compiles out of: the front end's answer over it, and each module's text.
 //!
 //! **Every table here is the front end's, not the tree's** (ADR 0052 §1). The constructor table,
 //! the roots the unit compiles, their cache keys, their arities and the module list all come from
-//! a [`Front`], so that the day the tree goes, what is left to move is the reference emitter and
-//! nothing around it. The tree is read for one thing: the body `definition` hands the reference
-//! emitter.
+//! a [`Front`].
 
 use ply_hash::HashOutput;
 use ply_hash::body::BodySet;
-use ply_span::{SourceId, Span, Symbol};
-use ply_syntax::ast::{
-    AtomExpr, Expr, ExprKind, FnDef, Generics, Ident, Item, Lit, Param, Program, QName, SpecKind,
-    Stmt, TestDef, TypeExpr, UnOp, Visibility,
-};
+use ply_span::{SourceId, Symbol};
+use ply_syntax::ast::{AtomExpr, Expr, ExprKind, Item, Lit, Program, QName, SpecKind, Stmt, UnOp};
 use ply_syntax::resolve::{Namespace, Resolved};
 use ply_ty::{
     CheckOutput, DefWritten, EffectAtom, EffectSet, Footprint, Front, Hashed, LawInfo, Literal,
@@ -29,58 +23,14 @@ pub struct Source {
     pub front: &'static Front,
     /// [`Front::check`], which is where a name's scheme, footprint and spec are read from.
     pub check: &'static CheckOutput,
-    /// Every definition by program-wide name, with the index of its module: the code generator
-    /// asks for one at each name it resolves.
-    ///
-    /// The tests', laws' and clauses' entries are synthesized here because the reference emitter
-    /// reads a body from the tree; their *names* are the front end's, as [`Tables::roots`] lists
-    /// them, so the root set is one answer rather than two walks that have to agree.
-    definitions: HashMap<String, (&'static FnDef, usize)>,
     tables: Tables,
     /// What each definition's emitted code is a function of, when the caller knows: its hash over
     /// its own text and everything it references. Empty when nobody supplied any, and then nothing
     /// is kept between runs.
     pub keys: HashMap<String, String>,
-    /// Each module's source text, by module name, when the caller has it: what a second emitter
-    /// is handed, since it reads the program from its text. Empty otherwise.
+    /// Each module's source text, by module name: what the emitter reads the program from, so a
+    /// build over a source without them is refused.
     pub texts: HashMap<String, String>,
-    regions: std::sync::OnceLock<ply_eval::region_kind::Regions>,
-    stack_handled: std::sync::OnceLock<StackHandled>,
-}
-
-/// What some handler on the stack could answer, anywhere in this program.
-///
-/// The question a `perform` in a compiled body has to settle is whether it can reach a handler
-/// rather than the host. A handler on the stack resumes, and resuming means capturing the frame
-/// the `perform` is in, which a compiled frame cannot give; the host *returns*, which is a call.
-/// So the compilable `perform` is the one that provably finds no stack handler.
-///
-/// It is a whole-program property and that is what makes it sound against an interpreted caller: a
-/// compiled body can be called from inside an interpreted `handle`, but if the program declares no
-/// handler for the operation, no frame above it can be one.
-#[derive(Default)]
-pub struct StackHandled {
-    /// `effect.op` of every `handle` clause written anywhere, resource ignored -- a clause with a
-    /// resource is counted for every resource, which refuses more than it must and never less.
-    ops: std::collections::HashSet<String>,
-    /// The brand of every `with_cell`, whose operations a cell answers.
-    resources: std::collections::HashSet<Symbol>,
-}
-
-impl StackHandled {
-    /// Whether a `perform` of this operation could find a handler rather than the host.
-    ///
-    /// `task.*` is answered by a `simulate` opening a region rather than by a handler at all, so it
-    /// counts as reachable however the program is written.
-    pub fn could_reach(&self, effect: &str, op: &str, resource: Option<&Symbol>) -> bool {
-        if effect == "task" {
-            return true;
-        }
-        if self.ops.contains(&format!("{effect}.{op}")) {
-            return true;
-        }
-        resource.is_some_and(|r| self.resources.contains(r))
-    }
 }
 
 /// The name a test's root takes: its place among its module's tests, which `ply_eval`'s test
@@ -188,12 +138,6 @@ fn qualified(module: &Symbol, name: &Symbol) -> String {
 /// One clause of `owner`, whose name is already program-wide.
 fn clause_root(owner: &Symbol, kind: &str, ordinal: usize) -> String {
     format!("{owner}#{kind}#{ordinal}")
-}
-
-/// Whether `name` is one of the roots above rather than a written definition or a test.
-pub fn is_spec_root(name: &str) -> bool {
-    let local = name.rsplit('.').next().unwrap_or(name);
-    name.contains(".law#") || local.contains("#requires#") || local.contains("#ensures#")
 }
 
 /// A [`Front`] assembled from the tree around a check the caller already holds, for a source the
@@ -651,82 +595,6 @@ fn is_scalar(ty: &Type) -> bool {
     matches!(ty, Type::Con(name, args) if args.is_empty() && matches!(name.as_str(), "Int" | "Bool"))
 }
 
-fn bool_type(span: Span) -> TypeExpr {
-    TypeExpr::Con {
-        name: QName::bare(Ident {
-            name: Symbol::new("Bool"),
-            span,
-        }),
-        args: Vec::new(),
-        span,
-    }
-}
-
-/// A proposition over bound names as a definition answering `Bool`, so the unit compiles it
-/// like any other and the judge enters it with the names' values as arguments.
-fn proposition_as_definition(name: &Symbol, params: Vec<Param>, body: &Expr, span: Span) -> FnDef {
-    FnDef {
-        vis: Visibility::Private,
-        name: Ident {
-            name: name.clone(),
-            span,
-        },
-        generics: Generics {
-            types: Vec::new(),
-            effects: Vec::new(),
-        },
-        params,
-        ret: Some(bool_type(span)),
-        effects: None,
-        constraints: Vec::new(),
-        derived: None,
-        spec: Vec::new(),
-        reuse: None,
-        body: body.clone(),
-        span,
-    }
-}
-
-/// The owner's parameters as a proposition's, when every one has a written type; a clause over
-/// an unannotated parameter has no root, and the judge evaluates it as before.
-fn typed_params(def: &FnDef) -> Option<Vec<Param>> {
-    def.params
-        .iter()
-        .map(|p| {
-            p.ty.as_ref().map(|ty| Param {
-                name: p.name.clone(),
-                ty: Some(ty.clone()),
-                default: None,
-                span: p.span,
-            })
-        })
-        .collect()
-}
-
-/// A test's body as a nullary definition, so the fragment compiles it like any other.
-fn test_as_definition(test: &TestDef, name: &Symbol) -> FnDef {
-    FnDef {
-        vis: Visibility::Private,
-        name: Ident {
-            name: name.clone(),
-            span: test.name_span,
-        },
-        generics: Generics {
-            types: Vec::new(),
-            effects: Vec::new(),
-        },
-        params: Vec::new(),
-        ret: None,
-        effects: None,
-        constraints: Vec::new(),
-        derived: None,
-        spec: Vec::new(),
-        reuse: None,
-        body: test.body.clone(),
-        span: test.span,
-    }
-}
-
 impl Source {
     /// A source over a program the Rust chain has already answered for, with no hashes: nothing is
     /// kept between runs for it.
@@ -768,153 +636,22 @@ impl Source {
             resolved,
             front,
             check: &front.check,
-            definitions: synthesized(program),
             tables: Tables::of(front),
             keys,
             texts: HashMap::new(),
-            regions: std::sync::OnceLock::new(),
-            stack_handled: std::sync::OnceLock::new(),
         }
     }
-}
 
-/// Every definition of the program by program-wide name, with the index of the module its bare
-/// names resolve in — and the tests', laws' and clauses' propositions synthesized as definitions,
-/// because the reference emitter reads a *body* from the tree.
-///
-/// The names are the front end's: [`Tables::roots`] lists exactly these, walking the same items in
-/// the same order, so the root set is one answer rather than two walks that have to agree.
-fn synthesized(program: &'static Program) -> HashMap<String, (&'static FnDef, usize)> {
-    let mut definitions = HashMap::new();
-    for (index, module) in program.modules.iter().enumerate() {
-        let mut ordinal = 0;
-        let mut law_ordinal = 0;
-        for item in &module.items {
-            match item {
-                Item::Fn(def) => {
-                    definitions
-                        .entry(module.name.qualify(&def.name.name).to_string())
-                        .or_insert((&**def, index));
-                }
-                // A test is a root the machine enters whole: a nullary definition of its
-                // body, named by its place among the module's tests, which is the name the
-                // test runner offers.
-                Item::Test(test) => {
-                    let name = test_root_name(ordinal);
-                    let def: &'static FnDef = Box::leak(Box::new(test_as_definition(test, &name)));
-                    definitions.insert(module.name.qualify(&name).to_string(), (def, index));
-                    ordinal += 1;
-                }
-                Item::Law(law) => {
-                    let params: Vec<Param> = law
-                        .binders
-                        .iter()
-                        .map(|b| Param {
-                            name: b.name.clone(),
-                            ty: Some(b.ty.clone()),
-                            default: None,
-                            span: b.span,
-                        })
-                        .collect();
-                    let parts = [("guard", law.guard.as_ref()), ("body", Some(&law.body))];
-                    for (part, expr) in parts {
-                        let Some(expr) = expr else { continue };
-                        let name = law_root_name(law_ordinal, part);
-                        let def: &'static FnDef = Box::leak(Box::new(proposition_as_definition(
-                            &name,
-                            params.clone(),
-                            expr,
-                            law.span,
-                        )));
-                        definitions.insert(module.name.qualify(&name).to_string(), (def, index));
-                    }
-                    law_ordinal += 1;
-                }
-                _ => {}
-            }
-            if let Item::Fn(def) = item
-                && let Some(params) = typed_params(def)
-            {
-                let mut counts = (0usize, 0usize);
-                for clause in &def.spec {
-                    let (kind, ordinal, params) = match clause.kind {
-                        SpecKind::Requires => {
-                            counts.0 += 1;
-                            ("requires", counts.0 - 1, params.clone())
-                        }
-                        SpecKind::Ensures => {
-                            counts.1 += 1;
-                            let Some(ret) = &def.ret else { continue };
-                            let mut with_result = params.clone();
-                            with_result.push(Param {
-                                name: Ident {
-                                    name: Symbol::new("result"),
-                                    span: def.span,
-                                },
-                                ty: Some(ret.clone()),
-                                default: None,
-                                span: def.span,
-                            });
-                            ("ensures", counts.1 - 1, with_result)
-                        }
-                    };
-                    let name = clause_root_name(&def.name.name, kind, ordinal);
-                    let root: &'static FnDef = Box::leak(Box::new(proposition_as_definition(
-                        &name,
-                        params,
-                        &clause.expr,
-                        clause.span,
-                    )));
-                    definitions.insert(module.name.qualify(&name).to_string(), (root, index));
-                }
-            }
-        }
-    }
-    definitions
-}
-
-impl Source {
     /// The same source, with each module's text.
     pub fn with_texts(mut self, texts: HashMap<String, String>) -> Source {
         self.texts = texts;
         self
     }
 
-    /// The definition a program-wide name denotes, and the index of the module its bare names
-    /// resolve in — the pair the machine keys everything on.
-    pub fn definition(&self, name: &str) -> Option<(&'static FnDef, usize)> {
-        self.definitions.get(name).copied()
-    }
-
     /// Every sum-type constructor in the program, by program-wide name, with its arity — the table
     /// `Machine::build` assembles and `lookup` reads.
     pub fn ctors(&self) -> Vec<(Symbol, usize)> {
         self.tables.ctors.clone()
-    }
-
-    /// The regions this program opens, inferred once and kept. A `with cell` site asks whether it
-    /// opens one, which decides whether a tier with no frame to close it on can carry the site.
-    pub fn regions(&self) -> &ply_eval::region_kind::Regions {
-        self.regions
-            .get_or_init(|| ply_eval::region_kind::infer(self.program, self.resolved))
-    }
-
-    /// [`StackHandled`] for this program, walked once and kept.
-    pub fn stack_handled(&self) -> &StackHandled {
-        self.stack_handled.get_or_init(|| {
-            let mut out = StackHandled::default();
-            for name in self.functions() {
-                let Some((def, _)) = self.definition(&name) else {
-                    continue;
-                };
-                let params: Vec<Symbol> = def.params.iter().map(|p| p.name.name.clone()).collect();
-                // The *unoptimised* body: inlining can only bring more handlers into a body, never
-                // fewer, and this has to be an answer about the program rather than about one
-                // emitter's settings.
-                walk_handlers(&ply_eval::code::lower_fn(&params, &def.body).code, &mut out);
-            }
-            out
-        })
     }
 
     /// Every root this unit compiles: every `fn` by program-wide name in source order, then the
@@ -946,86 +683,5 @@ impl Source {
     /// Every module's name, in program order.
     pub fn module_names(&self) -> impl Iterator<Item = &Symbol> {
         self.tables.modules.iter().map(|(name, _)| name)
-    }
-}
-
-/// Every `handle` clause and `with_cell` brand in one lowered body, lambdas and clause bodies
-/// included.
-fn walk_handlers(code: &ply_eval::code::Code, out: &mut StackHandled) {
-    use ply_eval::code::NodeKind as N;
-    match &code.kind {
-        N::Handle { body, clauses, ret } => {
-            for c in clauses.iter() {
-                out.ops
-                    .insert(format!("{}.{}", c.effect.symbol().as_str(), c.op.as_str()));
-            }
-            walk_handlers(body, out);
-            for c in clauses.iter() {
-                walk_handlers(&c.body, out);
-            }
-            if let Some(r) = ret {
-                walk_handlers(&r.body, out);
-            }
-        }
-        N::WithCell {
-            resource,
-            init,
-            body,
-            ..
-        } => {
-            out.resources.insert(resource.clone());
-            walk_handlers(init, out);
-            walk_handlers(body, out);
-        }
-        N::Lit(..) | N::Var { .. } => {}
-        N::Unary { operand, .. } => walk_handlers(operand, out),
-        N::Binary { lhs, rhs, .. } => {
-            walk_handlers(lhs, out);
-            walk_handlers(rhs, out);
-        }
-        N::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            walk_handlers(cond, out);
-            walk_handlers(then_branch, out);
-            walk_handlers(else_branch, out);
-        }
-        N::Block { stmts, tail } => {
-            for s in stmts.iter() {
-                match s {
-                    ply_eval::code::Stmt::Let { value, .. } => walk_handlers(value, out),
-                    ply_eval::code::Stmt::Expr { code } => walk_handlers(code, out),
-                }
-            }
-            if let Some(t) = tail {
-                walk_handlers(t, out);
-            }
-        }
-        N::Field { base, .. } => walk_handlers(base, out),
-        N::Record { fields } => fields.iter().for_each(|(_, e)| walk_handlers(e, out)),
-        N::RecordUpdate { base, sets, .. } => {
-            walk_handlers(base, out);
-            sets.iter().for_each(|(_, e)| walk_handlers(e, out));
-        }
-        N::List { items } => items.iter().for_each(|i| walk_handlers(i, out)),
-        N::App { func, args } => {
-            walk_handlers(func, out);
-            args.iter().for_each(|a| walk_handlers(a, out));
-        }
-        N::Match { scrutinee, arms } => {
-            walk_handlers(scrutinee, out);
-            for a in arms.iter() {
-                if let Some(g) = &a.guard {
-                    walk_handlers(g, out);
-                }
-                walk_handlers(&a.body, out);
-            }
-        }
-        N::Lambda { body, .. } | N::Simulate { body, .. } | N::WithRegion { body } => {
-            walk_handlers(body, out)
-        }
-        N::Perform { args, .. } => args.iter().for_each(|a| walk_handlers(a, out)),
     }
 }

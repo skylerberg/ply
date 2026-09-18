@@ -9,5 +9,4 @@ mod c;
 mod heap;
 mod list;
 mod map;
-mod opt;
 mod stack;

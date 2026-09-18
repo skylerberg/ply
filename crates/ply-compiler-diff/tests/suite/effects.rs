@@ -1,10 +1,6 @@
 //! What the compiled tiers would have to carry to compile effects, and what corpus there is to
 //! test it against.
 //!
-//! Both compiled tiers refuse all four effect constructs today (`c/emit.rs`'s `describe`,
-//! `jit.rs`'s arms beside it), so an effectful body runs interpreted. This is the census of what
-//! that costs and of what any implementation has to be checked against.
-//!
 //! **The hard one is `handle`.** Ply's `resume` is multi-shot (`docs/GUIDE.md` §7.7, ADR 0034), so
 //! a captured extent has to splice onto any stack at any height -- which a C function's frame
 //! cannot do. Compiling it means a state-machine transform for every function with a non-empty

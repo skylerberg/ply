@@ -571,7 +571,7 @@ footprint, suspects, culprit and replay command. `--watch` re-runs on every
 `--backend c` compiles the program to C and enters compiled code for what it
 accepts, leaving the rest to the interpreter. A test the backend fails and the
 interpreter passes is `E0503`. Backend results are cached separately.
-`--profile development` (default; fastest compiler, inlining off) or `release`
+`--profile development` (default; fastest compiler) or `release`
 (`cc -O2`) requires `--backend`. `--backend [c:]wrong:<mutation>` is wrong on
 purpose and never cached.
 

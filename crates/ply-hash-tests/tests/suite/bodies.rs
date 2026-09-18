@@ -652,7 +652,7 @@ fn on_the_tier<'a>(
 ) -> ply_eval::Machine<'a> {
     let texts: std::collections::HashMap<String, String> =
         ply_syntax::print::program(program).into_iter().collect();
-    let unit = ply_codegen::Unit::over_with_texts(program, resolved, check, texts)
+    let unit = ply_codegen::Unit::over_with_texts(program, resolved, texts)
         .expect("this host has a C compiler");
     let spec = ply_eval::BackendSpec {
         kind: ply_eval::BackendKind::C,

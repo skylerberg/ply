@@ -89,13 +89,9 @@ impl Compiled {
     /// Every eval-test that runs a program uses it, since a bare machine holds no evaluator.
     pub fn machine(&self) -> Machine<'_> {
         let mut m = Machine::new(&self.program, &self.resolved, &self.check);
-        let unit = ply_codegen::Unit::over_with_texts(
-            &self.program,
-            &self.resolved,
-            &self.check,
-            self.texts.clone(),
-        )
-        .expect("this host has a C compiler");
+        let unit =
+            ply_codegen::Unit::over_with_texts(&self.program, &self.resolved, self.texts.clone())
+                .expect("this host has a C compiler");
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,
             ..Default::default()

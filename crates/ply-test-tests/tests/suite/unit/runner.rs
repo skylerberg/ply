@@ -98,15 +98,10 @@ impl Program {
 
     /// Runs the fixture on a real compiled C tier — the only evaluator under tier-only — so every
     /// scheduling and caching test in this file is exercised over a real Ply program end to end.
-    /// `Unit::over` leaks a `&'static Unit`, which is fine in a test.
+    /// `Unit::over_with_texts` leaks a `&'static Unit`, which is fine in a test.
     fn run(&self, selection: &Selection, store: &mut Store) -> ply_test::RunReport {
-        let unit = ply_codegen::Unit::over_with_texts(
-            &self.program,
-            &self.resolved,
-            &self.check,
-            self.texts(),
-        )
-        .expect("this host has a C compiler");
+        let unit = ply_codegen::Unit::over_with_texts(&self.program, &self.resolved, self.texts())
+            .expect("this host has a C compiler");
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,
             ..Default::default()
