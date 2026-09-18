@@ -123,10 +123,7 @@ impl Front {
             .any(|d| d.severity == Severity::Error)
     }
 
-    /// The part no module declares (the order and the prelude's entries), then one part per
-    /// module in `check.modules` order. A part numbers its tests and laws from zero and spans only
-    /// its own module, so written against that module alone it reads back at any position. `Err`
-    /// when a table is not laid out as [`Front::join`] lays it, so could not be rebuilt.
+    /// The part no module declares, then one per module; `Err` when `join` could not rebuild it.
     pub fn split(&self) -> Result<(Front, Vec<Front>), String> {
         if !self.diagnostics.is_empty() {
             return Err("an answer with diagnostics does not split".to_string());
@@ -191,7 +188,6 @@ impl Front {
             parts[i].types.insert(name.clone(), t.clone());
         }
 
-        // Each test's and law's part, and its number there.
         let mut tested = Vec::with_capacity(tests);
         let mut laid = Laid::new("tests");
         for (n, t) in self.check.tests.iter().enumerate() {
@@ -341,9 +337,7 @@ impl Front {
         Ok((program, parts))
     }
 
-    /// [`Front::split`] undone, `parts` in source order. Definitions, effects and constructors
-    /// follow `program`'s order, as the checker publishes them; the rest follows the parts, with
-    /// tests and laws numbered program-wide again.
+    /// Undoes [`Front::split`]; `parts` are in source order, not `program.order`.
     pub fn join(program: Front, mut parts: Vec<Front>) -> Result<Front, String> {
         let mut place: BTreeMap<&Symbol, usize> = BTreeMap::new();
         for (i, part) in parts.iter().enumerate() {
@@ -456,7 +450,6 @@ impl Front {
     }
 }
 
-/// Checks a table arrives as [`Front::join`] lays it down: grouped, the groups ascending.
 struct Laid {
     what: &'static str,
     at: usize,
@@ -476,7 +469,6 @@ impl Laid {
     }
 }
 
-/// A table keyed by program-wide name, dealt to the parts that declare its names.
 fn deal<V: Clone>(
     table: &IndexMap<Symbol, V>,
     owned: impl Fn(&Symbol) -> Result<usize, String>,

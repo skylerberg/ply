@@ -1,6 +1,4 @@
-//! The front end's answer over the last program asked about, in the parts the driver files it
-//! as, each under the key of everything it is a function of. One file, replaced whole, so it
-//! never holds more than one program's parts.
+//! The parts of the front end's last answer, in one file replaced whole.
 
 use crate::{ContentHash, FRONTEND_FORMAT, FRONTEND_VERSION, disk};
 use ply_span::frames::Cursor;

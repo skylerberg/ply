@@ -306,12 +306,10 @@ pub struct Store {
     stdlib: Stdlib,
 }
 
-/// The front end's answer in parts, read on the first question.
 #[derive(Default)]
 struct Answer {
     path: PathBuf,
     stored: OnceLock<std::collections::BTreeMap<ContentHash, String>>,
-    /// Set only when it differs from what is on disk; replaces every part there.
     pending: Option<std::collections::BTreeMap<ContentHash, String>>,
 }
 
@@ -944,7 +942,6 @@ impl Store {
         self.stdlib.pending = Some(digest);
     }
 
-    /// A part of the front end's last answer, when it was filed under `key`.
     pub fn front_part(&self, key: ContentHash) -> Option<String> {
         let parts = match &self.answer.pending {
             Some(pending) => pending,
@@ -953,8 +950,7 @@ impl Store {
         parts.get(&key).cloned()
     }
 
-    /// Replaces every part on disk at the next flush, unless these are the parts already there:
-    /// only the latest answer is ever kept.
+    /// Replaces every part on disk at the next flush, unless these are the parts already there.
     pub fn put_front_parts(&mut self, parts: std::collections::BTreeMap<ContentHash, String>) {
         self.answer.pending = if self.answer.stored().keys().eq(parts.keys()) {
             None

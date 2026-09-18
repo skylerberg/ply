@@ -400,14 +400,10 @@ fn an_unchanged_project_is_answered_from_the_store_and_an_edit_asks_again() {
     assert_eq!(snapshot(&again), snapshot(&edited));
 }
 
-/// Structurally, so every table's order and every span's source must agree too.
 fn answer(loaded: &Loaded) -> String {
     format!("{:?}", loaded.front)
 }
 
-/// After each edit the incremental answer is the from-scratch one, and the port was
-/// asked about only the modules the edit reached, with what they import; an edit to the import
-/// graph asks the whole program.
 #[test]
 fn an_edit_asks_only_the_modules_it_reached_and_answers_as_a_full_load() {
     use ply_codegen::c::producer;
@@ -439,7 +435,6 @@ fn an_edit_asks_only_the_modules_it_reached_and_answers_as_a_full_load() {
     edit(dir.path(), "leaf.ply", "pub fn one()", "fn one()");
     step("`pub` removed in a leaf", 1);
 
-    // The port's diagnostics for a part are not the whole program's, so an error asks it whole.
     edit(
         dir.path(),
         "leaf.ply",
