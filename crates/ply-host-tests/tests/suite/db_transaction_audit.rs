@@ -413,7 +413,12 @@ fn a_connection_lost_mid_transaction_is_a_value_and_commits_nothing(cluster: &Cl
         ALONE,
     )
     .expect("a peer that went away is a value and not a diagnostic");
-    failed_with(&after, "08006");
+    // The server may deliver its termination notice before the socket closes.
+    let code = sqlstate(&after);
+    assert!(
+        matches!(code.as_deref(), Some("08006" | "57P01")),
+        "expected a lost connection, got {after:?}"
+    );
 
     let committed = commit(&db);
     failed_with(&committed, "08006");
