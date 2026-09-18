@@ -6,9 +6,7 @@ pub mod tokens;
 use ply_span::{Diagnostic, SourceId, Span};
 use ply_syntax::ast::*;
 use ply_syntax::parse_unexpanded;
-
-/// **What the differential compares, and what it structurally cannot see.**
-pub mod dumper_boundaries {}
+use std::path::{Path, PathBuf};
 
 /// The whole answer for one file: the tree, then every diagnostic in the order the parser raised
 /// them.
@@ -60,8 +58,6 @@ pub fn nodes_the_rewrites_add(text: &str) -> isize {
     let a = node_count(&dump_of(text, &after, &ad));
     a as isize - b as isize
 }
-
-// > **WITHDRAWN 2026-08-30 — the projection is gone, not merely unused.**
 
 /// **What the pre-expansion comparison gives up, as data rather than as prose.**
 pub fn diagnostics_the_rewrites_add(text: &str) -> Vec<String> {
@@ -869,104 +865,6 @@ fn strip_one_newline(mut s: String) -> String {
     s
 }
 
-/// One diagnostic, read back out of a dump: code, primary span, every label, and the note count.
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct DumpedDiag {
-    pub code: String,
-    pub span: (u32, u32),
-    pub notes: usize,
-    pub labels: Vec<(u32, u32, bool)>,
-}
-
-/// A dump split into its tree and its diagnostics.
-pub fn split_diags(dump: &str) -> Option<(&str, Vec<DumpedDiag>)> {
-    let mut starts: Vec<usize> = Vec::new();
-    for (i, _) in dump.match_indices('#') {
-        starts.push(i);
-    }
-    for &at in starts.iter().rev() {
-        let rest = &dump[at..];
-        let Some(semi) = rest.find(';') else { continue };
-        let Ok(k) = rest[1..semi].parse::<usize>() else {
-            continue;
-        };
-        if let Some(ds) = read_diags(&rest[semi + 1..], k) {
-            return Some((&dump[..at], ds));
-        }
-    }
-    None
-}
-
-fn read_diags(mut tail: &str, k: usize) -> Option<Vec<DumpedDiag>> {
-    let mut out = Vec::with_capacity(k);
-    for _ in 0..k {
-        let body = tail.strip_prefix('!')?;
-        let end = body.find(';')?;
-        let f: Vec<&str> = body[..end].split(':').collect();
-        if f.len() != 5 {
-            return None;
-        }
-        let nlabels: usize = f[3].parse().ok()?;
-        let mut d = DumpedDiag {
-            code: f[0].to_string(),
-            span: (f[1].parse().ok()?, f[2].parse().ok()?),
-            notes: f[4].parse().ok()?,
-            labels: Vec::with_capacity(nlabels),
-        };
-        tail = &body[end + 1..];
-        for _ in 0..nlabels {
-            let lb = tail.strip_prefix('=')?;
-            let e = lb.find(';')?;
-            let g: Vec<&str> = lb[..e].split(':').collect();
-            if g.len() != 3 {
-                return None;
-            }
-            d.labels
-                .push((g[0].parse().ok()?, g[1].parse().ok()?, g[2] == "1"));
-            tail = &lb[e + 1..];
-        }
-        out.push(d);
-    }
-    if tail.is_empty() { Some(out) } else { None }
-}
-
-/// A `b"..."` literal holding exactly these bytes, for embedding a source file in a generated Ply
-/// program.
-pub fn byte_literal(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() + 16);
-    out.push_str("b\"");
-    for &b in bytes {
-        match b {
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            0x20..=0x7e => out.push(b as char),
-            _ => out.push_str(&format!("\\x{b:02x}")),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// A program bundle: programs separated by a line holding exactly `%%%`, modules within one by a
-/// line holding exactly `%%`, and each module's first line its dotted name.
-pub fn programs(text: &str) -> Vec<Vec<(String, String)>> {
-    let mut out = Vec::new();
-    // Everything before the first separator is the bundle's header, not a program.
-    for chunk in text.split("\n%%%\n").skip(1) {
-        let chunk = chunk.trim_start_matches('\n');
-        if chunk.trim().is_empty() {
-            continue;
-        }
-        let mut modules = Vec::new();
-        for m in chunk.split("\n%%\n") {
-            let (name, src) = m.split_once('\n').unwrap_or((m, ""));
-            modules.push((name.trim().to_string(), src.to_string()));
-        }
-        out.push(modules);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1031,49 +929,16 @@ mod tests {
     }
 
     #[test]
-    fn a_dump_splits_into_its_tree_and_its_diagnostics() {
-        let dump = reference_dump("derive frobnicate for Order\nfn f() = 1\n");
-        let (tree, ds) = split_diags(&dump).expect("a well-formed dump");
-        assert_eq!(ds.len(), 1);
-        assert_eq!(ds[0].code, "E0207");
-        assert_eq!(ds[0].labels, vec![(7, 17, true)]);
-        assert!(tree.ends_with("@31;"), "{tree}");
-        // A tree holding its own `#K;` runs must not be mistaken for the block: the split is the
-        // last suffix that parses, so an empty diagnostic list after a tree full of lists still
-        // lands in the right place.
-        let clean = reference_dump("fn f() = [1, 2, 3]\n");
-        let (_, none) = split_diags(&clean).expect("a well-formed dump");
-        assert!(none.is_empty());
-    }
-
-    #[test]
     fn a_bundle_gives_back_exactly_the_fixtures_that_were_written() {
         // The three cases the separator rule exists for: no trailing newline, one trailing newline,
         // and empty.
         let text = "header\nlines\n%%\nfn f() = 1\n%%\nfn g() = 2\n\n%%\n\n";
         assert_eq!(bundle(text), vec!["fn f() = 1", "fn g() = 2\n", ""]);
     }
-
-    #[test]
-    fn a_byte_literal_round_trips_every_byte_through_the_real_lexer() {
-        let all: Vec<u8> = (0u8..=255).collect();
-        let source = byte_literal(&all);
-        let (tokens, diags) = ply_syntax::lexer::lex(SourceId(0), &source);
-        assert!(diags.is_empty(), "{diags:?}");
-        assert_eq!(tokens[0].kind, ply_syntax::lexer::TokenKind::Bytes(all));
-    }
 }
 
-/// The port, entered in-process: the self-hosted compiler as the binary carries it, compiled,
-/// each phase called with its input and answering the dump the reference side is compared to.
-///
-/// The bundle is the compiler, and the fixpoint test in `crates/ply-codegen-tests` is what says
-/// it was emitted from the sources in the tree; a working copy is entered through
-/// `PLY_C_EMITTER=ply:<dir>` once `stage` has bootstrapped it.
 pub mod port {
-    use ply_eval::{Fields, Value};
-    use ply_span::Symbol;
-    use std::sync::Arc;
+    use ply_eval::Value;
 
     /// Enters `name` -- `module.function`, as the sources spell it -- and answers the string it
     /// returned. A raise, a missing entry or a non-string answer is the harness's own failure and
@@ -1094,55 +959,27 @@ pub mod port {
     pub fn dump(name: &str, src: &[u8]) -> String {
         call(name, &[Value::bytes(src)])
     }
-
-    /// `resolve.Source`, the module record every whole-program phase takes a list of.
-    #[allow(clippy::arc_with_non_send_sync)]
-    pub fn source(name: &str, src: &str) -> Value {
-        Value::Record(Arc::new(Fields::from_unsorted(vec![
-            (Symbol::new("name"), Value::bytes(name.as_bytes())),
-            (Symbol::new("src"), Value::bytes(src.as_bytes())),
-        ])))
-    }
-
-    /// A phase over a program: `name(sources: List<Source>) -> String`.
-    pub fn dump_program(name: &str, modules: &[(String, String)]) -> String {
-        let sources = modules.iter().map(|(n, s)| source(n, s)).collect();
-        call(name, &[Value::list(sources)])
-    }
-
-    pub fn bytes_list(items: &[String]) -> Value {
-        Value::list(items.iter().map(|s| Value::bytes(s.as_bytes())).collect())
-    }
 }
 
-/// The items at positions `index`, `index + of`, `index + 2·of`, …: one round-robin part of a
-/// corpus, for a differential too long to be one test. CI's partitions are bounded by their
-/// slowest single test, and dealing a corpus this way keeps every part the same shape.
-pub fn part<T: Clone>(items: &[T], index: usize, of: usize) -> Vec<T> {
-    items
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| i % of == index)
-        .map(|(_, item)| item.clone())
-        .collect()
+pub fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("this crate sits at <root>/crates/ply-compiler-diff")
+        .to_path_buf()
 }
 
-/// One dump beside every input, as files under `fixtures/goldens/<phase>/`: the specification the
-/// port is held to, in the tree, so that it survives the Rust reference's retirement
-/// (ADR 0050 §2).
-///
-/// The golden has to exist and the port has to agree with it. That is the whole check: nothing
-/// recomputes a reference dump to compare against, so the goldens are what the phase means.
-/// With `PLY_DIFF_BLESS` set, [`golden::check`] rewrites the golden from the **port's** answer --
-/// it used to take the reference's -- which makes blessing a deliberate act of moving the
-/// specification rather than of re-deriving it from a second implementation.
+pub fn fixtures() -> PathBuf {
+    repo_root().join("crates/ply-codegen-tests/fixtures")
+}
+
 pub mod golden {
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     pub fn dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/goldens")
+        super::fixtures().join("goldens")
     }
 
     pub fn blessing() -> bool {
@@ -1252,67 +1089,5 @@ pub mod golden {
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         use std::io::Write as _;
         write!(file, "%%% {index}\n{text}\n").unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    }
-}
-
-/// The compiled compiler's cost, held to `benches/compiled-compiler.json` (ADR 0051 §2): what
-/// its entries allocated and recycled, which do not vary with a machine, and the most chunk
-/// bytes one held, which varies with how the chunks grew.
-pub mod census {
-    use std::path::PathBuf;
-
-    pub const FILE: &str = "benches/compiled-compiler.json";
-
-    fn path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("the crate lives two levels below the repository root")
-            .join(FILE)
-    }
-
-    /// Holds the thread's census since the last reset to the file's entry for `key`, within one
-    /// per cent on the counts and a quarter on the chunk bytes. A missing entry fails with the
-    /// reading, which is what the file is written from.
-    pub fn hold(key: &str, lines: usize) -> Result<(), String> {
-        let got = ply_codegen::c::producer::census();
-        let reading = serde_json::json!({
-            "entries": got.entries,
-            "allocated": got.allocated,
-            "recycled": got.recycled,
-            "chunk_bytes": got.chunk_bytes,
-            "source_lines": lines,
-        });
-        let text = std::fs::read_to_string(path()).unwrap_or_else(|_| "{}".to_string());
-        let file: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| format!("{} does not parse: {e}", path().display()))?;
-        let Some(want) = file.get(key) else {
-            return Err(format!(
-                "{} has no entry `{key}`; this reading, from the run that asked, is what it takes:\n  \"{key}\": {reading}",
-                path().display()
-            ));
-        };
-        let field = |name: &str| -> Result<f64, String> {
-            want.get(name)
-                .and_then(serde_json::Value::as_f64)
-                .ok_or_else(|| format!("`{key}` in {} has no `{name}`", path().display()))
-        };
-        for (name, measured, band) in [
-            ("entries", got.entries as f64, 0.0),
-            ("allocated", got.allocated as f64, 0.01),
-            ("recycled", got.recycled as f64, 0.01),
-            ("chunk_bytes", got.chunk_bytes as f64, 0.25),
-        ] {
-            let claimed = field(name)?;
-            let drift = (claimed - measured).abs() / measured.max(1.0);
-            if drift > band {
-                return Err(format!(
-                    "`{key}` in {} says {name} is {claimed:.0} and this tree reads {measured:.0}; re-take the entry from this reading if the change is meant:\n  \"{key}\": {reading}",
-                    path().display()
-                ));
-            }
-        }
-        println!("  {key}: {reading}");
-        Ok(())
     }
 }

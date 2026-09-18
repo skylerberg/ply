@@ -8,22 +8,8 @@
 //! The port is entered in-process through `port`: the bundle the binary carries is the compiler
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
 
-use crate::harness::part;
-use crate::harness::{golden, port, programs, records};
-use std::path::{Path, PathBuf};
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("this crate sits at <root>/crates/ply-compiler-diff")
-        .to_path_buf()
-}
-
-/// This crate's own directory, which is where the mined corpora live.
-fn here() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
+use crate::harness::{bundle, fixtures, golden, own, part, port, programs, records, repo_root};
+use std::path::PathBuf;
 
 fn first_difference(reference: &str, actual: &str) -> Option<String> {
     let want = records(reference);
@@ -89,22 +75,26 @@ fn examples() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Runs `inputs` through both sides and reports every disagreement.
 fn compare(label: &str, inputs: &[(String, Vec<(String, String)>)]) {
-    compare_through("infer.check_dump", label, inputs);
+    compare_through("infer.check_dump", label, inputs, |d, _| d);
 }
 
 /// The same, through the restored path: each program checked from what its own first check
 /// published.
 fn compare_known(label: &str, inputs: &[(String, Vec<(String, String)>)]) {
-    compare_through("infer.check_dump_known", label, inputs);
+    compare_through("infer.check_dump_known", label, inputs, |d, _| d);
 }
 
-fn compare_through(entry: &str, label: &str, inputs: &[(String, Vec<(String, String)>)]) {
+fn compare_through(
+    entry: &str,
+    label: &str,
+    inputs: &[(String, Vec<(String, String)>)],
+    view: fn(String, &[(String, String)]) -> String,
+) {
     let mut failures: Vec<String> = Vec::new();
     let mut records_total = 0usize;
     for (name, program) in inputs {
-        let actual = port::dump_program(entry, program);
+        let actual = view(port::dump_program(entry, program), program);
         records_total += records(&actual).len();
         if let Err(report) = golden::check(entry, name, &actual, first_difference) {
             failures.push(format!("{label}: {report}"));
@@ -144,7 +134,12 @@ fn the_ply_checker_matches_its_golden_on_every_example_with_the_standard_library
             (format!("std + examples/{name}.ply"), program)
         })
         .collect();
-    compare("examples", &part(&inputs, index, of));
+    compare_through(
+        "infer.check_dump",
+        "examples",
+        &part(&inputs, index, of),
+        |d, p| own::keyed(&d, p, &["F", "T", "L", "E", "C"], &[]),
+    );
 }
 
 #[test]
@@ -164,7 +159,7 @@ fn the_ply_checker_matches_its_golden_on_every_example_with_the_standard_library
 
 #[test]
 fn the_ply_checker_matches_its_golden_on_the_resolvers_reference_programs() {
-    let text = std::fs::read_to_string(here().join("fixtures/reference-programs.corpus"))
+    let text = std::fs::read_to_string(fixtures().join("reference-programs.corpus"))
         .expect("the mined programs; run mine-programs.py");
     let inputs: Vec<(String, Vec<(String, String)>)> = programs(&text)
         .into_iter()
@@ -177,7 +172,7 @@ fn the_ply_checker_matches_its_golden_on_the_resolvers_reference_programs() {
 
 #[test]
 fn the_ply_checker_matches_its_golden_on_the_resolvers_hand_written_programs() {
-    let text = std::fs::read_to_string(here().join("fixtures/resolve-programs.corpus"))
+    let text = std::fs::read_to_string(fixtures().join("resolve-programs.corpus"))
         .expect("the hand-written programs");
     let inputs: Vec<(String, Vec<(String, String)>)> = programs(&text)
         .into_iter()
@@ -205,18 +200,18 @@ fn the_ply_checker_restored_from_its_own_interfaces_matches_its_golden_on_the_st
 fn the_ply_checker_restored_from_its_own_interfaces_matches_its_golden_on_the_bundles() {
     let mut inputs: Vec<(String, Vec<(String, String)>)> = Vec::new();
     for (file, label) in [
-        ("fixtures/resolve-programs.corpus", "resolve-programs"),
-        ("fixtures/check-programs.corpus", "check-programs"),
-        ("fixtures/reference-programs.corpus", "reference-programs"),
+        ("resolve-programs.corpus", "resolve-programs"),
+        ("check-programs.corpus", "check-programs"),
+        ("reference-programs.corpus", "reference-programs"),
     ] {
-        let text = std::fs::read_to_string(here().join(file)).expect("a bundle");
+        let text = std::fs::read_to_string(fixtures().join(file)).expect("a bundle");
         for (i, p) in programs(&text).into_iter().enumerate() {
             inputs.push((format!("{label}.corpus#{i}"), p));
         }
     }
-    let text = std::fs::read_to_string(here().join("fixtures/reference-checks.corpus"))
+    let text = std::fs::read_to_string(fixtures().join("reference-checks.corpus"))
         .expect("the mined checker inputs; run mine-checks.py");
-    for (i, f) in crate::harness::bundle(&text).into_iter().enumerate() {
+    for (i, f) in bundle(&text).into_iter().enumerate() {
         inputs.push((
             format!("reference-checks.corpus#{i}"),
             vec![("m".to_string(), f)],
@@ -228,7 +223,7 @@ fn the_ply_checker_restored_from_its_own_interfaces_matches_its_golden_on_the_bu
 
 #[test]
 fn the_ply_checker_matches_its_golden_on_the_checkers_hand_written_programs() {
-    let text = std::fs::read_to_string(here().join("fixtures/check-programs.corpus"))
+    let text = std::fs::read_to_string(fixtures().join("check-programs.corpus"))
         .expect("the hand-written checker programs");
     let inputs: Vec<(String, Vec<(String, String)>)> = programs(&text)
         .into_iter()
@@ -247,9 +242,9 @@ fn the_ply_checker_matches_its_golden_on_the_checkers_hand_written_programs() {
 /// diagnostics are compared, code by code and label by label.
 #[test]
 fn the_ply_checker_matches_its_golden_on_the_references_own_inputs() {
-    let text = std::fs::read_to_string(here().join("fixtures/reference-checks.corpus"))
+    let text = std::fs::read_to_string(fixtures().join("reference-checks.corpus"))
         .expect("the mined checker inputs; run mine-checks.py");
-    let inputs: Vec<(String, Vec<(String, String)>)> = crate::harness::bundle(&text)
+    let inputs: Vec<(String, Vec<(String, String)>)> = bundle(&text)
         .into_iter()
         .enumerate()
         .map(|(i, f)| {
