@@ -216,7 +216,7 @@ pub mod poison {
     }
 
     thread_local! {
-        /// Three consecutive `i64`s in the running entry's `Ctx`: its site module, start and end.
+        /// Three consecutive `i64`s in the running entry's `Ctx`: its site root, start and end.
         static SITE: std::cell::Cell<*const i64> = const { std::cell::Cell::new(std::ptr::null()) };
     }
 
@@ -244,8 +244,8 @@ pub mod poison {
         let at = if site.is_null() {
             "outside any entry".to_string()
         } else {
-            let (m, start, end) = unsafe { (*site, *site.add(1), *site.add(2)) };
-            format!("module {m} bytes {start}..{end}")
+            let (root, start, end) = unsafe { (*site, *site.add(1), *site.add(2)) };
+            format!("root {root} bytes {start}..{end} from its start")
         };
         panic!("a stale read: {why}, at {at}");
     }
