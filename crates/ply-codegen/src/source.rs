@@ -177,7 +177,7 @@ pub fn front_of(
 const CELL: &str = "cell";
 
 /// Fill what the syntax tree carries and [`CheckOutput`] does not: written signatures, types,
-/// effect visibility, test label spans, law guard literals and effect sets.
+/// effect visibility, test label spans, guard literals and effect sets.
 pub fn fill_written(front: &mut Front, program: &Program, resolved: &Resolved) {
     let mut defs_written = std::mem::take(&mut front.defs_written);
     let mut types = std::mem::take(&mut front.types);
@@ -191,6 +191,10 @@ pub fn fill_written(front: &mut Front, program: &Program, resolved: &Resolved) {
             for item in &module.items {
                 match item {
                     Item::Fn(d) => {
+                        let mut requires_literals = Vec::new();
+                        for clause in d.spec.iter().filter(|c| c.kind == SpecKind::Requires) {
+                            collect_literals(&clause.expr, &mut requires_literals);
+                        }
                         defs_written.insert(
                             module.name.qualify(&d.name.name),
                             DefWritten {
@@ -204,6 +208,7 @@ pub fn fill_written(front: &mut Front, program: &Program, resolved: &Resolved) {
                                         span: p.span,
                                     })
                                     .collect(),
+                                requires_literals,
                             },
                         );
                     }
@@ -292,7 +297,7 @@ fn set_effect(
     }
 }
 
-/// A guard's literals, deduplicated, in the stack order `ply-cli`'s witness search walks it.
+/// A guard's literals, deduplicated, in the stack order `front.ply`'s `collect_lits` walks it.
 fn collect_literals(expr: &Expr, out: &mut Vec<Literal>) {
     let mut stack = vec![expr];
     while let Some(e) = stack.pop() {

@@ -54,6 +54,8 @@ pub struct DefWritten {
     pub reuse: bool,
     /// In source order.
     pub params: Vec<WrittenParam>,
+    /// What its `requires` clauses mention, in the witness search's order.
+    pub requires_literals: Vec<Literal>,
 }
 
 /// A `type`; no table of [`CheckOutput`] holds its arity, visibility or span.
@@ -79,7 +81,7 @@ pub struct EffectSet {
     pub atoms: Footprint,
 }
 
-/// A literal a law's guard mentions, which is where the witness search looks for a domain.
+/// A literal a guard mentions, which is where the witness search looks for a domain.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Literal {
     Int(i64),
@@ -612,6 +614,9 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
             );
         }
         p.field("span", &w.span(d.span, &what)?);
+        for literal in &written.requires_literals {
+            p.field("literal", &literal_text(literal));
+        }
         p.frame(&mut out, "def", name.as_str());
     }
 
@@ -1400,9 +1405,10 @@ impl Reader<'_> {
         let (mut effectful, mut span) = (None, None);
         let (mut public, mut reuse) = (None, None);
         let (mut constraints, mut aliases, mut spec) = (Vec::new(), Vec::new(), Vec::new());
-        let mut params = Vec::new();
+        let (mut params, mut requires_literals) = (Vec::new(), Vec::new());
         for (key, text) in f.all() {
             match key {
+                "literal" => requires_literals.push(literal_of(text, what)?),
                 "module" => f.once(&mut module, key, text)?,
                 "simple_name" => f.once(&mut simple, key, text)?,
                 "public" => f.once(&mut public, key, text)?,
@@ -1459,6 +1465,7 @@ impl Reader<'_> {
             vis: visibility(f.flag(f.required(public, "public")?, "public")?),
             reuse: f.flag(f.required(reuse, "reuse")?, "reuse")?,
             params,
+            requires_literals,
         };
         let def = DefInfo {
             name: Symbol::new(name),
