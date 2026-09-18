@@ -1626,19 +1626,47 @@ failures are `E0502`, "neither front end holds a body for `test#0`" -- an empty
 tier on the *first* run, not a cache miss on the second, which is what the
 ran-to-skipped counts were really showing.
 
-The tier is empty because of *where* it is built. `RECIPE` and `IDENTITY` are
-`OnceLock`s, so an installation is process-wide, while `MINE`, `BUILDING` and
-`HANDED` are thread-locals, and `REFERENCE_ONLY` was one until this record
-changed it. `execute_group` puts every group through `rayon::broadcast`, so
-`Executor::worker` -- and the `attach` that builds the unit -- runs on pool
-threads. Instrumented at the time, the guard read `ref` on the test thread and
-`ply` on all three workers at the same moment: a per-thread switch set by the
-test could not reach the emitter that answered, which is the difference from
-`ply-codegen-tests`, whose bodies attach on the thread that guards them.
+The tier is empty because the emitter never called its own `qualify`. These
+fixtures parse through `ply_syntax::parse`, which names the module
+`ModuleName::anonymous()`, and both front ends agree what that name means:
+`ply-ty`'s `ModuleName::qualify` returns the bare name for it, and
+`resolve.ply`'s `qualify` does the same. `emit.ply` open-coded the join
+instead, at every root name and every C symbol, so an empty module produced
+`.add` where `p.body` asks for `add`, and `ply__add` where the loader asks
+for `ply_add`.
+
+Asked directly, the port answers. Over `unit/runner.rs`'s own fixture it
+returned all six bodies -- 6052 bytes of C -- and filed every one under a
+name nothing would look up. Nothing on that path refuses anything, which is
+why it reads as a refusal: `bodies_of` answers `Ok(HashMap::new())` rather
+than an error when a text is missing, and `build.rs` flattens
+`with_current(...)`, so "no producer on this thread" and "a producer that
+held no answer" arrive as the same `None` and print the same
+`which the Ply emitter did not answer`. That sentence was false every time it
+appeared here, and four mechanisms were argued against it before anyone asked
+the port what it had answered.
+
+A measurement this entry took belongs to a different question. Instrumented
+while `REFERENCE_ONLY` was still only a thread-local, the guard read `ref` on
+the test thread and `ply` on all three workers at the same moment, and
+`execute_group` does put every group through `rayon::broadcast`, so
+`Executor::worker` and the `attach` that builds the unit do run on pool
+threads. All of that holds; none of it empties the tier, which reproduces on
+the test thread alone, single-threaded, with no guard set at all.
+
+Routed through `qualify`, the configuration this entry calls broken is green:
+sixty-five tests at the default thread count, `ensure_default()` in `compile`,
+the fixtures still anonymous, and not one expected name moved. Naming the
+fixtures' module instead was tried and is worse -- it qualifies every
+program-wide symbol, and ten tests fail on the names they assert. For a named
+module the fix is byte-identical: the same fixture under a name answers 6276
+bytes from the committed bundle and 6276 from the edited sources.
 
 Three ways out were named here: make the reference switch process-wide, teach
 the port to emit what this fixture needs, or give the harness its check without
-installing a producer. The first is taken, and not the way it first reads.
+installing a producer. The first is taken, and not the way it first reads. The
+second was misnamed: the port emits this fixture already, and what wanted
+teaching was the emitter's own qualification, above.
 
 Making `REFERENCE_ONLY` itself process-wide breaks the callers it already has.
 `cargo test` runs this crate's tests over one process, so two `reference_only`
@@ -1674,10 +1702,14 @@ One hypothesis on the way was checked and dropped: that taking `hashes` from the
 port rather than from the hasher was the fault. It is not -- forty failed either
 way.
 
-So two ways out are left, and the second reads better now than it did: teach the
-port to emit what this fixture needs, or give the harness its check without
-installing a producer at all. The conflict is the installation itself, which is
-what the second removes.
+So one way out is left for the migration, and the fix above is not it. The
+emitter's qualification takes the empty tier away, so `ensure_default()` in
+`compile` no longer costs anything; but the conflict this section closes on is
+a different fault and stands untested under the fix -- `compile` asking the
+port for its check while `run` denies the producer. Giving the harness its
+check without installing a producer removes the installation, which is the
+conflict itself. The migration is worth trying again now that the tier is
+real, and that is the next entry's work rather than this one's.
 
 **Built, 2026-09-17: `verify` sees the member it could not see, and the count
 says what it counts.** This record described the gap twice and fixed it neither
@@ -1999,7 +2031,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s, 153 s, 199 s, 381 s, 139 s, 168 s, 167 s, 211 s, 219 s, 193 s and 167 s, each reusing by tree the same way and for the same reason. Ten of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, the sixth 199 s, the seventh 381 s and the eighth 211 s, which the entries closing this section take. None of those six was caused by the tree. The ninth and tenth, 219 s and 193 s, were: they are the handover's own cost, and the two entries closing this section take them together with the reading that placed it. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s, 153 s, 199 s, 381 s, 139 s, 168 s, 167 s, 211 s, 219 s, 193 s, 167 s and 173 s, each reusing by tree the same way and for the same reason. Ten of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, the sixth 199 s, the seventh 381 s and the eighth 211 s, which the entries closing this section take. None of those six was caused by the tree. The ninth and tenth, 219 s and 193 s, were: they are the handover's own cost, and the two entries closing this section take them together with the reading that placed it. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
