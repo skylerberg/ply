@@ -6,6 +6,7 @@ use super::tables::Tables;
 use crate::source::Source;
 use anyhow::{Context, Result, anyhow, bail};
 use ply_eval::{Fields, Value};
+use ply_span::frames::Cursor;
 use ply_span::{Severity, SourceId, Symbol};
 use ply_ty::{Front, read_front};
 use std::cell::{Cell, RefCell};
@@ -511,16 +512,7 @@ pub fn front_dump(sources: &[(String, String)]) -> Result<String> {
         census.modules += sources.len();
         c.set(census);
     });
-    let records: Vec<Value> = sources
-        .iter()
-        .map(|(name, src)| {
-            Value::Record(Arc::new(Fields::from_unsorted(vec![
-                (Symbol::new("name"), Value::bytes(name.as_bytes())),
-                (Symbol::new("src"), Value::bytes(src.as_bytes())),
-            ])))
-        })
-        .collect();
-    let answer = call(FRONT, &[Value::list(records)])?;
+    let answer = call(FRONT, &[source_list(sources)])?;
     let Value::Str(dump) = &answer else {
         bail!(
             "`{FRONT}` answered a {} rather than a string",
@@ -528,6 +520,79 @@ pub fn front_dump(sources: &[(String, String)]) -> Result<String> {
         );
     };
     Ok(dump.to_string())
+}
+
+fn source_list(sources: &[(String, String)]) -> Value {
+    Value::list(
+        sources
+            .iter()
+            .map(|(name, src)| {
+                Value::Record(Arc::new(Fields::from_unsorted(vec![
+                    (Symbol::new("name"), Value::bytes(name.as_bytes())),
+                    (Symbol::new("src"), Value::bytes(src.as_bytes())),
+                ])))
+            })
+            .collect(),
+    )
+}
+
+/// [`FRONT`], pulling in the shipped modules the program imports itself.
+const FRONT_PULLING: &str = "front.front_pulling_std";
+
+/// What [`front_pulling_std`] answered.
+pub struct Pulled {
+    /// The shipped modules pulled in, in the positions they took after the user's.
+    pub modules: Vec<String>,
+    /// [`front_dump`]'s answer over the user's modules followed by [`Pulled::modules`].
+    pub dump: String,
+}
+
+/// [`front_dump`] over `user` plus each module of `shipped` it imports, transitively, placed
+/// as the CLI driver places them: a round of newly imported modules at a time, each in byte order.
+pub fn front_pulling_std(
+    user: &[(String, String)],
+    shipped: &[(String, String)],
+) -> Result<Pulled> {
+    let answer = call(FRONT_PULLING, &[source_list(user), source_list(shipped)])?;
+    let Value::Str(answer) = &answer else {
+        bail!(
+            "`{FRONT_PULLING}` answered a {} rather than a string",
+            answer.type_name()
+        );
+    };
+    let answer: &str = answer;
+    let mut frames = Cursor::new(answer.as_bytes(), "frame");
+    let (words, payload) = frames
+        .unit()
+        .map_err(|e| anyhow!("`{FRONT_PULLING}`'s answer: {e}"))?;
+    if words != ["pulled", "_"] {
+        bail!(
+            "`{FRONT_PULLING}` led with `{}` rather than the modules it pulled in",
+            words.join(" ")
+        );
+    }
+    let mut fields = Cursor::new(payload, "field");
+    let mut modules = Vec::new();
+    while !fields.done() {
+        let (key, name) = fields
+            .unit()
+            .map_err(|e| anyhow!("the modules `{FRONT_PULLING}` pulled in: {e}"))?;
+        if key != ["module"] {
+            bail!(
+                "the modules `{FRONT_PULLING}` pulled in hold a `{}` field",
+                key.join(" ")
+            );
+        }
+        modules.push(
+            std::str::from_utf8(name)
+                .context("a pulled module's name")?
+                .to_string(),
+        );
+    }
+    Ok(Pulled {
+        modules,
+        dump: answer[frames.at()..].to_string(),
+    })
 }
 
 /// [`front`] over the default producer, with the program's errors raised rather than answered.
