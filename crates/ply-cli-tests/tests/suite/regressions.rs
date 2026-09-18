@@ -205,3 +205,30 @@ fn the_same_operation_handled_twice_is_still_reported() {
         d.message
     );
 }
+
+#[test]
+fn a_failure_is_placed_in_the_text_that_ran_after_its_definition_moved() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |text: &str| -> serde_json::Value {
+        write(dir.path(), "m.ply", text);
+        let out = assert_cmd::Command::cargo_bin("ply")
+            .unwrap()
+            .args(["--color", "never", "run", "m.ply", "--json"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stderr)))
+    };
+    // The hash of `main` is the same in both texts; only where it sits moved.
+    let below = run("\n\n\nfn main() -> Int = 1 / 0\n");
+    assert_eq!(
+        below["diagnostics"][0]["labels"][0]["start"]["line"], 4,
+        "{below}"
+    );
+    let above = run("fn main() -> Int = 1 / 0\n");
+    assert_eq!(
+        above["diagnostics"][0]["labels"][0]["start"]["line"], 1,
+        "{above}"
+    );
+}
