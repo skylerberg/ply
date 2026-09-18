@@ -1,7 +1,6 @@
 use ply_eval::builtins::Builtin;
 
-/// [`Analysis::walk_callback`] reads the callback out of the **last** argument, which is true
-/// of all eight and is not a rule the type system enforces.
+/// `walk_callback` reads the callback from the last argument, which the type system does not enforce.
 #[test]
 fn the_callback_builtins_are_the_eight_this_module_knows() {
     let mut names: Vec<&str> = Builtin::all()
@@ -36,8 +35,6 @@ fn the_callback_builtins_are_the_eight_this_module_knows() {
     }
 }
 
-/// A run must be a function of its definitions and nothing else, so nothing here may reach a
-/// hash-ordered collection or a clock.
 #[test]
 fn this_module_names_no_hash_based_collection_and_reads_no_clock() {
     let body = include_str!("../../../../ply-eval/src/region_kind.rs");

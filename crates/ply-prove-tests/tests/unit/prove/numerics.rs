@@ -15,8 +15,6 @@ fn half() -> Float = 0.5
 law "a float from a call" forall (n: Int) { half() == half() }
 "#;
 
-/// Every one of these is either trivially true or true of every value that is not a `NaN`, and
-/// **none** of them may be proved.
 #[test]
 fn no_law_mentioning_a_float_is_ever_proved() {
     let f = fixture(FLOATS);
@@ -34,8 +32,6 @@ fn no_law_mentioning_a_float_is_ever_proved() {
     }
 }
 
-/// The refusal is reported as a blocker rather than being invisible, so "what would extend this
-/// prover" stays a number somebody can read.
 #[test]
 fn a_refused_float_obligation_says_that_is_why() {
     let f = fixture(FLOATS);
@@ -47,7 +43,6 @@ fn a_refused_float_obligation_says_that_is_why() {
     );
 }
 
-/// A `Float` binder is refused even where the *body* never mentions it.
 #[test]
 fn a_float_binder_alone_is_enough_to_refuse() {
     let f = fixture(
@@ -58,8 +53,6 @@ fn a_float_binder_alone_is_enough_to_refuse() {
     not_proved(&f, "an int is itself, beside a float");
 }
 
-/// The control: the same claim without the `Float` binder is proved, so the refusal above is the
-/// `Float` and not a general loss of reach.
 #[test]
 fn the_same_claim_without_a_float_is_still_proved() {
     let f = fixture(r#"law "an int is itself" forall (x: Int) { x == x }"#);
@@ -82,8 +75,7 @@ law "a decimal sum commutes" forall (x: Decimal, y: Decimal) { x + y == y + x }
 law "a decimal is at least itself" forall (x: Decimal) { x >= x }
 "#;
 
-/// `==` on `Decimal` is an equivalence relation, so reflexivity and congruence are sound over it —
-/// which is the whole of what the type is allowed to do inside a certificate.
+/// `==` on `Decimal` is an equivalence relation, so reflexivity and congruence are sound over it.
 #[test]
 fn a_decimal_is_provable_as_an_uninterpreted_term() {
     let f = fixture(DECIMALS);
@@ -93,17 +85,14 @@ fn a_decimal_is_provable_as_an_uninterpreted_term() {
     proof(&f, "a decimal literal is itself");
 }
 
-/// `1.5m` and `1.50m` are **equal in value** and differently written.
 #[test]
 fn two_decimal_literals_of_one_value_are_one_term() {
     let f = fixture(DECIMALS);
     proof(&f, "two scales are one value");
-    // And two literals that really are different values stay different, so the normalization did
-    // not merge everything.
+    // Distinct values must stay distinct: the normalization merged nothing else.
     not_proved(&f, "two values are two values");
 }
 
-/// No arithmetic and no ordering.
 #[test]
 fn decimal_arithmetic_and_ordering_are_property_rather_than_proved() {
     let f = fixture(DECIMALS);
@@ -112,8 +101,6 @@ fn decimal_arithmetic_and_ordering_are_property_rather_than_proved() {
     not_proved(&f, "a decimal is at least itself");
 }
 
-/// A `Decimal` obligation is refused for a *reason*, and the reason is not the one `Float` gets:
-/// nothing about the type is outside the fragment, only its arithmetic.
 #[test]
 fn a_decimal_never_reports_the_float_blocker() {
     let f = fixture(DECIMALS);
@@ -131,7 +118,6 @@ fn a_decimal_never_reports_the_float_blocker() {
     );
 }
 
-/// The linear-arithmetic fragment is over `Int` and does not extend by a type arriving.
 #[test]
 fn the_arithmetic_fragment_did_not_grow() {
     let ints = fixture(
@@ -149,9 +135,7 @@ fn the_arithmetic_fragment_did_not_grow() {
     not_proved(&decimals, "a decimal zero is additive");
 }
 
-/// The prelude's ADTs are declared by the language rather than by a file, so the fragment has to
-/// see their constructor lists in full — otherwise a `match o { None -> .., Some(v) -> .. }` is a
-/// case analysis the prover declines and an obligation it can decide comes back `Unknown`.
+/// Prelude ADTs have no declaring file, yet the fragment must see their constructor lists.
 #[test]
 fn a_prelude_adt_is_a_case_analysis_like_any_other() {
     let f = fixture(
@@ -189,8 +173,7 @@ fn a_float_pulled_out_of_a_destructuring_is_still_refused() {
     );
     not_proved(&f, "a destructured float sum commutes");
     not_proved(&f, "a matched float sum commutes");
-    // The `Int` control, so the refusal above is the `Float` rather than the destructuring: this
-    // one is outside the fragment for its own reason and must not be reported as a `Float` problem.
+    // The `Int` control: outside the fragment for its own reason, never as a `Float` problem.
     let (_, blockers) = attempt_for_test(&f, "a destructured int sum commutes");
     assert!(
         !blockers.contains(&Blocker::FloatTerm),

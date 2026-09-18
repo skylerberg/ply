@@ -1,5 +1,3 @@
-//! What decides whether a host-backed test runs at all.
-
 use crate::fixture::{Compiled, TierExecutor};
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
@@ -52,7 +50,6 @@ impl Compiled {
     }
 }
 
-/// A handler that answers a constant and counts how often it was asked.
 struct Counting {
     calls: Arc<AtomicUsize>,
 }
@@ -138,7 +135,6 @@ fn reason(compiled: &Compiled, store: &Store, name: &str) -> Reason {
     selection.reasons[index]
 }
 
-/// A `nondet` effect, which is every effect W1's trusted computing base serves.
 const NONDET: &str = r#"
 nondet effect wire {
   read peek[r](k: Int) -> Int
@@ -149,8 +145,6 @@ fn ask(k: Int) -> Int / {wire.read[log]} = wire.peek[log](k)
 test/nondet "reaches the host" { assert_eq(ask(1), 99) }
 "#;
 
-/// The claim host determinism propagation and hermetic by default are built on, end to end: a run that reached a real
-/// handler writes nothing, so the next run cannot believe it.
 #[test]
 fn a_pass_earned_over_a_host_handler_is_never_written_to_the_cache() {
     let compiled = Compiled::new(NONDET);
@@ -181,8 +175,6 @@ fn a_pass_earned_over_a_host_handler_is_never_written_to_the_cache() {
     );
 }
 
-/// And the flag really is what changed: with nothing bound the same test cannot reach the handler
-/// at all.
 #[test]
 fn the_same_test_reaches_nothing_when_nothing_is_bound() {
     let compiled = Compiled::new(NONDET);
@@ -196,8 +188,6 @@ fn the_same_test_reaches_nothing_when_nothing_is_bound() {
     assert_eq!(calls.load(Ordering::Relaxed), 0);
 }
 
-/// A **deterministic** effect, which determinism propagation permits a host handler to serve and which nothing
-/// in W1's trusted computing base currently does.
 const DETERMINISTIC: &str = r#"
 effect disk {
   read peek[r](k: Int) -> Int
@@ -209,7 +199,6 @@ fn ask(k: Int) -> Int / {disk.read[log]} =
 test "its footprint reaches the host, its path does not" { assert_eq(ask(1), 1) }
 "#;
 
-/// The binding is what decides, and it agrees this test can reach it.
 #[test]
 fn a_deterministic_registration_binds_and_the_test_footprint_reaches_it() {
     let compiled = Compiled::new(DETERMINISTIC);
@@ -228,7 +217,6 @@ fn a_deterministic_registration_binds_and_the_test_footprint_reaches_it() {
     );
 }
 
-/// **The gap.**
 #[test]
 fn documents_a_host_reaching_test_is_skipped_when_its_hermetic_pass_was_cached() {
     let compiled = Compiled::new(DETERMINISTIC);
@@ -237,7 +225,6 @@ fn documents_a_host_reaching_test_is_skipped_when_its_hermetic_pass_was_cached()
     let mut store = root.store();
     let calls = Arc::new(AtomicUsize::new(0));
 
-    // A hermetic run.
     let report = run(&compiled, &mut store, None);
     assert_eq!(report.failed, 0, "{:?}", report.failures);
     assert_eq!(report.passed, 1);

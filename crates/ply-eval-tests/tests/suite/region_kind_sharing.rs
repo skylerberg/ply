@@ -1,11 +1,8 @@
-//! One program, one region-kind analysis — however many engines run it.
-
 use crate::fixture::Compiled;
 use ply_eval::RegionKind;
 use ply_eval::region_kind::Kinds;
 
-/// Both kinds in one program, and a region reached only through a call, so the propagation step has
-/// something to do as well as the direct scan.
+/// Includes a region reached only through a call, so propagation has work besides the direct scan.
 const BOTH_KINDS: &str = r#"
 effect amb { read flip[coin]() -> Bool }
 
@@ -28,8 +25,7 @@ test "the pure region" { assert_eq(scratch(41), 42) }
 test "the shared region" { assert_eq(searched(), 21) }
 "#;
 
-/// A handed analysis is *the same allocation*, which is the only observable that separates "shared"
-/// from "inferred twice and happened to agree".
+/// Pointer identity is all that separates "shared" from "inferred twice and agreed".
 #[test]
 fn an_engine_handed_an_analysis_does_not_infer_one_of_its_own() {
     let compiled = Compiled::new(BOTH_KINDS);
@@ -46,8 +42,6 @@ fn an_engine_handed_an_analysis_does_not_infer_one_of_its_own() {
     );
 }
 
-/// An engine handed nothing infers its own, and every engine in this repository that is handed
-/// nothing has always done so.
 #[test]
 fn an_engine_handed_nothing_still_answers() {
     let compiled = Compiled::new(BOTH_KINDS);
@@ -56,7 +50,6 @@ fn an_engine_handed_nothing_still_answers() {
     assert_eq!(alone.region_kinds().shared(), 1);
 }
 
-/// Region by region: a shared analysis decides what a private one decides.
 #[test]
 fn a_shared_analysis_answers_what_a_private_one_answers() {
     let compiled = Compiled::new(BOTH_KINDS);

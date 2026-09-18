@@ -1,5 +1,4 @@
-//! The properties in CONTRACTS.md, plus the collision cases a normalizer is most likely to get
-//! wrong.
+//! The hashing properties, plus the collision cases a normalizer is most likely to get wrong.
 
 use ply_hash::*;
 use ply_span::{Span, Symbol};
@@ -480,8 +479,6 @@ fn a_region_is_part_of_the_definition_it_brands() {
     assert_ne!(region("r"), region("s"));
 }
 
-/// The region brands the values, not the names inside it: a local is a de Bruijn level under a
-/// region exactly as it is anywhere else.
 #[test]
 fn renaming_a_cell_binder_under_a_region_changes_no_hash() {
     let program = |binder: &str| {
@@ -593,9 +590,7 @@ fn reordering_mutually_recursive_definitions_changes_no_hash() {
     );
 }
 
-/// `f(n) = g(n-1)` and `g(n) = f(n-1)` differ only in which of the two they call, which makes them
-/// the same definition twice over: either one can be substituted for the other anywhere without
-/// changing what the program computes.
+/// `f(n) = g(n-1)` and `g(n) = f(n-1)` are interchangeable, so they are one definition.
 #[test]
 fn indistinguishable_cycle_members_share_one_hash() {
     let even = func(
@@ -624,8 +619,7 @@ fn indistinguishable_cycle_members_share_one_hash() {
     );
 }
 
-/// Refinement has to keep splitting past the first round: `a` and `c` are told apart only by what
-/// their callees' callees do, which no single pass sees.
+/// `a` and `c` differ only in what their callees' callees do, which no single pass sees.
 #[test]
 fn refinement_separates_members_that_differ_only_deeper_in_the_cycle() {
     let step = |name: &str, next: &str, extra: i64| {
@@ -698,9 +692,7 @@ fn reordering_the_atoms_of_an_effect_annotation_changes_no_hash() {
     assert_ne!(a, different);
 }
 
-/// Two atoms of *different* effects at the same mode and with no resource are the case the sort
-/// cannot separate on bytes alone: the pass that numbers the effect slots runs with no hash table,
-/// so both encode as `REF_SELF`.
+/// Different effects at one mode with no resource: the slot-numbering pass encodes both as `REF_SELF`.
 const TWO_EFFECTS: &str = r#"
 effect x { write a() -> Unit }
 effect y { write b() -> Unit }
@@ -717,9 +709,7 @@ fn reordering_two_atoms_the_first_pass_cannot_tell_apart_changes_no_hash() {
     );
 }
 
-/// The same case, from the other side: an effect named only by an atom the dedup drops still has to
-/// reach the enumeration, or its reference is written as slot 0 — the slot of whichever effect the
-/// enumeration does begin with.
+/// Otherwise its reference is written as slot 0, the slot of whichever effect is enumerated first.
 #[test]
 fn an_effect_named_only_by_a_deduplicated_atom_is_still_enumerated() {
     let one = parsed(TWO_EFFECTS);
@@ -1029,8 +1019,6 @@ fn string_literals_cannot_be_confused_with_their_neighbours() {
     assert_ne!(a, b);
 }
 
-/// The two have different types and must not share a definition, which is the whole reason
-/// `LIT_BYTES` is a tag of its own rather than `LIT_STR` reused.
 #[test]
 fn a_byte_literal_never_hashes_as_the_string_with_the_same_characters() {
     let s = hash_of(vec![func("f", &[], str_lit("ab"))], "f");
@@ -1063,8 +1051,7 @@ fn byte_literals_cannot_be_confused_with_their_neighbours() {
     assert_ne!(empty, nul);
 }
 
-/// A `b"..."` pattern is a `PatternKind::Lit` like any other, so this is really a check that the
-/// pattern path reaches the same tag the expression path does.
+/// Checks that the pattern path reaches the same tag the expression path does.
 #[test]
 fn a_byte_pattern_is_distinct_from_a_string_pattern() {
     let arms = |l: Lit| {
@@ -1228,7 +1215,6 @@ fn handler_clause_parameters_are_de_bruijn_bound() {
     assert_eq!(a, renamed);
 }
 
-/// The control-stack design, required tests 24 and 25.
 #[test]
 fn binding_a_continuation_changes_the_hash_and_renaming_the_binder_does_not() {
     let with_binder = |binder: &str| {
@@ -1491,8 +1477,6 @@ fn deps_include_the_types_and_effects_a_definition_mentions() {
     assert!(!out.decls.contains_key(&Symbol::new("f")));
 }
 
-/// A declaration is content-addressed like anything else, so renaming a type moves nothing and
-/// changing its shape moves it.
 #[test]
 fn declaration_hashes_follow_structure_not_names() {
     let program = |name: &str, extra: Vec<VariantDef>| {
@@ -1794,8 +1778,6 @@ fn look_alikes(a: &str, b: &str, eff: &str) -> HashOutput {
     )
 }
 
-/// A definition that performs one of two byte-identical effects and one that performs the other
-/// differ by a consistent renaming of the two and by nothing else, so they are one definition.
 #[test]
 fn performing_either_of_two_identically_declared_effects_is_one_definition() {
     assert_eq!(
@@ -1804,7 +1786,6 @@ fn performing_either_of_two_identically_declared_effects_is_one_definition() {
     );
 }
 
-/// The separating context.
 #[test]
 fn a_handler_records_which_look_alike_it_discharges() {
     let source = |handled: &str| {
@@ -1823,9 +1804,7 @@ fn a_handler_records_which_look_alike_it_discharges() {
     );
 }
 
-/// Renaming an effect is free even when the program holds a second one declared exactly like it,
-/// and free in either direction: the pair below is renamed so that the two swap places in every
-/// name ordering.
+/// The pair is renamed so the two swap places in every name ordering.
 #[test]
 fn renaming_look_alike_effects_changes_no_hash() {
     let f = |a: &str, b: &str, eff: &str| look_alikes(a, b, eff).defs[&Symbol::new("f")];
@@ -1875,7 +1854,6 @@ fn two_let_bindings_of_the_same_name_are_not_reordered() {
     );
 }
 
-/// A dependency chain far deeper than any call stack Tarjan could afford to use.
 #[test]
 fn a_very_deep_dependency_chain_does_not_overflow_the_stack() {
     const DEPTH: usize = 2000;
@@ -1932,7 +1910,6 @@ fn tarjan_groups_cycles_and_orders_them_before_their_dependents() {
     assert!(graph::is_cyclic(&[0], &[vec![graph::NodeId(0)]]));
 }
 
-/// The contract entry point, driven the way the CLI drives it.
 #[test]
 fn hash_module_agrees_with_hash_ast() {
     let source = r#"
@@ -1953,7 +1930,6 @@ test "double doubles" {
     assert_eq!(out, hash_ast(&parsed_module).unwrap());
 }
 
-/// A spec is a claim *about* a definition, so its key has to move when the definition does.
 #[test]
 fn a_spec_key_moves_when_its_definition_does() {
     let owner = DefHash([1; 32]);
@@ -1965,8 +1941,6 @@ fn a_spec_key_moves_when_its_definition_does() {
     );
 }
 
-/// The clause's own structure, its position among its siblings, and which kind of clause it is are
-/// all part of what is being claimed, so each separates two obligations.
 #[test]
 fn a_spec_key_separates_the_clause_from_its_siblings() {
     let owner = DefHash([1; 32]);
@@ -1976,8 +1950,6 @@ fn a_spec_key_separates_the_clause_from_its_siblings() {
     assert_ne!(base, spec_hash(owner, SpecKind::Ensures, 0, b"other"));
 }
 
-/// Domain-tagged, so no clause can ever produce the hash of some definition's own normalized bytes
-/// and read a test's result as its own.
 #[test]
 fn a_spec_key_cannot_collide_with_a_definition_hash() {
     let owner = DefHash([1; 32]);
@@ -1988,8 +1960,6 @@ fn a_spec_key_cannot_collide_with_a_definition_hash() {
     );
 }
 
-/// A spec is a claim *about* a definition, not part of it, so the normalizer erases it exactly as
-/// it erases names, spans and `pub`.
 #[test]
 fn writing_a_spec_or_a_law_changes_no_definition_hash_and_no_test_hash() {
     const BARE: &str = r#"
@@ -2054,8 +2024,7 @@ test "the ledger settles" {
         assert_eq!(with_spec.decls, bare.decls);
         assert_eq!(with_spec.tests, bare.tests, "a test would be re-run");
 
-        // A law is an item of its own, so it brings its own reference entry — which is what
-        // `Laws::of` reads to decide the definitions it covers.
+        // A law brings its own reference entry, which `Laws::of` reads to decide what it covers.
         for (name, deps) in &bare.deps {
             assert_eq!(with_spec.deps.get(name), Some(deps), "`{name}` moved");
             assert_eq!(with_spec.closure.get(name), bare.closure.get(name));
@@ -2075,8 +2044,6 @@ test "the ledger settles" {
     }
 }
 
-/// The claim gets its own hash, which covers the definition's — so editing an implementation
-/// re-opens its obligations, while editing the claim moves nothing at all.
 #[test]
 fn an_obligation_key_covers_the_implementation_and_the_clause() {
     const SOURCE: &str = r#"
@@ -2098,8 +2065,7 @@ fn apply_debit(balance: Int, amount: Int) -> Int
     );
     assert_ne!(rewritten.specs[&Symbol::new("apply_debit")], clauses);
 
-    // The claim moved and the implementation did not: the definition's hash is untouched, and only
-    // the clause that changed gets a new key.
+    // The claim moved and the implementation did not: only the changed clause gets a new key.
     let restated = parsed(&SOURCE.replace("result <= balance", "result - balance <= 0"));
     assert_eq!(restated.defs, base.defs);
     assert_eq!(restated.specs[&Symbol::new("apply_debit")][0], clauses[0]);
@@ -2122,8 +2088,6 @@ fn apply_debit(balance: Int, amount: Int) -> Int
     );
 }
 
-/// The complement of the key above, and the whole of what `ply review` asks: a claim's *sentence*
-/// moves when the sentence is rewritten and stays put when the implementation under it is.
 #[test]
 fn a_claims_sentence_moves_with_the_claim_and_not_with_the_implementation() {
     const SOURCE: &str = r#"
@@ -2174,8 +2138,6 @@ law "a debit never raises the balance"
     assert_eq!(reformatted.law_texts, base.law_texts);
 }
 
-/// A law's identity is its binders, guard and body against the *hashes* of what it names — never
-/// their names, and never its own label.
 #[test]
 fn a_law_is_hashed_by_what_it_claims_rather_than_by_what_it_is_called() {
     const SOURCE: &str = r#"
@@ -2252,7 +2214,6 @@ fn param_of(name: &str, ty: TypeExpr) -> Param {
     }
 }
 
-/// Not a taste call.
 #[test]
 fn adding_a_constraint_changes_the_definition_hash() {
     let bare = hash_of(constrained("a", &[]), "f");
@@ -2299,8 +2260,6 @@ fn renaming_a_constrained_type_parameter_changes_no_hash() {
     assert_eq!(a, elem, "a type parameter is a level, not a name");
 }
 
-/// A constraint the signature does not bind is an error the checker reports, and a hash may not
-/// depend on a name the definition cannot reach.
 #[test]
 fn a_constraint_on_an_unbound_parameter_contributes_nothing() {
     let bare = hash_of(constrained("a", &[]), "f");
@@ -2308,7 +2267,6 @@ fn a_constraint_on_an_unbound_parameter_contributes_nothing() {
     assert_eq!(bare, dangling);
 }
 
-/// The decoder's half for a region.
 #[test]
 fn a_region_survives_a_body_round_trip() {
     let items = vec![func(
@@ -2352,7 +2310,6 @@ fn a_region_survives_a_body_round_trip() {
     );
 }
 
-/// The decoder's half.
 #[test]
 fn a_constraint_survives_a_body_round_trip() {
     let items = constrained("a", &[(Deriver::Ord, "a"), (Deriver::Json, "a")]);
@@ -2385,18 +2342,12 @@ fn a_constraint_survives_a_body_round_trip() {
     );
 }
 
-// ---- a definition's own form ----
-
 const LEDGER_PAIR: &str = r#"
 fn apply_debit(balance: Int, amount: Int) -> Int = balance - amount
 
 fn settle(balance: Int, amount: Int) -> Int = apply_debit(balance, amount)
 "#;
 
-/// The whole of what early cutoff asks of [`HashOutput::own`], and it fails in
-/// opposite directions. If it moved with a callee's body it would recheck
-/// exactly what a `DefHash` already rechecks and buy nothing; if it stayed put
-/// when the definition's own text moved, a real edit would go unchecked.
 #[test]
 fn an_own_hash_moves_with_the_definitions_own_text_and_not_with_its_callees() {
     let base = parsed(LEDGER_PAIR);
@@ -2413,8 +2364,7 @@ fn an_own_hash_moves_with_the_definitions_own_text_and_not_with_its_callees() {
         "a gate key is domain-tagged apart from the identity beside it"
     );
 
-    // The callee was re-implemented. Its identity moves and so does its
-    // caller's, because a `DefHash` is transitive and stays that way.
+    // A `DefHash` is transitive, so the caller's identity moves too.
     let rebodied = parsed(&LEDGER_PAIR.replace("balance - amount", "balance - (amount + 0)"));
     assert_ne!(rebodied.defs[&debit], base.defs[&debit]);
     assert_ne!(rebodied.defs[&settle], base.defs[&settle]);
@@ -2438,9 +2388,6 @@ fn an_own_hash_moves_with_the_definitions_own_text_and_not_with_its_callees() {
     assert_eq!(reformatted.own[&settle], base.own[&settle]);
 }
 
-/// The price of writing references by name, and why it is affordable: renaming a
-/// callee still moves no identity, so it still selects no test and rebuilds
-/// nothing. It costs the caller one recheck it did not need.
 #[test]
 fn renaming_a_callee_moves_its_callers_own_hash_and_no_identity() {
     let base = parsed(LEDGER_PAIR);
@@ -2454,11 +2401,7 @@ fn renaming_a_callee_moves_its_callers_own_hash_and_no_identity() {
     assert_ne!(renamed.own[&settle], base.own[&settle]);
 }
 
-/// A by-name encoding has no component index to write, so a cycle's members are
-/// encoded like any other definition — and must still be told apart. Their
-/// `DefHash`es may legitimately coincide, since refinement makes interchangeable
-/// members one definition; two gate keys collapsing onto one entry would instead
-/// lose a recheck.
+/// Their `DefHash`es may coincide, but two own hashes collapsing would lose a recheck.
 #[test]
 fn the_members_of_a_cycle_get_one_own_hash_each() {
     let out = parsed(

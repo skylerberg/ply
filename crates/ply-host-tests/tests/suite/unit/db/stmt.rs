@@ -24,9 +24,6 @@ fn a_statement_is_scanned_once_and_the_answer_is_reused() {
     assert_eq!(cache.len(), 2);
 }
 
-/// A refusal is cached too — a statement the driver will not run is refused identically every time
-/// — but the *span* is the perform's, not the one that first produced it, or every later refusal
-/// would point a reader at the wrong line.
 #[test]
 fn a_cached_refusal_points_at_the_perform_that_asked_for_it() {
     let cache = Cache::new(8);
@@ -42,8 +39,7 @@ fn a_cached_refusal_points_at_the_perform_that_asked_for_it() {
     assert_eq!(second.labels[0].span, span(99));
 }
 
-/// A program generating statement text is the case where nothing would have hit the cache anyway,
-/// so overflow costs a rescan rather than unbounded memory.
+/// Generated statement text would never hit the cache anyway, so overflow costs only a rescan.
 #[test]
 fn the_cache_is_bounded() {
     let cache = Cache::new(4);

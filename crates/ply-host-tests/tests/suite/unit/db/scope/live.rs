@@ -1,9 +1,6 @@
-//! The scope table, driven against a real postgres server.
-
 use super::*;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// A connection, driven synchronously on a current-thread runtime.
 struct Pg {
     runtime: tokio::runtime::Runtime,
     client: tokio_postgres::Client,
@@ -24,7 +21,6 @@ impl Pg {
         Pg { runtime, client }
     }
 
-    /// Runs one command.
     fn run(&self, sql: &str) -> Result<(), String> {
         self.runtime
             .block_on(self.client.simple_query(sql))
@@ -55,7 +51,6 @@ impl Pg {
     }
 }
 
-/// A scope table, a connection, and a scratch table of its own.
 struct Live {
     pg: Pg,
     observer: Pg,
@@ -65,12 +60,9 @@ struct Live {
     pid: String,
 }
 
-/// Distinct scratch table names within one process.
 static NEXT: AtomicU32 = AtomicU32::new(0);
 
 impl Live {
-    /// `None` when no server is configured, which every test below reports rather than passing
-    /// quietly.
     fn open() -> Option<Live> {
         let url = std::env::var("PLY_PG_URL").ok()?;
         let pg = Pg::open(&url);
@@ -95,7 +87,6 @@ impl Live {
         })
     }
 
-    /// Executes whatever `db.begin` asked for.
     fn begin(&mut self, who: Owner, level: Isolation, access: Access) -> Result<(), String> {
         match self.table.begin(who, level, access) {
             Step::Open { sql } | Step::Nested { sql, .. } => {
@@ -122,9 +113,7 @@ impl Live {
         match step {
             Step::Close { sql, .. } | Step::Nested { sql, .. } => {
                 let outcome = self.pg.run(&sql);
-                // Popped whether the server accepted it or not: a failed `COMMIT` has already ended
-                // the transaction, and a scope kept after its close would make every later
-                // savepoint name wrong.
+                // Popped even on failure: a failed `COMMIT` has already ended the transaction.
                 self.table.closed(who, true);
                 outcome
             }
@@ -133,8 +122,6 @@ impl Live {
         }
     }
 
-    /// What the machine calls on every exit path from an entry point, and what the driver does with
-    /// what it names.
     fn end_entry_point(&mut self) -> Vec<Result<(), String>> {
         self.table
             .end_entry_point(super::MACHINE)
@@ -156,8 +143,7 @@ impl Live {
             .expect("a count")
     }
 
-    /// Through a **different** connection, which is the only vantage point from which "committed"
-    /// means anything.
+    /// Through a different connection, the only place "committed" means anything.
     fn visible_elsewhere(&self) -> i64 {
         self.observer
             .one(&format!("SELECT count(*) FROM {}", self.rows))
@@ -165,7 +151,6 @@ impl Live {
             .expect("a count")
     }
 
-    /// What the server thinks this session is doing.
     fn session_state(&self) -> String {
         self.observer.one(&format!(
             "SELECT state FROM pg_stat_activity WHERE pid = {}",
@@ -173,8 +158,6 @@ impl Live {
         ))
     }
 
-    /// Everything a reusable connection has to be able to do: the server says it is idle, and a
-    /// statement on it works.
     fn assert_reusable(&self) {
         assert_eq!(
             self.session_state(),
@@ -187,8 +170,7 @@ impl Live {
     }
 }
 
-/// Every test below shares this preamble, and printing the reason is the point: a live test that
-/// vanishes silently is worth less than no live test at all.
+/// Prints why a live test skipped: one that vanishes silently is worse than none.
 macro_rules! live {
     ($name:ident) => {
         let Some(mut $name) = Live::open() else {
@@ -214,7 +196,6 @@ fn a_committed_transaction_persists_and_the_connection_is_reusable() {
     live.assert_reusable();
 }
 
-/// The property the milestone is about.
 #[test]
 fn an_aborted_transaction_leaves_nothing_and_the_connection_is_reusable() {
     live!(live);
@@ -230,8 +211,7 @@ fn an_aborted_transaction_leaves_nothing_and_the_connection_is_reusable() {
     live.assert_reusable();
 }
 
-/// A body that raises propagates past the `handle` that would have committed or aborted it, so the
-/// `BEGIN` is still open when the entry point ends.
+/// A raise propagates past the `handle` that would have closed the scope.
 #[test]
 fn a_body_that_raises_leaves_a_scope_that_end_entry_point_rolls_back() {
     live!(live);
@@ -308,8 +288,6 @@ fn a_released_savepoint_survives_until_the_outer_scope_decides() {
     live.assert_reusable();
 }
 
-/// Every savepoint the bound allows, on a real server, named by the same arithmetic that names them
-/// in memory.
 #[test]
 fn the_savepoint_bound_is_reachable_and_unwinds_in_order() {
     live!(live);
@@ -328,7 +306,6 @@ fn the_savepoint_bound_is_reachable_and_unwinds_in_order() {
         "the bound is a `Failed` and not a diagnostic"
     );
 
-    // Unwind one savepoint at a time, and every write disappears with the scope that made it.
     for depth in (1..=MAX_SAVEPOINTS).rev() {
         live.abort(ALONE).expect("a rollback to the savepoint");
         assert_eq!(live.visible_here(), depth as i64);
@@ -338,8 +315,6 @@ fn the_savepoint_bound_is_reachable_and_unwinds_in_order() {
     live.assert_reusable();
 }
 
-/// The mechanical backstop on a row that claims to be read-only, supplied by the one component in
-/// the stack that cannot be fooled by an annotation.
 #[test]
 fn a_write_inside_a_read_only_transaction_is_25006_from_the_server() {
     live!(live);
@@ -354,8 +329,6 @@ fn a_write_inside_a_read_only_transaction_is_25006_from_the_server() {
     live.assert_reusable();
 }
 
-/// After a statement fails inside a scope, every later statement in that scope is `25P02` until the
-/// scope ends or a savepoint below the failure is rolled back to.
 #[test]
 fn a_failed_statement_poisons_the_scope_until_a_savepoint_below_it_is_rolled_back_to() {
     live!(live);
@@ -383,8 +356,7 @@ fn a_failed_statement_poisons_the_scope_until_a_savepoint_below_it_is_rolled_bac
     live.assert_reusable();
 }
 
-/// `40001` is a value the program matches on and not a diagnostic, and W4 never retries on its
-/// behalf: only the program knows whether the body sent an email between two statements.
+/// Never retried on the program's behalf: only the program knows what else the body did.
 #[test]
 fn a_serialization_failure_is_a_value_and_a_fresh_transaction_succeeds() {
     live!(live);
@@ -397,8 +369,7 @@ fn a_serialization_failure_is_a_value_and_a_fresh_transaction_succeeds() {
         .run("BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE")
         .expect("the other one");
 
-    // Each reads what the other is about to write, which is the shape postgres detects rather than
-    // a lock it can wait on.
+    // Each reads what the other writes: a cycle postgres detects, not a lock it can wait on.
     live.pg
         .run(&format!("SELECT count(*) FROM {}", live.rows))
         .expect("a read");
@@ -420,8 +391,7 @@ fn a_serialization_failure_is_a_value_and_a_fresh_transaction_succeeds() {
         "which is what `is_retryable` answers true for"
     );
 
-    // The retry is a fresh transaction rather than a resumption, so it is outside the linearity
-    // rule entirely — and it succeeds.
+    // A fresh transaction, not a resumption, so the linearity rule does not apply.
     contender
         .run("BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE")
         .expect("a fresh transaction");
@@ -433,8 +403,7 @@ fn a_serialization_failure_is_a_value_and_a_fresh_transaction_succeeds() {
     live.assert_reusable();
 }
 
-/// What `std.db`'s `is_retryable` says, in Rust, so the assertion above is about the same two codes
-/// rather than about a string.
+/// Mirrors `std.db`'s `is_retryable`, so the assertion is about the same two codes.
 fn retryable(code: &str) -> bool {
     code == "40001" || code == "40P01"
 }

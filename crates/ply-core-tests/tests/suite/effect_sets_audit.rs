@@ -1,5 +1,3 @@
-//! Adversarial audit of "an `effect set` is annotation-only".
-
 use crate::fixture::compile;
 use ply_core::CheckOutput;
 use ply_span::{Diagnostic, SourceId, Symbol, codes};
@@ -67,8 +65,6 @@ fn program(rest: &str) -> String {
     format!("{EFFECTS}{rest}")
 }
 
-// --- 1. an alias cannot launder an atom -------------------------------------
-
 #[test]
 fn an_alias_cannot_hide_a_nondet_atom_the_body_performs() {
     let diags = errors(&program(
@@ -87,8 +83,6 @@ fn an_alias_cannot_hide_a_nondet_atom_the_body_performs() {
     );
 }
 
-/// Resource granularity is the whole design contribution, so an alias that holds `db.read[users]`
-/// may not stand in for `db.read[orders]`.
 #[test]
 fn an_alias_over_one_resource_does_not_cover_another() {
     let diags = errors(&program(
@@ -102,7 +96,6 @@ fn an_alias_over_one_resource_does_not_cover_another() {
     );
 }
 
-/// The mode is half of an atom.
 #[test]
 fn an_alias_of_reads_does_not_admit_a_write() {
     let diags = errors(&program(
@@ -116,8 +109,6 @@ fn an_alias_of_reads_does_not_admit_a_write() {
     );
 }
 
-/// An atom reached only through a callee is still the caller's atom, and the alias bounds it the
-/// same way.
 #[test]
 fn an_alias_bounds_what_a_callee_reaches() {
     let diags = errors(&program(
@@ -132,7 +123,6 @@ fn an_alias_bounds_what_a_callee_reaches() {
     );
 }
 
-/// An empty set is a bound, not an absence of one.
 #[test]
 fn an_empty_set_is_the_empty_bound_and_refuses_everything() {
     let diags = errors(&program(
@@ -151,8 +141,6 @@ fn an_empty_set_is_the_empty_bound_and_refuses_everything() {
     assert_eq!(published(&out, "m.handler"), "{}");
 }
 
-/// A row variable admits *more* atoms, so it must not admit them past the set: the concrete part of
-/// `{Web | e}` is still an upper bound on the concrete part of what the body performs.
 #[test]
 fn a_row_variable_beside_a_set_does_not_dissolve_the_bound() {
     let diags = errors(&program(
@@ -166,8 +154,6 @@ fn a_row_variable_beside_a_set_does_not_dissolve_the_bound() {
     );
 }
 
-/// A handler discharges atoms, and the alias bounds what is left over rather than what was
-/// performed inside the region.
 #[test]
 fn an_alias_bounds_what_survives_a_handler_including_the_clauses() {
     let out = ok(&program(
@@ -191,9 +177,6 @@ fn an_alias_bounds_what_survives_a_handler_including_the_clauses() {
     );
 }
 
-// --- 2. an alias cannot widen what inference produced ------------------------
-
-/// The published row is the expansion and `performed` is the body's.
 #[test]
 fn an_over_broad_alias_widens_the_published_row_and_not_the_performed_one() {
     let out = ok(&program(
@@ -207,8 +190,6 @@ fn an_over_broad_alias_widens_the_published_row_and_not_the_performed_one() {
     assert_eq!(performed(&out, "m.handler"), "{m.db.read[users]}");
 }
 
-/// The consequence a caller feels: it is checked against what the callee *published*, so an
-/// over-broad set propagates.
 #[test]
 fn a_caller_inherits_the_published_row_rather_than_the_performed_one() {
     let out = ok(&program(
@@ -227,10 +208,6 @@ fn a_caller_inherits_the_published_row_rather_than_the_performed_one() {
     );
 }
 
-// --- 3. `E0412` sees the atoms ----------------------------------------------
-
-/// A `nondet` atom that a set carries but the body never performs still reaches the determinism
-/// check, because a caller is checked against the *published* row.
 #[test]
 fn a_nondet_atom_an_over_broad_set_declares_still_reaches_e0412() {
     let diags = errors(&program(
@@ -251,8 +228,6 @@ fn a_nondet_atom_an_over_broad_set_declares_still_reaches_e0412() {
     );
 }
 
-/// And handling the atom discharges it, alias or no alias — the set is not a second thing that has
-/// to be discharged.
 #[test]
 fn handling_the_atom_a_set_carries_discharges_it() {
     let out = ok(&program(
@@ -269,10 +244,6 @@ fn handling_the_atom_a_set_carries_discharges_it() {
     assert_eq!(out.tests[0].footprint.to_string(), "{}");
 }
 
-// --- 4. a refused set contributes nothing, and says so ----------------------
-
-/// A cycle is `E0115` and nothing else: no second, misleading `E0302` produced by quietly expanding
-/// the cyclic set to nothing and then measuring the body against it.
 #[test]
 fn a_cyclic_set_is_one_refusal_and_not_a_silently_empty_bound() {
     let diags = errors(&program(
@@ -295,8 +266,6 @@ fn a_cyclic_set_is_one_refusal_and_not_a_silently_empty_bound() {
     );
 }
 
-/// Two independent cycles are two reports, so a file with several of them tells a reader about all
-/// of them in one run.
 #[test]
 fn two_disjoint_cycles_are_two_refusals() {
     let diags = errors(&program(
@@ -316,8 +285,6 @@ fn two_disjoint_cycles_are_two_refusals() {
     );
 }
 
-/// A set that merely *reaches* a cycle is refused with the cycle rather than expanded to a partial
-/// answer.
 #[test]
 fn a_set_that_reaches_a_cycle_does_not_publish_a_partial_expansion() {
     let diags = errors(&program(
@@ -326,16 +293,13 @@ fn a_set_that_reaches_a_cycle_does_not_publish_a_partial_expansion() {
          fn handler() -> Int / {Outer} { log.line(1); db.all[users]() }\n",
     ));
     only(&diags, codes::EFFECT_SET_CYCLE);
-    // `log.write` is outside anything written, so if `Outer` were expanded at all the body would be
-    // measured against a bound the author did not write.
+    // `log.write` is outside every written bound, so any expansion of `Outer` would refuse it.
     assert!(
         !diags.iter().any(|d| d.code == codes::EFFECT_NOT_PERMITTED),
         "{diags:#?}"
     );
 }
 
-/// A set naming a set that does not exist is `E0114` at the *member*, so the fix is at the
-/// declaration rather than at each row that named the outer set.
 #[test]
 fn a_member_naming_an_undeclared_set_is_e0114_once() {
     let diags = errors(&program(
@@ -353,8 +317,6 @@ fn a_member_naming_an_undeclared_set_is_e0114_once() {
     );
 }
 
-/// A duplicate set name is `E0105` and the file does not compile, so there is no run in which one
-/// of two spellings of `Web` silently won.
 #[test]
 fn a_duplicate_set_is_refused_rather_than_resolved() {
     let diags = errors(&program(
@@ -376,8 +338,6 @@ fn a_duplicate_set_is_refused_rather_than_resolved() {
     );
 }
 
-/// The module-local rule, from the other side: a set declared in one module is not in scope in
-/// another, and the refusal says why rather than merely that the name was not found.
 #[test]
 fn a_set_is_not_reachable_from_another_module() {
     let inputs = [

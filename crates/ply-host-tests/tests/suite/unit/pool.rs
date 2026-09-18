@@ -1,9 +1,6 @@
 use ply_host::pool::{FS_FIRST_TOKEN, NET_FIRST_TOKEN};
 
-/// The invariant `NET_FIRST_TOKEN` argues for, asserted rather than
-/// described. A composed runtime asks each facility whether it minted a
-/// token and the first one to say yes answers it, so two ranges that met
-/// would not be a wrong answer — they would be a poll that never resolves.
+/// The first facility to claim a token answers it, so overlapping ranges would hang a poll forever.
 #[test]
 fn no_two_facilities_mint_the_same_token() {
     let ranges = [
@@ -21,9 +18,7 @@ fn no_two_facilities_mint_the_same_token() {
                 first < next,
                 "`{whose}` starts at {first} and `{other}` at {next}: the ranges are not ordered"
             );
-            // Unreachable rather than maximal: `net` starts at 1 because 0 is the token a
-            // zeroed `Pending` carries, so the gap below it is one short of a power of two
-            // and no choice of constants makes every gap exactly 2^62.
+            // Not maximal: `net` starts at 1 (a zeroed `Pending` carries 0), so no gap is 2^62.
             assert!(
                 next - first >= 1 << 61,
                 "`{whose}` reaches `{other}` after {} operations",

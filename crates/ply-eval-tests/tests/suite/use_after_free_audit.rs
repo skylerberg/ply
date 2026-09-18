@@ -1,14 +1,8 @@
-//! Reading a slot after its region reclaimed it.
-
 use crate::fixture::Compiled;
 use ply_eval::Value;
 use ply_eval::arena::{Arena, Reclaim, RegionKind, Slot, Stats};
 use ply_span::{Diagnostic, Span, codes};
 
-// ------------------------------------------------------------------ harness
-
-/// The diagnostics that refused `src`, insisting there are some: every caller here is asserting
-/// that a use-after-free was caught, so an accepted fixture is the interesting failure.
 #[track_caller]
 fn refused(src: &str) -> Vec<Diagnostic> {
     match Compiled::rejected(src) {
@@ -50,7 +44,6 @@ fn codes_of(diags: &[Diagnostic]) -> Vec<&str> {
     diags.iter().map(|d| d.code).collect()
 }
 
-/// The escape brand's list, walked to the end.
 #[test]
 fn every_carrier_out_of_a_region_is_refused_before_it_can_dangle() {
     let carriers: &[(&str, &str)] = &[
@@ -92,8 +85,6 @@ fn every_carrier_out_of_a_region_is_refused_before_it_can_dangle() {
     }
 }
 
-/// W2's hole was a check that ran *before* alias resolution, and the region model's Consequences name it as
-/// the way an escape gets past the brand.
 #[test]
 fn a_cell_round_tripped_through_a_type_alias_keeps_its_brand() {
     const ALIAS: &str = "type Held = Cell<Int>\nfn keep(c: Held) -> Held = c\n";
@@ -122,8 +113,6 @@ fn a_cell_round_tripped_through_a_type_alias_keeps_its_brand() {
     );
 }
 
-/// A `law` body opens regions like any other body, so `check_regions` has to have filed a site for
-/// it.
 #[test]
 fn a_region_in_a_law_body_reports_its_escape() {
     let diags = refused(
@@ -136,9 +125,6 @@ fn a_region_in_a_law_body_reports_its_escape() {
     );
 }
 
-/// The asymmetry that pays for the three above, and the reason it is a decision rather than an
-/// oversight: `with_region` is new syntax with no program depending on the loose rule, so the
-/// identical escape is a compile error that names the task.
 #[test]
 fn the_same_escape_out_of_a_with_region_is_refused_statically() {
     let diags = refused(
@@ -160,7 +146,6 @@ pub fn attack() -> Int = simulate {
     );
 }
 
-/// The shapes `region_reclamation_audit` does not walk.
 #[test]
 fn no_region_reaching_a_capture_indirectly_is_inferred_unique() {
     const AMB: &str = "effect amb { read flip[coin]() -> Bool }\n";
@@ -201,8 +186,7 @@ fn no_region_reaching_a_capture_indirectly_is_inferred_unique() {
     }
 }
 
-/// Why a wrong answer from the inference is survivable, stated as a property of the allocator
-/// rather than as a hope: [`Arena::close`] never reads the region's kind.
+/// Why a wrong inferred kind is survivable: [`Arena::close`] never reads the region's kind.
 #[test]
 fn what_a_close_reclaims_is_decided_by_the_pin_and_never_by_the_kind() {
     for kind in [RegionKind::Unique, RegionKind::Shared] {
@@ -236,8 +220,7 @@ fn what_a_close_reclaims_is_decided_by_the_pin_and_never_by_the_kind() {
     }
 }
 
-/// The generation is what turns a stale read into a diagnostic instead of a wrong value, so the one
-/// way a wrong value comes back is the counter coming back around.
+/// Only the generation catches a stale read, so wrapping is the one way a wrong value returns.
 #[test]
 fn a_positions_generation_only_rises_and_never_hands_back_an_identity() {
     const ROUNDS: u32 = 2_000;

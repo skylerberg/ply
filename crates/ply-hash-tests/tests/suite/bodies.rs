@@ -211,8 +211,6 @@ fn renumber(
     }
 }
 
-/// Every definition must come back with the interface it went in with, modulo the names the
-/// reconstruction invented.
 fn assert_interfaces_survive(files: &[(&str, &str)]) -> Checked {
     let original = compile(files);
     let (rebuilt, names) = rebuild(&original);
@@ -326,8 +324,6 @@ test/nondet "the clock is not deterministic" {
 }
 "#;
 
-/// Every operator the language has, so the byte table and its inverse are exercised over all of
-/// it rather than the handful an example uses.
 const EVERY_OPERATOR: &str = r#"
 fn arithmetic(a, b) = a + b - a * b / a % b
 fn comparison(a, b) = (a == b) && (a != b) || (a < b) && (a <= b) || (a > b) && (a >= b)
@@ -337,13 +333,7 @@ fn shifts(a, b) = (a << b) + (a >> b) + (a >>> b)
 fn prefixes(a, p) = -a + ~a + (if !p { 1 } else { 0 })
 "#;
 
-/// The comment above `body::binop_of` called its table "pinned by a round-trip
-/// test over every operator" and no such test existed; the bit and filesystem surface added six
-/// operators to `binop_byte` and one to `unop_byte`, and the inverse is a
-/// second hand-written list, so an omission there is not a compile error — it
-/// is `W0602` at decode time, on a body that hashed and stored perfectly well.
-/// This is that test. It deliberately does not typecheck: what is under test is
-/// the byte table, not the prelude.
+/// Deliberately does not typecheck: the byte table is under test, not the prelude.
 #[test]
 fn every_operator_survives_the_byte_table_and_its_inverse() {
     let (program, resolved) = parse(&[("m", EVERY_OPERATOR)]);
@@ -437,8 +427,6 @@ fn cross_module_references_resolve_after_reconstruction() {
     ]);
 }
 
-/// Self-recursion is one member in its own component, so its intra-component reference names the
-/// only class there is and comes back unambiguously.
 #[test]
 fn self_recursion_round_trips() {
     let original = assert_interfaces_survive(&[(
@@ -464,9 +452,6 @@ fn self_recursion_round_trips() {
     assert!(module.imports.is_empty());
 }
 
-/// A mutually recursive component's bytes label each intra-component reference with the class
-/// refinement assigned, and refinement runs to a *labelled* fixed point — so the label a reference
-/// mentions is the label its referent is filed under, and which member calls which is recoverable.
 #[test]
 fn a_mutually_recursive_component_round_trips_wired_the_way_it_was_written() {
     let original = compile(&[(
@@ -491,7 +476,6 @@ fn a_mutually_recursive_component_round_trips_wired_the_way_it_was_written() {
     assert_eq!(names.len(), 2);
 }
 
-/// Two three-cycles that differ only in the direction they are wired.
 #[test]
 fn two_cycles_wired_in_opposite_directions_do_not_collide() {
     let clockwise = compile(&[(
@@ -595,8 +579,6 @@ fn a_reference_with_no_body_is_named_rather_than_guessed() {
     );
 }
 
-/// Renaming is free for a hash, so it must be free for a body: the bytes a definition is stored
-/// under cannot move when its name does.
 #[test]
 fn renaming_changes_no_body() {
     let before = compile(&[("m", "fn f(x: Int) -> Int = x + 1\nfn g() -> Int = f(1)\n")]);
@@ -612,9 +594,6 @@ fn renaming_changes_no_body() {
     assert_eq!(lhs, rhs);
 }
 
-/// Moving a definition between modules changes no hash, so it must change no body either — this is
-/// the property a reconstruction of a historical set depends on, because the modules moved and the
-/// hashes did not.
 #[test]
 fn moving_a_definition_between_modules_changes_no_body() {
     let together = compile(&[(
@@ -640,11 +619,7 @@ fn moving_a_definition_between_modules_changes_no_body() {
     assert_eq!(lhs, rhs);
 }
 
-/// Checking is not the bar — M5 has to *evaluate* a historical definition set — so the
-/// reconstructed tests are run, in the reconstructed program, against the reconstructed
-/// definitions.
-/// A rebuilt program is an AST with no text, and the whole emitter reads text: it is handed the
-/// program printed back to source, as `ply_test::hybrid` hands it a mixture.
+/// A rebuilt program has no text, so the C emitter is handed it printed back to source.
 fn on_the_tier<'a>(
     program: &'a ply_syntax::ast::Program,
     resolved: &'a ply_syntax::resolve::Resolved,
@@ -699,9 +674,6 @@ fn reconstructed_tests_evaluate() {
     }
 }
 
-/// The printer is what hands a reconstructed program to the whole emitter, so the source it
-/// writes has to *be* that program: every definition, test and law hashes to what it hashed as
-/// before it was printed. Over the same corpus `the_examples_reconstruct` walks.
 #[test]
 fn a_reconstructed_program_prints_to_the_source_it_hashes_as() {
     let files = corpus();
@@ -757,7 +729,6 @@ fn corpus() -> Vec<(String, String)> {
     files
 }
 
-/// The corpus a person actually edits, rather than a snippet written to pass.
 #[test]
 fn the_examples_reconstruct() {
     let files = corpus();
@@ -768,8 +739,7 @@ fn the_examples_reconstruct() {
     assert_interfaces_survive(&borrowed);
 }
 
-/// Every mutation is re-filed under *its own* key, so the self-check passes and the decoder is
-/// handed real garbage rather than being let off at the door.
+/// Each mutation is re-filed under its own key, so the decoder rather than the self-check sees it.
 #[test]
 fn no_mutation_of_a_body_can_abort_the_decoder() {
     let original = compile(&[("m", EVERY_ITEM_KIND)]);
@@ -787,8 +757,7 @@ fn no_mutation_of_a_body_can_abort_the_decoder() {
             let Some(key) = stored.key() else { continue };
             let mut set = BodySet::default();
             set.insert(key, stored);
-            // Succeeding is allowed — some mutations are still a definition — and only returning
-            // without aborting is being asserted.
+            // Succeeding is allowed: some mutations are still a definition.
             let _ = reconstruct(&set);
         }
     }
@@ -803,7 +772,6 @@ fn nothing_reconstructs_into_an_empty_program() {
     assert!(rebuilt.test_keys.is_empty());
 }
 
-/// The reconstruction is an artifact something else will diff, so it may not vary run to run.
 #[test]
 fn reconstruction_is_deterministic() {
     let original = compile(&[("m", EVERY_ITEM_KIND)]);
@@ -832,9 +800,6 @@ fn reconstruction_is_deterministic() {
     assert_eq!(first.names, second.names);
 }
 
-// --- reconstructing under the names a definition was written with ------------
-
-/// Two definitions in one module, a cross-module reference, and an effect a host handler names.
 const NAMED: [(&str, &str); 2] = [
     (
         "store.wire",
@@ -1043,8 +1008,7 @@ fn the_examples_come_back_under_their_own_names() {
     exact_round_trip(&compile(&borrowed));
 }
 
-/// Bisection's route is untouched: it deliberately reconstructs without a namespace, because a
-/// historical definition set has to be rebuildable without knowing what anything is called now.
+/// Bisection reconstructs without a namespace: a historical set must rebuild without today's names.
 #[test]
 fn reconstruct_without_a_namespace_is_unchanged() {
     let original = compile(&NAMED.map(|(n, s)| (n, s)));
@@ -1057,9 +1021,6 @@ fn reconstruct_without_a_namespace_is_unchanged() {
     assert_eq!(bare.program.modules.len(), original.bodies.len());
 }
 
-/// Two effect declarations that normalize identically are one hash, so a reconstruction cannot tell
-/// them apart — and the encoding only records that a definition *did* tell them apart when one
-/// component reached both.
 #[test]
 fn two_identical_effect_declarations_are_one_hash() {
     let original = compile(&[
@@ -1074,8 +1035,7 @@ fn two_identical_effect_declarations_are_one_hash() {
     );
 }
 
-/// A slot is a de Bruijn level into **one component's** effect enumeration, and each test is its
-/// own component.
+/// Slots index one component's effect enumeration, and each test is its own component.
 #[test]
 fn two_tests_that_number_one_effect_differently_both_reconstruct() {
     let original = compile(&[(

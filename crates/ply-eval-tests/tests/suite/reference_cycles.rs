@@ -1,6 +1,3 @@
-//! Why the leak the reference-counting pass accepts is not reachable yet, pinned so that the day it becomes
-//! reachable is a failing test rather than a silent leak.
-
 use crate::fixture::Compiled;
 use ply_span::codes;
 
@@ -24,8 +21,6 @@ test "a cell that reaches itself" {
     );
 }
 
-/// And declaring a type to hold the cell moves the refusal to the declaration, which is the other
-/// half of why the shape has nowhere to be written.
 #[test]
 fn a_declared_field_cannot_hold_a_cell_for_a_cycle_to_run_through() {
     let diags = Compiled::rejected(
@@ -46,8 +41,6 @@ test "a cell that reaches itself through a variant" {
     );
 }
 
-/// The detector itself still answers, so the guard is not vacuous code that stopped working while
-/// nothing could reach it.
 #[test]
 fn the_detector_still_finds_the_shape_it_guards_against() {
     use ply_eval::TaskRegions;

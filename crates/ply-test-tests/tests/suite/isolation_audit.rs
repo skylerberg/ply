@@ -1,7 +1,3 @@
-//! An attack on the scheduler's claim under region isolation: that a test's allocations live in a region
-//! closed when the test ends, so tests still cannot observe each other's allocations — while a
-//! region *label* two tests both write is one piece of state and colours them apart.
-
 use crate::fixture::{Compiled, TierExecutor};
 use ply_eval::{Plan, TaskRegions, Value};
 use ply_span::SourceId;
@@ -55,8 +51,7 @@ impl Compiled {
     }
 }
 
-/// Each test allocates its cell at the same id as every other one, reads and writes it, and checks
-/// every value it wrote.
+/// Every test allocates its cell at the same id, writes it, and checks every value it wrote.
 fn contending_source(tests: usize, label: impl Fn(usize) -> String) -> String {
     let mut out = String::new();
     let mut declared: Vec<String> = Vec::new();
@@ -99,7 +94,6 @@ fn a_label_each(i: usize) -> String {
     format!("table{i}")
 }
 
-/// `is_region_scoped` and `is_ambient` both trust one effect name.
 #[test]
 fn a_program_cannot_declare_either_effect_the_scheduler_names() {
     for name in ply_test::REGION_SCOPED.iter().chain(ply_test::AMBIENT) {
@@ -134,7 +128,6 @@ test "claim the name" {{
     }
 }
 
-/// The classification is by exact effect name, so a neighbouring name gains nothing.
 #[test]
 fn an_effect_whose_name_merely_resembles_the_builtin_is_not_region_scoped() {
     let compiled = Compiled::anonymous(
@@ -160,9 +153,6 @@ test "two" { cells.put[rows](2) }
     );
 }
 
-/// Region isolation's lost case, reached by inference rather than by injection: six tests whose only
-/// atoms name one label are six colours wide, and every one of them is `shared` on the line
-/// `--explain` prints.
 #[test]
 fn tests_naming_one_region_label_are_coloured_apart_and_reported_as_shared() {
     let compiled = Compiled::anonymous(&contending_source(6, one_label));
@@ -182,7 +172,6 @@ fn tests_naming_one_region_label_are_coloured_apart_and_reported_as_shared() {
     assert_eq!(group_by_conflict(&compiled.scheduled()).len(), 6);
 }
 
-/// A label nobody else names conflicts with nothing, so losing the fork bought it nothing to lose.
 #[test]
 fn tests_on_distinct_region_labels_still_share_one_group() {
     let compiled = Compiled::anonymous(&contending_source(16, a_label_each));
@@ -190,7 +179,6 @@ fn tests_on_distinct_region_labels_still_share_one_group() {
     assert_eq!(group_by_conflict(&compiled.scheduled()).len(), 1);
 }
 
-/// The classification subtracts atoms; it never subtracts tests.
 #[test]
 fn a_cell_atom_beside_a_real_one_does_not_launder_the_real_one() {
     let compiled = Compiled::anonymous(
@@ -250,8 +238,6 @@ test "a real read" {
     );
 }
 
-/// The colouring's own invariant, checked against the corpus rather than asserted about it: no two
-/// tests sharing a group conflict at all.
 #[test]
 fn no_pair_in_a_group_conflicts_at_all() {
     let source = format!(
@@ -287,8 +273,6 @@ test "other writer" {{ db.log[audit](1) }}
     }
 }
 
-/// The claim, executed: one group, real threads, every test writing the cell every other test also
-/// allocated at `#0`.
 #[test]
 fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
     const TESTS: usize = 32;
@@ -345,8 +329,6 @@ fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
     }
 }
 
-/// Region isolation's fixture, at the runner: built once for the group, mutated in place by every test
-/// in it, and the test's own allocations closed on top.
 #[test]
 fn the_group_fixture_is_built_once_and_carries_each_tests_write_to_the_next() {
     const TESTS: usize = 12;
@@ -401,14 +383,12 @@ fn the_group_fixture_is_built_once_and_carries_each_tests_write_to_the_next() {
 #[derive(Debug)]
 struct Observation {
     index: usize,
-    /// What the fixture cell held when this test opened the region.
     observed_at_open: i64,
     mark: usize,
     fixture_len: usize,
 }
 
-/// A worker whose "test" reads the fixture, writes it, and allocates a cell of its own — the three
-/// things a real test does to a region, with nothing else in the way.
+/// Reads the fixture, writes it, and allocates its own cell: everything a real test does to a region.
 #[derive(Default)]
 struct FixtureProbe {
     built: AtomicUsize,
@@ -453,8 +433,6 @@ impl ply_test::Executor for FixtureProbe {
     }
 }
 
-/// The same fixture at eight workers, which is where "built once per group" is not what the runner
-/// does and saying so would over-claim.
 #[test]
 fn a_group_spread_over_eight_workers_gets_one_fixture_each() {
     const TESTS: usize = 24;
@@ -511,9 +489,6 @@ fn a_group_spread_over_eight_workers_gets_one_fixture_each() {
     );
 }
 
-/// W4's and W5's shared-state defects surfaced as a verdict that moved with the job count, so that
-/// is what the region model is checked against: one worker and eight, over a corpus that has
-/// colliding labels, disjoint labels and pure tests all at once.
 #[test]
 fn verdicts_do_not_move_between_one_worker_and_eight() {
     let source = format!(
@@ -592,7 +567,6 @@ fn verdicts_do_not_move_between_one_worker_and_eight() {
     );
 }
 
-/// A region-isolated test may not create a group, for any corpus size.
 #[test]
 fn adding_isolated_tests_never_adds_a_group() {
     let shared = r#"

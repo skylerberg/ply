@@ -53,14 +53,11 @@ fn a_nullary_enum_and_bool_are_finite_and_everything_unbounded_is_not() {
     );
 }
 
-/// An uninterpreted sort has no cardinality.
 #[test]
 fn a_type_variable_is_never_finite() {
     assert_eq!(cardinality(&Type::Var(ply_ty::TyVar(0)), &kinds()), None);
 }
 
-/// A type in a constructor cycle has values of every nesting depth, so it has no finite domain
-/// to cover — which is exactly where induction would be needed and is not available.
 #[test]
 fn a_recursive_type_is_infinite_even_with_a_nullary_base_case() {
     let ctors = vec![
@@ -84,8 +81,6 @@ fn a_product_beyond_the_bound_is_refused_rather_than_walked() {
     assert_eq!(finite(&narrow, &world).map(|d| d.points), Some(81));
 }
 
-/// A ground claim is the degenerate finite domain: one point, the empty tuple, and no way to
-/// miss any of it.
 #[test]
 fn a_ground_claim_has_exactly_one_point() {
     let domain = finite(&[], &kinds()).expect("no binders is a finite domain");
@@ -94,8 +89,6 @@ fn a_ground_claim_has_exactly_one_point() {
     assert_eq!(domain.point(&kinds(), 0).map(|p| p.len()), Some(0));
 }
 
-/// Every point exactly once, in an order two runs agree on — a refutation found here reports
-/// its point as the counterexample with no shrinking.
 #[test]
 fn enumeration_covers_the_domain_once_each_in_a_fixed_order() {
     let world = kinds();

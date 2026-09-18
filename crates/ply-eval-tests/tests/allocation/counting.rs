@@ -1,18 +1,5 @@
-//! The counting allocator every test in this binary measures against.
-//!
-//! There is one of these because a `#[global_allocator]` is a whole-binary
-//! decision, and seven copies of it meant seven binaries. It counts on the
-//! calling thread only — the counters are `thread_local!` — which is what lets
-//! the tests here run in parallel with each other the way the tests inside any
-//! one of those seven already did.
-//!
-//! `ARMED` is why the counters can be read at all: without it every test would
-//! also charge itself the harness's own allocations between measured regions.
-//!
-//! `crates/ply-corpus-tests/tests/allocation/counting.rs` is the same file. Integration
-//! tests in different crates cannot share a module, so closing that last seam
-//! would mean a workspace member existing only to hold this. Two copies is the
-//! cheaper end of that trade; thirteen was not.
+//! Counters are thread-local, so the tests in this binary measure in parallel.
+//! Duplicated in crates/ply-corpus-tests/tests/allocation/counting.rs; keep the two in step.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -39,8 +26,7 @@ unsafe impl GlobalAlloc for Counting {
     }
 }
 
-/// What `f` charged the global allocator on this thread: its value, then the
-/// allocation count and the bytes.
+/// `f`'s value, then the allocations and bytes it charged on this thread.
 pub fn charge<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
     ALLOCS.with(|c| c.set(0));
     BYTES.with(|c| c.set(0));

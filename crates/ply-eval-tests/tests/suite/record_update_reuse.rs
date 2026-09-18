@@ -1,8 +1,3 @@
-//! `{..b, f: e}` reuses the base record's cells when nothing else holds it — ADR 0034's decision
-//! 3, drop-reuse for record literals — and is built as written otherwise. The programs here pin
-//! the semantics the reuse must not move: a shared base stays what it was, and a literal that
-//! copies only some of a record's fields is that smaller record.
-
 use crate::fixture::Compiled;
 use ply_eval::rc;
 
@@ -43,8 +38,7 @@ test "two updates of one base" {
     );
 }
 
-/// The reuse is keyed on the literal naming exactly the base's fields, which the expansion of
-/// `{..b, ..}` always does and a hand-written literal need not.
+/// Reuse is keyed on the literal naming exactly the base's fields; a hand-written one need not.
 #[test]
 fn a_literal_copying_some_of_a_records_fields_is_that_smaller_record() {
     passes(

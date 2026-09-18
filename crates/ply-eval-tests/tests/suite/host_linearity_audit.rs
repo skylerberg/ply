@@ -1,7 +1,3 @@
-//! Adversarial audit of host linearity — the retries and captures a host operation still permits
-//! on the tier. The at-most-once linearity counter (E0426) the tree machine raised is not a tier
-//! mechanism, so the cases that turned on it were removed with that machine.
-
 use crate::fixture::Compiled;
 use ply_eval::Value;
 use ply_eval::host::{
@@ -12,8 +8,7 @@ use ply_span::{Diagnostic, Symbol, codes};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Answers the ordinal of its own call, so a replay is visible in the value as well as in the
-/// count.
+/// Answers the ordinal of its own call, so a replay shows in the value as well as the count.
 #[derive(Default)]
 struct Counter {
     calls: AtomicU64,
@@ -90,8 +85,7 @@ fn with_tasks(mut registry: HostRegistry, handler: Arc<dyn HostHandler>) -> Host
     registry
 }
 
-/// Runs `source` with `net.send` bound at `linearity`, and answers what the run did and how many
-/// packets went out.
+/// What a run with `net.send` bound did, and how many packets went out.
 struct Run {
     outcome: Result<(), Diagnostic>,
     sends: u64,
@@ -108,8 +102,7 @@ fn run_with(source: &str, linearity: Linearity, tasks: bool, runtime: bool) -> R
         op("net", "send", linearity),
         counter.clone() as Arc<dyn HostHandler>,
     )]);
-    // Registered only where the fixture declares it: a registration for an operation the program
-    // does not have is `E0421` before anything runs.
+    // Registered only where declared: registering an operation the program lacks is `E0421`.
     if source.contains("accept[s]") {
         registry.register(op("net", "accept", linearity), Arc::new(Waits));
     }
@@ -131,8 +124,6 @@ fn run_with(source: &str, linearity: Linearity, tasks: bool, runtime: bool) -> R
     }
 }
 
-/// The rule is about one `perform` running twice because its control was reinstated, not about a
-/// program that performs twice.
 #[test]
 fn two_ordinary_performs_are_a_retry_and_are_allowed() {
     let run = run(
@@ -154,7 +145,6 @@ test/nondet "retries" {
     assert_eq!(run.sends, 2);
 }
 
-/// Two performs of one operation capture two continuations, each resumed once.
 #[test]
 fn a_fresh_capture_after_a_send_may_still_be_resumed_once() {
     let run = run(
@@ -187,8 +177,6 @@ test/nondet "twice over" {
     assert_eq!(run.sends, 2);
 }
 
-/// A `simulate` region and a host operation in the same entry point, with the operation *outside*
-/// the region.
 #[test]
 fn a_send_beside_a_simulate_region_is_performed_once_by_the_machine() {
     let run = run(
@@ -214,9 +202,6 @@ test/nondet "a region and a socket, side by side" {
     assert_eq!(run.sends, 1);
 }
 
-/// A registry compiled in but not bound is the `ply test` default, and it must leave M6 exactly
-/// where it was: `host_ops` stays zero for the life of the entry point, and a three-shot handler
-/// still runs three times.
 #[test]
 fn a_present_but_unbound_registry_leaves_multi_shot_alone() {
     let compiled = Compiled::named(
@@ -250,8 +235,6 @@ test/nondet "three resumptions, nothing bound" {
     assert_eq!(counter.calls(), 0);
 }
 
-/// M8 runs a law's body once per generated case, so a law that could reach a socket would send one
-/// packet per case and report the result as a `property` tier over the whole domain.
 #[test]
 fn a_spec_can_never_reach_the_host_because_a_spec_can_never_perform() {
     for source in [

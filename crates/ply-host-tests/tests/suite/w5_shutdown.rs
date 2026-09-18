@@ -1,5 +1,3 @@
-//! The drain, against a real postgres.
-
 use crate::support::cluster::{self, Cluster};
 use ply_eval::Value;
 use ply_eval::host::{HostAnswer, MachineId, Pending, ShutdownReport};
@@ -86,13 +84,11 @@ fn host(cluster: &Cluster, shutdown: &Arc<Shutdown>) -> Host {
     .stopping_on(Arc::clone(shutdown))
 }
 
-/// The teardown, as `ply run` reaches it: through the `HostRuntime` the machine was given, on the
-/// machine's own thread, after the entry point ended.
+/// Through the machine's `HostRuntime`, on its thread, after the entry point ended, as `ply run`.
 fn tear_down(host: &Host, drain_ms: u64) -> ShutdownReport {
     host.runtime().shutdown(drain_ms)
 }
 
-/// Sessions this cluster has sitting inside a transaction.
 fn idle_in_transaction(cluster: &Cluster) -> i64 {
     cluster
         .psql(
@@ -126,7 +122,6 @@ fn the_drain_never_commits_and_never_leaks() {
     the_drain_reports_what_it_rolled_back(&cluster);
 }
 
-/// **The one that matters.**
 fn an_open_transaction_at_shutdown_is_rolled_back(cluster: &Cluster) {
     let shutdown = Shutdown::new(Bounds {
         lead: Duration::ZERO,
@@ -163,8 +158,7 @@ fn an_open_transaction_at_shutdown_is_rolled_back(cluster: &Cluster) {
          assertion mean something"
     );
 
-    // The signal arrives while the request is inside the transaction, and the drain runs out before
-    // the body could finish.
+    // The signal arrives mid-transaction, and the drain runs out before the body could finish.
     shutdown.request(Signal::Terminate);
     let until = Instant::now() + Duration::from_secs(5);
     while !shutdown.drain_expired() && Instant::now() < until {
@@ -200,8 +194,7 @@ fn an_open_transaction_at_shutdown_is_rolled_back(cluster: &Cluster) {
     );
 }
 
-/// The other half of the claim, and the one that would make the first vacuous: a drain rolls back
-/// what was *open*, and takes nothing back that a body already committed.
+/// Without this, a drain that rolled back everything would pass the test above.
 fn a_committed_transaction_survives_the_drain(cluster: &Cluster) {
     let shutdown = Shutdown::new(Bounds::default());
     let host = host(cluster, &shutdown);
@@ -241,9 +234,7 @@ fn a_committed_transaction_survives_the_drain(cluster: &Cluster) {
     cluster.psql(&cluster.database, "delete from ledger");
 }
 
-/// The pinned order, checked at the one place it is observable: the sink is flushed **while the
-/// pool is still open**, so a record naming a rolled-back transaction is written by a run that
-/// still holds the connection that rolled it back.
+/// So a record naming a rolled-back transaction is written while its connection is still held.
 fn the_sink_is_flushed_before_the_pool_closes(cluster: &Cluster) {
     use ply_host::trace::{Level, Record, Sink, Trace};
     use std::sync::Mutex;
@@ -299,8 +290,7 @@ fn the_sink_is_flushed_before_the_pool_closes(cluster: &Cluster) {
     let db = host.database().expect("a database").clone();
     *sink.db.lock().unwrap() = Some(Arc::clone(&db));
 
-    // One statement, so a connection has actually been established: a pool that never opened one
-    // would make the assertion below true for the wrong reason.
+    // One statement, so a connection exists and the assertion below holds for the right reason.
     execute(
         &db,
         "ledger",
@@ -332,8 +322,7 @@ fn the_sink_is_flushed_before_the_pool_closes(cluster: &Cluster) {
     cluster.psql(&cluster.database, "delete from ledger");
 }
 
-/// A run that shut down uncleanly still shut down, so what the teardown could not hand back is
-/// `W0606` and data rather than a verdict.
+/// An unclean shutdown is `W0606` and data, not a verdict.
 fn the_drain_reports_what_it_rolled_back(cluster: &Cluster) {
     let shutdown = Shutdown::new(Bounds::default());
     let host = host(cluster, &shutdown);
@@ -397,8 +386,7 @@ fn the_drain_reports_what_it_rolled_back(cluster: &Cluster) {
     assert_eq!(idle_in_transaction(cluster), 0);
 }
 
-/// The coordinator holds the socket side by trait, so a `Host` built with a database still answers
-/// phase 2's questions.
+/// The coordinator holds the socket side by trait, so a database-backed `Host` still answers.
 #[test]
 fn a_host_with_a_database_still_answers_what_phase_two_asks() {
     let shutdown = Shutdown::new(Bounds::default());

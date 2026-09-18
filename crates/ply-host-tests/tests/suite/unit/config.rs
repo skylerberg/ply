@@ -16,8 +16,7 @@ fn sets(args: &[&str]) -> Vec<String> {
     args.iter().map(|a| (*a).to_string()).collect()
 }
 
-/// A reader over an in-memory tree, so a test that is about precedence is not also a test about
-/// `std::fs`.
+/// In memory, so a test about precedence is not also a test about `std::fs`.
 fn files(entries: &[(&str, &str)]) -> impl Fn(&Path) -> std::io::Result<String> + use<> {
     let entries: BTreeMap<String, String> = entries
         .iter()
@@ -89,8 +88,6 @@ fn renders(diagnostic: &Diagnostic) -> String {
     out
 }
 
-// --- precedence -------------------------------------------------------------
-
 #[test]
 fn precedence_walks_down_as_sources_are_removed() {
     let schema = spec(vec![with_default("DESK_REGION", Shape::Text, "default")]);
@@ -137,8 +134,6 @@ fn precedence_walks_down_as_sources_are_removed() {
     assert_eq!(snapshot.values["DESK_REGION"].source, Source::Default);
 }
 
-/// Two `--config` files naming one key: the later file wins, which is the rule that lets a
-/// deployment layer an override file over a base one.
 #[test]
 fn a_later_config_file_wins_over_an_earlier_one() {
     let tree = [
@@ -151,8 +146,6 @@ fn a_later_config_file_wins_over_an_earlier_one() {
     assert_eq!(snapshot.get("DESK_PORT"), Some("8137"));
 }
 
-/// The same rule for a repeated `--set`, so "the last one on the command line wins" has one answer
-/// across both explicit sources.
 #[test]
 fn the_last_set_of_a_key_wins() {
     let sources = read(&["K=first", "K=second"], &[], &[], &[]).expect("both parse");
@@ -165,15 +158,13 @@ fn the_environment_is_read_once_and_the_snapshot_never_changes() {
     let snapshot = resolve(&sources, None).snapshot;
     assert_eq!(snapshot.get("DESK_REGION"), Some("eu"));
 
-    // A second read of a *different* environment produces a different snapshot and leaves the first
-    // one exactly as it was.
+    // A second read of a different environment leaves the first snapshot as it was.
     let later = read(&[], &[], &[("DESK_REGION", "us")], &[]).expect("it is well formed");
     let later = resolve(&later, None).snapshot;
     assert_eq!(later.get("DESK_REGION"), Some("us"));
     assert_eq!(snapshot.get("DESK_REGION"), Some("eu"));
 }
 
-/// A run with no `--host` opens no source, whatever the environment holds.
 #[test]
 fn an_unopened_snapshot_answers_nothing() {
     let snapshot = Snapshot::unopened();
@@ -182,8 +173,6 @@ fn an_unopened_snapshot_answers_nothing() {
     assert_eq!(snapshot.counts(), Counts::default());
     assert!(!snapshot.has_spec());
 }
-
-// --- the file format --------------------------------------------------------
 
 #[test]
 fn a_malformed_config_file_names_the_file_and_the_line() {
@@ -260,9 +249,7 @@ fn a_set_that_is_not_key_equals_value_is_e0440_with_the_form() {
     }
 }
 
-/// Blank lines and whole-line comments are ignored; a `#` after the `=` is part of the value,
-/// because there is no quoting to escape one with and a password truncated at a `#` is exactly what
-/// this file format must not do.
+/// There is no quoting to escape a `#` with, so a password containing one must survive.
 #[test]
 fn comments_are_whole_lines_and_a_hash_in_a_value_survives() {
     let tree = [(
@@ -275,8 +262,6 @@ fn comments_are_whole_lines_and_a_hash_in_a_value_survives() {
     assert_eq!(snapshot.get("DESK_KEY"), Some("pa#ss"));
 }
 
-/// A key with an `=` in its value keeps the whole of it: the split is on the first `=` and the
-/// value is the rest of the line.
 #[test]
 fn the_value_is_the_rest_of_the_line() {
     let sources = read(&["DESK_DSN=a=b=c"], &[], &[], &[]).expect("it parses");
@@ -286,7 +271,6 @@ fn the_value_is_the_rest_of_the_line() {
     );
 }
 
-/// An empty value is a value.
 #[test]
 fn an_empty_value_is_a_value() {
     let sources = read(&["DESK_REGION="], &[], &[], &[]).expect("it parses");
@@ -296,8 +280,7 @@ fn an_empty_value_is_a_value() {
     );
 }
 
-/// The process environment holds names no program chose, and refusing the run over one would make
-/// `ply run --host` fail on a machine with an exported bash function.
+/// Refusing would fail `ply run --host` on any machine with an exported bash function.
 #[test]
 fn an_environment_name_that_is_not_a_key_is_skipped_rather_than_refused() {
     let sources = read(
@@ -311,8 +294,6 @@ fn an_environment_name_that_is_not_a_key_is_skipped_rather_than_refused() {
     assert_eq!(snapshot.get("DESK_REGION"), Some("eu"));
     assert_eq!(snapshot.get("BASH_FUNC_x%%"), None);
 }
-
-// --- the schema -------------------------------------------------------------
 
 #[test]
 fn a_required_key_nothing_supplies_is_e0441_naming_the_four_sources() {
@@ -335,7 +316,6 @@ fn a_required_key_nothing_supplies_is_e0441_naming_the_four_sources() {
     assert!(rendered.contains("default"), "{rendered}");
 }
 
-/// A required key with a default is supplied by definition, so it is not `E0441`.
 #[test]
 fn a_required_key_with_a_default_is_supplied() {
     let schema = spec(vec![Key {
@@ -395,8 +375,7 @@ fn a_malformed_secret_is_e0442_without_printing_the_value() {
         "the refusal says why the value is absent: {rendered}"
     );
 
-    // And the same with a value that is not empty, to check the omission is a property of the shape
-    // rather than of there being nothing to print.
+    // Non-empty too, so the omission is shown to belong to the shape, not to emptiness.
     let schema = spec(vec![Key {
         shape: Shape::Secret,
         ..required("DESK_API_KEY", Shape::Int)
@@ -442,15 +421,13 @@ fn an_undeclared_explicit_key_is_w0607_and_an_undeclared_environment_key_is_not(
     );
 }
 
-/// With no schema there is nothing to be undeclared against, so a `--set` is not warned about.
 #[test]
 fn without_a_schema_nothing_is_undeclared() {
     let sources = read(&["ANYTHING=1"], &[], &[], &[]).expect("it parses");
     assert!(resolve(&sources, None).warnings.is_empty());
 }
 
-/// Two declarations of one key may disagree about the shape, and which one applied would depend on
-/// the order the schema function built its list in.
+/// Which of two disagreeing declarations applied would depend on the schema's list order.
 #[test]
 fn a_schema_that_declares_a_key_twice_is_refused() {
     let error = Spec::new(vec![
@@ -462,8 +439,6 @@ fn a_schema_that_declares_a_key_twice_is_refused() {
     assert!(error.message.contains("DESK_REGION"), "{}", error.message);
 }
 
-/// Every refusal is raised together rather than one per run, so an operator fixing a deployment
-/// sees the whole list instead of discovering the second missing key after correcting the first.
 #[test]
 fn every_missing_and_invalid_key_is_reported_at_once() {
     let schema = spec(vec![
@@ -482,8 +457,6 @@ fn every_missing_and_invalid_key_is_reported_at_once() {
         ]
     );
 }
-
-// --- the secret gate --------------------------------------------------------
 
 #[test]
 fn get_refuses_a_secret_key_and_secret_refuses_a_plain_one() {
@@ -509,7 +482,6 @@ fn get_refuses_a_secret_key_and_secret_refuses_a_plain_one() {
     );
 }
 
-/// The boundary of the claim, stated as a test rather than left to a reader.
 #[test]
 fn without_a_schema_containment_is_only_as_strong_as_the_schema() {
     let sources = read(&["DESK_API_KEY=s3cret"], &[], &[], &[]).expect("it parses");
@@ -518,9 +490,7 @@ fn without_a_schema_containment_is_only_as_strong_as_the_schema() {
     assert_eq!(snapshot.plaintext("DESK_API_KEY"), Some("s3cret"));
 }
 
-/// A key the schema declares `SSecret` that no source supplies is `None` from both operations
-/// rather than an empty `Secret`, so "unset" and "set to nothing" stay distinguishable at the call
-/// site as well as at start-up.
+/// `None`, not an empty `Secret`, so unset and set-to-nothing stay distinguishable.
 #[test]
 fn an_unsupplied_optional_secret_answers_none_from_both() {
     let schema = spec(vec![key("DESK_API_KEY", Shape::Secret)]);
@@ -530,10 +500,6 @@ fn an_unsupplied_optional_secret_answers_none_from_both() {
     assert_eq!(snapshot.plaintext("DESK_API_KEY"), None);
 }
 
-// --- what a report may print ------------------------------------------------
-
-/// The `keys` line prints values for non-secret keys and `****` for secret ones, with the winning
-/// source beside each.
 #[test]
 fn a_report_prints_a_value_for_every_key_but_a_secret() {
     let schema = spec(vec![
@@ -588,7 +554,6 @@ fn a_report_prints_a_value_for_every_key_but_a_secret() {
     );
 }
 
-/// The environment's own names are never listed.
 #[test]
 fn a_report_lists_only_the_declared_keys() {
     let schema = spec(vec![key("DESK_REGION", Shape::Text)]);
@@ -604,8 +569,6 @@ fn a_report_lists_only_the_declared_keys() {
     assert_eq!(listed, ["DESK_REGION"]);
     assert_eq!(snapshot.environment, 2, "the count is printed");
 }
-
-// --- the registration -------------------------------------------------------
 
 #[test]
 fn two_configuration_readers_never_conflict() {
@@ -626,8 +589,7 @@ fn two_configuration_readers_never_conflict() {
         "two readers of one namespace do not conflict either, which is the whole point of a read"
     );
 
-    // And the shape that would conflict, so the test is about the mode rather than about
-    // `conflicts_with` answering `false` to everything.
+    // The conflicting shape too, so `conflicts_with` is shown not to answer `false` to everything.
     let writer = Footprint::from_atoms([EffectAtom::new(
         effect.clone(),
         Resource::Named(Symbol::new("credentials")),
@@ -636,7 +598,6 @@ fn two_configuration_readers_never_conflict() {
     assert!(atom("credentials").conflicts_with(&writer));
 }
 
-/// The three columns `ply hosts` prints, and each is a claim this module has to be able to defend.
 #[test]
 fn the_registration_declares_what_the_snapshot_makes_true() {
     let registry = registry(Arc::new(Snapshot::unopened()));

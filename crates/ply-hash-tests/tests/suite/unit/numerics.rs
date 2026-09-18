@@ -30,7 +30,6 @@ fn bodies_of(source: &str) -> BodySet {
         .1
 }
 
-/// `1`, `1.0` and `1m` have three types.
 #[test]
 fn the_three_numeric_literals_are_three_definitions() {
     let int = hash_of("pub fn f() -> Int = 1");
@@ -41,7 +40,6 @@ fn the_three_numeric_literals_are_three_definitions() {
     assert_ne!(int, decimal);
 }
 
-/// The bit patterns differ, so the definitions differ.
 #[test]
 fn positive_and_negative_zero_are_two_definitions() {
     assert_ne!(
@@ -50,7 +48,6 @@ fn positive_and_negative_zero_are_two_definitions() {
     );
 }
 
-/// Equal in value and differently written, so differently hashed.
 #[test]
 fn two_decimals_of_one_value_at_two_scales_are_two_definitions() {
     assert_ne!(
@@ -59,8 +56,6 @@ fn two_decimals_of_one_value_at_two_scales_are_two_definitions() {
     );
 }
 
-/// The encoding is over the `f64`, not over the source text, so two spellings of one binary64 are
-/// one definition and two neighbouring doubles are two.
 #[test]
 fn a_float_hashes_by_bit_pattern_rather_than_by_spelling() {
     assert_eq!(
@@ -73,8 +68,6 @@ fn a_float_hashes_by_bit_pattern_rather_than_by_spelling() {
     );
 }
 
-/// Renaming is free for a numeric definition exactly as it is for any other: the literal is in the
-/// bytes and the name is not.
 #[test]
 fn renaming_a_definition_holding_a_numeric_literal_changes_no_hash() {
     assert_eq!(
@@ -100,9 +93,7 @@ fn round_trip(source: &str) {
     }
 }
 
-/// For a `Float` this is where the bit pattern earns its place: decoding through the numeric value
-/// would merge `0.0` and `-0.0`, and the body's self-check would then fail on a store that is
-/// perfectly healthy.
+/// Decoding through the value would merge `0.0` and `-0.0` and fail the self-check on a healthy store.
 #[test]
 fn numeric_literals_survive_the_stored_body_round_trip() {
     round_trip("pub fn f() -> Float = -0.0");
@@ -116,17 +107,14 @@ fn numeric_literals_survive_the_stored_body_round_trip() {
     );
 }
 
-/// A `Decimal` outside the type's range never leaves the lexer, so it never enters a body — and a
-/// stream carrying one is refused rather than decoded into a value the evaluator would have to
-/// invent.
+/// The lexer never produces such a `Decimal`, so a stream carrying one is corrupt.
 #[test]
 fn a_body_carrying_an_out_of_range_decimal_is_refused() {
     let bodies = bodies_of("pub fn f() -> Decimal = 1.50m");
     let (_, body) = bodies.defs().next().expect("one definition");
     let mut bytes = body.as_bytes().to_vec();
 
-    // The scale is the last little-endian `2` in the stream: the encoder writes the mantissa's
-    // sixteen bytes and then the scale's four.
+    // The scale is the last little-endian `2`: the mantissa's sixteen bytes come before it.
     let scale = bytes
         .windows(4)
         .rposition(|w| w == 2u32.to_le_bytes())
@@ -134,8 +122,7 @@ fn a_body_carrying_an_out_of_range_decimal_is_refused() {
     bytes[scale..scale + 4].copy_from_slice(&99u32.to_le_bytes());
 
     let body = StoredBody::from_bytes(bytes).expect("still a body envelope");
-    // Filed under its *own* key, so the envelope's self-check passes and the range guard is what
-    // refuses it.
+    // Filed under its own key, so the range guard rather than the self-check refuses it.
     let key = body.key().expect("a solo body keys itself");
     let mut tampered = BodySet::default();
     tampered.insert(key, body);

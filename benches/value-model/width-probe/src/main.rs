@@ -1,17 +1,6 @@
-//! What does the *number type* cost, with the compiler held constant?
-//!
-//! Three transliterations of the same BLAKE3 over the same input, differing only in how a word is
-//! typed and what an add means:
-//!
-//!   w32  — `u32` words, `wrapping_add`, `rotate_right`. The repo's bar.
-//!   i64c — `i64` words masked to 32 bits after every add, each add checked. What Ply's `Int`
-//!          forces on `crates/ply-std/ply/hash.ply` today.
-//!   i64w — the same, with the check removed and the mask kept. Separates width from checking.
-//!
-//! Everything else — the tree walk, the block words, the state as a struct of sixteen fields —
-//! is identical, so a difference is the type. LLVM is the compiler for all three, which is the
-//! point: it says whether an optimiser strong enough to narrow `(a + b) & 0xFFFF_FFFF` back to a
-//! 32-bit add recovers the u32 code, or whether the type has to say it.
+//! What the number type costs with the compiler held constant: four BLAKE3s differing in words.
+//! `w32`: `u32` wrapping. `i64c`: masked to 32 bits, each add checked, as Ply's `Int` forces.
+//! `i64w`: masked, unchecked. `i64t`: `i64c` plus Ply's tagged-immediate representation.
 
 use std::time::Instant;
 
@@ -20,8 +9,6 @@ const BYTES: usize = 65536;
 const BLOCK_LEN: usize = 64;
 const CHUNK_LEN: usize = 1024;
 
-// The state is a record of sixteen named fields, as `hash.ply`'s `Words16` is, rather than an
-// array: a field of a record is what the finding says the code generator cannot see through.
 macro_rules! words16 {
     ($name:ident, $t:ty) => {
         #[derive(Clone, Copy)]
@@ -32,8 +19,6 @@ macro_rules! words16 {
 }
 words16!(W32, u32);
 words16!(W64, i64);
-
-// --- w32: the bar ------------------------------------------------------------------------------
 
 mod w32 {
     use super::*;
@@ -117,8 +102,6 @@ mod w32 {
         IV
     }
 }
-
-// --- i64: what one integer type forces ---------------------------------------------------------
 
 macro_rules! i64_impl {
     ($modname:ident, $add:expr) => {
@@ -224,9 +207,7 @@ macro_rules! i64_impl {
     };
 }
 
-// The fourth arm: Ply's compiled representation. Every word in the record is a tagged immediate
-// `(v << 1) | 1`; a read untags with an arithmetic shift, a write tags. Arithmetic is masked and
-// checked as `i64c`'s is. Nothing else differs, so the difference from `i64c` is the tag.
+// Every word is a tagged immediate `(v << 1) | 1`: reads untag, writes tag.
 macro_rules! i64_tagged {
     ($modname:ident) => {
         mod $modname {
@@ -327,8 +308,6 @@ i64_impl!(i64c, |a, b| a
     .checked_add(b)
     .unwrap_or_else(|| panic!("integer overflow in addition")));
 i64_impl!(i64w, |a, b| a.wrapping_add(b));
-
-// --- the same tree walk, three times ------------------------------------------------------------
 
 macro_rules! driver {
     ($drv:ident, $k:ident, $t:ty, $words:ident) => {
@@ -435,8 +414,6 @@ driver!(d64w, i64w, i64, W64);
 driver!(d64t_raw, i64t, i64, W64);
 mod d64t {
     pub fn blake3(input: &[u8]) -> [u8; 32] {
-        // `i64t::compress` answers tagged words; the driver above stores them straight back into
-        // `cv`, which `compress` tags again. Untag once at the digest, as the seam does.
         let d = super::d64t_raw::blake3(input);
         d
     }
@@ -459,7 +436,7 @@ fn time(f: impl Fn(&[u8]) -> [u8; 32], input: &[u8]) -> (f64, String) {
 
 fn main() {
     let input: Vec<u8> = (0..BYTES).map(|i| (i % 251) as u8).collect();
-    // Counterbalanced: each arm runs in each position across three blocks.
+    // Counterbalanced: each arm runs once in each position.
     let arms: [&str; 4] = ["w32", "i64c", "i64w", "i64t"];
     let mut digests: Vec<(String, String)> = Vec::new();
     for b in 0..4 {
@@ -475,8 +452,7 @@ fn main() {
             digests.push((arm.to_string(), d));
         }
     }
-    // The tagged arm's digest is the tagged words' low bytes and will not match; every other arm
-    // must agree, and the tagged arm must at least be self-consistent across its blocks.
+    // The tagged arm's digest cannot match the others; it need only agree with itself.
     let plain: Vec<&(String, String)> = digests.iter().filter(|(a, _)| a != "i64t").collect();
     for (arm, d) in &plain {
         assert_eq!(d, &plain[0].1, "{arm} computed a different digest");

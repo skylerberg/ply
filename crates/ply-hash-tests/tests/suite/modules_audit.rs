@@ -45,8 +45,7 @@ fn def(out: &HashOutput, name: &str) -> DefHash {
         .unwrap_or_else(|| panic!("no definition named `{name}`; have {:?}", out.defs.keys()))
 }
 
-/// A module whose effect declaration is byte-identical to every other one built this way, so that
-/// only the disambiguator can tell two of them apart.
+/// Byte-identical to every other one built this way, so only the disambiguator tells them apart.
 fn look_alike(effect: &str) -> String {
     format!(
         "pub effect {effect} {{\n  write emit[r](v: Int) -> Int\n}}\n\
@@ -54,11 +53,7 @@ fn look_alike(effect: &str) -> String {
     )
 }
 
-// False negatives: a real change that must move a hash.
-
-/// Redirecting a call from `a::log` to `b::log` moves nothing *by itself*: `a` and `b` are
-/// byte-identical, so the two programs differ by a consistent renaming of the two modules and
-/// denote the same computation.
+/// A redirect alone moves nothing, since `a` and `b` are byte-identical; this caller reaches both.
 #[test]
 fn redirecting_a_call_moves_a_definition_that_sees_both_look_alikes() {
     let forms = [
@@ -89,8 +84,6 @@ fn redirecting_a_call_moves_a_definition_that_sees_both_look_alikes() {
     }
 }
 
-/// A selective import reaches the same definition by a different route, and the route is not part
-/// of the hash.
 #[test]
 fn a_selective_import_and_a_qualified_path_reach_one_hash() {
     let a = look_alike("db");
@@ -105,8 +98,6 @@ fn a_selective_import_and_a_qualified_path_reach_one_hash() {
     assert_eq!(def(&qualified, "c.go"), def(&selective, "c.go"));
 }
 
-/// Injectivity is the property that stops a stale pass, and it is owed to every definition that can
-/// *observe* which look-alike it got.
 #[test]
 fn many_look_alike_effects_never_alias_where_a_definition_can_tell_them_apart() {
     for named in [true, false] {
@@ -157,8 +148,6 @@ fn many_look_alike_effects_never_alias_where_a_definition_can_tell_them_apart() 
     }
 }
 
-/// The same test text in two modules is two different computations when its bare names denote
-/// different definitions.
 #[test]
 fn identically_worded_tests_that_mean_different_things_do_not_share_a_hash() {
     let out = hashes(&[
@@ -168,8 +157,6 @@ fn identically_worded_tests_that_mean_different_things_do_not_share_a_hash() {
     assert_ne!(out.tests[0], out.tests[1]);
 }
 
-/// A bare name that meant a prelude builtin means the import once one is added, and the prelude's
-/// `len` is not this `len`.
 #[test]
 fn a_selective_import_that_captures_a_prelude_name_moves_the_hash() {
     let provider = "pub fn len(xs: List<Int>) -> Int = 0\n";
@@ -187,8 +174,7 @@ fn a_selective_import_that_captures_a_prelude_name_moves_the_hash() {
     assert_ne!(def(&before, "b.count"), def(&after, "b.count"));
 }
 
-/// Import order must never decide what a name means, because nothing downstream of resolution can
-/// see the order.
+/// Nothing downstream of resolution can see import order.
 #[test]
 fn two_imports_of_one_name_are_rejected_in_either_order() {
     let a = "pub fn f(x: Int) -> Int = x + 1\n";
@@ -205,9 +191,7 @@ fn two_imports_of_one_name_are_rejected_in_either_order() {
     }
 }
 
-/// A local definition shadowing an import of the same name is the case where a silent winner would
-/// be invisible in the source, so it is an error — and qualifying the reference both fixes it and
-/// names a different definition.
+/// A silent winner would be invisible in the source, so the collision is an error.
 #[test]
 fn a_local_definition_colliding_with_an_import_is_ambiguous_and_qualifying_fixes_it() {
     let a = "pub fn f(x: Int) -> Int = x + 1\n";
@@ -224,8 +208,7 @@ fn a_local_definition_colliding_with_an_import_is_ambiguous_and_qualifying_fixes
     );
 }
 
-/// Hashing resolves names without consulting `pub`, which is only safe while a reference to a
-/// private name is rejected before a hash is ever used.
+/// Hashing ignores `pub`, which is only safe while a private reference is rejected first.
 #[test]
 fn a_reference_to_a_private_name_is_rejected() {
     let a = "fn hidden(x: Int) -> Int = x + 1\n";
@@ -253,9 +236,6 @@ fn moving_a_definition_while_editing_it_still_moves_its_hash() {
     assert_ne!(def(&before, "b.use_it"), def(&after, "b.use_it"));
 }
 
-// False positives: a no-op edit that must not move a hash.
-
-/// Adding a module changes the namespace and nothing else.
 #[test]
 fn adding_an_unrelated_module_changes_no_hash() {
     let base: &[(&str, &str)] = &[("m", &look_alike("db"))];
@@ -282,11 +262,7 @@ fn reordering_the_files_of_a_program_changes_no_hash() {
     assert_eq!(forward.tests, backward.tests);
 }
 
-// The regressions the disambiguator used to cause.
-
-/// Moving a definition between modules changes no hash, and that has to survive two
-/// identically-declared effects of the same simple name — the arrangement where a name-ordered rank
-/// swaps the pair and drifts a module nobody edited.
+/// A name-ordered rank would swap two same-named look-alikes and drift a module nobody edited.
 #[test]
 fn moving_a_look_alike_effect_of_the_same_name_changes_no_hash() {
     let before = hashes(&[("a", &look_alike("db")), ("b", &look_alike("db"))]);
@@ -303,8 +279,6 @@ fn moving_a_look_alike_effect_of_the_same_name_changes_no_hash() {
     );
 }
 
-/// Adding a file is not an edit to any existing definition, so it may not invalidate one — not even
-/// when the new file declares an effect whose operations match an existing one exactly.
 #[test]
 fn adding_a_module_that_declares_a_look_alike_effect_changes_no_hash() {
     let before = hashes(&[("m", &look_alike("db"))]);
@@ -312,7 +286,6 @@ fn adding_a_module_that_declares_a_look_alike_effect_changes_no_hash() {
     assert_eq!(def(&before, "m.log"), def(&after, "m.log"));
 }
 
-/// The mirror image: deleting a module leaves the survivors alone.
 #[test]
 fn deleting_a_module_that_declares_a_look_alike_effect_changes_no_other_hash() {
     let before = hashes(&[("m", &look_alike("aaa")), ("n", &look_alike("zzz"))]);
@@ -320,9 +293,7 @@ fn deleting_a_module_that_declares_a_look_alike_effect_changes_no_other_hash() {
     assert_eq!(def(&before, "n.log"), def(&after, "n.log"));
 }
 
-/// Renaming is the property the whole language is sold on, and it has to hold for an effect renamed
-/// *past* one of its look-alikes: `aaa` -> `zzz` crosses `mmm`, and `n.log`, which nobody touched,
-/// must not move.
+/// `aaa` -> `zzz` crosses `mmm`, and `n.log` must not move.
 #[test]
 fn renaming_an_effect_changes_no_hash_in_another_module() {
     let before = hashes(&[("m", &look_alike("aaa")), ("n", &look_alike("mmm"))]);
@@ -330,8 +301,6 @@ fn renaming_an_effect_changes_no_hash_in_another_module() {
     assert_eq!(def(&before, "n.log"), def(&after, "n.log"));
 }
 
-/// `alpha` returns `Foo` and `beta` returns `Bar`; they are not look-alikes by any reading and
-/// nothing may couple them.
 #[test]
 fn effects_whose_operations_differ_in_type_are_not_look_alikes() {
     let module = |effect: &str, ty: &str| {
@@ -353,8 +322,7 @@ fn effects_whose_operations_differ_in_type_are_not_look_alikes() {
     assert_eq!(def(&before, "n.use_it"), def(&after, "n.use_it"));
 }
 
-/// `hash_module` / `hash_ast` hash one module with no project around it, so every qualified
-/// reference falls through to a free name.
+/// With no project around it, every qualified reference falls through to a free name.
 #[test]
 fn single_module_hashing_does_not_alias_qualified_references() {
     let of = |source: &str| {
@@ -367,9 +335,6 @@ fn single_module_hashing_does_not_alias_qualified_references() {
     );
 }
 
-/// The one-module entry point may not accept a module whose references resolve only against other
-/// modules: with nothing to resolve against it would write the binder the file happened to spell,
-/// and a name is exactly what content addressing refuses to key on.
 #[test]
 fn a_lone_module_that_imports_is_refused_rather_than_hashed_by_name() {
     let module = ply_syntax::parse(SourceId(0), "import a.b\npub fn go() -> Int = b::log()\n")
@@ -388,8 +353,6 @@ fn a_lone_module_that_imports_is_refused_rather_than_hashed_by_name() {
     );
 }
 
-/// Two files importing *different* modules under one binder are token-identical below the import,
-/// so hashing by binder gives them one hash and one cache entry.
 #[test]
 fn two_modules_aliased_by_one_binder_are_not_hashed_alike() {
     let of = |source: &str| {
@@ -400,8 +363,6 @@ fn two_modules_aliased_by_one_binder_are_not_hashed_alike() {
     assert!(of("import p.q as m\npub fn go(v: Int) -> Int = m::log(v)\n").is_err());
 }
 
-/// A selective import binds a *bare* name, so the reference does not even carry a qualifier that
-/// could have kept the two apart.
 #[test]
 fn two_selectively_imported_names_are_not_hashed_alike() {
     let of = |source: &str| {
@@ -412,8 +373,6 @@ fn two_selectively_imported_names_are_not_hashed_alike() {
     assert!(of("import p.q (log)\npub fn go(v: Int) -> Int = log(v)\n").is_err());
 }
 
-/// The failure that contradicts a required invariant outright: `as`-renaming an import must change
-/// no hash, and hashing by binder makes it change one.
 #[test]
 fn an_as_rename_cannot_move_a_hash_because_neither_form_is_hashed() {
     let of = |source: &str| {

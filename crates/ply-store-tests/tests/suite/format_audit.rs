@@ -142,8 +142,7 @@ fn fingerprint() -> SourceFingerprint {
     }
 }
 
-/// A cache holding one of everything, plus a result so that a test can show the result cache came
-/// through a front-end failure untouched.
+/// One of everything, plus a result, to show the result cache survives a front-end failure.
 fn seeded(name: &str) -> TempRoot {
     let root = TempRoot::new(name);
     let mut store = root.open();
@@ -199,9 +198,7 @@ fn frame_checksum(kind: u8, payload: &[u8]) -> [u8; 8] {
     out
 }
 
-/// Every frame in a data file as `(offset, kind, payload length)`, found by walking it — which
-/// nothing in the store ever does, because a frame is only ever reached through an index record
-/// that already claims where it is.
+/// Every frame as `(offset, kind, payload length)`, found by walking the file as the store never does.
 fn frames(path: &Path) -> Vec<(usize, u8, usize)> {
     let bytes = read(path);
     let mut out = Vec::new();
@@ -230,9 +227,7 @@ fn payload_of(path: &Path, kind: u8) -> Vec<u8> {
     read(path)[offset + FRAME_HEADER..offset + FRAME_HEADER + len].to_vec()
 }
 
-/// Overwrites a frame's payload in place and repairs its checksum: bytes that verify but no longer
-/// say what the decoder expects, which is what a build with a different schema looks like from the
-/// outside.
+/// Overwrites a payload and repairs its checksum: what a build with another schema looks like.
 fn rewrite_payload(path: &Path, kind: u8, payload: &[u8]) {
     let (offset, len) = frame_of(path, kind);
     assert_eq!(payload.len(), len, "this helper cannot resize a frame");
@@ -264,8 +259,7 @@ fn set_located(index: &Path, record: usize, offset: u64, len: u32) {
     repair_index(index);
 }
 
-/// The shape every damaged cache must present: nothing cached, one warning, and a result cache that
-/// never noticed.
+/// What every damaged cache presents: nothing cached, one warning, an untouched result cache.
 fn assert_degraded(store: &Store, root: &TempRoot, what: &str) {
     assert!(
         store.frontend_is_empty(),
@@ -300,8 +294,6 @@ fn assert_degraded(store: &Store, root: &TempRoot, what: &str) {
     );
 }
 
-/// A damaged cache is not a broken project: the next run must be able to write a healthy one over
-/// it.
 fn assert_repairs_itself(root: &TempRoot, what: &str) {
     let mut store = root.open();
     store.put_def(hash(42), def());
@@ -317,10 +309,7 @@ fn assert_repairs_itself(root: &TempRoot, what: &str) {
     assert!(repaired.def(hash(42)).is_some(), "{what}");
 }
 
-// truncation ---------------------------------------------------------------------------
-
-/// A killed writer that got half a frame out, and then a *later* index that vouches for the whole
-/// of it.
+/// A killed writer's half frame, then a later index that vouches for all of it.
 #[test]
 fn a_data_file_truncated_inside_an_entry_degrades_to_an_empty_cache() {
     let root = seeded("dat-truncated-mid-entry");
@@ -336,7 +325,6 @@ fn a_data_file_truncated_inside_an_entry_degrades_to_an_empty_cache() {
     assert_repairs_itself(&root, "a data file cut inside an entry");
 }
 
-/// The same cut, landing exactly on a frame boundary.
 #[test]
 fn a_data_file_truncated_between_entries_degrades_to_an_empty_cache() {
     let root = seeded("dat-truncated-between-entries");
@@ -371,7 +359,7 @@ fn a_data_file_cut_inside_its_own_header_degrades_to_an_empty_cache() {
     assert_degraded(&store, &root, "a data file shorter than its header");
 }
 
-/// Random bytes of exactly the right length, so nothing about the file's size gives it away.
+/// Exactly the right length, so the file's size gives nothing away.
 #[test]
 fn a_data_file_of_random_bytes_degrades_to_an_empty_cache() {
     let root = seeded("dat-random");
@@ -392,7 +380,6 @@ fn a_data_file_of_random_bytes_degrades_to_an_empty_cache() {
     assert_repairs_itself(&root, "a data file of random bytes");
 }
 
-/// Every field of the data file's header, one at a time.
 #[test]
 fn every_field_of_the_data_header_is_checked() {
     for (what, offset, bytes) in [
@@ -409,8 +396,6 @@ fn every_field_of_the_data_header_is_checked() {
     }
 }
 
-/// A frame is reached through an index record that already claims its kind, its length and —
-/// through the checksum — its contents.
 #[test]
 fn every_field_of_a_frame_header_is_checked_before_its_payload_is_believed() {
     for (what, field, expected) in [
@@ -449,7 +434,6 @@ fn every_field_of_a_frame_header_is_checked_before_its_payload_is_believed() {
     }
 }
 
-/// A single flipped bit anywhere in a payload.
 #[test]
 fn a_single_damaged_byte_in_a_payload_costs_that_entry_and_no_other() {
     let root = seeded("payload-bitflip");
@@ -479,8 +463,6 @@ fn a_single_damaged_byte_in_a_payload_costs_that_entry_and_no_other() {
     }
 }
 
-/// The whole-index checksum is what protects the records, which are the only thing binding a
-/// `DefHash` to a byte range.
 #[test]
 fn a_damaged_index_record_is_refused_rather_than_followed() {
     for field in [0usize, 32, 40] {
@@ -499,8 +481,7 @@ fn a_damaged_index_record_is_refused_rather_than_followed() {
     }
 }
 
-/// With the checksum repaired the record is *plausible*, which is the only way to reach the checks
-/// below it.
+/// With the checksum repaired the record is plausible, the only way to reach the checks below it.
 #[test]
 fn an_index_offset_moved_into_the_interior_of_a_frame_is_refused() {
     for slide in [1i64, -1, 5, 7, 64] {
@@ -538,7 +519,6 @@ fn an_index_offset_moved_into_the_interior_of_a_frame_is_refused() {
     }
 }
 
-/// An offset below the data file's own header, which no frame can ever occupy.
 #[test]
 fn an_index_offset_inside_the_data_header_is_refused_at_open() {
     let root = seeded("index-offset-in-header");
@@ -550,7 +530,6 @@ fn an_index_offset_inside_the_data_header_is_refused_at_open() {
     assert_degraded(&store, &root, "an offset inside the data header");
 }
 
-/// An index that names bytes the data file does not have.
 #[test]
 fn an_index_that_claims_more_data_than_exists_is_refused() {
     let root = seeded("index-claims-too-much");
@@ -569,8 +548,6 @@ fn an_index_that_claims_more_data_than_exists_is_refused() {
     assert_repairs_itself(&root, "an index claiming more data than exists");
 }
 
-/// The other side of the same crash: the data was appended and synced, and the index that would
-/// have named it never landed.
 #[test]
 fn data_appended_past_the_index_is_invisible_rather_than_corrupt() {
     let root = seeded("index-behind-data");
@@ -598,8 +575,7 @@ fn data_appended_past_the_index_is_invisible_rather_than_corrupt() {
     );
 }
 
-/// The index header is not covered by the index checksum, so the fields in it have to defend
-/// themselves.
+/// The index header is not covered by the index checksum.
 #[test]
 fn every_field_of_the_index_header_is_checked() {
     for (what, offset, bytes) in [
@@ -617,7 +593,6 @@ fn every_field_of_the_index_header_is_checked() {
     }
 }
 
-/// A section table that describes more sections than the index holds.
 #[test]
 fn a_section_count_larger_than_the_table_is_refused() {
     for count in [6u32, 7, 64, u32::MAX] {
@@ -629,8 +604,7 @@ fn a_section_count_larger_than_the_table_is_refused() {
     }
 }
 
-/// An append never moves a byte, so an index from before an append still names exactly what it
-/// named — this is the property that lets a reader take no lock, and it has to keep holding.
+/// This is what lets a reader take no lock.
 #[test]
 fn an_older_index_over_an_appended_data_file_still_reads_its_own_entries() {
     let root = seeded("older-index");
@@ -679,7 +653,6 @@ fn an_index_from_before_a_compaction_is_refused_rather_than_followed() {
     assert_eq!(store.warnings().len(), 1, "{:?}", store.warnings());
 }
 
-/// Two projects' files, mixed.
 #[test]
 fn an_index_and_a_data_file_from_different_projects_are_refused() {
     let root = seeded("mixed-index");
@@ -690,15 +663,13 @@ fn an_index_and_a_data_file_from_different_projects_are_refused() {
     assert_degraded(&store, &root, "a data file from another project");
 }
 
-/// The case a checksum cannot catch: bytes that verify but were written to a different shape.
 #[test]
 fn a_frame_carrying_another_shapes_payload_is_refused_rather_than_misread() {
     let root = seeded("shape-swap");
     let decl_payload = payload_of(&root.data_file(), KIND_DECL);
     let (def_offset, def_len) = frame_of(&root.data_file(), KIND_DEF);
 
-    // Same length or the index would disagree before the tag ever mattered, so pad the declaration
-    // payload out with the definition's trailing bytes.
+    // Same length, or the index would disagree before the tag mattered.
     let mut forged = decl_payload;
     forged.resize(def_len, 0xee);
     let mut bytes = read(&root.data_file());
@@ -721,7 +692,6 @@ fn a_frame_carrying_another_shapes_payload_is_refused_rather_than_misread() {
     assert_eq!(warnings[0].code, codes::CACHE_CORRUPT);
 }
 
-/// An index record pointed at a frame of another kind.
 #[test]
 fn an_index_record_pointed_at_a_frame_of_another_kind_is_refused() {
     let root = seeded("kind-crossed");
@@ -754,8 +724,7 @@ fn an_index_record_pointed_at_a_frame_of_another_kind_is_refused() {
     );
 }
 
-/// Every byte of a stored fingerprint, flipped under `mask` one at a time with the frame checksum
-/// repaired — a drifted encoder, simulated exhaustively.
+/// Flips every byte of a stored fingerprint under `mask`, repairing the frame checksum each time.
 fn no_mutation_of_a_fingerprint_decodes_into_something_it_does_not_say(mask: u8) {
     let root = TempRoot::new(&format!("fingerprint-mutations-{mask:02x}"));
     let mut store = root.open();
@@ -817,10 +786,7 @@ fn no_whole_byte_mutation_of_a_fingerprint_decodes_into_something_it_does_not_sa
     no_mutation_of_a_fingerprint_decodes_into_something_it_does_not_say(0xff);
 }
 
-// exemplars never reach
-
-/// `schema_fingerprint`'s exemplars are the definition of what "the schema" means, and what they do
-/// not encode, they do not pin.
+/// What the schema exemplars do not encode, they do not pin.
 #[test]
 fn shapes_no_schema_exemplar_reaches_still_round_trip() {
     let root = TempRoot::new("uncovered-shapes");
@@ -944,7 +910,6 @@ fn the_edges_of_every_scalar_field_survive_a_round_trip() {
     );
 }
 
-/// Whatever the encoder will write, the decoder must read back.
 #[test]
 fn a_deeply_nested_type_round_trips_rather_than_reporting_a_healthy_cache_corrupt() {
     for depth in [1usize, 8, 64, 122, 132, 400, 800] {
@@ -979,8 +944,7 @@ fn a_deeply_nested_type_round_trips_rather_than_reporting_a_healthy_cache_corrup
     }
 }
 
-/// A body is keyed by a hash of itself, so a damaged one has two independent gates: the frame
-/// checksum, and the key check `body_set` applies.
+/// Two independent gates: the frame checksum, and `body_set`'s key check.
 #[test]
 fn a_damaged_body_never_becomes_a_definition() {
     let root = seeded("body-damage");
@@ -1001,15 +965,12 @@ fn a_damaged_body_never_becomes_a_definition() {
     assert_eq!(missing, vec![hash(1)]);
 }
 
-/// A body whose payload was rewritten to bytes that verify against the frame but are not the
-/// definition the key names.
 #[test]
 fn a_body_rewritten_to_other_bytes_is_not_rebuilt_into_a_definition() {
     let root = seeded("body-substituted");
     let payload = payload_of(&root.data_file(), KIND_BODY);
     let mut forged = payload.clone();
-    // The tail of the envelope is the body's own bytes; changing them changes what the body *is*
-    // without changing the frame it lives in.
+    // The envelope's tail is the body's own bytes: this changes what the body is, not its frame.
     let last = forged.len() - 1;
     forged[last] ^= 0xff;
     rewrite_payload(&root.data_file(), KIND_BODY, &forged);
@@ -1060,7 +1021,6 @@ fn a_reader_arriving_mid_append_never_sees_a_torn_cache() {
     assert_seed_is_whole(&store, root, "after the writers finished");
 }
 
-/// Two writers, each flushing repeatedly.
 #[test]
 fn concurrent_writers_never_interleave_their_frames() {
     let root = seeded("concurrent-writers");
@@ -1094,8 +1054,7 @@ fn concurrent_writers_never_interleave_their_frames() {
     }
 }
 
-/// A section count is the one index-header field with no independent check, and the header is not
-/// covered by the index checksum — so a damaged one is read as written.
+/// A section count has no independent check, and the header is outside the index checksum.
 #[test]
 fn a_damaged_section_count_loses_entries_but_never_invents_one() {
     for count in [0u32, 1, 2, 3, 4, 5] {

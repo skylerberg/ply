@@ -1,9 +1,3 @@
-//! Parse, resolve and check a source, and the stubbed `json` module a derivation test checks
-//! against: what the modules in this binary need before they can assert anything.
-//!
-//! Two shapes, because `derive` expansion is not free and half the fixtures here have nothing to
-//! expand: [`compile`] skips it, [`expanded`] runs it as the driver does.
-
 use ply_core::{CheckOutput, check_program};
 use ply_span::{Diagnostic, SourceId};
 use ply_syntax::ast::ModuleName;

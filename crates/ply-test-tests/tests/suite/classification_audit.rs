@@ -1,6 +1,3 @@
-//! What the defect/program-error split does with *every* code an evaluator can attach to a failure,
-//! and what each `Skipped` variant is actually applied to.
-
 use crate::fixture::Compiled;
 use ply_eval::Plan;
 use ply_hash::HashOutput;
@@ -46,8 +43,7 @@ fn double(x: Int) -> Int = x * 2
 test "double doubles" { assert_eq(double(4), 8) }
 "#;
 
-/// Answers with whatever the case wants the evaluator to have said, so the classifier is measured
-/// against a code rather than against whichever program happens to produce it today.
+/// Answers with a chosen code, so the classifier is measured against the code, not a program.
 struct Answering {
     diagnostic: Option<Diagnostic>,
     unwind: bool,
@@ -105,7 +101,6 @@ fn classified(code: &'static str) -> (bool, Status, Verdict) {
     )
 }
 
-/// Every code the language uses for "the program did something the language defines it may do".
 #[test]
 fn no_program_level_code_is_read_as_a_defect_in_ply() {
     for code in [
@@ -129,7 +124,6 @@ fn no_program_level_code_is_read_as_a_defect_in_ply() {
     }
 }
 
-/// The other direction, and the more expensive one.
 #[test]
 fn an_internal_error_and_an_unwind_are_both_defects() {
     let (defect, status, verdict) = classified(codes::INTERNAL_ERROR);
@@ -155,7 +149,6 @@ fn an_internal_error_and_an_unwind_are_both_defects() {
     );
 }
 
-/// A warning is not a failure, and the severity is not what the split reads.
 #[test]
 fn a_non_error_severity_is_still_a_failure() {
     let report = report_for(&Answering {
@@ -167,7 +160,6 @@ fn a_non_error_severity_is_still_a_failure() {
     assert!(!report.failures[0].defect);
 }
 
-/// **A divergence between a backend and the machine is a defect in Ply.**
 #[test]
 fn an_engine_divergence_is_a_defect_in_ply() {
     let (defect, status, verdict) = classified(codes::ENGINE_DIVERGENCE);
@@ -175,8 +167,6 @@ fn an_engine_divergence_is_a_defect_in_ply() {
     assert_eq!(status, Status::Panicked);
     assert_eq!(verdict, Verdict::NotAttempted(Skipped::Panicked));
 }
-
-// ---------------------------------------------- one variant, one description
 
 fn hash(seed: &str) -> ply_hash::DefHash {
     ply_hash::DefHash::from_hex(&seed.repeat(32)).expect("a well-formed hash")
@@ -186,9 +176,6 @@ fn baseline() -> Baseline {
     Baseline::with_decls(hash("a1"), BTreeMap::new(), BTreeMap::new())
 }
 
-/// Each variant answers a different question for a consumer, so each has to be reachable from
-/// exactly the condition its `describe` claims — and the order has to be the order the answers are
-/// worth.
 #[test]
 fn precheck_maps_each_condition_to_exactly_its_own_variant() {
     struct Case {
@@ -314,8 +301,6 @@ fn precheck_maps_each_condition_to_exactly_its_own_variant() {
     );
 }
 
-/// `Mode::Always` must not be able to talk the gate out of a skip that is about evidence rather
-/// than about effort.
 #[test]
 fn bisect_always_does_not_override_a_missing_premise() {
     for (defect, host, nondet) in [
@@ -331,8 +316,6 @@ fn bisect_always_does_not_override_a_missing_premise() {
     }
 }
 
-/// The strings are the artifact's contract with a consumer that branches on them, so no two may
-/// collide and none may be empty.
 #[test]
 fn every_skipped_variant_has_its_own_tag_and_its_own_description() {
     let all = [
@@ -346,9 +329,7 @@ fn every_skipped_variant_has_its_own_tag_and_its_own_description() {
         Skipped::NoHybrids,
     ];
 
-    // `all` is a hand-written list and this is what keeps it honest: the `match` makes a new
-    // variant a compile error, and the ordinals make forgetting to add it to `all` a failure here
-    // rather than a variant nothing ever tested.
+    // The `match` makes a new variant a compile error; the ordinals make leaving it out of `all` fail.
     let ordinal = |s: Skipped| match s {
         Skipped::NotRequested => 0,
         Skipped::NeverPassed => 1,
@@ -384,8 +365,7 @@ fn every_skipped_variant_has_its_own_tag_and_its_own_description() {
         "two variants share a description"
     );
 
-    // A skip is never a verdict about the program: a consumer must be able to tell "no answer" from
-    // "the answer is the empty set".
+    // A consumer must be able to tell "no answer" from "the answer is the empty set".
     for skipped in all {
         let bisection = Bisection::not_attempted(skipped);
         assert_eq!(bisection.verdict, Verdict::NotAttempted(skipped));
@@ -399,8 +379,6 @@ fn every_skipped_variant_has_its_own_tag_and_its_own_description() {
     }
 }
 
-/// `NoChanges` is the one skip that is a statement about the *program* rather than about the run or
-/// the build, so it has to be reachable from an empty delta and from nothing else.
 #[test]
 fn no_changes_is_reached_only_when_nothing_moved() {
     use ply_test::bisect::{NoHybrid, bisect};
@@ -424,8 +402,7 @@ fn no_changes_is_reached_only_when_nothing_moved() {
     );
     assert_eq!(out.groups, vec![vec![name]], "{:?}", out.groups);
 
-    // A change that is only `Derived` is no candidate, so the delta is again empty — and
-    // `no_changes` is the honest answer even though a hash moved.
+    // Only `Derived`, so no candidate: `no_changes` even though a hash moved.
     let derived = Change::derived(ply_span::Symbol::new("m.g"), hash("c3"), hash("d4"));
     let only_derived = Delta::new(None, vec![derived], &DepEdges::from(&HashOutput::default()));
     assert_eq!(
@@ -434,8 +411,6 @@ fn no_changes_is_reached_only_when_nothing_moved() {
     );
 }
 
-/// `NoHybrids` says "this build cannot mix two eras", which is only an honest answer to a question
-/// that needed a mixture.
 #[test]
 fn no_hybrids_is_reported_only_where_a_mixture_was_actually_needed() {
     use ply_span::Symbol;
@@ -472,7 +447,6 @@ fn no_hybrids_is_reported_only_where_a_mixture_was_actually_needed() {
     );
 }
 
-/// `Skipped::Panicked` still says "the interpreter failed rather than the program".
 #[test]
 fn the_panicked_description_still_describes_only_ply_defects() {
     let described = Skipped::Panicked.describe();
@@ -490,8 +464,6 @@ fn the_panicked_description_still_describes_only_ply_defects() {
     }
 }
 
-/// `Options::never()` is the only way a caller asks for no bisection at all, and it has to reach
-/// `NotRequested` rather than any of the reasons that are about the failure.
 #[test]
 fn options_never_is_the_only_thing_that_reads_as_not_requested() {
     let never = Options::never();
@@ -506,8 +478,6 @@ fn options_never_is_the_only_thing_that_reads_as_not_requested() {
     );
 }
 
-/// A diagnostic with no span at all still has to be classified — the split reads the code, and a
-/// defensive path that forgot its span is exactly where a missing `primary` would come from.
 #[test]
 fn a_spanless_diagnostic_is_classified_by_its_code_alone() {
     let report = report_for(&Answering {

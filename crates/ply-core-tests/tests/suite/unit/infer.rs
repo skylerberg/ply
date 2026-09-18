@@ -1,5 +1,3 @@
-//! The parser lands in a sibling crate on its own schedule, so these build the AST directly.
-
 use ply_core::infer::check_module;
 use ply_core::print::print_scheme;
 use ply_core::{CheckOutput, DefInfo, Footprint, Known, KnownDef};
@@ -136,8 +134,7 @@ fn clause(
     }
 }
 
-/// `op(x̄) resume κ -> body`: the general form, whose body has the whole `handle`'s type rather
-/// than the operation's.
+/// `op(x̄) resume κ -> body`: a general clause, whose body has the whole `handle`'s type.
 fn general_clause(
     effect: &str,
     op: &str,
@@ -442,7 +439,6 @@ fn wall_effect() -> Item {
     )
 }
 
-/// The principal type is now *written*: `fn id<a>(x: a) -> a = x`.
 #[test]
 fn identity_gets_its_principal_type() {
     let out = check(vec![
@@ -456,9 +452,6 @@ fn identity_gets_its_principal_type() {
     assert_eq!(footprint(&out, "id"), "{}");
 }
 
-/// This was `let_bound_polymorphism_allows_two_instantiations`, and it asserted the opposite of
-/// what it asserts now: `let f = |x| x` generalized, so `f(1)` and `f(true)` in one body both
-/// checked and `main` published `() -> Bool`.
 #[test]
 fn a_let_bound_lambda_may_not_be_used_at_two_types() {
     let body = block(
@@ -635,7 +628,6 @@ fn a_handler_subtracts_the_atoms_it_discharges() {
     assert_eq!(footprint(&out, "isolated"), "{}");
 }
 
-/// The handle typing rule.
 #[test]
 fn a_clause_that_calls_its_own_continuation_infers_a_closed_row() {
     let out = check(vec![
@@ -669,7 +661,6 @@ fn a_clause_that_calls_its_own_continuation_infers_a_closed_row() {
     assert_eq!(sig(&out, "resumed"), "() -> Int");
 }
 
-/// footprint invariance under multi-shot.
 #[test]
 fn resuming_zero_once_or_twice_gives_one_footprint() {
     let program = |body: Expr| {
@@ -714,8 +705,6 @@ fn resuming_zero_once_or_twice_gives_one_footprint() {
     assert_eq!(of(twice), "{}");
 }
 
-/// A tail-resumptive clause's body is the *operation's* result; a general clause's body is the
-/// whole `handle`'s.
 #[test]
 fn a_general_clause_returns_the_handles_result_not_the_operations() {
     let items = |body: Expr| {
@@ -833,8 +822,7 @@ fn with_cell_discharges_the_cell_atoms_of_its_own_region() {
     assert_eq!(sig(&out, "counted"), "() -> Int");
 }
 
-/// The escaping value is bound to a `let` rather than returned, so the definition's own return type
-/// is writable (`E0126`) and the only diagnostic left is the one under test.
+/// Bound to a `let` rather than returned, so the only diagnostic is the one under test.
 #[test]
 fn a_cell_may_not_outlive_the_region_that_discharges_its_atoms() {
     let body = block(
@@ -858,8 +846,7 @@ fn a_cell_may_not_outlive_the_region_that_discharges_its_atoms() {
 
 #[test]
 fn a_region_escape_is_caught_however_the_cell_is_wrapped() {
-    // The region's value is bound to a `let`, so each definition's own return type stays writable
-    // and the escape is the only thing being reported.
+    // Bound to a `let`, so the escape is the only thing reported.
     let escaping = |name: &str, region: Expr| {
         func(name, &[], block(vec![let_("held", region)], Some(int(0))))
             .ret(con("Int", vec![]))
@@ -1318,8 +1305,7 @@ fn several_independent_errors_are_reported_in_one_run() {
         func("b", &[], var("missing_two"))
             .ret(con("Int", vec![]))
             .item(),
-        // `true + 1` answers its left operand's type, so `Bool` is what the signature has to claim
-        // for the arithmetic to be the only mistake.
+        // `true + 1` answers its left operand's type, so `Bool` leaves only the arithmetic wrong.
         func("c", &[], add(bool_lit(true), int(1)))
             .ret(con("Bool", vec![]))
             .item(),
@@ -1420,8 +1406,6 @@ fn a_definition_used_before_it_is_written_still_generalizes() {
 
 #[test]
 fn sum_types_give_constructors_and_exhaustiveness() {
-    // `Option` is the prelude's: `map_get` returns one and `decimal_of_string` returns one, so a
-    // builtin's type would otherwise mention a type the user has to declare.
     let arm = |kind: PatternKind, body: Expr| MatchArm {
         pat: Pattern { kind, span: any() },
         guard: None,
@@ -1488,8 +1472,6 @@ fn sum_types_give_constructors_and_exhaustiveness() {
     );
 }
 
-/// The fixture used to be `fn omega(x) = x(x)`, and there is no signature to write for it: the type
-/// its parameter needs is the one the occurs check refuses to build.
 #[test]
 fn the_occurs_check_rejects_self_application() {
     let body = block(
@@ -1531,8 +1513,6 @@ fn duplicate_definitions_are_reported_once_and_the_first_wins() {
     );
 }
 
-/// Constructors and functions are one namespace, so declaring both under a name makes the second
-/// unreachable.
 #[test]
 fn a_function_and_a_constructor_may_not_share_a_name() {
     let variant = |name: &str, start: u32| VariantDef {
@@ -1618,8 +1598,6 @@ fn a_constructor_and_a_later_function_are_reported_against_the_function() {
     );
 }
 
-/// The check may not fire between namespaces that really are separate, nor report a same-kind
-/// collision a second time.
 #[test]
 fn a_type_an_effect_and_a_function_may_all_share_one_name() {
     let out = check(vec![
@@ -2040,8 +2018,7 @@ fn a_record_arm_with_rest_is_exhaustive_without_naming_every_field() {
     ]);
 }
 
-/// The evaluator only matches a `..`-less record pattern against a record with exactly those
-/// fields, so accepting a subset here would compile to an arm that silently never fires.
+/// The evaluator matches a `..`-less record pattern only against exactly those fields.
 #[test]
 fn a_record_pattern_without_rest_must_name_every_field() {
     let diags = check_err(vec![
@@ -2156,11 +2133,7 @@ fn comparing_ordinary_values_stays_legal() {
     assert_eq!(sig(&out, "cmp"), "<a>(a, a) -> Bool");
 }
 
-// Cross-module checking.
-
-/// Parsed and expanded, in that order and never one without the other: the driver expands a
-/// `derive` before it resolves anything, so a harness that skipped it would check a program the
-/// compiler never sees and would report a generated definition as an unknown name.
+/// Expanded as the driver does, or a generated definition would report as an unknown name.
 fn parse_program(files: &[(&str, &str)]) -> Program {
     let mut program = Program {
         modules: files
@@ -2301,9 +2274,7 @@ fn a_local_binder_beats_a_module_item_which_beats_the_prelude() {
          fn module_item() -> Int = len(1)",
     )]);
 
-    // The parameter wins over the module's own `len`...
     assert_eq!(sig(&out, "app.shadowed"), "(Int) -> Int");
-    // ...and the module's own `len` wins over the prelude's `List<a> -> Int`.
     assert_eq!(sig(&out, "app.module_item"), "() -> Int");
 }
 
@@ -2429,8 +2400,7 @@ fn a_public_alias_expands_in_the_module_that_wrote_it() {
         ),
     ]);
 
-    // `Cents` is private to `money`, so only expanding the alias in its own module's scope can give
-    // `Money` a meaning here.
+    // `Cents` is private to `money`, so only its own module's scope can give `Money` a meaning.
     assert_eq!(sig(&out, "app.total"), "(Int) -> Int");
 }
 
@@ -2486,8 +2456,7 @@ fn a_nondet_effect_stays_nondet_across_a_module_boundary() {
         ),
     ]);
     let d = only(&diags, codes::NONDET_IN_DET_TEST);
-    // The suggested handler has to be writable in the file it is suggested to: `clock.clock` is the
-    // program-wide name and is not syntax.
+    // The suggestion must be writable: `clock.clock` is the program-wide name, not syntax.
     assert!(
         d.notes.iter().any(|n| n.contains("clock::clock.now()")),
         "{:?}",
@@ -2566,9 +2535,6 @@ fn a_qualified_name_in_the_wrong_namespace_says_what_the_module_exports() {
     );
 }
 
-/// The example corpus is the one place cross-module resolution meets real code: `tests/fixtures/`
-/// holds the programs that are meant to fail, so anything here failing to check is a regression
-/// rather than a fixture.
 #[test]
 fn the_example_corpus_checks_as_one_program() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
@@ -2613,8 +2579,6 @@ fn the_example_corpus_checks_as_one_program() {
         "a test key is `<module>.<label>`, which is what keeps two labels apart"
     );
 }
-
-// and `simulate`.
 
 #[test]
 fn task_spawn_answers_a_task_and_join_unwraps_it() {
@@ -2672,8 +2636,6 @@ fn every_prelude_operation_types_at_its_declared_signature() {
     assert_eq!(sig(&out, "d"), "() -> Int / {sim.read}");
 }
 
-/// Without `e` on `spawn`'s own row a test that spawns a writer of `orders` would report an empty
-/// footprint, and the cross-test conflict graph would run it beside a reader of `orders`.
 #[test]
 fn the_effects_of_a_spawned_body_land_in_the_spawners_row() {
     let spawned = lambda(
@@ -2737,8 +2699,6 @@ fn a_region_discharges_task_clock_and_random_and_publishes_the_seed() {
     assert_eq!(footprint(&out, "f"), "{sim.read}");
 }
 
-/// The language does not get to claim it simulated an effect it has never heard of, and that is the
-/// safety property that survives M7.
 #[test]
 fn a_region_discharges_nothing_a_user_declared() {
     let body = block(
@@ -2818,8 +2778,6 @@ fn clock_now_outside_any_region_in_a_det_test_is_still_e0412() {
     );
 }
 
-/// The other direction of the same rule: `simulate` is a handler, handlers discharge, and `sim` is
-/// not `nondet` — so a time-dependent, concurrent test is an ordinary `det`, cacheable one.
 #[test]
 fn a_simulated_test_is_deterministic_and_carries_only_the_seed() {
     let spawned = lambda(&[], perform("clock", "now", None, vec![]));
@@ -2851,7 +2809,6 @@ fn a_users_own_nondet_effect_inside_a_region_is_still_e0412() {
     assert!(primary.message.contains("wall.read"), "{}", primary.message);
 }
 
-/// A `Task` is a key into the region's scheduler, and the scheduler dies with the region.
 #[test]
 fn a_task_in_a_regions_result_type_is_e0413() {
     let body = block(
@@ -2932,8 +2889,6 @@ fn a_region_that_reaches_one_through_a_call_is_e0416_as_well() {
     );
 }
 
-/// A handler answering `sim.seed()` with a constant pins one known-interesting seed as an ordinary
-/// regression test, whose outcome is a function of the definition set alone.
 #[test]
 fn a_handler_answering_sim_seed_closes_the_seed_out_of_the_row() {
     let region = simulate(block(
@@ -2945,8 +2900,7 @@ fn a_handler_answering_sim_seed_closes_the_seed_out_of_the_row() {
     assert_eq!(out.tests[0].footprint.to_string(), "{}");
 }
 
-/// Every `task` operation performs the one atom `task.write`, so a handler that covers any of them
-/// discharges the effect for the whole body.
+/// Every `task` operation performs the one atom `task.write`, so covering any one discharges it.
 #[test]
 fn a_user_written_task_handler_discharges_the_effect() {
     let spawned = block(
@@ -2988,8 +2942,6 @@ fn an_effect_claiming_a_prelude_name_is_a_duplicate_definition() {
     }
 }
 
-/// The prelude is consulted last, so a module's own declaration wins — which is what leaves
-/// `examples/clock.ply` uninvolved.
 #[test]
 fn a_modules_own_clock_shadows_the_prelude() {
     let out = check_files(&[(
@@ -3021,8 +2973,6 @@ fn a_byte_literal_has_its_own_type_and_never_unifies_with_a_string() {
     only(&mixed, codes::TYPE_MISMATCH);
 }
 
-/// The whole surface at once: a signature that moved would otherwise be caught only by whichever
-/// downstream test happened to use it.
 #[test]
 fn the_bytes_and_string_builtins_have_the_types_the_contract_states() {
     let expected = [
@@ -3054,8 +3004,7 @@ fn the_bytes_and_string_builtins_have_the_types_the_contract_states() {
         ("string_contains", "(String, String) -> Bool"),
         ("string_find", "(String, String) -> Int"),
     ];
-    // `fn probe_f() -> <ty> = f` returns the builtin itself, so the printed signature of the probe
-    // carries the builtin's whole type.
+    // Each probe returns the builtin itself, so its printed signature is the builtin's whole type.
     let src: String = expected
         .iter()
         .map(|(name, ty)| format!("fn probe_{name}() -> {ty} = {name}\n"))
@@ -3140,8 +3089,6 @@ fn a_task_of_the_wrong_element_type_is_rejected() {
     assert!(has_code(&diags, codes::TYPE_MISMATCH), "{}", render(&diags));
 }
 
-/// The atom propagates through calls by the ordinary row rules, so a test whose closure reaches a
-/// region carries the seed with no new analysis.
 #[test]
 fn the_seed_atom_propagates_through_an_ordinary_call() {
     let helper = func("run", &[], simulate(block(vec![], Some(int(1)))))
@@ -3159,15 +3106,13 @@ fn the_seed_atom_propagates_through_an_ordinary_call() {
     assert!(!out.tests[0].nondet);
 }
 
-/// The three simulation fixtures that fail in the front end.
 #[test]
 fn the_simulation_fixtures_produce_the_codes_they_are_named_for() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
     for (file, code, expected) in [
         ("unscheduled_task.ply", codes::NONDET_IN_DET_TEST, 1),
         ("task_escapes_scope.ply", codes::TASK_ESCAPES_SCOPE, 1),
-        // Lexically, and through a call: one row-membership question answers both, so the fixture
-        // writes both and both must fire.
+        // The fixture writes it lexically and through a call, so both must fire.
         ("nested_simulation.ply", codes::NESTED_SIMULATION, 2),
     ] {
         let text = std::fs::read_to_string(root.join(file))
@@ -3183,8 +3128,6 @@ fn the_simulation_fixtures_produce_the_codes_they_are_named_for() {
         );
     }
 }
-
-// Specs and laws.
 
 fn parsed(src: &str) -> Module {
     ply_syntax::parse(SRC, src).unwrap_or_else(|d| panic!("should parse: {}", render(&d)))
@@ -3388,8 +3331,7 @@ fn a_law_binder_may_carry_a_type_variable() {
     );
 }
 
-/// The prover reads a type variable as an uninterpreted sort, so a proof over it holds for every
-/// instantiation — which is only true if the body cannot pick one.
+/// The prover reads a type variable as an uninterpreted sort, sound only if the body can't pick.
 #[test]
 fn a_law_body_cannot_instantiate_a_binders_type_variable() {
     let diags = check_src_err("law \"pins a\" forall (x: a) { x == 1 }");
@@ -3402,8 +3344,6 @@ fn a_law_body_may_be_a_simulate_region() {
     assert_eq!(out.laws[0].footprint.to_string(), "{sim.read}");
 }
 
-/// A guard decides which values the law is a claim about, so a domain that depends on a seed would
-/// be a different domain per run.
 #[test]
 fn a_where_guard_may_not_carry_the_seed() {
     let diags =
@@ -3426,7 +3366,6 @@ fn a_law_body_that_performs_an_ordinary_effect_is_rejected() {
     );
 }
 
-/// A law that may reach the world.
 #[test]
 fn a_law_host_relaxes_its_body_and_never_its_guard() {
     let diags = check_src_err(&format!(
@@ -3446,7 +3385,6 @@ fn a_law_host_relaxes_its_body_and_never_its_guard() {
     assert!(law.host);
     assert_eq!(law.footprint.to_string(), "{db.read[users]}");
 
-    // The guard is still pure, whatever the law is.
     let diags = check_src_err(&format!(
         "{DB}law/host \"guarded\" forall (n: Int) where db.get[users](n) > 0 {{ n == n }}"
     ));
@@ -3541,8 +3479,7 @@ fn laws_are_indexed_in_program_order() {
     );
 }
 
-/// Gate 2 skips re-inferring a body whose hash is unchanged, and a spec is erased from that hash —
-/// so a clause must be typed against the restored interface every run in which its file was parsed.
+/// Gate 2 skips re-inferring an unchanged body, and a spec is erased from its hash.
 #[test]
 fn a_restored_definition_still_has_its_clauses_typed() {
     let src = "fn withdraw(a: Int, n: Int) -> Int requires n > 0 ensures result == a - n = a - n";
@@ -3573,8 +3510,6 @@ fn a_restored_definition_still_has_its_clauses_typed() {
     assert_eq!(spec.len(), 2);
     assert!(spec.iter().all(|s| s.footprint.is_empty()));
 
-    // And the restored path still judges the clause, rather than accepting it because nothing
-    // constrained the types it was checked against.
     let broken = "fn withdraw(a: Int, n: Int) -> Int ensures result == \"x\" = a - n";
     let mut program = parse_program(&[("ledger", broken)]);
     let resolved = ply_syntax::resolve(&mut program).expect("resolves");
@@ -3583,8 +3518,6 @@ fn a_restored_definition_still_has_its_clauses_typed() {
     assert!(has_code(&diags, codes::TYPE_MISMATCH), "{}", render(&diags));
 }
 
-/// The corpus is where the two purity rules meet real code: a clause's row is empty, and a law
-/// body's is empty or exactly the seed.
 #[test]
 fn every_law_and_clause_in_the_example_corpus_is_pure() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
@@ -3629,8 +3562,6 @@ fn every_law_and_clause_in_the_example_corpus_is_pure() {
     }
     let seed = Footprint::from_atoms([ply_core::prelude::seed_atom()]);
     for law in &out.laws {
-        // A `law/host` is the one law whose body may carry any row, and it says so in its own
-        // declaration.
         assert!(
             law.host || law.footprint.is_empty() || law.footprint == seed,
             "law {:?} has footprint {}",
@@ -3648,10 +3579,6 @@ fn every_law_and_clause_in_the_example_corpus_is_pure() {
     );
 }
 
-/// This was written against `fn f(x) ensures result > x = x + 1` and named for it — "a clause sees
-/// the types the body forced on an unannotated signature": the signature was inferred, and the
-/// point was that a clause is typed against whatever the *body* settled on rather than against
-/// nothing.
 #[test]
 fn a_clause_is_typed_against_the_written_signature() {
     let out = check_src("fn f(x: Int) -> Int ensures result > x = x + 1");
@@ -3692,8 +3619,6 @@ fn a_clause_and_a_law_may_name_an_imported_definition() {
     );
 }
 
-/// `mark_internal_effects` indexes definitions by program-wide name, and a module that declares one
-/// twice is `E0105` — a diagnostic this pass runs *before*, not after.
 #[test]
 fn a_definition_declared_twice_is_a_diagnostic_even_when_one_of_them_handles_an_effect() {
     let src = "effect s { read g[r]() -> Int }\n\
@@ -3707,7 +3632,6 @@ fn a_definition_declared_twice_is_a_diagnostic_even_when_one_of_them_handles_an_
     );
 }
 
-/// One mistake is one diagnostic, however many places repeat it.
 #[test]
 fn one_mistake_is_not_reported_once_per_call_site() {
     let src = "fn f(a: Int, b: Int = \"not an int\") -> Int = a + b\n\
@@ -3726,7 +3650,6 @@ fn one_mistake_is_not_reported_once_per_call_site() {
         "{diags:#?}"
     );
 
-    // And the count does not grow with the program: a fourth caller adds no fifth diagnostic.
     let more = check_src_err(&format!("{src}fn four() -> Int = f(4)\n"));
     assert_eq!(more.len(), 2, "{more:#?}");
 }
