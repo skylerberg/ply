@@ -536,12 +536,10 @@ fn a_duplicate_definition_is_still_reported_per_module() {
 
 #[test]
 fn the_checked_entry_point_agrees_with_the_unchecked_one() {
-    let mut program = program_of(&[("a", A_BEFORE), ("b", B_BEFORE), ("c", C_BEFORE)]);
+    let files = [("a", A_BEFORE), ("b", B_BEFORE), ("c", C_BEFORE)];
+    let mut program = program_of(&files);
     let resolved = ply_syntax::resolve(&mut program).expect("resolves");
-    let check = match ply_core::check_program(&program, &resolved) {
-        Ok(check) => check,
-        Err(diags) => panic!("program did not typecheck: {diags:#?}"),
-    };
+    let check = crate::fixture::port_check(&files);
     let out = ply_hash::hash_program(&program, &resolved, &check).expect("hashes");
     assert_eq!(out, hash_program_ast(&program, &resolved).expect("hashes"));
     assert_eq!(out.tests.len(), check.tests.len());
@@ -562,10 +560,7 @@ fn test_hashes_pair_with_the_checked_tests_whatever_the_load_order() {
     let paired = |files: &[(&str, &str)]| -> Vec<(String, DefHash)> {
         let mut program = program_of(files);
         let resolved = ply_syntax::resolve(&mut program).expect("resolves");
-        let check = match ply_core::check_program(&program, &resolved) {
-            Ok(check) => check,
-            Err(diags) => panic!("program did not typecheck: {diags:#?}"),
-        };
+        let check = crate::fixture::port_check(files);
         let out = ply_hash::hash_program(&program, &resolved, &check).expect("hashes");
         assert_eq!(out.tests.len(), check.tests.len());
         check

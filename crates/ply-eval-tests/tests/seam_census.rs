@@ -1,5 +1,5 @@
 use ply_eval::{Fixture, Machine};
-use ply_span::{SourceMap, Symbol};
+use ply_span::{SourceId, SourceMap, Symbol};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
 use ply_syntax::resolve::{Resolved, resolve};
@@ -41,7 +41,7 @@ fn subdirectories(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn std_imports(id: ply_span::SourceId, name: &ModuleName, text: &str) -> Vec<ModuleName> {
+fn std_imports(id: SourceId, name: &ModuleName, text: &str) -> Vec<ModuleName> {
     let Ok(module) = ply_syntax::parse_module(id, name.clone(), text) else {
         return Vec::new();
     };
@@ -53,7 +53,9 @@ fn std_imports(id: ply_span::SourceId, name: &ModuleName, text: &str) -> Vec<Mod
         .collect()
 }
 
-fn load(root: &Path, files: &[PathBuf]) -> Option<(Program, Resolved)> {
+type Loaded = (Program, Resolved, Vec<(String, String)>, Vec<SourceId>);
+
+fn load(root: &Path, files: &[PathBuf]) -> Option<Loaded> {
     let mut map = SourceMap::new();
     let mut loaded = Vec::new();
     for path in files {
@@ -88,7 +90,12 @@ fn load(root: &Path, files: &[PathBuf]) -> Option<(Program, Resolved)> {
         return None;
     }
     let resolved = resolve(&mut program).ok()?;
-    Some((program, resolved))
+    let named = loaded
+        .iter()
+        .map(|(_, name, text)| (name.to_string(), text.clone()))
+        .collect();
+    let ids = loaded.iter().map(|(id, _, _)| *id).collect();
+    Some((program, resolved, named, ids))
 }
 
 fn corpora(root: &Path) -> Vec<(String, PathBuf, Vec<PathBuf>)> {
@@ -225,12 +232,13 @@ fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_
 
     let mut prev = (body0, admitted0, scalar0);
     for (label, dir, files) in selection.corpora() {
-        let Some((program, resolved)) = load(&dir, &files) else {
+        let Some((program, resolved, named, ids)) = load(&dir, &files) else {
             continue;
         };
-        let Ok(check) = ply_core::check_program(&program, &resolved) else {
+        let Ok(front) = ply_codegen::c::producer::checked_front(&named, &ids) else {
             continue;
         };
+        let check = front.check;
         let backend = std::rc::Rc::new(Declining::over(&program));
         // One machine: `admitted` is process-wide, so a second machine would count every call twice.
         let mut machine = Machine::new(&program, &resolved, &check);

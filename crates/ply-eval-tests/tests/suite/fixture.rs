@@ -1,10 +1,46 @@
-use ply_core::check_program;
 use ply_eval::{Machine, Provider};
 use ply_span::{Diagnostic, SourceId};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
 use ply_ty::CheckOutput;
 use std::collections::HashMap;
+
+/// `sources[i]` is `(module name, text)` for `SourceId(i)`.
+#[track_caller]
+pub fn port_check(sources: &[(&str, &str)]) -> CheckOutput {
+    let (named, ids) = inputs(sources);
+    ply_codegen::c::producer::checked_front(&named, &ids)
+        .unwrap_or_else(|e| panic!("the fixture must typecheck: {e:#}"))
+        .check
+}
+
+/// Every diagnostic when any is an error, as a refusing checker answers; empty otherwise.
+#[track_caller]
+pub fn port_errors(sources: &[(&str, &str)]) -> Vec<Diagnostic> {
+    let (named, ids) = inputs(sources);
+    ply_codegen::c::producer::ensure_default();
+    let front = ply_codegen::c::producer::front(&named, &ids)
+        .unwrap_or_else(|e| panic!("the port answers for the fixture: {e:#}"));
+    if front.has_error() {
+        front.diagnostics
+    } else {
+        Vec::new()
+    }
+}
+
+fn inputs(sources: &[(&str, &str)]) -> (Vec<(String, String)>, Vec<SourceId>) {
+    let named = sources
+        .iter()
+        .map(|(name, src)| {
+            (
+                ModuleName::from_dotted(name).to_string(),
+                (*src).to_string(),
+            )
+        })
+        .collect();
+    let ids = (0..sources.len()).map(|i| SourceId(i as u32)).collect();
+    (named, ids)
+}
 
 pub struct Compiled {
     pub program: Program,
@@ -39,8 +75,7 @@ impl Compiled {
             .unwrap_or_else(|d| panic!("the fixture must parse: {d:#?}"));
         let resolved =
             resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
+        let check = port_check(sources);
         let texts = sources
             .iter()
             .map(|(name, src)| {
@@ -58,7 +93,7 @@ impl Compiled {
         }
     }
 
-    /// The checker's diagnostics, empty if it accepted; failing to parse or resolve panics.
+    /// The port's diagnostics, empty if it accepted.
     #[track_caller]
     pub fn rejected(source: &str) -> Vec<Diagnostic> {
         Compiled::rejected_in("m", source)
@@ -67,12 +102,7 @@ impl Compiled {
     /// [`Compiled::rejected`] under the module name the assertions spell.
     #[track_caller]
     pub fn rejected_in(module: &str, source: &str) -> Vec<Diagnostic> {
-        let inputs = [(SourceId(0), ModuleName::from_dotted(module), source)];
-        let mut program = ply_syntax::parse_program(inputs)
-            .unwrap_or_else(|d| panic!("the fixture must parse: {d:#?}"));
-        let resolved =
-            resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        check_program(&program, &resolved).err().unwrap_or_default()
+        port_errors(&[(module, source)])
     }
 
     /// A machine with a compiled tier attached: a bare machine holds no evaluator.

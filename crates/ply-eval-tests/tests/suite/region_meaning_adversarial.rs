@@ -1,19 +1,4 @@
-use ply_core::check_program;
-use ply_span::{SourceId, SourceMap};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::parse_program;
-use ply_syntax::resolve::{Resolved, resolve};
-
-fn load(src: &str) -> (Program, Resolved) {
-    let mut map = SourceMap::new();
-    let id: SourceId = map.add("adversarial.ply", src.to_string());
-    let mut program = match parse_program([(id, ModuleName::from_dotted("adversarial"), src)]) {
-        Ok(p) => p,
-        Err(ds) => panic!("the probe must parse: {ds:#?}\n{src}"),
-    };
-    let resolved = resolve(&mut program).expect("the probe must resolve");
-    (program, resolved)
-}
+use crate::fixture::port_check;
 
 /// A route out of a region that the escape brand says is closed, and is not.
 #[test]
@@ -36,8 +21,7 @@ fn discharges(n: Int) -> Int =
 test "through a general clause" { assert_eq(leaks(1), 2) }
 test "through a tail-resumptive one" { assert_eq(discharges(1), 2) }
 "#;
-    let (program, resolved) = load(src);
-    let check = check_program(&program, &resolved).expect("the probe must typecheck");
+    let check = port_check(&[("adversarial", src)]);
     let atoms = |name: &str| -> Vec<String> {
         let at = check
             .tests

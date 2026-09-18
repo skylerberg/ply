@@ -628,6 +628,94 @@ pub fn tagged(n: Int) -> Int = label(if n > 0 {{ TB(n) }} else {{ TA }})
     );
 }
 
+/// Keyed as a command keys it, on the front end's hashes; `spare`'s nonce makes the second build miss the unit cache and ask body by body.
+#[test]
+fn a_definition_that_only_moved_is_served_from_the_cache_and_placed_where_it_now_is() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        % 1_000_000_000_000_000;
+    let main = "fn main() -> Int = 1 / 0\n";
+    let moved = format!("fn spare() -> Int = {nonce}\n\n\n{main}");
+    let hashed = |text: &str| -> &'static ply_codegen::Source {
+        let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
+        let id = ply_span::SourceId(0);
+        let mut ast =
+            ply_syntax::parse_program([(id, ply_syntax::ast::ModuleName::from_dotted("m"), owned)])
+                .expect("parses");
+        let resolved = ply_syntax::resolve::resolve(&mut ast).expect("resolves");
+        let front =
+            ply_codegen::c::producer::checked_front(&[("m".to_string(), owned.to_string())], &[id])
+                .expect("checks");
+        let front: &'static ply_ty::Front = Box::leak(Box::new(front));
+        let keys = ply_codegen::emit_keys(front);
+        Box::leak(Box::new(
+            ply_codegen::Source::from_front(
+                Box::leak(Box::new(ast)),
+                Box::leak(Box::new(resolved)),
+                front,
+                keys,
+            )
+            .with_texts(std::collections::HashMap::from([(
+                "m".to_string(),
+                owned.to_string(),
+            )])),
+        ))
+    };
+    let failure = |source: &'static ply_codegen::Source| -> Option<ply_span::Span> {
+        let names = source.functions();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let native = match ply_codegen::c::build(source, &refs) {
+            Ok((native, _)) => native,
+            Err(e) if e.to_string().contains("could not run") => return None,
+            Err(e) => panic!("{e}"),
+        };
+        let entry = native.entry("m.main").expect("`main` was refused");
+        let mut ctx = native.context();
+        ctx.fuel = 10_000;
+        let _ = unsafe { entry(&mut ctx, std::ptr::null()) };
+        assert_ne!(ctx.failed, 0, "`main` divided by zero and answered");
+        let d = ctx.take_failure().expect("a failed entry has a diagnostic");
+        let label = d
+            .labels
+            .iter()
+            .find(|l| l.primary)
+            .expect("a primary label");
+        Some(label.span)
+    };
+    let asked = || ply_codegen::c::producer::with_current(|p| p.counts().0).unwrap_or(0);
+
+    let _config = CONFIG.read().unwrap_or_else(|e| e.into_inner());
+    let (first, second) = (hashed(main), hashed(&moved));
+    let key = first.keys.get("m.main").expect("`main` is keyed");
+    assert_eq!(
+        second.keys.get("m.main"),
+        Some(key),
+        "moving `main` changed its key"
+    );
+    let Some(before) = failure(first) else {
+        return;
+    };
+    let asked_before = asked();
+    let Some(after) = failure(second) else {
+        return;
+    };
+    assert_eq!(
+        asked() - asked_before,
+        1,
+        "`main` was emitted again rather than served from the cache"
+    );
+    let shift = moved.find(main).expect("`main` is in the moved text") as u32;
+    assert!(!before.is_dummy(), "the failure names no place");
+    assert_eq!(
+        (after.start, after.end),
+        (before.start + shift, before.end + shift),
+        "the failure is placed where `main` was, not where it is"
+    );
+    assert_eq!(moved[..after.start as usize].matches('\n').count() + 1, 4);
+}
+
 /// Asserted on the memo, not a clock: without the emitted `rt_constant` the slot stays empty however long the run takes.
 #[test]
 fn a_pure_nullary_root_that_answers_a_handle_is_asked_once() {

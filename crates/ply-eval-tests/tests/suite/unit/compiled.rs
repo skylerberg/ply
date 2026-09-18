@@ -1,5 +1,5 @@
+use crate::fixture::port_check;
 use crate::unit::build::*;
-use ply_core::check_program;
 use ply_eval::Value;
 use ply_eval::compiled::*;
 use ply_eval::evaluator::Machine;
@@ -19,11 +19,10 @@ struct Checked {
 }
 
 fn checked(items: Vec<Item>) -> Checked {
-    let (program, resolved) = standalone(items);
-    let check = match check_program(&program, &resolved) {
-        Ok(check) => check,
-        Err(ds) => panic!("the program under test does not check: {ds:#?}"),
-    };
+    let m = module(items);
+    let text = ply_syntax::print::module(&m);
+    let check = port_check(&[("", text.as_str())]);
+    let (program, resolved) = standalone_module(m);
     Checked {
         program,
         resolved,
@@ -50,10 +49,7 @@ fn checked_source(source: &str) -> Checked {
     )])
     .expect("the fixture must parse");
     let resolved = ply_syntax::resolve::resolve(&mut program).expect("the fixture must resolve");
-    let check = match check_program(&program, &resolved) {
-        Ok(check) => check,
-        Err(ds) => panic!("the program under test does not check: {ds:#?}"),
-    };
+    let check = port_check(&[("", source)]);
     Checked {
         program,
         resolved,
