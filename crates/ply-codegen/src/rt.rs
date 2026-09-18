@@ -27,9 +27,9 @@ use std::sync::Arc;
 pub type Entry = unsafe extern "C" fn(*mut Ctx, *const i64) -> i64;
 
 pub struct Tables {
-    /// The constant pool as values, for a literal rebuilt per evaluation.
+    /// The constant pool as values.
     pub consts: Vec<Value>,
-    /// The same constants as immortal words, which a folded literal is an immediate of.
+    /// The same constants as immortal words, which a literal answers.
     pub const_words: Vec<Word>,
     pub layouts: Layouts,
     /// Every field name a compiled body reads by name, so that a field access is an index rather
@@ -133,6 +133,10 @@ impl Tables {
     /// down — a record's fields, a constructor's arguments, a short list's elements — the words
     /// they came from, since a body that takes a memo value apart hands those parts back in.
     pub fn remember(&self, w: Word, v: &Value) {
+        // Replacing the value would free allocations its recorded identities still name.
+        if self.memo_values.borrow().contains_key(&w) {
+            return;
+        }
         self.memo_values.borrow_mut().insert(w, v.clone());
         let mut words = self.memo_words.borrow_mut();
         if let Some(id) = identity(v) {
@@ -1018,18 +1022,10 @@ pub unsafe extern "C" fn rt_arith(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i64
     }
 }
 
-/// A literal, built the way the interpreter builds it: a fresh allocation per evaluation.
+/// A literal: the unit's immortal word for it, built once at load.
 pub unsafe extern "C" fn rt_lit(ctx: *mut Ctx, index: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let tables = Rc::clone(&ctx.tables);
-    let value = &tables.consts[index as usize];
-    let rebuilt = match value {
-        Value::Bytes(b) => Value::bytes(b.as_ref()),
-        Value::Str(s) => Value::str(s.as_ref()),
-        Value::Ctor { name, args } => Value::ctor(name.clone(), args.as_ref().clone()),
-        other => other.clone(),
-    };
-    ctx.word(&rebuilt)
+    let ctx = unsafe { &*ctx };
+    ctx.tables.const_words[index as usize]
 }
 
 /// A `match` whose arms did not cover the value.
