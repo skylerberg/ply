@@ -658,10 +658,20 @@ fn the_writer_refuses_a_front_the_protocol_cannot_carry() {
     assert!(err.contains("module `m` is source 7"), "{err}");
 }
 
-/// `sample` as the checker publishes it: defs in dependency order, the prelude's constructor first.
+fn unused(what: &str, at: Span) -> Diagnostic {
+    Diagnostic::warning(codes::UNUSED_DEFINITION, format!("{what} is never used"))
+        .primary(at, "never used")
+}
+
+/// `sample` as the checker publishes it: defs in dependency order, the prelude's constructor first,
+/// and the warnings by module in source order.
 fn published() -> Front {
     let mut front = sample();
-    front.diagnostics.clear();
+    front.diagnostics = vec![
+        unused("type `std.db.Row`", span(0, 30, 33)),
+        unused("fn `m.helper`", span(1, 100, 106)).secondary(Span::DUMMY, "nothing calls it"),
+        unused("type `m.Unused`", span(1, 110, 116)),
+    ];
     front.check.defs = std::mem::take(&mut front.check.defs)
         .into_iter()
         .rev()
@@ -684,6 +694,12 @@ fn an_answer_split_by_module_and_filed_joins_back_at_other_positions() {
         1,
         "the prelude's constructor belongs to no module"
     );
+    assert!(program.diagnostics.is_empty());
+    assert_eq!(
+        [parts[0].diagnostics.len(), parts[1].diagnostics.len()],
+        [1, 2],
+        "each warning belongs to the module it points into"
+    );
 
     let moved = [SourceId(7), SourceId(3)];
     let program = read_front(&write_front(&program, &[]).unwrap(), &[]).unwrap();
@@ -696,16 +712,51 @@ fn an_answer_split_by_module_and_filed_joins_back_at_other_positions() {
         })
         .collect();
     assert_eq!(parts[1].check.defs[&sym("m.count")].span, span(3, 0, 40));
+    let helper = &parts[1].diagnostics[0];
+    assert_eq!(helper.primary_span(), Some(span(3, 100, 106)));
+    assert!(helper.labels[1].span.is_dummy());
 
     let joined = Front::join(program, parts).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(write_front(&joined, &moved).unwrap(), whole);
     assert_eq!(joined.hashes, front.hashes);
+    let messages =
+        |f: &Front| -> Vec<String> { f.diagnostics.iter().map(|d| d.message.clone()).collect() };
+    assert_eq!(messages(&joined), messages(&front));
 }
 
 #[test]
 fn an_answer_that_is_not_laid_out_by_module_does_not_split() {
-    let err = sample().split().unwrap_err();
-    assert!(err.contains("diagnostics"), "{err}");
+    let mut front = published();
+    front.diagnostics.push(
+        Diagnostic::error(codes::TYPE_MISMATCH, "expected Int").primary(span(1, 2, 3), "here"),
+    );
+    let err = front.split().unwrap_err();
+    assert!(
+        err.contains("an answer with an error does not split"),
+        "{err}"
+    );
+
+    let mut front = published();
+    front.diagnostics.reverse();
+    let err = front.split().unwrap_err();
+    assert!(
+        err.contains("the diagnostics are not grouped by module"),
+        "{err}"
+    );
+
+    let mut front = published();
+    front
+        .diagnostics
+        .push(unused("fn `m.nowhere`", Span::DUMMY));
+    let err = front.split().unwrap_err();
+    assert!(err.contains("`W0611` names no module"), "{err}");
+
+    let mut front = published();
+    front.diagnostics[0] = front.diagnostics[0]
+        .clone()
+        .secondary(span(1, 0, 1), "and here");
+    let err = front.split().unwrap_err();
+    assert!(err.contains("`W0611` labels two modules"), "{err}");
 
     let mut front = published();
     front.check.defs = std::mem::take(&mut front.check.defs)

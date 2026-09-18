@@ -1175,6 +1175,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `W0608` | drain deadline expired with requests in flight |
 | `W0609` | spans still open when an entry point ended |
 | `W0610` | reference cycle, never freed |
+| `W0611` | definition no `pub` item, `main`, test or law reaches; a leading `_` in its name keeps it quiet |
 
 ## 18. What Ply does not have
 
