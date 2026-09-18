@@ -39,7 +39,7 @@ impl Run {
             ),
         };
         let hashes = loaded.hashes.clone();
-        let collected = obligations::collect(&loaded.program, &loaded.check, &hashes);
+        let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
         assert!(
             collected.warnings.is_empty(),
             "an obligation was not collected: {:?}",
@@ -176,7 +176,7 @@ fn the_differential_tier_audit() {
     for path in corpus() {
         let loaded = load(&path).expect("the corpus compiles");
         let hashes = loaded.hashes.clone();
-        let collected = obligations::collect(&loaded.program, &loaded.check, &hashes);
+        let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
         let prover = Prover::new(&loaded)
             .expect("the port lowers the claims")
             .with_backend(

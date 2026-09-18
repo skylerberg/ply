@@ -9,7 +9,6 @@ use ply_prove::{
 };
 use ply_span::{Diagnostic, SourceId, Span, Symbol};
 use ply_syntax::ast::{Mode, Program};
-use ply_syntax::resolve::Resolved;
 use ply_ty::DefHash;
 use ply_ty::prelude;
 use ply_ty::{CheckOutput, EffectAtom, LawBinder, Resource, Row, RowVar, TyVar, Type};
@@ -19,7 +18,6 @@ use std::rc::Rc;
 pub(crate) struct Fixture {
     source: String,
     program: Program,
-    resolved: Resolved,
     check: CheckOutput,
 }
 
@@ -27,7 +25,7 @@ impl Fixture {
     pub(crate) fn compile(src: &str) -> Fixture {
         let module = ply_syntax::parse(SourceId(0), src).expect("the fixture must parse");
         let mut program = Program::single(module);
-        let resolved = ply_syntax::resolve(&mut program)
+        ply_syntax::resolve(&mut program)
             .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
         // Anonymous, so the keys stay bare.
         let check = ply_codegen::c::producer::checked_front(
@@ -39,7 +37,6 @@ impl Fixture {
         Fixture {
             source: src.to_string(),
             program,
-            resolved,
             check,
         }
     }
@@ -52,7 +49,7 @@ impl Fixture {
     fn tier(&self) -> Rc<ply_codegen::Bodies> {
         let name = self.program.modules[0].name.to_string();
         let texts = HashMap::from([(name, self.source.clone())]);
-        ply_codegen::Unit::over_with_texts(&self.program, &self.resolved, texts)
+        ply_codegen::Unit::over_with_texts(&self.program, texts)
             .expect("this host has a C compiler")
             .bodies()
             .expect("the unit builds")

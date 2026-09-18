@@ -23,16 +23,8 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
 
     let warnings = once_each(warnings);
 
-    if loaded.promised {
-        // Every module is parsed on every load, so the whole-program check has what it needs.
-        let broken = crate::costs::promises(&loaded.program, &loaded.resolved);
-        if !broken.is_empty() {
-            let err = crate::load::LoadError {
-                sources: loaded.sources.clone(),
-                diagnostics: broken,
-            };
-            return report_load_error("check", &err, args.json, style);
-        }
+    if let Some(err) = super::test::broken_promises(&loaded) {
+        return report_load_error("check", &err, args.json, style);
     }
 
     if args.json {
@@ -62,8 +54,10 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
     if args.types {
         print_types(&loaded, args.explain, style);
     }
-    if args.costs {
-        print_costs(&loaded, style);
+    if args.costs
+        && let Err(err) = print_costs(&loaded, style)
+    {
+        return report_load_error("check", &err, args.json, style);
     }
     EXIT_OK
 }
@@ -96,9 +90,10 @@ fn check(
 }
 
 /// For every `push`, whether it grows its list in place or copies it.
-fn print_costs(loaded: &Loaded, style: Style) {
+fn print_costs(loaded: &Loaded, style: Style) -> Result<(), crate::load::LoadError> {
+    let tree = loaded.tree().map_err(|d| loaded.refused(d))?;
     println!();
-    match crate::costs::lines(&loaded.program, &loaded.resolved, &loaded.sources, style) {
+    match crate::costs::lines(&tree.program, &tree.resolved, &loaded.sources, style) {
         Some(lines) => {
             for line in lines {
                 println!("{line}");
@@ -106,6 +101,7 @@ fn print_costs(loaded: &Loaded, style: Style) {
         }
         None => println!("{IND}{}", style.dim("no appends: nothing to cost")),
     }
+    Ok(())
 }
 
 /// Grouped by module with simple names: the heading already carries the qualification.
@@ -155,13 +151,7 @@ fn print_types(loaded: &Loaded, explain: bool, style: Style) {
         }
 
         let sets = if explain {
-            signature::effect_sets(
-                &loaded.program,
-                &loaded.resolved,
-                &loaded.check,
-                module.name,
-                &defs,
-            )
+            signature::effect_sets(&loaded.front, module.name, &defs)
         } else {
             Vec::new()
         };
@@ -214,22 +204,16 @@ fn attach_provenance(report: &mut Value, loaded: &Loaded) {
         for entry in modules {
             let name = ModuleName::from_dotted(entry["name"].as_str().unwrap_or_default());
             let defs = loaded.defs_of(&name);
-            let sets: Vec<Value> = signature::effect_sets(
-                &loaded.program,
-                &loaded.resolved,
-                &loaded.check,
-                &name,
-                &defs,
-            )
-            .iter()
-            .map(|s| {
-                json!({
-                    "name": s.name,
-                    "expansion": s.atoms,
-                    "used_by": s.used_by,
+            let sets: Vec<Value> = signature::effect_sets(&loaded.front, &name, &defs)
+                .iter()
+                .map(|s| {
+                    json!({
+                        "name": s.name,
+                        "expansion": s.atoms,
+                        "used_by": s.used_by,
+                    })
                 })
-            })
-            .collect();
+                .collect();
             entry["effect_sets"] = Value::Array(sets);
         }
     }

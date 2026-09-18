@@ -6,6 +6,7 @@ use super::tables::Tables;
 use crate::source::Source;
 use anyhow::{Context, Result, anyhow, bail};
 use ply_eval::{Fields, Value};
+use ply_span::frames::Cursor;
 use ply_span::{Severity, SourceId, Symbol};
 use ply_ty::{Front, read_front};
 use std::cell::{Cell, RefCell};
@@ -189,42 +190,23 @@ pub fn build(src: &Sources) -> Result<PlyProducer, String> {
 }
 
 /// The emitter's own program through the front end, modules as `SourceId(0..n)` in `modules_of`'s
-/// order; the check comes from the emitter handed over by [`build`].
+/// order; the answer comes from the emitter handed over by [`build`].
 fn front_end(src: &Sources) -> Result<&'static Source, String> {
     let modules = modules_of(src);
     let ids: Vec<SourceId> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
-    let inputs: Vec<_> = modules
+    let front = front(&modules, &ids).map_err(|e| format!("{e:#}"))?;
+    if let Some(error) = front
+        .diagnostics
         .iter()
-        .enumerate()
-        .map(|(i, (module, text))| {
-            let text: &'static str = Box::leak(text.clone().into_boxed_str());
-            (
-                SourceId(i as u32),
-                ply_syntax::ast::ModuleName::from_dotted(module),
-                text,
-            )
-        })
-        .collect();
-    let first = |ds: Vec<ply_span::Diagnostic>| {
-        ds.first()
-            .map(|d| d.message.clone())
-            .unwrap_or_else(|| "no diagnostic".to_string())
-    };
-    let mut ast = ply_syntax::parse_program(inputs).map_err(first)?;
-    let expanded = ply_derive::expand_program(&mut ast);
-    if !expanded.is_empty() {
-        return Err(first(expanded));
+        .find(|d| d.severity == Severity::Error)
+    {
+        return Err(error.message.clone());
     }
-    let resolved = ply_syntax::resolve::resolve(&mut ast).map_err(first)?;
-    let program: &'static ply_syntax::ast::Program = Box::leak(Box::new(ast));
-    let resolved = Box::leak(Box::new(resolved));
-    let front = Box::leak(Box::new(
-        front(&modules, &ids).map_err(|e| format!("{e:#}"))?,
-    ));
+    let front: &'static Front = Box::leak(Box::new(front));
     let keys = crate::source::emit_keys(front);
     let texts: HashMap<String, String> = modules.iter().cloned().collect();
     Ok(Box::leak(Box::new(
-        Source::from_front(program, resolved, front, keys).with_texts(texts),
+        Source::from_front(front, keys).with_texts(texts),
     )))
 }
 
@@ -522,16 +504,7 @@ pub fn claims_dump(sources: &[(String, String)]) -> Result<String> {
 }
 
 fn dump_over(entry: &str, sources: &[(String, String)]) -> Result<String> {
-    let records: Vec<Value> = sources
-        .iter()
-        .map(|(name, src)| {
-            Value::Record(Arc::new(Fields::from_unsorted(vec![
-                (Symbol::new("name"), Value::bytes(name.as_bytes())),
-                (Symbol::new("src"), Value::bytes(src.as_bytes())),
-            ])))
-        })
-        .collect();
-    let answer = call(entry, &[Value::list(records)])?;
+    let answer = call(entry, &[source_list(sources)])?;
     let Value::Str(dump) = &answer else {
         bail!(
             "`{entry}` answered a {} rather than a string",
@@ -539,6 +512,84 @@ fn dump_over(entry: &str, sources: &[(String, String)]) -> Result<String> {
         );
     };
     Ok(dump.to_string())
+}
+
+fn source_list(sources: &[(String, String)]) -> Value {
+    Value::list(
+        sources
+            .iter()
+            .map(|(name, src)| {
+                Value::Record(Arc::new(Fields::from_unsorted(vec![
+                    (Symbol::new("name"), Value::bytes(name.as_bytes())),
+                    (Symbol::new("src"), Value::bytes(src.as_bytes())),
+                ])))
+            })
+            .collect(),
+    )
+}
+
+/// [`FRONT`], pulling in the shipped modules the program imports itself.
+const FRONT_PULLING: &str = "front.front_pulling_std";
+
+/// What [`front_pulling_std`] answered.
+pub struct Pulled {
+    /// The shipped modules pulled in, in the positions they took after the user's.
+    pub modules: Vec<String>,
+    /// [`front_dump`]'s answer over the user's modules followed by [`Pulled::modules`].
+    pub dump: String,
+}
+
+/// [`front_dump`] over `user` plus each module of `shipped` it imports, transitively, placed
+/// as the CLI driver places them: a round of newly imported modules at a time, each in byte order.
+pub fn front_pulling_std(
+    user: &[(String, String)],
+    shipped: &[(String, String)],
+) -> Result<Pulled> {
+    let answer = call(FRONT_PULLING, &[source_list(user), source_list(shipped)])?;
+    let Value::Str(answer) = &answer else {
+        bail!(
+            "`{FRONT_PULLING}` answered a {} rather than a string",
+            answer.type_name()
+        );
+    };
+    let answer: &str = answer;
+    let mut frames = Cursor::new(answer.as_bytes(), "frame");
+    let (words, payload) = frames
+        .unit()
+        .map_err(|e| anyhow!("`{FRONT_PULLING}`'s answer: {e}"))?;
+    if words != ["pulled", "_"] {
+        bail!(
+            "`{FRONT_PULLING}` led with `{}` rather than the modules it pulled in",
+            words.join(" ")
+        );
+    }
+    let mut fields = Cursor::new(payload, "field");
+    let mut modules = Vec::new();
+    while !fields.done() {
+        let (key, name) = fields
+            .unit()
+            .map_err(|e| anyhow!("the modules `{FRONT_PULLING}` pulled in: {e}"))?;
+        if key != ["module"] {
+            bail!(
+                "the modules `{FRONT_PULLING}` pulled in hold a `{}` field",
+                key.join(" ")
+            );
+        }
+        modules.push(
+            std::str::from_utf8(name)
+                .context("a pulled module's name")?
+                .to_string(),
+        );
+    }
+    CENSUS.with(|c| {
+        let mut census = c.get();
+        census.modules += user.len() + modules.len();
+        c.set(census);
+    });
+    Ok(Pulled {
+        modules,
+        dump: answer[frames.at()..].to_string(),
+    })
 }
 
 /// [`front`] over the default producer, with the program's errors raised rather than answered.

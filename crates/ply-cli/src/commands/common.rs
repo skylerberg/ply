@@ -65,15 +65,15 @@ pub fn run_on_tier(
     store: &mut ply_store::Store,
 ) -> ply_test::RunReport {
     ply_codegen::c::producer::ensure_default();
-    let (program, resolved) = (&loaded.program, &loaded.resolved);
-    let texts = module_texts(program, &loaded.sources);
-    let unit = ply_codegen::Unit::over_front(program, resolved, &loaded.front, texts)
+    let tree = loaded.tree().unwrap_or_else(|d| panic!("{}", d.message));
+    let texts = module_texts(&loaded.check, &loaded.sources);
+    let unit = ply_codegen::Unit::over_front(&tree.program, &loaded.front, texts)
         .expect("this host has a C compiler");
     let spec = ply_eval::BackendSpec {
         kind: ply_eval::BackendKind::C,
         ..Default::default()
     };
-    let executor = ply_test::InterpExecutor::new(program, resolved, &loaded.check)
+    let executor = ply_test::InterpExecutor::new(&tree.program, &tree.resolved, &loaded.check)
         .with_backend(unit, spec)
         .with_search(ply_test::Search::of(selection))
         .with_hosts(hosting);
@@ -81,12 +81,12 @@ pub fn run_on_tier(
 }
 
 pub fn module_texts(
-    program: &ply_syntax::ast::Program,
+    check: &ply_ty::CheckOutput,
     sources: &SourceMap,
 ) -> std::collections::HashMap<String, String> {
-    program
+    check
         .modules
-        .iter()
+        .values()
         .filter_map(|m| {
             sources
                 .get(m.source)
@@ -106,10 +106,9 @@ pub fn prover_backend(
     };
     let provider = build_backend_over(
         &spec,
-        &loaded.program,
-        &loaded.resolved,
+        &loaded.tree()?.program,
         &loaded.front,
-        module_texts(&loaded.program, &loaded.sources),
+        module_texts(&loaded.check, &loaded.sources),
     )?;
     Ok(Some((provider, spec)))
 }
@@ -118,13 +117,12 @@ pub fn prover_backend(
 pub fn build_backend_over(
     spec: &ply_eval::BackendSpec,
     program: &ply_syntax::ast::Program,
-    resolved: &ply_syntax::resolve::Resolved,
     front: &ply_ty::Front,
     texts: std::collections::HashMap<String, String>,
 ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
     ply_codegen::c::producer::ensure_default();
     match spec.kind {
-        ply_eval::BackendKind::C => ply_codegen::Unit::over_front(program, resolved, front, texts)
+        ply_eval::BackendKind::C => ply_codegen::Unit::over_front(program, front, texts)
             .map(|unit| unit as &'static dyn ply_eval::Provider)
             .map_err(unbuilt),
     }

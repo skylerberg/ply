@@ -226,3 +226,67 @@ fn a_leading_dot_slash_never_reaches_a_rendered_span() {
     assert_eq!(tidy(Path::new("./src/a.ply")), PathBuf::from("src/a.ply"));
     assert_eq!(tidy(Path::new("src/a.ply")), PathBuf::from("src/a.ply"));
 }
+
+#[test]
+fn the_rust_tree_is_parsed_on_first_use_under_the_port_s_source_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "a.ply",
+        "import std.json\npub fn a() -> Int = 1\n",
+    );
+    write(dir.path(), "b.ply", "import a\nfn b() -> Int = a::a()\n");
+
+    let loaded = load(dir.path()).unwrap();
+    assert!(!loaded.rust.built(), "a load parsed in Rust");
+    let tree = loaded.tree().expect("the front ends agree");
+    let parsed: Vec<_> = tree
+        .program
+        .modules
+        .iter()
+        .map(|m| (m.name.to_string(), m.source))
+        .collect();
+    let answered: Vec<_> = loaded
+        .check
+        .modules
+        .values()
+        .map(|m| (m.name.to_string(), m.source))
+        .collect();
+    assert_eq!(parsed, answered);
+    assert!(parsed.iter().any(|(name, _)| name == "std.json"));
+}
+
+#[test]
+fn a_text_only_the_rust_front_end_rejects_is_ply_s_fault() {
+    let mut sources = ply_span::SourceMap::new();
+    let source = sources.add("m.ply", "fn f( -> Int = 1\n");
+    let mut check = ply_ty::CheckOutput::default();
+    check.modules.insert(
+        Symbol::new("m"),
+        ply_ty::ModuleInfo {
+            name: ModuleName::from_dotted("m"),
+            source,
+            items: Vec::new(),
+            imports: Vec::new(),
+        },
+    );
+    let loaded = Loaded {
+        root: PathBuf::from("."),
+        files: vec![PathBuf::from("m.ply")],
+        sources,
+        front: Default::default(),
+        check,
+        hashes: Default::default(),
+        frontend: Default::default(),
+        promised: false,
+        rust: Default::default(),
+    };
+    let d = loaded.tree().expect_err("the Rust parser rejects it");
+    assert_eq!(d.code, codes::INTERNAL_ERROR);
+    assert!(
+        d.message.contains("the front ends disagree about `m.ply`"),
+        "{}",
+        d.message
+    );
+    assert!(d.notes.iter().any(|n| n.contains("E0001")), "{:?}", d.notes);
+}

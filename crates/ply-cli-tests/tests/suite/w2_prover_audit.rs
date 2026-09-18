@@ -31,7 +31,7 @@ impl Run {
             )
         });
         let hashes = loaded.hashes.clone();
-        let collected = obligations::collect(&loaded.program, &loaded.check, &hashes);
+        let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
         let prover = Prover::new(&loaded)
             .expect("the port lowers the claims")
             .with_backend(
@@ -148,7 +148,7 @@ fn a_certificate_over_a_hidden_float_is_refuted_by_sampling() {
     let dir = project(source);
     let loaded = load(dir.path()).expect("the fixture compiles");
     let hashes = loaded.hashes.clone();
-    let collected = obligations::collect(&loaded.program, &loaded.check, &hashes);
+    let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
     let prover = Prover::new(&loaded)
         .expect("the port lowers the claims")
         .with_backend(
