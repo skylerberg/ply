@@ -650,7 +650,6 @@ fn on_the_tier<'a>(
     resolved: &'a ply_syntax::resolve::Resolved,
     check: &'a CheckOutput,
 ) -> ply_eval::Machine<'a> {
-    ply_codegen::c::producer::ensure_default();
     let texts: std::collections::HashMap<String, String> =
         ply_syntax::print::program(program).into_iter().collect();
     let unit = ply_codegen::Unit::over_with_texts(program, resolved, check, texts)

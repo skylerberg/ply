@@ -330,7 +330,7 @@ impl Loaded {
             let id = sources.add(ply_std::pseudo_path(module), source.to_string());
             inputs.push((id, module.clone(), source));
         }
-        // `texts` below is a map, for `Unit::over_with_texts`. The port needs the same pairs
+        // `texts` below is a map, for `Unit::over_front`. The port needs the same pairs
         // in the program's order, because that order is how a span names its module.
         let ordered: Vec<(String, String)> = inputs
             .iter()
@@ -346,7 +346,7 @@ impl Loaded {
         }
         let resolved = ply_syntax::resolve::resolve(&mut program)
             .map_err(|d| diagnostics("resolving the service", &d))?;
-        let port = crate::port_front(&ordered, &ids)
+        let port = ply_codegen::c::producer::checked_front(&ordered, &ids)
             .map_err(|e| anyhow::anyhow!("checking the service: {e}"))?;
         Ok(Loaded {
             program,

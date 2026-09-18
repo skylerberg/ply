@@ -55,16 +55,9 @@ impl Bench {
         let ids: Vec<_> = (0..modules.len())
             .map(|i| ply_span::SourceId(i as u32))
             .collect();
-        ply_codegen::c::producer::ensure_default();
-        let front = ply_codegen::c::producer::front(&modules, &ids)
-            .unwrap_or_else(|e| panic!("the port answers for the shipped modules: {e:#}"));
-        let errors: Vec<_> = front
-            .diagnostics
-            .iter()
-            .filter(|d| d.code.starts_with("E0") && d.severity == ply_span::Severity::Error)
-            .collect();
-        assert!(errors.is_empty(), "they check: {errors:#?}");
-        let check = front.check;
+        let check = ply_codegen::c::producer::checked_front(&modules, &ids)
+            .unwrap_or_else(|e| panic!("they check: {e:#}"))
+            .check;
         Bench {
             program,
             resolved,
@@ -240,15 +233,9 @@ fn a_whole_request_through_the_host_boundary() {
     let ids: Vec<_> = (0..modules.len())
         .map(|i| ply_span::SourceId(i as u32))
         .collect();
-    ply_codegen::c::producer::ensure_default();
-    let front = ply_codegen::c::producer::front(&modules, &ids)
-        .unwrap_or_else(|e| panic!("the port answers: {e:#}"));
-    assert!(
-        front.diagnostics.is_empty(),
-        "{:#?}",
-        front.diagnostics.iter().take(3).collect::<Vec<_>>()
-    );
-    let check = front.check;
+    let check = ply_codegen::c::producer::checked_front(&modules, &ids)
+        .unwrap_or_else(|e| panic!("{e:#}"))
+        .check;
 
     let mut best = f64::MAX;
     for _ in 0..3 {

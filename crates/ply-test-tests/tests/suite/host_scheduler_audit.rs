@@ -56,7 +56,6 @@ impl Compiled {
     /// The whole Ply emitter's unit for this program, and the C backend spec to install it with —
     /// what a run needs under tier-only (ADR 0048), since a bare machine holds no evaluator.
     fn tier(&self) -> (&'static ply_codegen::Unit, ply_eval::BackendSpec) {
-        ply_codegen::c::producer::ensure_default();
         let unit = ply_codegen::Unit::over_with_texts(
             &self.program,
             &self.resolved,

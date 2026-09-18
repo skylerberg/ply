@@ -1,4 +1,4 @@
-use ply_cli::commands::common::{backend_spec, build_backend, location, module_texts};
+use ply_cli::commands::common::{backend_spec, build_backend_over, location, module_texts};
 use ply_cli::commands::run::*;
 use ply_cli::load::{Loaded, load};
 use ply_eval::Machine;
@@ -25,11 +25,11 @@ fn attach_tier(machine: &mut Machine<'_>, loaded: &Loaded) -> Result<(), Diagnos
         return Ok(());
     };
     let texts = module_texts(&loaded.program, &loaded.sources);
-    let provider = build_backend(
+    let provider = build_backend_over(
         &spec,
         &loaded.program,
         &loaded.resolved,
-        &loaded.check,
+        &loaded.front,
         texts,
     )?;
     machine.set_compiled(provider.attach(&spec));

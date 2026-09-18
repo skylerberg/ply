@@ -67,14 +67,7 @@ fn load(modules: &[(&str, &str)], with_std: bool) -> &'static Loaded {
     // `emitter` calls this before its own handover takes effect, so the committed bundle answers
     // here while the emitter under test is handed over around each test's `build`. That is the
     // circularity a `OnceLock` could not express and a `Drop`-scoped handover can.
-    producer::ensure_default();
-    let front = producer::front(&named, &ids).expect("the port answers for these modules");
-    assert!(
-        front.diagnostics.is_empty(),
-        "checks: {:?}",
-        front.diagnostics
-    );
-    let check = front.check;
+    let check = producer::checked_front(&named, &ids).expect("checks").check;
     Box::leak(Box::new(Loaded {
         program: Box::leak(Box::new(ast)),
         resolved: Box::leak(Box::new(resolved)),

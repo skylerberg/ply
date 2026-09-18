@@ -135,7 +135,7 @@ pub fn prover_backend(
     Ok(Some((provider, spec)))
 }
 
-/// [`build_backend`] over the front end's answer this run already holds.
+/// The tier over the front end's answer this run already holds.
 ///
 /// **Every command that loaded a program uses this one.** The driver enters the port once per load
 /// (ADR 0052 §1) and the answer is what the unit is built from, so an invocation runs one front
@@ -153,28 +153,6 @@ pub fn build_backend_over(
         ply_eval::BackendKind::C => ply_codegen::Unit::over_front(program, resolved, front, texts)
             .map(|unit| unit as &'static dyn ply_eval::Provider)
             .map_err(unbuilt),
-    }
-}
-
-/// The operations a binding would answer, as the producer keys them: a compiled `perform` of
-/// one stays the machine's until the tier has a route to the host.
-///
-/// For a program no load answered for — an artifact's, rebuilt from its stored bodies — which is
-/// why this one derives a front end of its own.
-pub fn build_backend(
-    spec: &ply_eval::BackendSpec,
-    program: &ply_syntax::ast::Program,
-    resolved: &ply_syntax::resolve::Resolved,
-    check: &ply_ty::CheckOutput,
-    texts: std::collections::HashMap<String, String>,
-) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
-    ply_codegen::c::producer::ensure_default();
-    match spec.kind {
-        ply_eval::BackendKind::C => {
-            ply_codegen::Unit::over_with_texts(program, resolved, check, texts)
-                .map(|unit| unit as &'static dyn ply_eval::Provider)
-                .map_err(unbuilt)
-        }
     }
 }
 

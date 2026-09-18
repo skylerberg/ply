@@ -149,9 +149,8 @@ fn load(dir: &str) -> &'static Source {
     let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the project resolves");
     // The port answers the front end here, as the driver does: the gate times the kernel entry,
     // and which front end built the `Source` is setup rather than what it reads (ADR 0052 §2).
-    ply_codegen::c::producer::ensure_default();
     let front = Box::leak(Box::new(
-        ply_codegen::c::producer::front(&modules, &ids).expect("the port answers for this project"),
+        ply_codegen::c::producer::checked_front(&modules, &ids).expect("the project checks"),
     ));
     let texts: std::collections::HashMap<String, String> = modules.into_iter().collect();
     let program = Box::leak(Box::new(ast));
