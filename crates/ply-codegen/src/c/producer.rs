@@ -455,6 +455,8 @@ impl PlyProducer {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Census {
     pub entries: usize,
+    /// Modules handed to the front end, summed over its entries.
+    pub modules: usize,
     pub allocated: usize,
     pub recycled: usize,
     /// The most chunk bytes any one entry held at its end.
@@ -462,7 +464,7 @@ pub struct Census {
 }
 
 thread_local! {
-    static CENSUS: Cell<Census> = const { Cell::new(Census { entries: 0, allocated: 0, recycled: 0, chunk_bytes: 0 }) };
+    static CENSUS: Cell<Census> = const { Cell::new(Census { entries: 0, modules: 0, allocated: 0, recycled: 0, chunk_bytes: 0 }) };
 }
 
 fn note_census(ctx: &crate::rt::Ctx) {
@@ -504,6 +506,11 @@ pub fn front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
 
 /// The front end's raw answer, before [`read_front`].
 pub fn front_dump(sources: &[(String, String)]) -> Result<String> {
+    CENSUS.with(|c| {
+        let mut census = c.get();
+        census.modules += sources.len();
+        c.set(census);
+    });
     let records: Vec<Value> = sources
         .iter()
         .map(|(name, src)| {
