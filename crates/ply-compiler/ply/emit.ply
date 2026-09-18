@@ -1,20 +1,5 @@
-// The C emitter, in Ply: what a code generator writes.
-//
-// `code.ply` builds the tree `crates/ply-codegen`'s emitter reads; this writes
-// what it writes. The oracle is `reference_emit_dump` in `harness/src/lib.rs`,
-// and the comparison is byte for byte over one body's C -- placeholders and all,
-// because a body names the unit's tables by its own positions and is therefore a
-// function of the body alone.
-//
-// **What is covered is written down and refused otherwise.** `emit_fn` answers
-// `None` for a form this port has not reached, exactly as `code.ply`'s `lower`
-// does, so the differential compares what was written rather than a guess.
-//
-// One coupling the emit oracle records and this file has to live with: the
-// reference optimises before it lowers, so `1 + 2` reaches its emitter as `3`
-// while this one sees the addition. The comparison is over programs where that
-// makes no difference, and closing the gap is `fold_literals` -- a piece of
-// `opt.rs`, not of this file.
+// The C emitter: writes the C for one lowered body, or `None` for a form it does not cover.
+// Output is diffed byte for byte against the Rust back end, so emission order and temporary numbering are load-bearing.
 
 import spine (num, Ident, Span, dummy_span)
 import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NUpd, NApp, NRecord, NMatch, CPat, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, CPatField, NPerform, NCell, NRegion, NLambda, NSim, NHandle, CStmt, CLet, CLetPat, CDo, pat_slots, CField, CArm, Cap, CClause, CRet, Own, Borrowed, Owned, lower_fn, qname_text)
@@ -27,12 +12,9 @@ import types (MWrite, TypeExpr, TVar, TCon, TRecord)
 import rewrite (expand)
 import patterns (Lit, LInt, LFixed, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
 
-// The C type a value is held in, and what the emitter knows about it. `Boxed` is
-// a `Word`; `Int` is the untagged sixty-four bits inside one.
+// `KBoxed` is a tagged word; `KInt` is the untagged 64 bits inside one.
 pub type Kind = | KBoxed | KInt | KBool
-  // A fixed width the C carries in a register of its own: the six below sixty-four bits.
-  // A width is held in its own C type and cast where the signedness matters, because
-  // signed overflow is undefined in C. The two sixty-four-bit widths stay words.
+  // Below 64 bits a width has its own C type; signed overflow is undefined in C, so casts carry signedness.
   | KNum(Width)
 
 pub type Width = { bits: Int, signed: Bool }
@@ -47,7 +29,7 @@ pub fn ctype(k: Kind) -> Bytes =
 fn utype(w: Width) -> Bytes =
   if w.bits == 8 { b"uint8_t" } else if w.bits == 16 { b"uint16_t" } else { b"uint32_t" }
 
-// The eight widths by name; `width_index` is the order the reference numbers them in.
+// `width_index`'s order is the runtime's width numbering.
 fn width_named(name: Bytes) -> Option<Width> =
   if name == b"U8" { Some({ bits: 8, signed: false }) }
   else if name == b"U16" { Some({ bits: 16, signed: false }) }
@@ -71,7 +53,6 @@ fn width_min(w: Width) -> Int = if w.signed { 0 - pow2(w.bits - 1) } else { 0 }
 
 fn width_max(w: Width) -> Int = if w.signed { pow2(w.bits - 1) - 1 } else { pow2(w.bits) - 1 }
 
-// A value as a width's own C type: the reference's `as_num`.
 fn as_num(v: V, w: Width) -> Bytes =
   match v.k {
     KNum(h) -> if h == w { v.c } else { bytes_concat_all([b"(", ctype(KNum(w)), b")(", v.c, b")"]) },
@@ -79,162 +60,80 @@ fn as_num(v: V, w: Width) -> Bytes =
     _ -> bytes_concat_all([b"(", ctype(KNum(w)), b")(", v.c, b")"]),
   }
 
-// One emitted value: the kind it is held at, and the C expression naming it.
+// An emitted value: the kind it is held at and the C expression naming it.
 pub type V = { k: Kind, c: Bytes, ty: Ty }
 
-// What the emitter knows about a value's shape. Only records need more than the
-// kind, and only so that a field name can become the index it is read at.
-// `TyOpaque` is a `Float` or a `Decimal`: a value an operator cannot read as an `Int`, so an
-// operator over one reaches the machine's own operator through the runtime instead.
+// `TyOpaque` is a `Float` or `Decimal`: operators on it go through the runtime, never through `Int`.
 pub type Ty = | TyOpen | TyRec(List<FieldTy>) | TyBytes | TyList | TyOpaque
 
-// A record's fields, in the order they were written. The *kind* matters as much
-// as the name: a scalar field is read into a register of its own kind and a
-// field of any other type stays the word it is, and reading every field as an
-// `Int` writes an unbox the reference does not.
+// Fields in written order; a field's kind decides whether reading it unboxes, so it must not default to `KInt`.
 pub type FieldTy = { name: Bytes, k: Kind, ty: Ty }
 
-// The emitter's state: the lines written so far and the next temporary's number.
-// The lines written so far, the next temporary's number, and the slots whose
-// word has already been unboxed.
-//
-// The last is not a cache for its own sake: the reference binds a parameter's
-// untagged value once and every later integer read of that slot names the same
-// temporary, so `(a + b) * (a - b)` unboxes twice and not four times. An emitter
-// that unboxed per read would answer the same and write different C.
-// `reads` is every slot read anywhere in the body, once per read. The release
-// rule counts over the whole body rather than over what has been emitted: the
-// emitter does not visit reads in the order the lowering marked them.
+// `conv`: slots already unboxed -- a parameter is unboxed once and later reads reuse that temporary.
+// `reads`: every slot read in the body, counted whole because reads are not emitted in the order they were marked.
 pub type Em = { out: List<Bytes>, n: Int, conv: List<Conv>, ind: Int, reads: List<Int>,
                 shapes: List<List<Bytes>>, built: List<Built>, module: Bytes, module_index: Int,
-                // Locals holding a count on something this body made and nothing
-                // else can name. A callee that takes one of these is handed the
-                // count rather than a duplicate of it.
+                // Locals holding a count only this body can name; a callee taking one is handed the count, not a duplicate.
                 made: List<Made>,
-                // The definitions of the module being emitted, with the kind each
-                // answers. A bare name that is not one of them is a builtin or an
-                // import, and this port resolves neither, so it refuses rather
-                // than mangling a guess.
+                // This module's definitions; any other bare name is a builtin or an import.
                 here: List<Def>,
                 imports: List<Imported>,
-                // The literals this body has met, in the order it met them. A
-                // body names the unit's tables by its own positions, so two
-                // occurrences of one literal share an index and two bodies with
-                // the same literal need not agree about where it sits.
+                // Literals in first-met order: a body indexes the unit's tables by its own positions.
                 consts: List<Lit>,
-                // Every constructor's program-wide name, in the order the tags
-                // are assigned. Handed in: a tag is a position in a table over
-                // the whole program, and this port sees one module.
+                // Every constructor's program-wide name; a tag is its index here.
                 ctors: List<Bytes>,
-                // The sub-functions this body has produced, and how many. A
-                // lambda's own code goes here and is written after the function
-                // that built the closure, which is where the reference puts it.
+                // Lambda sub-functions, written after the function that builds the closure.
                 extra: Bytes,
-                // The symbols this body's code table names: each lambda's entry, and each pure
-                // nullary definition's entry a constant is asked for.
+                // This body's code table: each lambda's entry and each pure nullary constant's entry.
                 lambdas: List<Bytes>,
-                // The name the sub-functions are numbered under, which is the
-                // *named* function's, not an enclosing lambda's.
+                // Sub-functions are numbered under the named function, not an enclosing lambda.
                 owner: Bytes,
-                // Every builtin's name, handed in, and the ones this body has
-                // met. A bare name that is neither this module's nor one of its
-                // imports is one of these, and there is no way to know which from
-                // one module's text.
                 builtins: List<Bytes>,
                 met: List<Bytes>,
-                // The field names this body has met, for the reads whose record
-                // shape it cannot see.
+                // Field names met, for reads whose record shape is unknown.
                 fields: List<Bytes>,
-                // Whether nothing in this function is emitted after the node
-                // being written. An update at the tail releases its base however
-                // many times the body reads it, because the later read the
-                // one-read guard protects against cannot be there.
-                //
-                // Preserved down a block's tail, into both arms of an `if` and
-                // every arm of a `match` -- only one of those runs. Cleared into
-                // a call's arguments, where a fused loop's body is emitted once
-                // and runs once per iteration, so "nothing after it" is true of
-                // the text and false of the execution.
+                // Nothing is emitted after the current node, so a tail update may release its base whatever its read count.
+                // Kept into block tails and `if`/`match` arms; cleared into call arguments, where a fused loop body runs repeatedly.
                 tail: Bool,
-                // Every definition this body calls, by program-wide name, as the reference's cache
-                // records it: a body kept between runs is checked against the set the fixpoint took.
+                // Program-wide names this body calls: a cached body is checked against this set.
                 calls: List<Bytes>,
-                // The first reason this body was refused, if it was. A refusal does not stop the
-                // emission: it poisons the state and emission runs out, so every refusal carries
-                // its reason to the top of the body and no signature had to change for it.
+                // The first refusal; emission runs on in a poisoned state, so no signature carries it.
                 refused: Option<Bytes>,
-                // A flat record built from locals is held back until something asks for its
-                // word, and the local it will land in is declared at the top of the body.
+                // Flat records built from locals, held back until their word is asked for; their locals are declared at the top.
                 deferred: List<Deferred>, rlocals: List<Bytes>,
-                // The effects this body performs and handles, under their program-wide names;
-                // the label a failing call inside a `handle` body jumps to, if it is inside one;
-                // and the effect names in scope, each with its program-wide name.
+                // `landing`: the label a failing call inside a `handle` body jumps to.
                 performs: List<Bytes>, handles: List<Bytes>, landing: Option<Bytes>, effects: List<EffectName>,
-                // The slots already released. `Owned` marks a *use* as the last
-                // one, and a body that hands a record to a call and then reads a
-                // field of it for a later argument has two reads marked that way.
-                // Releasing at both frees a record the first release gave back.
+                // Slots already released: two reads can both be marked `Owned`, and releasing at both double-frees.
                 released: List<Bytes>,
-                // The reuse-token widths this body has *used*, collected as it
-                // goes. The declarations are written afterwards and put in front,
-                // which is what the reference does -- a pre-pass that predicted
-                // them instead had to predict the release rule too, and the two
-                // disagreed on every body where a shape reached the emitter that
-                // the pass could not see.
+                // Reuse-token widths actually used, declared afterwards at the top: predicting them would duplicate the release rule.
                 toks: List<Int>,
-                // A rename is an alias, not a second object. `alias` follows a
-                // local back to the one it renames, and `by_root` charges each
-                // binding's reads to the object the local holds -- so an object
-                // wearing three names, each read once, counts three and not one.
-                //
-                // Counting a single name there says "one read, safe to release"
-                // about an object three other names still hold.
+                // `by_root` counts reads per object, not per name: an object with three names each read once has three reads.
                 alias: List<{ local: Bytes, root: Bytes }>,
                 by_root: List<{ root: Bytes, n: Int }>,
-                // Whether this body releases what it holds (ADR 0046). Off, every count is kept
-                // until the entry ends, which is the reference's rule and the text the ratchet
-                // compares. On, `made` is every local holding a count, `bound` the ones a slot
-                // names -- moved only at a read the lowering marked `Owned` -- and `pinned` the
-                // ones a fused loop's body may read but never move.
+                // Off, every count is held until the entry ends. On: `bound` are locals a slot names, moved only at
+                // a read marked `Owned`; `pinned` are ones a fused loop body may read but never move.
                 release: Bool, pinned: List<Bytes>, bound: List<Bytes> }
 
-// A definition of this module, with what a call of it answers. The *shape* as
-// well as the kind: a call whose answer is a record of known fields is where a
-// later field read gets its offset, and dropping it here is what sent those
-// reads through the runtime.
-// `pure` is the checker's word: an empty footprint and no constraint, which is what lets a
-// nullary call be answered from the constant table.
+// `ret_ty` keeps a record answer's fields so later reads get offsets; `pure` lets a nullary call come from the constant table.
 pub type Def = { name: Bytes, ret: Option<Kind>, ret_ty: Ty, pure: Bool, arity: Int }
 
-// A name another module exports and this one brought in by name. An imported
-// name lowers to a bare global, indistinguishable from a builtin, so the module's
-// own import list is the only thing that tells the two apart without resolving.
-// `defs` is the imported module's definitions, so a call across modules opens its answer to
-// the callee's declared type as a local call does; empty when the module was not in reach.
+// An imported name lowers like a builtin; only the import list tells them apart. `defs` is empty when the module is out of reach.
 pub type Imported = { name: Bytes, module: Bytes, defs: List<Def> }
 
-// One module's definitions, for the imports that name it.
 pub type ModDefs = { module: Bytes, defs: List<Def>, aliases: List<Alias> }
 
-// A `type` item that names a type: its parameters, and the type in its own module's scope.
+// A `type` alias: its parameters and the type in its own module's scope.
 pub type Alias = { name: Bytes, params: List<Bytes>, ty: TypeExpr }
 
-// A type variable an alias's argument bound, resolved where the argument was written.
+// A type variable an alias argument bound, resolved in the argument's scope.
 pub type Bound = { name: Bytes, k: Kind, ty: Ty }
 
-// A record this body built, and the values its fields were built from. A later
-// field read of it is that value: it is already in a register, and going to
-// memory for it would be the store, the load and the tag that building the
-// record in the first place is trying to avoid.
-//
-// Sound because the values are locals of this body, and a record that leaves the
-// body leaves through a name this table has no entry for.
+// A record this body built: a field read of it reuses the built value (sound: the values are this body's locals).
 pub type Built = { local: Bytes, names: List<Bytes>, vals: List<V> }
 
 pub type Deferred = { name: Bytes, shape: Int, n: Int, flags: Int, words: List<Bytes> }
 
-// A C local holding one count, and the block depth it is declared at: released at that
-// block's close unless spent first.
+// A C local holding one count, released at its block's close unless spent first.
 pub type Made = { name: Bytes, ind: Int }
 
 pub type EffectName = { written: Bytes, global: Bytes, ops: List<OpMode> }
@@ -243,18 +142,15 @@ pub type OpMode = { name: Bytes, write: Bool }
 
 pub type Conv = { slot: Int, k: Kind, c: Bytes, ty: Ty }
 
-// A parameter, as the emitter needs it: the C word arrives boxed and the
-// declared type says how to open it.
+// A parameter arrives boxed; its declared type says how to open it.
 pub type P = { name: Bytes, k: Kind, ty: Ty }
 
 pub type Out = { em: Em, v: V }
 
-// What a `match` arm's body becomes: an assignment to the match's answer local, or the loop's
-// own control when the match is a fused `iterate` step (`emit_step`).
+// Where a `match` arm's answer goes: the answer local, or a fused `iterate` step's loop control.
 pub type Sink = | ToValue(Bytes) | ToLoop({ state: Bytes, answer: Bytes, stop: Int, go: Int, depth: Int })
 
-// A line is pushed, and a body's text joined once: appending to one string would copy the
-// body so far for every line, which is quadratic in a heap that keeps what an entry lets go.
+// Lines are joined once at the end; appending to one string would be quadratic.
 fn line(em: Em, text: Bytes) -> Em =
   { out: push(em.out, bytes_concat_all([pad(em.ind), text, b"\n"])), n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, module_index: em.module_index, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
@@ -264,13 +160,7 @@ fn indent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind + 1
 
 fn outdent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind - 1, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, module_index: em.module_index, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
-// A branch leaves the enclosing scope with the temporaries it unboxed: they are
-// declared inside the C block and are gone at the brace. `conv` goes back to
-// what it was, or a later read names a dead variable.
-// Everything below this node is emitted before whatever follows it.
-// The arms of a `match` and the branches of an `if` are tails when the node is,
-// and they are reached *through* the scrutinee or the condition -- which are not.
-// Restoring the node's own answer is what makes an arm a tail again.
+// Restoring the node's own `tail` makes an arm a tail again after its scrutinee or condition.
 fn withtail(em: Em, t: Bool) -> Em =
   if em.tail == t { em } else {
     { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
@@ -289,6 +179,7 @@ fn notail(em: Em) -> Em =
       alias: em.alias, by_root: em.by_root, tail: false, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
   }
 
+// A branch's unboxed temporaries die at its closing brace, so `conv` must be restored after it.
 fn rescope(em: Em, conv: List<Conv>) -> Em = { out: em.out, n: em.n, conv: conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, module_index: em.module_index, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
 fn fresh(em: Em) -> { em: Em, name: Bytes } =
@@ -305,16 +196,12 @@ fn remember(em0: Em, slot: Int, v: V) -> Em = {
   { ..em1, conv: push(em1.conv, { slot: slot, k: v.k, c: v.c, ty: v.ty }) }
 }
 
-// A binding, which is what every intermediate value is: `<type> tN = <expr>;`.
 fn bind(em: Em, k: Kind, expr: Bytes) -> Out = {
   let f = fresh(em);
-  // A record held back is its local already: binding it is the name itself, and the number
-  // is spent as the reference spends it.
+  // A held-back record is already its local; the temporary number is still spent to keep numbering aligned.
   if fold(em.rlocals, false, |acc: Bool, r: Bytes| acc || r == expr) { { em: f.em, v: { k: k, c: expr, ty: TyOpen } } } else {
   let o = line(f.em, bytes_concat_all([ctype(k), b" ", f.name, b" = ", expr, b";"]));
-  // A binding that is only a rename carries the fields the record was built from
-  // with it. A block binds its tail, so without this the knowledge is lost at
-  // the first one -- which is immediately, since every `if` arm is a block.
+  // A rename keeps the fields the record was built from; without this the knowledge dies at the first block.
   let kept0 = match built_of(o, expr) {
     Some(b) -> remember_built(o, f.name, b.names, b.vals),
     None -> o,
@@ -331,8 +218,7 @@ fn bind(em: Em, k: Kind, expr: Bytes) -> Out = {
 fn deferred_of(em: Em, name: Bytes) -> Option<Deferred> =
   fold(em.deferred, None, |acc: Option<Deferred>, d: Deferred| if d.name == name { Some(d) } else { acc })
 
-// A record held back is built here, where its word is first asked for, and the guard keeps a
-// second asking from building it twice.
+// Built at the first demand for its word; the guard stops a second demand building it twice.
 fn materialise(em: Em, name: Bytes) -> Em =
   match deferred_of(em, name) {
     None -> em,
@@ -352,15 +238,13 @@ fn materialise(em: Em, name: Bytes) -> Em =
     },
   }
 
-// A value's word, with a record held back built first: the reference's `word`.
 fn word_of(em: Em, v: V) -> { em: Em, c: Bytes } =
   match v.k {
     KBoxed -> { em: materialise(em, v.c), c: v.c },
     _ -> { em: em, c: as_word(v) },
   }
 
-// The reads a body's counts are over: a lambda's body counts in its own window, its captures
-// already charged from outside.
+// A lambda body counts reads in its own window; its captures are charged outside.
 fn with_reads(em: Em, reads: List<Int>) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: reads, shapes: em.shapes,
     built: em.built, module: em.module, module_index: em.module_index, made: em.made, here: em.here, imports: em.imports,
@@ -412,10 +296,7 @@ fn note_deferred0(em: Em, d: Deferred) -> Em =
     deferred: push(em.deferred, d), rlocals: push(em.rlocals, d.name),
     performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
-// One record, from its sorted names, the words that fill it and the values those words came
-// from: the reference's `emit_record`. A record whose every field is a width or a `Bool` is
-// flat, and one built from locals is held back rather than built; any other is built now,
-// from a reuse token of its width when the body has one.
+// A flat record (all widths or `Bool`) built from locals is held back; others are built now, from a reuse token if one fits.
 fn build_record(em: Em, names: List<Bytes>, words: List<Bytes>, kinds: List<Kind>, vals: Option<List<V>>) -> Out = {
   let sh = shape_of(em, names);
   let n = len(names);
@@ -456,15 +337,13 @@ fn built_now(em: Em, names: List<Bytes>, words: List<Bytes>, shape: Int, n: Int,
   { em: note_made(kept, rec.v.c), v: { k: KBoxed, c: rec.v.c, ty: ty } }
 }
 
-// The same, keeping the shape the value already had. A rename that dropped it
-// would lose a record's field list at the first block boundary, and every `if`
-// arm is a block.
+// Like `bind`, keeping the value's shape so a record's fields survive block boundaries.
 fn bind_keeping(em: Em, k: Kind, ty: Ty, expr: Bytes) -> Out = {
   let o = bind(em, k, expr);
   { em: o.em, v: { k: o.v.k, c: o.v.c, ty: ty } }
 }
 
-// A local name: `t12`, `p0`, `q1`. Anything else is an expression.
+// A local name (`t12`, `p0`, `q1`) rather than an expression.
 fn is_local(e: Bytes) -> Bool =
   bytes_len(e) > 1
     && (bytes_at(e, 0) == 116 || bytes_at(e, 0) == 112 || bytes_at(e, 0) == 113)
@@ -506,17 +385,14 @@ fn reads_of_root(em: Em, local: Bytes) -> Int = {
 fn built_of(em: Em, local: Bytes) -> Option<Built> =
   fold(em.built, None, |acc: Option<Built>, b: Built| if b.local == local { Some(b) } else { acc })
 
-// A runtime helper hands back a word it owns. A *compiled* call does not count,
-// and the distinction is the reference's: a call's result is duplicated before
-// it is handed on, and only a helper's count is handed over.
+// Only a runtime helper's result hands over its count; a compiled call's result is duplicated before it is handed on.
 fn answers_owned(em: Em, expr: Bytes) -> Bool =
   (bytes_len(expr) > 3 && bytes_slice(expr, 0, 3) == b"rt_")
   || (em.release
       && ((bytes_len(expr) > 4 && bytes_slice(expr, 0, 4) == b"ply_" && calls_with_ctx(expr))
           || (bytes_len(expr) > 13 && bytes_slice(expr, 0, 13) == b"(ply_fits_imm")))
 
-// A compiled call: `ply_<name>(ctx, ...)`, told from a load or an immediate by what follows the
-// first parenthesis.
+// A compiled call `ply_<name>(ctx, ...)`, told from a load or immediate by what follows the first parenthesis.
 fn calls_with_ctx(expr: Bytes) -> Bool = {
   let p = bytes_scan_until(expr, 0, b"(", bytes_len(expr));
   p + 4 <= bytes_len(expr) && bytes_slice(expr, p, p + 4) == b"(ctx"
@@ -562,20 +438,17 @@ fn is_bound(em: Em, name: Bytes) -> Bool =
 fn is_pinned(em: Em, name: Bytes) -> Bool =
   fold(em.pinned, false, |acc: Bool, p: Bytes| acc || p == name)
 
-// A count a consumer may take in place: held by a local no slot names and no loop pins. A
-// slot's local is spent only by a read marked `Owned`, which moves it out under a name of its
-// own first.
+// A count a consumer may take in place: held by a local no slot names and no loop pins.
 fn spendable(em: Em, name: Bytes) -> Bool =
   is_made(em, name) && !is_bound(em, name) && !is_pinned(em, name)
 
-// A holder, under release only: the reference's text keeps every count until the entry ends.
+// Holders are tracked only under release; otherwise every count lives until the entry ends.
 fn note_holder(em: Em, name: Bytes) -> Em =
   if em.release { note_made(em, name) } else { em }
 
 fn note_bound(em: Em, name: Bytes) -> Em = { ..em, bound: push(em.bound, name) }
 
-// Every holder in scope, pinned for a fused loop's body: the text is read once and runs as
-// often as the loop does, so a mark that says "last use" is about the text.
+// Pinned for a fused loop body: its text runs once per iteration, so a "last use" mark is about text, not execution.
 fn pin_all(em: Em) -> Em =
   { ..em, pinned: fold(em.made, em.pinned, |acc: List<Bytes>, m: Made| push(acc, m.name)) }
 
@@ -583,15 +456,12 @@ fn with_pinned(em: Em, pinned: List<Bytes>) -> Em = { ..em, pinned: pinned }
 
 fn with_made(em: Em, made: List<Made>) -> Em = { ..em, made: made }
 
-// What may still be held after either of two paths: released at the scope's end, where the
-// path that spent it left it null.
+// Held after either of two paths; released at scope end, where the path that spent it left it null.
 fn union_made(a: List<Made>, b: List<Made>) -> List<Made> =
   fold(b, a, |acc: List<Made>, m: Made|
     if fold(acc, false, |seen: Bool, x: Made| seen || x.name == m.name) { acc } else { push(acc, m) })
 
-// Releases every holder declared at depth `from` or deeper and forgets the block's own. A
-// `break` names the loop's depth and keeps the enclosing blocks' holders for the paths that
-// stay.
+// Releases holders at depth `from` or deeper; a `break` passes the loop's depth.
 fn release_at(em: Em, from: Int) -> Em =
   if !em.release { em } else {
     let out: Em = fold(em.made, em, |acc: Em, m: Made|
@@ -599,12 +469,9 @@ fn release_at(em: Em, from: Int) -> Em =
     { ..out, made: fold(em.made, [], |acc: List<Made>, m: Made| if m.ind >= em.ind { acc } else { push(acc, m) }) }
   }
 
-// The close of a block that may have declared holders.
 fn close(em: Em) -> Em = line(outdent(release_at(em, em.ind)), b"}")
 
-// A slot's local at the read the lowering marked its last use: moved out under a name of its
-// own, which a consumer then takes, and nulled so the scope's release passes it by. A pinned
-// local stays, and a held-back record is built first.
+// At a slot's `Owned` read the local is moved to a fresh name and nulled, so the scope's release skips it.
 fn move_read(em: Em, own: Own, v: V) -> Out =
   if !em.release || own != Owned || v.k != KBoxed || !is_made(em, v.c) || is_pinned(em, v.c) { { em: em, v: v } } else {
     let b = match deferred_of(em, v.c) {
@@ -615,39 +482,33 @@ fn move_read(em: Em, own: Own, v: V) -> Out =
       v: { k: KBoxed, c: b.v.c, ty: v.ty } }
   }
 
-// A local a slot is about to name holds a count of its own: taken over from a temporary
-// already, or added to what another name still holds.
+// A local a slot will name must hold its own count: taken over from a temporary, or added.
 fn ensure_owned(em: Em, v: V) -> Em =
   if !em.release || v.k != KBoxed || is_made(em, v.c) { em } else {
     note_made(line(em, bytes_concat_all([b"ply_inc(", v.c, b");"])), v.c)
   }
 
-// `target = word;` where the target holds a count afterwards: a temporary's count moves, a
-// name still held elsewhere is held once more, and an expression answers a count of its own.
+// After `target = word;` the target holds a count: a temporary's moves, a shared name's is duplicated, an expression's is fresh.
 fn assign_owned(em: Em, target: Bytes, c: Bytes) -> Em =
   if !em.release { em }
   else if spendable(em, c) { line(spend_made(em, c), bytes_concat_all([c, b" = 0;"])) }
   else if is_local(c) { line(em, bytes_concat_all([b"ply_inc(", target, b");"])) }
   else { em }
 
-// A value nothing takes: a statement's, released where it is.
+// A statement's unused value, released where it is.
 fn drop_value(em: Em, v: V) -> Em =
   if em.release && v.k == KBoxed && spendable(em, v.c) {
     line(spend_made(em, v.c), bytes_concat_all([b"ply_dec(ctx, ", v.c, b"); ", v.c, b" = 0;"]))
   } else { em }
 
-// The word a function answers, owned by its caller: under release the count is taken or added
-// first, and everything the body still holds is released before the return.
+// The returned word is owned by the caller; under release everything else the body holds is released first.
 fn returned(em: Em, v: V) -> { em: Em, c: Bytes } =
   if !em.release { word_of(em, v) } else {
     let r = owned(em, v);
     { em: release_at(r.em, 0), c: r.v.c }
   }
 
-
-// A value collected into an aggregate: boxed, and held in a local declared
-// `Word` rather than by its kind's C type, because the array a list is built
-// from is an array of words.
+// Aggregate elements are held as `Word` locals: a list is built from an array of words.
 fn sets_bound(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<V>)
     -> Option<{ em: Em, vals: List<V> }> =
   if i >= len(xs) { Some({ em: em, vals: acc }) } else {
@@ -688,9 +549,7 @@ fn bind_word(em: Em, v: V) -> Out = {
     v: { k: KBoxed, c: f.name, ty: TyOpen } }
 }
 
-// A word a callee is about to take, held once more first: a callee that takes
-// will release, and the duplicate is what puts the count back. A scalar is an
-// immediate and holds no count, so there is nothing to take.
+// Duplicate a word before a callee takes it; scalars are immediates and hold no count.
 fn owned(em: Em, v: V) -> Out = {
   let spend = if em.release { spendable(em, v.c) } else { is_made(em, v.c) };
   let w = bind_word(if spend { spend_made(em, v.c) } else { em }, v);
@@ -702,9 +561,7 @@ fn owned(em: Em, v: V) -> Out = {
   }
 }
 
-// The check after any helper that can raise: a body that failed answers nothing.
-// Where the body is, stored before a call that can fail so what the runtime raises is placed.
-// A synthesized node has no place and stores none.
+// Stores the source place before a call that can fail; a synthesized node (empty span) has none.
 fn site(em: Em, s: Span) -> Em =
   if s.end <= s.start { em } else {
     line(em, bytes_concat_all([b"PLY_SITE(ctx, ", num(em.module_index), b", ", num(s.start), b", ", num(s.end), b");"]))
@@ -713,13 +570,10 @@ fn site(em: Em, s: Span) -> Em =
 fn check(em: Em) -> Em =
   match em.landing {
     None -> line(em, b"if (ctx->failed) return 0;"),
-    // Inside a `handle` body a failing call lands at the handle, which pops its frame, passes
-    // an error on, and catches an unwind aimed at it.
+    // Inside a `handle` body a failure jumps to the handle, which pops its frame.
     Some(l) -> line(em, bytes_concat_all([b"if (ctx->failed) goto ", l, b";"])),
   }
 
-// A word as the sixty-four bits inside it, which is where integer arithmetic
-// happens. Already-`Int` values are themselves.
 fn as_int(v: V) -> Bytes =
   match v.k {
     KInt -> v.c,
@@ -729,26 +583,12 @@ fn as_int(v: V) -> Bytes =
                                 b") : rt_unbox_int_p(ctx, ", v.c, b"))"]),
   }
 
-// The other direction, for a value leaving the body.
-// A field's index is its place among the record's names *sorted*, which is the
-// order the checker settles on -- `{ z: Int, a: Int }` reads `.z` at 1. Nothing
-// is sorted to answer that: the index is how many of the names sort below it.
-// The one release this port makes: a record read to its last use gives its
-// memory back through a reuse token of its width.
-//
-// The guards are the reference's, and each of them is there because leaving it
-// out broke the self-hosted front end. The base must be a *bare variable* marked
-// as its own last use, and the object must have exactly one name reading it --
-// counted over the whole body, because the emitter does not visit reads in the
-// order the lowering marked them, and a body that hands a record on and also
-// reads a field of it would otherwise release at whichever read came second and
-// read the freed record through the other.
+// Releases a record at its last use into a reuse token. Guards: the base is a bare variable marked `Owned`, and
+// exactly one name reads the object, counted over the whole body since reads are not emitted in marking order.
 fn release_base(em: Em, base: Code, b: V, params: List<P>) -> Option<Em> =
   release_from(em, base, b, params, false)
 
-// `at_tail` is the reference's `Site::TailUpdate`: it skips the one-read guard,
-// because nothing is emitted after the node and the later read that guard exists
-// to protect against cannot be there.
+// `at_tail` skips the one-read guard: nothing is emitted after the node, so no later read can exist.
 fn release_from(em: Em, base: Code, b: V, params: List<P>, at_tail: Bool) -> Option<Em> =
   if em.release {
     if base_owned(base) && spendable(em, b.c) { Some(release_holder(spend_made(em, b.c), b)) } else { Some(em) }
@@ -757,15 +597,12 @@ fn release_from(em: Em, base: Code, b: V, params: List<P>, at_tail: Bool) -> Opt
     Owned -> match base.node {
       NVar(v) -> match v.slot {
         None -> Some(em),
-        // At most once per binding -- keyed on the object the local holds, as the reference
-        // keys it, so a name each arm of a `match` binds afresh releases in each -- and only
-        // where the binding is read once.
+        // At most once per object (not per name), and only when it is read once.
         Some(_) -> if (!at_tail && reads_of_root(em, b.c) != 1)
                       || fold(em.released, false, |acc: Bool, r: Bytes| acc || r == root_of(em, b.c)) { Some(em) }
                    else {
           let em = note_released(em, root_of(em, b.c));
-          // A record held back dies without ever having been built, and holds no counts; guarded
-          // rather than skipped, because another path may have wanted the word and built it.
+          // A held-back record dies unbuilt; guarded, since another path may have built it.
           match deferred_of(em, b.c) {
             Some(d) -> Some(line(note_tok(em, d.n), bytes_concat_all([
               b"if (", b.c, b") { if (tok", num(d.n), b" == 0) { tok", num(d.n), b" = ply_reset_flat(", b.c,
@@ -786,15 +623,13 @@ fn release_from(em: Em, base: Code, b: V, params: List<P>, at_tail: Bool) -> Opt
     _ -> Some(em),
   } }
 
-// A base a slot names, at the read the lowering marked its last use.
 fn base_owned(base: Code) -> Bool =
   match base.own {
     Owned -> match base.node { NVar(v) -> v.slot != None, _ -> false },
     _ -> false,
   }
 
-// A holder's count let go, its cells kept as a reuse token where the shape is known, and the
-// local nulled so the scope's release passes it by.
+// Releases a holder's count, keeping its cells as a reuse token when the shape is known, and nulls the local.
 fn release_holder(em: Em, b: V) -> Em =
   match deferred_of(em, b.c) {
     Some(d) -> line(note_tok(em, d.n), bytes_concat_all([
@@ -810,8 +645,7 @@ fn release_holder(em: Em, b: V) -> Em =
     },
   }
 
-// A field forwarded from the values a record was built of, when the record itself is about to
-// be released: held once more first, as `rt_field` moves a field out before it lets the base go.
+// A forwarded field of a record about to be released is duplicated first, as `rt_field` does.
 fn secure_field(em: Em, base: Code, b: V, v: V) -> Out =
   if !em.release || v.k != KBoxed || !base_owned(base) || !spendable(em, b.c) { { em: em, v: v } } else {
     let t = bind_word_of(em, v.c);
@@ -826,8 +660,7 @@ fn through_caps(reads: List<Int>, caps: List<Cap>) -> List<Int> =
       None -> acc,
     })
 
-// Every slot read in the tree, once per read, lambdas and clause bodies
-// included: a name a barrier copies in is still a read of the object.
+// Every slot read, lambdas and clause bodies included: a name a barrier copies in is still a read.
 fn slots_read(c: Code) -> List<Int> =
   match c.node {
     NVar(v) -> match v.slot { Some(s) -> [s], None -> [] },
@@ -854,9 +687,7 @@ fn slots_read(c: Code) -> List<Int> =
     NPerform(p) -> all_read(p.args),
     NCell(c2) -> concat(slots_read(c2.init), slots_read(c2.body)),
     NRegion(r) -> slots_read(r.body),
-    // A lambda's body reads in a window of its own: a read of a capture there is a read of
-    // the object it copies, in the enclosing window's numbering, and a read of the lambda's
-    // own parameter is of nothing here. The copy itself is not a read.
+    // A capture read inside a lambda is a read of the object it copies; the lambda's own parameter is not a read here.
     NLambda(l) -> through_caps(slots_read(l.body), l.caps),
     NSim(x) -> concat(map(x.caps, |c2: Cap| c2.src), slots_read(x.body)),
     NHandle(h) -> concat(slots_read(h.body), concat(
@@ -871,9 +702,6 @@ fn all_read(xs: List<Code>) -> List<Int> =
 fn concat(a: List<Int>, b: List<Int>) -> List<Int> =
   fold(b, a, |acc: List<Int>, x: Int| push(acc, x))
 
-// The shape's index in this body's own table, added on first use. A body names
-// the unit's tables by its own positions, which is what makes one body's text
-// comparable at all.
 fn opaque_from_table(em: Em, l: Lit) -> Out = {
   let o = from_table(em, l);
   { em: o.em, v: { k: KBoxed, c: o.v.c, ty: TyOpaque } }
@@ -885,20 +713,14 @@ fn from_table(em: Em, l: Lit) -> Out = {
   { em: check(o.em), v: o.v }
 }
 
-// Every occurrence takes the next index, and two occurrences of one literal do
-// **not** share one. A shape is interned and a constant is not, which reads as an
-// inconsistency and is what the reference does: `ledger.journal` writes the same
-// literal twice and the two are `@@c2@@` and `@@c4@@`.
+// Every occurrence takes a new index: constants are not interned, unlike shapes.
 fn const_of(em: Em, l: Lit) -> { em: Em, i: Int } =
   { em: { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads,
           shapes: em.shapes, built: em.built, module: em.module, module_index: em.module_index, made: em.made,
           here: em.here, imports: em.imports, consts: push(em.consts, l), ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound },
     i: len(em.consts) }
 
-// A capital first letter, after any module binder.
-// The tag a constructor takes: its position in the table, found by the name the
-// occurrence wrote. A bare name is this module's; a qualified one names another.
-// A constructor's tag: the module's own, a qualified one, or one an import brought in bare.
+// A constructor's tag: this module's own, a qualified one, or one an import brought in bare.
 fn tag_of(em: Em, name: Bytes) -> Option<Int> = {
   let want = match qualified(name) {
     Some(q) -> match from_import(em.imports, q.binder) {
@@ -950,8 +772,7 @@ fn opened_to(em: Em, v: V, d: { k: Option<Kind>, ty: Ty }) -> Out =
     Some(KInt) -> bind(em, KInt, as_int(v)),
     Some(KBool) -> bind(em, KBool, as_bool(v)),
     Some(KNum(w)) -> bind(em, KNum(w), as_num(v, w)),
-    // A word, but not a shapeless one: the callee's declared type says what it
-    // holds, and a field read of it can then be a load rather than a search.
+    // The callee's declared type makes a later field read a load rather than a search.
     _ -> { em: em, v: { k: v.k, c: v.c, ty: d.ty } },
   }
 
@@ -959,8 +780,7 @@ fn ret_of(here: List<Def>, name: Bytes) -> { k: Option<Kind>, ty: Ty } =
   fold(here, { k: None, ty: TyOpen }, |acc: { k: Option<Kind>, ty: Ty }, d: Def|
     if d.name == name { { k: d.ret, ty: d.ret_ty } } else { acc })
 
-// A nullary name the constant table answers: a definition of this module or of an imported one,
-// published pure, whose declared return is a word. The program-wide name and the type it answers.
+// A nullary pure definition (here or imported) returning a word is answered from the constant table.
 fn constant_of(em: Em, name: Bytes) -> Option<{ full: Bytes, ty: Ty }> =
   if fold(em.here, false, |acc: Bool, h: Def| acc || h.name == name) {
     if is_pure(em.here, name) && ret_of(em.here, name).k == Some(KBoxed)
@@ -977,20 +797,7 @@ fn constant_of(em: Em, name: Bytes) -> Option<{ full: Bytes, ty: Ty }> =
 fn is_pure(here: List<Def>, name: Bytes) -> Bool =
   fold(here, false, |acc: Bool, d: Def| if d.name == name { d.pure } else { acc })
 
-// The builtins the reference does not simply call: four expanded in place around
-// a load, and the joins, which it fuses over a list literal rather than building
-// the list and joining it.
-// `fold(xs, init, |a, x| ..)` with the callback written out: the reference runs
-// the loop itself rather than handing the closure to `rt_fold`, so the closure is
-// built, called once per element, and released at the end.
-//
-// The list is read through `rt_list_at_p` and its length through the *builtin*,
-// not through the inline length beside it -- the fused loop asks the same
-// question a different way, and matching means asking it the reference's way.
-// A definition of arity two that `f` names directly, with the C function it became: a fold
-// over one calls it straight, with no closure and no dispatch. The reference also asks
-// whether the unit took the definition; a body naming one the unit does not hold is refused
-// at the seam, so the answer here is the same.
+// A definition of arity two that `f` names directly: a fold over it calls it straight, with no closure.
 fn nameable_step(em: Em, f: Code) -> Option<{ full: Bytes, c: Bytes }> =
   match f.node {
     NVar(fv) -> match fv.slot {
@@ -1003,8 +810,6 @@ fn nameable_step(em: Em, f: Code) -> Option<{ full: Bytes, c: Bytes }> =
     _ -> None,
   }
 
-// The definition a bare or qualified name resolves to -- of this module, or brought in from
-// another -- with its program-wide name, the C function it became, and its arity.
 fn def_of(em: Em, name: Bytes) -> Option<{ full: Bytes, c: Bytes, arity: Int }> =
   if is_ctor_name(name) { None } else {
     let target = match qualified(name) {
@@ -1029,10 +834,7 @@ fn def_of(em: Em, name: Bytes) -> Option<{ full: Bytes, c: Bytes, arity: Int }> 
     }
   }
 
-// `bytes_position(b, from, p)` is a loop over the bytes calling `p` until it answers `true`:
-// through the runtime it suspends at the first call, which a native frame cannot resume, so
-// under release the loop is emitted into the body. The reference calls the runtime, and the
-// reference's text keeps that call.
+// Under release `bytes_position` is a loop in the body: the runtime's would suspend, which a native frame cannot resume.
 fn position_call(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: Span) -> Option<Out> =
   if !em.release || name != b"bytes_position" || len(args) != 3 { None } else {
     match tag_of(em, b"Some") {
@@ -1058,8 +860,7 @@ fn position_call(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: S
                         Some(pv) -> {
                           let po = owned(pv.em, pv.v);
                           let bi = builtin_of(po.em, b"bytes_position");
-                          // A start past the end, or bytes that are not bytes: the runtime's own
-                          // call raises the machine's diagnostic before it would suspend.
+                          // Bad input goes to the runtime's own call, which raises before it would suspend.
                           let guard = line(site(bi.em, span), bytes_concat_all([
                             b"if (ply_is_imm(", bo.v.c, b") || ply_obj(", bo.v.c, b")->kind != 10 || (uint64_t)", from.v.c,
                             b" > (uint64_t)ply_obj(", bo.v.c, b")->len) { Word a[3]; a[0] = ", bo.v.c, b"; a[1] = ply_imm(", from.v.c,
@@ -1094,9 +895,7 @@ fn position_call(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: S
     }
   }
 
-// `iterate` over a one-parameter lambda is the loop the reference emits into the body, which
-// this port has not read; over anything else it is the runtime's helper, as the reference
-// calls it.
+// `iterate` over a one-parameter lambda is fused into the body; anything else calls the runtime's helper.
 fn iterate_call(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: Span) -> Option<Out> =
   if name != b"iterate" || len(args) != 3 { None } else {
     match list_at(args, 2) {
@@ -1108,12 +907,7 @@ fn iterate_call(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: Sp
     }
   }
 
-// `iterate` over a one-parameter lambda is the loop, emitted into the body rather than called
-// through the runtime: `iterate` *is* the loop in this language, so a tier that sent it through
-// a callback would be sending every loop through one. The lambda's body runs in a window of
-// its own -- its parameter is the state, its captures are the values they copy -- and a body
-// that answers `Stop` or `Continue` directly in every arm is written as the loop's own
-// assignments; any other body is called and its answer's tag is tested.
+// A step answering `Stop`/`Continue` directly in every arm becomes the loop's assignments; any other is called and its tag tested.
 fn fused_iterate(em: Em, args: List<Code>, l: { params: Int, size: Int, caps: List<Cap>, body: Code }, params: List<P>, span: Span) -> Option<Out> =
   match tag_of(em, b"Stop") {
     None -> Some(refused(em, b"`iterate` with no `Stop` and `Continue` in the program")),
@@ -1141,8 +935,6 @@ fn fused_iterate(em: Em, args: List<Code>, l: { params: Int, size: Int, caps: Li
                   let guarded = line(line(site(opened, span), bytes_concat_all([
                     b"if (", left.name, b" <= 0) { rt_iterate_bad_p(ctx, 0, ", bud, b"); return 0; }"])),
                     bytes_concat_all([left.name, b" -= 1;"]));
-                  // The lambda's window: its captures as the values they copy, its parameter as
-                  // the state, held under a name of its own.
                   match fold(l.caps, Some([]), |acc: Option<List<Conv>>, c: Cap| match acc {
                       None -> None,
                       Some(w) -> match conv_of(guarded, c.src) {
@@ -1158,10 +950,7 @@ fn fused_iterate(em: Em, args: List<Code>, l: { params: Int, size: Int, caps: Li
                     }) {
                     None -> Some(refused(em, b"a capture this port has not bound")),
                     Some(window) -> {
-                      // The body's counts are the lambda's own: its parameter's reads are of the
-                      // state, and a capture's were charged to its object outside.
-                      // Everything held outside the loop is pinned: the body reads it as often as
-                      // the loop runs. The state's rename is the iteration's own holder.
+                      // Everything held outside the loop is pinned: the body reads it once per iteration.
                       let held = bind_keeping(with_reads(rescope(pin_all(guarded), window), slots_read(l.body)), KBoxed, sv.v.ty, state.name);
                       let inner = remember(note_holder(held.em, held.v.c), 0, held.v);
                       let body = if fusable_step(inner, l.body) {
@@ -1204,7 +993,6 @@ fn fused_iterate(em: Em, args: List<Code>, l: { params: Int, size: Int, caps: Li
     },
   }
 
-// A step body that answers `Stop` or `Continue` directly in every arm.
 fn fusable_step(em: Em, c: Code) -> Bool =
   match c.node {
     NApp(a) -> len(a.args) == 1 && match a.func.node {
@@ -1223,8 +1011,7 @@ fn fusable_step(em: Em, c: Code) -> Bool =
     _ -> false,
   }
 
-// The loop's own assignments for a step that answers a constructor directly: `Stop(x)` sets the
-// answer and breaks, `Continue(x)` sets the state.
+// `Stop(x)` sets the answer and breaks; `Continue(x)` sets the state.
 fn emit_step(em: Em, c: Code, state: Bytes, answer: Bytes, stop: Int, go: Int, params: List<P>, depth: Int) -> Option<Em> =
   match c.node {
     NApp(a) -> match list_at(a.args, 0) {
@@ -1235,7 +1022,7 @@ fn emit_step(em: Em, c: Code, state: Bytes, answer: Bytes, stop: Int, go: Int, p
           let w = word_of(v.em, v.v);
           let which = match a.func.node { NVar(fv) -> tag_of(em, fv.name), _ -> None };
           if which == Some(stop) {
-            // The loop's holders go before the `break` leaves their block.
+            // The loop's holders are released before the `break` leaves their block.
             Some(line(release_at(assign_owned(line(w.em, bytes_concat_all([answer, b" = ", w.c, b";"])), answer, w.c), depth), b"break;"))
           } else {
             Some(assign_owned(line(w.em, bytes_concat_all([state, b" = ", w.c, b";"])), state, w.c))
@@ -1304,14 +1091,9 @@ fn fused_fold(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: Span
                 let raw = bind(bi.em, KBoxed, bytes_concat_all([
                   b"rt_builtin_p(ctx, @@b", num(bi.i), b"@@, (Word)(intptr_t)", arr.name, b", 1)"]));
                 let n = bind(check(raw.em), KInt, as_int(raw.v));
-                // A function the unit compiled is called straight, per element. Anything else
-                // is held as a value, evaluated once outside the loop rather than per element:
-                // `rt_call` takes its callee, so each iteration hands it a count of its own and
-                // the loop lets go of the last one at the end.
+                // A compiled function is called straight per element; anything else is evaluated once outside the loop, and each iteration hands `rt_call` its own count.
                 let step = nameable_step(n.em, f);
-                // The reference builds the closure before it evaluates the seed; the machine
-                // evaluates the seed first, and under release the order is the machine's: a
-                // capture the closure takes at its last use is null once the closure is built.
+                // Under release the seed is evaluated before the closure is built: a capture taken at its last use is null afterwards.
                 let ordered = if n.em.release {
                   match expr(notail(n.em), init, params) {
                     None -> None,
@@ -1338,9 +1120,7 @@ fn fused_fold(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: Span
                     None -> None,
                     Some(co) -> match expr(notail(co.em), init, params) {
                       None -> None,
-                      // The accumulator's word, *not* held once more: the loop hands it to the
-                      // closure and takes back what the closure answers, so the count it starts
-                      // with is the one it ends with.
+                      // The accumulator is not duplicated: the loop hands its count to the closure and takes back the answer's.
                       Some(iv) -> { let acc = bind_word(iv.em, iv.v); Some({ em: acc.em, co: co.v, acc: acc.v }) },
                     },
                   }
@@ -1387,13 +1167,7 @@ fn fused_fold(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: Span
     }
   }
 
-// The builtins the reference expands in place where the declaration fixes the
-// kind: with nothing to test, a length is the header's own field and a byte is a
-// bounds test around a load, with the runtime call as the out-of-range arm.
-//
-// `bytes_u32_le` is the fourth of the family and is not here: it reads four bytes
-// through a `memcpy` and answers a `U32`, which is a width this port has no kind
-// for.
+// Builtins expanded in place where the declaration fixes the kind: a length is the header's field, a byte a bounds-tested load.
 fn inline_len(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: Span) -> Option<Out> =
   if name == b"bytes_at" && len(args) == 2 { inline_at(em, args, params, false, span) }
   else if name == b"bytes_u32_le" && len(args) == 2 { inline_at(em, args, params, true, span) }
@@ -1422,7 +1196,6 @@ fn inline_len(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: Span
 fn is_wrap(name: Bytes) -> Bool =
   name == b"wrap_add" || name == b"wrap_sub" || name == b"wrap_mul" || name == b"rotr"
 
-// `u8_of_int` and the seven beside it, by the width they convert into.
 fn of_int_width(name: Bytes) -> Option<Width> =
   if name == b"u8_of_int" { width_named(b"U8") } else if name == b"u16_of_int" { width_named(b"U16") }
   else if name == b"u32_of_int" { width_named(b"U32") } else if name == b"u64_of_int" { width_named(b"U64") }
@@ -1430,7 +1203,6 @@ fn of_int_width(name: Bytes) -> Option<Width> =
   else if name == b"i32_of_int" { width_named(b"I32") } else if name == b"i64_of_int" { width_named(b"I64") }
   else { None }
 
-// `int_of_u8` and the seven beside it, by the width they convert from.
 fn int_of_width(name: Bytes) -> Option<Width> =
   if name == b"int_of_u8" { width_named(b"U8") } else if name == b"int_of_u16" { width_named(b"U16") }
   else if name == b"int_of_u32" { width_named(b"U32") } else if name == b"int_of_u64" { width_named(b"U64") }
@@ -1438,9 +1210,7 @@ fn int_of_width(name: Bytes) -> Option<Width> =
   else if name == b"int_of_i32" { width_named(b"I32") } else if name == b"int_of_i64" { width_named(b"I64") }
   else { None }
 
-// The wrapping arithmetic and the conversions over a carried width, in place; over a
-// sixty-four-bit width or an operand of no width, the runtime's call over the values already
-// evaluated, as the reference falls back.
+// Wrapping arithmetic and conversions over a carried width, in place; otherwise the runtime's call on the evaluated values.
 fn width_builtin(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: Span) -> Option<Out> =
   if !((is_wrap(name) && len(args) == 2) || ((of_int_width(name) != None || int_of_width(name) != None) && len(args) == 1)) { None } else {
     match args_evaled(em, args, params, 0, []) {
@@ -1489,10 +1259,7 @@ fn width_builtin(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: S
     }
   }
 
-// `len`, `bytes_len` or `bytes_at` over a value whose kind the declaration does not fix: a
-// kind test, with the header's own field (or the byte, under a bounds test) in the fast arm
-// and the runtime's call in the slow one -- which is where a value of the wrong kind is
-// caught, with the interpreter's own diagnostic.
+// A kind test: the header's field (or a bounds-tested byte) fast, the runtime's call slow, which raises on a wrong kind.
 fn kind_tested(em: Em, name: Bytes, v: V, index: Option<V>) -> Out = {
   let t = bind(em, KBoxed, as_word(v));
   let out = fresh(t.em);
@@ -1534,8 +1301,7 @@ fn kind_tested(em: Em, name: Bytes, v: V, index: Option<V>) -> Out = {
   { em: close(body), v: { k: KInt, c: out.name, ty: TyOpen } }
 }
 
-// `bytes_concat_all([a, b, ..])` joins the pieces without building the list; over anything
-// else it is the runtime's call.
+// `bytes_concat_all([a, b, ..])` joins the pieces without building the list.
 fn inline_join(em: Em, args: List<Code>, params: List<P>, span: Span) -> Option<Out> =
   match list_at(args, 0) {
     None -> None,
@@ -1558,10 +1324,7 @@ fn inline_join(em: Em, args: List<Code>, params: List<P>, span: Span) -> Option<
     },
   }
 
-// `bytes_at` and `bytes_u32_le` share everything but their width: one byte read
-// with a bounds test, or four read through a `memcpy` -- which is how a C
-// compiler is told to emit an unaligned load, and lowers to one instruction
-// rather than a call. Over bytes the declaration does not fix, the runtime's call.
+// `bytes_u32_le` reads four bytes through `memcpy`, which C compilers lower to one unaligned load.
 fn inline_at(em: Em, args: List<Code>, params: List<P>, wide: Bool, span: Span) -> Option<Out> =
   match list_at(args, 0) {
     None -> None,
@@ -1569,14 +1332,12 @@ fn inline_at(em: Em, args: List<Code>, params: List<P>, wide: Bool, span: Span) 
       None -> None,
       Some(i0) -> match expr(notail(em), b0, params) {
         None -> None,
-        // The bytes are read before the index and bound after it: `bytes_at(b, bytes_len(b) - 1)`
-        // reads `b` in the index at its last use, and a slot moved there is null here.
+        // The bytes are read before the index and bound after: the index may read `b` at its last use and null it.
         Some(bv0) -> {
           let bv = secure_across(bv0.em, bv0.v, i0, params);
           match expr(notail(bv.em), i0, params) {
           None -> None,
-          // The kind-tested arm reads one byte; `bytes_u32_le` over bytes the declaration does
-          // not fix is the runtime's call, which reads four.
+          // Over bytes of unfixed kind, `bytes_u32_le` is the runtime's call.
           Some(iv0) -> {
             let iv = { em: site(iv0.em, span), v: iv0.v };
             if bv.v.ty != TyBytes {
@@ -1614,15 +1375,11 @@ fn is_inlined(name: Bytes) -> Bool =
   name == b"len" || name == b"bytes_len" || name == b"bytes_at" || name == b"bytes_u32_le"
     || name == b"bytes_concat_all"
 
-// The ones the reference does not answer with a plain call to the runtime.
-// `fold` is fused where its callback is written out, and `map_fold` and
-// `iterate` are shapes this port has not read.
+// Callback builtins that are not a plain runtime call: `fold` may fuse, `iterate` may loop in place.
 fn is_callback(name: Bytes) -> Bool =
   name == b"fold" || name == b"iterate"
 
-// The index a builtin takes in this body's own table, added on first use. Two
-// calls of one builtin share it, which is what the reference's table does and
-// what a *constant* deliberately does not.
+// Calls of one builtin share an index; constants deliberately do not.
 fn builtin_of(em: Em, name: Bytes) -> { em: Em, i: Int } =
   match fold(range(0, len(em.met)), None, |acc: Option<Int>, i: Int|
           match list_at(em.met, i) {
@@ -1638,9 +1395,7 @@ fn builtin_of(em: Em, name: Bytes) -> { em: Em, i: Int } =
                i: len(em.met) },
   }
 
-// The helper that answers a builtin directly, where one does. Transcribed from
-// `c/emit.rs`'s table of the same name; a builtin with no entry here is refused
-// rather than sent down the generic path, which needs the unit's builtin table.
+// A builtin missing here is refused rather than sent down the generic path.
 fn direct_helper(name: Bytes, args: Int) -> Option<Bytes> =
   if name == b"push" && args == 2 { Some(b"rt_push_p") }
   else if name == b"map_insert" && args == 3 { Some(b"rt_map_insert_p") }
@@ -1654,32 +1409,13 @@ fn direct_helper(name: Bytes, args: Int) -> Option<Bytes> =
   else if name == b"bytes_scan_until" && args == 4 { Some(b"rt_bytes_scan_until_p") }
   else if name == b"list_at" && args == 2 { Some(b"rt_list_index_p") }
   else if name == b"list_set" && args == 3 { Some(b"rt_list_set_p") }
-  // `map` and `filter` hand the closure to the runtime, which walks the list.
-  // `fold` does **not**: it is fused into the body, and `fused_fold` is why it is
-  // absent here.
+  // `fold` is absent: it is fused into the body (`fused_fold`).
   else if name == b"map" && args == 2 { Some(b"rt_map_p") }
   else if name == b"filter" && args == 2 { Some(b"rt_filter_p") }
   else if name == b"map_fold" && args == 3 { Some(b"rt_map_fold_p") }
-  // `map`, `filter` and `fold` are deliberately absent, and it is not an
-  // oversight in the table they were copied from. Handed a *literal* lambda the
-  // reference does not call a helper at all: it fuses the loop into the body and
-  // the closure is never built. Routing them to `rt_map_p` and the two beside it
-  // emitted a call where the reference emitted a loop, over eighteen bodies.
   else { None }
 
-// A **builtin's** arguments: every one evaluated first, and only then each held
-// once more.
-//
-// Two passes rather than one, and the order is observable: interleaving them
-// puts the duplicate of the first argument between the first argument's own
-// evaluation and the second's, and the reference writes it after both. A
-// *compiled* call is the other way round -- `args_one_pass` below -- and the
-// corpus says so at `std.json.b64_three` and `std.db.in_failed_txn`, one of
-// each.
-// `opaque` says whether any argument is a `Float` or `Decimal`: a builtin's answer over one
-// stays opaque, so an operator downstream reaches the runtime rather than reading it as an `Int`.
-// A builtin's arguments for a helper of its own: evaluated, the site stored, then each held
-// once more -- the reference's order, which stores the site before it holds anything.
+// Two passes: every argument evaluated, the site stored, then each duplicated; a compiled call interleaves (`args_one_pass`).
 fn args_owned_at(em: Em, xs: List<Code>, params: List<P>, span: Span)
     -> Option<{ em: Em, names: List<Bytes> }> =
   match args_evaled(em, xs, params, 0, []) {
@@ -1698,13 +1434,9 @@ fn args_owned(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<Bytes>)
     Some(w) -> Some({ em: w.em, names: w.names }),
   }
 
-// A builtin with no helper of its own goes through the runtime, under this body's own index
-// for it: every value held once more, the array they are read out of, then the call. The
-// answer is opaque when any argument was, which is what keeps `Float` arithmetic out of the
-// inline operators.
+// A builtin with no helper goes through the runtime by this body's index for it; the answer is opaque when any argument was.
 fn builtin_call(em: Em, name: Bytes, vals: List<V>) -> Out = {
-  // A conversion into a width no register carries answers a word the operators must not
-  // unbox as an `Int`: opaque, like a `Float`, so what follows it is the runtime's.
+  // A conversion into an uncarried width answers a word operators must not unbox as `Int`.
   let widened = match of_int_width(name) { Some(t) -> !carried(t), None -> false };
   let opaque = widened || fold(vals, false, |acc: Bool, v: V| acc || v.ty == TyOpaque);
   let w = fold(vals, { em: em, names: [] }, |a: { em: Em, names: List<Bytes> }, v: V| {
@@ -1735,9 +1467,7 @@ fn args_owned_typed(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<B
     },
   }
 
-// A call through the runtime of whatever the callee evaluates to: it may be a lambda of this
-// unit, a compiled function used as a value, or something the machine made. The callee is
-// held once more, then each argument as it is evaluated.
+// Whatever the callee evaluates to, called through the runtime: the callee is duplicated, then each argument as evaluated.
 fn call_value(em: Em, func: Code, args: List<Code>, params: List<P>, span: Span) -> Option<Out> =
   match expr(notail(em), func, params) {
     None -> None,
@@ -1757,9 +1487,7 @@ fn call_value(em: Em, func: Code, args: List<Code>, params: List<P>, span: Span)
     },
   }
 
-// The slots a lambda copies in, each held once more for the closure. A parameter the
-// prologue did not open is not in the window and is read as its own word, as a variable
-// read of it is.
+// A parameter the prologue did not open is outside the window and read as its own word.
 fn caps_owned(em: Em, cs: List<Cap>, params: List<P>, i: Int, acc: List<Bytes>)
     -> Option<{ em: Em, names: List<Bytes> }> =
   if i >= len(cs) { Some({ em: em, names: acc }) } else {
@@ -1788,13 +1516,8 @@ fn caps_owned(em: Em, cs: List<Cap>, params: List<P>, i: Int, acc: List<Bytes>)
     }
   }
 
-// A lambda's own function. Its C parameters are the captures first and then its
-// own, all words: it has no declared types, so nothing is opened at entry the
-// way a named function's `Int` is.
-// The tables are the *unit's*, not the body's, so what the lambda meets keeps
-// counting from what the function that builds it met, and what it adds is
-// carried back out. Emitting it against a copy numbered a second body's
-// constants and builtins from zero.
+// A lambda's C parameters are its captures then its own, all words, none opened at entry.
+// It continues the unit's tables from its builder and hands additions back; a fresh copy would renumber from zero.
 fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>, body: Code })
     -> Option<{ text: Bytes, extra: Bytes, met: List<Bytes>, consts: List<Lit>, shapes: List<List<Bytes>>, fields: List<Bytes>, lambdas: List<Bytes>, calls: List<Bytes>, performs: List<Bytes>, handles: List<Bytes>, refused: Option<Bytes> }> = {
   let n = len(l.caps) + l.params;
@@ -1807,10 +1530,7 @@ fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>
     |acc: List<Conv>, j: Int|
       push(acc, { slot: j, k: KBoxed, c: bytes_concat(b"q", num(len(l.caps) + j)), ty: TyOpen }));
   let reads = slots_read(l.body);
-  // The tables are the body's, continued: a lambda's constant or shape takes the next index
-  // after what the body met, and what the body met stays in the table the lambda hands back.
-  // Nothing in a lambda's body is a tail: the reference marks a function's tails and does not
-  // descend into a lambda, so an update at the end of one keeps the one-read guard.
+  // Nothing in a lambda's body is a tail, so an update at its end keeps the one-read guard.
   let start = { out: [], n: 0, conv: window, ind: 0, reads: reads, shapes: em.shapes, built: [],
                 module: em.module, module_index: em.module_index, made: [], here: em.here, imports: em.imports, consts: em.consts,
                 ctors: em.ctors, extra: b"", lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: [], toks: [], alias: [], by_root: [], tail: false, calls: em.calls, refused: em.refused, deferred: [], rlocals: [], performs: em.performs, handles: em.handles, landing: None, effects: em.effects, release: em.release, pinned: [], bound: [] };
@@ -1826,7 +1546,6 @@ fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>
       b"Word ply_", name, b"(PlyCtx *ctx",
       fold(range(0, n), b"", |acc: Bytes, i: Int| bytes_concat_all([acc, b", Word q", num(i)])),
       b") {\n", fuel_head(),
-      // A lambda is a function of its own, with reuse tokens and held-back records of its own.
       fold(sorted_widths(o.em.toks), b"", |acc: Bytes, w: Int|
         bytes_concat_all([acc, b"  Word tok", num(w), b" = 0;\n"])),
       fold(o.em.rlocals, b"", |acc: Bytes, r: Bytes| bytes_concat_all([acc, b"  Word ", r, b" = 0;\n"])),
@@ -1839,7 +1558,7 @@ fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>
   }
 }
 
-// A compiled call's arguments: each held once more as soon as it is evaluated.
+// A compiled call's arguments: each duplicated as soon as it is evaluated, unlike a builtin's.
 fn args_one_pass(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<Bytes>)
     -> Option<{ em: Em, names: List<Bytes> }> =
   if i >= len(xs) { Some({ em: em, names: acc }) } else {
@@ -1912,8 +1631,7 @@ fn same_names(a: List<Bytes>, b: List<Bytes>) -> Bool =
   len(a) == len(b) && fold(a, true, |acc: Bool, x: Bytes|
     acc && fold(b, false, |seen: Bool, y: Bytes| seen || y == x))
 
-// The word of the field whose name sorts at `at`, since the values were built in
-// the order they were written and the record holds them in the shape's order.
+// Values were built in written order; the record holds them in sorted-name order.
 fn word_at_rank(names: List<Bytes>, words: List<Bytes>, at: Int) -> Bytes =
   fold(range(0, len(names)), b"", |acc: Bytes, i: Int|
     match list_at(names, i) {
@@ -1947,6 +1665,7 @@ fn count_of(reads: List<Int>, slot: Int) -> Int =
 fn width_of(ty: Ty) -> Option<Int> =
   match ty { TyRec(fs) -> Some(len(fs)), _ -> None }
 
+// A field's index is its rank among the record's names sorted, not its written position.
 fn field_at(ty: Ty, name: Bytes) -> Option<{ at: Int, k: Kind, ty: Ty }> =
   match ty {
     TyRec(fs) -> fold(fs, None, |acc: Option<{ at: Int, k: Kind, ty: Ty }>, f: FieldTy|
@@ -1967,21 +1686,18 @@ fn as_bool(v: V) -> Bytes =
 fn as_word(v: V) -> Bytes =
   match v.k {
     KBoxed -> v.c,
-    // Either way it widens to the word the immediate carries; the C type the
-    // value is held in is what decides whether that is a sign or a zero extension.
+    // The C type the value is held in decides sign or zero extension.
     KNum(_) -> bytes_concat_all([b"ply_imm((int64_t)", v.c, b")"]),
-    // A `Bool` leaves as one of the two immortal words the runtime holds for it.
     KBool -> bytes_concat_all([b"(", v.c, b" ? ply_true : ply_false)"]),
     KInt -> bytes_concat_all([b"(ply_fits_imm(", v.c, b") ? ply_imm(", v.c,
                               b") : rt_box_int_p(ctx, ", v.c, b"))"]),
   }
 
-// `rt_arith`'s opcode: multiply, divide, and everything else.
+// `rt_arith`'s opcode numbering.
 fn arith_code(op: Bytes) -> Int =
   if op == b"mul" { 0 } else if op == b"div" { 1 } else { 2 }
 
-// The runtime's numbering of the operators `rt_binary` takes, in the order the
-// runtime's own table lists them.
+// `rt_binary`'s operator numbering, in the runtime table's order.
 fn binary_code(op: Bytes) -> Int =
   if op == b"add" { 0 } else if op == b"sub" { 1 } else if op == b"mul" { 2 }
   else if op == b"div" { 3 } else if op == b"rem" { 4 } else if op == b"eq" { 5 }
@@ -2015,14 +1731,12 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
   match c.node {
     NLit(l) -> match l {
       LInt(n) -> Some({ em: em, v: { k: KInt, c: int_lit(n), ty: TyOpen } }),
-      // A `Bool` is C's own 1 and 0 until something asks for its word.
+      // A `Bool` is C's 1 or 0 until something asks for its word.
       LBool(b) -> Some({ em: em, v: { k: KBool, c: if b { b"1" } else { b"0" }, ty: TyOpen } }),
-      // Anything the tag cannot hold is built once and read from the unit's
-      // constant table. The helper can raise, so the check follows.
+      // A literal the tag cannot hold is read from the unit's constant table; the helper can raise.
       LStr(_) -> Some(from_table(em, l)),
       LBytes(_) -> Some(from_table(em, l)),
-      // Below sixty-four bits a literal is its C type's own; at sixty-four it is built once and
-      // read from the constant table, which has no place for a value above the signed range.
+      // Below 64 bits a literal is its C type's own; at 64 bits it comes from the constant table.
       LFixed(name, bits) -> match width_named(name) {
         None -> Some(refused(em, b"a fixed-width literal of no known width")),
         Some(w) -> if carried(w) {
@@ -2030,14 +1744,11 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         } else { Some(from_table(em, l)) },
       },
       LUnit -> Some(from_table(em, l)),
-      // A `Float` or `Decimal` is a constant the runtime holds, opaque here: every operator over
-      // it is the machine's own, through the runtime. The reference has no path for these.
+      // A `Float` or `Decimal` is an opaque runtime constant; every operator over it goes through the runtime.
       LFloat(_) -> Some(opaque_from_table(em, l)),
       LDec(_) -> Some(opaque_from_table(em, l)),
       _ -> Some(refused(em, b"a literal this port does not pool")),
     },
-    // A parameter is `pN`; anything else needs the window, which is the next
-    // piece of this port.
     NVar(v) -> match v.slot {
       // The table has no arities: the runtime answers a nullary constructor's singleton or a function.
       None -> if is_ctor_name(v.name) {
@@ -2049,9 +1760,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           },
         }
       } else { match def_of(em, v.name) {
-        // A definition used as a value: a nullary one is called, and any other is a closure over
-        // its entry with nothing captured. The reference also asks whether the unit took it; a
-        // body naming one the unit does not hold is refused at the seam.
+        // A definition used as a value: a nullary one is called, any other becomes a closure over its entry with no captures.
         Some(d) -> if d.arity == 0 {
           let o = bind(note_call(em, d.full), KBoxed, bytes_concat_all([d.c, b"(ctx)"]));
           Some({ em: check(o.em), v: o.v })
@@ -2071,8 +1780,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
       } },
       Some(s) -> match conv_of(em, s) {
         Some(v) -> Some(move_read(em, c.own, v)),
-        // Not in the window: a parameter the prologue did not open, which is a
-        // record. It is read as its own word, here, each time.
+        // A parameter the prologue did not open (a record) is read as its own word each time.
         None -> match list_at(params, s) {
           None -> Some(refused(em, bytes_concat(b"a local this port has not bound: ", v.name))),
           Some(p) -> match p.k {
@@ -2083,12 +1791,10 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
       },
     },
     NBinary(b) ->
-      // Two `Int` literals under an operator are one literal: the reference folds them before
-      // it lowers, checked, so an overflow is left for the runtime to raise.
+      // Two `Int` literals under an operator fold to one, checked, so an overflow is left for the runtime.
       match lit_int(c) {
         Some(n) -> Some({ em: em, v: { k: KInt, c: int_lit(n), ty: TyOpen } }),
         None ->
-      // `&&` and `||` short-circuit, so the right operand is emitted inside the branch.
       if b.op == b"and" || b.op == b"or" {
         match expr(notail(em), b.lhs, params) {
           None -> None,
@@ -2101,7 +1807,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
               None -> None,
               Some(r) -> {
                 let assigned = line(r.em, bytes_concat_all([out.name, b" = ", as_bool(r.v), b";"]));
-                // One path runs the branch: what it moved is still held on the other.
+                // Only one path runs the branch: what it moved is still held on the other.
                 let closed = close(assigned);
                 Some({ em: with_made(closed, union_made(opened.made, closed.made)), v: { k: KBool, c: out.name, ty: TyOpen } })
               },
@@ -2109,7 +1815,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           },
         }
       }
-      // `++` joins two values the runtime knows how to join, and takes both.
+      // `++` takes both operands.
       else if b.op == b"concat" {
         match secured(expr(notail(em), b.lhs, params)) {
           None -> None,
@@ -2136,19 +1842,15 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           },
         }
       } },
-    // Lowering wraps every `if` branch and every `{ }` body in one of these. A
-    // block binds its tail even when it holds no statements, which is why an
-    // `if` branch shows a rename the branch itself did not ask for.
+    // A block binds its tail even with no statements, so an `if` branch shows a rename it did not ask for.
     NBlock(bl) -> match bl.tail {
-      // A block with no tail is its statements, and its value is the unit.
       None -> match stmts(em, bl.stmts, params, 0) {
         None -> None,
         Some(after) -> Some(bind(withtail(after, em.tail), KBoxed, b"ply_unit")),
       },
       Some(t) -> match stmts(em, bl.stmts, params, 0) {
         None -> None,
-        // The statements are not tails and cleared the flag; the block's tail is one when the
-        // block is.
+        // The block's tail is a tail when the block is; its statements are not.
         Some(after) -> match expr(withtail(after, em.tail), t, params) {
           None -> None,
           Some(o) -> Some(bind_keeping(o.em, o.v.k, o.v.ty, o.v.c)),
@@ -2164,16 +1866,14 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           match o.v.k {
             // A width negates wide and narrows back, under the same guard as a subtraction.
             KNum(w) -> narrow(bind(site(o.em, c.span), KInt, bytes_concat_all([b"-(int64_t)(", as_num(o.v, w), b")"])), w, 2),
-            // A word of a type this port cannot see may be a `Float` or a `Decimal`: the
-            // machine's own negation, through the runtime.
+            // A word may be a `Float` or `Decimal`: negate through the runtime.
             KBoxed -> {
               let held = owned(o.em, o.v);
               let out = bind_keeping(site(held.em, c.span), KBoxed, o.v.ty, bytes_concat_all([b"rt_negate_p(ctx, ", held.v.c, b")"]));
               Some({ em: check(out.em), v: out.v })
             },
             _ -> {
-              // Negation overflows at one input, and the guard runs before the value
-              // exists rather than after: code 2, as `rt_arith_p`'s table numbers it.
+              // Negation overflows at one input; the guard runs before the value exists (code 2, `rt_arith_p`'s numbering).
               let a = as_int(o.v);
               let g = line(site(o.em, c.span), bytes_concat_all([b"if (", a,
                 b" == INT64_MIN) { rt_overflow_p(ctx, 2); return 0; }"]));
@@ -2187,14 +1887,8 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           }
         } else { None },
     },
-    // A lambda is a closure over the slots it copies in, *and* a function of
-    // its own written after the one that builds it. Emitting the closure without
-    // the function would be a call to something nothing defines, so the two are
-    // one node here.
-    //
-    // A lambda inside a lambda is one more of the owner's: numbered after the one it sits in,
-    // its entry interned before its body as the reference reserves the slot, and its text
-    // written after its owner's.
+    // A lambda is a closure and also a function written after the one that builds it.
+    // A nested lambda is one more of the owner's: numbered after its container, its entry interned before its body.
     NLambda(l) -> {
       match caps_owned(em, l.caps, params, 0, []) {
         None -> None,
@@ -2204,7 +1898,6 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           let idx = fold(w.em.lambdas, 0, |acc: Int, sym: Bytes|
             if bytes_len(sym) >= bytes_len(prefix) && bytes_slice(sym, 0, bytes_len(prefix)) == prefix { acc + 1 } else { acc });
           let sub = bytes_concat_all([em.owner, b"_lambda", num(idx)]);
-          // The closure names its code by the entry's place in the body's table.
           let entry = lambda_of(w.em, bytes_concat_all([b"ply_", sub, b"_entry"]));
           match emit_lambda(entry.em, sub, l) {
             None -> None,
@@ -2226,8 +1919,6 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         },
       }
     },
-    // A list: every item boxed into a `Word` local, then the array they are
-    // read out of, then the helper. The helper can raise, so the check follows.
     NList(l) -> match items(em, l.items, params, 0, []) {
       None -> None,
       Some(w) -> {
@@ -2240,15 +1931,10 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         Some({ em: check(o.em), v: o.v })
       },
     },
-    // `ply_words(base)[i]`, where the index is the field's place in the record's
-    // sorted names. A base whose shape the port does not know is refused rather
-    // than read at a guessed offset.
     NField(f) -> match expr(notail(em), f.base, params) {
       None -> None,
       Some(b) -> match built_field(b.em, b.v.c, f.field) {
-        // Built in this body: the value is already in a register, and asking for
-        // the word here is what would force a record into memory that nothing
-        // else ever looks at.
+        // Built in this body: the value is already in a register; asking for the word would force the record into memory.
         Some(v) -> {
           let kept = secure_field(b.em, f.base, b.v, v);
           match release_base(kept.em, f.base, b.v, params) {
@@ -2261,19 +1947,13 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           // Under release the rename is the holder: the temporary it renamed was nulled.
           let hv = if b.em.release { { k: KBoxed, c: held.v.c, ty: b.v.ty } } else { b.v };
           match field_at(b.v.ty, f.field) {
-            // The shape is known, so the read is a load at the field's offset. A
-            // scalar field then goes into a register of its own kind; anything
-            // else stays the word it already is.
+            // A known shape reads at the field's offset; a scalar field goes into a register of its kind.
             Some(i) -> {
               let w = bind_keeping(held.em, KBoxed, i.ty,
                 bytes_concat_all([b"ply_words(", held.v.c, b")[", num(i.at), b"]"]));
               match i.k {
-                // A field whose own kind is a word does **not** release the base.
-                // The reference returns before the release for exactly this case,
-                // and the reason is recorded there: the in-place field take that
-                // would make it safe is not in the tier.
-                // Under release a base at its last use is let go here, the field held once more
-                // first, which is what `rt_field` does with its `own` of 1.
+                // Without release a word-kinded field never releases its base: there is no in-place field take.
+                // Under release a base at its last use is let go here, the field duplicated first, as `rt_field` does.
                 KBoxed -> if w.em.release && base_owned(f.base) && spendable(w.em, hv.c) {
                     let tf = note_made(line(w.em, bytes_concat_all([b"ply_inc(", w.v.c, b");"])), w.v.c);
                     match release_base(tf, f.base, hv, params) {
@@ -2290,12 +1970,10 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                 },
               }
             },
-            // The shape is not known and neither is the offset: the runtime's read by name,
-            // through this body's field table. It answers a word, and a field whose kind is a
-            // word does not release its base.
+            // Unknown shape: the runtime reads by name through this body's field table; a word-kinded field does not release its base.
             None -> {
               let idx = field_of(held.em, f.field);
-              // The runtime takes a base at its last use, under release.
+              // Under release the runtime takes a base at its last use.
               let take = idx.em.release && base_owned(f.base) && spendable(idx.em, hv.c);
               let w = bind(idx.em, KBoxed, bytes_concat_all([b"rt_field_p(ctx, ", held.v.c, b", @@f", num(idx.i), b"@@, ",
                                                             if take { b"1" } else { b"0" }, b")"]));
@@ -2306,18 +1984,11 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         },
       },
     },
-    // `{..b, f: e}`, which is a record built out of the base's own memory rather
-    // than fresh: the base is released *before* the allocation, so its cells are
-    // the token this build then takes.
-    //
-    // The written fields are evaluated first, then the base is read, then each
-    // field in the shape's order -- a copy through the base, a set from what was
-    // evaluated -- and the stores follow.
+    // `{..b, f: e}` reuses the base's memory: the base is released before the allocation, so its cells are the token.
+    // Order: the written fields are evaluated, then the base read, then each field filled in shape order.
     NUpd(u) -> {
       let names = sorted_names(concat_names(u.copies, map(u.sets, |f: CField| f.name)));
-      // Each written field is evaluated **and bound** before the base is read.
-      // A literal set writes a line of its own here, which is the only sign the
-      // binding happens at all.
+      // Each written field is evaluated and bound before the base is read.
       match sets_bound(em, map(u.sets, |f: CField| f.value), params, 0, []) {
         None -> None,
         Some(ev) -> match expr(notail(ev.em), u.base, params) {
@@ -2325,10 +1996,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           Some(bv) -> {
             let held = bind(bv.em, KBoxed, as_word(bv.v));
             let hv = if bv.em.release { { k: KBoxed, c: held.v.c, ty: bv.v.ty } } else { bv.v };
-            // Each field's word, its kind by the base's declared type, and the value it came
-            // from where the value is still in a register: a copy the base itself remembered is
-            // the value rather than a load, which is what carries the knowledge along a chain of
-            // updates. A word read out of memory is what keeps the record from being held back.
+            // A copy the base remembered is its value, not a load; any word read from memory stops the record being held back.
             let filled = fold(range(0, len(names)), { em: held.em, ws: [], kinds: [], vals: [], known: true },
               |acc: { em: Em, ws: List<Bytes>, kinds: List<Kind>, vals: List<V>, known: Bool }, at: Int| {
                 let nm = match list_at(names, at) { Some(x) -> x, None -> b"" };
@@ -2340,17 +2008,12 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                       { em: o.em, ws: push(acc.ws, o.v.c), kinds: push(acc.kinds, fk), vals: push(acc.vals, taken_as(o.em, v, o.v)), known: acc.known }
                     },
                     None -> match field_at(bv.v.ty, nm) {
-                      // Read at the field's place in the **base's** shape, which is the new
-                      // record's only when the update writes no field the base lacks -- and a
-                      // literal recognised as an update usually does.
+                      // Read at the field's place in the base's shape, which differs from the new record's when the update adds a field.
                       Some(f) -> {
                         let w = bind_word_of(acc.em, bytes_concat_all([
                           b"ply_words(", held.v.c, b")[", num(f.at), b"]"]));
                         let inc = line(w.em, bytes_concat_all([b"ply_inc(", w.v.c, b");"]));
-                        // A scalar copy is read into a register of its own kind, as any
-                        // field read is -- and the register is then unused, because the
-                        // *word* is what the store takes. A copy whose field is already
-                        // a word converts nothing.
+                        // A scalar copy is read into a register of its kind, then unused: the store takes the word.
                         match f.k {
                           KBoxed -> { em: inc, ws: push(acc.ws, w.v.c), kinds: push(acc.kinds, fk), vals: acc.vals, known: false },
                           _ -> { let c = bind(inc, f.k, as_kind(w.v, f.k));
@@ -2361,7 +2024,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                         let idx = field_of(acc.em, nm);
                         let w = bind(idx.em, KBoxed, bytes_concat_all([
                           b"rt_field_p(ctx, ", held.v.c, b", @@f", num(idx.i), b"@@, 0)"]));
-                        // The runtime answers the copy held once more, and the record takes it.
+                        // The runtime answers the copy duplicated, and the record takes it.
                         { em: spend_made(check(w.em), w.v.c), ws: push(acc.ws, w.v.c), kinds: push(acc.kinds, fk), vals: acc.vals, known: false }
                       },
                     },
@@ -2369,16 +2032,13 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                 } else {
                   match set_value(u.sets, ev.vals, nm) {
                     None -> { em: acc.em, ws: push(acc.ws, b"0"), kinds: push(acc.kinds, KBoxed), vals: acc.vals, known: false },
-                    // The written field's word is *held once more*: the record
-                    // being built takes it, as a copy's read does.
+                    // The written field's word is duplicated: the record being built takes it.
                     Some(v) -> { let w = owned(acc.em, v);
                                  { em: w.em, ws: push(acc.ws, w.v.c), kinds: push(acc.kinds, v.k), vals: push(acc.vals, taken_as(w.em, v, w.v)), known: acc.known } },
                   }
                 }
               });
-            // The release here is the reference's `Site::TailUpdate` at the body's tail, which
-            // skips the one-read guard: nothing is emitted after the update, so the later read the
-            // guard protects cannot be there.
+            // At the body's tail the release skips the one-read guard: no later read can exist.
             match release_from(filled.em, u.base, hv, params, em.tail) {
               None -> None,
               Some(rel) -> Some(build_record(rel, names, filled.ws, filled.kinds,
@@ -2388,9 +2048,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         },
       }
     },
-    // A record: values in the order they are written, assembled in the order the
-    // shape holds them, which is by name. The memory comes from a reuse token of
-    // this width when the body has one and from the allocator when it does not.
+    // Values evaluated in written order, assembled in sorted-name order, from a reuse token of this width when there is one.
     NRecord(r) -> {
       let names = map(r.fields, |f: CField| f.name);
       match items(em, map(r.fields, |f: CField| f.value), params, 0, []) {
@@ -2406,20 +2064,8 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         },
       }
     },
-    // A direct call to a definition of this module. A qualified name resolves
-    // through an import and this port does not resolve, so it is refused rather
-    // than mangled at a guess; so is a call of anything but a name, which is a
-    // closure and needs the handle ABI.
     NApp(a) -> match a.func.node {
-      // A constructor is applied like a function and is not one: the reference
-      // builds a tagged object rather than calling anything. A leading capital
-      // is what tells them apart without resolving, and this port has no
-      // constructors, so one is refused.
-      // A constructor is a tagged object rather than a call, and its tag is its
-      // place in the unit's table.
-      // A name bound in this body holds a closure, and calling one goes through
-      // the runtime: it may be a lambda of this unit, a compiled function used as
-      // a value, or something the machine made.
+      // A name bound in this body holds a closure, called through the runtime; a constructor builds a tagged object.
       NVar(fv) -> match fv.slot {
         Some(_) -> call_value(em, a.func, a.args, params, c.span),
         None -> if is_ctor_name(fv.name) {
@@ -2438,11 +2084,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           },
         }
       } else {
-        // A nullary call is not a call on the other side: a pure one is answered
-        // by the unit's constant table, which is a purity analysis this port does
-        // not have. Refused rather than emitted as the call it lowered to.
-        // A pure nullary definition whose answer is a word is asked of the runtime's constant
-        // table rather than called: the unit remembers it, as the machine's memo does.
+        // A pure nullary definition answering a word is read from the runtime's constant table, not called.
         if len(a.args) == 0 && constant_of(em, fv.name) != None {
           match constant_of(em, fv.name) {
             None -> None,
@@ -2455,31 +2097,14 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           }
         }
                 else if !fold(em.here, false, |acc: Bool, h: Def| acc || h.name == fv.name) {
-                  // Not a definition of this module: a builtin, or an import this
-                  // port cannot resolve. The ones with a helper of their own are
-                  // a swap for the call and nothing about ownership changes.
+                  // Not this module's: a builtin or an import.
                   match direct_helper(fv.name, len(a.args)) {
-                    // Brought in by name from another module: the same direct
-                    // call, mangled with the module it came from.
+                    // An import: the same direct call, mangled with its module.
                     None -> match match qualified(fv.name) {
                       Some(q) -> from_import(em.imports, q.binder),
                       None -> from_import(em.imports, fv.name),
                     } {
-                      // A builtin with no helper of its own goes through the
-                      // runtime, which is the interpreter's own path, under this
-                      // body's own index for it.
-                      //
-                      // Two families are refused instead. The **callback** family
-                      // is fused: handed a literal lambda the reference emits the
-                      // loop into the body and never builds the closure. The
-                      // **inline** family -- `len`, `bytes_len`, `bytes_at`,
-                      // `bytes_u32_le` -- is expanded in place, with a kind test
-                      // and a bounds test around a load, and the runtime call is
-                      // only its slow arm. Emitting a call for either is a wrong
-                      // answer rather than a slow one.
-                      // `len` and `bytes_len` over a value whose kind the
-                      // declaration fixes: no test to make, and the answer is the
-                      // header's own field.
+                      // Callback and inline builtins outside their fused shapes are refused: a plain call for them is a wrong answer, not a slow one.
                       None -> match fused_fold(em, fv.name, a.args, params, c.span) {
                         Some(o) -> Some(o),
                         None -> match iterate_call(em, fv.name, a.args, params, c.span) {
@@ -2510,15 +2135,12 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                             b"(ctx",
                             fold(w.names, b"", |acc: Bytes, nm: Bytes|
                               bytes_concat_all([acc, b", ", nm])), b")"]));
-                          // Opened to the callee's declared type when its module was resolved
-                          // alongside this one; a word otherwise.
+                          // Opened to the callee's declared type when its module was resolved alongside; a word otherwise.
                           Some(opened_to(check(o.em), o.v, ret_of(imp.defs, callee)))
                         },
                       },
                     },
-                    // Two passes, except for the two that take a closure: those
-                    // hold the list before the closure is built, where the rest
-                    // evaluate everything and only then hold any of it.
+                    // `map` and `filter` duplicate the list before the closure is built; the rest evaluate everything first.
                     Some(h) -> match (if fv.name == b"map" || fv.name == b"filter" {
                                         args_one_pass(em, a.args, params, 0, [])
                                       } else if fv.name == b"map_fold" {
@@ -2542,9 +2164,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
               b"ply_", mangle(qualify(em.module, fv.name)), b"(ctx",
               fold(w.names, b"", |acc: Bytes, nm: Bytes| bytes_concat_all([acc, b", ", nm])),
               b")"]));
-            // The answer is opened to the *callee's* declared type, here rather
-            // than at the caller's return: a body whose own answer is already a
-            // word hands it straight back.
+            // Opened to the callee's declared type here, so a body whose answer is already a word hands it straight back.
             Some(opened_to(check(o.em), o.v, ret_of(em.here, fv.name)))
           },
         } } },
@@ -2552,8 +2172,6 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
       // Any other callee -- a field holding a function, a call's answer -- is a value too.
       _ -> call_value(em, a.func, a.args, params, c.span),
     },
-    // A `match` is arms in order over one flag: each arm runs only if no earlier
-    // one matched, and a body that falls off the end raises rather than answering.
     NMatch(m) -> match match_subject(em, m.scrutinee, m.arms, params) {
       None -> None,
       Some(s) -> {
@@ -2568,19 +2186,10 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
     NIf(i) -> match expr(notail(em), i.cond, params) {
       None -> None,
       Some(cnd) -> {
-        // A condition is read as a *bool*: the two conversions agree on anything
-        // already untagged and differ on a word, where this one is the runtime's
-        // bool unbox rather than the integer's.
+        // A condition is read as a bool: on a word that is the runtime's bool unbox, not the integer's.
         let cv = { em: cnd.em, v: { k: KBool, c: as_bool(cnd.v), ty: TyOpen } };
-        // The join is the kind both arms *answered*, or a word: the arms are emitted into
-        // buffers first, and the join's local is declared before the `if` in the text but
-        // after both arms in the numbering.
         {
-          // The join's number is taken *before* either arm and its declaration is
-          // written before the `if`, but the arms are emitted into buffers of
-          // their own first: a record-valued join is not one local but one per
-          // field, numbered after everything in both arms, and there is no way to
-          // know that until both have been written.
+          // The join's number is taken before either arm; arms go into buffers because a record-valued join needs one local per field, numbered after both.
           let j = fresh(cv.em);
           match arm(withtail(blank(j.em), em.tail), i.then_branch, params) {
             None -> None,
@@ -2588,16 +2197,12 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                                  i.else_branch, params) {
               None -> None,
               Some(e) -> {
-                // Asked with the *later* table, which holds what both arms built.
+                // Asked with the later table, which holds what both arms built.
                 let shape = shared_shape(e.em, t.v, e.v);
                 match shape {
-                  // Both arms answer a record this body built, of one shape: the
-                  // join carries the *fields* rather than the word, one local
-                  // each, and a third record is assembled from them afterwards.
-                  // The number taken above is spent and never declared.
+                  // Both arms built a record of one shape: the join carries one local per field and reassembles; the number taken above is spent, never declared.
                   Some(names) -> {
                     let n = len(names);
-                    // One local per field, in the field's own kind.
                     let js = fold(names, { em: rescope(blank(e.em), cv.em.conv), names: [] },
                       |acc: { em: Em, names: List<V> }, nm: Bytes| {
                         let k = match built_field(e.em, t.v.c, nm) { Some(fv) -> fv.k, None -> KInt };
@@ -2653,8 +2258,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         }
       },
     },
-    // A `perform` is the runtime's search of the handler frames for the operation, over the
-    // arguments each held once more; the effect is named program-wide (ADR 0043).
+    // A `perform` searches the handler frames through the runtime; arguments are duplicated and the effect named program-wide.
     NPerform(p) -> match effect_named(em, p.effect) {
       None -> Some(refused(em, bytes_concat(b"an effect this port cannot resolve: ", p.effect))),
       Some(en) -> match args_one_pass(em, p.args, params, 0, []) {
@@ -2678,13 +2282,11 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
       },
     },
     NHandle(h) -> handle_site(em, h.body, h.clauses, h.ret, params),
-    // `with cell`: a region opened as shared -- the arena's default, and the kind the
-    // reference's analysis proves stronger where it can -- a cell in it holding the initial
-    // value, the binder in scope for the body, and the region closed after it.
+    // `with cell`: a shared region holding a cell with the initial value, the binder in scope for the body, the region closed after.
     NCell(cl) -> match expr(notail(em), cl.init, params) {
       None -> None,
       Some(iv) -> {
-        // The runtime takes the initial value; the reference hands it a word it still holds.
+        // Under release the runtime takes the initial value; otherwise it is handed a word still held.
         let init = if iv.em.release { owned(iv.em, iv.v) } else {
           let w0 = word_of(iv.em, iv.v);
           { em: w0.em, v: { k: KBoxed, c: w0.c, ty: TyOpen } }
@@ -2702,8 +2304,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         }
       },
     },
-    // `simulate { body }`: the body is a nullary closure the runtime runs as the root task of
-    // a region whose scheduler it drives; the site handles every operation the region answers.
+    // `simulate { body }`: the body is a nullary closure run as the root task of a region whose scheduler the runtime drives.
     NSim(x) -> {
       let lam = { own: Borrowed, span: dummy_span(), node: NLambda({ params: 0, size: x.size, caps: x.caps, body: x.body }) };
       match expr(notail(em), lam, params) {
@@ -2719,17 +2320,15 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
     _ -> Some(refused(em, b"an effect construct or another node this port does not emit")),
   }
 
-// The operations a `simulate` region answers, as the fixpoint names a handled operation.
+// The operations a `simulate` region answers, named as the fixpoint names a handled operation.
 fn scheduled_ops() -> List<Bytes> =
   [b"task#spawn", b"task#join", b"task#yield", b"clock#now", b"clock#sleep",
    b"random#next", b"random#below", b"sim#seed"]
 
-// A name in this body's field table, written as the placeholder the unit resolves: the
-// runtime reads effect, operation and resource names out of the unit's table.
+// A field-table placeholder the unit resolves; the runtime reads effect, operation and resource names from it.
 fn field_ref(i: Int) -> Bytes = bytes_concat_all([b"@@f", num(i), b"@@"])
 
-// The effect a `perform` or a clause names, under its program-wide name; `None` for a name
-// the module's scope does not bind.
+// `None` for a name the module's scope does not bind.
 fn effect_global(em: Em, written: Bytes) -> Option<Bytes> =
   match effect_named(em, written) { Some(e) -> Some(e.global), None -> None }
 
@@ -2746,12 +2345,11 @@ fn prelude_effects_here() -> List<EffectName> =
    { written: b"random", global: b"random", ops: [{ name: b"next", write: true }, { name: b"below", write: true }] },
    { written: b"sim", global: b"sim", ops: [{ name: b"seed", write: false }] }]
 
-// Whether an operation of an effect writes: the atom a `perform` records carries its mode.
+// Whether an operation writes: a `perform`'s recorded atom carries its mode.
 fn op_writes(e: EffectName, op: Bytes) -> Bool =
   fold(e.ops, false, |acc: Bool, o: OpMode| if o.name == op { o.write } else { acc })
 
-// Every effect name a module's scope binds, bare or through a module binder, with the name
-// the program knows it by.
+// Every effect name a module's scope binds, bare or through a module binder, with its program-wide name.
 fn effects_in(r: Resolved, i: Int, mods: List<Mod>) -> List<EffectName> =
   match list_at(r.scopes, i) {
     None -> [],
@@ -2766,7 +2364,6 @@ fn effects_in(r: Resolved, i: Int, mods: List<Mod>) -> List<EffectName> =
     },
   }
 
-// The operations an effect declares, with their modes, from the module that declares it.
 fn ops_of(mods: List<Mod>, owner: Int, name: Bytes) -> List<OpMode> =
   match list_at(mods, owner) {
     None -> [],
@@ -2778,9 +2375,7 @@ fn ops_of(mods: List<Mod>, owner: Int, name: Bytes) -> List<OpMode> =
     }),
   }
 
-// A clause that binds `resume` may only call it in tail position, once along any path: that is
-// the clause the tier carries as a plain call or an unwind. Every read of the binder must be
-// such a call.
+// A clause may call `resume` only in tail position, once per path; every read of the binder must be such a call.
 fn resume_in_tail_only(body: Code, k: Int) -> Bool =
   count_of(slots_read(body), k) == tail_calls_of(body, k)
 
@@ -2796,18 +2391,14 @@ fn tail_calls_of(c: Code, k: Int) -> Int =
     _ -> 0,
   }
 
-// A `handle` site: each clause body and the `return` body become closures as a lambda does;
-// the frame is pushed, the body emitted inline with its failing calls landing here, and the
-// landing pops the frame, applies the `return` clause to a body that completed, and catches an
-// unwind aimed at this frame.
+// Clause bodies become closures; the body is inlined, its failing calls landing where the frame is popped and unwinds are caught.
 fn handle_site(em: Em, body: Code, clauses: List<CClause>, ret: Option<CRet>, params: List<P>) -> Option<Out> = {
   let named = fold(clauses, Some([]), |acc: Option<List<{ global: Bytes, c: CClause }>>, c: CClause|
     match acc {
       None -> None,
       Some(xs) -> match effect_global(em, c.effect) { Some(g) -> Some(push(xs, { global: g, c: c })), None -> None },
     });
-  // A clause that binds `resume` and calls it off the tail detaches the body: it runs on a stack
-  // of its own and the clause on the resumer's, so the body is a closure rather than inline.
+  // A clause calling `resume` off the tail detaches the body: it runs on its own stack, so it becomes a closure.
   let detached = fold(clauses, false, |acc: Bool, c: CClause| acc || (c.resume && !resume_in_tail_only(c.body, c.params)));
   match named {
     None -> Some(refused(em, b"a `handle` this tier cannot carry: an effect it cannot resolve")),
@@ -2853,8 +2444,7 @@ fn handle_site(em: Em, body: Code, clauses: List<CClause>, ret: Option<CRet>, pa
           match retc {
             None -> None,
             Some(rc) -> if detached {
-              // The body closes over every slot it reads, at the same slot numbers, so nothing in
-              // it is renumbered; the runtime runs it on its own stack.
+              // The body closes over every slot it reads at the same slot numbers, so nothing is renumbered.
               let reads = filter(dedup(slots_read(body)), |r: Int|
                 match conv_of(rc.em, r) { Some(_) -> true, None -> match list_at(params, r) { Some(_) -> true, None -> false } });
               let lam = { own: Borrowed, span: dummy_span(), node: NLambda({ params: 0, size: fold(reads, 0, |m: Int, r: Int| if r + 1 > m { r + 1 } else { m }),
@@ -2871,10 +2461,7 @@ fn handle_site(em: Em, body: Code, clauses: List<CClause>, ret: Option<CRet>, pa
               let depth = bind(rc.em, KInt, bytes_concat_all([b"rt_handle_push_p(ctx, (Word)(intptr_t)", arr.name, b", ", num(len(cs)), b", ", rc.c, b")"]));
               let mark = fresh(depth.em);
               let label = bytes_concat(b"land_", num(mark.em.n));
-              // Under release the body is a block of its own: a failing call jumps to the label
-              // past the declarations after it, so what the body holds is released at the block's
-              // close and is out of scope at the label. What the body may have moved is released
-              // at the enclosing scope's end on the path that did not run it.
+              // Under release the body is its own block, so its holders are released at its close, before the landing label.
               let opened = if mark.em.release { indent(line(mark.em, b"{")) } else { mark.em };
               match expr(notail(with_landing(opened, Some(label))), body, params) {
                 None -> None,
@@ -2898,11 +2485,7 @@ fn handle_site(em: Em, body: Code, clauses: List<CClause>, ret: Option<CRet>, pa
 fn dedup(xs: List<Int>) -> List<Int> =
   fold(xs, [], |acc: List<Int>, x: Int| if count_of(acc, x) > 0 { acc } else { push(acc, x) })
 
-// The items of a list, left to right, each boxed into its own `Word` local.
-// One pass, and **not** the two an argument list makes. An aggregate's item is
-// held once more as soon as it is evaluated; a call's arguments are all
-// evaluated and only then held. Both orders were tried against the corpus and
-// each is wrong in the other's place.
+// Each item is duplicated as soon as it is evaluated, unlike a call's two passes; each order is wrong in the other's place.
 fn items(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<Bytes>)
     -> Option<{ em: Em, names: List<Bytes>, vals: List<V> }> =
   items_from(em, xs, params, i, acc, [])
@@ -2922,14 +2505,11 @@ fn items_from(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<Bytes>,
     }
   }
 
-// The value a record remembers a field by, once the record has taken the word: under release
-// the temporary it came from is null, so the word the record holds is remembered instead.
+// Under release the temporary a field came from is null once the record takes it, so the held word is remembered instead.
 fn taken_as(em: Em, v: V, w: V) -> V =
   if em.release && v.k == KBoxed { { k: KBoxed, c: w.c, ty: v.ty } } else { v }
 
-// A value read now and taken later, held once more now: the machine clones at the read, and a
-// read in between may be the binding's last use and move it. Under release only; the reference
-// holds everything after evaluating everything.
+// Under release a value read now and taken later is duplicated now: a read in between may be its last use and move it.
 fn secure(em: Em, v: V) -> Out =
   if !em.release || v.k != KBoxed || spendable(em, v.c) { { em: em, v: v } } else {
     let w = owned(em, v);
@@ -2939,10 +2519,7 @@ fn secure(em: Em, v: V) -> Out =
 fn secured(o: Option<Out>) -> Option<Out> =
   match o { None -> None, Some(x) -> Some(secure(x.em, x.v)) }
 
-// `secure` for a value consumed only after `later` is evaluated, held once more only when a
-// read in `later` can move it: the same guard `move_read` applies, over the slots `later`
-// reads. The inline family reads `bytes_at(b, i)` per byte inside pinned loops, where nothing
-// moves and a count taken per byte would be the cost the family exists to avoid.
+// Duplicated only when a read in `later` can move it: a count per byte in the inline family's loops would cost what it saves.
 fn secure_across(em: Em, v: V, later: Code, params: List<P>) -> Out =
   if !em.release || v.k != KBoxed || spendable(em, v.c) { { em: em, v: v } } else {
     let r = root_of(em, v.c);
@@ -2966,9 +2543,7 @@ fn bytes_join(xs: List<Bytes>, sep: Bytes) -> Bytes =
     bytes_concat_all([acc, if i == 0 { b"" } else { sep },
                       match list_at(xs, i) { Some(x) -> x, None -> b"" }]))
 
-// A block's statements, in order. A `let` binds its value under its own name --
-// the reference writes the rename even when the value is already a temporary --
-// and records it against the slot the body reads it back through.
+// A `let` binds its value under its own name even when it is already a temporary.
 fn stmts(em: Em, xs: List<CStmt>, params: List<P>, i: Int) -> Option<Em> =
   if i >= len(xs) { Some(em) } else {
     match list_at(xs, i) {
@@ -2977,14 +2552,11 @@ fn stmts(em: Em, xs: List<CStmt>, params: List<P>, i: Int) -> Option<Em> =
         CLet(l) -> match expr(notail(em), l.value, params) {
           None -> None,
           Some(o) -> {
-            // The type stays with the binding, as the reference keeps it.
             let b = bind_keeping(o.em, o.v.k, o.v.ty, o.v.c);
             stmts(remember(ensure_owned(b.em, b.v), l.slot, b.v), xs, params, i + 1)
           },
         },
-        // The value is held as a word and the pattern's names are bound from it, as an arm's are.
-        // A refutable `let` first tests the pattern and raises rather than reading a field that is
-        // not there (a `let Circle(r) = s` on a `Tri`); an irrefutable one has nothing to test.
+        // A refutable `let` tests the pattern first and raises rather than reading a missing field.
         CLetPat(l) -> match expr(notail(em), l.value, params) {
           None -> None,
           Some(o) -> {
@@ -3010,18 +2582,13 @@ fn stmts(em: Em, xs: List<CStmt>, params: List<P>, i: Int) -> Option<Em> =
     }
   }
 
-// The arms, in order. Each is guarded by the flag rather than by an `else`, so
-// an arm's own test is written at one depth whatever the arm before it did.
-// Under `lookup` the subject is the local a lookup answered, which the arms test and bind
-// directly.
+// Each arm is guarded by the flag rather than an `else`, so its test is written at one depth.
 fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, sink: Sink, flag: Bytes,
         base: List<Made>, seen: List<Made>, lookup: Bool)
     -> Option<Em> =
   if i >= len(xs) { Some(with_made(em, if i == 0 { em.made } else { seen })) } else {
     match list_at(xs, i) {
       None -> None,
-      // A guard is a second test after the pattern binds, and this port does not
-      // reach one yet.
       Some(a) -> if a.guard != None { Some(poison(em, b"a match guard")) } else {
         let guarded = indent(line(with_made(em, base), bytes_concat_all([b"if (!", flag, b") {"])));
         match (if lookup { Some({ em: guarded, c: lookup_test(a.pat, subj.c) }) }
@@ -3047,8 +2614,6 @@ fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, sink: Sink, fl
     }
   }
 
-// An arm's body, into its sink: the word assigned to the match's answer, or the loop's own
-// assignments for a step that answers `Stop` or `Continue`.
 fn arm_body(em: Em, sink: Sink, body: Code, params: List<P>) -> Option<Em> =
   match sink {
     ToValue(ans) -> match expr(em, body, params) {
@@ -3061,10 +2626,7 @@ fn arm_body(em: Em, sink: Sink, body: Code, params: List<P>) -> Option<Em> =
     ToLoop(l) -> emit_step(em, body, l.state, l.answer, l.stop, l.go, params, l.depth),
   }
 
-// What a `match` tests, held in a local. For the match `lookup_of` recognised that is the element
-// held once more, or zero, straight from the runtime, with no `Some` built and taken apart
-// between; the failure check has to come before zero is read as `None`, because a call that
-// failed answers zero too.
+// Under `lookup_of` the subject is the element or zero; check failure before reading zero as `None`, as a failed call answers zero too.
 fn match_subject(em: Em, scrutinee: Code, xs: List<CArm>, params: List<P>) -> Option<{ em: Em, subj: V, lookup: Bool }> =
   match lookup_of(em, scrutinee, xs) {
     Some(l) -> match args_owned_at(notail(em), l.args, params, scrutinee.span) {
@@ -3086,9 +2648,7 @@ fn match_subject(em: Em, scrutinee: Code, xs: List<CArm>, params: List<P>) -> Op
     },
   }
 
-// The arms over one flag, after the subject: each runs only if no earlier one matched, and a
-// body that falls off the end raises rather than answering. `tail` is the match's own position,
-// which the subject's evaluation cleared.
+// Arms over one flag; a body falling off the end raises. `tail` is the match's own position, which evaluating the subject cleared.
 fn match_arms(em: Em, subj: V, lookup: Bool, xs: List<CArm>, params: List<P>, sink: Sink, span: Span, tail: Bool) -> Option<Em> = {
   let flag = fresh(em);
   let opened = line(flag.em, bytes_concat_all([b"int ", flag.name, b" = 0;"]));
@@ -3098,9 +2658,7 @@ fn match_arms(em: Em, subj: V, lookup: Bool, xs: List<CArm>, params: List<P>, si
   }
 }
 
-// `match list_at(xs, i) { Some(x) -> .., None -> .. }` and the same over `map_get`, when the
-// scrutinee names the builtin, both arms are unguarded, and the `Some` arm binds one name or
-// nothing: the helper that answers the element or zero, and the call's arguments.
+// `match list_at(..)` or `map_get(..)` with unguarded `Some(x)`/`None` arms: the helper answering the element or zero, and its arguments.
 fn lookup_of(em: Em, scrutinee: Code, xs: List<CArm>) -> Option<{ helper: Bytes, args: List<Code> }> =
   match scrutinee.node {
     NApp(a) -> match a.func.node {
@@ -3159,25 +2717,18 @@ fn lookup_test(p: CPat, held: Bytes) -> Bytes =
     _ -> bytes_concat_all([b"(", held, b" == 0)"]),
   }
 
-// A lookup's `Some` binds its one name to the answer itself: the helper handed back a count,
-// so there is no increment to add.
+// The helper handed back a count, so binding it adds no increment.
 fn lookup_bind(em: Em, p: CPat, subj: V) -> Em =
   match p {
     PxCtor(c) -> match list_at(c.args, 0) { Some(sub) -> pat_bind(em, sub, subj), None -> em },
     _ -> em,
   }
 
-// The C condition an arm's pattern is. `1` where the pattern cannot fail.
-// A pattern that cannot fail: the reference's `irrefutable_pat`. A nullary constructor
-// wearing a variable's shape never arrives from the parser, which makes every upper-case bare
-// name in pattern position a constructor, so a variable is irrefutable here.
+// A variable pattern is irrefutable: the parser makes every upper-case bare name in pattern position a constructor.
 fn irrefutable(p: CPat) -> Bool =
   match p { PxWild -> true, PxVar(_) -> true, _ -> false }
 
-// The C condition an arm's pattern is, and the state after the reads the test itself
-// needs: a nested pattern tests a field held in a local, guarded by the test built so far,
-// because a read of a non-record raises rather than answering. `1` where the pattern cannot
-// fail; `None` for a pattern the reference refuses too.
+// A nested pattern reads a field into a local under the test so far, since reading a non-record raises. `None` for an unsupported pattern.
 fn pat_test(p: CPat, subj: V, em: Em) -> Option<{ em: Em, c: Bytes }> =
   match p {
     PxWild -> Some({ em: em, c: b"1" }),
@@ -3190,8 +2741,7 @@ fn pat_test(p: CPat, subj: V, em: Em) -> Option<{ em: Em, c: Bytes }> =
       LBool(b) -> Some({ em: em, c: bytes_concat_all([b"(", subj.c, b" == ", if b { b"ply_true" } else { b"ply_false" }, b")"]) }),
       _ -> None,
     },
-    // A constructor is its tag and its width, over an object rather than an immediate. An
-    // argument with a test of its own is read into a local first, under the test so far.
+    // A constructor tests its tag and width over an object; an argument with its own test is read into a local under the test so far.
     PxCtor(c) -> match tag_of(em, c.name) {
       None -> None,
       Some(tag) -> {
@@ -3216,8 +2766,7 @@ fn pat_test(p: CPat, subj: V, em: Em) -> Option<{ em: Em, c: Bytes }> =
           })
       },
     },
-    // Refutable despite the shape: on a value that is not a record, on the field count when
-    // there is no `..`, and on a field the value does not have.
+    // Refutable despite the shape: a non-record, the field count without `..`, or a missing field.
     PxRecord(r) -> {
       let head = bytes_concat_all([b"rt_record_fits_p(ctx, ", subj.c, b", ", num(len(r.fields)),
                                    b", ", if r.rest { b"0" } else { b"1" }, b")"]);
@@ -3238,8 +2787,7 @@ fn pat_test(p: CPat, subj: V, em: Em) -> Option<{ em: Em, c: Bytes }> =
           },
         })
     },
-    // A refutable `..rest` would need the tail built before it could be tested, which is a
-    // list allocated inside a test that may fail; the reference draws the same line.
+    // A refutable `..rest` would allocate the tail inside a test that may fail, so it is refused.
     PxList(l) ->
       if match l.rest { Some(r) -> !irrefutable(r), None -> false } { None } else {
         let head = bytes_concat_all([b"rt_list_fits_p(ctx, ", subj.c, b", ", num(len(l.items)),
@@ -3262,28 +2810,22 @@ fn pat_test(p: CPat, subj: V, em: Em) -> Option<{ em: Em, c: Bytes }> =
       },
   }
 
-// What the pattern names, bound to the subject. A constructor's argument is a
-// word out of the object, held once more because the object still holds it.
+// A constructor's argument is duplicated when bound: the object still holds it.
 fn pat_bind(em: Em, p: CPat, subj: V) -> Em =
   match p {
-    // The binder is the subject under another name, and carries its shape: a
-    // `match r { x -> x.f }` reads the field at an offset, not by name.
+    // The binder carries the subject's shape, so `match r { x -> x.f }` reads at an offset.
     PxVar(v) -> match v.slot {
       None -> em,
       Some(s) -> { let b = bind_keeping(em, KBoxed, subj.ty, subj.c); remember(ensure_owned(b.em, b.v), s, b.v) },
     },
-    // **Every** argument is read out and held once more, whether or not the
-    // pattern names it: the object still holds it, and the arm's scope is the
-    // same shape either way. A named one is then renamed into scope, exactly as
-    // a `let` renames its value.
+    // Every argument is read and duplicated whether or not the pattern names it, so the arm's scope has one shape.
     PxCtor(c) -> fold(range(0, len(c.args)), em, |acc: Em, i: Int| {
       let w = bind(acc, KBoxed,
         bytes_concat_all([b"ply_words(", subj.c, b")[", num(i), b"]"]));
       let inc = note_holder(line(w.em, bytes_concat_all([b"ply_inc(", w.v.c, b");"])), w.v.c);
       match list_at(c.args, i) { Some(sub) -> pat_bind(inc, sub, w.v), None -> inc }
     }),
-    // The runtime's read by name answers the field held once more, so there is no
-    // increment to add here.
+    // The runtime's read by name answers the field duplicated; no increment here.
     PxRecord(r) -> fold(r.fields, em, |acc: Em, f: CPatField| {
       let idx = field_of(acc, f.name);
       let field = bind(idx.em, KBoxed, bytes_concat_all([
@@ -3307,27 +2849,23 @@ fn pat_bind(em: Em, p: CPat, subj: V) -> Em =
     _ -> em,
   }
 
-// One arm of an `if`, into a buffer of its own so that what follows it can still
-// be numbered. The bind the reference writes here belongs to the block lowering
-// wrapped the branch in, so nothing is added.
+// An `if` arm goes into its own buffer so what follows it can still be numbered.
 fn arm(em: Em, c: Code, params: List<P>) -> Option<{ em: Em, text: Bytes, v: V }> =
   match expr(indent(em), c, params) {
     None -> None,
     Some(o) -> Some({ em: outdent(o.em), text: bytes_join(o.em.out, b""), v: o.v }),
   }
 
-// The same buffer with the join's assignment on the end.
 fn assigned(em: Em, arm_em: Em, text: Bytes, ind: Int, k: Kind, v: V, join: Bytes) -> { em: Em, text: Bytes, made: List<Made> } = {
   let m0 = match k { KBoxed -> materialise(indent(with_out(em, [])), v.c), _ -> indent(with_out(em, [])) };
   let m1 = line(m0, bytes_concat_all([join, b" = ", as_kind(v, k), b";"]));
-  // The join takes the arm's value, and the arm's own holders are released behind it.
+  // The join takes the arm's value; the arm's own holders are released behind it.
   let m2 = if k == KBoxed { assign_owned(with_made(m1, arm_em.made), join, v.c) } else { with_made(m1, arm_em.made) };
   let m3 = release_at(m2, ind + 1);
   { em: outdent(with_out(with_made(m3, em.made), em.out)),
     text: bytes_concat_all([text, bytes_join(m3.out, b"")]), made: m3.made }
 }
 
-// A value as the kind a join holds it in: the reference's `as_kind`.
 fn as_kind(v: V, k: Kind) -> Bytes =
   match k {
     KBoxed -> as_word(v),
@@ -3336,8 +2874,7 @@ fn as_kind(v: V, k: Kind) -> Bytes =
     KNum(w) -> as_num(v, w),
   }
 
-// The same, for a record-valued join: one assignment per field, from the values
-// the record was built out of rather than from the record.
+// A record-valued join: one assignment per field, from the values the record was built from.
 fn joined(em: Em, arm_em: Em, text: Bytes, v: V, names: List<Bytes>, js: List<V>) -> { text: Bytes, made: List<Made> } = {
   let a0 = with_made(indent(with_out(em, [])), arm_em.made);
   let a1 = fold(range(0, len(names)), a0, |acc: Em, i: Int| {
@@ -3359,8 +2896,7 @@ fn blank(em: Em) -> Em =
 
 fn strip(em: Em) -> Bytes = bytes_join(em.out, b"")
 
-// The shape both arms answer, when both answer a record this body built and the
-// two shapes are the same. `None` otherwise, and then the join is one local.
+// The shape both arms answer when both built a record of the same shape; otherwise the join is one local.
 fn shared_shape(em: Em, a: V, b: V) -> Option<List<Bytes>> =
   match a.ty {
     TyRec(na) -> match b.ty {
@@ -3382,24 +2918,19 @@ fn shared_shape(em: Em, a: V, b: V) -> Option<List<Bytes>> =
 
 fn first_name(ns: List<Bytes>) -> Bytes = match list_at(ns, 0) { Some(n) -> n, None -> b"" }
 
-// The record's names in the order the shape holds them, which is by name.
+// Sorted by name: the order a shape holds its fields in.
 fn sorted_names(ns: List<Bytes>) -> List<Bytes> =
   fold(range(0, len(ns)), [], |acc: List<Bytes>, i: Int|
     fold(ns, acc, |a2: List<Bytes>, n: Bytes| if rank_of(ns, n) == i { push(a2, n) } else { a2 }))
 
-// The record the join's fields are assembled back into, after the arms close.
 fn rebuild(em: Em, names: List<Bytes>, js: List<V>) -> Option<Out> =
   Some(build_record(em, names, map(js, |x: V| as_word(x)), map(js, |x: V| x.k), Some(js)))
 
-// The `Int` two literals fold to under an operator, or nothing: the reference's
-// `fold_literals`, rule for rule. Addition, subtraction and multiplication only
-// when they do not overflow; a shift only by a count the width holds.
-// `INT64_C(-9223372036854775808)` is not a constant C can write -- the digits are an
-// unsigned literal and the minus is applied to it, so `1 << 63 < 0` came out false -- and the
-// least `Int` is named instead.
+// `INT64_C(-9223372036854775808)` negates an unsigned literal, which C cannot write as a constant, so the least `Int` is named.
 fn int_lit(n: Int) -> Bytes =
   if n == 0 - 9223372036854775807 - 1 { b"INT64_MIN" } else { bytes_concat_all([b"INT64_C(", num(n), b")"]) }
 
+// Two literals folded under an operator: `+`, `-`, `*` only without overflow, a shift only by a count the width holds.
 fn lit_int(c: Code) -> Option<Int> =
   match c.node {
     NLit(l) -> match l { LInt(n) -> Some(n), _ -> None },
@@ -3442,8 +2973,7 @@ fn checked_mul(a: Int, b: Int) -> Option<Int> =
     if p / a == b && p % a == 0 { Some(p) } else { None }
   }
 
-// Whether a node answers a `Float` or `Decimal`, without emitting it: what the
-// emission's typing says, read structurally, so a join can be known first.
+// Whether a node answers a `Float` or `Decimal`, read structurally before emission so a join's kind is known first.
 fn opaque_of(em: Em, c: Code) -> Bool =
   match c.node {
     NVar(v) -> match v.slot {
@@ -3455,8 +2985,7 @@ fn opaque_of(em: Em, c: Code) -> Bool =
     NApp(a) -> match a.func.node {
       NVar(fv) -> match fv.slot {
         Some(_) -> false,
-        // A definition of this module answers its declared type; a builtin answers
-        // opaque over an opaque argument.
+        // A definition of this module answers its declared type; a builtin answers opaque over an opaque argument.
         None -> if fold(em.here, false, |acc: Bool, h: Def| acc || h.name == fv.name) {
                   ret_of(em.here, fv.name).ty == TyOpaque
                 } else {
@@ -3486,7 +3015,6 @@ fn is_shift(op: Bytes) -> Bool = op == b"shl" || op == b"shr" || op == b"ushr"
 
 fn bitop_c(op: Bytes) -> Bytes = if op == b"bitand" { b"&" } else if op == b"bitor" { b"|" } else { b"^" }
 
-// A wide result narrowed to a width, under the overflow guard: the reference's `narrow`.
 // `code` is `rt_overflow_p`'s: 0 an addition, 1 a subtraction, 2 a negation.
 fn narrow(wide: Out, w: Width, code: Int) -> Option<Out> = {
   let g = line(wide.em, bytes_concat_all([b"if (", wide.v.c, b" < ", int_lit(width_min(w)),
@@ -3495,8 +3023,7 @@ fn narrow(wide: Out, w: Width, code: Int) -> Option<Out> = {
   Some(bind(g, KNum(w), bytes_concat_all([b"(", ctype(KNum(w)), b")", wide.v.c])))
 }
 
-// A shift: the count is tested against the width -- sixty-four for `Int` -- and the shift is
-// done unsigned where C would otherwise leave it undefined.
+// The count is tested against the width (64 for `Int`), and the shift done unsigned where C would leave it undefined.
 fn shift(em: Em, op: Bytes, l: V, r: V, width: Option<Width>) -> Out = {
   let bound = match width { Some(t) -> t.bits, None -> 64 };
   let count = bind(em, KInt, as_int(r));
@@ -3522,8 +3049,7 @@ fn shift(em: Em, op: Bytes, l: V, r: V, width: Option<Width>) -> Out = {
   }
 }
 
-// An operator over a width: both operands as the width's C type, arithmetic done wide and
-// narrowed back under the overflow guard, the rest in the width itself.
+// Arithmetic over a width is done wide and narrowed back under the overflow guard; the rest in the width itself.
 fn width_binary(em: Em, op: Bytes, l: V, r: V, t: Width) -> Option<Out> = {
   let a = as_num(l, t);
   let bb = as_num(r, t);
@@ -3546,30 +3072,21 @@ fn width_binary(em: Em, op: Bytes, l: V, r: V, t: Width) -> Option<Out> = {
   } }
 }
 
-// Every operator but the two that short-circuit and `++`, over two evaluated operands. A width
-// on either side decides the whole operator; otherwise `Int` is C's own, a `Bool` equality is
-// too, and anything a word holds goes through the runtime.
+// A width on either side decides the whole operator; otherwise `Int` and `Bool` equality are C's own, and words go through the runtime.
 fn binary_rest(em: Em, op: Bytes, l: V, r: V) -> Option<Out> = {
   let width = match l.k { KNum(t) -> Some(t), _ -> match r.k { KNum(t) -> Some(t), _ -> None } };
   match width {
     Some(t) -> width_binary(em, op, l, r, t),
     None -> {
       let native = (l.k == KInt && r.k == KInt) || (l.k == KBool && r.k == KBool);
-      // Equality over anything that is not already an untagged scalar is
-      // the runtime's, which walks the two values. The C operator would
-      // compare two *words* -- two pointers, for a record or a
-      // constructor -- and answer no for equal values.
+      // Equality over words goes through the runtime: C's `==` would compare pointers and answer no for equal values.
       if (op == b"eq" || op == b"ne") && !native {
-        // The helper reads both. Under release they are handed over as they are held, and a
-        // temporary among them is released at its scope's end; the reference holds each once
-        // more and never lets go.
+        // Under release both are handed over as held, and a temporary among them is released at its scope's end.
         let lo = if em.release { let w = word_of(em, l); { em: w.em, v: { k: KBoxed, c: w.c, ty: l.ty } } } else { owned(em, l) };
         let ro = if lo.em.release { let w = word_of(lo.em, r); { em: w.em, v: { k: KBoxed, c: w.c, ty: r.ty } } } else { owned(lo.em, r) };
         let e = bind(ro.em, KBool, bytes_concat_all([
           b"rt_equal_p(ctx, ", lo.v.c, b", ", ro.v.c, b")"]));
-        // The helper walks two values and can raise, so the check follows.
-        // The answer is then bound under a name of its own -- and for `!=`
-        // that binding *is* the negation rather than following one.
+        // For `!=` the answer's binding is the negation.
         Some(bind(check(e.em), KBool,
           if op == b"ne" { bytes_concat_all([b"!(", e.v.c, b")"]) } else { e.v.c }))
       } else if is_shift(op) && (l.ty == TyOpaque || r.ty == TyOpaque) {
@@ -3577,14 +3094,10 @@ fn binary_rest(em: Em, op: Bytes, l: V, r: V) -> Option<Out> = {
       } else if (l.k == KBoxed && r.k == KBoxed && (is_arith(op) || compare_op(op) != None))
                 || (is_bitop(op) && (l.ty == TyOpaque || r.ty == TyOpaque)) {
         {
-          // A `Float` or `Decimal` operand, or two words of a type this port cannot see -- which
-          // may both be `Decimal`s: the machine's own operator, through the runtime, so the body
-          // answers what the machine answers. One operand in a register is an `Int` the checker
-          // vouched for on both sides.
+          // A `Float`/`Decimal` operand, or two words that may both be `Decimal`s: the runtime's own operator. One operand in a register means both are checked `Int`s.
           let lo = owned(em, l);
           let ro = owned(lo.em, r);
-          // The answer's type is the reference's: a comparison answers a `Bool`, an operator
-          // over an opaque left operand answers opaque, and otherwise it takes the right's.
+          // A comparison answers `Bool`, an opaque left operand answers opaque, and otherwise the right's type.
           let o = bind_keeping(ro.em, KBoxed,
             if compare_op(op) != None { TyOpen } else if l.ty == TyOpaque { TyOpaque } else { r.ty },
             bytes_concat_all([b"rt_binary_p(ctx, ", num(binary_code(op)), b", ",
@@ -3598,8 +3111,6 @@ fn binary_rest(em: Em, op: Bytes, l: V, r: V) -> Option<Out> = {
         let a = { k: KInt, c: as_int(l), ty: TyOpen };
         let bb = { k: KInt, c: as_int(r), ty: TyOpen };
         match compare_op(op) {
-          // `!=` is written as the negation of `==`, which is what the
-          // reference emits: one comparison in the C for the two spellings.
           Some(c) -> Some(bind(em, KBool,
             if op == b"ne" { bytes_concat_all([b"!((", a.c, b") == (", bb.c, b"))"]) }
             else { bytes_concat_all([b"(", a.c, b") ", c, b" (", bb.c, b")"]) })),
@@ -3610,8 +3121,7 @@ fn binary_rest(em: Em, op: Bytes, l: V, r: V) -> Option<Out> = {
   }
 }
 
-// The six orderings, which compile to C's own on the untagged integers rather
-// than to a helper: an `Int` comparison cannot raise.
+// The six orderings compile to C's own on untagged integers: an `Int` comparison cannot raise.
 fn compare_op(op: Bytes) -> Option<Bytes> =
   if op == b"lt" { Some(b"<") }
   else if op == b"le" { Some(b"<=") }
@@ -3621,9 +3131,7 @@ fn compare_op(op: Bytes) -> Option<Bytes> =
   else if op == b"ne" { Some(b"!=") }
   else { None }
 
-// Addition and subtraction are checked in the emitted C, because a wrap is a
-// wrong answer and the runtime's own overflow report is what the machine gives.
-// The rest go through `rt_arith`, which raises for a zero divisor.
+// Addition and subtraction are overflow-checked in the C; the rest go through `rt_arith`, which raises on a zero divisor.
 fn arithmetic(em: Em, op: Bytes, l: V, r: V) -> Out =
   if is_add_or_sub(op) {
     let f = fresh(em);
@@ -3639,23 +3147,13 @@ fn arithmetic(em: Em, op: Bytes, l: V, r: V) -> Out =
     { em: check(o.em), v: o.v }
   }
 
-// One definition as the C that runs it: the signature, the fuel the machine
-// bounds a compiled recursion by, the body, and the entry the seam calls it
-// through.
-// Every parameter is opened at entry, in declaration order, whether the body
-// reads it or not -- an unused one still gets its temporary, and a `Bool` opens
-// through a different helper than an `Int`. Opening lazily at the first read
-// answers the same and writes the temporaries in a different order, which is
-// what `a * b + c` showed.
+// Every parameter is opened at entry, in order, read or not: opening lazily writes the temporaries in a different order.
 fn prologue(em: Em, params: List<P>) -> Em =
   fold(range(0, len(params)), em, |acc: Em, i: Int|
     match list_at(params, i) {
       None -> acc,
       Some(p) -> { let acc = note_bound(note_holder(acc, bytes_concat(b"p", num(i))), bytes_concat(b"p", num(i))); match p.k {
-        // A record arrives as its word and is never opened here: there is nothing
-        // to untag, and each read of it binds the word where the read is. Its
-        // reads are still charged to it, or the release rule sees an object
-        // nothing reads and lets nothing go.
+        // A record arrives as its word and is never opened, but its reads are still charged, or the release rule sees nothing read it.
         KBoxed -> charge(acc, i, bytes_concat(b"p", num(i))),
         KBool -> {
           let o = bind(acc, KBool, bytes_concat_all([b"rt_unbox_bool_p(ctx, p", num(i), b")"]));
@@ -3674,34 +3172,17 @@ fn prologue(em: Em, params: List<P>) -> Em =
       } },
     })
 
-// `Int` and `Bool` are the two the prologue knows how to open. Anything else --
-// a record, a list, a type variable, a missing annotation -- refuses the whole
-// function rather than guessing at a helper.
-// A named type resolves to the record it stands for: an alias is transparent to
-// the checker, so by the time the reference's emitter sees `v: Values` the type
-// *is* the record and a field of one is read at an offset.
-//
-// It is on. Getting there took five rules about *releases*, each found by the
-// corpus and each recorded where it is made: a release counts an object's reads
-// and not one slot's, a field whose kind is a word does not release its base, an
-// update emits its own build, an update at the tail releases anyway, and an arm
-// reached through a scrutinee is still a tail. The disagreements went 38 to 8
-// over them, and the port reaches 484 shipped bodies against 426.
-
 // A module's type aliases, under the binder an import gives it in the module being emitted.
 pub type ModAliases = { binder: Bytes, aliases: List<Alias> }
 
 fn param_kind_in(aliases: List<Alias>, t: Option<TypeExpr>)
     -> Option<{ k: Kind, ty: Ty }> = param_kind_with(aliases, [], t)
 
-// The same, with the imported modules' aliases in reach: `http::Response` resolves through
-// `http`'s own aliases to the record it names, and a field of it is read at an offset.
+// With imported aliases in reach: `http::Response` resolves through `http`'s aliases to its record, read at offsets.
 fn param_kind_with(aliases: List<Alias>, others: List<ModAliases>, t: Option<TypeExpr>)
     -> Option<{ k: Kind, ty: Ty }> = written_kind(aliases, others, [], t)
 
-// An alias's arguments are resolved where they are written, and its body in the alias's own
-// module with its parameters bound to them: `Ran<http::Response>` reads `response.status` at
-// an offset, through two modules' scopes.
+// An alias's arguments resolve where written, its body in the alias's own module with its parameters bound to them.
 fn bind_args(aliases: List<Alias>, others: List<ModAliases>, vars: List<Bound>,
              params: List<Bytes>, args: List<TypeExpr>) -> List<Bound> =
   map(range(0, len(params)), |i: Int| {
@@ -3745,8 +3226,7 @@ fn written_kind(aliases: List<Alias>, others: List<ModAliases>, vars: List<Bound
     _ -> param_kind_record(aliases, others, vars, t),
   }
 
-// A record's fields resolve in the same scope as the record: a field typed by an alias, or by
-// another module's type, is a shape the port can then see.
+// A record's fields resolve in the record's own scope.
 fn param_kind_record(aliases: List<Alias>, others: List<ModAliases>, vars: List<Bound>, t: Option<TypeExpr>)
     -> Option<{ k: Kind, ty: Ty }> =
   match t {
@@ -3763,33 +3243,25 @@ fn param_kind_record(aliases: List<Alias>, others: List<ModAliases>, vars: List<
 
 pub fn param_kind(t: Option<TypeExpr>) -> Option<{ k: Kind, ty: Ty }> =
   match t {
-    // `Int` and `Bool` are the two the prologue opens. Everything else arrives
-    // as its word and is read as one, which is what the prologue does with a
-    // record and what it does with a list, a `Bytes` or a type of the program's
-    // own.
+    // The prologue opens `Int` and `Bool`; everything else arrives and is read as a word.
     Some(TCon(c)) ->
-      // A type of another module is a word whose shape this port cannot see; the reference
-      // resolves it through the checker, and a field read of one is the next thing to reach.
+      // Another module's type is a word of unknown shape.
       if c.name.module != None { Some({ k: KBoxed, ty: TyOpen }) }
       else if c.name.name.name == b"Int" && len(c.args) == 0 { Some({ k: KInt, ty: TyOpen }) }
       else if c.name.name.name == b"Bool" && len(c.args) == 0 { Some({ k: KBool, ty: TyOpen }) }
-      // The two the inline builtins ask about: with the kind known there is no
-      // test to make and the read is a load.
+      // The inline builtins ask about these two: with the kind known the read is a plain load.
       else if c.name.name.name == b"Bytes" && len(c.args) == 0 { Some({ k: KBoxed, ty: TyBytes }) }
       else if c.name.name.name == b"List" && len(c.args) == 1 { Some({ k: KBoxed, ty: TyList }) }
       else if (c.name.name.name == b"Float" || c.name.name.name == b"Decimal") && len(c.args) == 0 {
         Some({ k: KBoxed, ty: TyOpaque }) }
-      // A width below sixty-four bits is carried in a register; the two at sixty-four are words
-      // the reference treats as opaque.
+      // A width below 64 bits is carried in a register; the 64-bit widths are opaque words.
       else if len(c.args) == 0 && width_named(c.name.name.name) != None {
         match width_named(c.name.name.name) {
           Some(w) -> if carried(w) { Some({ k: KNum(w), ty: TyOpen }) } else { Some({ k: KBoxed, ty: TyOpaque }) },
           None -> Some({ k: KBoxed, ty: TyOpen }),
         } }
       else { Some({ k: KBoxed, ty: TyOpen }) },
-    // The field *order* is the checker's, not the declaration's: a record written
-    // `{ z: Int, a: Int }` reads `.z` at index 1. Sorting by name here is what
-    // makes an offset agree.
+    // Field order is the checker's (sorted by name), not the declaration's.
     Some(TRecord(r)) ->
       if fold(r.fields, false, |acc: Bool, f: { name: Ident, ty: TypeExpr }|
                 acc || param_kind(Some(f.ty)) == None) { None }
@@ -3798,14 +3270,10 @@ pub fn param_kind(t: Option<TypeExpr>) -> Option<{ k: Kind, ty: Ty }> =
                  Some(x) -> { name: f.name.name, k: x.k, ty: x.ty },
                  None -> { name: f.name.name, k: KBoxed, ty: TyOpen },
                })) }) },
-    // Any other written type -- a function, a variable, a unit -- is a word too.
-    // What stays refused is a parameter with no annotation at all, where there is
-    // nothing to read.
+    // Any other written type is a word; only a missing annotation is refused.
     Some(_) -> Some({ k: KBoxed, ty: TyOpen }),
     None -> None,
   }
-
-
 
 pub fn emit_fn(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>, name: Bytes, params: List<P>, body: Code) -> Option<Bytes> =
   match emit_fn_full(module, 0, here, imports, ctors, builtins, name, params, body, [], false) {
@@ -3813,13 +3281,10 @@ pub fn emit_fn(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: L
     Some(f) -> Some(f.text),
   }
 
-// The C of one definition, with the tables it names by its own positions, in the
-// encoding `crates/ply-codegen/src/c/cache.rs` keeps a body in: what the C tier
-// reads when this emitter is its producer.
+// One definition's C, with its tables encoded as the C tier's body cache keeps them.
 pub fn emit_fn_full(module: Bytes, module_index: Int, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>, name: Bytes, params: List<P>, body: Code, effects: List<EffectName>, release: Bool) -> Option<{ text: Bytes, tables: Bytes }> = {
   let reads = slots_read(body);
-  // The reuse tokens come before the prologue, and are named by width rather
-  // than numbered, so finding them does not disturb the temporaries.
+  // Reuse tokens are named by width, not numbered, so they do not disturb the temporaries.
   let start = fold([], { out: [], n: 0, conv: [], ind: 0, reads: reads, shapes: [], built: [], module: module, module_index: module_index, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: [], owner: name, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [], tail: true, calls: [], refused: None, deferred: [], rlocals: [], performs: [], handles: [], landing: None, effects: effects, release: release, pinned: [], bound: [] },
     |acc: Em, w: Int| line(acc, bytes_concat_all([b"Word tok", num(w), b" = 0;"])));
   match expr(prologue(start, params), body, params) {
@@ -3837,9 +3302,7 @@ pub fn emit_fn_full(module: Bytes, module_index: Int, here: List<Def>, imports: 
         b"Word ply_", name, b"_entry(PlyCtx *ctx, const Word *args) {\n  return ply_", name,
         b"(ctx", fold(range(0, len(params)), b"", |acc: Bytes, i: Int|
           bytes_concat_all([acc, b", args[", num(i), b"]"])), b");\n}\n"]);
-      // The declarations are written now that the body has said which it used,
-      // and go in front of it. They take no temporary of their own, so nothing
-      // the body wrote has to move.
+      // Token declarations go in front once the body has used them; they take no temporary, so nothing moves.
       let toks = fold(sorted_widths(o.em.toks), b"", |acc: Bytes, w: Int|
         bytes_concat_all([acc, b"  Word tok", num(w), b" = 0;\n"]));
       let decls = fold(o.em.rlocals, b"", |acc: Bytes, r: Bytes| bytes_concat_all([acc, b"  Word ", r, b" = 0;\n"]));
@@ -3849,7 +3312,7 @@ pub fn emit_fn_full(module: Bytes, module_index: Int, here: List<Def>, imports: 
   }
 }
 
-// Why a body was refused, or nothing when it was emitted: the same walk, read for its reason.
+// Why a body was refused, or nothing when it was emitted.
 pub fn emit_fn_why(module: Bytes, module_index: Int, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>, name: Bytes, params: List<P>, body: Code, effects: List<EffectName>, release: Bool) -> Option<Bytes> = {
   let reads = slots_read(body);
   let start = fold([], { out: [], n: 0, conv: [], ind: 0, reads: reads, shapes: [], built: [], module: module, module_index: module_index, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: [], owner: name, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [], tail: true, calls: [], refused: None, deferred: [], rlocals: [], performs: [], handles: [], landing: None, effects: effects, release: release, pinned: [], bound: [] },
@@ -3860,9 +3323,7 @@ pub fn emit_fn_why(module: Bytes, module_index: Int, here: List<Def>, imports: L
   }
 }
 
-// One body's tables as the reference's cache encodes them: five tables, then the
-// calls, each as a count and one entry per line. A constant is `s`/`b` and its
-// bytes in hex; only strings and byte strings reach this port's pool.
+// Five tables, then the calls, each as a count and one entry per line; a constant is its tag and its bytes in hex.
 fn encode_tables(em: Em, owner: Bytes) -> Bytes =
   bytes_concat_all([
     counted(b"consts", map(em.consts, |l: Lit| match l {
@@ -3890,13 +3351,7 @@ fn counted(what: Bytes, xs: List<Bytes>) -> Bytes =
   fold(xs, bytes_concat_all([what, b" ", num(len(xs)), b"\n"]),
     |acc: Bytes, x: Bytes| bytes_concat_all([acc, x, b"\n"]))
 
-// The record widths this body gives back, by the rule `release_base` applies:
-// a bare variable read at its own last use, read exactly once in the body, whose
-// type says how wide it is.
-// A slot's shape, as the pre-pass can know it: seeded from the parameters and
-// extended by every `let`. The emitter learns the same shapes as it goes; this
-// walk has to learn them too, or a release it did not foresee names a reuse
-// token that was never declared.
+// A slot's shape, as the width pre-pass learns it from the parameters and every `let`.
 pub type Shaped = { slot: Int, ty: Ty }
 
 fn shape_at(env: List<Shaped>, slot: Int) -> Ty =
@@ -3954,8 +3409,7 @@ fn widths_in(c: Code, env: List<Shaped>, here: List<Def>, reads: List<Int>) -> L
     NIf(i) -> merge_widths(widths_in(i.cond, env, here, reads),
                 merge_widths(widths_in(i.then_branch, env, here, reads),
                              widths_in(i.else_branch, env, here, reads))),
-    // A `let` puts its value's shape in scope for everything after it, which is
-    // what lets a release of a bound record find its width.
+    // A `let` puts its value's shape in scope, so a release of a bound record finds its width.
     NBlock(b) -> {
       let walked = fold(b.stmts, { env: env, ws: [] },
         |acc: { env: List<Shaped>, ws: List<Int> }, st: CStmt| match st {
@@ -3970,9 +3424,7 @@ fn widths_in(c: Code, env: List<Shaped>, here: List<Def>, reads: List<Int>) -> L
     },
     NList(l) -> fold(l.items, [], |acc: List<Int>, x: Code|
       merge_widths(acc, widths_in(x, env, here, reads))),
-    // The rest of the walk, so a record built inside a call's argument or a
-    // match arm still declares its token. Leaving these out declared no token
-    // for `std.http.endless`, which builds one two fields wide inside a call.
+    // Call arguments and arms too: a record built there still needs its token.
     NApp(a) -> fold(a.args, widths_in(a.func, env, here, reads), |acc: List<Int>, x: Code|
       merge_widths(acc, widths_in(x, env, here, reads))),
     NMatch(m) -> fold(m.arms, widths_in(m.scrutinee, env, here, reads),
@@ -3996,9 +3448,7 @@ fn widths_in(c: Code, env: List<Shaped>, here: List<Def>, reads: List<Int>) -> L
     NLit(_) -> [],
   }
 
-// Ascending, because the reference keeps its tokens in a sorted set and the
-// declarations come out in that order rather than in the order the widths were
-// found.
+// Ascending: declarations come out sorted, not in the order the widths were found.
 fn sorted_widths(xs: List<Int>) -> List<Int> =
   fold(range(0, len(xs)), [], |acc: List<Int>, _i: Int|
     match fold(xs, None, |best: Option<Int>, x: Int|
@@ -4012,8 +3462,7 @@ fn merge_widths(a: List<Int>, b: List<Int>) -> List<Int> =
   fold(b, a, |acc: List<Int>, x: Int|
     if fold(acc, false, |seen: Bool, y: Int| seen || y == x) { acc } else { push(acc, x) })
 
-// What every compiled function does before its body: spends fuel, and refuses when the native
-// stack is nearly out, because a C frame is not a machine frame.
+// Spends fuel, and refuses when the native stack is nearly out: a C frame is not a machine frame.
 fn fuel_head() -> Bytes = bytes_concat_all([
   b"  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n",
   b"  { char probe; if ((uintptr_t)&probe < ctx->stack_floor) { rt_no_stack_p(ctx); return 0; } }\n",
@@ -4026,28 +3475,19 @@ test "a body that answers a literal" {
 }
 
 test "a form this port does not reach is refused" {
-  // A `Float` literal: the fragment has no path for one at all, on either side.
   assert_eq(match emit_fn(b"m", [], [], [], [], b"m_f", [], { own: Borrowed, span: dummy_span(), node: NLit(LBad) }) {
     Some(_) -> false, None -> true }, true)
 }
 
 // --- the emitter's entry ----------------------------------------------------
-//
-// Lower each function, hand it to `emit.ply`, and answer the C for the ones both
-// stages reached. Framed as the emit oracle frames it: `C;n;` then `f:<name>;`
-// and the body per definition.
 
-// The module's own name, so a dump over many modules names each body the way the
-// reference names it -- `std.hash.round`, not `m.round`.
-// One module's bodies, as it was parsed and rewritten but with no defaults filled: what the
-// per-module differential compares.
+// One module's bodies, parsed and rewritten with no defaults filled.
 fn emit_all_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, src: Bytes, release: Bool) -> List<Emitted> = {
   let r = parse(src);
   let x = expand(r.node, r.p.uses_sets, r.p.diags);
   emit_module(module, 0, x.module, ctors, builtins, [], [], [], release)
 }
 
-// Every definition of a module, with its declared return as the emitter reads it.
 fn aliases_in(m: Module) -> List<Alias> =
   fold(m.items, [], |acc: List<Alias>, it: Item|
     match it {
@@ -4084,10 +3524,7 @@ fn defs_in(module: Bytes, m: Module, pure: List<Bytes>, program: List<ModDefs>) 
     })
 }
 
-// Every module of a program, resolved together first -- so a call's default arguments are
-// filled and every `derive` is expanded, which is what the reference's emitter sees -- and then
-// emitted one module at a time. A program that does not resolve emits nothing: a body emitted
-// against unfilled calls would be wrong rather than partial.
+// Resolved together first, so defaults are filled and derives expanded; a program that does not resolve emits nothing.
 fn emit_all_program(sources: List<Source>, ctors: List<Bytes>, builtins: List<Bytes>, release: Bool) -> List<Emitted> = {
   let parsed = map(range(0, len(sources)), |i: Int| {
     let s = match list_at(sources, i) { Some(x) -> x, None -> { name: b"", src: b"" } };
@@ -4126,9 +3563,7 @@ fn emit_module(module: Bytes, module_index: Int, x_module: Module, ctors: List<B
         let path = bytes_join_dots(map(im.path, |i: Ident| i.name));
         fold(ns, acc, |a: List<Imported>, n: Ident| push(a, { name: n.name, module: path, defs: defs_of(path) }))
       },
-      // A whole module binds under its last segment, or under its alias, and a
-      // call through it is written `binder::name`. The binder is recorded under
-      // the empty name so one table answers both spellings.
+      // A whole module binds under its last segment or alias; the binder goes under the empty name so one table answers both spellings.
       IModule -> {
         let path = bytes_join_dots(map(im.path, |i: Ident| i.name));
         push(acc, { name: last_segment(im.path), module: path, defs: defs_of(path) })
@@ -4167,8 +3602,7 @@ fn emit_module(module: Bytes, module_index: Int, x_module: Module, ctors: List<B
                      k: match list_at(kinds, i) { Some(Some(p)) -> p.k, _ -> KInt },
                      ty: match list_at(kinds, i) { Some(Some(p)) -> p.ty, _ -> TyOpen } });
         let after = match if known { lower_fn(names, d.body) } else { None } {
-          // What the body handles is read off the source, so the unit's fixpoint still drops
-          // its performers when the lowering never reached the body.
+          // Handled operations are read off the source, so the fixpoint still drops performers of an unlowered body.
           None -> { out: push(acc.out, { name: full, text: b"", tables: b"", handles: ast_handles(d.body, effects),
                                          why: Some(if known { b"a body the lowering does not reach" } else { b"a parameter with no written type" }) }),
                     tests: acc.tests, laws: acc.laws },
@@ -4181,8 +3615,7 @@ fn emit_module(module: Bytes, module_index: Int, x_module: Module, ctors: List<B
         };
         clause_roots(after, d, names, kinds, module, module_index, here, imports, ctors, builtins, effects, release, aliases, others)
       },
-      // A test is a root the machine enters whole: a nullary body named by its place
-      // among the module's tests, as the reference names it.
+      // A test is a nullary root named by its place among the module's tests.
       ITest(t) -> {
         let root = bytes_concat_all([b"test_", num(acc.tests)]);
         let full = qualify(module, bytes_concat_all([b"test#", num(acc.tests)]));
@@ -4196,8 +3629,7 @@ fn emit_module(module: Bytes, module_index: Int, x_module: Module, ctors: List<B
           },
         }
       },
-      // A law's guard and body are roots the judge enters with the binders' values, named as
-      // the reference names them (ADR 0045 §"The facade").
+      // A law's guard and body are roots the judge enters with the binders' values.
       ILaw(d) -> {
         let names = map(d.binders, |b: Binder| b.name.name);
         let kinds = map(d.binders, |b: Binder| param_kind_with(aliases, others, Some(b.ty)));
@@ -4219,7 +3651,6 @@ fn emit_module(module: Bytes, module_index: Int, x_module: Module, ctors: List<B
   walked.out
 }
 
-// One emitted definition: its program-wide name, its C, and its tables encoded.
 // `why` is the refusal's reason, and then `text` and `tables` are empty.
 pub type Emitted = { name: Bytes, text: Bytes, tables: Bytes, why: Option<Bytes>, handles: List<Bytes> }
 
@@ -4245,8 +3676,7 @@ fn root_emitted(module: Bytes, module_index: Int, here: List<Def>, imports: List
     },
   }
 
-// A definition's `requires` clauses over its parameters and its `ensures` clauses over them and
-// then `result`, each a root of its own: `<owner>#requires#<k>`, `<owner>#ensures#<k>`.
+// `requires` and `ensures` clauses as roots: `<owner>#requires#<k>`, `<owner>#ensures#<k>`.
 fn clause_roots(acc: Walk, d: FnDef, names: List<Bytes>, kinds: List<Option<{ k: Kind, ty: Ty }>>, module: Bytes, module_index: Int,
                 here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>,
                 effects: List<EffectName>, release: Bool, aliases: List<Alias>, others: List<ModAliases>) -> Walk = {
@@ -4277,11 +3707,7 @@ fn clause_roots(acc: Walk, d: FnDef, names: List<Bytes>, kinds: List<Option<{ k:
 fn concat_effects(a: List<EffectName>, b: List<EffectName>) -> List<EffectName> =
   fold(b, a, |acc: List<EffectName>, x: EffectName| push(acc, x))
 
-// The operations a body's `handle` clauses answer, as `effect#op` under the program-wide
-// effect name, read off the lowered tree: a refused body still says what it would have
-// handled, so the unit can drop the performers with it.
-// The operations a body handles, read off its source: `walk_handles` over the expression tree
-// rather than the lowered one, for a body the lowering did not reach.
+// The operations a body handles, read off its source, so a body the lowering did not reach still names them.
 fn ast_handles(e: Expr, effects: List<EffectName>) -> List<Bytes> = {
   let here = |acc: List<Bytes>, x: Expr| concat_names(acc, ast_handles(x, effects));
   let all = |xs: List<Expr>| fold(xs, [], here);
@@ -4366,22 +3792,16 @@ pub fn emit_dump_all(names: List<Bytes>, srcs: List<Bytes>, ctors: List<Bytes>, 
   string_of_bytes(fold(emit_all_program(zip_sources(names, srcs), ctors, builtins, false), b"C;1;", |acc: Bytes, e: Emitted|
     if e.why != None { acc } else { bytes_concat_all([acc, b"f:", e.name, b";", e.text, b";"]) }))
 
-// Every body the port refused over a program, one per line as `<name> :: <reason>`: the census
-// of what keeps it out of the rest.
+// Every refused body, one per line as `<name> :: <reason>`.
 pub fn emit_refusals_all(names: List<Bytes>, srcs: List<Bytes>, ctors: List<Bytes>, builtins: List<Bytes>) -> String =
   string_of_bytes(fold(emit_all_program(zip_sources(names, srcs), ctors, builtins, true), b"", |acc: Bytes, e: Emitted|
     match e.why { None -> acc, Some(w) -> bytes_concat_all([acc, e.name, b" :: ", w, b"\n"]) }))
 
-// The unit's rendering over a whole program: every body as the producer's frame, and every
-// refusal as a frame of its own, so the driver that enters the chain whole can drop what the
-// port refused as the reference's fixpoint drops what it refused.
-// The frames are collected and joined once: appending each to the dump so far would copy the
-// dump per body, quadratic in a heap that keeps what an entry lets go.
+// Every body as a producer frame and every refusal as its own frame, so the driver can drop what was refused. Joined once.
 pub fn emit_unit_all(names: List<Bytes>, srcs: List<Bytes>, ctors: List<Bytes>, builtins: List<Bytes>) -> String =
   string_of_bytes(bytes_join(fold(emit_all_program(zip_sources(names, srcs), ctors, builtins, true), [], |acc: List<Bytes>, e: Emitted|
     match e.why {
-      // A refusal still says which operations the body would have handled, so the fixpoint can
-      // drop their performers with it.
+      // A refusal still names the operations the body would have handled, so the fixpoint drops their performers.
       Some(w) -> {
         let frame = bytes_concat_all([w, b"\nhandles ", bytes_join(e.handles, b" ")]);
         push(acc, bytes_concat_all([b"refused ", e.name, b" ", num(bytes_len(frame)), b"\n", frame]))
@@ -4400,8 +3820,7 @@ pub fn emit_bodies_all(names: List<Bytes>, srcs: List<Bytes>, ctors: List<Bytes>
       push(acc, bytes_concat_all([b"body ", e.name, b" ", num(bytes_len(enc)), b"\n", enc]))
     }), b""))
 
-// The same under the reference's ownership, which keeps every count until the entry ends:
-// the text `harness/tests/emit_diff.rs` compares against the reference's, body for body.
+// Without release every count is kept until the entry ends: the text compared against the Rust back end.
 pub fn emit_bodies_reference(names: List<Bytes>, srcs: List<Bytes>, ctors: List<Bytes>, builtins: List<Bytes>) -> String =
   string_of_bytes(bytes_join(fold(emit_all_program(zip_sources(names, srcs), ctors, builtins, false), [], |acc: List<Bytes>, e: Emitted|
     if e.why != None { acc } else {
@@ -4409,8 +3828,7 @@ pub fn emit_bodies_reference(names: List<Bytes>, srcs: List<Bytes>, ctors: List<
       push(acc, bytes_concat_all([b"body ", e.name, b" ", num(bytes_len(enc)), b"\n", enc]))
     }), b""))
 
-// A module's place among the sources: what a site names its module by, and the order the
-// runtime resolves it in.
+// A module's place among the sources: what a site names its module by, and the order the runtime resolves it in.
 fn source_index(sources: List<Source>, name: Bytes) -> Int =
   fold(range(0, len(sources)), -1, |acc: Int, i: Int|
     if acc >= 0 { acc } else {
@@ -4422,9 +3840,7 @@ fn zip_sources(names: List<Bytes>, srcs: List<Bytes>) -> List<Source> =
     { name: match list_at(names, i) { Some(n) -> n, None -> b"" },
       src: match list_at(srcs, i) { Some(t) -> t, None -> b"" } })
 
-// The producer's rendering, framed by length so no byte of a body is a delimiter:
-// `body <name> <n>\n` and then exactly `n` bytes -- the tables in the cache's
-// encoding, `text\n`, and the C.
+// Framed by length so no byte of a body is a delimiter: `body <name> <n>\n`, then exactly `n` bytes.
 pub fn emit_bodies_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, src: Bytes) -> String =
   string_of_bytes(fold(emit_all_in(module, ctors, builtins, src, true), b"", |acc: Bytes, e: Emitted|
     if e.why != None { acc } else {
