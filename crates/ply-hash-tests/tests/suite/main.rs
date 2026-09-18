@@ -6,6 +6,7 @@ mod bodies;
 mod derivation;
 mod effect_sets;
 mod effect_sets_audit;
+mod fixture;
 mod map;
 mod modules;
 mod modules_audit;

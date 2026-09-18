@@ -101,9 +101,9 @@ pub fn exists(dir: &Path) -> bool {
 }
 
 /// Builds the emitter's own program from the bundle: the bundle's C is compiled and loaded
-/// against the tables it carries. Nothing is emitted and nothing is parsed; the modules are
-/// numbered from zero, as the bootstrap assigns them. A bundle emitted against a helper table this
-/// runtime's does not start with fails here with [`super::exports::Unserved`].
+/// against the tables it carries. Nothing is emitted and nothing is parsed, so a failure inside it
+/// names no place. A bundle emitted against a helper table this runtime's does not start with
+/// fails here with [`super::exports::Unserved`].
 ///
 /// The embedded bundle loads through [`super::upgrade`], except under nextest, where a background
 /// compile would contend with the suite and change which object a later test loads.
