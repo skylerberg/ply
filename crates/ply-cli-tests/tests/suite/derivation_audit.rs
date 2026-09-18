@@ -15,7 +15,6 @@ fn one(source: &str) -> TempDir {
     project(&[("m.ply", source)])
 }
 
-/// `Checker::require_written_signature` keys `E0126`'s exemption on `FnDef::derived`; without it every `derive` stops checking.
 #[test]
 fn a_derived_definition_is_exempt_from_the_written_signature_rule() {
     let dir = one("import std.json\n\
