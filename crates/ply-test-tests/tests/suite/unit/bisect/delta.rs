@@ -25,8 +25,8 @@ impl Compiled {
         let mut program = Program::single(module);
         let resolved = ply_syntax::resolve(&mut program)
             .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = ply_core::check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
+        let check =
+            crate::fixture::port_check(&[(String::new(), src.to_string())], &[SourceId(0)]);
         let hashes = ply_hash::hash_program(&program, &resolved, &check)
             .unwrap_or_else(|d| panic!("the fixture must hash: {d:#?}"));
         Compiled {
@@ -525,8 +525,12 @@ fn compiled_program(modules: &[(&str, &str)]) -> Compiled {
     let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
     let resolved = ply_syntax::resolve(&mut program)
         .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-    let check = ply_core::check_program(&program, &resolved)
-        .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
+    let sources: Vec<(String, String)> = modules
+        .iter()
+        .map(|(name, src)| (ModuleName::from_dotted(name).to_string(), (*src).to_string()))
+        .collect();
+    let ids: Vec<SourceId> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
+    let check = crate::fixture::port_check(&sources, &ids);
     let hashes = ply_hash::hash_program(&program, &resolved, &check)
         .unwrap_or_else(|d| panic!("the fixture must hash: {d:#?}"));
     Compiled {
