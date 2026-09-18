@@ -715,7 +715,11 @@ impl Ctx {
         self.heap.to_word(&tables.layouts, v)
     }
 
+    /// Safe on any word an error path meets: an immediate or `0` reads no memory.
     fn type_name(&self, w: Word) -> &'static str {
+        if w == 0 {
+            return "no value";
+        }
         self.value(w).type_name()
     }
 }
@@ -2170,18 +2174,19 @@ pub unsafe extern "C" fn rt_builtin_value(ctx: *mut Ctx, index: i64) -> i64 {
     ctx.heap.bridge(Value::builtin(b))
 }
 
-/// A constructor used as a value, likewise.
-/// The singleton a nullary constructor *is*, as against the constructor as a function value,
-/// which is what `rt_ctor_value` answers. The two are not interchangeable: `None` is a value and
-/// `Some` is a function, and a tier that asks for the wrong one gets a closure where a variant
-/// belongs and answers every `None` case wrongly.
+/// The singleton a nullary constructor *is*, and `0` for any other constructor.
 pub unsafe extern "C" fn rt_nullary(ctx: *mut Ctx, index: i64) -> i64 {
     unsafe { &*ctx }.nullary(index as u32)
 }
 
+/// A constructor named as a value: the singleton a nullary one is, and a function otherwise.
 pub unsafe extern "C" fn rt_ctor_value(ctx: *mut Ctx, index: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
-    let (name, arity) = ctx.tables.layouts.ctors[index as usize].clone();
+    let (name, arity) = &ctx.tables.layouts.ctors[index as usize];
+    if *arity == 0 {
+        return ctx.nullary(index as u32);
+    }
+    let (name, arity) = (name.clone(), *arity);
     ctx.heap.bridge(Value::Closure(Arc::new(Closure {
         name: Some(name.clone()),
         kind: ClosureKind::Ctor { name, arity },
@@ -2465,11 +2470,11 @@ pub unsafe extern "C" fn rt_map_fold(ctx: *mut Ctx, map: i64, init: i64, f: i64)
         heap::dec(f);
         return acc;
     }
-    let value = c.value(map);
-    let Value::Map(entries) = &value else {
+    let value = (map != 0).then(|| c.value(map));
+    let Some(Value::Map(entries)) = &value else {
         let d = error(format!(
             "`map_fold` needs a Map, and this is {}",
-            value.type_name()
+            c.type_name(map)
         ));
         return c.fail(d);
     };

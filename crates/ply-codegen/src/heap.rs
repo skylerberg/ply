@@ -1233,10 +1233,10 @@ impl Drop for Heap {
 
 // --- Counts ------------------------------------------------------------------------------------
 
-/// One more holder of `w`.
+/// One more holder of `w`. Zero is no object, as `ply_inc` and `ply_dec` read it.
 #[inline]
 pub fn inc(w: Word) {
-    if is_imm(w) {
+    if is_imm(w) || w == 0 {
         return;
     }
     let o = obj(w);
@@ -1251,7 +1251,7 @@ pub fn inc(w: Word) {
 /// One holder fewer; the last one dismantles the object, children and all.
 #[inline]
 pub fn dec(w: Word) {
-    if is_imm(w) {
+    if is_imm(w) || w == 0 {
         return;
     }
     let o = obj(w);
@@ -1547,6 +1547,9 @@ pub fn as_int(w: Word) -> Option<i64> {
     if is_imm(w) {
         return Some(imm_value(w));
     }
+    if w == 0 {
+        return None;
+    }
     let o = obj(w);
     unsafe {
         if (*o).kind == KIND_INT {
@@ -1559,7 +1562,7 @@ pub fn as_int(w: Word) -> Option<i64> {
 
 #[inline]
 pub fn as_bool(w: Word) -> Option<bool> {
-    if is_imm(w) {
+    if is_imm(w) || w == 0 {
         return None;
     }
     let o = obj(w);
