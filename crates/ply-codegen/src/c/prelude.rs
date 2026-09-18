@@ -82,7 +82,7 @@ static inline int ply_sub_ov(int64_t a, int64_t b, int64_t *r) {
 
 static inline Word ply_imm(int64_t v) { return (Word)(((uint64_t)v << 1) | 1); }
 static inline int64_t ply_imm_value(Word w) { return w >> 1; }
-static inline int ply_fits_imm(int64_t v) { return ((v << 1) >> 1) == v; }
+static inline int ply_fits_imm(int64_t v) { return v >= -(INT64_C(1) << 62) && v < (INT64_C(1) << 62); }
 
 /* An immortal object carries `rc == UINT32_MAX` and is never counted, exactly as `heap.rs` says. */
 /* A record dying at a count of one, with no children to let go of, becomes the token the next

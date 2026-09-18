@@ -44,6 +44,7 @@ pub mod producer;
 pub mod sweep;
 pub mod tables;
 pub mod toolchain;
+pub mod upgrade;
 
 pub use build::{Native, Produced, build, load_unit, produce, served};
 pub use exports::{Exports, Unserved};

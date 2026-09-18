@@ -35,6 +35,7 @@ pub fn write(dir: &Path, text: &str, sources_digest: &str) -> Result<()> {
 pub struct Bundle {
     unit: std::borrow::Cow<'static, [u8]>,
     sources: Option<String>,
+    embedded: bool,
 }
 
 /// The bundle for `src`, or `None` when there is none.
@@ -43,6 +44,7 @@ pub fn of(src: &super::producer::Sources) -> Option<Bundle> {
         super::producer::Sources::Embedded => Some(Bundle {
             unit: std::borrow::Cow::Borrowed(ply_compiler::bootstrap::UNIT),
             sources: Some(ply_compiler::bootstrap::SOURCES.trim().to_string()),
+            embedded: true,
         }),
         super::producer::Sources::Directory(dir) => from_dir(&dir.join("bootstrap")),
     }
@@ -53,6 +55,7 @@ pub fn from_dir(dir: &Path) -> Option<Bundle> {
     Some(Bundle {
         unit: std::borrow::Cow::Owned(std::fs::read(dir.join(UNIT)).ok()?),
         sources: sources_digest(dir),
+        embedded: false,
     })
 }
 
@@ -101,7 +104,15 @@ pub fn exists(dir: &Path) -> bool {
 /// against the tables it carries. Nothing is emitted and nothing is parsed; the modules are
 /// numbered from zero, as the bootstrap assigns them. A bundle emitted against a helper table this
 /// runtime's does not start with fails here with [`super::exports::Unserved`].
+///
+/// The embedded bundle loads through [`super::upgrade`], except under nextest, where a background
+/// compile would contend with the suite and change which object a later test loads.
 pub fn build(bundle: &Bundle) -> Result<(Native, Vec<Refused>)> {
     let text = text_of(bundle)?;
-    super::build::load_unit(&text, None, "bootstrap")
+    let lib = if bundle.embedded && std::env::var_os("NEXTEST").is_none() {
+        super::upgrade::load(&text, "bootstrap")?
+    } else {
+        super::load::compile_and_load(&text, "bootstrap")?
+    };
+    super::build::finish_unit(lib, None)
 }
