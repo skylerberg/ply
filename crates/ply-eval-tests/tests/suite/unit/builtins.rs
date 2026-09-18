@@ -1014,8 +1014,6 @@ fn advancing_a_frame_that_is_not_a_builtin_step_is_reported_not_ignored() {
         name: None,
         call_site: Span::DUMMY,
         memo: false,
-        callee_window: 0,
-        caller_window: 0,
     };
     let d = advance(frame, Value::Unit).unwrap_err();
     assert_eq!(d.code, codes::INTERNAL_ERROR);

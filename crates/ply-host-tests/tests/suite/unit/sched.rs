@@ -14,16 +14,8 @@ type Sched = Scheduler<Continuation, Value>;
 
 /// No scheduler decision looks inside a continuation, so an empty segment stands in for a task.
 fn suspended() -> Continuation {
-    let prompt = std::rc::Rc::new(Prompt {
-        clauses: std::rc::Rc::new(Vec::new()),
-        effects: std::rc::Rc::new(Vec::new()),
-        ret: None,
-        clause_captures: Vec::new(),
-        ret_captures: std::rc::Rc::from(Vec::new()),
-        module: 0,
-        span: Span::DUMMY,
-    });
-    Stack::new().push_prompt(prompt, 0).capture(1, 0).0
+    let prompt = std::rc::Rc::new(Prompt { span: Span::DUMMY });
+    Stack::new().push_prompt(prompt).capture(1, 0).0
 }
 
 #[derive(Default)]

@@ -6,21 +6,12 @@ pub fn sp() -> Span {
     Span::new(SourceId(0), 0, 1)
 }
 
-pub fn at(start: u32, end: u32) -> Span {
-    Span::new(SourceId(0), start, end)
-}
-
 pub fn id(name: &str) -> Ident {
     Ident::new(name, sp())
 }
 
 pub fn ex(kind: ExprKind) -> Expr {
     Expr { kind, span: sp() }
-}
-
-pub fn spanned(mut e: Expr, span: Span) -> Expr {
-    e.span = span;
-    e
 }
 
 pub fn int(i: i64) -> Expr {
@@ -68,51 +59,6 @@ pub fn param_ty(name: &str, ty: TypeExpr) -> Param {
     Param {
         ty: Some(ty),
         ..param(name)
-    }
-}
-
-pub fn lam(params: &[&str], body: Expr) -> Expr {
-    ex(ExprKind::Lambda {
-        params: params.iter().map(|p| param(p)).collect(),
-        body: Box::new(body),
-        ret: None,
-    })
-}
-
-pub fn block(stmts: Vec<Stmt>, tail: Option<Expr>) -> Expr {
-    ex(ExprKind::Block {
-        stmts,
-        tail: tail.map(Box::new),
-    })
-}
-
-pub fn let_(pat: Pattern, value: Expr) -> Stmt {
-    Stmt::Let {
-        pat,
-        ty: None,
-        value: Box::new(value),
-        span: sp(),
-    }
-}
-
-pub fn letv(name: &str, value: Expr) -> Stmt {
-    let_(pvar(name), value)
-}
-
-pub fn discard(e: Expr) -> Stmt {
-    Stmt::Expr(e)
-}
-
-pub fn record(fields: Vec<(&str, Expr)>) -> Expr {
-    ex(ExprKind::Record {
-        fields: fields.into_iter().map(|(n, e)| (id(n), e)).collect(),
-    })
-}
-
-pub fn pvar(name: &str) -> Pattern {
-    Pattern {
-        kind: PatternKind::Var(id(name)),
-        span: sp(),
     }
 }
 
