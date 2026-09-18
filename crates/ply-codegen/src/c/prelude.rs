@@ -28,12 +28,13 @@ typedef struct {
   int64_t failed;
   int64_t fuel;
   uintptr_t stack_floor;
-  int64_t site_module;
+  int64_t site_root;
   int64_t site_start;
   int64_t site_end;
 } PlyCtx;
-/* Where the body is, stored before a call that can fail so what the runtime raises is placed. */
-#define PLY_SITE(ctx, m, s, e) ((ctx)->site_module = (m), (ctx)->site_start = (s), (ctx)->site_end = (e))
+/* Where the body is, stored before a call that can fail so what the runtime raises is placed: its
+   root, and bytes from that root's definition, so the C does not change when the definition moves. */
+#define PLY_SITE(ctx, r, s, e) ((ctx)->site_root = (r), (ctx)->site_start = (s), (ctx)->site_end = (e))
 
 static inline Word *ply_words(Word w) { return (Word *)((char *)(intptr_t)w + PLY_HEADER); }
 static inline PlyObj *ply_obj(Word w) { return (PlyObj *)(intptr_t)w; }
