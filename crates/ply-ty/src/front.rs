@@ -304,13 +304,13 @@ impl Front {
             parts[i].hash_order.push(local);
         }
         let n = parts.len();
-        let mut defs = deal(&h.defs, &owned, n)?.into_iter();
-        let mut own = deal(&h.own, &owned, n)?.into_iter();
-        let mut decls = deal(&h.decls, &owned, n)?.into_iter();
-        let mut specs = deal(&h.specs, &owned, n)?.into_iter();
-        let mut spec_texts = deal(&h.spec_texts, &owned, n)?.into_iter();
-        let mut deps = deal(&h.deps, &owned, n)?.into_iter();
-        let mut closure = deal(&h.closure, &owned, n)?.into_iter();
+        let mut defs = deal(&h.defs, owned, n)?.into_iter();
+        let mut own = deal(&h.own, owned, n)?.into_iter();
+        let mut decls = deal(&h.decls, owned, n)?.into_iter();
+        let mut specs = deal(&h.specs, owned, n)?.into_iter();
+        let mut spec_texts = deal(&h.spec_texts, owned, n)?.into_iter();
+        let mut deps = deal(&h.deps, owned, n)?.into_iter();
+        let mut closure = deal(&h.closure, owned, n)?.into_iter();
         for part in &mut parts {
             let h = &mut part.hashes;
             h.defs = defs.next().unwrap_or_default();
