@@ -13,6 +13,8 @@
 //! command that builds a backend builds it over this run's [`Front`] rather than over one of its
 //! own; `ply_codegen::Unit::over_front` is that door. A second ask is a second front end over the
 //! project *and* the standard library, which is the cost this shape exists to pay exactly once.
+//! An incremental load does not ask at all when the store holds the answer over these very texts
+//! from this very emitter.
 
 use crate::load::{Discovered, LoadError, Loaded, anchor, discover, unreadable};
 use ply_hash::body::StoredBody;
@@ -20,12 +22,11 @@ use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
 use ply_store::{
     CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, ContentHash, DeclBody, DefBody,
-    DefEntry, DefKind, FileSpan, ImportEdge, Member, NameRef, SourceFingerprint, Store,
-    exports_digest,
+    DefEntry, DefKind, FileSpan, Member, NameRef, SourceFingerprint, Store,
 };
 use ply_syntax::ast::{Module, ModuleName, Program};
 use ply_syntax::resolve::resolve;
-use ply_ty::{DefInfo, Front};
+use ply_ty::Front;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -49,7 +50,7 @@ pub struct Phases {
     pub read: Duration,
     pub parse: Duration,
     pub resolve: Duration,
-    /// The port's whole front end over this program, asked once.
+    /// The port's whole front end over this program, asked once, or its answer read back.
     pub front: Duration,
     pub write_back: Duration,
 }
@@ -115,6 +116,9 @@ impl FileState {
         }
     }
 }
+
+/// The port's answer as it gave it, under its key, when this run asked and may keep it.
+type Fresh = Option<(ContentHash, String)>;
 
 struct Driver<'s> {
     root: PathBuf,
@@ -218,7 +222,7 @@ impl<'s> Driver<'s> {
     fn finish(mut self) -> Result<Loaded, LoadError> {
         self.parse_all()?;
         let (program, resolved) = self.assemble()?;
-        let front = self.ask_the_port()?;
+        let (front, fresh) = self.ask_the_port()?;
         if front.has_error() {
             return Err(LoadError {
                 sources: self.sources.clone(),
@@ -228,7 +232,7 @@ impl<'s> Driver<'s> {
 
         let stdlib = self.stdlib_notice(&front.hashes);
         let writing = Instant::now();
-        let cache = self.write_back(&front);
+        let cache = self.write_back(&front, fresh);
         self.phases.write_back += writing.elapsed();
 
         let mut warnings = stdlib;
@@ -257,23 +261,51 @@ impl<'s> Driver<'s> {
         })
     }
 
-    /// The port's whole answer over this program: the one front end a load runs.
+    /// The port's whole answer over this program: the one front end a load runs, or the answer the
+    /// store kept from the last run over the same texts. Beside it, the answer to keep, when it is
+    /// new and refuses nothing.
     ///
     /// The module texts are handed over in the order `self.files` holds them, which is the order
     /// the program's modules are in, so a span's module index in the answer is a position in this
     /// very list and reads back as the `SourceId` the file was read under.
-    fn ask_the_port(&mut self) -> Result<Front, LoadError> {
+    fn ask_the_port(&mut self) -> Result<(Front, Fresh), LoadError> {
         ply_codegen::c::producer::ensure_default();
+        let ids: Vec<SourceId> = self.files.iter().map(|f| f.source).collect();
+        let started = Instant::now();
+        let key = self.answer_key();
+        let kept = key.and_then(|key| self.store.as_deref()?.front_answer(key));
+        if let Some(front) = kept.and_then(|dump| ply_ty::read_front(&dump, &ids).ok()) {
+            self.phases.front += started.elapsed();
+            return Ok((front, None));
+        }
         let sources: Vec<(String, String)> = self
             .files
             .iter()
             .map(|f| (f.module.to_string(), f.text.to_string()))
             .collect();
-        let ids: Vec<SourceId> = self.files.iter().map(|f| f.source).collect();
-        let started = Instant::now();
-        let answer = ply_codegen::c::producer::front(&sources, &ids);
+        let dump = ply_codegen::c::producer::front_dump(&sources);
         self.phases.front += started.elapsed();
-        answer.map_err(|e| self.seam_failed(&format!("{e:#}")))
+        let dump = dump.map_err(|e| self.seam_failed(&format!("{e:#}")))?;
+        let front = ply_ty::read_front(&dump, &ids)
+            .map_err(|e| self.seam_failed(&format!("the front end's answer does not read: {e}")))?;
+        let fresh = key.filter(|_| !front.has_error()).map(|key| (key, dump));
+        Ok((front, fresh))
+    }
+
+    /// Everything the port's answer is a function of: the emitter, and each module's name and text
+    /// in the order they are handed over. `None` when this run keeps no cache.
+    fn answer_key(&self) -> Option<ContentHash> {
+        if self.mode != Mode::Incremental || self.store.is_none() {
+            return None;
+        }
+        let mut key = ply_codegen::c::producer::emitter().into_bytes();
+        for file in &self.files {
+            key.push(0);
+            key.extend_from_slice(file.module.as_str().as_bytes());
+            key.push(0);
+            key.extend_from_slice(&file.content.0);
+        }
+        Some(ContentHash::of(&key))
     }
 
     /// The front end could not be *asked*, which is this compiler failing rather than the program.
@@ -509,28 +541,18 @@ impl<'s> Driver<'s> {
         ]
     }
 
-    /// Everything the store keeps about this run, all of it read out of the front end's answer.
-    fn write_back(&mut self, front: &Front) -> Vec<Diagnostic> {
+    /// Everything the store keeps about this run, all of it read out of the front end's answer,
+    /// and the answer itself when the port was asked for it.
+    fn write_back(&mut self, front: &Front, fresh: Fresh) -> Vec<Diagnostic> {
         if self.mode != Mode::Incremental {
             return Vec::new();
         }
         let witnesses = witnesses(&front.hashes);
-        let exports = export_table(front);
-        let table = hash_table(&front.hashes);
-        let ifaces: BTreeMap<Symbol, DefHash> = front
-            .check
-            .defs
-            .iter()
-            .map(|(name, info)| (name.clone(), iface_of(info)))
-            .collect();
         let paths: Vec<PathBuf> = self.files.iter().map(|f| f.path.clone()).collect();
         let whole_project = self.whole_project;
 
         let fingerprints: Vec<(usize, SourceFingerprint)> = (0..self.files.len())
-            .filter_map(|i| {
-                self.fingerprint_of(i, front, &table, &exports, &ifaces)
-                    .map(|f| (i, f))
-            })
+            .filter_map(|i| self.fingerprint_of(i, front).map(|f| (i, f)))
             .collect();
         let interfaces = interfaces(front, &witnesses);
         let bodies = stored_bodies(front);
@@ -538,6 +560,9 @@ impl<'s> Driver<'s> {
         let Some(store) = self.store.as_deref_mut() else {
             return Vec::new();
         };
+        if let Some((key, dump)) = fresh {
+            store.put_front_answer(key, dump);
+        }
         for (hash, entry) in interfaces {
             match entry {
                 Interface::Def(def) => store.put_def(hash, def),
@@ -571,41 +596,18 @@ impl<'s> Driver<'s> {
         }
     }
 
-    fn fingerprint_of(
-        &self,
-        i: usize,
-        front: &Front,
-        table: &BTreeMap<Symbol, DefHash>,
-        exports: &BTreeMap<Symbol, Vec<NameRef>>,
-        ifaces: &BTreeMap<Symbol, DefHash>,
-    ) -> Option<SourceFingerprint> {
+    fn fingerprint_of(&self, i: usize, front: &Front) -> Option<SourceFingerprint> {
         let file = &self.files[i];
-        let module = file.module.as_symbol();
-        let info = front.check.modules.get(module)?;
+        let info = front.check.modules.get(file.module.as_symbol())?;
         let hashes = &front.hashes;
         let mut fingerprint = SourceFingerprint::new(file.content);
-
-        // `ModuleInfo::imports` is this module's imports, deduplicated, in source order.
-        for import in &info.imports {
-            let name = import.as_symbol().clone();
-            let digest = exports_digest(exports.get(&name).map(Vec::as_slice).unwrap_or(&[]));
-            fingerprint.imports.push(ImportEdge {
-                module: name,
-                exports: digest,
-            });
-        }
-
-        fingerprint.deps = free_names(front, module, info)
-            .into_iter()
-            .filter_map(|name| table.get(&name).map(|hash| NameRef::new(name, *hash)))
-            .collect();
 
         // A name declared in two namespaces — a `fn` and a `type` of one name — is in `items`
         // twice and gets one entry per namespace, once.
         let mut seen: BTreeSet<&Symbol> = BTreeSet::new();
         for name in &info.items {
             if seen.insert(name) {
-                fingerprint.defs.extend(def_entries(front, name, ifaces));
+                fingerprint.defs.extend(def_entries(front, name));
             }
         }
 
@@ -622,8 +624,6 @@ impl<'s> Driver<'s> {
                 nondet: test.nondet,
                 footprint: test.footprint.clone(),
                 span: FileSpan::of(test.span),
-                name_span: FileSpan::of(*front.test_name_spans.get(index)?),
-                deps: hashes.deps.get(&test.key).cloned().unwrap_or_default(),
             });
         }
         Some(fingerprint)
@@ -635,7 +635,6 @@ enum Interface {
     Decl(CachedDecl),
 }
 
-/// Program-wide name -> current hash.
 /// The checker's output with its definitions in the order a reader can predict: the run's files
 /// in load order, then each file's items as written. The port answers them in the checker's own
 /// order, which is dependency-first, and `ply check --json` publishes this one.
@@ -656,106 +655,26 @@ fn published_order(front: &Front) -> ply_ty::CheckOutput {
     check
 }
 
-fn hash_table(hashes: &HashOutput) -> BTreeMap<Symbol, DefHash> {
-    hashes
-        .defs
-        .iter()
-        .chain(hashes.decls.iter())
-        .map(|(name, hash)| (name.clone(), *hash))
-        .collect()
-}
-
-/// Every module's `(name, hash)` pairs, which is what an importer's [`ImportEdge`] digest is taken
-/// over.
-fn export_table(front: &Front) -> BTreeMap<Symbol, Vec<NameRef>> {
-    let hashes = &front.hashes;
-    let mut out: BTreeMap<Symbol, Vec<NameRef>> = BTreeMap::new();
-    for (module, info) in &front.check.modules {
-        let mut names: Vec<NameRef> = Vec::new();
-        let mut seen: BTreeSet<&Symbol> = BTreeSet::new();
-        for name in &info.items {
-            if !seen.insert(name) {
-                continue;
-            }
-            if let Some(hash) = hashes.defs.get(name).or_else(|| hashes.decls.get(name)) {
-                names.push(NameRef::new(name.clone(), *hash));
-            }
-        }
-        out.insert(module.clone(), names);
-    }
-    out
-}
-
-/// Every top-level name a module mentions but does not declare.
-fn free_names(front: &Front, module: &Symbol, info: &ply_ty::ModuleInfo) -> BTreeSet<Symbol> {
-    let mut declared: BTreeSet<Symbol> = BTreeSet::new();
-    let mut keys: Vec<Symbol> = Vec::new();
-    for name in &info.items {
-        // Everything this module declares under a name a reference could reach — which is what
-        // `items` holds beside each sum type's constructors, and those are reached through the
-        // type.
-        if (front.check.defs.contains_key(name)
-            || front.types.contains_key(name)
-            || front.check.effects.contains_key(name))
-            && declared.insert(name.clone())
-        {
-            keys.push(name.clone());
-        }
-    }
-    for test in front
-        .check
-        .tests
-        .iter()
-        .filter(|t| t.module.as_symbol() == module)
-    {
-        keys.push(test.key.clone());
-    }
-
-    let mut out = BTreeSet::new();
-    for key in &keys {
-        for dep in front.hashes.deps.get(key).into_iter().flatten() {
-            if !declared.contains(dep) {
-                out.insert(dep.clone());
-            }
-        }
-    }
-    out
-}
-
 /// What one program-wide name declares: a `fn`, a `type`, an `effect`, or two of them when the
 /// source spells one name in two namespaces.
-fn def_entries(front: &Front, name: &Symbol, ifaces: &BTreeMap<Symbol, DefHash>) -> Vec<DefEntry> {
+fn def_entries(front: &Front, name: &Symbol) -> Vec<DefEntry> {
     let hashes = &front.hashes;
     let mut out = Vec::new();
-    let mut entry =
-        |kind: DefKind, hash: DefHash, span: Span, members: Vec<Member>, reuse: bool| {
-            out.push(DefEntry {
-                name: name.clone(),
-                hash,
-                // A `type` or `effect` is in neither map: its signature comes from its own text and
-                // reaches no body, so its hash already answers both questions.
-                own: hashes.own.get(name).copied().unwrap_or(hash),
-                iface: ifaces.get(name).copied().unwrap_or(hash),
-                span: FileSpan::of(span),
-                kind,
-                members,
-                deps: hashes.deps.get(name).cloned().unwrap_or_default(),
-                reuse,
-            });
-        };
+    let mut entry = |kind: DefKind, hash: DefHash, span: Span, members: Vec<Member>| {
+        out.push(DefEntry {
+            name: name.clone(),
+            hash,
+            span: FileSpan::of(span),
+            kind,
+            members,
+        });
+    };
 
     if let (Some(def), Some(&hash)) = (front.check.defs.get(name), hashes.defs.get(name)) {
-        let reuse = front.defs_written.get(name).is_some_and(|w| w.reuse);
-        entry(DefKind::Fn, hash, def.span, Vec::new(), reuse);
+        entry(DefKind::Fn, hash, def.span, Vec::new());
     }
     if let (Some(ty), Some(&hash)) = (front.types.get(name), hashes.decls.get(name)) {
-        entry(
-            DefKind::Type,
-            hash,
-            ty.span,
-            ctor_members(front, name),
-            false,
-        );
+        entry(DefKind::Type, hash, ty.span, ctor_members(front, name));
     }
     if let (Some(effect), Some(&hash)) = (front.check.effects.get(name), hashes.decls.get(name)) {
         let ops = effect
@@ -766,7 +685,7 @@ fn def_entries(front: &Front, name: &Symbol, ifaces: &BTreeMap<Symbol, DefHash>)
                 span: FileSpan::of(op.span),
             })
             .collect();
-        entry(DefKind::Effect, hash, effect.span, ops, false);
+        entry(DefKind::Effect, hash, effect.span, ops);
     }
     out
 }
@@ -795,9 +714,9 @@ fn ctor_members(front: &Front, type_name: &Symbol) -> Vec<Member> {
 
 /// The witness this run writes for every definition and declaration.
 ///
-/// Still written now that no gate reads it back: [`ply_store`] keys an interface's slot by the
-/// name its witness says it was written for, so two definitions that share a hash keep their own
-/// entries — and `ply cache inspect` reads it. It is a function of the hashes alone.
+/// [`ply_store`] keys an interface's slot by the name its witness says it was written for, so two
+/// definitions that share a hash keep their own entries, and `ply cache inspect` shows it. It is a
+/// function of the hashes alone.
 fn witnesses(hashes: &HashOutput) -> BTreeMap<Symbol, Vec<NameRef>> {
     let mut out = BTreeMap::new();
     let named = |name: &Symbol| -> Option<NameRef> {
@@ -837,11 +756,7 @@ fn interfaces(
         out.push((
             hash,
             Interface::Def(
-                CachedDef::new(d.scheme.clone(), d.footprint.clone())
-                    .performing(d.performed.clone())
-                    .written_as(d.row_aliases.clone())
-                    .witnessed_by(names.clone())
-                    .performing_internally(d.internally_effectful),
+                CachedDef::new(d.scheme.clone(), d.footprint.clone()).witnessed_by(names.clone()),
             ),
         ));
     }
@@ -928,14 +843,4 @@ fn stored_bodies(front: &Front) -> Vec<(DefHash, DefBody)> {
         }
     }
     out
-}
-
-/// Everything a caller can observe of a definition, taken over exactly the `DefInfo`
-/// [`Driver::write_back`] stores.
-///
-/// All three parts come from one `DefInfo`: `DefConstraint::param` indexes that scheme's `ty_vars`.
-fn iface_of(info: &DefInfo) -> DefHash {
-    // As published, not canonicalized: a `DefConstraint::param` indexes this
-    // scheme's `ty_vars`, and `canonicalize_scheme` sorts them.
-    ply_hash::interface_hash(&info.scheme, &info.footprint, &info.constraints)
 }

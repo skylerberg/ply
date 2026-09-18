@@ -371,6 +371,46 @@ fn a_dependencys_change_reaches_its_dependents() {
     agree(dir.path(), "dependency changed");
 }
 
+/// A load over texts the store already has the answer for enters the port not at all, and an edit
+/// to one module sends the next load back to it.
+#[test]
+fn an_unchanged_project_is_answered_from_the_store_and_an_edit_asks_again() {
+    use ply_codegen::c::producer;
+    let dir = corpus();
+    let load = || {
+        let mut store = Store::open(dir.path()).unwrap();
+        producer::reset_census();
+        let loaded = driver::load_incremental(dir.path(), &mut store)
+            .unwrap_or_else(|e| panic!("the load failed: {:?}", codes(&e)));
+        (loaded, producer::census().entries)
+    };
+
+    let (cold, entries) = load();
+    assert!(entries > 0, "the first load must ask the port");
+    let (warm, entries) = load();
+    assert_eq!(entries, 0, "an unchanged project entered the port");
+    assert_eq!(snapshot(&warm), snapshot(&cold));
+
+    let three = ply_span::Symbol::new("leaf.three");
+    edit(
+        dir.path(),
+        "leaf.ply",
+        "pub fn two()",
+        "pub fn three() -> Int = 3\npub fn two()",
+    );
+    let (edited, entries) = load();
+    assert!(entries > 0, "an edited project was answered from the store");
+    assert!(!warm.check.defs.contains_key(&three));
+    assert!(
+        edited.check.defs.contains_key(&three),
+        "the load after an edit does not see it"
+    );
+
+    let (again, entries) = load();
+    assert_eq!(entries, 0, "the answer to the edit was not kept");
+    assert_eq!(snapshot(&again), snapshot(&edited));
+}
+
 /// `--no-incremental` must neither read nor write the front-end cache, so a run under it can never
 /// be the reason a later run skips something.
 #[test]

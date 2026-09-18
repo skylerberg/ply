@@ -27,9 +27,9 @@ use std::sync::Arc;
 pub type Entry = unsafe extern "C" fn(*mut Ctx, *const i64) -> i64;
 
 pub struct Tables {
-    /// The constant pool as values, for a literal rebuilt per evaluation.
+    /// The constant pool as values.
     pub consts: Vec<Value>,
-    /// The same constants as immortal words, which a folded literal is an immediate of.
+    /// The same constants as immortal words, which a literal answers.
     pub const_words: Vec<Word>,
     pub layouts: Layouts,
     /// Every field name a compiled body reads by name, so that a field access is an index rather
@@ -133,6 +133,10 @@ impl Tables {
     /// down — a record's fields, a constructor's arguments, a short list's elements — the words
     /// they came from, since a body that takes a memo value apart hands those parts back in.
     pub fn remember(&self, w: Word, v: &Value) {
+        // Replacing the value would free allocations its recorded identities still name.
+        if self.memo_values.borrow().contains_key(&w) {
+            return;
+        }
         self.memo_values.borrow_mut().insert(w, v.clone());
         let mut words = self.memo_words.borrow_mut();
         if let Some(id) = identity(v) {
@@ -711,7 +715,11 @@ impl Ctx {
         self.heap.to_word(&tables.layouts, v)
     }
 
+    /// Safe on any word an error path meets: an immediate or `0` reads no memory.
     fn type_name(&self, w: Word) -> &'static str {
+        if w == 0 {
+            return "no value";
+        }
         self.value(w).type_name()
     }
 }
@@ -1018,18 +1026,10 @@ pub unsafe extern "C" fn rt_arith(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i64
     }
 }
 
-/// A literal, built the way the interpreter builds it: a fresh allocation per evaluation.
+/// A literal: the unit's immortal word for it, built once at load.
 pub unsafe extern "C" fn rt_lit(ctx: *mut Ctx, index: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let tables = Rc::clone(&ctx.tables);
-    let value = &tables.consts[index as usize];
-    let rebuilt = match value {
-        Value::Bytes(b) => Value::bytes(b.as_ref()),
-        Value::Str(s) => Value::str(s.as_ref()),
-        Value::Ctor { name, args } => Value::ctor(name.clone(), args.as_ref().clone()),
-        other => other.clone(),
-    };
-    ctx.word(&rebuilt)
+    let ctx = unsafe { &*ctx };
+    ctx.tables.const_words[index as usize]
 }
 
 /// A `match` whose arms did not cover the value.
@@ -2174,18 +2174,19 @@ pub unsafe extern "C" fn rt_builtin_value(ctx: *mut Ctx, index: i64) -> i64 {
     ctx.heap.bridge(Value::builtin(b))
 }
 
-/// A constructor used as a value, likewise.
-/// The singleton a nullary constructor *is*, as against the constructor as a function value,
-/// which is what `rt_ctor_value` answers. The two are not interchangeable: `None` is a value and
-/// `Some` is a function, and a tier that asks for the wrong one gets a closure where a variant
-/// belongs and answers every `None` case wrongly.
+/// The singleton a nullary constructor *is*, and `0` for any other constructor.
 pub unsafe extern "C" fn rt_nullary(ctx: *mut Ctx, index: i64) -> i64 {
     unsafe { &*ctx }.nullary(index as u32)
 }
 
+/// A constructor named as a value: the singleton a nullary one is, and a function otherwise.
 pub unsafe extern "C" fn rt_ctor_value(ctx: *mut Ctx, index: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
-    let (name, arity) = ctx.tables.layouts.ctors[index as usize].clone();
+    let (name, arity) = &ctx.tables.layouts.ctors[index as usize];
+    if *arity == 0 {
+        return ctx.nullary(index as u32);
+    }
+    let (name, arity) = (name.clone(), *arity);
     ctx.heap.bridge(Value::Closure(Arc::new(Closure {
         name: Some(name.clone()),
         kind: ClosureKind::Ctor { name, arity },
@@ -2469,11 +2470,11 @@ pub unsafe extern "C" fn rt_map_fold(ctx: *mut Ctx, map: i64, init: i64, f: i64)
         heap::dec(f);
         return acc;
     }
-    let value = c.value(map);
-    let Value::Map(entries) = &value else {
+    let value = (map != 0).then(|| c.value(map));
+    let Some(Value::Map(entries)) = &value else {
         let d = error(format!(
             "`map_fold` needs a Map, and this is {}",
-            value.type_name()
+            c.type_name(map)
         ));
         return c.fail(d);
     };

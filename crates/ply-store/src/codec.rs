@@ -4,7 +4,7 @@ use crate::DefBody;
 use crate::binary::{Decoded, Reader, Writer};
 use crate::frontend::{
     CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, DeclBody, DefEntry, DefKind, FileSpan,
-    ImportEdge, Member, NameRef, SourceFingerprint,
+    Member, NameRef, SourceFingerprint,
 };
 use ply_ty::Mode;
 use ply_ty::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
@@ -29,7 +29,6 @@ mod tag {
 
     pub(super) const NAME_REF: u8 = 0x40;
     pub(super) const MEMBER: u8 = 0x41;
-    pub(super) const IMPORT_EDGE: u8 = 0x42;
     pub(super) const FILE_SPAN: u8 = 0x43;
     pub(super) const DEF_ENTRY: u8 = 0x44;
     pub(super) const CACHED_TEST: u8 = 0x45;
@@ -322,22 +321,6 @@ fn get_span(r: &mut Reader) -> Decoded<FileSpan> {
     })
 }
 
-fn put_symbols(w: &mut Writer, symbols: &[ply_span::Symbol]) {
-    w.count(symbols.len());
-    for symbol in symbols {
-        w.symbol(symbol);
-    }
-}
-
-fn get_symbols(r: &mut Reader, what: &'static str) -> Decoded<Vec<ply_span::Symbol>> {
-    let count = r.count(what)?;
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        out.push(r.symbol(what)?);
-    }
-    Ok(out)
-}
-
 /// The witness comes first so [`peek_names`] can identify an entry without decoding its scheme.
 pub fn encode_def(def: &CachedDef) -> Vec<u8> {
     let mut w = Writer::new();
@@ -345,12 +328,6 @@ pub fn encode_def(def: &CachedDef) -> Vec<u8> {
     put_names(&mut w, &def.names);
     put_scheme(&mut w, &def.scheme);
     put_footprint(&mut w, &def.footprint);
-    put_footprint(&mut w, &def.performed);
-    w.count(def.row_aliases.len());
-    for alias in &def.row_aliases {
-        w.symbol(alias);
-    }
-    w.count(usize::from(def.internally_effectful));
     w.tag(tag::END);
     w.finish()
 }
@@ -362,22 +339,12 @@ pub(crate) fn decode_def(bytes: &[u8]) -> Decoded<CachedDef> {
     let names = get_names(&mut r)?;
     let scheme = get_scheme(&mut r)?;
     let footprint = get_footprint(&mut r)?;
-    let performed = get_footprint(&mut r)?;
-    let count = r.count(WHAT)?;
-    let mut row_aliases = Vec::with_capacity(count.min(64));
-    for _ in 0..count {
-        row_aliases.push(r.symbol(WHAT)?);
-    }
-    let internally_effectful = r.count(WHAT)? != 0;
     r.tag(tag::END, WHAT)?;
     r.end(WHAT)?;
     Ok(CachedDef {
         scheme,
         footprint,
-        performed,
-        row_aliases,
         names,
-        internally_effectful,
     })
 }
 
@@ -526,23 +493,11 @@ pub fn encode_fingerprint(f: &SourceFingerprint) -> Vec<u8> {
     w.tag(tag::FINGERPRINT);
     w.content_hash(f.content_hash);
 
-    w.count(f.imports.len());
-    for import in &f.imports {
-        w.tag(tag::IMPORT_EDGE);
-        w.symbol(&import.module);
-        w.content_hash(import.exports);
-        w.tag(tag::END);
-    }
-
-    put_names(&mut w, &f.deps);
-
     w.count(f.defs.len());
     for def in &f.defs {
         w.tag(tag::DEF_ENTRY);
         w.symbol(&def.name);
         w.def_hash(def.hash);
-        w.def_hash(def.own);
-        w.def_hash(def.iface);
         put_span(&mut w, def.span);
         put_kind(&mut w, def.kind);
         w.count(def.members.len());
@@ -552,8 +507,6 @@ pub fn encode_fingerprint(f: &SourceFingerprint) -> Vec<u8> {
             put_span(&mut w, member.span);
             w.tag(tag::END);
         }
-        put_symbols(&mut w, &def.deps);
-        w.bool(def.reuse);
         w.tag(tag::END);
     }
 
@@ -565,8 +518,6 @@ pub fn encode_fingerprint(f: &SourceFingerprint) -> Vec<u8> {
         w.bool(test.nondet);
         put_footprint(&mut w, &test.footprint);
         put_span(&mut w, test.span);
-        put_span(&mut w, test.name_span);
-        put_symbols(&mut w, &test.deps);
         w.tag(tag::END);
     }
 
@@ -581,25 +532,11 @@ pub(crate) fn decode_fingerprint(bytes: &[u8]) -> Decoded<SourceFingerprint> {
     let content_hash = r.content_hash(WHAT)?;
 
     let count = r.count(WHAT)?;
-    let mut imports = Vec::with_capacity(count);
-    for _ in 0..count {
-        r.tag(tag::IMPORT_EDGE, WHAT)?;
-        let module = r.symbol(WHAT)?;
-        let exports = r.content_hash(WHAT)?;
-        r.tag(tag::END, WHAT)?;
-        imports.push(ImportEdge { module, exports });
-    }
-
-    let deps = get_names(&mut r)?;
-
-    let count = r.count(WHAT)?;
     let mut defs = Vec::with_capacity(count);
     for _ in 0..count {
         r.tag(tag::DEF_ENTRY, WHAT)?;
         let name = r.symbol(WHAT)?;
         let hash = r.def_hash(WHAT)?;
-        let own = r.def_hash(WHAT)?;
-        let iface = r.def_hash(WHAT)?;
         let span = get_span(&mut r)?;
         let kind = get_kind(&mut r)?;
         let count = r.count(WHAT)?;
@@ -611,19 +548,13 @@ pub(crate) fn decode_fingerprint(bytes: &[u8]) -> Decoded<SourceFingerprint> {
             r.tag(tag::END, WHAT)?;
             members.push(Member { name, span });
         }
-        let deps = get_symbols(&mut r, WHAT)?;
-        let reuse = r.bool(WHAT)?;
         r.tag(tag::END, WHAT)?;
         defs.push(DefEntry {
             name,
             hash,
-            own,
-            iface,
             span,
             kind,
             members,
-            deps,
-            reuse,
         });
     }
 
@@ -636,8 +567,6 @@ pub(crate) fn decode_fingerprint(bytes: &[u8]) -> Decoded<SourceFingerprint> {
         let nondet = r.bool(WHAT)?;
         let footprint = get_footprint(&mut r)?;
         let span = get_span(&mut r)?;
-        let name_span = get_span(&mut r)?;
-        let deps = get_symbols(&mut r, WHAT)?;
         r.tag(tag::END, WHAT)?;
         tests.push(CachedTest {
             name,
@@ -645,8 +574,6 @@ pub(crate) fn decode_fingerprint(bytes: &[u8]) -> Decoded<SourceFingerprint> {
             nondet,
             footprint,
             span,
-            name_span,
-            deps,
         });
     }
 
@@ -654,8 +581,6 @@ pub(crate) fn decode_fingerprint(bytes: &[u8]) -> Decoded<SourceFingerprint> {
     r.end(WHAT)?;
     Ok(SourceFingerprint {
         content_hash,
-        imports,
-        deps,
         defs,
         tests,
     })

@@ -26,7 +26,6 @@ pub fn notice(store: &Store, warnings: &[Diagnostic]) -> Option<Diagnostic> {
 
     Some(
         Diagnostic::warning(codes::CACHE_VERSION_CHANGED, headline)
-            .note("this run recomputes types and hashes for the whole project")
             .note("the result cache is untouched, so no test re-runs because of this")
             .note("nothing to do: the front-end cache is rebuilt as this run goes"),
     )

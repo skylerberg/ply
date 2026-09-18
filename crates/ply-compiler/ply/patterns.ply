@@ -1,17 +1,4 @@
-// Area 2 of the Ply parser spike: pattern forms. A port of
-// `crates/ply-syntax/src/parser.rs` — `pattern`, `pattern_body`,
-// `list_pattern` and `record_pattern` — function for function.
-//
-// A leaf of the sort DAG alongside types: `Pattern` reaches `Ident`, `QName`,
-// `Lit` and `Pattern`, and neither `Expr` nor `TypeExpr`. It owns the third of
-// the reference's three `deeper()` sites (`parser.rs:1846`) and the
-// negative-literal special case.
-//
-// **`Lit` lives here** rather than with expressions, because the sort DAG puts
-// it below `Pattern` and `Pattern` below `Expr`: `exprs.ply` imports it from
-// here. A second `Lit` declared there would be a second type with a second
-// `dump_lit` to keep in step, and the two dumps agreeing would then be a thing
-// to check rather than a thing that holds.
+// Patterns, and the `Lit` that expressions share with them.
 
 import spine (push_front, positional, Span, Ident, QName, Ctx, P, R, Ate, Acc, PDiag,
               span_to, dummy_span, no_ident, no_qname,
@@ -31,26 +18,10 @@ import lexer (Tok, Token, TIdent, TInt, TFixed, TFloat, TDec, TStr, TBytes, TKw,
 
 // --- Literals ---------------------------------------------------------------
 
-// `LFloat` and `LDec` carry **the raw source bytes over the literal node's own
-// span** — not a value, and not `lexer.ply`'s normalised text.
-//
-// This is the point of the choice and not an economy.
-// `crates/ply-compiler/README.md` records that any corruption of a float's digits
-// which rounds to the same `f64` passes that spike's agreement test, and says
-// "anyone extending this spike past the lexer must close this first". Emitting
-// raw source closes it by **removing the normalisation from the comparison**
-// rather than by adding a third normaliser to check the second: this parser
-// never builds an `f64`, the reference dumper reads the same bytes from the
-// same offsets, and the decimal-to-binary conversion stays inside the Rust
-// lexer where it is the only implementation.
-//
-// The rule is *the literal node's span*, not the number token's, so a negated
-// pattern literal carries its `-` and needs no negation Ply cannot perform.
-// `exprs.ply`'s `ELit` must use the same rule or the two halves of the dump
-// disagree about what a float is.
+// `LFloat` and `LDec` carry the raw source over the literal node's own span, `-` included, never a parsed value.
 pub type Lit =
   | LInt(Int)
-  // ADR 0039's suffixed literal: the width's name and the pattern the width reads.
+  // A width-suffixed literal: the width's name and the `Int` bit pattern the width reads.
   | LFixed(Bytes, Int)
   | LBool(Bool)
   | LStr(Bytes)
@@ -76,14 +47,7 @@ pub fn dump_lit(l: Lit) -> Bytes =
 
 // --- The AST ----------------------------------------------------------------
 
-// Every variant carries its own span, `PVar` included — and `TypeExpr::Var`
-// does not, which is a difference worth stating rather than smoothing over.
-// `ty_body` hands a parenthesised type back untouched, so `(a)` is a `TVar`
-// whose span is its name's; `pattern_body` **rewrites** the span of a
-// parenthesised pattern to cover the parens (`inner.span = open.to(close)`), so
-// `(x)` is a `Var` whose span is wider than its name's and a `PVar(Ident)`
-// could not hold it. A dump that led with the `Ident`'s span would agree with
-// the reference on `(x)` while carrying a different tree.
+// Every variant carries its own span: a parenthesised pattern's span covers the parens, wider than its name's.
 pub type Pattern =
   | PWild({ span: Span })
   | PVar({ span: Span, name: Ident })
@@ -91,7 +55,7 @@ pub type Pattern =
   | PCtor({ span: Span, name: QName, args: List<Pattern> })
   | PRecord({ span: Span, rest: Bool, fields: List<{ name: Ident, pat: Pattern }> })
   | PList({ span: Span, rest: Option<Pattern>, items: List<Pattern> })
-  // No analogue in `ast.rs`; the stand-in `settle` asks for. See `types.ply`.
+  // The placeholder `settle` asks for; no parse produces it.
   | PBad({ span: Span })
 
 pub fn pat_span(x: Pattern) -> Span =
@@ -105,9 +69,6 @@ pub fn pat_span(x: Pattern) -> Span =
     PBad(v) -> v.span,
   }
 
-// `inner.span = open.to(close)` — one assignment in Rust, seven arms here,
-// because Ply has neither mutation nor record-update syntax and the span is a
-// field of every variant rather than of a wrapper struct. `GAPS.md` §P4.
 fn set_pat_span(x: Pattern, s: Span) -> Pattern =
   match x {
     PWild(v) -> PWild({ span: s }),
@@ -125,7 +86,6 @@ fn is_bare(q: QName) -> Bool = match q.module { None -> true, Some(m) -> false }
 
 // --- Patterns ---------------------------------------------------------------
 
-// The third of the reference's three `deeper()` sites (`parser.rs:1846`).
 pub fn pattern(c: Ctx, p: P) -> Result<R<Pattern>, P> = {
   let d = deeper(c, p)?;
   match pattern_body(c, d) {
@@ -155,8 +115,7 @@ fn pattern_body(c: Ctx, p: P) -> Result<R<Pattern>, P> = {
   match kind(c, p) {
     TInt(v) -> lit_pat(c, p, LInt(v)),
     TFixed(ty, v) -> lit_pat(c, p, LFixed(ty, v)),
-    // `lexer.ply`'s payload is discarded on purpose: what goes in the tree is
-    // the source, sliced. See the note on `Lit`.
+    // The lexer's payload is discarded: the tree holds the source, sliced.
     TFloat(f) -> lit_pat(c, p, LFloat(src_over(c, st))),
     TDec(m, sc) -> lit_pat(c, p, LDec(src_over(c, st))),
     TStr(s) -> lit_pat(c, p, LStr(s)),
@@ -171,9 +130,7 @@ fn pattern_body(c: Ctx, p: P) -> Result<R<Pattern>, P> = {
         let a = advance(c, p);
         Ok({ p: a.p, node: PWild({ span: a.node }) })
       }
-      // A negative literal is one pattern rather than an operator applied to
-      // one, because a pattern is not an expression and there is nothing to
-      // apply. Two tokens of lookahead decide it.
+      // A negative literal is one pattern, decided by two tokens of lookahead.
       else if s == b"minus" && is_num_tok(kind_at(c, p, 1)) { neg_lit(c, p, st) }
       else if s == b"lparen" { pattern_paren(c, p) }
       else if s == b"lbracket" { list_pattern(c, p) }
@@ -185,7 +142,7 @@ fn pattern_body(c: Ctx, p: P) -> Result<R<Pattern>, P> = {
 
 fn string_lower_bytes(b: Bytes) -> Bytes = bytes_of_string(string_lower(string_of_bytes(b)))
 
-// `-v` taken modulo the width, which is what `IntTy::normalize` of a wrapped negation gives.
+// `-v` wrapped to the width.
 fn neg_at_width(ty: Bytes, v: Int) -> Int =
   match width_named(string_lower_bytes(ty)) {
     Some(w) -> width_normalize(w, wrap_sub(0, v)),
@@ -196,21 +153,15 @@ fn neg_lit(c: Ctx, p: P, st: Span) -> Result<R<Pattern>, P> = {
   let m = advance(c, p);
   let a = advance(c, m.p);
   let s = span_to(st, a.node);
-  // `Int` negates as arithmetic on both sides. `Float` and `Decimal` do not
-  // negate at all: their payload is the raw source over `s`, which already has
-  // the `-` in it.
+  // `Float` and `Decimal` are not negated: their raw source over `s` already has the `-`.
   match kind(c, m.p) {
     TInt(v) -> Ok({ p: a.p, node: PLit({ span: s, lit: LInt(0 - v) }) }),
-    // Negated at the width, where `-128i8` is a value and `128i8` is not, so the smallest value
-    // of every signed type is writable in a pattern.
+    // Negated at the width, so each signed type's minimum (`-128i8`) is writable.
     TFixed(ty, v) ->
       Ok({ p: a.p, node: PLit({ span: s, lit: LFixed(ty, neg_at_width(ty, v)) }) }),
     TFloat(f) -> Ok({ p: a.p, node: PLit({ span: s, lit: LFloat(src_over(c, s)) }) }),
     TDec(mm, sc) -> Ok({ p: a.p, node: PLit({ span: s, lit: LDec(src_over(c, s)) }) }),
-    // Unreachable: `is_num_tok` on `kind_at(1)` is what reached this function.
-    // The reference writes `unreachable!()`; Ply has no expression that stands
-    // for "cannot happen" and has the arm's type, so the arm answers a literal
-    // the reference can never build. `GAPS.md` §P5.
+    // Unreachable: `is_num_tok` admitted only a number.
     _ -> Ok({ p: a.p, node: PLit({ span: s, lit: LBad }) }),
   }
 }
@@ -265,8 +216,7 @@ fn pattern_named(c: Ctx, p: P, st: Span) -> Result<R<Pattern>, P> = {
 
 // --- List patterns ----------------------------------------------------------
 
-// `items` is the field that grows, so it is last in the declaration and last in
-// every literal that pushes to it. `crates/ply-compiler/GAPS-lexer.md` §1.
+// `items` grows, so it is written last in every literal that pushes to it.
 type ListAcc = { p: P, rest: Option<Pattern>, items: List<Pattern> }
 
 type ListOut = { rest: Option<Pattern>, items: List<Pattern> }
@@ -297,8 +247,7 @@ fn list_items(c: Ctx, p: P, open: Span) -> Result<R<ListOut>, P> =
       };
       match bound {
         Err(q) -> Stop(Err(q)),
-        // `self.eat(&TokenKind::Comma);` — the reference drops the answer, so a
-        // trailing comma after `..` is allowed and an element after it is not.
+        // A trailing comma after `..` is allowed; an element after it is not.
         Ok(b) -> Stop(Ok({ p: eat(c, b.p, t_comma()).p,
                            node: { items: s.items, rest: Some(b.node) } })),
       }
@@ -345,8 +294,7 @@ fn record_fields(c: Ctx, p: P, open: Span) -> Result<R<RecOut>, P> =
           Ok(fname) -> {
             let n = { p: fname.p, node: fname.node.name };
             let co = eat(c, n.p, t_colon());
-            // The shorthand `{x}` binds `x` with the *name's* span and not a
-            // wider one; a keyword cannot bind one.
+            // The shorthand `{x}` binds with the name's span; a keyword cannot be punned.
             let f = if co.ok { pattern(c, co.p) }
                     else if fname.node.keyword { Err(keyword_pun_refusal(co.p, n.node)) }
                     else { Ok({ p: co.p, node: PVar({ span: n.node.span, name: n.node }) }) };
@@ -390,14 +338,12 @@ fn dump_pat_field(f: { name: Ident, pat: Pattern }) -> Bytes =
 
 // --- The area's own entry point ---------------------------------------------
 
-// A pattern is reachable from the reference through `fn t(x) = match x { <PAT>
-// -> 0 }`; this is the direct form, for the tests below.
+// Parses one pattern on its own, for the tests below.
 pub fn dump_pattern_of(src: Bytes) -> String = {
   let s = start(src);
   let r = settle(pattern(s.c, s.p), no_pattern());
   string_of_bytes(bytes_concat(dump_pattern(r.node), dump_diags(r.p.diags)))
 }
-
 
 // --- Tests ------------------------------------------------------------------
 
@@ -414,8 +360,6 @@ test "wildcards, variables and constructors" {
             "0:11:pctr;0:5:qname;?1;0:1:ident;@6d;3:5:ident;@4f6b;#2;6:7:pvar;6:7:ident;@61;9:10:pvar;9:10:ident;@62;#0;")
 }
 
-// A parenthesised pattern is the inner node with a **wider span** — which is
-// why every variant here carries its own span and `TypeExpr::Var` does not.
 test "a parenthesised pattern is the inner node with the parens' span" {
   assert_eq(dump_pattern_of(b"(x)"),
             "0:3:pvar;1:2:ident;@78;#0;");
@@ -438,10 +382,6 @@ test "literal patterns" {
             "0:7:plit;%bytes;@47455420;#0;")
 }
 
-// The payload is the source, sliced over the pattern's own span. `1.50m` and
-// `1.5m` would be two dumps because they are two spellings, which is *finer*
-// than the reference's `Lit::Decimal` — and finer is safe: the injectivity
-// check asks that equal dumps imply equal trees, not the converse.
 test "a float or decimal pattern carries the source bytes over its own span" {
   assert_eq(dump_pattern_of(b"1.5"),
             "0:3:plit;%float;@312e35;#0;");
@@ -449,10 +389,6 @@ test "a float or decimal pattern carries the source bytes over its own span" {
             "0:5:plit;%dec;@312e35306d;#0;")
 }
 
-// A negative literal is one pattern and not an operator applied to one, so the
-// `-` is inside the node's span and therefore inside the payload. An `Int`
-// negates as arithmetic; a `Float` and a `Decimal` negate by being sliced one
-// byte earlier, which is why neither needs a value Ply cannot build.
 test "a negative literal pattern is one literal and the minus is in its span" {
   assert_eq(dump_pattern_of(b"-42"),
             "0:3:plit;%int;@2d3432;#0;");
@@ -496,9 +432,6 @@ test "a field with no pattern after its colon is one diagnostic" {
             "0:0:pbad;#1;!E0001:4:5:1:0;=4:5:1;")
 }
 
-// `Parser::new` seeds `self.diags` with the lexer's, so a byte no token can
-// start is reported once by the lexer and once by the parser that then finds
-// end of input.
 test "a lexical error and the syntactic one it causes are both reported" {
   assert_eq(dump_pattern_of(b"@"),
             "0:0:pbad;#2;!E0001:0:1:1:0;=0:1:1;!E0001:1:1:1:0;=1:1:1;")
