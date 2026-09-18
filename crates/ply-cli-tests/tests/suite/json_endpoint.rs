@@ -1,5 +1,3 @@
-//! `examples/orders.ply` over a real socket, with a derived codec on both ends.
-
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -19,8 +17,7 @@ fn reserve_port() -> u16 {
     listener.local_addr().expect("a bound address").port()
 }
 
-/// The example verbatim, plus the entry point it deliberately does not carry: `examples/hello.ply`
-/// holds the only `main` under `examples/`, so `ply run examples` has one.
+/// Plus the `main` the example deliberately lacks: `examples/hello.ply` holds the only one under `examples/`.
 fn project(port: u16, connections: u32) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("a temp dir");
     let orders = std::fs::read_to_string(repo("examples/orders.ply")).expect("examples/orders.ply");

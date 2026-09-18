@@ -12,8 +12,7 @@ fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
     dir
 }
 
-/// A `Loaded` is expensive to build here, so the state is exercised through the two questions
-/// the watch loop actually asks: has the tree moved, and may the held state be reused.
+/// A `Loaded` is expensive here, so the state is exercised through the two questions the watch loop asks.
 fn held(root: &std::path::Path, files: &[&str]) -> Warm {
     let paths: Vec<_> = files.iter().map(|f| root.join(f)).collect();
     let mut warm = Warm {
@@ -52,8 +51,7 @@ fn a_rewritten_file_moves_the_tree() {
     );
 }
 
-/// The case a stamp alone cannot see, and the reason `tree_moved` walks the tree as well: a new
-/// file changes the program without touching any file the held state knows about.
+/// A new file changes the program without touching any file the held state knows, so `tree_moved` walks the tree too.
 #[test]
 fn a_new_file_moves_the_tree() {
     let dir = project(&[("m.ply", "fn a() -> Int = 1\n")]);
@@ -77,8 +75,7 @@ fn a_deleted_file_moves_the_tree() {
     assert!(warm.tree_moved(dir.path()));
 }
 
-/// The cache directory is written by every run, so a walk that counted it would report every
-/// tree as moved and the loop would never settle.
+/// Every run writes the cache directory, so a walk that counted it would never settle.
 #[test]
 fn the_cache_directory_is_not_the_program() {
     let dir = project(&[("m.ply", "fn a() -> Int = 1\n")]);
@@ -88,8 +85,7 @@ fn the_cache_directory_is_not_the_program() {
     assert!(!warm.tree_moved(dir.path()));
 }
 
-/// Taking leaves nothing held: an iteration owns what it runs on, so one that fails part way
-/// through cannot leave a state behind that no run finished with.
+/// An iteration that fails part way must not leave behind a state no run finished with.
 #[test]
 fn taking_leaves_nothing_behind() {
     let dir = project(&[("m.ply", "fn a() -> Int = 1\n")]);
@@ -111,19 +107,14 @@ fn a_moved_tree_is_not_reused() {
     assert!(matches!(reuse, Reuse::Reloaded { .. }));
 }
 
-/// The case the whole reuse path exists for, and the one a stamp alone cannot see: the loop
-/// wakes because a file was written, and the file says exactly what it said before. Most saves
-/// are this, and before the content was compared the reuse path could not fire at all — the
-/// loop only wakes when a stamp moved, and a moved stamp was taken as a changed file.
+/// Most saves rewrite the same bytes, which a stamp alone cannot tell from an edit.
 #[test]
 fn a_file_written_with_the_same_bytes_is_reused_whole() {
     let text = "fn a() -> Int = 1\n";
     let dir = project(&[("m.ply", text)]);
     let mut warm = held(dir.path(), &["m.ply"]);
 
-    // Rewrite it byte for byte, and put the stamp somewhere it cannot match. Set rather than
-    // waited for: a filesystem's timestamp resolution is not this test's subject, and a rewrite
-    // inside one tick would leave the stamp equal and quietly test nothing.
+    // Stamp set rather than waited for: a rewrite inside one timestamp tick would leave it equal and test nothing.
     std::fs::write(dir.path().join("m.ply"), text).unwrap();
     warm.stamps
         .insert(dir.path().join("m.ply"), (None, u64::MAX));
@@ -137,11 +128,7 @@ fn a_file_written_with_the_same_bytes_is_reused_whole() {
     assert!(taken.is_some());
 }
 
-/// A held unit is a function of everything the front end published, **tests included**.
-///
-/// Keyed on `defs` alone, an edit to a test reuses a unit holding the old test and the watch
-/// loop reports the old answer. That is a wrong answer with nothing to notice it, so it is
-/// pinned here rather than left to a loop nobody runs in a test.
+/// Keyed on `defs` alone, an edit to a test would reuse a unit holding the old test.
 #[test]
 fn a_held_unit_is_dropped_when_a_test_moves() {
     struct Nothing;

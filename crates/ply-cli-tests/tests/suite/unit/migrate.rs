@@ -13,8 +13,7 @@ fn a_healthy_cache_says_nothing() {
     assert!(notice(&store, &[]).is_none());
 }
 
-/// The result cache degrading is not this: its contents are lost, but no type or hash is
-/// recomputed and the reassurance below would be a lie.
+/// A degraded result cache loses its contents, but no type or hash is recomputed.
 #[test]
 fn a_result_cache_warning_is_not_a_front_end_migration() {
     let dir = tempfile::tempdir().unwrap();
@@ -45,8 +44,7 @@ fn an_unreadable_front_end_cache_is_reported_with_what_survived_it() {
     );
 }
 
-/// Inert while the store's own front-end file is the legacy one, which is what makes this
-/// detection safe to ship before the binary store does.
+/// Inert while the store's own front-end file is the legacy one.
 #[test]
 fn a_superseded_json_cache_is_named_even_without_a_warning() {
     let dir = tempfile::tempdir().unwrap();

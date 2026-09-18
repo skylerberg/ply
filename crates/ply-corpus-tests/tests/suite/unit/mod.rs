@@ -1,7 +1,4 @@
-//! `ply-corpus`'s unit tests, in a package of their own so they compile at
-//! opt-level 0 against the optimised rlib. The module tree mirrors
-//! `crates/ply-corpus/src` without the `tests` level; the crate root's own
-//! tests are here.
+//! `ply-corpus`'s unit tests; the module tree mirrors `crates/ply-corpus/src`.
 
 mod bench;
 mod build;
@@ -30,8 +27,6 @@ use ply_corpus::{CorpusSpec, Verified, verify};
 use ply_eval::Plan;
 use ply_store::Store;
 
-/// The whole point of the crate, at a size a unit test can afford: a corpus the real compiler
-/// accepts and the real scheduler runs green.
 #[test]
 fn a_generated_corpus_compiles_and_every_test_passes() {
     let dir = tempfile::tempdir().unwrap();
@@ -56,8 +51,6 @@ fn a_generated_corpus_compiles_and_every_test_passes() {
     );
 }
 
-/// Tests that write a shared resource have to end up in different groups, or the corpus is not
-/// exercising the scheduler at all.
 #[test]
 fn contended_resources_force_more_than_one_concurrency_group() {
     let dir = tempfile::tempdir().unwrap();
@@ -184,9 +177,6 @@ fn verify_at(density: f64) -> Verified {
     verify(&root).unwrap_or_else(|e| panic!("density {density} does not compile: {e:#}"))
 }
 
-/// A generated concurrent test has to be green under **every** interleaving, or the corpus
-/// cannot be the fixed point a reduction is measured against: a failure would be reported as a
-/// race rather than as a bad generator.
 #[test]
 fn a_concurrent_corpus_compiles_and_passes_at_every_density() {
     for density in [0.0, 0.5, 1.0] {
@@ -200,8 +190,7 @@ fn a_concurrent_corpus_compiles_and_passes_at_every_density() {
     }
 }
 
-/// `sim.read` names an input no test can write, so adding simulated tests to an
-/// otherwise-isolated corpus must not serialize anything.
+/// `sim.read` names an input no test can write, so it serializes nothing.
 #[test]
 fn concurrent_tests_do_not_change_how_the_suite_is_scheduled() {
     let plain = {
@@ -243,8 +232,6 @@ fn front_of(spec: &CorpusSpec, dir: &std::path::Path) -> Front {
     front(&root).unwrap()
 }
 
-/// A corpus the compiler rejects is worthless, and a specified one is a corpus the compiler has
-/// more to reject.
 #[test]
 fn a_specified_corpus_compiles_and_every_test_still_passes() {
     for (fraction, specimens) in [(0.0, 3), (0.5, 3), (1.0, 0), (1.0, 4)] {
@@ -277,7 +264,6 @@ fn raising_the_spec_density_changes_no_definition_hash() {
     assert_eq!(bare.hashes.tests, specified.hashes.tests);
 }
 
-/// And the consequence that makes the invariant worth having: a spec edit selects nothing.
 #[test]
 fn attaching_a_spec_to_every_definition_selects_no_test() {
     let dir = tempfile::tempdir().unwrap();
@@ -286,8 +272,7 @@ fn attaching_a_spec_to_every_definition_selects_no_test() {
     write(&root, &bare, &generate(&bare)).unwrap();
     verify(&root).unwrap();
 
-    // Written over the top rather than through `write::write`, which clears the directory and
-    // would take the cache the test is about with it.
+    // Not `write::write`, which clears the directory and the cache with it.
     for file in emit(&generate(&specified_spec(1.0, 0))) {
         std::fs::write(root.join(&file.path), &file.text).unwrap();
     }
@@ -310,8 +295,6 @@ fn attaching_a_spec_to_every_definition_selects_no_test() {
     );
 }
 
-/// A claim is not an effect, so it cannot join a footprint, so it cannot change which tests may
-/// run concurrently.
 #[test]
 fn attaching_a_spec_changes_no_footprint_and_no_concurrency_group() {
     let bare = tempfile::tempdir().unwrap();
@@ -337,7 +320,6 @@ fn attaching_a_spec_changes_no_footprint_and_no_concurrency_group() {
     }
 }
 
-/// The counts a measurement reads back.
 #[test]
 fn the_manifest_reports_the_obligations_the_corpus_actually_carries() {
     let dir = tempfile::tempdir().unwrap();
@@ -365,8 +347,6 @@ fn the_manifest_reports_the_obligations_the_corpus_actually_carries() {
     );
 }
 
-/// The corpus exists to measure incremental selection, so the property it measures has to hold
-/// on the corpus itself.
 #[test]
 fn a_second_run_over_an_unchanged_corpus_selects_nothing() {
     let dir = tempfile::tempdir().unwrap();

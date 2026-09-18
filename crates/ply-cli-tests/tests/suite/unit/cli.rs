@@ -57,7 +57,6 @@ fn inspect_needs_something_to_look_up() {
     }
 }
 
-/// The credential is `NAME=CERT,KEY` and is repeatable, one per listener.
 #[test]
 fn a_tls_credential_parses_into_its_name_and_its_two_files() {
     let cli = Cli::parse_from([
@@ -79,8 +78,6 @@ fn a_tls_credential_parses_into_its_name_and_its_two_files() {
     assert_eq!(args.tls.tls[0].key, PathBuf::from("certs/api.key"));
 }
 
-/// A malformed credential is refused with the form rather than accepted and
-/// discovered on the first handshake.
 #[test]
 fn a_credential_that_is_not_name_cert_key_is_refused_with_the_form() {
     for bad in ["api", "api=only.pem", "=a.pem,b.key", "api=,b.key"] {
@@ -93,9 +90,6 @@ fn a_credential_that_is_not_name_cert_key_is_refused_with_the_form() {
     }
 }
 
-/// Credentials configure a binding. Without `--host` there is no binding,
-/// so a `--tls` that would be silently ignored is refused instead — the
-/// same rule that keeps `--sim-budget` from being quietly dropped.
 #[test]
 fn tls_without_host_is_refused_rather_than_ignored() {
     assert!(Cli::try_parse_from(["ply", "run", "--tls", "api=a.pem,b.key"]).is_err());

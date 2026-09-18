@@ -1,8 +1,3 @@
-//! The shipped corpora on the compiled tier, through the `ply` binary: what the `same-tests` CI
-//! job used to assert as shell steps, each now a test that partitions, retries and times out
-//! like any other. Every assertion here is about the whole tree -- `examples/`, `tests/lang`,
-//! the standard library, the compiler's own sources -- rather than a program written for it.
-
 use assert_cmd::Command;
 use serde_json::Value;
 use std::io::{Read, Write};
@@ -24,7 +19,6 @@ fn ply(dir: &Path) -> Command {
     cmd
 }
 
-/// The compiler's own sources in a directory of their own, as `ply test` takes a project.
 fn compiler_copy() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     for entry in std::fs::read_dir(repo().join("crates/ply-compiler/ply")).unwrap() {
@@ -80,7 +74,6 @@ fn the_code_generator_runs_examples_green_and_enters_the_seam() {
     );
 }
 
-/// The emitter is asked for every body and answers; nothing here is the reference's.
 #[test]
 fn the_ply_emitter_produces_the_unit_and_examples_runs_green() {
     let cache = tempfile::tempdir().unwrap();
@@ -107,9 +100,7 @@ fn the_ply_emitter_produces_the_unit_and_examples_runs_green() {
     );
 }
 
-/// The compiler's own tests, run by the compiler it bootstraps into, with nothing else to fall
-/// back on. It runs alone in CI (`.github/ci-shards.sh`), since it is the emitter over its own
-/// sources once more.
+/// Runs alone in CI (`.github/ci-shards.sh`): it is the emitter over its own sources once more.
 #[test]
 fn the_compiled_tier_runs_the_compilers_own_tests_as_the_only_engine() {
     let dir = compiler_copy();
@@ -147,7 +138,6 @@ fn the_compiled_tier_is_the_only_engine_over_examples_and_the_standard_library()
     }
 }
 
-/// `ply prove --backend c` enters the propositions of every corpus and refutes none.
 #[test]
 fn the_compiled_tier_judges_the_corpus_specifications() {
     for corpus in ["examples", "crates/ply-std/ply"] {
@@ -173,8 +163,6 @@ fn the_compiled_tier_judges_the_corpus_specifications() {
     }
 }
 
-/// `examples/hello.ply` served by the tier alone: it answers a request, the tier held every
-/// definition, and the run exits when its connection count is served.
 #[test]
 fn a_served_example_with_the_tier_holding_its_accept_loop() {
     let dir = tempfile::tempdir().unwrap();
@@ -263,8 +251,7 @@ fn a_served_example_with_the_tier_holding_its_accept_loop() {
     );
 }
 
-/// Sixty-four chunks: the tree path of the hash, and long enough that every loop in it comes
-/// round with a record its tier may have held back.
+/// Sixty-four chunks: long enough that every loop comes round with a record its tier may have held back.
 #[test]
 fn the_c_tier_hashes_a_long_input_consistently() {
     let dir = tempfile::tempdir().unwrap();

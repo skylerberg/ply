@@ -1,5 +1,3 @@
-//! An adversarial audit of the stdlib path.
-
 use assert_cmd::prelude::*;
 use ply_cli::driver;
 use ply_cli::load::{Loaded, load};
@@ -46,8 +44,7 @@ fn hash_of(loaded: &Loaded, name: &str) -> String {
         .to_hex()
 }
 
-/// A project that reaches `std.net` and handles every atom, so its test is `det` and cacheable —
-/// which is what makes "did it re-run?"
+/// Handles every atom, so its test is `det` and cacheable, which makes "did it re-run?" answerable.
 const IMPORTER: &str = "\
 import std.net (net, drain)
 
@@ -58,9 +55,6 @@ test \"reads to the end\" {
 }
 ";
 
-// --- Can a project module impersonate a `std` one? --------------------------
-
-/// The reserved root, attacked from every direction a path can take.
 #[test]
 fn nothing_a_project_can_name_lands_under_the_reserved_root() {
     // Every one of these derives a module name at or under `std`.
@@ -82,8 +76,7 @@ fn nothing_a_project_can_name_lands_under_the_reserved_root() {
         );
     }
 
-    // And the near misses, which must keep working: reserving a prefix must not reserve every name
-    // that starts with the same three letters.
+    // Near misses must keep working: reserving a prefix must not reserve every name starting with those letters.
     for rel in ["stdlib.ply", "mine/std_helpers.ply", "a/std_thing.ply"] {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), rel, "pub fn f() -> Int = 1\n");
@@ -91,7 +84,6 @@ fn nothing_a_project_can_name_lands_under_the_reserved_root() {
     }
 }
 
-/// A project file inside a directory called `std`, named directly rather than discovered.
 #[test]
 fn naming_a_file_under_std_directly_cannot_smuggle_it_in_as_a_std_module() {
     let dir = tempfile::tempdir().unwrap();
@@ -110,7 +102,6 @@ fn naming_a_file_under_std_directly_cannot_smuggle_it_in_as_a_std_module() {
     assert!(loaded.check.defs.contains_key(&Symbol::new("json.parse")));
 }
 
-/// Two modules that would bind the same name, one shipped and one the project's.
 #[test]
 fn a_project_module_named_net_beside_std_net_is_a_loud_collision() {
     let dir = tempfile::tempdir().unwrap();
@@ -134,8 +125,7 @@ fn a_project_module_named_net_beside_std_net_is_a_loud_collision() {
         err.diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
     );
 
-    // `as` is the escape hatch, and both are then reachable and distinct: the two `net` effects
-    // produce atoms under different program-wide names.
+    // `as` is the escape hatch: the two `net` effects then produce atoms under different program-wide names.
     write(
         dir.path(),
         "app.ply",
@@ -153,12 +143,9 @@ fn a_project_module_named_net_beside_std_net_is_a_loud_collision() {
     );
 }
 
-/// A `std` module cannot be made to import a project one, so a cycle between the two is
-/// unrepresentable rather than merely rejected.
 #[test]
 fn no_cycle_can_be_built_between_a_project_and_the_stdlib() {
-    // A project module named after the one `std.json` imports, in case a shipped module's import
-    // could be captured by a project file.
+    // A project module named after the one `std.json` imports, in case the shipped import could be captured.
     let dir = tempfile::tempdir().unwrap();
     write(
         dir.path(),
@@ -179,8 +166,7 @@ fn no_cycle_can_be_built_between_a_project_and_the_stdlib() {
         }
     }
 
-    // And a self-import written into a shipped module is E0505, not the user's problem — asserted
-    // through the same loader path a real one would take.
+    // A self-import in a shipped module is E0505, asserted through the loader path a real one would take.
     for (name, source) in ply_std::sources() {
         assert!(
             !source.contains("import ")
@@ -193,9 +179,6 @@ fn no_cycle_can_be_built_between_a_project_and_the_stdlib() {
     }
 }
 
-// --- Does importing `std` disturb anything that does not? -------------------
-
-/// Nothing outside a definition's own reachable graph may enter its hash.
 #[test]
 fn a_definition_that_does_not_import_std_is_unmoved_by_one_that_does() {
     let dir = tempfile::tempdir().unwrap();
@@ -229,8 +212,6 @@ fn a_definition_that_does_not_import_std_is_unmoved_by_one_that_does() {
     );
 }
 
-// --- The warm cache, across a compiler upgrade ------------------------------
-
 /// What the previous compiler left behind, rewritten as this one would find it.
 fn age_the_shipped_fingerprint(dir: &Path, mut mutate: impl FnMut(&mut DefEntry)) {
     let path = ply_std::pseudo_path(&std_net());
@@ -252,7 +233,6 @@ fn age_the_shipped_fingerprint(dir: &Path, mut mutate: impl FnMut(&mut DefEntry)
     store.flush().unwrap();
 }
 
-/// The upgrade that changed nothing but the bytes — a comment, a reflow.
 #[test]
 fn an_upgrade_that_moves_no_definition_re_runs_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -271,8 +251,6 @@ fn an_upgrade_that_moves_no_definition_re_runs_nothing() {
     );
 }
 
-/// The direction that is a blocker rather than a cost: the cache was written under a `std.net`
-/// whose definitions really did move, and the run must not believe any of it.
 #[test]
 fn an_upgrade_that_moved_a_definition_invalidates_exactly_its_dependents() {
     let dir = tempfile::tempdir().unwrap();
@@ -301,8 +279,7 @@ fn an_upgrade_that_moved_a_definition_invalidates_exactly_its_dependents() {
     let mut store = Store::open(dir.path()).unwrap();
     let loaded = driver::load_incremental(dir.path(), &mut store).unwrap();
 
-    // The published hashes are what a from-scratch run computes — a cache written under an older
-    // `std.net` may be believed by none of them.
+    // A cache written under an older `std.net` may be believed by none of the published hashes.
     let scratch = load(dir.path()).unwrap();
     for name in ["app.read_all", "std.net.drain", "elsewhere.untouched"] {
         assert_eq!(
@@ -313,9 +290,7 @@ fn an_upgrade_that_moved_a_definition_invalidates_exactly_its_dependents() {
     }
 }
 
-/// The cache written under one digest and read under another warns, and the number it reports is
-/// the number of definitions *this program reaches* whose hash moved — which is zero here, and must
-/// be said as zero rather than implied.
+/// Zero here, and it must be said as zero rather than implied.
 #[test]
 fn the_upgrade_notice_counts_what_moved_rather_than_what_exists() {
     let dir = tempfile::tempdir().unwrap();
@@ -355,10 +330,6 @@ fn the_upgrade_notice_counts_what_moved_rather_than_what_exists() {
     );
 }
 
-// --- Renaming a `std` definition is free ------------------------------------
-
-/// The module rules's headline invariant, asked of the stdlib: renaming a definition changes no hash
-/// anywhere.
 #[test]
 fn renaming_a_shipped_definition_moves_no_hash() {
     let dir = tempfile::tempdir().unwrap();

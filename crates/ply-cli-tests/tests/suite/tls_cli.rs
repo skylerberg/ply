@@ -1,13 +1,9 @@
-//! TLS as the command line sees it: `--tls NAME=CERT,KEY`, and what `ply hosts` discloses about the
-//! stack it added to the trusted computing base.
-
 use assert_cmd::Command;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-/// A program that can create a TLS listener, which is what puts `ply_host::tls::listen` into the
-/// listing.
+/// Can create a TLS listener, which is what puts `ply_host::tls::listen` into the listing.
 const SECURE: &str = "\
 import std.net
 
@@ -18,8 +14,7 @@ fn main() -> Int / {net::net.write[listener]} = {
 }
 ";
 
-/// A program that opens a plaintext listener — and whose row nonetheless admits `net.listen_tls`,
-/// because a row names a resource and a mode rather than an operation.
+/// A plaintext listener whose row still admits `net.listen_tls`: a row names a resource and a mode, not an operation.
 const PLAIN: &str = "\
 import std.net
 
@@ -30,8 +25,7 @@ fn main() -> Int / {net::net.write[listener]} = {
 }
 ";
 
-/// A program that reaches the boundary without touching a socket at all, so nothing in its trusted
-/// computing base is a TLS stack.
+/// Reaches the boundary without touching a socket.
 const NO_SOCKET: &str = "\
 fn main() -> Int = simulate { spawn { 1 }; 2 }
 ";
@@ -56,8 +50,7 @@ fn stderr_of(output: &std::process::Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("stderr is utf-8")
 }
 
-/// A self-signed leaf, generated rather than checked in: a private key in a repository is a private
-/// key that leaks.
+/// Generated rather than checked in: a private key in a repository leaks.
 fn credential(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
     let key = rcgen::KeyPair::generate().expect("a key pair");
     let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
@@ -74,8 +67,6 @@ fn credential(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
 fn spec(name: &str, cert: &Path, key: &Path) -> String {
     format!("{name}={},{}", cert.display(), key.display())
 }
-
-// --- the listing ------------------------------------------------------------
 
 #[test]
 fn the_listing_discloses_the_tls_stack_and_the_credential_it_was_given() {
@@ -108,8 +99,6 @@ fn the_listing_discloses_the_tls_stack_and_the_credential_it_was_given() {
     assert!(text.contains("digest: b3:"), "{text}");
 }
 
-/// A program that reaches no socket has no TLS stack in its trusted computing base, and says
-/// nothing about one.
 #[test]
 fn a_program_that_touches_no_socket_reports_no_transport() {
     let dir = project(NO_SOCKET);
@@ -119,10 +108,6 @@ fn a_program_that_touches_no_socket_reports_no_transport() {
     assert!(!text.contains("ply_host::tls"), "{text}");
 }
 
-/// A program that only calls `net.listen` still discloses the TLS stack, and that is deliberate
-/// rather than a leak: a row names a resource and a mode, not an operation, so
-/// `{net.write[listener]}` admits `net.listen_tls` and the listing has to say the handler is
-/// reachable.
 #[test]
 fn a_plaintext_program_whose_row_admits_listen_tls_still_discloses_it() {
     let dir = project(PLAIN);
@@ -132,8 +117,6 @@ fn a_plaintext_program_whose_row_admits_listen_tls_still_discloses_it() {
     assert!(text.contains("   transport"), "{text}");
 }
 
-/// A program that can call `net.listen_tls` with nothing configured is a run that will answer
-/// `E0429` at the perform site.
 #[test]
 fn a_tls_program_with_no_credential_is_told_what_will_happen() {
     let dir = project(SECURE);
@@ -145,8 +128,6 @@ fn a_tls_program_with_no_credential_is_told_what_will_happen() {
     );
 }
 
-/// The trusted computing base listing: the digest covers the credential names, the provider and the library version, and
-/// **not** the fingerprint.
 #[test]
 fn the_digest_is_stable_across_a_rotation_and_moves_when_a_credential_is_added() {
     let dir = project(SECURE);
@@ -188,7 +169,6 @@ fn the_digest_is_stable_across_a_rotation_and_moves_when_a_credential_is_added()
     assert_ne!(before, digest(Vec::new()), "removing one must move it");
 }
 
-/// `--json` carries the whole fingerprint; the table abbreviates it.
 #[test]
 fn the_json_object_carries_the_transport_and_the_full_fingerprint() {
     let dir = project(SECURE);
@@ -221,8 +201,6 @@ fn the_json_object_carries_the_transport_and_the_full_fingerprint() {
     );
 }
 
-// --- refusals ---------------------------------------------------------------
-
 #[test]
 fn a_credential_that_does_not_load_is_e0430_naming_the_file() {
     let dir = project(SECURE);
@@ -244,8 +222,7 @@ fn a_credential_that_does_not_load_is_e0430_naming_the_file() {
         assert!(rendered.contains("E0430"), "{rendered}");
     }
 
-    // A key that is not the leaf's is the check that needs both files, and it is the one a deploy
-    // gets wrong.
+    // A key that is not the leaf's needs both files to catch, and is the one a deploy gets wrong.
     let (_, other_key) = credential(dir.path(), "other");
     let output = ply(dir.path())
         .arg("run")
@@ -258,8 +235,7 @@ fn a_credential_that_does_not_load_is_e0430_naming_the_file() {
     assert!(rendered.contains("E0430"), "{rendered}");
 }
 
-/// The shape is a usage error rather than E0430: a reader who mistyped the argument needs the form,
-/// and one whose PEM is broken needs the file.
+/// A mistyped argument needs the form; a broken PEM needs the file.
 #[test]
 fn a_malformed_argument_is_refused_with_the_form_rather_than_a_diagnostic() {
     let dir = project(SECURE);
@@ -279,7 +255,6 @@ fn a_malformed_argument_is_refused_with_the_form_rather_than_a_diagnostic() {
     assert!(!rendered.contains("E0430"), "{rendered}");
 }
 
-/// Credentials configure a binding, and without `--host` there is none.
 #[test]
 fn tls_without_host_is_refused() {
     let dir = project(SECURE);
@@ -297,7 +272,6 @@ fn tls_without_host_is_refused() {
     }
 }
 
-/// Hermetic is the default and the flag is the only way out — for credentials too.
 #[test]
 fn a_hermetic_run_reaches_no_credential_and_says_so() {
     let dir = project(SECURE);

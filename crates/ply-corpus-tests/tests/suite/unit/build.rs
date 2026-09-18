@@ -30,9 +30,6 @@ fn no_concurrency_is_asked_for_by_default_and_none_is_generated() {
     assert!(generate(&small()).concurrent.is_empty());
 }
 
-/// The knob's two ends, which are the two ends of the claim: at 0.0 the dependence relation has
-/// nothing to relate and the search should collapse to one interleaving, at 1.0 it relates
-/// everything and there is nothing to prune.
 #[test]
 fn density_zero_gives_every_task_its_own_shard_and_density_one_gives_them_all_the_same() {
     let disjoint = generate(&concurrent(0.0));
@@ -65,8 +62,6 @@ fn contention_rises_with_the_density_asked_for() {
     assert!(low < mid && mid < high, "{low} {mid} {high}");
 }
 
-/// Only the shard assignment may move with the density, or a measurement across densities is
-/// comparing two different programs and attributing the difference to contention.
 #[test]
 fn density_changes_the_shard_assignment_and_nothing_else() {
     let disjoint = generate(&concurrent(0.0));
@@ -272,8 +267,6 @@ fn the_density_asked_for_is_roughly_the_density_generated() {
     assert_eq!(generate(&specified(0.0, 0)).specified_defs(), 0);
 }
 
-/// A claim's stream is keyed by the definition it is attached to, so raising the density adds
-/// claims rather than moving the ones already there.
 #[test]
 fn raising_the_density_only_ever_adds_claims() {
     let thin = generate(&specified(0.3, 0));
@@ -288,9 +281,7 @@ fn raising_the_density_only_ever_adds_claims() {
     assert!(thick.specified_defs() > thin.specified_defs());
 }
 
-/// An obligation on an effectful definition cannot be attempted — nothing hands `ply prove` a
-/// handler — and a corpus that spared itself that population would be measuring a tier
-/// distribution the real one does not have.
+/// Nothing hands `ply prove` a handler, so an obligation on an effectful definition cannot be attempted.
 #[test]
 fn a_claim_on_an_effectful_definition_is_built_as_a_gap() {
     let corpus = generate(&specified(1.0, 0));
@@ -308,9 +299,6 @@ fn a_claim_on_an_effectful_definition_is_built_as_a_gap() {
     assert!(gaps > 0, "no effectful definition carried a claim");
 }
 
-/// The tier distribution has to span the table, and it has to do so the same way under every
-/// seed: a distribution that moved with the seed is not one a measurement can compare two runs
-/// against.
 #[test]
 fn specimens_span_the_tiers_and_do_not_move_with_the_seed() {
     let corpus = generate(&specified(0.0, 3));

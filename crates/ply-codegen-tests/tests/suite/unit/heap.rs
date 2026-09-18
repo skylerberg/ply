@@ -8,7 +8,6 @@ fn layouts() -> Layouts {
     Layouts::new(vec![(Symbol::new("Some"), 1), (Symbol::new("None"), 0)])
 }
 
-/// Two byte strings compare as bytes on the fast path, and as the interpreter orders them.
 #[test]
 fn two_byte_strings_compare_in_byte_order_at_every_length() {
     let mut h = Heap::new();
@@ -40,8 +39,6 @@ fn two_byte_strings_compare_in_byte_order_at_every_length() {
     );
 }
 
-/// A flat record's release walks nothing and still recycles it; a field written in place
-/// that holds a count takes the flag with it.
 #[test]
 fn a_flat_record_is_released_without_a_walk_and_loses_the_flag_when_it_gains_a_count() {
     let mut h = Heap::new();
@@ -69,8 +66,6 @@ fn a_flat_record_is_released_without_a_walk_and_loses_the_flag_when_it_gains_a_c
     unsafe { assert_eq!((*child).kind, KIND_DEAD, "a counted field was not let go") };
 }
 
-/// Perceus's reset keeps a record held once with its fields let go, and releases anything
-/// else.
 #[test]
 fn a_reset_record_keeps_its_memory_and_lets_its_fields_go() {
     let mut h = Heap::new();
@@ -390,8 +385,7 @@ fn a_word_is_an_object_only_at_a_live_start() {
     let mut heap = Heap::new();
     enter(&mut heap);
     let o = heap.alloc(KIND_RECORD, 0, 2, 0);
-    // Filled before the `dec` below, as every caller of `alloc` must: the two words are
-    // whatever the last tenant of this memory left there until they are written.
+    // Filled before the `dec`, as every caller of `alloc` must: until written, the words hold the last tenant's leftovers.
     unsafe {
         set_word(o, 0, imm(1));
         set_word(o, 1, imm(2));

@@ -1,5 +1,3 @@
-//! Region isolation's number, taken against real projects rather than against footprints somebody typed.
-
 use ply_corpus::regions::{self, Corpus, Hypothetical};
 use ply_ty::Footprint;
 use std::path::{Path, PathBuf};
@@ -12,8 +10,6 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// One test per label, so the counterfactual is a clique of `per_label` tests per label and the
-/// group count is exactly `per_label`.
 fn cell_project(dir: &Path, cells: usize, labels: usize, pure: usize) {
     let mut src = String::new();
     for i in 0..cells {
@@ -34,8 +30,6 @@ fn cell_project(dir: &Path, cells: usize, labels: usize, pure: usize) {
     std::fs::write(dir.join("main.ply"), src).expect("writing the scratch project");
 }
 
-/// The mechanism, end to end and on the real runner: a declared `cell` footprint reaches a test,
-/// the scheduler calls the test isolated anyway, and the counterfactual is one group per label.
 #[test]
 fn a_cell_atom_reaches_a_footprint_and_only_forking_hides_it() {
     let dir = tempfile::tempdir().expect("a scratch directory");
@@ -66,7 +60,6 @@ fn a_cell_atom_reaches_a_footprint_and_only_forking_hides_it() {
     );
 }
 
-/// A label nobody else names conflicts with nothing, so the exemption was buying it nothing.
 #[test]
 fn cell_tests_on_distinct_labels_are_free_to_lose_the_exemption() {
     let dir = tempfile::tempdir().expect("a scratch directory");
@@ -80,7 +73,6 @@ fn cell_tests_on_distinct_labels_are_free_to_lose_the_exemption() {
     assert_eq!(cost.today.groups, cost.without_forking.groups);
 }
 
-/// The measured answer for the corpus region isolation quotes.
 #[test]
 fn the_examples_suite_loses_nothing_to_the_region_model() {
     let root = repo_root().join("examples");
@@ -105,8 +97,6 @@ fn the_examples_suite_loses_nothing_to_the_region_model() {
     );
 }
 
-/// The colouring the counterfactual is read off has to be the one the runner uses, on a real corpus
-/// and not only on the seven hand-made footprints the unit test carries.
 #[test]
 fn the_examples_colouring_is_the_runners_own() {
     let root = repo_root().join("examples");
@@ -124,8 +114,6 @@ fn the_examples_colouring_is_the_runners_own() {
     );
 }
 
-/// What the cost would be if the shape existed, so the verdict rests on a measured exposure rather
-/// than on the absence of an example.
 #[test]
 fn the_exposure_is_a_group_per_test_only_at_one_label() {
     let shape = |labels: usize| {
@@ -148,7 +136,6 @@ fn the_exposure_is_a_group_per_test_only_at_one_label() {
     );
 }
 
-/// A group is a barrier, so the wall-clock model must not be `sum / jobs`.
 #[test]
 fn the_wall_clock_model_charges_the_barrier_it_claims_to() {
     let corpus = Corpus {

@@ -1,6 +1,3 @@
-//! Whether the W6 measurement files still describe the tree they ship in, and whether the decision
-//! machinery can be made to answer without checking C3.
-
 use ply_corpus::w6::{self, Alternative, Criteria, Layer, Report, Verdict};
 use std::path::{Path, PathBuf};
 
@@ -12,7 +9,7 @@ fn repo() -> PathBuf {
         .to_path_buf()
 }
 
-/// The shipped report, merged the way `ply-corpus w6` merges it.
+/// Merged the way `ply-corpus w6` merges it.
 fn shipped() -> Report {
     let mut merged = serde_json::Map::new();
     for name in ["benches/w6-ladder.json", "benches/w6-spike.json"] {
@@ -29,8 +26,6 @@ fn shipped() -> Report {
         .expect("the merged measurements are a W6 report")
 }
 
-/// The interpreter share is what M9's case rests on, and a share summed from nine differences would
-/// be an additive fiction the moment one rung's `without` stopped being the rung below it.
 #[test]
 fn the_interpreter_share_telescopes_to_one_measured_absolute() {
     let report = shipped();
@@ -59,8 +54,6 @@ fn the_interpreter_share_telescopes_to_one_measured_absolute() {
     );
 }
 
-/// The share's numerator and its denominator are taken in different arenas on different stacks, and
-/// the ladder says so in a column.
 #[test]
 fn a_negative_residue_is_evidence_the_share_is_not_a_lower_bound() {
     let report = shipped();
@@ -112,7 +105,6 @@ fn a_negative_residue_is_evidence_the_share_is_not_a_lower_bound() {
     );
 }
 
-/// **The C3 hole, closed.**
 #[test]
 fn an_absent_alternatives_list_cannot_advance_m9() {
     let mut report = shipped();
@@ -140,9 +132,6 @@ fn an_absent_alternatives_list_cannot_advance_m9() {
     }
 }
 
-/// The same hole through the other field: `priced` and `end_to_end` are numbers in a file, so a
-/// report could claim all seven levers were priced at 1.00x and advance M9 without any of them
-/// having been measured.
 #[test]
 fn a_measurement_file_cannot_price_a_lever_by_asserting_it() {
     let mut report = shipped();
@@ -164,8 +153,6 @@ fn a_measurement_file_cannot_price_a_lever_by_asserting_it() {
     );
 }
 
-/// What the shipped file *does* price, and that the lever it prices is one of the roster's rather than one
-/// of its own invention.
 #[test]
 fn every_priced_lever_answers_for_a_lever_adr_0016_names() {
     let report = shipped();
@@ -203,7 +190,6 @@ fn every_priced_lever_answers_for_a_lever_adr_0016_names() {
     );
 }
 
-/// The shipped files may not carry a verdict or a threshold.
 #[test]
 fn neither_shipped_measurement_file_carries_a_verdict_or_a_criterion() {
     for name in ["benches/w6-ladder.json", "benches/w6-spike.json"] {
@@ -239,7 +225,6 @@ fn neither_shipped_measurement_file_carries_a_verdict_or_a_criterion() {
     }
 }
 
-/// **The staleness guard, and the one this audit exists because nothing had.**
 #[test]
 fn the_shipped_ladder_still_describes_the_tree_it_ships_in() {
     let report = shipped();
@@ -329,8 +314,6 @@ fn the_shipped_ladder_still_describes_the_tree_it_ships_in() {
     );
 }
 
-/// The pinned criteria and the shipped numbers together, so a reader can see which criterion the
-/// verdict turned on rather than being told.
 #[test]
 fn the_shipped_verdict_turns_on_c3() {
     let report = shipped();
@@ -386,7 +369,6 @@ fn the_shipped_verdict_turns_on_c3() {
     );
 }
 
-/// **The file is the command's output, not a document assembled around it.**
 #[test]
 fn the_shipped_ladder_is_what_the_command_writes() {
     let path = repo().join("benches/w6-ladder.json");
