@@ -84,9 +84,8 @@ pub(super) fn cache_dir() -> std::path::PathBuf {
 /// order `ply_bind` will fill it, and every body -- so a change to any of them is a change here,
 /// and a stale object cannot be loaded against a runtime that moved under it. The compiler's own
 /// size and modification time go in because upgrading `cc` in place changes nothing else.
-fn key_of(source: &str, level: &str) -> String {
-    let cc = compiler();
-    let stamp = std::fs::metadata(which(&cc).unwrap_or_default())
+pub(super) fn key_of(cc: &str, source: &str, level: &str) -> String {
+    let stamp = std::fs::metadata(which(cc).unwrap_or_default())
         .ok()
         .map(|m| {
             format!(
@@ -100,7 +99,7 @@ fn key_of(source: &str, level: &str) -> String {
         })
         .unwrap_or_default();
     let mut h = blake3::Hasher::new();
-    for part in [cc.as_str(), level, stamp.as_str(), source] {
+    for part in [cc, level, stamp.as_str(), source] {
         h.update(part.as_bytes());
         h.update(&[0]);
     }
@@ -120,7 +119,7 @@ pub(super) fn open_by_key(key: &str) -> Option<Library> {
 /// The key an assembled source and the current compiler settle on, so it can be recorded beside
 /// the unit that produced it.
 pub(super) fn object_key(source: &str) -> String {
-    key_of(source, &opt_level())
+    key_of(&compiler(), source, &opt_level())
 }
 
 /// The optimisation flag, in one place: three callers ask, and one of them asking differently
@@ -129,7 +128,7 @@ fn opt_level() -> String {
     super::toolchain::Profile::current().opt_level()
 }
 
-fn ext() -> &'static str {
+pub(super) fn ext() -> &'static str {
     if cfg!(target_os = "macos") {
         "dylib"
     } else {
@@ -161,7 +160,8 @@ pub fn compile_and_load(source: &str, stem: &str) -> Result<Library> {
     // the loop's path, and for the self-hosted front end it is tens of seconds -- every invocation,
     // because `crates/ply-codegen` persisted nothing across runs.
     let cache = cache_dir();
-    let key = key_of(source, &level);
+    let cc = compiler();
+    let key = key_of(&cc, source, &level);
     let cached = cache.join(format!("{key}.{ext}"));
     // A cached object that will not load is not a reason to fail: it is a reason to build one.
     // Anything that could make it unloadable -- a truncated write, an OS upgrade -- is answered by
@@ -183,7 +183,6 @@ pub fn compile_and_load(source: &str, stem: &str) -> Result<Library> {
     let c = dir.join("unit.c");
     let so = dir.join(format!("unit.{ext}"));
     std::fs::write(&c, source)?;
-    let cc = compiler();
     let support = super::toolchain::extra_args(&cc);
     let out = std::process::Command::new(&cc)
         .args(&support)
@@ -234,7 +233,7 @@ pub fn compile_and_load(source: &str, stem: &str) -> Result<Library> {
 
 impl Library {
     /// `dlopen` one object, whether it was compiled just now or last week.
-    fn open(so: &std::path::Path) -> Result<Library> {
+    pub(super) fn open(so: &std::path::Path) -> Result<Library> {
         let path = CString::new(so.to_string_lossy().as_bytes())?;
         let handle = unsafe { dlopen(path.as_ptr(), RTLD_NOW) };
         if handle.is_null() {

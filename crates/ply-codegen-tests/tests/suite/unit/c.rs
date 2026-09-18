@@ -1,6 +1,7 @@
 mod cache;
 mod sweep;
 mod toolchain;
+mod upgrade;
 
 use ply_codegen::c::{HELPERS, Native, PRELUDE, compile_and_load, helper_addresses, runtime_decls};
 
