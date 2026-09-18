@@ -62,14 +62,6 @@ impl NameRef {
     }
 }
 
-/// Whether every name still denotes what it did: an interface is written in names a hash erases.
-pub fn witness_holds(
-    names: &[NameRef],
-    mut resolve: impl FnMut(&Symbol) -> Option<DefHash>,
-) -> bool {
-    names.iter().all(|n| resolve(&n.name) == Some(n.hash))
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DefKind {
@@ -89,23 +81,11 @@ pub struct Member {
 pub struct DefEntry {
     pub name: Symbol,
     pub hash: DefHash,
-    /// Its form with references left as written, so a callee edit moves no caller's `own`.
-    /// Not an identity: nothing may key a cache on it.
-    pub own: DefHash,
-    /// What a caller can observe: scheme, footprint, constraints. Effect rows are inferred, so a
-    /// body that gains a `perform` moves it.
-    pub iface: DefHash,
     pub span: FileSpan,
     pub kind: DefKind,
     /// Empty for a `fn`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<Member>,
-    /// The names this definition mentions directly, in normalization order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub deps: Vec<Symbol>,
-    /// A `reuse fn`; gate 1 needs this without a parse, since the promise is checked whole-program.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub reuse: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -115,27 +95,12 @@ pub struct CachedTest {
     pub nondet: bool,
     pub footprint: Footprint,
     pub span: FileSpan,
-    pub name_span: FileSpan,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub deps: Vec<Symbol>,
 }
 
-/// A module this file imports, with a digest of the exports it was compiled against.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-pub struct ImportEdge {
-    pub module: Symbol,
-    pub exports: ContentHash,
-}
-
-/// `content_hash` covers the raw bytes: gate 1 decides whether to parse before any parse exists.
+/// What one file declared when it was last checked, and the bytes it was checked as.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct SourceFingerprint {
     pub content_hash: ContentHash,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub imports: Vec<ImportEdge>,
-    /// Every top-level name this file mentions but does not declare, and what it resolved to.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub deps: Vec<NameRef>,
     pub defs: Vec<DefEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tests: Vec<CachedTest>,
@@ -145,8 +110,6 @@ impl SourceFingerprint {
     pub fn new(content_hash: ContentHash) -> SourceFingerprint {
         SourceFingerprint {
             content_hash,
-            imports: Vec::new(),
-            deps: Vec::new(),
             defs: Vec::new(),
             tests: Vec::new(),
         }
@@ -156,39 +119,9 @@ impl SourceFingerprint {
         self.content_hash == ContentHash::of(bytes)
     }
 
-    /// The `(name, hash)` pairs this file publishes, sorted, as [`exports_digest`] takes them.
-    pub fn exports(&self) -> Vec<NameRef> {
-        let mut out: Vec<NameRef> = self
-            .defs
-            .iter()
-            .map(|d| NameRef {
-                name: d.name.clone(),
-                hash: d.hash,
-            })
-            .collect();
-        out.sort_by(|a, b| a.name.cmp(&b.name).then(a.hash.cmp(&b.hash)));
-        out
-    }
-
     pub fn referenced_hashes(&self) -> impl Iterator<Item = DefHash> + '_ {
         self.defs.iter().map(|d| d.hash)
     }
-}
-
-pub fn exports_digest(exports: &[NameRef]) -> ContentHash {
-    let mut sorted: Vec<&NameRef> = exports.iter().collect();
-    sorted.sort_by(|a, b| a.name.cmp(&b.name).then(a.hash.cmp(&b.hash)));
-    sorted.dedup_by(|a, b| a.name == b.name && a.hash == b.hash);
-
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
-    for entry in sorted {
-        let name = entry.name.as_str().as_bytes();
-        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(name);
-        bytes.extend_from_slice(&entry.hash.0);
-    }
-    ContentHash::of(&bytes)
 }
 
 /// The published interface of one `fn`, keyed by its [`DefHash`].
@@ -196,44 +129,17 @@ pub fn exports_digest(exports: &[NameRef]) -> ContentHash {
 pub struct CachedDef {
     pub scheme: Scheme,
     pub footprint: Footprint,
-    /// What row inference computed for the body, which a declared row may be wider than.
-    #[serde(default)]
-    pub performed: Footprint,
-    /// The `effect set` names the row was written with, in source order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub row_aliases: Vec<Symbol>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<NameRef>,
-    /// Can perform an effect its published row hides; `true`, the conservative answer, if absent.
-    #[serde(default = "yes")]
-    pub internally_effectful: bool,
-}
-
-fn yes() -> bool {
-    true
 }
 
 impl CachedDef {
-    /// `performed` starts equal to `footprint`: nothing narrower is known.
     pub fn new(scheme: Scheme, footprint: Footprint) -> CachedDef {
         CachedDef {
             scheme,
-            internally_effectful: true,
-            performed: footprint.clone(),
             footprint,
-            row_aliases: Vec::new(),
             names: Vec::new(),
         }
-    }
-
-    pub fn performing(mut self, performed: Footprint) -> CachedDef {
-        self.performed = performed;
-        self
-    }
-
-    pub fn written_as(mut self, row_aliases: Vec<Symbol>) -> CachedDef {
-        self.row_aliases = row_aliases;
-        self
     }
 
     pub fn witnessed_by(mut self, names: Vec<NameRef>) -> CachedDef {
@@ -241,23 +147,11 @@ impl CachedDef {
         self
     }
 
-    pub fn witness_holds(&self, resolve: impl FnMut(&Symbol) -> Option<DefHash>) -> bool {
-        witness_holds(&self.names, resolve)
-    }
-
-    pub fn performing_internally(mut self, yes: bool) -> CachedDef {
-        self.internally_effectful = yes;
-        self
-    }
-
     pub fn canonicalized(self) -> CachedDef {
         CachedDef {
             scheme: canonicalize_scheme(&self.scheme),
             footprint: self.footprint,
-            performed: self.performed,
-            row_aliases: self.row_aliases,
             names: canonical_names(self.names),
-            internally_effectful: self.internally_effectful,
         }
     }
 }
@@ -288,10 +182,6 @@ impl CachedDecl {
     pub fn witnessed_by(mut self, names: Vec<NameRef>) -> CachedDecl {
         self.names = names;
         self
-    }
-
-    pub fn witness_holds(&self, resolve: impl FnMut(&Symbol) -> Option<DefHash>) -> bool {
-        witness_holds(&self.names, resolve)
     }
 
     pub fn canonicalized(self) -> CachedDecl {

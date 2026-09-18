@@ -61,6 +61,11 @@ impl Bundle {
     pub fn sources_digest(&self) -> Option<&str> {
         self.sources.as_deref()
     }
+
+    /// The unit's C, compressed, as the bundle stores it.
+    pub fn unit(&self) -> &[u8] {
+        &self.unit
+    }
 }
 
 /// A unit's C compressed, as the bundle stores it and as an artifact embeds it.
