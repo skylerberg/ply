@@ -1,5 +1,3 @@
-//! The staleness guard that cannot be blamed on a machine.
-
 use crate::counting::charge;
 use std::path::{Path, PathBuf};
 
@@ -26,7 +24,6 @@ fn number_before(text: &str, after: &str) -> Option<f64> {
     digits.replace(',', "").trim().parse().ok()
 }
 
-/// What one `/health` request allocates, in a 200-request window.
 fn per_request() -> (f64, f64) {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service compiles");
     let request = ply_corpus::w6_run::head();
@@ -41,7 +38,6 @@ fn per_request() -> (f64, f64) {
     (allocs as f64 / N as f64, bytes as f64 / N as f64)
 }
 
-/// What the shipped report says a request allocates, against what one does.
 #[test]
 fn the_shipped_allocation_evidence_still_describes_this_request_path() {
     let text = std::fs::read_to_string(repo().join("benches/w6-ladder.json"))
@@ -79,7 +75,6 @@ fn the_shipped_allocation_evidence_still_describes_this_request_path() {
     );
 }
 
-/// The figures `w6-alloc` wrote.
 fn shipped_figures() -> ply_corpus::w6_run::Allocation {
     let path = repo().join(ply_corpus::w6_run::ALLOCATION_FILE);
     let text = std::fs::read_to_string(&path)
@@ -91,7 +86,6 @@ fn shipped_figures() -> ply_corpus::w6_run::Allocation {
 const RETAKE: &str =
     "Re-take it: `./target/release/w6-alloc --repo . --requests 200 --out benches/w6-alloc.json`.";
 
-/// What the shipped figures say a request allocates, against what one does.
 #[test]
 fn the_shipped_figures_still_describe_this_request_path() {
     let figures = shipped_figures();

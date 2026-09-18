@@ -5,8 +5,7 @@ use ply_span::codes;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// Bodies that are not decodable definitions, deliberately: everything below is about the
-/// *container*, and `decode` checks a body against its key and nothing more.
+/// Not decodable definitions, deliberately: `decode` checks a body against its key and nothing more.
 fn sample() -> Artifact {
     let mut bodies = BTreeMap::new();
     let mut names = Vec::new();

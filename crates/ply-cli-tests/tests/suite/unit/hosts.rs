@@ -65,8 +65,7 @@ pub mod fixture {
         HostResource::Only(Resource::Named(Symbol::new(label)))
     }
 
-    /// The same registration, declared deterministic, which binds against an effect the program did
-    /// not mark `nondet`.
+    /// Declared deterministic, which binds against an effect the program did not mark `nondet`.
     pub fn deterministic(mut op: HostOp) -> HostOp {
         op.determinism = Determinism::Deterministic;
         op
@@ -135,8 +134,6 @@ fn listing() -> HostListing {
     full().preview(&check(DB)).expect("the fixture binds")
 }
 
-/// One line per resolved triple, ascending, and an `Any` handler's resources spelled out rather
-/// than hidden behind a `*`.
 #[test]
 fn the_listing_names_every_resource_an_any_handler_got() {
     let listing = listing();
@@ -155,7 +152,6 @@ fn the_listing_names_every_resource_an_any_handler_got() {
     assert!(!text.contains('*'), "a resource was hidden:\n{text}");
 }
 
-/// The listing whole, rather than a claim per column.
 #[test]
 fn the_table_is_exactly_the_shape_the_contract_specifies() {
     let lines = listing_lines(&listing(), &Disclosures::default());
@@ -175,8 +171,6 @@ db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  
     assert!(digest[0].starts_with("digest: b3:"), "{digest:?}");
 }
 
-/// The whole ambition of the listing is a one-line diff in a review, which requires two runs
-/// over one program to agree byte for byte.
 #[test]
 fn the_listing_and_its_digest_are_stable_across_runs() {
     let program = check(DB);
@@ -190,8 +184,6 @@ fn the_listing_and_its_digest_are_stable_across_runs() {
     assert_eq!(rows_json(&once), rows_json(&twice));
 }
 
-/// A handler that quietly became repeatable, or quietly stopped declaring itself blocking, is
-/// exactly the change worth a reviewer's attention.
 #[test]
 fn the_digest_moves_when_a_flag_alone_moves() {
     let program = check(DB);
@@ -218,9 +210,7 @@ fn the_digest_moves_when_a_flag_alone_moves() {
     assert_ne!(one, linear, "linearity alone must move the digest");
     assert_ne!(one, blocks, "blocking alone must move the digest");
 
-    // The newest column, and the one whose value a reviewer most needs a diff for: a handler
-    // that quietly became able to receive a credential is where the secret containment claim's claim stops
-    // being enforceable.
+    // A handler that quietly became able to receive a credential is where secret containment stops being enforceable.
     let secrets = registry(vec![receives_secrets(op(
         "clock",
         "now",
@@ -261,8 +251,7 @@ fn hermetic_says_so_and_still_reports_what_would_bind() {
     assert!(lines[2].contains("--host"));
 }
 
-/// An empty listing is indistinguishable from a registry that failed to load, so neither form
-/// is allowed to print one and stop.
+/// An empty listing is indistinguishable from a registry that failed to load.
 #[test]
 fn an_empty_registry_says_it_is_empty_rather_than_printing_nothing() {
     let empty = HostRegistry::new().preview(&check(DB)).unwrap();
@@ -281,8 +270,7 @@ fn an_empty_registry_says_it_is_empty_rather_than_printing_nothing() {
         true,
         "ply_host::postgres::read",
     )]);
-    // A driver linked into a program that declares the effect and never queries is idle, not
-    // wrong.
+    // A driver linked into a program that declares the effect and never queries is idle, not wrong.
     let quiet = check("nondet effect db {\n  read get[r](key: Int) -> Int\n}\nfn f() -> Int = 1\n");
     let idle = idle.preview(&quiet).unwrap();
     assert!(idle.rows.is_empty());
@@ -308,8 +296,6 @@ fn the_json_row_carries_the_declaration_side_of_the_determinism_pair() {
     assert_eq!(rows[1]["blocking"], true);
 }
 
-/// The default is the point: nothing binds without the flag, and a hermetic binding reaches
-/// nothing whatever the registry holds.
 #[test]
 fn hermetic_is_the_default_and_reaches_nothing() {
     let program = check(DB);
@@ -332,8 +318,6 @@ fn hermetic_is_the_default_and_reaches_nothing() {
     }
 }
 
-/// A footprint that meets the binding is host-backed and therefore not isolated, however
-/// isolated its atoms would otherwise make it.
 #[test]
 fn a_host_backed_test_leaves_the_trivially_parallel_count() {
     let program = check(DB);
@@ -358,8 +342,7 @@ fn a_host_backed_test_leaves_the_trivially_parallel_count() {
     assert_eq!(counts.isolated, 1);
     assert_eq!(counts.shared, 1);
 
-    // The same corpus under a hermetic binding: the host column is empty and every other number
-    // is what it was before W1.
+    // Under a hermetic binding the host column is empty.
     let hermetic = Hosts::open(
         &program,
         false,
@@ -380,10 +363,7 @@ fn a_host_backed_test_leaves_the_trivially_parallel_count() {
     assert_eq!(counts.shared, 1);
 }
 
-// --- database -----------------------------------------------------------
-
-/// A registry whose `db.*` resolve to the postgres driver's paths, which is how a listing row
-/// is recognised as one.
+/// `db.*` resolve to the postgres driver's paths, which is how a listing row is recognised as one.
 fn postgres(op_name: &'static str, path: &'static str) -> HostRegistry {
     registry(vec![op(
         "db",
@@ -406,9 +386,6 @@ fn configured(schema: Option<&str>) -> DbConfig {
     .expect("--host and a URL yield a configuration")
 }
 
-/// The check `--db` exists for: a program that reaches postgres and a run that named no
-/// database is a service that would discover it had nowhere to connect after accepting a
-/// request.
 #[test]
 fn reaching_postgres_with_no_database_configured_is_refused_before_anything_runs() {
     let program = check(DB);
@@ -428,9 +405,7 @@ fn reaching_postgres_with_no_database_configured_is_refused_before_anything_runs
     );
 }
 
-/// The complement, and the reason the check keys on the *binding*: an HTTP-only program under
-/// `--host` binds no postgres handler and must not be made to name a database it will never
-/// open.
+/// The check keys on the binding: an HTTP-only program under `--host` binds no postgres handler.
 #[test]
 fn a_program_that_reaches_no_database_needs_none_and_discloses_none() {
     let program = check(DB);
@@ -480,8 +455,7 @@ fn a_configured_run_says_it_reached_a_real_database_and_never_says_the_password(
     );
 }
 
-/// Transactions as handlers handles `db.rollback` in Ply, inside `transaction`, so a bound one would abort
-/// nothing and commit what the program meant to discard.
+/// `db.rollback` is handled in Ply inside `transaction`, so a bound one would abort nothing and commit what was meant to be discarded.
 #[test]
 fn a_bound_rollback_is_refused_as_a_defect_rather_than_listed() {
     let program = check(
@@ -519,10 +493,7 @@ fn a_db_schema_naming_nothing_is_refused_with_what_the_program_does_have() {
     );
 }
 
-// --- transport ----------------------------------------------------------
-
-/// A registry whose `net.listen_tls` resolves to the real TLS handler, so the listing carries
-/// the row `Transport::of` keys on.
+/// `net.listen_tls` resolves to the real TLS handler, so the listing carries the row `Transport::of` keys on.
 fn transport_only(transport: Transport) -> Disclosures {
     Disclosures {
         transport: Some(transport),
@@ -555,9 +526,6 @@ fn tls_listing() -> HostListing {
         .expect("the fixture binds")
 }
 
-/// A program that cannot create a TLS listener says nothing about TLS, and its digest is what
-/// it was before W3 — which is the whole reason the block is conditional rather than always
-/// printed.
 #[test]
 fn a_plaintext_program_reports_no_transport_and_keeps_its_digest() {
     let listing = listing();
@@ -593,8 +561,7 @@ fn a_program_that_can_listen_over_tls_discloses_the_stack_by_name() {
     assert!(text.contains("alpn http/1.1"), "{text}");
 }
 
-/// The `--json` object carries the whole fingerprint; the table carries enough of it to
-/// recognise and not enough to push the columns out.
+/// The table carries enough of the fingerprint to recognise and not enough to push the columns out.
 #[test]
 fn a_credential_is_listed_by_name_and_fingerprint() {
     let transport = Transport {
@@ -620,8 +587,7 @@ fn a_credential_is_listed_by_name_and_fingerprint() {
     );
 }
 
-/// The trusted computing base listing: a CI check that broke on every certificate renewal is a CI check people learn
-/// to ignore.
+/// A CI check that broke on every certificate renewal is one people learn to ignore.
 #[test]
 fn the_digest_survives_a_rotation_and_moves_when_a_credential_does() {
     let listing = tls_listing();
@@ -670,8 +636,7 @@ fn the_digest_survives_a_rotation_and_moves_when_a_credential_does() {
     );
 }
 
-/// A handshake failure is not the program's fault and not attributable to any definition, so it
-/// is never a diagnostic — but silence would be wrong, so it is counted with its reason.
+/// A handshake failure is attributable to no definition, so it is counted with its reason rather than raised.
 #[test]
 fn refused_handshakes_are_counted_and_named_rather_than_raised() {
     assert!(handshake_lines(&tls::HandshakeCounts::default()).is_empty());

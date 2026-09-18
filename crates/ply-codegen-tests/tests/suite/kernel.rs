@@ -1,12 +1,9 @@
-//! The compute kernel the compute-kernel record measured, compiled by the shipping code generator.
-
 use ply_codegen::Unit;
 use ply_eval::{Provider, Value};
 use ply_span::Symbol;
 use ply_syntax::ast::{ModuleName, Program};
 
-/// Loads `benches/kernel` the way `ply test benches/kernel` loads it: the project's own `.ply`
-/// files, and no standard-library module, because the kernel imports none.
+/// As `ply test benches/kernel` loads it: the project's own `.ply` files, and no standard library.
 fn kernel() -> (&'static Program, &'static Unit) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -48,8 +45,6 @@ fn kernel() -> (&'static Program, &'static Unit) {
     (ast, unit)
 }
 
-/// **The fixpoint refuses nothing in this kernel**, which is the property that makes it the right
-/// workload for a code generator and the wrong one for generalising from.
 #[test]
 fn the_whole_kernel_is_inside_the_fragment() {
     let (_, unit) = kernel();
@@ -58,19 +53,16 @@ fn the_whole_kernel_is_inside_the_fragment() {
         "the fragment refused part of the kernel: {:?}",
         unit.refusals()
     );
-    // Forty-four definitions and the kernel's eight tests, each a root (ADR 0036, Decision 7).
+    // Forty-four definitions and the kernel's eight tests, each a root.
     assert_eq!(
         unit.compiled().len(),
         52,
         "the kernel changed size; update this number deliberately rather than loosening it"
     );
-    // Every compiled definition is registered; the seam admits each call by its carried types,
-    // so a definition returning `Tree` is entered when `Tree` carries and declined at the answer
-    // when it does not.
+    // Every compiled definition is registered; the seam admits each call by its carried types.
     assert_eq!(unit.len(), 52, "enterable definitions");
 }
 
-/// The search itself answers natively, and the answer is the one the kernel's own oracle expects.
 #[test]
 fn the_search_answers_through_compiled_code() {
     let (program, unit) = kernel();
@@ -81,8 +73,7 @@ fn the_search_answers_through_compiled_code() {
         matches!(answer, Some(Value::Int(_))),
         "the compiled search declined or answered something the seam cannot carry: {answer:?}"
     );
-    // And a spot check with an answer that does not depend on the search's internals, so a wrong
-    // `Int` above is not read as a pass.
+    // An answer independent of the search's internals, so a wrong `Int` above is not read as a pass.
     assert_eq!(
         backend.enter(
             &Symbol::new("mcts.nim_sum"),
@@ -94,9 +85,7 @@ fn the_search_answers_through_compiled_code() {
     );
 }
 
-/// Three heaps in four bits apiece, side to move in the fifth field — the packing `mcts.pack`
-/// performs, spelled out here so the assertion above is checking the kernel's arithmetic rather
-/// than restating it.
+/// The packing `mcts.pack` performs, spelled out so the assertion checks the kernel's arithmetic.
 fn mcts_state(a: i64, b: i64, c: i64) -> i64 {
     a + b * 16 + c * 256
 }

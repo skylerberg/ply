@@ -1,7 +1,4 @@
-//! The language claims that are *raises*, sorted out of `crates/ply-eval-tests` (ADR 0045
-//! §"The suites"): a fixture under `tests/fixtures/lang/` states, in `// raises <test> :: <text>`
-//! lines, which of its tests fail with `E0502` carrying `<text>`, and this runs it on the machine
-//! and with the tier as the only engine.
+//! A fixture under `tests/fixtures/lang/` states in `// raises <test> :: <text>` lines which tests fail with `E0502` carrying `<text>`.
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -38,10 +35,7 @@ fn failures(dir: &Path, tier_only: bool) -> Vec<Value> {
     }
     let out = cmd.output().unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
-    // What the child said, kept for when it fails. Two attempts at ADR 0052 §2's seed path were
-    // diagnosed blind because this dropped it twice over: `ply test` answered an error shape, and
-    // the reason was on a stderr nobody read. A canary that reports only *that* something broke
-    // costs more than it saves.
+    // Kept for when it fails: the reason for an error shape is on stderr.
     let said = || {
         format!(
             "exit {:?}\nstdout: {text}\nstderr: {}",
@@ -125,7 +119,6 @@ fn footprints(source: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// A claim about the checker's footprint inference: `ply check --json` reports the row.
 #[test]
 fn the_footprints_the_checker_infers_are_the_ones_stated() {
     let source = std::fs::read_to_string(repo("tests/fixtures/lang/footprints.ply"))

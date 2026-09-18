@@ -1,10 +1,7 @@
-//! An adversarial audit of `std.http`, written as an attacker rather than as an author.
-
 use assert_cmd::prelude::*;
 use std::path::Path;
 use std::process::Command;
 
-/// What one `ply test` run over a generated project answered.
 struct Outcome {
     passed: bool,
     output: String,
@@ -26,12 +23,10 @@ impl Outcome {
     }
 }
 
-/// One `main.ply` in a temporary directory, run under `ply test`.
 fn ply_test(source: &str) -> Outcome {
     ply_test_with(source, &[])
 }
 
-/// The same, with extra flags, for a caller that has to control how the suite is scheduled.
 fn ply_test_with(source: &str, flags: &[&str]) -> Outcome {
     let dir = tempfile::tempdir().expect("a temp dir");
     write(dir.path(), source);
@@ -58,8 +53,7 @@ fn write(dir: &Path, source: &str) {
     std::fs::write(dir.join("main.ply"), source).unwrap();
 }
 
-/// The head parser, reduced to the number a table of cases reads as: the status an input earns,
-/// `-1` for "still arriving" and `0` for accepted.
+/// The status an input earns, `-1` for "still arriving" and `0` for accepted.
 const HEAD: &str = r#"
 import std.http (parse_head, default_limits, Limits, Parsed, Refused, Incomplete)
 
@@ -85,8 +79,7 @@ fn chunk_status(buf: Bytes) -> Int =
   }
 "#;
 
-/// A serve loop over a scripted peer: the first `recv` answers `first` and every later one answers
-/// `more`, and the bytes the server wrote come back.
+/// The first `recv` answers `first` and every later one `more`; the bytes the server wrote come back.
 const SERVE: &str = r#"
 import std.net (net)
 import std.http (default_limits, text_response, serve_connection, Request, Response,
@@ -116,10 +109,6 @@ fn drive(first: Bytes, more: Bytes) -> { out: Bytes, reads: Int } =
   } }
 "#;
 
-// --- Framing: what a second parser in front of this one would decide ---------
-
-/// The whole of request smuggling in one test: a message whose length can be read two ways must
-/// never be accepted, whichever way this parser would have picked.
 #[test]
 fn no_message_with_two_available_framings_is_accepted() {
     let out = ply_test(&format!(
@@ -137,7 +126,6 @@ test \"two framings\" {{
     out.green("a message with two available framings was accepted, which is a request smuggle");
 }
 
-/// Everything about a request line that a second implementation might read differently.
 #[test]
 fn a_request_line_is_refused_wherever_it_is_ambiguous() {
     let out = ply_test(&format!(
@@ -155,7 +143,6 @@ test \"request line\" {{
     out.green("a request line two parsers would split differently was accepted");
 }
 
-/// The chunk-size line, which is the other place a length is decided.
 #[test]
 fn every_malformed_chunk_size_line_is_refused() {
     let out = ply_test(&format!(
@@ -175,7 +162,6 @@ test \"chunk sizes\" {{
     out.green("a chunk-size line two parsers would size differently was accepted");
 }
 
-/// A chunked body whose terminator has not arrived is never completed short.
 #[test]
 fn a_chunked_body_missing_its_terminator_is_never_completed() {
     let out = ply_test(&format!(
@@ -190,7 +176,6 @@ test \"terminators\" {{
     out.green("a chunked body was completed before its terminator arrived");
 }
 
-/// The three size bounds, each bought with one packet.
 #[test]
 fn a_head_a_peer_sized_is_refused_at_the_bound() {
     let out = ply_test(&format!(
@@ -210,7 +195,6 @@ test \"bounds\" {{
     out.green("a head a peer sized past the bound was not refused at the bound");
 }
 
-/// **The measurement behind the header-block off-by-two**, pinned rather than argued about.
 #[test]
 fn the_header_block_bound_does_not_charge_the_terminator() {
     let out = ply_test(&format!(
@@ -248,10 +232,6 @@ test \"the terminator is not charged\" {{
     );
 }
 
-// --- Resource exhaustion ----------------------------------------------------
-
-/// A body that never ends and a head that never ends both stop, and both stop because of a bound
-/// rather than because the peer relented.
 #[test]
 fn a_peer_that_never_finishes_is_answered_rather_than_waited_on() {
     let out = ply_test(&format!(
@@ -326,9 +306,6 @@ test "the whole message is bounded, not each read" {
     );
 }
 
-// --- Response correctness ---------------------------------------------------
-
-/// Response splitting, refused rather than sanitized — what response encoding refuses.
 #[test]
 fn a_program_supplied_header_value_with_cr_or_lf_refuses_the_encode() {
     let out = ply_test(
@@ -350,8 +327,7 @@ test "a CR in a value splits nothing" {
     out.says("contains CR or LF, which would split the response");
 }
 
-/// The framing fields belong to `encode`, and a program that sets one has written a second answer
-/// to "how long is this message".
+/// The framing fields belong to `encode`; a program setting one writes a second answer to the message's length.
 #[test]
 fn a_program_may_not_set_a_framing_field_on_a_response() {
     let out = ply_test(
@@ -372,8 +348,6 @@ test "a second Content-Length" {
     out.says("may not be set by the program");
 }
 
-/// A handler that fails takes the whole run with it: no 500, no response, and no further
-/// connections.
 #[test]
 fn a_handler_that_fails_ends_the_run_rather_than_the_connection() {
     let out = ply_test(
@@ -409,8 +383,6 @@ test "a failing handler" {
     out.says("the handler had a bug");
 }
 
-// --- Defects ----------------------------------------------------------------
-
 #[test]
 fn a_chunk_size_that_does_not_fit_in_an_int_is_refused_rather_than_overflowing() {
     let out = ply_test(&format!(
@@ -431,7 +403,6 @@ test \"a chunk size at the top of the 16-digit range\" {{
     );
 }
 
-/// **Was a remote denial of service, one request.**
 #[test]
 fn a_target_that_is_not_origin_form_is_refused_rather_than_ending_the_run() {
     let out = ply_test(&format!(
@@ -529,7 +500,6 @@ test "a producer with more chunks than the stream bound" {
     );
 }
 
-/// **`max_stream_chunks` is a policy number, not the evaluator's call ceiling.**
 #[test]
 fn a_streamed_response_may_exceed_the_evaluators_call_budget() {
     let out = ply_test(

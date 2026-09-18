@@ -15,7 +15,6 @@ fn repo(rel: &str) -> PathBuf {
         .join(rel)
 }
 
-/// A port nothing is listening on.
 fn reserve_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral port");
     listener.local_addr().expect("a bound address").port()
@@ -97,8 +96,7 @@ impl Server {
         }
     }
 
-    /// The server was asked for a fixed number of connections and has been given them, so it must
-    /// return on its own.
+    /// Asked for a fixed number of connections and given them, the server must return on its own.
     fn finish(mut self) {
         let deadline = Instant::now() + STARTUP;
         loop {
@@ -154,8 +152,6 @@ fn exchange(mut stream: TcpStream, request: &[u8]) -> String {
     String::from_utf8(response).expect("the response is UTF-8")
 }
 
-// --- The round trip ---------------------------------------------------------
-
 #[test]
 fn a_request_over_a_real_socket_is_answered_by_a_ply_program() {
     let port = reserve_port();
@@ -188,9 +184,6 @@ fn a_request_over_a_real_socket_is_answered_by_a_ply_program() {
     server.finish();
 }
 
-/// A peer sending nonsense is the case a host boundary makes dangerous: the bytes come from
-/// outside, and the response to them must be a 400 rather than a panic that takes the listener with
-/// it.
 #[test]
 fn a_malformed_request_is_answered_400_and_the_server_survives_it() {
     let port = reserve_port();
@@ -249,10 +242,6 @@ fn a_request_split_across_writes_is_read_to_its_terminator() {
     server.finish();
 }
 
-// --- The same source, hermetically ------------------------------------------
-
-/// The point of the boundary: the program that just answered a socket is also the program `ply
-/// test` runs with nothing bound, and there it touches nothing at all.
 #[test]
 fn the_same_program_is_hermetic_under_ply_test() {
     let dir = project(reserve_port(), 1);
@@ -272,8 +261,6 @@ fn the_same_program_is_hermetic_under_ply_test() {
     );
 }
 
-/// Without `--host` the run is hermetic, and reaching the boundary there is `E0424` rather than a
-/// socket.
 #[test]
 fn without_the_flag_the_program_never_reaches_the_socket() {
     let port = reserve_port();
@@ -298,9 +285,6 @@ fn without_the_flag_the_program_never_reaches_the_socket() {
     );
 }
 
-// --- `ply test` and the binding ----------------------------------------------
-
-/// A test that reaches a socket, and the same project's whole cache lifecycle around it.
 fn reaching_test(port: u16) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("a temp dir");
     std::fs::write(
@@ -329,8 +313,6 @@ fn output(out: &Output) -> String {
     )
 }
 
-/// `ply test` binds the registry **without** binding it: nothing is reachable, and the refusal
-/// still names the handler that `--host` would have used.
 #[test]
 fn a_hermetic_test_that_reaches_the_boundary_names_the_handler_it_did_not_use() {
     let dir = reaching_test(reserve_port());
@@ -340,8 +322,7 @@ fn a_hermetic_test_that_reaches_the_boundary_names_the_handler_it_did_not_use() 
         .expect("`ply test` runs");
     let text = output(&out);
     assert_ne!(out.status.code(), Some(0), "got:\n{text}");
-    // The failure block prints the diagnostic's message rather than its code, and E0424's message
-    // is the one sentence E0303 cannot produce.
+    // The failure block prints the message, not the code, and E0424's message is one E0303 cannot produce.
     assert!(
         text.contains("reached the host boundary in a hermetic run"),
         "got:\n{text}"
@@ -350,7 +331,6 @@ fn a_hermetic_test_that_reaches_the_boundary_names_the_handler_it_did_not_use() 
     assert!(!text.contains("no handler for"), "got:\n{text}");
 }
 
-/// `--host` is not reporting: the test opens a real listener and goes green.
 #[test]
 fn a_host_backed_pass_is_never_cached_and_never_satisfies_a_hermetic_run() {
     let dir = reaching_test(reserve_port());
@@ -389,7 +369,6 @@ fn a_host_backed_pass_is_never_cached_and_never_satisfies_a_hermetic_run() {
     );
 }
 
-/// The production scheduler, reached the only way a program can reach it.
 #[test]
 fn task_spawn_under_the_flag_runs_on_the_production_scheduler() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -411,8 +390,7 @@ fn task_spawn_under_the_flag_runs_on_the_production_scheduler() {
     assert_eq!(out.status.code(), Some(0), "got:\n{text}");
     assert!(text.contains('3'), "got:\n{text}");
 
-    // Lock 3: hermetically the same program reaches the boundary and is told both remedies, rather
-    // than getting real threads by accident.
+    // Hermetically, the program reaches the boundary and is told both remedies rather than getting real threads.
     let out = ply(dir.path()).arg("run").output().expect("`ply run` runs");
     let text = output(&out);
     assert_ne!(out.status.code(), Some(0), "got:\n{text}");

@@ -6,8 +6,6 @@ fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// Both variants have to be programs, and a rewrite that silently matched nothing would leave a
-/// load run measuring the sequential loop twice.
 #[test]
 fn both_variants_are_produced_from_the_example_and_typecheck() {
     let service = Service::open(&repo()).expect("the example is where it was");
@@ -27,9 +25,6 @@ fn both_variants_are_produced_from_the_example_and_typecheck() {
     }
 }
 
-/// The served project has to be a program too, and it has to reach the twin rather than
-/// postgres: a `main` still calling `run` would have a load run refuse to start for want of a
-/// `--db` two minutes into its probe loop.
 #[test]
 fn the_served_project_typechecks_and_drives_the_twin() {
     let service = Service::open(&repo()).unwrap();
@@ -50,8 +45,6 @@ fn the_served_project_typechecks_and_drives_the_twin() {
     }
 }
 
-/// The expansion has to be a program too, and it has to have replaced every row rather than the
-/// first one.
 #[test]
 fn the_explicit_spelling_typechecks_and_names_no_set() {
     let service = Service::open(&repo()).unwrap();
@@ -61,8 +54,6 @@ fn the_explicit_spelling_typechecks_and_names_no_set() {
     Loaded::parse(&explicit).expect("the expanded service typechecks");
 }
 
-/// The headline claim of section 6, as a test rather than only as a number in a table nobody
-/// re-runs.
 #[test]
 fn an_alias_and_its_expansion_are_one_program() {
     let report = aliases(&repo()).unwrap();
@@ -74,15 +65,11 @@ fn an_alias_and_its_expansion_are_one_program() {
     assert!(report.source_bytes_explicit > report.source_bytes_aliased);
 }
 
-/// A response the client mis-frames is a client bug reported as a server number, so both
-/// framings the service produces are read here.
 #[test]
 fn the_client_reads_both_framings_the_service_produces() {
     let service = Service::open(&repo()).unwrap();
     let loaded = Loaded::parse(&service.source(Variant::Sequential).unwrap()).unwrap();
-    // One connection carrying a buffered route and the streamed one, which is also the
-    // pipelining case: the client must find the second response beginning exactly where the
-    // first ended.
+    // Buffered then streamed on one connection: the second response must begin exactly where the first ended.
     let script = vec![vec![get("/items"), get("/orders/1/receipt")]];
     let (_, connections) = loaded.over_sim(script).unwrap();
     assert_eq!(connections, 1);
@@ -97,8 +84,6 @@ fn percentiles_are_nearest_rank() {
     assert_eq!(Sample::percentile(&[], 0.5), Duration::ZERO);
 }
 
-/// A padded head has to grow bytes without growing fields, or the first sweep is measuring the
-/// second one's axis.
 #[test]
 fn padding_a_value_adds_bytes_and_no_fields() {
     let small = request("GET", "/items", None, false, 0, 0);

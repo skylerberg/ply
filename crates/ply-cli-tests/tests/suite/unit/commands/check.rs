@@ -13,8 +13,7 @@ fn fixture(text: &str) -> (tempfile::TempDir, Loaded) {
     (dir, loaded)
 }
 
-/// The report also carries the prelude's own effects, so an effect is found by the name the
-/// module gave it rather than by its position.
+/// The report also carries the prelude's effects, so an effect is found by name, not position.
 fn effect_named<'a>(report: &'a Value, name: &str) -> &'a Value {
     report["effects"]
         .as_array()
@@ -121,8 +120,6 @@ fn two_modules_may_reuse_a_name_without_colliding() {
     assert_eq!(names, ["a.total", "b.total"]);
 }
 
-/// The promise, its exemption and its refusal — the checked obligation ADR 0034's decision 4
-/// puts on the callee.
 #[test]
 fn a_reuse_fn_is_refused_only_for_a_copy_its_own_body_causes() {
     // Kept: the append is the last use of a parameter, whatever the caller does with it.

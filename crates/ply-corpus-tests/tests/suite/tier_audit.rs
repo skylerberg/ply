@@ -1,5 +1,3 @@
-//! The differential tier audit, over generated corpora.
-
 use ply_cli::engine::Prover;
 use ply_cli::load::load;
 use ply_cli::obligations;
@@ -32,8 +30,6 @@ fn every_proof_a_generated_corpus_produces_survives_a_wide_sample() {
         let loaded = load(&root).expect("a generated corpus compiles");
         let hashes = loaded.hashes.clone();
         let collected = obligations::collect(&loaded.program, &loaded.check, &hashes);
-        // The prover samples generated functions on the compiled tier (ADR 0048) — the only
-        // evaluator — so it is given one, as `ply prove` gives its own prover one.
         let backend = ply_cli::commands::common::prover_backend(None, &loaded)
             .expect("the corpus compiles to a tier");
         let prover =

@@ -53,8 +53,7 @@ fn a_seed_replays_exactly_one_interleaving() {
     assert_eq!(built.seeds(), vec![Seed::at(7, vec![3, 0, 2])]);
 }
 
-/// The step bound is not a widening: a replay still needs one, and it is the only search flag
-/// `--seed` leaves alone.
+/// A replay still needs the step bound; it is the only search flag `--seed` leaves alone.
 #[test]
 fn a_replay_keeps_its_step_bound() {
     let built = plan(&SimOptions {
@@ -66,8 +65,6 @@ fn a_replay_keeps_its_step_bound() {
     assert_eq!(built.mode, SimMode::Once);
 }
 
-/// A flag that cannot mean anything is refused rather than ignored: a silently dropped
-/// `--sim-budget` reads as a search that was widened.
 #[test]
 fn a_budget_under_random_is_refused() {
     assert!(
@@ -123,8 +120,7 @@ fn every_flag_that_widens_the_search_changes_the_key() {
     }
 }
 
-/// `--measure-reduction` reports a number; it does not change what was searched, so it must not
-/// split the cache.
+/// `--measure-reduction` reports a number without changing what was searched, so it must not split the cache.
 #[test]
 fn measuring_the_reduction_does_not_change_the_plan() {
     assert_eq!(

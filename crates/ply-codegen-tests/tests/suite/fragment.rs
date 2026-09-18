@@ -1,6 +1,3 @@
-//! What the code generator compiles, what it refuses, and that what it answers is what the
-//! interpreter answers.
-
 use ply_codegen::Unit;
 use ply_eval::{Provider, Value};
 use ply_span::Symbol;
@@ -55,7 +52,6 @@ fn load(source: &str) -> Loaded {
     }
 }
 
-/// The program under the Ply emitter, which re-parses the module texts to produce.
 pub fn unit(source: &str) -> (&'static Loaded, &'static Unit) {
     let loaded: &'static Loaded = Box::leak(Box::new(load(source)));
     let unit = Unit::over_front(
@@ -69,8 +65,6 @@ pub fn unit(source: &str) -> (&'static Loaded, &'static Unit) {
     (loaded, unit)
 }
 
-/// Arithmetic, comparison, `if`, `let`, a `match` on literals, recursion, and a call between two
-/// members — the fragment the spike's fragment pins, in one module.
 const ARITHMETIC: &str = r#"
 fn double(x: Int) -> Int = x * 2
 
@@ -101,8 +95,6 @@ fn capped(n: Int) -> Int = if odd(n) && n > limit() { limit() } else { n }
 fn shaped(x: Int) -> List<Int> = [x, x]
 "#;
 
-/// `++` and the pattern shapes the fixpoint gained: a record pattern, one with `..`, one nested
-/// inside a constructor, and a constructor nested inside a list.
 const SHAPES: &str = r#"
 type Step = { value: Int, next: Int }
 
@@ -209,10 +201,6 @@ pub fn call(unit: &'static Unit, name: &str, args: &[Value]) -> Option<Value> {
     backend.enter(&Symbol::new(name), args, 10_000)
 }
 
-/// Closures and the callbacks that take them: a lambda capturing a parameter, nested lambdas, a
-/// named function and a constructor and a builtin used as values, a call through a parameter and
-/// through a `let`, `iterate` stopping and running out, `map_fold` over a map built in place, and
-/// the bitwise operators.
 const CLOSURES: &str = r#"
 fn sum_to(n: Int) -> Int = fold(range(0, n), 0, |acc, x| acc + x)
 
@@ -271,7 +259,6 @@ fn kept(n: Int) -> Int = len(filter(map(range(0, n), inc), |x: Int| x % 2 == 1))
 fn longer(n: Int) -> Int = fold(map(range(0, n), inc), 0, |acc: Int, x: Int| acc + x * 2)
 "#;
 
-/// The control every other test here is read against: the fragment is not empty.
 #[test]
 fn the_fragment_is_not_empty() {
     let (_, unit) = unit(ARITHMETIC);
@@ -280,8 +267,6 @@ fn the_fragment_is_not_empty() {
     assert!(members.contains(&"m.double"), "{members:?}");
 }
 
-/// The whole point: a call the seam admits is answered by native code, and the answer is the
-/// interpreter's.
 #[test]
 fn a_compiled_body_answers_what_the_interpreter_answers() {
     let (_, unit) = unit(ARITHMETIC);
@@ -312,11 +297,6 @@ fn a_compiled_body_answers_what_the_interpreter_answers() {
     }
 }
 
-/// A body outside the fragment is a registry miss, not a wrong answer.
-/// Compiled code answers what the interpreter answers over `++` and the nested patterns.
-///
-/// These paths are compiled by every census over the parser but entered by no workload measured
-/// so far, so without this the fixpoint's own count is the only thing vouching for them.
 #[test]
 #[allow(clippy::arc_with_non_send_sync)]
 fn a_compiled_body_answers_over_concat_and_nested_patterns() {
@@ -330,17 +310,13 @@ fn a_compiled_body_answers_over_concat_and_nested_patterns() {
         ("m.let_rest", vec![Value::Int(7)], Value::Int(7)),
         ("m.let_tuple", vec![Value::Int(4)], Value::Int(20)),
         ("m.let_nested", vec![Value::Int(4)], Value::Int(8)),
-        // A written field's own block projects a record it binds; that record is not the
-        // literal's update base.
+        // A written field's own block projects a record it binds; that record is not the literal's update base.
         ("m.projected", vec![Value::Int(4)], Value::Int(9)),
-        // A branch answering a local must not alias it at one count: the update through the
-        // alias would otherwise write into the original.
+        // A branch answering a local must not alias it at one count, or the update writes the original.
         ("m.aliased", vec![Value::Int(4)], Value::Int(103)),
         ("m.listed", vec![Value::Int(5)], Value::Int(7)),
         ("m.joined", vec![Value::Int(11)], Value::Int(11)),
-        // A record rebuilt from a dying one of its width takes the dying one's memory
-        // (ADR 0036, Decision 8); one still held elsewhere is left where it is, and a literal
-        // written from a base of another shape, or from one read later, is built as written.
+        // Rebuilt from a dying record of its width reuses its memory; a held, differently shaped or later-read base is built as written.
         ("m.spun", vec![Value::Int(1)], Value::Int(4_140)),
         ("m.shared", vec![Value::Int(3)], Value::Int(3_023)),
         ("m.swapped", vec![Value::Int(2)], Value::Int(772)),
@@ -371,8 +347,7 @@ fn a_compiled_body_answers_over_concat_and_nested_patterns() {
             Value::Int(9),
         ),
         ("m.boxed_field", vec![Value::Int(4)], Value::Int(8)),
-        // A `match` over `map_get` whose arms only ask whether the key was found builds no
-        // constructor: the value found, or nothing, is tested directly.
+        // A `match` over `map_get` whose arms only ask whether the key was found builds no constructor.
         ("m.looked_up", vec![Value::Int(6)], Value::Int(40)),
         ("m.looked_up", vec![Value::Int(1)], Value::Int(-1)),
         ("m.looked_up_any", vec![Value::Int(2)], Value::Int(7)),
@@ -382,8 +357,7 @@ fn a_compiled_body_answers_over_concat_and_nested_patterns() {
         ("m.looked_up_nested", vec![Value::Int(2)], Value::Int(-1)),
         ("m.looked_up_twice", vec![Value::Int(6)], Value::Int(7)),
         ("m.looked_up_by_list", vec![Value::Int(4)], Value::Int(4)),
-        // The same shape over `list_at`; a three-way compare answering singletons; and the empty
-        // list and the empty map made once, grown apart.
+        // The same over `list_at`; a three-way compare answering singletons; empty list and map made once, grown apart.
         ("m.indexed", vec![Value::Int(5)], Value::Int(30)),
         ("m.indexed", vec![Value::Int(2)], Value::Int(-1)),
         ("m.indexed_past", vec![Value::Int(3)], Value::Int(-1)),
@@ -404,8 +378,7 @@ fn a_compiled_body_answers_over_concat_and_nested_patterns() {
         ),
         ("m.grown_apart", vec![Value::Int(4)], Value::Int(121)),
         ("m.maps_apart", vec![Value::Int(7)], Value::Int(110)),
-        // The rotate of the low word and the wrapping arithmetic, each one instruction in a
-        // compiled body, answering what the interpreter answers at the edges.
+        // Rotate and wrapping arithmetic at the edges.
         (
             "m.turned",
             vec![Value::Int(1), Value::Int(1)],
@@ -441,9 +414,7 @@ fn a_compiled_body_answers_over_concat_and_nested_patterns() {
             vec![Value::Int(1)],
             Value::Int(0x1000_0000 + (1 << 28)),
         ),
-        // A callee that only reads a record borrows it: the caller's hold outlives the call,
-        // beside a later read, beside a call that takes it, and inside a step called per
-        // iteration.
+        // A read-only callee borrows: beside a later read, a call that takes it, and a per-iteration step.
         ("m.lent_then_read", vec![Value::Int(4)], Value::Int(41 + 4)),
         (
             "m.lent_beside_a_move",
@@ -471,8 +442,6 @@ fn a_compiled_body_answers_over_concat_and_nested_patterns() {
     }
 }
 
-/// Compiled code answers what the interpreter answers over closures, the callback builtins and
-/// the bitwise operators.
 #[test]
 fn a_compiled_body_answers_over_closures_and_callbacks() {
     let (_, unit) = unit(CLOSURES);
@@ -509,12 +478,10 @@ fn a_compiled_body_answers_over_closures_and_callbacks() {
             vec![Value::Int(10), Value::Int(5)],
             Value::Int(15),
         ),
-        // Fused loops: a `fold` over a range with a compiled step, over an `Int` and over a
-        // record, and an `iterate` with a lambda that captures.
+        // Fused loops: `fold` over a range with a compiled step, over an `Int` and a record, and a capturing `iterate`.
         ("m.stepped", vec![Value::Int(10)], Value::Int(45)),
         ("m.totals", vec![Value::Int(4)], Value::Int(10)),
-        // Fused loops over a list built by a fused `map`: a typed step, a filter, a lambda step
-        // over a list of a hundred so the walk crosses a leaf.
+        // Fused loops over a fused `map`'s list; a hundred elements so the walk crosses a leaf.
         ("m.listed_sum", vec![Value::Int(10)], Value::Int(55)),
         ("m.kept", vec![Value::Int(5)], Value::Int(3)),
         ("m.longer", vec![Value::Int(100)], Value::Int(10100)),
@@ -534,9 +501,6 @@ fn a_compiled_body_answers_over_closures_and_callbacks() {
     }
 }
 
-/// A closure never crosses the seam: a definition answering a function is registered like any
-/// other, runs, and has its answer refused by the backend itself, while the compiled body that
-/// calls through the same closure answers.
 #[test]
 fn a_native_closure_stays_inside_the_entry_that_made_it() {
     let (_, unit) = unit(CLOSURES);
@@ -548,9 +512,6 @@ fn a_native_closure_stays_inside_the_entry_that_made_it() {
     );
 }
 
-/// `list_set` through the tier: the element replaced, the rest kept, the list it was given
-/// unchanged when it is still read, in the tail and below it in the trie; and an index the list
-/// does not hold declines as the interpreter's raise does.
 #[test]
 fn list_set_answers_the_replaced_list_and_declines_outside_it() {
     let (_, unit) = unit(SHAPES);
@@ -581,8 +542,6 @@ fn list_set_answers_the_replaced_list_and_declines_outside_it() {
     );
 }
 
-/// What raises in the interpreter declines here: an `iterate` past its budget, and a shift by a
-/// count outside `0..64`.
 #[test]
 fn a_callback_that_raises_declines_rather_than_answering() {
     let (_, unit) = unit(CLOSURES);
@@ -600,15 +559,12 @@ fn a_callback_that_raises_declines_rather_than_answering() {
 fn a_definition_the_fragment_has_no_body_for_is_declined() {
     let (_, unit) = unit(ARITHMETIC);
     assert_eq!(call(unit, "m.no_such_function", &[Value::Int(1)]), None);
-    // A carried list answer crosses now that every compiled function is registered.
     assert_eq!(
         call(unit, "m.shaped", &[Value::Int(1)]),
         Some(Value::list(vec![Value::Int(1), Value::Int(1)]))
     );
 }
 
-/// A call with the wrong number of arguments declines rather than reading past the argument array
-/// it was handed.
 #[test]
 fn a_call_of_the_wrong_arity_is_declined() {
     let (_, unit) = unit(ARITHMETIC);
@@ -641,16 +597,13 @@ fn a_recursion_past_the_budget_declines_rather_than_running_it() {
     );
 }
 
-/// Arithmetic that raises in the interpreter declines here rather than answering a wrapped value.
 #[test]
 fn an_overflow_declines_rather_than_wrapping() {
     let (_, unit) = unit(ARITHMETIC);
     assert_eq!(call(unit, "m.double", &[Value::Int(i64::MAX)]), None);
 }
 
-/// Pointer identity, as `code::Lowering::describes` is and for the same reason: a bisection builds
-/// programs whose definitions carry the names of the ones they replace, and a registry keyed on a
-/// bare name would answer for the wrong body.
+/// A bisection builds programs whose definitions reuse the names they replace, so a registry keyed on a name answers for the wrong body.
 #[test]
 fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
     let (loaded, unit) = unit(ARITHMETIC);
@@ -660,9 +613,6 @@ fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
     assert!(!backend.describes(other.program));
 }
 
-/// The set is closed under calls, which is the property that makes the promise
-/// `ply_codegen::backend` gives the machine true by construction: from inside a member there is no
-/// reachable call that leaves compiled code.
 #[test]
 fn the_compiled_set_is_closed_under_calls() {
     let (loaded, unit) = unit(ARITHMETIC);
@@ -676,8 +626,6 @@ fn the_compiled_set_is_closed_under_calls() {
     );
 }
 
-/// The census this crate exists to move, printed so that a run of the suite says what the fragment
-/// reached rather than only that it did not crash.
 #[test]
 fn the_census_over_the_standard_library() {
     let (loaded, unit) = unit(ARITHMETIC);
@@ -714,11 +662,6 @@ fn the_census_over_the_standard_library() {
     assert!(functions > 100, "only {functions} functions were offered");
 }
 
-/// `with_cell`, carried since ADR 0041.
-///
-/// A cell is the one effect construct that is not control: it binds a first-class value and its
-/// operations are builtins. What the tiers had to gain is the node that opens one, the region it
-/// brands, and the close on the way out.
 const CELLS: &str = "\
 pub fn tally(n: Int) -> Int = with_cell[t](0) { c -> {
   cell_set(c, n * 2);
@@ -755,10 +698,6 @@ fn a_cell_a_compiled_body_opens_answers_what_the_interpreter_answers() {
     }
 }
 
-/// The bodies above are compiled rather than answered by a registry miss.
-///
-/// Without this the test beside it would pass over an empty fragment, which is the failure mode
-/// every claim about a code generator has.
 #[test]
 fn a_body_that_opens_a_cell_is_in_the_fragment() {
     let (_, unit) = unit(CELLS);

@@ -16,8 +16,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// A test's footprint is what its handlers did *not* discharge, so the way to give one a
-/// residual atom is to grant it less than the code it calls may use.
+/// A footprint is what the handlers did not discharge, so a residual atom comes from granting less than the code may use.
 const SOURCE: &str = "\
 effect db {
   read  all[t]() -> List<Int>
@@ -85,8 +84,7 @@ fn plan_for(filter: Option<&str>) -> (tempfile::TempDir, Loaded, HashOutput, Pla
     (dir, loaded, hashes, plan)
 }
 
-/// The artifact as `execute` builds it: the binding is opened the same way, so a test can never
-/// assert about a shape the real command does not produce.
+/// Opens the binding as `execute` does, so a test cannot assert about a shape the real command does not produce.
 fn json_report(
     loaded: &Loaded,
     hashes: &HashOutput,
@@ -198,8 +196,7 @@ fn a_write_is_scheduled_apart_from_the_reads_of_the_same_resource() {
         group_of("reads orders only"),
         group_of("writes users when asked")
     );
-    // A test that touches nothing conflicts with nothing, so it shares whichever group it lands
-    // in rather than forcing a third.
+    // A test that touches nothing conflicts with nothing, so it shares a group rather than forcing a third.
     assert_eq!(plan.selection.groups.len(), 2);
 }
 
@@ -377,8 +374,7 @@ fn no_cache_never_touches_the_real_store() {
 #[test]
 fn an_unopenable_cache_still_runs_but_says_it_gave_up_on_caching() {
     let dir = tempfile::tempdir().unwrap();
-    // A file where the cache directory needs to go: `create_dir_all` cannot succeed, so
-    // `Store::open` has to fail.
+    // A file where the cache directory must go, so `Store::open` has to fail.
     std::fs::write(dir.path().join(ply_store::CACHE_DIR_NAME), "in the way").unwrap();
 
     let cache = Cache::open(dir.path(), false).unwrap();
@@ -528,8 +524,7 @@ fn the_failure_artifact_carries_the_v4_shape_an_agent_branches_on() {
             .ends_with("ledger.ply")
     );
 
-    // Present even where the evidence behind them is missing: a field that vanishes and a field
-    // that says "not known" are different answers, and a consumer branches on the difference.
+    // Present even without evidence: a vanished field and a "not known" field are different answers.
     assert!(f["culprit"]["verdict"].is_string());
     assert!(f["culprit"]["confidence"].is_string());
     assert!(f["culprit"]["definitions"].is_array());
@@ -540,7 +535,6 @@ fn the_failure_artifact_carries_the_v4_shape_an_agent_branches_on() {
         f["assertion"].is_null(),
         "the evaluator carries no payload yet"
     );
-    // v3.
     assert!(f["seed"].is_null());
     assert!(f["replay"].is_null());
     assert!(f["race"].is_null());
@@ -552,8 +546,6 @@ fn the_failure_artifact_carries_the_v4_shape_an_agent_branches_on() {
     );
 }
 
-/// Two runs over one failure have to produce the same bytes, or yesterday's artifact cannot be
-/// diffed against today's.
 #[test]
 fn the_artifact_is_byte_identical_across_two_runs_over_one_failure() {
     let (dir, loaded, hashes) = project(&[(
@@ -639,7 +631,6 @@ fn bisect_never_reports_that_nothing_was_attempted_and_evaluates_nothing() {
     assert_eq!(v["options"]["bisect"], "never");
 }
 
-/// The one ordering claim the human form makes.
 #[test]
 fn the_culprit_line_comes_above_the_assertion_and_is_absent_when_there_is_none() {
     let (_dir, loaded, _h, mut report) = failing(ONE_FAILURE);
@@ -875,8 +866,6 @@ fn marks_are_ascii_when_unstyled_and_glyphs_when_styled() {
     assert!(styled.contains('\x1b'));
 }
 
-/// A naive search that spent its budget bounds the ratio as well as the count, and the ratio is
-/// the number the milestone is claimed on.
 #[test]
 fn a_reduction_over_a_bounded_naive_count_is_reported_as_a_bound() {
     let line = |naive: ply_eval::Naive| {
@@ -990,10 +979,7 @@ fn a_stored_failure_is_re_run_rather_than_believed() {
     assert!(selected.to_run.contains(&0));
 }
 
-// --- The binding's effect on what a run reports -------------------------
-
-/// A binding over the fixture's `db.all[users]`, which is the residual atom of the two reading
-/// tests and of neither of the others.
+/// Binds the fixture's `db.all[users]`, the residual atom of the two reading tests and of neither of the others.
 fn bound(loaded: &Loaded) -> Hosts {
     use crate::unit::hosts::fixture::{deterministic, named, op, registry};
     Hosts::bind(
@@ -1026,9 +1012,7 @@ fn recorded_result(recorded: Option<Record>) -> TestResult {
     }
 }
 
-/// The check can fire, which is the whole of its value: the command names the engine before it
-/// builds a provider and the run names it from the provider it built, so the two are separate
-/// readings of one fact and nothing else compares them.
+/// The command names the engine before building a provider and the run names it from the provider; nothing else compares them.
 #[test]
 fn recording_under_an_engine_the_run_did_not_select_against_is_an_escape() {
     let mut report = report_over(vec![recorded_result(Some(Record::Under(vec![])))]);
@@ -1047,8 +1031,7 @@ fn recording_under_an_engine_the_run_did_not_select_against_is_an_escape() {
     );
 }
 
-/// And the one case where they legitimately differ: a run that selected nothing builds no
-/// backend, so the runner names the evaluator over a run that recorded no pass at all.
+/// A run that selected nothing builds no backend, so the runner names the evaluator.
 #[test]
 fn a_run_that_recorded_nothing_cannot_have_escaped() {
     let mut report = report_over(vec![recorded_result(None)]);
@@ -1083,8 +1066,6 @@ fn index_of(loaded: &Loaded, name: &str) -> usize {
         .unwrap()
 }
 
-/// The claim `--explain` publishes: a test that can reach a socket is not isolated, and saying
-/// `region` about it would over-claim exactly the number M6 introduced.
 #[test]
 fn a_host_backed_test_is_reported_as_host_rather_than_world() {
     let (_dir, loaded, _h, plan) = plan_for(None);
@@ -1107,8 +1088,6 @@ fn a_host_backed_test_is_reported_as_host_rather_than_world() {
     assert_eq!(view.counts.shared, 1);
 }
 
-/// The same corpus with nothing bound: every label and every count is what it was before W1,
-/// which is what makes the hermetic default free.
 #[test]
 fn a_hermetic_run_reports_exactly_what_it_did_before() {
     let (_dir, loaded, _h, plan) = plan_for(None);
@@ -1143,9 +1122,6 @@ fn a_hermetic_run_reports_exactly_what_it_did_before() {
     assert!(view.escapes.is_empty());
 }
 
-/// The failure mode this milestone is built around is a green result over unexplored space, and
-/// a cached pass earned over a real socket is exactly that: every later hermetic run believes
-/// it, and nothing about those runs looks wrong.
 #[test]
 fn a_cached_pass_over_the_host_fails_the_run_that_wrote_it() {
     let (_dir, loaded, hashes, plan) = plan_for(None);
@@ -1179,8 +1155,7 @@ fn a_cached_pass_over_the_host_fails_the_run_that_wrote_it() {
             .any(|n| n.contains("ply cache clear"))
     );
 
-    // A test the binding cannot reach is cached exactly as it always was: `--host` is not a
-    // `--no-cache`, and a build that made it one would teach people not to run it.
+    // `--host` is not `--no-cache`: a test the binding cannot reach is cached as always.
     let ordinary = recorded(index_of(&loaded, "pure arithmetic"));
     let view = HostView::of(&hosts, &plan, &loaded.check, &ordinary);
     assert!(view.escapes.is_empty());
@@ -1201,9 +1176,6 @@ fn a_cached_pass_over_the_host_fails_the_run_that_wrote_it() {
     assert!(view.escapes.is_empty());
 }
 
-/// The same corpus behind the postgres driver's own registration path, with a database
-/// configured — which is the run W4 introduces and the one whose cached pass would be believed
-/// by every later hermetic run.
 #[test]
 fn a_database_backed_test_is_host_backed_never_cached_and_says_which_database() {
     use crate::unit::hosts::fixture::{deterministic, named, op, registry};
@@ -1272,8 +1244,6 @@ fn a_database_backed_test_is_host_backed_never_cached_and_says_which_database() 
     assert_eq!(view.escapes[0].code, codes::INTERNAL_ERROR);
 }
 
-/// Two structurally identical tests in different modules have the same hash, so proving one
-/// proves the other — the corollary the module rules call out as looking like a bug.
 #[test]
 fn identical_tests_in_two_modules_share_one_cache_entry() {
     let (dir, loaded, hashes) = project(&[

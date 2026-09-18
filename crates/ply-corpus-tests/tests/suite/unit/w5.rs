@@ -1,8 +1,6 @@
 use ply_corpus::w5::{Program, Rung, sink_for};
 use ply_eval::Value;
 
-/// The program every row of [`events`] runs has to be a program, and the rows it publishes have
-/// to be the ones the substitution rests on.
 #[test]
 fn the_bench_program_checks_and_publishes_one_channel() {
     let program = Program::parse().expect("the bench program checks");
@@ -27,8 +25,6 @@ fn the_bench_program_checks_and_publishes_one_channel() {
     );
 }
 
-/// The twin discharges every `trace` atom, which is what makes the `twin` rung a rung rather
-/// than a stub: it runs on a machine with no host at all.
 #[test]
 fn a_twin_entry_point_reaches_nothing() {
     let program = Program::parse().unwrap();
@@ -41,8 +37,6 @@ fn a_twin_entry_point_reaches_nothing() {
     }
 }
 
-/// Every rung answers the same count, which is the whole of what makes a difference between two
-/// rows the operation rather than the work.
 #[test]
 fn every_rung_runs_the_same_loop() {
     let program = Program::parse().unwrap();

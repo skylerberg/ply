@@ -1,14 +1,9 @@
-//! The same audit as `ply-eval`'s `determinism_audit`, one level up: through the real binary,
-//! across separate processes.
-
 use assert_cmd::Command;
 use serde_json::{Map, Value};
 use std::path::Path;
 use tempfile::TempDir;
 
-/// A racy test, a test that is order-insensitive, and one that never simulates — so the artifact
-/// has failures, exhaustive searches and ordinary cached tests in it at once, and a difference in
-/// any of them shows.
+/// Failures, exhaustive searches and ordinary cached tests at once, so a difference in any of them shows.
 const CORPUS: &str = r#"
 effect counter {
   read  get[r]() -> Int
@@ -84,17 +79,13 @@ fn scrub(value: &Value) -> Value {
             fields
                 .iter()
                 .filter(|(k, _)| {
-                    // `*_nanos` are the compiled tier's analysis and codegen wall-clocks (ADR
-                    // 0048); like every duration they vary run to run, and a determinism claim is
-                    // about the program's result, not what compiling it cost.
+                    // `*_nanos` are the tier's compile wall-clocks, which vary run to run like every duration.
                     !(k.contains("duration")
                         || k.ends_with("_ms")
                         || k.ends_with("_nanos")
                         || k == &"front_end"
                         || k == &"workers"
-                        // The tier builds a unit per worker (a backend does not cross threads), so
-                        // `units` counts compiles and scales with `--jobs`; it is a compile
-                        // artifact, not a scheduling decision the result turns on.
+                        // The tier builds a unit per worker, so `units` scales with `--jobs`: a compile artifact, not a scheduling decision.
                         || k == &"units"
                         || k == &"elapsed")
                 })
@@ -118,8 +109,6 @@ fn artifact(dir: &Path, args: &[&str]) -> Value {
     scrub(&json)
 }
 
-/// The result for one test, by key, so that a whole-suite artifact and a filtered one can be
-/// compared over the test they have in common.
 fn result_for<'a>(artifact: &'a Value, key: &str) -> &'a Value {
     artifact["results"]
         .as_array()
@@ -129,8 +118,6 @@ fn result_for<'a>(artifact: &'a Value, key: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("no result for `{key}` in {artifact}"))
 }
 
-/// The claim in its plainest form: run the same command in eight separate processes and get the
-/// same artifact.
 #[test]
 fn one_seed_is_one_artifact_across_separate_processes() {
     let dir = project(CORPUS);
@@ -144,7 +131,6 @@ fn one_seed_is_one_artifact_across_separate_processes() {
     }
 }
 
-/// The same, for the search rather than for one interleaving.
 #[test]
 fn a_whole_search_is_one_artifact_across_separate_processes() {
     let dir = project(CORPUS);
@@ -156,8 +142,7 @@ fn a_whole_search_is_one_artifact_across_separate_processes() {
             "process {run} searched differently"
         );
     }
-    // ...and the artifact is worth comparing: it has to carry a failure with a seed in it, or this
-    // test would pass on an empty run.
+    // The artifact must carry a failure with a seed, or this test would pass on an empty run.
     let failures = first["failures"].as_array().expect("failures is an array");
     assert!(
         failures.iter().any(|f| f["seed"].is_string()),
@@ -165,8 +150,6 @@ fn a_whole_search_is_one_artifact_across_separate_processes() {
     );
 }
 
-/// A scheduling decision that read anything varying with thread count would show here and nowhere
-/// else.
 #[test]
 fn the_worker_count_does_not_reach_a_scheduling_decision() {
     let dir = project(CORPUS);
@@ -180,7 +163,6 @@ fn the_worker_count_does_not_reach_a_scheduling_decision() {
     }
 }
 
-/// A test run alone must report exactly what it reports run beside others.
 #[test]
 fn running_a_test_alone_reports_what_it_reports_in_company() {
     let dir = project(CORPUS);
@@ -199,7 +181,6 @@ fn running_a_test_alone_reports_what_it_reports_in_company() {
     }
 }
 
-/// The front-end cache changes what is parsed, hashed and restored rather than re-derived.
 #[test]
 fn a_warm_front_end_cache_does_not_change_an_interleaving() {
     let dir = project(CORPUS);
@@ -213,8 +194,6 @@ fn a_warm_front_end_cache_does_not_change_an_interleaving() {
     );
 }
 
-/// The repro path, end to end: the seed a failure prints, handed back to the binary, reproduces
-/// that failure and no other.
 #[test]
 fn the_seed_a_failure_prints_replays_that_failure() {
     let dir = project(CORPUS);

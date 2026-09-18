@@ -1,10 +1,7 @@
-//! What one request allocates, exactly, layer by layer.
-
 use crate::counting::charge;
 use ply_eval::Value;
 use std::path::{Path, PathBuf};
 
-/// The repository root this test reads `examples/desk.ply` from.
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -13,7 +10,6 @@ fn repo() -> PathBuf {
         .to_path_buf()
 }
 
-/// Allocations per request, on the same rungs the ladder times.
 #[test]
 fn a_request_allocates_where_the_ladder_says_its_time_goes() {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service must compile");
@@ -82,9 +78,7 @@ fn a_request_allocates_where_the_ladder_says_its_time_goes() {
     }
 }
 
-/// The twin's store is not on a served request path, and this is why it is kept out of the ladder's
-/// `endpoint` rung: `std.db`'s memory engine parses its SQL in Ply on every call, so a `/items`
-/// handler over it allocates several times what the same handler costs against postgres.
+/// `std.db`'s memory engine parses its SQL in Ply on every call, which is why it is kept out of the `endpoint` rung.
 #[test]
 fn the_in_memory_store_is_priced_apart_from_the_endpoint() {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service must compile");
@@ -116,7 +110,6 @@ fn the_in_memory_store_is_priced_apart_from_the_endpoint() {
     );
 }
 
-/// Entering the machine is not the cost.
 #[test]
 fn entering_the_machine_allocates_a_bounded_amount() {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service must compile");

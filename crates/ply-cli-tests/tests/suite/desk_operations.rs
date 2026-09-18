@@ -1,6 +1,3 @@
-//! `examples/desk.ply` as an operator meets it: what its types say about liveness and readiness,
-//! which channels each endpoint records on, and where a credential is allowed to go.
-
 use assert_cmd::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -56,8 +53,7 @@ impl Run {
     }
 }
 
-/// One definition's block from `ply check --types`: the signature line and the row lines that
-/// follow it, joined.
+/// The signature line and the row lines that follow it, joined.
 fn signature_of(output: &str, name: &str) -> String {
     let mut lines = output.lines().skip_while(|l| {
         let trimmed = l.trim_start();
@@ -91,9 +87,6 @@ fn desk_types() -> String {
     run.stdout
 }
 
-// --- liveness and readiness -------------------------------------------------
-
-/// Health and readiness as routes, and the reason the two routes exist rather than one.
 #[test]
 fn health_has_no_row_and_ready_names_what_it_verifies() {
     let types = desk_types();
@@ -120,10 +113,6 @@ fn health_has_no_row_and_ready_names_what_it_verifies() {
     );
 }
 
-// --- observability as an effect ---------------------------------------------
-
-/// The sibling of "which tables does this route touch", which is what W5 buys: the row says which
-/// channels an endpoint records on.
 #[test]
 fn a_row_says_which_channels_an_endpoint_records_on() {
     let types = desk_types();
@@ -155,8 +144,7 @@ fn a_row_says_which_channels_an_endpoint_records_on() {
         );
     }
 
-    // The request span is the serving layer's, not an endpoint's, so `http` appears exactly where
-    // the span is opened and nowhere below it.
+    // The request span is the serving layer's, so `http` appears where the span is opened and nowhere below.
     assert!(signature_of(&types, "dispatch").contains("std.trace.trace.write[http]"));
     assert!(!signature_of(&types, "place_order").contains("trace.write[http]"));
 }
@@ -172,9 +160,6 @@ fn two_channels_are_two_atoms_rather_than_one_recording_capability() {
     );
 }
 
-// --- configuration ----------------------------------------------------------
-
-/// start-up versus per-request configuration: configuration is read at start-up and is a value thereafter.
 #[test]
 fn only_the_entry_point_reads_settings_and_only_one_route_reads_a_credential() {
     let types = desk_types();
@@ -186,8 +171,7 @@ fn only_the_entry_point_reads_settings_and_only_one_route_reads_a_credential() {
         "{main}"
     );
 
-    // The serving layer carries the credential namespace and never the settings namespace: the port
-    // was resolved before a socket existed.
+    // The serving layer carries the credential namespace, never settings: the port was resolved before a socket existed.
     let dispatch = signature_of(&types, "dispatch");
     assert!(
         dispatch.contains("std.config.config.read[credentials]"),
@@ -206,9 +190,6 @@ fn only_the_entry_point_reads_settings_and_only_one_route_reads_a_credential() {
     }
 }
 
-// --- the credential ---------------------------------------------------------
-
-/// The headline, checked over a whole run rather than over one call.
 #[test]
 fn the_desks_credential_reaches_no_line_of_a_whole_test_run() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -217,20 +198,16 @@ fn the_desks_credential_reaches_no_line_of_a_whole_test_run() {
 
     let run = Run::of(&["test", "--json", dir.path().to_str().unwrap()]);
     assert!(run.ok, "the desk's suite must be green\n\n{}", run.all());
-    // Not in the `--json` document, not in a diff, not in a diagnostic, not in a trace field — over
-    // sixty-odd tests that each drive the check end to end.
     run.silent_about("twin-key-not-a-credential");
 
-    // Not in the result cache either, which is the one that would matter for a *failing* assertion:
-    // a failure report is stored, and `Value::render` is `Secret(****)` before it gets there.
+    // A failure report is stored, and `Value::render` is `Secret(****)` before it gets there.
     let results = std::fs::read(dir.path().join(".ply-cache/results.json")).unwrap_or_default();
     assert!(
         !String::from_utf8_lossy(&results).contains("twin-key-not-a-credential"),
         "a credential must not reach the result cache, which never forgets"
     );
 
-    // And the hole, pinned: a literal *is* in the front-end store, because a literal is part of the
-    // definition it was written in.
+    // The known hole: a literal is in the front-end store, as part of the definition it was written in.
     let store = std::fs::read(dir.path().join(".ply-cache/frontend.dat")).unwrap_or_default();
     assert!(
         String::from_utf8_lossy(&store).contains("twin-key-not-a-credential"),
@@ -239,8 +216,6 @@ fn the_desks_credential_reaches_no_line_of_a_whole_test_run() {
     );
 }
 
-/// The closed exfiltration routes as a fixture: every route out of a `Secret` is a compile error, and this is the
-/// list.
 #[test]
 fn every_route_out_of_a_secret_is_a_compile_error() {
     let run = Run::of(&[
@@ -254,14 +229,12 @@ fn every_route_out_of_a_secret_is_a_compile_error() {
         "the containment fixture must not compile — every line in it is a leak\n\n{}",
         run.all()
     );
-    // `++`, a trace field and a SQL parameter are `E0201`; there is no pattern that binds the
-    // payload, which is `E0101`; and a law cannot quantify over one, which is `E0418`.
+    // `++`, a trace field and a SQL parameter are `E0201`; binding the payload is `E0101`; a law over one is `E0418`.
     for code in ["E0201", "E0101", "E0418"] {
         run.says(code);
     }
 
-    // Derivation is a second run because it refuses *before* inference: one file holding both would
-    // report `E0206` and hide the five refusals above it.
+    // A separate run: derivation refuses before inference, so one file would report `E0206` and hide the rest.
     let derived = Run::of(&[
         "check",
         repo("tests/fixtures/secret_not_derivable.ply")
@@ -273,10 +246,6 @@ fn every_route_out_of_a_secret_is_a_compile_error() {
     derived.says("`ord` cannot be derived");
 }
 
-// --- what a run is, and stays -----------------------------------------------
-
-/// The invariant W5 must not regress, over a corpus that now has `trace`, `config`, `signal` and
-/// `Secret` rows in it: the desk's suite is hermetic without `--host`, and says so.
 #[test]
 fn the_desks_suite_is_hermetic_without_host_and_says_so() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -285,36 +254,26 @@ fn the_desks_suite_is_hermetic_without_host_and_says_so() {
 
     let first = Run::of(&["test", "--explain", dir.path().to_str().unwrap()]);
     assert!(first.ok, "{}", first.all());
-    // Every one of the desk's tests is region-isolated, including the ones that assert on trace
-    // records and the ones that supply a credential: the twins are values in region-scoped cells,
-    // so nothing reaches the boundary and nothing is `isolation: host`.
+    // The twins are values in region-scoped cells, so nothing reaches the boundary.
     first.says("isolated 68 of 68");
     first.silent_about("isolation: host");
 
-    // And every one of them is cached, for the same reason: a twin-backed tracing test's row is
-    // empty after the region, so it is `det`, and its second run is a cache hit rather than a
-    // re-run.
+    // And every one is cached: a twin-backed tracing test's row is empty after the region, so it is `det`.
     let second = Run::of(&["test", dir.path().to_str().unwrap()]);
     assert!(second.ok, "{}", second.all());
     second.says("0 passed, 68 cached");
 }
 
-/// The spans, the counters and the credential check did not cost the desk its specifications.
 #[test]
 fn the_desks_laws_still_hold_over_a_service_that_records_and_authenticates() {
     let run = Run::of(&["prove", repo("examples/desk.ply").to_str().unwrap()]);
     assert!(run.ok, "{}", run.all());
     run.says("7 held");
     run.says("2 proved");
-    // The two placement laws now drive the whole route — the key check, the decode and the span —
-    // so a credential that could not be verified would refute them rather than being invisible to
-    // them.
+    // The placement laws drive the whole route, so an unverifiable credential would refute them.
     run.says("a placement the shelf can cover moves the shelf by exactly the drawdown");
 }
 
-// --- what an operator reads before starting it ------------------------------
-
-/// The host listing's two new blocks, over the desk.
 #[test]
 fn hosts_prints_where_records_go_which_channels_exist_and_what_a_signal_does() {
     let desk = repo("examples/desk.ply");
@@ -324,25 +283,21 @@ fn hosts_prints_where_records_go_which_channels_exist_and_what_a_signal_does() {
 
     run.says("observability");
     run.says("sink       ply_host::trace::json → stderr · level info");
-    // Three channels, and they are the desk's own: `http` for the request span, `orders` and
-    // `items` for the two tables.
+    // `http` for the request span, `orders` and `items` for the two tables.
     run.says("channels   http items orders");
     run.says("spans      per-task stack · closed at end_entry_point");
 
     run.says("shutdown");
     run.says("signals    INT TERM · lead 0ms · drain 30000ms · second signal exits 130/143");
 
-    // `--trace off` is a handler and not an absence, so it is named; and a level on a discarding
-    // sink is a distinction with no consequence, so it is not.
+    // `--trace off` is a handler, not an absence, so it is named; a level on a discarding sink is not.
     let off = Run::of(&["hosts", desk, "--host", "--trace", "off"]);
     assert!(off.ok, "{}", off.all());
     off.says("sink       ply_host::trace::discard → nothing");
     off.silent_about("→ nothing · level");
 }
 
-/// The host listing's digest rule, which is the whole reason the blocks are hashed rather than only
-/// printed: a structural change to the trusted computing base breaks CI, and a deployment's own
-/// configuration does not.
+/// A structural change to the trusted computing base breaks CI; a deployment's own configuration does not.
 #[test]
 fn the_hosts_digest_moves_with_the_sink_and_the_drain_and_not_with_a_value() {
     let desk = repo("examples/desk.ply");

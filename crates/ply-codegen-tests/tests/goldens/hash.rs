@@ -1,10 +1,3 @@
-//! The sixth comparison: every hash `hash.ply` publishes for a program — each definition's,
-//! each declaration's, each test's and law's, the own-form and spec keys — and the reference
-//! graph beside them, compared record by record against a blessed golden.
-//!
-//! The port is entered in-process through `port`: the bundle the binary carries is the compiler
-//! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
-
 use crate::harness::{bundle, fixtures, golden, own, part, port, programs, records, repo_root};
 use std::path::{Path, PathBuf};
 
@@ -120,8 +113,7 @@ fn the_ply_hasher_matches_its_golden_on_every_example_with_the_standard_library(
 fn the_ply_hasher_matches_its_golden_on_every_example_with_the_standard_library_part_1_of_2() {
     ply_codegen::c::producer::reset_census();
     the_ply_hasher_matches_its_golden_on_every_example_with_the_standard_library(0, 2);
-    // The hasher's cost over this half of the corpus, the standard library counted once per
-    // program as it is hashed once per program (ADR 0051 §2).
+    // The standard library is counted once per program, as it is hashed once per program.
     let lines: usize = std_modules().iter().map(|(_, t)| t.lines().count()).sum();
     if let Err(report) = crate::harness::census::hold("hasher-over-std-and-examples-part-1", lines)
     {

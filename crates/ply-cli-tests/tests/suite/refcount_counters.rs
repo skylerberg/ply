@@ -1,5 +1,3 @@
-//! `ply run --json` reports what the reference-counting pass actually did.
-
 use std::process::Command;
 
 fn run(src: &str) -> serde_json::Value {
@@ -14,8 +12,7 @@ fn run(src: &str) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).expect("`--json` must answer one object")
 }
 
-/// A loop that appends 200 times with the growing field last, so the machine can reuse at every
-/// step and the counts are a round number a reader can check.
+/// The growing field last, so the machine can reuse at every step and the counts are round.
 const APPENDS: &str = "\
 fn build(n: Int) -> List<Int> =
   iterate({i: 0, out: []}, n + 1, |s: {i: Int, out: List<Int>}|
@@ -28,17 +25,13 @@ fn the_machine_reports_what_it_reused() {
     let v = run(APPENDS);
     let c = &v["counters"];
     assert_eq!(c["updates"], 200, "200 appends were made: {c}");
-    // The tier reads `s.out` out of the state record with a count of its own rather than taking
-    // the field -- ADR 0034 records the take as tried and removed -- so the list is held twice at
-    // each push and grows by copying a tail. The ratio is reported, and it is not 1.0.
+    // The tier reads `s.out` with a count of its own rather than taking the field, so the ratio is not 1.0.
     let in_place = c["in_place"]
         .as_f64()
         .unwrap_or_else(|| panic!("the reuse ratio is reported: {c}"));
     assert!((0.0..=1.0).contains(&in_place), "{c}");
 }
 
-/// Non-vacuity: the counters must move with the program, or the test above would pass over a
-/// surface that reports a constant.
 #[test]
 fn the_counts_follow_the_program_rather_than_being_a_constant() {
     let ten = run(&APPENDS.replace("build(200)", "build(10)"));

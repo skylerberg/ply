@@ -1,8 +1,3 @@
-//! The Ply emitter as the C tier's producer (ADR 0042).
-//!
-//! The front end and `emit.ply` are built as a working copy is and handed over as the producer; a
-//! program is then compiled by it, and every body it answered is entered and held to the machine.
-//!
 //! One binary of its own, because the producer is a process-wide installation.
 
 use ply_codegen::Source;
@@ -36,7 +31,6 @@ struct Loaded {
     texts: HashMap<String, String>,
 }
 
-/// A program from named module texts, the standard library alongside.
 fn load(modules: &[(&str, &str)], with_std: bool) -> &'static Loaded {
     let mut sources = ply_span::SourceMap::new();
     let mut inputs = Vec::new();
@@ -93,8 +87,6 @@ fn nested(a: Int, b: Int) -> Int = (a + b) * (a - b)
 fn sum_to(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, i: Int| acc + i)
 "#;
 
-/// The unit built with the Ply emitter as its producer, and every case's answer checked against
-/// the machine's. The refusals are the fixpoint's, and this program has none.
 /// The producer's mode is a process-wide flag, so the tests that set it take turns.
 static MODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -157,9 +149,6 @@ fn built_and_checked() {
     }
 }
 
-/// Effects by evidence passing (ADR 0043): a tail-resumptive handler with a `return` clause, a
-/// perform two calls deep, a handler installed inside another's body, and the zero-shot
-/// `resume` that unwinds. The machine is the oracle.
 const EFFECTS: &str = r#"
 effect counter {
   write bump(n: Int) -> Int
@@ -209,9 +198,7 @@ fn the_chain_entered_whole_carries_handlers_as_the_machine_does() {
     let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
     assert!(refused.is_empty(), "{refused:?}");
     let mut oracle = ply_eval::interp::Pure::new(loaded.program, loaded.resolved);
-    // ADR 0048 retired the interpreter oracle. `counted` and `nested` are tail-resumptive, so the
-    // pure applier still answers them; `guarded`'s named zero-shot `resume` it declines, so that
-    // case pins the tier's answer as a regression guard (the corpus validates the mechanism).
+    // The pure applier declines `guarded`'s zero-shot `resume`, so its cases carry the tier's answer.
     let cases: Vec<(&str, Vec<Value>, Option<Value>)> = vec![
         ("m.counted", vec![Value::Int(3)], None),
         ("m.nested", vec![Value::Int(5)], None),
@@ -256,10 +243,6 @@ fn the_chain_entered_whole_answers_what_the_machine_answers() {
     built_and_checked();
 }
 
-/// The per-operation rule (ADR 0043) under tier-only: a compiled `perform` searches the compiled
-/// frames, which is complete because nothing outside the unit runs. A handler the unit refuses
-/// cannot be on the stack, so its performer compiles, and a `perform` no compiled handler answers
-/// reaches the host binding from the runtime -- as one nothing in the program handles does.
 const DROPPED: &str = r#"
 effect counter {
   write bump(n: Int) -> Int
@@ -314,9 +297,7 @@ fn a_performer_keeps_compiling_when_its_handler_is_dropped() {
         "{}",
         reason("m.handler")
     );
-    // A `perform` no handler in the program answers is compiled: it reaches the host binding
-    // from the runtime, with the machine's checks, and an unbound one fails there as the
-    // machine fails it.
+    // A `perform` nothing in the program answers compiles and reaches the host binding from the runtime.
     for taken in ["m.performer", "m.lonely", "m.hosted", "m.hosting"] {
         assert!(
             !refused.iter().any(|r| r.function == taken),
@@ -350,9 +331,6 @@ impl ply_eval::HostHandler for Doubler {
     }
 }
 
-/// A `perform` nothing on the stack answers reaches the host binding from the runtime: a bound
-/// handler answers it as it answers the machine, and a hermetic binding refuses it with the
-/// machine's diagnostic.
 #[test]
 fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
@@ -381,9 +359,7 @@ fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
     );
     let bound = std::sync::Arc::new(registry.bind(loaded.check).expect("the registry binds"));
     let hermetic = std::sync::Arc::new(ply_eval::HostBinding::hermetic());
-    // ADR 0048 retired the interpreter oracle; these pin the tier's answers as a regression guard
-    // (the corpus validates the mechanism end-to-end). Under tier-only, a user effect performed by
-    // a compiled root resolves to no host row, so every case here refuses at the host boundary.
+    // A user effect performed by a compiled root resolves to no host row, so every case refuses at the host boundary.
     let cases: Vec<HostCase> = vec![
         (
             "m.hosted",
@@ -450,10 +426,7 @@ fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
     }
 }
 
-/// `Float` and `Decimal` literals are constants the runtime holds, opaque to the emitted C:
-/// every operator over one is the machine's own through the runtime, as is any operator over
-/// two words the emitter cannot type. Neither crosses the seam, so each case answers through a
-/// conversion that does.
+/// `Float` and `Decimal` do not cross the seam, so each case answers through a conversion that does.
 const NUMERIC: &str = r#"
 fn bigger(bits: Int) -> Bool = float_of_bits(bits) > 1.5
 fn half(bits: Int) -> Int = bits_of_float(float_of_bits(bits) * 0.5)
@@ -553,8 +526,6 @@ fn racing(n: Int) -> Int =
   }
 "#;
 
-/// A `simulate` region compiles to a frame the runtime serves, and under one seed the compiled
-/// scheduler makes the machine's choices: the answers agree, and so does every step's footprint.
 #[test]
 fn the_chain_entered_whole_schedules_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
@@ -567,8 +538,6 @@ fn the_chain_entered_whole_schedules_as_the_machine_does() {
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
     assert!(refused.is_empty(), "{refused:?}");
-    // ADR 0048 retired the interpreter oracle; these pin the tier's schedule as a regression
-    // guard (the corpus validates the mechanism end-to-end).
     let cases: Vec<(&str, Vec<Value>, Value, i64, &str)> = vec![
         (
             "m.ordered",
@@ -676,9 +645,6 @@ fn mixed(seed: Int) -> Int =
   }
 "#;
 
-/// A clause that resumes off the tail runs the body on a stack of its own, and `k` switches
-/// into it from the clause: the answers are the machine's, including the `return` clause's
-/// place inside `k` and a body dropped without resuming.
 #[test]
 fn the_chain_entered_whole_resumes_off_the_tail_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
@@ -691,8 +657,6 @@ fn the_chain_entered_whole_resumes_off_the_tail_as_the_machine_does() {
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
     assert!(refused.is_empty(), "{refused:?}");
-    // ADR 0048 retired the interpreter oracle; these pin the tier's answers as a regression guard
-    // (the corpus validates the mechanism end-to-end).
     let cases: Vec<(&str, Vec<Value>, Value)> = vec![
         ("m.later", vec![Value::Int(3)], Value::Int(140)),
         ("m.returned", vec![Value::Int(4)], Value::Int(2132)),
@@ -793,11 +757,6 @@ fn across(seed: Int) -> Int =
   } }
 "#;
 
-/// A continuation resumed again after its body finished restores the stack it was captured on
-/// and runs the body from there once more: the machine's multi-shot answers, including a string
-/// built twice from one argument, a cell shared across the resumptions, and slot writes that do
-/// not leak between siblings. A capture under a task belongs to a region that has ended by the
-/// second resumption, and both engines say so.
 #[test]
 fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
@@ -810,9 +769,7 @@ fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
     assert!(refused.is_empty(), "{refused:?}");
-    // ADR 0048 retired the interpreter oracle; these pin the tier's answers as a regression guard
-    // (the corpus validates the mechanism end-to-end). `across` captures a continuation under a
-    // task whose region has ended by the second resumption, so the tier refuses it.
+    // `across` captures under a task whose region has ended by the second resumption, so the tier refuses it.
     let cases: Vec<(&str, Vec<Value>, Result<Value, &str>)> = vec![
         ("m.both", vec![Value::Int(3)], Ok(Value::Int(303))),
         ("m.thrice", vec![Value::Int(7)], Ok(Value::Int(42))),
@@ -912,10 +869,6 @@ impl ply_eval::HostRuntime for Reactor {
     }
 }
 
-/// A `task` operation outside any `simulate` opens the production region the binding permits,
-/// with the performer's stack as the root: tasks spawn and join, a pending host answer parks
-/// the task until the reactor resolves it, and the region drains after the root returns. A
-/// hermetic binding refuses the region with the machine's code.
 #[test]
 fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
@@ -942,8 +895,7 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
         },
         std::sync::Arc::new(Slow),
     );
-    // The binding names the scheduler's operations as the host crate's does; neither engine
-    // calls the handler, since a region answers them.
+    // Neither engine calls the handler: a region answers the scheduler's operations.
     for op in ply_eval::sim::TASK_OPS {
         registry.register(
             ply_eval::HostOp {
@@ -961,10 +913,7 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
     }
     let bound = std::sync::Arc::new(registry.bind(loaded.check).expect("the registry binds"));
     let hermetic = std::sync::Arc::new(ply_eval::HostBinding::hermetic());
-    // ADR 0048 retired the interpreter oracle; these pin the tier's answers as a regression guard
-    // (the corpus validates the mechanism end-to-end). A bound `spawned` opens its production
-    // region and answers; `parked`'s `slow.fetch` resolves to no host row, and a hermetic binding
-    // refuses the region, so both of those refuse at the host boundary.
+    // `parked`'s `slow.fetch` resolves to no host row and a hermetic binding refuses the region: both refuse at the host boundary.
     let cases: Vec<HostCase> = vec![
         (
             "m.spawned",
@@ -1039,8 +988,7 @@ law "zero moves nothing" forall (account: Account) where account.balance > 0 {
 }
 "#;
 
-/// ADR 0045 §"The facade": a law's guard and body and a definition's clauses are roots of the
-/// unit, entered with the bound names' values and answering `Bool`.
+/// A law's guard and body and a definition's clauses are roots, entered with the bound names' values.
 #[test]
 #[allow(clippy::arc_with_non_send_sync)]
 fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
