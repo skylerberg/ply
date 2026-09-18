@@ -354,9 +354,8 @@ fn once(root: &Path, backend: Option<&str>) -> Result<(Timings, Shape)> {
             ply_cli::commands::common::build_backend_over(
                 spec,
                 &program,
-                &resolved,
                 &port,
-                ply_cli::commands::common::module_texts(&program, &sources),
+                ply_cli::commands::common::module_texts(&check, &sources),
             )
             .map_err(|d| anyhow::anyhow!("building the backend: {}", d.message))?,
         ),
@@ -376,8 +375,8 @@ fn once(root: &Path, backend: Option<&str>) -> Result<(Timings, Shape)> {
         // No backend named: the default tier.
         _ => {
             ply_codegen::c::producer::ensure_default();
-            let texts = ply_cli::commands::common::module_texts(&program, &sources);
-            let unit = ply_codegen::Unit::over_front(&program, &resolved, &port, texts)
+            let texts = ply_cli::commands::common::module_texts(&check, &sources);
+            let unit = ply_codegen::Unit::over_front(&program, &port, texts)
                 .map_err(|e| anyhow::anyhow!("building the default tier: {e:#}"))?;
             let executor = ply_test::InterpExecutor::new(&program, &resolved, &check)
                 .with_search(ply_test::Search::of(&selection))

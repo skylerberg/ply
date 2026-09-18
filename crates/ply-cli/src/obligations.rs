@@ -3,9 +3,8 @@
 use ply_hash::HashOutput;
 use ply_prove::{Frame, Obligation, ObligationKind, frame_of};
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::{Item, Program, SpecKind};
-use ply_ty::{CheckOutput, LawBinder, Type};
-use std::collections::HashMap;
+use ply_syntax::ast::SpecKind;
+use ply_ty::{CheckOutput, DefWritten, Front, LawBinder, Type};
 
 pub struct Collected {
     pub obligations: Vec<Obligation>,
@@ -24,16 +23,8 @@ pub fn project_view(check: &CheckOutput, std: bool) -> std::borrow::Cow<'_, Chec
     std::borrow::Cow::Owned(scoped)
 }
 
-pub fn collect(program: &Program, check: &CheckOutput, hashes: &HashOutput) -> Collected {
-    let mut fns: HashMap<Symbol, &ply_syntax::ast::FnDef> = HashMap::new();
-    for module in &program.modules {
-        for item in &module.items {
-            if let Item::Fn(def) = item {
-                fns.insert(module.name.qualify(&def.name.name), def);
-            }
-        }
-    }
-
+/// `front` for each definition's parameters as written; `check` for which claims to collect.
+pub fn collect(front: &Front, check: &CheckOutput, hashes: &HashOutput) -> Collected {
     let mut out = Collected {
         obligations: Vec::new(),
         warnings: Vec::new(),
@@ -46,11 +37,11 @@ pub fn collect(program: &Program, check: &CheckOutput, hashes: &HashOutput) -> C
         }
         let guarded = info.spec.iter().any(|s| s.kind == SpecKind::Requires);
         let keys = hashes.specs.get(name);
-        let Some(def) = fns.get(name) else {
-            out.warnings.push(unparsed(name, info.span));
+        let Some(written) = front.defs_written.get(name) else {
+            out.warnings.push(unwritten(name, info.span));
             continue;
         };
-        let binders = clause_binders(def, info);
+        let binders = clause_binders(written, info);
         let frame = frame_of(&info.footprint);
 
         // Keyed by position among all the owner's clauses, as `spec_hash` covers them.
@@ -101,17 +92,17 @@ pub fn collect(program: &Program, check: &CheckOutput, hashes: &HashOutput) -> C
 }
 
 /// The owner's parameters, then `result`.
-fn clause_binders(def: &ply_syntax::ast::FnDef, info: &ply_ty::DefInfo) -> Vec<LawBinder> {
+fn clause_binders(written: &DefWritten, info: &ply_ty::DefInfo) -> Vec<LawBinder> {
     let (params, ret) = match &info.scheme.ty {
         Type::Fn { params, ret, .. } => (params.as_slice(), (**ret).clone()),
         other => (&[][..], other.clone()),
     };
-    let mut binders: Vec<LawBinder> = def
+    let mut binders: Vec<LawBinder> = written
         .params
         .iter()
         .zip(params)
         .map(|(param, ty)| LawBinder {
-            name: param.name.name.clone(),
+            name: param.name.clone(),
             ty: ty.clone(),
             span: param.span,
         })
@@ -119,15 +110,15 @@ fn clause_binders(def: &ply_syntax::ast::FnDef, info: &ply_ty::DefInfo) -> Vec<L
     binders.push(LawBinder {
         name: Symbol::new("result"),
         ty: ret,
-        span: def.span,
+        span: info.span,
     });
     binders
 }
 
-fn unparsed(name: &Symbol, span: Span) -> Diagnostic {
+fn unwritten(name: &Symbol, span: Span) -> Diagnostic {
     Diagnostic::warning(
         codes::CACHE_CORRUPT,
-        format!("`{name}` carries a specification whose source was not parsed"),
+        format!("`{name}` carries a specification with no record of its parameters"),
     )
     .primary(span, "its obligations were not collected")
     .note("nothing here claims they hold; run again with `--no-incremental`")

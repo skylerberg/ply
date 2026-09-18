@@ -140,22 +140,15 @@ pub mod tests_support {
             ply_codegen::c::producer::checked_front(&[("m".to_string(), owned.to_string())], &[id])
                 .expect("checks")
                 .check;
-        let bare = Source::new(
-            Box::leak(Box::new(ast)),
-            Box::leak(Box::new(resolved)),
-            Box::leak(Box::new(check)),
-        );
+        let bare = Source::new(&ast, &resolved, &check);
         let stamp = blake3::hash(text.as_bytes()).to_hex();
         let keys = bare
             .functions()
             .into_iter()
             .map(|n| (n.clone(), format!("h-{n}-{}", &stamp[..16])))
             .collect();
-        let program = bare.program;
-        let resolved = bare.resolved;
-        let check = bare.check;
         Some(Box::leak(Box::new(
-            Source::keyed(program, resolved, check, keys).with_texts(texts(text)),
+            Source::keyed(&ast, &resolved, &check, keys).with_texts(texts(text)),
         )))
     }
 
@@ -641,26 +634,15 @@ fn a_definition_that_only_moved_is_served_from_the_cache_and_placed_where_it_now
     let hashed = |text: &str| -> &'static ply_codegen::Source {
         let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
         let id = ply_span::SourceId(0);
-        let mut ast =
-            ply_syntax::parse_program([(id, ply_syntax::ast::ModuleName::from_dotted("m"), owned)])
-                .expect("parses");
-        let resolved = ply_syntax::resolve::resolve(&mut ast).expect("resolves");
         let front =
             ply_codegen::c::producer::checked_front(&[("m".to_string(), owned.to_string())], &[id])
                 .expect("checks");
         let front: &'static ply_ty::Front = Box::leak(Box::new(front));
         let keys = ply_codegen::emit_keys(front);
         Box::leak(Box::new(
-            ply_codegen::Source::from_front(
-                Box::leak(Box::new(ast)),
-                Box::leak(Box::new(resolved)),
-                front,
-                keys,
-            )
-            .with_texts(std::collections::HashMap::from([(
-                "m".to_string(),
-                owned.to_string(),
-            )])),
+            ply_codegen::Source::from_front(front, keys).with_texts(
+                std::collections::HashMap::from([("m".to_string(), owned.to_string())]),
+            ),
         ))
     };
     let failure = |source: &'static ply_codegen::Source| -> Option<ply_span::Span> {

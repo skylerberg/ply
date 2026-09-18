@@ -45,9 +45,9 @@ pub fn tier_machine<'a>(
     sources: &ply_span::SourceMap,
 ) -> ply_eval::Machine<'a> {
     ply_codegen::c::producer::ensure_default();
-    let texts = ply_cli::commands::common::module_texts(program, sources);
-    let unit = ply_codegen::Unit::over_front(program, resolved, port, texts)
-        .expect("this host has a C compiler");
+    let texts = ply_cli::commands::common::module_texts(&port.check, sources);
+    let unit =
+        ply_codegen::Unit::over_front(program, port, texts).expect("this host has a C compiler");
     let mut machine = ply_eval::Machine::new(program, resolved, &port.check);
     machine.set_compiled(ply_eval::Provider::attach(unit, &honest()));
     machine
@@ -62,8 +62,8 @@ pub fn run_on_tier(
     hosting: ply_test::Hosting<'_>,
 ) -> ply_test::RunReport {
     ply_codegen::c::producer::ensure_default();
-    let texts = ply_cli::commands::common::module_texts(&front.program, &front.sources);
-    let unit = ply_codegen::Unit::over_front(&front.program, &front.resolved, &front.port, texts)
+    let texts = ply_cli::commands::common::module_texts(&front.check, &front.sources);
+    let unit = ply_codegen::Unit::over_front(&front.program, &front.port, texts)
         .expect("this host has a C compiler");
     let executor = ply_test::InterpExecutor::new(&front.program, &front.resolved, &front.check)
         .with_backend(unit, honest())

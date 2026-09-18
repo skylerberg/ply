@@ -179,12 +179,11 @@ fn fake_loaded(root: &std::path::Path, files: &[&str]) -> Loaded {
         root: root.to_path_buf(),
         files: files.iter().map(|f| root.join(f)).collect(),
         sources: ply_span::SourceMap::new(),
-        program: Default::default(),
-        resolved: Default::default(),
         front: Default::default(),
         check: Default::default(),
         hashes: Default::default(),
         frontend: Default::default(),
         promised: false,
+        rust: Default::default(),
     }
 }
