@@ -2105,7 +2105,7 @@ pub unsafe extern "C" fn rt_call(ctx: *mut Ctx, callee: i64, args: *const i64, n
 }
 
 /// Applies `callee` to `args`, or answers 0 with the context failed. Reads the callee, takes the
-/// arguments; an interpreted closure cannot reach here, since the seam carries no function.
+/// arguments.
 pub(crate) fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
     let c = unsafe { &mut *ctx };
     match heap::kind(callee) {
@@ -2202,10 +2202,23 @@ pub(crate) fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
                         }
                     }
                 }
-                _ => {
-                    let d = error(
-                        "an interpreted closure reached compiled code, which has no machine to run it on",
-                    );
+                ClosureKind::Synth { arity, rule } => {
+                    if args.len() != *arity {
+                        let d = error(format!(
+                            "a generated function takes {arity} arguments and was given {}",
+                            args.len()
+                        ));
+                        return c.fail(d);
+                    }
+                    let values = values_taken(c, args);
+                    match rule.apply(&values) {
+                        Ok(v) => c.word(&v),
+                        Err(d) => c.fail(d),
+                    }
+                }
+                // `Heap::to_word` rebuilds a native closure as one, so it never crosses as a bridge.
+                ClosureKind::Native { .. } => {
+                    let d = error("a compiled closure arrived bridged rather than native");
                     c.fail(d)
                 }
             }

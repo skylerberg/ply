@@ -3,8 +3,6 @@
 use clap::Args;
 use ply_host::config::{Key, Shape, Snapshot, Sources, Spec};
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::Program;
-use ply_syntax::resolve::Resolved;
 use ply_ty::CheckOutput;
 use ply_ty::ty::Type;
 use serde_json::{Value as Json, json};
@@ -73,21 +71,19 @@ pub struct SchemaView {
 
 impl Configuration {
     /// Read sources, materialise the schema, check every key; warnings are returned, not printed.
+    /// `constant` enters a nullary definition on the run's compiled unit.
     pub fn open(
-        program: &Program,
-        resolved: &Resolved,
         check: &CheckOutput,
         host: bool,
         options: &ConfigOptions,
+        constant: &dyn Fn(&str) -> Result<ply_eval::Value, Diagnostic>,
     ) -> Result<(Configuration, Vec<Diagnostic>), Vec<Diagnostic>> {
         let Some(sources) = options.read(host)? else {
             return Ok((Configuration::default(), Vec::new()));
         };
         let spec = match &options.schema {
             None => None,
-            Some(name) => {
-                Some(schema::materialise(program, resolved, check, name).map_err(|d| vec![d])?)
-            }
+            Some(name) => Some(schema::materialise(check, name, constant).map_err(|d| vec![d])?),
         };
         let report = Snapshot::resolve(&sources, spec.as_ref())?;
         let view = options.schema.as_ref().map(|name| SchemaView {
@@ -295,10 +291,9 @@ pub mod schema {
 
     /// Resolve, evaluate and decode; unlike `--db-schema`, an evaluation failure is a refusal.
     pub fn materialise(
-        program: &Program,
-        resolved: &Resolved,
         check: &CheckOutput,
         name: &str,
+        constant: &dyn Fn(&str) -> Result<ply_eval::Value, Diagnostic>,
     ) -> Result<Spec, Diagnostic> {
         resolve(check, name)?;
         let def = check
@@ -306,16 +301,14 @@ pub mod schema {
             .values()
             .find(|d| d.name.as_str() == name)
             .ok_or_else(|| unknown(check, name))?;
-        let value = ply_eval::interp::Pure::new(program, resolved)
-            .call(name, Vec::new(), def.span, 10_000)
-            .map_err(|failure| {
-                Diagnostic::error(
-                    codes::CONFIG_UNAVAILABLE,
-                    format!("`--config-schema {name}` could not be evaluated: {}", failure.message),
-                )
-                .primary(def.span, "this function decides what the run requires of its configuration")
-                .note("it is called once, before anything is bound, and a run that cannot compute its schema does not know whether it is configured")
-            })?;
+        let value = constant(name).map_err(|failure| {
+            Diagnostic::error(
+                codes::CONFIG_UNAVAILABLE,
+                format!("`--config-schema {name}` could not be evaluated: {}", failure.message),
+            )
+            .primary(def.span, "this function decides what the run requires of its configuration")
+            .note("it is called once, before anything is bound, and a run that cannot compute its schema does not know whether it is configured")
+        })?;
         spec_of(&value, name)
     }
 

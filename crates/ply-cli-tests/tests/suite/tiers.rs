@@ -345,6 +345,29 @@ law "a pure function is a function"
     );
 }
 
+/// Refuted only if compiled code applies the generated functions it is handed; a raise is a gap.
+#[test]
+fn a_higher_order_law_is_sampled_on_the_tier() {
+    let dir = project(
+        r#"
+law "two functions agree"
+  forall (f: (Int) -> Int, g: (Int) -> Int, x: Int) {
+    f(x) == g(x)
+  }
+"#,
+    );
+    let run = Run::of(dir.path());
+    let discharge = &run.find("two functions agree").1;
+    let Discharge::Refuted(counterexample) = discharge else {
+        panic!("{discharge:?}");
+    };
+    assert!(
+        counterexample.bindings[0].rendered.starts_with("<fn |"),
+        "{:?}",
+        counterexample.bindings
+    );
+}
+
 #[test]
 fn a_proved_polymorphic_law_records_its_sorts() {
     let dir = project(

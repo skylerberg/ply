@@ -32,8 +32,7 @@ pub fn world_independent(value: &Value) -> bool {
             Value::Closure(closure) => match &closure.kind {
                 ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) => {}
                 ClosureKind::Native { captured, .. } => pending.extend(captured.iter()),
-                ClosureKind::Code { captured, .. } => pending.extend(captured.iter()),
-                ClosureKind::Fn { bindings, .. } => pending.extend(bindings.iter().map(|(_, v)| v)),
+                ClosureKind::Synth { rule, .. } => pending.extend(rule.values()),
             },
         }
     }

@@ -1,13 +1,7 @@
-use crate::unit::build::{
-    bin, block, callv, clause, discard, effect_def, handle, int, lam, letv, list, perform,
-    standalone, var, with_cell,
-};
 use ply_eval::builtins::*;
-use ply_eval::evaluator::Machine;
 use ply_eval::task_regions::TaskRegions;
 use ply_eval::{Frame, Value};
 use ply_span::{Diagnostic, Span, codes};
-use ply_syntax::ast::{BinOp, Expr, Item, Mode};
 
 fn ints(xs: &[i64]) -> Value {
     Value::list(xs.iter().copied().map(Value::Int).collect())
@@ -1411,100 +1405,6 @@ fn a_wrapping_builtin_refuses_a_non_int_and_nothing_else() {
         .expect_err("a `String` is not an `Int`");
     assert_eq!(d.code, codes::RUNTIME_ERROR);
     assert!(d.message.contains("wrap_add"), "{}", d.message);
-}
-
-fn run(items: Vec<Item>, e: Expr) -> Result<Value, Diagnostic> {
-    let (program, resolved) = standalone(items);
-    Machine::for_program(&program, &resolved).eval_expr_for_test(&e)
-}
-
-fn state() -> Item {
-    effect_def("state", &[("get", Mode::Read, false)])
-}
-
-/// A builtin that carried its own arena copy would keep the count at 1 and the wrong elements.
-#[test]
-fn a_predicate_that_performs_sees_every_write_the_handler_made_before_it() {
-    let bump = block(
-        vec![discard(callv(
-            "cell_set",
-            vec![
-                var("c"),
-                bin(BinOp::Add, callv("cell_get", vec![var("c")]), int(1)),
-            ],
-        ))],
-        Some(bin(
-            BinOp::Eq,
-            bin(BinOp::Rem, callv("cell_get", vec![var("c")]), int(2)),
-            int(0),
-        )),
-    );
-    let kept = handle(
-        callv(
-            "filter",
-            vec![
-                list(vec![int(10), int(20), int(30), int(40)]),
-                lam(&["x"], perform("state", "get", None, vec![])),
-            ],
-        ),
-        vec![clause("state", "get", None, &[], bump)],
-    );
-    let e = with_cell(
-        "s",
-        int(0),
-        "c",
-        block(
-            vec![letv("kept", kept)],
-            Some(bin(
-                BinOp::Add,
-                bin(BinOp::Mul, callv("len", vec![var("kept")]), int(100)),
-                callv("cell_get", vec![var("c")]),
-            )),
-        ),
-    );
-    assert_eq!(run(vec![state()], e).unwrap().render(), "204");
-}
-
-#[test]
-fn a_fold_function_may_perform_and_the_accumulator_still_threads() {
-    let e = handle(
-        callv(
-            "fold",
-            vec![
-                list(vec![int(1), int(2), int(3)]),
-                int(0),
-                lam(
-                    &["acc", "x"],
-                    bin(
-                        BinOp::Add,
-                        bin(BinOp::Add, var("acc"), var("x")),
-                        perform("state", "get", None, vec![]),
-                    ),
-                ),
-            ],
-        ),
-        vec![clause("state", "get", None, &[], int(100))],
-    );
-    assert_eq!(run(vec![state()], e).unwrap().render(), "306");
-}
-
-#[test]
-fn an_assertion_inside_a_callback_keeps_its_structured_failure() {
-    let e = callv(
-        "map",
-        vec![
-            list(vec![int(1), int(2)]),
-            lam(&["x"], callv("assert_eq", vec![var("x"), int(1)])),
-        ],
-    );
-    let d = run(Vec::new(), e).unwrap_err();
-    assert_eq!(d.code, codes::ASSERTION_FAILED);
-    assert_eq!(d.message, "assertion failed: expected 1, found 2");
-    assert!(
-        d.notes.contains(&"actual:   2".to_string()),
-        "{:?}",
-        d.notes
-    );
 }
 
 #[test]

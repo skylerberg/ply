@@ -4,7 +4,6 @@ mod fixture;
 
 mod constant_memo;
 mod determinism_audit;
-mod differential_corpus;
 mod hoist_staleness_audit;
 mod host_boundary;
 mod host_linearity_audit;

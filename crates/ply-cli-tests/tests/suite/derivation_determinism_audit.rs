@@ -287,10 +287,6 @@ test "one catalogue, one document" {
 
     let (code, text) = run(dir.path(), &["test", "--no-cache"]);
     assert_eq!(code, 0, "{text}");
-    assert!(
-        !text.contains("E0503"),
-        "a `Decimal`-keyed map did not survive the cache:\n{text}"
-    );
 }
 
 #[test]

@@ -161,8 +161,8 @@ fn a_non_error_severity_is_still_a_failure() {
 }
 
 #[test]
-fn an_engine_divergence_is_a_defect_in_ply() {
-    let (defect, status, verdict) = classified(codes::ENGINE_DIVERGENCE);
+fn a_simulation_divergence_is_a_defect_in_ply() {
+    let (defect, status, verdict) = classified(codes::SIMULATION_DIVERGENCE);
     assert!(defect, "a divergence is Ply's fault, not the program's");
     assert_eq!(status, Status::Panicked);
     assert_eq!(verdict, Verdict::NotAttempted(Skipped::Panicked));

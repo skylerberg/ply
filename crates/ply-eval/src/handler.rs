@@ -9,7 +9,6 @@ use crate::value::Value;
 use crate::window::Windows;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_ty::Mode;
-use ply_ty::{EffectAtom, Resource};
 use std::rc::Rc;
 
 /// The machine's states minus `Halt`, which no handler transition produces.
@@ -34,21 +33,6 @@ pub enum OpDecl {
     Declared { resource_param: bool, mode: Mode },
     NoSuchOp,
     UnknownEffect,
-}
-
-pub fn performed_atom(
-    effect: &Symbol,
-    resource: Option<&Symbol>,
-    decl: OpDecl,
-) -> Option<EffectAtom> {
-    let OpDecl::Declared { mode, .. } = decl else {
-        return None;
-    };
-    let resource = match resource {
-        Some(r) => Resource::Named(r.clone()),
-        None => Resource::Singleton,
-    };
-    Some(EffectAtom::new(effect.clone(), resource, mode))
 }
 
 pub struct Transition {

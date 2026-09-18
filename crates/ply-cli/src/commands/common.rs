@@ -244,28 +244,45 @@ pub fn report_bind_error(
     EXIT_COMPILE_ERROR
 }
 
-pub fn describe_schema(loaded: &crate::load::Loaded, hosts: &mut crate::hosts::Hosts) {
+pub fn describe_schema(
+    hosts: &mut crate::hosts::Hosts,
+    constant: &dyn Fn(&str) -> Result<ply_eval::Value, Diagnostic>,
+) {
     let Some(name) = hosts.schema_function().map(str::to_string) else {
         return;
     };
-    hosts.describe_schema(materialise_schema(loaded, &name));
+    hosts.describe_schema(materialise_schema(&name, constant));
 }
 
 pub fn materialise_schema(
-    loaded: &crate::load::Loaded,
     name: &str,
+    constant: &dyn Fn(&str) -> Result<ply_eval::Value, Diagnostic>,
 ) -> Option<crate::db::schema::Shape> {
-    let def = loaded
-        .check
-        .defs
-        .values()
-        .find(|d| d.name.as_str() == name)?;
-    // A pure const read before the run, so the pure applier evaluates it without a compiled tier.
-    ply_eval::interp::Pure::new(&loaded.program, &loaded.resolved)
-        .call(name, Vec::new(), def.span, 10_000)
+    constant(name)
         .ok()
         .as_ref()
         .and_then(crate::db::schema::shape_of)
+}
+
+/// A pure nullary definition entered on `provider`'s unit: how a schema function is evaluated.
+pub fn enter_constant(
+    provider: Option<&'static dyn ply_eval::Provider>,
+    name: &str,
+) -> Result<ply_eval::Value, Diagnostic> {
+    let spec = ply_eval::BackendSpec {
+        kind: ply_eval::BackendKind::C,
+        ..Default::default()
+    };
+    let name = ply_span::Symbol::new(name);
+    let entered = match provider {
+        Some(provider) => provider.attach(&spec).enter_whole(&name, &[], 10_000),
+        None => ply_eval::Entered::Declined,
+    };
+    match entered {
+        ply_eval::Entered::Answered(value) => Ok(value),
+        ply_eval::Entered::Raised(raised) => Err(raised),
+        ply_eval::Entered::Declined => Err(ply_eval::err_not_compiled(&name, Span::DUMMY)),
+    }
 }
 
 /// The one place a `--json` command writes to stdout.

@@ -1,5 +1,4 @@
-use ply_eval::interp::Pure;
-use ply_eval::{DEFAULT_MAX_CALLS, Value};
+use ply_eval::{Compiled, DEFAULT_MAX_CALLS, Entered, Value};
 use ply_prove::property::{
     EDGE_CASES, EDGE_INTS, GenStream, Judge, TypeWorld, Ungeneratable, draw_cases, generatable,
     generate, run_property,
@@ -14,9 +13,11 @@ use ply_syntax::resolve::Resolved;
 use ply_ty::DefHash;
 use ply_ty::prelude;
 use ply_ty::{CheckOutput, EffectAtom, LawBinder, Resource, Row, RowVar, TyVar, Type};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::rc::Rc;
 
 pub(crate) struct Fixture {
+    source: String,
     program: Program,
     resolved: Resolved,
     check: CheckOutput,
@@ -36,6 +37,7 @@ impl Fixture {
         .unwrap_or_else(|e| panic!("the fixture must typecheck: {e:#}"))
         .check;
         Fixture {
+            source: src.to_string(),
             program,
             resolved,
             check,
@@ -46,8 +48,14 @@ impl Fixture {
         TypeWorld::new(self.check.ctors.values())
     }
 
-    fn pure(&self) -> Pure<'_> {
-        Pure::new(&self.program, &self.resolved)
+    /// Leaks the unit, as every tier does.
+    fn tier(&self) -> Rc<ply_codegen::Bodies> {
+        let name = self.program.modules[0].name.to_string();
+        let texts = HashMap::from([(name, self.source.clone())]);
+        ply_codegen::Unit::over_with_texts(&self.program, &self.resolved, texts)
+            .expect("this host has a C compiler")
+            .bodies()
+            .expect("the unit builds")
     }
 }
 
@@ -65,6 +73,15 @@ pub(crate) fn binder(name: &str, ty: Type) -> LawBinder {
 
 fn con(name: &str) -> Type {
     Type::Con(Symbol::new(name), Vec::new())
+}
+
+/// `name` entered whole on the tier, which applies the generated functions among `args`.
+fn apply(tier: &ply_codegen::Bodies, name: &str, args: Vec<Value>) -> Result<Value, Diagnostic> {
+    match tier.enter_whole(&Symbol::new(name), &args, DEFAULT_MAX_CALLS) {
+        Entered::Answered(value) => Ok(value),
+        Entered::Raised(d) => Err(d),
+        Entered::Declined => panic!("the tier declined `{name}`"),
+    }
 }
 
 fn draw(ty: &Type, world: &TypeWorld, cases: u32) -> Vec<Value> {
@@ -386,26 +403,13 @@ fn a_generated_function_is_total_pure_and_deterministic() {
         ret: Box::new(Type::int()),
         effects: Row::empty(),
     };
-    let mut applied = 0;
+    let tier = fixture.tier();
+    let mut applied = 0u64;
     for f in draw(&ty, &world, 40) {
         for x in [-3i64, 0, 1, 7, i64::MAX] {
-            let mut machine = fixture.pure();
-            let first = machine
-                .call(
-                    "apply1",
-                    vec![f.clone(), Value::Int(x)],
-                    Span::DUMMY,
-                    DEFAULT_MAX_CALLS,
-                )
+            let first = apply(&tier, "apply1", vec![f.clone(), Value::Int(x)])
                 .unwrap_or_else(|d| panic!("a generated function must be total: {d:?}"));
-            let mut machine = fixture.pure();
-            let second = machine
-                .call(
-                    "apply1",
-                    vec![f.clone(), Value::Int(x)],
-                    Span::DUMMY,
-                    DEFAULT_MAX_CALLS,
-                )
+            let second = apply(&tier, "apply1", vec![f.clone(), Value::Int(x)])
                 .expect("a generated function must be total");
             assert_eq!(first.render(), second.render());
             assert!(matches!(first, Value::Int(_)));
@@ -413,6 +417,11 @@ fn a_generated_function_is_total_pure_and_deterministic() {
         }
     }
     assert!(applied > 0);
+    assert_eq!(
+        tier.entered(),
+        2 * applied,
+        "an application ran off the tier"
+    );
 }
 
 #[test]
@@ -424,20 +433,15 @@ fn a_generated_function_over_a_compound_argument_applies() {
         ret: Box::new(Type::bool()),
         effects: Row::empty(),
     };
+    let tier = fixture.tier();
     for f in draw(&ty, &world, 24) {
         for x in ["", "a", "hello"] {
-            let mut machine = fixture.pure();
-            let answer = machine
-                .call(
-                    "apply_str",
-                    vec![f.clone(), Value::str(x)],
-                    Span::DUMMY,
-                    DEFAULT_MAX_CALLS,
-                )
+            let answer = apply(&tier, "apply_str", vec![f.clone(), Value::str(x)])
                 .unwrap_or_else(|d| panic!("a generated function must be total: {d:?}"));
             assert!(matches!(answer, Value::Bool(_)));
         }
     }
+    assert_eq!(tier.entered(), 24 * 3, "an application ran off the tier");
 }
 
 #[test]
