@@ -1,25 +1,9 @@
 #!/usr/bin/env bash
-#
 # The tables CI's test jobs are cut from, and the check that the cut is total.
 #
-# The suite is built once, as a nextest archive of every workspace member, and
-# run by many short jobs at once: a fixed number of partitions that each take a
-# slice of the tests, one job per test that has to run alone on a runner of its
-# own, one for the tests that have to be seen to run, one for the postgres
-# suites, and one for the scripts that drive a `ply` binary. A job's wall clock
-# is the archive's build plus the slowest test in it, so the tables here are cut
-# on run time, and the archive is what makes "every member is tested" a
-# property of `cargo nextest archive --workspace` rather than of a table.
-#
-# What a table can still get wrong is losing a *test* silently: a test named
-# here that nothing defines selects nothing and says nothing. `verify` fails on
-# that, on a crate no member reaches, and on a probe with no required job.
-#
-#   ci-shards.sh verify          every crate is a member or listed as not one,
-#                                every test named here exists where the table
-#                                says, and every directory under `probes/` is
-#                                run by a named CI job that the `ci` aggregate
-#                                requires
+#   ci-shards.sh verify          every crate is a member, every test named here
+#                                exists, and every `probes/` directory is run by
+#                                a job the `ci` aggregate requires
 #   ci-shards.sh partitions      the JSON matrix of partition slices
 #   ci-shards.sh solo-matrix     the JSON matrix of tests that run alone
 #   ci-shards.sh solo-filter ID  the nextest filterset selecting one solo test
@@ -35,36 +19,9 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
-# How many jobs the partitioned tests are cut across. nextest's `slice:m/n`
-# deals tests round-robin after the filters, so tests of one binary spread
-# across partitions rather than landing in one.
-#
-# Eight was chosen when a runner arrived for each job about eight seconds after
-# the last, which put the last partition some 8n seconds after `build` and made
-# the wall smallest near the square root of the work over eight.
-#
-# Two runs measured on 2026-09-17 do not show that arrival: every job but one
-# started within two seconds of the others, and the one that did not started
-# 35 s late and set the wall by itself. The constant is kept -- two runs are not
-# enough to move a tuning number -- but what bounds it now is the half minute of
-# setup and the 28 s object-cache restore each job pays, not the arrivals. ADR
-# 0052 §3 holds the readings.
 PARTITIONS=8
 
-# Tests that get a runner of their own, as `id:package:target:test`. Each runs
-# the emitter over the compiler's own sources and, by `.config/nextest.toml`,
-# with every test thread and nothing beside it -- so in a partition it would
-# be that partition's whole floor. `verify` fails when a name here is not
-# defined where the table says, and every solo job asserts that it ran exactly
-# one test.
-#
-# A test beside one of these that is *not* named here still runs, in a
-# partition, alone within it: the override in `.config/nextest.toml` is on the
-# binary, or on the `emit_diff` module of the differentials' `suite`. Naming it
-# here only moves it to a runner of its own, which is worth a job once it is the
-# longest thing a partition would hold; the other emitter differentials came
-# down to seconds when they stopped spawning `ply` (#244) and went back to the
-# partitions.
+# Tests that get a runner of their own, as `id:package:target:test`.
 SOLO=(
   "bootstrap:ply-codegen-tests:bootstrap:the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds"
   "compiler-on-the-tier:ply-cli-tests:suite:corpus::the_compiled_tier_runs_the_compilers_own_tests_as_the_only_engine"
@@ -72,63 +29,22 @@ SOLO=(
   "archive-tree-moved:ply-cli-tests:suite:bootstrap_archive::an_archive_stops_describing_a_tree_that_moved"
   "corpus-session:ply-cli-tests:suite:incremental::the_example_corpus_agrees_across_a_session"
   "corpus-session-audit:ply-cli-tests:suite:incremental_audit::a_long_session_over_the_example_corpus_agrees_at_every_step"
-  # 9.6 s when it checked with `ply_core`, 52 s once it asked the port (ADR 0052
-  # §1), which is the front end it now measures rather than a regression. That
-  # put it 42 s above every other test in its partition and made whichever slice
-  # held it the run's pole. It needs a runner, not the threads: no override in
-  # `.config/nextest.toml`, unlike the two above it that hold the whole pool.
   "parser-census:ply-codegen-tests:suite:parser_census::the_census_over_the_parser_spike"
 )
 
-# The packages whose tests need a postgres server and cluster binaries. They
-# skip -- passing -- without them, so the partitions leave them to the job that
-# has both and asserts the gates are open.
+# Their tests skip, passing, without a postgres server; only `test-postgres` runs them.
 POSTGRES_PACKAGES=(ply-host-tests)
 
-# `crates/ply-cli-tests/tests/suite/w5_shutdown.rs` is `#![cfg(unix)]`: on any
-# other host it compiles to nothing and prints nothing. The gates job runs it by
-# name and asserts the log names it, which a partition could not do for a module
-# dealt across ten of them.
+# `#![cfg(unix)]`, so the gates job asserts it ran.
 W5_FILTER='binary_id(=ply-cli-tests::suite) & test(/^w5_shutdown::/)'
 
-# Crate directories that are deliberately not workspace members, and why. A
-# crate in neither this list nor `members` is an accident: nothing builds it and
-# no job tests it, which is the failure this file exists to prevent.
-# Expanded as ${KNOWN_OUTSIDE[@]+...} everywhere below: bash 3.2, which is
-# /bin/bash on macOS, treats "${empty[@]}" as unset under `set -u`, and this
-# list is meant to stay empty.
+# Crate directories that are deliberately not workspace members, as `name:why`.
+# Expanded as ${KNOWN_OUTSIDE[@]+...}: bash 3.2 treats an empty array as unset under `set -u`.
 declare -a KNOWN_OUTSIDE=(
 )
 
-# Tests that fail on a property of the *tree* rather than of a run, as
-# `package:target:test`, where `target` is an integration test binary or the
-# literal `lib` for a unit test. Names are matched exactly, so a unit test is
-# named by its full module path.
-#
-# Not "gates" in the sense §"There is CI" uses that word — those are
-# dependencies that make a suite skip silently. These are checks whose subject
-# is the source tree itself.
-#
-# They are already inside the partitions' run of `ply-span-tests`. They are
-# named here as well for one reason: a check that stops running reports
-# nothing, and reporting nothing is indistinguishable from passing. `verify`
-# fails when a name here is not defined in the file this table says, and the
-# gates job runs each by exact name and asserts it actually ran — so renaming
-# one, deleting it, or filtering it away turns CI red instead of quietly
-# reducing what CI checks.
-#
-# All seven are in `crates/ply-span-tests/tests/armed.rs`. Six of them are one defect:
-# a mechanism declared and registered everywhere a reader would look for it and
-# constructed nowhere. CONTRIBUTING.md s"The shape it keeps taking: declared,
-# registered, raised nowhere" has the catalogue; that file's header has the rule
-# and the list of what it does not cover.
-#
-# The seventh, `no_two_adrs_share_a_number`, is a different kind and was added
-# in ad74275: its subject is the `docs/adr/` filenames rather than a mechanism
-# in the source. It sits here because the file it lives in is the tree-check
-# file and the reason for naming it here is identical -- a check that stops
-# running reports nothing. This comment said "all six" for two commits after it
-# landed, which is the staleness this table exists to make expensive.
+# Checks on the tree, as `package:target:test` (`target` is `lib` for a unit test, named by full
+# module path). The gates job asserts each ran, since a check that stops running reports nothing.
 TREE_CHECKS=(
   "ply-span-tests:armed:every_registered_code_is_constructed_in_production"
   "ply-span-tests:armed:every_variant_of_a_covered_enum_is_constructed_in_production"
@@ -136,22 +52,9 @@ TREE_CHECKS=(
   "ply-span-tests:armed:the_code_registry_table_is_total_over_the_codes_module"
   "ply-span-tests:armed:no_allowlist_entry_has_outlived_its_reason"
   "ply-span-tests:armed:ambiguous_enum_names_are_declared"
-  "ply-span-tests:armed:no_two_adrs_share_a_number"
 )
 
-# Directories that hold code no cargo build reaches, and the CI job that runs each.
-#
-# `KNOWN_OUTSIDE` above exists because a crate outside the workspace is a crate nothing builds,
-# and it happened twice here: `crates/ply-compiler` and `crates/ply-compiler-diff` each sat
-# outside the cargo workspace with their own `[workspace]`, and the first was in **no CI job at
-# all** while its `README.md` predicted in writing that it would bit-rot -- and it did. Four
-# language features landed, its differential went red on 28 of 763 inputs (70.2% of the corpus
-# by bytes) and nothing said so for two days. Both are members now, and this list is down to
-# what is genuinely not Rust.
-#
-# Each entry is `dir:job`, and `verify` fails unless the job exists in `.github/workflows/ci.yml`
-# **and** is named in the `ci` aggregate job's `needs:` list -- because a job that nothing needs is
-# not required, and the `ci` job's own comment is what says a skipped job is not a green tick.
+# `probes/` directories no cargo build reaches, as `dir:job`; the job must be in `ci`'s `needs`.
 declare -a PROBE_JOBS=(
   "ucontext:ucontext-probe"
 )
@@ -232,15 +135,11 @@ cmd_tree_check_filter() {
   printf '\n'
 }
 
-# What the gates job runs: the shutdown suite, and the tree checks by name. The
-# tree checks run in a partition as well; here they are asserted to have run.
 cmd_gate_filter() {
   printf '%s | %s\n' "$W5_FILTER" "$(cmd_tree_check_filter)"
 }
 
-# What a partition leaves to the other jobs. The solo tests are excluded by
-# name, so a test that joins one of those binaries later is still run -- in a
-# partition, alone within it -- rather than lost.
+# Solo tests are excluded by name, so a new test in one of their binaries still runs in a partition.
 cmd_exclude_filter() {
   printf '%s | %s | %s\n' "$(cmd_solo | cut -d' ' -f2- | filter_of)" "$W5_FILTER" "$(cmd_postgres_filter)"
 }
@@ -266,8 +165,7 @@ cmd_solo_matrix() {
   printf ']}\n'
 }
 
-# Workspace members, read out of `Cargo.toml` as text. Read rather than asked of cargo so that a
-# manifest cargo refuses to parse fails here too, with the manifest named.
+# Workspace members under `crates/`, read out of `Cargo.toml` as text.
 members() {
   local manifest="$root/Cargo.toml" found
   if [[ ! -f $manifest ]]; then
@@ -283,10 +181,6 @@ members() {
   printf '%s\n' "$found"
 }
 
-# Workspace members that do not live under `crates/`, read out of the same block.
-# `members` deliberately returns only the `crates/` ones; nothing below it is
-# shaped for a member elsewhere, so they are checked separately rather than by
-# widening that pattern.
 members_outside_crates() {
   sed -n '/^members = \[/,/^]/p' "$root/Cargo.toml" |
     sed -n 's#.*"\([^"]*\)".*#\1#p' |
@@ -329,10 +223,6 @@ cmd_verify() {
   while read -r member; do all_members+=("$member"); done < <(members)
 
   # --- crates --------------------------------------------------------------
-  #
-  # A `-tests` package is tests only, compiled at `opt-level = 0` by an override
-  # the root manifest has to carry; and every directory under `crates/` is a
-  # member or is listed here as deliberately not one.
   for member in "${all_members[@]}"; do
     [[ $member == *-tests ]] || continue
     if [[ -d "$root/crates/$member/src" ]]; then
@@ -386,12 +276,6 @@ cmd_verify() {
   done
 
   # --- members outside `crates/` --------------------------------------------
-  #
-  # Nothing below `members` is shaped for one, and no partition names one, so what
-  # keeps such a member compiling is a workspace-wide lint leg. The workflow header
-  # records that lint does not gate the expensive jobs and that the `ci` aggregate
-  # is where it is required -- so that `needs` entry is the whole of the coverage,
-  # and this is the check that it is still there.
   local outside
   while read -r outside; do
     [[ -n $outside ]] || continue
@@ -425,17 +309,13 @@ cmd_verify() {
     echo "FAIL: W5_FILTER names crates/ply-cli-tests/tests/suite/w5_shutdown.rs, which does not exist" >&2
     failures=$((failures + 1))
   fi
-  # Cargo builds a package's binaries only for that package's own integration
-  # tests, and the suite that drives `ply` is in `ply-cli-tests`.
+  # Cargo builds `ply` for ply-cli-tests only if ply-cli has an integration test of its own.
   if ! ls "$root"/crates/ply-cli/tests/*.rs >/dev/null 2>&1; then
     echo "FAIL: crates/ply-cli/tests/ has no .rs file, so cargo builds no 'ply' for ply-cli-tests' suite to run" >&2
     failures=$((failures + 1))
   fi
 
   # --- probes ---------------------------------------------------------------
-  #
-  # Is every directory accounted for, does every job this table names exist,
-  # and is it actually required.
   local workflow="$root/.github/workflows/ci.yml"
   local -a probe_listed=()
   local probe job needs block
@@ -443,10 +323,7 @@ cmd_verify() {
     echo "FAIL: no workflow at $workflow, so no probe job can be checked" >&2
     failures=$((failures + 1))
   fi
-  # The `needs:` list of the `ci` aggregate job, read by joining the whole
-  # `ci:` block onto one line first, because the list wraps across lines. The
-  # `exit` on the next job-level key keeps this reading `ci`'s list and not a
-  # later job's, if `ci` ever stops being last.
+  # The `ci` job's `needs:` list, which wraps across lines.
   needs=$(awk '/^  ci:/{f=1;next} f && /^  [a-z]/{exit} f' "$workflow" 2>/dev/null |
     tr '\n' ' ' | sed -n 's/.*needs: *\(\[[^]]*\]\).*/\1/p')
   if [[ -z $needs ]]; then
@@ -469,11 +346,7 @@ cmd_verify() {
     if ! grep -q "^  $job:\$" "$workflow"; then
       echo "FAIL: PROBE_JOBS says job '$job' runs probes/$probe, and $workflow defines no such job" >&2
       failures=$((failures + 1))
-    # A job that exists and is required still proves nothing unless it runs
-    # *this* directory: watched to fail 2026-08-30 by making exactly that
-    # substitution. The block is matched with `[[ == * ]]` rather than piped
-    # into `grep -q`, which under `pipefail` reads backwards when it exits at
-    # its first match.
+    # `[[ == * ]]`, not `grep -q`: under pipefail an early-exiting grep fails the pipe.
     else
       block=$(awk -v j="  $job:" '$0 == j {f = 1; next} f && /^  [a-z]/ {exit} f' "$workflow")
       if [[ $block != *"probes/$probe/run.sh"* ]]; then
@@ -481,8 +354,7 @@ cmd_verify() {
         failures=$((failures + 1))
       fi
     fi
-    # Whole word: a substring test passes `probe` against a `needs:` holding
-    # only `ucontext-probe`, which is the same false green one directory down.
+    # Whole word, so `probe` does not match `ucontext-probe`.
     if [[ " ${needs//[][,]/ } " != *" $job "* ]]; then
       echo "FAIL: job '$job' is not in the \`ci\` job's needs list, so it is not required and a green tick can be reported over it never having run" >&2
       failures=$((failures + 1))
@@ -496,7 +368,7 @@ cmd_verify() {
         [[ $candidate == "$probe" ]] && seen=$((seen + 1))
       done
       if [[ $seen -eq 0 ]]; then
-        echo "FAIL: probes/$probe is in no CI job, so nothing in CI runs it -- which is exactly how crates/ply-compiler rotted" >&2
+        echo "FAIL: probes/$probe is in no CI job, so nothing in CI runs it" >&2
         failures=$((failures + 1))
       elif [[ $seen -gt 1 ]]; then
         echo "FAIL: probes/$probe is listed $seen times" >&2

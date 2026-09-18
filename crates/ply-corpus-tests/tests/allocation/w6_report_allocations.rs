@@ -79,7 +79,7 @@ fn the_shipped_allocation_evidence_still_describes_this_request_path() {
     );
 }
 
-/// The figures `w6-alloc` wrote, which `README.md`'s sentence is rendered from.
+/// The figures `w6-alloc` wrote.
 fn shipped_figures() -> ply_corpus::w6_run::Allocation {
     let path = repo().join(ply_corpus::w6_run::ALLOCATION_FILE);
     let text = std::fs::read_to_string(&path)
@@ -88,8 +88,8 @@ fn shipped_figures() -> ply_corpus::w6_run::Allocation {
         .unwrap_or_else(|e| panic!("{} is what `w6-alloc --out` writes: {e}", path.display()))
 }
 
-const RETAKE: &str = "Re-take it in one command, which rewrites `README.md`'s sentence too: \
-                      `./target/release/w6-alloc --repo . --requests 200 --out benches/w6-alloc.json`.";
+const RETAKE: &str =
+    "Re-take it: `./target/release/w6-alloc --repo . --requests 200 --out benches/w6-alloc.json`.";
 
 /// What the shipped figures say a request allocates, against what one does.
 #[test]
@@ -118,18 +118,4 @@ fn the_shipped_figures_still_describe_this_request_path() {
             drift * 100.0
         );
     }
-}
-
-/// `README.md` carries the sentence the shipped figures render, so a figure in prose is never
-/// typed by hand: the file moves, the sentence moves with it, and this is what says they did.
-#[test]
-fn the_readme_sentence_is_the_one_the_shipped_figures_render() {
-    let text = std::fs::read_to_string(repo().join("README.md")).expect("the repository ships one");
-    let want = shipped_figures().readme_sentence();
-    let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        flat(&text).contains(&flat(&want)),
-        "`README.md` does not carry the sentence `{}` renders:\n  {want}\n{RETAKE}",
-        ply_corpus::w6_run::ALLOCATION_FILE
-    );
 }

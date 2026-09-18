@@ -1,5 +1,4 @@
-//! Name resolution over a whole [`Program`], done once so that inference, hashing and evaluation
-//! cannot disagree about what a name means.
+//! Name resolution over a whole [`Program`], done once so every later phase agrees on a name.
 
 use crate::ast::{
     Ident, ImportDecl, ImportKind, Item, Module, ModuleName, Program, QName, TypeDefBody,
@@ -9,7 +8,6 @@ use indexmap::IndexMap;
 use indexmap::map::Entry;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 
-/// Ply's three name spaces.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Namespace {
     Value,
@@ -29,13 +27,11 @@ impl Namespace {
     pub const ALL: [Namespace; 3] = [Namespace::Value, Namespace::Type, Namespace::Effect];
 }
 
-/// A name a module declares, whether or not it exports it.
 #[derive(Clone, Debug)]
 pub struct Declared {
     /// The program-wide name, `store.orders.place`.
     pub qualified: Symbol,
     pub vis: Visibility,
-    /// Where the item is declared, for a "defined here, but private" label.
     pub span: Span,
 }
 
@@ -67,7 +63,6 @@ impl Declarations {
         }
     }
 
-    /// The names another module may name through `binder::name`.
     pub fn exported(&self, ns: Namespace) -> impl Iterator<Item = &Symbol> {
         self.space(ns)
             .iter()
@@ -76,8 +71,7 @@ impl Declarations {
     }
 }
 
-/// A [`Declared`] as seen from a module that can use it unqualified — its own, or one that imported
-/// it selectively.
+/// A [`Declared`] as seen from a module that can use it unqualified.
 #[derive(Clone, Debug)]
 pub struct Binding {
     pub qualified: Symbol,
@@ -87,7 +81,6 @@ pub struct Binding {
     pub span: Span,
 }
 
-/// Every name a module declares, as a [`Binding`].
 #[derive(Clone, Debug, Default)]
 pub struct Bindings {
     pub values: IndexMap<Symbol, Binding>,
@@ -119,8 +112,7 @@ pub struct Scope {
     pub module: ModuleName,
     /// Module binder -> index into [`Program::modules`].
     pub modules: IndexMap<Symbol, (usize, Span)>,
-    /// Modules this file imported names from without binding them as a module, keyed by the binder
-    /// such an import would *not* introduce.
+    /// Selectively imported modules, keyed by the binder such an import does *not* introduce.
     pub selective: IndexMap<Symbol, (usize, Span)>,
     pub values: IndexMap<Symbol, Binding>,
     pub types: IndexMap<Symbol, Binding>,
@@ -185,8 +177,7 @@ impl Resolved {
         self.declared[owner].get(ns, q.symbol())
     }
 
-    /// A bare name must already have failed local lookup — locals are not in scope here and win
-    /// unconditionally.
+    /// Call only after local lookup fails: locals are not in scope here and always win.
     pub fn lookup(&self, module: usize, ns: Namespace, q: &QName) -> Result<&Binding, Diagnostic> {
         let Some(scope) = self.scopes.get(module) else {
             return Err(Diagnostic::error(
@@ -245,8 +236,6 @@ impl Resolved {
         d
     }
 
-    /// The first module that exports this name, for a "you meant this import" note on a bare name
-    /// that resolves nowhere.
     fn exporter_of(&self, ns: Namespace, name: &Symbol) -> Option<usize> {
         self.declarations
             .iter()
@@ -335,8 +324,6 @@ impl Resolved {
     }
 }
 
-/// Reports, per module: unknown modules, import cycles, duplicate import bindings, imports that
-/// collide with a local definition, and selective imports of a name that is missing or private.
 pub fn resolve(program: &mut Program) -> Result<Resolved, Vec<Diagnostic>> {
     let mut diags: Vec<Diagnostic> = Vec::new();
     let mut index: IndexMap<Symbol, usize> = IndexMap::new();
@@ -396,8 +383,7 @@ pub fn resolve(program: &mut Program) -> Result<Resolved, Vec<Diagnostic>> {
         diags.push(cycle_diagnostic(program, cycle));
     }
 
-    // Only with a consistent set of tables: expansion resolves names through them, and a program
-    // with a duplicate module or an import cycle has none it could trust.
+    // Expansion resolves names through these tables, which a duplicate module or a cycle poisons.
     if !diags.is_empty() {
         return Err(diags);
     }
@@ -431,13 +417,11 @@ fn declarations_of(module: &Module) -> Declarations {
                 declare(&mut out, Namespace::Type, module, &def.name, vis);
                 if let TypeDefBody::Sum(variants) = &def.body {
                     for variant in variants {
-                        // A type you can name but cannot match on is not a useful export, so a
-                        // constructor is as public as it is.
+                        // A constructor is as public as its type: an unmatchable type is no use.
                         declare(&mut out, Namespace::Value, module, &variant.name, vis);
                     }
                 }
             }
-            // None declares a name a reference could reach.
             Item::Test(_) | Item::Law(_) | Item::Derive(_) | Item::EffectSet(_) => {}
         }
     }
@@ -669,8 +653,7 @@ impl ScopeBuilder<'_> {
         }
     }
 
-    /// Local-wins was rejected deliberately: adding a local `place` beside `import m (place)` would
-    /// silently steal every existing call site.
+    /// Not local-wins: a new local beside `import m (place)` would silently steal every call site.
     fn ambiguous(&mut self, name: &Ident, ns: Namespace, local: Span, module: &ModuleName) {
         self.diags.push(
             Diagnostic::error(
@@ -712,12 +695,10 @@ impl ScopeBuilder<'_> {
 
 struct Cycle {
     nodes: Vec<usize>,
-    /// The import that closed it — the one worth pointing at.
     closing: Span,
 }
 
-/// One iterative DFS: it finds every cycle and, when there is none, leaves a postorder that is
-/// exactly the dependency-first load order.
+/// One iterative DFS: every cycle, and when there is none a postorder that is the load order.
 fn traverse(edges: &[Vec<(usize, Span)>]) -> (Vec<Cycle>, Vec<usize>) {
     #[derive(Clone, Copy, PartialEq)]
     enum Color {
@@ -775,8 +756,7 @@ fn traverse(edges: &[Vec<(usize, Span)>]) -> (Vec<Cycle>, Vec<usize>) {
     (cycles, order)
 }
 
-/// Rotated so the smallest index leads: the same cycle reached from two roots must compare equal,
-/// or it would be reported twice.
+/// Smallest index first, so one cycle reached from two roots is reported once.
 fn canonical(nodes: &[usize]) -> Vec<usize> {
     let Some(at) = nodes
         .iter()

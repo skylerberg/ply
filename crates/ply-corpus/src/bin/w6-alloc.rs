@@ -64,20 +64,9 @@ fn main() -> anyhow::Result<()> {
 
     let rendered = format!("{}\n", serde_json::to_string_pretty(&figures)?);
     print!("{rendered}");
-    // The file is the figure and the README's sentence is rendered from it, in one command, so
-    // the two cannot be re-taken apart.
     if let Some(out) = out {
         std::fs::write(&out, rendered)?;
-        let readme = repo.join("README.md");
-        let text = std::fs::read_to_string(&readme)?;
-        let Some(text) = figures.rewrite_readme(&text) else {
-            anyhow::bail!(
-                "{} carries no request-path sentence to rewrite",
-                readme.display()
-            );
-        };
-        std::fs::write(&readme, text)?;
-        eprintln!("wrote {} and {}", out.display(), readme.display());
+        eprintln!("wrote {}", out.display());
     }
     Ok(())
 }

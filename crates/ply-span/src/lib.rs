@@ -212,243 +212,155 @@ pub mod codes {
     pub const DUPLICATE_IMPORT: &str = "E0110";
     pub const INVALID_MODULE_PATH: &str = "E0111";
     pub const AMBIGUOUS_ENTRY_POINT: &str = "E0112";
-    /// A project file whose path would name a module under a root the language reserves — `std`
-    /// today.
+    /// A project file whose path would name a module under a reserved root such as `std`.
     pub const RESERVED_MODULE_NAME: &str = "E0113";
     /// A row, or an `effect set` body, naming a set the module does not declare.
     pub const UNKNOWN_EFFECT_SET: &str = "E0114";
-    /// An `effect set` that contains itself, directly or through another.
     pub const EFFECT_SET_CYCLE: &str = "E0115";
     /// The base of a record update `{..b, f: e}` has no record shape this module can name.
     pub const RECORD_UPDATE_SHAPE: &str = "E0116";
-    /// A record update names a field the base does not have.
     pub const RECORD_UPDATE_FIELD: &str = "E0117";
-    /// A `?` whose enclosing function has no return type this file can read as `Result` or
-    /// `Option`, so the expansion has no constructors to name.
+    /// A `?` whose enclosing function's return type is not readable as `Result` or `Option`.
     pub const TRY_SCOPE: &str = "E0118";
-    /// A `?` written where its early exit would change what runs, or would discard something
-    /// written.
+    /// A `?` whose early exit would change what runs or discard something written.
     pub const TRY_POSITION: &str = "E0119";
-    /// A parameter default written where no call could ever fill it in: on a lambda, on an effect
-    /// operation, or on a handler clause.
+    /// A parameter default on a lambda, an effect operation or a handler clause.
     pub const DEFAULT_NOT_ALLOWED: &str = "E0120";
     /// A parameter default that is not a pure, closed expression.
     pub const DEFAULT_NOT_PURE: &str = "E0121";
     /// A default on a `pub fn` that mentions a name the callee's module does not export.
     pub const DEFAULT_PRIVATE_NAME: &str = "E0122";
-    /// A named argument that names no parameter of the callee, or names one twice, or names one a
-    /// positional argument already filled.
+    /// A named argument naming no parameter, one named twice, or one filled positionally.
     pub const UNKNOWN_ARGUMENT_NAME: &str = "E0123";
     /// A positional argument after a named one.
     pub const ARGUMENT_ORDER: &str = "E0124";
     /// A parameter filled neither positionally nor by name, carrying no default.
     pub const MISSING_ARGUMENT: &str = "E0125";
-    /// A top-level `fn` that left a parameter type or its return type to be
-    /// inferred; the diagnostic names the type inference would have given.
+    /// A top-level `fn` that leaves a parameter or return type to inference.
     pub const MISSING_SIGNATURE: &str = "E0126";
-    /// A `reuse fn` whose body has an append the cost checker cannot show reuses its list for a
-    /// reason inside the body — the callee-side promise ADR 0034 decision 4 specifies.
+    /// A `reuse fn` with an append the cost checker cannot show reuses its list.
     pub const REUSE_BROKEN: &str = "E0127";
     pub const TYPE_MISMATCH: &str = "E0201";
     pub const ARITY_MISMATCH: &str = "E0202";
     pub const OCCURS_CHECK: &str = "E0203";
     pub const NOT_A_FUNCTION: &str = "E0204";
     pub const NON_EXHAUSTIVE_MATCH: &str = "E0205";
-    /// A type has no derivation for the deriver asked for, and the diagnostic names the field that
-    /// blocks it rather than the type as a whole.
+    /// No derivation for the requested deriver; reported at the field that blocks it.
     pub const NOT_DERIVABLE: &str = "E0206";
-    /// A `derive` or a `where` clause naming something that is not one of the derivers the language
-    /// defines.
     pub const UNKNOWN_DERIVER: &str = "E0207";
     /// A `derive` in a module other than the one declaring its target type.
     pub const ORPHAN_DERIVE: &str = "E0208";
     /// `/` applied to `Decimal`.
     pub const DECIMAL_DIVISION: &str = "E0209";
-    /// An arithmetic or ordered-comparison operand whose numeric type nothing
-    /// determines.
+    /// An arithmetic or ordered-comparison operand whose numeric type nothing determines.
     pub const NUMERIC_UNDETERMINED: &str = "E0210";
-    /// An integer literal that is not a value of the fixed-width type its context gave it.
+    /// An integer literal outside the fixed-width type its context gave it.
     pub const LITERAL_OUT_OF_RANGE: &str = "E0211";
     pub const UNBOUND_ROW_VAR: &str = "E0301";
     pub const EFFECT_NOT_PERMITTED: &str = "E0302";
     pub const UNHANDLED_EFFECT: &str = "E0303";
     pub const RESOURCE_REQUIRED: &str = "E0304";
     pub const NONDET_IN_DET_TEST: &str = "E0412";
-    /// A `Task` in a `simulate` region's result type, or a `join` of a task whose region has
-    /// already ended.
+    /// A `Task` in a `simulate` region's result, or a `join` after its region ended.
     pub const TASK_ESCAPES_SCOPE: &str = "E0413";
-    /// A simulated region made no more progress: nothing is enabled and no timer can fire, or the
-    /// per-interleaving step budget was spent.
+    /// A simulated region with nothing enabled and no timer to fire, or out of step budget.
     pub const DEADLOCK: &str = "E0414";
     /// Replaying a seed did not reproduce the recorded schedule.
     pub const SIMULATION_DIVERGENCE: &str = "E0415";
     /// A `simulate` region inside a `simulate` region, lexically or through a call.
     pub const NESTED_SIMULATION: &str = "E0416";
-    /// A `requires`, `ensures` or `where` guard whose row is not empty, or a law body whose row is
-    /// not a subset of `{sim.read}`.
+    /// An effectful `requires`/`ensures`/`where` guard, or a law body beyond `{sim.read}`.
     pub const EFFECT_IN_SPEC: &str = "E0417";
-    /// A `forall` binder whose type cannot be quantified over: no generator (`Cell`, `Task`), a
-    /// function type with a non-empty row, or an effect-row variable.
+    /// A `forall` binder type with no generator, an effectful function type, or a row variable.
     pub const UNQUANTIFIABLE_TYPE: &str = "E0418";
-    /// An obligation was refuted by a counterexample.
     pub const OBLIGATION_REFUTED: &str = "E0419";
-    /// The guard admitted no values, so the obligation is trivially valid and says nothing.
+    /// The guard admitted no values, so the obligation says nothing.
     pub const VACUOUS_OBLIGATION: &str = "E0420";
     /// A host registration names an effect, operation or resource the program does not declare.
     pub const HOST_OPERATION_UNKNOWN: &str = "E0421";
     /// Two host registrations claim one atom.
     pub const HOST_HANDLER_CONFLICT: &str = "E0422";
-    /// A host handler declares itself nondeterministic for an effect the program did not declare
-    /// `nondet`.
+    /// A host handler declared nondeterministic for an effect not declared `nondet`.
     pub const HOST_DETERMINISM_MISMATCH: &str = "E0423";
     /// An operation reached the host boundary with nothing bound.
     pub const HERMETIC_BOUNDARY: &str = "E0424";
-    /// A host operation reached from a test the search re-runs — from inside a `simulate` region,
-    /// or from the prefix or suffix around one.
+    /// A host operation reached from a test the search re-runs, in or around a `simulate`.
     pub const HOST_IN_SIMULATION: &str = "E0425";
     /// A continuation was resumed a second time across an at-most-once host operation.
     pub const HOST_CONTINUATION_RESUMED: &str = "E0426";
-    /// A host handler answered an atom outside the declared footprint of the entry point that
-    /// reached it.
+    /// A host handler answered an atom outside its entry point's declared footprint.
     pub const HOST_FOOTPRINT_ESCAPE: &str = "E0427";
     /// A handler declared `blocking: true` answered a value inline instead of a pending token.
     pub const HOST_BLOCKING_ANSWER: &str = "E0428";
     /// `net.listen_tls` named a credential the binding does not hold.
     pub const TLS_CREDENTIAL_UNKNOWN: &str = "E0429";
-    /// A `--tls` credential that does not load: the file is unreadable, the PEM does not parse, it
-    /// holds no certificate or no private key, or the key does not match the leaf certificate.
+    /// A `--tls` credential that does not load, or whose key does not match its certificate.
     pub const TLS_CREDENTIAL_INVALID: &str = "E0430";
-    /// `--host` bound the postgres driver and the run named no database, named one that does not
-    /// parse, asked for an `sslmode` W4 does not configure, or named a server that could not be
-    /// reached.
+    /// Postgres is bound but the database is unnamed, unparseable, unsupported or unreachable.
     pub const DB_NOT_CONFIGURED: &str = "E0431";
-    /// Statement text the driver refuses before preparing it: more than one statement, a construct
-    /// the table scanner cannot account for, a parameter or result type outside the pinned mapping,
-    /// or a nondeterministic function in the text where a parameter belongs.
     pub const DB_STATEMENT_REFUSED: &str = "E0432";
-    /// The server refused to prepare a statement — syntax, an unknown relation, an unknown column —
-    /// or its result description has two columns of one name or lacks a column the row codec
-    /// requires.
+    /// The server refused to prepare a statement, or its columns do not fit the row codec.
     pub const DB_PREPARE_FAILED: &str = "E0433";
-    /// A statement touches a table outside the declared footprint of the entry point that reached
-    /// it — caught at prepare time from the declared footprint the request carries, and again at
-    /// answer time from the atoms the handler reported it touched.
+    /// A statement touches a table outside its entry point's declared footprint.
     pub const DB_FOOTPRINT_UNDECLARED: &str = "E0434";
-    /// The live database differs from the schema the run named: a missing table or column, a type
-    /// outside the mapping, a nullability that disagrees, or a missing constraint.
     pub const DB_SCHEMA_MISMATCH: &str = "E0435";
-    /// A database operation performed by a task that does not own the open transaction scope.
+    /// A database operation by a task that does not own the open transaction scope.
     pub const DB_TRANSACTION_SCOPE: &str = "E0436";
-    /// No connection became available within the acquire deadline.
     pub const DB_POOL_EXHAUSTED: &str = "E0437";
-    /// The live schema carries a trigger, a rewrite rule, or a referential action that cascades —
-    /// an effect that makes one statement touch a table its own text never names, which no scanner
-    /// can see and no row can report.
+    /// The live schema has a trigger, rule or cascade touching tables no statement names.
     pub const DB_UNMODELLED_SIDE_EFFECT: &str = "E0438";
-    /// A host operation was handed a value containing a `Secret` and its registration does not
-    /// declare that it may receive one.
+    /// A `Secret` passed to a host operation whose registration does not accept one.
     pub const SECRET_TO_HOST: &str = "E0439";
-    /// A configuration source the run named could not be read: a `--config` file that is
-    /// unreadable, a line that is not `KEY=VALUE`, an empty key, a key that is not an identifier,
-    /// or a `--set` of the same shape.
+    /// A `--config` file or `--set` that cannot be read or is not `KEY=VALUE`.
     pub const CONFIG_UNAVAILABLE: &str = "E0440";
     /// A key the run's `--config-schema` marks `required` that no source supplies.
     pub const CONFIG_MISSING: &str = "E0441";
-    /// A resolved configuration value that does not satisfy its declared shape.
     pub const CONFIG_INVALID: &str = "E0442";
-    /// A deployable artifact that does not verify: the header, the section table, the program
-    /// digest, a definition body against the hash it is filed under, or a reference to a hash the
-    /// artifact does not carry.
+    /// A deployable artifact whose contents do not verify against its own digests.
     pub const ARTIFACT_INVALID: &str = "E0443";
-    /// An artifact built under a different `FRONTEND_VERSION`, `RUNTIME_VERSION` or `BODY_ENCODING`
-    /// than the binary loading it.
+    /// An artifact built under a different frontend, runtime or body-encoding version.
     pub const ARTIFACT_VERSION: &str = "E0444";
-    /// `trace.exit` naming a span that is not open on the performing task's stack — closed already,
-    /// never opened, or opened by another task.
+    /// `trace.exit` naming a span not open on the performing task's stack.
     pub const SPAN_UNBALANCED: &str = "E0445";
-    /// A value branded with a region's name would outlive the region: returned from it, stored into
-    /// a binding that predates it, captured by a closure that leaves it, or written as a field of a
-    /// declared type, which is outside every region there is.
+    /// A value branded with a region's name would outlive the region.
     pub const REGION_ESCAPE: &str = "E0446";
     /// Two regions in scope at once under one name.
     pub const REGION_ALREADY_OPEN: &str = "E0447";
     /// A region declared `unique` across which a continuation capture is reachable.
     pub const REGION_KIND_REFUSED: &str = "E0448";
-    /// A value reaching a runtime boundary carrying a handle into a region — a `Cell`, a `Task` or
-    /// a continuation — where no type is left for [`REGION_ESCAPE`] to look at: a host operation's
-    /// argument, a host handler's answer, or an entry point's argument.
+    /// A region handle crossing a runtime boundary, where no type is left to check.
     pub const REGION_ESCAPE_AT_BOUNDARY: &str = "E0449";
-    /// A compiled backend a run asked for cannot be attached: the spec does not name one, or the
-    /// engine asked for has no compiled path to attach it to.
     pub const BACKEND_UNAVAILABLE: &str = "E0450";
-    /// A `fs` operation named a resource label the run bound no root to.
-    ///
-    /// The label *is* the capability (the rooted filesystem effect): `fs.read_file[src]` says
-    /// "somewhere under whatever `src` names", and what it names is
-    /// `--fs src=./crates` beside the run rather than a path inside the
-    /// program — a path in the program would put a filesystem location into a
-    /// definition's hash and into a store designed never to forget. So an
-    /// unbound label is a run that was configured wrongly, and the diagnostic
-    /// names the label and the flag that would bind it rather than a file.
+    /// An `fs` operation named a resource label the run bound no root to.
     pub const FS_ROOT_UNBOUND: &str = "E0451";
-    /// A path that leaves the root its label is bound to: `..` above it, an
-    /// absolute path, or a symlink whose target resolves outside.
-    ///
-    /// Raised **before** the operation's own syscall, and after resolving
-    /// symlinks — a confinement check that did not resolve them would be
-    /// decorative, since a link is exactly how a path that looks contained
-    /// reaches somewhere it is not. It names the root and the resolved target,
-    /// because the two together are what makes the refusal checkable by
-    /// someone who did not write the path.
+    /// A path leaving its label's root via `..`, an absolute path, or a symlink.
     pub const FS_PATH_ESCAPES_ROOT: &str = "E0452";
-    /// A whole-file read of a file larger than the bound the run allows.
-    ///
-    /// `fs.read_file` answers `Option<Bytes>` and there are no file handles and
-    /// no streaming in v1, so the whole file becomes one value in the machine's
-    /// heap. The bound is on the allocation the host would make on the
-    /// program's word; without it, `read_file` on a large file is an
-    /// out-of-memory abort with no diagnostic attached to anything.
     pub const FS_FILE_TOO_LARGE: &str = "E0453";
-    /// A `--fs NAME=PATH` root that does not load: the path does not exist, is
-    /// not a directory, or cannot be resolved to a real one.
-    ///
-    /// Raised before anything runs, for the reason [`TLS_CREDENTIAL_INVALID`]
-    /// gives: a run that discovers its output directory is a dangling symlink
-    /// on the first write has already done half the work it is about to lose.
-    /// Every root is resolved once, at load, and the resolved path is what
-    /// every later confinement check is against.
+    /// A `--fs NAME=PATH` root that is missing, not a directory, or unresolvable.
     pub const FS_ROOT_INVALID: &str = "E0454";
     pub const ASSERTION_FAILED: &str = "E0501";
-    /// A program-level failure the language defines: `panic`, division by zero, integer overflow, a
-    /// resource limit.
+    /// A failure the language defines: `panic`, division by zero, overflow, a resource limit.
     pub const RUNTIME_ERROR: &str = "E0502";
     /// A compiled backend answered something the machine would not have.
     pub const ENGINE_DIVERGENCE: &str = "E0503";
     pub const INTERNAL_ERROR: &str = "E0505";
-    /// `W` rather than `E`: cache trouble is never a fault in the user's program, so these are
-    /// always warnings.
+    /// Cache codes are warnings: cache trouble is never a fault in the user's program.
     pub const CACHE_UNREADABLE: &str = "W0601";
     pub const CACHE_CORRUPT: &str = "W0602";
     pub const CACHE_VERSION_CHANGED: &str = "W0603";
-    /// An obligation the system could not decide at any tier — an effect nothing discharges, a
-    /// parameter nothing can generate, an evaluation that raised.
+    /// An obligation no tier could decide.
     pub const OBLIGATION_NOT_DISCHARGED: &str = "W0604";
     /// The stdlib shipped with this compiler differs from the one the cache was written under.
     pub const STDLIB_CHANGED: &str = "W0605";
-    /// A host runtime could not hand every resource back when an entry point ended: a transaction
-    /// scope whose `ROLLBACK` failed, a connection closed rather than returned to the pool, an
-    /// operation still in flight when the bound expired.
+    /// A host runtime could not hand every resource back when an entry point ended.
     pub const HOST_TEARDOWN: &str = "W0606";
-    /// A configuration key supplied explicitly — by `--set` or by a `--config` file — that the
-    /// run's schema does not declare.
+    /// An explicitly supplied configuration key the run's schema does not declare.
     pub const CONFIG_UNDECLARED: &str = "W0607";
     /// The drain deadline expired with connections still in flight.
     pub const DRAIN_INCOMPLETE: &str = "W0608";
-    /// A value was made to reach itself, so reference counting will never free it. Cycles are not
-    /// collected, and the leak is accepted.
+    /// A value was made to reach itself; cycles are not collected, so it leaks.
     pub const REFERENCE_CYCLE: &str = "W0610";
-    /// Spans were still open when an entry point ended, so teardown closed them rather than the
-    /// program.
+    /// Spans still open when an entry point ended, closed by teardown.
     pub const SPAN_ABANDONED: &str = "W0609";
 }
 
@@ -549,8 +461,7 @@ mod tests {
         assert_eq!(a.to(Span::DUMMY), a);
     }
 
-    /// A code is matched on by tooling long after the release that introduced it, so a number may
-    /// never be reused or renumbered.
+    /// Tooling matches on codes, so a number is never reused or renumbered.
     #[test]
     fn every_registered_code_has_its_published_number() {
         let registry = [

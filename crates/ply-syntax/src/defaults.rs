@@ -8,20 +8,15 @@ use crate::resolve::{Namespace, Resolved};
 use indexmap::IndexMap;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 
-/// One parameter of a callee this pass can match a call against.
 #[derive(Clone)]
 struct ParamInfo {
     name: Symbol,
-    /// Already qualified against the module that wrote it, so splicing it into any caller means
-    /// what it meant where it was written.
+    /// Already qualified against the writing module, so it means the same in any caller.
     default: Option<Expr>,
-    /// The module binders [`qualify`] introduced, which every module the default lands in has to
-    /// carry — including the one that wrote it, which does not import itself.
+    /// Module binders every module the default lands in must carry, the writing one included.
     imports: Vec<(Symbol, usize)>,
 }
 
-/// A callee's parameters, plus the module that wrote them — needed because the implicit imports a
-/// spliced default requires are the *writer's* modules.
 #[derive(Clone)]
 struct Signature {
     params: Vec<ParamInfo>,
@@ -40,8 +35,7 @@ fn builtin_signature(name: &Symbol) -> Option<Signature> {
                 },
                 ParamInfo {
                     name: Symbol::new("message"),
-                    // A prelude constructor, which is in every module's reach without an import —
-                    // so this one needs no qualifying, and brings no module in with it.
+                    // A prelude constructor: in reach everywhere, so it needs no qualifying.
                     default: Some(Expr {
                         kind: ExprKind::Var(crate::ast::QName::bare(Ident::new("None", span))),
                         span,
@@ -54,8 +48,7 @@ fn builtin_signature(name: &Symbol) -> Option<Signature> {
     }
 }
 
-/// The shape this pass believes a builtin has: how many parameters, and how many of them carry a
-/// default.
+/// `(parameters, defaulted parameters)` for a builtin that carries a default.
 pub fn builtin_shape(name: &str) -> Option<(usize, usize)> {
     let sig = builtin_signature(&Symbol::new(name))?;
     let defaults = sig.params.iter().filter(|p| p.default.is_some()).count();
@@ -88,8 +81,7 @@ pub(crate) fn expand(program: &mut Program, resolved: &mut Resolved, diags: &mut
     program.modules = items.into_iter().map(|(_, module)| module).collect();
 }
 
-/// Every `fn` in the program by its program-wide name, with each default already qualified against
-/// the module that wrote it.
+/// Every `fn` by program-wide name, each default qualified against the module that wrote it.
 fn collect(
     program: &Program,
     resolved: &mut Resolved,
@@ -114,8 +106,7 @@ fn collect(
                         };
                     };
                     let (default, imports) = qualify(d, m, resolved, def.vis.is_public(), diags);
-                    // The writing module needs the binder as much as any caller does: the checker
-                    // types this default where it was written, and a module does not import itself.
+                    // The checker types the default in its own module, which cannot import itself.
                     for (binder, target) in &imports {
                         owner_imports.push((m, binder.clone(), *target));
                     }
@@ -135,7 +126,6 @@ fn collect(
     out
 }
 
-/// Records that `module` now reaches `target` under `binder`.
 fn bind_module(resolved: &mut Resolved, module: usize, binder: Symbol, target: usize) {
     if let Some(scope) = resolved.scopes.get_mut(module) {
         scope.modules.entry(binder).or_insert((target, Span::DUMMY));
@@ -311,7 +301,6 @@ struct Qualify<'a> {
     resolved: &'a Resolved,
     public: bool,
     bound: Vec<Symbol>,
-    /// The module binders this default now needs, wherever it is spliced.
     imports: Vec<(Symbol, usize)>,
     diags: &'a mut Vec<Diagnostic>,
 }
@@ -324,8 +313,7 @@ impl Qualify<'_> {
                     return;
                 }
                 let Some(binding) = self.resolved.find(self.owner, Namespace::Value, q) else {
-                    // A builtin or a prelude constructor: in reach everywhere, so it needs no
-                    // qualifying and gets none.
+                    // A builtin or a prelude constructor: in reach everywhere.
                     return;
                 };
                 let owner = binding.owner;
@@ -420,8 +408,6 @@ impl Qualify<'_> {
             ExprKind::Field { base, .. } => self.expr(base),
             ExprKind::List { items } => items.iter_mut().for_each(|i| self.expr(i)),
             ExprKind::Try { operand } => self.expr(operand),
-            // Refused by `is_default_expr` before this runs, and reached only when the checker has
-            // already reported that.
             ExprKind::Perform { args, .. } => args.iter_mut().for_each(|a| self.expr(a)),
             ExprKind::Handle { body, .. }
             | ExprKind::WithCell { body, .. }
@@ -463,8 +449,7 @@ struct Cx<'a> {
     module: usize,
     /// Local binders, innermost last.
     scope: Vec<Symbol>,
-    /// Modules a spliced default made this one reference, to be added to its scope once the walk
-    /// lets go of `resolved`.
+    /// Modules spliced defaults need, bound once the walk lets go of `resolved`.
     implicit: Vec<(Symbol, usize)>,
     diags: &'a mut Vec<Diagnostic>,
 }
@@ -477,9 +462,7 @@ impl Cx<'_> {
                 for p in &d.params {
                     self.scope.push(p.name.name.clone());
                 }
-                // A default is not walked here: it was qualified against this module in `collect`,
-                // and a call inside one is refused by `is_default_expr` before it could need
-                // expanding.
+                // Defaults are not walked: `collect` qualified them, and they hold no call to fill.
                 for s in &mut d.spec {
                     self.expr(&mut s.expr);
                 }
@@ -502,8 +485,7 @@ impl Cx<'_> {
         }
     }
 
-    /// Children first, then this node, so a call nested in another's argument is filled before the
-    /// outer one copies it.
+    /// Children first, so a nested call is filled before the outer one copies it.
     fn expr(&mut self, e: &mut Expr) {
         grow(|| {
             match &mut e.kind {
@@ -615,15 +597,13 @@ impl Cx<'_> {
         })
     }
 
-    /// Matches one call against its callee's signature.
     fn fill(&mut self, e: &mut Expr) {
         let span = e.span;
         let ExprKind::App { func, args, named } = &mut e.kind else {
             unreachable!("just matched")
         };
         let Some(sig) = self.signature_of(func) else {
-            // No signature in hand: a call through a value, a constructor, or a name that does not
-            // resolve.
+            // A call through a value, a constructor, or a name that does not resolve.
             for n in named.iter() {
                 self.diags.push(
                     Diagnostic::error(
@@ -641,13 +621,13 @@ impl Cx<'_> {
             return;
         };
 
-        // Over-application is `E0202`'s to report, with the callee's own type in hand.
+        // Over-application is inference's to report, with the callee's type in hand.
         if args.len() > sig.params.len() {
             named.clear();
             return;
         }
 
-        // Kept so that a call this pass cannot complete is left exactly as it was written.
+        // Restored if the call cannot be completed.
         let written: Vec<Expr> = args.clone();
         let was_named = !named.is_empty();
         let mut slots: Vec<Option<Expr>> = sig.params.iter().map(|_| None).collect();
@@ -701,20 +681,18 @@ impl Cx<'_> {
                 missing.push(p.name.as_str());
                 continue;
             };
-            // The default may name something in the module that wrote it, and this one may never
-            // have imported that module.
+            // The default may name a module this one never imported.
             for edge in &p.imports {
                 if !self.implicit.contains(edge) {
                     self.implicit.push(edge.clone());
                 }
             }
-            // Keeping the default's own span, not the call's.
+            // The default's own span, not the call's.
             out.push(default.clone());
         }
 
         if !missing.is_empty() {
-            // A call with no names in it that leaves a hole is under-applied, which was `E0202`
-            // from inference before defaults existed and stays `E0202` now.
+            // Without names, a hole is plain under-application, which inference reports.
             if was_named {
                 self.diags.push(
                     Diagnostic::error(
@@ -741,7 +719,6 @@ impl Cx<'_> {
         *args = out;
     }
 
-    /// The callee's signature, if this call reaches one by name.
     fn signature_of(&mut self, func: &Expr) -> Option<Signature> {
         let ExprKind::Var(q) = &func.kind else {
             return None;
@@ -750,12 +727,11 @@ impl Cx<'_> {
         if q.is_bare() && is_ctor_name(q.symbol()) {
             return None;
         }
-        // A local binder wins over everything, so a call through one is a call through a value.
+        // A local binder shadows everything, so this is a call through a value.
         if q.is_bare() && self.scope.contains(q.symbol()) {
             return None;
         }
-        // `find` and not `lookup`: this runs on every call in the program and most of them are
-        // builtins, which resolve to nothing here.
+        // `find`, not `lookup`: most calls are builtins, which resolve to nothing here.
         match self.resolved.find(self.module, Namespace::Value, q) {
             Some(binding) => self.signatures.get(&binding.qualified).cloned(),
             // A builtin, or a name whose own diagnostic is somebody else's.

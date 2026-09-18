@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Is the binary I am about to measure with built from the tree I am looking at?
+# Is this binary built from the tree it sits in?
 #
 #   .github/binary-is-current.sh                    # target/release/ply, or $PLY_BIN
 #   .github/binary-is-current.sh target/debug/ply target/release/ply-corpus
@@ -9,44 +9,9 @@
 # Exit 0 the binary is current · 1 it is STALE · 2 the question cannot be
 # answered (no binary, no dep-info).
 #
-# `find crates -name '*.rs' -newer target/release/ply` is the shape this
-# replaces, and it is blind in the one place it is most often pointed:
-# `crates/ply-std/src/lib.rs` `include_str!`s all eight stdlib modules into the
-# binary, so editing one changes what `import std.http` means and moves no
-# `.rs` at all. A round-1 workstream published a headline count taken through
-# that hole, and the self-hosting spike opens with a measurement nearly lost to the same class.
-#
-# Three instruments, cheapest first.
-#
-#   1. rustc's own dep-info -- `<binary>.d`, written beside the binary at every
-#      link, listing exactly the files read to produce it. `target/release/ply.d`
-#      lists 152 paths across twelve crates: 144 `.rs` and all eight
-#      `crates/ply-std/ply/*.ply`. It is per binary, so there is no table here
-#      to go stale, and it covers any `include_str!` anyone adds tomorrow.
-#
-#   2. The bytes, not the clock -- `ply std --show std.<m>` prints the module
-#      source compiled into *this* binary. Diffing it against the file answers
-#      the real question rather than a proxy for it: it survives `touch`, a
-#      checkout that rewrites mtimes, an rsync, clock skew, and the
-#      second-granular window recorded in `crates/ply-eval/src/compiled.rs`'s
-#      test-module header. It is only available where `std --show` is, which is
-#      `ply` and no other binary: `ply-corpus` and `w6-alloc` embed
-#      `crates/ply-corpus/ply/{w4,w5}.ply` with no way to read them back out, so
-#      for those two this arm is skipped and says so, and their embedded `.ply`
-#      rest on dep-info mtimes alone. A `.ply` whose bytes changed while its
-#      mtime went backwards is caught for `ply` and not for them.
-#
-#   3. What dep-info does not carry -- `Cargo.toml`, `Cargo.lock`,
-#      `rust-toolchain*` and `.cargo/config.toml` are cargo's inputs, not
-#      rustc's, and appear in no `.d` file. Checked here explicitly. A file
-#      newer than the binary, in a crate the binary depends on, that the
-#      dep-info does not list is reported as SUSPECT: usually a new module no
-#      `mod` declares yet, occasionally a new `include_str!` target.
-#
-# Timestamps are compared to whole seconds and equality counts as stale. That is
-# deliberate and conservative: cargo fingerprints on second-granular mtimes, a
-# false STALE costs one rebuild, and a false "current" is what this file exists
-# to prevent.
+# Checks rustc's dep-info (`<binary>.d`), the stdlib bytes the binary embeds
+# (`ply std --show`, so `ply` only), and cargo's own inputs, which no dep-info
+# lists. An mtime equal to the binary's counts as stale.
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -56,7 +21,7 @@ targets=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --self-test) self_test=1; shift ;;
-    -h|--help) sed -n '2,49p' "${BASH_SOURCE[0]}" | sed 's|^# \{0,1\}||'; exit 0 ;;
+    -h|--help) sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's|^# \{0,1\}||'; exit 0 ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *) targets+=("$1"); shift ;;
   esac
@@ -110,9 +75,7 @@ check_depinfo() {                    # $1 binary, $2 dep-info, $3 scratch
   return "$bad"
 }
 
-# 2. content: the stdlib bytes inside the binary against the bytes on disk. $2
-#    is a directory so --self-test can point it at a corrupted copy without
-#    touching the worktree.
+# 2. content: the stdlib bytes inside the binary against the bytes in directory $2.
 check_embedded_stdlib() {            # $1 binary, $2 stdlib dir
   local bin="$1" dir="$2" bad=0 f name
   if ! "$bin" std --digest >/dev/null 2>&1; then
@@ -152,9 +115,8 @@ check_cargo_inputs() {               # $1 binary, $2 scratch
   return "$bad"
 }
 
-# A `.rs`/`.ply` newer than the binary, inside a crate the binary depends on,
-# that the dep-info does not list. Reported, not fatal: it is the one thing
-# dep-info structurally cannot know about, and it is usually a new file.
+# A `.rs`/`.ply` newer than the binary, in a crate it depends on, that dep-info does not list.
+# Reported, not fatal: usually a new file.
 check_unlisted() {                   # $1 binary, $2 scratch
   local bin="$1" tmp="$2" d
   sed "s|^$root/||" "$tmp/deps" | sed -n 's|^\(crates/[^/]*\)/.*|\1|p' | sort -u > "$tmp/crates"
@@ -187,10 +149,7 @@ verdict_for() {                      # 0 current, 1 stale, 2 unanswerable
     echo "UNKNOWN  $(rel "$bin") -- no $(rel "$dep"); rebuild so rustc writes one"
     return 2
   fi
-  # A `.d` NEWER than the binary is normal: cargo refreshes every dep-info at
-  # the end of the build, seconds after the link. `ply.d` was 31s newer than
-  # `ply` on the build this was written against. Only the other direction is
-  # odd -- cargo cannot produce it -- so it is noted and the checks still run.
+  # cargo writes dep-info after linking, so only a `.d` older than the binary is odd.
   if [ "$(mtime_of "$dep")" -lt "$(mtime_of "$bin")" ]; then
     echo "  NOTE     $(rel "$dep") is older than the binary; the binary was not written by this cargo build"
   fi
@@ -208,10 +167,7 @@ verdict_for() {                      # 0 current, 1 stale, 2 unanswerable
   return "$rc"
 }
 
-# `--self-test`: watch both instruments go red. Neither arm touches the
-# worktree -- the content arm compares the binary against a corrupted *copy* of
-# the stdlib, and the mtime arm writes a dep-info of its own under a scratch
-# directory.
+# Watches each check go red and green, touching only a scratch directory.
 run_self_test() {
   local bin="${PLY_BIN:-$root/target/release/ply}" tmp rc=0 out arc
   [ -x "$bin" ] || { echo "self-test needs $(rel "$bin"); build it first" >&2; exit 2; }
@@ -264,9 +220,6 @@ run_self_test() {
     echo "   FAILED -- it called an older input stale:"; echo "$out"; rc=1
   fi
 
-  # Arms 1-5 exercise the instruments in isolation. These two exercise the
-  # assembly: a red arm has to become a STALE verdict and a nonzero exit, which
-  # is a separate thing to get wrong and the thing every caller actually reads.
   mkdir -p "$tmp/whole"
   cp "$bin" "$tmp/whole/ply"
 

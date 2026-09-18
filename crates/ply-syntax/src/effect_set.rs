@@ -15,8 +15,7 @@ pub(crate) fn expand(module: &mut Module, diags: &mut Vec<Diagnostic>) {
     walk_module_rows(module, &mut |row| {
         let mut atoms = Vec::new();
         for alias in &row.aliases {
-            // `None` is a set that was refused; the diagnostic is already recorded, and splicing
-            // nothing in is the only expansion there is.
+            // `None` is a refused set, already reported; it splices in nothing.
             if let Some(i) = sets.lookup(alias, diags) {
                 atoms.extend(sets.defs[i].expansion.iter().cloned());
             }
@@ -29,13 +28,10 @@ pub(crate) fn expand(module: &mut Module, diags: &mut Vec<Diagnostic>) {
 struct Sets {
     defs: Vec<EffectSetDef>,
     by_name: IndexMap<Symbol, usize>,
-    /// One entry per set, parallel to `defs`: where each of its `includes` resolved to, or `None`
-    /// for one already reported.
+    /// Parallel to `defs`: each `includes` target, or `None` for one already reported.
     edges: Vec<Vec<Option<usize>>>,
-    /// A set that is part of a cycle.
     cyclic: Vec<bool>,
-    /// The effects the module declares, so `{db}` can be told that a member is an atom rather than
-    /// merely that no set is called `db`.
+    /// The module's effects, so a member naming one is told it should be an atom.
     effect_names: Vec<Symbol>,
 }
 
@@ -92,7 +88,7 @@ impl Sets {
         }
     }
 
-    /// The set a member or a row named, reporting `E0114` when there is none.
+    /// The set a member or a row named; `None` when missing, foreign or cyclic.
     fn lookup(&self, q: &QName, diags: &mut Vec<Diagnostic>) -> Option<usize> {
         if !q.is_bare() {
             diags.push(
@@ -161,8 +157,7 @@ impl Sets {
         d
     }
 
-    /// Marks every set on a cycle, and every set that reaches one, and reports each cycle once with
-    /// its members in the order they contain each other.
+    /// Marks every set on a cycle and reports each cycle.
     fn find_cycles(&mut self, diags: &mut Vec<Diagnostic>) {
         #[derive(Clone, Copy, PartialEq)]
         enum Color {
@@ -173,8 +168,7 @@ impl Sets {
         let mut color = vec![Color::White; self.defs.len()];
         let mut path: Vec<usize> = Vec::new();
 
-        // Explicit stack: a file may declare arbitrarily many sets, and a chain of them must not
-        // decide whether the parser overflows.
+        // Explicit stack: a long chain of sets must not overflow the parser's stack.
         for root in 0..self.defs.len() {
             if color[root] != Color::White {
                 continue;
@@ -241,8 +235,6 @@ impl Sets {
             .note("expansion is a fixed point, and a cycle has none: break it by inlining the atoms one of these sets needs")
     }
 
-    /// Every set's atoms after its `includes` are followed, in first-appearance order and
-    /// deduplicated by written form.
     fn expand_all(&mut self) {
         let mut done = vec![false; self.defs.len()];
         for root in 0..self.defs.len() {
@@ -282,8 +274,7 @@ impl Sets {
             let Some(&i) = self.by_name.get(&d.name.name) else {
                 continue;
             };
-            // A duplicate name binds to the first declaration, so only that one takes the
-            // expansion; the second was refused and keeps nothing.
+            // A duplicate binds to the first declaration; the refused second one keeps nothing.
             if seen.insert(d.name.name.clone(), i).is_some() {
                 continue;
             }
@@ -292,8 +283,6 @@ impl Sets {
     }
 }
 
-/// Two members that are the same atom are one atom, and the survivors are put in written-form
-/// order.
 fn canonicalize(atoms: &mut Vec<AtomExpr>) {
     let key = |a: &AtomExpr| {
         (
@@ -307,7 +296,6 @@ fn canonicalize(atoms: &mut Vec<AtomExpr>) {
     atoms.dedup_by_key(|a| key(a));
 }
 
-/// Every written row in the module, wherever one can appear.
 fn walk_module_rows(module: &mut Module, f: &mut impl FnMut(&mut RowExpr)) {
     for item in &mut module.items {
         match item {
@@ -391,8 +379,7 @@ fn walk_type(t: &mut TypeExpr, f: &mut impl FnMut(&mut RowExpr)) {
     })
 }
 
-/// A `let` binding and a lambda parameter carry types, and a type carries a function type, so a row
-/// can appear at any depth of any body.
+/// `let` and lambda annotations can hold function types, so a row can appear at any depth.
 fn walk_expr(e: &mut Expr, f: &mut impl FnMut(&mut RowExpr)) {
     grow(|| match &mut e.kind {
         ExprKind::Lit(_) | ExprKind::Var(_) => {}
@@ -457,8 +444,7 @@ fn walk_expr(e: &mut Expr, f: &mut impl FnMut(&mut RowExpr)) {
                 walk_expr(v, f);
             }
         }
-        // Row expansion runs before record-update expansion, so it walks the sugar rather than its
-        // expansion.
+        // Row expansion runs before record-update and `?` expansion, so it walks the sugar.
         ExprKind::RecordUpdate { base, fields } => {
             walk_expr(base, f);
             for (_, v) in fields {
@@ -466,7 +452,6 @@ fn walk_expr(e: &mut Expr, f: &mut impl FnMut(&mut RowExpr)) {
             }
         }
         ExprKind::Field { base, .. } => walk_expr(base, f),
-        // Row expansion runs before `?` expansion too, so it walks through the sugar.
         ExprKind::Try { operand } => walk_expr(operand, f),
         ExprKind::List { items } => {
             for i in items {
