@@ -128,7 +128,7 @@ fn a_reuse_fn_is_refused_only_for_a_copy_its_own_body_causes() {
          fn keep(xs: List<Int>) -> Int = len(grow(xs, 1)) + len(xs)\n",
     );
     assert!(loaded.promised);
-    assert!(ply_cli::costs::promises(&loaded.program, &loaded.resolved).is_empty());
+    assert!(promises(&loaded).is_empty());
 
     // Broken: the binding is read again after the append, inside the promised body.
     let (_dir, loaded) = fixture(
@@ -137,7 +137,7 @@ fn a_reuse_fn_is_refused_only_for_a_copy_its_own_body_causes() {
          \x20 if len(xs) < 0 { xs } else { ys }\n\
          }\n",
     );
-    let broken = ply_cli::costs::promises(&loaded.program, &loaded.resolved);
+    let broken = promises(&loaded);
     assert_eq!(broken.len(), 1, "{broken:#?}");
     assert_eq!(broken[0].code, ply_span::codes::REUSE_BROKEN);
     assert!(broken[0].message.contains("`grow` is a `reuse fn`"));
@@ -159,7 +159,7 @@ fn a_reuse_fn_is_refused_only_for_a_copy_its_own_body_causes() {
          }\n",
     );
     assert!(!loaded.promised);
-    assert!(ply_cli::costs::promises(&loaded.program, &loaded.resolved).is_empty());
+    assert!(promises(&loaded).is_empty());
 }
 
 #[test]
@@ -213,4 +213,9 @@ fn a_definition_no_root_reaches_is_warned_once_at_its_name() {
             ("type `m.Unused` is never used", "Unused"),
         ]
     );
+}
+
+fn promises(loaded: &Loaded) -> Vec<ply_span::Diagnostic> {
+    let tree = loaded.tree().expect("the front ends agree");
+    ply_cli::costs::promises(&tree.program, &tree.resolved)
 }

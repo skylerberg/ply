@@ -1972,7 +1972,7 @@ fn the_front_end_reports_where_its_time_went() {
 
     let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
     let phases = json_of(&out)["front_end"]["phases"].clone();
-    const PARTS: [&str; 5] = ["read", "parse", "resolve", "front", "write_back"];
+    const PARTS: [&str; 3] = ["read", "front", "write_back"];
     for name in PARTS.iter().chain(["total"].iter()) {
         assert!(
             phases[name].is_number(),

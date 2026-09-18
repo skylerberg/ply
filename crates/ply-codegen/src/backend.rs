@@ -70,7 +70,6 @@ impl Unit {
     /// [`Unit::over_front`] over the front end's answer for `texts`.
     pub fn over_with_texts(
         program: &Program,
-        resolved: &ply_syntax::resolve::Resolved,
         texts: HashMap<String, String>,
     ) -> Result<&'static Unit> {
         let sources = program
@@ -87,26 +86,20 @@ impl Unit {
         let ids: Vec<ply_span::SourceId> = program.modules.iter().map(|m| m.source).collect();
         let front = crate::c::producer::checked_front(&sources, &ids)
             .context("the front end's answer over this program")?;
-        Unit::over_front(program, resolved, &front, texts)
+        Unit::over_front(program, &front, texts)
     }
 
     /// [`Unit::over_with_texts`] over a front end's answer the caller already has.
     pub fn over_front(
         program: &Program,
-        resolved: &ply_syntax::resolve::Resolved,
         front: &ply_ty::Front,
         texts: HashMap<String, String>,
     ) -> Result<&'static Unit> {
         let front: &'static ply_ty::Front = Box::leak(Box::new(front.clone()));
         let keys = crate::source::emit_keys(front);
-        // Compiled from a copy, so the unit shares no state with the machine's program.
         let origin = std::ptr::from_ref(program) as usize;
-        let program: &'static Program = Box::leak(Box::new(program.clone()));
-        let resolved: &'static ply_syntax::resolve::Resolved =
-            Box::leak(Box::new(resolved.clone()));
-        let source: &'static Source = Box::leak(Box::new(
-            Source::from_front(program, resolved, front, keys).with_texts(texts),
-        ));
+        let source: &'static Source =
+            Box::leak(Box::new(Source::from_front(front, keys).with_texts(texts)));
         let candidates = source.functions();
         let started = std::time::Instant::now();
         // The pre-flight decides the compiled set and leaves the unit every worker reads back.
@@ -142,10 +135,6 @@ impl Unit {
     ) -> Result<&'static Unit> {
         let exports = crate::c::Exports::read(&crate::c::compile_and_load(&text, "artifact")?)?;
         let origin = std::ptr::from_ref(program) as usize;
-        let program: &'static Program = Box::leak(Box::new(program.clone()));
-        let resolved: &'static ply_syntax::resolve::Resolved =
-            Box::leak(Box::new(resolved.clone()));
-        let check: &'static ply_ty::CheckOutput = Box::leak(Box::new(check.clone()));
         let source: &'static Source = Box::leak(Box::new(Source::new(program, resolved, check)));
         let compiled = exports.names();
         let members: BTreeSet<Symbol> = compiled

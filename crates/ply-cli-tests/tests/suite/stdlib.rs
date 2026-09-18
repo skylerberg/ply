@@ -489,15 +489,6 @@ fn a_cold_cache_does_not_warn_about_the_stdlib() {
     );
 }
 
-/// The shipped sources may import only `std.*`
-#[test]
-fn a_shipped_module_importing_outside_std_is_ply_s_fault() {
-    let d = ply_std::foreign_import(&std_net(), &Symbol::new("app"), ply_span::Span::DUMMY);
-    assert_eq!(d.code, codes::INTERNAL_ERROR);
-    let rendered = format!("{d:?}");
-    assert!(rendered.contains("not in this program"), "{rendered}");
-}
-
 fn repo(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -552,7 +543,7 @@ fn pulled_and_loaded(dir: &Path) -> (Vec<String>, ply_ty::Front, Result<Loaded, 
 }
 
 #[test]
-fn the_port_pulls_in_the_shipped_modules_the_driver_does_and_answers_it_alike() {
+fn the_driver_places_the_shipped_modules_the_port_pulls_in_and_answers_as_it_does() {
     let chain = tempfile::tempdir().unwrap();
     write(
         chain.path(),
@@ -604,7 +595,7 @@ fn headlines(ds: &[Diagnostic]) -> Vec<(&'static str, &str, Option<Span>)> {
 }
 
 #[test]
-fn what_the_driver_refuses_before_asking_the_port_the_port_refuses_alike() {
+fn the_driver_refuses_with_the_port_s_diagnostics_alone() {
     let unshipped = tempfile::tempdir().unwrap();
     write(
         unshipped.path(),

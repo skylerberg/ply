@@ -65,7 +65,7 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
     let scoped = crate::obligations::project_view(&loaded.check, args.std);
     let laws = Laws::of(&scoped, &hashes);
 
-    let collected = crate::obligations::collect(&loaded.program, &scoped, &hashes);
+    let collected = crate::obligations::collect(&loaded.front, &scoped, &hashes);
     warnings.extend(collected.warnings);
     // Before the filter and discharge: carrying a claim is a fact about the program.
     let specified = obligation::specified(&scoped, &laws, &collected.obligations);
@@ -83,6 +83,12 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
         Ok(db) => db,
         Err(diagnostics) => {
             return report_bind_error("prove", &diagnostics, &loaded.sources, args.json, style);
+        }
+    };
+    let tree = match loaded.tree() {
+        Ok(tree) => tree,
+        Err(diagnostic) => {
+            return report_load_error("prove", &loaded.refused(diagnostic), args.json, style);
         }
     };
     let backend = match super::common::prover_backend(args.backend.as_ref(), &loaded) {
@@ -126,8 +132,8 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
             .map(|f| f as &(dyn Fn() -> std::rc::Rc<dyn ply_eval::host::HostRuntime> + Sync)),
     });
     let engine = crate::engine::of(
-        &loaded.program,
-        &loaded.resolved,
+        &tree.program,
+        &tree.resolved,
         &loaded.check,
         hosting,
         backend,
