@@ -731,8 +731,7 @@ use std::sync::Arc;
 fn binding() -> HostBinding {
     let source = "nondet effect db { read get[r](k: Int) -> Int }\n\
                   fn lookup(k: Int) -> Int / {db.read[users]} = db.get[users](k)";
-    let module = ply_syntax::parse(ply_span::SourceId(0), source).expect("the fixture parses");
-    let check = ply_core::check_module(&module).expect("the fixture typechecks");
+    let check = crate::fixture::port_check(&[("", source)]);
     let mut registry = HostRegistry::new();
     registry.register(
         HostOp {

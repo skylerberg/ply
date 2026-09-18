@@ -1103,8 +1103,59 @@ fn every_builtin_is_reachable_by_the_name_it_reports() {
     }
 }
 
+/// Each builtin's parameter count in the port's prelude, read from `install_prelude`'s table.
+fn prelude_arities() -> std::collections::HashMap<String, usize> {
+    /// The comma-separated items of `s`, up to the bracket that closes what `s` sits inside.
+    fn items(s: &str) -> Vec<&str> {
+        let (mut depth, mut start, mut out) = (0usize, 0, Vec::new());
+        for (i, c) in s.char_indices() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' if depth == 0 => {
+                    out.push(s[start..i].trim());
+                    break;
+                }
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 0 => {
+                    out.push(s[start..i].trim());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        out.retain(|item| !item.is_empty());
+        out
+    }
+
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ply-compiler/ply/infer.ply");
+    let text = std::fs::read_to_string(&path).expect("the port's checker is readable");
+    let mut out = std::collections::HashMap::new();
+    for line in text.lines() {
+        let Some(entry) = line.trim_start().strip_prefix("{ name: b\"") else {
+            continue;
+        };
+        let Some((name, scheme)) = entry.split_once("\", sc: ") else {
+            continue;
+        };
+        let (args, params_at) = if let Some(args) = scheme.strip_prefix("mono_fn(") {
+            (args, 0)
+        } else if let Some(args) = scheme.strip_prefix("poly_fn(") {
+            (args, 2)
+        } else {
+            panic!("`{name}`'s scheme is neither `mono_fn` nor `poly_fn`: {line}");
+        };
+        let params = items(args)[params_at]
+            .strip_prefix('[')
+            .unwrap_or_else(|| panic!("`{name}`'s parameters are not a list literal: {line}"));
+        out.insert(name.to_string(), items(params).len());
+    }
+    out
+}
+
 #[test]
 fn every_builtin_agrees_on_its_arity_everywhere() {
+    let prelude = prelude_arities();
     for b in Builtin::all() {
         let (min, max) = b.arity();
         assert_eq!(
@@ -1117,7 +1168,7 @@ fn every_builtin_agrees_on_its_arity_everywhere() {
         );
 
         // A builtin the prelude does not type cannot be called, so the tables cover the same set.
-        let typed = ply_core::prelude_arity(b.name()).unwrap_or_else(|| {
+        let typed = *prelude.get(b.name()).unwrap_or_else(|| {
             panic!(
                 "`{}` is a builtin with no scheme in the prelude: no program can call it",
                 b.name()

@@ -375,6 +375,8 @@ pub mod codes {
     pub const REFERENCE_CYCLE: &str = "W0610";
     /// Spans still open when an entry point ended, closed by teardown.
     pub const SPAN_ABANDONED: &str = "W0609";
+    /// A definition no `pub` item, `main`, test or law reaches.
+    pub const UNUSED_DEFINITION: &str = "W0611";
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -638,6 +640,7 @@ mod tests {
             ("DRAIN_INCOMPLETE", codes::DRAIN_INCOMPLETE, "W0608"),
             ("SPAN_ABANDONED", codes::SPAN_ABANDONED, "W0609"),
             ("REFERENCE_CYCLE", codes::REFERENCE_CYCLE, "W0610"),
+            ("UNUSED_DEFINITION", codes::UNUSED_DEFINITION, "W0611"),
         ];
 
         for (name, code, expected) in registry {
