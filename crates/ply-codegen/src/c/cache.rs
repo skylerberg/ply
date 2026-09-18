@@ -10,8 +10,8 @@ fn dir() -> PathBuf {
     super::load::cache_dir().join("emit")
 }
 
-/// What a body's C is a function of: the definition's hash, the constructor table, the helper
-/// table and the binary's stamp, so rebuilding `ply` invalidates the cache.
+/// What a body's C is a function of: its root's key (`Source::keys`), the constructor table, the
+/// helper table and the binary's stamp, so rebuilding `ply` invalidates the cache.
 pub fn key(def_hash: &str, ctors: &str) -> String {
     let mut h = blake3::Hasher::new();
     for part in [

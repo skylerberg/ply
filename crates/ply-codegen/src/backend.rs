@@ -210,9 +210,7 @@ impl Unit {
     fn build(&'static self) -> Result<Bodies> {
         let started = std::time::Instant::now();
         let native = match &self.embedded {
-            Some(text) => {
-                crate::c::load_unit(text, Some(self.source.module_sources()), "artifact")?.0
-            }
+            Some(text) => crate::c::load_unit(text, Some(self.source), "artifact")?.0,
             // The same set as the pre-flight, so the unit key matches and the unit is read back.
             None => {
                 let candidates = self.source.functions();
