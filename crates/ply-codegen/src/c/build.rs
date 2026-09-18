@@ -291,7 +291,14 @@ pub fn load_unit(
     sources: Option<Vec<SourceId>>,
     stem: &str,
 ) -> Result<(Native, Vec<Refused>)> {
-    let lib = compile_and_load(text, stem)?;
+    finish_unit(compile_and_load(text, stem)?, sources)
+}
+
+/// A unit's object, however it was compiled, finished against what it says about itself.
+pub(super) fn finish_unit(
+    lib: Library,
+    sources: Option<Vec<SourceId>>,
+) -> Result<(Native, Vec<Refused>)> {
     let exports = Exports::read(&lib)?;
     let refused = refused_of(&exports);
     let native = finish(lib, exports, sources)?;
