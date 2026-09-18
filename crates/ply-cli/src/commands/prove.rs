@@ -85,18 +85,23 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
             return report_bind_error("prove", &diagnostics, &loaded.sources, args.json, style);
         }
     };
-    let (configuration, config_warnings) = match crate::config::Configuration::open(
-        &loaded.program,
-        &loaded.resolved,
-        &loaded.check,
-        args.host,
-        &args.config,
-    ) {
-        Ok(resolved) => resolved,
-        Err(diagnostics) => {
-            return report_bind_error("prove", &diagnostics, &loaded.sources, args.json, style);
+    let backend = match super::common::prover_backend(args.backend.as_ref(), &loaded) {
+        Ok(backend) => backend,
+        Err(diagnostic) => {
+            return report_bind_error("prove", &[diagnostic], &loaded.sources, args.json, style);
         }
     };
+    let constant = |name: &str| {
+        super::common::enter_constant(backend.as_ref().map(|(provider, _)| *provider), name)
+    };
+    let (configuration, config_warnings) =
+        match crate::config::Configuration::open(&loaded.check, args.host, &args.config, &constant)
+        {
+            Ok(resolved) => resolved,
+            Err(diagnostics) => {
+                return report_bind_error("prove", &diagnostics, &loaded.sources, args.json, style);
+            }
+        };
     warnings.extend(config_warnings);
     let hosts = match Hosts::open(
         &loaded.check,
@@ -120,12 +125,6 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
             .as_ref()
             .map(|f| f as &(dyn Fn() -> std::rc::Rc<dyn ply_eval::host::HostRuntime> + Sync)),
     });
-    let backend = match super::common::prover_backend(args.backend.as_ref(), &loaded) {
-        Ok(backend) => backend,
-        Err(diagnostic) => {
-            return report_bind_error("prove", &[diagnostic], &loaded.sources, args.json, style);
-        }
-    };
     let engine = crate::engine::of(
         &loaded.program,
         &loaded.resolved,

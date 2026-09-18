@@ -1,13 +1,7 @@
-use crate::unit::build::{
-    at, bin, block, callv, discard, fn_def, int, lam, record, spanned, standalone, var,
-};
-use ply_eval::Own;
+use crate::unit::build::{at, bin, block, callv, discard, int, lam, record, spanned, var};
 use ply_eval::code::*;
-use ply_span::Symbol;
-use ply_syntax::ast::Item;
-use ply_syntax::ast::{BinOp, Expr};
+use ply_syntax::ast::BinOp;
 use std::rc::Rc;
-use std::sync::Arc;
 
 #[test]
 fn lowering_preserves_spans() {
@@ -61,78 +55,4 @@ fn a_lambda_captures_its_free_variable_into_its_own_window() {
     };
     assert_eq!(captures.len(), 1, "`n` is free in the lambda");
     assert_eq!(*size, 2, "the window holds the parameter and the capture");
-}
-
-fn body_of<'a>(program: &'a ply_syntax::ast::Program, name: &str) -> &'a Expr {
-    program.modules[0]
-        .items
-        .iter()
-        .find_map(|item| match item {
-            Item::Fn(f) if f.name.name.as_str() == name => Some(&f.body),
-            _ => None,
-        })
-        .expect("the program declares it")
-}
-
-#[test]
-fn a_body_lowered_twice_is_lowered_once() {
-    let (program, _) = standalone(vec![fn_def("f", &["x"], bin(BinOp::Add, var("x"), int(1)))]);
-    let lowering = Lowering::for_program(&program);
-    let params: Params = Rc::new(vec![Symbol::new("x")]);
-    let first = lowering.of(&params, body_of(&program, "f"));
-    let second = lowering.of(&params, body_of(&program, "f"));
-    assert!(
-        Rc::ptr_eq(&first.code, &second.code),
-        "the same body lowered twice produced two different trees"
-    );
-    assert_eq!(lowering.len(), 1, "one body, {} entries", lowering.len());
-}
-
-/// A cache that answered for one parameter list from the other would hand out the wrong liveness.
-#[test]
-fn one_body_under_two_parameter_lists_is_lowered_twice() {
-    let (program, _) = standalone(vec![fn_def("f", &["x"], var("x"))]);
-    let lowering = Lowering::for_program(&program);
-    let body = body_of(&program, "f");
-    let owned = lowering.of(&Rc::new(vec![Symbol::new("x")]), body);
-    let borrowed = lowering.body(body);
-    assert!(matches!(owned.code.own, Own::Owned));
-    assert!(
-        matches!(borrowed.code.own, Own::Borrowed),
-        "a body lowered under no parameters was answered from the entry that had one"
-    );
-}
-
-#[test]
-fn a_cache_taken_over_another_program_does_not_describe_this_one() {
-    let (one, _) = standalone(vec![fn_def("f", &[], int(1))]);
-    let (two, _) = standalone(vec![fn_def("f", &[], int(2))]);
-    let lowering = Lowering::for_program(&one);
-    assert!(lowering.describes(&one));
-    assert!(
-        !lowering.describes(&two),
-        "a cache over one program claimed to describe another, so a bisection's \
-         rebuilt body could be answered from the body it replaced"
-    );
-}
-
-#[test]
-fn the_last_closure_body_is_lowered_once_however_often_it_is_applied() {
-    let body = Arc::new(bin(BinOp::Add, var("x"), int(1)));
-    let params = [Symbol::new("x")];
-    let mut cache = ClosureCode::default();
-    let first = cache.of(&[], &params, &body);
-    let second = cache.of(&[], &params, &body);
-    assert!(Rc::ptr_eq(&first.code, &second.code));
-
-    let other = Arc::new(bin(BinOp::Sub, var("x"), int(1)));
-    let third = cache.of(&[], &params, &other);
-    assert!(
-        !Rc::ptr_eq(&first.code, &third.code),
-        "a different body was answered from the previous one's entry"
-    );
-    assert!(Rc::ptr_eq(
-        &third.code,
-        &cache.of(&[], &params, &other).code
-    ));
 }

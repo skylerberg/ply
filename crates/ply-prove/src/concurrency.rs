@@ -4,7 +4,7 @@ use crate::{
     Binding, CaseReport, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation, Rule,
     Vacuity, VacuityKind,
 };
-use ply_eval::{Exploration, Interleaving, Machine, Plan, Seed, Value, Verdict, explore};
+use ply_eval::{Exploration, Interleaving, Plan, Seed, Value, Verdict, explore};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_ty::Type;
 
@@ -100,11 +100,7 @@ impl BodyRun {
     }
 }
 
-pub fn body_run(machine: &Machine<'_>, value: Result<Value, Diagnostic>, span: Span) -> BodyRun {
-    body_run_recorded(machine.simulated(), value, span)
-}
-
-pub fn body_run_recorded(
+pub fn body_run(
     record: Option<&ply_eval::region::Record>,
     value: Result<Value, Diagnostic>,
     span: Span,

@@ -1,4 +1,4 @@
-use ply_eval::{Evaluator, Fixture, Machine};
+use ply_eval::{Fixture, Machine};
 use ply_span::{SourceMap, Symbol};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
@@ -235,10 +235,10 @@ fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_
         // One machine: `admitted` is process-wide, so a second machine would count every call twice.
         let mut machine = Machine::new(&program, &resolved, &check);
         machine.set_compiled(backend.clone());
-        Evaluator::set_fixture(&mut machine, &Fixture::empty());
+        machine.set_regions(Fixture::empty().open().0);
         let mut ran = 0usize;
-        for index in 0..Evaluator::test_count(&machine) {
-            let _ = Evaluator::eval_test(&mut machine, index);
+        for index in 0..machine.test_count() {
+            let _ = machine.eval_test(index);
             ran += 1;
         }
         compared += ran;

@@ -1,16 +1,15 @@
-//! The engine: entry points and tests run on the compiled tier, loose expressions on the
-//! interpreter; performed atoms go to one [`Trace`] either way.
+//! The engine: entry points and tests run on the compiled tier; performed atoms go to one
+//! [`Trace`].
 
 use crate::arena::RegionKind;
 use crate::compiled::{Compiled, Entered};
 use crate::host::{HostBinding, HostRuntime, HostUse, MachineId, Pending};
-use crate::interp::{Core, Interpreter, Run};
 use crate::limit::DEFAULT_MAX_CALLS;
 use crate::region;
 use crate::sim::{DEFAULT_STEPS, Seed};
 use crate::trace::Trace;
 use crate::value::Value;
-use crate::{Arena, TaskRegions, code};
+use crate::{Arena, TaskRegions};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{Expr, Item, Program};
 use ply_syntax::resolve::Resolved;
@@ -33,8 +32,7 @@ pub struct Machine<'a> {
     program: &'a Program,
     resolved: &'a Resolved,
     check: Option<&'a CheckOutput>,
-    interp: Interpreter<'a>,
-    core: Core<'a>,
+    regions: TaskRegions,
     tests: Vec<TestSlot<'a>>,
     region_kinds: crate::region_kind::Kinds,
     trace: Trace,
@@ -94,8 +92,7 @@ impl<'a> Machine<'a> {
             program,
             resolved,
             check,
-            interp: Interpreter::borrow(program, resolved),
-            core: Core::new(program),
+            regions: TaskRegions::new(),
             tests,
             region_kinds: crate::region_kind::Kinds::default(),
             trace: Trace::new(),
@@ -189,15 +186,15 @@ impl<'a> Machine<'a> {
     }
 
     pub fn cells(&self) -> &Arena {
-        self.core.cells()
+        self.regions.arena()
     }
 
     pub fn cells_mut(&mut self) -> &mut Arena {
-        self.core.cells_mut()
+        self.regions.arena_mut()
     }
 
     pub fn regions(&self) -> &TaskRegions {
-        self.core.regions()
+        &self.regions
     }
 
     /// `None` when `span` opens no region.
@@ -220,16 +217,6 @@ impl<'a> Machine<'a> {
         self.region_kinds = kinds;
     }
 
-    pub fn share_lowering(&self) -> Rc<crate::code::Lowering<'a>> {
-        self.core.lowering()
-    }
-
-    pub fn set_lowering(&mut self, lowering: Rc<crate::code::Lowering<'a>>) {
-        if lowering.describes(self.program) {
-            self.core.set_lowering(lowering);
-        }
-    }
-
     pub fn set_compiled(&mut self, compiled: Rc<dyn Compiled>) {
         if compiled.describes(self.program) {
             self.compiled = Some(compiled);
@@ -247,7 +234,7 @@ impl<'a> Machine<'a> {
 
     /// Every subsequent entry point resets to this stack's fixture rather than to an empty one.
     pub fn set_regions(&mut self, regions: TaskRegions) {
-        self.core.set_regions(regions);
+        self.regions = regions;
     }
 
     pub fn test_count(&self) -> usize {
@@ -311,7 +298,7 @@ impl<'a> Machine<'a> {
             .name
             .qualify(&Symbol::new(format!("test#{ordinal}")));
         let Some(backend) = self.compiled.clone() else {
-            return Err(err_no_front_end(&root, span));
+            return Err(err_not_compiled(&root, span));
         };
         backend.set_seed(self.seed.clone(), self.sim_steps);
         let entered = backend.enter_test(&root, self.max_calls);
@@ -325,7 +312,7 @@ impl<'a> Machine<'a> {
             Entered::Answered(_) => {
                 self.compiled_refusals.set(self.compiled_refusals.get() + 1);
                 self.compiled_declines.set(self.compiled_declines.get() + 1);
-                Err(err_no_front_end(&root, span))
+                Err(err_not_compiled(&root, span))
             }
             Entered::Raised(raised) => {
                 self.compiled_entries.set(self.compiled_entries.get() + 1);
@@ -333,61 +320,12 @@ impl<'a> Machine<'a> {
             }
             Entered::Declined => {
                 self.compiled_declines.set(self.compiled_declines.get() + 1);
-                Err(err_no_front_end(&root, span))
+                Err(err_not_compiled(&root, span))
             }
         };
         let _ = label;
         self.end_entry_point();
         out
-    }
-
-    /// An expression of unknown provenance, lowered afresh and run on the interpreter.
-    pub fn eval_expr_for_test(&mut self, e: &Expr) -> Result<Value, Diagnostic> {
-        self.begin_entry();
-        let lowered = code::lower(e);
-        let entered =
-            Run::new(&self.interp, &mut self.core).enter_lowered(lowered, 0, &[], self.max_calls);
-        self.answer_expr(entered)
-    }
-
-    /// An expression from `module`, with `bindings` lowered as leading parameters of its window.
-    pub fn eval_expr_in(
-        &mut self,
-        e: &'a Expr,
-        module: usize,
-        bindings: &[(Symbol, Value)],
-    ) -> Result<Value, Diagnostic> {
-        self.begin_entry();
-        let entered = Run::new(&self.interp, &mut self.core).enter_expr_in(
-            e,
-            bindings,
-            module,
-            self.max_calls,
-        );
-        self.answer_expr(entered)
-    }
-
-    fn answer_expr(&mut self, entered: Entered) -> Result<Value, Diagnostic> {
-        match entered {
-            Entered::Answered(v) => {
-                self.record_core_atoms();
-                self.end_entry_point();
-                Ok(v)
-            }
-            Entered::Raised(d) => {
-                self.record_core_atoms();
-                self.end_entry_point();
-                Err(d)
-            }
-            Entered::Declined => {
-                self.end_entry_point();
-                Err(Diagnostic::error(
-                    codes::RUNTIME_ERROR,
-                    "this expression uses a construct only the compiled tier evaluates",
-                )
-                .note("an arbitrary expression has no compiled body to fall back to"))
-            }
-        }
     }
 
     /// `name` is the program-wide name — `app.main`, not `main`.
@@ -409,7 +347,7 @@ impl<'a> Machine<'a> {
         span: Span,
     ) -> Result<Value, Diagnostic> {
         let Some(backend) = self.compiled.clone() else {
-            return Err(err_no_front_end(sym, span));
+            return Err(err_not_compiled(sym, span));
         };
         backend.set_seed(self.seed.clone(), self.sim_steps);
         let entered = backend.enter_whole(sym, &args, self.max_calls);
@@ -425,22 +363,15 @@ impl<'a> Machine<'a> {
                 self.compiled_entries.set(self.compiled_entries.get() + 1);
                 Err(raised)
             }
-            Entered::Declined => Err(err_no_front_end(sym, span)),
+            Entered::Declined => Err(err_not_compiled(sym, span)),
         }
     }
 
-    /// Clears per-entry accounting; `Core` resets its own arena and handler stack on entry.
     fn begin_entry(&mut self) {
         self.trace.clear();
         self.host_use = HostUse::default();
         self.host_ops = 0;
         self.record = None;
-    }
-
-    fn record_core_atoms(&mut self) {
-        for atom in self.core.take_performed() {
-            self.trace.record(atom);
-        }
     }
 
     fn record_compiled_atoms(&mut self) {
@@ -472,18 +403,13 @@ impl<'a> Machine<'a> {
     }
 }
 
-fn err_no_front_end(name: &Symbol, span: Span) -> Diagnostic {
+pub fn err_not_compiled(name: &Symbol, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        format!("neither front end holds a body for `{name}`"),
+        format!("the compiled tier holds no body for `{name}`"),
     )
-    .primary(
-        span,
-        "the interpreter declined it and the compiled tier has no body for it",
-    )
-    .note(
-        "attach the compiled tier, or the construct this body uses is one no front end carries yet",
-    )
+    .primary(span, "the compiled tier declined this")
+    .note("attach the compiled tier, or the construct this body uses is one it does not carry yet")
 }
 
 pub fn err_nested_simulation(span: Span, outer: Span) -> Diagnostic {

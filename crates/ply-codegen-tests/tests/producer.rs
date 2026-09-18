@@ -3,7 +3,6 @@
 use ply_codegen::Source;
 use ply_codegen::c::producer::{self, PlyProducer, Sources};
 use ply_eval::Value;
-use ply_span::Span;
 use ply_syntax::ast::{ModuleName, Program};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -109,25 +108,27 @@ fn built_and_checked() {
     );
     println!("  the Ply emitter answered {answered} of {asked} bodies");
 
-    let mut oracle = ply_eval::interp::Pure::new(loaded.program, loaded.resolved);
-    let cases: Vec<(&str, Vec<Value>)> = vec![
-        ("m.double", vec![Value::Int(21)]),
-        ("m.add", vec![Value::Int(40), Value::Int(2)]),
+    let cases: Vec<(&str, Vec<Value>, Value)> = vec![
+        ("m.double", vec![Value::Int(21)], Value::Int(42)),
+        ("m.add", vec![Value::Int(40), Value::Int(2)], Value::Int(42)),
         (
             "m.clamp",
             vec![Value::Int(-5), Value::Int(0), Value::Int(9)],
+            Value::Int(0),
         ),
         (
             "m.clamp",
             vec![Value::Int(50), Value::Int(0), Value::Int(9)],
+            Value::Int(9),
         ),
-        ("m.nested", vec![Value::Int(7), Value::Int(3)]),
-        ("m.sum_to", vec![Value::Int(100)]),
+        (
+            "m.nested",
+            vec![Value::Int(7), Value::Int(3)],
+            Value::Int(40),
+        ),
+        ("m.sum_to", vec![Value::Int(100)], Value::Int(4950)),
     ];
-    for (name, args) in cases {
-        let want = oracle
-            .call(name, args.clone(), Span::DUMMY, 10_000)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the pure applier: {}", d.message));
+    for (name, args, want) in cases {
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -142,10 +143,7 @@ fn built_and_checked() {
         assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
         ctx.end();
-        assert_eq!(
-            got, want,
-            "`{name}{args:?}`: the tier and the machine disagree"
-        );
+        assert_eq!(got, want, "`{name}{args:?}`");
     }
 }
 
@@ -197,21 +195,13 @@ fn the_chain_entered_whole_carries_handlers_as_the_machine_does() {
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
     assert!(refused.is_empty(), "{refused:?}");
-    let mut oracle = ply_eval::interp::Pure::new(loaded.program, loaded.resolved);
-    // The pure applier declines `guarded`'s zero-shot `resume`, so its cases carry the tier's answer.
-    let cases: Vec<(&str, Vec<Value>, Option<Value>)> = vec![
-        ("m.counted", vec![Value::Int(3)], None),
-        ("m.nested", vec![Value::Int(5)], None),
-        ("m.guarded", vec![Value::Int(4)], Some(Value::Int(1008))),
-        ("m.guarded", vec![Value::Int(40)], Some(Value::Int(-40))),
+    let cases: Vec<(&str, Vec<Value>, Value)> = vec![
+        ("m.counted", vec![Value::Int(3)], Value::Int(68)),
+        ("m.nested", vec![Value::Int(5)], Value::Int(111)),
+        ("m.guarded", vec![Value::Int(4)], Value::Int(1008)),
+        ("m.guarded", vec![Value::Int(40)], Value::Int(-40)),
     ];
-    for (name, args, golden) in cases {
-        let want = match golden {
-            Some(v) => v,
-            None => oracle
-                .call(name, args.clone(), Span::DUMMY, 10_000)
-                .unwrap_or_else(|d| panic!("`{name}` raised in the pure applier: {}", d.message)),
-        };
+    for (name, args, want) in cases {
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -231,10 +221,7 @@ fn the_chain_entered_whole_carries_handlers_as_the_machine_does() {
         );
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
         ctx.end();
-        assert_eq!(
-            got, want,
-            "`{name}{args:?}`: the tier and the oracle disagree"
-        );
+        assert_eq!(got, want, "`{name}{args:?}`");
     }
 }
 
@@ -449,23 +436,26 @@ fn the_chain_entered_whole_holds_float_and_decimal_literals_as_the_machine_does(
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
     assert!(refused.is_empty(), "{refused:?}");
-    let mut oracle = ply_eval::interp::Pure::new(loaded.program, loaded.resolved);
-    let two = Value::Int(2.0f64.to_bits() as i64);
-    let three = Value::Int(3.0f64.to_bits() as i64);
-    let cases: Vec<(&str, Vec<Value>)> = vec![
-        ("m.bigger", vec![two.clone()]),
-        ("m.bigger", vec![Value::Int(1.0f64.to_bits() as i64)]),
-        ("m.half", vec![three]),
-        ("m.tenth", vec![Value::Int(7)]),
-        ("m.same", vec![Value::Int(2.5f64.to_bits() as i64)]),
-        ("m.negated", vec![two]),
-        ("m.product", vec![Value::Int(6), Value::Int(7)]),
-        ("m.ordered", vec![Value::Int(6), Value::Int(7)]),
+    let bits = |f: f64| Value::Int(f.to_bits() as i64);
+    let cases: Vec<(&str, Vec<Value>, Value)> = vec![
+        ("m.bigger", vec![bits(2.0)], Value::Bool(true)),
+        ("m.bigger", vec![bits(1.0)], Value::Bool(false)),
+        ("m.half", vec![bits(3.0)], bits(1.5)),
+        ("m.tenth", vec![Value::Int(7)], Value::str("0.70")),
+        ("m.same", vec![bits(2.5)], Value::Bool(true)),
+        ("m.negated", vec![bits(2.0)], bits(-2.0)),
+        (
+            "m.product",
+            vec![Value::Int(6), Value::Int(7)],
+            Value::str("42"),
+        ),
+        (
+            "m.ordered",
+            vec![Value::Int(6), Value::Int(7)],
+            Value::Bool(true),
+        ),
     ];
-    for (name, args) in cases {
-        let want = oracle
-            .call(name, args.clone(), Span::DUMMY, 10_000)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the pure applier: {}", d.message));
+    for (name, args, want) in cases {
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -485,10 +475,7 @@ fn the_chain_entered_whole_holds_float_and_decimal_literals_as_the_machine_does(
         );
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
         ctx.end();
-        assert_eq!(
-            got, want,
-            "`{name}{args:?}`: the tier and the machine disagree"
-        );
+        assert_eq!(got, want, "`{name}{args:?}`");
     }
 }
 

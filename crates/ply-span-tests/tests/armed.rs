@@ -26,9 +26,9 @@ const UNARMED_CODES: &[(&str, &str)] = &[
 const UNARMED_VARIANTS: &[(&str, &str)] = &[
     (
         "Severity::Note",
-        "Three renderers and no producer: crates/ply-span/src/render.rs:73 maps \
-         it to ariadne's ReportKind::Advice, crates/ply-eval/src/differential.rs:803 \
-         to \"note\", crates/ply-cli/src/commands/common.rs:55 to a dim \"note\". \
+        "Two renderers and no producer: crates/ply-span/src/render.rs:73 maps \
+         it to ariadne's ReportKind::Advice, crates/ply-cli/src/commands/common.rs:55 \
+         to a dim \"note\". \
          Nothing builds one. Severity also derives Deserialize, so a Note could \
          in principle arrive from a stored diagnostic rather than from a \
          constructor — nothing in the workspace writes one, and the gate cannot \
@@ -1611,7 +1611,7 @@ fn a_codes_path_is_recognised_however_it_is_qualified() {
 const BACKEND_INSTALLERS: &[(&str, &str)] = &[
     (
         "crates/ply-test/src/lib.rs",
-        "`InterpExecutor::machine_lowering`, installing what `InterpExecutor::with_backend` \
+        "`InterpExecutor::machine`, installing what `InterpExecutor::with_backend` \
          was handed. It is the route `ply test` has, and it arms the cache rule on it \
          twice: `run_with` records under `Executor::engine`, so a pass goes into the \
          installed backend's namespace and never the evaluator's, and `cache_bypassed` \

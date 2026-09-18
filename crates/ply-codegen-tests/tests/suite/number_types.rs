@@ -73,8 +73,8 @@ fn boxed(n: Int) -> Word = {w: u32_of_int(n)}
 "#;
 
 #[test]
-fn each_width_answers_what_the_interpreter_answers() {
-    let (loaded, unit) = unit(WIDTHS);
+fn each_width_answers_what_its_type_means() {
+    let (_, unit) = unit(WIDTHS);
     let cases: &[(&str, Vec<Value>, Value)] = &[
         // Checked at the type's own width, and the sum is the type's.
         (
@@ -189,6 +189,14 @@ fn each_width_answers_what_the_interpreter_answers() {
             vec![Value::Int(100)],
             Value::Int(44),
         ),
+        (
+            "m.round_trip",
+            vec![Value::Int(0xDEAD_BEEF)],
+            Value::Int(0x7713_A5D9),
+        ),
+        ("m.round_trip", vec![Value::Int(0)], Value::Int(0x4892_2726)),
+        ("m.mixed", vec![Value::Int(16)], Value::Int(0xE414_A0AF)),
+        ("m.mixed", vec![Value::Int(0)], Value::Int(0)),
     ];
     for (name, args, want) in cases {
         let got = call(unit, name, args);
@@ -196,23 +204,6 @@ fn each_width_answers_what_the_interpreter_answers() {
             got.as_ref(),
             Some(want),
             "`{name}{args:?}` answered {got:?}, not {want:?}"
-        );
-    }
-    // Two not worth writing out by hand, checked against the interpreter.
-    let mut oracle = ply_eval::interp::Pure::new(loaded.program, loaded.resolved);
-    for (name, args) in [
-        ("m.round_trip", vec![Value::Int(0xDEAD_BEEF)]),
-        ("m.round_trip", vec![Value::Int(0)]),
-        ("m.mixed", vec![Value::Int(16)]),
-        ("m.mixed", vec![Value::Int(0)]),
-    ] {
-        let want = oracle
-            .call(name, args.clone(), ply_span::Span::DUMMY, 10_000)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the interpreter: {}", d.message));
-        assert_eq!(
-            call(unit, name, &args),
-            Some(want),
-            "`{name}{args:?}`: the tier and the interpreter disagree"
         );
     }
 }

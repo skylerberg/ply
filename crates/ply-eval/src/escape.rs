@@ -259,34 +259,11 @@ fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
             Some(handle)
         }),
 
-        Value::Closure(closure) => grow(|| {
-            let named = |bound: &ply_span::Symbol, route: &mut Vec<String>, handle| {
-                let what = match &closure.name {
-                    Some(n) => format!("`{bound}`, captured by `{n}`"),
-                    None => format!("`{bound}`, captured by a closure"),
-                };
-                route.push(what);
-                Some(handle)
-            };
-            match &closure.kind {
-                ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) => None,
-                ClosureKind::Native { captured, .. } => {
-                    captured.iter().find_map(|v| find(v, route))
-                }
-                ClosureKind::Fn { bindings, .. } => bindings.iter().find_map(|(bound, v)| {
-                    let handle = find(v, route)?;
-                    named(bound, route, handle)
-                }),
-                ClosureKind::Code {
-                    captures, captured, ..
-                } => captures
-                    .names
-                    .iter()
-                    .zip(captured.iter())
-                    .find_map(|(bound, v)| {
-                        let handle = find(v, route)?;
-                        named(bound, route, handle)
-                    }),
+        Value::Closure(closure) => grow(|| match &closure.kind {
+            ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) => None,
+            ClosureKind::Native { captured, .. } => captured.iter().find_map(|v| find(v, route)),
+            ClosureKind::Synth { rule, .. } => {
+                rule.values().into_iter().find_map(|v| find(v, route))
             }
         }),
     }

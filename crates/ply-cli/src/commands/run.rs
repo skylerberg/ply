@@ -1,6 +1,6 @@
 use super::common::{
-    IND, backend_spec, build_backend_over, counters_json, describe_schema, diagnostic_json,
-    emit_json, location, plural, print_diagnostics, report_bind_error, report_load_error,
+    IND, counters_json, describe_schema, diagnostic_json, emit_json, enter_constant, location,
+    plural, print_diagnostics, prover_backend, report_bind_error, report_load_error,
     select_profile,
 };
 use crate::cli::RunArgs;
@@ -66,18 +66,25 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
         .defs
         .get(&entry.name)
         .map(|d| d.footprint.clone());
-    let (configuration, config_warnings) = match crate::config::Configuration::open(
-        &loaded.program,
-        &loaded.resolved,
-        &loaded.check,
-        args.host,
-        &args.config,
-    ) {
-        Ok(resolved) => resolved,
-        Err(diagnostics) => {
-            return report_bind_error("run", &diagnostics, &loaded.sources, args.json, style);
+    // Before the configuration: its schema is entered on this unit.
+    let backend = match select_profile(&args.profile)
+        .and_then(|()| prover_backend(args.backend.as_ref(), &loaded))
+    {
+        Ok(backend) => backend,
+        Err(diagnostic) => {
+            return report_bind_error("run", &[diagnostic], &loaded.sources, args.json, style);
         }
     };
+    let constant =
+        |name: &str| enter_constant(backend.as_ref().map(|(provider, _)| *provider), name);
+    let (configuration, config_warnings) =
+        match crate::config::Configuration::open(&loaded.check, args.host, &args.config, &constant)
+        {
+            Ok(resolved) => resolved,
+            Err(diagnostics) => {
+                return report_bind_error("run", &diagnostics, &loaded.sources, args.json, style);
+            }
+        };
     // Before the binding, which decides whether `signal` is bound.
     let shutdown = args.host.then(|| Shutdown::new(args.shutdown.bounds()));
     if let Some(shutdown) = &shutdown
@@ -107,7 +114,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
             return report_bind_error("run", &diagnostics, &loaded.sources, args.json, style);
         }
     };
-    describe_schema(&loaded, &mut hosts);
+    describe_schema(&mut hosts, &constant);
     // An undeclared `--set` is a classic silent deploy failure, so it is always reported.
     if !args.json {
         print_diagnostics(&config_warnings, &loaded.sources, style);
@@ -143,14 +150,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     let module = entry.module.to_string();
     let span = entry.span;
     let plan = crate::simulation::run_plan(args.seed.as_ref());
-    let backend = match select_profile(&args.profile)
-        .and_then(|()| compiled_backend(args.backend.as_ref(), &loaded))
-    {
-        Ok(backend) => backend,
-        Err(diagnostic) => {
-            return report_bind_error("run", &[diagnostic], &loaded.sources, args.json, style);
-        }
-    };
+    let backend = backend.map(|(provider, spec)| provider.attach(&spec));
     // The counters are process-wide and cumulative.
     ply_eval::rc::reset();
     let answer = evaluate(
@@ -387,24 +387,6 @@ fn print_handshakes(hosts: &Hosts, style: Style) {
     for line in crate::hosts::handshake_lines(&hosts.handshakes()) {
         println!("{IND}{}", style.dim(&line));
     }
-}
-
-/// `--backend`, built over the loaded program and attached as `ply test` attaches it.
-pub fn compiled_backend(
-    flag: Option<&String>,
-    loaded: &Loaded,
-) -> Result<Option<std::rc::Rc<dyn ply_eval::Compiled>>, Diagnostic> {
-    let Some(spec) = backend_spec(flag)? else {
-        return Ok(None);
-    };
-    let provider = build_backend_over(
-        &spec,
-        &loaded.program,
-        &loaded.resolved,
-        &loaded.front,
-        super::common::module_texts(&loaded.program, &loaded.sources),
-    )?;
-    Ok(Some(provider.attach(&spec)))
 }
 
 fn evaluate(

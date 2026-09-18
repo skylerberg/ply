@@ -568,9 +568,8 @@ footprint, suspects, culprit and replay command. `--watch` re-runs on every
 
 ### 8.5 Compiled backend
 
-`--backend c` compiles the program to C and enters compiled code for what it
-accepts, leaving the rest to the interpreter. A test the backend fails and the
-interpreter passes is `E0503`. Backend results are cached separately.
+`--backend c` compiles the program to C and runs it there: compiled code is the
+only evaluator. Backend results are cached separately.
 `--profile development` (default; fastest compiler) or `release`
 (`cc -O2`) requires `--backend`. `--backend [c:]wrong:<mutation>` is wrong on
 purpose and never cached.
@@ -1163,7 +1162,6 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `E0454` | `--fs` root that is not a directory |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit |
-| `E0503` | compiled backend and interpreter disagree |
 | `E0505` | Ply broke one of its own invariants |
 | `W0601` | cache unreadable |
 | `W0602` | cache corrupt |

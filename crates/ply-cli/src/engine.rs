@@ -42,6 +42,8 @@ enum Claim<'a> {
         owner: Symbol,
         def: &'a FnDef,
         clause: &'a Expr,
+        /// Its place among the owner's `ensures` clauses, which names its root.
+        index: usize,
     },
     Law {
         module: usize,
@@ -170,42 +172,37 @@ impl<'a> Prover<'a> {
     }
 
     /// A proposition's body root: its program-wide name in the unit.
-    fn body_root(&self, obligation: &Obligation, claim: &Claim<'a>) -> Option<Symbol> {
+    fn body_root(&self, claim: &Claim<'a>) -> Symbol {
         let module = &self.program.modules[claim.module()].name;
         match claim {
-            Claim::Ensures { def, .. } => {
-                let ObligationKind::Ensures { index } = obligation.kind else {
-                    return None;
-                };
-                Some(module.qualify(&ply_codegen::clause_root_name(
-                    &def.name.name,
-                    "ensures",
-                    index,
-                )))
-            }
+            Claim::Ensures { def, index, .. } => module.qualify(&ply_codegen::clause_root_name(
+                &def.name.name,
+                "ensures",
+                *index,
+            )),
             Claim::Law { ordinal, .. } => {
-                Some(module.qualify(&ply_codegen::law_root_name(*ordinal, "body")))
+                module.qualify(&ply_codegen::law_root_name(*ordinal, "body"))
             }
         }
     }
 
     /// Each guard's compiled root, in [`Claim::guards`] order, which `source.rs` numbers alike.
-    fn guard_roots(&self, claim: &Claim<'a>) -> Vec<Option<Symbol>> {
+    fn guard_roots(&self, claim: &Claim<'a>) -> Vec<Symbol> {
         let module = &self.program.modules[claim.module()].name;
         match claim {
             Claim::Ensures { def, .. } => (0..claim.guards().len())
                 .map(|k| {
-                    Some(module.qualify(&ply_codegen::clause_root_name(
+                    module.qualify(&ply_codegen::clause_root_name(
                         &def.name.name,
                         "requires",
                         k,
-                    )))
+                    ))
                 })
                 .collect(),
             Claim::Law { ordinal, .. } => claim
                 .guards()
                 .iter()
-                .map(|_| Some(module.qualify(&ply_codegen::law_root_name(*ordinal, "guard"))))
+                .map(|_| module.qualify(&ply_codegen::law_root_name(*ordinal, "guard")))
                 .collect(),
         }
     }
@@ -230,6 +227,7 @@ impl<'a> Prover<'a> {
                     owner: obligation.owner.clone(),
                     def,
                     clause: &clause.expr,
+                    index,
                 })
             }
             ObligationKind::Law => {
@@ -571,16 +569,12 @@ impl<'a> Prover<'a> {
                 });
             }
         }
-        let body_root = self.body_root(obligation, claim);
         Ok(Cases {
             machine: self.machine(),
             compiled: self.compiled(),
             guard_roots: self.guard_roots(claim),
-            body_root,
-            module: claim.module(),
+            body_root: self.body_root(claim),
             binders: obligation.generated().to_vec(),
-            guards: claim.guards(),
-            body: claim.body(),
             span: obligation.span,
             call,
             result,
@@ -678,11 +672,8 @@ impl<'a> Prover<'a> {
         };
 
         let mut search = Search {
-            prover: self,
             compiled: self.compiled(),
             body_root: cases.body_root.clone(),
-            module: claim.module(),
-            body: claim.body(),
             binders: obligation.generated().to_vec(),
             points,
             steps: plan.sim.steps,
@@ -895,12 +886,9 @@ fn bindings_of(binders: &[LawBinder], values: &[Value]) -> Vec<Binding> {
 struct Cases<'a> {
     machine: Machine<'a>,
     compiled: Option<Rc<dyn ply_eval::Compiled>>,
-    guard_roots: Vec<Option<Symbol>>,
-    body_root: Option<Symbol>,
-    module: usize,
+    guard_roots: Vec<Symbol>,
+    body_root: Symbol,
     binders: Vec<LawBinder>,
-    guards: Vec<&'a Expr>,
-    body: &'a Expr,
     span: Span,
     /// The definition an `ensures` is attached to, called to produce `result`.
     call: Option<Symbol>,
@@ -908,26 +896,17 @@ struct Cases<'a> {
 }
 
 impl Cases<'_> {
-    /// The proposition entered on the tier, or `None` for the Core to answer. The tier goes first
-    /// because the Core declines handler clauses that bind `resume`, as `std.db`'s `transaction`.
-    fn on_tier(&self, root: &Option<Symbol>, args: &[Value]) -> Option<Result<Value, Diagnostic>> {
-        let (compiled, root) = (self.compiled.as_ref()?, root.as_ref()?);
-        if args.iter().any(carries_a_closure) {
-            return None;
+    /// The proposition entered on the tier, the only evaluator a proposition has.
+    fn on_tier(&self, root: &Symbol, args: &[Value]) -> Result<Value, Diagnostic> {
+        let entered = match &self.compiled {
+            Some(compiled) => compiled.enter_whole(root, args, DEFAULT_MAX_CALLS),
+            None => ply_eval::Entered::Declined,
+        };
+        match entered {
+            ply_eval::Entered::Answered(value) => Ok(value),
+            ply_eval::Entered::Raised(d) => Err(d),
+            ply_eval::Entered::Declined => Err(ply_eval::err_not_compiled(root, self.span)),
         }
-        match compiled.enter_whole(root, args, DEFAULT_MAX_CALLS) {
-            ply_eval::Entered::Answered(value) => Some(Ok(value)),
-            ply_eval::Entered::Raised(d) => Some(Err(d)),
-            ply_eval::Entered::Declined => None,
-        }
-    }
-
-    fn scope(&self, values: &[Value]) -> Vec<(Symbol, Value)> {
-        self.binders
-            .iter()
-            .zip(values)
-            .map(|(binder, value)| (binder.name.clone(), value.clone()))
-            .collect()
     }
 
     fn boolean(&self, value: Value) -> Result<bool, Diagnostic> {
@@ -945,14 +924,8 @@ impl Cases<'_> {
 
 impl Judge for Cases<'_> {
     fn guard(&mut self, values: &[Value]) -> Result<bool, Diagnostic> {
-        let scope = self.scope(values);
-        let empty = None;
-        for (i, guard) in self.guards.iter().enumerate() {
-            let root = self.guard_roots.get(i).unwrap_or(&empty);
-            let value = match self.on_tier(root, values) {
-                Some(answered) => answered?,
-                None => self.machine.eval_expr_in(guard, self.module, &scope)?,
-            };
+        for root in &self.guard_roots {
+            let value = self.on_tier(root, values)?;
             if !self.boolean(value)? {
                 return Ok(false);
             }
@@ -961,45 +934,23 @@ impl Judge for Cases<'_> {
     }
 
     fn body(&mut self, values: &[Value]) -> Result<bool, Diagnostic> {
-        let mut scope = self.scope(values);
-        if let (Some(name), Some(result)) = (&self.call, &self.result) {
+        // A law's binders, or an owner's parameters then `result`: the order `source.rs` expects.
+        let mut args = values.to_vec();
+        if let (Some(name), Some(_)) = (&self.call, &self.result) {
             let returned = self
                 .machine
                 .call(name.as_str(), values.to_vec(), self.span)?;
-            scope.push((result.clone(), returned));
+            args.push(returned);
         }
-        // A law's binders, or an owner's parameters then `result`: the order `source.rs` expects.
-        let args: Vec<Value> = scope.iter().map(|(_, v)| v.clone()).collect();
-        let value = match self.on_tier(&self.body_root, &args) {
-            Some(answered) => answered?,
-            None => self.machine.eval_expr_in(self.body, self.module, &scope)?,
-        };
+        let value = self.on_tier(&self.body_root, &args)?;
         self.boolean(value)
     }
 }
 
-/// Whether a value holds a closure; the tier would misapply a synthesized one, not decline it.
-fn carries_a_closure(v: &Value) -> bool {
-    match v {
-        Value::Closure(_) | Value::Continuation(_) => true,
-        Value::List(items) => items.iter().any(carries_a_closure),
-        Value::Map(entries) => entries
-            .iter()
-            .any(|(k, v)| carries_a_closure(k) || carries_a_closure(v)),
-        Value::Record(fields) => fields.values().any(carries_a_closure),
-        Value::Ctor { args, .. } => args.iter().any(carries_a_closure),
-        Value::Secret(inner) => carries_a_closure(inner),
-        _ => false,
-    }
-}
-
 /// One law body, run at a point of its value domain under a seed the interleaving search chooses.
-struct Search<'a, 'p> {
-    prover: &'p Prover<'a>,
+struct Search {
     compiled: Option<Rc<dyn ply_eval::Compiled>>,
-    body_root: Option<Symbol>,
-    module: usize,
-    body: &'a Expr,
+    body_root: Symbol,
     binders: Vec<LawBinder>,
     /// The points the guard kept, in order.
     points: Vec<Vec<Value>>,
@@ -1007,33 +958,22 @@ struct Search<'a, 'p> {
     span: Span,
 }
 
-impl LawSearch for Search<'_, '_> {
+impl LawSearch for Search {
     fn run(&mut self, point: u64, seed: &Seed) -> BodyRun {
         let values = self.points.get(point as usize).cloned().unwrap_or_default();
-        let scope: Vec<(Symbol, Value)> = self
-            .binders
-            .iter()
-            .zip(&values)
-            .map(|(binder, value)| (binder.name.clone(), value.clone()))
-            .collect();
-        if let (Some(compiled), Some(root)) = (&self.compiled, &self.body_root) {
-            compiled.set_seed(seed.clone(), self.steps);
-            match compiled.enter_whole(root, &values, DEFAULT_MAX_CALLS) {
-                ply_eval::Entered::Answered(value) => {
-                    let record = compiled.simulated();
-                    return concurrency::body_run_recorded(record.as_ref(), Ok(value), self.span);
+        let declined = || ply_eval::err_not_compiled(&self.body_root, self.span);
+        let (value, record) = match &self.compiled {
+            Some(compiled) => {
+                compiled.set_seed(seed.clone(), self.steps);
+                match compiled.enter_whole(&self.body_root, &values, DEFAULT_MAX_CALLS) {
+                    ply_eval::Entered::Answered(value) => (Ok(value), compiled.simulated()),
+                    ply_eval::Entered::Raised(raised) => (Err(raised), compiled.simulated()),
+                    ply_eval::Entered::Declined => (Err(declined()), None),
                 }
-                ply_eval::Entered::Raised(raised) => {
-                    let record = compiled.simulated();
-                    return concurrency::body_run_recorded(record.as_ref(), Err(raised), self.span);
-                }
-                ply_eval::Entered::Declined => {}
             }
-        }
-        let mut machine = self.prover.machine();
-        machine.set_seed(seed.clone(), self.steps);
-        let value = machine.eval_expr_in(self.body, self.module, &scope);
-        concurrency::body_run(&machine, value, self.span)
+            None => (Err(declined()), None),
+        };
+        concurrency::body_run(record.as_ref(), value, self.span)
     }
 
     fn bindings(&self, point: u64) -> Vec<Binding> {
