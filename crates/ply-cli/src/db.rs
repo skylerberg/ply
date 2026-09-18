@@ -6,43 +6,22 @@ use ply_ty::ty::Type;
 use std::collections::BTreeMap;
 use std::fmt;
 
-// --- what the trusted computing base is called ------------------------------
-
-/// The Rust path prefix every postgres handler is registered under, and
-/// therefore how a listing row is recognised as one.
+/// Path prefix of every postgres handler; how a listing row is recognised as one.
 pub const HANDLER_PREFIX: &str = "ply_host::db::";
 
-/// The SQL scanner `ply hosts` discloses. It is a parser inside the trusted
-/// computing base, which the HTTP design's rule says is the line worth a human's
-/// attention.
+/// The SQL scanner `ply hosts` discloses: a parser inside the trusted computing base.
 pub const SCANNER: &str = "ply_host::db::scan";
 
-/// The statement shapes the scanner accounts for. Everything else is `E0432`,
-/// so this is the whole of what a program may send.
-///
-/// Taken from the scanner rather than restated, because it is printed in the
-/// listing and hashed into the digest: a second copy that drifted would make
-/// `ply hosts` disclose a trusted computing base other than the one linked.
+/// Statements the scanner accepts (else `E0432`); read from it so the listing cannot drift.
 pub const ACCEPTED: &str = ply_host::db::scan::ACCEPTED;
 
-// --- configuration from the environment -------------------------------------
-
-/// The connection string, when `--db` did not carry one.
-///
-/// Consulted only under `--host`: the environment can say *which* database a
-/// bound run uses and can never cause a binding, which is what keeps the host boundary contract's
-/// "a reviewer reads `--host` in the command" true.
+/// Connection string when `--db` is absent; read only under `--host`, so it never binds.
 pub const URL_ENV: &str = "PLY_DB_URL";
 
-/// The password, when the connection string does not carry one.
-///
-/// The reason this exists is `ps`: an argument is readable by every process on
-/// the machine and lands in a shell history, so a `--db` that had to carry the
-/// password would be a design that leaks it by default.
+/// The password, kept out of `--db` so it never shows in `ps` or a shell history.
 pub const PASSWORD_ENV: &str = "PLY_DB_PASSWORD";
 
-/// Where a run's connection string came from, printed so an operator debugging
-/// "it connected to the wrong database" is told rather than left to guess.
+/// Where a run's connection string came from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Source {
     Flag,
@@ -58,18 +37,10 @@ impl Source {
     }
 }
 
-// --- the secret -------------------------------------------------------------
-
-/// A password. Printing one is impossible by construction; reading one is
-/// [`Secret::expose`] and nothing else.
-///
-/// No `Serialize`, no `Display` that reveals, no `Debug` that reveals, and no
-/// `PartialEq` against a `&str` — every one of those is a way a value reaches a
-/// log line, a `--json` object or a cached failure report by accident.
+/// A password that renders as `****` everywhere; only [`Secret::expose`] yields the bytes.
 #[derive(Clone)]
 pub struct Secret(String);
 
-/// What every rendering of a password is.
 pub const REDACTED: &str = "****";
 
 impl Secret {
@@ -77,8 +48,7 @@ impl Secret {
         Secret(text.into())
     }
 
-    /// The one call that yields the bytes. Its only legitimate caller is the
-    /// code that opens a connection.
+    /// Only the code that opens a connection may call this.
     #[must_use]
     pub fn expose(&self) -> &str {
         &self.0
@@ -105,14 +75,7 @@ impl PartialEq for Secret {
 
 impl Eq for Secret {}
 
-// --- the connection string --------------------------------------------------
-
-/// `sslmode`, restricted to what W4 configures.
-///
-/// `require` and above are `E0431` naming the trusted computing base listing: wiring rustls into
-/// `tokio-postgres` is a real trusted-computing-base decision that belongs
-/// beside W5's secrets, and accepting the word while not encrypting would be a
-/// label that lies.
+/// `sslmode`, limited to modes that need no TLS; `require` and above are `E0431`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SslMode {
     #[default]
@@ -129,12 +92,7 @@ impl SslMode {
     }
 }
 
-/// A parsed `postgres://` connection string, with the password held apart.
-///
-/// Every field the driver needs is here, so the driver builds its client
-/// configuration from these rather than from the text. `Display` and `Debug` are
-/// the redacted form, which is what makes it safe to interpolate one into a
-/// diagnostic.
+/// A parsed `postgres://` connection string; `Display` and `Debug` redact the password.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DbUrl {
     pub host: String,
@@ -143,22 +101,14 @@ pub struct DbUrl {
     pub user: String,
     password: Option<Secret>,
     pub sslmode: SslMode,
-    /// `application_name`, and nothing else today. Kept as a map because it is
-    /// what the driver passes through, and refusing the rest is what keeps a
-    /// mistyped parameter from being silently dropped.
+    /// Only `application_name`; any other parameter is refused rather than dropped.
     pub parameters: BTreeMap<String, String>,
 }
 
-/// Postgres's own default, so a string that omits the port means what libpq
-/// would have meant by it.
 pub const DEFAULT_PORT: u16 = 5432;
 
 impl DbUrl {
     /// `postgres://user[:password]@host[:port]/database[?sslmode=…]`.
-    ///
-    /// The error is prose for an operator rather than a [`Diagnostic`], because
-    /// the caller knows whether the text came from `--db` or from the
-    /// environment and the message has to say which.
     pub fn parse(text: &str) -> Result<DbUrl, String> {
         let rest = text
             .strip_prefix("postgres://")
@@ -280,22 +230,12 @@ impl DbUrl {
         self.password.is_some()
     }
 
-    /// Attach the password the environment supplied. Refused rather than
-    /// overwritten when the string already carries one — see
-    /// [`DbOptions::resolve_with`].
+    /// Callers refuse a second password rather than overwrite; see [`DbOptions::resolve_with`].
     fn set_password(&mut self, secret: Secret) {
         self.password = Some(secret);
     }
 
-    /// The text the driver connects with — the **only** rendering that carries
-    /// the password.
-    ///
-    /// It is rebuilt from the parsed fields rather than passed through, so what
-    /// the driver opens is what this module validated and reported rather than
-    /// whatever the operator typed. `Secret` is the return type so that the one
-    /// dangerous string in the system cannot be printed, logged or serialized by
-    /// accident: a caller has to write [`Secret::expose`], which is one word to
-    /// grep the whole workspace for.
+    /// The only rendering that carries the password, rebuilt from the validated fields.
     pub fn connection_string(&self) -> Secret {
         let mut out = String::from("postgres://");
         out.push_str(&encode(&self.user));
@@ -317,8 +257,7 @@ impl DbUrl {
         Secret::new(out)
     }
 
-    /// The form that goes into a diagnostic, a listing, a `--json` object and a
-    /// cached report: everything but the password, and `****` where that was.
+    /// The form for diagnostics, listings and reports: the password is `****`.
     pub fn redacted(&self) -> String {
         let mut out = String::from("postgres://");
         out.push_str(&self.user);
@@ -343,18 +282,14 @@ impl fmt::Display for DbUrl {
     }
 }
 
-/// Redacted, because `{:?}` in a `dbg!`, an `expect` or a derived `Debug` on
-/// something holding one of these is the accident this type exists to prevent.
+/// Redacted, so `{:?}` in a `dbg!` or an `expect` cannot leak the password.
 impl fmt::Debug for DbUrl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "DbUrl({})", self.redacted())
     }
 }
 
-/// Percent-encoding, over every delimiter a userinfo or a path component could
-/// otherwise terminate. The inverse of [`decode`], and the reason
-/// [`DbUrl::connection_string`] can rebuild a string the driver reads back as
-/// the same fields.
+/// Percent-encoding; the inverse of [`decode`].
 fn encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {
@@ -368,9 +303,7 @@ fn encode(text: &str) -> String {
     out
 }
 
-/// Percent-decoding, over the two components that need it: a password with an
-/// `@` or a `/` in it is ordinary, and one that was silently truncated at the
-/// delimiter is an authentication failure nobody can explain.
+/// Percent-decoding, so a password containing `@` or `/` is not truncated at the delimiter.
 fn decode(text: &str) -> Result<String, String> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -394,25 +327,16 @@ fn decode(text: &str) -> Result<String, String> {
     String::from_utf8(out).map_err(|_| format!("`{text}` percent-decodes to something not UTF-8"))
 }
 
-// --- the resolved configuration ---------------------------------------------
-
-/// The pool's defaults, taken from the pool rather than restated. A number the
-/// CLI prints and the driver acts on must be one number.
+/// Taken from the pool so the printed and enforced numbers cannot differ.
 pub const DEFAULT_POOL: u32 = ply_host::db::pool::DEFAULT_POOL_SIZE as u32;
 pub const DEFAULT_ACQUIRE_MS: u64 = ply_host::db::pool::DEFAULT_ACQUIRE_MS;
 pub const DEFAULT_STATEMENT_MS: u64 = ply_host::db::pool::DEFAULT_STATEMENT_MS;
 pub const DEFAULT_IDLE_TXN_MS: u64 = ply_host::db::pool::DEFAULT_IDLE_TXN_MS;
 pub const DEFAULT_CONNECT_MS: u64 = ply_host::db::pool::DEFAULT_CONNECT_MS;
-/// Statement preparation. Not in the pool's defaults: the statement cache is a property
-/// of a connection rather than of the pool.
+/// A per-connection setting, so not among the pool's defaults.
 pub const DEFAULT_STATEMENT_CACHE: u32 = 256;
 
-/// Everything a run was told about its database, validated.
-///
-/// Handed to the driver whole. The pool numbers are in [`Database::hash_into`]
-/// and therefore in the `ply hosts` digest: a service whose pool silently
-/// halved is a change to what the trusted computing base does under load, and
-/// the digest is the line a CI check pins.
+/// A run's validated database configuration; its pool numbers feed the `ply hosts` digest.
 #[derive(Clone, Debug)]
 pub struct DbConfig {
     pub url: DbUrl,
@@ -423,18 +347,12 @@ pub struct DbConfig {
     pub idle_txn_ms: u64,
     pub connect_ms: u64,
     pub statement_cache: u32,
-    /// `<module>.<fn>`, checked for shape here and resolved against the program
-    /// by [`schema::resolve`].
+    /// `<module>.<fn>`, resolved against the program by [`schema::resolve`].
     pub schema: Option<String>,
 }
 
 impl DbConfig {
-    /// What the driver's pool is built from.
-    ///
-    /// The connection string is a [`Secret`] rather than a `String` — see
-    /// [`DbUrl::connection_string`] — and the pool's numbers are the ones this
-    /// run's report and digest carry, so what is printed and what is opened
-    /// cannot disagree.
+    /// Built from the same numbers the report and digest carry.
     pub fn pool_config(&self) -> (Secret, PoolBounds) {
         (
             self.url.connection_string(),
@@ -450,8 +368,6 @@ impl DbConfig {
     }
 }
 
-/// The pool's bounds as durations, which is the shape the driver wants and the
-/// milliseconds are the shape a command line and a report want.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PoolBounds {
     pub size: usize,
@@ -462,20 +378,10 @@ pub struct PoolBounds {
     pub statements: usize,
 }
 
-// --- the flags --------------------------------------------------------------
-
 /// The database knobs, on every command that can bind a host handler.
-///
-/// Every one carries `requires = "host"` for the reason `--tls` does: a flag
-/// that would be silently ignored reads as a run that was configured and was
-/// not. They are `Option` rather than `default_value_t` so that "the operator
-/// chose 8" and "nobody said" stay distinguishable at the point the requirement
-/// is checked.
 #[derive(clap::Args, Clone, Debug, Default)]
 pub struct DbOptions {
-    /// The database: `--db postgres://ply@127.0.0.1:5432/desk`. Reads
-    /// `PLY_DB_URL` when absent, and `PLY_DB_PASSWORD` for the password, which
-    /// keeps the secret out of `ps` and out of a shell history.
+    /// The database URL; defaults to `PLY_DB_URL`, with the password from `PLY_DB_PASSWORD`.
     #[arg(long = "db", value_name = "URL", requires = "host")]
     pub url: Option<String>,
 
@@ -503,32 +409,18 @@ pub struct DbOptions {
     #[arg(long = "db-statement-cache", value_name = "N", requires = "host", value_parser = clap::value_parser!(u32).range(1..))]
     pub statement_cache: Option<u32>,
 
-    /// `<module>.<fn>` — a nullary pure function returning a `Schema`, evaluated
-    /// at start-up for its table and column counts. Nothing compares it to the
-    /// live database: a mismatch is `E0433` at prepare time, per statement, on
-    /// first execution. `ply hosts` prints this `declared`, never `verified`.
+    /// `<module>.<fn>`: a nullary pure function returning a `Schema` (not checked live).
     #[arg(long = "db-schema", value_name = "MODULE.FN", requires = "host")]
     pub schema: Option<String>,
 }
 
 impl DbOptions {
-    /// The configuration this run has, or `None` when it named no database.
-    ///
-    /// `None` is not yet a failure: a program that performs no `db` operation
-    /// binds no postgres handler and needs no database, and refusing here would
-    /// make `--host` unusable for the HTTP-only services W3 shipped.
-    /// [`missing`] is what turns it into `E0431`, once the binding says the
-    /// driver is actually in the run.
+    /// `None` when the run named no database; [`missing`] makes that `E0431` if the driver binds.
     pub fn resolve(&self, host: bool) -> Result<Option<DbConfig>, Vec<Diagnostic>> {
         self.resolve_with(host, &|key| std::env::var(key).ok())
     }
 
-    /// [`resolve`] against an explicit environment.
-    ///
-    /// Tests read this rather than `std::env`, which is process-global and
-    /// therefore a race between two of them under one test binary.
-    ///
-    /// [`resolve`]: DbOptions::resolve
+    /// [`DbOptions::resolve`] against an explicit environment, since `std::env` is process-global.
     pub fn resolve_with(
         &self,
         host: bool,
@@ -575,13 +467,7 @@ impl DbOptions {
     }
 }
 
-/// `E0431` for a run whose program reached the postgres driver with no database
-/// configured.
-///
-/// `named` is what the run will actually reach — the entry point's own `db`
-/// atoms, or the operations that bound when no entry point is known — so the
-/// reader is told *why* a database is suddenly required by a command that did
-/// not need one yesterday.
+/// `E0431`: the program reaches the postgres driver and no database is configured.
 pub fn missing(named: &[String]) -> Diagnostic {
     let mut diagnostic = Diagnostic::error(
         codes::DB_NOT_CONFIGURED,
@@ -630,35 +516,20 @@ fn err_two_passwords(source: Source) -> Diagnostic {
     .note(format!("remove the `:password` from the connection string, or unset `{PASSWORD_ENV}`"))
 }
 
-// --- `--db-schema` ----------------------------------------------------------
-
 /// Resolving `--db-schema <module>.<fn>` against the program.
-///
-/// A schema is a value (migrations, out of scope): there is no migration tool, no version
-/// table and no ordering across deploys. What W4 owns is the check that the
-/// database the run is pointed at is the one the program describes, and the
-/// first half of that check — that the program describes one at all — is here,
-/// where the type checker's output is in hand and a mistake is a start-up
-/// refusal rather than a start-up panic.
 pub mod schema {
     use super::*;
 
-    /// The type a `--db-schema` function must return, by simple name. Matched on
-    /// the tail rather than on the whole program-wide name so that a project
-    /// aliasing `std.db` still resolves.
+    /// Matched on the name's tail so a project aliasing `std.db` still resolves.
     const SCHEMA_TYPE: &str = "Schema";
 
     /// The one field the pinned `Schema` record has.
     const TABLES: &str = "tables";
 
-    /// What the run learned about the schema it named.
     #[derive(Clone, PartialEq, Eq, Debug)]
     pub struct SchemaView {
         pub name: String,
-        /// `None` when the function was named and resolved but not evaluated —
-        /// which is every command that does not need the numbers. An absent
-        /// count is printed as absent rather than as zero, because "the schema
-        /// declares no tables" is a different and much worse claim.
+        /// `None` when not evaluated; printed as absent, never as zero tables.
         pub shape: Option<Shape>,
         pub state: State,
     }
@@ -669,12 +540,7 @@ pub mod schema {
         pub columns: usize,
     }
 
-    /// The table and column counts of a materialised `Schema`, or `None` when
-    /// the value is not one this reader recognises.
-    ///
-    /// Structural rather than typed: the type checker already accepted the
-    /// return type, and reproducing `std.db`'s record layout in Rust would be a
-    /// second definition of it that could drift from the first.
+    /// Read structurally, so Rust holds no second copy of `std.db`'s record layout.
     pub fn shape_of(value: &ply_eval::Value) -> Option<Shape> {
         use ply_eval::Value;
         let Value::Record(fields) = value else {
@@ -699,11 +565,7 @@ pub mod schema {
         })
     }
 
-    /// How much is actually known about the live database's agreement with it.
-    ///
-    /// `Declared` is the honest word for "the program describes this and nothing
-    /// compared it to a server". Printing `verified` there would be the green
-    /// result over unexplored space this project audits for.
+    /// `Declared`: nothing compared the schema to a live server.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum State {
         Declared,
@@ -740,13 +602,7 @@ pub mod schema {
         .note("write the program-wide name of the function, as `ply hash` prints it"))
     }
 
-    /// The definition `--db-schema` names, checked to be one a schema can be
-    /// materialised from.
-    ///
-    /// Every refusal lists the candidates, because the fix is a different
-    /// argument rather than an edit to the program and an operator who mistyped
-    /// a module prefix should not have to run a second command to find out what
-    /// they meant.
+    /// The definition `--db-schema` names, if it can build a schema; refusals list candidates.
     pub fn resolve<'a>(check: &'a CheckOutput, name: &str) -> Result<&'a Symbol, Diagnostic> {
         let Some((symbol, def)) = check.defs.iter().find(|(key, _)| key.as_str() == name) else {
             return Err(unknown(check, name));
@@ -786,15 +642,7 @@ pub mod schema {
         Ok(symbol)
     }
 
-    /// `Schema` is `{ tables: List<Table> }`, and a record type alias is
-    /// **expanded** by inference — so by the time a signature is in hand there is
-    /// no name left to match on and the check has to be structural. It is
-    /// deliberately the same shape [`shape_of`] reads, so a return type this
-    /// accepts is one the counts can be taken from.
-    ///
-    /// The nominal arm stays for a `Schema` that is an ADT or an opaque
-    /// constructor rather than a record, which is what the type would become if
-    /// `std.db` ever hid its representation.
+    /// Structural, since inference expands the `Schema` alias; must match what [`shape_of`] reads.
     fn returns_schema(ret: &Type) -> bool {
         match ret {
             Type::Con(name, args) if args.is_empty() => name
@@ -850,14 +698,7 @@ pub mod schema {
     }
 }
 
-// --- what `ply hosts` says about the database -------------------------------
-
-/// What the driver learned from the server it connected to.
-///
-/// Absent until a connection is made, and its absence is printed rather than
-/// papered over: "not connected" and "connected to a server whose collation is
-/// C" are different facts and a reader deciding whether to trust the twin's
-/// `ORDER BY` needs the second one.
+/// Facts from the connected server; absent (and printed so) until a connection is made.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ServerFacts {
     pub version: String,
@@ -866,33 +707,18 @@ pub struct ServerFacts {
     pub encoding: String,
 }
 
-/// The `database` block of `ply hosts --host`, and its contribution to the
-/// digest.
-///
-/// It exists for the same reason W3's `transport` block does: a fact the rows
-/// cannot carry and a reviewer must not have to derive. The **collation** is
-/// printed because what the twin does not model makes it the twin's largest silent divergence,
-/// and the **scanner** because it is a parser inside the trusted computing base.
+/// The `database` block of `ply hosts --host`, and its contribution to the digest.
 #[derive(Clone, Debug)]
 pub struct Database {
-    /// The configuration, redacted at every use. `None` is a program that
-    /// performs `db` under a binding that never opened one — which is
-    /// `E0431`, so a `Database` with no configuration only ever appears in a
-    /// hermetic `ply hosts`.
+    /// `None` only in a hermetic `ply hosts`; otherwise that run is `E0431`.
     pub config: Option<DbConfig>,
     pub server: Option<ServerFacts>,
     pub schema: Option<schema::SchemaView>,
-    /// The postgres rows of the listing, by triple, so the block can say how
-    /// many operations it accounts for without the reader counting them.
     pub operations: Vec<String>,
 }
 
 impl Database {
-    /// `Some` when this program can reach a postgres handler, or when the run
-    /// was configured with a database.
-    ///
-    /// Absent otherwise, which is what keeps a program with no database in reach
-    /// hashing and printing exactly what it did before W4.
+    /// `None` unless a postgres handler is reachable or a database was configured.
     pub fn of(
         operations: Vec<String>,
         config: Option<DbConfig>,
@@ -910,8 +736,6 @@ impl Database {
         })
     }
 
-    /// Every postgres operation the listing resolved, as `ply hosts` prints
-    /// them.
     pub fn operations_of(listing: &ply_eval::host::HostListing) -> Vec<String> {
         listing
             .rows
@@ -921,13 +745,7 @@ impl Database {
             .collect()
     }
 
-    /// `db.rollback` reaching the binding is a defect: transactions as handlers handles it
-    /// in Ply, inside `transaction`, and a bound one would mean an abort that
-    /// discarded no continuation.
-    ///
-    /// Checked here rather than trusted, because the failure is silent — the
-    /// program would commit what it meant to roll back — and this is the one
-    /// place in the CLI that reads the resolved rows.
+    /// `db.rollback` must be a Ply handler inside `transaction`; a bound one would silently commit.
     pub fn rollback_bound(listing: &ply_eval::host::HostListing) -> Option<Diagnostic> {
         let bound: Vec<String> = listing
             .rows
@@ -949,9 +767,7 @@ impl Database {
         )
     }
 
-    /// Whether a run actually reached a database, which is the fact a report has
-    /// to carry so that "these tests passed" is not read as "these tests passed
-    /// hermetically".
+    /// Whether the run actually reached a database, so a report is not read as hermetic.
     pub fn is_live(&self) -> bool {
         self.config.is_some() && !self.operations.is_empty()
     }
@@ -1050,15 +866,7 @@ impl Database {
         })
     }
 
-    /// What the digest covers: the pool numbers, the scanner's accepted
-    /// statement set and the schema function's **name**.
-    ///
-    /// Deliberately **not** the server version, the database name, the host or
-    /// the user. A CI check that broke on a minor server upgrade is a CI check
-    /// people learn to ignore — W3's argument about a certificate fingerprint,
-    /// and the same conclusion. The table and column counts are out for a
-    /// sharper reason: they are a property of the *database*, and a digest that
-    /// moved when someone else's migration ran would be pinning the wrong thing.
+    /// Pool numbers, scanner and schema name only: server facts change without the program.
     pub fn hash_into(&self, hasher: &mut blake3::Hasher) {
         fn write(hasher: &mut blake3::Hasher, text: &str) {
             hasher.update(&(text.len() as u64).to_le_bytes());

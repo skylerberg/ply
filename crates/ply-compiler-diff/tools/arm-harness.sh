@@ -1,58 +1,12 @@
 #!/usr/bin/env bash
+# Arms the differential: each mutation edits a copy of the compiler's modules, `stage`
+# bootstraps it, and the agreement suite must report a disagreement.
 #
-# Arms the differential in `harness/`.
-#
-#   ./crates/ply-compiler-diff/tools/arm-harness.sh          # every mutation (22 of them)
+#   ./crates/ply-compiler-diff/tools/arm-harness.sh          # every mutation
 #   ./crates/ply-compiler-diff/tools/arm-harness.sh 4 7      # just these
 #
-# House rule 6: "the signature defect here is a green result over unexplored
-# space. A comparison that cannot go red proves nothing." So every claim the
-# harness makes is checked by breaking the thing it watches and confirming the
-# comparison notices.
-#
-# Each mutation edits a copy of the compiler's modules under a temp directory,
-# `stage` bootstraps that copy and `PLY_C_EMITTER` points the differential at
-# it -- the worktree is never touched. Three outcomes, and the script distinguishes them because two of them
-# look alike from the outside:
-#
-#   ARMED     the comparison reported a disagreement. What we want.
-#   INVALID   the mutant does not typecheck or does not run, so the suite failed
-#             for a reason that is not a disagreement. This is *not* arming: a
-#             mutation that cannot compile watches nothing, and counting it
-#             would be the same error as counting a skipped test as a pass.
-#   SURVIVED  the mutant ran and the comparison stayed green. A hole, and the
-#             script says which one.
-#
-# The mutations are chosen to be the three classes the brief names -- a dropped
-# field, a wrong span, a swapped associativity -- plus one per structural
-# property the dump grammar claims to have, plus one per feature the port
-# learned on 2026-08-30.
-#
-# **Two changes to the table on 2026-08-30, both recorded rather than done
-# quietly.**
-#
-#   * #7 was `types.ply|s/node: { name: n, ty: Some(t),/node: { name: n, ty:
-#     None,/`, and its anchor no longer exists: `param` moved to `exprs.ply`
-#     when a parameter gained a default expression (`GAPS.md` 11R.D). It is
-#     REPLACED, not dropped, by the same corruption at the same parser in its
-#     new home -- a parameter's type annotation parsed and discarded -- so the
-#     property it watches is unchanged.
-#   * #17 through #22 are new, one per dump edge the port gained: the named
-#     argument list, `ETry`'s span, `ERecordUpdate`'s base, `Param`'s default,
-#     `E0124`, and the `?` byte itself. #17 is the one worth naming: it is
-#     exactly the port `GAPS.md` 11R.N showed would have PASSED before this
-#     change -- one that reads `name`, `:`, `value` and throws all three away.
-#
-# #13 corrupts a row's atoms. Its old description said it stood behind clause 2
-# of `only_the_expanders_diagnostics`; that tolerance is gone with the
-# projection, and the mutation now watches `desk.ply`'s rows directly, which is
-# a stronger thing for it to watch.
-# No `pipefail`. `printf '%s' "$big" | grep -q x` sets the pipeline's status to
-# printf's SIGPIPE under it, because grep exits at the first match and closes the
-# pipe -- so a mutation with a lot of output reads as "no match". The first run
-# of this script scored three ARMED mutations as INVALID for exactly that, and
-# the tell was that they were the three with the most disagreements. Matching is
-# done with `[[ == * ]]` below, which has no pipeline at all.
+# INVALID (the mutant did not run) is not arming: a mutant that cannot compile watches nothing.
+# No pipefail: `printf | grep -q` would read printf's SIGPIPE as "no match"; match with [[ ]].
 set -u
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -60,9 +14,7 @@ root="$(cd "$here/../../.." && pwd)"
 src="$root/crates/ply-compiler/ply"
 
 # Each entry: file | sed script | what it corrupts | which property watches it.
-#
-# `|` separates the fields, so no sed script below may contain one; the two that
-# want an alternation use a second `-e` instead.
+# No sed script may contain `|`.
 mutations=(
 "items.ply|s/constraints: cs, spec: sp,/constraints: [], spec: sp,/|a DROPPED FIELD: a fn's \`where\` constraints are parsed and thrown away|every list emits its length"
 "items.ply|s/dump_opt(d.effects, dump_row),//|a DROPPED FIELD in the dumper: a fn's effect row is never emitted|every Option emits its presence"

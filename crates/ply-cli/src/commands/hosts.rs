@@ -12,7 +12,6 @@ use ply_host::tls;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-/// The `--json` object's shape.
 pub const SCHEMA_VERSION: u32 = 1;
 
 pub fn execute(args: &HostsArgs, style: Style) -> i32 {
@@ -21,8 +20,7 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
         Err(err) => return report_load_error("hosts", &err, args.json, style),
     };
 
-    // Resolved whether or not `--host` was passed: the TCB is a property of the registry and the
-    // program, and a digest that moved when a flag moved would pin nothing.
+    // Whether or not `--host` was passed: a digest that moved with a flag would pin nothing.
     let trace = args.trace.open();
     let shutdown = ply_host::signal::Shutdown::new(args.shutdown.bounds());
     let listing = match hosts::Hosts::preview(&loaded.check, Some(Arc::clone(&trace))) {
@@ -44,17 +42,14 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
         }
     };
 
-    // Loaded here rather than only under `--host`, because `ply hosts` is the command that answers
-    // "what does this run trust" and a credential that will not load is a run that will not start.
+    // Loaded even without `--host`: this command answers what a run trusts, and whether it starts.
     let credentials = match tls::Credentials::load(&args.tls.tls) {
         Ok(credentials) => credentials,
         Err(diagnostics) => {
             return report_bind_error("hosts", &diagnostics, &loaded.sources, args.json, style);
         }
     };
-    // Resolved here for the credentials' reason: this command's whole answer to "what can
-    // this program touch" is the label-to-directory mapping, so a root that will not resolve
-    // is `E0454` before a listing overstates what the run reaches.
+    // Likewise, so an unresolvable root is `E0454` before the listing overstates what is reached.
     let roots = match ply_host::fs::Roots::load(&args.fs.fs, ply_span::Span::DUMMY) {
         Ok(roots) => roots,
         Err(diagnostic) => {
@@ -67,9 +62,6 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
             );
         }
     };
-    // Resolved here for the same reason the credentials are: `ply hosts` is the command that
-    // answers "what does this run trust", and a connection string that will not parse is a run that
-    // will not start.
     let db = match args.db.resolve(args.host) {
         Ok(db) => db,
         Err(diagnostics) => {
@@ -88,9 +80,6 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
             );
         }
     };
-    // Resolved here for the reason the credentials and the connection string are: `ply hosts`
-    // answers "what does this run trust", and a required key nothing supplies is a run that will
-    // not start.
     let (configuration, config_warnings) = match crate::config::Configuration::open(
         &loaded.program,
         &loaded.resolved,
@@ -131,7 +120,6 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
             "handlers": listing.handlers,
             "operations": listing.rows.len(),
             "digest": hosts::digest_short(&listing, &disclosures),
-            // Present in both bindings.
             "hosts": hosts::rows_json(&listing),
             "diagnostics": Value::Array(Vec::new()),
         });
@@ -171,8 +159,7 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
             println!("{IND}{line}");
         }
     }
-    // Rendered like the errors of its class rather than as a bare line: a `W0607` is the run's
-    // configuration at fault, exactly as `E0440` is, and a deploy check greps for the code.
+    // Rendered as a diagnostic, since a deploy check greps for the code.
     print_diagnostics(&config_warnings, &loaded.sources, style);
     EXIT_OK
 }

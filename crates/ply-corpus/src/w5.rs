@@ -39,14 +39,11 @@ fn diagnostics(what: &str, diagnostics: &[Diagnostic]) -> anyhow::Error {
     anyhow::anyhow!("{what} failed:\n  {}", shown.join("\n  "))
 }
 
-// --- The program ------------------------------------------------------------
-
 pub struct Program {
     program: ply_syntax::ast::Program,
     resolved: ply_syntax::resolve::Resolved,
     check: CheckOutput,
-    /// The port's whole answer, so the tier is built from it rather than from a second front end
-    /// derived inside `over_with_texts` (ADR 0052 §2).
+    /// The port's whole answer, which the tier is built from.
     port: ply_ty::Front,
     sources: ply_span::SourceMap,
 }
@@ -70,8 +67,7 @@ impl Program {
             let id = sources.add(ply_std::pseudo_path(module), source.to_string());
             inputs.push((id, module.clone(), source));
         }
-        // Built before `parse_program` takes `inputs`, and in its order: the protocol writes a
-        // span's module as its position in this list.
+        // In `inputs` order, taken before `parse_program`: a span names its module by position.
         let ordered: Vec<(String, String)> = inputs
             .iter()
             .map(|(_, m, s)| (m.to_string(), s.to_string()))
@@ -113,8 +109,7 @@ impl Program {
             .map(|d| d.footprint.clone())
     }
 
-    /// One call over a hermetic machine: no host at all, which is what the `bare` and `twin` rungs
-    /// run on.
+    /// One call over a hermetic machine with no host, as the `bare` and `twin` rungs run.
     pub fn call_pure(&self, simple: &str, n: i64) -> Result<(Duration, Value)> {
         let name = self.full(simple)?;
         let mut machine = self.machine();
@@ -125,8 +120,7 @@ impl Program {
         Ok((started.elapsed(), value))
     }
 
-    /// One call with a real `trace` binding, which is the whole of what the bound rungs add: a
-    /// `perform` that leaves the program and a sink that answers it.
+    /// One call with a real `trace` binding: a `perform` that leaves the program, and a sink.
     pub fn call_traced(
         &self,
         host: &ply_host::Host,
@@ -152,9 +146,7 @@ impl Program {
     }
 }
 
-// --- A sink whose destination is a parameter --------------------------------
-
-/// `ply_host::trace::json`'s formatting with somewhere other than this process's stderr to put it.
+/// `ply_host::trace::json`'s formatting, written somewhere other than stderr.
 struct FileJson {
     level: Level,
     out: Mutex<std::io::BufWriter<std::fs::File>>,
@@ -203,8 +195,6 @@ impl sink::Sink for FileJson {
     }
 }
 
-// --- Section 1: what one trace operation costs ------------------------------
-
 #[derive(Clone, Debug, Serialize)]
 pub struct EventPoint {
     /// Which sink answered, or `bare` for the loop with the perform deleted.
@@ -214,8 +204,7 @@ pub struct EventPoint {
     pub operations: u32,
     pub per_operation_micros: f64,
     pub per_second: f64,
-    /// Microseconds this rung adds over `bare` at the same operation, which is the number the operations design
-    /// a span's cost owes.
+    /// Microseconds this rung adds over `bare` at the same operation.
     pub over_bare_micros: f64,
 }
 
@@ -226,8 +215,7 @@ pub enum Rung {
     Bare,
     /// `--trace off`: the shipped `ply_host::trace::discard`.
     Discard,
-    /// `--trace json --trace-level warn` over `Debug` events: the shipped filter, refusing before a
-    /// name is decoded or a field list is built.
+    /// `--trace json --trace-level warn` over `Debug` events: the shipped filter refuses early.
     Filtered,
     /// `ply_host::trace::json`'s encoder, written to `/dev/null`.
     JsonNull,
@@ -260,8 +248,7 @@ pub fn events(
     let program = Program::parse()?;
     let mut out: Vec<EventPoint> = Vec::new();
 
-    // The denominator, taken once per size, because the fold, the list and the `Fields` map are the
-    // program's cost at every rung and charging them to tracing would overstate what a sink costs.
+    // Taken once per size: the fold, list and `Fields` map cost the same at every rung.
     let bare_big = time(&program, Rung::Bare, "bare", iterations, repeats, dir)?;
     let bare_small = time(&program, Rung::Bare, "bare", twin_iterations, repeats, dir)?;
     out.push(point(Rung::Bare, "none", iterations, bare_big, bare_big));
@@ -313,7 +300,7 @@ fn time(
     repeats: usize,
     dir: &Path,
 ) -> Result<f64> {
-    // Answered by every rung, so a rung whose loop did not run is a failure rather than a fast row.
+    // Every rung answers this, so a loop that did not run fails rather than looking fast.
     let n = iterations as i64;
     let expect = Value::Int(2 * n);
     let mut best = Duration::MAX;
@@ -363,19 +350,15 @@ pub fn sink_for(rung: Rung, dir: &Path) -> Result<Arc<Trace>> {
     Ok(Arc::new(Trace::new(s)))
 }
 
-// --- The served project -----------------------------------------------------
-
 /// Which store, transport and sink a served point runs under.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Sinking {
     /// `--trace off` — `ply_host::trace::discard`, a listed handler and not an absence.
     Off,
-    /// `--trace json`, with stderr on `/dev/null`: the encoder's cost with the destination's taken
-    /// out.
+    /// `--trace json`, with stderr on `/dev/null`: the encoder without the destination.
     JsonNull,
-    /// `--trace json`, with stderr on a file the harness reads afterwards, so the records are
-    /// counted rather than assumed.
+    /// `--trace json`, with stderr on a file the harness reads, so records are counted.
     JsonFile,
 }
 
@@ -420,8 +403,7 @@ impl Stack {
 
 /// `examples/desk.ply` as a project `ply run --host` can be pointed at.
 fn project(dir: &Path, service: &str, stack: Stack, variant: w3::Variant) -> Result<()> {
-    // The twin discharges every `db`, `trace` and `signal` atom in Ply, so its entry point's row is
-    // narrower than the real desk's and moves with the call.
+    // The twin discharges `db`, `trace` and `signal` in Ply, so its entry row is narrower.
     let spawning = variant == w3::Variant::TaskPerConn;
     let task = if spawning { "task.write, " } else { "" };
     let from = format!(
@@ -461,7 +443,6 @@ fn replace(source: &str, from: &str, to: &str) -> Result<String> {
     Ok(source.replace(from, to))
 }
 
-/// Everything a served point is configured with, in one place.
 struct Serving {
     _dir: tempfile::TempDir,
     server: Server,
@@ -546,8 +527,7 @@ impl Serving {
         })
     }
 
-    /// Records the sink actually wrote, so a `json` row is a row about a sink that wrote something
-    /// rather than one that was configured to.
+    /// Records the sink actually wrote, so a `json` row shows a sink that wrote something.
     fn records_written(&self) -> usize {
         let Some(path) = &self.records else {
             return 0;
@@ -558,13 +538,10 @@ impl Serving {
     }
 }
 
-// --- Section 2: what the service pays for tracing ---------------------------
-
 #[derive(Clone, Debug, Serialize)]
 pub struct ServedPoint {
     pub stack: &'static str,
-    /// Which accept loop served it: `sequential` is `examples/desk.ply` as written, `task-per-conn`
-    /// is the same service with a spawn in its loop.
+    /// Which accept loop served it: `sequential` or `task-per-conn`.
     pub accept: &'static str,
     pub sink: &'static str,
     pub route: String,
@@ -575,10 +552,7 @@ pub struct ServedPoint {
     pub p95_micros: f64,
     pub p99_micros: f64,
     pub max_micros: f64,
-    /// Lines the sink wrote, counted from the file it wrote them to, and `0` on every row whose
-    /// sink has no file to count — `off`, `/dev/null`, and every route but the last of a point,
-    /// because one server serves the routes of a point and its file does not say which line came
-    /// from which.
+    /// Lines the sink wrote; `0` for sinks with no file and for all but a point's last route.
     pub records: usize,
 }
 
@@ -636,9 +610,7 @@ pub fn tracing(
                 }
                 let written = serving.records_written().saturating_sub(before);
                 serving.server.finish()?;
-                // Charged to the last route of the point, because the sink is shared across the
-                // routes a server served and splitting it would be inventing an attribution the
-                // file does not carry.
+                // Charged to the last route: the point's routes share one server and one file.
                 if let Some(last) = out.last_mut() {
                     last.records = written;
                 }
@@ -648,23 +620,18 @@ pub fn tracing(
     Ok(out)
 }
 
-// --- Section 3: the drain ---------------------------------------------------
-
 #[derive(Clone, Debug, Serialize)]
 pub struct DrainPoint {
-    /// How the point was set up, in one phrase.
     pub scenario: String,
     /// Connections holding a request the server had not answered when the signal was delivered.
     pub in_flight: u32,
     pub drain_ms: u64,
     pub lead_ms: u64,
-    /// Milliseconds from the signal to the process exiting.
     pub stop_to_exit_ms: f64,
     pub exit_code: i32,
     /// Requests that got a response after the signal.
     pub answered: u32,
-    /// Requests whose connection was closed with no response, which is what W5 costs at the
-    /// deadline for want of cancellation.
+    /// Requests whose connection closed with no response, for want of cancellation.
     pub abandoned: u32,
     /// Whether the run printed `W0608`.
     pub drain_incomplete: bool,
@@ -694,8 +661,7 @@ pub fn drain(
             "completes",
         )?);
     }
-    // The deadline case: the clients hold their requests open for longer than the drain, so the run
-    // runs out of time with them still in flight.
+    // The clients hold their requests longer than the drain, so it runs out with them in flight.
     let &widest = in_flight.last().unwrap_or(&1);
     out.push(one_drain(
         repo,
@@ -708,8 +674,7 @@ pub fn drain(
         api_key,
         "expires",
     )?);
-    // And the lead: accept keeps running while `signal.stopping()` already answers true, which is
-    // what lets a readiness route shed before the listener closes.
+    // Accept keeps running while `signal.stopping()` answers true, so a readiness route can shed.
     out.push(one_drain(
         repo,
         ply,
@@ -775,21 +740,18 @@ fn one_drain(
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     w3::wait_until_serving(&mut server, addr)?;
 
-    // N connections, each with a request head begun and not finished.
     let mut held = Vec::new();
     for _ in 0..in_flight {
         held.push(crate::w5::Partial::open(addr, hold_ms)?);
     }
-    // Give the accept loop time to take every one of them, so the signal finds them in flight
-    // rather than in the listen backlog.
+    // Let the accept loop take them all, so the signal finds them in flight, not in the backlog.
     std::thread::sleep(Duration::from_millis(200));
 
     let pid = server.pid().context("the server has already been reaped")?;
     let signalled = Instant::now();
     signal(pid, "TERM")?;
 
-    // The clients run on their own threads, because the time under measurement is the signal to the
-    // process exiting and a harness that finished its clients first would be timing its own sleep.
+    // Clients run on their own threads, so the clock measures signal-to-exit, not this harness.
     let clients: Vec<_> = held
         .into_iter()
         .map(|conn| std::thread::spawn(move || conn.finish().unwrap_or(false)))
@@ -880,8 +842,6 @@ fn signal(pid: u32, name: &str) -> Result<()> {
     Ok(())
 }
 
-// --- Section 4: a transaction open at the deadline --------------------------
-
 #[derive(Clone, Debug, Serialize)]
 pub struct TxnOutcome {
     /// The order sequence before and after.
@@ -923,10 +883,7 @@ pub fn transaction_at_deadline(
         format!("DESK_API_KEY={api_key}"),
     ];
     let drain = drain_ms.to_string();
-    // Above the drain, so what stops the run is the deadline under measurement rather than postgres
-    // losing patience first — and not far above it, because the *teardown* is bounded by this and
-    // not by `--drain-ms`: a `ROLLBACK` queues behind the statement the connection is still
-    // executing, and that statement is blocked on a lock.
+    // Above the drain so the deadline stops the run; not far, since the `ROLLBACK` waits on it.
     let statement = (drain_ms + 5_000).to_string();
     let mut args: Vec<&str> = vec![
         "--config-schema",
@@ -959,8 +916,6 @@ pub fn transaction_at_deadline(
 
     blocker.lock_bolt()?;
     let order = post_order(addr, api_key)?;
-    // Wait until the desk's own connection is the one waiting on the lock, which is the state the
-    // measurement is about.
     wait_until_blocked(url, Duration::from_secs(30))?;
 
     let pid = server.pid().context("the server has already been reaped")?;
@@ -970,8 +925,7 @@ pub fn transaction_at_deadline(
     let stop_to_exit = signalled.elapsed();
     drop(order);
 
-    // The lock is released only now, so nothing the desk left behind could have been resolved by
-    // this harness getting out of the way first.
+    // Released only now, so nothing the desk left behind is resolved by this harness.
     blocker.release()?;
 
     let orders_after = count_orders(url)?;
@@ -1137,8 +1091,6 @@ fn wait_until_blocked(url: &str, within: Duration) -> Result<()> {
     }
 }
 
-// --- Section 5: the deploy --------------------------------------------------
-
 #[derive(Clone, Debug, Serialize)]
 pub struct DeployReport {
     pub definitions: usize,
@@ -1154,8 +1106,7 @@ pub struct DeployReport {
     pub unchanged_definitions: usize,
     /// The bodies a transfer of only the changed definitions would have carried.
     pub changed_body_bytes: u64,
-    /// Those bodies as a fraction of a whole artifact, and of an artifact plus the binary a deploy
-    /// must also ship.
+    /// Those bodies as a fraction of a whole artifact, and of the artifact plus the binary.
     pub of_artifact: f64,
     pub of_deploy: f64,
 }
@@ -1193,8 +1144,7 @@ pub fn deploy(repo: &Path, ply: &Path, edit: (&str, &str)) -> Result<DeployRepor
         .collect();
     let changed_body_bytes: u64 = changed
         .iter()
-        // The record as the `BODIES` section holds it: the key, the length and the bytes, because a
-        // transfer ships all three.
+        // A `BODIES` record: the key, the length and the bytes, since a transfer ships all three.
         .map(|(_, body)| body.len() as u64 + 32 + 4)
         .sum();
     let unchanged = new.bodies.len() - changed.len();
@@ -1247,8 +1197,6 @@ fn build(ply: &Path, root: &Path, to: &Path) -> Result<BuiltArtifact> {
         digest: json["digest"].as_str().unwrap_or("").to_string(),
     })
 }
-
-// --- The report -------------------------------------------------------------
 
 #[derive(Default, Serialize)]
 pub struct Measurements {

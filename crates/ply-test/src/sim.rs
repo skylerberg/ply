@@ -8,7 +8,6 @@ use ply_hash::DefHash;
 use ply_span::Diagnostic;
 use std::collections::BTreeMap;
 
-/// Fix the interleaving the next entry point will take.
 pub fn seed_run(machine: &mut Machine<'_>, seed: &Seed, steps: u32) {
     machine.set_seed(seed.clone(), steps);
 }
@@ -30,11 +29,9 @@ pub enum Record {
     Under(Vec<DefHash>),
     /// The search spent its budget.
     Exhausted,
-    /// The test's footprint carries `sim.read` and the evaluator reported no search, so what
-    /// actually ran is unknown.
+    /// The footprint carries `sim.read` but the evaluator reported no search.
     Unobserved,
-    /// The run reached a host handler, so its green verdict is a statement about a socket at one
-    /// moment and about nothing else.
+    /// The run reached a host handler, so its green verdict is about one socket at one moment.
     Host,
 }
 
@@ -51,9 +48,8 @@ impl Record {
     }
 }
 
-/// `run` is the plan the run was selected against and whose key the result is published under;
-/// `ran` is what this test actually searched, which differs only when `random` narrowed a widened
-/// root set to the roots no per-seed key covered.
+/// `run` is the plan the result is published under; `ran` is what this test searched, which
+/// differs only when `random` narrowed a widened root set.
 pub fn record_under(
     test_hash: DefHash,
     seeded: bool,
@@ -65,8 +61,7 @@ pub fn record_under(
     if seeded && exploration.is_none() {
         return Record::Unobserved;
     }
-    // Applied to an unseeded test too: a handler answering `sim.seed()` closes `sim.read` out of
-    // the row, and the region inside it still searched under a budget it may have spent.
+    // Unseeded tests too: a `sim.seed()` handler hides `sim.read`, but the region still searched.
     if exploration.is_some_and(|e| !e.is_cacheable()) {
         return Record::Exhausted;
     }
@@ -85,20 +80,18 @@ pub fn record_under(
     Record::Under(keys)
 }
 
-/// What this run's simulated tests searched, aggregated.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct SimSummary {
     pub simulated: usize,
     /// Every test the run executed, simulated or not.
     pub total: usize,
-    /// Seeds the plan started the simulated tests from, summed over them.
+    /// Seeds started from, summed over the simulated tests.
     pub seeds: usize,
     pub interleavings: u64,
-    /// Searches that emptied their frontier: every interleaving ran.
+    /// Searches that emptied their frontier.
     pub exhaustive: usize,
     /// Searches that spent their budget.
     pub exhausted: usize,
-    /// Searches that reported a failing seed.
     pub failed: usize,
 }
 
@@ -129,7 +122,6 @@ impl SimSummary {
     }
 }
 
-/// The command that replays exactly this failure.
 pub fn replay_command(seed: &Seed, test_name: &str) -> String {
     format!("ply test --seed {seed} --filter \"{test_name}\"")
 }
@@ -154,9 +146,7 @@ pub fn schedules_differ(ours: &Interleaving, theirs: &Interleaving) -> Option<St
             theirs.steps.len()
         ));
     }
-    // A cell is named by its slot in an arena, and the two engines' arenas number theirs
-    // differently; what must agree is which accesses touch the same cell, so each side's cells
-    // are renamed by first appearance before the footprints are compared.
+    // The engines number arena cells differently, so cells are renamed by first appearance.
     let canonical = |steps: &[ply_eval::explore::Step]| -> Vec<Vec<String>> {
         let mut names: BTreeMap<String, usize> = BTreeMap::new();
         steps

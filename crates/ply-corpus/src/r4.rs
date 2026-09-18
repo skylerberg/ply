@@ -1,4 +1,4 @@
-//! The bar each of the value-representation work's levers has to clear, written before the lever is.
+//! The bar each value-representation lever has to clear.
 
 /// The window pair every figure a verdict reads must be fitted from.
 pub const WINDOW: (usize, usize) = (20, 200);
@@ -15,17 +15,11 @@ pub enum Lever {
 }
 
 impl Lever {
-    /// The allocations per request the attribution places under this lever, as a share of
-    /// [`BASELINE`].
+    /// Allocations per request attributed to this lever, as a share of [`BASELINE`].
     pub fn attributed_share(self) -> f64 {
         match self {
-            // 341.4 transient argument vectors of the 372.4 built; the other 31.0 are retained as
-            // `Ctor.args` and are not the pool's to take.
             Lever::ArgumentVectors => 341.4 / BASELINE,
-            // 65.0 literal `Str`/`Bytes` + 21.0 nullary constructor mentions + 24.0
-            // constructor-closure mentions.
             Lever::ConstantValues => 110.0 / BASELINE,
-            // 33.0 B-tree nodes.
             Lever::RecordLayout => 33.0 / BASELINE,
         }
     }

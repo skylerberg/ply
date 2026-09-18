@@ -1,5 +1,4 @@
-//! SplitMix64, written out rather than pulled in, so that a corpus generated from a seed today is
-//! byte-identical to one generated from it in a year.
+//! SplitMix64, written out so a seed's corpus stays byte-identical across dependency upgrades.
 
 #[derive(Clone, Debug)]
 pub struct Rng {

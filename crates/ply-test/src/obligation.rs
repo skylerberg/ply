@@ -26,7 +26,6 @@ pub struct Laws {
 }
 
 impl Laws {
-    /// Every law the program declares, with the definitions it names.
     pub fn of(check: &CheckOutput, hashes: &HashOutput) -> Laws {
         let mut laws = Laws::default();
         for law in &check.laws {
@@ -62,8 +61,7 @@ impl Laws {
         self.targets.get(law)
     }
 
-    /// The *sentence* of every law naming this definition, so that rewriting a law reads as a spec
-    /// change on everything it constrains — and re-implementing one of those definitions does not.
+    /// Every law sentence naming this definition: rewriting a law changes its targets' spec.
     pub fn naming(&self, name: &Symbol) -> Vec<DefHash> {
         self.targets
             .iter()
@@ -81,9 +79,6 @@ impl Laws {
     }
 }
 
-// --- The cache --------------------------------------------------------------
-
-/// Why an obligation was or was not attempted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Reason {
     /// Nothing is recorded under any key this run may read.
@@ -92,15 +87,13 @@ pub enum Reason {
     Proved,
     /// A sampled discharge, read under this exact plan's key.
     Sampled,
-    /// The cache was not consulted: `--no-cache`.
+    /// `--no-cache`.
     Uncached,
-    /// Something was recorded under a key it does not belong under, or under a label its evidence
-    /// does not support.
+    /// Recorded under a key it does not belong under, or a label its evidence does not support.
     Refused,
 }
 
 impl Reason {
-    /// Whether the answer came from the cache rather than from work.
     pub fn hit(self) -> bool {
         matches!(self, Reason::Proved | Reason::Sampled)
     }
@@ -116,12 +109,10 @@ impl Reason {
     }
 }
 
-/// What the cache had to say about one obligation.
 pub struct Answer {
     pub reason: Reason,
     pub evidence: Option<Evidence>,
-    /// A refusal, reported rather than swallowed: a cache that quietly declines to answer looks
-    /// exactly like a prover that is slow for no reason.
+    /// A refusal, reported: a cache that silently declines looks like a slow prover.
     pub warning: Option<Diagnostic>,
 }
 
@@ -153,7 +144,7 @@ impl Answer {
     }
 }
 
-/// What the cache holds for one obligation, under the two keys the obligation cache rule allows.
+/// A proof may only sit under the bare key, and a sample only under this plan's key.
 pub fn lookup(store: &Store, key: DefHash, plan: &ProvePlan) -> Answer {
     if let Some(entry) = store.obligation(key) {
         return match from_cached(entry) {
@@ -183,14 +174,13 @@ pub fn lookup(store: &Store, key: DefHash, plan: &ProvePlan) -> Answer {
     }
 }
 
-/// Writes a discharge, at the key its tier belongs under.
 pub fn record(store: &mut Store, key: DefHash, discharge: &Discharge, plan: &ProvePlan) -> bool {
     let Discharge::Held(evidence) = discharge else {
         return false;
     };
     let tier = evidence.tier();
     let at = result_key(key, Some(tier), plan);
-    // `result_key` already decides this.
+    // Defensive: only a proof may land on the bare key.
     if tier != Tier::Proved && at == key {
         return false;
     }
@@ -198,7 +188,6 @@ pub fn record(store: &mut Store, key: DefHash, discharge: &Discharge, plan: &Pro
     true
 }
 
-/// The cache's vocabulary, from the prover's.
 pub fn to_cached(evidence: &Evidence) -> CachedObligation {
     CachedObligation {
         tier: evidence.tier().as_str().to_string(),
@@ -220,7 +209,7 @@ pub fn to_cached(evidence: &Evidence) -> CachedObligation {
     }
 }
 
-/// The prover's vocabulary, from the cache's — and the one place the recorded tier is checked.
+/// The one place the recorded tier is checked.
 pub fn from_cached(entry: &CachedObligation) -> Result<Evidence, String> {
     let evidence = match &entry.evidence {
         CachedEvidence::Proof(c) => Evidence::Proof(Certificate {
@@ -244,8 +233,7 @@ pub fn from_cached(entry: &CachedObligation) -> Result<Evidence, String> {
             entry.tier
         ));
     }
-    // A certificate that did not establish its guard has a domain it cannot vouch for, so it is the
-    // `Vacuous` path rather than a hold — and nothing may read one back as a proof.
+    // A certificate that did not establish its guard is `Vacuous`, never readable as a proof.
     if let Evidence::Proof(c) = &evidence
         && !c.guard_satisfiable
     {
@@ -304,8 +292,6 @@ fn from_cached_rule(rule: &CachedRule) -> Rule {
     }
 }
 
-// --- Selection and discharge ------------------------------------------------
-
 /// What the cache answered for each obligation, parallel to the obligation list.
 pub struct Selection {
     pub reasons: Vec<Reason>,
@@ -334,10 +320,7 @@ pub fn select(
         warnings: Vec::new(),
     };
     for (index, obligation) in obligations.iter().enumerate() {
-        // A `law/host` is never read from the cache, in either direction and for the same reason a
-        // host-backed test is not: a green verdict that reached a real database is a claim about
-        // that database at that moment, and replaying it as a hit would report a discharge nothing
-        // performed.
+        // A `law/host` is never cached: a verdict against a real database is about that moment.
         let answer = if use_cache && !obligation.host {
             lookup(store, obligation.key, plan)
         } else {
@@ -355,22 +338,17 @@ pub fn select(
     selection
 }
 
-/// What actually decides an obligation.
 pub trait Discharger: Sync {
     fn discharge(&self, obligation: &Obligation, plan: &ProvePlan) -> Discharge;
 }
 
-/// A discharged run: the report, and where each answer came from.
 pub struct Proved {
     pub report: ProveReport,
-    /// Parallel to [`ProveReport::obligations`] — every obligation gets exactly one answer, from
-    /// the cache or from work.
+    /// Parallel to [`ProveReport::obligations`]: exactly one answer each, from cache or work.
     pub reasons: Vec<Reason>,
     pub warnings: Vec<Diagnostic>,
 }
 
-/// Selects, discharges what the cache could not answer, records what may be recorded, and assembles
-/// the report.
 pub fn prove(
     obligations: Vec<Obligation>,
     check: &CheckOutput,
@@ -432,7 +410,6 @@ pub fn prove(
     }
 }
 
-/// A [`Discharger`] that decides nothing.
 pub struct Undecided;
 
 impl Discharger for Undecided {
@@ -442,8 +419,6 @@ impl Discharger for Undecided {
         ))
     }
 }
-
-// --- Coverage ---------------------------------------------------------------
 
 /// The review surface: how much of the program a reader still has to read line by line.
 pub fn coverage(check: &CheckOutput, laws: &Laws, results: &[(Obligation, Discharge)]) -> Coverage {
@@ -513,15 +488,12 @@ pub fn specified(check: &CheckOutput, laws: &Laws, obligations: &[Obligation]) -
         .count()
 }
 
-// --- Review -----------------------------------------------------------------
-
 /// Whether something moved since the baseline a human accepted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Moved {
     Unchanged,
     Changed,
-    /// No baseline exists: this definition has never been accepted, or its name moved and took its
-    /// baseline with it.
+    /// No baseline: never accepted, or its name moved and took its baseline with it.
     Never,
 }
 
@@ -535,7 +507,6 @@ impl Moved {
     }
 }
 
-/// One definition, as `ply review --changed` reports it.
 #[derive(Clone, Debug)]
 pub struct Reviewed {
     pub name: Symbol,
@@ -553,7 +524,6 @@ impl Reviewed {
         self.holding > 0
     }
 
-    /// Whether a spec is attached at all, whatever became of it.
     pub fn claimed(&self) -> bool {
         !self.obligations.is_empty()
     }
@@ -563,7 +533,6 @@ impl Reviewed {
     }
 }
 
-/// What a review run found.
 #[derive(Clone, Debug, Default)]
 pub struct ReviewReport {
     pub definitions: usize,
@@ -580,17 +549,14 @@ pub struct ReviewReport {
 }
 
 impl ReviewReport {
-    /// Changed definitions carrying at least one obligation that holds.
     pub fn specified(&self) -> usize {
         self.changed.iter().filter(|r| r.specified()).count()
     }
 
-    /// Changed definitions carrying none.
     pub fn unspecified(&self) -> usize {
         self.changed.len() - self.specified()
     }
 
-    /// The one sentence this command must not get wrong.
     pub fn headline(&self) -> String {
         if self.changed.is_empty() {
             return "no definition changed since the last accepted review".to_string();
@@ -598,8 +564,7 @@ impl ReviewReport {
         let changed = self.changed.len();
         let unspecified = self.unspecified();
         let claim = if self.broken > 0 && self.broken == self.undischarged {
-            // Never discharged is not "no longer holds": nothing established it in the first place,
-            // and saying it stopped holding would report a check nobody ran.
+            // Never discharged is not "no longer holds": nothing established it in the first place.
             format!(
                 "{} obligation{} on a changed definition {} not discharged, so nothing here was established",
                 self.broken,
@@ -704,7 +669,6 @@ pub fn review(
     out
 }
 
-/// Records the current state of every definition as accepted.
 pub fn accept(check: &CheckOutput, hashes: &HashOutput, laws: &Laws, store: &mut Store) -> usize {
     let mut accepted = 0;
     for name in check.defs.keys() {
@@ -720,8 +684,7 @@ pub fn accept(check: &CheckOutput, hashes: &HashOutput, laws: &Laws, store: &mut
     accepted
 }
 
-/// Every claim *about* one definition: its own clause keys, and the hash of every law that names it
-/// directly.
+/// Every claim about one definition: its own clause keys and every law naming it directly.
 fn spec_hashes(name: &Symbol, hashes: &HashOutput, laws: &Laws) -> Vec<DefHash> {
     let mut out: Vec<DefHash> = hashes.spec_texts.get(name).cloned().unwrap_or_default();
     out.extend(laws.naming(name));

@@ -91,8 +91,7 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
         &loaded.program,
         &loaded.resolved,
         &loaded.check,
-        // `ply review` reports what moved; it binds nothing, so a `law/host` is a gap here exactly
-        // as it is under a hermetic `ply prove`.
+        // `ply review` binds nothing, so a `law/host` is a gap, as under a hermetic `ply prove`.
         None,
         backend,
     );
@@ -170,8 +169,6 @@ fn report_accept(
     code
 }
 
-/// What a reviewer should do with this definition, from the four rows of the review table's table that
-/// are worth printing.
 fn advice(entry: &Reviewed) -> &'static str {
     if !entry.specified() {
         return if entry.claimed() {
@@ -287,8 +284,7 @@ fn report_json(
         "coverage": coverage_json(&review.coverage),
         "plan": plan_json(&report.plan),
         "duration_ms": millis(review.duration),
-        // Not `changed`: a definition nobody specified can change without anything here noticing,
-        // so the artifact says what the claim is about.
+        // Not `changed`: an unspecified definition can change without anything here noticing.
         "headline": review.headline(),
         "specified_changed": review.specified(),
         "unspecified_changed": review.unspecified(),

@@ -14,9 +14,8 @@ pub trait Classify {
     /// The same for the test's own body.
     fn renormalized_test(&mut self, key: &Symbol) -> Option<DefHash>;
 
-    /// Whether the published interface — canonical scheme and footprint — is the same on both
-    /// sides, which is exactly the condition under which a hybrid that swaps this definition alone
-    /// still typechecks.
+    /// Whether the canonical scheme and footprint match on both sides, which is exactly when a
+    /// hybrid swapping this definition alone still typechecks.
     fn interface_stable(&mut self, key: &DefKey, before: DefHash) -> Option<bool>;
 
     /// The strongly connected component `key` belongs to, when it has more than one member.
@@ -24,8 +23,7 @@ pub trait Classify {
         Vec::new()
     }
 
-    /// Every hash the *whole current program* re-normalizes to against the baseline table — the
-    /// identities the current definitions would have had back then.
+    /// Every hash the whole current program re-normalizes to against the baseline table.
     fn baseline_image(&mut self) -> BTreeSet<DefHash> {
         BTreeSet::new()
     }

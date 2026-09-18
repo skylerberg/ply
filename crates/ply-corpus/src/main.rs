@@ -26,62 +26,39 @@ enum Command {
     Bench(BenchArgs),
     /// Generate and benchmark at several sizes, for one comparison table.
     Sweep(SweepArgs),
-    /// Price the control-stack machine's own claims: interpreter throughput
-    /// fixture open against rebuild, resumption cost, and
-    /// what isolation did to the schedule.
+    /// Price interpreter throughput, fixture open against rebuild, and resumption cost.
     Measure(MeasureArgs),
-    /// Price the search: interleavings pruned against unpruned, seeds to the
-    /// first failure against sampling, and seeds per second.
+    /// Price the search: pruning, seeds to the first failure, and seeds per second.
     Sim(SimArgs),
-    /// Price the spec tier: where obligations land, why the ones that fell
-    /// short did, and what shrinking bought.
+    /// Price the spec tier: where obligations land, why some fell short, what shrinking bought.
     Prove(ProveArgs),
-    /// Price a request: what one costs per layer, and what the endpoint
-    /// sustains under load. The number W6's decision on M9 turns on.
+    /// Price a request: its cost per layer, and what the endpoint sustains under load.
     Serve(ServeArgs),
-    /// Price what W2 put on the request path: a derived JSON codec, `Map`, and
-    /// what derivation costs the front end and the cache.
+    /// Price a derived JSON codec, `Map`, and what derivation costs the front end and cache.
     Payload(PayloadArgs),
-    /// Price what W3 put on it: routing, real HTTP/1.1 framing, keep-alive and
-    /// TLS — and re-take W2's field-proportional cost sweep against the result.
+    /// Price routing, HTTP/1.1 framing, keep-alive and TLS on the request path.
     W3(W3Args),
-    /// Price what W4 put behind it: a statement through the effect boundary
-    /// against the same statement with no Ply in the path, the pool, and a
-    /// route that hits the database against one that does not.
+    /// Price a statement through the effect boundary against one with no Ply in the path.
     W4(W4Args),
-    /// Price what W5 put around it: a trace operation against the same loop
-    /// performing none, the service with only `--trace` moved, a drain with
-    /// requests in flight, what the deadline does to an open transaction, and
-    /// what a deploy ships.
+    /// Price tracing, a drain with requests in flight, the deadline, and a deploy.
     W5(W5Args),
-    /// Assemble the W6 report and apply the M9 criteria to it. The thresholds
-    /// live in `ply_corpus::w6::Criteria` and are not readable from the file,
-    /// so a measurement cannot supply the bar it is about to clear.
+    /// Assemble the W6 report and apply the M9 criteria to it.
     W6(W6Args),
-    /// Take the W6 ladder: nine rungs, each a pair of absolutes differing in
-    /// one substitution, plus the floor, the served total and the offering rows.
-    /// Writes the measurement half of a
-    /// `ply_corpus::w6::Report`, which `w6` then judges.
+    /// Take the W6 ladder, writing the measurement half of a report that `w6` judges.
     W6Ladder(W6LadderArgs),
-    /// Price region isolation before it is built: colour the same test set with and
-    /// without the world-backed exemption, and report what the second colouring
-    /// costs in groups, in critical path and in wall clock.
+    /// Price region isolation: colour the tests with and without the world-backed exemption.
     Regions(RegionsArgs),
 }
 
 #[derive(Args, Debug)]
 struct RegionsArgs {
-    /// Projects to analyse. Each is loaded the way `ply` loads one, so shipped
-    /// modules resolve and `examples/` works.
+    /// Projects to analyse, each loaded the way `ply` loads one.
     #[arg(required = false)]
     roots: Vec<PathBuf>,
-    /// Workers the wall-clock columns are modelled at, and the pool the
-    /// measured suite number is taken in.
+    /// Workers the wall-clock columns are modelled at and the suite is measured with.
     #[arg(long, default_value_t = 8)]
     jobs: usize,
     /// Hypothetical footprints, `cells:labels`, appended as their own rows.
-    /// The measured corpora carry no `cell` atom at all, so this is how the
-    /// risk is priced rather than asserted away.
     #[arg(long, value_delimiter = ',')]
     hypothetical: Vec<String>,
     /// Tests carrying a contending resource atom in each hypothetical row.
@@ -132,17 +109,13 @@ struct ShapeArgs {
     /// `counter.bump` calls per task, separated by a `task.yield()`.
     #[arg(long, default_value_t = 2)]
     steps_per_task: usize,
-    /// 0.0 gives every task its own resource, so nothing conflicts and the
-    /// search collapses; 1.0 puts every task on one, so nothing prunes.
+    /// 0.0 gives every task its own resource; 1.0 puts every task on one.
     #[arg(long, default_value_t = 0.5)]
     conflict_density: f64,
     /// Fraction of generated definitions carrying a `requires`/`ensures` pair.
-    /// This is the axis to vary when pricing discharge against definition count.
     #[arg(long, default_value_t = 0.0)]
     spec_fraction: f64,
-    /// Definitions per module written for their obligation, so that the tier
-    /// distribution spans the table instead of landing in one bucket. Each
-    /// contributes a law as well.
+    /// Definitions per module written for their obligation, each with a law.
     #[arg(long, default_value_t = 0)]
     specimens_per_module: usize,
 }
@@ -178,8 +151,7 @@ struct GenArgs {
     out: PathBuf,
     #[command(flatten)]
     shape: ShapeArgs,
-    /// Write the corpus without compiling it. Only useful for inspecting output
-    /// the compiler has already rejected.
+    /// Write the corpus without compiling it.
     #[arg(long)]
     no_verify: bool,
     #[arg(long)]
@@ -193,8 +165,7 @@ struct BenchArgs {
     /// Repeats per scenario; the fastest run is reported.
     #[arg(long, default_value_t = 3)]
     repeats: usize,
-    /// Attach a compiled backend, as `ply test --backend` spells it. Every scenario is measured
-    /// under it, and a `compile` phase appears beside the others: one row is one engine.
+    /// Attach a compiled backend, as `ply test --backend` spells it.
     #[arg(long, value_name = "BACKEND")]
     backend: Option<String>,
     #[arg(long)]
@@ -222,8 +193,7 @@ struct SweepArgs {
 
 #[derive(Args, Debug)]
 struct MeasureArgs {
-    /// A directory a previous `gen` wrote. Omit it for the measurements that
-    /// need no corpus — fixture cost and resumption cost.
+    /// A directory a previous `gen` wrote. Omit it for fixture and resumption cost.
     corpus: Option<PathBuf>,
     /// Repeats per measurement; the fastest is reported.
     #[arg(long, default_value_t = 3)]
@@ -231,8 +201,7 @@ struct MeasureArgs {
     /// Fixture sizes for the open-against-rebuild comparison.
     #[arg(long, value_delimiter = ',', default_values_t = [1usize, 100, 1_000, 10_000, 100_000])]
     cells: Vec<usize>,
-    /// Skip everything but the throughput table, so a profile is not dominated
-    /// by measurements that are not being investigated.
+    /// Skip everything but the throughput table.
     #[arg(long)]
     only_throughput: bool,
     #[arg(long)]
@@ -243,19 +212,16 @@ struct MeasureArgs {
 struct SimArgs {
     /// A `.ply` file, or a directory a previous `gen` wrote.
     corpus: PathBuf,
-    /// Roots per strategy in the race-finding table. Zero drops that table,
-    /// which is what to do on a corpus with no failing test.
+    /// Roots per strategy in the race-finding table. Zero drops that table.
     #[arg(long, default_value_t = 32)]
     trials: u32,
-    /// Interleavings a search may run per root. The unpruned side gets the same
-    /// one, so a spent budget is reported on both.
+    /// Interleavings a search may run per root, pruned or not.
     #[arg(long, default_value_t = 4096)]
     budget: u32,
     /// Scheduling steps one interleaving may take.
     #[arg(long, default_value_t = ply_eval::sim::DEFAULT_STEPS)]
     steps: u32,
-    /// Seeds the throughput table times. Sampled, so the rate is one whole test
-    /// per seed with no search state between them.
+    /// Seeds the throughput table times.
     #[arg(long, default_value_t = 64)]
     rate_seeds: u32,
     /// Drop the reduction table, which is the expensive one.
@@ -294,13 +260,10 @@ fn simulate(args: SimArgs) -> Result<()> {
 
 #[derive(Args, Debug)]
 struct ServeArgs {
-    /// The repository root, which is where `examples/hello.ply` is read from.
-    /// The endpoint under measurement is the one W1 shipped, not a copy.
+    /// The repository root, where `examples/hello.ply` is read from.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// The `ply` binary the load table drives. Defaults to this binary's
-    /// sibling, so a release measurement never silently serves from a debug
-    /// build.
+    /// The `ply` binary the load table drives. Defaults to this binary's sibling.
     #[arg(long)]
     ply: Option<PathBuf>,
     /// Requests per ladder rung. Each is one connection.
@@ -312,13 +275,10 @@ struct ServeArgs {
     /// Requests per load point.
     #[arg(long, default_value_t = 2000)]
     requests: u32,
-    /// Simultaneous client connections to sweep. `serve` recursion is charged
-    /// against the call budget, so a point costs `requests` nested calls.
+    /// Simultaneous client connections to sweep.
     #[arg(long, value_delimiter = ',', default_values_t = [1u32, 2, 4, 8, 16, 32, 64])]
     concurrency: Vec<u32>,
-    /// Filler header lines the client's request carries, per load point. Zero is
-    /// `curl`; eight is about what a browser sends, which is the length W1's
-    /// scans were quadratic-feeling on.
+    /// Filler header lines the client's request carries, per load point.
     #[arg(long, value_delimiter = ',', default_values_t = [0usize])]
     load_headers: Vec<usize>,
     /// Drop the per-request ladder, which is the slow half.
@@ -327,8 +287,7 @@ struct ServeArgs {
     /// Drop the load table, which is the half that needs a built `ply`.
     #[arg(long)]
     no_load: bool,
-    /// Also measure the endpoint with W1's `fold`-based scans, so the byte
-    /// builtins' before and after are one table taken on one machine.
+    /// Also measure the endpoint with `fold`-based scans instead of the byte builtins.
     #[arg(long)]
     baseline: bool,
     #[arg(long)]
@@ -372,9 +331,7 @@ fn serve(args: ServeArgs) -> Result<()> {
         };
         for &headers in &args.load_headers {
             for &parser in parsers {
-                // The sequential endpoint is `examples/hello.ply` as written, and it serves one
-                // connection at a time however many arrive — so it is reported at concurrency 1
-                // alone.
+                // The sequential endpoint serves one connection at a time, so only concurrency 1.
                 load.push(ply_corpus::serve::load(
                     &args.repo,
                     &ply,
@@ -421,13 +378,10 @@ fn serve(args: ServeArgs) -> Result<()> {
 
 #[derive(Args, Debug)]
 struct W3Args {
-    /// The repository root, which is where `examples/desk.ply` is read from.
-    /// The service under measurement is the one W3 shipped, not a copy.
+    /// The repository root, where `examples/desk.ply` is read from.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// The `ply` binary the load tables drive. Defaults to this binary's
-    /// sibling, so a release measurement never silently serves from a debug
-    /// build.
+    /// The `ply` binary the load tables drive. Defaults to this binary's sibling.
     #[arg(long)]
     ply: Option<PathBuf>,
     /// Simultaneous client connections to sweep.
@@ -436,12 +390,10 @@ struct W3Args {
     /// Requests one connection carries in the throughput sweep.
     #[arg(long, default_value_t = 32)]
     per_conn: u32,
-    /// Requests per point in the throughput sweep, held about constant across
-    /// concurrencies so a p99 at one rests on as many samples as at another.
+    /// Requests per point in the throughput sweep, held constant across concurrencies.
     #[arg(long, default_value_t = 4000)]
     requests_per_point: u32,
-    /// Requests per point in the keep-alive and TLS ladders, held constant
-    /// while the requests-per-connection rung varies.
+    /// Requests per point in the keep-alive and TLS ladders.
     #[arg(long, default_value_t = 3200)]
     ladder_requests: u32,
     /// Client threads in the keep-alive and TLS ladders.
@@ -453,12 +405,10 @@ struct W3Args {
     /// Repeats per in-process point; the fastest is reported.
     #[arg(long, default_value_t = 3)]
     repeats: usize,
-    /// Also serve the task-per-connection variant, which is the same service
-    /// with a spawn in its accept loop.
+    /// Also serve the task-per-connection variant.
     #[arg(long)]
     concurrent: bool,
-    /// Also re-take W2's single-endpoint load number on this machine, so the
-    /// comparison is one table rather than a figure quoted from a milestone ago.
+    /// Also re-take W2's single-endpoint load number on this machine.
     #[arg(long)]
     w2_baseline: bool,
     /// Sections to drop, for a run pointed at one question.
@@ -543,13 +493,10 @@ fn w3(args: W3Args) -> Result<()> {
 
 #[derive(Args, Debug)]
 struct W4Args {
-    /// The repository root, which is where `examples/desk.ply` is read from for
-    /// the `crud` section.
+    /// The repository root, where `examples/desk.ply` is read from for `crud`.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// The database every section runs against. This harness creates and drops
-    /// its own `part` table in it and touches nothing else, and the `crud`
-    /// section expects the desk's schema to be there already.
+    /// The database; its own `part` table is created and dropped, and `crud` needs the desk schema.
     #[arg(long)]
     db: String,
     #[arg(long)]
@@ -566,8 +513,7 @@ struct W4Args {
     /// Pool sizes the `pool` section sweeps.
     #[arg(long, value_delimiter = ',', default_values_t = [1usize, 2, 4, 8, 16])]
     pool_sizes: Vec<usize>,
-    /// Connections the `ops` sweep's pool holds, held constant so its rows
-    /// differ in concurrency and not in two things at once.
+    /// Connections the `ops` sweep's pool holds, constant across its rows.
     #[arg(long, default_value_t = 16)]
     pool: usize,
     /// Repeats per point; the fastest is reported.
@@ -611,8 +557,7 @@ fn w4(args: W4Args) -> Result<()> {
     }
     if !args.no_pool {
         out.pool = w4::pool(&args.db, &args.pool_sizes, 8, args.operations, args.repeats)?;
-        // A pool acquire is a *deadline*, not a capacity check: a pool of one with eight open
-        // scopes queues and completes if the deadline is generous, and refuses if it is not.
+        // An acquire is a deadline, not a capacity check: a small pool queues until it expires.
         for (pool, concurrency, acquire) in [
             (1, 8, 5000),
             (1, 32, 5000),
@@ -651,23 +596,18 @@ fn w4(args: W4Args) -> Result<()> {
 
 #[derive(Args, Debug)]
 struct W5Args {
-    /// The repository root, which is where `examples/desk.ply` is read from.
+    /// The repository root, where `examples/desk.ply` is read from.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
     #[arg(long)]
     ply: Option<PathBuf>,
-    /// The database the served sections run against. It must already hold the
-    /// desk's schema — `--db-schema desk.schema` refuses at bind time if not —
-    /// and the transaction section writes one order into it and expects the
-    /// teardown to take it away again.
+    /// The database the served sections run against. It must hold the desk's schema.
     #[arg(long)]
     db: Option<String>,
     /// Trace operations per point in the `events` table.
     #[arg(long, default_value_t = 20_000)]
     operations: u32,
-    /// Operations per twin point. Smaller because `std.trace`'s `Sink` appends
-    /// with `push` and is therefore quadratic in the records it holds, and a
-    /// twin lives inside one test holding tens of them.
+    /// Operations per twin point. Small because `Sink` appends are quadratic in records held.
     #[arg(long, default_value_t = 200)]
     twin_operations: u32,
     #[arg(long, default_value_t = 3)]
@@ -684,18 +624,13 @@ struct W5Args {
     in_flight: Vec<u32>,
     #[arg(long, default_value_t = 5_000)]
     drain_ms: u64,
-    /// How long a client holds its half-sent request before finishing it, in
-    /// the points whose drain is meant to complete.
+    /// How long a client holds its half-sent request before finishing it.
     #[arg(long, default_value_t = 500)]
     hold_ms: u64,
-    /// The credential the served desk is configured with. A benchmark's key is
-    /// a fixture credential and is not a credential.
+    /// The credential the served desk is configured with.
     #[arg(long, default_value = "bench-key")]
     api_key: String,
-    /// Serve the `served` table from the task-per-connection accept loop rather
-    /// than `examples/desk.ply`'s sequential one. A sequential server answers
-    /// one connection at a time, so a tail latency at concurrency 8 is a queue
-    /// rather than a service.
+    /// Serve the `served` table from the task-per-connection accept loop.
     #[arg(long)]
     concurrent: bool,
     /// Sections to drop, for a run pointed at one question.
@@ -731,9 +666,7 @@ fn w5(args: W5Args) -> Result<()> {
         )?;
     }
     if !args.no_deploy {
-        // One definition's body, and one that nothing in `desk.ply` reads at start-up, so the
-        // second build differs in exactly one leaf and its dependents rather than in the shape of
-        // the program.
+        // Nothing reads this at start-up, so the second build differs in one leaf.
         out.deploy = Some(w5::deploy(
             &args.repo,
             &ply,
@@ -807,39 +740,31 @@ fn w5(args: W5Args) -> Result<()> {
 
 #[derive(Args, Debug)]
 struct W6LadderArgs {
-    /// The repository root, which is where `examples/desk.ply` is read from.
-    /// The service under measurement is the one W5 shipped, not a copy.
+    /// The repository root, where `examples/desk.ply` is read from.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// The `ply` binary the served rungs drive. Defaults to this binary's
-    /// sibling, so a release measurement never serves from a debug build.
+    /// The `ply` binary the served rungs drive. Defaults to this binary's sibling.
     #[arg(long)]
     ply: Option<PathBuf>,
-    /// The database the served rungs run against. It must already hold the
-    /// desk's schema: `--db-schema desk.schema` refuses at bind time if not.
+    /// The database the served rungs run against. It must hold the desk's schema.
     #[arg(long)]
     db: String,
-    /// Requests per in-process point, for the rungs taken over `SimNet`, over a
-    /// real listener and against the Rust floor.
+    /// Requests per in-process point: over `SimNet`, a real listener, and the Rust floor.
     #[arg(long, default_value_t = 2000)]
     requests: u32,
-    /// Iterations of the in-Ply loop rungs 2, 3 and 4 are read off. One
-    /// `Machine::call` runs them all, so the twin's fixture is amortized rather
-    /// than landing inside a layer.
+    /// Iterations of the in-Ply loop rungs 2, 3 and 4 are read off.
     #[arg(long, default_value_t = 2000)]
     iterations: u32,
     #[arg(long, default_value_t = 3)]
     repeats: usize,
-    /// Client concurrencies the served sweep takes. The total is read off
-    /// whichever maximizes throughput.
+    /// Client concurrencies the served sweep takes; the total uses the fastest.
     #[arg(long, num_args = 1.., default_values_t = [1u32, 2, 4, 8, 16, 32])]
     concurrency: Vec<u32>,
     #[arg(long, default_value_t = 32)]
     per_conn: u32,
     #[arg(long, default_value_t = 3000)]
     requests_per_point: u32,
-    /// The credential the served desk is configured with. A benchmark's key is
-    /// a fixture credential and is not a credential.
+    /// The credential the served desk is configured with.
     #[arg(long, default_value = "bench-key")]
     api_key: String,
     /// The machine the numbers were taken on, for the provenance line.
@@ -851,52 +776,31 @@ struct W6LadderArgs {
     /// Drop the served half, for a run pointed at the in-process rungs.
     #[arg(long)]
     no_served: bool,
-    /// Run one phase on its own and print what it cost per request, so a
-    /// sampling profiler sees that phase and nothing else. One of `sim`,
-    /// `socket`, `routed`, `endpoint`, `items`.
+    /// Run one phase alone for a profiler: `sim`, `socket`, `routed`, `endpoint` or `items`.
     #[arg(long)]
     only: Option<String>,
     /// Rounds of `--only`, each of `--requests` requests.
     #[arg(long, default_value_t = 1)]
     rounds: usize,
-    /// Which accept loop the **ladder's** rungs and total are read off.
-    ///
-    /// what the ladder is measured on pins `task-per-conn`, and the default here departs from it
-    /// for a measured reason: `task.spawn` opens a production region for the
-    /// life of the server, and `Machine::constant` refuses the constant memo
-    /// inside any open region — so a spawning service memoizes nothing. The
-    /// in-process rungs are `run_memory` over one connection at a time and do
-    /// memoize, so a ladder whose lower rungs spanned one regime and whose
-    /// total spanned the other would divide a memo-active numerator by a
-    /// memo-inert denominator. Both loops are measured either way, and the one
-    /// this is not set to becomes its own labelled offering rows.
+    /// Which accept loop the ladder is read off. Spawning disables the constant memo.
     #[arg(long, default_value = "sequential")]
     accept: String,
-    /// Repeats of the sweep on the loop the ladder is *not* read off. It
-    /// contributes tail latency and throughput rows, which need no band.
+    /// Repeats of the sweep on the loop the ladder is not read off.
     #[arg(long, default_value_t = 1)]
     other_repeats: usize,
-    /// Repeats of the whole served sweep. The rungs above the socket are
-    /// differences between served rows, and a difference between two numbers
-    /// taken once has no width.
+    /// Repeats of the whole served sweep, so rung differences have a width.
     #[arg(long, default_value_t = 3)]
     served_repeats: usize,
-    /// Skip the constant memo's end-to-end pricing, which serves a second
-    /// variant of the service and roughly doubles the run.
+    /// Skip the constant memo's end-to-end pricing.
     #[arg(long)]
     no_levers: bool,
-    /// Where to write the report. The default is stdout, so
-    /// `w6-ladder .. > benches/w6-ladder.json` reproduces the shipped file.
+    /// Where to write the report. Defaults to stdout.
     #[arg(long)]
     out: Option<PathBuf>,
-    /// Where to write the raw in-process and served rows the report is read
-    /// off. Not part of the report, and not needed to re-take it.
+    /// Where to write the raw rows the report is read off.
     #[arg(long)]
     detail: Option<PathBuf>,
-    /// Write the control the constant memo's price is measured against —
-    /// `examples/desk.ply` with every nullary definition of its own given a
-    /// dead parameter — into this directory, and stop. A ratio is only as
-    /// checkable as the program on the other side of it.
+    /// Write the constant memo's control program into this directory, and stop.
     #[arg(long)]
     write_control: Option<PathBuf>,
 }
@@ -952,8 +856,7 @@ fn w6_ladder(args: W6LadderArgs) -> Result<()> {
         &args.api_key,
         args.served_repeats,
     )?;
-    // The other loop, reported once, separately and labelled — which is what the ladder's method asks of whichever
-    // loop the ladder is not read off.
+    // The loop the ladder is not read off, reported as its own labelled rows.
     let other_rows = w6_run::served(
         &args.repo,
         &ply,
@@ -1022,14 +925,10 @@ fn w6_ladder(args: W6LadderArgs) -> Result<()> {
 
 #[derive(Args, Debug)]
 struct W6Args {
-    /// One or more measurement files. Each is a `ply_corpus::w6::Report`
-    /// fragment; later files win field by field, which is how the ladder agent
-    /// and the spike agent produce their halves independently.
+    /// Measurement files, each a `ply_corpus::w6::Report` fragment; later files win per field.
     #[arg(required = true)]
     reports: Vec<PathBuf>,
-    /// Exit non-zero when the report is incomplete. The default prints the
-    /// audit and still renders, because a partial report is worth reading; CI
-    /// wants the other behaviour.
+    /// Exit non-zero when the report is incomplete.
     #[arg(long)]
     strict: bool,
     #[arg(long)]
@@ -1074,16 +973,13 @@ fn w6(args: W6Args) -> Result<()> {
 
 #[derive(Args, Debug)]
 struct PayloadArgs {
-    /// Line items per JSON payload. Forty is about four kilobytes, which is the
-    /// size a real order body arrives at.
+    /// Line items per JSON payload.
     #[arg(long, value_delimiter = ',', default_values_t = [1usize, 10, 40, 200, 1000])]
     lines: Vec<usize>,
     /// Encodes and decodes per payload size.
     #[arg(long, default_value_t = 200)]
     iterations: u32,
-    /// `lines:pad` pairs for the table that separates a decode's per-field cost
-    /// from its per-byte one. The default holds the line count still and grows
-    /// one string field, which is the only way the two come apart.
+    /// `lines:pad` pairs separating a decode's per-field cost from its per-byte one.
     #[arg(long, value_delimiter = ',', default_values_t = [
         String::from("40:0"),
         String::from("40:100"),
@@ -1100,8 +996,7 @@ struct PayloadArgs {
     /// Types per module in that comparison.
     #[arg(long, default_value_t = 10)]
     types_per_module: usize,
-    /// Processes the `map_keys` order check spawns. Two is the minimum that can
-    /// see a per-process hasher seed at all.
+    /// Processes the `map_keys` order check spawns; two is the minimum to see a hasher seed.
     #[arg(long, default_value_t = 4)]
     processes: usize,
     /// The `ply` binary the order check drives.
@@ -1109,8 +1004,7 @@ struct PayloadArgs {
     ply: Option<PathBuf>,
     #[arg(long, default_value_t = 3)]
     repeats: usize,
-    /// Drop the derivation comparison, which is the slow half: it compiles and
-    /// runs six whole projects.
+    /// Drop the derivation comparison, the slow half.
     #[arg(long)]
     no_derivation: bool,
     #[arg(long)]
@@ -1146,8 +1040,7 @@ fn payload(args: PayloadArgs) -> Result<()> {
     Ok(())
 }
 
-/// `lines:pad` — the two numbers that have to move independently for the table
-/// to say anything.
+/// Parses `lines:pad`.
 fn parse_shape(point: &str) -> Result<(usize, usize)> {
     let (lines, pad) = point
         .split_once(':')
@@ -1165,8 +1058,7 @@ fn parse_shape(point: &str) -> Result<(usize, usize)> {
 
 #[derive(Args, Debug)]
 struct ProveArgs {
-    /// One or more `.ply` files or directories. Each is reported on its own row
-    /// so a generated corpus never averages with a written one.
+    /// `.ply` files or directories, each reported on its own row.
     #[arg(required = true)]
     projects: Vec<PathBuf>,
     #[arg(long, default_value_t = ply_prove::DEFAULT_CASES)]
@@ -1216,8 +1108,7 @@ fn measure(args: MeasureArgs) -> Result<()> {
     if let Some(root) = &args.corpus {
         out.throughput = Some(measure::throughput(root, args.repeats)?);
         if !args.only_throughput {
-            // Scheduling clears the cache, so the store is timed before it rather than over the
-            // empty one it leaves behind.
+            // Scheduling clears the cache, so the store is timed before it.
             out.store_open = Some(measure::store_open(root, args.repeats)?);
             out.scheduling = Some(measure::scheduling(root)?);
         }
@@ -1413,8 +1304,7 @@ fn sweep(args: SweepArgs) -> Result<()> {
     Ok(())
 }
 
-/// `modules,defs_per_module,tests` — the three numbers that move together when
-/// a corpus is scaled, so a sweep names sizes rather than repeating ten flags.
+/// Parses `modules,defs_per_module,tests`.
 fn parse_size(size: &str, seed: u64) -> Result<CorpusSpec> {
     let parts: Vec<&str> = size.split(',').collect();
     if parts.len() != 3 {

@@ -10,34 +10,26 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub struct Loaded {
-    /// The project root: what module names are derived relative to, and where the cache lives.
+    /// What module names are derived relative to, and where the cache lives.
     pub root: PathBuf,
-    /// One entry per module, in load order — paths sorted.
+    /// One entry per module, sorted.
     pub files: Vec<PathBuf>,
     pub sources: SourceMap,
-    /// Every module of the program, the shipped ones included.
+    /// Every module, the shipped ones included.
     pub program: Program,
     pub resolved: Resolved,
-    /// The front end's whole answer over this program, as the port gave it (ADR 0052 §1): the
-    /// checker's output and the hashes below, and beside them the load order, the item ordinals,
-    /// the normalized bodies and what each declaration's source wrote.
-    ///
-    /// A command that needs a compiled tier hands **this** to `ply_codegen::Unit::over_front`, so
-    /// that one invocation runs one front end.
+    /// Handed to `ply_codegen::Unit::over_front` so one invocation runs one front end.
     pub front: Front,
-    /// [`Front::check`], which nearly everything downstream reads.
+    /// [`Front::check`].
     pub check: CheckOutput,
     /// [`Front::hashes`].
     pub hashes: HashOutput,
     pub frontend: FrontEnd,
-    /// Whether any module — parsed this run or restored from the cache — declares a `reuse fn`,
-    /// so a command knows whether the promise check has anything to check before it parses
-    /// everything the check needs.
+    /// Whether any module declares a `reuse fn`, so the promise check can be skipped.
     pub promised: bool,
 }
 
-/// Carries the [`SourceMap`] even on failure: a parse error is useless without the text its spans
-/// point into.
+/// Carries the [`SourceMap`]: a parse error is useless without the text its spans point into.
 #[derive(Debug)]
 pub struct LoadError {
     pub sources: SourceMap,
@@ -53,8 +45,7 @@ impl LoadError {
     }
 }
 
-/// A module and the file it was read from, which the AST does not record — a
-/// [`ply_syntax::ast::Module`] knows its [`SourceId`], not its path.
+/// A module and the file it was read from, which the AST does not record.
 pub struct ModuleView<'a> {
     pub name: &'a ModuleName,
     pub info: &'a ModuleInfo,
@@ -101,8 +92,7 @@ impl Loaded {
             .collect()
     }
 
-    /// Tests declared by one module, paired with their index in [`CheckOutput::tests`] — the index
-    /// everything else is keyed by.
+    /// Tests declared by one module, with their index in [`CheckOutput::tests`].
     pub fn tests_of(&self, module: &ModuleName) -> Vec<(usize, &TestInfo)> {
         self.check
             .tests
@@ -112,7 +102,7 @@ impl Loaded {
             .collect()
     }
 
-    /// Every definition named `main`, whatever module declares it.
+    /// Every non-std definition named `main`.
     pub fn entry_points(&self) -> Vec<&DefInfo> {
         let main = Symbol::new("main");
         self.check
@@ -123,7 +113,7 @@ impl Loaded {
     }
 }
 
-/// The directory module names are derived relative to, and the directory the caches live under.
+/// The directory module names are relative to and the caches live under.
 pub fn project_root(path: &Path) -> PathBuf {
     match std::fs::metadata(path) {
         Ok(meta) if meta.is_file() => path
@@ -142,7 +132,7 @@ pub fn load(path: &Path) -> Result<Loaded, LoadError> {
 
 pub(crate) struct Discovered {
     pub(crate) path: PathBuf,
-    /// Relative to the project root, which is what names the module.
+    /// Relative to the project root; names the module.
     pub(crate) relative: PathBuf,
 }
 
@@ -188,8 +178,7 @@ pub(crate) fn discover(path: &Path) -> Result<(PathBuf, Vec<Discovered>), Vec<Di
 
 /// Every `.ply` file under `root`, sorted.
 pub(crate) fn ply_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
-    // A project rooted at `.` keys its cache under the empty path, which names the cache directory
-    // correctly and reads as no directory at all.
+    // A project rooted at `.` has the empty path as its root.
     let root = if root.as_os_str().is_empty() {
         Path::new(".")
     } else {
@@ -201,8 +190,7 @@ pub(crate) fn ply_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Hidden directories are excluded, which is also what keeps `.ply-cache` and the VCS metadata out
-/// of the program.
+/// Skips hidden directories, which keeps `.ply-cache` and VCS metadata out.
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -224,8 +212,7 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `Path::new(".").join("a.ply")` is `./a.ply`, and that prefix would show up in every span this
-/// file ever renders.
+/// Strips `./`, which would otherwise show up in every rendered span.
 pub fn tidy(path: &Path) -> PathBuf {
     path.strip_prefix("./").unwrap_or(path).to_path_buf()
 }

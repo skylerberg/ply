@@ -24,8 +24,7 @@ use std::path::{Path, PathBuf};
 
 pub fn execute(args: &TestArgs, style: Style) -> i32 {
     let warnings = Vec::new();
-    // Before the store is opened, because a misspelled `--backend` must not leave a cache directory
-    // behind for a run that is about to refuse.
+    // Before the store opens, so a refused `--backend` leaves no cache directory behind.
     let backend =
         match select_profile(&args.profile).and_then(|()| backend_spec(args.backend.as_ref())) {
             Ok(spec) => spec,
@@ -44,8 +43,6 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
             }
         };
     let no_cache = cache_bypassed(args);
-    // Which engine's history this run reads and adds to. Decided before the store is opened,
-    // because it is what selection is read against.
     let engine = super::common::engine_of(backend.as_ref());
     let mut cache = match Cache::open(&project_root(&args.path), no_cache) {
         Ok(cache) => cache,
@@ -63,9 +60,6 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
             return EXIT_COMPILE_ERROR;
         }
     };
-    // The store, the front end and the compiled unit outlive one iteration under `--watch`, which
-    // is the whole of what a warm process is: `benches/marginal-change/` reads an invocation that
-    // rechecks nothing and still pays a front end proportional to the project.
     let mut warm = crate::warm::Warm::default();
     if !args.watch {
         return iterate(
@@ -90,9 +84,7 @@ fn watch(
     let root = project_root(&args.path);
     iterate(args, style, cache, backend, engine, warm, warnings);
     loop {
-        // A poll rather than a filesystem notification: the scan is a stat per file and this
-        // command already owes the tree a walk to discover it, so a watcher would be a dependency
-        // buying latency this loop cannot use.
+        // Polling: the walk is owed anyway, so a watcher would add a dependency for no latency.
         std::thread::sleep(std::time::Duration::from_millis(120));
         if !warm.tree_moved(&root) {
             continue;
@@ -122,9 +114,7 @@ fn iterate(
     warnings.extend(migration);
 
     let incremental = !args.no_incremental && !no_cache;
-    // What the last iteration built, if every file is still as it was. The front end is a function
-    // of the sources, so an unmoved tree has the same one — and re-deriving it is the cost that
-    // dominates a small edit.
+    // The front end is a function of the sources, so an unmoved tree reuses it.
     let (held, reuse) = warm.take(&project_root(&args.path));
     let loaded = match held {
         Some(loaded) => Ok(loaded),
@@ -134,8 +124,7 @@ fn iterate(
     let loaded = match loaded {
         Ok(mut loaded) => {
             if reuse == crate::warm::Reuse::Whole {
-                // Nothing was read, parsed or derived this iteration, and the report says so
-                // rather than repeating what the iteration that did the work spent.
+                // Nothing was re-derived, so this iteration reports no phase time.
                 loaded.frontend.phases = driver::Phases::default();
             }
             loaded
@@ -146,8 +135,7 @@ fn iterate(
     warnings.extend(loaded.frontend.warnings.iter().cloned());
 
     let hashes = loaded.hashes.clone();
-    // Half of what a simulated test is cached under, so it is decided before selection and never
-    // after it.
+    // Part of a simulated test's cache key, so decided before selection.
     let search = crate::simulation::plan(&args.simulation);
     let selected = ply_test::select(&loaded.check, &hashes, &cache.store, &search, engine);
     let plan = Plan::new(selected, &loaded.check, args.filter.as_deref(), args.std);
@@ -156,15 +144,13 @@ fn iterate(
         return report_load_error("test", &err, args.json, style);
     }
 
-    // Before anything runs: a registration the program does not declare is the host author's bug,
-    // and a run that started anyway would touch a resource nobody could name.
+    // Before anything runs, so no test touches a resource the program does not declare.
     let db = match args.db.resolve(args.host) {
         Ok(db) => db,
         Err(diagnostics) => {
             return report_bind_error("test", &diagnostics, &loaded.sources, args.json, style);
         }
     };
-    // Every row this run can enter, which is the union of the tests'.
     let reach = ply_ty::ty::Footprint::from_atoms(
         loaded
             .check
@@ -172,9 +158,7 @@ fn iterate(
             .iter()
             .flat_map(|t| t.footprint.atoms().cloned()),
     );
-    // Before the binding, because a required key nothing supplies is the run's configuration and
-    // has nothing to do with what the registry resolves — and because a suite that discovers it is
-    // misconfigured after its first host test has already run that test against the wrong thing.
+    // Before binding, so a missing required key fails before any host test runs.
     let (configuration, config_warnings) = match crate::config::Configuration::open(
         &loaded.program,
         &loaded.resolved,
@@ -195,8 +179,7 @@ fn iterate(
         &args.fs.fs,
         db,
         configuration,
-        // `ply test` discards, always: a suite asserts on its records through `std.trace`'s twin,
-        // and `--trace` on this command already names M5's definition trace.
+        // `--trace` on this command names the definition trace, so records are discarded.
         &crate::trace::TraceOptions::silent(),
         Some(&reach),
     ) {
@@ -211,23 +194,13 @@ fn iterate(
     let (pool, workers) = build_pool(args.jobs, &mut warnings);
     let simulation =
         ply_test::Search::of(&plan.selection).measuring(args.simulation.measure_reduction);
-    // A factory rather than a handle: a reactor belongs to the thread its machine runs on, and the
-    // runner builds a machine per worker.
+    // A factory: a reactor belongs to its thread, and each worker builds its own machine.
     let runtime = hosts.runtime_factory();
-    // One per run, not one per worker: a backend may not borrow the program (`Machine`'s `compiled`
-    // field says why), so building one costs a copy of the AST and the workers share it.
-    // A unit compiled to run nothing is the whole project's compile spent on an empty selection,
-    // and `benches/marginal-change/` prices it at about half of a backed run. A run that selected
-    // no test has nothing to enter, so it builds nothing — which is what makes a warm loop under a
-    // backend cost the edit rather than the project.
+    // One per run, shared by the workers; an empty selection builds nothing.
     let nothing_to_run = plan.selection.to_run.is_empty();
-    // The backend is built over the same program the runner works over: it answers only for the
-    // program it was built over, and the machine checks that before installing it.
+    // A backend answers only for the program it was built over, and the machine checks that.
     let (run_program, run_resolved) = (&loaded.program, &loaded.resolved);
-    // The unit the last iteration compiled, when every definition still says what it said. The
-    // front end was already held across iterations and the unit was not, so a warm run under a
-    // backend recompiled the whole project each time -- which for the emitted tier is tens of
-    // seconds and is most of what an iteration costs.
+    // The last iteration's unit, when every definition is unchanged.
     let held_unit = backend
         .as_ref()
         .filter(|_| !nothing_to_run)
@@ -247,8 +220,6 @@ fn iterate(
         }) {
         None => held_unit,
         Some(Ok(provider)) => {
-            // Held for the next iteration, which is what makes a warm loop pay for the edit rather
-            // than for the project a second time.
             if let Some(spec) = backend.as_ref() {
                 warm.keep_unit(spec, &hashes, provider);
             }
@@ -289,10 +260,8 @@ fn iterate(
     };
     warnings.extend(report.warnings.iter().cloned());
 
-    // After the run, and against the store as the run left it: a pass this run recorded is a
-    // legitimate baseline for a *different* test's failure. Over the program that ran, because a
-    // bisection rebuilds the failing test from its own definitions and a test in a module wanted
-    // only to run has none in the checked program.
+    // After the run, since a pass recorded now is a valid baseline for another test's failure;
+    // over the program that ran, since a run-only module's tests are absent from the checked one.
     warnings.extend(ply_test::diagnose_failures(
         &mut report,
         run_program,
@@ -301,8 +270,7 @@ fn iterate(
         &mut cache.store,
         &diagnosis_options(args),
     ));
-    // Not redundant with the drains above: the pass records are read lazily, on the first question
-    // a failure asks, so an unreadable baseline only warns here.
+    // Pass records are read lazily, so an unreadable baseline only surfaces here.
     warnings.extend(cache.store.take_warnings());
     let warnings = once_each(warnings);
 
@@ -337,8 +305,7 @@ fn iterate(
             style,
         );
     }
-    // Held for the next iteration, and only now: an iteration that returned early left nothing
-    // behind, so the next one loads rather than trusting a state no run finished with.
+    // Only now: an iteration that returned early leaves no state behind.
     warm.keep(loaded);
     exit_code(ok)
 }
@@ -349,10 +316,8 @@ pub struct BackendView {
     name: &'static str,
     /// Definitions the backend had a body for.
     fragment: usize,
-    /// What the provider spent compiling, if it compiles anything.
     compiled: Option<ply_eval::Compilation>,
-    /// Calls offered, offers naming a targeted definition, and answers a mutation changed — over
-    /// every worker.
+    /// Summed over every worker.
     offers: ply_eval::Offers,
     /// Bodies entered natively and calls declined, summed over the tests.
     entries: u64,
@@ -393,8 +358,7 @@ impl BackendView {
             .map(|b| b.declines)
             .sum();
         let mut escapes = backend_escapes(report, selected_under);
-        // A worker whose backend failed to build declines every call, so the run would be green
-        // over a seam nothing reached.
+        // An unbuilt backend declines every call, which would make a green run vacuous.
         let unbuilt = provider.map_or(0, ply_eval::Provider::unbuilt);
         if unbuilt > 0 {
             escapes.push(
@@ -433,17 +397,13 @@ impl BackendView {
     }
 }
 
-/// A test that entered native code and whose pass was written to the result cache — the run caching
-/// a claim about a third execution strategy.
+/// Tests that entered native code and whose passes were cached anyway.
 pub fn backend_escapes(report: &RunReport, selected_under: &ply_test::Engine) -> Vec<Diagnostic> {
     if &report.engine == selected_under {
         return Vec::new();
     }
-    // The invariant is about what was written, so a run that wrote nothing cannot have broken it.
-    // This is the case where the two legitimately differ: a run that selected no test builds no
-    // backend, because a unit compiled to enter nothing is the whole project's compile spent on an
-    // empty selection — so the runner sees no provider and names the evaluator, over a run that
-    // recorded no pass under either engine.
+    // A run that selected nothing builds no backend and names the evaluator; it wrote nothing,
+    // so it cannot have broken the invariant.
     if !report
         .results
         .iter()
@@ -469,8 +429,7 @@ pub fn backend_escapes(report: &RunReport, selected_under: &ply_test::Engine) ->
     ]
 }
 
-/// What the binding contributed to this run, threaded through both projections so the human summary
-/// and `--json` cannot disagree about it.
+/// Shared by the human and `--json` projections so they cannot disagree.
 pub struct HostView<'a> {
     hosts: &'a Hosts,
     pub counts: hosts::Counts,
@@ -557,20 +516,11 @@ fn cache_escapes(report: &RunReport, check: &CheckOutput, hosts: &Hosts) -> Vec<
         .collect()
 }
 
-/// Whether this run gets no store at all.
-///
-/// A backend used to be reason enough, on the ground that a stored `Pass` is a claim about what
-/// the authoritative engine did. That reason is about *results*, and one store holds two caches:
-/// bypassing it also threw away the front end's, which is the same work whichever engine executes
-/// afterwards. So the results are namespaced by engine instead (`ply_test::Engine`) and the store
-/// stays open. What still gets nothing is a backend that is **wrong on purpose**: it exists so a
-/// green run can be read as evidence, and a run that skipped a test because a previous run passed
-/// it is not evidence about anything.
+/// Only a deliberately corrupt backend bypasses the store: its green run must be evidence.
 fn cache_bypassed(args: &TestArgs) -> bool {
     args.no_cache || backend_is_corrupt(args)
 }
 
-/// Whether `--backend` asked for a deliberately wrong one.
 fn backend_is_corrupt(args: &TestArgs) -> bool {
     args.backend
         .as_deref()
@@ -580,9 +530,7 @@ fn backend_is_corrupt(args: &TestArgs) -> bool {
         })
 }
 
-/// What `--backend` asked for, or the diagnostic that refuses it.
-/// `--bisect never` goes *through* the diagnosis rather than around it, so that the artifact has
-/// one shape: a consumer branches on `verdict` and never on whether a field is present.
+/// `--bisect never` still goes through the diagnosis, so the artifact has one shape.
 pub fn diagnosis_options(args: &TestArgs) -> ply_test::Options {
     ply_test::Options {
         bisect: match args.bisect {
@@ -599,10 +547,7 @@ pub fn diagnosis_options(args: &TestArgs) -> ply_test::Options {
     }
 }
 
-// --- Selection under `--filter` ---------------------------------------------
-
-/// A filtered run must report `selected 2 of 3`, not `of 47`: the denominator a person checks
-/// against is the set they asked for.
+/// Counts under `--filter` use the filtered set as their denominator.
 pub struct Plan {
     pub selection: Selection,
     /// Test indices still in scope, ascending.
@@ -618,11 +563,8 @@ impl Plan {
         filter: Option<&str>,
         std_tests: bool,
     ) -> Plan {
-        // Two separate questions.
         let in_scope = |t: &ply_ty::TestInfo| std_tests || !ply_std::is_std(&t.module);
-        // Matched against `<module>.<label>` rather than the label alone, so `--filter store.`
-        // narrows to a module without a second flag, and a label substring still matches because
-        // the key contains the label.
+        // Against `<module>.<label>`, so `--filter store.` narrows to a module.
         let matches = |t: &ply_ty::TestInfo| filter.is_none_or(|n| t.key.as_str().contains(n));
 
         let scoped = check.tests.iter().filter(|t| in_scope(t)).count();
@@ -661,8 +603,7 @@ impl Plan {
             .map(|&i| (i, check.tests[i].footprint.clone()))
             .collect();
         let groups = ply_test::group_by_conflict(&footprints);
-        // Counted over the visible tests, because `selected 2 of 3` and `isolated 1 of 3` have to
-        // share a denominator a person can check.
+        // Over the visible tests, so every count shares one denominator.
         let parallelism = ply_test::parallelism(
             visible
                 .iter()
@@ -679,14 +620,11 @@ impl Plan {
                 cached,
                 to_run,
                 groups,
-                // Indexed by test index, so they stay whole even when the plan is narrowed; nothing
-                // reads their length.
+                // Indexed by test index, so they stay whole under a narrowed plan.
                 reasons: selection.reasons,
                 isolation: selection.isolation,
                 parallelism,
-                // A filter hides tests; it does not change what the visible ones search, and a
-                // search that changed with `--filter` would key the cache on which tests happened
-                // to be asked for.
+                // A filter must not change the search, which is part of the cache key.
                 plan: selection.plan,
                 narrowed: selection.narrowed,
                 out_of_scope,
@@ -703,16 +641,11 @@ impl Plan {
     }
 }
 
-// --- Cache ------------------------------------------------------------------
-
-/// `--no-cache` is honoured by pointing the store at a scratch directory that is deleted on the way
-/// out.
+/// `--no-cache` points the store at a scratch directory deleted on the way out.
 pub struct Cache {
     pub store: Store,
     pub scratch: Option<PathBuf>,
-    /// An unusable cache must never stop a run, but it must never pass unmentioned either —
-    /// silently re-running everything looks like a bug in selection, which is the one thing this
-    /// system asks to be trusted on.
+    /// An unusable cache never stops a run, but is always reported.
     pub warnings: Vec<Diagnostic>,
 }
 
@@ -781,8 +714,6 @@ fn scratch_failed(dir: &Path, cause: &str) -> Diagnostic {
     .note("set TMPDIR to a writable directory, or drop `--no-cache`")
 }
 
-// --- Human output -----------------------------------------------------------
-
 #[allow(clippy::too_many_arguments)]
 fn print_human(
     loaded: &Loaded,
@@ -831,8 +762,7 @@ fn print_human(
             counts.total,
         );
     }
-    // A socket lives outside every region, so a host-backed test is not isolated and is never
-    // cached.
+    // A socket lives outside every region, so a host-backed test is never isolated or cached.
     if !view.hosts.is_hermetic() {
         println!(
             "{IND}{} {} of {} · {}",
@@ -862,8 +792,6 @@ fn print_human(
     if let Some(line) = report.simulation.line() {
         println!("{IND}{}", style.bold(&line));
     }
-    // What the backend was asked and what it did with it, printed whether or not anything went
-    // wrong.
     if let Some(corruption) = &backend.spec {
         let offers = backend.offers;
         println!(
@@ -875,9 +803,7 @@ fn print_human(
             backend.declines,
             backend.fragment,
         );
-        // Printed apart from the entry counts because it is what the backend cost rather than what
-        // it did, and because the two halves scale differently: the analysis is paid once and the
-        // code generation is paid per worker.
+        // Apart from the entry counts: analysis is paid once, code generation per worker.
         if let Some(c) = backend.compiled {
             println!(
                 "{IND}{}",
@@ -978,7 +904,7 @@ fn print_human(
     }
 }
 
-/// The culprit before the diff, because the culprit is the answer and the diff is the evidence.
+/// The culprit before the diff: the culprit is the answer.
 fn print_failure(failure: &Failure, loaded: &Loaded, style: Style) {
     for line in failure_lines(failure, loaded, style) {
         println!("{IND}{line}");
@@ -1014,8 +940,7 @@ pub fn failure_lines(failure: &Failure, loaded: &Loaded, style: Style) -> Vec<St
     {
         lines.push(format!("    at {}", style.dim(&at)));
     }
-    // A deadlock says which task waits on which in its secondary labels and nowhere else, so
-    // dropping them here leaves the terminal reader with a count where the JSON has the cycle.
+    // A deadlock's cycle lives only in its secondary labels.
     for label in failure.diagnostic.labels.iter().filter(|l| !l.primary) {
         let at = location(&loaded.sources, label.span)
             .map(|at| format!("   {}", style.dim(&at)))
@@ -1066,7 +991,7 @@ pub fn failure_lines(failure: &Failure, loaded: &Loaded, style: Style) -> Vec<St
     lines
 }
 
-/// The repro, which under M7 is a seed rather than a stack trace.
+/// The repro, which is a seed rather than a stack trace.
 fn seed_lines(failure: &Failure, loaded: &Loaded, style: Style) -> Vec<String> {
     let Some(seed) = &failure.seed else {
         return Vec::new();
@@ -1096,8 +1021,7 @@ fn seed_lines(failure: &Failure, loaded: &Loaded, style: Style) -> Vec<String> {
     lines
 }
 
-/// Silent when nobody asked for a bisection: a run that was told not to look has nothing to
-/// apologize for, while every other verdict names something the reader can act on.
+/// Silent when no bisection was asked for.
 fn no_culprit_reason(bisection: &Bisection) -> Option<&str> {
     match bisection.verdict {
         Verdict::NotAttempted(Skipped::NotRequested) => None,
@@ -1132,8 +1056,7 @@ pub fn no_tests_note(loaded: &Loaded, args: &TestArgs) -> &'static str {
     }
 }
 
-/// Two modules may label a test identically, so a single-module run reads the label and anything
-/// larger reads `<module>.<label>` — the same key `--filter` matches on.
+/// The label in a single-module run, `<module>.<label>` otherwise.
 pub fn display_name(check: &CheckOutput, index: usize, fallback: &str) -> String {
     match check.tests.get(index) {
         Some(test) if check.modules.len() > 1 => test.key.to_string(),
@@ -1142,8 +1065,6 @@ pub fn display_name(check: &CheckOutput, index: usize, fallback: &str) -> String
     }
 }
 
-/// Long test names are the norm — they are sentences — so the duration column follows the longest
-/// one rather than a guess that everything overruns.
 fn name_column(names: &[String]) -> usize {
     names
         .iter()
@@ -1169,8 +1090,7 @@ pub fn result_line(result: &TestResult, name: &str, name_width: usize, style: St
         };
         (mark.to_string(), 5)
     };
-    // `mark` may carry escapes, so the padding is computed rather than left to `{:<width$}`, which
-    // counts bytes.
+    // `mark` may carry escapes, and `{:<width$}` counts bytes.
     let pad = " ".repeat(width.saturating_sub(display_width(&mark)));
     format!(
         "{mark}{pad} {name:<name_width$} {:>8.1}ms",
@@ -1195,8 +1115,7 @@ pub fn simulation_line(result: &TestResult) -> Option<String> {
     if let Some(naive) = exploration.naive {
         parts.push(format!("naive {naive}"));
         if let Some(reduction) = exploration.reduction() {
-            // A ratio over a naive count that spent its budget is a lower bound too, and printing
-            // it bare claims a number nobody observed.
+            // A bounded naive count makes the ratio a lower bound.
             let bound = if naive.bounded { ">= " } else { "" };
             parts.push(format!("{bound}{reduction:.0}× reduction"));
         }
@@ -1204,9 +1123,7 @@ pub fn simulation_line(result: &TestResult) -> Option<String> {
     Some(parts.join(" · "))
 }
 
-/// `host` is beside `cached` rather than only in the header, because the last line a person reads
-/// is where "0 cached" would otherwise look like selection working rather than a run that proved
-/// nothing it may keep.
+/// `host` sits beside `cached` so "0 cached" is not misread as selection working.
 fn print_summary(report: &RunReport, host: usize, database: bool, style: Style) {
     let failed = format!("{} failed", report.failed);
     let failed = if report.failed > 0 {
@@ -1266,14 +1183,11 @@ fn print_explain(
         let atoms = if isolation == Isolation::Region.as_str() {
             String::new()
         } else if ply_test::contends_only_over_regions(&test.footprint) {
-            // A contention a rename would remove is worth distinguishing from one that needs a
-            // database.
+            // Contention a rename would remove, as opposed to one that needs a database.
             format!(" {shared} (region labels)")
         } else {
             format!(" {shared}")
         };
-        // A test whose row carries `sim.read` reaches a `simulate` region, so it is searched
-        // cannot run one.
         let engine = if ply_test::is_seeded(&test.footprint) {
             " · searched"
         } else {
@@ -1313,17 +1227,12 @@ fn print_explain(
     println!("{IND}{}", style.dim("concurrency groups"));
     let parallelism = &plan.selection.parallelism;
     let counts = &view.counts;
-    // A host-backed test is grouped by footprint conflict like any other — a host atom contends
-    // exactly as an in-memory one does — but it is never *free*, so it is named apart from the
-    // count that claims it is.
+    // Grouped like any other test, but a host-backed test is never free.
     let hosted = if counts.host == 0 {
         String::new()
     } else {
         format!(" · {} host-backed and never free", counts.host)
     };
-    // host effects having no region isolation again, for the population region isolation moves: a contention a rename would remove
-    // reads differently from one that needs a database, and a report that did not separate them
-    // would leave the cost of losing the fork looking like ordinary shared state.
     let regioned = if parallelism.region_contended == 0 {
         String::new()
     } else {
@@ -1446,8 +1355,6 @@ pub fn why(reason: Reason) -> &'static str {
     }
 }
 
-// --- JSON output ------------------------------------------------------------
-
 #[allow(clippy::too_many_arguments)]
 pub fn report_json(
     loaded: &Loaded,
@@ -1485,8 +1392,7 @@ pub fn report_json(
                 "group": selection.group_of(index),
                 "footprint": test.footprint.to_string(),
                 "isolation": isolation_label(plan, view, check, index, &test.footprint),
-                // Whether this test's footprint meets the binding, and therefore whether it always
-                // runs and is never cached.
+                // Whether this test reaches the binding, and so always runs uncached.
                 "host": view.reaches(check, index),
                 "shared_atoms": ply_test::shared_footprint(&test.footprint)
                     .atoms()
@@ -1524,8 +1430,7 @@ pub fn report_json(
                 "status": r.status,
                 "duration_ms": millis(r.duration),
                 "diagnostic": r.failure.as_ref().map(|d| diagnostic_json(d, sources)),
-                // Absent, never zeroed, on a test that reached no region: a consumer cannot tell an
-                // explored count of zero from a test that never simulated anything.
+                // Absent, never zeroed, when no region was reached.
                 "simulation": r.simulation.as_ref().map(ply_test::report::exploration_json),
                 "cached": r.recorded.as_ref().map(|record| record.is_written()),
             })
@@ -1555,8 +1460,6 @@ pub fn report_json(
         })).collect::<Vec<_>>(),
         "filter": args.filter,
         "no_cache": cache_bypassed(args),
-        // What this run could reach outside itself, and which trusted computing base it was reached
-        // with.
         "binding": view.hosts.label(),
         "hosts": view.hosts.summary_json(),
         "workers": workers,
@@ -1564,8 +1467,7 @@ pub fn report_json(
             "bisect": args.bisect.as_str(),
             "bisect_budget": args.bisect_budget,
             "trace": args.trace.as_str(),
-            // The whole plan, because every field of it is in a seeded test's cache key and a
-            // consumer comparing two runs needs to see which one searched more.
+            // The whole plan: every field is in a seeded test's cache key.
             "sim": {
                 "mode": selection.plan.mode.as_str(),
                 "seed": args.simulation.seed.as_ref().map(|s| s.to_string()),
@@ -1583,8 +1485,6 @@ pub fn report_json(
             "exhausted": report.simulation.exhausted,
             "failed": report.simulation.failed,
         },
-        // What the differential oracle actually covered.
-        // What a compiled backend was asked and what it did with it.
         "backend": backend.installed().then(|| json!({
             "spec": args.backend,
             "name": backend.name,
@@ -1598,8 +1498,6 @@ pub fn report_json(
             "units": backend.compiled.map(|c| c.units),
             "entered": backend.entries,
             "declined": backend.declines,
-            // The seam's census: objects built from the arguments at every entry, and objects
-            // read back out of every answer.
             "converted_in": backend.offers.converted_in,
             "converted_out": backend.offers.converted_out,
         })),
@@ -1609,9 +1507,7 @@ pub fn report_json(
             "cached": selection.cached.len(),
             "filtered_out": plan.filtered_out,
             "groups": groups,
-            // Corrected for the binding: a host-backed test is counted under `host` and under
-            // neither of the other two, because it is not isolated and saying otherwise over-claims
-            // the number M6 published.
+            // A host-backed test counts only under `host`, since it is not isolated.
             "isolated": counts.isolated,
             "shared": counts.shared,
             "host": counts.host,
@@ -1626,8 +1522,7 @@ pub fn report_json(
         },
         "results": results,
         "failures": failures,
-        // Not a warning: an entry that escaped here is believed by every later run, so it fails
-        // this one.
+        // Not a warning: every later run believes an escaped entry.
         "diagnostics": diagnostics_json(
             &view.escapes.iter().chain(&backend.escapes).cloned().collect::<Vec<_>>(),
             sources,
@@ -1636,7 +1531,6 @@ pub fn report_json(
     })
 }
 
-/// The failure artifact, built on `ply-test`'s projection rather than beside it.
 pub fn failure_json(
     failure: &Failure,
     loaded: &Loaded,
@@ -1682,9 +1576,7 @@ pub fn failure_json(
         "footprint".into(),
         json!({
             "declared": test.map(|t| atoms(&t.footprint)),
-            // Null rather than empty when nothing was traced: "performed no atom" and "was never
-            // watched" are different findings, and a consumer that reads one as the other looks in
-            // the wrong place.
+            // Null rather than empty when untraced: unwatched differs from performing nothing.
             "observed": failure
                 .attribution
                 .slice
@@ -1716,7 +1608,7 @@ fn status_str(status: Status) -> &'static str {
     }
 }
 
-/// Positions rather than byte offsets, because the consumer of this field opens an editor with it.
+/// Line and column rather than byte offsets, for editors.
 fn location_json(sources: &SourceMap, span: Span) -> Value {
     let Some(file) = sources.get(span.source) else {
         return Value::Null;
@@ -1736,8 +1628,7 @@ fn display_width(s: &str) -> usize {
     crate::style::strip_ansi(s).chars().count()
 }
 
-/// A `reuse fn` among the modules this run parsed whose promise the cost checker cannot show: the
-/// program does not get as far as running, as it would not under `ply check`.
+/// A `reuse fn` whose promise the cost checker cannot show stops the run, as under `ply check`.
 pub(crate) fn broken_promises(loaded: &Loaded) -> Option<crate::load::LoadError> {
     if !loaded.promised {
         return None;

@@ -1,27 +1,9 @@
 #!/usr/bin/env bash
-#
-# Every green in this area is worthless until it has been seen to go red.
-# `CONTRIBUTING.md`'s first-named defect is a green result over unexplored
-# space, so this file corrupts, one at a time, each thing the area's checks
-# claim to watch, and prints which instrument noticed.
+# Corrupts, one at a time, each thing the Items area's checks claim to watch, and prints which
+# instrument noticed: TESTS (`ply test` over items.ply, pins the tree) or DIAG (diff-items.py
+# against the shipping parser, pins the diagnostics).
 #
 #   ./crates/ply-compiler-diff/tools/arm-items.sh
-#
-# There are two instruments and they are not interchangeable, which is itself a
-# result:
-#
-#   TESTS   `ply test` over `items.ply`'s own 13 `test` blocks, which assert an
-#           exact dump and therefore pin the **tree**.
-#   DIAG    a differential against the shipping parser: for 28 fixtures that
-#           reach the error paths, `ply check --json`'s diagnostics against this
-#           parser's, compared on code, every label's span, every label's
-#           primary flag, and the note count. It pins the **diagnostics** and
-#           nothing else.
-#
-# A mutation that only TESTS catches is a tree difference no diagnostic
-# comparison can see. A mutation that neither catches is a line of this parser
-# that nothing in the area distinguishes from any other line, and those are
-# listed at the end rather than left out.
 set -u
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$here/../../.." && pwd)
@@ -109,12 +91,7 @@ probe "an effect set is recognised without its third token" \
   'pub fn at_effect_set_start(c: Ctx, p: P) -> Bool =
   false && at(c, p, k_effect())'
 
-# The anchor here named `body.node`, which stopped existing when `?` replaced
-# the `bail` flag and `fn_def` began destructuring its callee's answer
-# (`let {p, node: body} = fn_body(c, p)?`). It reported MUTATION MISSED from
-# that day until 2026-08-30 -- a corruption that tests nothing and says so, but
-# only to a reader of the last column. Re-anchored, not dropped: it is the only
-# probe in this file aimed at an item's span.
+# The only probe in this file aimed at an item's span.
 probe 'a FnDef span stops at its own keyword' \
   'body: body, span: span_to(st.node, expr_span(body)) } })' \
   'body: body, span: st.node } })'
@@ -128,19 +105,6 @@ probe "op_param eats the documentation name it should skip" \
              bump(c, bump(c, p))
            } else { p };' \
   'let p2 = p;'
-
-# > **Withdrawn (the try operator, 2026-08-30): three probes that cannot be applied.**
-# > They stood here as `probe "the bail guard on fn_body is deleted"`,
-# > `.. on law_def ..` and `.. on item ..`, each replacing `if p.bail {` at the
-# > head of the function with `if false {`. `fn_body`'s is the one `GAPS.md` §2
-# > quotes at length as **the** load-bearing guard in the whole parser: with it
-# > gone, `at(c, e.p, t_lbrace())` answered `false` on a bailed state and a
-# > phantom `E0001` appeared that the reference never raises.
-# >
-# > `?` deletes the shape rather than the guard. `where_clause`'s failure now
-# > leaves `fn_def` at its `?`, so `fn_body` is never entered and there is no
-# > `if p.bail` anywhere to turn into `if false`. See the note above `fn_body`
-# > in `items.ply`.
 
 restore
 echo

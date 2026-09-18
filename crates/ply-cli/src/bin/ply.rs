@@ -1,8 +1,6 @@
 use clap::{CommandFactory, Parser};
 
-/// A command runs on a thread with room for a deep program: the front end and the emitter
-/// recurse once per node on the native stack, and the default thread is not enough for an
-/// expression a few thousand deep, which the harness's workers already allow for.
+/// The front end and emitter recurse once per node on the native stack.
 const STACK: usize = 256 << 20;
 
 fn main() {

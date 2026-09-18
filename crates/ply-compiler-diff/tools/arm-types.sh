@@ -1,19 +1,6 @@
 #!/usr/bin/env bash
-# Every green in `types.ply` and `patterns.ply`, seen to go red.
-#
-# `CONTRIBUTING.md`'s first-named defect is a green result over unexplored
-# space, and both files passed every one of their tests on the first run, which
-# is exactly when that defect is invisible. This script corrupts one thing at a
-# time and asserts the suite fails.
-#
-# `equiv` is the other half: a mutation that is *supposed* to leave the suite
-# green because the mutant is semantically equal to the original. Calling an
-# equivalent mutant a hole is how a suite grows tests that assert an
-# implementation detail. The three `equiv` entries at the foot are the area's
-# most useful result and are written up in `GAPS-types.md` §P7: they are the
-# `bail` guards, which the pre-registration expected to be armed by an error
-# fixture, and which nothing here can arm because the dedup rule in
-# `push_diag` already absorbs what they suppress.
+# Mutates types.ply and patterns.ply one thing at a time: every `arm` must turn the suite
+# red, every `equiv` (a semantically equal mutant) must leave it green.
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -110,12 +97,6 @@ arm "a lowercase bare name in a type becomes a constructor" types \
   'else if false {
     Ok({ p: q.p, node: TVar(q.node.name) })'
 
-# The `else ` at the front of this anchor was a typo, not a moved line:
-# `patterns.ply:206` reads `if is_bare(q.node) && ..` and always has, so this
-# mutation reported MUTATION DID NOT LAND -- it tested itself and not the
-# parser -- from the day it was written until 2026-08-30. Found by running the
-# script while checking that moving `param` out of `types.ply` had not
-# invalidated anything here; it had not, and this was already broken.
 arm "an uppercase bare name in a pattern becomes a binder" patterns \
   'if is_bare(q.node) && !starts_upper(q.node.name.name) {' \
   'if is_bare(q.node) {'

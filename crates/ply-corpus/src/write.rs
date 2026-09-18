@@ -22,14 +22,12 @@ pub struct EditSite {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RenameSite {
-    /// The definition's simple name, unique corpus-wide, so a benchmark can rename it with a plain
-    /// textual substitution across every file.
+    /// Simple name, unique corpus-wide, so a plain textual substitution renames it.
     pub symbol: String,
     pub replacement: String,
 }
 
-/// What the concurrent half of a corpus looks like, so a measurement can plot exploration against
-/// contention without re-deriving it from the source.
+/// The concurrent half of a corpus, so a measurement need not re-derive it from source.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConcurrencyProfile {
     pub tests: usize,
@@ -40,13 +38,12 @@ pub struct ConcurrencyProfile {
     pub contention: f64,
 }
 
-/// What the specified half of a corpus looks like, so a measurement can price discharge against
-/// definition count and report a tier distribution without re-deriving either from the source.
+/// The specified half of a corpus, so a measurement need not re-derive it from source.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SpecProfile {
     /// Generated definitions carrying an `ensures`, specimens included.
     pub specified_definitions: usize,
-    /// Definitions carrying none — the review surface the corpus is modelling.
+    /// Definitions carrying none.
     pub unspecified_definitions: usize,
     /// One per `ensures` clause and one per law.
     pub obligations: usize,
@@ -226,8 +223,7 @@ pub fn reverse_edges(corpus: &Corpus) -> Vec<Vec<DefId>> {
     callers
 }
 
-/// The most, or least, directly depended upon one-line definition that some test roots at — editing
-/// one nothing tests selects nothing, which measures only that the run happened.
+/// The most, or least, depended upon one-line definition that some test roots at.
 pub fn pick(
     corpus: &Corpus,
     callers: &[Vec<DefId>],
