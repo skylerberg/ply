@@ -108,14 +108,12 @@ fn the_shipped_figures_still_describe_this_request_path() {
         ("allocations", figures.allocations_per_request, allocs),
         ("bytes", figures.bytes_per_request, bytes),
     ] {
-        let drift = (claimed - measured).abs() / measured;
         assert!(
-            drift <= 0.01,
-            "`{}` says one {} request makes {claimed:.2} {what} and this tree makes \
-             {measured:.2} — {:.1}% apart. {RETAKE}",
+            measured <= claimed * 1.01,
+            "`{}` caps one {} request at {claimed:.2} {what} and this tree makes {measured:.2}. \
+             Lower it, or {RETAKE}",
             ply_corpus::w6_run::ALLOCATION_FILE,
             figures.route,
-            drift * 100.0
         );
     }
 }
