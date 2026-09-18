@@ -16,7 +16,7 @@ use body::{BodySet, StoredBody};
 use graph::{Entry, NodeBody, NodeId, ProgramIndex};
 use normalize::{ComponentIndices, EffectIndex, HashTable, Normalizer};
 
-pub use ply_ty::hash::{DefHash, HashOutput, interface_hash, spec_hash};
+pub use ply_ty::hash::{DefHash, HashOutput, spec_hash};
 
 pub fn hash_program(
     program: &Program,

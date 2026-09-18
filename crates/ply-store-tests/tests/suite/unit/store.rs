@@ -653,13 +653,9 @@ fn fingerprint(n: u8) -> SourceFingerprint {
     fp.defs.push(DefEntry {
         name: ply_span::Symbol::new("active_users"),
         hash: hash(n),
-        own: hash(n.wrapping_add(50)),
-        iface: hash(n.wrapping_add(60)),
         span: FileSpan { start: 10, end: 42 },
         kind: DefKind::Fn,
         members: Vec::new(),
-        deps: Vec::new(),
-        reuse: n & 1 == 1,
     });
     fp.tests.push(CachedTest {
         name: "active_users excludes inactive".to_string(),
@@ -670,8 +666,6 @@ fn fingerprint(n: u8) -> SourceFingerprint {
             start: 50,
             end: 120,
         },
-        name_span: FileSpan { start: 55, end: 60 },
-        deps: Vec::new(),
     });
     fp
 }
@@ -1620,84 +1614,6 @@ fn source_paths_round_trip_back_to_the_paths_that_were_stored() {
 }
 
 #[test]
-fn a_witness_holds_only_while_every_name_still_denotes_what_it_did() {
-    let cached = CachedDef::new(scheme(), footprint()).witnessed_by(vec![
-        NameRef::new("Row", hash(1)),
-        NameRef::new("db", hash(2)),
-    ]);
-
-    let resolved = |name: &ply_span::Symbol| match name.as_str() {
-        "Row" => Some(hash(1)),
-        "db" => Some(hash(2)),
-        _ => None,
-    };
-    assert!(cached.witness_holds(resolved));
-
-    // `Row` was edited: same name, different definition.
-    let edited = |name: &ply_span::Symbol| match name.as_str() {
-        "Row" => Some(hash(7)),
-        "db" => Some(hash(2)),
-        _ => None,
-    };
-    assert!(!cached.witness_holds(edited));
-
-    // `Row` was renamed away, so the scheme's `Row` no longer denotes anything.
-    let renamed = |name: &ply_span::Symbol| match name.as_str() {
-        "db" => Some(hash(2)),
-        _ => None,
-    };
-    assert!(!cached.witness_holds(renamed));
-
-    assert!(CachedDef::new(scheme(), footprint()).witness_holds(renamed));
-}
-
-#[test]
-fn an_exports_digest_ignores_order_and_notices_every_change() {
-    let a = NameRef::new("a", hash(1));
-    let b = NameRef::new("b", hash(2));
-
-    let forward = exports_digest(&[a.clone(), b.clone()]);
-    let backward = exports_digest(&[b.clone(), a.clone()]);
-    assert_eq!(
-        forward, backward,
-        "reordering items must not invalidate an importer"
-    );
-
-    assert_ne!(
-        forward,
-        exports_digest(std::slice::from_ref(&a)),
-        "a removed export shows"
-    );
-    assert_ne!(
-        forward,
-        exports_digest(&[a.clone(), b.clone(), NameRef::new("c", hash(3))]),
-        "an added export shows"
-    );
-    assert_ne!(
-        forward,
-        exports_digest(&[a.clone(), NameRef::new("b", hash(9))]),
-        "an edited export shows"
-    );
-    // Renaming is the whole point of content addressing: it must show here, because an importer
-    // names what it imports.
-    assert_ne!(
-        forward,
-        exports_digest(&[a.clone(), NameRef::new("bb", hash(2))]),
-        "a renamed export shows"
-    );
-}
-
-#[test]
-fn a_digest_cannot_be_forged_by_running_two_names_together() {
-    let split = exports_digest(&[NameRef::new("ab", hash(1)), NameRef::new("c", hash(2))]);
-    let joined = exports_digest(&[NameRef::new("a", hash(1)), NameRef::new("bc", hash(2))]);
-    assert_ne!(
-        split, joined,
-        "names must be length-prefixed, not concatenated"
-    );
-}
-
-#[test]
 fn a_file_span_survives_the_source_ids_of_the_next_run() {
     let first = ply_span::SourceId(3);
     let later = ply_span::SourceId(0);
@@ -2019,36 +1935,23 @@ const BUMP: &str = "the on-disk schema changed. Bump the version constant this \
 fn pin_fingerprint() -> SourceFingerprint {
     SourceFingerprint {
         content_hash: content(1),
-        imports: vec![ImportEdge {
-            module: ply_span::Symbol::new("store.db"),
-            exports: content(2),
-        }],
-        deps: vec![NameRef::new("store.db.get", hash(7))],
         defs: vec![
             DefEntry {
                 name: ply_span::Symbol::new("user.active_users"),
                 hash: hash(2),
-                own: hash(8),
-                iface: hash(9),
                 span: FileSpan { start: 10, end: 42 },
                 kind: DefKind::Fn,
                 members: vec![],
-                deps: vec![ply_span::Symbol::new("store.db.get")],
-                reuse: false,
             },
             DefEntry {
                 name: ply_span::Symbol::new("user.User"),
                 hash: hash(3),
-                own: hash(10),
-                iface: hash(11),
                 span: FileSpan { start: 50, end: 80 },
                 kind: DefKind::Type,
                 members: vec![Member {
                     name: ply_span::Symbol::new("user.Active"),
                     span: FileSpan { start: 60, end: 66 },
                 }],
-                deps: vec![],
-                reuse: false,
             },
         ],
         tests: vec![CachedTest {
@@ -2060,22 +1963,12 @@ fn pin_fingerprint() -> SourceFingerprint {
                 start: 90,
                 end: 140,
             },
-            name_span: FileSpan {
-                start: 95,
-                end: 100,
-            },
-            deps: vec![ply_span::Symbol::new("user.active_users")],
         }],
     }
 }
 
-/// `performed` is deliberately narrower than `footprint` and `row_aliases` is deliberately
-/// non-empty: a pin over a value that happened to take the default would not move when the field's
-/// encoding did.
 fn pin_def() -> CachedDef {
     CachedDef::new(counted_scheme(9, 4), footprint())
-        .performing(Footprint::empty())
-        .written_as(vec![ply_span::Symbol::new("Web")])
         .witnessed_by(vec![NameRef::new("user.User", hash(3))])
 }
 
@@ -2164,8 +2057,8 @@ fn the_front_end_entry_encoding_is_pinned() {
     assert_eq!(found, pinned.to_vec(), "{BUMP}");
 }
 
-const PINNED_FINGERPRINT: &str = "912fc010fb16672c71bc56d7e7c282f42cade04c66e2aedd65903422d4df1d66";
-const PINNED_DEF: &str = "7ed1bc4fb830312b18bab806e8e3ee98c29804cc286f390e710b43364d1c7a41";
+const PINNED_FINGERPRINT: &str = "300fe8c0ddf5800c064400b08474309dc35cd462cc7543ee6acf4313248b46ed";
+const PINNED_DEF: &str = "6d1312f0f06072ba7f40f0b201b0a2f8005d0d0fe1d3b44c110f8b6b15a99644";
 const PINNED_TYPE_DECL: &str = "563d17593d11975f979c1714dbf0845f19433439fd5517b15d8d7750dd2d6d91";
 const PINNED_EFFECT_DECL: &str = "0b5bc11329b83fd823d762923323c2373dfb1e9e985756570dd709013e1a004d";
 const PINNED_BODY: &str = "adf0f67e207566df6efe0eb0ac42e091e3f554a4d7b36ec34cd37b8306f21900";
@@ -2293,13 +2186,9 @@ fn lookup_finds_a_definition_by_full_name_simple_name_or_hash_prefix() {
     fp.defs.push(DefEntry {
         name: ply_span::Symbol::new("user.active_users"),
         hash: hash(9),
-        own: hash(19),
-        iface: hash(29),
         span: FileSpan { start: 10, end: 42 },
         kind: DefKind::Fn,
         members: Vec::new(),
-        deps: Vec::new(),
-        reuse: false,
     });
     store.put_source(&file, fp);
 
@@ -2358,13 +2247,9 @@ fn lookup_returns_every_match_rather_than_refusing() {
         fp.defs.push(DefEntry {
             name: ply_span::Symbol::new(format!("{module}.place")),
             hash: hash(n),
-            own: hash(n.wrapping_add(50)),
-            iface: hash(n.wrapping_add(60)),
             span: FileSpan { start: 0, end: 1 },
             kind: DefKind::Fn,
             members: Vec::new(),
-            deps: Vec::new(),
-            reuse: false,
         });
         store.put_source(&root.path().join(format!("{module}.ply")), fp);
     }
@@ -2523,16 +2408,12 @@ fn opening_a_ten_thousand_definition_cache_decodes_nothing() {
             fp.defs.push(DefEntry {
                 name: name.clone(),
                 hash,
-                own: hash,
-                iface: hash,
                 span: FileSpan {
                     start: n,
                     end: n + 10,
                 },
                 kind: DefKind::Fn,
                 members: Vec::new(),
-                deps: Vec::new(),
-                reuse: false,
             });
             store.put_def(
                 hash,
