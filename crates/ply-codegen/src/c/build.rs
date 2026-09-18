@@ -860,7 +860,8 @@ fn bind(lib: &Library) -> Result<()> {
 
 /// The tables the runtime reads the unit against: the constant pool made immortal, the shapes, the
 /// field names and the builtins the bodies named.
-fn tables_of(unit: Unit, ctors: &[(Symbol, usize)]) -> Tables {
+fn tables_of(mut unit: Unit, ctors: &[(Symbol, usize)]) -> Tables {
+    unit.layouts.index_fields(&unit.fields);
     let mut immortals = Heap::persistent();
     let mut const_words = Vec::with_capacity(unit.consts.len());
     for v in &unit.consts {
