@@ -18,31 +18,20 @@ use ply_test::{BackendUse, Engine, Executor, InterpExecutor, Worker};
 use ply_ty::CheckOutput;
 use std::collections::HashMap;
 
-/// The port's check over these modules — the front end this repository keeps (ADR 0052 §1),
-/// rather than the Rust checker it retires.
 #[track_caller]
 pub fn port_check(sources: &[(String, String)], ids: &[SourceId]) -> CheckOutput {
-    let front = port_front(sources, ids);
-    let errors: Vec<&Diagnostic> = front
-        .diagnostics
-        .iter()
-        .filter(|d| d.severity == ply_span::Severity::Error)
-        .collect();
-    assert!(errors.is_empty(), "the fixture must typecheck: {errors:#?}");
-    front.check
+    ply_codegen::c::producer::checked_front(sources, ids)
+        .unwrap_or_else(|e| panic!("the fixture must typecheck: {e:#}"))
+        .check
 }
 
 /// What the port raises over these modules, for a fixture meant to be refused.
 #[track_caller]
 pub fn port_diagnostics(sources: &[(String, String)], ids: &[SourceId]) -> Vec<Diagnostic> {
-    port_front(sources, ids).diagnostics
-}
-
-#[track_caller]
-fn port_front(sources: &[(String, String)], ids: &[SourceId]) -> ply_ty::Front {
     ply_codegen::c::producer::ensure_default();
     ply_codegen::c::producer::front(sources, ids)
         .unwrap_or_else(|e| panic!("the port answers for the fixture: {e:#}"))
+        .diagnostics
 }
 
 pub struct Compiled {
@@ -150,11 +139,9 @@ impl Compiled {
     }
 
     /// The whole Ply emitter's unit for this program, and the C backend spec to install it with —
-    /// what a run needs under tier-only, since a bare machine holds no evaluator. `Unit::over`
-    /// alone gets only the reference fragment, which holds no `perform`/`handle`/`simulate`; the
-    /// texts are what the emitter re-parses into bodies. Leaks a `&'static` unit, which a test may.
+    /// what a run needs under tier-only, since a bare machine holds no evaluator. Leaks a
+    /// `&'static` unit, which a test may.
     pub fn tier(&self) -> (&'static ply_codegen::Unit, ply_eval::BackendSpec) {
-        ply_codegen::c::producer::ensure_default();
         let unit = ply_codegen::Unit::over_with_texts(
             &self.program,
             &self.resolved,

@@ -217,7 +217,6 @@ impl Hybrid for BodyHybrid<'_> {
         // A mixture is a reconstructed AST with no source text, and the whole front end reads
         // text: it is printed back to source once, and that one answer is what checks it here and
         // what the unit below is built from (ADR 0052 §2).
-        ply_codegen::c::producer::ensure_default();
         let printed = ply_syntax::print::program(&rebuilt.program);
         // Fresh ids rather than the tree's: a reconstructed module carries `Span::DUMMY.source`,
         // so every module would share one id and the answer's module positions — which the
@@ -225,12 +224,9 @@ impl Hybrid for BodyHybrid<'_> {
         let ids: Vec<ply_span::SourceId> = (0..printed.len())
             .map(|i| ply_span::SourceId(i as u32))
             .collect();
-        let Ok(front) = ply_codegen::c::producer::front(&printed, &ids) else {
+        let Ok(front) = ply_codegen::c::producer::checked_front(&printed, &ids) else {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
-        if front.has_error() {
-            return Trial::unresolved(Unresolved::DoesNotCheck);
-        }
         let check = &front.check;
         let rehashed = &front.hashes;
         let Some(index) = rebuilt

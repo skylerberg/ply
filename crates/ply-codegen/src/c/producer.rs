@@ -20,7 +20,6 @@ use ply_span::{Severity, SourceId, Symbol};
 use ply_ty::{Front, read_front};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// How a thread builds its producer.
@@ -30,14 +29,6 @@ static RECIPE: OnceLock<Recipe> = OnceLock::new();
 /// A digest of the emitter's own sources, folded into every cache key a produced body or unit
 /// is kept under: a body the last version of the emitter wrote is not this version's.
 static IDENTITY: OnceLock<String> = OnceLock::new();
-
-/// Whether the reference emits for the whole process, whatever thread asks. This is not the
-/// switch a test reaches for -- [`reference_only`] is, and it is per-thread. This one exists
-/// because the thread that asks is sometimes not the thread that decides: `ply-test`'s
-/// `execute_group` puts every group through `rayon::broadcast`, so the `attach` that builds a
-/// unit runs on a pool worker a per-thread switch never reaches (ADR 0052 §2). A handover still
-/// wins over both, because [`with_current`] reads `HANDED` first.
-static REFERENCE_EVERYWHERE: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static MINE: RefCell<Option<Result<PlyProducer, String>>> = const { RefCell::new(None) };
@@ -245,8 +236,6 @@ fn front_end(src: &Sources) -> Result<&'static Source, String> {
         front(&modules, &ids).map_err(|e| format!("{e:#}"))?,
     ));
     let keys = crate::source::emit_keys(front);
-    // `bodies_of` hands the emitter each module's text and answers an empty map without them, so
-    // an unattached `texts` refuses every root as unanswered rather than failing once.
     let texts: HashMap<String, String> = modules.iter().cloned().collect();
     Ok(Box::leak(Box::new(
         Source::from_front(program, resolved, front, keys).with_texts(texts),
@@ -293,11 +282,7 @@ pub fn mode() -> &'static str {
     if HANDED.with(|h| h.borrow().is_some()) {
         return "ply";
     }
-    if !installed()
-        || BUILDING.with(Cell::get)
-        || REFERENCE_ONLY.with(Cell::get)
-        || REFERENCE_EVERYWHERE.load(Ordering::Relaxed)
-    {
+    if !installed() || BUILDING.with(Cell::get) || REFERENCE_ONLY.with(Cell::get) {
         "ref"
     } else {
         "ply"
@@ -305,13 +290,8 @@ pub fn mode() -> &'static str {
 }
 
 /// Runs `f` with the reference emitter forced, whatever producer is installed: [`mode`] answers
-/// `ref` and the producer is not consulted or built. This is for the checks that hold the
-/// fragment against the whole emitter -- the differentials, and the emitter's own tests -- which
-/// need a unit the fragment emitted while the whole emitter is the default everywhere else.
-///
-/// Per-thread, which is what a test binary needs: `cargo test` runs this crate's tests over one
-/// process, and making this switch process-wide made them clobber each other's guard -- eighteen
-/// of `fragment`'s nineteen failed at two threads and all nineteen passed serially.
+/// `ref` and no body is asked of the producer, though [`front`] still is. Per-thread, because a
+/// process-wide switch let concurrent tests clobber each other's guard.
 pub fn reference_only<R>(f: impl FnOnce() -> R) -> R {
     struct Guard(bool);
     impl Drop for Guard {
@@ -320,24 +300,6 @@ pub fn reference_only<R>(f: impl FnOnce() -> R) -> R {
         }
     }
     let _guard = Guard(REFERENCE_ONLY.with(|c| c.replace(true)));
-    f()
-}
-
-/// [`reference_only`] for every thread, for a harness whose work runs where it cannot reach:
-/// `ply-test` builds its tier inside `rayon::broadcast`, so the thread that sets a per-thread
-/// switch is never the thread that reads it.
-///
-/// Two of these on different threads at once would restore each other's value, which is the fault
-/// that kept the switch above per-thread. So this is for a caller that owns its process, which is
-/// what `cargo nextest` gives a test.
-pub fn reference_only_everywhere<R>(f: impl FnOnce() -> R) -> R {
-    struct Guard(bool);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            REFERENCE_EVERYWHERE.store(self.0, Ordering::Relaxed);
-        }
-    }
-    let _guard = Guard(REFERENCE_EVERYWHERE.swap(true, Ordering::Relaxed));
     f()
 }
 
@@ -376,25 +338,25 @@ pub fn who() -> String {
     }
 }
 
+/// `serving`, unless [`reference_only`] withholds the producer as the emitter.
+pub fn with_current<T>(f: impl FnOnce(&PlyProducer) -> T) -> Option<T> {
+    if REFERENCE_ONLY.with(Cell::get) && HANDED.with(|h| h.borrow().is_none()) {
+        return None;
+    }
+    serving(f)
+}
+
 /// Runs `f` with this thread's producer, building it first if the recipe is installed and this
 /// thread has not built one. `None` when there is no producer, when it is being built, or when
 /// building it failed -- the failure is reported once, and the reference emits everything.
-/// Whether the producer's own unit is being built on this thread.
-pub fn building() -> bool {
-    BUILDING.with(Cell::get)
-}
-
-pub fn with_current<T>(f: impl FnOnce(&PlyProducer) -> T) -> Option<T> {
-    // An emitter handed over serves before anything else, and before the flags below: this is
-    // how one emitter emits another's sources, which a nested ask could not otherwise do.
+fn serving<T>(f: impl FnOnce(&PlyProducer) -> T) -> Option<T> {
+    // An emitter handed over serves before anything else: this is how one emitter emits another's
+    // sources, which a nested ask could not otherwise do.
     if HANDED.with(|h| h.borrow().is_some()) {
         return HANDED.with(|h| h.borrow().as_ref().map(|(p, _)| f(p)));
     }
     let recipe = RECIPE.get()?;
-    if BUILDING.with(Cell::get)
-        || REFERENCE_ONLY.with(Cell::get)
-        || REFERENCE_EVERYWHERE.load(Ordering::Relaxed)
-    {
+    if BUILDING.with(Cell::get) {
         return None;
     }
     MINE.with(|mine| {
@@ -470,8 +432,8 @@ impl PlyProducer {
         (self.asked.get(), self.answered.get())
     }
 
-    /// The emitter's C for `name`, or nothing: it did not reach the body, or the program has no
-    /// source texts to hand the emitter.
+    /// The emitter's C for `name`, or nothing: it did not reach the body, or it failed over the
+    /// program, which [`PlyProducer::failure`] then says.
     pub fn body(&self, loaded: &Source, name: &str, module_index: usize) -> Option<Answer> {
         self.asked.set(self.asked.get() + 1);
         if module_index >= loaded.module_count() {
@@ -508,7 +470,7 @@ impl PlyProducer {
         for module in loaded.module_names() {
             let name = module.to_string();
             let Some(text) = loaded.texts.get(&name) else {
-                return Ok(HashMap::new());
+                bail!("no source text for module `{name}`, and the emitter reads a program's text");
             };
             names.push(Value::bytes(name.as_bytes()));
             srcs.push(Value::bytes(text.as_bytes()));
@@ -615,8 +577,7 @@ const FRONT: &str = "front.front_dump";
 /// **A refusal of the program is in the answer, not in the `Err`.** The driver asks this before it
 /// has an opinion of its own, so a type error is `front.diagnostics` and reaches the terminal like
 /// any other; `Err` is the seam failing — no emitter on this thread, a dump that does not read.
-/// A caller that has already accepted the program holds the two apart itself; [`front_agreeing`]
-/// is that caller's door.
+/// A caller that expects the program to check asks [`checked_front`] instead.
 pub fn front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
     if sources.len() != ids.len() {
         bail!(
@@ -644,29 +605,27 @@ pub fn front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
     read_front(dump, ids).map_err(|e| anyhow!("the front end's answer does not read: {e}"))
 }
 
-/// [`front`] for a caller that has already run a front end over this program and accepted it: an
-/// error diagnostic is then two front ends differing rather than the program's fault, so it is
-/// raised rather than handed back as an answer.
-pub fn front_agreeing(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
+/// [`front`] over the default producer, with the program's errors raised rather than answered.
+pub fn checked_front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
+    ensure_default();
     let front = front(sources, ids)?;
-    if let Some(d) = front
+    let errors: Vec<String> = front
         .diagnostics
         .iter()
-        .find(|d| d.severity == Severity::Error)
-    {
-        bail!(
-            "the port's front end refuses a program the driver accepted: {} [{}]",
-            d.message,
-            d.code
-        );
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| format!("{} [{}]", d.message, d.code))
+        .collect();
+    if !errors.is_empty() {
+        bail!("the program does not check: {}", errors.join("; "));
     }
     Ok(front)
 }
 
 /// Enters `name` in this thread's compiled emitter, building it first when the thread has none.
 pub fn call(name: &str, args: &[Value]) -> Result<Value> {
-    with_current(|p| p.call(name, args))
-        .unwrap_or_else(|| bail!("no Ply emitter serves on this thread: none is installed, it is being built, or the reference is forced"))
+    serving(|p| p.call(name, args)).unwrap_or_else(|| {
+        bail!("no Ply emitter serves on this thread: none is installed, or it is being built")
+    })
 }
 
 /// `body <name> <n>\n` and then exactly `n` bytes, repeated: the tables in the cache's encoding,

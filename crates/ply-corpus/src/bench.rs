@@ -362,12 +362,12 @@ fn once(root: &Path, backend: Option<&str>) -> Result<(Timings, Shape)> {
     let started = Instant::now();
     let provider = match &spec {
         Some(spec) if !selection.to_run.is_empty() => Some(
-            ply_cli::commands::common::build_backend(
+            ply_cli::commands::common::build_backend_over(
                 spec,
                 &program,
                 &resolved,
-                &check,
-                Default::default(),
+                &port,
+                ply_cli::commands::common::module_texts(&program, &sources),
             )
             .map_err(|d| anyhow::anyhow!("building the backend: {}", d.message))?,
         ),

@@ -299,7 +299,8 @@ fn load(name: &str, src: &str) -> Result<(Program, Resolved, ply_ty::Front, ply_
         .map_err(|ds| anyhow::anyhow!("the measurement program must parse: {ds:#?}"))?;
     let resolved =
         resolve(&mut program).map_err(|ds| anyhow::anyhow!("it must also resolve: {ds:#?}"))?;
-    let port = crate::port_front(&[(name.to_string(), src.to_string())], &[id])?;
+    let port =
+        ply_codegen::c::producer::checked_front(&[(name.to_string(), src.to_string())], &[id])?;
     Ok((program, resolved, port, map))
 }
 

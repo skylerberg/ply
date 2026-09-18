@@ -151,7 +151,6 @@ pub mod tests_support {
     /// A machine over `source` with the default tier attached, so what the reference fragment
     /// answers is checked against what the whole emitter answers.
     pub fn machine(source: &'static Source, text: &str) -> ply_eval::Machine<'static> {
-        ply_codegen::c::producer::ensure_default();
         let texts = std::collections::HashMap::from([("m".to_string(), text.to_string())]);
         let unit = {
             let _config = super::CONFIG.read().unwrap_or_else(|e| e.into_inner());
@@ -179,15 +178,10 @@ pub mod tests_support {
         let mut ast =
             ply_syntax::parse_program([(id, ModuleName::from_dotted("m"), owned)]).expect("parses");
         let resolved = ply_syntax::resolve::resolve(&mut ast).expect("resolves");
-        ply_codegen::c::producer::ensure_default();
-        let front = ply_codegen::c::producer::front(&[("m".to_string(), owned.to_string())], &[id])
-            .expect("the port answers");
-        assert!(
-            front.diagnostics.is_empty(),
-            "checks: {:?}",
-            front.diagnostics
-        );
-        let check = front.check;
+        let check =
+            ply_codegen::c::producer::checked_front(&[("m".to_string(), owned.to_string())], &[id])
+                .expect("checks")
+                .check;
         let bare = Source::new(
             Box::leak(Box::new(ast)),
             Box::leak(Box::new(resolved)),
@@ -216,15 +210,10 @@ pub mod tests_support {
         let mut ast =
             ply_syntax::parse_program([(id, ModuleName::from_dotted("m"), owned)]).expect("parses");
         let resolved = ply_syntax::resolve::resolve(&mut ast).expect("resolves");
-        ply_codegen::c::producer::ensure_default();
-        let front = ply_codegen::c::producer::front(&[("m".to_string(), owned.to_string())], &[id])
-            .expect("the port answers");
-        assert!(
-            front.diagnostics.is_empty(),
-            "checks: {:?}",
-            front.diagnostics
-        );
-        let check = front.check;
+        let check =
+            ply_codegen::c::producer::checked_front(&[("m".to_string(), owned.to_string())], &[id])
+                .expect("checks")
+                .check;
         let source: &'static Source = Box::leak(Box::new(Source::new(
             Box::leak(Box::new(ast)),
             Box::leak(Box::new(resolved)),

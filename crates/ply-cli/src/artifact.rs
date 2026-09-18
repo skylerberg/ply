@@ -238,7 +238,7 @@ pub fn build(
     // again (ADR 0052 §1).
     let front = &loaded.front;
     let hashes = &front.hashes;
-    let bodies = bodies_by_hash(front);
+    let bodies = ply_hash::body::of_front(front);
     let Some(entry_hash) = hashes.defs.get(&entry.name).copied() else {
         return Err(vec![missing_entry(&entry.name)]);
     };
@@ -268,7 +268,7 @@ pub fn build(
             .into_iter()
             .flatten()
         {
-            match bodies.get(hash) {
+            match bodies.get(*hash) {
                 Some(body) => {
                     out.bodies.insert(*hash, body.clone());
                     out.names.push((name.to_string(), *hash));
@@ -713,37 +713,6 @@ pub fn open(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnostic>>
     open_sources(artifact, path)
 }
 
-/// The port's bodies, keyed by the hash each is filed under.
-///
-/// The bytes are the envelope the hasher wrote, so they are wrapped rather than re-hashed. Only a
-/// name declared in two namespaces — a `fn` and a `type` of one name — has two bodies, and that is
-/// the one case a body has to say which of the two hashes it is filed under.
-fn bodies_by_hash(front: &Front) -> BTreeMap<DefHash, StoredBody> {
-    let hashes = &front.hashes;
-    let mut by_name: BTreeMap<&Symbol, Vec<StoredBody>> = BTreeMap::new();
-    for (name, bytes) in &front.bodies {
-        if let Some(body) = StoredBody::from_bytes(bytes.clone()) {
-            by_name.entry(name).or_default().push(body);
-        }
-    }
-    let mut out = BTreeMap::new();
-    for (name, stored) in by_name {
-        for hash in [hashes.defs.get(name), hashes.decls.get(name)]
-            .into_iter()
-            .flatten()
-        {
-            let found = match stored.as_slice() {
-                [only] => Some(only),
-                many => many.iter().find(|b| b.verify(*hash)),
-            };
-            if let Some(body) = found {
-                out.insert(*hash, body.clone());
-            }
-        }
-    }
-    out
-}
-
 /// The port's whole answer over these module texts: the one front end opening an artifact runs.
 ///
 /// An artifact carries its own sources and pulls in the shipped modules it imports, so the texts
@@ -835,13 +804,13 @@ fn open_sources(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnost
 
     // The sources are believed only if they build the artifact they arrived in.
     let hashes = &front.hashes;
-    let bodies = bodies_by_hash(&front);
+    let bodies = ply_hash::body::of_front(&front);
     let mut rebuilt: BTreeMap<DefHash, StoredBody> = BTreeMap::new();
     for (name, hash) in &artifact.names {
         let symbol = Symbol::new(name);
         let known =
             hashes.defs.get(&symbol) == Some(hash) || hashes.decls.get(&symbol) == Some(hash);
-        match bodies.get(hash) {
+        match bodies.get(*hash) {
             Some(body) if known => {
                 rebuilt.insert(*hash, body.clone());
             }

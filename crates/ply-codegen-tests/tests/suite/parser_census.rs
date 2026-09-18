@@ -46,14 +46,9 @@ fn load_dir(dir: &str) -> Loaded {
     let expanded = ply_derive::expand_program(&mut ast);
     assert!(expanded.is_empty(), "{expanded:?}");
     let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the corpus resolves");
-    ply_codegen::c::producer::ensure_default();
-    let front = ply_codegen::c::producer::front(&named, &ids).expect("the port answers");
-    assert!(
-        front.diagnostics.is_empty(),
-        "the corpus checks: {:?}",
-        front.diagnostics
-    );
-    let check = front.check;
+    let check = ply_codegen::c::producer::checked_front(&named, &ids)
+        .expect("the corpus checks")
+        .check;
     Loaded {
         program: Box::leak(Box::new(ast)),
         resolved: Box::leak(Box::new(resolved)),
@@ -65,8 +60,7 @@ fn load_dir(dir: &str) -> Loaded {
 fn the_census_over_the_parser_spike() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../ply-compiler/ply");
     let loaded = load_dir(dir);
-    // The census is of the reference emitter's fragment, so the reference emits here whatever the
-    // check came from; the installed producer would answer no body at all for a text-less source.
+    // The census is of the reference emitter's fragment.
     let unit = ply_codegen::c::producer::reference_only(|| {
         ply_codegen::Unit::over(loaded.program, loaded.resolved, loaded.check)
     })

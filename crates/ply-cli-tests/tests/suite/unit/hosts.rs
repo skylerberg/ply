@@ -97,16 +97,9 @@ fn stamp() -> Int / {clock.read} = clock.now()
 "#;
 
 fn check(source: &str) -> CheckOutput {
-    producer::ensure_default();
-    let modules = [("m".to_string(), source.to_string())];
-    let front =
-        producer::front(&modules, &[SourceId(0)]).expect("the port answers for the fixture");
-    assert!(
-        front.diagnostics.is_empty(),
-        "the fixture typechecks: {:?}",
-        front.diagnostics
-    );
-    front.check
+    producer::checked_front(&[(String::new(), source.to_string())], &[SourceId(0)])
+        .expect("the fixture typechecks")
+        .check
 }
 
 fn full() -> HostRegistry {
@@ -152,9 +145,9 @@ fn the_listing_names_every_resource_an_any_handler_got() {
         triples,
         [
             "clock.now",
-            "m.db.get[orders]",
-            "m.db.get[users]",
-            "m.db.put[orders]"
+            "db.get[orders]",
+            "db.get[users]",
+            "db.put[orders]"
         ]
     );
     assert_eq!(listing.handlers, 3);
@@ -172,11 +165,11 @@ fn the_table_is_exactly_the_shape_the_contract_specifies() {
         "\
 3 host handlers · 4 operations · trusted computing base
 
-OPERATION         ATOM                HANDLER                    DET  LINEAR        BLOCKING  SECRETS
-clock.now         clock.read          ply_host::clock::now       no   repeatable    no        no
-m.db.get[orders]  m.db.read[orders]   ply_host::postgres::read   no   at-most-once  yes       no
-m.db.get[users]   m.db.read[users]    ply_host::postgres::read   no   at-most-once  yes       no
-m.db.put[orders]  m.db.write[orders]  ply_host::postgres::write  no   at-most-once  yes       no
+OPERATION       ATOM              HANDLER                    DET  LINEAR        BLOCKING  SECRETS
+clock.now       clock.read        ply_host::clock::now       no   repeatable    no        no
+db.get[orders]  db.read[orders]   ply_host::postgres::read   no   at-most-once  yes       no
+db.get[users]   db.read[users]    ply_host::postgres::read   no   at-most-once  yes       no
+db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  yes       no
 "
     );
     assert!(digest[0].starts_with("digest: b3:"), "{digest:?}");
