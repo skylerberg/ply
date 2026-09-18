@@ -29,7 +29,7 @@ fn sample() -> Artifact {
         entry,
         bodies,
         names,
-        sources: Vec::new(),
+        closure: Vec::new(),
         unit: None,
     }
 }
@@ -56,9 +56,9 @@ fn a_round_trip_preserves_every_field() {
 }
 
 #[test]
-fn sources_round_trip_and_are_believed_only_as_bytes() {
+fn a_closure_round_trips_and_is_believed_only_as_bytes() {
     let mut artifact = sample();
-    artifact.sources = vec![
+    artifact.closure = vec![
         ("a.ply".to_string(), "fn a() -> Int = 1\n".to_string()),
         ("sub/b.ply".to_string(), "fn b() -> Int = 2\n".to_string()),
     ];
@@ -109,12 +109,37 @@ fn the_digest_covers_every_byte_after_it() {
 }
 
 #[test]
-fn embedding_sources_moves_the_digest() {
-    let bare = sample();
+fn the_closure_is_in_the_digest() {
     let mut with = sample();
-    with.sources = vec![("m.ply".to_string(), "fn main() -> Int = 1\n".to_string())];
-    assert_ne!(bare.digest(), with.digest());
-    assert!(!bare.has_sources() && with.has_sources());
+    with.closure = vec![("m.ply".to_string(), "fn main() -> Int = 1\n".to_string())];
+    assert_ne!(sample().digest(), with.digest());
+}
+
+/// Two artifacts that ship one closure and start at different definitions are two programs.
+#[test]
+fn the_entry_point_is_in_the_digest() {
+    let artifact = sample();
+    let mut elsewhere = sample();
+    elsewhere.entry = *artifact
+        .bodies
+        .keys()
+        .find(|hash| **hash != artifact.entry)
+        .expect("a second definition");
+    assert_ne!(artifact.digest(), elsewhere.digest());
+    assert_eq!(
+        artifact.encode()[OFF_SECTIONS..],
+        elsewhere.encode()[OFF_SECTIONS..],
+        "only the entry point differs"
+    );
+}
+
+/// An artifact of the generation that carried whole source files is rebuilt, not re-transferred.
+#[test]
+fn a_format_3_artifact_is_a_version_refusal() {
+    let mut bytes = sample().encode();
+    bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
+    let err = decode(&bytes, Path::new("t.plyx")).unwrap_err();
+    assert_eq!(err.code, codes::ARTIFACT_VERSION);
 }
 
 #[test]

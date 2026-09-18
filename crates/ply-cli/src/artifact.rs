@@ -1,8 +1,8 @@
 //! The deployable artifact: the transitive closure of one entry point, in the same bytes the
-//! content-addressed store already holds.
+//! content-addressed store already holds and printed back to the source a target opens.
 
 use crate::load::Loaded;
-use ply_hash::body::StoredBody;
+use ply_hash::body::{BodySet, StoredBody};
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Severity, SourceMap, Span, Symbol, codes};
 use ply_syntax::ast::{ModuleName, Program};
@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The generation of the container below.
-pub const ARTIFACT_FORMAT: u32 = 3;
+pub const ARTIFACT_FORMAT: u32 = 4;
 
 /// The extension `ply run` recognises, and the reason it does not have to guess.
 pub const EXTENSION: &str = "plyx";
@@ -21,10 +21,10 @@ const MAGIC: &[u8; 8] = b"PLYPROG1";
 
 /// Domain tag, so a program digest can never be confused with a definition hash or with `ply hosts
 /// --digest`.
-const DIGEST_DOMAIN: &[u8] = b"ply.program.1";
+const DIGEST_DOMAIN: &[u8] = b"ply.program.2";
 
-/// Bit 0 of `flags`: the `SOURCES` section is present.
-const FLAG_SOURCES: u32 = 1;
+/// Bit 0 of `flags`: the `CLOSURE` section is present.
+const FLAG_CLOSURE: u32 = 1;
 const FLAG_UNIT: u32 = 2;
 
 pub const HEADER_LEN: usize = 188;
@@ -37,14 +37,14 @@ const OFF_BODY_ENC: usize = 80;
 const OFF_STD: usize = 84;
 const OFF_ENTRY: usize = 116;
 const OFF_DIGEST: usize = 148;
-/// Where the digest's coverage begins: every byte of the file from here on.
+/// Where the digest's coverage begins: every byte of the file from here on, and the entry point.
 pub const OFF_SECTIONS: usize = 180;
 const OFF_RESERVED: usize = 184;
 
 const KIND_BODIES: u32 = 1;
 const KIND_NAMES: u32 = 2;
 const KIND_STRINGS: u32 = 3;
-const KIND_SOURCES: u32 = 4;
+const KIND_CLOSURE: u32 = 4;
 const KIND_UNIT: u32 = 5;
 
 /// The compiled unit the Ply emitter produced over an artifact's definitions: its C, compressed,
@@ -69,18 +69,14 @@ pub struct Artifact {
     pub bodies: BTreeMap<DefHash, StoredBody>,
     /// The namespace: program-wide name to hash, sorted.
     pub names: Vec<(String, DefHash)>,
-    /// Source text, keyed by the path that names the module, relative to the project root so that
-    /// two builds from two roots agree.
-    pub sources: Vec<(String, String)>,
+    /// The closure printed back to source, keyed by the path that names each module (`a/b.ply`):
+    /// no test, no law, no comment and nothing unreached. The shipped modules are the target's own.
+    pub closure: Vec<(String, String)>,
     /// The compiled unit over these definitions, when the emitter produced one at build.
     pub unit: Option<EmbeddedUnit>,
 }
 
 impl Artifact {
-    pub fn has_sources(&self) -> bool {
-        !self.sources.is_empty()
-    }
-
     pub fn has_unit(&self) -> bool {
         self.unit.is_some()
     }
@@ -93,8 +89,8 @@ impl Artifact {
             .map(|(name, _)| name.as_str())
     }
 
-    /// BLAKE3 over every byte of the encoded file from `sections` onward: the section table and
-    /// every payload, domain-tagged.
+    /// BLAKE3 over the entry point and every byte of the encoded file from `sections` onward: the
+    /// section table and every payload, domain-tagged.
     pub fn digest(&self) -> [u8; 32] {
         let bytes = self.encode();
         digest_of(&bytes).unwrap_or([0; 32])
@@ -133,15 +129,15 @@ impl Artifact {
         sections.push((KIND_NAMES, self.names.len() as u32, names));
         sections.push((KIND_STRINGS, strings.len() as u32, strings));
 
-        if self.has_sources() {
+        if !self.closure.is_empty() {
             let mut payload = Vec::new();
-            for (path, text) in &self.sources {
+            for (path, text) in &self.closure {
                 payload.extend_from_slice(&(path.len() as u32).to_le_bytes());
                 payload.extend_from_slice(path.as_bytes());
                 payload.extend_from_slice(&(text.len() as u32).to_le_bytes());
                 payload.extend_from_slice(text.as_bytes());
             }
-            sections.push((KIND_SOURCES, self.sources.len() as u32, payload));
+            sections.push((KIND_CLOSURE, self.closure.len() as u32, payload));
         }
         if let Some(unit) = &self.unit {
             fn put(payload: &mut Vec<u8>, bytes: &[u8]) {
@@ -157,7 +153,11 @@ impl Artifact {
         let mut out = vec![0u8; table];
         out[..8].copy_from_slice(MAGIC);
         out[OFF_FORMAT..OFF_FORMAT + 4].copy_from_slice(&ARTIFACT_FORMAT.to_le_bytes());
-        let mut flags = if self.has_sources() { FLAG_SOURCES } else { 0 };
+        let mut flags = if self.closure.is_empty() {
+            0
+        } else {
+            FLAG_CLOSURE
+        };
         if self.has_unit() {
             flags |= FLAG_UNIT;
         }
@@ -198,6 +198,7 @@ pub fn digest_of(bytes: &[u8]) -> Option<[u8; 32]> {
     }
     let mut hasher = blake3::Hasher::new();
     hasher.update(DIGEST_DOMAIN);
+    hasher.update(&bytes[OFF_ENTRY..OFF_ENTRY + 32]);
     hasher.update(&bytes[OFF_SECTIONS..]);
     Some(*hasher.finalize().as_bytes())
 }
@@ -258,7 +259,7 @@ pub fn build(
         entry: entry_hash,
         bodies: BTreeMap::new(),
         names: Vec::new(),
-        sources: Vec::new(),
+        closure: Vec::new(),
         unit: None,
     };
 
@@ -283,9 +284,12 @@ pub fn build(
     out.names.sort();
     out.names.dedup();
 
-    out.sources = embedded_sources(loaded);
+    out.closure = closure_texts(&out)?;
+    // Reopened as a target opens it, so an artifact that builds is one that opens, and its unit is
+    // over the program a target runs rather than over the project.
+    let opened = reopen(&out).map_err(|diags| vec![unreopened(&diags)])?;
     let names: Vec<&str> = out.names.iter().map(|(n, _)| n.as_str()).collect();
-    let (unit, warnings) = embedded_unit(loaded, &names);
+    let (unit, warnings) = embedded_unit(&opened, &names);
     out.unit = unit;
 
     Ok(Built {
@@ -297,22 +301,44 @@ pub fn build(
     })
 }
 
+/// The closure's bodies printed back to source, a module per entry.
+fn closure_texts(artifact: &Artifact) -> Result<Vec<(String, String)>, Vec<Diagnostic>> {
+    let mut bodies = BodySet::default();
+    for (hash, body) in &artifact.bodies {
+        bodies.insert(*hash, body.clone());
+    }
+    let names: Vec<(Symbol, DefHash)> = artifact
+        .names
+        .iter()
+        .map(|(name, hash)| (Symbol::new(name), *hash))
+        .collect();
+    let program = ply_hash::body::reconstruct_exact(&bodies, &names, ply_std::is_std)?;
+    Ok(program
+        .modules
+        .iter()
+        .map(|module| {
+            let path = module.name.segments().collect::<Vec<_>>().join("/");
+            (format!("{path}.ply"), ply_syntax::print::module(module))
+        })
+        .collect())
+}
+
 /// The whole unit over the artifact's definitions, produced by the Ply emitter and embedded so
 /// that `ply run` enters the program as it was built rather than rebuilding what it can from
 /// bodies alone, which costs an emit and a C compile at every run. A production that fails leaves
 /// the artifact without one, and says so.
-fn embedded_unit(loaded: &Loaded, names: &[&str]) -> (Option<EmbeddedUnit>, Vec<Diagnostic>) {
+fn embedded_unit(opened: &Opened, names: &[&str]) -> (Option<EmbeddedUnit>, Vec<Diagnostic>) {
     ply_codegen::c::producer::ensure_default();
     // Definitions only: the closure also names the effect and resource declarations it reaches,
     // which no emitter is offered.
     let names: Vec<&str> = names
         .iter()
         .copied()
-        .filter(|name| loaded.check.defs.contains_key(&Symbol::new(name)))
+        .filter(|name| opened.front.check.defs.contains_key(&Symbol::new(name)))
         .collect();
-    let texts = crate::commands::common::module_texts(&loaded.program, &loaded.sources);
+    let texts = crate::commands::common::module_texts(&opened.program, &opened.sources);
     let produced =
-        ply_codegen::Unit::over_front(&loaded.program, &loaded.resolved, &loaded.front, texts)
+        ply_codegen::Unit::over_front(&opened.program, &opened.resolved, &opened.front, texts)
             .and_then(|unit| unit.produce(&names))
             .and_then(|produced| {
                 let text = ply_codegen::c::bundle::pack(&produced.text)?;
@@ -362,26 +388,6 @@ fn stale_unit() -> Diagnostic {
     )
     .note("the artifact's bodies are printed back to source and compiled at this run instead")
     .note("rebuild the artifact with this `ply` to carry a unit it can enter")
-}
-
-/// Every project file, keyed by its path relative to the project root.
-fn embedded_sources(loaded: &Loaded) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    for file in loaded.sources.files() {
-        if ply_std::is_pseudo_path(&file.path) {
-            continue;
-        }
-        let relative = file.path.strip_prefix(&loaded.root).unwrap_or(&file.path);
-        let key = relative
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("/");
-        out.push((key, file.text.to_string()));
-    }
-    out.sort();
-    out.dedup();
-    out
 }
 
 fn restricted_closure(
@@ -505,7 +511,7 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
         entry,
         bodies: BTreeMap::new(),
         names: Vec::new(),
-        sources: Vec::new(),
+        closure: Vec::new(),
         unit: None,
     };
 
@@ -563,7 +569,7 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
         }
     }
 
-    if let Some(&(records, offset, len)) = payloads.get(&KIND_SOURCES) {
+    if let Some(&(records, offset, len)) = payloads.get(&KIND_CLOSURE) {
         let mut at = offset;
         let end = offset + len;
         for _ in 0..records {
@@ -572,16 +578,16 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
             let text_len = r.u32(at + 4 + path_len)? as usize;
             let raw_text = r.slice(at + 8 + path_len, text_len)?;
             let file = std::str::from_utf8(raw_path)
-                .map_err(|_| invalid(path, "an embedded source path is not valid UTF-8"))?;
+                .map_err(|_| invalid(path, "a module path in the closure is not valid UTF-8"))?;
             let text = std::str::from_utf8(raw_text)
-                .map_err(|_| invalid(path, "an embedded source file is not valid UTF-8"))?;
-            out.sources.push((file.to_string(), text.to_string()));
+                .map_err(|_| invalid(path, "a module in the closure is not valid UTF-8"))?;
+            out.closure.push((file.to_string(), text.to_string()));
             at += 8 + path_len + text_len;
         }
         if at != end {
             return Err(invalid(
                 path,
-                format!("the source section has {} bytes nothing claims", end - at),
+                format!("the closure section has {} bytes nothing claims", end - at),
             ));
         }
     }
@@ -690,33 +696,37 @@ pub struct Opened {
     pub sources: SourceMap,
     pub program: Program,
     pub resolved: Resolved,
-    /// The port's whole answer over the artifact's own sources. The unit a run builds is built
-    /// from *this* rather than from a front end derived a second time (ADR 0052 §1).
+    /// The port's whole answer over the artifact's closure. The unit a run builds is built from
+    /// *this* rather than from a front end derived a second time (ADR 0052 §1).
     pub front: Front,
     /// The name the entry point answers to *in this program*.
     pub entry: Symbol,
 }
 
-/// Turns an artifact into something runnable. An artifact carries its sources and they are the
-/// only thing it is opened from: the path that rebuilt a program from the stored bodies alone is
-/// the case ADR 0052 §2 removes rather than keeps working.
+/// Turns an artifact into something runnable: its closure, checked with the shipped modules it
+/// imports, and believed only if it is exactly the definitions the artifact names.
 pub fn open(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnostic>> {
-    if !artifact.has_sources() {
-        return Err(vec![
-            version(
+    reopen(artifact).map_err(|diags| {
+        if diags
+            .first()
+            .is_some_and(|d| d.code == codes::INTERNAL_ERROR)
+        {
+            return diags;
+        }
+        vec![
+            invalid(
                 path,
-                "the artifact carries no source text, and a program is opened from its sources",
+                "the artifact's closure does not open as the program it names",
             )
-            .note("an artifact written before sources were carried has none to open"),
-        ]);
-    }
-    open_sources(artifact, path)
+            .note(first_of(&diags)),
+        ]
+    })
 }
 
 /// The port's whole answer over these module texts: the one front end opening an artifact runs.
 ///
-/// An artifact carries its own sources and pulls in the shipped modules it imports, so the texts
-/// handed over are the whole program and the answer is complete (ADR 0052 §1).
+/// An artifact carries its closure and pulls in the shipped modules it imports, so the texts handed
+/// over are the whole program and the answer is complete (ADR 0052 §1).
 fn ask_the_port(
     inputs: &[(ply_span::SourceId, ModuleName, String)],
 ) -> Result<Front, Vec<Diagnostic>> {
@@ -748,12 +758,18 @@ fn ask_the_port(
     }
 }
 
-fn open_sources(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnostic>> {
+/// [`open`], with its refusals as the parser, the checker or the comparison raised them.
+fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
     let mut sources = SourceMap::new();
     let mut inputs: Vec<(ply_span::SourceId, ModuleName, String)> = Vec::new();
-    for (file, text) in &artifact.sources {
+    for (file, text) in &artifact.closure {
         let relative = PathBuf::from(file);
         let name = ModuleName::from_relative_path(&relative).map_err(|d| vec![d])?;
+        if ply_std::is_std(&name) {
+            return Err(vec![unfaithful(format!(
+                "the closure carries `{file}`, a module this `ply` ships"
+            ))]);
+        }
         let id = sources.add(&relative, text.clone());
         inputs.push((id, name, text.clone()));
     }
@@ -802,7 +818,6 @@ fn open_sources(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnost
     // hashes the artifact is keyed by both come from the one ask (ADR 0052 §1).
     let front = ask_the_port(&inputs)?;
 
-    // The sources are believed only if they build the artifact they arrived in.
     let hashes = &front.hashes;
     let bodies = ply_hash::body::of_front(&front);
     let mut rebuilt: BTreeMap<DefHash, StoredBody> = BTreeMap::new();
@@ -815,30 +830,37 @@ fn open_sources(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnost
                 rebuilt.insert(*hash, body.clone());
             }
             _ => {
-                return Err(vec![
-                    invalid(
-                        path,
-                        format!("the embedded source does not define `{name}`"),
-                    )
-                    .note("the artifact's sources are not the sources it was built from"),
-                ]);
+                return Err(vec![unfaithful(format!(
+                    "the closure does not define `{name}` as the artifact does"
+                ))]);
             }
         }
     }
     if rebuilt != artifact.bodies {
-        return Err(vec![
-            invalid(
-                path,
-                "the embedded source does not rebuild the artifact's definitions",
-            )
-            .note("the artifact's sources are not the sources it was built from"),
-        ]);
+        return Err(vec![unfaithful(
+            "the closure does not rebuild the artifact's definitions".to_string(),
+        )]);
+    }
+    let named: BTreeSet<&str> = artifact
+        .names
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if let Some(extra) = hashes
+        .defs
+        .keys()
+        .chain(hashes.decls.keys())
+        .find(|name| !ply_std::is_reserved(name.as_str()) && !named.contains(name.as_str()))
+    {
+        return Err(vec![unfaithful(format!(
+            "the closure declares `{extra}`, which the artifact does not name"
+        ))]);
     }
 
     let entry = artifact
         .entry_name()
         .map(Symbol::new)
-        .ok_or_else(|| vec![invalid(path, "the artifact names no entry point")])?;
+        .ok_or_else(|| vec![unfaithful("the artifact names no entry point".to_string())])?;
     Ok(Opened {
         sources,
         program,
@@ -916,6 +938,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     };
     use crate::{EXIT_COMPILE_ERROR, EXIT_FAILED, EXIT_OK};
 
+    // A closure's positions are in text printed at build, which is nothing a reader wrote.
     let empty = SourceMap::new();
     let refuse = |diagnostics: &[Diagnostic]| -> i32 {
         if args.json {
@@ -961,7 +984,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     let db = match args.db.resolve(args.host) {
         Ok(db) => db,
         Err(diagnostics) => {
-            return report_bind_error("run", &diagnostics, &opened.sources, args.json, style);
+            return report_bind_error("run", &diagnostics, &empty, args.json, style);
         }
     };
     let declared = opened
@@ -981,11 +1004,11 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     ) {
         Ok(resolved) => resolved,
         Err(diagnostics) => {
-            return report_bind_error("run", &diagnostics, &opened.sources, args.json, style);
+            return report_bind_error("run", &diagnostics, &empty, args.json, style);
         }
     };
     if !args.json {
-        print_diagnostics(&config_warnings, &opened.sources, style);
+        print_diagnostics(&config_warnings, &empty, style);
     }
     // A deployed artifact drains exactly as a source tree does.
     let shutdown = args
@@ -997,7 +1020,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         return report_bind_error(
             "run",
             std::slice::from_ref(&diagnostic),
-            &opened.sources,
+            &empty,
             args.json,
             style,
         );
@@ -1015,7 +1038,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     ) {
         Ok(hosts) => hosts,
         Err(diagnostics) => {
-            return report_bind_error("run", &diagnostics, &opened.sources, args.json, style);
+            return report_bind_error("run", &diagnostics, &empty, args.json, style);
         }
     };
     if !args.json {
@@ -1129,10 +1152,10 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
                     "configuration": hosts.configuration().to_json(),
                     "value": serde_json::Value::Null,
                     "shutdown": teardown_json,
-                    "diagnostics": [diagnostic_json(&diagnostic, &opened.sources)],
+                    "diagnostics": [diagnostic_json(&diagnostic, &empty)],
                 }));
             } else {
-                print_diagnostics(std::slice::from_ref(&diagnostic), &opened.sources, style);
+                print_diagnostics(std::slice::from_ref(&diagnostic), &empty, style);
             }
             code
         }
@@ -1184,15 +1207,9 @@ fn evaluate(
         configure(&mut machine);
         return machine.call(name, Vec::new(), span);
     }
-    // Without a unit, the whole Ply emitter is a front end that reads text, and it is handed the
-    // program printed back to source rather than the artifact's own files.
     let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.front.check);
     if let Some(spec) = crate::commands::common::backend_spec(backend)? {
-        // The hashes are the port's, so the unit's emit cache keys are this program's rather
-        // than absent.
-        let texts = ply_syntax::print::program(&opened.program)
-            .into_iter()
-            .collect();
+        let texts = crate::commands::common::module_texts(&opened.program, &opened.sources);
         let provider = crate::commands::common::build_backend_over(
             &spec,
             &opened.program,
@@ -1214,6 +1231,29 @@ fn invalid(path: &Path, message: impl Into<String>) -> Diagnostic {
     Diagnostic::error(codes::ARTIFACT_INVALID, message.into())
         .primary(Span::DUMMY, format!("in `{}`", path.display()))
         .note("rebuild it with `ply build`, or transfer the file again")
+}
+
+/// The closure is not the program the artifact names: a different text, or one that does not check.
+fn unfaithful(message: String) -> Diagnostic {
+    Diagnostic::error(codes::ARTIFACT_INVALID, message)
+}
+
+/// The first refusal as one line a note can carry.
+fn first_of(diags: &[Diagnostic]) -> String {
+    diags.first().map_or_else(
+        || "no reason was given".to_string(),
+        |d| format!("{}: {}", d.code, d.message),
+    )
+}
+
+/// A closure the build printed and could not open again is Ply's fault rather than the program's.
+fn unreopened(diags: &[Diagnostic]) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        "the closure printed back to source does not open as the program it was printed from",
+    )
+    .note(first_of(diags))
+    .note("this is Ply's fault, not the program's, and nothing was built")
 }
 
 fn version(path: &Path, message: impl Into<String>) -> Diagnostic {

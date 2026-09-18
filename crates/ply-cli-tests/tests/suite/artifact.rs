@@ -143,6 +143,26 @@ fn an_artifact_carries_no_test_no_law_and_nothing_unreached() {
         !names.iter().any(|n| n.contains("ply_tests")),
         "no test key may appear: {names:?}"
     );
+
+    let opened = artifact::open(&built.artifact, Path::new("t.plyx")).expect("it should open");
+    assert!(opened.front.check.tests.is_empty(), "a test was deployed");
+    assert!(opened.front.check.laws.is_empty(), "a law was deployed");
+
+    // Nor is any of it disclosed, in any section or in the unit's C.
+    let mut shipped = vec![String::from_utf8_lossy(&built.artifact.encode()).into_owned()];
+    if let Some(unit) = &built.artifact.unit {
+        shipped.push(ply_codegen::c::bundle::unpack(&unit.text).unwrap());
+    }
+    for text in &shipped {
+        for word in [
+            "unreached",
+            "announce",
+            "shade reads a payload",
+            "even and odd disagree",
+        ] {
+            assert!(!text.contains(word), "`{word}` shipped");
+        }
+    }
 }
 
 /// Every definition in the artifact is filed under the hash `ply hash` gives it, which is what
@@ -210,17 +230,26 @@ fn an_artifact_run_binds_nothing_without_host() {
     assert_eq!(report["binding"], "hermetic");
 }
 
-/// An artifact's text is re-parsed and re-checked, then re-hashed and compared against the bodies
-/// it arrived with — so a failure carries a line number and the sources cannot be a different
-/// program than the digest names.
+/// The closure is text printed at build rather than text anyone wrote, so a failure raised by a
+/// run of an artifact names no line in it.
 #[test]
-fn an_artifact_locates_its_failures() {
+fn a_failure_in_an_artifact_carries_no_line_number() {
     let dir = project("fn main() -> Int = 1 / 0\n");
     ply(dir.path())
         .args(["build", ".", "-o", "m.plyx"])
         .assert()
         .success();
 
+    let from_source = json_of(
+        &ply(dir.path())
+            .args(["run", "m.ply", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        from_source["diagnostics"][0]["labels"][0]["start"]["line"],
+        1
+    );
     let failed = json_of(
         &ply(dir.path())
             .args(["run", "m.plyx", "--json"])
@@ -228,23 +257,40 @@ fn an_artifact_locates_its_failures() {
             .unwrap(),
     );
     assert_eq!(failed["ok"], false);
-    assert_eq!(failed["diagnostics"][0]["labels"][0]["start"]["line"], 1);
+    assert_eq!(
+        failed["diagnostics"][0]["code"],
+        from_source["diagnostics"][0]["code"]
+    );
+    assert!(
+        failed["diagnostics"][0]["labels"][0]["start"].is_null(),
+        "{failed}"
+    );
 }
 
-/// Sources are believed only if they rebuild the artifact they arrived in.
+/// The closure is believed only if it is exactly the definitions the artifact names, and one that
+/// does not parse is refused the same way.
 #[test]
-fn embedded_sources_that_are_not_the_sources_are_refused() {
+fn a_closure_that_is_not_the_closure_is_refused() {
     let dir = project(PROGRAM);
-    let mut artifact = built(dir.path()).1.artifact;
-    assert!(artifact.has_sources());
-    for (_, text) in artifact.sources.iter_mut() {
+    let artifact = artifact_of(dir.path());
+    let mut altered = artifact.clone();
+    for (_, text) in altered.closure.iter_mut() {
         *text = text.replace("Blue(20)", "Blue(19)");
     }
-    let diags = match artifact::open(&artifact, Path::new("t.plyx")) {
-        Ok(_) => panic!("altered sources must not be believed"),
-        Err(diags) => diags,
-    };
-    assert_eq!(diags[0].code, codes::ARTIFACT_INVALID);
+    assert_ne!(
+        altered.closure, artifact.closure,
+        "the closure spells the literal"
+    );
+    let mut garbled = artifact.clone();
+    garbled.closure[0].1 = "fn (".to_string();
+
+    for broken in [altered, garbled] {
+        let diags = match artifact::open(&broken, Path::new("t.plyx")) {
+            Ok(_) => panic!("a closure that is not the program must not be believed"),
+            Err(diags) => diags,
+        };
+        assert_eq!(diags[0].code, codes::ARTIFACT_INVALID);
+    }
 }
 
 // --- verification ------------------------------------------------------------
@@ -297,6 +343,40 @@ fn no_prefix_of_an_artifact_is_believed() {
         assert_eq!(err.code, codes::ARTIFACT_INVALID, "at {cut}");
     }
     assert!(artifact::decode(&bytes, &path).is_ok());
+}
+
+/// A body taken out of the file leaves a closure that still declares it and a namespace that does
+/// not name it, which is not the program the digest names.
+#[test]
+fn removing_a_body_is_e0443() {
+    let dir = project(PROGRAM);
+    let mut artifact = artifact_of(dir.path());
+    let victim = artifact
+        .names
+        .iter()
+        .find(|(name, _)| name == "m.shade")
+        .map(|(_, hash)| *hash)
+        .expect("`shade` is in the closure");
+    artifact.bodies.remove(&victim);
+    artifact.names.retain(|(_, h)| *h != victim);
+
+    // Re-encoded, so the digest and every remaining body still verify.
+    let path = dir.path().join("open.plyx");
+    write_artifact(&path, &artifact);
+    let (decoded, _) = artifact::read(&path).expect("the container still verifies");
+    let diags = match artifact::open(&decoded, &path) {
+        Ok(_) => panic!("a closure missing a body is not a program"),
+        Err(diags) => diags,
+    };
+    assert_eq!(diags[0].code, codes::ARTIFACT_INVALID);
+
+    let report = json_of(
+        &ply(dir.path())
+            .args(["run", "open.plyx", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(report["diagnostics"][0]["code"], "E0443", "{report}");
 }
 
 /// The two call for opposite responses — rebuild the artifact, versus transfer it again — so they
@@ -394,29 +474,45 @@ fn the_digest_is_one_line_and_agrees_with_the_build() {
     assert_eq!(report["digest"], digest);
 }
 
-/// The digest covers the sources the artifact carries, so it moves for an edit anywhere in the
-/// project. The closure is what the *bodies* answer for, and that is the narrower claim: a
-/// definition nothing reaches is in none of them.
+/// An edit nothing in the closure reaches leaves every byte of the artifact where it was; a change
+/// to a definition in it moves the digest.
 #[test]
-fn the_digest_moves_with_the_program_and_the_bodies_only_with_the_closure() {
+fn the_digest_moves_with_the_closure_and_with_nothing_else() {
     let dir = project(PROGRAM);
-    let first = artifact_of(dir.path());
+    let before = artifact_of(dir.path()).encode();
 
-    std::fs::write(
-        dir.path().join("m.ply"),
-        PROGRAM.replace("fn unreached() -> Int = 99", "fn unreached() -> Int = 98"),
-    )
-    .unwrap();
-    let outside = artifact_of(dir.path());
-    assert_ne!(
-        outside.digest(),
-        first.digest(),
-        "the sources moved, so the artifact did"
-    );
-    assert_eq!(
-        outside.bodies, first.bodies,
-        "a definition outside the closure is in no body"
-    );
+    for (what, edited) in [
+        (
+            "an unreached definition",
+            PROGRAM.replace("fn unreached() -> Int = 99", "fn unreached() -> Int = 98"),
+        ),
+        (
+            "a new unreached type",
+            format!("{PROGRAM}\ntype Spare = | Unused | Kept(Int)\n"),
+        ),
+        (
+            "a test",
+            PROGRAM.replace(
+                "assert_eq(shade(Blue(7)), 7)",
+                "assert_eq(shade(Blue(8)), 8)",
+            ),
+        ),
+        (
+            "a law",
+            PROGRAM.replace("n >= 0 && n < 4", "n >= 0 && n < 5"),
+        ),
+        (
+            "a local's name",
+            PROGRAM.replace("Blue(n) -> n", "Blue(k) -> k"),
+        ),
+    ] {
+        assert_ne!(edited, PROGRAM, "{what}: the edit did not apply");
+        std::fs::write(dir.path().join("m.ply"), &edited).unwrap();
+        assert!(
+            artifact_of(dir.path()).encode() == before,
+            "{what} moved the artifact"
+        );
+    }
 
     std::fs::write(
         dir.path().join("m.ply"),
@@ -424,8 +520,7 @@ fn the_digest_moves_with_the_program_and_the_bodies_only_with_the_closure() {
     )
     .unwrap();
     let inside = artifact_of(dir.path());
-    assert_ne!(inside.digest(), first.digest());
-    assert_ne!(inside.bodies, first.bodies);
+    assert_ne!(artifact::digest_of(&before), Some(inside.digest()));
 }
 
 // --- the difference between two artifacts -------------------------------------
@@ -530,6 +625,72 @@ fn a_rename_moves_a_name_and_no_hash() {
     );
 }
 
+// --- what the closure has to spell ---------------------------------------------
+
+/// Builds `dir` and runs the artifact beside the source, which answer alike.
+fn runs_as_its_source(dir: &Path) -> Value {
+    ply(dir)
+        .args(["build", ".", "-o", "app.plyx"])
+        .assert()
+        .success();
+    let from_source = json_of(&ply(dir).args(["run", ".", "--json"]).output().unwrap());
+    let from_artifact = json_of(
+        &ply(dir)
+            .args(["run", "app.plyx", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(from_source["ok"], true, "{from_source}");
+    assert_eq!(
+        from_artifact["value"], from_source["value"],
+        "{from_artifact}"
+    );
+    from_artifact["value"].clone()
+}
+
+/// Two modules whose last segments collide cannot both be bound by it in the closure's text.
+#[test]
+fn modules_sharing_a_last_segment_ship_and_run() {
+    let dir = tempfile::tempdir().unwrap();
+    for (path, text) in [
+        ("left/util.ply", "pub fn one() -> Int = 1\n"),
+        ("right/util.ply", "pub fn two() -> Int = 20\n"),
+        (
+            "m.ply",
+            "import left.util as l\nimport right.util as r\n\nfn main() -> Int = l::one() + r::two()\n",
+        ),
+    ] {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    assert_eq!(runs_as_its_source(dir.path()), "21");
+
+    let (shipped, _) = artifact::read(&dir.path().join("app.plyx")).unwrap();
+    let files: Vec<&str> = shipped.closure.iter().map(|(f, _)| f.as_str()).collect();
+    assert_eq!(files, ["left/util.ply", "m.ply", "right/util.ply"]);
+}
+
+/// Two definitions with one body are one hash under two names, and the closure keeps both.
+#[test]
+fn two_names_for_one_body_ship_and_run() {
+    let dir = project(
+        "fn one() -> Int = 1\nfn uno() -> Int = 1\nfn main() -> Int = one() + uno() * 10\n",
+    );
+    assert_eq!(runs_as_its_source(dir.path()), "11");
+
+    let (shipped, _) = artifact::read(&dir.path().join("app.plyx")).unwrap();
+    let hash = |name: &str| {
+        shipped
+            .names
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, h)| *h)
+    };
+    assert!(hash("m.one").is_some(), "{:?}", shipped.names);
+    assert_eq!(hash("m.one"), hash("m.uno"), "one body, two names");
+}
+
 // --- what the command prints ---------------------------------------------------
 
 /// Incremental transfer was refused because the binary is the part that actually
@@ -551,6 +712,8 @@ fn the_build_prints_the_artifacts_size_beside_the_binarys() {
             .output()
             .unwrap(),
     );
+    assert_eq!(report["format"], artifact::ARTIFACT_FORMAT, "{report}");
+    assert!(report.get("sources").is_none(), "{report}");
     let artifact_bytes = report["artifact_bytes"].as_u64().unwrap();
     let binary_bytes = report["binary_bytes"].as_u64().unwrap();
     assert_eq!(
@@ -677,6 +840,8 @@ fn an_artifact_keeps_the_names_a_host_handler_is_registered_against() {
         message.contains("std.net.net.listen[listener]"),
         "the artifact lost the name a handler is registered against: {message}"
     );
+    // The one thing the artifact does lose, stated rather than discovered.
+    assert!(from_artifact["diagnostics"][0]["labels"][0]["start"].is_null());
 }
 
 /// The entry point answers to the name it was built under, so `--entry`, `--db-schema` and
@@ -773,14 +938,13 @@ pub fn spec() -> config::ConfigSpec = {keys: required_keys()}
 fn main() -> Int = 1
 "#;
 
-/// **A `.plyx` applies a config schema whether or not it was named at build time.**
+/// **A `.plyx` has to be able to carry its own `--config-schema`.**
 #[test]
-fn a_plyx_applies_a_config_schema_named_at_build_time_or_not() {
+fn a_config_schema_named_at_build_time_is_in_the_artifact_and_still_refuses() {
     let dir = project(WITH_SCHEMA);
 
-    // An artifact carries its sources and is opened from them, so the closure no longer decides
-    // what a deployed artifact can name: a schema not named at build time is reachable all the
-    // same, and the refusal is the missing key rather than an unreadable source.
+    // Without the flag, the schema is outside the closure and naming it is a refusal — the
+    // behaviour that made the deployed form lose its guarantee.
     ply(dir.path())
         .args(["build", "-o", "bare.plyx"])
         .assert()
@@ -800,7 +964,7 @@ fn a_plyx_applies_a_config_schema_named_at_build_time_or_not() {
     assert_eq!(bare_run["ok"], false, "{bare_run}");
     assert_eq!(
         bare_run["diagnostics"][0]["code"],
-        codes::CONFIG_MISSING,
+        codes::CONFIG_UNAVAILABLE,
         "{bare_run}"
     );
 

@@ -1018,10 +1018,14 @@ $ ply run app.plyx --host
 ```
 
 `ply build` writes the closure of one entry point (default `main`) as a `.plyx`
-file (default `<entry module>.plyx`) carrying the sources and the compiled unit,
-identified by a BLAKE3 digest. A body that fails verification is `E0443`; an
-artifact from another version is `E0444`. `--config-schema` and `--db-schema`
-ship those functions too.
+file (default `<entry module>.plyx`): its definitions, printed back to source
+without tests, laws, comments or anything unreached, and the compiled unit. The
+BLAKE3 digest covers those and the entry point, so an edit nothing reaches
+leaves it unchanged; a failure raised by a run of it carries no line number. A
+body or closure that fails verification is `E0443`, as is a build whose closure
+holds two identical declarations it cannot tell apart (two effects, or two
+members of one recursive group); an artifact from another version is `E0444`.
+`--config-schema` and `--db-schema` ship those functions too.
 
 ## 16. The `ply` command
 
