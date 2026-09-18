@@ -1,4 +1,4 @@
-use ply_core::check_program;
+use crate::fixture::port_check;
 use ply_eval::{Answer, Handlers, SEEDED_OPS, SimTy, TaskId, Value};
 use ply_span::{SourceId, Span, Symbol};
 use ply_syntax::ast::{ExprKind, Item, ModuleName, Program};
@@ -37,8 +37,8 @@ fn program() -> (Program, CheckOutput) {
     let module = parse_module(SourceId(0), ModuleName::from_dotted("sig"), SOURCE)
         .expect("the declaration parses");
     let mut program = Program::single(module);
-    let resolved = resolve(&mut program).expect("one module with no imports resolves");
-    let check = check_program(&program, &resolved).expect("the declaration typechecks");
+    resolve(&mut program).expect("one module with no imports resolves");
+    let check = port_check(&[("sig", SOURCE)]);
     (program, check)
 }
 

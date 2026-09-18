@@ -1920,10 +1920,7 @@ test "double doubles" {
 }
 "#;
     let parsed_module = ply_syntax::parse(ply_span::SourceId(0), source).expect("parses");
-    let check = match ply_core::check_module(&parsed_module) {
-        Ok(check) => check,
-        Err(diags) => panic!("source did not typecheck: {diags:#?}"),
-    };
+    let check = crate::fixture::port_check(&[("", source)]);
     let out = hash_module(&parsed_module, &check).expect("hashes");
     assert_eq!(out.defs.len(), 1);
     assert_eq!(out.tests.len(), check.tests.len());

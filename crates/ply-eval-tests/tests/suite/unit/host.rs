@@ -1,7 +1,6 @@
+use crate::fixture::port_check;
 use ply_eval::host::*;
-use ply_span::SourceId;
 use ply_span::{Diagnostic, Symbol, codes};
-use ply_syntax::ast::ModuleName;
 use ply_ty::CheckOutput;
 use ply_ty::{EffectAtom, Footprint, Resource};
 use std::sync::Arc;
@@ -18,17 +17,12 @@ impl HostHandler for Never {
 }
 
 fn check(source: &str) -> CheckOutput {
-    let module = ply_syntax::parse(SourceId(0), source).expect("the fixture parses");
-    ply_core::check_module(&module).expect("the fixture typechecks")
+    port_check(&[("", source)])
 }
 
 /// Inside a named module, so every declared effect is program-wide `<module>.<name>` as a real load makes it.
 fn qualified(module: &str, source: &str) -> CheckOutput {
-    let mut program =
-        ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted(module), source)])
-            .expect("the fixture parses");
-    let resolved = ply_syntax::resolve::resolve(&mut program).expect("the fixture resolves");
-    ply_core::check_program(&program, &resolved).expect("the fixture typechecks")
+    port_check(&[(module, source)])
 }
 
 fn op(effect: &str, name: &str, resource: HostResource) -> HostOp {
@@ -522,21 +516,16 @@ fn lookup(k: Int) -> Int / {db.read[users]} = db.get[users](k)
 
 #[test]
 fn one_registration_over_two_declarations_of_the_name_is_e0422() {
-    let mut program = ply_syntax::parse_program(vec![
+    let check = port_check(&[
         (
-            SourceId(0),
-            ModuleName::from_dotted("a"),
+            "a",
             "nondet effect db {\n  read get[r](key: Int) -> Int\n}\n\nfn f(k: Int) -> Int / {db.read[users]} = db.get[users](k)\n",
         ),
         (
-            SourceId(1),
-            ModuleName::from_dotted("b"),
+            "b",
             "nondet effect db {\n  read get[r](key: Int) -> Int\n}\n\nfn g(k: Int) -> Int / {db.read[users]} = db.get[users](k)\n",
         ),
-    ])
-    .expect("the fixture parses");
-    let resolved = ply_syntax::resolve::resolve(&mut program).expect("the fixture resolves");
-    let check = ply_core::check_program(&program, &resolved).expect("the fixture typechecks");
+    ]);
 
     let diagnostics = registry(vec![op("db", "get", named("users"))])
         .bind(&check)

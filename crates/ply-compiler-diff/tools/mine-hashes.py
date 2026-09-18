@@ -1,35 +1,88 @@
 """Mines `crates/ply-hash-tests/tests/suite/unit/hash.rs` for hasher inputs and writes them as a
-fixture bundle, the way `mine-checks.py` mines the checker's tests.
+fixture bundle.
 
     python3 crates/ply-compiler-diff/tools/mine-hashes.py
 
 The reference hasher's tests build most of their programs as trees rather than
-as source, so what this yields is the minority written as string literals; the
-bundle format, the rule that every literal is taken and none hand-picked, and
-the newline convention are `mine-checks.py`'s, and its docstring is the
-rationale.
+as source, so what this yields is the minority written as string literals.
+Every literal is taken, none hand-picked: a filter is a place to quietly drop
+the fixture that would have gone red, and a string that is not Ply source is
+still a valid input both sides must agree on.
+
+The bundle's own header states its format. The newline before a separator
+belongs to the separator, because `"fn f() = \"oops"` is an unterminated string
+at end of input and a bundle that appended a newline would turn it into a
+different lexer path.
 """
 
-import importlib.util, os, sys
-
-# Loading the sibling miner would otherwise leave a `__pycache__` here.
-sys.dont_write_bytecode = True
+import os, re, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 SRC = os.path.join(ROOT, "crates", "ply-hash-tests", "tests", "suite", "unit", "hash.rs")
 OUT = os.path.join(ROOT, "crates", "ply-codegen-tests", "fixtures", "reference-hashes.corpus")
 
+ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", "\\": "\\", '"': '"', "'": "'"}
 
-def checks_miner():
-    spec = importlib.util.spec_from_file_location("mine_checks", os.path.join(HERE, "mine-checks.py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+
+def literals(src: str) -> list[str]:
+    """Every string literal, raw and cooked, outside line comments."""
+    out, i, n = [], 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            j = src.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if c == "r" and i + 1 < n and src[i + 1] in '#"':
+            k = i + 1
+            hashes = 0
+            while k < n and src[k] == "#":
+                hashes += 1
+                k += 1
+            if k < n and src[k] == '"':
+                close = '"' + "#" * hashes
+                j = src.find(close, k + 1)
+                if j > 0:
+                    out.append(src[k + 1 : j])
+                    i = j + len(close)
+                    continue
+        if c == '"':
+            j, buf = i + 1, []
+            while j < n:
+                if src[j] == "\\":
+                    e = src[j + 1]
+                    if e in ESCAPES:
+                        buf.append(ESCAPES[e])
+                        j += 2
+                    elif e == "x":
+                        buf.append(chr(int(src[j + 2 : j + 4], 16)))
+                        j += 4
+                    elif e == "u":
+                        m = re.match(r"\{([0-9a-fA-F]+)\}", src[j + 2 :])
+                        buf.append(chr(int(m.group(1), 16)))
+                        j += 2 + m.end()
+                    elif e == "\n":
+                        # A `\` at end of line eats the newline and the indent.
+                        j += 2
+                        while j < n and src[j] in " \t":
+                            j += 1
+                    else:
+                        buf.append(e)
+                        j += 2
+                    continue
+                if src[j] == '"':
+                    break
+                buf.append(src[j])
+                j += 1
+            out.append("".join(buf))
+            i = j + 1
+            continue
+        i += 1
+    return out
 
 
 def main() -> int:
-    literals = checks_miner().literals
     src = open(SRC).read()
     seen, order = set(), []
     for lit in literals(src):
