@@ -577,10 +577,17 @@ purpose and never cached.
 
 | variable | effect |
 | --- | --- |
+| `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
+| `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
+| `PLY_C_CACHE=DIR` | compiled unit cache (default under the temp directory) |
+| `PLY_C_CACHE_MAX=BYTES` | cap on that cache, oldest entries swept first; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused |
-| `PLY_C_CACHE=DIR` | compiled unit cache (default under the temp directory) |
+| `PLY_C_DUMP=NAME` | print one body's emitted C, or `*` for the unit's largest bodies |
+| `PLY_C_ONLY=a,b`, `PLY_C_SKIP=prefix,...` | compile only the named definitions, or drop those with a prefix |
 | `PLY_C_PHASES=1` | print compile phases and allocation counts |
+| `PLY_HEAP_POISON=1` | poison released blocks and fail on a read of one |
+| `PLY_HEAP_DELAY=N` | reuse a released block only after `N` more releases |
 | `PLY_C_EMITTER=ply:DIR` | use emitter sources from `DIR` instead of the built-in ones |
 | `PLY_TIER_ONLY=1` | compiled code is the only engine; a missing body is `E0505` |
 | `PLY_CODEGEN_REGISTER=narrow` | enter compiled code only for scalar signatures |

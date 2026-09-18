@@ -10,12 +10,11 @@ pub struct Tables {
     pub builtins: Vec<Builtin>,
     pub fields: Vec<Symbol>,
     pub shapes: Vec<Vec<Symbol>>,
-    /// Every definition this body calls, so that a body restored from a cache can be checked
-    /// against the set the fixpoint took rather than trusted.
+    /// Every definition this body calls, so a cached body is checked against the fixpoint's set.
     pub calls: Vec<String>,
     /// The C symbols of the lambda entries this body defines, in the order it met them.
     pub lambdas: Vec<String>,
-    /// The effects this body performs and the effects it handles, under their program-wide names.
+    /// Effects performed and handled, under their program-wide names.
     pub performs: Vec<String>,
     pub handles: Vec<String>,
 }
@@ -25,10 +24,8 @@ pub struct Unit {
     pub consts: Vec<Value>,
     pub fields: Vec<Symbol>,
     pub builtins: Vec<Builtin>,
-    /// The shapes and constructor indices the runtime reads a record and a variant against.
     pub layouts: crate::heap::Layouts,
-    /// The C symbol of every lambda entry in the unit. `rt_closure` is handed a position in this,
-    /// and `rt::Tables::functions` holds the address `dlsym` found for each.
+    /// Lambda entry symbols; `rt_closure` takes a position here.
     pub lambdas: Vec<String>,
 }
 
@@ -43,7 +40,6 @@ impl Unit {
         }
     }
 
-    /// The shape a field set interns to, in the same table the runtime will read it against.
     pub fn shape(&mut self, names: &[Symbol]) -> u32 {
         self.layouts.shape(names.to_vec())
     }

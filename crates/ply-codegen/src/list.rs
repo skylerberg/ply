@@ -1,12 +1,5 @@
-//! The compiled list (ADR 0035 sequence step 6, after ADR 0034's representation gate refused the
-//! array): `ply_eval::list`'s shape over words. A list object holds its newest elements inline
-//! as a *tail* after the trie's root, with the prefix a `rest` dropped, the tail's length and
-//! the tail's capacity in the header, so a list no longer than a leaf is one object; above
-//! that, its full leaves are the leaves of a radix trie of `WIDTH`-wide counted nodes. A push
-//! down a uniquely held path writes in place and copies at most one leaf and one branch per
-//! level otherwise; a `[x, ..rest]` moves the offset and shares the trie, paying at most one
-//! copy of a tail. No operation's cost grows with the list's length on a property the source
-//! does not show.
+//! The compiled list, `ply_eval::list`'s shape over words: a radix trie of `WIDTH`-wide nodes plus
+//! an inline tail, with a dropped-prefix offset so `[x, ..rest]` shares the trie.
 
 use crate::heap::{
     self, Heap, KIND_BRANCH, KIND_LEAF, KIND_LIST, Obj, Word, dec, inc, is_unique, obj, set_word,
@@ -101,8 +94,7 @@ impl Heap {
 
     /// A list of `items`, which it takes.
     pub fn list_from(&mut self, items: &[Word]) -> Word {
-        // A short list is sized to what it holds: a push grows it by doubling, so the copies a
-        // list built by pushing pays are bounded by a tail, and a literal pays for nothing.
+        // Sized exactly: pushes grow the tail by doubling.
         if items.len() <= WIDTH {
             let o = self.alloc_list(items.len() as u32);
             unsafe {
@@ -158,8 +150,7 @@ impl Heap {
         self.insert(root, shift, count, leaf)
     }
 
-    /// `node` with `leaf` inserted at `index`, in place when the node is held once and as a
-    /// copy otherwise; the node answered is the one to hold from now on.
+    /// `node` with `leaf` inserted at `index`, in place when held once; hold the node answered.
     fn insert(&mut self, node: Word, shift: u32, index: usize, leaf: Word) -> Word {
         let node = self.writable(node);
         let o = obj(node);
@@ -180,8 +171,7 @@ impl Heap {
         node
     }
 
-    /// A node that may be written: itself when held once, and otherwise a copy holding its
-    /// children once more, with the original released.
+    /// Itself when held once, else a copy holding its children once more (the original released).
     fn writable(&mut self, node: Word) -> Word {
         if is_unique(node) {
             return node;
@@ -196,8 +186,7 @@ impl Heap {
         copy
     }
 
-    /// A list object of `xs`'s contents with room for `cap` tail elements, holding what `xs`
-    /// holds once more.
+    /// A copy of `xs` with room for `cap` tail elements, holding its contents once more.
     fn clone_list(&mut self, xs: *mut Obj, cap: usize) -> *mut Obj {
         let out = self.alloc_list(cap as u32);
         let r = root(xs);
@@ -218,8 +207,7 @@ impl Heap {
         out
     }
 
-    /// `xs` with `x` appended. Takes both: a list held by nobody else grows in place, and any
-    /// other is copied at most a tail's worth before it does.
+    /// `xs` with `x` appended. Takes both; an unshared list grows in place.
     pub fn list_push(&mut self, xs: Word, x: Word) -> Word {
         let mut o = obj(xs);
         let n = tail_len(o);
@@ -256,9 +244,7 @@ impl Heap {
         o as Word
     }
 
-    /// `xs` with its element at `i`, which must be in range, replaced by `v`, sharing every node
-    /// off the path to it. Takes both: a list held by nobody else writes in place, and any other
-    /// copies at most a tail or one node per level. The old element is released.
+    /// `xs` with in-range element `i` replaced by `v`, in place when unshared. Takes both.
     pub fn list_set(&mut self, xs: Word, i: usize, v: Word) -> Word {
         let mut o = obj(xs);
         debug_assert!(i < len(o));
@@ -303,9 +289,8 @@ impl Heap {
         self.writable(node)
     }
 
-    /// The list without its first `k` elements, sharing the trie with `xs` and copying at most
-    /// the tail; once the dropped prefix covers the trie the tail is the list, so a chain of
-    /// `rest`s over a long list holds only the leaf it is reading. Reads `xs`.
+    /// The list without its first `k` elements, sharing the trie and copying at most the tail.
+    /// Reads `xs`.
     pub fn list_skip(&mut self, xs: Word, k: usize) -> Word {
         let o = obj(xs);
         let k = k.min(len(o));
@@ -350,16 +335,14 @@ pub fn get(o: *mut Obj, i: usize) -> Word {
     unsafe { word_at(node, p & MASK) }
 }
 
-/// Every element in order, borrowed: the trie's leaves from the dropped prefix on, then the
-/// tail.
+/// Every element in order, borrowed.
 pub fn to_vec(o: *mut Obj) -> Vec<Word> {
     let mut out = Vec::with_capacity(len(o));
     for_each(o, &mut |w| out.push(w));
     out
 }
 
-/// `f` on every element in order, without copying them out first; `f` may run user code, so
-/// the list must be held for the walk's whole duration.
+/// `f` on every element in order; `f` may run user code, so the list must stay held throughout.
 pub fn for_each<F: FnMut(Word)>(o: *mut Obj, mut f: F) {
     let r = root(o);
     if r != 0 {
@@ -386,8 +369,7 @@ fn walk<F: FnMut(Word)>(node: *mut Obj, skip: &mut usize, f: &mut F) {
     }
 }
 
-/// The words a list holds, for a walk over its children: the root when there is one, then the
-/// tail. A leaf's or a branch's children are its payload words.
+/// The words a list holds, for a walk over its children: the root if any, then the tail.
 pub fn children(o: *mut Obj) -> impl Iterator<Item = Word> {
     let r = root(o);
     (r != 0)

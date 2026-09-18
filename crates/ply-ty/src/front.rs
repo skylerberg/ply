@@ -1,82 +1,5 @@
-//! The front end's whole answer over a program as length-framed text — the diagnostics, the load
-//! order, the checker's output, the hashes, the item ordinals and the stored bodies — read back
-//! into the structs the driver, the store and the backend consume, and written from them. The
-//! writer is the protocol: the self-hosted front end's `front.front_dump` is held to its text, and
-//! `crates/ply-compiler/ply/front.ply` writes the same grammar.
-//!
-//! A frame is `<kind> <name> <length>\n<payload>`; a payload is a run of fields, each
-//! `<key> <length>\n<bytes>`, unless the kind says otherwise. Every length is in bytes. Frames come
-//! in this order, each kind in the order its source table iterates:
-//!
-//! ```text
-//! diag <i> <n>              exactly ply_span::frames; if any is an error the dump ends here
-//! order _ <n>               module <n>\n<module name>                    dependency-first
-//! module <name> <n>         index <n>\n<position in the source list>      in source-list order
-//!                           item <n>\n<program-wide name>                  ModuleInfo::items
-//!                           import <n>\n<module name>
-//!                           effect_set <n>\n<name> <includes> <atoms>      source order
-//! def <name> <n>            module, simple_name, public 0|1, reuse 0|1, scheme (print_scheme),
-//!                           footprint, performed
-//!                           constraint <n>\n<deriver> <ty_vars index>
-//!                           internally_effectful <n>\n0|1
-//!                           row_alias <n>\n<effect set's simple name>     source order
-//!                           param <n>\n<name> <span>                      source order
-//!                           spec <n>\n<requires|ensures> <index> <footprint>\n<span>
-//!                           span <n>\n<span>
-//! type <name> <n>           module, simple_name, public 0|1, arity, span   program order
-//! test <i> <n>              key, name, module, index, nondet 0|1, footprint, span, name_span
-//! law <i> <n>               key, name, module, index
-//!                           binder <n>\n<name> <span>\n<print_type>
-//!                           has_guard 0|1, host 0|1, footprint, span
-//!                           literal <n>\n<int|str|bytes> <value>          the guard's, in order
-//! effect <name> <n>         module, simple_name, public 0|1, nondet 0|1
-//!                           op <n>\n<name> <read|write> <resource_param 0|1> <param count>
-//!                                        <has_scheme 0|1> <span>\n
-//!                                 <print_type>\n        one line per parameter
-//!                                 <print_type>\n        the result
-//!                                 <print_scheme>\n      only when has_scheme is 1
-//!                           span
-//! ctor <name> <n>           module, simple_name, type_name, index, arity
-//!                           field <n>\n<print_type>
-//!                           scheme, span
-//! hash <name> <n>           def <n>\n<hex>, own <n>\n<hex>, decl <n>\n<hex>   each when present
-//!                           spec <n>\n<hex>, spec_text <n>\n<hex>           clause order
-//!                           dep <n>\n<name>                                 reference order
-//!                           closure <n>\n<name>                             sorted
-//! testhash <i> <n>          key, hash, dep*, closure*
-//! lawhash <i> <n>           key, hash, text, dep*, closure*
-//! ordinal <module> <n>      item <n>\n<fn <name>[ <kind>,<kind>..] | test <key> | law <key>>
-//! body <name> <n>           a fn's, type's or effect's stored body as lowercase hex; no fields
-//! testbody <i> <n>          a test's, likewise
-//! ```
-//!
-//! A footprint is `atom,atom` with no spaces, empty for the pure one; an atom is
-//! `effect.mode[resource]`, the resource omitted for a singleton. A span is `<module> <start>
-//! <end>`, the module its position in the source list and `4294967295` outside every module. A
-//! module name is its dotted form, empty for the anonymous module. Tests and laws are numbered by
-//! their position in `CheckOutput::tests` and `::laws`, which is the position their hashes hold,
-//! and the `test` and `law` frames come in that order. The `hash`, `testhash` and `lawhash`
-//! frames follow the hasher's item order — every module in program order, its items in source
-//! order, a name declared in two namespaces once — which [`Front::hash_order`] records, so a
-//! `testhash` may sit between two `hash` frames; the reader takes them in any order by their
-//! index and requires each index once. The bodies follow the same walk, one per declaration, so
-//! a name in two namespaces has two. A fn's ordinal names its clauses' kinds in source order, so
-//! a clause root can be numbered without the source.
-//!
-//! The rest is what the syntax tree carries and the checker's tables do not. `public` is 1 when the
-//! source wrote `pub`; a prelude effect, which no source declares, is public and has no `type`
-//! frame of its own. `reuse` is 1 when a `fn` carries ADR 0034's marker. A `param` field is `<name>
-//! <span>`, one per parameter as written, in source order — what a clause's binders are named and
-//! placed by. A `type` frame is the one declaration no table of `CheckOutput` holds: a type reaches
-//! them through its constructors and an alias reaches them not at all, so its arity, its visibility
-//! and its own span travel nowhere else. A test's `name_span` is its label's, beside the whole
-//! item's `span`. A law's `literal` fields are the literals its guard mentions, each `int
-//! <decimal>`, `str <text>` or `bytes <lowercase hex>`, in the order the witness search walks the
-//! guard and first-occurrence within a kind — that order seeds a search, so a difference in it is a
-//! different search rather than a different answer. A module's `effect_set` field is `<name>
-//! <includes> <atoms>`: the set's simple name, the sets it includes by simple name comma-joined,
-//! and its expansion resolved to program-wide atoms and written the way a footprint is. Either list
-//! may be empty, so the field is three space-separated words whichever way.
+//! The front end's answer as length-framed text, read into and written from [`Front`]; the
+//! grammar is shared with `crates/ply-compiler/ply/front.ply`, which writes it too.
 
 use crate::hash::{DefHash, HashOutput};
 use crate::parse::{parse_footprint, parse_scheme, parse_type};
@@ -97,8 +20,7 @@ const NO_MODULE: u32 = u32::MAX;
 /// One keyable item of a module, in source order: what the backend's cache keys are minted from.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Ordinal {
-    /// A `fn`, by program-wide name, with the kind of each `requires` / `ensures` clause in
-    /// source order.
+    /// A `fn`, with the kind of each `requires` / `ensures` clause in source order.
     Fn(Symbol, Vec<SpecKind>),
     /// A `test`, by `<module>.<label>`.
     Test(Symbol),
@@ -117,8 +39,7 @@ pub enum Hashed {
     Law(usize),
 }
 
-/// A parameter as the source wrote it: what a `requires` / `ensures` clause's binders are named
-/// and placed by, zipped against the checked scheme's parameter types.
+/// A parameter as the source wrote it, which a spec clause's binders are named and placed by.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WrittenParam {
     pub name: Symbol,
@@ -129,22 +50,20 @@ pub struct WrittenParam {
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct DefWritten {
     pub vis: Visibility,
-    /// A `reuse fn`: ADR 0034's callee-side promise, which a gate has to know without a parse.
+    /// A `reuse fn`, which a gate has to know without a parse.
     pub reuse: bool,
     /// In source order.
     pub params: Vec<WrittenParam>,
 }
 
-/// A `type`, which no table of [`CheckOutput`] holds — a sum type reaches them through its
-/// constructors and an alias reaches them not at all — so its arity, its visibility and its own
-/// span travel nowhere else.
+/// A `type`; no table of [`CheckOutput`] holds its arity, visibility or span.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TypeDecl {
     pub name: Symbol,
     pub module: ModuleName,
     pub simple_name: Symbol,
     pub vis: Visibility,
-    /// Type parameters, by count: their names are binders and never escape.
+    /// Type parameter count; their names never escape.
     pub arity: usize,
     pub span: Span,
 }
@@ -156,8 +75,7 @@ pub struct EffectSet {
     pub name: Symbol,
     /// The sets this one includes, by simple name, in source order.
     pub includes: Vec<Symbol>,
-    /// The expansion as program-wide atoms. An atom naming an effect that resolves to nothing is
-    /// dropped, as the row that named it dropped it.
+    /// The expansion as program-wide atoms; an atom naming an unresolved effect is dropped.
     pub atoms: Footprint,
 }
 
@@ -180,8 +98,7 @@ pub struct Front {
     pub hash_order: Vec<Hashed>,
     /// Per module in program order, its keyable items in source order.
     pub ordinals: Vec<(Symbol, Vec<Ordinal>)>,
-    /// Every `fn`'s, `type`'s and `effect`'s stored body, by program-wide name, in the hasher's
-    /// item order.
+    /// Every `fn`'s, `type`'s and `effect`'s stored body, in the hasher's item order.
     pub bodies: Vec<(Symbol, Vec<u8>)>,
     /// Parallel to `CheckOutput::tests`.
     pub test_bodies: Vec<Vec<u8>>,
@@ -189,15 +106,13 @@ pub struct Front {
     pub defs_written: IndexMap<Symbol, DefWritten>,
     /// Every `type` the source declares, by program-wide name, in program order.
     pub types: IndexMap<Symbol, TypeDecl>,
-    /// Whether each `effect` was written `pub`, by program-wide name. A prelude effect is declared
-    /// by no source, so it has no entry and is public.
+    /// Whether each `effect` was written `pub`; a prelude effect has no entry and is public.
     pub effects_written: IndexMap<Symbol, Visibility>,
     /// Parallel to `CheckOutput::tests`: the span of each test's label.
     pub test_name_spans: Vec<Span>,
     /// Parallel to `CheckOutput::laws`: the literals each law's guard mentions, in walk order.
     pub law_literals: Vec<Vec<Literal>>,
-    /// Every module's `effect set`s, by module name, in source order. A module that declares none
-    /// has no entry.
+    /// Every module's `effect set`s in source order; a module that declares none has no entry.
     pub effect_sets: IndexMap<Symbol, Vec<EffectSet>>,
 }
 
@@ -208,8 +123,6 @@ impl Front {
             .any(|d| d.severity == Severity::Error)
     }
 }
-
-// --- writing -----------------------------------------------------------------
 
 pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String> {
     let mut out = write_diagnostics(&front.diagnostics, sources)?;
@@ -438,9 +351,7 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
     Ok(out)
 }
 
-/// One frame per entry of [`Front::hash_order`], each carrying what every map of `HashOutput`
-/// holds under its key; a test whose key is also a definition's name shares the reach that key
-/// holds, as the hasher merged it.
+/// One frame per [`Front::hash_order`] entry; a test keyed like a definition shares its reach.
 fn write_hashes(front: &Front, out: &mut String) -> Result<(), String> {
     let h = &front.hashes;
     for (table, keys) in [
@@ -611,8 +522,7 @@ fn flag(b: bool) -> &'static str {
     if b { "1" } else { "0" }
 }
 
-/// A prelude effect is declared by no source, so it has no entry and is public; a `pub` one a
-/// module declares and the syntax tables missed is an error rather than a guess.
+/// A prelude effect has no entry and is public; a module's effect with no entry is an error.
 fn effect_public(front: &Front, name: &Symbol, e: &EffectInfo) -> Result<bool, String> {
     match front.effects_written.get(name) {
         Some(vis) => Ok(vis.is_public()),
@@ -658,11 +568,6 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-// --- reading -----------------------------------------------------------------
-
-/// A frame kind, a field key or a value the protocol does not know is an error naming it, and so is
-/// a frame or a field that ends before its length says, a required field that is missing, and a
-/// frame that names a test or a law no earlier frame declared.
 pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
     let mut frames = Cursor::new(dump.as_bytes(), "frame");
     let mut front = Front::default();
@@ -1404,11 +1309,7 @@ impl Reader<'_> {
             }
         }
         let scheme = self.scheme(f.required(scheme, "scheme")?, what)?;
-        // A field's type and the constructor's answer share one numbering or they mean different
-        // things: `Err`'s field of `Result<a, b>` is the second variable, and read on its own it
-        // is the first variable there is, so a caller substituting the type's arguments by
-        // position fills it with the wrong one. The scheme carries them together, so the fields
-        // are its parameters and the `field` lines are read only to check the count.
+        // Fields come from the scheme so they share its type-variable numbering.
         let fields: Vec<crate::Type> = match &scheme.ty {
             crate::Type::Fn { params, .. } => params.clone(),
             _ => Vec::new(),
@@ -1481,9 +1382,7 @@ impl Reader<'_> {
         Ok(())
     }
 
-    /// A test's or a law's hash frame: the hash, a law's text hash, and the references filed
-    /// under its key — merged into what that key already holds, as the hasher merges a key two
-    /// items share.
+    /// A test's or law's hash frame; its references merge into what its key already holds.
     fn item_hash(
         &self,
         payload: &[u8],

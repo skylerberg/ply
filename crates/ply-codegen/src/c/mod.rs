@@ -1,38 +1,5 @@
 //! The compiled tier: the machine's lowered `Code`, emitted as C and handed to `cc`.
-//!
-//! ADR 0037 listed the candidates and `benches/value-model/c-tier/` priced this one on the value
-//! model Ply actually compiles before it was built; `benches/value-model/` carries what was built
-//! reads against the Rust bar, and ADR 0042 records why it is the only code generator.
-//!
-//! ## The instruments
-//!
-//! These environment variables steer this tier, and until they were listed here the only way to
-//! find one was to grep. None changes what a program means; each narrows, widens or reports on
-//! how it gets compiled.
-//!
-//! | variable | what it does | where |
-//! | --- | --- | --- |
-//! | `PLY_C_ONLY` | compile only the definitions named, comma-separated. An allow-list does not fit in an environment variable at corpus scale -- fourteen hundred names is about thirty kilobytes -- and a truncated one silently compiles a different program | `build.rs` |
-//! | `PLY_C_SKIP` | the same the other way round: drop every definition whose name starts with one of these prefixes. This is the one to reach for | `build.rs` |
-//! | `PLY_C_REFUSALS` | print what the tier refused and why, and how much of the offered set it took | `build.rs` |
-//! | `PLY_C_DUMP` | print one body's emitted C by name, or `*` for the unit's size and its largest bodies | `build.rs` |
-//! | `PLY_C_PHASES` | print where a whole build's time went -- emit-and-resolve, assemble, compile-and-load, tables, and the source's size -- or that the unit came back whole from the cache; and at every entry's end what it allocated, recycled and still held, by kind | `build.rs`, `rt.rs` |
-//! | `PLY_HEAP_POISON` | the diagnostic mode of the heap: a dead block's payload is poisoned at release and a read of it before the block is taken again fails at the body's site. Set it to anything; nothing ships with it | `heap.rs` |
-//! | `PLY_HEAP_DELAY` | the other one: a dead block waits this many releases before an allocation may take it, so the chunk bytes at an entry's end read what building a value by copying the whole of it each step costs | `heap.rs` |
-//! | `PLY_C_CACHE` | where compiled objects and emitted bodies are kept. A directory of its own is what makes one measurement independent of the last | `load.rs` |
-//! | `PLY_C_CACHE_MAX` | how many bytes that directory may hold. The sweep runs at the start of a build, oldest entry first; `0` is no bound | `sweep.rs` |
-//! | `PLY_C_KEEP` | keep the emitted `.c` beside the object, which the cache otherwise throws away | `load.rs` |
-//! | `PLY_C_PROFILE` | `development` (the default) picks the fast toolchain -- `tcc` if installed, else `cc -O0`; `release` is `cc -O2`. Overrides the CLI's `--profile`, so that a bench script pins one without a command line | `toolchain.rs` |
-//! | `PLY_CC` | the C compiler to shell out to, overriding the profile's | `load.rs` |
-//! | `PLY_CC_OPT` | the optimisation flag it is given, overriding the profile's | `load.rs` |
-//! | `PLY_C_EMITTER` | `ply:<dir>` produces with the Ply emitter in `<dir>` rather than the one beside the binary: a working copy, for an emitter change not yet bootstrapped | `producer.rs` |
-//! | `PLY_C_BOOTSTRAP_REFRESH` | `1` on the fixpoint test in `crates/ply-codegen-tests` rewrites `crates/ply-compiler/bootstrap` from the emission that test proves is a fixpoint. It starts from the bundle there, so one this runtime does not serve is first replaced by an older one from git history | `bundle.rs` |
-//! | `PLY_TIER_ONLY` | `1` makes this backend the only engine: a test or an entry it does not hold fails with `E0505`, and the machine evaluates nothing (ADR 0045) | `backend.rs` |
-//!
-//! Two things the next one added here would have to know. `PLY_C_ONLY` and `PLY_C_SKIP` narrow the offered set
-//! **before** its digest is taken, because a refusal is cached against that digest -- filtering
-//! after it served a narrowed run's refusals back to an unfiltered one and built a unit neither
-//! run would produce. And anything that changes an emitted body has to reach the cache key.
+//! `PLY_C_*`, `PLY_CC*`, `PLY_HEAP_*` and `PLY_TIER_ONLY` knobs never change a program's meaning.
 
 mod build;
 pub mod bundle;
@@ -70,8 +37,7 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-/// The addresses the loaded unit binds, in [`HELPERS`]' order, so a helper cannot be declared and
-/// left unbound: the table below and the table there are read together by a test.
+/// The addresses the loaded unit binds, in [`HELPERS`]' order; a test reads both tables together.
 pub fn helper_addresses() -> Vec<*mut std::ffi::c_void> {
     use crate::rt;
     let mut out: Vec<*mut std::ffi::c_void> = Vec::with_capacity(HELPERS.len());

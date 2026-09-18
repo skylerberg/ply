@@ -37,8 +37,7 @@ pub struct Adt {
     pub variants: &'static [(&'static str, &'static [&'static str])],
 }
 
-/// Read top to bottom, like `ply-host`'s registry: the whole of what the language declares without
-/// a file.
+/// Every ADT the language declares without a file.
 pub const ADTS: &[Adt] = &[
     Adt {
         name: "Option",
@@ -55,7 +54,6 @@ pub const ADTS: &[Adt] = &[
         params: &[],
         variants: &[("Less", &[]), ("Equal", &[]), ("Greater", &[])],
     },
-    // The six `decimal_div` and `decimal_round` take.
     Adt {
         name: "Rounding",
         params: &[],
@@ -68,9 +66,7 @@ pub const ADTS: &[Adt] = &[
             ("Floor", &[]),
         ],
     },
-    // `iterate`'s step answers one of these, and the two type parameters are the point: `Stop`
-    // carries a value the seed never held, so a loop can finish with something it computed on its
-    // last step rather than with the seed it was handed.
+    // Two parameters so `Stop` can carry a result of a different type than the seed.
     Adt {
         name: "Iter",
         params: &["s", "r"],
@@ -113,8 +109,7 @@ pub fn ctors() -> IndexMap<Symbol, CtorInfo> {
                 name.clone(),
                 CtorInfo {
                     name: name.clone(),
-                    // No module declares these, and the anonymous name qualifies to itself, so the
-                    // program-wide name is the written one.
+                    // The anonymous module qualifies to itself.
                     module: ModuleName::anonymous(),
                     simple_name: name,
                     type_name: Symbol::new(adt.name),
@@ -147,8 +142,7 @@ pub fn seed_atom() -> EffectAtom {
     EffectAtom::new(SIM, Resource::Singleton, Mode::Read)
 }
 
-/// The atoms a `simulate` region removes from its body's row, derived from the declarations above
-/// so the two cannot disagree.
+/// The atoms a `simulate` region removes from its body's row.
 pub fn simulated_atoms() -> BTreeSet<EffectAtom> {
     let mut out = BTreeSet::new();
     for effect in effects().values() {
@@ -174,7 +168,6 @@ pub fn task_type(elem: Type) -> Type {
     Type::Con(Symbol::new(TASK_TYPE), vec![elem])
 }
 
-/// Whether a type mentions a `Task` anywhere, which is what the region's result-type check asks.
 pub fn mentions_task(t: &Type) -> bool {
     match t {
         Type::Con(name, args) => name.as_str() == TASK_TYPE || args.iter().any(mentions_task),
@@ -189,7 +182,6 @@ pub fn effects() -> IndexMap<Symbol, EffectInfo> {
     let a = TyVar(0);
     let e = RowVar(0);
     let ta = Type::Var(a);
-    // `spawn`'s row carries `e`.
     let body = Type::Fn {
         params: vec![],
         ret: Box::new(ta.clone()),
@@ -235,7 +227,6 @@ pub fn effects() -> IndexMap<Symbol, EffectInfo> {
             CLOCK,
             true,
             vec![
-                // `now` observes virtual time; it does not move it.
                 op(
                     "now",
                     Mode::Read,
@@ -260,8 +251,7 @@ pub fn effects() -> IndexMap<Symbol, EffectInfo> {
             RANDOM,
             true,
             vec![
-                // Both are writes: drawing advances the stream, so two tasks drawing in the other
-                // order get the other values.
+                // Writes: drawing advances the stream, so draw order matters.
                 op(
                     "next",
                     Mode::Write,
@@ -305,8 +295,7 @@ fn declare(name: &str, nondet: bool, ops: Vec<OpInfo>) -> EffectInfo {
     let name = Symbol::new(name);
     EffectInfo {
         name: name.clone(),
-        // No module declares these, and the anonymous name qualifies to itself, so the program-wide
-        // name and the written one coincide.
+        // The anonymous module qualifies to itself.
         module: ModuleName::anonymous(),
         simple_name: name,
         nondet,

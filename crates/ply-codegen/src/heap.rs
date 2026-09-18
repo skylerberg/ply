@@ -1,22 +1,5 @@
-//! The value model compiled code runs on (ADR 0035): one machine word per value, with an
-//! immediate for an `Int` that fits and a pointer to a counted object for everything else.
-//!
-//! A word with its low bit set is an `Int` in its upper sixty-three bits; a word with it clear is
-//! the address of an [`Obj`]. `Unit`, `true` and `false` are three immortal objects, so a `Bool`
-//! is a pointer compare and never an allocation. A record, a constructor, a list, a map and a
-//! native closure are laid out as words after a sixteen-byte header, and a string or a bytes
-//! value as its bytes after the same header, with room to grow so that appending to one nobody
-//! else holds is a copy of the appended piece alone; anything the model does not lay out
-//! natively yet — floats, decimals, secrets, the interpreter's own closures — is carried whole as
-//! a [`Value`] behind a `Bridge` object.
-//!
-//! Every object an entry allocates is logged, and [`Heap::end`] releases the log: a count that
-//! reaches zero dismantles its object then and there — its children let go, a bridged value
-//! dropped — and its memory goes back to the entry's free list for its size class, so an
-//! entry's memory is bounded by what it holds, in every build alike: a debug build's heap once
-//! kept dead blocks back so a stale reference read a `DEAD` header, and every form of that cost
-//! memory the entry never held (ADR 0049 item 2, ADR 0050 §1b). A stale reference is caught by
-//! the counts the audits assert and by the `DEAD` header a block keeps until it is taken.
+//! The value model compiled code runs on: one word per value, an `Int` immediate (low bit set)
+//! or a pointer to a counted [`Obj`]; anything not laid out natively is bridged as a [`Value`].
 
 use crate::list;
 use crate::map;
@@ -39,17 +22,16 @@ pub const KIND_CTOR: u8 = 4;
 pub const KIND_LIST: u8 = 5;
 pub const KIND_CLOSURE: u8 = 6;
 pub const KIND_BRIDGE: u8 = 7;
-/// A sorted array of key and value words, `len` entries of two words with room for `layout`.
+/// A map's handle: one word, its tree's root or zero.
 pub const KIND_MAP: u8 = 8;
 /// `len` bytes of UTF-8 with room for `layout`.
 pub const KIND_STR: u8 = 9;
 /// `len` bytes with room for `layout`.
 pub const KIND_BYTES: u8 = 10;
-/// A list's trie nodes (`list.rs`): `len` elements or children of `layout` slots.
+/// A list's trie nodes: `len` elements or children of `layout` slots.
 pub const KIND_LEAF: u8 = 11;
 pub const KIND_BRANCH: u8 = 12;
-/// A map's tree nodes (`map.rs`): a leaf of `len` sorted pairs, a branch of `len` children
-/// with their greatest keys beside them.
+/// A map's tree nodes: a leaf of `len` sorted pairs, a branch of `len` children and max keys.
 pub const KIND_MLEAF: u8 = 13;
 pub const KIND_MBRANCH: u8 = 14;
 pub const KIND_DEAD: u8 = 255;
@@ -59,16 +41,11 @@ pub const IMMORTAL: u32 = u32::MAX;
 
 pub const HEADER: usize = 16;
 
-/// A record or constructor none of whose fields holds a count — each an immediate or an
-/// immortal — so releasing it walks nothing. Set where one is built from such fields, kept where
-/// an update in place writes only such fields, and never set otherwise.
+/// A record or constructor none of whose fields holds a count: releasing it walks nothing.
 pub const FLAT: u8 = 1;
 
-/// The header every object starts with. `len` is the payload's word count for a record, a
-/// constructor, a trie node or a closure, its byte count for a string or a bytes value, and a
-/// list's length; `layout` is a record's shape, a constructor's index, a node's or a string's
-/// capacity, a closure's arity or the prefix a list dropped; `flags` and `aux` are a `Bool`'s
-/// value and a list's tail length and tail capacity (`list.rs`).
+/// `len`: payload words, byte count or list length; `layout`: shape, ctor index, capacity, arity
+/// or dropped list prefix; `flags`/`aux`: a `Bool`'s value, a list's tail length and capacity.
 #[repr(C, align(8))]
 pub struct Obj {
     pub rc: u32,
@@ -149,28 +126,20 @@ pub fn obj(w: Word) -> *mut Obj {
     w as *mut Obj
 }
 
-/// Whether every heap is in the diagnostic mode ADR 0051 §1 built: a dead block's payload is
-/// poisoned at release, and a read of it through the runtime, before the block is taken again,
-/// fails at the body's site. `PLY_HEAP_POISON=1` turns it on for a process; nothing ships with
-/// it.
+/// Under `PLY_HEAP_POISON`, dead payloads are poisoned so a stale read fails at the body's site.
 #[inline]
 pub fn poisoning() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("PLY_HEAP_POISON").is_some())
 }
 
-/// Whether allocations are also tallied by layout, which `PLY_C_PHASES` prints at an entry's
-/// end and costs a map insert per allocation.
+/// Under `PLY_C_PHASES`, allocations are also tallied by layout, at a map insert each.
 fn census_by_layout() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("PLY_C_PHASES").is_some())
 }
 
-/// How many releases a dead block waits before an allocation may take it: zero, unless
-/// `PLY_HEAP_DELAY=<n>` says otherwise for a process. The other diagnostic mode, for reading
-/// what a program's allocation pattern costs when a block is not reused at once: a value built
-/// by copying the whole of it each step keeps `n` copies alive under a delay of `n`, and the
-/// chunk bytes at the entry's end say so (ADR 0051 §3). Nothing ships with it.
+/// How many releases a dead block waits before reuse: `PLY_HEAP_DELAY`, zero by default.
 pub fn delay() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -181,8 +150,7 @@ pub fn delay() -> usize {
     })
 }
 
-/// A bytes value of one byte or none, laid out as the heap lays one out: the header, then the
-/// payload where `bytes_ptr` looks for it.
+/// A bytes value of one byte or none, laid out as the heap lays one out.
 #[repr(C)]
 struct SmallBytes {
     obj: Obj,
@@ -220,9 +188,7 @@ static ONE_BYTE: [SmallBytes; 256] = {
     out
 };
 
-/// The immortal bytes value holding `b`, when `b` is a byte or none: the compiler's sources
-/// make tens of millions of these, as the empty literal a fold starts from and as the one
-/// character a lexer step keeps, and none of them needs a block of its own (ADR 0051 §3).
+/// The immortal bytes value holding `b` when it is one byte or none.
 pub fn small_bytes(b: &[u8]) -> Option<Word> {
     match b {
         [] => Some(&raw const EMPTY_BYTES.obj as Word),
@@ -231,13 +197,11 @@ pub fn small_bytes(b: &[u8]) -> Option<Word> {
     }
 }
 
-/// The diagnostic mode's pieces: the word a dead payload is filled with, the check every object
-/// read passes through, and the site the check names.
+/// The poison diagnostic: the dead-payload word and the check every object read passes.
 pub mod poison {
     use super::{IMMORTAL, KIND_DEAD, Obj, Word, is_imm};
 
-    /// What a poisoned payload word points at: an object that is dead by its header and immortal
-    /// by its count, so a read through it is caught by the header and never counted.
+    /// Dead by its header and immortal by its count: a read through it is caught, never counted.
     static POISONED: Obj = Obj {
         rc: IMMORTAL,
         kind: KIND_DEAD,
@@ -252,8 +216,7 @@ pub mod poison {
     }
 
     thread_local! {
-        /// The running entry's `site_module`, `site_start` and `site_end`, three `i64`s in a row
-        /// inside its `Ctx`, so a failure here can say where the body was.
+        /// Three consecutive `i64`s in the running entry's `Ctx`: its site module, start and end.
         static SITE: std::cell::Cell<*const i64> = const { std::cell::Cell::new(std::ptr::null()) };
     }
 
@@ -265,9 +228,7 @@ pub mod poison {
         SITE.with(|s| s.set(std::ptr::null()));
     }
 
-    /// Fails, naming the body's site, when `w` is the poison word or points at a dead header.
-    /// The failure is a panic: it reaches the log through whatever `extern "C"` frame is above,
-    /// which is loud and is what a diagnostic mode is for.
+    /// Panics, naming the body's site, when `w` is the poison word or points at a dead header.
     pub fn check(w: Word) {
         if is_imm(w) || w == 0 {
             return;
@@ -340,8 +301,7 @@ pub unsafe fn str_of<'a>(o: *mut Obj) -> &'a str {
     unsafe { std::str::from_utf8_unchecked(bytes_of(o)) }
 }
 
-/// The shapes records are laid out by: a shape is its sorted field names, and a field's offset
-/// is its position in them.
+/// Record shapes: a shape is its sorted field names, and a field's offset its position in them.
 #[derive(Default)]
 pub struct Shapes {
     ids: HashMap<Rc<[Symbol]>, u32>,
@@ -362,8 +322,7 @@ impl Shapes {
     }
 }
 
-/// What a word is read against: the shapes, shared between the compiler that interns a
-/// literal's and the entry that interns an arriving record's, and the constructors by index.
+/// Record shapes and constructors by index, shared by the compiler and the running entry.
 pub struct Layouts {
     shapes: RefCell<Shapes>,
     pub ctors: Vec<(Symbol, usize)>,
@@ -376,11 +335,10 @@ pub struct Layouts {
     pub less: Option<u32>,
     pub equal: Option<u32>,
     pub greater: Option<u32>,
-    /// Per shape interned before [`Layouts::index_fields`], the offset of each field name the
-    /// compiled unit reads by index, `width` to a row, so a lookup is a load rather than a search.
+    /// Field offsets by shape and index, `width` to a row, for shapes interned before indexing.
     rows: Box<[u16]>,
     width: usize,
-    /// The shape of a `{key, value}` entry, interned once.
+    /// The shape of a `{key, value}` entry.
     entry_shape: u32,
 }
 
@@ -440,8 +398,7 @@ impl Layouts {
         self.width = names.len();
     }
 
-    /// The offset of the field named at `index` in `names`, in `shape`: one load for a shape the
-    /// rows cover, and a search for one interned since.
+    /// The offset of `names[index]` in `shape`: a load for an indexed shape, else a search.
     #[inline]
     pub fn offset_by_index(&self, shape: u32, index: usize, names: &[Symbol]) -> Option<usize> {
         match self.rows.get(shape as usize * self.width + index) {
@@ -455,8 +412,7 @@ impl Layouts {
         self.shapes.borrow_mut().intern(fields)
     }
 
-    /// Every shape's fields, in id order, so a unit read back from a cache can intern them in the
-    /// same order and land on the same ids. The ids are baked into emitted C as numbers.
+    /// Every shape's fields in id order, so a cached unit re-interns them to the ids its C bakes.
     pub fn all_shape_names(&self) -> Vec<Vec<Symbol>> {
         self.shapes
             .borrow()
@@ -482,39 +438,29 @@ impl Layouts {
     }
 }
 
-/// What an entry allocates from: a bump pointer over chunks that are recycled at the entry's
-/// end, since the entry's answer is copied out before then and nothing outside it can hold a
-/// word. A persistent heap — the constant pool, the memo — never recycles.
+/// An entry's bump allocator over chunks recycled at its end; a persistent heap never recycles.
 #[repr(C)]
 pub struct Heap {
-    /// The next free byte and the end of the current chunk, first so that compiled code can
-    /// bump them at fixed offsets from the context.
+    /// First so compiled code can bump them at fixed offsets from the context.
     cur: *mut u8,
     end: *mut u8,
     chunks: Vec<(*mut u8, usize)>,
-    /// One bit per eight bytes of each chunk, set where an object starts, so that a word found on
-    /// a captured stack can be told from an integer or a stale address: a continuation resumed
-    /// again pins the objects its snapshot references, and this is how it knows which they are.
+    /// One bit per word of each chunk, set at each object start, for [`Heap::is_object`].
     starts: Vec<Vec<u64>>,
     /// Which chunk `cur` is in.
     chunk: usize,
-    /// Bridged values allocated since the last reset, whose interpreter value must be dropped.
+    /// Bridged values allocated since the last reset, to drop at the end.
     bridges: Vec<*mut Obj>,
     persistent: bool,
     /// Objects allocated since the last reset, and the same by kind.
     count: usize,
     by_kind: [usize; 16],
-    /// Under `PLY_C_PHASES`: constructors and records by their layout, and bytes and strings by
-    /// the power of two their length rounds up to, keyed by kind.
+    /// Under `PLY_C_PHASES`, allocations by kind and layout or power-of-two length.
     by_layout: HashMap<(u8, u32), usize>,
     recycled: usize,
-    /// Dead objects by size class, for an allocation of that class to take before the bump
-    /// pointer moves: what keeps an entry's memory bounded by what it holds rather than by what
-    /// it ever held.
+    /// Dead objects by size class in words, taken before the bump pointer moves.
     free: Vec<Vec<*mut Obj>>,
-    /// Dead objects past the small classes, by the power of two their block was rounded up to:
-    /// a program that builds a large string by appending would otherwise keep every version it
-    /// let go until the entry ends.
+    /// Dead blocks past the small classes, by the power of two their size was rounded up to.
     large: Vec<Vec<*mut Obj>>,
     /// Dead blocks not yet on a free list, oldest first, under `delay()`.
     delayed: std::collections::VecDeque<(*mut Obj, usize)>,
@@ -523,13 +469,11 @@ pub struct Heap {
     census: bool,
 }
 
-/// The size classes a dead object is kept in, in words; anything larger goes back only at the
-/// entry's end.
+/// Small size classes, in words; larger blocks are reused by power of two.
 const REUSE_CLASSES: usize = 64;
 
 thread_local! {
-    /// The heap of the entry running on this thread, which a dying object goes back to. Entries
-    /// never nest on a thread (a re-entry is declined), so one is enough.
+    /// The running entry's heap, which dying objects return to; entries never nest on a thread.
     static CURRENT: std::cell::Cell<*mut Heap> = const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
 
@@ -542,8 +486,7 @@ pub fn leave() {
     CURRENT.with(|c| c.set(std::ptr::null_mut()));
 }
 
-/// The payload an object was allocated with, from its header: what its allocation site asked
-/// for, kind by kind, so a dead object goes back to the class it came from.
+/// The payload bytes an object was allocated with, from its header; `usize::MAX` if unsized.
 unsafe fn payload_bytes(o: *mut Obj) -> usize {
     unsafe {
         match (*o).kind {
@@ -559,9 +502,7 @@ unsafe fn payload_bytes(o: *mut Obj) -> usize {
     }
 }
 
-/// A dead object goes back to the current heap's free list for its class. A bridged one does
-/// not: its slot is on the heap's drop log, and a second bridged value in the same slot would
-/// be dropped twice at the entry's end.
+/// Returns a dead object to its free list; never a bridge, which the drop log would drop twice.
 unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
     if heap.is_null() {
         return;
@@ -575,9 +516,7 @@ unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
             return;
         }
         let object = Heap::object_size(size);
-        // Poisoned and still reused: a heap that kept every dead block over the emitter's own
-        // sources needed more memory than a runner has, so the net is the poison a stale read
-        // meets until the block is taken again, not the block waiting.
+        // Reused even when poisoned: holding dead blocks back exhausts memory.
         if (*heap).poison {
             let words = (object - HEADER) / 8;
             for i in 0..words {
@@ -634,8 +573,7 @@ impl Heap {
         }
     }
 
-    /// The free list a dead block of `object` bytes goes to: its size class, or the power of two
-    /// past the small classes.
+    /// The free list for a dead block of `object` bytes: its size class or its power of two.
     fn free_list(&mut self, object: usize) -> &mut Vec<*mut Obj> {
         let (lists, class) = match Heap::large_class(object) {
             Some(class) => (&mut self.large, class),
@@ -654,9 +592,7 @@ impl Heap {
         h
     }
 
-    /// How many objects have been allocated since the last reset.
-    /// Every object still counted at this moment, tallied by kind: what an entry holds at its
-    /// end is what it leaked or what its answer needs, and the tally says which.
+    /// Live objects by kind, with their count and payload bytes.
     pub fn live_by_kind(&self) -> Vec<(u8, usize, usize)> {
         let mut tally: std::collections::BTreeMap<u8, (usize, usize)> = Default::default();
         for (i, (base, cap)) in self.chunks.iter().enumerate() {
@@ -685,8 +621,7 @@ impl Heap {
                     }
                     let e = tally.entry(kind).or_insert((0, 0));
                     e.0 += 1;
-                    // A kind the header does not size -- a bridge, a singleton -- counts its
-                    // header alone; `usize::MAX` is `payload_bytes`'s "not recyclable", not a size.
+                    // `usize::MAX` means unsized (a bridge, a singleton): count the header alone.
                     e.1 += if size == usize::MAX { HEADER } else { size };
                 }
             }
@@ -699,19 +634,17 @@ impl Heap {
         self.chunks.iter().map(|(_, cap)| *cap).sum()
     }
 
+    /// Objects allocated since the last reset.
     pub fn allocated(&self) -> usize {
         self.count
     }
 
-    /// The same by kind, indexed by the `KIND_*` constants: which values a program is made of,
-    /// which is what a change to the value model is aimed by.
+    /// Allocations by kind, indexed by the `KIND_*` constants.
     pub fn allocated_by_kind(&self) -> [usize; 16] {
         self.by_kind
     }
 
-    /// Under `PLY_C_PHASES`, the constructors and records allocated by layout and the bytes and
-    /// strings by length class, most first: which constructors and which shapes a program is
-    /// made of.
+    /// Under `PLY_C_PHASES`, allocations by kind and layout or length class, most first.
     pub fn allocated_by_layout(&self) -> Vec<((u8, u32), usize)> {
         let mut out: Vec<((u8, u32), usize)> =
             self.by_layout.iter().map(|(k, n)| (*k, *n)).collect();
@@ -719,23 +652,12 @@ impl Heap {
         out
     }
 
-    /// Allocations served from the free list rather than from fresh memory.
-    ///
-    /// The observable for whether anything is being *released*. `allocated` counts either kind, so
-    /// a body that leaks every temporary and one that recycles them read the same there; this is
-    /// what tells them apart.
-    ///
-    /// **Over the emitted tier it reads zero**, and that is the finding it exists to make legible:
-    /// that tier takes no count it should not any more, but it still releases nothing at the end
-    /// of a scope, so a temporary built and dropped without being handed on has a count of one and
-    /// nobody to drop it. Reading a number here is what would say the other half of the ownership
-    /// discipline had landed.
+    /// Allocations served from a free list rather than fresh memory.
     pub fn recycled(&self) -> usize {
         self.recycled
     }
 
-    /// Moves to a chunk with `need` bytes free: the next one already on hand that fits, or a
-    /// new one, each larger than the last up to a bound.
+    /// Moves to a chunk with `need` bytes free: the next fitting one on hand, or a new, larger one.
     fn grow(&mut self, need: usize) {
         while self.chunk + 1 < self.chunks.len() {
             self.chunk += 1;
@@ -762,8 +684,7 @@ impl Heap {
         (HEADER + payload_bytes.max(8) + 7) & !7
     }
 
-    /// The bytes a block takes: an object's size in the small classes, and the next power of two
-    /// past them, so a dead block serves any later object that rounds to the same power.
+    /// A block's size: the object size in the small classes, else the next power of two.
     fn block_size(payload_bytes: usize) -> usize {
         let size = Heap::object_size(payload_bytes);
         match Heap::large_class(size) {
@@ -787,7 +708,6 @@ impl Heap {
         payload_bytes: usize,
     ) -> *mut Obj {
         let size = Heap::block_size(payload_bytes);
-        // A dead object of this class, if the entry has one, before the bump pointer moves.
         let recycled = match Heap::large_class(size) {
             Some(class) => self.large.get_mut(class).and_then(Vec::pop),
             None => self.free.get_mut(size / 8).and_then(Vec::pop),
@@ -825,7 +745,7 @@ impl Heap {
         if self.census {
             let key = match kind {
                 KIND_CTOR | KIND_RECORD => Some(layout),
-                // Bytes arrive with `len` zero and the room in the payload; the class is the room.
+                // Bytes arrive with `len` zero; the class is the capacity.
                 KIND_BYTES | KIND_STR => Some((payload_bytes as u32).next_power_of_two()),
                 _ => None,
             };
@@ -836,8 +756,7 @@ impl Heap {
         p
     }
 
-    /// Whether `w` is the address of an object this heap allocated in the entry now running and
-    /// has not dismantled: aligned, inside a chunk, at a start the allocator marked, and headed.
+    /// Whether `w` is a live object this heap allocated in the running entry.
     pub fn is_object(&self, w: Word) -> bool {
         if is_imm(w) || w == 0 || !(w as usize).is_multiple_of(8) {
             return false;
@@ -857,18 +776,13 @@ impl Heap {
         false
     }
 
-    /// A fresh object with `len` payload words.
-    ///
-    /// **The payload comes back as it was left**, because a dead object is recycled whole: the
-    /// caller writes all `len` words before anything can release this object, or [`dec`] walks
-    /// whatever the last tenant wrote and follows it as a child. Every caller here evaluates its
-    /// field values first and fills the object immediately after, with no fallible call between.
+    /// A fresh object with `len` payload words, left as a recycled block's last tenant wrote them:
+    /// fill every word before anything can release it, or [`dec`] follows garbage.
     pub fn alloc(&mut self, kind: u8, flags: u8, len: u32, layout: u32) -> *mut Obj {
         self.raw_alloc(kind, flags, len, layout, len as usize * 8)
     }
 
-    /// [`dec`] for a word compiled code has already found held once and mortal: released into
-    /// this heap's free lists without asking a thread-local which heap that is.
+    /// [`dec`] of a mortal word held once, into this heap without the thread-local lookup.
     pub fn release_last(&mut self, w: Word) {
         debug_assert!(!is_imm(w) && w != 0);
         let o = obj(w);
@@ -883,8 +797,7 @@ impl Heap {
         self.raw_alloc(kind, 0, 0, cap, cap as usize)
     }
 
-    /// A string or bytes value of `kind` holding `a` then `b`, with at least `room` bytes of
-    /// capacity.
+    /// A string or bytes value of `kind` holding `a` then `b`, with at least `room` capacity.
     fn joined(&mut self, kind: u8, a: &[u8], b: &[u8], room: usize) -> *mut Obj {
         let len = a.len() + b.len();
         if kind == KIND_BYTES
@@ -910,10 +823,7 @@ impl Heap {
         self.joined(KIND_BYTES, b, &[], 0) as Word
     }
 
-    /// `a` with `b` appended, of `a`'s kind. Takes `a`: when nobody else holds it and it has the
-    /// room, the bytes are written after its own and it is answered; otherwise a fresh value with
-    /// room to grow again is answered and `a` released. A value built by appending to it in a
-    /// loop therefore copies each piece once.
+    /// Takes `a` and appends `b`: in place when `a` is unique and has room, else a doubled copy.
     pub fn append(&mut self, a: Word, b: &[u8]) -> Word {
         let o = obj(a);
         let (len, cap) = unsafe { ((*o).len as usize, (*o).layout as usize) };
@@ -946,8 +856,7 @@ impl Heap {
         o as Word
     }
 
-    /// A word that lives as long as this persistent heap does: the constant pool. Every object
-    /// under it is immortal too, so no count is touched through a constant.
+    /// A constant-pool word: immortal, as is everything under it.
     pub fn immortal(&mut self, layouts: &Layouts, v: &Value) -> Word {
         debug_assert!(
             self.persistent,
@@ -958,9 +867,7 @@ impl Heap {
         w
     }
 
-    /// A copy of everything under `w` into this persistent heap, immortal: what the memo keeps
-    /// of an entry's word, since the entry's own memory is recycled. An object already immortal
-    /// is shared rather than copied.
+    /// An immortal deep copy of `w` into this persistent heap, sharing what is already immortal.
     pub fn adopt(&mut self, w: Word) -> Word {
         debug_assert!(
             self.persistent,
@@ -1024,9 +931,7 @@ impl Heap {
         }
     }
 
-    /// Resets the entry's memory: every bridged value still alive is dropped, and the chunks
-    /// are kept for the next entry. A live count is no obstacle: the entry's answer has already
-    /// been copied out as a [`Value`], so nothing outside the entry can hold a word.
+    /// Resets the entry's memory, keeping its chunks; the answer is already copied out.
     pub fn end(&mut self) {
         if self.persistent {
             return;
@@ -1058,8 +963,6 @@ impl Heap {
             bits.fill(0);
         }
     }
-
-    // --- Conversions ------------------------------------------------------------------------
 
     /// The compiled word for an interpreter value: deep, and every object fresh in the entry.
     pub fn to_word(&mut self, layouts: &Layouts, v: &Value) -> Word {
@@ -1133,9 +1036,7 @@ impl Heap {
         Heap::to_value_counted(layouts, w, &mut Walked::default())
     }
 
-    /// [`Heap::to_value`], noting what it read on the way: the objects, for the seam's census,
-    /// and whether any was a handle — a closure, or a bridged value holding one — which the
-    /// seam refuses to carry out, so it need not walk the answer a second time to ask.
+    /// [`Heap::to_value`], also counting objects read and noting any handle among them.
     pub fn to_value_counted(layouts: &Layouts, w: Word, walked: &mut Walked) -> Value {
         if is_imm(w) {
             return Value::Int(imm_value(w));
@@ -1231,8 +1132,6 @@ impl Drop for Heap {
     }
 }
 
-// --- Counts ------------------------------------------------------------------------------------
-
 /// One more holder of `w`. Zero is no object, as `ply_inc` and `ply_dec` read it.
 #[inline]
 pub fn inc(w: Word) {
@@ -1280,9 +1179,8 @@ unsafe fn release(o: *mut Obj, heap: *mut Heap) {
     }
 }
 
-/// Perceus's `reset`: `w`, a record held once, lets its fields go and keeps its memory for the
-/// next record of the same width — its length zeroed, so a release before that walks nothing.
-/// Answers the word kept, or `0` — the object released — for anything that is not such a record.
+/// Perceus's `reset`: a unique record drops its fields and keeps its memory with `len` zeroed;
+/// answers `w`, or `0` after releasing anything else.
 pub fn reset(w: Word) -> Word {
     if is_imm(w) || w == 0 {
         return 0;
@@ -1306,8 +1204,7 @@ pub fn reset(w: Word) -> Word {
     w
 }
 
-/// Byte order over two slices, by hand for the short keys a map is probed with and by `memcmp`
-/// past that.
+/// Byte order, by hand for short keys and by `memcmp` past sixteen bytes.
 #[inline]
 fn cmp_bytes(x: &[u8], y: &[u8]) -> Ordering {
     let n = x.len().min(y.len());
@@ -1322,13 +1219,10 @@ fn cmp_bytes(x: &[u8], y: &[u8]) -> Ordering {
     x.len().cmp(&y.len())
 }
 
-/// How deep a dying object's dying children are dismantled on the stack before the rest are
-/// deferred to a heap list: a record of scalars, the common case, allocates nothing.
+/// How deep dismantling recurses on the stack before deferring to a heap list.
 const DISMANTLE_DEPTH: usize = 32;
 
-/// `o`, held once, dies: each child is let go, a child it was the last holder of dismantled in
-/// turn, and its header marked dead — read as such by anything still holding a stale word,
-/// dropped by nothing twice, and its memory recycled with the entry.
+/// `o`, held once, dies: its children are released and its header marked dead.
 unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>, heap: *mut Heap) {
     unsafe {
         debug_assert!((*o).rc == 1 && (*o).kind != KIND_DEAD);
@@ -1377,8 +1271,7 @@ unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>, hea
     }
 }
 
-/// Marks everything under `w` immortal where it lies: no count is touched through it again, and
-/// the entry's end hands it to whoever keeps the memo rather than releasing it.
+/// Marks everything under `w` immortal in place, so no count is touched through it again.
 pub fn mark_immortal(w: Word) {
     let mut pending = vec![w];
     while let Some(w) = pending.pop() {
@@ -1418,8 +1311,7 @@ pub fn mark_immortal(w: Word) {
     }
 }
 
-/// `ply_eval::memo::world_independent` over a word: whether what it denotes means the same thing
-/// in a world it was not produced in, which is what a remembered constant must.
+/// `ply_eval::memo::world_independent` over a word: whether a memo may keep it.
 pub fn world_independent(w: Word) -> bool {
     let mut pending = vec![w];
     while let Some(w) = pending.pop() {
@@ -1450,8 +1342,7 @@ pub fn world_independent(w: Word) -> bool {
                     }
                 }
                 KIND_BRIDGE => {
-                    // A credential is a value like any other inside an entry and must not
-                    // outlive it: the memo is the one place a word does.
+                    // A handle must not outlive its entry, and the memo would keep it.
                     if crate::rt::holds_a_handle(bridged(o)).is_some()
                         || !ply_eval::memo::world_independent(bridged(o))
                     {
@@ -1465,8 +1356,7 @@ pub fn world_independent(w: Word) -> bool {
     true
 }
 
-/// Whether `w` reaches cell `slot`: the tier's side of the cycle check a `cell_set` makes, within
-/// the same walk budget the interpreter's has.
+/// Whether `w` reaches cell `slot`, within the interpreter's walk budget.
 pub fn reaches_cell(w: Word, slot: ply_eval::arena::Slot) -> bool {
     let mut budget = 256usize;
     let mut pending = vec![w];
@@ -1531,10 +1421,7 @@ pub fn kind(w: Word) -> u8 {
     if is_imm(w) {
         KIND_INT
     } else if w == 0 {
-        // Zero is the emitted tier's "no word here": a record it has not built yet, and the answer
-        // of a guarded read whose guard was false. It is not an address, and `kind` is the first
-        // thing every runtime helper asks -- so without this line a zero reaching one of them
-        // reads `(*null).kind`, which is a fault at address 4 rather than a diagnostic.
+        // Zero is "no word here"; reading its header would fault at address 4.
         KIND_DEAD
     } else {
         unsafe { (*obj(w)).kind }
@@ -1574,8 +1461,6 @@ pub fn as_bool(w: Word) -> Option<bool> {
         }
     }
 }
-
-// --- Order -------------------------------------------------------------------------------------
 
 /// The interpreter's rank of a value's variant, which orders values of different kinds.
 fn rank(w: Word) -> u8 {
@@ -1619,16 +1504,12 @@ fn rank(w: Word) -> u8 {
     }
 }
 
-/// `Value::cmp` over words: structural, total and deterministic, the order a map's keys are held
-/// in — and the same order, so a map crosses the seam with its entries where the interpreter
-/// would put them. Two words of one native kind compare in place; anything else compares as the
-/// values it denotes.
+/// `Value::cmp` over words, so a map crosses the seam in the interpreter's key order.
 pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
     if a == b {
         return Ordering::Equal;
     }
-    // Two strings, or two byte strings — a map's keys, most often — are compared as bytes
-    // before any of the ranking below is asked of them.
+    // Fast path for a map's usual keys: two strings or two byte strings.
     if !is_imm(a) && !is_imm(b) && a != 0 && b != 0 {
         let (oa, ob) = (obj(a), obj(b));
         let (ka, kb) = unsafe { ((*oa).kind, (*ob).kind) };
@@ -1714,8 +1595,7 @@ pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
     }
 }
 
-/// Whether a word can be a native map's key: ordered in place, and already canonical — a
-/// `Decimal` is neither, a `Secret` has no order, and both are the interpreter's to refuse.
+/// Whether a word can be a native map's key: ordered in place and canonical.
 pub fn native_key(w: Word) -> bool {
     if is_imm(w) {
         return true;

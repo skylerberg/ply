@@ -1,6 +1,4 @@
-//! The type vocabulary: what a checked program's types, rows, footprints and interfaces look
-//! like, shared by the checker that produces them and everything downstream that reads them.
-//! Pinned: concurrent crates are written against these shapes.
+//! The type vocabulary of a checked program, shared by the checker and everything downstream.
 
 pub mod decl;
 pub mod expr;
@@ -35,13 +33,11 @@ pub struct OpInfo {
     pub params: Vec<Type>,
     pub ret: Type,
     pub span: Span,
-    /// `Some` only for a prelude operation, whose signature is constructed rather than parsed and
-    /// may be polymorphic in a type and in an effect row — `task.spawn` needs both.
+    /// `Some` only for a prelude operation, whose signature is constructed rather than parsed.
     pub scheme: Option<Scheme>,
 }
 
-/// `name` is the program-wide name, `store.db`, and so is the `effect` field of every
-/// [`EffectAtom`] it produces.
+/// `name` is program-wide (`store.db`) and equals the `effect` of every [`EffectAtom`] it makes.
 #[derive(Clone, Debug)]
 pub struct EffectInfo {
     pub name: Symbol,
@@ -73,7 +69,7 @@ pub struct SpecInfo {
     pub kind: SpecKind,
     /// Position among the owner's clauses, in source order.
     pub index: usize,
-    /// Always empty — a spec expression's row must be pure, or it could change what it observes.
+    /// Always empty: a spec expression must not change what it observes.
     pub footprint: Footprint,
     pub span: Span,
 }
@@ -99,11 +95,9 @@ pub struct LawInfo {
     /// Empty for a ground law, which is decided by evaluating it.
     pub binders: Vec<LawBinder>,
     pub has_guard: bool,
-    /// `law/host`: the body may carry any row, so this law reaches the world.
+    /// `law/host`: the body may carry any row.
     pub host: bool,
-    /// `{}`, or `{sim.read}` for a concurrency law — which is discharged by exhaustive interleaving
-    /// search rather than by a static argument — or any row at all when [`host`](LawInfo::host) is
-    /// set.
+    /// `{}`, `{sim.read}` for a concurrency law, or any row when [`host`](LawInfo::host) is set.
     pub footprint: Footprint,
     pub span: Span,
 }
@@ -124,10 +118,9 @@ pub struct DefInfo {
     pub module: ModuleName,
     pub simple_name: Symbol,
     pub scheme: Scheme,
-    /// The **published** row: the `/ {..}` annotation when there is one, and the inferred row when
-    /// there is not.
+    /// The published row: the `/ {..}` annotation if written, else the inferred row.
     pub footprint: Footprint,
-    /// What row inference computed for the **body**.
+    /// The row inference computed for the body.
     pub performed: Footprint,
     /// The `effect set`s this definition's row was written with, in source order, by simple name.
     pub row_aliases: Vec<Symbol>,
@@ -135,8 +128,7 @@ pub struct DefInfo {
     pub constraints: Vec<DefConstraint>,
     /// `requires` / `ensures`, in source order.
     pub spec: Vec<SpecInfo>,
-    /// Whether running this definition can execute a `perform` that [`DefInfo::footprint`] does not
-    /// show.
+    /// Whether running this can execute a `perform` that [`DefInfo::footprint`] does not show.
     pub internally_effectful: bool,
     pub span: Span,
 }
@@ -146,11 +138,9 @@ pub struct TestInfo {
     /// The declared label, as written.
     pub name: String,
     pub module: ModuleName,
-    /// `<module>.<label>`: unique program-wide, and what a test's hash, closure and cache entry are
-    /// keyed by.
+    /// `<module>.<label>`: unique program-wide; keys the test's hash, closure and cache entry.
     pub key: Symbol,
-    /// Position in [`CheckOutput::tests`], which is the order the modules were loaded in and then
-    /// source order within each.
+    /// Position in [`CheckOutput::tests`]: module load order, then source order.
     pub index: usize,
     pub nondet: bool,
     pub footprint: Footprint,
@@ -166,8 +156,7 @@ pub struct ModuleInfo {
     pub imports: Vec<ModuleName>,
 }
 
-/// Every map is keyed by program-wide name, so entries from different modules cannot collide and no
-/// key is ever rewritten when a definition moves.
+/// Every map is keyed by program-wide name, so entries from different modules cannot collide.
 #[derive(Clone, Debug, Default)]
 pub struct CheckOutput {
     pub defs: IndexMap<Symbol, DefInfo>,
