@@ -165,8 +165,7 @@ impl<'a> Renormalizer<'a> {
         self.witnessed.iter().filter(|w| !**w).count()
     }
 
-    /// `key`'s current body, re-normalized with every reference written as `table` says rather than
-    /// as it hashes now.
+    /// `key`'s current body re-normalized with every reference written as `table` says.
     pub fn rehash(&self, key: &DefKey, table: &EraTable) -> Option<DefHash> {
         let v = self.node_of(key)?;
         if !self.witnessed[v] {
@@ -183,8 +182,7 @@ impl<'a> Renormalizer<'a> {
         self.hash_test(t, &table.table)
     }
 
-    /// The other members of `key`'s strongly connected component, `key` included, when it is
-    /// mutually recursive.
+    /// `key`'s strongly connected component, `key` included, when it is mutually recursive.
     pub fn component_of(&self, key: &DefKey) -> Vec<DefKey> {
         let Some(v) = self.node_of(key) else {
             return Vec::new();

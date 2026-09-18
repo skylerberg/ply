@@ -211,8 +211,7 @@ pub fn emit_def(corpus: &Corpus, def: &Def) -> String {
             let _ = writeln!(s, "  {}", combine(corpus, def, &core));
             s.push_str("}\n");
         }
-        // A `match` cannot be spliced into an argument list, so a `Sum` with extras is rebuilt as a
-        // block whose `let` holds the arms.
+        // A `match` cannot be an argument, so a `Sum` with extras binds it in a block's `let`.
         Shape::Sum { off, f, idle } => {
             let module = &corpus.modules[here];
             let arms = format!(
@@ -244,8 +243,7 @@ pub fn emit_def(corpus: &Corpus, def: &Def) -> String {
     s
 }
 
-/// A spec clause ends a line, so the `=` that starts the body goes on the next one rather than
-/// trailing an `ensures`.
+/// A spec clause ends a line, so the body's `=` goes on the next one.
 fn assign(head: &str) -> String {
     if head.contains('\n') {
         format!("{head}\n=")
@@ -329,8 +327,7 @@ fn core_expr(corpus: &Corpus, def: &Def, shape: &Shape) -> String {
     .to_string()
 }
 
-/// `base` is the caller's expression for the callee's first argument, before the call's own offset
-/// is added.
+/// `base` is the callee's first argument before the call's own offset is added.
 pub fn call_expr(corpus: &Corpus, here: ModuleId, call: Call, base: &str) -> String {
     let callee = &corpus.defs[call.target];
     let qualifier = qualify(corpus, here, call.target);
@@ -350,8 +347,7 @@ pub fn call_expr(corpus: &Corpus, here: ModuleId, call: Call, base: &str) -> Str
     }
 }
 
-/// A module has no binder for itself, so a same-module reference must be bare; every other one is
-/// `m::x` and so cannot be captured by a local binder.
+/// Same-module references are bare (a module has no binder for itself); others are `m::x`.
 fn qualify(corpus: &Corpus, here: ModuleId, target: DefId) -> String {
     let owner = corpus.defs[target].module;
     if owner == here {
@@ -504,8 +500,7 @@ pub fn emit_task(corpus: &Corpus, task: &TaskBody) -> String {
     s
 }
 
-/// The test itself: one cell per shard, one handler clause per shard, and assertions that hold
-/// under every interleaving — the per-shard totals and the values the tasks returned.
+/// One cell and handler clause per shard, asserting only what holds under every interleaving.
 pub fn emit_concurrent_test(corpus: &Corpus, test: &ConcurrentTest) -> String {
     let mut body: Vec<String> = test
         .tasks

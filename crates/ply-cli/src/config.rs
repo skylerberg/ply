@@ -11,16 +11,10 @@ use serde_json::{Value as Json, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Where a run's configuration comes from, on the command line.
-///
-/// The process environment is the third source and has no flag, because it has
-/// no name to give: a key is one string in one namespace across all four
-/// sources, so "which key was that" has one answer. There is no `PLY_` prefix,
-/// no upper-casing and no `.`-to-`_` translation.
+/// Configuration sources; the environment is read with no `PLY_` prefix or case translation.
 #[derive(Args, Clone, Debug, Default)]
 pub struct ConfigOptions {
-    /// A configuration value: `--set DESK_REGION=eu`. Repeatable, highest
-    /// precedence, and the last one for a key wins.
+    /// A configuration value: `--set DESK_REGION=eu`. Repeatable; highest precedence, last wins.
     #[arg(
         id = "config_set",
         long = "set",
@@ -29,10 +23,7 @@ pub struct ConfigOptions {
     )]
     pub set: Vec<String>,
 
-    /// A `KEY=VALUE` file, one pair per line. Repeatable, and a later file wins
-    /// over an earlier one. No quoting, no interpolation, no sections: the
-    /// effect returns `Option<String>`, and a format richer than the type it
-    /// feeds is a format whose extra structure is silently dropped.
+    /// A `KEY=VALUE` file, one pair per line, no quoting. Repeatable; a later file wins.
     #[arg(
         id = "config_files",
         long = "config",
@@ -41,15 +32,7 @@ pub struct ConfigOptions {
     )]
     pub files: Vec<PathBuf>,
 
-    /// `<module>.<fn>` — a nullary pure function returning a `ConfigSpec`,
-    /// resolved against the sources at start-up so a missing or malformed value
-    /// is `E0441`/`E0442` before anything is bound rather than a `None` two
-    /// hundred requests in.
-    ///
-    /// It is also what decides which keys are credentials: a key declared
-    /// `SSecret` is readable only through `config.secret`, which answers a
-    /// `Secret<String>`. Without a schema there are no such keys, and a password
-    /// can be read as an ordinary `String`.
+    /// `<module>.<fn>`: a nullary pure function returning a `ConfigSpec`, checked at start-up.
     #[arg(
         id = "config_schema",
         long = "config-schema",
@@ -60,10 +43,7 @@ pub struct ConfigOptions {
 }
 
 impl ConfigOptions {
-    /// The sources, read once, before anything is bound.
-    ///
-    /// `None` without `--host`: no file is opened and the process environment is
-    /// not consulted, whatever it holds.
+    /// The sources, read once before anything is bound; `None` without `--host`.
     pub fn read(&self, host: bool) -> Result<Option<Sources>, Vec<Diagnostic>> {
         if !host {
             return Ok(None);
@@ -75,24 +55,16 @@ impl ConfigOptions {
     }
 }
 
-/// A run's configuration, resolved: the snapshot the handlers answer from, and
-/// what the report may say about it.
+/// A run's resolved configuration: the snapshot the handlers answer from.
 #[derive(Clone, Default)]
 pub struct Configuration {
-    /// Shared with the `Host` that serves `config.get` and `config.secret`. One
-    /// per run, immutable, and the reason two host-backed tests that read
-    /// configuration are not coupled.
+    /// Shared with the `Host`; immutable, so host-backed tests reading it are not coupled.
     pub snapshot: Arc<Snapshot>,
-    /// The `--config-schema` function's name and the keys it declared, or `None`
-    /// for a run that named none.
+    /// The `--config-schema` function's name and declared keys.
     pub schema: Option<SchemaView>,
 }
 
-/// What the run learned from the schema it named.
-///
-/// The key *names* and *shapes* are here and the resolved values are not: the
-/// digest covers this, and a CI check that broke on a deployment's own
-/// configuration is a CI check people learn to ignore.
+/// Key names and shapes from the named schema, never values: the digest covers this.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SchemaView {
     pub name: String,
@@ -100,13 +72,7 @@ pub struct SchemaView {
 }
 
 impl Configuration {
-    /// Resolve everything: read the sources, materialise the schema, check every
-    /// declared key against it.
-    ///
-    /// The warnings — `W0607` for a `--set` the schema does not declare — come
-    /// back rather than being printed, because this crate's commands each own
-    /// their own report and a warning printed here would land outside the
-    /// `--json` document.
+    /// Read sources, materialise the schema, check every key; warnings are returned, not printed.
     pub fn open(
         program: &Program,
         resolved: &Resolved,
@@ -141,9 +107,6 @@ impl Configuration {
         ))
     }
 
-    /// Whether this run opened any source at all. A hermetic run did not, and
-    /// says so rather than printing a block of zeroes that reads like a run that
-    /// was configured with nothing.
     pub fn is_opened(&self) -> bool {
         self.snapshot.has_spec()
             || self.snapshot.environment > 0
@@ -152,11 +115,6 @@ impl Configuration {
     }
 
     /// The `configuration` block of `ply hosts --host`.
-    ///
-    /// Three lines, and every number in them is a fact the run already holds:
-    /// the source counts are the snapshot's own, the schema line is the
-    /// materialised spec, and the keys line is the resolution. Nothing is
-    /// computed for the report.
     pub fn lines(&self) -> Vec<String> {
         let counts = self.snapshot.counts();
         let mut lines = vec![format!(
@@ -219,11 +177,7 @@ impl Configuration {
         parts.join(" · ")
     }
 
-    /// The `--json` object.
-    ///
-    /// The **keys and their sources** are here and a secret's value is not: an
-    /// operator debugging "it used the wrong credential" needs to know which
-    /// source won, and that is metadata rather than the value.
+    /// The `--json` object: keys and their sources, never a secret's value.
     pub fn to_json(&self) -> Json {
         let counts = self.snapshot.counts();
         json!({
@@ -250,23 +204,12 @@ impl Configuration {
         })
     }
 
-    /// Whether this configuration is part of what a CI check pins.
-    ///
-    /// Only a named `--config-schema` is. A run under `--host` always reads the
-    /// process environment, so a digest that moved because a block *existed*
-    /// would move on every `--host` run of every W4 program — and the one line a
-    /// CI check pins may not depend on whether `--host` was passed.
+    /// Only a named schema is pinned, so the digest does not depend on whether `--host` was passed.
     pub fn is_pinned(&self) -> bool {
         self.schema.is_some()
     }
 
-    /// What the trusted-computing-base digest covers: the schema function's
-    /// name, and every key's name and shape.
-    ///
-    /// Deliberately **not** the resolved values, the number of environment
-    /// variables, or which source won. Those are a deployment's own
-    /// configuration, and a digest that moved when a region changed would be a
-    /// digest CI learns to ignore.
+    /// The schema function's name and every key's name and shape; never values or sources.
     pub fn digest_into(&self, write: &mut dyn FnMut(&str)) {
         let Some(view) = &self.schema else {
             return;
@@ -279,23 +222,13 @@ impl Configuration {
     }
 }
 
-// --- `--config-schema` ------------------------------------------------------
-
-/// Resolving `--config-schema <module>.<fn>` against the program, and reading
-/// the value it returns.
-///
-/// A configuration schema is a value, exactly as a database schema is: there is
-/// no separate schema file, no format to learn and nothing that can disagree
-/// with the program, because the program is where it is written.
+/// Resolving `--config-schema <module>.<fn>` against the program and reading its value.
 pub mod schema {
     use super::*;
 
-    /// The type a `--config-schema` function must return, by simple name.
-    /// Matched on the tail rather than on the whole program-wide name so that a
-    /// project aliasing `std.config` still resolves.
+    /// Matched on the name's tail so a project aliasing `std.config` still resolves.
     const SPEC_TYPE: &str = "ConfigSpec";
 
-    /// The one field the pinned `ConfigSpec` record has.
     const KEYS: &str = "keys";
 
     /// `<module>.<fn>`, before any program is in hand.
@@ -320,13 +253,7 @@ pub mod schema {
         .note("write the program-wide name of the function, as `ply hash` prints it"))
     }
 
-    /// The definition `--config-schema` names, checked to be one a schema can be
-    /// materialised from.
-    ///
-    /// Every refusal lists the candidates, because the fix is a different
-    /// argument rather than an edit to the program, and an operator who mistyped
-    /// a module prefix should not have to run a second command to find out what
-    /// they meant.
+    /// The definition `--config-schema` names, checked to be one a schema can be materialised from.
     pub fn resolve<'a>(check: &'a CheckOutput, name: &str) -> Result<&'a Symbol, Diagnostic> {
         let Some((symbol, def)) = check.defs.iter().find(|(key, _)| key.as_str() == name) else {
             return Err(unknown(check, name));
@@ -366,12 +293,7 @@ pub mod schema {
         Ok(symbol)
     }
 
-    /// Resolve, evaluate and decode.
-    ///
-    /// Unlike `--db-schema`, a failure to *evaluate* is a refusal rather than an
-    /// absent count: this value decides which keys are required and which are
-    /// credentials, so a run that could not compute it does not know whether it
-    /// is configured.
+    /// Resolve, evaluate and decode; unlike `--db-schema`, an evaluation failure is a refusal.
     pub fn materialise(
         program: &Program,
         resolved: &Resolved,
@@ -384,9 +306,6 @@ pub mod schema {
             .values()
             .find(|d| d.name.as_str() == name)
             .ok_or_else(|| unknown(check, name))?;
-        // A schema function is checked pure and first-order above (its footprint must be empty),
-        // and reading a const the tooling needs before anything is bound is exactly what the pure
-        // applier is for (ADR 0048) — no compiled tier to stand up for one nullary call.
         let value = ply_eval::interp::Pure::new(program, resolved)
             .call(name, Vec::new(), def.span, 10_000)
             .map_err(|failure| {
@@ -400,12 +319,7 @@ pub mod schema {
         spec_of(&value, name)
     }
 
-    /// `{ keys: List<Key> }`, structurally.
-    ///
-    /// The type checker already accepted the return type; what is checked here
-    /// is that the *value* has the fields the resolution reads, because a
-    /// `ConfigSpec` that decoded partially would silently drop a required key
-    /// and turn `E0441` into the `None` at first use it exists to prevent.
+    /// `{ keys: List<Key> }`, checked on the value: a partial decode would drop a required key.
     pub fn spec_of(value: &ply_eval::Value, name: &str) -> Result<Spec, Diagnostic> {
         use ply_eval::Value;
         let Value::Record(fields) = value else {
@@ -471,11 +385,7 @@ pub mod schema {
         })
     }
 
-    /// `ConfigSpec` is `{ keys: List<Key> }`, and a record type alias is
-    /// **expanded** by inference — so by the time a signature is in hand there is
-    /// no name left to match on and the check has to be structural. The nominal
-    /// arm stays for a `ConfigSpec` that is an ADT or an opaque constructor
-    /// rather than a record.
+    /// Structural, because inference expands the `ConfigSpec` record alias away.
     fn returns_spec(ret: &Type) -> bool {
         match ret {
             Type::Con(name, args) if args.is_empty() => name

@@ -2,8 +2,6 @@ use ply_eval::host::{Determinism, Linearity, Pending};
 use ply_host::{Host, registry};
 use ply_span::codes;
 
-/// The listing is the artifact this milestone exists to produce, so a change to it must be a
-/// change someone made on purpose.
 #[test]
 fn the_trusted_computing_base_declares_everything_it_must() {
     let registry = registry();
@@ -25,8 +23,7 @@ fn the_trusted_computing_base_declares_everything_it_must() {
     }
 }
 
-/// `Repeatable` is a claim that replaying the operation changes nothing outside the program,
-/// and it is the one column that silently re-opens multi-shot resumption over the boundary.
+/// `Repeatable` is the one column that silently re-opens multi-shot resumption over the boundary.
 #[test]
 fn every_repeatable_operation_is_one_that_was_argued_for() {
     let repeatable: Vec<String> = registry()

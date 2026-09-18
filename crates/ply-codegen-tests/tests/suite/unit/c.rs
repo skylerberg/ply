@@ -1,5 +1,3 @@
-//! What the emitted C must agree with, checked rather than commented.
-
 mod cache;
 mod sweep;
 mod toolchain;
@@ -7,8 +5,7 @@ mod upgrade;
 
 use ply_codegen::c::{HELPERS, Native, PRELUDE, compile_and_load, helper_addresses, runtime_decls};
 
-/// Every helper the prelude declares has an address, and the two tables are the same length: a
-/// declaration with no address is a null call at run time, which is a crash rather than a decline.
+/// A declaration with no address is a null call at run time: a crash rather than a decline.
 #[test]
 fn every_declared_helper_has_an_address() {
     let addrs = helper_addresses();
@@ -18,8 +15,6 @@ fn every_declared_helper_has_an_address() {
     }
 }
 
-/// The layouts the prelude mirrors, against the Rust they mirror. A header that drifts is a wrong
-/// answer, not a slow one.
 #[test]
 fn the_prelude_agrees_with_the_layouts_it_mirrors() {
     assert_eq!(ply_codegen::heap::HEADER, 16, "PLY_HEADER");
@@ -43,7 +38,6 @@ fn the_prelude_agrees_with_the_layouts_it_mirrors() {
     assert!(PRELUDE.contains("#define PLY_HEADER 16"));
 }
 
-/// The whole pipeline, on the smallest unit there is: emit, compile, load, bind, call.
 #[test]
 fn a_unit_compiles_loads_binds_and_answers() {
     let mut src = String::from(PRELUDE);
@@ -58,8 +52,7 @@ Word ply_probe(PlyCtx *ctx, const Word *args) {
     );
     let lib = match compile_and_load(&src, "probe") {
         Ok(l) => l,
-        // A machine with no C compiler is a machine this tier is not for; the test says so
-        // rather than failing the suite for everyone.
+        // A machine with no C compiler is not one this tier is for.
         Err(e) if e.to_string().contains("could not run") => return,
         Err(e) => panic!("{e}"),
     };
@@ -77,7 +70,6 @@ Word ply_probe(PlyCtx *ctx, const Word *args) {
     assert_eq!(ply_codegen::heap::imm_value(answer), 42);
 }
 
-/// The whole tier on a real program: emit, compile, load, and answer what the interpreter answers.
 #[test]
 fn the_tier_answers_what_the_interpreter_answers() {
     let source = r#"
@@ -123,19 +115,7 @@ pub fn shaped(n: Int) -> Int = { let r = {x: n, y: n + 1}; r.x * 10 + r.y }
     let _ = loaded;
 }
 
-/// Process-wide state a build reads or writes, which a test binary shares between its threads.
-///
-/// Two kinds. `PLY_C_CACHE` and `PLY_C_SKIP` are read from the environment on whichever thread
-/// reaches them -- rayon workers included -- so a test that changes one changes it under every
-/// build running beside it. `cache::UNITS_REUSED` is a counter every build adds to, so a test
-/// that reads it before and after its own build is measuring the whole binary.
-///
-/// Under `cargo nextest` neither can bite, because each test is its own process; under
-/// `cargo test` every test in this binary shares one, and both did -- a build picked up another
-/// test's cache directory and failed to `dlopen` what it had just written.
-///
-/// So: a test that changes the environment, or counts what a build did, takes [`CONFIG`] for
-/// writing; every other build here takes it for reading.
+/// `PLY_C_CACHE`, `PLY_C_SKIP` and `cache::UNITS_REUSED` are process-wide: a test that changes or counts them takes this for writing, every other build for reading.
 static CONFIG: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 pub mod tests_support {
@@ -148,11 +128,7 @@ pub mod tests_support {
         with_refusals(text).map(|(s, n, _)| (s, n))
     }
 
-    /// The same, with a key per definition so the emit cache is live.
-    ///
-    /// The key has to move when the text does. A name alone is stable and distinct, which is all
-    /// the cache asks of the *shape* of a key, but two tests that both define `m.f` would then
-    /// share an entry and the second would be served the first one's C.
+    /// Keyed on the text, not the name: two tests defining `m.f` would otherwise share an emit-cache entry.
     pub fn keyed(text: &str) -> Option<&'static Source> {
         let mut sources = ply_span::SourceMap::new();
         let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
@@ -214,7 +190,6 @@ pub mod tests_support {
         }
     }
 
-    /// What the interpreter answers, which is the oracle the tier is held to.
     pub fn interpreted(
         source: &'static Source,
         name: &str,
@@ -233,7 +208,6 @@ pub mod tests_support {
     }
 }
 
-/// The tier answers what the interpreter answers over widths, loops, bytes, shifts and matches.
 #[test]
 fn the_tier_agrees_with_the_interpreter() {
     let source = r#"
@@ -271,10 +245,7 @@ pub fn looped(n: Int) -> Int =
         ("m.mixed", vec![ply_eval::Value::Int(0xDEAD_BEEF)]),
         ("m.mixed", vec![ply_eval::Value::Int(0)]),
         ("m.counted", vec![ply_eval::Value::Int(40)]),
-        // A record built at one site but *described* once per iteration. The tier holds such a
-        // record back and builds it on demand, and the build has to describe a new one each time
-        // round -- reusing the first iteration's object is a wrong answer, not a crash, and it
-        // takes an input long enough to loop before anything notices.
+        // Built at one site but described once per iteration: reusing the first iteration's object is a wrong answer, not a crash.
         ("m.looped", vec![ply_eval::Value::Int(1)]),
         ("m.looped", vec![ply_eval::Value::Int(7)]),
         (
@@ -312,12 +283,7 @@ pub fn looped(n: Int) -> Int =
     }
 }
 
-/// A `U64` past `2^62` is not an immediate: tagging one eats its top bit, so `carried` stops
-/// below sixty-four and a value of the two widths past it is held as the machine's own value. An
-/// operator over one reaches the machine's operator through the runtime rather than a register,
-/// and the property is that the answer is the machine's -- a tier that emits a body it cannot get
-/// right is worse than one that declines it, because the seam has an interpreter behind it and no
-/// way to know it is needed.
+/// A `U64` past `2^62` is not an immediate (tagging eats its top bit), so it is held as the machine's own value.
 #[test]
 fn a_width_the_tier_cannot_carry_in_a_register_still_answers_what_the_machine_answers() {
     let source = r#"
@@ -335,8 +301,7 @@ pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 265443576
         let entry: ply_codegen::rt::Entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
-        // `-7` is the machine raising -- `u64_of_int` refuses a negative -- and the tier has to
-        // raise with it rather than answer.
+        // `-7` makes the machine raise (`u64_of_int` refuses a negative), and the tier has to raise with it.
         for n in [0i64, 1, 12_345, 1 << 40, -7] {
             let want = tests_support::interpreted(loaded, name, &[ply_eval::Value::Int(n)]);
             let mut ctx = native.context();
@@ -365,7 +330,6 @@ pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 265443576
     }
 }
 
-/// Which shape loses a counted field. Each is one step of a parser's state handling.
 #[test]
 fn a_record_with_a_counted_field_survives_being_rebuilt() {
     for (which, body) in [
@@ -423,12 +387,7 @@ fn noted(p: P, x: Int) -> P = {{ pos: p.pos, depth: p.depth, diags: push(p.diags
     }
 }
 
-/// Two definitions that say exactly the same thing are one content hash, and an emitted body
-/// carries its own name -- so a cache keyed on the hash alone serves one body for both and the
-/// unit holds two definitions of one symbol and none of the other.
-///
-/// `crates/ply-compiler/ply/lexer.ply` has that pair (`hex1` and `hex2`) and the C compiler is what
-/// noticed. This is the five-line version, and it fails without the name in the key.
+/// An emitted body carries its own name, so a cache keyed on the content hash alone would serve one body for both.
 #[test]
 fn two_definitions_that_say_the_same_thing_get_their_own_bodies() {
     let source = r#"
@@ -442,13 +401,7 @@ pub fn two(b: Bytes, i: Int) -> Int = bytes_at(b, i) + 1
     assert!(native.entry("m.two").is_some(), "`two` has no body");
 }
 
-/// A constructor a *program* declares, rather than one the prelude does.
-///
-/// The unit interns a user constructor under the program-wide name its module qualifies it with,
-/// and a body names it bare, so nothing but the resolver stands between the two. Reading the
-/// table with the bare symbol found only the prelude's, so every `type` a program declared was
-/// refused -- and the fixpoint then refused each of that body's callers in turn, which is most of
-/// why this tier took 295 of the front end's 1400 definitions and not why you would guess.
+/// A user constructor is interned under its module-qualified name, while a body names it bare.
 #[test]
 fn a_constructor_a_program_declares_is_built_and_matched_like_a_preludes() {
     let source = r#"
@@ -498,20 +451,7 @@ pub fn named(b: Bytes) -> Int = code(TName(b))
     }
 }
 
-/// A list read after a fold over it, and a closure called through a value.
-///
-/// Two defects met here, and both were silent in every workload smaller than the self-hosted
-/// front end.
-///
-/// `rt_dec` is `Heap::release_last`: it frees *unconditionally*, because it is the `rc == 1` case
-/// its caller has already established. The in-process tier establishes it — it emits the count
-/// test and calls the helper only on the branch where the count is one. This tier called it bare
-/// at all five of its release sites, so a release freed the object whatever else was holding it.
-/// The `debug_assert` that says so is compiled out of the profile the suite runs.
-///
-/// And `fused_fold` released a count it had never taken, so a caller that read the list again was
-/// reading freed memory even once the release itself was guarded. `fold(xs, 0, add) + len(xs)` is
-/// the whole reproduction; it had been wrong since this tier's first commit.
+/// `rt_dec` frees unconditionally (the `rc == 1` case), and its `debug_assert` is compiled out of the suite's profile.
 #[test]
 fn a_list_survives_a_fold_over_it_and_a_closure_survives_being_called() {
     let source = r#"
@@ -570,15 +510,7 @@ pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
     }
 }
 
-/// A run that compiles fewer definitions must not poison the next one that compiles more.
-///
-/// A refusal is cached, so a definition this tier will not take is not asked for again every run.
-/// It is keyed on the digest of what was *offered*, because a body is refused when something it
-/// calls was not — so the two have to be the same set. They were not: the instruments that narrow
-/// the offered set filtered it after the digest was taken, so a narrowed run's refusals were
-/// served back to an unfiltered one. The unit that came out had bodies compiled against a program
-/// that never existed, and it segfaulted rather than answering wrongly, which is the only lucky
-/// thing about it.
+/// Refusals are cached by the digest of the offered set, so the digest must be taken after any filter narrows it.
 #[test]
 fn a_narrower_run_does_not_poison_a_wider_one() {
     let source = r#"
@@ -589,8 +521,7 @@ pub fn alone(n: Int) -> Int = twice(n)
 "#;
     let dir = std::env::temp_dir().join(format!("ply-c-poison-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    // The whole test holds `CONFIG` for writing: this run needs a cache of its own, and the
-    // variable that gives it one is read by every build in the process.
+    // `CONFIG` for writing: this run needs its own cache, and every build in the process reads that variable.
     let _config = CONFIG.write().unwrap_or_else(|e| e.into_inner());
     let restore = std::env::var("PLY_C_CACHE").ok();
     unsafe { std::env::set_var("PLY_C_CACHE", &dir) };
@@ -615,9 +546,7 @@ pub fn alone(n: Int) -> Int = twice(n)
     assert_eq!(answer(&wide, "m.both", 5), Some(25));
     drop(wide);
 
-    // The same offered set, narrowed by the instrument rather than by the caller. This is the
-    // path the digest has to follow: `names` is unchanged, so a digest taken before the filter is
-    // the same digest, and the refusals below land under the wider run's key.
+    // Narrowed by the instrument: `names` is unchanged, so a digest taken before the filter would be the wider run's key.
     unsafe { std::env::set_var("PLY_C_SKIP", "m.thrice") };
     let (narrowed, refused) = ply_codegen::c::build(loaded, &all).expect("builds");
     assert!(
@@ -628,7 +557,6 @@ pub fn alone(n: Int) -> Int = twice(n)
     drop(narrowed);
 
     unsafe { std::env::remove_var("PLY_C_SKIP") };
-    // The one that used to come back wrong.
     let (again, refused) = ply_codegen::c::build(loaded, &all).expect("builds");
     assert!(
         refused.is_empty(),
@@ -636,8 +564,7 @@ pub fn alone(n: Int) -> Int = twice(n)
     );
     assert_eq!(answer(&again, "m.both", 5), Some(25));
     let _ = std::fs::remove_dir_all(&dir);
-    // Put the shared cache back before the write lock goes, so the builds waiting on it read the
-    // directory the rest of this binary uses.
+    // Restore the shared cache before the write lock goes, so the builds waiting on it read the usual directory.
     unsafe {
         match &restore {
             Some(had) => std::env::set_var("PLY_C_CACHE", had),
@@ -646,22 +573,7 @@ pub fn alone(n: Int) -> Int = twice(n)
     }
 }
 
-/// A unit built once is put back together, not built again.
-///
-/// Every worker used to rebuild it: reading each cached body, substituting its placeholders and
-/// assembling the whole translation unit, only to hand it to an object cache that already had the
-/// answer. Sharing the built unit in process is not open to this tier -- `ply_eval::Value` holds
-/// `Rc`, so nothing containing one crosses a rayon worker -- so it goes through the file system,
-/// and this is the property that has to hold when it does: the second build answers what the
-/// first one did.
-///
-/// The shapes are the part to distrust. Their ids are baked into the emitted C as numbers, so a
-/// unit read back has to intern them in the order it recorded them or the C reads the wrong field
-/// of the wrong record. `finish` refuses a unit whose ids come back different rather than guessing.
-///
-/// The nonce is what makes the first build a miss: the unit key is a function of every offered
-/// definition's hash, so a body no previous run has seen has no entry waiting for it. Without it
-/// this test would pass on its second-ever run without exercising the write path at all.
+/// Shape ids are baked into the C, so a unit read back must intern them in recorded order; the nonce makes the first build a miss.
 #[test]
 fn a_unit_read_back_from_the_cache_answers_what_it_answered_when_built() {
     let nonce = std::time::SystemTime::now()
@@ -732,20 +644,7 @@ pub fn tagged(n: Int) -> Int = label(if n > 0 {{ TB(n) }} else {{ TA }})
     );
 }
 
-/// A pure nullary root that answers a handle is asked once, not once per call.
-///
-/// The in-process tier has always done this: `rt_constant` runs the root, remembers the word, and
-/// answers it from then on. This tier declared the helper, bound it, and never emitted it -- so a
-/// two-hundred-and-fifty-six-element list built inside a twenty-thousand-iteration fold cost 56ms
-/// here against 0.1ms in process. Not worse code; the same code, run twenty thousand more times.
-///
-/// The memo is the observable, and it is the right one to assert on rather than a clock: without
-/// the emitted `rt_constant` the compiled body calls the root directly and the slot stays empty
-/// however long the run takes.
-///
-/// The slot is also a row of the unit's code table, which is what `rt_constant` calls through. Two
-/// numberings here would be a value remembered by the seam that compiled code cannot see, and the
-/// index this tier handed the seam was not a row of that table until the helper was emitted.
+/// Asserted on the memo, not a clock: without the emitted `rt_constant` the slot stays empty however long the run takes.
 #[test]
 fn a_pure_nullary_root_that_answers_a_handle_is_asked_once() {
     let source = r#"
@@ -781,18 +680,7 @@ pub fn probe(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, _x: Int| acc + len
     let _ = loaded;
 }
 
-/// Reading the accumulator more than once costs no allocations.
-///
-/// The rule that lets a record go is guarded on the base being read exactly once, because the
-/// emitter does not visit reads in the order the lowering marked them and two attempts to relax
-/// that guard by counting freed a record something later read. Every accumulator this tier
-/// compiles reads its record more than once -- `{..s, count: s.count + 1}` is two -- so the guard
-/// meant the record was never let go at all, and a fold allocated one per iteration and kept it.
-///
-/// The exception is position rather than counting: at the body's tail nothing is emitted after the
-/// update, so the later read the guard protects cannot be there to protect. This is what says so.
-/// `wide` and `narrow` differ only in how many times they read `s`, and on the old rule `wide`
-/// allocated one five-word record per iteration that `narrow` did not.
+/// At the body's tail nothing follows the update, so the read-once guard need not hold there; `wide` and `narrow` differ only in reads of `s`.
 #[test]
 fn an_accumulator_read_more_than_once_is_still_let_go() {
     let source = r#"
@@ -828,18 +716,7 @@ pub fn with_wide(n: Int) -> Int = fold(range(0, n), {i: 0, tag: b"z"}, wide).i
     let _ = loaded;
 }
 
-/// A temporary a body makes and hands on is counted once, not twice.
-///
-/// Every runtime helper that answers a word answers an **owned** one: `rt_ctor` allocates,
-/// `rt_field` increments what it reads out, `rt_concat` builds a new string, and each releases the
-/// word arguments it was given -- which is what the duplicate on the way *in* is for. The emitter
-/// took a second count at every use of such an answer, so `f(g(x))` counted `g`'s answer once for
-/// `f` and once for nobody, and the second one was never released.
-///
-/// Asserted on the emitted text because that is where the property lives and nothing downstream
-/// can see it: a doubled count is not a wrong answer, it is an object that cannot die. `wrap`
-/// makes one word with a helper and hands it straight to another, so a correct emit takes no count
-/// at all -- and the version this replaces took exactly one.
+/// Asserted on the emitted text: a doubled count is not a wrong answer but an object that cannot die.
 #[test]
 fn a_helper_answer_handed_to_a_helper_is_not_counted_again() {
     let source = r#"

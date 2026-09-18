@@ -1,5 +1,3 @@
-//! An adversarial audit of the defect/program-error split, through the binary.
-
 use assert_cmd::Command;
 use serde_json::Value;
 use std::path::Path;
@@ -31,7 +29,6 @@ fn json_of(output: &std::process::Output) -> Value {
         .unwrap_or_else(|e| panic!("stdout was not one JSON object: {e}\n---\n{text}\n---"))
 }
 
-/// One `--json` run, and the single failure it must have produced.
 fn sole_failure(dir: &TempDir) -> Value {
     let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
     let v = json_of(&out);
@@ -47,8 +44,6 @@ fn sole_failure(dir: &TempDir) -> Value {
     failure
 }
 
-/// The whole claim, in one place: the program is at fault, the run says so, and nothing about the
-/// failure took bisection off the table.
 fn assert_program_error(failure: &Value, what: &str) {
     assert_eq!(
         failure["defect"], false,
@@ -67,8 +62,6 @@ fn assert_program_error(failure: &Value, what: &str) {
         "{what} must not have bisection suppressed as a Ply defect: {failure}"
     );
 }
-
-// --- every language-defined runtime failure is the program's ----------------
 
 fn every_language_defined_runtime_failure_is_a_program_error(index: usize, of: usize) {
     let cases: &[(&str, &str, &str)] = &[
@@ -128,8 +121,7 @@ fn every_language_defined_runtime_failure_is_a_program_error(index: usize, of: u
             "assertion failed",
         ),
         (
-            // One argument written, two passed: `message` defaults to `None` and
-            // `ply_syntax::defaults` splices it in before this runs.
+            // One argument written, two passed: `ply_syntax::defaults` splices in `message`'s `None`.
             "a failing assert",
             "fn no() -> Bool = false\n\
              test \"holds\" { assert(no()) }\n",
@@ -149,8 +141,7 @@ fn every_language_defined_runtime_failure_is_a_program_error(index: usize, of: u
         ),
     ];
 
-    // One round-robin part of the table per test: each case runs the binary to a resource
-    // limit, and CI's partitions are bounded by their slowest single test.
+    // Round-robin parts: each case runs the binary to a resource limit, and CI partitions are bounded by their slowest test.
     for (what, source, needle) in cases.iter().skip(index).step_by(of) {
         let dir = project(source);
         let failure = sole_failure(&dir);
@@ -180,7 +171,6 @@ fn every_language_defined_runtime_failure_is_a_program_error_part_3_of_3() {
     every_language_defined_runtime_failure_is_a_program_error(2, 3);
 }
 
-/// A clause body is ordinary code that happens to run under a `handle`.
 #[test]
 fn a_failure_inside_a_handler_clause_body_is_still_the_programs() {
     let cases: &[(&str, &str)] = &[
@@ -213,7 +203,6 @@ fn a_failure_inside_a_handler_clause_body_is_still_the_programs() {
     }
 }
 
-/// Both engines and the audit that runs them together classify a resource limit the same way.
 #[test]
 fn the_recursion_limit_is_a_program_error() {
     const RUNAWAY: &str = "fn spin(n: Int) -> Int = spin(n + 1)\n\
@@ -233,10 +222,7 @@ fn the_recursion_limit_is_a_program_error() {
     );
 }
 
-// --- the consequence: these failures are actually bisected ------------------
-
-/// Two independent edits, one benign; only *running* a mixture can say which one caused the
-/// failure.
+/// Two independent edits, one benign: only running a mixture can say which caused the failure.
 fn assert_bisected_to(dir: &TempDir, culprit: &str, innocent: &str) {
     let v = json_of(&ply(dir.path()).args(["test", "--json"]).output().unwrap());
     let failure = &v["failures"][0];
@@ -326,8 +312,6 @@ fn report(n: Int) -> Int = area(pick(shift(n)))
 test \"the picked shape has an area\" { assert_eq(report(0), 3) }
 ";
 
-/// A `match` that stops covering a case is a *compile* error — see
-/// `a_match_that_stops_being_exhaustive_never_reaches_the_runner`.
 #[test]
 fn a_pattern_that_stops_matching_is_bisected_to_the_culprit() {
     let dir = project(MATCHING);
@@ -344,8 +328,6 @@ fn a_pattern_that_stops_matching_is_bisected_to_the_culprit() {
     assert_bisected_to(&dir, "m.pick", "m.shift");
 }
 
-/// Exhaustiveness is decided statically, so an edit that drops an arm never produces a red test to
-/// bisect: `ply test` exits 2 with `E0205` and runs nothing.
 #[test]
 fn a_match_that_stops_being_exhaustive_never_reaches_the_runner() {
     const EXHAUSTIVE: &str = "\
@@ -372,8 +354,6 @@ test \"the picked shape has an area\" { assert_eq(area(pick(1)), 1) }
     );
 }
 
-/// A recursion limit used to set `defect`, and `defect` is per failure — but a reader who has only
-/// ever seen it in a one-test project cannot tell a per-failure flag from a per-run one.
 #[test]
 fn a_runaway_recursion_costs_a_sibling_failure_nothing() {
     const BOTH: &str = "\
@@ -409,8 +389,7 @@ test \"step bottoms out\" { assert_eq(step(3), 0) }
     }
 }
 
-/// `test/nondet` is the one skip that outranks having a perfectly good baseline: its outcome is not
-/// a function of the definition set, so a mixture's answer would be evidence about nothing.
+/// A nondet outcome is not a function of the definition set, so a mixture's answer would be evidence about nothing.
 #[test]
 fn a_nondet_test_that_hits_a_runtime_limit_is_skipped_as_nondet() {
     let dir = project(
@@ -423,8 +402,6 @@ fn a_nondet_test_that_hits_a_runtime_limit_is_skipped_as_nondet() {
     assert_eq!(failure["culprit"]["skipped"], "nondet", "{failure}");
 }
 
-/// `--bisect never` is the only skip that says nothing about the failure, so it has to win over
-/// every other reason — including a runtime limit, which no longer has a reason of its own.
 #[test]
 fn bisect_never_outranks_the_reason_a_runtime_limit_would_have_given() {
     let dir = project(RECURSION);
@@ -444,7 +421,6 @@ fn bisect_never_outranks_the_reason_a_runtime_limit_would_have_given() {
     assert_eq!(v["failures"][0]["defect"], false, "{}", v["failures"][0]);
 }
 
-/// A first-ever red test has no earlier definition set, whatever it failed with.
 #[test]
 fn a_first_ever_runtime_limit_is_skipped_as_never_passed() {
     let dir = project(
@@ -460,9 +436,7 @@ fn a_first_ever_runtime_limit_is_skipped_as_never_passed() {
     );
 }
 
-/// `no_bodies` is "go and stop pruning" and `no_hybrids` is "this build cannot do it at all" — a
-/// consumer acts on them differently, so a cache with its body store removed must produce the first
-/// and not the second.
+/// `no_bodies` means "stop pruning" and `no_hybrids` "this build cannot"; a consumer acts on them differently.
 #[test]
 fn a_pruned_body_store_says_no_bodies_and_not_no_hybrids() {
     let dir = project(RECURSION);
@@ -492,9 +466,6 @@ fn a_pruned_body_store_says_no_bodies_and_not_no_hybrids() {
     );
 }
 
-// --- a user program may never abort the process ------------------------------
-
-/// **A legal program used to kill the run.**
 #[test]
 fn a_value_the_call_limit_permits_is_compared_rather_than_aborting_the_run() {
     let dir = project(
@@ -510,8 +481,7 @@ fn a_value_the_call_limit_permits_is_compared_rather_than_aborting_the_run() {
     assert_eq!(v["summary"]["passed"], 2, "{v}");
 }
 
-/// Past the bound the answer is a diagnostic, not an abort — and the bound is only reachable by
-/// *iteration*, since a value built by recursion is at most as deep as the recursion that built it.
+/// Only reachable by iteration: a value built by recursion is at most as deep as the recursion that built it.
 #[test]
 fn a_value_deeper_than_the_bound_is_an_ordinary_program_error() {
     const DEEP: &str = "\
@@ -540,8 +510,7 @@ test \"deep values compare\" { assert_eq(stack(20000), stack(20000)) }
     }
 }
 
-/// The same hole reached without any recursion in the *program*: 3,000 terms of `+` is a depth the
-/// front end checks and hashes without complaint, and `ply run` evaluates on the main thread.
+/// No recursion in the program: 3,000 terms of `+`, which `ply run` evaluates on the main thread.
 #[test]
 fn a_deeply_nested_expression_runs_rather_than_aborting_the_run() {
     let mut source = String::from("fn deep() -> Int = 1");

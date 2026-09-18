@@ -1,5 +1,3 @@
-//! What a trace operation costs when nothing is collecting, exactly.
-
 use ply_eval::host::{
     HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostRuntime, MachineId, Pending,
 };
@@ -64,10 +62,9 @@ impl HostRuntime for NoRuntime {
     }
 }
 
-/// The same handlers a bound run calls, over the same declarations `ply hosts` prints.
 struct Bench {
     handlers: Vec<(HostOp, Arc<dyn HostHandler>)>,
-    /// The resolved atom, built **once**.
+    /// Built once, outside the measurement.
     atom: EffectAtom,
     trace: Arc<Trace>,
     clock: Arc<CountedClock>,
@@ -157,7 +154,6 @@ fn fields() -> Value {
 
 const EVENTS: usize = 1_000;
 
-/// The headline number: a discarded event allocates nothing at all in the handler.
 #[test]
 fn a_discarded_event_allocates_nothing_and_reads_no_clock() {
     let b = bench(Arc::new(Discard), "orders");
@@ -166,8 +162,7 @@ fn a_discarded_event_allocates_nothing_and_reads_no_clock() {
     let fields = fields();
     let args = [level, name, fields];
 
-    // Warm: the first call through a `dyn` handler may fault in a page, and what is being measured
-    // is the steady state a request path is in.
+    // Warm: a first call through `dyn` may fault in a page; the steady state is what is measured.
     for _ in 0..16 {
         b.perform(Op::Event, &args).expect("discarded");
     }
@@ -190,8 +185,6 @@ fn a_discarded_event_allocates_nothing_and_reads_no_clock() {
     assert_eq!(b.trace.counts().events, 0);
 }
 
-/// The same for a metric, because a counter incremented per request is the operation a service
-/// performs most.
 #[test]
 fn a_discarded_metric_allocates_nothing() {
     let b = bench(Arc::new(Discard), "orders");
@@ -207,9 +200,7 @@ fn a_discarded_metric_allocates_nothing() {
     assert_eq!(allocs, 0, "a discarded counter cost {allocs} allocations");
 }
 
-/// A level filter is the sink's, so it saves everything a discard saves — and **not** the perform
-/// or the call site's map, which is the honest half of the claim and is why this asserts the clock
-/// rather than the wall clock.
+/// The perform and the call site's map are still paid, so this asserts clock reads, not wall time.
 #[test]
 fn a_debug_event_under_a_warn_filter_costs_what_a_discarded_one_costs() {
     let b = bench(Arc::new(Json::new(Level::Warn)), "orders");
@@ -233,9 +224,7 @@ fn a_debug_event_under_a_warn_filter_costs_what_a_discarded_one_costs() {
     );
 }
 
-/// A span under `discard` is not free, and this is the number rather than a reassurance: the stack
-/// entry and the `Span` record the operation's *type* requires are what it costs, and neither is
-/// the sink's to avoid.
+/// It costs the stack entry and the `Span` the operation's type requires; neither is the sink's.
 #[test]
 fn a_discarded_span_costs_only_the_stack_entry_and_the_span_it_must_answer() {
     let b = bench(Arc::new(Discard), "http");
@@ -274,9 +263,7 @@ fn a_discarded_span_costs_only_the_stack_entry_and_the_span_it_must_answer() {
     assert_eq!(b.trace.open_spans(), 0, "every span was closed");
 }
 
-/// The other end of the ratio, so the disabled number has something to be read against: a
-/// *collected* event decodes its name and every field, which is what a run pays when it has asked
-/// for the records.
+/// The collected cost, for the discarded ones to be read against.
 #[test]
 fn a_collected_event_pays_for_the_record_it_asked_for() {
     let sink = Arc::new(ply_host::trace::sink::Recording::new(Level::Debug));
@@ -297,7 +284,6 @@ fn a_collected_event_pays_for_the_record_it_asked_for() {
         "a collected event that allocated nothing would mean nothing was collected"
     );
     assert_eq!(sink.records().len(), COLLECTED + 16);
-    // The number this file exists to publish.
     println!("  discarded event   0 allocations · 0 clock reads");
     println!("  collected event   {per_event:.1} allocations · 1 clock read");
 }

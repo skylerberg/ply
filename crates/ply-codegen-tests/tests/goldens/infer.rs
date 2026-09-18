@@ -1,13 +1,3 @@
-//! The fourth comparison: `infer.ply`'s check of a whole program — every definition's scheme,
-//! footprint and constraints, every test's and law's footprint, every effect and constructor, or
-//! the diagnostics — against a blessed golden, over the standard library, the standard
-//! library with each example, the programs the resolve comparison reads and the reference
-//! checker's own inputs; and the same through the restored path, each program checked from what
-//! its own first check published.
-//!
-//! The port is entered in-process through `port`: the bundle the binary carries is the compiler
-//! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
-
 use crate::harness::{bundle, fixtures, golden, own, part, port, programs, records, repo_root};
 use std::path::PathBuf;
 
@@ -79,8 +69,7 @@ fn compare(label: &str, inputs: &[(String, Vec<(String, String)>)]) {
     compare_through("infer.check_dump", label, inputs, |d, _| d);
 }
 
-/// The same, through the restored path: each program checked from what its own first check
-/// published.
+/// Each program checked from what its own first check published.
 fn compare_known(label: &str, inputs: &[(String, Vec<(String, String)>)]) {
     compare_through("infer.check_dump_known", label, inputs, |d, _| d);
 }
@@ -186,8 +175,6 @@ fn the_ply_checker_matches_its_golden_on_the_resolvers_hand_written_programs() {
     compare("hand-written programs", &inputs);
 }
 
-/// The restored path: the reference and the port each check a program, hand what it published
-/// back in as `Known`, check again from those interfaces, and must publish the same thing.
 #[test]
 fn the_ply_checker_restored_from_its_own_interfaces_matches_its_golden_on_the_standard_library() {
     compare_known(
@@ -237,9 +224,6 @@ fn the_ply_checker_matches_its_golden_on_the_checkers_hand_written_programs() {
     compare("hand-written checker programs", &inputs);
 }
 
-/// The reference checker's own test inputs, each as a one-module program named `m`, the way
-/// `crates/ply-core-tests/tests/suite/unit/infer.rs` checks them. Most are error paths: this is where the port's
-/// diagnostics are compared, code by code and label by label.
 #[test]
 fn the_ply_checker_matches_its_golden_on_the_references_own_inputs() {
     let text = std::fs::read_to_string(fixtures().join("reference-checks.corpus"))

@@ -1,7 +1,6 @@
 use crate::unit::build::*;
 use ply_core::check_program;
 use ply_eval::Value;
-/// Doubles, because nothing in this workspace implements [`Compiled`].
 use ply_eval::compiled::*;
 use ply_eval::evaluator::Machine;
 use ply_eval::{Closure, ClosureKind};
@@ -17,7 +16,6 @@ use std::sync::Arc;
 
 type Reply = dyn Fn(&Symbol, &[Value], usize) -> Option<Value>;
 
-/// One call the machine offered a backend.
 #[derive(Clone, Debug, PartialEq)]
 struct Offer {
     name: Symbol,
@@ -25,7 +23,6 @@ struct Offer {
     budget: usize,
 }
 
-/// A backend that records every offer and answers by a closure the test supplies.
 struct Double {
     /// Never dereferenced.
     program: *const Program,
@@ -45,12 +42,10 @@ impl Double {
         })
     }
 
-    /// Declines everything and remembers what it was offered.
     fn declining(program: &Program) -> Rc<Double> {
         Double::over(program, |_, _, _| None)
     }
 
-    /// Answers `value` for `name` and declines everything else.
     fn answering(program: &Program, name: &str, value: Value) -> Rc<Double> {
         let wanted = Symbol::new(name);
         Double::over(program, move |asked, _, _| {
@@ -86,7 +81,6 @@ impl Compiled for Double {
     }
 }
 
-/// A program and the check output the purity gate reads.
 struct Checked {
     program: Program,
     resolved: Resolved,
@@ -116,8 +110,7 @@ impl Checked {
     }
 }
 
-/// The same thing from source, because the argument gate is now a question about *declared
-/// types* and `crate::unit::build`'s `fn_def` cannot write one.
+/// From source, because `build::fn_def` cannot write the declared types the argument gate reads.
 fn checked_source(source: &str) -> Checked {
     let mut program = ply_syntax::parse_program(vec![(
         ply_span::SourceId(0),
@@ -167,8 +160,6 @@ fn a_machine_with_no_backend_never_asks_and_never_counts() {
     assert_eq!(machine.compiled_refusals(), 0);
 }
 
-/// `hoist_staleness_audit.rs`'s hazard: a bisection builds a program whose definitions carry
-/// the names of the ones they replace.
 #[test]
 fn a_backend_built_over_another_program_is_ignored() {
     let elsewhere = checked(vec![fn_def_sig(
@@ -190,8 +181,7 @@ fn a_backend_built_over_another_program_is_ignored() {
     assert!(backend.offers().is_empty());
 }
 
-/// A `Code` closure built by hand, so [`admit`] can be asked about a body the machine would not
-/// otherwise hand it: an anonymous one, or one under a name no definition publishes.
+/// Built by hand, so [`admit`] can be asked about a body the machine would never hand it.
 fn code_closure(name: Option<&str>, params: &[&str], body: Expr) -> Closure {
     let params: Vec<Symbol> = params.iter().copied().map(Symbol::new).collect();
     let lowered = ply_eval::code::lower_fn(&params, &body);
@@ -208,8 +198,6 @@ fn code_closure(name: Option<&str>, params: &[&str], body: Expr) -> Closure {
     }
 }
 
-/// A program whose `handled` performs and discharges its own operation, and whose `wrapper`
-/// does nothing but call it.
 fn self_handled() -> Checked {
     checked(vec![
         effect_def("state", &[("get", ply_syntax::ast::Mode::Read, false)]),
@@ -249,8 +237,6 @@ fn self_handled() -> Checked {
     ])
 }
 
-/// The purity gate reads the published row, so a machine driven without a type-check pass has
-/// nothing to clear a definition with and the hook is inert.
 #[test]
 fn a_machine_with_no_check_output_offers_nothing() {
     let (program, resolved) = standalone(vec![double_def()]);
@@ -291,9 +277,7 @@ fn crossable_admits_every_leaf_kind_that_holds_no_handle_and_nothing_else() {
     }
 }
 
-/// `Cell`, `Task` and `Secret` are `Type::Con`s with a name and arguments, exactly as `Option`
-/// is, so a rule that read "any nominal type is a record or a constructor" would carry all
-/// three — and the third is a credential while the first two are handles into this run's world.
+/// `Cell`, `Task` and `Secret` are `Type::Con`s just as `Option` is, so "any nominal type" would carry them.
 #[test]
 fn a_world_handle_typed_parameter_is_refused_though_it_is_a_nominal_type() {
     let c = checked_source(
@@ -323,9 +307,6 @@ fn a_world_handle_typed_parameter_is_refused_though_it_is_a_nominal_type() {
     );
 }
 
-// 2026-08-31.
-
-/// A carried declared return type licenses one `Value` kind, not any.
 #[test]
 fn an_answer_whose_kind_is_not_its_declared_returns_is_refused_unless_it_is_childless() {
     let c = checked_source(
@@ -358,7 +339,6 @@ fn an_answer_whose_kind_is_not_its_declared_returns_is_refused_unless_it_is_chil
     );
 }
 
-/// A declared return type that can hold code is not answered for at all.
 #[test]
 fn a_closure_bearing_record_return_is_refused_however_ordinary_the_record_looks() {
     let c = checked_source(
@@ -385,8 +365,6 @@ fn a_closure_bearing_record_return_is_refused_however_ordinary_the_record_looks(
     assert!(types.signature_carried(&Symbol::new("make_plain")));
 }
 
-/// Entering a call now hides its whole subtree, and the effects gate has to hold over the
-/// subtree rather than over the entry.
 #[test]
 fn an_entered_subtree_is_refused_for_an_effect_two_hops_down_that_it_would_hide() {
     let c = self_handled();
@@ -424,9 +402,6 @@ fn an_entered_subtree_is_refused_for_an_effect_two_hops_down_that_it_would_hide(
     );
 }
 
-/// A record `Value` from a list of fields, which no helper in [`crate::unit::build`] answers because
-/// that module builds `Expr`s.
-/// A backend that holds only test roots, and ends every entry the one way it is told to.
 struct Roots {
     /// Never dereferenced.
     program: *const Program,
@@ -477,7 +452,6 @@ fn assertion_raised() -> Entered {
     Entered::Raised(Diagnostic::error(codes::RUNTIME_ERROR, "assertion failed"))
 }
 
-/// The same raise where the machine raises too is the machine's diagnostic, as before.
 #[test]
 fn a_test_root_the_backend_raised_in_keeps_the_machines_diagnostic_when_it_raises_too() {
     let c = checked(double_doubles(43));

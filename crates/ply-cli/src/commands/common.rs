@@ -5,13 +5,11 @@ use ply_span::{Diagnostic, Severity, SourceMap, Span, codes};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
-/// The gutter the specified output shape is indented by.
 pub const IND: &str = "   ";
 
 /// `--backend`'s value as a spec, or the diagnostic that refuses it.
 pub fn backend_spec(flag: Option<&String>) -> Result<Option<ply_eval::BackendSpec>, Diagnostic> {
     let Some(spec) = flag else {
-        // Tier-only: the compiled tier is the default (and only) evaluator of the language.
         return Ok(Some(ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,
             ..ply_eval::BackendSpec::default()
@@ -25,12 +23,8 @@ pub fn backend_spec(flag: Option<&String>) -> Result<Option<ply_eval::BackendSpe
     })
 }
 
-/// Fixes the toolchain the emitted C tier compiles with, before anything compiles.
-///
-/// Not part of `Engine`'s variant, and the rule for that is `Provider::variant`'s own: what
-/// belongs there is a knob that changes *which* definitions run natively. This one changes how the
-/// same set is compiled, and the two profiles are required to answer identically -- which the
-/// corpus is what checks, and which a namespaced result cache would hide rather than prove.
+/// Fixes the emitted C tier's toolchain before anything compiles; not part of `Engine`'s variant,
+/// because both profiles must answer identically.
 pub fn select_profile(flag: &str) -> Result<(), Diagnostic> {
     let Some(profile) = ply_codegen::Profile::parse(flag) else {
         return Err(Diagnostic::error(
@@ -50,10 +44,7 @@ pub fn select_profile(flag: &str) -> Result<(), Diagnostic> {
     Ok(())
 }
 
-/// The engine a run under `spec` selects against and records under, named before a provider
-/// exists — selection is what decides whether building one is worth anything.
-/// `a_commands_engine_is_the_one_the_run_records_under` pins that this agrees with what the
-/// executor answers once the provider is built.
+/// Named before a provider exists, since selection decides whether building one is worth it.
 pub fn engine_of(spec: Option<&ply_eval::BackendSpec>) -> ply_test::Engine {
     let Some(spec) = spec else {
         return ply_test::Engine::Evaluator;
@@ -64,19 +55,9 @@ pub fn engine_of(spec: Option<&ply_eval::BackendSpec>) -> ply_test::Engine {
     ply_test::Engine::of_backend(name, variant, spec)
 }
 
-/// The cache key each keyable root is kept under.
-///
-/// One definition of these keys, in `ply_codegen`: they decide what the emitter caches *and*, under
-/// tier-only, what the unit holds as a root, so a second copy that drifted from the first would
-/// quietly change both. This crate had one, and its comment claimed a spec clause is keyed by its
-/// owner's hash "which covers the clause" -- which is not true, and cost the prover a judgement.
 pub(crate) use ply_codegen::emit_keys;
 
-/// Runs `selection` on a compiled tier — the only evaluator under tier-only (ADR 0048) — built by
-/// the whole Ply emitter from `loaded`'s module source texts, over the program the runner works on
-/// (`to_run`). The reusable form of what the `test` command builds inline, for the callers that
-/// reached for `ply_test::run` when the interpreter needed no backend and now decline every test
-/// without one.
+/// Runs `selection` on the compiled tier built from `loaded`'s module source texts.
 pub fn run_on_tier(
     loaded: &crate::load::Loaded,
     selection: &ply_test::Selection,
@@ -99,7 +80,6 @@ pub fn run_on_tier(
     ply_test::run_with(selection, &loaded.check, &loaded.hashes, store, &executor)
 }
 
-/// Each module's source text by name: what a second emitter reads the program from.
 pub fn module_texts(
     program: &ply_syntax::ast::Program,
     sources: &SourceMap,
@@ -115,8 +95,7 @@ pub fn module_texts(
         .collect()
 }
 
-/// The backend `ply prove` and `ply review` attach for a program's propositions (ADR 0045
-/// §"The facade"): the unit over the whole program, its laws' and clauses' roots included.
+/// The unit over the whole program, its laws' and clauses' roots included.
 pub fn prover_backend(
     flag: Option<&String>,
     loaded: &crate::load::Loaded,
@@ -135,12 +114,7 @@ pub fn prover_backend(
     Ok(Some((provider, spec)))
 }
 
-/// The tier over the front end's answer this run already holds.
-///
-/// **Every command that loaded a program uses this one.** The driver enters the port once per load
-/// (ADR 0052 §1) and the answer is what the unit is built from, so an invocation runs one front
-/// end rather than one per unit — a second is a whole front end over the project and the standard
-/// library.
+/// Every command that loaded a program uses this, so an invocation runs one front end.
 pub fn build_backend_over(
     spec: &ply_eval::BackendSpec,
     program: &ply_syntax::ast::Program,
@@ -193,8 +167,7 @@ pub fn print_diagnostics(diagnostics: &[Diagnostic], sources: &SourceMap, style:
     eprint!("{}", style.sanitize(&rendered));
 }
 
-/// One unreadable file is found more than once — a lazy read consults it, and a later flush
-/// re-reads it to merge — and each drain reports what it found.
+/// A lazy read and a later flush can each report the same unreadable file.
 pub fn once_each(warnings: Vec<Diagnostic>) -> Vec<Diagnostic> {
     let mut seen: BTreeSet<(&'static str, String)> = BTreeSet::new();
     warnings
@@ -203,8 +176,7 @@ pub fn once_each(warnings: Vec<Diagnostic>) -> Vec<Diagnostic> {
         .collect()
 }
 
-/// Cache trouble and scheduling trouble are not the user's program misbehaving, so they are one
-/// indented line each rather than a full report.
+/// Cache and scheduling trouble is one indented line each, not a full report.
 pub fn print_warnings(warnings: &[Diagnostic], style: Style) {
     for w in warnings {
         let label = match w.severity {
@@ -219,8 +191,7 @@ pub fn print_warnings(warnings: &[Diagnostic], style: Style) {
     }
 }
 
-/// Every command fails the same way, so an agent can key off `command` and `exit_code` without
-/// knowing which one it asked for.
+/// One shape for every command, so an agent can key off `command` and `exit_code`.
 pub fn report_load_error(command: &str, err: &LoadError, json: bool, style: Style) -> i32 {
     if json {
         emit_json(&json!({
@@ -245,9 +216,7 @@ pub fn report_load_error(command: &str, err: &LoadError, json: bool, style: Styl
     EXIT_COMPILE_ERROR
 }
 
-/// A registration that does not match the program is the host author's bug, not the program's, and
-/// it is a start-up failure: nothing ran, so the report is diagnostics and the binding that was
-/// asked for.
+/// A registration that does not match the program is a start-up failure: nothing ran.
 pub fn report_bind_error(
     command: &str,
     diagnostics: &[Diagnostic],
@@ -275,7 +244,6 @@ pub fn report_bind_error(
     EXIT_COMPILE_ERROR
 }
 
-/// Fill in the table and column counts of the `--db-schema` function, for the `database` block.
 pub fn describe_schema(loaded: &crate::load::Loaded, hosts: &mut crate::hosts::Hosts) {
     let Some(name) = hosts.schema_function().map(str::to_string) else {
         return;
@@ -283,7 +251,6 @@ pub fn describe_schema(loaded: &crate::load::Loaded, hosts: &mut crate::hosts::H
     hosts.describe_schema(materialise_schema(loaded, &name));
 }
 
-/// Evaluate a resolved `--db-schema` function and read its size.
 pub fn materialise_schema(
     loaded: &crate::load::Loaded,
     name: &str,
@@ -293,8 +260,7 @@ pub fn materialise_schema(
         .defs
         .values()
         .find(|d| d.name.as_str() == name)?;
-    // A `--db-schema` function is a pure const the tooling reads before the run; the pure applier
-    // evaluates it without a compiled tier (ADR 0048), as `--config-schema` does.
+    // A pure const read before the run, so the pure applier evaluates it without a compiled tier.
     ply_eval::interp::Pure::new(&loaded.program, &loaded.resolved)
         .call(name, Vec::new(), def.span, 10_000)
         .ok()
@@ -302,13 +268,11 @@ pub fn materialise_schema(
         .and_then(crate::db::schema::shape_of)
 }
 
-/// The one place a `--json` command writes to stdout, so "exactly one object and nothing else" is
-/// checkable by reading this file.
+/// The one place a `--json` command writes to stdout.
 pub fn emit_json(value: &Value) {
     match serde_json::to_string_pretty(value) {
         Ok(text) => println!("{text}"),
-        // Serialization of a tree we built ourselves cannot fail, but printing a half-object would
-        // break the one guarantee `--json` makes.
+        // A half-object would break the one guarantee `--json` makes.
         Err(e) => println!("{{\"ok\":false,\"error\":\"could not serialize the report: {e}\"}}"),
     }
 }
@@ -322,7 +286,7 @@ pub fn phases_json(phases: &crate::driver::Phases) -> Value {
     Value::Object(out)
 }
 
-/// Every phase, longest first, so what dominated a run is the first line read.
+/// Longest first, so what dominated a run is read first.
 pub fn print_phases(phases: &crate::driver::Phases, style: Style) {
     println!();
     println!("{IND}{}", style.bold("front-end time"));
@@ -358,15 +322,10 @@ pub fn plural(n: usize, word: &str) -> String {
     }
 }
 
-/// A worker's stack. The machine's bound on nested calls is `ply_eval::DEFAULT_MAX_CALLS`, and a
-/// compiled body honours the same count on the native stack -- where an unoptimising C compiler
-/// gives every temporary a slot, so a frame can run to kilobytes. The stack has to hold the
-/// budget's worth of the largest frames or the budget is not the bound that fires; a thread's
-/// default two megabytes holds a few thousand. Reserved, not committed: the pages an idle worker
-/// never touches cost nothing.
+/// A compiled body honours `ply_eval::DEFAULT_MAX_CALLS` on the native stack, where unoptimised
+/// frames can run to kilobytes. Reserved, not committed.
 const WORKER_STACK: usize = 256 << 20;
 
-/// The worker pool a run installs.
 pub fn build_pool(
     jobs: Option<u32>,
     warnings: &mut Vec<Diagnostic>,
@@ -398,7 +357,6 @@ pub fn exit_code(ok: bool) -> i32 {
     if ok { EXIT_OK } else { crate::EXIT_FAILED }
 }
 
-/// What the reference-counting pass and the evaluator counted over one run.
 pub fn counters_json(stats: &ply_eval::rc::Stats) -> Value {
     json!({
         "updates": stats.updates,
@@ -415,7 +373,6 @@ pub fn counters_json(stats: &ply_eval::rc::Stats) -> Value {
     })
 }
 
-/// The one-line human projection of [`counters_json`].
 pub fn counters_line(stats: &ply_eval::rc::Stats) -> String {
     let pct = |v: Option<f64>| match v {
         Some(v) => format!("{:.1}%", v * 100.0),

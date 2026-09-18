@@ -134,8 +134,7 @@ fn the_stored_schema_is_pinned() {
     );
 }
 
-/// A variant no exemplar reaches contributes nothing to the digest, so a change to it would be
-/// invisible to the pin.
+/// A variant no exemplar reaches would be invisible to the pin.
 #[test]
 fn every_variant_is_covered() {
     let mentioned = mentioned();
@@ -160,8 +159,7 @@ fn every_variant_is_covered() {
     );
 }
 
-/// `Bytes` added a normalization tag and no stored type, so `BODY_ENCODING` is the whole path
-/// by which it reaches this digest.
+/// A normalization change with no stored type reaches this digest only through `BODY_ENCODING`.
 #[test]
 fn the_digest_follows_the_body_encoding_generation() {
     assert_ne!(

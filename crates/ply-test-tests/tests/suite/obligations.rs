@@ -1,5 +1,3 @@
-//! The obligation cache, coverage, and the review baseline.
-
 use ply_hash::{DefHash, HashOutput};
 use ply_prove::key::prove_key;
 use ply_prove::{
@@ -15,8 +13,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-// --- Fixtures ---------------------------------------------------------------
 
 struct TempRoot(PathBuf);
 
@@ -147,8 +143,7 @@ fn unattempted() -> Discharge {
     Discharge::Unattempted(Gap::UnhandledEffect(Footprint::empty()))
 }
 
-/// A prover whose answers are written down in advance, and which records every obligation it was
-/// actually asked about — which is what a cache test is measuring.
+/// A prover with scripted answers that records every obligation it was asked about.
 struct Scripted {
     answers: BTreeMap<DefHash, Discharge>,
     asked: Mutex<Vec<DefHash>>,
@@ -162,8 +157,7 @@ impl Scripted {
         }
     }
 
-    /// Sorted, because `obligation::prove` discharges over a `par_iter` and the arrival order is
-    /// the thread pool's rather than the program's.
+    /// Sorted: `obligation::prove` discharges over a `par_iter`, so arrival order is the pool's.
     fn asked(&self) -> Vec<DefHash> {
         let mut asked = self.asked.lock().unwrap().clone();
         asked.sort();
@@ -193,8 +187,6 @@ fn run(
 ) -> ply_prove::ProveReport {
     obligation::prove(obligations, check, laws, store, plan, true, discharger).report
 }
-
-// --- The cache --------------------------------------------------------------
 
 #[test]
 fn an_obligation_discharges_once_and_stays_discharged() {
@@ -240,7 +232,6 @@ fn an_obligation_discharges_once_and_stays_discharged() {
     assert_eq!(report.count(Tier::Proved), 1);
 }
 
-/// A cached `proved` and a cached `property` are different claims.
 #[test]
 fn every_tier_survives_a_reload_as_itself() {
     let dir = TempRoot::new();
@@ -283,7 +274,6 @@ fn every_tier_survives_a_reload_as_itself() {
     assert_eq!(tiers(&before), tiers(&after));
 }
 
-/// The asymmetry the whole operational value of `proved` rests on.
 #[test]
 fn widening_the_plan_re_runs_the_samples_and_none_of_the_proofs() {
     let dir = TempRoot::new();
@@ -314,8 +304,7 @@ fn widening_the_plan_re_runs_the_samples_and_none_of_the_proofs() {
     assert_eq!(report.count(Tier::Property), 1);
 }
 
-/// The rule whose absence is silent: a sampled discharge under the bare key would let
-/// `--prove-cases 10` satisfy a run that asked for a thousand.
+/// Under the bare key, `--prove-cases 10` would satisfy a run that asked for a thousand.
 #[test]
 fn a_sample_is_never_written_under_the_bare_key() {
     let dir = TempRoot::new();
@@ -375,9 +364,6 @@ fn a_refutation_a_vacuity_and_a_gap_are_never_cached() {
     );
 }
 
-/// The permissive-direction failure, and the one that must not ship: an obligation's key covers its
-/// owner's hash, so rewriting the implementation moves the key and the discharged claim does not
-/// follow it.
 #[test]
 fn editing_the_implementation_moves_the_key_and_re_opens_the_obligation() {
     let dir = TempRoot::new();
@@ -397,8 +383,7 @@ fn editing_the_implementation_moves_the_key_and_re_opens_the_obligation() {
     );
     store.flush().unwrap();
 
-    // The same clause on the same definition, after the body changed: the key is a function of the
-    // owner's hash, so it is a different key.
+    // Same clause after the body changed: the key covers the owner's hash, so it moves.
     let second = Scripted::new([(hash(2), sampled(200))]);
     let mut store = dir.store();
     let report = run(
@@ -414,7 +399,6 @@ fn editing_the_implementation_moves_the_key_and_re_opens_the_obligation() {
     assert_eq!(report.count(Tier::Proved), 0);
 }
 
-/// A file whose label and whose evidence tell different stories is not evidence of either.
 #[test]
 fn an_entry_whose_label_disagrees_with_its_evidence_is_refused() {
     let dir = TempRoot::new();
@@ -455,7 +439,6 @@ fn a_proof_written_under_a_plan_key_is_refused_rather_than_believed() {
     assert!(answer.evidence.is_none());
 }
 
-/// A certificate that did not establish its guard has a domain it cannot vouch for.
 #[test]
 fn a_proof_that_did_not_establish_its_guard_is_refused() {
     let dir = TempRoot::new();
@@ -473,8 +456,6 @@ fn a_proof_that_did_not_establish_its_guard_is_refused() {
     );
 }
 
-/// A refusal is a warning and a re-discharge, never a silent read: a cache that quietly declines to
-/// answer looks exactly like a prover that is slow for no reason, and nobody investigates that.
 #[test]
 fn a_refused_entry_reaches_the_caller_and_the_obligation_is_attempted_again() {
     let dir = TempRoot::new();
@@ -521,8 +502,6 @@ fn a_refused_entry_reaches_the_caller_and_the_obligation_is_attempted_again() {
     assert_eq!(proved.report.count(Tier::Property), 1);
 }
 
-/// The plan key is an identity, not an ordering: a sample taken under a *wider* plan is not read by
-/// a narrower run either.
 #[test]
 fn narrowing_the_plan_re_opens_a_sample_and_leaves_a_proof_alone() {
     let dir = TempRoot::new();
@@ -552,7 +531,6 @@ fn narrowing_the_plan_re_opens_a_sample_and_leaves_a_proof_alone() {
     assert_eq!(report.count(Tier::Proved), 1);
 }
 
-/// The root set is part of the plan, so re-spelling it is one key and widening it is another.
 #[test]
 fn a_sample_is_keyed_by_the_root_set_as_well_as_the_case_count() {
     let dir = TempRoot::new();
@@ -605,7 +583,6 @@ fn a_sample_is_keyed_by_the_root_set_as_well_as_the_case_count() {
     assert_eq!(wider.asked(), vec![hash(1)]);
 }
 
-/// The discharger that decides nothing.
 #[test]
 fn a_run_that_decides_nothing_claims_nothing_and_caches_nothing() {
     let dir = TempRoot::new();
@@ -656,8 +633,6 @@ fn no_cache_reads_nothing_and_writes_nothing() {
     assert_eq!(store.obligations_len(), 0);
 }
 
-// --- Coverage ---------------------------------------------------------------
-
 fn coverage_of(
     names: &[&str],
     laws: &Laws,
@@ -686,9 +661,6 @@ fn only_an_obligation_that_holds_covers_its_definition() {
     );
 }
 
-/// A definition is covered at the strongest tier that holds of it, and the per-tier counts add up
-/// to the covered count — otherwise the two numbers on the coverage line are measuring different
-/// things.
 #[test]
 fn coverage_counts_a_definition_at_its_strongest_holding_tier() {
     let coverage = coverage_of(
@@ -711,7 +683,6 @@ fn coverage_counts_a_definition_at_its_strongest_holding_tier() {
     );
 }
 
-/// A law covers what it names and nothing else.
 #[test]
 fn a_law_covers_the_definitions_it_names_directly_and_no_others() {
     let mut laws = Laws::default();
@@ -748,9 +719,7 @@ fn a_law_that_does_not_hold_covers_nothing() {
     assert_eq!(coverage.uncovered, vec![Symbol::new("m.credited")]);
 }
 
-/// A `requires` is a filter on the domain of the `ensures` clauses beside it, not a claim about
-/// behaviour — so it is not an obligation at all, and a definition carrying only preconditions is
-/// one a reviewer still has to read.
+/// A `requires` only filters the `ensures` domain, so preconditions alone are no obligation.
 #[test]
 fn a_definition_with_no_obligation_is_never_covered() {
     let coverage = coverage_of(&["m.f"], &Laws::default(), Vec::new());
@@ -758,8 +727,6 @@ fn a_definition_with_no_obligation_is_never_covered() {
     assert_eq!(coverage.uncovered, vec![Symbol::new("m.f")]);
     assert_eq!(coverage.uncovered_count(), 1);
 }
-
-// --- Review -----------------------------------------------------------------
 
 /// `specs` and `laws` are the claims *as written*.
 fn hashes_of(defs: &[(&str, u8)], specs: &[(&str, Vec<u8>)], laws: &[u8]) -> HashOutput {
@@ -800,8 +767,6 @@ fn review_after_accept(
     obligation::review(&check, after, laws_after, &store, &report)
 }
 
-/// The cheapest review in the system, and the row the milestone exists for: the claim is fixed and
-/// still holds, so the diff is an implementation detail.
 #[test]
 fn a_changed_body_under_an_unchanged_spec_reports_the_obligations() {
     let before = hashes_of(&[("m.f", 1)], &[("m.f", vec![7])], &[]);
@@ -865,8 +830,6 @@ fn an_unchanged_definition_is_not_reported_at_all() {
     );
 }
 
-/// A law is part of the specification of every definition it names, so editing one has to read as a
-/// spec change on each of them.
 #[test]
 fn editing_a_law_is_a_spec_change_on_every_definition_it_names() {
     let mut before_laws = Laws::default();
@@ -899,7 +862,6 @@ fn editing_a_law_is_a_spec_change_on_every_definition_it_names() {
     assert_eq!(review.changed[0].spec, Moved::Changed);
 }
 
-/// Renaming a definition loses its baseline, which costs one re-read and never a false "unchanged".
 #[test]
 fn a_definition_with_no_baseline_is_unreviewed_rather_than_unchanged() {
     let before = hashes_of(&[("m.old", 1)], &[], &[]);
@@ -917,7 +879,6 @@ fn a_definition_with_no_baseline_is_unreviewed_rather_than_unchanged() {
     assert_eq!(review.reviewed, 0);
 }
 
-/// The sentence this command must not get wrong.
 #[test]
 fn the_headline_never_claims_more_than_the_specifications_cover() {
     let before = hashes_of(&[("m.f", 1), ("m.g", 3)], &[("m.f", vec![7])], &[]);
@@ -969,8 +930,6 @@ fn a_changed_definition_whose_obligation_broke_says_so() {
     );
 }
 
-/// A law is labelled per module and hashed by what it claims, so moving one between modules changes
-/// no hash.
 #[test]
 fn a_law_moved_between_modules_leaves_every_baseline_where_it_was() {
     let mut before_laws = Laws::default();
@@ -1001,9 +960,6 @@ fn a_law_moved_between_modules_leaves_every_baseline_where_it_was() {
     assert_eq!(review.coverage.covered, 1);
 }
 
-/// Deleting a law is a change to the specification of everything it spoke about, in the same way
-/// editing one is — otherwise a claim could be withdrawn while every definition it constrained
-/// reported "spec unchanged".
 #[test]
 fn deleting_a_law_reads_as_a_spec_change_on_what_it_named() {
     let mut before_laws = Laws::default();
@@ -1030,7 +986,6 @@ fn deleting_a_law_reads_as_a_spec_change_on_what_it_named() {
     assert_eq!(review.coverage.covered, 0);
 }
 
-/// A claim the machine could not attempt is not evidence about anything.
 #[test]
 fn a_changed_definition_whose_only_obligation_is_a_gap_gains_no_evidence() {
     let before = hashes_of(&[("m.f", 1)], &[("m.f", vec![7])], &[]);

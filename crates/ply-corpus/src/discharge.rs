@@ -1,4 +1,4 @@
-//! What the spec tier actually buys, measured on a project rather than argued.
+//! What the spec tier buys, measured on a project.
 
 use anyhow::{Result, bail};
 use ply_cli::engine::{Prover, Reach};
@@ -34,8 +34,7 @@ pub struct Tiers {
     pub refuted: usize,
     pub vacuous: usize,
     pub unattempted: usize,
-    /// `proved` obligations whose certificate came from execution — ground evaluation, a covered
-    /// finite domain, an emptied interleaving frontier — rather than from a static argument.
+    /// `proved` obligations certified by execution rather than by a static argument.
     pub proved_by_execution: usize,
 }
 

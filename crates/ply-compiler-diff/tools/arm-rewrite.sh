@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# The rewrite differential, armed: each mutation below is applied to a copy of
-# `rewrite.ply` and the fast half of `crates/ply-codegen-tests/tests/goldens/rewrite.rs` (the hand-written
-# fixtures and the reference's own inputs) must go red.
+# Each mutation is applied to a copy of rewrite.ply, and the fast half of the rewrite goldens must go red.
 #
 #   ./crates/ply-compiler-diff/tools/arm-rewrite.sh
 set -uo pipefail

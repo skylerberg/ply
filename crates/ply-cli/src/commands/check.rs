@@ -11,8 +11,7 @@ use ply_syntax::ast::ModuleName;
 use ply_ty::print_scheme;
 use serde_json::{Value, json};
 
-/// What every line of the `--types` block is printed at: `IND` plus the two spaces that put a
-/// definition under its module heading.
+/// `IND` plus the two spaces that put a definition under its module heading.
 const TYPES_INDENT: usize = IND.len() + 2;
 
 pub fn execute(args: &CheckArgs, style: Style) -> i32 {
@@ -25,8 +24,7 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
     let warnings = once_each(warnings);
 
     if loaded.promised {
-        // The promise is whole-program, and every module is parsed on every load, so the check has
-        // everything it needs already.
+        // Every module is parsed on every load, so the whole-program check has what it needs.
         let broken = crate::costs::promises(&loaded.program, &loaded.resolved);
         if !broken.is_empty() {
             let err = crate::load::LoadError {
@@ -70,8 +68,7 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
     EXIT_OK
 }
 
-/// A cache that cannot be opened is never a reason to refuse to typecheck: the front end degrades
-/// to the full path and says so.
+/// An unopenable cache never refuses a typecheck: the front end degrades to the full path.
 fn check(
     args: &CheckArgs,
     warnings: &mut Vec<Diagnostic>,
@@ -98,7 +95,7 @@ fn check(
     }
 }
 
-/// the ownership design: for every `push`, whether it grows its list in place or copies it.
+/// For every `push`, whether it grows its list in place or copies it.
 fn print_costs(loaded: &Loaded, style: Style) {
     println!();
     match crate::costs::lines(&loaded.program, &loaded.resolved, &loaded.sources, style) {
@@ -111,8 +108,7 @@ fn print_costs(loaded: &Loaded, style: Style) {
     }
 }
 
-/// Grouped by module and printed with simple names: the module heading already carries the
-/// qualification, and repeating it on every line would bury the signatures the flag was asked for.
+/// Grouped by module with simple names: the heading already carries the qualification.
 fn print_types(loaded: &Loaded, explain: bool, style: Style) {
     for module in loaded.modules() {
         let defs = loaded.defs_of(module.name);
@@ -212,8 +208,7 @@ fn print_types(loaded: &Loaded, explain: bool, style: Style) {
     }
 }
 
-/// Adds under `--explain` what the AST knows and the check output does not: the `effect set` table
-/// per module and, per definition, the sets its row named.
+/// Under `--explain`, the `effect set` table per module and the sets each definition's row named.
 fn attach_provenance(report: &mut Value, loaded: &Loaded) {
     if let Some(modules) = report["modules"].as_array_mut() {
         for entry in modules {

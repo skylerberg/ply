@@ -12,7 +12,7 @@ rationale.
 
 import importlib.util, os, sys
 
-# Loading the sibling miner would otherwise leave a `__pycache__` beside the spike.
+# Loading the sibling miner would otherwise leave a `__pycache__` here.
 sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))

@@ -1,5 +1,3 @@
-//! Where content addressing under modules meets the incremental front end.
-
 use ply_cli::driver;
 use ply_cli::load::Loaded;
 use ply_store::Store;
@@ -81,7 +79,6 @@ test \"touch is handled\" {
 }
 ";
 
-/// The shape that used to desynchronize the two front ends.
 #[test]
 fn adding_a_look_alike_effect_keeps_the_two_front_ends_in_agreement() {
     let dir = tempfile::tempdir().unwrap();
@@ -98,8 +95,6 @@ fn adding_a_look_alike_effect_keeps_the_two_front_ends_in_agreement() {
     agree(dir.path(), "after a new file declared a look-alike effect");
 }
 
-/// The control: the same corpus, the same warm store, and a new file whose effect is *not* a
-/// look-alike.
 #[test]
 fn adding_an_unrelated_effect_keeps_the_two_front_ends_in_agreement() {
     let dir = tempfile::tempdir().unwrap();

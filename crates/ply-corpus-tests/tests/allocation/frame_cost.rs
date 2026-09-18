@@ -1,5 +1,3 @@
-//! What a step costs the allocator, exactly.
-
 use crate::counting::charge;
 use ply_eval::Stack;
 use ply_eval::cont::{Frame, Prompt, Segment};
@@ -22,7 +20,6 @@ fn call_frame() -> Frame {
     }
 }
 
-/// One allocation to push a frame — the link that holds it — and none at all to pop one.
 #[test]
 fn pushing_one_frame_costs_one_allocation_and_popping_costs_none() {
     let mut stack = Stack::new();
@@ -41,8 +38,7 @@ fn pushing_one_frame_costs_one_allocation_and_popping_costs_none() {
     });
     let per_push = allocs as f64 / PUSHES as f64;
 
-    // `into_next` rather than `next`, because that is what the machine's return transition uses: it
-    // owns its stack, so the frame is moved out of its link rather than cloned.
+    // `into_next`, as the return transition does: the frame is moved out of its link, not cloned.
     let (_, pop_allocs) = allocations_of(|| {
         let mut s = grown.clone();
         for _ in 0..PUSHES {
@@ -74,9 +70,6 @@ fn pushing_one_frame_costs_one_allocation_and_popping_costs_none() {
     );
 }
 
-/// Opening a prompt is the operation that genuinely needs a new segment, and a frame push must
-/// never cost more than it: a `handle` is rare and a push happens on all but a handful of
-/// transitions.
 #[test]
 fn pushing_a_frame_costs_no_more_than_opening_a_prompt() {
     let prompt = Rc::new(Prompt {

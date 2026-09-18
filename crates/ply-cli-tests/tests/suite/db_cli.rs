@@ -1,6 +1,3 @@
-//! The database as the command line configures it: `--db`, the pool knobs, `--db-schema`, and what
-//! a run is allowed to say about any of it afterwards.
-
 use assert_cmd::Command;
 use serde_json::Value;
 use std::path::Path;
@@ -41,7 +38,6 @@ fn stderr_of(output: &std::process::Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("stderr is utf-8")
 }
 
-/// Every byte under a directory, concatenated.
 fn bytes_under(dir: &Path) -> String {
     let mut out = String::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -58,10 +54,6 @@ fn bytes_under(dir: &Path) -> String {
     out
 }
 
-// --- the flags --------------------------------------------------------------
-
-/// A flag that configures a binding, with no binding to configure, is refused rather than ignored —
-/// the rule `--tls` established, applied to every knob `--db` brought with it.
 #[test]
 fn every_database_flag_without_host_is_refused_rather_than_silently_dropped() {
     let dir = project(HOSTED);
@@ -90,8 +82,6 @@ fn every_database_flag_without_host_is_refused_rather_than_silently_dropped() {
     }
 }
 
-/// Zero is not "no bound"; a pool of zero connections and a timeout of zero milliseconds are both
-/// configurations that can only hang or fail.
 #[test]
 fn a_zero_bound_is_refused_rather_than_meaning_unlimited() {
     let dir = project(HOSTED);
@@ -104,11 +94,7 @@ fn a_zero_bound_is_refused_rather_than_meaning_unlimited() {
     }
 }
 
-// --- malformed configuration ------------------------------------------------
-
-/// Every refusal is `E0431`, at start-up, and none of them echoes the string it was handed: the
-/// caller cannot know whether the operator put a password in it, and a diagnostic reaches the
-/// result cache.
+/// None echoes its input: the operator may have put a password in it, and a diagnostic reaches the result cache.
 #[test]
 fn a_malformed_connection_string_is_e0431_and_is_never_echoed() {
     let dir = project(HOSTED);
@@ -132,8 +118,6 @@ fn a_malformed_connection_string_is_e0431_and_is_never_echoed() {
     }
 }
 
-/// The trusted computing base listing: TLS to postgres is not wired up in W4, so a word that promised encryption would be
-/// a label that lies — and this project's whole posture is that a label is a truth claim.
 #[test]
 fn an_sslmode_that_promises_encryption_names_the_decision_that_refused_it() {
     let dir = project(HOSTED);
@@ -151,8 +135,6 @@ fn an_sslmode_that_promises_encryption_names_the_decision_that_refused_it() {
     assert!(rendered.contains("a word that lies"), "{rendered}");
 }
 
-/// A `--json` command emits exactly one object on stdout, and a start-up refusal is not an
-/// exception to it.
 #[test]
 fn a_refused_configuration_still_emits_one_json_object() {
     let dir = project(HOSTED);
@@ -167,9 +149,6 @@ fn a_refused_configuration_still_emits_one_json_object() {
     assert_eq!(report["diagnostics"][0]["code"], "E0431");
 }
 
-// --- the environment --------------------------------------------------------
-
-/// The environment says *which* database; only `--host` says that there is one.
 #[test]
 fn the_environment_cannot_cause_a_binding() {
     let dir = project(HOSTED);
@@ -219,10 +198,6 @@ fn a_malformed_environment_url_names_the_variable_rather_than_the_flag() {
     assert!(rendered.contains(ply_cli::db::URL_ENV), "{rendered}");
 }
 
-// --- the password -----------------------------------------------------------
-
-/// The whole reason `PLY_DB_PASSWORD` exists: an argument is readable by every process on the
-/// machine and lands in a shell history.
 #[test]
 fn the_password_reaches_no_output_and_no_cache() {
     let dir = project(HOSTED);
@@ -247,8 +222,6 @@ fn the_password_reaches_no_output_and_no_cache() {
     assert!(!stored.contains(PASSWORD), "the password reached the store");
 }
 
-/// The same claim for the form that puts the secret in the string itself, which an operator will do
-/// whatever the documentation says.
 #[test]
 fn a_password_inside_the_url_is_redacted_everywhere_it_is_reported() {
     let dir = project(HOSTED);
@@ -292,7 +265,6 @@ fn a_password_in_both_places_is_refused() {
     );
 }
 
-/// A definition's hash is a function of the program and of nothing else.
 #[test]
 fn no_credential_reaches_a_definition_s_hash() {
     let dir = project(HOSTED);
@@ -314,10 +286,6 @@ fn no_credential_reaches_a_definition_s_hash() {
     assert!(!stdout_of(&configured).contains(PASSWORD));
 }
 
-// --- what `ply hosts` discloses ---------------------------------------------
-
-/// The `database` block exists for the same reason W3's `transport` block does: a fact the rows
-/// cannot carry and a reviewer must not have to derive.
 #[test]
 fn the_database_block_names_the_pool_the_scanner_and_what_is_not_connected() {
     let dir = project(HOSTED);
@@ -342,8 +310,6 @@ fn the_database_block_names_the_pool_the_scanner_and_what_is_not_connected() {
     );
 }
 
-/// A program with no database in reach and a run that named none must print and hash exactly what
-/// it did before W4 — which is what keeps every existing corpus's digest where it was.
 #[test]
 fn a_run_with_no_database_says_nothing_about_one() {
     let dir = project(HOSTED);
@@ -391,10 +357,6 @@ fn the_digest_moves_with_the_pool_and_not_with_the_database_name() {
     );
 }
 
-// --- `--db-schema` ----------------------------------------------------------
-
-/// There is no migration tool: a schema is a value, and W4's job is to check that the database
-/// matches the one the program describes.
 #[test]
 fn a_db_schema_that_names_nothing_is_refused_with_what_the_program_has() {
     let dir = project(HOSTED);
@@ -430,8 +392,7 @@ fn a_db_schema_that_is_not_module_dot_fn_is_refused_before_the_program_is_consul
     assert!(rendered.contains("<module>.<fn>"), "{rendered}");
 }
 
-/// A function of the right shape is accepted, materialised, and its size reported — with `declared`
-/// rather than `verified`, because nothing compared it to a server.
+/// `declared` rather than `verified`, because nothing compared it to a server.
 #[test]
 fn a_resolvable_schema_is_materialised_and_reported_as_declared() {
     let dir = project(
@@ -470,9 +431,7 @@ fn main() -> Int = 1
     assert_eq!(report["database"]["schema"]["state"], "declared");
 }
 
-/// The digest covers the schema function's *name* and not the shape it materialises to: the table
-/// count is a property of the database, and a digest that moved when someone else's migration ran
-/// would be pinning the wrong thing.
+/// The table count is a property of the database, so a digest that moved with it would pin the wrong thing.
 #[test]
 fn the_digest_covers_the_schema_name_and_not_its_size() {
     let with = |tables: &str| {
@@ -508,9 +467,6 @@ fn main() -> Int = 1
     );
 }
 
-// --- reporting --------------------------------------------------------------
-
-/// A run that reached a database has to say so on the line a person reads last.
 #[test]
 fn a_hermetic_run_claims_no_database_on_the_line_a_person_reads_last() {
     let dir = project(HOSTED);

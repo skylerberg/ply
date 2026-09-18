@@ -1,5 +1,3 @@
-//! Adversarial audit of `std.router`, driven the way a service drives it.
-
 use assert_cmd::prelude::*;
 use std::path::Path;
 use std::process::Command;
@@ -124,8 +122,6 @@ test "a null byte is a byte and matches no literal that lacks one" {{
     ));
 }
 
-/// The table is a value, so which route wins has to be a function of that value rather than of the
-/// order it happened to be assembled in.
 #[test]
 fn precedence_is_a_function_of_the_table_and_not_of_its_order() {
     run_tests(&format!(
@@ -205,9 +201,6 @@ test "a route that can only ever lose is a reported conflict" {{
     ));
 }
 
-/// 404 and 405 are the two answers a table can give about a path it does not serve under this
-/// method, and the difference between them is the difference between "no such thing" and "not like
-/// that".
 #[test]
 fn the_405_is_distinguished_from_the_404_and_lists_every_method() {
     run_tests(&format!(
@@ -258,9 +251,6 @@ test "a method is matched byte-exactly, so a lowercase token is another method" 
     ));
 }
 
-/// The shapes a path can take that are not a path: an empty one, a trailing slash, an empty middle
-/// segment, one that carries a query the caller forgot to strip, and one with far more segments
-/// than any table has patterns.
 #[test]
 fn the_edges_of_a_path_are_answered_rather_than_smoothed_over() {
     run_tests(&format!(

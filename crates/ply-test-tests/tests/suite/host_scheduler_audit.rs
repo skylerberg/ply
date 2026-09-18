@@ -1,5 +1,3 @@
-//! Adversarial audit of the scheduler split, and of what re-execution does to a host operation.
-
 use crate::fixture::TierExecutor;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
@@ -48,13 +46,10 @@ struct Compiled {
     resolved: Resolved,
     check: CheckOutput,
     hashes: HashOutput,
-    /// The module source text, keyed by name — what the whole Ply emitter re-parses into bodies.
     texts: std::collections::HashMap<String, String>,
 }
 
 impl Compiled {
-    /// The whole Ply emitter's unit for this program, and the C backend spec to install it with —
-    /// what a run needs under tier-only (ADR 0048), since a bare machine holds no evaluator.
     fn tier(&self) -> (&'static ply_codegen::Unit, ply_eval::BackendSpec) {
         let unit =
             ply_codegen::Unit::over_with_texts(&self.program, &self.resolved, self.texts.clone())
@@ -88,8 +83,7 @@ fn compile(source: &str) -> Compiled {
     }
 }
 
-/// The whole runner over one compiled fixture on the tier — the only evaluator under tier-only —
-/// presenting as the evaluator so its cache namespace is the one `select` read.
+/// Presents as the evaluator, so its cache namespace is the one `select` reads.
 fn run_report(
     compiled: &Compiled,
     store: &mut Store,
@@ -113,7 +107,6 @@ fn run_report(
     )
 }
 
-/// Counts every call.
 #[derive(Default)]
 struct Counting {
     calls: AtomicUsize,
@@ -145,8 +138,7 @@ fn op(effect: &str, name: &str) -> HostOp {
     }
 }
 
-/// `net.send` plus the three `task` operations, so a fixture can reach the production scheduler and
-/// a socket in the same binding.
+/// `net.send` plus the `task` operations, so one binding reaches a socket and the production scheduler.
 fn registry(handler: Arc<Counting>, tasks: bool) -> HostRegistry {
     let mut registry = HostRegistry::new();
     registry.register(op("net", "send"), handler.clone());
@@ -179,8 +171,7 @@ impl Ran {
     }
 }
 
-/// The whole runner, over one fixture, with the binding actually bound — `--host`, in other words,
-/// which is the only configuration in which any of these questions has an answer.
+/// The runner with the binding bound, as `--host` runs it.
 fn run_hosted(source: &str, tasks: bool) -> Ran {
     let compiled = compile(source);
     let counter = Arc::new(Counting::default());
@@ -210,8 +201,6 @@ fn run_hosted(source: &str, tasks: bool) -> Ran {
     }
 }
 
-/// A `--host` run and a `simulate` region in one suite is an ordinary configuration, and the region
-/// has to keep answering `task` itself.
 #[test]
 fn a_hosted_run_still_gives_simulate_the_seeded_scheduler() {
     let ran = run_hosted(
@@ -247,7 +236,6 @@ test "a seeded region under a bound registry" {
     );
 }
 
-/// Lock 2, from the other side.
 #[test]
 fn a_simulate_inside_a_spawned_production_task_is_refused() {
     let ran = run_hosted(
@@ -262,8 +250,6 @@ test/nondet "a region inside a spawned task" {
     ran.refused(codes::NESTED_SIMULATION);
 }
 
-/// A production task that outlives its region — the shape that would leave real work running past
-/// the scope that owns it.
 #[test]
 fn a_handler_cannot_discard_a_production_region_and_orphan_its_tasks() {
     let ran = run_hosted(
@@ -299,8 +285,6 @@ test/nondet "a clause that never resumes, over a spawned task" {
     );
 }
 
-/// The seeded region *can* be discarded that way, and when it is, the machine must not answer the
-/// next `task.*` by opening a production region beside the corpse.
 #[test]
 fn a_task_after_an_abandoned_seeded_region_does_not_open_a_production_one() {
     let ran = run_hosted(
@@ -331,9 +315,7 @@ test/nondet "a production region beside an abandoned seeded one" {
     let d = ran
         .failure()
         .unwrap_or_else(|| panic!("a discarded region must be reported, not run beside a second"));
-    // `Machine::innermost_simulation` looks for a live seeded region rather than for one the stack
-    // still holds, so the abandoned region shadows the boundary and the second region is never
-    // opened.
+    // `innermost_simulation` finds the abandoned region because it is live, and it shadows the boundary.
     assert_eq!(
         d.code,
         codes::HOST_IN_SIMULATION,
@@ -344,8 +326,6 @@ test/nondet "a production region beside an abandoned seeded one" {
     assert_eq!(ran.sends, 0, "nothing reached the socket");
 }
 
-/// The same shadowing, from the other direction: an ordinary host operation after a region whose
-/// control a handler discarded.
 #[test]
 fn a_send_after_an_abandoned_seeded_region_is_refused_rather_than_performed() {
     let ran = run_hosted(
@@ -377,8 +357,6 @@ test/nondet "a socket after a discarded region" {
     assert_eq!(ran.sends, 0);
 }
 
-/// A production region and a `simulate` in *sequence*, which is not nesting in any reading of the
-/// source.
 #[test]
 fn a_simulate_after_a_production_region_is_refused_as_nesting() {
     let ran = run_hosted(
@@ -403,9 +381,7 @@ test/nondet "spawn, join, then simulate" {
     ran.refused(codes::NESTED_SIMULATION);
 }
 
-/// The footprint check refuses a host operation inside a `simulate` region with `E0425`, on the ground that
-/// "DPOR re-runs a test whole per interleaving; a region that reaches a socket would send one
-/// packet per interleaving explored and call the result a proof".
+/// `E0425`: DPOR re-runs a test per interleaving, so the send would repeat per interleaving.
 const SEND_BESIDE_A_REGION: &str = r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -449,7 +425,6 @@ fn a_send_beside_a_region_is_refused_before_the_first_packet() {
     );
 }
 
-/// And the escape hatch the refusal names really is one.
 #[test]
 fn under_simulation_once_the_same_send_runs_exactly_once_and_is_not_cached() {
     let compiled = compile(SEND_BESIDE_A_REGION);
@@ -499,8 +474,6 @@ fn under_simulation_once_the_same_send_runs_exactly_once_and_is_not_cached() {
     );
 }
 
-/// Hermetically the same program is `E0424`, and the diagnostic says that `--host` — the second of
-/// the two remedies it names — would not help.
 #[test]
 fn a_hermetic_refusal_says_that_host_would_not_repair_a_searched_test() {
     let compiled = compile(SEND_BESIDE_A_REGION);
@@ -537,8 +510,6 @@ fn a_hermetic_refusal_says_that_host_would_not_repair_a_searched_test() {
     assert_eq!(counter.calls(), 0);
 }
 
-/// `--simulation measure-reduction` runs the whole search a second time with the dependence
-/// relation forced to true, so it doubles whatever the first search did.
 #[test]
 fn measure_reduction_re_executes_a_once_plan_and_is_refused() {
     let compiled = compile(SEND_BESIDE_A_REGION);
@@ -568,8 +539,6 @@ fn measure_reduction_re_executes_a_once_plan_and_is_refused() {
     assert_eq!(counter.calls(), 0);
 }
 
-/// The other re-executing consumer: M5's bisection, which runs a failing test once per mixed
-/// definition set.
 #[test]
 fn a_bisection_hybrid_re_evaluates_a_host_test_without_reaching_the_host() {
     use ply_test::bisect::{Delta, Hybrid};
@@ -655,8 +624,6 @@ test "a det test over a deterministic host handler" {
     );
 }
 
-/// Lock 3 at the runner rather than at the machine: with no binding, a `task.*` that reaches the
-/// boundary is `E0424` and no production scheduler is built.
 #[test]
 fn a_hermetic_run_cannot_build_a_production_scheduler() {
     let compiled = compile(

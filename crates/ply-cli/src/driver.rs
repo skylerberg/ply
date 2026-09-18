@@ -1,20 +1,5 @@
 //! The front end: the Rust chain that still has to run, and the port that answers for the rest.
-//!
-//! The driver reads the project, parses it and resolves it with the Rust chain — `Program` and
-//! `Resolved` are still what the prover, `ply check --costs`, the artifact path, `Pure` and the
-//! interpreter read — and then asks the **port** for the whole front end's answer over the same
-//! module texts. What it takes from that answer is everything it used to derive a second time:
-//! the diagnostics it reports, the `CheckOutput` it hands downstream, the `HashOutput` everything
-//! keys on, the module load order, the item ordinals and the normalized bodies the store files
-//! (ADR 0052 §1). `ply_core::check_program` and `ply_hash::hash_program` are not called on a
-//! user's program from here.
-//!
-//! **Asking costs a whole front end, so it is asked once per load and the answer travels.** A
-//! command that builds a backend builds it over this run's [`Front`] rather than over one of its
-//! own; `ply_codegen::Unit::over_front` is that door. A second ask is a second front end over the
-//! project *and* the standard library, which is the cost this shape exists to pay exactly once.
-//! An incremental load does not ask at all when the store holds the answer over these very texts
-//! from this very emitter.
+//! Asking the port costs a whole front end, so it is asked once per load and the answer travels.
 
 use crate::load::{Discovered, LoadError, Loaded, anchor, discover, unreadable};
 use ply_hash::body::StoredBody;
@@ -40,17 +25,12 @@ pub enum Mode {
 }
 
 /// Where a front-end run's time went.
-///
-/// Five phases, and the shape of the answer is the point: `read`, `parse` and `resolve` are the
-/// Rust chain that still runs because `Program` and `Resolved` are still read downstream, `front`
-/// is the one question put to the port, and `write_back` is the store. A run's cost is `front`
-/// plus a parse of the same text — which is what ADR 0052 §2 exists to remove.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Phases {
     pub read: Duration,
     pub parse: Duration,
     pub resolve: Duration,
-    /// The port's whole front end over this program, asked once, or its answer read back.
+    /// The port's whole front end over this program, or its answer read back.
     pub front: Duration,
     pub write_back: Duration,
 }
@@ -71,7 +51,6 @@ impl Phases {
     }
 }
 
-/// What one load has to say about itself.
 #[derive(Clone, Debug, Default)]
 pub struct FrontEnd {
     pub incremental: bool,
@@ -89,8 +68,7 @@ pub fn load_incremental(path: &Path, store: &mut Store) -> Result<Loaded, LoadEr
 
 pub fn run(path: &Path, mode: Mode, store: Option<&mut Store>) -> Result<Loaded, LoadError> {
     let (root, discovered) = discover(path).map_err(LoadError::bare)?;
-    // Pruning deletes every fingerprint the run did not see, which is only correct when the run saw
-    // everything.
+    // Pruning deletes every fingerprint the run did not see, so it needs the whole project.
     let whole_project = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
     Driver::new(root, discovered, mode, store, whole_project)?.finish()
 }
@@ -101,14 +79,13 @@ struct FileState {
     source: SourceId,
     text: Arc<str>,
     content: ContentHash,
-    /// Taken when the program is assembled: nothing after that reads a tree through this.
+    /// Taken when the program is assembled; nothing after that reads a tree through this.
     ast: Option<Module>,
     /// Embedded in the binary rather than discovered on disk.
     shipped: bool,
 }
 
 impl FileState {
-    /// Every module this file imports.
     fn imports(&self) -> Vec<ModuleName> {
         match &self.ast {
             Some(ast) => ast.imports.iter().map(|i| i.module_name()).collect(),
@@ -170,12 +147,10 @@ impl<'s> Driver<'s> {
             });
         }
 
-        // Naming is checked with the text already on hand so an unusable path is reported against
-        // the file itself rather than against nowhere.
+        // Checked with the text on hand, so an unusable path is reported against the file.
         let mut files = Vec::with_capacity(discovered.len());
         for (file, &(source, content)) in discovered.iter().zip(&read) {
             match ModuleName::from_relative_path(&file.relative) {
-                // `std` is reserved before anything else looks at the file.
                 Ok(module) if ply_std::is_reserved(module.as_str()) => {
                     let diagnostic = ply_std::reserved_diagnostic(&file.path, module.as_str());
                     diagnostics.push(anchor(diagnostic, &sources, source));
@@ -240,8 +215,7 @@ impl<'s> Driver<'s> {
         warnings.extend(cache);
 
         let files = self.files.iter().map(|f| f.path.clone()).collect();
-        // A `reuse fn` anywhere in the program, which is what decides whether the whole-program
-        // promise check has anything to check.
+        // Whether the whole-program promise check has anything to check.
         let promised = front.defs_written.values().any(|w| w.reuse);
         Ok(Loaded {
             root: self.root,
@@ -261,13 +235,8 @@ impl<'s> Driver<'s> {
         })
     }
 
-    /// The port's whole answer over this program: the one front end a load runs, or the answer the
-    /// store kept from the last run over the same texts. Beside it, the answer to keep, when it is
-    /// new and refuses nothing.
-    ///
-    /// The module texts are handed over in the order `self.files` holds them, which is the order
-    /// the program's modules are in, so a span's module index in the answer is a position in this
-    /// very list and reads back as the `SourceId` the file was read under.
+    /// The port's answer, run or read back from the store, plus the answer to keep when fresh.
+    /// Texts go in `self.files` order, so a span's module index reads back as its `SourceId`.
     fn ask_the_port(&mut self) -> Result<(Front, Fresh), LoadError> {
         ply_codegen::c::producer::ensure_default();
         let ids: Vec<SourceId> = self.files.iter().map(|f| f.source).collect();
@@ -292,8 +261,7 @@ impl<'s> Driver<'s> {
         Ok((front, fresh))
     }
 
-    /// Everything the port's answer is a function of: the emitter, and each module's name and text
-    /// in the order they are handed over. `None` when this run keeps no cache.
+    /// The emitter plus each module's name and text, in handover order; `None` without a cache.
     fn answer_key(&self) -> Option<ContentHash> {
         if self.mode != Mode::Incremental || self.store.is_none() {
             return None;
@@ -308,7 +276,7 @@ impl<'s> Driver<'s> {
         Some(ContentHash::of(&key))
     }
 
-    /// The front end could not be *asked*, which is this compiler failing rather than the program.
+    /// This compiler failing, rather than the program.
     fn seam_failed(&self, why: &str) -> LoadError {
         LoadError {
             sources: self.sources.clone(),
@@ -324,11 +292,10 @@ impl<'s> Driver<'s> {
         }
     }
 
-    /// The program the rest of the round runs on. The trees are **moved** out of the files: the
-    /// port reads the text, not a tree, and nothing here consults one again.
+    /// The trees are moved out of the files: the port reads text, and nothing reads a tree again.
     fn assemble(&mut self) -> Result<(Program, ply_syntax::resolve::Resolved), LoadError> {
         let modules: Vec<Module> = self.files.iter_mut().filter_map(|f| f.ast.take()).collect();
-        // Mutable because `resolve` fills every call's defaults and places its named arguments.
+        // Mutable because `resolve` fills defaults and places named arguments.
         let mut program = Program { modules };
         let resolved =
             timed(&mut self.phases.resolve, || resolve(&mut program)).map_err(|diagnostics| {
@@ -340,8 +307,7 @@ impl<'s> Driver<'s> {
         Ok((program, resolved))
     }
 
-    /// Every file parsed, and every shipped module something imports pulled in and parsed too —
-    /// to a fixed point, because a shipped module may import another.
+    /// To a fixed point, because a shipped module may import another.
     fn parse_all(&mut self) -> Result<(), LoadError> {
         loop {
             self.parse_pending()?;
@@ -351,15 +317,14 @@ impl<'s> Driver<'s> {
         }
     }
 
-    /// Loading is demand-driven: a module that ships with the compiler is pulled out of the
-    /// embedded table only when something already in the program imports it, and then transitively.
+    /// Shipped modules are pulled in only when something imports them, transitively.
     fn pull_stdlib(&mut self) -> Result<bool, LoadError> {
         let mut diagnostics = Vec::new();
         let mut wanted: BTreeSet<Symbol> = BTreeSet::new();
 
         for file in &self.files {
             for imported in file.imports() {
-                // A shipped module may import only `std.*`
+                // A shipped module may import only `std.*`.
                 if file.shipped && !ply_std::is_std(&imported) {
                     diagnostics.push(self.foreign_import(file, &imported));
                     continue;
@@ -391,8 +356,7 @@ impl<'s> Driver<'s> {
         Ok(added)
     }
 
-    /// An embedded module, filed under its pseudo-path so that the store needs no new mechanism:
-    /// its fingerprint is keyed by that path like any other file's.
+    /// Filed under its pseudo-path, so the store keys its fingerprint like any file's.
     fn add_shipped(&mut self, module: ModuleName) {
         let Some(source) = ply_std::source(&module) else {
             return;
@@ -417,7 +381,6 @@ impl<'s> Driver<'s> {
         });
     }
 
-    /// Where a file writes an import.
     fn import_span(&self, file: &FileState, imported: &ModuleName) -> Span {
         file.ast
             .as_ref()
@@ -457,8 +420,7 @@ impl<'s> Driver<'s> {
                     continue;
                 }
                 match ply_syntax::parse_module(file.source, file.module.clone(), &file.text) {
-                    // Expansion is part of parsing a file: it reads that file's own type
-                    // declarations and nothing else.
+                    // Expansion reads only this file's own type declarations.
                     Ok(mut module) => {
                         diagnostics.append(&mut ply_derive::expand_module(&mut module));
                         file.ast = Some(module);
@@ -493,7 +455,6 @@ impl<'s> Driver<'s> {
             return Vec::new();
         }
 
-        // What the last run recorded for the shipped modules, against what they hash to now.
         let mut moved: BTreeSet<Symbol> = BTreeSet::new();
         for path in store.source_paths() {
             if !ply_std::is_pseudo_path(&path) {
@@ -541,8 +502,6 @@ impl<'s> Driver<'s> {
         ]
     }
 
-    /// Everything the store keeps about this run, all of it read out of the front end's answer,
-    /// and the answer itself when the port was asked for it.
     fn write_back(&mut self, front: &Front, fresh: Fresh) -> Vec<Diagnostic> {
         if self.mode != Mode::Incremental {
             return Vec::new();
@@ -575,17 +534,14 @@ impl<'s> Driver<'s> {
         for (i, fingerprint) in fingerprints {
             store.put_source(&paths[i], fingerprint);
         }
-        // `paths` already holds the pseudo-paths of the shipped modules this run loaded, so a `std`
-        // module the project stopped importing is pruned like any other file that left the program
-        // — correct, and recomputable.
+        // A `std` module no longer imported is pruned like any file that left the program.
         if whole_project {
             store.prune(&paths);
         }
         store.set_stdlib_digest(ply_std::digest_short());
         match store.flush() {
             Ok(()) => Vec::new(),
-            // A flush writes both caches and either half can be the one that failed, so naming one
-            // here would be a guess.
+            // A flush writes both caches, so naming the one that failed would be a guess.
             Err(e) => vec![
                 Diagnostic::warning(
                     codes::CACHE_UNREADABLE,
@@ -602,8 +558,7 @@ impl<'s> Driver<'s> {
         let hashes = &front.hashes;
         let mut fingerprint = SourceFingerprint::new(file.content);
 
-        // A name declared in two namespaces — a `fn` and a `type` of one name — is in `items`
-        // twice and gets one entry per namespace, once.
+        // A name in two namespaces is in `items` twice and gets one entry per namespace.
         let mut seen: BTreeSet<&Symbol> = BTreeSet::new();
         for name in &info.items {
             if seen.insert(name) {
@@ -635,9 +590,7 @@ enum Interface {
     Decl(CachedDecl),
 }
 
-/// The checker's output with its definitions in the order a reader can predict: the run's files
-/// in load order, then each file's items as written. The port answers them in the checker's own
-/// order, which is dependency-first, and `ply check --json` publishes this one.
+/// Files in load order, then items as written; the port answers dependency-first.
 fn published_order(front: &Front) -> ply_ty::CheckOutput {
     let mut check = front.check.clone();
     let mut defs = indexmap::IndexMap::with_capacity(check.defs.len());
@@ -655,8 +608,7 @@ fn published_order(front: &Front) -> ply_ty::CheckOutput {
     check
 }
 
-/// What one program-wide name declares: a `fn`, a `type`, an `effect`, or two of them when the
-/// source spells one name in two namespaces.
+/// Two entries when the source spells one name in two namespaces.
 fn def_entries(front: &Front, name: &Symbol) -> Vec<DefEntry> {
     let hashes = &front.hashes;
     let mut out = Vec::new();
@@ -712,11 +664,7 @@ fn ctor_members(front: &Front, type_name: &Symbol) -> Vec<Member> {
         .collect()
 }
 
-/// The witness this run writes for every definition and declaration.
-///
-/// [`ply_store`] keys an interface's slot by the name its witness says it was written for, so two
-/// definitions that share a hash keep their own entries, and `ply cache inspect` shows it. It is a
-/// function of the hashes alone.
+/// Slots are keyed by the witnessed name, so definitions sharing a hash keep their own entries.
 fn witnesses(hashes: &HashOutput) -> BTreeMap<Symbol, Vec<NameRef>> {
     let mut out = BTreeMap::new();
     let named = |name: &Symbol| -> Option<NameRef> {
@@ -741,7 +689,6 @@ fn witnesses(hashes: &HashOutput) -> BTreeMap<Symbol, Vec<NameRef>> {
     out
 }
 
-/// The published interface of every definition and declaration in the program.
 fn interfaces(
     front: &Front,
     witnesses: &BTreeMap<Symbol, Vec<NameRef>>,
@@ -784,8 +731,7 @@ fn interfaces(
         ));
     }
 
-    // A prelude effect is declared by no source and hashed by nothing, so it has no `decls` entry
-    // and contributes no interface.
+    // A prelude effect is declared by no source, so it has no `decls` entry.
     for (name, e) in &front.check.effects {
         let (Some(&hash), Some(names)) = (hashes.decls.get(name), witnesses.get(name)) else {
             continue;
@@ -815,10 +761,7 @@ fn interfaces(
     out
 }
 
-/// The normalized body of every definition, keyed by the hash it is filed under.
-///
-/// A name declared in two namespaces has two bodies and one entry per hash, so the body is matched
-/// to its hash rather than assumed: the envelope carries enough to verify which it is.
+/// A name in two namespaces has two bodies, so each body is matched to its hash, not assumed.
 fn stored_bodies(front: &Front) -> Vec<(DefHash, DefBody)> {
     let hashes = &front.hashes;
     let mut by_name: BTreeMap<&Symbol, Vec<StoredBody>> = BTreeMap::new();

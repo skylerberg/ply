@@ -1,12 +1,8 @@
-//! A `Map` through the result cache, which is where a non-canonical iteration order would do its
-//! quietest damage.
-
 use assert_cmd::Command;
 use std::path::Path;
 use tempfile::TempDir;
 
-/// The orders are data rather than source, so the two runs below are the *same* definitions — which
-/// is what makes the second one a cache read rather than a second first run.
+/// The orders are data rather than source, so the second run is a cache read of the same definitions.
 const SOURCE: &str = "\
 fn build(ks: List<Int>) -> Map<Int, Int> =
   fold(ks, map_new(), |m, k| map_insert(m, k, k * 10))
@@ -58,8 +54,6 @@ fn a_test_over_maps_built_in_different_orders_passes_and_then_caches() {
     );
 }
 
-/// The same program with the cache bypassed, so a map-valued answer is recomputed rather than read
-/// back.
 #[test]
 fn a_map_valued_program_passes_with_the_cache_bypassed() {
     let dir = project(SOURCE);

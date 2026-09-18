@@ -1,11 +1,8 @@
-//! `Float` and `Decimal` through the real binary.
-
 use assert_cmd::Command;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-/// A tiny billing module: the shape `Decimal` exists for.
 const BILLING: &str = r#"
 pub type Line = { description: String, unit: Decimal, quantity: Int }
 
@@ -72,8 +69,6 @@ fn repo(relative: &str) -> PathBuf {
         .join(relative)
 }
 
-/// The exit criterion for this half of the milestone, in one run: a program written in `Decimal`
-/// checks, runs, and reports a total that lost no cent.
 #[test]
 fn a_decimal_program_checks_runs_and_tests_clean() {
     let dir = project(BILLING);
@@ -93,7 +88,6 @@ fn a_decimal_program_checks_runs_and_tests_clean() {
     assert_eq!(test.status.code(), Some(0), "{}", combined(&test));
 }
 
-/// The four tests above are cached like any other, so a second run selects none of them.
 #[test]
 fn decimal_tests_are_cached_exactly_as_any_other_are() {
     let dir = project(BILLING);
@@ -125,7 +119,6 @@ fn decimal_division_is_e0209_and_names_decimal_div() {
     );
 }
 
-/// The fixture `tests/fixtures/` owes for `E0209`.
 #[test]
 fn the_decimal_division_fixture_reports_e0209_and_nothing_else() {
     let dir = tempfile::tempdir().unwrap();
@@ -166,9 +159,7 @@ law "a float is a float" forall (x: Float, y: Float) where x < y { !(y < x) }
 pub fn main() -> Int = 0
 "#;
 
-/// The worst defect this project can ship is a wrong `proved`, and this is the shape most likely to
-/// produce one: two false laws that are true everywhere except `NaN`, and two that are true
-/// *everywhere*.
+/// Two laws false only at `NaN` and two true everywhere: the shape most likely to produce a wrong `proved`.
 #[test]
 fn no_float_law_is_ever_reported_proved() {
     let dir = project(FLOAT_LAWS);
@@ -188,8 +179,7 @@ fn no_float_law_is_ever_reported_proved() {
     }
     assert_eq!(report["summary"]["proved"], 0, "{text}");
 
-    // And the generator earns the refutation rather than the prover guessing at it: the
-    // counterexample to `x == x` is the value the type is defined by.
+    // The counterexample to `x == x` is the value the type is defined by.
     let refuted = obligations
         .iter()
         .find(|o| {
@@ -206,9 +196,7 @@ fn no_float_law_is_ever_reported_proved() {
     );
 }
 
-/// The `Decimal` half of the same claim, and the control that shows the refusal above is about
-/// `Float` rather than about numerics in general: a congruence over `Decimal` *is* provable,
-/// because its `==` is an equivalence relation.
+/// `Decimal`'s `==` is an equivalence relation, so the refusal above is about `Float`, not numerics.
 #[test]
 fn a_decimal_congruence_is_proved_and_decimal_arithmetic_is_not() {
     let dir = project(
@@ -239,8 +227,7 @@ fn a_decimal_congruence_is_proved_and_decimal_arithmetic_is_not() {
     assert_ne!(tier("additive"), "proved", "{text}");
 }
 
-/// A `Float` in a program still runs, and `-0.0` is the value most
-/// likely to make them disagree.
+/// `-0.0` is the value most likely to make the engines disagree.
 #[test]
 fn the_two_engines_agree_over_the_numeric_types() {
     let dir = project(
@@ -261,7 +248,6 @@ fn the_two_engines_agree_over_the_numeric_types() {
     assert_eq!(out.status.code(), Some(0), "{}", combined(&out));
 }
 
-/// A `Decimal` overflow is a diagnostic, not a wrap and not a rounding.
 #[test]
 fn a_decimal_overflow_is_reported_rather_than_absorbed() {
     let dir = project(

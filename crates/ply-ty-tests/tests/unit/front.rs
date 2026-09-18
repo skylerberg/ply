@@ -418,7 +418,7 @@ fn a_front_writes_reads_and_writes_to_the_same_text() {
     );
     assert!(text.contains("binder 20\nxs 1 62 70\nList<Int>"), "{text}");
     assert!(text.contains("testhash 0 "), "{text}");
-    // The fields the syntax tree carries, which `front.ply` pins the same way.
+    // Syntax-tree fields, which `front.ply` pins the same way.
     assert!(text.contains("public 1\n1reuse 1\n1"), "{text}");
     assert!(text.contains("param 9\nxs 1 8 10"), "{text}");
     assert!(text.contains("type m.Shape "), "{text}");
@@ -517,7 +517,6 @@ fn the_reader_names_what_it_refuses() {
         "{err}"
     );
 
-    // The `testhash 0` frame whole, once more: its header line, then as many bytes as it says.
     let at = text.find("testhash 0 ").unwrap();
     let header_end = at + text[at..].find('\n').unwrap();
     let length: usize = text[at + "testhash 0 ".len()..header_end].parse().unwrap();

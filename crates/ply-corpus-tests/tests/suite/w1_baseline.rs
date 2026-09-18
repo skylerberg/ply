@@ -1,5 +1,3 @@
-//! The before column of W2's headline number has to be a twin, not a guess.
-
 use ply_corpus::serve::{Endpoint, Parser};
 use ply_eval::Plan;
 use std::path::PathBuf;
@@ -46,9 +44,6 @@ fn the_reconstructed_parser_passes_every_test_the_shipped_one_does() {
         selection.total
     );
 
-    // Under tier-only (ADR 0048) the reconstruction runs on a compiled tier, which the whole Ply
-    // emitter produces from the module source texts — hello.ply serves over host effects the
-    // reference fragment does not carry, so the texts are what make the twin comparison honest.
     let report = ply_cli::commands::common::run_on_tier(
         &loaded,
         &selection,

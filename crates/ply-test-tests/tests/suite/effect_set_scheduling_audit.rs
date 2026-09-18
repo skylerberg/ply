@@ -1,6 +1,3 @@
-//! What an over-broad `effect set` costs the scheduler — the required tests's required test 8, and the
-//! other half of "an alias is annotation-only".
-
 use crate::fixture::Compiled;
 use ply_test::{group_by_conflict, shared_footprint};
 use ply_ty::Footprint;
@@ -20,7 +17,6 @@ effect store {
 }
 ";
 
-/// Two endpoints, one reading `items` and one writing `orders`, and one test reaching each.
 const PRECISE: &str = "\
 fn list_items() -> Int / {store.read[items]} = store.all[items]()
 
@@ -31,7 +27,6 @@ test \"items\" { assert_eq(list_items(), 0) }
 test \"orders\" { assert_eq(place_order(), 2) }
 ";
 
-/// The same two endpoints, both annotated with one set that covers the union.
 const ALIASED: &str = "\
 effect set Desk = {store.read[items], store.write[orders]}
 
@@ -59,7 +54,6 @@ fn precise_rows_let_two_disjoint_endpoints_run_side_by_side() {
     );
 }
 
-/// The headline: one set, two endpoints, and now they cannot share a round.
 #[test]
 fn one_over_broad_set_serialises_two_endpoints_that_do_not_contend() {
     let compiled = Compiled::anonymous(&format!("{STORE}{ALIASED}"));
@@ -76,8 +70,6 @@ fn one_over_broad_set_serialises_two_endpoints_that_do_not_contend() {
     );
 }
 
-/// And the atoms that did it are nameable, which is what makes the cost a finding rather than a
-/// mystery.
 #[test]
 fn the_atoms_that_serialised_them_are_the_expansions_and_not_a_name() {
     let compiled = Compiled::anonymous(&format!("{STORE}{ALIASED}"));
@@ -108,8 +100,6 @@ fn the_atoms_that_serialised_them_are_the_expansions_and_not_a_name() {
     );
 }
 
-/// The claim the cost of an over-broad alias makes about *why* it is only a cost and never a soundness defect: the
-/// widening is upward.
 #[test]
 fn an_alias_only_ever_widens_a_tests_footprint() {
     let precise = Compiled::anonymous(&format!("{STORE}{PRECISE}")).footprints();

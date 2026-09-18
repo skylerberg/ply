@@ -1,5 +1,3 @@
-//! Drives the real binary.
-
 use assert_cmd::Command;
 use serde_json::Value;
 use std::path::Path;
@@ -51,8 +49,6 @@ fn json_of(output: &std::process::Output) -> Value {
         .unwrap_or_else(|e| panic!("stdout was not one JSON object: {e}\n---\n{text}\n---"))
 }
 
-// --- check ------------------------------------------------------------------
-
 #[test]
 fn check_accepts_a_good_module() {
     let dir = project(GREEN);
@@ -70,8 +66,6 @@ fn check_types_prints_signatures_and_footprints() {
     let out = ply(dir.path()).args(["check", "--types"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     let text = stdout_of(&out);
-    // W3 moved the row onto its own line under the type, because at a hundred endpoints a row run
-    // onto the end of a signature is a row nobody reads.
     assert!(
         text.contains("     rows : () -> List<Int>\n            / {m.db.read[users]}\n"),
         "got:\n{text}"
@@ -79,9 +73,6 @@ fn check_types_prints_signatures_and_footprints() {
     assert!(text.contains("effect db"));
 }
 
-/// `--costs` — the residue the checker reports since ADR 0034: an append copies only when
-/// something else genuinely owns the list, and a binding read again after the append is the
-/// plainest such owner. Position decides nothing any more.
 #[test]
 fn check_costs_separates_two_spellings_of_one_computation() {
     let dir = project(
@@ -104,8 +95,7 @@ fn check_costs_separates_two_spellings_of_one_computation() {
         text.contains("m.grows_shared  1 COPIES"),
         "the read-again spelling must read `COPIES`:\n{text}"
     );
-    // The fix is named, and `copy` is not what is offered: the warning names the restructuring
-    // and never recommends the pessimization.
+    // The warning names the restructuring and never recommends `copy`.
     assert!(
         text.contains("fix: make the append the binding's last use"),
         "a copy must name its edit:\n{text}"
@@ -120,8 +110,6 @@ fn check_costs_separates_two_spellings_of_one_computation() {
     );
 }
 
-/// A program with no append says so, rather than printing nothing and leaving a
-/// reader unable to tell a clean program from a flag that did not run.
 #[test]
 fn check_costs_says_so_when_there_is_nothing_to_cost() {
     let dir = project(GREEN);
@@ -168,8 +156,6 @@ fn check_json_is_a_single_object_even_when_the_module_is_broken() {
     assert_eq!(v["diagnostics"][0]["labels"][0]["start"]["line"], 1);
 }
 
-// --- test -------------------------------------------------------------------
-
 #[test]
 fn test_leads_with_the_selection_line() {
     let dir = project(GREEN);
@@ -194,8 +180,6 @@ fn a_second_run_selects_nothing_because_the_cache_is_exact() {
     assert!(text.contains("0 failed, 0 passed, 2 cached"));
 }
 
-/// The compiled loop's whole point, and what it could not do before engines were told apart: a
-/// backed run reads the passes backed runs earned, so a second one selects nothing.
 #[test]
 fn a_second_backed_run_selects_nothing() {
     let dir = project(GREEN);
@@ -213,8 +197,6 @@ fn a_second_backed_run_selects_nothing() {
     assert!(text.contains("selected 0 of 2 (2 cached)"), "got:\n{text}");
 }
 
-/// Under tier-only the default run and `--backend c` are one engine: a pass either earns, the
-/// other reads. A backend wrong on purpose stays in a namespace of its own (below).
 #[test]
 fn the_default_tier_and_backend_c_are_one_engine() {
     let dir = project(GREEN);
@@ -239,8 +221,6 @@ fn the_default_tier_and_backend_c_are_one_engine() {
     );
 }
 
-/// A backend that is wrong on purpose exists so that a green run can be read as evidence, and a
-/// run that skipped the test is not evidence. It gets no store in either direction.
 #[test]
 fn a_corrupt_backend_neither_reads_nor_writes_the_cache() {
     let dir = project(GREEN);
@@ -268,8 +248,6 @@ fn a_corrupt_backend_neither_reads_nor_writes_the_cache() {
     );
 }
 
-/// The warm process, end to end: one invocation, two runs, and the second one does not pay a front
-/// end at all because the tree it holds is the tree on disk.
 #[test]
 fn watch_reruns_on_a_save_and_keeps_the_front_end_it_already_had() {
     let dir = project(GREEN);
@@ -280,10 +258,7 @@ fn watch_reruns_on_a_save_and_keeps_the_front_end_it_already_had() {
         .spawn()
         .unwrap();
 
-    // One JSON object per iteration, concatenated; the reader hands each over as it lands, so the
-    // save below happens after the first iteration has reported rather than at a guessed moment
-    // inside it -- a save the watcher sees while it is still running the tree it already holds
-    // is not a change to notice.
+    // The save happens only after the first iteration reports: a save seen mid-run is not a change to notice.
     let stdout = child.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -298,8 +273,7 @@ fn watch_reruns_on_a_save_and_keeps_the_front_end_it_already_had() {
     let first = rx
         .recv_timeout(window)
         .expect("`--watch` reported its first iteration");
-    // Save the module byte for byte as it already is -- the common case in a loop, and the one
-    // that must not cost a front end.
+    // Saved byte for byte as it is: the common case, and the one that must not cost a front end.
     std::fs::write(dir.path().join("m.ply"), GREEN).unwrap();
     let second = rx
         .recv_timeout(window)
@@ -311,9 +285,7 @@ fn watch_reruns_on_a_save_and_keeps_the_front_end_it_already_had() {
         assert_eq!(report["ok"], Value::Bool(true), "iteration {i}: {report}");
     }
 
-    // The property the warm process exists for, and the one an unarmed claim would rot around: the
-    // save changed no byte, so the second iteration re-derived no front end. A cold invocation
-    // cannot report this, because it has no front end to keep.
+    // The save changed no byte, so the second iteration re-derived no front end.
     let second = &reports[1];
     assert_eq!(
         second["front_end"]["phases"]["total"], 0.0,
@@ -380,8 +352,7 @@ fn editing_a_body_re_runs_exactly_the_tests_that_reach_it() {
     assert_eq!(ran, ["a is one"]);
 }
 
-/// `ply test` loads twice: once to select, and once more to parse the modules a selected test needs
-/// a body from.
+/// `ply test` loads twice: once to select, and once more to parse the modules a selected test needs a body from.
 #[test]
 fn a_nondet_test_elsewhere_does_not_cost_an_edited_module_its_body() {
     let dir = tempfile::tempdir().unwrap();
@@ -476,8 +447,7 @@ fn test_json_is_exactly_one_object_on_stdout() {
     assert_eq!(failure["diagnostic"]["code"], "E0501");
     assert_eq!(failure["diagnostic"]["labels"][0]["file"], "m.ply");
     assert!(failure["diagnostic"]["labels"][0]["start"]["line"].is_number());
-    // Schema v2: a ranked object per suspect, so that a consumer reading only `suspects[0]` gets
-    // the best guess rather than the alphabetically first.
+    // Ranked, so a consumer reading only `suspects[0]` gets the best guess rather than the alphabetically first.
     assert_eq!(failure["suspects"][0]["name"], "m.balance");
     assert_eq!(failure["suspects"].as_array().unwrap().len(), 1);
 
@@ -567,13 +537,9 @@ fn explain_reports_a_reason_per_test_and_a_footprint_per_group() {
     assert!(text.contains("region-isolated and free"), "got:\n{text}");
 }
 
-/// A report that still said `world` after the forkable world was gone would
-/// over-claim by exactly the tests that moved, so `--explain` names the contention *and* what kind
-/// it is.
 #[test]
 fn explain_separates_a_region_label_contention_from_a_real_one() {
-    // The `cell` atoms reach the footprint through a written row: the escape brand closed every route
-    // that carried a cell out of its region, so an annotation is the only way one gets there.
+    // The `cell` atoms reach the footprint only through a written row: nothing carries a cell out of its region.
     let dir = project(
         "fn touches(n: Int) -> Int / {cell.read[table], cell.write[table]} = n\n\
          test \"a\" {\n  \
@@ -614,16 +580,13 @@ fn explain_separates_a_region_label_contention_from_a_real_one() {
     assert_eq!(v["selection"]["parallelism"]["isolated"], 1);
 }
 
-/// The milestone's claim has to be a number a project can watch, on every run and not only under
-/// `--explain`.
 #[test]
 fn a_run_reports_how_many_tests_cannot_disturb_another() {
     let dir = project(GREEN);
     let text = stdout_of(&ply(dir.path()).arg("test").output().unwrap());
     assert!(text.contains("isolated 2 of 2"), "got:\n{text}");
 
-    // The writing test cannot pass — an atom that escapes the test is an operation nothing handles
-    // — but the schedule is still an artifact about it, which is the half being asserted here.
+    // The writing test cannot pass, but the schedule is still about it, which is what is asserted.
     let effectful = project(
         "effect db {\n  write put[t](v: Int) -> Unit\n}\n\
          fn store(v: Int) -> Int / {db.write[users]} = { db.put[users](v); v }\n\
@@ -754,8 +717,6 @@ fn a_nondet_test_in_a_det_test_is_a_compile_error() {
     let v = json_of(&out);
     assert_eq!(v["diagnostics"][0]["code"], "E0412");
 }
-
-// --- directories ------------------------------------------------------------
 
 fn multi_module() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -929,8 +890,6 @@ fn a_missing_path_is_a_diagnostic_with_exit_two() {
     );
 }
 
-// --- run --------------------------------------------------------------------
-
 #[test]
 fn run_evaluates_main() {
     let dir = project(GREEN);
@@ -1010,8 +969,6 @@ fn two_mains_are_reported_rather_than_resolved_by_load_order() {
     assert_eq!(v["entry"], "two.main");
 }
 
-// --- simulated time ---------------------------------------------------------
-
 /// Ten minutes of it, which no runner will spend on a test.
 const SLEEPER: &str = "\
 fn nap() -> Int / {clock.write, clock.read} = {
@@ -1024,10 +981,7 @@ test \"ten simulated minutes cost no wall clock\" {
 }
 ";
 
-/// `clock.sleep` moves a region's virtual time and waits for nothing: the whole reason a test can
-/// assert a retry backoff, and the property a real sleep in the runtime would quietly take away.
-/// The program asserts the jump; that the ten minutes were not waited out is a `slow-timeout` on
-/// this test in `.config/nextest.toml`, which kills the process rather than reading a clock here.
+/// That the ten minutes are not waited out is this test's `slow-timeout` in `.config/nextest.toml`.
 #[test]
 fn a_simulated_sleep_is_a_jump_rather_than_a_wait() {
     let dir = project(SLEEPER);
@@ -1042,8 +996,6 @@ fn a_simulated_sleep_is_a_jump_rather_than_a_wait() {
     );
     assert_eq!(out.status.code(), Some(0), "{text}");
 }
-
-// --- tasks under --host -----------------------------------------------------
 
 const SPAWN_UNDER_A_HANDLER: &str = "\
 effect note {
@@ -1104,8 +1056,6 @@ test \"a task cannot reach a clause that binds resume\" {
 }
 ";
 
-/// The production region is opened by the first `task.spawn`, on the stack that holds the
-/// handlers `main` installed before it: a task performs against those.
 #[test]
 fn a_task_under_host_performs_against_the_handlers_around_its_spawn() {
     let dir = project(SPAWN_UNDER_A_HANDLER);
@@ -1120,8 +1070,6 @@ fn a_task_under_host_performs_against_the_handlers_around_its_spawn() {
     );
 }
 
-/// When the region's loop ends on a task's failure it resumes the root directly, and the root
-/// unwinds its own handlers on its own stack rather than the loop's.
 #[test]
 fn a_task_that_fails_under_host_is_reported_rather_than_aborting_the_process() {
     let dir = project(A_TASK_FAILS_UNDER_HANDLERS);
@@ -1150,8 +1098,6 @@ fn a_task_reaching_a_clause_that_binds_resume_is_refused_with_a_diagnostic() {
     assert!(!text.contains("panicked"), "{text}");
 }
 
-// --- hosts ------------------------------------------------------------------
-
 #[test]
 fn hosts_defaults_to_hermetic_and_still_says_what_would_bind() {
     let dir = project(GREEN);
@@ -1163,8 +1109,7 @@ fn hosts_defaults_to_hermetic_and_still_says_what_would_bind() {
         text.contains("no host handler is bound"),
         "an empty listing is indistinguishable from a registry that failed to load:\n{text}"
     );
-    // Never a bare "nothing here": the reader has to be able to tell an empty trusted computing
-    // base from a binding that was simply not asked for.
+    // Never a bare "nothing here": an empty trusted computing base must read differently from an unasked binding.
     assert!(text.lines().filter(|l| !l.trim().is_empty()).count() >= 2);
 }
 
@@ -1238,8 +1183,6 @@ fn hosts_on_a_broken_program_is_a_compile_error_with_a_clean_stdout() {
     assert!(String::from_utf8(out.stderr).unwrap().contains("E0201"));
 }
 
-// --- `--host` on test and run -----------------------------------------------
-
 #[test]
 fn test_is_hermetic_without_the_flag_and_says_which_binding_it_used() {
     let dir = project(GREEN);
@@ -1247,8 +1190,7 @@ fn test_is_hermetic_without_the_flag_and_says_which_binding_it_used() {
     assert_eq!(v["binding"], "hermetic");
     assert_eq!(v["hosts"]["operations"], 0);
     assert!(v["hosts"]["digest"].as_str().unwrap().starts_with("b3:"));
-    // Nothing is bound, so no test can reach a host handler, and every test is classified exactly
-    // as it was before W1.
+    // Nothing is bound, so no test can reach a host handler.
     assert_eq!(v["selection"]["host"], 0);
     for test in v["selection"]["tests"].as_array().unwrap() {
         assert_eq!(test["host"], false);
@@ -1276,8 +1218,6 @@ fn host_changes_the_binding_a_run_reports() {
     );
 }
 
-/// Visible without `--json`: a person reading the terminal has to be able to see that this run
-/// reached outside itself.
 #[test]
 fn a_host_run_says_so_in_the_summary_a_person_reads() {
     let dir = project(GREEN);
@@ -1287,13 +1227,11 @@ fn a_host_run_says_so_in_the_summary_a_person_reads() {
     assert!(text.contains("not cached"), "got:\n{text}");
     assert!(text.contains("binding host"), "got:\n{text}");
 
-    // And silent when nothing was asked for, so the ordinary run reads exactly as it did before W1.
+    // And silent when nothing was asked for.
     let hermetic = stdout_of(&ply(dir.path()).args(["test"]).output().unwrap());
     assert!(!hermetic.contains("binding host"), "got:\n{hermetic}");
 }
 
-/// The trivially-parallel count is a claim, and a claim that grew when a socket was bound would be
-/// the over-claim host effects having no region isolation exists to prevent.
 #[test]
 fn explain_never_reports_more_isolation_under_host_than_without_it() {
     let dir = project(GREEN);
@@ -1334,9 +1272,7 @@ fn run_is_hermetic_by_default_and_reports_its_binding() {
     );
 }
 
-/// Corollary 1 of the host boundary contract, checked end to end: if a binding moved a hash, a row or an E0412
-/// verdict, `ply check` would answer differently under `--host` and every cache in the system would
-/// split on a flag.
+/// If a binding moved a hash, a row or an E0412 verdict, every cache would split on a flag.
 #[test]
 fn a_binding_changes_nothing_the_front_end_computes() {
     let dir = project(GREEN);
@@ -1366,8 +1302,6 @@ fn a_binding_changes_nothing_the_front_end_computes() {
     assert_eq!(hashes_of(&hermetic), hashes_of(&bound));
     assert_eq!(hermetic["selection"]["total"], bound["selection"]["total"]);
 }
-
-// --- hash -------------------------------------------------------------------
 
 #[test]
 fn hash_prints_a_short_hash_per_definition() {
@@ -1452,8 +1386,7 @@ fn moving_a_definition_between_modules_re_runs_nothing() {
     );
 }
 
-/// A module is loaded in path order but checked in dependency order, and test indices are shared
-/// between the two.
+/// Modules load in path order but check in dependency order, and test indices are shared between the two.
 #[test]
 fn an_edit_re_runs_the_test_that_reaches_it_when_load_order_is_not_dependency_order() {
     let dir = tempfile::tempdir().unwrap();
@@ -1481,8 +1414,6 @@ fn an_edit_re_runs_the_test_that_reaches_it_when_load_order_is_not_dependency_or
         .collect();
     assert_eq!(ran, ["a.a one"], "the wrong test was re-run");
 }
-
-// --- cache ------------------------------------------------------------------
 
 #[test]
 fn cache_stats_counts_what_a_run_recorded() {
@@ -1565,8 +1496,7 @@ fn an_earlier_module_does_not_lose_the_attribution() {
     assert_eq!(culprit["definitions"][0], "b.b holds");
 }
 
-/// The baseline is read during the *diagnosis* of a failure, which happens after every other point
-/// the run collects warnings from the store.
+/// The baseline is read while diagnosing a failure, after every other point the run collects store warnings.
 #[test]
 fn a_corrupt_baseline_is_reported_rather_than_read_as_never_passed() {
     let dir = project(GREEN);
@@ -1804,8 +1734,6 @@ fn cache_inspect_reports_a_test_and_whether_it_is_proven() {
     assert_eq!(v["matches"][0]["interface"]["nondet"], false);
 }
 
-/// The whole point of telling the user: a front-end cache this build cannot read costs a recompile
-/// and *no* test re-runs, and only saying the first half reads as though the results went too.
 #[test]
 fn an_unreadable_front_end_cache_says_the_results_survived_it() {
     let dir = project(GREEN);
@@ -1828,8 +1756,6 @@ fn an_unreadable_front_end_cache_says_the_results_survived_it() {
     );
 }
 
-/// The migration proper: a project whose cache directory still holds the JSON front-end cache and
-/// none of the binary one.
 #[test]
 fn a_leftover_json_front_end_cache_is_explained_and_then_removed() {
     let dir = project(GREEN);
@@ -1886,8 +1812,6 @@ fn cache_stats_reports_a_discarded_front_end_cache_too() {
     assert!(codes.contains(&"W0603"), "got {codes:?}");
 }
 
-// --- the failure artifact ---------------------------------------------------
-
 #[test]
 fn test_json_carries_schema_version_four_and_a_ranked_suspect_object() {
     let dir = project(RED);
@@ -1927,9 +1851,6 @@ fn test_json_carries_schema_version_four_and_a_ranked_suspect_object() {
     assert!(f["causal_slice"].is_null());
 }
 
-/// A first-ever red test and a regression are different situations, and this is where the
-/// difference shows: a regression leads with a name, a test that has never passed leads with why
-/// there is no name to lead with.
 #[test]
 fn a_test_that_has_never_passed_says_why_it_has_no_culprit() {
     let dir = project(RED);
@@ -1967,8 +1888,6 @@ fn bisect_never_reports_not_requested_and_is_still_one_json_object() {
     assert_eq!(v["failures"][0]["culprit"]["search"]["evaluated"], 0);
 }
 
-/// Two runs over one failure must produce the same bytes, or an agent cannot diff today's artifact
-/// against yesterday's.
 #[test]
 fn two_runs_over_one_failure_emit_the_same_artifact() {
     let dir = project(RED);
@@ -1979,8 +1898,6 @@ fn two_runs_over_one_failure_emit_the_same_artifact() {
         serde_json::to_string(&twice["failures"]).unwrap()
     );
 }
-
-// --- shape ------------------------------------------------------------------
 
 #[test]
 fn every_subcommand_answers_help_and_exits_zero() {
@@ -2018,8 +1935,6 @@ fn test_no_incremental_still_selects_the_same_tests() {
     );
 }
 
-/// Where a run's front end went is part of the reported interface: `front` is the one question put
-/// to the port, and the parse beside it is the Rust chain the tools still read.
 #[test]
 fn the_front_end_reports_where_its_time_went() {
     let dir = project("fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n");
@@ -2051,7 +1966,6 @@ fn the_front_end_reports_where_its_time_went() {
     );
 }
 
-/// An edit to one test's module selects that test and no other.
 #[test]
 fn one_edited_test_is_the_only_one_selected() {
     let dir = tempfile::tempdir().unwrap();
@@ -2139,12 +2053,10 @@ fn two_candidate_edits_are_narrowed_to_the_culprit_by_running_the_mixture() {
     assert_eq!(failure["suspects"][1]["culprit"], false);
 }
 
-/// The same narrowing, in a project of more than one file with a warm cache behind it.
 #[test]
 fn an_earlier_file_does_not_cost_the_failure_its_culprit() {
     let dir = project(LEDGER);
-    // Sorts before `m.ply`, so its tests take the indices the fresh body set would otherwise line
-    // `m`'s up against.
+    // Sorts before `m.ply`, so its tests take the indices `m`'s would otherwise line up against.
     std::fs::write(
         dir.path().join("a.ply"),
         "pub fn untouched(x: Int) -> Int = x\n\
@@ -2172,7 +2084,6 @@ fn an_earlier_file_does_not_cost_the_failure_its_culprit() {
     assert!(culprit["search"]["evaluated"].as_u64().unwrap() > 0);
 }
 
-/// `--bisect never` must still cost nothing, now that there is an engine it could have driven.
 #[test]
 fn bisect_never_runs_no_mixture_even_when_one_could_be_built() {
     let dir = project(LEDGER);
@@ -2240,8 +2151,7 @@ fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }
 test \"parity\" { assert(even(4)) }
 ";
 
-/// Members of one strongly connected component share a component hash and one stored body, so no
-/// hybrid can flip one without the other.
+/// An SCC shares one component hash and one stored body, so no hybrid can flip one member without the other.
 #[test]
 fn a_recursive_pair_is_reported_as_one_fused_group_that_says_why() {
     let dir = project(PARITY);
@@ -2268,9 +2178,6 @@ fn a_recursive_pair_is_reported_as_one_fused_group_that_says_why() {
     );
 }
 
-// --- multi-shot resumption --------------------------------------------------
-
-/// A clause that binds a continuation.
 const MULTI_SHOT: &str = "\
 effect amb {
   read flip[coin]() -> Bool
@@ -2312,8 +2219,7 @@ fn a_multi_shot_program_runs_and_caches_with_no_flags_at_all() {
     );
 }
 
-/// One unreadable file is found by more than one read — a lazy consult and a flush that re-reads to
-/// merge — and each reports it.
+/// One unreadable file is found by more than one read: a lazy consult and a flush that re-reads to merge.
 #[test]
 fn an_unreadable_cache_file_is_reported_once_not_once_per_read() {
     let dir = project(GREEN);
@@ -2342,8 +2248,6 @@ fn an_unreadable_cache_file_is_reported_once_not_once_per_read() {
     assert_eq!(unique.len(), messages.len(), "{messages:#?}");
     assert_eq!(out.status.code(), Some(0));
 }
-
-// --- the search plan --------------------------------------------------------
 
 #[test]
 fn the_search_plan_is_published_so_two_runs_can_be_compared() {
@@ -2396,8 +2300,6 @@ fn a_seed_that_is_not_a_seed_is_refused_before_anything_runs() {
     }
 }
 
-/// A flag that cannot mean anything is refused rather than ignored: silently dropped, it reads as a
-/// search that was widened and was not.
 #[test]
 fn a_flag_with_nothing_to_mean_is_refused() {
     let dir = project(GREEN);

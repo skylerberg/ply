@@ -6,9 +6,7 @@ use ply_span::{Span, codes};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// A real slot from a real region, because [`Slot`](ply_eval::arena::Slot) carries a generation
-/// and has no constructor outside the allocator — which is the property that makes a stale one
-/// readable as stale.
+/// A real slot, because a [`Slot`](ply_eval::arena::Slot) carries a generation only the allocator assigns.
 fn cell() -> Value {
     let mut arena = Arena::new();
     arena.open(RegionKind::Shared, Span::DUMMY);
@@ -33,8 +31,7 @@ fn data_without_a_handle_crosses() {
     assert_eq!(carries(&value), None);
 }
 
-/// The erasure route the escape brand leaves open, seen from the boundary: the constructor's field
-/// type mentions no brand, so only the value says so.
+/// The constructor's field type mentions no brand, so only the value says so.
 #[test]
 fn a_handle_inside_a_constructor_is_found_and_the_route_names_it() {
     let value = Value::Ctor {
@@ -70,8 +67,6 @@ fn the_route_reads_outermost_first() {
     );
 }
 
-/// A `Secret` is walked, because a wrapper nothing descends into is a wrapper a handle hides
-/// behind — and the route stops at it, because what is inside one is redacted everywhere else.
 #[test]
 fn a_secret_is_not_a_place_to_hide_a_handle_and_its_shape_stays_redacted() {
     let value = Value::Secret(Arc::new(Value::Ctor {
@@ -104,9 +99,7 @@ fn a_builtin_closure_carries_nothing() {
     assert_eq!(carries(&value), None);
 }
 
-/// The backstop the module doc describes, exercised where it can be: no source program builds
-/// this closure today (`E0302` refuses the shape at the constructor), so the environment is
-/// assembled directly.
+/// `E0302` refuses this shape in source, so the environment is assembled directly.
 #[test]
 fn a_closure_whose_scope_reaches_a_handle_is_found_and_the_binding_named() {
     use ply_eval::Closure;

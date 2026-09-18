@@ -1,6 +1,3 @@
-//! What remembering a nullary pure definition is worth on the desk, and what it costs in meaning:
-//! nothing.
-
 use anyhow::Result;
 use ply_corpus::{w3, w6_run};
 use std::path::{Path, PathBuf};
@@ -14,8 +11,6 @@ fn repo() -> PathBuf {
         .to_path_buf()
 }
 
-/// The requests the twin answers without a credential: a constant route, a routing miss, a method
-/// that is refused, and the one that reads the store.
 fn script() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         ("/health", w3::request("GET", "/health", None, false, 0, 0)),
@@ -53,8 +48,7 @@ fn script() -> Vec<(&'static str, Vec<u8>)> {
 fn variants() -> Result<(w3::Loaded, w3::Loaded)> {
     let service = w3::Service::open(&repo())?;
     let source = service.source(w3::Variant::Sequential)?;
-    // The ladder's own rewrite, so the control this test asserts on and the control `w6-ladder`
-    // prices the lever against are one program.
+    // The ladder's own rewrite, so this control and the one `w6-ladder` prices against are one program.
     let control = w6_run::without_constants(&source);
     assert_ne!(source, control, "the rewrite found nothing to disable");
     Ok((w3::Loaded::parse(&source)?, w3::Loaded::parse(&control)?))
@@ -78,12 +72,10 @@ fn remembering_a_constant_changes_no_byte_of_any_response() {
     }
 }
 
-/// Alternating, best-of, in one process.
 #[test]
 fn what_remembering_the_constants_is_worth_per_request() {
     let (memoized, control) = variants().expect("both variants load");
-    // `limits().max_keep_alive` is 100, so a connection carrying more requests than that would be
-    // closed part way and the divisor would be a fiction.
+    // `limits().max_keep_alive` is 100: more requests than that would close the connection part way.
     let per_conn = 32usize;
     let connections = 16usize;
     let requests = per_conn * connections;
@@ -117,16 +109,12 @@ fn what_remembering_the_constants_is_worth_per_request() {
     }
 }
 
-/// The rung the ladder reads routing off, and the definition this began with.
 #[test]
 fn what_the_route_table_costs_to_rebuild() {
     let loaded = w6_run::program(&repo()).expect("the ladder's driver loads");
     let bench = loaded.full("w6_bench").expect("the driver is present");
     let iterations = 2000u32;
-    // Each rung runs its loop `iterations` deep as tail recursion, which the tier compiles to that
-    // many native C frames (ADR 0048); a `cargo test` thread's 2 MiB stack overflows well before
-    // the language's call limit, so the loop runs on a deep stack, as the CLI's own worker pool
-    // would give it.
+    // The tier compiles the tail-recursive loop to native C frames, which overflow a test thread's stack.
     let (empty, table, routed, hoisted) = ply_corpus::on_deep_stack(|| {
         let mode = |m: i64| -> f64 {
             let mut best = f64::MAX;

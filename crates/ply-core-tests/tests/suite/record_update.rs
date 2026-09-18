@@ -1,5 +1,3 @@
-//! What `{..b, f: e}` does to a check, at the source level.
-
 use crate::fixture::compile;
 use ply_core::{CheckOutput, print_scheme};
 use ply_span::{Diagnostic, SourceId, Symbol, codes};
@@ -33,7 +31,6 @@ fn scheme(out: &CheckOutput, name: &str) -> String {
 
 const DECLS: &str = "type L = {a: Int, b: Int, c: Int}\ntype W = {lim: L, n: Int}\n";
 
-/// The claim the brief states as the feature's job: **the update's type is the base's type.**
 #[test]
 fn an_updates_type_is_its_bases_type() {
     let out = ok(&format!(
@@ -50,7 +47,6 @@ fn an_updates_type_is_its_bases_type() {
     }
 }
 
-/// The width is not taken on trust.
 #[test]
 fn a_narrower_result_annotation_is_a_mismatch() {
     let diags = errors(&format!(
@@ -59,20 +55,15 @@ fn a_narrower_result_annotation_is_a_mismatch() {
     only(&diags, codes::TYPE_MISMATCH);
 }
 
-/// A replacement value is checked against the field it replaces, exactly as it would be in the
-/// longhand.
 #[test]
 fn a_replacement_of_the_wrong_type_is_a_mismatch() {
     let diags = errors(&format!("{DECLS}fn f(s: L) -> L = {{..s, b: \"x\"}}\n"));
     only(&diags, codes::TYPE_MISMATCH);
 }
 
-/// The twelve fields `chunk_trailers` stops writing cannot be mispaired, because they are not
-/// spelled.
 #[test]
 fn the_longhand_admits_a_mispairing_the_update_cannot_express() {
-    // All three fields are `Int`, so swapping two of them type-checks and is silently wrong — the
-    // defect record update removes structurally.
+    // All three fields are `Int`, so the swap type-checks and is silently wrong.
     ok(&format!(
         "{DECLS}fn swapped(s: L) -> L = {{a: s.c, b: 1, c: s.a}}\n"
     ));
@@ -119,7 +110,6 @@ fn a_base_with_no_nameable_shape_is_e0116() {
     }
 }
 
-/// The module-local restriction, stated as a test rather than as prose.
 #[test]
 fn a_shape_declared_in_another_module_is_refused() {
     let inputs = vec![
@@ -142,8 +132,6 @@ fn a_shape_declared_in_another_module_is_refused() {
     );
 }
 
-/// The fixtures `tests/fixtures/` owes for the two new codes, checked here rather than left as
-/// files nothing reads.
 #[test]
 fn the_fixtures_produce_the_codes_they_are_named_for() {
     for (path, code) in [

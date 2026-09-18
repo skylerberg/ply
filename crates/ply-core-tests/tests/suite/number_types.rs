@@ -1,6 +1,3 @@
-//! The eight fixed-width integer types, at the checker: what pins a literal, what refuses to
-//! widen, and what the conversions publish.
-
 use crate::fixture::compile;
 use ply_core::{CheckOutput, print_type};
 use ply_span::{Diagnostic, Symbol, codes};
@@ -27,7 +24,6 @@ fn sig(out: &CheckOutput, name: &str) -> String {
     print_type(&out.defs[&Symbol::new(format!("m.{name}"))].scheme.ty)
 }
 
-/// All eight exist, and arithmetic at each answers that type rather than `Int`.
 #[test]
 fn arithmetic_is_defined_at_each_of_the_eight() {
     let out = ok(r#"
@@ -45,7 +41,6 @@ fn h(x: I64, y: I64) -> I64 = x * y
     assert_eq!(sig(&out, "h"), "(I64, I64) -> I64");
 }
 
-/// The whole point of the family: a value can say it is thirty-two bits wide.
 #[test]
 fn a_record_field_can_be_a_fixed_width_type() {
     let out = ok(r#"
@@ -55,8 +50,6 @@ fn combine(w: Word) -> U32 = w.hi ^ w.lo
     assert_eq!(sig(&out, "combine"), "({hi: U32, lo: U32}) -> U32");
 }
 
-/// A literal's type is its spelling, which is the decision §5.2 already took for `Decimal`: `1`,
-/// `1.0`, `1m` and `1u32` are four literals with four types.
 #[test]
 fn a_literal_carries_its_width_as_a_suffix() {
     let out = ok(r#"
@@ -70,12 +63,10 @@ fn e() -> Int = 5
     assert_eq!(sig(&out, "b"), "() -> U32");
     assert_eq!(sig(&out, "c"), "() -> I8");
     assert_eq!(sig(&out, "d"), "(U16) -> U16");
-    // An unsuffixed literal is an `Int` and stays one; nothing widens it.
     assert_eq!(sig(&out, "e"), "() -> Int");
     assert_eq!(code("fn f(x: U16) -> U16 = x + 1\n"), codes::TYPE_MISMATCH);
 }
 
-/// The lexer bounds a suffixed literal by its type, so nothing downstream has to.
 #[test]
 fn a_literal_outside_its_type_is_refused() {
     assert_eq!(code("fn f() -> U8 = 256u8\n"), codes::LITERAL_OUT_OF_RANGE);
@@ -86,8 +77,7 @@ fn a_literal_outside_its_type_is_refused() {
     );
     ok("fn f() -> U8 = 255u8\n");
     ok("fn f() -> I8 = 127i8\n");
-    // A hex literal is a bit pattern, so its bound is the width: the largest `U64` is written as
-    // one, and `0xFFu8` is 255 rather than a refusal.
+    // A hex literal is a bit pattern, so its bound is the width: `0xFFu8` is 255.
     ok("fn f() -> U64 = 0xFFFF_FFFF_FFFF_FFFFu64\n");
     ok("fn f() -> U8 = 0xFFu8\n");
     assert_eq!(
@@ -96,8 +86,6 @@ fn a_literal_outside_its_type_is_refused() {
     );
 }
 
-/// No numeric tower and no implicit widening — the rule `Int`, `Float` and `Decimal` already
-/// keep, extended over eight more types rather than relaxed for them.
 #[test]
 fn nothing_widens_implicitly() {
     assert_eq!(
@@ -115,7 +103,6 @@ fn nothing_widens_implicitly() {
     );
 }
 
-/// Sixteen conversions, and the widths reach each other only through `Int`.
 #[test]
 fn the_conversions_publish_what_they_promise() {
     let out = ok(r#"
@@ -134,8 +121,6 @@ fn every(n: Int) -> I16 = i16_of_int(n)
     );
 }
 
-/// The bit operators answer their operands' type, and a shift's count is an `Int` whatever the
-/// word is — a count is not a word.
 #[test]
 fn the_bit_operators_are_defined_at_every_integer_type() {
     let out = ok(r#"
@@ -154,7 +139,6 @@ fn ushr(a: I32, n: Int) -> I32 = a >>> n
     );
 }
 
-/// The wrapping builtins are how a program says it meant the wrap, at every integer type.
 #[test]
 fn the_wrapping_builtins_and_rotr_are_defined_at_every_integer_type() {
     let out = ok(r#"
@@ -167,8 +151,7 @@ fn e(x: I64) -> I64 = rotr(x, 3)
     assert_eq!(sig(&out, "a"), "(U32, U32) -> U32");
     assert_eq!(sig(&out, "c"), "(Int, Int) -> Int");
     assert_eq!(sig(&out, "d"), "(U32) -> U32");
-    // `forall a. (a, a) -> a` alone would take two `String`s; the obligation at the call is what
-    // refuses them.
+    // `forall a. (a, a) -> a` alone takes two `String`s; the obligation at the call refuses them.
     assert_eq!(
         code("fn f(a: String, b: String) -> String = wrap_add(a, b)\n"),
         codes::TYPE_MISMATCH
@@ -179,7 +162,6 @@ fn e(x: I64) -> I64 = rotr(x, 3)
     );
 }
 
-/// They order and compare, so they are map keys and `derive` leaves.
 #[test]
 fn a_fixed_width_type_is_a_map_key_and_a_derivable_leaf() {
     let out = ok(r#"

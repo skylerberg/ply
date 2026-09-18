@@ -1,5 +1,3 @@
-//! Determinism where derivation and the stdlib touch content addressing.
-
 use assert_cmd::Command;
 use std::path::Path;
 use tempfile::TempDir;
@@ -25,7 +23,6 @@ fn run(dir: &Path, args: &[&str]) -> (i32, String) {
     (out.status.code().unwrap_or(-1), text)
 }
 
-/// `ply hash`, checked for success and returned whole.
 fn hashes(dir: &Path) -> String {
     let (code, text) = run(dir, &["hash"]);
     assert_eq!(code, 0, "{text}");
@@ -44,8 +41,6 @@ fn hash_of(text: &str, name: &str) -> String {
         .to_string()
 }
 
-/// Everything a derived definition is built out of, hashed twice in two processes and once more
-/// from a second directory.
 const DERIVED: &str = r#"import std.json
 
 pub type Colour = Red | Green | Blue
@@ -89,8 +84,7 @@ fn a_derived_program_hashes_identically_in_two_processes_and_two_directories() {
     );
 }
 
-/// A generated body is written against whatever spelling the module's `import` gives it —
-/// `json::object`, `j::object`, or a bare `object` under a selective import.
+/// A generated body is written against the import's spelling: `json::object`, `j::object`, or a bare `object`.
 #[test]
 fn a_generated_definitions_hash_does_not_depend_on_the_import_that_spelled_it() {
     let body = "\npub type A = { x: Int, y: String }\npub type B = Left(Int) | Right(A)\n\
@@ -116,8 +110,7 @@ fn a_generated_definitions_hash_does_not_depend_on_the_import_that_spelled_it() 
     }
 }
 
-/// The emitter picks its own binder prefix by walking away from the type parameters' names, so
-/// `Pair<a, b>` and `Pair<d, e>` generate *different source*.
+/// The emitter's binder prefix walks away from the type parameters' names, so `Pair<a, b>` and `Pair<d, e>` generate different source.
 #[test]
 fn renaming_a_type_parameter_does_not_move_a_generated_hash() {
     let with = |params: &str, fst: &str, snd: &str| {
@@ -128,8 +121,7 @@ fn renaming_a_type_parameter_does_not_move_a_generated_hash() {
         )
     };
     let plain = project(&[("m.ply", &with("a, b", "a", "b"))]);
-    // `d` is the prefix the emitter reaches for first, so this fixture forces it to walk to `d_`
-    // and rename every binder in the generated body.
+    // `d` is the emitter's first-choice prefix, so this forces it to walk to `d_` and rename every binder.
     let shadowing = project(&[("m.ply", &with("d, e", "d", "e"))]);
     assert_eq!(
         hash_of(&hashes(plain.path()), "pair_json"),
@@ -164,8 +156,6 @@ fn reordering_two_fields_moves_the_hash_and_leaves_the_wire_alone() {
     }
 }
 
-/// The headline invariant, now covering derivation, end to end at the level a user sees: **renaming
-/// the type re-runs no test; renaming a variant re-runs exactly the tests that reach it.**
 #[test]
 fn renaming_the_type_re_runs_no_test_and_renaming_a_variant_re_runs_its_own() {
     let source = |ty: &str, codec: &str, variant: &str| {
@@ -220,8 +210,6 @@ fn renaming_the_type_re_runs_no_test_and_renaming_a_variant_re_runs_its_own() {
     );
 }
 
-/// A derived encoding containing a `Map` must be a function of the map's contents and not of the
-/// history that built it — in one process and across processes.
 #[test]
 fn a_map_in_a_derived_encoding_is_byte_identical_however_it_was_built() {
     let dir = project(&[(
@@ -257,8 +245,7 @@ test "one map, one document" {
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("0 failed, 1 passed"), "{text}");
 
-    // Cached under one order and read back under another: the value is the same value, so the
-    // second run selects nothing.
+    // Cached under one order and read back under another: the same value, so the second run selects nothing.
     let (code, text) = run(dir.path(), &["test"]);
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("selected 0 of 1 (1 cached)"), "{text}");
@@ -267,7 +254,6 @@ test "one map, one document" {
     assert_eq!(code, 0, "{text}");
 }
 
-/// The same claim over the key type it was **false** for until 2026-08-21.
 #[test]
 fn a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last() {
     let dir = project(&[(
@@ -307,8 +293,6 @@ test "one catalogue, one document" {
     );
 }
 
-/// The stdlib digest is **in no cache key**, and this is the assertion that says so from outside: a
-/// cache written under a digest that no longer matches warns and re-runs nothing.
 #[test]
 fn a_stdlib_digest_that_moved_invalidates_nothing() {
     let dir = project(&[(
@@ -339,8 +323,6 @@ fn a_stdlib_digest_that_moved_invalidates_nothing() {
     );
 }
 
-/// Adding a stdlib module to a *program* — which is what an `import std.json` in one file does to
-/// the whole run — must change no hash in a module that does not import it.
 #[test]
 fn pulling_the_stdlib_into_a_program_moves_no_hash_outside_it() {
     const PLAIN: &str = "pub fn total(xs: List<Int>) -> Int = fold(xs, 0, |a, x| a + x)\n\
@@ -368,8 +350,6 @@ fn pulling_the_stdlib_into_a_program_moves_no_hash_outside_it() {
     }
 }
 
-/// A `std` module's source is source: copying it into the project produces the same definitions,
-/// keyed under a real path rather than under `<std>/json.ply`, and neither key may reach the bytes.
 #[test]
 fn a_copied_stdlib_is_the_same_definitions_but_cannot_host_a_derivation() {
     let shipped = project(&[(

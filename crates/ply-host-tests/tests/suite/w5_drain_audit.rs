@@ -1,5 +1,3 @@
-//! The drain's remaining questions, against a real postgres.
-
 use crate::support::cluster::{self, Cluster};
 use ply_eval::Value;
 use ply_eval::host::{HostAnswer, MachineId, Pending};
@@ -42,8 +40,7 @@ fn settle(db: &Postgres, answered: Result<HostAnswer, Diagnostic>) -> Result<Val
     }
 }
 
-/// Issue a statement and hand back the token rather than the answer, which is what a machine holds
-/// while a task is blocked on a host handler.
+/// The token rather than the answer: what a machine holds while a task is blocked on a handler.
 fn issue(db: &Postgres, op: Op, table: &str, sql: &str, owner: Owner) -> Pending {
     let scan = db::scan::scan(sql, Span::DUMMY).expect("the statement scans");
     let at = label(table);
@@ -168,7 +165,6 @@ fn the_drain_answers_its_remaining_questions() {
     a_second_signal_during_the_drain_names_what_it_abandons(&cluster);
 }
 
-/// **Does the drain hang?**
 fn a_task_blocked_on_a_host_handler_does_not_outlast_the_drain(cluster: &Cluster) {
     cluster.psql(
         &cluster.database,
@@ -178,8 +174,7 @@ fn a_task_blocked_on_a_host_handler_does_not_outlast_the_drain(cluster: &Cluster
         lead: Duration::ZERO,
         drain: Duration::from_millis(200),
     });
-    // A statement timeout far above the drain, so "it came back" can only be the drain and never
-    // the statement giving up.
+    // A statement timeout far above the drain, so a return can only be the drain's doing.
     let host = host(cluster, &shutdown, 4, Duration::from_secs(20));
     let db = host.database().expect("a database").clone();
     let runtime = host.runtime();
@@ -202,8 +197,7 @@ fn a_task_blocked_on_a_host_handler_does_not_outlast_the_drain(cluster: &Cluster
         "update ledger set note = 'waiter' where id = 1",
         TWO,
     );
-    // Let it actually reach the lock rather than asserting against a statement that has not been
-    // sent yet.
+    // Let it reach the lock before asserting against it.
     std::thread::sleep(Duration::from_millis(200));
 
     shutdown.request(Signal::Terminate);
@@ -230,15 +224,10 @@ fn a_task_blocked_on_a_host_handler_does_not_outlast_the_drain(cluster: &Cluster
         refused.notes
     );
 
-    // The teardown still runs, and still has to come back **inside the budget it was given**: the
-    // second entry point's statement is *still executing* on a pool thread, blocked on the first's
-    // row lock.
+    // The second entry point's statement is still executing, blocked on the first's row lock.
     let started = Instant::now();
     let report = runtime.shutdown(200);
-    // The budget, plus the connect deadline the last step may hand its answer back within, plus a
-    // second of slack for a loaded machine — and nothing about the twenty-second statement timeout,
-    // which is what a teardown that waited on the server rather than on the operator's deadline
-    // would take.
+    // Budget + connect deadline + slack; never the statement timeout a server-bound teardown takes.
     let bound = Duration::from_millis(200) + Duration::from_secs(5) + Duration::from_secs(1);
     assert!(
         started.elapsed() < bound,
@@ -268,7 +257,6 @@ fn a_task_blocked_on_a_host_handler_does_not_outlast_the_drain(cluster: &Cluster
     cluster.psql(&cluster.database, "delete from ledger");
 }
 
-/// **The pool exhausted at the signal.**
 fn a_drain_with_the_pool_exhausted_still_rolls_back(cluster: &Cluster) {
     let shutdown = Shutdown::new(Bounds {
         lead: Duration::ZERO,
@@ -320,7 +308,6 @@ fn a_drain_with_the_pool_exhausted_still_rolls_back(cluster: &Cluster) {
     );
 }
 
-/// **Before or after.**
 fn the_pool_closes_after_the_rollbacks_and_leaves_no_session(cluster: &Cluster) {
     cluster.psql(
         &cluster.database,
@@ -341,8 +328,7 @@ fn the_pool_closes_after_the_rollbacks_and_leaves_no_session(cluster: &Cluster) 
         Vec::new(),
         ONE,
     );
-    // A second entry point with its own scope, so the teardown has more than one to unwind and the
-    // order is a question rather than a single step.
+    // A second scope, so the teardown's unwind order is a question.
     begin(&db, TWO);
     execute(
         &db,
@@ -390,7 +376,6 @@ fn the_pool_closes_after_the_rollbacks_and_leaves_no_session(cluster: &Cluster) 
     cluster.psql(&cluster.database, "delete from ledger");
 }
 
-/// **The second signal.**
 fn a_second_signal_during_the_drain_names_what_it_abandons(cluster: &Cluster) {
     let shutdown = Shutdown::new(Bounds {
         lead: Duration::ZERO,
@@ -436,8 +421,7 @@ fn a_second_signal_during_the_drain_names_what_it_abandons(cluster: &Cluster) {
     assert_eq!(Signal::Interrupt.exit_code(), 130);
     assert_eq!(Signal::Terminate.exit_code(), 143);
 
-    // The line `exit_now` prints is these two numbers, read from the facilities the coordinator was
-    // attached to.
+    // `exit_now` prints these two numbers, read from the facilities the coordinator holds.
     assert_eq!(
         db.open_scopes(),
         1,
@@ -449,8 +433,7 @@ fn a_second_signal_during_the_drain_names_what_it_abandons(cluster: &Cluster) {
         "the coordinator reads the same number through the trait it holds"
     );
 
-    // And the outcome an operator has to be able to rely on after a `kill -9` shaped exit: postgres
-    // aborted the transaction on the disconnect, so the half-finished body is not durable.
+    // Postgres aborted the transaction on disconnect, so a `kill -9` exit leaves nothing durable.
     drop(host);
     drop(db);
     let until = Instant::now() + Duration::from_secs(30);

@@ -1,4 +1,4 @@
-//! Taking the W6 ladder, so that `w6.rs` only has to assemble and judge it.
+//! Takes the W6 ladder; `w6.rs` assembles and judges it.
 
 use anyhow::{Context, Result, bail};
 use ply_eval::Value;
@@ -59,8 +59,7 @@ pub struct Allocation {
     pub bytes_per_request: f64,
 }
 
-/// The four in-Ply loops rungs 2, 3 and 4 are read off, and the empty one that says what the loop
-/// itself costs.
+/// The in-Ply loops rungs 2-4 are read off, plus an empty one pricing the loop itself.
 const DRIVER: &str = r#"
 
 // --- W6: the in-process ladder's driver -------------------------------------
@@ -194,7 +193,6 @@ fn w6_items(mode: Int, n: Int) -> Int =
   } }
 "#;
 
-/// What the in-process half measured, in the units the ladder wants.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct InProcess {
     /// One `Machine::call` on a function returning a constant.
@@ -205,10 +203,10 @@ pub struct InProcess {
     pub routed_worst_micros: f64,
     pub sim_worst_micros: f64,
     pub socket_worst_micros: f64,
-    /// The floor answering the response `/items` returns, which is what the measured total serves.
+    /// The floor answering the `/items` response.
     pub items_floor_micros: f64,
     pub items_response_bytes: usize,
-    /// The in-Ply loop's own per-iteration cost, and the twin fixture the loop is wrapped in.
+    /// The in-Ply loop's per-iteration cost, and the twin fixture around it.
     pub loop_micros: f64,
     pub fixture_micros: f64,
     pub endpoint_micros: f64,
@@ -233,7 +231,6 @@ pub struct InProcess {
     pub head_bytes: usize,
 }
 
-/// The best and the worst of one measurement's repeats.
 #[derive(Clone, Copy, Debug)]
 struct Repeated {
     best: f64,
@@ -294,9 +291,7 @@ pub fn in_process(
         Ok(seen)
     };
 
-    // Two counts of the empty loop separate the fixture from the scaffold: the slope is what one
-    // iteration costs and the intercept is what building the `MemDb` cost, and neither has to be
-    // assumed.
+    // Two counts of the empty loop: the slope is one iteration, the intercept building the `MemDb`.
     let empty_one = mode(0, iterations)?.best;
     let empty_half = mode(0, iterations / 2)?.best;
     let per_iteration = (empty_one - empty_half) / (iterations - iterations / 2) as f64;
@@ -371,8 +366,7 @@ pub fn in_process(
     })
 }
 
-/// The whole service over a real listener, in this process: the same `run_memory` the `SimNet` rung
-/// calls, with `ply_host`'s TCP handler under it instead of the twin.
+/// `run_memory` over a real listener in this process, with `ply_host`'s TCP handler under it.
 fn over_socket(loaded: &w3::Loaded, request: &[u8], requests: u32) -> Result<Duration> {
     let port = reserve_port()?;
     let host = Arc::new(ply_host::Host::new());
@@ -416,8 +410,7 @@ fn over_socket(loaded: &w3::Loaded, request: &[u8], requests: u32) -> Result<Dur
     Ok(taken)
 }
 
-/// The denominator: the same accept, read, write and close in Rust, answering the bytes the service
-/// answers, driven by the same client over connections carrying the same number of requests.
+/// The denominator: the same accept, read, write and close in Rust, answering the same bytes.
 fn rust_floor(request: &[u8], response: &[u8], requests: u32) -> Result<Duration> {
     let listener = TcpListener::bind("127.0.0.1:0").context("binding the floor's listener")?;
     let port = listener.local_addr()?.port();
@@ -436,8 +429,7 @@ fn rust_floor(request: &[u8], response: &[u8], requests: u32) -> Result<Duration
                 break;
             }
             at += read;
-            // One head per `\r\n\r\n`, which is all the floor has to find: the requests carry no
-            // body.
+            // The requests carry no body, so each `\r\n\r\n` ends one.
             while let Some(end) = find(&buf[..at], b"\r\n\r\n") {
                 socket.write_all(response)?;
                 answered += 1;
@@ -462,8 +454,7 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Connections a rung opens to make `requests` of them, rounded up so the two sides of a pair
-/// answer the same count.
+/// Connections needed to carry `requests`, rounded up.
 fn connections_for(requests: u32) -> u32 {
     requests.div_ceil(PER_CONN).max(1)
 }
@@ -530,8 +521,7 @@ fn spawn_client(
     })
 }
 
-/// One phase, run on its own for as long as it is asked to, so a sampling profiler sees that phase
-/// and nothing else.
+/// One phase on its own, so a sampling profiler sees only that phase.
 pub fn only(repo: &Path, phase: &str, requests: u32, rounds: usize) -> Result<f64> {
     let loaded = program(repo)?;
     let request = head();
@@ -566,7 +556,6 @@ pub fn only(repo: &Path, phase: &str, requests: u32, rounds: usize) -> Result<f6
     Ok(best)
 }
 
-/// One served configuration, as a rate and a per-request cost.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Served {
     pub accept: String,
@@ -585,8 +574,7 @@ pub struct Served {
     pub p99_micros: f64,
 }
 
-/// The same sweep taken `repeats` times, merged into one row per configuration carrying its best
-/// and its worst.
+/// Repeated sweeps merged into one row per configuration, carrying its best and worst.
 fn merged(rounds: Vec<Vec<Served>>) -> Vec<Served> {
     let mut out: Vec<Served> = Vec::new();
     for round in rounds {
@@ -675,7 +663,7 @@ pub fn served(
 /// Rows within this much of the best throughput are the same measurement.
 const FLAT: f64 = 0.05;
 
-/// The row of a served sweep a rung is read off: the concurrency that maximizes throughput (the ladder's own rule), with a flat curve resolved to its lowest concurrency rather than to its luckiest.
+/// The throughput-maximizing row, a flat curve resolved to its lowest concurrency.
 pub fn best(points: &[Served], stack: &str, sink: &str, route: &str) -> Option<Served> {
     let matching: Vec<&Served> = points
         .iter()
@@ -747,9 +735,7 @@ pub fn allocations(repo: &Path, given: Option<PathBuf>) -> Result<Option<(f64, f
 /// Definitions the control may not disable.
 const NOT_DISABLED: [&str; 3] = ["main", "config", "schema"];
 
-/// The same source with every nullary definition of its own given a dead parameter, which is the
-/// narrowest edit that puts a definition outside the constant memo's rule without changing what it
-/// computes.
+/// Gives every own nullary definition a dead parameter, putting it outside the constant memo.
 pub fn without_constants(source: &str) -> String {
     let mut nullary: Vec<String> = Vec::new();
     for line in source.lines() {
@@ -772,8 +758,7 @@ pub fn without_constants(source: &str) -> String {
         }
     }
     let mut out = source.to_string();
-    // Declarations first: a call-site rewrite cannot tell `fn table()` from `table()` by the
-    // character in front of it.
+    // Declarations first: a call-site rewrite cannot tell `fn table()` from `table()`.
     for name in &nullary {
         out = out.replace(
             &format!("fn {name}() "),
@@ -786,8 +771,7 @@ pub fn without_constants(source: &str) -> String {
     out
 }
 
-/// `name()` becomes `name(0)` wherever the character before it can start an identifier reference
-/// and is not part of a longer name or a module path.
+/// `name()` becomes `name(0)` unless it is part of a longer name or a module path.
 fn replace_calls(source: &str, name: &str) -> String {
     let needle = format!("{name}()");
     let mut out = String::with_capacity(source.len());
@@ -808,8 +792,7 @@ fn replace_calls(source: &str, name: &str) -> String {
     out
 }
 
-/// What the constant memo is worth **end to end on the served workload**, which is the only shape
-/// The cheaper levers accepts as a price.
+/// The constant memo's end-to-end worth on the served workload.
 #[allow(clippy::too_many_arguments)]
 pub fn memo_lever(
     repo: &Path,
@@ -835,9 +818,7 @@ pub fn memo_lever(
 
     let routes: [(&'static str, &'static str); 2] =
         [("health (no db)", ROUTE), ("items (1 select)", DB_ROUTE)];
-    // Both accept loops, because on this tree the answer depends on which one is under the service:
-    // `task.spawn` opens a production region for the life of the server and `Machine::constant`
-    // refuses the memo inside an open region, so a spawning service memoizes nothing.
+    // Both loops: a spawning service keeps a region open, and the memo is refused inside one.
     let mut priced: Vec<LoopPrice> = Vec::new();
     for loop_variant in [variant, other] {
         let mut with = Repeated::new();
@@ -921,7 +902,7 @@ pub struct LoopPrice {
     pub health_without: f64,
 }
 
-/// Everything the ladder half of the report carries: the whole file, not a fragment of one.
+/// The ladder half of the report.
 #[allow(clippy::too_many_arguments)]
 pub fn report(
     machine: String,
@@ -942,8 +923,7 @@ pub fn report(
     let total = best(served, tls, json, route).with_context(|| {
         format!("the served sweep has no `{tls}` x `{json}` x `{route}` row to read the total off")
     })?;
-    // Every other served rung is taken at the total's concurrency, so a layer is one flag moved
-    // rather than one flag moved and two rows selected.
+    // Every other served rung is taken at the total's concurrency, so a layer is one flag moved.
     let c = total.concurrency;
     let need = |stack: &str, sink: &str, route: &str| -> Result<Served> {
         at(served, stack, sink, route, c).with_context(|| {
@@ -1024,7 +1004,6 @@ pub fn report(
             stack.requests,
         ),
         from_served(w6::Layer::Tls, DB_ROUTE, &tls_with, &tls_without),
-        // the workload ladder pins this rung's `without` as `run_memory`.
         from_served(
             w6::Layer::Database,
             "/items against /health",
@@ -1034,8 +1013,7 @@ pub fn report(
         from_served(w6::Layer::Tracing, DB_ROUTE, &trace_with, &trace_without),
     ];
 
-    // A row answering `/items` is read against the floor replaying `/items`' response and a row
-    // answering `/health` against `/health`'s.
+    // Each row is read against the floor replaying its own route's response.
     let floor_for = |route_label: &str| {
         if route_label == health {
             1e6 / stack.floor_micros
@@ -1128,16 +1106,15 @@ pub fn report(
     })
 }
 
-/// What the ladder run priced of the cheaper levers, as measured numbers rather than as prose.
+/// The cheaper levers the ladder run priced.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Levers {
-    /// The served end-to-end ratio of the shipped service against the same service with its nullary
-    /// constants disabled, on the ladder's own workload, and the same on `/health`.
+    /// Served ratio of the service with nullary constants disabled against the shipped one.
     pub memo_items: Option<f64>,
     pub memo_health: Option<f64>,
     /// How the two were measured, for the evidence column.
     pub memo_evidence: String,
-    /// The same ratio on each accept loop, because on this tree they differ.
+    /// The same ratio on each accept loop, because they differ.
     pub loops: Vec<LoopPrice>,
     /// Allocations and bytes one `/health` request makes.
     pub allocations: Option<(f64, f64)>,
@@ -1157,9 +1134,7 @@ fn alternatives(stack: &InProcess, levers: &Levers) -> Vec<w6::Alternative> {
             };
             match *name {
                 "caching derived work" => {
-                    // Both routes, because the ratio C3 reads is `/items`' and the one the limits
-                    // section reads is `/health`'s; a run that took only one of them priced
-                    // neither.
+                    // Priced only when both routes were taken.
                     if let (Some(items), Some(_health)) = (levers.memo_items, levers.memo_health) {
                         alternative.priced = true;
                         alternative.end_to_end = items;
@@ -1429,8 +1404,7 @@ fn chrono_date() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// The `ply` binary a served row drives, defaulting to this binary's sibling so a release
-/// measurement never silently serves from a debug build.
+/// Defaults to this binary's sibling, so a release run never serves from a debug build.
 pub fn ply_binary(given: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = given {
         return Ok(path);

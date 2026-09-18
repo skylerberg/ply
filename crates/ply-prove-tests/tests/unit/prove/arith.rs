@@ -24,8 +24,6 @@ fn a_variable_below_and_above_a_bound_is_infeasible() {
     assert_eq!(f, Feasibility::Infeasible);
 }
 
-/// The false instance, which matters more: a satisfiable system must never come back
-/// infeasible.
 #[test]
 fn a_satisfiable_system_is_not_infeasible() {
     let f = decide(|s| {
@@ -71,7 +69,6 @@ fn a_chain_that_is_merely_tight_stays_satisfiable() {
     assert_eq!(f, Feasibility::Unknown);
 }
 
-/// A coefficient that leaves `i128` is `Unknown`, never a claim.
 #[test]
 fn an_overflowing_combination_is_unknown() {
     let f = decide(|s| {

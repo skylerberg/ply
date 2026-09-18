@@ -38,7 +38,6 @@ fn hash_of(source: &str, name: &str) -> DefHash {
         .unwrap_or_else(|| panic!("no definition `{key}` in {:?}", out.defs.keys()))
 }
 
-/// A `derive eq` for a one-field record, written out.
 const HANDWRITTEN: &str = "type Order = {id: Int}\n\
                            fn by_hand() -> {eq: (Order, Order) -> Bool} = \
                            {eq: |da: Order, db: Order| da == db}";

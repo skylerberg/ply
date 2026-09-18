@@ -44,8 +44,6 @@ fn setup_is_reported_apart_from_evaluation() {
     );
 }
 
-/// A capture cuts one segment whatever it holds: the 100,000-frame row moves every frame and
-/// exactly one segment, which is what "capture does not walk the stack" is as a count.
 #[test]
 fn capture_and_resume_are_flat_in_the_frames_they_move() {
     let points = stack_cost(3);

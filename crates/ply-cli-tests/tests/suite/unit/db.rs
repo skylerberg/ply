@@ -17,8 +17,6 @@ fn options(url: Option<&str>) -> DbOptions {
     }
 }
 
-// --- parsing ------------------------------------------------------------
-
 #[test]
 fn a_full_url_parses_into_the_fields_the_driver_needs() {
     let url = DbUrl::parse("postgres://ply:hunter2@db.internal:5433/desk?sslmode=disable")
@@ -39,8 +37,6 @@ fn the_port_and_the_sslmode_default_to_what_postgres_means_by_omitting_them() {
     assert!(!url.has_password());
 }
 
-/// A password with an `@` or a `/` in it is ordinary, and one truncated at
-/// the delimiter is an authentication failure nobody can explain.
 #[test]
 fn a_percent_escaped_password_survives_the_delimiters_it_contains() {
     let url = DbUrl::parse("postgres://ply:p%40ss%2Fword@localhost:5432/desk").unwrap();
@@ -68,8 +64,6 @@ fn every_malformed_string_is_refused_with_what_to_write() {
     }
 }
 
-/// The trusted computing base listing: TLS to postgres is not wired up, so a word that promised
-/// encryption would be a word that lies.
 #[test]
 fn an_sslmode_stronger_than_prefer_is_refused_by_name() {
     for mode in ["require", "verify-ca", "verify-full", "allow"] {
@@ -81,7 +75,6 @@ fn an_sslmode_stronger_than_prefer_is_refused_by_name() {
     assert!(DbUrl::parse("postgres://ply@h:5432/d?sslmode=disable").is_ok());
 }
 
-/// A mistyped parameter that was silently dropped is a timeout nobody set.
 #[test]
 fn an_unknown_parameter_is_refused_rather_than_ignored() {
     let why = DbUrl::parse("postgres://ply@h/d?connect_timeout=3").unwrap_err();
@@ -89,11 +82,7 @@ fn an_unknown_parameter_is_refused_rather_than_ignored() {
     assert!(DbUrl::parse("postgres://ply@h/d?application_name=desk").is_ok());
 }
 
-// --- redaction ----------------------------------------------------------
-
-/// The whole reason this module has its own types. A password reaching a
-/// diagnostic reaches the result cache, and the store is designed never to
-/// forget.
+/// A password reaching a diagnostic reaches the result cache, which never forgets.
 #[test]
 fn no_rendering_of_a_url_or_a_secret_contains_the_password() {
     let url = DbUrl::parse("postgres://ply:hunter2@localhost:5432/desk").unwrap();
@@ -131,9 +120,6 @@ fn no_rendering_of_a_url_or_a_secret_contains_the_password() {
     );
 }
 
-/// What the driver opens has to be what this module validated and reported,
-/// so the rebuilt string parses back to the same fields — including a
-/// password whose bytes are delimiters.
 #[test]
 fn the_string_the_driver_connects_with_round_trips_through_the_fields() {
     let url = DbUrl::parse("postgres://ply:p%40ss%2Fw%3Ard@db.internal:5433/desk?sslmode=disable")
@@ -144,9 +130,7 @@ fn the_string_the_driver_connects_with_round_trips_through_the_fields() {
     assert_eq!(rebuilt.password().map(Secret::expose), Some("p@ss/w:rd"));
 }
 
-/// `connection_string` is the one rendering that carries the password, and
-/// it returns a `Secret` so a caller has to say `expose` to get at it. That
-/// word is what a reviewer greps the workspace for.
+/// It returns a `Secret`, so a caller must write `expose`: the word a reviewer greps for.
 #[test]
 fn the_only_rendering_that_carries_the_password_is_a_secret() {
     let url = DbUrl::parse("postgres://ply:hunter2@localhost:5432/desk").unwrap();
@@ -156,8 +140,7 @@ fn the_only_rendering_that_carries_the_password_is_a_secret() {
     assert!(!format!("{carrier:?}").contains("hunter2"));
 }
 
-/// Nothing about a diagnostic may echo the string it was handed, because the
-/// caller cannot know whether the operator put a password in it.
+/// The caller cannot know whether the operator put a password in the string.
 #[test]
 fn a_malformed_url_diagnostic_never_echoes_what_it_was_given() {
     let options = options(Some("postgres://ply:hunter2@localhost:5432"));
@@ -169,10 +152,6 @@ fn a_malformed_url_diagnostic_never_echoes_what_it_was_given() {
     assert_eq!(diagnostics[0].code, codes::DB_NOT_CONFIGURED);
 }
 
-// --- resolution ---------------------------------------------------------
-
-/// The host boundary contract's rule is untouched: the environment says *which* database, and
-/// only `--host` decides that there is one.
 #[test]
 fn the_environment_supplies_the_url_and_never_the_binding() {
     let env = env_of(&[(URL_ENV, "postgres://ply@localhost:5432/desk")]);
@@ -211,8 +190,6 @@ fn the_password_comes_out_of_the_environment_and_not_out_of_ps() {
     assert!(!config.url.redacted().contains("hunter2"));
 }
 
-/// Two answers to one question. Picking one silently is how a deploy
-/// authenticates as the wrong user.
 #[test]
 fn a_password_in_both_places_is_refused_rather_than_resolved() {
     let env = env_of(&[(PASSWORD_ENV, "fromenv")]);
@@ -236,8 +213,6 @@ fn an_empty_environment_value_is_a_refusal_rather_than_an_absence() {
     assert!(diagnostics[0].message.contains(URL_ENV));
 }
 
-/// Naming no database is not yet a failure: an HTTP-only service under
-/// `--host` binds no postgres handler and needs none.
 #[test]
 fn naming_no_database_is_not_an_error_until_the_driver_binds() {
     assert!(
@@ -280,8 +255,6 @@ fn a_schema_name_that_is_not_module_dot_fn_is_refused_at_resolution() {
     options.schema = Some("desk.schema".to_string());
     assert!(options.resolve_with(true, &env_of(&[])).is_ok());
 }
-
-// --- the `database` block -----------------------------------------------
 
 fn config() -> DbConfig {
     options(Some(
@@ -332,9 +305,6 @@ fn the_block_names_the_scanner_the_pool_and_the_collation() {
     assert!(database.is_live());
 }
 
-/// "connected" and "not connected" are different facts, and a reader
-/// deciding whether to trust the twin's `ORDER BY` needs the second one said
-/// out loud rather than implied by an absent line.
 #[test]
 fn an_unconnected_run_says_so_and_still_redacts() {
     let database = Database::of(
@@ -356,8 +326,7 @@ fn an_unconnected_run_says_so_and_still_redacts() {
     assert_eq!(database.json()["server"], serde_json::Value::Null);
 }
 
-/// The digest is the line a CI check pins, so a halved pool must move it and
-/// a server upgrade must not.
+/// A halved pool must move the digest a CI check pins, and a server upgrade must not.
 #[test]
 fn the_digest_covers_the_pool_and_the_schema_name_and_not_the_server() {
     let digest = |database: &Database| {

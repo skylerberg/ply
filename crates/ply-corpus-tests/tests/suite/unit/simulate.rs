@@ -21,8 +21,6 @@ fn corpus(density: f64, tasks: usize) -> tempfile::TempDir {
     dir
 }
 
-/// The claim, at the size a unit test can afford: pruning never runs more interleavings than
-/// not pruning, and the search reaches its frontier.
 #[test]
 fn pruning_never_costs_more_than_not_pruning() {
     let dir = corpus(0.0, 2);
@@ -40,9 +38,6 @@ fn pruning_never_costs_more_than_not_pruning() {
     }
 }
 
-/// Withholding the recording's clocks may only cost interleavings, never save them: the filter
-/// refuses reorderings that are unreachable, so a search that cannot see the ordering has
-/// strictly more to do.
 #[test]
 fn a_search_that_cannot_see_the_synchronization_never_runs_fewer() {
     let dir = corpus(0.0, 3);
@@ -57,8 +52,6 @@ fn a_search_that_cannot_see_the_synchronization_never_runs_fewer() {
     }
 }
 
-/// A corpus with no failing test reports misses rather than a median over nothing, and never a
-/// zero that reads as "found immediately".
 #[test]
 fn a_test_that_never_fails_reports_misses_and_no_ratio() {
     let dir = corpus(1.0, 2);
@@ -81,8 +74,6 @@ fn a_rate_is_reported_per_seeded_test_and_counts_the_seeds_it_ran() {
     }
 }
 
-/// A statistic that dropped its misses would report the search as better than it is, which is
-/// the one direction this module must not err in.
 #[test]
 fn a_summary_carries_its_misses() {
     let trials = [

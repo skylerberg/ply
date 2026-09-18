@@ -1,6 +1,3 @@
-//! Whether a region that a continuation is captured across is recognised as one, and whether the
-//! arena's save-and-restore primitive covers what it says it covers.
-
 use ply_eval::Value;
 use ply_eval::arena::{Arena, RegionKind, Slot};
 use ply_eval::region_kind::{Cause, Regions, check, infer};
@@ -50,8 +47,7 @@ fn int_at(arena: &Arena, slot: Slot) -> Option<i64> {
     }
 }
 
-/// The region-kind rule's two-resumption example with the `handle` written *outside* the `with_cell` instead
-/// of inside it.
+/// The two-resumption example with the `handle` outside the `with_cell` instead of inside it.
 const HANDLE_ENCLOSES: &str = r#"
 effect amb { read flip[coin]() -> Bool }
 
@@ -70,7 +66,6 @@ test "handler outside the region" {
 }
 "#;
 
-/// A capture crosses `trace` on every resumption, so `trace` is `shared` and the site is named.
 #[test]
 fn a_handle_enclosing_the_region_does_not_hide_the_capture() {
     let (program, resolved) = load(HANDLE_ENCLOSES);
@@ -94,8 +89,6 @@ fn a_handle_enclosing_the_region_does_not_hide_the_capture() {
     );
 }
 
-/// Two spellings of one program must agree, which is how the hole was diagnosed rather than merely
-/// observed.
 #[test]
 fn hoisting_the_perform_into_a_helper_does_not_flip_the_inferred_kind() {
     let inline = r#"
@@ -126,7 +119,6 @@ fn f() -> Int =
     );
 }
 
-/// The hole was not confined to one spelling of the region or one clause form.
 #[test]
 fn the_enclosing_handle_hides_the_capture_for_no_shape_of_region() {
     const AMB: &str = "effect amb { read flip[coin]() -> Bool }\n";
@@ -143,7 +135,7 @@ fn f() -> Int =
     );
     assert_eq!(kind_of(&tail, "trace"), RegionKind::Shared);
 
-    // `with_region[r]` with a cell allocated into it — the region syntax.
+    // `with_region[r]` with a cell allocated into it.
     let with_region = format!(
         r#"{AMB}
 fn f() -> Int =
@@ -157,8 +149,7 @@ fn f() -> Int =
     );
     assert_eq!(kind_of(&with_region, "r"), RegionKind::Shared);
 
-    // Nested regions: the capture crosses both, so a snapshot of either would have been required
-    // and neither may be freed at its close.
+    // Nested regions: the capture crosses both, so neither may be freed at its close.
     let nested = format!(
         r#"{AMB}
 fn f() -> Int =
@@ -181,8 +172,7 @@ fn f() -> Int =
         ]
     );
 
-    // Through a callback builtin, where the region is opened per element and the capture is taken
-    // inside it.
+    // Through a callback builtin, which opens the region per element and captures inside it.
     let callback = format!(
         r#"{AMB}
 fn f() -> List<Int> =
@@ -197,8 +187,6 @@ fn f() -> List<Int> =
     assert_eq!(kind_of(&callback, "r"), RegionKind::Shared);
 }
 
-/// The region-kind rule: "forcing `unique` where a capture is reachable is a compile error naming the
-/// capture site".
 #[test]
 fn forcing_unique_over_a_capture_an_enclosing_handle_answers_is_refused() {
     let (program, resolved) = load(HANDLE_ENCLOSES);
@@ -260,8 +248,6 @@ fn only_the_open_form_of_snapshot_covers_an_enclosing_regions_writes() {
     arena.close(outer);
 }
 
-/// The same statement as a cost: covering every open region costs the whole live arena, not the
-/// innermost scope.
 #[test]
 fn covering_every_open_region_costs_the_whole_live_arena_at_every_capture() {
     let mut arena = Arena::new();
@@ -287,8 +273,6 @@ fn covering_every_open_region_costs_the_whole_live_arena_at_every_capture() {
     arena.close(outer);
 }
 
-/// A `unique` region open at the point of a checkpoint is the inference and the machine
-/// disagreeing, and the caller has to be told *which* region so it can name it.
 #[test]
 fn a_unique_region_open_at_a_checkpoint_is_reported_rather_than_skipped() {
     let mut arena = Arena::new();
@@ -302,8 +286,6 @@ fn a_unique_region_open_at_a_checkpoint_is_reported_rather_than_skipped() {
     arena.close(outer);
 }
 
-/// A [`Snapshot`] records the scope stack as well as the bump range, so a restore restores the
-/// arena's state rather than a range of it.
 #[test]
 fn a_restore_brings_a_closed_regions_scope_back_with_its_slots() {
     let mut arena = Arena::new();
@@ -336,7 +318,6 @@ fn a_restore_brings_a_closed_regions_scope_back_with_its_slots() {
     assert_eq!(arena.live(), 0);
 }
 
-/// **Opened since the snapshot.**
 #[test]
 fn a_region_opened_after_the_snapshot_does_not_survive_the_restore() {
     let mut arena = Arena::new();
@@ -366,8 +347,7 @@ fn a_region_opened_after_the_snapshot_does_not_survive_the_restore() {
     assert_eq!(arena.live(), 0);
 }
 
-/// The precondition [`Arena::extent`] and [`Arena::snapshot`] subtract on, held across the
-/// open/alloc/close/snapshot/restore cycle rather than asserted once.
+/// The precondition [`Arena::extent`] and [`Arena::snapshot`] subtract on.
 #[test]
 fn no_regions_mark_ever_sits_above_the_bump_pointer() {
     let mut arena = Arena::new();
@@ -393,8 +373,6 @@ fn no_regions_mark_ever_sits_above_the_bump_pointer() {
     arena.close(r);
 }
 
-/// A slot's generation is the number of times its physical position has been freed, and it is a
-/// `u32` incremented with `wrapping_add`.
 #[test]
 fn a_slots_generation_counts_frees_and_is_a_wrapping_u32() {
     let mut arena = Arena::new();

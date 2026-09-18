@@ -107,9 +107,6 @@ fn before() -> HashOutput {
     hashes(&[("a", A_BEFORE), ("b", B_BEFORE), ("c", C_BEFORE)])
 }
 
-/// The property the module system exists to preserve: `shared` is called from two other modules and
-/// is moved to a third, which rewrites two `import`s and four qualified references, and not one
-/// hash in the program moves.
 #[test]
 fn moving_a_definition_between_modules_changes_no_hash() {
     let after = hashes(&[
@@ -162,8 +159,6 @@ fn renaming_a_definition_imported_by_two_modules_changes_no_hash() {
     assert_eq!(before.tests, after.tests);
 }
 
-/// Renaming a module is renaming its file, so every importer's `import` line and every qualified
-/// reference changes.
 #[test]
 fn renaming_a_module_changes_no_hash() {
     let after = hashes(&[
@@ -289,8 +284,6 @@ fn one_name_in_two_modules_is_two_definitions() {
     assert_eq!(out.defs.len(), 2);
 }
 
-/// A module binder lives in its own namespace, so `a` the parameter cannot hide `a` the module —
-/// and if it ever did, the reference would fall back to a free name and this hash would drift.
 #[test]
 fn a_local_binder_does_not_hide_a_module_binder() {
     let shadowing = hashes(&[
@@ -343,7 +336,6 @@ fn identically_labelled_tests_in_two_modules_stay_distinct() {
     assert_ne!(out.tests[0], out.tests[1]);
 }
 
-/// Two identical tests in different modules are one computation and share one cache entry.
 #[test]
 fn identical_tests_in_two_modules_share_a_hash() {
     let out = hashes(&[
@@ -360,9 +352,6 @@ pub effect db {
 pub fn log(v: Int) -> Int / {db.write[audit]} = db.emit[audit](v)
 ";
 
-/// Two modules each declaring `effect db` declare two capabilities, not one — and `a.log` and
-/// `b.log` are still one definition, because they differ only by which of the two identical
-/// declarations they name.
 #[test]
 fn performers_of_two_identically_declared_effects_are_one_definition() {
     let out = hashes(&[("a", LOOK_ALIKE), ("b", LOOK_ALIKE)]);
@@ -400,8 +389,6 @@ fn performing_an_imported_effect_hashes_like_performing_a_local_one() {
     assert_eq!(def(&split, "b.read_one"), def(&together, "a.read_one"));
 }
 
-/// Look-alike effects are ranked by the name the source wrote, program-wide, so the rank — and
-/// every performer's hash — survives one of them moving.
 #[test]
 fn moving_a_look_alike_effect_between_modules_changes_no_hash() {
     let audit = LOOK_ALIKE
@@ -453,9 +440,7 @@ fn a_type_and_its_constructors_survive_a_move() {
     assert_eq!(def(&before, "b.describe"), def(&after, "b.describe"));
 }
 
-/// Import cycles are rejected upstream, but the definition graph is built over resolved references
-/// and is module-blind, so an SCC that happens to span two files must be hashed exactly like one
-/// that does not.
+/// Import cycles are rejected upstream, but the definition graph is module-blind.
 #[test]
 fn a_strongly_connected_component_may_span_modules() {
     let split = hashes_ignoring_cycles(&[
@@ -549,7 +534,6 @@ fn a_duplicate_definition_is_still_reported_per_module() {
     assert_eq!(diags[0].code, ply_span::codes::DUPLICATE_DEFINITION);
 }
 
-/// The entry point the CLI actually calls.
 #[test]
 fn the_checked_entry_point_agrees_with_the_unchecked_one() {
     let mut program = program_of(&[("a", A_BEFORE), ("b", B_BEFORE), ("c", C_BEFORE)]);
@@ -572,8 +556,7 @@ fn hashing_a_multi_module_program_is_stable_across_runs() {
     }
 }
 
-/// `HashOutput::tests` is indexed in parallel with `CheckOutput::tests`, and the two crates build
-/// that order independently.
+/// `HashOutput::tests` pairs by index with `CheckOutput::tests`, and each crate orders its own.
 #[test]
 fn test_hashes_pair_with_the_checked_tests_whatever_the_load_order() {
     let paired = |files: &[(&str, &str)]| -> Vec<(String, DefHash)> {

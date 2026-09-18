@@ -36,8 +36,6 @@ create table child (
 create table wide (id int8 primary key, small float4, exact numeric, scaled numeric(12,4));
 ";
 
-// the way the machine does.
-
 fn settle(db: &Postgres, answered: Result<HostAnswer, Diagnostic>) -> Result<Value, Diagnostic> {
     match answered? {
         HostAnswer::Value(value) => Ok(value),
@@ -58,8 +56,7 @@ fn scan_of(sql: &str) -> db::Scan {
     db::scan::scan(sql, Span::DUMMY).unwrap_or_else(|d| panic!("`{sql}`: {}", d.message))
 }
 
-/// One data statement through the driver, labelled `table`, with no declared row — so the only
-/// footprint check that applies is the label's own.
+/// No declared row, so the only footprint check that applies is the label's own.
 fn perform(
     db: &Postgres,
     op: Op,
@@ -96,7 +93,6 @@ fn query(db: &Postgres, table: &str, sql: &str, params: Vec<Param>) -> Value {
         .unwrap_or_else(|d| panic!("`{sql}`: {} {}", d.code, d.message))
 }
 
-/// The constructor a `std.db.Answer` carries, which is what a Ply `match` reads.
 fn ctor(value: &Value) -> String {
     match value {
         Value::Ctor { name, .. } => name.to_string(),
@@ -104,7 +100,6 @@ fn ctor(value: &Value) -> String {
     }
 }
 
-/// The SQLSTATE inside a `Failed`, or `None` for any other answer.
 fn sqlstate(value: &Value) -> Option<String> {
     let Value::Ctor { name, args } = value else {
         return None;
@@ -169,7 +164,7 @@ fn raw(reactor: &Reactor, sql: &str, params: Vec<Param>) -> Result<Answer, Diagn
     }
 }
 
-/// What postgres holds, read through `psql` — never through the driver.
+/// Read through `psql`, never through the driver.
 fn rows_in(cluster: &Cluster, table: &str) -> i64 {
     cluster
         .psql("audit", &format!("select count(*) from {table}"))
@@ -208,8 +203,6 @@ fn transactions_the_pool_and_parameters_under_adversarial_conditions() {
     long_values_and_embedded_nul_bytes_are_data_or_a_named_failure(&cluster);
 }
 
-/// The property W4 exists to make impossible, checked from the one vantage point where "committed"
-/// means anything: a connection that did not write the rows.
 fn a_rollback_is_invisible_to_a_second_connection(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
 
@@ -243,8 +236,6 @@ fn a_rollback_is_invisible_to_a_second_connection(cluster: &Cluster) {
     finish(cluster, db);
 }
 
-/// Nesting is a savepoint, and the question that matters is whether an inner `commit` can smuggle
-/// its writes past an outer rollback.
 fn a_nested_rollback_keeps_the_outer_and_an_outer_rollback_takes_the_inner(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
 
@@ -294,7 +285,6 @@ fn a_nested_rollback_keeps_the_outer_and_an_outer_rollback_takes_the_inner(clust
     finish(cluster, db);
 }
 
-/// A commit of a transaction a failed statement already aborted is `Failed`.
 fn a_commit_after_a_failed_statement_reports_the_aborted_scope(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
 
@@ -335,7 +325,6 @@ fn a_commit_after_a_failed_statement_reports_the_aborted_scope(cluster: &Cluster
     finish(cluster, db);
 }
 
-/// The same shape, reached the way a service reaches it.
 fn a_commit_after_a_statement_timeout_reports_the_aborted_scope(cluster: &Cluster) {
     let db = driver(cluster, |c| c.statement = Duration::from_millis(200));
     // A table big enough that a nested loop over it outlives the deadline.
@@ -371,8 +360,6 @@ fn a_commit_after_a_statement_timeout_reports_the_aborted_scope(cluster: &Cluste
     finish(cluster, db);
 }
 
-/// The first of the four exits, and the one the driver gets right: a constraint that can
-/// only fail at `COMMIT` is a `Failed` the program reads.
 fn a_deferred_constraint_that_fails_at_commit_is_a_value(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
 
@@ -401,7 +388,6 @@ fn a_deferred_constraint_that_fails_at_commit_is_a_value(cluster: &Cluster) {
     finish(cluster, db);
 }
 
-/// A backend killed out of band mid-transaction.
 fn a_connection_lost_mid_transaction_is_a_value_and_commits_nothing(cluster: &Cluster) {
     let db = driver(cluster, |c| c.size = 2);
 
@@ -444,8 +430,6 @@ fn a_connection_lost_mid_transaction_is_a_value_and_commits_nothing(cluster: &Cl
     finish(cluster, db);
 }
 
-/// A spawned task has no scope of its own, and both answers available to the driver are wrong — so
-/// it refuses, at the statement and at the close alike.
 fn a_task_that_does_not_own_the_scope_is_refused(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
 
@@ -463,8 +447,6 @@ fn a_task_that_does_not_own_the_scope_is_refused(cluster: &Cluster) {
     finish(cluster, db);
 }
 
-/// Every transaction holds a connection from `db.begin` to its close, so a pool smaller than the
-/// transactions in flight cannot make progress.
 fn a_pool_exhausted_by_open_transactions_is_e0437(cluster: &Cluster) {
     let db = driver(cluster, |c| {
         c.size = 1;
@@ -474,8 +456,7 @@ fn a_pool_exhausted_by_open_transactions_is_e0437(cluster: &Cluster) {
 
     begin(&db, Isolation::ReadCommitted, Access::ReadWrite);
 
-    // A second entry point, on a thread of its own, asking for the connection the first one is
-    // holding.
+    // A second entry point, on its own thread, wanting the connection the first one holds.
     let contender = Arc::clone(&db);
     let started = std::time::Instant::now();
     let refused = std::thread::spawn(move || {
@@ -514,8 +495,6 @@ fn a_pool_exhausted_by_open_transactions_is_e0437(cluster: &Cluster) {
     finish_shared(cluster, db);
 }
 
-/// A scope nothing closed, through the driver rather than through the reactor: `end_entry_point`
-/// rolls it back, and the *next* borrower sees neither the rows nor the transaction.
 fn an_abandoned_transaction_is_gone_before_the_connection_is_reused(cluster: &Cluster) {
     let db = driver(cluster, |c| c.size = 1);
 
@@ -548,7 +527,6 @@ fn an_abandoned_transaction_is_gone_before_the_connection_is_reused(cluster: &Cl
     finish(cluster, db);
 }
 
-/// A pooled connection carries no session state to its next borrower.
 fn session_state_does_not_reach_the_next_borrower(cluster: &Cluster) {
     let db = driver(cluster, |c| c.size = 1);
     let reactor = db.reactor();
@@ -570,7 +548,7 @@ fn session_state_does_not_reach_the_next_borrower(cluster: &Cluster) {
             search_path: r#""$user", public"#.to_string(),
             temp_tables: 0,
             advisory_locks: 0,
-            // The one that survives, and it is stated rather than silently tolerated.
+            // The one that survives, stated rather than silently tolerated.
             prepared: 1,
             listening: 0,
         },
@@ -588,7 +566,6 @@ fn session_state_does_not_reach_the_next_borrower(cluster: &Cluster) {
     finish(cluster, db);
 }
 
-/// The reachability half of the one above, and the second half of where the table set comes from.
 fn a_statement_that_could_change_session_state_is_refused(cluster: &Cluster) {
     for sql in [
         "select set_config('search_path', 'pg_catalog', false) from t",
@@ -604,7 +581,6 @@ fn a_statement_that_could_change_session_state_is_refused(cluster: &Cluster) {
         assert_eq!(refused.code, codes::DB_STATEMENT_REFUSED, "`{sql}`");
     }
 
-    // The functions a statement may still call are unaffected.
     for sql in [
         "select count(*) from t",
         "select sum(n) from t",
@@ -635,8 +611,6 @@ fn a_statement_that_could_change_session_state_is_refused(cluster: &Cluster) {
         .scan(sql, Span::DUMMY)
         .expect_err("a session-mutating call never reaches a connection");
     assert_eq!(refused.code, codes::DB_STATEMENT_REFUSED);
-    // And the scan is what the handler runs before it acquires anything, so the pool's session is
-    // what it was.
     query(&db, "t", "select count(*) from t", Vec::new());
     assert_ne!(
         inspect_session(db.reactor()).search_path,
@@ -648,10 +622,6 @@ fn a_statement_that_could_change_session_state_is_refused(cluster: &Cluster) {
     finish(cluster, db);
 }
 
-// driver.
-
-/// Two entry points, one driver, and the property that makes `ply test --jobs n` mean anything
-/// against a real database.
 fn two_entry_points_are_two_scope_stacks(cluster: &Cluster) {
     let db = Arc::new(driver(cluster, |c| c.size = 4));
 
@@ -741,7 +711,6 @@ fn two_entry_points_are_two_scope_stacks(cluster: &Cluster) {
     finish_shared(cluster, db);
 }
 
-/// Every route a value could take into statement text, tried both ways.
 fn every_injection_route_stays_inside_one_statement(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
 
@@ -786,7 +755,6 @@ fn every_injection_route_stays_inside_one_statement(cluster: &Cluster) {
         "a parameter changed the schema"
     );
 
-    // The same payload spliced into every position a program might splice it.
     for (route, sql) in [
         ("table name", format!("select id from {payload}")),
         ("order by", format!("select id from t order by {payload}")),
@@ -810,8 +778,7 @@ fn every_injection_route_stays_inside_one_statement(cluster: &Cluster) {
         assert_eq!(refused.code, codes::DB_STATEMENT_REFUSED, "{route}");
     }
 
-    // A spliced identifier that names a second relation is caught by the footprint rather than by
-    // the scanner, which is the second lock working.
+    // A spliced second relation is caught by the footprint, not by the scanner.
     let scan = scan_of("select id from t, other");
     let refused = db::check_footprint(
         &scan,
@@ -823,7 +790,7 @@ fn every_injection_route_stays_inside_one_statement(cluster: &Cluster) {
     .expect_err("`other` is not in the row");
     assert_eq!(refused.code, codes::DB_FOOTPRINT_UNDECLARED);
 
-    // The limit, stated.
+    // The limit: a spliced tautology that stays in one statement over one table is admitted.
     let tautology = "select id from t where s like '%' or 1=1 -- '";
     let scan = scan_of(tautology);
     assert_eq!(scan.tables.all().into_iter().collect::<Vec<_>>(), ["t"]);
@@ -833,7 +800,6 @@ fn every_injection_route_stays_inside_one_statement(cluster: &Cluster) {
     finish(cluster, db);
 }
 
-/// A `float4` parameter is a named refusal rather than a silent narrowing.
 fn a_float4_parameter_is_refused_rather_than_narrowed(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
     let reactor = db.reactor();
@@ -858,8 +824,7 @@ fn a_float4_parameter_is_refused_rather_than_narrowed(cluster: &Cluster) {
         "a refused parameter still reached the column"
     );
 
-    // The narrowing the program writes for itself still runs, and it is visible in the statement a
-    // reader reads.
+    // A narrowing the program writes into the statement itself still runs.
     raw(
         reactor,
         "insert into wide (id, small) values ($1, $2::float8::float4)",
@@ -875,7 +840,6 @@ fn a_float4_parameter_is_refused_rather_than_narrowed(cluster: &Cluster) {
     finish(cluster, db);
 }
 
-/// W2's argument — a total that quietly lost a cent — applied to the wire.
 fn the_numeric_edges_are_refusals_rather_than_roundings(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
     let reactor = db.reactor();
@@ -941,8 +905,7 @@ fn the_numeric_edges_are_refusals_rather_than_roundings(cluster: &Cluster) {
         );
     }
 
-    // A column's own scale is the server's answer and the driver is faithful to it rather than to
-    // the literal's.
+    // The column's declared scale wins over the literal's.
     raw(
         reactor,
         "insert into wide (id, scaled) values ($1, $2)",
@@ -970,8 +933,6 @@ fn the_numeric_edges_are_refusals_rather_than_roundings(cluster: &Cluster) {
     finish(cluster, db);
 }
 
-/// A Ply value and a postgres column type that disagree is a refusal naming the position and the
-/// type, before anything is sent — never a coercion.
 fn a_parameter_whose_type_disagrees_is_refused_before_a_byte_moves(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
     let reactor = db.reactor();
@@ -1009,8 +970,7 @@ fn a_parameter_whose_type_disagrees_is_refused_before_a_byte_moves(cluster: &Clu
         );
     }
 
-    // An array with a `PNull`, and a nested array: `List<a>` has no shape for either, so both
-    // refuse rather than flattening.
+    // `List<a>` has no shape for a null element or a nested array, so both refuse.
     for params in [
         vec![Param::Array(vec![Param::Int(1), Param::Null])],
         vec![Param::Array(vec![Param::Array(vec![Param::Int(1)])])],
@@ -1020,7 +980,6 @@ fn a_parameter_whose_type_disagrees_is_refused_before_a_byte_moves(cluster: &Clu
         assert_eq!(refused.code, codes::DB_STATEMENT_REFUSED);
     }
 
-    // Too few and too many parameters, which is a claim about the statement.
     let refused = raw(
         reactor,
         "insert into t (id, n) values ($1, $2)",
@@ -1038,8 +997,6 @@ fn a_parameter_whose_type_disagrees_is_refused_before_a_byte_moves(cluster: &Clu
     finish(cluster, db);
 }
 
-/// Bytes with embedded nulls are data; text with an embedded null is the server's own `22021`
-/// rather than a truncated string; four megabytes of either survives the round trip.
 fn long_values_and_embedded_nul_bytes_are_data_or_a_named_failure(cluster: &Cluster) {
     let db = driver(cluster, |_| {});
     let reactor = db.reactor();
@@ -1096,8 +1053,7 @@ fn driver(cluster: &Cluster, edit: impl FnOnce(&mut PoolConfig)) -> Postgres {
     Postgres::start(config).expect("the driver starts")
 }
 
-/// Close a phase: nothing is left open, and nothing is left for the next phase to inherit through
-/// the server.
+/// Nothing left open, and nothing for the next phase to inherit through the server.
 fn finish(cluster: &Cluster, db: Postgres) {
     let _ = db.end_entry_point(ALONE.0);
     let _ = db.end_entry_point(OTHER.0);
@@ -1161,7 +1117,6 @@ fn count_of(value: &Value) -> i64 {
     }
 }
 
-/// A statement run directly on a pooled connection, for the session-state phases.
 fn on_connection(reactor: &Reactor, sql: &'static str) -> Result<usize, String> {
     let pending = reactor
         .borrow(
@@ -1194,7 +1149,6 @@ struct Inherited {
     listening: i64,
 }
 
-/// What a borrower finds on the connection the pool hands it.
 fn inspect_session(reactor: &Reactor) -> Inherited {
     let pending = reactor
         .borrow(

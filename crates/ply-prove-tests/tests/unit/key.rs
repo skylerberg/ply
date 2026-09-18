@@ -6,8 +6,6 @@ fn key() -> DefHash {
     DefHash([7; 32])
 }
 
-/// The rule that stops a run under one plan from reading a discharge another plan earned, and
-/// the one whose absence is silent.
 #[test]
 fn a_sampled_discharge_is_never_written_under_the_bare_key() {
     let plan = ProvePlan::default();
@@ -50,8 +48,7 @@ fn widening_the_plan_changes_where_a_sample_is_read_from() {
     assert_ne!(prove_key(key(), &narrow), prove_key(key(), &deeper));
 }
 
-/// A wider shrink budget can only produce a smaller counterexample, and failures are never
-/// cached, so it cannot change a cached claim.
+/// Failures are never cached, so the shrink budget cannot change a cached claim.
 #[test]
 fn the_shrink_budget_does_not_move_a_key() {
     let narrow = ProvePlan::default();
@@ -68,8 +65,6 @@ fn the_key_separates_obligations() {
     assert_ne!(prove_key(DefHash([1; 32]), &plan), prove_key(key(), &plan));
 }
 
-/// An unknown tier takes the plan key: the bare key is the one that survives a widening, so it
-/// is the one nothing may be written under by accident.
 #[test]
 fn an_absent_tier_takes_the_conservative_key() {
     let plan = ProvePlan::default();

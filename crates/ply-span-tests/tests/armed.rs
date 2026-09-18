@@ -1,14 +1,11 @@
-//! The gate for the defect `CONTRIBUTING.md` §"The shape it keeps taking: declared, registered,
-//! raised nowhere" counts: a mechanism named everywhere a reader would look for it and constructed
-//! nowhere.
+//! Gates against a mechanism that is declared and registered but constructed nowhere.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// Registered codes that no production source constructs, each with the reason it is allowed to
-/// stay that way.
+/// Registered codes no production source constructs, each with the reason it may stay so.
 const UNARMED_CODES: &[(&str, &str)] = &[
     (
         "DB_SCHEMA_MISMATCH",
@@ -101,8 +98,7 @@ const AMBIGUOUS_ENUM_NAMES: &[(&str, &str)] = &[(
 struct Indirection {
     file: &'static str,
     function: &'static str,
-    /// Read by `no_allowlist_entry_has_outlived_its_reason`, so that an entry here cannot be added
-    /// without one.
+    /// `no_allowlist_entry_has_outlived_its_reason` requires a real one.
     reason: &'static str,
 }
 
@@ -112,8 +108,7 @@ const COVERED_ENUM_ROOTS: &[&str] = &["crates/ply-test/src"];
 /// Individually covered enums outside `COVERED_ENUM_ROOTS`, as `(file, name)`.
 const COVERED_ENUMS: &[(&str, &str)] = &[("crates/ply-span/src/lib.rs", "Severity")];
 
-/// Replaces the contents of comments, string literals, raw string literals and character literals
-/// with spaces, preserving every byte offset and every newline.
+/// Blanks comments and string, raw-string and char literals, preserving offsets and newlines.
 fn blank_literals_and_comments(src: &[u8]) -> Vec<u8> {
     let mut out = src.to_vec();
     let n = src.len();
@@ -265,8 +260,7 @@ fn blank_cfg_test_blocks(text: &[u8]) -> Vec<u8> {
         } else if header_declares_a_module(&text[i + ATTR.len()..j]) {
             i += ATTR.len();
         } else {
-            // A `;`-terminated item that is not a module declaration — a `const`, a `static`, a
-            // `type`, a `use`.
+            // A `;`-terminated item that is not a `mod` declaration.
             blank(&mut out, i, j + 1);
             i = j + 1;
         }
@@ -356,8 +350,7 @@ fn line_of(text: &[u8], offset: usize) -> usize {
         + 1
 }
 
-/// Byte ranges that are pattern positions or `use` paths — the two places a `Type::Variant` can
-/// appear without anything being constructed.
+/// Pattern positions and `use` paths: where a `Type::Variant` appears without being constructed.
 fn pattern_and_use_regions(text: &[u8]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     scan(text, 0, text.len(), &mut out);
@@ -396,8 +389,7 @@ fn scan(text: &[u8], lo: usize, hi: usize, out: &mut Vec<(usize, usize)>) {
                     i = end;
                 }
             }
-            // `if let`, `while let` and a plain `let` are the same shape: a pattern between the
-            // keyword and the `=`.
+            // `if let`, `while let` and `let` all put a pattern between the keyword and the `=`.
             b"let" => {
                 let mut j = end;
                 while j < hi {
@@ -487,8 +479,7 @@ fn scan_match(text: &[u8], brace: usize, close: usize, out: &mut Vec<(usize, usi
         }
         match state {
             Arm::Head => {
-                // A pattern's own groups — tuple, slice and struct patterns — are inside the head
-                // range, so they need no separate marking.
+                // A pattern's own groups already lie inside the head range.
                 if matches!(c, b'(' | b'[' | b'{') {
                     i = delim_close(text, i).min(end);
                 } else if c == b'=' && text.get(i + 1) == Some(&b'>') {
@@ -530,8 +521,7 @@ fn scan_match(text: &[u8], brace: usize, close: usize, out: &mut Vec<(usize, usi
     }
 }
 
-/// A block body ends at its own `}`, with the comma after it optional; any other body ends at the
-/// next comma outside a group.
+/// A block body ends at its `}`, comma optional; any other body at the next ungrouped comma.
 fn consume_arm_body(text: &[u8], i: usize, end: usize, out: &mut Vec<(usize, usize)>) -> usize {
     let mut i = skip_ws(text, i, end);
     if text.get(i) == Some(&b'{') {
@@ -575,8 +565,7 @@ fn workspace_root() -> PathBuf {
         .expect("the workspace root is two directories above crates/ply-span")
 }
 
-/// Package names from `[workspace] members`, read out of the root manifest as text — the same
-/// source `.github/ci-shards.sh` reads, for the same reason.
+/// Package names from `[workspace] members`, read out of the root manifest as text.
 fn workspace_members(root: &Path) -> Vec<String> {
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("a workspace manifest");
     let list = manifest
@@ -664,8 +653,7 @@ fn attributes_include_cfg_test(text: &[u8], mod_at: usize) -> bool {
     }
 }
 
-/// Walks `mod` declarations from every crate root and returns the production files: everything
-/// reachable without passing through a `#[cfg(test)] mod`.
+/// Files reachable from a crate root's `mod` declarations without passing a `#[cfg(test)] mod`.
 fn production_sources(root: &Path) -> Vec<Source> {
     let mut reached: BTreeMap<PathBuf, bool> = BTreeMap::new();
     let mut queue: Vec<(PathBuf, bool)> = Vec::new();
@@ -689,8 +677,7 @@ fn production_sources(root: &Path) -> Vec<Source> {
 
     while let Some((path, test_only)) = queue.pop() {
         match reached.get(&path) {
-            // A module reachable by both a production and a test path is production: it compiles
-            // into the library.
+            // Reachable by any production path means it compiles into the library.
             Some(&seen) if seen == test_only || !seen => continue,
             _ => {}
         }
@@ -790,8 +777,7 @@ fn declared_codes(root: &Path) -> BTreeMap<String, (String, usize)> {
         let start = open + start;
         let name_at = skip_ws(&blanked, start + b"pub const".len(), close);
         let (name, name_end) = ident_at(&blanked, name_at);
-        // `skip_ws` over `blanked` would walk straight over the blanked string literal and land on
-        // the `;`.
+        // `skip_ws` over `blanked` would skip the blanked literal and land on the `;`.
         let value_at = match blanked[name_end..close].iter().position(|b| *b == b'=') {
             Some(eq) => skip_ws(&raw, name_end + eq + 1, close),
             None => continue,
@@ -815,8 +801,7 @@ fn declared_codes(root: &Path) -> BTreeMap<String, (String, usize)> {
     out
 }
 
-/// The `(name, codes::NAME, "E0001")` rows of the registry table in ply-span's own test module,
-/// read as text — an integration test cannot call into a `#[cfg(test)]` module.
+/// The registry table's rows in ply-span's `#[cfg(test)]` module, read as text.
 fn registry_rows(root: &Path) -> BTreeSet<String> {
     let raw = std::fs::read(root.join("crates/ply-span/src/lib.rs")).expect("ply-span's lib.rs");
     let blanked = blank_literals_and_comments(&raw);
@@ -835,8 +820,7 @@ fn registry_rows(root: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-/// Every `Diagnostic::error`/`warning` call in production, as `(source index, offset, first
-/// argument as written)`.
+/// Every production `Diagnostic::error`/`warning` call, as `(source, offset, first argument)`.
 fn constructor_calls(sources: &[Source]) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
     for (idx, source) in sources.iter().enumerate() {
@@ -989,8 +973,7 @@ fn covered_enums(sources: &[Source]) -> Vec<CoveredEnum> {
     out
 }
 
-/// Every `Ident::Ident` in production that is not a pattern and not a `use` path, as `(before,
-/// after, source index)`.
+/// Every production `Ident::Ident` outside patterns and `use` paths: `(before, after, source)`.
 fn path_occurrences(sources: &[Source]) -> BTreeSet<(String, String, usize)> {
     let mut out = BTreeSet::new();
     for (idx, source) in sources.iter().enumerate() {
@@ -1020,8 +1003,7 @@ fn path_occurrences(sources: &[Source]) -> BTreeSet<(String, String, usize)> {
     out
 }
 
-/// Whether any production source builds `Enum::Variant` somewhere that is not a pattern and not a
-/// `use` path.
+/// Whether production builds `Enum::Variant` outside a pattern or `use` path.
 fn variant_is_armed(tree: &Tree, covered: &CoveredEnum, variant: &str) -> bool {
     (0..tree.sources.len()).any(|idx| {
         tree.paths
@@ -1197,8 +1179,7 @@ fn every_variant_of_a_covered_enum_is_constructed_in_production() {
     }
 }
 
-/// Without this, one new pass-through wrapper disarms the rule for every code that only reaches the
-/// constructor through it, and both gates go green over the gap.
+/// A pass-through wrapper would otherwise disarm the rule for every code routed through it.
 #[test]
 fn every_diagnostic_constructor_call_names_its_code_literally() {
     let Tree { sources, calls, .. } = tree();
@@ -1242,7 +1223,6 @@ fn every_diagnostic_constructor_call_names_its_code_literally() {
     );
 }
 
-/// The mirror defect: declared and *not* registered.
 #[test]
 fn the_code_registry_table_is_total_over_the_codes_module() {
     let Tree { declared, rows, .. } = tree();
@@ -1275,7 +1255,6 @@ fn the_code_registry_table_is_total_over_the_codes_module() {
     );
 }
 
-/// An allowlist that outlives its reason is the same defect wearing the gate's own clothes.
 #[test]
 fn no_allowlist_entry_has_outlived_its_reason() {
     let tree = tree();
@@ -1443,8 +1422,7 @@ fn assert_pattern(src: &str, needle: &str, expected: bool) {
 
 #[test]
 fn arm_bodies_are_expressions_and_arm_heads_are_patterns() {
-    // The exact shape that fooled the prototype: a block-bodied arm with no trailing comma,
-    // followed by another arm.
+    // A block-bodied arm with no trailing comma, followed by another arm.
     assert_pattern(
         "fn f(e: E) { match e { E::A => { g(); } E::B => { h(); } } }",
         "E::B",
@@ -1460,7 +1438,6 @@ fn arm_bodies_are_expressions_and_arm_heads_are_patterns() {
         "E::A",
         true,
     );
-    // A nested match inside an arm body is still scanned.
     assert_pattern(
         "fn f(e: E) { match e { E::A => match g() { E::C => 1, _ => 2 }, _ => 3 } }",
         "E::C",
@@ -1472,7 +1449,6 @@ fn arm_bodies_are_expressions_and_arm_heads_are_patterns() {
         "E::A",
         false,
     );
-    // Or-patterns and struct patterns.
     assert_pattern(
         "fn f(e: E) { match e { E::A | E::B => 1, _ => 2 } }",
         "E::B",
@@ -1483,7 +1459,6 @@ fn arm_bodies_are_expressions_and_arm_heads_are_patterns() {
         "E::A",
         true,
     );
-    // The other consumers.
     assert_pattern("fn f(e: E) { if let E::A = e { g() } }", "E::A", true);
     assert_pattern("fn f(e: E) { while let E::A = e { g() } }", "E::A", true);
     assert_pattern("fn f(e: E) -> bool { matches!(e, E::A) }", "E::A", true);
@@ -1555,8 +1530,6 @@ fn cfg_test_items_and_modules_are_not_production() {
     assert!(mod_declarations(b"mod inline { fn f() {} }").is_empty());
 }
 
-/// The walk from `#[cfg(test)]` to the item's body used to stop at the first `;`, which a header
-/// can contain without ending anything.
 #[test]
 fn a_cfg_test_item_is_not_production_whatever_its_header_looks_like() {
     // A `;` inside an array type in the return position.
@@ -1576,8 +1549,7 @@ fn a_cfg_test_item_is_not_production_whatever_its_header_looks_like() {
         b"GHOST"
     ));
 
-    // `;`-terminated items that are not modules are test-only source too, and a `const` initialiser
-    // is a construction wherever it is written.
+    // Non-module `;`-terminated items are test-only source too.
     for src in [
         "#[cfg(test)]\nconst K: E = E::GHOST;\nfn after() {}",
         "#[cfg(test)]\nstatic K: E = E::GHOST;\nfn after() {}",
@@ -1595,8 +1567,7 @@ fn a_cfg_test_item_is_not_production_whatever_its_header_looks_like() {
         );
     }
 
-    // ... and a `mod` declaration is still the exception, however it is spelled, because the
-    // resolver reads it to decide the file it names is test-only.
+    // A `mod` declaration survives however it is spelled: the resolver reads it.
     for src in [
         "#[cfg(test)]\nmod tests;",
         "#[cfg(test)]\npub(crate) mod delta_tests;",
@@ -1636,9 +1607,7 @@ fn a_codes_path_is_recognised_however_it_is_qualified() {
     assert_eq!(code_from_path("other::X"), None);
 }
 
-/// Production files that install a compiled backend, and the reason each is allowed to, in the
-/// shape `UNARMED_CODES` uses and for the same reason: a route that appears without anybody
-/// deciding it should must look different from one that was decided on.
+/// Production files that install a compiled backend, each with the reason it may.
 const BACKEND_INSTALLERS: &[(&str, &str)] = &[
     (
         "crates/ply-test/src/lib.rs",
@@ -1701,7 +1670,6 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
     ),
 ];
 
-/// A backend installed by a route the cache rule does not know about.
 #[test]
 fn a_shipping_command_that_installs_a_backend_must_also_bypass_the_cache() {
     let Tree { sources, .. } = tree();
@@ -1738,7 +1706,6 @@ fn a_shipping_command_that_installs_a_backend_must_also_bypass_the_cache() {
          row — an excuse that outlives its fact is what this file exists to prevent."
     );
 
-    // The two halves, read off the production source that owes them.
     let cli = sources
         .iter()
         .find(|s| s.rel == "crates/ply-cli/src/commands/test.rs")

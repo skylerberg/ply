@@ -1,5 +1,3 @@
-//! The archive a bootstrap reads: the front end as C, and the two digests that name it.
-
 use assert_cmd::Command;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -16,7 +14,6 @@ fn project(dir: &TempDir, source: &str) -> std::path::PathBuf {
     dir.path().to_path_buf()
 }
 
-/// An archive is written, describes the tree it came from, and says so again when asked.
 #[test]
 fn an_archive_is_written_and_verifies_against_the_tree_it_came_from() {
     let dir = TempDir::new().expect("a scratch directory");
@@ -76,7 +73,6 @@ fn an_archive_is_written_and_verifies_against_the_tree_it_came_from() {
     );
 }
 
-/// A change to the program is a change to the version, and the archive refuses to claim otherwise.
 #[test]
 fn an_archive_stops_describing_a_tree_that_moved() {
     let dir = TempDir::new().expect("a scratch directory");

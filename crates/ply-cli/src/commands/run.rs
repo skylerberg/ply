@@ -17,8 +17,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 pub fn execute(args: &RunArgs, style: Style) -> i32 {
-    // A built artifact is run out of its own verified definitions rather than out of a source tree
-    // it may not be sitting next to.
+    // An artifact runs out of its own verified definitions, not a source tree.
     if args
         .path
         .extension()
@@ -54,17 +53,14 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
         }
     };
 
-    // After the entry point is known and before anything evaluates: a bad registration is a
-    // start-up failure, and a hermetic run resolves nothing at all, so the default path cannot be
-    // broken by a registry it never consults.
+    // Before anything evaluates; a hermetic run resolves nothing, so no registry can break it.
     let db = match args.db.resolve(args.host) {
         Ok(db) => db,
         Err(diagnostics) => {
             return report_bind_error("run", &diagnostics, &loaded.sources, args.json, style);
         }
     };
-    // The entry point's own row, which is what a host answer is checked against and what decides
-    // whether this run needs a database at all.
+    // What a host answer is checked against, and whether this run needs a database.
     let declared = loaded
         .check
         .defs
@@ -82,8 +78,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
             return report_bind_error("run", &diagnostics, &loaded.sources, args.json, style);
         }
     };
-    // Before the binding, because whether `signal` is bound or withheld is decided when the
-    // registry is built.
+    // Before the binding, which decides whether `signal` is bound.
     let shutdown = args.host.then(|| Shutdown::new(args.shutdown.bounds()));
     if let Some(shutdown) = &shutdown
         && let Err(diagnostic) = signal::listen(shutdown)
@@ -113,23 +108,18 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
         }
     };
     describe_schema(&loaded, &mut hosts);
-    // A `--set` the schema does not declare is the classic silent deploy failure, so it is reported
-    // whichever projection the caller asked for.
+    // An undeclared `--set` is a classic silent deploy failure, so it is always reported.
     if !args.json {
         print_diagnostics(&config_warnings, &loaded.sources, style);
     }
     let config_warnings =
         crate::commands::common::diagnostics_json(&config_warnings, &loaded.sources);
 
-    // Before anything evaluates, because a service that printed what it was configured with only
-    // when it stopped would be a service nobody could read that from.
     if !args.json {
         print_binding(&hosts, style);
     }
-    // a request live at the deadline: `--drain-ms` should exceed the program's own `body_timeout_ms +
-    // write_timeout_ms`, and the run cannot check that because `http::Limits` is a Ply value it
-    // never sees — so the number is printed where it can be compared by eye against the one in the
-    // program.
+    // `--drain-ms` should exceed the program's `body_timeout_ms + write_timeout_ms`, which the run
+    // cannot see, so it is printed for comparison by eye.
     if let Some(shutdown) = &shutdown
         && !args.json
     {
@@ -161,8 +151,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
             return report_bind_error("run", &[diagnostic], &loaded.sources, args.json, style);
         }
     };
-    // The counters are process-wide and cumulative, so they mean nothing unless this run is the
-    // only thing they have seen.
+    // The counters are process-wide and cumulative.
     ply_eval::rc::reset();
     let answer = evaluate(
         &loaded,
@@ -176,8 +165,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
 
     let counters_value = counters_json(&ply_eval::rc::stats());
 
-    // A cycle among escaped values is never collected (the reference-counting pass), so the run that built one is
-    // the only place a reader can be told it is there.
+    // A cycle among escaped values is never collected, so only this run can report it.
     let mut config_warnings = config_warnings;
     let cycles = ply_eval::rc::take_cycles();
     if !cycles.is_empty() {
@@ -193,8 +181,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
         }
     }
 
-    // After the entry point and before the process exits, on the machine's own thread: roll every
-    // open transaction back, flush the sink, close the pool.
+    // On the machine's own thread, before the process exits.
     let teardown = teardown(&hosts, shutdown.as_ref(), args.shutdown.drain_ms);
     let teardown_json = teardown_json(shutdown.as_ref(), teardown.as_ref(), &args.shutdown);
     if !args.json {
@@ -230,9 +217,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
             EXIT_OK
         }
         Err(diagnostic) => {
-            // A drain that expired is the run's configuration at fault rather than the program's:
-            // it is a warning, it is attributed to no definition and it is not bisected, and what
-            // carries the verdict is the exit code.
+            // An expired drain is the configuration's fault: a warning, not attributed or bisected.
             let drained = ply_eval::is_drain_incomplete(&diagnostic);
             let code = if drained {
                 EXIT_DRAIN_INCOMPLETE
@@ -276,8 +261,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     }
 }
 
-/// The teardown order's pinned order: every open transaction rolled back and never committed, every open
-/// span closed `Abandoned`, the sink flushed, the pool closed.
+/// Rolls back every open transaction, closes spans `Abandoned`, flushes the sink, closes the pool.
 pub(crate) fn teardown(
     hosts: &Hosts,
     shutdown: Option<&Arc<Shutdown>>,
@@ -293,10 +277,8 @@ pub(crate) fn teardown(
     hosts.runtime().map(|rt| rt.shutdown(budget))
 }
 
-/// The least a teardown gets after a drain that already expired.
 pub(crate) const TEARDOWN_FLOOR_MS: u64 = 1_000;
 
-/// The `shutdown` object of every `--json` run, source or artifact.
 pub(crate) fn teardown_json(
     shutdown: Option<&Arc<Shutdown>>,
     teardown: Option<&ply_eval::ShutdownReport>,
@@ -314,7 +296,7 @@ pub(crate) fn teardown_json(
     })
 }
 
-/// What a stopping service prints, and nothing when nobody asked it to stop.
+/// Nothing when nobody asked the service to stop.
 pub(crate) fn stop_lines(
     hosts: &Hosts,
     shutdown: Option<&Arc<Shutdown>>,
@@ -349,7 +331,6 @@ pub(crate) fn stop_lines(
             lines.push(format!("warning[{}]: {problem}", codes::HOST_TEARDOWN));
         }
     }
-    // What the sink saw, counted by the sink.
     if let Some(counts) = hosts.trace_counts() {
         lines.push(format!(
             "trace       {} event(s) · {} span(s) · {} abandoned · {}",
@@ -366,7 +347,6 @@ pub(crate) fn stop_lines(
     lines
 }
 
-/// What a `--host` run is about to reach for, before it reaches for it.
 pub(crate) fn print_binding(hosts: &Hosts, style: Style) {
     if hosts.is_hermetic() {
         return;
@@ -382,16 +362,12 @@ pub(crate) fn print_binding(hosts: &Hosts, style: Style) {
             crate::hosts::digest_short(listing, &disclosures),
         ))
     );
-    // Every number on this line is a fact the run already holds: the snapshot counted by the source
-    // that won each key.
     if disclosures.configuration.is_some() {
         println!(
             "{IND}{}",
             style.dim(&format!("config      {}", hosts.configuration().banner()))
         );
     }
-    // Where this run's records go and which channels exist, which is the pair a reader needs before
-    // deciding whether an empty log means "quiet" or "wrong sink".
     if let Some(observability) = &disclosures.observability {
         println!(
             "{IND}{}",
@@ -403,8 +379,7 @@ pub(crate) fn print_binding(hosts: &Hosts, style: Style) {
     }
 }
 
-/// The one thing on the banner a run can only know once it is over: how many handshakes completed
-/// and how many were refused.
+/// Handshakes completed and refused, which a run only knows once it is over.
 fn print_handshakes(hosts: &Hosts, style: Style) {
     if hosts.is_hermetic() {
         return;
@@ -414,11 +389,7 @@ fn print_handshakes(hosts: &Hosts, style: Style) {
     }
 }
 
-/// Under `both`, the authoritative engine's answer is what `main` produced and the other engine's
-/// is only ever a reason to fail: a value the two disagree about must never be printed as if it
-/// were the program's.
-/// `--backend`, built over the loaded program and attached as `ply test` attaches it: the
-/// machine drops into compiled code at the leaves and the answer is what `main` produced.
+/// `--backend`, built over the loaded program and attached as `ply test` attaches it.
 pub fn compiled_backend(
     flag: Option<&String>,
     loaded: &Loaded,
@@ -456,13 +427,11 @@ fn evaluate(
     if let Some(declared) = declared {
         machine.set_declared_footprint(declared.clone());
     }
-    // `ply run` takes exactly one interleaving, the one its seed names: exploration is a test-time
-    // activity, so there is nothing to search here.
+    // Exploration is a test-time activity; `ply run` takes the one interleaving its seed names.
     ply_test::sim::seed_run(&mut machine, &plan.seeds()[0], plan.steps);
     machine.call(name, Vec::new(), span)
 }
 
-/// A file argument names one module, so its `main` is the only candidate.
 pub fn entry_point(loaded: &Loaded) -> Result<&DefInfo, Diagnostic> {
     let mut candidates = loaded.entry_points();
     match candidates.len() {
@@ -472,8 +441,7 @@ pub fn entry_point(loaded: &Loaded) -> Result<&DefInfo, Diagnostic> {
     }
 }
 
-/// Inference already proved every name resolves, so a missing `main` is a missing entry point
-/// rather than an unbound reference — say so before the evaluator gets a chance to phrase it worse.
+/// Every name already resolves, so a missing `main` is a missing entry point.
 pub fn no_main(loaded: &Loaded) -> Diagnostic {
     let modules = loaded.modules();
     let mut diagnostic = Diagnostic::error(codes::UNKNOWN_NAME, "no `main` to run")
@@ -498,8 +466,7 @@ pub fn no_main(loaded: &Loaded) -> Diagnostic {
     diagnostic
 }
 
-/// The empty span at the end of a file: where the missing definition would be written, and the one
-/// position in the file that is not existing code.
+/// The empty span at the end of a file, where the missing definition would go.
 fn end_of(loaded: &Loaded, source: SourceId) -> Span {
     let end = loaded
         .sources
