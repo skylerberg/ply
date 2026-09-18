@@ -1,6 +1,3 @@
-//! `iterate`'s type surface, at the source level: the one loop whose bound is an argument rather
-//! than the evaluator's call ceiling.
-
 use crate::fixture::compile;
 use ply_core::{CheckOutput, print_type};
 use ply_span::{Diagnostic, Symbol, codes};
@@ -29,19 +26,15 @@ fn footprint(out: &CheckOutput, name: &str) -> String {
         .to_string()
 }
 
-/// `fn probe_iterate() -> <the contract's type> = iterate` returns the builtin itself, so the
-/// probe's own signature carries the builtin's whole type.
+/// The probe returns the builtin itself, so its signature is the builtin's whole type.
 #[test]
 fn iterate_has_the_type_the_contract_states() {
     let want = "(a, Int, (a) -> Iter<a, b> / e) -> b / e";
     let source = format!("fn probe_iterate<a, b | e>() -> {want} = iterate\n");
     let out = ok(&source);
-    // Stronger than reading the type off inference was: `iterate` must now *unify* with the
-    // contract's type rather than merely print as it.
     assert_eq!(sig(&out, "probe_iterate"), format!("() -> {want}"));
 }
 
-/// The budget sits **second** and the callback **last**.
 #[test]
 fn the_budget_is_the_second_argument_and_the_step_is_the_last() {
     ok("fn go(n: Int) -> Int = iterate(0, n, |s: Int| Stop(s))\n");
@@ -52,7 +45,6 @@ fn the_budget_is_the_second_argument_and_the_step_is_the_last() {
     );
 }
 
-/// A step's row is the caller's.
 #[test]
 fn an_iterate_publishes_the_row_of_the_step_it_drives() {
     let out = ok(r#"
@@ -75,8 +67,6 @@ fn loud_loop(n: Int) -> Int =
     );
 }
 
-/// `Iter` joins `builtin_types()`, so a project's own `type Iter` is `E0105` exactly as `type
-/// Option` already is.
 #[test]
 fn a_project_may_not_declare_its_own_iter() {
     let d = errors("type Iter = Yes | No\n");
@@ -92,9 +82,6 @@ fn a_project_may_not_declare_its_own_iter() {
     );
 }
 
-/// `Continue` and `Stop` are **constructors**, not type names, and constructors are not globally
-/// reserved: a module's own shadow the prelude's, which is why `std.signal`'s `type Stop` and
-/// `std.json`'s `type Step` still check.
 #[test]
 fn a_module_may_still_declare_its_own_stop_and_continue() {
     let out = ok(r#"
@@ -104,11 +91,9 @@ type Phase = Continue(Int) | Done
 fn halt() -> Stop = { stopping: true }
 fn first() -> Phase = Continue(1)
 "#);
-    // The alias is normalized away in the printed type; that it checked at all is the claim — the
-    // prelude's `Stop` constructor did not collide with it.
+    // The alias prints normalized away; that it checked at all is the claim.
     assert_eq!(sig(&out, "halt"), "() -> {stopping: Bool}");
     assert_eq!(sig(&out, "first"), "() -> m.Phase");
-    // And the prelude's own `Stop` is still reachable where nothing shadows it.
     let plain = ok("fn stop_at(n: Int) -> Iter<Int, Int> = Stop(n)\n");
     assert_eq!(sig(&plain, "stop_at"), "(Int) -> Iter<Int, Int>");
 }

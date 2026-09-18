@@ -1,5 +1,3 @@
-//! Inference over the three numeric types, and the prelude's ADTs.
-
 use ply_core::check_program;
 use ply_core::print::print_scheme;
 use ply_span::{Diagnostic, SourceId, codes};
@@ -46,8 +44,6 @@ fn scheme(source: &str, name: &str) -> String {
     print_scheme(&def.scheme)
 }
 
-// -- Operator overloading ---------------------------------------------------
-
 #[test]
 fn arithmetic_works_at_each_of_the_three_numeric_types() {
     assert_eq!(
@@ -67,8 +63,6 @@ fn arithmetic_works_at_each_of_the_three_numeric_types() {
     );
 }
 
-/// The operand type is often unknown at the node and known three tokens later, which is why the
-/// decision is deferred rather than taken on sight.
 #[test]
 fn the_operand_type_is_learned_from_either_side() {
     ok("pub fn f() -> Float = { let g = |a| a + 1.0; 0.0 }");
@@ -76,8 +70,7 @@ fn the_operand_type_is_learned_from_either_side() {
     ok("pub fn f() -> Int = { let g = |a| a < 1.5; 0 }");
 }
 
-/// A caller inside the same recursive component can be what pins a callee's operand type, so
-/// settling one body at a time would decide `Int` before the other body said `Decimal`.
+/// Settling one body at a time would decide `Int` before the other body said `Decimal`.
 #[test]
 fn a_recursive_component_settles_after_every_member() {
     assert_eq!(
@@ -90,7 +83,6 @@ fn a_recursive_component_settles_after_every_member() {
     );
 }
 
-/// An operand type nothing pins is `NUMERIC_UNDETERMINED`, not a default.
 #[test]
 fn an_unconstrained_operand_is_e0210_rather_than_defaulting_to_int() {
     assert_eq!(
@@ -105,9 +97,6 @@ fn an_unconstrained_operand_is_e0210_rather_than_defaulting_to_int() {
     ok("pub fn f() -> Int = { let g = |a| 0 - a; 0 }");
 }
 
-/// A top-level `fn` publishes what a human wrote, so an omitted parameter type or return type is
-/// `MISSING_SIGNATURE` — and the diagnostic names the type inference would have given, which is
-/// what makes the fix mechanical.
 #[test]
 fn an_omitted_signature_is_e0126_and_the_message_carries_the_fix() {
     let diags = errors("pub fn shout(m: String) = string_upper(m)");
@@ -126,8 +115,6 @@ fn an_omitted_signature_is_e0126_and_the_message_carries_the_fix() {
     );
 }
 
-/// An effect row is the deliberate exception: derived from what the body calls rather than chosen,
-/// so it stays inferred with every type written.
 #[test]
 fn an_omitted_effect_row_is_still_inferred() {
     assert_eq!(
@@ -136,7 +123,6 @@ fn an_omitted_effect_row_is_still_inferred() {
     );
 }
 
-/// Only a top-level `fn` publishes a signature, so only a top-level `fn` has to write one.
 #[test]
 fn a_handler_clause_binder_and_a_lambda_binder_still_infer() {
     ok("effect log { write emit(m: String) -> Unit }\n\
@@ -145,7 +131,6 @@ fn a_handler_clause_binder_and_a_lambda_binder_still_infer() {
     ok("pub fn f(xs: List<Int>) -> List<Int> = map(xs, |n| n + 1)");
 }
 
-/// The one place W2 refuses what every other language allows.
 #[test]
 fn decimal_division_is_e0209_and_names_its_replacement() {
     let diags = errors("pub fn unit(total: Decimal, count: Decimal) -> Decimal = total / count");
@@ -158,18 +143,15 @@ fn decimal_division_is_e0209_and_names_its_replacement() {
         "the diagnostic has to say what to call instead: {:?}",
         diags[0].notes
     );
-    // The span is the operator's expression, not the whole definition.
     assert!(diags[0].primary_span().is_some());
 }
 
-/// `%` is allowed where `/` is not: the remainder of a decimal division is a decimal even when the
-/// quotient is not.
+/// The remainder of a decimal division is a decimal even when the quotient is not.
 #[test]
 fn decimal_remainder_is_accepted() {
     ok("pub fn f(a: Decimal, b: Decimal) -> Decimal = a % b");
 }
 
-/// `/` at the other two numeric types is untouched.
 #[test]
 fn division_is_refused_only_at_decimal() {
     ok("pub fn f(a: Int, b: Int) -> Int = a / b");
@@ -195,7 +177,6 @@ fn arithmetic_on_a_non_numeric_type_names_the_three_that_work() {
     );
 }
 
-/// Mixing two numeric types is one diagnostic about the operands, not two.
 #[test]
 fn mixing_two_numeric_types_is_reported_once() {
     let diags = errors("pub fn f(a: Int, b: Float) -> Int = a + b");
@@ -234,7 +215,6 @@ fn negation_is_defined_at_each_numeric_type() {
     );
 }
 
-/// Three types, so a literal of one is not a literal of another.
 #[test]
 fn the_three_literal_forms_have_three_types() {
     assert_eq!(scheme("pub fn f() -> Int = 1", "m.f"), "() -> Int");
@@ -244,10 +224,6 @@ fn the_three_literal_forms_have_three_types() {
     assert_eq!(code("pub fn f() -> Float = 1m"), codes::TYPE_MISMATCH);
 }
 
-// -- The prelude's ADTs -----------------------------------------------------
-
-/// A builtin whose type mentions a type the user has to import first would be incoherent, so these
-/// four are in scope with no declaration anywhere.
 #[test]
 fn the_prelude_adts_are_in_scope_without_a_declaration() {
     ok("pub fn f(d: Decimal) -> Option<Int> = int_of_decimal(d, HalfEven)");
@@ -270,7 +246,6 @@ fn a_prelude_adt_can_be_matched_and_is_checked_for_exhaustiveness() {
     );
 }
 
-/// A language with two `Option`s is worse than one with none.
 #[test]
 fn redeclaring_a_prelude_adt_is_a_duplicate_definition() {
     assert_eq!(
@@ -295,8 +270,6 @@ fn the_prelude_adts_carry_their_declared_arity() {
     );
 }
 
-// -- The numeric builtins ---------------------------------------------------
-
 #[test]
 fn the_decimal_builtins_have_the_signatures_the_contract_names() {
     let out = ok("pub fn f() -> Int = 1");
@@ -316,16 +289,12 @@ fn the_decimal_builtins_have_the_signatures_the_contract_names() {
         ("bits_of_float", "(Float) -> Int"),
         ("float_of_bits", "(Int) -> Float"),
     ] {
-        // Checking through a definition that names it is what proves the builtin is reachable *and*
-        // has the type, in one step.
         let source = format!("pub fn f() -> Int = 1\npub fn g() -> {want} = {name}");
         let printed = scheme(&source, "m.g");
         assert_eq!(printed, format!("() -> {want}"), "`{name}`");
     }
 }
 
-/// A scale is an argument rather than a default, and a rounding mode is a value the caller writes
-/// down.
 #[test]
 fn decimal_div_will_not_typecheck_without_a_rounding_mode() {
     assert_eq!(
@@ -338,8 +307,7 @@ fn decimal_div_will_not_typecheck_without_a_rounding_mode() {
     );
 }
 
-/// The property generator builds its `TypeWorld` from `CheckOutput::ctors`, so a prelude ADT that
-/// never reached that map would be `E0418` — a law over an `Option` nobody can check.
+/// The property generator builds its `TypeWorld` from `CheckOutput::ctors`.
 #[test]
 fn the_prelude_adts_reach_the_check_output() {
     let out = ok("pub fn f() -> Option<Int> = None");

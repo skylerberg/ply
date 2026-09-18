@@ -3,8 +3,7 @@ use ply_eval::arena::*;
 use ply_span::Span;
 use std::sync::Arc;
 
-/// A value whose payload is behind an `Arc`, so `strong_count` reports whether the arena freed
-/// it or is still holding it.
+/// Behind an `Arc`, so `strong_count` shows whether the arena freed it.
 fn payload(n: i64) -> (Arc<Vec<Value>>, Value) {
     let items = Arc::new(vec![Value::Int(n)]);
     (
@@ -40,8 +39,6 @@ fn allocation_is_a_bump_and_close_gives_the_slots_back() {
     assert_eq!(arena.extent(r), None);
 }
 
-/// The free at the region's close is a real free: the values are dropped, which is what an
-/// `Arc` payload's refcount says.
 #[test]
 fn closing_a_region_drops_the_values_it_held() {
     let mut arena: Arena = Arena::new();
@@ -59,7 +56,6 @@ fn closing_a_region_drops_the_values_it_held() {
     assert_eq!(Arc::strong_count(&arc), 1, "the region's close freed it");
 }
 
-/// The point of a bump arena: the second region through costs the allocator nothing.
 #[test]
 fn a_second_region_of_the_same_size_allocates_nothing() {
     let mut arena: Arena = Arena::new();
@@ -209,9 +205,6 @@ fn a_unique_region_refuses_to_be_snapshotted() {
     arena.close(r);
 }
 
-/// The primitive's contract, stated over the sequence a checkpoint would use: after a restore
-/// the arena is exactly as the snapshot found it, and a slot allocated between the two is not
-/// readable through it.
 #[test]
 fn a_restore_undoes_every_write_and_every_allocation_since_the_snapshot() {
     let mut arena: Arena = Arena::new();
@@ -236,8 +229,6 @@ fn a_restore_undoes_every_write_and_every_allocation_since_the_snapshot() {
     arena.close(r);
 }
 
-/// A slot allocated after the snapshot and one allocated after the restore take the same
-/// physical position.
 #[test]
 fn allocations_either_side_of_a_restore_are_different_slots() {
     let mut arena: Arena = Arena::new();
@@ -256,8 +247,6 @@ fn allocations_either_side_of_a_restore_are_different_slots() {
     arena.close(r);
 }
 
-/// The slot identities held from before the snapshot survive a restore, or whoever holds one
-/// reads `None` where it left a value.
 #[test]
 fn a_restore_keeps_the_slots_the_capture_was_holding() {
     let mut arena: Arena = Arena::new();
@@ -278,8 +267,6 @@ fn a_restore_keeps_the_slots_the_capture_was_holding() {
     arena.close(r);
 }
 
-/// A snapshot of a region covers the regions nested inside it, because their slots sit above
-/// its mark.
 #[test]
 fn a_snapshot_covers_the_regions_nested_inside_the_one_it_names() {
     let mut arena: Arena = Arena::new();
@@ -301,10 +288,6 @@ fn a_snapshot_covers_the_regions_nested_inside_the_one_it_names() {
     arena.close(outer);
 }
 
-/// The reason [`Arena::snapshot_open`] exists, written as the failure it prevents: a snapshot
-/// of the region a capture is *lexically* inside covers that region and no enclosing one, so a
-/// write the first resumption makes to an enclosing region survives the restore and the second
-/// resumption reads it.
 #[test]
 fn a_snapshot_of_the_inner_region_leaves_the_enclosing_regions_writes_in_place() {
     let mut arena: Arena = Arena::new();
@@ -342,7 +325,6 @@ fn a_snapshot_of_the_inner_region_leaves_the_enclosing_regions_writes_in_place()
     arena.close(outer);
 }
 
-/// The cost, stated as the number it actually is rather than the one the region-kind rule advertised.
 #[test]
 fn covering_every_open_region_costs_the_whole_live_arena() {
     let mut arena: Arena = Arena::new();
@@ -364,8 +346,6 @@ fn covering_every_open_region_costs_the_whole_live_arena() {
     arena.close(outer);
 }
 
-/// A `unique` region open at a capture is the inference and the machine disagreeing, and the
-/// capture path has to be told which region so it can name it.
 #[test]
 fn a_capture_across_a_unique_region_is_refused_and_names_it() {
     let mut arena: Arena = Arena::new();
@@ -396,7 +376,6 @@ fn a_capture_outside_every_region_has_nothing_to_snapshot() {
     assert_eq!(arena.stats().snapshots, 0);
 }
 
-/// A restore restores the arena's state, not a bump range.
 #[test]
 fn a_restore_brings_a_closed_regions_scope_back_with_its_slots() {
     let mut arena: Arena = Arena::new();
@@ -429,8 +408,6 @@ fn a_restore_brings_a_closed_regions_scope_back_with_its_slots() {
     assert_eq!(arena.live(), 0);
 }
 
-/// The other direction: a region opened after the snapshot did not exist at it, so it is gone
-/// after the restore.
 #[test]
 fn a_region_opened_after_the_snapshot_does_not_survive_the_restore() {
     let mut arena: Arena = Arena::new();
@@ -452,8 +429,7 @@ fn a_region_opened_after_the_snapshot_does_not_survive_the_restore() {
     assert_eq!(arena.extent(q), None, "and its extent is not a subtraction");
     assert!(arena.get(stranded).is_none());
 
-    // The allocation the next resumption makes is reclaimed by the region it is actually in,
-    // rather than escaping to a mark nothing reaches.
+    // The next allocation is reclaimed by the region it is actually in.
     let again = arena.alloc(Value::Int(4)).expect("inside a region");
     assert_eq!(arena.extent(r), Some(2));
     arena.close(r);
@@ -461,8 +437,7 @@ fn a_region_opened_after_the_snapshot_does_not_survive_the_restore() {
     assert!(arena.get(again).is_none());
 }
 
-/// Every open region's mark stays at or below the bump pointer, which is the invariant `extent`
-/// and `snapshot` subtract under.
+/// The invariant `extent` and `snapshot` subtract under.
 #[test]
 fn no_sequence_of_restores_strands_a_regions_mark_above_the_bump_pointer() {
     let mut arena: Arena = Arena::new();
@@ -488,8 +463,6 @@ fn no_sequence_of_restores_strands_a_regions_mark_above_the_bump_pointer() {
     assert_eq!(arena.depth(), 0);
 }
 
-/// The cost the region-kind rule says is paid at the capture, stated as a number: one copy per live slot of the
-/// region, and nothing per allocation.
 #[test]
 fn a_snapshot_copies_the_regions_slots_and_no_others() {
     let mut arena: Arena = Arena::new();
@@ -511,8 +484,6 @@ fn a_snapshot_copies_the_regions_slots_and_no_others() {
     arena.close(outer);
 }
 
-/// Linear in the region's size and in nothing else, so "cost is paid at the capture" is a
-/// measurement rather than a slogan.
 #[test]
 fn snapshot_cost_is_linear_in_the_regions_size() {
     for size in [0usize, 1, 100, 1_000, 10_000] {
@@ -529,9 +500,6 @@ fn snapshot_cost_is_linear_in_the_regions_size() {
     }
 }
 
-/// A snapshot holds the payload rather than copying it: a `Value` clone is a refcount bump, so
-/// a snapshot of a region full of lists is proportional to the *slot count* and not to what the
-/// slots point at.
 #[test]
 fn a_snapshot_shares_payloads_rather_than_deep_copying_them() {
     let mut arena: Arena = Arena::new();
@@ -562,8 +530,6 @@ fn a_snapshot_shares_payloads_rather_than_deep_copying_them() {
     }
 }
 
-/// A snapshot that is dropped unused costs only itself: the region closes at its lexical end
-/// and its arena is freed as if nothing had been saved.
 #[test]
 fn a_snapshot_that_is_never_restored_costs_only_itself() {
     let mut arena: Arena = Arena::new();

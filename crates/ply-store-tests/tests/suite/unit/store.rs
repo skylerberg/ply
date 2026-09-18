@@ -147,8 +147,7 @@ fn an_abandoned_temp_file_does_not_disturb_the_cache() {
         "a completed flush leaves no temp file"
     );
 
-    // What an interrupted `ply test` leaves behind: a half-written temp file that was never
-    // renamed.
+    // What an interrupted `ply test` leaves behind: a temp file that was never renamed.
     let abandoned = store.dir().join("results.999999.0.0.tmp");
     fs::write(&abandoned, "{\"format\": 1, \"runtime_ver").unwrap();
 
@@ -398,9 +397,7 @@ fn a_reader_never_observes_a_partial_file_while_writers_run() {
 
     let final_store = root.open();
     assert!(final_store.warnings().is_empty());
-    // `flush` waits `LOCK_WAIT` for the cache lock and, if it does not get it, warns and writes
-    // nothing (`lib.rs`'s `flush`, `disk.rs`'s "a caller that proceeds unlocked risks losing a
-    // concurrent writer's entries, which costs a re-run, but still cannot produce a torn file").
+    // A `flush` that cannot take the lock within `LOCK_WAIT` warns and writes nothing.
     let lost = declined.load(Ordering::Acquire) as usize;
     assert_eq!(
         final_store.len() + lost,
@@ -438,8 +435,6 @@ fn a_lock_excludes_a_second_holder_and_is_released_on_drop() {
     assert!(after.held, "dropping the holder releases the lock");
 }
 
-/// A writer that cannot take the lock now writes nothing, so a lock a killed process left behind
-/// would block every write forever if it were not broken by age.
 #[test]
 fn a_lock_left_by_a_dead_process_never_blocks_a_flush() {
     let root = TempRoot::new("lock-abandoned");
@@ -516,8 +511,7 @@ fn an_observed_definition_survives_disk_without_becoming_a_result() {
     assert!(!reopened.knows_definition(hash(3)));
     assert_eq!(reopened.definitions_len(), 2);
 
-    // The two records answer different questions and must never leak into each other: a definition
-    // is not a test that passed.
+    // The two records answer different questions: a definition is not a test that passed.
     assert!(reopened.get(hash(1)).is_none());
     assert!(!reopened.contains(hash(1)));
     assert_eq!(reopened.len(), 1);
@@ -688,8 +682,7 @@ impl TempRoot {
     }
 }
 
-/// The header field offsets the format fixes, named here so a test that damages one says which one
-/// it damaged.
+/// The header field offsets the format fixes, named so a test says which one it damaged.
 mod at {
     pub(super) const MAGIC: usize = 0;
     pub(super) const SCHEMA: usize = 16;
@@ -705,9 +698,7 @@ fn patch(path: &Path, offset: usize, bytes: &[u8]) {
     fs::write(path, file).unwrap();
 }
 
-/// Every frame in a data file, as `(offset, kind, payload length)`, by walking it the way nothing
-/// in the store ever does — a frame is only ever reached through an index record that already
-/// claims where it is.
+/// Every frame as `(offset, kind, payload length)`, found by walking the file as the store never does.
 fn frames(path: &Path) -> Vec<(usize, u8, usize)> {
     let bytes = fs::read(path).unwrap();
     let mut out = Vec::new();
@@ -733,8 +724,7 @@ fn frame_checksum(kind: u8, payload: &[u8]) -> [u8; 8] {
     out
 }
 
-/// Rewrites one frame's payload and repairs its checksum, which is what an encoding change looks
-/// like from the outside: bytes that verify but no longer mean what the decoder expects.
+/// Rewrites a payload and repairs its checksum: what an encoding change looks like from outside.
 fn rewrite_payload(path: &Path, frame: usize, edit: impl FnOnce(&mut Vec<u8>)) {
     let (offset, kind, len) = frames(path)[frame];
     let mut bytes = fs::read(path).unwrap();
@@ -814,8 +804,7 @@ fn a_fingerprint_an_interface_and_a_body_survive_a_round_trip_through_disk() {
     assert!(reopened.body(hash(2)).is_none());
 }
 
-/// The index is rewritten whole on every flush, so a run that re-derives exactly what is already
-/// stored must not flush at all.
+/// The index is rewritten whole on every flush.
 #[test]
 fn re_storing_identical_entries_leaves_the_cache_clean() {
     let root = TempRoot::new("frontend-idempotent");
@@ -854,7 +843,6 @@ fn re_storing_identical_entries_leaves_the_cache_clean() {
     );
 }
 
-/// Two definitions in different modules with the same `DefHash` and different schemes.
 #[test]
 fn two_definitions_sharing_a_hash_each_keep_their_own_interface() {
     let root = TempRoot::new("frontend-shared-hash");
@@ -968,9 +956,7 @@ fn the_two_caches_are_versioned_and_invalidated_independently() {
     assert!(reopened.warnings()[0].message.contains("front end"));
 }
 
-/// The gate that exists because a binary encoding cannot fail loudly on its own: a stored shape
-/// that changed without a version bump would otherwise decode into a plausible wrong `Footprint`,
-/// and footprints decide which tests may run concurrently.
+/// Otherwise a changed shape decodes into a plausible wrong `Footprint`, and footprints schedule tests.
 #[test]
 fn a_cache_written_against_other_shapes_is_refused() {
     for (tag, file) in [
@@ -1036,8 +1022,6 @@ fn an_index_that_does_not_match_its_own_checksum_is_refused() {
     );
 }
 
-/// The two files carry a shared nonce, so an index cannot be read against a data file it was not
-/// written for — the case where one of the two is deleted, or restored from a backup.
 #[test]
 fn an_index_and_a_data_file_that_were_not_written_together_are_refused() {
     let root = seeded("frontend-unpaired");
@@ -1062,7 +1046,6 @@ fn an_index_without_its_data_file_is_refused_rather_than_answered_from() {
     assert_eq!(store.warnings()[0].code, codes::CACHE_CORRUPT);
 }
 
-/// The bound that makes an offset safe to follow.
 #[test]
 fn an_index_entry_pointing_past_the_end_of_the_data_file_is_refused() {
     let root = seeded("frontend-past-end");
@@ -1090,7 +1073,6 @@ fn an_index_entry_pointing_past_the_end_of_the_data_file_is_refused() {
     );
 }
 
-/// A killed writer leaves bytes above the length the index vouches for.
 #[test]
 fn a_torn_append_is_invisible_and_is_recovered_by_the_next_flush() {
     let root = seeded("frontend-torn-append");
@@ -1128,7 +1110,6 @@ fn a_torn_append_is_invisible_and_is_recovered_by_the_next_flush() {
     assert!(reopened.def(hash(2)).is_some());
 }
 
-/// A frame whose bytes were damaged in place.
 #[test]
 fn an_entry_whose_checksum_fails_is_not_cached_and_is_reported() {
     let root = TempRoot::new("frontend-frame-checksum");
@@ -1163,8 +1144,6 @@ fn an_entry_whose_checksum_fails_is_not_cached_and_is_reported() {
     assert!(!warnings[0].notes.is_empty());
 }
 
-/// The case a checksum cannot catch and a tag must: bytes that verify but were written to a
-/// different shape.
 #[test]
 fn a_payload_whose_shape_drifted_is_refused_rather_than_misread() {
     let root = TempRoot::new("frontend-shape-drift");
@@ -1182,7 +1161,7 @@ fn a_payload_whose_shape_drifted_is_refused_rather_than_misread() {
     assert_eq!(warnings[0].code, codes::CACHE_CORRUPT);
 }
 
-/// The crash window: a flush has written its temp index in full and died before the rename.
+/// The crash window: a flush wrote its temp index in full and died before the rename.
 #[test]
 fn an_entry_written_but_never_renamed_is_not_observable() {
     let root = seeded("frontend-crash-window");
@@ -1218,8 +1197,6 @@ fn an_entry_written_but_never_renamed_is_not_observable() {
     );
 }
 
-/// Frames a writer appended but whose index it has not yet renamed into place are equally
-/// invisible: the index on disk is the only thing that says an entry exists.
 #[test]
 fn an_appended_frame_no_index_names_is_not_observable() {
     let root = seeded("frontend-unindexed-frame");
@@ -1394,8 +1371,6 @@ fn a_pass_record_survives_a_flush_and_a_reopen() {
     assert_eq!(reopened.pass_records_len(), 1);
 }
 
-/// One record per test, so the baseline is always the *last* configuration it passed at rather than
-/// the first.
 #[test]
 fn a_later_pass_replaces_the_baseline_rather_than_accumulating() {
     let root = TempRoot::new("pass-record-overwrite");
@@ -1414,9 +1389,7 @@ fn a_later_pass_replaces_the_baseline_rather_than_accumulating() {
     );
 }
 
-/// The records are read on the first question rather than at `open`, so a corrupt file produces no
-/// warning until something asks — and asking must not answer "never passed" without saying why it
-/// cannot tell.
+/// The records are read lazily, so a corrupt file warns only when something asks.
 #[test]
 fn corrupt_pass_records_warn_and_do_not_claim_the_test_never_passed() {
     let root = TempRoot::new("pass-record-corrupt");
@@ -1450,8 +1423,6 @@ fn corrupt_pass_records_warn_and_do_not_claim_the_test_never_passed() {
     );
 }
 
-/// Re-recording an identical baseline must not dirty the cache, or every warm run over a green
-/// project rewrites the result cache for nothing.
 #[test]
 fn re_recording_the_same_baseline_writes_nothing() {
     let root = TempRoot::new("pass-record-clean");
@@ -1481,8 +1452,7 @@ fn re_recording_the_same_baseline_writes_nothing() {
     );
 }
 
-/// The failure artifact's silent-wrongness path: prune deletes the baselines, and every later failure degrades
-/// to `no_bodies` with no error to explain it.
+/// Otherwise every later failure degrades to `no_bodies` with no error to explain it.
 #[test]
 fn pruning_keeps_the_bodies_a_baseline_names_even_when_no_file_declares_them() {
     let root = TempRoot::new("prune-keeps-baselines");
@@ -1512,8 +1482,7 @@ fn pruning_keeps_the_bodies_a_baseline_names_even_when_no_file_declares_them() {
     assert!(root.open().has_body(hash(2)));
 }
 
-/// The retention is not unconditional: a body no surviving file *and* no baseline names is still
-/// garbage, or `prune` would stop reclaiming anything once a single test had ever passed.
+/// Otherwise `prune` would reclaim nothing once a single test had ever passed.
 #[test]
 fn a_baseline_retains_only_the_hashes_it_actually_names() {
     let root = TempRoot::new("prune-baseline-scope");
@@ -1561,8 +1530,6 @@ fn pruning_to_the_same_file_set_changes_nothing() {
     assert_eq!(store.defs_len(), 1);
 }
 
-/// A prune that drops nothing must leave the cache clean, or every run over an unchanged project
-/// rewrites the index it just read.
 #[test]
 fn pruning_a_project_that_did_not_change_leaves_the_cache_clean() {
     let root = TempRoot::new("frontend-prune-clean");
@@ -1729,8 +1696,7 @@ fn every_shape_of_unreadable_front_end_file_degrades_rather_than_crashes() {
     }
 }
 
-/// Readers take no lock, which is only sound because an append never moves a byte another process
-/// has already mapped.
+/// Sound only because an append never moves a byte another process has mapped.
 #[test]
 fn a_reader_never_observes_a_partial_front_end_cache_while_writers_run() {
     let root = TempRoot::new("frontend-torn");
@@ -1783,9 +1749,7 @@ fn a_reader_never_observes_a_partial_front_end_cache_while_writers_run() {
 
     let final_store = root.open();
     assert!(final_store.warnings().is_empty());
-    // `flush` waits `LOCK_WAIT` for the cache lock and, if it does not get it, warns and writes
-    // nothing (`lib.rs`'s `flush`, `disk.rs`'s "a caller that proceeds unlocked risks losing a
-    // concurrent writer's entries, which costs a re-run, but still cannot produce a torn file").
+    // A `flush` that cannot take the lock within `LOCK_WAIT` warns and writes nothing.
     let lost = declined.load(Ordering::Acquire) as usize;
     assert_eq!(
         final_store.defs_len() + lost,
@@ -1815,8 +1779,7 @@ fn a_fingerprint_is_only_believed_against_the_bytes_that_produced_it() {
     );
 }
 
-/// `fn f<a, e>(a) -> a / e`, numbered the way a run's global counter would leave it rather than
-/// from zero.
+/// `fn f<a, e>(a) -> a / e`, numbered as a run's global counter would leave it.
 fn counted_scheme(a: u32, e: u32) -> Scheme {
     Scheme {
         ty_vars: vec![TyVar(a)],
@@ -1857,8 +1820,7 @@ fn a_scheme_is_canonical_by_the_time_it_reaches_the_disk() {
         "a witness is sorted by name so two callers write the same bytes"
     );
 
-    // What the equivalence test does: the same definition checked under a different global counter
-    // has to land on byte-identical bytes.
+    // The same definition checked under a different global counter must land on identical bytes.
     let other = TempRoot::new("frontend-canonical-other");
     let mut other_store = other.open();
     other_store.put_def(
@@ -1924,10 +1886,6 @@ fn an_abandoned_front_end_temp_file_does_not_disturb_the_cache() {
     assert!(!abandoned.exists(), "a stale sweep covers both cache files");
 }
 
-/// Both caches are discarded whole when the version constant they were written under does not match
-/// this build's, so a shape change that is *not* paired with a bump is read back as though it were
-/// the old shape — either as a parse failure, which costs a whole project's work, or silently as
-/// the wrong type, which is worse.
 const BUMP: &str = "the on-disk schema changed. Bump the version constant this \
                     cache is keyed on, then update this pin — a build that reads \
                     an entry written under the old shape has no other way to know";
@@ -2063,9 +2021,7 @@ const PINNED_TYPE_DECL: &str = "563d17593d11975f979c1714dbf0845f19433439fd5517b1
 const PINNED_EFFECT_DECL: &str = "0b5bc11329b83fd823d762923323c2373dfb1e9e985756570dd709013e1a004d";
 const PINNED_BODY: &str = "adf0f67e207566df6efe0eb0ac42e091e3f554a4d7b36ec34cd37b8306f21900";
 
-/// The other direction, which the forward pin cannot show: bytes written by an earlier run of this
-/// version still decode to the same values, through the framing and the index rather than through
-/// the encoder alone.
+/// Bytes from an earlier run decode through the framing and index, not just the encoder.
 #[test]
 fn a_front_end_cache_in_the_pinned_shape_loads_back_unchanged() {
     let root = TempRoot::new("pin-frontend-read");
@@ -2104,9 +2060,7 @@ fn a_front_end_cache_in_the_pinned_shape_loads_back_unchanged() {
     );
 }
 
-/// The encoding version is checked per entry as well as by the schema fingerprint, so an entry that
-/// somehow outlived a bump still cannot be handed to a decoder that would read it as this build's
-/// shape.
+/// The encoding version is checked per entry too, for an entry that outlived a bump.
 #[test]
 fn a_body_written_under_another_encoding_is_not_handed_back() {
     let root = TempRoot::new("body-encoding");
@@ -2117,8 +2071,7 @@ fn a_body_written_under_another_encoding_is_not_handed_back() {
     assert_eq!(store.bodies_len(), 1, "it is stored, just not readable");
 }
 
-/// A body is keyed by a hash of itself, so two different bodies under one hash means the encoding
-/// depends on something the hash does not cover.
+/// Bodies are self-keyed, so two under one hash means the encoding depends on something unhashed.
 #[test]
 fn two_different_bodies_for_one_hash_are_refused_and_reported() {
     let root = TempRoot::new("body-conflict");
@@ -2145,8 +2098,6 @@ fn two_different_bodies_for_one_hash_are_refused_and_reported() {
     assert_eq!(reopened.take_warnings().len(), 1);
 }
 
-/// The whole point of the split: two definitions in different modules with one hash share a body,
-/// because a body is name-free and therefore a function of that hash.
 #[test]
 fn one_body_serves_every_definition_that_shares_its_hash() {
     let root = TempRoot::new("body-shared");
@@ -2236,8 +2187,7 @@ fn lookup_finds_a_test_by_label_and_keeps_it_distinct_from_a_definition() {
     assert_eq!(test.footprint, footprint());
 }
 
-/// One name in two modules is two answers, and the store holds no namespace that could pick between
-/// them.
+/// The store holds no namespace that could pick between two modules' answers.
 #[test]
 fn lookup_returns_every_match_rather_than_refusing() {
     let root = TempRoot::new("lookup-ambiguous");
@@ -2296,8 +2246,6 @@ fn stats_counts_both_caches_and_measures_what_is_on_disk() {
     );
 }
 
-/// The number `ply cache stats` reports and compaction reclaims: what the data file holds that no
-/// index record names.
 #[test]
 fn garbage_is_what_no_index_record_names() {
     let root = TempRoot::new("garbage");
@@ -2361,8 +2309,7 @@ fn compacting_drops_what_no_surviving_file_refers_to_and_shrinks_the_cache() {
     );
 }
 
-/// `Arc` rather than `&`: an entry the store decoded on demand is owned by nothing the borrow could
-/// point into, and a materialized one has to be able to outlive the lookup that produced it.
+/// An entry decoded on demand is owned by nothing a borrow could point into, hence `Arc`.
 #[test]
 fn a_materialized_entry_outlives_the_store_that_produced_it() {
     let root = TempRoot::new("arc-entries");
@@ -2390,8 +2337,6 @@ fn a_materialized_entry_outlives_the_store_that_produced_it() {
     assert_eq!(fingerprint_of_file.content_hash, content(1));
 }
 
-/// What the format exists for: opening a ten-thousand-definition cache decodes nothing, and an
-/// entry asked for afterwards still answers.
 #[test]
 fn opening_a_ten_thousand_definition_cache_decodes_nothing() {
     let root = TempRoot::new("open-budget");
@@ -2505,8 +2450,6 @@ fn the_result_cache_on_disk_schema_is_pinned() {
     );
 }
 
-/// The one thing that must survive a format bump: a cache written before the pass records moved out
-/// still answers, and the run that reads it relocates them rather than dropping them.
 #[test]
 fn a_format_one_result_cache_keeps_its_baselines_and_is_rewritten() {
     let root = TempRoot::new("pin-results-migrate");
@@ -2551,8 +2494,6 @@ fn a_format_one_result_cache_keeps_its_baselines_and_is_rewritten() {
     assert!(reopened.knows_definition(hash(3)));
 }
 
-/// The regression that made this split necessary: a result cache full of baselines is part of what
-/// `Store::open` opens, and the records are all still there for the one run that needs them.
 #[test]
 fn a_baseline_for_every_test_survives_the_reopen() {
     let root = TempRoot::new("open-budget-passes");
@@ -2589,8 +2530,7 @@ fn a_baseline_for_every_test_survives_the_reopen() {
     );
 }
 
-/// The stdlib digest survives a reopen, and survives a `RUNTIME_VERSION` change — which is exactly
-/// why it is its own file rather than a field of the result cache.
+/// Its own file rather than a result-cache field, so it survives a `RUNTIME_VERSION` change.
 #[test]
 fn the_stdlib_digest_round_trips_and_is_written_only_when_it_moves() {
     let root = TempRoot::new("stdlib-digest");
@@ -2625,8 +2565,7 @@ fn the_stdlib_digest_round_trips_and_is_written_only_when_it_moves() {
         Some("b3:bbbbbbbbbbbb")
     );
 
-    // `ply cache clear` forgets it: after a clear there is nothing left for a moved stdlib to have
-    // invalidated.
+    // `ply cache clear` forgets it.
     let mut store = root.open();
     store.clear().unwrap();
     assert_eq!(store.stdlib_digest(), None);

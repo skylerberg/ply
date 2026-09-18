@@ -134,8 +134,6 @@ fn a_divergence_only_in_a_label_span_is_caught() {
     assert!(report.divergences[0].left.contains("88..100"));
 }
 
-/// The case a verdict comparison alone would miss entirely: both sides pass, and one of them
-/// left its cells somewhere else.
 #[test]
 fn an_arena_that_differs_after_a_passing_test_is_caught_at_the_cell() {
     let (program, resolved) = standalone(corpus());
@@ -165,8 +163,7 @@ fn an_arena_whose_contents_differ_names_the_cell_and_both_values() {
 
     let seeded = Fixture::build(|r| Value::Cell(r.alloc_cell(Value::Int(0))));
 
-    // `compare_tests` re-seeds both from its own base, so the divergence has to be injected
-    // through the engine rather than through the fixture.
+    // `compare_tests` re-seeds both from its own base, so the divergence goes through the engine.
     right.extra_cell = Some(Value::Int(7));
     let report = compare_tests(&mut left, &mut right, &seeded);
     let d = &report.divergences[0];
@@ -222,10 +219,7 @@ fn a_divergence_becomes_a_failing_diagnostic_naming_both_sides() {
     assert!(d.notes.iter().any(|n| n.contains("boom")), "{:?}", d.notes);
 }
 
-/// Exercises the shapes a backend is most likely to get wrong: a handler answering
-/// a perform, a cell written from a clause, all three higher-order builtins driving a closure
-/// that itself performs, and four distinct failures whose diagnostics must match label for
-/// label.
+/// The shapes a backend most likely gets wrong, with four failures whose diagnostics must match.
 fn mixed_corpus() -> Vec<Item> {
     let state = effect_def("state", &[("get", Mode::Read, false)]);
     let handled =

@@ -256,7 +256,6 @@ fn malformed_text_is_refused_with_the_position() {
     assert!(parse_row("{db.read | e").is_err());
 }
 
-/// The program every real scheme comes from.
 fn std_check() -> CheckOutput {
     let mut program = ply_syntax::ast::Program {
         modules: Vec::new(),

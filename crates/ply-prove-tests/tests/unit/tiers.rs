@@ -29,8 +29,6 @@ fn certificate() -> Certificate {
     }
 }
 
-/// The rule the whole module exists to make unavailable to get wrong: a tier is computed from
-/// the evidence, and only a certificate computes to `Proved`.
 #[test]
 fn only_a_certificate_yields_proved() {
     assert_eq!(Evidence::Proof(certificate()).tier(), Tier::Proved);
@@ -46,8 +44,7 @@ fn the_kept_count_alone_separates_property_from_example() {
     assert_eq!(cases(0).tier(), Tier::Example);
 }
 
-/// `min` on two tiers is "report the weaker", so the ordering has to be the strength ordering
-/// and not the declaration order it happens to share.
+/// `min` reports the weaker tier, so the order must be strength and not declaration order.
 #[test]
 fn tiers_order_by_strength() {
     assert!(Tier::Example < Tier::Property);
@@ -81,8 +78,6 @@ fn nothing_but_a_hold_has_a_tier_or_is_cached() {
     }
 }
 
-/// The asymmetry the whole operational value of `proved` rests on: a proof is valid under every
-/// plan, a sample is a claim about the plan that took it.
 #[test]
 fn only_a_proof_is_plan_independent() {
     assert!(Discharge::Held(Evidence::Proof(certificate())).is_plan_independent());
@@ -127,8 +122,7 @@ fn an_exhaustive_search_proves_only_when_the_value_domain_was_covered_too() {
     let plan = Plan::default();
     assert_eq!(plan.mode, SimMode::Dpor);
     assert!(interleaving_proves(&plan, &exploration(true, false), true));
-    // The condition an implementer drops: exhaustive over *schedules* says nothing about the
-    // values that were sampled.
+    // Exhaustive over schedules says nothing about the values that were sampled.
     assert!(!interleaving_proves(
         &plan,
         &exploration(true, false),

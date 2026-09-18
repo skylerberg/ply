@@ -33,7 +33,6 @@ fn build() -> Map<String, Int> =
   map_insert(map_insert(map_new(), \"a\", 1), \"b\", 2)
 ";
 
-/// Renaming a local changes nothing, exactly as it does for every other body.
 #[test]
 fn a_map_body_hashes_like_any_other_body() {
     let one = hash_of(
@@ -47,8 +46,6 @@ fn a_map_body_hashes_like_any_other_body() {
     assert_eq!(one, other, "a local's name reached the hash");
 }
 
-/// Two definitions that build the same *value* by different insertion orders are two computations,
-/// so they hash differently — and that is right.
 #[test]
 fn two_ways_of_building_one_map_are_two_definitions() {
     let forward = hash_of(BUILD, "build");
@@ -59,8 +56,6 @@ fn two_ways_of_building_one_map_are_two_definitions() {
     assert_ne!(forward, backward);
 }
 
-/// The declared `Map<k, v>` is part of the published signature, so swapping the key and value types
-/// moves the hash even though the body is untouched.
 #[test]
 fn the_declared_key_and_value_types_are_in_the_hash() {
     let a = hash_of("fn empty() -> Map<String, Int> = map_new()\n", "empty");
@@ -68,8 +63,6 @@ fn the_declared_key_and_value_types_are_in_the_hash() {
     assert_ne!(a, b);
 }
 
-/// A pin, and therefore a claim across runs, processes and builds: a definition whose body is a map
-/// is normalized to these bytes and to no others.
 #[test]
 fn a_map_body_normalizes_to_a_pinned_hash() {
     assert_eq!(

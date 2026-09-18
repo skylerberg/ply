@@ -15,9 +15,6 @@ fn a_move_leaves_the_slot_marked_and_a_vacant_slot_stays_vacant() {
     assert!(matches!(w.read(1), SlotVal::Vacant));
 }
 
-/// The overlap rule: the shared portion below the captured prompt's entry is cloned, and the
-/// extent above it is moved out — so the activation continuing below still reads its window,
-/// and the resumption reads the snapshot.
 #[test]
 fn a_cut_clones_the_shared_portion_and_moves_the_extent() {
     let mut w = Windows::new();

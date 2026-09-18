@@ -35,7 +35,6 @@ fn depth_counts_up_from_the_failure() {
     assert_eq!(s.depth_of(&Symbol::new("outer")), Some(2));
 }
 
-/// Everything on the stack ran, but not everything that ran is on the stack.
 #[test]
 fn a_definition_that_returned_before_the_failure_ran_but_has_no_depth() {
     let s = slice();
@@ -75,8 +74,6 @@ fn built(events: &[Event]) -> SliceBuilder {
     b
 }
 
-/// The two halves of the slice answer different questions, and confusing them ranks a
-/// definition that had already returned as if it were where the failure happened.
 #[test]
 fn the_stack_is_the_path_and_entered_is_everything_that_ran() {
     let mut b = built(&[
@@ -115,7 +112,6 @@ fn a_definition_entered_twice_is_one_row_with_a_count() {
     assert_eq!(slice.entered[0].calls, 3);
 }
 
-/// The cap bounds how many *distinct* definitions are remembered.
 #[test]
 fn hitting_the_cap_truncates_the_roster_and_not_the_stack() {
     let mut b = SliceBuilder::with_cap(2);
@@ -144,8 +140,6 @@ fn only_performed_atoms_are_observed() {
     assert_eq!(slice.observed.atoms().collect::<Vec<_>>(), vec![&atom]);
 }
 
-/// A failure that is never reported leaves no path, which is different from a path of length
-/// zero and has to stay so.
 #[test]
 fn a_builder_that_was_never_told_of_a_failure_reports_no_stack() {
     let slice = built(&[enter("f")]).finish(true);

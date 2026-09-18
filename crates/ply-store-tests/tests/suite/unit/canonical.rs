@@ -8,8 +8,7 @@ fn var(n: u32) -> Type {
     Type::Var(TyVar(n))
 }
 
-/// `fn f<a, b, e>(a, b) -> a / e`, quantified over whatever numbers the run happened to hand
-/// out.
+/// `fn f<a, b, e>(a, b) -> a / e`, quantified over whatever numbers the run handed out.
 fn identity_pair(a: u32, b: u32, e: u32) -> Scheme {
     Scheme {
         ty_vars: vec![TyVar(a), TyVar(b)],
@@ -159,8 +158,7 @@ fn record_fields_are_walked_in_key_order() {
 
 #[test]
 fn one_numbering_spans_a_declaration_so_its_constructors_stay_related() {
-    // `type Pair<a, b> = | P(a, b) | Q(b)` — `Q`'s field is the *second* parameter, and
-    // numbering each constructor on its own would erase that.
+    // `type Pair<a, b> = | P(a, b) | Q(b)`: numbering each constructor alone would erase that `Q` holds `b`.
     let pair = |a: u32, b: u32| DeclBody::Type {
         arity: 2,
         ctors: vec![

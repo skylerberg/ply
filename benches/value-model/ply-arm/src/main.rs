@@ -1,28 +1,11 @@
-//! The Ply arm of ADR 0035's gate, measured the way the Rust arm is.
-//!
-//! `benches/value-model/rust` takes the minimum over `REPEATS` calls **inside one process**. The
-//! Ply arm used to run each kernel once per process and take the minimum over three processes, so
-//! it carried the whole of a run's fixed cost -- process start, page cache, whatever the allocator
-//! was holding -- where the Rust arm carried none of it. At k1's fifth of a millisecond that is
-//! most of what was being timed, and it is why one day's six readings put k1 at 2.20, 2.46, 2.76,
-//! 2.97, 3.41 and 3.69 against a bar of 3.0.
-//!
-//! There is no interpreter in what this times. `ply test --audit-backend` reports k1 as `entered 1,
-//! declined 0`: one call into compiled code and never back out. So the call below is the same
-//! shape the machine makes, without the machine.
-//!
-//!   ply-arm <project-dir> c
-//!
-//! Prints `k1=<ms> k2=<ms> digest=<hex>`, which is the Rust arm's line exactly.
+//! The value-model bench's Ply arm, timed in-process like the Rust arm so fixed costs drop out.
+//! Usage: `ply-arm <project-dir> c`; prints the Rust arm's line plus `profile=`.
 
 use ply_codegen::source::Source;
 use ply_syntax::ast::ModuleName;
 use std::time::Instant;
 
-/// The Rust arm's, so the two statistics are the same statistic. k1 gets more because it is two
-/// hundred times the shorter: twenty repeats of a fifth of a millisecond is not enough of a
-/// sample for the minimum to settle, and the spread of the minimum is what the gate reads as its
-/// resolution.
+/// k1 is far shorter than k2, so it needs more repeats for its minimum to settle.
 const K1_REPEATS: usize = 200;
 const K2_REPEATS: usize = 20;
 
@@ -37,9 +20,7 @@ fn main() {
     };
 
     let loaded = load(&dir);
-    // The fragment the tier itself would choose: the largest subset that compiles as one unit.
-    // Offering every function instead makes the in-process tier fail on the first one outside it,
-    // and `std.config` has one.
+    // Offering every function instead fails the tier on the first one outside the fragment.
     let (names, _refused) =
         ply_codegen::closure(loaded, &loaded.functions()).expect("the fragment closes");
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -54,7 +35,7 @@ fn main() {
     let mut ctx = code.context();
     let layouts: *const ply_codegen::heap::Layouts = &code.tables().layouts;
 
-    // The input, made once. Remaking it per repeat would put a 64KB copy inside the measurement.
+    // Made once, so building the input stays out of the measurement.
     let input = call(&code, &mut ctx, "input.k1_input", &[]);
     let mut k1 = f64::MAX;
     let mut digest = 0i64;
@@ -79,11 +60,7 @@ fn main() {
         ply_eval::Value::Bytes(b) => b.iter().map(|x| format!("{x:02x}")).collect::<String>(),
         other => panic!("blake3 answered {other:?}"),
     };
-    // The profile goes in the line because the C tier's default is `development` -- `cc -O0`,
-    // forty times slower on k1 -- and a reading taken under it against a bar taken
-    // under `release` is a verdict about a compiler flag wearing a verdict about a value model.
-    // `run.sh` exports `release` and refuses to start otherwise; this is what puts it in the raw
-    // file, where a reader who did not run the script can still see which one it was.
+    // A `development` (`cc -O0`) reading is not comparable to a `release` bar, so say which.
     println!(
         "k1={k1:.3} k2={k2:.3} digest={hex} profile={}",
         ply_codegen::Profile::current().name()
@@ -110,12 +87,10 @@ fn call(
 fn load(dir: &str) -> &'static Source {
     let mut sources = ply_span::SourceMap::new();
     let mut units: Vec<(ply_span::SourceId, ModuleName, &'static str)> = Vec::new();
-    // The same texts the port is handed, in the same order: the protocol reads a span's module as
-    // its position in this list (ADR 0052 §1).
+    // The protocol reads a span's module as its position in this list.
     let mut modules: Vec<(String, String)> = Vec::new();
     let mut ids: Vec<ply_span::SourceId> = Vec::new();
-    // The whole standard library, under the names it ships with -- the kernels import `std.hash`,
-    // and that module imports others.
+    // The whole standard library: the kernels import `std.hash`, which imports others.
     for name in ply_std::modules() {
         let text = ply_std::source(&name).expect("a listed std module has a source");
         let id = sources.add(ply_std::pseudo_path(&name), text.to_string());
@@ -147,8 +122,6 @@ fn load(dir: &str) -> &'static Source {
     }
     let mut ast = ply_syntax::parse_program(units).expect("the project parses");
     let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the project resolves");
-    // The port answers the front end here, as the driver does: the gate times the kernel entry,
-    // and which front end built the `Source` is setup rather than what it reads (ADR 0052 §2).
     let front = Box::leak(Box::new(
         ply_codegen::c::producer::checked_front(&modules, &ids).expect("the project checks"),
     ));

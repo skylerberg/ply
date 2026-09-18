@@ -2,8 +2,7 @@ use ply_eval::Value;
 use ply_eval::argv::*;
 use std::sync::Arc;
 
-/// Empties every class, so a test that counts hits is not reading whatever the test before it left
-/// behind.
+/// So a test that counts hits does not read what the test before it left behind.
 fn drain_the_free_list() {
     let _ = FREE.try_with(|free| {
         for class in free.borrow_mut().iter_mut() {
@@ -32,7 +31,6 @@ fn a_vector_given_back_full_does_not_come_out_of_take_full() {
     assert!(v.is_empty(), "take handed out a vector holding {}", v.len());
 }
 
-/// The secret containment claim: a credential may not sit in a buffer the next call reads from.
 #[test]
 fn a_secret_handed_back_is_not_held_by_the_pool() {
     let payload = Arc::new(Value::str("hunter2"));
@@ -44,9 +42,6 @@ fn a_secret_handed_back_is_not_held_by_the_pool() {
     );
 }
 
-/// The point of the list, stated as the assertion `link_reuse.rs`'s
-/// `a_warm_frame_push_allocates_nothing` makes for the control stack: once a buffer of a class
-/// has been handed back, the next call of that arity does not reach the allocator.
 #[test]
 fn a_warm_call_of_a_pooled_arity_reuses_the_buffer_it_gave_back() {
     drain_the_free_list();
@@ -66,8 +61,6 @@ fn a_warm_call_of_a_pooled_arity_reuses_the_buffer_it_gave_back() {
     }
 }
 
-/// An arity outside the four classes is the allocator's, and it must not come back out of a
-/// class it was never in.
 #[test]
 fn an_arity_the_list_does_not_serve_is_left_to_the_allocator() {
     drain_the_free_list();
@@ -86,7 +79,6 @@ fn an_arity_the_list_does_not_serve_is_left_to_the_allocator() {
     });
 }
 
-/// The list is bounded, so its memory cost is a number rather than a hope.
 #[test]
 fn the_pools_upper_bound_is_stated_in_bytes() {
     drain_the_free_list();

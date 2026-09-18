@@ -117,8 +117,7 @@ fn a_continuation_may_be_resumed_twice_onto_different_stacks() {
     assert_eq!(field_of(&b), "f9");
 }
 
-/// `into_next` moves the frame out of its link when nothing else holds it, so a captured
-/// segment has to be the thing that stops it.
+/// `into_next` moves the frame out when nothing else holds it, so the captured segment must hold it.
 #[test]
 fn popping_a_captured_frame_leaves_the_continuation_able_to_splice_it_again() {
     let s = Stack::new()
@@ -145,9 +144,6 @@ fn popping_a_captured_frame_leaves_the_continuation_able_to_splice_it_again() {
     assert_eq!(field_of(&replayed), "f2");
 }
 
-/// The relative bookkeeping a capture reads off the cut: window-bearing frames say how many
-/// slots sit above the captured prompt's push height, and the segment says how many below it
-/// belong to the pushing activation.
 #[test]
 fn a_capture_reads_its_slot_metrics_off_the_frames_it_cuts() {
     let s = Stack::new()
@@ -169,8 +165,6 @@ fn a_capture_reads_its_slot_metrics_off_the_frames_it_cuts() {
     assert_eq!(k.cut_window(), 3, "the prompt was pushed with window 3");
 }
 
-/// A stack may hold as many frames as the calls under `DEFAULT_MAX_CALLS` can pend, which no
-/// constant caps, so releasing one has to be a loop.
 #[test]
 fn dropping_a_deep_stack_does_not_recurse_through_the_native_stack() {
     std::thread::Builder::new()
@@ -261,8 +255,7 @@ fn an_unhandled_operation_finds_no_prompt() {
     );
 }
 
-/// A `simulate` region's delimiter answers the three simulated effects and nothing else, and a
-/// `handle` nested inside one still shadows it.
+/// A `handle` nested inside a `simulate` region still shadows it.
 #[test]
 fn a_sim_delimiter_answers_the_scheduled_operations_only() {
     let s = Stack::new().push_sim(SimId(0));

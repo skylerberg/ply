@@ -1,5 +1,3 @@
-//! What fraction of a real program's calls can cross the compiled seam.
-
 use ply_eval::{Evaluator, Fixture, Machine};
 use ply_span::{SourceMap, Symbol};
 use ply_syntax::ast::{ModuleName, Program};
@@ -115,8 +113,7 @@ fn corpora(root: &Path) -> Vec<(String, PathBuf, Vec<PathBuf>)> {
     out
 }
 
-/// Declines everything and counts what it was handed — which is what `admit` cleared, and nothing
-/// else.
+/// Declines everything and counts what it was handed: exactly what `admit` cleared.
 struct Declining {
     program: usize,
     offered: Cell<u64>,
@@ -149,7 +146,6 @@ const BUCKETS: usize = 8;
 /// The census counters are process-wide, so the tests here take turns and read deltas.
 static TURN: Mutex<()> = Mutex::new(());
 
-/// What one test sweeps.
 #[derive(Clone, Copy)]
 enum Selection {
     /// The one real program, and the only selection whose counts prove anything.
@@ -236,10 +232,7 @@ fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_
             continue;
         };
         let backend = std::rc::Rc::new(Declining::over(&program));
-        // One machine, deliberately. `admitted` is a process-wide counter this
-        // crate's `admit` bumps, so a second machine over the same corpus counts
-        // every call twice while only the backed one's backend counts an offer,
-        // and the cross-check below reads exactly 2x.
+        // One machine: `admitted` is process-wide, so a second machine would count every call twice.
         let mut machine = Machine::new(&program, &resolved, &check);
         machine.set_compiled(backend.clone());
         Evaluator::set_fixture(&mut machine, &Fixture::empty());
@@ -286,7 +279,6 @@ fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_
         "over {selection}, the gate histogram does not sum"
     );
 
-    // The two halves of the argument test, separated over a corpus.
     let type_gated = ply_eval::census::type_gated_shipping() - type_gated0;
     assert_eq!(
         type_gated,
@@ -296,7 +288,6 @@ fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_
         type_gated.saturating_sub(admitted)
     );
 
-    // The two ends of the seam's one table, over a corpus.
     let walked = ply_eval::census::carried_sig_walked() - walked0;
     assert_eq!(
         walked,
@@ -311,7 +302,6 @@ fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_
         println!("{}", ply_eval::census::report());
         assert!(compared > 0, "no corpus ran");
         assert!(body > 0, "the census hook never fired");
-        // And the gate is not vacuous on this corpus: it refuses something.
         assert!(
             argument_type > 0,
             "`Gate::ArgumentType` refused nothing over examples, so this run says nothing about \
@@ -320,7 +310,6 @@ fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_
     }
 }
 
-/// One test per fixture bucket: the buckets carry the cross-checks over one slice of the fixtures.
 macro_rules! over_every_corpus {
     ($family:ident) => {
         mod $family {

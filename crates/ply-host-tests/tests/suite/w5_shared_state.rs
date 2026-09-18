@@ -1,8 +1,4 @@
-//! An adversarial audit of the three host states W5 adds, against the shared states.
-
-// A `Value::Record` holds `Arc<BTreeMap<Symbol, Value>>` and a `Value` is not `Send`; that is
-// `ply-eval`'s design and this is the same allow, for the same reason, that `ply-host` itself
-// carries.
+// A `Value::Record` holds an `Arc` and a `Value` is not `Send`, by `ply-eval`'s design.
 #![allow(clippy::arc_with_non_send_sync)]
 
 use ply_eval::host::{
@@ -21,8 +17,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
-// driver as several entry points
-
 struct NoRuntime;
 
 impl HostRuntime for NoRuntime {
@@ -37,8 +31,7 @@ impl HostRuntime for NoRuntime {
     }
 }
 
-/// A clock that ascends by one per read, so a stamp is a count and a golden assertion has nothing
-/// that moves with the wall clock in it.
+/// Ascends by one per read, so golden assertions hold nothing that moves with the wall clock.
 #[derive(Default)]
 struct Ticking(AtomicI64);
 
@@ -48,7 +41,6 @@ impl Clock for Ticking {
     }
 }
 
-/// One driver, and the declarations a bound run would dispatch through.
 struct Driver {
     trace: Arc<Trace>,
     sink: Arc<Recording>,
@@ -162,7 +154,6 @@ fn ctor(name: &str, args: Vec<Value>) -> Value {
     Value::ctor(format!("std.trace.{name}"), args)
 }
 
-/// A `Span` as `trace.enter` answered it.
 fn span_id(value: &Value) -> i64 {
     match value {
         Value::Record(fields) => match fields.get(&Symbol::new("id")) {
@@ -173,8 +164,7 @@ fn span_id(value: &Value) -> i64 {
     }
 }
 
-/// A `Span` a program built for itself, which is what a span id is: an ordinary record,
-/// forgeable, and `E0445` when it names nothing this task holds.
+/// A span id is an ordinary, forgeable record; `E0445` when it names nothing this task holds.
 fn forged(id: i64, channel: &str) -> Value {
     Value::Record(Arc::new(
         [
@@ -195,10 +185,6 @@ fn rendered(diagnostic: &Diagnostic) -> String {
     text
 }
 
-// what is not shared ---------------------------------------------------------------------------
-
-/// The property the shared states rest on: the span *stack* is keyed on the machine and the task, so two entry
-/// points recording on channels that do not conflict cannot nest into each other.
 #[test]
 fn two_entry_points_on_disjoint_channels_never_nest_into_each_other() {
     let d = driver();
@@ -239,8 +225,7 @@ fn two_entry_points_on_disjoint_channels_never_nest_into_each_other() {
         span_id(&outer_a),
         "`a`'s event landed in the wrong span, so `b`'s exit closed `a`'s span"
     );
-    // Every span closed `Ok`: an `Abandoned` here would mean one entry point's exit had swept up
-    // the other's.
+    // An `Abandoned` here would mean one entry point's exit swept up the other's.
     let outcomes: Vec<&Outcome> = records
         .iter()
         .filter(|r| r.kind == Kind::Exit)
@@ -249,7 +234,6 @@ fn two_entry_points_on_disjoint_channels_never_nest_into_each_other() {
     assert_eq!(outcomes, [&Outcome::Ok, &Outcome::Ok]);
 }
 
-/// The teardown half of the same property.
 #[test]
 fn a_teardown_closes_only_the_entry_point_that_ended() {
     let d = driver();
@@ -288,9 +272,6 @@ fn a_teardown_closes_only_the_entry_point_that_ended() {
     assert_eq!(d.trace.open_spans(), 0);
 }
 
-/// The question span nesting answers with "the handler keeps the stack, per task": a task that is
-/// suspended across other tasks' whole span lifetimes resumes into the span it opened, and not into
-/// whichever one was opened last.
 #[test]
 fn a_task_resumed_later_records_under_the_span_it_opened() {
     let d = driver();
@@ -325,9 +306,6 @@ fn a_task_resumed_later_records_under_the_span_it_opened() {
     );
 }
 
-// what *is* shared ---------------------------------------------------------------------------
-
-/// **A finding, characterised.**
 #[test]
 fn a_span_id_a_program_receives_does_not_move_with_a_disjoint_entry_points_work() {
     // Alone: the first span of this entry point is 1.
@@ -347,8 +325,7 @@ fn a_span_id_a_program_receives_does_not_move_with_a_disjoint_entry_points_work(
         "the id counter is per entry point, so a disjoint entry point's work is invisible"
     );
 
-    // And within one entry point they still ascend and are never reused, which is the property the
-    // counter existed for.
+    // Within one entry point they still ascend and are never reused.
     let d = driver();
     let mine = entry_point();
     let first = span_id(&d.enter(mine, "orders", "a"));
@@ -361,7 +338,6 @@ fn a_span_id_a_program_receives_does_not_move_with_a_disjoint_entry_points_work(
     );
 }
 
-/// **The same finding where it reaches a verdict.**
 #[test]
 fn an_unbalanced_exit_is_diagnosed_from_the_entry_points_own_span_table() {
     let program_span = forged(1, "orders");
@@ -378,8 +354,7 @@ fn an_unbalanced_exit_is_diagnosed_from_the_entry_points_own_span_table() {
         rendered(&alone)
     );
 
-    // Beside an entry point that happens to hold span 1, on a channel that does not conflict with
-    // `orders`.
+    // Beside an entry point holding span 1 on a channel that does not conflict with `orders`.
     let d = driver();
     let other = entry_point();
     let _ = d.enter(other, "items", "list_items");
@@ -393,8 +368,7 @@ fn an_unbalanced_exit_is_diagnosed_from_the_entry_points_own_span_table() {
         rendered(&beside)
     );
 
-    // Beside an entry point that opened and closed span 1, which used to be a third classification
-    // from nothing this program did.
+    // Beside an entry point that opened and closed span 1.
     let d = driver();
     let other = entry_point();
     let theirs = d.enter(other, "items", "list_items");
@@ -411,8 +385,6 @@ fn an_unbalanced_exit_is_diagnosed_from_the_entry_points_own_span_table() {
     assert_eq!(rendered(&beside), rendered(&after));
 }
 
-/// The classification that *is* this program's own: a span open on another task of the same entry
-/// point.
 #[test]
 fn a_span_open_on_another_task_of_the_same_entry_point_still_names_it() {
     let d = driver();
@@ -429,8 +401,7 @@ fn a_span_open_on_another_task_of_the_same_entry_point_still_names_it() {
     );
 }
 
-/// The counters the shutdown banner prints are the run's, not an entry point's, and that is correct
-/// for a banner and wrong for anything a test asserts on.
+/// Run-level, not per entry point: right for the shutdown banner, wrong for a test to assert on.
 #[test]
 fn the_run_level_counts_are_a_sum_over_every_entry_point() {
     let d = driver();
@@ -448,8 +419,6 @@ fn the_run_level_counts_are_a_sum_over_every_entry_point() {
     );
     assert_eq!(d.trace.open_spans(), 1, "`b`'s is still open");
 }
-
-// snapshot ---------------------------------------------------------------------------
 
 fn snapshot(set: &[&str], env: &[(&str, &str)], keys: Vec<Key>) -> Snapshot {
     let set: Vec<String> = set.iter().map(|s| (*s).to_string()).collect();
@@ -476,7 +445,6 @@ fn key(name: &str, shape: Shape) -> Key {
     }
 }
 
-/// **No finding.**
 #[test]
 fn every_entry_point_reads_one_configuration_and_none_can_move_it() {
     let before = snapshot(
@@ -497,8 +465,7 @@ fn every_entry_point_reads_one_configuration_and_none_can_move_it() {
                 for _ in 0..100 {
                     assert_eq!(shared.get("DESK_REGION"), Some("eu"));
                     assert_eq!(shared.get("DESK_PORT"), Some("8137"));
-                    // The `SSecret` gate: `config.get` answers `None` whatever the sources hold, on
-                    // every thread and every read.
+                    // The `SSecret` gate: `config.get` answers `None` whatever the sources hold.
                     assert_eq!(shared.get("DESK_API_KEY"), None);
                     assert_eq!(shared.get("NOTHING_SUPPLIED"), None);
                 }
@@ -513,8 +480,6 @@ fn every_entry_point_reads_one_configuration_and_none_can_move_it() {
     );
 }
 
-/// The other half: a snapshot is a value, so two of them in one process are two runs'
-/// configurations and neither is the other's.
 #[test]
 fn two_snapshots_in_one_process_do_not_see_each_other() {
     let one = snapshot(
@@ -529,9 +494,7 @@ fn two_snapshots_in_one_process_do_not_see_each_other() {
     );
     assert_eq!(one.get("DESK_REGION"), Some("eu"));
     assert_eq!(two.get("DESK_REGION"), Some("us"));
-    // Built second, and the first is unchanged — which is the whole of what a test asking "can a
-    // configuration change in one test be seen by another" has to check, because there is no other
-    // way to make one.
+    // Built second, and the first is unchanged: the only route between two tests' configurations.
     assert_eq!(one.get("DESK_REGION"), Some("eu"));
     assert!(!Snapshot::unopened().has_spec());
     assert_eq!(Snapshot::unopened().get("DESK_REGION"), None);
@@ -575,7 +538,6 @@ fn until_phase_two(shutdown: &Arc<Shutdown>) {
     );
 }
 
-/// **No finding.**
 #[test]
 fn a_stop_one_run_asked_for_reaches_nothing_that_did_not() {
     let asked = Shutdown::new(Bounds::default());
@@ -597,10 +559,7 @@ fn a_stop_one_run_asked_for_reaches_nothing_that_did_not() {
     assert!(!untouched.second_requested());
 }
 
-/// A `Host` with no coordinator answers `false` to the scheduler's `stopping()` whatever any other
-/// coordinator in the process is doing — which is the property `ply test` depends on, since it
-/// builds exactly such a `Host` and the park loop and the deadlock check are the two places the
-/// answer is read.
+/// `ply test` builds exactly such a `Host`; the park loop and the deadlock check read this answer.
 #[test]
 fn a_host_with_no_coordinator_is_never_stopping() {
     let stopping = Shutdown::new(Bounds::default());
@@ -623,8 +582,7 @@ fn a_host_with_no_coordinator_is_never_stopping() {
     );
 }
 
-/// The registrations are the same two either way, so `ply hosts` lists them for a suite as well as
-/// for a service — what differs is whether they are bound.
+/// The registrations are the same either way, so `ply hosts` lists them; only binding differs.
 #[test]
 fn a_withheld_signal_handler_refuses_rather_than_answering() {
     let withheld = ply_host::signal::registrations(None);
@@ -651,9 +609,7 @@ fn a_withheld_signal_handler_refuses_rather_than_answering() {
     assert!(refused.message.contains("withheld"), "{}", refused.message);
 }
 
-/// `ply run --host` calls `signal::listen` before it opens the pool, loads the TLS material, binds
-/// the registry and verifies the schema, and only then calls `Host::stopping_on`, which is what
-/// hands the coordinator the socket table.
+/// `ply run --host` calls `signal::listen` well before `Host::stopping_on` wires the socket table.
 #[test]
 fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
     let shutdown = Shutdown::new(Bounds {
@@ -664,8 +620,7 @@ fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
     assert!(shutdown.request(Signal::Terminate));
     until_phase_two(&shutdown);
 
-    // The facilities finish coming up and are wired to the coordinator, exactly as
-    // `Hosts::open_stopping` wires them.
+    // Wired to the coordinator exactly as `Hosts::open_stopping` wires them.
     let net = Arc::new(TcpHost::new());
     shutdown.attach_net(Arc::clone(&net) as Arc<dyn Accepting>);
     let listener = int(&settle(&net, net.listen(&listener_label(), 0, Span::DUMMY)));
@@ -691,8 +646,7 @@ fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
         "nothing was handed to the program after the stop"
     );
 
-    // And the catch-up's own account is in the banner's numbers rather than lost: a socket table
-    // that already had a listener when it arrived reports the one it closed.
+    // A socket table that already had a listener reports the one the catch-up closed.
     let shutdown = Shutdown::new(Bounds {
         lead: Duration::ZERO,
         drain: Duration::from_secs(5),
@@ -719,8 +673,6 @@ fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
     );
 }
 
-/// The same window, one step later: a signal delivered *after* the socket table is attached does
-/// stop accept, which is what makes the test above a window rather than a total failure.
 #[test]
 fn a_signal_after_the_coordinator_is_wired_stops_accept() {
     let shutdown = Shutdown::new(Bounds {
@@ -744,9 +696,7 @@ fn a_signal_after_the_coordinator_is_wired_stops_accept() {
     );
 }
 
-/// `Shutdown::request` hands the phase machine to a thread of its own so the signal reactor stays
-/// free to notice a second signal, and phase 2 then tells the socket table to stop accepting, dials
-/// every listener until the parked `accept`s have returned, and writes down what it found.
+/// The phase machine runs on its own thread: stop accept, then dial until parked `accept`s return.
 #[test]
 fn the_shutdown_banners_counts_are_written_before_the_run_can_observe_the_stop() {
     use std::sync::atomic::AtomicUsize;
@@ -758,22 +708,19 @@ fn the_shutdown_banners_counts_are_written_before_the_run_can_observe_the_stop()
 
     impl Accepting for SlowToWake {
         fn stop_accepting(&self) -> usize {
-            // What really happens here: the socket table's flag goes up and `net.accept` answers
-            // `0` from this instant.
+            // The socket table's flag goes up and `net.accept` answers `0` from here.
             self.stopped.fetch_add(1, Ordering::Release);
             1
         }
         fn listening_at(&self) -> Vec<std::net::SocketAddr> {
-            // An address the wake dial can try and never wake anything on, so the loop goes round
-            // rather than giving up on having nowhere to dial.
+            // Dialable but wakes nothing, so the loop goes round rather than giving up.
             vec![std::net::SocketAddr::from(([127, 0, 0, 1], 1))]
         }
         fn connections_in_flight(&self) -> usize {
             1
         }
         fn accepts_in_flight(&self) -> usize {
-            // Still parked, so the coordinator is inside its wake loop and has long since written
-            // the state it found.
+            // Still parked, so the coordinator is in its wake loop and has written its state.
             self.parked.load(Ordering::Acquire)
         }
     }
@@ -789,8 +736,7 @@ fn the_shutdown_banners_counts_are_written_before_the_run_can_observe_the_stop()
     shutdown.attach_net(Arc::clone(&net) as Arc<dyn Accepting>);
     assert!(shutdown.request(Signal::Terminate));
 
-    // Wait for the point the *run* stops: the socket table has been told, so every `net.accept`
-    // answers `0` and `serve` is already returning.
+    // Wait until the run stops: every `net.accept` answers `0`.
     let until = Instant::now() + Duration::from_secs(5);
     while net.stopped.load(Ordering::Acquire) == 0 && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(1));
@@ -801,8 +747,7 @@ fn the_shutdown_banners_counts_are_written_before_the_run_can_observe_the_stop()
         "phase 2 never told the socket table to stop"
     );
 
-    // This is the banner, printed on the machine's thread after the entry point returned, while the
-    // coordinator is still dialling.
+    // The banner, printed after the entry point returned while the coordinator still dials.
     assert_eq!(
         shutdown.at_stop(),
         (1, 1, 0),

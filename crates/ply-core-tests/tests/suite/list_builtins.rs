@@ -1,5 +1,3 @@
-//! The list index's and the list update's type surface, at the source level.
-
 use crate::fixture::compile;
 use ply_core::{CheckOutput, print_type};
 use ply_span::{Diagnostic, Symbol, codes};
@@ -28,8 +26,7 @@ fn footprint(out: &CheckOutput, name: &str) -> String {
         .to_string()
 }
 
-/// `fn probe_at<a>() -> T = list_at` returns the builtin itself, so the printed signature of the
-/// probe carries the builtin's whole type.
+/// The probe returns the builtin itself, so its signature is the builtin's whole type.
 #[test]
 fn list_at_has_the_type_the_contract_states() {
     let want = "(List<a>, Int) -> Option<a>";
@@ -37,7 +34,6 @@ fn list_at_has_the_type_the_contract_states() {
     assert_eq!(sig(&out, "probe_at"), format!("() -> {want}"));
 }
 
-/// The element type is the list's, in both directions.
 #[test]
 fn the_answer_is_at_the_lists_element_type() {
     let out = ok(r#"
@@ -55,7 +51,6 @@ fn two(xs: List<String>) -> Option<String> = list_at(xs, 0)
     );
 }
 
-/// This is the gate for a *third* argument.
 #[test]
 fn a_third_argument_to_list_at_is_refused_by_the_scheme() {
     let d = errors("fn bad(xs: List<Int>) -> Option<Int> = list_at(xs, 0, 9)\n");
@@ -70,7 +65,6 @@ fn a_third_argument_to_list_at_is_refused_by_the_scheme() {
     );
 }
 
-/// `list_at` is pure.
 #[test]
 fn the_index_is_pure_and_publishes_only_its_arguments_row() {
     let out = ok(r#"
@@ -91,15 +85,12 @@ fn loud(xs: List<Int>) -> Option<Int> = list_at(xs, { tell.say[out]("x"); 0 })
     );
 }
 
-/// A negative index is a type-correct `Int`, so nothing here refuses one.
 #[test]
 fn a_negative_index_is_a_type_error_nowhere() {
     ok("fn go(xs: List<Int>) -> Option<Int> = list_at(xs, 0 - 1)\n");
     ok("fn go(xs: List<Int>, i: Int) -> Option<Int> = list_at(xs, i)\n");
 }
 
-/// `list_set` takes the list, an `Int` and an element at the list's type, answers the list's
-/// type, refuses any other count of arguments, and is pure.
 #[test]
 fn list_set_has_the_type_the_contract_states_and_is_pure() {
     let want = "(List<a>, Int, a) -> List<a>";
@@ -140,7 +131,6 @@ fn loud(xs: List<Int>) -> List<Int> = list_set(xs, { tell.say[out]("x"); 0 }, 1)
     );
 }
 
-/// The name is not reserved.
 #[test]
 fn the_name_is_not_reserved_so_a_module_may_declare_its_own() {
     let out = ok("fn list_at<a>(xs: List<a>, i: Int) -> Int = 0\n");

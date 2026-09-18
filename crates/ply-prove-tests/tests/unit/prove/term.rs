@@ -19,7 +19,6 @@ fn a_linear_combination_is_canonical() {
     assert_eq!(back, x);
 }
 
-/// The prover's own arithmetic must never wrap.
 #[test]
 fn a_coefficient_that_overflows_produces_no_term() {
     let mut terms = Terms::new();
@@ -31,8 +30,6 @@ fn a_coefficient_that_overflows_produces_no_term() {
     assert!(terms.mul(again, big).is_none());
 }
 
-/// A sum of two `i64::MAX`s is not an `Int`, so there is no literal to fold it to and the
-/// prover declines rather than wrapping.
 #[test]
 fn a_constant_outside_int_produces_no_term() {
     let mut terms = Terms::new();

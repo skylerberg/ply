@@ -1,9 +1,3 @@
-//! Every slot the resolver assigns names the variable it was resolved from — the slot rewrite.
-//!
-//! The runtime still answers every lookup by name, so a wrong slot costs nothing today. It would
-//! cost a wrong value the moment the machine reads by index, and that is a change no test can be
-//! written after: this is the one that has to exist first.
-
 use ply_eval::slots;
 use ply_span::{SourceId, SourceMap, Symbol};
 use ply_syntax::ast::{Expr, ExprKind, Item, ModuleName, Stmt as AstStmt};
@@ -136,11 +130,7 @@ fn check_source(src: &str) -> usize {
     checked
 }
 
-/// Shadowing is the case a flat table gets wrong: one name, two slots, and the occurrence decides.
-///
-/// Asserting only that *two* slots exist would pass with the resolver picking either one, so this
-/// pins which slot each occurrence reads. `x` is bound by the parameter and again by the inner
-/// `let`, and the three reads straddle the second binder.
+/// Pins which slot each read takes: asserting only that two slots exist passes whichever it picks.
 #[test]
 fn a_shadowed_name_resolves_to_the_binder_nearest_it() {
     let src = "\
@@ -175,8 +165,7 @@ fn go(x: Int) -> Int = {
     );
     let (outer, inner) = (of_x[0], of_x[1]);
 
-    // Every read of `x`, left to right. The first is left of the inner binder and the other two are
-    // right of it.
+    // Every read of `x`, left to right: the first precedes the inner binder, the others follow.
     let mut reads: Vec<(u32, u32)> = Vec::new();
     let mut stack = vec![&f.body];
     while let Some(e) = stack.pop() {
@@ -202,8 +191,6 @@ fn go(x: Int) -> Int = {
     );
 }
 
-/// A lambda's body indexes its own table: an outer name is free there, and a free name takes a
-/// **capture slot** of the lambda's own window, threaded from the slot it resolves to outside.
 #[test]
 fn a_lambda_body_gives_its_free_variable_a_capture_slot_of_its_own() {
     let src = "\
@@ -239,11 +226,6 @@ fn go(xs: List<Int>, n: Int) -> List<Int> = map(xs, |y| y + n)
     );
 }
 
-/// Every function the repository ships, rather than the eight shapes below.
-///
-/// The hand-written probes pin the cases a flat table gets wrong; this one is the breadth. When the
-/// machine starts reading by index, it reads these programs, and a slot that names the wrong
-/// binding in any of them is a wrong value.
 #[test]
 fn every_slot_in_every_shipped_module_names_its_own_variable() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -308,7 +290,6 @@ fn every_slot_in_every_shipped_module_names_its_own_variable() {
     );
 }
 
-/// The shapes the corpus is written in, checked together rather than one at a time.
 #[test]
 fn every_resolved_slot_names_its_own_variable() {
     let sources = [
