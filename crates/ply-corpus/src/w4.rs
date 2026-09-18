@@ -20,7 +20,6 @@ use crate::w3;
 /// The program the `ops` and `pool` sections run.
 const BENCH: &str = include_str!("../ply/w4.ply");
 
-/// Where `examples/desk.ply` stops being the service.
 fn desk_service(repo: &Path) -> Result<String> {
     w3::Service::open(repo)?.source(w3::Variant::Sequential)
 }
@@ -38,15 +37,12 @@ fn diagnostics(what: &str, diagnostics: &[Diagnostic]) -> anyhow::Error {
     anyhow::anyhow!("{what} failed:\n  {}", shown.join("\n  "))
 }
 
-// --- The program ------------------------------------------------------------
-
 /// The checked bench program, and the pieces a run needs off it.
 pub struct Program {
     program: ply_syntax::ast::Program,
     resolved: ply_syntax::resolve::Resolved,
     check: CheckOutput,
-    /// The port's whole answer, so the tier is built from it rather than from a second front end
-    /// derived inside `over_with_texts` (ADR 0052 §2).
+    /// The tier is built from this rather than from a second front end.
     port: ply_ty::Front,
     sources: ply_span::SourceMap,
 }
@@ -73,8 +69,7 @@ impl Program {
             let id = sources.add(ply_std::pseudo_path(module), source.to_string());
             inputs.push((id, module.clone(), source));
         }
-        // Built before `parse_program` takes `inputs`, and in its order: the protocol writes a
-        // span's module as its position in this list.
+        // Built before `parse_program` takes `inputs`; a span's module is its index in this order.
         let ordered: Vec<(String, String)> = inputs
             .iter()
             .map(|(_, m, s)| (m.to_string(), s.to_string()))
@@ -116,8 +111,7 @@ impl Program {
             .map(|d| d.footprint.clone())
     }
 
-    /// The DDL the fixture is created with, taken from the program's own `schema()` rather than
-    /// restated here.
+    /// The DDL the fixture is created with, from the program's own `schema()`.
     pub fn ddl(&self) -> Result<Vec<String>> {
         let name = self.full("ddl")?;
         let mut machine = self.machine();
@@ -136,7 +130,7 @@ impl Program {
             .collect()
     }
 
-    /// One call of one entry point over a hermetic machine — no host at all.
+    /// One call of one entry point with no host.
     pub fn call_pure(&self, simple: &str, args: Vec<Value>) -> Result<(Duration, Value)> {
         let name = self.full(simple)?;
         let mut machine = self.machine();
@@ -171,9 +165,7 @@ impl Program {
         Ok((started.elapsed(), value))
     }
 
-    /// The same, keeping the diagnostic rather than the value: the exhaustion row of [`pool`] is a
-    /// refusal, and a harness that turned it into an error string would have thrown away the code
-    /// it is asserting.
+    /// The same, keeping the diagnostic, whose code the exhaustion row asserts.
     fn refusal_on(
         &self,
         host: &Arc<ply_host::Host>,
@@ -201,8 +193,6 @@ impl Program {
         registry.bind(&self.check)
     }
 }
-
-// --- The fixture ------------------------------------------------------------
 
 /// The one table both handlers use, created from the program's own schema.
 pub struct Fixture {
@@ -239,8 +229,7 @@ impl Fixture {
         })
     }
 
-    /// The table as a read workload needs it: the keys the twin's own fixture holds, and nothing a
-    /// previous write workload left behind.
+    /// Refills the table with the twin fixture's keys, dropping earlier writes.
     pub fn reset(&self) -> Result<()> {
         self.fill(64)
     }
@@ -256,8 +245,7 @@ impl Fixture {
                 .context("connecting to reset the fixture")?;
             let handle = tokio::spawn(connection);
             client.batch_execute("truncate part").await?;
-            // The same rows `bench.ply`'s `seeded_to` puts in the twin, by the same keys, so a
-            // parameterised select finds a row on both sides.
+            // The rows `bench.ply`'s `seeded_to` puts in the twin, so a keyed select hits on both.
             client
                 .batch_execute(&format!(
                     "insert into part (sku, name, price, n) \
@@ -271,8 +259,6 @@ impl Fixture {
         })
     }
 }
-
-// --- The workloads ----------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -304,8 +290,7 @@ impl Workload {
         }
     }
 
-    /// Whether a run of it leaves rows behind, and therefore needs the fixture reset and a fresh
-    /// key range per repeat.
+    /// Whether it leaves rows behind, needing a reset and a fresh key range per repeat.
     fn writes(self) -> bool {
         matches!(self, Workload::Insert | Workload::Transaction)
     }
@@ -337,8 +322,7 @@ impl Workload {
         }
     }
 
-    /// The arguments the sequential entry point takes: the write workloads need a key base so a
-    /// repeat does not collide with the last one.
+    /// Write workloads also take a key base so a repeat does not collide with the last.
     pub fn args(self, base: i64, count: u32) -> Vec<Value> {
         if self.writes() {
             vec![Value::Int(base), Value::Int(count as i64)]
@@ -359,8 +343,6 @@ impl Workload {
         }
     }
 }
-
-// --- Section 1: one statement through the boundary --------------------------
 
 #[derive(Clone, Debug, Serialize)]
 pub struct OpPoint {
@@ -384,8 +366,7 @@ pub fn ops(
     let program = Program::parse()?;
     let fixture = Fixture::create(url, &program)?;
     let mut out = Vec::new();
-    // A key base that never repeats across the whole table, so no write workload ever collides with
-    // a row an earlier point inserted.
+    // A key base that never repeats, so no write collides with an earlier point's row.
     let mut base: i64 = 1;
     // The twin's fixture is built through the twin's own scanner inside every `twin_*` call.
     let mut seed = Duration::MAX;
@@ -408,7 +389,6 @@ pub fn ops(
             let per = (operations / concurrency).max(1);
             let total = per * concurrency;
 
-            // The floor.
             let mut floor = Duration::MAX;
             for _ in 0..repeats {
                 fixture.reset()?;
@@ -418,7 +398,6 @@ pub fn ops(
             }
             out.push(point(workload, "rust-floor", concurrency, total, floor));
 
-            // Ply, over the same server.
             let mut live = Duration::MAX;
             for _ in 0..repeats {
                 fixture.reset()?;
@@ -444,8 +423,7 @@ pub fn ops(
             }
             out.push(point(workload, "ply-postgres", concurrency, total, live));
 
-            // The twin has no server to be concurrent against — it is a value threaded through a
-            // cell — so it is measured at the first concurrency and not swept.
+            // The twin has no server to be concurrent against, so it is not swept.
             if concurrency != concurrencies[0] {
                 continue;
             }
@@ -488,8 +466,7 @@ fn point(
     }
 }
 
-/// A workload that answered fewer operations than it was asked for did not run the workload, and
-/// reporting its time would be reporting a different one.
+/// A short count means a statement failed, so its time would describe a different workload.
 fn expect(answered: Value, want: u32, workload: Workload, rung: &str) -> Result<()> {
     match answered {
         Value::Int(n) if n == i64::from(want) => Ok(()),
@@ -507,8 +484,6 @@ fn config(url: &str, pool: usize) -> PoolConfig {
         ..PoolConfig::new(url)
     }
 }
-
-// --- The floor --------------------------------------------------------------
 
 /// The same statements, prepared once per connection, with no Ply anywhere.
 fn floor_run(
@@ -533,9 +508,7 @@ fn floor_run(
             clients.push(client);
         }
         let started = Instant::now();
-        // Spawned rather than awaited in turn: the point of the row is that `concurrency`
-        // statements are in flight at once, which is what the Ply rung above it does with
-        // `task.spawn`.
+        // Spawned so `concurrency` statements are in flight at once, like the Ply rung's tasks.
         let mut running = tokio::task::JoinSet::new();
         for (slot, client) in clients.into_iter().enumerate() {
             let from = base + (slot as i64) * i64::from(per);
@@ -598,8 +571,6 @@ async fn floor_task(
     Ok(())
 }
 
-// --- Section 2: what the twin costs as its table grows -----------------------
-
 #[derive(Clone, Debug, Serialize)]
 pub struct SizePoint {
     pub rows: u32,
@@ -609,8 +580,7 @@ pub struct SizePoint {
     pub per_second: f64,
 }
 
-/// One `select ... order by sku limit 1` against a table of `rows` rows, on the twin and on
-/// postgres.
+/// One `select ... order by sku limit 1` against `rows` rows, on the twin and on postgres.
 pub fn sizes(url: &str, rows: &[u32], operations: u32, repeats: usize) -> Result<Vec<SizePoint>> {
     let program = Program::parse()?;
     let fixture = Fixture::create(url, &program)?;
@@ -641,7 +611,6 @@ pub fn sizes(url: &str, rows: &[u32], operations: u32, repeats: usize) -> Result
             per_second: f64::from(operations) / twin.as_secs_f64(),
         });
 
-        // Postgres, over the same statement and the same row count.
         fixture.fill(n)?;
         let mut live = Duration::MAX;
         for _ in 0..repeats {
@@ -659,8 +628,6 @@ pub fn sizes(url: &str, rows: &[u32], operations: u32, repeats: usize) -> Result
     }
     Ok(out)
 }
-
-// --- Section 3: the pool ----------------------------------------------------
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PoolPoint {
@@ -771,8 +738,6 @@ pub fn exhaustion(url: &str, pool: usize, concurrency: u32, acquire_ms: u64) -> 
     })
 }
 
-// --- Section 3: the service under load --------------------------------------
-
 /// Which store the served `examples/desk.ply` runs over.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -812,15 +777,12 @@ fn project(dir: &Path, service: &str, store: Store) -> Result<()> {
     Ok(())
 }
 
-/// The `--set` arguments a served desk needs, now that its port, its budget and its credential are
-/// configuration rather than definitions.
+/// The `--set` arguments a served desk needs.
 fn settings(port: u16, connections: u32) -> Vec<String> {
     vec![
         format!("DESK_PORT={port}"),
         format!("DESK_CONNECTIONS={connections}"),
-        // A benchmark's key is a fixture credential and is not a credential; what it is here for is
-        // that `--config-schema desk.config` declares the key `required`, so a run without one
-        // refuses to start.
+        // A fixture value: `desk.config` declares the key `required`, so a run needs one.
         "DESK_API_KEY=bench-key".to_string(),
     ]
 }
@@ -836,8 +798,7 @@ fn replace(source: &str, from: &str, to: &str) -> Result<String> {
     Ok(source.replace(from, to))
 }
 
-/// Throughput and tail latency for one route at one concurrency, over the real binary and a real
-/// socket.
+/// Throughput and tail latency per route and concurrency, over the real binary and socket.
 pub fn crud(
     repo: &Path,
     ply: &Path,
@@ -890,8 +851,6 @@ pub fn crud(
     }
     Ok(out)
 }
-
-// --- The report -------------------------------------------------------------
 
 #[derive(Default, Serialize)]
 pub struct Measurements {

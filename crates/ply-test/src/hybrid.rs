@@ -28,11 +28,9 @@ impl Signature {
     }
 }
 
-/// Every definition the two configurations know about, and where its body comes from on each side.
+/// Every definition either configuration knows, with its baseline (`before`) and current hash.
 pub struct Mixture {
-    /// Baseline hash per key.
     before: BTreeMap<DefKey, DefHash>,
-    /// Current hash per key.
     after: BTreeMap<DefKey, DefHash>,
 }
 
@@ -52,7 +50,6 @@ impl Mixture {
         self.after.insert(key, hash);
     }
 
-    /// Everything either side names, which is the set a trial has to decide about.
     fn keys(&self) -> BTreeSet<&DefKey> {
         self.before.keys().chain(self.after.keys()).collect()
     }
@@ -96,17 +93,14 @@ pub fn mixture_for(hashes: &HashOutput, key: &Symbol, baseline: &crate::Baseline
 
 pub struct BodyHybrid<'a> {
     store: &'a Store,
-    /// This run's own normalized bytes, consulted before the store: a definition this run
-    /// introduced has no stored body until the cache is flushed, and a bisection that could not see
-    /// the *current* side would have nothing to flip to.
+    /// Consulted before the store: a definition this run introduced is not stored until the flush.
     fresh: &'a BodySet,
     mixture: Mixture,
-    /// The failing test's body as it is written now.
     test: StoredBody,
     signature: Signature,
     /// Hybrid test hashes that went green.
     proved: Vec<DefHash>,
-    /// The interleaving the failure being explained happened in, pinned.
+    /// Pinned to the interleaving the failure happened in.
     plan: Plan,
 }
 
@@ -129,14 +123,12 @@ impl<'a> BodyHybrid<'a> {
         }
     }
 
-    /// Pins every trial to the interleaving the failure happened in.
     pub fn at_seed(mut self, seed: &Seed) -> BodyHybrid<'a> {
         self.plan = Plan::once(seed.clone());
         self
     }
 
-    /// The current test's stored body, found by the hash the run published for it rather than by
-    /// position.
+    /// Found by the hash the run published for it, not by position.
     pub fn test_body(bodies: &BodySet, published: DefHash) -> Option<StoredBody> {
         bodies
             .tests()
@@ -156,8 +148,7 @@ impl<'a> BodyHybrid<'a> {
         self.store.body(hash)?.stored()
     }
 
-    /// Which version of each definition this mixture takes, and the redirection that makes every
-    /// reference point at it.
+    /// Each definition's chosen version, and the redirection pointing every reference at it.
     fn choose(&self, flipped: &BTreeSet<DefKey>) -> Result<Chosen, Unresolved> {
         let mut hashes = Vec::new();
         let mut relink: BTreeMap<DefHash, DefHash> = BTreeMap::new();
@@ -210,17 +201,12 @@ impl Hybrid for BodyHybrid<'_> {
         let Ok(mut rebuilt) = reconstruct_relinked(&bodies, &chosen.relink) else {
             return Trial::unresolved(Unresolved::MissingBody);
         };
-        // `resolve` also fills defaults, which it needs the program mutably for.
         let Ok(resolved) = ply_syntax::resolve(&mut rebuilt.program) else {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
-        // A mixture is a reconstructed AST with no source text, and the whole front end reads
-        // text: it is printed back to source once, and that one answer is what checks it here and
-        // what the unit below is built from (ADR 0052 §2).
+        // A mixture has no source text: it is printed once, and that text is checked and built.
         let printed = ply_syntax::print::program(&rebuilt.program);
-        // Fresh ids rather than the tree's: a reconstructed module carries `Span::DUMMY.source`,
-        // so every module would share one id and the answer's module positions — which the
-        // protocol writes as positions in this very list — would fold onto it.
+        // Fresh ids: reconstructed modules all carry `Span::DUMMY.source` and would share one.
         let ids: Vec<ply_span::SourceId> = (0..printed.len())
             .map(|i| ply_span::SourceId(i as u32))
             .collect();
@@ -237,15 +223,12 @@ impl Hybrid for BodyHybrid<'_> {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
 
-        // The hybrid's own test hash covers its whole closure, so a `Pass` recorded under it is a
-        // claim about exactly this configuration.
+        // The hybrid's test hash covers its whole closure, so a `Pass` is about this mixture.
         let seeded = is_seeded(&check.tests[index].footprint);
         let hash = rehashed
             .tests
             .first()
-            // `Engine::Evaluator` whatever the run around this one installed: the trial below
-            // runs the whole emitter over the mixture, so what it proves is the evaluator's claim
-            // and belongs in the evaluator's namespace.
+            // The evaluator's namespace whatever the run installed: the trial runs the evaluator.
             .map(|hash| result_key(*hash, seeded, &self.plan, &Engine::Evaluator));
         if let Some(hash) = hash
             && matches!(self.store.get(hash), Some(Outcome::Pass))
@@ -253,13 +236,9 @@ impl Hybrid for BodyHybrid<'_> {
             return Trial::passes().from_cache();
         }
 
-        // The authoritative engine, for the reason a cached `Pass` is a claim about that engine and
-        // this trial may write one.
         let plan = self.plan.clone();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            // Hermetic, always, whatever the run around it was configured with: a search asks this
-            // question up to `Budget::max_trials` times, and a binding threaded in here would
-            // answer each of them with a real packet.
+            // Hermetic always: a search asks this up to `Budget::max_trials` times.
             let texts: std::collections::HashMap<String, String> =
                 printed.iter().cloned().collect();
             let mut machine = ply_eval::Machine::new(&rebuilt.program, &resolved, check);
@@ -282,15 +261,13 @@ impl Hybrid for BodyHybrid<'_> {
             }
             Ok(Err(d)) if Signature::of(&d) == self.signature => Trial::fails(),
             Ok(Err(_)) => Trial::unresolved(Unresolved::DifferentFailure),
-            // A panic inside a mixture says nothing about the program the user wrote, and must not
-            // be reported as either outcome.
+            // A panic inside a mixture says nothing about the user's program.
             Err(_) => Trial::unresolved(Unresolved::DifferentFailure),
         }
     }
 }
 
-/// Whether a mixture can be built at all, which is the difference between `no_bodies` — go and stop
-/// pruning — and a bisection that will run.
+/// Whether a mixture can be built at all; `false` means `no_bodies` rather than a bisection.
 pub fn bodies_available(store: &Store, fresh: &BodySet, mixture: &Mixture) -> bool {
     mixture
         .before

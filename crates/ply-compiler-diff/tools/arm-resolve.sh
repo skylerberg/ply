@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
-# The resolve differential, armed: each mutation below is applied to a copy of
-# `resolve.ply` and the fast half of `crates/ply-codegen-tests/tests/goldens/resolve.rs` (the hand-written
-# programs, the reference's own programs, the standard library) must go red.
-# A mutation that stays green watched nothing, and says so.
+# Each mutation is applied to a copy of resolve.ply, and the fast half of the resolve goldens must go red.
 #
 #   ./crates/ply-compiler-diff/tools/arm-resolve.sh
 set -uo pipefail

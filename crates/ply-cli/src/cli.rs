@@ -16,15 +16,13 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
 
-    /// Colour and the ✓/✗ marks. `auto` uses them only when stdout is a
-    /// terminal and NO_COLOR is unset.
+    /// Colour and the ✓/✗ marks; `auto` uses them only on a terminal with NO_COLOR unset.
     #[arg(long, value_enum, default_value_t = ColorChoice::Auto, global = true)]
     pub color: ColorChoice,
 }
 
 impl Cli {
-    /// What `clap`'s own machinery cannot check. `None` when the command line is
-    /// coherent.
+    /// A contradiction clap cannot check itself, or `None`.
     pub fn conflict(&self) -> Option<String> {
         match &self.command {
             Command::Test(args) => args.simulation.conflict(),
@@ -43,14 +41,11 @@ pub enum Command {
     Test(TestArgs),
     /// Discharge every obligation and report the tier each was discharged at.
     Prove(ProveArgs),
-    /// What changed, whether its specification changed, and whether its
-    /// obligations still hold.
+    /// Report what changed and whether its specification and obligations still hold.
     Review(ReviewArgs),
-    /// Evaluate `main`. A directory must hold exactly one; a `.plyx` file is a
-    /// built artifact and is run out of its own definitions.
+    /// Evaluate `main` (a directory must hold exactly one), or run a built `.plyx`.
     Run(RunArgs),
-    /// Write a deployable artifact: the transitive closure of one entry point,
-    /// identified by a digest and verifiable against it.
+    /// Write a deployable artifact: the transitive closure of one entry point.
     Build(BuildArgs),
     /// List every host handler this binary can bind: the trusted computing base.
     Hosts(HostsArgs),
@@ -58,8 +53,7 @@ pub enum Command {
     Std(StdArgs),
     /// Print the content hash of every definition.
     Hash(HashArgs),
-    /// Write the front end out as the C that builds it, with the digests that
-    /// name the version and verify the artifact.
+    /// Write the front end out as the C that builds it, with its digests.
     Bootstrap(BootstrapArgs),
     /// Read, reclaim or discard what the caches hold.
     Cache(CacheArgs),
@@ -89,14 +83,11 @@ impl When {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, clap::ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum SimArg {
-    /// One interleaving, the one the seed names. The replay path.
+    /// One interleaving, the one the seed names.
     Once,
-    /// One interleaving per seed. No state, and the seeds are independent, which
-    /// is what makes widening a seed set cost only the new seeds.
+    /// One independent interleaving per seed.
     Random,
-    /// Footprint-guided partial-order reduction. Never runs two interleavings
-    /// from one equivalence class, so a small state space finishes exhaustively
-    /// — a proof rather than a sample.
+    /// Partial-order reduction; a small state space finishes exhaustively.
     #[default]
     Dpor,
 }
@@ -117,13 +108,10 @@ impl From<SimArg> for ply_eval::SimMode {
     }
 }
 
-/// What a run searches, and therefore half of what a simulated test is cached
-/// under. Every field is in the key: a green run under one plan is not a green
-/// run under another.
+/// What a run searches; every field is in a simulated test's cache key.
 #[derive(Args, Clone, Debug)]
 pub struct SimOptions {
-    /// Replay exactly one interleaving: `7`, or `7:3.0.2` for a seed the search
-    /// refined. Implies `--sim once`, and it is the whole of a repro.
+    /// Replay exactly one interleaving: `7`, or `7:3.0.2`. Implies `--sim once`.
     #[arg(
         long,
         value_name = "SEED",
@@ -136,8 +124,7 @@ pub struct SimOptions {
     #[arg(long, value_enum, default_value_t = SimArg::default(), value_name = "MODE")]
     pub sim: SimArg,
 
-    /// Seeds per simulated test. Defaults to 1 under `dpor`, which already
-    /// enumerates equivalence classes, and 64 under `random`.
+    /// Seeds per simulated test. Defaults to 1 under `dpor` and 64 under `random`.
     #[arg(long = "seeds", alias = "sim-roots", value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub seeds: Option<u32>,
 
@@ -145,21 +132,17 @@ pub struct SimOptions {
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub sim_budget: Option<u32>,
 
-    /// Scheduling steps one interleaving may take before the region is reported
-    /// as making no progress.
+    /// Scheduling steps one interleaving may take before it reports no progress.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub sim_steps: Option<u32>,
 
-    /// Also run the search with the dependence relation forced to `true` and
-    /// report what an unpruned one would have cost. Off by default: the claim is
-    /// a benchmark, not something every run pays double for.
+    /// Also run an unpruned search and report what it would have cost.
     #[arg(long)]
     pub measure_reduction: bool,
 }
 
 impl SimOptions {
-    /// The one contradiction `conflicts_with` cannot express, because it is
-    /// between a flag and a *value* of another flag.
+    /// The conflict `conflicts_with` cannot express: a flag against another flag's value.
     pub fn conflict(&self) -> Option<String> {
         (self.sim == SimArg::Random && self.sim_budget.is_some()).then(|| {
             "`--sim-budget` has no meaning under `--sim random`, which runs one \
@@ -170,12 +153,9 @@ impl SimOptions {
     }
 }
 
-/// TLS credential material, configured beside the run and named from it.
 #[derive(Args, Clone, Debug, Default)]
 pub struct TlsOptions {
-    /// TLS credential: `--tls api=certs/api.pem,certs/api.key`. Repeatable, one
-    /// credential per listener. PEM: a certificate chain leaf first, and a
-    /// private key in PKCS#8, PKCS#1 or SEC1.
+    /// TLS credential: `--tls api=certs/api.pem,certs/api.key`. Repeatable, one per listener.
     #[arg(
         long = "tls",
         value_name = "NAME=CERT,KEY",
@@ -185,21 +165,10 @@ pub struct TlsOptions {
     pub tls: Vec<CredentialSpec>,
 }
 
-/// The directories a run lets a program reach, named from it.
-///
-/// A resource label is the capability: `fs.read_file[src]` reads somewhere
-/// under whatever `src` names, and what it names is here rather than in the
-/// program — a path written in a definition would put a filesystem location
-/// into its hash and into a store designed never to forget, and the same
-/// program would then mean two things on two machines.
-///
-/// Resolved at bind time, before anything runs, for the reason [`TlsOptions`]
-/// gives: a run that discovers its output directory is a dangling symlink on
-/// the first write has already done the work it is about to lose.
+/// Directory roots per resource label; kept out of the program so no path enters a hash.
 #[derive(Args, Clone, Debug, Default)]
 pub struct FsOptions {
-    /// Filesystem root: `--fs src=./crates`. Repeatable, one root per resource
-    /// label. An operation reaches only what is under the root its label names.
+    /// Filesystem root: `--fs src=./crates`. Repeatable, one root per resource label.
     #[arg(
         long = "fs",
         value_name = "NAME=PATH",
@@ -212,8 +181,7 @@ pub struct FsOptions {
 /// What a `SIGINT` or a `SIGTERM` does to a serving run.
 #[derive(Args, Clone, Debug)]
 pub struct ShutdownOptions {
-    /// How long in-flight requests have to finish once the run stops accepting.
-    /// A drain that expires reports `W0608` and exits `3`.
+    /// How long in-flight requests have to finish after accepting stops (else `W0608`, exit 3).
     #[arg(
         long = "drain-ms",
         value_name = "MS",
@@ -222,9 +190,7 @@ pub struct ShutdownOptions {
     )]
     pub drain_ms: u64,
 
-    /// How long accept keeps running after the signal, so a readiness route can
-    /// answer `503` and a load balancer can take the instance out before it
-    /// stops taking connections.
+    /// How long accept keeps running after the signal, so a readiness route can answer `503`.
     #[arg(
         long = "drain-lead-ms",
         value_name = "MS",
@@ -252,20 +218,17 @@ impl ShutdownOptions {
     }
 }
 
-/// The shape is a usage error rather than `E0430`: a reader who mistyped the
-/// argument needs the form, and one whose PEM is broken needs the file.
+/// A bad shape is a usage error; `E0430` is for a broken PEM.
 fn parse_credential(text: &str) -> Result<CredentialSpec, String> {
     CredentialSpec::parse(text)
 }
 
-/// The same split, one code along: the shape is a usage error and `E0454` is
-/// for a root that does not resolve.
+/// A bad shape is a usage error; `E0454` is for a root that does not resolve.
 fn parse_root(text: &str) -> Result<RootSpec, String> {
     RootSpec::parse(text)
 }
 
-/// A seed that parses loosely replays something other than what failed, so
-/// every form that is not canonical is refused with the two that are.
+/// Refuses non-canonical forms: a loosely parsed seed would replay the wrong interleaving.
 fn parse_seed(text: &str) -> Result<Seed, String> {
     Seed::parse(text).ok_or_else(|| {
         format!(
@@ -277,8 +240,7 @@ fn parse_seed(text: &str) -> Result<Seed, String> {
 
 #[derive(Args, Debug)]
 pub struct CheckArgs {
-    /// A `.ply` file, or a project root: every `*.ply` under it is a module
-    /// named after its path relative to that root.
+    /// A `.ply` file, or a project root whose `*.ply` files are modules named by path.
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
@@ -286,8 +248,7 @@ pub struct CheckArgs {
     #[arg(long)]
     pub types: bool,
 
-    /// Print, for every `push`, whether it grows its list in place or copies
-    /// it, and what would remove the copy.
+    /// Print, for every `push`, whether it grows its list in place or copies it.
     #[arg(long)]
     pub costs: bool,
 
@@ -295,21 +256,18 @@ pub struct CheckArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Report which files were parsed and which definitions were rechecked,
-    /// with the reason a skip was refused.
+    /// Report which files were parsed and which definitions were rechecked, and why.
     #[arg(long)]
     pub explain: bool,
 
-    /// Neither read nor write the front-end cache: parse every file and
-    /// recheck every definition.
+    /// Neither read nor write the front-end cache.
     #[arg(long)]
     pub no_incremental: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct TestArgs {
-    /// A `.ply` file, or a project root: every `*.ply` under it is a module
-    /// named after its path relative to that root.
+    /// A `.ply` file, or a project root whose `*.ply` files are modules named by path.
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
@@ -317,18 +275,15 @@ pub struct TestArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Show why each test was selected or skipped, and how the concurrency
-    /// groups were formed.
+    /// Show why each test was selected or skipped, and how concurrency groups formed.
     #[arg(long)]
     pub explain: bool,
 
-    /// Neither read nor write the result cache: every test runs, and nothing
-    /// this run proves is remembered.
+    /// Neither read nor write the result cache: every test runs.
     #[arg(long)]
     pub no_cache: bool,
 
-    /// Only consider tests whose `<module>.<label>` key contains this
-    /// substring.
+    /// Only consider tests whose `<module>.<label>` key contains this substring.
     #[arg(long, value_name = "SUBSTRING")]
     pub filter: Option<String>,
 
@@ -336,51 +291,27 @@ pub struct TestArgs {
     #[arg(long, short = 'j', value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub jobs: Option<u32>,
 
-    /// Neither read nor write the front-end cache. The result cache is
-    /// untouched; `--no-cache` is what disables both.
+    /// Neither read nor write the front-end cache; the result cache is untouched.
     #[arg(long)]
     pub no_incremental: bool,
 
-    /// Attribute a failure to the change that caused it. `auto` bisects a
-    /// failing det test that has passed before; `never` reports no culprit at
-    /// all.
+    /// Attribute a failure to its change; `auto` bisects only a det test that has passed before.
     #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]
     pub bisect: When,
 
-    /// Hybrid programs a bisection may evaluate. Counted in evaluations rather
-    /// than seconds, so two runs over the same failure agree.
+    /// Hybrid programs a bisection may evaluate; counted, not timed, so runs agree.
     #[arg(long, default_value_t = 64, value_name = "N")]
     pub bisect_budget: usize,
 
-    /// Record which definitions a failing test actually entered. `auto` traces
-    /// the re-run of a failure; `always` traces the first execution too.
+    /// Record which definitions a failing test entered; `always` also traces the first run.
     #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]
     pub trace: When,
 
-    /// Attach a compiled backend to the machine, so a call it accepts is
-    /// entered natively instead of evaluated.
-    ///
-    /// `c` is the code generator: it emits the program as C, compiles it at
-    /// startup and the machine drops into it at the leaves.
-    ///
-    /// `[c:]wrong:<mutation>` is a backend that is wrong on purpose, so
-    /// that a green run can be read as evidence — one of `off-by-one`,
-    /// `inverted`, `stale`, `wrong-type`, `unoffered`, `handle`,
-    /// `exceeds-budget[={k}]` or
-    /// `answers={int}`, each optionally `@<definition>`. Never reads or writes
-    /// the result cache.
+    /// Attach a compiled backend: `c`, or a deliberately wrong `[c:]wrong:<mutation>[@<def>]`.
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
 
-    /// Which toolchain the emitted C tier compiles with. Ignored by every other
-    /// backend, which have one each.
-    ///
-    /// `development`, the default, is the fastest compiler on the machine —
-    /// `tcc` if it is installed, else `cc -O0` — which is what an edit-to-green
-    /// loop wants.
-    ///
-    /// `release` is `cc -O2`: faster code, and the profile any measurement must
-    /// ask for.
+    /// C toolchain: `development` (`tcc`, else `cc -O0`) or `release` (`cc -O2`).
     #[arg(
         long,
         value_name = "PROFILE",
@@ -389,17 +320,11 @@ pub struct TestArgs {
     )]
     pub profile: String,
 
-    /// Stay running: re-select and re-run whenever a `.ply` file under the path changes,
-    /// keeping the front end and the caches in memory between iterations. An iteration where
-    /// nothing changed costs a scan of the tree rather than a whole front end, which is what an
-    /// invocation costs otherwise.
+    /// Stay running: re-select and re-run whenever a `.ply` file under the path changes.
     #[arg(long)]
     pub watch: bool,
 
-    /// Bind the real host handlers. Off by default, and the default is the
-    /// point: a suite that silently acquires a live dependency is the failure
-    /// mode this language exists to prevent. A test that reaches a bound
-    /// handler always runs and is never cached.
+    /// Bind the real host handlers; a test that reaches one always runs and is never cached.
     #[arg(long)]
     pub host: bool,
 
@@ -415,9 +340,7 @@ pub struct TestArgs {
     #[command(flatten)]
     pub config: crate::config::ConfigOptions,
 
-    /// Also select the tests declared by the modules that ship with the
-    /// compiler. Off by default: a project's test count must not change with a
-    /// compiler upgrade, for tests the project did not write and cannot fix.
+    /// Also select the tests declared by the modules that ship with the compiler.
     #[arg(long)]
     pub std: bool,
 
@@ -425,38 +348,29 @@ pub struct TestArgs {
     pub simulation: SimOptions,
 }
 
-/// What a run searches, and therefore what everything weaker than a proof is
-/// cached under. A proof is cached under none of it: it is a claim about every
-/// input satisfying the guard, so widening any of these cannot re-open it.
+/// Search bounds; they key every cached result weaker than a proof.
 #[derive(Args, Clone, Debug)]
 pub struct ProveOptions {
-    /// Candidate binder tuples drawn per root. Fewer than 25 *kept* can only
-    /// ever report `example`.
+    /// Candidate binder tuples drawn per root; fewer than 25 kept can only report `example`.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub prove_cases: Option<u32>,
 
-    /// Generator roots. Each draws its own case set, so widening this widens
-    /// the search rather than repeating it.
+    /// Generator roots, each drawing its own case set.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub prove_roots: Option<u32>,
 
-    /// Static inference steps per obligation. A spent budget is inconclusive,
-    /// which reports `property` — never `proved` and never `refuted`.
+    /// Static inference steps per obligation; a spent budget reports `property`.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub prove_budget: Option<u32>,
 
-    /// Candidate *evaluations* a counterexample may be shrunk by — never
-    /// seconds, so two runs over one failure agree. Deliberately not part of any
-    /// cache key: it can only change a counterexample's minimality, and
-    /// failures are never cached.
+    /// Evaluations a counterexample may be shrunk by; in no cache key, since failures never are.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub shrink_budget: Option<u32>,
 }
 
 #[derive(Args, Debug)]
 pub struct ProveArgs {
-    /// A `.ply` file, or a project root: every `*.ply` under it is a module
-    /// named after its path relative to that root.
+    /// A `.ply` file, or a project root whose `*.ply` files are modules named by path.
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
@@ -468,8 +382,7 @@ pub struct ProveArgs {
     #[arg(long)]
     pub explain: bool,
 
-    /// Neither read nor write the obligation cache: every obligation is
-    /// discharged again, and nothing this run establishes is remembered.
+    /// Neither read nor write the obligation cache: every obligation is discharged again.
     #[arg(long)]
     pub no_cache: bool,
 
@@ -477,8 +390,7 @@ pub struct ProveArgs {
     #[arg(long, value_name = "SUBSTRING")]
     pub filter: Option<String>,
 
-    /// Worker threads. Defaults to one per core. Every obligation is pure, so
-    /// no two contend and this changes only the wall clock.
+    /// Worker threads. Defaults to one per core.
     #[arg(long, short = 'j', value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub jobs: Option<u32>,
 
@@ -486,10 +398,7 @@ pub struct ProveArgs {
     #[arg(long)]
     pub no_incremental: bool,
 
-    /// Also discharge the laws declared by the modules that ship with the
-    /// compiler, and count their definitions in the coverage line. Off by
-    /// default, for the reason `ply test --std` is: a project's obligation count
-    /// must not change with a compiler upgrade.
+    /// Also discharge the laws declared by the modules that ship with the compiler.
     #[arg(long)]
     pub std: bool,
 
@@ -497,11 +406,7 @@ pub struct ProveArgs {
     #[arg(long)]
     pub host: bool,
 
-    /// Attach a compiled backend, so that a law's guard and body and a
-    /// definition's `requires` and `ensures` clauses are entered as roots of
-    /// the compiled unit rather than evaluated; `c` or a `wrong:` corruption,
-    /// as `ply test --backend` takes it. A root the unit does not hold is
-    /// evaluated as before.
+    /// Attach a compiled backend, as `ply test --backend` does, for laws and contracts.
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
 
@@ -529,19 +434,15 @@ pub struct ProveArgs {
 
 #[derive(Args, Debug)]
 pub struct ReviewArgs {
-    /// A `.ply` file, or a project root: every `*.ply` under it is a module
-    /// named after its path relative to that root.
+    /// A `.ply` file, or a project root whose `*.ply` files are modules named by path.
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
-    /// Report only what moved since the last accepted review. This is the
-    /// default; naming it is how a script says what it meant.
+    /// Report only what moved since the last accepted review (the default).
     #[arg(long)]
     pub changed: bool,
 
-    /// Record the current definitions and specifications as reviewed. Written
-    /// per definition, keyed by name, so that renaming one loses its baseline
-    /// and reports it as unreviewed rather than as unchanged.
+    /// Record the current definitions and specifications as reviewed, keyed by name.
     #[arg(long, conflicts_with = "changed")]
     pub accept: bool,
 
@@ -557,8 +458,7 @@ pub struct ReviewArgs {
     #[arg(long)]
     pub no_incremental: bool,
 
-    /// Also review the definitions the modules that ship with the compiler
-    /// declare. Off by default: a project reviews what it wrote.
+    /// Also review the definitions the modules that ship with the compiler declare.
     #[arg(long)]
     pub std: bool,
 
@@ -575,8 +475,7 @@ pub struct ReviewArgs {
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
-    /// A `.ply` file, or a project root: every `*.ply` under it is a module
-    /// named after its path relative to that root.
+    /// A `.ply` file, or a project root whose `*.ply` files are modules named by path.
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
@@ -588,9 +487,7 @@ pub struct RunArgs {
     #[arg(long, value_name = "SEED", value_parser = parse_seed)]
     pub seed: Option<Seed>,
 
-    /// Bind the real host handlers. Off by default: reaching the boundary with
-    /// nothing bound is a diagnostic naming the handler that would have served
-    /// it, never a silent syscall.
+    /// Bind the real host handlers; unbound, reaching the boundary is a diagnostic.
     #[arg(long)]
     pub host: bool,
 
@@ -612,20 +509,11 @@ pub struct RunArgs {
     #[command(flatten)]
     pub shutdown: ShutdownOptions,
 
-    /// Attach a compiled backend to the machine, as `ply test --backend` does:
-    /// `c` or a `wrong:` corruption. A `.plyx` runs under it the same way.
+    /// Attach a compiled backend, as `ply test --backend` does.
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
 
-    /// Which toolchain the emitted C tier compiles with. Ignored by every other
-    /// backend, which have one each.
-    ///
-    /// `development`, the default, is the fastest compiler on the machine —
-    /// `tcc` if it is installed, else `cc -O0` — which is what an edit-to-green
-    /// loop wants.
-    ///
-    /// `release` is `cc -O2`: faster code, and the profile any measurement must
-    /// ask for.
+    /// C toolchain: `development` (`tcc`, else `cc -O0`) or `release` (`cc -O2`).
     #[arg(
         long,
         value_name = "PROFILE",
@@ -637,40 +525,31 @@ pub struct RunArgs {
 
 #[derive(Args, Debug)]
 pub struct BuildArgs {
-    /// A `.ply` file, or a project root: every `*.ply` under it is a module
-    /// named after its path relative to that root.
+    /// A `.ply` file, or a project root whose `*.ply` files are modules named by path.
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
-    /// Where to write the artifact. Defaults to `<entry module>.plyx` in the
-    /// working directory.
+    /// Where to write the artifact. Defaults to `<entry module>.plyx` in the working directory.
     #[arg(long, short = 'o', value_name = "FILE")]
     pub output: Option<PathBuf>,
 
-    /// The definition whose closure is shipped: a program-wide name
-    /// (`app.serve`) or a simple one. Defaults to `main`.
+    /// The definition whose closure is shipped: `app.serve` or a simple name. Defaults to `main`.
     #[arg(long, value_name = "NAME")]
     pub entry: Option<String>,
 
-    /// Ship the closure of this `--config-schema` function too, so the deployed
-    /// artifact can be run with the same flag and keeps `E0441 CONFIG_MISSING`.
+    /// Also ship this `--config-schema` function's closure, so the artifact takes the same flag.
     #[arg(long = "config-schema", value_name = "MODULE.FN")]
     pub config_schema: Option<String>,
 
-    /// Ship the closure of this `--db-schema` function too, so the deployed
-    /// artifact can be run with the same flag and keeps W4's schema
-    /// verification.
+    /// Also ship this `--db-schema` function's closure, so the artifact takes the same flag.
     #[arg(long = "db-schema", value_name = "MODULE.FN")]
     pub db_schema: Option<String>,
 
-    /// Print `b3:...` and nothing else: the one line a deployment pins. Writes
-    /// no file.
+    /// Print `b3:...` and nothing else: the line a deployment pins. Writes no file.
     #[arg(long, conflicts_with_all = ["json", "diff", "output"])]
     pub digest: bool,
 
-    /// Report what this build changes relative to an artifact already deployed:
-    /// added, changed, dropped, unchanged, and what a change is reached by.
-    /// Writes no file.
+    /// Report what this build changes relative to a deployed artifact. Writes no file.
     #[arg(long, value_name = "OLD.plyx", conflicts_with = "output")]
     pub diff: Option<PathBuf>,
 
@@ -681,13 +560,11 @@ pub struct BuildArgs {
 
 #[derive(Args, Debug)]
 pub struct HostsArgs {
-    /// A `.ply` file, or a project root: every `*.ply` under it is a module
-    /// named after its path relative to that root.
+    /// A `.ply` file, or a project root whose `*.ply` files are modules named by path.
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
-    /// List the handlers as bound rather than reporting that nothing is.
-    /// Resolution — and therefore any registration error — happens either way.
+    /// List the handlers as bound; registration errors are reported either way.
     #[arg(long)]
     pub host: bool,
 
@@ -706,9 +583,7 @@ pub struct HostsArgs {
     #[command(flatten)]
     pub trace: crate::trace::TraceOptions,
 
-    /// The knobs the `shutdown` block prints. Accepted here and not only on
-    /// `ply run` because they are in the digest: a deployment that widened its
-    /// drain window changed what its trusted computing base does at a signal.
+    /// Accepted here as well as on `ply run` because the drain bounds are in the digest.
     #[command(flatten)]
     pub shutdown: ShutdownOptions,
 
@@ -716,22 +591,19 @@ pub struct HostsArgs {
     #[arg(long, conflicts_with = "digest")]
     pub json: bool,
 
-    /// Print `b3:...` and nothing else: the one line a CI check pins against
-    /// the trusted computing base.
+    /// Print `b3:...` and nothing else: the line a CI check pins.
     #[arg(long)]
     pub digest: bool,
 }
 
-/// `ply std` needs no project: the modules are compiled into the binary, so
-/// what it reports is a property of `ply` and of nothing on disk.
+/// Needs no project: the modules are compiled into the binary.
 #[derive(Args, Debug)]
 pub struct StdArgs {
     /// Emit one JSON object on stdout and nothing else.
     #[arg(long, conflicts_with = "digest")]
     pub json: bool,
 
-    /// Print `b3:...` and nothing else: the one line a CI check pins against
-    /// the stdlib, exactly as `ply hosts --digest` does for the host handlers.
+    /// Print `b3:...` and nothing else: the line a CI check pins.
     #[arg(long)]
     pub digest: bool,
 
@@ -742,8 +614,7 @@ pub struct StdArgs {
 
 #[derive(Args, Debug)]
 pub struct HashArgs {
-    /// A `.ply` file, or a project root: every `*.ply` under it is a module
-    /// named after its path relative to that root.
+    /// A `.ply` file, or a project root whose `*.ply` files are modules named by path.
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
@@ -776,8 +647,7 @@ pub enum CacheAction {
 
 #[derive(Args, Debug)]
 pub struct CacheScope {
-    /// The project whose `.ply-cache` is meant; a `.ply` file means its
-    /// directory.
+    /// The project whose `.ply-cache` is meant; a `.ply` file means its directory.
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
@@ -788,13 +658,11 @@ pub struct CacheScope {
 
 #[derive(Args, Debug)]
 pub struct InspectArgs {
-    /// A program-wide name (`store.orders.place`), a name as its module wrote
-    /// it (`place`), or a hash prefix of at least four hex characters.
+    /// A program-wide name, a name as its module wrote it, or a hash prefix of 4+ hex digits.
     #[arg(value_name = "DEF")]
     pub query: String,
 
-    /// The project whose `.ply-cache` is meant; a `.ply` file means its
-    /// directory.
+    /// The project whose `.ply-cache` is meant; a `.ply` file means its directory.
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
@@ -808,20 +676,19 @@ pub struct BootstrapArgs {
     /// A `.ply` file, or a project root: the front end to write out.
     pub path: PathBuf,
 
-    /// Where the archive goes. The C and its manifest are written here.
+    /// Where the archive goes: the C and its manifest.
     #[arg(long, value_name = "DIR", default_value = "bootstrap")]
     pub out: PathBuf,
 
-    /// Re-emit and compare against the archive already there, writing nothing.
-    /// Non-zero if the tree no longer produces what the archive records.
+    /// Re-emit and compare against the existing archive, writing nothing; non-zero on mismatch.
     #[arg(long)]
     pub verify: bool,
 
-    /// Which toolchain the emitter that writes the archive is compiled with.
-    /// `release` by default here, unlike everywhere else.
+    /// C toolchain for the emitter that writes the archive; `release` by default here.
     #[arg(long, value_name = "PROFILE", default_value = "release")]
     pub profile: String,
 
+    /// Emit one JSON object on stdout and nothing else.
     #[arg(long)]
     pub json: bool,
 }

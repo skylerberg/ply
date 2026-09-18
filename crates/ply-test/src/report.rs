@@ -108,8 +108,7 @@ fn shared_atoms(footprint: &Footprint) -> Vec<String> {
         .collect()
 }
 
-/// A shared test is told which atoms made it shared, and — when every one of them is a region label
-/// — that the contention is one it can remove by renaming a label.
+/// Names the atoms that made a test shared, and when renaming a region label would remove them.
 fn explain_isolation(footprint: &Footprint) -> String {
     match Isolation::of(footprint) {
         Isolation::Region => "  isolation: region".to_string(),
@@ -135,8 +134,6 @@ fn explain_parallelism(p: &Parallelism) -> Vec<String> {
         "isolated: {} of {} — {} can contend with another test",
         p.isolated, p.total, p.shared
     )];
-    // host effects having no region isolation: when a population stops being isolated, the report has to say so, or the
-    // trivially-parallel count over-claims by exactly the tests that moved.
     if p.region_contended > 0 {
         lines.push(format!(
             "{} of the {} contend only over a region label; a region is closed per test, \
@@ -181,8 +178,7 @@ impl RunReport {
         })
     }
 
-    /// The human summary, without the per-test lines: one line of counts, then each failure led by
-    /// its culprit.
+    /// One line of counts, then each failure led by its culprit.
     pub fn summary(&self) -> Vec<String> {
         let mut lines = vec![format!(
             "{} failed, {} passed, {} cached ({:.2}s)",
@@ -245,8 +241,7 @@ fn race_site(site: &RaceSite) -> String {
     format!("{}  {definition}   {}", site.task, site.access)
 }
 
-/// Silent when there is no culprit to lead with, so that a run which could not bisect reads exactly
-/// as it does today rather than gaining a line of apologies.
+/// Silent when there is no culprit to lead with.
 fn culprit_lines(attribution: &Attribution) -> Vec<String> {
     let bisection = &attribution.bisection;
     if !bisection.is_conclusive() {
@@ -313,14 +308,12 @@ fn test_json(result: &TestResult) -> Value {
 pub fn exploration_json(exploration: &Exploration) -> Value {
     json!({
         "explored": exploration.explored,
-        // The headline.
         "exhaustive": exploration.exhaustive,
         // The budget was spent, so the run is green and not cached.
         "exhausted": exploration.exhausted,
         "naive": exploration.naive.map(|naive| json!({
             "explored": naive.explored,
-            // A spent naive budget is a lower bound, and a lower bound reported as an exact count
-            // is a number nobody observed.
+            // A spent naive budget is a lower bound, not an exact count.
             "bounded": naive.bounded,
             "rendered": naive.to_string(),
         })),
@@ -360,7 +353,6 @@ fn race_site_json(site: &RaceSite) -> Value {
     })
 }
 
-/// The per-failure artifact.
 pub fn failure_json(failure: &Failure) -> Value {
     json!({
         "key": failure.key,
@@ -368,7 +360,6 @@ pub fn failure_json(failure: &Failure) -> Value {
         "diagnostic": failure.diagnostic,
         // Whether to go and read the program or go and report a bug in Ply.
         "defect": failure.defect,
-        // The repro artifact.
         "seed": failure.seed.as_ref().map(|s| s.to_string()),
         "replay": failure.replay(),
         // Only when the search actually observed the flip.

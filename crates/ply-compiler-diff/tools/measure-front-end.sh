@@ -1,30 +1,16 @@
 #!/usr/bin/env bash
+# Times the Ply lexer, the Ply parser (each with and without its dump) and the Rust front end.
 #
-# F1-F6 of /tmp/ply-parser-spike/PREREGISTRATION-MULTIPLIER.md: the Ply lexer,
-# the Ply parser and the Rust front end, all in one sitting at one load.
-#
-#   ./crates/ply-compiler-diff/tools/measure-front-end.sh            # the five registered files
+#   ./crates/ply-compiler-diff/tools/measure-front-end.sh            # the default files
 #   ./crates/ply-compiler-diff/tools/measure-front-end.sh <file>...  # others
 #
-# `measure-multiplier.sh` took (P-Z)/(L-Z) and nothing else. This adds the two
-# things that file's own §H5 caveat says are missing: the *dump* term, so that
-# the self-hosting spike's ~17,000 tokens/s can be re-taken in the probe shape it was
-# originally taken in rather than a different one, and the Rust front end, so
-# that the self-hosting spike's "not a clean single-sitting figure" stops being true.
-#
-# Five probes per file, five project directories each holding the same six
-# modules so module typechecking is identical and cancels in every difference:
-#
+# Probes per file, each in a project with the same modules so typechecking cancels out:
 #   Z   bytes_len(source())                     start, typecheck, the literal
 #   L   len(lexer::lex(source()).toks)          and the lexer
 #   P   len(items::parse(source()).node.items)  and the parser
-#   LD  string_len(lexer::dump(source()))       lexer + its dump  (the self-hosting spike's shape)
+#   LD  string_len(lexer::dump(source()))       lexer + its dump
 #   PD  string_len(items::dump(source()))       parser + the tree dump
-#
-# Minimum user CPU over N runs, N=5 where one run is under 2 s and N=3
-# otherwise -- decided from run 1, which is kept and counted. Every run printed,
-# `uptime` before and after, nothing discarded. The binary is checked before the
-# series and again after it.
+# Reports minimum user CPU over N runs, N fixed from run 1.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

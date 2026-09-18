@@ -1,4 +1,4 @@
-//! The four numbers the control-stack design spends and never priced.
+//! Prices the control-stack design: throughput, fixtures, multi-shot and scheduling.
 
 use crate::pipeline::{Front, front};
 use anyhow::{Context, Result, bail};
@@ -16,7 +16,6 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-/// The fastest of several attempts.
 fn best_of(repeats: usize, mut run: impl FnMut() -> Duration) -> Duration {
     (0..repeats.max(1))
         .map(|_| run())
@@ -36,8 +35,7 @@ fn nanos(d: Duration) -> f64 {
 pub struct Pass {
     /// Constructing one worker: what `ply-test` pays per rayon thread per concurrency group.
     pub worker_setup_millis: f64,
-    /// Every test once on a freshly built worker — setup, plus whatever the engine defers to first
-    /// call.
+    /// Every test once on a fresh worker, including whatever the engine defers to first call.
     pub first_pass_millis: f64,
     /// Every test again on the same worker.
     pub steady_pass_millis: f64,
@@ -141,16 +139,14 @@ fn run_every_test(worker: &mut dyn Evaluator) -> Result<u64> {
     Ok(performs)
 }
 
-/// What region isolation's region-scoped fixture costs, measured the way `fork`'s 1 ns was.
+/// What a region-scoped fixture costs to open, write and rebuild.
 #[derive(Clone, Debug, Serialize)]
 pub struct FixturePoint {
     pub cells: usize,
     pub open_nanos: f64,
-    /// An opened fixture a test then writes to — a slot write, where the persistent map paid for
-    /// copy-on-write down a root-to-leaf path.
+    /// An opened fixture a test then writes one slot of.
     pub open_and_write_nanos: f64,
-    /// Building the same fixture by running the setup again — the alternative to opening one, and
-    /// the denominator of the claim.
+    /// Building the same fixture by rerunning the setup: the alternative to opening one.
     pub rebuild_nanos: f64,
     pub rebuild_over_open: f64,
     pub rebuild_over_open_and_write: f64,
@@ -190,9 +186,7 @@ pub fn fixture_cost(sizes: &[usize], repeats: usize) -> Vec<FixturePoint> {
         .map(|&cells| {
             let fixture = seeded(cells);
             let slots = cells_of(fixture.handle());
-            // Enough iterations that a nanosecond-scale operation is not read off the clock's own
-            // resolution, and few enough that an O(n) open of a 10,000-cell fixture still finishes:
-            // the product is what is held roughly constant, not the count.
+            // Enough iterations to beat clock resolution, few enough for an O(n) open to finish.
             let iterations = (1_000_000 / (cells as u32 + 1)).max(16);
 
             let open = best_of(repeats, || {
@@ -247,8 +241,7 @@ pub struct StackPoint {
     pub segments: usize,
     pub capture_nanos: f64,
     pub resume_nanos: f64,
-    /// What `Continuation::frames` reports, to show the frames really were pending and the capture
-    /// still did not walk them.
+    /// What `Continuation::frames` reports: the frames were pending and capture did not walk them.
     pub captured_frames: usize,
 }
 
@@ -311,8 +304,7 @@ pub fn multi_shot(repeats: usize) -> Result<MultiShot> {
     let mut rows: Vec<Resumptions> = Vec::new();
     for (count, name) in [(0usize, "r0"), (1, "r1"), (2, "r2"), (4, "r4")] {
         let qualified = format!("multishot.{name}");
-        // One call outside the clock, so lazy lowering is not charged to the first row and read as
-        // a cost of resuming zero times.
+        // One call outside the clock, so lazy lowering is not charged to the first row.
         machine
             .call(&qualified, Vec::new(), Span::DUMMY)
             .map_err(|d| anyhow::anyhow!("`{qualified}` failed: {}", d.message))?;
@@ -355,8 +347,7 @@ fn empty_prompt() -> Rc<Prompt> {
     })
 }
 
-/// `Stack::capture` and `Stack::resume` against the number of frames pending inside the captured
-/// segment.
+/// `Stack::capture` and `Stack::resume` against frames pending in the captured segment.
 pub fn stack_cost(repeats: usize) -> Vec<StackPoint> {
     [8usize, 1_000, 100_000]
         .into_iter()
@@ -412,14 +403,11 @@ pub struct Scheduling {
     pub shared_groups: usize,
     pub largest_group: usize,
     pub smallest_group: usize,
-    /// Tests in the largest group over tests scheduled: the fraction that runs in one concurrent
-    /// wave.
+    /// Largest group over tests scheduled: the fraction run in one concurrent wave.
     pub largest_group_share: f64,
 }
 
-/// A cold run selects every test, so the schedule is a function of the corpus alone and the cache
-/// need not be touched — which matters, because clearing it to observe a cold schedule would
-/// destroy the state `store_open` measures.
+/// A cold run's schedule, from the corpus alone, leaving the cache `store_open` measures intact.
 pub fn scheduling(root: &Path) -> Result<Scheduling> {
     let front = front(root)?;
     let footprints: Vec<Footprint> = front

@@ -10,7 +10,6 @@ use ply_hash::{DefHash, HashOutput};
 use ply_span::Symbol;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Which namespace a program-wide name is being read in.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub enum Ns {
     #[default]
@@ -27,8 +26,7 @@ impl Ns {
     }
 }
 
-/// The identity of one definition across two configurations: its program-wide name and the
-/// namespace that name is read in.
+/// A definition's identity across two configurations: its program-wide name and namespace.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct DefKey {
     pub name: Symbol,
@@ -52,16 +50,13 @@ impl DefKey {
     }
 }
 
-/// Why a definition's hash differs between the two configurations.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ChangeKind {
     /// Its own normalized body differs.
     Edited,
     /// Its body is byte-identical; its hash moved only because a dependency's did.
     Derived,
-    /// Present now, absent from the baseline.
     Added,
-    /// Present in the baseline, absent now.
     Removed,
 }
 
@@ -75,13 +70,11 @@ impl ChangeKind {
         }
     }
 
-    /// Whether flipping this definition is a question worth asking.
     pub fn is_candidate(self) -> bool {
         !matches!(self, ChangeKind::Derived)
     }
 }
 
-/// One definition's identity on both sides of the edit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Change {
     /// The program-wide name — `store.orders.place`.
@@ -89,11 +82,9 @@ pub struct Change {
     pub ns: Ns,
     /// Its hash when the test last passed.
     pub before: Option<DefHash>,
-    /// Its hash now.
     pub after: Option<DefHash>,
     pub kind: ChangeKind,
-    /// Whether this definition's *published interface* — its scheme and its footprint — is the same
-    /// on both sides.
+    /// Whether its published interface (scheme and footprint) is the same on both sides.
     pub independent: bool,
 }
 
@@ -109,7 +100,6 @@ impl Change {
         }
     }
 
-    /// The same change, read in `ns`.
     pub fn in_namespace(mut self, ns: Ns) -> Change {
         self.ns = ns;
         self
@@ -122,7 +112,6 @@ impl Change {
         }
     }
 
-    /// A hash that moved only because a dependency's did.
     pub fn derived(name: Symbol, before: DefHash, after: DefHash) -> Change {
         Change {
             name,
@@ -134,8 +123,7 @@ impl Change {
         }
     }
 
-    /// Nothing that references a definition can be flipped without the definition itself, so an
-    /// added one is never independent.
+    /// Never independent: nothing referencing it can be flipped without it.
     pub fn added(name: Symbol, after: DefHash) -> Change {
         Change {
             name,
@@ -147,7 +135,7 @@ impl Change {
         }
     }
 
-    /// Symmetrically: a baseline body that still references it cannot be kept while it is deleted.
+    /// Never independent: a baseline body still referencing it cannot be kept while it is deleted.
     pub fn removed(name: Symbol, before: DefHash) -> Change {
         Change {
             name,
@@ -181,7 +169,6 @@ impl DepEdges {
         self.referrers.entry(to).or_default().insert(from);
     }
 
-    /// Every direct reference in the program as it stands now.
     pub fn extend_from_hashes(&mut self, hashes: &HashOutput) {
         for (from, deps) in &hashes.deps {
             for to in deps {
@@ -207,14 +194,11 @@ impl From<&HashOutput> for DepEdges {
     }
 }
 
-/// Why a group of changes has to be flipped as one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FusionReason {
-    /// Nothing forced it: this definition's interface is unchanged, so it stands alone and the
-    /// search can name it exactly.
+    /// Its interface is unchanged, so it stands alone and the search can name it exactly.
     Independent,
-    /// Its scheme or footprint moved, so its callers had to move with it and a hybrid that split
-    /// them would not typecheck.
+    /// Its scheme or footprint moved, so splitting it from its callers would not typecheck.
     InterfaceChanged,
     /// It exists on only one side, so nothing that mentions it can be flipped without it.
     Existence,
@@ -232,8 +216,7 @@ impl FusionReason {
         }
     }
 
-    /// The clause the artifact prints so that a fused group says *why* its members are inseparable
-    /// rather than only that they are.
+    /// Says *why* a fused group's members are inseparable.
     pub fn describe(self) -> &'static str {
         match self {
             FusionReason::Independent => "nothing forced these together",
@@ -253,15 +236,11 @@ impl FusionReason {
     }
 }
 
-/// A set of changes the search treats as one atom.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cluster {
-    /// Program-wide names, ascending — the order is part of the artifact and has to be
-    /// reproducible.
+    /// Program-wide names, ascending: the order is part of the artifact.
     pub members: Vec<Symbol>,
-    /// The same members with their namespaces, which is what a hybrid has to flip: `members`
-    /// deduplicates a name that is both a `fn` and a `type`, and a builder handed only that cannot
-    /// tell which of the two to swap.
+    /// `members` with namespaces: a name that is both a `fn` and a `type` must say which to swap.
     pub keys: Vec<DefKey>,
     pub reason: FusionReason,
 }
@@ -272,8 +251,7 @@ impl Cluster {
     }
 }
 
-/// Everything that moved between the configuration a test last passed at and the one it fails at,
-/// classified and grouped into what the search may flip.
+/// What moved since the test last passed, classified and grouped into what the search may flip.
 #[derive(Clone, Debug, Default)]
 pub struct Delta {
     /// The test's own definition, when the test body itself was edited.
@@ -291,8 +269,7 @@ impl Delta {
         Delta::with_components(test, changes, edges, &[])
     }
 
-    /// [`Delta::new`] plus the second thing no hybrid can separate: the members of a strongly
-    /// connected component.
+    /// [`Delta::new`], also fusing the members of each strongly connected component.
     pub fn with_components(
         test: Option<Change>,
         changes: Vec<Change>,
@@ -306,8 +283,7 @@ impl Delta {
         for (at, &i) in candidates.iter().enumerate() {
             slot.insert(changes[i].key(), at);
         }
-        // Fusion by reference is decided on names, because `DepEdges` is a name graph: a mention
-        // reaches whichever namespace the referent lives in.
+        // Fused by name: `DepEdges` is a name graph, and a mention reaches either namespace.
         let mut by_name: BTreeMap<&Symbol, Vec<usize>> = BTreeMap::new();
         for (at, &i) in candidates.iter().enumerate() {
             by_name.entry(&changes[i].name).or_default().push(at);
@@ -384,7 +360,6 @@ impl Delta {
         }
     }
 
-    /// Changes that carry an actual edit.
     pub fn candidates(&self) -> usize {
         self.changes.iter().filter(|c| c.is_candidate()).count()
     }
@@ -393,9 +368,7 @@ impl Delta {
         self.clusters.is_empty()
     }
 
-    /// A candidate is preferred over a `Derived` one sharing the name: a suspect annotated
-    /// `derived` is one an agent stops reading, so where a `fn` and a `type` share a name and only
-    /// one of them was edited, the edit is what the artifact has to show.
+    /// Prefers a candidate over a `Derived` change sharing its name, so the edit is what shows.
     pub fn change(&self, name: &Symbol) -> Option<&Change> {
         self.changes
             .iter()
@@ -407,8 +380,7 @@ impl Delta {
         self.changes.iter().find(|c| c.key() == *key)
     }
 
-    /// The definitions a hybrid must take from the post-edit side, given the cluster indices the
-    /// search chose.
+    /// The definitions a hybrid takes from the post-edit side, given the chosen cluster indices.
     pub fn flipped_names(&self, flipped: &[usize]) -> Vec<Symbol> {
         let mut out: Vec<Symbol> = flipped
             .iter()
@@ -505,15 +477,12 @@ impl Baseline {
 #[derive(Clone, Debug, Default)]
 pub struct Diff {
     pub delta: Delta,
-    /// Definitions whose `Edited`/`Derived` split could not be decided, and which are therefore
-    /// candidates that may not have needed to be.
+    /// Definitions whose `Edited`/`Derived` split could not be decided.
     pub unclassified: Vec<Symbol>,
-    /// The test's own hash moved and nothing could say whether its body was edited or merely
-    /// inherited the move.
+    /// The test's own hash moved and nothing could say whether its body was edited.
     pub test_unclassified: bool,
 }
 
-/// The failing test, and the configuration to compare it against.
 pub struct Regression<'a> {
     /// `<module>.<label>`.
     pub key: &'a Symbol,
@@ -540,8 +509,7 @@ pub fn diff(regression: &Regression<'_>, classify: &mut dyn Classify, edges: &De
     keys.remove(&DefKey::value(key.clone()));
     keys.remove(&DefKey::decl(key.clone()));
 
-    // A rename moves a name and no hash, so a definition that has apparently vanished but whose
-    // hash is still somewhere in the program did not go anywhere.
+    // A rename moves a name but no hash, so a vanished name whose hash remains did not go anywhere.
     let now: BTreeSet<DefHash> = current
         .defs
         .values()
@@ -626,8 +594,7 @@ pub fn diff(regression: &Regression<'_>, classify: &mut dyn Classify, edges: &De
 pub enum Mode {
     #[default]
     Auto,
-    /// Ignore the budget, and nothing else: no precondition can be waived without inventing
-    /// evidence.
+    /// Ignore the budget, nothing else: waiving a precondition would invent evidence.
     Always,
     Never,
 }
@@ -658,13 +625,10 @@ impl Mode {
     }
 }
 
-/// What [`precheck`] decides from.
 #[derive(Clone, Copy, Debug)]
 pub struct Gate<'a> {
     pub mode: Mode,
-    /// Ply failed rather than the program.
     pub defect: bool,
-    /// The failing run reached a host handler, so re-running it acts on the world again.
     pub host: bool,
     pub nondet: bool,
     pub baseline: Option<&'a Baseline>,
@@ -688,8 +652,7 @@ impl<'a> Gate<'a> {
     }
 }
 
-/// The order is the order the answers are worth: a consumer that reads `never_passed` stops looking
-/// for a bug in the cache, and one that reads `no_bodies` goes and un-prunes it.
+/// Checked in order of what each answer is worth to a consumer.
 pub fn precheck(gate: Gate<'_>) -> Result<(), Skipped> {
     if gate.mode == Mode::Never {
         return Err(Skipped::NotRequested);
@@ -709,7 +672,6 @@ pub fn precheck(gate: Gate<'_>) -> Result<(), Skipped> {
     Ok(())
 }
 
-/// The absence of a hybrid builder.
 pub struct NoHybrid;
 
 impl Hybrid for NoHybrid {
@@ -718,17 +680,13 @@ impl Hybrid for NoHybrid {
     }
 }
 
-/// Why a hybrid could not answer the question.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Unresolved {
-    /// Old and new disagree about a signature, so this particular mixture is not a well-typed
-    /// program.
+    /// Old and new disagree about a signature, so this mixture is ill-typed.
     DoesNotCheck,
     /// It failed, but not with the failure being explained.
     DifferentFailure,
-    /// The store cannot produce a body for some hash this mixture needs.
     MissingBody,
-    /// The search hit its budget before asking.
     BudgetSpent,
 }
 
@@ -783,21 +741,18 @@ impl Trial {
     }
 }
 
-/// Builds and evaluates one hybrid program.
 pub trait Hybrid {
     fn trial(&mut self, delta: &Delta, flipped: &[usize]) -> Trial;
 }
 
-/// A cap in hybrid *evaluations*, deliberately not in seconds: a failure artifact that varies with
-/// machine load is not one an agent can diff against yesterday's.
+/// A cap in hybrid *evaluations*, not seconds, so the artifact does not vary with machine load.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Budget {
     pub max_trials: usize,
 }
 
 impl Budget {
-    /// Enough for a clean bisection over roughly 2^30 candidates, and small enough that a
-    /// pathological search cannot outlast the test run it explains.
+    /// Enough for a clean bisection over ~2^30 candidates, small enough not to outlast the run.
     pub const DEFAULT: Budget = Budget { max_trials: 64 };
 
     pub fn new(max_trials: usize) -> Budget {
@@ -822,36 +777,28 @@ pub struct SearchStats {
     pub clusters: usize,
     /// Hybrids actually built and run.
     pub evaluated: usize,
-    /// Hybrids the result cache answered for free.
     pub cached: usize,
     /// Subsets the search would have asked about twice.
     pub memoized: usize,
     pub unresolved: usize,
-    /// The budget ran out before the search finished, so the result is a superset of the cause
-    /// rather than a minimal set.
+    /// The budget ran out, so the result is a superset of the cause rather than a minimal set.
     pub exhausted: bool,
 }
 
-/// What was skipped, and why.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Skipped {
     /// `--bisect=never`, or a run that never asked.
     NotRequested,
-    /// This test key has no recorded pass.
     NeverPassed,
-    /// The failing run reached a host handler.
     Host,
-    /// `test/nondet` outcomes are not a function of the definition set, so a hybrid's answer would
-    /// not be evidence about anything.
+    /// `test/nondet` outcomes are not a function of the definition set, so a hybrid proves nothing.
     Nondet,
-    /// The evaluator failed rather than the program: it unwound, or it reported one of its own
-    /// invariants broken.
     Panicked,
     /// Baseline and current agree on every definition in the closure.
     NoChanges,
     /// The store cannot produce the bodies a hybrid needs.
     NoBodies,
-    /// The bodies are there, but this build has no way to assemble them into a mixed program.
+    /// The bodies are there, but this build cannot assemble them into a mixed program.
     NoHybrids,
 }
 
@@ -899,17 +846,13 @@ impl Skipped {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Verdict {
-    /// The search ran and narrowed the change set.
     Bisected,
     /// Exactly one change could be flipped, so the answer needed no runs at all.
     Sole,
-    /// The baseline definitions with this test's current body already fail: the edit to the test is
-    /// the change that matters.
+    /// The baseline definitions with this test's current body already fail: the test edit matters.
     TestChanged,
-    /// The same, but the test was not edited — so nothing in the definition graph explains this
-    /// failure.
+    /// The same, but the test was not edited, so nothing in the definition graph explains it.
     NotInTheGraph,
-    /// The current program did not reproduce the failure when replayed.
     NotReproduced,
     /// Every hybrid the search could form was unresolved.
     Inconclusive,
@@ -948,14 +891,11 @@ impl Verdict {
 /// How much the culprit set may be trusted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Confidence {
-    /// One definition per group, and dropping any group makes the failure go away: the set is
-    /// 1-minimal.
+    /// One definition per group, and dropping any group makes the failure go away: 1-minimal.
     Minimal,
     /// Some group could not be split, because its members' interfaces changed together.
     Fused,
-    /// The search stopped early.
     Partial,
-    /// No search ran.
     None,
 }
 
@@ -970,7 +910,6 @@ impl Confidence {
     }
 }
 
-/// The result of attributing one failure to a change.
 #[derive(Clone, Debug)]
 pub struct Bisection {
     pub verdict: Verdict,
@@ -1039,16 +978,13 @@ impl Search<'_> {
     fn run(&mut self) -> Bisection {
         let n = self.delta.clusters.len();
         if n == 0 {
-            // Nothing to flip.
             return match &self.delta.test {
                 Some(test) => self.test_changed(test.name.clone()),
                 None => Bisection::not_attempted(Skipped::NoChanges),
             };
         }
         if n == 1 {
-            // One cluster is answered for free — unless the test was edited too, in which case the
-            // one definition that moved may be innocent and `H(∅)` is the question that separates
-            // them.
+            // One cluster is free unless the test was edited too; then `H(∅)` tells the two apart.
             let sole = self.delta.test.is_none() || self.ask(&[]) != TrialOutcome::Fails;
             let cluster = &self.delta.clusters[0];
             if sole {
@@ -1116,9 +1052,7 @@ impl Search<'_> {
             .map(|&i| self.delta.clusters[i].members.clone())
             .collect();
 
-        // Narrowing nothing while walking around unanswerable mixtures is not a bisection, and
-        // calling it one would have a consumer act on the whole change set as if the search had
-        // endorsed it.
+        // Narrowing nothing around unanswerable mixtures is not a bisection.
         if minimal.len() == n && self.stats.unresolved > 0 {
             return self.conclude(
                 Verdict::Inconclusive,
@@ -1143,9 +1077,7 @@ impl Search<'_> {
         self.conclude(Verdict::Bisected, groups, reason)
     }
 
-    /// A group of more than one is an answer a consumer has to read differently, so the artifact
-    /// says which constraint fused it rather than leaving the reader to guess whether the search
-    /// failed or the graph forbade the split.
+    /// The constraint that fused a multi-member group, so it is not read as a failed search.
     fn fused_because(&self) -> Option<&'static str> {
         let mut reasons: Vec<FusionReason> = self
             .delta
@@ -1173,8 +1105,7 @@ impl Search<'_> {
         )
     }
 
-    /// Zeller's ddmin over cluster indices, with the outcome three-valued so an unresolved mixture
-    /// simply is not evidence and the partition refines past it.
+    /// Zeller's ddmin over cluster indices, three-valued so an unresolved mixture is not evidence.
     fn ddmin(&mut self, mut set: Vec<usize>) -> Vec<usize> {
         let mut parts = 2usize;
         'outer: while set.len() > 1 && !self.stats.exhausted {
@@ -1241,9 +1172,7 @@ impl Search<'_> {
     }
 
     fn conclude(&self, verdict: Verdict, groups: Vec<Vec<Symbol>>, reason: String) -> Bisection {
-        // An unresolved trial anywhere disqualifies the minimality claim, even one off the path to
-        // the answer: the search walked around a question it could not ask, so it cannot say that
-        // dropping any group would make the failure go away.
+        // Any unresolved trial disqualifies minimality: the search walked around a question.
         let confidence = if groups.is_empty() {
             Confidence::None
         } else if self.stats.exhausted || self.stats.unresolved > 0 || self.delta.unclassified > 0 {
@@ -1267,8 +1196,7 @@ impl Search<'_> {
     }
 }
 
-/// Near-equal chunks in index order, so a run's partition — and therefore its trial sequence — is
-/// reproducible.
+/// Near-equal chunks in index order, so the trial sequence is reproducible.
 fn split(set: &[usize], parts: usize) -> Vec<Vec<usize>> {
     let parts = parts.clamp(1, set.len().max(1));
     let mut chunks = Vec::with_capacity(parts);

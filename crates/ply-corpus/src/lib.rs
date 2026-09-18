@@ -29,8 +29,7 @@ use ply_eval::Plan;
 use ply_store::Store;
 use std::path::Path;
 
-/// The honest default tier: what every run here evaluates on under tier-only (ADR 0048), since a
-/// bare machine has no front end and declines everything.
+/// The default tier; a bare machine has no front end and declines everything.
 pub(crate) fn honest() -> ply_eval::BackendSpec {
     ply_eval::BackendSpec {
         kind: ply_eval::BackendKind::C,
@@ -38,8 +37,7 @@ pub(crate) fn honest() -> ply_eval::BackendSpec {
     }
 }
 
-/// A machine over the program with the default tier attached, produced from the module texts
-/// `sources` holds.
+/// A machine over the program with the default tier attached.
 pub fn tier_machine<'a>(
     program: &'a ply_syntax::ast::Program,
     resolved: &'a ply_syntax::resolve::Resolved,
@@ -75,12 +73,7 @@ pub fn run_on_tier(
 }
 
 /// Runs `f` on a thread with a stack deep enough for the tier's longest legal recursion.
-///
-/// The compiled tier recurses on the native C stack (ADR 0048), where the interpreter recursed on
-/// the heap, and the language's call limit is `ply_eval::limit::DEFAULT_MAX_CALLS`. A benchmark
-/// that drives a loop written as tail recursion that deep needs the room the CLI's own worker pool
-/// gives it (`ply-cli`'s `WORKER_STACK`); a 2 MiB `cargo test` thread overflows first and the tier
-/// raises its recursion limit early. This is the harness's equivalent of that pool.
+/// The compiled tier recurses on the native stack; this mirrors `ply-cli`'s `WORKER_STACK`.
 pub fn on_deep_stack<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     const DEEP_STACK: usize = 256 << 20;
     std::thread::scope(|scope| {
@@ -103,8 +96,7 @@ pub struct Verified {
     pub failed: usize,
     pub groups: usize,
     pub largest_group: usize,
-    /// Tests whose footprint carries `sim.read` — the ones whose result is a function of the
-    /// definition set *and* a seed.
+    /// Tests whose footprint carries `sim.read`, so their result depends on a seed.
     pub seeded: usize,
 }
 
