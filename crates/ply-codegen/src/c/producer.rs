@@ -511,6 +511,18 @@ pub fn front_dump(sources: &[(String, String)]) -> Result<String> {
         census.modules += sources.len();
         c.set(census);
     });
+    dump_over(FRONT, sources)
+}
+
+/// What the prover's static tier reads, as `ply_prove::prove::read_claims` reads it.
+const CLAIMS: &str = "front.claims_dump";
+
+/// Every body, clause and law of a program [`front`] already checked, lowered.
+pub fn claims_dump(sources: &[(String, String)]) -> Result<String> {
+    dump_over(CLAIMS, sources)
+}
+
+fn dump_over(entry: &str, sources: &[(String, String)]) -> Result<String> {
     let records: Vec<Value> = sources
         .iter()
         .map(|(name, src)| {
@@ -520,10 +532,10 @@ pub fn front_dump(sources: &[(String, String)]) -> Result<String> {
             ])))
         })
         .collect();
-    let answer = call(FRONT, &[Value::list(records)])?;
+    let answer = call(entry, &[Value::list(records)])?;
     let Value::Str(dump) = &answer else {
         bail!(
-            "`{FRONT}` answered a {} rather than a string",
+            "`{entry}` answered a {} rather than a string",
             answer.type_name()
         );
     };

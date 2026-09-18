@@ -2,7 +2,7 @@
 
 use super::common::{
     IND, diagnostic_json, diagnostics_json, emit_json, millis, once_each, plural,
-    print_diagnostics, print_warnings, report_bind_error,
+    print_diagnostics, print_warnings, report_bind_error, report_load_error,
 };
 use super::prove::{
     coverage_json, diagnostics, evidence_summary, gap_summary, law_labels, load_complete,
@@ -87,14 +87,11 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
             return report_bind_error("review", &[diagnostic], &loaded.sources, args.json, style);
         }
     };
-    let engine = crate::engine::of(
-        &loaded.program,
-        &loaded.resolved,
-        &loaded.check,
-        // `ply review` binds nothing, so a `law/host` is a gap, as under a hermetic `ply prove`.
-        None,
-        backend,
-    );
+    // `ply review` binds nothing, so a `law/host` is a gap, as under a hermetic `ply prove`.
+    let engine = match crate::engine::of(&loaded, None, backend) {
+        Ok(engine) => engine,
+        Err(err) => return report_load_error("review", &err, args.json, style),
+    };
     let mut proved = obligation::prove(
         collected.obligations,
         &scoped,
