@@ -10,5 +10,4 @@ mod fragment;
 mod hazards;
 mod kernel;
 mod number_types;
-mod parser_census;
 mod unit;

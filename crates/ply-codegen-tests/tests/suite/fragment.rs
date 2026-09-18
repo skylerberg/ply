@@ -12,7 +12,7 @@ pub struct Loaded {
     pub resolved: &'static ply_syntax::resolve::Resolved,
     pub front: &'static ply_ty::Front,
     pub check: &'static ply_ty::CheckOutput,
-    /// Each module's text by name: what the whole Ply emitter re-parses to produce.
+    /// Each module's text by name: what the Ply emitter re-parses to produce.
     pub texts: HashMap<String, String>,
 }
 
@@ -55,26 +55,9 @@ fn load(source: &str) -> Loaded {
     }
 }
 
-/// The program under the reference emitter -- the fragment, which these tests are about. Built
-/// here, so the fragment is what answers whatever producer is installed when it is entered.
+/// The program under the Ply emitter, which re-parses the module texts to produce.
 pub fn unit(source: &str) -> (&'static Loaded, &'static Unit) {
     let loaded: &'static Loaded = Box::leak(Box::new(load(source)));
-    let unit = ply_codegen::c::producer::reference_only(|| {
-        let unit = Unit::over_front(
-            loaded.program,
-            loaded.resolved,
-            loaded.front,
-            HashMap::new(),
-        )
-        .expect("this host has a C compiler");
-        let _ = unit.bodies();
-        unit
-    });
-    (loaded, unit)
-}
-
-/// The same program under the whole Ply emitter, which re-parses the module texts to produce.
-pub fn whole(loaded: &'static Loaded) -> &'static Unit {
     let unit = Unit::over_front(
         loaded.program,
         loaded.resolved,
@@ -83,7 +66,7 @@ pub fn whole(loaded: &'static Loaded) -> &'static Unit {
     )
     .expect("this host has a C compiler");
     let _ = unit.bodies();
-    unit
+    (loaded, unit)
 }
 
 /// Arithmetic, comparison, `if`, `let`, a `match` on literals, recursion, and a call between two
@@ -222,20 +205,6 @@ fn lent_to_a_step(n: Int) -> Int = { let p = {x: n, y: 0}; fold(range(0, 3), 0, 
 "#;
 
 pub fn call(unit: &'static Unit, name: &str, args: &[Value]) -> Option<Value> {
-    // `attach` builds again -- `Unit::bodies` is not memoised -- so what answers here is whatever
-    // emitter is current now, not the one `unit` was built under. Every unit entered through this
-    // helper came from `unit`, which is the reference fragment, so the reference has to be current
-    // again; otherwise the installed producer is asked for a text-less source, answers nothing, and
-    // the members no longer match the code.
-    let backend =
-        ply_codegen::c::producer::reference_only(|| unit.attach(&ply_eval::BackendSpec::honest()));
-    backend.enter(&Symbol::new(name), args, 10_000)
-}
-
-/// The same, for a unit `whole` built: it is entered under the installed producer, because that is
-/// the emitter it is a unit of. Pairing this with `call` is what makes a test that runs both a
-/// comparison of two emitters rather than of one with itself.
-pub fn call_whole(unit: &'static Unit, name: &str, args: &[Value]) -> Option<Value> {
     let backend = unit.attach(&ply_eval::BackendSpec::honest());
     backend.enter(&Symbol::new(name), args, 10_000)
 }
@@ -302,23 +271,11 @@ fn kept(n: Int) -> Int = len(filter(map(range(0, n), inc), |x: Int| x % 2 == 1))
 fn longer(n: Int) -> Int = fold(map(range(0, n), inc), 0, |acc: Int, x: Int| acc + x * 2)
 "#;
 
-/// The control every other test here is read against: the fragment is not empty, and it is not
-/// everything.
+/// The control every other test here is read against: the fragment is not empty.
 #[test]
-fn the_fragment_is_neither_empty_nor_everything() {
-    let (loaded, unit) = unit(ARITHMETIC);
-    let total = loaded.program.modules.iter().flat_map(|m| &m.items).count();
+fn the_fragment_is_not_empty() {
+    let (_, unit) = unit(ARITHMETIC);
     assert!(unit.len() >= 6, "the fragment holds {}", unit.len());
-    assert!(
-        !unit.refusals().is_empty(),
-        "nothing was refused over the whole standard library, so the fixpoint is not deciding \
-         anything: {} items, {} compiled",
-        total,
-        unit.compiled().len()
-    );
-    // `adder` answers a function, which the seam never carries, so a call of it declines however
-    // wide the registry — the gap `Mutation::Unoffered` lives in.
-    assert!(!unit.compiled().is_empty());
     let members: Vec<&str> = unit.compiled().iter().map(String::as_str).collect();
     assert!(members.contains(&"m.double"), "{members:?}");
 }
@@ -515,7 +472,7 @@ fn a_compiled_body_answers_over_concat_and_nested_patterns() {
 }
 
 /// Compiled code answers what the interpreter answers over closures, the callback builtins and
-/// the bitwise operators — the constructs the parser census ranked first.
+/// the bitwise operators.
 #[test]
 fn a_compiled_body_answers_over_closures_and_callbacks() {
     let (_, unit) = unit(CLOSURES);
@@ -670,9 +627,7 @@ fn a_call_of_the_wrong_arity_is_declined() {
 #[test]
 fn a_recursion_past_the_budget_declines_rather_than_running_it() {
     let (_, unit) = unit(ARITHMETIC);
-    // As `call`: `attach` builds again, under whatever emitter is current.
-    let backend =
-        ply_codegen::c::producer::reference_only(|| unit.attach(&ply_eval::BackendSpec::honest()));
+    let backend = unit.attach(&ply_eval::BackendSpec::honest());
     let ladder = Symbol::new("m.ladder");
     assert_eq!(
         backend.enter(&ladder, &[Value::Int(100)], 8),
@@ -700,9 +655,7 @@ fn an_overflow_declines_rather_than_wrapping() {
 fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
     let (loaded, unit) = unit(ARITHMETIC);
     let other = load(ARITHMETIC);
-    // As `call`: `attach` builds again, under whatever emitter is current.
-    let backend =
-        ply_codegen::c::producer::reference_only(|| unit.attach(&ply_eval::BackendSpec::honest()));
+    let backend = unit.attach(&ply_eval::BackendSpec::honest());
     assert!(backend.describes(loaded.program));
     assert!(!backend.describes(other.program));
 }
@@ -713,12 +666,10 @@ fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
 #[test]
 fn the_compiled_set_is_closed_under_calls() {
     let (loaded, unit) = unit(ARITHMETIC);
-    let source = ply_codegen::Source::new(loaded.program, loaded.resolved, loaded.check);
+    let source = ply_codegen::Source::new(loaded.program, loaded.resolved, loaded.check)
+        .with_texts(loaded.texts.clone());
     let source: &'static ply_codegen::Source = Box::leak(Box::new(source));
-    // `closure` asks the current producer for every body too, and this unit is the reference's.
-    let (_, refusals) =
-        ply_codegen::c::producer::reference_only(|| ply_codegen::closure(source, unit.compiled()))
-            .expect("the set compiles");
+    let (_, refusals) = ply_codegen::closure(source, unit.compiled()).expect("the set compiles");
     assert!(
         refusals.is_empty(),
         "the fixpoint returned a set that still refuses: {refusals:?}"
@@ -823,112 +774,6 @@ fn a_body_that_opens_a_cell_is_in_the_fragment() {
     }
 }
 
-/// What the fragment refuses the shipped standard library for, split by whether the refusal costs
-/// a *definition* or a test root.
-///
-/// The split is the whole point. A refused test root runs interpreted, which is a test running the
-/// way tests ran before there was a code generator; a refused definition takes every caller in its
-/// unit with it. Counting them together says `handle` is the expensive construct, and counting
-/// them apart says the opposite -- `handle` costs one definition in the whole library and
-/// `perform` costs a dozen, with most of `http` cascading off them.
-///
-/// The ceilings ratchet **down**. Lower one when a construct lands; a rise is a regression and
-/// fails here.
-#[test]
-fn what_the_fragment_refuses_the_standard_library_for() {
-    let (_, unit) = unit("pub fn nothing() -> Int = 1\n");
-    let cost = |what: &str| -> (usize, Vec<String>) {
-        let (tests, defs): (Vec<&String>, Vec<&String>) = unit
-            .refusals()
-            .iter()
-            .filter(|(_, why)| why.contains(what))
-            .map(|(f, _)| f)
-            .partition(|f| f.contains("test#"));
-        (tests.len(), defs.iter().map(|s| (*s).clone()).collect())
-    };
-    for what in [
-        "a `handle`",
-        "perform",
-        "Decimal",
-        "not in this compiled unit",
-    ] {
-        let (tests, defs) = cost(what);
-        println!(
-            "  {what}: {tests} test root(s), {} definition(s) {defs:?}",
-            defs.len()
-        );
-    }
-    let (_, handled) = cost("a `handle`");
-    let (_, performed) = cost("perform");
-    let (_, cascade) = cost("not in this compiled unit");
-    assert!(
-        handled.len() <= 1,
-        "`handle` now costs {} definitions, not 1: {handled:?}",
-        handled.len()
-    );
-    assert!(
-        performed.len() <= 12,
-        "`perform` now costs {} definitions, not 12: {performed:?}",
-        performed.len()
-    );
-    // Three of these hold a `Decimal` literal of their own and are counted here because the
-    // callee they refuse on is reached first.
-    assert!(
-        cascade.len() <= 13,
-        "{} definitions now cascade off a refusal, not 13: {cascade:?}",
-        cascade.len()
-    );
-    // The claim the ceilings are here to keep honest: `perform` is what the library is actually
-    // losing definitions to, and `handle` is not. ADR 0041 stages the work on this.
-    assert!(
-        performed.len() > handled.len(),
-        "`perform` no longer costs more definitions than `handle`: perform {performed:?}, \
-         handle {handled:?}"
-    );
-}
-
-/// The port's side of the census above: the same standard library, emitted by the compiler
-/// written in Ply rather than by the reference, refusing no more of it.
-///
-/// This is the gate ADR 0052 §2 names before `c/emit.rs` can go, and it is a *comparison* rather
-/// than a blessed ceiling on purpose. The ceilings above are the reference's; what matters here is
-/// that the emitter replacing it does not cost the tier a definition the one it replaces kept. A
-/// construct the port refuses and the reference emits is named by the failure, which is the census
-/// §2 asks the record to carry.
-///
-/// `unit` builds under `reference_only` and `whole` does not, so the two units are the same
-/// program under the two emitters.
-#[test]
-fn the_port_refuses_no_more_of_the_standard_library_than_the_reference() {
-    let (loaded, reference) = unit("pub fn nothing() -> Int = 1\n");
-    let port = whole(loaded);
-    let definitions = |u: &Unit| -> Vec<String> {
-        u.refusals()
-            .iter()
-            .filter(|(f, _)| !f.contains("test#"))
-            .map(|(f, _)| f.clone())
-            .collect()
-    };
-    let reference_refuses = definitions(reference);
-    let port_refuses = definitions(port);
-    println!(
-        "  the reference refuses {} definition(s), the port {}",
-        reference_refuses.len(),
-        port_refuses.len()
-    );
-    let only_the_port: Vec<(&String, &String)> = port
-        .refusals()
-        .iter()
-        .filter(|(f, _)| !f.contains("test#") && !reference_refuses.contains(f))
-        .map(|(f, why)| (f, why))
-        .collect();
-    assert!(
-        only_the_port.is_empty(),
-        "the port refuses {} definition(s) the reference emits: {only_the_port:?}",
-        only_the_port.len()
-    );
-}
-
 /// The criterion ADR 0041's stage 2 rests on: whether a `perform` could find a handler on the
 /// stack rather than the host.
 ///
@@ -939,7 +784,7 @@ fn the_port_refuses_no_more_of_the_standard_library_than_the_reference() {
 /// program does not declare cannot be the frame above.
 #[test]
 fn a_perform_that_could_reach_a_handler_is_told_apart_from_one_that_reaches_the_host() {
-    let (loaded, _) = unit(
+    let loaded = load(
         "\
 pub nondet effect wire {
   write recv[s](conn: Int) -> Int

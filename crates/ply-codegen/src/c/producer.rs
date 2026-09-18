@@ -89,9 +89,14 @@ pub fn install_sources(src: Sources) {
     if installed() {
         return;
     }
-    let identity = digest_of(&modules_of(&src));
+    let identity = identity_of(&src);
     let _ = EMITTER.set(emitter_of(&src, &identity));
-    install(Arc::new(move || build_from(&src)), identity);
+    install(Arc::new(move || build(&src)), identity);
+}
+
+/// The digest the emitter `src` holds keys its bodies under.
+pub fn identity_of(src: &Sources) -> String {
+    digest_of(&modules_of(src))
 }
 
 /// A working copy is served by its own bundle, or by the committed one as is or emitting it.
@@ -154,25 +159,26 @@ fn modules_of(src: &Sources) -> Vec<(String, String)> {
 /// **committed** emitter this binary carries, handed over for the build. A working copy is the
 /// ordinary case: `PLY_C_EMITTER=ply:<dir>` names one before a bundle is bootstrapped for it, and
 /// what stands it up is the emitter already in hand, not the Rust chain (ADR 0052 §2).
-fn build_from(src: &Sources) -> Result<PlyProducer, String> {
+pub fn build(src: &Sources) -> Result<PlyProducer, String> {
     let from_committed = || -> Result<(super::Native, Vec<super::Refused>), String> {
         let carried = super::bundle::of(&Sources::Embedded)
             .ok_or_else(|| "this binary carries no bootstrap bundle".to_string())?;
         let (native, refused) = super::bundle::build(&carried).map_err(|e| {
             format!(
-                "the committed bundle does not serve this runtime either: {e:#}. Refresh it with \
+                "the committed bundle does not serve this runtime either: {e:#}. Check out an \
+                 older bundle this runtime serves from git history, then refresh it with \
                  `PLY_C_BOOTSTRAP_REFRESH=1 cargo nextest run -p ply-codegen-tests --test bootstrap`"
             )
         })?;
         // A working copy holding the sources the bundle was emitted from *is* that bundle, which
         // the fixpoint test asserts, so emitting them again answers the same unit for a minute of
         // work. Only a working copy that differs is worth standing an emitter up for.
-        let theirs = digest_of(&modules_of(src));
+        let theirs = identity_of(src);
         if carried.sources_digest() == Some(theirs.as_str()) {
             return Ok((native, refused));
         }
         let first = PlyProducer::new(native).map_err(|e| format!("{e:#}"))?;
-        let identity = digest_of(&modules_of(&Sources::Embedded));
+        let identity = identity_of(&Sources::Embedded);
         with_producer(first, identity, || {
             let source = front_end(src)?;
             let names: Vec<String> = source.functions();
@@ -220,7 +226,7 @@ fn build_from(src: &Sources) -> Result<PlyProducer, String> {
 
 /// The emitter's own program through the front end, keyed as the cache keys it, with the modules
 /// as `SourceId(0..n)` in `modules_of`'s order. The check and the hashes come from the emitter
-/// handed over by [`build_from`]: the port answers for the program it is about to become.
+/// handed over by [`build`]: the port answers for the program it is about to become.
 fn front_end(src: &Sources) -> Result<&'static Source, String> {
     let modules = modules_of(src);
     let ids: Vec<SourceId> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
