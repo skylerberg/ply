@@ -13,7 +13,6 @@ pub use rust_decimal::Decimal;
 use std::cell::RefCell;
 
 thread_local! {
-    /// Every nullary constructor's payload, built once per thread.
     static NO_ARGS: Arc<Vec<Value>> = Arc::new(Vec::new());
 }
 use std::cmp::Ordering;
@@ -24,7 +23,6 @@ use std::sync::Arc;
 
 pub use crate::list::List;
 
-/// The `Map` primitive's representation.
 pub type Map = RedBlackTreeMap<Value, Value>;
 
 const RENDER_MAX_ITEMS: usize = 32;
@@ -36,11 +34,6 @@ thread_local! {
 }
 
 /// A record's fields, sorted by name.
-///
-/// A flat vector rather than a `BTreeMap`: a record is built once and then read, its field set is
-/// statically known wherever its type is, and the tree cost an allocation per field plus a pointer
-/// chase per lookup. Iteration order is the same — both order by `Symbol`'s `Ord` — so nothing that
-/// compares, hashes or prints a record moves.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Fields(Vec<(Symbol, Value)>);
 
@@ -76,7 +69,6 @@ impl Fields {
         self.0.is_empty()
     }
 
-    /// Adds or replaces one field, keeping the vector sorted.
     pub fn insert(&mut self, name: Symbol, value: Value) -> Option<Value> {
         match self.0.binary_search_by(|(k, _)| k.cmp(&name)) {
             Ok(i) => Some(std::mem::replace(&mut self.0[i].1, value)),
@@ -91,7 +83,7 @@ impl Fields {
         self.0.into_iter().map(|(_, v)| v)
     }
 
-    /// Replaces one field's value, leaving the field set alone. `None` when the name is absent.
+    /// Replaces an existing field's value; `None` when the name is absent.
     pub fn set(&mut self, name: &Symbol, value: Value) -> Option<Value> {
         let i = self.0.binary_search_by(|(k, _)| k.cmp(name)).ok()?;
         Some(std::mem::replace(&mut self.0[i].1, value))
@@ -106,9 +98,7 @@ impl std::ops::Index<&Symbol> for Fields {
 }
 
 impl Fields {
-    /// The fields in any order, sorted in place: a literal's frame hands over the vector it
-    /// collected the values into, and that vector is the record's storage — no second one.
-    /// Later entries win, which is what collecting into a `BTreeMap` did.
+    /// Sorts `v` in place to become the record's storage; later duplicates win.
     pub fn from_unsorted(mut v: Vec<(Symbol, Value)>) -> Fields {
         v.sort_by(|(a, _), (b, _)| a.cmp(b));
         v.dedup_by(|later, earlier| {
@@ -144,20 +134,11 @@ impl<'a> IntoIterator for &'a Fields {
 #[derive(Clone, Default)]
 pub enum Value {
     Int(i64),
-    /// A fixed-width integer, and which of the eight it is. The type is carried on the value
-    /// because arithmetic is dispatched on the value here — `wrap_add` at `U8` and at `U32` are
-    /// different answers to the same call — and because the differential oracle compares values,
-    /// not the types the checker gave them.
     Fixed(Fixed),
     Bool(bool),
-    /// IEEE-754 binary64, unmodified.
     Float(f64),
-    /// Exact base ten: sign, a 96-bit mantissa and a scale of `0..=28`.
     Decimal(Decimal),
     Str(Arc<str>),
-    /// Mirrors [`Value::Str`] exactly, deliberately: what `bytes::Bytes` buys is cheap slicing of a
-    /// shared buffer, which W3's streaming bodies want and W1 does not, and it would put a type
-    /// carrying its own refcount semantics into the enum the hygiene rules are written against.
     Bytes(Arc<[u8]>),
     #[default]
     Unit,
@@ -170,19 +151,11 @@ pub enum Value {
         args: Arc<Vec<Value>>,
     },
     Closure(Arc<Closure>),
-    /// A slot in the region that allocated it, not a pointer into it: an index and a generation, so
-    /// a cell whose region has closed reads `None` rather than aliasing whatever was allocated in
-    /// its place.
+    /// An index and generation, so a cell of a closed region reads `None` instead of aliasing.
     Cell(Slot),
-    /// A handle on a task, and a key into its region's scheduler for the same reason
-    /// [`Value::Cell`] is one: a key cannot dangle, two keys cannot alias, and identity is integer
-    /// comparison.
     Task(TaskId),
-    /// A captured continuation.
     Continuation(Rc<Continuation>),
-    /// A credential, and a **distinct variant** rather than a `Ctor { name: "Secret", .. }`, which
-    /// is the single most important line of the secret containment claim: a `Ctor` is matchable, and `match s {
-    /// Secret(plain) -> plain }` would be a one-line escape from every guarantee below.
+    /// A credential; a distinct variant rather than a `Ctor`, so no pattern match can unwrap it.
     Secret(Arc<Value>),
 }
 
@@ -195,23 +168,17 @@ pub enum ClosureKind {
     Fn {
         params: Vec<Symbol>,
         body: Arc<Expr>,
-        /// External bindings the body reads by name, lowered as leading parameters when the
-        /// machine enters it.
+        /// External bindings the body reads by name, lowered as leading parameters.
         bindings: Vec<(Symbol, Value)>,
-        /// Index into `Program::modules`: the scope the body's bare names are resolved in, which
-        /// travels with the closure rather than the caller.
+        /// Index into `Program::modules`: where the body's bare names resolve.
         module: usize,
     },
-    /// A generator deep-clones an `Expr` per closure; the machine lowers once and every closure
-    /// after that is a pointer.
     Code {
         params: Rc<Vec<Symbol>>,
         body: Code,
         /// The body's window size.
         size: u32,
-        /// Which slots the captured values fill, and their names.
         captures: Rc<crate::code::Captures>,
-        /// The captured free-variable values, copied out of the defining window.
         captured: Rc<[Value]>,
         module: usize,
     },
@@ -220,10 +187,7 @@ pub enum ClosureKind {
         arity: usize,
     },
     Builtin(Builtin),
-    /// A closure a code generator built inside a compiled body: `code` is the address of a
-    /// compiled function taking `captured` as its leading arguments. It lives only inside the
-    /// entry that made it — the seam carries no function either way — so the machine never
-    /// enters one.
+    /// A compiled function taking `captured` as leading arguments; the machine never enters one.
     Native {
         code: usize,
         arity: usize,
@@ -256,9 +220,7 @@ impl Closure {
 }
 
 impl Value {
-    // The four constructors below are never inlined: `r4_value_construction` attributes the
-    // request path's allocations by the frame that made them, and an inlined constructor
-    // disappears from the backtrace and lands in "unattributed".
+    // Never inlined, so allocation attribution by backtrace sees these frames.
     #[inline(never)]
     pub fn str(s: impl AsRef<str>) -> Value {
         Value::Str(Arc::from(s.as_ref()))
@@ -278,8 +240,7 @@ impl Value {
         Value::Map(Map::new())
     }
 
-    /// Later entries win, which is what makes this a fold of `map_insert` and therefore the same
-    /// rule `map_of_entries` and `map_merge` follow.
+    /// Later entries win, as in a fold of `map_insert`.
     pub fn map(entries: impl IntoIterator<Item = (Value, Value)>) -> Value {
         let mut m = Map::new();
         for (k, v) in entries {
@@ -288,8 +249,6 @@ impl Value {
         Value::Map(m)
     }
 
-    /// A constructor over the vector its arguments were collected into — that vector is the
-    /// payload. A nullary constructor's payload is the thread's one shared empty vector.
     #[inline(never)]
     pub fn ctor(name: impl Into<Symbol>, args: Vec<Value>) -> Value {
         let args = if args.is_empty() {
@@ -303,9 +262,7 @@ impl Value {
         }
     }
 
-    /// `ctor` for arguments that arrived in a pooled buffer: the payload is an exact vector of its
-    /// own and the buffer goes back to the pool, so a constructor call does not drain the pool
-    /// the next call's arguments would have come from.
+    /// `ctor` for a pooled buffer: copies into an exact payload and returns the buffer.
     pub fn ctor_pooled(name: impl Into<Symbol>, mut args: Vec<Value>) -> Value {
         let mut payload = Vec::with_capacity(args.len());
         payload.append(&mut args);
@@ -313,7 +270,6 @@ impl Value {
         Value::ctor(name, payload)
     }
 
-    /// One `Value` per builtin per thread, built on first reference.
     pub fn builtin(b: Builtin) -> Value {
         let fresh = || {
             Value::Closure(Arc::new(Closure {
@@ -321,8 +277,7 @@ impl Value {
                 kind: ClosureKind::Builtin(b),
             }))
         };
-        // `try_with`, because a value dropped during thread-local teardown can reach here after the
-        // cache is gone, and building a fresh one is the right answer there rather than an abort.
+        // `try_with`: thread-local teardown can drop a value after the cache is gone.
         BUILTIN_VALUES
             .try_with(|cache| {
                 let mut cache = cache.borrow_mut();
@@ -368,7 +323,6 @@ impl Value {
         }
     }
 
-    /// The bits of a fixed-width value, with the type they are read as.
     pub fn as_fixed(&self, span: Span, what: &str) -> Result<Fixed, Diagnostic> {
         match self {
             Value::Fixed(f) => Ok(*f),
@@ -454,17 +408,12 @@ impl Value {
             Value::Int(i) => {
                 let _ = write!(out, "{i}");
             }
-            // The value, not the bits: `U8` renders `255` and `I8` renders `-1`. The type is not
-            // in the rendering, for the reason `Int` is not — a test's expected and actual are
-            // the same type or the program did not check.
             Value::Fixed(f) => {
                 let _ = write!(out, "{}", f.value());
             }
             Value::Bool(b) => {
                 let _ = write!(out, "{b}");
             }
-            // Never as an `Int`: a `Float` always shows a `.` or an exponent, so a rendered
-            // expected/actual pair cannot make `1` and `1.0` look like one value.
             Value::Float(f) => out.push_str(&render_float(*f)),
             // The scale as stored, so `1.50m` renders `1.50`.
             Value::Decimal(d) => {
@@ -499,8 +448,6 @@ impl Value {
                 }
                 out.push(']');
             }
-            // Key order, so two maps that are equal render identically and a failure's
-            // expected/actual pair can be read side by side.
             Value::Map(entries) => {
                 out.push('{');
                 for (i, (k, v)) in entries.iter().take(RENDER_MAX_ITEMS).enumerate() {
@@ -517,7 +464,7 @@ impl Value {
                 out.push('}');
             }
             Value::Record(fields) => {
-                // A tuple is the record `{_0: a, _1: b}` (GUIDE §5.3) and renders as it was written.
+                // A tuple is the record `{_0: a, _1: b}` and renders as one.
                 let tuple = fields.len() >= 2
                     && (0..fields.len())
                         .all(|i| fields.get(&Symbol::new(format!("_{i}"))).is_some());
@@ -572,20 +519,15 @@ impl Value {
             Value::Continuation(k) => {
                 let _ = write!(out, "<continuation {} frames>", k.frames());
             }
-            // Before the depth guard would matter and with no recursion into the payload, so the
-            // redaction is a property of this arm rather than of any bound: a `Secret` nested a
-            // thousand deep still prints this.
+            // No recursion into the payload, so the redaction holds at any depth.
             Value::Secret(_) => out.push_str(SECRET_REDACTED),
         }
     }
 }
 
-/// What a `Secret` renders as, everywhere, always.
 pub const SECRET_REDACTED: &str = "Secret(****)";
 
-/// Drop glue recurses once per level of nesting, so a value deeper than the host stack aborts the
-/// process on the way *out* — the same hole [`values_equal`] closes on the way in, and the one hole
-/// no bound can close, because a value has to be dropped whatever its depth.
+// Drop glue recurses per nesting level, so a deep value would overflow the stack when dropped.
 const DISMANTLE_KEEP: usize = 256;
 
 thread_local! {
@@ -622,7 +564,6 @@ fn nests(v: &Value) -> bool {
     }
 }
 
-/// Moves the children that can nest further onto `out`, leaving the value empty.
 fn take_children(v: &mut Value, out: &mut Vec<Value>) {
     match v {
         Value::List(xs) => {
@@ -640,9 +581,7 @@ fn take_children(v: &mut Value, out: &mut Vec<Value>) {
                 out.extend(std::mem::take(map).into_values().filter(nests));
             }
         }
-        // A map's entries cannot be moved onto the worklist: `rpds` hands out no owned iterator,
-        // and cloning them there would leave the tree holding them too, so the glue would walk the
-        // whole chain again at every level.
+        // `rpds` has no owned iterator, and cloning entries out would rewalk the tree per level.
         Value::Map(m) => {
             let taken = std::mem::replace(m, Map::new());
             grow(move || drop(taken));
@@ -687,7 +626,6 @@ fn escape(s: &str) -> String {
     out
 }
 
-/// One byte, as `b"..."` writes it.
 fn escape_byte(b: u8) -> String {
     match b {
         b'\n' => "\\n".to_string(),
@@ -700,11 +638,7 @@ fn escape_byte(b: u8) -> String {
     }
 }
 
-/// One value of one of the eight fixed-width integer types.
-///
-/// `bits` is always [`IntTy::normalize`]d, so two `Fixed` of one type are equal exactly when they
-/// are the same value, and a `Hash` derived on the pair is a hash of the value. Nothing in the
-/// tree may build one any other way; [`Fixed::new`] is the only constructor.
+/// A fixed-width integer; `bits` is always normalized, so derived `Eq` and `Hash` are by value.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Fixed {
     pub ty: IntTy,
@@ -719,8 +653,6 @@ impl Fixed {
         }
     }
 
-    /// `None` when `v` is not one of this type's values. Every conversion into a fixed-width type
-    /// that is not a deliberate truncation goes through here.
     pub fn of(ty: IntTy, v: i128) -> Option<Fixed> {
         ty.holds(v).then(|| Fixed::new(ty, v as u64))
     }
@@ -729,13 +661,12 @@ impl Fixed {
         self.bits
     }
 
-    /// The mathematical value, which is what a rendering, an ordering and an overflow report use.
+    /// The mathematical value, not the bits.
     pub fn value(self) -> i128 {
         self.ty.value(self.bits)
     }
 
-    /// The bits with nothing above this type's width — what a shift, a mask or a rotate turns on,
-    /// where a sign extension would be wrong.
+    /// The bits with nothing above this type's width, for shifts, masks and rotates.
     pub fn raw(self) -> u64 {
         if self.ty.bits() == 64 {
             self.bits
@@ -744,22 +675,13 @@ impl Fixed {
         }
     }
 
-    /// `f(a, b)` in `i128`, refused if it leaves the type -- and refused too if it leaves `i128`,
-    /// which a product of two `U64`s does: `(2^64 - 1)^2` is past `i128::MAX`. So the closure
-    /// answers with an `Option` and the caller uses `i128`'s own checked arithmetic, rather than
-    /// this relying on the wider type to be wide enough.
+    /// `f` over values in `i128`; `f` must check itself, since a `U64` product overflows `i128`.
     pub fn checked(self, other: Fixed, f: impl Fn(i128, i128) -> Option<i128>) -> Option<Fixed> {
         let v = f(self.value(), other.value())?;
         Fixed::of(self.ty, v)
     }
 
-    /// The same operation with the answer taken modulo the width: what `wrap_add` and its siblings
-    /// mean, and the only way this tree ever wraps.
-    ///
-    /// Over the *bits*, not the values. Two's complement makes `+`, `-` and `*` agree on the
-    /// pattern whether the type is signed or not, once the answer is cut to the width -- and
-    /// going through `value()` instead would have to hold a `U64` product, which no signed 128-bit
-    /// integer can.
+    /// `f` over the bits, cut to the width; two's complement makes this right when signed too.
     pub fn wrapping(self, other: Fixed, f: impl Fn(u128, u128) -> u128) -> Fixed {
         Fixed::new(self.ty, f(self.raw() as u128, other.raw() as u128) as u64)
     }
@@ -805,20 +727,16 @@ impl Ord for Value {
             (Value::Unit, Value::Unit) => Ordering::Equal,
             (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
             (Value::Int(x), Value::Int(y)) => x.cmp(y),
-            // By value rather than by bits, so `I8` orders `-1` below `0`. Two of different
-            // types cannot arrive: a map's keys are one type, and so are a comparison's operands.
+            // By value rather than by bits, so `I8` orders `-1` below `0`.
             (Value::Fixed(x), Value::Fixed(y)) => {
                 x.ty.cmp(&y.ty).then_with(|| x.value().cmp(&y.value()))
             }
-            // Total and deterministic where IEEE `<` is neither.
             (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
             // By numeric value, so `1.50m` and `1.5m` are one key.
             (Value::Decimal(x), Value::Decimal(y)) => x.cmp(y),
             (Value::Str(x), Value::Str(y)) => x.cmp(y),
             (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
-            // Every compound arm grows the host stack rather than bounding the walk: `cmp` has no
-            // way to report a refusal, and answering `Equal` past a depth would put two distinct
-            // keys in one slot.
+            // Grows the stack instead of bounding: `cmp` cannot refuse, and `Equal` merges keys.
             (Value::List(x), Value::List(y)) => grow(|| x.iter().cmp(y.iter())),
             (Value::Map(x), Value::Map(y)) => grow(|| x.iter().cmp(y.iter())),
             (Value::Record(x), Value::Record(y)) => grow(|| x.iter().cmp(y.iter())),
@@ -827,13 +745,10 @@ impl Ord for Value {
             }
             (Value::Cell(x), Value::Cell(y)) => x.cmp(y),
             (Value::Task(x), Value::Task(y)) => x.cmp(y),
-            // Unreachable from a well-typed program: `Map<Secret<a>, v>` is `E0206` because a key
-            // needs `derivable(ord, k)`, and `derive ord` and `compare_values` both refuse a
-            // `Secret`.
+            // Unreachable from a well-typed program: a `Secret` has no order.
             (Value::Secret(x), Value::Secret(y)) => grow(|| x.cmp(y)),
             (Value::Closure(_), Value::Closure(_))
             | (Value::Continuation(_), Value::Continuation(_)) => Ordering::Equal,
-            // Unreachable: the discriminants matched, so the variants did.
             _ => Ordering::Equal,
         }
     }
@@ -845,7 +760,7 @@ impl PartialOrd for Value {
     }
 }
 
-/// Rust's `==`, which is [`Ord`] and therefore **not** the language's equality.
+/// Rust's `==`, which is [`Ord`] and not the language's equality.
 impl PartialEq for Value {
     fn eq(&self, other: &Value) -> bool {
         self.cmp(other) == Ordering::Equal
@@ -854,14 +769,12 @@ impl PartialEq for Value {
 
 impl Eq for Value {}
 
-/// The one place a key enters a [`Map`] from Rust, so that the canonical form below cannot be
-/// bypassed by a seventh map builder.
+/// The one place a key enters a [`Map`] from Rust, so keys are always canonical.
 pub(crate) fn insert_key(m: &mut Map, k: Value, v: Value) {
     m.insert_mut(canonical_key(&k).unwrap_or(k), v);
 }
 
-/// The canonical member of a key's equivalence class under [`Value::cmp`], or `None` when the key
-/// already is one.
+/// The canonical member of `v`'s class under [`Value::cmp`], or `None` when `v` already is.
 pub(crate) fn canonical_key(v: &Value) -> Option<Value> {
     if is_canonical(v) {
         return None;
@@ -871,8 +784,7 @@ pub(crate) fn canonical_key(v: &Value) -> Option<Value> {
 
 fn is_canonical(v: &Value) -> bool {
     match v {
-        // `normalize` is minimal scale, which is unique per numeric value, so it is a canonical
-        // form rather than merely a smaller one.
+        // Minimal scale is unique per numeric value, so it is canonical.
         Value::Decimal(d) => d.serialize() == d.normalize().serialize(),
         Value::List(items) => grow(|| items.iter().all(is_canonical)),
         Value::Map(entries) => grow(|| {
@@ -890,8 +802,6 @@ fn canonicalize(v: &Value) -> Value {
     match v {
         Value::Decimal(d) => Value::Decimal(d.normalize()),
         Value::List(items) => grow(|| Value::list(items.iter().map(canonicalize).collect())),
-        // Rebuilt through `insert_key` rather than `insert_mut`, so that a nested map is canonical
-        // by the same rule and by the same code.
         Value::Map(entries) => grow(|| {
             let mut out = Map::new();
             for (k, val) in entries.iter() {
@@ -915,7 +825,6 @@ fn canonicalize(v: &Value) -> Value {
     }
 }
 
-/// The refusal every path that would order a credential meets.
 pub(crate) fn secret_has_no_order(v: &Value, what: &str, span: Span) -> Result<(), Diagnostic> {
     if !matches!(v, Value::Secret(_)) {
         return Ok(());
@@ -949,8 +858,7 @@ pub fn values_equal(a: &Value, b: &Value, span: Span) -> Result<bool, Diagnostic
     equal_at(a, b, span, 0)
 }
 
-/// One level down: refuses past the bound, and otherwise grows the host stack so that the bound is
-/// what a program meets.
+/// Refuses past the bound; otherwise grows the stack so the bound is what a program meets.
 fn descend(
     span: Span,
     depth: usize,
@@ -965,19 +873,13 @@ fn descend(
 fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diagnostic> {
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
-        // Both halves: a `U8` is never equal to an `I8`, which the falling-through arm would also
-        // give, and the checker refuses the comparison before it is reached.
         (Value::Fixed(x), Value::Fixed(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         // IEEE `==`, so `NaN != NaN` and `0.0 == -0.0`.
         (Value::Float(x), Value::Float(y)) => x == y,
-        // By numeric value, so `1.50m == 1.5m` — which is why the two are one map key and why
-        // `Decimal` may appear in a `proved` obligation as an uninterpreted term while `Float` may
-        // not.
+        // By numeric value, so `1.50m == 1.5m`.
         (Value::Decimal(x), Value::Decimal(y)) => x == y,
         (Value::Str(x), Value::Str(y)) => x == y,
-        // Content, not identity, and never equal to a `Str`: the two have different types, and the
-        // falling-through `_ => false` arm is what says so.
         (Value::Bytes(x), Value::Bytes(y)) => x == y,
         (Value::Unit, Value::Unit) => true,
         (Value::List(x), Value::List(y)) => {
@@ -993,7 +895,6 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
                 Ok(true)
             });
         }
-        // Length, then entries in key order.
         (Value::Map(x), Value::Map(y)) => {
             if x.size() != y.size() {
                 return Ok(false);
@@ -1035,16 +936,11 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
         }
         (Value::Cell(x), Value::Cell(y)) => x == y,
         (Value::Task(x), Value::Task(y)) => x == y,
-        // The language's `==` over two credentials, and the reason `assert_eq` over a record
-        // holding one works while printing nothing.
         (Value::Secret(x), Value::Secret(y)) => {
             return descend(span, depth, || match (&**x, &**y) {
                 (Value::Str(p), Value::Str(q)) => Ok(constant_time_eq(p.as_bytes(), q.as_bytes())),
                 (Value::Bytes(p), Value::Bytes(q)) => Ok(constant_time_eq(p, q)),
-                // No payload but a `String` is constructible — `secret_of_string` is the only
-                // introduction — so this arm is for a payload a later milestone adds, and it is
-                // structural rather than absent so that adding one cannot silently make two secrets
-                // unequal.
+                // Structural, so a new payload type cannot silently make two secrets unequal.
                 (p, q) => equal_at(p, q, span, depth + 1),
             });
         }
@@ -1061,8 +957,7 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
     })
 }
 
-/// Byte equality whose running time is a function of the lengths and not of where the first
-/// difference is.
+/// Byte equality whose time depends on the lengths, not on where they first differ.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let mut diff = (a.len() ^ b.len()) as u64;
     for i in 0..a.len().max(b.len()) {
@@ -1074,7 +969,6 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Bounded exactly as [`values_equal`] is, and for the same reason.
 pub fn first_difference(actual: &Value, expected: &Value) -> Option<(String, String, String)> {
     fn go(
         actual: &Value,
@@ -1097,8 +991,7 @@ pub fn first_difference(actual: &Value, expected: &Value) -> Option<(String, Str
                 }
                 None
             }),
-            // Only when the key sets agree, so a differing *shape* is reported as two whole maps
-            // rather than as a misaligned entry-by-entry walk.
+            // Only when key sets agree, so a differing shape reports the whole maps.
             (Value::Map(a), Value::Map(e)) if a.size() == e.size() && a.keys().eq(e.keys()) => {
                 grow(|| {
                     for ((k, x), y) in a.iter().zip(e.values()) {

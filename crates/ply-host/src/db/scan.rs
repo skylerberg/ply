@@ -1,11 +1,9 @@
-//! Which tables a statement touches, and a refusal for every statement whose answer this cannot
-//! compute.
+//! Which tables a statement touches, refusing any statement whose footprint it cannot compute.
 
 use ply_span::{Diagnostic, Span, codes};
 use std::collections::BTreeSet;
 use std::fmt;
 
-/// Statement shapes W4 admits.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Select,
@@ -26,26 +24,21 @@ impl Kind {
         }
     }
 
-    /// Whether the statement can change a row.
     pub fn writes(self) -> bool {
         matches!(self, Kind::Insert | Kind::Update | Kind::Delete)
     }
 }
 
-/// The accepted statement set, as `ply hosts` prints it.
 pub const ACCEPTED: &str = "select insert update delete values with";
 
-/// What one statement touches.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Tables {
-    /// Relations the statement can change.
     pub written: BTreeSet<String>,
-    /// Relations it reads and does not change.
+    /// Relations read but not written.
     pub read: BTreeSet<String>,
 }
 
 impl Tables {
-    /// Every relation, in one set, for the places that only need "which tables".
     pub fn all(&self) -> BTreeSet<String> {
         self.written.union(&self.read).cloned().collect()
     }
@@ -71,7 +64,6 @@ impl Tables {
     }
 }
 
-/// One statement's scan.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Scan {
     pub kind: Kind,
@@ -101,9 +93,7 @@ const NONDETERMINISTIC: &[&str] = &[
     "gen_random_uuid",
 ];
 
-/// The functions a statement may call.
 const CALLABLE: &[&str] = &[
-    // Aggregates the scanner models a footprint for.
     "avg",
     "count",
     "max",
@@ -114,7 +104,6 @@ const CALLABLE: &[&str] = &[
     "greatest",
     "least",
     "nullif",
-    // Numeric.
     "abs",
     "ceil",
     "ceiling",
@@ -129,7 +118,6 @@ const CALLABLE: &[&str] = &[
     "sign",
     "sqrt",
     "trunc",
-    // Text.
     "btrim",
     "char_length",
     "character_length",
@@ -160,8 +148,7 @@ const CALLABLE: &[&str] = &[
     "translate",
     "trim",
     "upper",
-    // json / jsonb, encode-side only: every set-returning one is a `from` item and is refused
-    // there.
+    // json / jsonb, encode-side only: set-returning ones are `from` items, refused there.
     "json_build_array",
     "json_build_object",
     "jsonb_array_length",
@@ -228,20 +215,16 @@ pub fn scan(sql: &str, span: Span) -> Result<Scan, Diagnostic> {
     }
 }
 
-// --- Tokens -----------------------------------------------------------------
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TokenKind {
     /// An identifier or a keyword.
     Word,
     Number,
-    /// A string literal, in any of postgres's spellings.
     Text,
     /// `$1`.
     Placeholder,
     Punct,
-    /// Its own kind because it is the one token whose presence is always a refusal, and the message
-    /// for it is specific.
+    /// Its own kind because it is always a refusal, with a specific message.
     Semicolon,
 }
 
@@ -288,9 +271,7 @@ fn tokenize(sql: &str, span: Span) -> Result<Vec<Token>, Diagnostic> {
                 }
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                // Postgres nests block comments, so a naive scan to the first `*/` would leave the
-                // tail of an outer comment as statement text — which is a construct the parser
-                // would then refuse, but for the wrong reason and at the wrong offset.
+                // Postgres nests block comments, so stopping at the first `*/` would leave text.
                 let start = i;
                 let mut nesting = 1usize;
                 i += 2;
@@ -489,10 +470,7 @@ fn dollar_quoted(sql: &str, open: usize, span: Span) -> Result<usize, Diagnostic
     }
 }
 
-// --- The parser -------------------------------------------------------------
-
-/// A statement nested this deep is a program the scanner will not vouch for, and a bound here is
-/// what keeps a pathological input from recursing the host's own stack.
+/// Keeps a pathological input from overflowing the host's own stack.
 const MAX_NESTING: usize = 32;
 
 struct Parser<'a> {
@@ -545,7 +523,6 @@ impl<'a> Parser<'a> {
         Err(self.here(&format!("`{p}` was expected here")))
     }
 
-    /// The statement, with its `WITH` prefix if it has one.
     fn statement(&mut self) -> Result<Scan, Diagnostic> {
         self.depth += 1;
         if self.depth > MAX_NESTING {
@@ -558,9 +535,7 @@ impl<'a> Parser<'a> {
             let recursive = self.eat_word("recursive");
             loop {
                 let name = self.identifier("a common table expression's name")?;
-                // A `recursive` CTE names itself inside its own body, so the name has to be in
-                // scope before the body is walked or the self-reference reads as a relation the
-                // database does not have.
+                // A `recursive` CTE names itself in its body, so the name is in scope first.
                 if recursive {
                     ctes.insert(name.clone());
                 }
@@ -576,8 +551,7 @@ impl<'a> Parser<'a> {
                 let inner = self.statement_within(&ctes)?;
                 self.expect_punct(")")?;
                 tables.absorb(inner.tables);
-                // Resolved to its own sources: a later reference to this name is the CTE and not a
-                // relation, and the relations it read are already in the set.
+                // Later references name the CTE, whose relations are already in the set.
                 ctes.insert(name);
                 if !self.eat_punct(",") {
                     break;
@@ -640,8 +614,6 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    // --- select ---
-
     fn select_stmt(&mut self, ctes: &BTreeSet<String>) -> Result<Tables, Diagnostic> {
         let mut tables = self.select_core(ctes)?;
         loop {
@@ -654,8 +626,7 @@ impl<'a> Parser<'a> {
             }
             break;
         }
-        // The tail clauses hold expressions and nothing that introduces a relation of its own
-        // except a scalar subquery, which `skip_expr` recurses into.
+        // Tail clauses introduce relations only via scalar subqueries, which `skip_expr` follows.
         if self.eat_word("order") {
             self.expect_word("by")?;
             self.skip_expr(
@@ -676,8 +647,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.at_word("fetch") || self.at_word("for") {
-                // `FOR UPDATE` takes a row lock, which is a write in every sense that matters to a
-                // conflict graph, and the scanner has no way to say so through a `read` atom.
+                // `FOR UPDATE` takes a row lock: a write the scanner cannot express as a read.
                 let t = self.peek().expect("checked");
                 let (start, text) = (t.start, t.display(self.sql));
                 return Err(self.refuse(
@@ -827,8 +797,7 @@ impl<'a> Parser<'a> {
         }
         self.eat_word("only");
         let name = self.qualified_name("a table name")?;
-        // `f(x)` in a from position is a set-returning function, whose relations are inside a
-        // function body no scanner can see.
+        // `f(x)` in `from` is a set-returning function whose relations are invisible here.
         if self.peek().is_some_and(|t| t.is_punct("(")) {
             let start = self.peek().expect("checked").start;
             return Err(self.refuse(
@@ -844,8 +813,6 @@ impl<'a> Parser<'a> {
         self.alias()?;
         Ok(())
     }
-
-    // --- insert / update / delete ---
 
     fn insert(&mut self, ctes: &BTreeSet<String>) -> Result<Scan, Diagnostic> {
         self.expect_word("insert")?;
@@ -933,9 +900,6 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    // --- pieces ---
-
-    /// The select list, one target at a time.
     fn target_list(
         &mut self,
         ctes: &BTreeSet<String>,
@@ -944,8 +908,7 @@ impl<'a> Parser<'a> {
         loop {
             self.skip_expr(ctes, tables, CLAUSE_WORDS, true)?;
             if self.eat_word("as") {
-                // Any word: postgres reserves almost nothing after `AS`, and a refusal here would
-                // be the scanner inventing a rule.
+                // Any word: postgres reserves almost nothing after `AS`.
                 self.identifier("an output column name")?;
             }
             if !self.eat_punct(",") {
@@ -954,8 +917,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Whether the word at `self.at` opens a function call, and whether that call is one the
-    /// trusted computing base will run.
     fn check_call(&self) -> Result<(), Diagnostic> {
         let token = self.peek().expect("called with a token");
         if token.kind != TokenKind::Word || token.quoted {
@@ -979,8 +940,7 @@ impl<'a> Parser<'a> {
             .note(format!("the scanner calls: {}", CALLABLE.join(" "))))
     }
 
-    /// Walk an expression, following any subquery inside it and stopping at the next clause keyword
-    /// at depth zero.
+    /// Walk an expression, following subqueries, up to the next stop word at depth zero.
     fn skip_expr(
         &mut self,
         ctes: &BTreeSet<String>,
@@ -1054,7 +1014,7 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
-    /// `[schema.]name`, answering the **last** segment.
+    /// `[schema.]name`, answering the last segment.
     fn qualified_name(&mut self, what: &str) -> Result<String, Diagnostic> {
         let mut name = self.identifier(what)?;
         while self.peek().is_some_and(|t| t.is_punct("."))

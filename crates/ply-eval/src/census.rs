@@ -15,14 +15,12 @@ pub fn enabled() -> bool {
     ON.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Turns the census on for the rest of the process, for a harness that cannot set an environment
-/// variable before the first machine runs.
+/// For a harness that cannot set `PLY_SEAM_CENSUS` before the first machine runs.
 pub fn enable() {
     let _ = enabled();
     ON.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The raw counts, for a test that asserts on them rather than printing them.
 pub fn snapshot() -> (u64, u64, u64, BTreeMap<&'static str, u64>) {
     let c = cell().lock().expect("census");
     (
@@ -33,12 +31,10 @@ pub fn snapshot() -> (u64, u64, u64, BTreeMap<&'static str, u64>) {
     )
 }
 
-/// What the shipping type gate alone admits, for the test that reads it against `admitted`.
 pub fn type_gated_shipping() -> u64 {
     cell().lock().expect("census").type_gated_shipping
 }
 
-/// [`Counts::carried_sig_walked`], for the test that reads it against `admitted_carried_sig`.
 pub fn carried_sig_walked() -> u64 {
     cell().lock().expect("census").carried_sig_walked
 }
@@ -49,40 +45,29 @@ pub struct Counts {
     pub builtin_calls: u64,
     pub ctor_calls: u64,
     pub admitted: u64,
-    /// Of `admitted`, those whose whole declared signature is carried by the seam — what
-    /// `backend::Reference` would actually answer rather than be offered and decline.
+    /// Of `admitted`, those whose whole declared signature the seam carries.
     pub admitted_carried_sig: u64,
-    /// The same question asked by a **walk** over the declared types rather than by reading
-    /// `compiled::CarriedTypes`'s per-definition table.
+    /// `admitted_carried_sig`, computed by walking the declared types instead of the table.
     pub carried_sig_walked: u64,
     pub frame_ceiling: u64,
     pub gates: BTreeMap<&'static str, u64>,
     /// For `ArgumentShape`: every argument `compiled::crossable` refuses, by kind.
     pub blocking_args: BTreeMap<&'static str, u64>,
-    /// For `ArgumentType`: what in the declared parameter types refused it — see
-    /// `compiled::CarriedTypes::refusal`.
+    /// For `ArgumentType`: what in the declared parameter types refused it.
     pub blocking_types: BTreeMap<&'static str, u64>,
-    /// Admitted calls by name.
     pub admitted_names: BTreeMap<String, u64>,
     /// Refused calls by `name @ gate`.
     pub refused_names: BTreeMap<String, u64>,
     pub builtin_names: BTreeMap<&'static str, u64>,
-    /// Counterfactual widenings of `compiled::crossable`, by level name: calls whose arguments all
-    /// pass that level *and* clear every other gate.
+    /// Per `LADDER` rung: calls whose arguments pass that rung and that clear every other gate.
     pub widened: BTreeMap<&'static str, u64>,
-    /// The same, and the definition's declared return type also passes — so a native body would
-    /// have something it could hand back.
     pub widened_returnable: BTreeMap<&'static str, u64>,
-    /// For the widest DEEP rung: what refused each call whose arguments the *shallow* rung would
-    /// have carried.
+    /// What the widest deep rung refused among calls the shallow rung carries.
     pub deep_blockers: BTreeMap<&'static str, u64>,
-    /// The third design: clear every gate but the shape one, and decide the arguments from the
-    /// definition's **declared parameter types** instead of from the values.
+    /// Calls clearing every gate but shape, deciding arguments by declared parameter types.
     pub type_gated: u64,
     pub type_gated_and_return: u64,
-    /// The type gate **as it ships** — `compiled::CarriedTypes` — asked with the value-kind test
-    /// removed, so the two halves of `Gate::ArgumentShape` and `Gate::ArgumentType` can be
-    /// separated.
+    /// The shipping type gate with the value-kind test removed.
     pub type_gated_shipping: u64,
 }
 
@@ -128,7 +113,6 @@ fn cell() -> &'static Mutex<Counts> {
     C.get_or_init(|| Mutex::new(Counts::default()))
 }
 
-/// The whole census, as lines on stderr.
 pub fn report() -> String {
     let Ok(c) = cell().lock() else {
         return String::new();

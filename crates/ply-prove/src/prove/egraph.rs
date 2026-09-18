@@ -5,10 +5,7 @@ use super::term::{Node, TermId, Terms};
 #[derive(Clone, Default)]
 pub struct Classes {
     parent: Vec<TermId>,
-    /// Pairs the branch has asserted distinct.
     diseqs: Vec<(TermId, TermId)>,
-    /// A contradiction was derived: two distinct constructors, two distinct literals, or an
-    /// asserted disequality between terms proved equal.
     pub contradiction: bool,
 }
 
@@ -21,8 +18,7 @@ impl Classes {
         }
     }
 
-    /// Terms created after this branch started — a case split's constructor fields — join as their
-    /// own classes.
+    /// Terms created after this branch started join as their own classes.
     pub fn grow(&mut self, size: usize) {
         while self.parent.len() < size {
             self.parent.push(self.parent.len());
@@ -42,8 +38,7 @@ impl Classes {
         if a == b {
             return false;
         }
-        // Lower id wins, so a branch's class representatives are a function of the assertions
-        // rather than of the order they arrived in.
+        // Lower id wins, so representatives do not depend on assertion order.
         let (keep, drop) = if a < b { (a, b) } else { (b, a) };
         self.parent[drop] = keep;
         true
@@ -67,7 +62,6 @@ impl Classes {
         }
     }
 
-    /// Every term, grouped by class, in class-representative order.
     pub fn groups(&self, size: usize) -> Vec<(TermId, Vec<TermId>)> {
         let mut out: Vec<(TermId, Vec<TermId>)> = Vec::new();
         let mut index: Vec<Option<usize>> = vec![None; size];
@@ -85,14 +79,12 @@ impl Classes {
     }
 }
 
-/// What a class is known to be, structurally.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Shape<'a> {
     Int(i64),
     Bool(bool),
     Str(&'a str),
-    /// Already normalized by [`Terms::decimal`](super::term::Terms::decimal), so two shapes differ
-    /// exactly when the two values do.
+    /// Normalized by [`Terms::decimal`](super::term::Terms::decimal): shapes differ iff values do.
     Decimal(i128, u32),
     Ctor(&'a Node),
     List(usize),

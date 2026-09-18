@@ -1,4 +1,4 @@
-//! Concurrency laws: the bridge from an obligation to M7's interleaving search.
+//! Concurrency laws: the bridge from an obligation to the interleaving search.
 
 use crate::{
     Binding, CaseReport, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation, Rule,
@@ -13,25 +13,21 @@ use ply_ty::Type;
 pub enum ValueDomain {
     /// The law has no binders, or every point of a finite domain was visited.
     Enumerated {
-        /// The domain, rendered, for [`Rule::ExhaustiveEnumeration`].
         domain: Symbol,
-        /// Points of the whole domain, guard-rejected ones included.
+        /// Guard-rejected points included.
         points: u64,
-        /// Points the guard kept, and therefore points the body ran at.
         kept: u64,
     },
-    /// The points were drawn.
     Sampled {
         generated: u32,
         kept: u32,
         rejected: u32,
-        /// Type variables monomorphised to generate, e.g. `a := Int`.
         instantiations: Vec<(Symbol, Type)>,
     },
 }
 
 impl ValueDomain {
-    /// The ground domain: one point, the empty tuple, and no way to miss any of it.
+    /// One point: the empty tuple.
     pub fn ground() -> ValueDomain {
         ValueDomain::Enumerated {
             domain: "unit".into(),
@@ -40,12 +36,10 @@ impl ValueDomain {
         }
     }
 
-    /// The concurrency-law conditions condition 5.
     pub fn covers_every_value(&self) -> bool {
         matches!(self, ValueDomain::Enumerated { .. })
     }
 
-    /// Points the guard kept, which is how many times the body is run.
     pub fn kept(&self) -> u64 {
         match *self {
             ValueDomain::Enumerated { kept, .. } => kept,
@@ -69,15 +63,13 @@ impl ValueDomain {
 
     fn vacuity(&self) -> VacuityKind {
         match *self {
-            // Enumerating a finite domain and keeping nothing *decides* the guard unsatisfiable,
-            // which is exhaustive enumeration applied to the guard rather than to the body.
+            // Enumerating and keeping nothing decides the guard unsatisfiable.
             ValueDomain::Enumerated { .. } => VacuityKind::ProvedUnsatisfiable,
             ValueDomain::Sampled { generated, .. } => VacuityKind::NoCaseKept { generated },
         }
     }
 }
 
-/// One evaluation of a law body, at one point of the value domain, under one seed.
 #[derive(Clone, Debug)]
 pub struct BodyRun {
     interleaving: Interleaving,
@@ -86,12 +78,10 @@ pub struct BodyRun {
 }
 
 impl BodyRun {
-    /// Whether the machine recorded a `simulate` region for this run.
     pub fn observed(&self) -> bool {
         self.observed
     }
 
-    /// Whether the body raised instead of coming to a Boolean.
     pub fn raised(&self) -> bool {
         self.raised
     }
@@ -100,7 +90,7 @@ impl BodyRun {
         &self.interleaving
     }
 
-    /// A run assembled by hand rather than read off a machine, for a search that models one.
+    /// A run assembled by hand, for a search that models the machine.
     pub fn model(interleaving: Interleaving, observed: bool, raised: bool) -> BodyRun {
         BodyRun {
             interleaving,
@@ -110,12 +100,10 @@ impl BodyRun {
     }
 }
 
-/// The one way to build a [`BodyRun`]: from the machine that just ran the body.
 pub fn body_run(machine: &Machine<'_>, value: Result<Value, Diagnostic>, span: Span) -> BodyRun {
     body_run_recorded(machine.simulated(), value, span)
 }
 
-/// The same over what a compiled unit recorded of the run.
 pub fn body_run_recorded(
     record: Option<&ply_eval::region::Record>,
     value: Result<Value, Diagnostic>,
@@ -131,8 +119,7 @@ pub fn body_run_recorded(
     BodyRun {
         interleaving: match record {
             Some(record) => record.interleaving(&outcome),
-            // The verdict is still the run's own: a body that reached no region must report nothing
-            // about interleavings and must not turn a false law true on the way past.
+            // No region reached: keep the body's own verdict so a false law stays false.
             None => match outcome {
                 Ok(()) => Interleaving::passed(Vec::new()),
                 Err(diagnostic) => Interleaving::failed(Vec::new(), diagnostic),
@@ -160,37 +147,27 @@ fn body_was_not_boolean(value: &Value, span: Span) -> Diagnostic {
     .note("the type checker rejects a non-`Bool` law body with E0201, so reaching this is a defect in Ply")
 }
 
-/// Running a law body at a point of its value domain, under a seed the search chooses.
 pub trait LawSearch {
-    /// Evaluate the law body with the binders bound to point `point`, under `seed`.
     fn run(&mut self, point: u64, seed: &Seed) -> BodyRun;
 
-    /// The bindings at `point`, as a counterexample renders them.
     fn bindings(&self, point: u64) -> Vec<Binding>;
 }
 
-/// What discharging a concurrency law did, beside the discharge itself.
 #[derive(Clone, Debug)]
 pub struct Searched {
     pub discharge: Discharge,
-    /// Interleavings that actually entered a `simulate` region, summed over the points the guard
-    /// kept.
+    /// Interleavings that entered a `simulate` region, summed over kept points.
     pub interleavings: u32,
-    /// Body evaluations, whether or not they reached a region.
+    /// Whether or not they reached a region.
     pub evaluations: u32,
-    /// Every point's frontier emptied within its budget.
     pub exhaustive: bool,
-    /// Some point's search spent its budget, so it proved nothing about the interleavings it did
-    /// not reach.
+    /// Some point's search spent its budget.
     pub exhausted: bool,
-    /// Every run entered a `simulate` region.
     pub observed: bool,
-    /// Points the body ran at.
     pub points: u64,
 }
 
 impl Searched {
-    /// `12 interleavings · exhaustive`, or why not.
     pub fn line(&self) -> Option<String> {
         if self.evaluations == 0 {
             return None;
@@ -224,7 +201,6 @@ fn plural(n: u32) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-/// Discharge a concurrency law by searching every point of its value domain.
 pub fn discharge(
     obligation: &Obligation,
     plan: &Plan,
@@ -263,8 +239,7 @@ pub fn discharge(
                 )
                 .primary(obligation.span, "this law's search")
             });
-            // A raise is not a refutation: a law that divides by zero says nothing about whether it
-            // is true.
+            // A raise is not a refutation.
             return totals.finish(if failing.unwrap_or(Failing::Raised) == Failing::Raised {
                 Discharge::Unattempted(Gap::Raised {
                     bindings: search.bindings(point),
@@ -274,7 +249,6 @@ pub fn discharge(
                 Discharge::Refuted(Counterexample {
                     bindings: search.bindings(point),
                     original: search.bindings(point),
-                    // Neither half is shrunk.
                     shrinks: 0,
                     root: seed.root,
                     case: u32::try_from(point).unwrap_or(u32::MAX),
@@ -289,8 +263,6 @@ pub fn discharge(
     totals.finish(discharge)
 }
 
-/// Aggregated over every point of the value domain, because a law is a claim about all of them: one
-/// point whose search spent its budget is a law whose search spent its budget.
 struct Totals {
     points: u64,
     interleavings: u32,
@@ -298,8 +270,7 @@ struct Totals {
     exhaustive: bool,
     exhausted: bool,
     observed: bool,
-    /// Carried rather than inferred from the early return a failure takes: [`Totals::proves`] must
-    /// be false on a failing search whatever the shape of the loop above it later becomes.
+    /// Carried, not inferred from the early return, so [`Totals::proves`] is false on failure.
     failure: Option<Seed>,
 }
 
@@ -309,8 +280,7 @@ impl Totals {
             points,
             interleavings: 0,
             evaluations: 0,
-            // Vacuously true over no points, and `proves` requires an interleaving to have run
-            // before it reads this.
+            // Vacuously true; `proves` also requires an interleaving to have run.
             exhaustive: true,
             exhausted: false,
             observed: true,
@@ -327,7 +297,6 @@ impl Totals {
         self.failure = self.failure.take().or_else(|| exploration.failure.clone());
     }
 
-    /// The conditions, all of them, in one place.
     fn proves(&self, plan: &Plan, domain: &ValueDomain) -> bool {
         let exploration = Exploration {
             exhaustive: self.exhaustive,
@@ -335,8 +304,7 @@ impl Totals {
             failure: self.failure.clone(),
             ..Exploration::default()
         };
-        // The five of the concurrency-law conditions, and then the sixth: a search that entered no region emptied a
-        // frontier it never filled.
+        // A search that entered no region emptied a frontier it never filled.
         crate::interleaving_proves(plan, &exploration, domain.covers_every_value())
             && self.observed
             && self.interleavings > 0
@@ -353,9 +321,7 @@ impl Totals {
             return Discharge::Held(Evidence::Proof(self.certificate(obligation, domain)));
         }
         Discharge::Held(Evidence::Cases(CaseReport {
-            // Interleavings rather than value points, because what a concurrency law samples is
-            // schedules: a ground law whose search spent its budget ran 256 cases, and calling that
-            // one case would report `example` for the strongest sampled evidence in the language.
+            // Count interleavings, not value points: a concurrency law samples schedules.
             generated: self.evaluations,
             kept: self.evaluations,
             rejected: u32::try_from(domain.rejected()).unwrap_or(u32::MAX),
@@ -366,8 +332,7 @@ impl Totals {
 
     fn certificate(&self, obligation: &Obligation, domain: &ValueDomain) -> Certificate {
         let mut rules = Vec::new();
-        // Both coverage claims are named, so an audit can check condition 5 against the certificate
-        // rather than re-deriving it from the law.
+        // Both coverage claims are named so an audit can check them against the certificate.
         if let ValueDomain::Enumerated {
             domain: name,
             points,
@@ -386,9 +351,7 @@ impl Totals {
         Certificate {
             rules,
             steps: self.interleavings,
-            // A point was kept, so the guard admits a value.
             guard_satisfiable: true,
-            // A proof about one program, not about an uninterpreted sort.
             sorts: Vec::new(),
         }
     }
@@ -408,7 +371,6 @@ impl Totals {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Failing {
-    /// The body evaluated to `false`.
     Refuted,
     /// The body raised, or the search caught its own driver diverging.
     Raised,
@@ -418,9 +380,7 @@ struct Driver<'a> {
     search: &'a mut dyn LawSearch,
     point: u64,
     observed: bool,
-    /// Runs that reached a `simulate` region.
     entered: u32,
-    /// Which of the two things happened at each seed that ended badly.
     failures: Vec<(Seed, Failing)>,
 }
 
@@ -455,13 +415,10 @@ impl ply_eval::Simulation for Driver<'_> {
     }
 }
 
-/// The command that replays exactly this failure.
 pub fn replay_command(seed: &Seed, law: &str) -> String {
     format!("ply prove --seed {seed} --filter \"{law}\"")
 }
 
-/// The failure artifact for a refuted concurrency law: the search's own diagnostic, with the seed,
-/// the race and the replay command attached.
 pub fn refutation(law: &str, counterexample: &Counterexample, found: Diagnostic) -> Diagnostic {
     let Some(seed) = &counterexample.sim_seed else {
         return found;
@@ -496,8 +453,6 @@ fn race_site(site: &ply_eval::RaceSite) -> String {
     format!("{}  {definition}   {}", site.task, site.access)
 }
 
-/// What the differential tier audit's concurrency-law condition test asserts, as a function so that the assertion
-/// is one call rather than a re-derivation that can drift from the thing it audits.
 pub fn audit_interleaving_proof(
     obligation: &Obligation,
     certificate: &Certificate,

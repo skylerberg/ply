@@ -4,7 +4,6 @@ use ply_span::Symbol;
 use ply_ty::Type;
 use serde::{Deserialize, Serialize};
 
-/// One inference rule a certificate names.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CachedRule {
@@ -43,7 +42,6 @@ pub enum CachedEvidence {
     Cases(CachedCases),
 }
 
-/// One discharged obligation, as the cache holds it.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct CachedObligation {
     /// `proved`, `property` or `example`, as the run that discharged it reported.

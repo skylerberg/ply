@@ -8,29 +8,23 @@ use crate::cont::SimId;
 use crate::sched::{Stamp, StepRecord, happens_before};
 use crate::sim::{Exploration, Naive, Plan, Race, RaceSite, Seed, SimMode, StepFootprint, TaskId};
 
-/// One step of one task, as the search reads it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Step {
-    /// Which of the entry point's `simulate` regions took this step.
     pub region: SimId,
     pub task: TaskId,
     /// Every task the scheduler could have resumed at this point, in its canonical order.
     pub enabled: Vec<TaskId>,
     /// The index into `enabled` that was taken; `enabled[choice] == task`.
     pub choice: u16,
-    /// What the step touched, **excluding** the terminating `task.*` / `clock.*` atom and
-    /// **including** every cell and every `random.write`.
+    /// Every cell and `random.write` touched, but not the terminating `task.*`/`clock.*` atom.
     pub accesses: StepFootprint,
-    /// The definition the step was inside.
     pub definition: Option<Symbol>,
     pub span: Span,
-    /// The acting task's vector clock, which says which earlier steps this one had already
-    /// observed.
+    /// The acting task's vector clock: which earlier steps this one had observed.
     pub stamp: Stamp,
 }
 
 impl Step {
-    /// Adopt the scheduler's record of a step.
     pub fn from_record(record: &StepRecord, definition: Option<Symbol>, span: Span) -> Step {
         Step {
             region: record.region,
@@ -45,14 +39,12 @@ impl Step {
     }
 }
 
-/// How one interleaving ended.
 #[derive(Clone, Debug)]
 pub enum Verdict {
     Passed,
     Failed(Diagnostic),
 }
 
-/// One interleaving, as the scheduler ran it.
 #[derive(Clone, Debug)]
 pub struct Interleaving {
     pub steps: Vec<Step>,
@@ -78,15 +70,12 @@ impl Interleaving {
         }
     }
 
-    /// The choice sequence actually taken, which is not the seed's path: beyond the path the
-    /// `sched` stream chose, and a backtrack point is named relative to what ran rather than to
-    /// what was fixed.
+    /// The choices actually taken, which extend past the seed's path.
     fn choices(&self) -> Vec<u16> {
         self.steps.iter().map(|s| s.choice).collect()
     }
 }
 
-/// Whole-test replay at one seed.
 pub trait Simulation {
     fn run(&mut self, seed: &Seed) -> Interleaving;
 }
@@ -97,7 +86,6 @@ impl<F: FnMut(&Seed) -> Interleaving> Simulation for F {
     }
 }
 
-/// Which dependence relation the search runs over.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dependence {
     Exact,
@@ -113,16 +101,12 @@ impl Dependence {
     }
 }
 
-/// The budget the naive search gets under [`measure_reduction`].
 pub const NAIVE_BUDGET: u32 = 4096;
 
-/// What a search produced.
 #[derive(Clone, Debug)]
 pub struct Explored {
     pub exploration: Exploration,
-    /// The failing interleaving's diagnostic.
     pub diagnostic: Option<Diagnostic>,
-    /// The interleavings run, in the order they were run.
     pub seeds: Vec<Seed>,
 }
 
@@ -132,12 +116,10 @@ impl Explored {
     }
 }
 
-/// Run `plan` against `driver`.
 pub fn explore(plan: &Plan, driver: &mut dyn Simulation) -> Explored {
     explore_under(plan, Dependence::Exact, driver)
 }
 
-/// [`explore`] with the dependence relation chosen explicitly.
 pub fn explore_under(plan: &Plan, dependence: Dependence, driver: &mut dyn Simulation) -> Explored {
     let plan = plan.clone().normalized();
     match plan.mode {
@@ -146,8 +128,7 @@ pub fn explore_under(plan: &Plan, dependence: Dependence, driver: &mut dyn Simul
     }
 }
 
-/// [`explore`], then the same search again with the dependence relation forced to `true`, filling
-/// [`Exploration::naive`].
+/// [`explore`], then again with every pair dependent, to fill [`Exploration::naive`].
 pub fn measure_reduction(plan: &Plan, driver: &mut dyn Simulation) -> Explored {
     let mut explored = explore(plan, driver);
     if plan.mode != SimMode::Dpor || explored.exploration.failure.is_some() {
@@ -165,7 +146,6 @@ pub fn measure_reduction(plan: &Plan, driver: &mut dyn Simulation) -> Explored {
         bounded: naive.exploration.exhausted || naive.exploration.failure.is_some(),
     });
     if let Some(seed) = naive.exploration.failure {
-        // The pruned search called this program green and the unpruned one failed it.
         explored.exploration.failure = Some(seed);
         explored.exploration.exhaustive = false;
         explored.diagnostic = naive.diagnostic.map(|d| {
@@ -239,8 +219,7 @@ fn search(plan: &Plan, dependence: Dependence, driver: &mut dyn Simulation) -> E
     }
 }
 
-/// Where a queued interleaving came from: the run it branched off, the scheduling point it diverges
-/// at, and — when the branch was taken to reverse a specific pair of steps — which pair.
+/// The run a queued interleaving branched off, and the scheduling point where it diverges.
 struct Branch {
     trace: Rc<Vec<Step>>,
     at: usize,
@@ -251,7 +230,7 @@ struct Branch {
 
 struct Work {
     path: Vec<u16>,
-    /// `None` for a root's first interleaving, which branched from nothing.
+    /// `None` for a root's first interleaving.
     branch: Option<Branch>,
 }
 
@@ -287,8 +266,6 @@ fn search_root(
 
     while let Some(work) = frontier.pop() {
         if report.explored >= budget {
-            // The frontier is not empty, so the interleavings still on it were never run and
-            // nothing may be claimed about them.
             report.exhausted = true;
             break;
         }
@@ -362,8 +339,7 @@ fn search_root(
     report
 }
 
-/// The backtrack points a completed interleaving reveals: at scheduling point `at`, each task worth
-/// resuming instead, and the step the search means to reorder against `trace[at]`.
+/// Per scheduling point: the tasks worth resuming instead, and the step each reorders against.
 pub fn backtracks(
     steps: &[Step],
     dependence: Dependence,
@@ -374,9 +350,7 @@ pub fn backtracks(
         for j in (0..i).rev() {
             let earlier = &steps[j];
             if earlier.region != later.region {
-                // Two regions of one entry point run in sequence, never interleaved, so no schedule
-                // puts these two in the other order — and a task id means a different task in each
-                // of them.
+                // Regions run in sequence, never interleaved, and task ids are per region.
                 continue;
             }
             if earlier.task == later.task {
@@ -404,8 +378,7 @@ pub fn backtracks(
     out
 }
 
-/// A task queued twice at one point keeps whichever pair was observed, so a conservative branch
-/// never erases the race a real one names.
+/// A concrete pair is never overwritten, so a conservative branch never erases a real race.
 fn record(at: &mut BTreeMap<TaskId, Option<usize>>, task: TaskId, against: Option<usize>) {
     let entry = at.entry(task).or_insert(None);
     if entry.is_none() {
@@ -413,14 +386,12 @@ fn record(at: &mut BTreeMap<TaskId, Option<usize>>, task: TaskId, against: Optio
     }
 }
 
-/// `check_recording` has already refused an enabled set too large to index, so the conversion
-/// cannot silently drop a backtrack point.
+/// `check_recording` has already refused enabled sets too large for a `u16` index.
 fn choice_of(enabled: &[TaskId], task: TaskId) -> Option<u16> {
     let index = enabled.iter().position(|&t| t == task)?;
     u16::try_from(index).ok()
 }
 
-/// The two steps whose reordering the failing branch was queued to perform.
 fn race_of(branch: &Branch) -> Option<Race> {
     let against = branch.against?;
     let left = branch.trace.get(branch.at)?;
@@ -445,9 +416,7 @@ fn site(step: &Step, other: &Step) -> Option<RaceSite> {
     })
 }
 
-/// A recording that does not describe a schedule is Ply's fault, and it is caught before the search
-/// reasons over it: every later conclusion — which interleavings exist, which were pruned, whether
-/// the search was exhaustive — is derived from these fields.
+/// A recording that is not a schedule is a Ply defect; every later conclusion rests on it.
 fn check_recording(seed: &Seed, steps: &[Step]) -> Result<(), Diagnostic> {
     for (i, step) in steps.iter().enumerate() {
         if step.enabled.len() > usize::from(u16::MAX) {
@@ -482,8 +451,7 @@ fn check_recording(seed: &Seed, steps: &[Step]) -> Result<(), Diagnostic> {
     Ok(())
 }
 
-/// Replay is self-checking: re-running a prefix must reproduce the enabled set at every scheduling
-/// point that prefix names.
+/// Re-running a prefix must reproduce the enabled set at every point that prefix names.
 fn check_replay(seed: &Seed, branch: &Branch, steps: &[Step]) -> Result<(), Diagnostic> {
     for point in 0..=branch.at {
         let expected = match branch.trace.get(point) {

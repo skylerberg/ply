@@ -13,44 +13,33 @@ use rustc_hash::FxHashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// A source of natively compiled bodies for a program's definitions.
 pub trait Compiled {
-    /// Whether these bodies were compiled from `program`.
     fn describes(&self, program: &Program) -> bool;
 
     /// Runs `name`'s body over `args`, or declines for any reason at all.
     fn enter(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value>;
 
-    /// Runs a test's body whole, through the nullary root the backend synthesized for it, and
-    /// says whether the body ran and raised — which `enter` folds into a decline — because a
-    /// test the backend fails and the machine passes is a disagreement, not a decline.
+    /// Runs a test whole, telling a raise from a decline, which [`Compiled::enter`] conflates.
     fn enter_test(&self, _name: &Symbol, _budget: usize) -> Entered {
         Entered::Declined
     }
 
-    /// A definition entered whole with its answer, refusal or failure told apart: what an engine
-    /// with no machine behind it asks, where [`Compiled::enter`] folds a failure into a decline
-    /// for the machine to run again.
+    /// A definition entered whole, for an engine with no machine behind it to fall back to.
     fn enter_whole(&self, _name: &Symbol, _args: &[Value], _budget: usize) -> Entered {
         Entered::Declined
     }
 
-    /// The atoms compiled code performed since the last entry, for the machine's trace. A
-    /// handled perform is still a perform, and the observed row is a claim the tests make.
+    /// Atoms performed since the last entry, handled ones included.
     fn take_performed(&self) -> Vec<EffectAtom> {
         Vec::new()
     }
 
-    /// The seed and step budget the next entry's `simulate` regions run under.
     fn set_seed(&self, _seed: Seed, _steps: u32) {}
 
-    /// What the last entry's regions did, for the search, if it opened any.
     fn simulated(&self) -> Option<Record> {
         None
     }
 
-    /// The host binding a `perform` nothing on the stack answers reaches, and the reactor a
-    /// pending answer is waited on.
     fn set_host(&self, _binding: Arc<HostBinding>, _runtime: Option<Rc<dyn HostRuntime>>) {}
 
     fn set_declared(&self, _declared: Option<Footprint>) {}
@@ -62,31 +51,24 @@ pub trait Compiled {
         (HostUse::default(), 0)
     }
 
-    /// What the host runtime said when the entries ended.
     fn take_teardown(&self) -> Vec<Diagnostic> {
         Vec::new()
     }
 
-    /// Whether the backend is to be the only engine: a test or an entry it does not hold fails
-    /// rather than falling to the machine.
+    /// A test or entry this backend does not hold fails rather than falling to the machine.
     fn tier_only(&self) -> bool {
         false
     }
 }
 
-/// How a test root's entry ended.
 #[derive(Debug)]
 pub enum Entered {
-    /// The body ran to its answer.
     Answered(Value),
-    /// The body ran and raised this.
     Raised(Diagnostic),
-    /// The backend did not run the body.
     Declined,
 }
 
-/// What may cross this boundary, in either direction: the two unboxed scalars, the two byte
-/// carriers and unit — every leaf kind that holds no handle.
+/// The leaf kinds that hold no handle, which may cross in either direction.
 pub fn crossable(value: &Value) -> bool {
     matches!(
         value,
@@ -94,7 +76,6 @@ pub fn crossable(value: &Value) -> bool {
     )
 }
 
-/// Whether `ty` mentions a fixed-width integer anywhere, at any depth.
 pub fn mentions_a_width(ty: &Type) -> bool {
     match ty {
         Type::Var(_) => false,
@@ -108,23 +89,16 @@ pub fn mentions_a_width(ty: &Type) -> bool {
     }
 }
 
-/// Which definitions' **declared parameter types** cannot reach a world handle, decided once per
-/// program rather than once per call.
+/// Which definitions' declared types cannot reach a world handle, decided once per program.
 pub struct CarriedTypes {
-    /// A declared sum type's own parameters and the field types of every one of its constructors,
-    /// by program-wide type name.
     decls: FxHashMap<Symbol, Decl>,
-    /// The fixpoint over [`CarriedTypes::decls`]: whether a value of that type can reach a world
-    /// handle, its type arguments left to each occurrence.
+    /// Fixpoint over `decls`: `true` when the type, arguments aside, cannot reach a world handle.
     safe: FxHashMap<Symbol, bool>,
-    /// Per definition, its declared signature read as [`Denotes`].
     sigs: FxHashMap<Symbol, Sig>,
 }
 
-/// One definition's declared signature, with every position answered once.
 struct Sig {
-    /// One entry per declared parameter: the `Value` kind that parameter's type denotes when it is
-    /// carried, and `None` when it is not.
+    /// Per declared parameter: the `Value` kind it denotes, or `None` when not carried.
     params: Vec<Option<Denotes>>,
     /// The same for the declared return type.
     ret: Option<Denotes>,
@@ -135,7 +109,6 @@ struct Decl {
     fields: Vec<Type>,
 }
 
-/// The one `Value` kind a carried type denotes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Denotes {
     Int,
@@ -166,9 +139,7 @@ impl Denotes {
 }
 
 impl CarriedTypes {
-    /// The table for `check`, or an empty one — which admits nothing — for a machine built without
-    /// a `CheckOutput`, for the reason [`Gate::PublishedRow`] refuses one: a machine that cannot
-    /// read the fact has not been told it holds.
+    /// Without a `CheckOutput` the table is empty and admits nothing.
     pub fn over(check: Option<&CheckOutput>) -> CarriedTypes {
         let mut table = CarriedTypes {
             decls: FxHashMap::default(),
@@ -187,8 +158,7 @@ impl CarriedTypes {
             decl.fields.extend(ctor.fields.iter().cloned());
         }
         table.safe = table.decls.keys().map(|n| (n.clone(), true)).collect();
-        // Lowering only ever removes, so this settles; the bound is one round per declaration and
-        // the loop asserts nothing about how many it took.
+        // Lowering only removes, so this settles.
         loop {
             let lowered: Vec<Symbol> = table
                 .decls
@@ -242,39 +212,27 @@ impl CarriedTypes {
                 "Unit" => Denotes::Unit,
                 "List" => Denotes::List,
                 "Map" => Denotes::Map,
-                // `carries` cleared it and it is none of the builtin heads, so it is a declared sum
-                // type and its values are constructors.
+                // Carried and not builtin, so a declared sum type.
                 _ => Denotes::Ctor,
             }),
-            // `carries` refuses both of these, so this is unreachable rather than conservative — it
-            // is spelled out so that a future kind added to `carries` without an entry here is
-            // refused rather than silently denoting whatever the arm above it did.
+            // Unreachable: `carries` refuses both. Spelled out so a new kind fails closed.
             Type::Var(_) | Type::Fn { .. } => None,
         }
     }
 
-    /// Whether `ty` is carried.
     pub fn carries(&self, ty: &Type, decl_vars: Option<&[TyVar]>) -> bool {
         match ty {
             Type::Var(v) => decl_vars.is_some_and(|vars| vars.contains(v)),
             Type::Fn { .. } => false,
             Type::Record(fields) => fields.values().all(|t| self.carries(t, decl_vars)),
             Type::Con(name, args) => match name.as_str() {
-                // The leaf set is `crossable`'s exactly, so it is the same list in both directions.
+                // Must match `crossable`'s leaf set.
                 "Int" | "Bool" | "Bytes" | "String" | "Unit" => args.is_empty(),
                 "List" | "Map" => args.iter().all(|t| self.carries(t, decl_vars)),
-                // The fragment has no path for either literal, so a body over them is refused
-                // before this table is asked; keeping them out here keeps the leaf set honest.
+                // Refused before this table is asked; excluded to keep the leaf set honest.
                 "Float" | "Decimal" => false,
-                // A world handle and a credential are `Type::Con`s like any other.
                 "Cell" | ply_ty::prelude::TASK_TYPE | SECRET => false,
-                // The fixed-width integer types, explicitly rather than by falling through to the
-                // undeclared arm below. Compiled code holds one as a tagged immediate, which is
-                // what an `Int` is held as, so a value crossing back would arrive as an `Int` and
-                // be a *wrong* answer rather than a slow one. The bodies still compile and still
-                // call each other directly (ADR 0039); it is the crossing that is refused, and
-                // this arm is what makes `std.hash`'s `compress` unreachable from the differential
-                // while `blake3` itself is entered whole.
+                // Compiled code holds these as `Int` immediates, so one crossing back is wrong.
                 n if IntTy::from_name(n).is_some() => false,
                 _ => match self.decls.get(name) {
                     Some(decl) => {
@@ -288,7 +246,6 @@ impl CarriedTypes {
         }
     }
 
-    /// Whether `value` may cross back as `name`'s answer.
     pub fn answer_crosses(&self, name: &Symbol, value: &Value) -> bool {
         self.sigs
             .get(name)
@@ -297,8 +254,6 @@ impl CarriedTypes {
             || crossable(value)
     }
 
-    /// Whether every position of `name`'s declared signature is carried — the registry question,
-    /// asked of a definition rather than of a call.
     pub fn signature_carried(&self, name: &Symbol) -> bool {
         self.sigs
             .get(name)

@@ -1,34 +1,21 @@
-//! The machine-owned slot stack.
-//!
-//! ADR 0034: the machine owns one stack of slots and an activation is a window into it; a frame
-//! records a base index, not a scope, so carrying is free — and a value can be moved out of a
-//! slot exactly because the array has one owner, the machine.
-//!
-//! Nothing here is addressed absolutely by anything a continuation can carry: frames and
-//! segments record only *relative* quantities (window sizes and offsets from the top), so a
-//! captured extent splices back at any height without rewriting a frame.
+//! The machine-owned slot stack; an activation is a window into it.
+//! Frames record only relative offsets, so a captured extent splices back at any height.
 
 use crate::value::Value;
 
-/// What one slot holds.
 #[derive(Clone, Debug, Default)]
 pub enum SlotVal {
-    /// Reserved for a binder that has not run — an arm not taken, a binder further down the
-    /// block, or a "binder" that is really a nullary constructor pattern. A read falls back to
-    /// global resolution, which is what a name no local binding supplies means.
+    /// A binder that has not run; a read falls back to global resolution.
     #[default]
     Vacant,
-    /// The last use moved the value out. A read is a defect in the liveness analysis, reported
-    /// loudly rather than answered.
+    /// Moved out by a last use; reading it is a liveness-analysis bug.
     Moved,
     Full(Value),
 }
 
-/// The slot stack and the current activation's base.
 #[derive(Default)]
 pub struct Windows {
     slots: Vec<SlotVal>,
-    /// The current activation's first slot.
     pub base: usize,
 }
 
@@ -45,8 +32,7 @@ impl Windows {
         self.slots.is_empty()
     }
 
-    /// The current activation's window size, which every frame pushed now records as its
-    /// caller-relative undo.
+    /// The current window size, which a pushed frame records as its caller-relative undo.
     pub fn window(&self) -> u32 {
         (self.slots.len() - self.base) as u32
     }
@@ -56,7 +42,6 @@ impl Windows {
         self.base = 0;
     }
 
-    /// Opens an activation of `size` slots on top, answering its base.
     pub fn enter(&mut self, size: u32) -> usize {
         let base = self.slots.len();
         self.slots
@@ -68,7 +53,6 @@ impl Windows {
         self.slots.truncate(to);
     }
 
-    /// The slot `at` of the current activation, read in place.
     pub fn read(&self, at: u32) -> &SlotVal {
         &self.slots[self.base + at as usize]
     }
@@ -77,8 +61,7 @@ impl Windows {
         &mut self.slots[self.base + at as usize]
     }
 
-    /// Moves the value out of slot `at`, leaving the slot [`SlotVal::Moved`]. A vacant slot stays
-    /// vacant — there is nothing to mark as moved.
+    /// Moves the value out, leaving [`SlotVal::Moved`]; a vacant slot stays vacant.
     pub fn take(&mut self, at: u32) -> SlotVal {
         let slot = &mut self.slots[self.base + at as usize];
         match slot {
@@ -92,9 +75,8 @@ impl Windows {
         self.slots[self.base + at as usize] = SlotVal::Full(value);
     }
 
-    /// Cuts a captured extent's windows out: everything above `entry_top` leaves the stack
-    /// whole, and `[floor, entry_top)` — the portion shared with the activation that pushed the
-    /// captured prompt, which keeps running below — is cloned.
+    /// Cuts a captured extent out; `[floor, entry_top)` is cloned because the activation below
+    /// keeps running on it.
     pub fn cut(&mut self, floor: usize, entry_top: usize) -> Vec<SlotVal> {
         debug_assert!(floor <= entry_top && entry_top <= self.slots.len());
         let mut saved: Vec<SlotVal> = Vec::with_capacity(self.slots.len() - floor);
@@ -103,13 +85,11 @@ impl Windows {
         saved
     }
 
-    /// Restores a captured extent's windows on top of the stack. Cloned rather than moved,
-    /// because a multi-shot continuation restores the same snapshot once per resumption.
+    /// Cloned rather than moved: a multi-shot continuation restores the same snapshot repeatedly.
     pub fn restore(&mut self, saved: &[SlotVal]) {
         self.slots.extend(saved.iter().cloned());
     }
 
-    /// Takes the whole stack, for a control that becomes a task.
     pub fn drain_all(&mut self) -> Vec<SlotVal> {
         self.base = 0;
         std::mem::take(&mut self.slots)

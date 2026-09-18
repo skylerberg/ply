@@ -1,4 +1,4 @@
-//! Where a record goes, and the three answers W5 ships.
+//! Trace sinks: where a record goes.
 
 use super::Level;
 use ply_eval::Decimal;
@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// What a run's wall clock is read through.
 pub trait Clock: Send + Sync {
     /// Epoch microseconds.
     fn micros(&self) -> i64;
@@ -23,13 +22,11 @@ impl Clock for HostClock {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_micros() as i64)
-            // Before the epoch is a machine whose clock is set wrongly, which is a fact about the
-            // deployment rather than a reason to refuse a log line.
+            // A clock set before the epoch is no reason to refuse a log line.
             .unwrap_or(0)
     }
 }
 
-/// One structured value a program attached to a record.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Field {
     Int(i64),
@@ -41,7 +38,6 @@ pub enum Field {
     Json(String),
 }
 
-/// Which of the six operations produced a record.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Event,
@@ -65,13 +61,11 @@ impl Kind {
     }
 }
 
-/// How a span ended.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Outcome {
     Ok,
     Failed(String),
-    /// Nothing ran the program's `exit`: a `db.rollback` discarded the continuation, a raise
-    /// propagated past, or the entry point ended with the span open.
+    /// The program's `exit` never ran: a rollback, a raise, or the entry point ended first.
     Abandoned,
 }
 
@@ -85,10 +79,8 @@ impl Outcome {
     }
 }
 
-/// One line, before anything has rendered it.
 pub struct Record<'a> {
-    /// Epoch microseconds, stamped by the driver from the [`Clock`] — never by the call site, which
-    /// is what keeps `clock.read` out of every tracing function's row.
+    /// Epoch microseconds, stamped by the driver.
     pub ts: i64,
     pub kind: Kind,
     pub level: Level,
@@ -99,35 +91,26 @@ pub struct Record<'a> {
     /// That span's parent, `0` at depth zero.
     pub parent: i64,
     pub outcome: &'a Outcome,
-    /// `count`'s delta, `time`'s micros, and a closing span's own duration when the sink wanted its
-    /// `enter` and therefore has a start stamp.
+    /// `count`'s delta, `time`'s micros, or a closing span's duration when its `enter` was kept.
     pub amount: Option<i64>,
-    /// `gauge`'s value.
     pub value: Option<Decimal>,
     pub fields: &'a [(String, Field)],
 }
 
-/// Where records go.
 pub trait Sink: Send + Sync {
-    /// The Rust path `ply hosts` prints — the reviewable identity of a member of the trusted
-    /// computing base.
     fn path(&self) -> &'static str;
 
-    /// Where the records go, in the words `ply hosts` prints.
     fn destination(&self) -> &'static str;
 
-    /// Whether a record at this level will be written.
     fn wants(&self, level: Level) -> bool;
 
     fn write(&self, record: &Record<'_>);
 
-    /// Called once at teardown, before the connection pool closes, so that a trace naming a
-    /// rolled-back transaction is written before the connection that rolled it back is gone.
+    /// Called once at teardown, before the connection pool closes.
     fn flush(&self);
 }
 
-/// What [`Discard::path`] answers, for the one caller that has to tell the discarding sink from a
-/// writing one without downcasting.
+/// [`Discard::path`], so a caller can recognise the discarding sink without downcasting.
 pub const DISCARD_PATH: &str = "ply_host::trace::discard";
 
 /// `--trace off`.
@@ -186,8 +169,7 @@ impl Sink for Json {
         write_json(&mut line, record);
         line.push('\n');
         let _guard = lock(&self.out);
-        // A log line that cannot be written is not a reason to end a run, and there is nowhere to
-        // report it to that is not the thing that failed.
+        // A failed log write has nowhere to be reported and must not end the run.
         let _ = std::io::stderr().write_all(line.as_bytes());
     }
 
@@ -289,7 +271,6 @@ pub struct Kept {
     pub fields: Vec<(String, Field)>,
 }
 
-/// A sink that keeps what it was given.
 pub struct Recording {
     level: Level,
     kept: Mutex<Vec<Kept>>,
@@ -319,8 +300,6 @@ impl Recording {
         self.flushes.load(Ordering::Relaxed)
     }
 
-    /// The same lines [`Json`] would have written, for a test that asserts on the wire format
-    /// without capturing a file descriptor.
     pub fn lines(&self) -> Vec<String> {
         lock(&self.kept)
             .iter()
@@ -382,14 +361,12 @@ impl Sink for Recording {
     }
 }
 
-/// A poisoned lock here holds a `Vec` of records, which has no invariant a panicking thread can
-/// break, and a log that stopped working because a *different* thread failed would be the worst
-/// time to lose one.
+/// Poison is ignored: the guarded data has no invariant a panic can break.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The envelope, with the program's fields nested under `fields` **always**, even when empty.
+/// The envelope; `fields` is always present, even when empty.
 pub fn write_json(out: &mut String, record: &Record<'_>) {
     let _ = write!(out, "{{\"ts\":{}", record.ts);
     let _ = write!(out, ",\"level\":\"{}\"", record.level.as_str());
@@ -418,8 +395,7 @@ pub fn write_json(out: &mut String, record: &Record<'_>) {
         let _ = write!(out, ",\"{key}\":{amount}");
     }
     if let Some(value) = record.value {
-        // A string, because a `Decimal`'s scale is a digit count the value carries and a JSON
-        // number consumer would round it away.
+        // A string, so a JSON number consumer cannot round away the `Decimal`'s scale.
         out.push_str(",\"value\":");
         write_string(out, &value.to_string());
     }
@@ -444,14 +420,12 @@ fn write_json_field(out: &mut String, field: &Field) {
             let _ = write!(out, "{b}");
         }
         Field::Text(s) => write_string(out, s),
-        // JSON has no `NaN` and no infinity, and a writer that emitted one would produce a document
-        // no parser accepts.
+        // JSON has no `NaN` or infinity, so those go out as strings.
         Field::Float(f) if f.is_finite() => {
             let _ = write!(out, "{}", ply_ty::render_float(*f));
         }
         Field::Float(f) => write_string(out, &ply_ty::render_float(*f)),
         Field::Decimal(d) => write_string(out, &d.to_string()),
-        // Lowercase hex.
         Field::Bytes(bytes) => {
             out.push('"');
             for byte in bytes {

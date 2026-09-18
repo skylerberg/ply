@@ -1,4 +1,4 @@
-//! The `net` effect and the two handlers that serve it.
+//! The `net` effect and its handlers.
 
 mod sim;
 mod socket;
@@ -18,20 +18,15 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-/// The Ply declaration the registrations below are checked against: the source of the module
-/// `std.net`, which ships with the compiler.
 pub const DECLARATION: &str = ply_std::NET;
 
-/// The module the declaration ships as, which is what qualifies [`EFFECT`].
 pub const MODULE: &str = "std.net";
 
-/// The program-wide effect name.
 pub const EFFECT: &str = "std.net.net";
 
 /// The most bytes one `recv` allocates for, whatever `max` asks.
 pub const MAX_RECV: usize = 1 << 20;
 
-/// The six operations.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Op {
     Listen,
@@ -63,7 +58,6 @@ impl Op {
         }
     }
 
-    /// How a diagnostic names it.
     pub fn what(self) -> &'static str {
         match self {
             Op::Listen => "`net.listen`",
@@ -79,44 +73,36 @@ impl Op {
         match self {
             Op::Listen | Op::Accept | Op::Close => 1,
             Op::ListenTls => 2,
-            // The deadline is the third argument.
             Op::Recv | Op::Send => 3,
         }
     }
 
-    /// Whether the operation has to wait on a peer.
     fn waits(self) -> bool {
         matches!(self, Op::Accept | Op::Recv | Op::Send)
     }
 
-    /// The registration.
     pub fn declaration(self, net: &dyn Net) -> HostOp {
         HostOp {
             effect: Symbol::new(EFFECT),
             op: Symbol::new(self.name()),
-            // Whichever labels the program uses.
             resource: HostResource::Any,
             determinism: Determinism::Nondeterministic,
             linearity: Linearity::AtMostOnce,
             blocking: self.waits() && net.waits(),
-            // A socket write takes `Bytes`, and `bytes_of_string` takes a `String`: no expression
-            // turns a `Secret` into either.
+            // No expression turns a `Secret` into the `Bytes` a socket write takes.
             secrets: false,
             path: net.path(self),
         }
     }
 }
 
-/// What a `net` implementation has to answer.
 pub trait Net: Send + Sync {
     /// Whether this implementation's waiting operations leave the machine's thread.
     fn waits(&self) -> bool;
 
-    /// The Rust path `ply hosts` prints.
     fn path(&self, op: Op) -> &'static str;
 
     fn listen(&self, at: &Resource, port: u16, span: Span) -> Result<HostAnswer, Diagnostic>;
-    /// The same listener, terminating TLS.
     fn listen_tls(
         &self,
         at: &Resource,
@@ -146,8 +132,7 @@ pub trait Net: Send + Sync {
     fn close(&self, at: &Resource, socket: i64, span: Span) -> Result<HostAnswer, Diagnostic>;
 }
 
-/// Which resource label each open socket is being operated under, and the one mechanical defence
-/// this handler has against misreporting its own footprint.
+/// The resource label each open socket is operated under.
 pub struct Handles {
     open: Mutex<BTreeMap<i64, Option<Resource>>>,
     next: AtomicI64,
@@ -162,8 +147,7 @@ impl Default for Handles {
 impl Handles {
     pub fn new() -> Handles {
         Handles {
-            // Handles ascend from 1 and are never reused, so 0 is never a live socket and a handle
-            // held past its `close` names nothing rather than naming whatever opened next.
+            // Handles ascend from 1 and are never reused, so a stale handle names nothing.
             open: Mutex::new(BTreeMap::new()),
             next: AtomicI64::new(1),
         }
@@ -209,12 +193,11 @@ fn wrong_label(handle: i64, existing: &Resource, at: &Resource, span: Span) -> D
     .note("one socket under two labels is two resources the scheduler will not serialise, over one socket it must; give each socket a label and keep it")
 }
 
-/// See `pool::lock`: a map with no invariant a panicking caller can break.
+/// Poison is ignored: the map has no invariant a panic can break.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Register every operation of `net` against `net`'s implementation.
 pub fn register(registry: &mut HostRegistry, net: Arc<dyn Net>) {
     for op in Op::ALL {
         registry.register(
@@ -227,7 +210,6 @@ pub fn register(registry: &mut HostRegistry, net: Arc<dyn Net>) {
     }
 }
 
-/// A registry serving `net` and nothing else.
 pub fn registry(net: Arc<dyn Net>) -> HostRegistry {
     let mut registry = HostRegistry::new();
     register(&mut registry, net);
@@ -245,9 +227,7 @@ impl HostHandler for Operation {
         if req.args.len() != self.op.arity() {
             return Err(arity(self.op, req.args.len(), span));
         }
-        // The resolved atom's resource, never one the handler re-derives: the registry already
-        // decided which label this perform named, and a handler that disagreed with it about that
-        // would be the one disagreement nothing downstream can detect.
+        // The resolved atom's resource, never one the handler re-derives.
         let at = &req.atom.resource;
         match self.op {
             Op::Listen => {
@@ -286,8 +266,7 @@ impl HostHandler for Operation {
     }
 }
 
-/// A caller that wants no deadline passes a large one, and being made to write the number down is
-/// the point: an operation with no bound is a connection a peer can hold for the life of the run.
+/// No value means `never`: an unbounded operation lets a peer hold a connection for the whole run.
 fn deadline(op: Op, ms: i64, span: Span) -> Result<Duration, Diagnostic> {
     if ms <= 0 {
         return Err(Diagnostic::error(
@@ -300,8 +279,7 @@ fn deadline(op: Op, ms: i64, span: Span) -> Result<Duration, Diagnostic> {
     Ok(Duration::from_millis(ms as u64))
 }
 
-/// What keeps `Some(0)` unambiguous: with an empty payload permitted, a caller could not tell "the
-/// peer is gone" from "there was nothing to write".
+/// Keeps `send`'s `Some(0)` unambiguous as the peer being gone.
 #[cold]
 fn empty_payload(span: Span) -> Diagnostic {
     Diagnostic::error(
@@ -325,8 +303,6 @@ fn port(op: Op, port: i64, span: Span) -> Result<u16, Diagnostic> {
     })
 }
 
-/// The loopback bind both listeners share, so that the two cannot come to differ about which
-/// interface a Ply program listens on.
 pub(crate) fn bind(what: &str, port: u16, span: Span) -> Result<std::net::TcpListener, Diagnostic> {
     std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
         Diagnostic::error(
@@ -337,8 +313,7 @@ pub(crate) fn bind(what: &str, port: u16, span: Span) -> Result<std::net::TcpLis
     })
 }
 
-/// Never a clamp on the low side: asking for nothing and being told nothing is how a program
-/// mistakes an empty answer for a peer's close.
+/// Refuses rather than clamps a non-positive `max`: an empty answer means the peer closed.
 fn bound(max: i64, span: Span) -> Result<usize, Diagnostic> {
     if max <= 0 {
         return Err(Diagnostic::error(
@@ -348,9 +323,7 @@ fn bound(max: i64, span: Span) -> Result<usize, Diagnostic> {
         .primary(span, "a read wants at least one byte")
         .note("an empty answer already means the peer has stopped sending, so a zero-length read would be indistinguishable from end of stream"));
     }
-    // Capped before the cast, not after: `as usize` on a target narrower than `Int` would wrap, and
-    // a wrap to zero is a read that answers empty, which is exactly the value that means the peer
-    // went away.
+    // Capped before the cast: on a narrow target a wrap to zero would read as the peer's close.
     Ok(max.min(MAX_RECV as i64) as usize)
 }
 
@@ -368,7 +341,6 @@ fn arity(op: Op, got: usize, span: Span) -> Diagnostic {
     .note("inference checks a perform's arity, so reaching this means the evaluator was handed a module that was never checked")
 }
 
-/// A handle the table does not hold.
 #[cold]
 fn unknown_handle(handle: i64, span: Span) -> Diagnostic {
     Diagnostic::error(
@@ -397,8 +369,7 @@ fn not_a_stream(handle: i64, span: Span) -> Diagnostic {
     .primary(span, "this handle came from `net.listen`, not `net.accept`")
 }
 
-/// Only the twin can raise this: a real `accept` waits for a peer, and a script has nothing left to
-/// wait for.
+/// Only the simulated network raises this; a real `accept` waits for a peer.
 #[cold]
 fn no_connection_scripted(span: Span) -> Diagnostic {
     Diagnostic::error(

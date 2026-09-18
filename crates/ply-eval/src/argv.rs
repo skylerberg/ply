@@ -14,12 +14,10 @@ thread_local! {
         const { RefCell::new([const { Vec::new() }; CLASSES]) };
 }
 
-/// The free list index an `arity`-argument buffer belongs in, if any.
 fn class_of(arity: usize) -> Option<usize> {
     (1..=CLASSES).contains(&arity).then(|| arity - 1)
 }
 
-/// A vector with room for `arity` arguments and nothing in it.
 pub fn take(arity: usize) -> Vec<Value> {
     if let Some(class) = class_of(arity) {
         let recycled = FREE
@@ -34,15 +32,13 @@ pub fn take(arity: usize) -> Vec<Value> {
     Vec::with_capacity(arity)
 }
 
-/// A pooled vector holding exactly `values`, for a builtin handing arguments to the function it
-/// calls: the callee drains it and gives it back, so a loop's callback steps allocate nothing.
+/// A pooled vector holding exactly `values`; the callee drains it and gives it back.
 pub fn of<const N: usize>(values: [Value; N]) -> Vec<Value> {
     let mut out = take(N);
     out.extend(values);
     out
 }
 
-/// Takes back a vector the callee has finished with.
 pub fn give(args: Vec<Value>) {
     if !args.is_empty() {
         return;

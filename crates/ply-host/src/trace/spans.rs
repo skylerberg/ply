@@ -7,24 +7,19 @@ use ply_span::{Diagnostic, Span, codes};
 use ply_ty::Resource;
 use std::collections::BTreeMap;
 
-/// Who a span belongs to: the machine that opened it and the task inside it, if any.
 pub type Owner = (MachineId, Option<TaskId>);
 
-/// One span a performer has open.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Open {
     pub id: i64,
-    /// The channel the `enter` named, kept so that a `close` can write the record on the channel
-    /// the span was opened on rather than on whichever channel happened to close it.
+    /// The channel the `enter` named; the closing record is written on it.
     pub channel: Resource,
     /// The `Arc<str>` the argument already held, so keeping it allocates nothing.
     pub name: std::sync::Arc<str>,
     pub parent: i64,
-    /// When the sink stamped this span's `enter`.
     pub started: Option<i64>,
 }
 
-/// A span the driver has just popped, and what the sink should be told about it.
 pub struct Closing {
     pub open: Open,
     pub outcome: Outcome,
@@ -34,20 +29,15 @@ pub struct Closing {
 pub enum Unbalanced {
     NeverOpened,
     AlreadyClosed,
-    /// Open, but on another performer's stack.
     OtherOwner(Owner),
-    /// Open on this stack under a different channel, which only a forged `Span` record can produce.
+    /// Open here under a different channel, which only a forged `Span` record can produce.
     OtherChannel(Resource),
 }
 
-/// Every span every entry point has open, and one id counter **per entry point**.
 pub struct Spans {
     open: BTreeMap<Owner, Vec<Open>>,
-    /// The next id each entry point will mint, absent until its first `enter` and dropped by
-    /// [`Spans::end_entry_point`] so a suite of ten thousand tests does not carry ten thousand
-    /// counters.
+    /// The next id each entry point mints; dropped by [`Spans::end_entry_point`].
     next: BTreeMap<MachineId, i64>,
-    /// Every span this driver has opened, and how many of them were closed `Abandoned`.
     opened: u64,
     abandoned: u64,
 }
@@ -76,7 +66,6 @@ impl Spans {
         self.abandoned
     }
 
-    /// How many spans `owner` has open.
     pub fn depth(&self, owner: Owner) -> usize {
         self.open.get(&owner).map_or(0, Vec::len)
     }
@@ -85,7 +74,7 @@ impl Spans {
         self.open.values().map(Vec::len).sum()
     }
 
-    /// The span an event or a metric performed by `owner` belongs to, and that span's parent.
+    /// The span `owner`'s events belong to and its parent; `(0, 0)` outside any.
     pub fn innermost(&self, owner: Owner) -> (i64, i64) {
         self.open
             .get(&owner)
@@ -93,7 +82,6 @@ impl Spans {
             .map_or((0, 0), |open| (open.id, open.parent))
     }
 
-    /// `trace.enter[c]`.
     pub fn enter(
         &mut self,
         owner: Owner,
@@ -101,8 +89,7 @@ impl Spans {
         name: std::sync::Arc<str>,
         started: Option<i64>,
     ) -> Open {
-        // From 1 per entry point, so `0` in a record's `span` or `parent` is unambiguously "no
-        // span" rather than a span that might exist.
+        // From 1, so `0` in a record's `span` or `parent` unambiguously means no span.
         let next = self.next.entry(owner.0).or_insert(1);
         let id = *next;
         *next += 1;
@@ -120,8 +107,7 @@ impl Spans {
         open
     }
 
-    /// `trace.exit[c]`, which closes `id` **and every span this owner opened above it**, innermost
-    /// first.
+    /// `trace.exit[c]`: closes `id` and every span opened above it, innermost first.
     pub fn exit(
         &mut self,
         owner: Owner,
@@ -140,10 +126,8 @@ impl Spans {
             .open
             .get_mut(&owner)
             .expect("the position came from it");
-        // Drained rather than removed.
         let popped: Vec<Open> = stack.drain(at..).collect();
-        // Outermost first in `popped`, and the outermost is the span the program named — everything
-        // after it was opened above it and never ran its own `exit`.
+        // `popped[0]` is the span the program named; the rest never ran their own `exit`.
         let closings: Vec<Closing> = popped
             .into_iter()
             .enumerate()
@@ -161,10 +145,8 @@ impl Spans {
         Ok(closings)
     }
 
-    /// Every span this machine still has open, innermost first per task, and the table emptied of
-    /// them.
+    /// Removes every span this machine still has open, innermost first per task.
     pub fn end_entry_point(&mut self, machine: MachineId) -> Vec<Closing> {
-        // With the entry point goes its counter.
         self.next.remove(&machine);
         let mine: Vec<Owner> = self
             .open
@@ -188,8 +170,6 @@ impl Spans {
         closings
     }
 
-    /// Which of the three ways an `exit` named a span that is not on this owner's stack, decided
-    /// from the performing entry point's own table.
     fn why(&self, owner: Owner, id: i64) -> Unbalanced {
         let next = self.next.get(&owner.0).copied().unwrap_or(1);
         if id < 1 || id >= next {
@@ -204,7 +184,6 @@ impl Spans {
     }
 }
 
-/// `E0445` — a `trace.exit` naming a span that is not open on the performing task's stack.
 #[cold]
 #[inline(never)]
 pub fn err_unbalanced(span: Span, operation: &str, id: i64, why: &Unbalanced) -> Diagnostic {
@@ -231,7 +210,6 @@ pub fn err_unbalanced(span: Span, operation: &str, id: i64, why: &Unbalanced) ->
     diagnostic.note("silently accepting an unbalanced exit is how one request's timing lands under another request's span")
 }
 
-/// `W0609` — spans were still open when an entry point ended.
 #[cold]
 #[inline(never)]
 pub fn warn_abandoned(closings: &[Closing]) -> Diagnostic {

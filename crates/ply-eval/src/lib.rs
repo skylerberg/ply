@@ -1,8 +1,6 @@
 //! The evaluator.
 
-// `Value` pins `Arc` for its shared payloads and `Rc` for shared code and continuations, so none of
-// those `Arc`s can ever be `Send` — which is the intended design, not an oversight the lint should
-// keep reporting.
+// `Value` mixes `Arc` payloads with `Rc` code and continuations, so it is never `Send` by design.
 #![allow(clippy::arc_with_non_send_sync)]
 
 pub mod arena;
@@ -39,12 +37,8 @@ pub mod trace;
 mod value;
 pub mod window;
 
-// `Slot`, `RegionId` and `Snapshot` stay behind `arena::`: they are the allocator's own vocabulary
-// and each of those names means something else somewhere in this crate.
+// `Slot`, `RegionId` and `Snapshot` stay behind `arena::`: each name means something else here.
 pub use arena::{Arena, RegionKind};
-// The one thing outside this crate needs from `argv`: the attribution harness splits a request's
-// surviving argument vectors at the free list's widest class and must split at the same number this
-// crate serves.
 pub use argv::CLASSES as ARGUMENT_VECTOR_CLASSES;
 pub use backend::{
     Compilation, Counters, Kind as BackendKind, Mutant, Mutation, Offers, Policed, Provider,
@@ -65,8 +59,7 @@ pub use host::{
     is_drain_incomplete,
 };
 pub use task_regions::{Fixture, TaskRegions};
-// `explore::Step` is deliberately not re-exported: `Step` at the root is the builtin's, and one
-// name for two things is worse than a qualified path.
+// `explore::Step` is not re-exported: `Step` at the root is the builtin's.
 pub use evaluator::{
     Machine, Unbound, carries_secret, check_host_answer, err_footprint_escape,
     err_host_in_simulation, err_nested_simulation, err_no_runtime, err_secret_to_host,

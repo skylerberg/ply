@@ -5,14 +5,11 @@ use std::collections::HashMap;
 
 use crate::frontend::{CachedCtor, CachedOp, DeclBody};
 
-/// Alpha-renames a scheme to its canonical numbering.
 pub fn canonicalize_scheme(scheme: &Scheme) -> Scheme {
     Renumber::default().scheme(scheme)
 }
 
-/// Canonicalizes a declaration's signatures under **one** numbering, because a type's parameters
-/// are shared by every constructor: renumbering each constructor independently would make `P(a)`
-/// and `Q(b)` of `type Pair<a, b>` both mention `t0`.
+/// One numbering for the whole declaration, because a type's parameters are shared by every ctor.
 pub fn canonicalize_decl_body(body: &DeclBody) -> DeclBody {
     Renumber::default().decl_body(body)
 }
@@ -53,8 +50,7 @@ impl Renumber {
                 ret: Box::new(self.ty(ret)),
                 effects: self.row(effects),
             },
-            // A `BTreeMap` iterates in key order, so the traversal does not depend on how the
-            // record was built.
+            // `BTreeMap` order keeps the numbering independent of how the record was built.
             Type::Record(fields) => Type::Record(
                 fields
                     .iter()
@@ -72,8 +68,7 @@ impl Renumber {
     }
 
     fn scheme(&mut self, scheme: &Scheme) -> Scheme {
-        // The body first: a variable's canonical number is where it is *used*, so that a quantifier
-        // list in a different order cannot change it.
+        // Body first, so the quantifier list's order cannot change the numbering.
         let ty = self.ty(&scheme.ty);
         let mut ty_vars: Vec<TyVar> = scheme.ty_vars.iter().map(|v| self.ty_var(*v)).collect();
         let mut row_vars: Vec<RowVar> = scheme.row_vars.iter().map(|v| self.row_var(*v)).collect();

@@ -5,10 +5,8 @@ use super::{Level, Outcome};
 use ply_eval::Value;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 
-/// The module `std.trace` ships as.
 const MODULE: &str = super::MODULE;
 
-/// The module `Json` ships in, for the one field that carries one.
 const JSON_MODULE: &str = "std.json";
 
 /// The simple name of a constructor a `Value` carries, when it is one of `module`'s.
@@ -18,7 +16,6 @@ fn simple<'a>(name: &'a Symbol, module: &str) -> Option<&'a str> {
         .and_then(|rest| rest.strip_prefix('.'))
 }
 
-/// `Debug | Info | Warn | Error`.
 pub fn level(value: &Value, span: Span) -> Result<Level, Diagnostic> {
     match value {
         Value::Ctor { name, .. } => match simple(name, MODULE) {
@@ -38,7 +35,6 @@ pub fn level(value: &Value, span: Span) -> Result<Level, Diagnostic> {
     }
 }
 
-/// `Ok | Failed(String) | Abandoned`.
 pub fn outcome(value: &Value, span: Span) -> Result<Outcome, Diagnostic> {
     match value {
         Value::Ctor { name, args } => match simple(name, MODULE) {
@@ -62,7 +58,6 @@ pub fn outcome(value: &Value, span: Span) -> Result<Outcome, Diagnostic> {
     }
 }
 
-/// `{ id: Int, channel: String }` — the span a `trace.exit` names.
 pub fn span_id(value: &Value, span: Span) -> Result<i64, Diagnostic> {
     match value {
         Value::Record(fields) => match fields.get(&super::ID) {
@@ -127,10 +122,9 @@ fn decode_field(value: &Value, span: Span) -> Result<Field, Diagnostic> {
     })
 }
 
-/// The bound on how deep a `json::Json` field may nest before the writer refuses.
+/// Bounds the recursive writer's stack.
 const MAX_JSON_DEPTH: usize = 64;
 
-/// `json::Json`, straight to its serialized form.
 fn write_json(out: &mut String, value: &Value, span: Span, depth: usize) -> Result<(), Diagnostic> {
     if depth >= MAX_JSON_DEPTH {
         return Err(Diagnostic::error(
@@ -188,8 +182,6 @@ fn write_json(out: &mut String, value: &Value, span: Span, depth: usize) -> Resu
     Ok(())
 }
 
-/// Inference checks a perform's shape, so reaching one of these means the evaluator ran a module
-/// that was never checked.
 #[cold]
 fn malformed(wanted: &str, span: Span) -> Diagnostic {
     Diagnostic::error(

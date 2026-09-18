@@ -1,7 +1,5 @@
 //! Where a host operation goes when it has to wait.
-//!
-//! One [`Pool`] per facility, minting in disjoint token ranges so a composed runtime
-//! can tell whose answer a token is.
+//! One [`Pool`] per facility, minting in disjoint token ranges.
 
 use ply_eval::{Pending, Value};
 use ply_span::{Diagnostic, Span, codes};
@@ -10,31 +8,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-/// How many host operations may be waiting at once, across every socket.
 pub const MAX_BLOCKING_OPERATIONS: usize = 64;
 
-/// The first token the socket pool mints.
 pub const NET_FIRST_TOKEN: u64 = 1;
 
-/// The first token the filesystem pool mints, far enough above [`NET_FIRST_TOKEN`] that
-/// neither range reaches the other and no token is owned by two pools.
+/// Far enough above [`NET_FIRST_TOKEN`] that the two ranges never meet.
 pub const FS_FIRST_TOKEN: u64 = 1 << 62;
 
-/// What a job hands back.
 pub enum Done {
     Int(i64),
     /// Whether a write happened; a filesystem's state is not the program's error.
     Bool(bool),
-    /// `net.recv`'s answer.
     MaybeBytes(Option<Vec<u8>>),
-    /// `net.send`'s answer; `fs.file_size` and `fs.modified_ms` under their own rule.
     MaybeInt(Option<i64>),
-    /// `fs.list_dir`'s answer, or `None` when it is not a directory this run can read.
+    /// `None` when it is not a directory this run can read.
     MaybeStrings(Option<Vec<String>>),
     /// The operation failed in a way that is neither the peer's doing nor a deadline.
     Failed(String),
-    /// A refusal the job computed, carrying its own code, because a confinement check runs where
-    /// the syscalls do and `E0452` has to be tellable from a disk that was busy.
     Refused(Diagnostic),
 }
 
@@ -42,7 +32,6 @@ type Job = Box<dyn FnOnce() -> Done + Send + 'static>;
 
 struct Waiting {
     span: Span,
-    /// The operation, as a diagnostic names it: `` `net.recv` ``.
     what: &'static str,
 }
 
@@ -59,29 +48,24 @@ struct Shared {
     next: AtomicU64,
 }
 
-/// Clone-free by design: the pool is owned by the handler that submits to it, and the jobs hold an
-/// [`Arc`] of the shared state instead.
+/// Not `Clone`: the handler owns it, and jobs hold an [`Arc`] of the shared state.
 pub struct Pool {
     shared: Arc<Shared>,
 }
 
 impl Pool {
-    /// `first` is where this pool's token range starts, and it is a parameter
-    /// rather than a constant because two pools counting from one would hand
-    /// out the same number twice. See [`NET_FIRST_TOKEN`].
+    /// `first` starts this pool's token range, which must not overlap another pool's.
     pub fn new(first: u64) -> Pool {
         Pool {
             shared: Arc::new(Shared {
                 state: Mutex::new(State::default()),
                 finished: Condvar::new(),
-                // Token 0 is never minted, so a zeroed `Pending` is a token no pool
-                // owns rather than one pool's first job.
+                // Token 0 is never minted, so a zeroed `Pending` belongs to no pool.
                 next: AtomicU64::new(first),
             }),
         }
     }
 
-    /// Start `job` and answer the token that will carry its result.
     pub fn submit(
         &self,
         span: Span,
@@ -131,7 +115,6 @@ impl Pool {
         Ok(Pending { token, label })
     }
 
-    /// Whether this pool minted the token.
     pub fn owns(&self, pending: &Pending) -> bool {
         let state = lock(&self.shared.state);
         state.waiting.contains_key(&pending.token) || state.done.contains_key(&pending.token)
@@ -171,16 +154,13 @@ impl Pool {
         Ok(())
     }
 
-    /// Drive until this token resolves.
     pub fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
         let mut state = lock(&self.shared.state);
         loop {
             match take(&mut state, pending.token) {
                 Taken::Ready(result) => return result,
                 Taken::Unknown => return Err(unknown_token(&pending)),
-                // Waiting on the condvar rather than on this token specifically: a wake for another
-                // token re-checks and waits again, which is correct and — because the result stays
-                // in `done` until its own poll consumes it — cannot spin.
+                // A wake for another token re-checks and waits again.
                 Taken::Waiting => state = wait(&self.shared.finished, state),
             }
         }
@@ -206,8 +186,7 @@ fn take(state: &mut State, token: u64) -> Taken {
             Taken::Unknown
         };
     };
-    // A finished job's `Waiting` entry is what carries the span its failure is reported at, so it
-    // is removed here and not when the job completes.
+    // `Waiting` carries the failure's span, so it is removed here rather than on completion.
     let waiting = state.waiting.remove(&token);
     let (span, what) = match &waiting {
         Some(w) => (w.span, w.what),
@@ -232,8 +211,7 @@ fn take(state: &mut State, token: u64) -> Taken {
     })
 }
 
-/// The prelude's `Option`, built on the polling thread because a `Value` holds `Rc` and never
-/// crosses one.
+/// Built on the polling thread: a `Value` holds `Rc` and never crosses threads.
 fn option(v: Option<Value>) -> Value {
     match v {
         Some(v) => Value::ctor("Some", vec![v]),

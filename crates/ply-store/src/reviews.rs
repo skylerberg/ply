@@ -3,13 +3,10 @@
 use ply_ty::DefHash;
 use serde::{Deserialize, Serialize};
 
-/// The definition and the claims about it, as they stood when they were accepted.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct ReviewRecord {
-    /// The implementation.
     pub def_hash: DefHash,
-    /// Every claim *about* this definition: its own `requires` / `ensures` clause keys, and the
-    /// hash of every law that names it directly.
+    /// Its own `requires`/`ensures` clause keys and every law that names it directly.
     pub specs: Vec<DefHash>,
 }
 

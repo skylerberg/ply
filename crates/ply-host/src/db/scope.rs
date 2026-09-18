@@ -1,5 +1,4 @@
-//! Transaction scopes: what `db.begin`, `db.commit` and `db.abort` do to the connection they run
-//! on, and to the driver's account of what is open.
+//! Transaction scopes: what `db.begin`, `db.commit` and `db.abort` do, and what is open.
 
 use super::pool::{Cleanup, LeaseId};
 use super::types::DbError;
@@ -12,7 +11,6 @@ use std::fmt;
 /// How many savepoints may be open below the outermost transaction.
 pub const MAX_SAVEPOINTS: usize = 16;
 
-/// The isolation a transaction runs at.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Isolation {
     ReadCommitted,
@@ -21,7 +19,6 @@ pub enum Isolation {
 }
 
 impl Isolation {
-    /// As `BEGIN` spells it.
     pub fn sql(self) -> &'static str {
         match self {
             Isolation::ReadCommitted => "READ COMMITTED",
@@ -30,8 +27,7 @@ impl Isolation {
         }
     }
 
-    /// As the Ply constructor spells it, which is what a diagnostic and a `Failed`'s detail have to
-    /// name for a reader to find the call site.
+    /// As the Ply constructor spells it, so diagnostics name what the call site wrote.
     pub fn as_str(self) -> &'static str {
         match self {
             Isolation::ReadCommitted => "ReadCommitted",
@@ -40,7 +36,6 @@ impl Isolation {
         }
     }
 
-    /// The inverse, for the decoder that has a `Value::Ctor` and needs the level.
     pub fn from_ctor(name: &str) -> Option<Isolation> {
         [
             Isolation::ReadCommitted,
@@ -92,20 +87,17 @@ impl fmt::Display for Access {
     }
 }
 
-/// The identity a scope belongs to: the machine that performed the operation and the task inside
-/// it, if any.
+/// The machine that performed an operation, and the task inside it if any.
 pub type Owner = (MachineId, Option<TaskId>);
 
-/// The SQLSTATEs this module answers with, spelled once.
 pub mod sqlstate {
-    /// `active_sql_transaction` — a nested `begin` asking for an isolation or an access the open
-    /// scope cannot give it.
+    /// `active_sql_transaction`: a nested `begin` asking for more than the open scope gives.
     pub const ACTIVE_TRANSACTION: &str = "25001";
-    /// `no_active_sql_transaction` — a `commit` or an `abort` with no scope open.
+    /// `no_active_sql_transaction`: a `commit` or an `abort` with no scope open.
     pub const NO_ACTIVE_TRANSACTION: &str = "25P01";
-    /// `program_limit_exceeded` — nesting past [`super::MAX_SAVEPOINTS`].
+    /// `program_limit_exceeded`: nesting past [`super::MAX_SAVEPOINTS`].
     pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
-    /// `in_failed_sql_transaction` — the scope a statement already aborted.
+    /// `in_failed_sql_transaction`: the scope a statement already aborted.
     pub const TRANSACTION_ABORTED: &str = "25P02";
 }
 
@@ -113,28 +105,29 @@ pub mod sqlstate {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Step {
     /// Acquire a connection and run this on it.
-    Open { sql: String },
+    Open {
+        sql: String,
+    },
     /// Run this on the scope's own connection.
-    Nested { lease: LeaseId, sql: String },
+    Nested {
+        lease: LeaseId,
+        sql: String,
+    },
     /// Run this, then hand the connection back with `cleanup`.
     Close {
         lease: LeaseId,
         sql: String,
-        /// What to do with the connection when the SQL **succeeded**.
+        /// What to do with the connection, applied only when the SQL succeeded.
         cleanup: Cleanup,
     },
-    /// Nothing to run.
     Refused(DbError),
 }
 
-/// One open scope.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Scope {
     /// The level the outermost `BEGIN` set.
     level: Isolation,
-    /// What the call site asked for.
     access: Access,
-    /// Whether a statement inside this scope has already failed.
     poisoned: bool,
 }
 
@@ -155,7 +148,6 @@ impl Held {
     }
 }
 
-/// The driver's account of every transaction scope every entry point has open.
 #[derive(Default)]
 pub struct ScopeTable {
     held: BTreeMap<Owner, Held>,
@@ -170,13 +162,11 @@ impl ScopeTable {
         self.held.is_empty()
     }
 
-    /// How deep `owner`'s scope stack is: `0` for no transaction, `1` for a transaction, `n + 1`
-    /// for `n` savepoints inside one.
+    /// `0` for no transaction, `1` for a transaction, `n + 1` for `n` savepoints inside one.
     pub fn depth(&self, owner: Owner) -> usize {
         self.held.get(&owner).map_or(0, Held::depth)
     }
 
-    /// The connection a `db` operation performed by `owner` runs on.
     pub fn route(
         &self,
         owner: Owner,
@@ -186,14 +176,12 @@ impl ScopeTable {
         if let Some(held) = self.held.get(&owner) {
             return Ok(Some(held.lease));
         }
-        // Only this machine's other tasks.
         match self.sibling(owner) {
             Some(other) => Err(err_transaction_scope(span, what, owner, other)),
             None => Ok(None),
         }
     }
 
-    /// Another task of the **same machine** holding a scope, if there is one.
     fn sibling(&self, owner: Owner) -> Option<Owner> {
         self.held
             .keys()
@@ -201,7 +189,6 @@ impl ScopeTable {
             .copied()
     }
 
-    /// `db.begin`.
     pub fn begin(&mut self, owner: Owner, level: Isolation, access: Access) -> Step {
         let Some(held) = self.held.get(&owner) else {
             return Step::Open {
@@ -209,8 +196,7 @@ impl ScopeTable {
             };
         };
 
-        // A savepoint has no isolation level and no access mode, so a nested `begin` that asked for
-        // a different one would be a call site saying a thing that does not happen.
+        // A savepoint has no isolation level or access mode, so a nested `begin` can't change them.
         let inner = held.innermost();
         if level != inner.level {
             return Step::Refused(DbError::new(
@@ -255,8 +241,7 @@ impl ScopeTable {
             lease,
             open: Vec::new(),
         });
-        // A nested scope inherits the transaction's level, because that is what it actually runs
-        // at.
+        // A nested scope actually runs at the transaction's level.
         let level = held.open.first().map_or(level, |root| root.level);
         held.open.push(Scope {
             level,
@@ -265,7 +250,6 @@ impl ScopeTable {
         });
     }
 
-    /// A statement performed by `owner` came back `Failed`.
     pub fn statement_failed(&mut self, owner: Owner) {
         if let Some(held) = self.held.get_mut(&owner)
             && let Some(scope) = held.open.last_mut()
@@ -282,20 +266,16 @@ impl ScopeTable {
             .is_some_and(|scope| scope.poisoned)
     }
 
-    /// `db.commit`.
     pub fn commit(&mut self, owner: Owner, span: Span) -> Result<Step, Diagnostic> {
         self.close(owner, Close::Commit, span)
     }
 
-    /// `db.abort` — what the `db.rollback` clause performs after it has discarded the continuation,
-    /// and what `sandbox` performs unconditionally.
     pub fn abort(&mut self, owner: Owner, span: Span) -> Result<Step, Diagnostic> {
         self.close(owner, Close::Abort, span)
     }
 
     fn close(&mut self, owner: Owner, close: Close, span: Span) -> Result<Step, Diagnostic> {
         let Some(held) = self.held.get(&owner) else {
-            // Somebody else's scope is open and this performer has none.
             if let Some(other) = self.sibling(owner) {
                 return Err(err_transaction_scope(span, close.what(), owner, other));
             }
@@ -315,9 +295,8 @@ impl ScopeTable {
                 cleanup: Cleanup::Clean,
             });
         }
-        // A savepoint is released rather than committed, and rolling one back releases it too: an
-        // abandoned savepoint name would accumulate one subtransaction per loop iteration on a
-        // connection the pool reuses.
+        // Rollback also releases: an abandoned savepoint leaks a subtransaction per loop iteration
+        // on a connection the pool reuses.
         let name = savepoint(depth - 1);
         Ok(Step::Nested {
             lease,
@@ -330,16 +309,14 @@ impl ScopeTable {
         })
     }
 
-    /// The scope a [`Step::Close`] or a nested close finished with, whether the server accepted it
-    /// or not.
+    /// The scope a close finished with, whether or not the server accepted it.
     pub fn closed(&mut self, owner: Owner, commit: bool) -> Closed {
         let Some(held) = self.held.get_mut(&owner) else {
             return Closed::default();
         };
         let poisoned = held.open.pop().is_some_and(|scope| scope.poisoned);
-        // `RELEASE SAVEPOINT` inside an aborted subtransaction does not clear the failed state —
-        // only `ROLLBACK TO SAVEPOINT` does — so a commit carries the poison outward and an abort
-        // drops it with the scope.
+        // `RELEASE SAVEPOINT` does not clear an aborted subtransaction, so a commit carries the
+        // poison outward and an abort drops it with the scope.
         if poisoned
             && commit
             && let Some(outer) = held.open.last_mut()
@@ -368,19 +345,16 @@ impl ScopeTable {
             .filter(|(owner, _)| *owner == machine)
             .copied()
             .collect();
-        // This machine's scopes and no others.
         mine.iter()
             .filter_map(|owner| self.held.remove(owner))
             .map(|held| held.lease)
             .collect()
     }
 
-    /// Every open scope's connection, without emptying anything.
     pub fn open_leases(&self) -> Vec<LeaseId> {
         self.held.values().map(|held| held.lease).collect()
     }
 
-    /// Every open scope, whichever entry point opened it, and the table left empty.
     pub fn shutdown(&mut self) -> Vec<LeaseId> {
         std::mem::take(&mut self.held)
             .into_values()
@@ -389,17 +363,14 @@ impl ScopeTable {
     }
 }
 
-/// What popping a scope left behind.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Closed {
     /// The connection to hand back, when the outermost scope closed.
     pub lease: Option<LeaseId>,
-    /// Whether a statement inside the scope had already aborted it, which is what makes a `COMMIT`
-    /// postgres answered without an error still a `Failed`.
+    /// Whether a statement already aborted the scope, making an error-free `COMMIT` a `Failed`.
     pub poisoned: bool,
 }
 
-/// Which way a scope is being closed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Close {
     Commit,
@@ -422,12 +393,11 @@ impl Close {
     }
 }
 
-/// The name a savepoint at this depth carries.
 fn savepoint(depth: usize) -> String {
     format!("ply_sp_{depth}")
 }
 
-/// `E0436` — a `db` operation from a performer that owns no scope, while another one is open.
+/// A `db` operation from a performer that owns no scope while a sibling task's is open.
 #[cold]
 #[inline(never)]
 fn err_transaction_scope(span: Span, what: &str, owner: Owner, other: Owner) -> Diagnostic {
