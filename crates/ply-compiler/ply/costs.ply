@@ -1,0 +1,546 @@
+// Whether an append copies: exactly when something else still owns the list when it runs.
+// Read off the lowering the emitter compiles, so a move here is a move there.
+
+import spine (Span, QName, num, dummy_span)
+import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform, NCell,
+             NRegion, NLambda, NSim, NHandle, NField, NUpd, CStmt, CLet, CLetPat, CDo, CArm, CField, CClause,
+             Cap, Own, Owned, pat_slots, lower_fn)
+import items (Module, Derived, Item, IFn, ITest, ILaw, Binder, parse)
+import exprs (Param, Expr)
+import rewrite (expand)
+import derive (expand_derives)
+import resolve (Mod, Resolved, Resolved_, Failed, NValue, resolve_modules, qualify, find)
+import tycore (at)
+
+type Cause = | CReadAgain | CCell | CMapEntry | CCapture | CCallerKeeps | CElement | CProgram | CCall | CHandler | CClosure
+
+type Why = { cause: Cause, text: Bytes }
+
+// Who owns a value besides the place it stands; a parameter is sole-owned exactly when every caller hands it over.
+type Owner = | OFresh | OParam(Int) | OBlocked(Why) | OUnknown(Why)
+
+type PState = | PSole | PUnsure(Why) | PShared(Why)
+
+type RState = | RFresh | RParam(Int) | RShared(Why) | RUnsure(Why)
+
+// Indexed as `Prog.defs` is.
+type Tables = { params: List<List<PState>>, rets: List<RState> }
+
+type Bind = { slot: Int, owner: Owner }
+
+type Demand = { callee: Int, param: Int, owner: Owner }
+
+type Raw = { span: Span, owner: Owner }
+
+type St = { chain: List<Bind>, sites: List<Raw>, demands: List<Demand>, escaped: List<Int> }
+
+type W = { st: St, owner: Owner }
+
+type Arms = { st: St, owner: Option<Owner> }
+
+type Args = { st: St, res: List<Owner> }
+
+type Def = { name: Bytes, arity: Int }
+
+// `def` is the index in `Prog.defs`, or -1 for a test or a law, which has no caller.
+type Body = { kind: Bytes, module: Int, module_name: Bytes, name: Bytes, label: Bytes, def: Int, arity: Int,
+              code: Option<Code>, reuse: Option<Span> }
+
+type Found = { sites: List<Raw>, demands: List<Demand>, escaped: List<Int>, ret: Owner }
+
+type Prog = { r: Resolved, index: Map<Bytes, Int>, builtins: Map<Bytes, Bool>, defs: List<Def>, bodies: List<Body> }
+
+type Env = { prog: Prog, module: Int, tables: Tables }
+
+type Settled = { tables: Tables, rounds: Int }
+
+type Parsed = { name: Bytes, module: Module, derived: List<Derived>, bad: Bool }
+
+fn blocked(c: Cause, text: Bytes) -> Owner = OBlocked({ cause: c, text: text })
+
+fn unknown(c: Cause, text: Bytes) -> Owner = OUnknown({ cause: c, text: text })
+
+fn reworded(w: Why, text: Bytes) -> Why = { cause: w.cause, text: text }
+
+fn fresh(st: St) -> W = { st: st, owner: OFresh }
+
+fn element() -> Owner = blocked(CElement, b"an element the list being walked still holds")
+
+fn owner_at(xs: List<Owner>, i: Int) -> Owner = match list_at(xs, i) { Some(o) -> o, None -> OFresh }
+
+// --- the walk ---------------------------------------------------------------
+
+fn owner_of(st: St, slot: Int) -> Option<Owner> =
+  fold(st.chain, None, |acc: Option<Owner>, b: Bind| if b.slot == slot { Some(b.owner) } else { acc })
+
+fn bind(st: St, slot: Int, o: Owner) -> St = { ..st, chain: push(st.chain, { slot: slot, owner: o }) }
+
+fn rebind(st: St, slot: Int, o: Owner) -> St =
+  { ..st, chain: map(st.chain, |b: Bind| if b.slot == slot { { slot: slot, owner: o } } else { b }) }
+
+fn add_site(st: St, span: Span, o: Owner) -> St = { ..st, sites: push(st.sites, { span: span, owner: o }) }
+
+fn add_demand(st: St, d: Demand) -> St = { ..st, demands: push(st.demands, d) }
+
+fn add_escaped(st: St, d: Int) -> St = { ..st, escaped: push(st.escaped, d) }
+
+fn with_chain(st: St, chain: List<Bind>) -> St = { ..st, chain: chain }
+
+fn walk(env: Env, c: Code, st: St) -> W =
+  match c.node {
+    NLit(_) -> fresh(st),
+    NVar(v) -> var_owner(env, v.name, v.slot, c.own, st),
+    NUnary(u) -> fresh(walk(env, u.operand, st).st),
+    NBinary(b) -> fresh(walk(env, b.rhs, walk(env, b.lhs, st).st).st),
+    NLambda(l) -> fresh(poison(barrier(env, l.params, [], l.body, st), l.caps, l.body)),
+    NApp(a) -> app(env, c.span, a.func, a.args, st),
+    NIf(i) -> {
+      let t = walk(env, i.then_branch, walk(env, i.cond, st).st);
+      let e = walk(env, i.else_branch, t.st);
+      { st: e.st, owner: join(t.owner, e.owner) }
+    },
+    NMatch(m) -> {
+      let sc = walk(env, m.scrutinee, st);
+      let arms = fold(m.arms, { st: sc.st, owner: None }, |acc: Arms, a: CArm| {
+        let bound = fold(pat_slots(a.pat), acc.st, |s: St, slot: Int| bind(s, slot, sc.owner));
+        let guarded = match a.guard { Some(g) -> walk(env, g, bound).st, None -> bound };
+        let w = walk(env, a.body, guarded);
+        { st: w.st, owner: Some(match acc.owner { None -> w.owner, Some(prev) -> join(prev, w.owner) }) }
+      });
+      { st: arms.st, owner: match arms.owner { Some(o) -> o, None -> OFresh } }
+    },
+    NBlock(b) -> {
+      let s = fold(b.stmts, st, |acc: St, stmt: CStmt| match stmt {
+        CLet(l) -> { let w = walk(env, l.value, acc); bind(w.st, l.slot, w.owner) },
+        CLetPat(l) -> {
+          let w = walk(env, l.value, acc);
+          fold(pat_slots(l.pat), w.st, |s2: St, slot: Int| bind(s2, slot, w.owner))
+        },
+        CDo(d) -> walk(env, d.code, acc).st,
+      });
+      match b.tail { Some(t) -> walk(env, t, s), None -> fresh(s) }
+    },
+    NRecord(r) -> fresh(fold(r.fields, st, |acc: St, f: CField| walk(env, f.value, acc).st)),
+    NUpd(u) -> fresh(walk(env, u.base, fold(u.sets, st, |acc: St, f: CField| walk(env, f.value, acc).st)).st),
+    // A field moves out of a record held once and is cloned out of one held twice.
+    NField(f) -> {
+      let b = walk(env, f.base, st);
+      match b.owner {
+        OBlocked(w) -> { st: b.st, owner: blocked(w.cause, bytes_concat_all([b"`.", f.field,
+                          b"` was read out of a record something else still holds: ", w.text])) },
+        _ -> b,
+      }
+    },
+    NList(l) -> fresh(fold(l.items, st, |acc: St, x: Code| walk(env, x, acc).st)),
+    NPerform(p) -> { st: fold(p.args, st, |acc: St, x: Code| walk(env, x, acc).st),
+                     owner: unknown(CHandler, b"the value a handler answered, which the handler may still hold") },
+    // Clause captures are copied at handle entry, before the body runs.
+    NHandle(h) -> {
+      let caught = fold(h.clauses, st, |acc: St, cl: CClause| poison(acc, cl.caps, cl.body));
+      let armed = match h.ret { Some(r) -> poison(caught, r.caps, r.body), None -> caught };
+      let ran = walk(env, h.body, armed).st;
+      let clauses = fold(h.clauses, ran, |acc: St, cl: CClause|
+        barrier(env, cl.params + (if cl.resume { 1 } else { 0 }), [], cl.body, acc));
+      { st: match h.ret { Some(r) -> barrier(env, 1, [], r.body, clauses), None -> clauses },
+        owner: unknown(CHandler, b"the value a `handle` answered") }
+    },
+    NCell(cl) -> {
+      let i = walk(env, cl.init, st);
+      walk(env, cl.body, match cl.slot {
+        Some(s) -> bind(i.st, s, blocked(CCell, b"a cell, whose region arena holds its contents")),
+        None -> i.st,
+      })
+    },
+    NSim(x) -> { st: barrier(env, 0, [], x.body, poison(st, x.caps, x.body)),
+                 owner: unknown(CHandler, b"the value a `simulate` answered") },
+    NRegion(r) -> walk(env, r.body, st),
+  }
+
+fn join(a: Owner, b: Owner) -> Owner =
+  match a {
+    OBlocked(_) -> a,
+    _ -> match b {
+      OBlocked(_) -> b,
+      _ -> match a {
+        OUnknown(_) -> a,
+        _ -> match b { OUnknown(_) -> b, _ -> match a { OParam(_) -> a, _ -> b } },
+      },
+    },
+  }
+
+// A body that may run again, later, or beside another task, so it sees no outer bindings.
+fn barrier(env: Env, n: Int, owners: List<Owner>, body: Code, st: St) -> St = {
+  let inner = with_chain(st, map(range(0, n), |i: Int| { slot: i, owner: match list_at(owners, i) {
+    Some(o) -> o,
+    None -> unknown(CClosure, b"a parameter of a closure whose caller this body does not name"),
+  } }));
+  with_chain(walk(env, body, inner).st, st.chain)
+}
+
+// A cloning capture gives the binding a second owner; a moving one leaves it dead.
+fn poison(st: St, caps: List<Cap>, body: Code) -> St =
+  fold(caps, st, |acc: St, cp: Cap|
+    if cp.own == Owned { acc } else {
+      match owner_of(acc, cp.src) {
+        None -> acc,
+        Some(OBlocked(_)) -> acc,
+        Some(_) -> rebind(acc, cp.src, blocked(CCapture, bytes_concat_all([b"a closure captured `",
+                     match first_name(body, cp.dst) { Some(n) -> n, None -> b"" },
+                     b"` and holds its own copy of the value"]))),
+      }
+    })
+
+// The name `slot` is read by in `c`, through any barrier that captures it.
+fn first_name(c: Code, slot: Int) -> Option<Bytes> =
+  match c.node {
+    NVar(v) -> if v.slot == Some(slot) { Some(v.name) } else { None },
+    NLambda(l) -> through(l.caps, l.body, slot),
+    NSim(x) -> through(x.caps, x.body, slot),
+    NHandle(h) -> {
+      let found = fold(h.clauses, first_name(h.body, slot), |acc: Option<Bytes>, cl: CClause|
+        match acc { Some(_) -> acc, None -> through(cl.caps, cl.body, slot) });
+      match found { Some(_) -> found, None -> match h.ret { Some(r) -> through(r.caps, r.body, slot), None -> None } }
+    },
+    _ -> fold(children(c), None, |acc: Option<Bytes>, x: Code| match acc { Some(_) -> acc, None -> first_name(x, slot) }),
+  }
+
+fn through(caps: List<Cap>, body: Code, slot: Int) -> Option<Bytes> =
+  fold(caps, None, |acc: Option<Bytes>, cp: Cap|
+    match acc { Some(_) -> acc, None -> if cp.src == slot { first_name(body, cp.dst) } else { None } })
+
+// What `c` reads in its own barrier.
+fn children(c: Code) -> List<Code> =
+  match c.node {
+    NUnary(u) -> [u.operand],
+    NBinary(b) -> [b.lhs, b.rhs],
+    NApp(a) -> fold(a.args, [a.func], |acc: List<Code>, x: Code| push(acc, x)),
+    NIf(i) -> [i.cond, i.then_branch, i.else_branch],
+    NBlock(b) -> {
+      let stmts = map(b.stmts, |s: CStmt| match s { CLet(l) -> l.value, CLetPat(l) -> l.value, CDo(d) -> d.code });
+      match b.tail { Some(t) -> push(stmts, t), None -> stmts }
+    },
+    NList(l) -> l.items,
+    NRecord(r) -> map(r.fields, |f: CField| f.value),
+    NUpd(u) -> push(map(u.sets, |f: CField| f.value), u.base),
+    NField(f) -> [f.base],
+    NMatch(m) -> fold(m.arms, [m.scrutinee], |acc: List<Code>, a: CArm|
+      push(match a.guard { Some(g) -> push(acc, g), None -> acc }, a.body)),
+    NPerform(p) -> p.args,
+    NCell(cl) -> [cl.init, cl.body],
+    NRegion(r) -> [r.body],
+    _ -> [],
+  }
+
+fn free(name: Bytes) -> Owner =
+  unknown(CClosure, bytes_concat_all([b"`", name, b"` is free in this closure; whether the closure's copy is the only other owner when the append runs is not a property of this body"]))
+
+fn var_owner(env: Env, name: Bytes, slot: Option<Int>, own: Own, st: St) -> W =
+  match slot {
+    Some(s) -> match owner_of(st, s) {
+      // A move keeps the binding's other owners; a clone is itself a second owner.
+      Some(o) -> { st: st, owner: if own == Owned { o } else {
+        blocked(CReadAgain, bytes_concat_all([b"`", name, b"` is read again after this point, so this use clones it"])) } },
+      None -> { st: st, owner: free(name) },
+    },
+    // Named outside callee position, a definition is applied by callers this cannot see.
+    None -> match def_of(env, name) {
+      Some(d) -> { st: add_escaped(st, d), owner: blocked(CProgram, b"a top-level definition, which the program holds") },
+      None -> { st: st, owner: if sep_at(name) >= 0 { blocked(CProgram, b"a module-qualified name denotes something the program holds") }
+                               else { free(name) } },
+    },
+  }
+
+// Where a lowered name's `::` starts, or -1 for a bare name.
+fn sep_at(text: Bytes) -> Int =
+  fold(range(0, bytes_len(text) - 1), 0 - 1, |acc: Int, i: Int|
+    if acc < 0 && bytes_at(text, i) == 58 && bytes_at(text, i + 1) == 58 { i } else { acc })
+
+fn qname_of(text: Bytes) -> QName = {
+  let at_ = sep_at(text);
+  if at_ < 0 { { module: None, name: { name: text, span: dummy_span() }, span: dummy_span() } }
+  else { { module: Some({ name: bytes_slice(text, 0, at_), span: dummy_span() }),
+           name: { name: bytes_slice(text, at_ + 2, bytes_len(text)), span: dummy_span() }, span: dummy_span() } }
+}
+
+fn def_of(env: Env, name: Bytes) -> Option<Int> =
+  match find(env.prog.r, env.module, NValue, qname_of(name)) {
+    None -> None,
+    Some(b) -> map_get(env.prog.index, b.qualified),
+  }
+
+// A builtin is a bare name no definition in scope shadows.
+fn builtin_of(env: Env, func: Code) -> Option<Bytes> =
+  match func.node {
+    NVar(v) -> if v.slot != None || sep_at(v.name) >= 0 || def_of(env, v.name) != None { None }
+               else if map_contains(env.prog.builtins, v.name) { Some(v.name) } else { None },
+    _ -> None,
+  }
+
+fn callee_of(env: Env, func: Code) -> Option<Int> =
+  match func.node {
+    NVar(v) -> if v.slot != None { None } else { def_of(env, v.name) },
+    _ -> None,
+  }
+
+fn app(env: Env, span: Span, func: Code, args: List<Code>, st: St) -> W = {
+  let builtin = builtin_of(env, func);
+  let callee = callee_of(env, func);
+  let n = len(args);
+  // A callee written as a name is a call, not the definition escaping.
+  let before = match func.node { NVar(_) -> st, _ -> walk(env, func, st).st };
+  let walked: Args = fold(args, { st: before, res: [] }, |acc: Args, arg: Code| {
+    let w = match callback_owners(builtin, len(acc.res), n, acc.res) {
+      Some(owners) -> callback(env, owners, arg, acc.st),
+      None -> walk(env, arg, acc.st),
+    };
+    { st: w.st, res: push(acc.res, w.owner) }
+  });
+  let sited = if builtin == Some(b"push") && n == 2 { add_site(walked.st, span, owner_at(walked.res, 0)) } else { walked.st };
+  let demanded = match callee {
+    None -> sited,
+    Some(d) -> fold(range(0, n), sited, |acc: St, j: Int| match owner_at(walked.res, j) {
+      OFresh -> acc,
+      o -> add_demand(acc, { callee: d, param: j, owner: o }),
+    }),
+  };
+  { st: demanded, owner: result_owner(env, builtin, callee, walked.res) }
+}
+
+fn result_owner(env: Env, builtin: Option<Bytes>, callee: Option<Int>, args: List<Owner>) -> Owner =
+  match builtin {
+    None -> match callee {
+      None -> unknown(CCall, b"the value a call answered, which the callee may also hold"),
+      Some(d) -> match list_at(env.tables.rets, d) {
+        Some(RParam(k)) -> match list_at(args, k) {
+          Some(o) -> o,
+          None -> unknown(CCall, b"a call answering an argument it was not given"),
+        },
+        Some(RShared(w)) -> OBlocked(w),
+        Some(RUnsure(w)) -> OUnknown(w),
+        _ -> OFresh,
+      },
+    },
+    Some(b) ->
+      if b == b"cell_get" { blocked(CCell, b"`cell_get` answers a clone the region's arena still holds \xe2\x80\x94 the append cannot be in place however the call is written; `cell_update` is the fix") }
+      else if b == b"map_get" { blocked(CMapEntry, b"`map_get` answers a clone the map still holds") }
+      else if b == b"list_at" { blocked(CElement, b"`list_at` answers a clone the list still holds") }
+      else if b == b"fold" { unknown(CCall, b"`fold` answers whatever its callback answered") }
+      else { OFresh },
+  }
+
+fn callback_owners(builtin: Option<Bytes>, at_: Int, arity: Int, done: List<Owner>) -> Option<List<Owner>> =
+  if at_ + 1 != arity { None } else {
+    match builtin {
+      None -> None,
+      Some(b) ->
+        if b == b"fold" { Some([match list_at(done, 1) { Some(o) -> o, None -> unknown(CCall, b"the seed of this fold") }, element()]) }
+        else if b == b"map" || b == b"filter" { Some([element()]) }
+        // The contents leave the arena for the call, so the function gets them uniquely owned.
+        else if b == b"cell_update" { Some([OFresh]) }
+        // The entry leaves the map, so it is uniquely owned exactly when the map was.
+        else if b == b"map_update" { Some([match list_at(done, 0) { Some(o) -> o, None -> unknown(CMapEntry, b"the map being updated") }]) }
+        else { None },
+    }
+  }
+
+// A callback written at the call site gets the owners the builtin is known to hand it.
+fn callback(env: Env, owners: List<Owner>, arg: Code, st: St) -> W =
+  match arg.node {
+    NLambda(l) -> fresh(poison(barrier(env, l.params, owners, l.body, st), l.caps, l.body)),
+    _ -> walk(env, arg, st),
+  }
+
+// --- the fixpoint over callers ----------------------------------------------
+
+fn rank(p: PState) -> Int = match p { PSole -> 2, PUnsure(_) -> 1, PShared(_) -> 0 }
+
+fn meet(a: PState, b: PState) -> PState = if rank(b) < rank(a) { b } else { a }
+
+fn param_at(t: Tables, d: Int, k: Int) -> Option<PState> =
+  match list_at(t.params, d) { Some(slots) -> list_at(slots, k), None -> None }
+
+fn meet_all(t: Tables, d: Int, p: PState) -> Tables =
+  match list_at(t.params, d) {
+    None -> t,
+    Some(slots) -> { ..t, params: list_set(t.params, d, map(slots, |s: PState| meet(s, p))) },
+  }
+
+fn meet_at(t: Tables, d: Int, j: Int, p: PState) -> Tables =
+  match list_at(t.params, d) {
+    None -> t,
+    Some(slots) -> match list_at(slots, j) {
+      None -> t,
+      Some(s) -> { ..t, params: list_set(t.params, d, list_set(slots, j, meet(s, p))) },
+    },
+  }
+
+fn with_ret(t: Tables, d: Int, r: RState) -> Tables = { ..t, rets: list_set(t.rets, d, r) }
+
+fn ret_of(o: Owner) -> RState =
+  match o { OFresh -> RFresh, OParam(k) -> RParam(k), OBlocked(w) -> RShared(w), OUnknown(w) -> RUnsure(w) }
+
+fn interpret(o: Owner, caller: Int, t: Tables, at_: Bytes) -> PState =
+  match o {
+    OFresh -> PSole,
+    OBlocked(w) -> PShared(reworded(w, bytes_concat_all([at_, b" passes a value where ", w.text]))),
+    OUnknown(w) -> PUnsure(reworded(w, bytes_concat_all([at_, b" passes a value where ", w.text]))),
+    OParam(k) -> match param_at(t, caller, k) {
+      Some(PSole) -> PSole,
+      Some(PUnsure(w)) -> PUnsure(reworded(w, bytes_concat_all([at_, b" passes its own parameter ", num(k), b", which is unsettled"]))),
+      Some(PShared(w)) -> PShared(reworded(w, bytes_concat_all([at_, b" passes its own parameter ", num(k), b", whose callers keep what they pass"]))),
+      None -> PUnsure({ cause: CCallerKeeps, text: bytes_concat_all([at_, b" passes a parameter this pass cannot name"]) }),
+    },
+  }
+
+fn start_tables(defs: List<Def>) -> Tables =
+  { params: map(defs, |d: Def| map(range(0, d.arity), |_i: Int| PSole)), rets: map(defs, |_d: Def| RFresh) }
+
+fn walk_body(env: Env, b: Body) -> Found =
+  match b.code {
+    // Not lowered, so not emitted: none of it runs.
+    None -> { sites: [], demands: [], escaped: [], ret: unknown(CCall, b"the value a call answered, which the callee may also hold") },
+    Some(c) -> {
+      let chain = map(range(0, b.arity), |k: Int| { slot: k, owner: if b.def < 0 { OFresh } else { OParam(k) } });
+      let w = walk(env, c, { chain: chain, sites: [], demands: [], escaped: [] });
+      { sites: w.st.sites, demands: w.st.demands, escaped: w.st.escaped, ret: w.owner }
+    },
+  }
+
+fn round(p: Prog, t: Tables) -> List<Found> =
+  map(p.bodies, |b: Body| walk_body({ prog: p, module: b.module, tables: t }, b))
+
+fn settle(p: Prog, found: List<Found>, t: Tables) -> Tables =
+  fold(range(0, len(p.bodies)), start_tables(p.defs), |acc: Tables, i: Int| {
+    let b: Body = at(p.bodies, i);
+    let f: Found = at(found, i);
+    let escaped = fold(f.escaped, acc, |s: Tables, d: Int|
+      meet_all(s, d, PUnsure({ cause: CProgram, text: bytes_concat_all([b"`", at(p.defs, d).name, b"` is used as a value in ",
+                                                                          b.label, b", so not every caller of it is known"]) })));
+    let demanded = fold(f.demands, escaped, |s: Tables, dm: Demand|
+      meet_at(s, dm.callee, dm.param, interpret(dm.owner, b.def, t, b.label)));
+    if b.def < 0 { demanded } else { with_ret(demanded, b.def, ret_of(f.ret)) }
+  })
+
+// Verdicts come from a walk under the settled tables, not the round that produced them.
+fn fixpoint(p: Prog, t: Tables, rounds: Int) -> Settled = {
+  let next = settle(p, round(p, t), t);
+  if next == t || rounds + 1 >= 24 { { tables: next, rounds: rounds + 1 } } else { fixpoint(p, next, rounds + 1) }
+}
+
+// --- the answer -------------------------------------------------------------
+
+fn fix(c: Option<Cause>) -> Bytes =
+  match c {
+    Some(CReadAgain) -> b"make the append the binding's last use: bind whatever you still need out of it first",
+    Some(CCell) -> b"`cell_update`",
+    Some(CMapEntry) -> b"`map_update`",
+    Some(CCapture) -> b"bind the list before the closure captures it, or capture less",
+    Some(CCallerKeeps) -> b"the edit is at the call site: the caller keeps the list",
+    _ -> b"",
+  }
+
+// `site <start> <end> <verdict> <parameter or -> <n> <m>\n`, then the reason's `n` bytes and the fix's `m`.
+fn site_frame(s: Span, verdict: Bytes, reason: Bytes, cause: Option<Cause>, param: Int) -> Bytes = {
+  let f = fix(cause);
+  bytes_concat_all([b"site ", num(s.start), b" ", num(s.end), b" ", verdict, b" ",
+                    if param < 0 { b"-" } else { num(param) }, b" ", num(bytes_len(reason)), b" ", num(bytes_len(f)), b"\n",
+                    reason, f])
+}
+
+fn finish(raw: Raw, def: Int, t: Tables) -> Bytes =
+  match raw.owner {
+    OFresh -> site_frame(raw.span, b"reuses", b"the list reaches `push` at one owner", None, 0 - 1),
+    OBlocked(w) -> site_frame(raw.span, b"copies", w.text, Some(w.cause), 0 - 1),
+    OUnknown(w) -> site_frame(raw.span, b"unknown", w.text, Some(w.cause), 0 - 1),
+    OParam(k) -> {
+      let head = bytes_concat_all([b"the list is parameter ", num(k)]);
+      match param_at(t, def, k) {
+        Some(PSole) -> site_frame(raw.span, b"reuses", bytes_concat(head, b", and every call site hands one over and stops reading it"), None, k),
+        Some(PShared(w)) -> site_frame(raw.span, b"copies", bytes_concat_all([head, b", and a caller keeps it: ", w.text]), Some(CCallerKeeps), k),
+        Some(PUnsure(w)) -> site_frame(raw.span, b"unknown", bytes_concat_all([head, b", and a call site is undecided: ", w.text]), Some(w.cause), k),
+        None -> site_frame(raw.span, b"unknown", bytes_concat(head, b" of a definition this pass cannot name"), Some(CCallerKeeps), k),
+      }
+    },
+  }
+
+// `def <kind> <promise start> <promise end> <a> <b> <c>\n`, then the module, the name and the label; `- -` for no `reuse`.
+fn def_frame(b: Body) -> Bytes =
+  bytes_concat_all([b"def ", b.kind, b" ",
+                    match b.reuse { Some(s) -> bytes_concat_all([num(s.start), b" ", num(s.end)]), None -> b"- -" },
+                    b" ", num(bytes_len(b.module_name)), b" ", num(bytes_len(b.name)), b" ", num(bytes_len(b.label)), b"\n",
+                    b.module_name, b.name, b.label])
+
+// A test or a law is labelled by its name, quoted and escaped.
+fn quoted(s: Bytes) -> Bytes =
+  bytes_concat_all([b"\"", bytes_concat_all(map(range(0, bytes_len(s)), |i: Int| {
+    let c = bytes_at(s, i);
+    if c == 34 { b"\\\"" } else if c == 92 { b"\\\\" } else if c == 10 { b"\\n" } else if c == 13 { b"\\r" }
+    else if c == 9 { b"\\t" } else { bytes_slice(s, i, i + 1) }
+  })), b"\""])
+
+fn lowered(names: List<Bytes>, body: Expr) -> Option<Code> =
+  match lower_fn(names, body) { Some(l) -> Some(l.code), None -> None }
+
+fn bodies_of(mods: List<Mod>, index: Map<Bytes, Int>) -> List<Body> =
+  fold(range(0, len(mods)), [], |acc: List<Body>, i: Int| {
+    let m: Mod = at(mods, i);
+    fold(m.module.items, acc, |a: List<Body>, it: Item| match it {
+      IFn(d) -> {
+        let names = map(d.params, |p: Param| p.name.name);
+        push(a, { kind: b"fn", module: i, module_name: m.name, name: d.name.name,
+                  label: bytes_concat_all([m.name, b".", d.name.name]),
+                  def: match map_get(index, qualify(m.name, d.name.name)) { Some(k) -> k, None -> 0 - 1 },
+                  arity: len(names), code: lowered(names, d.body), reuse: d.reuse })
+      },
+      ITest(t) -> push(a, { kind: b"test", module: i, module_name: m.name, name: t.name,
+                            label: bytes_concat_all([m.name, b": test ", quoted(t.name)]),
+                            def: 0 - 1, arity: 0, code: lowered([], t.body), reuse: None }),
+      ILaw(l) -> {
+        let names = map(l.binders, |bd: Binder| bd.name.name);
+        push(a, { kind: b"law", module: i, module_name: m.name, name: l.name,
+                  label: bytes_concat_all([m.name, b": law ", quoted(l.name)]),
+                  def: 0 - 1, arity: len(names), code: lowered(names, l.body), reuse: None })
+      },
+      _ -> a,
+    })
+  })
+
+// Parsed, rewritten, derived and resolved together, as the emitter takes a program.
+fn program_of(names: List<Bytes>, srcs: List<Bytes>, builtins: List<Bytes>) -> Option<Prog> = {
+  let parsed = map(range(0, len(names)), |i: Int| {
+    let r = parse(at(srcs, i));
+    let x = expand(r.node, r.p.uses_sets, r.p.diags);
+    let d = expand_derives(i, x.module);
+    { name: at(names, i), module: d.module, derived: d.derived, bad: len(d.diags) > 0 }
+  });
+  if fold(parsed, false, |acc: Bool, p: Parsed| acc || p.bad) { None } else {
+    match resolve_modules(map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived })) {
+      Failed(_) -> None,
+      Resolved_(x) -> {
+        let defs = fold(x.mods, [], |acc: List<Def>, m: Mod| fold(m.module.items, acc, |a: List<Def>, it: Item|
+          match it { IFn(d) -> push(a, { name: qualify(m.name, d.name.name), arity: len(d.params) }), _ -> a }));
+        let index = fold(range(0, len(defs)), map_new(), |acc: Map<Bytes, Int>, i: Int| map_insert(acc, at(defs, i).name, i));
+        Some({ r: x.r, index: index, defs: defs, bodies: bodies_of(x.mods, index),
+               builtins: fold(builtins, map_new(), |acc: Map<Bytes, Bool>, b: Bytes| map_insert(acc, b, true)) })
+      },
+    }
+  }
+}
+
+// Every append in the program, under the definition it is written in: `rounds <n>\n`, then each
+// definition with an append as a `def` frame followed by its `site` frames. Empty when the program does not resolve.
+pub fn costs_dump(names: List<Bytes>, srcs: List<Bytes>, builtins: List<Bytes>) -> String =
+  match program_of(names, srcs, builtins) {
+    None -> string_of_bytes(b""),
+    Some(p) -> {
+      let settled = fixpoint(p, start_tables(p.defs), 0);
+      let found = round(p, settled.tables);
+      string_of_bytes(bytes_concat_all(fold(range(0, len(p.bodies)), [bytes_concat_all([b"rounds ", num(settled.rounds), b"\n"])],
+        |acc: List<Bytes>, i: Int| {
+          let b: Body = at(p.bodies, i);
+          let f: Found = at(found, i);
+          if len(f.sites) == 0 { acc }
+          else { fold(f.sites, push(acc, def_frame(b)), |a: List<Bytes>, raw: Raw| push(a, finish(raw, b.def, settled.tables))) }
+        })))
+    },
+  }

@@ -50,8 +50,6 @@ pub struct Throughput {
     pub definitions: usize,
     pub tests: usize,
     pub pass: Pass,
-    /// `lower` over every test body once.
-    pub lower_test_bodies_millis: f64,
 }
 
 pub fn throughput(root: &Path, repeats: usize) -> Result<Throughput> {
@@ -60,30 +58,7 @@ pub fn throughput(root: &Path, repeats: usize) -> Result<Throughput> {
         root: root.display().to_string(),
         definitions: front.check.defs.len(),
         tests: front.check.tests.len(),
-        lower_test_bodies_millis: millis(lower_every_test_body(&front, repeats)),
         pass: one_pass(&front, repeats)?,
-    })
-}
-
-/// What the machine pays before a test's first transition.
-fn lower_every_test_body(front: &Front, repeats: usize) -> Duration {
-    let bodies: Vec<&ply_syntax::ast::Expr> = front
-        .program
-        .modules
-        .iter()
-        .flat_map(|m| m.items.iter())
-        .filter_map(|item| match item {
-            ply_syntax::ast::Item::Test(t) => Some(&t.body),
-            _ => None,
-        })
-        .collect();
-
-    best_of(repeats, || {
-        let started = Instant::now();
-        for body in &bodies {
-            black_box(ply_eval::lower(body));
-        }
-        started.elapsed()
     })
 }
 
@@ -335,31 +310,17 @@ pub fn multi_shot(repeats: usize) -> Result<MultiShot> {
     })
 }
 
-fn empty_prompt() -> Rc<Prompt> {
-    Rc::new(Prompt {
-        clauses: Rc::new(Vec::new()),
-        effects: Rc::new(Vec::new()),
-        ret: None,
-        clause_captures: Vec::new(),
-        ret_captures: Rc::from(Vec::new()),
-        module: 0,
-        span: Span::DUMMY,
-    })
-}
-
 /// `Stack::capture` and `Stack::resume` against frames pending in the captured segment.
 pub fn stack_cost(repeats: usize) -> Vec<StackPoint> {
     [8usize, 1_000, 100_000]
         .into_iter()
         .map(|pending| {
-            let mut stack = Stack::new().push_prompt(empty_prompt(), 0);
+            let mut stack = Stack::new().push_prompt(Rc::new(Prompt { span: Span::DUMMY }));
             for _ in 0..pending {
                 stack = stack.push(Frame::Call {
                     name: None,
                     call_site: Span::DUMMY,
                     memo: false,
-                    callee_window: 0,
-                    caller_window: 0,
                 });
             }
             let (k, below) = stack.capture(1, 0);
@@ -505,10 +466,6 @@ pub fn render(m: &Measurements) -> String {
             t.pass.first_pass_millis,
             t.pass.steady_pass_millis,
             t.pass.performs
-        ));
-        s.push_str(&format!(
-            "  lowering every test body once: {:.2} ms\n",
-            t.lower_test_bodies_millis
         ));
         s.push('\n');
     }

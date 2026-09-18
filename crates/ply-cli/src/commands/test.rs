@@ -1624,10 +1624,7 @@ fn display_width(s: &str) -> usize {
 
 /// A `reuse fn` whose promise the cost checker cannot show stops the run, as under `ply check`.
 pub(crate) fn broken_promises(loaded: &Loaded) -> Option<crate::load::LoadError> {
-    if !loaded.promised {
-        return None;
-    }
-    let diagnostics = crate::costs::promises(&loaded.program, &loaded.resolved);
+    let diagnostics = crate::costs::promises(loaded);
     (!diagnostics.is_empty()).then(|| crate::load::LoadError {
         sources: loaded.sources.clone(),
         diagnostics,

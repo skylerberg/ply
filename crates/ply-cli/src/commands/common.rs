@@ -379,13 +379,6 @@ pub fn counters_json(stats: &ply_eval::rc::Stats) -> Value {
         "updates": stats.updates,
         "updates_in_place": stats.updates_in_place,
         "in_place": stats.in_place(),
-        "takes_attempted": stats.takes_attempted,
-        "takes_moved": stats.takes_moved,
-        "dup_sites": stats.dup_sites,
-        "dup_emitted": stats.dup_emitted,
-        "drop_sites": stats.drop_sites,
-        "drop_emitted": stats.drop_emitted,
-        "elided": stats.elided(),
         "cycles": stats.cycles,
     })
 }
@@ -396,12 +389,9 @@ pub fn counters_line(stats: &ply_eval::rc::Stats) -> String {
         None => "n/a".to_string(),
     };
     format!(
-        "counters    in place {} of {} ({}) · moved {} of {} · elided {}",
+        "counters    in place {} of {} ({})",
         stats.updates_in_place,
         stats.updates,
         pct(stats.in_place()),
-        stats.takes_moved,
-        stats.takes_attempted,
-        pct(stats.elided()),
     )
 }

@@ -36,11 +36,6 @@ cargo test -p ply-compiler-diff --lib
 cargo test -p ply-compiler-diff --test suite -- fields:: --nocapture
 
 echo
-echo "==> the oracle for the stage after the front end: the lowered form"
-# Checks the lowered form is usable as an oracle: total, stable, and sensitive to slots and last reads.
-cargo test -p ply-compiler-diff --test suite -- lower:: --nocapture
-
-echo
 echo "==> the differential: this parser against crates/ply-syntax"
 # A run that executes nothing exits 0, so require a non-zero pass count.
 cargo test -p ply-compiler-diff --test suite -- agreement:: --nocapture --test-threads=2 |
@@ -85,12 +80,6 @@ grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-hash.log || {
   echo "the hash differential ran no tests at all -- see the note above" >&2
   exit 1
 }
-
-echo
-echo "==> the sixth differential: code.ply's lowering against ply_eval::code"
-# Compares only what the port claims to lower, and asserts the share it reaches.
-PLY_C_EMITTER="ply:$root/crates/ply-compiler/ply" cargo test -p ply-compiler-diff --test suite -- lower_diff:: --nocapture --test-threads=2 |
-  grep -E "input\(s\)|reaches|^test result|^error|panicked" || true
 
 echo
 echo "==> what compiling effects would have to carry, and the corpus for it"

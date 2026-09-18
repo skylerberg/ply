@@ -18,16 +18,8 @@ type Choice = Turn<Continuation, Value>;
 
 /// No scheduler decision looks inside a continuation, so an empty one stands in for a suspended task.
 fn suspended() -> Continuation {
-    let prompt = Rc::new(Prompt {
-        clauses: Rc::new(Vec::new()),
-        effects: Rc::new(Vec::new()),
-        ret: None,
-        clause_captures: Vec::new(),
-        ret_captures: Rc::from(Vec::new()),
-        module: 0,
-        span: Span::DUMMY,
-    });
-    Stack::new().push_prompt(prompt, 0).capture(1, 0).0
+    let prompt = Rc::new(Prompt { span: Span::DUMMY });
+    Stack::new().push_prompt(prompt).capture(1, 0).0
 }
 
 /// What a task does, in the order it does it.
