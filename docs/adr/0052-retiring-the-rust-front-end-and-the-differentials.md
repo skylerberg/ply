@@ -2036,7 +2036,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s, 153 s, 199 s, 381 s, 139 s, 168 s, 167 s, 211 s, 219 s, 193 s, 167 s and 173 s, each reusing by tree the same way and for the same reason. Ten of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, the sixth 199 s, the seventh 381 s and the eighth 211 s, which the entries closing this section take. None of those six was caused by the tree. The ninth and tenth, 219 s and 193 s, were: they are the handover's own cost, and the two entries closing this section take them together with the reading that placed it. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s, 153 s, 199 s, 381 s, 139 s, 168 s, 167 s, 211 s, 219 s, 193 s, 167 s, 173 s and 211 s, each reusing by tree the same way and for the same reason. Eleven of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, the sixth 199 s, the seventh 381 s and the eighth 211 s, which the entries closing this section take. None of those six was caused by the tree. The ninth and tenth, 219 s and 193 s, were: they are the handover's own cost, and the two entries closing this section take them together with the reading that placed it. The eleventh, 211 s again and not the run the eighth names, is the tree as well, and the entry closing this section takes it. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Twelve running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
@@ -2323,8 +2323,35 @@ merges too closely rather than from anything in the tree.
 
 **Why each of these got written at all.** The scripts that append a reading assert
 `wall < 173`; an over-bound one fails them and takes a different entry point that
-asserts the opposite. The guard is the reason eight excursions were each written
+asserts the opposite. The guard is the reason nine excursions were each written
 consciously instead of accumulating into a series nobody read.
+
+**Read, 2026-09-17: a bundle change costs one run, and the cache key says why.**
+`59d4c787`, the merge that routed the emitter through its own `qualify`, read
+211 s. Neither build leg is among the fourteen slowest jobs, so the by-tree
+lookup served this merge as it serves the rest. What moved is every partition
+at once: 161, 148, 140, 131, 128, 125, 123 and 108 s, against 141, 137, 122,
+119, 118, 94, 93 and 88 s on the merge before it, with `archive-tree-moved`
+under 48 s there and 136 s here. A slow runner is one job, which is what the
+222 s and the 199 s readings were. Eight together are the tree.
+
+The tree here is the object cache's key. `.github/actions/suite/action.yml`
+takes it from `hashFiles('crates/ply-codegen/src/**', 'crates/ply-compiler/**',
+'crates/ply-std/**')`, and this merge wrote two files under the second:
+`ply/emit.ply` and `bootstrap/unit.c.gz`. The primary key missed, the
+`restore-keys` prefix served an older cache whose entries were written by the
+emitter this merge replaced, and every partition emitted C that a hit would
+have handed it.
+
+The cost is paid once per emitter change -- not once, and not always. A merge
+that leaves the emitter alone hits the new key and pays nothing; one that
+touches it pays again, and §2's deletions will each touch it, so this is their
+standing cost rather than a fault in them. The run says the key was written:
+`actions/cache/save` ran and succeeded on all seventeen slots, the eight
+partitions and every solo job, so each now holds one under the new key. That
+the next run recovers is a prediction, and this record does not settle it: the
+next quiet merge either comes back to the band or it does not, and if it does
+not, the cause is not this.
 
 ## 4. The loop that is O(the change)
 
