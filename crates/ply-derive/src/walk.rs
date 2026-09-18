@@ -10,8 +10,7 @@ pub struct Blocker {
     pub span: Span,
     /// Completes "…^^^^ {reason}".
     pub reason: String,
-    /// The advice this particular refusal carries, when the reason alone does not say what to do
-    /// instead.
+    /// What to do instead, when the reason alone does not say.
     pub note: Option<&'static str>,
     /// Named in the note when the blocking type sits inside a variant rather than a record field.
     pub variant: Option<String>,
@@ -32,8 +31,7 @@ impl Blocker {
         self
     }
 
-    /// A record field is blamed as a whole — `on_complete: (Order) -> Unit` — because that is the
-    /// line the user edits, whatever depth the refusal was found at.
+    /// Blames the whole record field, the line the user edits, however deep the refusal was.
     fn at(mut self, span: Span) -> Blocker {
         self.span = span;
         self
@@ -58,9 +56,7 @@ pub fn check_decl(deriver: Deriver, def: &TypeDef) -> Result<(), Blocker> {
     }
 }
 
-/// A type parameter is derivable by assumption: the generated signature carries `where derivable(D,
-/// p)`, so a call site that instantiates it with something refused is the one that fails, and it
-/// fails naming its own type.
+/// Type parameters pass: the generated `where derivable(D, p)` makes the call site fail instead.
 pub fn check(deriver: Deriver, te: &TypeExpr) -> Result<(), Blocker> {
     match te {
         TypeExpr::Var(_) | TypeExpr::Unit { .. } => Ok(()),
@@ -87,8 +83,6 @@ pub fn check(deriver: Deriver, te: &TypeExpr) -> Result<(), Blocker> {
             {
                 return Err(Blocker::new(*span, rules::null_in_option(&rendered)));
             }
-            // A `Map`'s iteration order is what any encoding of it is a function of, so its key
-            // type must be ordered whichever deriver is walking.
             if simple == rules::MAP
                 && let Some(key) = args.first()
             {

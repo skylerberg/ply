@@ -15,8 +15,7 @@ pub enum Shape {
     Nominal,
 }
 
-/// A `Map`'s key type must be ordered whatever deriver is walking it: the map's iteration order is
-/// what a derived encoding of it is a function of.
+/// Its key type must be ordered for every deriver: a derived encoding follows iteration order.
 pub const MAP: &str = "Map";
 
 pub const OPTION: &str = "Option";
@@ -24,7 +23,6 @@ pub const OPTION: &str = "Option";
 /// The credential type.
 pub const SECRET: &str = "Secret";
 
-/// Whether a type constructor's JSON encoding can be the document `null`.
 pub fn json_null_encoded(name: &str) -> bool {
     matches!(name, "Unit" | OPTION)
 }
@@ -37,7 +35,7 @@ pub fn null_in_option(inner: &str) -> String {
     )
 }
 
-/// The advice that goes with [`null_in_option`], stated once because two crates print it.
+/// The advice that goes with [`null_in_option`]; two crates print it.
 pub const NULL_IN_OPTION_NOTE: &str = "wrap the inner value in a record or a one-field variant — both are tagged, and a tagged \
      encoding has no `null` to collide with";
 
@@ -64,7 +62,7 @@ impl Refusal {
         }
     }
 
-    /// The advice that goes with a `Secret` refusal, stated once because two crates print it.
+    /// The advice that goes with a `Secret` refusal; two crates print it.
     pub fn note(self) -> Option<&'static str> {
         match self {
             Refusal::Secret(Deriver::Ord) => Some(
@@ -82,13 +80,11 @@ impl Refusal {
     }
 }
 
-/// What a derivation of `deriver` would have had to do with a credential.
 fn secret_reason(deriver: Deriver) -> &'static str {
     match deriver {
         Deriver::Json => "a derived codec would write the credential into the document",
         Deriver::Ord => "a credential has no order",
-        // Unreachable while `eq` is the one deriver a `Secret` satisfies, and total rather than a
-        // panic because `Refusal` is a plain data type.
+        // Unreachable while `Secret` satisfies `eq`; total because `Refusal` is plain data.
         Deriver::Eq => "a credential has no structural equality to derive",
     }
 }
@@ -96,11 +92,8 @@ fn secret_reason(deriver: Deriver) -> &'static str {
 pub fn shape(deriver: Deriver, name: &str) -> Shape {
     match name {
         "Int" | "Bool" | "String" | "Bytes" | "Unit" | "Decimal" => Shape::Leaf,
-        // The eight fixed-width integer types are leaves for the same reason `Int` is: they have
-        // structural equality, a total order, and one obvious rendering.
         "U8" | "U16" | "U32" | "U64" | "I8" | "I16" | "I32" | "I64" => Shape::Leaf,
-        // A total order that disagrees with the language's `==` on its own keys is a lookup that
-        // fails to find what it just inserted, and `NaN` makes `<` non-total.
+        // `NaN` makes `<` non-total, so an ordered map could lose what it just inserted.
         "Float" => match deriver {
             Deriver::Ord => Shape::Refused(Refusal::FloatIsNotOrdered),
             _ => Shape::Leaf,
@@ -111,9 +104,8 @@ pub fn shape(deriver: Deriver, name: &str) -> Shape {
         "Ordering" | "Rounding" => Shape::Structural(0),
         "Cell" => Shape::Refused(Refusal::Handle("Cell")),
         "Task" => Shape::Refused(Refusal::Handle("Task")),
-        // `eq` is a `Leaf` rather than `Structural(1)`: the payload is compared by the evaluator in
-        // constant time and no generated body ever names it, so requiring `derivable(eq, a)` of the
-        // payload would be a constraint on a type nothing can reach.
+        // `eq` is a `Leaf`: the evaluator compares the payload in constant time and no generated
+        // body names it.
         SECRET => match deriver {
             Deriver::Eq => Shape::Leaf,
             other => Shape::Refused(Refusal::Secret(other)),
@@ -122,7 +114,6 @@ pub fn shape(deriver: Deriver, name: &str) -> Shape {
     }
 }
 
-/// What a function type is refused with.
 pub fn function_refusal(deriver: Deriver) -> &'static str {
     match deriver {
         Deriver::Json => "a function has no JSON encoding",
@@ -131,9 +122,7 @@ pub fn function_refusal(deriver: Deriver) -> &'static str {
     }
 }
 
-/// `snake_case(TypeName)`: insert `_` before an uppercase letter that follows a lowercase letter or
-/// a digit, and before the last uppercase of a run that is followed by a lowercase; then lowercase
-/// everything.
+/// `_` before an uppercase after a lowercase or digit, or ending an acronym run; then lowercase.
 pub fn snake_case(name: &str) -> String {
     let chars: Vec<char> = name.chars().collect();
     let mut out = String::with_capacity(name.len() + 4);
@@ -150,7 +139,6 @@ pub fn snake_case(name: &str) -> String {
     out
 }
 
-/// The name a derivation of `deriver` for `type_name` generates.
 pub fn generated_name(deriver: Deriver, type_name: &str) -> String {
     format!("{}_{}", snake_case(type_name), deriver.as_str())
 }

@@ -1,6 +1,5 @@
-//! Errors are collected, not returned: a failed item is abandoned, the token stream is
-//! resynchronised on the next item keyword, and parsing continues, so one run reports as many
-//! independent syntax errors as it can find.
+//! Errors are collected: a failed item is abandoned and parsing resumes at the next item
+//! keyword, so one run reports every independent syntax error.
 
 use crate::ast::*;
 use crate::lexer::{Kw, Token, TokenKind, lex};
@@ -9,13 +8,11 @@ use ply_span::{Diagnostic, SourceId, Span, codes};
 /// Signals that the enclosing construct was abandoned.
 pub struct Bail;
 
-/// What one comma-separated member of `{..}` turned out to be.
 enum RowMember {
     Atom(AtomExpr),
     Set(QName),
 }
 
-/// What one comma-separated member of an argument list turned out to be.
 enum Arg {
     Positional(Expr),
     Named(NamedArg),
@@ -23,11 +20,10 @@ enum Arg {
 
 type PResult<T> = Result<T, Bail>;
 
-/// Recursive descent walks the Rust stack, so nesting has to be capped before it overflows.
+/// Caps recursion before the Rust stack overflows.
 const MAX_DEPTH: u32 = 128;
 
-/// Parses a snippet as the anonymous module: it can neither import nor be imported, which is all a
-/// test or an editor scratch buffer needs.
+/// Parses a snippet as the anonymous module, which can neither import nor be imported.
 pub fn parse(source: SourceId, text: &str) -> Result<Module, Vec<Diagnostic>> {
     parse_module(source, ModuleName::anonymous(), text)
 }
@@ -45,7 +41,7 @@ pub fn parse_module(
     }
 }
 
-/// Parses as much as possible and hands back both the partial tree and every diagnostic.
+/// Returns the partial tree alongside every diagnostic.
 pub fn parse_recovering(
     source: SourceId,
     name: ModuleName,
@@ -54,7 +50,7 @@ pub fn parse_recovering(
     Parser::new(source, text).run(name)
 }
 
-/// **The tree before `effect_set`, `record_update` and `try_op` rewrite it.**
+/// The tree before the `effect_set`, `record_update` and `try_op` rewrites.
 #[doc(hidden)]
 pub fn parse_unexpanded(
     source: SourceId,
@@ -64,7 +60,6 @@ pub fn parse_unexpanded(
     Parser::new(source, text).run_unexpanded(name)
 }
 
-/// Each input becomes its own module.
 pub fn parse_program<'a>(
     inputs: impl IntoIterator<Item = (SourceId, ModuleName, &'a str)>,
 ) -> Result<Program, Vec<Diagnostic>> {
@@ -86,13 +81,9 @@ pub fn parse_expr(source: SourceId, text: &str) -> Result<Expr, Vec<Diagnostic>>
     let mut p = Parser::new(source, text);
     match p.expr() {
         Ok(mut e) if p.at(&TokenKind::Eof) && p.diags.is_empty() => {
-            // A bare expression has no module around it, so a record update here has no shape to
-            // resolve and every one refuses.
             if p.uses_record_update {
                 crate::record_update::expand_bare(&mut e, &mut p.diags);
             }
-            // Every `?` here refuses: a bare expression has no enclosing `fn`, so there is no
-            // written return type to read `Ok`/`Err` off.
             if p.uses_try {
                 crate::try_op::expand_bare(&mut e, &mut p.diags);
             }
@@ -114,17 +105,13 @@ struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     diags: Vec<Diagnostic>,
-    /// Inside an `if`/`match` scrutinee a `{` starts the arm block, never a record or block
-    /// expression.
+    /// In a scrutinee, where `{` opens the arm block rather than a record or block.
     no_brace: bool,
-    /// Inside a lambda's parameter list, where a `|` closes the list rather than being bit-or.
+    /// In a lambda's parameter list, where `|` closes the list rather than being bit-or.
     no_pipe: bool,
     depth: u32,
-    /// Whether the file declared an `effect set` or named one in a row.
     uses_effect_sets: bool,
-    /// Whether the file wrote `{..b, ...}` anywhere.
     uses_record_update: bool,
-    /// Whether the file wrote a `?` anywhere.
     uses_try: bool,
 }
 
@@ -162,8 +149,7 @@ impl Parser {
         self.tokens[self.pos.saturating_sub(1)].span
     }
 
-    /// Whether the `n` tokens after the cursor repeat the one at it with nothing between them,
-    /// which is the whole difference between `>>` and the error `a > > b` has always been.
+    /// Whether the next `n` tokens repeat this one with no gap, which tells `>>` from `> >`.
     fn joined(&self, n: usize) -> bool {
         let here = &self.tokens[self.pos];
         (1..=n).all(|i| match self.tokens.get(self.pos + i) {
@@ -192,7 +178,6 @@ impl Parser {
         matches!(self.kind(), TokenKind::Eof)
     }
 
-    /// The token `n` ahead, clamped at the end.
     fn peek_is(&self, n: usize, k: &TokenKind) -> bool {
         let i = (self.pos + n).min(self.tokens.len() - 1);
         &self.tokens[i].kind == k
@@ -251,8 +236,7 @@ impl Parser {
         }
     }
 
-    /// A field name: an identifier, or a keyword, since a field position has no other reading.
-    /// `keyword` says which it was, for the punned forms that need a variable too.
+    /// A field position also accepts a keyword; the `bool` says it was one.
     fn expect_field_name(&mut self, what: &str) -> PResult<(Ident, bool)> {
         if let TokenKind::Kw(k) = self.kind() {
             let name = k.as_str();
@@ -280,8 +264,7 @@ impl Parser {
         Bail
     }
 
-    /// `>=` immediately after a type parameter list is really `>` then `=`, as in `type Pair<a>=
-    /// ..`
+    /// Splits `>=` into `>` then `=`, as in `type Pair<a>= ..`.
     fn expect_gt(&mut self, what: &str) -> PResult<Span> {
         match self.kind() {
             TokenKind::Gt => Ok(self.advance()),
@@ -299,8 +282,7 @@ impl Parser {
     }
 
     fn push(&mut self, d: Diagnostic) {
-        // A single mistake usually trips several expectations at the same offset; only the first is
-        // informative.
+        // One mistake trips several expectations at the same offset; keep only the first.
         if let Some(last) = self.diags.last()
             && last.code == d.code
             && last.primary_span() == d.primary_span()
@@ -310,7 +292,7 @@ impl Parser {
         self.diags.push(d);
     }
 
-    /// Out of line, and that is not a style preference.
+    // Out of line: diagnostic builders inlined into the recursive frames overflow the stack.
     #[cold]
     #[inline(never)]
     fn no_named_arguments_on_a_perform(&mut self, effect: &QName, op: &Ident, named: &[NamedArg]) {
@@ -381,22 +363,18 @@ impl Parser {
         if self.uses_record_update {
             crate::record_update::expand(&mut module, &mut self.diags);
         }
-        // Last, by convention rather than by necessity.
         if self.uses_try {
             crate::try_op::expand(&mut module, &mut self.diags);
         }
         (module, self.diags)
     }
 
-    /// [`run`](Self::run) with the three rewrites above **not** run: the tree exactly as the
-    /// grammar built it, `ExprKind::Try` and `ExprKind::RecordUpdate` still in it and every effect
-    /// row still holding only the atoms that were written.
+    /// [`run`](Self::run) without the rewrites.
     fn run_unexpanded(mut self, name: ModuleName) -> (Module, Vec<Diagnostic>) {
         let module = self.parse_all(name);
         (module, self.diags)
     }
 
-    /// The grammar and the recovery loop, with no rewrite after them.
     fn parse_all(&mut self, name: ModuleName) -> Module {
         let source = self.source;
         let mut imports = self.imports();
@@ -425,8 +403,6 @@ impl Parser {
         }
     }
 
-    /// Every `import` precedes every item, so the import table is complete before any body is
-    /// parsed.
     fn imports(&mut self) -> Vec<ImportDecl> {
         let mut out = Vec::new();
         while self.at(&TokenKind::Kw(Kw::Import)) {
@@ -438,8 +414,6 @@ impl Parser {
         out
     }
 
-    /// Reported rather than silently accepted: a later pass would otherwise have to look ahead to
-    /// know what a name in an earlier body could mean.
     fn import_out_of_order(&mut self, first_item: Option<&Item>) {
         let span = self.span();
         let mut d = Diagnostic::error(
@@ -529,8 +503,7 @@ impl Parser {
             || self.at_reuse_start()
     }
 
-    /// `law` is contextual: it opens an item only when a quoted label follows, so `fn law(..)` and
-    /// a local named `law` keep their meaning.
+    /// `law` is contextual: an item only when a quoted label follows.
     fn at_law_start(&self) -> bool {
         self.at_ident_text("law")
             && (matches!(self.kind_at(1), TokenKind::Str(_))
@@ -538,21 +511,17 @@ impl Parser {
                     && matches!(self.kind_at(2), TokenKind::Ident(_))))
     }
 
-    /// `derive` is contextual for the same reason `law` is.
     fn at_derive_start(&self) -> bool {
         self.at_ident_text("derive") && matches!(self.kind_at(1), TokenKind::Ident(_))
     }
 
-    /// `reuse` is contextual too: it opens an item only when `fn` follows.
     fn at_reuse_start(&self) -> bool {
         self.at_ident_text("reuse") && matches!(self.kind_at(1), TokenKind::Kw(Kw::Fn))
     }
 
     fn recover_to_item(&mut self) {
         let mut depth = 0i32;
-        // Both callers consume the leading keyword before they can fail, so already being at an
-        // item start means progress was made and the token belongs to the next construct rather
-        // than the abandoned one.
+        // Callers consume the leading keyword first, so an item start here is the next item.
         if !self.at_eof() && !self.at_item_start() {
             self.advance();
         }
@@ -574,9 +543,7 @@ impl Parser {
         }
     }
 
-    /// A qualified reference uses `::` rather than `.` because with `.` it would be token-identical
-    /// to a perform and to a field access, and telling those apart needs scope information the
-    /// parser does not have.
+    /// `::` rather than `.`, which would be ambiguous with a perform or field access without scope.
     fn qname(&mut self, what: &str) -> PResult<QName> {
         let first = self.expect_ident(what)?;
         if !self.eat(&TokenKind::ColonColon) {
@@ -710,8 +677,6 @@ impl Parser {
                 break;
             }
         }
-        // A set denotes a ground set of atoms, so there is no tail to abstract over and `| e` here
-        // would have no meaning to give.
         if self.at(&TokenKind::Pipe) {
             let span = self.span();
             self.push(
@@ -733,8 +698,7 @@ impl Parser {
             name,
             atoms,
             includes,
-            // Filled by `effect_set::expand`, which needs every set in the file before it can
-            // resolve one.
+            // Filled by `effect_set::expand`, which needs every set in the file first.
             expansion: Vec::new(),
             span: start.to(close),
         })
@@ -758,9 +722,6 @@ impl Parser {
         })
     }
 
-    /// The derivers are fixed — there are no user-defined ones — so an unrecognized name is
-    /// reported here with the whole list rather than left to fail as an unknown reference in
-    /// generated code the user never wrote.
     fn deriver(&mut self, name: &Ident) -> PResult<Deriver> {
         match Deriver::from_name(name.name.as_str()) {
             Some(d) => Ok(d),
@@ -866,9 +827,7 @@ impl Parser {
         })
     }
 
-    /// `requires` and `ensures` are contextual, recognized only between a `fn` header and its body
-    /// — where the grammar previously admitted nothing but `=` and `{`, so no ordinary name loses
-    /// its meaning.
+    /// `requires`/`ensures` are contextual: recognized only between a `fn` header and its body.
     fn spec_clauses(&mut self) -> PResult<Vec<SpecClause>> {
         let mut out = Vec::new();
         loop {
@@ -880,8 +839,7 @@ impl Parser {
                 return Ok(out);
             };
             let start = self.advance();
-            // Parsed like an `if` condition: a `{` closes the clause and opens the function's block
-            // body, so `ensures p(x) { .. }` is a clause plus a body and never a record literal.
+            // A scrutinee, so `{` opens the fn body rather than a record literal.
             let expr = self.scrutinee()?;
             let span = start.to(expr.span);
             out.push(SpecClause { kind, expr, span });
@@ -942,8 +900,6 @@ impl Parser {
         })
     }
 
-    /// A binder's type is mandatory: inferring it would make a law's meaning depend on how its body
-    /// happened to be written.
     fn binder(&mut self) -> PResult<Binder> {
         let name = self.expect_ident("a binder name")?;
         self.expect(
@@ -972,8 +928,7 @@ impl Parser {
         } else {
             None
         };
-        // Parsed either way, so that a default written on a lambda is refused with the reason
-        // rather than with `expected `,` or `|``.
+        // Parsed either way so a lambda default gets a specific diagnostic.
         let default = if self.at(&TokenKind::Eq) {
             let eq = self.advance();
             let e = self.expr()?;
@@ -1072,8 +1027,7 @@ impl Parser {
         })
     }
 
-    /// `type T = A` is an alias; a sum needs either a leading `|`, a payload, or a second variant,
-    /// so that `type Id = Int` keeps meaning what it looks like.
+    /// A sum needs a leading `|`, a payload, or a second variant; `type Id = Int` is an alias.
     fn looks_like_variants(&self) -> bool {
         match self.kind() {
             TokenKind::Pipe => true,
@@ -1157,8 +1111,7 @@ impl Parser {
         })
     }
 
-    /// An operation parameter may be written `name: Type` for documentation; only the type is part
-    /// of the signature.
+    /// An optional `name:` is documentation only; the type is the signature.
     fn op_param(&mut self) -> PResult<TypeExpr> {
         if matches!(self.kind(), TokenKind::Ident(_)) && matches!(self.kind_at(1), TokenKind::Colon)
         {
@@ -1241,7 +1194,7 @@ impl Parser {
                 if params.len() == 1 {
                     return Ok(params.into_iter().next().expect("length checked"));
                 }
-                // Two or more make a tuple: the record `{_0: A, _1: B}` (GUIDE §5.3).
+                // A tuple is the record `{_0: A, _1: B}`.
                 Ok(TypeExpr::Record {
                     fields: params
                         .into_iter()
@@ -1272,8 +1225,6 @@ impl Parser {
                         span: start.to(close),
                     });
                 }
-                // A type parameter is bound by the enclosing `<..>`, never by a module, so only a
-                // bare lowercase name can be one.
                 if q.is_bare() && !starts_upper(q.symbol()) {
                     return Ok(TypeExpr::Var(q.name));
                 }
@@ -1345,8 +1296,7 @@ impl Parser {
                 span: start.to(close),
             });
         }
-        // A whole row that is a bare name is still a row *variable*: a set is only ever written
-        // inside braces, so `/ e` keeps the meaning it has.
+        // A bare name is a row variable; a set is only ever written inside braces.
         let tail = self.expect_ident("an effect row: `{..}` or a row variable")?;
         Ok(RowExpr {
             atoms: Vec::new(),
@@ -1356,7 +1306,6 @@ impl Parser {
         })
     }
 
-    /// One member of a row or of an `effect set`.
     fn row_member(&mut self, what: &str) -> PResult<RowMember> {
         let name = self.qname(what)?;
         if !self.at(&TokenKind::Dot) {
@@ -1366,7 +1315,7 @@ impl Parser {
         Ok(RowMember::Atom(self.atom_rest(name)?))
     }
 
-    /// The atom after its effect name and the `.` have been consumed.
+    /// Entered after the effect name and `.`.
     fn atom_rest(&mut self, effect: QName) -> PResult<AtomExpr> {
         let mode = self.mode()?;
         let resource = if self.at(&TokenKind::LBracket) {
@@ -1397,11 +1346,9 @@ impl Parser {
         r
     }
 
-    /// The operator at the cursor, its binding power, and how many tokens it spans; only a shift
-    /// is wider than one, because `>>` is not lexed and `Map<Int, List<Int>>` is why.
+    /// `(op, binding power, tokens spanned)`; shifts span several because `>>` is never lexed.
     fn peek_bin_op(&self) -> Option<(BinOp, u8, usize)> {
-        // A lambda's parameter list ends in a `|`, and a parameter's default is an expression, so
-        // `|x = 1| x` would otherwise read the closing pipe as bit-or and swallow the body.
+        // Otherwise `|x = 1| x` reads the closing pipe as bit-or.
         if self.no_pipe && matches!(self.kind(), TokenKind::Pipe) {
             return None;
         }
@@ -1468,7 +1415,6 @@ impl Parser {
             match self.kind() {
                 TokenKind::LParen => e = self.apply_to(e)?,
                 TokenKind::Dot => {
-                    // `db.get[users](k)` performs an effect; `r.f` reads a field.
                     let effect = match &e.kind {
                         ExprKind::Var(v)
                             if matches!(self.kind_at(1), TokenKind::Ident(_))
@@ -1496,8 +1442,6 @@ impl Parser {
                     };
                     e = self.perform_on(e, effect)?;
                 }
-                // Tightest tier, alongside `f(x)` and `r.field`, so `f(x)?.g` is `(f(x)?).g` and
-                // `-x?` is `-(x?)`
                 TokenKind::Question => {
                     let close = self.advance();
                     let span = e.span.to(close);
@@ -1525,7 +1469,7 @@ impl Parser {
         Ok(Some(r))
     }
 
-    /// `f(..)`, out of line.
+    // Out of line to keep the recursive `postfix_expr` frame small.
     #[inline(never)]
     fn apply_to(&mut self, func: Expr) -> PResult<Expr> {
         let (args, named, close) = self.call_args()?;
@@ -1540,14 +1484,12 @@ impl Parser {
         })
     }
 
-    /// `e.op[r](..)`, out of line for the reason [`Self::apply_to`] gives.
+    // Out of line, as `apply_to`.
     #[inline(never)]
     fn perform_on(&mut self, base: Expr, effect: QName) -> PResult<Expr> {
         let op = self.expect_ident("an operation name")?;
         let resource = self.opt_resource()?;
         let (args, named, close) = self.call_args()?;
-        // An operation has no defaults to fill and a handler clause must bind exactly what it
-        // declares, so there is nothing for a name to select.
         if !named.is_empty() {
             self.no_named_arguments_on_a_perform(&effect, &op, &named);
         }
@@ -1575,9 +1517,6 @@ impl Parser {
             for arg in parsed {
                 match arg {
                     Arg::Positional(e) => {
-                        // Ordering is the parser's to enforce because it is a property of the text;
-                        // which *names* are legal needs the callee's signature and is
-                        // `defaults::expand`'s.
                         if let Some(first) = named.first() {
                             self.positional_after_named(e.span, first.span);
                         }
@@ -1592,7 +1531,6 @@ impl Parser {
         r
     }
 
-    /// `name: value` is a named argument; anything else is positional.
     fn call_arg(&mut self) -> PResult<Arg> {
         if let TokenKind::Ident(name) = self.kind()
             && self.peek_is(1, &TokenKind::Colon)
@@ -1674,7 +1612,6 @@ impl Parser {
                 {
                     return self.with_region_expr();
                 }
-                // Contextual, like `with_cell`: `simulate` stays an identifier everywhere else.
                 if name.as_str() == "simulate"
                     && !self.no_brace
                     && matches!(self.kind_at(1), TokenKind::LBrace)
@@ -1699,7 +1636,6 @@ impl Parser {
                     })
                 } else {
                     self.expr().and_then(|mut inner| {
-                        // Two or more make a tuple: the record `{_0: a, _1: b}` (GUIDE §5.3).
                         if self.at(&TokenKind::Comma) {
                             self.advance();
                             let mut items = vec![inner];
@@ -1765,8 +1701,7 @@ impl Parser {
         }
     }
 
-    /// `{x: e}` and `{x, y}` are records; `{x}` is a block whose value is `x`. A keyword in the
-    /// name's place reads the same way, since no block starts with a keyword and `:` or `,`.
+    /// `{x: e}` and `{x, y}` are records; `{x}` is a block.
     fn at_record_literal(&self) -> bool {
         if matches!(self.kind_at(1), TokenKind::DotDot) {
             return true;
@@ -1787,8 +1722,6 @@ impl Parser {
         let base = if self.at(&TokenKind::DotDot) {
             self.uses_record_update = true;
             let b = self.record_update_base()?;
-            // `{..b}` is the whole expression when no comma follows; otherwise the comma separates
-            // the base from the fields that replace.
             if !self.at(&TokenKind::RBrace) {
                 self.expect(&TokenKind::Comma, "`,` after the record being updated")?;
             }
@@ -1808,12 +1741,10 @@ impl Parser {
         })
     }
 
-    /// The base of an update is a **path** — `s`, `state.limits` — and not an arbitrary expression.
+    /// A path such as `state.limits`, not an arbitrary expression.
     fn record_update_base(&mut self) -> PResult<Expr> {
         let dots = self.advance();
         if matches!(self.kind(), TokenKind::Dot) {
-            // `...b`: `..` then `.`, which would otherwise report the useless "expected a name,
-            // found `.`"
             let span = self.span();
             self.push(
                 Diagnostic::error(
@@ -1952,8 +1883,7 @@ impl Parser {
             None
         };
         let saved = std::mem::replace(&mut self.no_pipe, false);
-        // With a return type written the body is a block, as a `fn`'s is after its `->`: the
-        // type's end and the body's start are then unambiguous.
+        // With a return type the body must be a block, or the type's end is ambiguous.
         let body = if ret.is_some() {
             if self.at(&TokenKind::LBrace) {
                 self.block_expr()
@@ -2119,7 +2049,6 @@ impl Parser {
             open,
             "`)` to close the clause parameters",
         )?;
-        // `resume` is a keyword only here, between a clause's `)` and its `->`.
         let resume = if self.at_ident_text("resume") {
             self.advance();
             Some(self.expect_ident("a name to bind the continuation to")?)
@@ -2262,8 +2191,6 @@ impl Parser {
                     span: start,
                 })
             }
-            // A negative literal is one pattern rather than an operator applied to one, because a
-            // pattern is not an expression and there is nothing to apply.
             TokenKind::Minus
                 if matches!(
                     self.kind_at(1),
@@ -2276,8 +2203,7 @@ impl Parser {
                 self.advance();
                 let lit = match self.kind().clone() {
                     TokenKind::Int(v) => Lit::Int(-v),
-                    // Negated at the type's own width, where `-128i8` is a value and `128i8` is
-                    // not, so the smallest value of every signed type is writable in a pattern.
+                    // Negated at the type's width so `-128i8` is writable.
                     TokenKind::Fixed { ty, bits } => Lit::Fixed {
                         ty,
                         bits: ty.normalize((ty.value(bits) as i64).wrapping_neg() as u64),
@@ -2333,7 +2259,6 @@ impl Parser {
                     });
                 }
                 let mut inner = self.pattern()?;
-                // Two or more make a tuple pattern: the exact record pattern `{_0: p, _1: q}`.
                 if self.at(&TokenKind::Comma) {
                     self.advance();
                     let mut items = vec![inner];
@@ -2492,11 +2417,9 @@ impl Parser {
     }
 }
 
-/// One implementation, in `ast`, because [`ast::is_default_expr`] asks the same question of a
-/// default's callee that the grammar asks of a pattern.
 use crate::ast::is_ctor_name as starts_upper;
 
-/// Expressions that end in `}` may stand as a statement without a `;`.
+/// Ends in `}`, so may stand as a statement without a `;`.
 fn is_block_like(kind: &ExprKind) -> bool {
     matches!(
         kind,
@@ -2510,12 +2433,10 @@ fn is_block_like(kind: &ExprKind) -> bool {
     )
 }
 
-/// The one binding power no token carries on its own, since a shift is assembled from adjacent
-/// `Gt`/`Lt` by [`Parser::peek_bin_op`].
+/// Shifts are assembled from adjacent `Gt`/`Lt` by [`Parser::peek_bin_op`].
 const SHIFT_BP: u8 = 7;
 
-/// Loosest to tightest, 1 to 10; the numbers renumbered when the bit operators took four levels
-/// but no existing operator's relative order moved, so no program's parse tree did either.
+/// Binding powers, loosest (1) to tightest (10).
 fn bin_op(k: &TokenKind) -> Option<(BinOp, u8)> {
     Some(match k {
         TokenKind::PipePipe => (BinOp::Or, 1),

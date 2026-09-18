@@ -1,24 +1,9 @@
-//! The tree back as source.
-//!
-//! A program reconstructed from stored bodies is an AST with no text, and the whole Ply emitter is
-//! a front end: it reads text. This is what hands one to the other, so that a bisection's mixture
-//! and a textless artifact run on the emitter everything else does rather than on the reference
-//! fragment, which compiles no `perform`.
-//!
-//! Faithful rather than pretty. Every operand that is not atomic is parenthesized, so precedence
-//! never has to be reasoned about; every statement takes its `;`; and each form is spelled the one
-//! way `parser.rs` reads back to the same tree -- `{x}` is a block and `{x: x}` the record, an `if`
-//! with no `else` is the one whose else branch is the unit literal, a single-variant sum keeps its
-//! leading `|`, a call through a field is `(r.f)(x)` because `r.f(x)` performs an effect, and a
-//! function type in return position is parenthesized so a row after it binds to the right arrow.
-//! Two round trips hold this: every surface file in the tree through the parser's unexpanded
-//! entry, compared by the span-free dumper and as a fixpoint of this printer's own output; and
-//! every reconstructed program, compared by definition hash.
+//! The tree back as source, for programs reconstructed from stored bodies with no text.
+//! Faithful rather than pretty: each form is spelled the one way the parser reads back unchanged.
 
 use crate::ast::*;
 use crate::lexer::render_decimal;
 
-/// Every module of `p` as `(name, text)`, keyed the way the emitter is handed texts.
 pub fn program(p: &Program) -> Vec<(String, String)> {
     p.modules
         .iter()
@@ -250,6 +235,7 @@ impl Printer {
         match &t.body {
             TypeDefBody::Alias(a) => self.ty(a),
             TypeDefBody::Sum(vs) => {
+                // Every variant keeps its `|`: a single-variant sum without one reads as an alias.
                 for v in vs {
                     self.push("| ");
                     self.push(v.name.name.as_str());
@@ -293,8 +279,7 @@ impl Printer {
             TypeExpr::Var(i) => self.push(i.name.as_str()),
             TypeExpr::Con { name, args, .. } => {
                 self.push(&name.to_string());
-                // A bare lowercase name reads back as a type variable, so a reconstructed
-                // program's `d…` types keep their argument list even when it is empty.
+                // A bare lowercase name reads back as a type variable, so it keeps an empty `<>`.
                 if !args.is_empty() || (name.is_bare() && !is_ctor_name(name.symbol())) {
                     self.push("<");
                     self.sep(args, |p, a| p.ty(a));
@@ -329,8 +314,7 @@ impl Printer {
         }
     }
 
-    /// A function type after `->`, parenthesized: a row written after it would otherwise bind
-    /// to the inner arrow.
+    /// Parenthesizes a function type after `->`, or a row after it would bind to the inner arrow.
     fn ret_ty(&mut self, t: &TypeExpr) {
         if matches!(t, TypeExpr::Fn { .. }) {
             self.push("(");
@@ -383,8 +367,7 @@ impl Printer {
         }
     }
 
-    /// One primary the parser reads whole, which is what may stand bare as an operand, a
-    /// scrutinee, or the base of a field or `?`.
+    /// A primary the parser reads whole, so it may stand bare as an operand or scrutinee.
     fn atomic(e: &Expr) -> bool {
         matches!(
             e.kind,

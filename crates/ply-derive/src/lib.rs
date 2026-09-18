@@ -57,25 +57,20 @@ pub fn preview(module: &Module) -> Vec<String> {
 /// What one module's derivations produced.
 struct Expansion {
     generated: Vec<(String, FnDef)>,
-    /// Module binders the generated bodies write, for a runtime module the file imported without
-    /// binding one.
+    /// Binders added for a runtime module the file imported without binding one.
     imports: Vec<ImportDecl>,
     diags: Vec<Diagnostic>,
 }
 
 struct Expander<'a> {
     module: &'a Module,
-    /// The module's own type declarations, by simple name, in source order.
     types: IndexMap<Symbol, &'a TypeDef>,
-    /// Those of them that are parameterless aliases, which a written type is resolved through
-    /// before a `Map`'s key form is chosen.
+    /// The parameterless aliases among `types`, followed when choosing a `Map`'s key form.
     aliases: emit::Aliases<'a>,
-    /// Generated name -> the `derive` that claimed it, for the collision that `snake_case` being
-    /// total makes possible.
+    /// Generated name -> the `derive` that claimed it; `snake_case` can map two types to one name.
     claimed: IndexMap<String, &'a DeriveDef>,
     generated: Vec<(String, FnDef)>,
-    /// Runtime module name -> the binder its calls are written under, and the import that binds it
-    /// when this expansion had to add one.
+    /// Runtime module -> its binder, and the import this expansion added for it, if any.
     runtimes: IndexMap<String, (String, Option<ImportDecl>)>,
     diags: Vec<Diagnostic>,
 }
@@ -153,9 +148,7 @@ impl<'a> Expander<'a> {
         }
     }
 
-    /// Parsing what was just printed is the deriver's own round-trip check: a generated body that
-    /// does not parse is Ply's fault and is caught here rather than as a syntax error against a
-    /// file that does not contain it.
+    /// Round-trip check: an unparseable generated body is an internal error, not the user's.
     fn parse_generated(&self, source: &str) -> Option<FnDef> {
         let (parsed, diags) =
             parse_recovering(self.module.source, self.module.name.clone(), source);
