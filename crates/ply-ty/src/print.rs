@@ -3,9 +3,7 @@
 use crate::ty::{Row, RowVar, Scheme, TyVar, Type};
 use rustc_hash::FxHashMap;
 
-/// A cell's region has to be visible to inference — it decides which resource the `cell.read` /
-/// `cell.write` atoms name — but must not collide with a user type, hence a constructor name no
-/// lexer can produce.
+/// A constructor name no lexer can produce, so a cell's region type never collides with a user's.
 pub const REGION_PREFIX: &str = "#region:";
 
 pub fn region_type_name(resource: &str) -> String {

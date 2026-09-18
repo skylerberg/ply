@@ -1,13 +1,8 @@
-//! The C every emitted unit opens with: the value model's layout, the runtime's declarations, and
-//! the handful of operations that must be inline for a C compiler to see through them.
-//!
-//! Everything here mirrors something in `heap.rs` or `rt.rs` and is checked against it by
-//! `crate::c::tests::the_prelude_agrees_with_the_layouts_it_mirrors` — a header that drifts from
-//! the Rust it describes is a wrong answer, not a slow one.
+//! The C every emitted unit opens with. It mirrors `heap.rs` and `rt.rs`, and
+//! `the_prelude_agrees_with_the_layouts_it_mirrors` checks it against them.
 
-/// The layouts, and the inline operations. `rt_*` is declared rather than defined: the loader
-/// binds the addresses through [`super::BIND`] after `dlopen`, because a shared object cannot see
-/// symbols the host executable did not export.
+/// `rt_*` is declared, not defined: `ply_bind` supplies the addresses after `dlopen`, since a
+/// shared object cannot see symbols the host executable did not export.
 pub const PRELUDE: &str = r#"
 #include <stdint.h>
 #include <string.h>
@@ -109,9 +104,7 @@ static inline Word ply_field_at(Word base, int at) { return ply_words(base)[at];
 static inline void ply_set_field(Word base, int at, Word v) { ply_words(base)[at] = v; }
 "#;
 
-/// One runtime helper the emitted C may call: its name, how many arguments it takes past the
-/// context, and whether it answers a word. The table is what both the declarations and the
-/// binding are generated from, so a helper cannot be declared and left unbound.
+/// A runtime helper the emitted C may call: arguments past the context, and whether it answers.
 pub struct Helper {
     pub name: &'static str,
     pub args: usize,
@@ -193,8 +186,7 @@ helpers![
     ("rt_map_lookup", 2, true),
 ];
 
-/// The declarations, the function-pointer table and the exported binder, generated from
-/// [`HELPERS`] so the three cannot disagree.
+/// The declarations, function-pointer table and exported binder, all generated from [`HELPERS`].
 pub fn runtime_decls() -> String {
     let mut out = String::from("\n/* --- the runtime, bound at load --- */\n");
     for h in HELPERS {
@@ -208,13 +200,7 @@ pub fn runtime_decls() -> String {
             pointer_name(h.name)
         ));
     }
-    // `heap::dec`, with the counted case inline and a call only for the release itself.
-    //
-    // `rt_dec` is `release_last`: it frees *unconditionally*, because it is the `rc == 1` case a
-    // caller has already established, and the count test below is what establishes it. This tier
-    // once called it bare, so every release freed an object whatever else was holding it, and
-    // `fold(xs, 0, add) + len(xs)` read a freed list. Three lines of Ply, and it had been in the
-    // tier from its first commit.
+    // Trap: `rt_dec` frees unconditionally (it is `release_last`); only call it once `rc == 1`.
     out.push_str(
         "\nstatic inline void ply_dec(PlyCtx *ctx, Word w) {\n\
          \x20 if (ply_is_imm(w) || w == 0) return;\n\
@@ -224,10 +210,7 @@ pub fn runtime_decls() -> String {
          \x20 rt_dec_p(ctx, w);\n\
          }\n",
     );
-    // The three singletons, bound rather than baked. They are heap addresses, so writing them into
-    // the source made the source different in every process -- which is invisible while a unit is
-    // compiled and thrown away, and fatal the moment one is *kept*: a cached object would carry
-    // another run's pointers. Bound here, the emitted C is a function of the program alone.
+    // Singletons are heap addresses: bound at load, not baked in, or cached objects break.
     out.push_str("\nstatic Word ply_true, ply_false, ply_unit;\n");
     out.push_str(
         "void ply_bind_singletons(Word t, Word f, Word u) { ply_true = t; ply_false = f; ply_unit = u; }\n",
@@ -248,8 +231,7 @@ pub fn runtime_decls() -> String {
     out
 }
 
-/// A helper's function-pointer name. The pointer is not the helper's own name, so a unit that
-/// forgets to bind one is a link error rather than a call into the host's copy.
+/// A helper's function-pointer name; distinct from the helper's, so a missed binding fails to link.
 pub fn pointer_name(helper: &str) -> String {
     format!("{helper}_p")
 }

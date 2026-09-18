@@ -1,5 +1,3 @@
-//! Pinned: concurrent crates are written against these shapes.
-
 use ply_span::Symbol;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,8 +58,6 @@ impl EffectAtom {
         }
     }
 
-    /// Two atoms contend iff they name the same resource of the same effect and at least one
-    /// writes.
     pub fn conflicts_with(&self, other: &EffectAtom) -> bool {
         self.effect == other.effect
             && self.resource == other.resource
@@ -178,8 +174,6 @@ impl Footprint {
     }
 
     pub fn conflicts_with(&self, other: &Footprint) -> bool {
-        // Both sides are sorted by (effect, resource, mode), so a merge walk would beat this; the
-        // sets are small enough that it has not mattered.
         self.0
             .iter()
             .any(|a| other.0.iter().any(|b| a.conflicts_with(b)))
@@ -272,12 +266,9 @@ impl Type {
     }
 }
 
-/// The builtin type constructor the secret containment claim is about.
 pub const SECRET: &str = "Secret";
 
-/// `Some(n)` when a record's `len` fields are exactly `_0` to `_{n-1}` — the record a tuple is
-/// sugar for (GUIDE §5.3) — so it can be shown as the tuple it was written as. Two or more make
-/// a tuple, so a lone `_0` is a record.
+/// `Some(n)` when a record's fields are exactly `_0` to `_{n-1}` with `n >= 2`: a tuple.
 pub fn tuple_arity(len: usize, has: impl Fn(&Symbol) -> bool) -> Option<usize> {
     (len >= 2 && (0..len).all(|i| has(&Symbol::new(format!("_{i}"))))).then_some(len)
 }
@@ -341,13 +332,7 @@ impl fmt::Display for Scheme {
     }
 }
 
-/// A fixed-width integer type: eight of them, the widths the machine has.
-///
-/// `Int` is not one of these and is not a member of the family. It is the type a program counts
-/// and indexes with, and it stays exactly what it was — sixty-four bits, signed, checked. These
-/// exist for the algorithms that are *written* in a width: a hash's thirty-two-bit word, a byte,
-/// a wire format's field. Arithmetic on them is checked as `Int`'s is; `wrap_add` and its siblings
-/// are how a program says it meant the wrap.
+/// A fixed-width integer type; `Int` is not one. Arithmetic is checked unless `wrap_*` is used.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum IntTy {
     U8,
@@ -360,7 +345,6 @@ pub enum IntTy {
     I64,
 }
 
-/// Every fixed-width integer type, in the order the guide lists them.
 pub const INT_TYPES: [IntTy; 8] = [
     IntTy::U8,
     IntTy::U16,
@@ -448,8 +432,7 @@ impl IntTy {
         }
     }
 
-    /// The smallest value, as an `i128` so that a signed minimum and an unsigned zero are one
-    /// vocabulary.
+    /// The smallest value, as an `i128`.
     pub fn min(self) -> i128 {
         if self.signed() {
             -(1i128 << (self.bits() - 1))
@@ -458,14 +441,12 @@ impl IntTy {
         }
     }
 
-    /// Whether `v` — a literal's value, or an `Int` being converted — is one of this type's.
+    /// Whether `v` is one of this type's values.
     pub fn holds(self, v: i128) -> bool {
         v >= self.min() && v <= self.max() as i128
     }
 
-    /// `bits` reduced to this width and then extended the way this type reads it: zero-extended
-    /// when unsigned, sign-extended when signed. Every `Fixed` in the tree is in this form, so
-    /// two of one type compare, hash and render as that type orders them.
+    /// Truncated to this width, then zero- or sign-extended; every `Fixed` is in this form.
     pub fn normalize(self, bits: u64) -> u64 {
         let w = self.bits();
         if w == 64 {

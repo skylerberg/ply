@@ -1,8 +1,5 @@
-//! The host boundary from the compiled tier: a `perform` nothing on the stack answers reaches
-//! the binding the context carries, through the machine's checks in the machine's order, and a
-//! pending answer is waited on the reactor. What is not here is the production region the host
-//! policy opens for a `task` operation outside any `simulate`; the fixpoint leaves such a
-//! performer to the machine.
+//! The host boundary from the compiled tier: an unhandled `perform` reaches the context's binding
+//! through the machine's checks, in the machine's order.
 
 use crate::heap::{self, Word};
 use crate::rt::{Ctx, values_taken};
@@ -19,15 +16,14 @@ use ply_eval::{
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::sync::Arc;
 
-/// An at-most-once host operation an entry performed: what a second resumption across it would
-/// replay.
+/// An at-most-once host operation an entry performed, which a second resumption would replay.
 pub(crate) struct HostMark {
     operation: String,
     path: &'static str,
     span: Span,
 }
 
-/// `E0426` -- a second resumption across an at-most-once host operation.
+/// A second resumption across an at-most-once host operation.
 #[cold]
 #[inline(never)]
 pub(crate) fn err_continuation_resumed(
@@ -94,8 +90,6 @@ pub unsafe fn perform(
         };
         return c.fail(d);
     };
-    // A `task` operation the binding serves opens the production region with the performer's
-    // stack as the root task, and is answered by its scheduler.
     if effect.as_str() == "task" && TASK_OPS.contains(&op.as_str()) {
         let words: Vec<Word> = values.iter().map(|v| c.word(v)).collect();
         if !unsafe { crate::simulate::open_production(ctx, effect, op) } {

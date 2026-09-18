@@ -1,27 +1,5 @@
-//! The printed forms of [`crate::print`], read back: what `print_scheme` wrote for a scheme is
-//! parsed into a scheme that prints the same text. The grammar is the printer's, by construction:
-//!
-//! ```text
-//! scheme    := ( '<' vars '>' | '<' vars ' | ' rowvars '>' | '<| ' rowvars '>' )? type
-//! type      := var | con | fn | tuple | record
-//! var       := one of "abcdghijklmnopqrsuvwxyz", then digits for the round after the first
-//! con       := name ( '<' type ( ', ' type )* '>' )?
-//!            | 'Cell[' region ']<' type '>'         Cell with a known region
-//!            | 'Cell<' type '>'                     Cell whose region is unresolved
-//! fn        := '(' ( type ( ', ' type )* )? ') -> ' type ( ' / ' row )?
-//! tuple     := '(' type ', ' type ( ', ' type )* ')'   the record { _0, _1, .. }
-//! record    := '{' ( field ': ' type ( ', ' field ': ' type )* )? '}'
-//! row       := rowvar | '{' ( atom ( ', ' atom )* )? '}' | '{' atom ( ', ' atom )* ' | ' rowvar '}'
-//! rowvar    := one of "eft", then digits for the round after the first
-//! atom      := effect '.' ( 'read' | 'write' ) ( '[' resource ']' )?
-//! footprint := ( atom ( ',' atom )* )?                 as the check dump joins them
-//! ```
-//!
-//! Variables are numbered by first appearance, a scheme's quantifier head first, so two parses of
-//! one text are equal and `print(parse(print(t))) == print(t)`. The printer is not injective and
-//! this does not pretend otherwise: `Cell<Int>` hides which variable its region was, and a
-//! function whose result is a function shares one ` / row` position between the two, so the parse
-//! attaches such a row to the inner function. Both print back to the text they were read from.
+//! Reads back the text [`crate::print`] writes, so `print(parse(print(t))) == print(t)`; the
+//! printer is not injective (`Cell<Int>` hides its region variable).
 
 use crate::ty::{EffectAtom, Footprint, Mode, Resource, Row, RowVar, Scheme, TyVar, Type};
 use ply_span::Symbol;
@@ -132,8 +110,7 @@ impl<'a> Parser<'a> {
         format!("{what} at byte {} of `{}`", self.at, self.text)
     }
 
-    /// A name as the printer writes one: identifier characters and the dots of a program-wide
-    /// name, and `#` with `:` for the region constructor no lexer can produce.
+    /// Identifier characters, the dots of a program-wide name, and `#`/`:` in a region name.
     fn name(&mut self, what: &str) -> Result<&'a str, String> {
         self.skip_spaces();
         let start = self.at;
@@ -270,8 +247,7 @@ impl<'a> Parser<'a> {
         Ok(Type::Con(Symbol::new(name), args))
     }
 
-    /// `(` opens a function's parameter list or a tuple; which one is decided by what follows the
-    /// `)`.
+    /// A parameter list or a tuple, decided by whether `->` follows.
     fn parens(&mut self) -> Result<Type, String> {
         self.expect("(")?;
         let mut items = Vec::new();

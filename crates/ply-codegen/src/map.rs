@@ -1,12 +1,5 @@
-//! The compiled map (ADR 0036): an ordered B-tree over words, after ADR 0034's representation
-//! gate — asked of the sorted array the map was — found a shared insert's cost growing with the
-//! map's size. A map object holds its entry count and the root of a tree whose leaves are sorted
-//! runs of `WIDTH` key–value pairs and whose branches hold up to `WIDTH` children beside each
-//! child's greatest key. An insert or a removal walks one path, writing in place along what is
-//! held once and copying one node per level where it is not; a probe walks the same path with a
-//! binary search at each node; iteration is in key order, which is the interpreter's. Keys are
-//! ordered by [`heap::cmp_words`], so a native map holds its entries where the interpreter's
-//! would.
+//! The compiled map: a B-tree over words, keyed by [`heap::cmp_words`] so iteration matches the
+//! interpreter's. Writes go in place along what is held once, else copy one node per level.
 
 use crate::heap::{
     self, Heap, KIND_MAP, KIND_MBRANCH, KIND_MLEAF, Layouts, Obj, Word, dec, inc, is_unique, obj,
@@ -17,8 +10,8 @@ use std::cmp::Ordering;
 /// Pairs per leaf, and children per branch.
 pub const WIDTH: usize = 32;
 
-/// A branch's payload: its children first — with room for one over `WIDTH`, which is what an
-/// insert makes before the branch splits — then, from `KEYS`, each child's greatest key.
+/// A branch's payload: children (room for `WIDTH + 1` before a split), then from `KEYS` each
+/// child's greatest key.
 pub const KEYS: usize = WIDTH + 1;
 
 pub fn root(m: *mut Obj) -> Word {
@@ -64,8 +57,7 @@ fn max_key(node: *mut Obj) -> Word {
     }
 }
 
-/// The word ranges a node's children occupy: a leaf's pairs, or a branch's children and its
-/// keys.
+/// The word ranges a node's children occupy: a leaf's pairs, or a branch's children and keys.
 pub fn child_words(node: *mut Obj) -> impl Iterator<Item = usize> {
     let n = count(node);
     let (pairs, branch) = if is_leaf(node) {
@@ -90,8 +82,7 @@ fn leaf_find(layouts: &Layouts, leaf: *mut Obj, k: Word) -> Result<usize, usize>
     Err(lo)
 }
 
-/// The child of a branch that holds `k` or would: the first whose greatest key is not below
-/// it, and the last when every key is.
+/// The child that holds `k` or would: the first whose greatest key is `>= k`, else the last.
 fn branch_find(layouts: &Layouts, branch: *mut Obj, k: Word) -> usize {
     let n = count(branch);
     let (mut lo, mut hi) = (0usize, n - 1);
@@ -147,8 +138,7 @@ pub fn to_vec(m: *mut Obj) -> Vec<(Word, Word)> {
     out
 }
 
-/// What an insert into a node answered: the node to hold from now on, its greatest key, and a
-/// new sibling to its right with its greatest key when the node had to split.
+/// An insert's result: the node to hold now, its greatest key, and a right sibling if it split.
 struct Put {
     node: Word,
     max: Word,
@@ -157,7 +147,6 @@ struct Put {
 }
 
 impl Heap {
-    /// An empty map.
     pub fn map_new(&mut self) -> Word {
         let m = self.raw_alloc(KIND_MAP, 0, 0, 0, 8);
         unsafe { set_word(m, 0, 0) };
@@ -172,8 +161,7 @@ impl Heap {
         self.raw_alloc(KIND_MBRANCH, 0, 0, WIDTH as u32, 2 * KEYS * 8)
     }
 
-    /// A map over sorted, distinct entries, which it takes: leaves filled left to right and
-    /// branches above them, with no path walked.
+    /// A map over sorted, distinct entries, which it takes, built bottom-up.
     pub fn map_from_sorted(&mut self, entries: &[(Word, Word)]) -> Word {
         let mw = self.map_new();
         let m = obj(mw);
@@ -216,8 +204,7 @@ impl Heap {
         mw
     }
 
-    /// A node that may be written: itself when held once, and otherwise a copy holding its
-    /// children and keys once more, with the original released.
+    /// Itself when held once, else a copy holding its children and keys once more.
     fn writable_node(&mut self, node: Word) -> *mut Obj {
         if is_unique(node) {
             return obj(node);
@@ -238,8 +225,7 @@ impl Heap {
         copy
     }
 
-    /// The map object to write: itself when held once, a copy holding the root once more
-    /// otherwise.
+    /// Itself when held once, else a copy holding the root once more.
     fn writable_map(&mut self, m: Word) -> *mut Obj {
         if is_unique(m) {
             return obj(m);
@@ -255,8 +241,7 @@ impl Heap {
         copy
     }
 
-    /// `map_insert`: the entry replaced, key and value both, when the key is present, and put
-    /// in order when it is not — in place along what is held once. Takes all three.
+    /// `map_insert`, replacing key and value when present. Takes all three.
     pub fn map_insert(&mut self, layouts: &Layouts, m: Word, k: Word, v: Word) -> Word {
         let m = self.writable_map(m);
         let r = root(m);
@@ -392,8 +377,7 @@ impl Heap {
                 }
             }
             Err(i) => {
-                // Full: the upper half moves to a new leaf beside this one, and the entry goes
-                // into whichever half it falls in.
+                // Full: split, and insert into whichever half the entry falls in.
                 let right = self.alloc_leaf();
                 let half = n / 2;
                 unsafe {
@@ -428,8 +412,7 @@ impl Heap {
         }
     }
 
-    /// `map_remove`: the map without `k`, in place along what is held once. Takes the map,
-    /// reads the key.
+    /// `map_remove`. Takes the map, reads the key.
     pub fn map_remove(&mut self, layouts: &Layouts, m: Word, k: Word) -> Word {
         if get(layouts, obj(m), k).is_none() {
             return m;

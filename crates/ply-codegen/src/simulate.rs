@@ -1,17 +1,5 @@
-//! A region in the compiled tier: `simulate`, a frame the runtime serves, and the production
-//! region the host policy opens; both drive the scheduler over stacks.
-//!
-//! The body runs as the root task on a stack of its own, and every task the region spawns gets
-//! one. A `perform` of an operation the region answers — `task`, `clock`, `random` — hands the
-//! request to the scheduler by switching back to the stack that called [`rt_simulate`], where
-//! the loop below applies it, asks the scheduler who runs next, and switches to that task. The
-//! scheduler is the machine's, instantiated over a saved stack pointer where the machine has a
-//! continuation, so a plan chooses the same interleaving on both sides.
-//!
-//! A production region is opened by a `task` operation outside any `simulate` when the binding
-//! permits one: the stack that performed it becomes the root task, and the loop runs on a stack
-//! of its own, scheduling against the host runtime. The root finishes when its entry returns to
-//! the backend, which then lets the loop drain the other tasks before answering.
+//! `simulate` and production regions in the compiled tier: each task runs on its own stack and
+//! switches back to the machine's scheduler loop to perform `task`, `clock` or `random`.
 
 use crate::heap::{self, Word};
 use crate::rt::{Ctx, FAILED_UNWIND, call_value, drop_frame, inherit_frames, values_taken};
@@ -31,24 +19,18 @@ pub struct Simulation {
     /// The stack [`rt_simulate`] was called on, which the loop runs on.
     scheduler_sp: usize,
     running: Option<TaskId>,
-    /// What the task named asked when it last gave control back, until the loop applies it.
     request: Option<(TaskId, Request)>,
-    /// What the task being switched to gets back from the `perform` it stopped at.
     answer: Word,
-    /// The stack the region was entered on, whose frames every task's chain to.
+    /// The stack the region was entered on, which every task's frames chain to.
     stack: usize,
     floor_below: usize,
-    /// The closure the task being started runs, read by its entry on the new stack.
     starting: Option<Word>,
     root: Word,
     policy: Policy,
-    /// A production region's loop runs here rather than on the stack that opened the region,
-    /// since that stack is the root task.
+    /// A production region's loop stack; the opening stack is the root task.
     loop_stack: Option<Stack>,
-    /// The loop returned, with the region's answer or its failure in place; nothing may switch
-    /// into its stack again.
+    /// The loop returned; nothing may switch into its stack again.
     loop_done: bool,
-    /// Where the region was opened, for a diagnostic that names it.
     pub(crate) site: Span,
 }
 
@@ -59,15 +41,12 @@ struct TaskStack {
     frames: usize,
     floor: usize,
     sp: usize,
-    /// The stack its spawn was performed on. The frames from there up to the region's
-    /// boundary are copied under the task's own when it starts: a task performs against the
-    /// handlers around its spawn.
+    /// The stack its spawn was performed on; a task performs against the handlers around its spawn.
     inherits: Option<usize>,
 }
 
 enum Request {
-    /// The body, and the stack the spawn was performed on: the handlers around it are the
-    /// task's.
+    /// The body, and the stack the spawn was performed on.
     Spawn(Word, usize),
     Join(TaskId),
     Yield,
@@ -78,7 +57,6 @@ enum Request {
 }
 
 impl Simulation {
-    /// A seeded region over `sched`, opened at `site`.
     pub fn new(
         sched: Scheduler<usize, Word>,
         site: Span,
@@ -112,9 +90,8 @@ impl Simulation {
     }
 }
 
-/// Opens the production region a `task` operation outside any `simulate` asks for, with the
-/// performer's stack as the root task. `false` with the context failed when the binding permits
-/// none.
+/// Opens a production region for a `task` operation outside `simulate`, the performer as root.
+/// `false`, with the context failed, when the binding permits none.
 pub unsafe fn open_production(ctx: *mut Ctx, effect: &Symbol, op: &Symbol) -> bool {
     let c = unsafe { &mut *ctx };
     let Some(permit) = HostPolicy::of(&c.binding) else {
@@ -166,8 +143,7 @@ pub unsafe fn open_production(ctx: *mut Ctx, effect: &Symbol, op: &Symbol) -> bo
     true
 }
 
-/// A production region's loop, on its own stack: runs the scheduler until the region completes
-/// and hands the answer back to the root, which is waiting in the backend.
+/// A production region's loop: runs the scheduler, then hands the answer to the waiting root.
 extern "C" fn loop_entry(arg: usize) {
     let ctx = arg as *mut Ctx;
     let r = unsafe { run(ctx) };
@@ -181,8 +157,7 @@ extern "C" fn loop_entry(arg: usize) {
     std::process::abort();
 }
 
-/// From the backend, once a production region's root entry has returned with `value`: the root
-/// is finished, the loop drains the other tasks, and the region's answer comes back.
+/// Once a production root's entry has returned: the loop drains the other tasks and answers.
 pub unsafe fn finish_root(ctx: *mut Ctx, value: Word) -> Word {
     let c = unsafe { &mut *ctx };
     let sim = c.sims.last_mut().expect("a region is running");
@@ -209,12 +184,7 @@ pub unsafe fn finish_root(ctx: *mut Ctx, value: Word) -> Word {
     sim.answer
 }
 
-/// The region's loop: on the stack that entered a `simulate`, on its own stack for a production
-/// region. Returns the body's answer, or zero with the context failed. A request left by the
-/// task that gave control back, the root's opening `spawn` included, is applied before the
-/// scheduler is asked.
-/// The production loop ended -- on a failure -- while the root was suspended in it. The loop
-/// resumes the root directly, so the root takes the loop's answer back on its own stack here.
+/// The production loop failed while the root was suspended in it, and resumed the root directly.
 fn ended_under_root(c: &mut Ctx) -> Word {
     let sim = c.sims.pop().expect("the region that just ended");
     c.current = sim.tasks[ROOT.0 as usize].frames;
@@ -222,9 +192,7 @@ fn ended_under_root(c: &mut Ctx) -> Word {
     sim.answer
 }
 
-/// A task that owned its stack is done with it and with the frames it held: the handlers it
-/// inherited, and any it failed under. The production root runs on the stack that opened the
-/// region and keeps its frames.
+/// Drop a finished task's stack and frames; the production root keeps its frames.
 fn release(c: &mut Ctx, at: usize) {
     let sim = c.sims.last_mut().expect("a region is running");
     if sim.tasks[at].stack.take().is_none() {
@@ -236,6 +204,7 @@ fn release(c: &mut Ctx, at: usize) {
     }
 }
 
+/// The region's loop. Returns the body's answer, or zero with the context failed.
 pub unsafe fn run(ctx: *mut Ctx) -> Word {
     loop {
         let c = unsafe { &mut *ctx };
@@ -299,8 +268,7 @@ pub unsafe fn run(ctx: *mut Ctx) -> Word {
     }
 }
 
-/// Applies what `task` asked when it gave control back. `Err(None)` when the context is already
-/// failed with what the loop should return.
+/// Applies what `task` asked when it gave control back. `Err(None)`: the context is already failed.
 unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Option<Diagnostic>> {
     let c = unsafe { &mut *ctx };
     let site = c.site();
@@ -419,8 +387,7 @@ extern "C" fn task_entry(arg: usize) {
     std::process::abort();
 }
 
-/// A `perform` of an operation the region answers, from the task that performed it: hands the
-/// request to the loop and comes back with the answer once the scheduler runs this task again.
+/// A `perform` the region answers: switch to the loop, and return once the task runs again.
 pub unsafe fn perform(ctx: *mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]) -> Word {
     let c = unsafe { &mut *ctx };
     let request = match (effect.as_str(), op.as_str()) {
@@ -466,8 +433,7 @@ pub unsafe fn perform(ctx: *mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]
     std::mem::take(&mut sim.answer)
 }
 
-/// From a task of a production region: parks it on the host's pending answer and comes back
-/// with the value the runtime resolved it to.
+/// Parks a production task on the host's pending answer, returning its resolved value.
 pub unsafe fn park(ctx: *mut Ctx, pending: Pending) -> Word {
     let c = unsafe { &mut *ctx };
     let sim = c.sims.last_mut().expect("a region is running");
@@ -490,8 +456,7 @@ pub unsafe fn park(ctx: *mut Ctx, pending: Pending) -> Word {
     std::mem::take(&mut sim.answer)
 }
 
-/// Whether the innermost region is a production one with a task running, so that a host
-/// answer parks rather than blocks, and the request names the task.
+/// The running task of an innermost production region, so a host answer parks rather than blocks.
 pub fn running_task_of_production(c: &Ctx) -> Option<TaskId> {
     let sim = c.sims.last()?;
     if sim.policy != Policy::Host {
@@ -506,7 +471,6 @@ pub fn innermost_is_seeded(c: &Ctx) -> bool {
         .is_some_and(|sim| sim.policy == Policy::Seeded)
 }
 
-/// The access a cell builtin makes, for the running step's footprint.
 pub fn cell_access(ctx: &Ctx, b: ply_eval::Builtin, args: &[Word]) -> Option<Access> {
     use ply_eval::Builtin;
     use ply_ty::Mode;

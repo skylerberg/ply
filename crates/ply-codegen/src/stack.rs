@@ -1,17 +1,9 @@
-//! Stacks the runtime owns, and the switch between them.
-//!
-//! A suspended computation in the compiled tier is a C stack: a task body runs on one of these,
-//! and the scheduler's decision of who runs next is [`switch`]. Nothing emitted knows which stack
-//! it is on. The switch saves the callee-saved registers on the stack being left, stores its
-//! stack pointer where the caller asked, and resumes the other stack from its saved pointer; a
-//! stack that has never run is laid out by [`Stack::prepare`] so that the first switch into it
-//! returns into a trampoline that calls the entry.
+//! Stacks the runtime owns, and the [`switch`] between them: a suspended computation in the
+//! compiled tier is a C stack, and nothing emitted knows which stack it is on.
 
 use std::ptr;
 
-/// Reserved per stack. Pages are mapped on first touch, so the reservation costs address space
-/// until a frame reaches it, and the guard page below turns an overrun into a fault rather than a
-/// write into whatever was mapped there.
+/// Reserved per stack, mapped on first touch; a guard page below turns an overrun into a fault.
 pub const STACK_SIZE: usize = 8 * 1024 * 1024;
 
 const GUARD: usize = 16 * 1024;
@@ -30,8 +22,7 @@ impl Stack {
         Stack { base, size }
     }
 
-    /// The lowest address a compiled frame may begin at, in the same terms as the thread's own
-    /// floor: the guard, then the margin the runtime's Rust frames need under a compiled one.
+    /// The lowest address a compiled frame may begin at: the guard, then the Rust frames' margin.
     pub fn floor(&self) -> usize {
         self.base as usize + GUARD + crate::rt::STACK_MARGIN
     }
@@ -44,16 +35,14 @@ impl Stack {
         (self.base as usize..self.top()).contains(&address)
     }
 
-    /// Lays out the frame the first [`switch`] into this stack will pop: the callee-saved
-    /// registers, with the return address set to a trampoline that calls `entry(arg)`. `entry`
-    /// must switch away for the last time itself; there is nothing below it to return into.
+    /// Lays out the frame the first [`switch`] pops, returning into a trampoline that calls
+    /// `entry(arg)`, which must never return: there is nothing below it.
     pub fn prepare(&self, entry: extern "C" fn(usize), arg: usize) -> usize {
         let top = self.top() & !15;
         unsafe { lay_out(top, entry as usize, arg) }
     }
 
-    /// The bytes live on this stack when `sp` is its stack pointer: everything from `sp` to the
-    /// top, which is what a snapshot copies and what a restore writes back in place.
+    /// The bytes live on this stack when `sp` is its stack pointer: from `sp` to the top.
     pub fn live(&self, sp: usize) -> &[u8] {
         debug_assert!(self.holds(sp));
         unsafe { std::slice::from_raw_parts(sp as *const u8, self.top() - sp) }
@@ -81,8 +70,7 @@ impl Default for Stack {
 mod arch {
     use std::arch::naked_asm;
 
-    /// Bytes the saved frame takes: x19..x28, x29, x30 and d8..d15, rounded to the 16-byte
-    /// alignment the stack pointer must keep.
+    /// x19..x28, x29, x30 and d8..d15, rounded to 16-byte stack alignment.
     pub const FRAME: usize = 176;
 
     #[unsafe(naked)]
@@ -118,8 +106,7 @@ mod arch {
         )
     }
 
-    /// Where the first switch into a fresh stack lands: the entry is in x20 and its argument in
-    /// x19, exactly where [`lay_out`] put them.
+    /// Where the first switch into a fresh stack lands: entry in x20, argument in x19.
     #[unsafe(naked)]
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn ply_stack_trampoline() {
@@ -145,8 +132,7 @@ mod arch {
 mod arch {
     use std::arch::naked_asm;
 
-    /// rbp, rbx, r12..r15 and the return address, laid out so the trampoline is entered with the
-    /// stack pointer eight past a sixteen-byte boundary, as after a call.
+    /// rbp, rbx, r12..r15 and the return address; the trampoline is entered as after a call.
     pub const FRAME: usize = 64;
 
     #[unsafe(naked)]
@@ -171,9 +157,7 @@ mod arch {
         )
     }
 
-    /// Where the first switch into a fresh stack lands, with the stack pointer eight past a
-    /// sixteen-byte boundary as after a call; the `and` puts it on the boundary so that the call
-    /// below enters `entry` as the ABI requires.
+    /// Where the first switch into a fresh stack lands; the `and` realigns for the ABI.
     #[unsafe(naked)]
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn ply_stack_trampoline() {
@@ -195,8 +179,7 @@ mod arch {
     }
 }
 
-/// Leaves the current stack, storing its stack pointer in `from`, and continues the stack whose
-/// pointer is `to`. Returns when something switches back to `*from`.
+/// Saves the current stack pointer in `from` and continues `to`; returns when switched back.
 ///
 /// # Safety
 /// `to` must be a pointer a previous `switch` stored or [`Stack::prepare`] returned, for a stack
