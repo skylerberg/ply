@@ -84,7 +84,6 @@ pub fn execute(args: &BuildArgs, style: Style) -> i32 {
             "format": artifact::ARTIFACT_FORMAT,
             "definitions": built.artifact.bodies.len(),
             "names": built.artifact.names.len(),
-            "sources": built.artifact.sources.len(),
             "unit": built.artifact.has_unit(),
             "artifact_bytes": bytes.len(),
             "binary_bytes": binary_bytes(),
@@ -139,12 +138,6 @@ pub fn execute(args: &BuildArgs, style: Style) -> i32 {
                 .join(" · ")
         ),
     }
-    println!(
-        "{IND}{} {} {} embedded",
-        style.bold("sources"),
-        built.artifact.sources.len(),
-        plural(built.artifact.sources.len(), "file"),
-    );
     EXIT_OK
 }
 

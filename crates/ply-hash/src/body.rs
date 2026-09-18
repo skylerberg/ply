@@ -273,55 +273,14 @@ struct Unit {
     names: Vec<Symbol>,
     module: ModuleName,
     binder: Symbol,
+    /// Whether the unit is decoded, rather than only named so a reference into it can be written.
+    rebuilt: bool,
 }
-
-/// A program-wide name per hash — `store.orders.place` — which is what a deployable artifact
-/// carries beside the bodies.
-pub type Namespace = BTreeMap<DefHash, Symbol>;
 
 struct Layout {
     units: Vec<Unit>,
-    /// Hash -> (unit, class).
-    by_hash: BTreeMap<DefHash, (usize, usize)>,
-}
-
-/// What a unit is called, once every unit is known.
-fn naming(units: &[Unit], namespace: &Namespace) -> Option<Vec<(ModuleName, Vec<Symbol>)>> {
-    let mut out: Vec<(ModuleName, Vec<Symbol>)> = Vec::with_capacity(units.len());
-    // A qualifier is a module's last segment, so two modules sharing one cannot both be referred to
-    // from a third — the same ambiguity `import` has in source, and not one worth inventing a
-    // disambiguation for here.
-    let mut binders: BTreeMap<Symbol, ModuleName> = BTreeMap::new();
-    let mut taken: BTreeSet<Symbol> = BTreeSet::new();
-
-    for unit in units {
-        let mut module: Option<ModuleName> = None;
-        let mut simple = Vec::with_capacity(unit.hashes.len());
-        for hash in &unit.hashes {
-            let qualified = namespace.get(hash)?;
-            let (prefix, name) = qualified.as_str().rsplit_once('.')?;
-            let owner = ModuleName::from_dotted(prefix);
-            // A component's members are mutually recursive, so they were declared in one module;
-            // anything else did not come from a program.
-            if *module.get_or_insert_with(|| owner.clone()) != owner {
-                return None;
-            }
-            if !taken.insert(qualified.clone()) {
-                return None;
-            }
-            simple.push(Symbol::new(name));
-        }
-        let module = module?;
-        if binders
-            .entry(module.default_binder())
-            .or_insert_with(|| module.clone())
-            != &module
-        {
-            return None;
-        }
-        out.push((module, simple));
-    }
-    Some(out)
+    /// Hash -> every (unit, class) declaring it.
+    by_hash: BTreeMap<DefHash, Vec<(usize, usize)>>,
 }
 
 /// Unpacks the blob a component is hashed from: a count, then each member's encoding
@@ -345,50 +304,63 @@ fn unpack(payload: &[u8]) -> Option<Vec<Vec<u8>>> {
     Some(members)
 }
 
+/// The component a body belongs to: its id, its members' encodings in class order, and whether it
+/// is a solo definition rather than a cycle.
+fn component_of(hash: DefHash, body: &StoredBody) -> Result<(DefHash, Vec<Vec<u8>>, bool), String> {
+    let (id, members, solo) = match body.shape() {
+        None => {
+            return Err(format!(
+                "the body stored for `{hash}` is not a definition body"
+            ));
+        }
+        Some(Shape::Solo(bytes)) => (DefHash::of(bytes), vec![bytes.to_vec()], true),
+        Some(Shape::Member { class, payload }) => {
+            let Some(members) = unpack(payload) else {
+                return Err(format!(
+                    "the component body stored for `{hash}` is malformed"
+                ));
+            };
+            if class as usize >= members.len() {
+                return Err(format!(
+                    "the body stored for `{hash}` names member {class} of a component with {} of \
+                     them",
+                    members.len()
+                ));
+            }
+            (DefHash::of(payload), members, false)
+        }
+    };
+    if !body.verify(hash) {
+        return Err(format!(
+            "the body stored for `{hash}` hashes to `{}`",
+            body.key().map_or_else(|| "nothing".into(), |h| h.short())
+        ));
+    }
+    Ok((id, members, solo))
+}
+
+fn member_hashes(id: DefHash, width: usize, solo: bool) -> Vec<DefHash> {
+    if solo {
+        vec![id]
+    } else {
+        (0..width as u32).map(|i| member_hash(id, i)).collect()
+    }
+}
+
 impl Layout {
-    fn build(bodies: &BodySet, namespace: &Namespace) -> Result<Layout, Vec<Diagnostic>> {
+    fn build(bodies: &BodySet) -> Result<Layout, Vec<Diagnostic>> {
         let mut units: IndexMap<DefHash, Unit> = IndexMap::new();
         let mut diags = Vec::new();
-
         for (hash, body) in bodies.defs() {
-            let Some(shape) = body.shape() else {
-                diags.push(corrupt(format!(
-                    "the body stored for `{hash}` is not a definition body"
-                )));
-                continue;
-            };
-            let (id, members) = match shape {
-                Shape::Solo(bytes) => (DefHash::of(bytes), vec![bytes.to_vec()]),
-                Shape::Member { class, payload } => {
-                    let Some(members) = unpack(payload) else {
-                        diags.push(corrupt(format!(
-                            "the component body stored for `{hash}` is malformed"
-                        )));
-                        continue;
-                    };
-                    if class as usize >= members.len() {
-                        diags.push(corrupt(format!(
-                            "the body stored for `{hash}` names member {class} of a component with \
-                             {} of them",
-                            members.len()
-                        )));
-                        continue;
-                    }
-                    (DefHash::of(payload), members)
+            let (id, members, solo) = match component_of(hash, body) {
+                Ok(component) => component,
+                Err(message) => {
+                    diags.push(corrupt(message));
+                    continue;
                 }
             };
-            if !body.verify(hash) {
-                diags.push(corrupt(format!(
-                    "the body stored for `{hash}` hashes to `{}`",
-                    body.key().map_or_else(|| "nothing".into(), |h| h.short())
-                )));
-                continue;
-            }
             units.entry(id).or_insert_with(|| {
-                let hashes: Vec<DefHash> = match members.len() {
-                    1 if matches!(shape, Shape::Solo(_)) => vec![id],
-                    n => (0..n as u32).map(|i| member_hash(id, i)).collect(),
-                };
+                let hashes = member_hashes(id, members.len(), solo);
                 Unit {
                     id,
                     names: hashes.iter().map(|h| short_name('d', *h)).collect(),
@@ -396,120 +368,102 @@ impl Layout {
                     members,
                     module: ModuleName::from_dotted(short_name('m', id).as_str()),
                     binder: short_name('m', id),
+                    rebuilt: true,
                 }
             });
         }
-
         if !diags.is_empty() {
             return Err(diags);
         }
-
         // Module order decides nothing — resolution keys on names — but a reconstruction that is
         // not byte-identical run to run is not one an artifact can be diffed against.
         let mut units: Vec<Unit> = units.into_values().collect();
         units.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(Layout::index(units))
+    }
 
-        if let Some(naming) = naming(&units, namespace) {
-            for (unit, (module, names)) in units.iter_mut().zip(naming) {
-                unit.binder = module.default_binder();
-                unit.module = module;
-                unit.names = names;
-            }
-        }
-
-        let mut by_hash: BTreeMap<DefHash, (usize, usize)> = BTreeMap::new();
-        let mut names: BTreeMap<Symbol, DefHash> = BTreeMap::new();
+    fn index(units: Vec<Unit>) -> Layout {
+        let mut by_hash: BTreeMap<DefHash, Vec<(usize, usize)>> = BTreeMap::new();
         for (u, unit) in units.iter().enumerate() {
             for (class, hash) in unit.hashes.iter().enumerate() {
-                by_hash.insert(*hash, (u, class));
-                let qualified = unit.module.qualify(&unit.names[class]);
-                if let Some(other) = names.insert(qualified.clone(), *hash)
-                    && other != *hash
-                {
-                    diags.push(corrupt(format!(
-                        "definitions `{hash}` and `{other}` both reconstruct as `{qualified}`"
-                    )));
-                }
+                by_hash.entry(*hash).or_default().push((u, class));
             }
         }
-        if !diags.is_empty() {
-            return Err(diags);
-        }
-        Ok(Layout { units, by_hash })
+        Layout { units, by_hash }
+    }
+
+    /// The declaration a reference from `from` is written as when several carry its hash: one in
+    /// that module, else one that is rebuilt, else the first.
+    fn pick(&self, hash: DefHash, from: Option<&ModuleName>) -> Option<(usize, usize)> {
+        self.by_hash
+            .get(&hash)?
+            .iter()
+            .min_by_key(|(u, _)| {
+                let unit = &self.units[*u];
+                (Some(&unit.module) != from, !unit.rebuilt)
+            })
+            .copied()
     }
 }
 
-/// Rebuilds a checkable, evaluable program from stored bodies.
-pub fn reconstruct(bodies: &BodySet) -> Result<Reconstruction, Vec<Diagnostic>> {
-    reconstruct_relinked(bodies, &BTreeMap::new())
+/// Every rebuilt unit decoded into the module it names.
+struct Rebuilt {
+    modules: IndexMap<ModuleName, Module>,
+    names: IndexMap<DefHash, Symbol>,
+    kinds: IndexMap<DefHash, ItemKind>,
+    /// A member that did not decode, and why.
+    malformed: Vec<(DefHash, String)>,
+    /// Hashes a body refers to that no unit declares.
+    missing: BTreeSet<DefHash>,
 }
 
-/// [`reconstruct`], under the names the definitions were built with rather than under synthesized
-/// ones.
-pub fn reconstruct_named(
-    bodies: &BodySet,
-    namespace: &Namespace,
-) -> Result<Reconstruction, Vec<Diagnostic>> {
-    reconstruct_with(bodies, &BTreeMap::new(), namespace)
-}
-
-/// [`reconstruct`], with every stored reference rewritten through `relink` before it is resolved.
-pub fn reconstruct_relinked(
-    bodies: &BodySet,
-    relink: &BTreeMap<DefHash, DefHash>,
-) -> Result<Reconstruction, Vec<Diagnostic>> {
-    reconstruct_with(bodies, relink, &Namespace::new())
-}
-
-fn reconstruct_with(
-    bodies: &BodySet,
-    relink: &BTreeMap<DefHash, DefHash>,
-    namespace: &Namespace,
-) -> Result<Reconstruction, Vec<Diagnostic>> {
-    let layout = Layout::build(bodies, namespace)?;
-    let mut missing: BTreeSet<DefHash> = BTreeSet::new();
-    let mut diags: Vec<Diagnostic> = Vec::new();
-    // Keyed by name rather than pushed per unit: with a namespace restored, two units may belong to
-    // one module, and two `Module`s of one name is not a program.
-    let mut modules: IndexMap<ModuleName, Module> = IndexMap::new();
-    let mut names: IndexMap<DefHash, Symbol> = IndexMap::new();
-    let mut kinds: IndexMap<DefHash, ItemKind> = IndexMap::new();
-
+fn rebuild(layout: &Layout, relink: &BTreeMap<DefHash, DefHash>) -> Rebuilt {
+    let mut out = Rebuilt {
+        modules: IndexMap::new(),
+        names: IndexMap::new(),
+        kinds: IndexMap::new(),
+        malformed: Vec::new(),
+        missing: BTreeSet::new(),
+    };
     for (u, unit) in layout.units.iter().enumerate() {
+        if !unit.rebuilt {
+            continue;
+        }
         let mut items = Vec::with_capacity(unit.members.len());
-        let mut imports: BTreeSet<ModuleName> = BTreeSet::new();
+        let mut imports: BTreeMap<ModuleName, Symbol> = BTreeMap::new();
         let mut slots: BTreeMap<DefHash, u32> = BTreeMap::new();
 
         for (class, encoding) in unit.members.iter().enumerate() {
             let mut decoder = Decoder {
                 c: Cursor::new(encoding),
-                layout: &layout,
+                layout,
                 unit: u,
                 values: 0,
                 ty_params: 0,
                 row_params: 0,
                 imports: &mut imports,
                 slots: &mut slots,
-                missing: &mut missing,
+                missing: &mut out.missing,
                 relink,
             };
             match decoder.item(unit.names[class].clone()) {
                 Ok((item, kind)) => {
-                    names.insert(unit.hashes[class], unit.module.qualify(&unit.names[class]));
-                    kinds.insert(unit.hashes[class], kind);
+                    out.names
+                        .insert(unit.hashes[class], unit.module.qualify(&unit.names[class]));
+                    out.kinds.insert(unit.hashes[class], kind);
                     items.push(item);
                 }
-                Err(bad) => diags.push(corrupt(format!(
-                    "the body stored for `{}` is malformed: {}",
-                    unit.hashes[class], bad.0
-                ))),
+                Err(bad) => out.malformed.push((unit.hashes[class], bad.0)),
             }
         }
 
         // A module never imports itself, whatever a reference inside it asked for: a unit whose
         // referent turned out to be a sibling in the same module contributed nothing to resolve.
         imports.remove(&unit.module);
-        let module = modules
+        // Keyed by name rather than pushed per unit: several units may belong to one module, and
+        // two `Module`s of one name is not a program.
+        let module = out
+            .modules
             .entry(unit.module.clone())
             .or_insert_with(|| Module {
                 name: unit.module.clone(),
@@ -528,13 +482,34 @@ fn reconstruct_with(
             }
         }
     }
-    let mut modules: Vec<Module> = modules.into_values().collect();
+    out
+}
+
+/// Rebuilds a checkable, evaluable program from stored bodies.
+pub fn reconstruct(bodies: &BodySet) -> Result<Reconstruction, Vec<Diagnostic>> {
+    reconstruct_relinked(bodies, &BTreeMap::new())
+}
+
+/// [`reconstruct`], with every stored reference rewritten through `relink` before it is resolved.
+pub fn reconstruct_relinked(
+    bodies: &BodySet,
+    relink: &BTreeMap<DefHash, DefHash>,
+) -> Result<Reconstruction, Vec<Diagnostic>> {
+    let layout = Layout::build(bodies)?;
+    let rebuilt = rebuild(&layout, relink);
+    let mut diags: Vec<Diagnostic> = rebuilt
+        .malformed
+        .iter()
+        .map(|(hash, why)| corrupt(format!("the body stored for `{hash}` is malformed: {why}")))
+        .collect();
+    let mut missing = rebuilt.missing;
+    let mut modules: Vec<Module> = rebuilt.modules.into_values().collect();
 
     let mut test_keys = Vec::with_capacity(bodies.tests.len());
     if !bodies.tests.is_empty() {
         let module = ModuleName::from_dotted(TEST_MODULE);
         let mut items = Vec::with_capacity(bodies.tests.len());
-        let mut imports: BTreeSet<ModuleName> = BTreeSet::new();
+        let mut imports: BTreeMap<ModuleName, Symbol> = BTreeMap::new();
         for (i, body) in bodies.tests.iter().enumerate() {
             // Per test, not per module.
             let mut slots: BTreeMap<DefHash, u32> = BTreeMap::new();
@@ -585,16 +560,212 @@ fn reconstruct_with(
     if !diags.is_empty() {
         return Err(diags);
     }
-    let rebuilt = Reconstruction {
+    let out = Reconstruction {
         program: Program { modules },
-        names,
-        kinds,
+        names: rebuilt.names,
+        kinds: rebuilt.kinds,
         test_keys,
     };
     if relink.is_empty() {
-        rebuilt.verify(bodies)?;
+        out.verify(bodies)?;
     }
-    Ok(rebuilt)
+    Ok(out)
+}
+
+/// A program rebuilt from `bodies` under exactly the program-wide names `names` gives them: one
+/// item per name, in that name's module, imported `as` another binder wherever two modules share a
+/// last segment. Nothing is invented and nothing is dropped, and names that cannot say which
+/// declaration a body means are refused rather than guessed.
+///
+/// A module `named_only` is named, so that a reference into it can be written, and not rebuilt.
+pub fn reconstruct_exact(
+    bodies: &BodySet,
+    names: &[(Symbol, DefHash)],
+    named_only: impl Fn(&ModuleName) -> bool,
+) -> Result<Program, Vec<Diagnostic>> {
+    let mut named: BTreeMap<DefHash, Vec<(ModuleName, Symbol)>> = BTreeMap::new();
+    for (name, hash) in names {
+        let Some((module, simple)) = name.as_str().rsplit_once('.') else {
+            return Err(vec![refused(format!("`{name}` names no module"))]);
+        };
+        if !bodies.contains(*hash) {
+            return Err(vec![refused(format!("`{name}` has no body"))]);
+        }
+        named
+            .entry(*hash)
+            .or_default()
+            .push((ModuleName::from_dotted(module), Symbol::new(simple)));
+    }
+    for all in named.values_mut() {
+        all.sort();
+        all.dedup();
+    }
+
+    let mut units: Vec<Unit> = Vec::new();
+    let mut seen: BTreeSet<DefHash> = BTreeSet::new();
+    let mut declared: BTreeMap<(u8, Symbol), DefHash> = BTreeMap::new();
+    for (hash, body) in bodies.defs() {
+        let (id, members, solo) = component_of(hash, body).map_err(|why| vec![refused(why)])?;
+        if !seen.insert(id) {
+            continue;
+        }
+        let hashes = member_hashes(id, members.len(), solo);
+        let mut classes: Vec<&[(ModuleName, Symbol)]> = Vec::with_capacity(hashes.len());
+        for (member, encoding) in hashes.iter().zip(&members) {
+            let all: &[(ModuleName, Symbol)] =
+                named.get(member).map(Vec::as_slice).unwrap_or_default();
+            if all.is_empty() {
+                return Err(vec![refused(format!(
+                    "the body `{}` has no name",
+                    member.short()
+                ))]);
+            }
+            let kind = encoding.first().copied().unwrap_or_default();
+            if kind == tag::EFFECT && all.len() > 1 {
+                return Err(vec![
+                    refused(format!(
+                        "{} are one effect declaration, so a body cannot say which it performs",
+                        listed(all)
+                    ))
+                    .note("make the declarations differ, or keep one of them"),
+                ]);
+            }
+            for (module, simple) in all {
+                let qualified = module.qualify(simple);
+                if let Some(other) = declared.insert((kind, qualified.clone()), *member)
+                    && other != *member
+                {
+                    return Err(vec![refused(format!(
+                        "`{qualified}` names two different definitions"
+                    ))]);
+                }
+            }
+            classes.push(all);
+        }
+        let Some(sets) = copies(&classes) else {
+            let all: Vec<(ModuleName, Symbol)> = classes.concat();
+            return Err(vec![
+                refused(format!(
+                    "{} are a mutually recursive group in which two definitions share one body, so \
+                     a call cannot say which it reaches",
+                    listed(&all)
+                ))
+                .note("make the definitions differ, or keep one of them"),
+            ]);
+        };
+        for (module, names) in sets {
+            units.push(Unit {
+                id,
+                members: members.clone(),
+                hashes: hashes.clone(),
+                names,
+                binder: module.default_binder(),
+                rebuilt: !named_only(&module),
+                module,
+            });
+        }
+    }
+
+    let bound = binders(units.iter().map(|unit| &unit.module).collect());
+    for unit in &mut units {
+        unit.binder = bound[&unit.module].clone();
+    }
+    let layout = Layout::index(units);
+    let rebuilt = rebuild(&layout, &BTreeMap::new());
+    if let Some((hash, why)) = rebuilt.malformed.first() {
+        return Err(vec![refused(format!(
+            "the body `{}` does not decode: {why}",
+            hash.short()
+        ))]);
+    }
+    if !rebuilt.missing.is_empty() {
+        let absent: Vec<String> = rebuilt.missing.iter().take(8).map(|h| h.short()).collect();
+        return Err(vec![
+            refused(format!(
+                "{} definitions a body refers to are not among the bodies",
+                rebuilt.missing.len()
+            ))
+            .note(format!("missing: {}", absent.join(", "))),
+        ]);
+    }
+    let mut modules: Vec<Module> = rebuilt.modules.into_values().collect();
+    modules.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(Program { modules })
+}
+
+fn refused(message: impl Into<String>) -> Diagnostic {
+    Diagnostic::error(codes::ARTIFACT_INVALID, message)
+}
+
+fn listed(names: &[(ModuleName, Symbol)]) -> String {
+    let quoted: Vec<String> = names
+        .iter()
+        .map(|(module, name)| format!("`{}`", module.qualify(name)))
+        .collect();
+    quoted.join(", ")
+}
+
+/// A component's names as whole copies, one name per class. With one class every name is a copy
+/// of its own; otherwise a module's `n`th name of each class make one. `None` when a module names
+/// one class more often than another, which no set of copies can say.
+fn copies(classes: &[&[(ModuleName, Symbol)]]) -> Option<Vec<(ModuleName, Vec<Symbol>)>> {
+    if let [only] = classes {
+        return Some(
+            only.iter()
+                .map(|(module, name)| (module.clone(), vec![name.clone()]))
+                .collect(),
+        );
+    }
+    let mut by_module: BTreeMap<&ModuleName, Vec<Vec<&Symbol>>> = BTreeMap::new();
+    for (class, all) in classes.iter().enumerate() {
+        for (module, name) in all.iter() {
+            by_module
+                .entry(module)
+                .or_insert_with(|| vec![Vec::new(); classes.len()])[class]
+                .push(name);
+        }
+    }
+    let mut out = Vec::new();
+    for (module, by_class) in by_module {
+        let count = by_class[0].len();
+        if by_class.iter().any(|names| names.len() != count) {
+            return None;
+        }
+        for n in 0..count {
+            out.push((
+                module.clone(),
+                by_class.iter().map(|names| names[n].clone()).collect(),
+            ));
+        }
+    }
+    Some(out)
+}
+
+/// Each module's last segment, unless another module shares it: then each of those is bound as its
+/// whole path joined with `_`, suffixed until nothing else is bound so.
+fn binders(modules: BTreeSet<&ModuleName>) -> BTreeMap<ModuleName, Symbol> {
+    let mut sharing: BTreeMap<Symbol, usize> = BTreeMap::new();
+    for module in &modules {
+        *sharing.entry(module.default_binder()).or_default() += 1;
+    }
+    let mut taken: BTreeSet<Symbol> = sharing.keys().cloned().collect();
+    modules
+        .into_iter()
+        .map(|module| {
+            let own = module.default_binder();
+            if sharing[&own] == 1 {
+                return (module.clone(), own);
+            }
+            let base = module.segments().collect::<Vec<_>>().join("_");
+            let mut binder = Symbol::new(&base);
+            let mut n = 1;
+            while !taken.insert(binder.clone()) {
+                n += 1;
+                binder = Symbol::new(format!("{base}_{n}"));
+            }
+            (module.clone(), binder)
+        })
+        .collect()
 }
 
 impl Reconstruction {
@@ -652,15 +823,26 @@ impl Reconstruction {
     }
 }
 
-fn import_decls(modules: &BTreeSet<ModuleName>) -> Vec<ImportDecl> {
+fn import_decls(modules: &BTreeMap<ModuleName, Symbol>) -> Vec<ImportDecl> {
     modules
         .iter()
-        .map(|module| ImportDecl {
+        .map(|(module, binder)| ImportDecl {
             path: module.segments().map(ident).collect(),
-            kind: ImportKind::Module,
+            kind: if *binder == module.default_binder() {
+                ImportKind::Module
+            } else {
+                ImportKind::Alias(ident(binder.clone()))
+            },
             span: Span::DUMMY,
         })
         .collect()
+}
+
+/// A stored reference: a definition by hash, or a member of the component being decoded.
+#[derive(Clone, Copy)]
+enum Ref {
+    Hash(DefHash),
+    Class(usize),
 }
 
 struct Bad(String);
@@ -762,7 +944,8 @@ struct Decoder<'a> {
     values: u32,
     ty_params: u32,
     row_params: u32,
-    imports: &'a mut BTreeSet<ModuleName>,
+    /// Module -> the binder a reference into it is written with.
+    imports: &'a mut BTreeMap<ModuleName, Symbol>,
     /// Effect hash -> the slot it was seen at.
     slots: &'a mut BTreeMap<DefHash, u32>,
     missing: &'a mut BTreeSet<DefHash>,
@@ -784,8 +967,7 @@ impl Decoder<'_> {
         }
     }
 
-    /// Everything is `pub`: a reconstructed program is one namespace of synthesized names, and
-    /// visibility is metadata the encoding erased.
+    /// Everything is `pub`: visibility is metadata the encoding erased.
     fn fn_def(&mut self, name: Symbol) -> Decoded<FnDef> {
         self.c.expect(tag::FN, "a function")?;
         let type_count = self.c.u32()?;
@@ -989,7 +1171,7 @@ impl Decoder<'_> {
         }
     }
 
-    fn node_ref(&mut self) -> Decoded<DefHash> {
+    fn node_ref(&mut self) -> Decoded<Ref> {
         match self.c.u8()? {
             tag::REF_HASH => {
                 let raw: [u8; 32] = self.c.bytes(32)?.try_into().expect("thirty-two bytes");
@@ -998,16 +1180,14 @@ impl Decoder<'_> {
                 if !self.layout.by_hash.contains_key(&hash) {
                     self.missing.insert(hash);
                 }
-                Ok(hash)
+                Ok(Ref::Hash(hash))
             }
             tag::REF_INDEX => {
                 let class = self.c.u32()? as usize;
-                self.layout
-                    .units
-                    .get(self.unit)
-                    .and_then(|u| u.hashes.get(class))
-                    .copied()
-                    .ok_or_else(|| bad(format!("no member {class} in this component")))
+                match self.layout.units.get(self.unit) {
+                    Some(unit) if class < unit.hashes.len() => Ok(Ref::Class(class)),
+                    _ => Err(bad(format!("no member {class} in this component"))),
+                }
             }
             tag::REF_SELF => Err(bad(
                 "an unresolved self-reference, which a stored body never carries",
@@ -1016,26 +1196,35 @@ impl Decoder<'_> {
         }
     }
 
-    /// The name the reconstructed program gives a referenced definition, and the import that makes
-    /// it reachable from the module being built.
-    fn qname_of(&mut self, hash: DefHash, name: Option<Symbol>) -> QName {
-        let Some(&(unit, class)) = self.layout.by_hash.get(&hash) else {
-            return QName::bare(ident(name.unwrap_or_else(|| short_name('d', hash))));
-        };
-        let target = name.unwrap_or_else(|| self.layout.units[unit].names[class].clone());
-        // Modules rather than units: with a namespace restored, two units may land in one module,
-        // and a module that imported itself to reach its own definition would not resolve.
-        let module = &self.layout.units[unit].module;
-        if self
-            .layout
-            .units
-            .get(self.unit)
-            .is_some_and(|own| &own.module == module)
-        {
-            return QName::bare(ident(target));
+    fn hash_of(&self, target: Ref) -> DefHash {
+        match target {
+            Ref::Hash(hash) => hash,
+            Ref::Class(class) => self.layout.units[self.unit].hashes[class],
         }
-        self.imports.insert(module.clone());
-        QName::qualified(ident(self.layout.units[unit].binder.clone()), ident(target))
+    }
+
+    /// The name the reconstructed program gives a referenced definition, and the import that makes
+    /// it reachable from the module being built. A member of this component is this copy's own.
+    fn qname_of(&mut self, target: Ref, ctor: Option<Symbol>) -> QName {
+        let layout = self.layout;
+        let own = layout.units.get(self.unit).map(|unit| &unit.module);
+        let (unit, class) = match target {
+            Ref::Class(class) => (self.unit, class),
+            Ref::Hash(hash) => match layout.pick(hash, own) {
+                Some(at) => at,
+                None => return QName::bare(ident(ctor.unwrap_or_else(|| short_name('d', hash)))),
+            },
+        };
+        let owner = &layout.units[unit];
+        let name = ident(ctor.unwrap_or_else(|| owner.names[class].clone()));
+        // Modules rather than units: several units may land in one module, and a module that
+        // imported itself to reach its own definition would not resolve.
+        if own == Some(&owner.module) {
+            return QName::bare(name);
+        }
+        self.imports
+            .insert(owner.module.clone(), owner.binder.clone());
+        QName::qualified(ident(owner.binder.clone()), name)
     }
 
     fn value_ref(&mut self) -> Decoded<QName> {
@@ -1051,8 +1240,8 @@ impl Decoder<'_> {
             Some(&tag::CTOR) => self.ctor_ref(),
             Some(&tag::FREE) | Some(&tag::FREE_QUALIFIED) => self.free_ref(),
             _ => {
-                let hash = self.node_ref()?;
-                Ok(self.qname_of(hash, None))
+                let target = self.node_ref()?;
+                Ok(self.qname_of(target, None))
             }
         }
     }
@@ -1088,8 +1277,9 @@ impl Decoder<'_> {
         match self.c.bytes.get(self.c.pos) {
             Some(&tag::FREE) | Some(&tag::FREE_QUALIFIED) => self.free_ref(),
             _ => {
-                let hash = self.node_ref()?;
+                let target = self.node_ref()?;
                 let slot = self.c.u32()?;
+                let hash = self.hash_of(target);
                 match self.slots.insert(hash, slot) {
                     Some(previous) if previous != slot => {
                         return Err(bad(format!(
@@ -1099,7 +1289,7 @@ impl Decoder<'_> {
                     }
                     _ => {}
                 }
-                Ok(self.qname_of(hash, None))
+                Ok(self.qname_of(target, None))
             }
         }
     }
@@ -1127,8 +1317,8 @@ impl Decoder<'_> {
                     None => Some(match self.c.bytes.get(self.c.pos) {
                         Some(&tag::FREE) | Some(&tag::FREE_QUALIFIED) => self.free_ref()?,
                         _ => {
-                            let hash = self.node_ref()?;
-                            self.qname_of(hash, None)
+                            let target = self.node_ref()?;
+                            self.qname_of(target, None)
                         }
                     }),
                 };
