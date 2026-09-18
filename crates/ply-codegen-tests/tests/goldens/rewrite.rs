@@ -5,21 +5,8 @@
 //! The port is entered in-process through `port`: the bundle the binary carries is the compiler
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
 
-use crate::harness::{bundle, golden, port, records};
+use crate::harness::{bundle, fixtures, golden, port, records, repo_root};
 use std::path::{Path, PathBuf};
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("this crate sits at <root>/crates/ply-compiler-diff")
-        .to_path_buf()
-}
-
-/// This crate's own directory, which is where the mined corpora live.
-fn here() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
 
 /// The first record the two dumps disagree on, with context, or `None`.
 fn first_difference(reference: &str, actual: &str) -> Option<String> {
@@ -86,7 +73,10 @@ fn files_in(dir: &Path) -> Vec<(String, Vec<u8>)> {
         .into_iter()
         .map(|p| {
             (
-                p.display().to_string(),
+                p.strip_prefix(repo_root())
+                    .expect("an input under the repository")
+                    .display()
+                    .to_string(),
                 std::fs::read(&p).expect("readable"),
             )
         })
@@ -105,12 +95,12 @@ fn the_rewrites_agree_with_ply_syntax_on_the_shipped_standard_library() {
 
 #[test]
 fn the_rewrites_agree_with_ply_syntax_on_the_hand_written_fixtures() {
-    compare("fixtures", &files_in(&here().join("fixtures")));
+    compare("fixtures", &files_in(&fixtures()));
 }
 
 #[test]
 fn the_rewrites_agree_with_ply_syntax_on_the_reference_own_test_inputs() {
-    let text = std::fs::read_to_string(here().join("fixtures/reference-tests.corpus"))
+    let text = std::fs::read_to_string(fixtures().join("reference-tests.corpus"))
         .expect("the mined corpus");
     let inputs: Vec<(String, Vec<u8>)> = bundle(&text)
         .into_iter()

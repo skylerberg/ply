@@ -71,16 +71,11 @@ for p in programs:
     seen.add(key)
     unique.append(p)
 
-# Both crates read this corpus since ADR 0052 §2 moved the golden suites.
-outs = [
-    root / "crates/ply-compiler-diff/fixtures/reference-programs.corpus",
-    root / "crates/ply-codegen-tests/fixtures/reference-programs.corpus",
-]
-for out in outs:
-    with out.open("w") as f:
-        f.write("Mined from crates/ply-syntax-tests/tests/unit/resolve.rs by mine-programs.py. Do not edit.\n")
-        for p in unique:
-            f.write("\n%%%\n")
-            f.write("\n%%\n".join(f"{name}\n{text}" for name, text in p))
-        f.write("\n")
-print(f"{len(unique)} distinct programs -> " + ", ".join(str(o.relative_to(root)) for o in outs))
+out = root / "crates/ply-codegen-tests/fixtures/reference-programs.corpus"
+with out.open("w") as f:
+    f.write("Mined from crates/ply-syntax-tests/tests/unit/resolve.rs by mine-programs.py. Do not edit.\n")
+    for p in unique:
+        f.write("\n%%%\n")
+        f.write("\n%%\n".join(f"{name}\n{text}" for name, text in p))
+    f.write("\n")
+print(f"{len(unique)} distinct programs -> {out.relative_to(root)}")
