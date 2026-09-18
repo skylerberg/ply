@@ -5,12 +5,11 @@ use crate::{
     Binding, CaseReport, Counterexample, Discharge, Evidence, GEN_DEPTH, Gap, ProvePlan, Vacuity,
     VacuityKind,
 };
-use ply_eval::{Closure, ClosureKind, Decimal, Fixed, Value};
+use ply_eval::{Closure, ClosureKind, Decimal, Fixed, Synth, Value};
 use ply_span::{Diagnostic, Span, Symbol};
-use ply_syntax::ast::{Expr, ExprKind, Ident, QName};
 use ply_ty::DefHash;
 use ply_ty::prelude;
-use ply_ty::{BinOp, CtorInfo, IntTy, LawBinder, Row, TyVar, Type};
+use ply_ty::{CtorInfo, IntTy, LawBinder, Row, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
@@ -55,10 +54,6 @@ pub const MAX_GEN_ENTRIES: usize = 8;
 pub const HARD_GEN_DEPTH: u32 = 64;
 
 const GEN_DOMAIN: &[u8] = b"ply.gen.stream.1";
-
-const FN_SIZE: &str = "#size";
-const FN_CONST: &str = "#c";
-const FN_DEFAULT: &str = "#d";
 
 /// Counter-mode BLAKE3, keyed by the root and the obligation.
 #[derive(Clone, Debug)]
@@ -669,11 +664,11 @@ impl Gen<'_> {
                     table.push((key, value));
                 }
                 let default = self.value(ret, depth + 1)?;
-                Ok(table_fn(params.len(), table, default, self.world))
+                Ok(table_fn(params.len(), table, default))
             }
             _ => {
                 let value = self.value(ret, depth + 1)?;
-                Ok(const_fn(params.len(), value, self.world))
+                Ok(const_fn(params.len(), value))
             }
         }
     }
@@ -688,36 +683,14 @@ fn comparable(ty: &Type) -> bool {
     }
 }
 
-fn ident(name: &str) -> Ident {
-    Ident::new(name, Span::DUMMY)
-}
-
-fn var(name: &str) -> Expr {
-    Expr {
-        kind: ExprKind::Var(QName::bare(ident(name))),
-        span: Span::DUMMY,
-    }
-}
-
 fn param_names(arity: usize) -> Vec<Symbol> {
     (0..arity).map(|i| Symbol::new(format!("x{i}"))).collect()
 }
 
-/// The body names only its own bindings, so module index 0 is a placeholder.
-fn closure(
-    params: Vec<Symbol>,
-    body: Expr,
-    bindings: Vec<(Symbol, Value)>,
-    description: String,
-) -> Value {
+fn closure(arity: usize, rule: Synth, description: String) -> Value {
     Value::Closure(Arc::new(Closure {
         name: Some(Symbol::new(description)),
-        kind: ClosureKind::Fn {
-            params,
-            body: Arc::new(body),
-            bindings,
-            module: 0,
-        },
+        kind: ClosureKind::Synth { arity, rule },
     }))
 }
 
@@ -732,85 +705,49 @@ fn binder_list(arity: usize, names: &[Symbol]) -> String {
         .join(", ")
 }
 
-pub(crate) fn const_fn(arity: usize, value: Value, world: &TypeWorld) -> Value {
+pub(crate) fn const_fn(arity: usize, value: Value) -> Value {
     let description = format!("|{}| {}", binder_list(arity, &[]), value.render());
-    let bindings = vec![
-        (Symbol::new(FN_CONST), value.clone()),
-        (
-            Symbol::new(FN_SIZE),
-            Value::Int(saturating_i64(
-                2u64.saturating_add(shrink::size(&value, world)),
-            )),
-        ),
-    ];
-    closure(param_names(arity), var(FN_CONST), bindings, description)
+    closure(arity, Synth::Const(value), description)
 }
 
 fn projection_fn(arity: usize, index: usize) -> Value {
     let names = param_names(arity);
-    let picked = names[index].to_string();
-    let description = format!("|{}| {picked}", binder_list(arity, &names));
-    let bindings = vec![(Symbol::new(FN_SIZE), Value::Int(1))];
-    closure(names, var(&picked), bindings, description)
+    let description = format!("|{}| {}", binder_list(arity, &names), names[index]);
+    closure(arity, Synth::Project(index), description)
 }
 
-fn table_fn(arity: usize, table: Vec<(Value, Value)>, default: Value, world: &TypeWorld) -> Value {
+fn table_fn(arity: usize, entries: Vec<(Value, Value)>, default: Value) -> Value {
     let names = param_names(arity);
-    let subject = names[0].to_string();
-    let mut bindings = vec![(Symbol::new(FN_DEFAULT), default.clone())];
-    let mut size = 4u64.saturating_add(shrink::size(&default, world));
-    let mut body = var(FN_DEFAULT);
+    let subject = &names[0];
     let mut description = default.render();
-    for (i, (key, value)) in table.iter().enumerate().rev() {
-        let key_slot = format!("#k{i}");
-        let value_slot = format!("#v{i}");
-        bindings.push((Symbol::new(&key_slot), key.clone()));
-        bindings.push((Symbol::new(&value_slot), value.clone()));
-        size = size
-            .saturating_add(shrink::size(key, world))
-            .saturating_add(shrink::size(value, world));
+    for (key, value) in entries.iter().rev() {
         description = format!(
             "if {subject} == {} {{ {} }} else {{ {description} }}",
             key.render(),
             value.render()
         );
-        body = Expr {
-            kind: ExprKind::If {
-                cond: Box::new(Expr {
-                    kind: ExprKind::Binary {
-                        op: BinOp::Eq,
-                        lhs: Box::new(var(&subject)),
-                        rhs: Box::new(var(&key_slot)),
-                    },
-                    span: Span::DUMMY,
-                }),
-                then_branch: Box::new(var(&value_slot)),
-                else_branch: Box::new(body),
-            },
-            span: Span::DUMMY,
-        };
     }
-    bindings.push((Symbol::new(FN_SIZE), Value::Int(saturating_i64(size))));
     let description = format!("|{}| {description}", binder_list(arity, &names));
-    closure(names, body, bindings, description)
+    closure(arity, Synth::Table { entries, default }, description)
 }
 
-fn saturating_i64(n: u64) -> i64 {
-    i64::try_from(n).unwrap_or(i64::MAX)
-}
-
-pub(crate) fn fn_size(value: &Value) -> Option<u64> {
+pub(crate) fn fn_size(value: &Value, world: &TypeWorld) -> Option<u64> {
     let Value::Closure(closure) = value else {
         return None;
     };
-    let ClosureKind::Fn { bindings, .. } = &closure.kind else {
+    let ClosureKind::Synth { rule, .. } = &closure.kind else {
         return None;
     };
-    let size = Symbol::new(FN_SIZE);
-    match bindings.iter().find(|(n, _)| *n == size) {
-        Some((_, Value::Int(n))) => Some((*n).max(0) as u64),
-        _ => None,
-    }
+    let own: u64 = match rule {
+        Synth::Const(_) => 2,
+        Synth::Project(_) => 1,
+        Synth::Table { .. } => 4,
+    };
+    Some(
+        rule.values()
+            .into_iter()
+            .fold(own, |acc, v| acc.saturating_add(shrink::size(v, world))),
+    )
 }
 
 #[derive(Debug)]

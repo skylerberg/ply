@@ -1,11 +1,9 @@
 use crate::arena::Slot;
 use crate::builtins::Builtin;
-use crate::code::Code;
 use crate::cont::Continuation;
 use crate::limit::{self, MAX_VALUE_DEPTH, grow};
 use crate::sim::TaskId;
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::Expr;
 pub use ply_ty::IntTy;
 use ply_ty::render_float;
 use rpds::RedBlackTreeMap;
@@ -165,23 +163,6 @@ pub struct Closure {
 }
 
 pub enum ClosureKind {
-    Fn {
-        params: Vec<Symbol>,
-        body: Arc<Expr>,
-        /// External bindings the body reads by name, lowered as leading parameters.
-        bindings: Vec<(Symbol, Value)>,
-        /// Index into `Program::modules`: where the body's bare names resolve.
-        module: usize,
-    },
-    Code {
-        params: Rc<Vec<Symbol>>,
-        body: Code,
-        /// The body's window size.
-        size: u32,
-        captures: Rc<crate::code::Captures>,
-        captured: Rc<[Value]>,
-        module: usize,
-    },
     Ctor {
         name: Symbol,
         arity: usize,
@@ -193,28 +174,61 @@ pub enum ClosureKind {
         arity: usize,
         captured: Vec<Value>,
     },
+    /// A function the prover generated: data rather than a body, so the compiled tier applies it.
+    Synth {
+        arity: usize,
+        rule: Synth,
+    },
+}
+
+pub enum Synth {
+    Const(Value),
+    /// The argument at this position.
+    Project(usize),
+    /// The first entry whose key equals the first argument, else `default`.
+    Table {
+        entries: Vec<(Value, Value)>,
+        default: Value,
+    },
+}
+
+impl Synth {
+    /// `args` is as long as the closure's arity, which the caller checks.
+    pub fn apply(&self, args: &[Value]) -> Result<Value, Diagnostic> {
+        match self {
+            Synth::Const(value) => Ok(value.clone()),
+            Synth::Project(index) => Ok(args[*index].clone()),
+            Synth::Table { entries, default } => {
+                for (key, value) in entries {
+                    if values_equal(&args[0], key, Span::DUMMY)? {
+                        return Ok(value.clone());
+                    }
+                }
+                Ok(default.clone())
+            }
+        }
+    }
+
+    pub fn values(&self) -> Vec<&Value> {
+        match self {
+            Synth::Const(value) => vec![value],
+            Synth::Project(_) => Vec::new(),
+            Synth::Table { entries, default } => entries
+                .iter()
+                .flat_map(|(key, value)| [key, value])
+                .chain([default])
+                .collect(),
+        }
+    }
 }
 
 impl Closure {
     pub fn arity(&self) -> usize {
         match &self.kind {
-            ClosureKind::Fn { params, .. } => params.len(),
-            ClosureKind::Code { params, .. } => params.len(),
-            ClosureKind::Ctor { arity, .. } => *arity,
             ClosureKind::Builtin(b) => b.arity().0,
-            ClosureKind::Native { arity, .. } => *arity,
-        }
-    }
-
-    pub fn describe(&self) -> String {
-        match (&self.name, &self.kind) {
-            (Some(n), _) => format!("`{n}`"),
-            (None, ClosureKind::Ctor { name, .. }) => format!("`{name}`"),
-            (None, ClosureKind::Builtin(b)) => format!("`{}`", b.name()),
-            (None, ClosureKind::Fn { .. } | ClosureKind::Code { .. }) => {
-                "an anonymous function".to_string()
-            }
-            (None, ClosureKind::Native { .. }) => "a compiled function".to_string(),
+            ClosureKind::Ctor { arity, .. }
+            | ClosureKind::Native { arity, .. }
+            | ClosureKind::Synth { arity, .. } => *arity,
         }
     }
 }

@@ -4,7 +4,7 @@ use crate::pipeline::{Front, front};
 use anyhow::{Context, Result, bail};
 use ply_eval::arena::Slot;
 use ply_eval::cont::{Frame, Prompt, Stack};
-use ply_eval::{Evaluator, Fixture, Value};
+use ply_eval::{Fixture, Machine, Value};
 use ply_span::{SourceId, SourceMap, Span};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
@@ -88,8 +88,8 @@ fn lower_every_test_body(front: &Front, repeats: usize) -> Duration {
 }
 
 fn one_pass(front: &Front, repeats: usize) -> Result<Pass> {
-    fn build<'a>(front: &'a Front) -> Box<dyn Evaluator + 'a> {
-        Box::new(front.machine())
+    fn build(front: &Front) -> Machine<'_> {
+        front.machine()
     }
 
     let setup = best_of(repeats, || {
@@ -104,11 +104,11 @@ fn one_pass(front: &Front, repeats: usize) -> Result<Pass> {
     for _ in 0..repeats.max(1) {
         let mut worker = build(front);
         let started = Instant::now();
-        performs = run_every_test(worker.as_mut())?;
+        performs = run_every_test(&mut worker)?;
         let first = started.elapsed();
 
         let started = Instant::now();
-        run_every_test(worker.as_mut())?;
+        run_every_test(&mut worker)?;
         let steady = started.elapsed();
 
         if best.is_none_or(|(f, s)| first + steady < f + s) {
@@ -127,14 +127,14 @@ fn one_pass(front: &Front, repeats: usize) -> Result<Pass> {
 }
 
 /// Every test once, returning the atoms performed across the pass.
-fn run_every_test(worker: &mut dyn Evaluator) -> Result<u64> {
+fn run_every_test(worker: &mut Machine<'_>) -> Result<u64> {
     let mut performs = 0u64;
     for index in 0..worker.test_count() {
         let name = worker.test_name(index).unwrap_or("?").to_string();
         worker.eval_test(index).map_err(|d| {
             anyhow::anyhow!("test `{name}` failed while being timed: {}", d.message)
         })?;
-        performs += worker.observed_performs().unwrap_or_default();
+        performs += worker.trace().performs();
     }
     Ok(performs)
 }

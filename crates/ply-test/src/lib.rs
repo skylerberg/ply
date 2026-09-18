@@ -13,7 +13,7 @@ pub mod slice;
 
 use ply_eval::explore::{Interleaving, explore, measure_reduction};
 use ply_eval::host::{HostBinding, HostRuntime};
-use ply_eval::{Arena, Exploration, Lowering, Machine, Plan, Race, Seed, TaskRegions, Value};
+use ply_eval::{Arena, Exploration, Machine, Plan, Race, Seed, TaskRegions, Value};
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Symbol, codes};
 use ply_store::{Outcome, PassRecord, Store};
@@ -488,12 +488,6 @@ impl<'a> Worker<'a> {
         &self.region
     }
 
-    /// What this machine already lowered, reused by the machines a search builds per interleaving.
-    fn lowering(&self) -> Option<Rc<Lowering<'a>>> {
-        let m = &self.machine;
-        Some(m.share_lowering())
-    }
-
     fn open_region(&mut self) {
         if self.region.is_empty() {
             return;
@@ -594,20 +588,12 @@ impl<'a> InterpExecutor<'a> {
         Some(provider.attach(spec))
     }
 
-    /// The same machine, lowering into `lowering` rather than into a cache of its own.
-    fn machine_lowering(
-        &self,
-        lowering: Option<Rc<Lowering<'a>>>,
-        backend: Option<Rc<dyn ply_eval::Compiled>>,
-    ) -> Box<Machine<'a>> {
+    fn machine(&self, backend: Option<Rc<dyn ply_eval::Compiled>>) -> Box<Machine<'a>> {
         let mut machine = Machine::new(self.program, self.resolved, self.check);
         if let Some(backend) = backend {
             machine.set_compiled(backend);
         }
         machine.share_region_kinds(self.shared_region_kinds());
-        if let Some(lowering) = lowering {
-            machine.set_lowering(lowering);
-        }
         if let Some(binding) = &self.hosts.binding {
             machine.set_host_binding(Arc::clone(binding));
         }
@@ -617,10 +603,10 @@ impl<'a> InterpExecutor<'a> {
         Box::new(machine)
     }
 
-    fn run_one<E: ply_eval::Evaluator>(&self, e: &mut E, index: usize) -> Result<(), Diagnostic> {
+    fn run_one(&self, machine: &mut Machine<'a>, index: usize) -> Result<(), Diagnostic> {
         match self.addresses.get(index) {
-            Some((module, ordinal)) => e.eval_test_in(module, *ordinal),
-            None => e.eval_test(index),
+            Some((module, ordinal)) => machine.eval_test_in(module, *ordinal),
+            None => machine.eval_test(index),
         }
     }
 
@@ -660,10 +646,9 @@ impl<'a> InterpExecutor<'a> {
         // Every interleaving's, summed.
         let mut used: Option<BackendUse> = None;
         let region = &worker.region;
-        let lowering = worker.lowering();
         let backend = worker.backend.clone();
         let mut interleaving = |seed: &Seed| {
-            let mut machine = self.machine_lowering(lowering.clone(), backend.clone());
+            let mut machine = self.machine(backend.clone());
             if !region.is_empty() {
                 machine.set_regions(region.open().0);
             }
@@ -725,10 +710,7 @@ impl<'a> Executor for InterpExecutor<'a> {
 
     fn worker(&self) -> Worker<'a> {
         let backend = self.backend();
-        let mut worker = Worker::in_region(
-            self.machine_lowering(None, backend.clone()),
-            self.build_region(),
-        );
+        let mut worker = Worker::in_region(self.machine(backend.clone()), self.build_region());
         worker.backend = backend;
         // So the worker holds the group's region from creation, not only from its first test.
         worker.open_region();
@@ -1342,16 +1324,11 @@ fn execute_group<E: Executor>(
     out
 }
 
-/// Two evaluators disagreeing is a Ply defect: nothing in the user's graph decides which is right.
-fn is_divergence(d: &Diagnostic) -> bool {
-    d.code == codes::ENGINE_DIVERGENCE || d.code == codes::SIMULATION_DIVERGENCE
-}
-
 fn is_defect(d: &Diagnostic) -> bool {
     d.code == codes::INTERNAL_ERROR
         || d.code == codes::HOST_FOOTPRINT_ESCAPE
         || d.code == codes::SECRET_TO_HOST
-        || is_divergence(d)
+        || d.code == codes::SIMULATION_DIVERGENCE
 }
 
 fn panic_diagnostic(payload: Box<dyn Any + Send>, check: &CheckOutput, index: usize) -> Diagnostic {

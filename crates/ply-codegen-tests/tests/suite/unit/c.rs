@@ -190,26 +190,13 @@ pub mod tests_support {
         }
     }
 
-    pub fn interpreted(
-        source: &'static Source,
-        name: &str,
-        args: &[ply_eval::Value],
-    ) -> Result<ply_eval::Value, ply_span::Diagnostic> {
-        ply_eval::interp::Pure::new(source.program, source.resolved).call(
-            name,
-            args.to_vec(),
-            ply_span::Span::DUMMY,
-            100_000,
-        )
-    }
-
     fn texts(text: &str) -> HashMap<String, String> {
         HashMap::from([("m".to_string(), text.to_string())])
     }
 }
 
 #[test]
-fn the_tier_agrees_with_the_interpreter() {
+fn the_tier_answers_what_the_program_means() {
     let source = r#"
 type Quad = { a: U32, b: U32, c: U32, d: U32 }
 fn g(q: Quad, mx: U32) -> Quad = {
@@ -238,31 +225,33 @@ pub fn looped(n: Int) -> Int =
     if s.i >= n { Stop(int_of_u32(s.q.a ^ s.q.b ^ s.q.c ^ s.q.d)) }
     else { Continue({i: s.i + 1, q: g(s.q, u32_of_int(s.i))}) })
 "#;
-    let Some((loaded, native)) = tests_support::unit(source) else {
+    let Some((_, native)) = tests_support::unit(source) else {
         return;
     };
-    let cases: &[(&str, Vec<ply_eval::Value>)] = &[
-        ("m.mixed", vec![ply_eval::Value::Int(0xDEAD_BEEF)]),
-        ("m.mixed", vec![ply_eval::Value::Int(0)]),
-        ("m.counted", vec![ply_eval::Value::Int(40)]),
+    let int = ply_eval::Value::Int;
+    let cases: &[(&str, Vec<ply_eval::Value>, i64)] = &[
+        ("m.mixed", vec![int(0xDEAD_BEEF)], 0x4896_3B0D),
+        ("m.mixed", vec![int(0)], 0x4892_2726),
+        ("m.counted", vec![int(40)], 20_540),
         // Built at one site but described once per iteration: reusing the first iteration's object is a wrong answer, not a crash.
-        ("m.looped", vec![ply_eval::Value::Int(1)]),
-        ("m.looped", vec![ply_eval::Value::Int(7)]),
+        ("m.looped", vec![int(1)], 0x0010_0070),
+        ("m.looped", vec![int(7)], 0x627E_6B17),
         (
             "m.bytes_sum",
             vec![ply_eval::Value::bytes(b"the quick brown fox")],
+            1843,
         ),
         (
             "m.shifted",
-            vec![ply_eval::Value::Int(-9), ply_eval::Value::Int(3)],
+            vec![int(-9), int(3)],
+            2_305_843_009_213_693_876,
         ),
-        ("m.matched", vec![ply_eval::Value::Int(0)]),
-        ("m.matched", vec![ply_eval::Value::Int(1)]),
-        ("m.matched", vec![ply_eval::Value::Int(7)]),
+        ("m.matched", vec![int(0)], 100),
+        ("m.matched", vec![int(1)], 200),
+        ("m.matched", vec![int(7)], 21),
     ];
-    for (name, args) in cases {
-        let want = tests_support::interpreted(loaded, name, args)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the interpreter: {}", d.message));
+    for (name, args, want) in cases {
+        let want = ply_eval::Value::Int(*want);
         let entry: ply_codegen::rt::Entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -276,16 +265,13 @@ pub fn looped(n: Int) -> Int =
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
-        assert_eq!(
-            got, want,
-            "`{name}{args:?}`: the tier and the interpreter disagree"
-        );
+        assert_eq!(got, want, "`{name}{args:?}`");
     }
 }
 
 /// A `U64` past `2^62` is not an immediate (tagging eats its top bit), so it is held as the machine's own value.
 #[test]
-fn a_width_the_tier_cannot_carry_in_a_register_still_answers_what_the_machine_answers() {
+fn a_width_the_tier_cannot_carry_in_a_register_still_answers() {
     let source = r#"
 pub fn wide(n: Int) -> Int = {
   let a = u64_of_int(n);
@@ -294,16 +280,31 @@ pub fn wide(n: Int) -> Int = {
 }
 pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 2654435761u32), 7))
 "#;
-    let Some((loaded, native, _)) = tests_support::with_refusals(source) else {
+    let Some((_, native, _)) = tests_support::with_refusals(source) else {
         return;
     };
-    for name in ["m.wide", "m.narrow"] {
+    // `None` raises: `_of_int` refuses a value outside its width rather than truncating it.
+    let answers: [(&str, [Option<i64>; 5]); 2] = [
+        (
+            "m.wide",
+            [Some(0), Some(10_736), Some(26_178), Some(0), None],
+        ),
+        (
+            "m.narrow",
+            [
+                Some(0),
+                Some(1_664_904_947),
+                Some(3_544_340_112),
+                None,
+                None,
+            ],
+        ),
+    ];
+    for (name, wants) in answers {
         let entry: ply_codegen::rt::Entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
-        // `-7` makes the machine raise (`u64_of_int` refuses a negative), and the tier has to raise with it.
-        for n in [0i64, 1, 12_345, 1 << 40, -7] {
-            let want = tests_support::interpreted(loaded, name, &[ply_eval::Value::Int(n)]);
+        for (n, want) in [0i64, 1, 12_345, 1 << 40, -7].into_iter().zip(wants) {
             let mut ctx = native.context();
             ctx.fuel = 1_000;
             let layouts_ptr: *const ply_codegen::heap::Layouts = &native.tables().layouts;
@@ -312,19 +313,12 @@ pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 265443576
                 .to_word(unsafe { &*layouts_ptr }, &ply_eval::Value::Int(n));
             let answer = unsafe { entry(&mut ctx, [word].as_ptr()) };
             match want {
-                Ok(want) => {
+                Some(want) => {
                     assert_eq!(ctx.failed, 0, "`{name}({n})` raised in the C tier");
                     let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
-                    assert_eq!(
-                        got, want,
-                        "`{name}({n})`: the tier and the interpreter disagree"
-                    );
+                    assert_eq!(got, ply_eval::Value::Int(want), "`{name}({n})`");
                 }
-                Err(d) => assert_ne!(
-                    ctx.failed, 0,
-                    "`{name}({n})` answered where the interpreter raised: {}",
-                    d.message
-                ),
+                None => assert_ne!(ctx.failed, 0, "`{name}({n})` answered out of its width"),
             }
         }
     }
@@ -332,26 +326,31 @@ pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 265443576
 
 #[test]
 fn a_record_with_a_counted_field_survives_being_rebuilt() {
-    for (which, body) in [
+    for (which, body, want) in [
         (
             "plain",
             "pub fn probe(n: Int) -> P = {pos: 0, depth: n, diags: [n]}",
+            "{depth: 4, diags: [4], pos: 0}",
         ),
         (
             "rebuilt",
             "pub fn probe(n: Int) -> P = with_depth({pos: 0, depth: n, diags: [n]}, 9)",
+            "{depth: 9, diags: [4], pos: 0}",
         ),
         (
             "pushed",
             "pub fn probe(n: Int) -> P = noted({pos: 0, depth: n, diags: [n]}, 7)",
+            "{depth: 4, diags: [4, 7], pos: 0}",
         ),
         (
             "let-bound",
             "pub fn probe(n: Int) -> P = { let p = {pos: 0, depth: n, diags: [n]}; with_depth(p, p.depth + 1) }",
+            "{depth: 5, diags: [4], pos: 0}",
         ),
         (
             "wrapped",
             "pub fn probe(n: Int) -> Option<P> = Some({pos: 0, depth: n, diags: [n]})",
+            "Some({depth: 4, diags: [4], pos: 0})",
         ),
     ] {
         let source = format!(
@@ -363,12 +362,10 @@ fn noted(p: P, x: Int) -> P = {{ pos: p.pos, depth: p.depth, diags: push(p.diags
 "#
         );
         eprintln!("--- shape: {which}");
-        let Some((loaded, native)) = tests_support::unit(&source) else {
+        let Some((_, native)) = tests_support::unit(&source) else {
             return;
         };
         let args = vec![ply_eval::Value::Int(4)];
-        let want = tests_support::interpreted(loaded, "m.probe", &args)
-            .unwrap_or_else(|d| panic!("`{which}` raised in the interpreter: {}", d.message));
         let entry: ply_codegen::rt::Entry = native.entry("m.probe").expect("compiled");
         let mut ctx = native.context();
         ctx.fuel = 100_000;
@@ -380,10 +377,7 @@ fn noted(p: P, x: Int) -> P = {{ pos: p.pos, depth: p.depth, diags: push(p.diags
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{which}` raised in the C tier");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
-        assert_eq!(
-            got, want,
-            "`{which}`: the tier and the interpreter disagree"
-        );
+        assert_eq!(got.render(), want, "`{which}`");
     }
 }
 
@@ -416,21 +410,20 @@ pub fn round(n: Int) -> Int = code(TNum(n))
 pub fn eof() -> Int = code(TEof)
 pub fn named(b: Bytes) -> Int = code(TName(b))
 "#;
-    let Some((loaded, native, refused)) = tests_support::with_refusals(source) else {
+    let Some((_, native, refused)) = tests_support::with_refusals(source) else {
         return;
     };
     assert!(
         refused.is_empty(),
         "nothing here is outside the fragment: {refused:?}"
     );
-    let cases: &[(&str, Vec<ply_eval::Value>)] = &[
-        ("m.round", vec![ply_eval::Value::Int(7)]),
-        ("m.eof", vec![]),
-        ("m.named", vec![ply_eval::Value::bytes(b"abcd")]),
+    let cases: &[(&str, Vec<ply_eval::Value>, i64)] = &[
+        ("m.round", vec![ply_eval::Value::Int(7)], 7),
+        ("m.eof", vec![], 0),
+        ("m.named", vec![ply_eval::Value::bytes(b"abcd")], 4),
     ];
-    for (name, args) in cases {
-        let want = tests_support::interpreted(loaded, name, args)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the interpreter: {}", d.message));
+    for (name, args, want) in cases {
+        let want = &ply_eval::Value::Int(*want);
         let entry: ply_codegen::rt::Entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -444,10 +437,7 @@ pub fn named(b: Bytes) -> Int = code(TName(b))
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
-        assert_eq!(
-            got, want,
-            "`{name}{args:?}`: the tier and the interpreter disagree"
-        );
+        assert_eq!(&got, want, "`{name}{args:?}`");
     }
 }
 
@@ -464,7 +454,7 @@ pub fn by_name(xs: List<Int>) -> Int = fold(map(xs, |x: Int| x + 1), 0, add)
 pub fn adder(n: Int) -> (Int) -> Int = |x: Int| x + n
 pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
 "#;
-    let Some((loaded, native, refused)) = tests_support::with_refusals(source) else {
+    let Some((_, native, refused)) = tests_support::with_refusals(source) else {
         return;
     };
     assert!(
@@ -473,23 +463,20 @@ pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
     );
     let list =
         |xs: &[i64]| ply_eval::Value::list(xs.iter().map(|n| ply_eval::Value::Int(*n)).collect());
-    let cases: &[(&str, Vec<ply_eval::Value>)] = &[
-        ("m.twice", vec![list(&[1, 2, 3])]),
-        ("m.and_len", vec![list(&[1, 2, 3])]),
+    let int = ply_eval::Value::Int;
+    let cases: &[(&str, Vec<ply_eval::Value>, ply_eval::Value)] = &[
+        ("m.twice", vec![list(&[1, 2, 3])], int(12)),
+        ("m.and_len", vec![list(&[1, 2, 3])], int(9)),
         (
             "m.through_a_value",
-            vec![list(&[1, 2, 3]), ply_eval::Value::Int(10)],
+            vec![list(&[1, 2, 3]), int(10)],
+            int(60),
         ),
-        ("m.mapped", vec![list(&[1, 2, 3]), ply_eval::Value::Int(3)]),
-        ("m.by_name", vec![list(&[1, 2, 3, 4])]),
-        (
-            "m.used_twice",
-            vec![ply_eval::Value::Int(5), ply_eval::Value::Int(2)],
-        ),
+        ("m.mapped", vec![list(&[1, 2, 3]), int(3)], list(&[3, 6, 9])),
+        ("m.by_name", vec![list(&[1, 2, 3, 4])], int(14)),
+        ("m.used_twice", vec![int(5), int(2)], int(14)),
     ];
-    for (name, args) in cases {
-        let want = tests_support::interpreted(loaded, name, args)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the interpreter: {}", d.message));
+    for (name, args, want) in cases {
         let entry: ply_codegen::rt::Entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -503,10 +490,7 @@ pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
-        assert_eq!(
-            got, want,
-            "`{name}{args:?}`: the tier and the interpreter disagree"
-        );
+        assert_eq!(&got, want, "`{name}{args:?}`");
     }
 }
 

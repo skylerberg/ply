@@ -12,12 +12,10 @@ pub mod code;
 pub mod compiled;
 pub mod cont;
 pub mod costs;
-pub mod differential;
 pub mod escape;
 pub mod explore;
 pub mod handler;
 pub mod host;
-pub mod interp;
 pub mod limit;
 pub mod list;
 pub use list::List;
@@ -45,13 +43,12 @@ pub use backend::{
     Spec as BackendSpec,
 };
 pub use builtins::{Builtin, Step, assert_failure, assertion_failure};
-pub use code::{Captures, Code, Lowered, Lowering, Node, NodeKind, Pat, lower};
+pub use code::{Captures, Code, Lowered, Node, NodeKind, Pat, lower};
 pub use compiled::{Compiled, Entered, mentions_a_width};
 pub use cont::{
     Continuation, Delimiter, Extent, Frame, Handled, Next, Prompt, Segment, SimId, Stack, Target,
 };
 pub use costs::{Cause as CostCause, Costs, DefKind as CostDefKind, Verdict as CostVerdict};
-pub use differential::{Compared, Detail, Divergence, Evaluator, Report, compare_answers};
 pub use escape::{Boundary, Escapee, Handle};
 pub use host::{
     Bound, Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
@@ -62,8 +59,8 @@ pub use task_regions::{Fixture, TaskRegions};
 // `explore::Step` is not re-exported: `Step` at the root is the builtin's.
 pub use evaluator::{
     Machine, Unbound, carries_secret, check_host_answer, err_footprint_escape,
-    err_host_in_simulation, err_nested_simulation, err_no_runtime, err_secret_to_host,
-    err_unenumerated_atom,
+    err_host_in_simulation, err_nested_simulation, err_no_runtime, err_not_compiled,
+    err_secret_to_host, err_unenumerated_atom,
 };
 pub use explore::{
     Dependence, Explored, Interleaving, Simulation, Verdict, explore, explore_under,
@@ -73,7 +70,7 @@ pub use limit::{DEFAULT_MAX_CALLS, MAX_VALUE_DEPTH};
 pub use rc::{Own, Stats as RcStats};
 pub use region::{MachineScheduler, Spawned};
 pub use region_kind::Regions;
-pub use semantics::{ctor_value, lit_matches, strict_binary};
+pub use semantics::strict_binary;
 pub use sim::{
     Access, Answer, Clock, Domain, Exploration, Handlers, Naive, OpSignature, Plan, Race, RaceSite,
     Rand, SEEDED_EFFECTS, SEEDED_OPS, Seed, SimMode, SimTy, Sleep, StepFootprint, Stream, TaskId,
@@ -81,7 +78,7 @@ pub use sim::{
 };
 pub use trace::Trace;
 pub use value::{
-    Closure, ClosureKind, Decimal, Fields, Fixed, IntTy, Map, SECRET_REDACTED, Value,
+    Closure, ClosureKind, Decimal, Fields, Fixed, IntTy, Map, SECRET_REDACTED, Synth, Value,
     constant_time_eq, first_difference, values_equal,
 };
 pub use window::{SlotVal, Windows};

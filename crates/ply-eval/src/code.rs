@@ -5,15 +5,11 @@ use crate::rc::{Live, Own};
 use crate::value::Value;
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::{
-    Expr, ExprKind, HandleClause, Ident, MatchArm, Pattern, PatternKind, Program, QName,
-    ReturnClause, Stmt as AstStmt,
+    Expr, ExprKind, HandleClause, Ident, MatchArm, Pattern, PatternKind, QName, ReturnClause,
+    Stmt as AstStmt,
 };
 use ply_ty::{BinOp, Lit, UnOp};
-use rustc_hash::FxHashMap;
-use std::cell::RefCell;
-use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::Arc;
 
 pub type Code = Rc<Node>;
 
@@ -261,86 +257,6 @@ pub fn lower_fn(params: &[Symbol], e: &Expr) -> Lowered {
     Lowered {
         code,
         size: table.barriers[0].size(),
-    }
-}
-
-/// Shared with the closure built from the body rather than copied into the cache.
-pub type Params = Rc<Vec<Symbol>>;
-
-/// Lowered bodies, shared by every machine built from one program.
-pub struct Lowering<'a> {
-    program: &'a Program,
-    bodies: RefCell<FxHashMap<usize, (Params, Lowered)>>,
-    nullary: Params,
-    /// Makes the type invariant in `'a`; do not remove.
-    invariant: PhantomData<fn(&'a Program) -> &'a Program>,
-}
-
-impl<'a> Lowering<'a> {
-    pub fn for_program(program: &'a Program) -> Lowering<'a> {
-        Lowering {
-            program,
-            bodies: RefCell::new(FxHashMap::default()),
-            nullary: Rc::new(Vec::new()),
-            invariant: PhantomData,
-        }
-    }
-
-    /// Whether this cache was built for `program`, by pointer identity.
-    pub fn describes(&self, program: &Program) -> bool {
-        std::ptr::eq(self.program, program)
-    }
-
-    pub fn body(&self, body: &'a Expr) -> Lowered {
-        self.of(&self.nullary, body)
-    }
-
-    pub fn of(&self, params: &Params, body: &'a Expr) -> Lowered {
-        let key = std::ptr::from_ref(body) as usize;
-        let hit = self
-            .bodies
-            .borrow()
-            .get(&key)
-            .filter(|(cached, _)| cached == params)
-            .map(|(_, lowered)| lowered.clone());
-        if let Some(lowered) = hit {
-            return lowered;
-        }
-        let lowered = lower_fn(params, body);
-        self.bodies
-            .borrow_mut()
-            .insert(key, (Rc::clone(params), lowered.clone()));
-        lowered
-    }
-
-    pub fn len(&self) -> usize {
-        self.bodies.borrow().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-/// The lowered body of the last unlowered closure the machine applied.
-#[derive(Default)]
-pub struct ClosureCode {
-    last: Option<(Arc<Expr>, Vec<Symbol>, Lowered)>,
-}
-
-impl ClosureCode {
-    /// `pre` is the closure's external bindings, lowered as leading parameters.
-    pub fn of(&mut self, pre: &[Symbol], params: &[Symbol], body: &Arc<Expr>) -> Lowered {
-        let combined: Vec<Symbol> = pre.iter().chain(params.iter()).cloned().collect();
-        if let Some((held, cached, lowered)) = &self.last
-            && Arc::ptr_eq(held, body)
-            && cached.as_slice() == combined.as_slice()
-        {
-            return lowered.clone();
-        }
-        let lowered = lower_fn(&combined, body);
-        self.last = Some((Arc::clone(body), combined, lowered.clone()));
-        lowered
     }
 }
 

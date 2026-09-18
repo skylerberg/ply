@@ -118,7 +118,7 @@ pub fn size(value: &Value, world: &TypeWorld) -> u64 {
                 1u64.saturating_add(index).saturating_add(args.len() as u64)
             }
             // Only closures this crate generated carry a size.
-            Value::Closure(_) => fn_size(v).unwrap_or(1),
+            Value::Closure(_) => fn_size(v, world).unwrap_or(1),
             // Never generated: `forall (s: Secret<a>)` is rejected.
             Value::Cell(_) | Value::Task(_) | Value::Continuation(_) | Value::Secret(_) => 0,
         };
@@ -189,7 +189,7 @@ fn minimal_at(ty: &Type, world: &TypeWorld, depth: u32) -> Result<Value, Ungener
                 return Err(Ungeneratable::Effectful(effects.clone()));
             }
             let value = minimal_at(ret, world, depth + 1)?;
-            Ok(const_fn(params.len(), value, world))
+            Ok(const_fn(params.len(), value))
         }
         Type::Con(name, args) => match name.as_str() {
             "Int" => Ok(Value::Int(0)),
@@ -292,7 +292,7 @@ fn candidates_at(value: &Value, ty: &Type, world: &TypeWorld, depth: u32) -> Vec
         }
         // The constant function is the floor, so the size test ends the walk on the next pass.
         (Value::Closure(_), Type::Fn { params, ret, .. }) => minimal(ret, world)
-            .map(|v| vec![const_fn(params.len(), v, world)])
+            .map(|v| vec![const_fn(params.len(), v)])
             .unwrap_or_default(),
         _ => Vec::new(),
     }
