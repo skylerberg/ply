@@ -44,8 +44,6 @@ pub fn execute(args: &BootstrapArgs, style: Style) -> i32 {
             return EXIT_COMPILE_ERROR;
         }
     };
-    let program = Box::leak(Box::new(loaded.program.clone()));
-    let resolved = Box::leak(Box::new(loaded.resolved.clone()));
     // The load's own answer: asking again would run a second front end.
     let front = Box::leak(Box::new(loaded.front.clone()));
 
@@ -68,8 +66,8 @@ pub fn execute(args: &BootstrapArgs, style: Style) -> i32 {
 
     // Without the module texts the port answers no bodies, and the archive would be empty.
     let src: &'static ply_codegen::Source = Box::leak(Box::new(
-        ply_codegen::Source::from_front(program, resolved, front, emit_keys(front)).with_texts(
-            crate::commands::common::module_texts(&loaded.program, &loaded.sources),
+        ply_codegen::Source::from_front(front, emit_keys(front)).with_texts(
+            crate::commands::common::module_texts(&loaded.check, &loaded.sources),
         ),
     ));
     let names: Vec<String> = src.functions();

@@ -597,10 +597,11 @@ fn bisect_never_reports_that_nothing_was_attempted_and_evaluates_nothing() {
     let (_dir, loaded, hashes, mut report) = failing(ONE_FAILURE);
     let mut args = args_for(None);
     args.bisect = When::Never;
+    let tree = loaded.tree().expect("the front ends agree");
     ply_test::diagnose_failures(
         &mut report,
-        &loaded.program,
-        &loaded.resolved,
+        &tree.program,
+        &tree.resolved,
         &loaded.front,
         &mut Store::open(_dir.path()).unwrap(),
         &diagnosis_options(&args),

@@ -365,12 +365,15 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
     let (millis, sequential) = run(1)?;
     let (_, measured) = run(jobs)?;
 
+    let tree = loaded
+        .tree()
+        .map_err(|d| anyhow::anyhow!("`{}`: {}", root.display(), d.message))?;
     let setup = (0..3)
         .map(|_| {
             let started = Instant::now();
             std::hint::black_box(crate::tier_machine(
-                &loaded.program,
-                &loaded.resolved,
+                &tree.program,
+                &tree.resolved,
                 &loaded.front,
                 &loaded.sources,
             ));

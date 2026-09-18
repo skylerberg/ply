@@ -14,8 +14,6 @@ use std::collections::{HashMap, HashSet};
 
 /// A checked program, borrowed for as long as the unit compiled from it lives.
 pub struct Source {
-    pub program: &'static Program,
-    pub resolved: &'static Resolved,
     pub front: &'static Front,
     /// [`Front::check`].
     pub check: &'static CheckOutput,
@@ -563,39 +561,22 @@ fn is_scalar(ty: &Type) -> bool {
 
 impl Source {
     /// A source over an already-checked program, with no keys, so nothing is cached.
-    pub fn new(
-        program: &'static Program,
-        resolved: &'static Resolved,
-        check: &'static CheckOutput,
-    ) -> Source {
-        let front = front_of(program, resolved, check, HashOutput::default(), None);
-        Source::from_front(
-            program,
-            resolved,
-            Box::leak(Box::new(front)),
-            HashMap::new(),
-        )
+    pub fn new(program: &Program, resolved: &Resolved, check: &CheckOutput) -> Source {
+        Source::keyed(program, resolved, check, HashMap::new())
     }
 
     pub fn keyed(
-        program: &'static Program,
-        resolved: &'static Resolved,
-        check: &'static CheckOutput,
+        program: &Program,
+        resolved: &Resolved,
+        check: &CheckOutput,
         keys: HashMap<String, String>,
     ) -> Source {
         let front = front_of(program, resolved, check, HashOutput::default(), None);
-        Source::from_front(program, resolved, Box::leak(Box::new(front)), keys)
+        Source::from_front(Box::leak(Box::new(front)), keys)
     }
 
-    pub fn from_front(
-        program: &'static Program,
-        resolved: &'static Resolved,
-        front: &'static Front,
-        keys: HashMap<String, String>,
-    ) -> Source {
+    pub fn from_front(front: &'static Front, keys: HashMap<String, String>) -> Source {
         Source {
-            program,
-            resolved,
             front,
             check: &front.check,
             tables: Tables::of(front),

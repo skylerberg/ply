@@ -51,9 +51,8 @@ struct Compiled {
 
 impl Compiled {
     fn tier(&self) -> (&'static ply_codegen::Unit, ply_eval::BackendSpec) {
-        let unit =
-            ply_codegen::Unit::over_with_texts(&self.program, &self.resolved, self.texts.clone())
-                .expect("this host has a C compiler");
+        let unit = ply_codegen::Unit::over_with_texts(&self.program, self.texts.clone())
+            .expect("this host has a C compiler");
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,
             ..Default::default()

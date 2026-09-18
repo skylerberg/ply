@@ -190,42 +190,23 @@ pub fn build(src: &Sources) -> Result<PlyProducer, String> {
 }
 
 /// The emitter's own program through the front end, modules as `SourceId(0..n)` in `modules_of`'s
-/// order; the check comes from the emitter handed over by [`build`].
+/// order; the answer comes from the emitter handed over by [`build`].
 fn front_end(src: &Sources) -> Result<&'static Source, String> {
     let modules = modules_of(src);
     let ids: Vec<SourceId> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
-    let inputs: Vec<_> = modules
+    let front = front(&modules, &ids).map_err(|e| format!("{e:#}"))?;
+    if let Some(error) = front
+        .diagnostics
         .iter()
-        .enumerate()
-        .map(|(i, (module, text))| {
-            let text: &'static str = Box::leak(text.clone().into_boxed_str());
-            (
-                SourceId(i as u32),
-                ply_syntax::ast::ModuleName::from_dotted(module),
-                text,
-            )
-        })
-        .collect();
-    let first = |ds: Vec<ply_span::Diagnostic>| {
-        ds.first()
-            .map(|d| d.message.clone())
-            .unwrap_or_else(|| "no diagnostic".to_string())
-    };
-    let mut ast = ply_syntax::parse_program(inputs).map_err(first)?;
-    let expanded = ply_derive::expand_program(&mut ast);
-    if !expanded.is_empty() {
-        return Err(first(expanded));
+        .find(|d| d.severity == Severity::Error)
+    {
+        return Err(error.message.clone());
     }
-    let resolved = ply_syntax::resolve::resolve(&mut ast).map_err(first)?;
-    let program: &'static ply_syntax::ast::Program = Box::leak(Box::new(ast));
-    let resolved = Box::leak(Box::new(resolved));
-    let front = Box::leak(Box::new(
-        front(&modules, &ids).map_err(|e| format!("{e:#}"))?,
-    ));
+    let front: &'static Front = Box::leak(Box::new(front));
     let keys = crate::source::emit_keys(front);
     let texts: HashMap<String, String> = modules.iter().cloned().collect();
     Ok(Box::leak(Box::new(
-        Source::from_front(program, resolved, front, keys).with_texts(texts),
+        Source::from_front(front, keys).with_texts(texts),
     )))
 }
 
@@ -589,6 +570,11 @@ pub fn front_pulling_std(
                 .to_string(),
         );
     }
+    CENSUS.with(|c| {
+        let mut census = c.get();
+        census.modules += user.len() + modules.len();
+        c.set(census);
+    });
     Ok(Pulled {
         modules,
         dump: answer[frames.at()..].to_string(),

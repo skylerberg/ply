@@ -54,13 +54,8 @@ fn load(source: &str) -> Loaded {
 
 pub fn unit(source: &str) -> (&'static Loaded, &'static Unit) {
     let loaded: &'static Loaded = Box::leak(Box::new(load(source)));
-    let unit = Unit::over_front(
-        loaded.program,
-        loaded.resolved,
-        loaded.front,
-        loaded.texts.clone(),
-    )
-    .expect("this host has a C compiler");
+    let unit = Unit::over_front(loaded.program, loaded.front, loaded.texts.clone())
+        .expect("this host has a C compiler");
     let _ = unit.bodies();
     (loaded, unit)
 }

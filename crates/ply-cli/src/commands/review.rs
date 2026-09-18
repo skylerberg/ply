@@ -2,7 +2,7 @@
 
 use super::common::{
     IND, diagnostic_json, diagnostics_json, emit_json, millis, once_each, plural,
-    print_diagnostics, print_warnings, report_bind_error,
+    print_diagnostics, print_warnings, report_bind_error, report_load_error,
 };
 use super::prove::{
     coverage_json, diagnostics, evidence_summary, gap_summary, law_labels, load_complete,
@@ -61,7 +61,7 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
     let hashes = loaded.hashes.clone();
     let scoped = crate::obligations::project_view(&loaded.check, args.std);
     let laws = Laws::of(&scoped, &hashes);
-    let collected = crate::obligations::collect(&loaded.program, &scoped, &hashes);
+    let collected = crate::obligations::collect(&loaded.front, &scoped, &hashes);
     warnings.extend(collected.warnings);
 
     if args.accept {
@@ -81,6 +81,12 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
 
     let plan = crate::simulation::prove_plan(&args.prove, &args.simulation);
     let specified = obligation::specified(&scoped, &laws, &collected.obligations);
+    let tree = match loaded.tree() {
+        Ok(tree) => tree,
+        Err(diagnostic) => {
+            return report_load_error("review", &loaded.refused(diagnostic), args.json, style);
+        }
+    };
     let backend = match super::common::prover_backend(args.backend.as_ref(), &loaded) {
         Ok(backend) => backend,
         Err(diagnostic) => {
@@ -88,8 +94,8 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
         }
     };
     let engine = crate::engine::of(
-        &loaded.program,
-        &loaded.resolved,
+        &tree.program,
+        &tree.resolved,
         &loaded.check,
         // `ply review` binds nothing, so a `law/host` is a gap, as under a hermetic `ply prove`.
         None,
