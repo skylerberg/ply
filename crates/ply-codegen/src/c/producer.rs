@@ -29,6 +29,9 @@ static RECIPE: OnceLock<Recipe> = OnceLock::new();
 /// A digest of the emitter's own sources, folded into every cache key a produced body or unit
 /// is kept under: a body the last version of the emitter wrote is not this version's.
 static IDENTITY: OnceLock<String> = OnceLock::new();
+/// What the port's answers are a function of besides what it is asked: the units that may serve
+/// and the helper table they bind.
+static EMITTER: OnceLock<String> = OnceLock::new();
 
 thread_local! {
     static MINE: RefCell<Option<Result<PlyProducer, String>>> = const { RefCell::new(None) };
@@ -87,7 +90,24 @@ pub fn install_sources(src: Sources) {
         return;
     }
     let identity = digest_of(&modules_of(&src));
+    let _ = EMITTER.set(emitter_of(&src, &identity));
     install(Arc::new(move || build_from(&src)), identity);
+}
+
+/// A working copy is served by its own bundle, or by the committed one as is or emitting it.
+fn emitter_of(src: &Sources, identity: &str) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(super::exports::helpers_digest().as_bytes());
+    if let Some(carried) = super::bundle::of(&Sources::Embedded) {
+        h.update(carried.unit());
+    }
+    if let Sources::Directory(_) = src {
+        h.update(identity.as_bytes());
+        if let Some(own) = super::bundle::of(src) {
+            h.update(own.unit());
+        }
+    }
+    h.finalize().to_hex().to_string()
 }
 
 /// The emitter's modules -- the standard library, then the emitter's own -- as `(name, text)`
@@ -250,6 +270,14 @@ pub fn identity() -> String {
     HANDED
         .with(|h| h.borrow().as_ref().map(|(_, id)| id.clone()))
         .unwrap_or_else(|| IDENTITY.get().map_or(String::new(), String::clone))
+}
+
+/// What the emitter answering on this thread is, as a cache of its answers keys on it.
+pub fn emitter() -> String {
+    if HANDED.with(|h| h.borrow().is_some()) {
+        return identity();
+    }
+    EMITTER.get().cloned().unwrap_or_else(identity)
 }
 
 /// The identity of an emitter given as its modules' sources, in any order.
@@ -586,6 +614,12 @@ pub fn front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
             ids.len()
         );
     }
+    let dump = front_dump(sources)?;
+    read_front(&dump, ids).map_err(|e| anyhow!("the front end's answer does not read: {e}"))
+}
+
+/// The port's whole answer as it gives it, before [`read_front`] reads it.
+pub fn front_dump(sources: &[(String, String)]) -> Result<String> {
     let records: Vec<Value> = sources
         .iter()
         .map(|(name, src)| {
@@ -602,7 +636,7 @@ pub fn front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
             answer.type_name()
         );
     };
-    read_front(dump, ids).map_err(|e| anyhow!("the front end's answer does not read: {e}"))
+    Ok(dump.to_string())
 }
 
 /// [`front`] over the default producer, with the program's errors raised rather than answered.

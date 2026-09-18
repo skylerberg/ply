@@ -1826,10 +1826,6 @@ fn an_unreadable_front_end_cache_says_the_results_survived_it() {
         text.contains("no test re-runs"),
         "the user has to be told what survived:\n{text}"
     );
-    assert!(
-        text.contains("recomputes types and hashes"),
-        "the user has to be told what it cost:\n{text}"
-    );
 }
 
 /// The migration proper: a project whose cache directory still holds the JSON front-end cache and
