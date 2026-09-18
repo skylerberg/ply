@@ -31,8 +31,9 @@ impl Run {
             )
         });
         let hashes = loaded.hashes.clone();
-        let collected = obligations::collect(&loaded.program, &loaded.check, &hashes);
-        let prover = Prover::new(&loaded.program, &loaded.resolved, &loaded.check).with_backend(
+        let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
+        let tree = loaded.tree().expect("the front ends agree");
+        let prover = Prover::new(&tree.program, &tree.resolved, &loaded.check).with_backend(
             ply_cli::commands::common::prover_backend(None, &loaded)
                 .expect("the program compiles to a tier"),
         );
@@ -146,8 +147,9 @@ fn a_certificate_over_a_hidden_float_is_refuted_by_sampling() {
     let dir = project(source);
     let loaded = load(dir.path()).expect("the fixture compiles");
     let hashes = loaded.hashes.clone();
-    let collected = obligations::collect(&loaded.program, &loaded.check, &hashes);
-    let prover = Prover::new(&loaded.program, &loaded.resolved, &loaded.check).with_backend(
+    let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
+    let tree = loaded.tree().expect("the front ends agree");
+    let prover = Prover::new(&tree.program, &tree.resolved, &loaded.check).with_backend(
         ply_cli::commands::common::prover_backend(None, &loaded)
             .expect("the program compiles to a tier"),
     );

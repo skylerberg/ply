@@ -76,8 +76,12 @@ pub fn discharge(path: &Path, plan: &ProvePlan) -> Result<Discharged> {
             e.diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
         ),
     };
-    let collected = obligations::collect(&loaded.program, &loaded.check, &loaded.hashes);
-    let prover = Prover::new(&loaded.program, &loaded.resolved, &loaded.check);
+    let collected = obligations::collect(&loaded.front, &loaded.check, &loaded.hashes);
+    let tree = match loaded.tree() {
+        Ok(tree) => tree,
+        Err(d) => bail!("`{}`: {}", path.display(), d.message),
+    };
+    let prover = Prover::new(&tree.program, &tree.resolved, &loaded.check);
 
     let started = Instant::now();
     let discharges: Vec<Discharge> = collected

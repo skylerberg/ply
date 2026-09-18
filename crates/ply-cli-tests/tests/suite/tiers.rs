@@ -39,7 +39,7 @@ impl Run {
             ),
         };
         let hashes = loaded.hashes.clone();
-        let collected = obligations::collect(&loaded.program, &loaded.check, &hashes);
+        let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
         assert!(
             collected.warnings.is_empty(),
             "an obligation was not collected: {:?}",
@@ -49,7 +49,8 @@ impl Run {
                 .map(|d| d.message.clone())
                 .collect::<Vec<_>>()
         );
-        let prover = Prover::new(&loaded.program, &loaded.resolved, &loaded.check).with_backend(
+        let tree = loaded.tree().expect("the front ends agree");
+        let prover = Prover::new(&tree.program, &tree.resolved, &loaded.check).with_backend(
             ply_cli::commands::common::prover_backend(None, &loaded)
                 .expect("the program compiles to a tier"),
         );
@@ -174,8 +175,9 @@ fn the_differential_tier_audit() {
     for path in corpus() {
         let loaded = load(&path).expect("the corpus compiles");
         let hashes = loaded.hashes.clone();
-        let collected = obligations::collect(&loaded.program, &loaded.check, &hashes);
-        let prover = Prover::new(&loaded.program, &loaded.resolved, &loaded.check).with_backend(
+        let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
+        let tree = loaded.tree().expect("the front ends agree");
+        let prover = Prover::new(&tree.program, &tree.resolved, &loaded.check).with_backend(
             ply_cli::commands::common::prover_backend(None, &loaded)
                 .expect("the program compiles to a tier"),
         );

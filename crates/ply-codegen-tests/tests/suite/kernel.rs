@@ -37,10 +37,10 @@ fn kernel() -> (&'static Program, &'static Unit) {
     let ids: Vec<_> = inputs.iter().map(|(id, _, _)| *id).collect();
     let mut ast = ply_syntax::parse_program(inputs).expect("the kernel parses");
     assert!(ply_derive::expand_program(&mut ast).is_empty());
-    let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the kernel resolves");
+    ply_syntax::resolve::resolve(&mut ast).expect("the kernel resolves");
     let front = ply_codegen::c::producer::checked_front(&named, &ids).expect("the kernel checks");
     let ast: &'static Program = Box::leak(Box::new(ast));
-    let unit = Unit::over_front(ast, &resolved, &front, named.into_iter().collect())
+    let unit = Unit::over_front(ast, &front, named.into_iter().collect())
         .expect("this host has a C compiler");
     (ast, unit)
 }
