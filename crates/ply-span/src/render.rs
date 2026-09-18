@@ -173,7 +173,7 @@ mod tests {
         let id = sm.add("t.ply", "fn f() = \"é\"\n");
         for span in [
             Span::new(id, 21, 26),
-            Span::new(id, 10, 12),
+            Span::new(id, 11, 12),
             Span::new(id, 5, 2),
         ] {
             assert_eq!(sm.snippet(span), "");
