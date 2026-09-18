@@ -143,6 +143,36 @@ fn check_exits_two_on_a_syntax_error() {
     assert!(String::from_utf8(out.stderr).unwrap().contains("E0001"));
 }
 
+/// Run twice with the cache so the second answer is the stored one.
+#[test]
+fn an_unused_definition_warns_without_failing_check_or_test() {
+    let dir = project(
+        "fn dead() -> Int = 1\n\
+         pub fn live() -> Int = 2\n\
+         test \"live is two\" { assert_eq(live(), 2) }\n",
+    );
+    for args in [
+        &["check"][..],
+        &["check"][..],
+        &["check", "--no-incremental"][..],
+        &["test"][..],
+    ] {
+        let out = ply(dir.path()).args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        let text = stdout_of(&out);
+        assert!(
+            text.contains("warning: fn `m.dead` is never used"),
+            "{args:?}:\n{text}"
+        );
+        assert!(!text.contains("`m.live`"), "{args:?}:\n{text}");
+    }
+    let v = json_of(&ply(dir.path()).args(["check", "--json"]).output().unwrap());
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["diagnostics"][0]["code"], "W0611");
+    assert_eq!(v["diagnostics"][0]["severity"], "warning");
+    assert_eq!(v["diagnostics"][0]["labels"][0]["snippet"], "dead");
+}
+
 #[test]
 fn check_json_is_a_single_object_even_when_the_module_is_broken() {
     let dir = project(BROKEN);

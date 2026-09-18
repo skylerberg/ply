@@ -73,12 +73,13 @@ fn check(
     args: &CheckArgs,
     warnings: &mut Vec<Diagnostic>,
 ) -> Result<(Loaded, Option<Store>), crate::load::LoadError> {
-    if args.no_incremental {
-        return Ok((load(&args.path)?, None));
-    }
-    let root = project_root(&args.path);
-    match Store::open(&root) {
-        Ok(mut store) => {
+    let cache = if args.no_incremental {
+        None
+    } else {
+        Store::open(&project_root(&args.path)).ok()
+    };
+    let (loaded, store) = match cache {
+        Some(mut store) => {
             let opened = store.take_warnings();
             let migration = crate::migrate::notice(&store, &opened);
             warnings.extend(opened);
@@ -86,13 +87,12 @@ fn check(
 
             let loaded = driver::load_incremental(&args.path, &mut store);
             warnings.extend(store.take_warnings());
-            if let Ok(loaded) = &loaded {
-                warnings.extend(loaded.frontend.warnings.iter().cloned());
-            }
-            Ok((loaded?, Some(store)))
+            (loaded?, Some(store))
         }
-        Err(_) => Ok((load(&args.path)?, None)),
-    }
+        None => (load(&args.path)?, None),
+    };
+    warnings.extend(loaded.frontend.warnings.iter().cloned());
+    Ok((loaded, store))
 }
 
 /// For every `push`, whether it grows its list in place or copies it.
