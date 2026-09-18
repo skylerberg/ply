@@ -1,10 +1,7 @@
-//! Derivation end to end: expansion, then resolution, then inference.
-
 use crate::fixture::{JSON, expanded_modules};
 use ply_core::CheckOutput;
 use ply_span::{Diagnostic, codes};
 
-/// One project module, with the protocol stub beside it.
 fn with_json(source: &str) -> Result<CheckOutput, Vec<Diagnostic>> {
     expanded_modules(&[("std.json", JSON), ("m", source)])
 }
@@ -296,12 +293,8 @@ derive json for Order
 fn go(o: Order) -> json::Json = ship(o, order_json())");
 }
 
-/// The stub above is a claim about `std.json`.
 #[test]
 fn the_shipped_std_json_satisfies_the_protocol() {
-    // Read from the source tree rather than from `ply_std::MODULES`, so that this holds whether or
-    // not `std.json` has been added to the embedded table yet: what is being checked is the module
-    // the deriver targets.
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ply-std/ply/json.ply");
     let json = std::fs::read_to_string(&path).expect("`std.json` ships with the compiler");
     let mut modules: Vec<(&str, &str)> = ply_std::sources()

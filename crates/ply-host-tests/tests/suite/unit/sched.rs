@@ -1,6 +1,3 @@
-//! The production scheduler, driven exactly as the machine drives it, against a host runtime backed
-//! by real threads.
-
 use ply_eval::sched::{HostPolicy, Scheduler};
 use ply_eval::sched::{Policy, ROOT, Resumption, Turn};
 use ply_eval::sim::TASK_OPS;
@@ -15,8 +12,7 @@ use std::time::Duration;
 
 type Sched = Scheduler<Continuation, Value>;
 
-/// A continuation is control, and none of the scheduler's decisions look inside one, so a captured
-/// empty segment is a faithful stand-in for a suspended task.
+/// No scheduler decision looks inside a continuation, so an empty segment stands in for a task.
 fn suspended() -> Continuation {
     let prompt = std::rc::Rc::new(Prompt {
         clauses: std::rc::Rc::new(Vec::new()),
@@ -36,9 +32,7 @@ struct Slots {
     done: BTreeMap<u64, i64>,
 }
 
-/// One thread per outstanding operation, a `Condvar` to wake the machine's thread, and no `Value`
-/// anywhere near either: a job produces an `i64` and the polling thread — the machine's — builds
-/// the `Value`.
+/// Jobs produce an `i64`; only the machine's polling thread builds a `Value`.
 struct Threads {
     slots: Mutex<Slots>,
     finished: Condvar,
@@ -50,14 +44,11 @@ impl Threads {
         Arc::new(Threads {
             slots: Mutex::new(Slots::default()),
             finished: Condvar::new(),
-            // Token 0 is never minted, so a zeroed `Pending` is a token nothing owns rather than
-            // the first job.
+            // Token 0 is never minted, so a zeroed `Pending` is a token nothing owns.
             next: Mutex::new(1),
         })
     }
 
-    /// Starts a job that answers `value` after `delay` and hands back the token the performing task
-    /// parks on.
     fn submit(self: &Arc<Threads>, delay: Duration, value: i64) -> Pending {
         let token = {
             let mut next = lock(&self.next);
@@ -126,8 +117,7 @@ impl HostRuntime for Threads {
     }
 }
 
-/// A runtime whose `park` returns without ever resolving anything, which is the one failure a
-/// scheduler must not answer with a hot spin.
+/// A `park` that resolves nothing: the failure a scheduler must not answer with a hot spin.
 struct NeverResolves;
 
 impl HostRuntime for NeverResolves {
@@ -148,7 +138,6 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// What a task does, in the order it does it.
 #[derive(Clone)]
 enum Act {
     Mark(&'static str),
@@ -248,8 +237,7 @@ fn run(program: &Program, rt: &dyn HostRuntime) -> Result<Run, Diagnostic> {
     }
 }
 
-// `Act::Wait` needs the same runtime the run is driven by, and threading one through every arm of
-// the harness would say less than this does: there is one runtime per test, built by `with_jobs`.
+// One runtime per test, built by `with_jobs`; threading it through every arm would say less.
 thread_local! {
     static JOBS: std::cell::RefCell<Option<Arc<Threads>>> = const { std::cell::RefCell::new(None) };
 }
@@ -274,8 +262,7 @@ fn broken(message: &str) -> Diagnostic {
     Diagnostic::error(codes::INTERNAL_ERROR, message.to_string())
 }
 
-/// A `Turn` and a `Scheduler` hold control, which has no `Debug` and wants none, so an expected
-/// refusal is unwrapped here rather than through `expect_err`.
+/// `Turn` and `Scheduler` have no `Debug`, so `expect_err` is unavailable.
 fn refused<T>(outcome: Result<T, Diagnostic>, why: &str) -> Diagnostic {
     match outcome {
         Ok(_) => panic!("the scheduler answered instead of refusing: {why}"),
@@ -292,8 +279,7 @@ fn check(source: &str) -> ply_ty::CheckOutput {
     .check
 }
 
-/// A program whose footprint contains `task.write`, so the `Any` registrations have an atom to
-/// resolve against.
+/// Its footprint contains `task.write`, so the `Any` registrations have an atom to resolve against.
 const SPAWNS: &str = r#"
 fn spin() -> Unit / {task.write} = task.yield()
 "#;
@@ -316,9 +302,6 @@ fn permit() -> HostPolicy {
     HostPolicy::of(&bound()).expect("a bound binding mints a permit")
 }
 
-/// The exclusion that matters most, and the one a convention would get wrong: a hermetic run cannot
-/// *build* a production scheduler, so a test cannot acquire real threads by accident however it is
-/// written.
 #[test]
 fn a_hermetic_binding_mints_no_permit_and_opens_no_region() {
     let hermetic = HostBinding::hermetic_with(registry());
@@ -344,8 +327,6 @@ fn a_hermetic_binding_mints_no_permit_and_opens_no_region() {
     );
 }
 
-/// `HostBinding::default()` is the hermetic one, so the path a caller reaches by not thinking about
-/// it is the one that refuses.
 #[test]
 fn the_default_binding_is_the_one_that_refuses() {
     assert!(HostPolicy::of(&HostBinding::default()).is_none());
@@ -359,7 +340,6 @@ fn a_bound_binding_opens_a_production_region() {
     assert!(sched.holds(ROOT));
 }
 
-/// A production region answers `task` and nothing else.
 #[test]
 fn a_production_region_answers_task_and_not_the_clock() {
     let sched = open(&bound(), SimId(0), Span::DUMMY).expect("bound");
@@ -374,7 +354,6 @@ fn a_production_region_answers_task_and_not_the_clock() {
     }
 }
 
-/// The registry is the trusted computing base, and these three lines are what a reviewer reads.
 #[test]
 fn the_task_registrations_are_what_ply_hosts_prints() {
     let listing = bound().listing().clone();
@@ -389,7 +368,6 @@ fn the_task_registrations_are_what_ply_hosts_prints() {
     }
 }
 
-/// An `Any` registration that resolves to nothing is a driver that is idle rather than wrong.
 #[test]
 fn a_program_that_never_spawns_binds_cleanly_and_lists_nothing() {
     let binding = registry()
@@ -399,7 +377,6 @@ fn a_program_that_never_spawns_binds_cleanly_and_lists_nothing() {
     assert!(binding.footprint().is_empty());
 }
 
-/// A `task.*` perform is answered by opening a region, never by a handler.
 #[test]
 fn dispatching_a_task_perform_to_the_handler_is_refused() {
     let binding = bound();
@@ -424,8 +401,6 @@ fn dispatching_a_task_perform_to_the_handler_is_refused() {
     assert!(err.message.contains("task.spawn"), "{}", err.message);
 }
 
-/// Many tasks, all making progress, all finishing, with the region delivering its body's value only
-/// once the last of them has ended.
 #[test]
 fn many_concurrent_tasks_all_make_progress() {
     const WORKERS: usize = 64;
@@ -464,8 +439,6 @@ fn many_concurrent_tasks_all_make_progress() {
     );
 }
 
-/// The blocking rule, as a test rather than as a claim: a task waiting on a real operation on a real
-/// thread must not stop the others from being stepped.
 #[test]
 fn a_blocking_operation_does_not_starve_the_tasks_beside_it() {
     let program: Program = vec![
@@ -494,7 +467,6 @@ fn a_blocking_operation_does_not_starve_the_tasks_beside_it() {
     }
 }
 
-/// Every outstanding job is accounted for at the end.
 #[test]
 fn every_host_token_a_run_parks_on_is_collected() {
     let program: Program = vec![
@@ -508,9 +480,7 @@ fn every_host_token_a_run_parks_on_is_collected() {
     });
 }
 
-/// A failure in one task ends the region, names the task, and keeps answering with the same
-/// diagnostic — so a caller that keeps driving cannot turn a failure into a hang, and cannot get a
-/// second, different answer out of it.
+/// Keeps answering the same diagnostic, so a caller that keeps driving cannot turn it into a hang.
 #[test]
 fn a_task_failing_stops_the_region_and_names_it() {
     let program: Program = vec![
@@ -549,8 +519,6 @@ fn a_failed_production_region_answers_with_its_failure_forever() {
     }
 }
 
-/// A join cycle has no host operation that could ever break it, so it is a deadlock rather than a
-/// park that never returns.
 #[test]
 fn a_join_cycle_deadlocks_rather_than_parking_forever() {
     let program: Program = vec![vec![Act::Spawn(1), Act::Join(1)], vec![Act::Join(0)]];
@@ -562,8 +530,6 @@ fn a_join_cycle_deadlocks_rather_than_parking_forever() {
     assert!(waits.iter().any(|m| m.contains("@1 waits here for @0")));
 }
 
-/// A hot spin is the one failure mode a scheduler must not have: it burns a core and reports
-/// nothing, which is indistinguishable from working.
 #[test]
 fn a_runtime_whose_park_never_resolves_is_named_rather_than_spun_on() {
     let mut sched: Sched = Scheduler::production(SimId(0), Span::DUMMY, permit());
@@ -588,8 +554,7 @@ fn a_runtime_whose_park_never_resolves_is_named_rather_than_spun_on() {
     assert!(err.message.contains("park"), "{}", err.message);
 }
 
-/// A production region is unbounded by default — a server is supposed to keep scheduling — and
-/// bounded when a caller asks, which is what turns a livelock in a `--host` test into a diagnostic.
+/// Unbounded by default, as a server keeps scheduling; a budget makes a livelock a diagnostic.
 #[test]
 fn a_production_region_spends_a_budget_only_when_one_was_set() {
     let mut forever = vec![Act::Yield; 64];

@@ -46,9 +46,7 @@ fn a_symlink_out_of_the_root_is_refused() {
     assert_eq!(refusal.code, codes::FS_PATH_ESCAPES_ROOT);
 }
 
-/// A write to a path that does not exist yet still traverses the link its parent is, so the
-/// check has to look at the nearest existing ancestor rather than give up when the target is
-/// absent.
+/// A not-yet-existing target still traverses its parent's link, so the nearest ancestor is checked.
 #[test]
 fn a_write_through_a_symlinked_directory_is_refused() {
     let dir = root();

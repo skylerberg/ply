@@ -1,5 +1,3 @@
-//! An adversarial audit of M5 bisection: inputs chosen to make it name the wrong definition.
-
 use crate::fixture::Compiled;
 use ply_hash::{DefHash, HashOutput};
 use ply_span::SourceId;
@@ -25,8 +23,7 @@ impl Compiled {
             .expect("index the program")
     }
 
-    /// The closure as a `PassRecord` records it: one hash per program-wide name *per namespace*, so
-    /// an edit to a `type` whose name a `fn` also carries is not lost.
+    /// One hash per name *per namespace*, so a `type` and a `fn` sharing a name are both kept.
     fn baseline(&self, key: &str) -> Baseline {
         let key = sym(key);
         let index = self
@@ -54,8 +51,7 @@ impl Compiled {
     }
 }
 
-/// The real re-normalizer with a caller-supplied answer to the interface question, so a case can
-/// isolate the `Edited`/`Derived` split from fusion.
+/// A caller-supplied interface answer, so a case isolates the `Edited`/`Derived` split from fusion.
 struct Renormalizing<'a> {
     renormalizer: Renormalizer<'a>,
     table: EraTable,
@@ -116,8 +112,7 @@ fn members(diff: &Diff) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// The whole pipeline a failing `ply test` runs, minus the evaluator: no hybrid builder, so only
-/// the verdicts that need no mixture are reachable.
+/// No hybrid builder, so only the verdicts that need no mixture are reachable.
 fn attribute(before: &Compiled, after: &Compiled, key: &str, independent: bool) -> Attribution {
     let baseline = before.baseline(key);
     let mut classify = Renormalizing::new(after.renormalizer(), &baseline, independent);
@@ -151,8 +146,7 @@ fn attribute(before: &Compiled, after: &Compiled, key: &str, independent: bool) 
     )
 }
 
-/// Answers `Fails` from an arbitrary predicate over the flipped names, so a case can model an
-/// oracle that is non-monotone, that refuses, or that lies.
+/// An arbitrary predicate, so a case can model an oracle that is non-monotone, refuses, or lies.
 struct Oracle<F> {
     decide: F,
     asked: Vec<Vec<Symbol>>,
@@ -194,7 +188,6 @@ fn names(prefix: &str, n: usize) -> Vec<String> {
     (0..n).map(|i| format!("{prefix}{i:04}")).collect()
 }
 
-/// Two edits, either of which alone breaks the test.
 #[test]
 fn either_edit_alone_being_sufficient_yields_one_minimal_culprit() {
     let all = names("d", 6);
@@ -218,8 +211,6 @@ fn either_edit_alone_being_sufficient_yields_one_minimal_culprit() {
     );
 }
 
-/// Two edits that break the test only together, placed on opposite sides of the first partition so
-/// a plain binary search would return whichever half it tried first.
 #[test]
 fn a_pair_that_straddles_the_first_split_is_returned_whole() {
     let all = names("d", 8);
@@ -238,9 +229,7 @@ fn a_pair_that_straddles_the_first_split_is_returned_whole() {
     assert_eq!(out.confidence, Confidence::Minimal);
 }
 
-/// Neither edit alone is sufficient *and* neither is necessary on its own — a three-way
-/// interaction. ddmin is only obliged to return a 1-minimal set; the audit is that whatever it
-/// returns really does reproduce and really is 1-minimal against the same oracle.
+/// ddmin owes only *a* 1-minimal set, so this checks reproduction and 1-minimality, not which set.
 #[test]
 fn a_three_way_interaction_is_returned_as_a_genuinely_one_minimal_set() {
     let all = names("d", 7);
@@ -270,7 +259,6 @@ fn a_three_way_interaction_is_returned_as_a_genuinely_one_minimal_set() {
     }
 }
 
-/// A thousand changed definitions with one cause.
 #[test]
 fn a_thousand_candidates_are_narrowed_logarithmically_without_spending_the_budget() {
     let all = names("d", 1024);
@@ -293,7 +281,6 @@ fn a_thousand_candidates_are_narrowed_logarithmically_without_spending_the_budge
     assert!(out.search.evaluated <= 22, "{:?}", out.search);
 }
 
-/// The cause reaches the assertion only through a definition nobody touched.
 #[test]
 fn a_cause_that_acts_only_through_an_unchanged_definition_is_still_named() {
     let all = names("d", 5);
@@ -313,7 +300,6 @@ fn a_cause_that_acts_only_through_an_unchanged_definition_is_still_named() {
     );
 }
 
-/// A signature change that makes *every* split ill-typed.
 #[test]
 fn a_signature_change_that_poisons_every_split_is_fused_before_the_search() {
     let mut changes = independent_edits(&names("d", 3));
@@ -351,8 +337,6 @@ fn a_signature_change_that_poisons_every_split_is_fused_before_the_search() {
     }
 }
 
-/// A hybrid that cannot be built refuses rather than answers, and the search then keeps everything
-/// it could not separate and refuses to call the result minimal.
 #[test]
 fn an_inseparable_pair_that_refuses_keeps_both_and_drops_to_partial() {
     let all = names("d", 4);
@@ -374,9 +358,7 @@ fn an_inseparable_pair_that_refuses_keeps_both_and_drops_to_partial() {
     assert!(out.search.unresolved > 0);
 }
 
-/// Two members of one strongly connected component are hashed as `blake3(component_hash ‖ index)`,
-/// so a body kept at its baseline still names its partner's baseline hash: a mixture that flips one
-/// of them alone measures the baseline and passes.
+/// A kept member still names its partner's baseline hash, so flipping one alone replays the baseline.
 #[test]
 fn a_component_no_hybrid_can_split_is_never_offered_to_the_search_split() {
     let changes = independent_edits(&["even".to_string(), "odd".to_string()]);
@@ -410,8 +392,6 @@ fn a_component_no_hybrid_can_split_is_never_offered_to_the_search_split() {
     }
 }
 
-/// The current program replayed green is not evidence about anything, and must never be turned into
-/// a culprit.
 #[test]
 fn a_failure_that_does_not_reproduce_names_nobody() {
     let all = names("d", 4);
@@ -424,8 +404,6 @@ fn a_failure_that_does_not_reproduce_names_nobody() {
     assert_eq!(out.confidence, Confidence::None);
 }
 
-/// A failure nothing in the definition graph explains — a leaked `nondet` effect, the environment,
-/// a defect in Ply.
 #[test]
 fn a_failure_the_baseline_also_shows_is_never_attributed_to_a_change() {
     let all = names("d", 5);
@@ -453,8 +431,6 @@ fn chain(depth: usize, leaf: &str) -> String {
     src
 }
 
-/// A 64-deep chain: one edit at the bottom moves 64 hashes and exactly one of them is a change
-/// anybody made.
 #[test]
 fn a_deep_chain_yields_one_candidate_and_sixty_three_derived_ones() {
     let before = Compiled::new(&chain(64, "n + 1"));
@@ -488,8 +464,6 @@ test "handled" {
 }
 "#;
 
-/// A handler clause is part of the definition that carries it, so an edit to the double rather than
-/// to any value is attributed to that definition and to nothing else.
 #[test]
 fn editing_an_effect_handler_names_the_definition_that_carries_it() {
     let before = Compiled::new(HANDLED);
@@ -510,7 +484,6 @@ fn editing_an_effect_handler_names_the_definition_that_carries_it() {
     assert_eq!(out.culprits(), vec![sym("m.seeded")]);
 }
 
-/// An effect declaration is nominal, so everything that mentions it can see the move.
 #[test]
 fn editing_an_effect_declaration_makes_the_declaration_the_candidate() {
     let before = Compiled::new(HANDLED);
@@ -527,8 +500,6 @@ fn editing_an_effect_declaration_makes_the_declaration_the_candidate() {
     assert_eq!(diff.delta.candidates(), 1);
 }
 
-/// Renaming a definition moves no hash — that is the headline invariant — and a rename beside an
-/// edit elsewhere in the closure must not change that reading.
 #[test]
 fn a_rename_beside_an_edit_leaves_untouched_callers_derived() {
     let before = Compiled::new(
@@ -578,8 +549,6 @@ test "chain" { assert_eq(top(1), 4) }
     );
 }
 
-/// Two mutually recursive definitions share a component hash, so editing either moves both —
-/// correctly, the component is the unit of identity.
 #[test]
 fn a_recursive_component_is_fused_because_no_hybrid_can_separate_it() {
     let src = r#"
@@ -622,9 +591,7 @@ test "parity" { assert(even(4)) }
     );
 }
 
-/// Making the same pair non-independent — which is what `StoreClassify` does whenever the baseline
-/// interface is missing — produces the answer the component case wanted all along, for the wrong
-/// reason.
+/// The right answer for the wrong reason: `StoreClassify` fuses whenever the baseline interface is missing.
 #[test]
 fn a_recursive_pair_with_no_baseline_interface_fuses_into_the_right_group() {
     let src = r#"
@@ -655,8 +622,6 @@ fn use_it(a: Amount) -> Int = match a { Cents(c) -> c, Dollars(d) -> d * 100 }
 test "t" { assert_eq(use_it(Cents(5)), 5) }
 "#;
 
-/// A `fn`, a `type` and an `effect` may share a name — they are separate namespaces — so a baseline
-/// has to record one hash per *namespace*.
 #[test]
 fn a_name_shared_by_a_fn_and_a_type_still_names_the_edited_one() {
     let before = Compiled::new(COLLIDE);
@@ -714,8 +679,6 @@ fn a_name_shared_by_a_fn_and_a_type_still_names_the_edited_one() {
     assert_eq!(innocent.change, Some(ChangeKind::Derived));
 }
 
-/// The minimality claim is a claim about the *partition*, so a change the run could not classify
-/// costs it: that change entered the search as a candidate on a guess.
 #[test]
 fn an_unclassified_change_costs_the_minimality_claim() {
     let before = Compiled::new(COLLIDE);
@@ -730,8 +693,7 @@ fn an_unclassified_change_costs_the_minimality_claim() {
         baseline: &baseline,
         hashes: &after.hashes,
     };
-    // `Unknown` is what a pruned front-end cache leaves behind: it can tell nobody apart from a
-    // hash that merely moved.
+    // `Unknown` is what a pruned front-end cache leaves: it cannot tell an edit from a moved hash.
     let diff = diff(
         &regression,
         &mut ply_test::bisect::Unknown,
@@ -753,7 +715,6 @@ fn an_unclassified_change_costs_the_minimality_claim() {
     );
 }
 
-/// **Documents a defect.**
 #[test]
 fn documents_an_added_definition_is_suppressed_when_its_body_matches_a_baseline_one() {
     let before = Compiled::new(
@@ -786,7 +747,6 @@ test "t" { assert_eq(use_it(1), 2) }
     assert_eq!(kind_of(&diff, "m.use_it"), Some(ChangeKind::Edited));
 }
 
-/// **Documents a defect.**
 #[test]
 fn documents_a_single_unrelated_change_is_named_without_asking_whether_it_matters() {
     let before = Compiled::new(&chain(4, "n + 1"));
@@ -802,8 +762,6 @@ fn documents_a_single_unrelated_change_is_named_without_asking_whether_it_matter
     );
 }
 
-/// The artifact is diffed against yesterday's, so one failure must render the same bytes twice —
-/// over a real program, not just over a synthetic delta.
 #[test]
 fn two_diagnoses_of_one_real_failure_agree_byte_for_byte() {
     let before = Compiled::new(&chain(16, "n + 1"));
@@ -827,8 +785,6 @@ fn two_diagnoses_of_one_real_failure_agree_byte_for_byte() {
     assert_eq!(render(), render());
 }
 
-/// A test whose baseline was never recorded must not be bisected at all, whatever the definition
-/// graph looks like.
 #[test]
 fn a_test_that_never_passed_is_not_bisected_over_a_real_program() {
     let after = Compiled::new(&chain(8, "n + 2"));
@@ -869,7 +825,6 @@ fn enter(name: &str) -> Event {
     }
 }
 
-/// Everything the slice names must have run, and the stack must end where the assertion blew up.
 #[test]
 fn the_slice_names_only_definitions_that_ran_and_ends_at_the_failing_frame() {
     let mut b = SliceBuilder::new();
@@ -896,8 +851,6 @@ fn the_slice_names_only_definitions_that_ran_and_ends_at_the_failing_frame() {
     }
 }
 
-/// A `Return` with nothing live is a tracer bug, not a user program's; the stack must degrade
-/// rather than panic or go negative.
 #[test]
 fn unbalanced_returns_do_not_corrupt_the_stack() {
     let mut b = SliceBuilder::new();
@@ -911,8 +864,6 @@ fn unbalanced_returns_do_not_corrupt_the_stack() {
     assert_eq!(slice.path(), vec![&sym("g")]);
 }
 
-/// The roster of entered definitions is capped; past the cap a definition that *did* run is simply
-/// not recorded.
 #[test]
 fn a_truncated_trace_never_claims_a_definition_did_not_run() {
     let mut b = SliceBuilder::with_cap(2);
@@ -952,8 +903,6 @@ fn a_truncated_trace_never_claims_a_definition_did_not_run() {
     assert_eq!(attribution.suspects[0].depth, Some(0));
 }
 
-/// An untruncated roster still answers `false`, which is the whole value of the field: it is what
-/// lets a consumer stop reading a suspect.
 #[test]
 fn an_untruncated_trace_still_rules_a_definition_out() {
     let mut b = SliceBuilder::new();
@@ -965,8 +914,6 @@ fn an_untruncated_trace_still_rules_a_definition_out() {
     assert_eq!(slice.did_run(&sym("b")), Some(false));
 }
 
-/// A slice from a run that went green is evidence about a different execution and must not annotate
-/// anything.
 #[test]
 fn a_slice_that_did_not_reproduce_annotates_nothing() {
     let slice = CausalSlice {
@@ -994,7 +941,6 @@ fn a_slice_that_did_not_reproduce_annotates_nothing() {
     assert_eq!(attribution.suspects[0].depth, None);
 }
 
-/// **Documents a defect.**
 #[test]
 fn documents_a_budget_spent_before_the_first_question_still_reports_bisected() {
     let all = names("d", 5);
@@ -1022,8 +968,7 @@ fn documents_a_budget_spent_before_the_first_question_still_reports_bisected() {
     );
 }
 
-/// One cluster beside an edited test is the one case the fast path must not take: the definition
-/// that moved may be innocent and `H(∅)` is the question that separates it from the test edit.
+/// The moved definition may be innocent; only the `H(∅)` trial separates it from the test edit.
 #[test]
 fn a_single_cluster_beside_an_edited_test_cannot_claim_minimality() {
     let delta = Delta::new(

@@ -62,7 +62,6 @@ fn atom(table: &str, mode: ply_syntax::ast::Mode) -> EffectAtom {
     EffectAtom::new(Symbol::new(db::EFFECT), label(table), mode)
 }
 
-/// One statement through the real driver: acquire, prepare, bind, execute, release.
 fn run(reactor: &Reactor, sql: &str, params: Vec<Param>) -> Result<Answer, Diagnostic> {
     let text = sql.to_string();
     let pending = reactor
@@ -157,7 +156,6 @@ fn the_driver_speaks_to_a_real_postgres() {
     );
 }
 
-/// Connect, prepare, execute — the three things the driver has to be able to do at all.
 fn connect_and_prepare(reactor: &Reactor) {
     assert_eq!(
         answer(reactor, "select 1 as one", Vec::new()),
@@ -171,8 +169,7 @@ fn connect_and_prepare(reactor: &Reactor) {
         ),
         Answer::Count(1)
     );
-    // `insert … returning` describes columns, so the result description decides which shape the
-    // answer takes rather than the operation the call site named.
+    // `returning` describes columns, so the answer is rows though the statement is an insert.
     let returned = only(answer(
         reactor,
         "insert into bin (code, capacity) values ($1, $2) returning code, capacity",
@@ -212,11 +209,9 @@ fn every_mapped_type_round_trips(reactor: &Reactor) {
                 Param::Text("varchar".into()),
                 Param::Bytes(vec![0, 1, 127, 128, 255]),
                 Param::Float(1.5),
-                // `float4` is a *result* type in the type mapping and not a parameter type, so the
-                // narrowing is written where a reader sees it rather than performed silently by the
-                // driver.
+                // `float4` is a result type, not a parameter type, so the SQL spells the narrowing.
                 Param::Float(0.5),
-                // Scale 28, which is `Decimal`'s ceiling: the value W2's whole argument is about.
+                // Scale 28: `Decimal`'s ceiling.
                 Param::Numeric(dec("0.1234567890123456789012345678")),
                 Param::Json(json.clone()),
                 Param::Array(vec![Param::Int(1), Param::Int(2)]),
@@ -255,15 +250,12 @@ fn every_mapped_type_round_trips(reactor: &Reactor) {
         cell(&row, "a_list"),
         Datum::Array(vec![Datum::Int(1), Datum::Int(2)])
     );
-    // An empty `PArray` is legal and takes its element type from the parameter description; it
-    // comes back as an empty list rather than as `NULL`.
+    // An empty array takes the parameter's element type and reads back as a list, not `NULL`.
     assert_eq!(cell(&row, "a_texts"), Datum::Array(Vec::new()));
     assert_eq!(
         cell(&row, "a_uuid"),
         Datum::Text("6ba7b810-9dad-11d1-80b4-00c04fd430c8".into())
     );
-    // `Option<a>` is a nullable column of `a`, so a `PNull` reads back as `CNull` and not as a
-    // zero.
     assert_eq!(cell(&row, "an_optional"), Datum::Null);
 
     // A `numeric` column with a declared scale returns the column's scale, not the literal's.
@@ -284,11 +276,7 @@ fn every_mapped_type_round_trips(reactor: &Reactor) {
     assert_eq!(cell(&part, "price"), Datum::Numeric(dec("1.0000")));
 }
 
-/// Each of these is a place a driver quietly loses data, and each is a named refusal rather than a
-/// coerced value.
 fn the_edges_of_the_mapping_are_named_refusals(reactor: &Reactor) {
-    // A `numeric` past `Decimal`'s scale, and a `numeric` `NaN`: decode failures naming the column,
-    // never a rounding and never a zero.
     for literal in ["0.12345678901234567890123456789", "'NaN'::numeric", "1e40"] {
         let d = refusal(
             reactor,
@@ -303,7 +291,6 @@ fn the_edges_of_the_mapping_are_named_refusals(reactor: &Reactor) {
         );
     }
 
-    // A two-dimensional array, and an array with a NULL element.
     for literal in ["array[array[1,2]]", "array[1, null]"] {
         let d = refusal(
             reactor,
@@ -317,8 +304,7 @@ fn the_edges_of_the_mapping_are_named_refusals(reactor: &Reactor) {
         );
     }
 
-    // A timestamp column: no time type in Ply, so it is refused with the workaround named rather
-    // than rendered to text.
+    // No time type in Ply, so a timestamp is refused rather than rendered to text.
     let d = refusal(
         reactor,
         "select '2020-01-01'::timestamptz as t from wire where id = $1",
@@ -331,8 +317,7 @@ fn the_edges_of_the_mapping_are_named_refusals(reactor: &Reactor) {
         d.notes
     );
 
-    // A duplicate column name: a `Row` is a `Map`, so one of them would be kept and the other
-    // silently dropped.
+    // A `Row` is a `Map`, so a duplicate column would be silently dropped.
     let d = refusal(
         reactor,
         "select bin.code, part.sku as code from part join bin on bin.code = part.bin_code",
@@ -341,8 +326,6 @@ fn the_edges_of_the_mapping_are_named_refusals(reactor: &Reactor) {
     assert_eq!(d.code, codes::DB_PREPARE_FAILED);
     assert!(d.message.contains("two columns named"), "{}", d.message);
 
-    // An `Int` that does not fit its column: `22003` from the server's own vocabulary, never a
-    // truncation.
     assert_eq!(
         failure(
             reactor,
@@ -354,7 +337,6 @@ fn the_edges_of_the_mapping_are_named_refusals(reactor: &Reactor) {
     );
 }
 
-/// A SQLSTATE is a value.
 fn a_constraint_violation_is_a_value(reactor: &Reactor) {
     let duplicate = failure(
         reactor,
@@ -395,13 +377,10 @@ fn a_constraint_violation_is_a_value(reactor: &Reactor) {
     assert_eq!(check.code, "23514");
     assert_eq!(check.constraint, "bin_capacity_positive");
 
-    // The message is carried for a person and compared by nothing — which is what keeps the
-    // agreement law from failing on a server upgrade.
+    // Only non-empty: nothing compares the message, so a server upgrade cannot fail this.
     assert!(!check.detail.is_empty());
 }
 
-/// A prepare the server refuses is the program's fault, is the same every time, and will never
-/// succeed on a retry — so it is a diagnostic rather than a value a program is invited to loop on.
 fn a_prepare_the_server_refuses_is_a_diagnostic(reactor: &Reactor) {
     for sql in [
         "select * from no_such_table",
@@ -418,8 +397,6 @@ fn a_prepare_the_server_refuses_is_a_diagnostic(reactor: &Reactor) {
     }
 }
 
-/// The payload that would end a literal and start a statement is inserted as a string, because it
-/// never becomes syntax.
 fn a_parameter_is_never_syntax(reactor: &Reactor, cluster: &Cluster) {
     let payload = "'; drop table part; --";
     assert_eq!(
@@ -436,7 +413,6 @@ fn a_parameter_is_never_syntax(reactor: &Reactor, cluster: &Cluster) {
         vec![Param::Int(1), Param::Text(payload.into())],
     ));
     assert_eq!(cell(&stored, "code"), Datum::Text(payload.into()));
-    // The schema is untouched: the payload was a value the whole way.
     assert_eq!(
         cluster.psql(
             "desk",
@@ -445,8 +421,7 @@ fn a_parameter_is_never_syntax(reactor: &Reactor, cluster: &Cluster) {
         "1"
     );
 
-    // The same bytes as statement text are a refusal before anything is sent — one `Stmt` is one
-    // statement.
+    // As statement text the same bytes are refused before sending: one `Stmt` is one statement.
     let d = db::stmt::Cache::default()
         .scan(
             &format!("select * from bin where code = ''{payload}"),
@@ -483,8 +458,7 @@ fn the_footprint_of_a_join_names_both_tables(reactor: &Reactor) {
     assert!(matches!(answer(reactor, sql, Vec::new()), Answer::Rows(_)));
 }
 
-/// Asserted against the server's own catalogue rather than by timing: `N` executions of one
-/// statement leave exactly one prepared statement behind.
+/// Asserted against the server's catalogue rather than by timing.
 fn the_statement_cache_prepares_once(reactor: &Reactor, cluster: &Cluster) {
     let before: i64 = cluster
         .psql("desk", "select count(*) from pg_prepared_statements")
@@ -494,9 +468,7 @@ fn the_statement_cache_prepares_once(reactor: &Reactor, cluster: &Cluster) {
     for _ in 0..8 {
         answer(reactor, sql, vec![Param::Int(11)]);
     }
-    // The pool may have more than one connection, and a prepared statement is per session — but
-    // eight executions must not have left eight of them, and with a pool that hands the same
-    // connection back they leave one.
+    // Prepared statements are per session and the pool may hold several connections, hence `<= 1`.
     let after: i64 = cluster
         .psql("desk", "select count(*) from pg_prepared_statements")
         .parse()
@@ -508,21 +480,17 @@ fn the_statement_cache_prepares_once(reactor: &Reactor, cluster: &Cluster) {
     );
 }
 
-/// A database that went away is a peer that went away, which is a `Failed` value and not a
-/// diagnostic — and the request after it succeeds on a fresh connection.
 fn a_connection_dropped_mid_run_is_a_value_and_the_next_one_succeeds(
     reactor: &Reactor,
     cluster: &Cluster,
 ) {
-    // Terminate every backend this run holds, out of band.
     cluster.psql(
         "desk",
         "select pg_terminate_backend(pid) from pg_stat_activity \
          where application_name = 'ply' and pid <> pg_backend_pid()",
     );
 
-    // The next statement either fails with the connection's own SQLSTATE or succeeds on a
-    // connection the pool re-established.
+    // Either the dropped connection's SQLSTATE or a success on a re-established connection.
     match run(reactor, "select 1 as one", Vec::new()) {
         Ok(Answer::Failed(e)) => assert_eq!(e.code, "08006", "{}", e.detail),
         Ok(Answer::Rows(_)) => {}
@@ -530,7 +498,6 @@ fn a_connection_dropped_mid_run_is_a_value_and_the_next_one_succeeds(
         Err(d) => panic!("a dead peer became a diagnostic: {} {}", d.code, d.message),
     }
 
-    // And the one after it works, against a connection the pool established fresh.
     assert_eq!(
         answer(reactor, "select 1 as one", Vec::new()),
         Answer::Rows(vec![vec![("one".into(), Datum::Int(1))]])
@@ -544,7 +511,6 @@ create table item (
 );
 ";
 
-/// Drive one operation to a value, the way the machine does: answer, park, poll until it resolves.
 fn settle(db: &Postgres, answered: Result<HostAnswer, Diagnostic>) -> Result<Value, Diagnostic> {
     match answered? {
         HostAnswer::Value(value) => Ok(value),
@@ -587,7 +553,6 @@ fn driver_run(db: &Postgres, op: Op, sql: &str, params: Vec<Param>) -> Value {
     .unwrap_or_else(|d| panic!("`{sql}` was refused: {}", d.message))
 }
 
-/// The constructor name a `Value` must carry: the program-wide one.
 fn ctor_of(value: &Value) -> String {
     match value {
         Value::Ctor { name, .. } => name.to_string(),
@@ -625,13 +590,11 @@ fn driver_insert(db: &Postgres, sku: &str, on_hand: i64) -> Value {
     )
 }
 
-/// The `Driver` a `db` operation actually resolves to, reached the way the machine reaches it:
-/// through the trait, and through a `Pending` that has to be polled.
+/// Reached through the trait and a polled `Pending`, the way the machine reaches it.
 fn the_driver_serves_a_transaction(cluster: &Cluster) {
     cluster.psql("desk", DRIVER_SCHEMA);
     let db = Postgres::start(PoolConfig::new(cluster.url())).expect("the driver starts");
 
-    // A statement outside every scope: borrow, run, hand the connection back.
     assert_eq!(driver_count(&db), 0);
     assert_eq!(ctor_of(&driver_insert(&db, "bolt", 5)), "std.db.Count");
     assert_eq!(driver_count(&db), 1);
@@ -689,7 +652,6 @@ fn an_aborted_transaction_leaves_nothing(db: &Postgres) {
     )
     .expect("it begins");
     driver_insert(db, "widget", 9);
-    // Visible inside its own scope and nowhere else, which is what a transaction is.
     assert_eq!(driver_count(db), before + 1);
     settle(db, db.abort(ALONE, Span::DUMMY)).expect("it aborts");
     assert_eq!(db.depth(ALONE), 0);
@@ -723,16 +685,12 @@ fn a_nested_transaction_is_a_savepoint(db: &Postgres) {
     driver_insert(db, "inner", 1);
     settle(db, db.abort(ALONE, Span::DUMMY)).expect("the inner rolls back");
     assert_eq!(db.depth(ALONE), 1);
-    // The inner's write is gone and the outer's is not, which is the whole of what a savepoint
-    // buys.
     assert_eq!(driver_count(db), before + 1);
     settle(db, db.commit(ALONE, Span::DUMMY)).expect("the outer commits");
     assert_eq!(db.depth(ALONE), 0);
     assert_eq!(driver_count(db), before + 1);
 }
 
-/// A savepoint has no isolation level, so a nested `begin` asking for a different one is a `Failed`
-/// naming both rather than a silent narrowing.
 fn a_nested_level_that_disagrees_is_a_value(db: &Postgres) {
     settle(
         db,
@@ -763,8 +721,6 @@ fn a_nested_level_that_disagrees_is_a_value(db: &Postgres) {
     settle(db, db.abort(ALONE, Span::DUMMY)).expect("the outer rolls back");
 }
 
-/// The backstop supplied by the one component in the stack that cannot be fooled by an annotation:
-/// `25006`, from the server.
 fn a_read_only_transaction_is_refused_by_the_server(db: &Postgres) {
     settle(
         db,
@@ -785,8 +741,6 @@ fn a_read_only_transaction_is_refused_by_the_server(db: &Postgres) {
     settle(db, db.abort(ALONE, Span::DUMMY)).expect("it aborts");
 }
 
-/// The exit that needs a mechanism rather than an intention: an entry point that ended with a scope
-/// open.
 fn an_abandoned_scope_is_rolled_back_at_the_entry_point(db: &Postgres, cluster: &Cluster) {
     let before = driver_count(db);
     settle(

@@ -1,9 +1,3 @@
-//! Both engines over the corpora that exist on disk.
-//!
-//! `examples/` is the one real program and carries every liveness assertion; the fixtures are
-//! mostly deliberately broken programs, swept in round-robin buckets so that no single test walks
-//! the whole tree.
-
 use ply_eval::differential::compare_tests;
 use ply_eval::{Fixture, Machine};
 use ply_span::SourceMap;
@@ -47,7 +41,6 @@ fn subdirectories(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The `std.*` modules one source names.
 fn std_imports(id: ply_span::SourceId, name: &ModuleName, text: &str) -> Vec<ModuleName> {
     let Ok(module) = ply_syntax::parse_module(id, name.clone(), text) else {
         return Vec::new();
@@ -60,8 +53,7 @@ fn std_imports(id: ply_span::SourceId, name: &ModuleName, text: &str) -> Vec<Mod
         .collect()
 }
 
-/// A fixture is often a deliberately broken program, so anything that does not parse or resolve is
-/// not this test's business and is counted as skipped rather than failed.
+/// `None` for a fixture that does not parse or resolve: many are deliberately broken.
 fn load(root: &Path, files: &[PathBuf]) -> Option<(Program, Resolved)> {
     let mut map = SourceMap::new();
     let mut loaded = Vec::new();
@@ -72,9 +64,7 @@ fn load(root: &Path, files: &[PathBuf]) -> Option<(Program, Resolved)> {
         let id = map.add(path, text.clone());
         loaded.push((id, name, text));
     }
-    // Demand-driven, exactly as `ply`'s own loader is: a corpus that imports nothing from `std`
-    // gets nothing, so a one-file fixture stays the program it is rather than acquiring the
-    // stdlib's definitions and tests.
+    // Demand-driven like `ply`'s loader, so a fixture importing nothing from `std` gets none of it.
     let mut next = 0;
     while next < loaded.len() {
         let (id, name, text) = &loaded[next];
@@ -96,8 +86,7 @@ fn load(root: &Path, files: &[PathBuf]) -> Option<(Program, Resolved)> {
         .map(|(id, name, text)| (*id, name.clone(), text.as_str()))
         .collect();
     let mut program = parse_program(inputs).ok()?;
-    // A `derive` declares no name and every walker skips it, so a harness that forgets to expand
-    // runs a program whose generated definitions silently do not exist.
+    // Unexpanded, a `derive`'s generated definitions would silently not exist.
     if !ply_derive::expand_program(&mut program).is_empty() {
         return None;
     }
@@ -107,15 +96,13 @@ fn load(root: &Path, files: &[PathBuf]) -> Option<(Program, Resolved)> {
 
 const EXAMPLES: &str = "examples";
 
-/// One program on disk.
 struct Corpus {
     label: String,
     dir: PathBuf,
     files: Vec<PathBuf>,
 }
 
-/// Every directory that is one program, plus every stray top-level fixture as a program of its own
-/// — which is what they are, since a fixture in `tests/fixtures` names nothing in its neighbour.
+/// Every one-program directory, plus each stray top-level fixture as a program of its own.
 fn corpora(root: &Path) -> Vec<Corpus> {
     let mut out = Vec::new();
 
@@ -158,8 +145,7 @@ type Loaded = (
     &'static ply_ty::CheckOutput,
 );
 
-/// A corpus and its program, parsed once per process and leaked, so that every backend over one
-/// corpus costs one AST.
+/// Parsed once per process and leaked, so every backend over a corpus shares one AST.
 struct Entry {
     corpus: Corpus,
     loaded: OnceLock<Option<Loaded>>,
@@ -170,9 +156,7 @@ impl Entry {
         &self.corpus.label
     }
 
-    /// `None` for a fixture that does not parse, resolve or check. The check is required rather
-    /// than optional: the purity gate reads the published row, and a machine built without one has
-    /// an inert hook, which would be green over a seam it never reached.
+    /// Requires the check: without the published row the purity hook is inert and passes vacuously.
     fn loaded(&self) -> Option<Loaded> {
         *self.loaded.get_or_init(|| {
             let (program, resolved) = load(&self.corpus.dir, &self.corpus.files)?;
@@ -184,7 +168,6 @@ impl Entry {
     }
 }
 
-/// The corpora in their on-disk order.
 fn index() -> &'static [Entry] {
     static INDEX: OnceLock<Vec<Entry>> = OnceLock::new();
     INDEX.get_or_init(|| {
@@ -201,7 +184,6 @@ fn index() -> &'static [Entry] {
 /// Round-robin over the fixtures in their on-disk order, so a run of same-cost siblings spreads.
 const BUCKETS: usize = 8;
 
-/// What one test sweeps.
 #[derive(Clone, Copy)]
 enum Selection {
     /// The one real program, and the only selection whose counts prove anything.
@@ -271,7 +253,6 @@ fn every_fixture_is_in_exactly_one_bucket_and_examples_is_its_own() {
     assert_eq!(BUCKETS, 8, "`over_every_corpus!` names one test per bucket");
 }
 
-/// The same corpora, with a backend attached.
 mod backends {
     use ply_eval::{Compiled, Machine, Value};
     use ply_span::{Span, Symbol};
@@ -309,8 +290,7 @@ mod backends {
         }
     }
 
-    /// A backend whose "compiled code" is a nested machine, over its own copy of the program with
-    /// its own world.
+    /// A backend whose "compiled code" is a nested machine with its own program copy and world.
     pub struct Nested {
         program: *const Program,
         inner: RefCell<Machine<'static>>,
@@ -429,8 +409,6 @@ fn answering(selection: Selection) {
     );
 }
 
-/// One test per family per fixture bucket: `<family>::over_fixture_bucket_<k>` carries the
-/// family's safety assertions over one slice of the fixtures.
 macro_rules! over_every_corpus {
     ($($family:ident),* $(,)?) => {$(
         mod $family {

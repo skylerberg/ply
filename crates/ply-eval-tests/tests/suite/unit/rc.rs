@@ -1,5 +1,3 @@
-//! What the reference-counting pass claims, checked against what a run does.
-
 use crate::unit::build::*;
 use ply_eval::rc::*;
 use ply_eval::{Machine, Value};
@@ -7,8 +5,6 @@ use ply_span::Span;
 use ply_span::codes;
 use ply_syntax::ast::{BinOp, Expr, Item};
 
-/// Runs `e` on the machine with the counters cleared, and answers the value beside what reference
-/// counting did while producing it.
 #[track_caller]
 fn run(items: Vec<Item>, e: Expr) -> (Value, Stats) {
     let (program, resolved) = standalone(items);
@@ -35,7 +31,6 @@ fn int_of(v: &Value) -> i64 {
     }
 }
 
-/// The elision the pass performs, as a number.
 #[test]
 fn a_straight_line_body_elides_every_reference_counting_operation() {
     let e = block(
@@ -49,14 +44,11 @@ fn a_straight_line_body_elides_every_reference_counting_operation() {
     assert_eq!(int_of(&value), 2);
     // `a` and `b` are read once each, and each read is the last one.
     assert_eq!((stats.dup_sites, stats.dup_emitted), (2, 0));
-    // Two bindings, and neither pays a drop of its own: a last use moves the value out of its
-    // slot, and the scope's end is one window truncation.
+    // A last use moves the value out, and the scope's end is one window truncation.
     assert_eq!((stats.drop_sites, stats.drop_emitted), (2, 0));
     assert_eq!(stats.elided(), Some(1.0));
 }
 
-/// A binding read twice keeps its `dup`, which is the half of the accounting that would make the
-/// elision figure a lie if it were dropped.
 #[test]
 fn a_binding_read_twice_keeps_the_duplication_at_its_earlier_read() {
     let e = block(
@@ -76,9 +68,7 @@ fn a_binding_read_twice_keeps_the_duplication_at_its_earlier_read() {
     );
 }
 
-/// A read to the left of a capture of the same binding is not a last use: the capture copies the
-/// value later in evaluation order, so the earlier read must clone. The capture itself may be the
-/// move — the closure then owns the value outright, which is exactly right.
+/// The capture copies the value later in evaluation order, so the earlier read must clone.
 #[test]
 fn a_read_before_a_capture_is_cloned_and_the_program_still_answers() {
     let e = block(
@@ -99,7 +89,6 @@ fn a_read_before_a_capture_is_cloned_and_the_program_still_answers() {
     );
 }
 
-/// A cell made to contain itself leaks, and says so.
 #[test]
 fn a_cell_that_contains_itself_is_reported_rather_than_collected() {
     let e = with_cell(
@@ -135,8 +124,6 @@ fn a_cell_that_contains_itself_is_reported_rather_than_collected() {
     );
 }
 
-/// A value stored into a cell it does not reach is not a cycle, so the detector cannot turn into
-/// noise on every `cell_set`.
 #[test]
 fn an_ordinary_cell_write_reports_nothing() {
     let e = with_cell(
@@ -154,12 +141,6 @@ fn an_ordinary_cell_write_reports_nothing() {
     assert!(take_cycles().is_empty());
 }
 
-// The chain-level release and take-unique unit tests that stood here died with the chain: a moved
-// slot is [`ply_eval::window::SlotVal::Moved`], its read is an internal error rather than an outer
-// binding of the same name, and both are pinned in `ply_eval::window`'s own tests — a shadowed name
-// cannot be uncovered because the two bindings are two different slots.
-
-/// A binding read again after an inner scope reused its name.
 #[test]
 fn a_binding_reread_after_an_inner_scope_shadowed_it_survives() {
     let inner = block(vec![letv("x", int(9))], Some(int(0)));
@@ -175,8 +156,7 @@ fn a_binding_reread_after_an_inner_scope_shadowed_it_survives() {
     assert_eq!(int_of(&value), 3);
 }
 
-/// The same shape with the shadow inside a `match` arm, which is the other construct that binds
-/// without opening a barrier.
+/// A `match` arm also binds without opening a barrier.
 #[test]
 fn a_binding_reread_after_a_match_arm_shadowed_it_survives() {
     let e = block(
@@ -191,8 +171,6 @@ fn a_binding_reread_after_a_match_arm_shadowed_it_survives() {
     assert_eq!(int_of(&value), 3);
 }
 
-/// And with `with_cell`'s binder, whose region makes it look unlike the other two and whose live
-/// set is the same one.
 #[test]
 fn a_binding_reread_after_a_region_binder_shadowed_it_survives() {
     let e = block(
@@ -210,9 +188,6 @@ fn a_binding_reread_after_a_region_binder_shadowed_it_survives() {
     assert_eq!(int_of(&value), 3);
 }
 
-/// A read to the left of a shadowing scope is not a last use when the outer binding is read to the
-/// right of it, and marking it one would let the machine move the value out of a scope something
-/// else still reads.
 #[test]
 fn a_read_left_of_a_shadowing_scope_is_not_owned_when_the_outer_binding_lives_on() {
     let shadow = block(vec![letv("xs", int(9))], Some(int(0)));
@@ -228,8 +203,7 @@ fn a_read_left_of_a_shadowing_scope_is_not_owned_when_the_outer_binding_lives_on
     assert_eq!(int_of(&value), 6);
 }
 
-/// A generated corpus, because the shapes somebody thinks to write down are not the shapes that
-/// break a liveness analysis.
+/// Generated, because the shapes somebody thinks to write down are not the ones that break liveness.
 mod generated {
     use super::*;
     use ply_syntax::ast::Stmt as AstStmt;
@@ -350,8 +324,7 @@ mod generated {
                 } else {
                     Sort::List
                 };
-                // The value is generated before the binding enters scope, so a read inside it is a
-                // read of whatever this name meant before.
+                // Generated before the binding enters scope, so a read inside it sees the name's previous meaning.
                 let value = self.of_sort(sort, depth);
                 stmts.push(letv(name, value));
                 self.scope.push((name, sort));
@@ -368,8 +341,7 @@ mod generated {
             self.scope.push((name, Sort::Int));
             let bound = self.ints(depth);
             self.scope.pop();
-            // Half the time every arm binds the name, because an arm that does not is enough on its
-            // own to keep the outer binding's liveness and would hide a construct that drops it.
+            // An arm that does not bind the name keeps the outer binding live and would hide a construct that drops it.
             let catch_all = if self.pick(2) == 0 {
                 arm(pwild(), self.ints(depth))
             } else {
@@ -406,7 +378,6 @@ mod generated {
         }
     }
 
-    /// No generated program reaches the released-binding path.
     #[test]
     fn no_generated_program_releases_a_binding_something_still_reads() {
         let (program, resolved) = standalone(Vec::new());
@@ -425,7 +396,6 @@ mod generated {
     }
 }
 
-/// [`record_sites`] clears on the way in as well as on the way out.
 #[test]
 fn arming_site_recording_clears_what_the_last_caller_left() {
     let span = Span::new(ply_span::SourceId(0), 0, 1);

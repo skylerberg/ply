@@ -34,10 +34,7 @@ fn fixture(source: &str) -> Fixture {
         Ok(resolved) => resolved,
         Err(diagnostics) => panic!("resolve: {:?}", messages(&diagnostics)),
     };
-    // The module stays anonymous. `ply_syntax::parse` names it `ModuleName::anonymous()`, and an
-    // anonymous module qualifies nothing on either side -- `ModuleName::qualify` returns the bare
-    // name and `resolve.ply`'s `qualify` returns it for a zero-length module -- so the checker's
-    // keys are the bare ones this crate and `ply-prove`'s own API are written against.
+    // Anonymous, so the checker's keys are the bare ones `ply-prove`'s API is written against.
     let check =
         ply_codegen::c::producer::checked_front(&[(String::new(), source.to_string())], &[SRC])
             .unwrap_or_else(|e| panic!("check: {e:#}"))
@@ -70,7 +67,6 @@ impl Fixture {
     }
 }
 
-/// A law binder's declared type, resolved the way the front end does.
 fn resolve_type(ty: &TypeExpr, vars: &mut BTreeMap<Symbol, TyVar>) -> Type {
     match ty {
         TypeExpr::Var(name) => {
@@ -130,8 +126,6 @@ fn attempt_with(fixture: &Fixture, label: &str, limits: &Limits) -> Decision {
     )
 }
 
-/// [`decide_and_diagnose`] over a law, so a test can assert *why* an attempt was
-/// refused rather than only that it was.
 fn attempt_for_test(f: &Fixture, label: &str) -> (Decision, Vec<Blocker>) {
     let ctx = f.context();
     let law = f.law(label);
@@ -218,17 +212,12 @@ fn linear_arithmetic_decides_both_directions() {
     not_proved(&f, "ordering skips two");
 }
 
-/// Every `Int` is an `i64`, so its own width is a theorem rather than an assumption — which is what
-/// lets a guard establish that an operator's result fits and is the reason `x + 1` under `x < 100`
-/// is decided at all.
 #[test]
 fn an_int_is_bounded_by_its_own_width() {
     let f = fixture(ARITHMETIC);
     proof(&f, "an int is not below the smallest");
 }
 
-/// The claim is valid over ℤ and **raises** at `i64::MAX`, so there is no input at which it holds
-/// and the prover may not report one covering every input.
 #[test]
 fn arithmetic_that_can_leave_int_is_not_proved() {
     let f = fixture(ARITHMETIC);
@@ -243,23 +232,18 @@ fn arithmetic_that_can_leave_int_is_not_proved() {
     }
 }
 
-/// A zero divisor raises, so an uninterpreted `/` is a value only where the guard says the divisor
-/// is not zero.
 #[test]
 fn a_quotient_is_a_value_only_where_its_divisor_is_not_zero() {
     let f = fixture(ARITHMETIC);
     not_proved(&f, "a symbolic quotient is a function");
     proof(&f, "a nonzero quotient is a function");
 
-    // A literal divisor is decided outright, in both directions: `0` never has an answer, and `-1`
-    // has one everywhere except `i64::MIN`.
+    // `0` never has an answer, and `-1` has one everywhere except `i64::MIN`.
     not_proved(&f, "remainder by zero is a function");
     not_proved(&f, "dividing by minus one is a function");
     proof(&f, "dividing a bounded value by minus one");
 }
 
-/// `x < y` over `Int` is `x + 1 <= y`, and reasoning with that is what decides `x < y && y < z ⟹ x
-/// < z - 1` — true over ℤ and not over ℚ.
 #[test]
 fn strict_inequalities_are_tightened_to_the_integers() {
     let f = fixture(ARITHMETIC);
@@ -268,15 +252,12 @@ fn strict_inequalities_are_tightened_to_the_integers() {
     proof(&f, "ordering skips one");
 }
 
-/// `x * y` with both factors symbolic is uninterpreted, so commutativity — true of every actual
-/// `Int` — is not in the fragment and must not be proved.
 #[test]
 fn multiplication_by_a_symbolic_is_not_arithmetic() {
     let f = fixture(ARITHMETIC);
     not_proved(&f, "multiplication commutes");
 }
 
-/// Division is outside the fragment as a *value*, at all, including by a literal.
 #[test]
 fn division_is_uninterpreted_in_both_directions() {
     let f = fixture(ARITHMETIC);
@@ -287,7 +268,6 @@ fn division_is_uninterpreted_in_both_directions() {
     proof(&f, "remainder is a function");
 }
 
-/// The guard admits nothing, so the obligation is trivially valid and says nothing.
 #[test]
 fn an_unsatisfiable_guard_is_vacuous_and_never_proved() {
     let f = fixture(ARITHMETIC);
@@ -297,9 +277,6 @@ fn an_unsatisfiable_guard_is_vacuous_and_never_proved() {
     ));
 }
 
-/// The false instance of the vacuity rule, and the one that matters more: `x > 0 && x < 2` admits
-/// exactly one integer, so a claim under it is a real claim about a real domain and reporting it
-/// vacuous would be an error raised against a correct spec.
 #[test]
 fn a_satisfiable_guard_is_never_vacuous_however_narrow() {
     let f = fixture(ARITHMETIC);
@@ -335,19 +312,15 @@ law "an overflowing sum is itself" forall (x: Int)
   { x == 9223372036854775807 + 9223372036854775807 }
 "#;
 
-/// Every operator whose result left `Int` becomes an uninterpreted term, and **the operator has to
-/// be part of the term's identity.**
 #[test]
 fn two_operators_that_overflowed_are_not_one_term() {
     let f = fixture(BOUNDARIES);
     not_proved(&f, "an overflowing sum is an overflowing product");
     not_proved(&f, "an overflowing difference is an overflowing product");
-    // Nor is either of them a value at all: `MAX + MAX` raises, so the reflexivity that congruence
-    // would happily supply is a claim about something the program never computes.
+    // `MAX + MAX` raises, so congruence's reflexivity is about a value never computed.
     not_proved(&f, "an overflowing sum is itself");
 }
 
-/// The decidable fragment(a) reasons over ℤ.
 #[test]
 fn arithmetic_is_proved_only_where_the_result_is_an_int() {
     let f = fixture(BOUNDARIES);
@@ -356,7 +329,6 @@ fn arithmetic_is_proved_only_where_the_result_is_an_int() {
     proof(&f, "a bounded round trip");
 }
 
-/// What must never happen at the boundary is the prover's *own* arithmetic wrapping.
 #[test]
 fn a_constant_outside_int_is_opaque_rather_than_wrapped() {
     let f = fixture(BOUNDARIES);
@@ -364,8 +336,7 @@ fn a_constant_outside_int_is_opaque_rather_than_wrapped() {
     not_proved(&f, "the smallest int is smallest");
 }
 
-/// A coefficient that leaves `i128` makes the term uninterpreted — and the product it stands for is
-/// one no `Int` holds, so it is not a value either and congruence over it decides nothing.
+/// The product it stands for is one no `Int` holds, so congruence over it decides nothing.
 #[test]
 fn a_coefficient_that_overflows_stays_a_term() {
     let f = fixture(BOUNDARIES);
@@ -450,8 +421,6 @@ fn congruence_over_an_uninterpreted_function_decides_both_directions() {
     not_proved(&f, "any two arguments agree");
 }
 
-/// A proof over an uninterpreted sort is a proof for every instantiation, and the certificate says
-/// which variables stayed uninterpreted.
 #[test]
 fn a_polymorphic_proof_records_its_sorts() {
     let f = fixture(CONGRUENCE);
@@ -467,8 +436,6 @@ fn records_project_and_compare_structurally() {
     not_proved(&f, "records with any fields are equal");
 }
 
-/// Extensionality in the *introduction* direction: a record literal is proved equal to an opaque
-/// record when every field is.
 #[test]
 fn a_record_equals_one_rebuilt_from_all_of_its_fields_and_no_fewer() {
     let f = fixture(CONGRUENCE);
@@ -478,8 +445,7 @@ fn a_record_equals_one_rebuilt_from_all_of_its_fields_and_no_fewer() {
 
     not_proved(&f, "moving an account leaves it where it was");
     not_proved(&f, "one matching field is enough");
-    // The same claim without the guard moves a balance out of `Int`, so the record equality it
-    // rests on is an equality between values one side of which the program never produces.
+    // Unguarded, the balance can leave `Int`.
     not_proved(&f, "moving an unbounded account and back is the account");
 }
 
@@ -506,7 +472,6 @@ fn constructor_injectivity_decides_both_directions() {
     not_proved(&f, "two constructors are not");
 }
 
-/// Two distinct constructors cannot be equal, so the guard admits nothing.
 #[test]
 fn distinct_constructors_make_a_guard_vacuous() {
     let f = fixture(SHAPES);
@@ -535,8 +500,6 @@ law "every rank is small" forall (c: Colour) { rank(c) <= 6 }
 law "no rank is seven" forall (c: Colour) { rank(c) != 7 }
 "#;
 
-/// The split is over the constructor set, so eight arms are eight branches and the proof covers the
-/// type rather than a sample of it.
 #[test]
 fn a_case_split_over_many_constructors_decides_both_directions() {
     let f = fixture(RAINBOW);
@@ -587,8 +550,6 @@ fn a_non_recursive_definition_unfolds_to_the_stated_depth() {
     not_proved(&f, "four unfoldings do not");
 }
 
-/// A member of a recursive component is never unfolded: reaching a general statement about one
-/// needs induction, which M8 does not have.
 #[test]
 fn a_recursive_definition_is_never_unfolded() {
     let f = fixture(CHAIN);
@@ -610,9 +571,6 @@ fn difference() -> Int = bump() - bump()
 fn once() -> Int { let n = counter.next(); n - n }
 "#;
 
-/// An `ensures` on an effectful definition is attempted statically before it is reported as a gap
-/// (the unhandled-effect gap), so the prover does see impure bodies — and **a call that performs is not a
-/// function of its arguments.**
 #[test]
 fn two_calls_to_an_effectful_definition_are_not_one_term() {
     let f = fixture(EFFECTFUL);
@@ -620,8 +578,7 @@ fn two_calls_to_an_effectful_definition_are_not_one_term() {
         returns_zero(&f, "difference"),
         Decision::Proved(_)
     ));
-    // The direction the rule must not take with it: one performance bound to a local is evaluated
-    // once, so the two uses of `n` are one value and the difference really is zero.
+    // One performance bound to a local is evaluated once, so both uses of `n` are one value.
     assert!(matches!(returns_zero(&f, "once"), Decision::Proved(_)));
 }
 
@@ -655,8 +612,6 @@ fn returns_zero(fixture: &Fixture, source: &str) -> Decision {
     )
 }
 
-/// A definition that performs is not a value the fragment reasons about, so it is never inlined
-/// however non-recursive it is.
 #[test]
 fn an_effectful_definition_is_never_unfolded() {
     let f = fixture(EFFECTFUL);
@@ -690,8 +645,7 @@ fn a_literal_match_decides_both_directions() {
     not_proved(&f, "flipping once is identity");
 }
 
-/// The branch a definedness requirement was reached under is part of it: `0 - x` is only ever
-/// evaluated where `x < 0`, so the `else` arm costs nothing.
+/// `0 - x` is only evaluated where `x < 0`, so the `else` arm's definedness costs nothing.
 #[test]
 fn an_if_decides_both_directions() {
     let f = fixture(MATCHING);
@@ -762,8 +716,6 @@ fn ensures_goal(source: &str, clause: &str) -> Decision {
     )
 }
 
-/// The postcondition of spec clause syntax, end to end: `result` is bound to the definition's own body,
-/// the constructor is injective, the accessors unfold, and the arithmetic closes.
 #[test]
 fn a_postcondition_over_a_definition_decides_both_directions() {
     assert!(matches!(
@@ -780,8 +732,6 @@ fn a_postcondition_over_a_definition_decides_both_directions() {
     ));
 }
 
-/// Without the definitional equation `result` is an arbitrary value of its type, and a
-/// postcondition mentioning it cannot be valid.
 #[test]
 fn a_postcondition_without_the_definition_is_unknown() {
     let f = fixture(LEDGER);
@@ -853,7 +803,6 @@ fn spends_its_budget(fixture: &Fixture, label: &str, limits: &Limits) {
     );
 }
 
-/// A spent budget is inconclusive, and inconclusive reports the weaker tier.
 #[test]
 fn a_spent_budget_is_unknown_and_never_proved() {
     let f = fixture(HARD);
@@ -865,14 +814,10 @@ fn a_spent_budget_is_unknown_and_never_proved() {
             ..Limits::default()
         },
     );
-    // The same obligation decides at the default budget, so the assertion above is measuring the
-    // budget and not the fragment.
+    // Decides at the default budget, so the assertion above is about the budget alone.
     proof(&f, "four bits are bounded");
 }
 
-/// The case analysis is exponential in the number of binders, and every sum in the body carries a
-/// definedness requirement decided in the same analysis, so the default budget is reached long
-/// before the fragment is.
 #[test]
 fn an_obligation_larger_than_the_default_budget_is_unknown() {
     let f = fixture(HARD);
@@ -887,8 +832,6 @@ fn an_obligation_larger_than_the_default_budget_is_unknown() {
     ));
 }
 
-/// Two runs of the prover over one obligation produce one answer, including the rule list, which is
-/// what makes today's artifact diffable against yesterday's.
 #[test]
 fn a_decision_is_a_function_of_the_obligation() {
     let f = fixture(RAINBOW);
@@ -903,8 +846,6 @@ law "a guard nothing establishes" forall (x: Int, y: Int) where x < y { x != y }
 law "an unguarded claim" forall (x: Int) { x == x }
 "#;
 
-/// A certificate whose guard was never shown to admit a value has a domain it cannot vouch for, so
-/// it cannot be built until something establishes one.
 #[test]
 fn a_certificate_needs_the_guard_to_admit_a_value() {
     let f = fixture(GUARDED);
@@ -925,7 +866,6 @@ type Bottom = Wrap(Bottom)
 law "anything about nothing" forall (b: Bottom) { b == b }
 "#;
 
-/// A type with no values makes every claim about it valid and empty.
 #[test]
 fn an_uninhabited_domain_does_not_establish_satisfiability() {
     let f = fixture(UNINHABITED);
@@ -965,7 +905,6 @@ law "a nested pattern is not decided" forall (t: Tree) { depth_one(t) >= 0 }
 law "a nested pattern is still a function" forall (t: Tree) { depth_one(t) == depth_one(t) }
 "#;
 
-/// A nested constructor pattern leaves its `match` uninterpreted rather than guessed.
 #[test]
 fn a_nested_pattern_leaves_the_match_uninterpreted() {
     let f = fixture(OPAQUE);
@@ -978,12 +917,9 @@ fn a_nested_pattern_leaves_the_match_uninterpreted() {
 enum Truth {
     /// Holds of every input its guard admits, and the guard admits one.
     Valid,
-    /// Holds wherever it evaluates, and **raises** at some input its guard admits — an `Int` that
-    /// left `i64`, a zero divisor, a definition that does not return.
+    /// Holds wherever it evaluates, and raises at some input its guard admits.
     Partial,
-    /// Some input its guard admits falsifies it.
     Refutable,
-    /// The guard admits nothing.
     Vacuous,
 }
 
@@ -1103,9 +1039,7 @@ fn corpus() -> Vec<(&'static str, Truth)> {
         "a decimal equals itself",
         "two decimal scales are one value",
         "two decimals are two values",
-        // Exact and unable to overflow — adding zero needs no mantissa — so it is valid, and it is
-        // still not proved: there is no theory of `Decimal` arithmetic here and there is not meant
-        // to be.
+        // Valid, and still not proved: there is no theory of `Decimal` arithmetic.
         "a decimal zero is additive",
     ];
     let partial = [
@@ -1114,8 +1048,7 @@ fn corpus() -> Vec<(&'static str, Truth)> {
         "negation is subtraction",
         "doubling scales",
         "quadrupling scales",
-        // The guard itself raises at `i64::MAX`, so its domain is not empty — it is undecided,
-        // which is a different thing and a weaker claim.
+        // The guard raises at `i64::MAX`, so its domain is undecided rather than empty.
         "its own successor",
     ];
     let refutable = [
@@ -1153,9 +1086,6 @@ fn corpus() -> Vec<(&'static str, Truth)> {
         .collect()
 }
 
-/// The audit, and the most important test in this module: over a corpus whose truth was established
-/// by hand, **nothing false is ever proved and nothing with a real domain is ever called
-/// vacuous.**
 #[test]
 fn nothing_false_is_ever_proved_and_nothing_real_is_ever_vacuous() {
     let f = fixture(CORPUS);
@@ -1166,8 +1096,6 @@ fn nothing_false_is_ever_proved_and_nothing_real_is_ever_vacuous() {
                 !matches!(decision, Decision::GuardUnsatisfiable { .. }),
                 "`{label}` has a domain: {decision:?}"
             ),
-            // The entries this milestone's worst defect is made of: valid over ℤ and over total
-            // function symbols, and raising at some input the guard admits.
             Truth::Partial => assert!(
                 matches!(decision, Decision::Unknown { .. }),
                 "`{label}` raises at some input its guard admits: {decision:?}"
@@ -1185,8 +1113,7 @@ fn nothing_false_is_ever_proved_and_nothing_real_is_ever_vacuous() {
     }
 }
 
-/// The corpus is worth exactly what its reach is: an audit every entry of which came back `Unknown`
-/// would pass while proving nothing at all.
+/// An audit whose every entry came back `Unknown` would pass while proving nothing.
 #[test]
 fn the_audit_corpus_exercises_the_fragment() {
     let f = fixture(CORPUS);

@@ -1,9 +1,5 @@
-//! ADR 0035's Rust bars: the two kernels `benches/value-model/PRE-REGISTERED.md` names, written
-//! the way a competent engineer writes them and nothing cleverer. `k1` is a scalar transliteration
-//! of `crates/ply-std/ply/hash.ply` — the same rounds, the same masks, no SIMD; `k2` is the same
-//! state loop the Ply kernel runs, over a struct updated in place.
-//!
-//! Prints one line: `k1=<ms> k2=<ms> digest=<hex>`, each time the minimum over `REPEATS` runs.
+//! Rust bars for the value-model bench: `k1` is `hash.ply`'s BLAKE3 transliterated without SIMD,
+//! `k2` the Ply kernel's state loop over a struct updated in place.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -11,8 +7,6 @@ use std::time::Instant;
 const REPEATS: usize = 20;
 const K1_BYTES: usize = 65536;
 const K2_STEPS: i64 = 200_000;
-
-// --- K1: BLAKE3, transliterated from hash.ply ------------------------------------------------
 
 const IV: [u32; 8] = [
     0x6A09_E667, 0xBB67_AE85, 0x3C6E_F372, 0xA54F_F53A, 0x510E_527F, 0x9B05_688C, 0x1F83_D9AB,
@@ -171,8 +165,6 @@ fn blake3(input: &[u8]) -> [u8; 32] {
     digest
 }
 
-// --- K2: a threaded state ---------------------------------------------------------------------
-
 struct State {
     count: i64,
     total: i64,
@@ -209,8 +201,6 @@ fn run(n: i64) -> State {
         step,
     )
 }
-
-// --- The report ---------------------------------------------------------------------------------
 
 fn min_ms(mut f: impl FnMut()) -> f64 {
     let mut best = f64::INFINITY;

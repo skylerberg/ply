@@ -31,8 +31,7 @@ fn everything_else_is_rejected() {
 
 #[test]
 fn canonical_bytes_distinguish_a_path_from_a_longer_root() {
-    // `7:1` and `7` differ, and no length prefix ambiguity can make the path of one seed look
-    // like the root of another.
+    // No length-prefix ambiguity can make one seed's path look like another's root.
     assert_ne!(Seed::root(7).to_bytes(), Seed::at(7, vec![1]).to_bytes());
     assert_ne!(
         Seed::at(7, vec![1, 0]).to_bytes(),
@@ -45,8 +44,7 @@ fn branching_keeps_the_prefix_and_forgets_the_suffix() {
     let seed = Seed::at(3, vec![1, 2, 3, 4]);
     assert_eq!(seed.branch(2, 9), Seed::at(3, vec![1, 2, 9]));
     assert_eq!(seed.branch(0, 5), Seed::at(3, vec![5]));
-    // Branching past the recorded path pads rather than panicking: a search may reach a
-    // scheduling point the prefix never named, and the choice has to land at that index.
+    // A search may reach a scheduling point the prefix never named, so branching past it pads.
     let branched = seed.branch(6, 1);
     assert_eq!(branched.choice(6), Some(1));
     assert_eq!(branched.path.len(), 7);
@@ -57,8 +55,7 @@ fn the_two_streams_are_independent() {
     let sched: Vec<u64> = (0..8).map(|i| Stream::draw(11, Domain::Sched, i)).collect();
     let rand: Vec<u64> = (0..8).map(|i| Stream::draw(11, Domain::Rand, i)).collect();
     assert_ne!(sched, rand);
-    // Serving the rand stream must not disturb the sched stream, which is what stops a new
-    // `random.next()` call from shifting the interleaving.
+    // Serving `rand` must not disturb `sched`, or a new `random.next()` would shift the interleaving.
     let mut a = Stream::new(11, Domain::Sched);
     let mut r = Stream::new(11, Domain::Rand);
     let mut b = Stream::new(11, Domain::Sched);
@@ -88,8 +85,7 @@ fn below_is_in_range_and_refuses_a_zero_bound() {
     }
 }
 
-/// Not a statistical test — a distribution check that fails one run in a thousand is exactly
-/// the flake this project exists to delete.
+/// Not a statistical test: a check that fails one run in a thousand is a flake.
 #[test]
 fn below_rejects_only_above_the_limit() {
     let n = 3u64;
@@ -135,8 +131,6 @@ fn a_write_does_not_commute_with_a_read_of_the_same_resource() {
     assert_eq!(r.contention(&w).len(), 1);
 }
 
-/// The relation is at cell granularity, not label granularity: two cells allocated under one
-/// `with_cell[users]` are two locations.
 #[test]
 fn two_cells_are_two_locations_whatever_they_were_labelled() {
     let one = StepFootprint::from_accesses([Access::Cell {
@@ -155,8 +149,6 @@ fn two_cells_are_two_locations_whatever_they_were_labelled() {
     assert!(one.conflicts_with(&also_one));
 }
 
-/// The mistake the dependence relation exists to prevent: two tasks share one world, so a `cell` access
-/// is part of the dependence relation.
 #[test]
 fn cell_accesses_are_in_the_relation() {
     let write = StepFootprint::from_accesses([Access::Cell {
@@ -250,9 +242,6 @@ fn a_once_plan_names_exactly_the_seed_it_replays() {
     assert_eq!(Plan::once(seed.clone()).seeds(), vec![seed]);
 }
 
-/// An exhausted search proved nothing about the interleavings it did not reach, so its green
-/// verdict may not be cached — the first green `det` test in the language that is not
-/// cacheable, and correctly so.
 #[test]
 fn an_exhausted_search_is_not_cacheable() {
     let exhausted = Exploration {
@@ -320,7 +309,6 @@ fn sig(effect: &str, op: &str) -> &'static OpSignature {
     signature(effect, op).expect("a seeded operation")
 }
 
-/// Every answer a region delivered, rendered.
 fn transcript(answers: &[Answer]) -> Vec<String> {
     answers
         .iter()
@@ -375,7 +363,6 @@ fn another_seed_answers_another_sequence() {
     assert_ne!(transcript(&a), transcript(&b));
 }
 
-/// There is no `clock` stream.
 #[test]
 fn the_clock_is_not_drawn_from_the_seed() {
     let clock_of = |root| {
@@ -398,8 +385,6 @@ fn the_clock_is_not_drawn_from_the_seed() {
     assert_eq!(clock_of(1), clock_of(999_999));
 }
 
-/// The whole of "virtual time advances only via the scheduler": `now()` observes, `sleep`
-/// schedules, a draw is a draw, and none of them moves it.
 #[test]
 fn nothing_a_task_performs_moves_virtual_time() {
     let mut handlers = Handlers::new(3);
@@ -425,8 +410,6 @@ fn sleeping_for_no_time_is_a_yield() {
     assert_eq!(clock.next_deadline(), None);
 }
 
-/// Thirty simulated seconds are a jump, not thirty seconds: nothing here waits on anything, so
-/// the only cost of a long sleep is the arithmetic.
 #[test]
 fn a_long_sleep_advances_exactly_that_far() {
     let mut clock = Clock::new();
@@ -442,8 +425,6 @@ fn a_long_sleep_advances_exactly_that_far() {
     assert!(!clock.is_sleeping(TaskId(1)));
 }
 
-/// Sleeps are relative to the time the sleeping task observed, so a task that sleeps twice for
-/// 40ns wakes at 80ns rather than at 40ns again.
 #[test]
 fn a_deadline_is_measured_from_the_time_the_task_saw() {
     let mut clock = Clock::new();
@@ -467,8 +448,6 @@ fn tasks_sharing_a_deadline_wake_together_and_in_task_order() {
     assert_eq!(clock.deadline_of(TaskId(4)), Some(20));
 }
 
-/// A timeout is `clock.sleep` racing something else, and the earliest deadline is the only one
-/// that can fire.
 #[test]
 fn a_timeout_fires_at_its_deadline_and_never_before_a_nearer_one() {
     let mut clock = Clock::new();
@@ -490,8 +469,7 @@ fn a_timeout_fires_at_its_deadline_and_never_before_a_nearer_one() {
     assert_eq!(wake.woken, vec![timeout]);
 }
 
-/// With nothing enabled and no timer pending the region is stuck, which the scheduler reports
-/// as `E0414`.
+/// Nothing enabled and no timer pending is stuck, reported as `E0414`.
 #[test]
 fn no_timer_means_no_advance() {
     let mut clock = Clock::new();
@@ -544,9 +522,7 @@ fn a_draw_uses_the_rand_stream_and_the_whole_range_of_an_int() {
     assert!(negatives > 0, "`random.next` answers the whole of `Int`");
 }
 
-/// Excluding the terminating scheduler op is what leaves a reduction to measure; keeping
-/// `random.write` is what stops the search from calling two draws commutative when the program
-/// can tell them apart.
+/// Keeping `random.write` stops the search from calling two draws commutative.
 #[test]
 fn only_a_draw_is_an_access_of_the_step_it_ends() {
     for sig in SEEDED_OPS {
@@ -607,7 +583,6 @@ fn a_miscounted_argument_list_is_a_diagnostic_rather_than_a_panic() {
     assert_eq!(err.code, codes::RUNTIME_ERROR);
 }
 
-/// A sleeping task is not enabled, so the scheduler cannot resume it into a second sleep.
 #[test]
 fn a_task_cannot_hold_two_timers() {
     let mut clock = Clock::new();
@@ -619,8 +594,6 @@ fn a_task_cannot_hold_two_timers() {
     assert_eq!(clock.sleepers(), 1);
 }
 
-/// A rule about how a type is *used* is a rule nobody enforces; a rule about which types may be
-/// *named* is greppable.
 #[test]
 fn this_module_names_no_hash_based_collection_and_reads_no_clock() {
     let body = include_str!("../../../../ply-eval/src/sim.rs");

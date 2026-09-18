@@ -17,7 +17,6 @@ fn f() -> Value {
     Value::builtin(Builtin::IntToString)
 }
 
-/// Drives the protocol the way an engine does, answering every callback.
 fn drive(
     b: Builtin,
     args: Vec<Value>,
@@ -36,7 +35,6 @@ fn drive(
     }
 }
 
-/// A builtin that cannot suspend, called the way an engine calls it.
 fn done(b: Builtin, args: Vec<Value>) -> Result<Value, Diagnostic> {
     let mut cells: TaskRegions = TaskRegions::new();
     match call(b, args, cells.arena_mut(), Span::DUMMY)? {
@@ -49,7 +47,6 @@ fn bytes(b: &[u8]) -> Value {
     Value::bytes(b)
 }
 
-/// `Some(i)` or `None`, rendered, which is what a Ply program sees.
 fn found(b: Builtin, args: Vec<Value>) -> String {
     done(b, args).unwrap().render()
 }
@@ -58,8 +55,7 @@ fn some(i: i64) -> String {
     format!("Some({i})")
 }
 
-/// `Some(i)` as `i` and `None` as `-1`, which is the shape W1's folds answered in and therefore
-/// the shape a comparison against them needs.
+/// `Some(i)` as `i` and `None` as `-1`, the shape the folds it is compared against answer in.
 fn at(v: &Value) -> i64 {
     match v {
         Value::Ctor { args, .. } if !args.is_empty() => {
@@ -69,8 +65,7 @@ fn at(v: &Value) -> i64 {
     }
 }
 
-/// Deterministic and dependency-free, so a failing case is a seed a reader can reproduce rather
-/// than a number that moves between runs.
+/// Deterministic, so a failing case is a seed a reader can reproduce.
 struct Xorshift(u64);
 
 impl Xorshift {
@@ -147,8 +142,6 @@ fn index_of_covers_empty_absent_at_the_start_at_the_end_and_overlapping() {
     );
 }
 
-/// The index a `_from` search answers is absolute, so it feeds straight back into
-/// `bytes_slice`.
 #[test]
 fn index_of_from_answers_an_absolute_index_and_admits_the_end() {
     let hay = bytes(b"GET / HTTP/1.1");
@@ -236,7 +229,6 @@ fn index_of_byte_takes_a_byte_and_refuses_anything_else() {
     }
 }
 
-/// Required test 36.
 #[test]
 fn index_of_agrees_with_a_naive_search_over_ten_thousand_pairs() {
     fn naive(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
@@ -350,7 +342,6 @@ fn split_keeps_the_empty_pieces_a_join_needs_to_round_trip() {
     );
 }
 
-/// The limits's builtin.
 #[test]
 fn concat_all_joins_every_piece_in_order() {
     let empty = done(Builtin::BytesConcatAll, vec![Value::list(vec![])]).unwrap();
@@ -393,7 +384,6 @@ fn concat_all_joins_every_piece_in_order() {
     );
 }
 
-/// Required test 39, both halves.
 #[test]
 fn split_round_trips_against_a_join_and_refuses_an_empty_separator() {
     let mut rng = Xorshift(0xfeed_face_dead_b0d1);
@@ -465,8 +455,7 @@ fn a_scan_stops_on_the_class_and_the_other_stops_off_it() {
         "`=` is not a digit, so the scan stops where it started"
     );
 
-    // The whole point of `bytes_scan` over a fold: the answer for a run that reaches the end is
-    // the end, not a sentinel.
+    // A run that reaches the end answers the end, not a sentinel.
     assert_eq!(
         scan(Builtin::BytesScanUntil, head, 0, b"z", big).unwrap(),
         big
@@ -481,8 +470,7 @@ fn a_scan_stops_on_the_class_and_the_other_stops_off_it() {
     assert_eq!(scan(Builtin::BytesScan, head, big, b"a", big).unwrap(), big);
 }
 
-/// Every set size takes a different path — `memchr`, `memchr2`, `memchr3`, then the bitmap — so
-/// the four have to agree with each other.
+/// The four paths are `memchr`, `memchr2`, `memchr3`, then the bitmap.
 #[test]
 fn every_set_size_takes_its_own_path_and_they_all_agree() {
     fn naive(hay: &[u8], from: usize, set: &[u8], max: usize, want: bool) -> i64 {
@@ -520,7 +508,6 @@ fn every_set_size_takes_its_own_path_and_they_all_agree() {
     }
 }
 
-/// Required test 37.
 #[test]
 fn a_scan_examines_at_most_max_bytes() {
     for max in 0..40usize {
@@ -597,7 +584,6 @@ fn position_finds_the_first_byte_its_predicate_accepts() {
     );
 }
 
-/// Required test 38.
 #[test]
 fn position_calls_its_predicate_once_for_a_match_at_the_start_of_a_megabyte() {
     let mut calls = 0;
@@ -626,8 +612,6 @@ fn position_reports_a_non_boolean_answer_rather_than_reading_past_it() {
     assert!(d.message.contains("Bool"), "{}", d.message);
 }
 
-/// The property every builtin frame owes: a suspension point captured inside it can be advanced
-/// more than once, and each resumption is its own search.
 #[test]
 fn one_suspension_point_inside_position_can_be_resumed_twice() {
     let mut cells: TaskRegions = TaskRegions::new();
@@ -658,12 +642,10 @@ fn one_suspension_point_inside_position_can_be_resumed_twice() {
     );
 }
 
-/// The fold-based `index_of` from W1's `examples/hello.ply`, verbatim in Rust.
 #[test]
 fn the_scans_agree_with_the_folds_they_replace() {
     fn fold_index_of(hay: &[u8], byte: u8, from: usize) -> i64 {
-        // The fold's shape, kept: it visits every remaining byte even after it has the answer,
-        // which is the cost the builtins removed.
+        // Visits every remaining byte even after it has the answer, as the fold did.
         let mut found: i64 = -1;
         for (i, &b) in hay.iter().enumerate().skip(from) {
             if found < 0 && b == byte {
@@ -707,8 +689,7 @@ fn the_scans_agree_with_the_folds_they_replace() {
             "case {case}: {head:?}"
         );
 
-        // The same question through the bounded scan, whose "absent" is the end of the window
-        // rather than a sentinel.
+        // The bounded scan's "absent" is the end of the window, not a sentinel.
         let stopped = scan(Builtin::BytesScanUntil, &head, 0, &[byte], len).unwrap();
         assert_eq!(
             if stopped == len { -1 } else { stopped },
@@ -716,7 +697,7 @@ fn the_scans_agree_with_the_folds_they_replace() {
             "case {case}: {head:?}"
         );
 
-        // `head_end`, which was the most expensive of the five folds.
+        // `head_end`.
         let found = at(&done(
             Builtin::BytesIndexOf,
             vec![bytes(&head), bytes(b"\r\n\r\n")],
@@ -738,8 +719,6 @@ fn the_scans_agree_with_the_folds_they_replace() {
     }
 }
 
-/// These are byte builtins and index in bytes, which is the whole reason a request target is
-/// `Bytes`: a peer may send what is not UTF-8 at all.
 #[test]
 fn the_byte_searches_index_in_bytes_where_the_string_ones_index_in_characters() {
     let text = "héllo=wörld";
@@ -758,8 +737,7 @@ fn the_byte_searches_index_in_bytes_where_the_string_ones_index_in_characters() 
         "5"
     );
 
-    // A byte search may stop in the middle of a character, and the piece it cuts is refused by
-    // `string_of_bytes` rather than silently replaced.
+    // A byte search may cut a character, and `string_of_bytes` refuses the piece.
     let cut = done(
         Builtin::BytesSlice,
         vec![bytes(text.as_bytes()), Value::Int(0), Value::Int(2)],
@@ -776,8 +754,7 @@ fn the_byte_searches_index_in_bytes_where_the_string_ones_index_in_characters() 
         codes::RUNTIME_ERROR
     );
 
-    // A multi-byte needle is matched whole, so a search never reports a position that splits
-    // one.
+    // A multi-byte needle is matched whole, never split.
     assert_eq!(
         found(
             Builtin::BytesIndexOf,
@@ -847,8 +824,6 @@ fn fold_threads_the_accumulator_leftwards() {
     assert_eq!(out.render(), "123");
 }
 
-/// The property the frames exist for: a suspension point inside `map` can be advanced twice and
-/// each resumption completes its own list.
 #[test]
 fn one_suspension_point_inside_map_can_be_resumed_twice() {
     let mut cells: TaskRegions = TaskRegions::new();
@@ -876,8 +851,6 @@ fn one_suspension_point_inside_map_can_be_resumed_twice() {
     assert_eq!(b.render(), "[9, 1, 1]");
 }
 
-/// `iterate` through the protocol an engine drives, with the step answered by hand: the seed is
-/// threaded, `Stop` ends it, and the value `Stop` carries is the answer rather than the seed.
 #[test]
 fn an_iterate_threads_its_seed_and_answers_what_stop_carries() {
     let stop_at = |n: i64| {
@@ -910,9 +883,7 @@ fn an_iterate_threads_its_seed_and_answers_what_stop_carries() {
     assert_eq!(out.render(), "\"done at 9\"");
 }
 
-/// The reason the loop is a `Frame` and not host recursion: a continuation captured inside the
-/// step can be resumed more than once, and each resumption has to continue **its own** copy of
-/// the countdown.
+/// Each resumption has to continue its own copy of the countdown.
 #[test]
 fn one_suspension_point_inside_iterate_can_be_resumed_twice() {
     let mut cells: TaskRegions = TaskRegions::new();
@@ -966,8 +937,7 @@ fn one_suspension_point_inside_iterate_can_be_resumed_twice() {
         "the second resumption inherited a spent budget"
     );
 
-    // And the budget above is exactly tight, which is what makes the pair above non-vacuous:
-    // one leg spends all four rounds, so two legs sharing a countdown could not both finish.
+    // The budget is exactly tight, so two legs sharing a countdown could not both finish.
     let mut cells: TaskRegions = TaskRegions::new();
     let tight = call(
         Builtin::Iterate,
@@ -987,8 +957,6 @@ fn one_suspension_point_inside_iterate_can_be_resumed_twice() {
     assert!(d.message.contains("budget of 3 steps"), "{}", d.message);
 }
 
-/// The budget is spent per round and exhausting it is a diagnostic, because `Stop` is the only
-/// source of an answer and there is none to give.
 #[test]
 fn an_iterate_that_never_stops_exhausts_its_budget_and_says_so() {
     let d = drive(
@@ -1026,9 +994,7 @@ fn an_iterate_budget_below_one_is_refused_before_the_loop_starts() {
     }
 }
 
-/// Inference admits only `Iter<s, r>` in this position, so anything else arriving here came
-/// from a host handler or a `Value` built in Rust — and treating it as a silent stop would
-/// answer a value nobody asked for.
+/// Inference admits only `Iter` here, so this comes from a host handler or a `Value` built in Rust.
 #[test]
 fn an_iterate_step_answering_neither_continue_nor_stop_is_a_runtime_error() {
     let d = drive(
@@ -1088,8 +1054,7 @@ fn cell_builtins_read_and_write_the_arena_they_are_given() {
     assert_eq!(v.render(), "2");
 }
 
-/// The generation is what makes this a report rather than a read of the cell now living at that
-/// position: the stale slot and the live one share an index and differ in generation.
+/// The stale slot and the live one share an index and differ only in generation.
 #[test]
 fn a_cell_from_another_region_stack_is_named_rather_than_silently_read() {
     let mut other = TaskRegions::new();
@@ -1144,7 +1109,6 @@ fn every_builtin_is_reachable_by_the_name_it_reports() {
     }
 }
 
-/// **The test this repository went its whole history without.**
 #[test]
 fn every_builtin_agrees_on_its_arity_everywhere() {
     for b in Builtin::all() {
@@ -1158,8 +1122,7 @@ fn every_builtin_agrees_on_its_arity_everywhere() {
             b.name()
         );
 
-        // A builtin the prelude does not type cannot be called at all, so the two tables have
-        // to cover the same set.
+        // A builtin the prelude does not type cannot be called, so the tables cover the same set.
         let typed = ply_core::prelude_arity(b.name()).unwrap_or_else(|| {
             panic!(
                 "`{}` is a builtin with no scheme in the prelude: no program can call it",
@@ -1190,8 +1153,6 @@ fn every_builtin_agrees_on_its_arity_everywhere() {
     }
 }
 
-/// What [`Builtin::all`] lists, pinned — because until this was written, **nothing checked that
-/// it was complete**.
 #[test]
 fn builtin_all_is_complete_and_lists_each_name_once() {
     let mut names: Vec<&str> = Builtin::all().iter().map(|b| b.name()).collect();
@@ -1307,9 +1268,6 @@ fn builtin_all_is_complete_and_lists_each_name_once() {
     );
 }
 
-/// `list_set` answers the list with one element replaced and leaves the list it was given as it
-/// was, whether the write lands in the tail or below it in the trie; an index the list does not
-/// hold raises where `list_at` would answer `None`.
 #[test]
 fn list_set_replaces_one_element_keeps_the_original_and_raises_outside_the_list() {
     let xs = ints(&[10, 20, 30]);
@@ -1348,8 +1306,6 @@ fn list_set_replaces_one_element_keeps_the_original_and_raises_outside_the_list(
     }
 }
 
-/// The low word rotated: bits leaving the right come back on the left of a thirty-two-bit
-/// word, whatever the `Int` above that word held and whatever the count's sign.
 #[test]
 fn rotr32_turns_the_low_word_and_answers_it_non_negative() {
     let cases: &[(i64, i64, i64)] = &[
@@ -1371,10 +1327,7 @@ fn rotr32_turns_the_low_word_and_answers_it_non_negative() {
     }
 }
 
-/// The three that answer where `+`, `-` and `*` raise, at the boundaries
-/// that are the only reason they exist. A value below 2^32 needs none of
-/// them — the shift semantics says so — so every case here is at or across the
-/// 64-bit edge.
+/// Every case is at or across the 64-bit edge, the only place these differ from `+`, `-`, `*`.
 #[test]
 fn the_wrapping_builtins_are_modulo_two_to_the_sixty_fourth() {
     let cases: &[(Builtin, i64, i64, i64)] = &[
@@ -1400,9 +1353,7 @@ fn the_wrapping_builtins_are_modulo_two_to_the_sixty_fourth() {
     }
 }
 
-/// None of the three can fail, so the only diagnostic any of them produces
-/// is about an argument that is not an `Int` — which the checker refused
-/// before it got here, leaving this as the shape an unchecked body meets.
+/// The checker refuses a non-`Int` first; this is what an unchecked body meets.
 #[test]
 fn a_wrapping_builtin_refuses_a_non_int_and_nothing_else() {
     let d = done(Builtin::WrapAdd, vec![Value::Int(1), Value::str("2")])
@@ -1420,9 +1371,7 @@ fn state() -> Item {
     effect_def("state", &[("get", Mode::Read, false)])
 }
 
-/// The suspension points are where a builtin is most likely to be handed a stale arena, so the
-/// handler both writes a cell and decides the answer from it: a builtin that carried its own
-/// copy would keep the count at 1 and keep the wrong elements.
+/// A builtin that carried its own arena copy would keep the count at 1 and the wrong elements.
 #[test]
 fn a_predicate_that_performs_sees_every_write_the_handler_made_before_it() {
     let bump = block(

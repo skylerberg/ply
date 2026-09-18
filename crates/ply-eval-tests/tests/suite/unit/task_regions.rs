@@ -34,8 +34,6 @@ fn a_reset_discards_what_the_entry_point_allocated() {
     assert_eq!(regions.live(), 0);
 }
 
-/// The fork's guarantee, kept: a fixture cell is back at its seeded value at every entry point,
-/// and the slot the caller is holding still resolves.
 #[test]
 fn a_reset_puts_the_fixture_back_and_keeps_its_slots_valid() {
     let fixture = Fixture::build(|r| {
@@ -61,7 +59,6 @@ fn a_reset_puts_the_fixture_back_and_keeps_its_slots_valid() {
     assert_eq!(regions.live(), 2, "and so is what it allocated");
 }
 
-/// Two opens of one fixture are two stacks.
 #[test]
 fn two_stacks_opened_from_one_fixture_cannot_observe_each_other() {
     let fixture = Fixture::build(|r| Value::Cell(r.alloc_cell(Value::Int(0))));
@@ -91,7 +88,6 @@ fn sealing_makes_the_current_extent_the_thing_a_reset_goes_back_to() {
     assert_eq!(regions.base_len(), 1);
 }
 
-/// A region abandoned by a handler that discarded its continuation leaves a scope open.
 #[test]
 fn a_reset_closes_a_region_the_last_entry_point_abandoned() {
     let mut regions: TaskRegions = TaskRegions::new();
@@ -109,8 +105,6 @@ fn a_reset_closes_a_region_the_last_entry_point_abandoned() {
     assert_eq!(regions.live(), 0);
 }
 
-/// The escape case at the allocator: a continuation captured inside a `shared` region
-/// and resumed after its lexical close still reads the cell.
 #[test]
 fn a_shared_regions_close_keeps_the_slots_a_live_continuation_can_reach() {
     let mut regions: TaskRegions = TaskRegions::new();
@@ -127,8 +121,6 @@ fn a_shared_regions_close_keeps_the_slots_a_live_continuation_can_reach() {
     drop(pin);
 }
 
-/// The other half, and the one a region that never closed was not doing: when the last
-/// continuation that could reach the region has died, its close reclaims.
 #[test]
 fn a_shared_region_no_continuation_outlives_still_reclaims_at_its_close() {
     let mut regions: TaskRegions = TaskRegions::new();
@@ -156,9 +148,7 @@ fn a_unique_region_hands_its_slots_back_at_its_close() {
     assert_eq!(regions.live(), 1);
 }
 
-/// A pin taken where no program region is open would be an `Rc` allocation on the path of every
-/// `perform` in every program that never wrote `with_cell`, and there is nothing for it to
-/// defer.
+/// Otherwise every `perform` in a program without `with_cell` would pay an `Rc` allocation for nothing.
 #[test]
 fn no_pin_is_taken_outside_every_program_region() {
     let mut regions: TaskRegions = TaskRegions::new();

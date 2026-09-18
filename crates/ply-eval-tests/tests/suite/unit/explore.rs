@@ -9,7 +9,7 @@ use ply_ty::Mode;
 use ply_ty::{EffectAtom, Resource};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// A model scheduler: enough of the scheduler on the control stack to exercise the search, and none of the machine.
+/// Enough of a scheduler to exercise the search, and none of the machine.
 #[derive(Clone, Debug)]
 enum Op {
     /// Read a cell into this task's register.
@@ -19,8 +19,7 @@ enum Op {
     /// `db.<mode>[resource]`.
     Perform(&'static str, Mode),
     Spawn(&'static str, Vec<Op>),
-    /// Join this task's `n`th child, by spawn order rather than by id, so a program means the
-    /// same thing under every interleaving.
+    /// This task's `n`th child by spawn order, so a program means the same under every interleaving.
     Join(usize),
     Yield,
 }
@@ -33,8 +32,7 @@ struct ModelTask {
     register: i64,
     children: Vec<usize>,
     blocked: Option<usize>,
-    /// The same vector clock the real scheduler keeps, so the search's happens-before filter is
-    /// exercised here rather than only against the machine.
+    /// The real scheduler's vector clock, so the happens-before filter is exercised here too.
     clock: Stamp,
 }
 
@@ -188,8 +186,7 @@ impl Simulation for Model {
                 }
                 Op::Yield => {}
             }
-            // A task blocked on a join observes everything its target did, the moment the
-            // target finishes.
+            // A task blocked on a join observes everything its target did once the target finishes.
             for i in 0..tasks.len() {
                 if let Some(on) = tasks[i].blocked
                     && Model::finished(&tasks, on)
@@ -264,7 +261,6 @@ fn both_orders(model: &Model, a: TaskId, b: TaskId) -> bool {
         && model.traces.iter().filter_map(order).any(|x| !x)
 }
 
-/// The headline.
 #[test]
 fn tasks_that_never_conflict_explore_exactly_one_interleaving() {
     let mut model = Model::new(vec![
@@ -282,8 +278,6 @@ fn tasks_that_never_conflict_explore_exactly_one_interleaving() {
     assert!(explored.passed());
 }
 
-/// ...and the same program under an unpruned search runs seventy-one, which is the measurement
-/// the whole claim rests on.
 #[test]
 fn the_naive_count_for_the_same_program_is_larger() {
     let mut model = Model::new(vec![
@@ -306,8 +300,6 @@ fn the_naive_count_for_the_same_program_is_larger() {
     assert_eq!(explored.exploration.reduction(), Some(71.0));
 }
 
-/// Two tasks that *do* share a cell: the search runs nine interleavings against the unpruned
-/// seventy-one.
 #[test]
 fn a_shared_cell_costs_interleavings_and_still_reduces() {
     let program = || {
@@ -328,7 +320,6 @@ fn a_shared_cell_costs_interleavings_and_still_reduces() {
     assert_eq!(unpruned.exploration.explored, 71);
 }
 
-/// Small enough to enumerate by hand.
 #[test]
 fn the_naive_count_is_exact_on_a_fixture_that_can_be_counted_by_hand() {
     let mut model = Model::new(vec![
@@ -346,8 +337,6 @@ fn the_naive_count_is_exact_on_a_fixture_that_can_be_counted_by_hand() {
     );
 }
 
-/// A budget the naive search spends is reported as a lower bound and never as an exact number
-/// nobody observed.
 #[test]
 fn a_spent_naive_budget_is_reported_as_a_bound() {
     let mut model = Model::new(vec![
@@ -363,15 +352,13 @@ fn a_spent_naive_budget_is_reported_as_a_bound() {
         ..Plan::default()
     };
     let mut explored = measure_reduction(&plan, &mut model);
-    // The naive budget is the larger of the plan's and NAIVE_BUDGET, so shrink the space
-    // instead of the budget by asserting on the flag.
+    // The naive budget is at least `NAIVE_BUDGET`, so the space shrinks rather than the budget.
     let naive = explored.exploration.naive.take().expect("measured");
     assert!(naive.bounded, "expected a bounded count, got {naive}");
     assert_eq!(naive.explored, NAIVE_BUDGET);
     assert!(naive.to_string().starts_with(">= "));
 }
 
-/// Two writes to one cell.
 #[test]
 fn a_conflicting_pair_is_explored_in_both_orders() {
     let mut model = Model::new(vec![
@@ -393,8 +380,6 @@ fn a_conflicting_pair_is_explored_in_both_orders() {
     );
 }
 
-/// The lost update, as two steps of the model above: the search finds the interleaving in which
-/// both tasks load before either stores, and reports the seed that reproduces it.
 #[test]
 fn a_genuine_race_is_found_and_named() {
     let mut model = Model::new(vec![
@@ -434,7 +419,6 @@ fn a_genuine_race_is_found_and_named() {
     assert_eq!(again.exploration.race, None);
 }
 
-/// The pair conflicts on one resource and not on the other.
 #[test]
 fn footprints_that_conflict_on_one_resource_only() {
     let disjoint = vec![
@@ -471,9 +455,6 @@ fn footprints_that_conflict_on_one_resource_only() {
     assert!(naive.explored > contested.exploration.explored);
 }
 
-/// The property pruning has to preserve, checked directly rather than argued: over each
-/// program, the interleavings the pruned search runs produce **the same set of final worlds**
-/// as the interleavings an unpruned enumeration runs.
 #[test]
 fn pruning_preserves_every_outcome_the_unpruned_search_observes() {
     let programs: Vec<(&str, Vec<Op>)> = vec![
@@ -576,8 +557,7 @@ fn a_read_read_pair_is_one_interleaving_and_a_read_write_pair_is_both_orders() {
     assert!(both_orders(&writer, TaskId(1), TaskId(2)));
 }
 
-/// The relation is at cell granularity, so two cells that would share one `[r]` label are two
-/// locations and do not contend.
+/// The relation is at cell granularity, not label granularity.
 #[test]
 fn two_cells_under_one_label_do_not_contend() {
     let mut model = Model::new(vec![
@@ -589,9 +569,7 @@ fn two_cells_under_one_label_do_not_contend() {
     assert_eq!(explore(&dpor(64), &mut model).exploration.explored, 1);
 }
 
-/// Tasks that appear part way through a run: the enabled set grows, so a choice index at one
-/// scheduling point means something different from the same index at another, and a backtrack
-/// point is only meaningful against the enabled set that was recorded with it.
+/// The enabled set grows, so a backtrack point means something only against the set recorded with it.
 #[test]
 fn nested_spawns_are_explored() {
     let mut model = Model::new(vec![
@@ -614,8 +592,7 @@ fn nested_spawns_are_explored() {
         "the grandchild races the sibling and the search must reach it"
     );
     assert!(explored.exploration.race.is_some());
-    // @3 is the grandchild: spawned by @1, so it exists in no enabled set until @1 has run
-    // twice.
+    // @3 is the grandchild, in no enabled set until @1 has run twice.
     let race = explored.exploration.race.expect("a race");
     assert!(
         [race.left.task, race.right.task].contains(&TaskId(3)),
@@ -623,9 +600,6 @@ fn nested_spawns_are_explored() {
     );
 }
 
-/// A passing nested program is still enumerated to a frontier rather than sampled:
-/// exhaustiveness is the headline, and it must survive tasks that did not exist when the search
-/// started.
 #[test]
 fn a_nested_spawn_that_conflicts_with_nothing_is_one_interleaving() {
     let mut model = Model::new(vec![
@@ -677,8 +651,6 @@ fn a_race_with_a_task_that_was_blocked_at_the_backtrack_point_is_still_found() {
     }
 }
 
-/// The same case, as a unit of the rule rather than of the search: when the racing task is not
-/// enabled at the backtrack point, the alternatives that could unblock it are queued.
 #[test]
 fn the_backtrack_rule_queues_alternatives_when_the_racer_is_not_enabled() {
     let cell = |id: u32, mode: Mode| {
@@ -697,8 +669,7 @@ fn the_backtrack_rule_queues_alternatives_when_the_racer_is_not_enabled() {
         span: Span::DUMMY,
         stamp: Stamp::new(),
     };
-    // @2 is blocked at point 0 and writes the same cell at point 2; only @1 running at point 0
-    // can ever unblock it.
+    // @2 is blocked at point 0 and writes the same cell at point 2; only @1 at point 0 unblocks it.
     let blocked = vec![
         step(0, &[0, 1], 0, cell(1, Mode::Write)),
         step(1, &[0, 1], 1, StepFootprint::new()),
@@ -717,8 +688,7 @@ fn the_backtrack_rule_queues_alternatives_when_the_racer_is_not_enabled() {
         "@2 could not have run at point 0, so scheduling it there is not a schedule"
     );
 
-    // Where the racer *is* enabled, the pair is named exactly, and that is the pair the failure
-    // artifact prints.
+    // Where the racer is enabled, the pair is named exactly, as the failure artifact prints it.
     let enabled = vec![
         step(0, &[0, 1], 0, cell(1, Mode::Write)),
         step(1, &[0, 1], 1, cell(1, Mode::Write)),
@@ -730,8 +700,6 @@ fn the_backtrack_rule_queues_alternatives_when_the_racer_is_not_enabled() {
     );
 }
 
-/// The shape of nearly every concurrent test there is: spawn, join, then assert on what the
-/// children wrote.
 #[test]
 fn asserting_on_what_a_joined_task_wrote_costs_no_interleavings() {
     let program = || {
@@ -756,8 +724,7 @@ fn asserting_on_what_a_joined_task_wrote_costs_no_interleavings() {
     );
     assert!(explored.exploration.exhaustive);
 
-    // The same program with the recording's clocks withheld, which is what this search did
-    // before it read them.
+    // The same program with the recording's clocks withheld.
     struct Blind(Model);
     impl Simulation for Blind {
         fn run(&mut self, seed: &Seed) -> Interleaving {
@@ -775,7 +742,6 @@ fn asserting_on_what_a_joined_task_wrote_costs_no_interleavings() {
     assert_eq!(unsynchronized.exploration.explored, 6);
 }
 
-/// A stamp orders two steps only when the later task really had observed the earlier one.
 #[test]
 fn an_absent_clock_orders_nothing_and_a_present_one_orders_what_it_saw() {
     assert!(!happens_before(&Stamp::new(), TaskId(0), &vec![3, 1]));
@@ -808,9 +774,6 @@ fn a_joined_task_is_never_scheduled_before_its_target() {
     );
 }
 
-/// Budgets bound the search, and a search that did not empty its frontier says so — an
-/// exhausted run proved nothing about the interleavings it did not reach, and
-/// `Exploration::is_cacheable` is what acts on that.
 #[test]
 fn a_spent_budget_is_exhausted_and_not_exhaustive() {
     let mut model = Model::new(vec![
@@ -828,8 +791,6 @@ fn a_spent_budget_is_exhausted_and_not_exhaustive() {
     assert!(!explored.exploration.is_cacheable());
 }
 
-/// The search is itself a function of the seed: two runs of one plan visit the same
-/// interleavings in the same order.
 #[test]
 fn the_search_is_deterministic() {
     let program = || {
@@ -850,7 +811,6 @@ fn the_search_is_deterministic() {
     assert_eq!(first.runs, second.runs);
 }
 
-/// Every interleaving the search runs is a distinct seed.
 #[test]
 fn no_interleaving_is_run_twice() {
     let mut model = Model::new(vec![
@@ -867,8 +827,6 @@ fn no_interleaving_is_run_twice() {
     assert_eq!(explored.seeds.len(), explored.exploration.explored as usize);
 }
 
-/// A scheduler whose replay does not reproduce the recorded enabled set is Ply's fault, and it
-/// is caught rather than silently searched over.
 #[test]
 fn a_replay_that_does_not_reproduce_the_enabled_set_is_a_divergence() {
     let mut calls = 0u32;
@@ -877,8 +835,7 @@ fn a_replay_that_does_not_reproduce_the_enabled_set_is_a_divergence() {
         let enabled = if seed.is_root() {
             vec![TaskId(0), TaskId(1)]
         } else {
-            // The replay offers a different enabled set at the point the seed names, which
-            // makes the choice mean something else.
+            // A different enabled set at the point the seed names, so the choice means something else.
             vec![TaskId(0), TaskId(1), TaskId(2)]
         };
         let write = |resource| {
@@ -913,8 +870,6 @@ fn a_replay_that_does_not_reproduce_the_enabled_set_is_a_divergence() {
     assert!(explored.exploration.failure.is_some());
 }
 
-/// A recording that does not describe a schedule is Ply's fault too, and it is refused before
-/// the search draws conclusions from it.
 #[test]
 fn a_step_that_its_enabled_set_does_not_offer_is_an_internal_error() {
     let mut driver = |_: &Seed| {
@@ -936,8 +891,6 @@ fn a_step_that_its_enabled_set_does_not_offer_is_an_internal_error() {
     );
 }
 
-/// `once` is the replay path: exactly the interleaving the seed names, no search, and no claim
-/// of exhaustiveness from a sample of one.
 #[test]
 fn once_runs_exactly_the_interleaving_its_seed_names() {
     let mut model = Model::new(vec![
@@ -955,7 +908,6 @@ fn once_runs_exactly_the_interleaving_its_seed_names() {
     assert!(explored.exploration.is_cacheable());
 }
 
-/// `random` is one interleaving per root and no state between them.
 #[test]
 fn random_runs_one_interleaving_per_root() {
     let mut model = Model::new(vec![
@@ -968,17 +920,13 @@ fn random_runs_one_interleaving_per_root() {
     let explored = explore(&Plan::random(16), &mut model);
     assert!(explored.exploration.explored <= 16);
     assert!(!explored.exploration.exhaustive);
-    // A sample that happens to find the race reports no race pair, because nothing flipped:
-    // there was no earlier passing interleaving to flip.
+    // A sampled race reports no race pair: there was no earlier passing interleaving to flip.
     assert_eq!(explored.exploration.race, None);
 }
 
-/// A pruned search that passes where the unpruned one fails means the relation missed an
-/// access.
 #[test]
 fn a_failure_only_the_unpruned_search_reaches_is_reported() {
-    // A driver that lies: every step reports an empty footprint, so the exact relation prunes
-    // everything, while the program's outcome really does depend on the order.
+    // Every step reports an empty footprint, so the relation prunes everything though order matters.
     struct Liar(Model);
     impl Simulation for Liar {
         fn run(&mut self, seed: &Seed) -> Interleaving {
@@ -1022,8 +970,6 @@ fn a_failure_only_the_unpruned_search_reaches_is_reported() {
     );
 }
 
-/// A rule about how a type is *used* is a rule nobody enforces; a rule about which types may be
-/// *named* is greppable.
 #[test]
 fn this_module_names_no_hash_based_collection_and_reads_no_clock() {
     let body = include_str!("../../../../ply-eval/src/explore.rs");

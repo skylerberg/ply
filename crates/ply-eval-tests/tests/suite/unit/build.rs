@@ -1,5 +1,3 @@
-//! AST constructors for the tests.
-
 use ply_span::{SourceId, Span};
 use ply_syntax::ast::*;
 use ply_syntax::resolve::{Resolved, resolve};
@@ -104,8 +102,6 @@ pub fn param(name: &str) -> Param {
     }
 }
 
-/// `name: ty`. A `fn` parameter has to be written now, so every parameter of a
-/// definition that will be checked comes through here.
 pub fn param_ty(name: &str, ty: TypeExpr) -> Param {
     Param {
         ty: Some(ty),
@@ -337,8 +333,6 @@ pub fn with_cell(resource: &str, init: Expr, binder: &str, body: Expr) -> Expr {
     })
 }
 
-/// A nullary type constructor: `Int`, `Bool`, `Bytes`, `Unit`, `String`,
-/// `Float`.
 pub fn tcon(name: &str) -> TypeExpr {
     TypeExpr::Con {
         name: qname(name),
@@ -347,10 +341,7 @@ pub fn tcon(name: &str) -> TypeExpr {
     }
 }
 
-/// A definition with **no** written signature, which the checker now rejects
-/// with E0126 MISSING_SIGNATURE. For hashing and evaluation fixtures only —
-/// neither reads a written type, and neither runs the checker. A fixture that
-/// will be checked wants [`fn_def_sig`].
+/// No written signature, so the checker rejects it: hashing and evaluation fixtures only.
 pub fn fn_def(name: &str, params: &[&str], body: Expr) -> Item {
     Item::Fn(Box::new(FnDef {
         vis: Visibility::Private,
@@ -368,9 +359,7 @@ pub fn fn_def(name: &str, params: &[&str], body: Expr) -> Item {
     }))
 }
 
-/// [`fn_def`] with the signature written: every parameter typed and a return
-/// type, which is what a definition needs to clear E0126. The effect row stays
-/// absent, because rows are still inferred.
+/// [`fn_def`] with every parameter and the return typed; the effect row stays inferred.
 pub fn fn_def_sig(name: &str, params: &[(&str, TypeExpr)], ret: TypeExpr, body: Expr) -> Item {
     Item::Fn(Box::new(FnDef {
         vis: Visibility::Private,
@@ -439,8 +428,7 @@ pub fn effect_def(name: &str, ops: &[(&str, Mode, bool)]) -> Item {
     }))
 }
 
-/// One anonymous module standing alone: bare names stay bare, so a hand-built AST reads exactly as
-/// it did before modules existed.
+/// One anonymous module, so bare names stay bare.
 pub fn module(items: Vec<Item>) -> Module {
     Module {
         name: ModuleName::anonymous(),

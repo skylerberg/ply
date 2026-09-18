@@ -1,5 +1,3 @@
-//! What a **hostile** host handler can do, and what — if anything — notices.
-
 use crate::fixture::Compiled;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
@@ -51,8 +49,7 @@ fn diagnostic(outcome: Result<(), Diagnostic>) -> Diagnostic {
     outcome.expect_err("the program was expected to fail")
 }
 
-/// A handler registered against a **read** operation on one resource, which mutates state of its
-/// own on every call and answers the new value.
+/// Registered against a read, but mutates its own state on every call and answers the new value.
 #[derive(Default)]
 struct Mutates {
     writes: AtomicU64,
@@ -65,7 +62,6 @@ impl HostHandler for Mutates {
     }
 }
 
-/// One `read` operation over one resource, and a program that only ever reads.
 const READS: &str = r#"
 nondet effect db {
   read get[r](key: Int) -> Int
@@ -78,7 +74,6 @@ test/nondet "first" { assert_eq(lookup(1), 1) }
 test/nondet "second" { assert_eq(lookup(1), 2) }
 "#;
 
-/// **The headline.**
 #[test]
 fn documents_a_read_declared_handler_that_writes_is_recorded_as_a_read() {
     let compiled = Compiled::named("t", READS);
@@ -105,8 +100,6 @@ fn documents_a_read_declared_handler_that_writes_is_recorded_as_a_read() {
     );
 }
 
-/// The same fact stated where it is dangerous: two entry points, one machine, and a handler whose
-/// Rust-side state carries between them.
 #[test]
 fn documents_a_lying_handler_couples_two_entry_points_that_share_nothing() {
     let compiled = Compiled::named("t", READS);
@@ -119,8 +112,7 @@ fn documents_a_lying_handler_couples_two_entry_points_that_share_nothing() {
         .expect("the second test is green *because* it saw the first one's write");
 
     assert_eq!(handler.writes.load(Ordering::SeqCst), 2);
-    // And the machine's own reset is honest about everything it owns: the per-entry-point counters
-    // really did restart.
+    // The machine's own per-entry-point counters did restart.
     assert_eq!(machine.host_ops(), 0, "`get` is registered `Repeatable`");
     assert_eq!(
         machine.host_use().expect("reached the host").operations,
@@ -129,7 +121,6 @@ fn documents_a_lying_handler_couples_two_entry_points_that_share_nothing() {
     );
 }
 
-/// The narrow-resource lie, which is the same hole one level down.
 #[test]
 fn documents_a_narrow_registration_may_touch_a_resource_it_never_named() {
     /// Answers from a counter that another registration also owns.
@@ -196,8 +187,7 @@ test/nondet "writes orders" { assert_eq(writers(), 2) }
     assert_eq!(cell.load(Ordering::SeqCst), 2);
 }
 
-/// `blocking: true` means "the work leaves this thread and a token comes back", and the boundary
-/// now holds a handler to the half of that which is checkable.
+/// `blocking: true` promises a token back, so an inline value breaks the declaration.
 #[test]
 fn a_blocking_handler_that_answers_a_value_inline_is_refused() {
     struct Inline;
@@ -229,22 +219,19 @@ test/nondet "blocking, allegedly" { assert_eq(net.send[socket](1), 1) }
         d.message
     );
 
-    // The same handler, declared honestly, is green: the check is about the declaration disagreeing
-    // with the answer, not about answering a value.
+    // Declared honestly, the same handler passes: the check is the declaration against the answer.
     let mut machine = compiled.bound(vec![(any("net", "send"), Arc::new(Inline))]);
     machine.eval_test(0).expect("green");
 }
 
-/// And the residual, stated so nobody reads `E0428` as more than it is: the machine still calls
-/// **every** handler's `call` on its own thread, `blocking` or not.
+/// E0428 checks the answer only: every handler's `call` still runs on the machine's thread.
 #[test]
 fn a_blocking_handler_is_still_entered_on_the_machines_thread() {
     struct Reports(AtomicU64);
 
     impl HostHandler for Reports {
         fn call(&self, _: &dyn HostRuntime, _: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
-            // A `ThreadId` is opaque, so identity is established by hashing it into a `u64` the
-            // test can compare against its own.
+            // `ThreadId` is opaque, so identity is compared through its hash.
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             std::hash::Hash::hash(&std::thread::current().id(), &mut hasher);
             self.0
@@ -256,8 +243,7 @@ fn a_blocking_handler_is_still_entered_on_the_machines_thread() {
         }
     }
 
-    /// Resolves whatever it is handed, which is what a dispatched job that has already finished
-    /// looks like.
+    /// Resolves whatever it is handed, as an already-finished dispatched job would.
     struct Resolves;
 
     impl HostRuntime for Resolves {
@@ -300,8 +286,7 @@ test/nondet "blocking, honestly" { assert_eq(net.send[socket](1), 1) }
     );
 }
 
-/// A host answer is not type-checked against the operation it answers, so a handler can inject a
-/// value the program's own types say is impossible.
+/// Host answers are not type-checked, so a handler can inject a value the program's types rule out.
 #[test]
 fn documents_a_wrongly_typed_host_answer_is_a_diagnostic_that_blames_the_program() {
     struct Wrong;
@@ -332,7 +317,6 @@ test/nondet "arithmetic on a host answer" { assert_eq(net.send[socket](1) + 1, 2
     );
 }
 
-/// A fabricated task handle is refused rather than used as an index.
 #[test]
 fn a_fabricated_task_handle_from_a_host_answer_is_refused() {
     struct Fake;
@@ -373,8 +357,6 @@ test/nondet "a handle from nowhere" {
     );
 }
 
-/// The defence that does hold, and the one worth keeping: a cell cannot be written into a host
-/// operation's declared signature at all.
 #[test]
 fn a_cell_cannot_cross_a_host_operations_signature() {
     let cell = Compiled::rejected_in(
@@ -419,7 +401,6 @@ test/nondet "smuggle a closure over a cell" {
     );
 }
 
-/// Every route into the boundary that is not a bare `perform` in a test body.
 #[test]
 fn no_indirection_reaches_the_host_in_a_hermetic_run() {
     const CASES: [(&str, &str); 6] = [
@@ -487,9 +468,7 @@ fn helper(k: Int) -> Int / {{net.write[socket]}} = net.send[socket](k)
     }
 }
 
-/// A `simulate` region is the one route that must be refused even *with* `--host`, and it must be
-/// refused before the handler is called: DPOR re-runs the region once per interleaving, so a socket
-/// inside one sends a packet per schedule explored and then calls the total a proof.
+/// Refused before the handler runs, since DPOR re-runs a region once per interleaving.
 #[test]
 fn a_region_never_reaches_the_host_bound_or_not() {
     let compiled = Compiled::named(
@@ -525,9 +504,7 @@ test/nondet "a socket inside a region" { simulate { assert_eq(helper(1), 1) } }
     }
 }
 
-/// A registration for an effect the program never declares is silently idle when it is `Any` — by
-/// design, so that one registry can be compiled into every program — and the thing worth checking
-/// is that idle really means unreachable.
+/// An idle `Any` registration is by design, so one registry can be compiled into every program.
 #[test]
 fn an_idle_any_registration_contributes_no_atom_and_serves_nothing() {
     let compiled = Compiled::named(
@@ -570,8 +547,6 @@ test/nondet "only net" { assert_eq(net.send[socket](1), 1) }
     assert!(!binding.serves(&atom("t.postgres", "rows", Mode::Read)));
 }
 
-/// The claim a caller states once per entry point is never cleared, and the test runner never
-/// states it at all.
 #[test]
 fn documents_a_declared_footprint_outlives_the_entry_point_that_stated_it() {
     let compiled = Compiled::named("t", READS);
@@ -589,7 +564,6 @@ fn documents_a_declared_footprint_outlives_the_entry_point_that_stated_it() {
     assert_eq!(handler.writes.load(Ordering::SeqCst), 1);
 }
 
-/// A handler may refuse, and it does not get to choose the class its failure is reported under.
 #[test]
 fn a_handler_may_not_choose_the_code_its_failure_is_classified_under() {
     struct Impersonates(&'static str);
@@ -649,15 +623,10 @@ test/nondet "a handler that lies about why" { assert_eq(net.send[socket](1), 1) 
             "nothing names the handler the failure came from: {:?}",
             d.notes
         );
-        // The tier hands a host handler `Span::DUMMY`, so a handler-raised diagnostic carries no
-        // perform-site span to keep — the span-propagation claim lives with the deleted
-        // `a_span_from_the_perform_reaches_the_handler`, not here.
+        // No span assertion: the tier hands a host handler `Span::DUMMY`.
     }
 }
 
-/// And an ordinary refusal is left alone except for the attribution, which every host failure gets:
-/// a reader must never have to guess whether a diagnostic came from the evaluator or from a member
-/// of the trusted computing base.
 #[test]
 fn an_unreserved_code_from_a_handler_is_kept_and_attributed() {
     struct Refuses;
@@ -703,7 +672,6 @@ test/nondet "a handler that refuses honestly" { assert_eq(net.send[socket](1), 1
     );
 }
 
-/// The one blocking failure the runtime *can* see, pinned because it is the only one.
 #[test]
 fn a_token_nothing_resolves_is_diagnosed_inside_a_production_region() {
     struct NeverReady;
@@ -725,8 +693,7 @@ fn a_token_nothing_resolves_is_diagnosed_inside_a_production_region() {
         }
     }
 
-    /// A reactor that always wakes and never resolves: the shape a broken host runtime takes, and
-    /// the shape a livelock takes.
+    /// Always wakes and never resolves: a broken host runtime, or a livelock.
     struct NeverResolves;
 
     impl HostRuntime for NeverResolves {

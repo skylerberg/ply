@@ -16,9 +16,7 @@ use std::rc::Rc;
 type Sched = Scheduler<Continuation, Value>;
 type Choice = Turn<Continuation, Value>;
 
-/// A continuation is control, and none of the scheduler's decisions look inside one — so a
-/// captured empty segment is a faithful stand-in for a suspended task and lets the state
-/// machine be tested on its own.
+/// No scheduler decision looks inside a continuation, so an empty one stands in for a suspended task.
 fn suspended() -> Continuation {
     let prompt = Rc::new(Prompt {
         clauses: Rc::new(Vec::new()),
@@ -41,9 +39,7 @@ enum Act {
     Spawn(usize),
     Join(u32),
     Sleep(i64),
-    /// Serve the `rand` stream without ending the step, so that a run with draws and a run
-    /// without have the same step structure and their schedules can be compared point for
-    /// point.
+    /// Serve `rand` without ending the step, so runs with and without draws share a step structure.
     Draw,
     Fail,
 }
@@ -51,8 +47,6 @@ enum Act {
 /// A whole program: script 0 is the region's body and every other script is something spawned.
 type Program = Vec<Vec<Act>>;
 
-/// A scheduler, its clock and the entry point's trail, for the tests that drive the seam by
-/// hand rather than through a program.
 fn solo(root: u64) -> (Sched, Clock, Trail) {
     (
         Scheduler::new(SimId(0), Span::DUMMY),
@@ -61,8 +55,7 @@ fn solo(root: u64) -> (Sched, Clock, Trail) {
     )
 }
 
-/// A `Turn` holds control, which has no `Debug` and wants none, so an expected refusal is
-/// unwrapped here rather than through `expect_err`.
+/// A `Turn` has no `Debug`, so an expected refusal is unwrapped here rather than by `expect_err`.
 fn refused(turn: Result<Choice, Diagnostic>, why: &str) -> Diagnostic {
     match turn {
         Ok(_) => panic!("the scheduler handed out a task: {why}"),
@@ -72,15 +65,13 @@ fn refused(turn: Result<Choice, Diagnostic>, why: &str) -> Diagnostic {
 
 #[derive(Debug)]
 struct Run {
-    /// `(task, mark)` in the order the marks were reached — the observable that distinguishes
-    /// one interleaving from another.
+    /// `(task, mark)` in the order reached: the observable that tells interleavings apart.
     marks: Vec<(u32, &'static str)>,
     /// Virtual time at the end.
     clock: i64,
     choices: Vec<u16>,
     steps: Vec<(u32, Vec<u32>, u16)>,
-    /// `(task, stamp)` per step, which is what the search reads to decide whether two steps
-    /// could have run in the other order.
+    /// `(task, stamp)` per step, which the search reads to decide whether two steps could reorder.
     stamps: Vec<(TaskId, Stamp)>,
 }
 
@@ -88,9 +79,7 @@ fn run(program: &Program, seed: Seed) -> Result<Run, Diagnostic> {
     run_with(program, seed, DEFAULT_STEPS)
 }
 
-/// Drives the scheduler exactly as the machine's seeded prompt will: a perform ends a step,
-/// `clock` and `random` are answered by [`Handlers`], and what the handler answers decides
-/// whether the task stays enabled.
+/// Drives the scheduler as the machine's seeded prompt does: a perform ends a step.
 fn run_with(program: &Program, seed: Seed, budget: u32) -> Result<Run, Diagnostic> {
     let root = seed.root;
     let mut trail = Trail::new(seed);
@@ -250,8 +239,6 @@ fn different_seeds_produce_different_interleavings() {
     );
 }
 
-/// Whatever the interleaving, every task runs to completion and the marks of one task keep
-/// their own order.
 #[test]
 fn every_interleaving_runs_every_task_in_its_own_order() {
     let program = two_workers();
@@ -270,8 +257,7 @@ fn every_interleaving_runs_every_task_in_its_own_order() {
     }
 }
 
-/// The realized choice sequence — not the seed's path, which runs out — is what names an
-/// interleaving to replay.
+/// The realized choice sequence, not the seed's path (which runs out), names the interleaving.
 #[test]
 fn the_realized_choice_sequence_replays_the_run_it_came_from() {
     let program = two_workers();
@@ -281,8 +267,6 @@ fn the_realized_choice_sequence_replays_the_run_it_came_from() {
     assert_eq!(pinned.choices, free.choices);
 }
 
-/// A prefix pins its own steps and the stream decides the rest, which is what makes a backtrack
-/// point a seed rather than a whole schedule.
 #[test]
 fn a_path_prefix_pins_only_the_steps_it_names() {
     let program = two_workers();
@@ -292,8 +276,6 @@ fn a_path_prefix_pins_only_the_steps_it_names() {
     assert_eq!(&branched.choices[..3], &prefix[..]);
 }
 
-/// Ply's fault, not the program's: a path that does not index the enabled set means the run was
-/// not a function of the seed.
 #[test]
 fn a_choice_that_does_not_index_the_enabled_set_is_a_divergence() {
     let program = two_workers();
@@ -337,8 +319,6 @@ fn a_task_may_spawn_tasks_of_its_own() {
     }
 }
 
-/// Structured concurrency: the region does not deliver its value until every task it spawned
-/// has finished, joined or not.
 #[test]
 fn a_task_nobody_joins_still_runs_to_completion() {
     let program: Program = vec![
@@ -354,8 +334,6 @@ fn a_task_nobody_joins_still_runs_to_completion() {
     }
 }
 
-/// The two edges a simulated region has, as the search sees them: a child's steps happen before
-/// everything its parent does after the join, and nothing orders two siblings.
 #[test]
 fn a_join_orders_the_child_before_the_parent_and_siblings_against_nobody() {
     let program: Program = vec![
@@ -393,8 +371,6 @@ fn a_join_orders_the_child_before_the_parent_and_siblings_against_nobody() {
     }
 }
 
-/// The second join answers immediately from the recorded value: a task that has finished is
-/// joinable for as long as its region lasts.
 #[test]
 fn joining_a_task_that_already_finished_does_not_block() {
     let program: Program = vec![
@@ -412,8 +388,6 @@ fn joining_a_task_that_already_finished_does_not_block() {
     }
 }
 
-/// A hang is never an answer: every task blocked with none runnable is a diagnostic naming the
-/// tasks and what each waits on.
 #[test]
 fn a_join_cycle_is_a_deadlock_naming_both_tasks() {
     let program: Program = vec![vec![Act::Spawn(1), Act::Join(1)], vec![Act::Join(0)]];
@@ -451,8 +425,7 @@ fn a_task_that_joins_itself_deadlocks_rather_than_hanging() {
     );
 }
 
-/// A livelock is the same class of problem as a deadlock from the program's side, so it is the
-/// same code with a different message.
+/// A livelock shares the deadlock's code, with a different message.
 #[test]
 fn a_region_that_never_stops_spends_its_step_budget() {
     let mut forever = vec![Act::Yield; 64];
@@ -485,8 +458,6 @@ fn a_task_failing_stops_the_region_and_names_the_task() {
     assert!(err.notes.iter().any(|n| n.contains("replay with seed 4")));
 }
 
-/// A failed region stays failed: a caller that keeps driving the scheduler cannot turn a
-/// failure into a hang or into a second, different answer.
 #[test]
 fn a_failed_region_answers_with_its_failure_forever() {
     let (mut sched, mut clock, mut trail) = solo(0);
@@ -540,8 +511,6 @@ fn virtual_time_does_not_advance_while_any_task_can_run() {
     }
 }
 
-/// The timer-coalescing race that is nearly impossible to hit on a real clock: two tasks waking
-/// at one instant race, and the race is explored.
 #[test]
 fn tasks_sleeping_to_one_deadline_wake_together_and_their_order_is_explored() {
     let program: Program = vec![
@@ -603,7 +572,6 @@ fn joining_a_task_this_region_never_created_is_a_scope_error() {
     assert!(sched.holds(ROOT));
 }
 
-/// Every step records the set it was chosen from, and the choice indexes it.
 #[test]
 fn every_step_records_the_set_its_choice_indexed() {
     let program = two_workers();
@@ -632,8 +600,6 @@ fn atom(effect: &str, resource: Option<&str>, mode: Mode) -> Access {
     ))
 }
 
-/// The single most expensive mistake available in this milestone is a dependence relation that
-/// is too coarse *or* too fine.
 #[test]
 fn the_schedulers_own_bookkeeping_is_not_an_access_but_a_draw_is() {
     let (mut sched, mut clock, mut trail) = solo(0);
@@ -657,8 +623,6 @@ fn the_schedulers_own_bookkeeping_is_not_an_access_but_a_draw_is() {
     assert_eq!(trail.steps()[0].accesses.len(), 3);
 }
 
-/// Cell accesses are in the relation at cell granularity: two tasks share one world, so a cell
-/// is the main way two of them touch the same state.
 #[test]
 fn two_steps_touching_one_cell_are_dependent() {
     let (mut sched, mut clock, mut trail) = solo(0);
@@ -685,8 +649,6 @@ fn two_steps_touching_one_cell_are_dependent() {
     assert!(!steps[0].accesses.conflicts_with(&StepFootprint::new()));
 }
 
-/// The two domains have their own counters, so a program that draws random numbers gets the
-/// same schedule as one that does not.
 #[test]
 fn drawing_random_numbers_does_not_disturb_the_schedule() {
     let plain = two_workers();
@@ -735,8 +697,6 @@ fn suspending_with_nothing_running_is_refused_rather_than_silently_applied() {
     assert_eq!(err.code, codes::INTERNAL_ERROR);
 }
 
-/// A rule about how a type is *used* is a rule nobody enforces; a rule about which types may be
-/// *named* is greppable.
 #[test]
 fn this_module_names_nothing_a_seeded_run_may_not_depend_on() {
     let body = include_str!("../../../../ply-eval/src/sched.rs");
@@ -767,8 +727,7 @@ use ply_eval::host::{
 };
 use std::sync::Arc;
 
-/// Enough of a program to bind against, and nothing else: what these tests need from a binding
-/// is only that it is *bound*.
+/// Enough of a program to bind against; these tests need only that it is bound.
 fn binding() -> HostBinding {
     let source = "nondet effect db { read get[r](k: Int) -> Int }\n\
                   fn lookup(k: Int) -> Int / {db.read[users]} = db.get[users](k)";
@@ -802,8 +761,7 @@ impl HostHandler for Never {
     }
 }
 
-/// A runtime that owns no token: enough to drive a region whose tasks never wait, and it fails
-/// loudly if one does.
+/// Owns no token, so it fails loudly if a task ever waits.
 struct Idle;
 
 impl HostRuntime for Idle {
@@ -832,8 +790,6 @@ fn production() -> Sched {
     Scheduler::production(SimId(0), Span::DUMMY, permit)
 }
 
-/// `simulate` reaches `Scheduler::new` and nothing else, so a simulated region is seeded by
-/// construction rather than by anyone remembering.
 #[test]
 fn a_simulated_region_is_seeded_by_construction() {
     let (sched, _clock, _trail) = solo(0);
@@ -848,9 +804,6 @@ fn a_hermetic_binding_mints_no_permit() {
     assert!(HostPolicy::of(&binding()).is_some());
 }
 
-/// The lock that does not depend on the permit being unforgeable: whichever scheduler a caller
-/// is holding, driving it through the other loop is a diagnostic rather than a different
-/// answer.
 #[test]
 fn each_entry_point_refuses_the_other_policys_region() {
     let (mut seeded, mut clock, mut trail) = solo(0);
@@ -870,9 +823,7 @@ fn each_entry_point_refuses_the_other_policys_region() {
     assert!(err.message.contains("host region"), "{}", err.message);
 }
 
-/// A seeded region that parked on a real token would stop being a function of its seed while
-/// every assertion in it still passed, so the refusal is at the park rather than only at the
-/// binding.
+/// Parking on a real token would break seed-determinism while every assertion still passed.
 #[test]
 fn a_seeded_region_refuses_to_park_a_task_on_a_host_token() {
     let (mut sched, mut clock, mut trail) = solo(0);
@@ -909,7 +860,6 @@ fn a_production_region_refuses_a_virtual_sleep() {
     assert_eq!(err.code, codes::INTERNAL_ERROR);
 }
 
-/// Round-robin, so a task that yields in a loop cannot hold the region.
 #[test]
 fn the_production_scheduler_starves_nobody() {
     let mut sched = production();
@@ -932,16 +882,13 @@ fn the_production_scheduler_starves_nobody() {
     assert_eq!(order, vec![1, 2, 0, 1, 2, 0, 1, 2, 0]);
 }
 
-/// A lazily-opened region's root is the computation that opened it, so it starts *running*: the
-/// `task.*` that opened the region has not been answered yet, and only the ordinary
-/// spawn/join/suspend path can answer it.
+/// The `task.*` that opened the region is still unanswered, so the root starts running.
 #[test]
 fn a_lazily_opened_region_roots_on_the_control_that_opened_it() {
     let mut sched = production().rooted_running().expect("nothing has run yet");
     assert_eq!(sched.current(), Some(ROOT));
 
-    // The opening perform is answered through the same path every later one takes, which is
-    // what stops `spawn` meaning two things.
+    // Answered through the same path every later perform takes, so `spawn` means one thing.
     let child = sched.spawn(Value::Unit, Span::DUMMY, None);
     sched
         .suspend(suspended(), Value::Task(child))
@@ -964,8 +911,6 @@ fn a_lazily_opened_region_roots_on_the_control_that_opened_it() {
     assert_eq!(err.code, codes::INTERNAL_ERROR);
 }
 
-/// A production region writes no step, so it can neither fabricate an exploration nor disturb
-/// one a seeded region of the same entry point made.
 #[test]
 fn a_production_region_records_nothing_in_the_trail() {
     let trail = Trail::new(Seed::root(9));
@@ -1012,8 +957,7 @@ impl HostRuntime for Stopping {
     }
 }
 
-/// Two tasks each waiting for the other: nothing is enabled, nothing is waiting on the host,
-/// and no virtual clock exists to advance.
+/// Two tasks each waiting on the other, with no host wait and no virtual clock.
 fn deadlock(sched: &mut Sched) {
     let other = sched.spawn(Value::Unit, Span::DUMMY, None);
     sched
@@ -1029,8 +973,6 @@ fn deadlock(sched: &mut Sched) {
         .expect("the spawned task is running");
 }
 
-/// An idle service observes a signal and stops, and the deadlock check does not report `E0414`
-/// on the way.
 #[test]
 fn a_stopping_region_with_nothing_outstanding_drains_rather_than_deadlocking() {
     let mut sched = production();
@@ -1043,8 +985,7 @@ fn a_stopping_region_with_nothing_outstanding_drains_rather_than_deadlocking() {
     else {
         panic!("expected the root's step");
     };
-    // The root blocks on a task that will never finish: nothing is enabled and nothing is
-    // waiting on the host, which is `err_host_deadlock`'s exact condition.
+    // Nothing enabled and nothing waiting on the host: `err_host_deadlock`'s exact condition.
     deadlock(&mut sched);
 
     let runtime = Stopping {
@@ -1068,7 +1009,6 @@ fn a_stopping_region_with_nothing_outstanding_drains_rather_than_deadlocking() {
     );
 }
 
-/// A park that woke on a stop resolved no token and is not fruitless.
 #[test]
 fn a_park_that_woke_on_a_stop_is_not_counted_as_fruitless() {
     let mut sched = production();
@@ -1098,8 +1038,7 @@ fn a_park_that_woke_on_a_stop_is_not_counted_as_fruitless() {
     assert!(runtime.parks.get() > FRUITLESS_PARKS);
 }
 
-/// The same region with no stop in progress *is* a deadlock, so the exemption above is not a
-/// hole: what it turns off is the verdict for a run that is stopping and nothing else.
+/// So the stopping exemption is not a hole.
 #[test]
 fn a_region_that_is_not_stopping_still_deadlocks() {
     let mut sched = production();

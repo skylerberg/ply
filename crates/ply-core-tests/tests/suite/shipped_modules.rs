@@ -1,5 +1,3 @@
-//! The shipped modules, checked as one program.
-
 use crate::fixture::expanded_modules;
 use ply_core::CheckOutput;
 use ply_span::Symbol;
@@ -18,7 +16,6 @@ fn every_shipped_module_checks() {
     assert!(out.modules.contains_key(&Symbol::new("std.http")));
 }
 
-/// The claim HTTP framing rests on.
 #[test]
 fn framing_is_pure() {
     let out = shipped();
@@ -44,9 +41,6 @@ fn framing_is_pure() {
     }
 }
 
-/// The serve loop reaches a socket and says so, and says nothing else: an app's own row is threaded
-/// through rather than absorbed, which is what makes an endpoint's footprint visible in `ply check
-/// --types`.
 #[test]
 fn the_serve_loop_publishes_net_and_the_app_s_row() {
     let out = shipped();

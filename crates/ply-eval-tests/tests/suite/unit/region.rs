@@ -1,6 +1,4 @@
-/// The same rule `sim`, `sched` and `explore` are held to, and for the same reason: this module
-/// holds a live region's state, so a hash map named here would put the host's memory layout
-/// into a seeded run's answer just as surely as one named in the scheduler.
+/// A hash map here would put the host's memory layout into a seeded run's answer.
 #[test]
 fn this_module_names_no_hash_based_collection_and_reads_no_clock() {
     let body = include_str!("../../../../ply-eval/src/region.rs");

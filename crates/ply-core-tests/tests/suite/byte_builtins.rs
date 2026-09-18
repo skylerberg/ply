@@ -1,5 +1,3 @@
-//! The byte builtins' type surface, at the source level.
-
 use crate::fixture::compile;
 use ply_core::{CheckOutput, print_type};
 use ply_span::Symbol;
@@ -23,8 +21,7 @@ fn footprint(out: &CheckOutput, name: &str) -> String {
 
 #[test]
 fn the_byte_builtins_have_the_types_the_contract_states() {
-    // The middle column is the probe's generic list: only `bytes_position`'s
-    // type names a row variable, so only it binds one.
+    // The middle column is the probe's generic list: only `bytes_position` binds a row variable.
     let expected = [
         ("bytes_index_of", "", "(Bytes, Bytes) -> Option<Int>"),
         (
@@ -50,10 +47,6 @@ fn the_byte_builtins_have_the_types_the_contract_states() {
         .collect();
     let out = ok(&source);
     for (name, _, ty) in expected {
-        // The probe now *writes* the contract's type rather than reading the
-        // builtin's off inference (`MISSING_SIGNATURE`), which makes this
-        // strictly stronger: the builtin has to unify with the type the
-        // contract names, not merely print the same way it does.
         assert_eq!(
             sig(&out, &format!("probe_{name}")),
             format!("() -> {ty}"),
@@ -62,9 +55,6 @@ fn the_byte_builtins_have_the_types_the_contract_states() {
     }
 }
 
-/// Eight of the nine perform nothing, so a parser written with them has an empty row — which is
-/// what lets `examples/hello.ply` keep its head parser out of the trusted computing base and still
-/// publish `{}`.
 #[test]
 fn every_builtin_but_position_is_pure() {
     let out = ok(r#"
@@ -87,7 +77,6 @@ fn parse(head: Bytes) -> Int =
     assert_eq!(footprint(&out, "parse"), "{}");
 }
 
-/// `bytes_position` calls user code, so its row is the predicate's.
 #[test]
 fn position_threads_its_predicates_row_and_nothing_more() {
     let out = ok(r#"
@@ -109,8 +98,6 @@ fn first_space(b: Bytes) -> Option<Int> =
     );
 }
 
-/// The declared row is checked as an upper bound like any other, so a definition that claims purity
-/// and hands `bytes_position` an effectful predicate is refused rather than believed.
 #[test]
 fn a_declared_empty_row_refuses_an_effectful_predicate() {
     let d = compile(

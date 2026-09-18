@@ -16,8 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// A clock that counts, because the number a span's cost owes is "a discarded event reads the clock zero
-/// times" and nothing else can assert it.
+/// Counts reads, so a test can assert that a discarded event reads the clock zero times.
 #[derive(Default)]
 struct Counting {
     reads: AtomicU64,
@@ -27,8 +26,7 @@ struct Counting {
 impl Clock for Counting {
     fn micros(&self) -> i64 {
         self.reads.fetch_add(1, Ordering::Relaxed);
-        // Ascending by one per read, so a duration is the number of reads between two stamps and a
-        // golden line has a stamp that does not move.
+        // Ascending by one per read, so a duration counts reads and golden stamps do not move.
         self.at.fetch_add(1, Ordering::Relaxed) + 1
     }
 }
@@ -53,7 +51,6 @@ impl HostRuntime for NoRuntime {
     }
 }
 
-/// One driver, its sink and its clock, plus a machine to perform as.
 struct Fixture {
     trace: Arc<Trace>,
     sink: Arc<Recording>,
@@ -180,10 +177,7 @@ fn event(f: &Fixture, at: &str, level: &str, name: &str) -> ply_eval::Value {
     )
 }
 
-// --- what the row and the listing say -------------------------------------------
-
-/// The resource is a channel and every operation is `Any`, so `bind` expands one registration into
-/// one row per channel the program uses.
+/// The resource is a channel and every operation `Any`, so `bind` yields a row per channel used.
 #[test]
 fn every_operation_registers_per_channel_at_most_once_and_not_blocking() {
     for op in Op::ALL {
@@ -201,8 +195,6 @@ fn every_operation_registers_per_channel_at_most_once_and_not_blocking() {
     }
 }
 
-/// The path a row prints is the sink's, so `--trace off` says so rather than naming a writer the
-/// run does not have.
 #[test]
 fn the_listing_names_the_sink_that_actually_serves_the_run() {
     let discard = registry(Arc::new(Trace::new(Arc::new(Discard))));
@@ -216,8 +208,6 @@ fn the_listing_names_the_sink_that_actually_serves_the_run() {
     assert!(json.ops().all(|op| op.path == "ply_host::trace::json"));
     assert_eq!(json.len(), Op::ALL.len());
 }
-
-// --- spans ------------------------------------------------------------------------
 
 #[test]
 fn enter_answers_a_span_carrying_its_id_and_its_channel() {
@@ -264,7 +254,6 @@ fn a_nested_span_records_its_parent_and_an_event_inside_it_records_the_span() {
     );
 }
 
-/// The one the orchestrator asked for by name: a span opened in one task must not close in another.
 #[test]
 fn a_span_opened_in_one_task_does_not_close_in_another() {
     let f = fixture();
@@ -303,8 +292,7 @@ fn a_span_opened_in_one_task_does_not_close_in_another() {
     assert_eq!(f.kinds(), [Kind::Enter, Kind::Exit]);
 }
 
-/// Two tasks interleaving under one channel, checked against the tree the record list itself
-/// implies rather than against the driver's own bookkeeping.
+/// Checked against the tree the records imply, not the driver's own bookkeeping.
 #[test]
 fn two_tasks_interleaving_produce_correctly_nested_parent_links() {
     let f = fixture();
@@ -347,8 +335,7 @@ fn two_tasks_interleaving_produce_correctly_nested_parent_links() {
     assert_eq!(f.trace.counts().abandoned, 0);
 }
 
-/// The rollback shape: nothing runs the inner `exit`, so the outer one closes both and only the
-/// outer carries the outcome the program named.
+/// Nothing runs the inner `exit`, so the outer closes both and only it carries the outcome.
 #[test]
 fn closing_an_outer_span_abandons_the_spans_above_it() {
     let f = fixture();
@@ -378,7 +365,6 @@ fn closing_an_outer_span_abandons_the_spans_above_it() {
     assert_eq!(f.trace.counts().abandoned, 1);
 }
 
-/// The fourth exit — the one no handler clause can catch.
 #[test]
 fn teardown_closes_what_the_program_left_open_and_reports_w0609() {
     let f = fixture();
@@ -409,8 +395,7 @@ fn teardown_closes_what_the_program_left_open_and_reports_w0609() {
     );
 }
 
-/// A `db.rollback` inside a span is a discarded continuation, so the span's record is the one thing
-/// that says what the request was doing when it stopped.
+/// After a discarded continuation, the span's record is all that says what the request was doing.
 #[test]
 fn teardown_writes_before_it_flushes() {
     let f = fixture();
@@ -422,8 +407,6 @@ fn teardown_writes_before_it_flushes() {
     assert_eq!(f.sink.flushes(), 1);
     assert!(f.trace.counts().flushed);
 }
-
-// --- metrics ----------------------------------------------------------------------
 
 #[test]
 fn a_metric_is_a_record_on_the_channel_the_call_site_named() {
@@ -471,10 +454,6 @@ fn a_metric_is_a_record_on_the_channel_the_call_site_named() {
     );
 }
 
-// --- what a span costs when nothing is collecting ---------------------------------
-
-/// The claim a disabled span makes, in the one form that can be checked here: under `discard` no record is
-/// written and the clock is read **zero** times, whatever the operation.
 #[test]
 fn a_discarded_record_reads_no_clock_and_writes_nothing() {
     let (trace, clock) = discarding();
@@ -522,8 +501,7 @@ fn a_discarded_record_reads_no_clock_and_writes_nothing() {
     assert_eq!(trace.counts().events, 0);
 }
 
-/// And the span bookkeeping is kept anyway, because `E0445` is a statement about the program: a run
-/// whose verdict moved with `--trace off` would be a run nobody could debug.
+/// `E0445` is about the program, so a verdict that moved with `--trace off` would be undebuggable.
 #[test]
 fn spans_are_tracked_under_discard_so_a_verdict_does_not_depend_on_the_sink() {
     let (trace, _) = discarding();
@@ -561,8 +539,7 @@ fn spans_are_tracked_under_discard_so_a_verdict_does_not_depend_on_the_sink() {
     );
 }
 
-/// A level filter saves the record and nothing else, which is the honest claim: the perform and the
-/// call site's map are already paid for by the time the sink is asked.
+/// The perform and the call site's map are paid before the sink is asked; only the record is saved.
 #[test]
 fn a_level_filter_drops_the_record_and_reads_no_clock() {
     let f = fixture_at(Level::Warn);
@@ -575,8 +552,7 @@ fn a_level_filter_drops_the_record_and_reads_no_clock() {
     assert_eq!(f.clock.reads(), 1);
     assert_eq!(f.kinds(), [Kind::Event]);
 
-    // A span is `Info`, so a `warn` filter drops it — and the stack still knows about it, which is
-    // what keeps `E0445` and `W0609` right.
+    // A span is `Info`, so `warn` drops it, yet the stack keeps it for `E0445` and `W0609`.
     let span = enter(&f, "orders", "place_order");
     assert_eq!(f.trace.open_spans(), 1);
     exit(&f, "orders", span);
@@ -584,8 +560,7 @@ fn a_level_filter_drops_the_record_and_reads_no_clock() {
     assert_eq!(f.clock.reads(), 1, "and nothing at `info` was stamped");
 }
 
-/// A span's duration is the sink's, computed from the two stamps it took, so a call site never
-/// reads a clock and `clock.read` never enters a tracing function's row.
+/// Computed by the sink, so a call site never reads a clock and `clock.read` enters no tracing row.
 #[test]
 fn a_closing_span_carries_the_duration_the_sink_measured() {
     let f = fixture();
@@ -602,10 +577,6 @@ fn a_closing_span_carries_the_duration_the_sink_measured() {
     );
 }
 
-// --- the wire format ---------------------------------------------------------------
-
-/// The envelope is fixed and the program's fields are nested under `fields` **always**, so a
-/// program cannot forge a level by naming a field.
 #[test]
 fn a_program_field_named_like_an_envelope_key_does_not_shadow_it() {
     let f = fixture();
@@ -667,8 +638,7 @@ fn every_field_shape_renders_and_an_empty_field_set_still_writes_the_object() {
         render(ctor("FText", vec![ply_eval::Value::str("a\"b\nc")])),
         r#""fields":{"f":"a\"b\nc"}}"#
     );
-    // A `Decimal` is a string: its scale is a digit count the value carries, and a JSON number
-    // consumer would round it away.
+    // A `Decimal` is a string: a JSON number consumer would round its scale away.
     assert_eq!(
         render(ctor(
             "FDecimal",
@@ -768,13 +738,10 @@ fn an_exit_carries_its_outcome_and_a_failure_carries_its_reason() {
         line.contains(r#""outcome":"failed","reason":"23514""#),
         "{line}"
     );
-    // And an `enter` carries none: an outcome on a line that has not happened yet would be a fact
-    // the run does not hold.
+    // An `enter` carries no outcome: it has not happened yet.
     assert!(!f.sink.lines()[0].contains("outcome"));
 }
 
-/// The `Map` order is the canonical one, so two field sets built in different orders produce the
-/// same line and a golden test over it is stable.
 #[test]
 fn two_field_sets_built_in_different_orders_render_identically() {
     let render = |entries: [(&str, i64); 3]| {
@@ -800,8 +767,6 @@ fn two_field_sets_built_in_different_orders_render_identically() {
         render([("c", 3), ("a", 1), ("b", 2)])
     );
 }
-
-// --- shapes inference already checked, refused rather than guessed at --------------
 
 #[test]
 fn a_perform_the_front_end_could_not_have_produced_is_plys_fault() {
