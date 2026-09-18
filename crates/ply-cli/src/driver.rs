@@ -1,6 +1,4 @@
 //! The front end: the Rust chain that still has to run, and the port that answers for the rest.
-//! Asking the port costs a front end over what it is handed, so a load hands it only the modules
-//! an edit reached, and the answer travels.
 
 use crate::load::{Discovered, LoadError, Loaded, anchor, discover, unreadable};
 use ply_hash::body::StoredBody;
@@ -88,15 +86,11 @@ struct FileState {
     shipped: bool,
 }
 
-/// The parts of the port's answer under their keys, when this run asked and may keep them.
 type Fresh = Option<BTreeMap<ContentHash, String>>;
 
-/// What the parts of an answer are filed under; see [`Front::split`].
 struct Keys {
     /// The emitter and the import graph, which fix the order the checker publishes in.
     program: ContentHash,
-    /// Per file: the emitter and the name and text of every module it reaches by import, itself
-    /// included.
     modules: Vec<ContentHash>,
 }
 
@@ -239,8 +233,6 @@ impl<'s> Driver<'s> {
         })
     }
 
-    /// The port's answer, joined from the store's parts where it has them, plus the parts to keep
-    /// when this run asked.
     fn ask_the_port(&mut self) -> Result<(Front, Fresh), LoadError> {
         ply_codegen::c::producer::ensure_default();
         let started = Instant::now();
@@ -252,9 +244,7 @@ impl<'s> Driver<'s> {
         answer
     }
 
-    /// The modules whose parts missed are asked with all they import, so the port sees a closed
-    /// program, and joined with the parts that hit. Anything that stops the parts joining into
-    /// exactly the whole program's answer asks the whole program instead.
+    /// Missed modules are asked with all they import, so the port sees a closed program.
     fn in_parts(&self, keys: &Keys) -> Result<(Front, Fresh), LoadError> {
         let Some(store) = self.store.as_deref() else {
             return self.whole(keys);
@@ -317,7 +307,6 @@ impl<'s> Driver<'s> {
         }
     }
 
-    /// The whole program's answer, filed in parts unless it has errors or does not split.
     fn whole(&self, keys: &Keys) -> Result<(Front, Fresh), LoadError> {
         let front = self.ask(&self.everything())?;
         if front.has_error() {
@@ -340,7 +329,6 @@ impl<'s> Driver<'s> {
         Ok((front, fresh))
     }
 
-    /// The port over these files, handed over in `self.files` order.
     fn ask(&self, which: &[usize]) -> Result<Front, LoadError> {
         let sources: Vec<(String, String)> = which
             .iter()
@@ -362,7 +350,6 @@ impl<'s> Driver<'s> {
         (0..self.files.len()).collect()
     }
 
-    /// These files and every file they reach by import, in `self.files` order.
     fn reaching(&self, from: &[usize]) -> Vec<usize> {
         let mut seen: BTreeSet<usize> = from.iter().copied().collect();
         let mut stack = from.to_vec();
@@ -378,7 +365,6 @@ impl<'s> Driver<'s> {
         seen.into_iter().collect()
     }
 
-    /// `None` without a cache.
     fn keys(&self) -> Option<Keys> {
         if self.mode != Mode::Incremental || self.store.is_none() {
             return None;

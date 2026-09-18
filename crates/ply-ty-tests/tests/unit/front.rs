@@ -658,8 +658,7 @@ fn the_writer_refuses_a_front_the_protocol_cannot_carry() {
     assert!(err.contains("module `m` is source 7"), "{err}");
 }
 
-/// `sample` laid out as the checker publishes it: definitions in dependency order, and the
-/// prelude's constructor before any module's.
+/// `sample` as the checker publishes it: defs in dependency order, the prelude's constructor first.
 fn published() -> Front {
     let mut front = sample();
     front.diagnostics.clear();
@@ -686,7 +685,6 @@ fn an_answer_split_by_module_and_filed_joins_back_at_other_positions() {
         "the prelude's constructor belongs to no module"
     );
 
-    // Each part is filed against its own source alone and read where the next run put it.
     let moved = [SourceId(7), SourceId(3)];
     let program = read_front(&write_front(&program, &[]).unwrap(), &[]).unwrap();
     let parts: Vec<Front> = parts
@@ -745,8 +743,6 @@ fn ply_files(dir: &std::path::Path) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The port's answer over the standard library, the examples and the compiler's own sources,
-/// split by module, filed and read back, joins to the answer it was.
 #[test]
 fn a_real_answer_split_by_module_joins_back_byte_for_byte() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -784,7 +780,6 @@ fn a_real_answer_split_by_module_joins_back_byte_for_byte() {
     );
 }
 
-/// Where two long texts part, and the bytes around it.
 #[track_caller]
 fn same(what: &str, got: &str, want: &str) {
     if got == want {
