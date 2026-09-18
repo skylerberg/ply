@@ -43,14 +43,7 @@ impl Drop for TempRoot {
 
 impl Compiled {
     fn rejected(src: &str) -> Vec<ply_span::Diagnostic> {
-        let module = ply_syntax::parse(SourceId(0), src).expect("the fixture must parse");
-        let mut program = ply_syntax::ast::Program::single(module);
-        let Ok(resolved) = ply_syntax::resolve(&mut program) else {
-            return Vec::new();
-        };
-        ply_core::check_program(&program, &resolved)
-            .err()
-            .unwrap_or_default()
+        crate::fixture::port_diagnostics(&[(String::new(), src.to_string())], &[SourceId(0)])
     }
 
     fn scheduled(&self) -> Vec<(usize, Footprint)> {

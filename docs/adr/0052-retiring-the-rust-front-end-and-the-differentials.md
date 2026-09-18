@@ -1711,10 +1711,68 @@ twenty-seven of them. So the fault was never `run` denying what `compile`
 needs: it was the tier the old emitter could not key, and the `(0, 3)` this
 entry opens with is that same defect seen from the other end.
 
-That clears `unit/runner.rs` and not the crate. `ply-core` is still held at
-five more sites -- `fixture.rs`, `hybrid.rs`, `host_scheduler_audit.rs`,
-`isolation_audit.rs`, and `bisect/delta.rs` twice -- and the dependency drops
-only when those move too.
+That cleared `unit/runner.rs`, and the five sites beside it -- `fixture.rs`,
+`hybrid.rs`, `host_scheduler_audit.rs`, `isolation_audit.rs` and
+`bisect/delta.rs` twice -- went the same way. The entry below takes them and
+the dependency they held.
+
+**Built, 2026-09-17: `ply-test-tests` asks the port, and the tier makes it
+faster.** Every `ply_core::check_program` in the crate takes its check from
+`producer::front` instead, through one `port_check` in `fixture.rs` -- the
+module whose own header says it holds what every test here needs before it can
+assert anything. `ply-core` leaves the dev-dependencies, and four dependents
+remain: `ply-core-tests`, which goes with the crate, and `ply-eval-tests`,
+`ply-hash-tests` and `ply-store-tests`.
+
+Hashing did not move. Every site hashes with `ply_hash`, which never took the
+checker's answer -- `hash_program`'s check parameter is `_check` -- so only
+where `check` comes from changed, and `hash_program_with_bodies` still hands
+back the `BodySet` that a `Front` does not carry in that shape.
+
+`isolation_audit::rejected` takes the port's diagnostics, which is what it
+always wanted: a type error is `front.diagnostics` and `Err` is the seam
+failing. It no longer answers an empty vector when resolution fails, because
+the port resolves inside `front` and reports it. Its eleven tests pass.
+
+The cost went the other way from the one this record went looking for. On
+`main`, installing no producer, the sixty-five runner tests interpret an empty
+tier in 2.41 s; migrated they run on the tier in 0.85 to 1.05 s. The first run
+pays 12.60 s filling an 11 MB object cache -- once per emitter change, on the
+same key §3's excursion turns on. A hundred and seventy-two of the crate's two
+hundred and ninety-five tests now install a producer, and they are faster for
+it.
+
+What the port cannot answer is one site. `ply-eval-tests`' `prelude_arity` asks
+the checker's prelude environment for a builtin's arity over an *empty*
+program: there is no program to hand over and so no text to print, and the test
+it serves, `every_builtin_agrees_on_its_arity_everywhere`, compares three
+tables -- `Builtin::arity`, the prelude's scheme, and `defaults::builtin_shape`
+-- so handing it `Builtin`'s own arity would have it compare a value with
+itself. It is the only `ply_core::` call in the tree that is neither
+`check_program` nor `check_module`.
+
+Every other site holds a `Program`, and a `Program` has text whenever it is
+asked for it: `ply_syntax::print::program` renders one as the `(name, text)`
+pairs `front` takes. That is not a proposal. `ply-test`'s hybrid trial does it
+in production, `ply-cli`'s artifact path does it, and `ply-hash-tests`' own
+`bodies.rs` does it twice -- once to run a reconstructed program on the tier,
+and once to assert that every definition hashes identically after a print and a
+re-parse, which is the property a migration of these sites rests on. The two
+hazards are recorded above: printed modules take fresh dense source ids,
+because a reconstructed module carries `Span::DUMMY.source` and the protocol
+reads a span's module as a position in the list handed over; and a mixture
+reconstructed with a non-empty relink map is the case `reconstruct_with` skips
+`Reconstruction::verify` for.
+
+**Counted three times, and the method is the finding.** This paragraph first
+said each crate held one obstacle, then seven across three crates; the answer
+is one. The first count grepped `ply_core::`, which matches a qualified call
+and misses a bare-name one behind `use ply_core::check_program` -- the
+qualified share is ten of twelve in `ply-eval-tests`, one of two in
+`ply-store-tests`, five of nine in `ply-hash-tests`. The second counted the
+call sites correctly and then mistook "has no source text" for "cannot be
+served", when this tree already answered that in three places. What a site
+needs is not text. It is a `Program`, and text follows from one.
 
 **Built, 2026-09-17: `verify` sees the member it could not see, and the count
 says what it counts.** This record described the gap twice and fixed it neither
@@ -2036,7 +2094,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s, 153 s, 199 s, 381 s, 139 s, 168 s, 167 s, 211 s, 219 s, 193 s, 167 s, 173 s and 211 s, each reusing by tree the same way and for the same reason. Eleven of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, the sixth 199 s, the seventh 381 s and the eighth 211 s, which the entries closing this section take. None of those six was caused by the tree. The ninth and tenth, 219 s and 193 s, were: they are the handover's own cost, and the two entries closing this section take them together with the reading that placed it. The eleventh, 211 s again and not the run the eighth names, is the tree as well, and the entry closing this section takes it. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Twelve running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s, 153 s, 199 s, 381 s, 139 s, 168 s, 167 s, 211 s, 219 s, 193 s, 167 s, 173 s, 211 s and 164 s, each reusing by tree the same way and for the same reason. Eleven of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, the sixth 199 s, the seventh 381 s and the eighth 211 s, which the entries closing this section take. None of those six was caused by the tree. The ninth and tenth, 219 s and 193 s, were: they are the handover's own cost, and the two entries closing this section take them together with the reading that placed it. The eleventh, 211 s again and not the run the eighth names, is the tree as well, and the entry closing this section takes it. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Thirteen running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
@@ -2349,9 +2407,11 @@ touches it pays again, and §2's deletions will each touch it, so this is their
 standing cost rather than a fault in them. The run says the key was written:
 `actions/cache/save` ran and succeeded on all seventeen slots, the eight
 partitions and every solo job, so each now holds one under the new key. That
-the next run recovers is a prediction, and this record does not settle it: the
-next quiet merge either comes back to the band or it does not, and if it does
-not, the cause is not this.
+the next run recovers was a prediction when this was written, and the next
+quiet merge settled it. `d5f373d4`, records-only and touching none of the three
+keyed paths, read 164 s. Every partition came down -- 128, 118, 116, 111, 106,
+100, 99 and 89 s against 161, 148, 140, 131, 128, 125, 123 and 108 -- and
+`archive-tree-moved` left the twelve slowest entirely. The key is the cause.
 
 ## 4. The loop that is O(the change)
 
