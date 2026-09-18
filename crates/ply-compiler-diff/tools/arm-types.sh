@@ -167,23 +167,6 @@ arm "an unclosed list pattern loses the label on its opening bracket" patterns \
   'let {p, node: cl} = expect_close(c, p, t_rbracket(), o.node, b"`]` to close the list pattern")?;' \
   'let {p, node: cl} = expect(c, p, t_rbracket(), b"`]` to close the list pattern")?;'
 
-echo
-echo "== the bail guards: withdrawn, because there are none =="
-echo "   > **Withdrawn (the try operator, 2026-08-30).** Four mutations stood here"
-echo "   > under two headings, \`== the bail guards: 6 of 50 are killable ==\`"
-echo "   > and \`== equivalent mutants: the other 44 ==\`. One was an \`arm\`"
-echo "   > (the guard on \`ty_record\`s close result) and three were"
-echo "   > \`equiv\`s (the guards at the top of \`ty\` and \`pattern\`, and the"
-echo "   > call-site guard in \`ty_field\`), each replacing an \`if p.bail\`"
-echo "   > with \`if false\`. The block said: \"Registered arming instrument 4"
-echo "   > was delete one \\\`if p.bail\\\` guard and confirm the error fixtures"
-echo "   > go red. These three do not, and the reason is measured rather than"
-echo "   > guessed: see GAPS-types.md \u00a7P7.\""
-echo "   >"
-echo "   > \`?\` removed the flag, so there is no guard to delete in either"
-echo "   > file. GAPS-types.md \u00a7P7s 0-of-10 is a finding about a design"
-echo "   > this area no longer has."
-
 restore
 echo
 if [ "$fails" -eq 0 ]; then

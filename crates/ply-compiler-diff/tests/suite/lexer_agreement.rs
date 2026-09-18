@@ -152,7 +152,7 @@ fn every_non_ascii_byte_in_the_corpus_is_somewhere_both_lexers_agree() {
                          contents, which is why the agreement tests pass over it; one \
                          anywhere else is a position where the Ply lexer answers \
                          differently on purpose, so the agreement claim has to be \
-                         re-decided. README, Where this disagrees on purpose.",
+                         re-decided.",
                         path.display()
                     ),
                 }
