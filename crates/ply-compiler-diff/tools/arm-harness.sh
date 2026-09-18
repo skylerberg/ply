@@ -80,7 +80,7 @@ mutations=(
 "spine.ply|s/{ p: with_gt_split(p, p.pos), node: {start: s.start, end: s.start + 1} }/{ p: p, node: {start: s.start, end: s.start + 1} }/|a LOST TOKEN REWRITE: \`>=\` closing a type parameter list no longer leaves an \`=\` behind|the \`type Pair<a>= a\` split, and everything after it in the file"
 "items.ply|s/rec(d.span, b\"tst\"), rec(d.name_span, b\"tnm\")/rec(d.span, b\"tst\"), rec(d.span, b\"tnm\")/|a WRONG SPAN on a leaf: a test's label span becomes the whole item's|every node leads with its own span"
 "exprs.ply|s/dump_opt(v.tail, dump_expr)/dump_opt(None, dump_expr)/|a DROPPED TAIL: a block's tail expression is never emitted|every Option emits its presence"
-"exprs.ply|s/named: push(s.named, n)/named: s.named/|a DISCARDED NAMED ARGUMENT: \`name: value\` is lexed, parsed and thrown away|the named-argument list's length, which nothing emitted before 2026-08-30 (GAPS.md 11R.N)"
+"exprs.ply|s/named: push(s.named, n)/named: s.named/|a DISCARDED NAMED ARGUMENT: \`name: value\` is lexed, parsed and thrown away|the named-argument list's length"
 "exprs.ply|s/span: span_to(expr_span(s.node), q.node)/span: expr_span(s.node)/|a WRONG SPAN on the try operator: the \`?\` byte falls outside its own node|every node leads with its own span"
 "exprs.ply|s/Some(b) -> ERecordUpdate({ span: sp, base: b, fields: fields })/Some(b) -> ERecord({ span: sp, fields: fields })/|a COLLAPSED SUGAR NODE: \`{..b, f: e}\` becomes a plain record and the base vanishes|every enum arm, and the node the port must NOT expand"
 "exprs.ply|s/if allow { Ok({ p: p, node: Some(e) }) }/if allow { Ok({ p: p, node: None }) }/|a DROPPED OPTION: a parameter's default expression is parsed and discarded|every Option emits its presence"

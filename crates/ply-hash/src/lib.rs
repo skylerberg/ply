@@ -16,11 +16,8 @@ use body::{BodySet, StoredBody};
 use graph::{Entry, NodeBody, NodeId, ProgramIndex};
 use normalize::{ComponentIndices, EffectIndex, HashTable, Normalizer};
 
-/// The vocabulary a hashed program is published in lives in `ply-ty`, where the store, the test
-/// runner and the prover read it without this crate; these are the same items.
 pub use ply_ty::hash::{DefHash, HashOutput, interface_hash, spec_hash};
 
-/// Hashes every module of a program at once.
 pub fn hash_program(
     program: &Program,
     resolved: &Resolved,
@@ -29,8 +26,7 @@ pub fn hash_program(
     hash_program_ast(program, resolved)
 }
 
-/// [`hash_program`] without the type-check output, which normalization does not need: a hash is a
-/// function of resolved source structure alone.
+/// [`hash_program`] without the type-check output, which a hash never depends on.
 pub fn hash_program_ast(
     program: &Program,
     resolved: &Resolved,
@@ -79,9 +75,8 @@ fn hash_index(
     let no_component = ComponentIndices::default();
     let no_effects = EffectIndex::default();
 
-    // What a definition references does not depend on what any of them hash to, so one pass with
-    // nothing known yields the reference graph, plus a sketch that orders a cycle's members without
-    // appealing to source position.
+    // References do not depend on hashes, so one pass with nothing known yields the graph, plus a
+    // sketch that orders a cycle's members without appealing to source position.
     let mut edges: Vec<Vec<NodeId>> = Vec::with_capacity(n);
     let mut sketches: Vec<Vec<u8>> = Vec::with_capacity(n);
     for node in &index.nodes {
@@ -100,8 +95,7 @@ fn hash_index(
         }
     }
 
-    // Components arrive dependency-first, so a component's own enumeration can splice in the ones
-    // it references.
+    // Components arrive dependency-first, so an enumeration can splice in the ones it references.
     let mut orders: Vec<Vec<usize>> = Vec::with_capacity(components.len());
     for (ci, component) in components.iter().enumerate() {
         let mut members = component.clone();
@@ -166,7 +160,6 @@ fn hash_index(
         }
     }
 
-    // A law is an item with a body, hashed exactly as a test is.
     let mut law_hashes = Vec::with_capacity(index.laws.len());
     let mut law_refs = Vec::with_capacity(index.laws.len());
     let mut law_texts = Vec::with_capacity(index.laws.len());
@@ -246,9 +239,7 @@ fn hash_index(
     ))
 }
 
-/// One item with a body, encoded the way a test is: a first pass with nothing known yields the
-/// references, which fix the effect enumeration, and a second pass writes the bytes against the
-/// finished hash table.
+/// Two passes: the first finds the references that fix the effect enumeration, the second writes.
 fn encode_item<'a>(
     index: &'a ProgramIndex<'a>,
     module: usize,
@@ -298,8 +289,6 @@ struct Components<'a> {
     no_effects: &'a EffectIndex,
 }
 
-/// What the item passes produced, so [`assemble`] takes one argument per idea rather than five
-/// positional vectors.
 struct Hashed {
     tests: Vec<DefHash>,
     test_refs: Vec<Vec<NodeId>>,
@@ -311,8 +300,7 @@ struct Hashed {
     spec_texts: IndexMap<Symbol, Vec<DefHash>>,
 }
 
-/// The effects one component can see, in an order derived only from what it references — never from
-/// a name, a module, or a source position.
+/// The effects a component can see, ordered only by what it references, never by name or position.
 fn effect_order(
     index: &ProgramIndex<'_>,
     refs: &[NodeId],
@@ -351,8 +339,7 @@ fn slots(order: &[usize]) -> EffectIndex {
         .collect()
 }
 
-/// The hash each member of one strongly connected component gets, for a caller that has a hash
-/// table of its own to apply.
+/// The hash of each member of one strongly connected component.
 pub fn component_hashes(
     index: &ProgramIndex<'_>,
     component: &[usize],
@@ -362,20 +349,7 @@ pub fn component_hashes(
     hash_component(index, component, hashes, effects).0
 }
 
-/// A cyclic component is hashed as a unit and each member identified by an index
-/// within it. Source position cannot supply that index — moving a definition
-/// would change its hash — so refinement does: start with every member in one
-/// class, re-encode with each intra-component reference written as the
-/// referent's current class, and split until nothing splits further.
-///
-/// **The loop re-encodes once more after the partition settles**, rather than
-/// shipping the round that produced the final split. The label a reference
-/// mentions has to be the label its referent is filed under, and the round that
-/// put every member in one class writes every reference as `class 0` — under
-/// which `f -> g, g -> h, h -> f` and `f -> h, h -> g, g -> f` are one definition
-/// set, which is both a collision and a cycle no decoder could rewire. The
-/// payload is laid out in class order for the same reason, so a member's index
-/// in it *is* its class.
+/// A cycle is hashed as a unit; members are indexed by partition refinement, not source position.
 fn hash_component(
     index: &ProgramIndex<'_>,
     component: &[usize],
@@ -410,6 +384,8 @@ fn hash_component(
 
     let mut classes: ComponentIndices = component.iter().map(|&v| (v, 0u32)).collect();
     let mut encodings: Vec<Vec<u8>> = component.iter().map(|&v| encode(&classes, v)).collect();
+    // Re-encode once more after settling: each reference must name its referent's final class, or
+    // distinct cycles collide.
     loop {
         let next = relabel(&encodings);
         let settled = grouping(&next) == grouping(&classes);
@@ -420,9 +396,7 @@ fn hash_component(
         }
     }
 
-    // One entry per class, in class order: members that share a class are interchangeable — the
-    // partition settled, so their encodings are equal — and storing one twice would leave the
-    // payload's indices and the members' classes disagreeing about how many there are.
+    // One entry per class, in class order, so a member's index in the payload is its class.
     let width = classes.values().copied().max().unwrap_or(0) as usize + 1;
     let mut by_class: Vec<&[u8]> = vec![&[]; width];
     for (&v, encoding) in component.iter().zip(&encodings) {
@@ -457,8 +431,7 @@ fn assemble(
         }
     }
 
-    // Components arrive dependency-first, so every closure a component needs has already been built
-    // by the time it is reached.
+    // Components arrive dependency-first, so every closure a component needs is already built.
     let mut component_closure: Vec<BTreeSet<Symbol>> = Vec::with_capacity(components.len());
     for (ci, component) in components.iter().enumerate() {
         let mut closure = BTreeSet::new();
@@ -529,9 +502,7 @@ fn assemble(
                 );
                 record(&mut out, name, deps, closure);
             }
-            // A law's references are what it is a claim *about*: `Laws::of` reads them to decide
-            // which definitions one law covers, which is why coverage is what a law names directly
-            // rather than what it can reach.
+            // `Laws::of` reads a law's direct references as the definitions it covers.
             Entry::Law(l) => {
                 let name = index.laws[l].key.clone();
                 let (deps, closure) = reached(
@@ -548,8 +519,7 @@ fn assemble(
     out
 }
 
-/// What a nameless item — a test or a law — directly references, and everything its references can
-/// reach.
+/// What a test or law directly references, and everything those references reach.
 fn reached(
     refs: &[NodeId],
     index: &ProgramIndex<'_>,
@@ -568,8 +538,7 @@ fn reached(
     (deps, closure)
 }
 
-/// Names collide across namespaces — a `type` and a `fn` may share one, as may two tests — so
-/// entries are merged rather than one silently replacing the other.
+/// A `type` and a `fn` (or two tests) may share a name, so entries merge rather than replace.
 fn record(out: &mut HashOutput, name: Symbol, deps: Vec<Symbol>, closure: BTreeSet<Symbol>) {
     match out.deps.get_mut(&name) {
         Some(existing) => {

@@ -1,6 +1,3 @@
-//! Pinned: downstream crates are written against these shapes concurrently, so changing a variant
-//! is a cross-crate breaking change.
-
 use ply_span::{SourceId, Span, Symbol};
 use std::fmt;
 
@@ -24,8 +21,7 @@ impl Ident {
     }
 }
 
-/// A reference to a top-level name, optionally qualified by a module binder: `place` or
-/// `orders::place`.
+/// `place` or `orders::place`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QName {
     pub module: Option<Ident>,
@@ -96,7 +92,6 @@ impl Default for Module {
     }
 }
 
-/// Every module in the project.
 #[derive(Clone, Debug, Default)]
 pub struct Program {
     pub modules: Vec<Module>,
@@ -121,8 +116,7 @@ impl Program {
 /// `import store.orders`, `import store.orders as ord`, `import store.orders (place, cancel)`.
 #[derive(Clone, Debug)]
 pub struct ImportDecl {
-    /// One `Ident` per dotted segment, so a diagnostic can point at the segment that went wrong
-    /// rather than the whole declaration.
+    /// One `Ident` per dotted segment, so a diagnostic can point at one segment.
     pub path: Vec<Ident>,
     pub kind: ImportKind,
     pub span: Span,
@@ -133,7 +127,7 @@ pub enum ImportKind {
     /// Binds the module under its last path segment.
     Module,
     Alias(Ident),
-    /// Binds those names unqualified, and binds no module binder at all.
+    /// Binds the names unqualified, and no module binder.
     Names(Vec<Ident>),
 }
 
@@ -155,7 +149,6 @@ impl ImportDecl {
         }
     }
 
-    /// The module binder this import introduces, if any.
     pub fn binder(&self) -> Option<Symbol> {
         match &self.kind {
             ImportKind::Module => self.path.last().map(|s| s.name.clone()),
@@ -173,20 +166,15 @@ impl ImportDecl {
     }
 }
 
-/// Boxed because a `fn` is several times the size of the other variants and a module holds one
-/// `Vec<Item>` per file: unboxed, a program of ten thousand definitions pays the largest variant's
-/// width for every item it has.
+/// Boxed so every item does not pay the width of the largest variant.
 #[derive(Clone, Debug)]
 pub enum Item {
     Fn(Box<FnDef>),
     Type(Box<TypeDef>),
     Effect(Box<EffectDef>),
     Test(Box<TestDef>),
-    /// `law "label" forall (x: T) where g { body }`.
     Law(Box<LawDef>),
-    /// `derive json for Order`.
     Derive(Box<DeriveDef>),
-    /// `effect set Web = {db.read[users], log.write}`.
     EffectSet(Box<EffectSetDef>),
 }
 
@@ -203,8 +191,6 @@ impl Item {
         }
     }
 
-    /// `None` for a `test`, a `law`, a `derive` and an `effect set`, none of which have a name a
-    /// reference could reach.
     pub fn name(&self) -> Option<&Ident> {
         match self {
             Item::Fn(d) => Some(&d.name),
@@ -214,8 +200,7 @@ impl Item {
         }
     }
 
-    /// A `derive` carries no `pub` of its own: its generated definitions take the target type's
-    /// visibility, so a type you can name is a type you can encode and the two cannot drift.
+    /// A `derive` has no `pub` of its own: its generated definitions take the target's visibility.
     pub fn visibility(&self) -> Visibility {
         match self {
             Item::Fn(d) => d.vis,
@@ -236,8 +221,7 @@ pub struct EffectSetDef {
     pub atoms: Vec<AtomExpr>,
     /// Members naming another set, in source order.
     pub includes: Vec<QName>,
-    /// Every atom this set denotes, after expanding `includes` transitively: sorted and
-    /// deduplicated by written form.
+    /// Every atom after expanding `includes` transitively, sorted and deduplicated.
     pub expansion: Vec<AtomExpr>,
     pub span: Span,
 }
@@ -288,7 +272,6 @@ pub struct Generics {
 pub struct Param {
     pub name: Ident,
     pub ty: Option<TypeExpr>,
-    /// What a call that does not fill this parameter passes instead.
     pub default: Option<Expr>,
     pub span: Span,
 }
@@ -302,16 +285,13 @@ pub struct FnDef {
     pub ret: Option<TypeExpr>,
     /// The `/ {...}` annotation.
     pub effects: Option<RowExpr>,
-    /// `where derivable(json, a), derivable(ord, k)`, written after the effect row and before any
-    /// `requires`.
+    /// `where derivable(json, a), derivable(ord, k)`.
     pub constraints: Vec<Constraint>,
-    /// Set on a definition expansion generated from a `derive`, and `None` on everything a human
-    /// wrote.
+    /// `Some` only on definitions generated from a `derive`.
     pub derived: Option<Derived>,
     /// `requires` / `ensures`, in source order.
     pub spec: Vec<SpecClause>,
-    /// The span of a `reuse` before `fn`: the callee-side promise that every append in the body
-    /// reuses its list, checked by the cost checker and refused with E0127 when it cannot show it.
+    /// `reuse fn`: a promise that every append in the body reuses its list.
     pub reuse: Option<Span>,
     pub body: Expr,
     pub span: Span,
@@ -333,17 +313,14 @@ pub struct Binder {
     pub span: Span,
 }
 
-/// ```text law "credit and debit cancel" forall (a: Account, n: Int) where n > 0 && n <= a.balance
-/// { credited(debited(a, n), n) == a } ```.
+/// `law "label" forall (x: T) where g { body }`.
 #[derive(Clone, Debug)]
 pub struct LawDef {
     pub name: String,
     pub name_span: Span,
-    /// `law/host`: the **body** may carry any row, and the law is then a claim about the world
-    /// rather than about the program alone.
+    /// `law/host`: the body may carry any effect row.
     pub host: bool,
-    /// Empty for a ground law, which is a claim over a domain of one point and is therefore decided
-    /// by evaluating it.
+    /// Empty for a ground law, which is decided by evaluating it.
     pub binders: Vec<Binder>,
     pub guard: Option<Expr>,
     pub body: Expr,
@@ -385,8 +362,7 @@ pub struct EffectDef {
 pub struct OpDef {
     pub name: Ident,
     pub mode: Mode,
-    /// Declared as `op[r](..)`: call sites must supply a resource label, and the atom performed is
-    /// keyed by it.
+    /// Declared as `op[r](..)`: call sites must supply a resource label.
     pub resource_param: bool,
     pub params: Vec<TypeExpr>,
     pub ret: TypeExpr,
@@ -439,8 +415,7 @@ impl TypeExpr {
     }
 }
 
-/// A written effect row: `{db.read[users], clock.read | e}`, or `{Web, random.read}` naming an
-/// [`EffectSetDef`].
+/// `{db.read[users], clock.read | e}`, or `{Web, random.read}` naming an `effect set`.
 #[derive(Clone, Debug)]
 pub struct RowExpr {
     pub atoms: Vec<AtomExpr>,
@@ -465,8 +440,7 @@ pub struct Expr {
     pub span: Span,
 }
 
-/// Hand-written so the copy grows the host stack once per level, as parsing, inference and
-/// normalization already do.
+/// Hand-written to grow the stack on deep trees, where a derived clone would overflow it.
 impl Clone for Expr {
     fn clone(&self) -> Expr {
         const RED_ZONE: usize = 256 * 1024;
@@ -494,8 +468,7 @@ pub enum ExprKind {
     Lambda {
         params: Vec<Param>,
         body: Box<Expr>,
-        /// `|x| -> T { .. }`: a written return type, which is what gives a `?` inside the body
-        /// its meaning. Erased by normalization, as a spec is: it constrains, it does not denote.
+        /// `|x| -> T { .. }`: gives a `?` inside the body its meaning.
         ret: Option<TypeExpr>,
     },
     App {
@@ -521,7 +494,7 @@ pub enum ExprKind {
         fields: Vec<(Ident, Expr)>,
     },
 
-    /// `{..base, f: e}` — **parse-time only**.
+    /// `{..base, f: e}`; parse-time only.
     RecordUpdate {
         base: Box<Expr>,
         fields: Vec<(Ident, Expr)>,
@@ -532,7 +505,7 @@ pub enum ExprKind {
         field: Ident,
     },
 
-    /// `e?` — **parse-time only**, exactly as [`ExprKind::RecordUpdate`] is.
+    /// `e?`; parse-time only.
     Try {
         operand: Box<Expr>,
     },
@@ -563,13 +536,11 @@ pub enum ExprKind {
         body: Box<Expr>,
     },
 
-    /// `with_region[r] { body }`.
     WithRegion {
         region: Ident,
         body: Box<Expr>,
     },
 
-    /// `simulate { body }`.
     Simulate {
         body: Box<Expr>,
     },
@@ -600,8 +571,7 @@ pub struct HandleClause {
     pub op: Ident,
     pub resource: Option<Ident>,
     pub params: Vec<Ident>,
-    /// `op(x) resume k -> ...` binds the delimited continuation as `k`, and the clause's body then
-    /// has the whole `handle`'s type rather than the operation's.
+    /// `resume k` binds the continuation; the clause body then has the `handle`'s type.
     pub resume: Option<Ident>,
     pub body: Expr,
     pub span: Span,
@@ -639,8 +609,7 @@ pub enum PatternKind {
     },
 }
 
-/// Evaluates without calling anything and without performing anything, so it cannot diverge and
-/// cannot be observed by, or observe, its neighbours.
+/// Calls nothing and performs nothing, so it cannot diverge or observe its neighbours.
 pub fn is_pure(e: &Expr) -> bool {
     crate::effect_set::grow(|| match &e.kind {
         ExprKind::App { .. }
@@ -649,9 +618,7 @@ pub fn is_pure(e: &Expr) -> bool {
         | ExprKind::WithCell { .. }
         | ExprKind::WithRegion { .. }
         | ExprKind::Simulate { .. } => false,
-        // Conservative, and only ever consulted before expansion: a `?` that is being asked about
-        // here is one the scan did not reach in evaluation order, which means it sits behind a
-        // conditional or inside a nested block, and both of those are refused.
+        // Consulted only before expansion, where a `?` the scan did not reach is refused anyway.
         ExprKind::Try { .. } => false,
         ExprKind::Lit(_) | ExprKind::Var(_) => true,
         ExprKind::Binary { lhs, rhs, .. } => is_pure(lhs) && is_pure(rhs),
@@ -683,8 +650,7 @@ pub fn is_pure(e: &Expr) -> bool {
     })
 }
 
-/// Whether an expression may be a parameter's default: [`is_pure`], widened to admit a
-/// *constructor* application.
+/// [`is_pure`], widened to admit constructor applications.
 pub fn is_default_expr(e: &Expr) -> bool {
     crate::effect_set::grow(|| match &e.kind {
         ExprKind::App { func, args, named } => {

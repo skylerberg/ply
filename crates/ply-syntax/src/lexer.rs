@@ -67,17 +67,16 @@ impl Kw {
     }
 }
 
-/// `Eq` is deliberately absent: [`TokenKind::Float`] carries an `f64`, whose `==` is not reflexive.
+/// No `Eq`: `Float` carries an `f64`.
 #[derive(Clone, PartialEq, Debug)]
 pub enum TokenKind {
     Ident(Symbol),
     Int(i64),
-    /// `255u8`, `0x6A09_E667u32`: an integer literal with its width written on it.
+    /// `255u8`, `0x6A09_E667u32`.
     Fixed {
         ty: IntTy,
         bits: u64,
     },
-    /// `1.5`, `1e9`.
     Float(f64),
     /// `1.50m`.
     Decimal {
@@ -85,7 +84,6 @@ pub enum TokenKind {
         scale: u32,
     },
     Str(String),
-    /// `b"GET "`.
     Bytes(Vec<u8>),
     Kw(Kw),
 
@@ -121,12 +119,6 @@ pub enum TokenKind {
     Slash,
     Percent,
 
-    /// `&`, `^` and `~` are the bit operators of
-    /// `&` was a character the lexer
-    /// reached only to reject; `^` and `~` were in the token set nowhere, so
-    /// neither can collide. `&&` and `||` still munch first, so `|| body` is
-    /// still a nullary lambda and `TokenKind::Pipe` still separates a sum
-    /// type's variants.
     Amp,
     AmpAmp,
     Caret,
@@ -134,7 +126,7 @@ pub enum TokenKind {
     PipePipe,
     Tilde,
 
-    /// `e?` — the postfix try operator (GUIDE §6.10).
+    /// Postfix try, `e?`.
     Question,
 
     Eof,
@@ -208,8 +200,7 @@ impl TokenKind {
     }
 }
 
-/// The digits a `(mantissa, scale)` pair stands for, with the scale's trailing zeros kept: `(150,
-/// 2)` is `1.50`.
+/// Keeps the scale's trailing zeros: `(150, 2)` is `1.50`.
 pub fn render_decimal(mantissa: i128, scale: u32) -> String {
     let sign = if mantissa < 0 { "-" } else { "" };
     let digits = mantissa.unsigned_abs().to_string();
@@ -365,9 +356,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// A width suffix — `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64` — if one follows the
-    /// digits. `None` is no suffix at all, which is an `Int`; `Some(Err(()))` is a suffix that was
-    /// read and refused, already reported.
+    /// `None` is no suffix; `Some(Err(()))` is a refused suffix, already reported.
     fn width_suffix(&mut self, lit_start: usize) -> Option<Result<IntTy, ()>> {
         if !self.peek().is_some_and(is_ident_start) {
             return None;
@@ -397,8 +386,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// `0xFF`, `0xdead_beef`: the same `Lit::Int` as the decimal spelling, bounded as a
-    /// `u64` bit pattern so `0xFFFF_FFFF_FFFF_FFFF` is `-1`.
+    /// Bounded as a `u64` bit pattern, so `0xFFFF_FFFF_FFFF_FFFF` is `-1`.
     fn hex(&mut self, start: usize) -> TokenKind {
         self.bump();
         self.bump();
@@ -425,8 +413,7 @@ impl<'a> Lexer<'a> {
         let suffix = self.width_suffix(start);
         match u64::from_str_radix(&digits, 16) {
             Ok(v) => match suffix {
-                // A hex literal is a bit pattern, so its bound is the width and not the type's
-                // range: `0xFFu8` is 255 and `0xFFFF_FFFF_FFFF_FFFFu64` is the largest `U64`.
+                // A bit pattern: bounded by the width, not the type's range.
                 Some(Ok(ty)) => {
                     if ty.bits() < 64 && v > (u64::MAX >> (64 - ty.bits())) {
                         self.error(
@@ -442,9 +429,7 @@ impl<'a> Lexer<'a> {
                         bits: ty.normalize(v),
                     }
                 }
-                // A suffix that is not a width is reported and then ignored, which is what this
-                // lexer did before widths existed: the token is still the digits, so one bad
-                // suffix is one diagnostic rather than a second one from a `0` nobody wrote.
+                // Keep the digits so a bad suffix is one diagnostic, not a second from a `0`.
                 Some(Err(())) | None => TokenKind::Int(v as i64),
             },
             Err(_) => {
@@ -459,7 +444,6 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// `1`, `1.5`, `1e9`, `1.50m`.
     fn number(&mut self) -> TokenKind {
         let start = self.pos;
         if self.peek() == Some('0') && matches!(self.peek2(), Some('x') | Some('X')) {
@@ -469,8 +453,7 @@ impl<'a> Lexer<'a> {
         self.digits(&mut whole);
 
         let mut fraction = String::new();
-        // `..` is the range separator and `.` alone cannot open a field name, so a fraction is
-        // exactly a dot with a digit behind it.
+        // A dot with a digit behind it, so `..` stays the range separator.
         let has_fraction =
             self.peek() == Some('.') && self.peek2().is_some_and(|c| c.is_ascii_digit());
         if has_fraction {
@@ -485,9 +468,6 @@ impl<'a> Lexer<'a> {
             return self.decimal(start, &whole, &fraction, exponent.is_some());
         }
 
-        // A width suffix is only a literal's own type where the literal is an integer; on
-        // `1.5u8` the `u8` is read and then refused below with everything else that follows a
-        // fraction or an exponent.
         let width = if !has_fraction && exponent.is_none() {
             self.width_suffix(start)
         } else {
@@ -495,8 +475,6 @@ impl<'a> Lexer<'a> {
         };
         if let Some(Ok(ty)) = width {
             return match whole.parse::<i128>() {
-                // A decimal spelling is a value, so its bound is the type's range: `255u8` is the
-                // largest `U8` and `256u8` is refused here rather than three passes later.
                 Ok(v) if ty.holds(v) => TokenKind::Fixed {
                     ty,
                     bits: ty.normalize(v as u64),
@@ -512,8 +490,6 @@ impl<'a> Lexer<'a> {
                 }
             };
         }
-        // A suffix that was read and refused falls through to the plain integer below, for the
-        // reason the hex path gives.
 
         if self.peek().is_some_and(is_ident_start) {
             let suffix_start = self.pos;
@@ -558,8 +534,6 @@ impl<'a> Lexer<'a> {
             text.push('e');
             text.push_str(e);
         }
-        // Rust's parser is correctly rounded and saturates to an infinity rather than failing,
-        // which is what IEEE says decimal-to-binary conversion does.
         match text.parse::<f64>() {
             Ok(v) => TokenKind::Float(v),
             Err(_) => {
@@ -574,8 +548,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// The `e` of an exponent and its digits, consumed only when digits actually follow: `1e9` is a
-    /// float and `1 else` is two tokens.
+    /// Consumed only when digits follow, so `1 else` is two tokens.
     fn exponent(&mut self) -> Option<String> {
         if !matches!(self.peek(), Some('e' | 'E')) {
             return None;
@@ -595,8 +568,7 @@ impl<'a> Lexer<'a> {
         Some(out)
     }
 
-    /// `rust_decimal`'s domain, checked here so that every `Lit::Decimal` in the AST is one the
-    /// evaluator can build.
+    /// Checks `rust_decimal`'s domain so every `Lit::Decimal` is buildable by the evaluator.
     fn decimal(
         &mut self,
         start: usize,
@@ -770,8 +742,6 @@ impl<'a> Lexer<'a> {
                 Some(c) => {
                     let start = self.pos;
                     self.bump();
-                    // The file was read as UTF-8 or it did not parse at all, so these are the bytes
-                    // the author is looking at.
                     let encoded: String = c
                         .to_string()
                         .bytes()
@@ -790,7 +760,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// The two hex digits of a `\xNN`, with the backslash and `x` consumed.
+    /// The two hex digits of a `\xNN`, after the `\x`.
     fn hex_byte(&mut self, esc_start: usize) -> u8 {
         let start = self.pos;
         for _ in 0..2 {
@@ -816,8 +786,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// `None` means the character was not punctuation: an error was reported and the character
-    /// consumed, so the caller should just carry on.
+    /// `None`: not punctuation; already reported and consumed.
     fn punct(&mut self) -> Option<TokenKind> {
         let start = self.pos;
         let c = self.bump()?;

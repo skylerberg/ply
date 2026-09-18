@@ -882,8 +882,8 @@ fn what_the_fragment_refuses_the_standard_library_for() {
     // losing definitions to, and `handle` is not. ADR 0041 stages the work on this.
     assert!(
         performed.len() > handled.len(),
-        "`perform` no longer costs more definitions than `handle`, so ADR 0041's staging should \
-         be re-read: perform {performed:?}, handle {handled:?}"
+        "`perform` no longer costs more definitions than `handle`: perform {performed:?}, \
+         handle {handled:?}"
     );
 }
 
