@@ -1,34 +1,19 @@
-//! What one emitted body is, kept between runs.
-//!
-//! The emitted C, one body at a time, keyed on its definition's hash and the texts its sites are
-//! byte offsets into: a site can move under a definition whose hash did not.
-//!
-//! A body's text names the unit's tables by its own positions -- `@@c3@@`, resolved when the body
-//! goes into a unit -- so what is kept here is a function of the body alone and can be read back
-//! into a unit that looks nothing like the one it came from.
+//! Emitted bodies and units, kept between runs. A body names tables by its own positions
+//! (`@@c3@@`), so a cached body is a function of the body alone.
 
 use super::tables::Tables;
 use ply_eval::Value;
 use ply_span::Symbol;
 use std::path::PathBuf;
 
-/// Where emitted bodies are kept. Beside the objects, under `PLY_C_CACHE`.
 fn dir() -> PathBuf {
     super::load::cache_dir().join("emit")
 }
 
-/// What a body's C is a function of, as one name.
-///
-/// The definition's hash covers its own text *and* every definition it references, and
-/// `HashOutput::defs` moves when any of them does.
-///
-/// Beside it: the constructor table, whose positions the text writes as numbers, and the compiler
-/// binary's own stamp, so that rebuilding `ply` throws the cache away rather than asking anyone to
-/// remember to.
+/// What a body's C is a function of: the definition's hash, the constructor table, the helper
+/// table and the binary's stamp, so rebuilding `ply` invalidates the cache.
 pub fn key(def_hash: &str, ctors: &str) -> String {
     let mut h = blake3::Hasher::new();
-    // The runtime's helper table is part of the key: a body's C calls the helpers by shape, and
-    // a shape that moved would otherwise be read back from a body emitted against the old one.
     for part in [
         "ply-c-emit-4",
         &exe_stamp(),
@@ -42,8 +27,7 @@ pub fn key(def_hash: &str, ctors: &str) -> String {
     h.finalize().to_hex().to_string()
 }
 
-/// The running binary's size and modification time, which is a cheap identity for "the emitter as
-/// it is today".
+/// The running binary's size and modification time: a cheap identity for this build.
 fn exe_stamp() -> String {
     let Ok(exe) = std::env::current_exe() else {
         return String::new();
@@ -71,12 +55,7 @@ pub fn ctors_digest(ctors: &[(Symbol, usize)]) -> String {
     h.finalize().to_hex()[..32].to_string()
 }
 
-/// A refusal is worth keeping too, or a definition this tier will not take is asked of the emitter
-/// again every run.
-///
-/// Keyed with the fragment folded in, because a refusal is not a property of the definition alone:
-/// a body is refused when something it calls was not offered, and a different command offers a
-/// different set. A success needs no such thing -- its calls are recorded and checked.
+/// A refusal's key folds in the offered set: a body is refused when a callee was not offered.
 pub fn refusal_key(def_hash: &str, ctors: &str, fragment: &str) -> String {
     key(&format!("{def_hash}/{fragment}"), ctors)
 }
@@ -98,7 +77,6 @@ pub fn read_refusal(key: &str) -> Option<String> {
     std::fs::read_to_string(dir().join(format!("{key}.refused"))).ok()
 }
 
-/// Keep a refusal.
 pub fn write_refusal(key: &str, reason: &str) {
     let d = dir();
     if std::fs::create_dir_all(&d).is_err() {
@@ -115,21 +93,20 @@ pub fn read(key: &str) -> Option<(String, Tables)> {
     decode(&std::fs::read_to_string(dir().join(format!("{key}.body"))).ok()?)
 }
 
-/// Keep this body. A failure to write is a cache that did not help, never a run that fails.
+/// Keep this body; a failed write is ignored.
 pub fn write(key: &str, text: &str, tables: &Tables) {
     let d = dir();
     if std::fs::create_dir_all(&d).is_err() {
         return;
     }
     let encoded = encode(text, tables);
-    // Written beside and renamed, so a reader never sees half a body.
+    // Renamed into place, so a reader never sees half a body.
     let tmp = d.join(format!("{key}.{}.tmp", std::process::id()));
     if std::fs::write(&tmp, encoded).is_ok() {
         let _ = std::fs::rename(&tmp, d.join(format!("{key}.body")));
     }
 }
 
-/// One body as lines: the tables it names, then its text.
 pub fn encode(text: &str, t: &Tables) -> String {
     let mut out = encode_tables(&t.consts, &t.builtins, &t.fields, &t.shapes, &t.lambdas);
     out.push_str(&format!("calls {}\n", t.calls.len()));
@@ -149,7 +126,7 @@ pub fn encode(text: &str, t: &Tables) -> String {
     out
 }
 
-/// The five tables a body and a whole unit both name, in one encoding, so the two cannot drift.
+/// The five tables a body and a whole unit both name, in one shared encoding.
 pub(super) fn encode_tables(
     consts: &[Value],
     builtins: &[ply_eval::Builtin],
@@ -164,7 +141,6 @@ pub(super) fn encode_tables(
             Value::Str(s) => format!("s {}\n", hex(s.as_bytes())),
             Value::Bytes(b) => format!("b {}\n", hex(b)),
             Value::Fixed(f) => format!("f {} {}\n", f.ty as u8, f.bits()),
-            // A `Float` by its bits and a `Decimal` by its mantissa and scale: exact both ways.
             Value::Float(x) => format!("x {:016x}\n", x.to_bits()),
             Value::Decimal(d) => format!("d {} {}\n", d.mantissa(), d.scale()),
             other => unreachable!("a constant this tier does not pool: {other:?}"),
@@ -196,7 +172,7 @@ pub(super) fn encode_tables(
     out
 }
 
-/// The same five, read back. Leaves the cursor after them.
+/// Inverse of [`encode_tables`]; leaves the cursor after them.
 pub(super) fn decode_tables(s: &str, at: &mut usize) -> Option<Tables> {
     let mut t = Tables::default();
     let n = count(line(s, at)?, "consts")?;
@@ -212,8 +188,7 @@ pub(super) fn decode_tables(s: &str, at: &mut usize) -> Option<Tables> {
                 let (ty, bits) = rest.split_once(' ')?;
                 let n: u8 = ty.parse().ok()?;
                 let ty = ply_ty::INT_TYPES.iter().find(|t| **t as u8 == n)?;
-                // Written unsigned by `encode_tables` and as the wrapped `Int` by the emitter in
-                // Ply, whose integers are signed: one bit pattern either way.
+                // Unsigned from `encode_tables`, signed from the Ply emitter: same bit pattern.
                 let bits: u64 = match bits.parse::<u64>() {
                     Ok(b) => b,
                     Err(_) => bits.parse::<i64>().ok()? as u64,
@@ -231,9 +206,7 @@ pub(super) fn decode_tables(s: &str, at: &mut usize) -> Option<Tables> {
                     .ok()?,
                 )
             }
-            // The emitter written in Ply keeps a literal as its source text, and converts it
-            // here by the rule the lexer converts it with: the same parse, underscores dropped,
-            // the `m` suffix off a `Decimal`.
+            // The Ply emitter keeps these literals as source text; parse as the lexer does.
             "X" => Value::Float(rest.replace('_', "").parse().ok()?),
             "D" => Value::Decimal(
                 rest.replace('_', "")
@@ -265,9 +238,7 @@ pub(super) fn decode_tables(s: &str, at: &mut usize) -> Option<Tables> {
     Some(t)
 }
 
-/// Read one line and step the cursor past it, so that the text's start is a byte offset rather
-/// than a search for a marker: a field, a call or a shape can be spelled anything at all, `text`
-/// included, and a marker they can spell is a marker that splits the file in the wrong place.
+/// Read one line and step the cursor past it; the text is found by offset, never by a marker.
 pub(super) fn line<'a>(s: &'a str, at: &mut usize) -> Option<&'a str> {
     let rest = s.get(*at..)?;
     let end = rest.find('\n')?;
@@ -323,9 +294,7 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// What a unit is a function of: every offered definition and its hash, the constructor table,
-/// the emitter, and the binary. The *names* alone are not enough -- an edit leaves the offered
-/// set identical and changes what the unit contains.
+/// What a unit is a function of: every offered definition's hash, the constructors, the emitter.
 pub fn unit_key(
     keys: &std::collections::HashMap<String, String>,
     offered: &[&str],
@@ -338,8 +307,7 @@ pub fn unit_key(
     h.update(b"ply-c-unit-3");
     h.update(emitter.as_bytes());
     for name in sorted {
-        // Without a hash for every offered definition there is nothing to notice an edit by, and
-        // a unit cache that cannot notice one is a wrong answer rather than a slow one.
+        // No hash means an edit could go unnoticed, so no unit key.
         let hash = keys.get(name)?;
         h.update(name.as_bytes());
         h.update(&[0]);
@@ -349,23 +317,10 @@ pub fn unit_key(
     Some(key(&h.finalize().to_hex()[..32], ctors))
 }
 
-/// How many times a unit has been rebuilt from the cache rather than emitted.
-///
-/// The saving here is invisible from the outside: a unit put back together answers exactly what
-/// the one that built it answered, which is the whole point and also means a test cannot tell the
-/// two apart by asking. This is what it asks instead.
+/// How many times a unit has been rebuilt from the cache rather than emitted; for tests.
 pub static UNITS_REUSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// The object a unit key was built as. The object carries its own table (`exports.rs`), so a
-/// worker that finds this has no reason to assemble the C to learn the name of an object it
-/// already has, and nothing else to read.
-///
-/// A body cache saves the *emitting*, which is most of one worker's time and none of the other
-/// ten's: each would still walk fourteen hundred cached bodies, substitute their placeholders and
-/// assemble twenty-nine megabytes of C, only to hand it to an object cache that already had the
-/// answer. Sharing the built unit in process is not available -- `ply_eval::Value` holds `Rc`,
-/// so nothing containing one crosses a rayon worker -- so what is shared is this, through the
-/// same file system the objects already live on.
+/// The object a unit key was built as, so a worker skips assembling the C entirely.
 pub fn read_unit(key: &str) -> Option<String> {
     let s = std::fs::read_to_string(dir().join(format!("{key}.unit"))).ok()?;
     let object = s.trim();

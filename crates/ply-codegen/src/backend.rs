@@ -19,8 +19,7 @@ const MAX_ARITY: usize = 16;
 struct Admitted {
     entry: Entry,
     arity: usize,
-    /// The memo index of a pure nullary root, whose answer the seam remembers as compiled
-    /// code does.
+    /// The memo index of a pure nullary root.
     constant: Option<usize>,
 }
 
@@ -33,12 +32,9 @@ pub struct Declines {
     pub arity: u64,
     /// An entry arrived while another was running.
     pub reentered: u64,
-    /// A builtin allocated in the fragment's private arena, which means the compile-time refusal of
-    /// `cell_get`/`cell_set` has a hole in it.
+    /// A builtin touched cells, so the compile-time refusal of `cell_get`/`cell_set` has a hole.
     pub touched_cells: u64,
-    /// The body answered a value holding a closure, a cell, a task, a continuation or a secret —
-    /// nothing this boundary carries out. The machine would refuse it too; the backend refuses
-    /// it first, so no registry width can leak one.
+    /// The answer held a closure, cell, task, continuation or secret, which cannot cross out.
     pub answer: u64,
 }
 
@@ -48,35 +44,30 @@ impl Declines {
     }
 }
 
-/// One run's compiled unit: the program it answers for, the set of definitions it compiles, and
-/// the counters every worker's backend adds to.
+/// One run's compiled unit, shared by every worker's backend.
 pub struct Unit {
     /// The address of the `Program` the machine is running, for `Compiled::describes`.
     origin: usize,
     source: &'static Source,
     /// The set the emitter compiles as one unit, closed under calls.
     compiled: Vec<String>,
-    /// The subset of `compiled` whose whole signature is `Int` or `Bool`, which is the only part
-    /// the machine can ever be offered.
+    /// The subset of `compiled` the machine may be offered.
     members: BTreeSet<Symbol>,
     /// Definitions the emitter refused, with the construct that refused each.
     refusals: Vec<(String, String)>,
     counters: Counters,
-    /// Nanoseconds the pre-flight build took: whole-program, paid once, and the half that does
-    /// **not** scale with the worker count, since every worker after it reads the unit back.
+    /// Nanoseconds the pre-flight build took, paid once; workers read the unit back.
     analysis_nanos: u64,
-    /// Nanoseconds workers have spent building their unit, and how many have paid it.
     codegen_nanos: AtomicU64,
     compiles: AtomicU64,
     /// Workers whose build failed after the pre-flight in [`Unit::over_front`] succeeded.
     poisoned: AtomicU64,
-    /// The C of a unit produced elsewhere, an artifact's, that this one loads rather than builds.
-    /// The C describes itself (`c::Exports`), so the text is all an artifact carries of it.
+    /// An artifact's self-describing C, loaded rather than built.
     embedded: Option<String>,
 }
 
 impl Unit {
-    /// [`Unit::over_front`] over the port's answer for `texts`.
+    /// [`Unit::over_front`] over the front end's answer for `texts`.
     pub fn over_with_texts(
         program: &Program,
         resolved: &ply_syntax::resolve::Resolved,
@@ -99,9 +90,7 @@ impl Unit {
         Unit::over_front(program, resolved, &front, texts)
     }
 
-    /// [`Unit::over_with_texts`] over a front end's answer the caller already has. This is the door
-    /// the CLI uses: the driver enters the port once per load (ADR 0052 §1), and a unit built here
-    /// runs no front end of its own.
+    /// [`Unit::over_with_texts`] over a front end's answer the caller already has.
     pub fn over_front(
         program: &Program,
         resolved: &ply_syntax::resolve::Resolved,
@@ -110,8 +99,7 @@ impl Unit {
     ) -> Result<&'static Unit> {
         let front: &'static ply_ty::Front = Box::leak(Box::new(front.clone()));
         let keys = crate::source::emit_keys(front);
-        // The copy is what the compiled bodies are generated from, so a unit shares no state at all
-        // with the machine's program.
+        // Compiled from a copy, so the unit shares no state with the machine's program.
         let origin = std::ptr::from_ref(program) as usize;
         let program: &'static Program = Box::leak(Box::new(program.clone()));
         let resolved: &'static ply_syntax::resolve::Resolved =
@@ -121,9 +109,7 @@ impl Unit {
         ));
         let candidates = source.functions();
         let started = std::time::Instant::now();
-        // The pre-flight is the analysis: the emitter's fixpoint over every function is what
-        // decides the compiled set, and the unit it leaves in the cache is the one every worker
-        // reads back. It is also the reason this function is fallible.
+        // The pre-flight decides the compiled set and leaves the unit every worker reads back.
         let (compiled, refusals) = closure(source, &candidates)?;
         let members: BTreeSet<Symbol> = compiled
             .iter()
@@ -147,10 +133,7 @@ impl Unit {
         Ok(Box::leak(Box::new(unit)))
     }
 
-    /// A unit produced elsewhere, which is what an artifact carries: its definitions are the ones
-    /// its own table says it took, and nothing here asks a producer for anything. The C is
-    /// compiled and loaded once here to read that table; each `build` loads the same object
-    /// again from the cache.
+    /// An artifact's unit, produced elsewhere; loaded once here to read its table.
     pub fn embedded(
         program: &Program,
         resolved: &ply_syntax::resolve::Resolved,
@@ -196,11 +179,7 @@ impl Unit {
         self.source.ctors()
     }
 
-    /// The bodies this unit builds, as the concrete type rather than behind `dyn Compiled`.
-    ///
-    /// `attach` is the machine's door and hands back the trait object it wants. A test that is
-    /// about the seam rather than about a program needs the counters, `admits` and the reentrancy
-    /// hook that only `Bodies` has, and this is that door.
+    /// The bodies this unit builds, as the concrete type rather than `dyn Compiled`, for tests.
     pub fn bodies(&'static self) -> Result<Rc<Bodies>> {
         self.build().map(Rc::new)
     }
@@ -234,8 +213,7 @@ impl Unit {
             Some(text) => {
                 crate::c::load_unit(text, Some(self.source.module_sources()), "artifact")?.0
             }
-            // Offered the same set the pre-flight was, so the unit's key is the pre-flight's and a
-            // worker reads that unit back rather than emitting it again.
+            // The same set as the pre-flight, so the unit key matches and the unit is read back.
             None => {
                 let candidates = self.source.functions();
                 let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
@@ -252,10 +230,8 @@ impl Unit {
 }
 
 impl Provider for Unit {
-    /// One worker's compiled backend.
     fn attach(&'static self, spec: &ply_eval::BackendSpec) -> Rc<dyn ply_eval::Compiled> {
         if self.members.is_empty() {
-            // Nothing this worker could ever be asked, so nothing to compile.
             return ply_eval::backend::wrap(Rc::new(Absent { unit: self }), spec);
         }
         match self.build() {
@@ -272,8 +248,7 @@ impl Provider for Unit {
         "c"
     }
 
-    /// The registry width, because it decides which definitions run natively at all: a pass earned
-    /// under the narrow registry entered fewer of them, and is not the wide registry's pass.
+    /// The registry width, since it decides which definitions run natively.
     fn variant(&self) -> String {
         registry_width().to_string()
     }
@@ -335,10 +310,7 @@ pub struct Bodies {
     /// Kept alive because every [`Entry`] below points into its executable pages.
     _code: crate::c::Native,
     admitted: HashMap<Symbol, Admitted>,
-    /// One context for every entry, and the `RefCell` is the proof rather than a comment:
-    /// [`crate::rt::Ctx::slots`] is a bump arena with no pop, so an entry that began inside another
-    /// would have to either reset it — leaving the outer activation's handles indexing different
-    /// values of the same type — or let it grow for the life of the program.
+    /// One context for every entry; the `RefCell` forbids nesting, since `Ctx::slots` has no pop.
     ctx: RefCell<crate::rt::Ctx>,
     entered: Cell<u64>,
     declines: Cell<Declines>,
@@ -369,13 +341,7 @@ impl Bodies {
                      every call and no reason recorded against it"
                 );
             }
-            // A definition whose signature mentions a fixed width is compiled and called
-            // directly by its neighbours, and is not offered here: compiled code holds a width as
-            // the tagged immediate an `Int` is held as, so a value crossing either way would be
-            // read as an `Int` where a `U32` was declared — a wrong answer rather than a slow one
-            // (ADR 0039). `ply_eval`'s `Gate::ArgumentType` and `Gate::AnswerType` refuse the same
-            // call on the machine's side; this is the provider declining rather than relying on
-            // that, so nothing depends on which of the two runs first.
+            // Fixed widths are held as tagged `Int`s, so one crossing the seam would read wrongly.
             if unit
                 .source
                 .check
@@ -412,24 +378,17 @@ impl Bodies {
         self.entered.get()
     }
 
-    /// Runs `f` with this backend's context already borrowed.
-    ///
-    /// `Ctx` is one flat frame, so an entry that arrives while another is running would alias the
-    /// outer one's words; `enter` declines on `try_borrow_mut` rather than nesting. That guard is
-    /// unreachable from a program -- the machine is single-threaded and an entry does not call
-    /// back into `enter` -- so this is how a test reaches it, and it exists for that.
+    /// Runs `f` with the context borrowed, so a test can reach the reentrancy decline.
     pub fn while_entered<T>(&self, f: impl FnOnce() -> T) -> T {
         let _held = self.ctx.borrow_mut();
         f()
     }
 
-    /// Whether this backend would be offered `name` at all: it is registered, its signature
-    /// carries, and it has a body. What the machine asks before it asks anything else.
+    /// Whether this backend would be offered `name` at all.
     pub fn admits(&self, name: &str) -> bool {
         self.admitted.contains_key(&Symbol::new(name))
     }
 
-    /// Forgets what has been entered and declined, so a test can count one call rather than a run.
     pub fn reset_counts(&self) {
         self.entered.set(0);
         self.declines.set(Declines::default());
@@ -446,7 +405,6 @@ impl Bodies {
         Run::Declined
     }
 
-    /// One entry, on whatever fuel the caller names.
     fn run(&self, name: &Symbol, args: &[Value], fuel: usize) -> Run {
         let Some(admitted) = self.admitted.get(name) else {
             return self.decline(|d| d.not_compiled += 1);
@@ -459,8 +417,6 @@ impl Bodies {
         };
 
         let tables = Rc::clone(&ctx.tables);
-        // A pure nullary root already remembered is answered without running: the memo's word
-        // as the value it was converted to once.
         if let Some(index) = admitted.constant
             && let Some(kept) = tables.memoized(index)
             && let Some(value) = tables.memo_value(kept)
@@ -471,13 +427,10 @@ impl Bodies {
             return Run::Answered(value);
         }
         ctx.begin(i64::try_from(fuel).unwrap_or(i64::MAX));
-        // The arguments cross into the entry's own words, deep, and the answer crosses back the
-        // same way below: nothing outside the entry ever holds a word.
+        // Values are deep-converted in and out: nothing outside the entry ever holds a word.
         let mut handles = [0i64; MAX_ARITY];
         let before = ctx.heap.allocated();
-        // A value this unit answered from its memo goes back in as the word it came from; a
-        // call whose arguments are all such words is a pure function of remembered inputs, and
-        // is remembered in turn.
+        // A call whose arguments are all memoized words is itself memoized.
         let mut all_memo = !args.is_empty();
         for (slot, value) in handles.iter_mut().zip(args) {
             *slot = match tables.memo_word(value) {
@@ -497,10 +450,8 @@ impl Bodies {
             return Run::Answered(value);
         }
         let inward = (ctx.heap.allocated() - before) as u64;
-        // SAFETY: `admitted.entry` is a pointer into `self._code`'s finalized executable pages,
-        // which this struct owns and outlives the call; `ctx` is the context that unit's own
-        // `Ctx::new` built, borrowed uniquely here; and `handles` is `MAX_ARITY` wide against an
-        // arity this registration refused to exceed.
+        // SAFETY: `self._code` owns the entry's pages, `ctx` is uniquely borrowed, and
+        // `handles` is `MAX_ARITY` wide, which `Bodies::new` refused to exceed.
         let mut out =
             unsafe { (admitted.entry)(&mut *ctx as *mut crate::rt::Ctx, handles.as_ptr()) };
         if ctx.sims.last().is_some_and(|sim| sim.is_production()) {
@@ -516,10 +467,7 @@ impl Bodies {
             let out_of_stack = ctx.failed == crate::rt::FAILED_OUT_OF_STACK;
             let out_of_fuel = out_of_stack || ctx.failed == crate::rt::FAILED_OUT_OF_FUEL;
             let raised = if out_of_fuel {
-                // Tier-only (ADR 0048): no machine follows to raise the real one, so the limit is
-                // the tier's own to report. The count is the budget this entry was handed, which is
-                // the language's `DEFAULT_MAX_CALLS`; a native-stack floor tripped inside that
-                // budget still reports the budget, because that is the bound the program overran.
+                // Tier-only: no machine follows, so report the budget even on a stack overflow.
                 Some(
                     ply_span::Diagnostic::error(
                         ply_span::codes::RUNTIME_ERROR,
@@ -539,7 +487,6 @@ impl Bodies {
             };
             ctx.end();
             drop(ctx);
-            // The entry ran and raised: an answer about the program, not a decline.
             self.entered.set(self.entered.get() + 1);
             return match raised {
                 Some(raised) => Run::Raised(raised),
@@ -551,10 +498,7 @@ impl Bodies {
             drop(ctx);
             return self.decline(|d| d.touched_cells += 1);
         }
-        // A pure nullary root's answer is remembered as compiled code remembers it, and the
-        // value it is converted to once is kept beside the word: the next entry through this
-        // root answers that value without running, and the next entry handed that value passes
-        // the word back in without converting it.
+        // Memoize the word and its converted value, so later entries skip both run and conversion.
         let mut walked = crate::heap::Walked::default();
         let value = crate::heap::Heap::to_value_counted(&tables.layouts, out, &mut walked);
         let kept = match admitted.constant {
@@ -622,8 +566,7 @@ impl ply_eval::Compiled for Bodies {
         }
     }
 
-    // An entry that arrives while another is running finds the context borrowed: `run` declines
-    // it, so there is nothing to seed, take or read for it.
+    // A borrowed context means a nested entry, which `run` declines, so there is nothing to take.
     fn take_performed(&self) -> Vec<ply_ty::EffectAtom> {
         self.ctx
             .try_borrow_mut()
@@ -707,21 +650,13 @@ impl Policed for Bodies {
     }
 }
 
-/// Which of the compiled bodies are registered for the machine to enter.
-///
-/// Read once per process, so a test cannot set it and expect it to take now that the crate's tests
-/// share one binary; measure this arm through the command.
-/// Every function the fragment compiled is registered, and the seam admits each call by its
-/// carried types. ADR 0030 shipped the scalar-signature registry instead, because registering
-/// more only added leaf islands while the callback family was refused; with that family lowered
-/// the wide registry enters at the parse root and beats no backend on the front-end row
-/// (`benches/front-end`). `PLY_CODEGEN_REGISTER=narrow` keeps the arm that record measured.
+/// Which compiled bodies the machine may enter: all, or only scalar signatures under
+/// `PLY_CODEGEN_REGISTER=narrow` (read once per process).
 fn registers(source: &Source, name: &str) -> bool {
     !narrow_registry() || source.scalar_signature(name)
 }
 
-/// Read once per process, and read here rather than at each site so that the knob has one
-/// spelling: it is part of this provider's identity, which a cached result is namespaced by.
+/// Part of this provider's identity, which cached results are namespaced by.
 pub fn registry_width() -> &'static str {
     if narrow_registry() { "narrow" } else { "wide" }
 }
@@ -732,13 +667,7 @@ pub fn narrow_registry() -> bool {
         .get_or_init(|| std::env::var("PLY_CODEGEN_REGISTER").is_ok_and(|v| v.trim() == "narrow"))
 }
 
-/// The largest subset of `candidates` the emitter compiles **as one unit**, and every function
-/// that was dropped with the reason.
-///
-/// Public so that a measurement can compile the same set the tier does. The set is the emitter's
-/// fixpoint: emit everything, drop what refused, go round again, because dropping a body refuses
-/// the ones that call it. Running it builds the unit, so a worker offered the same candidates
-/// reads it back rather than paying it again.
+/// The largest subset of `candidates` the emitter compiles as one unit, and what it dropped.
 pub fn closure(source: &'static Source, candidates: &[String]) -> Result<Closed> {
     let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
     let (native, refused) =

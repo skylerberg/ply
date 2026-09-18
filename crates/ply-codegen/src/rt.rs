@@ -1,10 +1,5 @@
-//! The runtime compiled code calls into: every helper a body reaches for what it does not lower
-//! inline, over the words [`crate::heap`] lays out, and the context an entry runs in.
-//!
-//! Ownership follows Perceus as the code generator marks it: a helper that *takes* an argument
-//! owns it from then on and releases it when it is done or keeps it inside what it builds; a
-//! helper that *reads* one leaves its count alone; a helper answers a word its caller owns.
-//! Nothing here recurses over a value: a count reaching zero dismantles with a worklist.
+//! The helpers compiled code calls into and the context an entry runs in. A helper that takes an
+//! argument owns it, one that reads leaves its count alone, and every answer is the caller's.
 
 use crate::heap::{
     self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE, KIND_CTOR,
@@ -32,52 +27,38 @@ pub struct Tables {
     /// The same constants as immortal words, which a literal answers.
     pub const_words: Vec<Word>,
     pub layouts: Layouts,
-    /// Every field name a compiled body reads by name, so that a field access is an index rather
-    /// than a `Symbol` rebuilt per evaluation.
+    /// Every field name a compiled body reads, so a field access is an index.
     pub fields: Vec<Symbol>,
     /// Every builtin a compiled body may call.
     pub builtins: Vec<Builtin>,
-    /// Every compiled function by index, as its finalized address: what a native closure's
-    /// `code` is read from when the closure is built, since no address exists until the module
-    /// is finalized and every closure is built after that.
+    /// Every compiled function's finalized address by index, for building native closures.
     pub functions: Vec<usize>,
-    /// What each pure nullary function evaluated to, by the index above, once it has: the
-    /// machine's memo (`ply_eval::memo`) for compiled code, held as immortal words.
+    /// Each pure nullary function's memoized answer by index, as an immortal word.
     pub memo: RefCell<Vec<Option<Word>>>,
     /// Owns the constant pool's and the memo's objects for as long as the unit lives.
     pub immortals: RefCell<Heap>,
-    /// The two hundred and fifty-six one-byte values, each made immortal the first time it is
-    /// asked for, so `byte_of_int` allocates nothing.
+    /// The 256 one-byte values, each made immortal when first asked for.
     pub bytes: RefCell<[Word; 256]>,
-    /// Per constructor index, the immortal singleton a nullary one is, or `0`; and the empty
-    /// list and the empty map, made once — no body allocates any of these.
+    /// Per constructor index, a nullary one's immortal singleton, or `0`.
     pub nullaries: Vec<Word>,
     pub empty_list: Word,
     pub empty_map: Word,
-    /// The memo's words as the values the seam converted them to, once each, and those values'
-    /// identities back to the words: what lets a phase's tree cross the seam and come back
-    /// without being rebuilt either way.
+    /// Memo words and their converted values, both ways, so a tree crosses the seam unrebuilt.
     pub memo_values: RefCell<HashMap<Word, Value>>,
     pub memo_words: RefCell<HashMap<Identity, Word>>,
-    /// The answers of roots called with nothing but memo words, by the root and the words:
-    /// a pure function of remembered inputs, remembered in turn, up to a bound.
+    /// Answers of roots called with only memo words, up to [`CALL_MEMO_LIMIT`].
     pub calls: RefCell<HashMap<(Symbol, Vec<Word>), Word>>,
-    /// Each module's source by the index a site names, in program order. Filled from the program
-    /// at load and never cached: a `SourceId` is assigned per load.
+    /// Each module's source by site index; never cached, since a `SourceId` is per load.
     pub sources: Vec<SourceId>,
 }
 
-/// How many calls of roots over memo words a unit remembers; past it, a call is run and
-/// converted as any other.
+/// How many calls of roots over memo words a unit remembers.
 pub const CALL_MEMO_LIMIT: usize = 64;
 
-/// How many of an answer's parts are given identities of their own, one level down: the fields
-/// a body pulls out of a record or a constructor, and the elements of a short list.
+/// How many of an answer's direct parts get identities of their own.
 const PARTS_LIMIT: usize = 64;
 
-/// What identifies a value the seam handed out, without walking it: the allocation behind it
-/// and, for a list, the window it shows of that allocation. A value with no allocation of its
-/// own has no identity and is converted like any other.
+/// A handed-out value's allocation, plus a list's window onto it: an identity without a walk.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Identity {
     Record(usize),
@@ -105,8 +86,7 @@ impl Tables {
         self.memo.borrow().get(index).copied().flatten()
     }
 
-    /// Remembers `w`, world-independent, as the answer of the pure nullary function at `index`:
-    /// a copy in the tables' own heap, which outlives every entry, answered from then on.
+    /// Remembers `w` as pure nullary function `index`'s answer, copied into the immortal heap.
     pub fn memoize(&self, index: usize, w: Word) -> Word {
         let kept = self.immortals.borrow_mut().adopt(w);
         let mut memo = self.memo.borrow_mut();
@@ -122,16 +102,14 @@ impl Tables {
         self.memo_values.borrow().get(&w).cloned()
     }
 
-    /// The memo word a value came from, if the seam handed that value out. The values kept in
-    /// `memo_values` hold their allocations, so an identity here cannot be a later value's.
+    /// The memo word a value came from; `memo_values` holds the allocations, so ids are not reused.
     pub fn memo_word(&self, v: &Value) -> Option<Word> {
         let id = identity(v)?;
         self.memo_words.borrow().get(&id).copied()
     }
 
-    /// Keeps the value a memo word was just converted to, and gives the value's parts one level
-    /// down — a record's fields, a constructor's arguments, a short list's elements — the words
-    /// they came from, since a body that takes a memo value apart hands those parts back in.
+    /// Keeps `v` for memo word `w` and maps its direct parts to their words, since a body that
+    /// takes a memo value apart hands those parts back in.
     pub fn remember(&self, w: Word, v: &Value) {
         // Replacing the value would free allocations its recorded identities still name.
         if self.memo_values.borrow().contains_key(&w) {
@@ -178,8 +156,7 @@ impl Tables {
         self.memo_value(kept)
     }
 
-    /// Remembers `out`, world-independent, as the answer of `root` over these memo words, up to
-    /// the bound; answers the word to keep, or nothing when the bound is reached.
+    /// Remembers `out` for `root` over these memo words; `None` once the bound is reached.
     pub fn memoize_call(&self, root: &Symbol, words: &[Word], out: Word) -> Option<Word> {
         let mut calls = self.calls.borrow_mut();
         if calls.len() >= CALL_MEMO_LIMIT {
@@ -202,8 +179,7 @@ impl Tables {
         w
     }
 
-    /// Whether the constant pool holds a value that must never sit in a table outliving the call
-    /// that made it.
+    /// Whether the constant pool holds a value that must not outlive the call that made it.
     pub fn retains_a_handle(&self) -> Option<&'static str> {
         self.consts.iter().find_map(holds_a_handle)
     }
@@ -234,25 +210,21 @@ pub(crate) fn holds_a_handle(value: &Value) -> Option<&'static str> {
     }
 }
 
-/// The failure a compiled function reports by, and the fuel it spends.
+/// `Ctx::failed` when the fuel ran out.
 pub const FAILED_OUT_OF_FUEL: i64 = 2;
 /// The prologue found the native stack nearly out before the fuel was.
 pub const FAILED_OUT_OF_STACK: i64 = 3;
-/// A clause that bound `resume` answered without calling it: the fragment is unwinding to the
-/// `handle` the clause belongs to, and `Ctx::unwind` names it and carries the value.
+/// A clause answered without resuming: `Ctx::unwind` carries its value to its `handle`.
 pub const FAILED_UNWIND: i64 = 4;
 
-/// One installed handler: the frame a `handle` site pushes and a `perform` searches, innermost
-/// out. ADR 0043.
+/// An installed handler: pushed by a `handle` site, searched innermost-out by a `perform`.
 pub struct HandlerFrame {
     clauses: Vec<FrameClause>,
     /// The `return` clause's closure, or zero.
     ret: Word,
-    /// A `simulate` region's frame: it answers `task`, `clock`, `random` and `sim` through the
-    /// scheduler and has no clauses of its own.
+    /// A `simulate` region's clause-less frame, answering `task`, `clock`, `random` and `sim`.
     simulate: bool,
-    /// The body of a `handle` with a clause that resumes off the tail runs on a stack of its own,
-    /// and this frame sits at the bottom of that stack's frames; the index names the body.
+    /// For a `handle` resuming off the tail: the detached body whose own stack this frame bottoms.
     detached: Option<usize>,
 }
 
@@ -276,10 +248,8 @@ impl HandlerFrame {
     }
 }
 
-/// The handler frames of one stack. A task's or a detached body's frames chain to the stack it
-/// was entered from through `parent`, so a `perform` searches its own stack and then the one it
-/// runs under, which is what a deep handler means when a resumed body runs inside the clause
-/// that resumed it. A depth names a frame within one stack and does not move.
+/// One stack's handler frames, chained to the stack it was entered from, which a `perform`
+/// searches next. A depth names a frame within one stack.
 pub(crate) struct Frames {
     pub(crate) list: Vec<HandlerFrame>,
     pub(crate) parent: Option<usize>,
@@ -294,15 +264,13 @@ impl Frames {
     }
 }
 
-/// One clause: its effect and resource under their program-wide names, the operation, the
-/// closure the clause body became, and whether the clause binds `resume`.
+/// One clause, under program-wide effect and resource names.
 pub(crate) struct FrameClause {
     effect: Symbol,
     resource: Option<Symbol>,
     op: Symbol,
     closure: Word,
-    /// 0 for a clause that never resumes, 1 for one that calls `resume` in tail position, 2 for
-    /// one that binds it and calls it elsewhere, which only a detached frame carries.
+    /// 0: never resumes; 1: resumes in tail position; 2: elsewhere (only in a detached frame).
     resumes: u8,
 }
 
@@ -348,9 +316,8 @@ pub(crate) fn clone_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
         .collect()
 }
 
-/// A spawned task's view of the handlers around its spawn: copies, so the task performs against
-/// what enclosed the spawn whatever the spawner does next. None of them names a detached body --
-/// a clause off the tail would capture the spawner's stack, and `rt_perform` refuses it.
+/// A spawned task's copies of the handlers around its spawn; none may name a detached body,
+/// whose clause would capture the spawner's stack.
 pub(crate) fn inherit_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
     clone_frames(list)
         .into_iter()
@@ -370,9 +337,7 @@ pub(crate) fn drop_frame(f: HandlerFrame) {
     }
 }
 
-/// A heap word a cell holds: the arena's value type on the tier, so that a cell's contents never
-/// cross the seam. A clone is a count and a drop gives one back, which is why the arena is dropped
-/// before the heap that owns the words.
+/// A heap word a cell holds; clone and drop are counts, so the arena drops before the heap.
 pub struct Held(pub Word);
 
 impl Held {
@@ -411,42 +376,32 @@ impl std::fmt::Debug for Held {
 #[repr(C)]
 pub struct Ctx {
     pub failed: i64,
-    /// Nested native calls still allowed, counted down on entry to a compiled function and back up
-    /// on its normal return.
+    /// Nested native calls still allowed.
     pub fuel: i64,
-    /// The lowest stack address a compiled frame may begin at. The machine's bound on nesting is a
-    /// count, and a C frame is not a machine frame: an unoptimising compiler gives one every
-    /// temporary a slot, so a recursion well inside the count can run off a worker thread's stack
-    /// with no diagnostic at all. The prologue compares against this before it spends fuel.
+    /// The lowest address a compiled frame may begin at: C frames can overflow within the fuel.
     pub stack_floor: usize,
-    /// Where the body is -- the module index, start and end a body stores before a call that can
-    /// fail -- so what the runtime raises is placed. The module is `-1` until a body stores one.
+    /// The site the body stored before a fallible call; the module is `-1` until one is.
     pub site_module: i64,
     pub site_start: i64,
     pub site_end: i64,
     /// The cells, holding heap words: declared before the heap, so their counts go back first.
     cells: ply_eval::TaskRegions<Held>,
-    /// The arena's `(depth, live)` at the start of the entry now running, so [`Ctx::cells_balanced`]
-    /// can ask whether the body gave back everything it took rather than whether it took anything.
+    /// The arena's `(depth, live)` when the running entry began, for [`Ctx::cells_balanced`].
     cells_baseline: (usize, usize),
-    /// The arena `ply_eval::builtins::call` insists on, which nothing reaching it uses: the cell
-    /// builtins are the tier's own.
+    /// The arena `ply_eval::builtins::call` insists on; nothing reaching it uses it.
     scratch: ply_eval::Arena,
     pub heap: Heap,
-    /// The objects the entry that just finished allocated, kept because [`Ctx::end`] clears the
-    /// log and the number is otherwise gone.
+    /// Objects the last entry allocated, kept because [`Ctx::end`] clears the heap's count.
     last_entry: usize,
     unclosed_entries: u64,
     pub tables: Rc<Tables>,
     /// Why the last entry failed.
     pub diagnostic: Option<Diagnostic>,
     pub builtin_calls: u64,
-    /// One entry per stack that has run in this entry, the entry's own first; `current` is the
-    /// one running.
+    /// One per stack run in this entry, the entry's own first; `current` is the one running.
     pub(crate) stacks: Vec<Frames>,
     pub(crate) current: usize,
-    /// Every atom a compiled `perform` performed since the entry began, for the machine's trace:
-    /// the observed row is a claim the tests make, and a handled perform is still a perform.
+    /// Every atom a compiled `perform` performed since the entry began, for the machine's trace.
     pub performed: Vec<EffectAtom>,
     /// The regions live in this entry, innermost last; the checker forbids nesting, so at most one.
     pub sims: Vec<crate::simulate::Simulation>,
@@ -545,7 +500,7 @@ impl Ctx {
         self.entered_sims = 0;
         self.unwind = None;
         self.resumed = None;
-        // Every path out of an entry calls `end`, so this is one comparison against an empty log.
+        // Every path out of an entry calls `end`; this catches one that did not.
         if self.heap.allocated() != 0 {
             self.unclosed_entries += 1;
             self.end();
@@ -617,17 +572,8 @@ impl Ctx {
         self.unclosed_entries
     }
 
-    /// Whether the entry gave the arena back what it took: every region it opened closed, every
-    /// slot it allocated reclaimed with one of them.
-    ///
-    /// This is a *balance*, not a total, and the difference is the point. The counters in `stats`
-    /// only rise, so a body that opens a region and closes it looks identical to one that leaks it
-    /// — which is why the gate this replaced could only ever refuse a body that touched a cell at
-    /// all. Depth and live slots both come back down, so a `with cell` that ends is balanced and a
-    /// region left open is not.
-    ///
-    /// It is not on its own enough to let a cell out: a cell *word* in the answer is refused
-    /// separately, by the check that refuses a closure or a continuation there.
+    /// Whether the entry gave back every region it opened and cell slot it took; a cell word in the
+    /// answer is refused separately.
     pub fn cells_balanced(&self) -> bool {
         let arena = self.cells.arena();
         (arena.depth(), arena.live()) == self.cells_baseline
@@ -681,8 +627,7 @@ impl Ctx {
             })
     }
 
-    /// `d` anchored at the site when it names no place of its own: the runtime's helpers raise
-    /// with `Span::DUMMY`, and where the body was is the site it stored before the call.
+    /// `d` anchored at the body's stored site when it names no place of its own.
     fn placed(&self, mut d: Diagnostic) -> Diagnostic {
         let site = self.site();
         if site == Span::DUMMY {
@@ -724,7 +669,7 @@ impl Ctx {
     }
 }
 
-/// A failure inside compiled code, for the spike's own reporting.
+/// A runtime failure inside compiled code.
 fn error(message: impl Into<String>) -> Diagnostic {
     Diagnostic::error(codes::RUNTIME_ERROR, message.into()).primary(Span::DUMMY, "in compiled code")
 }
@@ -743,10 +688,7 @@ pub(crate) fn values_taken(ctx: &mut Ctx, args: &[Word]) -> Vec<Value> {
     out
 }
 
-/// Opens the region a `with cell` site brands, answering the id `rt_cell_close` takes back.
-///
-/// `unique` says the analysis proved no continuation is captured across the region; it is decided
-/// per site where the unit is built, so the emitted call carries the answer rather than asking.
+/// Opens a `with cell` region; `unique` is the site's proof that no continuation crosses it.
 pub unsafe extern "C" fn rt_region(ctx: *mut Ctx, unique: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let kind = match unique {
@@ -756,25 +698,15 @@ pub unsafe extern "C" fn rt_region(ctx: *mut Ctx, unique: i64) -> i64 {
     ctx.cells.open_region(kind, Span::DUMMY).0 as i64
 }
 
-/// Closes it again, reclaiming every cell allocated inside.
-///
-/// Only the *successful* path emits this. A body that fails leaves the region open, the entry is
-/// then unbalanced, and the seam declines it and lets the machine answer the call itself — which
-/// is the same fallback a failure already takes, so nothing depends on the emitted code unwinding.
+/// Closes a region, reclaiming its cells. Only success emits it; a failed body leaves the entry
+/// unbalanced and the seam falls back to the machine.
 pub unsafe extern "C" fn rt_region_close(ctx: *mut Ctx, region: i64) {
     let ctx = unsafe { &mut *ctx };
     ctx.cells
         .close_region(ply_eval::arena::RegionId(region as u32));
 }
 
-/// The cell a `with cell` opens, as the word its binder is bound to.
-///
-/// A cell is not reached through the handler stack -- `cell_get` and the two beside it are
-/// builtins over this value -- so opening one is an allocation and nothing more. The arena is the
-/// one the context already carries for those builtins, so a cell a compiled body opens and a cell
-/// an interpreted one opens are the same cell to everything that reads it.
-///
-/// The emitter refuses a site that opens a *region*, which is the part a C frame cannot carry.
+/// Allocates a cell in the context's arena, shared with the interpreter's cell builtins.
 pub unsafe extern "C" fn rt_cell(ctx: *mut Ctx, init: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if !ctx.sims.is_empty() {
@@ -796,8 +728,7 @@ pub unsafe extern "C" fn rt_dec(ctx: *mut Ctx, w: i64) {
     ctx.heap.release_last(w);
 }
 
-/// Perceus's `reset`: a record held once, at its last use in a body that builds another of its
-/// width, keeps its memory for that one. Answers the word kept, or `0` once released.
+/// Perceus's `reset`, as [`heap::reset`].
 pub unsafe extern "C" fn rt_reset(_ctx: *mut Ctx, w: i64) -> i64 {
     heap::reset(w)
 }
@@ -833,8 +764,7 @@ pub unsafe extern "C" fn rt_unbox_bool(ctx: *mut Ctx, w: i64) -> i64 {
     }
 }
 
-/// The operator code compiled code hands [`rt_binary`], and the operator it names. `emit.ply`'s
-/// `binary_code` spells the same positions, so a reordering here has to move it too.
+/// The operator codes compiled code hands [`rt_binary`]; `emit.ply`'s `binary_code` must match.
 const BINOPS: [BinOp; 17] = [
     BinOp::Add,
     BinOp::Sub,
@@ -855,11 +785,7 @@ const BINOPS: [BinOp; 17] = [
     BinOp::Shr,
 ];
 
-/// The machine's own operator over two values, for an operand whose type the emitter does not
-/// fix -- a `Float`, a `Decimal` -- so that such a body compiles and answers what the machine
-/// answers rather than being refused with every caller behind it. Takes both.
-/// `rt_negate(ctx, a)`: the machine's own negation of a value whose type the emitter cannot
-/// see -- a `Float` or `Decimal` in a word an `Int` operation would have unboxed.
+/// The machine's own negation of a value whose type the emitter cannot see. Takes it.
 pub unsafe extern "C" fn rt_negate(ctx: *mut Ctx, a: i64) -> i64 {
     let c = unsafe { &mut *ctx };
     let vals = values_taken(c, &[a]);
@@ -881,6 +807,7 @@ pub unsafe extern "C" fn rt_negate(ctx: *mut Ctx, a: i64) -> i64 {
     c.word(&answer)
 }
 
+/// The machine's own operator over two values whose type the emitter does not fix. Takes both.
 pub unsafe extern "C" fn rt_binary(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let Some(op) = usize::try_from(op)
@@ -910,22 +837,17 @@ pub unsafe extern "C" fn rt_no_fuel(ctx: *mut Ctx) {
     ctx.fail_with(FAILED_OUT_OF_FUEL, d);
 }
 
-/// The prologue's other refusal: this call would nest past what this thread's stack holds. The
-/// seam declines the entry as it does one out of fuel, and the machine, whose frames are on the
-/// heap, answers with its own bound.
+/// The prologue's other refusal: this call would nest past what this thread's stack holds.
 pub unsafe extern "C" fn rt_no_stack(ctx: *mut Ctx) {
     let ctx = unsafe { &mut *ctx };
     let d = error("this call would nest past what the native stack holds");
     ctx.fail_with(FAILED_OUT_OF_STACK, d);
 }
 
-/// Room kept below the floor for the runtime's own frames under the deepest compiled one, and
-/// for that frame itself: an unoptimising compiler has produced frames past a hundred kilobytes.
+/// Room below the floor for the runtime's frames and the deepest compiled frame itself.
 pub(crate) const STACK_MARGIN: usize = 512 * 1024;
 
-/// The floor for the thread this is called on, asked of the platform once per thread.
-///
-/// The main thread's bounds are a `/proc` read on Linux, which is why this is not asked per entry.
+/// The floor for this thread, asked of the platform once per thread (it can be a `/proc` read).
 fn stack_floor() -> usize {
     thread_local! {
         static FLOOR: usize = stack_floor_of_this_thread();
@@ -953,8 +875,7 @@ fn stack_floor_of_this_thread() -> usize {
 
 #[cfg(target_os = "linux")]
 fn stack_floor_of_this_thread() -> usize {
-    // `pthread_attr_t` is opaque and at most 56 bytes on the 64-bit libcs this runs on; this is
-    // room for it with its alignment.
+    // Room for the opaque `pthread_attr_t`, at most 56 bytes on 64-bit libcs.
     #[repr(C, align(8))]
     struct Attr([u8; 64]);
     unsafe extern "C" {
@@ -989,8 +910,7 @@ fn stack_floor_of_this_thread() -> usize {
     fallback_floor()
 }
 
-/// With no way to ask the platform: assume a spawned thread's default stack below the current
-/// frame, which refuses early on a large stack rather than late on a small one.
+/// Assumes a spawned thread's default stack below this frame: refusing early beats overflowing.
 #[cfg(not(target_os = "macos"))]
 fn fallback_floor() -> usize {
     let here = 0u8;
@@ -1050,8 +970,7 @@ pub unsafe extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
     ctx.fail(d);
 }
 
-/// An `Int` that is not one of the target width's values, reported as the interpreter's builtin
-/// reports it. `which` indexes [`ply_ty::INT_TYPES`].
+/// An `Int` outside the target width; `which` indexes [`ply_ty::INT_TYPES`].
 pub unsafe extern "C" fn rt_not_that_width(ctx: *mut Ctx, which: i64, value: i64) {
     let ctx = unsafe { &mut *ctx };
     let t = ply_ty::INT_TYPES[which as usize];
@@ -1064,9 +983,7 @@ pub unsafe extern "C" fn rt_not_that_width(ctx: *mut Ctx, which: i64, value: i64
     ctx.fail(d);
 }
 
-/// `==` and `!=` on anything that is not a pair of `Int`s or a pair of `Bool`s: two immediates
-/// compare as themselves, and anything else is answered by the evaluator's own comparison so the
-/// two cannot disagree. Reads both.
+/// `==` beyond two `Int`s or `Bool`s, deferring to the evaluator's comparison. Reads both.
 pub unsafe extern "C" fn rt_equal(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     if heap::is_imm(a) && heap::is_imm(b) {
         return i64::from(a == b);
@@ -1085,10 +1002,7 @@ pub unsafe extern "C" fn rt_equal(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     }
 }
 
-/// `++`, which is `String` concatenation only. Takes both: two native strings append, in place
-/// when the left one is held by nobody else and has the room; anything else goes through the
-/// same two `Value::as_str` calls `interp::strict_binary` uses, so a non-`Str` operand raises
-/// the identical error.
+/// `++`: native strings append; anything else raises the interpreter's error. Takes both.
 pub unsafe extern "C" fn rt_concat(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if heap::kind(a) == KIND_STR && heap::kind(b) == KIND_STR {
@@ -1106,9 +1020,7 @@ pub unsafe extern "C" fn rt_concat(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     ctx.word(&Value::str(joined))
 }
 
-/// A builtin over taken arguments: the few a front end leans on are answered over the words
-/// themselves, and the rest through the interpreter's own implementation over the values the
-/// words denote.
+/// A builtin over taken arguments: natively over words where it can, else the interpreter's.
 pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64, n: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let b = ctx.tables.builtins[index as usize];
@@ -1125,16 +1037,13 @@ pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64,
     builtin_over_values(ctx, b, args)
 }
 
-/// The interpreter's own implementation of `b` over the values the words denote: what answers
-/// when no native path does. Takes the arguments.
+/// The interpreter's implementation of `b` over the values the words denote. Takes the arguments.
 fn builtin_over_values(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
     let values = values_taken(ctx, args);
     let site = ctx.site();
     match ply_eval::builtins::call(b, values, &mut ctx.scratch, site) {
         Ok(Step::Done(v)) => ctx.word(&v),
-        // Unreachable: the emitter refuses every higher-order builtin at compile
-        // time, because answering `Step::Apply` here would need user code run from inside a native
-        // frame.
+        // Unreachable: the emitter refuses higher-order builtins.
         Ok(_) => {
             let d = error(format!(
                 "`{}` suspended, which the fragment excludes",
@@ -1146,9 +1055,7 @@ fn builtin_over_values(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
     }
 }
 
-/// `bytes_concat_all` over the pieces of a list literal, without the list: one value holding
-/// them all, or the interpreter's answer over the list when a piece is not bytes. Takes the
-/// pieces.
+/// `bytes_concat_all` over a list literal's pieces, without building the list. Takes the pieces.
 pub unsafe extern "C" fn rt_bytes_join(ctx: *mut Ctx, args: *const i64, n: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let pieces = args_of(args, n);
@@ -1157,10 +1064,7 @@ pub unsafe extern "C" fn rt_bytes_join(ctx: *mut Ctx, args: *const i64, n: i64) 
         let xs = ctx.heap.list_from(pieces);
         return builtin_over_values(ctx, Builtin::BytesConcatAll, &[xs]);
     }
-    // The fold that builds a dump appends to its accumulator through
-    // `bytes_concat_all([acc, ...])`, and the accumulator arrives here held once: it grows in
-    // place, with room doubling, and the other pieces are copied once each. A fresh buffer for
-    // them all is a copy of the accumulator per step, quadratic in the dump (ADR 0051 §3).
+    // A unique accumulator grows in place; a fresh buffer per step would be quadratic.
     if let Some((&first, rest)) = pieces.split_first()
         && heap::is_unique(first)
     {
@@ -1202,8 +1106,6 @@ pub unsafe extern "C" fn rt_bytes_join(ctx: *mut Ctx, args: *const i64, n: i64) 
     out as Word
 }
 
-/// The builtins answered over words, when their arguments have the native kinds; `None` hands the
-/// call to the interpreter's implementation.
 /// The cell a word names, when it is one.
 fn cell_of(w: Word) -> Option<Slot> {
     if heap::kind(w) != crate::heap::KIND_BRIDGE {
@@ -1231,6 +1133,7 @@ fn cell_read(ctx: &Ctx, slot: Slot, what: &str) -> Result<Word, Diagnostic> {
     }
 }
 
+/// The builtins answered over native words; `None` hands the call to the interpreter.
 fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> {
     match (which, args) {
         (Builtin::Len, [xs]) if heap::kind(*xs) == KIND_LIST => {
@@ -1241,7 +1144,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         (Builtin::Push, [xs, x]) if heap::kind(*xs) == KIND_LIST => {
             Some(ctx.heap.list_push(*xs, *x))
         }
-        // The cells: the tier's own, over heap words, so a cell's contents never cross the seam.
+        // Cells hold heap words, so their contents never cross the seam.
         (Builtin::CellGet, [c]) => {
             let slot = cell_of(*c)?;
             let answer = match cell_read(ctx, slot, "cell_get") {
@@ -1325,9 +1228,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             let items: Vec<Word> = (a..b).map(heap::imm).collect();
             Some(ctx.heap.list_from(&items))
         }
-        // Strings and bytes over their own payloads. Anything out of range, not a byte, not
-        // UTF-8 or not the kind the builtin wants is the interpreter's diagnostic to raise, so
-        // those answer `None` before touching a count.
+        // Anything the interpreter would raise on answers `None` before touching a count.
         (Builtin::BytesLen, [b]) if heap::kind(*b) == KIND_BYTES => {
             let n = unsafe { (*obj(*b)).len } as i64;
             heap::dec(*b);
@@ -1374,8 +1275,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             if !all_bytes {
                 return None;
             }
-            // As `rt_bytes_join`: a first piece the list alone holds, in a list nobody else
-            // holds, grows in place.
+            // As `rt_bytes_join`: a unique first piece of a unique list grows in place.
             if heap::is_unique(*xs) {
                 let items = list::to_vec(o);
                 if let Some(&first) = items.first()
@@ -1514,8 +1414,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             heap::dec(*s);
             Some(heap::imm(n))
         }
-        // The bounded scans, as `scan` answers them: a window of at most `max` bytes from `from`,
-        // the position of the first byte in the class (or off it), or the window's end.
+        // Within `max` bytes of `from`: the first byte in (or off) the class, or the window's end.
         (Builtin::BytesScan | Builtin::BytesScanUntil, [hay, from, members, max])
             if heap::kind(*hay) == KIND_BYTES && heap::kind(*members) == KIND_BYTES =>
         {
@@ -1715,8 +1614,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             let entries = list::to_vec(obj(*xs));
             let n = entries.len();
             let (key, value) = (Symbol::new("key"), Symbol::new("value"));
-            // Every entry must be a record with both fields and a key the map can order, or the
-            // interpreter's implementation raises the right diagnostic instead.
+            // Any other entry shape is the interpreter's to raise on.
             let mut pairs = Vec::with_capacity(n);
             for e in entries {
                 if heap::kind(e) != KIND_RECORD {
@@ -1762,8 +1660,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
     }
 }
 
-/// The half-open range a slicing builtin was given over `len` bytes, as `range_args` admits it:
-/// never clamped, so anything outside is `None` and the interpreter's to refuse.
+/// A slicing builtin's half-open range over `len`, never clamped: out of range is `None`.
 fn slice_range(start: Word, end: Word, len: usize) -> Option<(usize, usize)> {
     let (start, end) = (heap::as_int(start)?, heap::as_int(end)?);
     if start < 0 || end < start || !usize::try_from(end).is_ok_and(|e| e <= len) {
@@ -1772,8 +1669,7 @@ fn slice_range(start: Word, end: Word, len: usize) -> Option<(usize, usize)> {
     Some((start as usize, end as usize))
 }
 
-/// Where `needle` first occurs in `hay` at or after `from`: an empty needle occurs at `from`,
-/// as the interpreter's `find` answers.
+/// Where `needle` first occurs in `hay` at or after `from`; an empty needle occurs at `from`.
 fn find_bytes(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if needle.is_empty() {
         return Some(from);
@@ -1809,8 +1705,7 @@ fn position(ctx: &mut Ctx, at: Option<usize>) -> Option<Word> {
     })
 }
 
-/// A closure over `env`: the compiled function `index` names, entered with the captured values
-/// as its leading arguments. Takes the captures.
+/// A closure of compiled function `index` over `env`, its leading arguments. Takes the captures.
 pub unsafe extern "C" fn rt_closure(
     ctx: *mut Ctx,
     index: i64,
@@ -1836,11 +1731,7 @@ pub unsafe extern "C" fn rt_closure(
     o as Word
 }
 
-/// A builtin used as a value: the interpreter's own closure kind for it.
-/// `rt_handle_push(ctx, clauses, n, ret)`: install a handler and answer its depth. `clauses` is
-/// `n` entries of five words: the effect's, resource's and operation's field-table indices
-/// (the resource's negative for none), the clause closure, and whether the clause binds
-/// `resume`. The closures and `ret` are taken, and released when the frame is popped.
+/// Installs a handler and answers its depth; the clause closures and `ret` are taken until it pops.
 pub unsafe extern "C" fn rt_handle_push(
     ctx: *mut Ctx,
     clauses: *const i64,
@@ -1859,8 +1750,8 @@ pub unsafe extern "C" fn rt_handle_push(
     (frames.len() - 1) as i64
 }
 
-/// The clause table a `handle` site built: five words per clause, names as indices into the
-/// unit's field table.
+/// A `handle` site's clause table: per clause the effect, resource (negative for none) and op
+/// as field-table indices, the closure, and its `resumes`.
 fn clauses_of(c: &Ctx, clauses: *const i64, n: i64) -> Vec<FrameClause> {
     let words = args_of(clauses, n * 5);
     let name = |i: i64| c.tables.fields[i as usize].clone();
@@ -1876,8 +1767,7 @@ fn clauses_of(c: &Ctx, clauses: *const i64, n: i64) -> Vec<FrameClause> {
         .collect()
 }
 
-/// `handle { body } with { .. }` where a clause resumes off the tail: the body is a nullary
-/// closure run on a stack of its own. Answers the handle's value.
+/// A `handle` whose clause resumes off the tail: `body`, a nullary closure, runs on its own stack.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_handle_detached(
     ctx: *mut Ctx,
@@ -1891,8 +1781,7 @@ pub unsafe extern "C" fn rt_handle_detached(
     unsafe { crate::detached::open(ctx, clauses, ret, body) }
 }
 
-/// The `k` a clause that binds `resume` is handed: calling it in tail position records the
-/// value, which `rt_perform` then answers to the performer.
+/// The `k` a `resume`-binding clause gets: a tail call records the value for `rt_perform`.
 unsafe extern "C" fn rt_resume_entry(ctx: *mut Ctx, args: *const i64) -> i64 {
     let c = unsafe { &mut *ctx };
     let v = unsafe { *args.add(1) };
@@ -1939,12 +1828,8 @@ pub(crate) fn closure_of(c: &mut Ctx, entry: usize, capture: i64) -> Word {
     o as Word
 }
 
-/// `rt_perform(ctx, effect, op, resource, mode, args, n)`: the atom is recorded for the
-/// machine's trace, then the innermost frame with a clause for the operation answers. A
-/// tail-resumptive clause is called on the performer's stack with the frames from its own
-/// upward set aside, and its value is the perform's. A clause that binds `resume` is handed
-/// the token above; if it answers without calling it, the fragment unwinds to the clause's
-/// `handle` with that value.
+/// Records the atom; then the innermost frame with a clause answers, with frames from its own
+/// up set aside. A `resume`-binding clause that never resumes unwinds to its `handle`.
 pub unsafe extern "C" fn rt_perform(
     ctx: *mut Ctx,
     effect: i64,
@@ -1998,9 +1883,7 @@ pub unsafe extern "C" fn rt_perform(
                         break 'search;
                     };
                     let closure = cl.closure;
-                    // The names are moved in and dropped before the switch: this frame comes
-                    // back with every restored snapshot, and a local that owned heap memory
-                    // across the switch would be released once per restore.
+                    // Moved in: a local owning memory across the switch is freed once per restore.
                     return unsafe {
                         crate::detached::stop(
                             ctx,
@@ -2035,8 +1918,7 @@ pub unsafe extern "C" fn rt_perform(
         return c.fail(d);
     }
     let Some((stack, depth, closure, resumes)) = found else {
-        // A `task` operation inside the production region already open is the scheduler's;
-        // outside one it goes to the host route, which opens the region the binding permits.
+        // Inside an open production region a `task` op is the scheduler's; outside, the host's.
         if effect.as_str() == "task"
             && ply_eval::sim::TASK_OPS.contains(&op.as_str())
             && c.sims.last().is_some_and(|sim| sim.is_production())
@@ -2048,8 +1930,7 @@ pub unsafe extern "C" fn rt_perform(
         };
     };
     let mut call_args: Vec<Word> = args_of(args, n).to_vec();
-    // The clause runs outside the handler: the frame and everything above it, in this stack and
-    // in every stack chained under it down to the performer's, are out of reach until it returns.
+    // The clause runs outside its handler: that frame and all above it are hidden until it returns.
     let hidden = hide_above(c, stack, depth);
     if resumes {
         let k = resume_token(c, stack, depth);
@@ -2075,12 +1956,7 @@ pub unsafe extern "C" fn rt_perform(
     }
 }
 
-/// `rt_handle_land(ctx, depth, value)`: the `handle` at `depth` is over. Its frame and any above
-/// are popped; an unwind to it is caught and its value answered; any other failure passes; and
-/// a body that completed answers `value` through the `return` clause when there is one.
-/// `simulate { body }`: `body` is a nullary closure, run as the root task of a region whose
-/// scheduler the runtime drives on this stack. Answers what the body answered, or fails with
-/// the region's failure.
+/// `simulate { body }`: runs the nullary `body` as a region's root task on this stack.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rt_simulate(ctx: *mut Ctx, body: i64) -> i64 {
     let c = unsafe { &mut *ctx };
@@ -2118,6 +1994,7 @@ pub unsafe extern "C" fn rt_simulate(ctx: *mut Ctx, body: i64) -> i64 {
     r
 }
 
+/// The `handle` at `depth` is over: pops its frames, catches an unwind to it, applies `return`.
 pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -> i64 {
     let c = unsafe { &mut *ctx };
     let depth = depth as usize;
@@ -2161,6 +2038,7 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
     r
 }
 
+/// A builtin used as a value: the interpreter's own closure kind for it.
 pub unsafe extern "C" fn rt_builtin_value(ctx: *mut Ctx, index: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let b = ctx.tables.builtins[index as usize];
@@ -2186,32 +2064,27 @@ pub unsafe extern "C" fn rt_ctor_value(ctx: *mut Ctx, index: i64) -> i64 {
     })))
 }
 
-/// The value of the pure nullary function at `index`: remembered on its first evaluation when
-/// it is world-independent, as an immortal word, and evaluated on every call otherwise.
+/// The value of the pure nullary function at `index`, memoized when world-independent.
 pub unsafe extern "C" fn rt_constant(ctx: *mut Ctx, index: i64) -> i64 {
     let tables = Rc::clone(&unsafe { &*ctx }.tables);
     if let Some(Some(w)) = tables.memo.borrow().get(index as usize) {
         return *w;
     }
-    // SAFETY: as in `call_value`: a finalized address of this unit's own function, alive for as
-    // long as the context is, with the signature every compiled function has; a nullary function
-    // reads no argument, so the pointer is never dereferenced.
+    // SAFETY: as in `call_value`; a nullary function never reads the null argument pointer.
     let f: Entry = unsafe { std::mem::transmute::<usize, Entry>(tables.functions[index as usize]) };
     let w = unsafe { f(ctx, std::ptr::null()) };
     let c = unsafe { &mut *ctx };
     if c.failed != 0 {
         return 0;
     }
-    // Remembered as a copy in the tables' own heap, which outlives the entry's memory; the
-    // entry keeps using its own word.
+    // The memo keeps a copy; the entry keeps using its own word.
     if heap::world_independent(w) {
         tables.memoize(index as usize, w);
     }
     w
 }
 
-/// A call through a value: a local binding, a callee that is an expression, or a callback. Takes
-/// the callee and the arguments.
+/// A call through a value. Takes the callee and the arguments.
 pub unsafe extern "C" fn rt_call(ctx: *mut Ctx, callee: i64, args: *const i64, n: i64) -> i64 {
     let args = args_of(args, n);
     let r = call_value(ctx, callee, args);
@@ -2219,10 +2092,8 @@ pub unsafe extern "C" fn rt_call(ctx: *mut Ctx, callee: i64, args: *const i64, n
     r
 }
 
-/// Applies `callee` to `args` and answers the word of the result, or 0 with the context failed.
-/// Reads the callee and takes the arguments. A native closure is entered directly; a builtin or
-/// a constructor is the interpreter's own; an interpreted closure cannot be here, because the
-/// seam carries no function.
+/// Applies `callee` to `args`, or answers 0 with the context failed. Reads the callee, takes the
+/// arguments; an interpreted closure cannot reach here, since the seam carries no function.
 pub(crate) fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
     let c = unsafe { &mut *ctx };
     match heap::kind(callee) {
@@ -2236,16 +2107,9 @@ pub(crate) fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
                 ));
                 return c.fail(d);
             }
-            // The callee owns every parameter: the captures are held once more, since the
-            // closure may be called again, and the arguments were taken by the caller's mask. A
-            // stack array holds the words for any arity a body has, so a call allocates nothing.
-            //
-            // Uninitialised, and that is the point. This was `[0i64; 64]`, which is five hundred
-            // and twelve bytes memset on **every closure call** -- the compiler cannot see that
-            // only `total` of them are written, so it zeroes all of them first. Over the
-            // self-hosted front end `call_value` was 20.3% of the profile's self time and this was
-            // most of it. Exactly `total` entries are written below and the callee reads exactly
-            // `total`, so nothing uninitialised is ever read.
+            // Captures are held once more; the arguments are already taken.
+            // Uninitialised on purpose, as zeroing costs every call;
+            // exactly `total` words are written and read.
             let mut handles = [const { std::mem::MaybeUninit::<i64>::uninit() }; 64];
             let mut spilled: Vec<i64> = Vec::new();
             let captures = len - CLOSURE_CAPTURES;
@@ -2272,9 +2136,8 @@ pub(crate) fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
                 spilled.as_ptr()
             };
             let code = unsafe { word_at(o, CLOSURE_CODE) } as usize;
-            // SAFETY: `code` came out of `Tables::functions`, the finalized addresses of this
-            // unit's own functions, which `Bodies` keeps alive for as long as this context
-            // exists; the signature is the one every compiled function has.
+            // SAFETY: `code` is a finalized address from `Tables::functions`, which `Bodies`
+            // keeps alive as long as this context, with the signature every compiled function has.
             let f: Entry = unsafe { std::mem::transmute::<usize, Entry>(code) };
             unsafe { f(ctx, ptr) }
         }
@@ -2444,8 +2307,7 @@ pub unsafe extern "C" fn rt_fold(ctx: *mut Ctx, list: i64, init: i64, f: i64) ->
     acc
 }
 
-/// `map_fold(m, init, f)`: `f` on every entry in ascending key order, over a snapshot of the
-/// entries as the interpreter's loop takes one. Takes all three.
+/// `map_fold(m, init, f)` in ascending key order over a snapshot of the entries. Takes all three.
 pub unsafe extern "C" fn rt_map_fold(ctx: *mut Ctx, map: i64, init: i64, f: i64) -> i64 {
     let c = unsafe { &mut *ctx };
     if heap::kind(map) == KIND_MAP {
@@ -2491,8 +2353,7 @@ pub unsafe extern "C" fn rt_map_fold(ctx: *mut Ctx, map: i64, init: i64, f: i64)
     acc
 }
 
-/// `iterate(seed, budget, f)`: `f` until it answers `Stop`, or the budget runs out and the call
-/// fails the way the interpreter's raises. Takes all three.
+/// `iterate(seed, budget, f)`: `f` until it answers `Stop` or the budget runs out. Takes all three.
 pub unsafe extern "C" fn rt_iterate(ctx: *mut Ctx, seed: i64, budget: i64, f: i64) -> i64 {
     let c = unsafe { &mut *ctx };
     let budget = match heap::as_int(budget) {
@@ -2529,8 +2390,7 @@ pub unsafe extern "C" fn rt_iterate(ctx: *mut Ctx, seed: i64, budget: i64, f: i6
         if c.failed != 0 {
             return 0;
         }
-        // The step's answer gives up its payload, so the state threaded through the loop stays
-        // uniquely held.
+        // The answer gives up its payload so the threaded state stays uniquely held.
         let tag = if heap::kind(r) == KIND_CTOR {
             Some(unsafe { ((*obj(r)).layout, (*obj(r)).len) })
         } else {
@@ -2558,9 +2418,8 @@ pub unsafe extern "C" fn rt_iterate(ctx: *mut Ctx, seed: i64, budget: i64, f: i6
     }
 }
 
-/// What a fused `iterate` loop raises: `what` 0 for a budget under one (`n` the budget), 1 for
-/// a budget run out (`n` the budget), 2 for a step that answered neither `Continue` nor `Stop`
-/// (`n` the answer). Takes the answer in the last case.
+/// A fused `iterate`'s failure: `what` 0 a budget under one, 1 the budget spent, 2 a bad step
+/// answer `n`, which it takes.
 pub unsafe extern "C" fn rt_iterate_bad(ctx: *mut Ctx, what: i64, n: i64) {
     let ctx = unsafe { &mut *ctx };
     let d = match what {
@@ -2580,8 +2439,7 @@ pub unsafe extern "C" fn rt_iterate_bad(ctx: *mut Ctx, what: i64, n: i64) {
     ctx.fail(d);
 }
 
-/// A range longer than the interpreter's `range` admits, raised where a fused loop would have
-/// walked it.
+/// A range longer than [`RANGE_LIMIT`], raised where a fused loop would have walked it.
 pub unsafe extern "C" fn rt_bad_range(ctx: *mut Ctx, lo: i64, hi: i64) {
     let ctx = unsafe { &mut *ctx };
     let d = error(format!(
@@ -2594,8 +2452,7 @@ pub unsafe extern "C" fn rt_bad_range(ctx: *mut Ctx, lo: i64, hi: i64) {
 /// The most elements the interpreter's `range` builds, which a fused loop holds to as well.
 pub const RANGE_LIMIT: i64 = 10_000_000;
 
-/// The element at `i` of a list a fused loop walks by index, held once more. Reads the list;
-/// the loop checked the kind and the bound.
+/// Element `i` of a list a fused loop checked, held once more. Reads the list.
 pub unsafe extern "C" fn rt_list_get(_ctx: *mut Ctx, list: i64, i: i64) -> i64 {
     let w = list::get(obj(list), i as usize);
     heap::inc(w);
@@ -2608,8 +2465,7 @@ pub unsafe extern "C" fn rt_list_push(ctx: *mut Ctx, xs: i64, x: i64) -> i64 {
     ctx.heap.list_push(xs, x)
 }
 
-/// A fused loop was handed something other than a list, which the runtime's loop refuses the
-/// same way.
+/// A fused loop was handed something other than a list.
 pub unsafe extern "C" fn rt_not_a_list(ctx: *mut Ctx, which: i64, value: i64) {
     let ctx = unsafe { &mut *ctx };
     let what = match which {
@@ -2625,9 +2481,7 @@ pub unsafe extern "C" fn rt_not_a_list(ctx: *mut Ctx, which: i64, value: i64) {
     ctx.fail(d);
 }
 
-/// A shift count outside `0..64`, which the interpreter refuses too.
-/// A shift count outside the word, reported as the machine reports it: `which` indexes
-/// [`ply_ty::INT_TYPES`], and is `-1` for `Int`.
+/// A shift count outside the word; `which` indexes [`ply_ty::INT_TYPES`], or is `-1` for `Int`.
 pub unsafe extern "C" fn rt_shift_count(ctx: *mut Ctx, n: i64, which: i64) {
     let ctx = unsafe { &mut *ctx };
     let (ty, width) = match usize::try_from(which)
@@ -2675,9 +2529,8 @@ pub unsafe extern "C" fn rt_record(ctx: *mut Ctx, shape: i64, args: *const i64, 
     o as Word
 }
 
-/// A record update: `n` written fields at the `offsets` they take in `shape`, written into the
-/// base itself when it has that shape and nothing else holds it, and into a fresh record with
-/// the rest copied out of the base otherwise. Takes the base and the written fields.
+/// A record update writing `n` fields at `offsets` in `shape`: in place when the base is unique
+/// and has that shape, else into a fresh copy. Takes the base and the written fields.
 pub unsafe extern "C" fn rt_record_update(
     ctx: *mut Ctx,
     shape: i64,
@@ -2711,16 +2564,13 @@ pub unsafe extern "C" fn rt_record_update(
         unsafe { (*o).flags &= flat_over(written) | !heap::FLAT };
         return base;
     }
-    // A fresh record: the written fields at their offsets, and the rest copied out of the base
-    // by offset when it has the shape, or by name when the lowering's guess at a base was a
-    // record of another shape — which is only ever a value that dies here, so nothing is read
-    // from it unless the literal left a field unwritten.
+    // Unwritten fields come from the base by offset, or by name when the lowering guessed a base
+    // of another shape.
     let tables = Rc::clone(&ctx.tables);
     let width = tables.layouts.shape_width(shape);
     let flat = flat_over(written) & unsafe { (*o).flags };
     let out = ctx.heap.alloc(KIND_RECORD, flat, width as u32, shape);
-    // Which offsets the literal wrote: a bit each for a shape a word of bits covers, which is
-    // every shape a front end has, and a list for a wider one.
+    // Which offsets were written: a bitmask up to 128 fields, a list past that.
     let mut mask = 0u128;
     let mut wide = Vec::new();
     if width > 128 {
@@ -2767,11 +2617,8 @@ pub unsafe extern "C" fn rt_record_update(
     out as Word
 }
 
-/// One field of a record, by name, with the two failures the interpreter has here kept as
-/// failures rather than answered. `own` is the lowering's mark: 0 reads a local's record and
-/// answers a field held once more; 2 is the last use of this *field* while the record stays,
-/// which moves the field out when the record is held by nobody else; 1 is the base's last use
-/// and 3 a base that is a temporary, both of which take the base and release it.
+/// One field of a record by name. `own`: 0 reads the base and holds the field once more; 2 moves
+/// the field out of a unique base that stays; 1 and 3 also take and release the base.
 pub unsafe extern "C" fn rt_field(ctx: *mut Ctx, base: i64, index: i64, own: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if heap::kind(base) != KIND_RECORD {
@@ -2822,8 +2669,7 @@ pub unsafe extern "C" fn rt_list(ctx: *mut Ctx, args: *const i64, n: i64) -> i64
     ctx.heap.list_from(args_of(args, n))
 }
 
-/// Whether a value is a record whose field count a pattern admits: `exact` demands the count,
-/// because a pattern without `..` matches only a record of exactly its fields. Reads.
+/// Whether a value is a record a pattern admits: of exactly `len` fields when `exact`. Reads.
 pub unsafe extern "C" fn rt_record_fits(_ctx: *mut Ctx, value: i64, len: i64, exact: i64) -> i64 {
     if heap::kind(value) != KIND_RECORD {
         return 0;
@@ -2831,8 +2677,7 @@ pub unsafe extern "C" fn rt_record_fits(_ctx: *mut Ctx, value: i64, len: i64, ex
     i64::from(exact == 0 || unsafe { (*obj(value)).len } as i64 == len)
 }
 
-/// Whether a record holds the field a pattern names, a missing one being a failed match rather
-/// than the error [`rt_field`] raises. Reads.
+/// Whether a record holds the field a pattern names; a missing one fails the match. Reads.
 pub unsafe extern "C" fn rt_record_has(ctx: *mut Ctx, value: i64, index: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if heap::kind(value) != KIND_RECORD {
@@ -2847,8 +2692,7 @@ pub unsafe extern "C" fn rt_record_has(ctx: *mut Ctx, value: i64, index: i64) ->
     )
 }
 
-/// Whether a value is a list long enough for a pattern: `exact` demands the length, and otherwise
-/// `len` is a minimum because a `..rest` takes the remainder. Reads.
+/// Whether a value is a list of `len` elements when `exact`, else of at least `len`. Reads.
 pub unsafe extern "C" fn rt_list_fits(_ctx: *mut Ctx, value: i64, len: i64, exact: i64) -> i64 {
     if heap::kind(value) != KIND_LIST {
         return 0;
@@ -2874,8 +2718,7 @@ pub unsafe extern "C" fn rt_list_at(ctx: *mut Ctx, value: i64, i: i64) -> i64 {
     w
 }
 
-/// What a `..rest` binds: the list from `from` on, sharing the trie and copying at most a
-/// tail, as `ply_eval`'s `skip` does at the same point. Reads.
+/// What a `..rest` binds: the list from `from` on, sharing the trie. Reads.
 pub unsafe extern "C" fn rt_list_rest(ctx: *mut Ctx, value: i64, from: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if heap::kind(value) != KIND_LIST {
@@ -2885,9 +2728,8 @@ pub unsafe extern "C" fn rt_list_rest(ctx: *mut Ctx, value: i64, from: i64) -> i
     ctx.heap.list_skip(value, from.max(0) as usize)
 }
 
-/// One argument of a constructor value, once the compiled test has said it is that constructor:
-/// moved out when `take` is set and nothing else holds the constructor, held once more otherwise.
-/// Reads the constructor.
+/// Argument `i` of a matched constructor: moved out when `take` and it is unique, else held once
+/// more. Reads the constructor.
 pub unsafe extern "C" fn rt_ctor_arg(ctx: *mut Ctx, value: i64, i: i64, take: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if heap::kind(value) != KIND_CTOR {
@@ -2908,10 +2750,8 @@ pub unsafe extern "C" fn rt_ctor_arg(ctx: *mut Ctx, value: i64, i: i64, take: i6
     w
 }
 
-/// `map_get` for a `match` that unwraps its answer at once: the value held once more, or `0`
-/// for a key the map does not hold, with no constructor built between. Takes the map and the
-/// key; a map or a key the native path does not serve is answered through the interpreter's
-/// `map_get` and unwrapped here.
+/// `map_get` for a `match` that unwraps it at once: the value held once more, or `0` when absent,
+/// with no constructor built. Takes the map and the key.
 pub unsafe extern "C" fn rt_map_lookup(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if heap::kind(m) == KIND_MAP && heap::native_key(k) {
@@ -2936,8 +2776,7 @@ fn flat_over(words: &[Word]) -> u8 {
     }
 }
 
-/// A fresh object of `kind` with `len` words, its header written and its fields left for the
-/// compiled code that asked, which stores them itself.
+/// A fresh object of `kind` with `len` words, whose fields the compiled caller stores itself.
 pub unsafe extern "C" fn rt_alloc(
     ctx: *mut Ctx,
     kind: i64,
@@ -2950,8 +2789,7 @@ pub unsafe extern "C" fn rt_alloc(
         .alloc(kind as u8, flags as u8, len as u32, layout as u32) as Word
 }
 
-/// A builtin called directly by compiled code, with no dispatch on its index and no argument
-/// array: the native path, or the interpreter's over the values. Takes the arguments.
+/// A builtin called directly, natively where it can be, else over values. Takes the arguments.
 fn direct(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
     ctx.builtin_calls += 1;
     match native_builtin(ctx, b, args) {
