@@ -1,7 +1,7 @@
 //! Definition bodies: the third element of `Hash -> (Definition, Type, Footprint)`.
 
+use crate::fixture::port_check;
 use indexmap::IndexMap;
-use ply_core::check_program;
 use ply_hash::body::{BodySet, ItemKind, reconstruct};
 use ply_hash::{DefHash, HashOutput, hash_program_with_bodies};
 use ply_span::{SourceId, Symbol, codes};
@@ -39,10 +39,7 @@ fn parse(files: &[(&str, &str)]) -> (Program, Resolved) {
 
 fn compile(files: &[(&str, &str)]) -> Checked {
     let (program, resolved) = parse(files);
-    let check = match check_program(&program, &resolved) {
-        Ok(check) => check,
-        Err(diags) => panic!("program did not typecheck: {diags:#?}"),
-    };
+    let check = port_check(files);
     let (hashes, bodies) =
         hash_program_with_bodies(&program, &resolved).expect("program should hash");
     Checked {
@@ -52,6 +49,16 @@ fn compile(files: &[(&str, &str)]) -> Checked {
     }
 }
 
+/// A reconstructed program has no text, so the port checks it printed back to source.
+fn check_printed(program: &Program) -> CheckOutput {
+    let texts = ply_syntax::print::program(program);
+    let files: Vec<(&str, &str)> = texts
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect();
+    port_check(&files)
+}
+
 /// Reconstructs, then checks and re-hashes what came back.
 fn rebuild(original: &Checked) -> (Checked, IndexMap<DefHash, Symbol>) {
     let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
@@ -59,10 +66,7 @@ fn rebuild(original: &Checked) -> (Checked, IndexMap<DefHash, Symbol>) {
         Ok(resolved) => resolved,
         Err(diags) => panic!("reconstructed program did not resolve: {diags:#?}"),
     };
-    let check = match check_program(&rebuilt.program, &resolved) {
-        Ok(check) => check,
-        Err(diags) => panic!("reconstructed program did not typecheck: {diags:#?}"),
-    };
+    let check = check_printed(&rebuilt.program);
     let (hashes, bodies) =
         hash_program_with_bodies(&rebuilt.program, &resolved).expect("rebuilt program should hash");
 
@@ -663,7 +667,7 @@ fn reconstructed_tests_evaluate() {
 
     let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
     let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
-    let check = check_program(&rebuilt.program, &resolved).expect("it should check");
+    let check = check_printed(&rebuilt.program);
     let mut interp = on_the_tier(&rebuilt.program, &resolved, &check);
 
     assert_eq!(interp.test_count(), 2);
@@ -1060,7 +1064,7 @@ fn two_tests_that_number_one_effect_differently_both_reconstruct() {
 
     let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
     let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
-    let check = check_program(&rebuilt.program, &resolved).expect("it should typecheck");
+    let check = check_printed(&rebuilt.program);
     let mut interp = on_the_tier(&rebuilt.program, &resolved, &check);
     assert_eq!(interp.test_count(), 2);
     for index in 0..interp.test_count() {
