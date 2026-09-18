@@ -211,7 +211,13 @@ impl<'s> Driver<'s> {
         self.phases.write_back += writing.elapsed();
 
         let mut warnings = stdlib;
-        warnings.extend(front.diagnostics.iter().cloned());
+        warnings.extend(
+            front
+                .diagnostics
+                .iter()
+                .filter(|d| !self.in_shipped(d))
+                .cloned(),
+        );
         warnings.extend(cache);
 
         let files = self.files.iter().map(|f| f.path.clone()).collect();
@@ -274,6 +280,15 @@ impl<'s> Driver<'s> {
             key.extend_from_slice(&file.content.0);
         }
         Some(ContentHash::of(&key))
+    }
+
+    /// A warning inside a module the compiler ships is its maintainers', not this program's.
+    fn in_shipped(&self, d: &Diagnostic) -> bool {
+        d.primary_span().is_some_and(|span| {
+            self.files
+                .iter()
+                .any(|f| f.shipped && f.source == span.source)
+        })
     }
 
     /// This compiler failing, rather than the program.
