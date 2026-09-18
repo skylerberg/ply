@@ -319,7 +319,7 @@ impl<'s> Driver<'s> {
                 )
                 .primary(Span::DUMMY, "nothing was checked, so nothing is claimed")
                 .note("this is Ply's fault: the compiler's own front end is what failed here")
-                .note("the emitter comes from `crates/ply-compiler/bootstrap`; sources with no bundle are built by the reference emitter instead"),
+                .note("the emitter comes from `crates/ply-compiler/bootstrap`; sources with no bundle are emitted by the one this binary carries"),
             ],
         }
     }
