@@ -365,7 +365,7 @@ fn noted(p: P, x: Int) -> P = {{ pos: p.pos, depth: p.depth, diags: push(p.diags
         let Some((_, native)) = tests_support::unit(&source) else {
             return;
         };
-        let args = vec![ply_eval::Value::Int(4)];
+        let args = [ply_eval::Value::Int(4)];
         let entry: ply_codegen::rt::Entry = native.entry("m.probe").expect("compiled");
         let mut ctx = native.context();
         ctx.fuel = 100_000;
