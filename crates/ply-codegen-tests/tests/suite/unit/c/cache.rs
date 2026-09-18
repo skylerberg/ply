@@ -1,5 +1,5 @@
 use ply_codegen::c::cache::{decode, encode};
-use ply_codegen::c::emit::Tables;
+use ply_codegen::c::tables::Tables;
 use ply_eval::Value;
 use ply_span::Symbol;
 

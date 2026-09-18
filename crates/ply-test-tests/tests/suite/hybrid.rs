@@ -93,13 +93,9 @@ impl Compiled {
     fn failure(&self, key: &str) -> ply_span::Diagnostic {
         let index = self.test_index(key);
         let mut machine = ply_eval::Machine::new(&self.program, &self.resolved, &self.check);
-        let unit = ply_codegen::Unit::over_with_texts(
-            &self.program,
-            &self.resolved,
-            &self.check,
-            self.texts.clone(),
-        )
-        .expect("this host has a C compiler");
+        let unit =
+            ply_codegen::Unit::over_with_texts(&self.program, &self.resolved, self.texts.clone())
+                .expect("this host has a C compiler");
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,
             ..Default::default()

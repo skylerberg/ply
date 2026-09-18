@@ -142,13 +142,9 @@ impl Compiled {
     /// what a run needs under tier-only, since a bare machine holds no evaluator. Leaks a
     /// `&'static` unit, which a test may.
     pub fn tier(&self) -> (&'static ply_codegen::Unit, ply_eval::BackendSpec) {
-        let unit = ply_codegen::Unit::over_with_texts(
-            &self.program,
-            &self.resolved,
-            &self.check,
-            self.texts.clone(),
-        )
-        .expect("this host has a C compiler");
+        let unit =
+            ply_codegen::Unit::over_with_texts(&self.program, &self.resolved, self.texts.clone())
+                .expect("this host has a C compiler");
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,
             ..Default::default()

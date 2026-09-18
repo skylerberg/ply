@@ -25,20 +25,15 @@ use serde_json::json;
 
 /// What the archive records. Written beside the C and read back by `--verify`.
 fn manifest(source: &str, artifact: &str, definitions: usize, refused: usize) -> serde_json::Value {
-    let how = ply_codegen::Profile::current().inlining().overridden();
     json!({
         "source": source,
         "artifact": artifact,
         "definitions": definitions,
         "refused": refused,
-        "inlining": { "budget": how.budget, "depth": how.depth },
     })
 }
 
 pub fn execute(args: &BootstrapArgs, style: Style) -> i32 {
-    // An archive is the compiler somebody else will run, so it is emitted at `release` unless the
-    // caller says otherwise: `development` is a different artifact, with a different digest, and
-    // forty times slower on integer arithmetic.
     if let Err(d) = super::common::select_profile(&args.profile) {
         print_diagnostics(std::slice::from_ref(&d), &ply_span::SourceMap::new(), style);
         return EXIT_COMPILE_ERROR;

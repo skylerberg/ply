@@ -1,20 +1,4 @@
-use ply_codegen::c::toolchain::{Profile, support_flags};
-
-/// The compiler and the inlining are one choice.
-///
-/// A non-optimising compiler gives every temporary its own stack slot, so this tier's
-/// depth-3 bodies compile to 128KB frames against `-O2`'s 8, and the self-hosted front end
-/// recurses far enough to overflow the stack -- an `abort` with no diagnostic, under `tcc`,
-/// `cc -O0` and `cc -O1` alike. Every one of them runs the whole corpus at depth 0. If this
-/// assertion is in your way, that is what it is in the way of.
-#[test]
-fn the_fast_toolchain_does_not_inline() {
-    assert_eq!(Profile::Development.inlining().depth, 0);
-    assert_eq!(
-        Profile::Release.inlining().depth,
-        ply_codegen::opt::Inlining::EMITTED.depth
-    );
-}
+use ply_codegen::c::toolchain::support_flags;
 
 /// tcc finds `libtcc1.a` relative to `-B`, and a build that was never installed has no default
 /// that finds it. Without the flag the compile *succeeds* and the object will not load, with

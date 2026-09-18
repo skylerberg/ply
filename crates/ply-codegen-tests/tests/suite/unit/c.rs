@@ -571,19 +571,17 @@ pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
 
 /// A run that compiles fewer definitions must not poison the next one that compiles more.
 ///
-/// A refusal is cached, because refusing costs the inliner in full and a definition this tier
-/// will not take pays that on every run. It is keyed on the digest of what was *offered*, because
-/// a body is refused when something it calls was not — so the two have to be the same set. They
-/// were not: the instruments that narrow the offered set filtered it after the digest was taken,
-/// so a narrowed run's refusals were served back to an unfiltered one. The unit that came out had
-/// bodies compiled against a program that never existed, and it segfaulted rather than answering
-/// wrongly, which is the only lucky thing about it.
+/// A refusal is cached, so a definition this tier will not take is not asked for again every run.
+/// It is keyed on the digest of what was *offered*, because a body is refused when something it
+/// calls was not — so the two have to be the same set. They were not: the instruments that narrow
+/// the offered set filtered it after the digest was taken, so a narrowed run's refusals were
+/// served back to an unfiltered one. The unit that came out had bodies compiled against a program
+/// that never existed, and it segfaulted rather than answering wrongly, which is the only lucky
+/// thing about it.
 #[test]
 fn a_narrower_run_does_not_poison_a_wider_one() {
     let source = r#"
 fn twice(n: Int) -> Int = n * 2
-// Recursive, so the inliner leaves it a call: withholding it has to refuse `both`, and an
-// inlined callee would be part of `both`'s body and refuse nothing.
 fn thrice(n: Int) -> Int = if n <= 0 { 0 } else { 3 + thrice(n - 1) }
 pub fn both(n: Int) -> Int = twice(n) + thrice(n)
 pub fn alone(n: Int) -> Int = twice(n)
