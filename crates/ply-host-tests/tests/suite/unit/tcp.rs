@@ -43,18 +43,12 @@ fn fixture() -> String {
 }
 
 fn check(source: &str) -> CheckOutput {
-    ply_codegen::c::producer::ensure_default();
-    let front = ply_codegen::c::producer::front(
+    ply_codegen::c::producer::checked_front(
         &[(MODULE.to_string(), source.to_string())],
         &[SourceId(0)],
     )
-    .expect("the port answers for the declaration");
-    assert!(
-        front.diagnostics.is_empty(),
-        "the declaration typechecks: {:?}",
-        front.diagnostics
-    );
-    front.check
+    .expect("the declaration typechecks")
+    .check
 }
 
 fn bind(net: Arc<dyn Net>) -> HostBinding {

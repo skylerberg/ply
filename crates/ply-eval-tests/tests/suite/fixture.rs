@@ -87,12 +87,7 @@ impl Compiled {
 
     /// A machine running on a real compiled tier — the only evaluator under tier-only (ADR 0048).
     /// Every eval-test that runs a program uses it, since a bare machine holds no evaluator.
-    ///
-    /// The unit is built with the module source texts so the whole Ply emitter — installed by
-    /// [`ply_codegen::c::producer::ensure_default`] — can re-parse them into bodies; `Unit::over`
-    /// alone gets only the reference fragment, which holds no `perform`/`handle`/`simulate`.
     pub fn machine(&self) -> Machine<'_> {
-        ply_codegen::c::producer::ensure_default();
         let mut m = Machine::new(&self.program, &self.resolved, &self.check);
         let unit = ply_codegen::Unit::over_with_texts(
             &self.program,

@@ -166,7 +166,7 @@ pub fn front(root: &Path) -> Result<Front> {
             )
         })
         .collect();
-    let port = crate::port_front(&ordered, &ids)?;
+    let port = ply_codegen::c::producer::checked_front(&ordered, &ids)?;
 
     Ok(Front {
         root: root.to_path_buf(),

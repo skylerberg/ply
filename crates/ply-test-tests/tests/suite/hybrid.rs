@@ -92,7 +92,6 @@ impl Compiled {
     /// against.
     fn failure(&self, key: &str) -> ply_span::Diagnostic {
         let index = self.test_index(key);
-        ply_codegen::c::producer::ensure_default();
         let mut machine = ply_eval::Machine::new(&self.program, &self.resolved, &self.check);
         let unit = ply_codegen::Unit::over_with_texts(
             &self.program,

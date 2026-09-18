@@ -3,11 +3,10 @@
 //!
 //! **Every table here is the front end's, not the tree's** (ADR 0052 §1). The constructor table,
 //! the roots the unit compiles, their cache keys, their arities and the module list all come from
-//! a [`Front`] — the port's when it can serve one, and the Rust chain's otherwise — so that the
-//! day the tree goes, what is left to move is the reference emitter and nothing around it. The
-//! tree is read for one thing: the body `definition` hands the reference emitter.
+//! a [`Front`], so that the day the tree goes, what is left to move is the reference emitter and
+//! nothing around it. The tree is read for one thing: the body `definition` hands the reference
+//! emitter.
 
-use anyhow::Result;
 use ply_hash::HashOutput;
 use ply_hash::body::BodySet;
 use ply_span::{SourceId, Span, Symbol};
@@ -197,53 +196,8 @@ pub fn is_spec_root(name: &str) -> bool {
     name.contains(".law#") || local.contains("#requires#") || local.contains("#ensures#")
 }
 
-/// The front end's answer over `program`: the Rust chain's while it still runs, and the port's
-/// where it is asked for.
-///
-/// The port *is* a front end — it reads text — so asking it is a second front end over the
-/// program and the standard library, for every unit. That is the suite's time rather than a
-/// rounding error: asking it everywhere took a quiet run of `main` from 144 s to 254 s. So the
-/// chain answers while it exists, `PLY_FRONT=port` asks the port instead, and one CI gate runs
-/// with it set so that path stays exercised end to end. The differentials hold the two answers
-/// to each other byte for byte, which is what lets a unit be built from either, and the port
-/// becomes the only answer when the chain goes (ADR 0052 §1).
-pub fn front_for(
-    program: &Program,
-    resolved: &Resolved,
-    check: &CheckOutput,
-    texts: &HashMap<String, String>,
-) -> Result<Front> {
-    let sources: Option<Vec<(String, String)>> = program
-        .modules
-        .iter()
-        .map(|m| {
-            let name = m.name.to_string();
-            texts.get(&name).map(|text| (name, text.clone()))
-        })
-        .collect();
-    if std::env::var("PLY_FRONT").as_deref() == Ok("port")
-        && let Some(sources) = sources
-        && !sources.is_empty()
-        && crate::c::producer::mode() != "ref"
-    {
-        let ids: Vec<SourceId> = program.modules.iter().map(|m| m.source).collect();
-        return crate::c::producer::front_agreeing(&sources, &ids);
-    }
-    // A program that does not hash is one nothing is kept between runs for: the roots and the
-    // tables are still this program's and every cache key is simply absent, which is what the
-    // caller that supplied no hashes at all gets too.
-    let (hashes, bodies) = match ply_hash::hash_program_with_bodies(program, resolved) {
-        Ok((hashes, bodies)) => (hashes, Some(bodies)),
-        Err(_) => (HashOutput::default(), None),
-    };
-    Ok(front_of(program, resolved, check, hashes, bodies.as_ref()))
-}
-
-/// The Rust chain's answer as a [`Front`], from the pieces the driver already holds.
-///
-/// `ply_ty::front` is the protocol and `crates/ply-compiler/ply/front.ply` writes the same text;
-/// this assembles the reference's side of it, so that the tables below have one shape whichever
-/// front end answered.
+/// A [`Front`] assembled from the tree around a check the caller already holds, for a source the
+/// port's whole answer was not asked for: the tables below then have one shape either way.
 pub fn front_of(
     program: &Program,
     resolved: &Resolved,
@@ -801,8 +755,8 @@ impl Source {
         Source::from_front(program, resolved, Box::leak(Box::new(front)), keys)
     }
 
-    /// A source over a front end's answer the caller computed once, through [`front_for`]: how a
-    /// `Unit` is built, so the port's front end runs once for the unit rather than once per table.
+    /// A source over a front end's answer the caller computed once: how a `Unit` is built, so the
+    /// port's front end runs once for the unit rather than once per table.
     pub fn from_front(
         program: &'static Program,
         resolved: &'static Resolved,

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 pub struct Loaded {
     pub program: &'static Program,
     pub resolved: &'static ply_syntax::resolve::Resolved,
+    pub front: &'static ply_ty::Front,
     pub check: &'static ply_ty::CheckOutput,
     /// Each module's text by name: what the whole Ply emitter re-parses to produce.
     pub texts: HashMap<String, String>,
@@ -39,18 +40,14 @@ fn load(source: &str) -> Loaded {
     let expanded = ply_derive::expand_program(&mut ast);
     assert!(expanded.is_empty(), "{expanded:?}");
     let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the corpus resolves");
-    ply_codegen::c::producer::ensure_default();
-    let front = ply_codegen::c::producer::front(&named, &ids).expect("the port answers");
-    assert!(
-        front.diagnostics.is_empty(),
-        "the corpus checks: {:?}",
-        front.diagnostics
-    );
-    let check = front.check;
+    let front: &'static ply_ty::Front = Box::leak(Box::new(
+        ply_codegen::c::producer::checked_front(&named, &ids).expect("the corpus checks"),
+    ));
     Loaded {
         program: Box::leak(Box::new(ast)),
         resolved: Box::leak(Box::new(resolved)),
-        check: Box::leak(Box::new(check)),
+        front,
+        check: &front.check,
         texts: owned
             .iter()
             .map(|(module, text)| (module.to_string(), (*text).to_string()))
@@ -63,8 +60,13 @@ fn load(source: &str) -> Loaded {
 pub fn unit(source: &str) -> (&'static Loaded, &'static Unit) {
     let loaded: &'static Loaded = Box::leak(Box::new(load(source)));
     let unit = ply_codegen::c::producer::reference_only(|| {
-        let unit = Unit::over(loaded.program, loaded.resolved, loaded.check)
-            .expect("this host has a C compiler");
+        let unit = Unit::over_front(
+            loaded.program,
+            loaded.resolved,
+            loaded.front,
+            HashMap::new(),
+        )
+        .expect("this host has a C compiler");
         let _ = unit.bodies();
         unit
     });
@@ -73,14 +75,10 @@ pub fn unit(source: &str) -> (&'static Loaded, &'static Unit) {
 
 /// The same program under the whole Ply emitter, which re-parses the module texts to produce.
 pub fn whole(loaded: &'static Loaded) -> &'static Unit {
-    // Without this the producer is not installed, `producer::mode()` answers "ref", and this
-    // helper builds under the reference emitter while claiming the Ply one. Under nextest --
-    // one process per test -- no other test's `ensure_default` can reach here.
-    ply_codegen::c::producer::ensure_default();
-    let unit = Unit::over_with_texts(
+    let unit = Unit::over_front(
         loaded.program,
         loaded.resolved,
-        loaded.check,
+        loaded.front,
         loaded.texts.clone(),
     )
     .expect("this host has a C compiler");
@@ -898,9 +896,8 @@ fn what_the_fragment_refuses_the_standard_library_for() {
 /// construct the port refuses and the reference emits is named by the failure, which is the census
 /// §2 asks the record to carry.
 ///
-/// `unit` builds under `reference_only`; `whole` installs the producer, so the two units are the
-/// same program under the two emitters. Before the producer was installed in `whole`, both were
-/// the reference and a comparison like this one could not fail.
+/// `unit` builds under `reference_only` and `whole` does not, so the two units are the same
+/// program under the two emitters.
 #[test]
 fn the_port_refuses_no_more_of_the_standard_library_than_the_reference() {
     let (loaded, reference) = unit("pub fn nothing() -> Int = 1\n");
