@@ -4,7 +4,7 @@ use indexmap::IndexMap;
 use ply_core::check_program;
 use ply_hash::body::{BodySet, ItemKind, reconstruct};
 use ply_hash::{DefHash, HashOutput, hash_program_with_bodies};
-use ply_span::{SourceId, Symbol};
+use ply_span::{SourceId, Symbol, codes};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::Resolved;
 use ply_ty::CheckOutput;
@@ -704,23 +704,11 @@ fn reconstructed_tests_evaluate() {
 /// before it was printed. Over the same corpus `the_examples_reconstruct` walks.
 #[test]
 fn a_reconstructed_program_prints_to_the_source_it_hashes_as() {
-    let mut files: Vec<(String, String)> = Vec::new();
-    for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples")).unwrap()
-    {
-        let path = entry.unwrap().path();
-        if path.extension().is_some_and(|e| e == "ply") {
-            let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
-            files.push((stem, std::fs::read_to_string(&path).unwrap()));
-        }
-    }
-    files.sort();
-    let mut borrowed: Vec<(&str, &str)> = files
+    let files = corpus();
+    let borrowed: Vec<(&str, &str)> = files
         .iter()
         .map(|(name, text)| (name.as_str(), text.as_str()))
         .collect();
-    for (name, source) in ply_std::sources() {
-        borrowed.push((name, source));
-    }
     let original = compile(&borrowed);
     let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
     let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
@@ -752,9 +740,8 @@ fn a_reconstructed_program_prints_to_the_source_it_hashes_as() {
     );
 }
 
-/// The corpus a person actually edits, rather than a snippet written to pass.
-#[test]
-fn the_examples_reconstruct() {
+/// The examples and every shipped module: this harness has no import graph to pull in `std.net`.
+fn corpus() -> Vec<(String, String)> {
     let mut files: Vec<(String, String)> = Vec::new();
     for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples")).unwrap()
     {
@@ -766,16 +753,18 @@ fn the_examples_reconstruct() {
     }
     files.sort();
     assert!(!files.is_empty(), "the examples moved");
+    files.extend(ply_std::sources().map(|(name, source)| (name.to_string(), source.to_string())));
+    files
+}
 
-    let mut borrowed: Vec<(&str, &str)> = files
+/// The corpus a person actually edits, rather than a snippet written to pass.
+#[test]
+fn the_examples_reconstruct() {
+    let files = corpus();
+    let borrowed: Vec<(&str, &str)> = files
         .iter()
         .map(|(name, text)| (name.as_str(), text.as_str()))
         .collect();
-    // The corpus imports `std.net`, which `ply` pulls in on demand; this harness has no import
-    // graph to walk, so it loads the shipped set.
-    for (name, source) in ply_std::sources() {
-        borrowed.push((name, source));
-    }
     assert_interfaces_survive(&borrowed);
 }
 
@@ -845,10 +834,7 @@ fn reconstruction_is_deterministic() {
 
 // --- reconstructing under the names a definition was written with ------------
 
-/// Everything the `Namespace` is for, in one program: two definitions in one module (so units have
-/// to be *merged* rather than each given a module of its own), a cross-module reference (so a
-/// dotted import path has to be rebuilt), and an effect (whose program-wide name is the thing a
-/// host handler is registered against, and the whole reason this exists).
+/// Two definitions in one module, a cross-module reference, and an effect a host handler names.
 const NAMED: [(&str, &str); 2] = [
     (
         "store.wire",
@@ -871,104 +857,190 @@ const NAMED: [(&str, &str); 2] = [
     ),
 ];
 
-fn namespace(checked: &Checked) -> BTreeMap<DefHash, Symbol> {
+fn names_of(checked: &Checked) -> Vec<(Symbol, DefHash)> {
     checked
         .hashes
         .defs
         .iter()
         .chain(checked.hashes.decls.iter())
-        .map(|(name, hash)| (*hash, name.clone()))
+        .map(|(name, hash)| (name.clone(), *hash))
         .collect()
+}
+
+fn exact_round_trip(original: &Checked) -> Vec<(String, String)> {
+    let names = names_of(original);
+    let program = ply_hash::body::reconstruct_exact(&original.bodies, &names, |_| false)
+        .unwrap_or_else(|diags| panic!("the names say everything: {diags:#?}"));
+    let printed = ply_syntax::print::program(&program);
+    let borrowed: Vec<(&str, &str)> = printed
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect();
+    let again = compile(&borrowed).hashes;
+    for (name, hash) in &names {
+        let now = again
+            .defs
+            .get(name)
+            .or_else(|| again.decls.get(name))
+            .unwrap_or_else(|| panic!("`{name}` did not come back"));
+        assert_eq!(now, hash, "`{name}` came back as a different definition");
+    }
+    let wanted: BTreeSet<&Symbol> = names.iter().map(|(name, _)| name).collect();
+    let rebuilt: BTreeSet<&Symbol> = again.defs.keys().chain(again.decls.keys()).collect();
+    assert_eq!(rebuilt, wanted, "a name was invented or dropped");
+    printed
 }
 
 #[test]
 fn a_namespace_restores_the_names_and_the_modules() {
     let original = compile(&NAMED.map(|(n, s)| (n, s)));
-    let names = namespace(&original);
-    let mut rebuilt = ply_hash::body::reconstruct_named(&original.bodies, &names)
-        .expect("bodies should reconstruct");
-
-    for (hash, given) in &rebuilt.names {
-        assert_eq!(
-            Some(given),
-            names.get(hash),
-            "`{hash}` came back under a name the namespace did not give it"
-        );
-    }
-    // Module *order* is the units' — hash order, so a reconstruction is byte-identical run to run —
-    // but the set is the program's, which is the claim: five definitions came back as two modules
-    // rather than five.
-    let mut modules: Vec<String> = rebuilt
-        .program
-        .modules
-        .iter()
-        .map(|m| m.name.to_string())
-        .collect();
-    modules.sort();
+    let printed = exact_round_trip(&original);
+    let modules: Vec<&str> = printed.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(modules, ["app", "store.wire"], "units were not merged");
+}
 
-    // And it is a program, not just a naming: it resolves, it typechecks, and every definition
-    // hashes back to the key its body was filed under.
-    let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
-    let check = check_program(&rebuilt.program, &resolved).expect("it should typecheck");
-    assert!(check.defs.contains_key(&Symbol::new("app.main")));
+#[test]
+fn modules_sharing_a_last_segment_are_imported_under_distinct_binders() {
+    let original = compile(&[
+        (
+            "left.util",
+            "pub type Tally = { v: Int }\npub fn one() -> Int = 1\n",
+        ),
+        ("right.util", "pub fn two() -> Int = 2\n"),
+        (
+            "app",
+            r#"
+            import left.util as l
+            import right.util as r
+            fn main() -> Int = {
+              let t: l::Tally = { v: l::one() };
+              t.v + r::two()
+            }
+            "#,
+        ),
+    ]);
+    let printed = exact_round_trip(&original);
+    let app = &printed
+        .iter()
+        .find(|(name, _)| name == "app")
+        .expect("the app comes back")
+        .1;
+    assert!(app.contains("import left.util as left_util"), "{app}");
+    assert!(app.contains("import right.util as right_util"), "{app}");
+}
+
+#[test]
+fn every_name_of_one_body_comes_back() {
+    let pair = r#"
+        pub fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }
+        pub fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }
+    "#;
+    let twins = r#"
+        pub fn one() -> Int = 1
+        pub fn uno() -> Int = 1
+        pub fn spin(n: Int) -> Int = if n == 0 { 0 } else { twirl(n - 1) }
+        pub fn twirl(n: Int) -> Int = if n == 0 { 0 } else { spin(n - 1) }
+    "#;
+    let a = format!("{pair}{twins}");
+    let original = compile(&[("a", a.as_str()), ("b", pair)]);
+    let hash = |name: &str| original.hashes.defs[&Symbol::new(name)];
+    assert_eq!(hash("a.one"), hash("a.uno"));
+    assert_eq!(hash("a.spin"), hash("a.twirl"));
+    assert_eq!(hash("a.even"), hash("b.even"));
+    exact_round_trip(&original);
+}
+
+#[test]
+fn one_body_named_twice_within_a_group_is_refused() {
+    let original = compile(&[(
+        "m",
+        r#"
+        pub fn a(n: Int) -> Int = if n == 0 { 0 } else { b(n - 1) + c(n - 1) }
+        pub fn b(n: Int) -> Int = if n == 0 { 1 } else { a(n - 1) }
+        pub fn c(n: Int) -> Int = if n == 0 { 1 } else { a(n - 1) }
+        "#,
+    )]);
+    let hash = |name: &str| original.hashes.defs[&Symbol::new(name)];
+    assert_eq!(hash("m.b"), hash("m.c"));
+    let refused =
+        ply_hash::body::reconstruct_exact(&original.bodies, &names_of(&original), |_| false)
+            .expect_err("the names cannot say which member a call reaches");
+    assert_eq!(refused[0].code, codes::ARTIFACT_INVALID);
     assert!(
-        check
-            .effects
-            .values()
-            .any(|e| e.name.as_str() == "store.wire.audit")
+        refused[0].message.contains("`m.b`") && refused[0].message.contains("`m.c`"),
+        "{}",
+        refused[0].message
+    );
+}
+
+#[test]
+fn one_effect_declaration_named_twice_is_refused() {
+    let original = compile(&[
+        ("a", "pub effect one { read at() -> Int }"),
+        ("b", "pub effect two { read at() -> Int }"),
+    ]);
+    let names = names_of(&original);
+    let refused = ply_hash::body::reconstruct_exact(&original.bodies, &names, |_| false)
+        .expect_err("two names for one declaration");
+    assert!(
+        refused[0].message.contains("`a.one`") && refused[0].message.contains("`b.two`"),
+        "{}",
+        refused[0].message
     );
 
-    let (again, _) = hash_program_with_bodies(&rebuilt.program, &resolved).expect("it should hash");
-    for (name, hash) in original
-        .hashes
-        .defs
-        .iter()
-        .chain(original.hashes.decls.iter())
-    {
-        let now = again
-            .defs
-            .get(name)
-            .or_else(|| again.decls.get(name))
-            .unwrap_or_else(|| panic!("`{name}` is missing from the rebuilt program"));
-        assert_eq!(
-            now, hash,
-            "`{name}` was rebuilt into a different definition"
-        );
+    let once: Vec<(Symbol, DefHash)> = names
+        .into_iter()
+        .filter(|(name, _)| name.as_str() == "a.one")
+        .collect();
+    ply_hash::body::reconstruct_exact(&original.bodies, &once, |_| false)
+        .expect("named once, the declaration is that name's");
+}
+
+#[test]
+fn names_that_cannot_be_applied_are_refused() {
+    let original = compile(&NAMED.map(|(n, s)| (n, s)));
+    let full = names_of(&original);
+    for broken in [
+        full[1..].to_vec(),
+        full.iter()
+            .map(|(_, hash)| (Symbol::new("m.same"), *hash))
+            .collect(),
+        full.iter()
+            .map(|(_, hash)| (Symbol::new("bare"), *hash))
+            .collect(),
+    ] {
+        let refused = ply_hash::body::reconstruct_exact(&original.bodies, &broken, |_| false)
+            .expect_err("a namespace that cannot be applied");
+        assert_eq!(refused[0].code, codes::ARTIFACT_INVALID);
     }
 }
 
-/// A namespace that cannot be applied consistently is not applied at all.
 #[test]
-fn a_partial_or_colliding_namespace_falls_back_to_synthesized_names() {
+fn a_module_named_only_is_imported_and_not_rebuilt() {
     let original = compile(&NAMED.map(|(n, s)| (n, s)));
-    let full = namespace(&original);
+    let program =
+        ply_hash::body::reconstruct_exact(&original.bodies, &names_of(&original), |module| {
+            module.as_str() == "store.wire"
+        })
+        .expect("the names say everything");
+    let printed = ply_syntax::print::program(&program);
+    assert_eq!(printed.len(), 1);
+    assert_eq!(printed[0].0, "app");
+    assert!(
+        printed[0].1.contains("import store.wire"),
+        "{}",
+        printed[0].1
+    );
+}
 
-    for broken in [
-        // One definition missing.
-        {
-            let mut names = full.clone();
-            let victim = *names.keys().next().unwrap();
-            names.remove(&victim);
-            names
-        },
-        // Two definitions claiming one name.
-        full.keys().map(|h| (*h, Symbol::new("m.same"))).collect(),
-        // A name with no module to put it in.
-        full.keys().map(|h| (*h, Symbol::new("bare"))).collect(),
-    ] {
-        let mut rebuilt = ply_hash::body::reconstruct_named(&original.bodies, &broken)
-            .expect("a namespace that cannot be used is not a broken artifact");
-        assert!(
-            rebuilt
-                .names
-                .values()
-                .all(|n| n.as_str().starts_with('m') && n.as_str().contains(".d")),
-            "a mixture was produced: {:?}",
-            rebuilt.names.values().take(4).collect::<Vec<_>>()
-        );
-        ply_syntax::resolve(&mut rebuilt.program).expect("the fallback still resolves");
-    }
+#[test]
+fn the_examples_come_back_under_their_own_names() {
+    let files = corpus();
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect();
+    exact_round_trip(&compile(&borrowed));
 }
 
 /// Bisection's route is untouched: it deliberately reconstructs without a namespace, because a
