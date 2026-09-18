@@ -1,8 +1,7 @@
 //! What one emitted body is, kept between runs.
 //!
-//! This caches the C, one body at a time, keyed on what the body is a function of. Per body
-//! rather than per unit because that is what makes an edit cost the edit: one definition moving
-//! re-emits one definition, not a project.
+//! The emitted C, one body at a time, keyed on its definition's hash and the texts its sites are
+//! byte offsets into: a site can move under a definition whose hash did not.
 //!
 //! A body's text names the unit's tables by its own positions -- `@@c3@@`, resolved when the body
 //! goes into a unit -- so what is kept here is a function of the body alone and can be read back
