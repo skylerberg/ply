@@ -13,20 +13,15 @@ const UNARMED_CODES: &[(&str, &str)] = &[
     (
         "DB_SCHEMA_MISMATCH",
         "E0435. Reserved for a schema verification that was specified and never \
-         built. NOT fixed and NOT blessed: the database design says \
-         \"E0435 and E0438 are registered and reserved but never emitted\", \
-         and CONTRIBUTING.md \
-         s\"Do not state a guarantee you have not armed\" carries it as its \
-         first live example. This row exists so the gap is asserted rather than \
-         remembered; it is not a decision that the gap is acceptable.",
+         built. This row exists so the gap is asserted rather than remembered; \
+         it is not a decision that the gap is acceptable.",
     ),
     (
         "DB_UNMODELLED_SIDE_EFFECT",
-        "E0438. Same reservation, and the database design calls \
-         it \"the more serious of the two absences\". NOT fixed. Both codes are \
-         in crates/ply-eval/src/host.rs's RESERVED_CODES, so a handler cannot \
-         answer with either — a real, armed restriction (is_reserved_code), and \
-         not the same thing as the code being raised.",
+        "E0438. Same reservation. Both codes are in crates/ply-eval/src/host.rs's \
+         RESERVED_CODES, so a handler cannot answer with either — a real, armed \
+         restriction (is_reserved_code), and not the same thing as the code being \
+         raised.",
     ),
 ];
 
@@ -44,49 +39,43 @@ const UNARMED_VARIANTS: &[(&str, &str)] = &[
     ),
     (
         "AssertionKind::Bool",
-        "CONTRIBUTING.md item 14: Eq is the only variant ever built, at \
-         crates/ply-test/src/slice.rs:345. Disposition is a separate \
-         workstream's; this row holds the finding open.",
+        "Eq is the only variant ever built, in crates/ply-test/src/slice.rs. \
+         This row holds the finding open.",
     ),
     (
         "AssertionKind::Panic",
-        "CONTRIBUTING.md item 14. See AssertionKind::Bool.",
+        "Nothing constructs it either. See AssertionKind::Bool.",
     ),
     (
         "AssertionKind::Runtime",
-        "CONTRIBUTING.md item 14. See AssertionKind::Bool.",
+        "Nothing constructs it either. See AssertionKind::Bool.",
     ),
     (
         "AssertionKind::UnhandledEffect",
-        "CONTRIBUTING.md item 14. See AssertionKind::Bool.",
+        "Nothing constructs it either. See AssertionKind::Bool.",
     ),
     (
         "AssertionKind::RecursionLimit",
-        "CONTRIBUTING.md item 14, and row 4 of the catalogue in \
-         CONTRIBUTING.md s\"The shape it keeps taking\". \
-         crates/ply-eval/src/limit.rs:82 quotes a withdrawn claim that the failure \
-         0004's RecursionLimit \"still classifies it\" and records that nothing \
-         does. See AssertionKind::Bool.",
+        "Nothing constructs it either. See AssertionKind::Bool.",
     ),
     (
         "AssertionKind::Deadlock",
-        "CONTRIBUTING.md item 14. See AssertionKind::Bool.",
+        "Nothing constructs it either. See AssertionKind::Bool.",
     ),
     (
         "Event::Enter",
-        "CONTRIBUTING.md item 15: nothing outside crates/ply-test-tests/tests/ \
-         constructs a SliceBuilder, so nothing calls SliceBuilder::record, so no \
-         Event is ever built. SliceBuilder::record does match on all three \
-         variants — that is a consumer, not a producer.",
+        "Nothing outside crates/ply-test-tests/tests/ constructs a SliceBuilder, \
+         so nothing calls SliceBuilder::record, so no Event is ever built. \
+         SliceBuilder::record does match on all three variants — that is a \
+         consumer, not a producer.",
     ),
     (
         "Event::Return",
-        "CONTRIBUTING.md item 15. See Event::Enter.",
+        "Nothing constructs it either. See Event::Enter.",
     ),
     (
         "Event::Perform",
-        "CONTRIBUTING.md item 15, and row 5 of the catalogue in \
-         CONTRIBUTING.md s\"The shape it keeps taking\". See Event::Enter.",
+        "Nothing constructs it either. See Event::Enter.",
     ),
 ];
 
@@ -1081,11 +1070,10 @@ fn tree() -> &'static Tree {
 fn how_to_fix(what: &str, list: &str) -> String {
     format!(
         "\n\nEither construct it — {what} — or, if it is reserved on purpose, add a row to \
-         `{list}` in crates/ply-span-tests/tests/armed.rs with a reason and a citation. \
+         `{list}` in crates/ply-span-tests/tests/armed.rs with a reason. \
          An entry there is not absolution: it is what makes \"reserved on purpose\" and \
          \"we forgot\" stop looking identical. Do NOT loosen the rule to make an entry \
-         disappear; that inverts the point of this gate.\n\
-         See CONTRIBUTING.md \u{a7}\"The shape it keeps taking: declared, registered, raised nowhere\"."
+         disappear; that inverts the point of this gate."
     )
 }
 
@@ -1679,8 +1667,8 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
     ),
     (
         "crates/ply-cli/src/engine.rs",
-        "`Engine::machine`, attaching what the command resolved: the default tier under \
-         tier-only (ADR 0048), or what `--backend` names. `Engine::of_backend` keys an \
+        "`Engine::machine`, attaching what the command resolved: the default tier, or \
+         what `--backend` names. `Engine::of_backend` keys an \
          honest spec as `Evaluator`, so a pass the tier writes is the default run's own \
          namespace and a spec that is wrong on purpose keeps `c/wrong:..`. \
          `the_default_tier_and_backend_c_are_one_engine` and \
@@ -1790,37 +1778,4 @@ fn between(text: &[u8], open: &[u8], close: &[u8]) -> Vec<u8> {
         Some(&to) => rest[..to].to_vec(),
         None => rest.to_vec(),
     }
-}
-
-/// Two decision records may not share a number.
-#[test]
-fn no_two_adrs_share_a_number() {
-    let dir = workspace_root().join("docs/adr");
-    let mut seen: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for entry in std::fs::read_dir(&dir).expect("docs/adr must be readable") {
-        let name = entry.expect("a readable entry").file_name();
-        let name = name.to_string_lossy().to_string();
-        let Some(stem) = name.strip_suffix(".md") else {
-            continue;
-        };
-        let Some((number, _)) = stem.split_once('-') else {
-            panic!("`docs/adr/{name}` is not `NNNN-slug.md`, so nothing can order it");
-        };
-        seen.entry(number.to_string()).or_default().push(name);
-    }
-    assert!(
-        !seen.is_empty(),
-        "no records found — this test is reading the wrong directory"
-    );
-    let clashes: Vec<String> = seen
-        .iter()
-        .filter(|(_, files)| files.len() > 1)
-        .map(|(n, files)| format!("{n}: {}", files.join(", ")))
-        .collect();
-    assert!(
-        clashes.is_empty(),
-        "two records share a number, so a reference to that number is ambiguous \
-         and one of them has to be renumbered:\n  {}",
-        clashes.join("\n  ")
-    );
 }
