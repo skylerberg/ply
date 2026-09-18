@@ -1,20 +1,4 @@
-// The lowered intermediate form, in Ply: the shape a code generator reads.
-//
-// `crates/ply-codegen`'s emitter does not read the AST. It reads
-// `ply_eval::code::Code` -- windows numbered by `slots.rs`, ownership marked by
-// `rc.rs` -- so converting the emitter to Ply starts here, with the form it
-// consumes, and not with the emitter.
-//
-// The oracle is `reference_lower_dump` in `harness/src/lib.rs`, and this file
-// exists to be compared against it byte for byte, in the shape the six earlier
-// differentials use. `dump` below writes exactly that string.
-//
-// **What is covered so far is written down rather than implied.** `lower`
-// answers `Some` for the forms it lowers and `None` for the rest, and the
-// differential compares only where it answered -- so this file grows one node
-// kind at a time with a green comparison at every step, instead of arriving
-// whole and unverifiable. `covers` is the list, and it is the honest measure of
-// how far this port has got.
+// The lowered form the code generator reads: slots resolved and ownership marked.
 
 import spine (Span, Ident, QName, dummy_span, num)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LInt, LFixed, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
@@ -25,8 +9,7 @@ import exprs (HandleClause, MatchArm, Param, Expr, ELit, EVar, EBinary, EUnary, 
 import items (Module, Item, IFn, parse)
 import rewrite (expand)
 
-// How a read takes its value. `rc.rs`'s `Own`, with the same two cases and
-// the same one-letter spellings the oracle writes.
+// How a read takes its value.
 pub type Own = | Borrowed | Owned
 
 pub fn own_tag(o: Own) -> Bytes =
@@ -53,16 +36,12 @@ pub type Node =
   | NSim({ size: Int, caps: List<Cap>, body: Code })
   | NHandle({ body: Code, clauses: List<CClause>, ret: Option<CRet> })
   | NField({ base: Code, field: Bytes })
-  // `{..b, f: e}` after it has been desugared into a record naming every field.
-  // Not a node the parser leaves behind on either side: it is *recognised* in a
-  // plain literal, one in which some field is `b.<its own name>` for a single
-  // slot variable `b`.
+  // `{..b, f: e}`, recognised in a plain literal where some field is `b.<its own name>` for one slot variable `b`.
   | NUpd({ base: Code, copies: List<Bytes>, sets: List<CField> })
 
 pub type CField = { name: Bytes, value: Code }
 
-// `ply_eval::code::Pat`: a pattern with its binders resolved to slots, which is
-// what lets a match write bindings straight into the window.
+// A pattern with its binders resolved to slots, so a match writes bindings straight into the window.
 pub type CPat =
   | PxWild
   | PxVar({ name: Bytes, slot: Option<Int> })
@@ -75,21 +54,16 @@ pub type CPatField = { name: Bytes, pat: CPat }
 
 pub type CArm = { pat: CPat, guard: Option<Code>, body: Code }
 
-// One free name a barrier copies in when it is entered: the slot it comes from
-// in the enclosing barrier, the slot it lands in here, and how the read that
-// copies it takes the value.
+// A free name a barrier copies in on entry: its slot outside, its slot here, and how the copy reads it.
 pub type Cap = { src: Int, dst: Int, own: Own }
 
-// A handler clause, which opens a barrier of its own: its parameters and its
-// `resume` binder take its leading slots, and what its body reads from where the
-// handler was installed is copied in.
+// A handler clause opens its own barrier: its parameters and `resume` binder take the leading slots.
 pub type CClause = { effect: Bytes, op: Bytes, resource: Bytes, params: Int,
                      resume: Bool, size: Int, caps: List<Cap>, body: Code }
 
 pub type CRet = { size: Int, caps: List<Cap>, body: Code }
 
-// The slot a `let` writes, which is what the ownership pass drops when it walks
-// backwards past the binder.
+// `CLet`'s slot is what the ownership pass drops when it walks backwards past the binder.
 pub type CStmt =
   | CLet({ name: Bytes, slot: Int, value: Code })
   // `let <pattern> = e`: the value is bound as a whole and the pattern's names read out of it.
@@ -97,27 +71,19 @@ pub type CStmt =
   | CDo({ code: Code })
 
 // --- the dump ---------------------------------------------------------------
-//
-// Byte for byte what `reference_lower_dump` writes for the same tree. A
-// difference here is a difference in the *dump* rather than in the lowering,
-// which is why every piece of it is spelled out rather than derived.
+// Diffed byte for byte against the Rust lowering's dump, so every spelling here is load-bearing.
 
 pub fn dump_lit(l: Lit) -> Bytes =
   match l {
     LInt(n) -> bytes_concat(b"i", num(n)),
-    // Lowercased: the lexer keeps the suffix as written (`U32`) and the oracle derives it from
-    // the type (`u32`), so one of the two has to say which spelling the dump uses.
+    // Lowercased, so the dump has one spelling whatever case the suffix was written in.
     LFixed(name, bits) -> bytes_concat_all([b"x", lower_bytes(name), b":", num(bits)]),
     LBool(b) -> if b { b"T" } else { b"F" },
     LStr(s) -> bytes_concat_all([b"s", num(bytes_len(s)), b":", hex(s)]),
     LBytes(s) -> bytes_concat_all([b"y", num(bytes_len(s)), b":", hex(s)]),
-    // The tag and not the value: a Ply program cannot build a `Float`, and the
-    // consumer this oracle exists for refuses a `Float` literal outright.
     LFloat(_) -> b"f",
     LDec(_) -> b"d",
-    // The parser's two placeholders. Neither reaches a lowered tree from a
-    // program that checks, and dumping them as themselves is what would make it
-    // visible if one ever did.
+    // Parser placeholders: never in a checked program's tree, so they dump as themselves.
     LUnit -> b"u",
     LBad -> b"!",
   }
@@ -244,19 +210,12 @@ fn dump_node(n: Node) -> Bytes =
   }
 
 // --- slots ------------------------------------------------------------------
-//
-// `slots.rs`, for one barrier. Every binding gets a slot, every occurrence
-// resolves to one, and a block's scope ends without the slot numbers going
-// backwards -- a window is sized by how many bindings a body has, not by how
-// many are live at once.
-//
-// A forward pass, because a slot is decided by what is in scope to the left of
-// an occurrence. Ownership is the other direction and is the pass below.
+// Forward pass: every binding gets a slot and slot numbers never go back, so a window is sized by
+// bindings, not by how many are live at once.
 
 type Bind = { name: Bytes, slot: Int }
 
-// `names` is the barrier's window in order; `scope` is what is visible here,
-// innermost last, so a shadowing binder is found first by searching backwards.
+// `names` is the barrier's window in order; `scope` is what is visible here, innermost last.
 type Frame = { names: List<Bytes>, scope: List<Bind>, caps: List<Cap>, capnames: List<Bytes> }
 
 fn bind(f: Frame, name: Bytes) -> Frame =
@@ -268,9 +227,7 @@ fn find(f: Frame, name: Bytes) -> Option<Int> =
   fold(f.scope, None, |acc: Option<Int>, b: Bind|
     if b.name == name { Some(b.slot) } else { acc })
 
-// The barriers in scope, innermost last. A lambda opens one; a name free in it
-// and bound further out is threaded through every barrier between, taking a slot
-// in each, which is what `slots.rs` does and what a single frame cannot express.
+// The barriers in scope, innermost last. A free name is threaded through every barrier between use and binding.
 type Stack = { frames: List<Frame> }
 
 fn st_top(st: Stack) -> Frame =
@@ -304,8 +261,7 @@ fn st_depth(st: Stack, name: Bytes) -> Option<Int> =
 fn slot_in(f: Frame, name: Bytes) -> Option<Int> =
   match find(f, name) { Some(s) -> Some(s), None -> find_cap(f, name) }
 
-// Resolves `name` at the innermost barrier, threading a capture through every
-// barrier between the occurrence and the binding when the name is free.
+// Resolves `name` at the innermost barrier, threading a capture through every barrier between when it is free.
 type Resolved = { slot: Option<Int>, st: Stack }
 
 fn resolve(st: Stack, name: Bytes) -> Resolved =
@@ -328,29 +284,23 @@ fn resolve(st: Stack, name: Bytes) -> Resolved =
     },
   }
 
-// A block's binders leave scope at its end; the slots they took do not come
-// back. `names` is untouched and only `scope` is cut.
-// Binding and lookup act on the innermost barrier.
+// A block's binders leave scope at its end, but the slots they took are never reused.
 fn bind_st(st: Stack, name: Bytes) -> Stack = st_top_set(st, bind(st_top(st), name))
 
 fn unscope(f: Frame, to: Int) -> Frame =
   { names: f.names, scope: take(f.scope, to), caps: f.caps, capnames: f.capnames }
 
-// A scope closes on the innermost barrier only.
 fn unscope_st(st: Stack, to: Int) -> Stack = st_top_set(st, unscope(st_top(st), to))
 
 fn depth_of(st: Stack) -> Int = len(st_top(st).scope)
 
-// A name this barrier already copies in, if it does.
 fn find_cap(f: Frame, name: Bytes) -> Option<Int> =
   fold(range(0, len(f.capnames)), None, |acc: Option<Int>, i: Int|
     if nth_bytes(f.capnames, i) == name {
       match list_at(f.caps, i) { Some(c) -> Some(c.dst), None -> acc }
     } else { acc })
 
-// Threads a capture: a slot in this barrier, filled from `src` in the enclosing
-// one. The own mark is settled by the *enclosing* barrier's backward pass, so it
-// is `Borrowed` here and rewritten there.
+// The own mark is `Borrowed` here; the enclosing barrier's backward pass rewrites it.
 fn capture(f: Frame, name: Bytes, src: Int) -> Frame =
   { names: push(f.names, name),
     scope: f.scope,
@@ -364,10 +314,7 @@ fn at(xs: List<Bind>, i: Int) -> Bind =
   match list_at(xs, i) { Some(x) -> x, None -> { name: b"", slot: 0 } }
 
 // --- the lowering -----------------------------------------------------------
-//
-// `None` where this port does not reach yet, so the differential can compare
-// what is covered and say what is not, rather than comparing a wrong answer.
-// Every node is built `Borrowed`; `mark` below is what decides otherwise.
+// `None` for a form not lowered. Every node is built `Borrowed`; `mark` sets ownership.
 
 pub fn covers() -> List<Bytes> =
   [b"literals", b"unary", b"binary", b"if", b"list", b"field", b"application",
@@ -382,17 +329,9 @@ type Out = { code: Code, st: Stack }
 fn lower_in(e: Expr, st: Stack) -> Option<Out> =
   match e {
     ELit(x) -> Some({ code: { own: Borrowed, span: expr_span(e), node: NLit(x.lit) }, st: st }),
-    // `ERecordUpdate` is not lowered, and neither is it in the reference: it is
-    // expanded away before lowering on both sides. What the reference does that
-    // this port does not is *recognise* the result -- `lower_record_update` takes
-    // a plain record literal in which some field is `b.<its own name>`, for one
-    // slot variable `b` and every such copy of that same `b`, and rebuilds the
-    // update from it. No type information is needed, which is what makes it
-    // portable; what is needed is the ownership, where the base is read after
-    // every written field and reads only the copied ones.
+    // `ERecordUpdate` is expanded away before lowering; `as_update` recognises the result.
     EVar(x) -> match x.name.module {
-      // A qualified name is a global under the spelling it was written with, and
-      // never a slot: a module binder cannot be shadowed by a local.
+      // A qualified name is a global, never a slot: a module binder cannot be shadowed by a local.
       Some(m) -> Some({
         code: { own: Borrowed, span: expr_span(e),
                 node: NVar({ name: bytes_concat_all([m.name, b"::", x.name.name.name]),
@@ -400,8 +339,6 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
         st: st }),
       None -> {
         let name = x.name.name.name;
-        // `resolve` answers the innermost slot, threading a capture through
-        // every barrier between the occurrence and the binding on the way.
         let r = resolve(st, name);
         Some({ code: { own: Borrowed, span: expr_span(e), node: NVar({ name: name, slot: r.slot }) }, st: r.st })
       },
@@ -465,8 +402,7 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
         let walked = fold(x.arms, { arms: [], st: sc.st, ok: true },
           |acc: ArmAcc, a: MatchArm|
             if !acc.ok { acc } else {
-              // Each arm binds into the same barrier and its binders leave scope
-              // at the arm's end; the slots they took do not come back.
+              // Arm binders leave scope at the arm's end; their slots are not reused.
               let pd = depth_of(acc.st);
               let pat = lower_pat(a.pat, acc.st);
               match a.guard {
@@ -484,8 +420,6 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
         }
       },
     },
-    // The effect forms that open no barrier of their own. `handle` and
-    // `simulate` do, and are not here.
     EWithRegion(x) -> match lower_in(x.body, st) {
       Some(b) -> Some({ code: { own: Borrowed, span: expr_span(e), node: NRegion({ body: b.code }) }, st: b.st }),
       None -> None,
@@ -499,8 +433,7 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
           args: r.codes }) },
         st: r.st }),
     },
-    // The binder is in scope for the body and leaves at its end; the init is
-    // evaluated before it exists.
+    // The binder is in scope for the body only; the init is evaluated before it exists.
     EWithCell(x) -> match lower_in(x.init, st) {
       None -> None,
       Some(i) -> {
@@ -516,26 +449,12 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
         }
       },
     },
-    // A lambda opens a barrier of its own, and a name it reads from outside is a
-    // *capture*: a slot in this barrier filled from one in the enclosing barrier
-    // when the closure is made. Threading that chain is what `handle` and
-    // `simulate` need too, and it is not here.
-    //
-    // What is here is the closed case, and it is refused rather than guessed at
-    // when it is not: the body is lowered in a barrier holding only the lambda's
-    // parameters, and if any name in it is unresolved *and* would have resolved
-    // outside, this is a capture and the port stops.
+    // A lambda opens its own barrier; a name it reads from outside becomes a capture.
     ELambda(x) -> {
       let params = map(x.params, |p: Param| p.name.name);
       let inner = fold(params, { names: [], scope: [], caps: [], capnames: [] }, |g: Frame, n: Bytes| bind(g, n));
       match lower_in(x.body, st_push(st, inner)) {
         None -> None,
-        // A lambda inside a lambda is refused outright, and the reason is that
-        // the failure is otherwise silent: a name free in the inner one and
-        // bound two barriers out resolves to *no slot at all* here, which reads
-        // as a global and lowers to a tree that is wrong rather than absent.
-        // Threading a slot through every barrier between is what would answer
-        // it, and that chain is not here.
         Some(b) -> Some(lam_of(params, b)),
       }
     },
@@ -549,9 +468,7 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
                st: st_pop(b.st) })
       },
     },
-    // `handle`: the body runs in the barrier it is written in, and every clause
-    // opens one of its own whose leading slots are the clause parameters and its
-    // `resume` binder.
+    // The body runs in the enclosing barrier; each clause opens its own, led by its parameters and `resume`.
     EHandle(x) -> match lower_in(x.body, st) {
       None -> None,
       Some(b) -> {
@@ -607,17 +524,10 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
 fn field_name(fs: List<RecField>, i: Int) -> Bytes =
   match list_at(fs, i) { Some(fd) -> fd.name.name, None -> b"" }
 
-// A record literal that is an update: some field is `b.<its own name>` for one
-// slot variable `b`, and every such copy is of that same `b`. The base is read
-// after every written field and reads only the copied ones, which is what its
-// own mark has to say -- so it is lowered here and marked in `mark`.
-//
-// The reference recovers the node the same way and for the same reason: a
-// `RecordUpdate` expression does not survive either parser, so neither side has
-// one to lower.
+// Recovers an update from a literal whose copied fields are `b.<own name>` for one slot variable `b`;
+// the base is read after every written field, which `mark` has to reflect.
 fn as_update(fields: List<RecField>, st: Stack) -> Option<{ code: Code, st: Stack }> = {
-  // A copy is a field written as `b.<its own name>` for a bare variable `b` in scope. One such
-  // variable names the base; two different ones make this a plain literal.
+  // Two different copied-from variables make this a plain literal.
   let copies = fold(fields, { names: [], bad: false }, |acc: { names: List<Bytes>, bad: Bool }, f: RecField|
     match copy_base(f, st) {
       None -> acc,
@@ -626,17 +536,14 @@ fn as_update(fields: List<RecField>, st: Stack) -> Option<{ code: Code, st: Stac
                  else { { names: acc.names, bad: true } },
     });
   if copies.bad { None } else {
-    // A literal that rewrites every field has no copy to name its base, but a record it projects
-    // from inside a written field dies there just the same, and its cells are what to reuse.
+    // With no copied field, a record projected from inside a written field is the base whose cells are reused.
     let base = if len(copies.names) == 1 { list_at(copies.names, 0) }
                else { fold(fields, None, |acc: Option<Bytes>, f: RecField|
                         match acc { Some(_) -> acc, None -> if copy_base(f, st) != None { None } else { projected_var(f.value, st, []) } }) };
     match base {
       None -> None,
       Some(name) -> {
-        // The fields are walked in order, as the reference's slot pass walks them: a copy
-        // resolves the base where the copy stands, a written field is lowered, and the capture a
-        // lambda between an occurrence and its binding needs is numbered where the occurrence is.
+        // Walked in field order, so each copy resolves the base, and each capture is numbered, where it stands.
         let walked = fold(fields, Some({ codes: [], st: st }), |acc: Option<Seq>, f: RecField|
           match acc {
             None -> None,
@@ -683,9 +590,7 @@ fn copy_base(f: RecField, st: Stack) -> Option<Bytes> =
     _ -> None,
   }
 
-// The first in-scope variable a field read projects from anywhere inside `e`, walking as the
-// reference walks and not through a barrier of its own; a name `e` binds itself is dead by the
-// time the base is read, so it is never the base.
+// The first in-scope variable a field read projects from inside `e`; a name `e` binds itself is never the base.
 fn projected_var(e: Expr, st: Stack, inner: List<Bytes>) -> Option<Bytes> = {
   let first = |xs: List<Expr>| fold(xs, None, |acc: Option<Bytes>, x: Expr|
     match acc { Some(_) -> acc, None -> projected_var(x, st, inner) });
@@ -760,12 +665,7 @@ fn lower_seq(xs: List<Expr>, st: Stack) -> Option<Seq> =
       },
     })
 
-// A block opens a scope its binders leave at the end, and only a plain `let x =`
-// is reached: a destructuring pattern binds more than one slot and is the next
-// thing this port needs.
-// The lambda's own barrier is the top of the stack it was lowered on; what comes
-// back is the stack without it, carrying whatever captures were threaded into
-// the barriers below.
+// Pops the lambda's barrier; the stack below keeps the captures threaded into it.
 fn lam_of(params: List<Bytes>, b: Out) -> Out = {
   let inner = st_top(b.st);
   { code: { own: Borrowed, span: dummy_span(), node: NLambda({ params: len(params), size: len(inner.names),
@@ -824,10 +724,7 @@ fn lower_block(stmts: List<Stmt>, tail: Option<Expr>, st: Stack) -> Option<Out> 
 
 type PatOut = { pat: CPat, st: Stack }
 
-// A pattern's binders take slots in the order the walk meets them, which is what
-// lets an arm write its bindings straight into the window. A bare name may
-// really be a nullary constructor -- the tree cannot tell -- so it takes a slot
-// either way and the machine consults the constructor table before writing it.
+// Binders take slots in walk order. A bare name may be a nullary constructor, so it takes a slot either way.
 fn lower_pat(p: Pattern, st: Stack) -> PatOut =
   match p {
     PWild(_) -> { pat: PxWild, st: st },
@@ -880,17 +777,14 @@ fn nth_bytes(xs: List<Bytes>, i: Int) -> Bytes =
 fn nth_pat(xs: List<CPat>, i: Int) -> CPat =
   match list_at(xs, i) { Some(x) -> x, None -> PxWild }
 
-// A qualified name as the oracle writes it: `module.name`, or the bare name.
 pub fn qname_text(q: QName) -> Bytes =
   match q.module {
-    // `::`, which is how `ply_span::Symbol` renders a qualified name and what
-    // the oracle therefore writes -- not the `.` the source spells it with.
+    // `::`, not the source's `.`: the dump must match the Rust side's spelling.
     Some(m) -> bytes_concat_all([m.name, b"::", q.name.name]),
     None -> q.name.name,
   }
 
-// The slots a pattern binds, which the ownership pass drops when it walks back
-// past the arm that binds them.
+// The slots a pattern binds; the ownership pass drops them walking back past it.
 pub fn pat_slots(p: CPat) -> List<Int> =
   match p {
     PxWild -> [],
@@ -904,21 +798,13 @@ pub fn pat_slots(p: CPat) -> List<Int> =
     },
   }
 
-// Only the shape that binds exactly one name. Anything else binds a set of
-// slots and needs the pattern half of `slots.rs`, which this port has not
-// reached.
+// Only a single-name binder; any other pattern lowers as `CLetPat`.
 fn binder_of(p: Pattern) -> Option<Bytes> =
   match p { PVar(id) -> Some(id.name.name), _ -> None }
 
 // --- ownership --------------------------------------------------------------
-//
-// `rc.rs`'s half, and the one an emitter cannot do without: a read is `Owned`
-// when the slot it reads is not read again after it, and `Borrowed` when it is.
-// Backwards, because "again after it" is a fact about the future, and the two
-// branches of an `if` each see the same future.
-//
-// The live set is slots, not names: a shadowed name is two slots and they die
-// at different points.
+// Backwards: a read is `Owned` when its slot is not read again after it, else `Borrowed`.
+// Liveness is by slot, not name: a shadowed name is two slots that die at different points.
 
 type Marked = { code: Code, live: List<Int> }
 
@@ -948,8 +834,7 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
         live: live_add(live, s),
       },
     },
-    // The base is read *after* every written field, so backwards it is marked
-    // first.
+    // The base is read after every written field, so backwards it is marked first.
     NUpd(u) -> {
       let s = match base_slot(u.base) { Some(x) -> x, None -> -1 };
       let owned = s >= 0 && !live_has(live, s);
@@ -972,10 +857,7 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
       { code: { own: Borrowed, span: c.span, node: NBinary({ op: b.op, lhs: l.code, rhs: r.code }) },
         live: l.live }
     },
-    // A projection is a read of its base, marked here rather than through
-    // `mark` so the node itself stays `Borrowed`: the last read of a slot may
-    // move the record out, and a field is never taken out of it. ADR 0034
-    // records the take that was tried and why it went.
+    // The base is marked here so the node stays `Borrowed`: a last read may move the record out, never a field.
     NField(fd) -> match base_slot(fd.base) {
       None -> {
         let b = mark(fd.base, live);
@@ -988,9 +870,7 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
           live: live_add(live, s) }
       },
     },
-    // Every arm sees the same future, as the branches of an `if` do, and each
-    // arm's binders die at the arm: nothing before the match can read a slot a
-    // pattern wrote.
+    // Every arm sees the same future, and each arm's binders die at the arm.
     NMatch(m) -> {
       let marked = fold(m.arms, { arms: [], live: [] },
         |acc: ArmMark, a: CArm| {
@@ -1003,17 +883,14 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
       { code: { own: Borrowed, span: c.span, node: NMatch({ scrutinee: sc.code, arms: marked.arms }) },
         live: sc.live }
     },
-    // A lambda's body is its own barrier and its marks were settled when it was
-    // lowered. What happens *here* is the captures: each is a read of a slot of
-    // this barrier, at the point the closure is made.
+    // The body was marked when lowered; the captures are reads of this barrier where the closure is made.
     NLambda(l) -> {
       let w = mark_caps(l.caps, live);
       { code: { own: Borrowed, span: c.span, node: NLambda({ params: l.params, size: l.size,
                                                caps: w.caps, body: l.body }) },
         live: w.live }
     },
-    // A barrier's captures are reads of *this* barrier, at the point the barrier
-    // is entered, exactly as a lambda's are.
+    // Captures are reads of this barrier on entry, as a lambda's are.
     NSim(sm) -> {
       let w = mark_caps(sm.caps, live);
       { code: { own: Borrowed, span: c.span, node: NSim({ size: sm.size, caps: w.caps, body: sm.body }) },
@@ -1101,8 +978,7 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
 
 type CapMark = { caps: List<Cap>, live: List<Int> }
 
-// Each capture is a read of the enclosing barrier's slot, `Owned` when nothing
-// after it wants that slot.
+// A capture reads the enclosing barrier's slot, `Owned` when nothing after it wants that slot.
 fn mark_caps(caps: List<Cap>, live: List<Int>) -> CapMark = {
   let walked = fold(rev_caps(caps), { caps: [], live: live },
     |acc: CapMark, cp: Cap|
@@ -1130,8 +1006,6 @@ fn mark_seq(xs: List<Code>, live: List<Int>) -> MarkedSeq = {
 
 type MarkedSeq = { codes: List<Code>, live: List<Int> }
 
-// Reversal by index, because a `fold` that prepends needs `push_front` and this
-// corpus builds one per element type otherwise.
 fn rev_codes(xs: List<Code>) -> List<Code> =
   map(range(0, len(xs)), |i: Int| nth(xs, len(xs) - 1 - i))
 
@@ -1143,17 +1017,13 @@ fn rev_stmts(xs: List<CStmt>) -> List<CStmt> =
   map(range(0, len(xs)), |i: Int|
     match list_at(xs, len(xs) - 1 - i) { Some(x) -> x, None -> CDo({ code: { own: Borrowed, span: dummy_span(), node: NLit(LUnit) } }) })
 
-// --- the differential's entry -----------------------------------------------
-//
-// One module of source in, one dump out, in the oracle's own framing: `L;n;`
-// then a record per function this port lowered. A function it does not reach is
-// left out entirely rather than dumped wrongly, and the count of those is what
-// the comparison reports.
+// --- the module entry ------------------------------------------------------
+
+// `L;n;`, then one record per lowered function; a function not lowered is skipped and counted.
 
 pub type LowerOut = { dump: Bytes, lowered: Int, skipped: Int }
 
-/// One function body, lowered whole: slots resolved forwards, ownership marked
-/// backwards, and the window sized by how many bindings the body has.
+// One function body: slots resolved forwards, then ownership marked backwards.
 pub fn lower_fn(params: List<Bytes>, body: Expr) -> Option<{ code: Code, size: Int }> = {
   let start = fold(params, { names: [], scope: [], caps: [], capnames: [] }, |f: Frame, p: Bytes| bind(f, p));
   match lower_in(body, { frames: [start] }) {
@@ -1225,16 +1095,13 @@ test "a match binds its arms into the window and each arm's binders leave at its
 }
 
 test "what the dump holds is what the count reports" {
-  // The differential compares the records this dump holds and asserts how many
-  // there are. Those two have to be the same number or the share it reports is
-  // about something other than what it compared.
   let out = lower_module(b"fn f() -> Int = 1\nfn g(a: Int) -> Int = a\nfn h() -> Int = 2\n");
   assert_eq(out.lowered, 3);
   assert_eq(out.skipped, 0);
   assert_eq(count_records(bytes_of_string(lower_dump(b"fn f() -> Int = 1\nfn g(a: Int) -> Int = a\nfn h() -> Int = 2\n"))), 3)
 }
 
-// `f:m.` at the head of a record, counted the way the differential splits them.
+// Counts records by their `f:m.` heads.
 fn count_records(d: Bytes) -> Int =
   fold(range(0, bytes_len(d) - 3), 0, |acc: Int, i: Int|
     if bytes_at(d, i) == 102 && bytes_at(d, i + 1) == 58
