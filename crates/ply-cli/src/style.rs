@@ -8,8 +8,7 @@ pub enum ColorChoice {
     Never,
 }
 
-/// Colour and the ✓/✗ marks are one decision, not two: both are decoration that
-/// a pipe should never receive.
+/// One switch for colour and the ✓/✗ marks: neither may reach a pipe.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Style {
     styled: bool,
@@ -67,9 +66,7 @@ impl Style {
         self.paint("33", text)
     }
 
-    /// Terminal diagnostics come back from `ariadne` already coloured, and it
-    /// offers no way to ask after the fact. Stripping is the only way to keep
-    /// escapes out of a pipe.
+    /// `ariadne` colours diagnostics unasked, so unstyled output has to strip them.
     pub fn sanitize(self, text: &str) -> String {
         if self.styled {
             text.to_string()
@@ -79,8 +76,7 @@ impl Style {
     }
 }
 
-/// Drops CSI (`ESC [ … final`) and the two-character escapes; anything else
-/// after an `ESC` is passed through rather than guessed at.
+/// Drops CSI and two-character escapes; anything else after an `ESC` passes through.
 pub fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();

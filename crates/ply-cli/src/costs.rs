@@ -7,12 +7,10 @@ use ply_syntax::resolve::Resolved;
 
 use crate::style::Style;
 
-/// Where the verdict column starts. Wide enough for `stdlib.ply:1234:56`, which
-/// is the longest location the shipped modules produce.
+/// Where the verdict column starts: wide enough for `stdlib.ply:1234:56`.
 const LOCATION: usize = 22;
 
-/// Renders the whole report. `None` when the program declares no `push` at all,
-/// so a caller can say that rather than printing an empty block.
+/// The whole report, or `None` when the program declares no `push` at all.
 pub fn lines(
     program: &Program,
     resolved: &Resolved,
@@ -72,12 +70,7 @@ pub fn lines(
     Some(out)
 }
 
-/// The promise a `reuse fn` makes, checked: every append in its body reuses its list for every
-/// reason the body controls. An append onto the definition's own parameter keeps the promise
-/// whatever a caller does with what it passed — the promise says nothing about callers, which is
-/// what keeps the multi-shot counterexample from reaching it — and every other copy or undecided
-/// site is E0127, with the edit that would keep the promise where one exists. Only the modules in
-/// `program` are checked: a command that parsed part of a project checks the promises it parsed.
+/// Each `reuse fn`'s appends must reuse, except onto its own parameter; else E0127.
 pub fn promises(program: &Program, resolved: &Resolved) -> Vec<Diagnostic> {
     let promised: Vec<(usize, &FnDef)> = program
         .modules
@@ -151,7 +144,6 @@ fn tally(def: &Definition) -> String {
     parts.join(", ")
 }
 
-/// The whole-program line.
 fn summary(report: &Report) -> String {
     let (mut reuses, mut copies, mut unknown) = (0, 0, 0);
     for def in report.all() {

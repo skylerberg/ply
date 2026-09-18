@@ -23,7 +23,6 @@ use crate::serve::{Server, reserve_port};
 /// Where `examples/desk.ply` stops being the service and starts being its tests.
 const TESTS_MARKER: &str = "// --- Tests: the business, which needs no handler at all";
 
-/// The credential name the TLS runs are configured under.
 const CREDENTIAL: &str = "desk";
 
 /// `main`'s declared row in `examples/desk.ply`, and the same row once the accept loop spawns.
@@ -31,10 +30,8 @@ const MAIN_ROW: &str =
     "fn main() -> Int / {Serving, config.read[server], net.write[conn], net.write[listener]} = {";
 const MAIN_ROW_SPAWNING: &str = "fn main() -> Int / {Serving, config.read[server], task.write, net.write[conn], net.write[listener]} = {";
 
-/// How long a client waits on one response.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Connections one measured point may open.
 const MAX_CONNECTIONS: u32 = 1000;
 
 /// Connections per thread for a point, and the requests that implies.
@@ -47,14 +44,11 @@ fn micros(d: Duration) -> f64 {
     d.as_secs_f64() * 1e6
 }
 
-// --- The service ------------------------------------------------------------
-
 /// `examples/desk.ply`, split where its tests begin.
 pub struct Service {
     server_only: String,
 }
 
-/// Which accept loop the served program runs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Variant {
@@ -114,7 +108,6 @@ impl Service {
         }
     }
 
-    /// The accept loop, rewritten to spawn.
     fn task_per_connection(&self) -> Result<String> {
         const OLD_SERVE: &str = "\
 pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
@@ -165,8 +158,7 @@ pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
                 "pub fn run_tls(port: Int, credential: String, count: Int) -> Int\n  / {Serving, net.write[conn], net.write[listener]} =",
                 "pub fn run_tls(port: Int, credential: String, count: Int) -> Int\n  / {Serving, task.write, net.write[conn], net.write[listener]} =",
             ),
-            // The twin's entry points are the ones this harness drives, so they are widened with
-            // the rest rather than left behind at the row the sequential accept loop published.
+            // The twin's entry points are widened too, since this harness drives them.
             (
                 "pub fn run_memory(port: Int, api: Option<Secret<String>>, count: Int) -> Int\n  / {net.write[conn], net.write[listener]} =",
                 "pub fn run_memory(port: Int, api: Option<Secret<String>>, count: Int) -> Int\n  / {task.write, net.write[conn], net.write[listener]} =",
@@ -195,9 +187,7 @@ pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
         port: u16,
         connections: u32,
     ) -> Result<()> {
-        // `desk.ply` declares its own `main`, so the entry point is rewritten in place rather than
-        // written beside it: two modules declaring `main` is `E0112` and a directory is a whole
-        // program.
+        // Rewritten in place: `desk.ply` declares its own `main`, and a second one is `E0112`.
         let source = self.source(variant)?;
         let header = match variant {
             Variant::Sequential => MAIN_ROW,
@@ -264,8 +254,7 @@ pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
     }
 }
 
-/// The whole of `main`, from its declaration to the `}` that closes it, replaced by an entry point
-/// that drives the twin.
+/// Replaces `main`, declaration to closing `}`, with an entry point that drives the twin.
 fn replace_entry_point(source: &str, header: &str, to: &str) -> Result<String> {
     let at = source.find(header).with_context(|| {
         format!(
@@ -295,23 +284,18 @@ fn replace(source: &str, from: &str, to: &str) -> Result<String> {
     Ok(source.replace(from, to))
 }
 
-// --- The in-process program -------------------------------------------------
-
 /// A checked service, callable with whatever answers `net`.
 pub struct Loaded {
     pub program: ply_syntax::ast::Program,
     pub resolved: ply_syntax::resolve::Resolved,
     pub check: CheckOutput,
-    /// The port's whole answer, so the tier is built from it rather than from a second front end
-    /// derived inside `over_with_texts` (ADR 0052 §2).
+    /// The port's whole answer, which the tier is built from.
     pub port: ply_ty::Front,
-    /// This program's region kinds, shared by every machine below rather than inferred once per
-    /// machine.
+    /// This program's region kinds, shared by every machine below.
     region_kinds: ply_eval::region_kind::Kinds,
-    /// Each module's source text by `m.name.to_string()`: what the whole Ply emitter re-parses to
-    /// produce bodies, since under tier-only (ADR 0048) every machine here runs on a compiled tier.
+    /// Each module's source text, which the Ply emitter re-parses to produce bodies.
     texts: HashMap<String, String>,
-    /// The unit over the program, built once: every machine over this program attaches it.
+    /// The unit over the program, built once.
     unit: std::sync::OnceLock<&'static ply_codegen::Unit>,
 }
 
@@ -330,8 +314,7 @@ impl Loaded {
             let id = sources.add(ply_std::pseudo_path(module), source.to_string());
             inputs.push((id, module.clone(), source));
         }
-        // `texts` below is a map, for `Unit::over_front`. The port needs the same pairs
-        // in the program's order, because that order is how a span names its module.
+        // The port needs these pairs in program order, which is how a span names its module.
         let ordered: Vec<(String, String)> = inputs
             .iter()
             .map(|(_, name, source)| (name.to_string(), (*source).to_string()))
@@ -363,15 +346,12 @@ impl Loaded {
         self.full_in("desk", simple)
     }
 
-    /// This program's one answer about its regions, for an engine built outside this module.
+    /// This program's region kinds, for an engine built outside this module.
     pub fn shared_region_kinds(&self) -> ply_eval::region_kind::Kinds {
         ply_eval::region_kind::Kinds::clone(&self.region_kinds)
     }
 
-    /// A machine over this program, holding this program's region kinds rather than inferring its
-    /// own. Under tier-only (ADR 0048) the machine's evaluator is a compiled tier, which the whole
-    /// Ply emitter — installed by [`ply_codegen::c::producer::ensure_default`] — produces from the
-    /// module source texts.
+    /// A machine over this program, sharing its region kinds; its evaluator is a compiled tier.
     pub fn machine(&self) -> Machine<'_> {
         ply_codegen::c::producer::ensure_default();
         let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
@@ -393,9 +373,7 @@ impl Loaded {
         machine
     }
 
-    /// `Machine::call` takes the program-wide name, and two modules may declare the same simple one
-    /// — `desk::limits` and `std.http::default_limits` are one edit apart from colliding — so the
-    /// module is named rather than guessed at from whichever definition sorts first.
+    /// The program-wide name of `simple` in `module`; simple names can collide across modules.
     pub fn full_in(&self, module: &str, simple: &str) -> Result<String> {
         self.check
             .defs
@@ -405,7 +383,6 @@ impl Loaded {
             .with_context(|| format!("`{module}` declares no `{simple}`"))
     }
 
-    /// One pure call, timed.
     pub fn pure_call(&self, name: &str, args: Vec<Value>, calls: u32) -> Result<(Duration, Value)> {
         let mut machine = self.machine();
         let mut last = Value::Unit;
@@ -445,8 +422,7 @@ impl Loaded {
             .map(|d| d.footprint.clone())
     }
 
-    /// `desk::run` over a scripted network: the whole service — read, frame, route, dispatch,
-    /// encode, write — with no syscall in it.
+    /// `desk::run` over a scripted network: the whole service with no syscall in it.
     pub fn over_sim(&self, script: Vec<Vec<Vec<u8>>>) -> Result<(Duration, usize)> {
         let connections = script.len();
         let net: Arc<dyn Net> = Arc::new(SimNet::new(script));
@@ -471,8 +447,7 @@ impl Loaded {
     }
 }
 
-/// `desk::run_memory(port, api, count)` for a simulated network: port `0`, because `SimNet` answers
-/// whatever it is asked to listen on, and no API key, because no measured request presents one.
+/// Port `0`, since `SimNet` answers any, and no API key, since no measured request has one.
 fn twin_arguments(connections: i64) -> Vec<Value> {
     vec![
         Value::Int(0),
@@ -489,8 +464,6 @@ fn diagnostics(what: &str, diagnostics: &[ply_span::Diagnostic]) -> anyhow::Erro
         .collect();
     anyhow::anyhow!("{what} failed:\n  {}", shown.join("\n  "))
 }
-
-// --- Requests ---------------------------------------------------------------
 
 /// One request the harness sends, by the name a table prints for it.
 #[derive(Clone, Debug)]
@@ -569,8 +542,6 @@ pub fn read_mix() -> Vec<Call> {
     paths.iter().map(|(name, path)| call(name, path)).collect()
 }
 
-// --- The client -------------------------------------------------------------
-
 trait Stream: Read + Write + Send {}
 impl<T: Read + Write + Send> Stream for T {}
 
@@ -599,8 +570,7 @@ impl Conn {
         ))
     }
 
-    /// A TLS connection, with the handshake driven to completion here rather than left to the first
-    /// write — which is what lets [`tls`] report it as its own number.
+    /// A TLS connection with the handshake completed here, so [`tls`] can time it separately.
     fn tls(addr: SocketAddr, config: Arc<ClientConfig>) -> Result<(Conn, Duration, Duration)> {
         let started = Instant::now();
         let socket = TcpStream::connect_timeout(&addr, CLIENT_TIMEOUT)?;
@@ -685,8 +655,7 @@ impl Conn {
             }
             self.at += want;
         }
-        // The buffer is rewound rather than grown for the life of a connection that may serve a
-        // hundred requests.
+        // Rewound rather than grown, since one connection may serve many requests.
         if self.at == self.buf.len() {
             self.buf.clear();
             self.at = 0;
@@ -747,8 +716,7 @@ impl Sample {
         self
     }
 
-    /// A run over a server that answered some of the requests is not a slower server, it is a
-    /// different measurement.
+    /// A partial answer is a different measurement, not a slower server.
     fn require(&self, requests: u32) -> Result<()> {
         if !self.failures.is_empty() || self.latencies.len() as u32 != requests {
             bail!(
@@ -784,7 +752,6 @@ impl Sample {
     }
 }
 
-/// What the client threads should do.
 #[derive(Clone)]
 struct Plan {
     addr: SocketAddr,
@@ -808,8 +775,7 @@ impl Plan {
 
 fn drive(plan: &Plan, thread: u32) -> Sample {
     let mut sample = Sample::default();
-    // Each thread starts at a different point in the mix, so that at concurrency 8 over eight
-    // routes the server is not answering eight copies of one request at a time.
+    // Threads start at different points in the mix so they do not send identical requests.
     let mut next = thread as usize;
     for _ in 0..plan.conns_per_thread {
         let opened = match &plan.tls {
@@ -871,15 +837,12 @@ fn run_plan(plan: &Plan, threads: u32) -> Result<(Sample, Duration)> {
     Ok((sample, started.elapsed()))
 }
 
-// --- One measured point -----------------------------------------------------
-
 #[derive(Clone, Debug, Serialize)]
 pub struct LoadPoint {
     pub variant: &'static str,
     pub transport: &'static str,
     pub label: String,
     pub concurrency: u32,
-    /// Requests one connection carried.
     pub per_conn: u32,
     pub connections: u32,
     pub requests: u32,
@@ -915,8 +878,7 @@ impl Bench {
     ) -> Result<Bench> {
         let dir = tempfile::tempdir().context("a temp dir for the served project")?;
         let port = reserve_port()?;
-        // One connection for the probe below, which proves the server is answering before anything
-        // is timed.
+        // One extra connection for the probe that proves the server is answering.
         service.project(dir.path(), variant, transport, port, connections + 1)?;
         let (server, tls) = match transport {
             Transport::Http => (Server::start(ply, dir.path(), &[])?, None),
@@ -947,8 +909,7 @@ impl Bench {
         SocketAddr::from(([127, 0, 0, 1], self.port))
     }
 
-    /// One real request over the real transport, so the first timed point does not race the
-    /// server's typecheck.
+    /// One real request, so the first timed point does not race the server's typecheck.
     fn probe(&mut self) -> Result<()> {
         let plan = Plan {
             addr: self.addr(),
@@ -1033,10 +994,7 @@ impl Bench {
     }
 }
 
-// --- The client, for a harness that starts its own server -------------------
-
-/// Block until the server answers one real request over the real transport, so the first timed
-/// point does not race its typecheck.
+/// Block until the server answers a real request, so timing does not race its typecheck.
 pub fn wait_until_serving(server: &mut Server, addr: SocketAddr) -> Result<()> {
     wait_until_serving_over(server, addr, None)
 }
@@ -1151,8 +1109,6 @@ pub fn load_point_over(
     })
 }
 
-// --- TLS material -----------------------------------------------------------
-
 pub struct Material {
     pub certificate: PathBuf,
     pub key: PathBuf,
@@ -1174,8 +1130,7 @@ pub fn credential(dir: &Path) -> Result<Material> {
     })
 }
 
-/// A client that trusts exactly the certificate this run generated, so the handshake being measured
-/// is a real one rather than one with verification switched off.
+/// A client trusting exactly this run's certificate, so verification stays on.
 pub fn client_config(der: &CertificateDer<'static>) -> Result<ClientConfig> {
     let mut roots = RootCertStore::empty();
     roots.add(der.clone()).context("trusting the certificate")?;
@@ -1192,8 +1147,6 @@ pub fn client_config(der: &CertificateDer<'static>) -> Result<ClientConfig> {
     Ok(config)
 }
 
-// --- Section 1: the multi-route service under load --------------------------
-
 /// Throughput and tail latency for the mixed read load, at each concurrency.
 pub fn routes(
     repo: &Path,
@@ -1205,8 +1158,7 @@ pub fn routes(
 ) -> Result<Vec<LoadPoint>> {
     let service = Service::open(repo)?;
     let calls = read_mix();
-    // Every point gets about the same number of requests, so a p99 at concurrency 1 rests on as
-    // many samples as one at concurrency 64.
+    // Every point gets about as many requests, so each p99 rests on comparable samples.
     let shares: Vec<(u32, u32)> = concurrencies
         .iter()
         .map(|&c| (c, share(c, per_conn, requests_per_point)))
@@ -1220,8 +1172,6 @@ pub fn routes(
     bench.finish()?;
     Ok(out)
 }
-
-// --- Section 2: what each route costs ---------------------------------------
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RoutePoint {
@@ -1238,8 +1188,7 @@ pub fn per_route(repo: &Path, requests: u32, repeats: usize) -> Result<Vec<Route
     let service = Service::open(repo)?;
     let loaded = Loaded::parse(&service.source(Variant::Sequential)?)?;
 
-    // `POST /orders` draws one `bolt` off a shelf of five hundred, so its request count is capped
-    // rather than shared with the read routes'.
+    // `POST /orders` draws down a finite shelf, so its request count is capped.
     let writes = requests.min(400);
     let mut cases: Vec<(String, Vec<u8>, u32)> = read_mix()
         .into_iter()
@@ -1278,14 +1227,11 @@ pub fn per_route(repo: &Path, requests: u32, repeats: usize) -> Result<Vec<Route
     Ok(out)
 }
 
-// --- Where a request's time goes --------------------------------------------
-
 #[derive(Clone, Debug, Serialize)]
 pub struct StagePoint {
     pub stage: &'static str,
     pub what: &'static str,
     pub per_request_micros: f64,
-    /// This piece as a share of a whole request.
     pub share: f64,
 }
 
@@ -1365,9 +1311,7 @@ pub fn stages(repo: &Path, requests: u32, repeats: usize) -> Result<Vec<StagePoi
     Ok(out)
 }
 
-/// A constructor value the machine will match on has to come from the program: a pattern resolves
-/// its constructor to a module-qualified name, so a value synthesized in Rust from the bare one
-/// matches nothing.
+/// Constructors must come from the program: one synthesized in Rust matches no pattern.
 const STAGE_DRIVER: &str = r#"
 
 fn bench_method() -> http::Method = http::Get
@@ -1399,14 +1343,10 @@ fn best_of(repeats: usize, mut run: impl FnMut() -> Result<(Duration, usize)>) -
     Ok(best.expect("at least one attempt runs"))
 }
 
-// --- Section 3: fields or bytes ---------------------------------------------
-
 #[derive(Clone, Debug, Serialize)]
 pub struct ShapePoint {
-    /// Which axis is being grown.
     pub axis: &'static str,
-    /// What the axis says about the request: how many header fields it carries and how many bytes
-    /// it is.
+    /// How many header fields the request carries and how many bytes it is.
     pub fields: usize,
     pub request_bytes: usize,
     pub requests: u32,
@@ -1415,14 +1355,13 @@ pub struct ShapePoint {
     pub per_second: f64,
 }
 
-/// Three sweeps, and the only one that matters is the first.
+/// Per-request cost as header bytes, header fields and body bytes grow.
 pub fn shape(repo: &Path, requests: u32, repeats: usize) -> Result<Vec<ShapePoint>> {
     let service = Service::open(repo)?;
     let loaded = Loaded::parse(&service.source(Variant::Sequential)?)?;
     let mut out = Vec::new();
 
-    // `max_header_bytes` is 16384 and `max_header_count` is 64; both sweeps stop below their bound,
-    // because measuring a refusal is measuring a different program.
+    // Both header sweeps stop below the limits: measuring a refusal measures a different program.
     for pad in [0usize, 64, 256, 1024, 4096, 12288] {
         let bytes = request("GET", "/items", None, false, pad, 0);
         out.push(point(
@@ -1477,8 +1416,6 @@ fn point(
     })
 }
 
-// --- Section 4: keep-alive --------------------------------------------------
-
 /// The same total work, spread over fewer and fewer connections.
 pub fn keep_alive(
     repo: &Path,
@@ -1509,8 +1446,6 @@ pub fn keep_alive(
     bench.finish()?;
     Ok(out)
 }
-
-// --- Section 5: TLS ---------------------------------------------------------
 
 /// One route over HTTP and over HTTPS, at three degrees of connection reuse.
 pub fn tls(
@@ -1554,8 +1489,6 @@ pub fn tls(
     Ok(out)
 }
 
-// --- Section 6: an alias costs nothing --------------------------------------
-
 #[derive(Clone, Debug, Serialize)]
 pub struct AliasReport {
     /// Rows in `desk.ply` written `/ {Desk..}` and rewritten to the expansion.
@@ -1578,7 +1511,7 @@ pub struct AliasReport {
     pub declared_not_performed: Vec<String>,
 }
 
-/// The two spellings of one service, compared where it counts.
+/// The aliased and explicit spellings of one service, compared.
 pub fn aliases(repo: &Path) -> Result<AliasReport> {
     let service = Service::open(repo)?;
     let aliased = service.source(Variant::Sequential)?;
@@ -1610,8 +1543,7 @@ pub fn aliases(repo: &Path) -> Result<AliasReport> {
             body_differences += 1;
         }
     }
-    // A definition present on one side and not the other is a difference too, and would otherwise
-    // be invisible to the loop above.
+    // A definition present on one side only is a difference the loop above misses.
     hash_differences += right_hashes
         .defs
         .keys()
@@ -1659,8 +1591,6 @@ fn stored_bytes(bodies: &ply_hash::body::BodySet, hashes: &ply_hash::HashOutput)
         .map(|b| b.len())
         .sum()
 }
-
-// --- Reporting --------------------------------------------------------------
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Measurements {

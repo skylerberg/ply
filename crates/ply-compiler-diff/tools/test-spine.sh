@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# `spine.ply`'s own tests, in a project holding only `lexer.ply` and
-# `spine.ply`. `ply test crates/ply-compiler` typechecks every module in the
-# directory, and four agents write into it at once.
+# spine.ply tests, in a private project holding only lexer.ply and spine.ply.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../../.." && pwd)"

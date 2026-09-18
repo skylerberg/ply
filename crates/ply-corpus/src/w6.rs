@@ -1,4 +1,4 @@
-//! Where a request's time goes now, and what would justify M9.
+//! Where a request's time goes, and what would justify M9.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ pub enum Arena {
     Served,
 }
 
-/// One layer of the W5 stack, and the substitution that isolates it.
+/// One layer of the stack, and the substitution that isolates it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Layer {
@@ -123,13 +123,11 @@ impl Layer {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Point {
     pub layer: Layer,
-    /// The route this rung's pair was taken on.
     pub taken_on: String,
     /// The configuration **with** this layer, per request.
     pub with_micros: f64,
     /// The same configuration **without** it, same arena, same run.
     pub without_micros: f64,
-    /// The **worst** of the same repeats, when the rung was repeated.
     #[serde(default)]
     pub with_worst_micros: Option<f64>,
     #[serde(default)]
@@ -164,8 +162,7 @@ pub struct Rung {
     pub without_micros: f64,
     /// `with − without`.
     pub layer_micros: f64,
-    /// The same difference at its smallest and largest over the repeats, when the rung carries
-    /// them.
+    /// The same difference at its smallest and largest over the repeats.
     pub layer_low_micros: Option<f64>,
     pub layer_high_micros: Option<f64>,
     pub layer_share: f64,
@@ -182,16 +179,12 @@ impl Rung {
     }
 }
 
-/// What the floor and the total answered, so a multiple between them is readable rather than
-/// inferable.
+/// What the floor and the total answered, so a multiple between them is readable.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Denominators {
-    /// What the Rust floor answered, spelled out: the route, the response size and everything it
-    /// does *not* have under it.
+    /// What the Rust floor answered: the route, the response size, and what it lacks.
     pub floor_taken_on: String,
-    /// What the measured total served.
     pub total_taken_on: String,
-    /// The worst of the total's repeats, when it was repeated.
     pub total_worst_micros: Option<f64>,
 }
 
@@ -214,12 +207,10 @@ pub struct Ladder {
     /// The same with a **negative** residue charged back to it.
     pub conservative_micros: f64,
     pub conservative_share: f64,
-    /// The conservative share at the two ends of the repeats it was read off: the smallest
-    /// numerator over the largest denominator, and the reverse.
+    /// The conservative share at the two ends of its repeats.
     pub share_low: Option<f64>,
     pub share_high: Option<f64>,
-    /// Whether the interpreter rungs chain — each `without` is the rung below's `with` — so that
-    /// their sum is one absolute somebody measured rather than five differences added up.
+    /// Whether each interpreter rung's `without` is the one below's `with`.
     pub telescopes: bool,
     /// The most negative layer as a share of the total, as a positive number.
     pub worst_negative_share: f64,
@@ -313,9 +304,7 @@ impl Ladder {
         }
 
         let residue = total_micros - attributed;
-        // Only a negative residue moves the numerator: a positive one is time no substitution
-        // separated, and crediting it to the interpreter would be claiming an attribution the
-        // ladder did not earn.
+        // Only a negative residue moves the numerator; a positive one was never attributed.
         let seam = residue.min(0.0);
         let conservative = interpreter + seam;
 
@@ -327,8 +316,7 @@ impl Ladder {
             && interpreter_rungs
                 .first()
                 .is_some_and(|first| first.without_micros == 0.0);
-        // When the rungs chain, the interpreter total is the top rung's own absolute and its band
-        // is that rung's.
+        // When the rungs chain, the top rung's own absolute and band are the interpreter total's.
         let top = points.iter().rfind(|p| p.layer.is_interpreter());
         let (share_low, share_high) = match top.filter(|_| telescopes) {
             Some(top) => match top.with_worst_micros {
@@ -364,7 +352,6 @@ impl Ladder {
         })
     }
 
-    /// Layers the ladder does not carry.
     pub fn missing(&self) -> Vec<Layer> {
         Layer::ORDER
             .into_iter()
@@ -402,22 +389,18 @@ impl SpikeInput {
         self.interpreter_best_micros / self.spike_best_micros
     }
 
-    /// Whether the two samples separate at all.
     pub fn separated(&self) -> bool {
         self.spike_worst_micros < self.interpreter_best_micros
     }
 }
 
-/// What the throwaway codegen spike produced.
+/// What the codegen spike produced.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Spike {
-    /// The function compiled, named so the choice is reviewable.
     pub function: String,
-    /// Why this one.
     pub chosen_because: String,
-    /// Nodes in its lowered body, which is the size of what was compiled.
+    /// Nodes in its lowered body.
     pub nodes: usize,
-    /// What compiling it cost, once.
     pub compile_micros: f64,
     pub inputs: Vec<SpikeInput>,
 }
@@ -429,7 +412,6 @@ pub struct SpikeVerdict {
     /// The best optimistic ratio, for context only.
     pub optimistic: f64,
     pub evidence: bool,
-    /// Every rule that failed, named.
     pub failures: Vec<String>,
 }
 
@@ -481,7 +463,7 @@ impl Spike {
     }
 }
 
-/// One entry of the cheaper levers's table, **in code**.
+/// One entry of the cheaper-levers table.
 pub struct Lever {
     /// The key an [`Alternative`] carries in its `name` to answer for this lever.
     pub name: &'static str,
@@ -489,7 +471,6 @@ pub struct Lever {
     pub what: &'static str,
 }
 
-/// The cheaper levers's seven levers.
 pub const LEVERS: [Lever; 7] = [
     Lever {
         name: "more native builtins",
@@ -544,13 +525,11 @@ pub struct Alternative {
 }
 
 impl Alternative {
-    /// Whether this is a measurement C3 may read: priced, with a usable ratio, and carrying what
-    /// the ratio is between.
+    /// Whether C3 may read this: priced, with a usable ratio, and saying what it is between.
     pub fn is_priced(&self) -> bool {
         self.priced && usable(self.end_to_end) && !self.evidence.trim().is_empty()
     }
 
-    /// The best priced alternative, or none if nothing was priced.
     pub fn best(alternatives: &[Alternative]) -> Option<&Alternative> {
         alternatives
             .iter()
@@ -562,7 +541,6 @@ impl Alternative {
         alternatives.iter().filter(|a| !a.is_priced()).collect()
     }
 
-    /// What this alternative answers for, if anything.
     pub fn lever(&self) -> Option<&'static Lever> {
         LEVERS.iter().find(|l| l.name == self.name)
     }
@@ -606,25 +584,19 @@ pub fn c3_gaps(alternatives: &[Alternative]) -> Vec<String> {
 pub struct Criteria {
     /// Interpreter share at or above which M9's case can be made at all.
     pub min_share: f64,
-    /// Below this share, defer categorically and say why: the ceiling is `1/(1−share)` however good
-    /// the backend is.
+    /// Below this share, defer: the ceiling is `1/(1−share)` however good the backend is.
     pub defer_share: f64,
     /// Speedup the spike must show on a real request-path function.
     pub min_spike: f64,
-    /// Below this, defer: a constant factor this small is inside the range a cheaper lever has
-    /// already delivered once.
+    /// Below this spike speedup, defer: a cheaper lever has already delivered as much.
     pub defer_spike: f64,
     /// Projected end-to-end speedup, by Amdahl over the measured share.
     pub min_projection: f64,
-    /// Between [`Criteria::defer_share`] and [`Criteria::min_share`] the share alone cannot carry
-    /// M9, so the spike has to be this good instead.
+    /// The spike needed when the share is in the grey band below [`Criteria::min_share`].
     pub gray_spike: f64,
-    /// M9 must beat the best priced alternative by this factor, **on the gains rather than the
-    /// ratios**: a 1.5x and a 1.1x are a 50% and a 10% improvement, and 1.5 against 2×1.1 compares
-    /// nothing.
+    /// Margin over the best priced alternative, compared on gains rather than ratios.
     pub alternative_margin: f64,
-    /// A ladder with a negative layer larger than this did not separate, and nothing is decided
-    /// from it.
+    /// A negative layer larger than this share means the ladder did not separate.
     pub max_negative_share: f64,
 }
 
@@ -652,8 +624,7 @@ pub const WORKLOAD: &str =
 pub enum Verdict {
     /// Bring a code generator for this workload forward.
     Advance,
-    /// The grey band cleared: M9 is justified, and the report says on what conditions, because the
-    /// share alone did not carry it.
+    /// The grey band cleared: M9 is justified on the conditions the report states.
     Conditional,
     /// Keep deferring, with the number that would reopen it.
     Defer,
@@ -677,8 +648,7 @@ pub struct Decision {
     pub verdict: Verdict,
     /// What the share was taken on.
     pub workload: &'static str,
-    /// [`Ladder::conservative_share`] — the share after a negative residue is charged back —
-    /// because that is the one a decision may read.
+    /// [`Ladder::conservative_share`], the one a decision may read.
     pub interpreter_share: f64,
     pub spike_speedup: f64,
     /// Amdahl over the measured share and the spike's ratio.
@@ -851,9 +821,7 @@ pub fn decide(
         criteria: *criteria,
     };
 
-    // C3's first clause, against the roster in [`LEVERS`] rather than against whatever list the
-    // file carried: a report that mentions no alternative at all has priced none of them, which is
-    // the strongest form of this failure and used to be the one that read as success.
+    // Against the roster in `LEVERS`: a report that names no alternative has priced none.
     let gaps = c3_gaps(alternatives);
     if !gaps.is_empty() {
         decision.reasons.push(format!(
@@ -864,8 +832,7 @@ pub fn decide(
             if gaps.len() == 1 { "is" } else { "are" },
             gaps.join("; ")
         ));
-        // What C3 asks for, added to whatever else is unmet: the levers priced, and the best of
-        // them no better than half M9's projected gain.
+        // C3: the levers priced, and the best no better than half M9's projected gain.
         let priced = if e > 1.0 {
             format!(
                 "the {} unpriced lever(s) in the cheaper levers are priced and the best of them measures \
@@ -888,8 +855,7 @@ pub fn decide(
         return decision;
     }
 
-    // Every criterion left reads the share, so a share whose own repeats fall on both sides of a
-    // bar has not answered the criterion — it has answered whichever run was taken.
+    // A share whose repeats straddle a bar has not answered that criterion.
     if let (Some(low), Some(high)) = (ladder.share_low, ladder.share_high) {
         for (bar, what) in [
             (criteria.min_share, "the share M9 needs"),
@@ -1018,7 +984,6 @@ impl Offering {
 pub struct Limit {
     pub what: String,
     pub why: String,
-    /// The number that shows it, where one was taken.
     pub evidence: Option<String>,
 }
 
@@ -1026,13 +991,12 @@ pub struct Limit {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Provenance {
     pub machine: String,
-    /// `release`, always, and stated so a debug run cannot be mistaken for one.
+    /// Always `release`, so a debug run cannot be mistaken for one.
     pub profile: String,
     pub taken: String,
     pub repeats: usize,
     pub request_head_bytes: usize,
     pub postgres: Option<String>,
-    /// What was not measured, and why.
     pub not_measured: Vec<String>,
 }
 
@@ -1042,8 +1006,7 @@ pub struct Report {
     pub provenance: Provenance,
     pub floor_micros: f64,
     pub total_micros: f64,
-    /// What the floor answered and what the total served, so the multiple between them is readable
-    /// rather than assumed to be like for like.
+    /// What the floor and total each answered, so their multiple is not assumed like for like.
     #[serde(default)]
     pub denominators: Denominators,
     pub points: Vec<Point>,

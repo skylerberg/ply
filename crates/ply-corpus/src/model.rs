@@ -77,14 +77,11 @@ pub type Footprint = BTreeSet<Atom>;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Intent {
-    /// Settled statically: linear arithmetic, a split over a constructor set, a ground evaluation
-    /// or a finite enumeration.
+    /// Settled statically: arithmetic, a constructor split, ground evaluation or enumeration.
     Decided,
-    /// Reaches a recursive definition or a builtin the prover has no rule for, so the strongest
-    /// honest answer is a case report.
+    /// Reaches recursion or a builtin the prover has no rule for, so it is sampled.
     Sampled,
-    /// The owner performs an effect nothing supplies a handler for, so the obligation cannot be
-    /// attempted at all.
+    /// The owner performs an effect no handler supplies, so it cannot be attempted.
     Gap,
 }
 
@@ -94,8 +91,7 @@ pub struct Claim {
     pub intent: Intent,
 }
 
-/// A shape drives both the emitted source and the reference evaluator, so the two cannot drift
-/// apart.
+/// A shape drives both the emitted source and the reference evaluator, so they cannot drift.
 #[derive(Clone, Debug)]
 pub struct Def {
     pub id: DefId,
@@ -192,8 +188,7 @@ impl Shape {
     }
 }
 
-/// The per-module `stage` helper: the only definition that returns the module's sum type, and the
-/// reason a `match` appears in generated code at all.
+/// The per-module `stage` helper: the only definition returning the module's sum type.
 #[derive(Clone, Debug)]
 pub struct Helper {
     pub name: String,
@@ -218,8 +213,7 @@ pub struct Module {
 }
 
 impl Module {
-    /// The name another module refers to this one by: `ImportDecl::binder` is the last path
-    /// segment.
+    /// The name other modules use: `ImportDecl::binder` is the last path segment.
     pub fn binder(&self) -> &str {
         self.name.rsplit('.').next().unwrap_or(&self.name)
     }
@@ -236,8 +230,7 @@ pub struct Test {
     pub world: World,
     /// Exactly the atoms the mirror saw performed.
     pub granted: Footprint,
-    /// Table index -> length after every call, asserted at the end so a write that silently does
-    /// nothing cannot pass.
+    /// Table index -> final length, so a write that silently does nothing cannot pass.
     pub final_table_len: Vec<(usize, usize)>,
     pub final_region: Vec<(usize, i64)>,
 }
@@ -299,8 +292,7 @@ impl World {
     }
 }
 
-/// One task of a concurrent test: a `fn` of its own that bumps one shard `steps.len()` times with a
-/// `task.yield()` between each pair.
+/// One task of a concurrent test: bumps one shard `steps.len()` times, yielding in between.
 #[derive(Clone, Debug)]
 pub struct TaskBody {
     pub name: String,
@@ -363,8 +355,7 @@ pub struct Specimen {
 
 #[derive(Clone, Copy, Debug)]
 pub enum SpecimenKind {
-    /// `x * a + b`, with a postcondition that is the same claim rearranged, so closing it is linear
-    /// arithmetic rather than syntactic identity.
+    /// `x * a + b`, with a rearranged postcondition, so closing it needs linear arithmetic.
     Linear { a: i64, b: i64 },
     /// A split over the module's own two-constructor status type.
     Status,
@@ -393,8 +384,7 @@ pub struct Law {
 pub enum LawKind {
     /// No binders: a domain of one point, decided by evaluating it.
     Ground { a: i64, b: i64 },
-    /// Two `Bool` binders, so the domain is four points and enumerating it is a decision rather
-    /// than a sample.
+    /// Two `Bool` binders: four points, so enumeration decides it.
     Finite,
     /// Over a [`SpecimenKind::Length`] definition, so it is sampled.
     Length { specimen: SpecimenId },
@@ -440,8 +430,7 @@ pub fn total(xs: &[i64]) -> i64 {
 }
 
 impl Corpus {
-    /// The value `def(args)` evaluates to under `world`, which is mutated by exactly the writes the
-    /// definition performs.
+    /// `def(args)` under `world`, which receives exactly the writes the definition performs.
     pub fn eval(&self, def: DefId, args: &[i64], world: &mut World) -> i64 {
         let def = &self.defs[def];
         let p0 = args.first().copied().unwrap_or(0);
@@ -590,8 +579,7 @@ impl Corpus {
     }
 }
 
-/// A second parameter is synthesized from the call's own offset rather than drawn, so emission and
-/// evaluation cannot pick different values for it.
+/// The second parameter derives from the call's offset, so emission and evaluation agree.
 pub fn call_args(arity: usize, first: i64, offset: i64) -> Vec<i64> {
     if arity >= 2 {
         vec![first, second_arg(offset)]

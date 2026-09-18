@@ -60,9 +60,7 @@ def ply_dump(src):
     if j.get("exit_code"):
         raise SystemExit("ply run failed: %s" % [x.get("message") for x in j.get("diagnostics", [])][:3])
     v = j["value"]
-    # `ply run --json` renders a `String` value with its own quotes, so the
-    # field holds a quoted literal. The dump is ASCII with no `"` and no `\\`
-    # by construction, so stripping the quotes is the whole unescaping.
+    # The dump has no `"` or backslash, so stripping `--json`'s quotes is the whole unescaping.
     assert v.startswith('"') and v.endswith('"'), v[:40]
     return v[1:-1]
 
@@ -124,8 +122,7 @@ FIXTURES = {
  "empty input":                        '',
  "only a pub":                         'pub\n',
  "garbage between two items":          'fn a() = 1\n$$$\nfn b() = 2\n',
- # Added after arming: each of these exists because a mutation survived
- # without it, and the mutation it kills is named.
+ # Each of these kills a mutation that otherwise survived.
  "bracket depth carries recovery past an item keyword":
                                       'type T = 9 ( fn ) \nfn g() = 2\n',
  "`law` not followed by a label is not an item":

@@ -31,18 +31,14 @@ fn registry_for(check: &CheckOutput, trace: Option<Arc<ply_host::trace::Trace>>)
 
 /// What a run has bound, and what it *could* have bound.
 pub struct Hosts {
-    /// The facilities the bound handlers act on, and the source of every [`HostRuntime`] this run
-    /// hands to a machine.
+    /// The facilities the bound handlers act on; the source of every [`HostRuntime`].
     host: Option<Arc<ply_host::Host>>,
-    /// Shared rather than owned because the machine takes it by `Arc`: one binding serves the whole
-    /// run, and a run with two would have two answers to what it can do.
+    /// One binding serves the whole run.
     binding: Arc<HostBinding>,
     /// Every triple the registry resolves against this program, whether or not it is bound.
     listing: HostListing,
     db: Option<DbConfig>,
-    /// What the run resolved its configuration to, held for the same reason `db` is: the
-    /// `configuration` block, the start-up banner and the digest all read it, and none of them may
-    /// re-derive it from the command line.
+    /// Read by the `configuration` block, the banner and the digest; never re-derived from flags.
     config: Configuration,
     /// The `--db-schema` function, resolved against the program at start-up.
     schema: Option<db::schema::SchemaView>,
@@ -52,46 +48,7 @@ pub struct Hosts {
 }
 
 impl Hosts {
-    /// The binding a run gets. Resolution — and therefore E0421/E0422/E0423 —
-    /// happens only when something is actually being bound: a stale
-    /// registration is the host author's bug, and refusing to run a program's
-    /// hermetic tests over it would make the hermetic path the fragile one.
-    ///
-    /// `credentials` is loaded **before** the registry is built and before
-    /// anything runs, so an unreadable certificate is `E0430` at start-up
-    /// rather than a `500` on the first handshake. A hermetic run loads none:
-    /// nothing can reach `net.listen_tls`, and reading a private key for a run
-    /// that will not use it is exactly the residual the trusted registration refuses to
-    /// widen.
-    ///
-    /// `db` is the resolved `--db` / `PLY_DB_URL` configuration, and `reach` is
-    /// the row the run will actually enter — `main`'s for `ply run`, the union
-    /// of the tests' for `ply test`. `E0431` fires when that row names a `db`
-    /// atom and the run named nothing for it to open, which is narrower than
-    /// "the program mentions a database": an entry point that installs the twin
-    /// discharges every `db` atom in Ply and needs no server. A caller with no
-    /// entry point — `ply hosts`, which lists rather than runs — passes `None`
-    /// and the binding decides.
-    ///
-    /// `config` is the run's resolved configuration. It arrives already
-    /// resolved because resolving it needs an evaluator — `--config-schema`
-    /// names a function — and because `E0441` and `E0442` have to be raised
-    /// before a socket is opened rather than beside one. A hermetic run passes
-    /// [`Configuration::default`], which opened no source at all.
-    ///
-    /// `trace` is the sink this run selected. It is never `None`: `--trace off`
-    /// is `ply_host::trace::discard`, a listed handler, because a row cannot be
-    /// conditional on a flag and an unregistered `trace` would be `E0424` at the
-    /// first event.
-    ///
-    /// [`Configuration::default`]: crate::config::Configuration
-    ///
-    /// Eight arguments, one per thing the run was configured with, for the
-    /// reason [`open_stopping`] gives: a struct would put the credentials, the
-    /// roots, the database, the configuration and the sink behind one name and
-    /// make what a caller supplies invisible at the call site.
-    ///
-    /// [`open_stopping`]: Hosts::open_stopping
+    /// The binding a run gets; `reach` is the row it enters, or `None` to let the binding decide.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         check: &CheckOutput,
@@ -116,20 +73,7 @@ impl Hosts {
         )
     }
 
-    /// The same, for a run that listens for a stop.
-    ///
-    /// Only `ply run` passes one. `ply test` binds `trace`, `config`, `db` and
-    /// `net` and binds **no** signal handler, with or without `--host`: a test
-    /// that could be ended by the suite's own ctrl-C, or that observed a stop
-    /// another test requested, is a test whose verdict depends on the terminal.
-    /// The coordinator has to be here rather than attached afterwards because
-    /// the registry is built from the `Host`, and whether `signal` is bound or
-    /// withheld is decided there.
-    /// Nine arguments, and each is a different thing the run was configured
-    /// with. Bundling them into one struct would put the credentials, the
-    /// database, the configuration, the sink and the stop flag behind one name
-    /// and make what a caller supplies invisible at the call site — which is the
-    /// opposite of what a trusted computing base's entry point wants.
+    /// [`Hosts::open`] for a run that listens for a stop; only `ply run`, so ctrl-C ends no test.
     #[allow(clippy::too_many_arguments)]
     pub fn open_stopping(
         check: &CheckOutput,
@@ -156,19 +100,10 @@ impl Hosts {
             });
         }
         let material = tls::Credentials::load(credentials)?;
-        // Resolved here, beside the credentials, because both are the same kind
-        // of thing: material the run was configured with that the program names
-        // and never holds. `E0454` before anything runs, for `E0430`'s reason.
+        // Loaded up front so a bad root is `E0454` before anything runs.
         let roots = ply_host::fs::Roots::load(roots, Span::DUMMY).map_err(|d| vec![d])?;
-        // Opened before the binding, and only when a `db` operation could
-        // actually reach it: the pool is a thread and a set of sockets, and
-        // starting one for a program that never performs a `db` operation would
-        // turn `--db` on an unrelated run into a connection failure. Which is
-        // also the database design's wording — `E0431` is for a run that *binds the db
-        // driver* — and it is why the connection is probed here rather than at
-        // the first statement: a service that discovers its database is
-        // unreachable on the first request has already told a client it was
-        // listening.
+        // Opened only when a `db` operation can reach it, and probed now so an unreachable database
+        // fails start-up rather than the first request.
         let facilities = Arc::new(
             match db.as_ref().filter(|_| reaches_db(check, reach)) {
                 Some(config) => {
@@ -221,8 +156,7 @@ impl Hosts {
         })
     }
 
-    /// What the run resolved its configuration to: the `configuration` block, the banner's config
-    /// line, and the digest's contribution.
+    /// The run's resolved configuration.
     pub fn configuration(&self) -> &Configuration {
         &self.config
     }
@@ -237,21 +171,18 @@ impl Hosts {
         self.db.as_ref()
     }
 
-    /// The `database` block, or `None` for a run with no database in reach — which is what keeps a
-    /// W3 program's listing and digest what they were.
+    /// The `database` block, or `None` when no database is in reach.
     pub fn database(&self) -> Option<Database> {
         Database::of(
             Database::operations_of(&self.listing),
             self.db.clone(),
-            // The server's version, database name, collation and encoding come from a live
-            // connection.
+            // Server facts come only from a live connection.
             None,
             self.schema.clone(),
         )
     }
 
-    /// Whether this run reached a real database, which is the fact a report must carry so that a
-    /// green suite is not read as a hermetic one.
+    /// Whether this run reached a real database, so a green suite is not read as hermetic.
     pub fn is_live_database(&self) -> bool {
         self.database().is_some_and(|d| d.is_live())
     }
@@ -268,14 +199,12 @@ impl Hosts {
         self.schema.as_ref().map(|view| view.name.as_str())
     }
 
-    /// What the run has to say about TLS: the stack in the trusted computing base and the
-    /// credentials it was configured with, or `None` when neither exists.
+    /// The TLS stack and configured credentials, or `None` when neither exists.
     pub fn transport(&self) -> Option<Transport> {
         Transport::of(&self.listing, self.host.as_ref().map(|h| h.credentials()))
     }
 
-    /// Every block the rows cannot carry, together, because they are printed together and hashed
-    /// together.
+    /// Every block the rows cannot carry; printed and hashed together.
     pub fn disclosures(&self) -> Disclosures {
         Disclosures {
             transport: self.transport(),
@@ -287,7 +216,7 @@ impl Hosts {
         }
     }
 
-    /// [`open`] against an explicit registry, for a test that needs to control what is registered.
+    /// [`Hosts::open`] against an explicit registry, for tests.
     pub fn bind(
         registry: HostRegistry,
         check: &CheckOutput,
@@ -296,8 +225,7 @@ impl Hosts {
         Hosts::bind_with(registry, check, host, None)
     }
 
-    /// [`bind`], with a database configuration, for the tests that exercise the checks `open` runs
-    /// between the binding and the first evaluation.
+    /// [`Hosts::bind`] with a database configuration, for tests of the checks `open` runs.
     pub fn bind_with(
         registry: HostRegistry,
         check: &CheckOutput,
@@ -331,8 +259,7 @@ impl Hosts {
         })
     }
 
-    /// Everything the registry resolves to, bound or not: what `ply hosts` prints and what CI pins
-    /// a digest of.
+    /// Everything the registry resolves to, bound or not: what `ply hosts` prints and digests.
     pub fn preview(
         check: &CheckOutput,
         trace: Option<Arc<ply_host::trace::Trace>>,
@@ -365,7 +292,6 @@ impl Hosts {
         self.binding.is_hermetic()
     }
 
-    /// `"hermetic"` or `"host"`.
     pub fn label(&self) -> &'static str {
         if self.is_hermetic() {
             "hermetic"
@@ -387,8 +313,7 @@ impl Hosts {
         });
         if let Some(transport) = &disclosures.transport {
             summary["transport"] = transport.json();
-            // Not a Ply diagnostic: a client that speaks no TLS is not the program's fault and is
-            // attributable to no definition.
+            // Counts, not diagnostics: a client speaking no TLS is attributable to no definition.
             summary["handshakes"] = handshakes_json(&self.handshakes());
         }
         if let Some(filesystem) = &disclosures.filesystem {
@@ -436,8 +361,7 @@ fn db_schema(
     }
     let operations = Database::operations_of(listing);
     let Some(config) = config else {
-        // The binding lists every `db` operation the *program* can reach, which is not the same
-        // question.
+        // The binding lists what the program can reach, not what this run enters.
         let reached: Vec<String> = match reach {
             Some(reach) => reach
                 .atoms()
@@ -525,8 +449,7 @@ pub struct Counts {
 }
 
 impl Counts {
-    /// `tests` is every test the run reports on, paired with whether the raw classification called
-    /// it region-isolated.
+    /// `tests` pairs each footprint with whether it classified as region-isolated.
     pub fn of<'a>(hosts: &Hosts, tests: impl IntoIterator<Item = (&'a Footprint, bool)>) -> Counts {
         let mut counts = Counts::default();
         for (footprint, isolated) in tests {
@@ -543,39 +466,20 @@ impl Counts {
     }
 }
 
-// --- filesystem -------------------------------------------------------------
-
-/// The roots the run bound, and therefore everything an `fs` operation can
-/// reach.
-///
-/// This block exists for `transport`'s reason turned around. There, a row could
-/// not say whether a socket was encrypted; here, a row says `fs.read_file[src]`
-/// and cannot say *what `src` is* — the label is the capability and the
-/// directory it names is configured beside the run. A reader auditing what a
-/// program may touch needs the mapping, so it is written down.
+/// The roots the run bound: what each `fs` label in a row actually names.
 pub struct Filesystem {
-    /// By name, ascending. Empty is a real state and is reported as one: a
-    /// program that performs an `fs` operation with nothing bound gets `E0451`
-    /// at the perform site, and a listing that said nothing about it would
-    /// leave the reader to find that out from a half-finished build.
+    /// By name, ascending. Empty is reported, since an `fs` operation with no root is `E0451`.
     pub roots: Vec<RootView>,
 }
 
 pub struct RootView {
     pub name: String,
-    /// Resolved, because that is what a confinement check is against. The path
-    /// the flag was written with is not what bounds the run — a symlink makes
-    /// those two different — and printing the one that does is the point of
-    /// printing it at all.
+    /// Canonical, since that (not the path as written) is what confines the run.
     pub path: String,
 }
 
 impl Filesystem {
-    /// `Some` when this program can perform an `fs` operation, or when the run
-    /// bound a root.
-    ///
-    /// Absent otherwise, which is what keeps every existing listing and digest
-    /// byte-identical to what it was before the filesystem existed.
+    /// `Some` when the program can perform an `fs` operation or the run bound a root.
     pub fn of(listing: &HostListing, roots: Option<&ply_host::fs::Roots>) -> Option<Filesystem> {
         let reachable = listing
             .rows
@@ -627,21 +531,7 @@ impl Filesystem {
         })
     }
 
-    /// What the digest covers: the root **names**, and not the paths.
-    ///
-    /// Stated rather than left to be discovered, because it is a real hole and
-    /// the alternative is a worse one. A path is where a particular machine was
-    /// pointed — absolute, canonical, and different in a developer's checkout
-    /// and in CI — so hashing it makes the digest disagree between two runs of
-    /// the same command over the same program, which is exactly the pin nobody
-    /// can use. Hashing the names keeps what is structural: binding a root, or
-    /// removing one, moves the digest.
-    ///
-    /// **So a digest does not notice `--fs out=./target` becoming `--fs out=/`.**
-    /// The listing does, on the line above, and that is the instrument for this
-    /// one. `Transport` makes the same trade for a certificate fingerprint and
-    /// says so; this is the same sentence about a bigger hole, which is why it
-    /// is this long.
+    /// Names only, since paths differ per machine; repointing a root changes the listing, not this.
     fn hash_into(&self, hasher: &mut blake3::Hasher) {
         hasher.update(FILESYSTEM_DOMAIN);
         for root in &self.roots {
@@ -650,8 +540,6 @@ impl Filesystem {
         }
     }
 }
-
-// --- transport --------------------------------------------------------------
 
 /// The TLS stack in the trusted computing base, and the credentials the run was configured with.
 pub struct Transport {
@@ -671,8 +559,7 @@ pub struct CredentialView {
 }
 
 impl Transport {
-    /// `Some` when this program can create a TLS listener, or when the run was configured with
-    /// credentials.
+    /// `Some` when the program can create a TLS listener or the run was given credentials.
     pub fn of(listing: &HostListing, credentials: Option<&tls::Credentials>) -> Option<Transport> {
         let reachable = listing.rows.iter().any(|row| row.path == tls::HANDLER);
         let configured = credentials.is_some_and(|c| !c.is_empty());
@@ -777,8 +664,7 @@ pub struct Observability {
 }
 
 impl Observability {
-    /// `None` for a program that never mentions `std.trace`, which is what keeps every W3 and W4
-    /// corpus's block and digest where they were.
+    /// `None` for a program that never mentions `std.trace`.
     fn of(
         listing: &HostListing,
         trace: &Arc<ply_host::trace::Trace>,
@@ -864,16 +750,14 @@ impl Observability {
 /// What a `SIGINT` or a `SIGTERM` does to this run.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Shutdown {
-    /// `SIGTERM` does not exist on Windows, so which signals a run listens for is a fact printed
-    /// rather than a surprise a deployment discovers.
+    /// `SIGTERM` does not exist on Windows, so the signals listened for are printed.
     signals: [Option<&'static str>; 2],
     lead_ms: u128,
     drain_ms: u128,
 }
 
 impl Shutdown {
-    /// `None` for a program that never mentions `std.signal`, which is what keeps every W3 and W4
-    /// corpus's block and digest where they were.
+    /// `None` for a program that never mentions `std.signal`.
     fn of(listing: &HostListing, shutdown: &Arc<ply_host::signal::Shutdown>) -> Option<Shutdown> {
         if !listing
             .rows
@@ -925,14 +809,11 @@ impl Shutdown {
     }
 }
 
-/// The blocks `ply hosts` prints under the table: facts about the trusted computing base that no
-/// row can carry.
+/// The blocks `ply hosts` prints under the table: facts no row can carry.
 #[derive(Default)]
 pub struct Disclosures {
     pub transport: Option<Transport>,
-    /// The roots this run bound. `None` for a run that bound none and whose
-    /// program performs no `fs` operation, so that an existing listing's digest
-    /// does not move for want of a block it has nothing to put in.
+    /// `None` when no root is bound and the program performs no `fs` operation.
     pub filesystem: Option<Filesystem>,
     pub database: Option<Database>,
     /// The run's configuration, when it opened any source.
@@ -942,8 +823,7 @@ pub struct Disclosures {
 }
 
 impl Disclosures {
-    /// What a command that has no [`Hosts`] builds — `ply hosts` resolves the listing without
-    /// binding, so it assembles these itself.
+    /// For `ply hosts`, which resolves the listing without binding a [`Hosts`].
     #[allow(clippy::too_many_arguments)]
     pub fn of(
         listing: &HostListing,
@@ -1026,8 +906,7 @@ pub fn digest_short(listing: &HostListing, disclosures: &Disclosures) -> String 
         hasher.update(DATABASE_DOMAIN);
         database.hash_into(&mut hasher);
     }
-    // The schema function's name and every key's name and shape, and none of the resolved values: a
-    // CI check that broke on a deployment's own configuration is a CI check people learn to ignore.
+    // Names and shapes only, never resolved values: a deployment's own settings must not move it.
     if let Some(configuration) = disclosures.configuration.as_ref().filter(|c| c.is_pinned()) {
         hasher.update(CONFIGURATION_DOMAIN);
         configuration.digest_into(&mut |text| {
@@ -1052,23 +931,13 @@ pub fn digest_short(listing: &HostListing, disclosures: &Disclosures) -> String 
     out
 }
 
-/// Domain-separated from the row digest so that a listing with an empty disclosure can never
-/// collide with one that has none.
+/// Domain-separated so a listing with an empty disclosure cannot collide with one that has none.
 const DISCLOSURE_DOMAIN: &[u8] = b"ply.hosts.transport.v1\0";
 
-/// Keeps a filesystem-only listing from colliding with any other, for the
-/// reason [`DATABASE_DOMAIN`] exists.
+// One domain per block, so listings with different blocks cannot collide.
 const FILESYSTEM_DOMAIN: &[u8] = b"ply.hosts.filesystem.v1\0";
-
-/// Separates the database block from whatever precedes it, so that a
-/// transport-only listing and a database-only listing cannot collide.
 const DATABASE_DOMAIN: &[u8] = b"ply.hosts.database.v1\0";
-
-/// Separates the configuration block from whatever precedes it, for the reason [`DATABASE_DOMAIN`]
-/// exists.
 const CONFIGURATION_DOMAIN: &[u8] = b"ply.hosts.configuration.v1\0";
-
-/// Separates the observability and shutdown blocks, for the reason [`DATABASE_DOMAIN`] exists.
 const OBSERVABILITY_DOMAIN: &[u8] = b"ply.hosts.observability.v1\0";
 const SHUTDOWN_DOMAIN: &[u8] = b"ply.hosts.shutdown.v1\0";
 
@@ -1088,10 +957,7 @@ fn abbreviate(fingerprint: &str) -> String {
     }
 }
 
-// --- `ply hosts` ------------------------------------------------------------
-
-/// The row key and the atom, both, because the operation says *what* was bound and the atom is what
-/// scheduling and isolation speak in.
+/// The operation says what was bound; the atom is what scheduling and isolation speak in.
 const HEADERS: [&str; 7] = [
     "OPERATION",
     "ATOM",
@@ -1118,8 +984,7 @@ fn yes_no(flag: bool) -> String {
     if flag { "yes" } else { "no" }.to_string()
 }
 
-/// Every line of `ply hosts --host`, without the indent, so the shape is testable without a
-/// terminal.
+/// Every line of `ply hosts --host`, unindented.
 pub fn listing_lines(listing: &HostListing, disclosures: &Disclosures) -> Vec<String> {
     let mut lines = vec![format!(
         "{} {} · {} {} · trusted computing base",
@@ -1134,8 +999,6 @@ pub fn listing_lines(listing: &HostListing, disclosures: &Disclosures) -> Vec<St
         lines.push(empty_note(listing));
     } else {
         let rows: Vec<[String; 7]> = listing.rows.iter().map(cells).collect();
-        // Widths from the content rather than from a guess, so a long Rust path does not push the
-        // flag columns out of alignment.
         let mut widths = HEADERS.map(str::len);
         for row in &rows {
             for (width, cell) in widths.iter_mut().zip(row) {
@@ -1164,8 +1027,7 @@ pub fn listing_lines(listing: &HostListing, disclosures: &Disclosures) -> Vec<St
     lines
 }
 
-/// A bound listing with no rows is three different situations, and a reader who cannot tell them
-/// apart will debug the wrong one.
+/// Why a bound listing has no rows.
 fn empty_note(listing: &HostListing) -> String {
     if listing.handlers == 0 {
         "no host handler is compiled into this binary".to_string()
@@ -1200,8 +1062,7 @@ pub fn row_json(row: &HostRow) -> Value {
     json!({
         "effect": row.effect.as_str(),
         "operation": row.op.as_str(),
-        // Null for an operation declared without `[r]`: that is one singleton resource, not a
-        // resource named "singleton".
+        // Null for an operation declared without `[r]`: a singleton, not a resource named that.
         "resource": match &row.resource {
             ply_ty::ty::Resource::Named(name) => json!(name.as_str()),
             ply_ty::ty::Resource::Singleton => Value::Null,

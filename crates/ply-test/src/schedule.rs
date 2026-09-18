@@ -12,7 +12,6 @@ pub const AMBIENT: &[&str] = &["sim"];
 /// The effects the language simulates: `simulate { .. }` discharges exactly these and nothing else.
 pub const SIMULATED: &[&str] = &["task", "clock", "random"];
 
-/// The seed effect.
 pub const SIM_EFFECT: &str = "sim";
 
 pub fn is_region_scoped(atom: &EffectAtom) -> bool {
@@ -23,7 +22,6 @@ pub fn is_ambient(atom: &EffectAtom) -> bool {
     AMBIENT.contains(&atom.effect.as_str())
 }
 
-/// Whether this atom can bring one test into contention with another.
 pub fn contends(atom: &EffectAtom) -> bool {
     !is_ambient(atom)
 }
@@ -38,14 +36,12 @@ pub fn shared_footprint(f: &Footprint) -> Footprint {
     Footprint::from_atoms(f.atoms().filter(|a| contends(a)).cloned())
 }
 
-/// This test contends, and only over region labels.
 pub fn contends_only_over_regions(f: &Footprint) -> bool {
     let shared = shared_footprint(f);
     !shared.is_empty() && shared.atoms().all(is_region_scoped)
 }
 
-/// This test's outcome is a function of its definition set **and** a seed: something in its closure
-/// entered a `simulate` region.
+/// Something in its closure entered a `simulate` region, so its outcome also depends on a seed.
 pub fn is_seeded(f: &Footprint) -> bool {
     f.atoms().any(is_ambient)
 }
@@ -54,11 +50,9 @@ pub fn is_seeded(f: &Footprint) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Isolation {
-    /// This test names nothing another test can reach: its allocations live in a region closed when
-    /// it ends, and its footprint carries no atom that contends.
+    /// Names nothing another test can reach.
     Region,
-    /// At least one atom names state another test can reach — a resource outside the program, or a
-    /// region label a sibling also writes.
+    /// Names state another test can reach: an external resource, or a label a sibling writes.
     Shared,
 }
 
@@ -99,15 +93,15 @@ pub struct Parallelism {
 }
 
 impl Parallelism {
-    /// The property `--explain` publishes, so that a future change cannot quietly lose it.
+    /// Groups equal what the shared tests alone need: the property `--explain` publishes.
     pub fn holds(&self) -> bool {
         let floor = usize::from(self.scheduled > 0);
         self.groups == self.shared_groups.max(floor)
     }
 }
 
-/// `universe` is every test the run reports on; `scheduled` is the subset being coloured, with its
-/// footprints, and `groups` is what [`group_by_conflict`] made of them.
+/// `universe` is every test the run reports on; `scheduled` is the subset being coloured, and
+/// `groups` is what [`group_by_conflict`] made of it.
 pub fn parallelism<'a>(
     universe: impl IntoIterator<Item = &'a Footprint>,
     scheduled: &[(usize, Footprint)],
@@ -158,8 +152,7 @@ pub fn group_by_conflict(tests: &[(usize, Footprint)]) -> Vec<Vec<usize>> {
     let mut classes: Vec<Vec<usize>> = Vec::new();
     for &p in &order {
         let footprint = &shared[p];
-        // Conflict is not transitive, so a colour class is only safe if the candidate clears every
-        // member of it, not just one representative.
+        // Conflict is not transitive, so a candidate must clear every member of a colour class.
         let slot = classes
             .iter()
             .position(|class| class.iter().all(|&q| !footprint.conflicts_with(&shared[q])));

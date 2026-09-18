@@ -25,7 +25,6 @@ pub fn execute(args: &BuildArgs, style: Style) -> i32 {
         Ok(entry) => entry,
         Err(diagnostic) => return refuse(&loaded.sources, diagnostic, args.json, style),
     };
-    // The start-up definitions the deployed artifact has to be able to name.
     let mut startup: Vec<&DefInfo> = Vec::new();
     for (flag, named) in [
         ("--config-schema", args.config_schema.as_deref()),
@@ -107,7 +106,6 @@ pub fn execute(args: &BuildArgs, style: Style) -> i32 {
         out.display(),
     );
     print_diagnostics(&built.warnings, &loaded.sources, style);
-    // The ratio incremental transfer was decided against on.
     match binary_bytes() {
         Some(n) => println!(
             "{IND}{} ply {} · {}",
@@ -121,8 +119,7 @@ pub fn execute(args: &BuildArgs, style: Style) -> i32 {
             env!("CARGO_PKG_VERSION")
         ),
     }
-    // Printed whether or not any were named, because the absence of one is the deploy failure: an
-    // artifact with no schema is an artifact that cannot refuse to start on a missing credential.
+    // Printed even when empty: without a schema an artifact cannot refuse a missing credential.
     match built.startup.as_slice() {
         [] => println!(
             "{IND}{} none — this artifact cannot be run with `--config-schema` or `--db-schema`",
@@ -141,7 +138,6 @@ pub fn execute(args: &BuildArgs, style: Style) -> i32 {
     EXIT_OK
 }
 
-/// The names a reader is shown for a set that could be hundreds long.
 const SHOWN: usize = 8;
 
 fn report_diff(
@@ -241,8 +237,7 @@ fn entry_point<'a>(loaded: &'a Loaded, named: Option<&str>) -> Result<&'a DefInf
         .filter(|d| !ply_std::is_std(&d.module))
         .collect();
     match matches.as_slice() {
-        // An artifact is run by calling its entry point with nothing, so an entry point that takes
-        // an argument is one `ply run` could never start.
+        // An artifact runs by calling its entry point with nothing.
         [one] if arity(one) > 0 => Err(Diagnostic::error(
             codes::TYPE_MISMATCH,
             format!(
@@ -279,7 +274,6 @@ fn entry_point<'a>(loaded: &'a Loaded, named: Option<&str>) -> Result<&'a DefInf
     }
 }
 
-/// A `--config-schema` / `--db-schema` function, resolved as a build root.
 fn schema_root<'a>(loaded: &'a Loaded, flag: &str, named: &str) -> Result<&'a DefInfo, Diagnostic> {
     let matches: Vec<&DefInfo> = loaded
         .check
@@ -337,8 +331,7 @@ fn arity(def: &DefInfo) -> usize {
     }
 }
 
-/// `desk.run` becomes `desk.plyx`: the module, not the function, because the module is what a
-/// deployment thinks it is shipping.
+/// `desk.run` becomes `desk.plyx`: the module is what a deployment thinks it ships.
 pub fn default_output(entry: &Symbol) -> PathBuf {
     let text = entry.as_str();
     let module = text.rsplit_once('.').map_or(text, |(m, _)| m);
@@ -346,8 +339,7 @@ pub fn default_output(entry: &Symbol) -> PathBuf {
     PathBuf::from(format!("{leaf}.{}", artifact::EXTENSION))
 }
 
-/// `None` when the running binary cannot be located or measured, which is a fact about the platform
-/// and never a reason to fail a build.
+/// `None` when the running binary cannot be measured, which never fails a build.
 fn binary_bytes() -> Option<u64> {
     std::env::current_exe()
         .and_then(std::fs::metadata)

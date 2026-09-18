@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
-# The checker differential, armed: each mutation below is applied to a copy of
-# `infer.ply` or `tycore.ply` and the fast half of `crates/ply-codegen-tests/tests/goldens/infer.rs` (the
-# hand-written programs, the resolver's programs, the standard library and the
-# reference checker's own inputs) must go red.
+# Each mutation is applied to a copy of infer.ply or tycore.ply, and the fast half of the infer goldens must go red.
 #
 #   ./crates/ply-compiler-diff/tools/arm-infer.sh
 set -uo pipefail

@@ -17,9 +17,7 @@ pub enum Phase {
     Resolve,
     CacheOpen,
     Select,
-    /// Building the run's compiled unit, which is nothing at all without a backend. Its own phase
-    /// because it is the one an edit does not shrink: the unit is closed over every function the
-    /// fragment compiles, whatever changed.
+    /// Building the run's compiled unit (nothing without a backend); an edit does not shrink it.
     Compile,
     Execute,
 }
@@ -82,8 +80,7 @@ impl Timings {
     }
 }
 
-/// Everything a run produced, so a caller can time the front end once and then select and execute
-/// against it several times.
+/// A run's products, so a caller can time the front end once and execute against it repeatedly.
 #[derive(Debug)]
 pub struct Front {
     pub root: PathBuf,
@@ -93,12 +90,9 @@ pub struct Front {
     pub resolved: Resolved,
     pub check: CheckOutput,
     pub hashes: HashOutput,
-    /// The port's whole answer, for the tier this program is run on. `check` and `hashes` above
-    /// are taken from it: the Rust chain no longer runs here, so there are no chain phases left to
-    /// time and no second answer to disagree with (ADR 0052 §2).
+    /// The port's whole answer; `check` and `hashes` above are taken from it.
     pub port: ply_ty::Front,
     pub timings: Timings,
-    /// This program's region kinds.
     region_kinds: ply_eval::region_kind::Kinds,
 }
 
@@ -152,8 +146,7 @@ pub fn front(root: &Path) -> Result<Front> {
     let resolved = resolve(&mut program).map_err(|d| report(&d))?;
     timings.record(Phase::Resolve, started.elapsed());
 
-    // The port answers the check and the hashes, as it does for every command (ADR 0052 §1).
-    // Outside the clock: what this harness times is the phases it still runs itself.
+    // Outside the clock: this harness times only the phases it runs itself.
     let ordered: Vec<(String, String)> = ids
         .iter()
         .zip(&names)
@@ -188,8 +181,7 @@ fn timed<T>(f: impl FnOnce() -> Result<T>) -> Result<(T, Duration)> {
     Ok((value, started.elapsed()))
 }
 
-/// Diagnostics collapse to one error here on purpose: this crate compiles a corpus it generated, so
-/// a diagnostic is a defect in the generator and the first one is enough to go and look.
+/// Diagnostics collapse to one error: a diagnostic here is a generator defect.
 fn report(diagnostics: &[Diagnostic]) -> anyhow::Error {
     let shown: Vec<String> = diagnostics.iter().take(5).map(|d| d.to_string()).collect();
     anyhow::anyhow!(

@@ -1,19 +1,6 @@
 #!/usr/bin/env bash
-# Every green in `exprs.ply`, seen to go red.
-#
-# `CONTRIBUTING.md`'s first-named defect is a green result over unexplored
-# space, and this file passed its whole suite on the first run after the
-# expectations were corrected — which is exactly when that defect is invisible.
-# Each `arm` corrupts one thing and asserts the suite fails.
-#
-# `equiv` is the other half, and in this area it is the more interesting one: a
-# mutation that is *supposed* to leave the suite green because the mutant is
-# semantically equal. The `bail` guards below are equivalent mutants. A sweep
-# that deleted each of the 41 guards in the four modules one at a time found
-# **18 individually detected and 23 not** — not because the tests are weak but
-# because a deleted guard is caught by the guard of the first function the
-# unguarded body calls. That number is the price of the design decision that
-# replaces `?`, and it is written up in `GAPS-exprs.md` §4.
+# Mutates exprs.ply one thing at a time: every `arm` must turn the suite red, every `equiv`
+# (a semantically equal mutant) must leave it green.
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

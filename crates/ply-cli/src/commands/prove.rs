@@ -67,14 +67,11 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
 
     let collected = crate::obligations::collect(&loaded.program, &scoped, &hashes);
     warnings.extend(collected.warnings);
-    // Counted before the filter and before anything is discharged: "carries a claim" is a fact
-    // about the program, not about what this run chose to look at or managed to establish.
+    // Before the filter and discharge: carrying a claim is a fact about the program.
     let specified = obligation::specified(&scoped, &laws, &collected.obligations);
     let (obligations, filtered_out) = filter(collected.obligations, args.filter.as_deref());
 
-    // The row a `law/host` will enter, which is what decides whether this run needs a database at
-    // all: a file whose laws are all hermetic binds nothing, exactly as `ply test` binds nothing
-    // for a suite that installs the twin.
+    // A file whose laws are all hermetic binds nothing.
     let reach = ply_ty::ty::Footprint::from_atoms(
         scoped
             .laws
@@ -194,8 +191,7 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
     }
 }
 
-/// The project, with every module parsed — which every load gives, because a clause the run did
-/// not read is a claim nobody checked.
+/// Every module parsed: a clause the run did not read is a claim nobody checked.
 pub(crate) fn load_complete(
     path: &std::path::Path,
     incremental: bool,
@@ -232,8 +228,7 @@ fn filter(obligations: Vec<Obligation>, filter: Option<&str>) -> (Vec<Obligation
     (kept, filtered_out)
 }
 
-/// A law is labelled rather than named, so the report prints the label it was written with and not
-/// the `<module>.<label>` its key is.
+/// The label each law was written with, not its `<module>.<label>` key.
 pub(crate) fn law_labels(check: &CheckOutput) -> BTreeMap<Symbol, String> {
     check
         .laws
@@ -242,9 +237,6 @@ pub(crate) fn law_labels(check: &CheckOutput) -> BTreeMap<Symbol, String> {
         .collect()
 }
 
-// --- What each outcome says -------------------------------------------------
-
-/// The left-hand column: what became of this obligation.
 pub(crate) fn outcome_of(discharge: &Discharge) -> &'static str {
     match discharge {
         Discharge::Held(evidence) => evidence.tier().as_str(),
@@ -254,7 +246,6 @@ pub(crate) fn outcome_of(discharge: &Discharge) -> &'static str {
     }
 }
 
-/// What an `ensures` gives up when its owner's declared row is wider than its body's.
 fn weakened_frame(loaded: &Loaded, obligation: &Obligation) -> Vec<String> {
     if obligation.kind == ObligationKind::Law {
         return Vec::new();
@@ -287,7 +278,6 @@ pub(crate) fn owner_label(obligation: &Obligation, labels: &BTreeMap<Symbol, Str
     }
 }
 
-/// Why an obligation is `proved`, as the certificate itself says.
 pub(crate) fn certificate_summary(certificate: &Certificate) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut unfoldings = 0;
@@ -428,9 +418,6 @@ fn quantifier(obligation: &Obligation) -> String {
     format!("forall ({})", binders.join(", "))
 }
 
-// --- Diagnostics ------------------------------------------------------------
-
-/// One diagnostic per outcome that is not a hold.
 pub(crate) fn diagnostics(
     report: &ProveReport,
     labels: &BTreeMap<Symbol, String>,
@@ -505,9 +492,6 @@ fn refutation(obligation: &Obligation, counterexample: &Counterexample, what: &s
     diagnostic
 }
 
-// --- Human output -----------------------------------------------------------
-
-/// The two lines every run of either command starts with.
 pub(crate) fn print_coverage(coverage: &Coverage, specified: usize, explain: bool, style: Style) {
     let unspecified = coverage.definitions.saturating_sub(specified);
     println!(
@@ -518,9 +502,7 @@ pub(crate) fn print_coverage(coverage: &Coverage, specified: usize, explain: boo
     if coverage.uncovered.is_empty() {
         return;
     }
-    // Not the same number as `unspecified`, and the difference is the point: a definition can carry
-    // a claim the machine could not establish, and such a definition is one a reviewer still has to
-    // read.
+    // Unlike `unspecified`, this counts definitions whose claim the machine could not establish.
     let shown = if explain {
         coverage.uncovered.len()
     } else {
@@ -706,8 +688,6 @@ fn print_row(
         }
     }
 }
-
-// --- JSON -------------------------------------------------------------------
 
 pub(crate) fn coverage_json(coverage: &Coverage) -> Value {
     json!({

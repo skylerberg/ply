@@ -1,7 +1,5 @@
-//! `stage <dir>` -- bootstraps a working copy of the compiler: the modules in `<dir>/*.ply` are
-//! emitted by the emitter this binary carries and the unit is written to `<dir>/bootstrap`, so
-//! `PLY_C_EMITTER=ply:<dir>` enters *that* compiler. The arming scripts run every mutation
-//! through this, since a mutation of the sources is nothing until it is compiled.
+//! `stage <dir>`: emits `<dir>/*.ply` into `<dir>/bootstrap`, so `PLY_C_EMITTER=ply:<dir>`
+//! runs that compiler. The arming scripts compile every mutant through this.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -57,10 +55,7 @@ fn main() {
     let resolved = ply_syntax::resolve::resolve(&mut ast).unwrap_or_else(refused);
     let program: &'static ply_syntax::ast::Program = Box::leak(Box::new(ast));
     let resolved = Box::leak(Box::new(resolved));
-    // The port's answer over these very texts (ADR 0052 §1), rather than a second front end
-    // assembled from the chain. This binary installed the emitter above, and the ids run in the
-    // order the `SourceMap` assigned them, which is the order the protocol reads a span's module
-    // as a position in.
+    // Ids follow `SourceMap` order, which is how the protocol indexes a span's module.
     let ids: Vec<ply_span::SourceId> = (0..modules.len())
         .map(|i| ply_span::SourceId(i as u32))
         .collect();
@@ -98,7 +93,7 @@ fn main() {
     println!("{} staged as {identity}", out.display());
 }
 
-/// The front end refused the copy: an invalid mutant, which the arming scripts count as such.
+/// The front end refused the copy: the arming scripts count it as an invalid mutant.
 fn refused<T>(ds: Vec<ply_span::Diagnostic>) -> T {
     for d in &ds {
         eprintln!("{}", d.message);

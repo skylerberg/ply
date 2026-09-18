@@ -1,4 +1,4 @@
-//! What W2's payload types cost, measured rather than assumed.
+//! What payload types cost: JSON codecs, maps and derivation.
 
 use anyhow::{Context, Result, bail};
 use ply_cli::driver;
@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-/// Megabytes are 1e6 bytes here, and stated rather than assumed: a throughput quoted in MiB against
-/// one quoted in MB differs by five percent, which is inside the range these numbers are argued
-/// over.
+/// Megabytes are 1e6 bytes, not MiB.
 const MEGABYTE: f64 = 1e6;
 
 fn best_of(repeats: usize, mut run: impl FnMut() -> Result<Duration>) -> Result<Duration> {
@@ -34,7 +32,6 @@ fn millis(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
-/// A checked project and a machine over it.
 pub struct Checked {
     pub loaded: ply_cli::load::Loaded,
 }
@@ -65,8 +62,7 @@ impl Checked {
         )
     }
 
-    /// `Machine::call` takes a program-wide name, so a simple one is looked up rather than guessed
-    /// at from the file it was written in.
+    /// The program-wide name `Machine::call` takes.
     fn full(&self, simple: &str) -> Result<String> {
         self.loaded
             .check
@@ -92,9 +88,7 @@ pub fn write_project(files: &[(&str, String)]) -> Result<tempfile::TempDir> {
     Ok(dir)
 }
 
-/// An order with `lines` line items, which is the shape a payload benchmark should have: a record
-/// of scalars and a list of records, with a `String` needing escape analysis, an `Int`, a `Decimal`
-/// and a `Bool` in every element.
+/// An order with `lines` line items, each mixing `String`, `Int`, `Decimal` and `Bool`.
 pub const JSON_SRC: &str = r#"import std.json
 
 pub type Line = { sku: String, qty: Int, unit_price: Decimal, note: String, active: Bool }
@@ -209,9 +203,7 @@ pub fn json_throughput(sizes: &[usize], iterations: u32, repeats: usize) -> Resu
         };
         let payload_bytes = raw.len();
 
-        // The machine lowers a body on first call and caches nothing across calls, but a first call
-        // still pays for whatever the engine defers — and charged to a twenty-iteration batch that
-        // is a fifth of the number.
+        // Warm-up: a first call pays for whatever the engine defers.
         call(&mut machine, &encode, vec![value.clone()])?;
         call(&mut machine, &decode, vec![bytes.clone()])?;
 
@@ -257,15 +249,13 @@ pub struct ShapePoint {
     pub decode_micros: f64,
     /// `json::parse` alone: bytes to a `Json`, before any codec runs.
     pub parse_micros: f64,
-    /// The derived codec's own half — walking an already-parsed `Json` into the ADT, timed on its
-    /// own rather than as `decode - parse`.
+    /// The derived codec over an already-parsed `Json`, timed directly, not as `decode - parse`.
     pub codec_micros: f64,
     pub decode_micros_per_byte: f64,
     pub decode_micros_per_field: f64,
 }
 
-/// Whether a decode is priced by the fields it visits or by the bytes it crosses —
-/// the question the byte builtins asked of the request head, asked of the payload.
+/// Whether a decode is priced by the fields it visits or by the bytes it crosses.
 pub fn json_shape(
     points: &[(usize, usize)],
     iterations: u32,
@@ -343,7 +333,7 @@ pub fn json_shape(
     Ok(out)
 }
 
-/// `loop_only` is the subtrahend, and it is why these rows are about `Map` and not about `fold`.
+/// `loop_only` is the subtrahend that separates `Map` from `fold`.
 pub const MAP_SRC: &str = r#"
 fn key(i: Int) -> Int = (i * 2654435761) % 1000003
 
@@ -373,21 +363,19 @@ test "insertion order changes neither the map nor the order it iterates in" {
 #[derive(Clone, Debug, Serialize)]
 pub struct MapPoint {
     pub entries: usize,
-    /// `map_insert`, with the enclosing `fold` and the key computation subtracted — measured
-    /// alternately with that scaffold rather than against a separate run of it.
+    /// `map_insert` minus the `fold` and key scaffold, measured alternately with it.
     pub insert_nanos: f64,
     /// `map_get` on a key that is present, same subtraction.
     pub get_nanos: f64,
     /// `map_keys`, per entry of the list it materializes.
     pub keys_nanos_per_entry: f64,
-    /// `map_fold`, per entry, which is the iteration that allocates no list.
+    /// `map_fold`, per entry; it allocates no list.
     pub fold_nanos_per_entry: f64,
     /// What the `fold`/`range`/`key` scaffold cost per iteration on its own.
     pub loop_nanos: f64,
 }
 
-/// Times two calls that differ by one operation, alternating them call by call so that whatever the
-/// machine was doing landed on both.
+/// Times two calls differing by one operation, alternating so machine noise lands on both.
 fn paired(
     machine: &mut Machine<'_>,
     target: (&str, Vec<Value>),
@@ -432,8 +420,7 @@ pub fn map_ops(sizes: &[usize], repeats: usize) -> Result<Vec<MapPoint>> {
         let n = Value::Int(entries as i64);
         let map = call(&mut machine, &build, vec![n.clone()])?;
 
-        // Enough calls that one call's fixed cost is spread over a batch, and few enough that the
-        // largest size still finishes.
+        // Enough calls to spread fixed cost, few enough that the largest size finishes.
         let batch = (500_000 / entries.max(1)).clamp(1, 200) as u32;
         let time = |machine: &mut Machine<'_>, name: &str, args: Vec<Value>| -> Result<Duration> {
             call(machine, name, args.clone())?;
@@ -447,8 +434,7 @@ pub fn map_ops(sizes: &[usize], repeats: usize) -> Result<Vec<MapPoint>> {
             Ok(taken / batch)
         };
 
-        // `map_insert` and `map_get` cannot be called without a `fold` around them, so these two
-        // rows are subtractions and there is no way to make them anything else.
+        // `map_insert` and `map_get` need a `fold` around them, so these rows are subtractions.
         let (built, scaffold) = paired(
             &mut machine,
             (&build, vec![n.clone()]),
@@ -480,8 +466,7 @@ pub fn map_ops(sizes: &[usize], repeats: usize) -> Result<Vec<MapPoint>> {
     Ok(out)
 }
 
-/// A program whose whole output is what `map_keys` answered, under three insertion orders that
-/// build one key set.
+/// Prints `map_keys` under three insertion orders of one key set.
 pub const ORDER_SRC: &str = r#"
 fn key(i: Int) -> Int = (i * 2654435761) % 100003
 
@@ -513,12 +498,9 @@ fn main() -> String =
 pub struct OrderCheck {
     pub processes: usize,
     pub entries: usize,
-    /// Every process printed the same bytes.
     pub identical_across_processes: bool,
-    /// All three insertion orders produced one key sequence.
     pub identical_across_insertion_orders: bool,
-    /// That sequence is strictly ascending, which is the contract rather than merely a stable
-    /// order.
+    /// Strictly ascending, which is the contract, not merely a stable order.
     pub ascending: bool,
 }
 
@@ -547,9 +529,7 @@ pub fn map_order(ply: &Path, processes: usize) -> Result<OrderCheck> {
     let first = outputs[0].clone();
     let identical_across_processes = outputs.iter().all(|o| *o == first);
 
-    // `ply run` renders the returned `String` with its own framing — an indent and the quotes a
-    // `String` is printed inside — so the three renderings are recovered from the separator the
-    // program wrote after that framing is stripped, rather than from the whole line.
+    // `ply run` frames the `String` with an indent and quotes; split on the program's separator.
     let body = first.trim().trim_matches('"');
     let runs: Vec<&str> = body.split('|').skip(1).collect();
     if runs.len() != 3 {
@@ -612,14 +592,11 @@ pub struct DerivePoint {
     pub modules: usize,
     /// Everything the front end checked, the stdlib included.
     pub definitions: usize,
-    /// The project's own.
     pub project_definitions: usize,
-    /// Tests the project declares.
     pub tests: usize,
     /// A check with no cache at all.
     pub cold_check_millis: f64,
-    /// A check against a cache a previous identical run filled — both gates hit, which is what a
-    /// project's second `ply check` costs.
+    /// A check against a cache a previous identical run filled.
     pub warm_check_millis: f64,
     /// Selecting and running every test, from an empty result cache.
     pub cold_test_millis: f64,
@@ -662,8 +639,7 @@ fn one_derivation_point(
         })
         .collect();
 
-    // A fresh copy per timing, so a cold number is cold: a store the previous measurement filled
-    // would make the second project's cold check a warm one.
+    // A fresh copy per timing, so a cold number is cold.
     let cold = best_of(repeats, || {
         let dir = write_files(&files)?;
         let mut store = Store::open(dir.path())?;

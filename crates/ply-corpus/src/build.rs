@@ -83,8 +83,7 @@ pub fn generate(spec: &CorpusSpec) -> Corpus {
     corpus
 }
 
-/// A label list long enough for `count` entries: the vocabulary first, then numbered extensions of
-/// it, so a corpus with 40 tables still reads like one.
+/// `count` labels: the vocabulary first, then numbered extensions of it.
 fn labels(words: &[&str], count: usize) -> Vec<String> {
     (0..count)
         .map(|i| {
@@ -134,8 +133,7 @@ fn plan_modules(spec: &CorpusSpec, root: &Rng) -> Vec<Module> {
     planned
 }
 
-/// Imports run strictly downward through the layers, which is what makes the module graph acyclic
-/// by construction rather than by a check afterwards.
+/// Imports run strictly downward through the layers, so the module graph is acyclic.
 fn choose_imports(rng: &mut Rng, planned: &[Module], layer: usize, hubs: &[usize]) -> Vec<usize> {
     if layer == 0 {
         return Vec::new();
@@ -356,8 +354,7 @@ fn choose_shape(
     }
 }
 
-/// Picks `n` distinct callees whose combined weight leaves room under `budget`, preferring the
-/// front of the pool so hubs form.
+/// Picks `n` distinct callees fitting `budget`, preferring the pool's front so hubs form.
 fn affordable(
     rng: &mut Rng,
     corpus: &Corpus,
@@ -439,8 +436,7 @@ fn choose_extras(
     extras
 }
 
-/// `pub` is not decoration: a definition is exported exactly when another module reaches it, so
-/// removing an import removes an export and the corpus keeps being a real test of visibility.
+/// A definition is `pub` exactly when another module reaches it, so visibility stays tested.
 fn mark_public(corpus: &mut Corpus) {
     let mut exported = vec![false; corpus.defs.len()];
     for def in &corpus.defs {
@@ -460,8 +456,7 @@ fn mark_public(corpus: &mut Corpus) {
     }
 }
 
-/// Attaches a claim to a share of the definitions, keyed per definition so that raising the density
-/// adds claims rather than moving the ones already there.
+/// Claims are keyed per definition, so raising the density adds claims without moving others.
 fn attach_claims(spec: &CorpusSpec, root: &Rng, corpus: &mut Corpus) {
     if spec.spec_fraction <= 0.0 {
         return;
@@ -480,8 +475,7 @@ fn attach_claims(spec: &CorpusSpec, root: &Rng, corpus: &mut Corpus) {
     }
 }
 
-/// One specimen per index, cycling the three shapes, so a density of two puts a linear and a status
-/// specimen in every module and a density of three adds the recursive one.
+/// One specimen per index, cycling the three shapes.
 fn generate_specimens(spec: &CorpusSpec, corpus: &Corpus) -> Vec<Specimen> {
     let mut out = Vec::new();
     for module in &corpus.modules {
@@ -637,8 +631,7 @@ fn build_test(
         .map(|&r| (r, live.region(r)))
         .collect::<Vec<_>>();
 
-    // A clock atom that no handler discharges survives into the test's own footprint, and a `det`
-    // test may not carry one.
+    // An undischarged clock atom stays in the test's footprint, which a `det` test may not carry.
     let undischarged_clock = footprint
         .iter()
         .any(|a| a.effect == Eff::Clock && !granted.contains(a));
@@ -669,8 +662,7 @@ fn generate_concurrent_tests(
     corpus: &Corpus,
 ) -> Vec<ConcurrentTest> {
     let mut out = Vec::with_capacity(spec.concurrent_tests);
-    // One task is a sequential program with a `simulate` around it, and a corpus of those measures
-    // nothing.
+    // One task is a sequential program, which measures nothing.
     if spec.tasks_per_test < 2 || corpus.modules.is_empty() || corpus.shards.is_empty() {
         return out;
     }
