@@ -171,3 +171,46 @@ fn a_broken_module_never_reaches_the_report() {
     assert_eq!(code, EXIT_COMPILE_ERROR);
     assert!(!Path::new(&dir.path().join(".ply-cache")).exists());
 }
+
+#[test]
+fn a_definition_no_root_reaches_is_warned_once_at_its_name() {
+    let (_dir, loaded) = fixture(
+        "pub fn api() -> Int = shared()\n\
+         fn shared() -> Int = 1\n\
+         fn dead() -> Int = deader()\n\
+         fn deader() -> Int = 2\n\
+         fn tested() -> Int = 3\n\
+         fn lawful(x: Int) -> Int = x\n\
+         fn positive(x: Int) -> Bool = x > 0\n\
+         pub fn checked(x: Int) -> Int requires positive(x) = x\n\
+         type Pair = { a: Int }\n\
+         pub fn make() -> Int = {\n\
+         \x20 let f = |x: Int| -> Pair { { a: x } };\n\
+         \x20 f(1).a\n\
+         }\n\
+         fn _kept() -> Int = 4\n\
+         fn main() -> Int = 5\n\
+         type Unused = | Nothing\n\
+         test \"calls it\" { assert_eq(tested(), 3) }\n\
+         law \"it is the identity\" forall (x: Int) { lawful(x) == x }\n",
+    );
+    let unused: Vec<(&str, &str)> = loaded
+        .frontend
+        .warnings
+        .iter()
+        .filter(|d| d.code == ply_span::codes::UNUSED_DEFINITION)
+        .inspect(|d| assert_eq!(d.severity, ply_span::Severity::Warning))
+        .map(|d| {
+            let at = d.primary_span().expect("the name is labelled");
+            (d.message.as_str(), loaded.sources.snippet(at))
+        })
+        .collect();
+    assert_eq!(
+        unused,
+        [
+            ("fn `m.dead` is never used", "dead"),
+            ("fn `m.deader` is never used", "deader"),
+            ("type `m.Unused` is never used", "Unused"),
+        ]
+    );
+}

@@ -61,7 +61,7 @@ fn load(dir: &Path) -> Result<Loaded, Vec<ply_span::Diagnostic>> {
     let resolved = ply_syntax::resolve::resolve(&mut ast).map_err(|d| d.to_vec())?;
     ply_codegen::c::producer::ensure_default();
     let front = ply_codegen::c::producer::front(&named, &ids).expect("the port answers");
-    if !front.diagnostics.is_empty() {
+    if front.has_error() {
         return Err(front.diagnostics);
     }
     let check = front.check;

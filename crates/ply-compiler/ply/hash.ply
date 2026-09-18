@@ -10,10 +10,10 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               ESimulate, EBad, Stmt, SLet, SExpr, Param, MatchArm, HandleClause, ReturnClause, RecField)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
-              Constraint, Deriver, DJson, DEq, DOrd, SpecKind, SRequires, SEnsures, SpecClause, Derived, parse)
+              Constraint, Deriver, DJson, DEq, DOrd, SpecKind, SRequires, SEnsures, SpecClause, Derived, Vis, VPub, VPriv, parse)
 import rewrite (expand)
 import resolve (Mod, Source, Resolved, Scope, Binding, Bindings, ModBind, Diag, Outcome,
-                Resolved_, Failed, resolve_modules, diag2, is_bare, dump_diags, qualify)
+                Resolved_, Failed, resolve_modules, diag2, lab, is_bare, dump_diags, qualify)
 import derive (Expansion, expand_derives, deriver_tag)
 import std.hash (blake3)
 
@@ -1085,6 +1085,102 @@ fn record(a: Recording, name: Bytes, deps: List<Bytes>, closure: Names) -> Recor
     None -> { xs: push(out.closure, { name: name, names: closure }), at: map_insert(a.closure_at, name, len(out.closure)) },
   };
   { out: {..out, deps: deps_.xs, closure: closure_.xs}, deps_at: deps_.at, closure_at: closure_.at }
+}
+
+// --- What nothing reaches -------------------------------------------------------------------------------
+// The roots: a `pub` item, `main`, a derived definition, a name led by `_`, and what a test or a law mentions.
+// A spec clause is reached with its owner.
+
+type Reach = { seen: List<Bool>, frontier: List<Int> }
+
+pub fn unused(index: Index) -> List<Diag> = {
+  let n = len(index.nodes);
+  let edges = map(index.nodes, |node: Node| node_edges(index, node));
+  let own = filter(range(0, n), |v: Int| is_root(index, at(index.nodes, v)));
+  let tested = fold(index.tests, own, |acc: List<Int>, t: TestNode|
+    append(append(acc, refs_of(index, t.module, |z: Nz| test_def(z, t.def))), ret_refs(index, t.module, [t.def.body])));
+  let roots = fold(index.laws, tested, |acc: List<Int>, l: LawNode| {
+    let exprs = match l.def.guard { Some(g) -> [g, l.def.body], None -> [l.def.body] };
+    append(append(acc, refs_of(index, l.module, |z: Nz| law_def(z, l.def))), ret_refs(index, l.module, exprs))
+  });
+  let start = fold(roots, { seen: map(range(0, n), |i: Int| false), frontier: [] }, reach);
+  let seen = iterate(start, n + 2, |r: Reach|
+    if len(r.frontier) == 0 { Stop(r.seen) }
+    else { Continue(fold(r.frontier, { seen: r.seen, frontier: [] }, |acc: Reach, v: Int| fold(at(edges, v), acc, reach))) });
+  fold(range(0, n), [], |acc: List<Diag>, v: Int| if at(seen, v) { acc } else { push(acc, never_used(at(index.nodes, v))) })
+}
+
+fn reach(r: Reach, v: Int) -> Reach =
+  if at(r.seen, v) { r } else { { seen: set_at(r.seen, v, true), frontier: push(r.frontier, v) } }
+
+fn refs_of(index: Index, module: Int, encode: (Nz) -> Nz) -> List<Int> =
+  finish(encode(new_nz(index, module, map_new(), map_new(), map_new()))).refs
+
+fn node_edges(index: Index, node: Node) -> List<Int> = {
+  let own = refs_of(index, node.module, |z: Nz| normalize_node(z, node.body));
+  match node.body {
+    NFn(d) -> {
+      let clauses = fold(d.spec, own, |acc: List<Int>, c: SpecClause| append(acc, refs_of(index, node.module, |z: Nz| spec_clause(z, d, c))));
+      let defaults = fold(d.params, [], |acc: List<Expr>, p: Param| match p.default { Some(x) -> push(acc, x), None -> acc });
+      append(clauses, ret_refs(index, node.module, push(append(defaults, map(d.spec, |c: SpecClause| c.expr)), d.body)))
+    },
+    _ -> own,
+  }
+}
+
+// The encoding leaves a lambda's written return type out, and a type named only there is still used.
+fn ret_refs(index: Index, module: Int, exprs: List<Expr>) -> List<Int> =
+  refs_of(index, module, |z: Nz| fold(fold(exprs, [], |acc: List<TypeExpr>, e: Expr| lambda_rets(e, acc)), z, |acc: Nz, t: TypeExpr| type_expr(acc, t)))
+
+fn lambda_rets(e: Expr, out: List<TypeExpr>) -> List<TypeExpr> =
+  match e {
+    ELambda(l) -> lambda_rets(l.body, match l.ret { Some(t) -> push(out, t), None -> out }),
+    ELit(_) -> out,
+    EVar(_) -> out,
+    EBad(_) -> out,
+    EBinary(b) -> lambda_rets(b.rhs, lambda_rets(b.lhs, out)),
+    EUnary(u) -> lambda_rets(u.operand, out),
+    EApp(a) -> fold(a.args, lambda_rets(a.func, out), |acc: List<TypeExpr>, x: Expr| lambda_rets(x, acc)),
+    EIf(i) -> lambda_rets(i.else_branch, lambda_rets(i.then_branch, lambda_rets(i.cond, out))),
+    EMatch(m) -> fold(m.arms, lambda_rets(m.scrutinee, out), |acc: List<TypeExpr>, arm: MatchArm|
+      lambda_rets(arm.body, match arm.guard { Some(g) -> lambda_rets(g, acc), None -> acc })),
+    EBlock(b) -> {
+      let walked = fold(b.stmts, out, |acc: List<TypeExpr>, s: Stmt| match s { SLet(x) -> lambda_rets(x.value, acc), SExpr(x) -> lambda_rets(x, acc) });
+      match b.tail { Some(t) -> lambda_rets(t, walked), None -> walked }
+    },
+    ERecord(r) -> fold(r.fields, out, |acc: List<TypeExpr>, f: RecField| lambda_rets(f.value, acc)),
+    ERecordUpdate(r) -> fold(r.fields, lambda_rets(r.base, out), |acc: List<TypeExpr>, f: RecField| lambda_rets(f.value, acc)),
+    ETry(t) -> lambda_rets(t.operand, out),
+    EField(f) -> lambda_rets(f.base, out),
+    EList(l) -> fold(l.items, out, |acc: List<TypeExpr>, x: Expr| lambda_rets(x, acc)),
+    EPerform(p) -> fold(p.args, out, |acc: List<TypeExpr>, x: Expr| lambda_rets(x, acc)),
+    EHandle(h) -> {
+      let clauses = fold(h.clauses, lambda_rets(h.body, out), |acc: List<TypeExpr>, c: HandleClause| lambda_rets(c.body, acc));
+      match h.ret { Some(rc) -> lambda_rets(rc.body, clauses), None -> clauses }
+    },
+    EWithCell(c) -> lambda_rets(c.body, lambda_rets(c.init, out)),
+    EWithRegion(w) -> lambda_rets(w.body, out),
+    ESimulate(s) -> lambda_rets(s.body, out),
+  }
+
+fn is_pub(v: Vis) -> Bool = match v { VPub -> true, VPriv -> false }
+
+fn is_root(index: Index, node: Node) -> Bool =
+  bytes_starts_with(node.simple, b"_") || (match node.body {
+    NFn(d) -> is_pub(d.vis) || node.simple == b"main"
+      || fold(at(index.mods, node.module).derived, false, |b: Bool, x: Derived| b || x.span == d.span),
+    NType(d) -> is_pub(d.vis),
+    NEffect(d) -> is_pub(d.vis),
+  })
+
+fn never_used(node: Node) -> Diag = {
+  let named: { kind: Bytes, span: Span } = match node.body {
+    NFn(d) -> { kind: b"fn", span: d.name.span },
+    NType(d) -> { kind: b"type", span: d.name.span },
+    NEffect(d) -> { kind: b"effect", span: d.name.span },
+  };
+  { code: b"W0611", notes: 0, labels: [lab(node.module, named.span, true, b"never used")], text: b"",
+    message: bytes_concat_all([named.kind, b" `", node.name, b"` is never used"]), notes_text: [], severity: b"warning" }
 }
 
 // --- The dump -------------------------------------------------------------------------------------------

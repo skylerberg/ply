@@ -400,6 +400,109 @@ fn an_unchanged_project_is_answered_from_the_store_and_an_edit_asks_again() {
     assert_eq!(snapshot(&again), snapshot(&edited));
 }
 
+fn answer(loaded: &Loaded) -> String {
+    format!("{:?}", loaded.front)
+}
+
+#[test]
+fn an_edit_asks_only_the_modules_it_reached_and_answers_as_a_full_load() {
+    use ply_codegen::c::producer;
+    let dir = corpus();
+    let step = |what: &str, asked: usize| {
+        let mut store = Store::open(dir.path()).unwrap();
+        producer::reset_census();
+        let incremental = driver::load_incremental(dir.path(), &mut store)
+            .unwrap_or_else(|e| panic!("{what}: the incremental load failed: {:?}", codes(&e)));
+        let modules = producer::census().modules;
+        let full = driver::load_full(dir.path())
+            .unwrap_or_else(|e| panic!("{what}: the full load failed: {:?}", codes(&e)));
+        assert_eq!(answer(&incremental), answer(&full), "{what}");
+        assert_eq!(modules, asked, "{what}: modules handed to the port");
+    };
+
+    step("cold", 3);
+    step("unchanged", 0);
+
+    edit(dir.path(), "leaf.ply", "one() + one()", "one() + one() + 0");
+    step("a body edit in a leaf", 1);
+    edit(
+        dir.path(),
+        "leaf.ply",
+        "pub fn two() -> Int = one() + one() + 0",
+        "pub fn two(k: Int) -> Int = one() + k",
+    );
+    step("a signature edit in a leaf", 1);
+    edit(dir.path(), "leaf.ply", "pub fn one()", "fn one()");
+    step("`pub` removed in a leaf", 1);
+
+    edit(
+        dir.path(),
+        "leaf.ply",
+        "fn one() -> Int = 1",
+        "fn one() -> Int = \"1\"",
+    );
+    let mut store = Store::open(dir.path()).unwrap();
+    producer::reset_census();
+    let incremental = driver::load_incremental(dir.path(), &mut store).expect_err("a type error");
+    assert_eq!(producer::census().modules, 1 + 3);
+    let full = driver::load_full(dir.path()).expect_err("a type error");
+    assert_eq!(codes(&incremental), codes(&full));
+    edit(
+        dir.path(),
+        "leaf.ply",
+        "fn one() -> Int = \"1\"",
+        "fn one() -> Int = 1",
+    );
+    step("the error undone, whose parts were never replaced", 0);
+
+    edit(dir.path(), "core.ply", "pub fn label(", "pub fn title(");
+    step("a rename in a module another imports", 2);
+    edit(
+        dir.path(),
+        "core.ply",
+        "Book(_, p) -> p,",
+        "Book(_, p) -> p + 0,",
+    );
+    step("a body edit in a module another imports", 2);
+    edit(
+        dir.path(),
+        "shop.ply",
+        "acc + core::price(i)",
+        "acc + core::price(i) + 0",
+    );
+    step("a body edit in a module that imports another", 2);
+
+    edit(
+        dir.path(),
+        "shop.ply",
+        "import core\n",
+        "import core\nimport leaf\n",
+    );
+    step("an import added", 3);
+    edit(
+        dir.path(),
+        "shop.ply",
+        "import core\nimport leaf\n",
+        "import core\n",
+    );
+    step("an import removed", 3);
+
+    write(
+        dir.path(),
+        "extra.ply",
+        "import leaf\npub fn four() -> Int = leaf::two(2) + 2\n",
+    );
+    step("a file added", 4);
+    edit(dir.path(), "extra.ply", "+ 2\n", "+ 3\n");
+    step("an edit to the added file, which imports the leaf", 2);
+    edit(dir.path(), "leaf.ply", "one() + k", "one() + k + 0");
+    step("an edit to the leaf the added file imports", 2);
+    fs::remove_file(dir.path().join("extra.ply")).unwrap();
+    step("the added file deleted", 3);
+
+    step("unchanged again", 0);
+}
+
 #[test]
 fn the_full_path_writes_no_front_end_cache() {
     let dir = corpus();

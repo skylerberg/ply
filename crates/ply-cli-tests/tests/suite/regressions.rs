@@ -93,7 +93,7 @@ fn the_published_order_is_the_same_warm_as_cold() {
 #[test]
 fn a_result_cache_write_failure_is_not_blamed_on_the_front_end() {
     let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "m.ply", "fn f() -> Int = 1\n");
+    write(dir.path(), "m.ply", "pub fn f() -> Int = 1\n");
     // `rename` cannot replace a directory, so only the result cache's atomic write fails.
     fs::create_dir_all(dir.path().join(".ply-cache/results.json")).unwrap();
 
