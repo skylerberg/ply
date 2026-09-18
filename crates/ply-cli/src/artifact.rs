@@ -932,12 +932,20 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         .defs
         .get(&opened.entry)
         .map(|d| d.footprint.clone());
+    // Before the configuration: its schema is entered on this unit.
+    let tier = tier(&opened, args.backend.as_ref(), unit);
+    let constant = |name: &str| match &tier {
+        Ok(tier) => crate::commands::common::enter_constant(
+            tier.as_ref().map(|(provider, _)| *provider),
+            name,
+        ),
+        Err(diagnostic) => Err(diagnostic.clone()),
+    };
     let (configuration, config_warnings) = match crate::config::Configuration::open(
-        &opened.program,
-        &opened.resolved,
         &opened.front.check,
         args.host,
         &args.config,
+        &constant,
     ) {
         Ok(resolved) => resolved,
         Err(diagnostics) => {
@@ -1019,15 +1027,8 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         .map(|d| d.span)
         .unwrap_or(Span::DUMMY);
     let plan = crate::simulation::run_plan(args.seed.as_ref());
-    let answer = evaluate(
-        &opened,
-        span,
-        &plan,
-        &hosts,
-        declared.as_ref(),
-        args.backend.as_ref(),
-        unit,
-    );
+    let answer =
+        tier.and_then(|tier| evaluate(&opened, span, &plan, &hosts, declared.as_ref(), tier));
 
     // On the machine's own thread, never from a signal handler.
     let teardown =
@@ -1095,30 +1096,17 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     }
 }
 
-fn evaluate(
+/// The unit the artifact runs on: its embedded one as built, else one compiled from its bodies.
+fn tier(
     opened: &Opened,
-    span: Span,
-    plan: &ply_eval::Plan,
-    hosts: &crate::hosts::Hosts,
-    declared: Option<&ply_ty::ty::Footprint>,
     backend: Option<&String>,
     unit: Option<&EmbeddedUnit>,
-) -> Result<ply_eval::Value, Diagnostic> {
-    use ply_eval::Machine;
-
-    let name = opened.entry.as_str();
-    let configure = |machine: &mut Machine<'_>| {
-        machine.set_host_binding(hosts.binding());
-        if let Some(runtime) = hosts.runtime() {
-            machine.set_host_runtime(runtime);
-        }
-        if let Some(declared) = declared {
-            machine.set_declared_footprint(declared.clone());
-        }
-        ply_test::sim::seed_run(machine, &plan.seeds()[0], plan.steps);
+) -> Result<Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>, Diagnostic> {
+    let Some(spec) = crate::commands::common::backend_spec(backend)? else {
+        return Ok(None);
     };
     // Entered as built: no producer is asked.
-    if let (Some(unit), Some(spec)) = (unit, crate::commands::common::backend_spec(backend)?) {
+    if let Some(unit) = unit {
         let unit_error = |e: &dyn std::fmt::Display| {
             Diagnostic::error(
                 codes::ARTIFACT_INVALID,
@@ -1126,32 +1114,48 @@ fn evaluate(
             )
         };
         let text = ply_codegen::c::bundle::unpack(&unit.text).map_err(|e| unit_error(&e))?;
-        let provider = ply_codegen::Unit::embedded(
+        let provider: &'static dyn ply_eval::Provider = ply_codegen::Unit::embedded(
             &opened.program,
             &opened.resolved,
             &opened.front.check,
             text,
         )
         .map_err(|e| unit_error(&e))?;
-        let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.front.check);
-        machine.set_compiled(ply_eval::Provider::attach(provider, &spec));
-        configure(&mut machine);
-        return machine.call(name, Vec::new(), span);
+        return Ok(Some((provider, spec)));
     }
-    let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.front.check);
-    if let Some(spec) = crate::commands::common::backend_spec(backend)? {
-        let texts = crate::commands::common::module_texts(&opened.program, &opened.sources);
-        let provider = crate::commands::common::build_backend_over(
-            &spec,
-            &opened.program,
-            &opened.resolved,
-            &opened.front,
-            texts,
-        )?;
+    let texts = crate::commands::common::module_texts(&opened.program, &opened.sources);
+    let provider = crate::commands::common::build_backend_over(
+        &spec,
+        &opened.program,
+        &opened.resolved,
+        &opened.front,
+        texts,
+    )?;
+    Ok(Some((provider, spec)))
+}
+
+fn evaluate(
+    opened: &Opened,
+    span: Span,
+    plan: &ply_eval::Plan,
+    hosts: &crate::hosts::Hosts,
+    declared: Option<&ply_ty::ty::Footprint>,
+    tier: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
+) -> Result<ply_eval::Value, Diagnostic> {
+    let mut machine =
+        ply_eval::Machine::new(&opened.program, &opened.resolved, &opened.front.check);
+    if let Some((provider, spec)) = tier {
         machine.set_compiled(provider.attach(&spec));
     }
-    configure(&mut machine);
-    machine.call(name, Vec::new(), span)
+    machine.set_host_binding(hosts.binding());
+    if let Some(runtime) = hosts.runtime() {
+        machine.set_host_runtime(runtime);
+    }
+    if let Some(declared) = declared {
+        machine.set_declared_footprint(declared.clone());
+    }
+    ply_test::sim::seed_run(&mut machine, &plan.seeds()[0], plan.steps);
+    machine.call(opened.entry.as_str(), Vec::new(), span)
 }
 
 /// No span: a container failure is about the file, not a point in the program.

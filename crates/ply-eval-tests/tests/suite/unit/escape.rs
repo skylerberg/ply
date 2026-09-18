@@ -99,32 +99,24 @@ fn a_builtin_closure_carries_nothing() {
     assert_eq!(carries(&value), None);
 }
 
-/// `E0302` refuses this shape in source, so the environment is assembled directly.
+/// The generator never draws a handle, so this value is assembled directly.
 #[test]
-fn a_closure_whose_scope_reaches_a_handle_is_found_and_the_binding_named() {
-    use ply_eval::Closure;
-    use ply_syntax::ast::{Expr, ExprKind, Lit};
+fn a_generated_function_holding_a_handle_is_found() {
+    use ply_eval::{Closure, Synth};
 
-    let bindings = vec![
-        (Symbol::new("n"), Value::Int(1)),
-        (Symbol::new("c"), cell()),
-    ];
     let closure = Value::Closure(Arc::new(Closure {
-        name: Some(Symbol::new("m.later")),
-        kind: ClosureKind::Fn {
-            params: Vec::new(),
-            body: Arc::new(Expr {
-                kind: ExprKind::Lit(Lit::Int(0)),
-                span: Span::DUMMY,
-            }),
-            bindings,
-            module: 0,
+        name: Some(Symbol::new("|_| c")),
+        kind: ClosureKind::Synth {
+            arity: 1,
+            rule: Synth::Table {
+                entries: vec![(Value::Int(1), cell())],
+                default: Value::Int(0),
+            },
         },
     }));
 
-    let found = carries(&closure).expect("the scope reaches the cell");
+    let found = carries(&closure).expect("the table reaches the cell");
     assert_eq!(found.handle, Handle::Cell);
-    assert_eq!(found.route, vec!["`c`, captured by `m.later`"]);
 }
 
 #[test]

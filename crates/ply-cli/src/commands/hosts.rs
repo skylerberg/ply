@@ -68,7 +68,12 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
             return report_bind_error("hosts", &diagnostics, &loaded.sources, args.json, style);
         }
     };
-    let schema = match schema_view(&loaded, db.as_ref()) {
+    // Built only for a schema: this command runs nothing else.
+    let constant = |name: &str| {
+        let backend = super::common::prover_backend(None, &loaded)?;
+        super::common::enter_constant(backend.map(|(provider, _)| provider), name)
+    };
+    let schema = match schema_view(&loaded.check, db.as_ref(), &constant) {
         Ok(schema) => schema,
         Err(diagnostic) => {
             return report_bind_error(
@@ -80,18 +85,14 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
             );
         }
     };
-    let (configuration, config_warnings) = match crate::config::Configuration::open(
-        &loaded.program,
-        &loaded.resolved,
-        &loaded.check,
-        args.host,
-        &args.config,
-    ) {
-        Ok(resolved) => resolved,
-        Err(diagnostics) => {
-            return report_bind_error("hosts", &diagnostics, &loaded.sources, args.json, style);
-        }
-    };
+    let (configuration, config_warnings) =
+        match crate::config::Configuration::open(&loaded.check, args.host, &args.config, &constant)
+        {
+            Ok(resolved) => resolved,
+            Err(diagnostics) => {
+                return report_bind_error("hosts", &diagnostics, &loaded.sources, args.json, style);
+            }
+        };
     let disclosures = hosts::Disclosures::of(
         &listing,
         Some(&credentials),
@@ -165,15 +166,16 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
 }
 
 fn schema_view(
-    loaded: &crate::load::Loaded,
+    check: &ply_ty::CheckOutput,
     db: Option<&crate::db::DbConfig>,
+    constant: &dyn Fn(&str) -> Result<ply_eval::Value, ply_span::Diagnostic>,
 ) -> Result<Option<crate::db::schema::SchemaView>, ply_span::Diagnostic> {
     let Some(name) = db.and_then(|c| c.schema.as_deref()) else {
         return Ok(None);
     };
-    let resolved = crate::db::schema::resolve(&loaded.check, name)?;
+    let resolved = crate::db::schema::resolve(check, name)?;
     let name = resolved.as_str().to_string();
-    let shape = super::common::materialise_schema(loaded, &name);
+    let shape = super::common::materialise_schema(&name, constant);
     Ok(Some(crate::db::schema::SchemaView {
         name,
         shape,

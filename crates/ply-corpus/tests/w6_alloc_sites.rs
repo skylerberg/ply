@@ -313,8 +313,6 @@ fn the_two_allocation_harnesses_are_one_measurement_read_at_two_windows() {
         );
     }
 
-    // `Machine::definition` memoizes a lowered top-level body; the `ClosureKind::Fn` arm beside it
-    // does not, and lowers a lambda's body on every apply.
     let routing = loaded
         .full("w6_bench")
         .expect("the driver declares w6_bench");

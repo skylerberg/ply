@@ -651,9 +651,8 @@ pub fn operation_label(effect: &Symbol, op: &Symbol, resource: Option<&Symbol>) 
 }
 
 /// Codes a host handler may not raise.
-pub const RESERVED_CODES: [&str; 21] = [
+pub const RESERVED_CODES: [&str; 20] = [
     codes::INTERNAL_ERROR,
-    codes::ENGINE_DIVERGENCE,
     codes::SIMULATION_DIVERGENCE,
     codes::DEADLOCK,
     codes::NESTED_SIMULATION,

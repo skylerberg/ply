@@ -591,7 +591,6 @@ test/nondet "a handler that lies about why" { assert_eq(net.send[socket](1), 1) 
 
     for claimed in [
         codes::INTERNAL_ERROR,
-        codes::ENGINE_DIVERGENCE,
         codes::SIMULATION_DIVERGENCE,
         codes::HOST_FOOTPRINT_ESCAPE,
         codes::HERMETIC_BOUNDARY,

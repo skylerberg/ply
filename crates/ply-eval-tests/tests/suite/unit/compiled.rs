@@ -3,83 +3,14 @@ use crate::unit::build::*;
 use ply_eval::Value;
 use ply_eval::compiled::*;
 use ply_eval::evaluator::Machine;
-use ply_eval::{Closure, ClosureKind};
 use ply_span::Symbol;
 use ply_span::{Diagnostic, codes};
-use ply_syntax::ast::{BinOp, Expr, Item, Program};
+use ply_syntax::ast::{BinOp, Item, Program};
 use ply_syntax::resolve::Resolved;
 use ply_ty::CheckOutput;
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
-
-type Reply = dyn Fn(&Symbol, &[Value], usize) -> Option<Value>;
-
-#[derive(Clone, Debug, PartialEq)]
-struct Offer {
-    name: Symbol,
-    args: Vec<Value>,
-    budget: usize,
-}
-
-struct Double {
-    /// Never dereferenced.
-    program: *const Program,
-    reply: Box<Reply>,
-    offers: RefCell<Vec<Offer>>,
-}
-
-impl Double {
-    fn over(
-        program: &Program,
-        reply: impl Fn(&Symbol, &[Value], usize) -> Option<Value> + 'static,
-    ) -> Rc<Double> {
-        Rc::new(Double {
-            program: std::ptr::from_ref(program),
-            reply: Box::new(reply),
-            offers: RefCell::new(Vec::new()),
-        })
-    }
-
-    fn declining(program: &Program) -> Rc<Double> {
-        Double::over(program, |_, _, _| None)
-    }
-
-    fn answering(program: &Program, name: &str, value: Value) -> Rc<Double> {
-        let wanted = Symbol::new(name);
-        Double::over(program, move |asked, _, _| {
-            (*asked == wanted).then(|| value.clone())
-        })
-    }
-
-    fn offers(&self) -> Vec<Offer> {
-        self.offers.borrow().clone()
-    }
-
-    fn names(&self) -> Vec<String> {
-        self.offers
-            .borrow()
-            .iter()
-            .map(|o| o.name.as_str().to_string())
-            .collect()
-    }
-}
-
-impl Compiled for Double {
-    fn describes(&self, program: &Program) -> bool {
-        std::ptr::eq(self.program, std::ptr::from_ref(program))
-    }
-
-    fn enter(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value> {
-        self.offers.borrow_mut().push(Offer {
-            name: name.clone(),
-            args: args.to_vec(),
-            budget,
-        });
-        (self.reply)(name, args, budget)
-    }
-}
 
 struct Checked {
     program: Program,
@@ -126,15 +57,6 @@ fn checked_source(source: &str) -> Checked {
     }
 }
 
-/// `Diagnostic` has no `PartialEq`, so a failing outcome cannot be compared with `assert_eq!`
-#[track_caller]
-fn ok(outcome: Result<Value, Diagnostic>) -> Value {
-    match outcome {
-        Ok(value) => value,
-        Err(d) => panic!("expected a value, got {}: {}", d.code, d.message),
-    }
-}
-
 fn double_def() -> Item {
     fn_def_sig(
         "double",
@@ -142,109 +64,6 @@ fn double_def() -> Item {
         tcon("Int"),
         bin(BinOp::Mul, var("x"), int(2)),
     )
-}
-
-#[test]
-fn a_machine_with_no_backend_never_asks_and_never_counts() {
-    let c = checked(vec![double_def()]);
-    let mut machine = c.machine();
-    assert_eq!(
-        ok(machine.eval_expr_for_test(&callv("double", vec![int(21)]))),
-        Value::Int(42)
-    );
-    assert_eq!(machine.compiled_counts(), (0, 0));
-    assert_eq!(machine.compiled_refusals(), 0);
-}
-
-#[test]
-fn a_backend_built_over_another_program_is_ignored() {
-    let elsewhere = checked(vec![fn_def_sig(
-        "double",
-        &[("x", tcon("Int"))],
-        tcon("Int"),
-        int(1000),
-    )]);
-    let backend = Double::answering(&elsewhere.program, "double", Value::Int(84));
-
-    let c = checked(vec![double_def()]);
-    let mut machine = c.machine();
-    machine.set_compiled(backend.clone());
-    assert_eq!(
-        ok(machine.eval_expr_for_test(&callv("double", vec![int(21)]))),
-        Value::Int(42)
-    );
-    assert_eq!(machine.compiled_counts(), (0, 0));
-    assert!(backend.offers().is_empty());
-}
-
-/// Built by hand, so [`admit`] can be asked about a body the machine would never hand it.
-fn code_closure(name: Option<&str>, params: &[&str], body: Expr) -> Closure {
-    let params: Vec<Symbol> = params.iter().copied().map(Symbol::new).collect();
-    let lowered = ply_eval::code::lower_fn(&params, &body);
-    Closure {
-        name: name.map(Symbol::new),
-        kind: ClosureKind::Code {
-            params: Rc::new(params),
-            size: lowered.size,
-            body: lowered.code,
-            captures: ply_eval::code::no_captures(),
-            captured: Rc::from(Vec::new()),
-            module: 0,
-        },
-    }
-}
-
-fn self_handled() -> Checked {
-    checked(vec![
-        effect_def("state", &[("get", ply_syntax::ast::Mode::Read, false)]),
-        fn_def_sig(
-            "touch",
-            &[("x", tcon("Int"))],
-            tcon("Int"),
-            perform("state", "get", None, vec![var("x")]),
-        ),
-        fn_def_sig(
-            "handled",
-            &[("x", tcon("Int"))],
-            tcon("Int"),
-            handle(
-                callv("touch", vec![var("x")]),
-                vec![clause(
-                    "state",
-                    "get",
-                    None,
-                    &["n"],
-                    bin(BinOp::Add, var("n"), int(1)),
-                )],
-            ),
-        ),
-        fn_def_sig(
-            "wrapper",
-            &[("x", tcon("Int"))],
-            tcon("Int"),
-            callv("handled", vec![var("x")]),
-        ),
-        fn_def_sig(
-            "bump",
-            &[("x", tcon("Int"))],
-            tcon("Int"),
-            bin(BinOp::Add, var("x"), int(0)),
-        ),
-    ])
-}
-
-#[test]
-fn a_machine_with_no_check_output_offers_nothing() {
-    let (program, resolved) = standalone(vec![double_def()]);
-    let backend = Double::declining(&program);
-    let mut machine = Machine::for_program(&program, &resolved);
-    machine.set_compiled(backend.clone());
-    assert_eq!(
-        ok(machine.eval_expr_for_test(&callv("double", vec![int(21)]))),
-        Value::Int(42)
-    );
-    assert!(backend.offers().is_empty());
-    assert_eq!(machine.compiled_counts(), (0, 0));
 }
 
 #[test]
@@ -309,11 +128,7 @@ fn an_answer_whose_kind_is_not_its_declared_returns_is_refused_unless_it_is_chil
         "type Scan = { at: Int, tok: Bytes }\n\
          fn scan(i: Int) -> Scan = { at: i, tok: b\"x\" }\n",
     );
-    let holding = Value::list(vec![Value::Closure(Arc::new(code_closure(
-        None,
-        &["y"],
-        var("y"),
-    )))]);
+    let holding = Value::list(vec![Value::builtin(ply_eval::Builtin::IntToString)]);
     let types = c.types();
     let scan = Symbol::new("scan");
     assert!(
@@ -359,43 +174,6 @@ fn a_closure_bearing_record_return_is_refused_however_ordinary_the_record_looks(
         "a backend's registry would hold a definition the machine will not hear from"
     );
     assert!(types.signature_carried(&Symbol::new("make_plain")));
-}
-
-#[test]
-fn an_entered_subtree_is_refused_for_an_effect_two_hops_down_that_it_would_hide() {
-    let c = self_handled();
-    // `wrapper` calls `handled`, which discharges `state.get` under its own handler.
-    let mut machine = c.machine();
-    assert_eq!(
-        ok(machine.eval_expr_for_test(&callv("wrapper", vec![int(1)]))),
-        Value::Int(2)
-    );
-    assert_eq!(
-        machine.trace().performs(),
-        1,
-        "the fixture is wrong: nothing was performed, so hiding the subtree would cost \
-         nothing"
-    );
-    drop(machine);
-
-    // And the machine offers it to nobody, so the subtree is never hidden.
-    let backend = Double::declining(&c.program);
-    let mut machine = c.machine();
-    machine.set_compiled(backend.clone());
-    assert_eq!(
-        ok(machine.eval_expr_for_test(&callv("wrapper", vec![int(1)]))),
-        Value::Int(2)
-    );
-    assert!(
-        !backend.names().iter().any(|n| n == "wrapper"),
-        "a definition whose subtree performs was offered: {:?}",
-        backend.names()
-    );
-    assert_eq!(
-        machine.trace().performs(),
-        1,
-        "the atoms the interpreter records were lost"
-    );
 }
 
 struct Roots {
@@ -453,7 +231,8 @@ fn a_test_root_the_backend_raised_in_keeps_the_machines_diagnostic_when_it_raise
     let c = checked(double_doubles(43));
     let (outcome, _) = first_test_under(&c, assertion_raised);
     let d = outcome.expect_err("the assertion fails in the machine");
-    assert_ne!(d.code, codes::ENGINE_DIVERGENCE, "{}", d.message);
+    assert_eq!(d.code, codes::RUNTIME_ERROR);
+    assert_eq!(d.message, "assertion failed");
 }
 
 fn record_value(fields: &[(&str, Value)]) -> Value {

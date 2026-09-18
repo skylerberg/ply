@@ -1,8 +1,8 @@
 use super::common::{
     IND, backend_spec, build_backend_over, build_pool, describe_schema, diagnostic_json,
-    diagnostics_json, emit_json, exit_code, location, millis, once_each, phases_json, plural,
-    print_diagnostics, print_phases, print_warnings, report_bind_error, report_load_error,
-    select_profile,
+    diagnostics_json, emit_json, enter_constant, exit_code, location, millis, once_each,
+    phases_json, plural, print_diagnostics, print_phases, print_warnings, report_bind_error,
+    report_load_error, select_profile,
 };
 use crate::EXIT_COMPILE_ERROR;
 use crate::cli::{TestArgs, When};
@@ -158,66 +158,24 @@ fn iterate(
             .iter()
             .flat_map(|t| t.footprint.atoms().cloned()),
     );
-    // Before binding, so a missing required key fails before any host test runs.
-    let (configuration, config_warnings) = match crate::config::Configuration::open(
-        &loaded.program,
-        &loaded.resolved,
-        &loaded.check,
-        args.host,
-        &args.config,
-    ) {
-        Ok(resolved) => resolved,
-        Err(diagnostics) => {
-            return report_bind_error("test", &diagnostics, &loaded.sources, args.json, style);
-        }
-    };
-    warnings.extend(config_warnings);
-    let mut hosts = match Hosts::open(
-        &loaded.check,
-        args.host,
-        &args.tls.tls,
-        &args.fs.fs,
-        db,
-        configuration,
-        // `--trace` on this command names the definition trace, so records are discarded.
-        &crate::trace::TraceOptions::silent(),
-        Some(&reach),
-    ) {
-        Ok(hosts) => hosts,
-        Err(diagnostics) => {
-            return report_bind_error("test", &diagnostics, &loaded.sources, args.json, style);
-        }
-    };
-    describe_schema(&loaded, &mut hosts);
-    let hosts = hosts;
-
-    let (pool, workers) = build_pool(args.jobs, &mut warnings);
-    let simulation =
-        ply_test::Search::of(&plan.selection).measuring(args.simulation.measure_reduction);
-    // A factory: a reactor belongs to its thread, and each worker builds its own machine.
-    let runtime = hosts.runtime_factory();
-    // One per run, shared by the workers; an empty selection builds nothing.
+    // One per run, shared by the workers; an empty selection builds nothing a schema does not need.
     let nothing_to_run = plan.selection.to_run.is_empty();
+    let schema_named =
+        args.config.schema.is_some() || db.as_ref().is_some_and(|c| c.schema.is_some());
+    let wanted = backend.as_ref().filter(|_| !nothing_to_run || schema_named);
     // A backend answers only for the program it was built over, and the machine checks that.
     let (run_program, run_resolved) = (&loaded.program, &loaded.resolved);
     // The last iteration's unit, when every definition is unchanged.
-    let held_unit = backend
-        .as_ref()
-        .filter(|_| !nothing_to_run)
-        .and_then(|spec| warm.unit_for(spec, &hashes));
-    let provider = match backend
-        .as_ref()
-        .filter(|_| !nothing_to_run)
-        .filter(|_| held_unit.is_none())
-        .map(|spec| {
-            build_backend_over(
-                spec,
-                run_program,
-                run_resolved,
-                &loaded.front,
-                super::common::module_texts(run_program, &loaded.sources),
-            )
-        }) {
+    let held_unit = wanted.and_then(|spec| warm.unit_for(spec, &hashes));
+    let unit = match wanted.filter(|_| held_unit.is_none()).map(|spec| {
+        build_backend_over(
+            spec,
+            run_program,
+            run_resolved,
+            &loaded.front,
+            super::common::module_texts(run_program, &loaded.sources),
+        )
+    }) {
         None => held_unit,
         Some(Ok(provider)) => {
             if let Some(spec) = backend.as_ref() {
@@ -239,6 +197,42 @@ fn iterate(
             return EXIT_COMPILE_ERROR;
         }
     };
+    let constant = |name: &str| enter_constant(unit, name);
+    // Before binding, so a missing required key fails before any host test runs.
+    let (configuration, config_warnings) =
+        match crate::config::Configuration::open(&loaded.check, args.host, &args.config, &constant)
+        {
+            Ok(resolved) => resolved,
+            Err(diagnostics) => {
+                return report_bind_error("test", &diagnostics, &loaded.sources, args.json, style);
+            }
+        };
+    warnings.extend(config_warnings);
+    let mut hosts = match Hosts::open(
+        &loaded.check,
+        args.host,
+        &args.tls.tls,
+        &args.fs.fs,
+        db,
+        configuration,
+        // `--trace` on this command names the definition trace, so records are discarded.
+        &crate::trace::TraceOptions::silent(),
+        Some(&reach),
+    ) {
+        Ok(hosts) => hosts,
+        Err(diagnostics) => {
+            return report_bind_error("test", &diagnostics, &loaded.sources, args.json, style);
+        }
+    };
+    describe_schema(&mut hosts, &constant);
+    let hosts = hosts;
+    let provider = unit.filter(|_| !nothing_to_run);
+
+    let (pool, workers) = build_pool(args.jobs, &mut warnings);
+    let simulation =
+        ply_test::Search::of(&plan.selection).measuring(args.simulation.measure_reduction);
+    // A factory: a reactor belongs to its thread, and each worker builds its own machine.
+    let runtime = hosts.runtime_factory();
     let mut run = || {
         let mut executor = ply_test::InterpExecutor::new(run_program, run_resolved, &loaded.check)
             .with_search(simulation.clone())

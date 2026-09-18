@@ -1,27 +1,8 @@
 //! A node's meaning and diagnostics, shared by every evaluation strategy.
 
-use crate::handler::OpDecl;
-use crate::value::{Closure, ClosureKind, Decimal, Fixed, Value, type_error, values_equal};
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::{Ident, QName};
-use ply_ty::{BinOp, Lit, Mode, UnOp};
-use rustc_hash::FxHashMap;
-use std::cell::RefCell;
-use std::sync::Arc;
-
-/// Keyed by program-wide effect name and operation name.
-pub(crate) type OpTable = FxHashMap<(Symbol, Symbol), (bool, Mode)>;
-
-pub(crate) fn op_decl(ops: &OpTable, effect: &Symbol, op: &Symbol) -> OpDecl {
-    match ops.get(&(effect.clone(), op.clone())) {
-        Some(&(resource_param, mode)) => OpDecl::Declared {
-            resource_param,
-            mode,
-        },
-        None if ops.keys().any(|(e, _)| e == effect) => OpDecl::NoSuchOp,
-        None => OpDecl::UnknownEffect,
-    }
-}
+use crate::value::{Decimal, Fixed, Value, type_error, values_equal};
+use ply_span::{Diagnostic, Span, codes};
+use ply_ty::{BinOp, Lit};
 
 pub(crate) fn literal(lit: &Lit) -> Value {
     match lit {
@@ -39,70 +20,6 @@ pub(crate) fn literal(lit: &Lit) -> Value {
 /// The fallback is unreachable: the lexer and body decoder already enforce `Decimal`'s range.
 pub(crate) fn decimal_lit(mantissa: i128, scale: u32) -> Decimal {
     Decimal::try_from_i128_with_scale(mantissa, scale).unwrap_or(Decimal::ZERO)
-}
-
-/// `Float` matches by IEEE `==`, so a `NaN` pattern matches nothing, not even a NaN scrutinee.
-pub fn lit_matches(lit: &Lit, value: &Value) -> bool {
-    match (lit, value) {
-        (Lit::Int(a), Value::Int(b)) => a == b,
-        (Lit::Bool(a), Value::Bool(b)) => a == b,
-        (Lit::Str(a), Value::Str(b)) => a.as_str() == b.as_ref(),
-        (Lit::Bytes(a), Value::Bytes(b)) => a.as_slice() == b.as_ref(),
-        (Lit::Float(a), Value::Float(b)) => a == b,
-        // By numeric value, matching `==`: a `1.50m` pattern matches `1.5m`.
-        (Lit::Decimal { mantissa, scale }, Value::Decimal(b)) => {
-            decimal_lit(*mantissa, *scale) == *b
-        }
-        (Lit::Unit, Value::Unit) => true,
-        _ => false,
-    }
-}
-
-/// Constructor values cached per thread; past the bound the rest are built per mention.
-pub const CTOR_CACHE_KEEP: usize = 4096;
-
-thread_local! {
-    /// Holds the arity too: two programs on one thread can give one name two arities.
-    pub static CTOR_VALUES: RefCell<FxHashMap<Symbol, (usize, Value)>> =
-        RefCell::new(FxHashMap::default());
-}
-
-/// A constructor mention's value, shared per thread; the value is immutable and identity-free.
-pub fn ctor_value(name: &Symbol, arity: usize) -> Value {
-    let fresh = || {
-        if arity == 0 {
-            Value::ctor(name.clone(), Vec::new())
-        } else {
-            Value::Closure(Arc::new(Closure {
-                name: Some(name.clone()),
-                kind: ClosureKind::Ctor {
-                    name: name.clone(),
-                    arity,
-                },
-            }))
-        }
-    };
-    // `try_with`: a `Value` dropped in thread-local teardown can arrive after the cache is gone.
-    CTOR_VALUES
-        .try_with(|cache| {
-            let mut cache = cache.borrow_mut();
-            match cache.get(name) {
-                Some((at, value)) if *at == arity => value.clone(),
-                Some(_) => {
-                    let value = fresh();
-                    cache.insert(name.clone(), (arity, value.clone()));
-                    value
-                }
-                None => {
-                    let value = fresh();
-                    if cache.len() < CTOR_CACHE_KEEP {
-                        cache.insert(name.clone(), (arity, value.clone()));
-                    }
-                    value
-                }
-            }
-        })
-        .unwrap_or_else(|_| fresh())
 }
 
 #[inline(never)]
@@ -330,64 +247,6 @@ pub(crate) fn arity_error(span: Span, what: &str, expected: usize, got: usize) -
 
 #[cold]
 #[inline(never)]
-pub(crate) fn err_unknown_name(q: &QName) -> Diagnostic {
-    Diagnostic::error(
-        codes::UNKNOWN_NAME,
-        format!("cannot find `{q}` in this scope"),
-    )
-    .primary(q.span, "not bound here")
-}
-
-#[cold]
-#[inline(never)]
-pub(crate) fn err_not_a_function(span: Span, v: &Value) -> Diagnostic {
-    Diagnostic::error(
-        codes::NOT_A_FUNCTION,
-        format!("cannot call a value of type {}", v.type_name()),
-    )
-    .primary(span, format!("this is {}", v.render()))
-}
-
-#[cold]
-#[inline(never)]
-pub(crate) fn err_non_exhaustive(span: Span, v: &Value) -> Diagnostic {
-    Diagnostic::error(
-        codes::NON_EXHAUSTIVE_MATCH,
-        "no match arm applied to the scrutinee",
-    )
-    .primary(span, format!("this evaluated to {}", v.render()))
-    .note("add an arm covering this value, or a `_` catch-all")
-}
-
-#[cold]
-#[inline(never)]
-pub(crate) fn err_let_mismatch(span: Span, v: &Value) -> Diagnostic {
-    Diagnostic::error(
-        codes::NON_EXHAUSTIVE_MATCH,
-        "`let` pattern did not match the bound value",
-    )
-    .primary(span, format!("value was {}", v.render()))
-    .note("use `match` when the pattern can fail")
-}
-
-#[cold]
-#[inline(never)]
-pub(crate) fn err_no_such_field(field: &Ident, fields: &crate::value::Fields) -> Diagnostic {
-    let known: Vec<String> = fields.keys().map(|k| format!("`{k}`")).collect();
-    Diagnostic::error(
-        codes::UNKNOWN_NAME,
-        format!("record has no field `{}`", field.name),
-    )
-    .primary(field.span, "no such field")
-    .note(if known.is_empty() {
-        "the record is empty".to_string()
-    } else {
-        format!("available fields: {}", known.join(", "))
-    })
-}
-
-#[cold]
-#[inline(never)]
 pub(crate) fn err_shift_count(span: Span, n: i64) -> Diagnostic {
     Diagnostic::error(codes::RUNTIME_ERROR, "shift count out of range")
         .primary(span, format!("{n} is not in 0..=63"))
@@ -461,40 +320,4 @@ pub(crate) fn err_overflow(span: Span, what: &str, a: i64, b: i64) -> Diagnostic
 
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
-}
-
-pub(crate) fn apply_unary(
-    op: UnOp,
-    value: &Value,
-    operand_span: Span,
-    span: Span,
-) -> Result<Value, Diagnostic> {
-    match op {
-        // Not redundant: negation is how a program reaches `-0.0`.
-        UnOp::Neg => match value {
-            Value::Float(f) => Ok(Value::Float(-f)),
-            Value::Decimal(d) => Ok(Value::Decimal(-*d)),
-            // At an unsigned type `-x` overflows for every `x` but zero.
-            Value::Fixed(f) => match Fixed::of(f.ty, -f.value()) {
-                Some(n) => Ok(Value::Fixed(n)),
-                None => Err(err_fixed_overflow(span, "negation", *f, *f)),
-            },
-            _ => {
-                let i = value.as_int(operand_span, "negation")?;
-                match i.checked_neg() {
-                    Some(n) => Ok(Value::Int(n)),
-                    None => Err(err_overflow(span, "negation", i, 0)),
-                }
-            }
-        },
-        UnOp::Not => Ok(Value::Bool(!value.as_bool(operand_span, "`!`")?)),
-        UnOp::BitNot => match value {
-            Value::Fixed(f) => Ok(Value::Fixed(Fixed::new(f.ty, !f.bits()))),
-            _ => Ok(Value::Int(!value.as_int(operand_span, "`~`")?)),
-        },
-    }
-}
-
-pub(crate) fn short_circuits(op: BinOp, lhs: bool) -> bool {
-    lhs == matches!(op, BinOp::Or)
 }
