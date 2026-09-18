@@ -1,17 +1,4 @@
-// infer.ply — `crates/ply-core`'s `infer.rs`, ported: the checker over `tycore.ply`.
-//
-// The first stage. It reads the trees `rewrite.ply` and `resolve.ply` produce, as
-// the reference reads `parse_recovering`'s and `resolve`'s, and publishes what
-// `check_program` publishes: every definition's scheme, footprint and constraints,
-// every test's and law's footprint, every effect and constructor. `check_dump`
-// writes those in the encoding the goldens under
-// `crates/ply-compiler-diff/fixtures/goldens/infer.check_dump/` fix. Those
-// goldens are the specification now: the reference dumper that used to define
-// this encoding is gone, and the differential holds this side to the files.
-//
-// Not yet here: the derive expansion (`ply_derive::expand_program` runs before
-// the reference checker, so `check_derives` and `attribute_generated` have
-// nothing to walk until it is ported) and the incremental `Known` interface.
+// The type checker: schemes, footprints and constraints for every definition, test, law, effect and constructor.
 
 import spine (Span, Ident, QName, span_to, dummy_span, num)
 import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead, MWrite, MBad, ty_span)
@@ -50,7 +37,7 @@ import derive (Why, WFunction, WHandle, WFloatIsNotOrdered, WUnconstrained, WNul
 
 // --- What the checker keeps ----------------------------------------------------------
 
-// A prelude item's `at` is `{ module: 0, span: dummy_span() }`, the reference's `Span::DUMMY`.
+// A prelude item's `at` is `{ module: 0, span: dummy_span() }`.
 pub type Loc = { module: Int, span: Span }
 type TypeDecl = { params: List<Bytes>, alias: Option<TypeExpr>, owner: Int, span: Span }
 pub type OpInfo = { name: Bytes, mode: Mode, resource_param: Bool, params: List<Type>, ret: Type,
@@ -69,14 +56,12 @@ pub type LawInfo = { name: Bytes, module: Bytes, key: Bytes, index: Int, binders
                      footprint: List<Atom>, at: Loc }
 type PerformSite = { atom: Atom, module: Int, span: Span, direct: Bool }
 type Numeric = { span: Span, op: Bytes, ty: Type }
-// A bit operator's or an integer builtin's operand, kept until its type is known (ADR 0039).
-// `what` is how a diagnostic names the site, which is why the two are not one type.
+// A bit operator's or integer builtin's operand, kept until its type is known. `what` names the site in a diagnostic.
 type BitOp = { span: Span, what: Bytes, ty: Type }
 type Sig = { ty_params: Map<Bytes, Type>, row_params: Map<Bytes, Int>, fn_ty: Type, params: List<Type>,
              ret: Type, declared: Option<Row>, published_row: Row, scope: Int }
 type Assumed = { deriver: Deriver, vars: List<Int> }
 type SpawnSite = { span: Span, ty: Type }
-// `op` is `sink.put`, for the diagnostic.
 type HandoffSite = { span: Span, ty: Type, op: Bytes }
 type OpenRegion = { name: Bytes, with_cell: Bool, span: Span, simulate_depth: Int, spawns: List<SpawnSite>, handoffs: List<HandoffSite> }
 type OuterBinding = { name: Bytes, ty: Type, site: Span }
@@ -89,8 +74,7 @@ type MapKeySite = { module: Int, span: Span, scope: Int, key: Type, assumed: Lis
 type ConstraintSite = { module: Int, span: Span, deriver: Deriver, ty: Type, callee: Bytes, callee_at: Loc, assumed: List<Int>, params: List<RigidParam> }
 type SpecEnv = { name: Bytes, ty_params: Map<Bytes, Type>, row_params: Map<Bytes, Int>, params: List<Type>, ret: Type }
 
-// `Known`: the interfaces the driver hands in for definitions whose bodies it need not walk
-// again, and the footprints of tests it need not re-infer, one slot per `test` in source order.
+// The interfaces the driver hands in for definitions it need not re-walk, and test footprints, one slot per `test`.
 pub type KnownDef = { name: Bytes, scheme: Scheme, footprint: List<Atom>, performed: List<Atom> }
 pub type KnownTests = { module: Bytes, slots: List<Option<List<Atom>>> }
 pub type Known = { defs: List<KnownDef>, tests: List<KnownTests> }
@@ -133,7 +117,6 @@ type Cx = {
   constrained_uses: List<ConstraintSite>,
   spec_kind: Option<SpecKind>,
   spec_envs: List<SpecEnv>,
-  // The `derive` that generated the definition being walked, if any.
   derived: Option<Derived>,
   known: Known,
   assumed: List<Assumed>,
@@ -195,7 +178,6 @@ fn same_deriver(a: Deriver, b: Deriver) -> Bool = deriver_tag(a) == deriver_tag(
 
 pub fn deriver_text(d: Deriver) -> Bytes = match d { DJson -> b"json", DEq -> b"eq", DOrd -> b"ord" }
 
-// The `effect set` names a row was written with, in source order.
 fn row_aliases(def: FnDef) -> List<Bytes> =
   match def.effects { Some(r) -> map(r.aliases, |q: QName| q.name.name), None -> [] }
 
@@ -221,7 +203,6 @@ fn seed_atom() -> Atom = { effect: b"sim", resource: RSingleton, mode: MRead }
 
 fn builtin_type_arities() -> List<{ name: Bytes, arity: Int }> =
   [{ name: b"Int", arity: 0 }, { name: b"Bool", arity: 0 }, { name: b"String", arity: 0 }, { name: b"Bytes", arity: 0 },
-   // ADR 0039's eight fixed-width integer types.
    { name: b"U8", arity: 0 }, { name: b"U16", arity: 0 }, { name: b"U32", arity: 0 }, { name: b"U64", arity: 0 },
    { name: b"I8", arity: 0 }, { name: b"I16", arity: 0 }, { name: b"I32", arity: 0 }, { name: b"I64", arity: 0 },
    { name: b"Float", arity: 0 }, { name: b"Decimal", arity: 0 }, { name: b"Unit", arity: 0 }, { name: b"List", arity: 1 },
@@ -315,8 +296,7 @@ fn mono_fn(params: List<Type>, ret: Type) -> Scheme = mono(t_fn(params, ret, row
 fn poly_fn(tys: List<Int>, rows: List<Int>, params: List<Type>, ret: Type, eff: Row) -> Scheme =
   { ty_vars: tys, row_vars: rows, ty: t_fn(params, ret, eff) }
 
-// `install_prelude`: the builtin signatures, on the first three type variables and the first row
-// variable — which is why `fresh` starts past them.
+// The builtin signatures use the first three type variables and the first row variable, so `fresh` starts past them.
 fn install_prelude(cx0: Cx) -> Cx = {
   let cx = install_prelude_adts(cx0);
   let a: WithVar = new_ty_var(cx);
@@ -343,14 +323,12 @@ fn install_prelude(cx0: Cx) -> Cx = {
     { name: b"fold", sc: poly_fn([a.v, b.v], [e.v], [t_list(ta), tb, t_fn([tb, ta], tb, re)], tb, re) },
     { name: b"iterate", sc: poly_fn([a.v, b.v], [e.v], [ta, t_int(), t_fn([ta], t_iter(ta, tb), re)], tb, re) },
     { name: b"range", sc: mono_fn([t_int(), t_int()], t_list(t_int())) },
-    // ADR 0039: the wrapping family is `forall a. (a, a) -> a`, with the obligation that `a` is
-    // an integer type attached at each call by `infer_app` and discharged by `settle_bit_ops`.
+    // The wrapping family is `forall a. (a, a) -> a`; `infer_app` attaches the integer obligation at each call.
     { name: b"wrap_add", sc: poly_fn([a.v], [], [ta, ta], ta, row_empty()) },
     { name: b"wrap_sub", sc: poly_fn([a.v], [], [ta, ta], ta, row_empty()) },
     { name: b"wrap_mul", sc: poly_fn([a.v], [], [ta, ta], ta, row_empty()) },
     { name: b"rotr", sc: poly_fn([a.v], [], [ta, t_int()], ta, row_empty()) },
     { name: b"rotr32", sc: mono_fn([t_int(), t_int()], t_int()) },
-    // The sixteen conversions, eight each way.
     { name: b"u8_of_int", sc: mono_fn([t_int()], con(b"U8")) },
     { name: b"u16_of_int", sc: mono_fn([t_int()], con(b"U16")) },
     { name: b"u32_of_int", sc: mono_fn([t_int()], con(b"U32")) },
@@ -448,7 +426,7 @@ fn install_prelude(cx0: Cx) -> Cx = {
 
 type ValueKey = { name: Bytes, prelude: Bool }
 
-// `global`: a bare name through this module's scope, a qualified one through the resolver.
+// A bare name through this module's scope, a qualified one through the resolver.
 fn global(cx: Cx, ns: Ns, q: QName) -> { cx: Cx, name: Option<Bytes> } =
   if is_bare(q) {
     match lookup(scope_of(cx).bound, ns, q.name.name) {
@@ -466,8 +444,7 @@ fn global(cx: Cx, ns: Ns, q: QName) -> { cx: Cx, name: Option<Bytes> } =
     }
   }
 
-// A name a generated body cannot see is the field type's missing `derive`, not a bug in the
-// user's code: `E0206` at the name, with the two notes that say so.
+// A name a generated body cannot see is the field type's missing `derive`, not the user's bug.
 fn unresolved_in_derived(cx: Cx, q: QName, what: Bytes) -> Cx = {
   let d = match cx.derived { Some(d) -> d, None -> panic("only a generated body reaches this") };
   let dv = deriver_text(d.deriver);
@@ -477,7 +454,6 @@ fn unresolved_in_derived(cx: Cx, q: QName, what: Bytes) -> Cx = {
         bytes_concat_all([b"`", qname_text(q), b"` is what `derive ", dv, b" for <that type>` generates"])])
 }
 
-// `Resolved::lookup`'s diagnostics for a qualified name that does not resolve.
 fn lookup_failure(cx: Cx, ns: Ns, q: QName) -> Cx =
   match q.module {
     None -> cx,
@@ -485,7 +461,7 @@ fn lookup_failure(cx: Cx, ns: Ns, q: QName) -> Cx =
       let scope = scope_of(cx);
       match fold(scope.modules, None, |acc: Option<Int>, mb: { binder: Bytes, target: Int, span: Span }|
                  match acc { Some(_) -> acc, None -> if mb.binder == binder.name { Some(mb.target) } else { None } }) {
-        // `unknown_module`: one note either way, plus a secondary when a selective import bound it.
+        // One note either way, plus a secondary when a selective import bound it.
         None -> {
           let selective = fold(scope.selective, None, |acc: Option<{ binder: Bytes, target: Int, span: Span }>, mb: { binder: Bytes, target: Int, span: Span }|
             match acc { Some(_) -> acc, None -> if mb.binder == binder.name { Some(mb) } else { None } });
@@ -592,7 +568,7 @@ fn ctor_name(cx: Cx, q: QName) -> { cx: Cx, name: Option<Bytes> } = {
 fn covered_ctor(cx: Cx, q: QName) -> Option<Bytes> =
   match declared_value(cx, q) { Some(n) -> Some(n), None -> prelude_ctor(cx, q) }
 
-// `exporter`: another module that declares `name` publicly in `ns`.
+// Another module that declares `name` publicly in `ns`.
 fn exporter(cx: Cx, ns: Ns, name: Bytes) -> Option<Int> =
   fold(range(0, len(cx.r.declarations)), None, |acc: Option<Int>, i: Int|
     match acc {
@@ -686,7 +662,7 @@ fn conv_types(cx: Cx, ts: List<TypeExpr>) -> { cx: Cx, ts: List<Type> } =
     { cx: o.cx, ts: push(acc.ts, o.t) }
   })
 
-// `Checker::arity_error`: `what` loses its `s` when one was expected.
+// `what` loses its `s` when one was expected.
 fn arity_error(cx: Cx, span: Span, name: Bytes, expected: Int, found: Int, what: Bytes) -> Cx = {
   let w = if expected == 1 { bytes_slice(what, 0, bytes_len(what) - 1) } else { what };
   err1(cx, b"E0202", span, bytes_concat_all([b"`", name, b"` takes ", num(expected), b" ", w, b", but ", supplied(found)]),
@@ -963,7 +939,7 @@ fn collect_ctors(cx: Cx, m: Mod) -> Cx =
       _ -> c,
     })
 
-// `check_value_namespace`: a function and a constructor of one name in one module.
+// A function and a constructor of one name in one module.
 fn check_value_namespace(cx: Cx, m: Mod) -> Cx = {
   let walked = fold(m.module.items, { cx: cx, seen: [] }, |acc: { cx: Cx, seen: List<{ name: Bytes, span: Span, is_fn: Bool }> }, it: Item| {
     let declared = match it {
@@ -1063,7 +1039,6 @@ fn discharge(cx: Cx, mark: Int, handled: List<Atom>) -> Cx = {
 fn site_for(cx: Cx, atom: Atom) -> Option<PerformSite> =
   fold(cx.performs, None, |acc: Option<PerformSite>, s: PerformSite| match acc { Some(_) -> acc, None -> if s.atom == atom { Some(s) } else { None } })
 
-// `join`: two rows combined, their tails unified.
 fn join(cx: Cx, span: Span, a: Row, b: Row) -> { cx: Cx, r: Row } =
   match a.tail {
     Some(x) ->
@@ -1082,8 +1057,7 @@ fn join(cx: Cx, span: Span, a: Row, b: Row) -> { cx: Cx, r: Row } =
     None -> { cx: cx, r: row_union(a, b) },
   }
 
-// The reference's message is `<kind>: <context>` and its primary label prints the two sides with
-// one printer; both are part of what `deduplicated` compares, so both go into `text`.
+// The message and both sides of the primary label are what dedup compares, so both go into `text`.
 fn report_unify(cx: Cx, e: UnifyError, span: Span, context: Bytes) -> Cx =
   match e {
     Mismatch(m) -> {
@@ -1139,8 +1113,7 @@ fn expect(cx: Cx, span: Span, expected: Type, found: Type, context: Bytes) -> { 
   match u.err { Some(e) -> { cx: report_unify(c, e, span, context), ok: false }, None -> { cx: c, ok: true } }
 }
 
-// A bit operand's type is routinely a variable at the node, exactly as an arithmetic operand's
-// is, so the obligation is kept and discharged in `settle_bit_ops`.
+// A bit operand's type is often still a variable here, so the obligation waits for `settle_bit_ops`.
 fn note_bits(cx: Cx, span: Span, found: Type, what: Bytes) -> Cx =
   {..cx, bit_ops: push(cx.bit_ops, { span: span, what: what, ty: found })}
 
@@ -1316,8 +1289,7 @@ fn infer_var(cx: Cx, q: QName) -> Inferred = {
   }
 }
 
-// ADR 0039: `Int` and the eight widths are the integer types, and the bit operators are defined
-// at all nine and at nothing else.
+// `Int` and the eight widths are the integer types; the bit operators are defined at those nine only.
 fn is_int_name(n: Bytes) -> Bool =
   n == b"Int" || n == b"U8" || n == b"U16" || n == b"U32" || n == b"U64"
   || n == b"I8" || n == b"I16" || n == b"I32" || n == b"I64"
@@ -1336,8 +1308,7 @@ fn infer_binary(cx: Cx, span: Span, op: Bytes, lhs: Expr, rhs: Expr) -> Inferred
     let noted: Cx = if x.ok { {..x.cx, numerics: push(x.cx.numerics, { span: span, op: op, ty: l.ty })} } else { x.cx };
     { cx: noted, ty: if is_arithmetic(op) { l.ty } else { t_bool() }, row: j.r }
   } else if is_bits(op) {
-    // The answer has the operands' type, and a shift is not symmetric: its right operand is a
-    // *count*, which is an `Int` whatever the word is.
+    // A shift's right operand is a count: an `Int` whatever the word is.
     let shifting = op == b"shl" || op == b"shr" || op == b"ushr";
     let c1: Cx = note_bits(c, expr_span(lhs), l.ty, bytes_concat_all([b"the left operand of `", bits_text(op), b"`"]));
     let c2: Cx =
@@ -1390,8 +1361,7 @@ fn infer_app(cx: Cx, span: Span, func: Expr, args: List<Expr>) -> Inferred =
     _ -> infer_app_general(cx, span, func, args),
   }
 
-// The prelude names whose first parameter must be an integer type, checked at each call because
-// nothing in a scheme can say "an integer".
+// Builtins whose first parameter must be an integer type, checked per call: a scheme cannot say "an integer".
 fn int_builtin_name(func: Expr) -> Bytes =
   match func {
     EVar(v) -> if is_bare(v.name) { v.name.name.name } else { b"" },
@@ -1420,9 +1390,7 @@ fn infer_app_general(cx: Cx, span: Span, func: Expr, args: List<Expr>) -> Inferr
         { cx: j.cx, ty: fn_.ret, row: j.r }
       } else {
         let checked: Cx = fold(range(0, len(args)), c, |cc: Cx, i: Int| expect(cc, expr_span(at(args, i)), at(fn_.params, i), at(as_.tys, i), b"argument type").cx);
-        // `wrap_add` and its siblings are `forall a.`, which alone would take two `String`s; the
-        // obligation that `a` is an integer type goes on the instantiated variable here, at the
-        // call, and is discharged with every other one (ADR 0039).
+        // `forall a.` alone would admit two `String`s, so the integer obligation goes on the instantiated variable here.
         let obliged: Cx =
           if is_int_builtin(func) && len(fn_.params) > 0 {
             note_bits(checked, span, at(fn_.params, 0), bytes_concat_all([b"`", int_builtin_name(func), b"`"]))
@@ -1645,7 +1613,6 @@ fn check_exhaustive(cx: Cx, span: Span, scrutinee: Type, arms: List<MatchArm>) -
   }
 }
 
-// `missing_list_lengths`: the lengths the arms leave uncovered, named as the reference names them.
 fn missing_list_lengths(arms: List<MatchArm>) -> List<Bytes> = {
   let shapes = fold(arms, { exact: [], rest_from: 0 - 1 }, |acc: { exact: List<Int>, rest_from: Int }, a: MatchArm|
     match a.pat {
@@ -1694,7 +1661,7 @@ fn resolve_op(cx: Cx, eff: QName, op: Ident) -> { cx: Cx, hit: Option<{ info: Ef
   }
 }
 
-// `as_written`: the effect as this module can write it, for a suggestion that has to parse.
+// The effect as this module can write it, so a suggestion parses.
 fn as_written(cx: Cx, eff: Bytes) -> Bytes = {
   let scope = scope_of(cx);
   match fold(scope.bound.effects, None, |acc: Option<Bytes>, b: Binding| match acc { Some(_) -> acc, None -> if b.qualified == eff { Some(b.name) } else { None } }) {
@@ -1912,8 +1879,7 @@ fn note_spawn(cx: Cx, info: EffectInfo, op: OpInfo, args: List<Expr>, tys: List<
       if r.simulate_depth < cx.simulate_depth || r.with_cell { r } else { {..r, spawns: append(r.spawns, sites_of(args, tys))} })}
   }
 
-// Every argument of a user-declared operation, against every open region: its handler can be
-// installed anywhere.
+// Every argument of a user-declared operation, against every open region: its handler can be installed anywhere.
 fn note_handoff(cx: Cx, info: EffectInfo, op: OpInfo, args: List<Expr>, tys: List<Type>) -> Cx =
   if info.name == b"task" || len(cx.open_regions) == 0 { cx } else {
     let name = bytes_concat_all([info.simple_name, b".", op.name]);
@@ -1921,8 +1887,7 @@ fn note_handoff(cx: Cx, info: EffectInfo, op: OpInfo, args: List<Expr>, tys: Lis
     {..cx, open_regions: map(cx.open_regions, |r: OpenRegion| {..r, handoffs: append(r.handoffs, sites)})}
   }
 
-// The bindings a region could store into: what is in scope when it opens, paired with where its
-// body first names each.
+// What is in scope when a region opens, paired with where its body first names each.
 fn outer_bindings(cx: Cx, body: Expr) -> List<OuterBinding> = {
   let kept = fold(env_locals(cx.env), [], |acc: List<{ name: Bytes, ty: Type }>, l: { name: Bytes, sc: Scheme }| {
     let fv = free_vars(cx.subst, l.sc.ty, { tys: [], rows: [] });
@@ -1943,7 +1908,6 @@ fn outer_bindings(cx: Cx, body: Expr) -> List<OuterBinding> = {
   }
 }
 
-// Every position a region's value leaves through.
 fn region_exits(e: Expr, out: List<Span>) -> List<Span> =
   match e {
     EBlock(b) -> match b.tail { Some(t) -> region_exits(t, out), None -> out },
@@ -2057,7 +2021,7 @@ fn collect_refs(e: Expr, out: Refs) -> Refs =
     ESimulate(s) -> collect_refs(s.body, out),
   }
 
-// Tarjan's components, ported edge for edge so the components come out in the reference's order.
+// Tarjan's components; the goldens fix the order they come out in.
 type Tarjan = { index: List<Int>, low: List<Int>, on_stack: List<Bool>, stack: List<Int>,
                 call: List<{ v: Int, edge: Int }>, out: List<List<Int>>, next: Int }
 
@@ -2159,8 +2123,7 @@ fn adopt(cx: Cx, sc: Scheme) -> { cx: Cx, sc: Scheme } =
     { cx: rows.cx, sc: { ty_vars: tys.vs, row_vars: rows.vs, ty: rename_scheme(sc, tys.vs, rows.vs) } }
   }
 
-// A restored scheme came back with quantified variables of its own; unifying it with the
-// signature just built says which of them each constrained parameter is.
+// Unifying a restored scheme with the fresh signature says which of its variables each constrained parameter is.
 fn recovered_constraints(cx: Cx, def: FnDef, sig: Sig, args: List<Type>) -> List<DefConstraint> = {
   let found = fold(def.constraints, [], |acc: List<DefConstraint>, c: Constraint|
     match map_get(sig.ty_params, c.param.name) {
@@ -2174,9 +2137,7 @@ fn recovered_constraints(cx: Cx, def: FnDef, sig: Sig, args: List<Type>) -> List
   dedup_constraints(fold(found, [], |acc: List<DefConstraint>, c: DefConstraint| insert_constraint(acc, c)))
 }
 
-// A mutually recursive group published straight from the interfaces the caller supplied,
-// without walking a single body. A spec is erased from a definition's hash, so a clause is
-// still typed against the restored interface.
+// A recursive group published from the supplied interfaces without walking a body; specs are not hashed, so clauses are still typed.
 fn publish_known(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>, qualified: List<Bytes>) -> Cx =
   fold(range(0, len(comp)), cx, |c: Cx, slot: Int| {
     let def = at(fns, at(comp, slot));
@@ -2357,8 +2318,7 @@ fn numeric_mismatch(cx: Cx, entry: Numeric, ty: Type, what: Bytes) -> Cx =
   err1(cx, b"E0201", entry.span, bytes_concat_all([b"`", op_text(entry.op), b"` is not defined on `", type_text(ty), b"`"]),
        bytes_concat(what, b" here"), [b"the numeric types are `Int`, the eight fixed-width integers, `Float` and `Decimal`"])
 
-// `writable`: the resolved type, rendered, when every variable left in it is one the signature's
-// generic list binds — so the author can paste it.
+// The resolved type, rendered, when the signature's generics bind every variable in it, so the author can paste it.
 fn writable(cx: Cx, sig: Sig, t: Type) -> Option<Bytes> = {
   let resolved = resolve(cx, t);
   let bound = map_fold(sig.ty_params, [], |acc: List<Int>, k: Bytes, p: Type| match resolve(cx, p) { TyVar(v) -> push(acc, v), _ -> acc });
@@ -2413,8 +2373,7 @@ fn close_unreachable_row(cx: Cx, sig: Sig) -> Cx =
 
 // --- Tests and laws --------------------------------------------------------------------------------
 
-// A cached footprint carries the determinism verdict with it: an effect's `nondet` marker is
-// part of its declaration's hash.
+// A cached footprint carries the determinism verdict: an effect's `nondet` marker is part of its declaration's hash.
 fn check_tests(cx: Cx, m: Mod) -> Cx = {
   let walked = fold(m.module.items, { cx: cx, position: 0 }, |acc: { cx: Cx, position: Int }, it: Item|
     match it {
@@ -2462,7 +2421,7 @@ fn check_determinism(cx: Cx, def: TestDef, footprint: List<Atom>) -> Cx =
         },
     })
 
-// `example_clause`: a clause the reader could paste, for the operation the atom names.
+// A clause the reader could paste, for the operation the atom names.
 fn example_clause(cx: Cx, info: EffectInfo, atom: Atom) -> Bytes = {
   let written = as_written(cx, info.name);
   let named = match atom.resource { RNamed(_) -> true, RSingleton -> false };
@@ -2541,8 +2500,7 @@ fn check_law(cx0: Cx, m: Mod, def: LawDef) -> Cx = {
                               host: def.host, footprint: row.atoms, at: here(popped, def.span) })}
 }
 
-// A binder's type has to be one the generator can inhabit: a handler is syntax, a written row
-// would perform or quantify over rows, and a `Cell`, `Task` or `Secret` has no generator.
+// A binder's type must be one the generator can inhabit: no handler, written row, `Cell`, `Task` or `Secret`.
 fn law_binder(cx: Cx, b: Binder) -> { cx: Cx, t: Type } =
   match handler_mention(cx, b.ty) {
     Some(span) -> new_ty(err1(cx, b"E0418", span, b"`forall` cannot quantify over a handler", b"a handler is syntax, not a value",
@@ -2563,7 +2521,7 @@ fn unquantifiable(cx: Cx, b: Binder, reason: Bytes) -> Cx =
   err1(cx, b"E0418", ty_span(b.ty), bytes_concat_all([b"`forall` cannot quantify over `", b.name.name, b"`"]), reason,
        [b"a law over a type nothing can produce is a claim nothing can ever check, so it is refused here rather than reported as a gap at discharge time"])
 
-// `Row`'s `Display`: the raw variable, not the printer's letter.
+// The raw variable, not the printer's letter.
 fn row_display(r: Row) -> Bytes = {
   let atoms = join_with(map(r.atoms, atom_text), b", ");
   match r.tail {
@@ -2650,7 +2608,7 @@ fn site_phrase(s: SpecSite) -> Bytes =
 fn site_short(s: SpecSite) -> Bytes =
   match s { SSRequires -> b"`requires`", SSEnsures -> b"`ensures`", SSWhere -> b"`where` guard", SSLawBody -> b"law body" }
 
-// `check_spec_purity`: every atom past the allowed set is `E0417`, and an open row too.
+// Every atom past the allowed set is `E0417`, and an open row too.
 fn check_spec_purity(cx: Cx, site: SpecSite, allowed: List<Atom>, at_: Span, row: Row) -> Cx = {
   let law_body = match site { SSLawBody -> true, _ -> false };
   let c1: Cx = fold(atoms_difference(row.atoms, allowed), cx, |c: Cx, atom: Atom| {
@@ -2676,9 +2634,7 @@ fn check_spec_purity(cx: Cx, site: SpecSite, allowed: List<Atom>, at_: Span, row
 }
 
 // --- Spec clauses ------------------------------------------------------------------------------
-//
-// Typed after every definition in the module is published: a clause may name anything the
-// module can reach.
+// Typed after the whole module is published: a clause may name anything the module can reach.
 
 fn record_spec_env(cx: Cx, def: FnDef, name: Bytes, sig: Sig) -> Cx =
   if len(def.spec) == 0 { cx } else {
@@ -2746,9 +2702,7 @@ fn check_result_shadow(cx: Cx, def: FnDef) -> Cx =
   }
 
 // --- Derivability ------------------------------------------------------------------------------
-//
-// `derivable.rs`, over `derive.ply`'s `con_shape`: the one predicate a `where` clause, a
-// `Map` key type and a `derive` ask.
+// The one predicate a `where` clause, a `Map` key type and a `derive` ask.
 
 type Blocked = { ty: Type, why: Why }
 type AdtShape = { name: Bytes, params: List<Int>, fields: List<Type> }
@@ -2806,7 +2760,6 @@ fn derivable(d: Deriver, ty: Type, adts: List<AdtShape>, assumed: List<Int>, vis
 // A flexible variable is a type argument nothing pinned rather than one that is wrong.
 fn skipped_flexible(cx: Cx, b: Blocked) -> Bool = match b.why { WUnconstrained(v) -> !is_rigid_ty(cx.subst, v), _ -> false }
 
-// `secret_notes`: the refusal's reason and its advice.
 fn secret_notes(d: Deriver) -> List<Bytes> =
   match refusal_note(WSecret, d) { Some(n) -> [secret_reason(d), n], None -> [secret_reason(d)] }
 
@@ -2939,8 +2892,7 @@ fn check_constraints(cx: Cx) -> Cx = {
 fn expanded_here(m: Mod, def: DeriveDef) -> Bool =
   fold(m.derived, false, |acc: Bool, d: Derived| acc || (same_deriver(d.deriver, def.deriver) && d.target == def.target.name))
 
-// The `derive` target as a solved type, for a target with no parameters; an alias is expanded
-// with whatever it reports discarded, since its own declaration reported it already.
+// The target as a solved type when it has no parameters; an alias's reports are dropped, already made at its declaration.
 fn derive_target(cx: Cx, m: Mod, target: Bytes) -> Option<WithTy> = {
   let qualified = qualify(m.name, target);
   match map_get(cx.types, qualified) {
@@ -2970,7 +2922,7 @@ fn why_notes_for_derive(w: Why, d: Deriver, b: Blocked, blocker: Bytes) -> List<
     WUnconstrained(_) -> [],
   }
 
-// `derivable(D, T)` over each `derive`'s target as a **solved** type.
+// `derivable(D, T)` over each `derive`'s target as a solved type.
 fn check_derives(cx: Cx) -> Cx = {
   let adts = adt_shapes(cx);
   fold(range(0, len(cx.mods)), cx, |c: Cx, i: Int| {
@@ -3182,10 +3134,7 @@ fn check_region_handoffs(cx: Cx, site: RegionSite) -> Cx =
 // --- Internal effects ---------------------------------------------------------------------------------
 
 fn mark_internal_effects(cx: Cx) -> Cx = {
-  // The list and its index are built in one pass. Every use of this list was a scan: the
-  // membership test that grew it, and `position_bytes` below, once per definition and again per
-  // call edge. Over a list holding every qualified name in the program that is quadratic before
-  // anything reads it.
+  // The list and its index are built in one pass; scanning the list per definition and per call edge is quadratic.
   let indexed = fold(range(0, len(cx.mods)), { names: [], index: map_new() },
     |acc: { names: List<Bytes>, index: Map<Bytes, Int> }, mi: Int|
       fold(at(cx.mods, mi).module.items, acc,
@@ -3258,15 +3207,13 @@ type Checked = { cx: Cx, ok: Bool }
 
 pub fn check_program(r: Resolved, mods: List<Mod>) -> Checked = check_program_with(r, mods, no_known())
 
-// The driver's `Err`: every diagnostic, deduplicated, when any is an error — a warning alone is
-// not one, and `CheckOutput` carries none.
+// Every diagnostic, deduplicated, when any is an error; a warning alone is not one.
 pub fn check_diagnostics(r: Resolved, mods: List<Mod>) -> List<Diag> = {
   let out = check_program(r, mods);
   if fold(out.cx.diags, false, |b: Bool, d: Diag| b || d.severity == b"error") { dedup_diags(out.cx.diags) } else { [] }
 }
 
-// What `check_program` publishes, for `front.ply`: the tables `CheckOutput` holds, prelude
-// entries included as the reference includes them, or the driver's `Err` when any is an error.
+// What `check_program` publishes, prelude entries included, or the diagnostics when any is an error.
 pub type Front = { ok: Bool, diags: List<Diag>, defs: List<DefInfo>, tests: List<TestInfo>, laws: List<LawInfo>,
                    effects: List<EffectInfo>, ctors: List<CtorInfo> }
 
@@ -3277,9 +3224,7 @@ pub fn check_front(r: Resolved, mods: List<Mod>) -> Front = {
     defs: out.cx.defs, tests: out.cx.tests, laws: out.cx.laws, effects: out.cx.effects, ctors: out.cx.ctors }
 }
 
-// The program-wide names of the definitions the checker publishes as pure -- an empty footprint
-// and no constraint -- or nothing when the program does not check. What the emitter's constant
-// table wants: `memo::pure_by_published_row`, asked once for the whole program.
+// Definitions published as pure (empty footprint, no constraint), for the emitter's constant table; `None` if the program fails.
 pub fn pure_definitions(r: Resolved, mods: List<Mod>) -> Option<List<Bytes>> = {
   let out = check_program(r, mods);
   if !out.ok { None } else {
@@ -3339,15 +3284,13 @@ fn dump_checked(c: Cx) -> Bytes =
       bytes_concat_all([b"C;", k.name, b";", k.type_name, b";", n(k.index), b";", n(k.arity), b";", scheme_text(k.scheme), b";"]))),
   ])
 
-// `deduplicated`: diagnostics that would render alike are one; here, alike is the same code,
-// labels and note count.
+// Diagnostics that would render alike are one: the same code, labels and note count.
 fn dedup_diags(ds: List<Diag>) -> List<Diag> =
   fold(ds, [], |acc: List<Diag>, d: Diag| if fold(acc, false, |b: Bool, x: Diag| b || x == d) { acc } else { push(acc, d) })
 
 type Parsed = { name: Bytes, module: Module, derived: List<Derived>, diags: List<Diag> }
 
-// The driver's order: parse with the rewrites, expand every `derive`, resolve, check. An
-// expansion that reports stops the pipeline there, as `check_module` stops.
+// The driver's order: parse with the rewrites, expand every `derive`, resolve, check. A reporting expansion stops there.
 pub fn check_dump(sources: List<Source>) -> String = {
   let parsed = map(range(0, len(sources)), |i: Int| {
     let s = at(sources, i);
@@ -3371,12 +3314,10 @@ pub fn check_dump(sources: List<Source>) -> String = {
 fn dump_outcome(out: Checked) -> Bytes =
   if out.ok { dump_checked(out.cx) } else { bytes_concat(b"X;", dump_diags(dedup_diags(out.cx.diags))) }
 
-// What a checked program publishes, as the interfaces a second check of it would be handed:
-// every definition's, and every test's footprint in its module's slot.
+// What a checked program publishes, as the interfaces a second check of it would be handed.
 fn known_of(cx: Cx) -> Known = {
   let defs = map(cx.defs, |d: DefInfo| { name: d.name, scheme: d.scheme, footprint: d.footprint, performed: d.performed });
-  // `tests` is the modules in load order and source order within each, so the slots are a
-  // walk over the modules that takes the next entry for every `test` item.
+  // Tests are in load order, then source order, so each `test` item takes the next entry.
   let walked = fold(cx.mods, { next: 0, tests: [] }, |acc: { next: Int, tests: List<KnownTests> }, m: Mod| {
     let slots = fold(m.module.items, { next: acc.next, slots: [] }, |a: { next: Int, slots: List<Option<List<Atom>>> }, it: Item|
       match it { ITest(_) -> { next: a.next + 1, slots: push(a.slots, Some(at(cx.tests, a.next).footprint)) }, _ -> a });
@@ -3385,8 +3326,7 @@ fn known_of(cx: Cx) -> Known = {
   { defs: defs, tests: walked.tests }
 }
 
-// The same program checked twice, the second time from what the first published — the
-// driver's restored path, over the whole program rather than the skipped part of it.
+// The program checked twice, the second time from what the first published.
 pub fn check_dump_known(sources: List<Source>) -> String = {
   let parsed = map(range(0, len(sources)), |i: Int| {
     let s = at(sources, i);
@@ -3411,9 +3351,6 @@ pub fn check_dump_known(sources: List<Source>) -> String = {
 }
 
 // --- Tests ------------------------------------------------------------------
-//
-// The differential (`harness/tests/infer.rs`) is the instrument; these pin the
-// port's own shape on programs small enough to read.
 
 test "a definition's scheme is generalized and its footprint inferred" {
   let dump = check_dump([{ name: b"m", src: b"pub fn id<a>(x: a) -> a = x\nfn two() -> Int = id(2)\neffect log { write emit(Bytes) -> Unit }\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)" }]);
