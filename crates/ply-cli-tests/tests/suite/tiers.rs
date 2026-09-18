@@ -1,5 +1,3 @@
-//! What a tier label claims, checked against what actually happened.
-
 use ply_cli::engine::Prover;
 use ply_cli::load::load;
 use ply_cli::obligations;
@@ -93,8 +91,6 @@ impl Run {
     }
 }
 
-/// The corpora every audit below runs over: the examples a reader is meant to learn from, and the
-/// fixtures written to be wrong on purpose.
 fn corpus() -> Vec<PathBuf> {
     let mut paths = vec![repo("examples")];
     for fixture in [
@@ -108,10 +104,6 @@ fn corpus() -> Vec<PathBuf> {
     paths
 }
 
-// --- The two audits ---------------------------------------------------------
-
-/// Every rule a certificate names is a fragment rule, every certificate established its guard, and
-/// no unfolding went past the declared depth.
 #[test]
 fn the_certificate_audit() {
     let plan = ProvePlan::default();
@@ -171,8 +163,6 @@ fn the_certificate_audit() {
     assert!(proofs >= 10, "the corpus produced only {proofs} proofs");
 }
 
-/// The audit that would catch a lying prover: every obligation the corpus reports `proved` is
-/// re-run at the sampled tier, at 1,000 cases across 8 roots.
 #[test]
 fn the_differential_tier_audit() {
     let wide = ProvePlan {
@@ -198,9 +188,7 @@ fn the_differential_tier_audit() {
                 continue;
             }
             audited += 1;
-            // A vacuity is not a defect: it is a claim about the *sample*, not about the proof,
-            // because a guard the prover showed valid can still reject every drawn tuple and the
-            // proved path establishes its own guard.
+            // A vacuity is about the sample, not the proof: a valid guard can still reject every drawn tuple.
             if let Some(defect) = disagreement(&prover.resample(obligation, &wide)) {
                 panic!(
                     "`{}` is reported `proved` and a sampled run {defect} — a defect in Ply",
@@ -212,10 +200,6 @@ fn the_differential_tier_audit() {
     assert!(audited >= 10, "only {audited} proofs were audited");
 }
 
-// --- What each rule is for --------------------------------------------------
-
-/// `forall (b: Bool) { b || !b }` is decided by covering its domain, for two evaluations rather
-/// than two hundred draws.
 #[test]
 fn a_finite_domain_is_proved_by_covering_it() {
     let dir = project(
@@ -238,8 +222,6 @@ law "excluded middle"
     );
 }
 
-/// A ground claim is the degenerate finite domain: one point, and evaluating it is a decision
-/// procedure for it.
 #[test]
 fn a_ground_law_is_proved_rather_than_exemplified() {
     let dir = project(
@@ -260,8 +242,7 @@ law "the stock is three deep" {
     );
 }
 
-/// A recursive definition is never unfolded, because stopping the unfolding at a general statement
-/// is what induction is for and there is none here.
+/// Stopping the unfolding at a general statement is what induction is for, and there is none here.
 #[test]
 fn a_recursive_definition_is_never_unfolded() {
     let dir = project(
@@ -288,9 +269,6 @@ law "reverse is an involution"
     );
 }
 
-/// A new primitive that no generator reaches would make every `Bytes`-typed law `E0418` — an M8
-/// guarantee quietly regressing on contact with W1, which is the class of thing this project audits
-/// for.
 #[test]
 fn a_law_over_bytes_is_quantifiable_and_shrinks_toward_the_empty_value() {
     let dir = project(
@@ -323,8 +301,6 @@ law "every byte string is empty"
     );
 }
 
-/// `/` and `%` are outside the fragment entirely, so `x / 2 * 2 == x` — which is false — is not
-/// proved.
 #[test]
 fn a_term_outside_the_fragment_is_never_proved() {
     let dir = project(
@@ -347,8 +323,6 @@ law "halving and doubling cancel"
     ));
 }
 
-/// An equality that holds for an arbitrary `f` holds for every actual `f`, so this is a genuinely
-/// universal proof over an uninterpreted symbol.
 #[test]
 fn an_uninterpreted_function_closes_under_congruence() {
     let dir = project(
@@ -371,8 +345,6 @@ law "a pure function is a function"
     );
 }
 
-/// The prover treats a type variable as an uninterpreted sort, so a proved polymorphic law is
-/// genuinely polymorphic and the certificate says which variables stayed uninterpreted.
 #[test]
 fn a_proved_polymorphic_law_records_its_sorts() {
     let dir = project(
@@ -393,8 +365,6 @@ law "identity is identity"
     );
 }
 
-/// A spent budget is inconclusive, and inconclusive reports `property` — never `proved`, and never
-/// `refuted`.
 #[test]
 fn a_spent_budget_reports_the_weaker_tier() {
     const LAW: &str = r#"
@@ -432,9 +402,6 @@ law "one is below, equal to, or above the other"
     );
 }
 
-// --- The outcomes that are not tiers ----------------------------------------
-
-/// A guard the prover shows unsatisfiable is `Vacuous` — never `proved`.
 #[test]
 fn an_unsatisfiable_guard_is_vacuous_rather_than_proved() {
     let run = Run::of(&repo("tests/fixtures/vacuous_law.ply"));
@@ -451,8 +418,7 @@ fn an_unsatisfiable_guard_is_vacuous_rather_than_proved() {
     }
 }
 
-/// Checking an `ensures` means calling the definition, and a definition that performs needs a
-/// handler nothing supplies.
+/// Checking an `ensures` means calling the definition, and one that performs needs a handler nothing supplies.
 #[test]
 fn an_effectful_definition_is_a_gap_rather_than_a_claim() {
     let run = Run::of(&repo("tests/fixtures/obligation_not_discharged.ply"));
@@ -478,10 +444,7 @@ fn an_evaluation_that_raises_is_a_gap_rather_than_a_refutation() {
     );
 }
 
-// --- Concurrency laws -------------------------------------------------------
-
-/// Condition 5 of a concurrency law, which is the one an implementer drops: an exhaustive interleaving
-/// search over *sampled values* proves something about those values and nothing about the law.
+/// An exhaustive interleaving search over sampled values proves nothing about the law.
 #[test]
 fn a_concurrency_law_over_a_binder_is_property_however_exhaustive_the_search() {
     let run = Run::of(&repo("tests/fixtures/concurrency_law_binder.ply"));
@@ -494,8 +457,6 @@ fn a_concurrency_law_over_a_binder_is_property_however_exhaustive_the_search() {
     );
 }
 
-/// The same shape without a binder: the value domain is one point and the interleaving search
-/// emptied its frontier, so both coverage claims hold and the law is proved by execution.
 #[test]
 fn a_ground_concurrency_law_whose_search_is_exhaustive_is_proved() {
     let run = Run::of(&repo("examples"));
@@ -514,9 +475,7 @@ fn a_ground_concurrency_law_whose_search_is_exhaustive_is_proved() {
     );
 }
 
-/// Under `--sim once` there is no exhaustiveness to claim, whatever the exploration reports — and
-/// one interleaving is not a coverage claim either, so the honest label is the weaker of the two
-/// sampled tiers rather than `property`.
+/// One interleaving is not a coverage claim either, so the label is the weaker sampled tier, not `property`.
 #[test]
 fn a_single_interleaving_never_proves_a_concurrency_law() {
     let plan = ProvePlan {
@@ -531,9 +490,6 @@ fn a_single_interleaving_never_proves_a_concurrency_law() {
     );
 }
 
-// --- Determinism ------------------------------------------------------------
-
-/// Two runs over one program agree on every tier, every certificate and every counterexample.
 #[test]
 fn two_runs_over_one_corpus_agree() {
     for path in corpus() {
@@ -549,8 +505,6 @@ fn two_runs_over_one_corpus_agree() {
     }
 }
 
-/// A refutation names the input and says how far the search got, and both halves are byte-identical
-/// across runs.
 #[test]
 fn a_refutation_shrinks_to_the_same_value_twice() {
     let run = Run::of(&repo("tests/fixtures/refuted_law.ply"));
@@ -580,8 +534,7 @@ fn a_refutation_shrinks_to_the_same_value_twice() {
     assert_eq!(first.shrinks, second.shrinks);
 }
 
-/// The fixture above reports zero shrink steps: its first falsifying draw is already `[-1, -1]`, so
-/// nothing there says the walk reduces anything.
+/// The fixture above takes zero shrink steps: its first falsifying draw is already `[-1, -1]`.
 #[test]
 fn a_long_counterexample_is_visibly_reduced() {
     let dir = project(
@@ -615,10 +568,6 @@ law "a batch never holds more than six entries"
     );
 }
 
-// --- Coverage ---------------------------------------------------------------
-
-/// A definition carrying only `requires` makes no claim about behaviour, so it is not covered and a
-/// reader still has to read it.
 #[test]
 fn a_precondition_alone_is_not_an_obligation() {
     let dir = project(
@@ -635,8 +584,6 @@ fn withdraw(balance: Int, amount: Int) -> Int
     );
 }
 
-/// Each `ensures` is its own obligation at its own tier: a definition whose first postcondition is
-/// proved and whose second is sampled is told both.
 #[test]
 fn each_postcondition_is_discharged_at_its_own_tier() {
     let run = Run::of(&repo("examples/ledger.ply"));
@@ -682,9 +629,6 @@ fn disagreement(discharge: &Discharge) -> Option<String> {
     }
 }
 
-/// The tier cost of a **raising** accessor, which is the argument the total
-/// `list_at` rests on — and which was briefly struck as wrong before an
-/// adversarial review restored it.
 #[test]
 fn a_total_index_reaches_property_where_a_raising_one_is_a_gap() {
     let dir = project(

@@ -1,7 +1,3 @@
-//! An adversarial audit of the incremental front end, written against the equivalence property: for
-//! any source tree, in any state reachable by a sequence of edits, `load_incremental` must agree
-//! with `load_full` on every `DefHash`, `Scheme`, `Footprint`, constructor and effect signature.
-
 use assert_cmd::Command;
 use ply_cli::driver;
 use ply_cli::load::{LoadError, Loaded};
@@ -11,8 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// `{:?}` rather than a printed signature: printing renames variables per item, which would hide
-/// the numbering divergence canonicalization exists to prevent.
+/// `{:?}`, not a printed signature: printing renames variables per item and would hide a numbering divergence.
 fn snapshot(loaded: &Loaded) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for (name, hash) in &loaded.hashes.defs {
@@ -169,8 +164,7 @@ fn performer(module: &str) -> String {
     )
 }
 
-/// Normalization ranks every effect among the program's structurally identical ones and writes that
-/// rank into every performer's hash.
+/// Normalization writes an effect's rank among its structurally identical twins into every performer's hash.
 #[test]
 fn adding_an_identically_declared_effect_reranks_a_skipped_performer() {
     let dir = tempfile::tempdir().unwrap();
@@ -215,9 +209,7 @@ fn deleting_an_effect_declaring_module_reranks_the_survivor() {
     agree(dir.path(), "the module that ranked first was deleted");
 }
 
-/// Normalization sorts an effect's operations before hashing, so reordering them in source is a
-/// no-op for the `DefHash` — and the signature the run publishes for each operation must still be
-/// that operation's own rather than its neighbour's.
+/// Operations are sorted before hashing, so reordering is a `DefHash` no-op, but each signature must stay on its own operation.
 #[test]
 fn reordering_an_effects_operations_keeps_every_signature_on_its_operation() {
     let dir = tempfile::tempdir().unwrap();
@@ -263,8 +255,7 @@ fn reordering_a_types_variants_changes_its_hash_and_so_costs_a_recheck() {
     assert_ne!(after.hashes.decls[&Symbol::new("m.T")], before);
 }
 
-/// A test's hash covers its body and its `nondet` marker, never its label, so relabelling one
-/// changes no hash — and the label the run reports must still be the one in the source.
+/// A test's hash covers its body and `nondet` marker, never its label, yet the reported label must be the source's.
 #[test]
 fn renaming_a_test_label_is_reported_by_a_from_scratch_check() {
     let dir = tempfile::tempdir().unwrap();
@@ -284,9 +275,7 @@ fn renaming_a_test_label_is_reported_by_a_from_scratch_check() {
     agree(dir.path(), "and the run after that, in case it self-heals");
 }
 
-/// `pub` is erased by normalization, so making a name private changes no hash and the importer's
-/// own bytes did not change either: the error has to come from checking the program, because no
-/// hash could show it.
+/// `pub` is erased by normalization, so no hash can show this: the error has to come from checking.
 #[test]
 fn removing_pub_from_an_imported_name_is_still_an_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -368,8 +357,7 @@ fn moving_a_definition_between_modules_and_back_changes_no_hash() {
     );
 }
 
-/// Renaming a module means moving its file, which changes the fingerprint's key as well as every
-/// program-wide name derived from it.
+/// Moving the file changes the fingerprint's key as well as every program-wide name derived from it.
 #[test]
 fn renaming_a_module_and_renaming_it_back_changes_no_hash() {
     let dir = corpus();
@@ -416,7 +404,6 @@ fn rewriting_a_file_with_identical_bytes_invalidates_nothing() {
     );
 }
 
-/// A comment moves the bytes and no hash.
 #[test]
 fn a_comment_moves_no_hash_anywhere() {
     let dir = corpus();
@@ -468,8 +455,7 @@ fn switching_between_a_module_import_and_a_selective_one_agrees() {
     agree(dir.path(), "back to a module import");
 }
 
-/// A type renamed two modules away reaches nothing but the resolution witness: no hash moves, and
-/// the scheme of every definition that transitively mentions it is written in the old name.
+/// Nothing but the resolution witness moves: every scheme mentioning the type is written in the old name.
 #[test]
 fn renaming_a_type_two_modules_away_agrees() {
     let dir = tempfile::tempdir().unwrap();
@@ -483,12 +469,7 @@ fn renaming_a_type_two_modules_away_agrees() {
         "b.ply",
         "import a\npub fn get() -> a::T = a::mk()\n",
     );
-    // `top` depends on `b::get` without *republishing* its type. Since
-    // `MISSING_SIGNATURE` a written return type here would name `a::T`, and the
-    // rename below would then have to touch `c.ply` too — which is the one
-    // thing this test exists to show is unnecessary. That is a real cost of
-    // written signatures and it is stated rather than hidden: a module that
-    // passes a value through now names its type, unless it consumes it.
+    // `top` does not republish `b::get`'s type, so the rename need not touch `c.ply`.
     write(
         dir.path(),
         "c.ply",
@@ -562,9 +543,7 @@ fn a_cache_mangled_mid_session_degrades_to_the_full_path_and_recovers() {
     );
     agree(dir.path(), "edited");
 
-    // Mangled in the payload region rather than replaced wholesale: a header this build still
-    // recognizes over entries it cannot decode is the shape a half-written append leaves, and it is
-    // the one a length prefix and a checksum have to catch per entry.
+    // Mangled in the payload rather than replaced: a valid header over undecodable entries is what a half-written append leaves.
     let data = dir.path().join(".ply-cache/frontend.dat");
     let mut bytes = fs::read(&data).unwrap();
     for byte in bytes.iter_mut().skip(64) {
@@ -575,23 +554,19 @@ fn a_cache_mangled_mid_session_degrades_to_the_full_path_and_recovers() {
     agree(dir.path(), "and the run after that");
 }
 
-/// Fingerprints that survive an interface map emptied under them are the shape a half-finished
-/// garbage collection would leave.
+/// The shape a half-finished garbage collection would leave.
 #[test]
 fn fingerprints_without_their_interfaces_are_refused_rather_than_believed() {
     let dir = corpus();
     agree(dir.path(), "cold");
 
-    // The index still names every fingerprint and every interface; the file the offsets point into
-    // is gone.
+    // The index still names every fingerprint and interface; the file its offsets point into is gone.
     fs::remove_file(dir.path().join(".ply-cache/frontend.dat")).unwrap();
 
     agree(dir.path(), "fingerprints with no interfaces behind them");
     agree(dir.path(), "and the run after that");
 }
 
-/// A run that saw one file must not prune, and the fingerprint it writes must not mislead the
-/// whole-project run that follows.
 #[test]
 fn a_single_file_run_does_not_spoil_the_whole_project_run_after_it() {
     let dir = corpus();
@@ -640,8 +615,6 @@ fn a_nested_module_and_a_flat_one_sharing_a_prefix_agree() {
     agree(dir.path(), "the nested module changed");
 }
 
-/// A file with nothing in it has no definitions to cache and no fingerprint worth much, and it may
-/// appear and disappear between runs.
 #[test]
 fn an_empty_file_appearing_and_disappearing_agrees() {
     let dir = corpus();
@@ -654,8 +627,7 @@ fn an_empty_file_appearing_and_disappearing_agrees() {
     agree(dir.path(), "and went away");
 }
 
-/// Every mutation this audit knows about, one after another against one store, because an
-/// invalidation is only ever wrong in some *sequence* of edits.
+/// One store for every mutation: an invalidation is only ever wrong in some sequence of edits.
 #[test]
 fn a_long_session_over_the_example_corpus_agrees_at_every_step() {
     let dir = tempfile::tempdir().unwrap();
@@ -694,8 +666,7 @@ fn a_long_session_over_the_example_corpus_agrees_at_every_step() {
     );
 }
 
-/// A shuffle through states that all compile, seeded so a divergence is reproducible from the
-/// failure message alone.
+/// Seeded, so a divergence is reproducible from the failure message alone.
 #[test]
 fn a_shuffle_of_module_states_agrees_at_every_step() {
     let variants: [(&str, [String; 3]); 3] = [
@@ -780,8 +751,6 @@ fn the_worker_count_does_not_reach_a_test_hash() {
     assert_eq!(one, test_hashes(dir.path(), &["--no-incremental"]));
 }
 
-/// `.` and an absolute path name the same project, so a cache written under one must be usable
-/// under the other.
 #[test]
 fn a_relative_and_an_absolute_path_share_one_cache() {
     let dir = corpus();
@@ -793,8 +762,7 @@ fn a_relative_and_an_absolute_path_share_one_cache() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0));
-    // One cache, written under the project root either way — an absolute path must not open a
-    // second one somewhere else under the tree.
+    // One cache under the project root either way: an absolute path must not open a second one.
     let caches: Vec<_> = walkdir(dir.path())
         .into_iter()
         .filter(|p| p.ends_with(".ply-cache"))
@@ -821,8 +789,6 @@ fn walkdir(root: &Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// `HashOutput` carries the reference graph as well as the hashes, and a run with a warm cache
-/// behind it must publish the same graph a from-scratch one does.
 #[test]
 fn every_file_contributes_its_reference_graph() {
     let dir = tempfile::tempdir().unwrap();
@@ -844,8 +810,7 @@ fn every_file_contributes_its_reference_graph() {
     assert_eq!(warm.hashes.closure, full.hashes.closure);
 }
 
-/// `base` performs from the start, so `log` is already in every caller's witness: an edit below
-/// moves the row and nothing else, which is the only thing that can tell the two halves apart.
+/// `base` performs from the start, so an edit below it moves the row and nothing else.
 fn chain(base: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "lib.ply", &chain_lib(base));
@@ -865,12 +830,7 @@ fn chain_lib(base: &str) -> String {
     )
 }
 
-/// An edit that moves a row underneath a caller edited in the same run.
-///
-/// `base`'s row moves, so `mid`'s footprint moves while `mid`'s own text does not, and `top` is
-/// edited beside it. `top`'s declared row is what makes the difference visible: it permits where
-/// `mid` now performs, so an answer computed against a stale `mid` puts it in breach and reports
-/// `E0302` for a program that checks.
+/// `top`'s declared row permits where `mid` now performs, so an answer against a stale `mid` reports `E0302` for a program that checks.
 #[test]
 fn a_row_that_moves_under_a_caller_agrees() {
     let dir = tempfile::tempdir().unwrap();
@@ -894,8 +854,6 @@ fn a_row_that_moves_under_a_caller_agrees() {
     );
 }
 
-/// A row is inferred, so a body that moves what it performs publishes something new and every
-/// caller's own row has to move with it.
 #[test]
 fn a_body_edit_that_moves_the_published_row_still_reaches_every_caller() {
     let dir = chain(r#"log.note[a]("n") + n"#);

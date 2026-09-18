@@ -1,5 +1,3 @@
-//! Observability as an effect, checked from the outside.
-
 use assert_cmd::prelude::*;
 use ply_span::codes;
 use serde_json::Value;
@@ -30,8 +28,6 @@ fn json(dir: &Path, args: &[&str]) -> Value {
         .unwrap_or_else(|e| panic!("{e}: {}", output(&out)))
 }
 
-/// Two endpoints recording on two channels, and the clause set a test installs to collect what they
-/// recorded.
 const SERVICE: &str = r#"
 import std.trace
 import std.trace (trace)
@@ -86,15 +82,13 @@ test "what restock records is recorded on its own channel" {
 }
 "#;
 
-/// A row says what a function records, and it says it per channel.
 #[test]
 fn a_functions_row_names_the_channels_it_records_on() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "app.ply", SERVICE);
 
     let out = ply(dir.path()).args(["check", "--types"]).output().unwrap();
-    // Whitespace-insensitive, because a long row wraps and the claim is about the atoms rather than
-    // about the column the printer chose.
+    // Whitespace-insensitive: a long row wraps, and the claim is about the atoms.
     let text: String = output(&out)
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -109,12 +103,10 @@ fn a_functions_row_names_the_channels_it_records_on() {
     );
 }
 
-/// The reason the resource is a channel rather than a singleton.
 #[test]
 fn two_channels_do_not_conflict_and_two_definitions_on_one_channel_do() {
     let dir = tempfile::tempdir().unwrap();
-    // Host-backed, so the atoms survive into the schedule rather than being discharged by a
-    // handler.
+    // Host-backed, so the atoms survive into the schedule rather than being discharged by a handler.
     write(
         dir.path(),
         "app.ply",
@@ -162,8 +154,6 @@ test/nondet "records on items" {
     assert_eq!(selection["parallelism"]["groups"], 2, "{explained:#}");
 }
 
-/// The span stack survives the scheduler, end to end and through the real production scheduler
-/// rather than through a Rust unit test.
 #[test]
 fn two_tasks_interleaving_spans_nest_into_their_own_and_not_each_others() {
     let dir = tempfile::tempdir().unwrap();
@@ -238,8 +228,6 @@ pub fn main() -> Int / {trace.write[http], task.write} {
     );
 }
 
-/// A continuation resumed later cannot corrupt the span tree, and the mechanism that stops it is
-/// one already in the boundary rather than one this milestone added.
 #[test]
 fn a_continuation_resumed_twice_across_a_span_is_e0426() {
     let dir = tempfile::tempdir().unwrap();
@@ -278,9 +266,7 @@ pub fn main() -> Int / {trace.write[http]} =
     );
 }
 
-/// `nondet` on the declaration is load-bearing: a `det` test that reaches an unhandled `trace`
-/// operation does not compile, with `--host` and without it, and the only way to make it compile is
-/// to install a collecting handler.
+/// `nondet` on the declaration is load-bearing: only a collecting handler makes such a test compile.
 #[test]
 fn a_det_test_reaching_an_unhandled_trace_operation_is_e0412() {
     let dir = tempfile::tempdir().unwrap();
@@ -341,9 +327,7 @@ fn a_twin_backed_tracing_test_is_det_cached_and_hermetic() {
     assert_eq!(second["summary"]["passed"], 0, "{second:#}");
 }
 
-/// `--trace off` binds a real, listed handler rather than an empty registry, and the listing names
-/// *that* handler — because "the run is discarding records" and "the run is writing JSON" are
-/// different facts and a trusted computing base that confused them would be lying about itself.
+/// "Discarding records" and "writing JSON" are different facts, so `--trace off` binds a real, listed handler.
 #[test]
 fn ply_hosts_lists_the_sink_per_channel_and_names_the_one_that_serves_the_run() {
     let dir = tempfile::tempdir().unwrap();
@@ -384,7 +368,6 @@ fn ply_hosts_lists_the_sink_per_channel_and_names_the_one_that_serves_the_run() 
     assert_eq!(traced.len(), 12, "{listing:#}");
 }
 
-/// One JSON object per line, on **stderr**, while `--json` owns stdout.
 #[test]
 fn a_trace_line_goes_to_stderr_and_leaves_the_json_document_on_stdout_intact() {
     let dir = tempfile::tempdir().unwrap();

@@ -1,5 +1,3 @@
-//! Every hazard the compiled seam has to answer, against the shipping code generator.
-
 use ply_codegen::Unit;
 use ply_eval::{Machine, Value};
 use ply_span::{Span, Symbol};
@@ -148,7 +146,6 @@ fn refusal(unit: &Unit, name: &str) -> Option<String> {
         .map(|(_, why)| why.clone())
 }
 
-/// An entry that does not give back the regions and the slots it took is declined.
 #[test]
 fn a_definition_that_opens_its_own_region_runs_compiled_and_gives_the_arena_back() {
     let mut h = harness(hazards());
@@ -254,8 +251,7 @@ fn a_float_or_decimal_is_never_a_wrong_answer() {
     }
 }
 
-/// A nullary constructor written bare is `PatternKind::Var` in the AST, so a lowering that binds
-/// `None` makes the first arm match everything.
+/// A bare nullary constructor is `PatternKind::Var` in the AST, so binding it would make the first arm match everything.
 #[test]
 fn a_nullary_constructor_pattern_is_a_test_and_not_a_binding() {
     let mut h = harness(hazards());
@@ -278,8 +274,7 @@ fn a_compiled_failure_arrives_as_the_machines_own_diagnostic() {
     );
 }
 
-/// A raise inside compiled code must not make the *next* entry answer wrongly, and must not panic
-/// where there is no argument to answer with. `pure.seeded` is the nullary half.
+/// `pure.seeded` is the nullary case: a raise there has no argument to answer with.
 #[test]
 fn a_failed_entry_does_not_poison_the_one_after_it() {
     let mut h = harness(hazards());
@@ -305,7 +300,7 @@ fn a_native_body_runs_under_a_live_handler_stack() {
     }
 }
 
-/// Compiled recursion, not in tail position so it cannot become a loop, outrunning its budget.
+/// Not in tail position, so it cannot become a loop.
 #[test]
 fn a_compiled_recursion_that_outruns_its_budget_is_the_machines_diagnostic() {
     let mut h = harness(hazards());
@@ -316,8 +311,7 @@ fn a_compiled_recursion_that_outruns_its_budget_is_the_machines_diagnostic() {
     );
 }
 
-/// `Ctx` is one flat frame, so an entry arriving while another runs would alias the outer one's
-/// words.
+/// `Ctx` is one flat frame, so a nested entry would alias the outer one's words.
 #[test]
 fn an_entry_that_arrives_while_another_is_running_is_declined_and_reported() {
     let mut h = harness(hazards());

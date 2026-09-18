@@ -49,7 +49,6 @@ fn the_oldest_entries_go_until_the_rest_fits() {
     );
 }
 
-/// The sweep reaches both levels: the objects at the root and the bodies under `emit/`.
 #[test]
 fn an_object_is_as_removable_as_a_body() {
     let dir = tempfile::tempdir().unwrap();
@@ -75,8 +74,6 @@ fn a_temporary_is_never_swept() {
     );
 }
 
-/// The gate is what keeps the walk -- a second, over a full cache -- off every process's way
-/// in. One caller inside an interval takes it, and the rest are a single `stat`.
 #[test]
 fn one_caller_an_interval_sweeps_and_the_rest_do_not() {
     let dir = tempfile::tempdir().unwrap();
@@ -94,8 +91,7 @@ fn one_caller_an_interval_sweeps_and_the_rest_do_not() {
     );
 }
 
-/// Taking the claim is what marks the stamp, so two processes starting together do not both
-/// walk: whichever writes the stamp first turns the other into a `stat`.
+/// So two processes starting together do not both walk.
 #[test]
 fn the_stamp_is_marked_by_taking_the_claim_not_by_finishing_the_sweep() {
     let dir = tempfile::tempdir().unwrap();
@@ -106,8 +102,7 @@ fn the_stamp_is_marked_by_taking_the_claim_not_by_finishing_the_sweep() {
     );
 }
 
-/// The stamp is a file in the cache like any other, and a sweep that removed it would hand
-/// the claim back to the next process a second later.
+/// A sweep that removed it would hand the claim to the next process a second later.
 #[test]
 fn the_stamp_survives_a_sweep_that_empties_the_cache() {
     let dir = tempfile::tempdir().unwrap();

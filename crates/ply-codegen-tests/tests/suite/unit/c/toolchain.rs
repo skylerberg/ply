@@ -1,8 +1,6 @@
 use ply_codegen::c::toolchain::support_flags;
 
-/// tcc finds `libtcc1.a` relative to `-B`, and a build that was never installed has no default
-/// that finds it. Without the flag the compile *succeeds* and the object will not load, with
-/// an empty reason from `dlerror`.
+/// tcc finds `libtcc1.a` relative to `-B`; without it the compile succeeds and the object fails to load with an empty `dlerror`.
 #[test]
 fn a_tcc_that_is_not_installed_is_told_where_its_support_library_is() {
     let dir = std::env::temp_dir().join(format!("ply-tcc-probe-{}", std::process::id()));

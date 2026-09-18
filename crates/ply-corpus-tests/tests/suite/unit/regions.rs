@@ -13,7 +13,6 @@ fn fp(atoms: impl IntoIterator<Item = EffectAtom>) -> Footprint {
     Footprint::from_atoms(atoms)
 }
 
-/// The counterfactual is only worth anything if the baseline is the runner's.
 #[test]
 fn colouring_reproduces_the_runners_own_grouping() {
     let tests: Vec<(usize, Footprint)> = vec![
@@ -35,8 +34,6 @@ fn colouring_reproduces_the_runners_own_grouping() {
     );
 }
 
-/// The mechanism, in the smallest corpus that has it: two tests whose only atoms name one
-/// `cell` label.
 #[test]
 fn two_tests_sharing_one_cell_label_split_without_forking() {
     let corpus = Corpus {
@@ -59,8 +56,6 @@ fn two_tests_sharing_one_cell_label_split_without_forking() {
     assert_eq!(cost.wall_clock_ratio(), 2.0);
 }
 
-/// The overstatement region isolation warns about, stated as a test: a pure test is free either way,
-/// so adding a hundred of them must move nothing.
 #[test]
 fn pure_tests_cost_nothing_under_either_model() {
     let mut footprints = vec![fp([atom("db", "a", Mode::Write)])];
@@ -80,7 +75,6 @@ fn pure_tests_cost_nothing_under_either_model() {
     assert_eq!(cost.pure, 100);
 }
 
-/// A seed is an input, not memory.
 #[test]
 fn a_seeded_test_is_untouched_by_the_change() {
     let corpus = Corpus {
@@ -101,8 +95,6 @@ fn a_seeded_test_is_untouched_by_the_change() {
     assert_eq!(cost.without_forking.groups, 1);
 }
 
-/// A `cell` atom that no other test names conflicts with nothing, so it does not serialize even
-/// though the exemption stopped applying to it.
 #[test]
 fn a_lone_cell_label_does_not_serialize() {
     let corpus = Corpus {
@@ -123,8 +115,6 @@ fn a_lone_cell_label_does_not_serialize() {
     assert_eq!(cost.without_forking.groups, 1);
 }
 
-/// Groups are a barrier and a group costs its slowest member, so a schedule is not `sum /
-/// jobs`.
 #[test]
 fn makespan_charges_a_barrier_between_groups() {
     let groups = vec![vec![0, 1, 2, 3], vec![4]];

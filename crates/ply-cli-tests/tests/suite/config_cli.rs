@@ -1,12 +1,8 @@
-//! Configuration as the command line sees it: `--set`, `--config`, the process environment,
-//! `--config-schema`, and what each of them refuses.
-
 use assert_cmd::Command;
 use serde_json::Value;
 use std::path::Path;
 use tempfile::TempDir;
 
-/// A program with a schema, one key per shape, and a `main` that reads one.
 const DESK: &str = "\
 import std.config
 import std.config (config)
@@ -35,8 +31,6 @@ test \"a handled read is hermetic\" {
 }
 ";
 
-/// The same program with a `main` that reads the credential, for the tests that search a run's
-/// whole output for it.
 const SECRET_MAIN: &str = "\
 import std.config
 import std.config (config)
@@ -62,8 +56,7 @@ fn ply(dir: &Path) -> Command {
     cmd.arg("--color")
         .arg("never")
         .current_dir(dir)
-        // The parent's environment is a source, so a test that did not clear it would be a test
-        // whose answer depended on the machine it ran on.
+        // The parent's environment is a source, so an answer must not depend on the machine's.
         .env_remove("DESK_REGION")
         .env_remove("DESK_PORT")
         .env_remove("DESK_API_KEY");
@@ -82,8 +75,7 @@ fn json_of(output: &std::process::Output) -> Value {
     serde_json::from_str(&stdout_of(output)).expect("`--json` writes one document on stdout")
 }
 
-/// `ply hosts --host --json`, which is the command whose whole output is the resolved
-/// configuration, so it is what precedence is read from.
+/// Its whole output is the resolved configuration, so precedence is read from it.
 fn hosts(dir: &Path, extra: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     let mut cmd = ply(dir);
     cmd.arg("hosts").arg("--host").arg("--json");
@@ -103,8 +95,6 @@ fn key_of(report: &Value, name: &str) -> Value {
         .unwrap_or_else(|| panic!("`{name}` is not in {report:#}"))
         .clone()
 }
-
-// --- precedence -------------------------------------------------------------
 
 #[test]
 fn precedence_is_set_then_file_then_environment_then_default() {
@@ -180,8 +170,6 @@ fn without_host_no_source_is_opened_and_the_flags_are_refused() {
     );
 }
 
-// --- the file format --------------------------------------------------------
-
 #[test]
 fn a_malformed_config_file_is_e0440_naming_the_file_and_line() {
     let dir = project(DESK);
@@ -222,8 +210,6 @@ fn an_unreadable_config_file_is_e0440() {
     assert!(text.contains("E0440"), "{text}");
     assert!(text.contains("absent.env"), "{text}");
 }
-
-// --- the schema -------------------------------------------------------------
 
 #[test]
 fn a_required_key_nothing_supplies_is_e0441_at_startup() {
@@ -316,8 +302,6 @@ fn an_undeclared_set_warns_and_an_undeclared_environment_key_does_not() {
     );
 }
 
-/// A `--config-schema` naming nothing is refused with the candidates, because the fix is a
-/// different argument rather than an edit to the program.
 #[test]
 fn a_config_schema_naming_no_definition_lists_what_the_program_has() {
     let dir = project(DESK);
@@ -333,8 +317,6 @@ fn a_config_schema_naming_no_definition_lists_what_the_program_has() {
     assert!(text.contains("E0440"), "{text}");
     assert!(text.contains("m.spec"), "{text}");
 }
-
-// --- the secret gate --------------------------------------------------------
 
 #[test]
 fn get_cannot_read_a_key_the_schema_declares_secret() {
@@ -365,8 +347,6 @@ fn get_cannot_read_a_key_the_schema_declares_secret() {
     );
 }
 
-/// The credential arrives as a `Secret` and is usable through `secret_verify`, and its bytes appear
-/// in neither stream.
 #[test]
 fn a_secret_arrives_as_a_secret_and_appears_in_no_stream() {
     let dir = project(SECRET_MAIN);
@@ -391,8 +371,6 @@ fn a_secret_arrives_as_a_secret_and_appears_in_no_stream() {
     }
 }
 
-/// And the same for `--json`, whose one document on stdout carries the key's name and the source
-/// that won it and never its value.
 #[test]
 fn the_json_report_carries_a_secrets_key_and_source_and_not_its_value() {
     let dir = project(SECRET_MAIN);
@@ -412,8 +390,6 @@ fn the_json_report_carries_a_secrets_key_and_source_and_not_its_value() {
         stdout_of(&output)
     );
 }
-
-// --- hermetic supply --------------------------------------------------------
 
 #[test]
 fn a_test_supplying_configuration_is_hermetic_det_and_cached() {
@@ -441,8 +417,7 @@ fn a_test_supplying_configuration_is_hermetic_det_and_cached() {
     assert_eq!(report["selection"]["selected"], 0, "{report:#}");
 }
 
-/// The other half: an unhandled `config` operation in a `det` test is `E0412` at compile time, with
-/// `--host` and without it, because the effect is `nondet`.
+/// With `--host` and without it, because the effect is `nondet`.
 #[test]
 fn an_unhandled_config_read_in_a_det_test_is_e0412() {
     let source = "\
@@ -465,8 +440,6 @@ test \"reaches the environment\" {
     }
 }
 
-/// And a run that reaches the boundary with nothing bound is `E0424` naming the handler that
-/// *would* have served it — never a silent read of the environment.
 #[test]
 fn a_hermetic_run_that_reaches_config_is_e0424_naming_the_handler() {
     let dir = project(DESK);

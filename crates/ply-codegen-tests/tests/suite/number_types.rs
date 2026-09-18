@@ -1,12 +1,7 @@
-//! Fixed-width integers under the backend: that a compiled body answers what the interpreter
-//! answers at each width, and that a signature naming one is declined rather than answered wrongly.
-
 use crate::fragment::{call, unit};
 use ply_eval::Value;
 
-/// Every operation the family has, wrapped so the *signature* is `Int`: a fixed width may not
-/// cross the seam (ADR 0039), so the widths live inside the bodies and the answers come back as
-/// `Int`s. That is exactly the shape `std.hash` has.
+/// Signatures are `Int` because a fixed width may not cross the seam; the widths live inside the bodies, as in `std.hash`.
 const WIDTHS: &str = r#"
 fn add_u8(a: Int, b: Int) -> Int = int_of_u8(u8_of_int(a) + u8_of_int(b))
 fn wrap_u8(a: Int, b: Int) -> Int = int_of_u8(wrap_add(u8_of_int(a), u8_of_int(b)))
@@ -203,8 +198,7 @@ fn each_width_answers_what_the_interpreter_answers() {
             "`{name}{args:?}` answered {got:?}, not {want:?}"
         );
     }
-    // Two whose answers are not worth writing out by hand — a record of widths threaded through a
-    // body, and a loop over them — checked against the interpreter.
+    // Two not worth writing out by hand, checked against the interpreter.
     let mut oracle = ply_eval::interp::Pure::new(loaded.program, loaded.resolved);
     for (name, args) in [
         ("m.round_trip", vec![Value::Int(0xDEAD_BEEF)]),
@@ -223,8 +217,7 @@ fn each_width_answers_what_the_interpreter_answers() {
     }
 }
 
-/// A body still compiles and still calls its neighbours directly; what is refused is the
-/// *crossing*, because a width is held as a tagged immediate and would arrive as an `Int`.
+/// A width is a tagged immediate and would arrive as an `Int`, so the crossing is refused, not the body.
 #[test]
 fn a_signature_naming_a_width_is_declined_rather_than_answered() {
     let (_, unit) = unit(CROSSES);

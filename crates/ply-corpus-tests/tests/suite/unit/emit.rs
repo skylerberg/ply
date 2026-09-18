@@ -102,8 +102,7 @@ fn a_test_grants_one_clause_per_performed_atom_and_no_more() {
     }
 }
 
-/// Handlers are granted only for what actually fires, so a definition that declares more than a
-/// given call path performs leaves atoms behind.
+/// Handlers are granted only for what fires, so declaring more than a call path performs leaves atoms behind.
 #[test]
 fn some_tests_leave_a_declared_atom_ungranted() {
     let corpus = generate(&CorpusSpec {
@@ -139,9 +138,6 @@ fn concurrent(density: f64) -> Corpus {
     })
 }
 
-/// The declared row is what the reduction reads, so a task naming a shard it does not bump — or
-/// bumping one it does not name — is the defect that would make a density sweep measure
-/// nothing.
 #[test]
 fn a_task_declares_exactly_the_one_shard_it_bumps() {
     let corpus = concurrent(0.5);
@@ -184,8 +180,6 @@ fn a_concurrent_test_opens_one_cell_and_grants_one_clause_per_shard_it_uses() {
     }
 }
 
-/// Every assertion the emitter writes has to be one the model computed, or the corpus is
-/// asserting a tautology and its own verification pass proves nothing about the scheduler.
 #[test]
 fn the_asserted_totals_are_the_models_and_they_add_up() {
     for density in [0.0, 0.5, 1.0] {
@@ -203,8 +197,6 @@ fn the_asserted_totals_are_the_models_and_they_add_up() {
     }
 }
 
-/// The work each task does must not move with the density, or a sweep is comparing two
-/// different programs and calling the difference contention.
 #[test]
 fn a_task_body_is_the_same_at_every_density_but_for_the_shard_it_names() {
     let disjoint = concurrent(0.0);
@@ -241,8 +233,6 @@ fn specified() -> Corpus {
     })
 }
 
-/// One `requires` and one `ensures`, so a measurement pricing discharge per obligation does not
-/// have to divide first.
 #[test]
 fn a_specified_definition_carries_exactly_one_clause_of_each_kind() {
     let corpus = specified();
@@ -280,9 +270,7 @@ fn a_specified_definition_carries_exactly_one_clause_of_each_kind() {
     assert!(specified_count > 0);
 }
 
-/// The benchmark's edit sites are textual, so a clause between the header and the body must not
-/// stop one being rewritten — otherwise raising the density would quietly shrink the pool a hub
-/// edit is chosen from.
+/// The benchmark's edit sites are textual, so a clause between header and body must not hide the body.
 #[test]
 fn a_clause_does_not_stop_a_one_line_body_being_rewritten() {
     let corpus = specified();
@@ -327,8 +315,6 @@ fn a_specimen_states_its_claim_and_its_law_names_it() {
     }
 }
 
-/// Specimens carry no shape and no reference evaluation, so without their own test they would
-/// be the only generated definitions that are compiled and never run.
 #[test]
 fn every_specimen_is_asserted_by_the_test_its_module_carries() {
     let corpus = specified();

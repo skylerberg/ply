@@ -1,5 +1,3 @@
-//! What an edit to an `effect set` costs, measured in tests re-run.
-
 use assert_cmd::Command;
 use serde_json::Value;
 use std::path::Path;
@@ -19,9 +17,7 @@ fn combined(out: &std::process::Output) -> String {
     format!("{}{}", stdout_of(out), String::from_utf8_lossy(&out.stderr))
 }
 
-/// `store` is handled in both tests, so both are `det` and both are cacheable — which is what makes
-/// "selected zero" a statement about the cache rather than about a test that could not be cached
-/// anyway.
+/// `store` is handled in both tests, so both are cacheable and "selected zero" is a statement about the cache.
 fn source(web: &str) -> String {
     format!(
         r#"
@@ -55,8 +51,6 @@ fn project(web: &str) -> TempDir {
     dir
 }
 
-/// Runs `ply test` once to warm the cache, then edits and reports how many tests the next run
-/// selected.
 #[track_caller]
 fn selected_after(before: &str, after: &str) -> u64 {
     let dir = project(before);
@@ -117,16 +111,13 @@ fn declaring_a_set_nothing_uses_selects_no_tests() {
     assert_eq!(selected_after(NARROW, extra), 0);
 }
 
-/// Rewriting the row from the set to the atoms it stands for is the headline property, and
-/// selection is where it is felt: the definition did not change, so nothing re-runs.
 #[test]
 fn replacing_a_set_with_its_expansion_selects_no_tests() {
     let dir = project(NARROW);
     let warm = ply(dir.path()).arg("test").output().expect("ply test runs");
     assert_eq!(warm.status.code(), Some(0), "{}", combined(&warm));
 
-    // Written in the other order, too: a row is a set and the annotation's spelling may not decide
-    // what it means.
+    // Written in the other order too: the annotation's spelling may not decide what a row means.
     let after = source("").replace("/ {Web}", "/ {store.write[audit], store.read[orders]}");
     std::fs::write(dir.path().join("m.ply"), after).expect("the module is writable");
     let out = ply(dir.path())
@@ -147,8 +138,7 @@ fn widening_a_set_selects_exactly_the_tests_that_reach_it() {
     assert_eq!(selected_after(NARROW, wider), 1);
 }
 
-/// The equivalence property, across a sequence of `effect set` edits: a cold cache never exercises
-/// an invalidation, and an invalidation is the only thing that can be wrong.
+/// A cold cache never exercises an invalidation, and an invalidation is the only thing that can be wrong.
 #[test]
 fn incremental_and_from_scratch_agree_across_a_sequence_of_set_edits() {
     use ply_cli::driver;
