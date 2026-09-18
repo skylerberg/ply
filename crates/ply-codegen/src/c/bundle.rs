@@ -1,7 +1,7 @@
 //! A bootstrap bundle: the C a unit was emitted as, compressed, with the digest of the sources it
-//! was emitted from. The emitter written in Ply is built from one of these rather than by a
-//! reference emitter, and the fixpoint test in `crates/ply-codegen-tests` is what says the bundle
-//! serves: the emitter built from it emits, for its own sources, the C it was built from.
+//! was emitted from. The emitter written in Ply is built from one of these, and the fixpoint test
+//! in `crates/ply-codegen-tests` is what says the bundle serves: the emitter built from it emits,
+//! for its own sources, the C it was built from.
 //!
 //! **The unit describes itself.** Its runtime helper table, its constructor table, its functions
 //! and their arities, which of them are constants, its module count and its tables travel inside

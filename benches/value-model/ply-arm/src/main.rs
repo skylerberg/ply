@@ -79,8 +79,8 @@ fn main() {
         ply_eval::Value::Bytes(b) => b.iter().map(|x| format!("{x:02x}")).collect::<String>(),
         other => panic!("blake3 answered {other:?}"),
     };
-    // The profile goes in the line because the C tier's default is `development` -- `cc -O0` with
-    // the inliner off, forty times slower on k1 -- and a reading taken under it against a bar taken
+    // The profile goes in the line because the C tier's default is `development` -- `cc -O0`,
+    // forty times slower on k1 -- and a reading taken under it against a bar taken
     // under `release` is a verdict about a compiler flag wearing a verdict about a value model.
     // `run.sh` exports `release` and refuses to start otherwise; this is what puts it in the raw
     // file, where a reader who did not run the script can still see which one it was.

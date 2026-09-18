@@ -1,18 +1,15 @@
-//! A second emitter standing in for this one, body by body.
+//! The emitter written in Ply, as the C tier's producer (ADR 0042).
 //!
-//! ADR 0042's second step: the emitter written in Ply is held to *behaviour*, which means the C
-//! tier has to be able to take its bodies. This is the seam. A producer is installed once per
-//! process as a way of *building* one -- the compiled Ply emitter is a loaded unit holding `Rc`s,
-//! so a worker thread builds its own from the same recipe -- and `emit_one` asks it before it
-//! emits. What the producer answers for a body is the same pair the reference emits, the C text
-//! and the tables it names by its own positions, in the cache's own encoding; what it declines
-//! falls to the reference. The count of what it answered is the ratchet.
+//! A producer is installed once per process as a way of *building* one -- the compiled Ply emitter
+//! is a loaded unit holding `Rc`s, so a worker thread builds its own from the same recipe -- and
+//! `emit_one` asks it for every body. What it answers for a body is the C text and the tables it
+//! names by its own positions, in the cache's own encoding.
 //!
-//! The producer's own unit is built by the reference, never by itself: `building` is raised
-//! around that build, and `current` answers nothing while it is.
+//! The producer's own unit comes from a bootstrap bundle, never from itself: `BUILDING` is raised
+//! around that build, and [`with_current`] answers nothing on the thread while it is.
 
 use super::build::Native;
-use super::emit::Tables;
+use super::tables::Tables;
 use crate::source::Source;
 use anyhow::{Context, Result, anyhow, bail};
 use ply_eval::{Fields, Value};
@@ -36,10 +33,9 @@ static EMITTER: OnceLock<String> = OnceLock::new();
 thread_local! {
     static MINE: RefCell<Option<Result<PlyProducer, String>>> = const { RefCell::new(None) };
     static BUILDING: Cell<bool> = const { Cell::new(false) };
-    static REFERENCE_ONLY: Cell<bool> = const { Cell::new(false) };
     /// A producer handed over for the duration of a call, with the identity the caches must key
     /// its bodies under. This is how one emitter emits another's sources: the thread-locals above
-    /// carry one emitter per run, and a nested ask would otherwise fall back to the reference.
+    /// carry one emitter per run.
     static HANDED: RefCell<Option<(PlyProducer, String)>> = const { RefCell::new(None) };
 }
 
@@ -65,10 +61,12 @@ pub enum Sources {
 /// Install the self-hosted Ply emitter as the producer when none is installed: the working copy
 /// `PLY_C_EMITTER=ply:<dir>` names, or the one this binary carries.
 ///
-/// Every consumer -- the CLI, the corpus, the tests -- calls this, so the override is read in one
-/// place rather than wired through each of them. Under tier-only (ADR 0048) the Rust reference
-/// emitter is a fragment, so the language runs only when this produces.
+/// [`with_current`] calls this, so the override is read in one place rather than wired through
+/// each consumer.
 pub fn ensure_default() {
+    if installed() {
+        return;
+    }
     install_sources(match std::env::var("PLY_C_EMITTER") {
         Ok(spec) => match spec.strip_prefix("ply:") {
             Some(dir) => Sources::Directory(std::path::PathBuf::from(dir)),
@@ -272,10 +270,15 @@ pub fn reset_thread() {
     MINE.with(|mine| *mine.borrow_mut() = None);
 }
 
+/// The digest the emitter answering on this thread keys its bodies under. Installs the default
+/// first, as [`with_current`] does: a key taken before the emitter is known would file its bodies
+/// under no emitter at all.
 pub fn identity() -> String {
-    HANDED
-        .with(|h| h.borrow().as_ref().map(|(_, id)| id.clone()))
-        .unwrap_or_else(|| IDENTITY.get().map_or(String::new(), String::clone))
+    if let Some(id) = HANDED.with(|h| h.borrow().as_ref().map(|(_, id)| id.clone())) {
+        return id;
+    }
+    ensure_default();
+    IDENTITY.get().cloned().unwrap_or_default()
 }
 
 /// What the emitter answering on this thread is, as a cache of its answers keys on it.
@@ -283,6 +286,7 @@ pub fn emitter() -> String {
     if HANDED.with(|h| h.borrow().is_some()) {
         return identity();
     }
+    ensure_default();
     EMITTER.get().cloned().unwrap_or_else(identity)
 }
 
@@ -302,39 +306,6 @@ pub fn digest_of(modules: &[(String, String)]) -> String {
 
 pub fn installed() -> bool {
     RECIPE.get().is_some()
-}
-
-/// The producer's mode, as the caches key on it. While the producer's own unit is being built
-/// the reference is the emitter, whatever was asked for: the producer cannot answer for itself.
-///
-/// There were two producing modes while ADR 0042 was being walked: body-by-body, where the
-/// reference emitted and the port stood in for the bodies the reference had already accepted,
-/// and the whole unit. Under tier-only (ADR 0048) the reference is a fragment that refuses
-/// `perform`, so body-by-body could only ever offer what the fragment already covered -- less
-/// than the fragment alone, since it added no body and could refuse one. The unit is the mode.
-pub fn mode() -> &'static str {
-    if HANDED.with(|h| h.borrow().is_some()) {
-        return "ply";
-    }
-    if !installed() || BUILDING.with(Cell::get) || REFERENCE_ONLY.with(Cell::get) {
-        "ref"
-    } else {
-        "ply"
-    }
-}
-
-/// Runs `f` with the reference emitter forced, whatever producer is installed: [`mode`] answers
-/// `ref` and no body is asked of the producer, though [`front`] still is. Per-thread, because a
-/// process-wide switch let concurrent tests clobber each other's guard.
-pub fn reference_only<R>(f: impl FnOnce() -> R) -> R {
-    struct Guard(bool);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            REFERENCE_ONLY.with(|c| c.set(self.0));
-        }
-    }
-    let _guard = Guard(REFERENCE_ONLY.with(|c| c.replace(true)));
-    f()
 }
 
 /// Runs `f` with `p` as this thread's producer and `identity` as the digest its emissions key
@@ -362,46 +333,28 @@ impl Drop for Handed {
     }
 }
 
-/// The mode with the emitter's identity, as the caches key on it.
-pub fn who() -> String {
-    let mode = mode();
-    if mode == "ref" {
-        mode.to_string()
-    } else {
-        format!("{mode}\0{}", identity())
-    }
-}
-
-/// `serving`, unless [`reference_only`] withholds the producer as the emitter.
+/// Runs `f` with this thread's producer: the one handed over, else the one built from the
+/// installed recipe, the default installed first so that a caller cannot reach an emitter that
+/// answers nothing by forgetting [`ensure_default`]. `None` while it is being built, or when
+/// building it failed -- the failure is reported once.
 pub fn with_current<T>(f: impl FnOnce(&PlyProducer) -> T) -> Option<T> {
-    if REFERENCE_ONLY.with(Cell::get) && HANDED.with(|h| h.borrow().is_none()) {
-        return None;
-    }
-    serving(f)
-}
-
-/// Runs `f` with this thread's producer, building it first if the recipe is installed and this
-/// thread has not built one. `None` when there is no producer, when it is being built, or when
-/// building it failed -- the failure is reported once, and the reference emits everything.
-fn serving<T>(f: impl FnOnce(&PlyProducer) -> T) -> Option<T> {
     // An emitter handed over serves before anything else: this is how one emitter emits another's
     // sources, which a nested ask could not otherwise do.
     if HANDED.with(|h| h.borrow().is_some()) {
         return HANDED.with(|h| h.borrow().as_ref().map(|(p, _)| f(p)));
     }
-    let recipe = RECIPE.get()?;
     if BUILDING.with(Cell::get) {
         return None;
     }
+    ensure_default();
+    let recipe = RECIPE.get()?;
     MINE.with(|mine| {
         if mine.borrow().is_none() {
             BUILDING.with(|b| b.set(true));
             let built = recipe();
             BUILDING.with(|b| b.set(false));
             if let Err(e) = &built {
-                eprintln!(
-                    "the Ply emitter could not be built, so the reference emits everything: {e}"
-                );
+                eprintln!("the Ply emitter could not be built, so every body is refused: {e}");
             }
             *mine.borrow_mut() = Some(built);
         }
@@ -412,7 +365,6 @@ fn serving<T>(f: impl FnOnce(&PlyProducer) -> T) -> Option<T> {
     })
 }
 
-/// What the emitter answered for one module: each body's C and tables, by program-wide name.
 /// What the emitter said about one definition.
 #[derive(Clone)]
 pub enum Answer {
@@ -468,11 +420,8 @@ impl PlyProducer {
 
     /// The emitter's C for `name`, or nothing: it did not reach the body, or it failed over the
     /// program, which [`PlyProducer::failure`] then says.
-    pub fn body(&self, loaded: &Source, name: &str, module_index: usize) -> Option<Answer> {
+    pub fn body(&self, loaded: &Source, name: &str) -> Option<Answer> {
         self.asked.set(self.asked.get() + 1);
-        if module_index >= loaded.module_count() {
-            return None;
-        }
         let program = std::ptr::from_ref(loaded) as usize;
         if !self.modules.borrow().contains_key(&program) {
             let bodies = match self.bodies_of(loaded) {
@@ -663,8 +612,8 @@ pub fn checked_front(sources: &[(String, String)], ids: &[SourceId]) -> Result<F
 
 /// Enters `name` in this thread's compiled emitter, building it first when the thread has none.
 pub fn call(name: &str, args: &[Value]) -> Result<Value> {
-    serving(|p| p.call(name, args)).unwrap_or_else(|| {
-        bail!("no Ply emitter serves on this thread: none is installed, or it is being built")
+    with_current(|p| p.call(name, args)).unwrap_or_else(|| {
+        bail!("no Ply emitter serves on this thread: it is being built, or building it failed")
     })
 }
 

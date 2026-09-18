@@ -68,7 +68,7 @@ pub struct Unit {
     /// Nanoseconds workers have spent building their unit, and how many have paid it.
     codegen_nanos: AtomicU64,
     compiles: AtomicU64,
-    /// Workers whose build failed after the pre-flight in [`Unit::over`] succeeded.
+    /// Workers whose build failed after the pre-flight in [`Unit::over_front`] succeeded.
     poisoned: AtomicU64,
     /// The C of a unit produced elsewhere, an artifact's, that this one loads rather than builds.
     /// The C describes itself (`c::Exports`), so the text is all an artifact carries of it.
@@ -76,21 +76,10 @@ pub struct Unit {
 }
 
 impl Unit {
-    /// With no source text only the reference can emit, so hold `reference_only` around this.
-    pub fn over(
-        program: &Program,
-        resolved: &ply_syntax::resolve::Resolved,
-        check: &ply_ty::CheckOutput,
-    ) -> Result<&'static Unit> {
-        let front = crate::source::front_of(program, resolved, check, Default::default(), None);
-        Unit::over_front(program, resolved, &front, HashMap::new())
-    }
-
-    /// [`Unit::over_front`] over the port's answer for `texts`, whose check replaces the caller's.
+    /// [`Unit::over_front`] over the port's answer for `texts`.
     pub fn over_with_texts(
         program: &Program,
         resolved: &ply_syntax::resolve::Resolved,
-        _check: &ply_ty::CheckOutput,
         texts: HashMap<String, String>,
     ) -> Result<&'static Unit> {
         let sources = program

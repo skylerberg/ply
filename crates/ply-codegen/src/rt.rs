@@ -833,8 +833,8 @@ pub unsafe extern "C" fn rt_unbox_bool(ctx: *mut Ctx, w: i64) -> i64 {
     }
 }
 
-/// The operator code compiled code hands [`rt_binary`], and the operator it names. One table,
-/// read both ways, so the emitter and the runtime cannot disagree about a number.
+/// The operator code compiled code hands [`rt_binary`], and the operator it names. `emit.ply`'s
+/// `binary_code` spells the same positions, so a reordering here has to move it too.
 const BINOPS: [BinOp; 17] = [
     BinOp::Add,
     BinOp::Sub,
@@ -854,13 +854,6 @@ const BINOPS: [BinOp; 17] = [
     BinOp::Shl,
     BinOp::Shr,
 ];
-
-pub fn binop_code(op: BinOp) -> i64 {
-    BINOPS
-        .iter()
-        .position(|o| *o == op)
-        .map_or(-1, |i| i as i64)
-}
 
 /// The machine's own operator over two values, for an operand whose type the emitter does not
 /// fix -- a `Float`, a `Decimal` -- so that such a body compiles and answers what the machine

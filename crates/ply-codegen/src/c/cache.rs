@@ -1,21 +1,13 @@
 //! What one emitted body is, kept between runs.
 //!
-//! The emitted tier's time is not the C compiler. Measured on the self-hosted front end's twelve
-//! modules: **optimise and lower 1.7s, generate the C 0.085s, `cc` 1.6s** per unit. The compiler is
-//! the smaller half and it already has a cache of its own; the larger half is the inliner, and the
-//! only artefact that holds its work is the C it produced.
-//!
-//! So this caches the C, one body at a time, keyed on what the body is a function of: its
-//! definition's hash and the texts its sites are byte offsets into (`Source::with_texts`). Per
-//! body rather than per unit so that commands offering different roots over the same texts share
-//! every body they have in common. An edit to any text re-emits every body, because a site can
-//! move under a definition whose hash did not.
+//! The emitted C, one body at a time, keyed on its definition's hash and the texts its sites are
+//! byte offsets into: a site can move under a definition whose hash did not.
 //!
 //! A body's text names the unit's tables by its own positions -- `@@c3@@`, resolved when the body
 //! goes into a unit -- so what is kept here is a function of the body alone and can be read back
 //! into a unit that looks nothing like the one it came from.
 
-use super::emit::Tables;
+use super::tables::Tables;
 use ply_eval::Value;
 use ply_span::Symbol;
 use std::path::PathBuf;
@@ -27,22 +19,20 @@ fn dir() -> PathBuf {
 
 /// What a body's C is a function of, as one name.
 ///
-/// The definition's hash covers its own text *and* every definition it references, which is what
-/// an inlining emitter needs: a body's C changes when anything it inlines changes, and
-/// `HashOutput::defs` moves for exactly that reason.
+/// The definition's hash covers its own text *and* every definition it references, and
+/// `HashOutput::defs` moves when any of them does.
 ///
-/// Beside it: the constructor table, whose positions the text writes as numbers; how hard the
-/// inliner was told to work; and the compiler binary's own stamp, so that rebuilding `ply` throws
-/// the cache away rather than asking anyone to remember to.
-pub fn key(def_hash: &str, ctors: &str, inlining: (usize, usize)) -> String {
+/// Beside it: the constructor table, whose positions the text writes as numbers, and the compiler
+/// binary's own stamp, so that rebuilding `ply` throws the cache away rather than asking anyone to
+/// remember to.
+pub fn key(def_hash: &str, ctors: &str) -> String {
     let mut h = blake3::Hasher::new();
     // The runtime's helper table is part of the key: a body's C calls the helpers by shape, and
     // a shape that moved would otherwise be read back from a body emitted against the old one.
     for part in [
-        "ply-c-emit-3",
+        "ply-c-emit-4",
         &exe_stamp(),
         &super::exports::helpers_digest(),
-        &format!("{}:{}", inlining.0, inlining.1),
         ctors,
         def_hash,
     ] {
@@ -81,20 +71,14 @@ pub fn ctors_digest(ctors: &[(Symbol, usize)]) -> String {
     h.finalize().to_hex()[..32].to_string()
 }
 
-/// A refusal is worth keeping too, and it costs more than a body: the refusal happens *during* the
-/// emit, so a definition this tier will not take pays the inliner in full, every run. On the
-/// spike's twelve modules that is a thousand of them.
+/// A refusal is worth keeping too, or a definition this tier will not take is asked of the emitter
+/// again every run.
 ///
 /// Keyed with the fragment folded in, because a refusal is not a property of the definition alone:
 /// a body is refused when something it calls was not offered, and a different command offers a
 /// different set. A success needs no such thing -- its calls are recorded and checked.
-pub fn refusal_key(
-    def_hash: &str,
-    ctors: &str,
-    inlining: (usize, usize),
-    fragment: &str,
-) -> String {
-    key(&format!("{def_hash}/{fragment}"), ctors, inlining)
+pub fn refusal_key(def_hash: &str, ctors: &str, fragment: &str) -> String {
+    key(&format!("{def_hash}/{fragment}"), ctors)
 }
 
 /// The digest of the set of definitions this unit was offered.
@@ -228,7 +212,7 @@ pub(super) fn decode_tables(s: &str, at: &mut usize) -> Option<Tables> {
                 let (ty, bits) = rest.split_once(' ')?;
                 let n: u8 = ty.parse().ok()?;
                 let ty = ply_ty::INT_TYPES.iter().find(|t| **t as u8 == n)?;
-                // Written unsigned by the reference and as the wrapped `Int` by the emitter in
+                // Written unsigned by `encode_tables` and as the wrapped `Int` by the emitter in
                 // Ply, whose integers are signed: one bit pattern either way.
                 let bits: u64 = match bits.parse::<u64>() {
                     Ok(b) => b,
@@ -340,23 +324,19 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 }
 
 /// What a unit is a function of: every offered definition and its hash, the constructor table,
-/// the inlining, and the binary. The *names* alone are not enough -- an edit leaves the offered
+/// the emitter, and the binary. The *names* alone are not enough -- an edit leaves the offered
 /// set identical and changes what the unit contains.
 pub fn unit_key(
     keys: &std::collections::HashMap<String, String>,
     offered: &[&str],
     ctors: &str,
-    inlining: (usize, usize),
-    who: &str,
+    emitter: &str,
 ) -> Option<String> {
     let mut sorted: Vec<&str> = offered.to_vec();
     sorted.sort_unstable();
     let mut h = blake3::Hasher::new();
-    h.update(b"ply-c-unit-2");
-    // Which emitter filled the unit, and in which mode: a unit the reference emitted must not be
-    // served to a run that asked the Ply emitter to, or that run measures nothing, and a unit
-    // the Ply emitter filled behind the reference's acceptance is not the one it fills alone.
-    h.update(who.as_bytes());
+    h.update(b"ply-c-unit-3");
+    h.update(emitter.as_bytes());
     for name in sorted {
         // Without a hash for every offered definition there is nothing to notice an edit by, and
         // a unit cache that cannot notice one is a wrong answer rather than a slow one.
@@ -366,7 +346,7 @@ pub fn unit_key(
         h.update(hash.as_bytes());
         h.update(&[0]);
     }
-    Some(key(&h.finalize().to_hex()[..32], ctors, inlining))
+    Some(key(&h.finalize().to_hex()[..32], ctors))
 }
 
 /// How many times a unit has been rebuilt from the cache rather than emitted.

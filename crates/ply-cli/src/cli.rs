@@ -372,20 +372,15 @@ pub struct TestArgs {
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
 
-    /// Which toolchain the emitted C tier compiles with, and the inlining that
-    /// goes with it. Ignored by every other backend, which have one each.
+    /// Which toolchain the emitted C tier compiles with. Ignored by every other
+    /// backend, which have one each.
     ///
     /// `development`, the default, is the fastest compiler on the machine —
-    /// `tcc` if it is installed, else `cc -O0` — with inlining off. Over the
-    /// self-hosted front end that is a quarter of a second against `release`'s
-    /// thirty-eight, and it is what an edit-to-green loop wants.
+    /// `tcc` if it is installed, else `cc -O0` — which is what an edit-to-green
+    /// loop wants.
     ///
-    /// `release` is `cc -O2` with the inliner on: forty times faster code on
-    /// integer arithmetic, and the profile any measurement must ask for.
-    ///
-    /// The two settings are one choice, not two. A non-optimising compiler
-    /// gives every temporary its own stack slot, so `release`'s inlining under
-    /// `development`'s compiler overflows the stack on a deep enough program.
+    /// `release` is `cc -O2`: faster code, and the profile any measurement must
+    /// ask for.
     #[arg(
         long,
         value_name = "PROFILE",
@@ -622,20 +617,15 @@ pub struct RunArgs {
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
 
-    /// Which toolchain the emitted C tier compiles with, and the inlining that
-    /// goes with it. Ignored by every other backend, which have one each.
+    /// Which toolchain the emitted C tier compiles with. Ignored by every other
+    /// backend, which have one each.
     ///
     /// `development`, the default, is the fastest compiler on the machine —
-    /// `tcc` if it is installed, else `cc -O0` — with inlining off. Over the
-    /// self-hosted front end that is a quarter of a second against `release`'s
-    /// thirty-eight, and it is what an edit-to-green loop wants.
+    /// `tcc` if it is installed, else `cc -O0` — which is what an edit-to-green
+    /// loop wants.
     ///
-    /// `release` is `cc -O2` with the inliner on: forty times faster code on
-    /// integer arithmetic, and the profile any measurement must ask for.
-    ///
-    /// The two settings are one choice, not two. A non-optimising compiler
-    /// gives every temporary its own stack slot, so `release`'s inlining under
-    /// `development`'s compiler overflows the stack on a deep enough program.
+    /// `release` is `cc -O2`: faster code, and the profile any measurement must
+    /// ask for.
     #[arg(
         long,
         value_name = "PROFILE",
@@ -827,8 +817,8 @@ pub struct BootstrapArgs {
     #[arg(long)]
     pub verify: bool,
 
-    /// Which toolchain the archive is emitted for. `release` by default here,
-    /// unlike everywhere else: an archive is the compiler somebody else runs.
+    /// Which toolchain the emitter that writes the archive is compiled with.
+    /// `release` by default here, unlike everywhere else.
     #[arg(long, value_name = "PROFILE", default_value = "release")]
     pub profile: String,
 
