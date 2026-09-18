@@ -1742,14 +1742,29 @@ same key §3's excursion turns on. A hundred and seventy-two of the crate's two
 hundred and ninety-five tests now install a producer, and they are faster for
 it.
 
-What the port cannot answer is two sites, not two crates. `ply-eval-tests`
-holds `prelude_arity`, which asks the checker's prelude environment for a
-builtin's arity over an empty program: no front end has that shape, and the
-test it serves compares three tables, so handing it `Builtin`'s own arity would
-have it compare a value with itself. `ply-store-tests` holds the `reconstruct`
-test, which rebuilds a program from stored bodies "without the source, and
-without knowing what anything was called" -- `front(sources, ids)` needs bytes
-and there are none, by design. `ply-hash-tests` has neither obstacle.
+What the port cannot answer is seven sites across three crates, and every one of
+them is a program with no source text. `ply-eval-tests` holds two:
+`prelude_arity`, which asks the checker's prelude environment for a builtin's
+arity over an empty program -- no front end has that shape, and the test it
+serves compares three tables, so handing it `Builtin`'s own arity would have it
+compare a value with itself -- and `compiled.rs`'s `checked`, which builds its
+program from `Vec<Item>` rather than from bytes. `ply-store-tests` holds one,
+the `reconstruct` test, which rebuilds a program from stored bodies "without the
+source, and without knowing what anything was called"; its other `reconstruct`
+asserts that an incomplete set *fails* to rebuild and never reaches a checker,
+so it is not one. `ply-hash-tests` holds four, every one of them `bodies.rs`
+checking a `reconstruct`ed program, and only its `compile` starts from files.
+
+**A count taken from the wrong grep.** A draft of this paragraph said
+`ply-hash-tests` had no obstacle at all and each of the others had exactly one.
+All three were counted by grepping `ply_core::`, which matches a qualified call
+and misses a bare-name one behind `use ply_core::check_program`. Against the
+whole call set the qualified share is ten of twelve in `ply-eval-tests`, one of
+two in `ply-store-tests` and five of nine in `ply-hash-tests`, so the grep
+undercounted every crate it was pointed at. What survives the recount is the
+shape rather than the tally: the port answers for bytes, and a fixture that has
+none -- an AST assembled in the test, or a program rebuilt from stored bodies --
+is what it cannot serve.
 
 **Built, 2026-09-17: `verify` sees the member it could not see, and the count
 says what it counts.** This record described the gap twice and fixed it neither
