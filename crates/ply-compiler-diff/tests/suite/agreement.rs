@@ -311,8 +311,7 @@ fn the_rewrites_this_comparison_gives_up_raise_exactly_these_diagnostics() {
         .collect(),
         "the set of diagnostics this comparison gives up has moved. Every one of them is \
          raised by `effect_set`, `record_update` or `try_op` — the three passes the port \
-         does not implement — and `../GAPS.md` §11R.D priced the decision at exactly this \
-         list. Re-take the price before changing the number."
+         does not implement."
     );
 
     // The tree half, printed rather than pinned: it moves whenever a `.ply` in the tree gains or

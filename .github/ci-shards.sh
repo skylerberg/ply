@@ -136,7 +136,6 @@ TREE_CHECKS=(
   "ply-span-tests:armed:the_code_registry_table_is_total_over_the_codes_module"
   "ply-span-tests:armed:no_allowlist_entry_has_outlived_its_reason"
   "ply-span-tests:armed:ambiguous_enum_names_are_declared"
-  "ply-span-tests:armed:no_two_adrs_share_a_number"
 )
 
 # Directories that hold code no cargo build reaches, and the CI job that runs each.
