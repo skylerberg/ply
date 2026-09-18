@@ -1360,6 +1360,33 @@ object-cache restore; 4/8 ran the longest tests, 84.1 s, in a shorter job. The
 overhead a job pays now rivals the work inside it, and that is what six seconds
 of margin will be spent on next. The deletions §3 counts on do not shrink it.
 
+**Read, 2026-09-17: 222 s, and it was one runner's archive.** `ac8c7820` moved
+this record and nothing else, and ran 222 s. Every job started at 30 s; `3/8`
+ended last at 216 s on a 186 s job, of which 77.7 s was `nextest` and **67.9 s
+was the archive restore**. Its peers in that same run restored the same 254 MB
+in 7 to 12 s. The suite summed 506.9 s against `4d4e1f05`'s 492.0 s, so the
+tests were ordinary. One runner drew a slow transfer, which is the fifth time
+this record has landed on the artifact path rather than on the tree.
+
+That puts a number on the variance the entry above worried about: over code that
+did not change, main has now run 173, 174, 183 and 222 s.
+
+**Read, 2026-09-17: what the object cache buys, and why the clock cannot say.**
+The partitions ran once without the cache and once with it, on one branch and
+both pull requests, with the restore confirmed present in the second: 456.7 s of
+`nextest` across the eight without it, 533.6 s with it. Read straight that says
+the cache costs 77 s, which is the opposite of what it is for, and this record
+does not believe it. The difference is some ten seconds a partition and the
+noise above is larger, so the reading is not evidence either way. An earlier
+attempt at the same question was worse and is worth naming: it set a pull
+request against a *main* run, which build an archive and reuse one.
+
+The instrument is not the clock. `cache::UNITS_REUSED` counts what the cache
+served -- a build that loads a unit instead of emitting it adds to it -- and
+that answers whether the cache serves anything without asking a runner to be
+reproducible. The input this record added stays for whoever asks next; the
+measurement line does not.
+
 **Read, 2026-09-17: where §2 ends, and why it is not the bundle migration.**
 This record has said, more than once, that the seed path cannot go before a
 textual migration of an unserved bundle exists. That is true and it is not the
