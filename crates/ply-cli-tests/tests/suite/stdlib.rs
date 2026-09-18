@@ -619,9 +619,7 @@ fn what_the_driver_refuses_before_asking_the_port_the_port_refuses_alike() {
     );
     for dir in [unshipped.path(), unknown.path()] {
         let (_, ours, theirs) = pulled_and_loaded(dir);
-        let err = theirs
-            .err()
-            .expect("an import nothing answers for is refused");
+        let err = theirs.expect_err("an import nothing answers for is refused");
         assert_eq!(
             ours.diagnostics.first().map(|d| d.code),
             Some(codes::UNKNOWN_MODULE)
