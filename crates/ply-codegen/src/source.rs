@@ -3,7 +3,7 @@
 
 use ply_hash::HashOutput;
 use ply_hash::body::BodySet;
-use ply_span::{SourceId, Symbol};
+use ply_span::{SourceId, Span, Symbol};
 use ply_syntax::ast::{AtomExpr, Expr, ExprKind, Item, Lit, Program, QName, SpecKind, Stmt, UnOp};
 use ply_syntax::resolve::{Namespace, Resolved};
 use ply_ty::{
@@ -20,7 +20,8 @@ pub struct Source {
     /// [`Front::check`].
     pub check: &'static CheckOutput,
     tables: Tables,
-    /// Each root's cache key: its hash, plus the texts' layout once attached. Empty: no caching.
+    /// Each root's cache key: its hash, plus its definition's own text once attached. Empty: no
+    /// caching.
     pub keys: HashMap<String, String>,
     /// Each module's source text, by module name; the emitter requires them.
     pub texts: HashMap<String, String>,
@@ -104,21 +105,6 @@ pub fn emit_keys(front: &Front) -> HashMap<String, String> {
         }
     }
     keys
-}
-
-fn layout_digest<'a>(
-    modules: impl Iterator<Item = &'a Symbol>,
-    texts: &HashMap<String, String>,
-) -> String {
-    let mut h = blake3::Hasher::new();
-    for module in modules {
-        let text = texts.get(module.as_str()).map_or("", String::as_str);
-        for part in [module.as_str(), text] {
-            h.update(&(part.len() as u64).to_le_bytes());
-            h.update(part.as_bytes());
-        }
-    }
-    h.finalize().to_hex()[..32].to_string()
 }
 
 /// A program-wide name in `module`, as `ModuleName::qualify` spells it.
@@ -442,18 +428,23 @@ struct Tables {
     /// Roots whose parameters and answer are all `Int` or `Bool`.
     scalars: HashSet<String>,
     modules: Vec<(Symbol, SourceId)>,
+    /// Each root's definition span; a clause's is its owner's.
+    spans: HashMap<String, Span>,
 }
 
 impl Tables {
     fn of(front: &Front) -> Tables {
         let laws: HashMap<&Symbol, &LawInfo> =
             front.check.laws.iter().map(|l| (&l.key, l)).collect();
+        let tests_by_key: HashMap<&Symbol, Span> =
+            front.check.tests.iter().map(|t| (&t.key, t.span)).collect();
         let mut t = Tables {
             ctors: ctors_of(front),
             roots: Vec::new(),
             arities: HashMap::new(),
             scalars: HashSet::new(),
             modules: Vec::new(),
+            spans: HashMap::new(),
         };
         let (mut tests, mut specs) = (Vec::new(), Vec::new());
         for (module, items) in &front.ordinals {
@@ -469,6 +460,7 @@ impl Tables {
                         let Some(def) = front.check.defs.get(name) else {
                             continue;
                         };
+                        t.spans.insert(root.clone(), def.span);
                         let (params, ret) = signature(&def.scheme.ty);
                         let scalar_params = params.iter().all(is_scalar);
                         t.note(root.clone(), params.len(), scalar_params && is_scalar(ret));
@@ -492,13 +484,17 @@ impl Tables {
                             };
                             let clause = clause_root(name, kind, k);
                             t.note(clause.clone(), arity, scalar);
+                            t.spans.insert(clause.clone(), def.span);
                             specs.push(clause);
                         }
                     }
-                    Ordinal::Test(_) => {
+                    Ordinal::Test(key) => {
                         // A test is a nullary root, never scalar since it answers anything.
                         let root = qualified(module, &test_root_name(ordinal));
                         t.note(root.clone(), 0, false);
+                        if let Some(span) = tests_by_key.get(key) {
+                            t.spans.insert(root.clone(), *span);
+                        }
                         tests.push(root);
                         ordinal += 1;
                     }
@@ -512,6 +508,9 @@ impl Tables {
                             let root = qualified(module, &law_root_name(law_ordinal, part));
                             let scalar = binders.iter().all(|b| is_scalar(&b.ty));
                             t.note(root.clone(), binders.len(), scalar);
+                            if let Some(l) = law {
+                                t.spans.insert(root.clone(), l.span);
+                            }
                             specs.push(root);
                         }
                         law_ordinal += 1;
@@ -606,14 +605,30 @@ impl Source {
     }
 
     pub fn with_texts(mut self, texts: HashMap<String, String>) -> Source {
-        // A body's C bakes in byte offsets and module indices, which no definition hash covers.
-        let layout = layout_digest(self.module_names(), &texts);
-        for key in self.keys.values_mut() {
-            key.push('@');
-            key.push_str(&layout);
-        }
+        let modules: HashMap<SourceId, &Symbol> =
+            self.tables.modules.iter().map(|(m, s)| (*s, m)).collect();
+        // A site is an offset into its definition's text, whose layout the hash does not cover, so
+        // a root whose text is not here keeps no key.
+        let own = |root: &str| -> Option<String> {
+            let span = self.tables.spans.get(root)?;
+            let text = texts.get(modules.get(&span.source)?.as_str())?;
+            let written = text.get(span.range())?;
+            Some(blake3::hash(written.as_bytes()).to_hex()[..32].to_string())
+        };
+        self.keys = std::mem::take(&mut self.keys)
+            .into_iter()
+            .filter_map(|(root, key)| {
+                let digest = own(&root)?;
+                Some((root, format!("{key}@{digest}")))
+            })
+            .collect();
         self.texts = texts;
         self
+    }
+
+    /// The span of the definition `root` is part of: what its sites are offsets from.
+    pub fn span_of(&self, root: &str) -> Option<Span> {
+        self.tables.spans.get(root).copied()
     }
 
     /// Every constructor, by program-wide name, with its arity.
@@ -633,11 +648,6 @@ impl Source {
     /// Whether every parameter and the answer are `Int` or `Bool`.
     pub fn scalar_signature(&self, name: &str) -> bool {
         self.tables.scalars.contains(name)
-    }
-
-    /// Each module's source, in program order: what a stored span's module index refers to.
-    pub fn module_sources(&self) -> Vec<SourceId> {
-        self.tables.modules.iter().map(|(_, s)| *s).collect()
     }
 
     pub fn module_count(&self) -> usize {

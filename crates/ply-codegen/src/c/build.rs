@@ -11,7 +11,7 @@ use crate::rt::Entry;
 use crate::rt::{Ctx, Tables};
 use crate::source::Source;
 use anyhow::{Result, bail};
-use ply_span::{SourceId, Symbol};
+use ply_span::{Span, Symbol};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -106,10 +106,12 @@ fn emit_all(
         refusals.extend(round);
     };
     let mut unit = Unit::new(ctors.to_vec());
+    // In `taken`'s order, which `describe` keeps: a body's place here is the root its sites name.
     let bodies: Vec<(String, String)> = emitted
         .into_iter()
-        .map(|(name, text, tables)| {
-            let text = resolve(&text, &tables, &mut unit);
+        .enumerate()
+        .map(|(root, (name, text, tables))| {
+            let text = resolve(&text, &tables, root, &mut unit);
             (name, text)
         })
         .collect();
@@ -239,24 +241,21 @@ fn describe(
     }
 }
 
-/// Load a unit produced elsewhere against its own constructor table. `sources` maps its modules
-/// to `SourceId`s for spans; `None` numbers them from zero, as the bootstrap does.
+/// Load a unit produced elsewhere against its own constructor table. `source` places its sites;
+/// without one, as the bootstrap loads it, a failure names no place.
 pub fn load_unit(
     text: &str,
-    sources: Option<Vec<SourceId>>,
+    source: Option<&Source>,
     stem: &str,
 ) -> Result<(Native, Vec<Refused>)> {
-    finish_unit(compile_and_load(text, stem)?, sources)
+    finish_unit(compile_and_load(text, stem)?, source)
 }
 
 /// A unit's object, however it was compiled, finished against what it says about itself.
-pub(super) fn finish_unit(
-    lib: Library,
-    sources: Option<Vec<SourceId>>,
-) -> Result<(Native, Vec<Refused>)> {
+pub(super) fn finish_unit(lib: Library, source: Option<&Source>) -> Result<(Native, Vec<Refused>)> {
     let exports = Exports::read(&lib)?;
     let refused = refused_of(&exports);
-    let native = finish(lib, exports, sources)?;
+    let native = finish(lib, exports, source)?;
     Ok((native, refused))
 }
 
@@ -300,7 +299,7 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
         && let Ok(exports) = Exports::read(&lib)
     {
         let refused = refused_of(&exports);
-        if let Ok(native) = finish(lib, exports, Some(loaded.module_sources())) {
+        if let Ok(native) = finish(lib, exports, Some(loaded)) {
             super::cache::UNITS_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if std::env::var("PLY_C_PHASES").is_ok() {
                 eprintln!(
@@ -325,7 +324,7 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
     }
     // Read back from the object, so cold and warm builds share one path.
     let exports = Exports::read(&lib)?;
-    let native = finish(lib, exports, Some(loaded.module_sources()))?;
+    let native = finish(lib, exports, Some(loaded))?;
     if std::env::var("PLY_C_PHASES").is_ok() {
         eprintln!(
             "phases: emit+resolve {}ms, assemble {}ms, cc+load {}ms, tables {}ms, source {}MB",
@@ -339,9 +338,9 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
     Ok((native, refusals))
 }
 
-/// A loaded object plus its `Exports`, made into an enterable `Native`.
+/// A loaded object plus its `Exports`, made into an enterable `Native`; `source` places its sites.
 /// Invariant: every field of `Unit` must be recorded in `Exports`, or the ids move.
-fn finish(lib: Library, exports: Exports, sources: Option<Vec<SourceId>>) -> Result<Native> {
+fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Native> {
     // Before binding: the C reads the first `n` helpers of the table it is handed.
     if let Some(why) = exports.unserved() {
         return Err(why.into());
@@ -351,7 +350,7 @@ fn finish(lib: Library, exports: Exports, sources: Option<Vec<SourceId>>) -> Res
         ctors,
         taken,
         constants,
-        modules,
+        modules: _,
         refusals: _,
         consts,
         fields,
@@ -359,7 +358,6 @@ fn finish(lib: Library, exports: Exports, sources: Option<Vec<SourceId>>) -> Res
         shapes,
         lambdas,
     } = exports;
-    let sources = sources.unwrap_or_else(|| (0..modules).map(|i| SourceId(i as u32)).collect());
     bind(&lib)?;
     let mut unit = Unit::new(ctors.clone());
     unit.consts = consts;
@@ -398,7 +396,10 @@ fn finish(lib: Library, exports: Exports, sources: Option<Vec<SourceId>>) -> Res
     }
     let mut tables = tables_of(unit, &ctors);
     tables.functions = functions;
-    tables.sources = sources;
+    tables.roots = taken
+        .iter()
+        .map(|(name, _)| source.and_then(|s| s.span_of(name)).unwrap_or(Span::DUMMY))
+        .collect();
     Ok(Native {
         lib,
         entries,
@@ -476,8 +477,9 @@ fn emit_one(
     }
 }
 
-/// Rewrite a body's `@@kN@@` placeholders from its own table positions to the unit's.
-fn resolve(text: &str, tables: &super::tables::Tables, unit: &mut Unit) -> String {
+/// Rewrite a body's `@@kN@@` placeholders from its own table positions to the unit's; `@@r@@`
+/// is the body's own root.
+fn resolve(text: &str, tables: &super::tables::Tables, root: usize, unit: &mut Unit) -> String {
     let consts: Vec<usize> = tables
         .consts
         .iter()
@@ -496,14 +498,15 @@ fn resolve(text: &str, tables: &super::tables::Tables, unit: &mut Unit) -> Strin
             .find("@@")
             .expect("an emitted placeholder always closes");
         let (kind, digits) = body[..end].split_at(1);
-        let i: usize = digits.parse().expect("an emitted placeholder is numbered");
+        let i = || -> usize { digits.parse().expect("an emitted placeholder is numbered") };
         let resolved = match kind {
-            "c" => consts[i],
-            "b" => builtins[i],
-            "f" => fields[i],
-            "s" => shapes[i] as usize,
-            "l" => lambdas[i],
-            other => unreachable!("an emitted placeholder is one of five kinds, not `{other}`"),
+            "r" => root,
+            "c" => consts[i()],
+            "b" => builtins[i()],
+            "f" => fields[i()],
+            "s" => shapes[i()] as usize,
+            "l" => lambdas[i()],
+            other => unreachable!("an emitted placeholder is one of six kinds, not `{other}`"),
         };
         out.push_str(&resolved.to_string());
         rest = &body[end + 2..];
@@ -593,6 +596,6 @@ fn tables_of(mut unit: Unit, ctors: &[(Symbol, usize)]) -> Tables {
         memo_values: Default::default(),
         memo_words: Default::default(),
         calls: Default::default(),
-        sources: Vec::new(),
+        roots: Vec::new(),
     }
 }
