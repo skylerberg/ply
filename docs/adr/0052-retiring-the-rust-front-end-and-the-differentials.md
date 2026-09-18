@@ -1702,14 +1702,19 @@ One hypothesis on the way was checked and dropped: that taking `hashes` from the
 port rather than from the hasher was the fault. It is not -- forty failed either
 way.
 
-So one way out is left for the migration, and the fix above is not it. The
-emitter's qualification takes the empty tier away, so `ensure_default()` in
-`compile` no longer costs anything; but the conflict this section closes on is
-a different fault and stands untested under the fix -- `compile` asking the
-port for its check while `run` denies the producer. Giving the harness its
-check without installing a producer removes the installation, which is the
-conflict itself. The migration is worth trying again now that the tier is
-real, and that is the next entry's work rather than this one's.
+So one way out is left for the migration, and it is the fix above. Migrated --
+`compile` taking its check and its hashes from `producer::front`,
+`ensure_default()` installed, the fixtures still anonymous -- all sixty-five
+pass at the default thread count under `cargo test`, the runner this entry
+says broke. The same migrated code against the committed bundle fails
+twenty-seven of them. So the fault was never `run` denying what `compile`
+needs: it was the tier the old emitter could not key, and the `(0, 3)` this
+entry opens with is that same defect seen from the other end.
+
+That clears `unit/runner.rs` and not the crate. `ply-core` is still held at
+five more sites -- `fixture.rs`, `hybrid.rs`, `host_scheduler_audit.rs`,
+`isolation_audit.rs`, and `bisect/delta.rs` twice -- and the dependency drops
+only when those move too.
 
 **Built, 2026-09-17: `verify` sees the member it could not see, and the count
 says what it counts.** This record described the gap twice and fixed it neither
