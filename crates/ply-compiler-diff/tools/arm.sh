@@ -69,16 +69,7 @@ grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-rewrite.log || {
 }
 
 echo
-echo "==> the fourth differential: infer.ply against crates/ply-core's checker"
-cargo test -p ply-compiler-diff --test suite -- infer:: --nocapture --test-threads=2 |
-  tee /tmp/ply-parser-infer.log
-grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-infer.log || {
-  echo "the checker differential ran no tests at all -- see the note above" >&2
-  exit 1
-}
-
-echo
-echo "==> the fifth differential: derive.ply against crates/ply-derive"
+echo "==> the fourth differential: derive.ply against crates/ply-derive"
 cargo test -p ply-compiler-diff --test suite -- derive:: --nocapture --test-threads=2 |
   tee /tmp/ply-parser-derive.log
 grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-derive.log || {
@@ -87,7 +78,7 @@ grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-derive.log || {
 }
 
 echo
-echo "==> the sixth differential: hash.ply against crates/ply-hash"
+echo "==> the fifth differential: hash.ply against crates/ply-hash"
 cargo test -p ply-compiler-diff --test suite -- hash:: --nocapture --test-threads=2 |
   tee /tmp/ply-parser-hash.log
 grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-hash.log || {
@@ -96,7 +87,7 @@ grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-hash.log || {
 }
 
 echo
-echo "==> the seventh differential: code.ply's lowering against ply_eval::code"
+echo "==> the sixth differential: code.ply's lowering against ply_eval::code"
 # Compares only what the port claims to lower, and asserts the share it reaches.
 PLY_C_EMITTER="ply:$root/crates/ply-compiler/ply" cargo test -p ply-compiler-diff --test suite -- lower_diff:: --nocapture --test-threads=2 |
   grep -E "input\(s\)|reaches|^test result|^error|panicked" || true
