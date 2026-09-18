@@ -1,5 +1,5 @@
 //! The deployable artifact: the transitive closure of one entry point, in the same bytes the
-//! content-addressed store already holds and printed back to the source a target opens.
+//! content-addressed store already holds.
 
 use crate::load::Loaded;
 use ply_hash::body::{BodySet, StoredBody};
@@ -23,7 +23,6 @@ const MAGIC: &[u8; 8] = b"PLYPROG1";
 /// --digest`.
 const DIGEST_DOMAIN: &[u8] = b"ply.program.2";
 
-/// Bit 0 of `flags`: the `CLOSURE` section is present.
 const FLAG_CLOSURE: u32 = 1;
 const FLAG_UNIT: u32 = 2;
 
@@ -69,8 +68,7 @@ pub struct Artifact {
     pub bodies: BTreeMap<DefHash, StoredBody>,
     /// The namespace: program-wide name to hash, sorted.
     pub names: Vec<(String, DefHash)>,
-    /// The closure printed back to source, keyed by the path that names each module (`a/b.ply`):
-    /// no test, no law, no comment and nothing unreached. The shipped modules are the target's own.
+    /// The closure printed back to source, per module path; shipped modules are the target's own.
     pub closure: Vec<(String, String)>,
     /// The compiled unit over these definitions, when the emitter produced one at build.
     pub unit: Option<EmbeddedUnit>,
@@ -89,8 +87,6 @@ impl Artifact {
             .map(|(name, _)| name.as_str())
     }
 
-    /// BLAKE3 over the entry point and every byte of the encoded file from `sections` onward: the
-    /// section table and every payload, domain-tagged.
     pub fn digest(&self) -> [u8; 32] {
         let bytes = self.encode();
         digest_of(&bytes).unwrap_or([0; 32])
@@ -285,8 +281,7 @@ pub fn build(
     out.names.dedup();
 
     out.closure = closure_texts(&out)?;
-    // Reopened as a target opens it, so an artifact that builds is one that opens, and its unit is
-    // over the program a target runs rather than over the project.
+    // Reopened as a target opens it, so an artifact that builds is one that opens.
     let opened = reopen(&out).map_err(|diags| vec![unreopened(&diags)])?;
     let names: Vec<&str> = out.names.iter().map(|(n, _)| n.as_str()).collect();
     let (unit, warnings) = embedded_unit(&opened, &names);
@@ -301,7 +296,6 @@ pub fn build(
     })
 }
 
-/// The closure's bodies printed back to source, a module per entry.
 fn closure_texts(artifact: &Artifact) -> Result<Vec<(String, String)>, Vec<Diagnostic>> {
     let mut bodies = BodySet::default();
     for (hash, body) in &artifact.bodies {
@@ -696,15 +690,13 @@ pub struct Opened {
     pub sources: SourceMap,
     pub program: Program,
     pub resolved: Resolved,
-    /// The port's whole answer over the artifact's closure. The unit a run builds is built from
-    /// *this* rather than from a front end derived a second time (ADR 0052 §1).
+    /// A run's unit is built from this rather than from a front end derived a second time.
     pub front: Front,
     /// The name the entry point answers to *in this program*.
     pub entry: Symbol,
 }
 
-/// Turns an artifact into something runnable: its closure, checked with the shipped modules it
-/// imports, and believed only if it is exactly the definitions the artifact names.
+/// Believed only if the closure is exactly the definitions the artifact names.
 pub fn open(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnostic>> {
     reopen(artifact).map_err(|diags| {
         if diags
@@ -724,9 +716,6 @@ pub fn open(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnostic>>
 }
 
 /// The port's whole answer over these module texts: the one front end opening an artifact runs.
-///
-/// An artifact carries its closure and pulls in the shipped modules it imports, so the texts handed
-/// over are the whole program and the answer is complete (ADR 0052 §1).
 fn ask_the_port(
     inputs: &[(ply_span::SourceId, ModuleName, String)],
 ) -> Result<Front, Vec<Diagnostic>> {
@@ -1233,12 +1222,10 @@ fn invalid(path: &Path, message: impl Into<String>) -> Diagnostic {
         .note("rebuild it with `ply build`, or transfer the file again")
 }
 
-/// The closure is not the program the artifact names: a different text, or one that does not check.
 fn unfaithful(message: String) -> Diagnostic {
     Diagnostic::error(codes::ARTIFACT_INVALID, message)
 }
 
-/// The first refusal as one line a note can carry.
 fn first_of(diags: &[Diagnostic]) -> String {
     diags.first().map_or_else(
         || "no reason was given".to_string(),
@@ -1246,7 +1233,6 @@ fn first_of(diags: &[Diagnostic]) -> String {
     )
 }
 
-/// A closure the build printed and could not open again is Ply's fault rather than the program's.
 fn unreopened(diags: &[Diagnostic]) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,

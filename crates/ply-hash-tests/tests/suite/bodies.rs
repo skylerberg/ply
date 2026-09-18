@@ -740,8 +740,7 @@ fn a_reconstructed_program_prints_to_the_source_it_hashes_as() {
     );
 }
 
-/// The examples beside the shipped modules: the corpus imports `std.net`, which `ply` pulls in on
-/// demand, and this harness has no import graph to walk.
+/// The examples and every shipped module: this harness has no import graph to pull in `std.net`.
 fn corpus() -> Vec<(String, String)> {
     let mut files: Vec<(String, String)> = Vec::new();
     for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples")).unwrap()
@@ -835,9 +834,7 @@ fn reconstruction_is_deterministic() {
 
 // --- reconstructing under the names a definition was written with ------------
 
-/// Two definitions in one module (so units are merged rather than each given a module of its own),
-/// a cross-module reference (so a dotted import path is rebuilt), and an effect (whose program-wide
-/// name is what a host handler is registered against).
+/// Two definitions in one module, a cross-module reference, and an effect a host handler names.
 const NAMED: [(&str, &str); 2] = [
     (
         "store.wire",
@@ -860,7 +857,6 @@ const NAMED: [(&str, &str); 2] = [
     ),
 ];
 
-/// Every definition's and declaration's program-wide name, as an artifact lists them.
 fn names_of(checked: &Checked) -> Vec<(Symbol, DefHash)> {
     checked
         .hashes
@@ -871,8 +867,6 @@ fn names_of(checked: &Checked) -> Vec<(Symbol, DefHash)> {
         .collect()
 }
 
-/// Rebuilt under its own names, printed and compiled again: every name comes back as the definition
-/// it named, and no other name comes back at all.
 fn exact_round_trip(original: &Checked) -> Vec<(String, String)> {
     let names = names_of(original);
     let program = ply_hash::body::reconstruct_exact(&original.bodies, &names, |_| false)
@@ -905,8 +899,6 @@ fn a_namespace_restores_the_names_and_the_modules() {
     assert_eq!(modules, ["app", "store.wire"], "units were not merged");
 }
 
-/// Two modules that share a last segment cannot both be bound by it, so each is imported `as` a
-/// binder of its own.
 #[test]
 fn modules_sharing_a_last_segment_are_imported_under_distinct_binders() {
     let original = compile(&[
@@ -937,9 +929,6 @@ fn modules_sharing_a_last_segment_are_imported_under_distinct_binders() {
     assert!(app.contains("import right.util as right_util"), "{app}");
 }
 
-/// Content addressing gives two identical bodies one hash, and each name still comes back: solo
-/// definitions, a group each member of which is the other's twin, and one pair written into two
-/// modules.
 #[test]
 fn every_name_of_one_body_comes_back() {
     let pair = r#"
@@ -961,8 +950,6 @@ fn every_name_of_one_body_comes_back() {
     exact_round_trip(&original);
 }
 
-/// A group in which two definitions share a body and a third reaches both: which one a call reaches
-/// is not in the bytes, and a guess would be a different program.
 #[test]
 fn one_body_named_twice_within_a_group_is_refused() {
     let original = compile(&[(
@@ -986,7 +973,6 @@ fn one_body_named_twice_within_a_group_is_refused() {
     );
 }
 
-/// Effects are nominal and one declaration's hash cannot say which of its names a body performs.
 #[test]
 fn one_effect_declaration_named_twice_is_refused() {
     let original = compile(&[
@@ -1010,8 +996,6 @@ fn one_effect_declaration_named_twice_is_refused() {
         .expect("named once, the declaration is that name's");
 }
 
-/// Nothing is invented: a body with no name, several definitions under one name, and a name with no
-/// module are each refused rather than filled in.
 #[test]
 fn names_that_cannot_be_applied_are_refused() {
     let original = compile(&NAMED.map(|(n, s)| (n, s)));
@@ -1031,8 +1015,6 @@ fn names_that_cannot_be_applied_are_refused() {
     }
 }
 
-/// A module that is only named is referred to and not written: the program is the modules around
-/// it, importing it.
 #[test]
 fn a_module_named_only_is_imported_and_not_rebuilt() {
     let original = compile(&NAMED.map(|(n, s)| (n, s)));
@@ -1051,8 +1033,6 @@ fn a_module_named_only_is_imported_and_not_rebuilt() {
     );
 }
 
-/// The corpus under its own names: every example and shipped module comes back as exactly the
-/// definitions it declared.
 #[test]
 fn the_examples_come_back_under_their_own_names() {
     let files = corpus();
