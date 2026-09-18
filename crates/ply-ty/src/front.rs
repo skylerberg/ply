@@ -12,7 +12,7 @@ use crate::{
 use indexmap::IndexMap;
 use ply_span::frames::{Cursor, read_diagnostics, write_diagnostics};
 use ply_span::{Diagnostic, Severity, SourceId, Span, Symbol};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The module index of a span outside every module.
 const NO_MODULE: u32 = u32::MAX;
@@ -122,6 +122,363 @@ impl Front {
             .iter()
             .any(|d| d.severity == Severity::Error)
     }
+
+    /// The part no module declares, then one per module; `Err` when `join` could not rebuild it.
+    pub fn split(&self) -> Result<(Front, Vec<Front>), String> {
+        if !self.diagnostics.is_empty() {
+            return Err("an answer with diagnostics does not split".to_string());
+        }
+        let h = &self.hashes;
+        let (tests, laws) = (self.check.tests.len(), self.check.laws.len());
+        if [
+            self.test_name_spans.len(),
+            self.test_bodies.len(),
+            h.tests.len(),
+        ] != [tests; 3]
+            || [self.law_literals.len(), h.laws.len(), h.law_texts.len()] != [laws; 3]
+        {
+            return Err("a table beside the tests or the laws is not parallel to them".to_string());
+        }
+
+        let mut place: BTreeMap<&Symbol, usize> = BTreeMap::new();
+        let mut parts = Vec::with_capacity(self.check.modules.len());
+        for (name, info) in &self.check.modules {
+            place.insert(name, parts.len());
+            let mut part = Front::default();
+            part.check.modules.insert(name.clone(), info.clone());
+            parts.push(part);
+        }
+        let part_of = |module: &Symbol| {
+            place
+                .get(module)
+                .copied()
+                .ok_or_else(|| format!("`{module}` declares entries but has no module frame"))
+        };
+        // Each part's place in `order`, after the prelude's entries at 0.
+        let mut rank = vec![0; parts.len()];
+        for (at, module) in self.order.iter().enumerate() {
+            rank[part_of(module)?] = at + 1;
+        }
+        if self.order.len() != parts.len() || rank.contains(&0) {
+            return Err("the order does not name every module once".to_string());
+        }
+
+        for (module, sets) in &self.effect_sets {
+            parts[part_of(module)?]
+                .effect_sets
+                .insert(module.clone(), sets.clone());
+        }
+
+        let mut laid = Laid::new("definitions");
+        for (name, d) in &self.check.defs {
+            let i = part_of(d.module.as_symbol())?;
+            laid.next(rank[i])?;
+            let written = self
+                .defs_written
+                .get(name)
+                .ok_or_else(|| format!("def `{name}` has no record of what its source wrote"))?;
+            parts[i].check.defs.insert(name.clone(), d.clone());
+            parts[i].defs_written.insert(name.clone(), written.clone());
+        }
+
+        let mut laid = Laid::new("types");
+        for (name, t) in &self.types {
+            let i = part_of(t.module.as_symbol())?;
+            laid.next(i)?;
+            parts[i].types.insert(name.clone(), t.clone());
+        }
+
+        let mut tested = Vec::with_capacity(tests);
+        let mut laid = Laid::new("tests");
+        for (n, t) in self.check.tests.iter().enumerate() {
+            let i = part_of(t.module.as_symbol())?;
+            laid.next(i)?;
+            let part = &mut parts[i];
+            let local = part.check.tests.len();
+            part.check.tests.push(TestInfo {
+                index: local,
+                ..t.clone()
+            });
+            part.test_name_spans.push(self.test_name_spans[n]);
+            part.test_bodies.push(self.test_bodies[n].clone());
+            part.hashes.tests.push(h.tests[n]);
+            tested.push((i, local));
+        }
+        let mut lawful = Vec::with_capacity(laws);
+        let mut laid = Laid::new("laws");
+        for (n, l) in self.check.laws.iter().enumerate() {
+            let i = part_of(l.module.as_symbol())?;
+            laid.next(i)?;
+            let part = &mut parts[i];
+            let local = part.check.laws.len();
+            part.check.laws.push(LawInfo {
+                index: local,
+                ..l.clone()
+            });
+            part.law_literals.push(self.law_literals[n].clone());
+            part.hashes.laws.push(h.laws[n]);
+            part.hashes.law_texts.push(h.law_texts[n]);
+            lawful.push((i, local));
+        }
+
+        let mut program = Front {
+            order: self.order.clone(),
+            ..Front::default()
+        };
+        let mut laid = Laid::new("effects");
+        for (name, e) in &self.check.effects {
+            let into = if e.module.is_anonymous() {
+                laid.next(0)?;
+                &mut program
+            } else {
+                let i = part_of(e.module.as_symbol())?;
+                laid.next(rank[i])?;
+                &mut parts[i]
+            };
+            into.check.effects.insert(name.clone(), e.clone());
+            if let Some(vis) = self.effects_written.get(name) {
+                into.effects_written.insert(name.clone(), *vis);
+            }
+        }
+        let mut laid = Laid::new("constructors");
+        for (name, c) in &self.check.ctors {
+            let into = if c.module.is_anonymous() {
+                laid.next(0)?;
+                &mut program
+            } else {
+                let i = part_of(c.module.as_symbol())?;
+                laid.next(rank[i])?;
+                &mut parts[i]
+            };
+            into.check.ctors.insert(name.clone(), c.clone());
+        }
+
+        // A test keyed like another module's definition would share its hash entries across parts.
+        let mut owner: BTreeMap<&Symbol, usize> = BTreeMap::new();
+        let declared = self
+            .check
+            .defs
+            .iter()
+            .map(|(n, d)| (n, &d.module))
+            .chain(self.types.iter().map(|(n, t)| (n, &t.module)))
+            .chain(
+                self.check
+                    .effects
+                    .iter()
+                    .map(|(n, e)| (n, &e.module))
+                    .filter(|(_, m)| !m.is_anonymous()),
+            )
+            .chain(self.check.tests.iter().map(|t| (&t.key, &t.module)))
+            .chain(self.check.laws.iter().map(|l| (&l.key, &l.module)));
+        for (name, module) in declared {
+            let i = part_of(module.as_symbol())?;
+            if owner.insert(name, i).is_some_and(|j| j != i) {
+                return Err(format!("`{name}` is claimed by two modules"));
+            }
+        }
+        let owned = |name: &Symbol| {
+            owner
+                .get(name)
+                .copied()
+                .ok_or_else(|| format!("`{name}` is hashed but no module declares it"))
+        };
+
+        let mut laid = Laid::new("hashed items");
+        for entry in &self.hash_order {
+            let (i, local) = match entry {
+                Hashed::Def(name) => (owned(name)?, Hashed::Def(name.clone())),
+                Hashed::Test(n) => {
+                    let (i, local) = tested.get(*n).copied().ok_or_else(|| {
+                        format!("the hash order names test {n}, which there is not")
+                    })?;
+                    (i, Hashed::Test(local))
+                }
+                Hashed::Law(n) => {
+                    let (i, local) = lawful.get(*n).copied().ok_or_else(|| {
+                        format!("the hash order names law {n}, which there is not")
+                    })?;
+                    (i, Hashed::Law(local))
+                }
+            };
+            laid.next(i)?;
+            parts[i].hash_order.push(local);
+        }
+        let n = parts.len();
+        let mut defs = deal(&h.defs, owned, n)?.into_iter();
+        let mut own = deal(&h.own, owned, n)?.into_iter();
+        let mut decls = deal(&h.decls, owned, n)?.into_iter();
+        let mut specs = deal(&h.specs, owned, n)?.into_iter();
+        let mut spec_texts = deal(&h.spec_texts, owned, n)?.into_iter();
+        let mut deps = deal(&h.deps, owned, n)?.into_iter();
+        let mut closure = deal(&h.closure, owned, n)?.into_iter();
+        for part in &mut parts {
+            let h = &mut part.hashes;
+            h.defs = defs.next().unwrap_or_default();
+            h.own = own.next().unwrap_or_default();
+            h.decls = decls.next().unwrap_or_default();
+            h.specs = specs.next().unwrap_or_default();
+            h.spec_texts = spec_texts.next().unwrap_or_default();
+            h.deps = deps.next().unwrap_or_default();
+            h.closure = closure.next().unwrap_or_default();
+        }
+
+        let mut laid = Laid::new("ordinals");
+        for (module, items) in &self.ordinals {
+            let i = part_of(module)?;
+            laid.next(i)?;
+            parts[i].ordinals.push((module.clone(), items.clone()));
+        }
+        let mut laid = Laid::new("bodies");
+        for (name, bytes) in &self.bodies {
+            let i = owned(name)?;
+            laid.next(i)?;
+            parts[i].bodies.push((name.clone(), bytes.clone()));
+        }
+        Ok((program, parts))
+    }
+
+    /// Undoes [`Front::split`]; `parts` are in source order, not `program.order`.
+    pub fn join(program: Front, mut parts: Vec<Front>) -> Result<Front, String> {
+        let mut place: BTreeMap<&Symbol, usize> = BTreeMap::new();
+        for (i, part) in parts.iter().enumerate() {
+            let mut modules = part.check.modules.keys();
+            let (Some(module), None) = (modules.next(), modules.next()) else {
+                return Err(format!("part {i} is not one module"));
+            };
+            if place.insert(module, i).is_some() {
+                return Err(format!("two parts are module `{module}`"));
+            }
+        }
+        let named: BTreeSet<&Symbol> = program.order.iter().collect();
+        if named.len() != parts.len() || program.order.len() != parts.len() {
+            return Err("the order does not name every part once".to_string());
+        }
+        let by_order = program
+            .order
+            .iter()
+            .map(|m| {
+                place
+                    .get(m)
+                    .copied()
+                    .ok_or_else(|| format!("the order names `{m}`, which no part is"))
+            })
+            .collect::<Result<Vec<usize>, String>>()?;
+
+        let mut out = Front {
+            order: program.order,
+            check: CheckOutput {
+                effects: program.check.effects,
+                ctors: program.check.ctors,
+                ..CheckOutput::default()
+            },
+            effects_written: program.effects_written,
+            ..Front::default()
+        };
+        for i in by_order {
+            let part = &mut parts[i];
+            out.check.defs.extend(std::mem::take(&mut part.check.defs));
+            out.defs_written
+                .extend(std::mem::take(&mut part.defs_written));
+            out.check
+                .effects
+                .extend(std::mem::take(&mut part.check.effects));
+            out.effects_written
+                .extend(std::mem::take(&mut part.effects_written));
+            out.check
+                .ctors
+                .extend(std::mem::take(&mut part.check.ctors));
+        }
+        for part in parts {
+            if let Some(name) = part
+                .hashes
+                .deps
+                .keys()
+                .find(|n| out.hashes.deps.contains_key(*n))
+            {
+                return Err(format!("`{name}` is hashed in two parts"));
+            }
+            let (tests, laws) = (out.check.tests.len(), out.check.laws.len());
+            out.check.modules.extend(part.check.modules);
+            out.effect_sets.extend(part.effect_sets);
+            out.types.extend(part.types);
+            out.check
+                .tests
+                .extend(
+                    part.check
+                        .tests
+                        .into_iter()
+                        .enumerate()
+                        .map(|(k, t)| TestInfo {
+                            index: tests + k,
+                            ..t
+                        }),
+                );
+            out.test_name_spans.extend(part.test_name_spans);
+            out.test_bodies.extend(part.test_bodies);
+            out.check.laws.extend(
+                part.check
+                    .laws
+                    .into_iter()
+                    .enumerate()
+                    .map(|(k, l)| LawInfo {
+                        index: laws + k,
+                        ..l
+                    }),
+            );
+            out.law_literals.extend(part.law_literals);
+            out.hash_order
+                .extend(part.hash_order.into_iter().map(|entry| match entry {
+                    Hashed::Test(k) => Hashed::Test(tests + k),
+                    Hashed::Law(k) => Hashed::Law(laws + k),
+                    def => def,
+                }));
+            let h = part.hashes;
+            out.hashes.defs.extend(h.defs);
+            out.hashes.own.extend(h.own);
+            out.hashes.decls.extend(h.decls);
+            out.hashes.tests.extend(h.tests);
+            out.hashes.laws.extend(h.laws);
+            out.hashes.specs.extend(h.specs);
+            out.hashes.spec_texts.extend(h.spec_texts);
+            out.hashes.law_texts.extend(h.law_texts);
+            out.hashes.deps.extend(h.deps);
+            out.hashes.closure.extend(h.closure);
+            out.ordinals.extend(part.ordinals);
+            out.bodies.extend(part.bodies);
+        }
+        Ok(out)
+    }
+}
+
+struct Laid {
+    what: &'static str,
+    at: usize,
+}
+
+impl Laid {
+    fn new(what: &'static str) -> Laid {
+        Laid { what, at: 0 }
+    }
+
+    fn next(&mut self, group: usize) -> Result<(), String> {
+        if group < self.at {
+            return Err(format!("the {} are not grouped by module", self.what));
+        }
+        self.at = group;
+        Ok(())
+    }
+}
+
+fn deal<V: Clone>(
+    table: &IndexMap<Symbol, V>,
+    owned: impl Fn(&Symbol) -> Result<usize, String>,
+    parts: usize,
+) -> Result<Vec<IndexMap<Symbol, V>>, String> {
+    let mut out = vec![IndexMap::new(); parts];
+    for (name, value) in table {
+        out[owned(name)?].insert(name.clone(), value.clone());
+    }
+    Ok(out)
 }
 
 pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String> {

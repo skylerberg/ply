@@ -1,5 +1,5 @@
 //! The `.ply-cache` directory: results keyed by `(RUNTIME_VERSION, DefHash)`, and the front end
-//! keyed by `(FRONTEND_VERSION, path | DefHash)`, beside its last whole answer.
+//! keyed by `(FRONTEND_VERSION, path | DefHash)`, beside the parts of its last answer.
 
 mod answer;
 mod binary;
@@ -301,11 +301,22 @@ pub struct Store {
     frontend_path: PathBuf,
     frontend_data_path: PathBuf,
     frontend: frontend::Frontend,
-    answer_path: PathBuf,
-    /// Written at the next flush, replacing whatever answer is on disk.
-    answer: Option<(ContentHash, String)>,
+    answer: Answer,
     warnings: Vec<Diagnostic>,
     stdlib: Stdlib,
+}
+
+#[derive(Default)]
+struct Answer {
+    path: PathBuf,
+    stored: OnceLock<std::collections::BTreeMap<ContentHash, String>>,
+    pending: Option<std::collections::BTreeMap<ContentHash, String>>,
+}
+
+impl Answer {
+    fn stored(&self) -> &std::collections::BTreeMap<ContentHash, String> {
+        self.stored.get_or_init(|| answer::read(&self.path))
+    }
 }
 
 #[derive(Default)]
@@ -643,8 +654,10 @@ impl Store {
             frontend_path,
             frontend_data_path,
             frontend,
-            answer_path,
-            answer: None,
+            answer: Answer {
+                path: answer_path,
+                ..Answer::default()
+            },
             warnings: frontend_warnings,
             stdlib: Stdlib {
                 path: stdlib_path,
@@ -733,7 +746,7 @@ impl Store {
             && !self.reviews.dirty
             && !self.frontend.is_dirty()
             && self.stdlib.pending.is_none()
-            && self.answer.is_none()
+            && self.answer.pending.is_none()
         {
             return Ok(());
         }
@@ -768,8 +781,9 @@ impl Store {
             disk::save_stdlib(&self.dir, &self.stdlib.path, &digest)?;
             self.stdlib.stored = OnceLock::from(Some(digest));
         }
-        if let Some((key, dump)) = self.answer.take() {
-            answer::write(&self.dir, &self.answer_path, key, &dump)?;
+        if let Some(parts) = self.answer.pending.take() {
+            answer::write(&self.dir, &self.answer.path, &parts)?;
+            self.answer.stored = OnceLock::from(parts);
         }
         Ok(())
     }
@@ -823,7 +837,8 @@ impl Store {
         self.passes.clear();
         self.obligations.clear();
         self.frontend.clear();
-        self.answer = None;
+        self.answer.pending = None;
+        self.answer.stored = OnceLock::from(std::collections::BTreeMap::new());
         self.warnings.clear();
         self.dirty = false;
         // After a clear there is nothing a moved stdlib could have invalidated.
@@ -836,7 +851,7 @@ impl Store {
         remove(&self.obligations.path, "obligation cache")?;
         remove(&self.frontend_path, "front-end cache")?;
         remove(&self.frontend_data_path, "front-end cache")?;
-        remove(&self.answer_path, "front-end answer")?;
+        remove(&self.answer.path, "front-end answer")?;
         remove(&self.dir.join(LEGACY_FRONTEND_FILE), "front-end cache")?;
         disk::sweep_temps(&self.dir, None);
         Ok(())
@@ -927,17 +942,21 @@ impl Store {
         self.stdlib.pending = Some(digest);
     }
 
-    /// The whole front-end answer last filed, when it was filed under `key`.
-    pub fn front_answer(&self, key: ContentHash) -> Option<String> {
-        match &self.answer {
-            Some((pending, dump)) if *pending == key => Some(dump.clone()),
-            _ => answer::read(&self.answer_path, key),
-        }
+    pub fn front_part(&self, key: ContentHash) -> Option<String> {
+        let parts = match &self.answer.pending {
+            Some(pending) => pending,
+            None => self.answer.stored(),
+        };
+        parts.get(&key).cloned()
     }
 
-    /// Replaces the answer on disk at the next flush: only the latest is ever kept.
-    pub fn put_front_answer(&mut self, key: ContentHash, dump: String) {
-        self.answer = Some((key, dump));
+    /// Replaces every part on disk at the next flush, unless these are the parts already there.
+    pub fn put_front_parts(&mut self, parts: std::collections::BTreeMap<ContentHash, String>) {
+        self.answer.pending = if self.answer.stored().keys().eq(parts.keys()) {
+            None
+        } else {
+            Some(parts)
+        };
     }
 
     pub fn frontend_path(&self) -> &Path {
@@ -1148,7 +1167,7 @@ impl Store {
     }
 
     pub fn frontend_is_empty(&self) -> bool {
-        self.frontend.is_empty() && self.answer.is_none() && !self.answer_path.exists()
+        self.frontend.is_empty() && self.answer.pending.is_none() && !self.answer.path.exists()
     }
 
     pub fn frontend_is_dirty(&self) -> bool {
