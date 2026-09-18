@@ -39,7 +39,6 @@ impl Fixture {
         Context::new(self.claims.clone(), &self.check)
     }
 
-    /// A law's binders, as the checker typed them, and its lowered guard and body.
     fn law(&self, label: &str) -> (Vec<LawBinder>, &Law) {
         let info = self
             .check
@@ -55,7 +54,6 @@ impl Fixture {
     }
 }
 
-/// An owner's parameters, then `result`, typed as the checker typed them.
 fn clause_binders(info: &DefInfo) -> Vec<LawBinder> {
     let Type::Fn { params, ret, .. } = &info.scheme.ty else {
         panic!("`{}` is not a function", info.name);
@@ -116,7 +114,6 @@ fn attempt_for_test(f: &Fixture, label: &str) -> (Decision, Vec<Blocker>) {
     )
 }
 
-/// The static tier reads the port's lowering, so the Rust syntax tree is not among its inputs.
 #[test]
 fn the_prover_does_not_depend_on_the_rust_syntax_tree() {
     let manifest = include_str!("../../../ply-prove/Cargo.toml");
@@ -564,7 +561,6 @@ fn two_calls_to_an_effectful_definition_are_not_one_term() {
     assert!(matches!(returns_zero(&f, "once"), Decision::Proved(_)));
 }
 
-/// The `ensures result == 0` on the nullary `owner`.
 fn returns_zero(fixture: &Fixture, owner: &str) -> Decision {
     let ctx = fixture.context();
     let def = fixture.def(owner);
@@ -649,7 +645,6 @@ fn withdraw(acct: Account, amount: Int) -> Account
   = Account(identifier(acct), balance(acct) - amount)
 "#;
 
-/// `withdraw`'s `index`th `ensures`, beside its `requires`.
 fn ensures_goal(index: usize) -> Decision {
     let f = fixture(LEDGER);
     let ctx = f.context();

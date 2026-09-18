@@ -514,7 +514,6 @@ pub fn front_dump(sources: &[(String, String)]) -> Result<String> {
     dump_over(FRONT, sources)
 }
 
-/// What the prover's static tier reads, as `ply_prove::prove::read_claims` reads it.
 const CLAIMS: &str = "front.claims_dump";
 
 /// Every body, clause and law of a program [`front`] already checked, lowered.

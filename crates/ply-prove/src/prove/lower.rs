@@ -79,7 +79,6 @@ pub enum Blocker {
     DecimalArithmetic,
     /// `perform`, `handle`, `with_cell` or `simulate`.
     Region,
-    /// A pattern outside the fragment, or a guard, which leaves its whole body unlowered.
     UndecidableMatchArm,
     DestructuringLet,
 }
@@ -101,7 +100,6 @@ pub struct Lowering<'a, 'p> {
     rules: &'a mut RuleLog,
     unfold_depth: u32,
     depth: u32,
-    /// The slots of the innermost root, unfolded body or applied lambda; `None` until bound.
     window: Vec<Option<TermId>>,
     blockers: Vec<Blocker>,
     /// What must hold for the lowered expressions not to raise or diverge.
@@ -279,14 +277,13 @@ impl<'a, 'p> Lowering<'a, 'p> {
         self.terms
     }
 
-    /// A clause or body whose leading slots are `binders`, in order.
     pub fn lower_root(&mut self, code: &Code, binders: &[TermId]) -> TermId {
         let window = binders.iter().map(|t| Some(*t)).collect();
         self.within(window, |this| this.lower(code))
     }
 
     fn lower(&mut self, code: &Code) -> TermId {
-        // Bodies may nest as deep as the parser accepted.
+        // Expressions may nest as deep as the parser accepted.
         stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || self.lower_inner(code))
     }
 
@@ -418,7 +415,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
         }
     }
 
-    /// A slot nothing bound is a fresh symbol at every read.
     fn local(&mut self, slot: usize) -> TermId {
         match self.window.get(slot).copied().flatten() {
             Some(term) => term,
@@ -440,7 +436,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
         out
     }
 
-    /// A name no table holds, a builtin or one the resolver did not bind, is a fresh symbol.
     fn global(&mut self, name: &Symbol) -> TermId {
         if let Some(ctor) = self.ctx.ctor(name) {
             let sort = scheme_sort(&ctor.scheme);
@@ -796,7 +791,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
                     self.bind(*slot, term);
                 }
                 Stmt::LetPat(Pat::Wild, _) => {}
-                // One symbol per name, so two reads of it are one value.
                 Stmt::LetPat(pat, value) => {
                     let term = self.lower(value);
                     let sort = self.terms.sort(term).cloned();

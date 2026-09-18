@@ -35,7 +35,6 @@ pub fn of<'a>(
     Ok(Box::new(prover.with_backend(backend)))
 }
 
-/// The port's lowering of every body, clause and law, asked over the modules `loaded` holds.
 fn claims_of(loaded: &Loaded) -> Result<Claims, LoadError> {
     let failed = |why: String| LoadError {
         sources: loaded.sources.clone(),
@@ -111,12 +110,10 @@ pub struct Prover<'a> {
     program: &'a Program,
     resolved: &'a Resolved,
     check: &'a CheckOutput,
-    /// Where a guard's literals are read.
     front: &'a Front,
     world: TypeWorld,
     /// Built once; `machine()` runs per obligation.
     ctx: prove::Context<'a>,
-    /// Each law's place among its module's laws, by key.
     laws: HashMap<Symbol, (usize, &'a LawInfo)>,
     /// What a `law/host` is discharged against.
     hosting: Option<Hosting<'a>>,
@@ -273,7 +270,6 @@ impl<'a> Prover<'a> {
         machine
     }
 
-    /// The static tier's answer, and the fragment boundaries it crossed on the way.
     fn decide(
         &self,
         obligation: &Obligation,
@@ -478,7 +474,6 @@ impl<'a> Prover<'a> {
         None
     }
 
-    /// What the claim's guards mention, as the port read them off the source.
     fn literals(&self, claim: &Claim<'_>) -> Literals {
         let written = match claim {
             Claim::Ensures { owner, .. } => self
@@ -774,7 +769,6 @@ struct Literals {
 }
 
 impl Literals {
-    /// By kind, each in the order the guards mention it.
     fn of(written: &[Literal]) -> Literals {
         let mut out = Literals::default();
         for literal in written {

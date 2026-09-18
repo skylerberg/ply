@@ -22,7 +22,7 @@ pub const SPLIT_DEPTH: u32 = 48;
 
 /// Binder `i` is slot `i` of every clause's window.
 pub struct Goal<'a> {
-    /// For an `ensures`, the owner's parameters and then `result`; for a law, its `forall` binders.
+    /// For an `ensures`, the owner's parameters and `result`; for a law, its `forall` binders.
     pub binders: &'a [LawBinder],
     /// The `requires` clauses beside this one, or a law's `where`.
     pub guards: &'a [&'a Code],
