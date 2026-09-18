@@ -63,7 +63,7 @@ pub struct Exports {
     pub taken: Vec<(String, usize)>,
     /// The pure nullary functions, which the seam memoizes.
     pub constants: Vec<String>,
-    /// How many modules the unit was emitted from; spans store a module index.
+    /// How many modules the unit was emitted from.
     pub modules: usize,
     /// What the fixpoint dropped and why.
     pub refusals: Vec<(String, String)>,

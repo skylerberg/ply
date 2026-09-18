@@ -25,17 +25,11 @@ fn hashes(files: &[(&str, &str)]) -> HashOutput {
     hash_program_ast(&program, &resolved).expect("program should hash")
 }
 
-/// The codes reported by resolution, or by inference when resolution is happy.
 fn errors(files: &[(&str, &str)]) -> Vec<&'static str> {
-    let mut program = program_of(files);
-    let resolved = match ply_syntax::resolve(&mut program) {
-        Ok(resolved) => resolved,
-        Err(diags) => return diags.iter().map(|d| d.code).collect(),
-    };
-    match ply_core::check_program(&program, &resolved) {
-        Ok(_) => Vec::new(),
-        Err(diags) => diags.iter().map(|d| d.code).collect(),
-    }
+    crate::fixture::port_errors(files)
+        .iter()
+        .map(|d| d.code)
+        .collect()
 }
 
 #[track_caller]

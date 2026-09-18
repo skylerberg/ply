@@ -15,7 +15,6 @@ tests, the standard library, the `ply` command and the diagnostic codes.
 | `crates/ply-span` | spans, diagnostics and the registry of diagnostic codes |
 | `crates/ply-syntax` | lexer, parser, AST and the syntactic rewrites |
 | `crates/ply-ty` | the type vocabulary the checker produces and everything else reads |
-| `crates/ply-core` | name environments and type and effect inference |
 | `crates/ply-derive` | `derive` rules |
 | `crates/ply-hash` | content addressing of definitions |
 | `crates/ply-eval` | values, the evaluator, the scheduler and the simulator |

@@ -1,6 +1,5 @@
 //! Definition bodies through the store.
 
-use ply_core::check_program;
 use ply_hash::body::BodySet;
 use ply_hash::{DefHash, HashOutput, hash_program_with_bodies};
 use ply_span::{SourceId, Symbol};
@@ -52,7 +51,6 @@ fn compile(source: &str) -> (HashOutput, BodySet) {
         ply_syntax::parse_program([(SourceId(0), ModuleName::from_dotted("m"), source)])
             .expect("it should parse");
     let resolved = ply_syntax::resolve(&mut program).expect("it should resolve");
-    check_program(&program, &resolved).expect("it should check");
     hash_program_with_bodies(&program, &resolved).expect("it should hash")
 }
 
@@ -83,8 +81,12 @@ fn a_stored_definition_set_rebuilds_into_a_program_that_checks() {
         .reconstruct(every_hash(&hashes))
         .expect("the stored bodies should rebuild");
 
-    let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
-    let check = check_program(&rebuilt.program, &resolved).expect("it should check");
+    ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
+    let printed = ply_syntax::print::program(&rebuilt.program);
+    let ids: Vec<SourceId> = (0..printed.len()).map(|i| SourceId(i as u32)).collect();
+    let check = ply_codegen::c::producer::checked_front(&printed, &ids)
+        .unwrap_or_else(|e| panic!("it should check: {e:#}"))
+        .check;
 
     let lookup = hashes.defs[&Symbol::new("m.lookup")];
     let name = rebuilt.name_of(lookup).expect("a name for lookup");

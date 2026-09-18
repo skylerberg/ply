@@ -197,7 +197,7 @@ fn the_ply_checker_restored_from_its_own_interfaces_matches_its_golden_on_the_bu
         }
     }
     let text = std::fs::read_to_string(fixtures().join("reference-checks.corpus"))
-        .expect("the mined checker inputs; run mine-checks.py");
+        .expect("the reference checker inputs");
     for (i, f) in bundle(&text).into_iter().enumerate() {
         inputs.push((
             format!("reference-checks.corpus#{i}"),
@@ -227,7 +227,7 @@ fn the_ply_checker_matches_its_golden_on_the_checkers_hand_written_programs() {
 #[test]
 fn the_ply_checker_matches_its_golden_on_the_references_own_inputs() {
     let text = std::fs::read_to_string(fixtures().join("reference-checks.corpus"))
-        .expect("the mined checker inputs; run mine-checks.py");
+        .expect("the reference checker inputs");
     let inputs: Vec<(String, Vec<(String, String)>)> = bundle(&text)
         .into_iter()
         .enumerate()
