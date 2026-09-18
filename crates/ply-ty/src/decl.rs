@@ -1,12 +1,10 @@
-//! What a declaration is named and classified by, shared by the syntax tree and the checker's
-//! output.
+//! What a declaration is named and classified by, shared by the syntax tree and the checker.
 
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::fmt;
 use std::path::Path;
 
-/// A module's dotted name, derived from its file's path relative to the project root:
-/// `store/orders.ply` is `store.orders`.
+/// A module's dotted name from its path under the root: `store/orders.ply` is `store.orders`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ModuleName(Symbol);
 
@@ -26,8 +24,7 @@ impl ModuleName {
         self.0.as_str().is_empty()
     }
 
-    /// Every directory component and the file stem must be a Ply identifier; anything else is
-    /// [`codes::INVALID_MODULE_PATH`].
+    /// Every directory component and the file stem must be a Ply identifier.
     pub fn from_relative_path(path: &Path) -> Result<ModuleName, Diagnostic> {
         let invalid = |what: &str| {
             Diagnostic::error(

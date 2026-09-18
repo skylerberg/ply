@@ -1,18 +1,5 @@
-//! What a compiled unit says about itself, carried in its own C so that loading one reads no
-//! source and no side file: the constructor table its tags are positions in, every function it
-//! holds with its arity, which of those are pure constants, how many modules it was emitted from,
-//! what the fixpoint refused, and the five tables its bodies name by position.
-//!
-//! It is a string in the object, `ply_exports`, NUL-terminated, read back through `dlsym` once the
-//! unit loads. A unit is then one file: the bootstrap bundle is its C, an artifact embeds its C,
-//! and the whole-unit cache keeps an object's key and nothing beside it. This is the first piece
-//! of separate compilation: a unit can be linked against with none of its sources present.
-//!
-//! **The helper table travels with the unit, and a unit serves while the runtime's table starts
-//! with it.** The C declares one pointer per runtime helper and `ply_bind` fills them by
-//! position, so a unit emitted against the first `n` helpers binds the first `n` positions and
-//! reads no other. A helper appended to the runtime leaves every unit before it serving; a
-//! helper changed or removed does not, and [`Exports::unserved`] says which (ADR 0050 §1a).
+//! What a compiled unit says about itself, embedded in its C so loading reads no source. Helpers
+//! bind by position, so a unit serves while the runtime's helper table starts with the unit's.
 
 use super::cache::{count, decode_tables, encode_tables, line};
 use super::load::Library;
@@ -24,12 +11,10 @@ use ply_span::Symbol;
 /// The symbol the table is read from.
 pub const SYMBOL: &str = "ply_exports";
 
-/// Bytes of one encoded line per C string literal, so no literal is longer than every compiler
-/// takes: a pooled byte constant is one line, and one line can be a hundred kilobytes of hex.
+/// Bytes per C string literal, so no literal exceeds what compilers accept.
 const PIECE: usize = 2000;
 
-/// One runtime helper as a unit records it: its name, how many arguments it takes past the
-/// context, and whether it answers a word.
+/// One runtime helper as a unit records it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HelperShape {
     pub name: String,
@@ -37,7 +22,6 @@ pub struct HelperShape {
     pub answers: bool,
 }
 
-/// The runtime's own table, in the shape a unit records.
 pub fn runtime_helpers() -> Vec<HelperShape> {
     HELPERS
         .iter()
@@ -49,8 +33,7 @@ pub fn runtime_helpers() -> Vec<HelperShape> {
         .collect()
 }
 
-/// A digest of the runtime's whole helper table, for a cache key: a cached body calls helpers by
-/// shape, and a cache may be conservative where a unit need not be.
+/// A digest of the runtime's whole helper table, for cache keys (stricter than serving needs).
 pub fn helpers_digest() -> String {
     let mut h = blake3::Hasher::new();
     for helper in HELPERS {
@@ -59,8 +42,7 @@ pub fn helpers_digest() -> String {
     h.finalize().to_hex().to_string()
 }
 
-/// Why a unit does not serve this runtime: the first helper of its table that the runtime's
-/// table does not carry at the same position with the same shape.
+/// Why a unit does not serve this runtime: its first helper the runtime lacks at that position.
 #[derive(Debug)]
 pub struct Unserved(pub String);
 
@@ -74,19 +56,16 @@ impl std::error::Error for Unserved {}
 
 #[derive(Clone)]
 pub struct Exports {
-    /// The runtime helpers the C was emitted against, in binding order.
     pub helpers: Vec<HelperShape>,
-    /// The table the C's tags are positions in, in tag order.
+    /// The constructor table the C's tags index.
     pub ctors: Vec<(Symbol, usize)>,
-    /// Every function the unit holds, with its arity, in the order the fixpoint took them.
+    /// Every function the unit holds, with its arity.
     pub taken: Vec<(String, usize)>,
-    /// The taken functions that are nullary and pure by their published row, which the seam
-    /// remembers rather than runs.
+    /// The pure nullary functions, which the seam memoizes.
     pub constants: Vec<String>,
-    /// How many modules the unit was emitted from; a body stores its span against a module index.
+    /// How many modules the unit was emitted from; spans store a module index.
     pub modules: usize,
-    /// What the fixpoint dropped and why, so a unit loaded anywhere reports the refusals of the
-    /// build that produced it.
+    /// What the fixpoint dropped and why.
     pub refusals: Vec<(String, String)>,
     pub consts: Vec<Value>,
     pub fields: Vec<Symbol>,
@@ -100,8 +79,7 @@ impl Exports {
         self.taken.iter().map(|(n, _)| n.clone()).collect()
     }
 
-    /// `None` when the runtime's table starts with this unit's; otherwise the first helper of the
-    /// unit's table the runtime does not carry at that position with that shape.
+    /// `None` when the runtime's helper table starts with this unit's.
     pub fn unserved(&self) -> Option<Unserved> {
         let runtime = runtime_helpers();
         for (i, mine) in self.helpers.iter().enumerate() {
@@ -230,8 +208,7 @@ impl Exports {
         })
     }
 
-    /// The table as C: one string literal per piece of a line, every byte outside plain printable
-    /// ASCII written in octal, so the text is a function of the table alone whatever a name holds.
+    /// The table as C string literals, non-printable bytes in octal.
     pub fn embed(&self) -> String {
         let encoded = self.encode();
         let mut out = String::with_capacity(encoded.len() + encoded.len() / 8);
@@ -264,7 +241,6 @@ impl Exports {
         out
     }
 
-    /// The table a loaded unit carries.
     pub fn read(lib: &Library) -> Result<Exports> {
         let Some(p) = lib.symbol(SYMBOL) else {
             return Err(anyhow!(

@@ -1,17 +1,11 @@
-//! The expression vocabulary a lowered body still speaks after the tree is gone: operators and
-//! literals, shared by the syntax tree, the checker, the evaluator and the code generator.
+//! Operators and literals, shared by the syntax tree, checker, evaluator and code generator.
 
 use crate::IntTy;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Lit {
     Int(i64),
-    /// `255u8`, `0x6A09_E667u32`. A suffixed literal is that type and nothing else, exactly as a
-    /// `Decimal` literal is written `1m` — Ply has no numeric tower and no implicit widening, so a
-    /// literal cannot be a value of two types and the spelling is what says which.
-    ///
-    /// `bits` is the value as the type reads it, normalized by [`IntTy::normalize`], so the lexer
-    /// has already refused anything the type does not hold.
+    /// A suffixed literal such as `255u8`; `bits` is normalized by [`IntTy::normalize`].
     Fixed {
         ty: IntTy,
         bits: u64,
@@ -38,8 +32,7 @@ pub fn render_float(f: f64) -> String {
     if f.is_infinite() {
         return if f > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
     }
-    // Rust's `{}` is shortest-round-tripping in *digits* but always positional, so `1e300` comes
-    // back as three hundred and one characters.
+    // `{}` is always positional, so `1e300` would print every digit.
     let positional = format!("{f}");
     let exponential = format!("{f:e}");
     let text = if exponential.len() < positional.len() {
@@ -70,12 +63,7 @@ pub enum BinOp {
     And,
     Or,
     Concat,
-    /// The bit operators, defined at
-    /// `Int` only. `Shl` discards what it shifts out — the one deliberate
-    /// exception to checked arithmetic — and a shift count outside `0..=63`
-    /// raises. Appended rather than filed beside `And`/`Or` so that
-    /// `ply_hash::normalize::binop_byte` can append its bytes too: an existing
-    /// byte that moves is every cached result invalidated.
+    /// `Int` only. `Shl` discards what it shifts out; a shift count outside `0..=63` raises.
     BitAnd,
     BitOr,
     BitXor,
@@ -116,8 +104,6 @@ impl BinOp {
 pub enum UnOp {
     Neg,
     Not,
-    /// Prefix `~`: the two's-complement complement of an `Int`. `!` stays
-    /// `Bool`-only, so neither operator can be written where the other is meant
-    /// (the shift semantics).
+    /// Prefix `~` on an `Int`; `!` stays `Bool`-only.
     BitNot,
 }
