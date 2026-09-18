@@ -1,5 +1,3 @@
-//! What replaced the fork, as a number rather than a slogan.
-
 use crate::counting::charge;
 use ply_eval::arena::Slot;
 use ply_eval::{Fixture, Value};
@@ -43,7 +41,6 @@ fn slots_of(fixture: &Fixture) -> Vec<Slot> {
     }
 }
 
-/// The half that got dearer, stated rather than hidden.
 #[test]
 fn opening_a_fixture_costs_the_fixture_and_the_number_is_printed() {
     println!("\n  cells   open allocations   open bytes");
@@ -79,7 +76,6 @@ fn opening_a_fixture_costs_the_fixture_and_the_number_is_printed() {
     );
 }
 
-/// The half that got cheaper, and the one on the path a run actually takes.
 #[test]
 fn resetting_to_the_fixture_allocates_nothing_however_much_the_run_did() {
     let fixture = seeded(1_000);
@@ -100,7 +96,6 @@ fn resetting_to_the_fixture_allocates_nothing_however_much_the_run_did() {
     }
 }
 
-/// A fixture is a seed rather than a live parent, and the two stacks it hands out are independent.
 #[test]
 fn two_stacks_opened_from_one_fixture_share_no_storage() {
     let fixture = seeded(64);

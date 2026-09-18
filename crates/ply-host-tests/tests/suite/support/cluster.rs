@@ -1,10 +1,7 @@
-//! A postgres cluster this test binary owns, start to finish.
-
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Where the postgres binaries are, if this machine has them.
 fn binary(name: &str) -> Option<PathBuf> {
     if let Ok(path) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path) {
@@ -27,8 +24,7 @@ pub fn available() -> bool {
     binary("initdb").is_some() && binary("postgres").is_some()
 }
 
-/// A running server, stopped when this is dropped — including while a panic unwinds, which is the
-/// case that would otherwise leak a postgres process per failing test.
+/// Stopped on drop, including during a panic unwind, so a failing test leaks no postgres.
 pub struct Cluster {
     directory: tempfile::TempDir,
     server: Child,
@@ -37,7 +33,6 @@ pub struct Cluster {
 }
 
 impl Cluster {
-    /// `initdb`, start, and create the database.
     pub fn start(database: &str) -> Cluster {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let data = directory.path().join("data");
@@ -67,8 +62,7 @@ impl Cluster {
 
         let port = free_port();
         let postgres = binary("postgres").expect("postgres");
-        // Run the server directly rather than through `pg_ctl`, so it is this process's child and
-        // dies with the harness rather than being daemonised past it.
+        // Run directly, not via `pg_ctl`, so the server is our child and dies with the harness.
         let server = Command::new(&postgres)
             .args([
                 "-D",
@@ -103,7 +97,6 @@ impl Cluster {
         cluster
     }
 
-    /// The `--db` string a run would be configured with.
     pub fn url(&self) -> String {
         self.url_for(&self.database)
     }
@@ -115,7 +108,6 @@ impl Cluster {
         )
     }
 
-    /// Run SQL out of band, through `psql`.
     pub fn psql(&self, database: &str, sql: &str) -> String {
         let psql = binary("psql").expect("psql");
         let out = Command::new(&psql)
@@ -176,7 +168,7 @@ impl Cluster {
 
 impl Drop for Cluster {
     fn drop(&mut self) {
-        // `pg_ctl stop` rather than `Child::kill`, and the difference is not tidiness.
+        // Not `kill`: SIGKILL stops the postmaster signalling backends and freeing shared memory.
         if let Some(pg_ctl) = binary("pg_ctl") {
             let stopped = Command::new(pg_ctl)
                 .args([

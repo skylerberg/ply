@@ -1,10 +1,3 @@
-//! Parse, resolve and check a source: what every module in this binary needs before it can assert
-//! anything, and what twenty-three of them used to spell out for themselves.
-//!
-//! The module name a fixture compiles under is observable — assertions name `m.foo` or `t.foo` —
-//! so it is a parameter here rather than a constant, and [`Compiled::new`] fixes only the `m` that
-//! most of them want.
-
 use ply_core::check_program;
 use ply_eval::{Machine, Provider};
 use ply_span::{Diagnostic, SourceId};
@@ -17,8 +10,7 @@ pub struct Compiled {
     pub program: Program,
     pub resolved: Resolved,
     pub check: CheckOutput,
-    /// Each module's source text, keyed by `m.name.to_string()` — what the whole Ply emitter
-    /// re-parses to produce bodies, since it is a front end rather than an AST consumer.
+    /// Keyed by `m.name.to_string()`: the Ply emitter re-parses source text, not the AST.
     pub texts: HashMap<String, String>,
 }
 
@@ -29,7 +21,7 @@ impl Compiled {
         Compiled::modules(&[("m", source)])
     }
 
-    /// One module under the name its assertions spell, for the fixtures that say `t.foo`.
+    /// One module under the name its assertions spell.
     #[track_caller]
     pub fn named(module: &str, source: &str) -> Compiled {
         Compiled::modules(&[(module, source)])
@@ -66,9 +58,7 @@ impl Compiled {
         }
     }
 
-    /// The diagnostics the checker refused `source` with, empty if it accepted. Parsing and
-    /// resolution still have to succeed: a fixture that cannot get that far is a broken fixture,
-    /// not an observation.
+    /// The checker's diagnostics, empty if it accepted; failing to parse or resolve panics.
     #[track_caller]
     pub fn rejected(source: &str) -> Vec<Diagnostic> {
         Compiled::rejected_in("m", source)
@@ -85,8 +75,7 @@ impl Compiled {
         check_program(&program, &resolved).err().unwrap_or_default()
     }
 
-    /// A machine running on a real compiled tier — the only evaluator under tier-only (ADR 0048).
-    /// Every eval-test that runs a program uses it, since a bare machine holds no evaluator.
+    /// A machine with a compiled tier attached: a bare machine holds no evaluator.
     pub fn machine(&self) -> Machine<'_> {
         let mut m = Machine::new(&self.program, &self.resolved, &self.check);
         let unit =

@@ -16,8 +16,6 @@ fn atom(effect: &str, resource: Option<&str>, mode: Mode) -> EffectAtom {
     )
 }
 
-/// Without this, every simulated test would drop out of `isolated: n of m` for no reason: a
-/// seed is handed to a test, never shared between two.
 #[test]
 fn a_seed_read_does_not_make_a_test_shared() {
     let f = Footprint::from_atoms([atom(SIM_EFFECT, None, Mode::Read)]);
@@ -27,8 +25,6 @@ fn a_seed_read_does_not_make_a_test_shared() {
     assert!(shared_footprint(&f).is_empty());
 }
 
-/// The case region isolation costs, at its smallest: a seed keeps its exemption and the region label
-/// does not, so the test is shared *and* the seed is not what made it shared.
 #[test]
 fn a_region_label_contends_and_the_seed_beside_it_still_does_not() {
     let f = Footprint::from_atoms([
@@ -46,8 +42,6 @@ fn a_region_label_contends_and_the_seed_beside_it_still_does_not() {
     );
 }
 
-/// The spawned body's effects flow through `task.spawn`'s row, so a test that simulates
-/// concurrent writes to a real resource still contends with the tests that read it.
 #[test]
 fn a_simulated_test_still_contends_over_what_its_tasks_touch() {
     let writer = Footprint::from_atoms([
@@ -67,8 +61,6 @@ fn a_test_that_never_simulated_is_not_seeded() {
     assert!(!is_seeded(&Footprint::empty()));
 }
 
-/// The isolation rule's property, preserved with its population changed: what is free to add is a test
-/// that names nothing, not a test whose state used to be forked.
 #[test]
 fn adding_isolated_simulated_tests_changes_no_group_count() {
     let shared: Vec<(usize, Footprint)> = vec![
@@ -92,7 +84,6 @@ fn adding_isolated_simulated_tests_changes_no_group_count() {
     assert_eq!(group_by_conflict(&wider).len(), before);
 }
 
-/// Two tests naming one label are coloured apart; two tests naming different labels are not.
 #[test]
 fn one_label_separates_its_writers_and_two_labels_do_not() {
     let same: Vec<(usize, Footprint)> = (0..4)

@@ -1,6 +1,3 @@
-//! What a lying host handler does to the **runner** — scheduling, the cache and the failure
-//! artifact.
-
 use crate::fixture::{Compiled, TierExecutor};
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
@@ -171,8 +168,6 @@ fn documents_two_tests_a_writing_handler_couples_are_scheduled_into_one_group() 
     );
 }
 
-/// The one guarantee at this boundary that does hold under a hostile handler, and the reason a
-/// wrong answer never becomes a permanent one.
 const DET_REACHES_HOST: &str = r#"
 effect disk {
   read peek[r](key: Int) -> Int
@@ -216,16 +211,13 @@ fn a_det_pass_over_a_lying_deterministic_handler_is_never_written_to_the_cache()
         );
     }
 
-    // The *result* cache is untouched, and one thing is not: a passing test records its closure as
-    // observed, which is what ends a definition's life as an M5 suspect.
+    // A pass still records its closure as observed, which ends each definition's life as a suspect.
     assert!(
         store.definitions_len() > 0,
         "a host-backed run wrote nothing at all, so this note is out of date"
     );
 }
 
-/// A handler builds its own diagnostics, and `ply_test` classifies a failure by the code the
-/// diagnostic carries — so the code is not the handler's to choose.
 #[test]
 fn a_handler_cannot_classify_its_own_failure_as_a_defect_in_ply() {
     struct Impersonates;
@@ -294,7 +286,6 @@ fn a_handler_cannot_classify_its_own_failure_as_a_defect_in_ply() {
     );
 }
 
-/// And the same test, hermetic, fails rather than quietly passing over a double nobody wrote.
 #[test]
 fn the_same_det_test_is_refused_hermetically() {
     let compiled = Compiled::new(DET_REACHES_HOST);
@@ -405,7 +396,6 @@ fn an_operation_that_escapes_a_partial_clause_set_is_refused_before_the_handler_
     );
 }
 
-/// And the claim does not outlive the entry point that stated it.
 const TWO_TESTS_ONE_WORKER: &str = r#"
 effect disk {
   read peek[r](key: Int) -> Int
@@ -455,11 +445,9 @@ fn a_footprint_claim_is_restated_for_every_test_the_worker_runs() {
     );
 }
 
-/// Hermetic by default: "Bisection and hybrids are skipped for a host-backed failure (`Skipped::Host`).
 #[test]
 fn a_host_backed_failure_is_skipped_rather_than_attributed() {
-    // v1: the test never reaches the host, passes hermetically, and its pass is recorded — which is
-    // what gives the failure below a baseline to bisect against.
+    // v1 never reaches the host, so its hermetic pass is the baseline the failure below bisects against.
     let before = Compiled::new(
         r#"
 effect disk {
@@ -485,8 +473,7 @@ test "the regression" { assert_eq(ask(1), expected()) }
         "the baseline pass has to be recorded or there is nothing to bisect against"
     );
 
-    // v2: `ask` now reaches the host on the taken branch, and the answer the handler gives is not
-    // the one the assertion wants.
+    // v2: `ask` reaches the host on the taken branch, and the handler's answer fails the assertion.
     let after = Compiled::new(
         r#"
 effect disk {
@@ -550,8 +537,7 @@ test "the regression" { assert_eq(ask(1), expected()) }
         "diagnosis reached the handler; M5 evaluates a failing test once per candidate set, \
          so this is the packet sent that many times"
     );
-    // The static half is still owed to the reader, and it needs no run: the suspects are the
-    // closure intersected with what changed.
+    // Suspects need no run: they are the closure intersected with what changed.
     assert!(
         report.failures[0]
             .attribution

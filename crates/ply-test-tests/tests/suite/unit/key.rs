@@ -19,8 +19,6 @@ fn an_unseeded_test_keeps_its_own_hash() {
     );
 }
 
-/// The rule that stops a run under one plan from reading a pass another plan earned, and the
-/// one whose absence is silent.
 #[test]
 fn a_seeded_test_is_never_keyed_by_its_bare_hash() {
     let plan = Plan::default();
@@ -29,8 +27,6 @@ fn a_seeded_test_is_never_keyed_by_its_bare_hash() {
     assert_eq!(key, sim_key(hash(1), &plan));
 }
 
-/// The same rule one axis over: a backend's pass is a claim about the backend, so it may not be
-/// read as the evaluator's and the evaluator's may not be read as its.
 #[test]
 fn an_engine_never_reads_another_engines_key() {
     let plan = Plan::default();
@@ -45,7 +41,6 @@ fn an_engine_never_reads_another_engines_key() {
     );
 }
 
-/// Two backends are two engines, so one's pass is not the other's either.
 #[test]
 fn two_backends_are_two_namespaces() {
     let plan = Plan::default();
@@ -55,8 +50,6 @@ fn two_backends_are_two_namespaces() {
     );
 }
 
-/// The evaluator's keys are the ones this cache has always used, so adding engines reads every
-/// cache written before them rather than orphaning it.
 #[test]
 fn the_evaluator_keeps_the_keys_the_cache_already_holds() {
     let plan = Plan {

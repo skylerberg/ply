@@ -1,5 +1,4 @@
-//! The two files M8 adds, and the one property that makes them affordable: neither is read at
-//! [`Store::open`].
+//! The obligation and review files, neither of which is read at [`Store::open`].
 
 use ply_hash::DefHash;
 use ply_span::Symbol;
@@ -10,9 +9,7 @@ use ply_store::{
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// A unique directory under the system temp dir, removed on drop — the same device this crate's
-/// unit tests use, and for the same reason: a dev-dependency for one `mkdir` is not worth the build
-/// time.
+/// A temp directory removed on drop; `tempfile` is not worth a dev-dependency for one `mkdir`.
 struct TempRoot(PathBuf);
 
 impl TempRoot {
@@ -140,7 +137,6 @@ fn a_file_written_by_another_prover_is_discarded_whole() {
     );
 }
 
-/// The budget `Store::open` has predates all three lazily-read files.
 #[test]
 fn neither_file_is_read_at_open() {
     let dir = TempRoot::new("t");
@@ -188,7 +184,6 @@ fn a_review_record_is_keyed_by_name_and_sorts_its_specs() {
     assert_eq!(store.review_records_len(), 1);
 }
 
-/// `ply cache clear` means "prove everything again".
 #[test]
 fn clearing_the_cache_discards_the_obligations_and_keeps_the_review_baseline() {
     let dir = TempRoot::new("t");
@@ -209,8 +204,6 @@ fn clearing_the_cache_discards_the_obligations_and_keeps_the_review_baseline() {
     );
 }
 
-/// Two runs must not discard each other's work, so a flush merges rather than replaces — the same
-/// rule the result cache follows, under the same lock.
 #[test]
 fn a_flush_merges_with_what_another_run_wrote() {
     let dir = TempRoot::new("t");
@@ -228,9 +221,7 @@ fn a_flush_merges_with_what_another_run_wrote() {
     assert_eq!(store.obligation(key(2)), Some(&sample(200)));
 }
 
-/// The reason there are two version constants: a prover that learns a new rule must upgrade a tier
-/// without invalidating a single test result, and a change to evaluation must invalidate results
-/// without touching a proof that never ran a program.
+/// A new prover rule must upgrade a tier without invalidating a test result, and vice versa.
 #[test]
 fn discarding_the_obligations_leaves_every_test_result_where_it_was() {
     let dir = TempRoot::new("t");
@@ -257,8 +248,6 @@ fn discarding_the_obligations_leaves_every_test_result_where_it_was() {
     assert!(store.knows_definition(key(6)));
 }
 
-/// A run that answered every question from the cache has nothing to write, and must not rewrite the
-/// file to say so.
 #[test]
 fn re_recording_what_is_already_stored_is_not_a_write() {
     let dir = TempRoot::new("t");

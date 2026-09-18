@@ -1,5 +1,4 @@
-//! Adversarial audit of the property the alias properties calls the headline test: an `effect set` name
-//! never enters a hash.
+//! Adversarial audit: an `effect set` name never enters a hash.
 
 use ply_hash::{DefHash, HashOutput, hash_ast, hash_program_ast};
 use ply_span::{SourceId, Symbol};
@@ -38,9 +37,6 @@ fn with_effects(rest: &str) -> String {
     format!("{EFFECTS}{rest}")
 }
 
-// --- rows in positions the obvious test does not reach ----------------------
-
-/// A row on a function *type* — a parameter's, not the definition's.
 #[test]
 fn a_set_inside_a_parameters_function_type_is_erased() {
     let named = with_effects(
@@ -54,8 +50,6 @@ fn a_set_inside_a_parameters_function_type_is_erased() {
     assert_eq!(def(&named, "run"), def(&written, "run"));
 }
 
-/// A row inside a `let`'s type annotation, which is a row at an arbitrary depth of a body rather
-/// than in a signature.
 #[test]
 fn a_set_inside_a_let_annotation_is_erased() {
     let named = with_effects(
@@ -74,8 +68,6 @@ fn a_set_inside_a_let_annotation_is_erased() {
     assert_eq!(def(&named, "go"), def(&written, "go"));
 }
 
-/// A row inside a lambda parameter's type, which is a type inside an expression inside a definition
-/// — the deepest place `walk_expr` has to reach.
 #[test]
 fn a_set_inside_a_lambda_parameter_type_is_erased() {
     let named = with_effects(
@@ -89,7 +81,6 @@ fn a_set_inside_a_lambda_parameter_type_is_erased() {
     assert_eq!(def(&named, "go"), def(&written, "go"));
 }
 
-/// A row inside an effect operation's own declared type.
 #[test]
 fn a_set_inside_an_effect_operations_type_is_erased() {
     let named = with_effects(
@@ -113,9 +104,6 @@ fn a_set_inside_an_effect_operations_type_is_erased() {
     );
 }
 
-// --- ways of writing the same set -------------------------------------------
-
-/// A set with no members.
 #[test]
 fn a_set_that_expands_to_nothing_is_the_empty_row() {
     let named = with_effects(
@@ -126,7 +114,6 @@ fn a_set_that_expands_to_nothing_is_the_empty_row() {
     assert_eq!(def(&named, "pure_fn"), def(&written, "pure_fn"));
 }
 
-/// An empty set beside written atoms contributes nothing and moves nothing.
 #[test]
 fn an_empty_set_beside_atoms_contributes_nothing() {
     let named = with_effects(
@@ -137,7 +124,6 @@ fn an_empty_set_beside_atoms_contributes_nothing() {
     assert_eq!(def(&named, "f"), def(&written, "f"));
 }
 
-/// The row and the set naming one atom between them.
 #[test]
 fn an_atom_written_beside_the_set_that_already_holds_it_moves_no_hash() {
     let both = with_effects(
@@ -151,7 +137,6 @@ fn an_atom_written_beside_the_set_that_already_holds_it_moves_no_hash() {
     assert_eq!(def(&both, "f"), def(&alias_only, "f"));
 }
 
-/// One set named twice in one row.
 #[test]
 fn naming_one_set_twice_in_a_row_moves_no_hash() {
     let twice = with_effects(
@@ -165,7 +150,6 @@ fn naming_one_set_twice_in_a_row_moves_no_hash() {
     assert_eq!(def(&twice, "f"), def(&once, "f"));
 }
 
-/// A set declared below the definition that names it.
 #[test]
 fn a_set_declared_after_its_use_expands_the_same() {
     let after = with_effects(
@@ -179,7 +163,6 @@ fn a_set_declared_after_its_use_expands_the_same() {
     assert_eq!(def(&after, "f"), def(&before, "f"));
 }
 
-/// Two hundred sets, each naming the one below it.
 #[test]
 fn a_two_hundred_deep_chain_of_sets_expands_to_the_written_row() {
     let mut source = String::from("effect set S0 = {db.read[users], log.write}\n");
@@ -191,7 +174,6 @@ fn a_two_hundred_deep_chain_of_sets_expands_to_the_written_row() {
     assert_eq!(def(&with_effects(&source), "f"), def(&written, "f"));
 }
 
-/// A diamond: two sets that both reach a third.
 #[test]
 fn a_diamond_of_sets_splices_the_shared_atoms_once() {
     let diamond = with_effects(
@@ -205,7 +187,6 @@ fn a_diamond_of_sets_splices_the_shared_atoms_once() {
     assert_eq!(def(&diamond, "f"), def(&written, "f"));
 }
 
-/// A set whose name is also an effect's name.
 #[test]
 fn a_set_named_after_an_effect_is_still_only_a_set_in_a_row() {
     let shadowing = with_effects(
@@ -216,7 +197,6 @@ fn a_set_named_after_an_effect_is_still_only_a_set_in_a_row() {
     assert_eq!(def(&shadowing, "f"), def(&written, "f"));
 }
 
-/// A row that names a set *and* carries a row variable.
 #[test]
 fn a_set_beside_a_row_variable_is_erased() {
     let named = with_effects(
@@ -229,8 +209,6 @@ fn a_set_beside_a_row_variable_is_erased() {
     );
     assert_eq!(def(&named, "run"), def(&written, "run"));
 }
-
-// --- across modules ---------------------------------------------------------
 
 fn program(files: &[(&str, &str)]) -> HashOutput {
     let inputs = files
@@ -265,7 +243,6 @@ pub effect log {
 }
 ";
 
-/// A set holding atoms of an *imported* effect.
 #[test]
 fn a_set_over_an_imported_effect_hashes_as_the_written_row() {
     let named = program(&[
@@ -288,7 +265,6 @@ fn a_set_over_an_imported_effect_hashes_as_the_written_row() {
     assert_eq!(in_program(&named, "b.f"), in_program(&written, "b.f"));
 }
 
-/// The same set, reached through an import alias.
 #[test]
 fn a_set_written_through_an_import_alias_hashes_the_same() {
     let plain = program(&[
@@ -312,8 +288,7 @@ fn a_set_written_through_an_import_alias_hashes_the_same() {
     assert_eq!(in_program(&plain, "b.f"), in_program(&aliased, "b.f"));
 }
 
-/// Moving an annotated definition to another module, with the set moved beside it because a set is
-/// module-local.
+/// The set moves too, because a set is module-local.
 #[test]
 fn moving_an_aliased_definition_between_modules_moves_no_hash() {
     let here = program(&[
@@ -344,7 +319,6 @@ fn moving_an_aliased_definition_between_modules_moves_no_hash() {
     );
 }
 
-/// Two modules that declare a set of the same name over *different* atoms.
 #[test]
 fn two_modules_may_declare_one_set_name_over_different_atoms() {
     let out = program(&[

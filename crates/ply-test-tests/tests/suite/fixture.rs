@@ -1,14 +1,3 @@
-//! Parse, resolve, check and hash a source: what every module in this binary needs before it can
-//! assert anything about selection, scheduling or a cache.
-//!
-//! Two entry points, because they do not agree: [`Compiled::anonymous`] parses one module the way
-//! `ply_syntax::parse` names it, and [`Compiled::new`] names it `m`. A module name reaches the
-//! hashes through every program-wide symbol, so the two are not interchangeable.
-//!
-//! A run needs one more thing under tier-only (ADR 0048): the compiled tier is the only evaluator,
-//! so a fixture that is *run* — as opposed to only scheduled — carries its module source texts and
-//! hands them to the whole Ply emitter through [`Compiled::tier`].
-
 use ply_eval::{Exploration, host::HostUse};
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId};
@@ -39,11 +28,9 @@ pub struct Compiled {
     pub resolved: Resolved,
     pub check: CheckOutput,
     pub hashes: HashOutput,
-    /// Kept rather than dropped: a `Front` without them disables every hybrid silently, since
-    /// `bodies_available` answers false and the bisection reports no mixture instead of failing.
+    /// A `Front` without bodies silently disables every hybrid rather than failing.
     pub bodies: ply_hash::body::BodySet,
-    /// Each module's source text, keyed by `m.name.to_string()` — what the whole Ply emitter
-    /// re-parses to produce bodies, since it is a front end rather than an AST consumer.
+    /// Keyed by `m.name.to_string()`; the Ply emitter re-parses these rather than reading the AST.
     pub texts: HashMap<String, String>,
 }
 
@@ -54,7 +41,7 @@ impl Compiled {
         Compiled::modules(&[("m", src)])
     }
 
-    /// One module under the name `ply_syntax::parse` gives it, which is not `m`.
+    /// Named as `ply_syntax::parse` names it, not `m`; the module name reaches every hash.
     #[track_caller]
     pub fn anonymous(src: &str) -> Compiled {
         let module = ply_syntax::parse(SourceId(0), src).expect("the fixture must parse");
@@ -118,7 +105,6 @@ impl Compiled {
         }
     }
 
-    /// The Rust chain's answer as a [`ply_ty::Front`], which is what `diagnose_failures` takes.
     pub fn front(&self) -> ply_ty::Front {
         ply_codegen::source::front_of(
             &self.program,
@@ -129,7 +115,6 @@ impl Compiled {
         )
     }
 
-    /// Every test's footprint, owned, so a caller may take one from a temporary.
     pub fn footprints(&self) -> Vec<ply_ty::Footprint> {
         self.check
             .tests
@@ -138,9 +123,7 @@ impl Compiled {
             .collect()
     }
 
-    /// The whole Ply emitter's unit for this program, and the C backend spec to install it with —
-    /// what a run needs under tier-only, since a bare machine holds no evaluator. Leaks a
-    /// `&'static` unit, which a test may.
+    /// Leaks the `&'static` unit. A bare machine holds no evaluator, so every run needs this.
     pub fn tier(&self) -> (&'static ply_codegen::Unit, ply_eval::BackendSpec) {
         let unit =
             ply_codegen::Unit::over_with_texts(&self.program, &self.resolved, self.texts.clone())
@@ -153,11 +136,7 @@ impl Compiled {
     }
 }
 
-/// Wraps an [`InterpExecutor`] carrying the whole Ply tier so it presents as the evaluator. Under
-/// tier-only the C tier is the sole engine; a run's cache is keyed by the bare test hash in the
-/// [`Engine::Evaluator`] namespace, which is what every `select(.., Engine::Evaluator)` and
-/// `store.get(hash)` in these tests reads. Reporting the backend's own engine would move each pass
-/// into a namespace nothing here reads, so the engine the tier stands in for is the one it names.
+/// Reports `Engine::Evaluator`, the cache namespace every `select` and `store.get` here reads.
 pub struct TierExecutor<'a>(pub InterpExecutor<'a>);
 
 impl<'a> Executor for TierExecutor<'a> {

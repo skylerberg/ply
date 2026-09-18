@@ -1,5 +1,3 @@
-//! What the socket handler claims, and whether it is telling the truth.
-
 use ply_eval::{Bound, HostBinding, Pending, Value};
 use ply_eval::{HostAnswer, HostRequest, HostRuntime, Linearity};
 use ply_host::tcp::*;
@@ -15,8 +13,7 @@ use std::sync::Arc;
 const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n";
 const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nply";
 
-/// A registration is resolved against the atoms the **program** performs, and the shipped
-/// declaration names no resource label on its own.
+/// Registrations resolve against the atoms the program performs; the declaration names no label.
 const DRIVER: &str = r#"
 fn every_op(port: Int, payload: Bytes) -> Int / {net.write[listener], net.write[conn]} = {
   let l = net.listen[listener](port);
@@ -35,9 +32,7 @@ fn int_or_zero(answer: Option<Int>) -> Int =
   match answer { Some(n) -> n, None -> 0 }
 "#;
 
-/// Checked under the module name it ships as, because an effect's name is qualified: the same text
-/// loaded anonymously declares `net` rather than `std.net.net` and would not bind, which is the
-/// drift [`EFFECT`] exists to pin.
+/// Under its shipped name: anonymously it declares `net`, not `std.net.net`, and cannot bind.
 fn fixture() -> String {
     format!("{DECLARATION}{DRIVER}")
 }
@@ -61,8 +56,6 @@ fn atom(resource: &str) -> EffectAtom {
     EffectAtom::new(EFFECT, Resource::Named(Symbol::new(resource)), Mode::Write)
 }
 
-/// One `perform`, as the machine would make it: resolve the triple, call the handler, and drive a
-/// pending answer to a value the way an entry point with no scheduler around it does.
 fn perform(
     binding: &HostBinding,
     rt: &dyn HostRuntime,
@@ -105,7 +98,7 @@ fn bytes(v: Value) -> Vec<u8> {
         .to_vec()
 }
 
-/// `recv` and `send` answer an `Option` since deadlines as arguments, where `None` is a deadline.
+/// `recv` and `send` answer an `Option`, where `None` is a deadline.
 fn inside(v: Value) -> Value {
     match &v {
         Value::Ctor { name, args } if name.as_str() == "Some" => args[0].clone(),
@@ -115,8 +108,6 @@ fn inside(v: Value) -> Value {
         _ => v,
     }
 }
-
-// --- The registration -------------------------------------------------------
 
 #[test]
 fn the_declaration_binds_and_names_exactly_the_atoms_the_program_performs() {
@@ -132,7 +123,6 @@ fn the_declaration_binds_and_names_exactly_the_atoms_the_program_performs() {
     );
 }
 
-/// The claim `ply hosts` puts in front of a reviewer.
 #[test]
 fn the_listing_is_one_row_per_triple_and_never_a_star() {
     let binding = bind(Arc::new(TcpHost::new()));
@@ -151,9 +141,7 @@ fn the_listing_is_one_row_per_triple_and_never_a_star() {
             "std.net.net.close[listener] std.net.net.write[listener] ply_host::tcp::close",
             "std.net.net.listen[conn] std.net.net.write[conn] ply_host::tcp::listen",
             "std.net.net.listen[listener] std.net.net.write[listener] ply_host::tcp::listen",
-            // Its own line with its own path, which is the whole of how "this program can serve
-            // TLS" is disclosed: the row it contributes is an ordinary `net.write[..]`, so nothing
-            // else in the listing says it.
+            // The only row saying the program serves TLS; its other is a plain `net.write[..]`.
             "std.net.net.listen_tls[conn] std.net.net.write[conn] ply_host::tls::listen",
             "std.net.net.listen_tls[listener] std.net.net.write[listener] ply_host::tls::listen",
             "std.net.net.recv[conn] std.net.net.write[conn] ply_host::tcp::recv",
@@ -164,8 +152,6 @@ fn the_listing_is_one_row_per_triple_and_never_a_star() {
     );
 }
 
-/// The whole reason every operation is `[s]`: two sockets a program labels apart are two resources,
-/// so the conflict graph lets the tasks holding them run at once.
 #[test]
 fn two_labelled_sockets_do_not_conflict_and_one_label_does() {
     assert!(!atom("conn").conflicts_with(&atom("listener")));
@@ -192,7 +178,6 @@ fn the_twin_declares_the_same_signature_and_differs_only_where_it_must() {
     assert!(script.listing().rows.iter().all(|r| !r.blocking));
 }
 
-/// The flag the machine's E0426 rule keys on.
 #[test]
 fn no_operation_claims_to_be_repeatable() {
     for net in [
@@ -208,8 +193,6 @@ fn no_operation_claims_to_be_repeatable() {
     }
 }
 
-/// The arrow points from the declaration to the handler: the source says `nondet` or the handler is
-/// refused.
 #[test]
 fn a_declaration_without_nondet_refuses_the_handler() {
     let weakened = fixture().replacen("nondet effect net", "effect net", 1);
@@ -225,7 +208,6 @@ fn a_declaration_without_nondet_refuses_the_handler() {
     );
 }
 
-/// A rename on either side.
 #[test]
 fn an_operation_renamed_in_the_source_is_refused_at_bind_time() {
     let renamed = fixture().replace("recv", "read_bytes");
@@ -241,8 +223,6 @@ fn an_operation_renamed_in_the_source_is_refused_at_bind_time() {
     );
 }
 
-// --- The protocol, over a script --------------------------------------------
-
 #[test]
 fn the_script_serves_listen_accept_recv_send_close() {
     let net = Arc::new(SimNet::new(vec![vec![REQUEST.to_vec()]]));
@@ -253,7 +233,6 @@ fn the_script_serves_listen_accept_recv_send_close() {
     assert_eq!(net.sent(served.conn), RESPONSE);
 }
 
-/// A `recv` shorter than `max` is ordinary, and the bytes it did not take are still there.
 #[test]
 fn a_partial_read_leaves_the_rest_for_the_next_one() {
     let net = Arc::new(SimNet::new(vec![vec![b"abcdefghijk".to_vec()]]));
@@ -289,7 +268,6 @@ fn a_partial_read_leaves_the_rest_for_the_next_one() {
     );
 }
 
-/// A second `recv` is a second read, not a replay: the bytes the first one took are gone.
 #[test]
 fn a_second_read_takes_the_next_bytes_and_never_the_same_ones() {
     let net = Arc::new(SimNet::new(vec![vec![b"one".to_vec(), b"two".to_vec()]]));
@@ -420,7 +398,6 @@ fn a_listener_and_a_connection_are_not_interchangeable() {
     assert_eq!(other_way.code, codes::RUNTIME_ERROR);
 }
 
-/// The handler's one mechanical defence against misreporting its own footprint.
 #[test]
 fn one_socket_under_two_labels_is_refused() {
     let net = Arc::new(SimNet::new(vec![vec![b"hi".to_vec()]]));
@@ -451,8 +428,7 @@ fn one_socket_under_two_labels_is_refused() {
     );
 }
 
-/// Zero is refused rather than clamped, because an empty answer already means the peer has stopped
-/// sending.
+/// Refused, not clamped: an empty answer already means the peer stopped sending.
 #[test]
 fn a_read_of_no_bytes_is_refused() {
     let net = Arc::new(SimNet::new(vec![vec![b"hi".to_vec()]]));
@@ -492,8 +468,6 @@ fn an_accept_with_nothing_scripted_is_a_diagnostic_rather_than_a_wait() {
     assert_eq!(refused.code, codes::RUNTIME_ERROR);
 }
 
-// --- The protocol, over a real socket ---------------------------------------
-
 #[test]
 fn a_loopback_connection_is_served_end_to_end() {
     let net = Arc::new(TcpHost::new());
@@ -528,8 +502,6 @@ fn a_loopback_connection_is_served_end_to_end() {
     assert_eq!(net.outstanding(), 0, "every blocking operation was reaped");
 }
 
-/// The peer sends more than one `recv` asks for and keeps the connection open, so what comes back
-/// is short by construction.
 #[test]
 fn a_real_partial_read_returns_what_it_can_and_the_rest_next_time() {
     let net = Arc::new(TcpHost::new());
@@ -540,8 +512,7 @@ fn a_real_partial_read_returns_what_it_can_and_the_rest_next_time() {
     let peer = std::thread::spawn(move || {
         let mut stream = TcpStream::connect(addr).expect("the peer connects");
         stream.write_all(b"abcdefghijk").expect("the peer writes");
-        // Held open, so the reads below end because `max` ran out rather than because the stream
-        // did.
+        // Held open, so the reads end because `max` ran out, not the stream.
         std::thread::sleep(std::time::Duration::from_millis(200));
         stream
     });
@@ -611,7 +582,6 @@ fn a_connection_closed_mid_read_reads_empty_rather_than_failing() {
     peer.join().expect("the peer finished");
 }
 
-/// The substitution the simulated twin is about: one driver, two bindings, no change to what it performs.
 #[test]
 fn the_socket_and_the_script_answer_the_same_program() {
     let script = Arc::new(SimNet::new(vec![vec![REQUEST.to_vec()]]));
@@ -631,8 +601,6 @@ fn the_socket_and_the_script_answer_the_same_program() {
     assert_eq!(script.sent(simulated.conn), RESPONSE);
     assert_eq!(peer.join().expect("the peer finished"), RESPONSE);
 }
-
-// --- The pending token ------------------------------------------------------
 
 #[test]
 fn a_token_the_runtime_did_not_mint_is_loud_rather_than_lost() {
@@ -677,8 +645,6 @@ fn the_script_refuses_to_answer_for_a_token() {
     );
 }
 
-// --- Drivers ----------------------------------------------------------------
-
 struct Served {
     listener: i64,
     conn: i64,
@@ -686,8 +652,6 @@ struct Served {
     sent: i64,
 }
 
-/// The program both bindings serve: bind, take one connection, read until the peer is done, answer,
-/// close.
 fn serve_once(binding: &HostBinding, rt: &dyn HostRuntime) -> Served {
     let listener = listen(binding, rt);
     let served = serve_accepted(binding, rt, listener);
@@ -754,7 +718,6 @@ fn read_to_end(binding: &HostBinding, rt: &dyn HostRuntime, conn: i64) -> Vec<u8
     }
 }
 
-/// A peer that sends the request, stops sending, and reports what came back.
 fn speak(addr: SocketAddr) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut stream = TcpStream::connect(addr).expect("the peer connects");
@@ -768,15 +731,12 @@ fn speak(addr: SocketAddr) -> std::thread::JoinHandle<Vec<u8>> {
     })
 }
 
-/// Open a connection over whichever binding, so the reads below have one.
 fn open(binding: &HostBinding, rt: &dyn HostRuntime) -> (i64, i64) {
     let listener = listen(binding, rt);
     (listener, accept(binding, rt, listener))
 }
 
-// --- TLS, at the boundary ---------------------------------------------------
-
-/// The same shape as [`DRIVER`], with the one line that differs: the listener is created over TLS.
+/// [`DRIVER`] with its listener created over TLS.
 const TLS_DRIVER: &str = r#"
 fn serve_tls(port: Int, payload: Bytes) -> Int / {net.write[listener], net.write[conn]} = {
   let l = net.listen_tls[listener](port, "api");
@@ -805,8 +765,7 @@ fn bind_tls(net: Arc<dyn Net>) -> HostBinding {
         .expect("the declaration and the registration agree")
 }
 
-/// `E0429` at the perform site, from both implementations, listing what the run was configured with
-/// — because the fix is a `--tls` argument rather than an edit to the program.
+/// Lists what the run was configured with, because the fix is a `--tls` argument.
 #[test]
 fn a_credential_the_run_does_not_hold_is_refused_by_both_implementations() {
     let socket = Arc::new(TcpHost::new());
@@ -840,9 +799,7 @@ fn unconfigured(binding: &HostBinding, rt: &dyn HostRuntime) -> Diagnostic {
     .expect_err("no credential was configured")
 }
 
-/// The twin resolves the credential it was configured with and then serves an ordinary listener:
-/// above the boundary a TLS connection carries the same decrypted bytes, so a service is exercised
-/// hermetically here without its source moving.
+/// Above the boundary a TLS connection carries the same bytes, so a service runs here unchanged.
 #[test]
 fn the_script_serves_a_tls_listener_for_a_service_that_never_changed() {
     let net = Arc::new(SimNet::with_credentials(
@@ -864,8 +821,7 @@ fn the_script_serves_a_tls_listener_for_a_service_that_never_changed() {
     answer(&binding, net.as_ref(), conn);
     assert_eq!(net.sent(conn), RESPONSE);
 
-    // The same script over a plaintext listener answers the same program, which is what "TLS is not
-    // a separate effect" means at this level.
+    // A plaintext listener answers the same program: TLS is not a separate effect.
     let plain = Arc::new(SimNet::new(vec![vec![REQUEST.to_vec()]]));
     let binding = bind_tls(plain.clone());
     let listener = listen(&binding, plain.as_ref());
@@ -875,7 +831,6 @@ fn the_script_serves_a_tls_listener_for_a_service_that_never_changed() {
     assert_eq!(plain.sent(other), net.sent(conn));
 }
 
-/// `recv` until the peer stops sending, under the deadline every W3 read carries.
 fn drain_tls(binding: &HostBinding, rt: &dyn HostRuntime, conn: i64) -> Vec<u8> {
     let mut got = Vec::new();
     loop {
@@ -907,7 +862,6 @@ fn answer(binding: &HostBinding, rt: &dyn HostRuntime, conn: i64) {
     assert_eq!(int(sent_some(written)), RESPONSE.len() as i64);
 }
 
-/// The payload of a `Some`.
 fn sent_some(value: Value) -> Value {
     match &value {
         Value::Ctor { name, args } if name.as_str() == "Some" && args.len() == 1 => args[0].clone(),
@@ -915,9 +869,7 @@ fn sent_some(value: Value) -> Value {
     }
 }
 
-/// Without `--host`, `net.listen_tls` is `E0424` like every other host operation — and it must name
-/// the handler that would have served it, which is the TLS one rather than the plaintext
-/// listener's.
+/// It must name the TLS handler, not the plaintext listener's.
 #[test]
 fn a_hermetic_run_names_the_tls_handler_it_did_not_bind() {
     let hermetic = HostBinding::hermetic_with(registry(Arc::new(TcpHost::new())));

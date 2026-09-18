@@ -26,17 +26,13 @@ fn body_was_false(span: Span) -> Diagnostic {
     .primary(span, "evaluated to `false` in this interleaving")
 }
 
-/// `tasks` tasks, each reading a shared counter and writing it back — the lost update, which is
-/// the shape every concurrency law worth writing is about.
+/// `tasks` tasks, each reading a shared counter and writing it back: the lost update.
 struct Model {
     tasks: usize,
-    /// What the law claims of the counter when every task has finished.
     claims: fn(i64) -> bool,
     /// Points whose runs reach no `simulate` region.
     unobserved: bool,
-    /// Points whose runs raise instead of coming to a Boolean.
     raises: bool,
-    /// Every choice sequence this model was asked for, in order.
     traces: Vec<Vec<u16>>,
 }
 
@@ -93,8 +89,7 @@ impl Model {
                 }]),
                 definition: Some(Symbol::new("transfer")),
                 span: Span::DUMMY,
-                // No synchronization at all, so no pair is ordered and every dependent pair is
-                // a candidate.
+                // No synchronization, so every dependent pair is a candidate.
                 stamp: Vec::new(),
             });
         }
@@ -121,8 +116,7 @@ impl LawSearch for Model {
             );
         }
         if self.unobserved {
-            // What a body that never reaches a `simulate` region hands the search: a run with
-            // no steps and the body's own verdict.
+            // A body that never reaches a `simulate` region: no steps and the body's own verdict.
             return BodyRun::model(Interleaving::passed(Vec::new()), false, false);
         }
         BodyRun::model(self.interleave(seed), true, false)
@@ -171,7 +165,6 @@ fn certificate(searched: &Searched) -> &Certificate {
     }
 }
 
-/// A law that holds under **every** interleaving, discharged as a proof.
 #[test]
 fn a_law_that_holds_under_every_interleaving_is_proved() {
     let obligation = law(0);
@@ -197,12 +190,10 @@ fn a_law_that_holds_under_every_interleaving_is_proved() {
     assert_eq!(audit_interleaving_proof(&obligation, certificate), Ok(()));
 }
 
-/// A law that holds under *some* interleavings: a failure carrying the seed that reproduces it.
 #[test]
 fn a_law_that_holds_only_sometimes_is_refuted_with_a_seed() {
     let obligation = law(0);
-    // The lost update: two tasks that each read the counter and write it back reach 1 in the
-    // interleavings where the reads precede both writes.
+    // Reaches 1 when both reads precede both writes.
     let mut model = Model::new(2, |counter| counter == 2);
     let searched = discharge(&obligation, &dpor(64), &ValueDomain::ground(), &mut model);
 
@@ -228,8 +219,6 @@ fn a_law_that_holds_only_sometimes_is_refuted_with_a_seed() {
     );
 }
 
-/// A search that spends its budget proved nothing about the interleavings it did not reach, so
-/// it reports the sampled tier and says how many it ran.
 #[test]
 fn a_search_that_spends_its_budget_is_property_and_says_how_many() {
     let obligation = law(0);
@@ -247,8 +236,7 @@ fn a_search_that_spends_its_budget_is_property_and_says_how_many() {
     assert!(searched.line().unwrap().contains("budget spent"));
 }
 
-/// A spent budget is a claim about the plan that spent it, so it may never be read back under a
-/// wider one.
+/// A spent budget is a claim about the plan that spent it, so a wider plan must not read it.
 #[test]
 fn a_spent_budget_is_not_written_under_the_bare_key() {
     let obligation = law(0);
@@ -261,8 +249,6 @@ fn a_spent_budget_is_not_written_under_the_bare_key() {
     );
 }
 
-/// The artifact is M7's: `--seed` replays the interleaving exactly, and the replay refutes the
-/// same law with the same seed and the same trace.
 #[test]
 fn a_reported_failure_replays_exactly() {
     let obligation = law(0);
@@ -293,14 +279,11 @@ fn a_reported_failure_replays_exactly() {
         vec![failing_trace],
         "byte-for-byte the same interleaving"
     );
-    // `once` observes no flip, so it invents no race — the seed is the exact half and the pair
-    // is the half the search happened to see.
+    // `once` observes no flip, so it invents no race.
     assert!(replayed.race.is_none());
     assert_eq!(again.discharge.tier(), None);
 }
 
-/// The concurrency-law conditions's condition 5, and the required test that goes with it: the same law with a
-/// binder is `property` however exhaustive the schedules were.
 #[test]
 fn an_exhaustive_search_over_sampled_values_is_never_proved() {
     let obligation = law(1);
@@ -324,8 +307,6 @@ fn an_exhaustive_search_over_sampled_values_is_never_proved() {
     );
 }
 
-/// The same law over a domain that *was* covered is proved, and its certificate names both
-/// coverage claims so an audit can check condition 5 without re-deriving it.
 #[test]
 fn an_enumerated_value_domain_proves_and_names_its_enumeration() {
     let obligation = law(1);
@@ -355,8 +336,6 @@ fn an_enumerated_value_domain_proves_and_names_its_enumeration() {
     assert_eq!(searched.points, 2);
 }
 
-/// The audit catches a certificate that claims an exhaustive search over a law whose values
-/// nobody covered.
 #[test]
 fn the_audit_rejects_an_interleaving_proof_that_covered_no_value_domain() {
     let forged = Certificate {
@@ -381,15 +360,13 @@ fn the_audit_rejects_an_interleaving_proof_that_covered_no_value_domain() {
     assert!(audit_interleaving_proof(&law(0), &unguarded).is_err());
 }
 
-/// **The sixth condition.**
 #[test]
 fn a_search_that_reached_no_region_is_exhaustive_over_nothing() {
     let plan = dpor(64);
     let mut nothing = Model::new(2, |_| true);
     nothing.unobserved = true;
 
-    // What `Exploration` alone says, which is the overclaim: the search driven by the bare runs,
-    // without the region check `discharge` adds.
+    // The bare search, without the region check `discharge` adds: the overclaim.
     struct Probe<'a>(&'a mut Model);
     impl Simulation for Probe<'_> {
         fn run(&mut self, seed: &Seed) -> Interleaving {
@@ -404,7 +381,6 @@ fn a_search_that_reached_no_region_is_exhaustive_over_nothing() {
     );
     assert!(interleaving_proves(&plan, &explored.exploration, true));
 
-    // What this module reports, having asked whether a region ran.
     let searched = discharge(&law(0), &plan, &ValueDomain::ground(), &mut nothing);
     assert!(!searched.observed);
     assert_eq!(searched.interleavings, 0);
@@ -416,8 +392,6 @@ fn a_search_that_reached_no_region_is_exhaustive_over_nothing() {
     assert!(searched.line().unwrap().contains("no `simulate` region"));
 }
 
-/// Under `once` and `random` there is no frontier to empty, so there is nothing exhaustive to
-/// claim whatever the run reports.
 #[test]
 fn a_sampled_plan_never_proves() {
     for plan in [Plan::random(4), Plan::once(Seed::root(7))] {
@@ -429,8 +403,6 @@ fn a_sampled_plan_never_proves() {
     }
 }
 
-/// A law that raises is not a law that is false, so a raise is a gap and the raising input is
-/// reported rather than presented as a counterexample.
 #[test]
 fn a_body_that_raises_is_a_gap_and_not_a_refutation() {
     let mut model = Model::new(2, |_| true);
@@ -447,7 +419,6 @@ fn a_body_that_raises_is_a_gap_and_not_a_refutation() {
     assert_eq!(bindings.len(), 1);
 }
 
-/// A guard that admits nothing makes the obligation trivially valid and therefore silent.
 #[test]
 fn a_domain_the_guard_emptied_is_vacuous_and_not_proved() {
     let mut model = Model::new(2, |_| true);
@@ -490,21 +461,17 @@ fn a_domain_the_guard_emptied_is_vacuous_and_not_proved() {
     ));
 }
 
-/// One point of a law's domain whose search spent its budget is a law whose search spent its
-/// budget: a claim about every value is only as strong as its weakest point.
 #[test]
 fn one_unexhausted_point_costs_the_whole_law_its_proof() {
     struct Mixed {
         inner: Model,
-        /// The point whose search is given no room.
         starved: u64,
     }
 
     impl LawSearch for Mixed {
         fn run(&mut self, point: u64, seed: &Seed) -> BodyRun {
             if point == self.starved && seed.path.len() > 1 {
-                // A run the search cannot branch past, standing in for a point whose space is
-                // larger than the budget.
+                // Stands in for a point whose space is larger than the budget.
                 return BodyRun::model(Interleaving::passed(Vec::new()), true, false);
             }
             self.inner.run(point, seed)
@@ -534,7 +501,6 @@ fn one_unexhausted_point_costs_the_whole_law_its_proof() {
     assert_ne!(searched.discharge.tier(), Some(Tier::Proved));
 }
 
-/// Two runs over one law produce one artifact — the same tier, the same counts, the same seed.
 #[test]
 fn two_runs_over_one_law_agree() {
     let run = || {
@@ -557,8 +523,6 @@ fn the_replay_command_is_the_command() {
     );
 }
 
-/// The failure artifact carries what M7's carries: the seed, the race sites, and the command
-/// that replays it.
 #[test]
 fn a_refutation_reports_the_seed_the_race_and_the_replay() {
     let obligation = law(1);
@@ -589,8 +553,6 @@ fn a_refutation_reports_the_seed_the_race_and_the_replay() {
     assert!(notes.contains("n = 0"));
 }
 
-/// A concurrency law is discharged by execution, and `is_concurrency_law` is what routes it
-/// here.
 #[test]
 fn only_a_law_carrying_sim_read_is_routed_to_a_search() {
     assert!(law(0).is_concurrency_law());

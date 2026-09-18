@@ -24,8 +24,6 @@ fn an_unsimulated_test_is_written_under_its_own_hash_and_nothing_else() {
     );
 }
 
-/// The rule whose absence is silent: a run under one plan must not be able to read a pass
-/// another plan earned.
 #[test]
 fn a_seeded_test_is_never_written_under_its_bare_hash() {
     let plan = Plan::default();
@@ -85,8 +83,6 @@ fn a_random_search_writes_one_key_per_root_it_ran_plus_the_plan() {
     );
 }
 
-/// The first green `det` test in the language that is not cacheable, and it is correct that it
-/// is not.
 #[test]
 fn a_spent_budget_writes_nothing_under_either_mode() {
     let spent = Exploration {
@@ -108,8 +104,7 @@ fn a_spent_budget_writes_nothing_under_either_mode() {
     }
 }
 
-/// A handler answering `sim.seed()` takes `sim.read` out of the row, but the region inside it
-/// still searched under a budget it may have spent.
+/// A handler for `sim.seed()` drops `sim.read` from the row, but the region inside still searched.
 #[test]
 fn a_spent_budget_stops_an_unseeded_test_caching_too() {
     let plan = Plan::default();

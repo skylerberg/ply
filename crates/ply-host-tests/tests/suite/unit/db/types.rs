@@ -50,8 +50,7 @@ fn every_row_of_the_pinned_mapping_binds() {
         (Param::Json(Json::Null), Type::JSONB),
         (Param::Json(Json::Null), Type::JSON),
         (Param::Array(vec![Param::Int(1)]), Type::INT8_ARRAY),
-        // `Null` fits every column, which is what makes `Option<a>` a nullable column of `a` rather
-        // than a type of its own.
+        // `Null` fits every column, which is what makes `Option<a>` a nullable `a`.
         (Param::Null, Type::INT8),
         (Param::Null, Type::JSONB),
         (Param::Null, Type::TEXT_ARRAY),
@@ -64,7 +63,6 @@ fn every_row_of_the_pinned_mapping_binds() {
     }
 }
 
-/// An `Int` narrows to nothing.
 #[test]
 fn an_int_that_does_not_fit_its_column_is_a_failure_and_never_a_truncation() {
     assert_eq!(failed(Param::Int(i64::MAX), Type::INT4).code, "22003");
@@ -80,8 +78,7 @@ fn a_parameter_outside_the_mapping_names_the_type_it_was_going_to_be_sent_as() {
     assert!(d.message.contains("`PText`"), "{}", d.message);
     assert!(d.message.contains("int8"), "{}", d.message);
 
-    // No time type in Ply, so a column of one is refused rather than rendered to text — with the
-    // workaround named, because "unsupported" alone is a dead end.
+    // No time type in Ply, so refused with the workaround named rather than rendered to text.
     let d = refused(Param::Int(0), Type::TIMESTAMPTZ);
     assert!(
         d.notes.iter().any(|n| n.contains("microseconds")),
@@ -92,8 +89,7 @@ fn a_parameter_outside_the_mapping_names_the_type_it_was_going_to_be_sent_as() {
     refused(Param::Int(0), Type::INTERVAL);
 }
 
-/// The type mapping maps `Float` to `float8` as a **parameter** and to `float4` or `float8` only as a
-/// *result*, so a `float4` parameter is outside the mapping.
+/// `Float` maps to `float4` only as a result, so a `float4` parameter is outside the mapping.
 #[test]
 fn a_float4_parameter_is_refused_rather_than_narrowed() {
     for value in [1.5, 1e300, 0.1234567890123] {
@@ -205,8 +201,6 @@ fn the_mapping_admits_exactly_what_it_says_it_does() {
     }
 }
 
-// --- json -------------------------------------------------------------------
-
 fn parsed(text: &str) -> Json {
     Json::parse(text.as_bytes(), "a test").unwrap_or_else(|e| panic!("`{text}`: {e}"))
 }
@@ -234,8 +228,6 @@ fn json_round_trips_through_its_canonical_text() {
     }
 }
 
-/// The same rule `std.json` states, and the reason `Number` is a `Decimal`: a scale that quietly
-/// moved is a total that quietly lost a cent.
 #[test]
 fn a_json_number_keeps_the_scale_it_was_written_with() {
     assert_eq!(parsed("1.2500"), Json::Number(dec("1.2500")));

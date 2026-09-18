@@ -1,15 +1,11 @@
-//! What region isolation's fixture costs, measured the way the control-stack design's fork was.
-
 use ply_eval::{TaskRegions, Value};
 use ply_test::GroupRegion;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-/// What one test allocates in its own region.
 const TEST_CELLS: usize = 4;
 
-/// Records rather than integers, so a copy is a copy of something — the same shape
-/// `ply_corpus::measure::seeded` builds, so the two tables compare.
+/// Records rather than integers, so a copy copies something; matches `ply_corpus::measure::seeded`.
 fn seed(cells: usize) -> impl Fn(&mut TaskRegions) -> Value {
     move |regions: &mut TaskRegions| {
         Value::list(
@@ -54,15 +50,13 @@ struct Point {
 }
 
 impl Point {
-    /// One test's whole region cost against rebuilding the fixture for it, which is what a group
-    /// with no region would pay.
+    /// Rebuilding the fixture per test, what a group with no region pays, over one test's region cost.
     fn rebuild_over_region(&self) -> f64 {
         self.rebuild_nanos / (self.open_nanos + self.close_dirty_nanos)
     }
 }
 
-/// Enough that a nanosecond-scale operation is not being read off the clock's own resolution — and
-/// few enough that an unoptimized build still finishes in seconds.
+/// Enough to rise above clock resolution, few enough for an unoptimized build.
 fn iterations_for(cells: usize) -> u32 {
     match (cfg!(debug_assertions), cells) {
         (true, c) if c >= 1_000 => 20,
@@ -112,9 +106,7 @@ fn measure(cells: usize, repeats: usize) -> Point {
     }
 }
 
-/// The amortization, stated as the thing a group actually does: build one fixture and run *n* tests
-/// against it, against building one per test. The ladder's shape is arithmetic over the readings,
-/// so it holds whatever the machine was doing; how much a group saves is not asserted.
+/// Asserts only the ladder's shape, which is arithmetic over readings and so holds under any load.
 #[test]
 fn a_group_amortizes_the_build_up_to_a_ceiling_the_open_decides() {
     const CELLS: usize = 10_000;
@@ -145,8 +137,7 @@ fn a_group_amortizes_the_build_up_to_a_ceiling_the_open_decides() {
             "a group of {tests} claimed {ratio:.2}x against a ceiling of {ceiling:.2}x"
         );
     }
-    // And the first row is below the last: a group of a single test pays for a build *and* an open
-    // and a close, where rebuilding pays for the build alone.
+    // A one-test group pays build, open and close; rebuilding pays the build alone.
     let (_, biggest) = ratios.last().expect("the ladder is not empty");
     let (_, smallest) = ratios.first().expect("the ladder is not empty");
     assert!(
@@ -155,7 +146,6 @@ fn a_group_amortizes_the_build_up_to_a_ceiling_the_open_decides() {
     );
 }
 
-/// The case every corpus in this repository is actually in: no fixture at all.
 #[test]
 fn a_group_with_no_fixture_opens_and_closes_without_touching_the_arena() {
     let mut region = GroupRegion::empty();

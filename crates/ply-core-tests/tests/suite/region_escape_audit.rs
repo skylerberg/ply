@@ -1,6 +1,3 @@
-//! An adversarial reading of the escape brand, taken as a claim to be falsified rather than as a design
-//! to be illustrated.
-
 use crate::fixture::expanded;
 use ply_span::{Diagnostic, codes};
 
@@ -35,9 +32,6 @@ fn names(d: &Diagnostic, text: &str) {
     );
 }
 
-// --- routes that are closed, and were not pinned ----------------------------
-
-/// The store route where the region body never names the cell it stores into.
 #[test]
 fn storing_through_a_closure_bound_before_the_region_is_an_escape() {
     let d = code(
@@ -51,8 +45,7 @@ fn storing_through_a_closure_bound_before_the_region_is_an_escape() {
     names(&d, "`r`");
 }
 
-/// The same route with the outer cell one field access away, which is the shape a check that only
-/// looked at bare occurrences of a *cell-typed* binding would miss.
+/// The outer cell is one field access away, which a check of bare cell-typed bindings would miss.
 #[test]
 fn storing_through_a_record_field_holding_the_outer_cell_is_an_escape() {
     let d = code(
@@ -65,8 +58,6 @@ fn storing_through_a_record_field_holding_the_outer_cell_is_an_escape() {
     names(&d, "`r`");
 }
 
-/// The store performed by a lambda written inside the region, so the region's own result type is
-/// `Unit` and the enclosing definition's is `Int`.
 #[test]
 fn storing_from_a_lambda_written_inside_the_region_is_an_escape() {
     let d = code(
@@ -80,7 +71,6 @@ fn storing_from_a_lambda_written_inside_the_region_is_an_escape() {
     names(&d, "`slot`");
 }
 
-/// W2's hole was a check that ran before alias resolution.
 #[test]
 fn a_chain_of_type_aliases_does_not_hide_a_cell_in_an_operation() {
     let d = code(
@@ -92,8 +82,7 @@ effect sink { write put(x: B) -> Unit }",
     names(&d, "put");
 }
 
-/// A generic alias, where the `Cell` is the *argument* rather than the alias body, so nothing in
-/// the written parameter type is spelled `Cell` at its head.
+/// The `Cell` is the alias's argument, so nothing written is spelled `Cell` at its head.
 #[test]
 fn a_generic_alias_does_not_hide_a_cell_in_an_operation() {
     let d = code(
@@ -104,7 +93,6 @@ effect sink { write put(x: Boxed<Cell<Int>>) -> Unit }",
     names(&d, "put");
 }
 
-/// The same at a variant field, with the `Cell` behind a record alias.
 #[test]
 fn a_record_alias_does_not_hide_a_cell_in_a_variant_field() {
     let d = code(
@@ -115,7 +103,6 @@ type H = | Held(Rec)",
     names(&d, "Held");
 }
 
-/// `tests/suite/regions.rs` pins one polymorphic call.
 #[test]
 fn a_brand_survives_a_mutually_recursive_pair() {
     let d = code(
@@ -127,8 +114,6 @@ fn leak() = with_region[r] { with_cell[r](0) { c -> one(c) } }",
     names(&d, "Cell[r]<Int>");
 }
 
-/// A region whose value leaves through a `handle` installed *around* it, so the exit the region
-/// records is not the expression the definition answers with.
 #[test]
 fn a_region_inside_a_handle_still_reports_its_escape() {
     let d = code(
@@ -139,8 +124,6 @@ fn leak() = handle { with_region[r] { with_cell[r](0) { c -> c } } } with { retu
     names(&d, "Cell[r]<Int>");
 }
 
-/// The continuation carries the region's atoms in its row, so handing it to an operation is the
-/// operation route reached through the row rather than through the shape.
 #[test]
 fn a_continuation_handed_to_a_generic_operation_is_an_escape() {
     let d = code(
@@ -159,7 +142,6 @@ fn leak() -> Int / {sink.write} = with_region[r] {
     names(&d, "cell.read[r]");
 }
 
-/// A `test` is a definition like any other and its body is checked the same way.
 #[test]
 fn a_region_in_a_test_block_reports_its_escape() {
     let d = code(
@@ -169,8 +151,6 @@ fn a_region_in_a_test_block_reports_its_escape() {
     names(&d, "Cell[r]<Int>");
 }
 
-/// The brand is the region's *name* (`E0446`'s "region is already open" note says so), and a name
-/// is not unique across definitions.
 #[test]
 fn two_definitions_spelling_one_region_name_do_not_share_a_brand() {
     let diags = errors(
@@ -189,20 +169,15 @@ fn consume() -> Int = with_cell[k](0) { other ->
     );
 }
 
-/// A footprint's resource is the region's **name**, so a caller whose own region is
-/// spelled `k` discharges `cell.read[k]` out of everything its region encloses.
 #[test]
 fn only_a_written_row_can_put_a_foreign_regions_atom_in_a_callers_row() {
-    // The producer that used to hand its cell out is refused, so no atom belonging to a region the
-    // caller does not own can reach the caller at all.
     let d = code(
         "fn writer() = with_cell[k](0) { c -> {get: || cell_get(c), set: |v| cell_set(c, v)} }",
         codes::TYPE_MISMATCH,
     );
     names(&d, "escapes its `with_cell[k]` region");
 
-    // What remains is an annotation, and a region named `k` discharges it — inside the region, and
-    // only there.
+    // What remains is an annotation, which a region named `k` discharges only inside itself.
     let out = expanded(
         "fn touches(n: Int) -> Int / {cell.read[k]} = n
 fn outside() -> Int / {cell.read[k]} = { let seen = with_cell[k](0) { c -> cell_get(c) }; touches(seen) }
@@ -225,9 +200,6 @@ fn inside() -> Int = with_cell[k](0) { c -> touches(cell_get(c)) }",
     );
 }
 
-// --- the routes out of a bare `with_cell` -----------------------------------
-
-/// The brand's closure clause, applied to the region a `with_cell` opens.
 #[test]
 fn a_closure_capturing_a_bare_with_cells_cell_is_an_escape() {
     let d = code(
@@ -237,9 +209,6 @@ fn a_closure_capturing_a_bare_with_cells_cell_is_an_escape() {
     names(&d, "escapes its `with_cell[k]` region");
 }
 
-/// The writable half, which is what makes the escape more than a stale read: the pair is a full
-/// mutable handle on a region that has closed, and it survives being taken apart into two separate
-/// bindings.
 #[test]
 fn a_reader_and_writer_pair_over_a_bare_with_cells_cell_is_an_escape() {
     let d = code(
@@ -249,8 +218,6 @@ fn a_reader_and_writer_pair_over_a_bare_with_cells_cell_is_an_escape() {
     names(&d, "escapes its `with_cell[k]` region");
 }
 
-/// The operation route, which the region model calls "the route no other check can see" and closes for
-/// `with_region` in `Checker::check_region_handoffs`.
 #[test]
 fn a_bare_with_cells_cell_handed_to_a_generic_operation_is_an_escape() {
     let d = code(
@@ -261,7 +228,6 @@ fn leak() -> Int / {sink.write} = with_cell[k](0) { c -> { sink.put(c); 0 } }",
     names(&d, "sink.put");
 }
 
-/// The store route.
 #[test]
 fn a_bare_with_cells_cell_stored_into_an_enclosing_cell_is_an_escape() {
     let d = code(

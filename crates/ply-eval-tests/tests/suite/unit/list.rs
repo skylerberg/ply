@@ -5,7 +5,7 @@ fn ints(n: usize) -> Vec<Value> {
     (0..n as i64).map(Value::Int).collect()
 }
 
-/// Every operation, against a `Vec` model, across the sizes that reach three levels of trie.
+/// Across the sizes that reach three levels of trie.
 #[test]
 fn a_list_agrees_with_a_vec_under_every_operation() {
     let mut list = List::default();

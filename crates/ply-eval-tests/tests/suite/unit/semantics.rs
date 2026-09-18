@@ -3,8 +3,7 @@ use ply_eval::{Closure, ClosureKind, Value, values_equal};
 use ply_span::{Span, Symbol};
 use std::sync::Arc;
 
-/// A name no other test in this module uses, because the cache is
-/// thread-local and a test binary may run two tests on one thread.
+/// Unique per test, because the cache is thread-local and a test binary may run two tests on one thread.
 fn name(s: &str) -> Symbol {
     Symbol::new(format!("semantics::tests::{s}"))
 }
@@ -23,8 +22,7 @@ fn closure_of(v: &Value) -> Arc<Closure> {
     }
 }
 
-/// "Built once" as identity rather than as an allocation count: an equal
-/// value would mean it was rebuilt.
+/// Identity rather than equality: an equal value would mean it was rebuilt.
 #[test]
 fn a_nullary_constructors_value_is_built_once_per_thread() {
     let n = name("Red");
@@ -49,9 +47,7 @@ fn a_constructor_closure_is_built_once_per_thread() {
     assert_eq!(first.arity(), 1);
 }
 
-/// The hazard a cache keyed by name has and a fresh build does not: two
-/// programs run on one thread can spell one constructor with two arities,
-/// and the second must not be handed the first's value.
+/// Two programs run on one thread can spell one constructor with two arities.
 #[test]
 fn a_name_met_at_another_arity_is_not_answered_from_the_cache() {
     let n = name("Same");
@@ -74,9 +70,7 @@ fn a_shared_constructor_value_is_the_value_a_fresh_one_was() {
         values_equal(&shared, &fresh, Span::DUMMY).expect("two `Ctor`s compare"),
         "the shared value is not the value a mention used to build"
     );
-    // A closure has no equality a program can ask for, so this is the
-    // statement [`Value::builtin`]'s note rests on instead: the ordering
-    // that decides a `Map`'s key order cannot separate two of them.
+    // A closure has no equality a program can ask for, so this pins that the map order cannot separate two.
     let f = ctor_value(&name("Pair"), 2);
     let g = Value::Closure(Arc::new(Closure {
         name: Some(name("Pair")),
@@ -88,12 +82,6 @@ fn a_shared_constructor_value_is_the_value_a_fresh_one_was() {
     assert_eq!(f.cmp(&g), std::cmp::Ordering::Equal);
 }
 
-/// The secret invariant at this seam. A cached value has the program's lifetime, so
-/// what it may hold is the whole question: a nullary constructor's `args`
-/// are empty, so it can hold no [`Value::Cell`] past the region that would
-/// reclaim one and no [`Value::Secret`] past the call that made it — and
-/// `ctor_value` is reached only from a name resolution, which has no
-/// argument to put in one.
 #[test]
 fn a_cached_constructor_value_holds_nothing() {
     let held = ctor_value(&name("Empty"), 0);
@@ -112,34 +100,12 @@ fn a_cached_constructor_value_holds_nothing() {
     }
 }
 
-/// What the cache trades: a `malloc`/`free` pair for a hash of the name and
-/// a refcount bump. Unmeasured until this ran, and the value-representation work's
-/// `max_time_regression` is what it feeds.
-///
-/// Both arms are timed in one window inside one process, alternating, and
-/// the fastest of each is reported — `benches/README.md` §"Every ratio is
-/// taken inside one window" is the reason, and on a machine whose load
-/// moves between 3 and 47 it is the only way this resolves at all. The
-/// second arm is `ctor_value`'s body from before the constant-value memo, spelled out
-/// rather than called, because that function no longer exists.
-///
-/// **What it measures is a mention in a hot loop, where the allocator's
-/// free list is warm and a `malloc`/`free` pair is at its cheapest.** The
-/// nullary case comes out near even on that footing; the arity>=1 case does
-/// not, because rebuilding a constructor closure allocates 80 bytes rather
-/// than 40. Neither is the request path, where 45.0 fewer allocations is
-/// what the change is for — `r4_value_construction` is that instrument.
-///
-/// The bar here is deliberately loose: this is a wall clock on a shared
-/// machine, it decides nothing, and a green suite should not depend on one.
-/// It fails only if a lookup is *dearer than the allocation it replaced*
-/// by more than half, which would mean the trade is the wrong way round.
+/// A wall clock on a shared machine, so it fails only when the trade is clearly the wrong way round.
 #[test]
 #[ignore = "timing; run with `cargo test -p ply-eval-tests --release --test unit semantics::a_cached_mention_against_the_allocation_it_replaces -- --ignored --nocapture`"]
 fn a_cached_mention_against_the_allocation_it_replaces() {
     const MENTIONS: usize = 200_000;
-    // A real constructor's program-wide name rather than this module's
-    // prefixed one: the cache hashes the name, so its length is a cost.
+    // A real program-wide name, because the cache hashes the name and its length is a cost.
     let n = Symbol::new("m.Red");
     let b = Symbol::new("m.Box");
     let per = |s: f64| 1e9 * s / MENTIONS as f64;
@@ -200,9 +166,6 @@ fn a_cached_mention_against_the_allocation_it_replaces() {
     }
 }
 
-/// What the cache can hold, so its memory cost is a number rather than a
-/// hope, and what a program past the bound gets — which is what it got
-/// before the cache existed.
 #[test]
 fn past_the_bound_a_mention_is_built_as_it_was_before() {
     let entry = size_of::<Symbol>() + size_of::<usize>() + size_of::<Value>();

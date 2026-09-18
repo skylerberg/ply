@@ -1,5 +1,3 @@
-//! The seeded handlers against the signatures they claim.
-
 use ply_core::check_program;
 use ply_eval::{Answer, Handlers, SEEDED_OPS, SimTy, TaskId, Value};
 use ply_span::{SourceId, Span, Symbol};
@@ -9,8 +7,7 @@ use ply_syntax::resolve::resolve;
 use ply_ty::{CheckOutput, EffectInfo, Type};
 use std::path::{Path, PathBuf};
 
-/// The prelude effect declarations's declaration of the two effects the seeded handlers answer, plus a hand-written
-/// handler for it.
+/// The prelude's two effects the seeded handlers answer, plus a hand-written handler.
 const SOURCE: &str = r#"
 nondet effect clock {
   read now() -> Int
@@ -103,8 +100,6 @@ fn every_seeded_operation_has_the_declared_mode_and_types() {
     }
 }
 
-/// The signature is a promise about what a perform site receives, so it is only kept if the value
-/// the handler actually produces has the declared type.
 #[test]
 fn what_the_handlers_answer_has_the_declared_type() {
     let (_, check) = program();
@@ -120,8 +115,7 @@ fn what_the_handlers_answer_has_the_declared_type() {
             .iter()
             .map(|param| {
                 assert_eq!(*param, Type::int(), "`{sig}` takes something else now");
-                // Positive: `random.below` has no value to answer below zero, and a sleep of zero
-                // is a yield rather than a deadline.
+                // Positive: `random.below` cannot answer below zero, and a zero sleep is a yield.
                 Value::Int(3)
             })
             .collect();
@@ -142,8 +136,6 @@ fn what_the_handlers_answer_has_the_declared_type() {
     }
 }
 
-/// Three handlers for one signature — this stub, the seeded one, and the threaded one M9 will write
-/// — and no way for them to drift, because the declaration types all three.
 #[test]
 fn a_hand_written_handler_and_the_seeded_one_answer_the_same_operations() {
     let (program, check) = program();
@@ -201,8 +193,6 @@ fn sources(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// `clock.now()` is the only way a Ply program can ask what time it is, and a `simulate` region
-/// handles it.
 #[test]
 fn the_evaluator_reads_no_host_clock_and_no_host_entropy() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ply-eval/src");
@@ -242,8 +232,7 @@ fn the_evaluator_reads_no_host_clock_and_no_host_entropy() {
     }
 }
 
-/// The same rule one level down: a generator crate would put the host's entropy — and its own
-/// version — inside a seed's meaning.
+/// A generator crate would put the host's entropy, and its own version, inside a seed's meaning.
 #[test]
 fn the_crate_depends_on_no_generator_and_no_entropy_source() {
     let manifest = std::fs::read_to_string(

@@ -1,13 +1,8 @@
-//! What a cell operation costs now that the store is a region, and what it cost when the store was
-//! a persistent map — so "the forkable world and the zero-cost path are mutually exclusive" stays a
-//! number rather than a slogan.
-
 use crate::counting::charge;
 use ply_eval::arena::Slot;
 use ply_eval::{Fixture, TaskRegions, Value};
 use rpds::RedBlackTreeMap;
 
-/// Allocations and bytes charged while `f` runs.
 fn charged<T>(f: impl FnOnce() -> T) -> (usize, usize, T) {
     let (out, allocs, bytes) = charge(f);
     (allocs, bytes, out)
@@ -21,8 +16,7 @@ fn filled(n: usize) -> (TaskRegions, Vec<Slot>) {
     (regions, slots)
 }
 
-/// The store `World` was, rebuilt from the same crate it was built on, so the comparison below is
-/// against the thing that was removed rather than against a guess at it.
+/// The persistent map the region store replaced, as the baseline the comparisons read.
 fn persistent(n: usize) -> RedBlackTreeMap<u32, Value> {
     let mut map = RedBlackTreeMap::new();
     for i in 0..n {
@@ -31,7 +25,6 @@ fn persistent(n: usize) -> RedBlackTreeMap<u32, Value> {
     map
 }
 
-/// What a `cell_set` costs in the region store: nothing, at every size.
 #[test]
 fn a_cell_write_into_the_region_store_costs_nothing() {
     println!("\n  cells   region allocs/write   map allocs/write   region allocs/read");
@@ -87,15 +80,12 @@ fn a_cell_write_into_the_region_store_costs_nothing() {
     );
 }
 
-/// Allocating a cell is a bump once the arena has been through a region of the size before, where
-/// the persistent map allocated a node every time.
 #[test]
 fn allocating_a_cell_is_a_bump_once_the_arena_is_warm() {
     const CELLS: usize = 4_096;
 
     let mut regions = TaskRegions::new();
-    // A steady state: a service opens a region per request and a test opens one per test, so the
-    // interesting number is the second pass and not the first.
+    // Measure the second pass: the claim is about the steady state.
     for _ in 0..CELLS {
         regions.alloc_cell(Value::Unit);
     }
@@ -123,9 +113,6 @@ fn allocating_a_cell_is_a_bump_once_the_arena_is_warm() {
     );
 }
 
-/// The entry point's reset is what `World::fork` was, and it is what makes the arena's memory a
-/// steady state rather than a leak: whatever a run allocated, the next one starts from the fixture
-/// and takes nothing further from the allocator.
 #[test]
 fn resetting_to_the_fixture_returns_every_slot_and_allocates_nothing() {
     let (mut regions, _) = Fixture::empty().open();
@@ -143,7 +130,6 @@ fn resetting_to_the_fixture_returns_every_slot_and_allocates_nothing() {
         "the fixture's region and a fresh entry region"
     );
 
-    // And the chunks stayed, so the next run of the same size is free too.
     let (again, _, ()) = charged(|| {
         for i in 0..10_000 {
             regions.alloc_cell(Value::Int(i));
@@ -152,7 +138,6 @@ fn resetting_to_the_fixture_returns_every_slot_and_allocates_nothing() {
     assert_eq!(again, 0, "the second run reuses the first run's chunks");
 }
 
-/// The fixture every real run starts from is empty, so opening it copies nothing.
 #[test]
 fn the_fixture_every_ply_program_opens_is_empty() {
     let base = Fixture::empty();

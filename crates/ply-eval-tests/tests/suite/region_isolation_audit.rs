@@ -1,6 +1,3 @@
-//! Adversarial audit of the one property the milestone cannot be wrong about: **no two region
-//! stacks opened from one fixture observe each other's writes.**
-
 use crate::fixture::Compiled;
 use ply_eval::arena::Slot;
 use ply_eval::{Fixture, Machine, TaskRegions, Value};
@@ -31,8 +28,7 @@ fn cell_of(fixture: &Fixture) -> Slot {
         .expect("the handle is a cell")
 }
 
-/// The headline property, stated over three stacks rather than two so that a defect that leaks in
-/// only one direction cannot hide behind symmetry.
+/// Three stacks rather than two, so a leak in only one direction cannot hide behind symmetry.
 #[test]
 fn stacks_opened_from_one_fixture_never_read_each_others_value() {
     let fixture = one_cell();
@@ -42,8 +38,7 @@ fn stacks_opened_from_one_fixture_never_read_each_others_value() {
     for (i, stack) in stacks.iter_mut().enumerate() {
         assert!(stack.set(shared, Value::Int(i as i64 + 1)));
     }
-    // Interleaved a second time: a defect that needs the writes to alternate rather than run in a
-    // batch would survive the loop above.
+    // Interleaved again, for a defect that needs the writes to alternate rather than batch.
     for i in (0..stacks.len()).rev() {
         assert!(stacks[i].set(shared, Value::Int(i as i64 + 10)));
         for (j, other) in stacks.iter().enumerate() {
@@ -63,7 +58,6 @@ fn stacks_opened_from_one_fixture_never_read_each_others_value() {
     );
 }
 
-/// The direction the forkable world made least obvious was a write to a shared ancestor.
 #[test]
 fn no_amount_of_writing_to_an_open_stack_moves_what_the_fixture_seeds() {
     const DEPTH: usize = 12;
@@ -112,9 +106,6 @@ fn no_amount_of_writing_to_an_open_stack_moves_what_the_fixture_seeds() {
     }
 }
 
-/// An entry point's reset is the fork's replacement, and it has to mean both halves: the fixture
-/// comes back to what it was seeded as, and everything the entry point allocated on top of it is
-/// gone.
 #[test]
 fn a_reset_restores_the_seed_and_discards_what_the_entry_point_allocated() {
     let fixture = one_cell();
@@ -131,9 +122,7 @@ fn a_reset_restores_the_seed_and_discards_what_the_entry_point_allocated() {
     assert!(!regions.contains(scratch));
 }
 
-/// The hazard that makes every other test here necessary: two stacks opened from one fixture hand
-/// out the *same* slot for different cells, and reading a foreign slot succeeds quietly instead of
-/// failing.
+/// Two stacks hand out the same slot for different cells, so a foreign read succeeds quietly.
 #[test]
 fn a_foreign_slot_is_answered_by_the_reading_stack_and_never_by_its_owner() {
     let fixture = Fixture::empty();
@@ -151,8 +140,6 @@ fn a_foreign_slot_is_answered_by_the_reading_stack_and_never_by_its_owner() {
     assert_eq!(b.get(in_b).map(Value::render).unwrap(), "\"b's secret\"");
 }
 
-/// What a slot buys that a `CellId` did not: a slot whose region has been reclaimed reads `None` on
-/// every run rather than aliasing whatever was allocated in its place.
 #[test]
 fn a_slot_from_a_reclaimed_entry_point_reads_nothing_rather_than_its_successor() {
     let (mut regions, _) = Fixture::empty().open();
@@ -180,8 +167,6 @@ fn a_slot_from_a_reclaimed_entry_point_reads_nothing_rather_than_its_successor()
     );
 }
 
-/// Every carrier the escape brand names is refused, including the closure route it lists first among the
-/// ways this could go wrong.
 #[test]
 fn every_closure_shaped_carrier_out_of_a_region_is_refused() {
     for (carrier, src) in [
@@ -218,8 +203,6 @@ fn every_closure_shaped_carrier_out_of_a_region_is_refused() {
     }
 }
 
-/// A `cell` atom reaching a published footprint is what the scheduler colours on, and with every
-/// escape route closed a *written row* is the only way one gets there.
 #[test]
 fn a_declared_cell_atom_is_what_reaches_a_tests_footprint() {
     let compiled = Compiled::new(
@@ -255,8 +238,7 @@ test "a read and a write" {
         vec!["cell.read[log]".to_string(), "cell.write[log]".to_string()]
     );
 
-    // And a region discharges its own label: the same atoms performed inside the region never reach
-    // the footprint at all.
+    // A region discharges its own label: the same atoms inside it never reach the footprint.
     let discharged = Compiled::new(
         r#"
 test "inside the region" {
@@ -267,9 +249,6 @@ test "inside the region" {
     assert_eq!(discharged.footprint("inside the region").atoms().count(), 0);
 }
 
-/// A cell in a *constructor argument* used to be the one carrier the region check could not see:
-/// the variant's field type holds the `Cell`, so the region's result type was `Held` and mentioned
-/// no region.
 #[test]
 fn a_cell_in_a_constructor_argument_is_refused_where_the_field_is_declared() {
     let diags = Compiled::rejected(
@@ -290,9 +269,7 @@ test "a constructor carries the cell out of its region" {
     );
 }
 
-/// The boundary of that hole: the region variable in a declared `Cell<T>` field is fixed by the
-/// first region that fills it, so a second region using the same type is a mismatch rather than a
-/// silent alias between two regions' cells.
+/// The region variable in a declared `Cell<T>` field is fixed by the first region that fills it.
 #[test]
 fn one_variant_cannot_hold_cells_from_two_regions_at_once() {
     let diags = Compiled::rejected(
@@ -314,8 +291,6 @@ test "two regions through one variant" {
     );
 }
 
-/// A cell in a list element or a record field *is* caught, because both keep the `Cell` type in the
-/// region's result type where `mentions_region` finds it.
 #[test]
 fn a_cell_in_a_list_or_a_record_field_is_refused_by_the_region_check() {
     for (carrier, src) in [
@@ -346,7 +321,6 @@ test "smuggle" {
     }
 }
 
-/// A test can only sample the executions somebody thought of.
 #[test]
 fn a_region_stack_and_the_values_in_it_cannot_cross_a_thread() {
     assert!(
@@ -365,9 +339,7 @@ fn a_region_stack_and_the_values_in_it_cannot_cross_a_thread() {
     assert!(is_send!(ply_span::Span));
 }
 
-/// Autoref specialization: the inherent method exists only when `T: Send`, and the trait method on
-/// `&Probe<T>` needs one more autoref step, so it is chosen exactly when the inherent one does not
-/// apply.
+/// Autoref specialization: the inherent method exists only for `T: Send`, else the trait's applies.
 struct Probe<T>(PhantomData<T>);
 
 impl<T: Send> Probe<T> {

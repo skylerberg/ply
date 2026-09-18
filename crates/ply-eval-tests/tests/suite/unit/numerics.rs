@@ -1,5 +1,3 @@
-//! Evaluating `Float` and `Decimal`.
-
 use crate::unit::build::*;
 use ply_eval::{Decimal, values_equal};
 use ply_eval::{Machine, Value};
@@ -59,7 +57,6 @@ fn d(mantissa: i128, scale: u32) -> Decimal {
     Decimal::try_from_i128_with_scale(mantissa, scale).expect("in range")
 }
 
-/// A `Rounding` constructor, named bare.
 fn rounding(mode: &str) -> Expr {
     Expr {
         kind: ExprKind::Var(QName::bare(Ident::new(mode, Span::DUMMY))),
@@ -67,9 +64,6 @@ fn rounding(mode: &str) -> Expr {
     }
 }
 
-// -- Float ------------------------------------------------------------------
-
-/// IEEE, unmodified.
 #[test]
 fn float_arithmetic_is_ieee_at_the_edges() {
     assert_eq!(
@@ -82,16 +76,13 @@ fn float_arithmetic_is_ieee_at_the_edges() {
     );
     assert!(ok_float(bin(BinOp::Div, float(0.0), float(0.0))).is_nan());
     assert!(ok_float(bin(BinOp::Add, float(f64::NAN), float(1.0))).is_nan());
-    // `1.0 / -0.0` is what makes `0.0` and `-0.0` two definitions rather than one, so it had better
-    // tell them apart.
+    // `1.0 / -0.0` is what tells `0.0` and `-0.0` apart.
     assert_eq!(
         ok_float(bin(BinOp::Div, float(1.0), un(UnOp::Neg, float(0.0)))),
         f64::NEG_INFINITY
     );
 }
 
-/// The headline arithmetic difference between the two numeric types, in one test, because it is the
-/// reason both exist.
 #[test]
 fn binary_floating_point_loses_a_hundredth_and_decimal_does_not() {
     assert_ne!(ok_float(bin(BinOp::Add, float(0.1), float(0.2))), 0.3);
@@ -102,8 +93,6 @@ fn binary_floating_point_loses_a_hundredth_and_decimal_does_not() {
     );
 }
 
-/// `==` on `Float` is IEEE's, which is the source of every restriction on the type: not an ordered
-/// key type, not derivable for `ord`, never `proved`.
 #[test]
 fn float_equality_is_not_reflexive_and_zero_has_no_sign() {
     assert_eq!(
@@ -120,7 +109,6 @@ fn float_equality_is_not_reflexive_and_zero_has_no_sign() {
     );
 }
 
-/// A `NaN` comparison is false in both directions, so `<` is not the negation of `>=`.
 #[test]
 fn a_nan_comparison_is_false_in_both_directions() {
     for op in [BinOp::Lt, BinOp::Le, BinOp::Gt, BinOp::Ge] {
@@ -149,8 +137,7 @@ fn the_language_equality_and_the_map_order_part_only_at_nan_and_signed_zero() {
     assert!(values_equal(&zero, &negative_zero, Span::DUMMY).unwrap());
     assert_ne!(zero.cmp(&negative_zero), std::cmp::Ordering::Equal);
 
-    // Everywhere else the two agree, which is what makes `Float` the documented exception rather
-    // than an unexplored corner.
+    // Everywhere else the two agree.
     for a in [1.0f64, -1.0, f64::INFINITY, f64::MAX, 0.5] {
         for b in [1.0f64, -1.0, f64::INFINITY, f64::MAX, 0.5] {
             let (x, y) = (Value::Float(a), Value::Float(b));
@@ -173,9 +160,6 @@ fn a_float_renders_so_it_cannot_be_read_as_an_int() {
     assert_eq!(Value::Float(1.0).type_name(), "Float");
 }
 
-// -- Decimal ----------------------------------------------------------------
-
-/// Exact, or a diagnostic.
 #[test]
 fn a_decimal_addition_that_overflows_the_mantissa_is_a_runtime_error() {
     let max = Decimal::MAX;
@@ -189,8 +173,7 @@ fn a_decimal_addition_that_overflows_the_mantissa_is_a_runtime_error() {
     );
 }
 
-/// `%` is exact, and is therefore allowed where `/` is not: the *remainder* of a decimal division
-/// is a decimal even when the quotient is not.
+/// The remainder of a decimal division is a decimal even when the quotient is not.
 #[test]
 fn decimal_remainder_is_exact_and_a_zero_divisor_is_an_error() {
     assert_eq!(ok_decimal(bin(BinOp::Rem, dec(10, 0), dec(3, 0))), d(1, 0));
@@ -200,7 +183,6 @@ fn decimal_remainder_is_exact_and_a_zero_divisor_is_an_error() {
     );
 }
 
-/// The evaluator's own refusal, behind inference's.
 #[test]
 fn decimal_division_is_refused_by_the_evaluator_too() {
     let e = err(bin(BinOp::Div, dec(1, 0), dec(3, 0)));
@@ -212,8 +194,7 @@ fn decimal_division_is_refused_by_the_evaluator_too() {
     );
 }
 
-/// Half-to-even, at the two points that tell it from half-up: `0.125` has an even digit below it
-/// and rounds down, `0.135` has an odd one and rounds up.
+/// `0.125` has an even digit below it and rounds down; `0.135` has an odd one and rounds up.
 #[test]
 fn decimal_div_and_round_are_half_to_even() {
     let div = callv(
@@ -234,8 +215,7 @@ fn decimal_div_and_round_are_half_to_even() {
     );
     assert_eq!(ok_decimal(up), d(14, 2));
 
-    // Half-up is a different answer at the same point, which is why the mode is an argument rather
-    // than a default.
+    // Half-up is a different answer at the same point.
     let half_up = callv(
         "decimal_round",
         vec![dec(125, 3), int(2), rounding("HalfUp")],
@@ -266,7 +246,6 @@ fn decimal_div_refuses_a_zero_divisor_and_a_scale_outside_the_range() {
     assert_eq!(err(negative).code, codes::RUNTIME_ERROR);
 }
 
-/// Identity, scale included.
 #[test]
 fn decimal_to_string_after_decimal_of_string_is_identity() {
     for text in [
@@ -306,8 +285,7 @@ fn decimal_of_string_answers_none_rather_than_guessing() {
     }
 }
 
-/// JSON's number grammar admits an exponent and `std.json` hands the whole token here, so a number
-/// that is well inside `Decimal`'s range must not be reported as outside it.
+/// `std.json` hands the whole number token, exponent included, to this builtin.
 #[test]
 fn decimal_of_string_reads_the_exponent_form() {
     for (text, expect) in [
@@ -329,9 +307,6 @@ fn decimal_of_string_reads_the_exponent_form() {
     }
 }
 
-/// The **shortest** decimal that round-trips the float, which is the only defensible choice: `0.1`
-/// as a binary64 is not `0.1`, and any other answer is an arbitrary number of digits of a binary
-/// approximation.
 #[test]
 fn decimal_of_float_is_the_shortest_round_tripping_decimal() {
     let shortest = callv(
@@ -383,9 +358,7 @@ fn the_float_bit_pattern_round_trips_every_value_including_nan() {
     );
 }
 
-/// What the lexer makes of `text` written as a literal — taken from the lexer itself, so that the
-/// agreement below is against the parse a program's own literals go through and not against
-/// Rust's parser called twice.
+/// From the lexer itself, so the agreement is with the parse a program's literals go through.
 #[track_caller]
 fn lexed_float(text: &str) -> f64 {
     let (tokens, diags) = ply_syntax::lexer::lex(ply_span::SourceId(0), text);
@@ -396,10 +369,7 @@ fn lexed_float(text: &str) -> f64 {
     }
 }
 
-/// **The parse a front end carrying a literal's text needs.** The lexer hands the literal's digits
-/// to Rust's parser and the hasher writes `f.to_bits()`, so a front end that has the text and not
-/// the value hashes a float literal correctly exactly when this builtin is that same parse —
-/// including where the route through `Decimal` cannot follow.
+/// A front end holding only a literal's text hashes it correctly exactly when this is the lexer's parse.
 #[test]
 fn float_of_string_is_the_parse_the_lexer_makes_of_the_same_literal() {
     for text in [
@@ -413,8 +383,7 @@ fn float_of_string_is_the_parse_the_lexer_makes_of_the_same_literal() {
         assert_eq!(read, literal, "`{text}`");
     }
 
-    // Two spellings the lexer reads as something other than one float literal, which the builtin
-    // still reads as the number: an integer, as `decimal_of_string("0")` reads one, and a sign.
+    // Spellings that are not one float literal, which the builtin still reads: an integer and a sign.
     assert_eq!(
         ok_float(unwrap_some(callv("float_of_string", vec![string("1")]))),
         1.0
@@ -424,8 +393,7 @@ fn float_of_string_is_the_parse_the_lexer_makes_of_the_same_literal() {
         -2.5
     );
 
-    // The two extremes are ordinary `Float`s and have no `Decimal` between them and their text,
-    // which is why this is a builtin rather than two calls.
+    // No `Decimal` sits between these extremes and their text, so this cannot be two calls.
     for f in [1.0e-30, 1.0e300] {
         assert_eq!(
             ok(callv("decimal_of_float", vec![float(f)])),
@@ -435,8 +403,7 @@ fn float_of_string_is_the_parse_the_lexer_makes_of_the_same_literal() {
     }
 }
 
-/// What no literal spells is absent rather than guessed — `inf` and `NaN` above all, which Rust's
-/// `f64::from_str` accepts and Ply has no way to write.
+/// Rust's `f64::from_str` accepts `inf` and `NaN`, which no Ply literal spells.
 #[test]
 fn float_of_string_answers_none_rather_than_guessing() {
     for text in [
@@ -482,8 +449,6 @@ fn the_int_and_float_conversions_are_total_where_they_claim_to_be() {
     );
 }
 
-/// By numeric value, so `1.50m == 1.5m` — which is the same fact that makes the two one map key
-/// while leaving them two definitions.
 #[test]
 fn decimal_equality_is_by_value_and_ignores_the_scale() {
     assert_eq!(
@@ -523,7 +488,6 @@ fn decimal_comparison_is_by_value() {
     );
 }
 
-/// Mixing the numeric types is a runtime error rather than a coercion.
 #[test]
 fn the_numeric_types_do_not_mix_at_runtime() {
     assert_eq!(
@@ -541,8 +505,6 @@ fn the_numeric_types_do_not_mix_at_runtime() {
     );
 }
 
-/// Negation is how a program reaches `-0.0`, and it is exact on a `Decimal` at every value the type
-/// holds.
 #[test]
 fn negation_works_at_all_three_numeric_types() {
     assert!(ok_float(un(UnOp::Neg, float(0.0))).is_sign_negative());
@@ -550,8 +512,7 @@ fn negation_works_at_all_three_numeric_types() {
     assert_eq!(ok(un(UnOp::Neg, int(5))), Value::Int(-5));
 }
 
-/// `Some(x)` from a builtin, unwrapped — the prelude's `Option`, reachable without a `type`
-/// declaration anywhere.
+/// `Some(x)` from a builtin, unwrapped.
 fn unwrap_some(e: Expr) -> Expr {
     match_(
         e,
