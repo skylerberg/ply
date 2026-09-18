@@ -20,13 +20,11 @@ pub enum Target {
     Raises,
 }
 
-/// What the walk arrived at.
 #[derive(Debug)]
 pub struct Shrunk {
     pub values: Vec<Value>,
-    /// Accepted steps.
     pub steps: u32,
-    /// Candidates actually evaluated, against `--shrink-budget`.
+    /// Counted against `--shrink-budget`.
     pub evaluations: u32,
     /// For [`Target::Raises`], what the last accepted candidate raised.
     pub diagnostic: Option<Diagnostic>,
@@ -89,13 +87,9 @@ pub fn size(value: &Value, world: &TypeWorld) -> u64 {
     while let Some(v) = pending.pop() {
         let here = match v {
             Value::Int(n) => int_size(*n),
-            // The same measure over the value, so a `U8` shrinks toward zero as an `Int` does and
-            // an `I8` shrinks positive-before-negative.
             Value::Fixed(f) => int_size(f.value().clamp(i64::MIN as i128, i64::MAX as i128) as i64),
             Value::Bool(b) => u64::from(*b),
             Value::Unit => 0,
-            // Ordered so that every candidate below is a strict descent: toward zero, and positive
-            // before its negation.
             Value::Float(f) => float_size(*f),
             Value::Decimal(d) => decimal_size(*d),
             Value::Str(s) => s
@@ -108,9 +102,7 @@ pub fn size(value: &Value, world: &TypeWorld) -> u64 {
                 pending.extend(items.iter());
                 items.len() as u64
             }
-            // Keys count as well as values: two maps with one entry each are ordered by what is in
-            // them, which is what makes removing an entry a strict shrink and replacing a key with
-            // a smaller one another.
+            // Keys count too, so replacing a key with a smaller one is a strict shrink.
             Value::Map(entries) => {
                 pending.extend(entries.keys());
                 pending.extend(entries.values());
@@ -125,11 +117,9 @@ pub fn size(value: &Value, world: &TypeWorld) -> u64 {
                 let index = world.ctor(name).map(|(_, i)| i).unwrap_or(0) as u64;
                 1u64.saturating_add(index).saturating_add(args.len() as u64)
             }
-            // A closure this crate generated carries the size it was built with; anything else is
-            // left alone rather than guessed at.
+            // Only closures this crate generated carry a size.
             Value::Closure(_) => fn_size(v).unwrap_or(1),
-            // A `Secret` is unreachable here: `forall (s: Secret<a>)` is `E0418`, so the generator
-            // never mints one and no counterexample holds one.
+            // Never generated: `forall (s: Secret<a>)` is rejected.
             Value::Cell(_) | Value::Task(_) | Value::Continuation(_) | Value::Secret(_) => 0,
         };
         total = total.saturating_add(here);
@@ -137,8 +127,6 @@ pub fn size(value: &Value, world: &TypeWorld) -> u64 {
     total
 }
 
-/// Finite values by magnitude, with a negative outweighing its absolute value, and everything
-/// non-finite above every finite value.
 fn float_size(f: f64) -> u64 {
     if f.is_nan() {
         return u64::MAX;
@@ -147,19 +135,13 @@ fn float_size(f: f64) -> u64 {
         return u64::MAX - 1;
     }
     let magnitude = f.abs();
-    // A `Float` spans more magnitudes than a `u64` counts, so the measure is over the exponent and
-    // the mantissa rather than over the value: it only has to order candidates, and a saturating
-    // cast would make every large float one size and stall the walk.
+    // Measured over the bits: a saturating cast would make every large float one size and stall.
     let bits = magnitude.to_bits();
     bits.saturating_mul(2)
         .saturating_add(u64::from(f.is_sign_negative()))
 }
 
-/// Magnitude, then whether there is a fraction at all, then the scale, then the sign — strictly
-/// layered, so each is a tiebreak on the one above it.
 fn decimal_size(d: Decimal) -> u64 {
-    // The layers: a magnitude step is worth more than every tiebreak together, and having a
-    // fraction is worth more than the scale it is written at.
     const MAGNITUDE: u64 = 64;
     const FRACTION: u64 = 32;
     let magnitude = d.trunc().abs().to_u64().unwrap_or(u64::MAX / MAGNITUDE);
@@ -177,8 +159,7 @@ fn int_size(n: i64) -> u64 {
         .saturating_add(u64::from(n < 0))
 }
 
-/// The smallest value of a type: the shrinker's floor, and what fills a field a candidate
-/// constructor has and the current value does not.
+/// The smallest value of a type: the shrinker's floor.
 pub fn minimal(ty: &Type, world: &TypeWorld) -> Result<Value, Ungeneratable> {
     minimal_at(ty, world, 0)
 }
@@ -224,7 +205,6 @@ fn minimal_at(ty: &Type, world: &TypeWorld, depth: u32) -> Result<Value, Ungener
             "Bytes" => Ok(Value::bytes([])),
             "Unit" => Ok(Value::Unit),
             "List" => Ok(Value::list(Vec::new())),
-            // `map_new()`, which is the floor the contract names.
             "Map" => Ok(Value::empty_map()),
             "Cell" => Err(Ungeneratable::Cell),
             _ if name.as_str() == prelude::TASK_TYPE => Err(Ungeneratable::Task),
@@ -243,8 +223,6 @@ fn minimal_at(ty: &Type, world: &TypeWorld, depth: u32) -> Result<Value, Ungener
     }
 }
 
-/// The variant a minimal value of `Con(name, args)` uses: fewest nested constructors, then lowest
-/// declaration index.
 fn shallowest(name: &Symbol, args: &[Type], world: &TypeWorld) -> Option<(Symbol, Vec<Type>)> {
     let variants = world.variants(name)?;
     variants
@@ -312,9 +290,7 @@ fn candidates_at(value: &Value, ty: &Type, world: &TypeWorld, depth: u32) -> Vec
         (Value::Ctor { name, args }, Type::Con(ty_name, ty_args)) => {
             ctor_candidates(name, args, ty_name, ty_args, ty, world, depth)
         }
-        // Toward the constant function returning the smallest value of the return type, which is
-        // the family's floor, so a second application proposes the same value and the size test
-        // ends the walk.
+        // The constant function is the floor, so the size test ends the walk on the next pass.
         (Value::Closure(_), Type::Fn { params, ret, .. }) => minimal(ret, world)
             .map(|v| vec![const_fn(params.len(), v, world)])
             .unwrap_or_default(),
@@ -322,7 +298,6 @@ fn candidates_at(value: &Value, ty: &Type, world: &TypeWorld, depth: u32) -> Vec
     }
 }
 
-/// `0`, then halving toward zero, then one step toward zero, then the positive of a negative.
 fn int_candidates(n: i64) -> Vec<Value> {
     if n == 0 {
         return Vec::new();
@@ -346,7 +321,6 @@ fn int_candidates(n: i64) -> Vec<Value> {
     out.into_iter().map(Value::Int).collect()
 }
 
-/// Toward `0.0`, and a specific value before a special one.
 fn float_candidates(f: f64) -> Vec<Value> {
     if f == 0.0 && f.is_sign_positive() {
         return Vec::new();
@@ -355,8 +329,6 @@ fn float_candidates(f: f64) -> Vec<Value> {
         return vec![Value::Float(0.0)];
     }
     let mut out: Vec<f64> = vec![0.0];
-    // The truncation is the point: a fraction shrinks to the whole number below it, which is what
-    // makes `0.30000000000000004` reach `0.0` in two steps.
     let truncated = f.trunc();
     if truncated != f {
         out.push(truncated);
@@ -372,14 +344,11 @@ fn float_candidates(f: f64) -> Vec<Value> {
     if f.is_sign_negative() {
         out.push(-f);
     }
-    // `!=` and not `total_cmp`, so `-0.0` is dropped against a `0.0` candidate and the walk cannot
-    // cycle between two values the language calls equal.
+    // `!=`, not `total_cmp`: `-0.0 == 0.0`, and keeping it would cycle the walk.
     out.retain(|c| *c != f);
     out.into_iter().map(Value::Float).collect()
 }
 
-/// Toward `0m`, and toward scale 0 — the trailing zeros go before the digits do, so a witness reads
-/// `1.5m` rather than `1.500000m`.
 fn decimal_candidates(d: Decimal) -> Vec<Value> {
     if d.is_zero() && d.scale() == 0 {
         return Vec::new();
@@ -389,11 +358,9 @@ fn decimal_candidates(d: Decimal) -> Vec<Value> {
     if normalized.scale() != d.scale() {
         out.push(normalized);
     }
-    // Truncation, shortest first: `12.345m` offers `12m`, then `12.3m`, then `12.34m`.
     for places in 0..d.scale() {
         out.push(d.round_dp_with_strategy(places, RoundingStrategy::ToZero));
     }
-    // Then the magnitude, which is what moves an integer witness.
     let mut half = d;
     for _ in 0..96 {
         match half.checked_div(Decimal::TWO) {
@@ -413,8 +380,6 @@ fn decimal_candidates(d: Decimal) -> Vec<Value> {
     out.into_iter().map(Value::Decimal).collect()
 }
 
-/// Length before content, which is the order that makes a minimal witness readable: `b""`, then the
-/// two halves, then each byte lowered toward zero.
 fn bytes_candidates(b: &[u8]) -> Vec<Value> {
     if b.is_empty() {
         return Vec::new();
@@ -438,7 +403,6 @@ fn bytes_candidates(b: &[u8]) -> Vec<Value> {
     out
 }
 
-/// `""`, the two halves, then each character lowered toward `'a'`, left to right.
 fn string_candidates(s: &str) -> Vec<Value> {
     let chars: Vec<char> = s.chars().collect();
     if chars.is_empty() {
@@ -472,7 +436,6 @@ fn string_candidates(s: &str) -> Vec<Value> {
     out
 }
 
-/// `[]`, the two halves, each single element removed, then each element shrunk in place.
 fn list_candidates(items: &List, elem: &Type, world: &TypeWorld, depth: u32) -> Vec<Value> {
     if items.is_empty() {
         return Vec::new();
@@ -498,7 +461,6 @@ fn list_candidates(items: &List, elem: &Type, world: &TypeWorld, depth: u32) -> 
     out
 }
 
-/// The empty map, then each entry dropped, then each value shrunk, then each key shrunk.
 fn map_candidates(
     entries: &ply_eval::Map,
     key: &Type,
@@ -536,7 +498,6 @@ fn map_candidates(
     out
 }
 
-/// A recursive field, then a lower-index constructor, then each field shrunk in place.
 fn ctor_candidates(
     ctor: &Symbol,
     args: &Arc<Vec<Value>>,

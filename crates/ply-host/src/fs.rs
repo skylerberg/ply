@@ -1,4 +1,4 @@
-//! The filesystem, as nine operations over roots the run names.
+//! The filesystem, as operations confined to roots the run names.
 
 use crate::pool::{Done, FS_FIRST_TOKEN, Pool};
 use ply_eval::host::{
@@ -13,13 +13,12 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-/// The effect these operations serve, spelled as `std.fs` declares it.
+/// Must match the effect `std.fs` declares.
 pub const EFFECT: &str = "fs";
 
-/// The largest file `fs.read_file` will answer with.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// The nine operations, in the order `std.fs` declares them.
+/// In the order `std.fs` declares them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Op {
     ReadFile,
@@ -46,7 +45,6 @@ impl Op {
         Op::Rename,
     ];
 
-    /// The name in `std.fs`.
     pub fn name(self) -> &'static str {
         match self {
             Op::ReadFile => "read_file",
@@ -61,7 +59,6 @@ impl Op {
         }
     }
 
-    /// How a diagnostic names it.
     pub fn what(self) -> &'static str {
         match self {
             Op::ReadFile => "`fs.read_file`",
@@ -83,8 +80,7 @@ impl Op {
         }
     }
 
-    /// The thread name a job runs under, so a stack from a wedged run says which operation is
-    /// holding the thread.
+    /// The thread name a job runs under.
     fn label(self) -> &'static str {
         match self {
             Op::ReadFile => "fs-read",
@@ -103,15 +99,11 @@ impl Op {
         HostOp {
             effect: Symbol::new(EFFECT),
             op: Symbol::new(self.name()),
-            // Whichever roots the program names.
             resource: HostResource::Any,
             determinism: Determinism::Nondeterministic,
-            // At most once.
             linearity: Linearity::AtMostOnce,
-            // Every one of them waits on a disk, so every one of them leaves the machine's thread.
             blocking: true,
-            // A path is a `String` and a body is `Bytes`, and no expression turns a `Secret` into
-            // either.
+            // No expression turns a `Secret` into a path `String` or a body `Bytes`.
             secrets: false,
             path,
         }
@@ -136,7 +128,6 @@ impl RootSpec {
         if path.is_empty() {
             return Err(malformed(text, "the path is empty"));
         }
-        // A label is a resource label in a Ply program, and those are ordinary identifiers.
         if !name.chars().all(|c| c.is_alphanumeric() || c == '_')
             || name.chars().next().is_some_and(|c| c.is_numeric())
         {
@@ -167,7 +158,6 @@ impl Roots {
         Roots::default()
     }
 
-    /// Every root the run named, resolved.
     pub fn load(specs: &[RootSpec], span: Span) -> Result<Roots, Diagnostic> {
         let mut roots = Roots::new();
         for spec in specs {
@@ -176,7 +166,6 @@ impl Roots {
         Ok(roots)
     }
 
-    /// Resolve `path` and bind it to `name`.
     pub fn bind(&mut self, name: &str, path: &Path, span: Span) -> Result<(), Diagnostic> {
         let resolved = path.canonicalize().map_err(|e| {
             Diagnostic::error(
@@ -198,18 +187,14 @@ impl Roots {
         Ok(())
     }
 
-    /// The directory bound to the label an operation named, if any.
     pub fn get(&self, at: &Resource) -> Option<&Path> {
         match at {
             Resource::Named(name) => self.bound.get(name.as_str()).map(PathBuf::as_path),
-            // `std.fs` declares every operation `[r]`, so a singleton resource cannot arise from a
-            // well-typed program; answering `None` rather than panicking keeps a malformed
-            // registration a diagnostic.
+            // Unreachable when well-typed; `None` keeps a malformed registration a diagnostic.
             Resource::Singleton => None,
         }
     }
 
-    /// Every root, ascending, for the listing `ply hosts` prints.
     pub fn listing(&self) -> impl Iterator<Item = (&str, &Path)> {
         self.bound
             .iter()
@@ -221,7 +206,6 @@ impl Roots {
     }
 }
 
-/// The filesystem, and the pool its operations wait on.
 pub struct FsHost {
     roots: Roots,
     pool: Pool,
@@ -239,7 +223,6 @@ impl FsHost {
         &self.roots
     }
 
-    /// Whether this pool minted the token. What a composed runtime routes on.
     pub fn owns(&self, pending: &Pending) -> bool {
         self.pool.owns(pending)
     }
@@ -260,13 +243,10 @@ impl FsHost {
         self.pool.outstanding()
     }
 
-    /// Wait for one operation and answer it.
     pub fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
         self.pool.block_on(pending)
     }
 
-    /// The Rust path `ply hosts` prints, which must identify the implementation rather than the
-    /// effect.
     fn path(op: Op) -> &'static str {
         match op {
             Op::ReadFile => "ply_host::fs::read_file",
@@ -282,7 +262,6 @@ impl FsHost {
     }
 }
 
-/// Register every operation of `fs` against `fs`'s implementation.
 pub fn register(registry: &mut HostRegistry, fs: Arc<FsHost>) {
     for op in Op::ALL {
         registry.register(
@@ -331,14 +310,12 @@ impl HostHandler for Operation {
     }
 }
 
-/// The second argument of the two operations that take one.
 enum Second {
     None,
     Body(Arc<[u8]>),
     Path(String),
 }
 
-/// One operation, on a pool thread, with every syscall it makes.
 fn run(op: Op, root: &Path, path: &str, second: Second, span: Span) -> Done {
     let target = match confine(root, path, span) {
         Ok(target) => target,
@@ -361,9 +338,7 @@ fn run(op: Op, root: &Path, path: &str, second: Second, span: Span) -> Done {
                     .filter_map(|e| e.ok())
                     .map(|e| e.file_name().to_string_lossy().into_owned())
                     .collect();
-                // Ascending, because the order a directory is read in is a fact about the
-                // filesystem rather than about the directory, and a program whose output depended
-                // on it would answer differently on two machines holding the same bytes.
+                // Read order is a fact about the filesystem, not the directory's contents.
                 names.sort();
                 Done::MaybeStrings(Some(names))
             }
@@ -386,8 +361,7 @@ fn run(op: Op, root: &Path, path: &str, second: Second, span: Span) -> Done {
             Second::Body(body) => Done::Bool(std::fs::write(&target, &body[..]).is_ok()),
             _ => Done::Failed("a write with no body reached the pool".into()),
         },
-        // Every missing ancestor, and idempotent, because a cache writer that had to check first
-        // would race with itself.
+        // Idempotent, so a cache writer need not check first and race with itself.
         Op::CreateDir => Done::Bool(std::fs::create_dir_all(&target).is_ok()),
         // One file, or one empty directory.
         Op::Remove => match std::fs::symlink_metadata(&target) {
@@ -397,8 +371,7 @@ fn run(op: Op, root: &Path, path: &str, second: Second, span: Span) -> Done {
         },
         Op::Rename => match second {
             Second::Path(to) => match confine(root, &to, span) {
-                // Both paths are under the one label the operation named, which is what makes this
-                // Both paths are under one label, which is what makes this the atomic cache write.
+                // Both paths are under one label, which makes this the atomic cache write.
                 Err(refusal) => Done::Refused(refusal),
                 Ok(destination) => Done::Bool(std::fs::rename(&target, &destination).is_ok()),
             },
@@ -407,7 +380,6 @@ fn run(op: Op, root: &Path, path: &str, second: Second, span: Span) -> Done {
     }
 }
 
-/// The path `root` and `path` name together, or `E0452`.
 pub fn confine(root: &Path, path: &str, span: Span) -> Result<PathBuf, Diagnostic> {
     let relative = Path::new(path);
     if relative.is_absolute() {
@@ -445,12 +417,10 @@ pub fn confine(root: &Path, path: &str, span: Span) -> Result<PathBuf, Diagnosti
                 }
                 return Ok(target);
             }
-            // Not there yet, so check the nearest ancestor that is — the one a symlink would
-            // have to be on for the write to land outside.
+            // Not there yet: check the nearest existing ancestor, where a symlink could escape.
             Err(_) => match existing.parent() {
                 Some(parent) if parent.starts_with(root) => existing = parent,
-                // Nothing above it exists inside the root either, so there is no link to have been
-                // followed and the lexical checks above are the whole answer.
+                // No existing ancestor inside the root, so the lexical checks suffice.
                 _ => return Ok(target),
             },
         }

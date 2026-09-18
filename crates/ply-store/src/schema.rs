@@ -63,8 +63,7 @@ fn every_type() -> Type {
         params: vec![
             Type::Var(TyVar(0)),
             Type::Con(sym("List"), vec![Type::Var(TyVar(1))]),
-            // A two-argument `Con`, which no other exemplar reaches: `List` has one and `Map` is
-            // the first stored type whose arity the codec has to carry.
+            // The only two-argument `Con`, so the codec's arity is exercised.
             Type::map(Type::string(), Type::Var(TyVar(1))),
             Type::Record(BTreeMap::from([(sym("id"), Type::int())])),
         ],
@@ -90,8 +89,7 @@ pub fn exemplars() -> Exemplars {
                 exports: ContentHash([2u8; 32]),
             }],
             deps: vec![NameRef::new("store.db.get", h(7))],
-            // Every hash on a `DefEntry` is distinct, so the pin moves if two
-            // of the three are ever swapped or one is dropped.
+            // Distinct hashes per `DefEntry`, so the pin moves if two are swapped or one dropped.
             defs: vec![
                 DefEntry {
                     name: sym("user.active_users"),
@@ -193,29 +191,23 @@ pub fn exemplars() -> Exemplars {
     }
 }
 
-/// Digested over the *encoded* exemplars rather than over a description of the types: an encoder
-/// that starts writing a field differently changes this even though every type declaration is
-/// untouched, which is exactly the drift a reader cannot otherwise detect.
+/// Digests the *encoded* exemplars, so an encoder change moves it even when no type changes.
 pub fn fingerprint() -> ContentHash {
     fingerprint_at(BODY_ENCODING)
 }
 
-/// The digest as it would be under another generation of the body encoding.
 pub fn fingerprint_at(body_encoding: u32) -> ContentHash {
     let e = exemplars();
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"ply-store schema v1");
     hasher.update(&FRONTEND_FORMAT.to_le_bytes());
     hasher.update(&body_encoding.to_le_bytes());
-    // The declared variant set as well as the values, so that a variant added to a stored enum
-    // moves the digest at the point it is *named* rather than only once an exemplar happens to
-    // reach it.
+    // Variant names too, so a new variant moves the digest before an exemplar reaches it.
     for name in COVERED {
         hasher.update(&(name.len() as u64).to_le_bytes());
         hasher.update(name.as_bytes());
     }
-    // `Outcome` goes through serde because the result cache is still JSON, and its shape is what a
-    // bump of `RUNTIME_VERSION` is for.
+    // The result cache stores `Outcome` as JSON, so it is digested in that form.
     let outcomes = serde_json::to_vec(&e.outcomes)
         .unwrap_or_else(|e| format!("unserializable: {e}").into_bytes());
     for bytes in [

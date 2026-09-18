@@ -10,10 +10,8 @@ use ply_eval::{
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::sync::Arc;
 
-/// The effect the three operations belong to, as every `EffectAtom` names it.
 const TASK: &str = "task";
 
-/// The registrations, in the order `ply hosts` will sort them into anyway.
 pub fn registrations() -> Vec<(HostOp, Arc<dyn HostHandler>)> {
     TASK_OPS
         .iter()
@@ -36,8 +34,6 @@ pub fn registrations() -> Vec<(HostOp, Arc<dyn HostHandler>)> {
         .collect()
 }
 
-/// One path per operation rather than one for the trio: `ply hosts` prints a line per triple, and
-/// three lines naming one path would tell a reviewer less than three lines naming three.
 fn path_of(op: &str) -> &'static str {
     match op {
         "spawn" => "ply_host::sched::spawn",
@@ -46,7 +42,6 @@ fn path_of(op: &str) -> &'static str {
     }
 }
 
-/// Opens a production region, or says why it may not be opened.
 pub fn open(
     binding: &HostBinding,
     region: SimId,
@@ -76,7 +71,6 @@ impl HostHandler for Scheduled {
     }
 }
 
-/// Reaching the production scheduler with nothing bound.
 #[cold]
 #[inline(never)]
 fn err_hermetic(span: Span, binding: &HostBinding) -> Diagnostic {

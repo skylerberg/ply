@@ -7,7 +7,6 @@ use std::error::Error;
 use tokio_postgres::types::private::BytesMut;
 use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
-/// A JSON document, as the driver holds one.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Json {
     Null,
@@ -15,15 +14,14 @@ pub enum Json {
     Number(Decimal),
     Str(String),
     Array(Vec<Json>),
-    /// Insertion order as the document had it.
+    /// In document order.
     Object(Vec<(String, Json)>),
 }
 
-/// Deeper than this and the driver is walking a document a peer chose the shape of.
+/// Bounds recursion into a document whose shape a peer chose.
 const MAX_JSON_DEPTH: usize = 64;
 
 impl Json {
-    /// Parse strict JSON.
     pub fn parse(bytes: &[u8], at: &str) -> Result<Json, String> {
         let text = std::str::from_utf8(bytes)
             .map_err(|_| format!("{at} is not UTF-8, so it is not JSON"))?;
@@ -41,8 +39,7 @@ impl Json {
         Ok(value)
     }
 
-    /// Canonical text: no whitespace, keys in the order held, `Decimal`'s own rendering for a
-    /// number so a scale survives the round trip.
+    /// Canonical text: no whitespace, keys in order, numbers rendered so a scale survives.
     pub fn render(&self) -> String {
         let mut out = String::new();
         self.write(&mut out);
@@ -232,8 +229,7 @@ impl JsonParser<'_> {
                         b't' => out.push('\t'),
                         b'u' => {
                             let unit = self.hex4()?;
-                            // A surrogate pair is two escapes and one character; pushing the halves
-                            // separately would produce text that is not what the document held.
+                            // A surrogate pair is two escapes and one character.
                             if (0xd800..0xdc00).contains(&unit) {
                                 if self.src.get(self.at) != Some(&b'\\')
                                     || self.src.get(self.at + 1) != Some(&b'u')
@@ -309,8 +305,6 @@ impl JsonParser<'_> {
     }
 }
 
-/// What a program hands a `db` operation, decoded and ready to be checked against the type the
-/// server described for it.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Param {
     Null,
@@ -326,7 +320,6 @@ pub enum Param {
 }
 
 impl Param {
-    /// How a refusal names the constructor the program wrote.
     pub fn what(&self) -> &'static str {
         match self {
             Param::Null => "`PNull`",
@@ -342,7 +335,6 @@ impl Param {
     }
 }
 
-/// What comes back out of a column.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Datum {
     Null,
@@ -356,7 +348,6 @@ pub enum Datum {
     Array(Vec<Datum>),
 }
 
-/// The SQLSTATE the server returned and the object it named.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DbError {
     pub code: String,
@@ -373,15 +364,13 @@ impl DbError {
         }
     }
 
-    /// The connection went away mid-statement.
     pub fn connection(detail: impl Into<String>) -> DbError {
         DbError::new("08006", "", detail)
     }
 }
 
-/// A parameter that failed before anything was sent.
 pub enum BindError {
-    /// The program's claim and the statement's shape disagree, every time, for this statement text.
+    /// The program and the statement disagree, so every run of this text fails.
     Refused(Diagnostic),
     /// A value the column cannot hold.
     Failed(DbError),
@@ -455,14 +444,12 @@ impl ToSql for Bound {
                 out.extend_from_slice(text.as_bytes());
                 Ok(IsNull::No)
             }
-            // One dimension, framed by `postgres-types` itself: a hand-rolled framer here would be
-            // a second implementation of a format the decoder already reads through theirs.
+            // Framed by `postgres-types`, the same code the decoder reads through.
             BoundValue::Array(items) => items.to_sql(&self.ty, out),
         }
     }
 
-    /// Every `Bound` was built against the type the server described, so this is the check having
-    /// already happened rather than one being skipped.
+    /// Every `Bound` was already checked against the server's type by `bind_one`.
     fn accepts(_ty: &Type) -> bool {
         true
     }
@@ -470,7 +457,6 @@ impl ToSql for Bound {
     to_sql_checked!();
 }
 
-/// Check and encode every parameter against the types the server described.
 pub fn bind(params: &[Param], types: &[Type], span: Span) -> Result<Vec<Bound>, BindError> {
     if params.len() != types.len() {
         return Err(BindError::Refused(
@@ -523,8 +509,7 @@ pub fn bind_one(param: &Param, ty: &Type, position: usize, span: Span) -> Result
         },
         (Param::Bytes(v), &Type::BYTEA) => BoundValue::Bytes(v.clone()),
         (Param::Float(v), &Type::FLOAT8) => BoundValue::Float8(*v),
-        // The type mapping maps `Float` to `float8` **as a parameter** and to `float4` or `float8` only
-        // as a *result*, so a `float4` parameter is outside the pinned mapping.
+        // `Float` binds only as `float8`; `float4` is a result type only.
         (Param::Float(_), &Type::FLOAT4) => {
             return Err(BindError::Refused(
                 Diagnostic::error(
@@ -538,8 +523,7 @@ pub fn bind_one(param: &Param, ty: &Type, position: usize, span: Span) -> Result
             ));
         }
         (Param::Numeric(v), &Type::NUMERIC) => BoundValue::Numeric(*v),
-        // An `Int` bound to a `numeric` parameter, which is what a statement assigning to a
-        // `numeric` column describes.
+        // A statement assigning to a `numeric` column describes its parameter as `numeric`.
         (Param::Int(v), &Type::NUMERIC) => BoundValue::Numeric(Decimal::from(*v)),
         (Param::Json(v), &Type::JSON) | (Param::Json(v), &Type::JSONB) => {
             BoundValue::Json(v.render())
@@ -658,9 +642,7 @@ impl<'a> FromSql<'a> for Datum {
                 Datum::Json(Json::parse(body, "this column").map_err(as_error)?)
             }
             _ => match ty.kind() {
-                // `Vec<T>`'s own decoder refuses more than one dimension, and `Element`'s refuses a
-                // `NULL` element — which is the shape `List<a>` has nowhere to put, so it is a
-                // decode failure naming the column rather than a hole in the list.
+                // `Vec<T>` refuses more than one dimension and `Element` refuses a `NULL` element.
                 Kind::Array(_) => Datum::Array(
                     Vec::<Element>::from_sql(ty, raw)?
                         .into_iter()
@@ -681,7 +663,6 @@ impl<'a> FromSql<'a> for Datum {
     }
 }
 
-/// One element of an array column.
 struct Element(Datum);
 
 impl<'a> FromSql<'a> for Element {
@@ -718,8 +699,7 @@ fn numeric_from_sql(raw: &[u8]) -> Result<Decimal, Box<dyn Error + Sync + Send>>
     let sign = i16_at(raw, 4)? as u16;
     let scale = i16_at(raw, 6)?;
 
-    // `Decimal` has no representation for these and substituting zero is the silent-wrong-answer
-    // shape, so they are a decode failure naming the column.
+    // `Decimal` has no `NaN` or infinity; refuse rather than substitute zero.
     match sign {
         0x0000 | 0x4000 => {}
         0xC000 => return Err("this column holds `NaN`, which `Decimal` has no value for".into()),
@@ -793,7 +773,6 @@ fn render_uuid(raw: &[u8]) -> Result<String, Box<dyn Error + Sync + Send>> {
     ))
 }
 
-/// Whether a postgres type is in the pinned mapping at all.
 pub fn mapped(ty: &Type) -> bool {
     match *ty {
         Type::BOOL
@@ -812,15 +791,14 @@ pub fn mapped(ty: &Type) -> bool {
         | Type::JSON
         | Type::JSONB => true,
         _ => match ty.kind() {
-            // One dimension is a property of the value rather than of the type, so the refusal for
-            // a two-dimensional one is at decode.
+            // Dimensionality is a property of the value, so a 2-D array is refused at decode.
             Kind::Array(member) => !matches!(member.kind(), Kind::Array(_)) && mapped(member),
             _ => false,
         },
     }
 }
 
-/// What a program should write instead, for the types W4 deliberately does not map.
+/// What to write instead, for types the mapping deliberately leaves out.
 pub fn advice(ty: &Type) -> Option<&'static str> {
     match *ty {
         Type::TIMESTAMP | Type::TIMESTAMPTZ => Some(

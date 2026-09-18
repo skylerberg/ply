@@ -1,9 +1,5 @@
-//! The AST, lowered so that a subexpression can be held by a continuation frame.
-//!
-//! Two passes meet here. The forward pass — [`crate::slots`] — assigns every binding a slot in
-//! its barrier's window and resolves every occurrence to one. The backward pass — [`Live`] —
-//! computes each occurrence's ownership: the last use of a binding moves the value out of its
-//! slot rather than cloning it, which is ADR 0034's whole mechanism.
+//! The AST lowered so a subexpression can be held by a continuation frame, with every binding
+//! resolved to a slot and every occurrence marked as a move (last use) or a clone.
 
 use crate::rc::{Live, Own};
 use crate::value::Value;
@@ -28,14 +24,13 @@ pub struct Node {
     pub own: Own,
 }
 
-/// What entering a barrier copies in from the enclosing activation: for each free variable, the
-/// slot it is read from outside, the slot it is written to inside, and how the read takes it.
+/// What entering a barrier copies in: per free variable, the outer slot, the inner slot, and how.
 #[derive(Debug, Default)]
 pub struct Captures {
     pub src: Vec<u32>,
     pub dst: Vec<u32>,
     pub owns: Vec<Own>,
-    /// The names, parallel to the slots, for diagnostics and escape reporting.
+    /// Parallel to the slots.
     pub names: Vec<Symbol>,
 }
 
@@ -49,7 +44,7 @@ impl Captures {
     }
 }
 
-/// The shared empty capture set, so a barrier with no free variables allocates nothing per node.
+/// The shared empty capture set, so a barrier with no free variables allocates nothing.
 pub fn no_captures() -> Rc<Captures> {
     thread_local! {
         static EMPTY: Rc<Captures> = Rc::new(Captures::default());
@@ -57,8 +52,6 @@ pub fn no_captures() -> Rc<Captures> {
     EMPTY.with(Rc::clone)
 }
 
-/// The shared empty captured-value set, for the same reason at runtime: most handlers and every
-/// top-level definition capture nothing, and an `Rc` of nothing is still an allocation.
 pub fn no_captured() -> Rc<[Value]> {
     thread_local! {
         static EMPTY: Rc<[Value]> = Rc::from(Vec::new());
@@ -67,12 +60,11 @@ pub fn no_captured() -> Rc<[Value]> {
 }
 
 pub enum NodeKind {
-    /// The literal, and the [`Value`] it denotes, built once here rather than per evaluation.
+    /// The [`Value`] is built once here rather than per evaluation.
     Lit(Lit, Value),
     Var {
         name: QName,
-        /// The slot of the current activation this occurrence reads, or `None` for a name no
-        /// binder in scope introduces — a definition, a constructor or a builtin.
+        /// `None` for a definition, a constructor or a builtin.
         slot: Option<u32>,
     },
     Unary {
@@ -111,14 +103,8 @@ pub enum NodeKind {
     Record {
         fields: Rc<Vec<(Symbol, Code)>>,
     },
-    /// A record literal that copies fields out of one slot variable and writes the rest — the
-    /// shape `{..b, f: e}` expands to. Evaluated as the written fields followed by the base, whose
-    /// record is updated in place when nothing else holds it (ADR 0034, decision 3): reuse of a
-    /// dying value's cells, which a fresh literal cannot do.
-    ///
-    /// The copies are kept by name so the machine can check the literal names exactly the base's
-    /// fields before reusing it; a hand-written literal that copies *some* of a record's fields
-    /// is built as written.
+    /// A literal copying fields from one slot variable (what `{..b, f: e}` expands to); the base
+    /// is updated in place when uniquely owned and its fields are exactly `copies` plus `sets`.
     RecordUpdate {
         base: Code,
         copies: Rc<Vec<Ident>>,
@@ -146,14 +132,12 @@ pub enum NodeKind {
         resource: Symbol,
         init: Code,
         binder: Symbol,
-        /// The binder's slot in the current activation.
         slot: Option<u32>,
         body: Code,
     },
     Simulate {
         body: Code,
-        /// The body is a barrier of its own — a region's tasks interleave, so its control copies
-        /// in what it reads at the region's entry.
+        /// The body is its own barrier because a region's tasks interleave.
         size: u32,
         captures: Rc<Captures>,
     },
@@ -162,13 +146,10 @@ pub enum NodeKind {
     },
 }
 
-/// A pattern with its binders resolved to slots, which is what lets a match write bindings
-/// straight into the current activation's window.
 #[derive(Clone)]
 pub enum Pat {
     Wildcard,
-    /// May really be a nullary constructor — the AST cannot tell — so the machine still consults
-    /// the constructor table before binding, and a constructor's "slot" is simply never written.
+    /// May be a nullary constructor, so the machine checks the constructor table before binding.
     Var {
         name: Ident,
         slot: Option<u32>,
@@ -189,7 +170,6 @@ pub enum Pat {
 }
 
 impl Pat {
-    /// Every name this pattern can bind.
     pub fn binders(&self, out: &mut Vec<Symbol>) {
         crate::limit::grow(|| match self {
             Pat::Wildcard | Pat::Lit(_) => {}
@@ -242,13 +222,9 @@ pub struct Clause {
     pub op: Symbol,
     pub resource: Option<Symbol>,
     pub params: Rc<Vec<Symbol>>,
-    /// The continuation binder of a general clause.
     pub resume: Option<Symbol>,
     pub body: Code,
-    /// The clause body's window size.
     pub size: u32,
-    /// What the body reads from the scope its handler was installed in — copied into the
-    /// [`crate::cont::Prompt`] at handle entry, and nothing else.
     pub captures: Rc<Captures>,
     pub span: Span,
 }
@@ -257,26 +233,22 @@ pub struct ReturnArm {
     pub binder: Symbol,
     pub body: Code,
     pub size: u32,
-    /// As [`Clause::captures`].
     pub captures: Rc<Captures>,
     pub span: Span,
 }
 
-/// One lowered barrier: its code, and the window size an activation of it needs.
 #[derive(Clone)]
 pub struct Lowered {
     pub code: Code,
     pub size: u32,
 }
 
-/// Grows the host stack rather than bounding the nesting: the parser, inference and normalization
-/// all accept an expression of any depth by growing, and a bound here would refuse — on the machine
-/// only — a program `ply check` and `ply run` accept.
+/// Grows the host stack rather than bounding nesting, matching the parser and checker.
 pub fn lower(e: &Expr) -> Lowered {
     lower_fn(&[], e)
 }
 
-/// A function body, whose parameters take the leading slots of its window.
+/// Parameters take the leading slots of the window.
 pub fn lower_fn(params: &[Symbol], e: &Expr) -> Lowered {
     let table = crate::slots::resolve(params, e);
     let mut cx = Cx {
@@ -292,21 +264,15 @@ pub fn lower_fn(params: &[Symbol], e: &Expr) -> Lowered {
     }
 }
 
-/// A body's parameters, shared with the closure the machine builds from it rather than copied into
-/// the cache — the cache's own storage is a cost on a request path that lowers nothing, so it is
-/// kept to the map's slots.
+/// Shared with the closure built from the body rather than copied into the cache.
 pub type Params = Rc<Vec<Symbol>>;
 
 /// Lowered bodies, shared by every machine built from one program.
 pub struct Lowering<'a> {
     program: &'a Program,
     bodies: RefCell<FxHashMap<usize, (Params, Lowered)>>,
-    /// The parameter list of a test body and of a spec clause, so that the overwhelmingly common
-    /// empty one is one allocation for the cache rather than one per entry.
     nullary: Params,
-    /// Load-bearing, not decoration: a function pointer is contravariant in its argument and
-    /// covariant in its result, so `'a` occurring in both makes this field — and therefore the
-    /// whole type — invariant in `'a`.
+    /// Makes the type invariant in `'a`; do not remove.
     invariant: PhantomData<fn(&'a Program) -> &'a Program>,
 }
 
@@ -320,17 +286,15 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// Whether this cache was taken over `program`.
+    /// Whether this cache was built for `program`, by pointer identity.
     pub fn describes(&self, program: &Program) -> bool {
         std::ptr::eq(self.program, program)
     }
 
-    /// [`lower_fn`] over a body that takes no parameters: a test, a law, a spec clause.
     pub fn body(&self, body: &'a Expr) -> Lowered {
         self.of(&self.nullary, body)
     }
 
-    /// [`lower_fn`], skipped when this body has been lowered before.
     pub fn of(&self, params: &Params, body: &'a Expr) -> Lowered {
         let key = std::ptr::from_ref(body) as usize;
         let hit = self
@@ -349,7 +313,6 @@ impl<'a> Lowering<'a> {
         lowered
     }
 
-    /// How many bodies this has lowered.
     pub fn len(&self) -> usize {
         self.bodies.borrow().len()
     }
@@ -366,9 +329,7 @@ pub struct ClosureCode {
 }
 
 impl ClosureCode {
-    /// [`lower_fn`], skipped when this is the same body and the same parameters as the previous
-    /// call. `pre` is any external bindings the closure carries, lowered as leading parameters so
-    /// their occurrences resolve to slots like anything else.
+    /// `pre` is the closure's external bindings, lowered as leading parameters.
     pub fn of(&mut self, pre: &[Symbol], params: &[Symbol], body: &Arc<Expr>) -> Lowered {
         let combined: Vec<Symbol> = pre.iter().chain(params.iter()).cloned().collect();
         if let Some((held, cached, lowered)) = &self.last
@@ -383,8 +344,6 @@ impl ClosureCode {
     }
 }
 
-/// The lowering context: the forward pass's answers, the barrier being lowered, and the backward
-/// liveness state.
 struct Cx<'t> {
     table: &'t crate::slots::Slots,
     barrier: u32,
@@ -403,8 +362,6 @@ fn node(kind: NodeKind, span: Span) -> Code {
     })
 }
 
-/// Lowers a bare-variable occurrence, asking the forward pass for its slot and the backward pass
-/// for its ownership.
 fn lower_var(e: &Expr, q: &QName, cx: &mut Cx) -> Code {
     let resolved = if q.is_bare() { cx.table.var(e) } else { None };
     let (own, slot) = match resolved {
@@ -427,8 +384,7 @@ fn lower_var(e: &Expr, q: &QName, cx: &mut Cx) -> Code {
     })
 }
 
-/// Children are visited in **reverse** evaluation order throughout, so that `live` holds what the
-/// rest of the activation still reads by the time an occurrence is reached.
+/// Children are visited in reverse evaluation order, so `live` holds what is still read later.
 fn lower_node(e: &Expr, cx: &mut Cx) -> Code {
     let kind = match &e.kind {
         ExprKind::Lit(lit) => NodeKind::Lit(lit.clone(), crate::semantics::literal(lit)),
@@ -485,9 +441,7 @@ fn lower_node(e: &Expr, cx: &mut Cx) -> Code {
                 merged.extend(cx.live.snapshot());
             }
             lowered.reverse();
-            // A `match` with no arms reads nothing and answers nothing, so the union over its arms
-            // is empty and restoring it would forget every binding the enclosing activation still
-            // reads.
+            // With no arms the union is empty, and restoring it would forget every live binding.
             cx.live.restore(if lowered.is_empty() {
                 after
             } else {
@@ -520,23 +474,16 @@ fn lower_node(e: &Expr, cx: &mut Cx) -> Code {
                 }
             }
         },
-        // Unreachable: the sugar is gone before any module reaches this crate, and lowering it as
-        // if it were a plain record would drop the base's untouched fields — a wrong value,
-        // silently.
         ExprKind::RecordUpdate { .. } => unreachable!(
             "`{{..b, f: e}}` is expanded away by `ply_syntax::parse_module`; the guard is \
              `no_record_update_survives_parse_module_anywhere_in_the_tree`"
         ),
-        // Unreachable for the same reason and with the same guard: `?` is a `match` before it
-        // leaves the parser, so the machine has no early-exit node to get wrong at a `handle`
-        // boundary.
         ExprKind::Try { .. } => unreachable!(
             "`e?` is expanded away by `ply_syntax::parse_module`; the guard is \
              `no_try_survives_parse_module_anywhere_in_the_tree`"
         ),
         ExprKind::Field { base, field } => {
-            // A projection of a slot variable reads the whole record: its last read moves the
-            // record out, and the field is never taken out of it (ADR 0034).
+            // A projection of a slot variable reads the whole record; its last read moves it.
             if let ExprKind::Var(q) = &base.kind
                 && q.is_bare()
                 && let Some((barrier, slot)) = cx.table.var(base)
@@ -618,9 +565,7 @@ fn lower_node(e: &Expr, cx: &mut Cx) -> Code {
                 body,
             }
         }
-        // A barrier: a region's tasks interleave, so a binding in scope may be read by any of them
-        // at any point. What the body reads from the enclosing scope it copies in at the region's
-        // entry, always by clone — the region runs after the capture.
+        // A barrier whose captures are always clones: the region runs after the capture.
         ExprKind::Simulate { body } => {
             let (body, size, captures) = lower_barrier(&[], body, cx, false);
             NodeKind::Simulate {
@@ -629,8 +574,7 @@ fn lower_node(e: &Expr, cx: &mut Cx) -> Code {
                 captures,
             }
         }
-        // Kept as a node rather than lowered away: the machine opens an arena scope here and closes
-        // it at the body's end, and the span is the key `region_kind` filed its decision under.
+        // Kept as a node: the machine opens an arena scope here, keyed by this span.
         ExprKind::WithRegion { body, .. } => NodeKind::WithRegion {
             body: lower_in(body, cx),
         },
@@ -638,12 +582,8 @@ fn lower_node(e: &Expr, cx: &mut Cx) -> Code {
     node(kind, e.span)
 }
 
-/// A construct whose body may run more than once, or later, or beside another task: a lambda, a
-/// handler clause, a `return` clause, a `simulate` region. Lowers the body in its own barrier and
-/// answers its window size and capture set.
-///
-/// `movable` says whether the capture happens at the construct's own position in evaluation order
-/// — a lambda — as against at an enclosing construct's entry, before code to its left has run.
+/// A body that may run again, later, or beside another task. `movable` is true when the capture
+/// happens at the construct's own position (a lambda), so a capture can be a move.
 fn lower_barrier(
     params: &[Symbol],
     body: &Expr,
@@ -680,8 +620,7 @@ fn lower_barrier(
     (code, info.size(), captures)
 }
 
-/// A literal in which some field is `b.<its own name>` for one slot variable `b`, and every such
-/// copy is of that `b`: the base is read once, last, and the written fields are set into it.
+/// A literal whose copied fields all come from one slot variable `b`, read once and last.
 fn lower_record_update(fields: &[(Ident, Expr)], cx: &mut Cx) -> Option<NodeKind> {
     let mut base: Option<(&Expr, &QName, (u32, u32))> = None;
     let mut copies: Vec<Ident> = Vec::new();
@@ -704,16 +643,14 @@ fn lower_record_update(fields: &[(Ident, Expr)], cx: &mut Cx) -> Option<NodeKind
         }
         sets.push(entry);
     }
-    // A literal that rewrites every field has no copy to name its base, but a record it projects
-    // from inside a written field dies there just the same, and its cells are what to reuse. The
-    // machine's exact-shape check is what makes any candidate safe: a record of another shape is
-    // built as written.
+    // With no copies, a record projected inside a written field can still be reused; the
+    // machine's exact-shape check makes any candidate safe.
     let base = base.or_else(|| {
         sets.iter()
             .find_map(|(_, value)| projected_slot_var(value, cx))
     });
     let (b, q, (_, slot)) = base?;
-    // Reverse evaluation order: the base is read after every written field.
+    // Liveness first: the base is read after every written field.
     let own = cx.live.use_of(q.symbol());
     let base = Rc::new(Node {
         kind: NodeKind::Var {
@@ -735,9 +672,7 @@ fn lower_record_update(fields: &[(Ident, Expr)], cx: &mut Cx) -> Option<NodeKind
     })
 }
 
-/// The first slot variable projected anywhere inside `e` that is in scope around `e`, without
-/// crossing into a barrier of its own (a lambda's projections read its own window). A variable
-/// `e` binds itself is dead by the time the base is read, so it is never the base.
+/// The first outer slot variable projected in `e`, outside barriers and `e`'s own binders.
 fn projected_slot_var<'e>(e: &'e Expr, cx: &Cx) -> Option<(&'e Expr, &'e QName, (u32, u32))> {
     let mut inner = Vec::new();
     projected_outer_var(e, cx, &mut inner)
@@ -873,7 +808,6 @@ fn lower_arm(arm: &MatchArm, cx: &mut Cx) -> Arm {
     }
 }
 
-/// The statements and tail of a block.
 fn lower_block(stmts: &[AstStmt], tail: Option<&Expr>, cx: &mut Cx) -> (Vec<Stmt>, Option<Code>) {
     let bound: Vec<Vec<Symbol>> = stmts.iter().map(stmt_binders).collect();
     let flat: Vec<Symbol> = bound.iter().flatten().cloned().collect();
@@ -891,8 +825,7 @@ fn lower_block(stmts: &[AstStmt], tail: Option<&Expr>, cx: &mut Cx) -> (Vec<Stmt
                 for name in &bound[i] {
                     cx.live.kill(name);
                 }
-                // Left of this binder the name is the outer binding's again, and it is live exactly
-                // when the enclosing activation still reads it.
+                // Before this binder the name is the outer binding again, live if still read.
                 cx.live.union(
                     shadowed
                         .iter()
@@ -912,9 +845,7 @@ fn lower_block(stmts: &[AstStmt], tail: Option<&Expr>, cx: &mut Cx) -> (Vec<Stmt
         });
     }
     lowered.reverse();
-    // Every name here was handed back at the binder that shadowed it; saying so unconditionally is
-    // what makes the invariant hold for a binder the walk never crossed rather than only for the
-    // ones it did.
+    // Unconditional, so the invariant also holds for binders the walk never crossed.
     cx.live.union(shadowed);
     (lowered, tail)
 }
@@ -924,8 +855,7 @@ fn lower_clause(c: &HandleClause, cx: &mut Cx) -> Clause {
     let resume = c.resume.as_ref().map(|r| r.name.clone());
     let mut bound = params.clone();
     bound.extend(resume.clone());
-    // A clause's captures are copied at handle entry, before the handled body runs, so they are
-    // never a move.
+    // Captures are copied at handle entry, before the body runs, so they are never a move.
     let (body, size, captures) = lower_barrier(&bound, &c.body, cx, false);
     Clause {
         effect: c.effect.clone(),
@@ -960,7 +890,6 @@ fn stmt_binders(stmt: &AstStmt) -> Vec<Symbol> {
     out
 }
 
-/// Every name a pattern can bind.
 fn pattern_binders(p: &Pattern, out: &mut Vec<Symbol>) {
     crate::limit::grow(|| match &p.kind {
         PatternKind::Wildcard | PatternKind::Lit(_) => {}

@@ -1,30 +1,18 @@
 //! Every binding in every barrier gets a slot, every variable occurrence resolves to one, and
 //! every barrier knows which enclosing slots its free variables copy from.
-//!
-//! ADR 0034's prerequisite, and since the slot rewrite the pass the machine actually runs on:
-//! `code::lower_fn` consults this table when it builds slot-addressed nodes, and
-//! `slot_resolution.rs` wrong-checks the assignment against the names on every module the
-//! repository ships.
-//!
-//! It is a **forward** pass, unlike the ownership half of lowering, because a slot is decided by
-//! what is in scope to the left of an occurrence and ownership walks right to left for liveness.
-//! The two meet through node identity.
 
 use ply_span::Symbol;
 use ply_syntax::ast::{Expr, ExprKind, Pattern, PatternKind, Stmt as AstStmt};
 use rustc_hash::FxHashMap;
 
-/// One barrier's slots: its parameters first, then its binders and discovered free variables in
-/// the order the walk met them.
+/// One barrier's slots: parameters first, then binders and free variables in walk order.
 #[derive(Debug, Default, Clone)]
 pub struct Barrier {
     pub names: Vec<Symbol>,
     /// How many leading `names` are the barrier's parameters.
     pub params: u32,
-    /// The free variables this barrier copies in when it is entered: `(from, to)`, where `from`
-    /// is a slot of the **parent** barrier and `to` is a slot of this one.
+    /// Free variables copied in on entry, as `(parent slot, own slot)`.
     pub captures: Vec<(u32, u32)>,
-    /// The barrier this one's free variables resolve into.
     pub parent: Option<u32>,
 }
 
@@ -35,25 +23,15 @@ impl Barrier {
     }
 }
 
-/// What the pass answers, keyed by node identity.
-///
-/// **Keyed by the node's address, not its span.** Expansion — `?` and record update —
-/// synthesizes nodes that reuse the span they came from, so one span can carry two different
-/// occurrences and a span-keyed map answers for whichever it filed last. The address is unique
-/// for as long as the tree is alive, which is as long as this map is.
+/// Keyed by node address, not span: expanding `?` and record update reuses spans.
 #[derive(Debug, Default)]
 pub struct Slots {
-    /// A bare variable occurrence: the barrier it reads from, and the slot.
-    ///
-    /// Absent for a name no binder in scope introduces — a definition, a constructor or a
-    /// builtin.
+    /// A bare variable's barrier and slot; absent for a definition, constructor or builtin.
     pub of_var: FxHashMap<usize, (u32, u32)>,
-    /// A `Pattern::Var` binder, or a `with_cell` binder's `Ident`: the slot it writes, within
-    /// the barrier it is bound in.
+    /// A `Pattern::Var` or `with_cell` binder: the slot it writes in its barrier.
     pub of_binder: FxHashMap<usize, u32>,
-    /// A barrier's **body** expression: the barrier opened for it. The root body is barrier 0.
+    /// A barrier's body expression: the barrier opened for it. The root body is barrier 0.
     pub of_barrier: FxHashMap<usize, u32>,
-    /// Every barrier this pass opened, in the order it opened them.
     pub barriers: Vec<Barrier>,
 }
 
@@ -87,15 +65,11 @@ fn addr_ident(id: &ply_syntax::ast::Ident) -> usize {
     std::ptr::from_ref(id) as usize
 }
 
-/// One open barrier during the walk.
 struct Frame {
     /// Innermost last, so a shadowed name resolves to the binder nearest the occurrence.
     live: Vec<(Symbol, u32)>,
-    /// The capture slots this barrier has already threaded, one per free name. Kept apart from
-    /// `live` because a capture is barrier-wide: block scoping truncates `live` and must not
-    /// forget a capture, and a binder of the same name must still shadow it.
+    /// Barrier-wide capture slots: block scoping must not drop them, and binders shadow them.
     caps: Vec<(Symbol, u32)>,
-    /// Which barrier this frame is, as an index into [`Slots::barriers`].
     at: u32,
 }
 
@@ -121,7 +95,6 @@ impl Walker<'_> {
         self.stack.last_mut().expect("a barrier is open")
     }
 
-    /// Binds `name` in the innermost barrier, appending a slot for it.
     fn bind(&mut self, name: &Symbol) -> u32 {
         let frame = self.stack.last_mut().expect("a barrier is open");
         let at = frame.at as usize;
@@ -132,10 +105,8 @@ impl Walker<'_> {
         slot
     }
 
-    /// Resolves `name` at the innermost barrier, threading a capture chain through every barrier
-    /// between the occurrence and the binding when the name is free.
+    /// Resolves `name`, threading a capture through every barrier between use and binding.
     fn resolve(&mut self, name: &Symbol) -> Option<(u32, u32)> {
-        // The depth in `self.stack` whose scope has the name, innermost frame checked first.
         let mut found: Option<(usize, u32)> = None;
         for (depth, frame) in self.stack.iter().enumerate().rev() {
             if let Some(slot) = frame.find(name) {
@@ -169,7 +140,6 @@ impl Walker<'_> {
         Some((at, slot))
     }
 
-    /// Opens a barrier over `params` and walks `body` inside it.
     fn barrier(&mut self, params: &[Symbol], body: &Expr) -> u32 {
         let at = self.out.barriers.len() as u32;
         let parent = self.stack.last().map(|f| f.at);
@@ -307,8 +277,7 @@ impl Walker<'_> {
                     self.walk(a);
                 }
             }
-            // A clause body and a return clause are barriers of their own, and they run *below*
-            // their own handler, so neither sees the handled body's bindings.
+            // Clause and return bodies are barriers that run below the handler, outside its body.
             ExprKind::Handle {
                 body,
                 clauses,
@@ -336,8 +305,7 @@ impl Walker<'_> {
                 self.top().live.truncate(depth);
             }
             ExprKind::WithRegion { body, .. } => self.walk(body),
-            // A barrier: a region's tasks interleave, so the body's control is its own — what it
-            // reads from the enclosing scope it copies in at the region's entry.
+            // A barrier: its tasks interleave, so the body copies in what it reads on entry.
             ExprKind::Simulate { body, .. } => {
                 let _ = self.barrier(&[], body);
             }
@@ -352,7 +320,6 @@ fn binder_name(p: &Pattern) -> Option<Symbol> {
     }
 }
 
-/// Resolves a function body and everything nested in it.
 pub fn resolve(params: &[Symbol], body: &Expr) -> Slots {
     let mut out = Slots::default();
     let mut walker = Walker {

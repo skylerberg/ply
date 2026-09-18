@@ -1,5 +1,4 @@
-//! The host effect boundary: the types the machine speaks, and the registry that turns a Rust
-//! function into the handler for a Ply-declared operation.
+//! The host effect boundary: the types the machine speaks and the registry of host handlers.
 
 use crate::value::Value;
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -9,15 +8,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
-/// Domain tag for [`HostListing::digest`].
 const DIGEST_DOMAIN: &[u8] = b"ply.hosts.1";
 
-/// Which resource labels a registration serves.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum HostResource {
-    /// Exactly this label.
     Only(Resource),
-    /// Every label the *program* uses with this operation.
+    /// Every label the program uses with this operation.
     Any,
 }
 
@@ -44,9 +40,7 @@ impl Determinism {
 /// Whether replaying this operation changes anything outside the program.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Linearity {
-    /// A send, an insert, a charge.
     AtMostOnce,
-    /// A clock read, a read of an immutable resource.
     Repeatable,
 }
 
@@ -63,7 +57,6 @@ impl Linearity {
         }
     }
 
-    /// The `--json` spelling, which is snake_case where the human one is hyphenated.
     pub fn as_json(self) -> &'static str {
         match self {
             Linearity::AtMostOnce => "at_most_once",
@@ -72,29 +65,23 @@ impl Linearity {
     }
 }
 
-/// One registration: the `(effect, operation, resource)` triple it serves, a determinism flag, and
-/// its linearity obligation.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct HostOp {
-    /// The effect's name **as its `effect` declaration writes it** — `net`, not `hello.net`.
+    /// The effect's name as its declaration writes it: `net`, not `hello.net`.
     pub effect: Symbol,
     pub op: Symbol,
     pub resource: HostResource,
     pub determinism: Determinism,
     pub linearity: Linearity,
-    /// The handler's *work* may not run on the scheduler's thread: it dispatches to its own pool
-    /// and answers [`HostAnswer::Pending`] immediately, so a handler that calls a blocking library
-    /// cannot stall the tasks sharing its thread.
+    /// Dispatches off the scheduler's thread and answers [`HostAnswer::Pending`] immediately.
     pub blocking: bool,
     /// Whether this operation may be handed a value containing a [`Value::Secret`].
     pub secrets: bool,
-    /// The Rust path, as `ply hosts` prints it: the reviewable identity of a member of the trusted
-    /// computing base.
+    /// The Rust path `ply hosts` prints: the handler's reviewable identity.
     pub path: &'static str,
 }
 
 impl HostOp {
-    /// The atom a perform of this operation against `resource` contributes.
     fn atom(&self, effect: &Symbol, resource: Resource, mode: ply_syntax::ast::Mode) -> EffectAtom {
         EffectAtom::new(effect.clone(), resource, mode)
     }
@@ -119,12 +106,10 @@ impl fmt::Display for HostOp {
     }
 }
 
-/// Which machine performed an operation.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct MachineId(pub u64);
 
 impl MachineId {
-    /// The next unused identity.
     pub fn next() -> MachineId {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -138,35 +123,26 @@ impl fmt::Display for MachineId {
     }
 }
 
-/// What a handler is called with.
 pub struct HostRequest<'a> {
     pub atom: EffectAtom,
     pub op: &'a HostOp,
     pub args: &'a [Value],
     pub span: Span,
-    /// The machine that performed this operation, which with [`task`] is the whole identity a
-    /// handler keys scoped state on.
+    /// With `task`, the whole identity a handler keys scoped state on.
     pub machine: MachineId,
-    /// The task that performed this operation.
     pub task: Option<crate::sim::TaskId>,
-    /// The declared footprint of the entry point that reached this operation, when the caller
-    /// stated one.
     pub declared: Option<&'a Footprint>,
 }
 
-/// What a host handler answers a perform with.
 pub enum HostAnswer {
-    /// Completed.
     Value(Value),
-    /// Did not complete.
     Pending(Pending),
 }
 
-/// Opaque to `ply-eval`: minted by a [`HostRuntime`], polled by it, and never interpreted here.
+/// Opaque to `ply-eval`: minted and polled by a [`HostRuntime`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Pending {
     pub token: u64,
-    /// What the run is waiting on, as a diagnostic renders it: `"accept"`, `"read"`.
     pub label: &'static str,
 }
 
@@ -176,34 +152,27 @@ impl fmt::Display for Pending {
     }
 }
 
-/// A Rust implementation of one Ply operation.
 pub trait HostHandler: Send + Sync {
     fn call(&self, rt: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic>;
 }
 
-/// The one thing `ply-eval` needs from `ply-host`.
 pub trait HostRuntime {
     /// `Ok(None)` when the token has not resolved.
     fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic>;
-    /// Wait until at least one outstanding token resolves.
+    /// Waits until at least one outstanding token resolves.
     fn park(&self) -> Result<(), Diagnostic>;
-    /// Drive until this token resolves.
     fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic>;
 
-    /// Called on **every** exit path from an entry point — a value, a diagnostic, or a spent budget
-    /// — before the machine resets.
+    /// Called on every exit path from an entry point, before the machine resets.
     fn end_entry_point(&self, machine: MachineId) -> Result<(), Diagnostic> {
         let _ = machine;
         Ok(())
     }
 
-    /// Whether a stop has been requested.
     fn stopping(&self) -> bool {
         false
     }
 
-    /// The refusal that ends the region when the drain deadline has passed, and `None` while there
-    /// is still time or no stop was requested.
     fn drain_expired(&self) -> Option<Diagnostic> {
         None
     }
@@ -215,18 +184,14 @@ pub trait HostRuntime {
     }
 }
 
-/// What [`HostRuntime::shutdown`] managed, and what the run reports about it.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct ShutdownReport {
-    /// Transaction scopes that were still open and were rolled back.
     pub transactions_rolled_back: usize,
-    /// Connections closed rather than returned to the pool, and why.
     pub connections_closed: Vec<String>,
-    /// Spans still open at teardown, closed with the `Abandoned` outcome.
+    /// Spans still open at teardown, closed as `Abandoned`.
     pub spans_abandoned: usize,
-    /// Records the sink held when it was flushed, and `None` for a run with no sink bound.
+    /// `None` when no sink is bound.
     pub records_flushed: Option<usize>,
-    /// What the teardown could not hand back, as `W0606` renders it.
     pub problems: Vec<String>,
 }
 
@@ -236,17 +201,14 @@ impl ShutdownReport {
     }
 }
 
-/// Whether an entry point ended because the drain deadline expired rather than because the program
-/// failed.
 pub fn is_drain_incomplete(d: &Diagnostic) -> bool {
     d.code == codes::DRAIN_INCOMPLETE
 }
 
-/// The trusted computing base, before it meets a program.
 #[derive(Default)]
 pub struct HostRegistry {
     entries: Vec<(HostOp, Arc<dyn HostHandler>)>,
-    /// Indices of [`HostRegistry::entries`] this run declines to bind.
+    /// Indices of `entries` this run declines to bind.
     withheld: BTreeSet<usize>,
 }
 
@@ -259,7 +221,6 @@ impl HostRegistry {
         self.entries.push((op, handler));
     }
 
-    /// Register an operation the run knows how to serve and has decided not to.
     pub fn register_withheld(&mut self, op: HostOp, handler: Arc<dyn HostHandler>) {
         self.withheld.insert(self.entries.len());
         self.entries.push((op, handler));
@@ -277,7 +238,6 @@ impl HostRegistry {
         self.entries.iter().map(|(op, _)| op)
     }
 
-    /// Resolve every registration against the program.
     pub fn bind(self, check: &CheckOutput) -> Result<HostBinding, Vec<Diagnostic>> {
         let rows = resolve(&self.entries, &self.withheld, check)?;
         let footprint = Footprint::from_atoms(rows.iter().map(|r| r.atom.clone()));
@@ -302,7 +262,7 @@ impl HostRegistry {
         })
     }
 
-    /// What *would* bind, without binding.
+    /// What would bind, without binding.
     pub fn preview(&self, check: &CheckOutput) -> Result<HostListing, Vec<Diagnostic>> {
         Ok(HostListing {
             handlers: self.entries.len(),
@@ -311,8 +271,7 @@ impl HostRegistry {
     }
 }
 
-/// Every registration, resolved against the program's atoms, ascending by `(effect, op, resource)`
-/// and with every registration-time check applied.
+/// Rows ascending by `(effect, op, resource)`, with every registration-time check applied.
 fn resolve(
     entries: &[(HostOp, Arc<dyn HostHandler>)],
     withheld: &BTreeSet<usize>,
@@ -324,27 +283,22 @@ fn resolve(
     let performed = performed_atoms(check);
 
     for (index, (op, _)) in entries.iter().enumerate() {
-        // A withheld registration is in no row, so it is in no listing, no footprint and no index:
-        // what a run declined to bind must not appear in the trusted computing base it prints, or
-        // the listing is the one thing in the system that lies about the boundary.
+        // A withheld registration must not appear in the listing, footprint or index.
         if withheld.contains(&index) {
             continue;
         }
-        // A member of the trusted computing base that `ply hosts` cannot name is a member no
-        // reviewer can find, which defeats the whole of the listing.
+        // A handler `ply hosts` cannot name is one no reviewer can find.
         if op.path.trim().is_empty() {
             diagnostics.push(err_anonymous(op));
             continue;
         }
-        // By the declared name, resolved to the program's own, and where a program that declares
-        // the name twice is refused rather than served by a coin flip.
+        // A name declared twice is refused rather than served by a coin flip.
         let declarations: Vec<&EffectInfo> = check
             .effects
             .values()
             .filter(|e| registration_names(&op.effect, &e.name, &e.simple_name))
             .collect();
         let effect = match declarations.as_slice() {
-            // Nothing declares it.
             [] => {
                 if matches!(op.resource, HostResource::Only(_)) {
                     diagnostics.push(err_unknown_effect(op, check));
@@ -367,9 +321,6 @@ fn resolve(
             continue;
         }
 
-        // The atoms this registration resolves to: for `Only`, the one it names, provided the
-        // program can perform it; for `Any`, every label the program actually uses with this
-        // operation.
         let candidates: Vec<Resource> = match &op.resource {
             HostResource::Only(r) => vec![r.clone()],
             HostResource::Any => performed
@@ -388,8 +339,7 @@ fn resolve(
                 continue;
             }
             let atom = op.atom(name, resource.clone(), decl.mode);
-            // `Only` names a resource the program never performs: the claim is about nothing, which
-            // is a rename that was not followed through.
+            // `Only` naming a resource the program never performs is usually an unfollowed rename.
             if matches!(op.resource, HostResource::Only(_)) && !performed.contains(&atom) {
                 diagnostics.push(err_unused_resource(op, &atom, effect));
                 continue;
@@ -426,7 +376,7 @@ fn resolve(
     }
 }
 
-/// Whether a registration's `effect` names a given declaration.
+/// Reserved std effects match by program-wide name; others by their declared name.
 fn registration_names(registered: &Symbol, program_wide: &Symbol, declared: &Symbol) -> bool {
     if ply_std::is_reserved(registered.as_str()) {
         registered == program_wide
@@ -435,7 +385,6 @@ fn registration_names(registered: &Symbol, program_wide: &Symbol, declared: &Sym
     }
 }
 
-/// Every atom the program can perform, from the declared footprints of its definitions and tests.
 fn performed_atoms(check: &CheckOutput) -> BTreeSet<EffectAtom> {
     let mut out = BTreeSet::new();
     for def in check.defs.values() {
@@ -450,26 +399,23 @@ fn performed_atoms(check: &CheckOutput) -> BTreeSet<EffectAtom> {
     out
 }
 
-/// What identifies a row and what a perform resolves against: the triple.
+/// `(effect, op, resource)`.
 pub type RowKey = (Symbol, Symbol, Resource);
 
-/// One line of `ply hosts`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct HostRow {
     pub effect: Symbol,
     pub op: Symbol,
     pub resource: Resource,
-    /// The atom this triple contributes to a footprint.
     pub atom: EffectAtom,
-    /// Which registration produced this row.
+    /// Index of the registration that produced this row.
     pub row: usize,
     pub path: &'static str,
     pub deterministic: bool,
     pub linearity: Linearity,
     pub blocking: bool,
-    /// [`HostOp::secrets`], carried through so the listing can print it.
     pub secrets: bool,
-    /// Whether the *declaration* carries `nondet`.
+    /// Whether the declaration, not the handler, carries `nondet`.
     pub declared_nondet: bool,
 }
 
@@ -488,10 +434,9 @@ impl fmt::Display for HostRow {
     }
 }
 
-/// The trusted computing base of a Ply program, as one command prints it.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct HostListing {
-    /// Ascending by `(effect, op, resource)`, which is [`EffectAtom`]'s own order.
+    /// Ascending by `(effect, op, resource)`, [`EffectAtom`]'s own order.
     pub rows: Vec<HostRow>,
     /// Registrations, which is at most `rows.len()`.
     pub handlers: usize,
@@ -525,7 +470,7 @@ impl HostListing {
         *hasher.finalize().as_bytes()
     }
 
-    /// `b3:` and the first twelve hex characters — the one line a CI check pins.
+    /// `b3:` and the first twelve hex characters.
     pub fn digest_short(&self) -> String {
         let digest = self.digest();
         let mut out = String::with_capacity(15);
@@ -537,21 +482,17 @@ impl HostListing {
     }
 }
 
-/// One resolved registration, ready to be called.
 pub struct Bound<'a> {
     pub atom: EffectAtom,
     pub op: &'a HostOp,
     pub handler: &'a Arc<dyn HostHandler>,
 }
 
-/// What a run actually has bound.
 pub struct HostBinding {
     entries: Vec<(HostOp, Arc<dyn HostHandler>)>,
-    /// Indices of `entries` this run declined to bind.
     withheld: BTreeSet<usize>,
     listing: HostListing,
     footprint: Footprint,
-    /// What [`HostBinding::serves`] answers: the atoms, for intersecting a test's footprint.
     atoms: BTreeSet<EffectAtom>,
     /// Triple -> index into `listing.rows`.
     index: BTreeMap<RowKey, usize>,
@@ -564,8 +505,7 @@ impl Default for HostBinding {
     }
 }
 
-/// Hand-written, because a `dyn HostHandler` has no `Debug` and should not be made to have one:
-/// what identifies a handler is its declared path, which the listing already carries.
+/// Hand-written: `dyn HostHandler` has no `Debug`, and the listing already carries each path.
 impl fmt::Debug for HostBinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HostBinding")
@@ -577,7 +517,6 @@ impl fmt::Debug for HostBinding {
 }
 
 impl HostBinding {
-    /// The default everywhere.
     pub fn hermetic() -> HostBinding {
         HostBinding::hermetic_with(HostRegistry::new())
     }
@@ -598,7 +537,6 @@ impl HostBinding {
         !self.bound
     }
 
-    /// Every atom this binding serves.
     pub fn footprint(&self) -> &Footprint {
         &self.footprint
     }
@@ -607,7 +545,6 @@ impl HostBinding {
         self.atoms.contains(atom)
     }
 
-    /// Whether any atom of `footprint` reaches this binding.
     pub fn reaches(&self, footprint: &Footprint) -> bool {
         footprint.atoms().any(|a| self.serves(a))
     }
@@ -616,7 +553,6 @@ impl HostBinding {
         &self.listing
     }
 
-    /// The resolution the machine performs per perform that reached the boundary.
     pub fn resolve(
         &self,
         effect: &Symbol,
@@ -633,7 +569,6 @@ impl HostBinding {
         })
     }
 
-    /// The path a hermetic `E0424` names.
     pub fn would_serve(
         &self,
         effect: &Symbol,
@@ -644,7 +579,7 @@ impl HostBinding {
             .map(|(_, candidate)| candidate.path)
     }
 
-    /// Whether this run knows how to serve the operation and declined to.
+    /// The path of a handler this run could serve the operation with but declined to bind.
     pub fn withholds(
         &self,
         effect: &Symbol,
@@ -676,16 +611,13 @@ impl HostBinding {
     }
 }
 
-/// One binding serves a whole run, shared across the test runner's workers by `Arc`, so it has to
-/// be shareable — and a field that broke that would be added in this file, which is why the
-/// requirement is stated in this file.
+/// The test runner shares one binding across workers, so it must stay `Send + Sync`.
 const _: fn() = || {
     fn shareable<T: Send + Sync>() {}
     shareable::<HostRegistry>();
     shareable::<HostBinding>();
 };
 
-/// The resource a `perform` names.
 pub fn resource_of(resource: Option<&Symbol>) -> Resource {
     match resource {
         Some(r) => Resource::Named(r.clone()),
@@ -693,7 +625,6 @@ pub fn resource_of(resource: Option<&Symbol>) -> Resource {
     }
 }
 
-/// What a run reached across the boundary.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct HostUse {
     pub atoms: Footprint,
@@ -712,7 +643,6 @@ impl HostUse {
     }
 }
 
-/// How the source spells the operation a `perform` named.
 pub fn operation_label(effect: &Symbol, op: &Symbol, resource: Option<&Symbol>) -> String {
     match resource {
         Some(r) => format!("{effect}.{op}[{r}]"),
@@ -737,14 +667,11 @@ pub const RESERVED_CODES: [&str; 21] = [
     codes::HOST_FOOTPRINT_ESCAPE,
     codes::HOST_BLOCKING_ANSWER,
     codes::SECRET_TO_HOST,
-    // Raised by the machine about what crossed the boundary, in both directions.
     codes::REGION_ESCAPE_AT_BOUNDARY,
     codes::DB_NOT_CONFIGURED,
     codes::DB_SCHEMA_MISMATCH,
     codes::DB_UNMODELLED_SIDE_EFFECT,
-    // Raised by the artifact loader, before any binding exists — so a handler that answered with
-    // one would be claiming the program it is running failed to load, which is a verdict about the
-    // machine's own state rather than about anything the handler can see.
+    // Raised by the artifact loader before any binding exists.
     codes::ARTIFACT_INVALID,
     codes::ARTIFACT_VERSION,
 ];
@@ -782,7 +709,6 @@ pub fn attribute(
     diagnostic
 }
 
-/// `E0425` — a host operation in a test the search re-runs.
 #[cold]
 #[inline(never)]
 pub fn err_host_in_search(span: Span, operation: &str, path: &'static str) -> Diagnostic {
@@ -799,7 +725,6 @@ pub fn err_host_in_search(span: Span, operation: &str, path: &'static str) -> Di
     .note("`--sim once` runs a single interleaving, which is the one search a host-backed test may have")
 }
 
-/// `E0428` — a `blocking: true` handler that answered inline.
 #[cold]
 #[inline(never)]
 pub fn err_blocking_answered_inline(span: Span, operation: &str, path: &'static str) -> Diagnostic {
@@ -813,7 +738,6 @@ pub fn err_blocking_answered_inline(span: Span, operation: &str, path: &'static 
     .note("dispatch the work to the host's pool and answer `Pending`, or register the operation `blocking: false`")
 }
 
-/// `E0424` — the boundary, reached in a hermetic run.
 #[cold]
 #[inline(never)]
 pub fn err_hermetic(span: Span, operation: &str, path: &'static str) -> Diagnostic {
@@ -829,7 +753,6 @@ pub fn err_hermetic(span: Span, operation: &str, path: &'static str) -> Diagnost
     .note(format!("`{path}` would serve this under `--host`"))
 }
 
-/// `E0424` — an operation this run knows how to serve and deliberately did not bind.
 #[cold]
 #[inline(never)]
 pub fn err_withheld(
@@ -893,7 +816,6 @@ fn err_unknown_effect(op: &HostOp, check: &CheckOutput) -> Diagnostic {
     diagnostic.note("a host handler's triple is its footprint claim; a claim about an effect nothing declares is a claim about nothing")
 }
 
-/// One registration, two declarations it could serve.
 #[cold]
 #[inline(never)]
 fn err_ambiguous_effect(op: &HostOp, declarations: &[&EffectInfo]) -> Diagnostic {
@@ -1010,7 +932,6 @@ fn err_conflict(op: &HostOp, first: &str, second: &str) -> Diagnostic {
     .note("which one answers would decide which real resource is touched; narrow one registration's resource, or remove it")
 }
 
-/// The declared effect a registration most likely meant.
 fn nearest_effect(wanted: &Symbol, check: &CheckOutput) -> Option<Symbol> {
     let simple = simple_name(wanted.as_str());
     if let Some(name) = check

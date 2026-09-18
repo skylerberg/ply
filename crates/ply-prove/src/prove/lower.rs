@@ -8,15 +8,12 @@ use ply_syntax::ast::{Expr, ExprKind, Param, Pattern, PatternKind, QName, Stmt};
 use ply_ty::{BinOp, CtorInfo, Lit, Scheme, TyVar, Type, UnOp};
 use std::collections::BTreeMap;
 
-/// The size past which unfolding stops.
 const MAX_TERMS: usize = 20_000;
 
-/// The prelude functions whose evaluation cannot raise and cannot diverge, so a call to one needs
-/// no definedness requirement.
+/// Prelude functions that cannot raise or diverge, so a call needs no definedness requirement.
 const TOTAL_BUILTINS: &[&str] = &[
     "len",
     "push",
-    // The list index.
     "list_at",
     "int_to_string",
     "min",
@@ -37,7 +34,6 @@ const TOTAL_BUILTINS: &[&str] = &[
     "string_starts_with",
     "string_ends_with",
     "string_contains",
-    // `Map`.
     "map_new",
     "map_insert",
     "map_get",
@@ -49,68 +45,46 @@ const TOTAL_BUILTINS: &[&str] = &[
     "map_entries",
     "map_of_entries",
     "map_merge",
-    // The `Decimal` conversions with no input they refuse: each answers an `Option` or a total
-    // value rather than raising.
     "decimal_of_int",
     "decimal_to_string",
     "decimal_of_string",
     "float_of_decimal",
     "decimal_of_float",
     "int_of_decimal",
-    // The IEEE 754 bit pattern both ways, total by construction.
     "bits_of_float",
     "float_of_bits",
-    // The wrapping arithmetic (the shift semantics). Total by construction: they
-    // exist because `+`, `-` and `*` raise on overflow and a mixing step needs
-    // an answer there, so there is no input any of them declines. Uninterpreted
-    // still — `wrap_add(x, 0) == x` is `property` — and being total is what
-    // makes `wrap_mul(x, y) == wrap_mul(x, y)` a value rather than a guess.
+    // Total but still uninterpreted.
     "wrap_add",
     "wrap_sub",
     "wrap_mul",
-    // A rotate of the low word, total for the same reason and uninterpreted the same way.
     "rotr32",
 ];
 
-/// Where lowering left the decidable fragment, for measurement only.
+/// Where lowering left the decidable fragment.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Blocker {
-    /// A call to a member of a recursive component.
     RecursiveCall(Symbol),
-    /// A call whose row is not known to be empty: two occurrences may answer differently, so they
-    /// cannot share a term.
+    /// A call whose row is not known to be empty, so occurrences cannot share a term.
     EffectfulCall(Symbol),
-    /// A non-recursive call refused because [`crate::UNFOLD_DEPTH`] or the term limit was already
-    /// reached.
     UnfoldLimit(Symbol),
-    /// A call to something this crate cannot see the body of: a builtin, or a name from outside the
-    /// program.
+    /// A builtin, or a name from outside the program.
     OpaqueCall(Symbol),
     Division,
-    /// `x * y` with both factors symbolic.
     NonlinearMultiplication,
-    /// A linear combination whose coefficients left range.
     CoefficientRange,
     Lambda,
     StringConcat,
-    /// `&`, `|`, `^`, `<<`, `>>`, `>>>` or unary `~`: a statement about a
-    /// two's-complement word, uninterpreted in a fragment that is linear arithmetic over ℤ.
     BitOperator,
-    /// A `Float`-typed term anywhere in the graph.
     FloatTerm,
-    /// `Decimal` arithmetic or a `Decimal` ordering.
     DecimalArithmetic,
-    /// A `perform`, `handle`, `with_cell` or `simulate`.
+    /// `perform`, `handle`, `with_cell` or `simulate`.
     Region,
-    /// A parse-time-only node the parser is supposed to have expanded away — today only `{..b, f:
-    /// e}`, whose expansion runs inside `ply_syntax::parse_module`.
     UnexpandedSugar,
-    /// A pattern the fragment declines to reduce, or a pattern guard.
     UndecidableMatchArm,
     DestructuringLet,
 }
 
-/// The numeric type an operator was applied at, when it was not `Int`.
+/// A non-`Int` numeric operand type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Numeric {
     Float,
@@ -132,14 +106,10 @@ pub struct Lowering<'a, 'p> {
     frames: Vec<(Symbol, TermId)>,
     barriers: Vec<usize>,
     blockers: Vec<Blocker>,
-    /// What must hold for the lowered expressions to evaluate to a value rather than raise or
-    /// diverge.
+    /// What must hold for the lowered expressions not to raise or diverge.
     requirements: Vec<TermId>,
-    /// Conditions assumed true on the way to the expression being lowered: the branch of an `if`,
-    /// the right operand of a short-circuiting operator, and the guards a caller has already
-    /// lowered.
+    /// Conditions assumed on the way to the expression being lowered.
     path: Vec<TermId>,
-    /// Whether a `Float` was met.
     float: bool,
 }
 
@@ -166,7 +136,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
         }
     }
 
-    /// Records that a `Float` entered the obligation, which no proof survives.
+    /// No proof survives a `Float` in the obligation.
     fn float(&mut self) {
         if !self.float {
             self.blocked(Blocker::FloatTerm);
@@ -174,7 +144,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
         self.float = true;
     }
 
-    /// Whether anything lowered here puts a `Float` in the obligation.
     pub fn unsupported(&self) -> bool {
         self.float
     }
@@ -183,29 +152,24 @@ impl<'a, 'p> Lowering<'a, 'p> {
         self.blockers.push(blocker);
     }
 
-    /// Every fragment boundary this lowering crossed, in encounter order.
     pub fn blockers(&self) -> &[Blocker] {
         &self.blockers
     }
 
-    /// What must hold for everything lowered so far to evaluate to a value.
     pub fn requirements(&self) -> &[TermId] {
         &self.requirements
     }
 
-    /// How many requirements have been recorded, so a caller can tell the ones a guard owes from
-    /// the ones its body does.
+    /// Separates the requirements a guard owes from the ones its body does.
     pub fn requirement_mark(&self) -> usize {
         self.requirements.len()
     }
 
-    /// Assumes a condition for everything lowered after it.
     pub fn assume(&mut self, cond: TermId) {
         self.path.push(cond);
     }
 
-    /// Records a condition the evaluation depends on, under the path it was reached at: `p₁ ∧ … ∧
-    /// pₙ ⟹ cond`.
+    /// Records `p₁ ∧ … ∧ pₙ ⟹ cond` under the current path.
     fn require(&mut self, cond: TermId) {
         if cond == self.terms.true_id {
             return;
@@ -218,13 +182,11 @@ impl<'a, 'p> Lowering<'a, 'p> {
         self.requirements.push(out);
     }
 
-    /// The evaluation cannot be shown to produce a value at all.
     fn undefined(&mut self) {
         let never = self.terms.false_id;
         self.require(never);
     }
 
-    /// An arithmetic result must be an `Int`.
     fn require_int_range(&mut self, t: TermId) {
         if !matches!(self.terms.node(t), Node::Lin(_)) {
             return;
@@ -251,8 +213,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
         self.require(both);
     }
 
-    /// `a / b` and `a % b` raise on a zero divisor, and `i64::MIN / -1` is the one quotient that
-    /// leaves `Int`.
+    /// Zero divisors raise, and `i64::MIN / -1` overflows.
     fn require_divisible(&mut self, lhs: TermId, rhs: TermId) {
         if let Node::Int(k) = *self.terms.node(rhs) {
             if k == 0 {
@@ -281,10 +242,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
         self.require(safe);
     }
 
-    /// `a << n`, `a >> n` and `a >>> n` raise unless `n` is a bit position of
-    /// an `Int`. Every count is one or none of them, so this is the whole of
-    /// the condition — a shift itself refuses nothing else, and `<<` discarding
-    /// what leaves the word is deliberate rather than a raise (the shift semantics).
+    /// A shift raises unless its count is a bit position; nothing else makes it raise.
     fn require_shift_count(&mut self, count: TermId) {
         let zero = self.terms.int_lit(0);
         let width = self.terms.int_lit(63);
@@ -308,7 +266,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
         self.require(both);
     }
 
-    /// Lowers under one more assumed condition.
     fn under<T>(&mut self, cond: TermId, f: impl FnOnce(&mut Self) -> T) -> T {
         self.path.push(cond);
         let out = f(self);
@@ -316,8 +273,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
         out
     }
 
-    /// Introduces the obligation's binders as symbolic constants, which is what makes the answer a
-    /// statement about every input rather than about one.
     pub fn bind_symbolic(&mut self, name: &Symbol, ty: &Type) -> TermId {
         if self.ctx.reaches_float(ty) {
             self.float();
@@ -332,8 +287,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
     }
 
     pub fn lower(&mut self, expr: &Expr) -> TermId {
-        // Ply admits expressions as deep as the parser accepted, and this walk is recursive for the
-        // same reason inference's is.
+        // Expressions may nest as deep as the parser accepted.
         stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || self.lower_inner(expr))
     }
 
@@ -341,8 +295,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
         match &expr.kind {
             ExprKind::Lit(lit) => self.literal(lit),
             ExprKind::Var(q) => self.variable(q),
-            // `&&` and `||` short-circuit, so the right operand is only ever evaluated under the
-            // left one's answer and owes its requirements only there.
+            // Short-circuit: the right operand owes its requirements only under the left's answer.
             ExprKind::Binary {
                 op: op @ (BinOp::And | BinOp::Or),
                 lhs,
@@ -366,14 +319,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 let t = self.lower(operand);
                 match op {
                     UnOp::Not => self.terms.not(t),
-                    // `~x` is exactly `-x - 1` over ℤ, so folding it into that
-                    // polynomial would be *sound*: the value is right at every
-                    // `Int` and it never leaves the width. It is refused
-                    // anyway. `-x - 1` is not the same Ply expression — that
-                    // one raises at `i64::MIN`, where `~` answers `i64::MAX` —
-                    // and one bit operator inside the arithmetic while six sit
-                    // outside it is a rule with an exception in it. So: total,
-                    // uninterpreted, like `&`.
+                    // Not folded to `-x - 1`, which raises at `i64::MIN` where `~` does not.
                     UnOp::BitNot => {
                         self.terms.force_int(t);
                         self.blocked(Blocker::BitOperator);
@@ -404,7 +350,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
                     }
                 }
             }
-            // A function value the fragment does not look inside.
             ExprKind::Lambda { .. } => {
                 self.blocked(Blocker::Lambda);
                 self.terms.sym(None)
@@ -456,7 +401,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 let items: Vec<TermId> = items.iter().map(|i| self.lower(i)).collect();
                 self.terms.mk(Node::List(items), None)
             }
-            // Everything below performs, handles or schedules.
             ExprKind::Perform { .. }
             | ExprKind::Handle { .. }
             | ExprKind::WithCell { .. }
@@ -473,11 +417,9 @@ impl<'a, 'p> Lowering<'a, 'p> {
             Lit::Int(k) => self.terms.int_lit(*k),
             Lit::Bool(b) => self.terms.boolean(*b),
             Lit::Str(s) => self.terms.string(s.clone()),
-            // A fresh symbol rather than a reuse of `Node::Str`: sharing that node would make
-            // `b"ab"` and `"ab"` congruent, which is a wrong answer wearing a certificate.
+            // Not `Node::Str`: `b"ab"` and `"ab"` must not be congruent.
             Lit::Bytes(_) => self.terms.sym(Some(Type::bytes())),
-            // No `Node::Float`, deliberately: two occurrences of `0.0` sharing a node would make
-            // them congruent, and congruence needs a reflexive `==`, which this type does not have.
+            // No shared node: congruence needs a reflexive `==`, which `Float` lacks.
             Lit::Float(_) => {
                 self.float();
                 self.terms.sym(Some(Type::float()))
@@ -514,7 +456,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
         self.terms.mk(Node::Opaque(name), sort)
     }
 
-    /// Which non-`Int` numeric type an operator's operands have, by their sorts.
     fn operand_type(&self, lhs: TermId, rhs: TermId) -> Option<Numeric> {
         for side in [lhs, rhs] {
             match self.terms.sort(side) {
@@ -526,7 +467,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
         None
     }
 
-    /// An operator at `Float` or `Decimal`: an uninterpreted symbol, and no theory.
     fn non_int_operator(
         &mut self,
         op: BinOp,
@@ -583,8 +523,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
     }
 
     fn binary(&mut self, op: BinOp, lhs: TermId, rhs: TermId) -> TermId {
-        // `+`, `-`, `*`, `%`, `<` and friends are defined at three numeric types now, and
-        // everything below this point is the theory of exactly one of them.
         if matches!(
             op,
             BinOp::Add
@@ -608,9 +546,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                     BinOp::Add => self.terms.add(lhs, rhs),
                     BinOp::Sub => self.terms.sub(lhs, rhs),
                     BinOp::Mul => self.terms.mul(lhs, rhs),
-                    // Division is outside the fragment at all, including by a literal: an `x / 2 *
-                    // 2 == x` reported `proved` is exactly the defect this milestone must not ship,
-                    // and an uninterpreted `/` makes a wrong division rule impossible to have.
+                    // Uninterpreted even by a literal, so `x / 2 * 2 == x` can never be proved.
                     BinOp::Div | BinOp::Rem => None,
                     _ => unreachable!(),
                 };
@@ -628,12 +564,9 @@ impl<'a, 'p> Lowering<'a, 'p> {
                             _ => Blocker::CoefficientRange,
                         });
                         match op {
-                            // `/` and `%` are uninterpreted as *values* and still have a
-                            // definedness condition the fragment can decide, which is what keeps a
-                            // division under a guard that establishes its divisor in reach.
+                            // Uninterpreted as values, but their definedness is decidable.
                             BinOp::Div | BinOp::Rem => self.require_divisible(lhs, rhs),
-                            // Everything else got here by leaving `Int`, and a product or a sum
-                            // that left `Int` is not a value the evaluator ever produces.
+                            // Everything else left `Int`, which the evaluator never produces.
                             _ => self.undefined(),
                         }
                         let symbol = match op {
@@ -670,20 +603,14 @@ impl<'a, 'p> Lowering<'a, 'p> {
             }
             BinOp::And => self.terms.mk(Node::And(lhs, rhs), Some(Type::bool())),
             BinOp::Or => self.terms.mk(Node::Or(lhs, rhs), Some(Type::bool())),
-            // Comparing functions raises, and needs no requirement here: the type system rejects
-            // `==` at any type containing one (E0201), so a spec that could ask never reaches the
-            // prover.
+            // `==` on functions is a type error, so it needs no requirement here.
             BinOp::Eq => self.terms.eq(lhs, rhs),
             BinOp::Ne => {
                 let eq = self.terms.eq(lhs, rhs);
                 self.terms.not(eq)
             }
-            // The bit operators, uninterpreted. Each is a function of its
-            // arguments wherever it has an answer, so congruence over it is
-            // sound; nothing else is. Folding `x << 1` into `2·x` is the
-            // tempting one and it is wrong: that would prove `x << 1 > x` for
-            // every positive `x`, which the evaluator refutes at `x = 2^62`,
-            // where the bit that leaves is the sign.
+            // Uninterpreted. Folding `x << 1` into `2·x` is wrong: the evaluator refutes
+            // `x << 1 > x` at `x = 2^62`.
             BinOp::BitAnd
             | BinOp::BitOr
             | BinOp::BitXor
@@ -693,11 +620,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 self.terms.force_int(lhs);
                 self.terms.force_int(rhs);
                 self.blocked(Blocker::BitOperator);
-                // A shift is a value only where its count is a bit position
-                // (the shift semantics), which is a condition this fragment decides
-                // — so a shift under a guard that bounds its count is in
-                // reach, the way a division under one that establishes its
-                // divisor is. `&`, `|` and `^` refuse no input and owe nothing.
                 if matches!(op, BinOp::Shl | BinOp::Shr | BinOp::Ushr) {
                     self.require_shift_count(rhs);
                 }
@@ -743,8 +665,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
             return self.with_frame(params_frame(params, &lowered), |this| this.lower(body));
         }
 
-        // Asked before the head is lowered: a local binder and a top-level definition of one name
-        // lower to the same shape and are not the same callee.
+        // Before lowering the head: a local binder and a same-named definition lower alike.
         let callee = self.callee(func);
 
         let head = self.lower(func);
@@ -779,8 +700,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
             self.undefined();
         }
 
-        // A call the fragment cannot establish is a function of its arguments gets a fresh symbol
-        // per occurrence.
+        // A call not known to be a function of its arguments gets a fresh symbol per occurrence.
         if !pure {
             return self.terms.sym(sort);
         }
@@ -794,7 +714,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
         )
     }
 
-    /// What is being applied, decided from the source rather than from the lowered head.
+    /// Decided from the source, not the lowered head.
     fn callee(&self, func: &Expr) -> Callee {
         let ExprKind::Var(q) = &func.kind else {
             return Callee::Other;
@@ -809,29 +729,24 @@ impl<'a, 'p> Lowering<'a, 'p> {
         }
     }
 
-    /// Whether applying this callee produces a value, rather than raising or never returning.
     fn callee_is_total(&self, callee: &Callee, head: TermId) -> bool {
         match callee {
-            // A quantified function value.
             Callee::Local => matches!(
                 self.terms.sort(head),
                 Some(Type::Fn { effects, .. }) if effects.is_pure()
             ),
-            // Constructing a value is always a value; a definition whose body was not inlined is
-            // not.
+            // A definition whose body was not inlined is not known to be total.
             Callee::Named(name) => self.ctx.ctor(name).is_some(),
             Callee::Unresolved(name) => TOTAL_BUILTINS.contains(&name.as_str()),
             Callee::Other => false,
         }
     }
 
-    /// Whether applying this head is a function of its arguments, by the row the type system
-    /// already inferred for it.
     fn head_is_pure(&self, head: TermId) -> bool {
         matches!(self.terms.sort(head), Some(Type::Fn { effects, .. }) if effects.is_pure())
     }
 
-    /// Why [`Lowering::try_unfold`] declined, in the order it decides.
+    /// Why [`Lowering::try_unfold`] declined; keep in its decision order.
     fn note_unfold_refusal(&mut self, name: &Symbol) {
         let blocker = if self.depth >= self.unfold_depth || self.terms.len() >= MAX_TERMS {
             Blocker::UnfoldLimit(name.clone())
@@ -845,7 +760,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
         self.blocked(blocker);
     }
 
-    /// Inlines a non-recursive, pure definition.
     fn try_unfold(&mut self, name: &Symbol, args: &[TermId]) -> Option<TermId> {
         if self.depth >= self.unfold_depth || self.terms.len() >= MAX_TERMS {
             return None;
@@ -879,7 +793,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
         let mark = self.frames.len();
         for stmt in stmts {
             let Stmt::Let { pat, value, .. } = stmt else {
-                // A statement in a pure block computes a value nothing reads.
                 continue;
             };
             match &pat.kind {
@@ -888,9 +801,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                     self.frames.push((name.name.clone(), term));
                 }
                 PatternKind::Wildcard => {}
-                // A destructuring bind is not in the fragment, so every name it introduces stands
-                // for an unknown value rather than resolving past the binder to a definition of the
-                // same name.
+                // Bind every introduced name opaquely so none resolves past it to a definition.
                 _ => {
                     let term = self.lower(value);
                     let sort = self.terms.sort(term).cloned();
@@ -907,7 +818,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
         out
     }
 
-    /// Binds every name a pattern introduces to a fresh symbol.
     fn bind_opaque(&mut self, pat: &Pattern, sort: Option<&Type>) {
         if sort.is_some_and(|s| self.ctx.reaches_float(s)) {
             self.float();
@@ -926,7 +836,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
 
         for arm in arms {
             let mark = self.frames.len();
-            // A pattern guard is a second condition on top of the constructor test.
             let shape = if arm.guard.is_some() {
                 None
             } else {
@@ -957,7 +866,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
         )
     }
 
-    /// The test an arm reduces to, and the symbols its constructor's fields are exposed as.
     fn arm_shape(
         &mut self,
         pat: &Pattern,
@@ -980,7 +888,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 if ctor.arity != args.len() {
                     return None;
                 }
-                // Only a flat pattern.
                 if !args
                     .iter()
                     .all(|a| matches!(a.kind, PatternKind::Wildcard | PatternKind::Var(_)))
@@ -1012,16 +919,11 @@ impl<'a, 'p> Lowering<'a, 'p> {
     }
 }
 
-/// What an application is applying, for [`Lowering::callee_is_total`].
 enum Callee {
-    /// A local binder: a parameter, a `forall` binder, or a `let`.
     Local,
-    /// A name that resolves to a top-level definition or a constructor.
     Named(Symbol),
-    /// A bare name nothing in the program declares — a prelude function.
+    /// A prelude function.
     Unresolved(Symbol),
-    /// A computed function: a projection, another application, a lambda that was not applied in
-    /// place.
     Other,
 }
 
@@ -1055,8 +957,7 @@ fn scheme_sort(scheme: &Scheme) -> Option<Type> {
     Some(scheme.ty.clone())
 }
 
-/// The type parameters of the sum type a constructor belongs to, in the order its arguments are
-/// written.
+/// The owning sum type's parameters, in argument order.
 fn type_parameters(ctor: &CtorInfo) -> Option<Vec<TyVar>> {
     let ret = match &ctor.scheme.ty {
         Type::Fn { ret, .. } => ret.as_ref(),
@@ -1076,8 +977,7 @@ fn type_parameters(ctor: &CtorInfo) -> Option<Vec<TyVar>> {
         .collect()
 }
 
-/// The declared types of a constructor's fields, instantiated against the scrutinee's sort when
-/// that sort is known.
+/// Instantiated against the scrutinee's sort when it is known.
 pub(super) fn field_sorts(ctor: &CtorInfo, sort: Option<&Type>) -> Vec<Option<Type>> {
     let subst = match (sort, type_parameters(ctor)) {
         (Some(Type::Con(name, args)), Some(params))
@@ -1093,8 +993,6 @@ pub(super) fn field_sorts(ctor: &CtorInfo, sort: Option<&Type>) -> Vec<Option<Ty
         .collect()
 }
 
-/// The sort a constructor application has, solved from the sorts of the arguments that were
-/// supplied.
 fn ctor_result_sort(ctor: &CtorInfo, args: &[TermId], terms: &Terms) -> Option<Type> {
     let params = type_parameters(ctor)?;
     let mut subst: BTreeMap<TyVar, Type> = BTreeMap::new();
@@ -1110,8 +1008,7 @@ fn ctor_result_sort(ctor: &CtorInfo, args: &[TermId], terms: &Terms) -> Option<T
     Some(Type::Con(ctor.type_name.clone(), args))
 }
 
-/// One-way matching: solves the variables of `pattern` against `actual`, and silently declines
-/// wherever the two disagree.
+/// One-way matching of `pattern` against `actual`; silently declines where they disagree.
 fn match_type(pattern: &Type, actual: &Type, subst: &mut BTreeMap<TyVar, Type>) {
     match (pattern, actual) {
         (Type::Var(v), _) => {

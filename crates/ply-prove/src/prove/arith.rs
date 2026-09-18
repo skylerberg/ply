@@ -11,13 +11,12 @@ pub struct Row {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Feasibility {
-    /// No integer solution exists.
     Infeasible,
     /// Everything else: satisfiable, out of budget, or out of range.
     Unknown,
 }
 
-/// The largest row set an elimination may grow to before the answer becomes `Unknown`.
+/// Past this many rows an elimination answers `Unknown`.
 const MAX_ROWS: usize = 512;
 
 #[derive(Default)]
@@ -28,7 +27,6 @@ pub struct System {
 }
 
 impl System {
-    /// `Σ cᵢvᵢ + k ≤ 0`.
     pub fn leq(&mut self, coefficients: BTreeMap<usize, i128>, konst: i128) {
         self.rows.push(Row {
             coefficients,
@@ -36,7 +34,6 @@ impl System {
         });
     }
 
-    /// `Σ cᵢvᵢ + k = 0`, as the two inequalities.
     pub fn eq(&mut self, coefficients: BTreeMap<usize, i128>, konst: i128) {
         let mut negated = BTreeMap::new();
         let mut ok = true;
@@ -59,7 +56,6 @@ impl System {
         self.rows.is_empty()
     }
 
-    /// `Infeasible` iff no assignment of integers to the variables satisfies every row.
     pub fn feasibility(mut self, budget: &mut u32) -> Feasibility {
         for row in &mut self.rows {
             tighten(row);
@@ -84,7 +80,7 @@ impl System {
                     if !charge(budget, 1) {
                         return Feasibility::Unknown;
                     }
-                    // A combination whose coefficients left `i128` is **dropped**, not fatal.
+                    // An overflowing combination is dropped, which only weakens the system.
                     let Some(mut combined) = combine(p, n, variable) else {
                         continue;
                     };
@@ -107,8 +103,7 @@ impl System {
         }
     }
 
-    /// The variable whose elimination produces the fewest rows, with the lowest index winning a
-    /// tie, so the search is a function of the input alone.
+    /// Fewest rows produced, lowest index on a tie, so the search is deterministic.
     fn next_variable(&self) -> Option<usize> {
         let mut counts: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
         for row in &self.rows {
@@ -184,8 +179,7 @@ fn combine(positive: &Row, negative: &Row, variable: usize) -> Option<Row> {
     })
 }
 
-/// Divides a row through by the gcd of its coefficients and raises the constant to the next
-/// integer, which is valid because the variables are integers.
+/// Divides by the coefficients' gcd and rounds the constant up; valid over the integers.
 fn tighten(row: &mut Row) {
     row.coefficients.retain(|_, c| *c != 0);
     let mut g: i128 = 0;

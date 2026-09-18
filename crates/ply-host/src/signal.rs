@@ -14,10 +14,8 @@ use std::time::{Duration, Instant};
 /// The Ply declaration the registrations below are checked against.
 pub const DECLARATION: &str = ply_std::SIGNAL;
 
-/// The module the declaration ships as, which is what qualifies [`EFFECT`].
 pub const MODULE: &str = "std.signal";
 
-/// The program-wide effect name.
 pub const EFFECT: &str = "std.signal.signal";
 
 /// `--drain-ms`: how long in-flight requests have to finish once accept stops.
@@ -32,11 +30,9 @@ pub const DRAIN_POLL: Duration = Duration::from_millis(20);
 /// How long a wake connection waits for this process's own listener.
 const WAKE_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// How long phase 2 spends getting parked `accept`s to return before it gives up and leaves them to
-/// the drain deadline.
+/// How long phase 2 spends waking parked `accept`s before leaving them to the drain deadline.
 const WAKE_BUDGET: Duration = Duration::from_millis(1_000);
 
-/// Which signal arrived, and what a second one exits with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Signal {
     Interrupt,
@@ -51,9 +47,7 @@ impl Signal {
         }
     }
 
-    /// What an immediate second signal exits with: the shell's own convention, `128 + n`, so a
-    /// supervisor reads the same number it would have read from a process that did not catch the
-    /// signal at all.
+    /// What a second signal exits with: `128 + n`, as if the signal had not been caught.
     pub fn exit_code(self) -> i32 {
         match self {
             Signal::Interrupt => 130,
@@ -62,7 +56,7 @@ impl Signal {
     }
 }
 
-/// The two knobs, as the command line supplies them.
+/// `--drain-lead-ms` and `--drain-ms`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Bounds {
     pub lead: Duration,
@@ -78,54 +72,43 @@ impl Default for Bounds {
     }
 }
 
-/// The listening half of the server, as the coordinator needs it.
 pub trait Accepting: Send + Sync {
     /// Answer `0` to every further `net.accept`, close the listening sockets, and return any
     /// `accept` already parked on a pool thread.
     fn stop_accepting(&self) -> usize;
 
-    /// The addresses a parked `accept` is waiting on.
     fn listening_at(&self) -> Vec<SocketAddr>;
 
     /// Accepted connections the program has not closed.
     fn connections_in_flight(&self) -> usize;
 
-    /// `accept` operations parked on a pool thread right now.
     fn accepts_in_flight(&self) -> usize;
 }
 
-/// The transactional half, as the coordinator needs it for one line of output.
 pub trait Transactions: Send + Sync {
-    /// Transaction scopes open right now.
     fn open_scopes(&self) -> usize;
 }
 
 #[derive(Default)]
 struct State {
     signal: Option<Signal>,
-    /// When the stop was requested.
     at: Option<Instant>,
-    /// When the drain expires.
     deadline: Option<Instant>,
     listeners_closed: usize,
-    /// Connections open when phase 2 finished, which is the number the shutdown banner reports as
-    /// in flight.
+    /// Connections open when phase 2 finished; the banner reports these as in flight.
     in_flight_at_stop: usize,
     scopes_at_stop: usize,
 }
 
-/// The stop flag, the phases, and the answers the two Ply operations read.
 pub struct Shutdown {
     bounds: Bounds,
     /// The whole of what a signal handler touches.
     requested: AtomicBool,
-    /// Set once phase 2 has run, so a `net.accept` after it answers `0` even if the socket table
-    /// was rebuilt.
+    /// Set once phase 2 has run, so a later `net.accept` answers `0` even if the table is rebuilt.
     stopped_accepting: AtomicBool,
     second: AtomicBool,
     state: Mutex<State>,
-    /// Signalled when the stop is requested and at the end of each phase, so a park with nothing
-    /// outstanding wakes rather than sleeping out its bound.
+    /// Signalled on the request and each phase end, so an idle park wakes before its bound.
     woke: Condvar,
     signals: Vec<Signal>,
     net: Mutex<Option<Arc<dyn Accepting>>>,
@@ -151,13 +134,11 @@ impl Shutdown {
         self.bounds
     }
 
-    /// Which signals this run is listening for.
     pub fn signals(&self) -> &[Signal] {
         &self.signals
     }
 
-    /// Hand the coordinator the socket table, **catching up** with a phase machine that has already
-    /// run.
+    /// Hand over the socket table, catching up with a phase machine that has already run.
     pub fn attach_net(&self, net: Arc<dyn Accepting>) {
         let mut slot = lock(&self.net);
         *slot = Some(Arc::clone(&net));
@@ -170,8 +151,7 @@ impl Shutdown {
         state.in_flight_at_stop = net.connections_in_flight();
         drop(state);
         drop(slot);
-        // The listener is closed, but an `accept` posted before this may be parked inside it; the
-        // same dial phase 2 would have done gets it back.
+        // An `accept` posted before the close may still be parked inside it.
         wake_parked_accepts(net.as_ref());
         self.woke.notify_all();
     }
@@ -180,7 +160,6 @@ impl Shutdown {
         *lock(&self.db) = Some(db);
     }
 
-    /// Whether a stop has been requested.
     pub fn stopping(&self) -> bool {
         self.requested.load(Ordering::Acquire)
     }
@@ -193,8 +172,7 @@ impl Shutdown {
         let state = lock(&self.state);
         let left = match (state.deadline, state.at) {
             (Some(deadline), _) => deadline.saturating_duration_since(Instant::now()),
-            // Still in the lead: the drain has not started, so what is left is whatever the lead
-            // has plus the whole of it.
+            // Still in the lead: the rest of the lead plus the whole drain.
             (None, Some(at)) => {
                 let lead_left = self.bounds.lead.saturating_sub(at.elapsed());
                 lead_left + self.bounds.drain
@@ -204,7 +182,6 @@ impl Shutdown {
         left.as_millis().min(i64::MAX as u128) as i64
     }
 
-    /// Whether the drain deadline has passed.
     pub fn drain_expired(&self) -> bool {
         match lock(&self.state).deadline {
             Some(deadline) => Instant::now() >= deadline,
@@ -212,12 +189,10 @@ impl Shutdown {
         }
     }
 
-    /// Whether accept has been stopped, which is phase 2 having run.
     pub fn stopped_accepting(&self) -> bool {
         self.stopped_accepting.load(Ordering::Acquire)
     }
 
-    /// How long since the stop was requested, for the shutdown banner.
     pub fn elapsed(&self) -> Option<Duration> {
         lock(&self.state).at.map(|at| at.elapsed())
     }
@@ -242,7 +217,7 @@ impl Shutdown {
         let _ = self.woke.wait_timeout(state, bound);
     }
 
-    /// A stop, from the signal reactor or from a test.
+    /// Request a stop; `false` when one was already requested.
     pub fn request(self: &Arc<Shutdown>, signal: Signal) -> bool {
         if self.requested.swap(true, Ordering::AcqRel) {
             self.second.store(true, Ordering::Release);
@@ -255,25 +230,22 @@ impl Shutdown {
             state.at = Some(Instant::now());
         }
         self.woke.notify_all();
-        // The phase machine on a thread of its own, so the reactor that delivered this is free to
-        // notice a second signal while the first is still leading or draining.
+        // Phases run on their own thread so the reactor can still notice a second signal.
         let coordinator = Arc::clone(self);
         let spawned = std::thread::Builder::new()
             .name("ply-host-drain".to_string())
             .spawn(move || coordinator.run_phases());
         if spawned.is_err() {
-            // No thread to run the phases on, so run them here.
             self.run_phases();
         }
         true
     }
 
-    /// Whether a second signal has arrived.
     pub fn second_requested(&self) -> bool {
         self.second.load(Ordering::Acquire)
     }
 
-    /// Phases 1 and 2.
+    /// Phase 1 waits out the lead; phase 2 stops accepting and starts the drain.
     fn run_phases(&self) {
         if !self.bounds.lead.is_zero() {
             let state = lock(&self.state);
@@ -289,9 +261,7 @@ impl Shutdown {
             state.listeners_closed = closed;
             state.in_flight_at_stop = net.as_ref().map_or(0, |n| n.connections_in_flight());
             state.scopes_at_stop = lock(&self.db).as_ref().map_or(0, |db| db.open_scopes());
-            // The drain starts when accept stops, not when the signal arrived: a lead is time the
-            // operator asked for and charging it to the drain would silently shorten the drain by
-            // the lead.
+            // The drain starts when accept stops, so a lead never shortens the drain.
             state.deadline = Some(Instant::now() + self.bounds.drain);
             net
         };
@@ -303,7 +273,6 @@ impl Shutdown {
     }
 }
 
-/// Get every parked `accept` to return.
 fn wake_parked_accepts(net: &dyn Accepting) {
     let until = Instant::now() + WAKE_BUDGET;
     while net.accepts_in_flight() > 0 && Instant::now() < until {
@@ -390,7 +359,6 @@ fn deliver(shutdown: Arc<Shutdown>, which: Signal) {
     });
 }
 
-/// The second signal.
 fn exit_now(shutdown: &Arc<Shutdown>, which: Signal) -> ! {
     let connections = lock(&shutdown.net)
         .as_ref()
@@ -404,7 +372,6 @@ fn exit_now(shutdown: &Arc<Shutdown>, which: Signal) -> ! {
     std::process::exit(which.exit_code());
 }
 
-/// The two operations, both `Repeatable` and neither blocking.
 pub fn registrations(shutdown: Option<&Arc<Shutdown>>) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
     Op::ALL
         .iter()
@@ -418,8 +385,6 @@ pub fn registrations(shutdown: Option<&Arc<Shutdown>>) -> Vec<(HostOp, Arc<dyn H
         .collect()
 }
 
-/// Register the two operations, bound when this run has a coordinator and withheld when it does
-/// not.
 pub fn register(registry: &mut HostRegistry, shutdown: Option<&Arc<Shutdown>>) {
     for (op, handler) in registrations(shutdown) {
         match shutdown {
@@ -483,8 +448,7 @@ impl HostHandler for Operation {
         if !req.args.is_empty() {
             return Err(arity(self.op, req.args.len(), req.span));
         }
-        // A withheld registration is never resolved, so reaching here without a coordinator means
-        // the boundary dispatched one it had declined to bind.
+        // A withheld registration is never resolved, so this is a dispatch bug.
         let Some(shutdown) = &self.shutdown else {
             return Err(Diagnostic::error(
                 codes::INTERNAL_ERROR,
@@ -514,8 +478,7 @@ fn arity(op: Op, got: usize, span: Span) -> Diagnostic {
     .note("inference checks a perform's arity, so reaching this means the evaluator was handed a module that was never checked")
 }
 
-/// See `tcp::lock`: the state behind these has no invariant a panicking caller can break, so
-/// recovering is correct and propagating would take out the machine's thread as well.
+/// The guarded state has no invariant a panicking caller can break, so recovering is correct.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }

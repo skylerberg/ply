@@ -6,8 +6,7 @@ use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// `map_entries` and `map_of_entries` speak in records rather than tuples, because Ply has no
-/// tuples.
+/// Entries are `{key, value}` records because Ply has no tuples.
 const KEY: &str = "key";
 const VALUE: &str = "value";
 
@@ -30,20 +29,19 @@ pub(crate) fn new() -> Value {
     Value::empty_map()
 }
 
-/// The one gate every key passes through before [`Value::cmp`] sees it.
+/// The gate every key passes before [`Value::cmp`] sees it.
 fn key(k: &Value, what: &str, span: Span) -> Result<(), Diagnostic> {
     crate::value::secret_has_no_order(k, what, span)
 }
 
-/// The only insert in this module, so that adding a seventh map builder cannot reintroduce the gap:
-/// there is one place a key enters a `Map`.
+/// The only place a key enters a `Map`, so no builder can skip `key`.
 fn put(m: &mut Map, k: Value, v: Value, what: &str, span: Span) -> Result<(), Diagnostic> {
     key(&k, what, span)?;
     crate::value::insert_key(m, k, v);
     Ok(())
 }
 
-/// Replaces an equal key's entry, **key and value both** — the last write wins.
+/// Replaces an equal key's entry, key and value both.
 pub(crate) fn insert(mut m: Value, k: Value, v: Value, span: Span) -> Result<Value, Diagnostic> {
     match &mut m {
         Value::Map(out) => put(out, k, v, "map_insert", span)?,
@@ -67,8 +65,7 @@ pub(crate) fn contains(m: &Value, k: &Value, span: Span) -> Result<Value, Diagno
     ))
 }
 
-/// An absent key is a no-op rather than an error: removing what is not there leaves a map with the
-/// property the caller asked for, and refusing would make every caller write the guard.
+/// An absent key is a no-op, not an error.
 pub(crate) fn remove(mut m: Value, k: &Value, span: Span) -> Result<Value, Diagnostic> {
     key(k, "map_remove", span)?;
     match &mut m {
@@ -80,8 +77,7 @@ pub(crate) fn remove(mut m: Value, k: &Value, span: Span) -> Result<Value, Diagn
     Ok(m)
 }
 
-/// Takes the entry's value out of the map for a `map_update`: the map no longer holds it, so
-/// the function it is handed to sees the value at one owner when nothing else does.
+/// Removes the entry for `map_update` so the updating function can see the value uniquely owned.
 pub(crate) fn take(
     mut m: Value,
     k: &Value,
@@ -122,8 +118,7 @@ pub(crate) fn entries(m: &Value, span: Span) -> Result<Value, Diagnostic> {
     ))
 }
 
-/// Later entries win, matching a fold of [`insert`] — so `map_of_entries(map_entries(m))` is `m`
-/// for every `m`, which is the property a derived codec's round trip rests on.
+/// Later entries win, so `map_of_entries(map_entries(m))` is `m`; derived codecs rely on it.
 pub(crate) fn of_entries(list: &Value, span: Span) -> Result<Value, Diagnostic> {
     let items = list.as_list(span, "`map_of_entries`")?;
     let mut out = Map::new();
@@ -156,7 +151,7 @@ fn pair(item: &Value, span: Span) -> Result<(Value, Value), Diagnostic> {
     }
 }
 
-/// The right side wins a shared key, by the same last-write-wins rule [`insert`] follows.
+/// The right side wins a shared key.
 pub(crate) fn merge(a: &Value, b: &Value, span: Span) -> Result<Value, Diagnostic> {
     let mut out = a.as_map(span, "`map_merge`")?.clone();
     for (k, v) in b.as_map(span, "`map_merge`")?.iter() {
@@ -165,7 +160,7 @@ pub(crate) fn merge(a: &Value, b: &Value, span: Span) -> Result<Value, Diagnosti
     Ok(Value::Map(out))
 }
 
-/// The entries `map_fold` will visit, in ascending key order, snapshotted.
+/// A snapshot of the entries `map_fold` visits, in ascending key order.
 pub type Entries = Rc<Vec<(Value, Value)>>;
 
 pub(crate) fn fold_entries(m: &Value, span: Span) -> Result<Entries, Diagnostic> {
@@ -175,7 +170,6 @@ pub(crate) fn fold_entries(m: &Value, span: Span) -> Result<Entries, Diagnostic>
     ))
 }
 
-/// One step of `map_fold`: apply `f` to `(acc, key, value)`, or finish.
 pub(crate) fn next_fold(
     f: Value,
     entries: Entries,

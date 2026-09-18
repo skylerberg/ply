@@ -1,5 +1,4 @@
-//! The postgres [`Driver`]: the piece that joins the scanner, the type mapping, the scope table and
-//! The connection pool into something a Ply `db` operation resolves to.
+//! The postgres [`Driver`]: joins the scope table and the connection pool into `db` operations.
 
 use super::handler::{Driver, Statement};
 use super::pool::{self, Cleanup, LeaseId, Opened, Outcome, Reactor};
@@ -15,38 +14,38 @@ use std::time::Duration;
 
 /// What a resolved token still has to do.
 enum Next {
-    /// A data statement.
-    Statement { owner: Owner },
-    /// A `BEGIN`.
+    Statement {
+        owner: Owner,
+    },
     Begin {
         owner: Owner,
         level: Isolation,
         access: Access,
     },
-    /// A `SAVEPOINT`, which runs on a connection the scope already holds.
+    /// A nested `BEGIN`: a `SAVEPOINT` on the connection the scope already holds.
     Savepoint {
         owner: Owner,
         level: Isolation,
         access: Access,
         lease: LeaseId,
     },
-    /// `COMMIT` or `ROLLBACK` on the outermost scope: the scope is popped and the connection
-    /// released whatever the server said.
+    /// Outermost `COMMIT` or `ROLLBACK`: the connection is released whatever the server said.
     Close {
         owner: Owner,
         lease: LeaseId,
-        /// Whether this was a `COMMIT`.
         commit: bool,
     },
-    /// `RELEASE SAVEPOINT` or `ROLLBACK TO SAVEPOINT`: a scope is popped and no connection changes
-    /// hands.
-    Release { owner: Owner, commit: bool },
-    /// A control operation the driver refused without a round trip.
-    Refused { error: DbError },
+    /// `RELEASE SAVEPOINT` or `ROLLBACK TO SAVEPOINT`: no connection changes hands.
+    Release {
+        owner: Owner,
+        commit: bool,
+    },
+    Refused {
+        error: DbError,
+    },
 }
 
 impl Next {
-    /// Whose entry point posted this token, so a teardown drops only its own.
     fn owner(&self) -> Option<Owner> {
         match self {
             Next::Statement { owner }
@@ -59,7 +58,6 @@ impl Next {
     }
 }
 
-/// A `db` implementation over a real postgres.
 pub struct Postgres {
     reactor: Reactor,
     /// Per entry point, not per run: `end_entry_point` empties it.
@@ -72,7 +70,6 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A control statement's answer, as the Ply `Answer` a program matches on.
 fn opened_ok() -> Value {
     value::answer(&stmt::Answer::Count(0))
 }
@@ -81,7 +78,7 @@ fn failed(e: &DbError) -> Value {
     value::answer(&stmt::Answer::Failed(e.clone()))
 }
 
-/// What a close the server accepted answers.
+/// Postgres accepts a `COMMIT` of a failed transaction by rolling back; report that as aborted.
 fn aborted_or_ok(commit: bool, poisoned: bool) -> Value {
     if commit && poisoned {
         return failed(&DbError::new(
@@ -93,14 +90,12 @@ fn aborted_or_ok(commit: bool, poisoned: bool) -> Value {
     opened_ok()
 }
 
-/// A peer that went away, which the connection pool makes a value rather than a diagnostic: a database
-/// that restarted is a peer, and a peer's misbehaviour already decided what those are.
+/// A lost database is a peer failure, so it is a value rather than a diagnostic.
 fn unreachable(why: &str) -> Value {
     failed(&DbError::connection(why.to_string()))
 }
 
 impl Postgres {
-    /// Opens the pool.
     pub fn start(config: pool::PoolConfig) -> Result<Postgres, Diagnostic> {
         let statements = config.statements;
         Ok(Postgres {
@@ -115,7 +110,6 @@ impl Postgres {
         &self.reactor
     }
 
-    /// How deep `owner`'s scope stack is.
     pub fn depth(&self, owner: Owner) -> usize {
         lock(&self.scopes).depth(owner)
     }
@@ -129,11 +123,9 @@ impl Postgres {
         HostAnswer::Pending(pending)
     }
 
-    /// What a resolved token means, on the machine's thread.
     fn finish(&self, token: u64, outcome: Outcome) -> Result<Value, Diagnostic> {
         let Some(next) = lock(&self.pending).remove(&token) else {
-            // A token this driver minted is filed before it can resolve, so reaching here means the
-            // reactor answered one it did not mint.
+            // Tokens are filed before they can resolve, so this one was never minted here.
             return Err(Diagnostic::error(
                 ply_span::codes::INTERNAL_ERROR,
                 format!("the database driver was handed token #{token}, which it never posted"),
@@ -145,8 +137,7 @@ impl Postgres {
                     .downcast::<Result<stmt::Answer, Diagnostic>>()
                     .map_err(|_| mismatched("a statement"))?
                 {
-                    // A statement the server refused has put the block it ran in into the failed
-                    // state, and postgres answers the `COMMIT` that follows without an error.
+                    // Postgres accepts `COMMIT` after a failed statement, so record the failure.
                     Ok(answer) => {
                         if matches!(answer, stmt::Answer::Failed(_)) {
                             lock(&self.scopes).statement_failed(owner);
@@ -179,9 +170,8 @@ impl Postgres {
                             lock(&self.scopes).opened(owner, opened.lease, level, access);
                             Ok(opened_ok())
                         }
-                        // The `BEGIN` the server refused opened nothing, so the scope table never
-                        // hears about it and the connection goes back rolled back — it may have
-                        // been the transaction that failed rather than the socket.
+                        // A refused `BEGIN` opens no scope; roll back on release in case the
+                        // transaction rather than the socket failed.
                         Err(e) => {
                             self.reactor.release(opened.lease, Cleanup::Rollback)?;
                             Ok(failed(&e))
@@ -213,9 +203,8 @@ impl Postgres {
             } => {
                 let ran = control_result(outcome, "a transaction control")?;
                 let closed = lock(&self.scopes).closed(owner, commit);
-                // A close the server refused is always a rollback on release: nothing here can tell
-                // a deferred constraint from a connection that died mid-`COMMIT`, and the second
-                // must not go back to the pool carrying a transaction.
+                // A refused close may be a connection that died mid-`COMMIT`, which must not go
+                // back to the pool carrying a transaction.
                 let cleanup = match &ran {
                     Ok(()) => Cleanup::Clean,
                     Err(_) => Cleanup::Rollback,
@@ -250,44 +239,36 @@ impl Postgres {
         self.finish(pending.token, outcome)
     }
 
-    /// Roll back every scope still open and release or discard the connections holding them.
     pub fn end_entry_point(&self, machine: MachineId) -> Result<pool::DrainReport, Diagnostic> {
-        // Per entry point rather than per process, so the bound is the driver's own: this runs on
-        // the value path of every request, not only at a stop, and a run that is not stopping has
-        // no deadline to honour.
+        // Runs on every request, not only at a stop, so there is no shutdown deadline to honour.
         let config = self.reactor.config();
         let bound = config.statement + config.connect;
         let leases = lock(&self.scopes).end_entry_point(machine);
-        // This machine's tokens only.
         lock(&self.pending).retain(|_, next| next.owner().is_none_or(|o| o.0 != machine));
         let mut report = self.reactor.drain(&leases, bound)?;
         report.merge(self.reactor.take_discards());
         Ok(report)
     }
 
-    /// Transaction scopes open right now, across every entry point.
     pub fn open_scopes(&self) -> usize {
         lock(&self.scopes).open_leases().len()
     }
 
-    /// Step 1 of the process-level teardown: `ROLLBACK` every scope still open, whichever entry
-    /// point opened it, and **wait for the rollbacks**.
+    /// Step 1 of process teardown.
     pub fn roll_back_open_scopes(&self, budget: Duration) -> Result<pool::DrainReport, Diagnostic> {
         let leases = lock(&self.scopes).shutdown();
-        // Every pending answer, because there is no entry point left to hand one to: a token
-        // resolved after this would be a value nobody polls.
+        // No entry point is left to poll a pending answer.
         lock(&self.pending).clear();
         let mut report = self.reactor.drain(&leases, budget)?;
         report.merge(self.reactor.take_discards());
         Ok(report)
     }
 
-    /// Step 3: close the pool.
+    /// Step 3 of process teardown.
     pub fn close_pool(&self, budget: Duration) -> Result<pool::DrainReport, Diagnostic> {
         self.reactor.shutdown(budget)
     }
 
-    /// The statement text a control step runs, as a job on a connection.
     fn control(sql: String) -> pool::Job {
         pool::job(move |connection| async move {
             let out = stmt::control(&connection, &sql).await;
@@ -296,7 +277,6 @@ impl Postgres {
     }
 }
 
-/// A control step's answer, unwrapped from the outcome shapes that cannot occur.
 fn control_result(outcome: Outcome, what: &'static str) -> Result<Result<(), DbError>, Diagnostic> {
     match outcome {
         Outcome::Done(payload) => Ok(*payload
@@ -376,9 +356,7 @@ impl Driver for Postgres {
                     },
                 ))
             }
-            // Answered through the reactor rather than inline: `db.begin` is registered `blocking:
-            // true`, so a value returned from `call` is `E0428` — the machine's thread having done
-            // the work.
+            // `db.begin` is registered blocking, so an inline answer would be `E0428`.
             Step::Refused(e) => {
                 let pending = self.reactor.settled(
                     span,
@@ -448,7 +426,7 @@ impl Postgres {
     }
 }
 
-/// The `db` implementation a *listing* is taken over.
+/// The `db` implementation for a run that names no database, such as a listing.
 pub struct NotConfigured;
 
 impl NotConfigured {
@@ -490,14 +468,10 @@ impl Driver for NotConfigured {
     }
 }
 
-/// The SQLSTATEs this module can produce without asking a server, re-exported so a caller reading a
-/// `Failed` can name them.
 pub use sqlstate::{
     ACTIVE_TRANSACTION, NO_ACTIVE_TRANSACTION, PROGRAM_LIMIT_EXCEEDED, TRANSACTION_ABORTED,
 };
 
-/// What the shutdown coordinator asks the database for: one number, for one line of output and for
-/// The drain's own report.
 impl crate::signal::Transactions for Postgres {
     fn open_scopes(&self) -> usize {
         Postgres::open_scopes(self)

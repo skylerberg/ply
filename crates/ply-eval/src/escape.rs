@@ -5,14 +5,10 @@ use crate::value::{ClosureKind, Value};
 use ply_span::{Diagnostic, Span, codes};
 use std::borrow::Cow;
 
-/// What kind of region-bound handle was found.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Handle {
-    /// A key into the region that allocated it.
     Cell,
-    /// A key into a scheduler, which dies with its region.
     Task,
-    /// A captured continuation, which reaches every region that was open where it was captured.
     Continuation,
 }
 
@@ -25,7 +21,6 @@ impl Handle {
         }
     }
 
-    /// Why this handle is bound to a region, in the diagnostic's own voice.
     fn why(self) -> &'static str {
         match self {
             Handle::Cell => {
@@ -44,7 +39,6 @@ impl Handle {
     }
 }
 
-/// A handle a value can reach, and the route to it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Escapee {
     pub handle: Handle,
@@ -53,8 +47,6 @@ pub struct Escapee {
 }
 
 impl Escapee {
-    /// `, reached through item 2 → `Just`'s argument 1`, or the empty string when the value is the
-    /// handle itself.
     pub fn reached(&self) -> String {
         if self.route.is_empty() {
             return String::new();
@@ -63,25 +55,26 @@ impl Escapee {
     }
 }
 
-/// Which boundary a value was about to cross.
 #[derive(Clone, Copy, Debug)]
 pub enum Boundary<'a> {
-    /// An argument to a host operation.
     HostArgument {
         operation: &'a str,
         path: &'static str,
         position: usize,
     },
-    /// The value a host handler answered with, inline or through
-    /// [`HostRuntime::block_on`](crate::HostRuntime::block_on).
+    /// A host handler's answer, inline or through `HostRuntime::block_on`.
     HostAnswer {
         operation: &'a str,
         path: &'static str,
     },
     /// The value a host runtime resolved a parked token to.
-    HostToken { label: &'static str, token: u64 },
-    /// An argument handed to an entry point from outside the program.
-    EntryPoint { name: &'a str },
+    HostToken {
+        label: &'static str,
+        token: u64,
+    },
+    EntryPoint {
+        name: &'a str,
+    },
 }
 
 impl Boundary<'_> {
@@ -116,7 +109,6 @@ impl Boundary<'_> {
         }
     }
 
-    /// What outlives the region, said once per boundary.
     fn outlives(&self) -> Cow<'static, str> {
         match self {
             Boundary::HostArgument { path, .. } => Cow::Owned(format!(
@@ -164,7 +156,6 @@ pub fn carries(value: &Value) -> Option<Escapee> {
     Some(Escapee { handle, route })
 }
 
-/// Refuses `value` at `boundary`, or lets it through.
 pub fn check(boundary: &Boundary<'_>, value: &Value, span: Span) -> Result<(), Diagnostic> {
     match carries(value) {
         None => Ok(()),
@@ -172,7 +163,6 @@ pub fn check(boundary: &Boundary<'_>, value: &Value, span: Span) -> Result<(), D
     }
 }
 
-/// [`check`] over a run of arguments, naming the position of the first that carries a handle.
 pub fn check_arguments(
     operation: &str,
     path: &'static str,
@@ -209,8 +199,7 @@ fn refuse(boundary: &Boundary<'_>, escapee: &Escapee, span: Span) -> Diagnostic 
     .note(boundary.remedy())
 }
 
-/// Innermost-first: each frame pushes its own segment as the `Some` unwinds, so nothing is
-/// allocated for a value that carries no handle.
+/// Builds `route` innermost-first as the `Some` unwinds, so a clean value allocates nothing.
 fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
     match value {
         Value::Cell(_) => Some(Handle::Cell),

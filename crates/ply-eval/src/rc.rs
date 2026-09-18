@@ -1,9 +1,4 @@
 //! Reference counting for the values that outlive their region.
-//!
-//! Perceus' operations, on the machine's slot calculus (ADR 0034): `dup` is a clone at a read
-//! that is not the binding's last, `drop` is the window truncation at an activation's end, and a
-//! *move* is a last use taking the value out of its slot. There is no fourth row: a pending frame
-//! records a base index rather than holding a scope, so nothing owns "the scope" any more.
 
 use crate::arena::Slot;
 use crate::value::Value;
@@ -11,18 +6,16 @@ use ply_span::{Diagnostic, Span, Symbol, codes};
 use rustc_hash::FxHashMap;
 use std::cell::{Cell, RefCell};
 
-/// How a variable occurrence takes its value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Own {
-    /// The binding is read again later, so the read clones — Perceus' `dup`.
+    /// The binding is read again later, so the read clones.
     #[default]
     Borrowed,
-    /// The last use of a binding of the enclosing barrier: the read moves the value out of its
-    /// slot, leaving the slot empty.
+    /// The last use in the enclosing barrier: the read moves the value out of its slot.
     Owned,
 }
 
-/// Counters for the slot machine's capture-against-carry census. Diagnostics only.
+/// Capture-against-carry counters.
 pub mod census4 {
     use std::cell::Cell;
     thread_local! {
@@ -51,43 +44,28 @@ pub mod census4 {
     }
 }
 
-/// A pending frame started waiting while a sub-expression runs — what the census counts against
-/// captures. Under the slot machine a carry is a base index in the frame and costs nothing;
-/// the census stays because the trade it guards is still the trade: a capture *copies* the
-/// windows it cuts, and that is affordable only while carries outnumber captures.
+/// A capture copies the windows it cuts, which is affordable only while carries outnumber it.
 pub(crate) fn note_carry() {
     census4::carry();
 }
 
-/// What the pass and the runtime counted.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct Stats {
-    /// Occurrences of a binding the pass tracks — Perceus' naive `dup` count, one per read.
+    /// Reads of tracked bindings: the naive `dup` count.
     pub dup_sites: u64,
     /// Occurrences that still clone, because the binding is read again.
     pub dup_emitted: u64,
-    /// Bindings introduced — the naive `drop` count, one per binding.
+    /// Bindings introduced: the naive `drop` count.
     pub drop_sites: u64,
-    /// Per-binding drop operations the machine still runs. Zero since the slot rewrite: a scope's
-    /// end is one window truncation, so no binding pays a drop of its own.
+    /// Per-binding drops; always zero, since a scope ends with one window truncation.
     pub drop_emitted: u64,
-    /// Moves the machine attempted, at an `Owned` occurrence.
     pub takes_attempted: u64,
-    /// Those that found a live value in the slot and moved it.
     pub takes_moved: u64,
-    /// Updates of a compound value — an operation that answers the argument it was given with one
-    /// element changed.
+    /// Updates that answer a compound argument with one element changed.
     pub updates: u64,
-    /// Updates that rewrote the value rather than copying it.
     pub updates_in_place: u64,
     /// Slots copied by the updates that did not rewrite in place.
-    ///
-    /// The boolean above answers "did this append copy", and this answers how much: since ADR
-    /// 0034's bounded representation a copy is one leaf and the path above it, so an append that
-    /// cannot rewrite is a bounded cost rather than a whole-list one, and the two counters
-    /// together tell a genuine second owner from a quadratic accumulator.
     pub elements_copied: u64,
-    /// Cycles reported by [`cell_cycle`].
     pub cycles: u64,
 }
 
@@ -102,7 +80,6 @@ impl Stats {
         Some(1.0 - (emitted as f64 / naive as f64))
     }
 
-    /// The fraction of updates that rewrote their argument in place.
     pub fn in_place(&self) -> Option<f64> {
         if self.updates == 0 {
             return None;
@@ -125,15 +102,12 @@ thread_local! {
         cycles: 0,
     }) };
     static CYCLES: RefCell<Vec<Diagnostic>> = const { RefCell::new(Vec::new()) };
-    /// The `(cell, site)` pairs already reported, so that one cycle is one warning however many
-    /// times the write runs.
+    /// Reported `(cell, site)` pairs, so one cycle warns once however often the write runs.
     static SEEN: RefCell<Vec<(Slot, Span)>> = const { RefCell::new(Vec::new()) };
-    /// Off unless [`record_sites`] armed it, and read once per update when it is off.
     static RECORDING: Cell<bool> = const { Cell::new(false) };
     static SITES: RefCell<FxHashMap<Span, SiteCount>> = RefCell::new(FxHashMap::default());
 }
 
-/// What one `push` site did, over every time the corpus ran it.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct SiteCount {
     pub in_place: u64,
@@ -154,14 +128,12 @@ impl SiteCount {
     }
 }
 
-/// Arms or disarms per-site attribution of [`Stats::updates`], clearing the map
-/// in both directions so a measurement starts empty whatever ran before it.
+/// Arms or disarms per-site attribution of [`Stats::updates`], clearing the map either way.
 pub fn record_sites(on: bool) {
     let _ = RECORDING.try_with(|c| c.set(on));
     let _ = SITES.try_with(|c| c.borrow_mut().clear());
 }
 
-/// What each `push` site has done since [`record_sites`] armed it.
 pub fn sites() -> Vec<(Span, SiteCount)> {
     SITES
         .try_with(|c| c.borrow().iter().map(|(k, v)| (*k, *v)).collect())
@@ -177,7 +149,6 @@ pub fn stats() -> Stats {
     COUNTERS.try_with(|c| *c.borrow()).unwrap_or_default()
 }
 
-/// Clears this thread's counters and the cycles it has reported.
 pub fn reset() {
     let _ = COUNTERS.try_with(|c| *c.borrow_mut() = Stats::default());
     let _ = SITES.try_with(|c| c.borrow_mut().clear());
@@ -185,7 +156,6 @@ pub fn reset() {
     let _ = SEEN.try_with(|c| c.borrow_mut().clear());
 }
 
-/// [`note_update`], with the number of elements the update had to copy.
 pub fn note_update_of(in_place: bool, copied: usize, span: Span) {
     bump(|s| {
         s.updates += 1;
@@ -205,17 +175,14 @@ pub fn note_update_of(in_place: bool, copied: usize, span: Span) {
     }
 }
 
-/// Cycles reported so far, in the order they were built, and clears the list.
 pub fn take_cycles() -> Vec<Diagnostic> {
-    // The suppression list goes with them: a slot's position restarts at every entry point, so the
-    // same `(cell, site)` pair in a later run is a second cycle rather than the first one again.
+    // Slot positions restart at every entry point, so a later repeat is a new cycle.
     let _ = SEEN.try_with(|c| c.borrow_mut().clear());
     CYCLES
         .try_with(|c| std::mem::take(&mut *c.borrow_mut()))
         .unwrap_or_default()
 }
 
-/// A cell that reaches itself, which nothing will ever reclaim.
 pub(crate) fn cell_cycle(slot: Slot, value: &Value, span: Span) -> Option<Diagnostic> {
     if !value_reaches_cell(value, slot) {
         return None;
@@ -223,18 +190,15 @@ pub(crate) fn cell_cycle(slot: Slot, value: &Value, span: Span) -> Option<Diagno
     note_cell_cycle(slot, span)
 }
 
-/// Whether `v` reaches cell `slot`, within the walk's budget: what the tier asks of a bridged value
-/// inside a heap word.
+/// Whether `v` reaches cell `slot`, within the walk's budget.
 pub fn value_reaches_cell(v: &Value, slot: Slot) -> bool {
     let mut budget = CYCLE_WALK_BUDGET;
     reaches_cell(v, slot, 0, &mut budget)
 }
 
-/// A cell made to contain itself, once the walk -- the interpreter's or the tier's -- has found the
-/// cycle: counted, and warned about once per site.
+/// Counts a found cell cycle and warns once per site.
 pub fn note_cell_cycle(slot: Slot, span: Span) -> Option<Diagnostic> {
     bump(|s| s.cycles += 1);
-    // One cycle, one warning.
     let seen = SEEN
         .try_with(|c| {
             let mut seen = c.borrow_mut();
@@ -258,11 +222,9 @@ pub fn note_cell_cycle(slot: Slot, span: Span) -> Option<Diagnostic> {
     Some(d)
 }
 
-/// What one `cell_set` may spend looking for a cycle.
 const CYCLE_WALK_BUDGET: u32 = 256;
 
-/// Depth-bounded exactly as `values_equal` is, and node-bounded on top of that: a value's shape is
-/// the program's to choose, and this walk spends both the host's stack and the program's time.
+/// Depth- and node-bounded: the program chooses the shape, and the walk spends stack and time.
 fn reaches_cell(v: &Value, slot: Slot, depth: usize, budget: &mut u32) -> bool {
     if depth >= crate::limit::MAX_VALUE_DEPTH || *budget == 0 {
         return false;
@@ -282,15 +244,10 @@ fn reaches_cell(v: &Value, slot: Slot, depth: usize, budget: &mut u32) -> bool {
     }
 }
 
-/// The backward pass: the bindings still read to the right of the point the walk has reached.
-///
-/// Keyed on the binding and nothing finer. A read through a field, or as a record update's base,
-/// is a read of the binding: ADR 0034 records the field-granular take that once distinguished
-/// them, and why it went.
+/// The backward pass: bindings still read to the right, keyed per binding, never per field.
 pub struct Live {
     later: Vec<Symbol>,
-    /// One frame per barrier — a lambda, a handler clause, a `return` clause, a `simulate` body —
-    /// holding every slot name of that barrier: captures, parameters and binders alike.
+    /// Per barrier (lambda, clause, `simulate` body): every slot name it owns.
     ownable: Vec<Vec<Symbol>>,
 }
 
@@ -312,8 +269,7 @@ impl Live {
         }
     }
 
-    /// Records a read of the binding and answers whether the value may be moved rather than
-    /// cloned.
+    /// Records a read and answers whether the value may be moved rather than cloned.
     pub fn use_of(&mut self, name: &Symbol) -> Own {
         let tracked = self.tracked(name);
         let last = !self.any_later(name);
@@ -331,8 +287,7 @@ impl Live {
         }
     }
 
-    /// Whether this name is a binding of the current barrier, which is the only thing the counts
-    /// and the ownership answer are about.
+    /// Only the current barrier's bindings are counted or moved.
     fn tracked(&self, name: &Symbol) -> bool {
         self.ownable
             .last()
@@ -348,8 +303,7 @@ impl Live {
         self.later.retain(|u| u != name);
     }
 
-    /// Enters a scope in which `binders` denote new bindings, answering the uses of an outer
-    /// binding of one of those names that the rest of the activation still makes.
+    /// Enters a scope rebinding `binders`, returning the outer bindings' pending uses it hides.
     pub(crate) fn shadow(&mut self, binders: &[Symbol]) -> Vec<Symbol> {
         let held: Vec<Symbol> = self
             .later
@@ -369,27 +323,20 @@ impl Live {
         self.later = uses;
     }
 
-    /// Unions a branch's live set into the current one.
     pub(crate) fn union(&mut self, other: Vec<Symbol>) {
         for u in &other {
             self.push(u);
         }
     }
 
-    /// Opens a barrier over `bound`, answering the live set to restore with [`Live::close`].
+    /// Opens a barrier over `bound`, answering the live set to restore when it closes.
     pub(crate) fn open(&mut self, bound: Vec<Symbol>) -> Vec<Symbol> {
         self.ownable.push(bound);
         std::mem::take(&mut self.later)
     }
 
-    /// Closes a barrier, replaying its free variables as reads at the construct that captured
-    /// them, and answering how the capture may take each: a clone while the enclosing activation
-    /// still reads the name, a move when the capture is its last use.
-    ///
-    /// `movable` is false for a barrier whose capture runs *before* code lowered to its left in
-    /// the walk — a handler clause or a `simulate` body, both captured at the construct's entry
-    /// while the body between entry and any later read has yet to run. Those captures always
-    /// clone.
+    /// Closes a barrier, replaying its free variables as reads and answering how each is taken.
+    /// `movable` is false for captures taken at entry (handler clauses, `simulate`): they clone.
     pub(crate) fn close_with_owns(
         &mut self,
         outer: Vec<Symbol>,

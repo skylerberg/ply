@@ -1,7 +1,6 @@
 //! Obligations, and the tiers they are discharged at.
 
-// `Value` pins `Arc` for its shared payloads, so none of them can ever be `Send`; that is
-// `ply-eval`'s design and not something a value built here can change.
+// `Value` shares non-`Send` payloads through `Arc` by design.
 #![allow(clippy::arc_with_non_send_sync)]
 
 pub mod concurrency;
@@ -23,29 +22,23 @@ use std::time::Duration;
 /// Kept cases below which a run has concrete evidence and no coverage claim.
 pub const MIN_PROPERTY_CASES: u32 = 25;
 
-/// How deep a **non-recursive** call may be inlined by the prover.
 pub const UNFOLD_DEPTH: u32 = 3;
 
-/// The largest finite domain the prover will enumerate exhaustively.
 pub const ENUMERATION_BOUND: u64 = 4096;
 
-/// Past this generation depth only constructors with no recursive field are drawn, so generating a
-/// value of a recursive type terminates.
+/// Past this depth only non-recursive constructors are drawn, so generation terminates.
 pub const GEN_DEPTH: u32 = 4;
 
 pub const DEFAULT_CASES: u32 = 200;
 pub const DEFAULT_PROVE_BUDGET: u32 = 10_000;
 pub const DEFAULT_SHRINK_BUDGET: u32 = 500;
 
-/// The strength of the argument behind a held obligation.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
-    /// Concrete cases, and **no** coverage claim.
+    /// Concrete cases, and no coverage claim.
     Example,
-    /// Randomized cases, the count reported, shrinking on failure.
     Property,
-    /// A static argument covering **every** input satisfying the guard.
     Proved,
 }
 
@@ -65,13 +58,10 @@ impl fmt::Display for Tier {
     }
 }
 
-/// An inference rule the prover is allowed to use.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Rule {
-    /// A closed pure Boolean term evaluated to `true`.
     GroundEvaluation,
-    /// Every point of a finite domain of at most [`ENUMERATION_BOUND`] points evaluated.
     ExhaustiveEnumeration {
         domain: Symbol,
         points: u64,
@@ -80,7 +70,6 @@ pub enum Rule {
     LinearArithmetic,
     /// `&&`, `||`, `!`, `if` at `Bool`, by case split.
     Propositional,
-    /// A split on a scrutinee's outermost constructor.
     CaseSplit {
         ty: Symbol,
         arms: u32,
@@ -88,21 +77,16 @@ pub enum Rule {
     Congruence,
     /// `C(x̄) == C(ȳ) ⟺ x̄ == ȳ`, and `C(..) != D(..)` for `C ≠ D`.
     Injectivity,
-    /// A **non-recursive** definition inlined.
     Unfold {
         def: Symbol,
         depth: u32,
     },
-    /// The one certificate rule that comes from execution rather than from a static argument: M7's
-    /// footprint-guided search emptied its frontier, so every interleaving ran.
     ExhaustiveInterleaving {
         interleavings: u32,
     },
 }
 
 impl Rule {
-    /// Whether this rule's evidence came from running the program rather than from reasoning about
-    /// it.
     pub fn is_execution(&self) -> bool {
         matches!(
             self,
@@ -113,33 +97,25 @@ impl Rule {
     }
 }
 
-/// Why an obligation is `proved`.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize)]
 pub struct Certificate {
     /// In application order.
     pub rules: Vec<Rule>,
     pub steps: u32,
-    /// The guard was shown to admit at least one value.
     pub guard_satisfiable: bool,
-    /// Type variables the proof left as uninterpreted sorts, so the claim is genuinely polymorphic
-    /// rather than a claim about one instantiation.
+    /// Type variables left as uninterpreted sorts, so the claim is polymorphic.
     pub sorts: Vec<Symbol>,
 }
 
-/// What a sampled run did.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize)]
 pub struct CaseReport {
     pub generated: u32,
-    /// Candidates that satisfied the guard and were evaluated.
     pub kept: u32,
-    /// Candidates the guard rejected.
     pub rejected: u32,
     pub roots: Vec<u64>,
-    /// Type variables monomorphised for generation, e.g. `a := Int`.
     pub instantiations: Vec<(Symbol, Type)>,
 }
 
-/// What is behind a held obligation.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "snake_case", tag = "evidence")]
 pub enum Evidence {
@@ -157,7 +133,6 @@ impl Evidence {
     }
 }
 
-/// One binding of a counterexample, rendered.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize)]
 pub struct Binding {
     pub name: Symbol,
@@ -165,16 +140,13 @@ pub struct Binding {
     pub rendered: String,
 }
 
-/// A falsifying input, after shrinking.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Counterexample {
-    /// The shrunk bindings.
     pub bindings: Vec<Binding>,
     pub original: Vec<Binding>,
     pub shrinks: u32,
     pub root: u64,
     pub case: u32,
-    /// For a concurrency law: the two steps whose reordering flipped it.
     pub race: Option<Race>,
     pub sim_seed: Option<Seed>,
 }
@@ -182,34 +154,29 @@ pub struct Counterexample {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum VacuityKind {
-    /// The prover showed the guard unsatisfiable within the fragment.
     ProvedUnsatisfiable,
-    /// A full case budget kept nothing.
     NoCaseKept { generated: u32 },
 }
 
-/// The guard admitted no values, so the obligation is trivially valid and says nothing.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize)]
 pub struct Vacuity {
     pub guard: Span,
     pub kind: VacuityKind,
 }
 
-/// Why the system could not decide an obligation at any tier.
 #[derive(Clone, Debug)]
 pub enum Gap {
-    /// Checking an `ensures` means calling the definition, and its footprint needs a handler
-    /// nothing supplies.
+    /// Checking an `ensures` calls the definition, whose footprint needs an unsupplied handler.
     UnhandledEffect(Footprint),
-    /// A parameter of a type the generator cannot inhabit.
-    Ungeneratable { param: Symbol, ty: Type },
-    /// Evaluating a case raised: a runtime error, a division by zero, the recursion limit.
+    Ungeneratable {
+        param: Symbol,
+        ty: Type,
+    },
     Raised {
         bindings: Vec<Binding>,
         diagnostic: Diagnostic,
     },
-    /// The guard kept none of a full case budget, and the guard **does** admit a value — one is
-    /// carried here, found by evaluating the guard at the points its own literals name.
+    /// The guard kept no case of a full budget, yet admits `witness`.
     GuardNotSampled {
         generated: u32,
         witness: Vec<Binding>,
@@ -218,7 +185,6 @@ pub enum Gap {
     ReachesHost(Footprint),
 }
 
-/// What became of one obligation.
 #[derive(Clone, Debug)]
 pub enum Discharge {
     Held(Evidence),
@@ -228,7 +194,6 @@ pub enum Discharge {
 }
 
 impl Discharge {
-    /// `None` for everything that is not held.
     pub fn tier(&self) -> Option<Tier> {
         match self {
             Discharge::Held(e) => Some(e.tier()),
@@ -240,27 +205,21 @@ impl Discharge {
         matches!(self, Discharge::Held(_))
     }
 
-    /// Whether this result may be written to the obligation cache at all.
     pub fn is_cacheable(&self) -> bool {
         self.holds()
     }
 
-    /// Whether this result is a claim about **every** plan rather than about the one that produced
-    /// it.
     pub fn is_plan_independent(&self) -> bool {
         self.tier() == Some(Tier::Proved)
     }
 }
 
-/// What a definition leaves alone, from the footprint the effect system already inferred and
-/// already checked as an upper bound.
+/// What a definition leaves alone, from its checked footprint.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "snake_case", tag = "frame")]
 pub enum Frame {
-    /// The footprint is empty, so the result is a function of the arguments and the `ensures` is a
-    /// total specification of the definition.
+    /// The `ensures` is a total specification: the result depends only on the arguments.
     Pure,
-    /// Every resource outside this set is unchanged.
     Writes(BTreeSet<(Symbol, Resource)>),
 }
 
@@ -281,14 +240,10 @@ pub fn frame_of(footprint: &Footprint) -> Frame {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ObligationKind {
-    /// A postcondition.
-    Ensures {
-        index: usize,
-    },
+    Ensures { index: usize },
     Law,
 }
 
-/// One claim to discharge.
 #[derive(Clone, Debug)]
 pub struct Obligation {
     /// `spec_hash` for a clause, the law's own `DefHash` for a law.
@@ -298,11 +253,10 @@ pub struct Obligation {
     pub kind: ObligationKind,
     pub span: Span,
     pub frame: Frame,
-    /// The owner's parameters **then** `result` for a clause; the `forall` binders for a law.
+    /// The owner's parameters then `result` for a clause; the `forall` binders for a law.
     pub binders: Vec<LawBinder>,
-    /// Whether a `requires` or a `where` narrows the domain.
     pub guarded: bool,
-    /// `law/host`: the body reaches the world, and the law says so in its own declaration.
+    /// `law/host`: the body reaches the world.
     pub host: bool,
     /// `{}`, or `{sim.read}` for a concurrency law, or any row at all for a `law/host`.
     pub footprint: Footprint,
@@ -314,7 +268,6 @@ impl Obligation {
         matches!(self.kind, ObligationKind::Law) && !self.host && !self.footprint.is_empty()
     }
 
-    /// The binders a run **draws values for**.
     pub fn generated(&self) -> &[LawBinder] {
         match self.kind {
             ObligationKind::Ensures { .. } => &self.binders[..self.binders.len().saturating_sub(1)],
@@ -322,8 +275,7 @@ impl Obligation {
         }
     }
 
-    /// The binder standing for the return value, for the same obligations [`Obligation::generated`]
-    /// withholds it from.
+    /// The return-value binder that [`Obligation::generated`] withholds.
     pub fn result_binder(&self) -> Option<&LawBinder> {
         match self.kind {
             ObligationKind::Ensures { .. } => self.binders.last(),
@@ -332,13 +284,12 @@ impl Obligation {
     }
 }
 
-/// The review surface, reported ahead of the results and never behind a flag.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Coverage {
     pub definitions: usize,
-    /// Carries an `ensures` that holds, or is named **directly** by a law that holds.
+    /// Carries an `ensures` that holds, or is named directly by a law that holds.
     pub covered: usize,
-    /// Program-wide names, sorted, so two runs produce one artifact.
+    /// Sorted, so two runs produce one artifact.
     pub uncovered: Vec<Symbol>,
     pub by_tier: BTreeMap<Tier, usize>,
 }
@@ -349,19 +300,15 @@ impl Coverage {
     }
 }
 
-/// The search an obligation was discharged against.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ProvePlan {
-    /// Candidate binder tuples drawn per root.
+    /// Per root.
     pub cases: u32,
-    /// Ascending and deduplicated by [`ProvePlan::normalized`].
     pub roots: Vec<u64>,
-    /// Static inference steps per obligation.
+    /// Per obligation.
     pub prove_budget: u32,
-    /// Candidate **evaluations**, never seconds: an artifact that varies with machine load cannot
-    /// be diffed against yesterday's.
+    /// Candidate evaluations, not seconds, so the artifact does not vary with machine load.
     pub shrink_budget: u32,
-    /// The interleaving search a concurrency law is discharged against.
     pub sim: Plan,
 }
 
@@ -378,7 +325,7 @@ impl Default for ProvePlan {
 }
 
 impl ProvePlan {
-    /// Ascending, deduplicated roots, so that two spellings of one plan are one cache key.
+    /// So that two spellings of one plan are one cache key.
     pub fn normalized(mut self) -> ProvePlan {
         self.roots.sort_unstable();
         self.roots.dedup();
@@ -401,13 +348,11 @@ impl ProvePlan {
     }
 }
 
-/// What `ply prove` produces.
 #[derive(Clone, Debug)]
 pub struct ProveReport {
     pub obligations: Vec<(Obligation, Discharge)>,
     pub coverage: Coverage,
     pub plan: ProvePlan,
-    /// Answered from the cache without being attempted.
     pub cached: usize,
     pub duration: Duration,
 }
@@ -441,13 +386,11 @@ impl ProveReport {
             .count()
     }
 
-    /// Exit `1` on anything the spec got wrong.
     pub fn failed(&self) -> bool {
         self.refuted() > 0 || self.vacuous() > 0
     }
 }
 
-/// Whether an exhaustive interleaving search may be reported as a **proof**.
 pub fn interleaving_proves(
     plan: &Plan,
     exploration: &ply_eval::Exploration,

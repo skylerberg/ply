@@ -12,8 +12,7 @@ use ply_ty::Mode;
 use ply_ty::{EffectAtom, Resource};
 use std::rc::Rc;
 
-/// The machine's own state has these same three shapes plus `Halt`, which no handler transition can
-/// produce.
+/// The machine's states minus `Halt`, which no handler transition produces.
 pub enum State {
     Eval { code: Code, module: usize },
     Return(Value),
@@ -29,20 +28,14 @@ pub struct Request {
     pub span: Span,
 }
 
-/// Inference rules every failure below out, so reaching one means the evaluator was handed a module
-/// that was never checked; naming the mistake beats guessing at it.
+/// Inference rules out every failure here; reaching one means the module was never checked.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OpDecl {
-    Declared {
-        resource_param: bool,
-        mode: Mode,
-    },
+    Declared { resource_param: bool, mode: Mode },
     NoSuchOp,
-    /// Nothing in view declares this effect.
     UnknownEffect,
 }
 
-/// The atom this `perform` contributes to the observed footprint.
 pub fn performed_atom(
     effect: &Symbol,
     resource: Option<&Symbol>,
@@ -63,12 +56,10 @@ pub struct Transition {
     pub state: State,
 }
 
-/// Who answered a `perform`.
 pub enum Answered {
     Handler(Transition),
     /// A `simulate` region's delimiter was reached first.
     Scheduler(Scheduled),
-    /// Nothing on the stack handles this.
     Unhandled(Request),
 }
 
@@ -95,9 +86,7 @@ impl Transition {
     }
 }
 
-/// `⟨Eval(handle b with H, ρ, m), K, W⟩ → ⟨Eval(b, m), K ◁ Prompt(H), W⟩`. The prompt already
-/// carries the clause captures the machine copied out of the current window; `window` is that
-/// window's size, which a capture at this prompt subtracts to find its snapshot's floor.
+/// `window` is the current window's size; a capture at this prompt subtracts it to find its floor.
 pub fn enter_handle(
     stack: &Stack,
     body: &Code,
@@ -108,7 +97,6 @@ pub fn enter_handle(
     Transition::eval(stack.push_prompt(prompt, window), body, module)
 }
 
-/// Drives a `perform`'s arguments left to right and then hands the machine the [`Request`].
 #[allow(clippy::too_many_arguments)]
 pub fn perform_args(
     stack: &Stack,
@@ -149,10 +137,7 @@ pub fn perform_args(
     }
 }
 
-/// Seals a capture's slot snapshot onto the continuation: everything from the floor of the
-/// activation that pushed the captured prompt up to the top. The extent above the prompt's push
-/// height is moved out of the stack; the portion below it — shared with the activation continuing
-/// under the capture — is cloned.
+/// Snapshots the slots from the capturing activation's floor to the top into `k`.
 pub(crate) fn seal(k: Continuation, windows: &mut Windows) -> Continuation {
     let t = windows.len();
     let entry = t - k.cut_deltas();
@@ -167,8 +152,6 @@ pub(crate) fn seal(k: Continuation, windows: &mut Windows) -> Continuation {
     )
 }
 
-/// Opens a clause's activation window on top of the slot stack and fills it: captures from the
-/// prompt, then the operation's arguments into the parameter slots.
 fn open_clause(windows: &mut Windows, clause: &Clause, captured: &[Value], args: Vec<Value>) {
     let base = windows.enter(clause.size);
     windows.base = base;
@@ -180,7 +163,6 @@ fn open_clause(windows: &mut Windows, clause: &Clause, captured: &[Value], args:
     }
 }
 
-/// `⟨Perform(e, op, r, v̄, σ), K, W⟩` — search, split, dispatch.
 pub fn perform(
     stack: &Stack,
     windows: &mut Windows,
@@ -211,8 +193,7 @@ pub fn perform(
         Target::Ply { prompt, clause } => (prompt, clause),
         Target::Sim(region) => {
             let (k, _region_stack) = stack.capture(found.segments, born);
-            // The scheduler holds this until it resumes the task, which may be after every region
-            // open here has closed.
+            // The scheduler may resume this after every region open here has closed.
             let k = seal(k, windows).pinned(pin());
             return Ok(Answered::Scheduler(Scheduled {
                 region,
@@ -241,9 +222,7 @@ pub fn perform(
 
     let stack = match &clause.resume {
         Some(_) => {
-            // A named continuation may be stored, returned or resumed after the regions open here
-            // have closed, so it claims them — and it snapshots the windows it was captured over,
-            // because the machine's own slots keep moving under whoever holds it.
+            // A named continuation can outlive both the regions open here and the slots under it.
             let k = seal(k, windows).pinned(pin());
             debug_assert_eq!(windows.len(), entry);
             let below = below.pushed(Frame::Exit {
@@ -254,12 +233,8 @@ pub fn perform(
             windows.write(clause.params.len() as u32, Value::Continuation(Rc::new(k)));
             below
         }
-        // A tail-resumptive clause takes no pin, and no snapshot either. Both are claims about
-        // the stack rather than savings: the only thing that will ever splice this continuation
-        // is the `Resume` frame pushed here, and nothing runs between this capture and that
-        // splice except the clause's own activation, above the extent — so the extent's windows
-        // stay exactly where they are. This is what keeps a plain perform free of slot traffic,
-        // which is the hot path of every effect operation.
+        // Tail-resumptive: only the `Resume` frame pushed here splices `k`, and until then only the
+        // clause's activation runs, above the extent, so neither a pin nor a snapshot is needed.
         None => {
             let k = k.with_extent(Extent::InPlace, (t - windows.base) as u32);
             let below = below
@@ -294,7 +269,6 @@ pub fn continuation_argument(mut args: Vec<Value>, span: Span) -> Result<Value, 
     Ok(value)
 }
 
-/// `⟨Eval(with_cell[r](i){x→b}, ρ, m), K, W⟩ → ⟨Eval(i, m), K·WithCellBody, W⟩`.
 #[allow(clippy::too_many_arguments)]
 pub fn enter_with_cell(
     stack: &Stack,
@@ -317,7 +291,6 @@ pub fn enter_with_cell(
     Transition::eval(stack, init, module)
 }
 
-/// `Frame::WithCellBody`.
 #[allow(clippy::too_many_arguments)]
 pub fn open_cell(
     cells: &mut TaskRegions,
@@ -346,7 +319,6 @@ pub fn open_cell(
     Ok(Transition::eval(stack, body, module))
 }
 
-/// `⟨Eval(with_region[r]{b}, ρ, m), K, W⟩` — the region with no cell in it.
 pub fn enter_with_region(
     cells: &mut TaskRegions,
     stack: &Stack,
@@ -365,7 +337,6 @@ pub fn enter_with_region(
     Transition::eval(stack, body, module)
 }
 
-/// The declaration-level checks a `perform` makes before it looks at the stack.
 pub fn check_operation(
     decl: OpDecl,
     effect: &Symbol,
@@ -403,8 +374,7 @@ pub(crate) fn err_cells_exhausted(span: Span) -> Diagnostic {
     .note("hoist the region out of the loop, or reuse one cell across the iterations")
 }
 
-/// `E0303`, and deliberately not `E0424`: this one means inference should have prevented the
-/// perform and did not, so it is a bug-catcher.
+/// Deliberately not `E0424`: inference should have prevented this perform, so it is a bug-catcher.
 #[cold]
 #[inline(never)]
 pub fn err_unhandled(

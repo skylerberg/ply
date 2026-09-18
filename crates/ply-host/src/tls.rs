@@ -1,4 +1,4 @@
-//! TLS: the one place W3 grows the trusted computing base.
+//! TLS credentials and sessions, terminated through rustls.
 
 use ply_span::{Diagnostic, Span, codes};
 use rustls::crypto::CryptoProvider;
@@ -14,26 +14,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-/// The Rust path `ply hosts` prints for `net.listen_tls`, and the function below that it names.
+/// The Rust path `ply hosts` prints for `net.listen_tls`; it must name [`listen`].
 pub const HANDLER: &str = "ply_host::tls::listen";
 
-/// What the `transport` block of `ply hosts --host` discloses.
 pub const LIBRARY: &str = "rustls";
 pub const VERSION: &str = "0.23.43";
 
 /// `ring`, not rustls's default `aws-lc-rs`, which needs a C toolchain and cmake on some platforms.
 pub const PROVIDER: &str = "ring";
 
-/// Exactly `http/1.1`, and the refusal of anything else is the point: every browser offers `h2`
-/// first, and a server that negotiates it and then speaks 1.1 produces a connection error the
-/// client reports as the server being broken.
+/// Exactly `http/1.1`: browsers offer `h2` first, and negotiating it then speaking 1.1 breaks them.
 pub const ALPN: [&str; 1] = ["http/1.1"];
 
-/// What [`with_safe_default_protocol_versions`] resolves to under the `tls12` feature, in the order
-/// rustls prefers them.
+/// What `with_safe_default_protocol_versions` resolves to under `tls12`, in rustls's order.
 pub const VERSIONS: [&str; 2] = ["TLS 1.3", "TLS 1.2"];
-
-// --- Credentials ------------------------------------------------------------
 
 /// One `--tls NAME=CERT,KEY` argument, parsed but not yet loaded.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -44,7 +38,6 @@ pub struct CredentialSpec {
 }
 
 impl CredentialSpec {
-    /// `NAME=CERT,KEY`.
     pub fn parse(text: &str) -> Result<CredentialSpec, String> {
         let (name, paths) = text
             .split_once('=')
@@ -70,8 +63,7 @@ fn malformed(text: &str, why: &str) -> String {
     format!("`{text}` is not a TLS credential: {why}; write `--tls NAME=CERT.pem,KEY.pem`")
 }
 
-/// One loaded credential: a server configuration nothing outside this module can take the key back
-/// out of.
+/// A loaded credential; nothing outside this module can take the key back out.
 pub struct Credential {
     config: Arc<ServerConfig>,
     /// SHA-256 of the leaf certificate's DER, as `ply hosts` prints it.
@@ -89,7 +81,6 @@ impl Credential {
     }
 }
 
-/// Every credential a run was configured with, by name.
 #[derive(Default)]
 pub struct Credentials {
     entries: BTreeMap<String, Credential>,
@@ -100,7 +91,6 @@ impl Credentials {
         Credentials::default()
     }
 
-    /// Load and validate every credential, or refuse the run.
     pub fn load(specs: &[CredentialSpec]) -> Result<Credentials, Vec<Diagnostic>> {
         let mut entries: BTreeMap<String, Credential> = BTreeMap::new();
         let mut diagnostics = Vec::new();
@@ -135,8 +125,7 @@ impl Credentials {
         self.entries.iter().map(|(name, c)| (name.as_str(), c))
     }
 
-    /// The configuration a listener is built with, or [`E0429`] naming the credentials that were
-    /// configured — because the fix is a `--tls` argument rather than an edit to the program.
+    /// The configuration a listener is built with, or `E0429` naming the configured credentials.
     pub fn resolve(&self, name: &str, span: Span) -> Result<Arc<ServerConfig>, Diagnostic> {
         match self.entries.get(name) {
             Some(credential) => Ok(Arc::clone(&credential.config)),
@@ -146,7 +135,7 @@ impl Credentials {
 }
 
 impl fmt::Debug for Credentials {
-    /// By name only.
+    /// By name only, so no key material is printed.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.names()).finish()
     }
@@ -161,8 +150,7 @@ fn load_one(spec: &CredentialSpec) -> Result<Credential, Diagnostic> {
     let versions = ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .map_err(|e| err_provider(spec, &e))?;
-    // The one check that needs both files: rustls refuses a key whose `SubjectPublicKeyInfo` does
-    // not match the leaf certificate's public key.
+    // rustls refuses a key that does not match the leaf certificate's public key.
     let mut config = versions
         .with_no_client_auth()
         .with_single_cert(chain, key)
@@ -216,9 +204,7 @@ fn fingerprint(leaf: &CertificateDer<'_>) -> String {
         .map(|suite| suite.common.hash_provider)
         .find(|hash| hash.algorithm() == HashAlgorithm::SHA256)
     else {
-        // Unreachable with `ring`, which ships TLS13_AES_128_GCM_SHA256, and still not a panic: a
-        // fingerprint is something a listing prints, and no run should end because one could not be
-        // computed.
+        // Unreachable with `ring`; not a panic, since no run should end over a listed fingerprint.
         return "sha256:unavailable".to_string();
     };
     let mut out = String::from("sha256:");
@@ -228,9 +214,6 @@ fn fingerprint(leaf: &CertificateDer<'_>) -> String {
     out
 }
 
-// --- The listener -----------------------------------------------------------
-
-/// `net.listen_tls`, and the function [`HANDLER`] names.
 pub fn listen(
     credentials: &Credentials,
     credential: &str,
@@ -242,11 +225,7 @@ pub fn listen(
     Ok((listener, config))
 }
 
-// --- The session ------------------------------------------------------------
-
-/// A `TcpStream` behind an `Arc`, so that `close` can shut the file descriptor down while a pool
-/// thread is parked in a read on it. rustls wants something that is `Read + Write` by value; this
-/// is that, without a second file descriptor and without `try_clone`.
+/// `Read + Write` by value over a shared stream, so `close` can shut it down under a parked read.
 struct Socket(Arc<TcpStream>);
 
 impl Read for Socket {
@@ -265,7 +244,6 @@ impl Write for Socket {
     }
 }
 
-/// One TLS-terminated connection.
 pub struct Session {
     socket: Arc<TcpStream>,
     session: Mutex<Option<StreamOwned<ServerConnection, Socket>>>,
@@ -273,7 +251,6 @@ pub struct Session {
 }
 
 impl Session {
-    /// Wraps an accepted connection.
     pub fn new(
         config: Arc<ServerConfig>,
         socket: Arc<TcpStream>,
@@ -300,13 +277,10 @@ impl Session {
         let _ = self.socket.set_write_timeout(Some(timeout));
     }
 
-    /// Up to `max` decrypted bytes, under `std.net`'s one rule: `None` is the deadline expiring and
-    /// `Some` is what the peer sent, empty when it has stopped sending — or when the handshake
-    /// failed, or when this connection never established a session at all.
+    /// Up to `max` decrypted bytes: `None` on deadline, empty once the peer or session is gone.
     pub fn read(&self, max: usize) -> Option<Vec<u8>> {
         let mut guard = lock(&self.session);
-        // A finished session is an ending and never a deadline: `None` here would tell a caller to
-        // wait for a connection that is already gone.
+        // An ending, never a deadline: `None` would have the caller wait on a dead connection.
         let Some(stream) = guard.as_mut() else {
             return Some(Vec::new());
         };
@@ -351,7 +325,6 @@ impl Session {
         }
     }
 
-    /// Shuts the connection down.
     pub fn close(&self) {
         if let Ok(mut guard) = self.session.try_lock() {
             if let Some(stream) = guard.as_mut() {
@@ -383,8 +356,6 @@ impl Session {
     }
 }
 
-// --- Counting what went wrong ----------------------------------------------
-
 const REASON_CONFIGURATION: &str = "the listener's TLS configuration would not start a session";
 pub const REASON_NOT_TLS: &str = "the peer did not speak TLS, or a record was corrupt";
 pub const REASON_VERSION: &str =
@@ -407,7 +378,7 @@ fn expired(error: &io::Error) -> bool {
     )
 }
 
-/// Why a handshake was refused, as one of a **fixed** set of strings.
+/// Why a handshake was refused, as one of a fixed set of strings.
 pub fn reason(handshaking: bool, error: &io::Error) -> &'static str {
     if !handshaking {
         return REASON_TRANSPORT;
@@ -449,7 +420,6 @@ pub fn reason(handshaking: bool, error: &io::Error) -> &'static str {
     }
 }
 
-/// What the run's `--host` summary reports about TLS.
 #[derive(Default)]
 pub struct Handshakes {
     counts: Mutex<Counts>,
@@ -470,8 +440,7 @@ impl Handshakes {
         *lock(&self.counts).refused.entry(reason).or_default() += 1;
     }
 
-    /// A snapshot: completed, refused, and the reasons ascending by count and then by text, so two
-    /// runs over one failure print one order.
+    /// Reasons sort by descending count, then text, so one failure always prints one order.
     pub fn snapshot(&self) -> HandshakeCounts {
         let counts = lock(&self.counts);
         let mut reasons: Vec<(&'static str, u64)> =
@@ -498,15 +467,11 @@ impl HandshakeCounts {
     }
 }
 
-/// See `tcp::lock`: the state behind these is a map and an option, neither of which has an
-/// invariant a panicking caller can break.
+/// The guarded state has no invariant a panicking caller can break.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-// --- Diagnostics ------------------------------------------------------------
-
-/// `E0429`, shared by the socket handler and the simulated twin.
 #[cold]
 pub fn unknown_credential<'a>(
     name: &str,

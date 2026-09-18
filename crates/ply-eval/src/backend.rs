@@ -1,4 +1,4 @@
-//! A backend a shipping command can attach, and eight ways of being wrong.
+//! Backends a shipping command can attach, and mutations that make one wrong on purpose.
 
 use crate::compiled::Compiled;
 use crate::value::Value;
@@ -8,7 +8,6 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// What one run's backend was asked, summed over every worker.
 #[derive(Default)]
 pub struct Counters {
     offered: AtomicU64,
@@ -24,7 +23,6 @@ pub struct Counters {
 }
 
 impl Counters {
-    /// One offer, counted, and whether it carried a `Bytes` or a `String` in.
     pub fn note_offer(&self, args: &[Value]) {
         self.offered.fetch_add(1, Ordering::Relaxed);
         if args.iter().any(|a| matches!(a, Value::Bytes(_))) {
@@ -45,12 +43,10 @@ impl Counters {
         self.str_out.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// An offer naming the one definition a targeted mutation corrupts.
     pub fn note_offered_target(&self) {
         self.offered_target.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// An answer a mutation actually changed.
     pub fn note_fired(&self) {
         self.fired.fetch_add(1, Ordering::Relaxed);
     }
@@ -70,23 +66,18 @@ impl Counters {
         }
     }
 
-    /// The seam's census (ADR 0035 Decision 6): the objects one entry built from its arguments
-    /// and the objects it read back out of its answer.
     pub fn note_converted(&self, inward: u64, outward: u64) {
         self.converted_in.fetch_add(inward, Ordering::Relaxed);
         self.converted_out.fetch_add(outward, Ordering::Relaxed);
     }
 
-    /// One answer that carried a container out.
     pub fn note_container_out(&self) {
         self.containers_out.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-/// What a run's backend was asked and what it did with it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Offers {
-    /// Calls the machine offered this backend, over every worker.
     pub offered: u64,
     /// Offers naming the one definition a targeted mutation corrupts.
     pub offered_target: u64,
@@ -94,37 +85,27 @@ pub struct Offers {
     pub fired: u64,
     /// Offers carrying at least one [`Value::Bytes`] argument.
     pub bytes_in: u64,
-    /// Entered calls that answered a [`Value::Bytes`], counted before any mutation touches the
-    /// answer.
+    /// Entered calls that answered a [`Value::Bytes`], before any mutation.
     pub bytes_out: u64,
     /// Offers carrying at least one [`Value::Str`] argument.
     pub str_in: u64,
-    /// Entered calls that answered a [`Value::Str`], counted before any mutation touches the
-    /// answer.
+    /// Entered calls that answered a [`Value::Str`], before any mutation.
     pub str_out: u64,
-    /// Entered calls that answered a `List`, `Map`, `Record` or `Ctor`, counted before any mutation
-    /// touches the answer.
+    /// Entered calls that answered a `List`, `Map`, `Record` or `Ctor`, before any mutation.
     pub containers_out: u64,
-    /// Objects the entries built from their arguments — every value converted at the root that
-    /// was not an immediate — and objects read back out of their answers: the seam's census,
-    /// so a run whose conversion dominates is visible rather than inferred.
+    /// Non-immediate objects built from entry arguments; `converted_out` counts those read back.
     pub converted_in: u64,
     pub converted_out: u64,
 }
 
-/// A run's source of backends: one per run, shared by every worker, and the only route a shipping
-/// command has to install one.
+/// One per run, shared by every worker; the only way a shipping command installs a backend.
 pub trait Provider: Send + Sync {
-    /// This provider's backend for one worker, corrupted as `spec` asks.
     fn attach(&'static self, spec: &Spec) -> Rc<dyn Compiled>;
 
     /// What `--backend` calls this, for a report a user reads.
     fn name(&self) -> &'static str;
 
-    /// What decides this provider's answers beyond its name: anything that would make a result it
-    /// earned untrue of another run under the same name. Empty when the name is the whole
-    /// identity. A cached result is namespaced by it, so a knob that changes which definitions run
-    /// natively belongs here.
+    /// Identity beyond `name` that cached results are namespaced by; empty when the name suffices.
     fn variant(&self) -> String {
         String::new()
     }
@@ -136,7 +117,6 @@ pub trait Provider: Send + Sync {
         self.len() == 0
     }
 
-    /// What every worker's backend was asked, summed.
     fn offers(&self) -> Offers;
 
     /// What this provider spent compiling, or `None` for one that compiles nothing.
@@ -150,34 +130,28 @@ pub trait Provider: Send + Sync {
     }
 }
 
-/// What a run spent turning a program into compiled code.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Compilation {
-    /// Nanoseconds deciding *what* to compile.
     pub analysis_nanos: u64,
     /// Nanoseconds inside the code generator, summed over every backend built.
     pub codegen_nanos: u64,
-    /// Backends built.
     pub units: u64,
 }
 
-/// A backend the eight corruptions can wrap.
+/// A backend a [`Mutant`] can wrap.
 pub trait Policed: Compiled {
-    /// The run's counters, which every backend over one provider shares.
     fn counters(&self) -> &'static Counters;
 
-    /// Whether this backend has a body for `name` at all.
     fn holds(&self, name: &Symbol) -> bool;
 
-    /// The honest answer for a call, **without** counting an offer.
+    /// The honest answer for a call, without counting an offer.
     fn answer(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value>;
 
-    /// The body on an arbitrary bound, whatever the machine allowed.
+    /// Runs the body with `fuel`, ignoring the machine's budget.
     fn run_with_fuel(&self, name: &Symbol, args: &[Value], fuel: usize) -> Option<Value>;
 }
 
-/// One worker's backend, corrupted as `spec` asks — the one place a [`Mutant`] is built, so that no
-/// provider can install a wrapper the others do not.
+/// The one place a [`Mutant`] is built, so every provider installs the same wrapper.
 pub fn wrap(inner: Rc<dyn Policed>, spec: &Spec) -> Rc<dyn Compiled> {
     match (&spec.mutation, &spec.target) {
         (Mutation::None, None) => inner,
@@ -190,31 +164,18 @@ pub fn wrap(inner: Rc<dyn Policed>, spec: &Spec) -> Rc<dyn Compiled> {
     }
 }
 
-/// One way of being wrong.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Mutation {
-    /// The honest answer, so a harness can check that the wrapper itself changes nothing.
+    /// Honest, so a harness can check the wrapper itself changes nothing.
     #[default]
     None,
-    /// `Int(n)` becomes `Int(n + 1)`: the arithmetic is off by one.
     OffByOne,
-    /// `Bool(b)` becomes `Bool(!b)`: the comparison is inverted.
     Inverted,
-    /// This call answers what the *previous* entered call answered.
     Stale,
-    /// The same information in the wrong kind — `Bool` where the definition returns `Int`, `Int`
-    /// where it returns `Bool`, and the length where it returns `Bytes`.
     WrongType,
-    /// Answers for a name this backend has no body for, instead of declining.
     Unoffered,
-    /// Runs the body with more fuel than the machine allowed instead of declining.
     ExceedsBudget(Option<u32>),
-    /// Answers this value for the target name whatever the machine asked, and whether or not a body
-    /// exists.
     Answers(i64),
-    /// A handle into this run's world, inside an otherwise honest container answer: the first field
-    /// of a `Record`, the first argument of a `Ctor`, or the head of a `List` is replaced by a
-    /// `Value::Cell`.
     Handle,
 }
 
@@ -245,11 +206,9 @@ impl Mutation {
     }
 }
 
-/// Which of the backends a command can install.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Kind {
-    /// `ply_codegen::c`: the program emitted as C and handed to `cc` — under tier-only, the one
-    /// evaluator.
+    /// `ply_codegen::c`: the program emitted as C and compiled by `cc`.
     #[default]
     C,
 }
@@ -262,10 +221,8 @@ impl Kind {
     }
 }
 
-/// Which backend a command was asked for, and which definition it corrupts.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Spec {
-    /// Which backend answers.
     pub kind: Kind,
     pub mutation: Mutation,
     /// The one definition to corrupt, or every one of them.
@@ -287,7 +244,6 @@ impl Spec {
 
 /// Parses a `--backend` argument.
 pub fn parse(spec: &str) -> Result<Spec, String> {
-    // A bare backend name, honest.
     if spec == "c" {
         return Ok(Spec::honest());
     }
@@ -346,7 +302,6 @@ pub fn parse(spec: &str) -> Result<Spec, String> {
     })
 }
 
-/// A backend that is wrong on purpose, wrapped around one that is not.
 pub struct Mutant {
     inner: Rc<dyn Policed>,
     mutation: Mutation,
@@ -361,8 +316,7 @@ impl Mutant {
     }
 }
 
-/// `value` with a world handle in its first position, or `None` if it has no position to put one
-/// in.
+/// `value` with a world handle in its first position, if it has one.
 fn forge_handle(value: &Value) -> Option<Value> {
     let handle = Value::Cell(crate::arena::Slot::new(0, 0));
     match value {
@@ -434,8 +388,7 @@ impl Compiled for Mutant {
         self.inner.tier_only()
     }
 
-    /// A corruption is a wrong answer at the seam, and a test entered whole hands the seam
-    /// nothing to corrupt: a mutant leaves every test to the machine, where each call crosses.
+    /// A test entered whole gives the seam nothing to corrupt, so tests stay on the machine.
     fn enter_test(&self, _name: &Symbol, _budget: usize) -> crate::compiled::Entered {
         crate::compiled::Entered::Declined
     }
@@ -469,8 +422,6 @@ impl Compiled for Mutant {
             (Mutation::Inverted, Some(Value::Bool(b))) => self.fire(Value::Bool(!b)),
             (Mutation::WrongType, Some(Value::Int(n))) => self.fire(Value::Bool(n != 0)),
             (Mutation::WrongType, Some(Value::Bool(b))) => self.fire(Value::Int(i64::from(b))),
-            // The other leaf kinds the seam carries, and the arms that keep this mutation's claim
-            // true of them.
             (Mutation::WrongType, Some(Value::Bytes(ref b))) => {
                 self.fire(Value::Int(b.len() as i64))
             }
@@ -485,13 +436,11 @@ impl Compiled for Mutant {
                 let stale = self.previous.borrow_mut().replace(value.clone());
                 match stale {
                     Some(stale) if stale.render() != value.render() => self.fire(stale),
-                    // The first entry, or a repeat of the last answer: nothing to be stale about,
-                    // so this call is honest and is not counted.
+                    // First entry, or a repeat of the last answer: honest, not counted.
                     _ => Some(value),
                 }
             }
-            // A body that fits its budget answers the same either way; the mutation is only visible
-            // where the honest backend declined.
+            // A body within budget answers the same, so only a declined call shows this.
             (Mutation::ExceedsBudget(times), None) if self.inner.holds(name) => {
                 let fuel = match times {
                     None => usize::MAX,

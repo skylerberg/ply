@@ -11,7 +11,6 @@ use ply_span::{Diagnostic, Span, codes};
 /// The task a `simulate` region's own body runs as.
 pub const ROOT: TaskId = TaskId(0);
 
-/// What the machine must do to give a task its step.
 pub enum Resumption<K, B> {
     Enter,
     Start { body: B, span: Span },
@@ -23,11 +22,9 @@ pub enum Turn<K, B> {
         task: TaskId,
         resumption: Resumption<K, B>,
     },
-    /// Every task has finished, so the region delivers its body's value.
     Complete(Value),
 }
 
-/// Which of the two schedulers a region is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Policy {
     Seeded,
@@ -43,8 +40,7 @@ impl Policy {
     }
 }
 
-/// Permission to build a [`Policy::Host`] scheduler, and the first of the locks that make real
-/// threads unreachable from a hermetic run.
+/// Permission to build a [`Policy::Host`] scheduler; unobtainable in a hermetic run.
 pub struct HostPolicy(());
 
 impl HostPolicy {
@@ -54,20 +50,16 @@ impl HostPolicy {
     }
 }
 
-/// Why a task cannot run.
 enum Wait {
     Join {
         task: TaskId,
         span: Span,
     },
-    /// The timer itself is the [`Clock`]'s; this is the task's side of it, and `until` is carried
-    /// so a diagnostic can say what the task is waiting for without asking the clock about a timer
-    /// it has already fired.
+    /// The [`Clock`] owns the timer; `until` is kept so a diagnostic can name it after it fires.
     Timer {
         until: i64,
         span: Span,
     },
-    /// A host operation answered [`HostAnswer::Pending`].
     Host {
         pending: Pending,
         span: Span,
@@ -75,31 +67,22 @@ enum Wait {
 }
 
 enum TaskState<K, B> {
-    /// Enabled: suspended at a scheduling point with the control that continues it already decided.
     Ready(Resumption<K, B>),
-    /// The machine is executing this task's step right now.
     Running,
-    Blocked {
-        wait: Wait,
-        k: K,
-    },
+    Blocked { wait: Wait, k: K },
     Done(Value),
-    /// Raised a diagnostic.
     Failed,
 }
 
 struct Task<K, B> {
     state: TaskState<K, B>,
-    /// The `spawn` that created it, or the region for [`ROOT`].
     origin: Span,
     /// This task's claim on the regions that were open at its `spawn`.
     #[allow(dead_code)]
     pin: Option<Pin>,
 }
 
-/// One step of one task, as the search reads it back.
 pub struct StepRecord {
-    /// Which of the entry point's regions took this step.
     pub region: SimId,
     pub task: TaskId,
     /// Ascending by id.
@@ -109,15 +92,13 @@ pub struct StepRecord {
     pub at: i64,
     /// What the step touched, excluding the scheduler's own bookkeeping.
     pub accesses: StepFootprint,
-    /// The acting task's vector clock as of this step.
     pub stamp: Stamp,
 }
 
 /// A task's vector clock, indexed by [`TaskId`], as of one step.
 pub type Stamp = Vec<u32>;
 
-/// `earlier` happens before `later`: `later`'s task had already observed that step, transitively
-/// through spawns and joins, when it ran.
+/// `later`'s task had observed `earlier`'s step, transitively through spawns and joins.
 pub fn happens_before(earlier: &Stamp, earlier_task: TaskId, later: &Stamp) -> bool {
     if earlier.is_empty() || later.is_empty() {
         return false;
@@ -128,7 +109,6 @@ pub fn happens_before(earlier: &Stamp, earlier_task: TaskId, later: &Stamp) -> b
     mine > 0 && theirs >= mine
 }
 
-/// Whether an access is the scheduler's own bookkeeping rather than the program's state.
 pub fn is_scheduler_bookkeeping(access: &Access) -> bool {
     match access {
         Access::Atom(atom) => matches!(atom.effect.as_str(), "task" | "clock"),
@@ -136,37 +116,27 @@ pub fn is_scheduler_bookkeeping(access: &Access) -> bool {
     }
 }
 
-/// The set of runnable tasks of one region, and the enabledness that decides which of them may be
-/// picked.
 pub struct Scheduler<K, B> {
-    /// Which of the entry point's regions this is.
     region: SimId,
     /// Indexed by [`TaskId`].
     tasks: Vec<Task<K, B>>,
-    /// One vector clock per task, indexed by [`TaskId`] alongside `tasks`.
+    /// One vector clock per task, parallel to `tasks`.
     clocks: Vec<Stamp>,
     max_steps: u32,
-    /// Steps handed out, which only [`Policy::Host`] counts: a seeded region's budget is spent
-    /// against the [`Trail`]'s scheduling points, and one entry point's regions share that count.
+    /// Counted only under [`Policy::Host`]; a seeded region spends the [`Trail`]'s points instead.
     steps: u32,
     policy: Policy,
-    /// Where [`Policy::Host`]'s round-robin scan starts.
     resume_from: usize,
     current: Option<TaskId>,
-    /// The region, for a diagnostic that is about the region rather than about any one task.
     span: Span,
-    /// Set once a task fails.
     failure: Option<Diagnostic>,
 }
 
 impl<K: Clone, B> Scheduler<K, B> {
-    /// The seeded scheduler.
     pub fn new(region: SimId, span: Span) -> Scheduler<K, B> {
         Scheduler::rooted(region, span, Policy::Seeded, DEFAULT_STEPS)
     }
 
-    /// The production scheduler: this same state machine, choosing by real readiness instead of by
-    /// a seed.
     pub fn production(region: SimId, span: Span, _permit: HostPolicy) -> Scheduler<K, B> {
         Scheduler::rooted(region, span, Policy::Host, u32::MAX)
     }
@@ -177,8 +147,7 @@ impl<K: Clone, B> Scheduler<K, B> {
             tasks: vec![Task {
                 state: TaskState::Ready(Resumption::Enter),
                 origin: span,
-                // The root task is the region's own control; it holds no claim of its own, because
-                // the region it runs in outlives it.
+                // The region outlives its root task, so the root needs no claim.
                 pin: None,
             }],
             clocks: vec![vec![0]],
@@ -192,7 +161,6 @@ impl<K: Clone, B> Scheduler<K, B> {
         }
     }
 
-    /// Opens the region with its root task already **running**.
     pub fn rooted_running(mut self) -> Result<Scheduler<K, B>, Diagnostic> {
         if self.steps > 0 || self.current.is_some() || self.tasks.len() > 1 {
             return Err(self.internal("a region's root was re-rooted after it had begun"));
@@ -203,7 +171,6 @@ impl<K: Clone, B> Scheduler<K, B> {
         Ok(self)
     }
 
-    /// Scheduling steps this interleaving may take before it is [`codes::DEADLOCK`].
     pub fn with_step_budget(mut self, steps: u32) -> Scheduler<K, B> {
         self.max_steps = steps.max(1);
         self
@@ -213,12 +180,10 @@ impl<K: Clone, B> Scheduler<K, B> {
         self.policy
     }
 
-    /// Whether this region contributes to the [`Trail`] the search reads.
     pub fn records_steps(&self) -> bool {
         self.policy == Policy::Seeded
     }
 
-    /// Whether this region's delimiter answers `effect.op`.
     pub fn answers(&self, effect: &str, op: &str) -> bool {
         match self.policy {
             Policy::Seeded => crate::sim::is_scheduled(effect, op),
@@ -226,7 +191,6 @@ impl<K: Clone, B> Scheduler<K, B> {
         }
     }
 
-    /// The task whose step is in progress, if any.
     pub fn current(&self) -> Option<TaskId> {
         self.current
     }
@@ -249,7 +213,6 @@ impl<K: Clone, B> Scheduler<K, B> {
             .collect()
     }
 
-    /// Which task runs next, or that the region is over.
     pub fn next(&mut self, clock: &mut Clock, trail: &mut Trail) -> Result<Turn<K, B>, Diagnostic> {
         self.require(Policy::Seeded)?;
         if let Some(failure) = &self.failure {
@@ -313,7 +276,6 @@ impl<K: Clone, B> Scheduler<K, B> {
         Ok(Turn::Run { task, resumption })
     }
 
-    /// Which task runs next under [`Policy::Host`], waiting on `rt` when none can.
     pub fn next_host(&mut self, rt: &dyn HostRuntime) -> Result<Turn<K, B>, Diagnostic> {
         self.require(Policy::Host)?;
         if let Some(failure) = &self.failure {
@@ -325,8 +287,7 @@ impl<K: Clone, B> Scheduler<K, B> {
             )));
         }
 
-        // Once per scheduling decision, and this is the only place the machine gives control back
-        // while a request is still running.
+        // Once per decision: the only point control returns to the machine mid-request.
         if let Some(expired) = rt.drain_expired() {
             return Err(expired);
         }
@@ -350,9 +311,7 @@ impl<K: Clone, B> Scheduler<K, B> {
                     _ => Err(self.internal("the region finished without its body returning")),
                 };
             }
-            // A stop turns "nothing can make progress" from a verdict into a wait: the listening
-            // sockets are being closed under the run, so an `accept` that was the only outstanding
-            // token has already resolved and the tasks below it are about to become ready.
+            // Under a stop, closing listeners is about to resolve pending `accept`s, so wait.
             if !self.waiting_on_host() && !rt.stopping() {
                 return Err(self.err_host_deadlock());
             }
@@ -360,9 +319,7 @@ impl<K: Clone, B> Scheduler<K, B> {
             if let Some(expired) = rt.drain_expired() {
                 return Err(expired);
             }
-            // A park that woke on a stop resolved no token and is not fruitless: it is `park` doing
-            // the one thing that lets an idle service observe a signal at all, and counting it
-            // would report the runtime as broken for working.
+            // A park woken by a stop is how an idle service sees a signal, so it is not fruitless.
             if !rt.stopping() {
                 fruitless += 1;
                 if fruitless > FRUITLESS_PARKS {
@@ -371,8 +328,7 @@ impl<K: Clone, B> Scheduler<K, B> {
             }
         };
 
-        // `u32::MAX` is the absence of a budget rather than a very large one, so a server that
-        // legitimately schedules four billion times is not told it spent a limit nobody set.
+        // `u32::MAX` means no budget, not a very large one.
         if self.max_steps != u32::MAX && self.steps >= self.max_steps {
             return Err(self.err_host_step_budget());
         }
@@ -391,7 +347,6 @@ impl<K: Clone, B> Scheduler<K, B> {
         Ok(Turn::Run { task, resumption })
     }
 
-    /// Blocks the current task on a host token.
     pub fn park_on_host(&mut self, k: K, pending: Pending, span: Span) -> Result<(), Diagnostic> {
         if self.policy != Policy::Host {
             return Err(err_host_in_simulation(span, &pending, self.span));
@@ -415,9 +370,7 @@ impl<K: Clone, B> Scheduler<K, B> {
             } = &task.state
                 && let Some(value) = rt.poll(pending)?
             {
-                // The third route a host answer takes back into the program, and the one the
-                // machine's own two checks cannot see: the task parked, so nothing on this path
-                // knows which registration minted the token.
+                // A parked task's answer bypasses the machine's escape checks, so check it here.
                 crate::escape::check(
                     &crate::escape::Boundary::HostToken {
                         label: pending.label,
@@ -447,9 +400,6 @@ impl<K: Clone, B> Scheduler<K, B> {
         Ok(woke)
     }
 
-    /// The next enabled task after the one that ran last, wrapping, and without building the set:
-    /// `next_host` asks once per step of a run that may serve a great many connections, and the set
-    /// it would build is one it does not record.
     fn first_ready(&self) -> Option<TaskId> {
         let n = self.tasks.len();
         let start = self.resume_from % n.max(1);
@@ -471,9 +421,7 @@ impl<K: Clone, B> Scheduler<K, B> {
         })
     }
 
-    /// Creates a task and leaves the current one running, because the handle has to reach the
-    /// program before its step can end: the caller builds a value from this id and passes it to
-    /// [`Scheduler::suspend`].
+    /// Leaves the current task running: the caller must hand the id to [`Scheduler::suspend`].
     pub fn spawn(&mut self, body: B, span: Span, pin: Option<Pin>) -> TaskId {
         let id = TaskId(self.tasks.len() as u32);
         self.tasks.push(Task {
@@ -497,7 +445,6 @@ impl<K: Clone, B> Scheduler<K, B> {
         self.clocks[task][task] += 1;
     }
 
-    /// `into` observes everything `from` had observed.
     fn absorb(&mut self, into: usize, from: usize) {
         if self.policy != Policy::Seeded {
             return;
@@ -512,8 +459,6 @@ impl<K: Clone, B> Scheduler<K, B> {
         }
     }
 
-    /// Ends the current task's step; it stays enabled and is resumed with `value` whenever the
-    /// scheduler picks it again.
     pub fn suspend(&mut self, k: K, value: Value) -> Result<(), Diagnostic> {
         let at = self.running()?;
         self.tasks[at].state = TaskState::Ready(Resumption::Resume { k, value });
@@ -521,8 +466,6 @@ impl<K: Clone, B> Scheduler<K, B> {
         Ok(())
     }
 
-    /// Blocks the current task until `target` finishes, or resumes it immediately with `target`'s
-    /// value if it already has.
     pub fn join(&mut self, k: K, target: TaskId, span: Span) -> Result<(), Diagnostic> {
         let at = self.running()?;
         let Some(task) = self.tasks.get(target.0 as usize) else {
@@ -546,8 +489,7 @@ impl<K: Clone, B> Scheduler<K, B> {
         Ok(())
     }
 
-    /// Blocks the current task until virtual time reaches `deadline`, which the region's [`Clock`]
-    /// has already registered a timer for.
+    /// Blocks until virtual time reaches `deadline`; the [`Clock`] already holds the timer.
     pub fn sleep_until(&mut self, k: K, deadline: i64, span: Span) -> Result<(), Diagnostic> {
         if self.policy != Policy::Seeded {
             return Err(Diagnostic::error(
@@ -570,7 +512,6 @@ impl<K: Clone, B> Scheduler<K, B> {
         Ok(())
     }
 
-    /// The current task's body returned.
     pub fn finish(&mut self, value: Value) -> Result<(), Diagnostic> {
         let at = self.running()?;
         let done = TaskId(at as u32);
@@ -590,7 +531,6 @@ impl<K: Clone, B> Scheduler<K, B> {
         Ok(())
     }
 
-    /// The current task raised `failure`.
     pub fn fail(&mut self, failure: Diagnostic, seed: &Seed) -> Diagnostic {
         let mut failure = failure;
         if let Some(task) = self.current {
@@ -600,8 +540,6 @@ impl<K: Clone, B> Scheduler<K, B> {
                 .filter(|t| !matches!(t.state, TaskState::Done(_) | TaskState::Running))
                 .count();
             if self.tasks.len() > 1 {
-                // A production region has no seed to replay, and a note offering one would be an
-                // instruction that does not work.
                 failure = failure.note(match self.policy {
                     Policy::Seeded => format!(
                         "failed in task {task} of a simulated region, with {live} other task(s) unfinished; replay with seed {seed}"
@@ -639,9 +577,7 @@ impl<K: Clone, B> Scheduler<K, B> {
             .collect()
     }
 
-    /// Makes the tasks a timer fired for enabled, in the order the clock reported them — ascending,
-    /// so that two tasks waking at one instant race in an order the seed decides rather than one
-    /// the host does.
+    /// Readies timer-fired tasks in ascending order, so the seed, not the host, orders ties.
     fn wake(&mut self, woken: &[TaskId]) -> Result<(), Diagnostic> {
         for id in woken {
             let at = id.0 as usize;
@@ -669,8 +605,7 @@ impl<K: Clone, B> Scheduler<K, B> {
         Ok(())
     }
 
-    /// The seed's path decides while it lasts and the `sched` stream decides after it, both counted
-    /// over the whole entry point rather than over this region.
+    /// The seed's path decides while it lasts, then the `sched` stream; both count per entry point.
     fn choose(&self, trail: &mut Trail, enabled: &[TaskId]) -> Result<usize, Diagnostic> {
         let point = trail.point();
         match trail.pinned() {
@@ -719,8 +654,7 @@ impl<K: Clone, B> Scheduler<K, B> {
                 Wait::Join { task, span } => {
                     (*span, format!("{id} waits here for {task} to finish"))
                 }
-                // Unreachable while the clock still has a timer, since time would have advanced
-                // instead.
+                // Unreachable while the clock has a timer: time would have advanced instead.
                 Wait::Timer { until, span } => (
                     *span,
                     format!("{id} sleeps here until {until}ns, and it is {now}ns"),
@@ -740,7 +674,6 @@ impl<K: Clone, B> Scheduler<K, B> {
             .note(format!("replay with seed {seed}"))
     }
 
-    /// The production form.
     fn err_host_deadlock(&self) -> Diagnostic {
         let mut diagnostic = Diagnostic::error(
             codes::DEADLOCK,
@@ -768,7 +701,6 @@ impl<K: Clone, B> Scheduler<K, B> {
             .note("break the wait cycle, or make the task being waited on finish")
     }
 
-    /// The host runtime answered [`HostRuntime::park`] repeatedly without any token resolving.
     fn err_park_made_no_progress(&self) -> Diagnostic {
         Diagnostic::error(
             codes::INTERNAL_ERROR,
@@ -807,7 +739,6 @@ impl<K: Clone, B> Scheduler<K, B> {
         self.blocked().count()
     }
 
-    /// The mutual exclusion, at the point a scheduler is driven.
     fn require(&self, wanted: Policy) -> Result<(), Diagnostic> {
         if self.policy == wanted {
             return Ok(());
@@ -859,7 +790,6 @@ impl<K: Clone, B> Scheduler<K, B> {
         .note(format!("the seed replayed was {seed}"))
     }
 
-    /// Reaching one of these means the machine drove the scheduler in an order the seam forbids.
     fn internal(&self, message: impl Into<String>) -> Diagnostic {
         Diagnostic::error(codes::INTERNAL_ERROR, message).primary(
             self.span,
@@ -879,12 +809,8 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     }
 }
 
-/// Returns from [`HostRuntime::park`] with nothing resolved that this scheduler tolerates before it
-/// calls the runtime broken.
 pub const FRUITLESS_PARKS: u32 = 1024;
 
-/// A host operation reached a `simulate` region — the footprint check's `E0425`, caught at the scheduler
-/// because that is where it would otherwise take effect.
 #[cold]
 #[inline(never)]
 fn err_host_in_simulation(span: Span, pending: &Pending, region: Span) -> Diagnostic {

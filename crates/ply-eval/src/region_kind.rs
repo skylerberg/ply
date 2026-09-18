@@ -1,4 +1,4 @@
-//! Which of the region-kind rule's two kinds each region in a program is.
+//! Infers each region's kind: `unique` unless a continuation capture is reachable from it.
 
 use crate::arena::RegionKind;
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -7,29 +7,33 @@ use ply_syntax::resolve::{Namespace, Resolved};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 
-/// Why a continuation capture is reachable.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Cause {
     /// A handler clause with a `resume` binder, which may resume any number of times.
-    Clause { effect: Symbol, op: Symbol },
-    /// A tail-resumptive clause, whose continuation reaches no binder and is spliced above the
-    /// region's close, so it is not on its own a reason to be `shared` — the tail-resumptive refinement.
-    TailClause { effect: Symbol, op: Symbol },
-    /// A `perform` no `handle` inside the region answers.
-    Escapes { effect: Symbol, op: Symbol },
-    /// `task.spawn`, `task.join` or `task.yield`: the scheduler parks the performing task and
-    /// resumes it later.
-    Task { op: Symbol },
-    /// `simulate { .. }`, whose scheduler does the same to every task in it.
+    Clause {
+        effect: Symbol,
+        op: Symbol,
+    },
+    /// Tail-resumptive: the continuation reaches no binder, so it alone does not force `shared`.
+    TailClause {
+        effect: Symbol,
+        op: Symbol,
+    },
+    Escapes {
+        effect: Symbol,
+        op: Symbol,
+    },
+    Task {
+        op: Symbol,
+    },
     Simulate,
-    /// A call whose callee is not a statically known definition.
     Indirect,
-    /// An argument to a callback builtin that this analysis cannot name.
-    Callback { builtin: &'static str },
+    Callback {
+        builtin: &'static str,
+    },
 }
 
 impl Cause {
-    /// What the label under the capture site says.
     pub fn describe(&self) -> String {
         match self {
             Cause::Clause { effect, op } => {
@@ -57,7 +61,6 @@ impl Cause {
     }
 }
 
-/// Where a capture becomes reachable from a region, and how it was reached.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CaptureSite {
     pub span: Span,
@@ -77,21 +80,17 @@ impl CaptureSite {
     }
 }
 
-/// One region and what was decided about it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Region {
-    /// The whole region expression, which is what a diagnostic points at.
     pub span: Span,
     /// The brand: `r` of `with_region[r]` or of a `with_cell[r]` that opens its own region.
     pub brand: Symbol,
     pub kind: RegionKind,
     /// `Some` exactly when `kind` is [`RegionKind::Shared`] by inference.
     pub capture: Option<CaptureSite>,
-    /// Whether the kind was declared rather than inferred.
     pub declared: bool,
 }
 
-/// Every region in a program, and its kind.
 #[derive(Clone, Default, Debug)]
 pub struct Regions {
     /// Source order: by module, then by position.
@@ -99,7 +98,7 @@ pub struct Regions {
 }
 
 impl Regions {
-    /// The kind of the region opened at `span`.
+    /// `Shared` for a span that opens no known region.
     pub fn kind(&self, span: Span) -> RegionKind {
         self.at(span).map_or(RegionKind::Shared, |r| r.kind)
     }
@@ -132,17 +131,13 @@ impl Regions {
     }
 }
 
-/// One program's region kinds, computed at most once however many engines are built from that
-/// program.
 pub type Kinds = Arc<OnceLock<Regions>>;
 
-/// Infers a kind for every region in the program.
 pub fn infer(program: &Program, resolved: &Resolved) -> Regions {
     let (regions, _) = decide(program, resolved, &[]);
     regions
 }
 
-/// Infers, then holds each declared region to what it declared.
 pub fn check(
     program: &Program,
     resolved: &Resolved,
@@ -168,7 +163,6 @@ fn decide(
     analysis.settle(declared)
 }
 
-/// What one body contributes.
 #[derive(Clone, Default)]
 struct Scan {
     /// The first capture written in the body itself, in source order.
@@ -221,49 +215,39 @@ impl Scan {
         self.refs.extend(other.refs);
     }
 
-    /// The site to attribute, preferring the one actually written over the one that is merely
-    /// reachable.
+    /// Prefers the capture actually written over one merely reachable.
     fn site(&self) -> Option<&CaptureSite> {
         self.direct.as_ref().or(self.indirect.as_ref())
     }
 }
 
-/// A region found during the scan, before its kind is known.
 struct Found {
     span: Span,
     brand: Symbol,
     scan: Scan,
 }
 
-/// What a body is being walked under.
 #[derive(Clone)]
 struct Ctx {
     module: usize,
-    /// Operations answered by a `handle` written **inside the region being walked**.
+    /// Operations answered by a `handle` written inside the region being walked.
     handled: Vec<(Symbol, Symbol)>,
-    /// Brands of the regions open at this point, so a `with_cell[r]` written inside
-    /// `with_region[r]` allocates into that region rather than opening one of its own.
+    /// Brands open here; a `with_cell[r]` inside `with_region[r]` opens no region of its own.
     brands: Vec<Symbol>,
 }
 
 struct Analysis<'a> {
     program: &'a Program,
     resolved: &'a Resolved,
-    /// Program-wide names of the definitions, so a `Var` can be told from a constructor or a
-    /// builtin.
+    /// Program-wide definition names, to tell a `Var` from a constructor or builtin.
     definitions: BTreeSet<Symbol>,
-    /// The local binders in scope at the point of the walk, innermost last.
+    /// Local binders in scope, innermost last.
     locals: Vec<Symbol>,
-    /// The prelude's constructors, which no module declares.
     prelude_ctors: BTreeSet<Symbol>,
-    /// Per definition.
     scans: BTreeMap<Symbol, Scan>,
-    /// Regions, in source order.
     found: Vec<Found>,
-    /// The first capture written anywhere in the program, which is what an unknown callee may
-    /// reach.
+    /// The first capture written anywhere, which an unknown callee may reach.
     anywhere: Option<CaptureSite>,
-    /// Definition -> the site reachable from it, and the definitions between.
     reaches: BTreeMap<Symbol, CaptureSite>,
 }
 
@@ -293,7 +277,6 @@ impl<'a> Analysis<'a> {
         }
     }
 
-    /// Walks every body a definition, a test or a law holds.
     fn scan_program(&mut self) {
         for (m, module) in self.program.modules.iter().enumerate() {
             for item in &module.items {
@@ -340,8 +323,7 @@ impl<'a> Analysis<'a> {
         }
     }
 
-    /// Breadth-first over the reverse call graph from every definition with a site of its own, so
-    /// each definition gets the shortest chain to one.
+    /// Breadth-first over reverse calls, so each definition gets its shortest chain to a site.
     fn propagate(&mut self) {
         let mut callers: BTreeMap<Symbol, BTreeSet<Symbol>> = BTreeMap::new();
         for (name, scan) in &self.scans {
@@ -414,7 +396,6 @@ impl<'a> Analysis<'a> {
         (Regions { regions }, refusals)
     }
 
-    /// The capture a region reaches: one written inside it, or the first its body's calls lead to.
     fn capture_of(&self, scan: &Scan) -> Option<CaptureSite> {
         if let Some(site) = scan.site() {
             return Some(site.clone());
@@ -437,7 +418,6 @@ impl<'a> Analysis<'a> {
         crate::limit::grow(|| self.walk_at(e, ctx, out));
     }
 
-    /// Runs `f` with `names` bound as locals, and unbinds them however it returns.
     fn scoped(&mut self, names: Vec<Symbol>, f: impl FnOnce(&mut Self)) {
         let depth = self.locals.len();
         self.locals.extend(names);
@@ -461,8 +441,7 @@ impl<'a> Analysis<'a> {
             }
             ExprKind::Block { stmts, tail } => {
                 let depth = self.locals.len();
-                // A `let`'s binders are in scope for the statements after it and for the tail, and
-                // not for its own right-hand side.
+                // A `let`'s binders scope over later statements and the tail, not its own value.
                 for stmt in stmts {
                     match stmt {
                         Stmt::Let { pat, value, .. } => {
@@ -522,8 +501,7 @@ impl<'a> Analysis<'a> {
                     inner.handled.push((effect, op));
                 }
                 self.walk(body, &inner, out);
-                // A clause body and a return clause run *below* their own handler, so they are
-                // walked under the enclosing context.
+                // Clause and return bodies run below their handler, so use the outer context.
                 for clause in clauses {
                     let mut bound: Vec<Symbol> =
                         clause.params.iter().map(|p| p.name.clone()).collect();
@@ -550,8 +528,6 @@ impl<'a> Analysis<'a> {
             } => {
                 self.walk(init, ctx, out);
                 let bound = vec![binder.name.clone()];
-                // A cell written inside the region of the same brand is a value allocated in *that*
-                // region — the region model — so it opens nothing.
                 if ctx.brands.contains(&resource.name) {
                     self.scoped(bound, |a| a.walk(body, ctx, out));
                 } else {
@@ -567,9 +543,7 @@ impl<'a> Analysis<'a> {
     fn walk_region(&mut self, span: Span, brand: Symbol, body: &Expr, ctx: &Ctx, out: &mut Scan) {
         let mut inner = ctx.clone();
         inner.brands.push(brand.clone());
-        // A `handle` that encloses the region answers *across* the region's boundary, which is
-        // exactly what `Cause::Escapes` means, so its operations are not local to this region and
-        // must not be inherited.
+        // An enclosing `handle` answers across the boundary (`Cause::Escapes`): not inherited.
         inner.handled.clear();
         let mut scan = Scan::default();
         self.walk(body, &inner, &mut scan);
@@ -605,12 +579,9 @@ impl<'a> Analysis<'a> {
                 }
                 out.indirect_at(span, Cause::Indirect);
             }
-            // A local binding, so the callee is whatever it holds — including when it shadows the
-            // name of a definition, a constructor or a builtin, which is the case the module scope
-            // alone gets wrong.
+            // A local, even one shadowing a definition, constructor or builtin.
             ExprKind::Var(_) => out.indirect_at(span, Cause::Indirect),
-            // Written at the call site: the callee is known, and its body has already been walked
-            // as an argument-free subexpression.
+            // Written at the call site, so the callee is known.
             ExprKind::Lambda { params, body, .. } => {
                 let bound = params.iter().map(|p| p.name.name.clone()).collect();
                 self.scoped(bound, |a| a.walk(body, ctx, out));
@@ -623,8 +594,6 @@ impl<'a> Analysis<'a> {
         }
     }
 
-    /// `map`, `filter`, `fold`, `iterate`, `map_fold` and `bytes_position` call a function this
-    /// analysis has to be able to name.
     fn walk_callback(
         &mut self,
         span: Span,
@@ -634,8 +603,7 @@ impl<'a> Analysis<'a> {
         out: &mut Scan,
     ) {
         let nameable = match args.last().map(|arg| &arg.kind) {
-            // Written at the call site, or a definition or constructor named there: the `Var` arm
-            // above has already recorded the edge.
+            // Written or named at the call site; `walk_call` already recorded the edge.
             Some(ExprKind::Lambda { .. }) => true,
             Some(ExprKind::Var(q)) => {
                 !self.is_local(q)
@@ -653,15 +621,12 @@ impl<'a> Analysis<'a> {
 
     fn walk_perform(&mut self, span: Span, effect: &QName, op: &Symbol, ctx: &Ctx, out: &mut Scan) {
         let declared = self.global(ctx.module, Namespace::Effect, effect);
-        // The builtin `task`, which no module declares and which the scheduler answers by parking
-        // the performing task.
         if declared.is_none() && effect.is_bare() && effect.symbol().as_str() == "task" {
             out.direct_at(span, Cause::Task { op: op.clone() });
             return;
         }
         let name = declared.unwrap_or_else(|| effect.symbol().clone());
-        // `ctx.handled` carries only the handlers written inside this region, so an operation it
-        // names is already the reason the region is `shared` and adds nothing.
+        // Handled inside this region, whose clause already made it `shared`.
         if ctx.handled.contains(&(name.clone(), op.clone())) {
             return;
         }
@@ -674,13 +639,11 @@ impl<'a> Analysis<'a> {
         );
     }
 
-    /// Whether a bare name is bound by something inside the body being walked.
     fn is_local(&self, q: &QName) -> bool {
         q.is_bare() && self.locals.contains(q.symbol())
     }
 
-    /// The program-wide name of the definition a reference denotes, or `None` when it denotes
-    /// anything else — a local, a constructor, a builtin.
+    /// The definition `q` denotes; `None` for a local, constructor or builtin.
     fn definition(&self, module: usize, q: &QName) -> Option<Symbol> {
         if self.is_local(q) {
             return None;
@@ -720,8 +683,6 @@ impl<'a> Analysis<'a> {
     }
 }
 
-/// The region-kind rule: forcing `unique` where a capture is reachable is a compile error naming the capture
-/// site.
 fn refuse_unique(found: &Found, site: &CaptureSite) -> Diagnostic {
     let mut d = Diagnostic::error(
         codes::REGION_KIND_REFUSED,
@@ -747,7 +708,6 @@ fn refuse_unique(found: &Found, site: &CaptureSite) -> Diagnostic {
     )
 }
 
-/// Every name a pattern can bind.
 fn pattern_binders(p: &Pattern, out: &mut Vec<Symbol>) {
     crate::limit::grow(|| match &p.kind {
         PatternKind::Wildcard | PatternKind::Lit(_) => {}

@@ -1,14 +1,5 @@
-//! The evaluator (ADR 0047): one engine with two front ends over the shared runtime. The
-//! interpreted front end ([`crate::interp::Core`]) walks the lowered `code` directly — the
-//! first-order language, `with_cell`, tail-resumptive `handle`/`perform` — with no C compiler in
-//! the path. Anything it declines — a `simulate`, a region's tasks, a multi-shot `resume`, a host
-//! operation — runs on the compiled front end (the C tier attached with [`Machine::set_compiled`]),
-//! which carries the ADR 0044 stacks that hold those continuations. Between them they answer every
-//! body; there is no control-stack machine of a third kind.
-//!
-//! The engine is still called `Machine` so its consumers — the CLI, the harness, the prover, the
-//! corpus — are unchanged. It records each entry point's performed atoms into a [`Trace`] so its
-//! footprint reads the same whichever front end ran the body.
+//! The engine: entry points and tests run on the compiled tier, loose expressions on the
+//! interpreter; performed atoms go to one [`Trace`] either way.
 
 use crate::arena::RegionKind;
 use crate::compiled::{Compiled, Entered};
@@ -29,8 +20,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// Ordered as [`CheckOutput::tests`] is — load order, then source order — so the index into the
-/// two is the same index.
+/// Ordered as [`CheckOutput::tests`] is: load order, then source order.
 struct TestSlot<'a> {
     module: usize,
     name: &'a str,
@@ -38,43 +28,33 @@ struct TestSlot<'a> {
 }
 
 pub struct Machine<'a> {
-    /// This engine's identity, which with the performing task is what a host handler keys scoped
-    /// state on.
+    /// With the performing task, the key a host handler scopes its state by.
     id: MachineId,
     program: &'a Program,
     resolved: &'a Resolved,
     check: Option<&'a CheckOutput>,
-    /// The interpreted front end's program tables and its eval state.
     interp: Interpreter<'a>,
     core: Core<'a>,
     tests: Vec<TestSlot<'a>>,
-    /// Which of the region-kind rule's two kinds each region in this program is.
     region_kinds: crate::region_kind::Kinds,
-    /// What this entry point performed, recorded whichever front end ran it.
     trace: Trace,
     max_calls: usize,
-    /// The seed the next entry point's `simulate` region runs at, and the scheduling-step budget
-    /// one interleaving may spend.
+    /// Seed and per-interleaving step budget for the next entry point's `simulate` regions.
     seed: Seed,
     sim_steps: u32,
     /// The handler of last resort.
     binding: Arc<HostBinding>,
     /// What answers a [`crate::host::HostAnswer::Pending`].
     runtime: Option<Rc<dyn HostRuntime>>,
-    /// The compiled front end, for the bodies the interpreter declines.
     compiled: Option<Rc<dyn Compiled>>,
     compiled_entries: Cell<u64>,
     compiled_declines: Cell<u64>,
     compiled_refusals: Cell<u64>,
-    /// What this entry point's `simulate` regions did, read from the compiled front end.
     record: Option<region::Record>,
-    /// What this entry point reached across the host boundary.
     host_use: HostUse,
     host_ops: u64,
-    /// The declared footprint of the entry point about to run.
     declared: Option<Footprint>,
     re_executed: bool,
-    /// What the runtime reported while closing entry points.
     teardown: Vec<Diagnostic>,
 }
 
@@ -87,8 +67,7 @@ impl<'a> Machine<'a> {
         Machine::build(program, resolved, Some(check))
     }
 
-    /// Everything the engine needs is derivable from the resolved AST alone, so evaluation can be
-    /// exercised without a type-check pass.
+    /// An engine without a type-check pass; evaluation needs only the resolved AST.
     pub fn for_program(program: &'a Program, resolved: &'a Resolved) -> Machine<'a> {
         Machine::build(program, resolved, None)
     }
@@ -147,14 +126,11 @@ impl<'a> Machine<'a> {
         self.max_calls = max.max(1);
     }
 
-    /// Bind the host boundary.
     pub fn set_host_binding(&mut self, binding: Arc<HostBinding>) {
         self.binding = binding;
         self.share_host();
     }
 
-    /// The compiled front end performs against the same binding, reactor and declared footprint
-    /// this engine does, whichever was set last.
     fn share_host(&self) {
         if let Some(backend) = &self.compiled {
             backend.set_host(Arc::clone(&self.binding), self.runtime.clone());
@@ -163,7 +139,6 @@ impl<'a> Machine<'a> {
         }
     }
 
-    /// The reactor a [`crate::host::HostAnswer::Pending`] is polled on.
     pub fn set_host_runtime(&mut self, runtime: Rc<dyn HostRuntime>) {
         self.runtime = Some(runtime);
         self.share_host();
@@ -182,9 +157,7 @@ impl<'a> Machine<'a> {
         self.share_host();
     }
 
-    /// Declare that this entry point is one of several runs of the same test, so that reaching the
-    /// host boundary is [`codes::HOST_IN_SIMULATION`] rather than a packet sent once per
-    /// interleaving.
+    /// One of several runs of one test: reaching the host is [`codes::HOST_IN_SIMULATION`].
     pub fn set_re_executed(&mut self, re_executed: bool) {
         self.re_executed = re_executed;
         self.share_host();
@@ -227,19 +200,18 @@ impl<'a> Machine<'a> {
         self.core.regions()
     }
 
-    /// The kind of the region opened at `span`, and `None` when that span opens no region.
+    /// `None` when `span` opens no region.
     pub fn region_kind(&self, span: Span) -> Option<RegionKind> {
         self.region_kinds().at(span).map(|region| region.kind)
     }
 
-    /// This program's region kinds, inferring them if nothing has yet.
+    /// Inferred on first use.
     pub fn region_kinds(&self) -> &crate::region_kind::Regions {
         self.region_kinds
             .get_or_init(|| crate::region_kind::infer(self.program, self.resolved))
     }
 
-    /// The handle to hand another engine built from **this same program**, so the analysis behind
-    /// it runs once for the program rather than once per engine.
+    /// For another engine over this same program, so the analysis runs once per program.
     pub fn shared_region_kinds(&self) -> crate::region_kind::Kinds {
         crate::region_kind::Kinds::clone(&self.region_kinds)
     }
@@ -248,7 +220,6 @@ impl<'a> Machine<'a> {
         self.region_kinds = kinds;
     }
 
-    /// The lowering cache to hand an engine built next over **this same program**.
     pub fn share_lowering(&self) -> Rc<crate::code::Lowering<'a>> {
         self.core.lowering()
     }
@@ -259,7 +230,6 @@ impl<'a> Machine<'a> {
         }
     }
 
-    /// Attach the compiled front end: the source of the bodies the interpreter declines.
     pub fn set_compiled(&mut self, compiled: Rc<dyn Compiled>) {
         if compiled.describes(self.program) {
             self.compiled = Some(compiled);
@@ -308,9 +278,7 @@ impl<'a> Machine<'a> {
         self.eval_test_in(&name, ordinal)
     }
 
-    /// A position in this program is not a position in a [`CheckOutput`]: the incremental front end
-    /// reports every module's tests while parsing only some of them, so the two lists agree on
-    /// order but not on length.
+    /// Positions are per module: an incremental run parses only some modules' tests.
     pub fn eval_test_in(&mut self, module: &Symbol, ordinal: usize) -> Result<(), Diagnostic> {
         let program = self.program;
         let found = self
@@ -328,13 +296,10 @@ impl<'a> Machine<'a> {
             .note("run `ply cache clear`, or pass `--no-incremental`"));
         };
         self.begin_entry();
-        // Tier-only: the compiled tier runs the language, so a test is entered on it directly.
         self.tier_test(owner, ordinal, label, body.span)
     }
 
-    /// A test the interpreter declined, run on the compiled front end, which is the authority: its
-    /// unit answer is the pass, its raise the failure, and a body it does not hold is a failure the
-    /// interpreter could not answer either.
+    /// The compiled front end is the authority: unit passes, a raise fails, a missing body fails.
     fn tier_test(
         &mut self,
         owner: usize,
@@ -362,7 +327,6 @@ impl<'a> Machine<'a> {
                 self.compiled_declines.set(self.compiled_declines.get() + 1);
                 Err(err_no_front_end(&root, span))
             }
-            // The tier ran it and it raised: an entry, and the verdict.
             Entered::Raised(raised) => {
                 self.compiled_entries.set(self.compiled_entries.get() + 1);
                 Err(raised)
@@ -386,9 +350,7 @@ impl<'a> Machine<'a> {
         self.answer_expr(entered)
     }
 
-    /// An expression from `module`, with `bindings` already in scope: the names are lowered as
-    /// leading parameters of the body's window, so their occurrences resolve to slots exactly as a
-    /// function's parameters do.
+    /// An expression from `module`, with `bindings` lowered as leading parameters of its window.
     pub fn eval_expr_in(
         &mut self,
         e: &'a Expr,
@@ -437,7 +399,6 @@ impl<'a> Machine<'a> {
             crate::escape::check(&boundary, arg, span)?;
         }
         self.begin_entry();
-        // Tier-only: an entry point is run on the compiled tier.
         self.tier_call(&sym, args, span)
     }
 
@@ -468,8 +429,7 @@ impl<'a> Machine<'a> {
         }
     }
 
-    /// Clear the per-entry accounting the next run overwrites; the interpreter's `Core` resets its
-    /// own arena and handler stack when it enters.
+    /// Clears per-entry accounting; `Core` resets its own arena and handler stack on entry.
     fn begin_entry(&mut self) {
         self.trace.clear();
         self.host_use = HostUse::default();
@@ -507,7 +467,6 @@ impl<'a> Machine<'a> {
         }
     }
 
-    /// What the host runtime reported while closing entry points, and forgotten here.
     pub fn take_teardown_warnings(&mut self) -> Vec<Diagnostic> {
         std::mem::take(&mut self.teardown)
     }
@@ -527,7 +486,6 @@ fn err_no_front_end(name: &Symbol, span: Span) -> Diagnostic {
     )
 }
 
-/// A `simulate` region entered inside another one.
 pub fn err_nested_simulation(span: Span, outer: Span) -> Diagnostic {
     Diagnostic::error(
         codes::NESTED_SIMULATION,
@@ -541,7 +499,6 @@ pub fn err_nested_simulation(span: Span, outer: Span) -> Diagnostic {
     .note("hoist the inner region out, or handle its effects with an ordinary `handle`")
 }
 
-/// A `HostAnswer::Pending` with no reactor to resolve it.
 #[cold]
 #[inline(never)]
 pub fn err_no_runtime(
@@ -559,8 +516,7 @@ pub fn err_no_runtime(
     .note("`Machine::set_host_runtime` was never called; a handler that can answer `Pending` needs one")
 }
 
-/// `E0427` — a registration claims this operation, the run is bound, and the binding enumerated no
-/// atom for it.
+/// `E0427`: the binding enumerated no atom for an operation a registration claims.
 #[cold]
 #[inline(never)]
 pub fn err_unenumerated_atom(span: Span, operation: &str, path: &'static str) -> Diagnostic {
@@ -574,7 +530,6 @@ pub fn err_unenumerated_atom(span: Span, operation: &str, path: &'static str) ->
     .note("this is Ply's fault: report it with the program that produced it")
 }
 
-/// `E0427` — a host handler answered an atom outside the entry point's row.
 #[cold]
 #[inline(never)]
 pub fn err_footprint_escape(
@@ -622,8 +577,6 @@ pub fn carries_secret(v: &Value) -> bool {
     }
 }
 
-/// `E0439` — a credential reached a host operation whose registration does not declare that it may
-/// receive one.
 #[cold]
 #[inline(never)]
 pub fn err_secret_to_host(
@@ -643,7 +596,6 @@ pub fn err_secret_to_host(
     .note("this is Ply's fault: the registration and what crossed it disagree, and no definition in the program decides which was meant")
 }
 
-/// `E0425` — a host operation reached from inside a `simulate` region.
 #[cold]
 #[inline(never)]
 pub fn err_host_in_simulation(span: Span, operation: &str, region: Span) -> Diagnostic {

@@ -3,8 +3,7 @@
 use crate::{ProvePlan, Tier};
 use ply_ty::DefHash;
 
-/// Domain tag, so a plan-keyed result cannot collide with the bare obligation key, which is itself
-/// a `blake3` over normalized bytes.
+/// Domain tag, so a plan-keyed result cannot collide with the bare obligation key.
 const PLAN_DOMAIN: &[u8] = b"ply.prove.key.1";
 
 /// The key everything weaker than a proof is written under.
@@ -16,7 +15,6 @@ pub fn prove_key(key: DefHash, plan: &ProvePlan) -> DefHash {
     DefHash(*hasher.finalize().as_bytes())
 }
 
-/// Where a discharge of this tier belongs.
 pub fn result_key(key: DefHash, tier: Option<Tier>, plan: &ProvePlan) -> DefHash {
     match tier {
         Some(Tier::Proved) => key,

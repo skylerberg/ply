@@ -4,13 +4,9 @@ use crate::value::{ClosureKind, Value};
 use ply_span::Symbol;
 use ply_ty::CheckOutput;
 
-/// Whether the value means the same thing in a world it was not produced in — what a
-/// remembered constant must be, whichever engine produced it.
-///
-/// Walked with an explicit stack: a constant that holds a whole program's syntax tree is far
-/// deeper than the Rust stack should be asked to recurse. A cycle can only run through a cell
-/// (`reference_cycles.rs`), which the walk refuses without following, so it terminates.
+/// Whether the value means the same thing in a world it was not produced in.
 pub fn world_independent(value: &Value) -> bool {
+    // Explicit stack, since a constant may hold a whole syntax tree; any cycle ends at a cell.
     let mut pending = vec![value];
     while let Some(value) = pending.pop() {
         match value {
@@ -44,7 +40,6 @@ pub fn world_independent(value: &Value) -> bool {
     true
 }
 
-/// Whether `name`'s *published* row claims it reads nothing of the world.
 pub fn pure_by_published_row(check: Option<&CheckOutput>, name: &Symbol) -> bool {
     check
         .and_then(|check| check.defs.get(name))
