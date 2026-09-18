@@ -53,8 +53,7 @@ impl Program {
         let mut program = ply_syntax::ast::Program::single(module);
         let resolved = ply_syntax::resolve(&mut program)
             .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = ply_core::check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
+        let check = crate::fixture::port_check(&[(String::new(), src.to_string())], &[SourceId(0)]);
         let hashes = ply_hash::hash_program(&program, &resolved, &check)
             .unwrap_or_else(|d| panic!("hash: {d:#?}"));
         Program {
