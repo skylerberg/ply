@@ -36,8 +36,10 @@ impl Compiled {
         let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
         let resolved = ply_syntax::resolve(&mut program)
             .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = ply_core::check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
+        let check = crate::fixture::port_check(
+            &[(ModuleName::from_dotted("m").to_string(), src.to_string())],
+            &[SourceId(0)],
+        );
         let (hashes, bodies) = ply_hash::hash_program_with_bodies(&program, &resolved)
             .unwrap_or_else(|d| panic!("the fixture must hash: {d:#?}"));
         Compiled {

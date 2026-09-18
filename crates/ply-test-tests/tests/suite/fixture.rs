@@ -9,7 +9,6 @@
 //! so a fixture that is *run* — as opposed to only scheduled — carries its module source texts and
 //! hands them to the whole Ply emitter through [`Compiled::tier`].
 
-use ply_core::check_program;
 use ply_eval::{Exploration, host::HostUse};
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId};
@@ -18,6 +17,33 @@ use ply_syntax::resolve::Resolved;
 use ply_test::{BackendUse, Engine, Executor, InterpExecutor, Worker};
 use ply_ty::CheckOutput;
 use std::collections::HashMap;
+
+/// The port's check over these modules — the front end this repository keeps (ADR 0052 §1),
+/// rather than the Rust checker it retires.
+#[track_caller]
+pub fn port_check(sources: &[(String, String)], ids: &[SourceId]) -> CheckOutput {
+    let front = port_front(sources, ids);
+    let errors: Vec<&Diagnostic> = front
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == ply_span::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "the fixture must typecheck: {errors:#?}");
+    front.check
+}
+
+/// What the port raises over these modules, for a fixture meant to be refused.
+#[track_caller]
+pub fn port_diagnostics(sources: &[(String, String)], ids: &[SourceId]) -> Vec<Diagnostic> {
+    port_front(sources, ids).diagnostics
+}
+
+#[track_caller]
+fn port_front(sources: &[(String, String)], ids: &[SourceId]) -> ply_ty::Front {
+    ply_codegen::c::producer::ensure_default();
+    ply_codegen::c::producer::front(sources, ids)
+        .unwrap_or_else(|e| panic!("the port answers for the fixture: {e:#}"))
+}
 
 pub struct Compiled {
     pub program: Program,
@@ -78,8 +104,19 @@ impl Compiled {
     fn of(mut program: Program, texts: HashMap<String, String>) -> Compiled {
         let resolved = ply_syntax::resolve(&mut program)
             .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
+        let sources: Vec<(String, String)> = program
+            .modules
+            .iter()
+            .map(|m| {
+                let name = m.name.to_string();
+                let text = texts
+                    .get(&name)
+                    .unwrap_or_else(|| panic!("no source text for module {name:?}"));
+                (name, text.clone())
+            })
+            .collect();
+        let ids: Vec<SourceId> = program.modules.iter().map(|m| m.source).collect();
+        let check = port_check(&sources, &ids);
         let (hashes, bodies) = ply_hash::hash_program_with_bodies(&program, &resolved)
             .unwrap_or_else(|d| panic!("the fixture must hash: {d:#?}"));
         Compiled {
