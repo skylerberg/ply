@@ -31,16 +31,12 @@ impl Fixture {
         let resolved = ply_syntax::resolve(&mut program)
             .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
         // Anonymous, so the keys stay bare: see `fixture` in `prove.rs`.
-        ply_codegen::c::producer::ensure_default();
-        let front =
-            ply_codegen::c::producer::front(&[(String::new(), src.to_string())], &[SourceId(0)])
-                .unwrap_or_else(|e| panic!("the port answers for the fixture: {e:#}"));
-        assert!(
-            front.diagnostics.is_empty(),
-            "the fixture must typecheck: {:#?}",
-            front.diagnostics
-        );
-        let check = front.check;
+        let check = ply_codegen::c::producer::checked_front(
+            &[(String::new(), src.to_string())],
+            &[SourceId(0)],
+        )
+        .unwrap_or_else(|e| panic!("the fixture must typecheck: {e:#}"))
+        .check;
         Fixture {
             program,
             resolved,

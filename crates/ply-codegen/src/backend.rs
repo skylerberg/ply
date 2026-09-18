@@ -76,33 +76,36 @@ pub struct Unit {
 }
 
 impl Unit {
-    /// The compiled fragment of `program`, or the reason there is none.
+    /// With no source text only the reference can emit, so hold `reference_only` around this.
     pub fn over(
         program: &Program,
         resolved: &ply_syntax::resolve::Resolved,
         check: &ply_ty::CheckOutput,
     ) -> Result<&'static Unit> {
-        // The keys make a test or a law a root the unit compiles (ADR 0045/0048); without them the
-        // tier holds no `test#N` to enter. `over` derives them so a caller that has no hashes of
-        // its own — a test, `Unit::over` at large — still gets a unit that runs the language.
-        Unit::over_with_texts(program, resolved, check, HashMap::new())
+        let front = crate::source::front_of(program, resolved, check, Default::default(), None);
+        Unit::over_front(program, resolved, &front, HashMap::new())
     }
 
-    /// `over` with the program's module source texts, which the whole Ply emitter re-parses to
-    /// produce bodies (it is a front end, not an AST consumer): without them its `bodies_of`
-    /// returns nothing and the tier holds no body. A test that wants the full language on the tier
-    /// passes `texts` here; `over` (no texts) gets the reference emitter's fragment.
+    /// [`Unit::over_front`] over the port's answer for `texts`, whose check replaces the caller's.
     pub fn over_with_texts(
         program: &Program,
         resolved: &ply_syntax::resolve::Resolved,
-        check: &ply_ty::CheckOutput,
+        _check: &ply_ty::CheckOutput,
         texts: HashMap<String, String>,
     ) -> Result<&'static Unit> {
-        // The front end's answer, once for the whole unit: every table the emitter is offered is
-        // read from it, and so are the keys that make a test or a law a root (ADR 0052 §1). A
-        // caller that already holds one — the driver, which entered the port once for the whole
-        // invocation — hands it over through `over_front` instead, so it is not paid twice.
-        let front = crate::source::front_for(program, resolved, check, &texts)
+        let sources = program
+            .modules
+            .iter()
+            .map(|m| -> Result<(String, String)> {
+                let name = m.name.to_string();
+                let text = texts
+                    .get(&name)
+                    .with_context(|| format!("no source text for module `{name}`"))?;
+                Ok((name, text.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let ids: Vec<ply_span::SourceId> = program.modules.iter().map(|m| m.source).collect();
+        let front = crate::c::producer::checked_front(&sources, &ids)
             .context("the front end's answer over this program")?;
         Unit::over_front(program, resolved, &front, texts)
     }

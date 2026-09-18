@@ -38,13 +38,10 @@ fn fixture(source: &str) -> Fixture {
     // anonymous module qualifies nothing on either side -- `ModuleName::qualify` returns the bare
     // name and `resolve.ply`'s `qualify` returns it for a zero-length module -- so the checker's
     // keys are the bare ones this crate and `ply-prove`'s own API are written against.
-    ply_codegen::c::producer::ensure_default();
-    let front = ply_codegen::c::producer::front(&[(String::new(), source.to_string())], &[SRC])
-        .unwrap_or_else(|e| panic!("the port answers for the fixture: {e:#}"));
-    if !front.diagnostics.is_empty() {
-        panic!("check: {:?}", messages(&front.diagnostics));
-    }
-    let check = front.check;
+    let check =
+        ply_codegen::c::producer::checked_front(&[(String::new(), source.to_string())], &[SRC])
+            .unwrap_or_else(|e| panic!("check: {e:#}"))
+            .check;
     Fixture {
         program,
         resolved,

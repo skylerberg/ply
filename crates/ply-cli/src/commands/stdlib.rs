@@ -4,7 +4,7 @@ use super::common::{IND, diagnostics_json, emit_json, plural, print_diagnostics}
 use crate::cli::StdArgs;
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_OK};
-use ply_span::{Diagnostic, Severity, SourceId, SourceMap, Span, Symbol, codes};
+use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
 use ply_syntax::ast::ModuleName;
 use serde_json::{Value, json};
 
@@ -93,16 +93,8 @@ pub fn rows() -> Result<Vec<Row>, Vec<Diagnostic>> {
         .map(|(name, source)| (name.to_string(), source.to_string()))
         .collect();
     let ids: Vec<SourceId> = (0..sources.len()).map(|i| SourceId(i as u32)).collect();
-    ply_codegen::c::producer::ensure_default();
-    let front = ply_codegen::c::producer::front(&sources, &ids)
+    let front = ply_codegen::c::producer::checked_front(&sources, &ids)
         .map_err(|e| vec![shipped_refused(&format!("{e:#}"))])?;
-    if let Some(d) = front
-        .diagnostics
-        .iter()
-        .find(|d| d.severity == Severity::Error)
-    {
-        return Err(vec![shipped_refused(&format!("{} {}", d.code, d.message))]);
-    }
 
     Ok(sources
         .iter()

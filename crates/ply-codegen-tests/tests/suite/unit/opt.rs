@@ -9,15 +9,10 @@ fn optimized(src: &str, name: &str) -> String {
     let mut program =
         ply_syntax::parse_program(vec![(id, ModuleName::from_dotted("m"), src)]).expect("parses");
     let resolved = ply_syntax::resolve::resolve(&mut program).expect("resolves");
-    ply_codegen::c::producer::ensure_default();
-    let front = ply_codegen::c::producer::front(&[("m".to_string(), src.to_string())], &[id])
-        .expect("the port answers");
-    assert!(
-        front.diagnostics.is_empty(),
-        "checks: {:?}",
-        front.diagnostics
-    );
-    let check = front.check;
+    let check =
+        ply_codegen::c::producer::checked_front(&[("m".to_string(), src.to_string())], &[id])
+            .expect("checks")
+            .check;
     let program: &'static Program = Box::leak(Box::new(program));
     let source = Source::new(
         program,

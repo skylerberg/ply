@@ -274,15 +274,9 @@ fn std_check() -> CheckOutput {
         .map(|(n, t)| (n.to_string(), t.to_string()))
         .collect();
     let ids: Vec<SourceId> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
-    ply_codegen::c::producer::ensure_default();
-    let front = ply_codegen::c::producer::front(&modules, &ids)
-        .expect("the port answers for the standard library");
-    assert!(
-        front.diagnostics.is_empty(),
-        "the standard library checks: {:?}",
-        front.diagnostics
-    );
-    front.check
+    ply_codegen::c::producer::checked_front(&modules, &ids)
+        .expect("the standard library checks")
+        .check
 }
 
 #[test]

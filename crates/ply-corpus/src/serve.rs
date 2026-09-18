@@ -458,7 +458,7 @@ impl Program {
         }
         let resolved = ply_syntax::resolve::resolve(&mut program)
             .map_err(|d| diagnostics("resolving the endpoint", &d))?;
-        let port = crate::port_front(&ordered, &ids)
+        let port = ply_codegen::c::producer::checked_front(&ordered, &ids)
             .map_err(|e| anyhow::anyhow!("checking the endpoint: {e}"))?;
         Ok(Program {
             program,

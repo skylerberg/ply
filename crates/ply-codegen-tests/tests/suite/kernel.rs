@@ -41,24 +41,11 @@ fn kernel() -> (&'static Program, &'static Unit) {
     let mut ast = ply_syntax::parse_program(inputs).expect("the kernel parses");
     assert!(ply_derive::expand_program(&mut ast).is_empty());
     let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the kernel resolves");
-    ply_codegen::c::producer::ensure_default();
-    let front = ply_codegen::c::producer::front(&named, &ids).expect("the port answers");
-    assert!(
-        front.diagnostics.is_empty(),
-        "the kernel checks: {:?}",
-        front.diagnostics
-    );
-    let check = front.check;
+    let front = ply_codegen::c::producer::checked_front(&named, &ids).expect("the kernel checks");
     let ast: &'static Program = Box::leak(Box::new(ast));
-    // The port answers the check; the reference emitter still emits, which is the fragment this
-    // kernel is measured against. Without this the installed producer is asked for every body and
-    // answers none, since this source carries no texts.
+    // The fragment is what this kernel is measured against.
     let unit = ply_codegen::c::producer::reference_only(|| {
-        Unit::over(
-            ast,
-            Box::leak(Box::new(resolved)),
-            Box::leak(Box::new(check)),
-        )
+        Unit::over_front(ast, &resolved, &front, std::collections::HashMap::new())
     })
     .expect("this host has a C compiler");
     (ast, unit)
