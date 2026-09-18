@@ -1,11 +1,7 @@
-//! `Bytes` and the text builtins through the real binary.
-
 use assert_cmd::Command;
 use std::path::Path;
 use tempfile::TempDir;
 
-/// A request head arriving in three pieces, parsed the way a server has to: bytes off the wire, a
-/// decode that can fail, and text handling after it.
 const SERVER: &str = r#"
 fn head(a: Bytes, b: Bytes, c: Bytes) -> Bytes =
   bytes_concat(bytes_concat(a, b), c)
@@ -59,8 +55,7 @@ test "a cut multi-byte character is refused rather than replaced" {
 }
 "#;
 
-/// The failing half, kept out of `SERVER` so the green run above stays green: each of these is a
-/// partial builtin reached at an input it refuses.
+/// Kept out of `SERVER` so the green run stays green: each is a partial builtin at an input it refuses.
 const REFUSALS: &str = r#"
 test "a slice past the end is refused" {
   assert_eq(bytes_len(bytes_slice(b"abc", 0, 4)), 0)
@@ -96,8 +91,7 @@ fn a_program_over_bytes_and_text_passes() {
     assert!(text.contains("4 passed"), "{text}");
 }
 
-/// The second run must select nothing: a `Bytes` literal that normalized unstably would re-run
-/// every test on every invocation, and a green suite is exactly where nobody would look.
+/// A `Bytes` literal that normalized unstably would re-run every test on every invocation.
 #[test]
 fn a_second_run_over_bytes_selects_nothing() {
     let dir = project(SERVER);
@@ -107,9 +101,7 @@ fn a_second_run_over_bytes_selects_nothing() {
     assert!(text.contains("selected 0 of 4"), "{text}");
 }
 
-/// Renaming changes no hash, which is the M3 invariant a new literal tag is most likely to break —
-/// the tag carries a length, and a length written against the wrong cursor moves every hash after
-/// it.
+/// The literal tag carries a length, and a length written against the wrong cursor moves every hash after it.
 #[test]
 fn renaming_a_definition_over_bytes_selects_nothing() {
     let dir = project(SERVER);

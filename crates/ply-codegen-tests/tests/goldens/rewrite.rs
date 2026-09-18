@@ -1,14 +1,6 @@
-//! The third comparison: `rewrite.ply` — the effect-set, record-update and try-operator rewrites
-//! `Parser::run` applies after the grammar — against a blessed golden, tree and
-//! diagnostics, over every input the parser differential reads.
-//!
-//! The port is entered in-process through `port`: the bundle the binary carries is the compiler
-//! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
-
 use crate::harness::{bundle, fixtures, golden, port, records, repo_root};
 use std::path::{Path, PathBuf};
 
-/// The first record the two dumps disagree on, with context, or `None`.
 fn first_difference(reference: &str, actual: &str) -> Option<String> {
     let want = records(reference);
     let got = records(actual);

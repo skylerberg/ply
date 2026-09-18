@@ -41,9 +41,7 @@ fn a_pure_definition_prints_no_row_at_all() {
     assert_eq!(lines, ["endpoint_of  : (Request) -> Response"]);
 }
 
-/// The property W3's exit criterion rests on: an endpoint's row is legible at a glance, which
-/// means wrapped at a fixed column with the atoms hanging under the first one rather than run
-/// off the right edge.
+/// Wrapped at a fixed column, with the atoms hanging under the first one rather than run off the right edge.
 #[test]
 fn a_long_row_wraps_inside_the_brace_and_aligns() {
     let scheme = fn_scheme(
@@ -75,8 +73,7 @@ fn a_long_row_wraps_inside_the_brace_and_aligns() {
     );
 }
 
-/// A row variable is named once, by one printer, so the quantifier and the row cannot drift
-/// apart across the split.
+/// A row variable is named once, by one printer, so the quantifier and row cannot drift apart across the split.
 #[test]
 fn a_row_variable_survives_the_split_with_one_name() {
     let v = RowVar(3);
@@ -132,8 +129,6 @@ fn an_empty_row_still_renders_its_delimiters() {
     assert_eq!(fill("= {", "   ", &[], "}", 40), ["= {}"]);
 }
 
-/// The set block is the one place an alias is allowed to appear, and it has to carry its
-/// expansion beside it or it is the abbreviation without the definition.
 #[test]
 fn the_set_block_names_the_set_and_spells_out_its_expansion() {
     let view = EffectSetView {
@@ -209,8 +204,6 @@ fn provenance_names_the_alias_and_the_difference_the_alias_hides() {
     );
 }
 
-/// An alias whose expansion the body reaches entirely costs nothing, so there is no difference
-/// to report and the row is not printed twice.
 #[test]
 fn an_alias_the_body_uses_completely_reports_only_how_it_was_written() {
     let exact = Footprint::from_atoms([atom("log", Mode::Write, None)]);
@@ -226,7 +219,6 @@ fn a_definition_that_named_no_set_and_declared_no_slack_has_nothing_to_print() {
     assert!(p.lines(5).is_empty());
 }
 
-/// A row written out by hand can be over-broad too, and the cost is the same one.
 #[test]
 fn a_written_row_wider_than_its_body_is_reported_without_any_alias() {
     let p = provenance(&def(

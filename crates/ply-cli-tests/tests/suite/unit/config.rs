@@ -7,8 +7,6 @@ use ply_span::{SourceId, Symbol, codes};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-// --- the command line -------------------------------------------------------
-
 #[test]
 fn the_three_sources_parse_and_repeat() {
     let args = match Cli::parse_from([
@@ -39,7 +37,6 @@ fn the_three_sources_parse_and_repeat() {
     assert_eq!(args.config.schema.as_deref(), Some("desk.config"));
 }
 
-/// Configuration configures a *binding*.
 #[test]
 fn configuration_without_host_is_refused_rather_than_ignored() {
     for flag in [
@@ -69,7 +66,6 @@ fn every_binding_command_accepts_configuration() {
     }
 }
 
-/// Without `--host` no source is opened at all, whatever the environment holds.
 #[test]
 fn a_hermetic_run_opens_no_source() {
     let options = ConfigOptions {
@@ -84,8 +80,6 @@ fn a_hermetic_run_opens_no_source() {
     assert!(!Configuration::default().is_opened());
 }
 
-/// A `--config-schema` that is not `<module>.<fn>` is refused before any program is loaded, with
-/// the form rather than with a hunt.
 #[test]
 fn a_config_schema_that_is_not_a_qualified_name_is_refused() {
     for bad in ["config", "desk.", ".config", "desk..config", "1desk.config"] {
@@ -95,8 +89,6 @@ fn a_config_schema_that_is_not_a_qualified_name_is_refused() {
     assert!(schema::check_shape("desk.config").is_ok());
     assert!(schema::check_shape("store.orders.config").is_ok());
 }
-
-// --- resolving the schema function ------------------------------------------
 
 fn check(source: &str) -> ply_ty::CheckOutput {
     ply_codegen::c::producer::checked_front(&[(String::new(), source.to_string())], &[SourceId(0)])
@@ -124,8 +116,7 @@ fn a_nullary_pure_function_returning_a_spec_resolves() {
     );
 }
 
-/// Each refusal says what is wrong with the *argument*, because the fix is a different argument
-/// rather than an edit to the program.
+/// The fix is a different argument, not an edit to the program, so each refusal is about the argument.
 #[test]
 fn a_schema_function_that_is_not_one_is_refused_with_the_reason() {
     let program = check(SPEC_SOURCE);
@@ -139,8 +130,6 @@ fn a_schema_function_that_is_not_one_is_refused_with_the_reason() {
     }
 }
 
-/// An operator who mistyped the module prefix should not have to run a second command to find out
-/// what they meant.
 #[test]
 fn an_unknown_schema_function_lists_the_candidates() {
     let program = check(SPEC_SOURCE);
@@ -153,10 +142,7 @@ fn an_unknown_schema_function_lists_the_candidates() {
     );
 }
 
-// --- decoding the value it returns ------------------------------------------
-
-// A `Value` pins `Arc` for its shared payloads and `Rc` for shared code, so none of these `Arc`s
-// can ever be `Send`.
+// A `Value` pins `Arc` for shared payloads and `Rc` for shared code, so none of these `Arc`s can be `Send`.
 #[allow(clippy::arc_with_non_send_sync)]
 fn record(fields: &[(&str, Value)]) -> Value {
     Value::Record(Arc::new(
@@ -237,8 +223,7 @@ fn a_config_spec_decodes_into_the_keys_the_run_resolves() {
     );
 }
 
-/// A `ConfigSpec` that decoded partially would silently drop a required key and turn `E0441` into
-/// the `None` at first use it exists to prevent.
+/// A partial decode would drop a required key and turn `E0441` into the `None` at first use it exists to prevent.
 #[test]
 fn a_value_that_is_not_a_config_spec_is_refused_rather_than_partly_read() {
     let cases: Vec<(&str, Value)> = vec![
@@ -267,8 +252,7 @@ fn a_value_that_is_not_a_config_spec_is_refused_rather_than_partly_read() {
     }
 }
 
-/// A constructor's identity in a `Value` is its **program-wide** name, so a `SText` some other
-/// module declared is not read as `std.config`'s.
+/// A constructor's identity in a `Value` is its program-wide name.
 #[test]
 fn a_shape_from_another_module_is_not_one_of_std_configs() {
     let value = spec_value(vec![record(&[
@@ -280,8 +264,6 @@ fn a_shape_from_another_module_is_not_one_of_std_configs() {
     let error = schema::spec_of(&value, "desk.config").expect_err("not `std.config`'s shape");
     assert!(error.message.contains("desk.SSecret"), "{}", error.message);
 }
-
-// --- what a report says -----------------------------------------------------
 
 fn configured(set: &[&str], keys: Vec<(&str, Shape, bool, Option<&str>)>) -> Configuration {
     let sources = Sources::read_with(
@@ -316,8 +298,6 @@ fn configured(set: &[&str], keys: Vec<(&str, Shape, bool, Option<&str>)>) -> Con
     }
 }
 
-/// The whole point of the `keys` line: the value for a plain key, `****` for a credential, and the
-/// winning source beside each.
 #[test]
 fn no_projection_of_a_report_carries_a_secrets_value() {
     let configuration = configured(
@@ -346,8 +326,6 @@ fn no_projection_of_a_report_carries_a_secrets_value() {
     assert!(json.contains("\"secret\":true"), "{json}");
 }
 
-/// A run that named no schema says so rather than printing a block of zeroes that reads like a run
-/// configured with nothing.
 #[test]
 fn a_run_with_no_schema_says_what_that_costs() {
     let sources = Sources::read_with(&["K=v".to_string()], &[], &[], &|_| {
@@ -368,8 +346,6 @@ fn a_run_with_no_schema_says_what_that_costs() {
     assert!(configuration.is_opened(), "a `--set` opened a source");
 }
 
-// --- the digest -------------------------------------------------------------
-
 fn digest(configuration: &Configuration) -> String {
     let mut out = String::new();
     configuration.digest_into(&mut |text| {
@@ -379,8 +355,6 @@ fn digest(configuration: &Configuration) -> String {
     out
 }
 
-/// A key that appears, a key that changes shape and a schema function that moves are all structural
-/// changes to what the run requires of its environment, and CI should break on each.
 #[test]
 fn the_digest_covers_a_keys_name_and_shape() {
     let base = configured(
@@ -423,8 +397,6 @@ fn the_digest_does_not_cover_a_resolved_value_or_the_source_that_won() {
     assert_eq!(digest(&from_set), digest(&from_default));
 }
 
-/// A hermetic run contributes nothing, so no existing corpus's digest moves for want of a block it
-/// has nothing to put in.
 #[test]
 fn a_run_with_no_schema_contributes_nothing_to_the_digest() {
     assert!(digest(&Configuration::default()).is_empty());

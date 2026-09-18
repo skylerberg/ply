@@ -1,5 +1,3 @@
-//! An adversarial audit of the prover's W2 surface.
-
 use ply_cli::engine::Prover;
 use ply_cli::load::load;
 use ply_cli::obligations;
@@ -78,10 +76,7 @@ fn never_proved(source: &str, needle: &str) {
     );
 }
 
-// --- The refusal `Float` is supposed to get --------------------------------
-
-/// `==` on `Float` is not reflexive, so congruence closure over it is unsound and **no** obligation
-/// mentioning one may be proved.
+/// `==` on `Float` is not reflexive, so congruence closure over it is unsound.
 #[test]
 fn no_obligation_that_can_reach_a_float_is_proved() {
     let claims: &[(&str, &str)] = &[
@@ -109,8 +104,7 @@ fn no_obligation_that_can_reach_a_float_is_proved() {
             "visible parameter",
             "type Box<a> = B(a)\nlaw \"visible parameter\" forall (b: Box<Float>) { b == b }",
         ),
-        // The four below reach a `Float` through a *declaration* rather than through the binder's
-        // written type.
+        // The four below reach a `Float` through a declaration rather than the binder's written type.
         (
             "hidden in a variant",
             "type Money = Cents(Float)\nlaw \"hidden in a variant\" forall (m: Money) { m == m }",
@@ -196,9 +190,6 @@ fn a_certificate_over_a_hidden_float_is_refuted_by_sampling() {
     );
 }
 
-/// The same defect on a definition's own `ensures`, and the tightest statement of it available: one
-/// file where the spec is `proved` and a law asserting the very thing the proof would have to cover
-/// is *refuted*, at the value the proof does not hold at.
 #[test]
 fn an_ensures_over_a_hidden_float_is_not_proved() {
     let run = Run::of(
@@ -220,10 +211,7 @@ fn an_ensures_over_a_hidden_float_is_not_proved() {
     );
 }
 
-// --- `Decimal`, `Map`, `Bytes`: the refusals that must stay refusals --------
-
-/// `Decimal`'s `==` is an equivalence relation, so congruence over it is sound and reflexivity is a
-/// genuine proof.
+/// `Decimal`'s `==` is an equivalence relation, so congruence over it is sound.
 #[test]
 fn decimal_is_congruent_and_never_arithmetic() {
     let run = Run::of(
@@ -245,8 +233,7 @@ fn decimal_is_congruent_and_never_arithmetic() {
     }
 }
 
-/// A `Map` is opaque: there is no theory of arrays here, so nothing about `map_get` after
-/// `map_insert` may be concluded, and neither may anything about `map_len`.
+/// There is no theory of arrays: nothing about `map_get` after `map_insert`, or about `map_len`, may be concluded.
 #[test]
 fn a_map_is_opaque_to_the_prover() {
     let run = Run::of(
@@ -296,16 +283,14 @@ fn the_byte_builtins_are_uninterpreted() {
         never_proved(source, needle);
     }
 
-    // Two occurrences of one `Bytes` literal are deliberately not one term, so even the trivially
-    // true claim about them is `property`.
+    // Two occurrences of one `Bytes` literal are deliberately not one term, so even this is `property`.
     never_proved(
         "law \"two literals\" forall (n: Int) { b\"ab\" == b\"ab\" }",
         "two literals",
     );
 }
 
-/// A derived dictionary is an ordinary record of closures, so an obligation stated through one is
-/// outside the fragment.
+/// A derived dictionary is an ordinary record of closures, outside the fragment.
 #[test]
 fn a_derived_dictionary_carries_no_proof() {
     for (needle, source) in [

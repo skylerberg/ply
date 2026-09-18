@@ -70,9 +70,7 @@ fn a_rename_touches_every_file_that_mentions_the_symbol() {
     applied.undo().unwrap();
 }
 
-/// With more than one repeat, an edit scenario has to re-prove its dependents every time: if
-/// the cache is not restored, every repeat after the first is a warm run and the fastest one is
-/// reported.
+/// Without restoring the cache, every repeat after the first is warm and the fastest is reported.
 #[test]
 fn an_edit_scenario_reselects_on_every_repeat() {
     let dir = tempfile::tempdir().unwrap();
@@ -104,7 +102,6 @@ fn an_edit_scenario_reselects_on_every_repeat() {
     );
 }
 
-/// The headline invariant, measured rather than asserted in the abstract.
 #[test]
 fn renaming_selects_no_more_than_an_unchanged_run() {
     let dir = tempfile::tempdir().unwrap();

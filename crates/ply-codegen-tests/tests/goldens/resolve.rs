@@ -1,11 +1,3 @@
-//! The second comparison: `resolve.ply`'s resolution of a whole program — the tables, the load
-//! order, the diagnostics and the post-defaults trees — against a blessed golden, over the
-//! standard library, the standard library with each example, the hand-written programs beside
-//! this file, and every program the reference's own tests build.
-//!
-//! The port is entered in-process through `port`: the bundle the binary carries is the compiler
-//! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
-
 use crate::harness::{fixtures, golden, own, part, port, programs, records, repo_root};
 use std::path::PathBuf;
 

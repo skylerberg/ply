@@ -3,10 +3,7 @@ use ply_codegen::c::tables::Tables;
 use ply_eval::Value;
 use ply_span::Symbol;
 
-/// A body goes to disk and comes back the same, tables and all.
-///
-/// The tables hold names a program chose, so they can be spelled anything -- `text` included,
-/// which is what a marker-terminated format gets wrong and why the text's start is an offset.
+/// Table names can be spelled anything, `text` included, so the text's start is an offset rather than a marker.
 #[test]
 fn a_body_round_trips_through_the_encoding() {
     let mut t = Tables::default();

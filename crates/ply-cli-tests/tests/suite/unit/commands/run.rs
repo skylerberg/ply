@@ -88,8 +88,7 @@ fn a_missing_main_never_points_at_an_unrelated_definition() {
     assert!(!ply_span::render::to_terminal(&d, &l.sources).is_empty());
 }
 
-/// With several modules no file is the answer, so labelling one would be picking by load order
-/// — the same thing `ply run` refuses to do for two `main`s.
+/// Labelling one file would be picking by load order, which `ply run` refuses to do for two `main`s.
 #[test]
 fn a_missing_main_across_several_modules_labels_no_file_at_all() {
     let dir = tempfile::tempdir().unwrap();

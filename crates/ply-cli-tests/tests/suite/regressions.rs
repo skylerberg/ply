@@ -1,5 +1,3 @@
-//! Regressions for defects that survived a previous round of audits.
-
 use ply_cli::driver;
 use ply_cli::load::{Loaded, load};
 use ply_span::{Symbol, codes};
@@ -21,8 +19,7 @@ fn incremental(dir: &Path) -> Loaded {
     driver::load_incremental(dir, &mut store).expect("the corpus checks")
 }
 
-/// A name a file imports but never uses appears in no `deps` entry — nothing references it — so
-/// deleting it downstream leaves the importer's bytes and every hash it names untouched.
+/// An imported but unused name is in no `deps` entry, so deleting it leaves every hash the importer names untouched.
 #[test]
 fn deleting_an_unused_selectively_imported_name_is_reported_not_skipped_past() {
     let dir = tempfile::tempdir().unwrap();
@@ -53,9 +50,7 @@ fn deleting_an_unused_selectively_imported_name_is_reported_not_skipped_past() {
     );
 }
 
-/// Inference walks modules dependency-first, so a
-/// `CheckOutput` assembled in check order lists a project's definitions differently depending on
-/// what the cache held.
+/// Inference walks modules dependency-first, so check order depends on what the cache held.
 #[test]
 fn the_published_order_is_the_same_warm_as_cold() {
     let dir = tempfile::tempdir().unwrap();
@@ -90,20 +85,16 @@ fn the_published_order_is_the_same_warm_as_cold() {
     };
     assert_eq!(keys(&warm), keys(&full));
 
-    // And it is the run's own order, so a reader can predict it: files sorted, then each file's
-    // items as written.
+    // The run's own order: files sorted, then each file's items as written.
     let defs: Vec<&str> = full.check.defs.keys().map(|k| k.as_str()).collect();
     assert_eq!(defs, ["app.second", "app.first", "lib.base"]);
 }
 
-/// `Store::flush` writes the result cache and the front-end cache, and the driver used to label
-/// either failure as the front end's.
 #[test]
 fn a_result_cache_write_failure_is_not_blamed_on_the_front_end() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "m.ply", "fn f() -> Int = 1\n");
-    // A directory cannot be replaced by `rename`, so the result cache's atomic write fails while
-    // everything else about the run is fine.
+    // `rename` cannot replace a directory, so only the result cache's atomic write fails.
     fs::create_dir_all(dir.path().join(".ply-cache/results.json")).unwrap();
 
     let mut store = Store::open(dir.path()).unwrap();
@@ -171,8 +162,7 @@ fn three_operations_sharing_one_atom_are_three_reachable_clauses() {
     );
 }
 
-/// The other half: the same operation twice really is unreachable, and the warning names the
-/// operation rather than the atom, because the atom is not what the second clause lost to.
+/// The warning names the operation, not the atom: the atom is not what the second clause lost to.
 #[test]
 fn the_same_operation_handled_twice_is_still_reported() {
     let dir = tempfile::tempdir().unwrap();

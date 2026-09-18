@@ -25,8 +25,7 @@ fn scope(dir: &Path) -> CacheScope {
     }
 }
 
-/// Populates the front-end cache the only way anything ever should: by running the real front
-/// end over a real project.
+/// Populated by running the real front end over a real project.
 fn checked(files: &[(&str, &str)]) -> tempfile::TempDir {
     let dir = project(files);
     let mut store = Store::open(dir.path()).unwrap();
@@ -114,8 +113,7 @@ fn inspect_matches_a_hash_prefix_and_agrees_with_the_name_it_found() {
     );
 }
 
-/// Three characters is not a hash prefix, and a name that happens to be hex still has to match
-/// as a name.
+/// A name that happens to be hex still has to match as a name.
 #[test]
 fn a_query_shorter_than_four_characters_is_never_read_as_a_hash() {
     let dir = checked(&[("m.ply", "fn one() -> Int = 1\n")]);
@@ -183,9 +181,7 @@ fn inspect_reports_a_test_with_its_cached_outcome() {
     );
 }
 
-/// Two modules declaring one simple name is an honest ambiguity — the store holds no namespace
-/// that could pick between them — so both are printed, in an order that must not depend on how
-/// the store iterates.
+/// The store holds no namespace to pick between them, so both print, in an order independent of store iteration.
 #[test]
 fn a_simple_name_declared_twice_yields_both_in_a_stable_order() {
     let dir = checked(&[
@@ -220,7 +216,6 @@ fn an_edited_file_withholds_a_line_and_column_rather_than_guessing() {
     assert_eq!(entry.location, None);
 }
 
-/// The case a length check cannot catch.
 #[test]
 fn an_edit_that_preserves_the_length_is_still_stale() {
     let dir = checked(&[("m.ply", "fn one() -> Int = 1\nfn two() -> Int = 2\n")]);

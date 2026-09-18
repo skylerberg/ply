@@ -1,12 +1,9 @@
-//! `ply check --types` over a service, and the provenance `--explain` adds.
-
 use assert_cmd::Command;
 use serde_json::Value;
 use std::path::Path;
 use tempfile::TempDir;
 
-/// A service with two `effect set`s, an endpoint that performs less than it declares, and endpoints
-/// that write their rows out.
+/// Two `effect set`s, an endpoint that performs less than it declares, and endpoints that write their rows out.
 const SERVICE: &str = r#"
 effect store {
   read  all[table]() -> List<Int>
@@ -52,7 +49,6 @@ fn stdout_of(output: &std::process::Output) -> String {
     String::from_utf8(output.stdout.clone()).expect("stdout is utf-8")
 }
 
-/// The block one module contributes, from its heading to the end.
 fn module_block(text: &str) -> String {
     let start = text
         .find("\n   m ")
@@ -91,8 +87,6 @@ fn types(dir: &Path, extra: &[&str]) -> String {
     stdout_of(&output)
 }
 
-// --- the signatures ---------------------------------------------------------
-
 #[test]
 fn a_services_per_endpoint_footprints_are_legible_in_one_command() {
     let dir = project(SERVICE);
@@ -121,7 +115,6 @@ fn a_services_per_endpoint_footprints_are_legible_in_one_command() {
     );
 }
 
-/// what the reviewing command prints in its strongest form: the truth needs no flag.
 #[test]
 fn the_expansion_is_printed_without_a_flag_and_the_alias_is_not() {
     let dir = project(SERVICE);
@@ -135,9 +128,7 @@ fn the_expansion_is_printed_without_a_flag_and_the_alias_is_not() {
     assert!(text.contains("m.store.write[orders]"), "{text}");
 }
 
-/// No line may exceed the fixed width, and the width is fixed rather than the terminal's: this
-/// output is diffed, so a run in a narrow window and a run in a wide one have to produce the same
-/// bytes.
+/// The width is fixed rather than the terminal's, because this output is diffed.
 #[test]
 fn no_signature_line_runs_past_the_column_it_wraps_at() {
     let dir = project(SERVICE);
@@ -152,9 +143,6 @@ fn no_signature_line_runs_past_the_column_it_wraps_at() {
     }
 }
 
-// --- --explain --------------------------------------------------------------
-
-/// The set table and the provenance, pinned whole.
 #[test]
 fn explain_prints_the_set_table_the_alias_and_the_difference_it_hides() {
     let dir = project(SERVICE);
@@ -204,7 +192,6 @@ fn explain_prints_the_set_table_the_alias_and_the_difference_it_hides() {
     );
 }
 
-/// A set used through another set is used.
 #[test]
 fn an_included_set_counts_the_definitions_that_reach_it() {
     let dir = project(SERVICE);
@@ -220,9 +207,6 @@ fn an_included_set_counts_the_definitions_that_reach_it() {
     );
 }
 
-/// The cost of an over-broad alias: `--explain` must print the same bytes for a warm run, a cold
-/// one and a run that keeps no cache at all, or the reviewing command's output is a function of
-/// what the cache held.
 #[test]
 fn explain_prints_the_same_bytes_warm_cold_and_uncached() {
     let dir = project(SERVICE);
@@ -233,8 +217,6 @@ fn explain_prints_the_same_bytes_warm_cold_and_uncached() {
     assert_eq!(module_block(&cold), module_block(&warm));
     assert_eq!(module_block(&cold), module_block(&fresh));
 }
-
-// --- --json -----------------------------------------------------------------
 
 fn json_types(dir: &Path, extra: &[&str]) -> Value {
     let output = ply(dir)
@@ -247,8 +229,6 @@ fn json_types(dir: &Path, extra: &[&str]) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("stdout was not one object: {e}\n{text}"))
 }
 
-/// The provenance an agent reads, and the rule that keeps it honest: present only under
-/// `--explain`, so the object either carries these fields or does not, and never a subset.
 #[test]
 fn the_json_report_carries_the_provenance_only_under_explain() {
     let dir = project(SERVICE);
@@ -288,8 +268,6 @@ fn the_json_report_carries_the_provenance_only_under_explain() {
     assert!(explained.is_object());
 }
 
-/// `--json --explain` completes the parse too, so its provenance cannot be a function of what the
-/// cache held either.
 #[test]
 fn the_json_provenance_is_the_same_warm_and_cold() {
     let dir = project(SERVICE);
@@ -302,17 +280,12 @@ fn the_json_provenance_is_the_same_warm_and_cold() {
     assert_eq!(cold["definitions"], warm["definitions"]);
 }
 
-// --- the real service -------------------------------------------------------
-
 fn repo(rel: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(rel)
 }
 
-/// The claim on the example service rather than on a fixture only this file has ever seen: every
-/// endpoint that touches a resource prints a row, the pure parts of routing print none, and no
-/// alias name reaches the output.
 #[test]
 fn the_example_service_reads_as_a_map_of_the_api_to_what_it_touches() {
     let desk = repo("examples/desk.ply");
@@ -356,10 +329,6 @@ fn the_example_service_reads_as_a_map_of_the_api_to_what_it_touches() {
     }
 }
 
-// --- ply prove --------------------------------------------------------------
-
-/// The cost of an over-broad alias: the footprint is the frame condition, so an annotation wider than the body
-/// promises less about less — at the same tier and with no other sign that anything was lost.
 #[test]
 fn prove_explain_names_what_an_over_broad_row_gave_up() {
     let dir = project(
@@ -392,8 +361,7 @@ pub fn count() -> Int / {Web}
         "the alias name is provenance, never the claim:\n{text}"
     );
 
-    // A definition whose row is exactly its body's gives nothing up, so there is nothing to report
-    // and the line is absent rather than empty.
+    // A row exactly its body's gives nothing up, so the line is absent rather than empty.
     let tight = project("pub fn double(x: Int) -> Int\n  ensures result >= x\n  = x + x\n");
     let text = stdout_of(
         &ply(tight.path())
