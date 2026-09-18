@@ -1,32 +1,12 @@
-//! Diagnostics as length-framed text: what the self-hosted front end answers over a program,
-//! read back into [`Diagnostic`] values, and the same text written from them, so the two sides
-//! of a differential encode one way and cannot drift apart.
-//!
-//! ```text
-//! diag <index> <payload length>\n<payload>
-//! ```
-//!
-//! One frame per diagnostic, in report order. A payload is a run of fields, each
-//! `<key> <length>\n<bytes>` with the next field starting right after the bytes:
-//!
-//! ```text
-//! code <n>\nE0201
-//! severity <n>\nerror                                   error | warning
-//! message <n>\n<message text>
-//! label <n>\n<module> <start> <end> <0|1>\n<label text>  one per label, the primary first
-//! note <n>\n<note text>                                  one per note, in order
-//! ```
-//!
-//! Every length is in bytes, so no payload byte is a delimiter. A module is its index into the
-//! source list both sides were handed, which the caller builds in `SourceMap` order so that the
-//! index is the `SourceId`.
+//! Diagnostics as length-framed text, written and read by one codec so both sides of a
+//! differential encode one way.
 
 use crate::{Diagnostic, Label, Severity, SourceId, Span, codes};
 
 /// The module index of a span outside every module: [`Span::DUMMY`]'s source.
 const NO_MODULE: u32 = u32::MAX;
 
-/// The frame text for `diags`, each label's module written as its position in `sources`.
+/// Each label's module is written as its position in `sources`.
 pub fn write_diagnostics(diags: &[Diagnostic], sources: &[SourceId]) -> Result<String, String> {
     let mut out = String::new();
     for (index, d) in diags.iter().enumerate() {
@@ -87,9 +67,7 @@ fn module_index(span: Span, sources: &[SourceId], index: usize) -> Result<u32, S
         })
 }
 
-/// Every diagnostic in `dump`, each label's module read as an index into `sources`. A frame kind,
-/// a field key or a code the protocol does not know is an error naming it, and so is a frame or a
-/// field that ends before its length says.
+/// Each label's module is read as an index into `sources`; unknown or truncated input is an error.
 pub fn read_diagnostics(dump: &str, sources: &[SourceId]) -> Result<Vec<Diagnostic>, String> {
     let mut frames = Cursor::new(dump.as_bytes(), "frame");
     let mut out = Vec::new();
@@ -205,8 +183,7 @@ fn label(text: &str, sources: &[SourceId], index: usize) -> Result<Label, String
     })
 }
 
-/// Reads `<words...> <length>\n<bytes>` units off a byte string: the frames of a dump, and the
-/// fields of a frame's payload. Shared with the readers of the other protocols framed this way.
+/// Reads `<words...> <length>\n<bytes>` units; shared with the other protocols framed this way.
 pub struct Cursor<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -228,7 +205,7 @@ impl<'a> Cursor<'a> {
         self.at
     }
 
-    /// The next unit's header words, without its length, and the bytes the length framed.
+    /// The header words (length excluded) and the bytes the length framed.
     pub fn unit(&mut self) -> Result<(Vec<&'a str>, &'a [u8]), String> {
         let rest = &self.bytes[self.at..];
         let Some(nl) = rest.iter().position(|b| *b == b'\n') else {
@@ -256,9 +233,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// The codes the self-hosted front end raises, each built through its own constructor so that a
-/// code the Rust front end stops raising stays constructed here. A code outside this set is not one
-/// the port answers, and the reader refuses it rather than guessing a constant for it.
+/// The codes the self-hosted front end raises; any other code is refused rather than guessed.
 fn by_code(code: &str, message: &str) -> Option<Diagnostic> {
     Some(match code {
         "E0001" => Diagnostic::error(codes::UNEXPECTED_TOKEN, message),

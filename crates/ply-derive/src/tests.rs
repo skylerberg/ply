@@ -13,8 +13,7 @@ fn parse(source: &str) -> Module {
     }
 }
 
-/// The generated source, having also checked that expansion itself is clean and that what it
-/// produced went into `items`.
+/// The generated source, after asserting expansion was clean and landed in `items`.
 fn generated(source: &str) -> Vec<String> {
     let mut module = parse(source);
     let before = module.items.len();
@@ -181,7 +180,6 @@ fn generation_does_not_depend_on_the_order_unrelated_items_were_written_in() {
     assert_eq!(a, b);
 }
 
-/// The golden pin.
 #[test]
 fn the_generated_form_is_pinned() {
     let source = format!(
@@ -347,8 +345,7 @@ fn a_module_without_the_deriver_s_runtime_module_is_told_to_import_it() {
     assert!(d[0].notes.iter().any(|n| n.contains("import std.json")));
 }
 
-/// A selective import binds no module name, so expansion adds one and the generated body writes
-/// through it.
+/// A selective import binds no module name, so expansion adds one.
 #[test]
 fn a_selective_import_of_std_json_still_writes_a_module_binder() {
     let source = "import std.json (JsonCodec, Json, object, field, int_json)\n\
@@ -367,8 +364,7 @@ fn a_selective_import_of_std_json_still_writes_a_module_binder() {
     );
 }
 
-/// The binder expansion adds cannot collide with one the file already bound, and which name it
-/// picks is a function of the file's own imports.
+/// The name picked depends only on the file's own imports.
 #[test]
 fn a_synthesized_binder_steps_around_the_names_the_file_already_binds() {
     let g = one(
