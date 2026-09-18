@@ -40,7 +40,6 @@ impl Writer {
         self.buf.extend_from_slice(&value.to_le_bytes());
     }
 
-    /// A collection's element count.
     pub(crate) fn count(&mut self, count: usize) {
         self.u32(u32::try_from(count).unwrap_or(u32::MAX));
     }
@@ -158,8 +157,7 @@ impl<'a> Reader<'a> {
         Ok(ContentHash(out))
     }
 
-    /// Trailing bytes mean the payload was written by something that does not agree with this
-    /// decoder about the shape, which is exactly the case that must not be read as a value.
+    /// Trailing bytes mean a writer that disagrees with this decoder about the shape.
     pub(crate) fn end(self, what: &'static str) -> Decoded<()> {
         if self.remaining() != 0 {
             return Err(DecodeError { what, at: self.pos });

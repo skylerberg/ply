@@ -1,11 +1,4 @@
-//! Whether an append copies, decided before the program runs.
-//!
-//! Since ADR 0034 the machine moves a binding's value out of its slot at its last use, so the
-//! positional rule this checker once transcribed no longer exists: nothing is decided by where an
-//! expression sits in its enclosing call or literal. What is left — and what this reports — is the
-//! *residue*: the copies the semantics require, because something else genuinely owns the value
-//! when the append runs. A cell's arena, a map, a closure's capture, a caller that keeps reading
-//! what it passed, a binding read again later.
+//! Whether an append copies: exactly when something else still owns the list when it runs.
 
 use crate::builtins::Builtin;
 use crate::code::{self, Code, NodeKind, Stmt};
@@ -15,7 +8,6 @@ use ply_syntax::ast::{Item, Program, QName};
 use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-/// What the checker says one `push` site will cost.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Verdict {
     Reuses,
@@ -33,34 +25,28 @@ impl Verdict {
     }
 }
 
-/// Why a site is not `Reuses`, in the form a diagnostic can dispatch on.
+/// Why a site is not `Reuses`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
 pub enum Cause {
-    /// The binding is read again after this use, so this use clones the value.
     ReadAgain,
-    /// The list came out of a cell, whose region arena holds it for the whole of the append.
+    /// The list came out of a cell, whose region arena still holds it.
     Cell,
-    /// The list came out of a map, which still holds it.
     MapEntry,
-    /// A closure captured the binding, and holds its own copy of the value.
     Capture,
-    /// The list is a parameter and a caller keeps what it passes.
     CallerKeeps,
-    /// The list is an element of a list being walked, which still holds it.
+    /// An element of a list being walked, which still holds it.
     Element,
-    /// A top-level definition named outside callee position, so the program holds it.
+    /// A top-level definition named outside callee position.
     Program,
-    /// The value a call answered, which the callee may also hold.
+    /// A call's result, which the callee may also hold.
     Call,
-    /// The value a handler, a `handle` or a `simulate` answered.
+    /// The result of a handler, a `handle` or a `simulate`.
     Handler,
-    /// A free variable of a closure, where whether the closure's copy is still held when the
-    /// append runs is not a property of this body.
+    /// A free variable of a closure; whether its copy is still held is unknown here.
     Closure,
 }
 
 impl Cause {
-    /// The source edit that removes the copy, or `None` where no edit does.
     pub fn fix(self) -> Option<&'static str> {
         match self {
             Cause::ReadAgain => Some(
@@ -91,7 +77,6 @@ impl Cause {
     }
 }
 
-/// A cause and the sentence a diagnostic would print for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Why {
     cause: Cause,
@@ -106,7 +91,6 @@ impl Why {
         }
     }
 
-    /// The same cause with a sentence that says where it was met.
     fn reworded(&self, text: String) -> Why {
         Why {
             cause: self.cause,
@@ -115,31 +99,25 @@ impl Why {
     }
 }
 
-/// One `push` in one definition.
 #[derive(Clone, Debug)]
 pub struct Site {
     pub span: Span,
     pub verdict: Verdict,
-    /// Why, in the words a diagnostic would use.
     pub reason: String,
-    /// `None` at a [`Verdict::Reuses`] site, which has no cause to name.
+    /// `None` at a [`Verdict::Reuses`] site.
     pub cause: Option<Cause>,
-    /// Whether the lowering marked this append's **list argument** [`Own::Owned`] — the machine's
-    /// own move decision, recorded so the checker can be judged against it.
+    /// Whether the lowering marked the list argument [`Own::Owned`], to judge the checker against.
     pub own_marked: bool,
-    /// `Some(k)` when the list is the definition's parameter `k`, reaching the append at its last
-    /// use: whatever the verdict says about callers, the body itself hands the list over.
+    /// `Some(k)` when the list is parameter `k` at its last use.
     pub param: Option<usize>,
 }
 
 impl Site {
-    /// The source edit that would remove this copy, if one would.
     pub fn fix(&self) -> Option<&'static str> {
         self.cause.and_then(Cause::fix)
     }
 }
 
-/// What kind of item a [`Definition`] came from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DefKind {
     Fn,
@@ -147,7 +125,6 @@ pub enum DefKind {
     Law,
 }
 
-/// Every `push` site in one definition.
 #[derive(Clone, Debug)]
 pub struct Definition {
     pub name: String,
@@ -175,14 +152,11 @@ impl Definition {
     }
 }
 
-/// What the checker found, whole program.
 #[derive(Clone, Debug)]
 pub struct Report {
     defs: Vec<Definition>,
-    /// How many rounds the fixpoint took.
     pub rounds: usize,
-    /// Definitions whose parameters the fixpoint could not keep sole-owned, and what spoiled each
-    /// one.
+    /// Parameters the fixpoint could not keep sole-owned, with what spoiled each.
     pub spoiled: Vec<(String, usize, String)>,
 }
 
@@ -191,27 +165,21 @@ impl Report {
         &self.defs
     }
 
-    /// One module's definitions, in source order.
     pub fn module(&self, index: usize) -> Vec<&Definition> {
         self.defs.iter().filter(|d| d.module == index).collect()
     }
 }
 
-/// Who owns a value besides the place it is standing.
+/// Who owns a value besides the place it stands.
 #[derive(Clone, Debug)]
 enum Owner {
-    /// Nothing else can reach it.
     Fresh,
-    /// This definition's `k`th parameter, which is sole-owned exactly when every caller hands one
-    /// over and stops reading it.
+    /// Sole-owned exactly when every caller hands it over and stops reading it.
     Param(usize),
-    /// Provably held by something else when it is used.
     Blocked(Why),
-    /// Not decidable from this body.
     Unknown(Why),
 }
 
-/// [`Owner`], settled for a site or a callee demand.
 #[derive(Clone, Debug, Default)]
 enum Res {
     #[default]
@@ -230,36 +198,30 @@ fn to_res(owner: Owner) -> Res {
     }
 }
 
-/// One binding in the scope the machine would have built.
 #[derive(Clone, Debug)]
 struct Binding {
     name: Symbol,
-    /// What the value bound here is worth *besides* this binding itself.
     owner: Owner,
 }
 
 struct State {
     chain: Vec<Binding>,
-    /// The module the body being walked belongs to, for name resolution.
     module: usize,
 }
 
 impl State {
-    /// The innermost binding of `name`, which is the one a lookup would find.
     fn index_of(&self, name: &Symbol) -> Option<usize> {
         self.chain.iter().rposition(|b| &b.name == name)
     }
 }
 
-/// The checker over one program.
 pub struct Costs<'a> {
     program: &'a Program,
     resolved: &'a Resolved,
-    /// Program-wide name of every top-level `fn`, and its arity.
+    /// Program-wide name of every top-level `fn`, to its arity.
     defs: FxHashMap<Symbol, usize>,
 }
 
-/// What a whole-program pass concluded about one parameter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ParamState {
     Sole,
@@ -285,12 +247,10 @@ impl ParamState {
     }
 }
 
-/// What a definition's body answers with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RetState {
     Fresh,
-    /// The body answers its `k`th parameter, so the call answers whatever the argument at that
-    /// position was worth.
+    /// The body returns its `k`th parameter.
     Param(usize),
     Shared(Why),
     Unsure(Why),
@@ -302,7 +262,6 @@ struct Tables {
     rets: FxHashMap<Symbol, RetState>,
 }
 
-/// One definition, lowered once and walked once per round.
 struct Body<'p> {
     label: String,
     qname: Option<Symbol>,
@@ -314,7 +273,6 @@ struct Body<'p> {
     _marker: std::marker::PhantomData<&'p ()>,
 }
 
-/// What one round of walking found.
 #[derive(Default)]
 struct Found {
     sites: Vec<(Span, Res, bool)>,
@@ -324,7 +282,6 @@ struct Found {
     ret: Res,
 }
 
-/// How many rounds the fixpoint is allowed.
 const MAX_ROUNDS: usize = 24;
 
 impl<'a> Costs<'a> {
@@ -346,7 +303,6 @@ impl<'a> Costs<'a> {
         }
     }
 
-    /// Walk every definition to a fixpoint, then read the verdicts off it.
     pub fn check(&self) -> Report {
         let bodies = self.bodies();
         let mut tables = Tables {
@@ -373,8 +329,7 @@ impl<'a> Costs<'a> {
             }
             tables = next;
         }
-        // One more walk under the settled tables, so every verdict is read off the answer rather
-        // than off the round that produced it.
+        // Verdicts come from a walk under the settled tables, not the round that produced them.
         let found = self.round(&bodies, &tables);
 
         let mut spoiled: Vec<(String, usize, String)> = Vec::new();
@@ -412,7 +367,6 @@ impl<'a> Costs<'a> {
         }
     }
 
-    /// Every definition, test and law, lowered once.
     fn bodies(&self) -> Vec<Body<'a>> {
         let mut out = Vec::new();
         for (index, module) in self.program.modules.iter().enumerate() {
@@ -479,8 +433,7 @@ impl<'a> Costs<'a> {
                     .map(|(k, name)| Binding {
                         name: name.clone(),
                         owner: match body.qname {
-                            // A test or a law has no caller: its binders are whatever the harness
-                            // built.
+                            // A test or a law has no caller.
                             None => Owner::Fresh,
                             Some(_) => Owner::Param(k),
                         },
@@ -497,7 +450,6 @@ impl<'a> Costs<'a> {
             .collect()
     }
 
-    /// One step of the fixpoint: what the round just walked says the tables should be.
     fn settle(&self, bodies: &[Body<'_>], found: &[Found], tables: &Tables) -> Tables {
         let mut params: FxHashMap<Symbol, Vec<ParamState>> = self
             .defs
@@ -548,7 +500,6 @@ impl<'a> Costs<'a> {
     }
 }
 
-/// What one call site's argument says about the callee's parameter.
 fn interpret(res: &Res, caller: Option<&Symbol>, tables: &Tables, at: &str) -> ParamState {
     match res {
         Res::Unique => ParamState::Sole,
@@ -642,7 +593,6 @@ fn finish(
     }
 }
 
-/// One definition's traversal, under the tables the last round settled.
 struct Walk<'c, 'a> {
     costs: &'c Costs<'a>,
     tables: &'c Tables,
@@ -685,7 +635,7 @@ impl Walk<'_, '_> {
             NodeKind::App { func, args } => {
                 let builtin = self.builtin_of(func, st);
                 let callee = self.callee_of(func, st);
-                // A callee written as a name is not the definition *escaping*: it is the call.
+                // A callee written as a name is a call, not the definition escaping.
                 if !matches!(func.kind, NodeKind::Var { .. }) {
                     self.walk(func, st);
                 }
@@ -790,9 +740,7 @@ impl Walk<'_, '_> {
             }
 
             NodeKind::Field { base, field } => {
-                // A projection takes the field out when the record arrives at one owner — the
-                // machine probes uniqueness at the access — and clones it otherwise, so the field
-                // is worth what the record was.
+                // The machine moves the field out of a uniquely owned record and clones otherwise.
                 match self.walk(base, st) {
                     Owner::Blocked(why) => Owner::Blocked(why.reworded(format!(
                         "`.{}` was read out of a record something else still holds: {}",
@@ -866,7 +814,7 @@ impl Walk<'_, '_> {
         }
     }
 
-    /// A construct whose body may run again, later, or beside another task.
+    /// A body that may run again, later, or beside another task, so it sees no outer bindings.
     fn barrier(&mut self, params: &[Symbol], body: &Code, st: &mut State, owners: &[Owner]) {
         let held = std::mem::take(&mut st.chain);
         st.chain = params
@@ -886,9 +834,7 @@ impl Walk<'_, '_> {
         st.chain = held;
     }
 
-    /// A capture that clones keeps a copy for the closure's whole life, so the binding's value has
-    /// a second owner from here on; a capture that moves leaves the binding dead, which the
-    /// liveness pass already guarantees nothing reads.
+    /// A cloning capture gives the binding a second owner; a moving one leaves it dead.
     fn poison_captures(&mut self, captures: &code::Captures, st: &mut State) {
         for (j, name) in captures.names.iter().enumerate() {
             if captures.owns.get(j) == Some(&Own::Owned) {
@@ -905,12 +851,10 @@ impl Walk<'_, '_> {
         }
     }
 
-    /// What a name is worth where it is read.
     fn var_owner(&mut self, q: &QName, own: Own, st: &mut State) -> Owner {
         let bare = q.is_bare();
         if let Some(i) = bare.then(|| st.index_of(q.symbol())).flatten() {
-            // A move takes the binding's value with whatever other owners it already had; a clone
-            // is itself the second owner.
+            // A move keeps the binding's other owners; a clone is itself a second owner.
             return match own {
                 Own::Owned => st.chain[i].owner.clone(),
                 _ => Owner::Blocked(Why::new(
@@ -922,8 +866,7 @@ impl Walk<'_, '_> {
                 )),
             };
         }
-        // A definition named outside callee position is a definition applied by something this
-        // analysis cannot see.
+        // Named outside callee position, a definition is applied by callers this cannot see.
         if let Some(name) = self.costs.resolve_name(st.module, q)
             && self.costs.defs.contains_key(&name)
         {
@@ -939,7 +882,6 @@ impl Walk<'_, '_> {
                 "a module-qualified name denotes something the program holds",
             ));
         }
-        // A free variable of the enclosing closure.
         Owner::Unknown(Why::new(
             Cause::Closure,
             format!(
@@ -950,7 +892,6 @@ impl Walk<'_, '_> {
         ))
     }
 
-    /// The builtin a callee names, or `None` when it names something else.
     fn builtin_of(&self, func: &Code, st: &State) -> Option<Builtin> {
         let NodeKind::Var { name: q, .. } = &func.kind else {
             return None;
@@ -959,15 +900,13 @@ impl Walk<'_, '_> {
             return None;
         }
         let name = q.symbol();
-        // A local binding or a definition of the same name shadows the builtin, exactly as
-        // `Machine::lookup` orders them.
+        // Locals and definitions shadow builtins, as in `Machine::lookup`.
         if st.index_of(name).is_some() || self.costs.global(st.module, name).is_some() {
             return None;
         }
         Builtin::from_name(name)
     }
 
-    /// The definition a callee names, when it names one.
     fn callee_of(&self, func: &Code, st: &State) -> Option<Symbol> {
         let NodeKind::Var { name: q, .. } = &func.kind else {
             return None;
@@ -979,7 +918,6 @@ impl Walk<'_, '_> {
         self.costs.defs.contains_key(&name).then_some(name)
     }
 
-    /// What the value a call answers is worth.
     fn result_owner(
         &self,
         builtin: Option<Builtin>,
@@ -1008,8 +946,6 @@ impl Walk<'_, '_> {
             };
         };
         match b {
-            // Each builds a fresh `Vec` and hands it back; `push`'s two arms, and `list_set`'s,
-            // both answer a list nothing else has seen.
             Builtin::Push | Builtin::ListSet | Builtin::Map | Builtin::Filter | Builtin::Range => {
                 Owner::Fresh
             }
@@ -1022,7 +958,6 @@ impl Walk<'_, '_> {
                 Cause::MapEntry,
                 "`map_get` answers a clone the map still holds",
             )),
-            // The same fact as `map_get`'s, over a list.
             Builtin::ListAt => Owner::Blocked(Why::new(
                 Cause::Element,
                 "`list_at` answers a clone the list still holds",
@@ -1031,13 +966,10 @@ impl Walk<'_, '_> {
                 Cause::Call,
                 "`fold` answers whatever its callback answered",
             )),
-            // `map_update` answers a map rebuilt around the callback's answer; `cell_update`
-            // answers `Unit`.
             _ => Owner::Fresh,
         }
     }
 
-    /// What the callback builtins hand the function they call.
     fn callback_owners(
         &self,
         builtin: Option<Builtin>,
@@ -1064,10 +996,9 @@ impl Walk<'_, '_> {
                 Some(vec![seed, element])
             }
             Builtin::Map | Builtin::Filter => Some(vec![element]),
-            // The whole point of the fused update: the contents leave the arena for the length
-            // of the call, so the function is handed them at one owner.
+            // The contents leave the arena for the call, so the function gets them uniquely owned.
             Builtin::CellUpdate => Some(vec![Owner::Fresh]),
-            // The entry leaves the map, so it is at one owner exactly when the map was.
+            // The entry leaves the map, so it is uniquely owned exactly when the map was.
             Builtin::MapUpdate => Some(vec![match done.first() {
                 Some(Res::Unique) => Owner::Fresh,
                 Some(Res::Param(k)) => Owner::Param(*k),
@@ -1079,8 +1010,7 @@ impl Walk<'_, '_> {
         }
     }
 
-    /// A callback written at the call site, entered with the owners the builtin is known to hand it
-    /// rather than with the `Unknown` a closure of unknown provenance gets.
+    /// A callback written at the call site gets the owners the builtin is known to hand it.
     fn walk_callback(&mut self, owners: &[Owner], arg: &Code, st: &mut State) -> Owner {
         let NodeKind::Lambda {
             params,
@@ -1089,7 +1019,6 @@ impl Walk<'_, '_> {
             ..
         } = &arg.kind
         else {
-            // Named elsewhere: its body is checked where it is defined.
             return self.walk(arg, st);
         };
         self.barrier(params, body, st, owners);
@@ -1114,7 +1043,6 @@ impl Costs<'_> {
             .map(|b| b.qualified.clone())
     }
 
-    /// The definition a bare name denotes, if it denotes one.
     fn global(&self, module: usize, name: &Symbol) -> Option<Symbol> {
         let found = self
             .resolved
@@ -1126,7 +1054,6 @@ impl Costs<'_> {
     }
 }
 
-/// Joins two branch answers.
 fn join(a: Owner, b: Owner) -> Owner {
     match (to_res(a), to_res(b)) {
         (Res::Unique, Res::Unique) => Owner::Fresh,

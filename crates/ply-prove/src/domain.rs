@@ -8,17 +8,15 @@ use ply_ty::IntTy;
 use ply_ty::{LawBinder, Type};
 use std::collections::BTreeMap;
 
-/// A domain small enough to walk, and how to walk it.
 #[derive(Clone, Debug)]
 pub struct Finite {
     pub types: Vec<Type>,
-    /// Cardinality of each binder's type, parallel to `types`.
+    /// Parallel to `types`.
     sizes: Vec<u64>,
     pub points: u64,
 }
 
 impl Finite {
-    /// The binders' types rendered as the product they are, for the certificate.
     pub fn name(&self) -> Symbol {
         if self.types.is_empty() {
             return Symbol::new("unit");
@@ -46,8 +44,7 @@ pub fn finite(binders: &[LawBinder], world: &TypeWorld) -> Option<Finite> {
     let mut points: u64 = 1;
     for binder in binders {
         let size = cardinality(&binder.ty, world)?;
-        // An empty type makes the whole product empty, and a domain of no points is a vacuity
-        // rather than a proof.
+        // A domain of no points is a vacuity, not a proof.
         if size == 0 {
             return None;
         }
@@ -72,7 +69,6 @@ pub fn cardinality(ty: &Type, world: &TypeWorld) -> Option<u64> {
 
 fn size_of(ty: &Type, world: &TypeWorld, open: &mut Vec<Symbol>) -> Option<u64> {
     match ty {
-        // An uninterpreted sort has no cardinality.
         Type::Var(_) => None,
         Type::Fn { .. } => None,
         Type::Record(fields) => fields.values().try_fold(1u64, |acc, f| {
@@ -82,14 +78,9 @@ fn size_of(ty: &Type, world: &TypeWorld, open: &mut Vec<Symbol>) -> Option<u64> 
         Type::Con(name, args) => match name.as_str() {
             "Unit" => Some(1),
             "Bool" => Some(2),
-            // `Float` and `Decimal` are finite sets of machine values and are still not enumerable:
-            // a proof by covering 2^64 points is not a proof anybody runs, and claiming a
-            // cardinality here would put the whole domain inside `ENUMERATION_BOUND`'s arithmetic.
+            // `Float` and `Decimal` are finite but far too large to enumerate.
             "Int" | "String" | "Bytes" | "List" | "Float" | "Decimal" | "Map" => None,
-            // A fixed width *is* a finite set, and a small one at the narrow types: `U8` has 256
-            // values, which is inside `ENUMERATION_BOUND`, so `forall (b: U8)` is discharged by
-            // covering every byte rather than by sampling. Sixty-four bits is a cardinality no
-            // `u64` holds and no run would finish.
+            // 64-bit widths overflow the `u64` cardinality.
             n if IntTy::from_name(n).is_some_and(|t| t.bits() < 64) => {
                 Some(1u64 << IntTy::from_name(n).expect("just checked").bits())
             }
@@ -125,8 +116,6 @@ fn value_at(ty: &Type, world: &TypeWorld, index: u64) -> Option<Value> {
             "Unit" => Some(Value::Unit),
             "Bool" => Some(Value::Bool(index == 1)),
             "Int" | "String" | "Bytes" | "List" | "Float" | "Decimal" | "Map" => None,
-            // Ascending from the type's smallest value, so an exhaustive run walks the type in
-            // its own order.
             n if IntTy::from_name(n).is_some_and(|t| t.bits() < 64) => {
                 let t = IntTy::from_name(n).expect("just checked");
                 Fixed::of(t, t.min() + i128::from(index)).map(Value::Fixed)
@@ -162,7 +151,6 @@ fn value_at(ty: &Type, world: &TypeWorld, index: u64) -> Option<Value> {
     }
 }
 
-/// One point of a product of finite types, with the last varying fastest.
 fn tuple_at(types: &[Type], world: &TypeWorld, index: u64) -> Option<Vec<Value>> {
     let mut rest = index;
     let mut out = Vec::with_capacity(types.len());

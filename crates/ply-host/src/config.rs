@@ -14,16 +14,12 @@ use std::sync::Arc;
 /// The Ply declaration the registrations below are checked against.
 pub const DECLARATION: &str = ply_std::CONFIG;
 
-/// The module the declaration ships as, which is what qualifies [`EFFECT`].
 pub const MODULE: &str = "std.config";
 
-/// The program-wide effect name.
 pub const EFFECT: &str = "std.config.config";
 
-/// What every rendering of a secret configuration value is.
 pub const REDACTED: &str = "****";
 
-/// The two operations a program can perform.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Op {
     Get,
@@ -40,7 +36,6 @@ impl Op {
         }
     }
 
-    /// How a diagnostic names it.
     pub fn what(self) -> &'static str {
         match self {
             Op::Get => "`config.get`",
@@ -48,8 +43,6 @@ impl Op {
         }
     }
 
-    /// The Rust path `ply hosts` prints — the reviewable identity of a member of the trusted
-    /// computing base.
     pub fn path(self) -> &'static str {
         match self {
             Op::Get => "ply_host::config::get",
@@ -61,29 +54,20 @@ impl Op {
         HostOp {
             effect: Symbol::new(EFFECT),
             op: Symbol::new(self.name()),
-            // Whichever namespaces the program writes.
             resource: HostResource::Any,
-            // The environment is not a function of the program's state, so a `det` test that
-            // reaches this is E0412 at compile time and has to supply the values itself.
+            // The environment is not a function of program state; a `det` test supplies values.
             determinism: Determinism::Nondeterministic,
-            // Reading a frozen map twice is the definition of harmless, which is the only reason a
-            // `Repeatable` claim is safe here: it is true because of `Snapshot`'s immutability and
-            // of nothing else.
+            // True only because `Snapshot` is immutable.
             linearity: Linearity::Repeatable,
-            // No file is opened and no syscall is made: every source was read before this handler
-            // existed.
+            // Every source was read before this handler existed.
             blocking: false,
-            // `config.secret` **answers** a `Secret`; neither operation is ever handed one, because
-            // both take a key.
+            // `config.secret` answers a `Secret`; neither operation is handed one.
             secrets: false,
             path: self.path(),
         }
     }
 }
 
-// --- what a value's shape is ------------------------------------------------
-
-/// A declared key's type, as the run checks a resolved value against it.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Shape {
     Text,
@@ -113,7 +97,6 @@ impl Shape {
         }
     }
 
-    /// Whether a value of this shape may be printed.
     pub fn is_secret(self) -> bool {
         self == Shape::Secret
     }
@@ -141,7 +124,6 @@ impl fmt::Display for Shape {
     }
 }
 
-/// One declared key.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Key {
     pub name: String,
@@ -179,8 +161,6 @@ impl Spec {
     }
 }
 
-// --- where a value came from ------------------------------------------------
-
 /// Which of the four sources supplied a value, highest precedence first.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Source {
@@ -188,14 +168,11 @@ pub enum Source {
     Set,
     /// A `--config` file, by the path as the command line wrote it.
     File(String),
-    /// The process environment, read once at bind time.
     Environment,
-    /// The schema's own `default`.
     Default,
 }
 
 impl Source {
-    /// The short word `ply hosts` prints in the `keys` line.
     pub fn as_str(&self) -> &str {
         match self {
             Source::Set => "--set",
@@ -222,22 +199,18 @@ impl fmt::Display for Source {
     }
 }
 
-// --- the sources, read exactly once -----------------------------------------
-
 /// Every key any source supplies, with the source that won.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct Sources {
     resolved: BTreeMap<String, (String, Source)>,
-    /// How many `--set` arguments and `--config` files the command line carried, and how many
-    /// variables the environment held.
+    /// How many `--set` arguments and environment variables were read.
     pub sets: usize,
     pub files: Vec<PathBuf>,
     pub environment: usize,
 }
 
 impl Sources {
-    /// The empty sources: what a run with no `--host` has, and what it keeps whatever the
-    /// environment holds.
+    /// What a run with no `--host` has, whatever the environment holds.
     pub fn unopened() -> Sources {
         Sources::default()
     }
@@ -249,7 +222,6 @@ impl Sources {
         })
     }
 
-    /// [`read`], against an explicit environment and an explicit reader.
     pub fn read_with(
         set: &[String],
         files: &[PathBuf],
@@ -259,8 +231,7 @@ impl Sources {
         let mut diagnostics = Vec::new();
         let mut resolved: BTreeMap<String, (String, Source)> = BTreeMap::new();
 
-        // Lowest precedence first, each overwriting what is under it, so the last write for a key
-        // is the winner and the source recorded with it is the one that won.
+        // Lowest precedence first, so the last write for a key wins and records its source.
         for (key, value) in env {
             if key_shape(key).is_ok() {
                 resolved.insert(key.clone(), (value.clone(), Source::Environment));
@@ -292,8 +263,7 @@ impl Sources {
                 Ok(Some((key, value))) => {
                     resolved.insert(key, (value, Source::Set));
                 }
-                // A `--set` is never blank and never a comment: somebody typed it, so a line the
-                // file format would ignore is a mistake here.
+                // A `--set` was typed on purpose, so a blank or comment is a mistake here.
                 Ok(None) => diagnostics.push(err_bad_set(argument, "it supplies no key")),
                 Err(why) => diagnostics.push(err_bad_set(argument, &why)),
             }
@@ -358,9 +328,6 @@ fn parse_line(line: &str) -> Result<Option<(String, String)>, String> {
     Ok(Some((key.to_string(), value.to_string())))
 }
 
-// --- the snapshot -----------------------------------------------------------
-
-/// One resolved key.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Resolved {
     pub value: String,
@@ -370,7 +337,6 @@ pub struct Resolved {
 }
 
 impl Resolved {
-    /// What a report may print.
     pub fn shown(&self) -> &str {
         match self.shape {
             Some(Shape::Secret) => REDACTED,
@@ -383,12 +349,10 @@ impl Resolved {
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct Snapshot {
     pub values: BTreeMap<String, Resolved>,
-    /// Only the keys a schema declared, so the `SSecret` gate can tell "declared as something else"
-    /// from "not declared at all".
+    /// Only schema-declared keys, so the `SSecret` gate can tell them from undeclared ones.
     declared: BTreeMap<String, Shape>,
     /// Whether this run named a `--config-schema`.
     has_spec: bool,
-    /// Counts, for the start-up banner and `ply hosts`.
     pub sets: usize,
     pub files: Vec<PathBuf>,
     pub environment: usize,
@@ -400,7 +364,6 @@ impl Snapshot {
         Snapshot::default()
     }
 
-    /// Resolve the sources against the schema, before anything is bound.
     pub fn resolve(sources: &Sources, spec: Option<&Spec>) -> Result<Report, Vec<Diagnostic>> {
         let mut diagnostics = Vec::new();
         let mut warnings = Vec::new();
@@ -473,7 +436,6 @@ impl Snapshot {
         })
     }
 
-    /// What `config.get` answers.
     pub fn get(&self, key: &str) -> Option<&str> {
         let resolved = self.values.get(key)?;
         if resolved.shape == Some(Shape::Secret) {
@@ -499,7 +461,6 @@ impl Snapshot {
             .map(|(k, r)| (k.as_str(), r))
     }
 
-    /// How many declared keys each source won, for the banner's config line.
     pub fn counts(&self) -> Counts {
         let mut counts = Counts::default();
         for (_, resolved) in self.declared() {
@@ -533,17 +494,12 @@ pub struct Counts {
     pub secret: usize,
 }
 
-/// A resolution's outcome: the snapshot, and what it wants to say about the command line that
-/// produced it.
 #[derive(Debug)]
 pub struct Report {
     pub snapshot: Snapshot,
     pub warnings: Vec<Diagnostic>,
 }
 
-// --- the handlers -----------------------------------------------------------
-
-/// Register both operations against a snapshot.
 pub fn register(registry: &mut HostRegistry, snapshot: Arc<Snapshot>) {
     for op in Op::ALL {
         registry.register(
@@ -556,7 +512,6 @@ pub fn register(registry: &mut HostRegistry, snapshot: Arc<Snapshot>) {
     }
 }
 
-/// A registry serving `config` and nothing else.
 pub fn registry(snapshot: Arc<Snapshot>) -> HostRegistry {
     let mut registry = HostRegistry::new();
     register(&mut registry, snapshot);
@@ -599,8 +554,6 @@ fn option(value: Option<Value>) -> Value {
         },
     }
 }
-
-// --- diagnostics ------------------------------------------------------------
 
 #[cold]
 fn arity(op: Op, got: usize, span: Span) -> Diagnostic {
@@ -686,7 +639,6 @@ fn err_missing(key: &Key, sources: &Sources) -> Diagnostic {
 
 #[cold]
 fn err_invalid(key: &Key, resolved: &Resolved, why: &str) -> Diagnostic {
-    // The value is printed for every shape but a secret.
     let mut diagnostic = Diagnostic::error(
         codes::CONFIG_INVALID,
         format!(

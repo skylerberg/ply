@@ -1,11 +1,5 @@
-//! The list representation, and the bound on what a shared append costs (ADR 0034 Decision 2).
-//!
-//! A list is a radix trie of `WIDTH`-wide nodes with its newest leaf held apart as the *tail* —
-//! the shape Clojure's vector takes. A list no longer than a leaf is only a tail: one array, the
-//! flat vector the request path is measured on, so a small list costs what it did. Above that, a
-//! push whose path is uniquely held writes in place, a push onto a shared list copies one leaf
-//! and the branches above it, and a `[x, ..rest]` pattern moves an offset rather than copying the
-//! tail. No operation's cost grows with the list's length on a property the source does not show.
+//! A list: a radix trie of `WIDTH`-wide nodes with its newest leaf held apart as the tail.
+//! A push onto a shared list copies one leaf and the branches above it; `rest` moves an offset.
 
 use crate::value::Value;
 use std::sync::Arc;
@@ -62,15 +56,13 @@ fn path(leaf: Arc<Node>, shift: u32) -> Arc<Node> {
     }
 }
 
-/// What a push copied: `None` when every array on its path was uniquely held and the write
-/// went in place, and otherwise the slots copied — zero for an empty array, which is still a copy.
+/// `None` when a write went in place; otherwise the slots copied, zero for an empty array.
 pub type Copied = Option<usize>;
 
 fn add(copied: &mut Copied, slots: usize) {
     *copied = Some(copied.unwrap_or(0) + slots);
 }
 
-/// A node made writable, counting the slots a shared node had to be copied for.
 fn writable<'a>(node: &'a mut Arc<Node>, copied: &mut Copied) -> &'a mut Node {
     if Arc::get_mut(node).is_none() {
         add(copied, node.slots());
@@ -78,7 +70,6 @@ fn writable<'a>(node: &'a mut Arc<Node>, copied: &mut Copied) -> &'a mut Node {
     Arc::make_mut(node)
 }
 
-/// Appends a full leaf to a trie of `count` elements.
 fn push_leaf(
     root: Option<Arc<Node>>,
     count: usize,
@@ -179,8 +170,7 @@ impl List {
         self.iter().cloned().collect()
     }
 
-    /// Appends, and answers what the append copied: nothing when every array on its path was
-    /// uniquely held, and otherwise at most one leaf and one branch per level, whatever the length.
+    /// Copies at most one leaf and one branch per level, whatever the length.
     pub fn push(&mut self, x: Value) -> Copied {
         let mut copied = None;
         if self.tail.len() < WIDTH {
@@ -217,9 +207,7 @@ impl List {
         copied
     }
 
-    /// Replaces the element at `i`, which must be in range, sharing every array off the path to
-    /// it; answers what the write copied, as `push` does: nothing when the path was uniquely
-    /// held, and otherwise the tail or one array per level.
+    /// `i` must be in range; copies only the shared arrays on the path to it.
     pub fn set(&mut self, i: usize, v: Value) -> Copied {
         debug_assert!(i < self.len());
         let mut copied = None;
@@ -240,7 +228,6 @@ impl List {
         copied
     }
 
-    /// The list without its first `k` elements, sharing every array with this one.
     pub fn skip(&self, k: usize) -> List {
         let mut out = self.clone();
         out.start = (self.start as usize + k).min(self.len as usize) as u32;
@@ -248,9 +235,7 @@ impl List {
         out
     }
 
-    /// Once the dropped prefix covers the whole trie the tail is the list: drop the trie, so a
-    /// chain of `rest`s over a long list holds only the leaf it is reading, and pays one copy of
-    /// at most a leaf for the whole chain.
+    /// Drops the trie once the dropped prefix covers it, so a chain of `rest`s holds only one leaf.
     fn compact(&mut self) {
         let tail_offset = self.tail_offset();
         if self.root.is_some() && self.start as usize >= tail_offset {
@@ -262,8 +247,7 @@ impl List {
         }
     }
 
-    /// Moves every element this list holds alone onto `out`, leaving it empty of them: what a drop
-    /// that must not recurse through a deep value takes. Shared arrays stay with their other owner.
+    /// Moves every uniquely held element onto `out`, so a drop need not recurse through it.
     pub fn drain_unique(&mut self, out: &mut Vec<Value>) {
         if let Some(tail) = Arc::get_mut(&mut self.tail) {
             out.append(tail);
@@ -275,14 +259,12 @@ impl List {
         self.len = self.tail.len() as u32;
     }
 
-    /// Whether the list's arrays are all held by this list alone, so a push writes in place.
+    /// Whether a push would write in place.
     pub fn is_unique(&mut self) -> bool {
         Arc::get_mut(&mut self.tail).is_some() && self.root.as_mut().is_none_or(unique_path)
     }
 
-    /// What identifies this list without walking it: its tail's and root's allocations and the
-    /// window it shows of them. Two lists with one identity hold the same elements, for as long
-    /// as one of them keeps those allocations alive.
+    /// Equal identities mean equal elements, while one of the lists keeps the allocations alive.
     pub fn identity(&self) -> (usize, usize, usize, usize) {
         (
             Arc::as_ptr(&self.tail) as usize,
@@ -301,7 +283,7 @@ fn drain_node(node: Arc<Node>, out: &mut Vec<Value>) {
     }
 }
 
-/// Whether the rightmost path — the one a push writes — is uniquely held.
+/// Whether the rightmost path, which a push writes, is uniquely held.
 fn unique_path(node: &mut Arc<Node>) -> bool {
     match Arc::get_mut(node) {
         None => false,

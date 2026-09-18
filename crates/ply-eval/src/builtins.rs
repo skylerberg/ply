@@ -25,33 +25,21 @@ pub enum Builtin {
     AssertEq,
     Len,
     Push,
-    /// The list index, and the whole of it.
     ListAt,
     /// One element replaced, sharing the rest; raises where `list_at` answers `None`.
     ListSet,
     Map,
     Filter,
     Fold,
-    /// The one loop that can stop before its bound.
     Iterate,
     Range,
-    /// The three arithmetic operations that answer instead of raising, so a step defined to
-    /// wrap says so in the name it calls.
     WrapAdd,
     WrapSub,
     WrapMul,
-    /// The low thirty-two bits rotated right, the one step a hash written over masked words
-    /// spells as two shifts, a subtraction and a mask otherwise.
+    /// The low thirty-two bits of an `Int`, rotated right.
     Rotr32,
-    /// The same step at a fixed-width type, turning the whole word: `rotr` at `U32` is what
-    /// `rotr32` was at `Int`, and at `U8` it turns eight bits.
     Rotr,
-    /// `u32_of_int` and its seven siblings: an `Int` read as a fixed-width type, raising when it
-    /// is not one of that type's values. Mask first if a truncation is what you meant.
-    ///
-    /// Sixteen field-less variants rather than two carrying an [`IntTy`], because the enum is
-    /// cast to an index for the per-builtin caches and a payload would forbid the cast.
-    /// [`Builtin::of_int`] and [`Builtin::int_of`] are how the rest of the tree names them.
+    // Field-less rather than carrying an `IntTy`: the enum is cast to a per-builtin cache index.
     U8OfInt,
     U16OfInt,
     U32OfInt,
@@ -68,24 +56,16 @@ pub enum Builtin {
     IntOfI16,
     IntOfI32,
     IntOfI64,
-    /// The smaller and the larger of two integers.
     Min,
     Max,
-    /// One byte, from the number naming it: the inverse of `bytes_at`, which had none.
     ByteOfInt,
     IntToString,
     StringConcat,
     BytesLen,
     BytesAt,
-    /// Four bytes as one `U32`, least significant first.
-    ///
-    /// `bytes_at` four times and shifted is the same answer and four times the bounds checking:
-    /// BLAKE3's block decoding spent 128 branches and 131 comparisons per block doing exactly
-    /// that, against sixteen loads for the same bytes here.
     BytesU32Le,
     BytesSlice,
     BytesConcat,
-    /// One allocation over the whole list.
     BytesConcatAll,
     BytesOfString,
     BytesIsUtf8,
@@ -131,8 +111,7 @@ pub enum Builtin {
     FloatOfDecimal,
     DecimalOfFloat,
     DecimalOfString,
-    /// The lexer's own float parse, over text: what a front end carrying a literal's text needs
-    /// to reach the `Float` that literal denotes, which no route through `Decimal` reaches.
+    /// The lexer's float parse over text, reaching `Float`s no route through `Decimal` does.
     FloatOfString,
     DecimalToString,
     /// The IEEE 754 bit pattern, as the signed 64-bit `Int` it fits in.
@@ -143,9 +122,7 @@ pub enum Builtin {
     CompareValues,
     CellGet,
     CellSet,
-    /// The fused update: takes the cell's contents out of the arena, applies the function, and
-    /// stores the answer. Sole ownership established at runtime, which is what an append inside
-    /// the function needs and what no analysis of the caller can prove.
+    /// Takes the contents out for the call, so an append inside the function owns them.
     CellUpdate,
     Panic,
     /// The only introduction of a [`Value::Secret`].
@@ -357,9 +334,7 @@ impl Builtin {
     /// Inclusive `(min, max)` argument counts.
     pub fn arity(self) -> (usize, usize) {
         match self {
-            // Every builtin is exactly applied.
             Builtin::MapNew => (0, 0),
-            // Ply has no top-level constants, so the empty map is a call.
             Builtin::Len
             | Builtin::IntToString
             | Builtin::ByteOfInt
@@ -459,8 +434,7 @@ impl Builtin {
         }
     }
 
-    /// Calls user code, so [`call`] may answer [`Step::Apply`] rather than a value and the caller
-    /// must be able to suspend.
+    /// Calls user code, so [`call`] may answer [`Step::Apply`] and the caller must suspend.
     pub fn higher_order(self) -> bool {
         matches!(
             self,
@@ -475,7 +449,6 @@ impl Builtin {
         )
     }
 
-    /// The conversion into `t`, as a builtin.
     pub fn of_int(t: IntTy) -> Builtin {
         match t {
             IntTy::U8 => Builtin::U8OfInt,
@@ -489,7 +462,6 @@ impl Builtin {
         }
     }
 
-    /// The conversion out of `t`, as a builtin.
     pub fn int_of(t: IntTy) -> Builtin {
         match t {
             IntTy::U8 => Builtin::IntOfU8,
@@ -503,12 +475,10 @@ impl Builtin {
         }
     }
 
-    /// Which type this converts into, if it converts into one.
     pub fn converts_into(self) -> Option<IntTy> {
         INT_TYPES.into_iter().find(|t| Builtin::of_int(*t) == self)
     }
 
-    /// Which type this converts out of, if it converts out of one.
     pub fn converts_from(self) -> Option<IntTy> {
         INT_TYPES.into_iter().find(|t| Builtin::int_of(*t) == self)
     }
@@ -618,7 +588,6 @@ impl Builtin {
     }
 }
 
-/// What a builtin needs before it can produce a value.
 pub enum Step {
     Done(Value),
     /// Apply `callee` to `args`, then hand the answer to [`advance`] along with `frame`.
@@ -640,8 +609,6 @@ impl fmt::Debug for Step {
     }
 }
 
-/// `push`, with the reuse that is the point of reference counting — and with the defect that reuse
-/// arrives attached to.
 fn push(args: &mut Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
     let x = args.pop().expect("arity checked");
     let mut xs = args.pop().expect("arity checked");
@@ -653,8 +620,7 @@ fn push(args: &mut Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
     Ok(Step::Done(xs))
 }
 
-/// `list_set`, taking the list out of its arguments the way `push` does, so the last holder
-/// writes in place.
+/// `list_set`, taking the list out of its arguments so the last holder writes in place.
 fn list_set(args: &mut Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
     let v = args.pop().expect("arity checked");
     let index = args.pop().expect("arity checked");
@@ -671,12 +637,7 @@ fn list_set(args: &mut Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
     Ok(Step::Done(xs))
 }
 
-/// `cells` is the run's live arena, threaded rather than snapshotted: `cell_get` must observe every
-/// write made before this call, including one a handler clause made before resuming.
-///
-/// The argument vector goes back to the free list whatever the builtin did with its contents:
-/// measured on the request path, builtin calls consuming their vectors were the single largest
-/// source of allocations, at a third of the total.
+/// `cells` is the live arena, not a snapshot: `cell_get` must see a handler's earlier writes.
 pub fn call(
     b: Builtin,
     mut args: Vec<Value>,
@@ -778,7 +739,6 @@ fn call_with(
             Ok(Step::Done(Value::list((lo..hi).map(Value::Int).collect())))
         }
 
-        // Two's complement, modulo 2^64: the only arithmetic in the language that cannot raise.
         Builtin::Min | Builtin::Max => {
             let x = args[0].as_int(span, &format!("`{}`", b.name()))?;
             let y = args[1].as_int(span, &format!("`{}`", b.name()))?;
@@ -789,8 +749,6 @@ fn call_with(
             })))
         }
 
-        // The low thirty-two bits of `x` rotated right by `n` modulo thirty-two, answered as the
-        // non-negative `Int` a masked word is.
         Builtin::Rotr32 => {
             let x = args[0].as_int(span, "`rotr32`")?;
             let n = args[1].as_int(span, "`rotr32`")?;
@@ -799,8 +757,6 @@ fn call_with(
             ))))
         }
 
-        // The word turned whole, at whatever width the operand's type is, and the count taken
-        // modulo that width so every count names a rotation.
         Builtin::Rotr => {
             let n = args[1].as_int(span, "`rotr`")?;
             if let Value::Fixed(f) = &args[0] {
@@ -820,8 +776,6 @@ fn call_with(
             )))
         }
 
-        // Total by construction at every type, which is the whole of why they exist beside the
-        // checked operators.
         Builtin::WrapAdd | Builtin::WrapSub | Builtin::WrapMul => {
             let what = b.name();
             if let (Value::Fixed(x), Value::Fixed(y)) = (&args[0], &args[1])
@@ -843,9 +797,7 @@ fn call_with(
             })))
         }
 
-        // Out of range raises rather than truncating, for the reason `byte_of_int` does: a value
-        // silently reduced is one nobody chose. `x & 0xFFFF_FFFF` first is how a program says it
-        // meant the truncation.
+        // Out of range raises rather than truncating; a program masks first to mean truncation.
         Builtin::U8OfInt
         | Builtin::U16OfInt
         | Builtin::U32OfInt
@@ -870,7 +822,6 @@ fn call_with(
             }
         }
 
-        // The same value as an `Int`. Only `U64` reaches past `Int`, and only above its largest.
         Builtin::IntOfU8
         | Builtin::IntOfU16
         | Builtin::IntOfU32
@@ -892,8 +843,7 @@ fn call_with(
             }
         }
 
-        // Out of range raises rather than masking, because a silent `& 0xFF` would write a
-        // byte nobody chose.
+        // Raises rather than masking: a silent `& 0xFF` would write a byte nobody chose.
         Builtin::ByteOfInt => {
             let n = args[0].as_int(span, "`byte_of_int`")?;
             match u8::try_from(n) {
@@ -943,8 +893,7 @@ fn call_with(
                     IntTy::U32,
                     u64::from(u32::from_le_bytes(w)),
                 )))),
-                // Reported against the last index it would have read, since that is the one past
-                // the end and the one the caller has to move.
+                // Reported at the last index it would read: that is the one past the end.
                 None => Err(out_of_range(span, "bytes_u32_le", i + 3, b.len(), "bytes")),
             }
         }
@@ -1069,8 +1018,6 @@ fn call_with(
             Ok(Step::Done(Value::str(String::from_utf8_lossy(b))))
         }
 
-        // `len` is `(List<a>) -> Int`, so a String needs its own name until W2 settles
-        // type-directed dispatch.
         Builtin::StringLen => Ok(Step::Done(Value::Int(
             args[0].as_str(span, "`string_len`")?.chars().count() as i64,
         ))),
@@ -1156,10 +1103,8 @@ fn call_with(
             }
         }
 
-        // The order `Map` iterates in, so a derived `OrdDict` and a map's own key order are one
-        // order rather than two that can drift.
+        // The order `Map` iterates in, so a derived `OrdDict` and map key order cannot drift.
         Builtin::Compare | Builtin::CompareValues => {
-            // The runtime backstop the secret representation asks for.
             crate::value::secret_has_no_order(&args[0], b.name(), span)?;
             crate::value::secret_has_no_order(&args[1], b.name(), span)?;
             Ok(Step::Done(Value::ctor(
@@ -1172,8 +1117,7 @@ fn call_with(
             )))
         }
 
-        // Every one of these reaches a key through `map::key`, which is the one gate `Value::cmp`
-        // is behind.
+        // Every map builtin reaches keys through `map::key`, the one gate before `Value::cmp`.
         Builtin::MapNew => Ok(Step::Done(map::new())),
         Builtin::MapInsert => {
             let (k, v) = (args.remove(1), args.remove(1));
@@ -1185,7 +1129,6 @@ fn call_with(
             let k = args.remove(1);
             Ok(Step::Done(map::remove(args.remove(0), &k, span)?))
         }
-        // An absent key leaves the map as it was, for `map_remove`'s reason.
         Builtin::MapUpdate => {
             let f = args.remove(2);
             let key = args.remove(1);
@@ -1233,8 +1176,7 @@ fn call_with(
             if cells.is_taken(slot) {
                 return Err(cell_in_update(span, slot, "cell_set"));
             }
-            // Reported rather than refused: refusing would change what a legal program means, and
-            // the reference-counting pass accepts the leak and asks only that it be said out loud.
+            // Reported rather than refused: refusing would change what a legal program means.
             crate::rc::cell_cycle(slot, &args[1], span);
             if cells.set(slot, args.remove(1)) {
                 Ok(Step::Done(Value::Unit))
@@ -1243,8 +1185,7 @@ fn call_with(
             }
         }
 
-        // The contents leave the arena for the length of the call, so a `push` inside the function
-        // sees one owner; the machine puts the answer back at `Frame::CellUpdateStep`.
+        // Contents leave the arena for the call; `Frame::CellUpdateStep` puts the answer back.
         Builtin::CellUpdate => {
             let slot = args[0].as_cell(span, "`cell_update`")?;
             if cells.is_taken(slot) {
@@ -1260,8 +1201,6 @@ fn call_with(
             })
         }
 
-        // `/` on `Decimal` is `E0209` precisely so that a division names its scale and its rounding
-        // mode here instead.
         Builtin::DecimalDiv => {
             let a = args[0].as_decimal(span, "`decimal_div`")?;
             let b = args[1].as_decimal(span, "`decimal_div`")?;
@@ -1287,7 +1226,6 @@ fn call_with(
             )))
         }
 
-        // Total: every `Int` is a `Decimal`, at scale 0.
         Builtin::DecimalOfInt => Ok(Step::Done(Value::Decimal(Decimal::from(
             args[0].as_int(span, "`decimal_of_int`")?,
         )))),
@@ -1300,8 +1238,6 @@ fn call_with(
             )))
         }
 
-        // Lossy and total, which is the honest pair: every `Decimal` has a nearest `f64`, and
-        // saying so beats an `Option` nobody can act on.
         Builtin::FloatOfDecimal => {
             let d = args[0].as_decimal(span, "`float_of_decimal`")?;
             Ok(Step::Done(Value::Float(float_of_decimal(d))))
@@ -1322,15 +1258,12 @@ fn call_with(
             Ok(Step::Done(option(parse_float(s).map(Value::Float))))
         }
 
-        // Round-trips `decimal_of_string` exactly, scale included: `1.50m` renders `1.50`, because
-        // the trailing zero is what the value carries.
+        // Keeps the scale (`1.50m` renders `1.50`), so it round-trips `decimal_of_string`.
         Builtin::DecimalToString => {
             let d = args[0].as_decimal(span, "`decimal_to_string`")?;
             Ok(Step::Done(Value::str(d.to_string())))
         }
 
-        // Total both ways: every bit pattern is a `Float`, NaNs included, and the pattern is what
-        // content addressing hashes a literal by.
         Builtin::BitsOfFloat => {
             let f = args[0].as_float(span, "`bits_of_float`")?;
             Ok(Step::Done(Value::Int(f.to_bits() as i64)))
@@ -1352,15 +1285,12 @@ fn call_with(
             )
         }
 
-        // Does not consume its argument: Ply is a value language, so the plaintext is still in
-        // scope and can still be traced or returned.
         Builtin::SecretOfString => {
             args[0].as_str(span, "`secret_of_string`")?;
             Ok(Step::Done(Value::secret(args[0].clone())))
         }
 
-        // One bit per call, constant time over the compared bytes, and not rate limited — a loop
-        // over candidates recovers the value, which is the program's to prevent.
+        // Constant time but not rate limited: preventing a guessing loop is the program's job.
         Builtin::SecretVerify => {
             let Value::Secret(held) = &args[0] else {
                 return Err(type_error(span, "`secret_verify`", "Secret", &args[0]));
@@ -1373,7 +1303,6 @@ fn call_with(
             ))))
         }
 
-        // Presence, never the value.
         Builtin::SecretIsEmpty => {
             let Value::Secret(held) = &args[0] else {
                 return Err(type_error(span, "`secret_is_empty`", "Secret", &args[0]));
@@ -1381,21 +1310,17 @@ fn call_with(
             Ok(Step::Done(Value::Bool(match &**held {
                 Value::Str(s) => s.is_empty(),
                 Value::Bytes(b) => b.is_empty(),
-                // `secret_of_string` is the only introduction, so nothing else is constructible; a
-                // payload that is not a sequence has no emptiness, and answering `false` reports "a
-                // credential is present" rather than inventing one.
+                // Only strings are constructible; `false` reports a credential as present.
                 _ => false,
             })))
         }
     }
 }
 
-/// Where a list index becomes a position.
 fn at(xs: &List, i: i64) -> Option<&Value> {
     usize::try_from(i).ok().and_then(|i| xs.get(i))
 }
 
-/// `Some(v)` or `None`, the prelude's.
 fn option(v: Option<Value>) -> Value {
     match v {
         Some(v) => Value::ctor("Some", vec![v]),
@@ -1403,7 +1328,6 @@ fn option(v: Option<Value>) -> Value {
     }
 }
 
-/// A `Rounding` argument as `rust_decimal`'s strategy.
 fn rounding(v: &Value, span: Span, what: &str) -> Result<RoundingStrategy, Diagnostic> {
     let name = match v {
         Value::Ctor { name, args } if args.is_empty() => name.as_str(),
@@ -1425,8 +1349,7 @@ fn rounding(v: &Value, span: Span, what: &str) -> Result<RoundingStrategy, Diagn
     }
 }
 
-/// A scale argument, refused outside `0..=28` rather than clamped: a scale the caller asked for and
-/// did not get is a rounding they did not write down.
+/// A scale argument, refused outside `0..=28` rather than clamped.
 fn decimal_scale(v: &Value, span: Span, what: &str) -> Result<u32, Diagnostic> {
     let scale = int_arg(v, span, what)?;
     u32::try_from(scale)
@@ -1450,8 +1373,7 @@ fn decimal_overflow(span: Span, what: &str) -> Diagnostic {
     .note("`Decimal` is exact and bounded; it will not round to make room")
 }
 
-/// The **shortest decimal that round-trips the float**, and `None` for NaN, an infinity, and
-/// anything outside `Decimal`'s range.
+/// The shortest decimal that round-trips the float; `None` if non-finite or out of range.
 fn decimal_of_float(f: f64) -> Option<Decimal> {
     if !f.is_finite() {
         return None;
@@ -1459,16 +1381,13 @@ fn decimal_of_float(f: f64) -> Option<Decimal> {
     parse_decimal(&format!("{f}"))
 }
 
-/// The **nearest** `f64` to a decimal, which is what makes `float_of_decimal(decimal_of_float(f))
-/// == f` for every `f` that has a `Decimal` at all.
+/// The nearest `f64`, so `float_of_decimal(decimal_of_float(f)) == f` wherever defined.
 fn float_of_decimal(d: Decimal) -> f64 {
     d.to_string()
         .parse::<f64>()
         .unwrap_or_else(|_| d.to_f64().unwrap_or(f64::NAN))
 }
 
-/// The one decimal grammar, for `decimal_of_string` and for the shortest round-tripping form of a
-/// `Float` alike.
 fn parse_decimal(text: &str) -> Option<Decimal> {
     if text.contains(['e', 'E']) {
         Decimal::from_scientific(text).ok()
@@ -1477,19 +1396,7 @@ fn parse_decimal(text: &str) -> Option<Decimal> {
     }
 }
 
-/// The lexer's float grammar, over text: digits, an optional `.` fraction, an optional `e`
-/// exponent, an `_` anywhere `ply_syntax`'s lexer would drop one, and a leading sign no literal
-/// can spell but a caller can pass, as `decimal_of_string` takes one. **Anything else is `None`**
-/// — an empty text, `inf`, `NaN`, `1.`, `.5`, a hex spelling, a stray space — although Rust's
-/// `f64::from_str` accepts several of them: a builtin that answered where no literal could be
-/// written would be a second float grammar for the language to keep in step with the first.
-///
-/// What the grammar admits always parses, so `None` means exactly "not a literal's spelling".
-/// `f64::from_str` is correctly rounded and saturates to an infinity rather than failing — which
-/// is what the lexer relies on — so `1e400` is `Some` of an infinity where `decimal_of_string`
-/// has nothing to answer at all. `"1"` is `Some(1.0)` though the lexer reads that spelling as an
-/// `Int`: the question here is what number the text denotes, which is the question
-/// `decimal_of_string("0")` answers too.
+/// The lexer's float grammar plus a leading sign; `inf`, `NaN`, `.5` and the like are `None`.
 fn parse_float(text: &str) -> Option<f64> {
     let body = text.strip_prefix(['+', '-']).unwrap_or(text);
     let (mantissa, exponent) = match body.split_once(['e', 'E']) {
@@ -1513,8 +1420,6 @@ fn parse_float(text: &str) -> Option<f64> {
     text.replace('_', "").parse().ok()
 }
 
-/// Resumes a higher-order builtin: `answer` is what the user code the frame was waiting on
-/// returned.
 pub fn advance(frame: Frame, answer: Value) -> Result<Step, Diagnostic> {
     Ok(match frame {
         Frame::MapStep {
@@ -1576,8 +1481,7 @@ pub fn advance(frame: Frame, answer: Value) -> Result<Step, Diagnostic> {
             span,
         } => {
             if answer.as_bool(span, "the predicate given to `bytes_position`")? {
-                // `next` is one past the byte the predicate was asked about, and the answer is that
-                // byte's index rather than the byte.
+                // `next` is one past the byte the predicate was asked about.
                 Step::Done(position(Some(next - 1)))
             } else {
                 next_position(f, bytes, next, span)
@@ -1638,8 +1542,6 @@ fn next_fold(f: Value, items: List, next: usize, acc: Value, span: Span) -> Step
     }
 }
 
-/// `iterate`'s step, which is `next_fold`'s shape with the list replaced by a countdown and the end
-/// replaced by an answer the step itself gives.
 fn next_iterate(
     f: Value,
     seed: Value,
@@ -1662,16 +1564,13 @@ fn next_iterate(
     })
 }
 
-/// What the step answered, with its payload.
 enum IterAnswer {
     Continued(Value),
     Stopped(Value),
 }
 use IterAnswer::{Continued, Stopped};
 
-/// Anything but the prelude's two constructors is a type error rather than a silent stop: inference
-/// admits only `Iter<s, r>` here, so reaching this with another shape means a host handler or a
-/// `Value` built in Rust answered something the checker never saw.
+/// Anything but `Continue` or `Stop` is a type error rather than a silent stop.
 fn iterate_answer(answer: &Value, span: Span) -> Result<IterAnswer, Diagnostic> {
     if let Value::Ctor { name, args } = answer
         && args.len() == 1
@@ -1706,7 +1605,6 @@ fn next_position(f: Value, bytes: std::sync::Arc<[u8]>, next: usize, span: Span)
     }
 }
 
-/// `Option<Int>`, the answer shape of every builtin that searches.
 fn position(at: Option<usize>) -> Value {
     match at {
         Some(i) => Value::ctor("Some", vec![Value::Int(i as i64)]),
@@ -1714,8 +1612,7 @@ fn position(at: Option<usize>) -> Value {
     }
 }
 
-/// An empty needle occurs at `from`, which is what `str::find` answers and what makes
-/// `bytes_index_of(b, b"")` `Some(0)` rather than a special case every caller has to write.
+/// An empty needle occurs at `from`, as with `str::find`.
 fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if needle.is_empty() {
         return Some(from);
@@ -1723,8 +1620,6 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     memchr::memmem::find(&hay[from..], needle).map(|at| from + at)
 }
 
-/// A 256-bit membership test built once per call, in time proportional to the set rather than to
-/// the buffer.
 struct ByteSet([u64; 4]);
 
 impl ByteSet {
@@ -1741,13 +1636,10 @@ impl ByteSet {
     }
 }
 
-/// The bytes a bounded scan is allowed to look at: `max` of them at most, and never past the end.
 pub fn scan_window(hay: &[u8], from: usize, max: usize) -> &[u8] {
     &hay[from..hay.len().min(from.saturating_add(max))]
 }
 
-/// The typed-argument readers the byte and decimal builtins use, quoting the operation's name only
-/// when the argument is the wrong type.
 fn int_arg(v: &Value, span: Span, what: &str) -> Result<i64, Diagnostic> {
     match v {
         Value::Int(i) => Ok(*i),
@@ -1776,7 +1668,6 @@ fn bytes_arg<'a>(
     }
 }
 
-/// Both bounded scans.
 fn scan(args: &[Value], hay: &[u8], span: Span, want: bool) -> Result<i64, Diagnostic> {
     let what = if want {
         "bytes_scan_until"
@@ -1788,11 +1679,9 @@ fn scan(args: &[Value], hay: &[u8], span: Span, want: bool) -> Result<i64, Diagn
     let max = budget(&args[3], span, what)?;
     let window = scan_window(hay, from, max);
 
-    // `memchr` is SIMD and a bitmap loop is not, so a small set — which is every header delimiter a
-    // parser cares about — takes the fast path.
+    // `memchr` is SIMD and the bitmap loop is not, so small sets take it.
     let found = match (want, members.as_ref()) {
-        // An empty class is never entered, so `bytes_scan_until` runs out the window and
-        // `bytes_scan` — which stops off the class — stops at once.
+        // Empty class: `bytes_scan_until` runs out the window, `bytes_scan` stops at once.
         (true, []) => None,
         (true, [a]) => memchr::memchr(*a, window),
         (true, [a, b]) => memchr::memchr2(*a, *b, window),
@@ -1808,7 +1697,6 @@ fn scan(args: &[Value], hay: &[u8], span: Span, want: bool) -> Result<i64, Diagn
     })
 }
 
-/// A position a search may start at.
 fn start_at(v: &Value, len: usize, span: Span, what: &str) -> Result<usize, Diagnostic> {
     let from = int_arg(v, span, what)?;
     match usize::try_from(from) {
@@ -1824,7 +1712,7 @@ fn start_at(v: &Value, len: usize, span: Span, what: &str) -> Result<usize, Diag
     }
 }
 
-/// The bound that stops a 20-megabyte header line from being a denial of service.
+/// A scan's byte budget, which bounds the work hostile input can cause.
 fn budget(v: &Value, span: Span, what: &str) -> Result<usize, Diagnostic> {
     let max = int_arg(v, span, what)?;
     usize::try_from(max).map_err(|_| {
@@ -1882,9 +1770,6 @@ fn char_offset(s: &str, n: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-/// The offset is the first byte the decoder could not use, which is the number an author needs to
-/// find the truncation — a `Bytes` cut mid-character by `bytes_slice` reports the position of the
-/// character it cut.
 fn not_utf8(span: Span, b: &[u8], e: &std::str::Utf8Error) -> Diagnostic {
     let at = e.valid_up_to();
     let what = match e.error_len() {
@@ -1915,8 +1800,6 @@ fn out_of_range(span: Span, what: &str, index: i64, len: usize, unit: &str) -> D
     ))
 }
 
-/// The `ASSERTION_FAILED` an agent reads to decide what to fix: both values in full, plus the path
-/// to the first place they differ.
 pub fn assertion_failure(actual: &Value, expected: &Value, span: Span) -> Diagnostic {
     let mut diag = Diagnostic::error(
         codes::ASSERTION_FAILED,
@@ -1938,8 +1821,6 @@ pub fn assertion_failure(actual: &Value, expected: &Value, span: Span) -> Diagno
     diag
 }
 
-/// The `ASSERTION_FAILED` for a failing `assert`, whose second argument is the message the author
-/// wanted the reader to see.
 pub fn assert_failure(message: &Value, span: Span) -> Diagnostic {
     let mut diag = Diagnostic::error(
         codes::ASSERTION_FAILED,
@@ -1949,8 +1830,7 @@ pub fn assert_failure(message: &Value, span: Span) -> Diagnostic {
     let carried = match message {
         Value::Ctor { name, args, .. } if name.as_str() == "Some" => args.first(),
         Value::Ctor { .. } => None,
-        // A message that is not an `Option` at all can only come from a call this evaluator was
-        // handed without a check in front of it.
+        // A non-`Option` message comes only from an unchecked call.
         other => Some(other),
     };
     if let Some(message) = carried {
@@ -1962,8 +1842,6 @@ pub fn assert_failure(message: &Value, span: Span) -> Diagnostic {
     diag
 }
 
-/// A cell whose contents a `cell_update` is holding, reached before the update stored its answer:
-/// through an effect the function performed, or a nested update of the same cell.
 #[cold]
 #[inline(never)]
 pub fn cell_in_update(span: Span, slot: Slot, what: &str) -> Diagnostic {

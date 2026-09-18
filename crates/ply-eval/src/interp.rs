@@ -1,19 +1,5 @@
-//! The interpreted front end (ADR 0047): one evaluator walks the lowered `code` the compiled
-//! front end lowers to C, over the shared runtime, with no C compiler in the path.
-//!
-//! It reuses the leaf semantics the compiled tier shares — `strict_binary`, `apply_unary`,
-//! `lit_matches`, `ctor_value`, and `builtins::{call, advance}` — so a body it evaluates answers
-//! what the compiled code answers by construction. It carries the first-order language,
-//! `with_cell`, and tail-resumptive `handle`/`perform`, recording each performed atom so its
-//! footprint matches the tier's. Where it reaches a construct it does not carry — a clause that
-//! binds `resume`, a `simulate`, a region's tasks — it **declines**, and the caller (`Machine`
-//! and the `combined` audit) runs it on the compiled front end instead, whose continuations live
-//! on the tier's stacks (ADR 0044).
-//!
-//! The eval walk lives on [`Core`], which owns its per-run state as plain fields and borrows the
-//! program tables. Both the `interp` [`Provider`] (over a `RefCell<Core>`, so its `Compiled`
-//! methods stay `&self`) and [`crate::Machine`] (which embeds a `Core` and threads it by `&mut`,
-//! so `cells()` can hand out `&Arena`) evaluate through the one `Core`.
+//! The interpreter: walks the lowered `code` with the leaf semantics the compiled tier shares,
+//! declining what lives on the tier's stacks (multi-shot `resume`, `simulate`, regions).
 
 use crate::code::{
     self, Arm, Captures, Clause, Code, Lowered, Lowering, NodeKind, Pat, ReturnArm, Stmt,
@@ -34,17 +20,12 @@ type GlobalKey = (usize, Option<Symbol>, Symbol);
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// A body the interpreter can enter: its parameters and where its bare names resolve.
 struct Def<'p> {
     params: Vec<Symbol>,
     body: &'p Expr,
     module: usize,
 }
 
-/// The interpreter's program tables: the definitions, tests, constructors and effect operations
-/// of one program, with the name resolution behind them. Built either borrowing the program
-/// (`borrow`, for an engine that lives as long as the borrow) or leaked to `'static` (`over`, for
-/// a `Provider` a backend shares across threads).
 pub struct Interpreter<'p> {
     resolved: &'p Resolved,
     defs: FxHashMap<Symbol, Def<'p>>,
@@ -78,12 +59,10 @@ impl Interpreter<'static> {
 }
 
 impl<'p> Interpreter<'p> {
-    /// Build the tables borrowing the program, for an engine whose life is the borrow's.
     pub fn borrow(program: &'p Program, resolved: &'p Resolved) -> Interpreter<'p> {
         Interpreter::build(program, resolved)
     }
 
-    /// The parameters, body and home module of a definition, for an engine entering it whole.
     pub fn def(&self, name: &Symbol) -> Option<(code::Params, &'p Expr, usize)> {
         self.defs
             .get(name)
@@ -156,8 +135,6 @@ impl<'p> Interpreter<'p> {
     }
 }
 
-/// The eval walk and the per-run state it mutates: a cell/region arena reset per entry, the
-/// caches a run fills, and the active handler stack. Borrows the program [`Interpreter`] tables.
 pub struct Core<'p> {
     lowering: Rc<Lowering<'p>>,
     regions: TaskRegions,
@@ -179,13 +156,11 @@ impl<'p> Core<'p> {
         }
     }
 
-    /// The lowering cache to hand a `Core` built next over the same program, so a body is lowered
-    /// once for the program rather than once per engine.
+    /// For a `Core` built next over the same program, so each body is lowered once.
     pub fn lowering(&self) -> Rc<Lowering<'p>> {
         Rc::clone(&self.lowering)
     }
 
-    /// Lower into `lowering` rather than into a cache of this `Core`'s own.
     pub fn set_lowering(&mut self, lowering: Rc<Lowering<'p>>) {
         self.lowering = lowering;
     }
@@ -211,9 +186,7 @@ impl<'p> Core<'p> {
     }
 }
 
-/// The eval walk over one entry point: the program tables and the mutable [`Core`] state as
-/// disjoint borrows, so an engine can own both an [`Interpreter`] and its `Core` and still walk
-/// without a self-referential struct.
+/// Borrows the tables and [`Core`] disjointly, so one engine can own both without self-reference.
 pub struct Run<'p, 'x> {
     home: &'x Interpreter<'p>,
     st: &'x mut Core<'p>,
@@ -224,17 +197,13 @@ impl<'p, 'x> Run<'p, 'x> {
         Run { home, st }
     }
 
-    /// Restore the world for a fresh entry point: the arena the entry resets to, and the handler
-    /// stack and performed atoms it starts empty. The name and lowering caches are program-level
-    /// and kept.
+    /// Resets per-entry state; the name and lowering caches are program-level and kept.
     fn reset_run(&mut self) {
         self.st.regions.reset();
         self.st.handlers.clear();
         self.st.performed.clear();
     }
 
-    /// Enter a test or whole definition as an entry point: reset, seed the window with the
-    /// arguments, and walk the lowered body under a fresh recursion budget.
     pub fn enter_root(
         &mut self,
         params: code::Params,
@@ -247,8 +216,7 @@ impl<'p, 'x> Run<'p, 'x> {
         self.enter_lowered(lowered, module, &args, budget)
     }
 
-    /// Enter an expression from this program, with `bindings` written into its leading slots as a
-    /// function's parameters would be — the path `eval_expr` takes for a law body or a const.
+    /// Enters an expression with `bindings` in its leading slots, as for a law body or a const.
     pub fn enter_expr_in(
         &mut self,
         e: &'p Expr,
@@ -262,8 +230,6 @@ impl<'p, 'x> Run<'p, 'x> {
         self.enter_lowered(lowered, module, &values, budget)
     }
 
-    /// Reset the world, seed the window with `bindings`, and walk a lowered body under a fresh
-    /// recursion budget.
     pub fn enter_lowered(
         &mut self,
         lowered: Lowered,
@@ -525,8 +491,7 @@ impl<'p, 'x> Run<'p, 'x> {
                 self.eval(body, window, module, calls)
             }
 
-            // A region's tasks interleave on the tier's stacks; the caller runs these on the
-            // compiled front end.
+            // A region's tasks interleave on the tier's stacks.
             NodeKind::WithRegion { .. } | NodeKind::Simulate { .. } => Err(Bail::Decline),
         }
     }
@@ -577,8 +542,7 @@ impl<'p, 'x> Run<'p, 'x> {
                     return Err(Bail::Fail(arity(span, closure, params.len(), args.len())));
                 }
                 let calls = calls.deeper(span)?;
-                // The bindings the closure carries are lowered as leading parameters, so their
-                // occurrences resolve to slots ahead of the closure's own parameters.
+                // Carried bindings are lowered as leading parameters, ahead of the closure's own.
                 let combined: Vec<Symbol> = bindings
                     .iter()
                     .map(|(n, _)| n.clone())
@@ -656,7 +620,6 @@ impl<'p, 'x> Run<'p, 'x> {
         )))
     }
 
-    /// Match a pattern, writing binders into the window.
     fn bind(
         &self,
         pat: &Pat,
@@ -763,10 +726,7 @@ impl<'p, 'x> Run<'p, 'x> {
         Ok(out.into())
     }
 
-    /// A handler's clauses and its `return` arm, with each body's free variables captured from the
-    /// scope the `handle` was written in — the tail-resumptive subset. A clause that binds
-    /// `resume` is carried but declined when performed, since its continuation lives on the tier's
-    /// stacks.
+    /// Captures clause free variables at the `handle`; a `resume` clause declines when performed.
     fn handler_frame(
         &self,
         clauses: &Rc<Vec<Clause>>,
@@ -803,8 +763,7 @@ impl<'p, 'x> Run<'p, 'x> {
         Ok(HandlerFrame { clauses: cs, ret })
     }
 
-    /// Search the active handlers from the innermost out for a clause that answers this operation,
-    /// and run it below its own frame so a `perform` in the clause sees only the outer handlers.
+    /// Runs the innermost matching clause below its own frame, so it sees only outer handlers.
     fn perform(
         &mut self,
         effect: &Symbol,
@@ -840,7 +799,6 @@ impl<'p, 'x> Run<'p, 'x> {
                 args.len(),
             )));
         }
-        // Run the clause with the handlers below its own frame in scope.
         let saved: Vec<HandlerFrame> = self.st.handlers.split_off(depth);
         let out = self.run_clause(
             &c.params,
@@ -856,7 +814,7 @@ impl<'p, 'x> Run<'p, 'x> {
         out
     }
 
-    /// Evaluate a clause or `return` body in a fresh window: its parameters, then its captures.
+    /// A clause or `return` body in a fresh window: parameters, then captures.
     #[allow(clippy::too_many_arguments)]
     fn run_clause(
         &mut self,
@@ -970,12 +928,7 @@ impl<'p, 'x> Run<'p, 'x> {
     }
 }
 
-/// The pure applier: an [`Interpreter`] and a [`Core`] over one program, used to evaluate an
-/// ad-hoc expression that has no compiled body — a const the tooling reads, a `law` body, and the
-/// generated function values higher-order property testing applies. It is the tier that runs the
-/// language; this is the interpreter kept only for expressions the tier never compiled. It carries
-/// the pure first-order language, local `with_cell`, and tail-resumptive `handle`/`perform` — never
-/// `simulate`, regions, or multi-shot `resume`, which a law never uses.
+/// Evaluates expressions with no compiled body: consts, `law` bodies, generated function values.
 pub struct Pure<'a> {
     interp: Interpreter<'a>,
     core: Core<'a>,
@@ -989,8 +942,6 @@ impl<'a> Pure<'a> {
         }
     }
 
-    /// Evaluate `e` in `module` with `bindings` bound as its leading parameters — a law body over
-    /// its generated binders.
     pub fn eval_expr_in(
         &mut self,
         e: &'a Expr,
@@ -1001,14 +952,13 @@ impl<'a> Pure<'a> {
         answer(Run::new(&self.interp, &mut self.core).enter_expr_in(e, bindings, module, budget))
     }
 
-    /// Evaluate an expression of unknown provenance, lowered afresh in module 0.
+    /// An expression of unknown provenance, lowered afresh in module 0.
     pub fn eval_expr(&mut self, e: &Expr, budget: usize) -> Result<Value, Diagnostic> {
         let lowered = crate::code::lower(e);
         answer(Run::new(&self.interp, &mut self.core).enter_lowered(lowered, 0, &[], budget))
     }
 
-    /// Enter a definition whole — the program-wide name, `store.orders.place` not `place` — for a
-    /// const the tooling reads or a helper that applies a generated closure.
+    /// Enters a definition by its program-wide name (`store.orders.place`, not `place`).
     pub fn call(
         &mut self,
         name: &str,
@@ -1030,8 +980,7 @@ impl<'a> Pure<'a> {
     }
 }
 
-/// Turn an [`Entered`] into a `Result`, where a `Declined` is a pure-evaluator refusal rather than
-/// a fall-through to a tier — the pure applier has no tier to fall to.
+/// A `Declined` is a refusal here: the pure applier has no tier to fall back to.
 fn answer(entered: Entered) -> Result<Value, Diagnostic> {
     match entered {
         Entered::Answered(v) => Ok(v),
@@ -1075,9 +1024,7 @@ struct RetArm {
     module: usize,
 }
 
-/// A per-entry recursion depth, capped as the tier caps nested calls: counted on each closure
-/// application and unwound by the native stack, so a sequential loop of ten thousand calls stays
-/// shallow while unbounded recursion is refused.
+/// Nesting depth, not call count: sequential calls stay shallow, unbounded recursion is refused.
 #[derive(Clone, Copy)]
 struct Calls {
     depth: usize,

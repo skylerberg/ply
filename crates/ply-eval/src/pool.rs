@@ -7,7 +7,6 @@ use std::thread::LocalKey;
 /// Links kept per type per thread.
 const KEEP: usize = 1024;
 
-/// One link of a persistent chain.
 pub(crate) struct Link<T> {
     pub(crate) value: Option<T>,
     pub(crate) next: Option<Rc<Link<T>>>,
@@ -25,12 +24,10 @@ impl<T> Free<T> {
     }
 }
 
-/// A type whose chain links are pooled.
 pub(crate) trait Pooled: Sized + 'static {
     fn free() -> &'static LocalKey<Free<Self>>;
 }
 
-/// A link holding `value` on top of `next`, from the free list when it has one.
 pub(crate) fn link<T: Pooled>(value: T, next: Option<Rc<Link<T>>>) -> Rc<Link<T>> {
     let recycled = T::free()
         .try_with(|f| f.links.borrow_mut().pop())
@@ -53,7 +50,6 @@ pub(crate) fn link<T: Pooled>(value: T, next: Option<Rc<Link<T>>>) -> Rc<Link<T>
     node
 }
 
-/// Keeps `node`'s allocation, dropping whatever it holds.
 pub(crate) fn give<T: Pooled>(mut node: Rc<Link<T>>) {
     let Some(slot) = Rc::get_mut(&mut node) else {
         return;

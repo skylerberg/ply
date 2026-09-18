@@ -28,23 +28,18 @@ pub const DEFAULT_IDLE_TXN_MS: u64 = 30_000;
 /// `--db-connect-ms`: establishing a connection.
 pub const DEFAULT_CONNECT_MS: u64 = 5_000;
 
-/// The first token this reactor mints.
 pub const FIRST_TOKEN: u64 = 1 << 63;
 
-/// A connection checked out of the pool, as the reactor's tasks hold it.
 pub type Connection = Object;
 
-/// What a job hands back.
 pub type Payload = Box<dyn Any + Send>;
 
-/// The work a driver runs on a pooled connection.
 pub type Job = Box<
     dyn FnOnce(Connection) -> Pin<Box<dyn Future<Output = (Connection, Payload)> + Send>>
         + Send
         + 'static,
 >;
 
-/// Build a [`Job`] from an ordinary async closure.
 pub fn job<F, Fut, T>(f: F) -> Job
 where
     F: FnOnce(Connection) -> Fut + Send + 'static,
@@ -76,15 +71,11 @@ impl fmt::Display for LeaseId {
     }
 }
 
-/// What the driver believes it is handing back.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cleanup {
-    /// No open transaction.
     Clean,
-    /// A scope the driver believes is open: `ROLLBACK` before release, and if the rollback fails
-    /// the connection is closed and discarded rather than returned.
+    /// `ROLLBACK` before release; if the rollback fails the connection is discarded.
     Rollback,
-    /// Do not return it at all.
     Discard,
 }
 
@@ -95,11 +86,9 @@ pub enum Outcome {
     Lease(LeaseId),
     /// A job's result, for the driver to downcast and turn into a `Value`.
     Done(Payload),
-    /// No connection could be established.
     Unreachable(String),
 }
 
-/// A lease and what the job that opened it answered.
 pub struct Opened {
     pub lease: LeaseId,
     pub payload: Payload,
@@ -113,33 +102,26 @@ impl fmt::Debug for Opened {
     }
 }
 
-/// A connection that was closed instead of returned to the pool.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Discarded {
     pub lease: Option<LeaseId>,
     pub reason: String,
 }
 
-/// What [`Reactor::drain`] and [`Reactor::shutdown`] did.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct DrainReport {
-    /// Scopes that were still open and were rolled back.
     pub rolled_back: usize,
-    /// Connections closed rather than returned, and why.
     pub discarded: Vec<Discarded>,
-    /// Jobs that were still running and were waited for rather than dropped.
+    /// Jobs still running that were waited for rather than dropped.
     pub awaited: usize,
-    /// Jobs that had not finished when the bound expired and were abandoned.
     pub abandoned: usize,
 }
 
 impl DrainReport {
-    /// Whether everything was handed back intact — what a run reports nothing about.
     pub fn is_clean(&self) -> bool {
         self.discarded.is_empty() && self.abandoned == 0
     }
 
-    /// One line for a run-level warning, or `None` when there is nothing to say.
     pub fn describe(&self) -> Option<String> {
         if self.is_clean() {
             return None;
@@ -166,8 +148,6 @@ impl DrainReport {
         Some(parts.join(", "))
     }
 
-    /// Fold another report into this one, for a caller that drains in two steps — the leases it
-    /// knows about, then whatever the reactor discarded on its own.
     pub fn merge(&mut self, other: DrainReport) {
         self.rolled_back += other.rolled_back;
         self.discarded.extend(other.discarded);
@@ -176,21 +156,17 @@ impl DrainReport {
     }
 }
 
-/// What `ply hosts` prints in its `pool` line, and what `E0437` names.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PoolStatus {
     /// `--db-pool`.
     pub size: usize,
-    /// Connections actually established, which is at most `size`.
+    /// Connections actually established; at most `size`.
     pub open: usize,
     pub checked_out: usize,
-    /// Callers waiting for one.
     pub waiting: usize,
-    /// Connections held across a transaction scope.
     pub leases: usize,
 }
 
-/// Everything the run decided about the database before anything ran.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PoolConfig {
     /// The `--db` connection string, in either libpq form.
@@ -217,7 +193,6 @@ impl PoolConfig {
         }
     }
 
-    /// The `tokio_postgres` configuration this run connects with.
     pub fn pg_config(&self) -> Result<tokio_postgres::Config, Diagnostic> {
         let mut config: tokio_postgres::Config = self.url.parse().map_err(|e| {
             err_not_configured(format!(
@@ -261,9 +236,7 @@ impl PoolConfig {
             }
         }
         config.connect_timeout(self.connect);
-        // So an operator — and the required tests's tests, which read `pg_stat_activity` rather than the
-        // driver's own bookkeeping — can tell this run's backends from everything else on the
-        // server.
+        // Lets operators and tests reading `pg_stat_activity` tell this run's backends apart.
         if config.get_application_name().is_none() {
             config.application_name("ply");
         }
@@ -288,7 +261,6 @@ pub fn session_sql(config: &PoolConfig, reset: bool) -> String {
     sql
 }
 
-/// The one OS thread postgres is spoken to from, and the pool on it.
 pub struct Reactor {
     config: PoolConfig,
     shared: Arc<Shared>,
@@ -304,9 +276,8 @@ impl Reactor {
             pg,
             tokio_postgres::NoTls,
             ManagerConfig {
-                // Not `Fast`, which only asks `is_closed()` and hands out a hard-closed socket, and
-                // not `Clean`, whose `RESET ALL` would undo the session state this very query
-                // establishes.
+                // Not `Fast`, which hands out hard-closed sockets, nor `Clean`, whose `RESET ALL`
+                // would undo the session state this query establishes.
                 recycling_method: RecyclingMethod::Custom(session_sql(&config, true)),
             },
         );
@@ -350,7 +321,7 @@ impl Reactor {
                 let _ = thread.join();
                 Err(err_not_configured(why))
             }
-            // The thread died without answering: it panicked before it could.
+            // The thread panicked before answering.
             Err(_) => {
                 let _ = thread.join();
                 Err(err_not_configured(
@@ -393,8 +364,7 @@ impl Reactor {
         )
     }
 
-    /// Acquire a connection, run `job` on it, and **keep** it — one token for the acquisition and
-    /// the statement that opens the scope.
+    /// Acquire a connection, run `job` on it, and keep it, all under one token.
     pub fn lease_running(
         &self,
         span: Span,
@@ -429,7 +399,6 @@ impl Reactor {
         self.post(Command::On { token, lease, job }, token)
     }
 
-    /// Give a lease back.
     pub fn release(&self, lease: LeaseId, cleanup: Cleanup) -> Result<(), Diagnostic> {
         {
             let mut state = lock(&self.shared.state);
@@ -464,7 +433,6 @@ impl Reactor {
             posted += 1;
         }
         drop(ack);
-        // The operator's deadline, never more.
         let bound = (self.config.statement + self.config.connect).min(budget);
         let until = Instant::now() + bound;
         for _ in 0..posted {
@@ -479,15 +447,13 @@ impl Reactor {
                     }
                     report.awaited += released.awaited;
                 }
-                // The cleanup outlived `--db-statement-ms` plus the connect deadline, so the server
-                // has stopped answering rather than being slow.
+                // Outlived statement plus connect deadlines: the server stopped answering.
                 Err(_) => report.abandoned += 1,
             }
         }
         Ok(report)
     }
 
-    /// Every connection closed rather than returned since the last call.
     pub fn take_discards(&self) -> DrainReport {
         let mut state = lock(&self.shared.state);
         DrainReport {
@@ -496,13 +462,11 @@ impl Reactor {
         }
     }
 
-    /// Every lease still held.
     pub fn leases(&self) -> Vec<LeaseId> {
         lock(&self.shared.state).held.iter().copied().collect()
     }
 
-    /// Stop: refuse new work, finish what is in flight, roll back and close every connection, and
-    /// join the thread.
+    /// Refuse new work, finish what is in flight, roll back and close every connection, join.
     pub fn shutdown(&self, budget: Duration) -> Result<DrainReport, Diagnostic> {
         let thread = {
             let mut held = self.thread.lock().unwrap_or_else(|e| e.into_inner());
@@ -513,8 +477,7 @@ impl Reactor {
         };
         let (ack, acked) = std::sync::mpsc::channel();
         let mut report = if self.send(Command::Stop { ack, budget }).is_ok() {
-            // The reactor's own `stop` is bounded by the same budget and answers inside it, so this
-            // is that plus room to hand the answer back rather than a second, longer deadline.
+            // The reactor's `stop` answers within `budget`; `connect` is room to hand it back.
             acked
                 .recv_timeout(budget + self.config.connect)
                 .unwrap_or_else(|_| DrainReport {
@@ -531,13 +494,11 @@ impl Reactor {
         Ok(report)
     }
 
-    /// Whether this reactor minted the token.
     pub fn owns(&self, pending: &Pending) -> bool {
         let state = lock(&self.shared.state);
         state.waiting.contains_key(&pending.token) || state.done.contains_key(&pending.token)
     }
 
-    /// How many operations are outstanding.
     pub fn outstanding(&self) -> usize {
         lock(&self.shared.state).waiting.len()
     }
@@ -566,7 +527,7 @@ impl Reactor {
         Ok(())
     }
 
-    /// The same, with a bound.
+    /// [`Reactor::park`] with a bound; `false` on timeout.
     pub fn park_timeout(&self, bound: Duration) -> Result<bool, Diagnostic> {
         let mut state = lock(&self.shared.state);
         if state.waiting.is_empty() && state.done.is_empty() {
@@ -593,7 +554,6 @@ impl Reactor {
         Ok(true)
     }
 
-    /// Drive until this token resolves.
     pub fn block_on(&self, pending: Pending) -> Result<Outcome, Diagnostic> {
         let mut state = lock(&self.shared.state);
         loop {
@@ -610,7 +570,6 @@ impl Reactor {
         }
     }
 
-    /// A token that is already answered.
     pub fn settled(
         &self,
         span: Span,
@@ -659,8 +618,7 @@ impl Reactor {
 
 impl Drop for Reactor {
     fn drop(&mut self) {
-        // The last `Reactor` went without a `shutdown`, so there is no run's deadline to honour and
-        // the config-derived bound is the only one there has ever been.
+        // No `shutdown` ran, so there is no run deadline; use the config-derived bound.
         let _ =
             self.shutdown(self.config.acquire.max(self.config.statement) + self.config.connect * 2);
     }
@@ -675,15 +633,11 @@ impl fmt::Debug for Reactor {
     }
 }
 
-/// One reactor serves a whole run, shared across the test runner's workers by `Arc`, so it has to
-/// be shareable — and a field that broke that would be added in this file, which is why the
-/// requirement is stated in this file.
+/// One reactor serves a whole run, shared across the test runner's workers by `Arc`.
 const _: fn() = || {
     fn shareable<T: Send + Sync>() {}
     shareable::<Reactor>();
 };
-
-// the shared state.
 
 struct Waiting {
     span: Span,
@@ -707,8 +661,7 @@ struct Shared {
     finished: Condvar,
     next_token: AtomicU64,
     next_lease: AtomicU64,
-    /// Cloned rather than moved to the reactor: `status()` is read from the machine's thread, and
-    /// `deadpool`'s own counters are the only honest source for `E0437`'s numbers.
+    /// Cloned rather than moved: `status()` reads `deadpool`'s counters from the machine's thread.
     pool: DeadPool,
 }
 
@@ -789,8 +742,7 @@ enum Command {
     },
     Lease {
         token: u64,
-        /// Run on the connection before the lease is published, which is what makes `BEGIN` one
-        /// token rather than two.
+        /// Runs before the lease is published, so `BEGIN` is one token rather than two.
         opening: Option<Job>,
     },
     On {
@@ -805,12 +757,10 @@ enum Command {
     },
     Stop {
         ack: std::sync::mpsc::Sender<DrainReport>,
-        /// How long the whole stop has.
         budget: Duration,
     },
 }
 
-/// What a lease's task does next.
 enum LeaseCommand {
     Run {
         token: u64,
@@ -826,7 +776,6 @@ enum LeaseCommand {
 struct Released {
     lease: LeaseId,
     discarded: Option<String>,
-    /// Jobs the lease was still running when the release arrived.
     awaited: usize,
 }
 
@@ -850,7 +799,6 @@ fn reactor_thread(
         }
     };
     runtime.block_on(async move {
-        // The bind-time proof.
         match pool.timeout_get(&timeouts(&config)).await {
             Ok(connection) => {
                 drop(connection);
@@ -933,8 +881,7 @@ async fn serve(
                                 ack: ack.clone(),
                             })
                             .is_ok() => {}
-                    // Nothing holds it: the lease's own task already ended, so the connection is
-                    // back and there is nothing to roll back.
+                    // The lease's task already ended, so there is nothing to roll back.
                     _ => {
                         if let Some(ack) = ack {
                             let _ = ack.send(Released {
@@ -964,7 +911,6 @@ async fn serve(
     .await;
 }
 
-/// Refuse new work, roll back every lease, wait for what is in flight, and close the pool.
 async fn stop(
     config: &PoolConfig,
     pool: &DeadPool,
@@ -987,9 +933,7 @@ async fn stop(
     }
     drop(ack);
 
-    // Long enough that nothing still capable of finishing is cut off — a task in flight is either
-    // waiting for the pool (`acquire`) or waiting on the server (`statement`), and a cleanup after
-    // either is bounded by `connect` — and never longer than the stop's own budget.
+    // A task waits on `acquire` or `statement`, then a `connect`-bounded cleanup; capped at budget.
     let bound = (config.acquire.max(config.statement) + config.connect).min(budget);
     let waited =
         tokio::time::timeout(bound, async { while tasks.join_next().await.is_some() {} }).await;
@@ -1029,9 +973,7 @@ async fn borrow(pool: DeadPool, shared: Arc<Shared>, config: PoolConfig, token: 
         }
     };
     let (connection, payload) = job(connection).await;
-    // Released before the answer is published, so that a machine which sees the result and
-    // immediately asks for another connection finds this one back in the pool rather than racing
-    // it.
+    // Released before publishing, so an immediate next request finds this connection in the pool.
     if let Err(reason) = finish(connection, Cleanup::Clean, config.connect).await {
         shared.discard(None, reason);
     }
@@ -1065,9 +1007,7 @@ async fn lease(
     };
     let id = LeaseId(shared.next_lease.fetch_add(1, Ordering::Relaxed));
     let (sender, receiver) = unbounded_channel();
-    // Registered on both sides *before* the answer is published: the machine may post a statement
-    // the instant it reads the lease id, and a lease the reactor has not recorded yet would be
-    // refused as unknown.
+    // Registered before publishing: the machine may post a statement the instant it reads the id.
     leases
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1081,7 +1021,6 @@ async fn lease(
     hold(id, connection, receiver, shared, config, leases).await;
 }
 
-/// One lease, as a task that owns its connection.
 async fn hold(
     id: LeaseId,
     mut connection: Connection,
@@ -1119,16 +1058,14 @@ async fn hold(
             }
         }
     }
-    // Every sender is gone without a release: the reactor is shutting down and the scope was never
-    // closed.
+    // Senders gone without a release: shutting down with the scope still open.
     if let Err(reason) = finish(connection, Cleanup::Rollback, config.connect).await {
         shared.discard(Some(id), reason);
     }
     let _ = leases.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
 }
 
-/// What to hand the machine when an acquisition produced no connection: a value the driver turns
-/// into `Failed`, or a diagnostic that stops the run.
+/// A failed acquisition: a value the driver turns into `Failed`, or a run-stopping diagnostic.
 type Refusal = Result<Outcome, Diagnostic>;
 
 async fn acquire(
@@ -1143,8 +1080,7 @@ async fn acquire(
         Err(PoolError::Timeout(TimeoutType::Wait)) => {
             Err(Err(err_exhausted(shared, config, token)))
         }
-        // Everything else is the server: unreachable, refusing the connection, or too slow to
-        // establish one.
+        // Anything else is the server: unreachable, refusing, or too slow to connect.
         Err(e) => Err(Ok(Outcome::Unreachable(describe(&e)))),
     }
 }
@@ -1185,9 +1121,8 @@ fn timeouts(config: &PoolConfig) -> Timeouts {
     Timeouts {
         wait: Some(config.acquire),
         create: Some(config.connect),
-        // The recycle round trip is `session_sql`, which talks to the server: bounding it by the
-        // connect deadline is what stops a connection the server has stopped answering on from
-        // consuming the whole acquire deadline before it is discarded.
+        // Recycling runs `session_sql`; without this bound a dead connection eats the acquire
+        // deadline before it is discarded.
         recycle: Some(config.connect),
     }
 }
@@ -1216,7 +1151,6 @@ fn describe(error: &PoolError) -> String {
     }
 }
 
-/// `E0437` — the pool was full for the whole acquire deadline.
 fn err_exhausted(shared: &Arc<Shared>, config: &PoolConfig, token: u64) -> Diagnostic {
     let status = shared.pool.status();
     let (span, what) = {
@@ -1227,8 +1161,7 @@ fn err_exhausted(shared: &Arc<Shared>, config: &PoolConfig, token: u64) -> Diagn
         }
     };
     let checked_out = status.size.saturating_sub(status.available);
-    // `waiting` counts the *others*: this operation gave up its place before this diagnostic was
-    // built, so it is no longer one of them.
+    // `waiting` excludes this operation, which gave up its place before this was built.
     Diagnostic::error(
         codes::DB_POOL_EXHAUSTED,
         format!(

@@ -14,8 +14,7 @@ pub const MUL: &str = "(*)";
 pub const DIV: &str = "(/)";
 pub const REM: &str = "(%)";
 pub const CONCAT: &str = "(++)";
-/// The bit operators, uninterpreted: seven symbols, because `-1 >> 1` and `-1 >>> 1` differ and one
-/// symbol would prove them equal by congruence.
+/// One symbol each: `-1 >> 1` and `-1 >>> 1` differ, and a shared one would equate them.
 pub const BIT_AND: &str = "(&)";
 pub const BIT_OR: &str = "(|)";
 pub const BIT_XOR: &str = "(^)";
@@ -23,7 +22,6 @@ pub const BIT_NOT: &str = "(~)";
 pub const SHL: &str = "(<<)";
 pub const SHR: &str = "(>>)";
 pub const USHR: &str = "(>>>)";
-/// The ordered comparisons, uninterpreted.
 pub const LT: &str = "(<)";
 pub const LE: &str = "(<=)";
 pub const GT: &str = "(>)";
@@ -110,7 +108,6 @@ impl Poly {
     }
 }
 
-/// One arm of a [`Node::Match`], already lowered.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Arm {
     pub test: ArmTest,
@@ -121,13 +118,10 @@ pub struct Arm {
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum ArmTest {
-    /// A wildcard or a bare variable: taken whenever it is reached.
     Always,
-    /// Taken iff the scrutinee's outermost constructor is this one.
     Ctor(Symbol),
-    /// Taken iff the scrutinee equals this literal.
     Lit(TermId),
-    /// A pattern the fragment does not decide — a nested constructor, a record or a list pattern.
+    /// A nested constructor, record or list pattern.
     Undecidable,
 }
 
@@ -136,14 +130,12 @@ pub enum Node {
     Int(i64),
     Bool(bool),
     Str(String),
-    /// A `Decimal` literal, **normalized to its numeric value**: `1.5m` and `1.50m` are one node.
+    /// Normalized: `1.5m` and `1.50m` are one node.
     Decimal {
         mantissa: i128,
         scale: u32,
     },
-    /// A fixed-width integer literal. A node of its own rather than [`Node::Int`], because `5` and
-    /// `5u32` have different types and congruence between them would be a wrong answer wearing a
-    /// certificate. Arithmetic over it stays uninterpreted, since `is_int` is false for its type.
+    /// Distinct from [`Node::Int`]: `5` and `5u32` must not be congruent. Arithmetic stays opaque.
     Fixed {
         ty: IntTy,
         bits: u64,
@@ -152,11 +144,9 @@ pub enum Node {
     /// A `forall` binder, `result`, a constructor field exposed by a case split, or an opaque
     /// stand-in for a term outside the fragment.
     Sym(u32),
-    /// A top-level definition named as a value, or an operator the fragment leaves uninterpreted:
-    /// `*` over two symbolics, `/`, `%`, `++`.
+    /// A top-level definition named as a value, or an uninterpreted operator.
     Opaque(Symbol),
     Lin(Poly),
-    /// An application of an arbitrary head.
     App {
         head: TermId,
         args: Vec<TermId>,
@@ -165,7 +155,6 @@ pub enum Node {
         name: Symbol,
         args: Vec<TermId>,
     },
-    /// A list literal.
     List(Vec<TermId>),
     /// Ascending by field name.
     Record(Vec<(Symbol, TermId)>),
@@ -200,8 +189,7 @@ pub enum Node {
 pub struct Terms {
     nodes: Vec<Node>,
     sorts: Vec<Option<Type>>,
-    /// Set for anything the type system has already proved is an `Int`: a literal, a linear
-    /// combination, and every operand of an arithmetic operator or a comparison.
+    /// Set for anything the type system has already proved is an `Int`.
     int: Vec<bool>,
     index: HashMap<Node, TermId>,
     next_sym: u32,
@@ -253,7 +241,6 @@ impl Terms {
         self.int[t]
     }
 
-    /// Records what the type system already knows.
     pub fn force_int(&mut self, t: TermId) {
         self.int[t] = true;
     }
@@ -287,8 +274,7 @@ impl Terms {
         self.mk(Node::Str(s), Some(Type::string()))
     }
 
-    /// Interned by numeric value: trailing zeros are stripped so that two literals the language
-    /// calls equal are one term.
+    /// Trailing zeros are stripped so equal literals are one term.
     pub fn decimal(&mut self, mantissa: i128, scale: u32) -> TermId {
         let (mut mantissa, mut scale) = (mantissa, scale);
         while scale > 0 && mantissa % 10 == 0 {
@@ -298,7 +284,6 @@ impl Terms {
         self.mk(Node::Decimal { mantissa, scale }, Some(Type::decimal()))
     }
 
-    /// Interned by value, so two occurrences of one literal are one term.
     pub fn fixed(&mut self, ty: IntTy, bits: u64) -> TermId {
         let bits = ty.normalize(bits);
         self.mk(Node::Fixed { ty, bits }, Some(Type::con(ty.name())))
@@ -308,14 +293,12 @@ impl Terms {
         self.mk(Node::Unit, Some(Type::unit()))
     }
 
-    /// A fresh symbolic constant.
     pub fn sym(&mut self, sort: Option<Type>) -> TermId {
         let n = self.next_sym;
         self.next_sym += 1;
         self.mk(Node::Sym(n), sort)
     }
 
-    /// The linear view of a term.
     pub fn poly(&self, t: TermId) -> Poly {
         match &self.nodes[t] {
             Node::Int(k) => Poly::constant(*k as i128),
@@ -328,8 +311,7 @@ impl Terms {
         if p.monomials.is_empty() {
             return match i64::try_from(p.konst) {
                 Ok(k) => Some(self.int_lit(k)),
-                // A constant no `Int` can hold is not a Ply value, so there is nothing honest to
-                // fold it to.
+                // Not a Ply value.
                 Err(_) => None,
             };
         }
@@ -368,8 +350,7 @@ impl Terms {
         self.intern_poly(p)
     }
 
-    /// Projection reduces over a record literal on sight; the same reduction up to a proved
-    /// equality is a rule in the solver.
+    /// Reduces over a record literal; the same reduction up to equality is a solver rule.
     pub fn field(&mut self, base: TermId, field: Symbol) -> TermId {
         if let Node::Record(fields) = &self.nodes[base]
             && let Some((_, v)) = fields.iter().find(|(n, _)| *n == field)
@@ -397,8 +378,7 @@ impl Terms {
         self.mk(Node::Eq { lhs, rhs }, Some(Type::bool()))
     }
 
-    /// Intern `a.f` and `b.f` for every field of a record-sorted equality, so that the solver's
-    /// extensionality rule has projections to compare.
+    /// Interns both sides' fields so the solver's extensionality rule has projections to compare.
     fn project_fields(&mut self, a: TermId, b: TermId) {
         let (Some(Type::Record(left)), Some(Type::Record(right))) =
             (self.sorts[a].clone(), self.sorts[b].clone())

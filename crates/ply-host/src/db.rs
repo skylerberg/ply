@@ -21,17 +21,12 @@ use ply_eval::{Determinism, HostOp, HostResource, Linearity};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_ty::Footprint;
 
-/// The Ply declaration the registrations below are checked against: the source of the module
-/// `std.db`, which ships with the compiler.
 pub const DECLARATION: &str = ply_std::DB;
 
-/// The module the declaration ships as, which is what qualifies [`EFFECT`].
 pub const MODULE: &str = "std.db";
 
-/// The program-wide effect name.
 pub const EFFECT: &str = "std.db.db";
 
-/// The operations the driver serves.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Op {
     Query,
@@ -63,7 +58,6 @@ impl Op {
         }
     }
 
-    /// How a diagnostic names it.
     pub fn what(self) -> &'static str {
         match self {
             Op::Query => "`db.query`",
@@ -75,8 +69,6 @@ impl Op {
         }
     }
 
-    /// The Rust path `ply hosts` prints — the reviewable identity of a member of the trusted
-    /// computing base.
     pub fn path(self) -> &'static str {
         match self {
             Op::Query => "ply_host::db::query",
@@ -96,12 +88,10 @@ impl Op {
         }
     }
 
-    /// Whether the operation carries a table.
     pub fn takes_table(self) -> bool {
         matches!(self, Op::Query | Op::Execute | Op::Returning)
     }
 
-    /// Whether a statement performed under this operation may change a row.
     pub fn writes(self) -> bool {
         !matches!(self, Op::Query)
     }
@@ -111,7 +101,6 @@ impl Op {
             effect: Symbol::new(EFFECT),
             op: Symbol::new(self.name()),
             resource: if self.takes_table() {
-                // Whichever tables the program uses.
                 HostResource::Any
             } else {
                 HostResource::Only(ply_ty::Resource::Singleton)
@@ -126,8 +115,6 @@ impl Op {
     }
 }
 
-/// A statement's table set, against the label the call site wrote and the footprint the entry point
-/// declared.
 pub fn check_footprint(
     scan: &Scan,
     op: Op,
@@ -138,9 +125,7 @@ pub fn check_footprint(
     use ply_ty::Mode;
     use ply_ty::{EffectAtom, Resource};
 
-    // The statement's own kind, and any data-modifying CTE inside it: a `select` whose `with` holds
-    // a `delete` changes rows, and a `read` atom for it would put it in a concurrency group with
-    // every reader of the table.
+    // A `select` whose `with` holds a `delete` writes too, so it must not run beside readers.
     if (scan.kind.writes() || !scan.tables.written.is_empty()) && !op.writes() {
         return Err(Diagnostic::error(
             codes::DB_STATEMENT_REFUSED,
@@ -172,7 +157,6 @@ pub fn check_footprint(
         ));
     }
 
-    // The label the call site wrote is the statement's principal table.
     if let Resource::Named(named) = label
         && !scan.tables.all().contains(named.as_str())
     {
@@ -194,8 +178,7 @@ pub fn check_footprint(
             if declared.atoms().any(|a| a == atom) {
                 continue;
             }
-            // A write is not covered by a declared read of the same table: the conflict graph runs
-            // two readers side by side.
+            // A declared read does not cover a write: two readers may run side by side.
             return Err(Diagnostic::error(
                 codes::DB_FOOTPRINT_UNDECLARED,
                 format!(

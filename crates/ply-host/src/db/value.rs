@@ -9,10 +9,8 @@ use rust_decimal::Decimal;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// The module `Json` ships in.
 pub const JSON_MODULE: &str = "std.json";
 
-/// A constructor of `module`, as the qualified symbol a `Value` carries.
 pub fn ctor(module: &str, name: &str) -> Symbol {
     Symbol::new(format!("{module}.{name}"))
 }
@@ -24,7 +22,6 @@ fn simple<'a>(name: &'a Symbol, module: &str) -> Option<&'a str> {
         .and_then(|rest| rest.strip_prefix('.'))
 }
 
-/// `{ sql: String }` — the statement text, and nothing else in the record.
 pub fn statement(value: &Value, span: Span) -> Result<String, Diagnostic> {
     match value {
         Value::Record(fields) => match fields.get(&Symbol::new("sql")) {
@@ -130,7 +127,6 @@ pub fn json(value: &Value, span: Span) -> Result<Json, Diagnostic> {
     })
 }
 
-/// `ReadCommitted | RepeatableRead | Serializable`, as the `SET TRANSACTION` text postgres wants.
 pub fn isolation(value: &Value, span: Span) -> Result<Isolation, Diagnostic> {
     match value {
         Value::Ctor { name, .. } => {
@@ -165,8 +161,6 @@ pub fn access(value: &Value, span: Span) -> Result<Access, Diagnostic> {
     }
 }
 
-// --- outward ----------------------------------------------------------------
-
 pub fn answer(answer: &Answer) -> Value {
     match answer {
         Answer::Rows(rows) => Value::ctor(
@@ -178,8 +172,7 @@ pub fn answer(answer: &Answer) -> Value {
     }
 }
 
-/// A `Map` from column name to value, which is what gives a row one canonical form: two rows built
-/// in different column orders are one value, and a golden test over a result set is stable.
+/// A `Map`, so a row has one canonical form whatever its column order.
 pub fn row(row: &Row) -> Value {
     Value::map(
         row.iter()
@@ -233,13 +226,11 @@ pub fn error(e: &DbError) -> Value {
     Value::Record(Arc::new(fields.into_iter().collect()))
 }
 
-/// A `Failed` answer built from a SQLSTATE the driver produced rather than the server: a pool that
-/// could not reach anything, a connection that went away.
+/// A `Failed` answer with a SQLSTATE the driver produced rather than the server.
 pub fn failed(code: &str, detail: impl Into<String>) -> Value {
     answer(&Answer::Failed(DbError::new(code, "", detail)))
 }
 
-/// The `Decimal` a `Number` carries, for a caller that wants it without the wrapper.
 pub fn as_decimal(value: &Value) -> Option<Decimal> {
     match value {
         Value::Decimal(d) => Some(*d),
@@ -247,8 +238,6 @@ pub fn as_decimal(value: &Value) -> Option<Decimal> {
     }
 }
 
-/// Inference checks a perform's shape, so reaching one of these means the evaluator ran a module
-/// that was never checked.
 #[cold]
 fn malformed(wanted: &str, span: Span) -> Diagnostic {
     Diagnostic::error(

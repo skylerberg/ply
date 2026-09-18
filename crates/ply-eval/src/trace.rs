@@ -2,8 +2,7 @@
 
 use ply_ty::{EffectAtom, Footprint};
 
-/// The count is kept because a row is a set: an engine that performed one atom three times and an
-/// engine that performed it once agree on the footprint and have not done the same thing.
+/// Counts performs too: a footprint is a set, so it cannot tell one perform from three.
 #[derive(Clone, Debug)]
 pub struct Trace {
     footprint: Footprint,

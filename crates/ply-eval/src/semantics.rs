@@ -1,11 +1,4 @@
-//! The meaning of a node, independent of any strategy for reaching it.
-//!
-//! A literal, a binary operator, a constructor value, a pattern match and the
-//! diagnostics they raise are the same whether a machine steps to them or a
-//! lowering folds them away. They live here rather than in `machine.rs` because
-//! `builtins.rs`, `handler.rs` and `sim.rs` all raise from the same set, and a
-//! second spelling of "takes 2 arguments, but 3 were given" is a divergence in
-//! the only surface a user reads.
+//! A node's meaning and diagnostics, shared by every evaluation strategy.
 
 use crate::handler::OpDecl;
 use crate::value::{Closure, ClosureKind, Decimal, Fixed, Value, type_error, values_equal};
@@ -16,10 +9,9 @@ use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::sync::Arc;
 
-/// An operation's declaration, by program-wide effect name and operation name.
+/// Keyed by program-wide effect name and operation name.
 pub(crate) type OpTable = FxHashMap<(Symbol, Symbol), (bool, Mode)>;
 
-/// One spelling of a mis-declared operation, wherever it is noticed.
 pub(crate) fn op_decl(ops: &OpTable, effect: &Symbol, op: &Symbol) -> OpDecl {
     match ops.get(&(effect.clone(), op.clone())) {
         Some(&(resource_param, mode)) => OpDecl::Declared {
@@ -44,22 +36,12 @@ pub(crate) fn literal(lit: &Lit) -> Value {
     }
 }
 
-/// A `Decimal` literal's value.
-///
-/// Total because both producers of a `Lit::Decimal` already enforce the type's
-/// range — the lexer refuses a mantissa past 96 bits or a scale past 28, and the
-/// body decoder refuses the same bytes — so the fallback is a shape no stream
-/// this evaluator is handed can carry.
+/// The fallback is unreachable: the lexer and body decoder already enforce `Decimal`'s range.
 pub(crate) fn decimal_lit(mantissa: i128, scale: u32) -> Decimal {
     Decimal::try_from_i128_with_scale(mantissa, scale).unwrap_or(Decimal::ZERO)
 }
 
-/// A literal pattern against a value, shared by the machine and the lowering so a
-/// both` divergence cannot be the two of them disagreeing about a NaN.
-///
-/// `Float` matches by IEEE `==`, so a `NaN` pattern matches nothing at all —
-/// including a NaN scrutinee. A pattern that answered otherwise would be a
-/// second equality on the type, and nobody wrote that one down.
+/// `Float` matches by IEEE `==`, so a `NaN` pattern matches nothing, not even a NaN scrutinee.
 pub fn lit_matches(lit: &Lit, value: &Value) -> bool {
     match (lit, value) {
         (Lit::Int(a), Value::Int(b)) => a == b,
@@ -76,42 +58,16 @@ pub fn lit_matches(lit: &Lit, value: &Value) -> bool {
     }
 }
 
-/// Constructor values kept per thread.
-///
-/// Bounded for [`crate::pool`]'s reason and stated here so the cost is a number:
-/// a thread that has run a program with more constructors than this keeps the
-/// first [`CTOR_CACHE_KEEP`] it met and builds the rest per mention, which is
-/// what it did before this cache existed. Past the bound the cost degrades to
-/// the old one rather than to a cliff, which is why nothing is evicted.
+/// Constructor values cached per thread; past the bound the rest are built per mention.
 pub const CTOR_CACHE_KEEP: usize = 4096;
 
 thread_local! {
-    /// Keyed by the constructor's program-wide name, holding the arity the
-    /// value was built at: two programs run on one thread can spell one name
-    /// with two arities, and the second must not read the first's value. See
-    /// [`ctor_value`].
+    /// Holds the arity too: two programs on one thread can give one name two arities.
     pub static CTOR_VALUES: RefCell<FxHashMap<Symbol, (usize, Value)>> =
         RefCell::new(FxHashMap::default());
 }
 
-/// The value a mention of a constructor evaluates to: one per constructor per
-/// thread, built on first mention.
-///
-/// A mention is a compile-time constant — the value is a function of the name
-/// and the arity and of nothing else — and rebuilding it per mention cost 21.0
-/// nullary `Value::Ctor`s and 24.0 `Arc<Closure>`s per `/health` request,
-/// measured by `cargo test -p ply-corpus-tests --release --test r4_value_construction
-/// -- --nocapture`. [`Value::builtin`] has shared a builtin's closure since W6
-/// for the same reason and its note carries the argument that sharing one is
-/// invisible: a `Closure` is immutable and [`Value::cmp`] answers `Equal` for
-/// any two of them, so there is no identity to observe. The nullary case adds
-/// one clause to that argument — a shared `Ctor` is immutable because its
-/// `args` are empty, so it holds no [`Value::Cell`] past the region that would
-/// reclaim one, and it can never be a [`Value::Secret`], which is built by no
-/// path that reaches here.
-///
-/// [`Value::builtin`]: crate::value::Value::builtin
-/// [`Value::cmp`]: crate::value::Value
+/// A constructor mention's value, shared per thread; the value is immutable and identity-free.
 pub fn ctor_value(name: &Symbol, arity: usize) -> Value {
     let fresh = || {
         if arity == 0 {
@@ -126,10 +82,7 @@ pub fn ctor_value(name: &Symbol, arity: usize) -> Value {
             }))
         }
     };
-    // `try_with`, because a `Value` dropped during thread-local teardown can
-    // reach here after the cache is gone, and building a fresh one is the right
-    // answer there rather than an abort. [`Value::builtin`] takes it for the
-    // same reason.
+    // `try_with`: a `Value` dropped in thread-local teardown can arrive after the cache is gone.
     CTOR_VALUES
         .try_with(|cache| {
             let mut cache = cache.borrow_mut();
@@ -152,8 +105,6 @@ pub fn ctor_value(name: &Symbol, arity: usize) -> Value {
         .unwrap_or_else(|_| fresh())
 }
 
-/// The operator over two values, exactly as the machine applies it; a compiled body reaches it
-/// for an operand whose type its emitter does not fix.
 #[inline(never)]
 pub fn strict_binary(
     op: BinOp,
@@ -171,10 +122,7 @@ pub fn strict_binary(
             let b = r.as_str(rspan, "`++`")?;
             Ok(Value::str(format!("{a}{b}")))
         }
-        // `Float` answers by IEEE, where `NaN < x` and `NaN >= x` are both
-        // false — so a comparison is not the negation of its converse. That is
-        // what the type says, and smoothing it over here would make the operator
-        // disagree with `==` on the same two values.
+        // IEEE: `NaN < x` and `NaN >= x` are both false; a comparison is not its converse negated.
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
             if let (Value::Float(a), Value::Float(b)) = (l, r) {
                 return Ok(Value::Bool(match op {
@@ -186,8 +134,7 @@ pub fn strict_binary(
             }
             let ordering = match (l, r) {
                 (Value::Int(a), Value::Int(b)) => a.cmp(b),
-                // By value, not by bits, so `I8` puts `-1` below `0`. The checker unified the two
-                // operands, so a pair of different fixed-width types cannot arrive.
+                // By value, not bits, so `I8` puts `-1` below `0`.
                 (Value::Fixed(a), Value::Fixed(b)) if a.ty == b.ty => a.value().cmp(&b.value()),
                 (Value::Str(a), Value::Str(b)) => a.as_ref().cmp(b.as_ref()),
                 (Value::Decimal(a), Value::Decimal(b)) => a.cmp(b),
@@ -244,8 +191,6 @@ pub fn strict_binary(
                 None => Err(err_overflow(span, what, a, b)),
             }
         }
-        // The two's-complement bit pattern of the `Int`, and nothing else: the checker
-        // refused every other operand type.
         BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
             if let (Value::Fixed(a), Value::Fixed(b)) = (l, r)
                 && a.ty == b.ty
@@ -267,12 +212,8 @@ pub fn strict_binary(
             }))
         }
 
-        // A count outside `0..=63` raises for the reason a zero divisor does, while `<<`
-        // itself discards rather than raising, because a mixing step is defined to drop
-        // the bits that leave.
+        // An out-of-range count raises, but `<<` itself drops the bits that leave.
         BinOp::Shl | BinOp::Shr | BinOp::Ushr => {
-            // The count is an `Int` whatever the word is; the bound it must sit inside is the
-            // *word's* width, so a count of 32 is a shift at `Int` and a refusal at `U32`.
             let n = r.as_int(rspan, "a shift")?;
             if let Value::Fixed(a) = l {
                 let width = i64::from(a.ty.bits());
@@ -283,9 +224,7 @@ pub fn strict_binary(
                 let raw = a.raw();
                 let bits = match op {
                     BinOp::Shl => raw << n,
-                    // Arithmetic, so the sign is what fills: at an unsigned type `Fixed` holds the
-                    // bits zero-extended and `value()` is non-negative, so the two shifts agree
-                    // there and differ exactly where the type is signed.
+                    // `value()` is non-negative when unsigned, so this zero-fills there.
                     BinOp::Shr => (a.value() >> n) as u64,
                     _ => raw >> n,
                 };
@@ -298,7 +237,6 @@ pub fn strict_binary(
             let n = n as u32;
             Ok(Value::Int(match op {
                 BinOp::Shl => ((a as u64) << n) as i64,
-                // Both shifts exist because `Int` is signed and there is no `UInt`.
                 BinOp::Shr => a >> n,
                 _ => ((a as u64) >> n) as i64,
             }))
@@ -312,11 +250,7 @@ pub fn strict_binary(
     }
 }
 
-/// IEEE-754, unmodified. There is no overflow error and no zero-divisor error:
-/// `1.0 / 0.0` is `Infinity` and `0.0 / 0.0` is `NaN`, and those are values the
-/// standard defines rather than failures. Refusing them would make `Float` a
-/// worse `Decimal` instead of a different type — and the cost is stated in the
-/// type, which is why nothing about a `Float` may be `proved`.
+/// IEEE-754, unmodified: no overflow or zero-divisor error; `Infinity` and `NaN` are values.
 fn float_arithmetic(op: BinOp, a: f64, b: f64, span: Span) -> Result<Value, Diagnostic> {
     Ok(Value::Float(match op {
         BinOp::Add => a + b,
@@ -334,13 +268,7 @@ fn float_arithmetic(op: BinOp, a: f64, b: f64, span: Span) -> Result<Value, Diag
     }))
 }
 
-/// Exact, or a diagnostic. Never a silent wrap and never a silent rounding: a
-/// total that quietly lost a cent is the failure this type exists to prevent.
-///
-/// `/` never arrives — inference refuses it with `E0209`, because the exact
-/// quotient of two decimals is not in general a decimal and an operator would
-/// have to round. `%` does, and is exact: the *remainder* of a decimal division
-/// is a decimal even when the quotient is not.
+/// Exact, or a diagnostic; never a silent wrap or rounding. Inference already refuses `/`.
 fn decimal_arithmetic(
     op: BinOp,
     a: Decimal,
@@ -351,9 +279,7 @@ fn decimal_arithmetic(
     let (result, what) = match op {
         BinOp::Add => (a.checked_add(b), "addition"),
         BinOp::Sub => (a.checked_sub(b), "subtraction"),
-        // Exact while the result's scale fits, and half-to-even at scale 28
-        // otherwise. `checked_mul` is what applies that rule; a mantissa that
-        // leaves 96 bits is `None` and is reported rather than rounded.
+        // Half-to-even past scale 28; a mantissa past 96 bits is `None`, reported not rounded.
         BinOp::Mul => (a.checked_mul(b), "multiplication"),
         BinOp::Rem => {
             if b.is_zero() {
@@ -490,9 +416,7 @@ pub(crate) fn err_fixed_overflow(span: Span, what: &str, a: Fixed, b: Fixed) -> 
         .primary(span, detail)
 }
 
-/// Exact or a diagnostic, at whichever of the eight widths the operands are — the same rule `Int`
-/// keeps, at a narrower type. `wrap_add` and its siblings are how a program says it meant the
-/// wrap; nothing here wraps.
+/// Exact or a diagnostic at the operands' width; wrapping is `wrap_add` and its siblings.
 fn fixed_arithmetic(
     op: BinOp,
     a: Fixed,
@@ -503,12 +427,9 @@ fn fixed_arithmetic(
     let (result, what) = match op {
         BinOp::Add => (a.checked(b, i128::checked_add), "addition"),
         BinOp::Sub => (a.checked(b, i128::checked_sub), "subtraction"),
-        // Checked in `i128` too: two `U64`s near the top multiply past `i128::MAX`, and a product
-        // that leaves the wider type has certainly left the narrower one.
+        // Two large `U64`s overflow `i128` too, which is still an overflow of the narrow type.
         BinOp::Mul => (a.checked(b, i128::checked_mul), "multiplication"),
         BinOp::Div if b.value() == 0 => return Err(err_zero_divisor(rspan, "division")),
-        // Truncating toward zero, as `Int`'s is. Only one pair overflows: the signed minimum
-        // divided by minus one, whose quotient is one past the maximum.
         BinOp::Div => (a.checked(b, i128::checked_div), "division"),
         _ if b.value() == 0 => return Err(err_zero_divisor(rspan, "remainder")),
         _ => (a.checked(b, i128::checked_rem), "remainder"),
@@ -549,13 +470,11 @@ pub(crate) fn apply_unary(
     span: Span,
 ) -> Result<Value, Diagnostic> {
     match op {
-        // `-0.0` is a `Float` distinct from `0.0` and negation is how a program reaches it, so this
-        // arm is not decoration.
+        // Not redundant: negation is how a program reaches `-0.0`.
         UnOp::Neg => match value {
             Value::Float(f) => Ok(Value::Float(-f)),
             Value::Decimal(d) => Ok(Value::Decimal(-*d)),
-            // Checked at the operand's own width, so `-x` at an unsigned type is an overflow for
-            // every `x` but zero — which is what the type says and not a special case.
+            // At an unsigned type `-x` overflows for every `x` but zero.
             Value::Fixed(f) => match Fixed::of(f.ty, -f.value()) {
                 Some(n) => Ok(Value::Fixed(n)),
                 None => Err(err_fixed_overflow(span, "negation", *f, *f)),
@@ -569,8 +488,6 @@ pub(crate) fn apply_unary(
             }
         },
         UnOp::Not => Ok(Value::Bool(!value.as_bool(operand_span, "`!`")?)),
-        // Every bit of the two's-complement pattern flipped, so `~0` is `-1` at `Int` and the
-        // largest value at an unsigned type.
         UnOp::BitNot => match value {
             Value::Fixed(f) => Ok(Value::Fixed(Fixed::new(f.ty, !f.bits()))),
             _ => Ok(Value::Int(!value.as_int(operand_span, "`~`")?)),
@@ -578,8 +495,6 @@ pub(crate) fn apply_unary(
     }
 }
 
-/// `||` is decided by a `true` left operand and `&&` by a `false` one; anything else has to
-/// evaluate the right.
 pub(crate) fn short_circuits(op: BinOp, lhs: bool) -> bool {
     lhs == matches!(op, BinOp::Or)
 }

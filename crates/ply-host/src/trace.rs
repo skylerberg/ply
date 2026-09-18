@@ -20,17 +20,12 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-/// The Ply declaration the registrations below are checked against: the source of the module
-/// `std.trace`, which ships with the compiler.
 pub const DECLARATION: &str = ply_std::TRACE;
 
-/// The module the declaration ships as, which is what qualifies [`EFFECT`].
 pub const MODULE: &str = "std.trace";
 
-/// The program-wide effect name.
 pub const EFFECT: &str = "std.trace.trace";
 
-/// How much of a record a sink admits.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Level {
     Debug,
@@ -50,7 +45,6 @@ impl Level {
     }
 }
 
-/// The six operations `std.trace` declares.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Op {
     Event,
@@ -82,7 +76,6 @@ impl Op {
         }
     }
 
-    /// How a diagnostic names it.
     pub fn what(self) -> &'static str {
         match self {
             Op::Event => "`trace.event`",
@@ -112,25 +105,21 @@ impl Op {
         }
     }
 
-    /// The registration.
     pub fn declaration(self, path: &'static str) -> HostOp {
         HostOp {
             effect: Symbol::new(EFFECT),
             op: Symbol::new(self.name()),
-            // Whichever channels the program uses.
             resource: HostResource::Any,
             determinism: Determinism::Nondeterministic,
             linearity: Linearity::AtMostOnce,
             blocking: false,
-            // A `Field` has no constructor over a `Secret`, so nothing of that type can reach a
-            // record.
+            // A `Field` has no constructor over a `Secret`.
             secrets: false,
             path,
         }
     }
 }
 
-/// What the run's own summary says about tracing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Counts {
     pub events: u64,
@@ -139,7 +128,6 @@ pub struct Counts {
     pub flushed: bool,
 }
 
-/// The sink, the clock, and every span every entry point has open.
 pub struct Trace {
     sink: Arc<dyn Sink>,
     clock: Arc<dyn Clock>,
@@ -159,9 +147,6 @@ impl Trace {
         Trace::with_clock(sink, Arc::new(HostClock))
     }
 
-    /// The same, over a clock a test supplies — which is how the counting harness asserts that a
-    /// discarded event reads the clock zero times, and how a golden test over a JSON line gets a
-    /// stamp that does not move.
     pub fn with_clock(sink: Arc<dyn Sink>, clock: Arc<dyn Clock>) -> Trace {
         Trace {
             sink,
@@ -172,8 +157,6 @@ impl Trace {
         }
     }
 
-    /// The sink's reviewable identity and where it writes, for the `observability` block of `ply
-    /// hosts` and for the digest that block is in.
     pub fn sink_path(&self) -> &'static str {
         self.sink.path()
     }
@@ -182,7 +165,6 @@ impl Trace {
         self.sink.destination()
     }
 
-    /// What the shutdown banner prints.
     pub fn counts(&self) -> Counts {
         let spans = lock(&self.spans);
         Counts {
@@ -193,7 +175,6 @@ impl Trace {
         }
     }
 
-    /// How many spans are open across every entry point.
     pub fn open_spans(&self) -> usize {
         lock(&self.spans).total_open()
     }
@@ -210,7 +191,6 @@ impl Trace {
         Some(spans::warn_abandoned(&closings))
     }
 
-    /// Flushes the sink.
     pub fn flush(&self) {
         self.sink.flush();
         self.flushed.fetch_add(1, Ordering::Relaxed);
@@ -238,7 +218,6 @@ impl Trace {
     }
 }
 
-/// Register every operation of `trace` against a sink.
 pub fn register(registry: &mut HostRegistry, trace: Arc<Trace>) {
     let path = trace.sink.path();
     for op in Op::ALL {
@@ -246,12 +225,10 @@ pub fn register(registry: &mut HostRegistry, trace: Arc<Trace>) {
     }
 }
 
-/// One operation's handler, outside a registry.
 pub fn handler(op: Op, trace: Arc<Trace>) -> Arc<dyn HostHandler> {
     Arc::new(Operation { op, trace })
 }
 
-/// A registry serving `trace` and nothing else.
 pub fn registry(trace: Arc<Trace>) -> HostRegistry {
     let mut registry = HostRegistry::new();
     register(&mut registry, trace);
@@ -269,18 +246,14 @@ impl HostHandler for Operation {
         if req.args.len() != self.op.arity() {
             return Err(arity(self.op, req.args.len(), span));
         }
-        // The resolved atom's resource, never one the handler re-derives: the registry already
-        // decided which channel this perform named.
+        // The resolved atom's resource, never one the handler re-derives.
         let channel = &req.atom.resource;
         let owner: Owner = (req.machine, req.task);
         match self.op {
-            // Two operations keep state whatever the sink does, because `E0445` is a statement
-            // about the program and a program whose verdict moved with `--trace off` would be a
-            // program nobody could debug.
+            // Span state is kept whatever the sink does, so `E0445` cannot depend on `--trace`.
             Op::Enter => self.enter(req, channel, owner),
             Op::Exit => self.exit(req, channel, owner, span),
-            // The other four have nothing to keep, so a sink that wants nothing is answered before
-            // a name is decoded, a field is built or a clock is read.
+            // Stateless: a sink that wants nothing is answered before any decoding or clock read.
             Op::Event => {
                 let level = value::level(&req.args[0], span)?;
                 self.simple(req, channel, owner, level, 1)
@@ -338,9 +311,7 @@ impl Operation {
     ) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let wanted = self.trace.sink.wants(Level::Info);
-        // The `Arc<str>` the argument already holds, so keeping the name costs no allocation even
-        // when nothing is collecting — which is what lets `W0609` name the innermost span under
-        // `--trace off`.
+        // Shares the argument's `Arc<str>`, so keeping the name is free even under `--trace off`.
         let name = match &req.args[0] {
             ply_eval::Value::Str(s) => Arc::clone(s),
             other => return Err(value_error(span, "a span's name", other)),
@@ -388,17 +359,14 @@ impl Operation {
         Ok(HostAnswer::Value(ply_eval::Value::Unit))
     }
 
-    /// The span an event or a metric was recorded in, and that span's parent.
     fn enclosing(&self, owner: Owner) -> (i64, i64) {
         lock(&self.trace.spans).innermost(owner)
     }
 }
 
-/// The two field names of a `Span`, interned once.
 pub(crate) static ID: std::sync::LazyLock<Symbol> = std::sync::LazyLock::new(|| Symbol::new("id"));
 static CHANNEL: std::sync::LazyLock<Symbol> = std::sync::LazyLock::new(|| Symbol::new("channel"));
 
-/// `{ id: Int, channel: String }`, as `trace.enter` answers it.
 fn span_value(id: i64, channel: &Resource) -> ply_eval::Value {
     let mut fields = BTreeMap::new();
     fields.insert(ID.clone(), ply_eval::Value::Int(id));
@@ -406,8 +374,7 @@ fn span_value(id: i64, channel: &Resource) -> ply_eval::Value {
     ply_eval::Value::Record(Arc::new(fields.into_iter().collect()))
 }
 
-/// A poisoned lock here holds a span table whose invariant is "innermost last", which a thread that
-/// panicked mid-push cannot have broken: the push is one `Vec::push`.
+/// Poison is ignored: a panic cannot break "innermost last", since a push is one `Vec::push`.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
