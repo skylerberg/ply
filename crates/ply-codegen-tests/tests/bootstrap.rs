@@ -50,9 +50,19 @@ fn emitter_source() -> (&'static Source, String) {
     let ids: Vec<_> = (0..modules.len())
         .map(|i| ply_span::SourceId(i as u32))
         .collect();
-    let check = producer::checked_front(&modules, &ids)
-        .expect("the emitter checks")
-        .check;
+    let front = producer::checked_front(&modules, &ids).expect("the emitter checks");
+    let unused: Vec<&str> = front
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == ply_span::codes::UNUSED_DEFINITION)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert!(
+        unused.is_empty(),
+        "the compiler or the standard library carries definitions nothing reaches; delete them:\n  {}",
+        unused.join("\n  ")
+    );
+    let check = front.check;
     let program: &'static ply_syntax::ast::Program = Box::leak(Box::new(ast));
     let resolved = Box::leak(Box::new(resolved));
     let check = Box::leak(Box::new(check));

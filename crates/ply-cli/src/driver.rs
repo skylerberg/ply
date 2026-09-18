@@ -1,5 +1,4 @@
 //! The front end: the Rust chain that still has to run, and the port that answers for the rest.
-//! Asking the port costs a whole front end, so it is asked once per load and the answer travels.
 
 use crate::load::{Discovered, LoadError, Loaded, anchor, discover, unreadable};
 use ply_hash::body::StoredBody;
@@ -81,21 +80,19 @@ struct FileState {
     content: ContentHash,
     /// Taken when the program is assembled; nothing after that reads a tree through this.
     ast: Option<Module>,
+    /// As parsed and expanded, so they outlive the tree.
+    imports: Vec<ModuleName>,
     /// Embedded in the binary rather than discovered on disk.
     shipped: bool,
 }
 
-impl FileState {
-    fn imports(&self) -> Vec<ModuleName> {
-        match &self.ast {
-            Some(ast) => ast.imports.iter().map(|i| i.module_name()).collect(),
-            None => Vec::new(),
-        }
-    }
-}
+type Fresh = Option<BTreeMap<ContentHash, String>>;
 
-/// The port's answer as it gave it, under its key, when this run asked and may keep it.
-type Fresh = Option<(ContentHash, String)>;
+struct Keys {
+    /// The emitter and the import graph, which fix the order the checker publishes in.
+    program: ContentHash,
+    modules: Vec<ContentHash>,
+}
 
 struct Driver<'s> {
     root: PathBuf,
@@ -165,6 +162,7 @@ impl<'s> Driver<'s> {
                         .unwrap_or_else(|| "".into()),
                     content,
                     ast: None,
+                    imports: Vec::new(),
                     shipped: false,
                 }),
                 Err(diagnostic) => diagnostics.push(anchor(diagnostic, &sources, source)),
@@ -211,7 +209,13 @@ impl<'s> Driver<'s> {
         self.phases.write_back += writing.elapsed();
 
         let mut warnings = stdlib;
-        warnings.extend(front.diagnostics.iter().cloned());
+        warnings.extend(
+            front
+                .diagnostics
+                .iter()
+                .filter(|d| !self.in_shipped(d))
+                .cloned(),
+        );
         warnings.extend(cache);
 
         let files = self.files.iter().map(|f| f.path.clone()).collect();
@@ -235,45 +239,183 @@ impl<'s> Driver<'s> {
         })
     }
 
-    /// The port's answer, run or read back from the store, plus the answer to keep when fresh.
-    /// Texts go in `self.files` order, so a span's module index reads back as its `SourceId`.
     fn ask_the_port(&mut self) -> Result<(Front, Fresh), LoadError> {
         ply_codegen::c::producer::ensure_default();
-        let ids: Vec<SourceId> = self.files.iter().map(|f| f.source).collect();
         let started = Instant::now();
-        let key = self.answer_key();
-        let kept = key.and_then(|key| self.store.as_deref()?.front_answer(key));
-        if let Some(front) = kept.and_then(|dump| ply_ty::read_front(&dump, &ids).ok()) {
-            self.phases.front += started.elapsed();
+        let answer = match self.keys() {
+            Some(keys) => self.in_parts(&keys),
+            None => self.ask(&self.everything()).map(|front| (front, None)),
+        };
+        self.phases.front += started.elapsed();
+        answer
+    }
+
+    /// Missed modules are asked with all they import, so the port sees a closed program.
+    fn in_parts(&self, keys: &Keys) -> Result<(Front, Fresh), LoadError> {
+        let Some(store) = self.store.as_deref() else {
+            return self.whole(keys);
+        };
+        let program = store.front_part(keys.program).and_then(|text| {
+            let front = ply_ty::read_front(&text, &[]).ok()?;
+            Some((text, front))
+        });
+        let Some((program_text, program)) = program else {
+            return self.whole(keys);
+        };
+        let mut kept: Vec<Option<(String, Front)>> = keys
+            .modules
+            .iter()
+            .zip(&self.files)
+            .map(|(key, file)| {
+                let text = store.front_part(*key)?;
+                let part = ply_ty::read_front(&text, &[file.source]).ok()?;
+                Some((text, part))
+            })
+            .collect();
+        let missed: Vec<usize> = (0..kept.len()).filter(|&i| kept[i].is_none()).collect();
+
+        if !missed.is_empty() {
+            let asked = self.reaching(&missed);
+            let front = self.ask(&asked)?;
+            // An answer with errors does not split, so its diagnostics come from the whole program.
+            let Ok((_, fresh)) = front.split() else {
+                return self.whole(keys);
+            };
+            if fresh.len() != asked.len() {
+                return self.whole(keys);
+            }
+            for (&i, part) in asked.iter().zip(fresh) {
+                let file = &self.files[i];
+                let Ok(text) = ply_ty::write_front(&part, &[file.source]) else {
+                    return self.whole(keys);
+                };
+                // A module asked only because something imports it must answer as its part did.
+                let moved = kept[i].as_ref().is_some_and(|(filed, _)| *filed != text);
+                if moved || !part.check.modules.contains_key(file.module.as_symbol()) {
+                    return self.whole(keys);
+                }
+                kept[i] = Some((text, part));
+            }
+        }
+
+        let mut filed = BTreeMap::from([(keys.program, program_text)]);
+        let mut parts = Vec::with_capacity(kept.len());
+        for (key, entry) in keys.modules.iter().zip(kept) {
+            let Some((text, part)) = entry else {
+                return self.whole(keys);
+            };
+            filed.insert(*key, text);
+            parts.push(part);
+        }
+        match Front::join(program, parts) {
+            Ok(front) => Ok((front, (!missed.is_empty()).then_some(filed))),
+            Err(_) => self.whole(keys),
+        }
+    }
+
+    fn whole(&self, keys: &Keys) -> Result<(Front, Fresh), LoadError> {
+        let front = self.ask(&self.everything())?;
+        if front.has_error() {
             return Ok((front, None));
         }
-        let sources: Vec<(String, String)> = self
-            .files
-            .iter()
-            .map(|f| (f.module.to_string(), f.text.to_string()))
-            .collect();
-        let dump = ply_codegen::c::producer::front_dump(&sources);
-        self.phases.front += started.elapsed();
-        let dump = dump.map_err(|e| self.seam_failed(&format!("{e:#}")))?;
-        let front = ply_ty::read_front(&dump, &ids)
-            .map_err(|e| self.seam_failed(&format!("the front end's answer does not read: {e}")))?;
-        let fresh = key.filter(|_| !front.has_error()).map(|key| (key, dump));
+        let fresh = front.split().ok().and_then(|(program, parts)| {
+            let mut filed =
+                BTreeMap::from([(keys.program, ply_ty::write_front(&program, &[]).ok()?)]);
+            if parts.len() != self.files.len() {
+                return None;
+            }
+            for ((key, part), file) in keys.modules.iter().zip(&parts).zip(&self.files) {
+                if !part.check.modules.contains_key(file.module.as_symbol()) {
+                    return None;
+                }
+                filed.insert(*key, ply_ty::write_front(part, &[file.source]).ok()?);
+            }
+            Some(filed)
+        });
         Ok((front, fresh))
     }
 
-    /// The emitter plus each module's name and text, in handover order; `None` without a cache.
-    fn answer_key(&self) -> Option<ContentHash> {
+    fn ask(&self, which: &[usize]) -> Result<Front, LoadError> {
+        let sources: Vec<(String, String)> = which
+            .iter()
+            .map(|&i| {
+                (
+                    self.files[i].module.to_string(),
+                    self.files[i].text.to_string(),
+                )
+            })
+            .collect();
+        let ids: Vec<SourceId> = which.iter().map(|&i| self.files[i].source).collect();
+        let dump = ply_codegen::c::producer::front_dump(&sources)
+            .map_err(|e| self.seam_failed(&format!("{e:#}")))?;
+        ply_ty::read_front(&dump, &ids)
+            .map_err(|e| self.seam_failed(&format!("the front end's answer does not read: {e}")))
+    }
+
+    fn everything(&self) -> Vec<usize> {
+        (0..self.files.len()).collect()
+    }
+
+    fn reaching(&self, from: &[usize]) -> Vec<usize> {
+        let mut seen: BTreeSet<usize> = from.iter().copied().collect();
+        let mut stack = from.to_vec();
+        while let Some(i) = stack.pop() {
+            for imported in &self.files[i].imports {
+                if let Some(&j) = self.by_module.get(imported.as_symbol())
+                    && seen.insert(j)
+                {
+                    stack.push(j);
+                }
+            }
+        }
+        seen.into_iter().collect()
+    }
+
+    fn keys(&self) -> Option<Keys> {
         if self.mode != Mode::Incremental || self.store.is_none() {
             return None;
         }
-        let mut key = ply_codegen::c::producer::emitter().into_bytes();
+        let emitter = ply_codegen::c::producer::emitter();
+        let mut graph = format!("order\0{emitter}").into_bytes();
         for file in &self.files {
-            key.push(0);
-            key.extend_from_slice(file.module.as_str().as_bytes());
-            key.push(0);
-            key.extend_from_slice(&file.content.0);
+            graph.push(0);
+            graph.extend_from_slice(file.module.as_str().as_bytes());
+            for imported in &file.imports {
+                graph.push(1);
+                graph.extend_from_slice(imported.as_str().as_bytes());
+            }
         }
-        Some(ContentHash::of(&key))
+        let modules = (0..self.files.len())
+            .map(|i| {
+                let mut reached: Vec<(&str, &ContentHash)> = self
+                    .reaching(&[i])
+                    .into_iter()
+                    .map(|j| (self.files[j].module.as_str(), &self.files[j].content))
+                    .collect();
+                reached.sort_unstable();
+                let mut key = format!("module\0{emitter}\0{}", self.files[i].module).into_bytes();
+                for (name, content) in reached {
+                    key.push(0);
+                    key.extend_from_slice(name.as_bytes());
+                    key.push(0);
+                    key.extend_from_slice(&content.0);
+                }
+                ContentHash::of(&key)
+            })
+            .collect();
+        Some(Keys {
+            program: ContentHash::of(&graph),
+            modules,
+        })
+    }
+
+    /// A warning inside a module the compiler ships is its maintainers', not this program's.
+    fn in_shipped(&self, d: &Diagnostic) -> bool {
+        d.primary_span().is_some_and(|span| {
+            self.files
+                .iter()
+                .any(|f| f.shipped && f.source == span.source)
+        })
     }
 
     /// This compiler failing, rather than the program.
@@ -323,22 +465,21 @@ impl<'s> Driver<'s> {
         let mut wanted: BTreeSet<Symbol> = BTreeSet::new();
 
         for file in &self.files {
-            for imported in file.imports() {
+            for imported in &file.imports {
                 // A shipped module may import only `std.*`.
-                if file.shipped && !ply_std::is_std(&imported) {
-                    diagnostics.push(self.foreign_import(file, &imported));
+                if file.shipped && !ply_std::is_std(imported) {
+                    diagnostics.push(self.foreign_import(file, imported));
                     continue;
                 }
-                if !ply_std::is_std(&imported) || self.by_module.contains_key(imported.as_symbol())
-                {
+                if !ply_std::is_std(imported) || self.by_module.contains_key(imported.as_symbol()) {
                     continue;
                 }
-                match (ply_std::source(&imported).is_some(), file.shipped) {
+                match (ply_std::source(imported).is_some(), file.shipped) {
                     (true, _) => {
                         wanted.insert(imported.as_symbol().clone());
                     }
-                    (false, true) => diagnostics.push(self.foreign_import(file, &imported)),
-                    (false, false) => diagnostics.push(self.unknown_std(file, &imported)),
+                    (false, true) => diagnostics.push(self.foreign_import(file, imported)),
+                    (false, false) => diagnostics.push(self.unknown_std(file, imported)),
                 }
             }
         }
@@ -372,6 +513,7 @@ impl<'s> Driver<'s> {
             .insert(module.as_symbol().clone(), self.files.len());
         self.files.push(FileState {
             ast: None,
+            imports: Vec::new(),
             path,
             module,
             source: id,
@@ -423,6 +565,7 @@ impl<'s> Driver<'s> {
                     // Expansion reads only this file's own type declarations.
                     Ok(mut module) => {
                         diagnostics.append(&mut ply_derive::expand_module(&mut module));
+                        file.imports = module.imports.iter().map(|i| i.module_name()).collect();
                         file.ast = Some(module);
                     }
                     Err(mut d) => diagnostics.append(&mut d),
@@ -519,8 +662,8 @@ impl<'s> Driver<'s> {
         let Some(store) = self.store.as_deref_mut() else {
             return Vec::new();
         };
-        if let Some((key, dump)) = fresh {
-            store.put_front_answer(key, dump);
+        if let Some(parts) = fresh {
+            store.put_front_parts(parts);
         }
         for (hash, entry) in interfaces {
             match entry {

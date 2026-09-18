@@ -657,3 +657,198 @@ fn the_writer_refuses_a_front_the_protocol_cannot_carry() {
     let err = write_front(&front, &SOURCES).unwrap_err();
     assert!(err.contains("module `m` is source 7"), "{err}");
 }
+
+fn unused(what: &str, at: Span) -> Diagnostic {
+    Diagnostic::warning(codes::UNUSED_DEFINITION, format!("{what} is never used"))
+        .primary(at, "never used")
+}
+
+/// `sample` as the checker publishes it: defs in dependency order, the prelude's constructor first,
+/// and the warnings by module in source order.
+fn published() -> Front {
+    let mut front = sample();
+    front.diagnostics = vec![
+        unused("type `std.db.Row`", span(0, 30, 33)),
+        unused("fn `m.helper`", span(1, 100, 106)).secondary(Span::DUMMY, "nothing calls it"),
+        unused("type `m.Unused`", span(1, 110, 116)),
+    ];
+    front.check.defs = std::mem::take(&mut front.check.defs)
+        .into_iter()
+        .rev()
+        .collect();
+    front.check.ctors = std::mem::take(&mut front.check.ctors)
+        .into_iter()
+        .rev()
+        .collect();
+    front
+}
+
+#[test]
+fn an_answer_split_by_module_and_filed_joins_back_at_other_positions() {
+    let front = published();
+    let whole = write_front(&front, &SOURCES).unwrap();
+    let (program, parts) = front.split().unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(parts.len(), 2);
+    assert_eq!(
+        program.check.ctors.len(),
+        1,
+        "the prelude's constructor belongs to no module"
+    );
+    assert!(program.diagnostics.is_empty());
+    assert_eq!(
+        [parts[0].diagnostics.len(), parts[1].diagnostics.len()],
+        [1, 2],
+        "each warning belongs to the module it points into"
+    );
+
+    let moved = [SourceId(7), SourceId(3)];
+    let program = read_front(&write_front(&program, &[]).unwrap(), &[]).unwrap();
+    let parts: Vec<Front> = parts
+        .iter()
+        .zip(SOURCES.iter().zip(&moved))
+        .map(|(part, (was, is))| {
+            let text = write_front(part, &[*was]).unwrap_or_else(|e| panic!("{e}"));
+            read_front(&text, &[*is]).unwrap_or_else(|e| panic!("{e}\n{text}"))
+        })
+        .collect();
+    assert_eq!(parts[1].check.defs[&sym("m.count")].span, span(3, 0, 40));
+    let helper = &parts[1].diagnostics[0];
+    assert_eq!(helper.primary_span(), Some(span(3, 100, 106)));
+    assert!(helper.labels[1].span.is_dummy());
+
+    let joined = Front::join(program, parts).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(write_front(&joined, &moved).unwrap(), whole);
+    assert_eq!(joined.hashes, front.hashes);
+    let messages =
+        |f: &Front| -> Vec<String> { f.diagnostics.iter().map(|d| d.message.clone()).collect() };
+    assert_eq!(messages(&joined), messages(&front));
+}
+
+#[test]
+fn an_answer_that_is_not_laid_out_by_module_does_not_split() {
+    let mut front = published();
+    front.diagnostics.push(
+        Diagnostic::error(codes::TYPE_MISMATCH, "expected Int").primary(span(1, 2, 3), "here"),
+    );
+    let err = front.split().unwrap_err();
+    assert!(
+        err.contains("an answer with an error does not split"),
+        "{err}"
+    );
+
+    let mut front = published();
+    front.diagnostics.reverse();
+    let err = front.split().unwrap_err();
+    assert!(
+        err.contains("the diagnostics are not grouped by module"),
+        "{err}"
+    );
+
+    let mut front = published();
+    front
+        .diagnostics
+        .push(unused("fn `m.nowhere`", Span::DUMMY));
+    let err = front.split().unwrap_err();
+    assert!(err.contains("`W0611` names no module"), "{err}");
+
+    let mut front = published();
+    front.diagnostics[0] = front.diagnostics[0]
+        .clone()
+        .secondary(span(1, 0, 1), "and here");
+    let err = front.split().unwrap_err();
+    assert!(err.contains("`W0611` labels two modules"), "{err}");
+
+    let mut front = published();
+    front.check.defs = std::mem::take(&mut front.check.defs)
+        .into_iter()
+        .rev()
+        .collect();
+    let err = front.split().unwrap_err();
+    assert!(
+        err.contains("the definitions are not grouped by module"),
+        "{err}"
+    );
+
+    let mut front = published();
+    front.check.tests[0].key = sym("std.db.query");
+    let err = front.split().unwrap_err();
+    assert!(
+        err.contains("`std.db.query` is claimed by two modules"),
+        "{err}"
+    );
+}
+
+fn ply_files(dir: &std::path::Path) -> Vec<(String, String)> {
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "ply"))
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|p| {
+            let stem = p.file_stem().unwrap().to_string_lossy().to_string();
+            (stem, std::fs::read_to_string(&p).unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn a_real_answer_split_by_module_joins_back_byte_for_byte() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut program: Vec<(String, String)> = ply_std::sources()
+        .map(|(name, text)| (name.to_string(), text.to_string()))
+        .collect();
+    program.extend(ply_files(&root.join("examples")));
+    program.extend(ply_files(&root.join("crates/ply-compiler/ply")));
+    let ids: Vec<SourceId> = (0..program.len()).map(|i| SourceId(i as u32)).collect();
+    let front = ply_codegen::c::producer::checked_front(&program, &ids)
+        .unwrap_or_else(|e| panic!("the corpus does not check: {e:#}"));
+    let whole = write_front(&front, &ids).unwrap();
+
+    let (rest, parts) = front.split().unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(parts.len(), program.len());
+    let rest = read_front(&write_front(&rest, &[]).unwrap(), &[]).unwrap();
+    let parts: Vec<Front> = parts
+        .iter()
+        .zip(&ids)
+        .map(|(part, id)| {
+            let text = write_front(part, &[*id]).unwrap_or_else(|e| panic!("{e}"));
+            read_front(&text, &[*id]).unwrap_or_else(|e| panic!("{e}"))
+        })
+        .collect();
+    let joined = Front::join(rest, parts).unwrap_or_else(|e| panic!("{e}"));
+    same(
+        "the written answer",
+        &write_front(&joined, &ids).unwrap(),
+        &whole,
+    );
+    same(
+        "the answer's structure",
+        &format!("{joined:?}"),
+        &format!("{front:?}"),
+    );
+}
+
+#[track_caller]
+fn same(what: &str, got: &str, want: &str) {
+    if got == want {
+        return;
+    }
+    let shorter = got.len().min(want.len());
+    let at = got
+        .bytes()
+        .zip(want.bytes())
+        .position(|(a, b)| a != b)
+        .unwrap_or(shorter);
+    let near = |text: &str| {
+        let bytes = &text.as_bytes()[at.saturating_sub(200)..(at + 200).min(text.len())];
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    panic!(
+        "{what} departs at byte {at}\n  got:  {:?}\n  want: {:?}",
+        near(got),
+        near(want)
+    );
+}
