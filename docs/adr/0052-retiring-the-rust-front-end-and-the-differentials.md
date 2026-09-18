@@ -1742,29 +1742,37 @@ same key §3's excursion turns on. A hundred and seventy-two of the crate's two
 hundred and ninety-five tests now install a producer, and they are faster for
 it.
 
-What the port cannot answer is seven sites across three crates, and every one of
-them is a program with no source text. `ply-eval-tests` holds two:
-`prelude_arity`, which asks the checker's prelude environment for a builtin's
-arity over an empty program -- no front end has that shape, and the test it
-serves compares three tables, so handing it `Builtin`'s own arity would have it
-compare a value with itself -- and `compiled.rs`'s `checked`, which builds its
-program from `Vec<Item>` rather than from bytes. `ply-store-tests` holds one,
-the `reconstruct` test, which rebuilds a program from stored bodies "without the
-source, and without knowing what anything was called"; its other `reconstruct`
-asserts that an incomplete set *fails* to rebuild and never reaches a checker,
-so it is not one. `ply-hash-tests` holds four, every one of them `bodies.rs`
-checking a `reconstruct`ed program, and only its `compile` starts from files.
+What the port cannot answer is one site. `ply-eval-tests`' `prelude_arity` asks
+the checker's prelude environment for a builtin's arity over an *empty*
+program: there is no program to hand over and so no text to print, and the test
+it serves, `every_builtin_agrees_on_its_arity_everywhere`, compares three
+tables -- `Builtin::arity`, the prelude's scheme, and `defaults::builtin_shape`
+-- so handing it `Builtin`'s own arity would have it compare a value with
+itself. It is the only `ply_core::` call in the tree that is neither
+`check_program` nor `check_module`.
 
-**A count taken from the wrong grep.** A draft of this paragraph said
-`ply-hash-tests` had no obstacle at all and each of the others had exactly one.
-All three were counted by grepping `ply_core::`, which matches a qualified call
-and misses a bare-name one behind `use ply_core::check_program`. Against the
-whole call set the qualified share is ten of twelve in `ply-eval-tests`, one of
-two in `ply-store-tests` and five of nine in `ply-hash-tests`, so the grep
-undercounted every crate it was pointed at. What survives the recount is the
-shape rather than the tally: the port answers for bytes, and a fixture that has
-none -- an AST assembled in the test, or a program rebuilt from stored bodies --
-is what it cannot serve.
+Every other site holds a `Program`, and a `Program` has text whenever it is
+asked for it: `ply_syntax::print::program` renders one as the `(name, text)`
+pairs `front` takes. That is not a proposal. `ply-test`'s hybrid trial does it
+in production, `ply-cli`'s artifact path does it, and `ply-hash-tests`' own
+`bodies.rs` does it twice -- once to run a reconstructed program on the tier,
+and once to assert that every definition hashes identically after a print and a
+re-parse, which is the property a migration of these sites rests on. The two
+hazards are recorded above: printed modules take fresh dense source ids,
+because a reconstructed module carries `Span::DUMMY.source` and the protocol
+reads a span's module as a position in the list handed over; and a mixture
+reconstructed with a non-empty relink map is the case `reconstruct_with` skips
+`Reconstruction::verify` for.
+
+**Counted three times, and the method is the finding.** This paragraph first
+said each crate held one obstacle, then seven across three crates; the answer
+is one. The first count grepped `ply_core::`, which matches a qualified call
+and misses a bare-name one behind `use ply_core::check_program` -- the
+qualified share is ten of twelve in `ply-eval-tests`, one of two in
+`ply-store-tests`, five of nine in `ply-hash-tests`. The second counted the
+call sites correctly and then mistook "has no source text" for "cannot be
+served", when this tree already answered that in three places. What a site
+needs is not text. It is a `Program`, and text follows from one.
 
 **Built, 2026-09-17: `verify` sees the member it could not see, and the count
 says what it counts.** This record described the gap twice and fixed it neither
