@@ -1,21 +1,16 @@
-//! What the static tier reads: every `fn` body and clause and every law, as
-//! `crates/ply-compiler/ply/code.ply` lowers them, with each global named program-wide. `front.ply`'s
-//! `claims_dump` writes it.
+//! `front.ply`'s `claims_dump` read back: each `fn` body, clause and law as `code.ply` lowers it.
 
 use ply_span::frames::Cursor;
 use ply_span::{SourceId, Span, Symbol};
 use ply_ty::{BinOp, IntTy, Lit, SpecKind, UnOp};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// The module index of a span outside every module.
 const NO_MODULE: u32 = u32::MAX;
 
-/// A local is a slot of the window its root, its definition or its lambda opens.
 #[derive(Clone, Debug)]
 pub enum Code {
     Lit(Lit),
     Local(usize),
-    /// Program-wide when the resolver bound it; a builtin or a prelude constructor as written.
     Global(Symbol),
     Unary(UnOp, Box<Code>),
     Binary(BinOp, Box<Code>, Box<Code>),
@@ -26,19 +21,15 @@ pub enum Code {
     Record(Vec<(Symbol, Code)>),
     Field(Box<Code>, Symbol),
     Match(Box<Code>, Vec<Arm>),
-    /// The parameters take the window's leading slots; each capture copies an `(outer, inner)` slot.
     Lambda {
         params: usize,
         captures: Vec<(usize, usize)>,
         body: Box<Code>,
     },
-    /// `perform`, `handle`, `with cell`, `with region` or `simulate`.
     Region,
-    /// A body the lowering does not reach, which only a match guard makes.
     Unreached,
 }
 
-/// An expression statement is not kept: nothing the prover decides reads one.
 #[derive(Clone, Debug)]
 pub enum Stmt {
     Let(usize, Code),
@@ -51,7 +42,6 @@ pub enum Pat {
     Var(usize),
     Lit(Lit),
     Ctor(Symbol, Vec<Pat>),
-    /// A record or list pattern, by the patterns inside it.
     Nested(Vec<Pat>),
 }
 
@@ -71,9 +61,7 @@ pub struct Clause {
 pub struct Definition {
     pub params: usize,
     pub body: Code,
-    /// In source order; an `ensures` reads `result` at slot `params`.
     pub spec: Vec<(SpecKind, Clause)>,
-    /// Every global the body names, a lambda's and a region's included.
     pub refs: BTreeSet<Symbol>,
 }
 
@@ -86,9 +74,7 @@ pub struct Law {
 #[derive(Clone, Debug, Default)]
 pub struct Claims {
     pub defs: HashMap<Symbol, Definition>,
-    /// By key.
     pub laws: HashMap<Symbol, Law>,
-    /// Each declared sum type's variant count.
     pub sums: BTreeMap<Symbol, usize>,
 }
 
@@ -220,7 +206,6 @@ fn span(text: &str, sources: &[SourceId], what: &str) -> Result<Span, String> {
     Ok(Span::new(source, number(start)?, number(end)?))
 }
 
-/// Empty where the lowering did not reach the body.
 fn code(text: &str, what: &str, refs: &mut BTreeSet<Symbol>) -> Result<Code, String> {
     if text.is_empty() {
         return Ok(Code::Unreached);
@@ -238,7 +223,6 @@ fn code(text: &str, what: &str, refs: &mut BTreeSet<Symbol>) -> Result<Code, Str
     Ok(out)
 }
 
-/// `code.ply`'s `dump`, read back.
 struct Dump<'a, 'r> {
     text: &'a [u8],
     at: usize,
@@ -290,7 +274,6 @@ impl<'a> Dump<'a, '_> {
         }
     }
 
-    /// Up to the first of `ends`, which must follow.
     fn word(&mut self, ends: &[u8]) -> Result<&'a str, String> {
         let text = self.text;
         let start = self.at;
@@ -317,11 +300,9 @@ impl<'a> Dump<'a, '_> {
     }
 
     fn code(&mut self) -> Result<Code, String> {
-        // Bodies nest as deep as the parser accepted.
         stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || self.node())
     }
 
-    /// The ownership mark leads every node; the prover has no use for it.
     fn node(&mut self) -> Result<Code, String> {
         if !(self.eat(b'b') || self.eat(b'o')) {
             return self.fail("an ownership mark");
@@ -479,7 +460,6 @@ impl<'a> Dump<'a, '_> {
                     }
                     let ret = self.eat_str("ret(");
                     if !ret {
-                        // Effect, operation, resource, parameter count, `resume`, window size.
                         self.expect_str("cl(")?;
                         for _ in 0..5 {
                             self.word(b",")?;
@@ -516,7 +496,6 @@ impl<'a> Dump<'a, '_> {
                 self.expect(b',')?;
                 Code::Field(Box::new(base), Symbol::new(self.word(b")")?))
             }
-            // `{..b, f: e}`: the copied fields are read off the base, as the literal wrote them.
             "upd" => {
                 let base = self.code()?;
                 let mut fields = Vec::new();
@@ -540,7 +519,6 @@ impl<'a> Dump<'a, '_> {
         Ok(out)
     }
 
-    /// `[<outer>><inner><mark> ...]`.
     fn captures(&mut self) -> Result<Vec<(usize, usize)>, String> {
         self.expect(b'[')?;
         let mut out = Vec::new();
@@ -649,7 +627,6 @@ impl<'a> Dump<'a, '_> {
         })
     }
 
-    /// `<length>:<hex>`.
     fn hex(&mut self) -> Result<Vec<u8>, String> {
         let len: usize = self.number(b":")?;
         self.expect(b':')?;

@@ -54,7 +54,6 @@ pub struct DefWritten {
     pub reuse: bool,
     /// In source order.
     pub params: Vec<WrittenParam>,
-    /// What its `requires` clauses mention, in the witness search's order.
     pub requires_literals: Vec<Literal>,
 }
 
