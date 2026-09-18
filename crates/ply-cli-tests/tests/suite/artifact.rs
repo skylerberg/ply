@@ -148,7 +148,6 @@ fn an_artifact_carries_no_test_no_law_and_nothing_unreached() {
     assert!(opened.front.check.tests.is_empty(), "a test was deployed");
     assert!(opened.front.check.laws.is_empty(), "a law was deployed");
 
-    // Nor is any of it disclosed, in any section or in the unit's C.
     let mut shipped = vec![String::from_utf8_lossy(&built.artifact.encode()).into_owned()];
     if let Some(unit) = &built.artifact.unit {
         shipped.push(ply_codegen::c::bundle::unpack(&unit.text).unwrap());
@@ -230,8 +229,6 @@ fn an_artifact_run_binds_nothing_without_host() {
     assert_eq!(report["binding"], "hermetic");
 }
 
-/// The closure is text printed at build rather than text anyone wrote, so a failure raised by a
-/// run of an artifact names no line in it.
 #[test]
 fn a_failure_in_an_artifact_carries_no_line_number() {
     let dir = project("fn main() -> Int = 1 / 0\n");
@@ -267,8 +264,6 @@ fn a_failure_in_an_artifact_carries_no_line_number() {
     );
 }
 
-/// The closure is believed only if it is exactly the definitions the artifact names, and one that
-/// does not parse is refused the same way.
 #[test]
 fn a_closure_that_is_not_the_closure_is_refused() {
     let dir = project(PROGRAM);
@@ -345,8 +340,6 @@ fn no_prefix_of_an_artifact_is_believed() {
     assert!(artifact::decode(&bytes, &path).is_ok());
 }
 
-/// A body taken out of the file leaves a closure that still declares it and a namespace that does
-/// not name it, which is not the program the digest names.
 #[test]
 fn removing_a_body_is_e0443() {
     let dir = project(PROGRAM);
@@ -360,7 +353,6 @@ fn removing_a_body_is_e0443() {
     artifact.bodies.remove(&victim);
     artifact.names.retain(|(_, h)| *h != victim);
 
-    // Re-encoded, so the digest and every remaining body still verify.
     let path = dir.path().join("open.plyx");
     write_artifact(&path, &artifact);
     let (decoded, _) = artifact::read(&path).expect("the container still verifies");
@@ -474,8 +466,6 @@ fn the_digest_is_one_line_and_agrees_with_the_build() {
     assert_eq!(report["digest"], digest);
 }
 
-/// An edit nothing in the closure reaches leaves every byte of the artifact where it was; a change
-/// to a definition in it moves the digest.
 #[test]
 fn the_digest_moves_with_the_closure_and_with_nothing_else() {
     let dir = project(PROGRAM);
@@ -625,9 +615,6 @@ fn a_rename_moves_a_name_and_no_hash() {
     );
 }
 
-// --- what the closure has to spell ---------------------------------------------
-
-/// Builds `dir` and runs the artifact beside the source, which answer alike.
 fn runs_as_its_source(dir: &Path) -> Value {
     ply(dir)
         .args(["build", ".", "-o", "app.plyx"])
@@ -648,7 +635,6 @@ fn runs_as_its_source(dir: &Path) -> Value {
     from_artifact["value"].clone()
 }
 
-/// Two modules whose last segments collide cannot both be bound by it in the closure's text.
 #[test]
 fn modules_sharing_a_last_segment_ship_and_run() {
     let dir = tempfile::tempdir().unwrap();
@@ -671,7 +657,6 @@ fn modules_sharing_a_last_segment_ship_and_run() {
     assert_eq!(files, ["left/util.ply", "m.ply", "right/util.ply"]);
 }
 
-/// Two definitions with one body are one hash under two names, and the closure keeps both.
 #[test]
 fn two_names_for_one_body_ship_and_run() {
     let dir = project(
@@ -840,7 +825,6 @@ fn an_artifact_keeps_the_names_a_host_handler_is_registered_against() {
         message.contains("std.net.net.listen[listener]"),
         "the artifact lost the name a handler is registered against: {message}"
     );
-    // The one thing the artifact does lose, stated rather than discovered.
     assert!(from_artifact["diagnostics"][0]["labels"][0]["start"].is_null());
 }
 
@@ -938,13 +922,11 @@ pub fn spec() -> config::ConfigSpec = {keys: required_keys()}
 fn main() -> Int = 1
 "#;
 
-/// **A `.plyx` has to be able to carry its own `--config-schema`.**
 #[test]
 fn a_config_schema_named_at_build_time_is_in_the_artifact_and_still_refuses() {
     let dir = project(WITH_SCHEMA);
 
-    // Without the flag, the schema is outside the closure and naming it is a refusal — the
-    // behaviour that made the deployed form lose its guarantee.
+    // Without the flag the schema is outside the closure, so naming it at run is a refusal.
     ply(dir.path())
         .args(["build", "-o", "bare.plyx"])
         .assert()

@@ -115,7 +115,6 @@ fn the_closure_is_in_the_digest() {
     assert_ne!(sample().digest(), with.digest());
 }
 
-/// Two artifacts that ship one closure and start at different definitions are two programs.
 #[test]
 fn the_entry_point_is_in_the_digest() {
     let artifact = sample();
@@ -133,7 +132,6 @@ fn the_entry_point_is_in_the_digest() {
     );
 }
 
-/// An artifact of the generation that carried whole source files is rebuilt, not re-transferred.
 #[test]
 fn a_format_3_artifact_is_a_version_refusal() {
     let mut bytes = sample().encode();

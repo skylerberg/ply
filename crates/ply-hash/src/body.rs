@@ -304,8 +304,6 @@ fn unpack(payload: &[u8]) -> Option<Vec<Vec<u8>>> {
     Some(members)
 }
 
-/// The component a body belongs to: its id, its members' encodings in class order, and whether it
-/// is a solo definition rather than a cycle.
 fn component_of(hash: DefHash, body: &StoredBody) -> Result<(DefHash, Vec<Vec<u8>>, bool), String> {
     let (id, members, solo) = match body.shape() {
         None => {
@@ -392,8 +390,6 @@ impl Layout {
         Layout { units, by_hash }
     }
 
-    /// The declaration a reference from `from` is written as when several carry its hash: one in
-    /// that module, else one that is rebuilt, else the first.
     fn pick(&self, hash: DefHash, from: Option<&ModuleName>) -> Option<(usize, usize)> {
         self.by_hash
             .get(&hash)?
@@ -406,14 +402,11 @@ impl Layout {
     }
 }
 
-/// Every rebuilt unit decoded into the module it names.
 struct Rebuilt {
     modules: IndexMap<ModuleName, Module>,
     names: IndexMap<DefHash, Symbol>,
     kinds: IndexMap<DefHash, ItemKind>,
-    /// A member that did not decode, and why.
     malformed: Vec<(DefHash, String)>,
-    /// Hashes a body refers to that no unit declares.
     missing: BTreeSet<DefHash>,
 }
 
@@ -460,8 +453,7 @@ fn rebuild(layout: &Layout, relink: &BTreeMap<DefHash, DefHash>) -> Rebuilt {
         // A module never imports itself, whatever a reference inside it asked for: a unit whose
         // referent turned out to be a sibling in the same module contributed nothing to resolve.
         imports.remove(&unit.module);
-        // Keyed by name rather than pushed per unit: several units may belong to one module, and
-        // two `Module`s of one name is not a program.
+        // Keyed by name rather than pushed per unit: several units may belong to one module.
         let module = out
             .modules
             .entry(unit.module.clone())
@@ -572,12 +564,7 @@ pub fn reconstruct_relinked(
     Ok(out)
 }
 
-/// A program rebuilt from `bodies` under exactly the program-wide names `names` gives them: one
-/// item per name, in that name's module, imported `as` another binder wherever two modules share a
-/// last segment. Nothing is invented and nothing is dropped, and names that cannot say which
-/// declaration a body means are refused rather than guessed.
-///
-/// A module `named_only` is named, so that a reference into it can be written, and not rebuilt.
+/// Rebuilds `bodies` under exactly `names`; a `named_only` module is imported but not rebuilt.
 pub fn reconstruct_exact(
     bodies: &BodySet,
     names: &[(Symbol, DefHash)],
@@ -705,9 +692,7 @@ fn listed(names: &[(ModuleName, Symbol)]) -> String {
     quoted.join(", ")
 }
 
-/// A component's names as whole copies, one name per class. With one class every name is a copy
-/// of its own; otherwise a module's `n`th name of each class make one. `None` when a module names
-/// one class more often than another, which no set of copies can say.
+/// A module's `n`th name of each class make one copy; `None` if its classes differ in count.
 fn copies(classes: &[&[(ModuleName, Symbol)]]) -> Option<Vec<(ModuleName, Vec<Symbol>)>> {
     if let [only] = classes {
         return Some(
@@ -741,8 +726,6 @@ fn copies(classes: &[&[(ModuleName, Symbol)]]) -> Option<Vec<(ModuleName, Vec<Sy
     Some(out)
 }
 
-/// Each module's last segment, unless another module shares it: then each of those is bound as its
-/// whole path joined with `_`, suffixed until nothing else is bound so.
 fn binders(modules: BTreeSet<&ModuleName>) -> BTreeMap<ModuleName, Symbol> {
     let mut sharing: BTreeMap<Symbol, usize> = BTreeMap::new();
     for module in &modules {
@@ -944,7 +927,6 @@ struct Decoder<'a> {
     values: u32,
     ty_params: u32,
     row_params: u32,
-    /// Module -> the binder a reference into it is written with.
     imports: &'a mut BTreeMap<ModuleName, Symbol>,
     /// Effect hash -> the slot it was seen at.
     slots: &'a mut BTreeMap<DefHash, u32>,
@@ -1204,7 +1186,7 @@ impl Decoder<'_> {
     }
 
     /// The name the reconstructed program gives a referenced definition, and the import that makes
-    /// it reachable from the module being built. A member of this component is this copy's own.
+    /// it reachable from the module being built.
     fn qname_of(&mut self, target: Ref, ctor: Option<Symbol>) -> QName {
         let layout = self.layout;
         let own = layout.units.get(self.unit).map(|unit| &unit.module);
@@ -1217,8 +1199,6 @@ impl Decoder<'_> {
         };
         let owner = &layout.units[unit];
         let name = ident(ctor.unwrap_or_else(|| owner.names[class].clone()));
-        // Modules rather than units: several units may land in one module, and a module that
-        // imported itself to reach its own definition would not resolve.
         if own == Some(&owner.module) {
             return QName::bare(name);
         }
