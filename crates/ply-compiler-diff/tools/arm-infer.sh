@@ -93,8 +93,7 @@ arm "the scheme of a definition is published monomorphic" infer \
   '    let g: Generalized = { e: c.env, sc: mono(resolve(c, sig.fn_ty)) };'
 arm "the fields of a constructor are declared in reverse" infer \
   '                      let ty = if len(fs.ts) == 0 { result } else { t_fn(fs.ts, result, row_empty()) };' \
-  '                      let ty = if len(fs.ts) == 0 { result } else { t_fn(reverse_types(fs.ts), result, row_empty()) };
-                      let unused = reverse_types;'
+  '                      let ty = if len(fs.ts) == 0 { result } else { t_fn(map(range(0, len(fs.ts)), |i: Int| at(fs.ts, len(fs.ts) - 1 - i)), result, row_empty()) };'
 arm "a body that performs more than it declares is not reported" infer \
   '  let c1: Cx = if len(extra) == 0 { cx } else {' \
   '  let c1: Cx = if true { cx } else {'

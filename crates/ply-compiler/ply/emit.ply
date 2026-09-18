@@ -2895,8 +2895,6 @@ fn blank(em: Em) -> Em =
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
     builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
-fn strip(em: Em) -> Bytes = bytes_join(em.out, b"")
-
 // The shape both arms answer when both built a record of the same shape; otherwise the join is one local.
 fn shared_shape(em: Em, a: V, b: V) -> Option<List<Bytes>> =
   match a.ty {
@@ -2916,8 +2914,6 @@ fn shared_shape(em: Em, a: V, b: V) -> Option<List<Bytes>> =
     },
     _ -> None,
   }
-
-fn first_name(ns: List<Bytes>) -> Bytes = match list_at(ns, 0) { Some(n) -> n, None -> b"" }
 
 // Sorted by name: the order a shape holds its fields in.
 fn sorted_names(ns: List<Bytes>) -> List<Bytes> =
@@ -2974,38 +2970,8 @@ fn checked_mul(a: Int, b: Int) -> Option<Int> =
     if p / a == b && p % a == 0 { Some(p) } else { None }
   }
 
-// Whether a node answers a `Float` or `Decimal`, read structurally before emission so a join's kind is known first.
-fn opaque_of(em: Em, c: Code) -> Bool =
-  match c.node {
-    NVar(v) -> match v.slot {
-      None -> false,
-      Some(s) -> match conv_of(em, s) { Some(x) -> x.ty == TyOpaque, None -> false },
-    },
-    NBinary(b) -> is_arith(b.op) && (opaque_of(em, b.lhs) || opaque_of(em, b.rhs)),
-    NBlock(b) -> match b.tail { Some(t) -> opaque_of(em, t), None -> false },
-    NApp(a) -> match a.func.node {
-      NVar(fv) -> match fv.slot {
-        Some(_) -> false,
-        // A definition of this module answers its declared type; a builtin answers opaque over an opaque argument.
-        None -> if fold(em.here, false, |acc: Bool, h: Def| acc || h.name == fv.name) {
-                  ret_of(em.here, fv.name).ty == TyOpaque
-                } else {
-                  fold(a.args, false, |acc: Bool, x: Code| acc || opaque_of(em, x))
-                },
-      },
-      _ -> false,
-    },
-    _ -> false,
-  }
-
 // Where two arms disagree the join is a word, and each is converted into it.
 fn join_kind(a: Kind, b: Kind) -> Kind = if a == b { a } else { KBoxed }
-
-fn coerce(em: Em, k: Kind, v: V) -> Out =
-  match k {
-    KBoxed -> { em: em, v: { k: KBoxed, c: as_word(v), ty: v.ty } },
-    _ -> { em: em, v: { k: k, c: as_int(v), ty: TyOpen } },
-  }
 
 fn is_arith(op: Bytes) -> Bool =
   op == b"add" || op == b"sub" || op == b"mul" || op == b"div" || op == b"rem"
@@ -3175,9 +3141,6 @@ fn prologue(em: Em, params: List<P>) -> Em =
 
 // A module's type aliases, under the binder an import gives it in the module being emitted.
 pub type ModAliases = { binder: Bytes, aliases: List<Alias> }
-
-fn param_kind_in(aliases: List<Alias>, t: Option<TypeExpr>)
-    -> Option<{ k: Kind, ty: Ty }> = param_kind_with(aliases, [], t)
 
 // With imported aliases in reach: `http::Response` resolves through `http`'s aliases to its record, read at offsets.
 fn param_kind_with(aliases: List<Alias>, others: List<ModAliases>, t: Option<TypeExpr>)
@@ -3352,103 +3315,6 @@ fn counted(what: Bytes, xs: List<Bytes>) -> Bytes =
   fold(xs, bytes_concat_all([what, b" ", num(len(xs)), b"\n"]),
     |acc: Bytes, x: Bytes| bytes_concat_all([acc, x, b"\n"]))
 
-// A slot's shape, as the width pre-pass learns it from the parameters and every `let`.
-pub type Shaped = { slot: Int, ty: Ty }
-
-fn shape_at(env: List<Shaped>, slot: Int) -> Ty =
-  fold(env, TyOpen, |acc: Ty, e: Shaped| if e.slot == slot { e.ty } else { acc })
-
-fn ty_of(env: List<Shaped>, here: List<Def>, c: Code) -> Ty =
-  match c.node {
-    NVar(v) -> match v.slot { Some(s) -> shape_at(env, s), None -> TyOpen },
-    NBlock(b) -> match b.tail { Some(t) -> ty_of(env, here, t), None -> TyOpen },
-    NRecord(r) -> TyRec(map(r.fields, |f: CField| { name: f.name, k: KBoxed, ty: TyOpen })),
-    NApp(a) -> match a.func.node {
-      NVar(fv) -> match fv.slot { Some(_) -> TyOpen, None -> ret_of(here, fv.name).ty },
-      _ -> TyOpen,
-    },
-    NIf(i) -> {
-      let t = ty_of(env, here, i.then_branch);
-      if t == ty_of(env, here, i.else_branch) { t } else { TyOpen }
-    },
-    _ -> TyOpen,
-  }
-
-fn widths_released(c: Code, params: List<P>, here: List<Def>, reads: List<Int>) -> List<Int> = {
-  let env = fold(range(0, len(params)), [], |acc: List<Shaped>, i: Int|
-    match list_at(params, i) { Some(p) -> push(acc, { slot: i, ty: p.ty }), None -> acc });
-  widths_in(c, env, here, reads)
-}
-
-fn widths_in(c: Code, env: List<Shaped>, here: List<Def>, reads: List<Int>) -> List<Int> =
-  match c.node {
-    NField(f) -> {
-      let inner = widths_in(f.base, env, here, reads);
-      match f.base.own {
-        Owned -> match f.base.node {
-          NVar(v) -> match v.slot {
-            None -> inner,
-            Some(sl) -> if count_of(reads, sl) != 1 { inner } else {
-              match width_of(shape_at(env, sl)) {
-                None -> inner,
-                Some(w) -> if fold(inner, false, |acc: Bool, x: Int| acc || x == w) { inner }
-                           else { push(inner, w) },
-              }
-            },
-          },
-          _ -> inner,
-        },
-        _ -> inner,
-      }
-    },
-    NRecord(r) -> merge_widths([len(r.fields)],
-      fold(r.fields, [], |acc: List<Int>, f: CField|
-        merge_widths(acc, widths_in(f.value, env, here, reads)))),
-    NUnary(u) -> widths_in(u.operand, env, here, reads),
-    NBinary(b) -> merge_widths(widths_in(b.lhs, env, here, reads),
-                               widths_in(b.rhs, env, here, reads)),
-    NIf(i) -> merge_widths(widths_in(i.cond, env, here, reads),
-                merge_widths(widths_in(i.then_branch, env, here, reads),
-                             widths_in(i.else_branch, env, here, reads))),
-    // A `let` puts its value's shape in scope, so a release of a bound record finds its width.
-    NBlock(b) -> {
-      let walked = fold(b.stmts, { env: env, ws: [] },
-        |acc: { env: List<Shaped>, ws: List<Int> }, st: CStmt| match st {
-          CLet(l) -> { env: push(acc.env, { slot: l.slot, ty: ty_of(acc.env, here, l.value) }),
-                       ws: merge_widths(acc.ws, widths_in(l.value, acc.env, here, reads)) },
-          CLetPat(l) -> { env: fold(pat_slots(l.pat), acc.env, |e: List<Shaped>, sl: Int| push(e, { slot: sl, ty: TyOpen })),
-                          ws: merge_widths(acc.ws, widths_in(l.value, acc.env, here, reads)) },
-          CDo(d) -> { env: acc.env, ws: merge_widths(acc.ws, widths_in(d.code, acc.env, here, reads)) },
-        });
-      merge_widths(walked.ws,
-        match b.tail { Some(t) -> widths_in(t, walked.env, here, reads), None -> [] })
-    },
-    NList(l) -> fold(l.items, [], |acc: List<Int>, x: Code|
-      merge_widths(acc, widths_in(x, env, here, reads))),
-    // Call arguments and arms too: a record built there still needs its token.
-    NApp(a) -> fold(a.args, widths_in(a.func, env, here, reads), |acc: List<Int>, x: Code|
-      merge_widths(acc, widths_in(x, env, here, reads))),
-    NMatch(m) -> fold(m.arms, widths_in(m.scrutinee, env, here, reads),
-      |acc: List<Int>, ar: CArm| merge_widths(acc, merge_widths(
-        match ar.guard { Some(g) -> widths_in(g, env, here, reads), None -> [] },
-        widths_in(ar.body, env, here, reads)))),
-    NCell(c2) -> merge_widths(widths_in(c2.init, env, here, reads),
-                              widths_in(c2.body, env, here, reads)),
-    NRegion(r) -> widths_in(r.body, env, here, reads),
-    // An update builds a record of the base's width, so it takes a token too.
-    NUpd(u) -> merge_widths(widths_in(u.base, env, here, reads),
-      fold(u.sets, [], |acc: List<Int>, f: CField|
-        merge_widths(acc, widths_in(f.value, env, here, reads)))),
-    NPerform(pf) -> fold(pf.args, [], |acc: List<Int>, x: Code|
-      merge_widths(acc, widths_in(x, env, here, reads))),
-    // A lambda's body is a function of its own and declares its own tokens.
-    NLambda(_) -> [],
-    NSim(_) -> [],
-    NHandle(_) -> [],
-    NVar(_) -> [],
-    NLit(_) -> [],
-  }
-
 // Ascending: declarations come out sorted, not in the order the widths were found.
 fn sorted_widths(xs: List<Int>) -> List<Int> =
   fold(range(0, len(xs)), [], |acc: List<Int>, _i: Int|
@@ -3458,10 +3324,6 @@ fn sorted_widths(xs: List<Int>) -> List<Int> =
       Some(m) -> push(acc, m),
       None -> acc,
     })
-
-fn merge_widths(a: List<Int>, b: List<Int>) -> List<Int> =
-  fold(b, a, |acc: List<Int>, x: Int|
-    if fold(acc, false, |seen: Bool, y: Int| seen || y == x) { acc } else { push(acc, x) })
 
 // Spends fuel, and refuses when the native stack is nearly out: a C frame is not a machine frame.
 fn fuel_head() -> Bytes = bytes_concat_all([
