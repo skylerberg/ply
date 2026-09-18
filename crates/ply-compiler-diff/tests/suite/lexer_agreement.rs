@@ -6,22 +6,13 @@
 //! copy `stage` has bootstrapped. There used to be a copy of the lexer beside this file, and the
 //! one not in the front end is the one that went stale.
 
-use ply_compiler_diff::golden;
-use ply_compiler_diff::port;
 use ply_compiler_diff::tokens::{floats_to_bits, records, reference_dump};
+use ply_compiler_diff::{golden, port, repo_root};
 use std::path::{Path, PathBuf};
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("this crate sits at <root>/crates/ply-compiler-diff")
-        .to_path_buf()
-}
 
 /// The lexer differential's own fixtures, which are not the parser's.
 fn fixtures() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("lexer-fixtures")
+    ply_compiler_diff::fixtures().join("lexer")
 }
 
 /// Run the Ply lexer over `bytes` and return its dump.
@@ -61,7 +52,7 @@ fn check_agreement(path: &Path) {
     let actual = floats_to_bits(&ply_dump(&bytes));
     let name = path
         .strip_prefix(repo_root())
-        .unwrap_or(path)
+        .expect("an input under the repository")
         .display()
         .to_string();
     if let Err(report) = golden::check("lexer", &name, &actual, first_difference) {

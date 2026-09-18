@@ -6,22 +6,8 @@
 //! The port is entered in-process through `port`: the bundle the binary carries is the compiler
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
 
-use crate::harness::part;
-use crate::harness::{golden, port, programs, records};
-use std::path::{Path, PathBuf};
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("this crate sits at <root>/crates/ply-compiler-diff")
-        .to_path_buf()
-}
-
-/// This crate's own directory, which is where the mined corpora live.
-fn here() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
+use crate::harness::{fixtures, golden, own, part, port, programs, records, repo_root};
+use std::path::PathBuf;
 
 fn first_difference(reference: &str, actual: &str) -> Option<String> {
     let want = records(reference);
@@ -87,12 +73,11 @@ fn examples() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Runs `inputs` through both sides and reports every disagreement.
-fn compare(label: &str, inputs: &[(String, Vec<(String, String)>)]) {
+fn compare(label: &str, inputs: &[(String, Vec<(String, String)>)], view: fn(String) -> String) {
     let mut failures: Vec<String> = Vec::new();
     let mut records_total = 0usize;
     for (name, program) in inputs {
-        let actual = port::dump_program("resolve.resolve_dump", program);
+        let actual = view(port::dump_program("resolve.resolve_dump", program));
         records_total += records(&actual).len();
         if let Err(report) = golden::check("resolve", name, &actual, first_difference) {
             failures.push(format!("{label}: {report}"));
@@ -116,6 +101,7 @@ fn the_ply_resolver_matches_its_golden_on_the_standard_library() {
     compare(
         "std",
         &[("the standard library".to_string(), std_modules())],
+        |d| d,
     );
 }
 
@@ -132,7 +118,7 @@ fn the_ply_resolver_matches_its_golden_on_every_example_with_the_standard_librar
             (format!("std + examples/{name}.ply"), program)
         })
         .collect();
-    compare("examples", &part(&inputs, index, of));
+    compare("examples", &part(&inputs, index, of), |d| own::resolved(&d));
 }
 
 #[test]
@@ -147,7 +133,7 @@ fn the_ply_resolver_matches_its_golden_on_every_example_with_the_standard_librar
 
 #[test]
 fn the_ply_resolver_matches_its_golden_on_the_references_own_programs() {
-    let text = std::fs::read_to_string(here().join("fixtures/reference-programs.corpus"))
+    let text = std::fs::read_to_string(fixtures().join("reference-programs.corpus"))
         .expect("the mined programs; run mine-programs.py");
     let inputs: Vec<(String, Vec<(String, String)>)> = programs(&text)
         .into_iter()
@@ -155,12 +141,12 @@ fn the_ply_resolver_matches_its_golden_on_the_references_own_programs() {
         .map(|(i, p)| (format!("reference-programs.corpus#{i}"), p))
         .collect();
     assert!(!inputs.is_empty(), "the mined bundle holds no program");
-    compare("reference programs", &inputs);
+    compare("reference programs", &inputs, |d| d);
 }
 
 #[test]
 fn the_ply_resolver_matches_its_golden_on_the_hand_written_programs() {
-    let text = std::fs::read_to_string(here().join("fixtures/resolve-programs.corpus"))
+    let text = std::fs::read_to_string(fixtures().join("resolve-programs.corpus"))
         .expect("the hand-written programs");
     let inputs: Vec<(String, Vec<(String, String)>)> = programs(&text)
         .into_iter()
@@ -171,5 +157,5 @@ fn the_ply_resolver_matches_its_golden_on_the_hand_written_programs() {
         !inputs.is_empty(),
         "the hand-written bundle holds no program"
     );
-    compare("hand-written programs", &inputs);
+    compare("hand-written programs", &inputs, |d| d);
 }

@@ -129,23 +129,6 @@ pub fn records(dump: &str) -> Vec<&str> {
     dump.split_terminator(';').collect()
 }
 
-/// A `b"..."` literal holding exactly these bytes, for embedding a source file in a generated Ply
-/// program.
-pub fn byte_literal(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() + 16);
-    out.push_str("b\"");
-    for &b in bytes {
-        match b {
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            0x20..=0x7e => out.push(b as char),
-            _ => out.push_str(&format!("\\x{b:02x}")),
-        }
-    }
-    out.push('"');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,15 +150,6 @@ mod tests {
         let reference = reference_dump("1.5e-3");
         let as_text = "0:6:f:1.5e-3;6:6:e;";
         assert_eq!(floats_to_bits(as_text), reference);
-    }
-
-    #[test]
-    fn a_byte_literal_round_trips_every_byte_through_the_real_lexer() {
-        let all: Vec<u8> = (0u8..=255).collect();
-        let source = byte_literal(&all);
-        let (tokens, diags) = lex(SourceId(0), &source);
-        assert!(diags.is_empty(), "{diags:?}");
-        assert_eq!(tokens[0].kind, TokenKind::Bytes(all));
     }
 
     #[test]

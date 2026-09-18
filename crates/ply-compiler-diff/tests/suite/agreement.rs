@@ -5,22 +5,10 @@
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
 
 use ply_compiler_diff::{
-    bundle, golden, node_count, port, records, reference_dump, uses_effect_sets,
+    bundle, fixtures, golden, node_count, port, records, reference_dump, repo_root,
+    uses_effect_sets,
 };
 use std::path::{Path, PathBuf};
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("this crate sits at <root>/crates/ply-compiler-diff")
-        .to_path_buf()
-}
-
-/// This crate's own directory, which is where the mined corpora live.
-fn here() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
 
 /// The first record the two dumps disagree on, with context, or `None`.
 fn first_difference(reference: &str, actual: &str) -> Option<String> {
@@ -112,7 +100,10 @@ fn read_all(paths: &[PathBuf]) -> Vec<(String, Vec<u8>)> {
         .iter()
         .map(|p| {
             (
-                p.display().to_string(),
+                p.strip_prefix(repo_root())
+                    .expect("an input under the repository")
+                    .display()
+                    .to_string(),
                 std::fs::read(p).unwrap_or_else(|e| panic!("{}: {e}", p.display())),
             )
         })
@@ -176,7 +167,7 @@ fn the_ply_parser_agrees_with_ply_syntax_on_the_shipped_standard_library() {
 
 #[test]
 fn the_ply_parser_agrees_with_ply_syntax_on_the_hand_written_fixtures() {
-    let files = read_all(&ply_files(&here().join("fixtures")));
+    let files = read_all(&ply_files(&fixtures()));
     let tally = check_all(&files);
     assert_eq!(tally.inputs, files.len());
     assert!(
@@ -190,7 +181,7 @@ fn the_ply_parser_agrees_with_ply_syntax_on_the_hand_written_fixtures() {
 
 #[test]
 fn the_ply_parser_agrees_with_ply_syntax_on_the_reference_own_test_inputs() {
-    let path = here().join("fixtures/reference-tests.corpus");
+    let path = fixtures().join("reference-tests.corpus");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let fixtures = bundle(&text);
     assert!(
@@ -271,7 +262,7 @@ fn the_rewrites_this_comparison_gives_up_raise_exactly_these_diagnostics() {
             );
         }
     }
-    for path in ply_files(&here().join("fixtures")) {
+    for path in ply_files(&fixtures()) {
         inputs += 1;
         note(
             &path.display().to_string(),
@@ -279,8 +270,7 @@ fn the_rewrites_this_comparison_gives_up_raise_exactly_these_diagnostics() {
             &mut counts,
         );
     }
-    let mined =
-        std::fs::read_to_string(here().join("fixtures/reference-tests.corpus")).expect("UTF-8");
+    let mined = std::fs::read_to_string(fixtures().join("reference-tests.corpus")).expect("UTF-8");
     for (i, f) in bundle(&mined).iter().enumerate() {
         inputs += 1;
         note(&format!("reference-tests.corpus#{i}"), f, &mut counts);
@@ -330,7 +320,7 @@ fn the_rewrites_this_comparison_gives_up_raise_exactly_these_diagnostics() {
             }
         }
     }
-    for path in ply_files(&here().join("fixtures")) {
+    for path in ply_files(&fixtures()) {
         added += ply_compiler_diff::nodes_the_rewrites_add(
             &std::fs::read_to_string(&path).expect("UTF-8"),
         );
@@ -367,11 +357,10 @@ fn the_comparison_reaches_every_tag_the_reference_side_can_emit() {
             push(&std::fs::read_to_string(&path).expect("UTF-8"));
         }
     }
-    for path in ply_files(&here().join("fixtures")) {
+    for path in ply_files(&fixtures()) {
         push(&std::fs::read_to_string(&path).expect("UTF-8"));
     }
-    let mined =
-        std::fs::read_to_string(here().join("fixtures/reference-tests.corpus")).expect("UTF-8");
+    let mined = std::fs::read_to_string(fixtures().join("reference-tests.corpus")).expect("UTF-8");
     for f in bundle(&mined) {
         push(&f);
     }
