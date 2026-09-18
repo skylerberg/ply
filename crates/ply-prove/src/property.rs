@@ -1,5 +1,4 @@
-//! The property tier: drawing a value of every Ply type from a seed, running an obligation's cases
-//! against its guard, and reporting what the guard let through.
+//! The property tier: seeded generation of every Ply type, run against an obligation's guard.
 
 use crate::shrink::{self, Target};
 use crate::{
@@ -16,14 +15,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
-/// Case indices below this draw the **edge** of their type rather than a biased sample: an `Int`
-/// takes each of [`EDGE_INTS`] in turn.
+/// Case indices below this draw their type's edge values rather than a sample.
 pub const EDGE_CASES: u32 = 5;
 
-/// Drawn first, in this order, one per edge case index.
 pub const EDGE_INTS: [i64; 5] = [0, 1, -1, i64::MIN, i64::MAX];
 
-/// The `Float` edge, and the *whole* edge on purpose.
 pub const EDGE_FLOATS: [f64; 8] = [
     f64::NAN,
     0.0,
@@ -35,44 +31,36 @@ pub const EDGE_FLOATS: [f64; 8] = [
     f64::MAX,
 ];
 
-/// How many `Decimal` edge points [`edge_decimal`] offers.
 const EDGE_DECIMAL_COUNT: usize = 6;
 
-/// The `Decimal` edge: zero at two scales, one, minus one, and the ends of the range where an exact
-/// addition overflows.
 fn edge_decimal(index: usize) -> Decimal {
     match index {
         0 => Decimal::ZERO,
         1 => Decimal::ONE,
         2 => -Decimal::ONE,
-        // `0.00m`, so the difference between a value and its scale is drawn.
+        // `0.00m`: equal to zero at a different scale.
         3 => Decimal::new(0, 2),
         4 => Decimal::MAX,
         _ => Decimal::MIN,
     }
 }
 
-/// Sixteen characters starting at `'a'`, because the shrinker lowers a character toward `'a'` and a
-/// character outside the alphabet would shrink into it.
+/// Starts at `'a'` because the shrinker lowers characters toward `'a'`.
 pub const GEN_ALPHABET: &[u8; 16] = b"abcdefghijklmnop";
 
-/// The longest `List` or `String` a draw produces.
 pub const MAX_GEN_LEN: u64 = 16;
 
-/// The most entries a generated `Map` holds.
 pub const MAX_GEN_ENTRIES: usize = 8;
 
-/// An absolute ceiling on how deep generation may nest, independent of [`GEN_DEPTH`].
 pub const HARD_GEN_DEPTH: u32 = 64;
 
 const GEN_DOMAIN: &[u8] = b"ply.gen.stream.1";
 
-/// Env slots on a generated function value.
 const FN_SIZE: &str = "#size";
 const FN_CONST: &str = "#c";
 const FN_DEFAULT: &str = "#d";
 
-/// The value source: counter-mode BLAKE3, keyed by the root **and** the obligation.
+/// Counter-mode BLAKE3, keyed by the root and the obligation.
 #[derive(Clone, Debug)]
 pub struct GenStream {
     root: u64,
@@ -85,7 +73,6 @@ impl GenStream {
         GenStream::at(root, key, 0)
     }
 
-    /// A stream that has already served `counter` draws.
     pub fn at(root: u64, key: DefHash, counter: u64) -> GenStream {
         GenStream { root, key, counter }
     }
@@ -96,9 +83,7 @@ impl GenStream {
         value
     }
 
-    /// Uniform over `0..n` by rejection, specified exactly rather than described as unbiased: a
-    /// different unbiased rule is a different sequence, and every `(root, case)` ever printed would
-    /// name a different tuple.
+    /// Uniform by rejection. Do not change the rule: printed `(root, case)` pairs would shift.
     pub fn below(&mut self, n: u64) -> Option<u64> {
         if n == 0 {
             return None;
@@ -120,8 +105,7 @@ impl GenStream {
         self.root
     }
 
-    /// Pure, so a caller replaying a recorded run can ask for draw *i* without having served the
-    /// ones before it.
+    /// Pure, so a replay can ask for draw *i* directly.
     pub fn draw(root: u64, key: &DefHash, counter: u64) -> u64 {
         let mut hasher = blake3::Hasher::new();
         hasher.update(GEN_DOMAIN);
@@ -137,33 +121,26 @@ impl GenStream {
     }
 }
 
-/// One variant of a sum type, as generation and shrinking need it.
 #[derive(Clone, Debug)]
 pub struct Variant {
-    /// Program-wide constructor name, which is what a [`Value::Ctor`] carries.
     pub name: Symbol,
-    /// Position among the owning type's variants, in declaration order.
     pub index: usize,
-    /// Declared field types, still written in the owning type's parameters.
+    /// Written in the owning type's parameters.
     pub fields: Vec<Type>,
-    /// Nested constructor applications a value of this variant needs, at declaration level.
+    /// Nested constructor applications a value of this variant needs.
     pub depth: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
 struct TypeDecl {
-    /// The owning type's parameters, in declaration order, so a `Type::Con`'s arguments can be
-    /// substituted into a variant's field types.
     params: Vec<TyVar>,
     variants: Vec<Variant>,
     depth: Option<u64>,
 }
 
-/// What generation and shrinking need to know about the program's sum types.
 #[derive(Clone, Debug, Default)]
 pub struct TypeWorld {
     types: BTreeMap<Symbol, TypeDecl>,
-    /// Program-wide constructor name -> (owning type, position).
     ctors: BTreeMap<Symbol, (Symbol, usize)>,
 }
 
@@ -196,11 +173,9 @@ impl TypeWorld {
         world
     }
 
-    /// Least fixpoint of "how deep must a value of this type nest".
     fn solve_depths(&mut self) {
         let names: Vec<Symbol> = self.types.keys().cloned().collect();
-        // Each round settles at least one type or the fixpoint is reached, so one round per type is
-        // enough.
+        // Each round settles at least one type, so one round per type suffices.
         for _ in 0..=names.len() {
             let mut changed = false;
             for name in &names {
@@ -241,7 +216,6 @@ impl TypeWorld {
         }
     }
 
-    /// Nested constructor applications a value of this type needs, given what is known so far.
     fn type_depth(&self, ty: &Type) -> Option<u64> {
         match ty {
             Type::Var(_) => Some(0),
@@ -253,7 +227,6 @@ impl TypeWorld {
             Type::Con(name, _) => match name.as_str() {
                 "Int" | "Bool" | "String" | "Bytes" | "Unit" | "Float" | "Decimal" => Some(0),
                 n if IntTy::from_name(n).is_some() => Some(0),
-                // The empty collection needs nothing, whatever it holds.
                 "List" | "Map" => Some(0),
                 "Cell" => None,
                 _ if name.as_str() == prelude::TASK_TYPE => None,
@@ -267,14 +240,10 @@ impl TypeWorld {
         self.types.get(ty).map(|d| d.variants.as_slice())
     }
 
-    /// The owning type and the position of a constructor, by its program-wide name — what a
-    /// [`Value::Ctor`] carries and the shrinker needs back.
     pub fn ctor(&self, name: &Symbol) -> Option<(&Symbol, usize)> {
         self.ctors.get(name).map(|(ty, index)| (ty, *index))
     }
 
-    /// A variant's field types with a `Type::Con`'s arguments substituted for the owning type's
-    /// parameters.
     pub fn fields(&self, ty: &Symbol, variant: &Variant, args: &[Type]) -> Vec<Type> {
         let Some(decl) = self.types.get(ty) else {
             return variant.fields.clone();
@@ -318,26 +287,16 @@ fn substitute(ty: &Type, subst: &BTreeMap<TyVar, Type>) -> Type {
     }
 }
 
-/// Why no value of a type can be drawn.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Ungeneratable {
-    /// A cell belongs to the region that opened it, and an obligation opens none.
     Cell,
-    /// A task belongs to a `simulate` region, and a binder is not one.
     Task,
-    /// A credential.
     Secret,
-    /// A function type with a non-empty row: applying it inside a spec would make the spec impure,
-    /// so the binder would be unusable.
+    /// Applying it would make the spec impure.
     Effectful(Row),
-    /// An unsolved effect-row tail, which is not pure for every instantiation.
     RowVariable,
-    /// Every constructor of this type needs a value of a type that needs it, so no finite value
-    /// inhabits it.
     Uninhabited(Symbol),
-    /// A type constructor nothing declares.
     Unknown(Symbol),
-    /// Nesting reached [`HARD_GEN_DEPTH`].
     TooDeep,
 }
 
@@ -362,11 +321,9 @@ impl fmt::Display for Ungeneratable {
     }
 }
 
-/// Whether a value of this type can be drawn at all.
 pub fn generatable(ty: &Type, world: &TypeWorld) -> Result<(), Ungeneratable> {
     match ty {
-        // Monomorphised to `Int`, and recorded in `CaseReport::instantiations` so a sampled
-        // polymorphic law says which instantiation it is about.
+        // Monomorphised to `Int` and recorded in `CaseReport::instantiations`.
         Type::Var(_) => Ok(()),
         Type::Record(fields) => fields.values().try_for_each(|f| generatable(f, world)),
         Type::Fn {
@@ -403,7 +360,6 @@ pub fn generatable(ty: &Type, world: &TypeWorld) -> Result<(), Ungeneratable> {
     }
 }
 
-/// Draw one value of `ty` for case `case`.
 pub fn generate(
     ty: &Type,
     world: &TypeWorld,
@@ -419,7 +375,6 @@ pub fn generate(
     draw.value(ty, 0)
 }
 
-/// Every tuple a root draws, in order.
 pub fn draw_cases(
     binders: &[LawBinder],
     world: &TypeWorld,
@@ -439,7 +394,6 @@ pub fn draw_cases(
     Ok(out)
 }
 
-/// The size parameter, growing with the case index and then flat.
 fn size_for(case: u32) -> u64 {
     (case as u64).min(63)
 }
@@ -452,8 +406,7 @@ struct Gen<'a> {
     world: &'a TypeWorld,
     stream: &'a mut GenStream,
     size: u64,
-    /// `Some(i)` for an edge case: leaves take their `i`th edge point rather than a draw, and
-    /// collections take a short fixed length.
+    /// `Some(i)` for an edge case: leaves take their `i`th edge point.
     edge: Option<u32>,
 }
 
@@ -513,8 +466,6 @@ impl Gen<'_> {
         }
     }
 
-    /// The same shape as [`Self::int`], reduced to the type: the edges of the *type* rather than
-    /// of `Int`, because `0`, `1`, the minimum and the maximum are where a fixed width breaks.
     fn fixed(&mut self, t: IntTy) -> Fixed {
         let edges = [0i128, 1, -1, t.min(), t.max() as i128, t.max() as i128 - 1];
         let pick = |i: u64| {
@@ -551,7 +502,6 @@ impl Gen<'_> {
         }))
     }
 
-    /// Finite values **and the specials**.
     fn float(&mut self) -> f64 {
         if let Some(i) = self.edge {
             return EDGE_FLOATS[i as usize % EDGE_FLOATS.len()];
@@ -560,9 +510,7 @@ impl Gen<'_> {
         if (selector as usize) < EDGE_FLOATS.len() {
             return EDGE_FLOATS[selector as usize];
         }
-        // A draw over the bit pattern would be almost all NaN; a draw over a bounded mantissa and a
-        // bounded exponent reaches both the ordinary scale a program works at and the ends of the
-        // range.
+        // Not over the bit pattern: a bounded mantissa and exponent reach ordinary scales too.
         let mantissa = (self.stream.next_u64() >> 11) as f64;
         let exponent = (self.stream.next_u64() % (1 + self.size.min(60))) as i32 - 30;
         let sign = if self.stream.next_u64() & 1 == 0 {
@@ -573,7 +521,6 @@ impl Gen<'_> {
         sign * mantissa * 2f64.powi(exponent)
     }
 
-    /// Scale `0..=6` around zero, plus the ends of the range.
     fn decimal(&mut self) -> Decimal {
         if let Some(i) = self.edge {
             return edge_decimal(i as usize % EDGE_DECIMAL_COUNT);
@@ -597,8 +544,7 @@ impl Gen<'_> {
         }
     }
 
-    /// Length biased small by taking the lesser of two draws, then capped by the size parameter, so
-    /// a case-3 counterexample is short and a case-200 one still reaches the full width.
+    /// Length is the lesser of two draws, capped by the size parameter, so early cases are short.
     fn length(&mut self) -> usize {
         if let Some(i) = self.edge {
             return (i % 3) as usize;
@@ -619,8 +565,6 @@ impl Gen<'_> {
         Value::str(out)
     }
 
-    /// The whole byte range, unlike [`Generator::string`]'s alphabet: a `Bytes` that never contains
-    /// `0x00` or `0xff` is a `Bytes` whose laws are checked over the cases that never break.
     fn bytes(&mut self) -> Value {
         let len = self.length();
         let mut out = Vec::with_capacity(len);
@@ -631,7 +575,6 @@ impl Gen<'_> {
     }
 
     fn list(&mut self, elem: &Type, depth: u32) -> Result<Value, Ungeneratable> {
-        // Past `GEN_DEPTH` a collection is empty.
         let len = if depth >= GEN_DEPTH { 0 } else { self.length() };
         let mut items = Vec::with_capacity(len);
         for _ in 0..len {
@@ -640,7 +583,6 @@ impl Gen<'_> {
         Ok(Value::list(items))
     }
 
-    /// At most [`MAX_GEN_ENTRIES`] entries, drawn from the key and value generators.
     fn map(&mut self, key: &Type, value: &Type, depth: u32) -> Result<Value, Ungeneratable> {
         let len = if depth >= GEN_DEPTH {
             0
@@ -662,9 +604,7 @@ impl Gen<'_> {
         };
         let variants = decl.variants.clone();
 
-        // Only variants every one of whose *substituted* fields can be drawn: `type Box<a> = B(a)`
-        // is generatable at `Box<Int>` and not at `Box<Cell<Int>>`, and the declaration alone
-        // cannot tell the two apart.
+        // Check substituted fields: `Box<a>` is generatable at `Box<Int>`, not `Box<Cell<Int>>`.
         let mut usable: Vec<(&Variant, Vec<Type>)> = Vec::new();
         for variant in &variants {
             let fields = self.world.fields(name, variant, args);
@@ -676,7 +616,6 @@ impl Gen<'_> {
             return Err(Ungeneratable::Uninhabited(name.clone()));
         }
 
-        // Past `GEN_DEPTH`, only the shallowest constructors.
         if depth >= GEN_DEPTH {
             let shallowest = usable
                 .iter()
@@ -703,9 +642,7 @@ impl Gen<'_> {
         Ok(Value::ctor(ctor, out))
     }
 
-    /// A member of a fixed family, every one of which is pure, total, extensionally deterministic
-    /// and printable — so a counterexample naming a function names something a reader can act on
-    /// rather than `<fn>`.
+    /// From a fixed family of pure, total, printable functions, so counterexamples are readable.
     fn function(
         &mut self,
         params: &[Type],
@@ -742,7 +679,6 @@ impl Gen<'_> {
     }
 }
 
-/// Whether `==` on this type answers rather than raising.
 fn comparable(ty: &Type) -> bool {
     match ty {
         Type::Fn { .. } => false,
@@ -767,9 +703,7 @@ fn param_names(arity: usize) -> Vec<Symbol> {
     (0..arity).map(|i| Symbol::new(format!("x{i}"))).collect()
 }
 
-/// The synthesized body names only its own parameters and the values bound beside it, so the module
-/// scope is never consulted and index 0 is a placeholder rather than a claim about which module
-/// this came from.
+/// The body names only its own bindings, so module index 0 is a placeholder.
 fn closure(
     params: Vec<Symbol>,
     body: Expr,
@@ -798,7 +732,6 @@ fn binder_list(arity: usize, names: &[Symbol]) -> String {
         .join(", ")
 }
 
-/// `\(..) -> c`.
 pub(crate) fn const_fn(arity: usize, value: Value, world: &TypeWorld) -> Value {
     let description = format!("|{}| {}", binder_list(arity, &[]), value.render());
     let bindings = vec![
@@ -813,7 +746,6 @@ pub(crate) fn const_fn(arity: usize, value: Value, world: &TypeWorld) -> Value {
     closure(param_names(arity), var(FN_CONST), bindings, description)
 }
 
-/// `\(x0, ..) -> xi` where `xi` has the return type.
 fn projection_fn(arity: usize, index: usize) -> Value {
     let names = param_names(arity);
     let picked = names[index].to_string();
@@ -822,8 +754,6 @@ fn projection_fn(arity: usize, index: usize) -> Value {
     closure(names, var(&picked), bindings, description)
 }
 
-/// `\(x0, ..) -> if x0 == k { v } else .. else d`: a lookup table over the first parameter with a
-/// default.
 fn table_fn(arity: usize, table: Vec<(Value, Value)>, default: Value, world: &TypeWorld) -> Value {
     let names = param_names(arity);
     let subject = names[0].to_string();
@@ -869,7 +799,6 @@ fn saturating_i64(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
 }
 
-/// The size a generated function value was built with.
 pub(crate) fn fn_size(value: &Value) -> Option<u64> {
     let Value::Closure(closure) = value else {
         return None;
@@ -884,14 +813,11 @@ pub(crate) fn fn_size(value: &Value) -> Option<u64> {
     }
 }
 
-/// What one case did.
 #[derive(Debug)]
 pub enum Outcome {
-    /// The guard did not admit this tuple.
     Rejected,
     Held,
     Failed,
-    /// The guard or the body raised.
     Raised(Diagnostic),
 }
 
@@ -904,7 +830,6 @@ impl Outcome {
     }
 }
 
-/// How the property tier asks about one tuple of binder values.
 pub trait Judge {
     /// `Ok(false)` means the guard rejected this tuple.
     fn guard(&mut self, values: &[Value]) -> Result<bool, Diagnostic>;
@@ -921,7 +846,6 @@ impl<T: Judge + ?Sized> Judge for &mut T {
     }
 }
 
-/// Guard first, always.
 pub fn judge_case(judge: &mut dyn Judge, values: &[Value]) -> Outcome {
     match judge.guard(values) {
         Err(d) => Outcome::Raised(d),
@@ -934,8 +858,6 @@ pub fn judge_case(judge: &mut dyn Judge, values: &[Value]) -> Outcome {
     }
 }
 
-/// Draw, filter by the guard, evaluate, and report what happened — including the two outcomes that
-/// are not tiers.
 pub fn run_property(
     key: DefHash,
     binders: &[LawBinder],
@@ -998,8 +920,6 @@ pub fn run_property(
                     });
                 }
                 Outcome::Raised(diagnostic) => {
-                    // A minimal raising input is worth exactly what a minimal falsifying one is, so
-                    // it gets the same treatment.
                     let shrunk = shrink::shrink(
                         &values,
                         &types,
@@ -1018,7 +938,6 @@ pub fn run_property(
     }
 
     if kept == 0 {
-        // Never a pass.
         return Discharge::Vacuous(Vacuity {
             guard: guard_span,
             kind: VacuityKind::NoCaseKept { generated },
@@ -1046,7 +965,6 @@ fn bindings(binders: &[LawBinder], values: &[Value]) -> Vec<Binding> {
         .collect()
 }
 
-/// Every type variable the binders mention, monomorphised to `Int`.
 pub fn instantiations(types: &[Type]) -> Vec<(Symbol, Type)> {
     let mut seen: BTreeSet<TyVar> = BTreeSet::new();
     let mut out = Vec::new();

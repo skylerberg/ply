@@ -10,7 +10,6 @@ use ply_ty::Mode;
 use ply_ty::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Discriminants.
 mod tag {
     pub(super) const TYPE_VAR: u8 = 0x10;
     pub(super) const TYPE_CON: u8 = 0x11;
@@ -52,8 +51,7 @@ mod tag {
     pub(super) const END: u8 = 0xee;
 }
 
-/// Neither side of this codec may bound nesting the other does not: an encoder that writes what the
-/// decoder refuses makes a healthy cache report itself corrupt on every run, with no remedy.
+/// Encoder and decoder must bound nesting alike, or a healthy cache reads as corrupt every run.
 pub(crate) fn grow<R>(f: impl FnOnce() -> R) -> R {
     const RED_ZONE: usize = 256 * 1024;
     const NEW_SEGMENT: usize = 2 * 1024 * 1024;
@@ -340,8 +338,7 @@ fn get_symbols(r: &mut Reader, what: &'static str) -> Decoded<Vec<ply_span::Symb
     Ok(out)
 }
 
-/// The witness comes first so that [`peek_names`] can identify which definition an entry belongs to
-/// without decoding a scheme it is about to discard.
+/// The witness comes first so [`peek_names`] can identify an entry without decoding its scheme.
 pub fn encode_def(def: &CachedDef) -> Vec<u8> {
     let mut w = Writer::new();
     w.tag(tag::CACHED_DEF);
@@ -664,7 +661,6 @@ pub(crate) fn decode_fingerprint(bytes: &[u8]) -> Decoded<SourceFingerprint> {
     })
 }
 
-/// The witness of a `CachedDef` or `CachedDecl` payload, without the scheme behind it.
 pub(crate) fn peek_names(kind: u8, bytes: &[u8]) -> Decoded<Vec<NameRef>> {
     const WHAT: &str = "malformed cached interface";
     let mut r = Reader::new(bytes);

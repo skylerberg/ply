@@ -8,9 +8,7 @@ use ply_span::{Diagnostic, Span, codes};
 use ply_ty::{Footprint, Resource};
 use std::sync::Arc;
 
-/// What a `db` implementation has to answer.
 pub trait Driver: Send + Sync {
-    /// The Rust path `ply hosts` prints.
     fn path(&self, op: Op) -> &'static str;
 
     /// One data statement, on this task's open scope or on a connection of its own.
@@ -30,23 +28,18 @@ pub trait Driver: Send + Sync {
     fn abort(&self, owner: Owner, span: Span) -> Result<HostAnswer, Diagnostic>;
 }
 
-/// A data statement, checked and ready to run.
 pub struct Statement<'a> {
     pub op: Op,
-    /// The label the call site wrote: the statement's principal table, and the resource the
-    /// registry resolved this atom against.
+    /// The call site's label: the statement's principal table.
     pub at: &'a Resource,
     pub sql: &'a str,
     pub params: Vec<super::Param>,
-    /// Every atom the statement reaches, from [`scan`].
     pub touched: Footprint,
     pub scan: &'a Scan,
-    /// Whose scope stack this statement runs on: the machine and the task.
     pub owner: Owner,
     pub span: Span,
 }
 
-/// Register every operation of `db` against an implementation.
 pub fn register(registry: &mut HostRegistry, driver: Arc<dyn Driver>) {
     let cache = Arc::new(super::stmt::Cache::default());
     for op in Op::ALL {
@@ -63,7 +56,6 @@ pub fn register(registry: &mut HostRegistry, driver: Arc<dyn Driver>) {
     }
 }
 
-/// A registry serving `db` and nothing else.
 pub fn registry(driver: Arc<dyn Driver>) -> HostRegistry {
     let mut registry = HostRegistry::new();
     register(&mut registry, driver);
@@ -73,8 +65,7 @@ pub fn registry(driver: Arc<dyn Driver>) -> HostRegistry {
 pub struct Operation {
     pub op: Op,
     pub driver: Arc<dyn Driver>,
-    /// Shared across the operations, because a table set is a function of the statement text and of
-    /// nothing else — including of which operation performed it.
+    /// Shared across operations: a table set depends only on the statement text.
     pub cache: Arc<super::stmt::Cache>,
 }
 
@@ -96,9 +87,7 @@ impl HostHandler for Operation {
             Op::Query | Op::Execute | Op::Returning => {
                 let sql = value::statement(&req.args[0], span)?;
                 let params = value::params(&req.args[1], span)?;
-                // The scan first, and the footprint second, both before a connection is acquired: a
-                // statement the driver will not run and a table the row never declared each cost a
-                // diagnostic rather than a round trip.
+                // Checked before acquiring a connection, so a refusal costs no round trip.
                 let scan = self.cache.scan(&sql, span)?;
                 let touched =
                     check_footprint(&scan, self.op, &req.atom.resource, req.declared, span)?;

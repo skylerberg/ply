@@ -13,28 +13,15 @@ use std::time::{Duration, Instant};
 /// How long a park waits on the socket pool while the database also holds a token.
 const ALTERNATE: Duration = Duration::from_micros(250);
 
-/// Every facility this binary can serve, built once.
 pub struct Host {
     net: Arc<tcp::TcpHost>,
-    /// The database, when the run named one.
     db: Option<Arc<Postgres>>,
-    /// The run's configuration: every source read once, before this `Host` existed, and immutable
-    /// thereafter.
+    /// The run's configuration, read once before this `Host` existed and immutable thereafter.
     config: Arc<config::Snapshot>,
-    /// Where this run's records go, and every span every entry point has open.
     trace: Arc<trace::Trace>,
     /// The stop flag and the phase machine, when this run listens for a signal.
     shutdown: Option<Arc<Shutdown>>,
-    /// The roots `--fs NAME=PATH` bound, and the pool their operations wait on.
-    ///
-    /// Always present, and empty for a run that bound none — the same shape
-    /// `config` takes and for the same reason. The `fs` operations are
-    /// registered either way, so a hermetic run reaching one is `E0424` naming
-    /// the handler that *would* have served it, and a `--host` run that named
-    /// no root is `E0451` naming the label and the flag. Those are different
-    /// sentences and a reader needs both: the first says the run was hermetic,
-    /// the second says it was configured without the directory this program
-    /// asks for.
+    /// The roots `--fs NAME=PATH` bound, and the pool their operations wait on; empty if none.
     fs: Arc<fs::FsHost>,
 }
 
@@ -49,7 +36,6 @@ impl Host {
         Host::with_credentials(crate::tls::Credentials::empty())
     }
 
-    /// The same facilities, holding the TLS material this run was configured with.
     pub fn with_credentials(credentials: crate::tls::Credentials) -> Host {
         Host {
             net: Arc::new(tcp::TcpHost::with_credentials(credentials)),
@@ -61,16 +47,6 @@ impl Host {
         }
     }
 
-    /// The same facilities, reaching the roots this run named.
-    ///
-    /// A builder for the reason [`traced`] is one. Resolution happens before
-    /// this — [`Roots::bind`] is what raises `E0454`, and it does so before
-    /// anything runs, because a run that discovers its output directory is a
-    /// dangling symlink on the first write has already done the work it is
-    /// about to lose.
-    ///
-    /// [`traced`]: Host::traced
-    /// [`Roots::bind`]: crate::fs::Roots::bind
     pub fn rooted(self, roots: fs::Roots) -> Host {
         Host {
             fs: Arc::new(fs::FsHost::new(roots)),
@@ -78,34 +54,26 @@ impl Host {
         }
     }
 
-    /// The roots this run bound, for the `filesystem` block of `ply hosts`.
     pub fn roots(&self) -> &fs::Roots {
         self.fs.roots()
     }
 
-    /// The same facilities, writing records to the sink this run selected.
     pub fn traced(self, trace: Arc<trace::Trace>) -> Host {
         Host { trace, ..self }
     }
 
-    /// Where this run's records go, for the `observability` block of `ply hosts`, for the shutdown
-    /// banner's counts, and for the teardown that flushes it.
     pub fn tracing(&self) -> &Arc<trace::Trace> {
         &self.trace
     }
 
-    /// The same facilities, holding the configuration this run resolved.
     pub fn configured(self, config: Arc<config::Snapshot>) -> Host {
         Host { config, ..self }
     }
 
-    /// What the run was told, for the `configuration` block of `ply hosts` and for the start-up
-    /// banner.
     pub fn configuration(&self) -> &Arc<config::Snapshot> {
         &self.config
     }
 
-    /// The same facilities, plus a database.
     pub fn with_database(
         credentials: crate::tls::Credentials,
         config: db::PoolConfig,
@@ -120,56 +88,32 @@ impl Host {
         })
     }
 
-    /// The database this run was configured with, for the `database` block of `ply hosts` and for a
-    /// test that has to assert what a scope left open.
     pub fn database(&self) -> Option<&Arc<Postgres>> {
         self.db.as_ref()
     }
 
-    /// What the run's `--host` summary reports about TLS: how many handshakes completed, how many
-    /// were refused, and why.
     pub fn handshakes(&self) -> crate::tls::HandshakeCounts {
         self.net.handshakes()
     }
 
-    /// The credentials this run was configured with, for the `transport` block of `ply hosts`.
     pub fn credentials(&self) -> &crate::tls::Credentials {
         self.net.credentials()
     }
 
-    /// The trusted computing base of a run served by this `Host`.
     pub fn registry(&self) -> HostRegistry {
         let mut registry = HostRegistry::new();
-
-        // `net.*` — six operations over real sockets, one of them terminating TLS through
-        // `ply_host::tls`.
         tcp::register(&mut registry, Arc::clone(&self.net) as Arc<dyn tcp::Net>);
-
-        // `config.*` — two reads of one immutable map.
         config::register(&mut registry, Arc::clone(&self.config));
-
-        // `trace.*` — six operations over one sink.
         trace::register(&mut registry, Arc::clone(&self.trace));
-
-        // `task.*` — the production scheduler.
         for (op, handler) in sched::registrations() {
             registry.register(op, handler);
         }
-
-        // `db.*` — six operations over a real postgres, and only when this run named one.
         if let Some(driver) = &self.db {
             db::register(&mut registry, Arc::clone(driver) as Arc<dyn db::Driver>);
         }
-
-        // `fs.*` — nine operations over the roots this run named, registered whatever
-        // `--fs` said, so a run that bound no root is `E0451` at the perform rather than
-        // `E0424` naming a twin.
+        // Registered whatever `--fs` said, so a run that bound no root gets `E0451`, not `E0424`.
         fs::register(&mut registry, Arc::clone(&self.fs));
-
-        // `signal.*` — two reads of one flag, bound when this run listens for a stop and
-        // **withheld** when it does not.
         signal::register(&mut registry, self.shutdown.as_ref());
-
         registry
     }
 
@@ -184,12 +128,10 @@ impl Host {
         })
     }
 
-    /// The socket table, for a test that needs to know which port it got.
     pub fn net(&self) -> &Arc<tcp::TcpHost> {
         &self.net
     }
 
-    /// The same facilities, listening for a stop.
     pub fn stop(&self) -> Option<&Arc<Shutdown>> {
         self.shutdown.as_ref()
     }
@@ -205,8 +147,6 @@ impl Host {
         }
     }
 
-    /// The coordinator this run is stopping on, for the `shutdown` block of `ply hosts` and for the
-    /// banner a stopping service prints.
     pub fn shutdown(&self) -> Option<&Arc<Shutdown>> {
         self.shutdown.as_ref()
     }
@@ -217,7 +157,6 @@ pub fn registry() -> HostRegistry {
     registry_over(Arc::new(trace::Trace::default()), false)
 }
 
-/// The same listing, over the sink a run selected and with or without the postgres driver.
 pub fn registry_over(trace: Arc<trace::Trace>, database: bool) -> HostRegistry {
     let mut registry = Host::new()
         .traced(trace)
@@ -229,7 +168,7 @@ pub fn registry_over(trace: Arc<trace::Trace>, database: bool) -> HostRegistry {
     registry
 }
 
-/// The same, plus the `db` operations, served by an implementation that refuses.
+/// The hermetic listing plus the `db` operations, served by an implementation that refuses.
 pub fn registry_with_database() -> HostRegistry {
     registry_over(Arc::new(trace::Trace::default()), true)
 }
@@ -259,7 +198,6 @@ impl HostRuntime for Facilities {
         Err(err_unowned(pending))
     }
 
-    /// Waits on every facility with work outstanding.
     fn park(&self) -> Result<(), Diagnostic> {
         // A drain parks in bounded steps and never on a token.
         if self.stopping() {
@@ -281,16 +219,12 @@ impl HostRuntime for Facilities {
             }
             return Ok(());
         }
-        // Two facilities behind two condition variables cannot be waited on together, so a park
-        // that blocks on one alone sits through the other's completion.
+        // Separate condition variables cannot be waited on together, so a park blocks on one only
+        // when no other facility has work.
         let database_waiting = self
             .db
             .as_ref()
             .is_some_and(|db| db.reactor().outstanding() > 0);
-        // A third facility, so the rule the comment above states has to be read
-        // as "park boundedly whenever anyone else has work", not "whenever the
-        // database does". A file read outstanding while a park blocks forever
-        // on a socket is the same hang, reached from a different pair.
         let filesystem_waiting = self.fs.outstanding() > 0;
         if self.net.outstanding() > 0 {
             if database_waiting || filesystem_waiting {
@@ -329,24 +263,23 @@ impl HostRuntime for Facilities {
         ))
     }
 
-    /// The process-level teardown, in the order the teardown order pins.
+    /// The process-level teardown, in a pinned order.
     fn shutdown(&self, drain_ms: u64) -> ShutdownReport {
         let mut report = ShutdownReport {
             spans_abandoned: self.trace.open_spans(),
             ..ShutdownReport::default()
         };
         let until = Instant::now() + Duration::from_millis(drain_ms);
-        // 1. the database: every open scope rolled back, and none committed.
+        // Every open scope is rolled back, and none committed.
         if let Some(db) = &self.db {
             fold(
                 &mut report,
                 db.roll_back_open_scopes(until.saturating_duration_since(Instant::now())),
             );
         }
-        // 2. the sink, before the pool is gone.
+        // The sink flushes before the pool is gone.
         self.trace.flush();
         report.records_flushed = Some(self.trace.counts().events as usize);
-        // 3. the pool.
         if let Some(db) = &self.db {
             fold(
                 &mut report,
@@ -399,13 +332,11 @@ impl HostRuntime for Facilities {
         }
     }
 
-    /// Rolls back every transaction scope this entry point left open and releases or discards the
-    /// connections holding them, then closes every span it left open.
+    /// Rolls back the scopes this entry point left open, then closes the spans it left open.
     fn end_entry_point(&self, machine: MachineId) -> Result<(), Diagnostic> {
         let database = self.close_database(machine);
         let spans = self.trace.end_entry_point(machine);
-        // One diagnostic reaches the machine and two teardowns can produce one, so the second
-        // travels as a note on the first rather than being dropped.
+        // Only one diagnostic reaches the machine, so a second travels as a note on the first.
         match (database, spans) {
             (Ok(()), None) => Ok(()),
             (Ok(()), Some(spans)) => Err(spans),
@@ -436,7 +367,6 @@ impl Facilities {
     }
 }
 
-/// Fold one teardown step's outcome into the run's report.
 fn fold(report: &mut ShutdownReport, step: Result<db::pool::DrainReport, Diagnostic>) {
     match step {
         Ok(drained) => {
@@ -454,7 +384,6 @@ fn fold(report: &mut ShutdownReport, step: Result<db::pool::DrainReport, Diagnos
     }
 }
 
-/// The drain deadline, expired.
 #[cold]
 #[inline(never)]
 fn err_drain_incomplete(shutdown: &Shutdown, connections: usize, scopes: usize) -> Diagnostic {

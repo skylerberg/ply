@@ -53,7 +53,6 @@ pub(crate) struct HashSlot {
     pub(crate) at: Located,
 }
 
-/// Why a front-end cache was refused.
 pub(crate) enum CacheError {
     Missing,
     Io(std::io::Error),
@@ -131,9 +130,7 @@ pub(crate) fn version_hash() -> [u8; 32] {
     *blake3::hash(FRONTEND_VERSION.as_bytes()).as_bytes()
 }
 
-/// A nonce pairs an index with the data file it was written against, so that restoring one of the
-/// two from a backup, or deleting one, is detected rather than read as though the offsets still
-/// meant something.
+/// Pairs an index with its data file, so restoring or deleting just one of them is detected.
 pub(crate) fn fresh_nonce() -> u64 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&std::process::id().to_le_bytes());
@@ -157,7 +154,6 @@ struct Section {
     count: usize,
 }
 
-/// The index, held as the bytes that were read.
 pub(crate) struct Index {
     bytes: Vec<u8>,
     nonce: u64,
@@ -219,7 +215,6 @@ impl Index {
         }
     }
 
-    /// Every slot filed under a hash, in index order.
     pub(crate) fn slots(&self, kind: u8, hash: DefHash) -> Vec<HashSlot> {
         let section = self.section(kind);
         if section.count == 0 {
@@ -283,7 +278,6 @@ impl Index {
         None
     }
 
-    /// Every byte of the data file some index record names.
     pub(crate) fn live_bytes(&self) -> u64 {
         let frames = self.defs.count + self.decls.count + self.bodies.count + self.sources.count;
         let mut total = FRAME_HEADER * frames as u64;
@@ -295,7 +289,6 @@ impl Index {
     }
 }
 
-/// Reads and fully validates the index.
 pub(crate) fn read_index(path: &Path, schema: ContentHash) -> Result<Index, CacheError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -456,7 +449,6 @@ impl Data {
         })
     }
 
-    /// The payload of the frame an index record claims, or the reason it cannot be believed.
     pub(crate) fn frame(&self, at: Located, kind: u8) -> Result<&[u8], &'static str> {
         let Some(map) = self.map.as_ref() else {
             return Err("the front-end cache has no data file");
@@ -499,15 +491,13 @@ fn data_header(nonce: u64, schema: ContentHash) -> [u8; DATA_HEADER as usize] {
     header
 }
 
-/// The append half of a flush.
 pub(crate) struct Appender {
     file: File,
     at: u64,
 }
 
 impl Appender {
-    /// Truncates to the length the index vouches for, which is how a torn tail left by a killed
-    /// writer is recovered: no indexed entry ever lies above it, so nothing indexed is lost.
+    /// Truncating to the indexed length recovers a torn tail without losing anything indexed.
     pub(crate) fn open(path: &Path, data_len: u64) -> std::io::Result<Appender> {
         let file = OpenOptions::new()
             .read(true)
@@ -569,7 +559,6 @@ impl Appender {
     }
 }
 
-/// Everything the index names, ready to be written.
 #[derive(Default)]
 pub(crate) struct Directory {
     pub(crate) defs: Vec<HashSlot>,

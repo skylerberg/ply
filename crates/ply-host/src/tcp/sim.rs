@@ -27,19 +27,16 @@ struct SimState {
 pub struct SimNet {
     state: Mutex<SimState>,
     handles: Handles,
-    /// The credential names this simulated run was configured with — the twin's stand-in for what
-    /// `--tls` gave the socket handler.
+    /// Stands in for the credentials `--tls` gives the socket handler.
     credentials: BTreeSet<String>,
 }
 
 impl SimNet {
-    /// Each element is one connection `accept` hands out, in order; each connection is the chunks
-    /// `recv` answers with before it reports the peer is done.
+    /// Each connection `accept` hands out, as the chunks `recv` answers before end of stream.
     pub fn new(connections: Vec<Vec<Vec<u8>>>) -> SimNet {
         SimNet::with_credentials(connections, Vec::<String>::new())
     }
 
-    /// The same script, for a service whose listener is `net.listen_tls`.
     pub fn with_credentials(
         connections: Vec<Vec<Vec<u8>>>,
         credentials: Vec<impl Into<String>>,
@@ -63,7 +60,6 @@ impl SimNet {
         handle
     }
 
-    /// Everything the program wrote to a connection, in order.
     pub fn sent(&self, conn: i64) -> Vec<u8> {
         lock(&self.state)
             .sent
@@ -74,8 +70,6 @@ impl SimNet {
 }
 
 impl Net for SimNet {
-    /// A script never waits, so every answer is a value and nothing is dispatched off the machine's
-    /// thread.
     fn waits(&self) -> bool {
         false
     }
@@ -95,9 +89,7 @@ impl Net for SimNet {
         Ok(HostAnswer::Value(Value::Int(self.bind(at))))
     }
 
-    /// The credential is checked and then the listener is an ordinary one: the bytes a program
-    /// reads off a TLS connection are the bytes it reads off any other, and the twin's whole job is
-    /// to be that program's other binding.
+    /// Checks the credential, then binds an ordinary listener: TLS changes none of the bytes read.
     fn listen_tls(
         &self,
         at: &Resource,
@@ -121,7 +113,6 @@ impl Net for SimNet {
         if !state.listeners.contains(&listener) {
             return Err(not_a_listener(listener, span));
         }
-        // A real `accept` waits here for as long as it takes.
         let Some(chunks) = state.inbound.pop_front() else {
             return Err(no_connection_scripted(span));
         };
@@ -144,8 +135,7 @@ impl Net for SimNet {
         let Some(chunks) = state.conns.get_mut(&conn) else {
             return Err(not_a_stream(conn, span));
         };
-        // An exhausted script is a peer that has stopped sending, which is the empty answer a real
-        // `recv` gives at end of stream.
+        // An exhausted script is end of stream.
         let Some(mut chunk) = chunks.pop_front() else {
             return Ok(HostAnswer::Value(some(Value::bytes([]))));
         };
@@ -193,7 +183,7 @@ impl Net for SimNet {
     }
 }
 
-/// The twin mints no token, so any token it is handed belongs to something else.
+/// Mints no token, so any token it is handed belongs to another facility.
 impl HostRuntime for SimNet {
     fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
         Err(foreign_token(pending))
@@ -220,7 +210,7 @@ fn foreign_token(pending: &Pending) -> Diagnostic {
     .note("every simulated answer is a value; a pending token here means two host facilities were composed and the wrong one was asked")
 }
 
-/// See `pool::lock`: the state behind this is maps with no invariant a panicking caller can break.
+/// Poison is ignored: the maps have no invariant a panic can break.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }

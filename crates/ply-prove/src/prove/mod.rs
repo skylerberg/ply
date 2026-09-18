@@ -1,4 +1,4 @@
-//! The static proof tier: a decision procedure for the decidable fragment's fragment.
+//! The static proof tier: a decision procedure for the decidable fragment.
 
 pub mod arith;
 mod context;
@@ -16,27 +16,23 @@ use ply_syntax::ast::Expr;
 use ply_ty::{LawBinder, TyVar, Type};
 use std::collections::BTreeSet;
 
-/// How deep the case analysis nests before the answer becomes `Unknown`.
 pub const SPLIT_DEPTH: u32 = 48;
 
-/// One obligation, as the prover sees it.
 pub struct Goal<'a> {
-    /// Index into `Program::modules`: the module the expressions were written in, which is what
-    /// their bare names resolve against.
+    /// Index into `Program::modules`; bare names in the expressions resolve against it.
     pub module: usize,
     /// For an `ensures`, the owner's parameters and `result`; for a law, its `forall` binders.
     pub binders: &'a [LawBinder],
     /// The `requires` clauses beside this one, or a law's `where`.
     pub guards: &'a [&'a Expr],
-    /// For an `ensures`: the binder standing for the return value — which must also appear in
-    /// `binders`, carrying the declared return type — and the definition's own body.
+    /// For an `ensures`: the result binder (also in `binders`) and the definition's body.
     pub result: Option<(Symbol, &'a Expr)>,
     pub body: &'a Expr,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Limits {
-    /// Inference steps, charged per obligation.
+    /// Charged per obligation.
     pub steps: u32,
     pub unfold_depth: u32,
     pub split_depth: u32,
@@ -52,27 +48,19 @@ impl Default for Limits {
     }
 }
 
-/// Why an attempt was inconclusive.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Reason {
-    /// A branch of the case analysis survived — a term outside the fragment, a needed unfolding
-    /// refused because the callee is recursive, or a goal that is simply not valid.
     Open,
-    /// The step budget or the split depth ran out.
     BudgetSpent,
 }
 
-/// A static argument, and the rules it rests on.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Proof {
     /// In application order, deduplicated.
     pub rules: Vec<Rule>,
     pub steps: u32,
-    /// Type variables the proof left as uninterpreted sorts, so a proved polymorphic law is
-    /// genuinely polymorphic.
     pub sorts: Vec<Symbol>,
-    /// Whether the **prover** established that the guard admits a value: there is no guard over an
-    /// inhabited domain, or the guard was itself proved valid.
+    /// No guard, or a valid one, over an inhabited domain.
     pub guard_satisfiable: bool,
 }
 
@@ -93,14 +81,8 @@ impl Proof {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Decision {
     Proved(Proof),
-    /// The prover showed the guard unsatisfiable within the fragment.
-    GuardUnsatisfiable {
-        steps: u32,
-    },
-    Unknown {
-        reason: Reason,
-        steps: u32,
-    },
+    GuardUnsatisfiable { steps: u32 },
+    Unknown { reason: Reason, steps: u32 },
 }
 
 impl Decision {
@@ -112,12 +94,10 @@ impl Decision {
     }
 }
 
-/// Attempts one obligation.
 pub fn decide(ctx: &Context<'_>, goal: &Goal<'_>, limits: &Limits) -> Decision {
     decide_and_diagnose(ctx, goal, limits).0
 }
 
-/// [`decide`], and where the obligation left the fragment on the way.
 pub fn decide_and_diagnose(
     ctx: &Context<'_>,
     goal: &Goal<'_>,
@@ -135,13 +115,11 @@ pub fn decide_and_diagnose(
     let mut guards: Vec<term::TermId> = Vec::with_capacity(goal.guards.len());
     for guard in goal.guards {
         let lowered = lowering.lower(guard);
-        // A later `requires` is only reached when the earlier ones held, so it may lean on them —
-        // exactly as the evaluator does, which stops at the first clause that answers `false`.
+        // The evaluator stops at the first false `requires`, so a later one may assume the earlier.
         lowering.assume(lowered);
         guards.push(lowered);
     }
-    // Everything after this point is evaluated under a guard that already held; everything before
-    // it is evaluated to decide whether it holds, so it may not assume it.
+    // Requirements before this mark decide the guard, so they may not assume it.
     let guard_requirements = lowering.requirement_mark();
     let definition = goal.result.as_ref().and_then(|(name, body)| {
         let value = lowering.lower(body);
@@ -154,8 +132,7 @@ pub fn decide_and_diagnose(
     let unsupported = lowering.unsupported();
     let mut terms = lowering.finish();
 
-    // The `Float` refusal, and it is deliberately here rather than at the end: no solver runs, so
-    // no `Proof` is constructed, so no `Certificate` can be built out of one.
+    // Refuse `Float` before any solver runs, so no `Proof` or `Certificate` can be built.
     if unsupported || float_in(ctx, &terms) {
         let mut blockers = blockers;
         if !blockers.contains(&Blocker::FloatTerm) {
@@ -178,8 +155,7 @@ pub fn decide_and_diagnose(
     let guarded: Vec<(term::TermId, bool)> = guards.iter().map(|g| (*g, true)).collect();
     let ranges = int_ranges(&mut terms, result_symbol);
 
-    // The guard is evaluated before anything knows whether it holds, so a guard that raises at some
-    // input has no domain to speak of and the obligation is not decided here at any tier.
+    // A guard that can raise has no domain, so the obligation is not decided at any tier.
     let (guard_needs, body_needs) = requirements.split_at(guard_requirements);
     if let Some(conjoined) = conjunction(&mut terms, guard_needs) {
         let mut assertions = ranges.clone();
@@ -198,7 +174,6 @@ pub fn decide_and_diagnose(
         }
     }
 
-    // Vacuity first, and over the guard **alone**.
     if !guarded.is_empty() {
         let mut vacuity = RuleLog::default();
         let (answer, left) = run(&mut terms, ctx, &mut vacuity, budget, limits, &guarded);
@@ -209,7 +184,6 @@ pub fn decide_and_diagnose(
         }
     }
 
-    // The goal decides `guard ⟹ body` over ℤ and over total function symbols.
     let claim = match conjunction(&mut terms, body_needs) {
         Some(conjoined) => terms.mk(term::Node::And(body, conjoined), Some(Type::bool())),
         None => body,
@@ -236,7 +210,7 @@ pub fn decide_and_diagnose(
     let guard_satisfiable = domain_inhabited(ctx, goal.binders)
         && match conjunction(&mut terms, &guards) {
             None => true,
-            // A guard that holds of *every* input admits one, given the domain is not empty.
+            // A valid guard over a non-empty domain admits a value.
             Some(all) => {
                 let mut ignored = RuleLog::default();
                 let (answer, left) = run(
@@ -263,12 +237,10 @@ pub fn decide_and_diagnose(
     )
 }
 
-/// Whether any term in the graph has a sort mentioning `Float`.
 fn float_in(ctx: &Context<'_>, terms: &term::Terms) -> bool {
     (0..terms.len()).any(|t| terms.sort(t).is_some_and(|s| ctx.reaches_float(s)))
 }
 
-/// Why an attempt stopped, or `None` when it closed.
 fn inconclusive(answer: solve::Answer) -> Option<Reason> {
     match answer {
         solve::Answer::Closed => None,
@@ -327,8 +299,7 @@ fn int_ranges(
     out
 }
 
-/// Every term reachable from `root`, by one pass in construction order: the interner never builds a
-/// node before its children, so a parent's flag is settled by the time it is read.
+/// Terms containing `root`, in one pass: the interner builds children before their parents.
 fn derived_from(terms: &term::Terms, root: Option<term::TermId>) -> Vec<bool> {
     let mut out = vec![false; terms.len()];
     let Some(root) = root else {
@@ -384,15 +355,7 @@ fn children(node: &term::Node) -> Vec<term::TermId> {
     }
 }
 
-/// The heads [`int_ranges`] declines to call atoms.
-///
-/// The bit operators are here for the same reason `(/)` is rather than the
-/// reason `(+)` is: a shift is a value only where its count is a bit position,
-/// so `MIN <= x << n <= MAX` is a theorem about the shifts that have an answer
-/// and not about every one that can be written. `(&)`, `(|)`, `(^)` and `(~)`
-/// do have the unconditional width and lose a little reach by sitting here,
-/// which is the price of one rule over an operator set instead of a rule with
-/// four exceptions in it.
+/// The heads [`int_ranges`] declines to call atoms: a shift has a value only at some counts.
 fn is_operator_symbol(name: &str) -> bool {
     matches!(
         name,
@@ -440,7 +403,6 @@ fn run(
     (answer, left)
 }
 
-/// Whether every binder's type has at least one value.
 fn domain_inhabited(ctx: &Context<'_>, binders: &[LawBinder]) -> bool {
     binders.iter().all(|b| ctx.inhabited(&b.ty))
 }
@@ -467,7 +429,7 @@ fn collect_vars(ty: &Type, out: &mut BTreeSet<TyVar>) {
     }
 }
 
-/// The rules a proof used, in application order and without repeats.
+/// In application order, without repeats.
 #[derive(Default)]
 pub(crate) struct RuleLog {
     rules: Vec<Rule>,

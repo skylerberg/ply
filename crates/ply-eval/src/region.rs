@@ -10,15 +10,12 @@ use crate::value::Value;
 use ply_span::{Diagnostic, Span, Symbol};
 use std::rc::Rc;
 
-/// Where a step was standing when it ended, which the scheduler does not know and a race report
-/// prints.
 pub struct StepSite {
     pub definition: Option<Symbol>,
     pub span: Span,
 }
 
-/// What the machine hands the scheduler to start a task: the body to apply and the delimiters
-/// the spawning frame sat under, which the task's stack is installed over.
+/// A task to start: its body, and the spawning frame's delimiters its stack is installed over.
 pub struct Spawned {
     pub body: Value,
     pub over: Vec<Delimiter>,
@@ -32,17 +29,14 @@ pub struct Region {
     pub handlers: Handlers,
     /// The stack the region delivers its value onto.
     pub below: Stack,
-    /// What the root task evaluates.
     pub body: Option<Code>,
-    /// The root body's window size, and the values its free variables were bound to at the
-    /// region's entry.
+    /// The root body's window size, and its free variables' values at entry.
     pub size: u32,
     pub captures: Rc<Captures>,
     pub captured: Rc<[Value]>,
     pub module: usize,
     pub span: Span,
-    /// The slot-stack height at the region's entry, which every scheduling turn resets to: a
-    /// task's windows live above it and die with the task's turn.
+    /// Slot-stack height at entry; every scheduling turn resets to it.
     pub floor: usize,
     /// The entering activation's base, restored when the region delivers its value.
     pub rbase: usize,
@@ -100,25 +94,19 @@ impl Region {
     }
 }
 
-/// One entry point's whole simulated run: the choice sequence it makes, the steps it takes, and
-/// where each of them stood.
 pub struct Trail {
     seed: Seed,
     sched: Stream,
-    /// The choice actually made at each scheduling point — which is *not* the seed's path, because
-    /// the path runs out and the stream decides after it.
+    /// The choices actually made, which extend past the seed's path.
     choices: Vec<u16>,
     steps: Vec<StepRecord>,
     /// Parallel to `steps`, appended as each step ends.
     sites: Vec<StepSite>,
     /// Where the running step *first* touched something a task can share.
     pending: Option<StepSite>,
-    /// Draws the `rand` stream has served.
     drawn: u64,
-    /// Virtual time the most recently ended region reached.
     virtual_time: i64,
-    /// The region currently live, for a step whose site was never closed because the run failed
-    /// inside it.
+    /// The live region's span, for a step whose site never closed because the run failed in it.
     fallback: Span,
     entered: bool,
 }
@@ -144,7 +132,6 @@ impl Trail {
         &self.seed
     }
 
-    /// Whether this entry point reached a `simulate` region at all.
     pub fn entered(&self) -> bool {
         self.entered
     }
@@ -159,13 +146,11 @@ impl Trail {
         self.fallback = span;
     }
 
-    /// A region ended.
     pub fn leave(&mut self, virtual_time: i64, drawn: u64) {
         self.virtual_time = virtual_time;
         self.drawn = drawn;
     }
 
-    /// The next scheduling point's index.
     pub fn point(&self) -> usize {
         self.choices.len()
     }
@@ -175,7 +160,6 @@ impl Trail {
         self.seed.choice(self.choices.len())
     }
 
-    /// Draws the next scheduling choice from the `sched` stream.
     pub fn draw(&mut self, options: usize) -> Option<usize> {
         self.sched.below(options as u64).map(|drawn| drawn as usize)
     }
@@ -189,13 +173,11 @@ impl Trail {
         &self.steps
     }
 
-    /// The realized choice sequence: `Seed::at(root, choices[..j].to_vec())` replays this run's
-    /// first `j` steps exactly.
+    /// `Seed::at(root, choices[..j].to_vec())` replays this run's first `j` steps exactly.
     pub fn choices(&self) -> &[u16] {
         &self.choices
     }
 
-    /// Records what the current step touched.
     pub fn record_access(&mut self, access: Access) {
         if crate::sched::is_scheduler_bookkeeping(&access) {
             return;
@@ -205,17 +187,15 @@ impl Trail {
         }
     }
 
-    /// Whether the running step already knows where it is standing.
     pub fn has_site(&self) -> bool {
         self.pending.is_some()
     }
 
-    /// Records where the running step is standing, if it has not already.
+    /// The first site noted for a step wins.
     pub fn note_site(&mut self, site: StepSite) {
         self.pending.get_or_insert(site);
     }
 
-    /// Closes the running step's site.
     pub fn end_step(&mut self, fallback: Span) {
         let site = self.pending.take().unwrap_or(StepSite {
             definition: None,
@@ -224,7 +204,6 @@ impl Trail {
         self.sites.push(site);
     }
 
-    /// What this entry point's regions did, as [`crate::explore`] reads it.
     pub fn record(&self) -> Record {
         Record {
             steps: self
@@ -244,7 +223,6 @@ impl Trail {
     }
 }
 
-/// What one entry point's simulated regions did, as [`crate::explore`] reads it.
 #[derive(Clone)]
 pub struct Record {
     pub steps: Vec<Step>,
@@ -252,7 +230,6 @@ pub struct Record {
 }
 
 impl Record {
-    /// The record, given how the entry point that produced it ended.
     pub fn interleaving(&self, outcome: &Result<(), Diagnostic>) -> Interleaving {
         Interleaving {
             steps: self.steps.clone(),

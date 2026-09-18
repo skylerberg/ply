@@ -6,7 +6,7 @@ use ply_span::{Diagnostic, Span, codes};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-/// `in_failed_sql_transaction`: every command but a rollback is refused, `Parse` included.
+/// SQLSTATE `in_failed_sql_transaction`.
 const TRANSACTION_ABORTED: &str = "25P02";
 
 /// `--db-statement-cache`: prepared statements kept per connection.
@@ -15,7 +15,6 @@ pub const DEFAULT_STATEMENT_CACHE: usize = 256;
 /// One row, in the result description's own column order.
 pub type Row = Vec<(String, Datum)>;
 
-/// What a data operation answers.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Answer {
     Rows(Vec<Row>),
@@ -23,15 +22,12 @@ pub enum Answer {
     Failed(DbError),
 }
 
-/// A statement that prepared, and everything the prepare established about it.
 #[derive(Clone, Debug)]
 pub struct Prepared {
     pub statement: tokio_postgres::Statement,
-    /// The result description's column names, in order.
     pub columns: Vec<String>,
 }
 
-/// What the scan of a statement text costs, paid once.
 pub struct Cache {
     scans: Mutex<HashMap<String, Arc<Result<Scan, Diagnostic>>>>,
     bound: usize,
@@ -51,7 +47,6 @@ impl Cache {
         }
     }
 
-    /// The table set for this statement, computed once.
     pub fn scan(&self, sql: &str, span: Span) -> Result<Scan, Diagnostic> {
         {
             let cached = lock(&self.scans);
@@ -78,8 +73,6 @@ impl Cache {
     }
 }
 
-/// A cached diagnostic points at the `perform` that first produced it, which is the wrong source
-/// location for every later one.
 fn respan(cached: &Result<Scan, Diagnostic>, span: Span) -> Result<Scan, Diagnostic> {
     match cached {
         Ok(scan) => Ok(scan.clone()),
@@ -93,7 +86,6 @@ fn respan(cached: &Result<Scan, Diagnostic>, span: Span) -> Result<Scan, Diagnos
     }
 }
 
-/// Prepare `sql` on this connection, bind `params`, run it, and decode the answer.
 pub async fn execute(
     connection: &deadpool_postgres::Object,
     sql: &str,
@@ -101,7 +93,6 @@ pub async fn execute(
     cache_bound: usize,
     span: Span,
 ) -> Result<Answer, Diagnostic> {
-    // The bound on the per-connection prepared-statement cache.
     if connection.statement_cache.size() >= cache_bound {
         connection.statement_cache.clear();
     }
@@ -112,9 +103,7 @@ pub async fn execute(
             if let Some(failure) = as_connection_failure(&e) {
                 return Ok(Answer::Failed(failure));
             }
-            // Postgres refuses `Parse` as well as `Execute` inside a transaction block a statement
-            // already aborted, so a statement whose text this connection has not seen before fails
-            // *at prepare* with `25P02`.
+            // An aborted transaction refuses even `Parse`, so a new statement text fails here.
             if let Some(db) = e.as_db_error()
                 && db.code().code() == TRANSACTION_ABORTED
             {
@@ -165,8 +154,7 @@ pub async fn execute(
         .map(|b| b as &(dyn tokio_postgres::types::ToSql + Sync))
         .collect();
 
-    // The result description decides which of the two the statement is, not the operation the call
-    // site named: an `insert … returning` describes columns and an `insert` does not.
+    // The result description, not the call site's operation, decides rows versus a count.
     if statement.columns().is_empty() {
         return match connection.execute(&statement, &slots).await {
             Ok(count) => Ok(Answer::Count(count as i64)),
@@ -184,8 +172,6 @@ pub async fn execute(
         for (index, name) in columns.iter().enumerate() {
             match row.try_get::<_, Datum>(index) {
                 Ok(datum) => decoded.push((name.clone(), datum)),
-                // A decode failure is the driver refusing to answer a value the column did not hold
-                // — a `numeric` past `Decimal`'s range, a `NaN`, an array with a `NULL` element.
                 Err(e) => {
                     return Err(Diagnostic::error(
                         codes::DB_PREPARE_FAILED,
@@ -209,7 +195,6 @@ pub async fn control(connection: &deadpool_postgres::Object, sql: &str) -> Resul
     }
 }
 
-/// The SQLSTATE and the object it named.
 pub fn as_failure(e: &tokio_postgres::Error) -> DbError {
     if let Some(db) = e.as_db_error() {
         return DbError {
@@ -222,13 +207,10 @@ pub fn as_failure(e: &tokio_postgres::Error) -> DbError {
             detail: db.message().to_string(),
         };
     }
-    // No SQLSTATE means the conversation ended rather than the server answering: a closed socket, a
-    // server that restarted, a connection reset under a statement.
+    // No SQLSTATE means the connection ended rather than the server answering.
     DbError::connection(e.to_string())
 }
 
-/// Whether a prepare failed because the connection died rather than because the statement was
-/// wrong.
 fn as_connection_failure(e: &tokio_postgres::Error) -> Option<DbError> {
     if e.as_db_error().is_some() {
         return None;
@@ -274,8 +256,7 @@ fn unmapped(what: &str, ty: &tokio_postgres::types::Type, span: Span) -> Diagnos
     )
 }
 
-/// A panicking job thread leaves a map with no invariant a panic can break, so recovering is
-/// correct and propagating would take out the machine's thread.
+/// Poison is ignored: the map has no invariant a panic can break.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }

@@ -1,5 +1,4 @@
-//! Deterministic simulation: the seed, the plan, the dependence relation, and the seeded handlers
-//! for `clock` and `random`.
+//! Deterministic simulation: seeds, plans, the dependence relation, and seeded `clock`/`random`.
 
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_ty::Mode;
@@ -11,7 +10,6 @@ use crate::arena::Slot;
 use crate::semantics::arity_error;
 use crate::value::Value;
 
-/// The repro artifact.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub struct Seed {
     pub root: u64,
@@ -53,8 +51,7 @@ impl Seed {
         Some(Seed { root, path })
     }
 
-    /// Canonical bytes for a cache key, which is a different job from the text form: it must be
-    /// unambiguous rather than readable, so the path is length prefixed.
+    /// Unambiguous bytes for a cache key; the path is length-prefixed.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(12 + 2 * self.path.len());
         out.extend_from_slice(&self.root.to_le_bytes());
@@ -65,8 +62,7 @@ impl Seed {
         out
     }
 
-    /// The seed naming the interleaving that agrees with this one up to scheduling point `at` and
-    /// takes `choice` there.
+    /// The interleaving that agrees with this one up to scheduling point `at` and takes `choice`.
     pub fn branch(&self, at: usize, choice: u16) -> Seed {
         let mut path: Vec<u16> = self.path.iter().copied().take(at).collect();
         path.resize(at, 0);
@@ -77,7 +73,7 @@ impl Seed {
         }
     }
 
-    /// The choice fixed at scheduling point `i`, or `None` when the stream decides.
+    /// `None` when the stream decides.
     pub fn choice(&self, i: usize) -> Option<u16> {
         self.path.get(i).copied()
     }
@@ -116,15 +112,12 @@ impl fmt::Display for TaskId {
 /// The two streams a root expands into.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Domain {
-    /// Which enabled task to resume.
     Sched,
-    /// `random.next` and `random.below`.
     Rand,
 }
 
 impl Domain {
-    /// Written into every draw, so the two streams cannot be made to coincide by any choice of
-    /// root.
+    /// Hashed into every draw, so no root makes the two streams coincide.
     fn tag(self) -> u8 {
         match self {
             Domain::Sched => 0,
@@ -155,7 +148,6 @@ impl Stream {
         Stream::at(root, domain, 0)
     }
 
-    /// A stream that has already served `counter` draws.
     pub fn at(root: u64, domain: Domain, counter: u64) -> Stream {
         Stream {
             root,
@@ -170,8 +162,7 @@ impl Stream {
         value
     }
 
-    /// Uniform over `0..n`, by rejection: with `limit = (u64::MAX / n) * n`, draw until `x <
-    /// limit`, answer `x % n`.
+    /// Uniform over `0..n`: draw until `x < (u64::MAX / n) * n`, answer `x % n`.
     pub fn below(&mut self, n: u64) -> Option<u64> {
         if n == 0 {
             return None;
@@ -185,13 +176,11 @@ impl Stream {
         }
     }
 
-    /// How many draws this stream has served.
     pub fn drawn(&self) -> u64 {
         self.counter
     }
 
-    /// Pure, so a caller replaying a recorded run can ask for draw *i* without having served the
-    /// ones before it.
+    /// Pure, so a replay can ask for draw `i` without serving the earlier ones.
     pub fn draw(root: u64, domain: Domain, counter: u64) -> u64 {
         let mut hasher = blake3::Hasher::new();
         hasher.update(STREAM_DOMAIN);
@@ -213,7 +202,7 @@ pub enum SimMode {
     Once,
     /// One interleaving per root.
     Random,
-    /// The search of the backtrack-set search.
+    /// Backtrack-set search.
     #[default]
     Dpor,
 }
@@ -245,14 +234,11 @@ impl SimMode {
 /// The default interleavings explored per root under [`SimMode::Dpor`].
 pub const DEFAULT_BUDGET: u32 = 256;
 
-/// The default scheduling steps one interleaving may take before the region is
-/// [`ply_span::codes::DEADLOCK`].
+/// Default scheduling steps per interleaving before the region is [`ply_span::codes::DEADLOCK`].
 pub const DEFAULT_STEPS: u32 = 100_000;
 
-/// Under `random`, one root is a sample of one.
 pub const DEFAULT_RANDOM_ROOTS: u32 = 64;
 
-/// What a run searches.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Plan {
     pub mode: SimMode,
@@ -262,8 +248,7 @@ pub struct Plan {
     pub budget: u32,
     /// Scheduling steps per interleaving.
     pub steps: u32,
-    /// The fixed path under [`SimMode::Once`], so that `--seed 7:3.0.2` names one interleaving
-    /// rather than one root.
+    /// The fixed path under [`SimMode::Once`], so `--seed 7:3.0.2` names one interleaving.
     pub path: Vec<u16>,
 }
 
@@ -280,7 +265,6 @@ impl Default for Plan {
 }
 
 impl Plan {
-    /// The replay plan: exactly this interleaving, explored no further.
     pub fn once(seed: Seed) -> Plan {
         Plan {
             mode: SimMode::Once,
@@ -316,7 +300,6 @@ impl Plan {
         self
     }
 
-    /// The seeds this plan starts from, in the order it explores them.
     pub fn seeds(&self) -> Vec<Seed> {
         self.roots
             .iter()
@@ -324,7 +307,6 @@ impl Plan {
             .collect()
     }
 
-    /// Whether running this plan can drive the entry point more than once.
     pub fn re_executes(&self) -> bool {
         let plan = self.clone().normalized();
         let per_root = match plan.mode {
@@ -334,8 +316,7 @@ impl Plan {
         plan.roots.len() as u64 * per_root > 1
     }
 
-    /// Covers every field, length-prefixed, so no two plans can serialize alike and the digest
-    /// never depends on the struct's field order at a call site.
+    /// Covers every normalized field, length-prefixed, so no two plans serialize alike.
     pub fn digest(&self) -> [u8; 32] {
         let plan = self.clone().normalized();
         let mut hasher = blake3::Hasher::new();
@@ -359,7 +340,6 @@ impl Plan {
     }
 }
 
-/// One access a step made.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Access {
     Atom(EffectAtom),
@@ -372,8 +352,7 @@ pub enum Access {
 }
 
 impl Access {
-    /// Two atoms contend by the relation the whole language is built on; two cells iff they are the
-    /// same location and one writes; two allocations always, since they take ids from one counter.
+    /// Cells conflict when one writes the same slot; allocations always, as they share one counter.
     pub fn conflicts_with(&self, other: &Access) -> bool {
         match (self, other) {
             (Access::Atom(a), Access::Atom(b)) => a.conflicts_with(b),
@@ -407,7 +386,6 @@ impl fmt::Display for Access {
     }
 }
 
-/// What one step of one task touched.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct StepFootprint(BTreeSet<Access>);
 
@@ -443,7 +421,6 @@ impl StepFootprint {
             .any(|a| other.0.iter().any(|b| a.conflicts_with(b)))
     }
 
-    /// The atoms and cells common to both, as a diagnostic renders them.
     pub fn contention(&self, other: &StepFootprint) -> Vec<&Access> {
         self.0
             .iter()
@@ -452,19 +429,15 @@ impl StepFootprint {
     }
 }
 
-/// One end of a race, as the failure artifact prints it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RaceSite {
     pub task: TaskId,
-    /// The definition the step was inside.
     pub definition: Option<Symbol>,
-    /// The contended access, rendered.
     pub access: String,
     pub span: Span,
 }
 
-/// The two steps whose reordering flipped a passing interleaving to a failing one, and the
-/// scheduling point where the search flipped them.
+/// Two steps whose reordering at scheduling point `at` turned a pass into a failure.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Race {
     pub left: RaceSite,
@@ -489,12 +462,10 @@ impl fmt::Display for Naive {
     }
 }
 
-/// What one entry point's search did.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Exploration {
     pub explored: u32,
-    /// The frontier emptied within the budget: **every** interleaving ran, up to an equivalence
-    /// that provably preserves outcomes.
+    /// Every interleaving ran, up to an outcome-preserving equivalence.
     pub exhaustive: bool,
     /// The budget was spent.
     pub exhausted: bool,
@@ -503,25 +474,22 @@ pub struct Exploration {
     pub steps: u64,
     /// Nanoseconds of virtual time the last interleaving consumed.
     pub virtual_time: i64,
-    /// The seed of the interleaving that failed.
     pub failure: Option<Seed>,
     pub race: Option<Race>,
 }
 
 impl Exploration {
-    /// How many times over an unpruned search would have run.
+    /// How many times more an unpruned search would have run.
     pub fn reduction(&self) -> Option<f64> {
         let naive = self.naive?;
         (self.explored > 0).then(|| f64::from(naive.explored) / f64::from(self.explored))
     }
 
-    /// Whether this run's green verdict may be written to the result cache.
     pub fn is_cacheable(&self) -> bool {
         self.failure.is_none() && !self.exhausted
     }
 }
 
-/// The types the seeded operations speak in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SimTy {
     Int,
@@ -529,7 +497,6 @@ pub enum SimTy {
 }
 
 impl SimTy {
-    /// The declared type this stands for.
     pub fn ply(self) -> Type {
         match self {
             SimTy::Int => Type::int(),
@@ -552,7 +519,6 @@ impl SimTy {
     }
 }
 
-/// One operation the seeded handlers answer, with the signature it answers it at.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OpSignature {
     pub effect: &'static str,
@@ -563,12 +529,11 @@ pub struct OpSignature {
 }
 
 impl OpSignature {
-    /// The atom a perform of this operation contributes to the row.
     pub fn atom(&self) -> EffectAtom {
         EffectAtom::new(self.effect, Resource::Singleton, self.mode)
     }
 
-    /// What this operation contributes to the access set of the step it ends.
+    /// What this operation adds to the access set of the step it ends.
     pub fn step_access(&self) -> Option<Access> {
         (self.effect == "random").then(|| Access::Atom(self.atom()))
     }
@@ -580,8 +545,6 @@ impl fmt::Display for OpSignature {
     }
 }
 
-/// The clause set [`Handlers`] installs, which is the prelude effect declarations's declaration of `clock` and
-/// `random` and nothing besides.
 pub const SEEDED_OPS: &[OpSignature] = &[
     OpSignature {
         effect: "clock",
@@ -613,19 +576,16 @@ pub const SEEDED_OPS: &[OpSignature] = &[
     },
 ];
 
-/// The effects [`Handlers`] discharges.
 pub const SEEDED_EFFECTS: &[&str] = &["clock", "random"];
 
-/// The signature of a seeded operation, or `None` when the operation is not one of them — which for
-/// the scheduler means `task.*` or a user's own effect, neither of which this module may answer.
+/// `None` for `task.*` or a user's own effect, which this module may not answer.
 pub fn signature(effect: &str, op: &str) -> Option<&'static OpSignature> {
     SEEDED_OPS
         .iter()
         .find(|sig| sig.effect == effect && sig.op == op)
 }
 
-/// The three `task` operations, which the scheduler answers rather than [`Handlers`]: their
-/// signature is polymorphic and their state is the scheduler's own.
+/// Answered by the scheduler, not [`Handlers`]: they are polymorphic and use scheduler state.
 pub const TASK_OPS: &[&str] = &["spawn", "join", "yield"];
 
 /// Whether a `simulate` region's delimiter answers this operation.
@@ -641,11 +601,9 @@ pub fn is_scheduled(effect: &str, op: &str) -> bool {
 pub enum Sleep {
     /// `d <= 0`.
     Yield,
-    /// The task is blocked until virtual time reaches this deadline.
     Until(i64),
 }
 
-/// The tasks a timer made enabled, and the time it happened at.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Wake {
     pub now: i64,
@@ -657,23 +615,19 @@ pub struct Wake {
 #[derive(Clone, Debug, Default)]
 pub struct Clock {
     now: i64,
-    /// Ascending by `(deadline, task)`, so ties come back in task order rather than in whatever
-    /// order a heap resolves them — an ordering the host must not get a vote in.
+    /// Ordered by `(deadline, task)` so ties wake in task order, never a heap's arbitrary order.
     timers: BTreeSet<(i64, TaskId)>,
 }
 
 impl Clock {
-    /// Time starts at zero.
     pub fn new() -> Clock {
         Clock::default()
     }
 
-    /// `clock.now()`.
     pub fn now(&self) -> i64 {
         self.now
     }
 
-    /// `clock.sleep(nanos)`.
     pub fn sleep(&mut self, task: TaskId, nanos: i64, span: Span) -> Result<Sleep, Diagnostic> {
         if nanos <= 0 {
             return Ok(Sleep::Yield);
@@ -688,7 +642,6 @@ impl Clock {
         Ok(Sleep::Until(deadline))
     }
 
-    /// Every task waiting on a timer, ascending by `(deadline, task)`.
     pub fn sleeping(&self) -> impl Iterator<Item = (TaskId, i64)> + '_ {
         self.timers.iter().map(|&(deadline, task)| (task, deadline))
     }
@@ -704,8 +657,7 @@ impl Clock {
             .map(|&(deadline, _)| deadline)
     }
 
-    /// When the next timer can fire, or `None` when none can — which, with nothing enabled, is the
-    /// region being stuck.
+    /// `None` when no timer is pending, which with nothing enabled means the region is stuck.
     pub fn next_deadline(&self) -> Option<i64> {
         self.timers.first().map(|&(deadline, _)| deadline)
     }
@@ -714,7 +666,6 @@ impl Clock {
         self.timers.len()
     }
 
-    /// Jump to the earliest deadline and wake every task waiting on it.
     pub fn advance(&mut self) -> Option<Wake> {
         let deadline = self.next_deadline()?;
         let mut woken = Vec::new();
@@ -733,7 +684,6 @@ impl Clock {
     }
 }
 
-/// The seeded `random` handler: one stream per region, drawn from the root.
 #[derive(Clone, Debug)]
 pub struct Rand {
     stream: Stream,
@@ -744,19 +694,16 @@ impl Rand {
         Rand::at(root, 0)
     }
 
-    /// Picks the `rand` stream up where an earlier region of the same entry point left it.
     pub fn at(root: u64, drawn: u64) -> Rand {
         Rand {
             stream: Stream::at(root, Domain::Rand, drawn),
         }
     }
 
-    /// `random.next()`.
     pub fn next_int(&mut self) -> i64 {
         self.stream.next_u64() as i64
     }
 
-    /// `random.below(bound)`, by the rejection rule [`Stream::below`] specifies.
     pub fn below(&mut self, bound: i64, span: Span) -> Result<i64, Diagnostic> {
         let n = u64::try_from(bound).ok().filter(|n| *n > 0);
         match n.and_then(|n| self.stream.below(n)) {
@@ -766,23 +713,18 @@ impl Rand {
         }
     }
 
-    /// How many draws this region has served.
     pub fn drawn(&self) -> u64 {
         self.stream.drawn()
     }
 }
 
-/// What a seeded handler answers a perform with.
 #[derive(Clone, Debug)]
 pub enum Answer {
-    /// Resume the performing task with this value.
     Value(Value),
-    /// The task is blocked until virtual time reaches `deadline`.
     Sleeping { deadline: i64 },
 }
 
-/// The seeded clause set for the effects `simulate` handles and the scheduler does not implement
-/// itself.
+/// Seeded handlers for the `simulate` effects the scheduler does not answer itself.
 #[derive(Clone, Debug)]
 pub struct Handlers {
     clock: Clock,
@@ -794,8 +736,7 @@ impl Handlers {
         Handlers::at(root, 0)
     }
 
-    /// Virtual time restarts per region — it is time since *this* region was entered — while the
-    /// `rand` stream carries on, because a draw is a draw of the run.
+    /// Virtual time restarts per region; the `rand` stream carries on across the run.
     pub fn at(root: u64, drawn: u64) -> Handlers {
         Handlers {
             clock: Clock::new(),
@@ -807,8 +748,7 @@ impl Handlers {
         &self.clock
     }
 
-    /// The scheduler needs this to call [`Clock::advance`], which it may do only with nothing
-    /// enabled.
+    /// For [`Clock::advance`], which the scheduler may call only with nothing enabled.
     pub fn clock_mut(&mut self) -> &mut Clock {
         &mut self.clock
     }
@@ -817,7 +757,6 @@ impl Handlers {
         &self.rand
     }
 
-    /// Answer one `clock.*` or `random.*` perform on behalf of `task`.
     pub fn dispatch(
         &mut self,
         sig: &OpSignature,

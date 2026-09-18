@@ -1,4 +1,4 @@
-//! The real one: `net` over loopback TCP, plaintext or TLS.
+//! `net` over loopback TCP, plaintext or TLS.
 
 use super::{Handles, Net, Op, not_a_listener, not_a_stream, unknown_handle};
 use crate::pool::{Done, NET_FIRST_TOKEN, Pool};
@@ -15,8 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 enum Sock {
-    /// `None` for a plaintext listener; a TLS listener carries the configuration every connection
-    /// it accepts is terminated with.
+    /// `None` for plaintext; otherwise the config every accepted connection is terminated with.
     Listener(Arc<TcpListener>, Option<Arc<ServerConfig>>),
     Stream(Arc<TcpStream>),
     Tls(Arc<tls::Session>),
@@ -24,14 +23,12 @@ enum Sock {
     Finished,
 }
 
-/// An accepted connection, whichever transport carries it.
 enum Conn {
     Plain(Arc<TcpStream>),
     Tls(Arc<tls::Session>),
 }
 
-/// The socket table and the handle allocator, in one [`Arc`] because a pool thread completing an
-/// `accept` has to insert into both.
+/// The socket table and handle allocator, together because a completing `accept` inserts into both.
 struct Sockets {
     open: Mutex<BTreeMap<i64, Sock>>,
     handles: Handles,
@@ -54,8 +51,7 @@ impl Sockets {
         match lock(&self.open).get(&handle) {
             Some(Sock::Listener(l, tls)) => Ok((Arc::clone(l), tls.clone())),
             Some(Sock::Stream(_) | Sock::Tls(_)) => Err(not_a_listener(handle, span)),
-            // Unreachable while `stop_accepting` sets its flag before it swaps any listener:
-            // `accept` reads the flag first and never gets here.
+            // Unreachable: `accept` checks the stop flag, set before any listener is swapped.
             Some(Sock::Finished) => Err(not_a_listener(handle, span)),
             None => Err(unknown_handle(handle, span)),
         }
@@ -71,7 +67,6 @@ impl Sockets {
         }
     }
 
-    /// Accepted connections the program has not closed.
     fn connections(&self) -> usize {
         lock(&self.open)
             .values()
@@ -80,14 +75,13 @@ impl Sockets {
     }
 }
 
-/// The TCP host handler's state: one socket table and one blocking pool.
 pub struct TcpHost {
     sockets: Arc<Sockets>,
     pool: Pool,
     /// What `net.listen_tls` resolves a credential name against.
     credentials: Credentials,
     handshakes: Arc<Handshakes>,
-    /// Phase 2 of the drain.
+    /// Set by phase 2 of the drain.
     stopping: Arc<AtomicBool>,
     /// `accept` operations parked on a pool thread.
     accepts: Arc<AtomicUsize>,
@@ -125,8 +119,6 @@ impl TcpHost {
         &self.credentials
     }
 
-    /// What the run's `--host` summary reports about TLS: how many handshakes completed, how many
-    /// were refused, and why.
     pub fn handshakes(&self) -> tls::HandshakeCounts {
         self.handshakes.snapshot()
     }
@@ -139,7 +131,6 @@ impl TcpHost {
         }
     }
 
-    /// Whether this host minted the token.
     pub fn owns(&self, pending: &Pending) -> bool {
         self.pool.owns(pending)
     }
@@ -148,7 +139,6 @@ impl TcpHost {
         self.pool.outstanding()
     }
 
-    /// Wait for at most `bound` for an outstanding operation to finish.
     pub fn park_until(&self, bound: Duration) -> Result<(), Diagnostic> {
         self.pool.park_until(bound)
     }
@@ -171,10 +161,7 @@ impl Net for TcpHost {
         true
     }
 
-    /// `net.recv` and `net.send` say `tcp` for both transports, because that is the handler the
-    /// registry resolves; what routes a particular socket through rustls is which listener accepted
-    /// it, and `ply hosts` makes that visible with its `transport` block rather than by splitting
-    /// these rows.
+    /// `tcp` for both transports: the accepting listener, not the op, decides whether rustls runs.
     fn path(&self, op: Op) -> &'static str {
         match op {
             Op::Listen => "ply_host::tcp::listen",
@@ -208,7 +195,7 @@ impl Net for TcpHost {
         ))))
     }
 
-    /// No handshake here, deliberately.
+    /// No handshake here, deliberately: the session handshakes on its first read or write.
     fn accept(&self, at: &Resource, listener: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
         // Before the lookup, because `stop_accepting` has already swapped the listener out.
         if self.stopping.load(Ordering::Acquire) {
@@ -223,11 +210,9 @@ impl Net for TcpHost {
         accepts.fetch_add(1, Ordering::AcqRel);
         self.waiting(span, "accept", Op::Accept.what(), move || {
             let done = match listener.accept() {
-                // A connection taken in the instant the run stopped accepting — the drain's own
-                // wake dial, or a client that raced it.
+                // Taken as the run stopped accepting: the drain's wake dial, or a client racing it.
                 Ok(_) if stopping.load(Ordering::Acquire) => Done::Int(0),
-                // No label: `accept` names the listener's, and the connection's is whichever one
-                // the program first reads or writes it under.
+                // No label: the connection takes whichever one the program first uses it under.
                 Ok((stream, _)) => {
                     let stream = Arc::new(stream);
                     let sock = match config {
@@ -238,8 +223,7 @@ impl Net for TcpHost {
                     };
                     Done::Int(sockets.insert(None, sock))
                 }
-                // A listener that is finished answers `0`, and handles ascend from 1 and are never
-                // reused, so `0` is never a live socket.
+                // `0` is never a live handle: handles ascend from 1 and are never reused.
                 Err(e) if transient(&e) => Done::Int(retry_accept(
                     &listener,
                     &sockets,
@@ -265,12 +249,10 @@ impl Net for TcpHost {
         let conn = self.sockets.stream(conn, at, span)?;
         self.waiting(span, "recv", Op::Recv.what(), move || match conn {
             Conn::Plain(stream) => {
-                // The deadline, as one `setsockopt` on a socket this job owns for its duration.
+                // This job owns the socket for its duration, so setting its timeout is safe.
                 let _ = stream.set_read_timeout(Some(timeout));
                 let mut buffer = vec![0u8; max];
-                // One `read`, deliberately: a short answer is what a partial read looks like and an
-                // empty one is what a peer's close looks like, and a loop here would hide both from
-                // the program that has to handle them.
+                // One `read`: a loop would hide short reads and closes from the program.
                 match (&*stream).read(&mut buffer) {
                     Ok(n) => {
                         buffer.truncate(n);
@@ -281,9 +263,7 @@ impl Net for TcpHost {
                     Err(e) => Done::Failed(e.to_string()),
                 }
             }
-            // Never `Failed`: a handshake that fails, a peer that resets and a record that will not
-            // decrypt are all "the peer went away", which is the path the server already has and
-            // the reason the accept loop survives a client sending nonsense.
+            // Never `Failed`: any TLS failure is "the peer went away", so the accept loop survives.
             Conn::Tls(session) => {
                 session.deadline(timeout);
                 Done::MaybeBytes(session.read(max))
@@ -304,8 +284,7 @@ impl Net for TcpHost {
         self.waiting(span, "send", Op::Send.what(), move || match conn {
             Conn::Plain(stream) => {
                 let _ = stream.set_write_timeout(Some(timeout));
-                // One `write`, which may take fewer bytes than it was given — that is what
-                // backpressure looks like, and `std.net.send_all` is where it is looped over.
+                // One `write`, which may be short under backpressure; `std.net.send_all` loops.
                 match (&*stream).write(&payload) {
                     Ok(n) => Done::MaybeInt(Some(n as i64)),
                     Err(e) if expired(&e) => Done::MaybeInt(None),
@@ -325,14 +304,12 @@ impl Net for TcpHost {
         let sock = lock(&self.sockets.open).remove(&socket);
         self.sockets.handles.close(socket);
         match sock {
-            // Shut down rather than only dropping: another Arc of this stream may be parked in a
-            // `recv` on a pool thread, and closing the fd is what returns that thread.
+            // Shut down, not just dropped: a `recv` parked on another `Arc` returns only then.
             Some(Sock::Stream(s)) => {
                 let _ = s.shutdown(Shutdown::Both);
                 Ok(HostAnswer::Value(Value::Unit))
             }
-            // A `close_notify` first, so a peer sees a clean end rather than a truncation it is
-            // right to treat as an attack.
+            // `close_notify` first, so the peer sees a clean end rather than a truncation.
             Some(Sock::Tls(s)) => {
                 s.close();
                 Ok(HostAnswer::Value(Value::Unit))
@@ -343,12 +320,9 @@ impl Net for TcpHost {
     }
 }
 
-/// Phase 2 of the drain, as the coordinator reaches it.
 impl crate::signal::Accepting for TcpHost {
     fn stop_accepting(&self) -> usize {
-        // The flag first and the swap second, so there is no instant in which a listener is gone
-        // and `accept` has not yet learnt to answer `0` — that window would be an `E0502` naming a
-        // handle the program is holding legitimately.
+        // Flag before swap, or `accept` could find its listener gone and raise `E0502`.
         self.stopping.store(true, Ordering::Release);
         let mut open = lock(&self.sockets.open);
         let listeners: Vec<i64> = open
@@ -366,8 +340,7 @@ impl crate::signal::Accepting for TcpHost {
             open.insert(*handle, Sock::Finished);
         }
         *lock(&self.closed_at) = closed;
-        // The descriptor closes when the last `Arc` of it drops, which is when the parked `accept`
-        // job returns — so the kernel stops queueing a moment after this rather than inside it.
+        // The fd closes when the parked `accept` job drops its `Arc`, shortly after this returns.
         listeners.len()
     }
 
@@ -408,7 +381,6 @@ impl HostRuntime for TcpHost {
     }
 }
 
-/// The deadline expired with nothing to show for it.
 fn expired(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
@@ -418,8 +390,7 @@ fn expired(e: &std::io::Error) -> bool {
     )
 }
 
-/// The peer's misbehaviour, which is an ordinary outcome rather than the program's error: end of
-/// stream for a read, `0` for a write.
+/// An ordinary outcome, not the program's error: end of stream for a read, `0` for a write.
 fn peer_gone(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
@@ -453,8 +424,7 @@ fn retry_accept(
             Ok(_) if stopping.load(Ordering::Acquire) => return 0,
             Ok((stream, _)) => {
                 let stream = Arc::new(stream);
-                // The listener's transport, not a plaintext default: a retry that dropped TLS would
-                // serve one connection in the clear.
+                // The listener's transport: a retry that dropped TLS would serve in the clear.
                 let sock = match config {
                     Some(config) => Sock::Tls(Arc::new(tls::Session::new(
                         Arc::clone(config),

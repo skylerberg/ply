@@ -9,28 +9,23 @@ use ply_syntax::ast::Expr;
 use ply_ty::Footprint;
 use std::fmt;
 
-/// What the harness needs of an engine.
 pub trait Evaluator {
     fn test_count(&self) -> usize;
     fn test_name(&self, index: usize) -> Option<&str>;
     fn eval_test(&mut self, index: usize) -> Result<(), Diagnostic>;
-    /// A position in a `CheckOutput` is not a position in the AST an engine holds, because the
-    /// incremental front end reports tests from modules it never parsed.
+    /// By module: the incremental front end reports tests from modules it never parsed.
     fn eval_test_in(&mut self, module: &Symbol, ordinal: usize) -> Result<(), Diagnostic>;
     fn eval_expr(&mut self, e: &Expr) -> Result<Value, Diagnostic>;
-    /// The run's cells, ascending by slot: the state the two sides must agree on once a test has
-    /// run.
+    /// The run's cells, ascending by slot.
     fn cells(&self) -> &Arena;
-    /// The same arena, so the harness can ask it to journal what it reclaims.
     fn cells_mut(&mut self) -> &mut Arena;
     fn set_fixture(&mut self, fixture: &Fixture);
 
-    /// The atoms actually performed, for an engine that traces.
+    /// `None` for an engine that does not trace.
     fn observed_footprint(&self) -> Option<Footprint> {
         None
     }
 
-    /// How many atoms were performed in total, for an engine that traces.
     fn observed_performs(&self) -> Option<u64> {
         None
     }
@@ -81,23 +76,12 @@ impl Evaluator for Machine<'_> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Detail {
-    /// One engine accepted the program and the other refused it.
     Verdict,
-    /// Both refused it, but not identically.
-    Diagnostic {
-        field: String,
-    },
-    /// Both accepted it and produced different values.
+    Diagnostic { field: String },
     Value,
     Footprint,
-    /// The arenas differ.
-    Cells {
-        at: String,
-    },
-    /// The two runs reclaimed different cells, or reclaimed them in a different order.
-    Reclaimed {
-        at: String,
-    },
+    Cells { at: String },
+    Reclaimed { at: String },
 }
 
 impl Detail {
@@ -113,8 +97,6 @@ impl Detail {
     }
 }
 
-/// A single disagreement, carrying both sides so the reader never has to re-run anything to see
-/// what happened.
 #[derive(Clone, Debug)]
 pub struct Divergence {
     /// The test's label, or the caller's name for an ad-hoc expression.
@@ -126,9 +108,7 @@ pub struct Divergence {
 }
 
 impl Divergence {
-    /// Fails the run.
-    /// Fails the run. The blame is the backend's, always: the machine hands it no
-    /// route back in, so a wrong answer is the only thing it can contribute.
+    /// The blame is always the backend's: the machine gives it no route back in.
     pub fn to_backend_diagnostic(&self, span: Span) -> Diagnostic {
         Diagnostic::error(
             codes::ENGINE_DIVERGENCE,
@@ -160,7 +140,6 @@ impl fmt::Display for Divergence {
 
 #[derive(Clone, Debug, Default)]
 pub struct Report {
-    /// Subjects both sides ran and the harness compared.
     pub compared: usize,
     /// Of those, how many carried a footprint from both sides.
     pub footprints_compared: usize,
@@ -176,8 +155,6 @@ impl Report {
         self.divergences.is_empty()
     }
 
-    /// The first divergence as a diagnostic, so a caller can fail a run without deciding how to
-    /// summarize the rest.
     pub fn into_result(self) -> Result<Report, Diagnostic> {
         match self.divergences.first() {
             Some(d) => Err(d.to_backend_diagnostic(Span::DUMMY)),
@@ -202,9 +179,7 @@ impl fmt::Display for Report {
     }
 }
 
-/// Both engines are stepped even when the first has already diverged: a run that stops at the first
-/// disagreement leaves the two evaluators at different points in the corpus and every later
-/// comparison becomes meaningless.
+/// Both engines always step, so a divergence never leaves them at different points in the corpus.
 pub fn compare_test(left: &mut dyn Evaluator, right: &mut dyn Evaluator, index: usize) -> Compared {
     let subject = left
         .test_name(index)
@@ -221,17 +196,11 @@ pub fn compare_test(left: &mut dyn Evaluator, right: &mut dyn Evaluator, index: 
     }
 }
 
-/// Asks both arenas to record what their closes reclaim.
 pub fn audit_state(left: &mut dyn Evaluator, right: &mut dyn Evaluator) {
     left.cells_mut().journal();
     right.cells_mut().journal();
 }
 
-/// Compares two evaluators that have each already answered the same question.
-///
-/// Not public: `--audit-backend` was the caller outside this module, and under tier-only (ADR
-/// 0048) there is no second engine for it to pair. What is left is [`compare_test`], which is how
-/// two machines over one program are held to the same answers.
 fn compare_outcomes(
     left: &dyn Evaluator,
     right: &dyn Evaluator,
@@ -253,7 +222,6 @@ fn compare_outcomes(
         })
 }
 
-/// What one subject's comparison produced.
 pub enum Compared {
     Agreed,
     Diverged(Divergence),
@@ -288,7 +256,6 @@ pub fn compare_answers(
         })
 }
 
-/// Compares one expression, for a snippet that is not a `test` in a program.
 pub fn compare_expr(
     left: &mut dyn Evaluator,
     right: &mut dyn Evaluator,
@@ -300,8 +267,7 @@ pub fn compare_expr(
     compare_answers(left, right, subject, &l, &r)
 }
 
-/// The two evaluators must have been built over the same program, so that an index means the same
-/// test on both sides.
+/// Both evaluators must be built over the same program, so an index names the same test.
 pub fn compare_tests(
     left: &mut dyn Evaluator,
     right: &mut dyn Evaluator,
@@ -332,8 +298,7 @@ pub fn compare_tests(
                 report.divergences.push(d);
             }
         }
-        // After the run, not before: before it, a footprint is the *previous* test's and counting
-        // it would claim a comparison that never happened.
+        // After the run: before it, the footprint is the previous test's.
         if left.observed_footprint().is_some() && right.observed_footprint().is_some() {
             report.footprints_compared += 1;
         }
@@ -341,8 +306,7 @@ pub fn compare_tests(
     report
 }
 
-/// The first field of two outcomes that differs, in the order a reader scans a diagnostic: whether
-/// it failed at all, then code, severity, message, labels, notes.
+/// The first differing field, in the order a reader scans a diagnostic.
 fn outcome_divergence(
     left: &Result<(), Diagnostic>,
     right: &Result<(), Diagnostic>,
@@ -404,7 +368,6 @@ fn diagnostic_divergence(a: &Diagnostic, b: &Diagnostic) -> Option<(Detail, Stri
     None
 }
 
-/// The atoms performed, and how many were performed in total.
 fn footprint_divergence(
     left: &dyn Evaluator,
     right: &dyn Evaluator,
@@ -427,8 +390,6 @@ fn plural(n: u64) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
-/// Two arenas agree when they hold the same cells in the same order with the same rendered
-/// contents.
 fn cells_divergence(left: &Arena, right: &Arena) -> Option<(Detail, String, String)> {
     let mut a = left.slots();
     let mut b = right.slots();
@@ -478,14 +439,10 @@ fn cells_divergence(left: &Arena, right: &Arena) -> Option<(Detail, String, Stri
     }
 }
 
-/// Two arenas agree about what they reclaimed when their journals are equal.
 fn reclaimed_divergence(left: &Arena, right: &Arena) -> Option<(Detail, String, String)> {
     let (a, b) = (left.journalled(), right.journalled());
     for (i, (x, y)) in a.iter().zip(b).enumerate() {
-        // By index and value, never by generation: a generation counts how many entry points a
-        // *position* has been through, which is a run's history and not the program's: two runs
-        // can reach the same state having reclaimed a different number of
-        // times.
+        // Never by generation: that is a slot's reuse history, which agreeing runs can differ on.
         if x.0.index() != y.0.index() || x.1.render() != y.1.render() {
             return Some((
                 Detail::Reclaimed { at: i.to_string() },

@@ -6,11 +6,10 @@ use ply_syntax::resolve::{Namespace, Resolved};
 use ply_ty::{CheckOutput, CtorInfo, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// A definition the prover may inline.
 pub struct Unfoldable<'a> {
     pub name: Symbol,
     pub def: &'a FnDef,
-    /// Index into `Program::modules`, which is what the body's bare names resolve against.
+    /// Index into `Program::modules`; the body's bare names resolve against it.
     pub module: usize,
 }
 
@@ -26,10 +25,8 @@ pub struct Context<'a> {
     defs: HashMap<Symbol, (usize, &'a FnDef)>,
     recursive: BTreeSet<Symbol>,
     by_type: BTreeMap<Symbol, Vec<Symbol>>,
-    /// The sum types with at least one value, by least fixed point.
     inhabited_types: BTreeSet<Symbol>,
-    /// Every nominal type whose *declaration* reaches a `Float`, by least fixed point over the
-    /// constructors.
+    /// Nominal types whose declaration reaches a `Float`.
     float_types: BTreeSet<Symbol>,
     sort_names: BTreeMap<TyVar, Symbol>,
 }
@@ -56,9 +53,7 @@ impl<'a> Context<'a> {
                 .or_default()
                 .push((info.index, name.clone()));
         }
-        // A type whose declaration the prover cannot see in full is one it must never split on, so
-        // an alias and a builtin are both absent by construction — neither contributes a
-        // `CtorInfo`.
+        // Aliases and builtins contribute no `CtorInfo`, so they are never split on.
         let mut sums: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
         for (ty, mut ctors) in by_type {
             ctors.sort();
@@ -82,13 +77,11 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// Whether a type reaches a `Float` — through its arguments, its fields, or **its own
-    /// declaration**.
+    /// Through its arguments, its fields, or its own declaration.
     pub fn reaches_float(&self, ty: &Type) -> bool {
         reaches_float(ty, &self.float_types)
     }
 
-    /// Names for the type variables a proof leaves as uninterpreted sorts.
     pub fn with_sort_names(mut self, names: BTreeMap<TyVar, Symbol>) -> Context<'a> {
         self.sort_names = names;
         self
@@ -101,8 +94,7 @@ impl<'a> Context<'a> {
             .unwrap_or_else(|| Symbol::new(Type::Var(v).to_string()))
     }
 
-    /// The program-wide name a reference denotes, or `None` when it denotes nothing this crate can
-    /// see — in which case the term becomes a fresh symbol rather than a guess.
+    /// `None` when the reference denotes nothing visible; the term then becomes a fresh symbol.
     pub fn resolve_value(&self, module: usize, q: &QName) -> Option<Symbol> {
         if let Ok(binding) = self.resolved.lookup(module, Namespace::Value, q) {
             return Some(binding.qualified.clone());
@@ -115,8 +107,7 @@ impl<'a> Context<'a> {
         self.check.ctors.get(name)
     }
 
-    /// `None` unless every constructor of the type is in hand, because a split over a partial list
-    /// is not a case analysis.
+    /// `None` unless every constructor is in hand: a split over a partial list is unsound.
     pub fn variants(&self, type_name: &Symbol) -> Option<Variants<'a>> {
         let names = self.by_type.get(type_name)?;
         let mut ctors = Vec::with_capacity(names.len());
@@ -133,7 +124,6 @@ impl<'a> Context<'a> {
         self.check.defs.get(name).map(|d| &d.scheme)
     }
 
-    /// Whether a type has at least one value.
     pub fn inhabited(&self, ty: &Type) -> bool {
         match ty {
             Type::Var(_) => true,
@@ -146,8 +136,7 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// Whether two calls to this definition with equal arguments must answer equally — the
-    /// assumption behind sharing one term between them.
+    /// Whether equal calls must answer equally, so they may share one term.
     pub fn is_pure(&self, name: &Symbol) -> bool {
         let Some(def) = self.check.defs.get(name) else {
             return false;
@@ -163,8 +152,7 @@ impl<'a> Context<'a> {
         self.recursive.contains(name)
     }
 
-    /// A definition the prover may inline: not in a recursive component, and with an empty
-    /// footprint.
+    /// Not in a recursive component, and with an empty footprint.
     pub fn unfoldable(&self, name: &Symbol) -> Option<Unfoldable<'a>> {
         if self.recursive.contains(name) {
             return None;
@@ -181,12 +169,9 @@ impl<'a> Context<'a> {
     }
 }
 
-/// Removes any sum type whose declared variant count disagrees with the number of constructors in
-/// hand.
 fn drop_incomplete(program: &Program, sums: &mut BTreeMap<Symbol, Vec<Symbol>>) {
     let mut declared: BTreeMap<Symbol, usize> = BTreeMap::new();
-    // The prelude's ADTs are declared by the *language* rather than by a file, so the check below —
-    // which reads the program's `type` items — would drop them and refuse to split on an `Option`.
+    // The prelude's ADTs have no `type` item, and would otherwise be dropped.
     for adt in ply_ty::prelude::ADTS {
         declared.insert(Symbol::new(adt.name), adt.variants.len());
     }
@@ -217,8 +202,7 @@ fn reaches_float(ty: &Type, declared: &BTreeSet<Symbol>) -> bool {
     }
 }
 
-/// Every nominal type some constructor of which reaches a `Float`, as a least fixed point so that a
-/// chain — `type Rate = R(Float)`, `type Row = W(Rate)` — and a recursive declaration both settle.
+/// A least fixed point, so chains of declarations and recursive ones both settle.
 fn float_reaching_types(check: &CheckOutput) -> BTreeSet<Symbol> {
     let mut fields: BTreeMap<Symbol, Vec<&Type>> = BTreeMap::new();
     for ctor in check.ctors.values() {
@@ -245,8 +229,7 @@ fn float_reaching_types(check: &CheckOutput) -> BTreeSet<Symbol> {
     }
 }
 
-/// The sum types with at least one value: a type is inhabited once some constructor's every field
-/// is, which is the least fixed point of that rule.
+/// Least fixed point: a type is inhabited once every field of some constructor is.
 fn inhabited_sum_types(
     check: &CheckOutput,
     sums: &BTreeMap<Symbol, Vec<Symbol>>,
@@ -290,8 +273,7 @@ fn field_inhabited(
     }
 }
 
-/// Every definition in a cycle of the call graph, by Tarjan's algorithm, run iteratively so a deep
-/// program cannot overflow the host stack.
+/// Definitions in a call-graph cycle; Tarjan run iteratively so deep programs cannot overflow.
 fn recursive_definitions(
     defs: &HashMap<Symbol, (usize, &FnDef)>,
     resolved: &Resolved,
@@ -379,7 +361,6 @@ fn tarjan(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
     components
 }
 
-/// Every top-level value a body could name.
 fn collect_references(expr: &Expr, module: usize, resolved: &Resolved, out: &mut BTreeSet<Symbol>) {
     let mut stack = vec![expr];
     while let Some(e) = stack.pop() {
