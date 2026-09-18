@@ -1,7 +1,7 @@
 //! Every hazard the compiled seam has to answer, against the shipping code generator.
 
 use ply_codegen::Unit;
-use ply_eval::{Machine, Value, compare_answers};
+use ply_eval::{Machine, Value};
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::{ModuleName, Program};
 use std::collections::HashMap;
@@ -18,7 +18,7 @@ pub struct Loaded {
     pub program: &'static Program,
     pub resolved: &'static ply_syntax::resolve::Resolved,
     pub check: &'static ply_ty::CheckOutput,
-    /// Each module's text by name: what the whole Ply emitter re-parses to produce.
+    /// Each module's text by name: what the Ply emitter re-parses to produce.
     pub texts: HashMap<String, String>,
 }
 
@@ -84,9 +84,7 @@ fn hazards() -> &'static Loaded {
 struct Harness {
     unit: &'static Unit,
     bodies: Rc<ply_codegen::Bodies>,
-    oracle: Rc<ply_codegen::Bodies>,
-    reference: Machine<'static>,
-    whole: Machine<'static>,
+    machine: Machine<'static>,
 }
 
 fn harness(loaded: &'static Loaded) -> Harness {
@@ -98,39 +96,19 @@ fn harness(loaded: &'static Loaded) -> Harness {
     )
     .expect("this host has a C compiler");
     let bodies = unit.bodies().expect("the unit builds");
-    let oracle = ply_codegen::c::producer::reference_only(|| {
-        Unit::over(loaded.program, loaded.resolved, loaded.check).and_then(|unit| unit.bodies())
-    })
-    .expect("the reference emitter builds the fragment");
-    let mut reference = Machine::new(loaded.program, loaded.resolved, loaded.check);
-    reference.set_compiled(oracle.clone());
-    let mut whole = Machine::new(loaded.program, loaded.resolved, loaded.check);
-    whole.set_compiled(bodies.clone());
+    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
+    machine.set_compiled(bodies.clone());
     Harness {
         unit,
         bodies,
-        oracle,
-        reference,
-        whole,
+        machine,
     }
 }
 
 impl Harness {
-    fn agree(&mut self, name: &str, args: &[Value]) -> Option<String> {
-        assert!(
-            self.bodies.admits(name) && self.oracle.admits(name),
-            "`{name}` is not compiled by both emitters; the port's refusal: {:?}",
-            refusal(self.unit, name)
-        );
-        let expected = self.reference.call(name, args.to_vec(), Span::DUMMY);
-        let actual = self.whole.call(name, args.to_vec(), Span::DUMMY);
-        compare_answers(&self.reference, &self.whole, name, &expected, &actual)
-            .map(|d| format!("the whole emitter against the reference, {d}"))
-    }
-
     fn run(&mut self, name: &str, args: &[Value]) -> Value {
         let unit = self.unit;
-        self.whole
+        self.machine
             .call(name, args.to_vec(), Span::DUMMY)
             .unwrap_or_else(|d| {
                 panic!(
@@ -139,6 +117,23 @@ impl Harness {
                     refusal(unit, name)
                 )
             })
+    }
+
+    /// The machine's own diagnostic, which a compiled failure has to arrive as.
+    fn raises(&mut self, name: &str, args: &[Value], message: &str) {
+        let raised = self
+            .machine
+            .call(name, args.to_vec(), Span::DUMMY)
+            .expect_err(name);
+        assert_eq!(
+            raised.code,
+            ply_span::codes::RUNTIME_ERROR,
+            "`{name}{args:?}` raised {raised}"
+        );
+        assert!(
+            raised.message.contains(message),
+            "`{name}{args:?}` raised {raised}, not {message:?}"
+        );
     }
 
     fn entered(&self) -> u64 {
@@ -161,10 +156,13 @@ fn refusal(unit: &Unit, name: &str) -> Option<String> {
 #[test]
 fn a_definition_that_opens_its_own_region_runs_compiled_and_gives_the_arena_back() {
     let mut h = harness(hazards());
-    for n in [0i64, 1, 7, -3] {
-        if let Some(difference) = h.agree("cells.counted", &[Value::Int(n)]) {
-            panic!("`cells.counted({n})`: {difference}");
-        }
+    // `pure.step(n) + pure.mix(n, 2)`, with `%` truncating.
+    for (n, want) in [(0i64, 35), (1, 69), (7, 273), (-3, -67)] {
+        assert_eq!(
+            h.run("cells.counted", &[Value::Int(n)]),
+            Value::Int(want),
+            "`cells.counted({n})`"
+        );
     }
     assert!(h.entered() > 0, "`cells.counted` never ran compiled");
     assert_eq!(h.declines().touched_cells, 0, "{:?}", h.declines());
@@ -196,18 +194,23 @@ fn ordering_on_a_string_is_refused_before_any_backend_sees_it() {
 
 /// Nothing in `tripled`'s `Int -> Int` signature says a callback is under it.
 #[test]
-fn a_higher_order_builtin_answers_what_the_reference_answers() {
+fn a_higher_order_builtin_answers_under_the_tier() {
     let mut h = harness(hazards());
-    for n in [0, 1, 5] {
-        if let Some(d) = h.agree("callbacks.tripled", &[Value::Int(n)]) {
-            panic!("`callbacks.tripled({n})`: {d}");
-        }
+    // `pure.step(n) + pure.step(n + 1)`.
+    for (n, want) in [(0, 5), (1, 11), (5, 35)] {
+        assert_eq!(
+            h.run("callbacks.tripled", &[Value::Int(n)]),
+            Value::Int(want),
+            "`callbacks.tripled({n})`"
+        );
     }
-    for n in [0, 3] {
+    for (n, want) in [(0, 0), (3, 3)] {
         let xs = Value::list((0..n).map(Value::Int).collect());
-        if let Some(d) = h.agree("callbacks.total", &[xs]) {
-            panic!("`callbacks.total` over {n} elements: {d}");
-        }
+        assert_eq!(
+            h.run("callbacks.total", &[xs]),
+            Value::Int(want),
+            "`callbacks.total` over {n} elements"
+        );
     }
 }
 
@@ -267,14 +270,16 @@ fn a_nullary_constructor_pattern_is_a_test_and_not_a_binding() {
 #[test]
 fn a_compiled_failure_arrives_as_the_machines_own_diagnostic() {
     let mut h = harness(hazards());
-    for (name, args) in [
-        ("pure.mix", vec![Value::Int(i64::MAX), Value::Int(1)]),
-        ("pure.share", vec![Value::Int(1), Value::Int(0)]),
-    ] {
-        if let Some(d) = h.agree(name, &args) {
-            panic!("`{name}` failed differently under the backend: {d}");
-        }
-    }
+    h.raises(
+        "pure.mix",
+        &[Value::Int(i64::MAX), Value::Int(1)],
+        "integer overflow in multiplication",
+    );
+    h.raises(
+        "pure.share",
+        &[Value::Int(1), Value::Int(0)],
+        "division by zero",
+    );
 }
 
 /// A raise inside compiled code must not make the *next* entry answer wrongly, and must not panic
@@ -286,7 +291,7 @@ fn a_failed_entry_does_not_poison_the_one_after_it() {
         ("pure.mix", vec![Value::Int(i64::MAX), Value::Int(1)]),
         ("pure.share", vec![Value::Int(1), Value::Int(0)]),
     ] {
-        let _ = h.whole.call(name, args, Span::DUMMY);
+        let _ = h.machine.call(name, args, Span::DUMMY);
         assert_eq!(h.run("pure.seeded", &[]), Value::Int(80));
         assert_eq!(h.run("pure.step", &[Value::Int(5)]), Value::Int(16));
     }
@@ -308,9 +313,11 @@ fn a_native_body_runs_under_a_live_handler_stack() {
 #[test]
 fn a_compiled_recursion_that_outruns_its_budget_is_the_machines_diagnostic() {
     let mut h = harness(hazards());
-    if let Some(d) = h.agree("pure.ladder", &[Value::Int(1_000_000), Value::Int(0)]) {
-        panic!("`pure.ladder` past its budget: {d}");
-    }
+    h.raises(
+        "pure.ladder",
+        &[Value::Int(1_000_000), Value::Int(0)],
+        "recursion limit of",
+    );
 }
 
 /// `Ctx` is one flat frame, so an entry arriving while another runs would alias the outer one's
@@ -324,8 +331,10 @@ fn an_entry_that_arrives_while_another_is_running_is_declined_and_reported() {
 
     let bodies = Rc::clone(&h.bodies);
     let before = h.entered();
-    let inside =
-        bodies.while_entered(|| h.whole.call("pure.step", vec![Value::Int(5)], Span::DUMMY));
+    let inside = bodies.while_entered(|| {
+        h.machine
+            .call("pure.step", vec![Value::Int(5)], Span::DUMMY)
+    });
     assert_eq!(
         h.entered(),
         before,
@@ -358,7 +367,11 @@ fn a_raced_simulate_region_answers_and_records_the_race() {
     let mut h = harness(hazards());
     for (n, want) in [(1, 90), (4, 201)] {
         assert_eq!(h.run("raced.raced", &[Value::Int(n)]), Value::Int(want));
-        let steps = &h.whole.simulated().expect("the region left a record").steps;
+        let steps = &h
+            .machine
+            .simulated()
+            .expect("the region left a record")
+            .steps;
         let spawned: Vec<_> = steps
             .iter()
             .filter(|s| s.task != ply_eval::sched::ROOT)

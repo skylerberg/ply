@@ -43,11 +43,8 @@ fn kernel() -> (&'static Program, &'static Unit) {
     let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the kernel resolves");
     let front = ply_codegen::c::producer::checked_front(&named, &ids).expect("the kernel checks");
     let ast: &'static Program = Box::leak(Box::new(ast));
-    // The fragment is what this kernel is measured against.
-    let unit = ply_codegen::c::producer::reference_only(|| {
-        Unit::over_front(ast, &resolved, &front, std::collections::HashMap::new())
-    })
-    .expect("this host has a C compiler");
+    let unit = Unit::over_front(ast, &resolved, &front, named.into_iter().collect())
+        .expect("this host has a C compiler");
     (ast, unit)
 }
 
@@ -77,9 +74,7 @@ fn the_whole_kernel_is_inside_the_fragment() {
 #[test]
 fn the_search_answers_through_compiled_code() {
     let (program, unit) = kernel();
-    // `attach` builds again, under whatever emitter is current, and this unit is the reference's.
-    let backend =
-        ply_codegen::c::producer::reference_only(|| unit.attach(&ply_eval::BackendSpec::honest()));
+    let backend = unit.attach(&ply_eval::BackendSpec::honest());
     assert!(backend.describes(program));
     let answer = backend.enter(&Symbol::new("mcts.plan_753"), &[Value::Int(200)], 10_000);
     assert!(

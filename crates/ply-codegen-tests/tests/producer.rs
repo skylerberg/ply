@@ -1,13 +1,12 @@
 //! The Ply emitter as the C tier's producer (ADR 0042).
 //!
-//! The front end and `emit.ply` are loaded, compiled with the reference emitter, and installed as
-//! the producer; a program is then compiled with the producer answering what it reaches and the
-//! reference the rest, and every body the producer answered is entered and held to the machine.
+//! The front end and `emit.ply` are built as a working copy is and handed over as the producer; a
+//! program is then compiled by it, and every body it answered is entered and held to the machine.
 //!
 //! One binary of its own, because the producer is a process-wide installation.
 
 use ply_codegen::Source;
-use ply_codegen::c::producer::{self, PlyProducer};
+use ply_codegen::c::producer::{self, PlyProducer, Sources};
 use ply_eval::Value;
 use ply_span::Span;
 use ply_syntax::ast::{ModuleName, Program};
@@ -64,9 +63,6 @@ fn load(modules: &[(&str, &str)], with_std: bool) -> &'static Loaded {
     let mut ast = ply_syntax::parse_program(inputs).expect("parses");
     assert!(ply_derive::expand_program(&mut ast).is_empty());
     let resolved = ply_syntax::resolve::resolve(&mut ast).expect("resolves");
-    // `emitter` calls this before its own handover takes effect, so the committed bundle answers
-    // here while the emitter under test is handed over around each test's `build`. That is the
-    // circularity a `OnceLock` could not express and a `Drop`-scoped handover can.
     let check = producer::checked_front(&named, &ids).expect("checks").check;
     Box::leak(Box::new(Loaded {
         program: Box::leak(Box::new(ast)),
@@ -76,74 +72,17 @@ fn load(modules: &[(&str, &str)], with_std: bool) -> &'static Loaded {
     }))
 }
 
-/// The emitter: `ply-compiler`'s modules and the standard library they import,
-/// compiled by the reference and loaded.
-/// The emitter's identity, for the cache keys: the digest of the same files the recipe reads.
-fn emitter_identity() -> String {
-    let dir = repo().join("crates/ply-compiler/ply");
-    let mut modules = Vec::new();
-    for e in std::fs::read_dir(&dir)
-        .expect("the emitter's directory")
-        .flatten()
-    {
-        let p = e.path();
-        if p.extension().is_some_and(|x| x == "ply") {
-            modules.push((
-                p.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-                std::fs::read_to_string(&p).expect("the emitter is readable"),
-            ));
-        }
-    }
-    producer::digest_of(&modules)
+/// The emitter as production builds a working copy of it: `PLY_C_EMITTER=ply:<dir>`'s recipe.
+fn emitter_sources() -> Sources {
+    Sources::Directory(repo().join("crates/ply-compiler/ply"))
 }
 
 fn emitter() -> Result<PlyProducer, String> {
-    let dir = repo().join("crates/ply-compiler/ply");
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|e| format!("{}: {e}", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|e| e == "ply"))
-        .collect();
-    files.sort();
-    let modules: Vec<(String, String)> = files
-        .iter()
-        .map(|p| {
-            let stem = p.file_stem().and_then(|s| s.to_str()).expect("a stem");
-            (
-                stem.to_string(),
-                std::fs::read_to_string(p).expect("the emitter is readable"),
-            )
-        })
-        .collect();
-    let borrowed: Vec<(&str, &str)> = modules
-        .iter()
-        .map(|(n, t)| (n.as_str(), t.as_str()))
-        .collect();
-    let loaded = load(&borrowed, true);
-    let hashes = ply_hash::hash_program(loaded.program, loaded.resolved, loaded.check)
-        .map_err(|_| "the emitter does not hash".to_string())?;
-    let keys: HashMap<String, String> = hashes
-        .defs
-        .iter()
-        .map(|(name, h)| (name.to_string(), h.to_hex()))
-        .collect();
-    let source: &'static Source = Box::leak(Box::new(Source::keyed(
-        loaded.program,
-        loaded.resolved,
-        loaded.check,
-        keys,
-    )));
-    let names: Vec<String> = source.functions();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    // The emitter under test is compiled by the reference, as this binary's header says. `load`
-    // installs the default producer to answer the check, and without this that producer would be
-    // asked to emit itself from a source carrying no texts, and would answer nothing.
-    let (native, _refused) = producer::reference_only(|| ply_codegen::c::build(source, &refs))
-        .map_err(|e| format!("{e:#}"))?;
-    PlyProducer::new(native).map_err(|e| format!("{e:#}"))
+    producer::build(&emitter_sources())
+}
+
+fn emitter_identity() -> String {
+    producer::identity_of(&emitter_sources())
 }
 
 const PROGRAM: &str = r#"
@@ -155,8 +94,7 @@ fn sum_to(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, i: Int| acc + i)
 "#;
 
 /// The unit built with the Ply emitter as its producer, and every case's answer checked against
-/// the machine's. The reference emits nothing of the program; the port's refusals are the
-/// fixpoint's, and this program has none.
+/// the machine's. The refusals are the fixpoint's, and this program has none.
 /// The producer's mode is a process-wide flag, so the tests that set it take turns.
 static MODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -221,8 +159,7 @@ fn built_and_checked() {
 
 /// Effects by evidence passing (ADR 0043): a tail-resumptive handler with a `return` clause, a
 /// perform two calls deep, a handler installed inside another's body, and the zero-shot
-/// `resume` that unwinds. The reference refuses every body here; only the chain entered whole
-/// compiles them, and the machine is the oracle.
+/// `resume` that unwinds. The machine is the oracle.
 const EFFECTS: &str = r#"
 effect counter {
   write bump(n: Int) -> Int
