@@ -1,6 +1,7 @@
 //! The `.ply-cache` directory: results keyed by `(RUNTIME_VERSION, DefHash)`, and the front end
-//! keyed by `(FRONTEND_VERSION, path | DefHash)`.
+//! keyed by `(FRONTEND_VERSION, path | DefHash)`, beside its last whole answer.
 
+mod answer;
 mod binary;
 mod bodies;
 mod canonical;
@@ -24,7 +25,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub use canonical::{canonicalize_decl_body, canonicalize_scheme};
 pub use frontend::{
     CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, DeclBody, DefEntry, DefKind, FileSpan,
-    ImportEdge, Member, NameRef, SourceFingerprint, exports_digest, witness_holds,
+    Member, NameRef, SourceFingerprint,
 };
 pub use obligations::{
     CachedCases, CachedCertificate, CachedEvidence, CachedObligation, CachedRule,
@@ -35,13 +36,13 @@ pub use schema::fingerprint as schema_fingerprint;
 /// Bumping this discards every cached result; a file from another runtime is never merged.
 pub const RUNTIME_VERSION: &str = "0.14.0";
 
-/// Bumping this discards every cached type, footprint and source fingerprint.
+/// Bumping this discards every cached type, footprint, source fingerprint and front-end answer.
 pub const FRONTEND_VERSION: &str = "0.21.0";
 
 /// Bumping this re-attempts every obligation and re-runs no test.
 pub const PROVER_VERSION: &str = "0.6.0";
 
-pub const FRONTEND_FORMAT: u32 = 6;
+pub const FRONTEND_FORMAT: u32 = 7;
 
 pub const BODY_ENCODING: u32 = ply_hash::body::BODY_ENCODING;
 
@@ -300,6 +301,9 @@ pub struct Store {
     frontend_path: PathBuf,
     frontend_data_path: PathBuf,
     frontend: frontend::Frontend,
+    answer_path: PathBuf,
+    /// Written at the next flush, replacing whatever answer is on disk.
+    answer: Option<(ContentHash, String)>,
     warnings: Vec<Diagnostic>,
     stdlib: Stdlib,
 }
@@ -612,6 +616,7 @@ impl Store {
         let frontend_path = dir.join(frontend::FRONTEND_FILE);
         let frontend_data_path = dir.join(frontend::FRONTEND_DATA_FILE);
         let stdlib_path = dir.join(disk::STDLIB_FILE);
+        let answer_path = dir.join(answer::ANSWER_FILE);
         let (frontend, frontend_warnings) =
             frontend::Frontend::open(&frontend_path, &frontend_data_path);
         let mut store = Store {
@@ -638,6 +643,8 @@ impl Store {
             frontend_path,
             frontend_data_path,
             frontend,
+            answer_path,
+            answer: None,
             warnings: frontend_warnings,
             stdlib: Stdlib {
                 path: stdlib_path,
@@ -726,6 +733,7 @@ impl Store {
             && !self.reviews.dirty
             && !self.frontend.is_dirty()
             && self.stdlib.pending.is_none()
+            && self.answer.is_none()
         {
             return Ok(());
         }
@@ -759,6 +767,9 @@ impl Store {
         if let Some(digest) = self.stdlib.pending.take() {
             disk::save_stdlib(&self.dir, &self.stdlib.path, &digest)?;
             self.stdlib.stored = OnceLock::from(Some(digest));
+        }
+        if let Some((key, dump)) = self.answer.take() {
+            answer::write(&self.dir, &self.answer_path, key, &dump)?;
         }
         Ok(())
     }
@@ -812,6 +823,7 @@ impl Store {
         self.passes.clear();
         self.obligations.clear();
         self.frontend.clear();
+        self.answer = None;
         self.warnings.clear();
         self.dirty = false;
         // After a clear there is nothing a moved stdlib could have invalidated.
@@ -824,6 +836,7 @@ impl Store {
         remove(&self.obligations.path, "obligation cache")?;
         remove(&self.frontend_path, "front-end cache")?;
         remove(&self.frontend_data_path, "front-end cache")?;
+        remove(&self.answer_path, "front-end answer")?;
         remove(&self.dir.join(LEGACY_FRONTEND_FILE), "front-end cache")?;
         disk::sweep_temps(&self.dir, None);
         Ok(())
@@ -912,6 +925,19 @@ impl Store {
             return;
         }
         self.stdlib.pending = Some(digest);
+    }
+
+    /// The whole front-end answer last filed, when it was filed under `key`.
+    pub fn front_answer(&self, key: ContentHash) -> Option<String> {
+        match &self.answer {
+            Some((pending, dump)) if *pending == key => Some(dump.clone()),
+            _ => answer::read(&self.answer_path, key),
+        }
+    }
+
+    /// Replaces the answer on disk at the next flush: only the latest is ever kept.
+    pub fn put_front_answer(&mut self, key: ContentHash, dump: String) {
+        self.answer = Some((key, dump));
     }
 
     pub fn frontend_path(&self) -> &Path {
@@ -1122,7 +1148,7 @@ impl Store {
     }
 
     pub fn frontend_is_empty(&self) -> bool {
-        self.frontend.is_empty()
+        self.frontend.is_empty() && self.answer.is_none() && !self.answer_path.exists()
     }
 
     pub fn frontend_is_dirty(&self) -> bool {

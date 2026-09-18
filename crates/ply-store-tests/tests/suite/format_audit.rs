@@ -119,24 +119,15 @@ fn decl() -> CachedDecl {
 fn fingerprint() -> SourceFingerprint {
     SourceFingerprint {
         content_hash: ContentHash::of(b"fn active_users() -> Int = 1\n"),
-        imports: vec![ply_store::ImportEdge {
-            module: Symbol::new("store.db"),
-            exports: ContentHash::of(b"exports"),
-        }],
-        deps: vec![NameRef::new("store.db.get", hash(7))],
         defs: vec![DefEntry {
             name: Symbol::new("user.active_users"),
             hash: hash(1),
-            own: hash(2),
-            iface: hash(3),
             span: FileSpan { start: 10, end: 42 },
             kind: DefKind::Fn,
             members: vec![ply_store::Member {
                 name: Symbol::new("user.Active"),
                 span: FileSpan { start: 12, end: 18 },
             }],
-            deps: vec![Symbol::new("store.db.get")],
-            reuse: false,
         }],
         tests: vec![CachedTest {
             name: "active_users excludes inactive".to_string(),
@@ -147,8 +138,6 @@ fn fingerprint() -> SourceFingerprint {
                 start: 50,
                 end: 120,
             },
-            name_span: FileSpan { start: 55, end: 60 },
-            deps: vec![Symbol::new("user.active_users")],
         }],
     }
 }
@@ -925,16 +914,15 @@ fn the_edges_of_every_scalar_field_survive_a_round_trip() {
     fp.defs.push(DefEntry {
         name: Symbol::new(&long),
         hash: DefHash([0xff; 32]),
-        own: DefHash([0; 32]),
-        iface: DefHash([0xff; 32]),
         span: FileSpan {
             start: u32::MAX - 1,
             end: u32::MAX,
         },
         kind: DefKind::Effect,
-        members: vec![],
-        deps: vec![Symbol::new("")],
-        reuse: false,
+        members: vec![ply_store::Member {
+            name: Symbol::new(""),
+            span: FileSpan { start: 0, end: 0 },
+        }],
     });
     fp.tests.push(CachedTest {
         name: String::new(),
@@ -942,8 +930,6 @@ fn the_edges_of_every_scalar_field_survive_a_round_trip() {
         nondet: true,
         footprint: Footprint::empty(),
         span: FileSpan { start: 0, end: 0 },
-        name_span: FileSpan { start: 0, end: 0 },
-        deps: vec![],
     });
 
     let mut store = root.open();

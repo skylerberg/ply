@@ -2,7 +2,7 @@
 
 use crate::frontend::{
     CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, DeclBody, DefEntry, DefKind, FileSpan,
-    ImportEdge, Member, NameRef, SourceFingerprint,
+    Member, NameRef, SourceFingerprint,
 };
 use crate::{BODY_ENCODING, ContentHash, DefBody, FRONTEND_FORMAT, Outcome};
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -84,43 +84,28 @@ pub fn exemplars() -> Exemplars {
     Exemplars {
         fingerprint: SourceFingerprint {
             content_hash: ContentHash([1u8; 32]),
-            imports: vec![ImportEdge {
-                module: sym("store.db"),
-                exports: ContentHash([2u8; 32]),
-            }],
-            deps: vec![NameRef::new("store.db.get", h(7))],
             // Distinct hashes per `DefEntry`, so the pin moves if two are swapped or one dropped.
             defs: vec![
                 DefEntry {
                     name: sym("user.active_users"),
                     hash: h(2),
-                    own: h(8),
-                    iface: h(9),
                     span: FileSpan { start: 10, end: 42 },
                     kind: DefKind::Fn,
                     members: vec![],
-                    deps: vec![sym("store.db.get")],
-                    reuse: false,
                 },
                 DefEntry {
                     name: sym("user.User"),
                     hash: h(3),
-                    own: h(10),
-                    iface: h(11),
                     span: FileSpan { start: 50, end: 80 },
                     kind: DefKind::Type,
                     members: vec![Member {
                         name: sym("user.Active"),
                         span: FileSpan { start: 60, end: 66 },
                     }],
-                    deps: vec![],
-                    reuse: false,
                 },
                 DefEntry {
                     name: sym("user.db"),
                     hash: h(4),
-                    own: h(12),
-                    iface: h(13),
                     span: FileSpan {
                         start: 90,
                         end: 120,
@@ -133,8 +118,6 @@ pub fn exemplars() -> Exemplars {
                             end: 110,
                         },
                     }],
-                    deps: vec![],
-                    reuse: false,
                 },
             ],
             tests: vec![CachedTest {
@@ -146,16 +129,9 @@ pub fn exemplars() -> Exemplars {
                     start: 130,
                     end: 180,
                 },
-                name_span: FileSpan {
-                    start: 135,
-                    end: 140,
-                },
-                deps: vec![sym("user.active_users")],
             }],
         },
         def: CachedDef::new(scheme.clone(), footprint())
-            .performing(Footprint::empty())
-            .written_as(vec![sym("Web")])
             .witnessed_by(vec![NameRef::new("user.User", h(3))]),
         type_decl: CachedDecl::new(DeclBody::Type {
             arity: 1,

@@ -473,6 +473,7 @@ pub fn sweep_temps(dir: &Path, max_age: Option<Duration>) {
             OBLIGATIONS_STEM,
             REVIEWS_STEM,
             crate::frontend::FRONTEND_STEM,
+            crate::answer::ANSWER_STEM,
         ]
         .iter()
         .any(|stem| name.starts_with(&format!("{stem}.")));
