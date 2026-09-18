@@ -1,29 +1,10 @@
-//! Which C toolchain this tier compiles with, and the inlining that has to go with it.
+//! Which C toolchain this tier compiles with.
 //!
-//! A warm run of the self-hosted front end reads its unit back out of a cache in milliseconds. An
-//! *edit* spends that in one go -- `cc -O2` over the front end's twenty-nine megabytes of C is
-//! about thirty-eight seconds.
-//!
-//! So there are two things to compile for, and one compiler cannot be both:
-//!
-//! | profile | compiler | inlining | the front end's unit | compile | k1 |
-//! | --- | --- | --- | --- | --- | --- |
-//! | `development` | `tcc`, else `cc -O0` | depth 0 | 7MB | 0.26s / 1.96s | 6.4ms / 4.7ms |
-//! | `release` | `cc -O2` | depth 3 | 29MB | 38.5s | 0.15ms |
-//!
-//! One code generator, two toolchains, and **`development` is the default** because that is what
-//! the numbers say a run is usually for. It costs about forty times on the integer kernel and buys
-//! back two orders of magnitude on an edit; the front end's own warm run is *faster* under it
-//! (1.38s against 1.51s), because a suite's time is not in the arithmetic those forty times are
-//! charged to. A measurement wants the other one and has to say so -- `--profile release`, or
+//! A warm run reads its unit back out of a cache. An *edit* recompiles it, and `cc -O2` over a
+//! large unit is the slow part of that. So there are two things to compile for, and one compiler
+//! cannot be both: `development`, the default, is `tcc` if installed, else `cc -O0`; `release` is
+//! `cc -O2`. A measurement wants `release` and has to say so -- `--profile release`, or
 //! `PLY_C_PROFILE=release`, which is what `benches/value-model/run.sh` passes.
-//!
-//! **The inlining is not a separate knob and this is the trap.** A non-optimising compiler gives
-//! every temporary its own stack slot and coalesces nothing across sibling blocks, so the tier's
-//! depth-3 bodies compile to frames of up to 128KB against `-O2`'s 8. The front end recurses far
-//! enough that this overflows the stack -- not an error, an `abort` with no diagnostic and nothing
-//! to attribute it to. `cc -O0`, `cc -O1` and `tcc` all do it at depth 3, and all of them run the
-//! whole corpus at depth 0. That is why the profile carries the depth: they are one choice.
 
 /// What this run is compiling for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -94,18 +75,6 @@ impl Profile {
         match self {
             Profile::Release => "-O2".to_string(),
             Profile::Development => "-O0".to_string(),
-        }
-    }
-
-    /// How hard the inliner is told to work. Read the module's last paragraph before separating
-    /// this from the compiler above.
-    pub fn inlining(self) -> crate::opt::Inlining {
-        match self {
-            Profile::Release => crate::opt::Inlining::EMITTED,
-            Profile::Development => crate::opt::Inlining {
-                depth: 0,
-                ..crate::opt::Inlining::EMITTED
-            },
         }
     }
 }

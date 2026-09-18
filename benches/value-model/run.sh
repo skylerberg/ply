@@ -11,7 +11,7 @@ ply="${PLY_BIN:-$root/target/release/ply}"
 # Which tier the `ply` arm runs on.
 backend="${PLY_BACKEND:-c}"
 # The C tier compiles under `development` unless told otherwise, and this file exists to measure
-# code rather than to compile it quickly: `development` is `cc -O0` with the inliner off, which is
+# code rather than to compile it quickly: `development` is `cc -O0`, which is
 # forty times slower on k1 and would move this gate's verdict without moving anything it is a gate
 # on. Exported rather than defaulted so that the raw file's readings and the command that took
 # them agree, and asserted below because a silently different profile is a silently different bar.

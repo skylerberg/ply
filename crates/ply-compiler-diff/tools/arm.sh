@@ -127,26 +127,8 @@ PLY_C_EMITTER="ply:$root/crates/ply-compiler/ply" cargo test -p ply-compiler-dif
   grep -E "input\(s\)|reaches|^test result|^error|panicked" || true
 
 echo
-echo "==> the oracle for the stage after that: the C a body emits"
-# Not a differential either -- the Ply emitter is not written. What it checks is that the oracle it
-# will be compared against is usable, and it records the one coupling a first attempt would
-# otherwise spend a day on: `emit_body` optimises before it lowers, so `1 + 2` reaches the emitter
-# as `3`.
-cargo test -p ply-compiler-diff --test suite -- emit:: --nocapture
-
-echo
 echo "==> what compiling effects would have to carry, and the corpus for it"
 cargo test -p ply-compiler-diff --test suite -- effects:: --nocapture
-
-echo
-echo "==> the eighth differential: emit.ply's C against crates/ply-codegen's,"
-echo "    on shapes chosen per node and then on the shipped corpus"
-PLY_C_EMITTER="ply:$root/crates/ply-compiler/ply" cargo test -p ply-compiler-diff --test suite -- emit_diff:: --nocapture --test-threads=1 |
-  tee /tmp/ply-parser-emit.log | grep -E "agreeing|^test result|^error|panicked"
-grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-emit.log || {
-  echo "the emitter differential is red or ran nothing -- see the log above" >&2
-  exit 1
-}
 
 
 if [ "${1:-}" = "--arm" ]; then

@@ -5,16 +5,15 @@
 //! is taken, so a set that compiles cannot call out of itself.
 
 use super::Refused;
-use super::emit::{Emit, Unit, mangle};
 use super::exports::Exports;
 use super::load::{Library, compile_and_load};
+use super::tables::{Unit, mangle};
 use super::{HELPERS, PRELUDE, helper_addresses, runtime_decls};
 use crate::heap::{Heap, Word, mark_immortal};
 use crate::rt::Entry;
 use crate::rt::{Ctx, Tables};
 use crate::source::Source;
 use anyhow::{Result, bail};
-use ply_eval::code::lower_fn;
 use ply_span::{SourceId, Symbol};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -60,57 +59,6 @@ impl Native {
     }
 }
 
-/// One body as C, with its placeholders unresolved.
-///
-/// The oracle a C emitter written in Ply is compared against. A body's text names the unit's
-/// tables by its *own* positions -- `@@c3@@` for the third constant this body met -- so it is a
-/// function of the body alone, which is what makes one comparable at all: two emitters that agree
-/// here agree whatever else is in the unit around them.
-/// `how` is passed rather than read from the profile so that a caller comparing *emitters* can
-/// take the optimiser out of the comparison: at a budget and depth of zero a call is emitted as a
-/// call, and what is left is the emitter alone.
-pub fn emit_body(loaded: &'static Source, name: &str, how: crate::opt::Inlining) -> Result<String> {
-    let ctors = loaded.ctors();
-    let ctors_digest = super::cache::ctors_digest(&ctors);
-    let names: Vec<String> = loaded.functions();
-    let offered: Vec<&str> = names.iter().map(String::as_str).collect();
-    let fragment = super::cache::fragment_digest(&offered);
-    let mut unit = Unit::new(ctors, names.clone());
-    let (text, _tables) = emit_one(
-        loaded,
-        &mut unit,
-        name,
-        &ctors_digest,
-        (how.budget, how.depth),
-        &fragment,
-    )?;
-    Ok(text)
-}
-
-/// The same body with its tables, in the encoding the cache keeps a body in: what a second
-/// emitter has to produce to stand in for this one, and what a differential over the two compares.
-pub fn emit_body_encoded(
-    loaded: &'static Source,
-    name: &str,
-    how: crate::opt::Inlining,
-) -> Result<String> {
-    let ctors = loaded.ctors();
-    let ctors_digest = super::cache::ctors_digest(&ctors);
-    let names: Vec<String> = loaded.functions();
-    let offered: Vec<&str> = names.iter().map(String::as_str).collect();
-    let fragment = super::cache::fragment_digest(&offered);
-    let mut unit = Unit::new(ctors, names.clone());
-    let (text, tables) = emit_one(
-        loaded,
-        &mut unit,
-        name,
-        &ctors_digest,
-        (how.budget, how.depth),
-        &fragment,
-    )?;
-    Ok(super::cache::encode(&text, &tables))
-}
-
 /// The definitions actually offered, after the two bisecting instruments, and the digest a refusal
 /// is cached against. Both callers need the same answer: a refusal is cached against this digest,
 /// so an instrument that narrows the offered set has to move it.
@@ -153,7 +101,6 @@ fn emit_all(
     fragment: &str,
     ctors: &[(Symbol, usize)],
     ctors_digest: &str,
-    inlining: (usize, usize),
 ) -> Result<Emitted> {
     let mut taken: Vec<String> = offered.iter().map(|n| (*n).to_string()).collect();
     let mut refusals: Vec<Refused> = Vec::new();
@@ -162,11 +109,10 @@ fn emit_all(
     // body can refuse the ones that call it. A body's text names the unit's tables by its own
     // positions, so nothing here touches the unit and a round is the emitting alone.
     let emitted = loop {
-        let mut unit = Unit::new(ctors.to_vec(), taken.clone());
-        let mut emitted: Vec<(String, String, super::emit::Tables)> = Vec::new();
+        let mut emitted: Vec<(String, String, super::tables::Tables)> = Vec::new();
         let mut round: Vec<Refused> = Vec::new();
         for name in &taken {
-            match emit_one(loaded, &mut unit, name, ctors_digest, inlining, fragment) {
+            match emit_one(loaded, &taken, name, ctors_digest, fragment) {
                 Ok((text, tables)) => emitted.push((name.clone(), text, tables)),
                 Err(e) => match e.downcast::<Refused>() {
                     Ok(r) => round.push(r),
@@ -189,7 +135,7 @@ fn emit_all(
         refusals.extend(round);
     };
     // The tables the settled set actually needs, filled once rather than once per round.
-    let mut unit = Unit::new(ctors.to_vec(), taken.clone());
+    let mut unit = Unit::new(ctors.to_vec());
     let bodies: Vec<(String, String)> = emitted
         .into_iter()
         .map(|(name, text, tables)| {
@@ -210,14 +156,6 @@ fn emit_all(
         if let Some((asked, answered)) = super::producer::with_current(|p| p.counts()) {
             eprintln!("ply emitter answered {answered} of {asked} bodies asked of it");
         }
-    }
-    if std::env::var("PLY_C_SPLIT").is_ok() {
-        use std::sync::atomic::Ordering::Relaxed;
-        eprintln!(
-            "c emit: optimise+lower {}ms, emit {}ms",
-            OPTIMISE.load(Relaxed) / 1000,
-            EMIT.load(Relaxed) / 1000
-        );
     }
     if let Ok(want) = std::env::var("PLY_C_DUMP") {
         if want == "*" {
@@ -264,15 +202,7 @@ pub fn produce(loaded: &'static Source, names: &[&str]) -> Result<Produced> {
     let ctors = loaded.ctors();
     let ctors_digest = super::cache::ctors_digest(&ctors);
     let (offered, fragment) = offered_set(names);
-    let how = super::toolchain::Profile::current().inlining().overridden();
-    produce_in(
-        loaded,
-        &offered,
-        &fragment,
-        &ctors,
-        &ctors_digest,
-        (how.budget, how.depth),
-    )
+    produce_in(loaded, &offered, &fragment, &ctors, &ctors_digest)
 }
 
 fn produce_in(
@@ -281,14 +211,17 @@ fn produce_in(
     fragment: &str,
     ctors: &[(Symbol, usize)],
     ctors_digest: &str,
-    inlining: (usize, usize),
 ) -> Result<Produced> {
+    // Up front, not only when a body misses the cache: a warm cache would otherwise hide it.
+    if !offered.is_empty() && loaded.texts.is_empty() {
+        bail!("no source text for this program, and the emitter reads a program's text");
+    }
     let Emitted {
         bodies,
         unit,
         taken,
         refusals,
-    } = emit_all(loaded, offered, fragment, ctors, ctors_digest, inlining)?;
+    } = emit_all(loaded, offered, fragment, ctors, ctors_digest)?;
     // An emitter that raised answered nothing, and a unit over that silence would be cached as
     // the program's bodies: the failure is the answer, and the next run asks again.
     if let Some(why) = super::producer::with_current(|p| p.failure(loaded)).flatten() {
@@ -396,22 +329,15 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
     let ctors = loaded.ctors();
     let ctors_digest = super::cache::ctors_digest(&ctors);
     let (offered, fragment) = offered_set(names);
-    // What the inliner will actually be told, profile and override included, because that is what
-    // the emitted body is a function of and the cache is keyed on it.
-    let how = super::toolchain::Profile::current().inlining().overridden();
-    let inlining = (how.budget, how.depth);
     // A unit this binary already built, against this program, this constructor table and this
-    // inlining. Every worker rebuilt it: reading fourteen hundred cached bodies, substituting
-    // their placeholders and assembling twenty-nine megabytes of C, to hand it to an object cache
-    // that already had the answer. Sharing the built unit in process is not open to us --
-    // `ply_eval::Value` holds `Rc`, so nothing containing one crosses a rayon worker -- so it is
-    // shared through the same file system the objects are.
+    // emitter. Sharing the built unit in process is not open to us -- `ply_eval::Value` holds
+    // `Rc`, so nothing containing one crosses a rayon worker -- so it is shared through the same
+    // file system the objects are.
     let unit_key = super::cache::unit_key(
         &loaded.keys,
         &offered,
         &ctors_digest,
-        inlining,
-        &super::producer::who(),
+        &super::producer::identity(),
     );
     // A unit entry that will not reconstruct is a reason to build one, never to fail.
     if let Some(k) = &unit_key
@@ -435,7 +361,7 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
         text,
         refused: refusals,
         ..
-    } = produce_in(loaded, &offered, &fragment, &ctors, &ctors_digest, inlining)?;
+    } = produce_in(loaded, &offered, &fragment, &ctors, &ctors_digest)?;
     let t_emit = started.elapsed();
     let t_assemble = started.elapsed();
     let lib = compile_and_load(&text, "unit")?;
@@ -467,8 +393,7 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
 /// is not a second implementation to be kept in step: there is one, and every build exercises it.
 ///
 /// A `Unit` is exactly what this rebuilds: its consts, fields, builtins and lambdas are recorded
-/// as they are, its `functions` is the taken set, and its `Layouts` is the constructor table plus
-/// the shapes interned in id order. Nothing else is in a `Unit`, which is why a recording of those
+/// as they are, and its `Layouts` is the constructor table plus the shapes interned in id order. Nothing else is in a `Unit`, which is why a recording of those
 /// is faithful; if a field is ever added to one, it has to be added to `Exports` too or the ids
 /// move.
 fn finish(lib: Library, exports: Exports, sources: Option<Vec<SourceId>>) -> Result<Native> {
@@ -495,10 +420,7 @@ fn finish(lib: Library, exports: Exports, sources: Option<Vec<SourceId>>) -> Res
     // unit was emitted from; a span then names the module at that index, or nothing.
     let sources = sources.unwrap_or_else(|| (0..modules).map(|i| SourceId(i as u32)).collect());
     bind(&lib)?;
-    let mut unit = Unit::new(
-        ctors.clone(),
-        taken.iter().map(|(n, _)| n.clone()).collect(),
-    );
+    let mut unit = Unit::new(ctors.clone());
     unit.consts = consts;
     unit.fields = fields;
     unit.builtins = builtins;
@@ -569,28 +491,22 @@ fn constants_of(constants: &[String], unit: &mut Unit) -> HashMap<String, usize>
         .collect()
 }
 
-/// PROBE: where the emit's time goes, in microseconds.
-pub static OPTIMISE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static EMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-struct Timed(std::time::Instant);
-impl Drop for Timed {
-    fn drop(&mut self) {
-        EMIT.fetch_add(
-            self.0.elapsed().as_micros() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-}
-
-/// The C for one body, or the refusal that stopped it.
-pub fn emit_one(
+/// The C for one body, or the refusal that stopped it. `taken` is the set the fixpoint holds this
+/// round: what a body may call.
+fn emit_one(
     loaded: &'static Source,
-    unit: &mut Unit,
+    taken: &[String],
     name: &str,
     ctors_digest: &str,
-    inlining: (usize, usize),
     fragment: &str,
-) -> Result<(String, super::emit::Tables)> {
+) -> Result<(String, super::tables::Tables)> {
+    let refused = |construct: String| -> anyhow::Error {
+        Refused {
+            function: name.to_string(),
+            construct,
+        }
+        .into()
+    };
     // Kept from a previous run, when the caller said what this body is a function of and the
     // definitions it calls are still ones this unit has. The check on the calls is what makes a
     // restored body safe: the fixpoint may have dropped a callee since, and a body that names one
@@ -599,185 +515,52 @@ pub fn emit_one(
     // two definitions that say the same thing share one -- and an emitted body carries its own
     // mangled name, so serving one for the other puts two definitions of the same symbol in the
     // unit. `lexer.hex1` and `lexer.hex2` are that pair, and the C compiler said so.
-    let produced = super::producer::mode() != "ref";
-    let who = if produced {
-        format!("\0ply\0{}", super::producer::identity())
-    } else {
-        String::new()
-    };
+    let identity = super::producer::identity();
     let key = loaded
         .keys
         .get(name)
-        .map(|h| super::cache::key(&format!("{name}\0{h}{who}"), ctors_digest, inlining));
-    // A refusal is the producer's own where one is installed and the reference's otherwise; the
-    // two are not served to each other, which is what `who` keeps apart.
+        .map(|h| super::cache::key(&format!("{name}\0{h}\0{identity}"), ctors_digest));
     let refusal = loaded.keys.get(name).map(|h| {
-        super::cache::refusal_key(
-            &format!("{name}\0{h}{who}"),
-            ctors_digest,
-            inlining,
-            fragment,
-        )
+        super::cache::refusal_key(&format!("{name}\0{h}\0{identity}"), ctors_digest, fragment)
     });
     if let Some(k) = &refusal
         && let Some(reason) = super::cache::read_refusal(k)
     {
-        return Err(Refused {
-            function: name.to_string(),
-            construct: reason,
-        }
-        .into());
+        return Err(refused(reason));
     }
     if let Some(k) = &key
         && let Some((text, tables)) = super::cache::read(k)
-        && tables.calls.iter().all(|c| unit.functions.contains(c))
+        && tables.calls.iter().all(|c| taken.contains(c))
     {
         return Ok((text, tables));
     }
-    let Some((def, module_index)) = loaded.definition(name) else {
-        return Err(Refused {
-            function: name.to_string(),
-            construct: "no definition".to_string(),
+    match super::producer::with_current(|p| p.body(loaded, name)).flatten() {
+        Some(super::producer::Answer::Body(text, tables)) => {
+            if let Some(missing) = tables.calls.iter().find(|c| !taken.contains(c)) {
+                return Err(refused(format!(
+                    "`{missing}`, which is not in this compiled unit"
+                )));
+            }
+            if let Some(k) = &key {
+                super::cache::write(k, &text, &tables);
+            }
+            Ok((text, tables))
         }
-        .into());
-    };
-    // The chain entered whole: the port's answer is the unit's, and the reference is not run.
-    if produced {
-        let answer =
-            super::producer::with_current(|p| p.body(loaded, name, module_index)).flatten();
-        return match answer {
-            Some(super::producer::Answer::Body(text, tables)) => {
-                if let Some(missing) = tables.calls.iter().find(|c| !unit.functions.contains(c)) {
-                    return Err(Refused {
-                        function: name.to_string(),
-                        construct: format!("`{missing}`, which is not in this compiled unit"),
-                    }
-                    .into());
-                }
-                if let Some(k) = &key {
-                    super::cache::write(k, &text, &tables);
-                }
-                Ok((text, tables))
+        Some(super::producer::Answer::Refused(why, _)) => {
+            if let Some(k) = &refusal {
+                super::cache::write_refusal(k, &why);
             }
-            Some(super::producer::Answer::Refused(why, _)) => {
-                if let Some(k) = &refusal {
-                    super::cache::write_refusal(k, &why);
-                }
-                Err(Refused {
-                    function: name.to_string(),
-                    construct: why,
-                }
-                .into())
-            }
-            None => Err(Refused {
-                function: name.to_string(),
-                construct: "which the Ply emitter did not answer".to_string(),
-            }
-            .into()),
-        };
-    }
-    if crate::source::is_spec_root(name) {
-        return Err(Refused {
-            function: name.to_string(),
-            construct: "a specification root, which only the emitter written in Ply carries"
-                .to_string(),
+            Err(refused(why))
         }
-        .into());
+        None => Err(refused("which the Ply emitter did not answer".to_string())),
     }
-    let t0 = std::time::Instant::now();
-    // The tuple the key was taken over, rather than the constant: two derivations of the same
-    // setting are two chances for the cache to be keyed on one and the body emitted at the other.
-    let body = crate::opt::optimize(
-        loaded,
-        module_index,
-        def,
-        crate::opt::Inlining {
-            budget: inlining.0,
-            depth: inlining.1,
-        },
-    );
-    let params: Vec<Symbol> = def.params.iter().map(|p| p.name.name.clone()).collect();
-    let lowered = lower_fn(&params, &body);
-    OPTIMISE.fetch_add(
-        t0.elapsed().as_micros() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    let t1 = std::time::Instant::now();
-    let _guard = Timed(t1);
-    let mut e = Emit::new(loaded, unit, name, module_index);
-    // Before the parameters are bound, not after: binding a name charges its reads to the object
-    // it holds, so a parameter bound while the table was empty contributes nothing and a rule that
-    // asks "does anything else read this object" hears no about the body's own argument.
-    e.count_reads(&lowered.code);
-    e.mark_tails(&lowered.code);
-    // Not `static`: an exported body carries a symbol, and a symbol is what lets a
-    // sampling profiler attribute time to a Ply definition.
-    let mut head = format!("Word {}(PlyCtx *ctx", mangle(name));
-    let declared: Vec<super::emit::CTy> = match loaded
-        .check
-        .defs
-        .get(&ply_span::Symbol::new(name))
-        .map(|d| &d.scheme.ty)
-    {
-        Some(ply_ty::Type::Fn { params, .. }) => params.iter().map(super::emit::CTy::of).collect(),
-        _ => vec![super::emit::CTy::Unknown; params.len()],
-    };
-    for (i, p) in params.iter().enumerate() {
-        head.push_str(&format!(", Word p{i}"));
-        e.param(
-            p,
-            format!("p{i}"),
-            declared
-                .get(i)
-                .cloned()
-                .unwrap_or(super::emit::CTy::Unknown),
-        );
-    }
-    head.push_str(") {\n");
-    // The prologue `ply_eval::limit` needs: one nested call spent here and given back on the
-    // normal return, so a compiled recursion is bounded by the number the machine bounds an
-    // interpreted one by.
-    head.push_str(super::emit::PROLOGUE);
-    let answer = match e.expr(&lowered.code) {
-        Ok(answer) => answer,
-        Err(err) => {
-            if let Some(k) = &refusal
-                && let Some(r) = err.downcast_ref::<Refused>()
-            {
-                super::cache::write_refusal(k, &r.construct);
-            }
-            return Err(err);
-        }
-    };
-    let word = e.word(&answer);
-    let mut out = head;
-    out.push_str(&e.token_decls());
-    out.push_str(&e.record_decls());
-    out.push_str(&e.out);
-    out.push_str(&format!("  ctx->fuel += 1;\n  return {word};\n}}\n"));
-    // The entry the seam and a closure reach the body through, over the handle ABI.
-    out.push_str(&format!(
-        "Word {0}_entry(PlyCtx *ctx, const Word *args) {{\n  return {0}(ctx{1});\n}}\n",
-        mangle(name),
-        (0..params.len())
-            .map(|i| format!(", args[{i}]"))
-            .collect::<Vec<_>>()
-            .join("")
-    ));
-    // The lambdas this body defines, as functions beside it. Part of the body's text, so they
-    // are cached and restored with it, and their placeholders are resolved with it.
-    out.push_str(&e.lambda_defs());
-    if let Some(k) = &key {
-        super::cache::write(k, &out, &e.tables);
-    }
-    Ok((out, e.tables.clone()))
 }
 
 /// A body's placeholders, resolved against the unit it is going into.
 ///
 /// The text names a constant, a builtin, a field or a shape by *its own* position, so that the
 /// text is a function of the body alone. This is where those become the unit's positions.
-fn resolve(text: &str, tables: &super::emit::Tables, unit: &mut Unit) -> String {
+fn resolve(text: &str, tables: &super::tables::Tables, unit: &mut Unit) -> String {
     let consts: Vec<usize> = tables
         .consts
         .iter()
