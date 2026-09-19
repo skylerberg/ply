@@ -55,6 +55,10 @@ pub enum Command {
     Explain(ExplainArgs),
     /// Print the content hash of every definition.
     Hash(HashArgs),
+    /// Every definition with its place, hash, signature and footprint.
+    Defs(DefsArgs),
+    /// What mentions a definition: definitions, tests and laws, directly and through calls.
+    Callers(CallersArgs),
     /// Write the front end out as the C that builds it, with its digests.
     Bootstrap(BootstrapArgs),
     /// Read, reclaim or discard what the caches hold.
@@ -635,6 +639,36 @@ pub struct ExplainArgs {
     /// List every code with its meaning.
     #[arg(long)]
     pub all: bool,
+
+    /// Emit one JSON object on stdout and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DefsArgs {
+    /// A `.ply` file, or a project root whose `*.ply` files are modules named by path.
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
+
+    /// Only definitions whose program-wide name contains this substring.
+    #[arg(long, value_name = "SUBSTRING")]
+    pub filter: Option<String>,
+
+    /// Emit one JSON object on stdout and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct CallersArgs {
+    /// A program-wide name (`store.orders.place`) or a simple name unique in the program.
+    #[arg(value_name = "DEF")]
+    pub query: String,
+
+    /// A `.ply` file, or a project root whose `*.ply` files are modules named by path.
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
 
     /// Emit one JSON object on stdout and nothing else.
     #[arg(long)]

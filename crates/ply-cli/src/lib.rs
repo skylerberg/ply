@@ -42,6 +42,8 @@ pub fn execute(cli: Cli) -> i32 {
         Command::Std(args) => commands::stdlib::execute(args, style),
         Command::Explain(args) => commands::explain::execute(args, style),
         Command::Hash(args) => commands::hash::execute(args, style),
+        Command::Defs(args) => commands::defs::execute(args, style),
+        Command::Callers(args) => commands::callers::execute(args, style),
         Command::Bootstrap(args) => commands::bootstrap::execute(args, style),
         Command::Cache(args) => match &args.action {
             CacheAction::Clear(scope) => commands::cache::clear(scope, style),
