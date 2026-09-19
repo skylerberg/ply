@@ -251,20 +251,13 @@ fn iterate(
     warnings.extend(report.warnings.iter().cloned());
 
     // After the run, since a pass recorded now is a valid baseline for another test's failure.
-    // Bisection still walks Rust trees, so only a failure parses one.
-    if !report.failures.is_empty() {
-        match loaded.tree() {
-            Ok(tree) => warnings.extend(ply_test::diagnose_failures(
-                &mut report,
-                &tree.program,
-                &tree.resolved,
-                &loaded.front,
-                &mut cache.store,
-                &diagnosis_options(args),
-            )),
-            Err(disagreement) => warnings.push(disagreement),
-        }
-    }
+    ply_test::diagnose_failures(
+        &mut report,
+        &loaded.texts(),
+        &loaded.front,
+        &mut cache.store,
+        &diagnosis_options(args),
+    );
     // Pass records are read lazily, so an unreadable baseline only surfaces here.
     warnings.extend(cache.store.take_warnings());
     let warnings = once_each(warnings);

@@ -1,4 +1,4 @@
-//! The tree back as source, for programs reconstructed from stored bodies with no text.
+//! The tree back as source, for a fixture built as a tree that the port must read as text.
 //! Faithful rather than pretty: each form is spelled the one way the parser reads back unchanged.
 
 use crate::ast::*;

@@ -1,10 +1,10 @@
 //! Bisection over the definition graph.
 
 pub mod classify;
-pub mod renormalize;
+pub mod rehash;
 
 pub use classify::{Classify, StoreClassify, Unknown};
-pub use renormalize::{EraTable, Renormalizer};
+pub use rehash::Rehashed;
 
 use ply_hash::{DefHash, HashOutput};
 use ply_span::Symbol;
