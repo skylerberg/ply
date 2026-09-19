@@ -525,6 +525,73 @@ fn an_edit_asks_only_the_modules_it_reached_and_answers_as_a_full_load() {
 }
 
 #[test]
+fn prove_asks_for_claims_only_when_something_is_discharged_and_only_where_an_edit_reached() {
+    use clap::Parser;
+    use ply_cli::cli::{Cli, Command};
+    use ply_codegen::c::producer;
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "base.ply",
+        "\
+pub fn one() -> Int = 1
+
+pub fn bump(x: Int) -> Int
+  requires x < 100
+  ensures result > x
+= x + one()
+",
+    );
+    write(
+        dir.path(),
+        "app.ply",
+        "\
+import base
+
+fn more(x: Int) -> Int
+  requires x < 50
+  ensures result > x
+= base::bump(x)
+",
+    );
+    write(
+        dir.path(),
+        "side.ply",
+        "\
+fn zero(x: Int) -> Int
+  ensures result == 0
+= x - x
+",
+    );
+    let path = dir.path().to_str().unwrap().to_string();
+    let prove = |what: &str, flags: &[&str], claimed: usize| {
+        let mut argv = vec!["ply", "prove"];
+        argv.extend_from_slice(flags);
+        argv.push(&path);
+        let Command::Prove(args) = Cli::parse_from(argv).command else {
+            panic!("`ply prove` parsed as another command");
+        };
+        producer::reset_census();
+        let code = ply_cli::commands::prove::execute(&args, ply_cli::style::Style::plain());
+        assert_eq!(code, ply_cli::EXIT_OK, "{what}: every claim holds");
+        assert_eq!(
+            producer::census().claimed,
+            claimed,
+            "{what}: modules whose claims the port was asked for"
+        );
+    };
+
+    prove("cold", &[], 3);
+    prove("every obligation discharged again", &["--no-cache"], 0);
+    edit(dir.path(), "side.ply", "x - x", "x - x + 0");
+    prove("an edit to a module nothing imports", &[], 1);
+    edit(dir.path(), "base.ply", "x + one()", "x + one() + 0");
+    prove("an edit to a module another imports", &[], 2);
+    fs::remove_file(dir.path().join(".ply-cache/claims.answer")).unwrap();
+    prove("every obligation answered from the cache", &[], 0);
+}
+
+#[test]
 fn the_full_path_writes_no_front_end_cache() {
     let dir = corpus();
     driver::load_full(dir.path()).unwrap();
