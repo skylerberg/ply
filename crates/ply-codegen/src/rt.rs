@@ -217,6 +217,8 @@ pub const FAILED_OUT_OF_FUEL: i64 = 2;
 pub const FAILED_OUT_OF_STACK: i64 = 3;
 /// A clause answered without resuming: `Ctx::unwind` carries its value to its `handle`.
 pub const FAILED_UNWIND: i64 = 4;
+/// The entry ran past its time budget.
+pub const FAILED_OUT_OF_TIME: i64 = 5;
 
 /// An installed handler: pushed by a `handle` site, searched innermost-out by a `perform`.
 pub struct HandlerFrame {
@@ -386,6 +388,11 @@ pub struct Ctx {
     pub site_root: i64,
     pub site_start: i64,
     pub site_end: i64,
+    /// Loop passes since the entry began; every 4096th samples the clock against the deadline.
+    pub ticks: i64,
+    /// When the running entry's time budget is spent, if it has one.
+    deadline: Option<std::time::Instant>,
+    time_budget_ms: u64,
     /// The cells, holding heap words: declared before the heap, so their counts go back first.
     cells: ply_eval::TaskRegions<Held>,
     /// The arena's `(depth, live)` when the running entry began, for [`Ctx::cells_balanced`].
@@ -446,6 +453,9 @@ impl Ctx {
             site_root: -1,
             site_start: 0,
             site_end: 0,
+            ticks: 0,
+            deadline: None,
+            time_budget_ms: 0,
             heap: Heap::new(),
             last_entry: 0,
             unclosed_entries: 0,
@@ -486,6 +496,11 @@ impl Ctx {
         self.cells_baseline = (arena.depth(), arena.live());
         self.failed = 0;
         self.fuel = fuel;
+        self.ticks = 0;
+        self.time_budget_ms = time_budget_ms();
+        self.deadline = (self.time_budget_ms > 0).then(|| {
+            std::time::Instant::now() + std::time::Duration::from_millis(self.time_budget_ms)
+        });
         self.stack_floor = stack_floor();
         self.site_root = -1;
         self.last_linear = None;
@@ -854,6 +869,46 @@ pub unsafe extern "C" fn rt_no_stack(ctx: *mut Ctx) {
     let ctx = unsafe { &mut *ctx };
     let d = error("this call would nest past what the native stack holds");
     ctx.fail_with(FAILED_OUT_OF_STACK, d);
+}
+
+/// A loop's periodic check: past the entry's deadline, the body stops where it is.
+pub unsafe extern "C" fn rt_tick(ctx: *mut Ctx) {
+    let ctx = unsafe { &mut *ctx };
+    if let Some(deadline) = ctx.deadline
+        && std::time::Instant::now() > deadline
+    {
+        let d = error(format!(
+            "ran past the time budget of {} ms",
+            ctx.time_budget_ms
+        ));
+        ctx.fail_with(FAILED_OUT_OF_TIME, d);
+    }
+}
+
+/// The wall-clock budget an entry begins with, in milliseconds; 0 is none. A command sets the
+/// process's, and a caller that wants one evaluation bounded differently sets its thread's.
+static TIME_BUDGET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static THREAD_TIME_BUDGET_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+pub fn set_time_budget(ms: u64) {
+    TIME_BUDGET_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Runs `f` with entries on this thread bounded by `ms` rather than the process's budget.
+pub fn with_time_budget<R>(ms: u64, f: impl FnOnce() -> R) -> R {
+    let before = THREAD_TIME_BUDGET_MS.with(|t| t.replace(Some(ms)));
+    let out = f();
+    THREAD_TIME_BUDGET_MS.with(|t| t.set(before));
+    out
+}
+
+pub fn time_budget_ms() -> u64 {
+    THREAD_TIME_BUDGET_MS
+        .with(|t| t.get())
+        .unwrap_or_else(|| TIME_BUDGET_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Room below the floor for the runtime's frames and the deepest compiled frame itself.

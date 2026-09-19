@@ -404,8 +404,13 @@ impl PlyProducer {
         parse(dump).context("reading the emitter's answer")
     }
 
-    /// Enters any function of the unit (`module.name`) with `args`, in a fresh context.
+    /// Enters any function of the unit (`module.name`) with `args`, in a fresh context and with
+    /// no time budget: the compiler's own work is never bounded by the program's.
     pub fn call(&self, name: &str, args: &[Value]) -> Result<Value> {
+        crate::rt::with_time_budget(0, || self.enter_own(name, args))
+    }
+
+    fn enter_own(&self, name: &str, args: &[Value]) -> Result<Value> {
         let entry = self
             .native
             .entry(name)
