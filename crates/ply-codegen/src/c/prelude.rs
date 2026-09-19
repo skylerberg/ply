@@ -31,6 +31,7 @@ typedef struct {
   int64_t site_root;
   int64_t site_start;
   int64_t site_end;
+  int64_t ticks;
 } PlyCtx;
 /* Where the body is, stored before a call that can fail so what the runtime raises is placed: its
    root, and bytes from that root's definition, so the C does not change when the definition moves. */
@@ -185,6 +186,7 @@ helpers![
     ("rt_list_set", 3, true),
     ("rt_list_lookup", 2, true),
     ("rt_map_lookup", 2, true),
+    ("rt_tick", 0, false),
 ];
 
 /// The declarations, function-pointer table and exported binder, all generated from [`HELPERS`].
