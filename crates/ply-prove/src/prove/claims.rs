@@ -48,6 +48,7 @@ pub enum Pat {
 #[derive(Clone, Debug)]
 pub struct Arm {
     pub pat: Pat,
+    pub guard: Option<Code>,
     pub body: Code,
 }
 
@@ -410,11 +411,16 @@ impl<'a> Dump<'a, '_> {
                 let mut arms = Vec::new();
                 while self.eat_str(",arm(") {
                     let pat = self.pat()?;
-                    // A guarded arm leaves its whole body unlowered, so no arm here has one.
-                    self.expect_str(",-,")?;
+                    self.expect(b',')?;
+                    let guard = if self.eat(b'-') {
+                        None
+                    } else {
+                        Some(self.code()?)
+                    };
+                    self.expect(b',')?;
                     let body = self.code()?;
                     self.expect(b')')?;
-                    arms.push(Arm { pat, body });
+                    arms.push(Arm { pat, guard, body });
                 }
                 Code::Match(Box::new(scrutinee), arms)
             }
