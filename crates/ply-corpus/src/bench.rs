@@ -320,8 +320,6 @@ struct Shape {
 
 fn once(root: &Path, backend: Option<&str>) -> Result<(Timings, Shape)> {
     let Front {
-        program,
-        resolved,
         check,
         hashes,
         port,
@@ -353,7 +351,6 @@ fn once(root: &Path, backend: Option<&str>) -> Result<(Timings, Shape)> {
         Some(spec) if !selection.to_run.is_empty() => Some(
             ply_cli::commands::common::build_backend_over(
                 spec,
-                &program,
                 &port,
                 ply_cli::commands::common::module_texts(&check, &sources),
             )
@@ -366,7 +363,7 @@ fn once(root: &Path, backend: Option<&str>) -> Result<(Timings, Shape)> {
     let started = Instant::now();
     let report = match (provider, spec) {
         (Some(provider), Some(spec)) => {
-            let executor = ply_test::InterpExecutor::new(&program, &resolved, &check)
+            let executor = ply_test::InterpExecutor::new(&port)
                 .with_search(ply_test::Search::of(&selection))
                 .with_hosts(ply_test::Hosting::hermetic())
                 .with_backend(provider, spec);
@@ -376,9 +373,9 @@ fn once(root: &Path, backend: Option<&str>) -> Result<(Timings, Shape)> {
         _ => {
             ply_codegen::c::producer::ensure_default();
             let texts = ply_cli::commands::common::module_texts(&check, &sources);
-            let unit = ply_codegen::Unit::over_front(&program, &port, texts)
+            let unit = ply_codegen::Unit::over_front(&port, texts)
                 .map_err(|e| anyhow::anyhow!("building the default tier: {e:#}"))?;
-            let executor = ply_test::InterpExecutor::new(&program, &resolved, &check)
+            let executor = ply_test::InterpExecutor::new(&port)
                 .with_search(ply_test::Search::of(&selection))
                 .with_hosts(ply_test::Hosting::hermetic())
                 .with_backend(unit, crate::honest());

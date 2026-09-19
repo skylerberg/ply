@@ -20,6 +20,7 @@ fn sym(s: &str) -> Symbol {
 struct Compiled {
     program: Program,
     resolved: Resolved,
+    port: ply_ty::Front,
     check: CheckOutput,
     hashes: HashOutput,
     bodies: BodySet,
@@ -32,7 +33,7 @@ impl Compiled {
         let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
         let resolved = ply_syntax::resolve(&mut program)
             .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = crate::fixture::port_check(
+        let port = crate::fixture::port_front(
             &[(ModuleName::from_dotted("m").to_string(), src.to_string())],
             &[SourceId(0)],
         );
@@ -41,7 +42,8 @@ impl Compiled {
         Compiled {
             program,
             resolved,
-            check,
+            check: port.check.clone(),
+            port,
             hashes,
             bodies,
             texts: std::collections::HashMap::from([(
@@ -87,8 +89,8 @@ impl Compiled {
     /// The signature every hybrid is judged against.
     fn failure(&self, key: &str) -> ply_span::Diagnostic {
         let index = self.test_index(key);
-        let mut machine = ply_eval::Machine::new(&self.program, &self.resolved, &self.check);
-        let unit = ply_codegen::Unit::over_with_texts(&self.program, self.texts.clone())
+        let mut machine = ply_eval::Machine::new(&self.port);
+        let unit = ply_codegen::Unit::over_front(&self.port, self.texts.clone())
             .expect("this host has a C compiler");
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,

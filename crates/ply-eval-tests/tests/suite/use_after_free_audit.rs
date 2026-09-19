@@ -19,10 +19,6 @@ impl Compiled {
         let answer = machine.call(name, Vec::new(), Span::DUMMY);
         (answer, machine.cells().stats())
     }
-
-    fn kinds(&self) -> ply_eval::region_kind::Regions {
-        ply_eval::region_kind::infer(&self.program, &self.resolved)
-    }
 }
 
 #[track_caller]
@@ -146,47 +142,7 @@ pub fn attack() -> Int = simulate {
     );
 }
 
-#[test]
-fn no_region_reaching_a_capture_indirectly_is_inferred_unique() {
-    const AMB: &str = "effect amb { read flip[coin]() -> Bool }\n";
-    let shapes: &[(&str, &str)] = &[
-        (
-            "a chain of two definitions",
-            "fn coin() -> Bool = amb.flip[coin]()
-             fn middle() -> Bool = coin()
-             fn go() -> Bool = with_cell[r](0) { c -> middle() }",
-        ),
-        (
-            "a callback this analysis cannot name",
-            "fn capturing() -> Bool = amb.flip[coin]()
-             fn go(f: (Int) -> Int) -> List<Int> = with_cell[r](0) { c -> map([1, 2], f) }",
-        ),
-        (
-            "a definition that spawns rather than performs",
-            "fn work() -> Int = 1
-             fn fork() -> Int = simulate { { let t = task.spawn(|| work()); task.join(t) } }
-             fn go() -> Int = with_cell[r](0) { c -> fork() }",
-        ),
-        (
-            "a value applied out of a binding, which may be any function",
-            "fn coin() -> Bool = amb.flip[coin]()
-             fn go(f: () -> Bool) -> Bool = with_cell[r](0) { c -> f() }",
-        ),
-    ];
-    for (what, body) in shapes {
-        let compiled = Compiled::new(&format!("{AMB}{body}\n"));
-        let regions = compiled.kinds();
-        assert!(!regions.is_empty(), "{what}: this shape opens no region");
-        assert_eq!(
-            regions.unique(),
-            0,
-            "{what}: `unique` is the claim that nothing can reach the region's slots after its \
-             close, and a capture reaches them"
-        );
-    }
-}
-
-/// Why a wrong inferred kind is survivable: [`Arena::close`] never reads the region's kind.
+/// [`Arena::close`] never reads the region's kind.
 #[test]
 fn what_a_close_reclaims_is_decided_by_the_pin_and_never_by_the_kind() {
     for kind in [RegionKind::Unique, RegionKind::Shared] {

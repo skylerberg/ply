@@ -1,10 +1,10 @@
 use ply_codegen::Unit;
 use ply_eval::{Provider, Value};
 use ply_span::Symbol;
-use ply_syntax::ast::{ModuleName, Program};
+use ply_syntax::ast::ModuleName;
 
 /// As `ply test benches/kernel` loads it: the project's own `.ply` files, and no standard library.
-fn kernel() -> (&'static Program, &'static Unit) {
+fn kernel() -> (&'static ply_ty::Front, &'static Unit) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -35,14 +35,11 @@ fn kernel() -> (&'static Program, &'static Unit) {
         .map(|(_, m, t)| (m.to_string(), (*t).to_string()))
         .collect();
     let ids: Vec<_> = inputs.iter().map(|(id, _, _)| *id).collect();
-    let mut ast = ply_syntax::parse_program(inputs).expect("the kernel parses");
-    assert!(ply_derive::expand_program(&mut ast).is_empty());
-    ply_syntax::resolve::resolve(&mut ast).expect("the kernel resolves");
     let front = ply_codegen::c::producer::checked_front(&named, &ids).expect("the kernel checks");
-    let ast: &'static Program = Box::leak(Box::new(ast));
-    let unit = Unit::over_front(ast, &front, named.into_iter().collect())
-        .expect("this host has a C compiler");
-    (ast, unit)
+    let front: &'static ply_ty::Front = Box::leak(Box::new(front));
+    let unit =
+        Unit::over_front(front, named.into_iter().collect()).expect("this host has a C compiler");
+    (front, unit)
 }
 
 #[test]
@@ -65,9 +62,9 @@ fn the_whole_kernel_is_inside_the_fragment() {
 
 #[test]
 fn the_search_answers_through_compiled_code() {
-    let (program, unit) = kernel();
+    let (front, unit) = kernel();
     let backend = unit.attach(&ply_eval::BackendSpec::honest());
-    assert!(backend.describes(program));
+    assert!(backend.describes(front.hashes.digest()));
     let answer = backend.enter(&Symbol::new("mcts.plan_753"), &[Value::Int(200)], 10_000);
     assert!(
         matches!(answer, Some(Value::Int(_))),

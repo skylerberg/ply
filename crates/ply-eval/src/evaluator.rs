@@ -1,7 +1,6 @@
 //! The engine: entry points and tests run on the compiled tier; performed atoms go to one
 //! [`Trace`].
 
-use crate::arena::RegionKind;
 use crate::compiled::{Compiled, Entered};
 use crate::host::{HostBinding, HostRuntime, HostUse, MachineId, Pending};
 use crate::limit::DEFAULT_MAX_CALLS;
@@ -11,30 +10,17 @@ use crate::trace::Trace;
 use crate::value::Value;
 use crate::{Arena, TaskRegions};
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::{Expr, Item, Program};
-use ply_syntax::resolve::Resolved;
-use ply_ty::CheckOutput;
-use ply_ty::{EffectAtom, Footprint};
+use ply_ty::{EffectAtom, Footprint, Front, ModuleName};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// Ordered as [`CheckOutput::tests`] is: load order, then source order.
-struct TestSlot<'a> {
-    module: usize,
-    name: &'a str,
-    body: &'a Expr,
-}
-
 pub struct Machine<'a> {
     /// With the performing task, the key a host handler scopes its state by.
     id: MachineId,
-    program: &'a Program,
-    resolved: &'a Resolved,
-    check: Option<&'a CheckOutput>,
+    /// Its tests are [`Machine::eval_test`]'s indices; its hashes name the unit it may enter.
+    front: &'a Front,
     regions: TaskRegions,
-    tests: Vec<TestSlot<'a>>,
-    region_kinds: crate::region_kind::Kinds,
     trace: Trace,
     max_calls: usize,
     /// Seed and per-interleaving step budget for the next entry point's `simulate` regions.
@@ -57,44 +43,11 @@ pub struct Machine<'a> {
 }
 
 impl<'a> Machine<'a> {
-    pub fn new(
-        program: &'a Program,
-        resolved: &'a Resolved,
-        check: &'a CheckOutput,
-    ) -> Machine<'a> {
-        Machine::build(program, resolved, Some(check))
-    }
-
-    /// An engine without a type-check pass; evaluation needs only the resolved AST.
-    pub fn for_program(program: &'a Program, resolved: &'a Resolved) -> Machine<'a> {
-        Machine::build(program, resolved, None)
-    }
-
-    fn build(
-        program: &'a Program,
-        resolved: &'a Resolved,
-        check: Option<&'a CheckOutput>,
-    ) -> Machine<'a> {
-        let mut tests = Vec::new();
-        for (m, module) in program.modules.iter().enumerate() {
-            for item in &module.items {
-                if let Item::Test(t) = item {
-                    tests.push(TestSlot {
-                        module: m,
-                        name: t.name.as_str(),
-                        body: &t.body,
-                    });
-                }
-            }
-        }
+    pub fn new(front: &'a Front) -> Machine<'a> {
         Machine {
             id: MachineId::next(),
-            program,
-            resolved,
-            check,
+            front,
             regions: TaskRegions::new(),
-            tests,
-            region_kinds: crate::region_kind::Kinds::default(),
             trace: Trace::new(),
             max_calls: DEFAULT_MAX_CALLS,
             seed: Seed::default(),
@@ -173,14 +126,6 @@ impl<'a> Machine<'a> {
         self.record.as_ref()
     }
 
-    pub fn program(&self) -> &'a Program {
-        self.program
-    }
-
-    pub fn check(&self) -> Option<&'a CheckOutput> {
-        self.check
-    }
-
     pub fn trace(&self) -> &Trace {
         &self.trace
     }
@@ -197,28 +142,8 @@ impl<'a> Machine<'a> {
         &self.regions
     }
 
-    /// `None` when `span` opens no region.
-    pub fn region_kind(&self, span: Span) -> Option<RegionKind> {
-        self.region_kinds().at(span).map(|region| region.kind)
-    }
-
-    /// Inferred on first use.
-    pub fn region_kinds(&self) -> &crate::region_kind::Regions {
-        self.region_kinds
-            .get_or_init(|| crate::region_kind::infer(self.program, self.resolved))
-    }
-
-    /// For another engine over this same program, so the analysis runs once per program.
-    pub fn shared_region_kinds(&self) -> crate::region_kind::Kinds {
-        crate::region_kind::Kinds::clone(&self.region_kinds)
-    }
-
-    pub fn share_region_kinds(&mut self, kinds: crate::region_kind::Kinds) {
-        self.region_kinds = kinds;
-    }
-
     pub fn set_compiled(&mut self, compiled: Rc<dyn Compiled>) {
-        if compiled.describes(self.program) {
+        if compiled.describes(self.front.hashes.digest()) {
             self.compiled = Some(compiled);
             self.share_host();
         }
@@ -238,65 +163,43 @@ impl<'a> Machine<'a> {
     }
 
     pub fn test_count(&self) -> usize {
-        self.tests.len()
+        self.front.check.tests.len()
     }
 
     pub fn test_name(&self, index: usize) -> Option<&'a str> {
-        self.tests.get(index).map(|t| t.name)
+        self.front.check.tests.get(index).map(|t| t.name.as_str())
     }
 
+    /// `index` into the front's tests: load order, then source order.
     pub fn eval_test(&mut self, index: usize) -> Result<(), Diagnostic> {
-        let Some(slot) = self.tests.get(index) else {
+        let front = self.front;
+        let tests = &front.check.tests;
+        let Some(test) = tests.get(index) else {
             return Err(Diagnostic::error(
                 codes::INTERNAL_ERROR,
                 format!(
                     "no test at index {index}; the program defines {}",
-                    self.tests.len()
+                    tests.len()
                 ),
             )
             .primary(Span::DUMMY, "requested test does not exist"));
         };
-        let module = slot.module;
-        let ordinal = self.tests[..index]
+        let ordinal = tests[..index]
             .iter()
-            .filter(|t| t.module == module)
+            .filter(|t| t.module == test.module)
             .count();
-        let name = self.program.modules[module].name.as_symbol().clone();
-        self.eval_test_in(&name, ordinal)
-    }
-
-    /// Positions are per module: an incremental run parses only some modules' tests.
-    pub fn eval_test_in(&mut self, module: &Symbol, ordinal: usize) -> Result<(), Diagnostic> {
-        let program = self.program;
-        let found = self
-            .tests
-            .iter()
-            .filter(|t| program.modules[t.module].name.as_symbol() == module)
-            .nth(ordinal)
-            .map(|slot| (slot.module, slot.body, slot.name));
-        let Some((owner, body, label)) = found else {
-            return Err(Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                format!("module `{module}` has no test at position {ordinal}"),
-            )
-            .primary(Span::DUMMY, "this test's module was not parsed")
-            .note("run `ply cache clear`, or pass `--no-incremental`"));
-        };
         self.begin_entry();
-        self.tier_test(owner, ordinal, label, body.span)
+        self.tier_test(&test.module, ordinal, test.span)
     }
 
     /// The compiled front end is the authority: unit passes, a raise fails, a missing body fails.
     fn tier_test(
         &mut self,
-        owner: usize,
+        module: &ModuleName,
         ordinal: usize,
-        label: &str,
         span: Span,
     ) -> Result<(), Diagnostic> {
-        let root = self.program.modules[owner]
-            .name
-            .qualify(&Symbol::new(format!("test#{ordinal}")));
+        let root = module.qualify(&Symbol::new(format!("test#{ordinal}")));
         let Some(backend) = self.compiled.clone() else {
             return Err(err_not_compiled(&root, span));
         };
@@ -323,7 +226,6 @@ impl<'a> Machine<'a> {
                 Err(err_not_compiled(&root, span))
             }
         };
-        let _ = label;
         self.end_entry_point();
         out
     }

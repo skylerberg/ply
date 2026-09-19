@@ -5,16 +5,16 @@ use crate::region::Record;
 use crate::sim::Seed;
 use crate::value::Value;
 use ply_span::{Diagnostic, Symbol};
-use ply_syntax::ast::Program;
 use ply_ty::CheckOutput;
 use ply_ty::Footprint;
-use ply_ty::{EffectAtom, IntTy, SECRET, TyVar, Type};
+use ply_ty::{DefHash, EffectAtom, IntTy, SECRET, TyVar, Type};
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
 pub trait Compiled {
-    fn describes(&self, program: &Program) -> bool;
+    /// Whether this was built over the program [`ply_ty::HashOutput::digest`] names.
+    fn describes(&self, program: DefHash) -> bool;
 
     /// Runs `name`'s body over `args`, or declines for any reason at all.
     fn enter(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value>;

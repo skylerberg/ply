@@ -291,8 +291,6 @@ pub struct Loaded {
     pub check: CheckOutput,
     /// The port's whole answer, which the tier is built from.
     pub port: ply_ty::Front,
-    /// This program's region kinds, shared by every machine below.
-    region_kinds: ply_eval::region_kind::Kinds,
     /// Each module's source text, which the Ply emitter re-parses to produce bodies.
     texts: HashMap<String, String>,
     /// The unit over the program, built once.
@@ -336,7 +334,6 @@ impl Loaded {
             resolved,
             check: port.check.clone(),
             port,
-            region_kinds: ply_eval::region_kind::Kinds::default(),
             texts,
             unit: std::sync::OnceLock::new(),
         })
@@ -346,18 +343,12 @@ impl Loaded {
         self.full_in("desk", simple)
     }
 
-    /// This program's region kinds, for an engine built outside this module.
-    pub fn shared_region_kinds(&self) -> ply_eval::region_kind::Kinds {
-        ply_eval::region_kind::Kinds::clone(&self.region_kinds)
-    }
-
-    /// A machine over this program, sharing its region kinds; its evaluator is a compiled tier.
+    /// A machine over this program; its evaluator is a compiled tier.
     pub fn machine(&self) -> Machine<'_> {
         ply_codegen::c::producer::ensure_default();
-        let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
-        machine.share_region_kinds(ply_eval::region_kind::Kinds::clone(&self.region_kinds));
+        let mut machine = Machine::new(&self.port);
         let unit = *self.unit.get_or_init(|| {
-            ply_codegen::Unit::over_front(&self.program, &self.port, self.texts.clone())
+            ply_codegen::Unit::over_front(&self.port, self.texts.clone())
                 .expect("this host has a C compiler")
         });
         let spec = ply_eval::BackendSpec {

@@ -15,7 +15,6 @@ mod memo;
 mod numerics;
 mod rc;
 mod region;
-mod region_kind;
 mod sched;
 mod sim;
 mod task_regions;

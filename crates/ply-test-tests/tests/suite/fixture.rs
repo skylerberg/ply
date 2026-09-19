@@ -8,10 +8,14 @@ use ply_ty::CheckOutput;
 use std::collections::HashMap;
 
 #[track_caller]
-pub fn port_check(sources: &[(String, String)], ids: &[SourceId]) -> CheckOutput {
+pub fn port_front(sources: &[(String, String)], ids: &[SourceId]) -> ply_ty::Front {
     ply_codegen::c::producer::checked_front(sources, ids)
         .unwrap_or_else(|e| panic!("the fixture must typecheck: {e:#}"))
-        .check
+}
+
+#[track_caller]
+pub fn port_check(sources: &[(String, String)], ids: &[SourceId]) -> CheckOutput {
+    port_front(sources, ids).check
 }
 
 /// What the port raises over these modules, for a fixture meant to be refused.
@@ -26,6 +30,8 @@ pub fn port_diagnostics(sources: &[(String, String)], ids: &[SourceId]) -> Vec<D
 pub struct Compiled {
     pub program: Program,
     pub resolved: Resolved,
+    /// What the tier is built over and the executor runs.
+    pub port: ply_ty::Front,
     pub check: CheckOutput,
     pub hashes: HashOutput,
     /// A `Front` without bodies silently disables every hybrid rather than failing.
@@ -92,13 +98,14 @@ impl Compiled {
             })
             .collect();
         let ids: Vec<SourceId> = program.modules.iter().map(|m| m.source).collect();
-        let check = port_check(&sources, &ids);
+        let port = port_front(&sources, &ids);
         let (hashes, bodies) = ply_hash::hash_program_with_bodies(&program, &resolved)
             .unwrap_or_else(|d| panic!("the fixture must hash: {d:#?}"));
         Compiled {
             program,
             resolved,
-            check,
+            check: port.check.clone(),
+            port,
             hashes,
             bodies,
             texts,
@@ -125,7 +132,7 @@ impl Compiled {
 
     /// Leaks the `&'static` unit. A bare machine holds no evaluator, so every run needs this.
     pub fn tier(&self) -> (&'static ply_codegen::Unit, ply_eval::BackendSpec) {
-        let unit = ply_codegen::Unit::over_with_texts(&self.program, self.texts.clone())
+        let unit = ply_codegen::Unit::over_front(&self.port, self.texts.clone())
             .expect("this host has a C compiler");
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,

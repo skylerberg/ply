@@ -151,7 +151,7 @@ test/nondet "closes without sending" {
 }
 "#,
     );
-    let binding = registry.bind(&idle.check).expect("binds");
+    let binding = registry.bind(&idle.front.check).expect("binds");
     let mut machine = idle.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     assert_eq!(
@@ -168,7 +168,7 @@ fn a_bound_run_reaches_the_handler_and_records_what_it_reached() {
         op("net", "send", Linearity::AtMostOnce),
         counter.clone(),
     )]);
-    let binding = registry.bind(&compiled.check).expect("binds");
+    let binding = registry.bind(&compiled.front.check).expect("binds");
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
@@ -201,7 +201,7 @@ test/nondet "the double answers" {
         op("net", "send", Linearity::AtMostOnce),
         counter.clone(),
     )]);
-    let binding = registry.bind(&compiled.check).expect("binds");
+    let binding = registry.bind(&compiled.front.check).expect("binds");
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
@@ -242,7 +242,7 @@ test/nondet "captured after the send" {
         op("net", "send", Linearity::AtMostOnce),
         counter.clone(),
     )]);
-    let binding = registry.bind(&compiled.check).expect("binds");
+    let binding = registry.bind(&compiled.front.check).expect("binds");
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
@@ -304,7 +304,7 @@ test/nondet "reached through a call" {
             op("net", "send", Linearity::AtMostOnce),
             counter.clone(),
         )]);
-        let binding = registry.bind(&compiled.check).expect("binds");
+        let binding = registry.bind(&compiled.front.check).expect("binds");
 
         let mut machine = compiled.machine_on_tier();
         machine.set_host_binding(Arc::new(binding));
@@ -365,7 +365,7 @@ test/nondet "the region's own scheduler answers" {
         (op("task", "spawn", Linearity::Repeatable), counter.clone()),
         (op("task", "join", Linearity::Repeatable), counter.clone()),
     ]);
-    let binding = registry.bind(&compiled.check).expect("binds");
+    let binding = registry.bind(&compiled.front.check).expect("binds");
     assert!(
         !binding.listing().is_empty(),
         "the fixture exists to have a bound `task` handler to shadow"
@@ -393,7 +393,7 @@ fn an_answer_outside_the_declared_footprint_is_refused() {
         op("net", "send", Linearity::AtMostOnce),
         counter.clone(),
     )]);
-    let binding = registry.bind(&compiled.check).expect("binds");
+    let binding = registry.bind(&compiled.front.check).expect("binds");
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
@@ -416,7 +416,7 @@ fn an_answer_inside_the_declared_footprint_is_allowed() {
         op("net", "send", Linearity::AtMostOnce),
         Arc::new(Counter::default()),
     )]);
-    let binding = registry.bind(&compiled.check).expect("binds");
+    let binding = registry.bind(&compiled.front.check).expect("binds");
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
@@ -435,7 +435,7 @@ fn the_declared_footprint_survives_the_next_entry_point() {
         op("net", "send", Linearity::AtMostOnce),
         Arc::new(Counter::default()),
     )]);
-    let binding = registry.bind(&compiled.check).expect("binds");
+    let binding = registry.bind(&compiled.front.check).expect("binds");
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
@@ -466,7 +466,7 @@ test/nondet "waits" {
         op("net", "send", Linearity::AtMostOnce),
         Arc::new(Waits),
     )]);
-    let binding = registry.bind(&compiled.check).expect("binds");
+    let binding = registry.bind(&compiled.front.check).expect("binds");
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
@@ -483,7 +483,7 @@ fn a_pending_answer_with_no_runtime_is_a_diagnostic() {
         op("net", "send", Linearity::AtMostOnce),
         Arc::new(Waits),
     )]);
-    let binding = registry.bind(&compiled.check).expect("binds");
+    let binding = registry.bind(&compiled.front.check).expect("binds");
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
@@ -537,7 +537,7 @@ test/nondet "two tasks and a join" {
     );
     let counter = Arc::new(Counter::default());
     let binding = task_registry(counter.clone())
-        .bind(&compiled.check)
+        .bind(&compiled.front.check)
         .expect("binds");
 
     let mut machine = compiled.machine_on_tier();
@@ -586,7 +586,7 @@ test/nondet "a region inside the production one" {
 "#,
     );
     let binding = task_registry(Arc::new(Counter::default()))
-        .bind(&compiled.check)
+        .bind(&compiled.front.check)
         .expect("binds");
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
@@ -609,7 +609,7 @@ test/nondet "reads a clock inside the production region" {
 "#,
     );
     let binding = task_registry(Arc::new(Counter::default()))
-        .bind(&compiled.check)
+        .bind(&compiled.front.check)
         .expect("binds");
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
@@ -672,7 +672,7 @@ test/nondet "the sibling runs while one task waits" {
     );
     let mut registry = task_registry(Arc::new(Counter::default()));
     registry.register(op("net", "accept", Linearity::AtMostOnce), Arc::new(Once));
-    let binding = registry.bind(&compiled.check).expect("binds");
+    let binding = registry.bind(&compiled.front.check).expect("binds");
 
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
@@ -705,7 +705,7 @@ test/nondet "one operation, no tasks" {
         op("net", "accept", Linearity::AtMostOnce),
         Arc::new(Waits),
     )]);
-    let binding = registry.bind(&compiled.check).expect("binds");
+    let binding = registry.bind(&compiled.front.check).expect("binds");
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     machine.set_host_runtime(std::rc::Rc::new(Resolved7));

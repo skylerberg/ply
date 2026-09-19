@@ -2,7 +2,6 @@
 
 use crate::load::Loaded;
 use ply_hash::{DefHash, HashOutput};
-use ply_span::Symbol;
 use ply_store::ContentHash;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,19 +24,8 @@ pub struct HeldUnit {
     provider: &'static dyn ply_eval::Provider,
     /// Two specs are two different units under one name.
     spec: ply_eval::BackendSpec,
-    /// Every published hash, tests included: test bodies are compiled too, and a stale one lies.
-    key: Key,
-}
-
-/// What the front end published about every definition, test and declaration.
-type Key = (Vec<(Symbol, DefHash)>, Vec<DefHash>, Vec<(Symbol, DefHash)>);
-
-fn key_of(hashes: &HashOutput) -> Key {
-    (
-        hashes.defs.iter().map(|(n, h)| (n.clone(), *h)).collect(),
-        hashes.tests.clone(),
-        hashes.decls.iter().map(|(n, h)| (n.clone(), *h)).collect(),
-    )
+    /// [`HashOutput::digest`], which a machine checks the unit against before entering it.
+    key: DefHash,
 }
 
 /// Why an iteration did or did not reuse what the last one built.
@@ -108,7 +96,7 @@ impl Warm {
         hashes: &HashOutput,
     ) -> Option<&'static dyn ply_eval::Provider> {
         let held = self.unit.as_ref()?;
-        (held.spec == *spec && held.key == key_of(hashes)).then_some(held.provider)
+        (held.spec == *spec && held.key == hashes.digest()).then_some(held.provider)
     }
 
     pub fn keep_unit(
@@ -120,7 +108,7 @@ impl Warm {
         self.unit = Some(HeldUnit {
             provider,
             spec: spec.clone(),
-            key: key_of(hashes),
+            key: hashes.digest(),
         });
     }
 }
