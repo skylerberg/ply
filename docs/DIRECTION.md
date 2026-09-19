@@ -26,8 +26,7 @@ A feature earns its place by one of these. Saving keystrokes does not count.
 - Structured fixes on diagnostics: a machine-applicable suggestion and candidates in the JSON.
 - `ply doc <name>` and `ply explain <code>`, from the tables the compiler uses, so the guide
   cannot drift from the compiler.
-- A program surface for agents: list callers, which tests reach a definition, replace a
-  definition by name.
+- Replace a definition by name, once `ply fmt` exists to print it back.
 - Induction in the prover, so recursive definitions can reach `proved`.
 - Mutation testing and per-definition coverage over the hash index.
 - A shared result cache, so parallel agents and CI never repeat each other.
