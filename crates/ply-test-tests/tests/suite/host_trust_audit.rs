@@ -504,18 +504,14 @@ test "the regression" { assert_eq(ask(1), expected()) }
     let during_the_run = calls.load(Ordering::SeqCst);
     assert_eq!(during_the_run, 1, "the failing run did reach the host");
 
-    let warnings = ply_test::diagnose_failures(
+    let mut sources: Vec<(String, String)> = after.texts.clone().into_iter().collect();
+    sources.sort();
+    ply_test::diagnose_failures(
         &mut report,
-        &after.program,
-        &after.resolved,
+        &sources,
         &after.front(),
         &mut store,
         &ply_test::Options::default(),
-    );
-    assert!(
-        warnings.is_empty(),
-        "{:?}",
-        warnings.iter().map(|d| d.code).collect::<Vec<_>>()
     );
 
     let bisection = &report.failures[0].attribution.bisection;

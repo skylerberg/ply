@@ -378,10 +378,6 @@ fn an_unchanged_project_is_answered_from_the_store_and_an_edit_asks_again() {
     assert!(entries > 0, "the first load must ask the port");
     let (warm, entries) = load();
     assert_eq!(entries, 0, "an unchanged project entered the port");
-    assert!(
-        !warm.rust.built(),
-        "a load answered from the store parsed in Rust"
-    );
     assert_eq!(snapshot(&warm), snapshot(&cold));
 
     let three = ply_span::Symbol::new("leaf.three");

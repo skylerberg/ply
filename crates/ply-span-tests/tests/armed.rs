@@ -1662,7 +1662,7 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
     ),
     (
         "crates/ply-test/src/hybrid.rs",
-        "the bisection's trial machine over a mixture, a reconstructed AST with no text: the \
+        "the bisection's trial machine over a mixture printed back from stored bodies: the \
          reference fragment only, which emits the C the whole tier ran for an effect-free \
          program, and a pass is recorded under `Engine::Evaluator` by `result_key`. \
          `hybrid::one_culprit_among_five_edits_is_named_within_the_logarithmic_budget` in \
