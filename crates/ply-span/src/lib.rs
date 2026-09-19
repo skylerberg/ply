@@ -341,8 +341,6 @@ pub mod codes {
     pub const REGION_ESCAPE: &str = "E0446";
     /// Two regions in scope at once under one name.
     pub const REGION_ALREADY_OPEN: &str = "E0447";
-    /// A region declared `unique` across which a continuation capture is reachable.
-    pub const REGION_KIND_REFUSED: &str = "E0448";
     /// A region handle crossing a runtime boundary, where no type is left to check.
     pub const REGION_ESCAPE_AT_BOUNDARY: &str = "E0449";
     pub const BACKEND_UNAVAILABLE: &str = "E0450";
@@ -608,7 +606,6 @@ mod tests {
             ("SPAN_UNBALANCED", codes::SPAN_UNBALANCED, "E0445"),
             ("REGION_ESCAPE", codes::REGION_ESCAPE, "E0446"),
             ("REGION_ALREADY_OPEN", codes::REGION_ALREADY_OPEN, "E0447"),
-            ("REGION_KIND_REFUSED", codes::REGION_KIND_REFUSED, "E0448"),
             (
                 "REGION_ESCAPE_AT_BOUNDARY",
                 codes::REGION_ESCAPE_AT_BOUNDARY,

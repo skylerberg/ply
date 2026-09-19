@@ -273,7 +273,7 @@ fn op(secrets: bool) -> HostOp {
 fn bound(compiled: &Compiled, handler: Arc<Counter>, secrets: bool) -> HostBinding {
     let mut registry = HostRegistry::new();
     registry.register(op(secrets), handler);
-    registry.bind(&compiled.check).expect("binds")
+    registry.bind(&compiled.front.check).expect("binds")
 }
 
 #[test]
@@ -343,7 +343,7 @@ fn the_secrets_column_moves_the_listing_digest() {
     let listing = |secrets| {
         let mut registry = HostRegistry::new();
         registry.register(op(secrets), Arc::new(Counter::default()));
-        registry.preview(&compiled.check).expect("resolves")
+        registry.preview(&compiled.front.check).expect("resolves")
     };
     assert_ne!(listing(false).digest(), listing(true).digest());
     assert!(listing(true).rows.iter().all(|r| r.secrets));

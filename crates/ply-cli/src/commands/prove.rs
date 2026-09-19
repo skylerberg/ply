@@ -85,9 +85,6 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
             return report_bind_error("prove", &diagnostics, &loaded.sources, args.json, style);
         }
     };
-    if let Err(diagnostic) = loaded.tree() {
-        return report_load_error("prove", &loaded.refused(diagnostic), args.json, style);
-    }
     let backend = match super::common::prover_backend(args.backend.as_ref(), &loaded) {
         Ok(backend) => backend,
         Err(diagnostic) => {

@@ -434,21 +434,6 @@ impl Builtin {
         }
     }
 
-    /// Calls user code, so [`call`] may answer [`Step::Apply`] and the caller must suspend.
-    pub fn higher_order(self) -> bool {
-        matches!(
-            self,
-            Builtin::Map
-                | Builtin::Filter
-                | Builtin::Fold
-                | Builtin::Iterate
-                | Builtin::BytesPosition
-                | Builtin::MapFold
-                | Builtin::CellUpdate
-                | Builtin::MapUpdate
-        )
-    }
-
     pub fn of_int(t: IntTy) -> Builtin {
         match t {
             IntTy::U8 => Builtin::U8OfInt,

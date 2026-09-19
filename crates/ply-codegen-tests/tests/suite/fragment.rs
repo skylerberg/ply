@@ -54,8 +54,8 @@ fn load(source: &str) -> Loaded {
 
 pub fn unit(source: &str) -> (&'static Loaded, &'static Unit) {
     let loaded: &'static Loaded = Box::leak(Box::new(load(source)));
-    let unit = Unit::over_front(loaded.program, loaded.front, loaded.texts.clone())
-        .expect("this host has a C compiler");
+    let unit =
+        Unit::over_front(loaded.front, loaded.texts.clone()).expect("this host has a C compiler");
     let _ = unit.bodies();
     (loaded, unit)
 }
@@ -602,10 +602,12 @@ fn an_overflow_declines_rather_than_wrapping() {
 #[test]
 fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
     let (loaded, unit) = unit(ARITHMETIC);
-    let other = load(ARITHMETIC);
+    let edited = ARITHMETIC.replace("x * 2", "x * 3");
+    assert_ne!(edited, ARITHMETIC, "the fixture spells `double`'s body");
+    let other = load(&edited);
     let backend = unit.attach(&ply_eval::BackendSpec::honest());
-    assert!(backend.describes(loaded.program));
-    assert!(!backend.describes(other.program));
+    assert!(backend.describes(loaded.front.hashes.digest()));
+    assert!(!backend.describes(other.front.hashes.digest()));
 }
 
 #[test]

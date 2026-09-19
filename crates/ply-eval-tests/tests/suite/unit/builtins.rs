@@ -1071,30 +1071,6 @@ fn a_cell_from_another_region_stack_is_named_rather_than_silently_read() {
 }
 
 #[test]
-fn exactly_the_callback_builtins_are_higher_order() {
-    let names: Vec<&str> = Builtin::all()
-        .iter()
-        .filter(|b| b.higher_order())
-        .map(|b| b.name())
-        .collect();
-    let mut names = names;
-    names.sort_unstable();
-    assert_eq!(
-        names,
-        [
-            "bytes_position",
-            "cell_update",
-            "filter",
-            "fold",
-            "iterate",
-            "map",
-            "map_fold",
-            "map_update"
-        ]
-    );
-}
-
-#[test]
 fn every_builtin_is_reachable_by_the_name_it_reports() {
     for b in Builtin::all() {
         assert_eq!(Builtin::from_name(b.name()), Some(*b));

@@ -3,7 +3,7 @@
 use crate::compiled::Compiled;
 use crate::value::Value;
 use ply_span::Symbol;
-use ply_syntax::ast::Program;
+use ply_ty::DefHash;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -344,7 +344,7 @@ fn forge_handle(value: &Value) -> Option<Value> {
 }
 
 impl Compiled for Mutant {
-    fn describes(&self, program: &Program) -> bool {
+    fn describes(&self, program: DefHash) -> bool {
         self.inner.describes(program)
     }
 

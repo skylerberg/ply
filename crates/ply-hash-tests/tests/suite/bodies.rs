@@ -1,6 +1,6 @@
 //! Definition bodies: the third element of `Hash -> (Definition, Type, Footprint)`.
 
-use crate::fixture::port_check;
+use crate::fixture::{port_check, port_front};
 use indexmap::IndexMap;
 use ply_hash::body::{BodySet, ItemKind, reconstruct};
 use ply_hash::{DefHash, HashOutput, hash_program_with_bodies};
@@ -51,12 +51,17 @@ fn compile(files: &[(&str, &str)]) -> Checked {
 
 /// A reconstructed program has no text, so the port checks it printed back to source.
 fn check_printed(program: &Program) -> CheckOutput {
+    printed_front(program).0.check
+}
+
+fn printed_front(program: &Program) -> (ply_ty::Front, std::collections::HashMap<String, String>) {
     let texts = ply_syntax::print::program(program);
     let files: Vec<(&str, &str)> = texts
         .iter()
         .map(|(name, text)| (name.as_str(), text.as_str()))
         .collect();
-    port_check(&files)
+    let front = port_front(&files);
+    (front, texts.into_iter().collect())
 }
 
 /// Reconstructs, then checks and re-hashes what came back.
@@ -624,20 +629,16 @@ fn moving_a_definition_between_modules_changes_no_body() {
 }
 
 /// A rebuilt program has no text, so the C emitter is handed it printed back to source.
-fn on_the_tier<'a>(
-    program: &'a ply_syntax::ast::Program,
-    resolved: &'a ply_syntax::resolve::Resolved,
-    check: &'a CheckOutput,
-) -> ply_eval::Machine<'a> {
-    let texts: std::collections::HashMap<String, String> =
-        ply_syntax::print::program(program).into_iter().collect();
-    let unit =
-        ply_codegen::Unit::over_with_texts(program, texts).expect("this host has a C compiler");
+fn on_the_tier(
+    front: &ply_ty::Front,
+    texts: std::collections::HashMap<String, String>,
+) -> ply_eval::Machine<'_> {
+    let unit = ply_codegen::Unit::over_front(front, texts).expect("this host has a C compiler");
     let spec = ply_eval::BackendSpec {
         kind: ply_eval::BackendKind::C,
         ..Default::default()
     };
-    let mut machine = ply_eval::Machine::new(program, resolved, check);
+    let mut machine = ply_eval::Machine::new(front);
     machine.set_compiled(ply_eval::Provider::attach(unit, &spec));
     machine
 }
@@ -666,9 +667,9 @@ fn reconstructed_tests_evaluate() {
     )]);
 
     let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
-    let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
-    let check = check_printed(&rebuilt.program);
-    let mut interp = on_the_tier(&rebuilt.program, &resolved, &check);
+    ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
+    let (front, texts) = printed_front(&rebuilt.program);
+    let mut interp = on_the_tier(&front, texts);
 
     assert_eq!(interp.test_count(), 2);
     for index in 0..interp.test_count() {
@@ -1063,9 +1064,9 @@ fn two_tests_that_number_one_effect_differently_both_reconstruct() {
     )]);
 
     let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
-    let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
-    let check = check_printed(&rebuilt.program);
-    let mut interp = on_the_tier(&rebuilt.program, &resolved, &check);
+    ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
+    let (front, texts) = printed_front(&rebuilt.program);
+    let mut interp = on_the_tier(&front, texts);
     assert_eq!(interp.test_count(), 2);
     for index in 0..interp.test_count() {
         interp

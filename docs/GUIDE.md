@@ -1153,7 +1153,6 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `E0445` | `trace.exit` of a span not open on this task |
 | `E0446` | value outlives its region |
 | `E0447` | two regions in scope under one name |
-| `E0448` | region forced `unique` across a continuation capture |
 | `E0449` | region handle reaching a runtime boundary |
 | `E0450` | compiled backend cannot be attached |
 | `E0451` | `fs` label with no root bound |

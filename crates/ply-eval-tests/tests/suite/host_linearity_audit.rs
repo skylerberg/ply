@@ -110,7 +110,7 @@ fn run_with(source: &str, linearity: Linearity, tasks: bool, runtime: bool) -> R
         registry = with_tasks(registry, counter.clone());
     }
     let binding = registry
-        .bind(&compiled.check)
+        .bind(&compiled.front.check)
         .unwrap_or_else(|d| panic!("the registry binds: {d:#?}"));
     let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));

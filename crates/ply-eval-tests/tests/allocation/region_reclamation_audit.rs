@@ -4,11 +4,7 @@
 use crate::counting::charge;
 use ply_eval::Value;
 use ply_eval::arena::{Arena, Pin, Reclaim, RegionKind, Slot, stale_slot, unique_capture};
-use ply_eval::region_kind::infer;
-use ply_span::{SourceId, SourceMap, Span, codes};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::parse_program;
-use ply_syntax::resolve::{Resolved, resolve};
+use ply_span::{Span, codes};
 use std::sync::Arc;
 
 fn counted<R>(f: impl FnOnce() -> R) -> (usize, R) {
@@ -323,56 +319,6 @@ fn runs_held_inside_a_region_are_absorbed_into_it_when_it_closes() {
     assert_eq!(arena.stats().slots_reclaimed_late, 64);
 }
 
-/// A `unique` region a capture can reach would free memory a continuation still holds.
-#[test]
-fn no_region_a_capture_can_be_taken_inside_is_inferred_unique() {
-    const AMB: &str = "effect amb { read flip[coin]() -> Bool }\n";
-    let shapes: &[(&str, &str)] = &[
-        (
-            "a general clause inside the region",
-            "fn go() -> Int = with_cell[r](0) { c ->
-               handle { if amb.flip[coin]() { 1 } else { 2 } }
-               with { amb.flip[coin]() resume k -> k(true) + k(false), return x -> x } }",
-        ),
-        (
-            "a handle lexically enclosing the region, which answers across it",
-            "fn go() -> Int =
-               handle { with_cell[r](0) { c -> if amb.flip[coin]() { 1 } else { 2 } } }
-               with { amb.flip[coin]() resume k -> k(true) + k(false), return x -> x }",
-        ),
-        (
-            "a perform the region does not answer",
-            "fn go() -> Bool = with_cell[r](0) { c -> amb.flip[coin]() }",
-        ),
-        (
-            "a capture reachable only through a called definition",
-            "fn coin() -> Bool = amb.flip[coin]()
-             fn go() -> Bool = with_cell[r](0) { c -> coin() }",
-        ),
-        (
-            "a task, which the scheduler parks and resumes",
-            "fn work() -> Unit = ()
-             fn go() -> Unit = with_cell[r](0) { c -> { let t = task.spawn(|| work()); task.join(t) } }",
-        ),
-        (
-            "a simulated region, which does the same to every task in it",
-            "fn go() -> Int = with_cell[r](0) { c -> simulate { cell_get(c) } }",
-        ),
-    ];
-
-    for (what, body) in shapes {
-        let src = format!("{AMB}{body}\n");
-        let (program, resolved) = load(&src);
-        let regions = infer(&program, &resolved);
-        assert!(!regions.is_empty(), "{what}: this probe opens no region");
-        assert_eq!(
-            regions.unique(),
-            0,
-            "{what}: a `unique` region here is memory freed under a live continuation\n{src}"
-        );
-    }
-}
-
 #[test]
 fn a_capture_across_a_unique_region_is_named_rather_than_freed() {
     let mut arena = Arena::new();
@@ -469,15 +415,4 @@ fn a_continuation_parked_in_the_region_that_pins_it_is_the_leak_adr_0017_accepts
     drop(arena);
     assert_eq!(Arc::strong_count(&arc), 1);
     drop(parked);
-}
-
-fn load(src: &str) -> (Program, Resolved) {
-    let mut map = SourceMap::new();
-    let id: SourceId = map.add("reclaim.ply", src.to_string());
-    let mut program = match parse_program([(id, ModuleName::from_dotted("reclaim"), src)]) {
-        Ok(p) => p,
-        Err(ds) => panic!("the probe must parse: {ds:#?}\n{src}"),
-    };
-    let resolved = resolve(&mut program).expect("the probe must resolve");
-    (program, resolved)
 }
