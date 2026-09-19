@@ -1,5 +1,6 @@
 use ply_span::frames::{read_diagnostics, write_diagnostics};
 use ply_span::{Diagnostic, Severity, SourceId, Span, codes};
+use ply_span::{Edit, Fix};
 
 fn sources() -> [SourceId; 2] {
     [SourceId(0), SourceId(1)]
@@ -14,7 +15,20 @@ fn two() -> Vec<Diagnostic> {
                 "the parameter is declared here",
             )
             .note("`+` is Int -> Int -> Int")
-            .note("a second note\nwith a line break"),
+            .note("a second note\nwith a line break")
+            .fix(
+                "add the annotation",
+                vec![
+                    Edit {
+                        span: Span::new(SourceId(1), 17, 17),
+                        text: ": Int".to_string(),
+                    },
+                    Edit {
+                        span: Span::new(SourceId(0), 2, 5),
+                        text: String::new(),
+                    },
+                ],
+            ),
         Diagnostic::warning(codes::UNKNOWN_NAME, "no such name `frob`\nsaid twice")
             .primary(Span::DUMMY, ""),
     ]
@@ -43,6 +57,22 @@ fn a_dump_round_trips_with_its_spans_labels_notes_and_severity() {
         ]
     );
 
+    assert_eq!(
+        read[0].fixes,
+        vec![Fix {
+            title: "add the annotation".to_string(),
+            edits: vec![
+                Edit {
+                    span: Span::new(SourceId(1), 17, 17),
+                    text: ": Int".to_string()
+                },
+                Edit {
+                    span: Span::new(SourceId(0), 2, 5),
+                    text: String::new()
+                },
+            ],
+        }]
+    );
     assert_eq!(read[1].code, codes::UNKNOWN_NAME);
     assert_eq!(read[1].severity, Severity::Warning);
     assert_eq!(read[1].message, "no such name `frob`\nsaid twice");

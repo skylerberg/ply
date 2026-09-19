@@ -1,6 +1,6 @@
 //! A deserializable `Diagnostic`: its `&'static str` code cannot borrow from a runtime file.
 
-use ply_span::{Diagnostic, Label, Severity};
+use ply_span::{Diagnostic, Fix, Label, Severity};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
@@ -14,6 +14,8 @@ pub struct DiagnosticRepr {
     labels: Vec<Label>,
     #[serde(default)]
     notes: Vec<String>,
+    #[serde(default)]
+    fixes: Vec<Fix>,
 }
 
 impl From<&Diagnostic> for DiagnosticRepr {
@@ -24,6 +26,7 @@ impl From<&Diagnostic> for DiagnosticRepr {
             message: d.message.clone(),
             labels: d.labels.clone(),
             notes: d.notes.clone(),
+            fixes: d.fixes.clone(),
         }
     }
 }
@@ -36,6 +39,7 @@ impl From<DiagnosticRepr> for Diagnostic {
             message: r.message,
             labels: r.labels,
             notes: r.notes,
+            fixes: r.fixes,
         }
     }
 }

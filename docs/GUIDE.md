@@ -1085,7 +1085,12 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 
 ## 17. Diagnostics
 
-`E` is an error; `W` is a warning and never a fault in your program.
+`E` is an error; `W` is a warning and never a fault in your program. A
+diagnostic that knows its own remedy carries `fixes` under `--json`: each has a
+`title` and `edits`, and an edit replaces the text between `start` and `end` of
+`file` (an empty range inserts) with `text`. Applied as they are, the edits
+leave a program the diagnostic no longer holds for. On a terminal a fix is the
+`fix:` line under the message.
 
 | code | meaning |
 | --- | --- |
