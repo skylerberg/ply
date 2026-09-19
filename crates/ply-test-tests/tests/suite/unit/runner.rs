@@ -97,7 +97,7 @@ impl Program {
 
     /// Runs on the compiled C tier; `Unit::over_with_texts` leaks a `&'static Unit`.
     fn run(&self, selection: &Selection, store: &mut Store) -> ply_test::RunReport {
-        let unit = ply_codegen::Unit::over_with_texts(&self.program, &self.resolved, self.texts())
+        let unit = ply_codegen::Unit::over_with_texts(&self.program, self.texts())
             .expect("this host has a C compiler");
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,

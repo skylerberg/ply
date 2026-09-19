@@ -1,6 +1,6 @@
 //! The modules that ship with the compiler.
 
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_span::{Diagnostic, Span, codes};
 use ply_syntax::ast::ModuleName;
 use std::path::{Path, PathBuf};
 
@@ -120,21 +120,6 @@ pub fn unknown_module(name: &ModuleName, span: Span) -> Diagnostic {
     .primary(span, "not found")
     .note(format!("the stdlib holds: {}", listed.join(", ")))
     .note("`ply std` lists them with the digest this binary was built from")
-}
-
-pub fn foreign_import(importer: &ModuleName, imported: &Symbol, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!(
-            "the shipped module `{importer}` imports `{imported}`, which this build does not ship"
-        ),
-    )
-    .primary(
-        span,
-        "a stdlib module may import only modules that ship with it",
-    )
-    .note("this is a defect in the compiler's own sources, not in this program")
-    .note("please report it with the version of `ply` that produced it")
 }
 
 #[cfg(test)]

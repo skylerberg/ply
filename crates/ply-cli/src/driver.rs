@@ -1,6 +1,6 @@
-//! The front end: the Rust chain that still has to run, and the port that answers for the rest.
+//! The front end: the port parses, resolves and checks the program; its answer is kept per module.
 
-use crate::load::{Discovered, LoadError, Loaded, anchor, discover, unreadable};
+use crate::load::{Discovered, LoadError, Loaded, RustTree, anchor, discover, unreadable};
 use ply_hash::body::StoredBody;
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
@@ -8,8 +8,7 @@ use ply_store::{
     CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, ContentHash, DeclBody, DefBody,
     DefEntry, DefKind, FileSpan, Member, NameRef, SourceFingerprint, Store,
 };
-use ply_syntax::ast::{Module, ModuleName, Program};
-use ply_syntax::resolve::resolve;
+use ply_syntax::ast::ModuleName;
 use ply_ty::Front;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -27,8 +26,6 @@ pub enum Mode {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Phases {
     pub read: Duration,
-    pub parse: Duration,
-    pub resolve: Duration,
     /// The port's whole front end over this program, or its answer read back.
     pub front: Duration,
     pub write_back: Duration,
@@ -36,14 +33,12 @@ pub struct Phases {
 
 impl Phases {
     pub fn total(&self) -> Duration {
-        self.read + self.parse + self.resolve + self.front + self.write_back
+        self.read + self.front + self.write_back
     }
 
-    pub fn labelled(&self) -> [(&'static str, Duration); 5] {
+    pub fn labelled(&self) -> [(&'static str, Duration); 3] {
         [
             ("read", self.read),
-            ("parse", self.parse),
-            ("resolve", self.resolve),
             ("front", self.front),
             ("write back", self.write_back),
         ]
@@ -78,15 +73,16 @@ struct FileState {
     source: SourceId,
     text: Arc<str>,
     content: ContentHash,
-    /// Taken when the program is assembled; nothing after that reads a tree through this.
-    ast: Option<Module>,
-    /// As parsed and expanded, so they outlive the tree.
+    /// As the port answered them, or, until it has, as the last filed answer recorded them.
     imports: Vec<ModuleName>,
     /// Embedded in the binary rather than discovered on disk.
     shipped: bool,
 }
 
 type Fresh = Option<BTreeMap<ContentHash, String>>;
+
+/// A module's part and the text it is filed as.
+type Part = Option<(String, Front)>;
 
 struct Keys {
     /// The emitter and the import graph, which fix the order the checker publishes in.
@@ -99,6 +95,8 @@ struct Driver<'s> {
     mode: Mode,
     store: Option<&'s mut Store>,
     whole_project: bool,
+    /// The project's own files, which every placement of the shipped modules follows.
+    project: SourceMap,
     sources: SourceMap,
     files: Vec<FileState>,
     by_module: BTreeMap<Symbol, usize>,
@@ -161,7 +159,6 @@ impl<'s> Driver<'s> {
                         .map(|f| f.text.clone())
                         .unwrap_or_else(|| "".into()),
                     content,
-                    ast: None,
                     imports: Vec::new(),
                     shipped: false,
                 }),
@@ -175,26 +172,22 @@ impl<'s> Driver<'s> {
             });
         }
 
-        let mut by_module = BTreeMap::new();
-        for (i, file) in files.iter().enumerate() {
-            by_module.insert(file.module.as_symbol().clone(), i);
-        }
-
-        Ok(Driver {
+        let mut driver = Driver {
             root,
             mode,
             store,
             whole_project,
+            project: sources.clone(),
             sources,
             files,
-            by_module,
+            by_module: BTreeMap::new(),
             phases,
-        })
+        };
+        driver.place(Vec::new());
+        Ok(driver)
     }
 
     fn finish(mut self) -> Result<Loaded, LoadError> {
-        self.parse_all()?;
-        let (program, resolved) = self.assemble()?;
         let (front, fresh) = self.ask_the_port()?;
         if front.has_error() {
             return Err(LoadError {
@@ -225,8 +218,6 @@ impl<'s> Driver<'s> {
             root: self.root,
             files,
             sources: self.sources,
-            program,
-            resolved,
             check: published_order(&front),
             hashes: front.hashes.clone(),
             front,
@@ -236,33 +227,239 @@ impl<'s> Driver<'s> {
                 warnings,
             },
             promised,
+            rust: RustTree::default(),
         })
     }
 
     fn ask_the_port(&mut self) -> Result<(Front, Fresh), LoadError> {
         ply_codegen::c::producer::ensure_default();
         let started = Instant::now();
-        let answer = match self.keys() {
-            Some(keys) => self.in_parts(&keys),
-            None => self.ask(&self.everything()).map(|front| (front, None)),
+        let answer = if self.keyed() {
+            self.in_parts()
+        } else {
+            self.whole()
         };
         self.phases.front += started.elapsed();
         answer
     }
 
-    /// Missed modules are asked with all they import, so the port sees a closed program.
-    fn in_parts(&self, keys: &Keys) -> Result<(Front, Fresh), LoadError> {
-        let Some(store) = self.store.as_deref() else {
-            return self.whole(keys);
+    fn keyed(&self) -> bool {
+        self.mode == Mode::Incremental && self.store.is_some()
+    }
+
+    fn own(&self) -> usize {
+        self.project.files().len()
+    }
+
+    /// The port pulls in the shipped modules the program imports, so its answer also places them.
+    fn whole(&mut self) -> Result<(Front, Fresh), LoadError> {
+        let own: Vec<(String, String)> = self.files[..self.own()]
+            .iter()
+            .map(|f| (f.module.to_string(), f.text.to_string()))
+            .collect();
+        let shelf: Vec<(String, String)> = ply_std::sources()
+            .map(|(module, text)| (module.to_string(), text.to_string()))
+            .collect();
+        let pulled = ply_codegen::c::producer::front_pulling_std(&own, &shelf)
+            .map_err(|e| self.seam_failed(&format!("{e:#}")))?;
+        self.place(
+            pulled
+                .modules
+                .iter()
+                .map(|m| (ModuleName::from_dotted(m), Vec::new()))
+                .collect(),
+        );
+        let ids: Vec<SourceId> = self.files.iter().map(|f| f.source).collect();
+        let front = ply_ty::read_front(&pulled.dump, &ids)
+            .map_err(|e| self.seam_failed(&format!("the front end's answer does not read: {e}")))?;
+        Ok(self.filed(front))
+    }
+
+    /// An answer over every module: what each imports is now known, and it splits into parts.
+    fn filed(&mut self, front: Front) -> (Front, Fresh) {
+        if front.has_error() {
+            return (front, None);
+        }
+        for file in &mut self.files {
+            if let Some(info) = front.check.modules.get(file.module.as_symbol()) {
+                file.imports = info.imports.clone();
+            }
+        }
+        let fresh = self.keys().and_then(|keys| self.parts(&front, &keys));
+        (front, fresh)
+    }
+
+    fn parts(&self, front: &Front, keys: &Keys) -> Fresh {
+        let (program, parts) = front.split().ok()?;
+        if parts.len() != self.files.len() {
+            return None;
+        }
+        let mut filed = BTreeMap::from([
+            (keys.program, ply_ty::write_front(&program, &[]).ok()?),
+            self.imports_record(),
+        ]);
+        for ((key, part), file) in keys.modules.iter().zip(&parts).zip(&self.files) {
+            if !part.check.modules.contains_key(file.module.as_symbol()) {
+                return None;
+            }
+            filed.insert(*key, ply_ty::write_front(part, &[file.source]).ok()?);
+        }
+        Some(filed)
+    }
+
+    /// A module's part is reused while its text and the texts of all it imports are unchanged; the
+    /// rest are asked with all they import, so the port sees a closed program.
+    fn in_parts(&mut self) -> Result<(Front, Fresh), LoadError> {
+        let recorded = self
+            .store
+            .as_deref()
+            .and_then(|store| store.front_part(imports_key()));
+        let Some(recorded) = recorded else {
+            return self.whole();
         };
-        let program = store.front_part(keys.program).and_then(|text| {
-            let front = ply_ty::read_front(&text, &[]).ok()?;
-            Some((text, front))
-        });
-        let Some((program_text, program)) = program else {
-            return self.whole(keys);
+        if !self.hint(&recorded) {
+            return self.whole();
+        }
+        let Some(keys) = self.keys() else {
+            return self.whole();
         };
-        let mut kept: Vec<Option<(String, Front)>> = keys
+        let Some(((program_text, program), mut kept)) = self.filed_parts(&keys) else {
+            return self.whole();
+        };
+        // A part's text fixes its imports, so a hint that keyed a part it does not match is stale.
+        if !kept.iter().zip(&self.files).all(|(part, file)| {
+            part.as_ref()
+                .is_none_or(|(_, part)| keyed_alike(part, file))
+        }) {
+            return self.whole();
+        }
+        let missed: Vec<usize> = (0..kept.len()).filter(|&i| kept[i].is_none()).collect();
+
+        if !missed.is_empty() {
+            let asked = self.reaching(&missed);
+            let front = self.ask(&asked)?;
+            // An answer with errors does not split, so its diagnostics come from the whole program.
+            if front.has_error() {
+                return self.whole();
+            }
+            if asked.len() == self.files.len() {
+                let front = self.filed(front);
+                return if self.placed_alike() {
+                    Ok(front)
+                } else {
+                    self.whole()
+                };
+            }
+            let taken = front
+                .split()
+                .is_ok_and(|(_, fresh)| self.take(&asked, fresh, &mut kept));
+            if !taken {
+                return self.whole();
+            }
+        }
+
+        let mut filed = BTreeMap::from([(keys.program, program_text), self.imports_record()]);
+        let mut parts = Vec::with_capacity(kept.len());
+        for (key, entry) in keys.modules.iter().zip(kept) {
+            let Some((text, part)) = entry else {
+                return self.whole();
+            };
+            filed.insert(*key, text);
+            parts.push(part);
+        }
+        match Front::join(program, parts) {
+            Ok(front) => Ok((front, (!missed.is_empty()).then_some(filed))),
+            Err(_) => self.whole(),
+        }
+    }
+
+    /// Imports as the last filed answer recorded them: exact for a module unchanged since, and for
+    /// an edited one a guess its answer checks. `false` for a module with none on record.
+    fn hint(&mut self, recorded: &str) -> bool {
+        let recorded: BTreeMap<Symbol, Vec<ModuleName>> = recorded
+            .lines()
+            .filter_map(|line| {
+                let mut words = line.split(' ');
+                let module = words.next().filter(|m| !m.is_empty())?;
+                Some((
+                    Symbol::new(module),
+                    words.map(ModuleName::from_dotted).collect(),
+                ))
+            })
+            .collect();
+        let own = self.own();
+        for file in &mut self.files[..own] {
+            let Some(imports) = recorded.get(file.module.as_symbol()) else {
+                return false;
+            };
+            file.imports = imports.clone();
+        }
+        match shipped_by(&self.files[..own], |m| recorded.get(m.as_symbol()).cloned()) {
+            Some(shipped) => {
+                self.place(shipped);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether the shipped modules placed from the hints are the ones the answered imports pull in.
+    fn placed_alike(&self) -> bool {
+        let own = self.own();
+        let answered = |m: &ModuleName| {
+            self.files[own..]
+                .iter()
+                .find(|f| &f.module == m)
+                .map(|f| f.imports.clone())
+        };
+        shipped_by(&self.files[..own], answered).is_some_and(|pulled| {
+            pulled
+                .iter()
+                .map(|(m, _)| m)
+                .eq(self.files[own..].iter().map(|f| &f.module))
+        })
+    }
+
+    /// Shipped modules follow the project's files, placed as the port pulls them in.
+    fn place(&mut self, shipped: Vec<(ModuleName, Vec<ModuleName>)>) {
+        let own = self.own();
+        self.files.truncate(own);
+        self.sources = self.project.clone();
+        for (module, imports) in shipped {
+            let Some(text) = ply_std::source(&module) else {
+                continue;
+            };
+            let path = ply_std::pseudo_path(&module);
+            let content = ContentHash::of(text.as_bytes());
+            let source = self.sources.add(&path, text);
+            let text = self
+                .sources
+                .get(source)
+                .map(|f| f.text.clone())
+                .unwrap_or_else(|| "".into());
+            self.files.push(FileState {
+                path,
+                module,
+                source,
+                text,
+                content,
+                imports,
+                shipped: true,
+            });
+        }
+        self.by_module = self
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.module.as_symbol().clone(), i))
+            .collect();
+    }
+
+    fn filed_parts(&self, keys: &Keys) -> Option<((String, Front), Vec<Part>)> {
+        let store = self.store.as_deref()?;
+        let text = store.front_part(keys.program)?;
+        let program = ply_ty::read_front(&text, &[]).ok()?;
+        let kept = keys
             .modules
             .iter()
             .zip(&self.files)
@@ -272,67 +469,41 @@ impl<'s> Driver<'s> {
                 Some((text, part))
             })
             .collect();
-        let missed: Vec<usize> = (0..kept.len()).filter(|&i| kept[i].is_none()).collect();
-
-        if !missed.is_empty() {
-            let asked = self.reaching(&missed);
-            let front = self.ask(&asked)?;
-            // An answer with errors does not split, so its diagnostics come from the whole program.
-            let Ok((_, fresh)) = front.split() else {
-                return self.whole(keys);
-            };
-            if fresh.len() != asked.len() {
-                return self.whole(keys);
-            }
-            for (&i, part) in asked.iter().zip(fresh) {
-                let file = &self.files[i];
-                let Ok(text) = ply_ty::write_front(&part, &[file.source]) else {
-                    return self.whole(keys);
-                };
-                // A module asked only because something imports it must answer as its part did.
-                let moved = kept[i].as_ref().is_some_and(|(filed, _)| *filed != text);
-                if moved || !part.check.modules.contains_key(file.module.as_symbol()) {
-                    return self.whole(keys);
-                }
-                kept[i] = Some((text, part));
-            }
-        }
-
-        let mut filed = BTreeMap::from([(keys.program, program_text)]);
-        let mut parts = Vec::with_capacity(kept.len());
-        for (key, entry) in keys.modules.iter().zip(kept) {
-            let Some((text, part)) = entry else {
-                return self.whole(keys);
-            };
-            filed.insert(*key, text);
-            parts.push(part);
-        }
-        match Front::join(program, parts) {
-            Ok(front) => Ok((front, (!missed.is_empty()).then_some(filed))),
-            Err(_) => self.whole(keys),
-        }
+        Some(((text, program), kept))
     }
 
-    fn whole(&self, keys: &Keys) -> Result<(Front, Fresh), LoadError> {
-        let front = self.ask(&self.everything())?;
-        if front.has_error() {
-            return Ok((front, None));
+    /// Files each asked module's part; `false` when one moved though nothing it reaches did, or
+    /// imports other than its hint named.
+    fn take(&self, asked: &[usize], fresh: Vec<Front>, kept: &mut [Part]) -> bool {
+        if fresh.len() != asked.len() {
+            return false;
         }
-        let fresh = front.split().ok().and_then(|(program, parts)| {
-            let mut filed =
-                BTreeMap::from([(keys.program, ply_ty::write_front(&program, &[]).ok()?)]);
-            if parts.len() != self.files.len() {
-                return None;
+        for (&i, part) in asked.iter().zip(fresh) {
+            let file = &self.files[i];
+            let Ok(text) = ply_ty::write_front(&part, &[file.source]) else {
+                return false;
+            };
+            let moved = kept[i].as_ref().is_some_and(|(filed, _)| *filed != text);
+            if moved || !keyed_alike(&part, file) {
+                return false;
             }
-            for ((key, part), file) in keys.modules.iter().zip(&parts).zip(&self.files) {
-                if !part.check.modules.contains_key(file.module.as_symbol()) {
-                    return None;
-                }
-                filed.insert(*key, ply_ty::write_front(part, &[file.source]).ok()?);
+            kept[i] = Some((text, part));
+        }
+        true
+    }
+
+    /// Every module's imports, one line each, so the next load can key the parts before it asks.
+    fn imports_record(&self) -> (ContentHash, String) {
+        let mut text = String::new();
+        for file in &self.files {
+            text.push_str(file.module.as_str());
+            for import in &file.imports {
+                text.push(' ');
+                text.push_str(import.as_str());
             }
-            Some(filed)
-        });
-        Ok((front, fresh))
+            text.push('\n');
+        }
+        (imports_key(), text)
     }
 
     fn ask(&self, which: &[usize]) -> Result<Front, LoadError> {
@@ -352,10 +523,6 @@ impl<'s> Driver<'s> {
             .map_err(|e| self.seam_failed(&format!("the front end's answer does not read: {e}")))
     }
 
-    fn everything(&self) -> Vec<usize> {
-        (0..self.files.len()).collect()
-    }
-
     fn reaching(&self, from: &[usize]) -> Vec<usize> {
         let mut seen: BTreeSet<usize> = from.iter().copied().collect();
         let mut stack = from.to_vec();
@@ -372,7 +539,7 @@ impl<'s> Driver<'s> {
     }
 
     fn keys(&self) -> Option<Keys> {
-        if self.mode != Mode::Incremental || self.store.is_none() {
+        if !self.keyed() {
             return None;
         }
         let emitter = ply_codegen::c::producer::emitter();
@@ -431,154 +598,6 @@ impl<'s> Driver<'s> {
                 .note("this is Ply's fault: the compiler's own front end is what failed here")
                 .note("the emitter comes from `crates/ply-compiler/bootstrap`; sources with no bundle are emitted by the one this binary carries"),
             ],
-        }
-    }
-
-    /// The trees are moved out of the files: the port reads text, and nothing reads a tree again.
-    fn assemble(&mut self) -> Result<(Program, ply_syntax::resolve::Resolved), LoadError> {
-        let modules: Vec<Module> = self.files.iter_mut().filter_map(|f| f.ast.take()).collect();
-        // Mutable because `resolve` fills defaults and places named arguments.
-        let mut program = Program { modules };
-        let resolved =
-            timed(&mut self.phases.resolve, || resolve(&mut program)).map_err(|diagnostics| {
-                LoadError {
-                    sources: self.sources.clone(),
-                    diagnostics,
-                }
-            })?;
-        Ok((program, resolved))
-    }
-
-    /// To a fixed point, because a shipped module may import another.
-    fn parse_all(&mut self) -> Result<(), LoadError> {
-        loop {
-            self.parse_pending()?;
-            if !self.pull_stdlib()? {
-                return Ok(());
-            }
-        }
-    }
-
-    /// Shipped modules are pulled in only when something imports them, transitively.
-    fn pull_stdlib(&mut self) -> Result<bool, LoadError> {
-        let mut diagnostics = Vec::new();
-        let mut wanted: BTreeSet<Symbol> = BTreeSet::new();
-
-        for file in &self.files {
-            for imported in &file.imports {
-                // A shipped module may import only `std.*`.
-                if file.shipped && !ply_std::is_std(imported) {
-                    diagnostics.push(self.foreign_import(file, imported));
-                    continue;
-                }
-                if !ply_std::is_std(imported) || self.by_module.contains_key(imported.as_symbol()) {
-                    continue;
-                }
-                match (ply_std::source(imported).is_some(), file.shipped) {
-                    (true, _) => {
-                        wanted.insert(imported.as_symbol().clone());
-                    }
-                    (false, true) => diagnostics.push(self.foreign_import(file, imported)),
-                    (false, false) => diagnostics.push(self.unknown_std(file, imported)),
-                }
-            }
-        }
-        if !diagnostics.is_empty() {
-            return Err(LoadError {
-                sources: self.sources.clone(),
-                diagnostics,
-            });
-        }
-
-        let added = !wanted.is_empty();
-        for name in wanted {
-            self.add_shipped(ModuleName::from_dotted(name.as_str()));
-        }
-        Ok(added)
-    }
-
-    /// Filed under its pseudo-path, so the store keys its fingerprint like any file's.
-    fn add_shipped(&mut self, module: ModuleName) {
-        let Some(source) = ply_std::source(&module) else {
-            return;
-        };
-        let path = ply_std::pseudo_path(&module);
-        let id = self.sources.add(&path, source.to_string());
-        let text = self
-            .sources
-            .get(id)
-            .map(|f| f.text.clone())
-            .unwrap_or_else(|| "".into());
-        self.by_module
-            .insert(module.as_symbol().clone(), self.files.len());
-        self.files.push(FileState {
-            ast: None,
-            imports: Vec::new(),
-            path,
-            module,
-            source: id,
-            text,
-            content: ContentHash::of(source.as_bytes()),
-            shipped: true,
-        });
-    }
-
-    fn import_span(&self, file: &FileState, imported: &ModuleName) -> Span {
-        file.ast
-            .as_ref()
-            .and_then(|ast| {
-                ast.imports
-                    .iter()
-                    .find(|i| &i.module_name() == imported)
-                    .map(|i| i.path_span())
-            })
-            .unwrap_or(Span::DUMMY)
-    }
-
-    fn unknown_std(&self, file: &FileState, imported: &ModuleName) -> Diagnostic {
-        let span = self.import_span(file, imported);
-        anchor(
-            ply_std::unknown_module(imported, span),
-            &self.sources,
-            file.source,
-        )
-    }
-
-    fn foreign_import(&self, file: &FileState, imported: &ModuleName) -> Diagnostic {
-        let span = self.import_span(file, imported);
-        anchor(
-            ply_std::foreign_import(&file.module, imported.as_symbol(), span),
-            &self.sources,
-            file.source,
-        )
-    }
-
-    fn parse_pending(&mut self) -> Result<(), LoadError> {
-        let mut diagnostics = Vec::new();
-        let files = &mut self.files;
-        timed(&mut self.phases.parse, || {
-            for file in files {
-                if file.ast.is_some() {
-                    continue;
-                }
-                match ply_syntax::parse_module(file.source, file.module.clone(), &file.text) {
-                    // Expansion reads only this file's own type declarations.
-                    Ok(mut module) => {
-                        diagnostics.append(&mut ply_derive::expand_module(&mut module));
-                        file.imports = module.imports.iter().map(|i| i.module_name()).collect();
-                        file.ast = Some(module);
-                    }
-                    Err(mut d) => diagnostics.append(&mut d),
-                }
-            }
-        });
-        if diagnostics.is_empty() {
-            Ok(())
-        } else {
-            Err(LoadError {
-                sources: self.sources.clone(),
-                diagnostics,
-            })
         }
     }
 
@@ -725,6 +744,53 @@ impl<'s> Driver<'s> {
             });
         }
         Some(fingerprint)
+    }
+}
+
+/// Where the imports every filed module answered with are kept.
+fn imports_key() -> ContentHash {
+    ContentHash::of(format!("imports\0{}", ply_codegen::c::producer::emitter()).as_bytes())
+}
+
+/// Whether a module's part names the imports its file was keyed by.
+fn keyed_alike(part: &Front, file: &FileState) -> bool {
+    part.check
+        .modules
+        .get(file.module.as_symbol())
+        .is_some_and(|info| info.imports == file.imports)
+}
+
+/// The shipped modules `files` import, transitively, as the port pulls them in: a round of newly
+/// imported ones at a time, each round in byte order. `None` for a module with no imports to go by.
+fn shipped_by(
+    files: &[FileState],
+    imports_of: impl Fn(&ModuleName) -> Option<Vec<ModuleName>>,
+) -> Option<Vec<(ModuleName, Vec<ModuleName>)>> {
+    let mut present: BTreeSet<Symbol> =
+        files.iter().map(|f| f.module.as_symbol().clone()).collect();
+    let mut round: Vec<ModuleName> = files
+        .iter()
+        .flat_map(|f| f.imports.iter().cloned())
+        .collect();
+    let mut pulled = Vec::new();
+    loop {
+        let wanted: BTreeSet<Symbol> = round
+            .iter()
+            .filter(|m| ply_std::is_std(m) && !present.contains(m.as_symbol()))
+            .map(|m| m.as_symbol().clone())
+            .collect();
+        if wanted.is_empty() {
+            return Some(pulled);
+        }
+        round.clear();
+        for name in wanted {
+            let module = ModuleName::from_dotted(name.as_str());
+            ply_std::source(&module)?;
+            let imports = imports_of(&module)?;
+            round.extend(imports.iter().cloned());
+            present.insert(name);
+            pulled.push((module, imports));
+        }
     }
 }
 

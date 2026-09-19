@@ -242,7 +242,7 @@ impl Hybrid for BodyHybrid<'_> {
             let texts: std::collections::HashMap<String, String> =
                 printed.iter().cloned().collect();
             let mut machine = ply_eval::Machine::new(&rebuilt.program, &resolved, check);
-            let unit = ply_codegen::Unit::over_front(&rebuilt.program, &resolved, &front, texts)
+            let unit = ply_codegen::Unit::over_front(&rebuilt.program, &front, texts)
                 .expect("this host has a C compiler");
             let spec = ply_eval::BackendSpec {
                 kind: ply_eval::BackendKind::C,

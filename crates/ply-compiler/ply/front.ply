@@ -1,22 +1,25 @@
 // The front end's answer for the driver: the errors, or else the warnings and every table it reads, in `diag.ply`'s framing.
 
-import spine (Span, Ident, QName, num)
+import spine (Span, Ident, QName, dummy_span, num)
 import lexer (byte_of)
 import items (Item, IFn, IType, IEffect, ITest, ILaw, IEffectSet, EffectSetDef, TDSum, VariantDef, SpecClause,
-              SpecKind, SRequires, SEnsures, ImportDecl, Vis, VPub, VPriv)
+              SpecKind, SRequires, SEnsures, ImportDecl, Vis, VPub, VPriv, FnDef, LawDef, Binder)
 import types (Mode, MRead, MWrite, MBad, AtomExpr)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord, ERecordUpdate,
               ETry, EField, EList, EPerform, EHandle, EWithCell, EWithRegion, ESimulate, EBad,
-              Param, Stmt, SLet, SExpr, MatchArm, RecField)
+              Param, Stmt, SLet, SExpr, MatchArm, RecField, expr_span)
 import patterns (Lit, LInt, LStr, LBytes)
+import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform, NCell,
+             NRegion, NLambda, NSim, NHandle, NField, NUpd, CField, CArm, CClause, CStmt, CLet, CLetPat, CDo,
+             CPat, CPatField, PxCtor, PxRecord, PxList, lower_fn, dump)
 import tycore (Atom, Resource, RNamed, RSingleton, Type, atom_text, atoms_insert, scheme_text, type_text,
                at, append, take, contains_bytes)
-import resolve (Source, Mod, Diag, Resolved, Resolved_, Failed, Ns, NEffect, resolve_modules, qualify,
-                lookup, find, is_bare)
+import resolve (Source, Mod, Diag, Resolved, Resolved_, Failed, Ns, NValue, NEffect, resolve_modules, qualify,
+                lookup, find, is_bare, diag1, backticked, import_module_name, path_span)
 import hash (Index, Entry, EDef, ETest, ELaw, HashOutput, build_index, hash_index, hex, unused)
 import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder, EffectInfo, OpInfo, CtorInfo,
               check_front, deriver_text, is_prelude_effect)
-import diag (Parsed, parse_all, outside_every_module, frame, field, flag)
+import diag (Parsed, parse_all, parse_at, outside_every_module, frame, field, flag)
 import std.hash (blake3)
 
 fn cat(parts: List<List<Bytes>>) -> List<Bytes> = fold(parts, [], |acc: List<Bytes>, p: List<Bytes>| append(acc, p))
@@ -43,9 +46,9 @@ fn loc_text(l: Loc) -> Bytes = span_text(l.module, l.span)
 
 fn vis_public(v: Vis) -> Bool = match v { VPub -> true, VPriv -> false }
 
-type Written = { public: Bool, reuse: Bool, params: List<Param> }
+type Written = { public: Bool, reuse: Bool, params: List<Param>, literals: List<Bytes> }
 
-fn no_written() -> Written = { public: false, reuse: false, params: [] }
+fn no_written() -> Written = { public: false, reuse: false, params: [], literals: [] }
 
 fn fn_written(mods: List<Mod>) -> Map<Bytes, Written> =
   fold(mods, map_new(), |acc: Map<Bytes, Written>, m: Mod|
@@ -54,7 +57,9 @@ fn fn_written(mods: List<Mod>) -> Map<Bytes, Written> =
         IFn(d) -> map_insert(a, qualify(m.name, d.name.name),
                              { public: vis_public(d.vis),
                                reuse: match d.reuse { Some(_) -> true, None -> false },
-                               params: d.params }),
+                               params: d.params,
+                               literals: fold(d.spec, [], |lits: List<Bytes>, c: SpecClause|
+                                 match c.kind { SRequires -> collect_lits([c.expr], lits), SEnsures -> lits }) }),
         _ -> a,
       }))
 
@@ -241,7 +246,8 @@ fn def_frame(d: DefInfo, w: Written) -> Bytes =
     map(d.row_aliases, |a: Bytes| field(b"row_alias", a)),
     map(w.params, |p: Param| field(b"param", bytes_concat_all([p.name.name, b" ", span_text(d.at.module, p.span)]))),
     map(d.spec, |s: SpecInfo| field(b"spec", bytes_concat_all([kind_text(s.kind), b" ", num(s.index), b" ", atoms_text(s.footprint), b"\n", span_text(d.at.module, s.span)]))),
-    [field(b"span", loc_text(d.at))]]))
+    [field(b"span", loc_text(d.at))],
+    map(w.literals, |x: Bytes| field(b"literal", x))]))
 
 fn type_frame(t: TypeRow) -> Bytes =
   framed(b"type", t.name,
@@ -383,8 +389,7 @@ fn tables(mods: List<Mod>, r: Resolved, c: Front, index: Index, h: HashOutput) -
        map(range(0, len(h.test_bodies)), |i: Int| framed(b"testbody", num(i), [hex(at(h.test_bodies, i))]))])
 }
 
-fn front(sources: List<Source>) -> List<Bytes> = {
-  let parsed = parse_all(sources);
+fn front(parsed: List<Parsed>) -> List<Bytes> = {
   let early = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
   if len(early) > 0 { diag_frames(early) } else {
     match resolve_modules(map(parsed, |p: Parsed| p.module)) {
@@ -403,7 +408,193 @@ fn front(sources: List<Source>) -> List<Bytes> = {
 }
 
 // One concatenation over the finished frames; appending per frame is quadratic.
-pub fn front_dump(sources: List<Source>) -> String = string_of_bytes(bytes_concat_all(front(sources)))
+pub fn front_dump(sources: List<Source>) -> String = string_of_bytes(bytes_concat_all(front(parse_all(sources))))
+
+fn global(r: Resolved, module: Int, written: Bytes) -> Bytes = {
+  let q: QName = match bytes_index_of(written, b"::") {
+    Some(i) -> { module: Some({ name: bytes_slice(written, 0, i), span: dummy_span() }),
+                 name: { name: bytes_slice(written, i + 2, bytes_len(written)), span: dummy_span() },
+                 span: dummy_span() },
+    None -> { module: None, name: { name: written, span: dummy_span() }, span: dummy_span() },
+  };
+  match find(r, module, NValue, q) { Some(b) -> b.qualified, None -> written }
+}
+
+fn named_pat(r: Resolved, m: Int, p: CPat) -> CPat =
+  match p {
+    PxCtor(c) -> PxCtor({ name: global(r, m, c.name), args: map(c.args, |a: CPat| named_pat(r, m, a)) }),
+    PxRecord(rc) -> PxRecord({ fields: map(rc.fields, |f: CPatField| { name: f.name, pat: named_pat(r, m, f.pat) }),
+                               rest: rc.rest }),
+    PxList(l) -> PxList({ items: map(l.items, |i: CPat| named_pat(r, m, i)),
+                          rest: match l.rest { Some(x) -> Some(named_pat(r, m, x)), None -> None } }),
+    _ -> p,
+  }
+
+fn named_fields(r: Resolved, m: Int, fs: List<CField>) -> List<CField> =
+  map(fs, |f: CField| { name: f.name, value: named(r, m, f.value) })
+
+fn named_opt(r: Resolved, m: Int, c: Option<Code>) -> Option<Code> =
+  match c { Some(x) -> Some(named(r, m, x)), None -> None }
+
+fn named_stmt(r: Resolved, m: Int, s: CStmt) -> CStmt =
+  match s {
+    CLet(l) -> CLet({ name: l.name, slot: l.slot, value: named(r, m, l.value) }),
+    CLetPat(l) -> CLetPat({ span: l.span, pat: named_pat(r, m, l.pat), value: named(r, m, l.value) }),
+    CDo(d) -> CDo({ code: named(r, m, d.code) }),
+  }
+
+fn named(r: Resolved, m: Int, c: Code) -> Code = {
+  let n = |x: Code| named(r, m, x);
+  let ns = |xs: List<Code>| map(xs, |x: Code| named(r, m, x));
+  let node = match c.node {
+    NLit(_) -> c.node,
+    NVar(v) -> match v.slot { Some(_) -> c.node, None -> NVar({ name: global(r, m, v.name), slot: None }) },
+    NUnary(u) -> NUnary({ op: u.op, operand: n(u.operand) }),
+    NBinary(b) -> NBinary({ op: b.op, lhs: n(b.lhs), rhs: n(b.rhs) }),
+    NApp(a) -> NApp({ func: n(a.func), args: ns(a.args) }),
+    NIf(i) -> NIf({ cond: n(i.cond), then_branch: n(i.then_branch), else_branch: n(i.else_branch) }),
+    NBlock(b) -> NBlock({ stmts: map(b.stmts, |s: CStmt| named_stmt(r, m, s)), tail: named_opt(r, m, b.tail) }),
+    NList(l) -> NList({ items: ns(l.items) }),
+    NRecord(rc) -> NRecord({ fields: named_fields(r, m, rc.fields) }),
+    NMatch(x) -> NMatch({ scrutinee: n(x.scrutinee),
+                          arms: map(x.arms, |a: CArm| { pat: named_pat(r, m, a.pat), guard: named_opt(r, m, a.guard),
+                                                        body: named(r, m, a.body) }) }),
+    NPerform(p) -> NPerform({ effect: p.effect, op: p.op, resource: p.resource, args: ns(p.args) }),
+    NCell(x) -> NCell({ resource: x.resource, binder: x.binder, slot: x.slot, init: n(x.init), body: n(x.body) }),
+    NRegion(x) -> NRegion({ body: n(x.body) }),
+    NLambda(l) -> NLambda({ params: l.params, size: l.size, caps: l.caps, body: n(l.body) }),
+    NSim(x) -> NSim({ size: x.size, caps: x.caps, body: n(x.body) }),
+    NHandle(h) -> NHandle({ body: n(h.body),
+                            clauses: map(h.clauses, |k: CClause| { effect: k.effect, op: k.op, resource: k.resource,
+                                                                   params: k.params, resume: k.resume, size: k.size,
+                                                                   caps: k.caps, body: named(r, m, k.body) }),
+                            ret: match h.ret { Some(x) -> Some({ size: x.size, caps: x.caps, body: n(x.body) }), None -> None } }),
+    NField(f) -> NField({ base: n(f.base), field: f.field }),
+    NUpd(u) -> NUpd({ base: n(u.base), copies: u.copies, sets: named_fields(r, m, u.sets) }),
+  };
+  { own: c.own, node: node, span: c.span }
+}
+
+fn lowered(r: Resolved, m: Int, params: List<Bytes>, e: Expr) -> Bytes =
+  match lower_fn(params, e) { Some(l) -> dump(named(r, m, l.code)), None -> b"" }
+
+fn clause_text(r: Resolved, m: Int, params: List<Bytes>, e: Expr) -> Bytes =
+  bytes_concat_all([span_text(m, expr_span(e)), b"\n", lowered(r, m, params, e)])
+
+// `result` takes the slot after the parameters, as the obligation's binders place it.
+fn def_claims(r: Resolved, m: Int, module: Bytes, d: FnDef) -> Bytes = {
+  let params = map(d.params, |p: Param| p.name.name);
+  framed(b"def", qualify(module, d.name.name), cat([
+    [field(b"params", num(len(params))), field(b"body", lowered(r, m, params, d.body))],
+    map(d.spec, |c: SpecClause| match c.kind {
+      SRequires -> field(b"requires", clause_text(r, m, params, c.expr)),
+      SEnsures -> field(b"ensures", clause_text(r, m, push(params, b"result"), c.expr)),
+    })]))
+}
+
+fn law_claims(r: Resolved, m: Int, module: Bytes, index: Int, d: LawDef) -> Bytes = {
+  let names = map(d.binders, |b: Binder| b.name.name);
+  framed(b"law", num(index), cat([
+    [field(b"key", qualify(module, d.name))],
+    match d.guard { Some(g) -> [field(b"guard", clause_text(r, m, names, g))], None -> [] },
+    [field(b"body", lowered(r, m, names, d.body))]]))
+}
+
+type Claimed = { frames: List<Bytes>, laws: Int }
+
+fn claim_frames(mods: List<Mod>, r: Resolved) -> List<Bytes> = {
+  let walked = fold(range(0, len(mods)), { frames: [], laws: 0 }, |acc: Claimed, i: Int| {
+    let m = at(mods, i);
+    fold(m.module.items, acc, |a: Claimed, it: Item|
+      match it {
+        IFn(d) -> { frames: push(a.frames, def_claims(r, i, m.name, d)), laws: a.laws },
+        // A split over a type is sound only with every variant in hand.
+        IType(d) -> match d.body {
+          TDSum(vs) -> { frames: push(a.frames, framed(b"sum", qualify(m.name, d.name.name), [field(b"variants", num(len(vs)))])),
+                         laws: a.laws },
+          _ -> a,
+        },
+        ILaw(d) -> { frames: push(a.frames, law_claims(r, i, m.name, a.laws, d)), laws: a.laws + 1 },
+        _ -> a,
+      })
+  });
+  walked.frames
+}
+
+pub fn claims_dump(sources: List<Source>) -> String =
+  match resolve_modules(map(parse_all(sources), |p: Parsed| p.module)) {
+    Failed(_) -> panic("a program the front end checked does not resolve"),
+    Resolved_(x) -> string_of_bytes(bytes_concat_all(claim_frames(x.mods, x.r))),
+  }
+
+// --- Pulling in the shipped modules --------------------------------------------
+// As the driver places them: after the program's own modules, a round of new imports at a time, each round in byte order.
+
+fn is_std(name: Bytes) -> Bool = name == b"std" || bytes_starts_with(name, b"std.")
+
+fn import_at(imports: List<ImportDecl>, name: Bytes) -> Span = {
+  let found = fold(imports, None, |acc: Option<Span>, d: ImportDecl|
+    match acc { Some(_) -> acc, None -> if import_module_name(d) == name { Some(path_span(d)) } else { None } });
+  match found { Some(s) -> s, None -> dummy_span() }
+}
+
+fn unknown_shipped(m: Int, at_: Span, name: Bytes, listed: List<Bytes>) -> Diag =
+  diag1(b"E0106", m, at_, bytes_concat_all([b"no module named `", name, b"` ships with this compiler"]), b"not found",
+        [bytes_concat(b"the stdlib holds: ", backticked(listed, b", ")),
+         b"`ply std` lists them with the digest this binary was built from"])
+
+fn foreign_import(m: Int, at_: Span, importer: Bytes, name: Bytes) -> Diag =
+  diag1(b"E0505", m, at_,
+        bytes_concat_all([b"the shipped module `", importer, b"` imports `", name, b"`, which this build does not ship"]),
+        b"a stdlib module may import only modules that ship with it",
+        [b"this is a defect in the compiler's own sources, not in this program",
+         b"please report it with the version of `ply` that produced it"])
+
+type Round = { wanted: Map<Bytes, Bytes>, diags: List<Diag> }
+
+fn pull_round(users: Int, shipped: Map<Bytes, Bytes>, listed: List<Bytes>, parsed: List<Parsed>) -> Round = {
+  let present = fold(parsed, map_new(), |acc: Map<Bytes, Bool>, p: Parsed| map_insert(acc, p.name, true));
+  fold(range(0, len(parsed)), { wanted: map_new(), diags: [] }, |acc: Round, i: Int| {
+    let p = at(parsed, i);
+    let imports = p.module.module.imports;
+    let ships = i >= users;
+    fold(imports, acc, |r: Round, d: ImportDecl| {
+      let name = import_module_name(d);
+      if is_std(name) && !map_contains(present, name) {
+        match map_get(shipped, name) {
+          Some(src) -> {..r, wanted: map_insert(r.wanted, name, src)},
+          None -> {..r, diags: push(r.diags, if ships { foreign_import(i, import_at(imports, name), p.name, name) }
+                                             else { unknown_shipped(i, import_at(imports, name), name, listed) })},
+        }
+      } else if ships && !is_std(name) { {..r, diags: push(r.diags, foreign_import(i, import_at(imports, name), p.name, name))} }
+      else { r }
+    })
+  })
+}
+
+type Pull = { parsed: List<Parsed>, pulled: List<Bytes>, diags: List<Diag> }
+
+fn pulling(users: Int, shipped: Map<Bytes, Bytes>, listed: List<Bytes>, x: Pull) -> Pull = {
+  let early = fold(x.parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
+  if len(early) > 0 { {..x, diags: early} } else {
+    let r = pull_round(users, shipped, listed, x.parsed);
+    if len(r.diags) > 0 { {..x, diags: r.diags} }
+    else if map_len(r.wanted) == 0 { x }
+    else {
+      pulling(users, shipped, listed, map_fold(r.wanted, x, |acc: Pull, name: Bytes, src: Bytes|
+        {..acc, parsed: push(acc.parsed, parse_at(len(acc.parsed), { name: name, src: src })), pulled: push(acc.pulled, name)}))
+    }
+  }
+}
+
+// `front_dump` over `user` and the modules of `shipped` it imports, led by a `pulled` frame naming those in order.
+pub fn front_pulling_std(user: List<Source>, shipped: List<Source>) -> String = {
+  let texts = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source| map_insert(acc, s.name, s.src));
+  let x = pulling(len(user), texts, map(shipped, |s: Source| s.name), { parsed: parse_all(user), pulled: [], diags: [] });
+  let head = framed(b"pulled", b"_", map(x.pulled, |n: Bytes| field(b"module", n)));
+  let body = if len(x.diags) > 0 { diag_frames(x.diags) } else { front(x.parsed) };
+  string_of_bytes(bytes_concat_all(cat([[head], body])))
+}
 
 // --- Tests ------------------------------------------------------------------
 
@@ -494,7 +685,7 @@ fn specified() -> List<Source> =
 test "a definition frames its row aliases and each clause with its kind, index and span" {
   let out = front_dump(specified());
   assert(holds(out, b"internally_effectful 1\n1row_alias 2\nIoparam 9\nb 0 76 84span 8\n0 69 114"));
-  assert(holds(out, b"def m.inc 209\nmodule 1\nmsimple_name 3\nincpublic 1\n0reuse 1\n0scheme 12\n(Int) -> Intfootprint 0\nperformed 0\ninternally_effectful 1\n0param 11\nx 0 122 128spec 21\nrequires 0 \n0 137 151spec 20\nensures 1 \n0 152 170span 9\n0 115 178"));
+  assert(holds(out, b"def m.inc 224\nmodule 1\nmsimple_name 3\nincpublic 1\n0reuse 1\n0scheme 12\n(Int) -> Intfootprint 0\nperformed 0\ninternally_effectful 1\n0param 11\nx 0 122 128spec 21\nrequires 0 \n0 137 151spec 20\nensures 1 \n0 152 170span 9\n0 115 178literal 5\nint 0"));
   assert(holds(out, b"ordinal m 71\nitem 8\nfn m.sayitem 25\nfn m.inc requires,ensuresitem 15\nlaw m.inc grows"))
 }
 
@@ -530,4 +721,37 @@ test "a law frames its binders with their spans and types, and its hashes carry 
   assert_eq(bytes_slice(d, spec_at + 135, spec_at + 143), b"spec 64\n");
   assert_eq(bytes_slice(d, spec_at + 207, spec_at + 215), b"spec 64\n");
   assert_eq(bytes_slice(d, spec_at + 279, spec_at + 292), b"spec_text 64\n")
+}
+
+fn claimed() -> List<Source> =
+  [{ name: b"base", src: b"pub fn one() -> Int = 1\npub type Coin = | Heads | Tails" },
+   { name: b"app", src: b"import base\nfn two(x: Int) -> Option<Int> requires x > 0 = Some(base::one() + len([x]))\nlaw \"it grows\" forall (x: Int) where x > 0 { two(x) != None }" }]
+
+test "a claim is lowered with each global named program-wide, and a builtin and a prelude constructor as written" {
+  let out = claims_dump(claimed());
+  assert(holds(out, b"def base.one 25\nparams 1\n0body 8\nblit(i1)sum base.Coin 12\nvariants 1\n2def app.two 152\nparams 1\n1"));
+  assert(holds(out, b"body 87\nbapp(bvar(Some,-),bbin(add,bapp(bvar(base.one,-)),bapp(bvar(len,-),blist(ovar(x,0),))))requires 35\n1 51 56\nbbin(gt,ovar(x,0),blit(i0))"));
+  assert(holds(out, b"key 12\napp.it growsguard "));
+  assert(holds(out, b"bbin(ne,bapp(bvar(app.two,-),ovar(x,0)),bvar(None,-))"))
+}
+
+fn shelf() -> List<Source> =
+  [{ name: b"std.a", src: b"import std.c\npub fn a() -> Int = 1" }, { name: b"std.b", src: b"pub fn b() -> Int = 2" },
+   { name: b"std.c", src: b"pub fn c() -> Int = 3" }, { name: b"std.d", src: b"pub fn d() -> Int = 4" }]
+
+test "the shipped modules a program imports follow it a round at a time, each round in byte order" {
+  let out = front_pulling_std([{ name: b"m", src: b"import std.b\nimport std.a\npub fn f() -> Int = 1" }], shelf());
+  assert(bytes_starts_with(bytes_of_string(out), b"pulled _ 42\nmodule 5\nstd.amodule 5\nstd.bmodule 5\nstd.corder _ "))
+}
+
+test "an import of a module that does not ship is reported at the import, listing the ones that do" {
+  assert_eq(front_pulling_std([{ name: b"m", src: b"import std.e\npub fn f() -> Int = 1" }], shelf()),
+            "pulled _ 0\ndiag 0 245\ncode 5\nE0106severity 5\nerrormessage 48\nno module named `std.e` ships with this compilerlabel 18\n0 7 12 1\nnot foundnote 52\nthe stdlib holds: `std.a`, `std.b`, `std.c`, `std.d`note 63\n`ply std` lists them with the digest this binary was built from")
+}
+
+test "a shipped module importing outside the shipped ones is placed in that module, which the answer names" {
+  let out = front_pulling_std([{ name: b"m", src: b"import std.x\npub fn f() -> Int = 1" }],
+                              [{ name: b"std.x", src: b"import m\npub fn x() -> Int = 1" }]);
+  assert(bytes_starts_with(bytes_of_string(out), b"pulled _ 14\nmodule 5\nstd.xdiag 0 "));
+  assert(holds(out, b"message 70\nthe shipped module `std.x` imports `m`, which this build does not shiplabel 65\n1 7 8 1\na stdlib module may import only modules that ship with it"))
 }

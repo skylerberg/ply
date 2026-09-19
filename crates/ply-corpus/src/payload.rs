@@ -54,9 +54,13 @@ impl Checked {
     }
 
     fn machine(&self) -> Machine<'_> {
+        let tree = self
+            .loaded
+            .tree()
+            .unwrap_or_else(|d| panic!("the measurement program: {}", d.message));
         crate::tier_machine(
-            &self.loaded.program,
-            &self.loaded.resolved,
+            &tree.program,
+            &tree.resolved,
             &self.loaded.front,
             &self.loaded.sources,
         )

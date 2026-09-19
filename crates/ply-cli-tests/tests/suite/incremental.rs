@@ -378,6 +378,10 @@ fn an_unchanged_project_is_answered_from_the_store_and_an_edit_asks_again() {
     assert!(entries > 0, "the first load must ask the port");
     let (warm, entries) = load();
     assert_eq!(entries, 0, "an unchanged project entered the port");
+    assert!(
+        !warm.rust.built(),
+        "a load answered from the store parsed in Rust"
+    );
     assert_eq!(snapshot(&warm), snapshot(&cold));
 
     let three = ply_span::Symbol::new("leaf.three");
@@ -478,7 +482,8 @@ fn an_edit_asks_only_the_modules_it_reached_and_answers_as_a_full_load() {
         "import core\n",
         "import core\nimport leaf\n",
     );
-    step("an import added", 3);
+    // Asked with the imports it had, which no longer close over it, and then as a whole.
+    step("an import added", 2 + 3);
     edit(
         dir.path(),
         "shop.ply",
@@ -497,6 +502,22 @@ fn an_edit_asks_only_the_modules_it_reached_and_answers_as_a_full_load() {
     step("an edit to the added file, which imports the leaf", 2);
     edit(dir.path(), "leaf.ply", "one() + k", "one() + k + 0");
     step("an edit to the leaf the added file imports", 2);
+    edit(
+        dir.path(),
+        "leaf.ply",
+        "fn one() -> Int = 1",
+        "import core\n\nfn one() -> Int = core::price(core::Note(\"n\")) + 1",
+    );
+    edit(
+        dir.path(),
+        "core.ply",
+        "Book(_, p) -> p + 0,",
+        "Book(_, p) -> p + 1,",
+    );
+    step(
+        "an import added to a module edited with the one it now imports",
+        4,
+    );
     fs::remove_file(dir.path().join("extra.ply")).unwrap();
     step("the added file deleted", 3);
 

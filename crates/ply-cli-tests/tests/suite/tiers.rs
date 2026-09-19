@@ -39,7 +39,7 @@ impl Run {
             ),
         };
         let hashes = loaded.hashes.clone();
-        let collected = obligations::collect(&loaded.program, &loaded.check, &hashes);
+        let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
         assert!(
             collected.warnings.is_empty(),
             "an obligation was not collected: {:?}",
@@ -49,10 +49,12 @@ impl Run {
                 .map(|d| d.message.clone())
                 .collect::<Vec<_>>()
         );
-        let prover = Prover::new(&loaded.program, &loaded.resolved, &loaded.check).with_backend(
-            ply_cli::commands::common::prover_backend(None, &loaded)
-                .expect("the program compiles to a tier"),
-        );
+        let prover = Prover::new(&loaded)
+            .expect("the port lowers the claims")
+            .with_backend(
+                ply_cli::commands::common::prover_backend(None, &loaded)
+                    .expect("the program compiles to a tier"),
+            );
         let results = collected
             .obligations
             .into_iter()
@@ -174,11 +176,13 @@ fn the_differential_tier_audit() {
     for path in corpus() {
         let loaded = load(&path).expect("the corpus compiles");
         let hashes = loaded.hashes.clone();
-        let collected = obligations::collect(&loaded.program, &loaded.check, &hashes);
-        let prover = Prover::new(&loaded.program, &loaded.resolved, &loaded.check).with_backend(
-            ply_cli::commands::common::prover_backend(None, &loaded)
-                .expect("the program compiles to a tier"),
-        );
+        let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
+        let prover = Prover::new(&loaded)
+            .expect("the port lowers the claims")
+            .with_backend(
+                ply_cli::commands::common::prover_backend(None, &loaded)
+                    .expect("the program compiles to a tier"),
+            );
         for obligation in &collected.obligations {
             if prover
                 .discharge_with(obligation, &ProvePlan::default())

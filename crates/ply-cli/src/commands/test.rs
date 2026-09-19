@@ -164,16 +164,20 @@ fn iterate(
         args.config.schema.is_some() || db.as_ref().is_some_and(|c| c.schema.is_some());
     let wanted = backend.as_ref().filter(|_| !nothing_to_run || schema_named);
     // A backend answers only for the program it was built over, and the machine checks that.
-    let (run_program, run_resolved) = (&loaded.program, &loaded.resolved);
+    let (run_program, run_resolved) = match loaded.tree() {
+        Ok(tree) => (&tree.program, &tree.resolved),
+        Err(diagnostic) => {
+            return report_load_error("test", &loaded.refused(diagnostic), args.json, style);
+        }
+    };
     // The last iteration's unit, when every definition is unchanged.
     let held_unit = wanted.and_then(|spec| warm.unit_for(spec, &hashes));
     let unit = match wanted.filter(|_| held_unit.is_none()).map(|spec| {
         build_backend_over(
             spec,
             run_program,
-            run_resolved,
             &loaded.front,
-            super::common::module_texts(run_program, &loaded.sources),
+            super::common::module_texts(&loaded.check, &loaded.sources),
         )
     }) {
         None => held_unit,
@@ -1624,6 +1628,9 @@ fn display_width(s: &str) -> usize {
 
 /// A `reuse fn` whose promise the cost checker cannot show stops the run, as under `ply check`.
 pub(crate) fn broken_promises(loaded: &Loaded) -> Option<crate::load::LoadError> {
+    if !loaded.promised {
+        return None;
+    }
     let diagnostics = crate::costs::promises(loaded);
     (!diagnostics.is_empty()).then(|| crate::load::LoadError {
         sources: loaded.sources.clone(),
