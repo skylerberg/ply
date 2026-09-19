@@ -1008,7 +1008,7 @@ fn fusable_step(em: Em, c: Code) -> Bool =
     },
     NIf(i) -> fusable_step(em, i.then_branch) && fusable_step(em, i.else_branch),
     NBlock(b) -> match b.tail { Some(t) -> fusable_step(em, t), None -> false },
-    NMatch(m) -> fold(m.arms, true, |acc: Bool, a: CArm| acc && a.guard == None && fusable_step(em, a.body)),
+    NMatch(m) -> fold(m.arms, true, |acc: Bool, a: CArm| acc && fusable_step(em, a.body)),
     _ -> false,
   }
 
@@ -1721,7 +1721,7 @@ pub fn covers() -> List<Bytes> =
    b"a record literal, through this body's reuse token for its width",
    b"a direct call to a definition of the same module",
    b"the builtins with a runtime helper of their own",
-   b"a match over wildcards, binders and Int literals",
+   b"a match over every pattern form, guards included",
    b"a call of a name another module exports by name",
    b"a Str or Bytes literal, from the unit's constant table",
    b"a constructor, tagged by its place in the unit's table",
@@ -2590,7 +2590,7 @@ fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, sink: Sink, fl
   if i >= len(xs) { Some(with_made(em, if i == 0 { em.made } else { seen })) } else {
     match list_at(xs, i) {
       None -> None,
-      Some(a) -> if a.guard != None { Some(poison(em, b"a match guard")) } else {
+      Some(a) -> {
         let guarded = indent(line(with_made(em, base), bytes_concat_all([b"if (!", flag, b") {"])));
         match (if lookup { Some({ em: guarded, c: lookup_test(a.pat, subj.c) }) }
                else { pat_test(a.pat, subj, guarded) }) {
@@ -2598,12 +2598,13 @@ fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, sink: Sink, fl
           Some(t) -> {
             let opened = line(t.em, bytes_concat_all([b"if (", t.c, b") {"]));
             let inner = indent(opened);
-            let bound = if lookup { lookup_bind(inner, a.pat, subj) } else { pat_bind(inner, a.pat, subj) };
-            match arm_body(bound, sink, a.body, params) {
+            // Past a failing guard the next arm tests the subject again, so neither its binders nor the guard may take its count.
+            let binding = match a.guard { None -> inner, Some(_) -> with_pinned(inner, push(inner.pinned, subj.c)) };
+            let bound = if lookup { lookup_bind(binding, a.pat, subj) } else { pat_bind(binding, a.pat, subj) };
+            match guarded_body(bound, inner.pinned, a.guard, sink, a.body, params, flag, em.tail) {
               None -> None,
               Some(o) -> {
-                let done = line(o, bytes_concat_all([flag, b" = 1;"]));
-                let closed = close(close(done));
+                let closed = close(close(o));
                 // The next arm is a tail when this one was: the body's own nodes cleared the flag.
                 arms(withtail(rescope(closed, em.conv), em.tail), xs, params, i + 1, subj, sink, flag,
                      base, union_made(seen, closed.made), lookup)
@@ -2613,6 +2614,28 @@ fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, sink: Sink, fl
         }
       },
     }
+  }
+
+// A failing guard leaves the flag clear; what the body moves is still held on that path, so it stays in `made`.
+fn guarded_body(em: Em, pinned: List<Bytes>, guard: Option<Code>, sink: Sink, body: Code, params: List<P>, flag: Bytes, tail: Bool) -> Option<Em> =
+  match guard {
+    None -> match arm_body(with_pinned(em, pinned), sink, body, params) {
+      None -> None,
+      Some(o) -> Some(line(o, bytes_concat_all([flag, b" = 1;"]))),
+    },
+    Some(g) -> match expr(notail(em), g, params) {
+      None -> None,
+      Some(gv) -> {
+        let opened = line(gv.em, bytes_concat_all([b"if (", as_bool(gv.v), b") {"]));
+        match arm_body(with_pinned(withtail(indent(opened), tail), pinned), sink, body, params) {
+          None -> None,
+          Some(o) -> {
+            let closed = close(line(o, bytes_concat_all([flag, b" = 1;"])));
+            Some(rescope(with_made(closed, union_made(opened.made, closed.made)), opened.conv))
+          },
+        }
+      },
+    },
   }
 
 fn arm_body(em: Em, sink: Sink, body: Code, params: List<P>) -> Option<Em> =
@@ -2725,6 +2748,21 @@ fn lookup_bind(em: Em, p: CPat, subj: V) -> Em =
     _ -> em,
   }
 
+// Outside the immediate range an `Int` is boxed, and so is every word that can equal it.
+fn int_test(subj: Bytes, n: Int) -> Bytes =
+  if n >= 0 - 4611686018427387904 && n < 4611686018427387904 {
+    bytes_concat_all([b"(ply_is_imm(", subj, b") ? ply_imm_value(", subj, b") == ", int_lit(n), b" : 0)"])
+  } else {
+    bytes_concat_all([b"(", subj, b" != 0 && !ply_is_imm(", subj, b") && rt_unbox_int_p(ctx, ", subj, b") == ", int_lit(n), b")"])
+  }
+
+// As `==` compares, against the unit's constant; a zero subject is an enclosing test that failed.
+fn equal_test(em: Em, l: Lit, subj: V) -> { em: Em, c: Bytes } = {
+  let k = from_table(em, l);
+  let eq = bind(k.em, KBool, bytes_concat_all([b"(", subj.c, b" != 0 && rt_equal_p(ctx, ", subj.c, b", ", k.v.c, b"))"]));
+  { em: check(eq.em), c: eq.v.c }
+}
+
 // A variable pattern is irrefutable: the parser makes every upper-case bare name in pattern position a constructor.
 fn irrefutable(p: CPat) -> Bool =
   match p { PxWild -> true, PxVar(_) -> true, _ -> false }
@@ -2735,19 +2773,25 @@ fn pat_test(p: CPat, subj: V, em: Em) -> Option<{ em: Em, c: Bytes }> =
     PxWild -> Some({ em: em, c: b"1" }),
     PxVar(_) -> Some({ em: em, c: b"1" }),
     PxLit(l) -> match l {
-      LInt(n) -> Some({ em: em, c: bytes_concat_all([b"(ply_is_imm(", subj.c, b") ? ply_imm_value(", subj.c,
-                                        b") == ", int_lit(n), b" : 0)"]) }),
-      LFixed(_, bits) -> Some({ em: em, c: bytes_concat_all([b"(ply_is_imm(", subj.c, b") ? ply_imm_value(", subj.c,
-                                        b") == ", int_lit(bits), b" : 0)"]) }),
+      LInt(n) -> Some({ em: em, c: int_test(subj.c, n) }),
+      // At 64 bits a width is the runtime's own object, not an immediate.
+      LFixed(name, bits) -> match width_named(name) {
+        None -> None,
+        Some(w) -> if carried(w) { Some({ em: em, c: int_test(subj.c, bits) }) } else { Some(equal_test(em, l, subj)) },
+      },
       LBool(b) -> Some({ em: em, c: bytes_concat_all([b"(", subj.c, b" == ", if b { b"ply_true" } else { b"ply_false" }, b")"]) }),
-      _ -> None,
+      // `()` is the only value of its type.
+      LUnit -> Some({ em: em, c: b"1" }),
+      LBad -> None,
+      _ -> Some(equal_test(em, l, subj)),
     },
     // A constructor tests its tag and width over an object; an argument with its own test is read into a local under the test so far.
+    // A nested subject is zero when an enclosing test failed, and its header must not be read then.
     PxCtor(c) -> match tag_of(em, c.name) {
       None -> None,
       Some(tag) -> {
         let head = bytes_concat_all([
-          b"(!ply_is_imm(", subj.c, b") && ply_obj(", subj.c, b")->kind == 4 && ply_obj(",
+          b"(", subj.c, b" != 0 && !ply_is_imm(", subj.c, b") && ply_obj(", subj.c, b")->kind == 4 && ply_obj(",
           subj.c, b")->layout == ", num(tag), b" && ply_obj(", subj.c, b")->len == ",
           num(len(c.args)), b")"]);
         fold(range(0, len(c.args)), Some({ em: em, c: head }),
@@ -3298,8 +3342,8 @@ fn encode_tables(em: Em, owner: Bytes) -> Bytes =
         None -> b"u",
       },
       // As written: the driver converts the text by the lexer's own rule.
-      LFloat(x) -> bytes_concat(b"X ", x),
-      LDec(x) -> bytes_concat(b"D ", x),
+      LFloat(x) -> bytes_concat(b"X ", unspaced(x)),
+      LDec(x) -> bytes_concat(b"D ", unspaced(x)),
       _ -> b"u",
     })),
     counted(b"builtins", em.met),
@@ -3310,6 +3354,11 @@ fn encode_tables(em: Em, owner: Bytes) -> Bytes =
     counted(b"calls", em.calls),
     counted(b"performs", em.performs),
     counted(b"handles", em.handles)])
+
+// A negative pattern literal's text runs from its `-`, across any space written after it.
+fn unspaced(s: Bytes) -> Bytes =
+  bytes_concat_all(map(range(0, bytes_len(s)), |i: Int|
+    if bytes_at(s, i) <= 32 { b"" } else { bytes_slice(s, i, i + 1) }))
 
 fn counted(what: Bytes, xs: List<Bytes>) -> Bytes =
   fold(xs, bytes_concat_all([what, b" ", num(len(xs)), b"\n"]),
@@ -3340,6 +3389,11 @@ test "a body that answers a literal" {
 test "a form this port does not reach is refused" {
   assert_eq(match emit_fn(b"m", [], [], [], [], b"m_f", [], { own: Borrowed, span: dummy_span(), node: NLit(LBad) }) {
     Some(_) -> false, None -> true }, true)
+}
+
+test "guarded arms and every literal pattern are emitted rather than refused" {
+  let src = b"fn f(n: Int, m: Int) -> Int = match n { x if x > m -> x, 0 -> 1, x if x < 0 - m -> m, _ -> m }\nfn g(s: String) -> Int = match s { t if t == \"a\" -> 1, \"b\" -> 2, _ -> 3 }\nfn h(u: Unit, b: Bytes, f: Float, d: Decimal, w: U64, n: Int) -> Int = match u { () -> match b { b\"x\" -> 1, _ -> match f { -1.5 -> 2, _ -> match d { 2.50m -> 3, _ -> match w { 7u64 -> 4, _ -> match n { 4611686018427387904 -> 5, _ -> 6 } } } } } }\n";
+  assert_eq(map(emit_all_in(b"m", [], [], src, true), |e: Emitted| e.why), [None, None, None])
 }
 
 // --- the emitter's entry ----------------------------------------------------
@@ -3635,7 +3689,8 @@ fn walk_handles(c: Code, effects: List<EffectName>) -> List<Bytes> = {
     NList(l) -> fold(l.items, [], here),
     NRecord(r) -> fold(r.fields, [], |acc: List<Bytes>, f: CField| here(acc, f.value)),
     NUpd(u) -> fold(u.sets, walk_handles(u.base, effects), |acc: List<Bytes>, f: CField| here(acc, f.value)),
-    NMatch(m) -> fold(m.arms, walk_handles(m.scrutinee, effects), |acc: List<Bytes>, a: CArm| here(acc, a.body)),
+    NMatch(m) -> fold(m.arms, walk_handles(m.scrutinee, effects), |acc: List<Bytes>, a: CArm|
+      here(match a.guard { Some(g) -> here(acc, g), None -> acc }, a.body)),
     NPerform(p) -> fold(p.args, [], here),
     NCell(c2) -> here(walk_handles(c2.init, effects), c2.body),
     NRegion(r) -> walk_handles(r.body, effects),

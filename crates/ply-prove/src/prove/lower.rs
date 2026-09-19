@@ -822,7 +822,12 @@ impl<'a, 'p> Lowering<'a, 'p> {
         let mut result_sort = None;
 
         for arm in arms {
-            let (test, binds) = match self.arm_shape(&arm.pat, scrutinee, scrutinee_sort.as_ref()) {
+            // What a guard admits is not modelled, so a guarded arm is never known to be taken.
+            let shape = match arm.guard {
+                Some(_) => None,
+                None => self.arm_shape(&arm.pat, scrutinee, scrutinee_sort.as_ref()),
+            };
+            let (test, binds) = match shape {
                 Some(shape) => shape,
                 None => {
                     self.blocked(Blocker::UndecidableMatchArm);
@@ -830,6 +835,9 @@ impl<'a, 'p> Lowering<'a, 'p> {
                     (ArmTest::Undecidable, Vec::new())
                 }
             };
+            if let Some(guard) = &arm.guard {
+                self.lower(guard);
+            }
             let body = self.lower(&arm.body);
             if result_sort.is_none() {
                 result_sort = self.terms.sort(body).cloned();
