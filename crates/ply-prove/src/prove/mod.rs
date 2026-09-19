@@ -197,7 +197,8 @@ pub fn decide_and_diagnose(
     budget = left;
 
     if let Some(reason) = inconclusive(answer) {
-        if let Some(proof) = induct::attempt(ctx, goal, limits, budget, spent, &blockers) {
+        let mut blockers = blockers;
+        if let Some(proof) = induct::attempt(ctx, goal, limits, budget, spent, &mut blockers) {
             return (Decision::Proved(proof), blockers);
         }
         return (

@@ -81,6 +81,8 @@ pub enum Blocker {
     Region,
     UndecidableMatchArm,
     DestructuringLet,
+    /// Why induction declined: which definition or case, in words.
+    Induction(String),
 }
 
 /// A non-`Int` numeric operand type.
