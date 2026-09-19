@@ -7,6 +7,8 @@ compiles to C.
 
 [`docs/GUIDE.md`](docs/GUIDE.md) is the language manual: syntax, types, effects,
 tests, the standard library, the `ply` command and the diagnostic codes.
+[`docs/DIRECTION.md`](docs/DIRECTION.md) is what the language is for and what that asks
+of it next.
 
 ## Layout
 
