@@ -67,7 +67,7 @@ pub fn install_sources(src: Sources) {
         return;
     }
     let identity = identity_of(&src);
-    let _ = EMITTER.set(emitter_of(&src, &identity));
+    let _ = EMITTER.set(emitter_of(&identity));
     install(Arc::new(move || build(&src)), identity);
 }
 
@@ -76,19 +76,12 @@ pub fn identity_of(src: &Sources) -> String {
     digest_of(&modules_of(src))
 }
 
-/// A working copy is served by its own bundle, or by the committed one as is or emitting it.
-fn emitter_of(src: &Sources, identity: &str) -> String {
+/// What the emitter's answers are a function of: the runtime's helper table and the sources it
+/// was built from; a stage emitted for those sources answers as the fixpoint of them would.
+fn emitter_of(identity: &str) -> String {
     let mut h = blake3::Hasher::new();
     h.update(super::exports::helpers_digest().as_bytes());
-    if let Some(carried) = super::bundle::of(&Sources::Embedded) {
-        h.update(carried.unit());
-    }
-    if let Sources::Directory(_) = src {
-        h.update(identity.as_bytes());
-        if let Some(own) = super::bundle::of(src) {
-            h.update(own.unit());
-        }
-    }
+    h.update(identity.as_bytes());
     h.finalize().to_hex().to_string()
 }
 
@@ -126,67 +119,75 @@ fn modules_of(src: &Sources) -> Vec<(String, String)> {
     modules
 }
 
-/// Build the emitter from its sources' own bundle, or else have the embedded emitter emit them.
+/// The emitter for `src`: the committed bundle when it was emitted from these very sources, else
+/// the stage kept for them by an earlier process, else the committed emitter emitting them now.
+/// A binary whose bundle is behind its sources therefore runs the sources, never the bundle.
 pub fn build(src: &Sources) -> Result<PlyProducer, String> {
-    let from_committed = || -> Result<(super::Native, Vec<super::Refused>), String> {
-        let carried = super::bundle::of(&Sources::Embedded)
-            .ok_or_else(|| "this binary carries no bootstrap bundle".to_string())?;
-        let (native, refused) = super::bundle::build(&carried).map_err(|e| {
-            format!(
-                "the committed bundle does not serve this runtime either: {e:#}. Check out an \
-                 older bundle this runtime serves from git history, then refresh it with \
-                 `PLY_C_BOOTSTRAP_REFRESH=1 cargo nextest run -p ply-codegen-tests --test bootstrap`"
-            )
-        })?;
-        // Sources identical to the bundle's emit that same unit (the fixpoint), so skip the work.
-        let theirs = identity_of(src);
-        if carried.sources_digest() == Some(theirs.as_str()) {
-            return Ok((native, refused));
+    let identity = identity_of(src);
+    let carried = super::bundle::embedded();
+    let (native, _refused) = if carried.sources_digest() == Some(identity.as_str()) {
+        super::bundle::build(&carried).map_err(|e| format!("{e:#}"))?
+    } else {
+        let staged = super::bundle::from_dir(&super::bundle::stage_dir(&identity))
+            .and_then(|stage| super::bundle::build(&stage).ok());
+        match staged {
+            Some(built) => built,
+            None => emit_stage(src, &identity)?,
         }
-        let first = PlyProducer::new(native).map_err(|e| format!("{e:#}"))?;
-        let identity = identity_of(&Sources::Embedded);
-        with_producer(first, identity, || {
-            let source = front_end(src)?;
-            let names: Vec<String> = source.functions();
-            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            let (native, refused) = super::build(source, &refs).map_err(|e| format!("{e:#}"))?;
-            // Say whether the entry was never offered or was refused; `PlyProducer::new` would not.
-            if native.entry(ENTRY).is_none() {
-                let head: Vec<String> = refused.iter().take(5).map(|r| r.to_string()).collect();
-                return Err(format!(
-                    "the committed emitter emitted no `{ENTRY}`: {} roots offered, `{ENTRY}` \
-                     {} among them, {} refused in all{}",
-                    names.len(),
-                    if names.iter().any(|n| n == ENTRY) {
-                        "was"
-                    } else {
-                        "was NOT"
-                    },
-                    refused.len(),
-                    if head.is_empty() {
-                        String::new()
-                    } else {
-                        format!("; first refusals: {}", head.join(" | "))
-                    },
-                ));
-            }
-            Ok((native, refused))
-        })
-    };
-    let (native, _refused) = match super::bundle::of(src) {
-        Some(bundle) => match super::bundle::build(&bundle) {
-            Ok(built) => built,
-            Err(e) if e.downcast_ref::<super::exports::Unserved>().is_some() => {
-                eprintln!(
-                    "the bootstrap bundle does not serve: {e:#}; the committed emitter builds it"
-                );
-                from_committed()?
-            }
-            Err(e) => return Err(format!("{e:#}")),
-        },
-        None => from_committed()?,
     };
     PlyProducer::new(native).map_err(|e| format!("{e:#}"))
+}
+
+/// The committed emitter emitting `src`, written as the stage for `identity` so no later process
+/// repeats the work.
+fn emit_stage(
+    src: &Sources,
+    identity: &str,
+) -> Result<(super::Native, Vec<super::Refused>), String> {
+    let (native, _) = super::bundle::build(&super::bundle::embedded()).map_err(|e| {
+        format!(
+            "the committed bundle does not serve this runtime: {e:#}. Check out an older bundle \
+             this runtime serves from git history, then refresh it with \
+             `PLY_C_BOOTSTRAP_REFRESH=1 cargo nextest run -p ply-codegen-tests --test bootstrap`"
+        )
+    })?;
+    let first = PlyProducer::new(native).map_err(|e| format!("{e:#}"))?;
+    with_producer(first, identity_of(&Sources::Embedded), || {
+        let source = front_end(src)?;
+        let names: Vec<String> = source.functions();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let produced = super::produce(source, &refs).map_err(|e| format!("{e:#}"))?;
+        // Say whether the entry was never offered or was refused; `PlyProducer::new` would not.
+        if !produced.exports.names().iter().any(|n| n == ENTRY) {
+            let head: Vec<String> = produced
+                .refused
+                .iter()
+                .take(5)
+                .map(|r| r.to_string())
+                .collect();
+            return Err(format!(
+                "the committed emitter emitted no `{ENTRY}`: {} roots offered, `{ENTRY}` {} among \
+                 them, {} refused in all{}",
+                names.len(),
+                if names.iter().any(|n| n == ENTRY) {
+                    "was"
+                } else {
+                    "was NOT"
+                },
+                produced.refused.len(),
+                if head.is_empty() {
+                    String::new()
+                } else {
+                    format!("; first refusals: {}", head.join(" | "))
+                },
+            ));
+        }
+        let dir = super::bundle::stage_dir(identity);
+        super::bundle::write(&dir, &produced.text, identity).map_err(|e| format!("{e:#}"))?;
+        let stage =
+            super::bundle::from_dir(&dir).ok_or_else(|| "the stage was not written".to_string())?;
+        super::bundle::build(&stage).map_err(|e| format!("{e:#}"))
+    })
 }
 
 /// The emitter's own program through the front end, modules as `SourceId(0..n)` in `modules_of`'s
