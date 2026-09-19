@@ -89,14 +89,19 @@ impl Warm {
         self.held = Some(loaded);
     }
 
-    /// The unit the last iteration compiled, if this iteration would compile the same one.
+    /// The unit the last iteration compiled, placed at `front`'s layout, if this iteration would
+    /// compile the same one.
     pub fn unit_for(
         &self,
         spec: &ply_eval::BackendSpec,
-        hashes: &HashOutput,
+        front: &ply_ty::Front,
+        sources: &ply_span::SourceMap,
     ) -> Option<&'static dyn ply_eval::Provider> {
         let held = self.unit.as_ref()?;
-        (held.spec == *spec && held.key == hashes.digest()).then_some(held.provider)
+        (held.spec == *spec
+            && held.key == front.hashes.digest()
+            && held.provider.relocate(front, sources))
+        .then_some(held.provider)
     }
 
     pub fn keep_unit(

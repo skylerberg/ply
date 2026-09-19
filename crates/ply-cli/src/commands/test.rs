@@ -163,8 +163,8 @@ fn iterate(
     let schema_named =
         args.config.schema.is_some() || db.as_ref().is_some_and(|c| c.schema.is_some());
     let wanted = backend.as_ref().filter(|_| !nothing_to_run || schema_named);
-    // The last iteration's unit, when every definition is unchanged.
-    let held_unit = wanted.and_then(|spec| warm.unit_for(spec, &hashes));
+    // The last iteration's unit, moved to this layout, when no definition's text changed.
+    let held_unit = wanted.and_then(|spec| warm.unit_for(spec, &loaded.front, &loaded.sources));
     let unit = match wanted.filter(|_| held_unit.is_none()).map(|spec| {
         build_backend_over(
             spec,

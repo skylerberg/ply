@@ -1,5 +1,5 @@
 use ply_cli::cli::{TestArgs, When};
-use ply_cli::commands::common::{exit_code, run_on_tier};
+use ply_cli::commands::common::{backend_spec, exit_code, run_on_tier};
 use ply_cli::commands::test::*;
 use ply_cli::hosts::Hosts;
 use ply_cli::load::{Loaded, load};
@@ -175,6 +175,65 @@ fn a_finished_run_holds_what_it_loaded() {
         .as_ref()
         .expect("a finished run holds what it loaded");
     assert!(loaded.check.tests.iter().any(|t| t.name == "f is one"));
+}
+
+/// The hashes do not cover layout, so `--watch` keeps the unit across a save that moves a test,
+/// and the unit has to report the failure where the test now is.
+#[test]
+fn a_held_unit_reports_a_failure_where_its_moved_test_now_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = TestArgs {
+        path: dir.path().to_path_buf(),
+        ..args_for(None)
+    };
+    let spec = backend_spec(None).unwrap().expect("a default tier");
+    let mut warm = ply_cli::warm::Warm::default();
+    let mut save_and_run = |text: &str| {
+        write(dir.path(), "m.ply", text);
+        assert_eq!(
+            execute_holding(&args, Style::plain(), &mut warm),
+            ply_cli::EXIT_FAILED
+        );
+        let loaded = warm
+            .held
+            .as_ref()
+            .expect("a finished run holds what it loaded");
+        let unit = warm
+            .unit_for(&spec, &loaded.front, &loaded.sources)
+            .expect("a finished run holds the unit it ran on");
+        let mut machine = ply_eval::Machine::new(&loaded.front);
+        machine.set_compiled(unit.attach(&spec));
+        let failure = machine
+            .eval_test(index_of(loaded, "wrong"))
+            .expect_err("the test fails");
+        // Not a refusal, whose span is the front's and would move with no unit at all.
+        assert_eq!(failure.code, codes::ASSERTION_FAILED);
+        let site = failure
+            .primary_span()
+            .expect("a compiled failure names its site");
+        let at = loaded
+            .sources
+            .get(site.source)
+            .unwrap()
+            .line_col(site.start);
+        (unit, at)
+    };
+
+    let (first, (line, column)) =
+        save_and_run("fn f() -> Int = 1\ntest \"wrong\" { assert_eq(f(), 2) }\n");
+    let (moved, at) =
+        save_and_run("fn f() -> Int = 1\n\n\n\ntest \"wrong\" { assert_eq(f(), 2) }\n");
+    assert!(
+        std::ptr::addr_eq(first, moved),
+        "only the layout moved, so the second run reused the unit"
+    );
+    assert_eq!((line, at), (2, (5, column)));
+
+    // A site is an offset into its test's own text, so an edit there is rebuilt rather than moved.
+    let (edited, at) =
+        save_and_run("fn f() -> Int = 1\n\n\n\ntest \"wrong\" {  assert_eq(f(), 2) }\n");
+    assert!(!std::ptr::addr_eq(moved, edited));
+    assert_eq!(at, (5, column + 1));
 }
 
 #[test]
