@@ -530,6 +530,7 @@ pub const MEANINGS: &[(&str, &str)] = &[
         "E0502",
         "runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit",
     ),
+    ("E0503", "ran past its time budget"),
     ("E0505", "Ply broke one of its own invariants"),
     ("W0601", "cache unreadable"),
     ("W0602", "cache corrupt"),
