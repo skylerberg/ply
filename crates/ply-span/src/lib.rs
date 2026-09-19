@@ -211,6 +211,20 @@ pub struct Label {
     pub primary: bool,
 }
 
+/// One replacement a fix makes: `text` in place of `span`; an empty span inserts, empty text deletes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edit {
+    pub span: Span,
+    pub text: String,
+}
+
+/// A change that applies as it is and leaves a program the diagnostic no longer holds for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fix {
+    pub title: String,
+    pub edits: Vec<Edit>,
+}
+
 /// Stable diagnostic codes.
 pub mod codes {
     pub const UNEXPECTED_TOKEN: &str = "E0001";
@@ -386,6 +400,7 @@ pub struct Diagnostic {
     pub message: String,
     pub labels: Vec<Label>,
     pub notes: Vec<String>,
+    pub fixes: Vec<Fix>,
 }
 
 impl Diagnostic {
@@ -396,6 +411,7 @@ impl Diagnostic {
             message: message.into(),
             labels: Vec::new(),
             notes: Vec::new(),
+            fixes: Vec::new(),
         }
     }
 
@@ -420,6 +436,14 @@ impl Diagnostic {
             span,
             message: message.into(),
             primary: false,
+        });
+        self
+    }
+
+    pub fn fix(mut self, title: impl Into<String>, edits: Vec<Edit>) -> Self {
+        self.fixes.push(Fix {
+            title: title.into(),
+            edits,
         });
         self
     }

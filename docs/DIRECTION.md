@@ -24,7 +24,8 @@ A feature earns its place by one of these. Saving keystrokes does not count.
   and a `handle` over a function value is judged too.
 - Fewer rules around `?` and record update; where the shape is inferable, infer it.
 - `ply fmt`, from the printer `ply build` already has.
-- Structured fixes on diagnostics: a machine-applicable suggestion and candidates in the JSON.
+- Fixes on every diagnostic that has one: missing types (`E0126`), rows (`E0302`), match arms
+  (`E0205`), near-miss names (`E0101`), literal suffixes (`E0201`), named arguments (`E0123`).
 - `ply doc <name>` and `ply explain <code>`, from the tables the compiler uses, so the guide
   cannot drift from the compiler.
 - A program surface for agents: list callers, which tests reach a definition, replace a

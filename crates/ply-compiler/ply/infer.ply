@@ -26,7 +26,7 @@ import tycore (Resource, RNamed, RSingleton, Atom, Row, Type, TyVar, TyCon, TyFn
                env_lookup, env_depth_of, env_locals, instantiate_with, instantiate, rename_scheme,
                generalize, region_prefix, region_of, atom_text, resource_text, scheme_text, type_text, row_text,
                printer_new, print_ty, print_row)
-import resolve (Mod, Source, Resolved, Scope, Binding, ModBind, Declared, Entry, Diag, Label, Ns, NValue, NType, NEffect,
+import resolve (Mod, Source, Resolved, Scope, Binding, ModBind, Declared, Entry, Diag, Label, Edit, Fix, with_fix, insertion, Ns, NValue, NType, NEffect,
                 resolve_modules, Resolved_, Failed, Expanded, find, lookup, dlookup, space,
                 qualify, default_binder, dump_diags, diag, diag1, diag2, lab, is_bare,
                 is_ctor_name, backticked, ns_describe, private_name)
@@ -60,7 +60,7 @@ type Src = | SDirect(Bytes) | SVia(Bytes) | SArgs | SOpaque
 type PerformSite = { atom: Atom, module: Int, span: Span, source: Src }
 type OpKey = { effect: Bytes, op: Bytes, res: Resource }
 // A `handle` awaiting the whole program: the operations its body performs on the atoms it handles are judged once every definition is summarised.
-type PendingHandle = { module: Int, span: Span, handled: List<Atom>, covered: List<OpKey>, sites: List<PerformSite> }
+type PendingHandle = { module: Int, span: Span, after: Int, handled: List<Atom>, covered: List<OpKey>, sites: List<PerformSite> }
 type OpAtom = { atom: Atom, op: Bytes }
 // What a body performs on its atoms: the operations known, and the atoms reached through a function value.
 type Summary = { ops: List<OpAtom>, opaque: List<Atom> }
@@ -1122,7 +1122,7 @@ fn report_unify(cx: Cx, e: UnifyError, span: Span, context: Bytes) -> Cx =
 
 fn report_text(cx: Cx, code: Bytes, span: Span, text: Bytes, message: Bytes, label: Bytes, notes: List<Bytes>) -> Cx =
   report(cx, { code: code, notes: len(notes), labels: [lab(cx.module, span, true, label)], text: text,
-               message: message, notes_text: notes, severity: b"error" })
+               message: message, notes_text: notes, severity: b"error", fixes: [] })
 
 fn bits_text(op: Bytes) -> Bytes =
   if op == b"bitand" { b"&" } else if op == b"bitor" { b"|" } else if op == b"bitxor" { b"^" }
@@ -1893,7 +1893,7 @@ fn infer_handle(cx: Cx, span: Span, body: Expr, clauses: List<HandleClause>, ret
                 let res_text = match clause.resource { Some(r) -> bytes_concat_all([b"[", r.name, b"]"]), None -> b"" };
                 report(shape.cx, { code: b"E0105", notes: 1, labels: [lab(shape.cx.module, clause.span, true, b"this clause is unreachable")], text: b"",
                                    message: bytes_concat_all([b"`", hit.info.name, b".", hit.op.name, res_text, b"` is handled more than once"]),
-                                   notes_text: [b"the first matching clause wins at run time"], severity: b"warning" })
+                                   notes_text: [b"the first matching clause wins at run time"], severity: b"warning", fixes: [] })
               } else { shape.cx };
               let pushed: Cx = {..c0, env: env_push(c0.env)};
               let bound: Cx = fold(range(0, len(clause.params)), pushed, |c: Cx, i: Int| {..c, env: env_bind(c.env, at(clause.params, i).name, mono(at(shape.params, i)))});
@@ -1924,7 +1924,8 @@ fn infer_handle(cx: Cx, span: Span, body: Expr, clauses: List<HandleClause>, ret
     }
   });
   let sites = filter(drop(walked.cx.performs, mark), |s: PerformSite| atoms_contains(walked.handled, s.atom));
-  let pending: PendingHandle = { module: walked.cx.module, span: span, handled: walked.handled, covered: walked.selected, sites: sites };
+  let after = fold(clauses, span.start, |acc: Int, cl: HandleClause| max(acc, expr_span(cl.body).end));
+  let pending: PendingHandle = { module: walked.cx.module, span: span, after: after, handled: walked.handled, covered: walked.selected, sites: sites };
   let noted: Cx = if len(sites) == 0 { walked.cx } else { {..walked.cx, pending_handles: push(walked.cx.pending_handles, pending)} };
   let discharged: Cx = discharge(noted, mark, walked.handled);
   let returned = match ret {
@@ -3075,7 +3076,7 @@ fn attribute_generated(cx: Cx) -> Cx = {
         { code: b"E0505", notes: d.notes + 2, labels: d.labels, text: d.text, message: b"a derived definition does not typecheck",
           notes_text: push(push_front_bytes(bytes_concat(b"this is a compiler bug in the deriver: ", d.message), d.notes_text),
                            b"derivation is total, so a generated body that fails to check is Ply's fault rather than yours"),
-          severity: d.severity }
+          severity: d.severity, fixes: d.fixes }
       }
     })}
   }
@@ -3412,13 +3413,14 @@ fn site_of_op(sites: List<PerformSite>, o: OpAtom, of: Map<Bytes, Summary>) -> O
 fn op_atom_text(cx: Cx, o: OpAtom) -> Bytes =
   bytes_concat_all([as_written(cx, o.atom.effect), b".", o.op, resource_text(o.atom.resource)])
 
-// The clause the reader could paste for an operation, with its declared parameter count.
+// A clause for the operation that checks as it is and raises where the operation was skipped before.
 fn clause_for(cx: Cx, o: OpAtom) -> Bytes = {
   let params = match effect_of(cx, o.atom.effect) {
     Some(info) -> fold(info.ops, 0, |acc: Int, op: OpInfo| if op.name == o.op { len(op.params) } else { acc }),
     None -> 0,
   };
-  bytes_concat_all([op_atom_text(cx, o), b"(", join_with(map(range(0, params), |i: Int| bytes_concat(b"a", num(i))), b", "), b") -> <value>"])
+  bytes_concat_all([op_atom_text(cx, o), b"(", join_with(map(range(0, params), |i: Int| bytes_concat(b"a", num(i))), b", "),
+                    b") -> panic(\"", op_atom_text(cx, o), b" is not handled here\")"])
 }
 
 fn simple_name_of(name: Bytes) -> Bytes =
@@ -3448,11 +3450,14 @@ fn check_handles(cx: Cx) -> Cx = {
           None -> acc,
         });
       let handled = join_with(map(h.handled, |a: Atom| bytes_concat_all([b"`", atom_text(a), b"`"])), b", ");
-      let notes = map(missing, |o: OpAtom| bytes_concat_all([b"add a clause: `", clause_for(c, o), b"`"]));
-      let reported: Cx = err_labels(c, b"E0305",
+      let d = diag(b"E0305",
         bytes_concat_all([b"this `handle` has no clause for ", listed, b", which its body performs"]),
         push(labels, lab(h.module, h.span, false, bytes_concat_all([b"handles ", handled, b" here, so the operation would run past it"]))),
-        notes);
+        []);
+      let fixed = fold(missing, d, |acc: Diag, o: OpAtom|
+        with_fix(acc, bytes_concat_all([b"add a clause for `", op_atom_text(c, o), b"`"]),
+                 [insertion(h.module, h.after, bytes_concat(b", ", clause_for(c, o)))]));
+      let reported: Cx = report(c, fixed);
       {..reported, module: c0.module}
     }
   })
@@ -3610,11 +3615,17 @@ test "the missing clause is named as the module would write it" {
   let r = parse(net_src(b"fn f() -> Unit = handle { net.send[c](b\"x\"); net.close[c]() } with { net.recv[c](n) -> b\"\" }"));
   let x = expand(r.node, r.p.uses_sets, r.p.diags);
   let d: Expansion = expand_derives(0, x.module);
-  let messages = match resolve_modules([{ name: b"m", module: d.module, derived: d.derived }]) {
+  let diags = match resolve_modules([{ name: b"m", module: d.module, derived: d.derived }]) {
     Failed(_) -> [],
-    Resolved_(y) -> map(check_program(y.r, y.mods).cx.diags, |dg: Diag| dg.message),
+    Resolved_(y) -> check_program(y.r, y.mods).cx.diags,
   };
-  assert_eq(messages, [b"this `handle` has no clause for `net.send[c]` and `net.close[c]`, which its body performs"])
+  assert_eq(map(diags, |dg: Diag| dg.message), [b"this `handle` has no clause for `net.send[c]` and `net.close[c]`, which its body performs"]);
+  let fixes = fold(diags, [], |acc: List<Fix>, dg: Diag| append(acc, dg.fixes));
+  assert_eq(map(fixes, |f: Fix| f.title), [b"add a clause for `net.send[c]`", b"add a clause for `net.close[c]`"]);
+  assert_eq(map(fixes, |f: Fix| map(f.edits, |e: Edit| e.text)),
+            [[b", net.send[c](a0) -> panic(\"net.send[c] is not handled here\")"], [b", net.close[c]() -> panic(\"net.close[c] is not handled here\")"]]);
+  let src = net_src(b"fn f() -> Unit = handle { net.send[c](b\"x\"); net.close[c]() } with { net.recv[c](n) -> b\"\" }");
+  assert_eq(map(fixes, |f: Fix| map(f.edits, |e: Edit| bytes_slice(src, e.start - 1, e.end))), [[b"\""], [b"\""]])
 }
 
 test "a body that performs more than its signature permits is refused" {
