@@ -158,6 +158,7 @@ fn a_plan_digest_ignores_the_shrink_budget_and_root_spelling() {
     let base = ProvePlan::default();
     let looser = ProvePlan {
         shrink_budget: base.shrink_budget * 4,
+        time_budget_ms: ply_prove::DEFAULT_TIME_BUDGET_MS,
         ..base.clone()
     };
     assert_eq!(base.digest(), looser.digest());
