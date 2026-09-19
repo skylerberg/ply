@@ -439,6 +439,8 @@ pub struct Census {
     pub entries: usize,
     /// Modules handed to the front end, summed over its entries.
     pub modules: usize,
+    /// Modules handed to [`claims_dump`], summed over its entries.
+    pub claimed: usize,
     pub allocated: usize,
     pub recycled: usize,
     /// The most chunk bytes any one entry held at its end.
@@ -446,17 +448,23 @@ pub struct Census {
 }
 
 thread_local! {
-    static CENSUS: Cell<Census> = const { Cell::new(Census { entries: 0, modules: 0, allocated: 0, recycled: 0, chunk_bytes: 0 }) };
+    static CENSUS: Cell<Census> = const { Cell::new(Census { entries: 0, modules: 0, claimed: 0, allocated: 0, recycled: 0, chunk_bytes: 0 }) };
+}
+
+fn tally(f: impl FnOnce(&mut Census)) {
+    CENSUS.with(|c| {
+        let mut census = c.get();
+        f(&mut census);
+        c.set(census);
+    });
 }
 
 fn note_census(ctx: &crate::rt::Ctx) {
-    CENSUS.with(|c| {
-        let mut census = c.get();
+    tally(|census| {
         census.entries += 1;
         census.allocated += ctx.heap.allocated();
         census.recycled += ctx.heap.recycled();
         census.chunk_bytes = census.chunk_bytes.max(ctx.heap.chunk_bytes());
-        c.set(census);
     });
 }
 
@@ -488,11 +496,7 @@ pub fn front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
 
 /// The front end's raw answer, before [`read_front`].
 pub fn front_dump(sources: &[(String, String)]) -> Result<String> {
-    CENSUS.with(|c| {
-        let mut census = c.get();
-        census.modules += sources.len();
-        c.set(census);
-    });
+    tally(|census| census.modules += sources.len());
     dump_over(FRONT, sources)
 }
 
@@ -500,6 +504,7 @@ const CLAIMS: &str = "front.claims_dump";
 
 /// Every body, clause and law of a program [`front`] already checked, lowered.
 pub fn claims_dump(sources: &[(String, String)]) -> Result<String> {
+    tally(|census| census.claimed += sources.len());
     dump_over(CLAIMS, sources)
 }
 
@@ -581,11 +586,7 @@ pub fn front_pulling_std(
                 .to_string(),
         );
     }
-    CENSUS.with(|c| {
-        let mut census = c.get();
-        census.modules += user.len() + modules.len();
-        c.set(census);
-    });
+    tally(|census| census.modules += user.len() + modules.len());
     Ok(Pulled {
         modules,
         dump: answer[frames.at()..].to_string(),
