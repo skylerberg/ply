@@ -389,9 +389,19 @@ reuse fn grow(xs: List<Int>, n: Int) -> List<Int> = {
 
 ### 5.7 Iteration
 
-There is no `for`, `while` or `break`. Use recursion (at most 10,000 nested
-calls, then `E0502`), `map`/`filter`/`fold`/`range` (which do not nest calls),
-the byte scanners, or `iterate` for an early exit:
+There is no `for`, `while` or `break`. A call of the enclosing function in tail
+position runs as a loop: it does not nest, so it may run any number of times.
+Tail position is the body's own value, the tail of a block, an `if` or `match`
+arm, or the right operand of `&&`/`||`:
+
+```ply
+fn sum_to(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { sum_to(n - 1, acc + n) }
+```
+
+Every other call nests, at most 10,000 deep (then `E0502`): `1 + f(n - 1)`, a
+call inside `handle`, `with_cell` or a lambda, and a call of another function.
+`map`/`filter`/`fold`/`range` and the byte scanners do not nest calls, and
+`iterate` is a loop with an early exit and a step budget:
 
 ```ply
 fn first_gap(xs: List<Int>) -> Int =

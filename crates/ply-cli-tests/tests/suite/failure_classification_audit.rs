@@ -72,9 +72,10 @@ fn every_language_defined_runtime_failure_is_a_program_error(index: usize, of: u
             "recursion limit",
         ),
         (
-            "a tail-recursive runaway",
-            "fn spin(n: Int) -> Int = spin(n + 1)\n\
-             test \"spins in tail position\" { assert_eq(spin(0), 0) }\n",
+            "a runaway mutual recursion",
+            "fn spin(n: Int) -> Int = spun(n + 1)\n\
+             fn spun(n: Int) -> Int = spin(n + 1)\n\
+             test \"spins across two definitions\" { assert_eq(spin(0), 0) }\n",
             "recursion limit",
         ),
         (
@@ -183,7 +184,7 @@ fn a_failure_inside_a_handler_clause_body_is_still_the_programs() {
     for (needle, clause) in cases {
         let dir = project(&format!(
             "effect db {{ read all[t]() -> List<Int> }}\n\
-             fn spin(n: Int) -> Int = spin(n + 1)\n\
+             fn spin(n: Int) -> Int = 1 + spin(n + 1)\n\
              fn rows() -> List<Int> = db.all[users]()\n\
              test \"counts\" {{\n\
              \x20 handle {{ assert_eq(len(rows()), 2) }} with {{\n\
@@ -205,7 +206,7 @@ fn a_failure_inside_a_handler_clause_body_is_still_the_programs() {
 
 #[test]
 fn the_recursion_limit_is_a_program_error() {
-    const RUNAWAY: &str = "fn spin(n: Int) -> Int = spin(n + 1)\n\
+    const RUNAWAY: &str = "fn spin(n: Int) -> Int = 1 + spin(n + 1)\n\
                            test \"spins\" { assert_eq(spin(0), 0) }\n";
     let dir = project(RUNAWAY);
     let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
