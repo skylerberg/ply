@@ -51,6 +51,8 @@ pub enum Command {
     Hosts(HostsArgs),
     /// List the modules that ship with this compiler, and the digest over them.
     Std(StdArgs),
+    /// What a diagnostic code means; `--all` lists every code.
+    Explain(ExplainArgs),
     /// Print the content hash of every definition.
     Hash(HashArgs),
     /// Write the front end out as the C that builds it, with its digests.
@@ -622,6 +624,21 @@ pub struct StdArgs {
     /// Print each module's source instead of listing it.
     #[arg(long, value_name = "MODULE")]
     pub show: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ExplainArgs {
+    /// A code such as `E0302` or `W0611`.
+    #[arg(required_unless_present = "all")]
+    pub code: Option<String>,
+
+    /// List every code with its meaning.
+    #[arg(long)]
+    pub all: bool,
+
+    /// Emit one JSON object on stdout and nothing else.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]

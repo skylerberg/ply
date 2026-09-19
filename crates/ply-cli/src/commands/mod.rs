@@ -3,6 +3,7 @@ pub mod build;
 pub mod cache;
 pub mod check;
 pub mod common;
+pub mod explain;
 pub mod hash;
 pub mod hosts;
 pub mod prove;
