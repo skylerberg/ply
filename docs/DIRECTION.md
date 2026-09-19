@@ -33,8 +33,8 @@ A feature earns its place by one of these. Saving keystrokes does not count.
 - A shared result cache, so parallel agents and CI never repeat each other.
 - The compiler's own loop: stage-1 emission cached by source digest and incremental per
   definition; the bundle refreshed by CI, not by hand.
-- Reach: `net.connect` and an HTTP client; libraries usable against more than one resource
-  label; packages with dependencies pinned by content hash.
+- Reach: an HTTP client over `net.connect`, and a TLS `connect`; libraries usable against more
+  than one resource label; packages with dependencies pinned by content hash.
 
 ## Open
 

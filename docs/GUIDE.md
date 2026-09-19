@@ -844,6 +844,7 @@ prints a source, and a changed standard library warns `W0605`.
 pub nondet effect net {
   write listen[s](port: Int) -> Int
   write listen_tls[s](port: Int, credential: String) -> Int
+  write connect[s](host: String, port: Int, timeout_ms: Int) -> Option<Int>
   write accept[s](listener: Int) -> Int
   write recv[s](conn: Int, max: Int, timeout_ms: Int) -> Option<Bytes>
   write send[s](conn: Int, payload: Bytes, timeout_ms: Int) -> Option<Int>
@@ -855,6 +856,9 @@ pub fn send_all(c: Int, payload: Bytes, timeout_ms: Int) -> Bool / {net.write[co
 
 `None` is a deadline expiring; an empty `Some` is EOF; `timeout_ms <= 0` is a
 runtime error. `send` may write fewer bytes than given; `send_all` loops.
+`connect` resolves the host and tries each address until the deadline; `None`
+is a host not reached for any reason, and the connection it answers is used
+under the label it was opened under.
 
 ### 13.2 `std.http` — HTTP/1.1
 
