@@ -6,9 +6,10 @@ the runtime and the CLI.
 
 ## Prose
 
-- The only prose documents are `README.md`, `docs/GUIDE.md` and this file. Don't add others:
-  no design records, status files, reports, ledgers or notes. Git history and PR descriptions
-  hold the history.
+- Prose is `README.md`, `docs/`, and this file. A document earns its place by being read: it
+  says what a reader needs and nothing more, and it is deleted when it stops being true. No
+  status files, reports, ledgers or dated readings. Git history and PR descriptions hold the
+  history.
 - Comments: default to none. Write one only for a non-obvious why, an invariant the types don't
   enforce, or a trap, and keep it to one line. No history ("used to", "since #123"), no
   references to PRs or documents, no figures.
