@@ -355,7 +355,7 @@ impl<'a> Prover<'a> {
             return Discharge::Unattempted(Gap::UnhandledEffect(footprint));
         }
 
-        let mut cases = match self.cases(obligation, &claim) {
+        let mut cases = match self.cases(obligation, &claim, plan) {
             Ok(cases) => cases,
             Err(gap) => return Discharge::Unattempted(gap),
         };
@@ -401,7 +401,7 @@ impl<'a> Prover<'a> {
         let Some(hosting) = &self.hosting else {
             return Discharge::Unattempted(Gap::ReachesHost(obligation.footprint.clone()));
         };
-        let mut cases = match self.cases(obligation, claim) {
+        let mut cases = match self.cases(obligation, claim, plan) {
             Ok(cases) => cases,
             Err(gap) => return Discharge::Unattempted(gap),
         };
@@ -517,7 +517,7 @@ impl<'a> Prover<'a> {
         if let Some(footprint) = self.unhandled(obligation) {
             return Discharge::Unattempted(Gap::UnhandledEffect(footprint));
         }
-        let mut cases = match self.cases(obligation, &claim) {
+        let mut cases = match self.cases(obligation, &claim, plan) {
             Ok(cases) => cases,
             Err(gap) => return Discharge::Unattempted(gap),
         };
@@ -540,7 +540,12 @@ impl<'a> Prover<'a> {
         (!footprint.is_empty()).then(|| footprint.clone())
     }
 
-    fn cases(&self, obligation: &Obligation, claim: &Claim<'_>) -> Result<Cases<'a>, Gap> {
+    fn cases(
+        &self,
+        obligation: &Obligation,
+        claim: &Claim<'_>,
+        plan: &ProvePlan,
+    ) -> Result<Cases<'a>, Gap> {
         let call = match claim {
             Claim::Ensures { .. } => Some(obligation.owner.clone()),
             Claim::Law { .. } => None,
@@ -563,6 +568,7 @@ impl<'a> Prover<'a> {
             span: obligation.span,
             call,
             result,
+            time_budget_ms: plan.time_budget_ms,
         })
     }
 
@@ -646,7 +652,7 @@ impl<'a> Prover<'a> {
         claim: &Claim<'_>,
         plan: &ProvePlan,
     ) -> Discharge {
-        let mut cases = match self.cases(obligation, claim) {
+        let mut cases = match self.cases(obligation, claim, plan) {
             Ok(cases) => cases,
             Err(gap) => return Discharge::Unattempted(gap),
         };
@@ -803,13 +809,16 @@ struct Cases<'a> {
     /// The definition an `ensures` is attached to, called to produce `result`.
     call: Option<Symbol>,
     result: Option<Symbol>,
+    time_budget_ms: u64,
 }
 
 impl Cases<'_> {
     /// The proposition entered on the tier, the only evaluator a proposition has.
     fn on_tier(&self, root: &Symbol, args: &[Value]) -> Result<Value, Diagnostic> {
         let entered = match &self.compiled {
-            Some(compiled) => compiled.enter_whole(root, args, DEFAULT_MAX_CALLS),
+            Some(compiled) => ply_codegen::rt::with_time_budget(self.time_budget_ms, || {
+                compiled.enter_whole(root, args, DEFAULT_MAX_CALLS)
+            }),
             None => ply_eval::Entered::Declined,
         };
         match entered {

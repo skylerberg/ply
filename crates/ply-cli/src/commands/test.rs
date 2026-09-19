@@ -224,6 +224,7 @@ fn iterate(
     let hosts = hosts;
     let provider = unit.filter(|_| !nothing_to_run);
 
+    ply_codegen::rt::set_time_budget(args.timeout);
     let (pool, workers) = build_pool(args.jobs, &mut warnings);
     let simulation =
         ply_test::Search::of(&plan.selection).measuring(args.simulation.measure_reduction);
