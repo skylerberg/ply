@@ -40,6 +40,7 @@ pub fn execute(cli: Cli) -> i32 {
         Command::Build(args) => commands::build::execute(args, style),
         Command::Hosts(args) => commands::hosts::execute(args, style),
         Command::Std(args) => commands::stdlib::execute(args, style),
+        Command::Explain(args) => commands::explain::execute(args, style),
         Command::Hash(args) => commands::hash::execute(args, style),
         Command::Bootstrap(args) => commands::bootstrap::execute(args, style),
         Command::Cache(args) => match &args.action {
