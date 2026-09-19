@@ -275,6 +275,8 @@ pub mod codes {
     pub const EFFECT_NOT_PERMITTED: &str = "E0302";
     pub const UNHANDLED_EFFECT: &str = "E0303";
     pub const RESOURCE_REQUIRED: &str = "E0304";
+    /// A `handle` whose body performs an operation, on an atom it handles, that no clause answers.
+    pub const HANDLER_CLAUSE_MISSING: &str = "E0305";
     pub const NONDET_IN_DET_TEST: &str = "E0412";
     /// A `Task` in a `simulate` region's result, or a `join` after its region ended.
     pub const TASK_ESCAPES_SCOPE: &str = "E0413";
@@ -530,6 +532,11 @@ mod tests {
             ("EFFECT_NOT_PERMITTED", codes::EFFECT_NOT_PERMITTED, "E0302"),
             ("UNHANDLED_EFFECT", codes::UNHANDLED_EFFECT, "E0303"),
             ("RESOURCE_REQUIRED", codes::RESOURCE_REQUIRED, "E0304"),
+            (
+                "HANDLER_CLAUSE_MISSING",
+                codes::HANDLER_CLAUSE_MISSING,
+                "E0305",
+            ),
             ("NONDET_IN_DET_TEST", codes::NONDET_IN_DET_TEST, "E0412"),
             ("TASK_ESCAPES_SCOPE", codes::TASK_ESCAPES_SCOPE, "E0413"),
             ("DEADLOCK", codes::DEADLOCK, "E0414"),
