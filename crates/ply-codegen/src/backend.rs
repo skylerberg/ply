@@ -229,6 +229,10 @@ impl Provider for Unit {
     fn unbuilt(&self) -> u64 {
         self.poisoned()
     }
+
+    fn relocate(&self, front: &ply_ty::Front, sources: &ply_span::SourceMap) -> bool {
+        self.source.relocate(front, sources)
+    }
 }
 
 /// A worker whose compile failed: it declines everything and is counted.
