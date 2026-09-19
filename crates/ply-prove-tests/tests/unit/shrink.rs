@@ -30,6 +30,7 @@ fn plan() -> ProvePlan {
         roots: vec![0],
         prove_budget: 10,
         shrink_budget: DEFAULT_SHRINK_BUDGET,
+        time_budget_ms: ply_prove::DEFAULT_TIME_BUDGET_MS,
         sim: Default::default(),
     }
 }
