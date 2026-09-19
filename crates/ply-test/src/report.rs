@@ -6,7 +6,7 @@ use crate::sim::SimSummary;
 use crate::slice::{Assertion, CausalSlice};
 use crate::{Attribution, Failure, Reason, RunReport, Selection, Status, Suspect, TestResult};
 use ply_eval::{Exploration, Race, RaceSite};
-use ply_hash::HashOutput;
+use ply_ty::HashOutput;
 use ply_ty::{CheckOutput, Footprint};
 use serde_json::{Value, json};
 use std::time::Duration;

@@ -22,7 +22,7 @@ struct Cli {
 enum Command {
     /// Write a synthetic project, then compile and run it to prove it is real.
     Gen(GenArgs),
-    /// Time parse, typecheck, hash, cache lookup and execution over a corpus.
+    /// Time discovery, cache lookup, selection, compilation and execution over a corpus.
     Bench(BenchArgs),
     /// Generate and benchmark at several sizes, for one comparison table.
     Sweep(SweepArgs),

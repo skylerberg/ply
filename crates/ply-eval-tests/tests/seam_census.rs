@@ -1,6 +1,6 @@
 use ply_eval::{Fixture, Machine};
 use ply_span::{SourceId, Symbol};
-use ply_syntax::ast::ModuleName;
+use ply_ty::ModuleName;
 use ply_ty::{DefHash, Front};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};

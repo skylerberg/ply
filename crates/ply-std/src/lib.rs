@@ -1,7 +1,7 @@
 //! The modules that ship with the compiler.
 
 use ply_span::{Diagnostic, Span, codes};
-use ply_syntax::ast::ModuleName;
+use ply_ty::ModuleName;
 use std::path::{Path, PathBuf};
 
 /// The reserved first segment.
@@ -203,31 +203,5 @@ mod tests {
             moved.update(blake3::hash(format!("{source}\n").as_bytes()).as_bytes());
         }
         assert_ne!(digest(), *moved.finalize().as_bytes());
-    }
-
-    #[test]
-    fn every_shipped_module_parses() {
-        for (i, (name, source)) in MODULES.iter().enumerate() {
-            let module = ModuleName::from_dotted(name);
-            ply_syntax::parse_module(ply_span::SourceId(i as u32), module, source)
-                .unwrap_or_else(|d| panic!("`{name}` does not parse: {d:?}"));
-        }
-    }
-
-    /// Duplicates the loader's check so a bad edit fails this crate's own suite.
-    #[test]
-    fn no_shipped_module_imports_outside_std() {
-        for (i, (name, source)) in MODULES.iter().enumerate() {
-            let module = ModuleName::from_dotted(name);
-            let parsed = ply_syntax::parse_module(ply_span::SourceId(i as u32), module, source)
-                .expect("it parses");
-            for import in &parsed.imports {
-                let imported = import.module_name();
-                assert!(
-                    is_std(&imported),
-                    "`{name}` imports `{imported}`, which is not under `{ROOT}`"
-                );
-            }
-        }
     }
 }

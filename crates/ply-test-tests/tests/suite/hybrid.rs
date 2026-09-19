@@ -1,16 +1,13 @@
 use ply_eval::Provider;
-use ply_hash::HashOutput;
-use ply_hash::body::BodySet;
 use ply_span::{SourceId, Symbol};
+use ply_store::body::{BodySet, of_front};
 use ply_store::{CachedDef, Outcome, PassRecord, Store};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::Resolved;
 use ply_test::bisect::{
     Baseline, Budget, Confidence, DepEdges, Regression, Rehashed, Skipped, StoreClassify, Verdict,
     bisect, diff,
 };
 use ply_test::{BodyHybrid, Signature, hybrid};
-use ply_ty::CheckOutput;
+use ply_ty::{CheckOutput, HashOutput, ModuleName};
 use std::collections::BTreeMap;
 
 fn sym(s: &str) -> Symbol {
@@ -18,8 +15,6 @@ fn sym(s: &str) -> Symbol {
 }
 
 struct Compiled {
-    program: Program,
-    resolved: Resolved,
     port: ply_ty::Front,
     check: CheckOutput,
     hashes: HashOutput,
@@ -29,38 +24,20 @@ struct Compiled {
 
 impl Compiled {
     fn new(src: &str) -> Compiled {
-        let inputs = [(SourceId(0), ModuleName::from_dotted("m"), src)];
-        let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
-        let resolved = ply_syntax::resolve(&mut program)
-            .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
         let port = crate::fixture::port_front(
             &[(ModuleName::from_dotted("m").to_string(), src.to_string())],
             &[SourceId(0)],
         );
-        let (hashes, bodies) = ply_hash::hash_program_with_bodies(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must hash: {d:#?}"));
         Compiled {
-            program,
-            resolved,
             check: port.check.clone(),
+            hashes: port.hashes.clone(),
+            bodies: of_front(&port),
             port,
-            hashes,
-            bodies,
             texts: std::collections::HashMap::from([(
                 ModuleName::from_dotted("m").to_string(),
                 src.to_string(),
             )]),
         }
-    }
-
-    fn front(&self) -> ply_ty::Front {
-        ply_codegen::source::front_of(
-            &self.program,
-            &self.resolved,
-            &self.check,
-            self.hashes.clone(),
-            Some(&self.bodies),
-        )
     }
 
     fn sources(&self) -> Vec<(String, String)> {
@@ -415,7 +392,7 @@ test "doubles" { assert_eq(scale(2) + other(0), 5) }
     ply_test::diagnose_failures(
         &mut report,
         &after.sources(),
-        &after.front(),
+        &after.port,
         &mut store,
         &ply_test::Options::default(),
     );

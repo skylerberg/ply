@@ -3,7 +3,7 @@ use ply_cli::driver;
 use ply_cli::load::{Loaded, load};
 use ply_span::{Symbol, codes};
 use ply_store::{ContentHash, DefEntry, Store};
-use ply_syntax::ast::ModuleName;
+use ply_ty::ModuleName;
 use std::path::Path;
 use std::process::Command;
 
@@ -270,7 +270,7 @@ fn an_upgrade_that_moved_a_definition_invalidates_exactly_its_dependents() {
         if entry.name == drain {
             let mut bytes = entry.hash.0;
             bytes[0] ^= 0xff;
-            entry.hash = ply_hash::DefHash(bytes);
+            entry.hash = ply_ty::DefHash(bytes);
             aged = true;
         }
     });

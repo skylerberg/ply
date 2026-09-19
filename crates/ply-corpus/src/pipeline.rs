@@ -1,11 +1,8 @@
 //! One pass of the compiler over a directory, with a stopwatch between phases.
 
 use anyhow::{Context, Result, bail};
-use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceMap};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
-use ply_ty::CheckOutput;
+use ply_ty::{CheckOutput, HashOutput, ModuleName};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -13,8 +10,6 @@ use std::time::{Duration, Instant};
 pub enum Phase {
     Discover,
     Read,
-    Parse,
-    Resolve,
     CacheOpen,
     Select,
     /// Building the run's compiled unit (nothing without a backend); an edit does not shrink it.
@@ -27,8 +22,6 @@ impl Phase {
         match self {
             Phase::Discover => "discover",
             Phase::Read => "read",
-            Phase::Parse => "parse",
-            Phase::Resolve => "resolve",
             Phase::Compile => "compile",
             Phase::CacheOpen => "cache open",
             Phase::Select => "select",
@@ -36,12 +29,10 @@ impl Phase {
         }
     }
 
-    pub fn all() -> [Phase; 8] {
+    pub fn all() -> [Phase; 6] {
         [
             Phase::Discover,
             Phase::Read,
-            Phase::Parse,
-            Phase::Resolve,
             Phase::CacheOpen,
             Phase::Select,
             Phase::Compile,
@@ -86,8 +77,6 @@ pub struct Front {
     pub root: PathBuf,
     pub files: Vec<PathBuf>,
     pub sources: SourceMap,
-    pub program: Program,
-    pub resolved: Resolved,
     pub check: CheckOutput,
     pub hashes: HashOutput,
     /// The port's whole answer; `check` and `hashes` above are taken from it.
@@ -125,19 +114,6 @@ pub fn front(root: &Path) -> Result<Front> {
     }
     timings.record(Phase::Read, started.elapsed());
 
-    let started = Instant::now();
-    let inputs: Vec<_> = ids
-        .iter()
-        .zip(&names)
-        .map(|(&id, name)| (id, name.clone(), sources.get(id).map_or("", |f| &*f.text)))
-        .collect();
-    let mut program = ply_syntax::parse_program(inputs).map_err(|d| report(&d))?;
-    timings.record(Phase::Parse, started.elapsed());
-
-    let started = Instant::now();
-    let resolved = resolve(&mut program).map_err(|d| report(&d))?;
-    timings.record(Phase::Resolve, started.elapsed());
-
     // Outside the clock: this harness times only the phases it runs itself.
     let ordered: Vec<(String, String)> = ids
         .iter()
@@ -157,8 +133,6 @@ pub fn front(root: &Path) -> Result<Front> {
         root: root.to_path_buf(),
         files,
         sources,
-        program,
-        resolved,
         check: port.check.clone(),
         hashes: port.hashes.clone(),
         port,

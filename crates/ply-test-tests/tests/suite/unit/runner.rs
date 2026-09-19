@@ -1,5 +1,4 @@
 use ply_eval::Plan;
-use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId, Symbol};
 use ply_store::{Outcome, Store};
 use ply_test::{
@@ -7,7 +6,7 @@ use ply_test::{
     group_by_conflict, run_with, select,
 };
 use ply_ty::Mode;
-use ply_ty::{CheckOutput, EffectAtom, Footprint, Resource};
+use ply_ty::{CheckOutput, DefHash, EffectAtom, Footprint, HashOutput, Resource};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,7 +38,6 @@ impl Drop for TempRoot {
 }
 
 struct Program {
-    program: ply_syntax::ast::Program,
     port: ply_ty::Front,
     check: CheckOutput,
     hashes: HashOutput,
@@ -48,28 +46,17 @@ struct Program {
 
 impl Program {
     fn compile(src: &str) -> Program {
-        let module = ply_syntax::parse(SourceId(0), src).expect("the fixture must parse");
-        let mut program = ply_syntax::ast::Program::single(module);
-        let resolved = ply_syntax::resolve(&mut program)
-            .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
         let port = crate::fixture::port_front(&[(String::new(), src.to_string())], &[SourceId(0)]);
-        let hashes = ply_hash::hash_program(&program, &resolved, &port.check)
-            .unwrap_or_else(|d| panic!("hash: {d:#?}"));
         Program {
-            program,
             check: port.check.clone(),
+            hashes: port.hashes.clone(),
             port,
-            hashes,
             src: src.to_string(),
         }
     }
 
     fn texts(&self) -> std::collections::HashMap<String, String> {
-        self.program
-            .modules
-            .iter()
-            .map(|m| (m.name.to_string(), self.src.clone()))
-            .collect()
+        std::collections::HashMap::from([(String::new(), self.src.clone())])
     }
 
     fn index_of(&self, name: &str) -> usize {
@@ -111,7 +98,7 @@ impl Program {
         run_with(selection, &self.check, &self.hashes, store, &executor)
     }
 
-    fn def_hash(&self, name: &str) -> ply_hash::DefHash {
+    fn def_hash(&self, name: &str) -> DefHash {
         self.hashes
             .defs
             .get(&Symbol::new(name))
@@ -1855,7 +1842,7 @@ impl Executor for SimExecutor {
     }
 }
 
-fn passed(store: &Store, key: ply_hash::DefHash) -> bool {
+fn passed(store: &Store, key: DefHash) -> bool {
     matches!(store.get(key), Some(Outcome::Pass))
 }
 

@@ -83,7 +83,7 @@ fn hermetic_is_not_bound_and_serves_nothing() {
     assert!(!binding.serves(&EffectAtom::new(
         "db",
         Resource::Named(Symbol::new("users")),
-        ply_syntax::ast::Mode::Read
+        ply_ty::Mode::Read
     )));
 }
 
@@ -268,7 +268,7 @@ fn the_footprint_is_exactly_what_resolve_answers() {
     let absent = EffectAtom::new(
         "db",
         Resource::Named(Symbol::new("customers")),
-        ply_syntax::ast::Mode::Read,
+        ply_ty::Mode::Read,
     );
     assert!(!binding.serves(&absent));
     assert!(
@@ -326,7 +326,7 @@ fn reaches_is_footprint_intersection() {
     let touched = Footprint::from_atoms([EffectAtom::new(
         "db",
         Resource::Named(Symbol::new("users")),
-        ply_syntax::ast::Mode::Read,
+        ply_ty::Mode::Read,
     )]);
     assert!(binding.reaches(&touched));
     assert!(!binding.reaches(&Footprint::empty()));
@@ -547,7 +547,7 @@ fn host_use_records_what_actually_happened() {
     let atom = EffectAtom::new(
         "db",
         Resource::Named(Symbol::new("users")),
-        ply_syntax::ast::Mode::Read,
+        ply_ty::Mode::Read,
     );
     use_.record(&atom);
     use_.record(&atom);

@@ -1,8 +1,8 @@
 use ply_cli::load::Loaded;
 use ply_cli::warm::*;
-use ply_hash::{DefHash, HashOutput};
 use ply_span::Symbol;
 use ply_store::ContentHash;
+use ply_ty::{DefHash, HashOutput};
 
 fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();

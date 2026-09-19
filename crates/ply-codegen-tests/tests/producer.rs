@@ -3,7 +3,7 @@
 use ply_codegen::Source;
 use ply_codegen::c::producer::{self, PlyProducer, Sources};
 use ply_eval::Value;
-use ply_syntax::ast::{ModuleName, Program};
+use ply_span::SourceId;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -24,44 +24,20 @@ fn repo() -> PathBuf {
 }
 
 struct Loaded {
-    program: &'static Program,
-    resolved: &'static ply_syntax::resolve::Resolved,
-    check: &'static ply_ty::CheckOutput,
+    front: &'static ply_ty::Front,
     texts: HashMap<String, String>,
 }
 
-fn load(modules: &[(&str, &str)], with_std: bool) -> &'static Loaded {
-    let mut sources = ply_span::SourceMap::new();
-    let mut inputs = Vec::new();
-    let mut texts = HashMap::new();
-    if with_std {
-        for (module, text) in ply_std::sources() {
-            let module = ModuleName::from_dotted(module);
-            let id = sources.add(ply_std::pseudo_path(&module), text.to_string());
-            texts.insert(module.to_string(), text.to_string());
-            inputs.push((id, module, text));
-        }
-    }
-    for (name, text) in modules {
-        let text: &'static str = Box::leak(text.to_string().into_boxed_str());
-        let id = sources.add(format!("{name}.ply"), text.to_string());
-        texts.insert(name.to_string(), text.to_string());
-        inputs.push((id, ModuleName::from_dotted(name), text));
-    }
-    let named: Vec<(String, String)> = inputs
+fn load(modules: &[(&str, &str)]) -> &'static Loaded {
+    let named: Vec<(String, String)> = modules
         .iter()
-        .map(|(_, m, t)| (m.to_string(), (*t).to_string()))
+        .map(|(name, text)| (name.to_string(), text.to_string()))
         .collect();
-    let ids: Vec<_> = inputs.iter().map(|(id, _, _)| *id).collect();
-    let mut ast = ply_syntax::parse_program(inputs).expect("parses");
-    assert!(ply_derive::expand_program(&mut ast).is_empty());
-    let resolved = ply_syntax::resolve::resolve(&mut ast).expect("resolves");
-    let check = producer::checked_front(&named, &ids).expect("checks").check;
+    let ids: Vec<SourceId> = (0..named.len()).map(|i| SourceId(i as u32)).collect();
+    let front = producer::checked_front(&named, &ids).expect("checks");
     Box::leak(Box::new(Loaded {
-        program: Box::leak(Box::new(ast)),
-        resolved: Box::leak(Box::new(resolved)),
-        check: Box::leak(Box::new(check)),
-        texts,
+        front: Box::leak(Box::new(front)),
+        texts: named.into_iter().collect(),
     }))
 }
 
@@ -92,9 +68,9 @@ static MODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn built_and_checked() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", PROGRAM)], false);
+    let loaded = load(&[("m", PROGRAM)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -187,9 +163,9 @@ fn guarded(n: Int) -> Int =
 fn the_chain_entered_whole_carries_handlers_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", EFFECTS)], false);
+    let loaded = load(&[("m", EFFECTS)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -264,9 +240,9 @@ fn lonely(n: Int) -> Int / {orphan.write} = orphan.poke(n)
 fn a_performer_keeps_compiling_when_its_handler_is_dropped() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", DROPPED)], false);
+    let loaded = load(&[("m", DROPPED)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -322,9 +298,9 @@ impl ply_eval::HostHandler for Doubler {
 fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", HOSTED)], false);
+    let loaded = load(&[("m", HOSTED)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -344,7 +320,11 @@ fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
         },
         std::sync::Arc::new(Doubler),
     );
-    let bound = std::sync::Arc::new(registry.bind(loaded.check).expect("the registry binds"));
+    let bound = std::sync::Arc::new(
+        registry
+            .bind(&loaded.front.check)
+            .expect("the registry binds"),
+    );
     let hermetic = std::sync::Arc::new(ply_eval::HostBinding::hermetic());
     // A user effect performed by a compiled root resolves to no host row, so every case refuses at the host boundary.
     let cases: Vec<HostCase> = vec![
@@ -428,9 +408,9 @@ fn ordered(a: Int, b: Int) -> Bool = decimal_of_int(a) < decimal_of_int(b)
 fn the_chain_entered_whole_holds_float_and_decimal_literals_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", NUMERIC)], false);
+    let loaded = load(&[("m", NUMERIC)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -517,9 +497,9 @@ fn racing(n: Int) -> Int =
 fn the_chain_entered_whole_schedules_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", SIMULATED)], false);
+    let loaded = load(&[("m", SIMULATED)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -636,9 +616,9 @@ fn mixed(seed: Int) -> Int =
 fn the_chain_entered_whole_resumes_off_the_tail_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", RESUMED)], false);
+    let loaded = load(&[("m", RESUMED)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -748,9 +728,9 @@ fn across(seed: Int) -> Int =
 fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", MULTISHOT)], false);
+    let loaded = load(&[("m", MULTISHOT)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -860,9 +840,9 @@ impl ply_eval::HostRuntime for Reactor {
 fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", PRODUCTION)], false);
+    let loaded = load(&[("m", PRODUCTION)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -898,7 +878,11 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
             std::sync::Arc::new(Slow),
         );
     }
-    let bound = std::sync::Arc::new(registry.bind(loaded.check).expect("the registry binds"));
+    let bound = std::sync::Arc::new(
+        registry
+            .bind(&loaded.front.check)
+            .expect("the registry binds"),
+    );
     let hermetic = std::sync::Arc::new(ply_eval::HostBinding::hermetic());
     // `parked`'s `slow.fetch` resolves to no host row and a hermetic binding refuses the region: both refuse at the host boundary.
     let cases: Vec<HostCase> = vec![
@@ -981,9 +965,9 @@ law "zero moves nothing" forall (account: Account) where account.balance > 0 {
 fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", PROPOSITIONS)], false);
+    let loaded = load(&[("m", PROPOSITIONS)]);
     let source: &'static Source = Box::leak(Box::new(
-        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     for root in [

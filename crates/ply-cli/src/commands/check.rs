@@ -7,7 +7,7 @@ use crate::signature;
 use crate::style::Style;
 use ply_span::{Diagnostic, Symbol};
 use ply_store::Store;
-use ply_syntax::ast::ModuleName;
+use ply_ty::ModuleName;
 use ply_ty::print_scheme;
 use serde_json::{Value, json};
 

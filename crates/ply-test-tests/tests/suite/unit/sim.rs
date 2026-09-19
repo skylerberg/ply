@@ -1,7 +1,7 @@
 use ply_eval::{Exploration, Naive, Plan, Seed, SimMode};
-use ply_hash::DefHash;
 use ply_test::key::Engine;
 use ply_test::sim::{Record, SimSummary, record_under, replay_command};
+use ply_ty::DefHash;
 
 fn hash(byte: u8) -> DefHash {
     DefHash([byte; 32])

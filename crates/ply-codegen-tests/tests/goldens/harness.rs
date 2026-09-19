@@ -129,7 +129,7 @@ pub mod golden {
     }
 }
 
-/// The self-hosted compiler the binary carries; `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
+/// The self-hosted compiler the binary carries; `PLY_C_EMITTER=ply:<dir>` enters a working copy of its `.ply` sources instead.
 pub mod port {
     use ply_eval::{Fields, Value};
     use ply_span::Symbol;

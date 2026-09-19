@@ -1,7 +1,7 @@
 //! Cache keys for test results: definitions, the plan searched, and the engine that answered.
 
 use ply_eval::{Plan, Seed};
-use ply_hash::DefHash;
+use ply_ty::DefHash;
 
 /// Domain tags, so a derived key cannot collide with a definition's own untagged hash.
 const PLAN_DOMAIN: &[u8] = b"ply.sim.key.1";

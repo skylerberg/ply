@@ -1,54 +1,27 @@
 use ply_codegen::Unit;
 use ply_eval::{Provider, Value};
-use ply_span::Symbol;
-use ply_syntax::ast::{ModuleName, Program};
+use ply_span::{SourceId, Symbol};
 use std::collections::HashMap;
 
 pub struct Loaded {
-    pub program: &'static Program,
-    pub resolved: &'static ply_syntax::resolve::Resolved,
     pub front: &'static ply_ty::Front,
-    pub check: &'static ply_ty::CheckOutput,
     /// Each module's text by name: what the Ply emitter re-parses to produce.
     pub texts: HashMap<String, String>,
 }
 
 /// The shipped standard library plus `source` as a module named `m`.
 fn load(source: &str) -> Loaded {
-    let mut sources = ply_span::SourceMap::new();
-    let mut owned: Vec<(ModuleName, &'static str)> = ply_std::sources()
-        .map(|(module, text)| (ModuleName::from_dotted(module), text))
+    let mut named: Vec<(String, String)> = ply_std::sources()
+        .map(|(module, text)| (module.to_string(), text.to_string()))
         .collect();
-    owned.push((
-        ModuleName::from_dotted("m"),
-        &*Box::leak(source.to_string().into_boxed_str()),
-    ));
-    let mut inputs = Vec::new();
-    for (module, text) in &owned {
-        let id = sources.add(ply_std::pseudo_path(module), (*text).to_string());
-        inputs.push((id, module.clone(), *text));
-    }
-    let named: Vec<(String, String)> = inputs
-        .iter()
-        .map(|(_, m, t)| (m.to_string(), (*t).to_string()))
-        .collect();
-    let ids: Vec<_> = inputs.iter().map(|(id, _, _)| *id).collect();
-    let mut ast = ply_syntax::parse_program(inputs).expect("the corpus parses");
-    let expanded = ply_derive::expand_program(&mut ast);
-    assert!(expanded.is_empty(), "{expanded:?}");
-    let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the corpus resolves");
+    named.push(("m".to_string(), source.to_string()));
+    let ids: Vec<SourceId> = (0..named.len()).map(|i| SourceId(i as u32)).collect();
     let front: &'static ply_ty::Front = Box::leak(Box::new(
         ply_codegen::c::producer::checked_front(&named, &ids).expect("the corpus checks"),
     ));
     Loaded {
-        program: Box::leak(Box::new(ast)),
-        resolved: Box::leak(Box::new(resolved)),
         front,
-        check: &front.check,
-        texts: owned
-            .iter()
-            .map(|(module, text)| (module.to_string(), (*text).to_string()))
-            .collect(),
+        texts: named.into_iter().collect(),
     }
 }
 
@@ -613,7 +586,7 @@ fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
 #[test]
 fn the_compiled_set_is_closed_under_calls() {
     let (loaded, unit) = unit(ARITHMETIC);
-    let source = ply_codegen::Source::new(loaded.program, loaded.resolved, loaded.check)
+    let source = ply_codegen::Source::from_front(loaded.front, HashMap::new())
         .with_texts(loaded.texts.clone());
     let source: &'static ply_codegen::Source = Box::leak(Box::new(source));
     let (_, refusals) = ply_codegen::closure(source, unit.compiled()).expect("the set compiles");
@@ -626,7 +599,7 @@ fn the_compiled_set_is_closed_under_calls() {
 #[test]
 fn the_census_over_the_standard_library() {
     let (loaded, unit) = unit(ARITHMETIC);
-    let functions = ply_codegen::Source::new(loaded.program, loaded.resolved, loaded.check)
+    let functions = ply_codegen::Source::from_front(loaded.front, HashMap::new())
         .functions()
         .len();
     let mut by_construct: std::collections::BTreeMap<&str, usize> = Default::default();

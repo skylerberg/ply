@@ -11,12 +11,12 @@ fn first_difference(reference: &str, actual: &str) -> Option<String> {
             let from = i.saturating_sub(6);
             let mut report = format!("record {i} of {} differs\n", want.len());
             report.push_str(&format!(
-                "  rust: {a:?}\n  ply : {b:?}\n  context (rust):\n"
+                "  golden: {a:?}\n  port  : {b:?}\n  context (golden):\n"
             ));
             for (j, r) in want.iter().enumerate().skip(from).take(14) {
                 report.push_str(&format!("    {j:>7} {r}\n"));
             }
-            report.push_str("  context (ply):\n");
+            report.push_str("  context (port):\n");
             for (j, r) in got.iter().enumerate().skip(from).take(14) {
                 report.push_str(&format!("    {j:>7} {r}\n"));
             }
@@ -76,22 +76,22 @@ fn files_in(dir: &Path) -> Vec<(String, Vec<u8>)> {
 }
 
 #[test]
-fn the_rewrites_agree_with_ply_syntax_on_every_example() {
+fn the_rewrites_match_their_golden_on_every_example() {
     compare("examples", &files_in(&repo_root().join("examples")));
 }
 
 #[test]
-fn the_rewrites_agree_with_ply_syntax_on_the_shipped_standard_library() {
+fn the_rewrites_match_their_golden_on_the_shipped_standard_library() {
     compare("stdlib", &files_in(&repo_root().join("crates/ply-std/ply")));
 }
 
 #[test]
-fn the_rewrites_agree_with_ply_syntax_on_the_hand_written_fixtures() {
+fn the_rewrites_match_their_golden_on_the_hand_written_fixtures() {
     compare("fixtures", &files_in(&fixtures()));
 }
 
 #[test]
-fn the_rewrites_agree_with_ply_syntax_on_the_reference_own_test_inputs() {
+fn the_rewrites_match_their_golden_on_the_reference_own_test_inputs() {
     let text = std::fs::read_to_string(fixtures().join("reference-tests.corpus"))
         .expect("the mined corpus");
     let inputs: Vec<(String, Vec<u8>)> = bundle(&text)

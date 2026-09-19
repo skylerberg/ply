@@ -13,14 +13,10 @@ tests, the standard library, the `ply` command and the diagnostic codes.
 | path | holds |
 | --- | --- |
 | `crates/ply-span` | spans, diagnostics and the registry of diagnostic codes |
-| `crates/ply-syntax` | lexer, parser, AST and the syntactic rewrites |
 | `crates/ply-ty` | the type vocabulary the checker produces and everything else reads |
-| `crates/ply-derive` | `derive` rules |
-| `crates/ply-hash` | content addressing of definitions |
 | `crates/ply-eval` | values, the evaluator, the scheduler and the simulator |
 | `crates/ply-codegen` | the compiled tier: emits C, builds it and loads it |
 | `crates/ply-compiler` | the compiler written in Ply (`ply/`) and its bootstrap bundle (`bootstrap/`) |
-| `crates/ply-compiler-diff` | the Rust parser's tree in the Ply compiler's dump format, and mutation scripts in `tools/` |
 | `crates/ply-store` | the result and front-end caches under `.ply-cache` |
 | `crates/ply-test` | test selection, scheduling and running |
 | `crates/ply-prove` | specification obligations and their discharge |

@@ -121,57 +121,42 @@ static CONFIG: std::sync::RwLock<()> = std::sync::RwLock::new(());
 pub mod tests_support {
     use ply_codegen::c::Native;
     use ply_codegen::source::Source;
-    use ply_syntax::ast::ModuleName;
+    use ply_span::SourceId;
     use std::collections::HashMap;
 
     pub fn unit(text: &str) -> Option<(&'static Source, Native)> {
         with_refusals(text).map(|(s, n, _)| (s, n))
     }
 
+    fn front(text: &str) -> &'static ply_ty::Front {
+        Box::leak(Box::new(
+            ply_codegen::c::producer::checked_front(
+                &[("m".to_string(), text.to_string())],
+                &[SourceId(0)],
+            )
+            .expect("checks"),
+        ))
+    }
+
     /// Keyed on the text, not the name: two tests defining `m.f` would otherwise share an emit-cache entry.
     pub fn keyed(text: &str) -> Option<&'static Source> {
-        let mut sources = ply_span::SourceMap::new();
-        let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
-        let id = sources.add("m.ply", owned.to_string());
-        let mut ast =
-            ply_syntax::parse_program([(id, ModuleName::from_dotted("m"), owned)]).expect("parses");
-        let resolved = ply_syntax::resolve::resolve(&mut ast).expect("resolves");
-        let check =
-            ply_codegen::c::producer::checked_front(&[("m".to_string(), owned.to_string())], &[id])
-                .expect("checks")
-                .check;
-        let bare = Source::new(&ast, &resolved, &check);
+        let front = front(text);
         let stamp = blake3::hash(text.as_bytes()).to_hex();
-        let keys = bare
+        let keys = Source::from_front(front, HashMap::new())
             .functions()
             .into_iter()
             .map(|n| (n.clone(), format!("h-{n}-{}", &stamp[..16])))
             .collect();
         Some(Box::leak(Box::new(
-            Source::keyed(&ast, &resolved, &check, keys).with_texts(texts(text)),
+            Source::from_front(front, keys).with_texts(texts(text)),
         )))
     }
 
     pub fn with_refusals(
         text: &str,
     ) -> Option<(&'static Source, Native, Vec<ply_codegen::c::Refused>)> {
-        let mut sources = ply_span::SourceMap::new();
-        let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
-        let id = sources.add("m.ply", owned.to_string());
-        let mut ast =
-            ply_syntax::parse_program([(id, ModuleName::from_dotted("m"), owned)]).expect("parses");
-        let resolved = ply_syntax::resolve::resolve(&mut ast).expect("resolves");
-        let check =
-            ply_codegen::c::producer::checked_front(&[("m".to_string(), owned.to_string())], &[id])
-                .expect("checks")
-                .check;
         let source: &'static Source = Box::leak(Box::new(
-            Source::new(
-                Box::leak(Box::new(ast)),
-                Box::leak(Box::new(resolved)),
-                Box::leak(Box::new(check)),
-            )
-            .with_texts(texts(text)),
+            Source::from_front(front(text), HashMap::new()).with_texts(texts(text)),
         ));
         let names = source.functions();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();

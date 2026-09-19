@@ -5,7 +5,7 @@ use crate::cli::StdArgs;
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_OK};
 use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
-use ply_syntax::ast::ModuleName;
+use ply_ty::ModuleName;
 use serde_json::{Value, json};
 
 pub const SCHEMA_VERSION: u32 = 1;
