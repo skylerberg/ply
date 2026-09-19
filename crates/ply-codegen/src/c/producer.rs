@@ -7,8 +7,8 @@ use crate::source::Source;
 use anyhow::{Context, Result, anyhow, bail};
 use ply_eval::{Fields, Value};
 use ply_span::frames::Cursor;
-use ply_span::{Severity, SourceId, Symbol};
-use ply_ty::{Front, read_front};
+use ply_span::{Diagnostic, Severity, SourceId, Symbol, codes};
+use ply_ty::{DefHash, Front, read_front};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -504,14 +504,7 @@ pub fn claims_dump(sources: &[(String, String)]) -> Result<String> {
 }
 
 fn dump_over(entry: &str, sources: &[(String, String)]) -> Result<String> {
-    let answer = call(entry, &[source_list(sources)])?;
-    let Value::Str(dump) = &answer else {
-        bail!(
-            "`{entry}` answered a {} rather than a string",
-            answer.type_name()
-        );
-    };
-    Ok(dump.to_string())
+    string_answer(entry, call(entry, &[source_list(sources)])?)
 }
 
 fn source_list(sources: &[(String, String)]) -> Value {
@@ -519,13 +512,127 @@ fn source_list(sources: &[(String, String)]) -> Value {
         sources
             .iter()
             .map(|(name, src)| {
-                Value::Record(Arc::new(Fields::from_unsorted(vec![
-                    (Symbol::new("name"), Value::bytes(name.as_bytes())),
-                    (Symbol::new("src"), Value::bytes(src.as_bytes())),
-                ])))
+                record(vec![
+                    ("name", Value::bytes(name.as_bytes())),
+                    ("src", Value::bytes(src.as_bytes())),
+                ])
             })
             .collect(),
     )
+}
+
+fn record(fields: Vec<(&str, Value)>) -> Value {
+    Value::Record(Arc::new(Fields::from_unsorted(
+        fields
+            .into_iter()
+            .map(|(name, value)| (Symbol::new(name), value))
+            .collect(),
+    )))
+}
+
+fn string_answer(entry: &str, answer: Value) -> Result<String> {
+    let Value::Str(text) = &answer else {
+        bail!(
+            "`{entry}` answered a {} rather than a string",
+            answer.type_name()
+        );
+    };
+    Ok(text.to_string())
+}
+
+const REHASH: &str = "front.rehash_dump";
+
+/// Every definition and test of an already checked program hashed with each reference to a
+/// definition `pins` names, `(name, declaration, hash)`, written as that hash.
+pub fn rehash_dump(
+    sources: &[(String, String)],
+    pins: &[(String, bool, DefHash)],
+) -> Result<String> {
+    let pins = Value::list(
+        pins.iter()
+            .map(|(name, decl, hash)| {
+                record(vec![
+                    ("name", Value::bytes(name.as_bytes())),
+                    ("decl", Value::Bool(*decl)),
+                    ("hash", Value::bytes(hash.0)),
+                ])
+            })
+            .collect(),
+    );
+    string_answer(REHASH, call(REHASH, &[source_list(sources), pins])?)
+}
+
+const PRINT: &str = "front.print_dump";
+
+/// Stored bodies printed back to source, `(module, text)` in byte order of module and then a
+/// `ply_tests` module holding `tests` as `t0`, `t1`, …: each body once under every name `names`
+/// gives its hash, a stored reference first redirected through `relink`. A `shipped` module is
+/// imported and not printed. `Err` is why the bodies cannot be printed as named.
+pub fn print_bodies(
+    bodies: &[&[u8]],
+    names: &[(&str, DefHash)],
+    tests: &[&[u8]],
+    relink: &[(DefHash, DefHash)],
+    shipped: &[&str],
+) -> std::result::Result<Vec<(String, String)>, Diagnostic> {
+    let refused = |message: String| Diagnostic::error(codes::ARTIFACT_INVALID, message);
+    let args = [
+        Value::list(bodies.iter().map(Value::bytes).collect()),
+        Value::list(
+            names
+                .iter()
+                .map(|(name, hash)| {
+                    record(vec![
+                        ("name", Value::bytes(name.as_bytes())),
+                        ("hash", Value::bytes(hash.0)),
+                    ])
+                })
+                .collect(),
+        ),
+        Value::list(tests.iter().map(Value::bytes).collect()),
+        Value::list(
+            relink
+                .iter()
+                .map(|(from, to)| {
+                    record(vec![
+                        ("from", Value::bytes(from.0)),
+                        ("to", Value::bytes(to.0)),
+                    ])
+                })
+                .collect(),
+        ),
+        Value::list(shipped.iter().map(|m| Value::bytes(m.as_bytes())).collect()),
+    ];
+    let dump = call(PRINT, &args)
+        .and_then(|answer| string_answer(PRINT, answer))
+        .map_err(|e| refused(format!("the stored bodies do not decode: {e:#}")))?;
+    let unreadable = |e: String| refused(format!("`{PRINT}`'s answer does not read: {e}"));
+    let mut frames = Cursor::new(dump.as_bytes(), "frame");
+    let mut modules = Vec::new();
+    while !frames.done() {
+        let (words, payload) = frames.unit().map_err(unreadable)?;
+        let text = std::str::from_utf8(payload)
+            .map_err(|e| unreadable(e.to_string()))?
+            .to_string();
+        match words[..] {
+            ["module", name] => modules.push((name.to_string(), text)),
+            ["refused", _] => {
+                let mut fields = Cursor::new(payload, "field");
+                let mut diagnostic = refused(String::new());
+                while !fields.done() {
+                    let (key, body) = fields.unit().map_err(unreadable)?;
+                    let body = String::from_utf8_lossy(body).into_owned();
+                    match key[..] {
+                        ["message"] => diagnostic.message = body,
+                        _ => diagnostic = diagnostic.note(body),
+                    }
+                }
+                return Err(diagnostic);
+            }
+            _ => return Err(unreadable(format!("a `{}` frame", words.join(" ")))),
+        }
+    }
+    Ok(modules)
 }
 
 /// [`FRONT`], pulling in the shipped modules the program imports itself.

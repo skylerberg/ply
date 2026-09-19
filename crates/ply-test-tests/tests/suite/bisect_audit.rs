@@ -3,9 +3,8 @@ use ply_hash::{DefHash, HashOutput};
 use ply_span::SourceId;
 use ply_span::{Span, Symbol};
 use ply_test::bisect::{
-    Baseline, Budget, ChangeKind, Classify, Confidence, DefKey, Delta, DepEdges, Diff, EraTable,
-    FusionReason, Hybrid, Regression, Renormalizer, Skipped, Trial, Unresolved, Verdict, bisect,
-    diff,
+    Baseline, Budget, ChangeKind, Classify, Confidence, DefKey, Delta, DepEdges, Diff,
+    FusionReason, Hybrid, Regression, Rehashed, Skipped, Trial, Unresolved, Verdict, bisect, diff,
 };
 use ply_test::{
     Attribution, CausalSlice, Entered, Event, Evidence, Frame, Options, SliceBuilder, diagnose,
@@ -17,10 +16,11 @@ fn sym(s: &str) -> Symbol {
 }
 
 impl Compiled {
-    fn renormalizer(&self) -> Renormalizer<'_> {
-        let test_keys: Vec<Symbol> = self.check.tests.iter().map(|t| t.key.clone()).collect();
-        Renormalizer::new(&self.program, &self.resolved, &self.hashes, &test_keys)
-            .expect("index the program")
+    fn rehashed(&self, baseline: &Baseline) -> Rehashed {
+        let mut sources: Vec<(String, String)> = self.texts.clone().into_iter().collect();
+        sources.sort();
+        Rehashed::under(&sources, baseline)
+            .unwrap_or_else(|e| panic!("the port re-hashes a checked program: {e}"))
     }
 
     /// One hash per name *per namespace*, so a `type` and a `fn` sharing a name are both kept.
@@ -52,44 +52,41 @@ impl Compiled {
 }
 
 /// A caller-supplied interface answer, so a case isolates the `Edited`/`Derived` split from fusion.
-struct Renormalizing<'a> {
-    renormalizer: Renormalizer<'a>,
-    table: EraTable,
+struct Renormalizing {
+    rehashed: Rehashed,
     independent: bool,
 }
 
-impl<'a> Renormalizing<'a> {
-    fn new(renormalizer: Renormalizer<'a>, baseline: &Baseline, independent: bool) -> Self {
-        let table = renormalizer.era_table(&|key: &DefKey| baseline.hash_of(key));
+impl Renormalizing {
+    fn new(after: &Compiled, baseline: &Baseline, independent: bool) -> Self {
         Renormalizing {
-            renormalizer,
-            table,
+            rehashed: after.rehashed(baseline),
             independent,
         }
     }
 }
 
-impl Classify for Renormalizing<'_> {
+impl Classify for Renormalizing {
     fn renormalized(&mut self, key: &DefKey) -> Option<DefHash> {
-        self.renormalizer.rehash(key, &self.table)
+        self.rehashed.rehash(key)
     }
     fn renormalized_test(&mut self, key: &Symbol) -> Option<DefHash> {
-        self.renormalizer.rehash_test(key, &self.table)
+        self.rehashed.rehash_test(key)
     }
     fn interface_stable(&mut self, _: &DefKey, _: DefHash) -> Option<bool> {
         Some(self.independent)
     }
     fn component(&mut self, key: &DefKey) -> Vec<DefKey> {
-        self.renormalizer.component_of(key)
+        self.rehashed.component_of(key)
     }
     fn baseline_image(&mut self) -> std::collections::BTreeSet<DefHash> {
-        self.table.image()
+        self.rehashed.image()
     }
 }
 
 fn diff_of(before: &Compiled, after: &Compiled, key: &str, independent: bool) -> Diff {
     let baseline = before.baseline(key);
-    let mut classify = Renormalizing::new(after.renormalizer(), &baseline, independent);
+    let mut classify = Renormalizing::new(after, &baseline, independent);
     let key = sym(key);
     let regression = Regression {
         key: &key,
@@ -115,7 +112,7 @@ fn members(diff: &Diff) -> Vec<Vec<String>> {
 /// No hybrid builder, so only the verdicts that need no mixture are reachable.
 fn attribute(before: &Compiled, after: &Compiled, key: &str, independent: bool) -> Attribution {
     let baseline = before.baseline(key);
-    let mut classify = Renormalizing::new(after.renormalizer(), &baseline, independent);
+    let mut classify = Renormalizing::new(after, &baseline, independent);
     let key = sym(key);
     let suspects: Vec<Symbol> = after
         .hashes

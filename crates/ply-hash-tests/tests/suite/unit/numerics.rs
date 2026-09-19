@@ -1,6 +1,5 @@
-//! Canonical encoding of the numeric literals, and the round trip through the stored body.
+//! Canonical encoding of the numeric literals.
 
-use ply_hash::body::{BodySet, StoredBody, reconstruct};
 use ply_hash::{DefHash, hash_program_with_bodies};
 use ply_span::SourceId;
 use ply_syntax::ast::{ModuleName, Program};
@@ -21,13 +20,6 @@ fn hash_of(source: &str) -> DefHash {
     let mut hashes: Vec<DefHash> = out.defs.values().copied().collect();
     assert_eq!(hashes.len(), 1, "expected exactly one definition");
     hashes.pop().unwrap()
-}
-
-fn bodies_of(source: &str) -> BodySet {
-    let (program, resolved) = compile(source);
-    hash_program_with_bodies(&program, &resolved)
-        .expect("hashes")
-        .1
 }
 
 #[test]
@@ -73,62 +65,5 @@ fn renaming_a_definition_holding_a_numeric_literal_changes_no_hash() {
     assert_eq!(
         hash_of("pub fn price() -> Decimal = 19.99m"),
         hash_of("pub fn amount() -> Decimal = 19.99m")
-    );
-}
-
-fn round_trip(source: &str) {
-    let bodies = bodies_of(source);
-    let mut rebuilt = reconstruct(&bodies).expect("bodies reconstruct");
-    let resolved = ply_syntax::resolve(&mut rebuilt.program)
-        .unwrap_or_else(|d| panic!("reconstruction did not resolve: {d:#?}"));
-    let (again, _) =
-        hash_program_with_bodies(&rebuilt.program, &resolved).expect("rebuilt program hashes");
-    for (hash, name) in &rebuilt.names {
-        let back = again
-            .defs
-            .get(name)
-            .or_else(|| again.decls.get(name))
-            .unwrap_or_else(|| panic!("`{name}` is missing from the rebuilt program"));
-        assert_eq!(back, hash, "`{name}` decoded to a different definition");
-    }
-}
-
-/// Decoding through the value would merge `0.0` and `-0.0` and fail the self-check on a healthy store.
-#[test]
-fn numeric_literals_survive_the_stored_body_round_trip() {
-    round_trip("pub fn f() -> Float = -0.0");
-    round_trip("pub fn f() -> Float = 0.0");
-    round_trip("pub fn f() -> Decimal = 1.50m");
-    round_trip("pub fn f() -> Decimal = -0.000000000000000000000000001m");
-    round_trip("pub fn f() -> Float = 1e300");
-    round_trip(
-        "pub fn total(a: Decimal, b: Decimal) -> Decimal = a + b * 2m\n\
-         pub fn rate() -> Float = 1.5 / 0.0\n",
-    );
-}
-
-/// The lexer never produces such a `Decimal`, so a stream carrying one is corrupt.
-#[test]
-fn a_body_carrying_an_out_of_range_decimal_is_refused() {
-    let bodies = bodies_of("pub fn f() -> Decimal = 1.50m");
-    let (_, body) = bodies.defs().next().expect("one definition");
-    let mut bytes = body.as_bytes().to_vec();
-
-    // The scale is the last little-endian `2`: the mantissa's sixteen bytes come before it.
-    let scale = bytes
-        .windows(4)
-        .rposition(|w| w == 2u32.to_le_bytes())
-        .expect("the scale is in the stream");
-    bytes[scale..scale + 4].copy_from_slice(&99u32.to_le_bytes());
-
-    let body = StoredBody::from_bytes(bytes).expect("still a body envelope");
-    // Filed under its own key, so the range guard rather than the self-check refuses it.
-    let key = body.key().expect("a solo body keys itself");
-    let mut tampered = BodySet::default();
-    tampered.insert(key, body);
-    let diags = reconstruct(&tampered).expect_err("a scale of 99 is not a `Decimal`");
-    assert!(
-        diags.iter().any(|d| d.message.contains("scale 99")),
-        "the refusal must name the scale: {diags:#?}"
     );
 }

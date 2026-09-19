@@ -63,9 +63,9 @@ fn every_hash(hashes: &HashOutput) -> Vec<DefHash> {
         .collect()
 }
 
-/// A later process rebuilds the program without the source or any names.
+/// A later process prints the program back from the store, with no source.
 #[test]
-fn a_stored_definition_set_rebuilds_into_a_program_that_checks() {
+fn a_stored_definition_set_prints_into_a_program_that_checks() {
     let root = TempRoot::new("rebuild");
     let (hashes, bodies) = compile(SOURCE);
 
@@ -77,20 +77,23 @@ fn a_stored_definition_set_rebuilds_into_a_program_that_checks() {
     assert_eq!(store.bodies_len(), every_hash(&hashes).len());
 
     let reopened = root.open();
-    let mut rebuilt = reopened
-        .reconstruct(every_hash(&hashes))
-        .expect("the stored bodies should rebuild");
-
-    ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
-    let printed = ply_syntax::print::program(&rebuilt.program);
+    let (set, missing) = reopened.body_set(every_hash(&hashes));
+    assert!(missing.is_empty(), "{missing:?}");
+    let stored: Vec<&[u8]> = set.defs().map(|(_, body)| body.as_bytes()).collect();
+    let names: Vec<(&str, DefHash)> = hashes
+        .defs
+        .iter()
+        .chain(hashes.decls.iter())
+        .map(|(name, hash)| (name.as_str(), *hash))
+        .collect();
+    let printed = ply_codegen::c::producer::print_bodies(&stored, &names, &[], &[], &[])
+        .unwrap_or_else(|d| panic!("the stored bodies should print: {d:#?}"));
     let ids: Vec<SourceId> = (0..printed.len()).map(|i| SourceId(i as u32)).collect();
     let check = ply_codegen::c::producer::checked_front(&printed, &ids)
         .unwrap_or_else(|e| panic!("it should check: {e:#}"))
         .check;
 
-    let lookup = hashes.defs[&Symbol::new("m.lookup")];
-    let name = rebuilt.name_of(lookup).expect("a name for lookup");
-    let info = &check.defs[name];
+    let info = &check.defs[&Symbol::new("m.lookup")];
     assert_eq!(info.footprint.atoms().count(), 1);
     assert_eq!(
         info.footprint.atoms().next().unwrap().resource,
@@ -142,15 +145,6 @@ fn a_definition_with_no_stored_body_is_named_rather_than_skipped() {
     let (set, missing) = store.body_set([shade, lookup]);
     assert_eq!(set.len(), 1);
     assert_eq!(missing, vec![lookup]);
-
-    let diags = store
-        .reconstruct([shade, lookup])
-        .expect_err("an incomplete set must not rebuild");
-    assert!(
-        diags
-            .iter()
-            .any(|d| d.code == ply_span::codes::CACHE_UNREADABLE)
-    );
 }
 
 #[test]

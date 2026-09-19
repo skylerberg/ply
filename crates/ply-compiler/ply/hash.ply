@@ -13,7 +13,8 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               Constraint, Deriver, DJson, DEq, DOrd, SpecKind, SRequires, SEnsures, SpecClause, Derived, Vis, VPub, VPriv, parse)
 import rewrite (expand)
 import resolve (Mod, Source, Resolved, Scope, Binding, Bindings, ModBind, Diag, Outcome,
-                Resolved_, Failed, resolve_modules, diag2, lab, is_bare, dump_diags, qualify)
+                Resolved_, Failed, resolve_modules, diag2, lab, is_bare, dump_diags, qualify,
+                default_binder, backticked, is_ctor_name)
 import derive (Expansion, expand_derives, deriver_tag)
 import std.hash (blake3)
 
@@ -926,9 +927,12 @@ type Hashed = { hashes: Map<Int, Bytes>, bodies: Map<Int, Bytes>, tests: List<By
                 laws: List<Bytes>, law_refs: List<List<Int>>, law_texts: List<Bytes>,
                 own: List<{ name: Bytes, hash: Bytes }>, specs: List<{ name: Bytes, hashes: List<Bytes> }>, spec_texts: List<{ name: Bytes, hashes: List<Bytes> }> }
 
-type Keyed = { hashes: Map<Int, Bytes>, bodies: Map<Int, Bytes> }
+// `hashes` is the table references are written from; `fresh` is what each body hashed to under it.
+type Keyed = { hashes: Map<Int, Bytes>, bodies: Map<Int, Bytes>, fresh: Map<Int, Bytes> }
 
-pub fn hash_index(index: Index) -> HashOutput = {
+type Graph = { edges: List<List<Int>>, components: List<List<Int>>, scc: Sccs }
+
+fn graph_of(index: Index) -> Graph = {
   let n = len(index.nodes);
   // A first pass with nothing known yields the reference graph, and a sketch that orders a cycle's members without source position.
   let first = map(index.nodes, |node: Node| finish(normalize_node(new_nz(index, node.module, map_new(), map_new(), map_new()), node.body)));
@@ -947,23 +951,36 @@ pub fn hash_index(index: Index) -> HashOutput = {
     let scc = { component_of: component_of, orders: acc };
     push(acc, fold(members, [], |o: List<Int>, v: Int| effect_order(index, at(edges, v), scc, Some(ci), o)))
   });
-  let scc = { component_of: component_of, orders: orders };
-  let keyed = fold(range(0, len(components)), { hashes: map_new(), bodies: map_new() }, |acc: Keyed, ci: Int| {
-    let component = at(components, ci);
-    let effects = slots(at(orders, ci));
-    if is_cyclic(component, edges) {
+  { edges: edges, components: components, scc: { component_of: component_of, orders: orders } }
+}
+
+// A definition `pinned` names enters the table under that hash instead of its own.
+fn key_components(index: Index, g: Graph, pinned: Map<Int, Bytes>) -> Keyed =
+  fold(range(0, len(g.components)), { hashes: map_new(), bodies: map_new(), fresh: map_new() }, |acc: Keyed, ci: Int| {
+    let component = at(g.components, ci);
+    let effects = slots(at(g.scc.orders, ci));
+    let own: Keyed = if is_cyclic(component, g.edges) {
       let refined: Refined = hash_component(index, component, acc.hashes, effects);
       fold(refined.members, acc, |a: Keyed, m: { node: Int, hash: Bytes }| {
         let class = match map_get(refined.classes, m.node) { Some(c) -> c, None -> 0 };
-        { hashes: map_insert(a.hashes, m.node, m.hash), bodies: map_insert(a.bodies, m.node, member_body(refined.packed, class)) }
+        {..a, fresh: map_insert(a.fresh, m.node, m.hash), bodies: map_insert(a.bodies, m.node, member_body(refined.packed, class))}
       })
     } else {
       let v = at(component, 0);
       let node = at(index.nodes, v);
       let encoding = finish(normalize_node(new_nz(index, node.module, acc.hashes, map_new(), effects), node.body)).bytes;
-      { hashes: map_insert(acc.hashes, v, blake3(encoding)), bodies: map_insert(acc.bodies, v, solo_body(encoding)) }
-    }
-  });
+      {..acc, fresh: map_insert(acc.fresh, v, blake3(encoding)), bodies: map_insert(acc.bodies, v, solo_body(encoding))}
+    };
+    {..own, hashes: fold(component, own.hashes, |h: Map<Int, Bytes>, v: Int|
+      match map_get(pinned, v) { Some(x) -> map_insert(h, v, x), None -> match map_get(own.fresh, v) { Some(x) -> map_insert(h, v, x), None -> h } })}
+  })
+
+pub fn hash_index(index: Index) -> HashOutput = {
+  let g = graph_of(index);
+  let components = g.components;
+  let edges = g.edges;
+  let scc = g.scc;
+  let keyed = key_components(index, g, map_new());
   let hashes = keyed.hashes;
   let tests = fold(index.tests, { hashes: [], bodies: [], refs: [] }, |acc: { hashes: List<Bytes>, bodies: List<Bytes>, refs: List<List<Int>> }, t: TestNode| {
     let f: Finished = encode_item(index, t.module, scc, hashes, false, |z: Nz| test_def(z, t.def));
@@ -1007,6 +1024,40 @@ pub fn hash_index(index: Index) -> HashOutput = {
   assemble(index, components, edges, { hashes: hashes, bodies: keyed.bodies, tests: tests.hashes, test_bodies: tests.bodies, test_refs: tests.refs,
                                         laws: laws.hashes, law_refs: laws.refs, law_texts: laws.texts,
                                         own: forms.own, specs: forms.specs, spec_texts: forms.spec_texts })
+}
+
+// --- Another era's table ------------------------------------------------------------------
+// Each body hashed with its references written as `pins` wrote them: a body that only inherited a
+// dependency's move comes back to its pinned hash, and an edited one does not.
+
+pub type Pin = { name: Bytes, decl: Bool, hash: Bytes }
+// `component` numbers a mutually recursive group, or is -1.
+pub type Rehash = { name: Bytes, decl: Bool, fresh: Bytes, table: Bytes, component: Int }
+pub type Rehashed = { nodes: List<Rehash>, tests: List<{ key: Bytes, hash: Bytes }> }
+
+fn is_decl(node: Node) -> Bool = match node.body { NFn(_) -> false, _ -> true }
+
+fn pin_key(name: Bytes, decl: Bool) -> Bytes = bytes_concat(if decl { b"decl " } else { b"def " }, name)
+
+pub fn rehash_index(index: Index, pins: List<Pin>) -> Rehashed = {
+  let wanted = fold(pins, map_new(), |acc: Map<Bytes, Bytes>, p: Pin| map_insert(acc, pin_key(p.name, p.decl), p.hash));
+  let pinned = fold(range(0, len(index.nodes)), map_new(), |acc: Map<Int, Bytes>, v: Int| {
+    let node = at(index.nodes, v);
+    match map_get(wanted, pin_key(node.name, is_decl(node))) { Some(h) -> map_insert(acc, v, h), None -> acc }
+  });
+  let g = graph_of(index);
+  let keyed = key_components(index, g, pinned);
+  let grouped = fold(range(0, len(g.components)), map_new(), |acc: Map<Int, Int>, ci: Int| {
+    let c = at(g.components, ci);
+    if len(c) < 2 { acc } else { fold(c, acc, |a: Map<Int, Int>, v: Int| map_insert(a, v, ci)) }
+  });
+  let got = |m: Map<Int, Bytes>, v: Int| match map_get(m, v) { Some(h) -> h, None -> b"" };
+  { nodes: map(range(0, len(index.nodes)), |v: Int| {
+      let node = at(index.nodes, v);
+      { name: node.name, decl: is_decl(node), fresh: got(keyed.fresh, v), table: got(keyed.hashes, v),
+        component: match map_get(grouped, v) { Some(ci) -> ci, None -> 0 - 1 } }
+    }),
+    tests: map(index.tests, |t: TestNode| { key: t.key, hash: blake3(encode_item(index, t.module, g.scc, keyed.hashes, false, |z: Nz| test_def(z, t.def)).bytes) }) }
 }
 
 // Keys come back in byte order.
@@ -1231,6 +1282,800 @@ pub fn hash_dump(sources: List<Source>) -> String = {
   string_of_bytes(bytes_concat(head, body))
 }
 
+// --- Stored bodies back to source ------------------------------------------------------------
+// The encoding read back and spelled the one way the parser reads to the same bytes; a binder is its level.
+
+pub type Refusal = { message: Bytes, notes: List<Bytes> }
+pub type Printing = | Printed(List<{ module: Bytes, text: Bytes }>) | Unprintable(Refusal)
+
+// One copy of a component: its members' names by class, and whether it is printed or only imported.
+type Part = { members: List<Bytes>, hashes: List<Bytes>, names: List<Bytes>, module: Bytes, binder: Bytes, printed: Bool }
+type Slot = { part: Int, class: Int }
+type Layout = { parts: List<Part>, by_hash: Map<Bytes, List<Slot>>, relink: Map<Bytes, Bytes> }
+// A test is printed in no part and from no module.
+type Pr = { layout: Layout, part: Int, own: Bytes }
+// The cursor, the binders in scope, and what the reading has met so far.
+type Dc = { b: Bytes, pos: Int, values: Int, typs: Int, rows: Int, imports: Map<Bytes, Bytes>, missing: Map<Bytes, Bool>, slots: Map<Bytes, Int> }
+type Got = { d: Dc, t: Bytes }
+type Rd = { d: Dc, v: Int }
+type Flag = { d: Dc, v: Bool }
+type Opt = { d: Dc, t: Bytes, some: Bool }
+type Many = { d: Dc, ts: List<Bytes> }
+// `class` is -1 for a reference by hash.
+type Rf = { d: Dc, hash: Bytes, class: Int }
+
+fn fresh_dc(b: Bytes) -> Dc = { b: b, pos: 0, values: 0, typs: 0, rows: 0, imports: map_new(), missing: map_new(), slots: map_new() }
+
+fn rd_bytes(d: Dc, n: Int) -> Got =
+  if d.pos + n > bytes_len(d.b) { panic("a stored body ends inside a value") }
+  else { { d: {..d, pos: d.pos + n}, t: bytes_slice(d.b, d.pos, d.pos + n) } }
+
+fn le_int(b: Bytes) -> Int = fold(range(0, bytes_len(b)), 0, |a: Int, i: Int| a | (bytes_at(b, i) << (8 * i)))
+
+fn rd_int(d: Dc, n: Int) -> Rd = { let g = rd_bytes(d, n); { d: g.d, v: le_int(g.t) } }
+
+fn rd_u8(d: Dc) -> Rd = rd_int(d, 1)
+
+fn rd_u32(d: Dc) -> Rd = rd_int(d, 4)
+
+fn rd_text(d: Dc) -> Got = { let n = rd_u32(d); rd_bytes(n.d, n.v) }
+
+fn rd_bool(d: Dc) -> Flag = { let r = rd_u8(d); if r.v > 1 { panic("a byte that is not a boolean") } else { { d: r.d, v: r.v == 1 } } }
+
+fn peek(d: Dc) -> Int = if d.pos < bytes_len(d.b) { bytes_at(d.b, d.pos) } else { 0 - 1 }
+
+fn skip(d: Dc) -> Dc = {..d, pos: d.pos + 1}
+
+fn expect(d: Dc, want: Int, what: Bytes) -> Dc = {
+  let r = rd_u8(d);
+  if r.v == want { r.d } else { panic(string_of_bytes(bytes_concat_all([b"expected ", what, b", found tag ", num(r.v)]))) }
+}
+
+// Every element of a counted list takes a byte, so a count past the end is a corrupt one.
+fn rd_count(d: Dc) -> Rd = { let r = rd_u32(d); if r.v > bytes_len(r.d.b) - r.d.pos { panic("a count runs past the stored body") } else { r } }
+
+// Binders take no bytes of their own.
+fn rd_binders(d: Dc) -> Rd = { let r = rd_u32(d); if r.v > 65535 { panic("a count of binders no definition declares") } else { r } }
+
+fn rd_many(d: Dc, count: Int, f: (Dc) -> Got) -> Many =
+  fold(range(0, count), { d: d, ts: [] }, |s: Many, i: Int| { let g = f(s.d); { d: g.d, ts: push(s.ts, g.t) } })
+
+fn rd_opt(d: Dc, f: (Dc) -> Got) -> Opt = {
+  let r = rd_u8(d);
+  if r.v == t_none() { { d: r.d, t: b"", some: false } }
+  else if r.v == t_some() { let g = f(r.d); { d: g.d, t: g.t, some: true } }
+  else { panic("a byte that is not an optional marker") }
+}
+
+fn joined(xs: List<Bytes>, sep: Bytes) -> Bytes =
+  bytes_concat_all(map(range(0, len(xs)), |i: Int| if i == 0 { at(xs, i) } else { bytes_concat(sep, at(xs, i)) }))
+
+fn prefixed(o: Opt, before: Bytes) -> Bytes = if o.some { bytes_concat(before, o.t) } else { b"" }
+
+fn bracketed(o: Opt) -> Bytes = if o.some { bytes_concat_all([b"[", o.t, b"]"]) } else { b"" }
+
+fn lname(level: Int) -> Bytes = bytes_concat(b"_l", num(level))
+fn tname(level: Int) -> Bytes = bytes_concat(b"_t", num(level))
+fn ename(level: Int) -> Bytes = bytes_concat(b"_e", num(level))
+
+fn nl(depth: Int) -> Bytes = bytes_concat(b"\n", bytes_concat_all(map(range(0, depth), |i: Int| b"  ")))
+
+fn zeros(k: Int) -> Bytes = bytes_concat_all(map(range(0, k), |i: Int| b"0"))
+
+fn short_hex(h: Bytes) -> Bytes = bytes_slice(hex(h), 0, 12)
+
+// --- References
+
+fn rd_ref(x: Pr, d: Dc) -> Rf = {
+  let t = rd_u8(d);
+  if t.v == t_ref_hash() {
+    let g = rd_bytes(t.d, 32);
+    let h = match map_get(x.layout.relink, g.t) { Some(to) -> to, None -> g.t };
+    { d: if map_contains(x.layout.by_hash, h) { g.d } else { {..g.d, missing: map_insert(g.d.missing, h, true)} }, hash: h, class: 0 - 1 }
+  } else if t.v == t_ref_index() {
+    let c = rd_u32(t.d);
+    let hashes = if x.part < 0 { [] } else { at(x.layout.parts, x.part).hashes };
+    if c.v >= len(hashes) { panic("a reference to a member this component does not have") } else { { d: c.d, hash: at(hashes, c.v), class: c.v } }
+  } else { panic(string_of_bytes(bytes_concat(b"a reference of tag ", num(t.v)))) }
+}
+
+// Its own module's copy first, then a printed one; the first of equals.
+fn pick(l: Layout, h: Bytes, own: Bytes) -> Option<Slot> = {
+  let score = |s: Slot| { let p = at(l.parts, s.part); (if p.module == own { 0 } else { 2 }) + (if p.printed { 0 } else { 1 }) };
+  match map_get(l.by_hash, h) {
+    None -> None,
+    Some(found) -> fold(found, None, |best: Option<Slot>, s: Slot| match best { Some(b) -> if score(s) < score(b) { Some(s) } else { best }, None -> Some(s) }),
+  }
+}
+
+fn qname(x: Pr, r: Rf, ctor: Option<Bytes>) -> Got = {
+  let found = if r.class >= 0 { Some({ part: x.part, class: r.class }) } else { pick(x.layout, r.hash, x.own) };
+  match found {
+    None -> { d: r.d, t: match ctor { Some(c) -> c, None -> short_hex(r.hash) } },
+    Some(s) -> {
+      let p = at(x.layout.parts, s.part);
+      let name = match ctor { Some(c) -> c, None -> at(p.names, s.class) };
+      if p.module == x.own { { d: r.d, t: name } }
+      else { { d: {..r.d, imports: map_insert(r.d.imports, p.module, p.binder)}, t: bytes_concat_all([p.binder, b"::", name]) } }
+    },
+  }
+}
+
+fn is_free(d: Dc) -> Bool = peek(d) == t_free() || peek(d) == t_free_qualified()
+
+fn rd_free(d: Dc) -> Got = {
+  let t = rd_u8(d);
+  if t.v == t_free() { rd_text(t.d) }
+  else if t.v == t_free_qualified() { let m = rd_text(t.d); let n = rd_text(m.d); { d: n.d, t: bytes_concat_all([m.t, b"::", n.t]) } }
+  else { panic("a tag that is not a free reference") }
+}
+
+fn rd_value(x: Pr, d: Dc) -> Got =
+  if peek(d) == t_local() {
+    let l = rd_u32(skip(d));
+    if l.v >= d.values { panic("a local that is not in scope") } else { { d: l.d, t: lname(l.v) } }
+  } else if peek(d) == t_ctor() { rd_ctor(x, d) }
+  else if is_free(d) { rd_free(d) }
+  else { qname(x, rd_ref(x, d), None) }
+
+fn rd_ctor(x: Pr, d: Dc) -> Got =
+  if peek(d) == t_ctor() {
+    let owner = rd_ref(x, skip(d));
+    let name = rd_text(owner.d);
+    qname(x, {..owner, d: name.d}, Some(name.t))
+  } else { rd_free(d) }
+
+// Two effects declared alike share a hash, and only the slot tells them apart.
+fn rd_effect(x: Pr, d: Dc) -> Got =
+  if is_free(d) { rd_free(d) } else {
+    let r = rd_ref(x, d);
+    let s = rd_u32(r.d);
+    match map_get(s.d.slots, r.hash) {
+      Some(was) -> if was != s.v { panic("two distinct effects share one declaration, which a hash-keyed body cannot tell apart") } else { qname(x, {..r, d: s.d}, None) },
+      None -> qname(x, {..r, d: {..s.d, slots: map_insert(s.d.slots, r.hash, s.v)}}, None),
+    }
+  }
+
+// --- Types
+
+fn p_type(x: Pr, d: Dc) -> Got = {
+  let t = rd_u8(d);
+  if t.v == t_ty_con() {
+    if peek(t.d) == t_ty_param() {
+      let l = rd_u32(skip(t.d));
+      let n = rd_u32(l.d);
+      if l.v >= d.typs || n.v != 0 { panic("a type parameter out of scope, or applied") } else { { d: n.d, t: tname(l.v) } }
+    } else {
+      let name = if is_free(t.d) { rd_free(t.d) } else { qname(x, rd_ref(x, t.d), None) };
+      let n = rd_count(name.d);
+      let args = rd_many(n.d, n.v, |e: Dc| p_type(x, e));
+      // A bare lowercase name reads back as a type variable, so it keeps an empty `<>`.
+      let bare = match bytes_index_of(name.t, b"::") { Some(_) -> false, None -> true };
+      { d: args.d, t: if n.v > 0 || (bare && !is_ctor_name(name.t)) { bytes_concat_all([name.t, b"<", joined(args.ts, b", "), b">"]) } else { name.t } }
+    }
+  } else if t.v == t_ty_fn() {
+    let n = rd_count(t.d);
+    let ps = rd_many(n.d, n.v, |e: Dc| p_type(x, e));
+    let ret = p_ret(x, ps.d);
+    let row = rd_opt(ret.d, |e: Dc| p_row(x, e));
+    { d: row.d, t: bytes_concat_all([b"(", joined(ps.ts, b", "), b") -> ", ret.t, prefixed(row, b" / ")]) }
+  } else if t.v == t_ty_record() {
+    let n = rd_count(t.d);
+    let fs = rd_many(n.d, n.v, |e: Dc| { let f = rd_text(e); let ty = p_type(x, f.d); { d: ty.d, t: bytes_concat_all([f.t, b": ", ty.t]) } });
+    { d: fs.d, t: bytes_concat_all([b"{", joined(fs.ts, b", "), b"}"]) }
+  } else if t.v == t_ty_unit() { { d: t.d, t: b"()" } }
+  else { panic("a tag that does not begin a type") }
+}
+
+// After `->` a function type is parenthesized, or a row after it would bind to the inner arrow.
+fn p_ret(x: Pr, d: Dc) -> Got =
+  if peek(d) == t_ty_fn() { let g = p_type(x, d); { d: g.d, t: bytes_concat_all([b"(", g.t, b")"]) } } else { p_type(x, d) }
+
+fn rd_mode(d: Dc) -> Got = {
+  let m = rd_u8(d);
+  if m.v == 0 { { d: m.d, t: b"read" } } else if m.v == 1 { { d: m.d, t: b"write" } } else { panic("a byte that is not an access mode") }
+}
+
+fn p_row(x: Pr, d: Dc) -> Got = {
+  let n = rd_count(expect(d, t_row(), b"an effect row"));
+  let atoms = rd_many(n.d, n.v, |e: Dc| {
+    let eff = rd_effect(x, expect(e, t_atom(), b"an effect atom"));
+    let m = rd_mode(eff.d);
+    let r = rd_opt(m.d, rd_text);
+    { d: r.d, t: bytes_concat_all([eff.t, b".", m.t, bracketed(r)]) }
+  });
+  let tail = rd_opt(atoms.d, |e: Dc| {
+    let k = rd_u8(e);
+    if k.v == t_row_param() { let l = rd_u32(k.d); if l.v >= e.rows { panic("a row parameter that is not in scope") } else { { d: l.d, t: ename(l.v) } } }
+    else if k.v == t_free() { rd_text(k.d) }
+    else { panic("a tag that is not a row tail") }
+  });
+  { d: tail.d, t: if n.v == 0 && tail.some { tail.t } else { bytes_concat_all([b"{", joined(atoms.ts, b", "), prefixed(tail, b" | "), b"}"]) } }
+}
+
+// --- Literals
+
+fn escape(c: Int, raw: Bool) -> Bytes =
+  if c == 34 { b"\\\"" } else if c == 92 { b"\\\\" } else if c == 10 { b"\\n" } else if c == 9 { b"\\t" } else if c == 13 { b"\\r" } else if c == 0 { b"\\0" }
+  else if raw || (c >= 32 && c <= 126) { byte_of(c) } else { bytes_concat_all([b"\\x", hex_digit(c >>> 4), hex_digit(c & 15)]) }
+
+fn str_lit(s: Bytes) -> Bytes = bytes_concat_all([b"\"", bytes_concat_all(map(range(0, bytes_len(s)), |i: Int| escape(bytes_at(s, i), true))), b"\""])
+
+fn bytes_lit(s: Bytes) -> Bytes = bytes_concat_all([b"b\"", bytes_concat_all(map(range(0, bytes_len(s)), |i: Int| escape(bytes_at(s, i), false))), b"\""])
+
+fn hex_int(v: Int, bits: Int) -> Bytes = {
+  let n = bits / 4;
+  let ds = map(range(0, n), |i: Int| (v >>> (4 * (n - 1 - i))) & 15);
+  let lead = fold(range(0, n), n - 1, |acc: Int, j: Int| if at(ds, j) != 0 && j < acc { j } else { acc });
+  bytes_concat(b"0x", bytes_concat_all(map(range(lead, n), |j: Int| hex_digit(at(ds, j)))))
+}
+
+// A negative literal is spelled as its bit pattern: `-5` would read back as a negation.
+fn int_text(v: Int) -> Bytes = if v >= 0 { num(v) } else { hex_int(v, 64) }
+
+fn fixed_text(which: Int, v: Int) -> Bytes =
+  match list_at(widths(), which) {
+    None -> panic("a byte that is not a fixed-width integer type"),
+    Some(w) -> bytes_concat(if v >= 0 { num(v) } else { hex_int(if w.bits == 64 { v } else { v & ((1 << w.bits) - 1) }, w.bits) }, w.name),
+  }
+
+// Little-endian limbs of nine decimal digits.
+fn big_mul(n: List<Int>, f: Int, add: Int) -> List<Int> = {
+  let r = fold(n, { limbs: [], carry: add }, |s: { limbs: List<Int>, carry: Int }, limb: Int| {
+    let v = limb * f + s.carry;
+    { limbs: push(s.limbs, v % 1000000000), carry: v / 1000000000 }
+  });
+  iterate(r, 4, |s: { limbs: List<Int>, carry: Int }|
+    if s.carry == 0 { Stop(s) } else { Continue({ limbs: push(s.limbs, s.carry % 1000000000), carry: s.carry / 1000000000 }) }).limbs
+}
+
+fn pow_int(b: Int, k: Int) -> Int = fold(range(0, k), 1, |a: Int, i: Int| a * b)
+
+// `n * base^e`, a chunk that keeps each limb's product inside an `Int` at a time.
+fn big_pow(n: List<Int>, base: Int, e: Int) -> List<Int> = {
+  let chunk = if base == 5 { 13 } else { 30 };
+  big_mul(fold(range(0, e / chunk), n, |acc: List<Int>, i: Int| big_mul(acc, pow_int(base, chunk), 0)), pow_int(base, e % chunk), 0)
+}
+
+fn big_digits(n: List<Int>) -> Bytes = {
+  let top = fold(range(0, len(n)), 0, |t: Int, i: Int| if at(n, i) != 0 { i } else { t });
+  bytes_concat_all(map(range(0, top + 1), |j: Int| { let d = num(at(n, top - j)); if j == 0 { d } else { bytes_concat(zeros(9 - bytes_len(d)), d) } }))
+}
+
+fn decimal_text(m: Bytes, scale: Int) -> Bytes =
+  if scale > 28 || fold(range(12, 16), false, |b: Bool, i: Int| b || bytes_at(m, i) != 0) { panic("a mantissa and scale that are not a `Decimal`") } else {
+    let ds = big_digits(fold(range(0, 12), [0], |acc: List<Int>, i: Int| big_mul(acc, 256, bytes_at(m, 11 - i))));
+    let padded = if bytes_len(ds) <= scale { bytes_concat(zeros(scale - bytes_len(ds) + 1), ds) } else { ds };
+    let point = bytes_len(padded) - scale;
+    bytes_concat(if scale == 0 { ds } else { bytes_concat_all([bytes_slice(padded, 0, point), b".", bytes_slice(padded, point, bytes_len(padded))]) }, b"m")
+  }
+
+// `digits` with the point after the first, times ten to `exp`.
+type Rounded = { digits: Bytes, exp: Int, p: Int }
+
+fn trim_zeros(s: Bytes) -> Bytes = bytes_slice(s, 0, fold(range(0, bytes_len(s)), 1, |acc: Int, i: Int| if bytes_at(s, i) != 48 { i + 1 } else { acc }))
+
+fn sci(s: Bytes, x: Int) -> Bytes =
+  bytes_concat_all([bytes_slice(s, 0, 1), if bytes_len(s) > 1 { bytes_concat(b".", bytes_slice(s, 1, bytes_len(s))) } else { b"" }, b"e", num(x)])
+
+fn round_to(ds: Bytes, x0: Int, p: Int) -> Rounded = {
+  let head = bytes_slice(ds, 0, p);
+  if p >= bytes_len(ds) || bytes_at(ds, p) < 53 { { digits: trim_zeros(head), exp: x0, p: p } }
+  else {
+    let k = fold(range(0, p), 0 - 1, |acc: Int, i: Int| if bytes_at(head, i) != 57 { i } else { acc });
+    if k < 0 { { digits: b"1", exp: x0 + 1, p: p } }
+    else { { digits: bytes_concat(bytes_slice(head, 0, k), byte_of(bytes_at(head, k) + 1)), exp: x0, p: p } }
+  }
+}
+
+fn reads_back(r: Rounded, mag: Int) -> Bool =
+  match float_of_string(string_of_bytes(sci(r.digits, r.exp))) { Some(f) -> bits_of_float(f) == mag, None -> false }
+
+// Seventeen digits always read back; fewer usually do.
+fn shortest(ds: Bytes, x0: Int, mag: Int) -> Rounded =
+  iterate({ digits: ds, exp: x0, p: 1 }, 19, |s: Rounded|
+    if s.p > 17 || s.p > bytes_len(ds) { Stop({ digits: trim_zeros(ds), exp: x0, p: s.p }) }
+    else { let r = round_to(ds, x0, s.p); if reads_back(r, mag) { Stop(r) } else { Continue({..s, p: s.p + 1}) } })
+
+// As `render_float` spells it: the shorter of positional and exponential, never mistakable for an integer.
+fn float_spelling(r: Rounded) -> Bytes = {
+  let s = r.digits;
+  let n = bytes_len(s);
+  let positional = if r.exp >= n - 1 { bytes_concat(s, zeros(r.exp - n + 1)) }
+    else if r.exp >= 0 { bytes_concat_all([bytes_slice(s, 0, r.exp + 1), b".", bytes_slice(s, r.exp + 1, n)]) }
+    else { bytes_concat_all([b"0.", zeros(0 - r.exp - 1), s]) };
+  let exponential = sci(s, r.exp);
+  let text = if bytes_len(exponential) < bytes_len(positional) { exponential } else { positional };
+  match bytes_index_of(text, b".") { Some(_) -> text, None -> match bytes_index_of(text, b"e") { Some(_) -> text, None -> bytes_concat(text, b".0") } }
+}
+
+// Exact digits first: a double is `m * 2^e`, which is `m * 5^-e` over a power of ten.
+fn float_text(bits: Int) -> Bytes = {
+  let mag = bits & 0x7FFFFFFFFFFFFFFF;
+  let sign = if bits < 0 { b"-" } else { b"" };
+  let ex = mag >>> 52;
+  let fr = mag & 0xFFFFFFFFFFFFF;
+  if ex == 2047 && fr != 0 { panic("a NaN, which no literal spells") }
+  else if ex == 2047 { bytes_concat(sign, b"1e400") }
+  else if mag == 0 { bytes_concat(sign, b"0.0") }
+  else {
+    let m = if ex == 0 { fr } else { fr | 0x10000000000000 };
+    let e2 = if ex == 0 { 0 - 1074 } else { ex - 1075 };
+    let start = [m % 1000000000, m / 1000000000];
+    let ds = big_digits(if e2 >= 0 { big_pow(start, 2, e2) } else { big_pow(start, 5, 0 - e2) });
+    let x0 = bytes_len(ds) - 1 + (if e2 >= 0 { 0 } else { e2 });
+    bytes_concat(sign, float_spelling(shortest(ds, x0, mag)))
+  }
+}
+
+fn p_lit(d: Dc) -> Got = {
+  let t = rd_u8(d);
+  let e = t.d;
+  if t.v == t_lit_int() { let v = rd_int(e, 8); { d: v.d, t: int_text(v.v) } }
+  else if t.v == t_lit_bool() { let b = rd_bool(e); { d: b.d, t: if b.v { b"true" } else { b"false" } } }
+  else if t.v == t_lit_str() { let s = rd_text(e); { d: s.d, t: str_lit(s.t) } }
+  else if t.v == t_lit_bytes() { let s = rd_text(e); { d: s.d, t: bytes_lit(s.t) } }
+  else if t.v == t_lit_float() { let v = rd_int(e, 8); { d: v.d, t: float_text(v.v) } }
+  else if t.v == t_lit_decimal() { let m = rd_bytes(e, 16); let s = rd_u32(m.d); { d: s.d, t: decimal_text(m.t, s.v) } }
+  else if t.v == t_lit_fixed() { let w = rd_u8(e); let v = rd_int(w.d, 8); { d: v.d, t: fixed_text(w.v, v.v) } }
+  else if t.v == t_lit_unit() { { d: e, t: b"()" } }
+  else { panic("a tag that is not a literal") }
+}
+
+// --- Patterns, expressions and statements
+
+fn p_pat(x: Pr, d: Dc) -> Got = {
+  let t = rd_u8(d);
+  let e = t.d;
+  if t.v == t_p_wildcard() { { d: e, t: b"_" } }
+  else if t.v == t_p_var() { { d: {..e, values: e.values + 1}, t: lname(e.values) } }
+  else if t.v == t_p_lit() { p_lit(e) }
+  else if t.v == t_p_ctor() {
+    let name = rd_ctor(x, e);
+    let n = rd_count(name.d);
+    let args = rd_many(n.d, n.v, |g: Dc| p_pat(x, g));
+    { d: args.d, t: if n.v == 0 { name.t } else { bytes_concat_all([name.t, b"(", joined(args.ts, b", "), b")"]) } }
+  } else if t.v == t_p_record() {
+    let n = rd_count(e);
+    let fs = rd_many(n.d, n.v, |g: Dc| { let f = rd_text(g); let p = p_pat(x, f.d); { d: p.d, t: bytes_concat_all([f.t, b": ", p.t]) } });
+    let rest = rd_bool(fs.d);
+    { d: rest.d, t: bytes_concat_all([b"{", joined(fs.ts, b", "), if !rest.v { b"" } else if n.v > 0 { b", .." } else { b".." }, b"}"]) }
+  } else if t.v == t_p_list() {
+    let n = rd_count(e);
+    let items = rd_many(n.d, n.v, |g: Dc| p_pat(x, g));
+    let named = peek(skip(items.d)) == t_p_var();
+    let rest = rd_opt(items.d, |g: Dc| p_pat(x, g));
+    { d: rest.d, t: bytes_concat_all([b"[", joined(items.ts, b", "),
+        if !rest.some { b"" } else { bytes_concat_all([if n.v > 0 { b", " } else { b"" }, b"..", if named { rest.t } else { b"" }]) }, b"]"]) }
+  } else { panic("a tag that does not begin a pattern") }
+}
+
+fn parens(g: Got, bare: Bool) -> Got = if bare { g } else { { d: g.d, t: bytes_concat_all([b"(", g.t, b")"]) } }
+
+// A primary the parser reads whole, so it may stand bare as an operand or scrutinee.
+fn is_atomic(d: Dc) -> Bool = {
+  let t = peek(d);
+  t == t_e_lit() || t == t_e_var() || t == t_e_app() || t == t_e_field() || t == t_e_list() || t == t_e_perform()
+}
+
+fn is_base(d: Dc) -> Bool = { let t = peek(d); t == t_e_var() || t == t_e_app() || t == t_e_field() || t == t_e_perform() }
+
+fn p_operand(x: Pr, d: Dc, depth: Int) -> Got = parens(p_expr(x, d, depth), is_atomic(d))
+
+// The body positions the grammar spells with braces.
+fn p_block(x: Pr, d: Dc, depth: Int) -> Got =
+  if peek(d) == t_e_block() { p_expr(x, d, depth) }
+  else { let g = p_expr(x, d, depth + 1); { d: g.d, t: bytes_concat_all([b"{", nl(depth + 1), g.t, nl(depth), b"}"]) } }
+
+fn binop_text(op: Int) -> Bytes =
+  match list_at([b"+", b"-", b"*", b"/", b"%", b"==", b"!=", b"<", b"<=", b">", b">=", b"&&", b"||", b"++", b"&", b"|", b"^", b"<<", b">>", b">>>"], op - 1) {
+    Some(t) -> t,
+    None -> panic("a byte that is not a binary operator"),
+  }
+
+fn unop_text(op: Int) -> Bytes = if op == 1 { b"-" } else if op == 2 { b"!" } else if op == 3 { b"~" } else { panic("a byte that is not a unary operator") }
+
+// `if c { t }` is the parser's own spelling of an `else ()`.
+fn p_if(x: Pr, d: Dc, depth: Int) -> Got = {
+  let c = p_operand(x, d, depth);
+  let th = p_block(x, c.d, depth);
+  let el = th.d;
+  let tail: Got = if peek(el) == t_e_lit() && peek(skip(el)) == t_lit_unit() { { d: {..el, pos: el.pos + 2}, t: b"" } }
+    else if peek(el) == t_e_if() { let g = p_expr(x, el, depth); { d: g.d, t: bytes_concat(b" else ", g.t) } }
+    else { let g = p_block(x, el, depth); { d: g.d, t: bytes_concat(b" else ", g.t) } };
+  { d: tail.d, t: bytes_concat_all([b"if ", c.t, b" ", th.t, tail.t]) }
+}
+
+fn p_expr(x: Pr, d: Dc, depth: Int) -> Got = {
+  let t = rd_u8(d);
+  let e = t.d;
+  let inner = depth + 1;
+  if t.v == t_e_lit() { p_lit(e) }
+  else if t.v == t_e_var() { rd_value(x, e) }
+  else if t.v == t_e_binary() {
+    let op = rd_u8(e);
+    let l = p_operand(x, op.d, depth);
+    let r = p_operand(x, l.d, depth);
+    { d: r.d, t: bytes_concat_all([l.t, b" ", binop_text(op.v), b" ", r.t]) }
+  } else if t.v == t_e_unary() {
+    let op = rd_u8(e);
+    let o = p_operand(x, op.d, depth);
+    { d: o.d, t: bytes_concat(unop_text(op.v), o.t) }
+  } else if t.v == t_e_lambda() {
+    let n = rd_count(e);
+    let anns = rd_many(n.d, n.v, |g: Dc| { let o = rd_opt(g, |h: Dc| p_type(x, h)); { d: o.d, t: prefixed(o, b": ") } });
+    let base = anns.d.values;
+    let body = p_expr(x, {..anns.d, values: base + n.v}, depth);
+    let ps = map(range(0, n.v), |i: Int| bytes_concat(lname(base + i), at(anns.ts, i)));
+    { d: {..body.d, values: base}, t: bytes_concat_all([if n.v == 0 { b"||" } else { bytes_concat_all([b"|", joined(ps, b", "), b"|"]) }, b" ", body.t]) }
+  } else if t.v == t_e_app() {
+    // `r.f(x)` performs an effect, so a call through anything but a name is parenthesized.
+    let f = parens(p_expr(x, e, depth), peek(e) == t_e_var());
+    let n = rd_count(f.d);
+    let args = rd_many(n.d, n.v, |g: Dc| p_expr(x, g, depth));
+    { d: args.d, t: bytes_concat_all([f.t, b"(", joined(args.ts, b", "), b")"]) }
+  } else if t.v == t_e_if() { p_if(x, e, depth) }
+  else if t.v == t_e_match() {
+    let s = p_operand(x, e, depth);
+    let n = rd_count(s.d);
+    let arms = rd_many(n.d, n.v, |g: Dc| {
+      let p = p_pat(x, expect(g, t_arm(), b"a match arm"));
+      let guard = rd_opt(p.d, |h: Dc| p_expr(x, h, inner));
+      let body = p_expr(x, guard.d, inner);
+      { d: {..body.d, values: g.values}, t: bytes_concat_all([nl(inner), p.t, prefixed(guard, b" if "), b" -> ", body.t, b","]) }
+    });
+    { d: arms.d, t: bytes_concat_all([b"match ", s.t, b" {", bytes_concat_all(arms.ts), nl(depth), b"}"]) }
+  } else if t.v == t_e_block() {
+    let n = rd_count(e);
+    let stmts = rd_many(n.d, n.v, |g: Dc| { let s = p_stmt(x, g, inner); { d: s.d, t: bytes_concat(nl(inner), s.t) } });
+    let tail = rd_opt(stmts.d, |g: Dc| p_expr(x, g, inner));
+    { d: {..tail.d, values: e.values}, t: bytes_concat_all([b"{", bytes_concat_all(stmts.ts), prefixed(tail, nl(inner)), nl(depth), b"}"]) }
+  } else if t.v == t_e_record() {
+    let n = rd_count(e);
+    let fs = rd_many(n.d, n.v, |g: Dc| { let f = rd_text(g); let v = p_expr(x, f.d, depth); { d: v.d, t: bytes_concat_all([f.t, b": ", v.t]) } });
+    { d: fs.d, t: bytes_concat_all([b"{", joined(fs.ts, b", "), b"}"]) }
+  } else if t.v == t_e_field() {
+    let b = parens(p_expr(x, e, depth), is_base(e));
+    let f = rd_text(b.d);
+    { d: f.d, t: bytes_concat_all([b.t, b".", f.t]) }
+  } else if t.v == t_e_list() {
+    let n = rd_count(e);
+    let items = rd_many(n.d, n.v, |g: Dc| p_expr(x, g, depth));
+    { d: items.d, t: bytes_concat_all([b"[", joined(items.ts, b", "), b"]"]) }
+  } else if t.v == t_e_perform() {
+    let eff = rd_effect(x, e);
+    let op = rd_text(eff.d);
+    let r = rd_opt(op.d, rd_text);
+    let n = rd_count(r.d);
+    let args = rd_many(n.d, n.v, |g: Dc| p_expr(x, g, depth));
+    { d: args.d, t: bytes_concat_all([eff.t, b".", op.t, bracketed(r), b"(", joined(args.ts, b", "), b")"]) }
+  } else if t.v == t_e_handle() {
+    let body = p_expr(x, e, depth);
+    let n = rd_count(body.d);
+    let clauses = rd_many(n.d, n.v, |g: Dc| {
+      let eff = rd_effect(x, expect(g, t_clause(), b"a handler clause"));
+      let op = rd_text(eff.d);
+      let r = rd_opt(op.d, rd_text);
+      let k = rd_binders(r.d);
+      let bound = g.values + k.v;
+      let resumed = rd_opt({..k.d, values: bound}, |h: Dc| { d: h, t: bytes_concat(b" resume ", lname(bound)) });
+      let cb = p_expr(x, {..resumed.d, values: if resumed.some { bound + 1 } else { bound }}, inner);
+      { d: {..cb.d, values: g.values},
+        t: bytes_concat_all([nl(inner), eff.t, b".", op.t, bracketed(r), b"(", joined(map(range(0, k.v), |i: Int| lname(g.values + i)), b", "), b")",
+                             resumed.t, b" -> ", cb.t, b","]) }
+    });
+    let ret = rd_opt(clauses.d, |g: Dc| {
+      let h = expect(g, t_return_clause(), b"a return clause");
+      let rb = p_expr(x, {..h, values: g.values + 1}, inner);
+      { d: {..rb.d, values: g.values}, t: bytes_concat_all([nl(inner), b"return ", lname(g.values), b" -> ", rb.t, b","]) }
+    });
+    { d: ret.d, t: bytes_concat_all([b"handle ", body.t, b" with {", bytes_concat_all(clauses.ts), ret.t, nl(depth), b"}"]) }
+  } else if t.v == t_e_with_cell() {
+    let r = rd_text(e);
+    let init = p_expr(x, r.d, depth);
+    let at_ = init.d.values;
+    let body = p_expr(x, {..init.d, values: at_ + 1}, inner);
+    { d: {..body.d, values: at_}, t: bytes_concat_all([b"with_cell[", r.t, b"](", init.t, b") {", nl(inner), lname(at_), b" -> ", body.t, nl(depth), b"}"]) }
+  } else if t.v == t_e_with_region() {
+    let r = rd_text(e);
+    let body = p_block(x, r.d, depth);
+    { d: body.d, t: bytes_concat_all([b"with_region[", r.t, b"] ", body.t]) }
+  } else if t.v == t_e_simulate() { let body = p_block(x, e, depth); { d: body.d, t: bytes_concat(b"simulate ", body.t) } }
+  else { panic(string_of_bytes(bytes_concat(b"a tag that does not begin an expression: ", num(t.v)))) }
+}
+
+fn p_stmt(x: Pr, d: Dc, depth: Int) -> Got = {
+  let t = rd_u8(d);
+  if t.v == t_s_let() {
+    let ty = rd_opt(t.d, |g: Dc| p_type(x, g));
+    let v = p_expr(x, ty.d, depth);
+    let p = p_pat(x, v.d);
+    { d: p.d, t: bytes_concat_all([b"let ", p.t, prefixed(ty, b": "), b" = ", v.t, b";"]) }
+  } else if t.v == t_s_expr() { let g = p_expr(x, t.d, depth); { d: g.d, t: bytes_concat(g.t, b";") } }
+  else { panic("a tag that does not begin a statement") }
+}
+
+// --- Items
+
+fn p_param_slot(x: Pr, d: Dc) -> Got = {
+  let t = rd_u8(d);
+  if t.v == t_none() { { d: t.d, t: b"" } }
+  else if t.v == t_some() { let ty = p_type(x, t.d); { d: ty.d, t: bytes_concat(b": ", ty.t) } }
+  else if t.v == t_param_default() {
+    let ty = rd_opt(t.d, |g: Dc| p_type(x, g));
+    let v = p_expr(x, ty.d, 0);
+    { d: v.d, t: bytes_concat_all([prefixed(ty, b": "), b" = ", v.t]) }
+  } else { panic("a tag that does not open a parameter") }
+}
+
+fn p_constraint(d: Dc) -> Got = {
+  let l = rd_u32(expect(d, t_constraint(), b"a constraint"));
+  let k = rd_u8(l.d);
+  let deriver = if k.v == 1 { b"json" } else if k.v == 2 { b"eq" } else if k.v == 3 { b"ord" } else { panic("a byte that is not a deriver") };
+  { d: k.d, t: bytes_concat_all([b"derivable(", deriver, b", ", tname(l.v), b")"]) }
+}
+
+fn p_fn(x: Pr, d: Dc, name: Bytes) -> Got = {
+  let tc = rd_binders(expect(d, t_fn(), b"a function"));
+  let ec = rd_binders(tc.d);
+  let generics = if tc.v == 0 && ec.v == 0 { b"" } else {
+    bytes_concat_all([b"<", joined(map(range(0, tc.v), tname), b", "), if ec.v > 0 { bytes_concat(b" | ", joined(map(range(0, ec.v), ename), b", ")) } else { b"" }, b">"]) };
+  let n = rd_count({..ec.d, typs: tc.v, rows: ec.v});
+  let ps = rd_many(n.d, n.v, |g: Dc| p_param_slot(x, g));
+  let ret = rd_opt(ps.d, |g: Dc| p_ret(x, g));
+  let row = rd_opt(ret.d, |g: Dc| p_row(x, g));
+  let cs = rd_count(row.d);
+  let derives = rd_many(cs.d, cs.v, p_constraint);
+  let body = p_expr(x, {..derives.d, values: n.v}, 0);
+  { d: body.d, t: bytes_concat_all([b"fn ", name, generics, b"(", joined(map(range(0, n.v), |i: Int| bytes_concat(lname(i), at(ps.ts, i))), b", "), b")",
+                                    prefixed(ret, b" -> "), prefixed(row, b" / "), if cs.v > 0 { bytes_concat(b" where ", joined(derives.ts, b", ")) } else { b"" },
+                                    b" =\n  ", body.t]) }
+}
+
+fn p_type_def(x: Pr, d: Dc, name: Bytes) -> Got = {
+  let n = rd_binders(expect(d, t_type(), b"a type"));
+  let k = rd_u8({..n.d, typs: n.v});
+  // Every variant keeps its `|`: a single-variant sum without one reads as an alias.
+  let body: Got = if k.v == t_type_alias() { p_type(x, k.d) }
+    else if k.v == t_type_sum() {
+      let vn = rd_count(k.d);
+      let vs = rd_many(vn.d, vn.v, |g: Dc| {
+        let vname = rd_text(expect(g, t_variant(), b"a variant"));
+        let fc = rd_count(vname.d);
+        let fs = rd_many(fc.d, fc.v, |h: Dc| p_type(x, h));
+        { d: fs.d, t: bytes_concat_all([b"| ", vname.t, if fc.v > 0 { bytes_concat_all([b"(", joined(fs.ts, b", "), b")"]) } else { b"" }, b" "]) }
+      });
+      { d: vs.d, t: bytes_concat_all(vs.ts) }
+    } else { panic("a tag that does not begin a type body") };
+  { d: body.d, t: bytes_concat_all([b"type ", name, if n.v > 0 { bytes_concat_all([b"<", joined(map(range(0, n.v), tname), b", "), b">"]) } else { b"" }, b" = ", body.t]) }
+}
+
+fn p_effect(x: Pr, d: Dc, name: Bytes) -> Got = {
+  let nd = rd_bool(expect(d, t_effect(), b"an effect"));
+  let n = rd_count(nd.d);
+  let ops = rd_many(n.d, n.v, |g: Dc| {
+    let op = rd_text(expect(g, t_op(), b"an operation"));
+    let m = rd_mode(op.d);
+    let r = rd_bool(m.d);
+    let pc = rd_count(r.d);
+    let ps = rd_many(pc.d, pc.v, |h: Dc| p_type(x, h));
+    let ret = p_type(x, ps.d);
+    { d: ret.d, t: bytes_concat_all([nl(1), m.t, b" ", op.t, if r.v { b"[r]" } else { b"" }, b"(", joined(ps.ts, b", "), b") -> ", ret.t]) }
+  });
+  { d: ops.d, t: bytes_concat_all([if nd.v { b"nondet " } else { b"" }, b"effect ", name, b" {", bytes_concat_all(ops.ts), b"\n}"]) }
+}
+
+// Everything is `pub`: visibility is metadata the encoding erased.
+fn p_item(x: Pr, d: Dc, name: Bytes) -> Got = {
+  let t = peek(d);
+  let g = if t == t_fn() { p_fn(x, d, name) } else if t == t_type() { p_type_def(x, d, name) } else if t == t_effect() { p_effect(x, d, name) }
+          else { panic("a tag that does not begin a definition") };
+  if g.d.pos != bytes_len(g.d.b) { panic("bytes remain after the definition") } else { { d: g.d, t: bytes_concat(b"pub ", g.t) } }
+}
+
+fn p_test(x: Pr, d: Dc, label: Bytes) -> Got = {
+  let nd = rd_bool(expect(d, t_test(), b"a test"));
+  let body = p_block(x, nd.d, 0);
+  if body.d.pos != bytes_len(body.d.b) { panic("bytes remain after the test") }
+  else { { d: body.d, t: bytes_concat_all([if nd.v { b"test/nondet " } else { b"test " }, str_lit(label), b" ", body.t]) } }
+}
+
+// --- The layout
+
+type Named = { module: Bytes, simple: Bytes }
+// A component's members in class order and their hashes; `key` is the hash this body is filed under.
+type Comp = { members: List<Bytes>, hashes: List<Bytes>, id: Bytes, key: Bytes }
+type Copied = { module: Bytes, names: List<Bytes> }
+type Parting = { seen: Map<Bytes, Bool>, declared: Map<Bytes, Bytes>, parts: List<Part>, bad: Option<Refusal> }
+type Sheet = { items: List<Bytes>, imports: Map<Bytes, Bytes> }
+
+fn refuse(message: Bytes, notes: List<Bytes>) -> Option<Refusal> = Some({ message: message, notes: notes })
+
+fn comp_of(body: Bytes) -> Comp = {
+  let k = rd_u8(fresh_dc(body));
+  if k.v == 0 { let payload = bytes_slice(body, 1, bytes_len(body)); let id = blake3(payload); { members: [payload], hashes: [id], id: id, key: id } }
+  else if k.v == 1 {
+    let class = rd_u32(k.d);
+    let payload = bytes_slice(body, 5, bytes_len(body));
+    let c = rd_count(fresh_dc(payload));
+    let ms = rd_many(c.d, c.v, rd_text);
+    if ms.d.pos != bytes_len(payload) || class.v >= c.v { panic("a malformed component body") } else {
+      let id = blake3(payload);
+      { members: ms.ts, hashes: map(range(0, c.v), |i: Int| member_hash(id, i)), id: id, key: member_hash(id, class.v) }
+    }
+  } else { panic("a stored body of a kind this build does not read") }
+}
+
+fn listed(ns: List<Named>) -> Bytes = backticked(map(ns, |n: Named| qualify(n.module, n.simple)), b", ")
+
+// The names by hash, each hash's sorted by module and then name.
+fn named_of(names: List<{ name: Bytes, hash: Bytes }>, keys: Map<Bytes, Bool>) -> { named: Map<Bytes, Map<Bytes, Named>>, bad: Option<Refusal> } =
+  fold(names, { named: map_new(), bad: None }, |acc: { named: Map<Bytes, Map<Bytes, Named>>, bad: Option<Refusal> }, n: { name: Bytes, hash: Bytes }|
+    match acc.bad {
+      Some(_) -> acc,
+      None -> {
+        let simple = default_binder(n.name);
+        if bytes_len(simple) == bytes_len(n.name) { {..acc, bad: refuse(bytes_concat_all([b"`", n.name, b"` names no module"]), [])} }
+        else if !map_contains(keys, n.hash) { {..acc, bad: refuse(bytes_concat_all([b"`", n.name, b"` has no body"]), [])} }
+        else {
+          let module = bytes_slice(n.name, 0, bytes_len(n.name) - bytes_len(simple) - 1);
+          let had = match map_get(acc.named, n.hash) { Some(m) -> m, None -> map_new() };
+          {..acc, named: map_insert(acc.named, n.hash, map_insert(had, bytes_concat_all([module, b"\x00", simple]), { module: module, simple: simple }))}
+        }
+      },
+    })
+
+// A module's `n`th name of each class make one copy; none if its classes differ in count.
+fn copies(classes: List<List<Named>>) -> Option<List<Copied>> =
+  if len(classes) == 1 { Some(map(at(classes, 0), |n: Named| { module: n.module, names: [n.simple] })) } else {
+    let by_module = fold(range(0, len(classes)), map_new(), |acc: Map<Bytes, List<List<Bytes>>>, c: Int|
+      fold(at(classes, c), acc, |a: Map<Bytes, List<List<Bytes>>>, n: Named| {
+        let rows = match map_get(a, n.module) { Some(r) -> r, None -> map(classes, |k: List<Named>| []) };
+        map_insert(a, n.module, set_at(rows, c, push(at(rows, c), n.simple)))
+      }));
+    map_fold(by_module, Some([]), |acc: Option<List<Copied>>, m: Bytes, rows: List<List<Bytes>>|
+      match acc {
+        None -> None,
+        Some(out) -> {
+          let count = len(at(rows, 0));
+          if fold(rows, false, |b: Bool, r: List<Bytes>| b || len(r) != count) { None }
+          else { Some(fold(range(0, count), out, |o: List<Copied>, k: Int| push(o, { module: m, names: map(rows, |r: List<Bytes>| at(r, k)) }))) }
+        },
+      })
+  }
+
+fn part_in(acc: Parting, c: Comp, named: Map<Bytes, Map<Bytes, Named>>, shipped: List<Bytes>) -> Parting = {
+  let classes = map(c.hashes, |h: Bytes| match map_get(named, h) { Some(m) -> map_values(m), None -> [] });
+  let checked = fold(range(0, len(c.hashes)), acc, |a: Parting, i: Int|
+    match a.bad {
+      Some(_) -> a,
+      None -> {
+        let all = at(classes, i);
+        let h = at(c.hashes, i);
+        let kind = bytes_at(at(c.members, i), 0);
+        if len(all) == 0 { {..a, bad: refuse(bytes_concat_all([b"the body `", short_hex(h), b"` has no name"]), [])} }
+        else if kind == t_effect() && len(all) > 1 {
+          {..a, bad: refuse(bytes_concat(listed(all), b" are one effect declaration, so a body cannot say which it performs"),
+                            [b"make the declarations differ, or keep one of them"])}
+        } else {
+          fold(all, a, |b: Parting, n: Named| {
+            let q = qualify(n.module, n.simple);
+            let key = bytes_concat(byte_of(kind), q);
+            match map_get(b.declared, key) {
+              Some(other) -> if other == h || is_some(b.bad) { b } else { {..b, bad: refuse(bytes_concat_all([b"`", q, b"` names two different definitions"]), [])} },
+              None -> {..b, declared: map_insert(b.declared, key, h)},
+            }
+          })
+        }
+      },
+    });
+  match checked.bad {
+    Some(_) -> checked,
+    None -> match copies(classes) {
+      None -> {..checked, bad: refuse(bytes_concat(listed(fold(classes, [], |o: List<Named>, ns: List<Named>| append(o, ns))),
+                                                   b" are a mutually recursive group in which two definitions share one body, so a call cannot say which it reaches"),
+                                      [b"make the definitions differ, or keep one of them"])},
+      Some(cs) -> {..checked, parts: fold(cs, checked.parts, |ps: List<Part>, cp: Copied|
+        push(ps, { members: c.members, hashes: c.hashes, names: cp.names, module: cp.module, binder: default_binder(cp.module), printed: !contains_bytes(shipped, cp.module) }))},
+    },
+  }
+}
+
+fn is_some(o: Option<Refusal>) -> Bool = match o { Some(_) -> true, None -> false }
+
+// Modules sharing a last segment are bound by their whole path instead, numbered past a clash.
+fn binders(modules: List<Bytes>) -> Map<Bytes, Bytes> = {
+  let sharing = fold(modules, map_new(), |acc: Map<Bytes, Int>, m: Bytes|
+    map_insert(acc, default_binder(m), 1 + match map_get(acc, default_binder(m)) { Some(k) -> k, None -> 0 }));
+  let start = { taken: map_fold(sharing, map_new(), |acc: Map<Bytes, Bool>, b: Bytes, k: Int| map_insert(acc, b, true)), out: map_new() };
+  let done = fold(modules, start, |s: { taken: Map<Bytes, Bool>, out: Map<Bytes, Bytes> }, m: Bytes| {
+    let own = default_binder(m);
+    if (match map_get(sharing, own) { Some(k) -> k == 1, None -> true }) { {..s, out: map_insert(s.out, m, own)} }
+    else {
+      let base = joined(bytes_split(m, b"."), b"_");
+      let found = iterate({ n: 1, binder: base }, 2 * len(modules) + 2, |t: { n: Int, binder: Bytes }|
+        if map_contains(s.taken, t.binder) { Continue({ n: t.n + 1, binder: bytes_concat_all([base, b"_", num(t.n + 1)]) }) } else { Stop(t) });
+      { taken: map_insert(s.taken, found.binder, true), out: map_insert(s.out, m, found.binder) }
+    }
+  });
+  done.out
+}
+
+fn layout_of(parts: List<Part>, relink: Map<Bytes, Bytes>) -> Layout = {
+  let bound = binders(map_keys(fold(parts, map_new(), |acc: Map<Bytes, Bool>, p: Part| map_insert(acc, p.module, true))));
+  let placed = map(parts, |p: Part| {..p, binder: match map_get(bound, p.module) { Some(b) -> b, None -> p.binder }});
+  { parts: placed,
+    by_hash: fold(range(0, len(placed)), map_new(), |acc: Map<Bytes, List<Slot>>, u: Int| {
+      let hashes = at(placed, u).hashes;
+      fold(range(0, len(hashes)), acc, |a: Map<Bytes, List<Slot>>, c: Int|
+        map_insert(a, at(hashes, c), push(match map_get(a, at(hashes, c)) { Some(xs) -> xs, None -> [] }, { part: u, class: c })))
+    }),
+    relink: relink }
+}
+
+// Its own module is never imported, whatever a reference inside it asked for.
+fn print_parts(l: Layout) -> { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool> } =
+  fold(range(0, len(l.parts)), { modules: map_new(), missing: map_new() }, |acc: { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool> }, u: Int| {
+    let p = at(l.parts, u);
+    if !p.printed { acc } else {
+      let x = { layout: l, part: u, own: p.module };
+      let walked = fold(range(0, len(p.members)), { d: {..fresh_dc(b""), missing: acc.missing}, ts: [] }, |s: Many, c: Int| {
+        let g = p_item(x, {..s.d, b: at(p.members, c), pos: 0, values: 0, typs: 0, rows: 0}, at(p.names, c));
+        { d: g.d, ts: push(s.ts, g.t) }
+      });
+      let had = match map_get(acc.modules, p.module) { Some(m) -> m, None -> { items: [], imports: map_new() } };
+      { modules: map_insert(acc.modules, p.module, { items: append(had.items, walked.ts), imports: map_merge(had.imports, map_remove(walked.d.imports, p.module)) }),
+        missing: walked.d.missing }
+    }
+  })
+
+// Each test in a module of its own, `t<index>`, numbering its effects afresh.
+fn print_tests(l: Layout, tests: List<Bytes>, missing: Map<Bytes, Bool>) -> Many = {
+  let x = { layout: l, part: 0 - 1, own: b"" };
+  fold(range(0, len(tests)), { d: {..fresh_dc(b""), missing: missing}, ts: [] }, |s: Many, i: Int| {
+    let body = at(tests, i);
+    if bytes_len(body) == 0 || bytes_at(body, 0) != 0 { panic("a test body that is not a solo body") } else {
+      let g = p_test(x, {..s.d, b: bytes_slice(body, 1, bytes_len(body)), pos: 0, values: 0, typs: 0, rows: 0, slots: map_new()}, bytes_concat(b"t", num(i)));
+      { d: g.d, ts: push(s.ts, g.t) }
+    }
+  })
+}
+
+fn sheet_text(s: Sheet) -> Bytes =
+  bytes_concat_all(append(
+    map_fold(s.imports, [], |acc: List<Bytes>, m: Bytes, b: Bytes|
+      push(acc, bytes_concat_all([b"import ", m, if b == default_binder(m) { b"" } else { bytes_concat(b" as ", b) }, b"\n"]))),
+    map(s.items, |it: Bytes| bytes_concat_all([b"\n", it, b"\n"]))))
+
+// Each body printed once under every name `names` gives its hash, a reference first redirected through
+// `relink`; a module in `shipped` is imported and not printed. Modules in byte order, then `ply_tests`.
+pub fn print_bodies(bodies: List<Bytes>, names: List<{ name: Bytes, hash: Bytes }>, tests: List<Bytes>,
+                    relink: List<{ from: Bytes, to: Bytes }>, shipped: List<Bytes>) -> Printing = {
+  let comps = map(bodies, comp_of);
+  let n = named_of(names, fold(comps, map_new(), |acc: Map<Bytes, Bool>, c: Comp| map_insert(acc, c.key, true)));
+  let parted: Parting = match n.bad {
+    Some(_) -> { seen: map_new(), declared: map_new(), parts: [], bad: n.bad },
+    None -> fold(comps, { seen: map_new(), declared: map_new(), parts: [], bad: None }, |acc: Parting, c: Comp|
+      if is_some(acc.bad) || map_contains(acc.seen, c.id) { acc } else { part_in({..acc, seen: map_insert(acc.seen, c.id, true)}, c, n.named, shipped) }),
+  };
+  match parted.bad {
+    Some(r) -> Unprintable(r),
+    None -> {
+      let l = layout_of(parted.parts, fold(relink, map_new(), |acc: Map<Bytes, Bytes>, r: { from: Bytes, to: Bytes }| map_insert(acc, r.from, r.to)));
+      let printed = print_parts(l);
+      let t = print_tests(l, tests, printed.missing);
+      let missing = map_keys(t.d.missing);
+      if len(missing) > 0 {
+        Unprintable({ message: bytes_concat(num(len(missing)), b" definitions a body refers to are not among the bodies"),
+                      notes: [bytes_concat(b"missing: ", joined(map(take(missing, min(8, len(missing))), short_hex), b", "))] })
+      } else {
+        let texts = map_fold(printed.modules, [], |acc: List<{ module: Bytes, text: Bytes }>, m: Bytes, s: Sheet| push(acc, { module: m, text: sheet_text(s) }));
+        Printed(if len(tests) == 0 { texts } else { push(texts, { module: b"ply_tests", text: sheet_text({ items: t.ts, imports: t.d.imports }) }) })
+      }
+    },
+  }
+}
+
 // --- Tests ------------------------------------------------------------------
 
 test "the little-endian encoders write what the reference writes" {
@@ -1271,4 +2116,63 @@ test "a mutually recursive pair hashes as one component with two members" {
   let d = bytes_of_string(hash_dump([{ name: b"m", src: b"fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\nfn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }" }]));
   assert(match bytes_index_of(d, b"C;m.even;m.even,m.odd;") { Some(_) -> true, None -> false });
   assert(match bytes_index_of(d, b"C;m.odd;m.even,m.odd;") { Some(_) -> true, None -> false })
+}
+
+test "a literal is spelled so it reads back to its bits" {
+  assert_eq(float_text(bits_of_float(0.1)), b"0.1");
+  assert_eq(float_text(bits_of_float(100.0)), b"100.0");
+  assert_eq(float_text(bits_of_float(1e300)), b"1e300");
+  assert_eq(float_text(bits_of_float(1.5e-7)), b"1.5e-7");
+  assert_eq(float_text(1), b"5e-324");
+  assert_eq(float_text(0x8000000000000000), b"-0.0");
+  assert_eq(decimal_text(i128_le_of_digits(b"50"), 3), b"0.050m");
+  assert_eq(decimal_text(i128_le_of_digits(b"79228162514264337593543950335"), 0), b"79228162514264337593543950335m");
+  assert_eq(int_text(0 - 1), b"0xffffffffffffffff");
+  assert_eq(fixed_text(4, 0 - 1), b"0xffi8");
+  assert_eq(bytes_lit(b"\x00\"q\xff"), b"b\"\\0\\\"q\\xff\"")
+}
+
+fn indexed(sources: List<Source>) -> Index =
+  match resolve_modules(map(range(0, len(sources)), |i: Int| {
+    let r = parse(at(sources, i).src);
+    let d: Expansion = expand_derives(i, expand(r.node, r.p.uses_sets, r.p.diags).module);
+    { name: at(sources, i).name, module: d.module, derived: d.derived }
+  })) {
+    Failed(_) -> panic("the fixture resolves"),
+    Resolved_(x) -> build_index(x.mods, x.r).index,
+  }
+
+fn named_hashes(out: HashOutput) -> List<{ name: Bytes, hash: Bytes }> = append(out.defs, out.decls)
+
+fn by_name(xs: List<{ name: Bytes, hash: Bytes }>) -> Map<Bytes, Bytes> =
+  fold(xs, map_new(), |m: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }| map_insert(m, x.name, x.hash))
+
+fn printed_of(out: HashOutput, shipped: List<Bytes>) -> List<{ module: Bytes, text: Bytes }> =
+  match print_bodies(map(out.bodies, |b: { name: Bytes, body: Bytes }| b.body), named_hashes(out), [], [], shipped) {
+    Printed(ms) -> ms,
+    Unprintable(why) -> panic(string_of_bytes(why.message)),
+  }
+
+fn holds_text(text: Bytes, part: Bytes) -> Bool = match bytes_index_of(text, part) { Some(_) -> true, None -> false }
+
+test "printed bodies hash back to what they were stored under, under their own names" {
+  let out = hash_index(indexed([
+    { name: b"left.util", src: b"pub type Shape = | Dot | Line(Int)\npub fn size(s: Shape) -> Int = match s { Dot -> 0, Line(n) -> n }" },
+    { name: b"right.util", src: b"pub fn big() -> Float = 0.1 + 1e300\npub fn tiny() -> Decimal = 0.050m\npub fn raw() -> Bytes = b\"\\x00\\\"q\"" },
+    { name: b"app", src: b"import left.util as l\nfn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\nfn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }\nfn all() -> Int = l::size(l::Line(0xFFFFFFFFFFFFFFFF)) + (match 255u8 { _ -> 1 })" }]));
+  let ms = printed_of(out, []);
+  assert_eq(map(ms, |m: { module: Bytes, text: Bytes }| m.module), [b"app", b"left.util", b"right.util"]);
+  assert(holds_text(at(ms, 0).text, b"import left.util as left_util\n"));
+  let again = hash_index(indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })));
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)));
+  let shipped = printed_of(out, [b"left.util"]);
+  assert_eq(map(shipped, |m: { module: Bytes, text: Bytes }| m.module), [b"app", b"right.util"])
+}
+
+test "one effect declaration under two names is refused, since a body cannot say which it performs" {
+  let out = hash_index(indexed([{ name: b"a", src: b"pub effect one { read at() -> Int }" }, { name: b"b", src: b"pub effect two { read at() -> Int }" }]));
+  match print_bodies(map(out.bodies, |b: { name: Bytes, body: Bytes }| b.body), named_hashes(out), [], [], []) {
+    Printed(_) -> panic("two names for one declaration must be refused"),
+    Unprintable(why) -> assert_eq(why.message, b"`a.one`, `b.two` are one effect declaration, so a body cannot say which it performs"),
+  }
 }

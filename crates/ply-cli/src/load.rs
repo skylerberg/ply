@@ -88,13 +88,29 @@ impl Loaded {
         }
     }
 
-    fn parse(&self) -> Result<Tree, Diagnostic> {
+    /// Every module and its text, in the order the port read them.
+    pub fn texts(&self) -> Vec<(String, String)> {
+        self.in_source_order()
+            .into_iter()
+            .map(|m| (m.name.to_string(), self.text_of(m.source).to_string()))
+            .collect()
+    }
+
+    fn in_source_order(&self) -> Vec<&ModuleInfo> {
         let mut modules: Vec<&ModuleInfo> = self.check.modules.values().collect();
         modules.sort_by_key(|m| m.source.0);
-        let inputs = modules.iter().map(|m| {
-            let text = self.sources.get(m.source).map_or("", |f| &*f.text);
-            (m.source, m.name.clone(), text)
-        });
+        modules
+    }
+
+    fn text_of(&self, source: SourceId) -> &str {
+        self.sources.get(source).map_or("", |f| &*f.text)
+    }
+
+    fn parse(&self) -> Result<Tree, Diagnostic> {
+        let modules = self.in_source_order();
+        let inputs = modules
+            .iter()
+            .map(|m| (m.source, m.name.clone(), self.text_of(m.source)));
         let mut program =
             ply_syntax::parse_program(inputs).map_err(|rust| self.disagreement(&rust))?;
         let expanded = ply_derive::expand_program(&mut program);

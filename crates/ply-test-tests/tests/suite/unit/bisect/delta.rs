@@ -1,42 +1,59 @@
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{SourceId, Symbol};
-use ply_syntax::ast::Program;
-use ply_syntax::resolve::Resolved;
 use ply_test::bisect::{
-    Baseline, Change, ChangeKind, Classify, DefKey, DepEdges, Diff, EraTable, Ns, Regression,
-    Renormalizer, StoreClassify, Unknown, diff,
+    Baseline, Change, ChangeKind, Classify, DefKey, DepEdges, Diff, Regression, Rehashed,
+    StoreClassify, Unknown, diff,
 };
 use ply_ty::CheckOutput;
 use std::collections::BTreeMap;
 
 struct Compiled {
-    program: Program,
-    resolved: Resolved,
+    sources: Vec<(String, String)>,
     check: CheckOutput,
     hashes: HashOutput,
 }
 
 impl Compiled {
+    /// One anonymous module, so every name is bare.
     fn new(src: &str) -> Compiled {
-        let module = ply_syntax::parse(SourceId(0), src).expect("the fixture must parse");
-        let mut program = Program::single(module);
-        let resolved = ply_syntax::resolve(&mut program)
-            .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = crate::fixture::port_check(&[(String::new(), src.to_string())], &[SourceId(0)]);
-        let hashes = ply_hash::hash_program(&program, &resolved, &check)
-            .unwrap_or_else(|d| panic!("the fixture must hash: {d:#?}"));
+        Compiled::of(&[("", src)])
+    }
+
+    fn of(modules: &[(&str, &str)]) -> Compiled {
+        let sources: Vec<(String, String)> = modules
+            .iter()
+            .map(|(name, src)| (name.to_string(), src.to_string()))
+            .collect();
+        let ids: Vec<SourceId> = (0..sources.len()).map(|i| SourceId(i as u32)).collect();
+        let front = ply_codegen::c::producer::checked_front(&sources, &ids)
+            .unwrap_or_else(|e| panic!("the fixture must check: {e:#}"));
         Compiled {
-            program,
-            resolved,
-            check,
-            hashes,
+            sources,
+            check: front.check,
+            hashes: front.hashes,
         }
     }
 
-    fn renormalizer(&self) -> Renormalizer<'_> {
-        let test_keys: Vec<Symbol> = self.check.tests.iter().map(|t| t.key.clone()).collect();
-        Renormalizer::new(&self.program, &self.resolved, &self.hashes, &test_keys)
-            .expect("index the program")
+    fn rehashed(&self, baseline: &Baseline) -> Rehashed {
+        Rehashed::under(&self.sources, baseline)
+            .unwrap_or_else(|e| panic!("the port re-hashes a checked program: {e}"))
+    }
+
+    /// Every definition as the program itself hashes it.
+    fn own_baseline(&self) -> Baseline {
+        let defs = self
+            .hashes
+            .defs
+            .iter()
+            .map(|(n, h)| (n.clone(), *h))
+            .collect();
+        let decls = self
+            .hashes
+            .decls
+            .iter()
+            .map(|(n, h)| (n.clone(), *h))
+            .collect();
+        Baseline::with_decls(DefHash([0; 32]), defs, decls)
     }
 
     fn baseline(&self, key: &str) -> Baseline {
@@ -67,45 +84,42 @@ impl Compiled {
     }
 }
 
-/// The real re-normalizer with no interface evidence, so every edit is fused-eligible.
-struct Renormalizing<'a> {
-    renormalizer: Renormalizer<'a>,
-    table: EraTable,
+/// The port's re-hash with no interface evidence, so every edit is fused-eligible.
+struct Renormalizing {
+    rehashed: Rehashed,
     independent: bool,
 }
 
-impl<'a> Renormalizing<'a> {
-    fn new(renormalizer: Renormalizer<'a>, baseline: &Baseline, independent: bool) -> Self {
-        let table = renormalizer.era_table(&|key: &DefKey| baseline.hash_of(key));
+impl Renormalizing {
+    fn new(after: &Compiled, baseline: &Baseline, independent: bool) -> Self {
         Renormalizing {
-            renormalizer,
-            table,
+            rehashed: after.rehashed(baseline),
             independent,
         }
     }
 }
 
-impl Classify for Renormalizing<'_> {
+impl Classify for Renormalizing {
     fn renormalized(&mut self, key: &DefKey) -> Option<DefHash> {
-        self.renormalizer.rehash(key, &self.table)
+        self.rehashed.rehash(key)
     }
     fn renormalized_test(&mut self, key: &Symbol) -> Option<DefHash> {
-        self.renormalizer.rehash_test(key, &self.table)
+        self.rehashed.rehash_test(key)
     }
     fn interface_stable(&mut self, _: &DefKey, _: DefHash) -> Option<bool> {
         Some(self.independent)
     }
     fn component(&mut self, key: &DefKey) -> Vec<DefKey> {
-        self.renormalizer.component_of(key)
+        self.rehashed.component_of(key)
     }
     fn baseline_image(&mut self) -> std::collections::BTreeSet<DefHash> {
-        self.table.image()
+        self.rehashed.image()
     }
 }
 
 fn diff_of(before: &Compiled, after: &Compiled, key: &str, independent: bool) -> Diff {
     let baseline = before.baseline(key);
-    let mut classify = Renormalizing::new(after.renormalizer(), &baseline, independent);
+    let mut classify = Renormalizing::new(after, &baseline, independent);
     let key = Symbol::new(key);
     let regression = Regression {
         key: &key,
@@ -325,33 +339,33 @@ fn a_classifier_with_no_evidence_calls_everything_edited() {
     assert_eq!(diff.delta.clusters.len(), 1);
 }
 
-#[test]
-fn the_renormalizer_reproduces_every_hash_ply_hash_published() {
-    for src in [CHAIN, include_str!("../../../../../../examples/ledger.ply")] {
-        let compiled = Compiled::new(src);
-        let renormalizer = compiled.renormalizer();
+/// Against the program's own table, every body must come back to the hash it was published under.
+#[track_caller]
+fn assert_rehash_is_the_identity(compiled: &Compiled) {
+    let rehashed = compiled.rehashed(&compiled.own_baseline());
+    for (name, hash) in &compiled.hashes.defs {
         assert_eq!(
-            renormalizer.unwitnessed(),
-            0,
-            "the re-normalizer disagrees with ply-hash"
+            rehashed.rehash(&DefKey::value(name.clone())),
+            Some(*hash),
+            "{name}"
         );
-        for name in compiled.hashes.defs.keys() {
-            assert!(renormalizer.witnessed(name), "{name} is not witnessed");
-        }
+    }
+    for (name, hash) in &compiled.hashes.decls {
+        assert_eq!(
+            rehashed.rehash(&DefKey::decl(name.clone())),
+            Some(*hash),
+            "{name}"
+        );
+    }
+    for (test, hash) in compiled.check.tests.iter().zip(&compiled.hashes.tests) {
+        assert_eq!(rehashed.rehash_test(&test.key), Some(*hash), "{}", test.key);
     }
 }
 
 #[test]
-fn re_normalizing_against_the_current_table_is_the_identity() {
-    let compiled = Compiled::new(CHAIN);
-    let renormalizer = compiled.renormalizer();
-    let table = renormalizer.era_table(&|key: &DefKey| match key.ns {
-        Ns::Value => compiled.hashes.defs.get(&key.name).copied(),
-        Ns::Decl => compiled.hashes.decls.get(&key.name).copied(),
-    });
-    for (name, hash) in &compiled.hashes.defs {
-        let key = DefKey::value(name.clone());
-        assert_eq!(renormalizer.rehash(&key, &table), Some(*hash), "{name}");
+fn re_hashing_against_the_current_table_is_the_identity() {
+    for src in [CHAIN, include_str!("../../../../../../examples/ledger.ply")] {
+        assert_rehash_is_the_identity(&Compiled::new(src));
     }
 }
 
@@ -410,8 +424,7 @@ fn an_interface_preserving_edit_is_independent() {
     let (_root, store) = stored(&before, &["scale", "total"]);
 
     let baseline = before.baseline("totals");
-    let renormalizer = after.renormalizer();
-    let mut classify = StoreClassify::new(&renormalizer, &baseline, &store, &after.check);
+    let mut classify = StoreClassify::new(after.rehashed(&baseline), &store, &after.check);
 
     let scale = Symbol::new("scale");
     assert_eq!(
@@ -434,8 +447,7 @@ fn a_signature_change_is_not_independent() {
     let (_root, store) = stored(&before, &["scale", "total"]);
 
     let baseline = before.baseline("totals");
-    let renormalizer = after.renormalizer();
-    let mut classify = StoreClassify::new(&renormalizer, &baseline, &store, &after.check);
+    let mut classify = StoreClassify::new(after.rehashed(&baseline), &store, &after.check);
 
     let scale = Symbol::new("scale");
     assert_eq!(
@@ -452,8 +464,7 @@ fn an_interface_the_store_never_saw_is_a_refusal_rather_than_a_yes() {
     let store = ply_store::Store::open(&root.0).expect("open store");
 
     let baseline = before.baseline("totals");
-    let renormalizer = after.renormalizer();
-    let mut classify = StoreClassify::new(&renormalizer, &baseline, &store, &after.check);
+    let mut classify = StoreClassify::new(after.rehashed(&baseline), &store, &after.check);
 
     let scale = Symbol::new("scale");
     assert_eq!(
@@ -469,8 +480,7 @@ fn the_store_backed_classifier_produces_the_same_split() {
     let (_root, store) = stored(&before, &["scale", "total"]);
 
     let baseline = before.baseline("totals");
-    let renormalizer = after.renormalizer();
-    let mut classify = StoreClassify::new(&renormalizer, &baseline, &store, &after.check);
+    let mut classify = StoreClassify::new(after.rehashed(&baseline), &store, &after.check);
 
     let key = Symbol::new("totals");
     let regression = Regression {
@@ -486,37 +496,6 @@ fn the_store_backed_classifier_produces_the_same_split() {
     assert!(diff.delta.test.is_none());
     assert_eq!(diff.delta.clusters.len(), 1);
     assert_eq!(diff.delta.clusters[0].members, vec![Symbol::new("scale")]);
-}
-
-fn compiled_program(modules: &[(&str, &str)]) -> Compiled {
-    use ply_syntax::ast::ModuleName;
-    let inputs: Vec<(SourceId, ModuleName, &str)> = modules
-        .iter()
-        .enumerate()
-        .map(|(i, (name, src))| (SourceId(i as u32), ModuleName::from_dotted(name), *src))
-        .collect();
-    let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
-    let resolved = ply_syntax::resolve(&mut program)
-        .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-    let sources: Vec<(String, String)> = modules
-        .iter()
-        .map(|(name, src)| {
-            (
-                ModuleName::from_dotted(name).to_string(),
-                (*src).to_string(),
-            )
-        })
-        .collect();
-    let ids: Vec<SourceId> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
-    let check = crate::fixture::port_check(&sources, &ids);
-    let hashes = ply_hash::hash_program(&program, &resolved, &check)
-        .unwrap_or_else(|d| panic!("the fixture must hash: {d:#?}"));
-    Compiled {
-        program,
-        resolved,
-        check,
-        hashes,
-    }
 }
 
 const STORE: &str = r#"
@@ -543,17 +522,14 @@ test "doubling" {
 
 /// Effect slots are a de Bruijn level computed from the reference graph, never from a name.
 #[test]
-fn the_witness_holds_across_a_module_boundary() {
-    let compiled = compiled_program(&[("store", STORE), ("app", APP)]);
-    let renormalizer = compiled.renormalizer();
-    assert_eq!(renormalizer.unwitnessed(), 0);
-    assert!(renormalizer.witnessed_test(&Symbol::new("app.doubling")));
+fn re_hashing_is_the_identity_across_a_module_boundary() {
+    assert_rehash_is_the_identity(&Compiled::of(&[("store", STORE), ("app", APP)]));
 }
 
 #[test]
 fn an_edit_in_one_module_leaves_its_importer_derived() {
-    let before = compiled_program(&[("store", STORE), ("app", APP)]);
-    let after = compiled_program(&[
+    let before = Compiled::of(&[("store", STORE), ("app", APP)]);
+    let after = Compiled::of(&[
         (
             "store",
             &STORE.replace("db.get[users](k)", "db.get[users](k + 1)"),
@@ -562,7 +538,7 @@ fn an_edit_in_one_module_leaves_its_importer_derived() {
     ]);
 
     let baseline = before.baseline("app.doubling");
-    let mut classify = Renormalizing::new(after.renormalizer(), &baseline, true);
+    let mut classify = Renormalizing::new(&after, &baseline, true);
     let key = Symbol::new("app.doubling");
     let regression = Regression {
         key: &key,

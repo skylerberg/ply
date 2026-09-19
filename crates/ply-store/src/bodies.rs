@@ -1,7 +1,6 @@
-//! Turns stored body bytes back into definitions, refusing bytes their key does not name.
+//! Stored body bytes, refusing bytes their key does not name.
 
-use ply_hash::body::{BodySet, Reconstruction, StoredBody, reconstruct};
-use ply_span::Diagnostic;
+use ply_hash::body::{BodySet, StoredBody};
 use ply_ty::DefHash;
 
 use crate::{BODY_ENCODING, DefBody, Store};
@@ -40,28 +39,5 @@ impl Store {
             }
         }
         (set, missing)
-    }
-
-    /// Definitions get synthesized names, so a historical set rebuilds without today's names.
-    pub fn reconstruct(
-        &self,
-        hashes: impl IntoIterator<Item = DefHash>,
-    ) -> Result<Reconstruction, Vec<Diagnostic>> {
-        let (set, missing) = self.body_set(hashes);
-        if !missing.is_empty() {
-            let named: Vec<String> = missing.iter().take(8).map(|h| h.short()).collect();
-            return Err(vec![
-                Diagnostic::warning(
-                    crate::codes::CACHE_UNREADABLE,
-                    format!(
-                        "{} of the definitions asked for have no stored body",
-                        missing.len()
-                    ),
-                )
-                .note(format!("missing: {}", named.join(", ")))
-                .note("a definition gets a body only after a run that checked it"),
-            ]);
-        }
-        reconstruct(&set)
     }
 }
