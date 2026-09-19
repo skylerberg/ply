@@ -887,7 +887,11 @@ pub unsafe extern "C" fn rt_tick(ctx: *mut Ctx) {
 
 /// The wall-clock budget an entry begins with, in milliseconds; 0 is none. A command sets the
 /// process's, and a caller that wants one evaluation bounded differently sets its thread's.
-static TIME_BUDGET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The default bounds a harness that never asked, so a loop that never ends fails there too.
+static TIME_BUDGET_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_TIME_BUDGET_MS);
+
+pub const DEFAULT_TIME_BUDGET_MS: u64 = 60_000;
 
 thread_local! {
     static THREAD_TIME_BUDGET_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
