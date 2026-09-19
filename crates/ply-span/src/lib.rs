@@ -395,6 +395,181 @@ pub mod codes {
     pub const UNUSED_DEFINITION: &str = "W0611";
 }
 
+/// Every published code with its meaning in one line, in the order the guide lists them; a code
+/// gets its row when it is registered, which the tree checks enforce.
+pub const MEANINGS: &[(&str, &str)] = &[
+    ("E0001", "unexpected token"),
+    ("E0002", "unterminated string or byte-string literal"),
+    ("E0101", "unknown name (including no `main` to run)"),
+    ("E0102", "unknown type"),
+    ("E0103", "unknown effect"),
+    ("E0104", "unknown operation"),
+    ("E0105", "duplicate definition, or a reserved name"),
+    ("E0106", "unknown module"),
+    ("E0107", "private name"),
+    ("E0108", "ambiguous import"),
+    ("E0109", "module cycle"),
+    ("E0110", "duplicate import"),
+    ("E0111", "file path that cannot name a module"),
+    ("E0112", "ambiguous entry point"),
+    ("E0113", "project module under the reserved root `std`"),
+    (
+        "E0114",
+        "unknown `effect set`, including a `pub` or qualified one",
+    ),
+    ("E0115", "`effect set` cycle"),
+    (
+        "E0116",
+        "record update base with no shape this file can name",
+    ),
+    ("E0117", "record update naming a field the base lacks"),
+    (
+        "E0118",
+        "`?` with no written `Result`/`Option` return type to exit through",
+    ),
+    (
+        "E0119",
+        "`?` where its early exit would change what runs or drop an annotation",
+    ),
+    (
+        "E0120",
+        "parameter default on a lambda, operation or handler clause",
+    ),
+    (
+        "E0121",
+        "parameter default that is not a pure, closed value",
+    ),
+    (
+        "E0122",
+        "default on a `pub fn` naming something its module does not export",
+    ),
+    ("E0123", "named argument naming no parameter, or one twice"),
+    ("E0124", "positional argument after a named one"),
+    (
+        "E0125",
+        "parameter left unfilled by a call that used a name",
+    ),
+    ("E0126", "top-level `fn` missing a parameter or return type"),
+    (
+        "E0127",
+        "`reuse fn` with an append that cannot reuse its list",
+    ),
+    ("E0201", "type mismatch"),
+    ("E0202", "arity mismatch"),
+    ("E0203", "occurs check"),
+    ("E0204", "not a function"),
+    ("E0205", "non-exhaustive match"),
+    ("E0206", "not derivable, including an unordered `Map` key"),
+    ("E0207", "unknown deriver"),
+    ("E0208", "orphan `derive`"),
+    ("E0209", "`/` on `Decimal`"),
+    ("E0210", "numeric operand type nothing determines"),
+    ("E0211", "integer literal out of range for its fixed width"),
+    ("E0301", "unbound row variable"),
+    ("E0302", "effect not permitted by the written row"),
+    ("E0303", "unhandled effect (compiler defect)"),
+    ("E0304", "resource label required"),
+    ("E0412", "nondeterministic effect in a deterministic test"),
+    ("E0413", "`Task` escapes its region"),
+    ("E0414", "deadlock, or spent step budget"),
+    (
+        "E0415",
+        "replay did not reproduce the schedule (Ply's fault)",
+    ),
+    ("E0416", "nested `simulate`"),
+    ("E0417", "effect in a spec, guard or law body"),
+    ("E0418", "`forall` binder type that cannot be quantified"),
+    ("E0419", "obligation refuted by a counterexample"),
+    ("E0420", "vacuous obligation: the guard admits nothing"),
+    ("E0421", "host registration for something undeclared"),
+    ("E0422", "two host registrations for one atom"),
+    (
+        "E0423",
+        "host handler determinism disagrees with the declaration",
+    ),
+    (
+        "E0424",
+        "operation reached the host boundary with nothing bound",
+    ),
+    (
+        "E0425",
+        "host operation reached from a test the search re-runs",
+    ),
+    (
+        "E0426",
+        "continuation resumed twice across an at-most-once host operation",
+    ),
+    (
+        "E0427",
+        "host handler answered an atom outside the entry point's footprint",
+    ),
+    ("E0428", "`blocking` host handler answered inline"),
+    ("E0429", "`net.listen_tls` named a credential the run lacks"),
+    ("E0430", "`--tls` credential that does not load"),
+    ("E0431", "no database configured"),
+    ("E0432", "statement text the driver refuses"),
+    ("E0433", "server refused to prepare a statement"),
+    ("E0434", "statement touches a table outside the footprint"),
+    ("E0435", "live database differs from the schema (reserved)"),
+    (
+        "E0436",
+        "database operation from a task not owning the transaction",
+    ),
+    ("E0437", "connection pool exhausted"),
+    (
+        "E0438",
+        "live schema has an unmodellable trigger, rule or cascade (reserved)",
+    ),
+    (
+        "E0439",
+        "`Secret` passed to a host operation not allowed one",
+    ),
+    ("E0440", "configuration source unreadable"),
+    ("E0441", "required configuration key missing"),
+    ("E0442", "configuration value of the wrong shape"),
+    ("E0443", "artifact does not verify"),
+    ("E0444", "artifact built under another version"),
+    ("E0445", "`trace.exit` of a span not open on this task"),
+    ("E0446", "value outlives its region"),
+    ("E0447", "two regions in scope under one name"),
+    ("E0449", "region handle reaching a runtime boundary"),
+    ("E0450", "compiled backend cannot be attached"),
+    ("E0451", "`fs` label with no root bound"),
+    ("E0452", "path leaves its root"),
+    ("E0453", "whole-file read over the bound"),
+    ("E0454", "`--fs` root that is not a directory"),
+    ("E0501", "assertion failed"),
+    (
+        "E0502",
+        "runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit",
+    ),
+    ("E0505", "Ply broke one of its own invariants"),
+    ("W0601", "cache unreadable"),
+    ("W0602", "cache corrupt"),
+    ("W0603", "cache from another version"),
+    ("W0604", "obligation undecided at every tier"),
+    (
+        "W0605",
+        "standard library changed since the cache was written",
+    ),
+    ("W0606", "host runtime could not release every resource"),
+    (
+        "W0607",
+        "supplied configuration key the schema does not declare",
+    ),
+    ("W0608", "drain deadline expired with requests in flight"),
+    ("W0609", "spans still open when an entry point ended"),
+    ("W0610", "reference cycle, never freed"),
+    (
+        "W0611",
+        "definition no `pub` item, `main`, test or law reaches; a leading `_` in its name keeps it quiet",
+    ),
+];
+
+pub fn meaning(code: &str) -> Option<&'static str> {
+    MEANINGS.iter().find(|(c, _)| *c == code).map(|(_, m)| *m)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub severity: Severity,

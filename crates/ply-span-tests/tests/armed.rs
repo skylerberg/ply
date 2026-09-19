@@ -1218,6 +1218,31 @@ fn every_diagnostic_constructor_call_names_its_code_literally() {
 }
 
 #[test]
+fn every_registered_code_has_its_meaning_and_no_other_does() {
+    let Tree { declared, .. } = tree();
+    let numbers: BTreeSet<&str> = declared.values().map(|(code, _)| code.as_str()).collect();
+    let explained: BTreeSet<&str> = ply_span::MEANINGS.iter().map(|(c, _)| *c).collect();
+    let unexplained: Vec<&&str> = numbers.iter().filter(|c| !explained.contains(*c)).collect();
+    assert!(
+        unexplained.is_empty(),
+        "{} code(s) have no row in `ply_span::MEANINGS`, so `ply explain` cannot say what they \
+         mean: {unexplained:?}",
+        unexplained.len()
+    );
+    let stale: Vec<&&str> = explained.iter().filter(|c| !numbers.contains(*c)).collect();
+    assert!(
+        stale.is_empty(),
+        "`ply_span::MEANINGS` explains {} code(s) nothing registers: {stale:?}",
+        stale.len()
+    );
+    assert_eq!(
+        ply_span::MEANINGS.len(),
+        explained.len(),
+        "a code is explained twice"
+    );
+}
+
+#[test]
 fn the_code_registry_table_is_total_over_the_codes_module() {
     let Tree { declared, rows, .. } = tree();
 
