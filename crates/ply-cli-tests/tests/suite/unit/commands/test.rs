@@ -123,6 +123,7 @@ fn json_report(
 
 fn args_for(filter: Option<&str>) -> TestArgs {
     TestArgs {
+        timeout: 60_000,
         profile: "development".to_string(),
         watch: false,
         path: PathBuf::from("."),

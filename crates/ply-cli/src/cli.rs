@@ -297,6 +297,10 @@ pub struct TestArgs {
     #[arg(long, short = 'j', value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub jobs: Option<u32>,
 
+    /// Wall clock per test, in milliseconds; a test past it fails with E0503. 0 is no bound.
+    #[arg(long, value_name = "MS", default_value_t = 60_000)]
+    pub timeout: u64,
+
     /// Neither read nor write the front-end cache; the result cache is untouched.
     #[arg(long)]
     pub no_incremental: bool,
@@ -372,6 +376,10 @@ pub struct ProveOptions {
     /// Evaluations a counterexample may be shrunk by; in no cache key, since failures never are.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub shrink_budget: Option<u32>,
+
+    /// Wall clock per evaluation of a claim, in milliseconds (default 5000); 0 is no bound.
+    #[arg(long, value_name = "MS")]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Args, Debug)]
@@ -488,6 +496,10 @@ pub struct RunArgs {
     /// Emit one JSON object on stdout and nothing else.
     #[arg(long)]
     pub json: bool,
+
+    /// Wall clock for the entry point, in milliseconds; past it the run fails with E0503. 0 is no bound.
+    #[arg(long, value_name = "MS", default_value_t = 0)]
+    pub timeout: u64,
 
     /// The interleaving a `simulate` region takes: `7`, or `7:3.0.2`.
     #[arg(long, value_name = "SEED", value_parser = parse_seed)]
