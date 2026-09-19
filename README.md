@@ -53,7 +53,9 @@ name a server.
 
 The compiler is Ply source under `crates/ply-compiler/ply`, compiled to C and
 committed as `crates/ply-compiler/bootstrap/unit.c.gz` beside `SOURCES.digest`, a
-digest of those sources and `crates/ply-std/ply`. Editing either makes CI's
-`bootstrap` job fail and upload the regenerated bundle as the `bootstrap-bundle`
-artifact; bring it into the tree with
+digest of those sources and `crates/ply-std/ply`. A binary whose bundle is behind
+its sources has the bundle's emitter emit them once, keeps that stage under the unit
+cache, and runs the sources from then on. Editing either makes CI's `bootstrap` job
+fail and upload the regenerated bundle as the `bootstrap-bundle` artifact; bring it
+into the tree with
 `gh run download <run-id> -n bootstrap-bundle -D crates/ply-compiler/bootstrap`.
