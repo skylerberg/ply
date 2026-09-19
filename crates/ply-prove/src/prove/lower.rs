@@ -121,6 +121,8 @@ pub struct Lowering<'a, 'p> {
     /// Recursive definitions inlined to the depth, each unrolling recorded as an equation.
     unrolled: BTreeSet<Symbol>,
     measure: Option<Measure>,
+    /// What each self call under the measure owes: the argument decreases and stays non-negative.
+    measures: Vec<TermId>,
     /// `f(x̄) == body(x̄)` for each unrolling of a recursive definition.
     equations: Vec<TermId>,
 }
@@ -145,8 +147,13 @@ impl<'a, 'p> Lowering<'a, 'p> {
             total: BTreeSet::new(),
             unrolled: BTreeSet::new(),
             measure: None,
+            measures: Vec::new(),
             equations: Vec::new(),
         }
+    }
+
+    pub fn measures(&self) -> &[TermId] {
+        &self.measures
     }
 
     pub fn set_total(&mut self, names: BTreeSet<Symbol>) {
@@ -212,12 +219,17 @@ impl<'a, 'p> Lowering<'a, 'p> {
         if cond == self.terms.true_id {
             return;
         }
+        let out = self.under_path(cond);
+        self.requirements.push(out);
+    }
+
+    fn under_path(&mut self, cond: TermId) -> TermId {
         let mut out = cond;
         for i in (0..self.path.len()).rev() {
             let negated = self.terms.not(self.path[i]);
             out = self.terms.mk(Node::Or(negated, out), Some(Type::bool()));
         }
-        self.requirements.push(out);
+        out
     }
 
     fn undefined(&mut self) {
@@ -840,7 +852,8 @@ impl<'a, 'p> Lowering<'a, 'p> {
             Some(Type::bool()),
         );
         let both = self.terms.mk(Node::And(low, high), Some(Type::bool()));
-        self.require(both);
+        let owed = self.under_path(both);
+        self.measures.push(owed);
         true
     }
 

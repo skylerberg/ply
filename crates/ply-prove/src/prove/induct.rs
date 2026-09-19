@@ -99,12 +99,13 @@ fn terminating(
             bound: bound[slot],
         });
         lowering.lower_root(&def.body, &bound);
-        let requirements = lowering.requirements().to_vec();
-        if lowering.unsupported() {
+        // Only the measure: whether the body raises is judged where it is unrolled.
+        let measures = lowering.measures().to_vec();
+        if lowering.unsupported() || measures.is_empty() {
             return Some((false, used));
         }
         let mut terms = lowering.finish();
-        let Some(all) = conjunction(&mut terms, &requirements) else {
+        let Some(all) = conjunction(&mut terms, &measures) else {
             continue;
         };
         let mut assertions = int_ranges(&mut terms, None);
