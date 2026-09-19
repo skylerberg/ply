@@ -201,7 +201,7 @@ fn front_end(src: &Sources) -> Result<&'static Source, String> {
         .iter()
         .find(|d| d.severity == Severity::Error)
     {
-        return Err(error.message.clone());
+        return Err(placed(error, &modules));
     }
     let front: &'static Front = Box::leak(Box::new(front));
     let keys = crate::source::emit_keys(front);
@@ -209,6 +209,35 @@ fn front_end(src: &Sources) -> Result<&'static Source, String> {
     Ok(Box::leak(Box::new(
         Source::from_front(front, keys).with_texts(texts),
     )))
+}
+
+/// The error with its place: the module, the line and column of its primary label, and what the
+/// label says, since nothing else about the emitter's own sources reaches a reader.
+fn placed(error: &ply_span::Diagnostic, modules: &[(String, String)]) -> String {
+    let mut out = error.message.clone();
+    if let Some(label) = error
+        .labels
+        .iter()
+        .find(|l| l.primary)
+        .or_else(|| error.labels.first())
+        && let Some((name, text)) = modules.get(label.span.source.0 as usize)
+    {
+        let start = label.span.start as usize;
+        let line = text[..start.min(text.len())].matches('\n').count() + 1;
+        let column = start
+            - text[..start.min(text.len())]
+                .rfind('\n')
+                .map_or(0, |i| i + 1)
+            + 1;
+        out.push_str(&format!(
+            " at {name}.ply:{line}:{column}: {}",
+            label.message
+        ));
+    }
+    for note in &error.notes {
+        out.push_str(&format!("; {note}"));
+    }
+    out
 }
 
 pub fn reset_thread() {
