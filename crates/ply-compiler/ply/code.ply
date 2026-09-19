@@ -319,7 +319,7 @@ fn at(xs: List<Bind>, i: Int) -> Bind =
 pub fn covers() -> List<Bytes> =
   [b"literals", b"unary", b"binary", b"if", b"list", b"field", b"application",
    b"records", b"blocks and `let`", b"parameters and their slots",
-   b"the ownership marks", b"match and every pattern form",
+   b"the ownership marks", b"match, its guards and every pattern form",
    b"perform, with_cell and with_region",
    b"a lambda and the names it captures, through any depth of barrier",
    b"handle with its clauses and return arm, and simulate"]
@@ -405,11 +405,11 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
               // Arm binders leave scope at the arm's end; their slots are not reused.
               let pd = depth_of(acc.st);
               let pat = lower_pat(a.pat, acc.st);
-              match a.guard {
-                Some(_) -> { arms: acc.arms, st: acc.st, ok: false },
-                None -> match lower_in(a.body, pat.st) {
+              match lower_guard(a.guard, pat.st) {
+                None -> { arms: acc.arms, st: acc.st, ok: false },
+                Some(g) -> match lower_in(a.body, g.st) {
                   None -> { arms: acc.arms, st: acc.st, ok: false },
-                  Some(b) -> { arms: push(acc.arms, { pat: pat.pat, guard: None, body: b.code }),
+                  Some(b) -> { arms: push(acc.arms, { pat: pat.pat, guard: g.code, body: b.code }),
                                st: unscope_st(b.st, pd), ok: true },
                 },
               }
@@ -678,6 +678,17 @@ type ClauseAcc = { clauses: List<CClause>, st: Stack, ok: Bool }
 
 type ArmAcc = { arms: List<CArm>, st: Stack, ok: Bool }
 
+type GuardOut = { code: Option<Code>, st: Stack }
+
+fn lower_guard(g: Option<Expr>, st: Stack) -> Option<GuardOut> =
+  match g {
+    None -> Some({ code: None, st: st }),
+    Some(e) -> match lower_in(e, st) {
+      None -> None,
+      Some(o) -> Some({ code: Some(o.code), st: o.st }),
+    },
+  }
+
 type BlockAcc = { stmts: List<CStmt>, st: Stack, ok: Bool }
 
 fn lower_block(stmts: List<Stmt>, tail: Option<Expr>, st: Stack) -> Option<Out> = {
@@ -871,16 +882,27 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
       },
     },
     // Every arm sees the same future, and each arm's binders die at the arm.
+    // Walked last arm first: a failing guard goes on to the later arms, whose tests read the subject again,
+    // so they and whatever the subject was read from are its future too.
     NMatch(m) -> {
-      let marked = fold(m.arms, { arms: [], live: [] },
+      let subject = mark(m.scrutinee, []).live;
+      let marked = fold(rev_arms(m.arms), { arms: [], live: [] },
         |acc: ArmMark, a: CArm| {
           let b = mark(a.body, live);
-          let after = fold(pat_slots(a.pat), b.live, |x: List<Int>, s: Int| live_drop(x, s));
-          { arms: push(acc.arms, { pat: a.pat, guard: None, body: b.code }),
+          let g: GuardMark = match a.guard {
+            None -> { guard: None, live: b.live },
+            Some(gc) -> {
+              let later = if len(acc.arms) == 0 { acc.live } else { live_union(acc.live, subject) };
+              let gm = mark(gc, live_union(b.live, later));
+              { guard: Some(gm.code), live: gm.live }
+            },
+          };
+          let after = fold(pat_slots(a.pat), g.live, |x: List<Int>, s: Int| live_drop(x, s));
+          { arms: push(acc.arms, { pat: a.pat, guard: g.guard, body: b.code }),
             live: live_union(acc.live, after) }
         });
       let sc = mark(m.scrutinee, marked.live);
-      { code: { own: Borrowed, span: c.span, node: NMatch({ scrutinee: sc.code, arms: marked.arms }) },
+      { code: { own: Borrowed, span: c.span, node: NMatch({ scrutinee: sc.code, arms: rev_arms(marked.arms) }) },
         live: sc.live }
     },
     // The body was marked when lowered; the captures are reads of this barrier where the closure is made.
@@ -990,6 +1012,8 @@ fn mark_caps(caps: List<Cap>, live: List<Int>) -> CapMark = {
 
 type ArmMark = { arms: List<CArm>, live: List<Int> }
 
+type GuardMark = { guard: Option<Code>, live: List<Int> }
+
 type Seq2 = { codes: List<CStmt>, live: List<Int> }
 
 fn cfield_name(fs: List<CField>, i: Int) -> Bytes =
@@ -1012,6 +1036,10 @@ fn rev_codes(xs: List<Code>) -> List<Code> =
 fn rev_caps(xs: List<Cap>) -> List<Cap> =
   map(range(0, len(xs)), |i: Int|
     match list_at(xs, len(xs) - 1 - i) { Some(x) -> x, None -> { src: 0, dst: 0, own: Borrowed } })
+
+fn rev_arms(xs: List<CArm>) -> List<CArm> =
+  map(range(0, len(xs)), |i: Int|
+    match list_at(xs, len(xs) - 1 - i) { Some(x) -> x, None -> { pat: PxWild, guard: None, body: { own: Borrowed, span: dummy_span(), node: NLit(LUnit) } } })
 
 fn rev_stmts(xs: List<CStmt>) -> List<CStmt> =
   map(range(0, len(xs)), |i: Int|
@@ -1092,6 +1120,16 @@ test "a `let` takes the next slot and the binder dies at it" {
 test "a match binds its arms into the window and each arm's binders leave at its end" {
   assert_eq(lower_dump(b"fn f(o: Option<Int>) -> Int = match o { Some(n) -> n, None -> 0 }\n"),
             "L;1;f:m.f:1:2;bmatch(ovar(o,0),arm(c:Some(v:n:1,),-,ovar(n,1)),arm(c:None(),-,blit(i0)));")
+}
+
+test "a guard is lowered between its arm's pattern and body and reads the arm's binders" {
+  assert_eq(lower_dump(b"fn f(n: Int) -> Int = match n { x if x > 0 -> x, _ -> n }\n"),
+            "L;1;f:m.f:1:2;bmatch(bvar(n,0),arm(v:x:1,bbin(gt,bvar(x,1),blit(i0)),ovar(x,1)),arm(_,-,ovar(n,0)));")
+}
+
+test "a guard borrows what a later arm still reads, the matched variable included" {
+  assert_eq(lower_dump(b"fn f(n: Int, m: Int) -> Int = match n { x if x > m -> x, _ -> m }\n"),
+            "L;1;f:m.f:2:3;bmatch(bvar(n,0),arm(v:x:2,bbin(gt,bvar(x,2),bvar(m,1)),ovar(x,2)),arm(_,-,ovar(m,1)));")
 }
 
 test "what the dump holds is what the count reports" {
