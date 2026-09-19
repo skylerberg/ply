@@ -15,11 +15,11 @@ A feature earns its place by one of these. Saving keystrokes does not count.
 - **Compute buys confidence.** More budget on a test, proof or search yields a stronger claim,
   never just a slower run.
 - **One implementation, O(change) everywhere.** Nothing is redone that an edit did not reach,
-  including in the compiler's own loop.
+  including in the compiler's own loop. New code is Ply; Rust is ported as work reaches it.
 
 ## Work
 
-- Guaranteed tail calls, so recursion is the loop.
+- Tail calls across definitions, so mutual recursion is a loop too.
 - Static handler completeness: a `handle` missing an operation's clause is a type error.
 - Fewer rules around `?` and record update; where the shape is inferable, infer it.
 - `ply fmt`, from the printer `ply build` already has.
