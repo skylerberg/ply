@@ -14,7 +14,6 @@ struct Compiled {
 }
 
 impl Compiled {
-    /// One anonymous module, so every name is bare.
     fn new(src: &str) -> Compiled {
         Compiled::of(&[("", src)])
     }
@@ -39,7 +38,6 @@ impl Compiled {
             .unwrap_or_else(|e| panic!("the port re-hashes a checked program: {e}"))
     }
 
-    /// Every definition as the program itself hashes it.
     fn own_baseline(&self) -> Baseline {
         let defs = self
             .hashes
@@ -84,7 +82,6 @@ impl Compiled {
     }
 }
 
-/// The port's re-hash with no interface evidence, so every edit is fused-eligible.
 struct Renormalizing {
     rehashed: Rehashed,
     independent: bool,
@@ -339,7 +336,6 @@ fn a_classifier_with_no_evidence_calls_everything_edited() {
     assert_eq!(diff.delta.clusters.len(), 1);
 }
 
-/// Against the program's own table, every body must come back to the hash it was published under.
 #[track_caller]
 fn assert_rehash_is_the_identity(compiled: &Compiled) {
     let rehashed = compiled.rehashed(&compiled.own_baseline());

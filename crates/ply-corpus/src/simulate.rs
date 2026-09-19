@@ -4,7 +4,6 @@ use crate::pipeline::{Front, front};
 use anyhow::{Context, Result, bail};
 use ply_eval::explore::{Dependence, Interleaving, Simulation, explore_under};
 use ply_eval::{Plan, Seed, SimMode};
-use ply_span::Symbol;
 use serde::Serialize;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -12,27 +11,19 @@ use std::time::{Duration, Instant};
 /// A test whose footprint carries `sim.read`, so its outcome depends on a seed.
 struct Seeded {
     key: String,
-    /// Not its `CheckOutput` index, which counts tests from modules the front end never parsed.
-    module: Symbol,
-    ordinal: usize,
+    index: usize,
 }
 
 fn seeded_tests(front: &Front) -> Vec<Seeded> {
-    let mut ordinals: std::collections::BTreeMap<Symbol, usize> = Default::default();
     front
         .check
         .tests
         .iter()
-        .filter_map(|test| {
-            let module = test.module.as_symbol().clone();
-            let ordinal = ordinals.entry(module.clone()).or_default();
-            let at = *ordinal;
-            *ordinal += 1;
-            ply_test::is_seeded(&test.footprint).then(|| Seeded {
-                key: format!("{}.{}", test.module, test.name),
-                module,
-                ordinal: at,
-            })
+        .enumerate()
+        .filter(|(_, test)| ply_test::is_seeded(&test.footprint))
+        .map(|(index, test)| Seeded {
+            key: format!("{}.{}", test.module, test.name),
+            index,
         })
         .collect()
 }
@@ -70,7 +61,7 @@ impl Simulation for Driver<'_> {
         self.runs += 1;
         let mut machine = self.front.machine();
         ply_test::sim::seed_run(&mut machine, seed, self.steps);
-        let outcome = machine.eval_test_in(&self.test.module, self.test.ordinal);
+        let outcome = machine.eval_test(self.test.index);
         match ply_test::sim::interleaving_of(&machine, &outcome) {
             Some(mut interleaving) => {
                 if self.blind {

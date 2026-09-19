@@ -398,8 +398,7 @@ fn evaluate(
     declared: Option<&Footprint>,
     backend: Option<std::rc::Rc<dyn ply_eval::Compiled>>,
 ) -> Result<PlyValue, Diagnostic> {
-    let tree = loaded.tree()?;
-    let mut machine = Machine::new(&tree.program, &tree.resolved, &loaded.check);
+    let mut machine = Machine::new(&loaded.front);
     if let Some(backend) = backend {
         machine.set_compiled(backend);
     }

@@ -184,6 +184,5 @@ fn fake_loaded(root: &std::path::Path, files: &[&str]) -> Loaded {
         hashes: Default::default(),
         frontend: Default::default(),
         promised: false,
-        rust: Default::default(),
     }
 }

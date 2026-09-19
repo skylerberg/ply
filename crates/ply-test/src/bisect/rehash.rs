@@ -1,5 +1,4 @@
-//! Deciding `Edited` versus `Derived`, exactly: today's bodies hashed as the baseline wrote their
-//! references.
+//! `Edited` versus `Derived`, exactly: today's bodies hashed as the baseline wrote references.
 
 use super::{Baseline, DefKey, Ns};
 use ply_hash::DefHash;
@@ -7,19 +6,15 @@ use ply_span::Symbol;
 use ply_span::frames::Cursor;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Every definition and test of the current program, hashed against the baseline era's table.
 #[derive(Clone, Debug, Default)]
 pub struct Rehashed {
     fresh: BTreeMap<DefKey, DefHash>,
     tests: BTreeMap<Symbol, DefHash>,
-    /// Every identity the era's table assigns, which is what a rename has to be recognized against.
     image: BTreeSet<DefHash>,
-    /// The mutually recursive definitions, by component.
     components: BTreeMap<DefKey, usize>,
 }
 
 impl Rehashed {
-    /// `sources` are the current program's modules as the front end read them.
     pub fn under(sources: &[(String, String)], baseline: &Baseline) -> Result<Rehashed, String> {
         let pins: Vec<(String, bool, DefHash)> = baseline
             .keys()
@@ -42,7 +37,6 @@ impl Rehashed {
         self.image.clone()
     }
 
-    /// `key`'s strongly connected component, `key` included, when it is mutually recursive.
     pub fn component_of(&self, key: &DefKey) -> Vec<DefKey> {
         let Some(id) = self.components.get(key) else {
             return Vec::new();

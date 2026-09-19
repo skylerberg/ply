@@ -1,5 +1,4 @@
-//! Definition bodies: the third element of `Hash -> (Definition, Type, Footprint)`, and the port
-//! printing them back to source.
+//! Definition bodies: the third element of `Hash -> (Definition, Type, Footprint)`.
 
 use crate::fixture::port_front;
 use ply_codegen::c::producer::print_bodies;
@@ -35,7 +34,6 @@ fn names_of(checked: &Checked) -> Vec<(Symbol, DefHash)> {
         .collect()
 }
 
-/// Every body under `names`, and every test.
 fn print(
     bodies: &BodySet,
     names: &[(Symbol, DefHash)],
@@ -112,7 +110,6 @@ fn renumber(
     }
 }
 
-/// Printed under its own names and checked again: every name, test and interface comes back.
 #[track_caller]
 fn round_trip(files: &[(&str, &str)]) -> (Checked, Vec<(String, String)>) {
     let original = compile(files);
@@ -424,13 +421,11 @@ fn a_truncated_body_is_refused_rather_than_printed() {
     assert_eq!(refused.code, codes::ARTIFACT_INVALID);
 }
 
-/// The lexer never produces such a `Decimal`, so a stream carrying one is corrupt.
 #[test]
 fn a_body_carrying_an_out_of_range_decimal_is_refused() {
     let original = compile(&[("m", "pub fn f() -> Decimal = 1.50m")]);
     let (_, body) = original.bodies.defs().next().expect("one definition");
     let mut bytes = body.as_bytes().to_vec();
-    // The scale is the last little-endian `2`: the mantissa's sixteen bytes come before it.
     let scale = bytes
         .windows(4)
         .rposition(|w| w == 2u32.to_le_bytes())
@@ -571,7 +566,6 @@ fn the_examples_come_back_under_their_own_names() {
     round_trip(&borrowed);
 }
 
-/// Each mutation is filed under its own key, so the printer rather than the name check sees it.
 #[test]
 fn no_mutation_of_a_body_can_abort_the_printer() {
     let original = compile(&[("m", EVERY_ITEM_KIND)]);
@@ -587,7 +581,6 @@ fn no_mutation_of_a_body_can_abort_the_printer() {
                 continue;
             };
             let Some(key) = stored.key() else { continue };
-            // Printing is allowed: some mutations are still a definition.
             let _ = print_bodies(&[stored.as_bytes()], &[("m.x", key)], &[], &[], &[]);
         }
     }

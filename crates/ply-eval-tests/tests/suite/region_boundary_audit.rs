@@ -37,7 +37,9 @@ fn bound(compiled: &Compiled, entries: Vec<(HostOp, Arc<dyn HostHandler>)>) -> H
     for (o, handler) in entries {
         registry.register(o, handler);
     }
-    registry.bind(&compiled.check).expect("the registry binds")
+    registry
+        .bind(&compiled.front.check)
+        .expect("the registry binds")
 }
 
 /// A continuation parked in an enclosing region's cell, resumed after the region it reads returns.

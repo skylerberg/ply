@@ -104,7 +104,7 @@ fn run(
     };
     let (unit, spec) = compiled.tier();
     let executor = TierExecutor(
-        InterpExecutor::new(&compiled.program, &compiled.resolved, &compiled.check)
+        InterpExecutor::new(&compiled.port)
             .with_backend(unit, spec)
             .with_search(Search::default())
             .with_hosts(hosting),

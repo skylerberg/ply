@@ -16,7 +16,7 @@ impl Compiled {
         for (op, handler) in entries {
             registry.register(op, handler);
         }
-        let binding = registry.bind(&self.check).expect("the fixture binds");
+        let binding = registry.bind(&self.front.check).expect("the fixture binds");
         let mut machine = self.machine_on_tier();
         machine.set_host_binding(Arc::new(binding));
         machine
@@ -173,8 +173,8 @@ test/nondet "writes orders" { assert_eq(writers(), 2) }
         ),
     ]);
 
-    let users = compiled.check.tests[0].footprint.clone();
-    let orders = compiled.check.tests[1].footprint.clone();
+    let users = compiled.front.check.tests[0].footprint.clone();
+    let orders = compiled.front.check.tests[1].footprint.clone();
     assert!(
         !users.conflicts_with(&orders),
         "the declared footprints do not conflict, so these two may run concurrently"
@@ -490,7 +490,7 @@ test/nondet "a socket inside a region" { simulate { assert_eq(helper(1), 1) } }
         registry.register(any("net", "send"), handler.clone());
         let mut machine = compiled.machine_on_tier();
         machine.set_host_binding(Arc::new(if bound {
-            registry.bind(&compiled.check).expect("binds")
+            registry.bind(&compiled.front.check).expect("binds")
         } else {
             HostBinding::hermetic_with(registry)
         }));
@@ -522,7 +522,7 @@ test/nondet "only net" { assert_eq(net.send[socket](1), 1) }
     // An effect this program has never heard of, registered `Any`.
     registry.register(any("postgres", "query"), Arc::new(Mutates::default()));
     let binding = registry
-        .bind(&compiled.check)
+        .bind(&compiled.front.check)
         .expect("an idle driver binds");
 
     assert_eq!(

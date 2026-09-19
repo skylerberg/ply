@@ -1,16 +1,18 @@
 //! The front end: the port parses, resolves and checks the program; its answer is kept per module.
 
-use crate::load::{Discovered, LoadError, Loaded, RustTree, anchor, discover, unreadable};
+use crate::load::{Discovered, LoadError, Loaded, anchor, discover, unreadable};
 use ply_hash::body::StoredBody;
 use ply_hash::{DefHash, HashOutput};
+use ply_prove::prove::{Claims, read_claims};
+use ply_span::frames::Cursor;
 use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
 use ply_store::{
     CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, ContentHash, DeclBody, DefBody,
     DefEntry, DefKind, FileSpan, Member, NameRef, SourceFingerprint, Store,
 };
 use ply_syntax::ast::ModuleName;
-use ply_ty::Front;
-use std::collections::{BTreeMap, BTreeSet};
+use ply_ty::{Front, ModuleInfo};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -65,6 +67,146 @@ pub fn run(path: &Path, mode: Mode, store: Option<&mut Store>) -> Result<Loaded,
     // Pruning deletes every fingerprint the run did not see, so it needs the whole project.
     let whole_project = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
     Driver::new(root, discovered, mode, store, whole_project)?.finish()
+}
+
+/// The port's lowered claims, kept per module as its front answer is: a module's part is reused
+/// while its text and the texts of all it imports are unchanged, and the rest are asked with all
+/// they import, so the port sees a closed program.
+pub fn claims(loaded: &Loaded, store: Option<&mut Store>) -> Result<Claims, String> {
+    let modules: Vec<&ModuleInfo> = loaded.check.modules.values().collect();
+    let texts = modules
+        .iter()
+        .map(|m| {
+            loaded
+                .sources
+                .get(m.source)
+                .map(|f| f.text.clone())
+                .ok_or_else(|| format!("module `{}` has no source text", m.name))
+        })
+        .collect::<Result<Vec<Arc<str>>, String>>()?;
+    let by_module: BTreeMap<Symbol, usize> = modules
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.name.as_symbol().clone(), i))
+        .collect();
+    let reach = |from: &[usize]| reaching(from, |i| modules[i].imports.as_slice(), &by_module);
+
+    let store = store.filter(|_| loaded.frontend.incremental);
+    let keys: Vec<ContentHash> = if store.is_some() {
+        let emitter = ply_codegen::c::producer::emitter();
+        let contents: Vec<ContentHash> = texts
+            .iter()
+            .map(|t| ContentHash::of(t.as_bytes()))
+            .collect();
+        (0..modules.len())
+            .map(|i| {
+                let reached = reach(&[i]).into_iter();
+                let reached = reached.map(|j| (modules[j].name.as_str(), &contents[j]));
+                module_key("claims", &emitter, &modules[i].name, reached)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut parts: Vec<Option<(String, Claims)>> = (0..modules.len())
+        .map(|i| {
+            let text = store.as_deref()?.claims_part(keys[i])?;
+            let read = claims_part(&text, modules[i].source).ok()?;
+            Some((text, read))
+        })
+        .collect();
+
+    let missed: Vec<usize> = (0..parts.len()).filter(|&i| parts[i].is_none()).collect();
+    if !missed.is_empty() {
+        let asked = reach(&missed);
+        let sources: Vec<(String, String)> = asked
+            .iter()
+            .map(|&i| (modules[i].name.to_string(), texts[i].to_string()))
+            .collect();
+        let dump = ply_codegen::c::producer::claims_dump(&sources).map_err(|e| format!("{e:#}"))?;
+        let items: HashMap<&str, usize> = modules
+            .iter()
+            .enumerate()
+            .flat_map(|(i, m)| m.items.iter().map(move |name| (name.as_str(), i)))
+            .collect();
+        let laws: HashMap<&str, usize> = loaded
+            .check
+            .laws
+            .iter()
+            .filter_map(|law| Some((law.key.as_str(), *by_module.get(law.module.as_symbol())?)))
+            .collect();
+        let unread = |e: String| format!("its answer does not read: {e}");
+        for (&i, text) in asked
+            .iter()
+            .zip(split_claims(&dump, &asked, &items, &laws).map_err(unread)?)
+        {
+            let read = claims_part(&text, modules[i].source).map_err(unread)?;
+            parts[i] = Some((text, read));
+        }
+        if let Some(store) = store {
+            let filed = keys
+                .iter()
+                .zip(&parts)
+                .filter_map(|(key, part)| Some((*key, part.as_ref()?.0.clone())))
+                .collect();
+            store.put_claims_parts(filed);
+        }
+    }
+
+    let mut claims = Claims::default();
+    for (_, read) in parts.into_iter().flatten() {
+        claims.defs.extend(read.defs);
+        claims.laws.extend(read.laws);
+        claims.sums.extend(read.sums);
+    }
+    Ok(claims)
+}
+
+/// Each asked module's part: its position among `asked`, then the frames it owns.
+fn split_claims(
+    dump: &str,
+    asked: &[usize],
+    items: &HashMap<&str, usize>,
+    laws: &HashMap<&str, usize>,
+) -> Result<Vec<String>, String> {
+    let mut parts: Vec<String> = (0..asked.len()).map(|at| format!("{at}\n")).collect();
+    let mut frames = Cursor::new(dump.as_bytes(), "frame");
+    while !frames.done() {
+        let start = frames.at();
+        let (words, payload) = frames.unit()?;
+        let owner = match words[..] {
+            ["law", _] => law_key(payload)?.and_then(|key| laws.get(key)),
+            [_, name] => items.get(name),
+            _ => None,
+        };
+        let at = owner
+            .and_then(|i| asked.iter().position(|j| j == i))
+            .ok_or_else(|| format!("`{}` belongs to no module asked", words.join(" ")))?;
+        parts[at].push_str(&dump[start..frames.at()]);
+    }
+    Ok(parts)
+}
+
+fn law_key(payload: &[u8]) -> Result<Option<&str>, String> {
+    let mut fields = Cursor::new(payload, "field");
+    while !fields.done() {
+        let (words, text) = fields.unit()?;
+        if words == ["key"] {
+            return Ok(std::str::from_utf8(text).ok());
+        }
+    }
+    Ok(None)
+}
+
+/// A module's frames span only it, so every position up to its own reads as its source.
+fn claims_part(text: &str, source: SourceId) -> Result<Claims, String> {
+    let (at, frames) = text
+        .split_once('\n')
+        .ok_or("a module's claims have no position")?;
+    let at: usize = at
+        .parse()
+        .map_err(|_| format!("a module's claims are at `{at}`"))?;
+    read_claims(frames, &vec![source; at + 1])
 }
 
 struct FileState {
@@ -227,7 +369,6 @@ impl<'s> Driver<'s> {
                 warnings,
             },
             promised,
-            rust: RustTree::default(),
         })
     }
 
@@ -524,18 +665,7 @@ impl<'s> Driver<'s> {
     }
 
     fn reaching(&self, from: &[usize]) -> Vec<usize> {
-        let mut seen: BTreeSet<usize> = from.iter().copied().collect();
-        let mut stack = from.to_vec();
-        while let Some(i) = stack.pop() {
-            for imported in &self.files[i].imports {
-                if let Some(&j) = self.by_module.get(imported.as_symbol())
-                    && seen.insert(j)
-                {
-                    stack.push(j);
-                }
-            }
-        }
-        seen.into_iter().collect()
+        reaching(from, |i| self.files[i].imports.as_slice(), &self.by_module)
     }
 
     fn keys(&self) -> Option<Keys> {
@@ -554,20 +684,13 @@ impl<'s> Driver<'s> {
         }
         let modules = (0..self.files.len())
             .map(|i| {
-                let mut reached: Vec<(&str, &ContentHash)> = self
-                    .reaching(&[i])
-                    .into_iter()
-                    .map(|j| (self.files[j].module.as_str(), &self.files[j].content))
-                    .collect();
-                reached.sort_unstable();
-                let mut key = format!("module\0{emitter}\0{}", self.files[i].module).into_bytes();
-                for (name, content) in reached {
-                    key.push(0);
-                    key.extend_from_slice(name.as_bytes());
-                    key.push(0);
-                    key.extend_from_slice(&content.0);
-                }
-                ContentHash::of(&key)
+                let reached = self.reaching(&[i]).into_iter().map(|j| &self.files[j]);
+                module_key(
+                    "module",
+                    &emitter,
+                    &self.files[i].module,
+                    reached.map(|f| (f.module.as_str(), &f.content)),
+                )
             })
             .collect();
         Some(Keys {
@@ -745,6 +868,45 @@ impl<'s> Driver<'s> {
         }
         Some(fingerprint)
     }
+}
+
+/// `from` and every module it imports, transitively, in order.
+fn reaching<'a>(
+    from: &[usize],
+    imports: impl Fn(usize) -> &'a [ModuleName],
+    by_module: &BTreeMap<Symbol, usize>,
+) -> Vec<usize> {
+    let mut seen: BTreeSet<usize> = from.iter().copied().collect();
+    let mut stack = from.to_vec();
+    while let Some(i) = stack.pop() {
+        for imported in imports(i) {
+            if let Some(&j) = by_module.get(imported.as_symbol())
+                && seen.insert(j)
+            {
+                stack.push(j);
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// A module's `kind` of answer is fixed by the emitter and the texts of all the module reaches.
+fn module_key<'a>(
+    kind: &str,
+    emitter: &str,
+    module: &ModuleName,
+    reached: impl Iterator<Item = (&'a str, &'a ContentHash)>,
+) -> ContentHash {
+    let mut reached: Vec<(&str, &ContentHash)> = reached.collect();
+    reached.sort_unstable();
+    let mut key = format!("{kind}\0{emitter}\0{module}").into_bytes();
+    for (name, content) in reached {
+        key.push(0);
+        key.extend_from_slice(name.as_bytes());
+        key.push(0);
+        key.extend_from_slice(&content.0);
+    }
+    ContentHash::of(&key)
 }
 
 /// Where the imports every filed module answered with are kept.

@@ -12,22 +12,22 @@ use ply_prove::{
     Binding, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation, ObligationKind,
     ProvePlan, Rule, Vacuity, VacuityKind,
 };
-use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
-use ply_syntax::ast::Program;
-use ply_syntax::resolve::Resolved;
+use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_store::Store;
 use ply_ty::{CheckOutput, DefInfo, Front, LawBinder, LawInfo, Literal, SpecKind};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// The discharger this build drives.
+/// The discharger this build drives, its claims kept in `store`.
 pub fn of<'a>(
     loaded: &'a Loaded,
     hosting: Option<Hosting<'a>>,
     backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
+    store: &mut Store,
 ) -> Result<Box<dyn ply_test::obligation::Discharger + 'a>, LoadError> {
-    let prover = Prover::new(loaded)?;
+    let prover = Prover::over(loaded, Some(store))?;
     let prover = match hosting {
         Some(hosting) => prover.with_hosting(hosting),
         None => prover,
@@ -35,8 +35,8 @@ pub fn of<'a>(
     Ok(Box::new(prover.with_backend(backend)))
 }
 
-fn claims_of(loaded: &Loaded) -> Result<Claims, LoadError> {
-    let failed = |why: String| {
+fn claims_of(loaded: &Loaded, store: Option<&mut Store>) -> Result<Claims, LoadError> {
+    crate::driver::claims(loaded, store).map_err(|why| {
         loaded.refused(
             Diagnostic::error(
                 codes::INTERNAL_ERROR,
@@ -45,20 +45,7 @@ fn claims_of(loaded: &Loaded) -> Result<Claims, LoadError> {
             .primary(Span::DUMMY, "nothing was proved, so nothing is claimed")
             .note("this is Ply's fault: the compiler's own front end is what failed here"),
         )
-    };
-    let mut sources = Vec::with_capacity(loaded.check.modules.len());
-    let mut ids: Vec<SourceId> = Vec::with_capacity(loaded.check.modules.len());
-    for info in loaded.check.modules.values() {
-        let file = loaded
-            .sources
-            .get(info.source)
-            .ok_or_else(|| failed(format!("module `{}` has no source text", info.name)))?;
-        sources.push((info.name.to_string(), file.text.to_string()));
-        ids.push(info.source);
-    }
-    let dump =
-        ply_codegen::c::producer::claims_dump(&sources).map_err(|e| failed(format!("{e:#}")))?;
-    prove::read_claims(&dump, &ids).map_err(|e| failed(format!("its answer does not read: {e}")))
+    })
 }
 
 /// Where an obligation's claim is written, found once per run.
@@ -106,8 +93,6 @@ impl<'s> Claim<'s> {
 }
 
 pub struct Prover<'a> {
-    program: &'a Program,
-    resolved: &'a Resolved,
     check: &'a CheckOutput,
     front: &'a Front,
     world: TypeWorld,
@@ -118,8 +103,6 @@ pub struct Prover<'a> {
     hosting: Option<Hosting<'a>>,
     /// A compiled unit holding the laws' and clauses' roots, where those propositions are entered.
     backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
-    /// Whole-program, so computed once like `ctx`.
-    region_kinds: ply_eval::region_kind::Kinds,
 }
 
 /// The binding and the reactor a `law/host` runs against.
@@ -130,8 +113,11 @@ pub struct Hosting<'a> {
 
 impl<'a> Prover<'a> {
     pub fn new(loaded: &'a Loaded) -> Result<Prover<'a>, LoadError> {
+        Prover::over(loaded, None)
+    }
+
+    fn over(loaded: &'a Loaded, store: Option<&mut Store>) -> Result<Prover<'a>, LoadError> {
         let check = &loaded.check;
-        let tree = loaded.tree().map_err(|d| loaded.refused(d))?;
         let mut laws = HashMap::new();
         let mut ordinals: HashMap<&Symbol, usize> = HashMap::new();
         for law in &check.laws {
@@ -140,16 +126,13 @@ impl<'a> Prover<'a> {
             *ordinal += 1;
         }
         Ok(Prover {
-            program: &tree.program,
-            resolved: &tree.resolved,
             check,
             front: &loaded.front,
             world: TypeWorld::new(check.ctors.values()),
-            ctx: prove::Context::new(claims_of(loaded)?, check),
+            ctx: prove::Context::new(claims_of(loaded, store)?, check),
             laws,
             hosting: None,
             backend: None,
-            region_kinds: ply_eval::region_kind::Kinds::default(),
         })
     }
 
@@ -249,9 +232,7 @@ impl<'a> Prover<'a> {
     }
 
     fn machine(&self) -> Machine<'a> {
-        let mut machine =
-            Machine::new(self.program, self.resolved, self.check).with_max_calls(DEFAULT_MAX_CALLS);
-        machine.share_region_kinds(ply_eval::region_kind::Kinds::clone(&self.region_kinds));
+        let mut machine = Machine::new(self.front).with_max_calls(DEFAULT_MAX_CALLS);
         // An owner is called through the machine to produce `result`, so the machine must hold the
         // tier its propositions are entered on, or that call declines with no body.
         if let Some((provider, spec)) = self.backend.as_ref() {

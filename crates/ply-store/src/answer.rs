@@ -1,15 +1,82 @@
-//! The parts of the front end's last answer, in one file replaced whole.
+//! The parts of one of the port's per-module answers, in one file replaced whole.
 
 use crate::{ContentHash, FRONTEND_FORMAT, FRONTEND_VERSION, disk};
 use ply_span::frames::Cursor;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub(crate) const ANSWER_FILE: &str = "frontend.answer";
 pub(crate) const ANSWER_STEM: &str = "answer";
+pub(crate) const CLAIMS_FILE: &str = "claims.answer";
+pub(crate) const CLAIMS_STEM: &str = "claims";
 
 const MAGIC: &[u8; 8] = b"PLYPARTS";
 const HEADER: usize = 8 + 32 + 32;
+
+pub(crate) struct Answer {
+    path: PathBuf,
+    stem: &'static str,
+    what: &'static str,
+    stored: OnceLock<BTreeMap<ContentHash, String>>,
+    pending: Option<BTreeMap<ContentHash, String>>,
+}
+
+impl Answer {
+    pub(crate) fn new(path: PathBuf, stem: &'static str, what: &'static str) -> Answer {
+        Answer {
+            path,
+            stem,
+            what,
+            stored: OnceLock::new(),
+            pending: None,
+        }
+    }
+
+    fn stored(&self) -> &BTreeMap<ContentHash, String> {
+        self.stored.get_or_init(|| read(&self.path))
+    }
+
+    pub(crate) fn part(&self, key: ContentHash) -> Option<String> {
+        self.pending
+            .as_ref()
+            .unwrap_or_else(|| self.stored())
+            .get(&key)
+            .cloned()
+    }
+
+    /// Replaces every part on disk at the next flush, unless these are the parts already there.
+    pub(crate) fn put(&mut self, parts: BTreeMap<ContentHash, String>) {
+        self.pending = if self.stored().keys().eq(parts.keys()) {
+            None
+        } else {
+            Some(parts)
+        };
+    }
+
+    pub(crate) fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending.is_none() && !self.path.exists()
+    }
+
+    pub(crate) fn flush(&mut self, dir: &Path) -> anyhow::Result<()> {
+        if let Some(parts) = self.pending.take() {
+            write(dir, &self.path, self.stem, &parts, self.what)?;
+            self.stored = OnceLock::from(parts);
+        }
+        Ok(())
+    }
+
+    /// Under the cache lock.
+    pub(crate) fn clear(&mut self) -> anyhow::Result<()> {
+        self.pending = None;
+        self.stored = OnceLock::from(BTreeMap::new());
+        crate::remove(&self.path, self.what)
+    }
+}
 
 fn stamp() -> [u8; 32] {
     let mut h = blake3::Hasher::new();
@@ -19,7 +86,7 @@ fn stamp() -> [u8; 32] {
 }
 
 /// Empty for a missing, foreign or damaged file: each is only a miss.
-pub(crate) fn read(path: &Path) -> BTreeMap<ContentHash, String> {
+fn read(path: &Path) -> BTreeMap<ContentHash, String> {
     parts(path).unwrap_or_default()
 }
 
@@ -47,10 +114,12 @@ fn parts(path: &Path) -> Option<BTreeMap<ContentHash, String>> {
     Some(parts)
 }
 
-pub(crate) fn write(
+fn write(
     dir: &Path,
     path: &Path,
+    stem: &str,
     parts: &BTreeMap<ContentHash, String>,
+    what: &str,
 ) -> anyhow::Result<()> {
     let mut body = Vec::new();
     for (key, text) in parts {
@@ -62,5 +131,5 @@ pub(crate) fn write(
     out.extend_from_slice(&stamp());
     out.extend_from_slice(blake3::hash(&body).as_bytes());
     out.extend_from_slice(&body);
-    disk::write_atomic(dir, path, ANSWER_STEM, &out, "front-end answer")
+    disk::write_atomic(dir, path, stem, &out, what)
 }

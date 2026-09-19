@@ -14,8 +14,6 @@ mod record_update_reuse;
 mod reference_cycles;
 mod region_boundary_audit;
 mod region_isolation_audit;
-mod region_kind_inference;
-mod region_kind_sharing;
 mod region_meaning_adversarial;
 mod resumption_snapshot_audit;
 mod secrets;
