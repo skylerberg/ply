@@ -1087,6 +1087,8 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply std` | `--show MODULE`, `--digest`; no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
 | `ply hash [path]` | `--deps` (references and transitive closure) |
+| `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
+| `ply callers DEF [path]` | what mentions a definition directly, and every definition, test and law whose closure reaches it |
 | `ply bootstrap <path>` | writes the front end as C: `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing), `--profile` (default `release`) |
 | `ply cache clear\|stats\|compact [path]` | discard results / report size and reclaimable space / reclaim it |
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
