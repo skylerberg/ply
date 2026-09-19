@@ -1,6 +1,6 @@
 // The type checker: schemes, footprints and constraints for every definition, test, law, effect and constructor.
 
-import spine (Span, Ident, QName, span_to, dummy_span, num)
+import spine (Span, Ident, QName, span_to, dummy_span, num, push_front)
 import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead, MWrite, MBad, ty_span)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
@@ -1547,66 +1547,170 @@ fn infer_match(cx: Cx, span: Span, scrutinee: Expr, arms: List<MatchArm>) -> Inf
     let popped: Cx = {..j.cx, env: env_pop(j.cx.env)};
     { cx: expect(popped, expr_span(arm.body), result.t, body.ty, b"match arms must agree").cx, row: j.r }
   });
-  { cx: check_exhaustive(walked.cx, span, s.ty, arms), ty: result.t, row: walked.row }
+  { cx: check_exhaustive(walked.cx, span, arms), ty: result.t, row: walked.row }
 }
 
-fn is_irrefutable(p: Pattern) -> Bool =
+// --- Exhaustiveness: usefulness over a matrix with one row per unguarded arm ---------------------
+
+// `XNone` is a constructor that does not resolve: it matches nothing, so its arm covers nothing.
+type XPat =
+  | XAny
+  | XNone
+  | XCon({ family: Bytes, key: Bytes, name: Bytes, args: List<XPat> })
+  | XRec(List<{ name: Bytes, pat: XPat }>)
+
+type XCtor = { key: Bytes, name: Bytes, arity: Int }
+
+fn check_exhaustive(cx: Cx, span: Span, arms: List<MatchArm>) -> Cx = {
+  let rows = fold(arms, [], |acc: List<List<XPat>>, a: MatchArm| match a.guard { None -> push(acc, [coverage_pat(cx, a.pat)]), Some(_) -> acc });
+  let missing = uncovered(cx, rows, 1);
+  if len(missing) == 0 { cx } else {
+    err1(cx, b"E0205", span, b"match does not cover every case",
+         bytes_concat(b"not covered: ", join_with(map(missing, |w: List<XPat>| tick(shown(at(w, 0)))), b", ")),
+         [b"add the missing arms, or a `_` arm"])
+  }
+}
+
+fn coverage_pat(cx: Cx, p: Pattern) -> XPat =
   match p {
-    PWild(_) -> true,
-    PVar(_) -> true,
-    PRecord(r) -> fold(r.fields, true, |acc: Bool, f: { name: Ident, pat: Pattern }| acc && is_irrefutable(f.pat)),
-    _ -> false,
+    PCtor(c) -> {
+      let info = match covered_ctor(cx, c.name) { Some(q) -> ctor_of(cx, q), None -> None };
+      match info {
+        Some(k) -> XCon({ family: k.type_name, key: k.name, name: k.simple_name, args: map(c.args, |a: Pattern| coverage_pat(cx, a)) }),
+        None -> XNone,
+      }
+    },
+    PLit(l) ->
+      match l.lit {
+        LBool(b) -> { let k = if b { b"true" } else { b"false" }; XCon({ family: b"#bool", key: k, name: k, args: [] }) },
+        LUnit -> XCon({ family: b"#unit", key: b"()", name: b"()", args: [] }),
+        _ -> XCon({ family: b"#lit", key: b"", name: b"", args: [] }),
+      },
+    PList(l) -> {
+      let n = len(l.items);
+      let last = match l.rest { Some(r) -> coverage_pat(cx, r), None -> list_con(b"[]", []) };
+      fold(range(0, n), last, |tail: XPat, i: Int| list_con(b"::", [coverage_pat(cx, at(l.items, n - 1 - i)), tail]))
+    },
+    PRecord(r) -> XRec(map(r.fields, |f: { name: Ident, pat: Pattern }| { name: f.name.name, pat: coverage_pat(cx, f.pat) })),
+    _ -> XAny,
   }
 
-fn check_exhaustive(cx: Cx, span: Span, scrutinee: Type, arms: List<MatchArm>) -> Cx = {
-  let unguarded = filter(arms, |a: MatchArm| match a.guard { None -> true, Some(_) -> false });
-  if fold(unguarded, false, |acc: Bool, a: MatchArm| acc || is_irrefutable(a.pat)) { cx } else {
-    let missing = match resolve(cx, scrutinee) {
-      TyCon(c) ->
-        if c.name == b"List" { missing_list_lengths(unguarded) }
-        else if c.name == b"Bool" {
-          let covered = map(filter(unguarded, |a: MatchArm| match a.pat { PLit(l) -> (match l.lit { LBool(_) -> true, _ -> false }), _ -> false }),
-                            |a: MatchArm| match a.pat { PLit(l) -> (match l.lit { LBool(b) -> b, _ -> false }), _ -> false });
-          map(filter([true, false], |b: Bool| !fold(covered, false, |acc: Bool, x: Bool| acc || x == b)),
-              |b: Bool| if b { b"`true`" } else { b"`false`" })
-        } else {
-          let variants = filter(cx.ctors, |k: CtorInfo| k.type_name == c.name);
-          if len(variants) == 0 { [b"other values"] } else {
-            let covered = fold(unguarded, [], |acc: List<Bytes>, a: MatchArm|
-              match a.pat {
-                PCtor(pc) -> if fold(pc.args, true, |b: Bool, x: Pattern| b && is_irrefutable(x)) {
-                               match covered_ctor(cx, pc.name) { Some(n) -> push(acc, n), None -> acc } } else { acc },
-                _ -> acc,
-              });
-            map(filter(variants, |k: CtorInfo| !contains_bytes(covered, k.name)), |k: CtorInfo| tick(k.simple_name))
-          }
-        },
-      _ -> [b"other values"],
-    };
-    if len(missing) == 0 { cx } else {
-      err1(cx, b"E0205", span, b"match does not cover every case", bytes_concat(b"not covered: ", join_with(missing, b", ")),
-           [b"add the missing arms, or a `_` arm"])
+fn list_con(key: Bytes, args: List<XPat>) -> XPat = XCon({ family: b"#list", key: key, name: key, args: args })
+
+fn wilds(n: Int) -> List<XPat> = map(range(0, n), |_i: Int| XAny)
+
+fn family_of(x: XPat) -> Bytes = match x { XCon(c) -> c.family, XRec(_) -> b"#rec", _ -> b"" }
+
+fn heads_ctor(rows: List<List<XPat>>, family: Bytes, key: Bytes) -> Bool =
+  fold(rows, false, |b: Bool, r: List<XPat>| b || (match at(r, 0) { XCon(c) -> c.family == family && c.key == key, _ -> false }))
+
+// `None` for a family no list of arms exhausts: literals, and a column that names no constructor.
+fn family_ctors(cx: Cx, family: Bytes) -> Option<List<XCtor>> =
+  if family == b"#bool" { Some([{ key: b"true", name: b"true", arity: 0 }, { key: b"false", name: b"false", arity: 0 }]) }
+  else if family == b"#unit" { Some([{ key: b"()", name: b"()", arity: 0 }]) }
+  else if family == b"#list" { Some([{ key: b"[]", name: b"[]", arity: 0 }, { key: b"::", name: b"::", arity: 2 }]) }
+  else if family == b"#lit" || family == b"" { None }
+  else { Some(map(filter(cx.ctors, |k: CtorInfo| k.type_name == family), |k: CtorInfo| { key: k.name, name: k.simple_name, arity: k.arity })) }
+
+// Rows of values no row matches, each `n` wide; empty when the rows are exhaustive.
+fn uncovered(cx: Cx, rows: List<List<XPat>>, n: Int) -> List<List<XPat>> =
+  if len(rows) == 0 { [wilds(n)] }
+  else if n == 0 { [] }
+  else {
+    let family = fold(rows, b"", |acc: Bytes, r: List<XPat>| if bytes_len(acc) > 0 { acc } else { family_of(at(r, 0)) });
+    if family == b"#rec" { uncovered_record(cx, rows, n) } else {
+      match family_ctors(cx, family) {
+        None -> map(uncovered(cx, default_rows(rows, family), n - 1), |w: List<XPat>| push_front(XAny, w)),
+        Some(all) ->
+          if fold(all, true, |b: Bool, k: XCtor| b && heads_ctor(rows, family, k.key)) {
+            fold(all, [], |acc: List<List<XPat>>, k: XCtor| append(acc, through(cx, rows, n, family, k)))
+          } else {
+            // A constructor no arm names is left uncovered exactly when the default rows are; then the named ones are searched too.
+            match list_at(uncovered(cx, default_rows(rows, family), n - 1), 0) {
+              None -> [],
+              Some(w) -> fold(all, [], |acc: List<List<XPat>>, k: XCtor|
+                if heads_ctor(rows, family, k.key) { append(acc, through(cx, rows, n, family, k)) }
+                else { push(acc, push_front(XCon({ family: family, key: k.key, name: k.name, args: wilds(k.arity) }), w)) }),
+            }
+          },
+      }
     }
   }
-}
 
-fn missing_list_lengths(arms: List<MatchArm>) -> List<Bytes> = {
-  let shapes = fold(arms, { exact: [], rest_from: 0 - 1 }, |acc: { exact: List<Int>, rest_from: Int }, a: MatchArm|
-    match a.pat {
-      PList(l) ->
-        if fold(l.items, true, |b: Bool, x: Pattern| b && is_irrefutable(x)) {
-          match l.rest {
-            Some(r) -> if is_irrefutable(r) { { exact: acc.exact, rest_from: if acc.rest_from < 0 { len(l.items) } else { min(acc.rest_from, len(l.items)) } } } else { acc },
-            None -> { exact: push(acc.exact, len(l.items)), rest_from: acc.rest_from },
-          }
-        } else { acc },
+fn through(cx: Cx, rows: List<List<XPat>>, n: Int, family: Bytes, k: XCtor) -> List<List<XPat>> =
+  map(uncovered(cx, specialize(rows, family, k), k.arity + n - 1), |w: List<XPat>|
+    push_front(XCon({ family: family, key: k.key, name: k.name, args: take(w, k.arity) }), drop(w, k.arity)))
+
+// A head of another family, or of the wrong arity, counts as a wildcard: its error is already reported.
+fn specialize(rows: List<List<XPat>>, family: Bytes, k: XCtor) -> List<List<XPat>> =
+  fold(rows, [], |acc: List<List<XPat>>, r: List<XPat>|
+    match at(r, 0) {
+      XNone -> acc,
+      XCon(c) ->
+        if c.family != family { push(acc, append(wilds(k.arity), drop(r, 1))) }
+        else if c.key != k.key { acc }
+        else if len(c.args) == k.arity { push(acc, append(c.args, drop(r, 1))) }
+        else { push(acc, append(wilds(k.arity), drop(r, 1))) },
+      _ -> push(acc, append(wilds(k.arity), drop(r, 1))),
+    })
+
+fn default_rows(rows: List<List<XPat>>, family: Bytes) -> List<List<XPat>> =
+  fold(rows, [], |acc: List<List<XPat>>, r: List<XPat>|
+    match at(r, 0) {
+      XNone -> acc,
+      XCon(c) -> if c.family == family { acc } else { push(acc, drop(r, 1)) },
+      _ -> push(acc, drop(r, 1)),
+    })
+
+// A record is one constructor over every field some arm names; the rest are wildcards everywhere.
+fn uncovered_record(cx: Cx, rows: List<List<XPat>>, n: Int) -> List<List<XPat>> = {
+  let names = fold(rows, [], |acc: List<Bytes>, r: List<XPat>|
+    match at(r, 0) {
+      XRec(fs) -> fold(fs, acc, |a: List<Bytes>, f: { name: Bytes, pat: XPat }| if contains_bytes(a, f.name) { a } else { push(a, f.name) }),
       _ -> acc,
     });
-  let longest = fold(shapes.exact, 0, |acc: Int, n: Int| max(acc, n + 1));
-  let bound = if shapes.rest_from < 0 { longest } else { shapes.rest_from };
-  let below = map(filter(range(0, bound), |n: Int| !contains_int(shapes.exact, n)), |n: Int|
-    if n == 0 { b"the empty list" } else if n == 1 { b"lists of 1 element" } else { bytes_concat_all([b"lists of ", num(n), b" elements"]) });
-  if shapes.rest_from < 0 { push(below, bytes_concat(b"lists longer than ", num(max(longest - 1, 0)))) } else { below }
+  let k = len(names);
+  let spread = fold(rows, [], |acc: List<List<XPat>>, r: List<XPat>|
+    match at(r, 0) {
+      XNone -> acc,
+      XRec(fs) -> push(acc, append(map(names, |nm: Bytes| field_pat(fs, nm)), drop(r, 1))),
+      _ -> push(acc, append(wilds(k), drop(r, 1))),
+    });
+  map(uncovered(cx, spread, k + n - 1), |w: List<XPat>|
+    push_front(XRec(map(range(0, k), |i: Int| { name: at(names, i), pat: at(w, i) })), drop(w, k)))
+}
+
+fn field_pat(fs: List<{ name: Bytes, pat: XPat }>, name: Bytes) -> XPat =
+  fold(fs, XAny, |acc: XPat, f: { name: Bytes, pat: XPat }| if f.name == name { f.pat } else { acc })
+
+fn shown(x: XPat) -> Bytes =
+  match x {
+    XCon(c) ->
+      if c.family == b"#list" { shown_list(x, []) }
+      else if len(c.args) == 0 { c.name }
+      else { bytes_concat_all([c.name, b"(", join_with(map(c.args, |a: XPat| shown(a)), b", "), b")"]) },
+    XRec(fs) -> shown_record(fs),
+    _ -> b"_",
+  }
+
+fn shown_list(x: XPat, items: List<Bytes>) -> Bytes =
+  match x {
+    XCon(c) ->
+      if c.key == b"::" && len(c.args) == 2 { shown_list(at(c.args, 1), push(items, shown(at(c.args, 0)))) }
+      else { bytes_concat_all([b"[", join_with(items, b", "), b"]"]) },
+    _ -> bytes_concat_all([b"[", join_with(push(items, b".."), b", "), b"]"]),
+  }
+
+// A tuple is the record `{_0, _1, ..}` and is shown as one; a record's other fields may be unnamed, so it ends in `..`.
+fn shown_record(fs: List<{ name: Bytes, pat: XPat }>) -> Bytes = {
+  let parts = map(fs, |f: { name: Bytes, pat: XPat }| shown(f.pat));
+  let tuple = len(fs) > 1 && fold(range(0, len(fs)), true, |b: Bool, i: Int| b && at(fs, i).name == bytes_concat(b"_", num(i)));
+  if !fold(parts, false, |b: Bool, t: Bytes| b || t != b"_") { b"_" }
+  else if tuple { bytes_concat_all([b"(", join_with(parts, b", "), b")"]) }
+  else {
+    let named = filter(range(0, len(fs)), |i: Int| at(parts, i) != b"_");
+    bytes_concat_all([b"{", join_with(push(map(named, |i: Int| bytes_concat_all([at(fs, i).name, b": ", at(parts, i)])), b".."), b", "), b"}"])
+  }
 }
 
 // --- Effects ----------------------------------------------------------------------------------
@@ -3360,4 +3464,55 @@ test "a cell leaving its region is reported at the exit, under the code its form
 test "a call instantiating a constrained parameter with a function is refused at the call" {
   let dump = check_dump([{ name: b"m", src: b"fn show<a>(x: a) -> String where derivable(json, a) = \"\"\nfn bad() -> String = show(|y: Int| y)" }]);
   assert_eq(dump, "K;1;X;D;1;!E0206:0:78:82:2:1;=0:78:82:1;=0:0:56:0;")
+}
+
+// The label of each `E0205` a one-module program raises.
+fn not_covered(src: Bytes) -> List<Bytes> = {
+  let r = parse(src);
+  let x = expand(r.node, r.p.uses_sets, r.p.diags);
+  let d: Expansion = expand_derives(0, x.module);
+  match resolve_modules([{ name: b"m", module: d.module, derived: d.derived }]) {
+    Failed(_) -> [b"does not resolve"],
+    Resolved_(ok) -> map(filter(check_program(ok.r, ok.mods).cx.diags, |g: Diag| g.code == b"E0205"), |g: Diag| at(g.labels, 0).text),
+  }
+}
+
+test "a match is exhaustive through nested constructors, and names the inner case it misses" {
+  let t = b"type T = | A | B\n";
+  assert_eq(not_covered(bytes_concat(t, b"fn f(o: Option<T>) -> Int = match o { Some(A) -> 1, Some(B) -> 2, None -> 3 }")), []);
+  assert_eq(not_covered(bytes_concat(t, b"fn f(o: Option<T>) -> Int = match o { Some(A) -> 1, None -> 3 }")), [b"not covered: `Some(B)`"]);
+  assert_eq(not_covered(bytes_concat(t, b"fn f(r: Result<Option<T>, T>) -> Int = match r { Ok(Some(A)) -> 1, Ok(None) -> 2, Err(_) -> 3 }")),
+            [b"not covered: `Ok(Some(B))`"]);
+  assert_eq(not_covered(bytes_concat(t, b"fn f(r: Result<T, T>) -> Int = match r { Ok(A) -> 1 }")),
+            [b"not covered: `Ok(B)`, `Err(_)`"])
+}
+
+test "a guarded arm covers nothing, and a constructor that does not resolve covers nothing" {
+  let t = b"type T = | A | B\n";
+  assert_eq(not_covered(bytes_concat(t, b"fn f(o: Option<T>, n: Int) -> Int = match o { Some(A) if n > 0 -> 1, Some(B) -> 2, None -> 3 }")),
+            [b"not covered: `Some(A)`"]);
+  assert_eq(not_covered(bytes_concat(t, b"fn f(o: Option<T>, n: Int) -> Int = match o { Some(A) if n > 0 -> 1, Some(_) -> 2, None -> 3 }")), []);
+  assert_eq(not_covered(bytes_concat(t, b"fn f(o: Option<T>) -> Int = match o { Some(C) -> 1, None -> 3 }")), [b"not covered: `Some(_)`"])
+}
+
+test "booleans are exhausted by both literals, a unit by its one, and other literals never" {
+  assert_eq(not_covered(b"fn f(p: (Bool, Bool)) -> Int = match p { (true, _) -> 1, (_, true) -> 2, (false, false) -> 3 }"), []);
+  assert_eq(not_covered(b"fn f(p: (Bool, Bool)) -> Int = match p { (true, _) -> 1, (false, true) -> 2 }"), [b"not covered: `(false, false)`"]);
+  assert_eq(not_covered(b"fn f(u: Unit) -> Int = match u { () -> 1 }"), []);
+  assert_eq(not_covered(b"fn f(n: Int) -> Int = match n { 0 -> 1, 1 -> 2 }"), [b"not covered: `_`"]);
+  assert_eq(not_covered(b"fn f(o: Option<Int>) -> Int = match o { Some(0) -> 1, None -> 2 }"), [b"not covered: `Some(_)`"])
+}
+
+test "list patterns are exhausted by exact lengths and prefixes, element patterns included" {
+  assert_eq(not_covered(b"fn f(xs: List<Int>) -> Int = match xs { [] -> 0, [x] -> x, [x, y, ..rest] -> x + y }"), []);
+  assert_eq(not_covered(b"fn f(xs: List<Int>) -> Int = match xs { [] -> 0, [x, y, ..rest] -> x + y }"), [b"not covered: `[_]`"]);
+  assert_eq(not_covered(b"fn f(xs: List<Int>) -> Int = match xs { [x, ..rest] -> x }"), [b"not covered: `[]`"]);
+  assert_eq(not_covered(b"fn f(xs: List<Option<Int>>) -> Int = match xs { [] -> 0, [None, ..] -> 1, [Some(x), ..rest] -> x }"), []);
+  assert_eq(not_covered(b"fn f(xs: List<Option<Int>>) -> Int = match xs { [] -> 0, [Some(x), ..rest] -> x }"), [b"not covered: `[None, ..]`"])
+}
+
+test "record patterns are exhausted field by field" {
+  let t = b"type T = | A | B\n";
+  assert_eq(not_covered(bytes_concat(t, b"fn f(p: { t: T, n: Int }) -> Int = match p { {t: A, n} -> n, {t: B, ..} -> 0 }")), []);
+  assert_eq(not_covered(bytes_concat(t, b"fn f(p: { t: T, n: Int }) -> Int = match p { {t: A, n} -> n }")), [b"not covered: `{t: B, ..}`"])
 }
