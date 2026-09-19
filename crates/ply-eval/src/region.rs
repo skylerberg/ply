@@ -1,14 +1,12 @@
-//! A live `simulate` region, and the trail every region of one entry point writes into.
+//! What a `simulate` region schedules, and the trail every region of one entry point writes into.
 
-use crate::code::{Captures, Code};
-use crate::cont::{Continuation, Delimiter, SimId, Stack};
+use crate::cont::{Continuation, Delimiter};
 use crate::explore::{Interleaving, Step, Verdict};
 use crate::sched::{Scheduler, StepRecord};
-use crate::sim::{Access, Domain, Handlers, Seed, Stream};
+use crate::sim::{Access, Domain, Seed, Stream};
 use crate::value::Value;
 
 use ply_span::{Diagnostic, Span, Symbol};
-use std::rc::Rc;
 
 pub struct StepSite {
     pub definition: Option<Symbol>,
@@ -22,77 +20,6 @@ pub struct Spawned {
 }
 
 pub type MachineScheduler = Scheduler<Continuation, Spawned>;
-
-pub struct Region {
-    pub id: SimId,
-    pub sched: MachineScheduler,
-    pub handlers: Handlers,
-    /// The stack the region delivers its value onto.
-    pub below: Stack,
-    pub body: Option<Code>,
-    /// The root body's window size, and its free variables' values at entry.
-    pub size: u32,
-    pub captures: Rc<Captures>,
-    pub captured: Rc<[Value]>,
-    pub module: usize,
-    pub span: Span,
-    /// Slot-stack height at entry; every scheduling turn resets to it.
-    pub floor: usize,
-    /// The entering activation's base, restored when the region delivers its value.
-    pub rbase: usize,
-}
-
-impl Region {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        id: SimId,
-        root: u64,
-        drawn: u64,
-        steps: u32,
-        below: Stack,
-        body: Code,
-        size: u32,
-        captures: Rc<Captures>,
-        captured: Rc<[Value]>,
-        module: usize,
-        span: Span,
-        floor: usize,
-        rbase: usize,
-    ) -> Region {
-        Region {
-            id,
-            sched: Scheduler::new(id, span).with_step_budget(steps),
-            handlers: Handlers::at(root, drawn),
-            below,
-            body: Some(body),
-            size,
-            captures,
-            captured,
-            module,
-            span,
-            floor,
-            rbase,
-        }
-    }
-
-    /// A region the host binding opened, over a scheduler the caller built and rooted.
-    pub fn production(id: SimId, sched: MachineScheduler, span: Span) -> Region {
-        Region {
-            id,
-            sched,
-            handlers: Handlers::at(0, 0),
-            below: Stack::new(),
-            body: None,
-            size: 0,
-            captures: crate::code::no_captures(),
-            captured: crate::code::no_captured(),
-            module: 0,
-            span,
-            floor: 0,
-            rbase: 0,
-        }
-    }
-}
 
 pub struct Trail {
     seed: Seed,

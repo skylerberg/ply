@@ -1,26 +1,8 @@
-//! A node's meaning and diagnostics, shared by every evaluation strategy.
+//! An operator's meaning and the diagnostics shared by every evaluation strategy.
 
 use crate::value::{Decimal, Fixed, Value, type_error, values_equal};
 use ply_span::{Diagnostic, Span, codes};
-use ply_ty::{BinOp, Lit};
-
-pub(crate) fn literal(lit: &Lit) -> Value {
-    match lit {
-        Lit::Int(i) => Value::Int(*i),
-        Lit::Fixed { ty, bits } => Value::Fixed(Fixed::new(*ty, *bits)),
-        Lit::Bool(b) => Value::Bool(*b),
-        Lit::Str(s) => Value::str(s),
-        Lit::Bytes(b) => Value::bytes(b),
-        Lit::Float(f) => Value::Float(*f),
-        Lit::Decimal { mantissa, scale } => Value::Decimal(decimal_lit(*mantissa, *scale)),
-        Lit::Unit => Value::Unit,
-    }
-}
-
-/// The fallback is unreachable: the lexer and body decoder already enforce `Decimal`'s range.
-pub(crate) fn decimal_lit(mantissa: i128, scale: u32) -> Decimal {
-    Decimal::try_from_i128_with_scale(mantissa, scale).unwrap_or(Decimal::ZERO)
-}
+use ply_ty::BinOp;
 
 #[inline(never)]
 pub fn strict_binary(

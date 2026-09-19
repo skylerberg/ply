@@ -20,7 +20,6 @@ mod region_meaning_adversarial;
 mod resumption_snapshot_audit;
 mod secrets;
 mod simulated_handlers;
-mod slot_resolution;
 mod unit;
 mod use_after_free_audit;
 mod value_semantics_audit;

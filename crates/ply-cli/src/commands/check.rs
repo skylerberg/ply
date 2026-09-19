@@ -91,9 +91,9 @@ fn check(
 
 /// For every `push`, whether it grows its list in place or copies it.
 fn print_costs(loaded: &Loaded, style: Style) -> Result<(), crate::load::LoadError> {
-    let tree = loaded.tree().map_err(|d| loaded.refused(d))?;
+    let lines = crate::costs::lines(loaded, style).map_err(|d| loaded.refused(d))?;
     println!();
-    match crate::costs::lines(&tree.program, &tree.resolved, &loaded.sources, style) {
+    match lines {
         Some(lines) => {
             for line in lines {
                 println!("{line}");

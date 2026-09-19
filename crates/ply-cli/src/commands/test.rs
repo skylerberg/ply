@@ -1631,10 +1631,7 @@ pub(crate) fn broken_promises(loaded: &Loaded) -> Option<crate::load::LoadError>
     if !loaded.promised {
         return None;
     }
-    let diagnostics = match loaded.tree() {
-        Ok(tree) => crate::costs::promises(&tree.program, &tree.resolved),
-        Err(diagnostic) => vec![diagnostic],
-    };
+    let diagnostics = crate::costs::promises(loaded);
     (!diagnostics.is_empty()).then(|| crate::load::LoadError {
         sources: loaded.sources.clone(),
         diagnostics,
