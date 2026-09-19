@@ -32,11 +32,14 @@ pub const HASH: &str = include_str!("../ply/hash.ply");
 
 pub const CODE: &str = include_str!("../ply/code.ply");
 
+pub const COSTS: &str = include_str!("../ply/costs.ply");
+
 pub const EMIT: &str = include_str!("../ply/emit.ply");
 
 /// The order is part of the identity: the producer digests these texts in this order.
 pub const MODULES: &[(&str, &str)] = &[
     ("code", CODE),
+    ("costs", COSTS),
     ("derive", DERIVE),
     ("diag", DIAG),
     ("emit", EMIT),

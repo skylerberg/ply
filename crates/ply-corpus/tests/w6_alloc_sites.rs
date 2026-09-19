@@ -296,22 +296,18 @@ fn the_two_allocation_harnesses_are_one_measurement_read_at_two_windows() {
         );
     }
 
-    // The two candidates R3 was planned against, rolled up over every chain a frame of theirs
-    // appears in: both are whole-program compile-time analyses and a per-site row understates them
-    // by splitting one pass across its recursion depths.
-    println!("\n== the two hoist candidates, over every site their frames appear in");
+    // A whole-program analysis: a per-site row understates it by splitting one pass across its recursion depths.
+    println!("\n== the hoist candidate, over every site its frames appear in");
     println!(
         "  {:>9} {:>10} {:>9} {:>9}  family",
         "per req", "per Machine", "at n=20", "at n=200"
     );
-    for family in HOISTS {
-        let (slope, intercept) = fit(family, &small, &large);
-        println!(
-            "  {slope:>9.1} {intercept:>10.0} {:>8.1}% {:>8.1}%  {family}",
-            100.0 * family_count(family, &small) / small.total as f64,
-            100.0 * family_count(family, &large) / large.total as f64,
-        );
-    }
+    let (slope, intercept) = fit(HOIST, &small, &large);
+    println!(
+        "  {slope:>9.1} {intercept:>10.0} {:>8.1}% {:>8.1}%  {HOIST}",
+        100.0 * family_count(HOIST, &small) / small.total as f64,
+        100.0 * family_count(HOIST, &large) / large.total as f64,
+    );
 
     let routing = loaded
         .full("w6_bench")
@@ -325,7 +321,7 @@ fn the_two_allocation_harnesses_are_one_measurement_read_at_two_windows() {
     let small_routing = capture(SMALL, || iterate(SMALL));
     let large_routing = capture(LARGE, || iterate(LARGE));
     println!(
-        "\n== the same two families on the routing rung, a second path\n  \
+        "\n== the same family on the routing rung, a second path\n  \
          {:>4} iterations: {:>9.1} allocations each\n  \
          {:>4} iterations: {:>9.1} allocations each",
         SMALL,
@@ -333,10 +329,8 @@ fn the_two_allocation_harnesses_are_one_measurement_read_at_two_windows() {
         LARGE,
         large_routing.per_request()
     );
-    for family in HOISTS {
-        let (slope, intercept) = fit(family, &small_routing, &large_routing);
-        println!("  {slope:>9.1} per iteration {intercept:>10.0} per Machine  {family}");
-    }
+    let (slope, intercept) = fit(HOIST, &small_routing, &large_routing);
+    println!("  {slope:>9.1} per iteration {intercept:>10.0} per Machine  {HOIST}");
 
     for window in [&small, &large] {
         let counted = w6_alloc(&counter, window.requests);
@@ -368,8 +362,7 @@ fn the_two_allocation_harnesses_are_one_measurement_read_at_two_windows() {
     );
 }
 
-/// The two compile-time analyses R3 proposes to hoist off the request path.
-const HOISTS: [&str; 2] = ["ply_eval::region_kind", "ply_eval::code::lower"];
+const HOIST: &str = "ply_eval::region_kind";
 
 fn family_count(family: &str, window: &Window) -> f64 {
     window

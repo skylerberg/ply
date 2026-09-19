@@ -916,8 +916,7 @@ fn a_promise_is_known_on_every_run_and_still_refused() {
     let second = agree(dir, "second run");
     assert!(second.promised, "the promise was lost on the second run");
 
-    let tree = second.tree().expect("the front ends agree");
-    let broken = ply_cli::costs::promises(&tree.program, &tree.resolved);
+    let broken = ply_cli::costs::promises(&second);
     assert_eq!(broken.len(), 1, "{broken:#?}");
     assert_eq!(broken[0].code, ply_span::codes::REUSE_BROKEN);
 }

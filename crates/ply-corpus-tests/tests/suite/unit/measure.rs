@@ -25,7 +25,6 @@ fn a_pass_reports_what_it_ran() {
     let t = throughput(&root, 1).unwrap();
     assert!(t.pass.steady_pass_millis > 0.0);
     assert!(t.pass.performs > 0, "the corpus performed no atom");
-    assert!(t.lower_test_bodies_millis > 0.0);
 }
 
 /// The machine lowers on first call, so setup must not be read as interpreter speed.

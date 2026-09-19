@@ -15,8 +15,6 @@ fn call_frame() -> Frame {
         name: None,
         call_site: Span::DUMMY,
         memo: false,
-        callee_window: 0,
-        caller_window: 0,
     }
 }
 
@@ -72,15 +70,7 @@ fn pushing_one_frame_costs_one_allocation_and_popping_costs_none() {
 
 #[test]
 fn pushing_a_frame_costs_no_more_than_opening_a_prompt() {
-    let prompt = Rc::new(Prompt {
-        clauses: Rc::new(Vec::new()),
-        effects: Rc::new(Vec::new()),
-        ret: None,
-        clause_captures: Vec::new(),
-        ret_captures: Rc::from(Vec::new()),
-        module: 0,
-        span: Span::DUMMY,
-    });
+    let prompt = Rc::new(Prompt { span: Span::DUMMY });
 
     let mut stack = Stack::new();
     for _ in 0..64 {
@@ -91,7 +81,7 @@ fn pushing_a_frame_costs_no_more_than_opening_a_prompt() {
     let (_, prompts) = allocations_of(|| {
         let mut s = stack.clone();
         for _ in 0..N {
-            s = s.push_prompt(prompt.clone(), 0);
+            s = s.push_prompt(prompt.clone());
         }
         s
     });
