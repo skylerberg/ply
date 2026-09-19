@@ -358,55 +358,103 @@ pub fn prove(
     use_cache: bool,
     discharger: &dyn Discharger,
 ) -> Proved {
-    let started = Instant::now();
-    let plan = plan.clone().normalized();
-    let selection = select(&obligations, store, &plan, use_cache);
-    let mut warnings = selection.warnings;
+    Asked::new(obligations, store, plan, use_cache).discharge(check, laws, store, discharger)
+}
 
-    let fresh: Vec<(usize, Discharge)> = selection
-        .to_discharge
-        .par_iter()
-        .map(|&index| (index, discharger.discharge(&obligations[index], &plan)))
-        .collect();
+/// [`prove`] up to what the cache answered, so a discharger is built only when one is needed.
+pub struct Asked {
+    obligations: Vec<Obligation>,
+    selection: Selection,
+    plan: ProvePlan,
+    use_cache: bool,
+    started: Instant,
+}
 
-    let mut discharges: Vec<Option<Discharge>> = selection
-        .cached
-        .into_iter()
-        .map(|evidence| evidence.map(Discharge::Held))
-        .collect();
-    for (index, discharge) in fresh {
-        if use_cache && !obligations[index].host {
-            record(store, obligations[index].key, &discharge, &plan);
+impl Asked {
+    pub fn new(
+        obligations: Vec<Obligation>,
+        store: &Store,
+        plan: &ProvePlan,
+        use_cache: bool,
+    ) -> Asked {
+        let started = Instant::now();
+        let plan = plan.clone().normalized();
+        let selection = select(&obligations, store, &plan, use_cache);
+        Asked {
+            obligations,
+            selection,
+            plan,
+            use_cache,
+            started,
         }
-        discharges[index] = Some(discharge);
     }
 
-    // Every index either came from the cache or was discharged, so no `None` survives.
-    let paired: Vec<(Obligation, Discharge)> = obligations
-        .into_iter()
-        .zip(discharges)
-        .map(|(obligation, discharge)| {
-            let discharge = discharge.unwrap_or_else(|| {
-                Discharge::Unattempted(ply_prove::Gap::UnhandledEffect(
-                    obligation.footprint.clone(),
-                ))
-            });
-            (obligation, discharge)
-        })
-        .collect();
+    /// Whether the cache left anything to discharge.
+    pub fn pending(&self) -> bool {
+        !self.selection.to_discharge.is_empty()
+    }
 
-    warnings.extend(store.take_warnings());
-    let coverage = coverage(check, laws, &paired);
-    Proved {
-        report: ProveReport {
-            obligations: paired,
-            coverage,
+    pub fn discharge(
+        self,
+        check: &CheckOutput,
+        laws: &Laws,
+        store: &mut Store,
+        discharger: &dyn Discharger,
+    ) -> Proved {
+        let Asked {
+            obligations,
+            selection,
             plan,
-            cached: selection.reasons.iter().filter(|r| r.hit()).count(),
-            duration: started.elapsed(),
-        },
-        reasons: selection.reasons,
-        warnings,
+            use_cache,
+            started,
+        } = self;
+        let mut warnings = selection.warnings;
+
+        let fresh: Vec<(usize, Discharge)> = selection
+            .to_discharge
+            .par_iter()
+            .map(|&index| (index, discharger.discharge(&obligations[index], &plan)))
+            .collect();
+
+        let mut discharges: Vec<Option<Discharge>> = selection
+            .cached
+            .into_iter()
+            .map(|evidence| evidence.map(Discharge::Held))
+            .collect();
+        for (index, discharge) in fresh {
+            if use_cache && !obligations[index].host {
+                record(store, obligations[index].key, &discharge, &plan);
+            }
+            discharges[index] = Some(discharge);
+        }
+
+        // Every index either came from the cache or was discharged, so no `None` survives.
+        let paired: Vec<(Obligation, Discharge)> = obligations
+            .into_iter()
+            .zip(discharges)
+            .map(|(obligation, discharge)| {
+                let discharge = discharge.unwrap_or_else(|| {
+                    Discharge::Unattempted(ply_prove::Gap::UnhandledEffect(
+                        obligation.footprint.clone(),
+                    ))
+                });
+                (obligation, discharge)
+            })
+            .collect();
+
+        warnings.extend(store.take_warnings());
+        let coverage = coverage(check, laws, &paired);
+        Proved {
+            report: ProveReport {
+                obligations: paired,
+                coverage,
+                plan,
+                cached: selection.reasons.iter().filter(|r| r.hit()).count(),
+                duration: started.elapsed(),
+            },
+            reasons: selection.reasons,
+            warnings,
+        }
     }
 }
 

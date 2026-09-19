@@ -128,22 +128,17 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
             .as_ref()
             .map(|f| f as &(dyn Fn() -> std::rc::Rc<dyn ply_eval::host::HostRuntime> + Sync)),
     });
-    let engine = match crate::engine::of(&loaded, hosting, backend) {
-        Ok(engine) => engine,
-        Err(err) => return report_load_error("prove", &err, args.json, style),
+    let asked = obligation::Asked::new(obligations, &store, &plan, !args.no_cache);
+    let engine: Box<dyn obligation::Discharger + '_> = if asked.pending() {
+        match crate::engine::of(&loaded, hosting, backend, &mut store) {
+            Ok(engine) => engine,
+            Err(err) => return report_load_error("prove", &err, args.json, style),
+        }
+    } else {
+        Box::new(obligation::Undecided)
     };
     let (pool, _workers) = build_pool(args.jobs, &mut warnings);
-    let discharge = || {
-        obligation::prove(
-            obligations,
-            &scoped,
-            &laws,
-            &mut store,
-            &plan,
-            !args.no_cache,
-            engine.as_ref(),
-        )
-    };
+    let discharge = || asked.discharge(&scoped, &laws, &mut store, engine.as_ref());
     let mut proved = match &pool {
         Some(pool) => pool.install(discharge),
         None => discharge(),
