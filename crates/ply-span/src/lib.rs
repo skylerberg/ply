@@ -455,7 +455,10 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ("E0302", "effect not permitted by the written row"),
     ("E0303", "unhandled effect (compiler defect)"),
     ("E0304", "resource label required"),
-    ("E0305", "`handle` with no clause for an operation its body performs on a handled atom"),
+    (
+        "E0305",
+        "`handle` with no clause for an operation its body performs on a handled atom",
+    ),
     ("E0412", "nondeterministic effect in a deterministic test"),
     ("E0413", "`Task` escapes its region"),
     ("E0414", "deadlock, or spent step budget"),
