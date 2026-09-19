@@ -248,7 +248,7 @@ fn one_culprit_among_five_edits_is_named_within_the_logarithmic_budget() {
 const RECURSION: &str = r#"
 fn step(n: Int) -> Int = n - 1
 fn guard(n: Int) -> Int = if n < 0 { 0 } else { n }
-fn countdown(n: Int) -> Int = if n <= 0 { 0 } else { countdown(step(n)) }
+fn countdown(n: Int) -> Int = if n <= 0 { 0 } else { 0 + countdown(step(n)) }
 fn total(n: Int) -> Int = countdown(guard(n))
 
 test "terminates" { assert_eq(total(3), 0) }
