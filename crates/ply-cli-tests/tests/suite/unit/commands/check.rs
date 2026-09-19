@@ -260,4 +260,3 @@ fn a_definition_no_root_reaches_is_warned_once_at_its_name() {
         ]
     );
 }
-
