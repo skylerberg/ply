@@ -166,6 +166,7 @@ impl Net for TcpHost {
         match op {
             Op::Listen => "ply_host::tcp::listen",
             Op::ListenTls => tls::HANDLER,
+            Op::Connect => "ply_host::tcp::connect",
             Op::Accept => "ply_host::tcp::accept",
             Op::Recv => "ply_host::tcp::recv",
             Op::Send => "ply_host::tcp::send",
@@ -193,6 +194,35 @@ impl Net for TcpHost {
             Some(at),
             Sock::Listener(Arc::new(listener), Some(config)),
         ))))
+    }
+
+    /// Resolution and the connect both happen on the job's thread; the deadline covers the connect
+    /// to each address the name resolves to in turn.
+    fn connect(
+        &self,
+        at: &Resource,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic> {
+        let sockets = Arc::clone(&self.sockets);
+        let host = host.to_string();
+        let at = at.clone();
+        self.waiting(span, "connect", Op::Connect.what(), move || {
+            use std::net::ToSocketAddrs;
+            let Ok(addrs) = (host.as_str(), port).to_socket_addrs() else {
+                return Done::MaybeInt(None);
+            };
+            for addr in addrs {
+                if let Ok(stream) = TcpStream::connect_timeout(&addr, timeout) {
+                    return Done::MaybeInt(Some(
+                        sockets.insert(Some(&at), Sock::Stream(Arc::new(stream))),
+                    ));
+                }
+            }
+            Done::MaybeInt(None)
+        })
     }
 
     /// No handshake here, deliberately: the session handshakes on its first read or write.
