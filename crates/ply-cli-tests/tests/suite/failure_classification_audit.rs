@@ -121,7 +121,7 @@ fn every_language_defined_runtime_failure_is_a_program_error(index: usize, of: u
             "assertion failed",
         ),
         (
-            // One argument written, two passed: `ply_syntax::defaults` splices in `message`'s `None`.
+            // One argument written, two passed: resolution splices in `message`'s `None`.
             "a failing assert",
             "fn no() -> Bool = false\n\
              test \"holds\" { assert(no()) }\n",

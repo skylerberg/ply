@@ -257,18 +257,6 @@ fn malformed_text_is_refused_with_the_position() {
 }
 
 fn std_check() -> CheckOutput {
-    let mut program = ply_syntax::ast::Program {
-        modules: Vec::new(),
-    };
-    for (i, (name, text)) in ply_std::sources().enumerate() {
-        let mut module =
-            ply_syntax::parse_module(SourceId(i as u32), ModuleName::from_dotted(name), text)
-                .unwrap_or_else(|d| panic!("{name} does not parse: {d:?}"));
-        let expansion = ply_derive::expand_module(&mut module);
-        assert!(expansion.is_empty(), "{name}: {expansion:?}");
-        program.modules.push(module);
-    }
-    ply_syntax::resolve(&mut program).expect("the standard library resolves");
     let modules: Vec<(String, String)> = ply_std::sources()
         .map(|(n, t)| (n.to_string(), t.to_string()))
         .collect();

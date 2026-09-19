@@ -8,8 +8,8 @@ use ply_prove::{
     Tier, VacuityKind,
 };
 use ply_span::{Diagnostic, SourceId, Span, Symbol};
-use ply_syntax::ast::Mode;
 use ply_ty::DefHash;
+use ply_ty::Mode;
 use ply_ty::prelude;
 use ply_ty::{EffectAtom, LawBinder, Resource, Row, RowVar, TyVar, Type};
 use std::collections::{BTreeSet, HashMap};

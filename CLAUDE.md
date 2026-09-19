@@ -2,7 +2,7 @@
 
 Ply is a general-purpose programming language. Its compiler is written in Ply
 (`crates/ply-compiler/ply`), compiled to C and committed as a bootstrap bundle. The Rust crates are
-the runtime, the CLI, and a Rust front end that is being retired.
+the runtime and the CLI.
 
 ## Prose
 

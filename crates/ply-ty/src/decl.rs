@@ -1,4 +1,4 @@
-//! What a declaration is named and classified by, shared by the syntax tree and the checker.
+//! What a declaration is named and classified by, as the front end publishes it.
 
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::fmt;
@@ -15,7 +15,7 @@ impl Default for ModuleName {
 }
 
 impl ModuleName {
-    /// The module of source that has no project root: a snippet handed to `ply_syntax::parse`.
+    /// The module of source that has no project root: a snippet.
     pub fn anonymous() -> ModuleName {
         ModuleName(Symbol::new(""))
     }
@@ -118,8 +118,6 @@ pub enum Deriver {
 }
 
 impl Deriver {
-    pub const ALL: &'static [Deriver] = &[Deriver::Json, Deriver::Eq, Deriver::Ord];
-
     pub fn from_name(name: &str) -> Option<Deriver> {
         Some(match name {
             "json" => Deriver::Json,
@@ -135,33 +133,6 @@ impl Deriver {
             Deriver::Eq => "eq",
             Deriver::Ord => "ord",
         }
-    }
-
-    /// The dictionary type a derivation of this kind produces.
-    pub fn dictionary(self) -> &'static str {
-        match self {
-            Deriver::Json => "JsonCodec",
-            Deriver::Eq => "EqDict",
-            Deriver::Ord => "OrdDict",
-        }
-    }
-
-    /// Distinguishes derivers in a definition hash and in a stored body.
-    pub fn tag(self) -> u8 {
-        match self {
-            Deriver::Json => 1,
-            Deriver::Eq => 2,
-            Deriver::Ord => 3,
-        }
-    }
-
-    pub fn from_tag(tag: u8) -> Option<Deriver> {
-        Some(match tag {
-            1 => Deriver::Json,
-            2 => Deriver::Eq,
-            3 => Deriver::Ord,
-            _ => return None,
-        })
     }
 }
 
@@ -196,14 +167,6 @@ impl SpecKind {
         match self {
             SpecKind::Requires => "requires",
             SpecKind::Ensures => "ensures",
-        }
-    }
-
-    /// Distinguishes the two in a spec hash.
-    pub fn tag(self) -> u8 {
-        match self {
-            SpecKind::Requires => 1,
-            SpecKind::Ensures => 2,
         }
     }
 }

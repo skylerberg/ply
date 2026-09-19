@@ -5,13 +5,13 @@ use ply_cli::hosts::Hosts;
 use ply_cli::load::{Loaded, load};
 use ply_cli::style::Style;
 use ply_eval::Plan as SimPlan;
-use ply_hash::HashOutput;
 use ply_span::{Symbol, codes};
 use ply_store::{Outcome, Store};
 use ply_test::{
     Bisection, Isolation, Reason, Record, RunReport, Selection, Skipped, Status, Suspect,
     TestResult, Verdict,
 };
+use ply_ty::HashOutput;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;

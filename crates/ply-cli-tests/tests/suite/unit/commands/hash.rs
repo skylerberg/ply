@@ -1,7 +1,7 @@
 use ply_cli::commands::hash::*;
 use ply_cli::load::{Loaded, load};
-use ply_hash::HashOutput;
 use ply_span::Symbol;
+use ply_ty::HashOutput;
 use serde_json::json;
 
 fn write(dir: &std::path::Path, rel: &str, text: &str) {
@@ -66,7 +66,7 @@ fn deps_adds_the_graph_and_the_closure() {
     );
 }
 
-fn def(hashes: &HashOutput, name: &str) -> ply_hash::DefHash {
+fn def(hashes: &HashOutput, name: &str) -> ply_ty::DefHash {
     hashes.defs[&Symbol::new(name)]
 }
 

@@ -1,10 +1,7 @@
 use ply_eval::{Exploration, host::HostUse};
-use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::Resolved;
 use ply_test::{BackendUse, Engine, Executor, InterpExecutor, Worker};
-use ply_ty::CheckOutput;
+use ply_ty::{CheckOutput, HashOutput, ModuleName};
 use std::collections::HashMap;
 
 #[track_caller]
@@ -23,15 +20,11 @@ pub fn port_diagnostics(sources: &[(String, String)], ids: &[SourceId]) -> Vec<D
 }
 
 pub struct Compiled {
-    pub program: Program,
-    pub resolved: Resolved,
     /// What the tier is built over and the executor runs.
     pub port: ply_ty::Front,
     pub check: CheckOutput,
     pub hashes: HashOutput,
-    /// A `Front` without bodies silently disables every hybrid rather than failing.
-    pub bodies: ply_hash::body::BodySet,
-    /// Keyed by `m.name.to_string()`; the Ply emitter re-parses these rather than reading the AST.
+    /// Keyed by `m.name.to_string()`; the Ply emitter re-parses these.
     pub texts: HashMap<String, String>,
 }
 
@@ -42,26 +35,16 @@ impl Compiled {
         Compiled::modules(&[("m", src)])
     }
 
-    /// Named as `ply_syntax::parse` names it, not `m`; the module name reaches every hash.
+    /// The module with no project root, named `""`; the module name reaches every hash.
     #[track_caller]
     pub fn anonymous(src: &str) -> Compiled {
-        let module = ply_syntax::parse(SourceId(0), src).expect("the fixture must parse");
-        let name = module.name.to_string();
-        Compiled::of(
-            ply_syntax::ast::Program::single(module),
-            HashMap::from([(name, src.to_string())]),
-        )
+        Compiled::modules(&[("", src)])
     }
 
     /// Several modules, each one's `SourceId` its position in `sources`.
     #[track_caller]
     pub fn modules(sources: &[(&str, &str)]) -> Compiled {
-        let inputs: Vec<_> = sources
-            .iter()
-            .enumerate()
-            .map(|(i, (name, src))| (SourceId(i as u32), ModuleName::from_dotted(name), *src))
-            .collect();
-        let texts = sources
+        let named: Vec<(String, String)> = sources
             .iter()
             .map(|(name, src)| {
                 (
@@ -70,51 +53,14 @@ impl Compiled {
                 )
             })
             .collect();
-        Compiled::of(
-            ply_syntax::parse_program(inputs)
-                .unwrap_or_else(|d| panic!("the fixture must parse: {d:#?}")),
-            texts,
-        )
-    }
-
-    #[track_caller]
-    fn of(mut program: Program, texts: HashMap<String, String>) -> Compiled {
-        let resolved = ply_syntax::resolve(&mut program)
-            .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let sources: Vec<(String, String)> = program
-            .modules
-            .iter()
-            .map(|m| {
-                let name = m.name.to_string();
-                let text = texts
-                    .get(&name)
-                    .unwrap_or_else(|| panic!("no source text for module {name:?}"));
-                (name, text.clone())
-            })
-            .collect();
-        let ids: Vec<SourceId> = program.modules.iter().map(|m| m.source).collect();
-        let port = port_front(&sources, &ids);
-        let (hashes, bodies) = ply_hash::hash_program_with_bodies(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must hash: {d:#?}"));
+        let ids: Vec<SourceId> = (0..named.len()).map(|i| SourceId(i as u32)).collect();
+        let port = port_front(&named, &ids);
         Compiled {
-            program,
-            resolved,
             check: port.check.clone(),
+            hashes: port.hashes.clone(),
             port,
-            hashes,
-            bodies,
-            texts,
+            texts: named.into_iter().collect(),
         }
-    }
-
-    pub fn front(&self) -> ply_ty::Front {
-        ply_codegen::source::front_of(
-            &self.program,
-            &self.resolved,
-            &self.check,
-            self.hashes.clone(),
-            Some(&self.bodies),
-        )
     }
 
     pub fn footprints(&self) -> Vec<ply_ty::Footprint> {

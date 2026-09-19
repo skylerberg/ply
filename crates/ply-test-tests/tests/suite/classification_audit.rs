@@ -1,12 +1,12 @@
 use crate::fixture::Compiled;
 use ply_eval::Plan;
-use ply_hash::HashOutput;
 use ply_span::{Diagnostic, Severity, SourceId, Span, codes};
 use ply_store::Store;
 use ply_test::{
     Baseline, Bisection, Executor, Gate, Mode, Options, RunReport, Skipped, Status, Verdict,
     precheck, run_with, select,
 };
+use ply_ty::HashOutput;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -168,8 +168,8 @@ fn a_simulation_divergence_is_a_defect_in_ply() {
     assert_eq!(verdict, Verdict::NotAttempted(Skipped::Panicked));
 }
 
-fn hash(seed: &str) -> ply_hash::DefHash {
-    ply_hash::DefHash::from_hex(&seed.repeat(32)).expect("a well-formed hash")
+fn hash(seed: &str) -> ply_ty::DefHash {
+    ply_ty::DefHash::from_hex(&seed.repeat(32)).expect("a well-formed hash")
 }
 
 fn baseline() -> Baseline {

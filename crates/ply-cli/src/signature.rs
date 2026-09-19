@@ -1,7 +1,7 @@
 //! How `ply check --types` renders a signature, and the effect-set provenance `--explain` adds.
 
 use ply_span::Symbol;
-use ply_syntax::ast::ModuleName;
+use ply_ty::ModuleName;
 use ply_ty::print::Printer;
 use ply_ty::ty::{Footprint, Row, Scheme, Type};
 use ply_ty::{DefInfo, Front};

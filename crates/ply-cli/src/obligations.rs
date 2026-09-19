@@ -1,9 +1,9 @@
 //! Building the list of claims a run has to discharge.
 
-use ply_hash::HashOutput;
 use ply_prove::{Frame, Obligation, ObligationKind, frame_of};
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::SpecKind;
+use ply_ty::HashOutput;
+use ply_ty::SpecKind;
 use ply_ty::{CheckOutput, DefWritten, Front, LawBinder, Type};
 
 pub struct Collected {

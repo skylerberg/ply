@@ -10,13 +10,13 @@ use crate::driver;
 use crate::hosts::{self, Hosts, hosting};
 use crate::load::{Loaded, load, project_root};
 use crate::style::Style;
-use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceMap, Span, codes};
 use ply_store::Store;
 use ply_test::{
     Bisection, Failure, Isolation, Reason, Record, RunReport, Selection, Skipped, Status, Suspect,
     TestResult, Verdict,
 };
+use ply_ty::HashOutput;
 use ply_ty::{CheckOutput, Footprint};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;

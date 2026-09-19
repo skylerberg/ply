@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use ply_eval::Plan;
 use ply_span::Symbol;
 use ply_store::Store;
-use ply_syntax::ast::Mode;
+use ply_ty::Mode;
 use ply_ty::{EffectAtom, Footprint};
 use serde::Serialize;
 use std::collections::BTreeSet;

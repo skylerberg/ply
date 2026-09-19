@@ -1104,8 +1104,8 @@ fn every_builtin_agrees_on_its_arity_everywhere() {
             min,
             max,
             "`{}` has a variable arity; every builtin is exactly applied, and a call \
-             that leaves an argument out is filled by `ply_syntax::defaults` before \
-             anything here sees it",
+             that leaves an argument out is filled by the front end's defaults pass \
+             before anything here sees it",
             b.name()
         );
 
@@ -1115,20 +1115,6 @@ fn every_builtin_agrees_on_its_arity_everywhere() {
                 max,
                 "`{}` takes {max} arguments here and {typed} in the prelude's scheme. \
                  Whichever is larger, the extra arm is unreachable from source.",
-                b.name()
-            );
-        }
-
-        if let Some((params, defaults)) = ply_syntax::defaults::builtin_shape(b.name()) {
-            assert_eq!(
-                params,
-                max,
-                "`{}`'s defaults table describes {params} parameters, its arity {max}",
-                b.name()
-            );
-            assert!(
-                defaults > 0,
-                "`{}` is in the defaults table with no default in it",
                 b.name()
             );
         }

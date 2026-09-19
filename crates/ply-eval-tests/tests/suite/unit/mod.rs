@@ -3,7 +3,6 @@
 
 mod arena;
 mod argv;
-mod build;
 mod builtins;
 mod compiled;
 mod cont;

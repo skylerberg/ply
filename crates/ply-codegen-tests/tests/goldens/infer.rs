@@ -10,13 +10,13 @@ fn first_difference(reference: &str, actual: &str) -> Option<String> {
         if a != b {
             let from = i.saturating_sub(6);
             let mut report = format!(
-                "record {i} of {} differs\n  rust: {a:?}\n  ply : {b:?}\n  context (rust):\n",
+                "record {i} of {} differs\n  golden: {a:?}\n  port  : {b:?}\n  context (golden):\n",
                 want.len()
             );
             for (j, r) in want.iter().enumerate().skip(from).take(14) {
                 report.push_str(&format!("    {j:>7} {r}\n"));
             }
-            report.push_str("  context (ply):\n");
+            report.push_str("  context (port):\n");
             for (j, r) in got.iter().enumerate().skip(from).take(14) {
                 report.push_str(&format!("    {j:>7} {r}\n"));
             }
@@ -149,7 +149,7 @@ fn the_ply_checker_matches_its_golden_on_every_example_with_the_standard_library
 #[test]
 fn the_ply_checker_matches_its_golden_on_the_resolvers_reference_programs() {
     let text = std::fs::read_to_string(fixtures().join("reference-programs.corpus"))
-        .expect("the mined programs; run mine-programs.py");
+        .expect("the mined programs");
     let inputs: Vec<(String, Vec<(String, String)>)> = programs(&text)
         .into_iter()
         .enumerate()

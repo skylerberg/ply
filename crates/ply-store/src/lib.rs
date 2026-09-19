@@ -4,7 +4,7 @@
 
 mod answer;
 mod binary;
-mod bodies;
+pub mod body;
 mod canonical;
 pub mod codec;
 pub mod diag;
@@ -45,7 +45,7 @@ pub const PROVER_VERSION: &str = "0.6.0";
 
 pub const FRONTEND_FORMAT: u32 = 7;
 
-pub const BODY_ENCODING: u32 = ply_hash::body::BODY_ENCODING;
+pub const BODY_ENCODING: u32 = 7;
 
 pub const CACHE_DIR_NAME: &str = ".ply-cache";
 

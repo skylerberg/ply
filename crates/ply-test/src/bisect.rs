@@ -6,8 +6,8 @@ pub mod rehash;
 pub use classify::{Classify, StoreClassify, Unknown};
 pub use rehash::Rehashed;
 
-use ply_hash::{DefHash, HashOutput};
 use ply_span::Symbol;
+use ply_ty::{DefHash, HashOutput};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]

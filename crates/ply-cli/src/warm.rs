@@ -1,8 +1,8 @@
 //! What survives one iteration of a warm process, so the next need not re-establish it.
 
 use crate::load::Loaded;
-use ply_hash::{DefHash, HashOutput};
 use ply_store::ContentHash;
+use ply_ty::{DefHash, HashOutput};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;

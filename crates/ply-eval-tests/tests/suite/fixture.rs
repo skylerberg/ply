@@ -1,6 +1,6 @@
 use ply_eval::{Machine, Provider};
 use ply_span::{Diagnostic, SourceId};
-use ply_syntax::ast::ModuleName;
+use ply_ty::ModuleName;
 use ply_ty::{CheckOutput, Front};
 use std::collections::HashMap;
 

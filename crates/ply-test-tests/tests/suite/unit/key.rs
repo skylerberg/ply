@@ -1,6 +1,6 @@
 use ply_eval::{Plan, Seed, SimMode};
-use ply_hash::DefHash;
 use ply_test::key::{Engine, SEED_DOMAIN, result_key, seed_key, sim_key};
+use ply_ty::DefHash;
 
 fn hash(byte: u8) -> DefHash {
     DefHash([byte; 32])

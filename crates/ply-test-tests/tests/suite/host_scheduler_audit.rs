@@ -1,16 +1,12 @@
-use crate::fixture::TierExecutor;
+use crate::fixture::{Compiled, TierExecutor};
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
 use ply_eval::{Plan, Value};
-use ply_hash::HashOutput;
-use ply_span::{Diagnostic, SourceId, Symbol, codes};
+use ply_span::{Diagnostic, Symbol, codes};
 use ply_store::Store;
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::Resolved;
 use ply_test::{Hosting, InterpExecutor, RunReport, Search, Selection, select};
-use ply_ty::CheckOutput;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,50 +34,6 @@ impl TempRoot {
 impl Drop for TempRoot {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    port: ply_ty::Front,
-    check: CheckOutput,
-    hashes: HashOutput,
-    texts: std::collections::HashMap<String, String>,
-}
-
-impl Compiled {
-    fn tier(&self) -> (&'static ply_codegen::Unit, ply_eval::BackendSpec) {
-        let unit = ply_codegen::Unit::over_front(&self.port, self.texts.clone())
-            .expect("this host has a C compiler");
-        let spec = ply_eval::BackendSpec {
-            kind: ply_eval::BackendKind::C,
-            ..Default::default()
-        };
-        (unit, spec)
-    }
-}
-
-fn compile(source: &str) -> Compiled {
-    let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), source)];
-    let mut program = ply_syntax::parse_program(inputs).expect("the fixture parses");
-    let resolved = ply_syntax::resolve(&mut program).expect("the fixture resolves");
-    let port = crate::fixture::port_front(
-        &[(ModuleName::from_dotted("m").to_string(), source.to_string())],
-        &[SourceId(0)],
-    );
-    let hashes =
-        ply_hash::hash_program(&program, &resolved, &port.check).expect("the fixture hashes");
-    Compiled {
-        program,
-        resolved,
-        check: port.check.clone(),
-        port,
-        hashes,
-        texts: std::collections::HashMap::from([(
-            ModuleName::from_dotted("m").to_string(),
-            source.to_string(),
-        )]),
     }
 }
 
@@ -175,7 +127,7 @@ impl Ran {
 
 /// The runner with the binding bound, as `--host` runs it.
 fn run_hosted(source: &str, tasks: bool) -> Ran {
-    let compiled = compile(source);
+    let compiled = Compiled::new(source);
     let counter = Arc::new(Counting::default());
     let binding = registry(counter.clone(), tasks)
         .bind(&compiled.check)
@@ -429,7 +381,7 @@ fn a_send_beside_a_region_is_refused_before_the_first_packet() {
 
 #[test]
 fn under_simulation_once_the_same_send_runs_exactly_once_and_is_not_cached() {
-    let compiled = compile(SEND_BESIDE_A_REGION);
+    let compiled = Compiled::new(SEND_BESIDE_A_REGION);
     let counter = Arc::new(Counting::default());
     let binding = registry(counter.clone(), false)
         .bind(&compiled.check)
@@ -478,7 +430,7 @@ fn under_simulation_once_the_same_send_runs_exactly_once_and_is_not_cached() {
 
 #[test]
 fn a_hermetic_refusal_says_that_host_would_not_repair_a_searched_test() {
-    let compiled = compile(SEND_BESIDE_A_REGION);
+    let compiled = Compiled::new(SEND_BESIDE_A_REGION);
     let counter = Arc::new(Counting::default());
     let root = TempRoot::new();
     let mut store = root.store();
@@ -514,7 +466,7 @@ fn a_hermetic_refusal_says_that_host_would_not_repair_a_searched_test() {
 
 #[test]
 fn measure_reduction_re_executes_a_once_plan_and_is_refused() {
-    let compiled = compile(SEND_BESIDE_A_REGION);
+    let compiled = Compiled::new(SEND_BESIDE_A_REGION);
     let counter = Arc::new(Counting::default());
     let binding = registry(counter.clone(), false)
         .bind(&compiled.check)
@@ -557,7 +509,7 @@ test "a det test over a deterministic host handler" {
   assert_eq(body(), 99)
 }
 "#;
-    let compiled = compile(source);
+    let compiled = Compiled::new(source);
     let counter = Arc::new(Counting::default());
     let mut registry = HostRegistry::new();
     let mut deterministic = op("net", "send");
@@ -587,8 +539,7 @@ test "a det test over a deterministic host handler" {
     assert_eq!(counter.calls(), 1, "the run itself reached the socket once");
     let signature = Signature::of(&report.failures[0].diagnostic);
 
-    let (_, fresh) = ply_hash::hash_program_with_bodies(&compiled.program, &compiled.resolved)
-        .expect("the fixture's bodies are reconstructible");
+    let fresh = ply_store::body::of_front(&compiled.port);
     let test_hash = compiled.hashes.tests[0];
     let test_body = BodyHybrid::test_body(&fresh, test_hash).expect("the test has a stored body");
     let mut mixture = Mixture::new();
@@ -628,7 +579,7 @@ test "a det test over a deterministic host handler" {
 
 #[test]
 fn a_hermetic_run_cannot_build_a_production_scheduler() {
-    let compiled = compile(
+    let compiled = Compiled::new(
         r#"
 test/nondet "spawns without a binding" {
   assert_eq(task.join(task.spawn(|| 1)), 1)

@@ -1,13 +1,24 @@
-//! Definition bodies: the third element of `Hash -> (Definition, Type, Footprint)`.
+//! Definition bodies printed back to source: the third element of `Hash -> (Definition, Type,
+//! Footprint)`.
 
-use crate::fixture::port_front;
 use ply_codegen::c::producer::print_bodies;
-use ply_hash::body::{BodySet, StoredBody};
-use ply_hash::{DefHash, HashOutput};
-use ply_span::{Diagnostic, Symbol, codes};
-use ply_ty::CheckOutput;
+use ply_span::{Diagnostic, SourceId, Symbol, codes};
+use ply_store::body::{BodySet, StoredBody};
+use ply_ty::{CheckOutput, DefHash, HashOutput};
 use ply_ty::{Row, RowVar, Scheme, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// `files[i]` is `(module name, text)` for `SourceId(i)`.
+#[track_caller]
+fn port_front(files: &[(&str, &str)]) -> ply_ty::Front {
+    let named: Vec<(String, String)> = files
+        .iter()
+        .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
+        .collect();
+    let ids: Vec<SourceId> = (0..files.len()).map(|i| SourceId(i as u32)).collect();
+    ply_codegen::c::producer::checked_front(&named, &ids)
+        .unwrap_or_else(|e| panic!("the program must typecheck: {e:#}"))
+}
 
 struct Checked {
     hashes: HashOutput,
@@ -18,7 +29,7 @@ struct Checked {
 fn compile(files: &[(&str, &str)]) -> Checked {
     let front = port_front(files);
     Checked {
-        bodies: ply_hash::body::of_front(&front),
+        bodies: ply_store::body::of_front(&front),
         hashes: front.hashes,
         check: front.check,
     }

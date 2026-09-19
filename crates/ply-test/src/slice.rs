@@ -1,7 +1,7 @@
 //! The dynamic half of a failure: which definitions actually ran.
 
-use ply_hash::DefHash;
 use ply_span::{Span, Symbol};
+use ply_ty::DefHash;
 use ply_ty::{EffectAtom, Footprint};
 use std::collections::{BTreeMap, BTreeSet};
 
