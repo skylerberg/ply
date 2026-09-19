@@ -857,6 +857,14 @@ pub fn run_property(
                     });
                 }
                 Outcome::Raised(diagnostic) => {
+                    // An evaluation that ran out of time is not shrunk: every candidate would
+                    // spend the whole budget again.
+                    if diagnostic.code == ply_span::codes::TIME_BUDGET {
+                        return Discharge::Unattempted(Gap::Raised {
+                            bindings: bindings(binders, &values),
+                            diagnostic,
+                        });
+                    }
                     let shrunk = shrink::shrink(
                         &values,
                         &types,

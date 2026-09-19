@@ -44,6 +44,7 @@ pub fn prove_plan(options: &ProveOptions, simulation: &SimOptions) -> ProvePlan 
         roots: (0..u64::from(roots)).collect(),
         prove_budget: options.prove_budget.unwrap_or(DEFAULT_PROVE_BUDGET),
         shrink_budget: options.shrink_budget.unwrap_or(DEFAULT_SHRINK_BUDGET),
+        time_budget_ms: options.timeout.unwrap_or(ply_prove::DEFAULT_TIME_BUDGET_MS),
         sim: plan(simulation),
     }
     .normalized()
