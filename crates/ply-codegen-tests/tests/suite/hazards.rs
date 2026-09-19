@@ -1,7 +1,7 @@
 use ply_codegen::Unit;
 use ply_eval::{Machine, Value};
 use ply_span::{Span, Symbol};
-use ply_syntax::ast::ModuleName;
+use ply_ty::ModuleName;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;

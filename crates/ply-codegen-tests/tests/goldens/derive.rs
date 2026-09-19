@@ -16,7 +16,7 @@ fn first_difference(reference: &str, actual: &str) -> Option<String> {
         s.get(from..end).unwrap_or("").to_string()
     };
     Some(format!(
-        "differs at byte {at} of {} (rust) / {} (ply)\n  rust: ...{}...\n  ply : ...{}...",
+        "differs at byte {at} of {} (golden) / {} (port)\n  golden: ...{}...\n  port  : ...{}...",
         reference.len(),
         actual.len(),
         window(reference),
@@ -68,7 +68,7 @@ fn ply_files(dir: &Path, prefix: &str) -> Vec<(String, String)> {
 }
 
 #[test]
-fn the_ply_deriver_matches_its_golden_on_the_hand_written_modules() {
+fn the_deriver_matches_its_golden_on_the_hand_written_modules() {
     let text = std::fs::read_to_string(fixtures().join("derive-programs.corpus"))
         .expect("the hand-written derive modules");
     let inputs: Vec<(String, Vec<(String, String)>)> = bundle(&text)
@@ -89,7 +89,7 @@ fn the_ply_deriver_matches_its_golden_on_the_hand_written_modules() {
 }
 
 #[test]
-fn the_ply_deriver_matches_its_golden_on_every_example_and_the_standard_library() {
+fn the_deriver_matches_its_golden_on_every_example_and_the_standard_library() {
     let mut inputs: Vec<(String, Vec<(String, String)>)> = Vec::new();
     for (name, text) in ply_files(&repo_root().join("examples"), "examples/") {
         inputs.push((name.clone(), vec![(name, text)]));

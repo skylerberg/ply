@@ -3,10 +3,9 @@
 
 use indexmap::IndexMap;
 use ply_span::Symbol;
+use ply_ty::DefHash;
 
-use crate::DefHash;
-
-pub const BODY_ENCODING: u32 = 7;
+use crate::{BODY_ENCODING, DefBody, Store};
 
 /// A definition that is its own strongly connected component: the payload is its normalized bytes
 /// and `blake3(payload)` is the key.
@@ -16,7 +15,7 @@ const KIND_SOLO: u8 = 0;
 const KIND_MEMBER: u8 = 1;
 
 /// A member of a component, given the component's own hash.
-pub(crate) fn member_hash(component: DefHash, class: u32) -> DefHash {
+fn member_hash(component: DefHash, class: u32) -> DefHash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&component.0);
     hasher.update(&class.to_le_bytes());
@@ -34,21 +33,6 @@ enum Shape<'a> {
 }
 
 impl StoredBody {
-    pub(crate) fn solo(encoding: &[u8]) -> StoredBody {
-        let mut out = Vec::with_capacity(encoding.len() + 1);
-        out.push(KIND_SOLO);
-        out.extend_from_slice(encoding);
-        StoredBody(out)
-    }
-
-    pub(crate) fn member(component: &[u8], class: u32) -> StoredBody {
-        let mut out = Vec::with_capacity(component.len() + 5);
-        out.push(KIND_MEMBER);
-        out.extend_from_slice(&class.to_le_bytes());
-        out.extend_from_slice(component);
-        StoredBody(out)
-    }
-
     /// Bytes read back from a store.
     pub fn from_bytes(bytes: Vec<u8>) -> Option<StoredBody> {
         let body = StoredBody(bytes);
@@ -120,10 +104,10 @@ impl StoredBody {
 
 /// The bodies out of a front end's answer, keyed the way the store files them.
 ///
-/// The inverse of `ply_codegen::source`'s `fill_bodies`, which writes each body as
-/// [`StoredBody::as_bytes`]; `from_bytes` reads that envelope back, so `key()` re-derives the
-/// hash the definition is filed under rather than being told it. A name declared in two
-/// namespaces has two bodies and one entry per hash, which is the case `verify` settles.
+/// The front end writes each body as [`StoredBody::as_bytes`]; `from_bytes` reads that envelope
+/// back, so `key()` re-derives the hash the definition is filed under rather than being told it. A
+/// name declared in two namespaces has two bodies and one entry per hash, which is the case
+/// `verify` settles.
 pub fn of_front(front: &ply_ty::Front) -> BodySet {
     let hashes = &front.hashes;
     let mut by_name: std::collections::BTreeMap<&Symbol, Vec<StoredBody>> = Default::default();
@@ -159,7 +143,7 @@ pub fn of_front(front: &ply_ty::Front) -> BodySet {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BodySet {
     defs: IndexMap<DefHash, StoredBody>,
-    /// Parallel to [`crate::HashOutput::tests`].
+    /// Parallel to [`ply_ty::HashOutput::tests`].
     tests: Vec<StoredBody>,
 }
 
@@ -194,5 +178,42 @@ impl BodySet {
 
     pub fn is_empty(&self) -> bool {
         self.defs.is_empty() && self.tests.is_empty()
+    }
+}
+
+impl DefBody {
+    pub fn of(body: StoredBody) -> DefBody {
+        DefBody::new(BODY_ENCODING, body.into_bytes())
+    }
+
+    /// `None` for an encoding this build does not speak, or bytes that are not a body envelope.
+    pub fn stored(&self) -> Option<StoredBody> {
+        if self.encoding() != BODY_ENCODING {
+            return None;
+        }
+        StoredBody::from_bytes(self.as_bytes().to_vec())
+    }
+
+    pub fn key(&self) -> Option<DefHash> {
+        self.stored()?.key()
+    }
+
+    pub fn verifies_as(&self, hash: DefHash) -> bool {
+        self.key() == Some(hash)
+    }
+}
+
+impl Store {
+    /// `hashes` must already be closed: finding what a body reaches means decoding it.
+    pub fn body_set(&self, hashes: impl IntoIterator<Item = DefHash>) -> (BodySet, Vec<DefHash>) {
+        let mut set = BodySet::default();
+        let mut missing = Vec::new();
+        for hash in hashes {
+            match self.body(hash).and_then(|b| b.stored()) {
+                Some(body) if body.verify(hash) => set.insert(hash, body),
+                _ => missing.push(hash),
+            }
+        }
+        (set, missing)
     }
 }

@@ -1,5 +1,4 @@
 use crate::fixture::Compiled;
-use ply_hash::{DefHash, HashOutput};
 use ply_span::SourceId;
 use ply_span::{Span, Symbol};
 use ply_test::bisect::{
@@ -9,6 +8,7 @@ use ply_test::bisect::{
 use ply_test::{
     Attribution, CausalSlice, Entered, Event, Evidence, Frame, Options, SliceBuilder, diagnose,
 };
+use ply_ty::{DefHash, HashOutput};
 use std::collections::BTreeMap;
 
 fn sym(s: &str) -> Symbol {

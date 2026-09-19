@@ -1,11 +1,11 @@
 mod delta;
 
-use ply_hash::DefHash;
 use ply_span::Symbol;
 use ply_test::bisect::{
     Budget, Change, Confidence, Delta, DepEdges, FusionReason, Hybrid, Skipped, Trial, Unresolved,
     Verdict, bisect,
 };
+use ply_ty::DefHash;
 use std::collections::BTreeSet;
 
 fn sym(s: &str) -> Symbol {

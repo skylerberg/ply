@@ -1,8 +1,6 @@
-//! What content addressing publishes: the definition hash, the keys derived from it, and the
-//! table a hashed program answers. The hashing itself is `ply-hash`'s.
+//! What content addressing publishes: the definition hash and the table a hashed program answers.
+//! The hashing itself is the front end's, in `crates/ply-compiler/ply/hash.ply`.
 
-use crate::decl::SpecKind;
-use crate::ty::Mode;
 use indexmap::IndexMap;
 use ply_span::Symbol;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -89,10 +87,6 @@ pub struct HashOutput {
     pub closure: IndexMap<Symbol, BTreeSet<Symbol>>,
 }
 
-// Domain tags keep keys hashed over the same bytes from being interchangeable.
-const SPEC_DOMAIN: &[u8] = b"ply.spec.1";
-const SPEC_TEXT_DOMAIN: &[u8] = b"ply.spec.text.1";
-const OWN_DOMAIN: &[u8] = b"ply.own.1";
 const HASHES_DOMAIN: &[u8] = b"ply.hashes.1";
 
 impl HashOutput {
@@ -127,41 +121,5 @@ impl HashOutput {
             }
         }
         DefHash(*hasher.finalize().as_bytes())
-    }
-}
-
-/// The identity of a claim as written.
-pub fn spec_text_hash(kind: Option<SpecKind>, index: u32, normalized: &[u8]) -> DefHash {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(SPEC_TEXT_DOMAIN);
-    hasher.update(&[kind.map_or(0, |k| k.tag())]);
-    hasher.update(&index.to_le_bytes());
-    hasher.update(normalized);
-    DefHash(*hasher.finalize().as_bytes())
-}
-
-pub fn own_hash(normalized: &[u8]) -> DefHash {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(OWN_DOMAIN);
-    hasher.update(normalized);
-    DefHash(*hasher.finalize().as_bytes())
-}
-
-/// The key an obligation attached to a definition is discharged under.
-pub fn spec_hash(owner: DefHash, kind: SpecKind, index: u32, normalized: &[u8]) -> DefHash {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(SPEC_DOMAIN);
-    hasher.update(&owner.0);
-    hasher.update(&[kind.tag()]);
-    hasher.update(&index.to_le_bytes());
-    hasher.update(normalized);
-    DefHash(*hasher.finalize().as_bytes())
-}
-
-/// How an access mode is written in a hashed stream.
-pub fn mode_byte(mode: Mode) -> u8 {
-    match mode {
-        Mode::Read => 0,
-        Mode::Write => 1,
     }
 }

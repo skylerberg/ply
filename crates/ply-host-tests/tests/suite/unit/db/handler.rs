@@ -114,7 +114,7 @@ fn perform_declared(
     let atom = EffectAtom::new(
         Symbol::new(ply_host::db::EFFECT),
         Resource::Named(Symbol::new(at)),
-        ply_syntax::ast::Mode::Read,
+        ply_ty::Mode::Read,
     );
     handler.call(
         &NoRuntime,
@@ -162,7 +162,7 @@ fn a_join_outside_the_declared_row_is_refused_before_the_statement_runs() {
         EffectAtom::new(
             Symbol::new(ply_host::db::EFFECT),
             Resource::Named(Symbol::new(table)),
-            ply_syntax::ast::Mode::Read,
+            ply_ty::Mode::Read,
         )
     };
 

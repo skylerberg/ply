@@ -1,21 +1,11 @@
-//! What the compiled tiers would have to carry to compile effects, and what corpus there is to
-//! test it against.
+//! Whether the shipped corpus still reaches every effect construct a compiled tier would have to
+//! carry. What this arms is the corpus, not the tier: if the last `handle` or the last `with cell`
+//! left it, effect work in the tier would have nothing to be checked against.
 //!
-//! **The hard one is `handle`.** Ply's `resume` is multi-shot (`docs/GUIDE.md` §7.7, ADR 0034), so
-//! a captured extent has to splice onto any stack at any height -- which a C function's frame
-//! cannot do. Compiling it means a state-machine transform for every function with a non-empty
-//! row, and that changes the tier's calling convention rather than adding a node to its emitter.
-//! `perform` and `with cell` are separable from that and much cheaper: `perform` where the handler
-//! is statically known and resumes in tail position is a call, and a cell is state, not control.
-//!
-//! What this test arms is the corpus, not the tier: if the last `handle` or the last `with cell`
-//! left the shipped corpus, effect work in either tier would have nothing to be checked against
-//! and nothing here would notice.
-//!
-//! The census is taken from the port's own lowering (`code.lower_dump`), which `code.ply` writes
-//! byte for byte as the reference's did. Counting the surface text instead would answer a
-//! different question: `with cell` reaches a `cell(` node its spelling does not contain.
-use ply_compiler_diff::{fixtures, repo_root};
+//! Counted on the port's lowering (`code.lower_dump`) rather than the surface text: `with cell`
+//! reaches a `cell(` node its spelling does not contain.
+
+use crate::harness::{fixtures, port, repo_root};
 use std::collections::BTreeMap;
 
 #[test]
@@ -35,7 +25,7 @@ fn the_corpus_still_exercises_every_effect_construct_a_tier_would_have_to_carry(
         files.sort();
         for f in files {
             let text = std::fs::read_to_string(&f).unwrap();
-            let dump = ply_compiler_diff::port::dump("code.lower_dump", text.as_bytes());
+            let dump = port::dump("code.lower_dump", text.as_bytes());
             for body in dump.split("f:").skip(1) {
                 bodies += 1;
                 let mut hit = false;
@@ -57,7 +47,7 @@ fn the_corpus_still_exercises_every_effect_construct_a_tier_would_have_to_carry(
         assert!(
             tally.get(tag).copied().unwrap_or(0) > 0,
             "no body in the shipped corpus reaches `{tag}` any more, so nothing here can check an \
-             implementation of it in either compiled tier"
+             implementation of it in the compiled tier"
         );
     }
 }

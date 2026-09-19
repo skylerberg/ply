@@ -3,7 +3,7 @@ use ply_cli::driver;
 use ply_cli::load::{LoadError, Loaded, load};
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 use ply_store::{ContentHash, Store};
-use ply_syntax::ast::ModuleName;
+use ply_ty::ModuleName;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -859,108 +859,75 @@ fn a_shipped_definition_the_project_never_touched_is_not_a_suspect() {
     );
 }
 
-use ply_syntax::ast::{Expr, ExprKind, Ident, Item, Module, Stmt, TypeDefBody, TypeExpr};
-
-fn shipped_http() -> Module {
-    use ply_span::SourceId;
-    let source = ply_std::source(&ModuleName::from_dotted("std.http")).expect("std.http ships");
-    ply_syntax::parse_module(SourceId(0), ModuleName::from_dotted("std.http"), source)
-        .expect("the shipped module parses")
+fn shipped_http() -> &'static str {
+    ply_std::source(&ModuleName::from_dotted("std.http")).expect("std.http ships")
 }
 
-fn limits_fields(module: &Module) -> Vec<String> {
-    let fields = module
-        .items
-        .iter()
-        .find_map(|i| match i {
-            Item::Type(d) if d.name.name.as_str() == "Limits" => match &d.body {
-                TypeDefBody::Alias(TypeExpr::Record { fields, .. }) => Some(fields),
-                _ => None,
-            },
-            _ => None,
-        })
-        .expect("`type Limits` is a record");
+fn limits_fields() -> Vec<String> {
+    let head = "pub type Limits = {";
+    let source = shipped_http();
+    let at = source.find(head).expect("`type Limits` is a record") + head.len();
+    let block = &source[at..at + source[at..].find('}').expect("`Limits` closes")];
+    let fields: Vec<String> = block
+        .split(',')
+        .filter_map(|field| field.split_once(':'))
+        .map(|(name, _)| name.trim().to_string())
+        .collect();
     assert!(
         fields.len() >= 13,
         "`Limits` shrank to {} fields; these tests are about the cost of it growing",
         fields.len()
     );
-    fields.iter().map(|(n, _)| n.name.to_string()).collect()
-}
-
-/// A dotted path such as `state.limits.max_body` rendered back to source, or `None`.
-fn dotted(e: &Expr) -> Option<String> {
-    match &e.kind {
-        ExprKind::Var(v) if v.is_bare() => Some(v.name.name.to_string()),
-        ExprKind::Field { base, field } => Some(format!("{}.{}", dotted(base)?, field.name)),
-        _ => None,
-    }
-}
-
-/// The field of `base` this expression reads, if it reads one directly.
-fn read_of_base(e: &Expr, base: &str) -> Option<String> {
-    let path = dotted(e)?;
-    let rest = path.strip_prefix(base)?.strip_prefix('.')?;
-    (!rest.contains('.')).then(|| rest.to_string())
-}
-
-/// The record literal `func` evaluates to: `let <binder>`'s value when named, otherwise the block's tail.
-fn limits_literal<'a>(module: &'a Module, func: &str, binder: Option<&str>) -> &'a [(Ident, Expr)] {
-    let body = module
-        .items
-        .iter()
-        .find_map(|i| match i {
-            Item::Fn(d) if d.name.name.as_str() == func => Some(&d.body),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("`{func}` is defined"));
-    let ExprKind::Block { stmts, tail } = &body.kind else {
-        panic!("`{func}` is a block")
-    };
-    let record = match binder {
-        Some(b) => stmts
-            .iter()
-            .find_map(|s| match s {
-                Stmt::Let { pat, value, .. } if format!("{:?}", pat.kind).contains(b) => {
-                    Some(&**value)
-                }
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("`let {b} = ...` in `{func}`")),
-        None => tail
-            .as_deref()
-            .unwrap_or_else(|| panic!("`{func}` has a tail")),
-    };
-    let ExprKind::Record { fields } = &record.kind else {
-        panic!("`{func}`'s result is a record literal, expanded from `{{..base, ..}}`")
-    };
     fields
 }
 
-/// Every `Limits` field `func` does not deliberately vary must be `base.<that same field>`.
-#[track_caller]
-fn copies_every_limit_it_does_not_vary(
-    func: &str,
-    binder: Option<&str>,
-    base: &str,
-    varied: &[(&str, Option<&str>)],
-) {
-    let module = shipped_http();
-    let fields = limits_literal(&module, func, binder);
+/// `func`'s `{..base, name: value, ..}` as written: the base, then each field it names.
+fn record_update(func: &str) -> (String, Vec<(String, String)>) {
+    let source = shipped_http();
+    let at = source
+        .find(&format!("fn {func}("))
+        .unwrap_or_else(|| panic!("`{func}` is defined"));
+    let body = &source[at..];
+    let open = body
+        .find("{..")
+        .unwrap_or_else(|| panic!("`{func}` builds its `Limits` by spreading one"))
+        + "{..".len();
+    let inner = &body[open..open + body[open..].find('}').expect("the spread closes")];
+    let mut parts = inner.split(',').map(str::trim).filter(|p| !p.is_empty());
+    let base = parts.next().expect("a spread names its base").to_string();
+    let fields = parts
+        .map(|part| {
+            let (name, value) = part
+                .split_once(':')
+                .unwrap_or_else(|| panic!("`{part}` in `{func}` is not `name: value`"));
+            (name.trim().to_string(), value.trim().to_string())
+        })
+        .collect();
+    (base, fields)
+}
 
-    let mut names: Vec<String> = fields.iter().map(|(n, _)| n.name.to_string()).collect();
-    let mut expected = limits_fields(&module);
-    names.sort();
-    expected.sort();
-    assert_eq!(
-        names, expected,
-        "`{func}` does not build exactly `Limits`, so it would not type-check as one"
-    );
+/// The field of `base` this value reads, if it reads one directly.
+fn read_of_base(value: &str, base: &str) -> Option<String> {
+    let rest = value.strip_prefix(base)?.strip_prefix('.')?;
+    (!rest.contains('.')).then(|| rest.to_string())
+}
+
+/// Every `Limits` field `func` names must be one it deliberately varies; the spread copies the rest.
+#[track_caller]
+fn copies_every_limit_it_does_not_vary(func: &str, base: &str, varied: &[(&str, Option<&str>)]) {
+    let (spread, fields) = record_update(func);
+    assert_eq!(spread, base, "`{func}` spreads `{spread}`, not `{base}`");
+    let limits = limits_fields();
+    for (name, _) in &fields {
+        assert!(
+            limits.contains(name),
+            "`{func}` sets `{name}`, which `Limits` does not have"
+        );
+    }
 
     let mut actual: Vec<(String, Option<String>)> = Vec::new();
     for (name, value) in fields {
-        let name = name.name.to_string();
-        match read_of_base(value, base) {
+        match read_of_base(&value, base) {
             Some(from) if from == name => {}
             other => actual.push((name, other)),
         }
@@ -980,7 +947,6 @@ fn copies_every_limit_it_does_not_vary(
 fn chunk_trailers_copies_every_limit_it_does_not_replace() {
     copies_every_limit_it_does_not_vary(
         "chunk_trailers",
-        Some("trailer_limits"),
         "state.limits",
         &[("max_header_bytes", Some("max_trailer_bytes"))],
     );
@@ -988,21 +954,10 @@ fn chunk_trailers_copies_every_limit_it_does_not_replace() {
 
 #[test]
 fn the_limits_helpers_vary_only_the_bounds_they_are_named_for() {
-    copies_every_limit_it_does_not_vary(
-        "limits_keeping",
-        None,
-        "base",
-        &[("max_keep_alive", None)],
-    );
-    copies_every_limit_it_does_not_vary(
-        "limits_streaming",
-        None,
-        "base",
-        &[("max_stream_chunks", None)],
-    );
+    copies_every_limit_it_does_not_vary("limits_keeping", "base", &[("max_keep_alive", None)]);
+    copies_every_limit_it_does_not_vary("limits_streaming", "base", &[("max_stream_chunks", None)]);
     copies_every_limit_it_does_not_vary(
         "limits_with",
-        None,
         "base",
         &[
             ("max_request_line", None),
@@ -1019,25 +974,23 @@ fn the_limits_helpers_vary_only_the_bounds_they_are_named_for() {
 /// Its seven written bounds are all `Int` parameters, so `max_chunk_size: chunk_line` would type-check.
 #[test]
 fn limits_with_pairs_each_bound_with_the_parameter_named_after_it() {
-    let module = shipped_http();
-    let params: Vec<String> = module
-        .items
-        .iter()
-        .find_map(|i| match i {
-            Item::Fn(d) if d.name.name.as_str() == "limits_with" => Some(&d.params),
-            _ => None,
-        })
+    let source = shipped_http();
+    let at = source
+        .find("fn limits_with(")
         .expect("`limits_with` is defined")
-        .iter()
-        .map(|p| p.name.name.to_string())
+        + "fn limits_with(".len();
+    let params: Vec<String> = source
+        [at..at + source[at..].find(')').expect("the parameters close")]
+        .split(',')
+        .filter_map(|param| param.split_once(':'))
+        .map(|(name, _)| name.trim().to_string())
         .collect();
 
     let mut paired = 0;
-    for (name, value) in limits_literal(&module, "limits_with", None) {
-        let name = name.name.to_string();
-        let Some(arg) = dotted(value).filter(|a| params.contains(a)) else {
+    for (name, arg) in record_update("limits_with").1 {
+        if !params.contains(&arg) {
             continue;
-        };
+        }
         assert_eq!(
             name,
             format!("max_{arg}"),

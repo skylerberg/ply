@@ -6,8 +6,8 @@ use crate::bisect::{
 };
 use crate::slice::{CausalSlice, Tracing};
 use crate::{Attribution, Suspect};
-use ply_hash::{DefHash, HashOutput};
 use ply_span::Symbol;
+use ply_ty::{DefHash, HashOutput};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Options {

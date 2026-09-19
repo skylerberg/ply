@@ -58,7 +58,7 @@ fn row(atoms: impl IntoIterator<Item = EffectAtom>) -> Footprint {
     Footprint::from_atoms(atoms)
 }
 
-fn atom(table: &str, mode: ply_syntax::ast::Mode) -> EffectAtom {
+fn atom(table: &str, mode: ply_ty::Mode) -> EffectAtom {
     EffectAtom::new(Symbol::new(db::EFFECT), label(table), mode)
 }
 
@@ -441,7 +441,7 @@ fn the_footprint_of_a_join_names_both_tables(reactor: &Reactor) {
     );
 
     // Declaring only the label's own table is `E0434` at prepare, before a row is read.
-    let narrow = row([atom("part", ply_syntax::ast::Mode::Read)]);
+    let narrow = row([atom("part", ply_ty::Mode::Read)]);
     let d = db::check_footprint(&scan, Op::Query, &label("part"), Some(&narrow), Span::DUMMY)
         .expect_err("`bin` is undeclared");
     assert_eq!(d.code, codes::DB_FOOTPRINT_UNDECLARED);
@@ -449,8 +449,8 @@ fn the_footprint_of_a_join_names_both_tables(reactor: &Reactor) {
 
     // Declaring both, it runs and both atoms are what the row records.
     let wide = row([
-        atom("part", ply_syntax::ast::Mode::Read),
-        atom("bin", ply_syntax::ast::Mode::Read),
+        atom("part", ply_ty::Mode::Read),
+        atom("bin", ply_ty::Mode::Read),
     ]);
     let touched = db::check_footprint(&scan, Op::Query, &label("part"), Some(&wide), Span::DUMMY)
         .expect("both are declared");

@@ -1,9 +1,6 @@
 use crate::fixture::port_check;
 use ply_eval::{Answer, Handlers, SEEDED_OPS, SimTy, TaskId, Value};
 use ply_span::{SourceId, Span, Symbol};
-use ply_syntax::ast::{ExprKind, Item, ModuleName, Program};
-use ply_syntax::parse_module;
-use ply_syntax::resolve::resolve;
 use ply_ty::{CheckOutput, EffectInfo, Type};
 use std::path::{Path, PathBuf};
 
@@ -33,13 +30,8 @@ fn stub() -> Int = handle work() with {
 }
 "#;
 
-fn program() -> (Program, CheckOutput) {
-    let module = parse_module(SourceId(0), ModuleName::from_dotted("sig"), SOURCE)
-        .expect("the declaration parses");
-    let mut program = Program::single(module);
-    resolve(&mut program).expect("one module with no imports resolves");
-    let check = port_check(&[("sig", SOURCE)]);
-    (program, check)
+fn checked() -> CheckOutput {
+    port_check(&[("sig", SOURCE)])
 }
 
 fn effect<'a>(check: &'a CheckOutput, simple: &str) -> &'a EffectInfo {
@@ -64,7 +56,7 @@ fn type_of(value: &Value) -> Option<Type> {
 
 #[test]
 fn the_clause_set_covers_each_declared_effect_exactly() {
-    let (_, check) = program();
+    let check = checked();
     for name in ["clock", "random"] {
         let info = effect(&check, name);
         assert!(
@@ -86,7 +78,7 @@ fn the_clause_set_covers_each_declared_effect_exactly() {
 
 #[test]
 fn every_seeded_operation_has_the_declared_mode_and_types() {
-    let (_, check) = program();
+    let check = checked();
     for sig in SEEDED_OPS {
         let info = effect(&check, sig.effect);
         let op = info
@@ -102,7 +94,7 @@ fn every_seeded_operation_has_the_declared_mode_and_types() {
 
 #[test]
 fn what_the_handlers_answer_has_the_declared_type() {
-    let (_, check) = program();
+    let check = checked();
     let mut handlers = Handlers::new(11);
     for sig in SEEDED_OPS {
         let op = effect(&check, sig.effect)
@@ -138,7 +130,7 @@ fn what_the_handlers_answer_has_the_declared_type() {
 
 #[test]
 fn a_hand_written_handler_and_the_seeded_one_answer_the_same_operations() {
-    let (program, check) = program();
+    let check = checked();
     let stub = check
         .defs
         .get(&Symbol::new("sig.stub"))
@@ -149,27 +141,21 @@ fn a_hand_written_handler_and_the_seeded_one_answer_the_same_operations() {
         stub.footprint.0.len()
     );
 
-    let module = &program.modules[0];
-    let body = module
-        .items
-        .iter()
-        .find_map(|item| match item {
-            Item::Fn(f) if f.name.name.as_str() == "stub" => Some(&f.body),
-            _ => None,
-        })
-        .expect("`stub` is a function");
-    let ExprKind::Handle { clauses, .. } = &body.kind else {
-        panic!("`stub` is a handler");
-    };
-
+    let (_, handler) = SOURCE
+        .split_once("handle work() with {")
+        .expect("`stub` is a handler");
+    let (clauses, _) = handler.split_once("\n}").expect("the handler is closed");
     let written: Vec<(String, String, usize)> = clauses
-        .iter()
-        .map(|c| {
-            (
-                c.effect.symbol().to_string(),
-                c.op.name.to_string(),
-                c.params.len(),
-            )
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|clause| {
+            let (head, _) = clause.split_once(" -> ").expect("a clause has a body");
+            let (op, params) = head.split_once('(').expect("a clause names its operation");
+            let (effect, op) = op.split_once('.').expect("a clause names its effect");
+            let params = params.trim_end_matches(')');
+            let count = params.split(',').filter(|p| !p.trim().is_empty()).count();
+            (effect.to_string(), op.to_string(), count)
         })
         .collect();
     let seeded: Vec<(String, String, usize)> = SEEDED_OPS

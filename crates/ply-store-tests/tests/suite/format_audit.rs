@@ -1,11 +1,11 @@
 //! An adversarial audit of the front-end cache's binary format.
 
-use ply_hash::DefHash;
 use ply_span::{Symbol, codes};
 use ply_store::{
     BODY_ENCODING, CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, ContentHash, DeclBody,
     DefBody, DefEntry, DefKind, FileSpan, NameRef, Outcome, SourceFingerprint, Store,
 };
+use ply_ty::DefHash;
 use ply_ty::Mode;
 use ply_ty::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
 use std::collections::BTreeMap;

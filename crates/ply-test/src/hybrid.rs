@@ -5,10 +5,10 @@ use crate::key::{Engine, result_key};
 use crate::schedule::is_seeded;
 use crate::sim::seed_run;
 use ply_eval::{Plan, Provider, Seed};
-use ply_hash::body::{BodySet, StoredBody};
-use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, SourceId, Symbol};
+use ply_store::body::{BodySet, StoredBody};
 use ply_store::{Outcome, Store};
+use ply_ty::{DefHash, HashOutput};
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 

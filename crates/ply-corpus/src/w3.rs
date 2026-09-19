@@ -2,12 +2,11 @@
 
 use anyhow::{Context, Result, bail};
 use ply_eval::{Machine, Provider, Value};
-use ply_hash::DefHash;
 use ply_host::tcp::{Net, SimNet};
 use ply_span::{Span, Symbol};
-use ply_syntax::ast::ModuleName;
-use ply_ty::CheckOutput;
+use ply_store::body::{BodySet, of_front};
 use ply_ty::ty::Footprint;
+use ply_ty::{CheckOutput, DefHash, HashOutput, ModuleName};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde::Serialize;
@@ -286,8 +285,6 @@ fn replace(source: &str, from: &str, to: &str) -> Result<String> {
 
 /// A checked service, callable with whatever answers `net`.
 pub struct Loaded {
-    pub program: ply_syntax::ast::Program,
-    pub resolved: ply_syntax::resolve::Resolved,
     pub check: CheckOutput,
     /// The port's whole answer, which the tier is built from.
     pub port: ply_ty::Front,
@@ -319,19 +316,9 @@ impl Loaded {
             .collect();
         let ids: Vec<ply_span::SourceId> = inputs.iter().map(|(id, _, _)| *id).collect();
         let texts = ordered.iter().cloned().collect();
-        let mut program = ply_syntax::parse_program(inputs)
-            .map_err(|d| diagnostics("parsing the service", &d))?;
-        let expanded = ply_derive::expand_program(&mut program);
-        if !expanded.is_empty() {
-            return Err(diagnostics("expanding a `derive`", &expanded));
-        }
-        let resolved = ply_syntax::resolve::resolve(&mut program)
-            .map_err(|d| diagnostics("resolving the service", &d))?;
         let port = ply_codegen::c::producer::checked_front(&ordered, &ids)
             .map_err(|e| anyhow::anyhow!("checking the service: {e}"))?;
         Ok(Loaded {
-            program,
-            resolved,
             check: port.check.clone(),
             port,
             texts,
@@ -1508,12 +1495,8 @@ pub fn aliases(repo: &Path) -> Result<AliasReport> {
 
     let left = Loaded::parse(&aliased)?;
     let right = Loaded::parse(&explicit)?;
-    let (left_hashes, left_bodies) =
-        ply_hash::hash_program_with_bodies(&left.program, &left.resolved)
-            .map_err(|d| diagnostics("hashing the aliased service", &d))?;
-    let (right_hashes, right_bodies) =
-        ply_hash::hash_program_with_bodies(&right.program, &right.resolved)
-            .map_err(|d| diagnostics("hashing the explicit service", &d))?;
+    let (left_hashes, left_bodies) = (&left.port.hashes, of_front(&left.port));
+    let (right_hashes, right_bodies) = (&right.port.hashes, of_front(&right.port));
 
     let mut hash_differences = 0;
     let mut body_differences = 0;
@@ -1561,15 +1544,15 @@ pub fn aliases(repo: &Path) -> Result<AliasReport> {
         definitions: left_hashes.defs.len(),
         hash_differences,
         body_differences,
-        stored_bytes_aliased: stored_bytes(&left_bodies, &left_hashes),
-        stored_bytes_explicit: stored_bytes(&right_bodies, &right_hashes),
+        stored_bytes_aliased: stored_bytes(&left_bodies, left_hashes),
+        stored_bytes_explicit: stored_bytes(&right_bodies, right_hashes),
         footprint_differences,
         definitions_naming_the_set: naming,
         declared_not_performed,
     })
 }
 
-fn stored_bytes(bodies: &ply_hash::body::BodySet, hashes: &ply_hash::HashOutput) -> usize {
+fn stored_bytes(bodies: &BodySet, hashes: &HashOutput) -> usize {
     hashes
         .defs
         .values()

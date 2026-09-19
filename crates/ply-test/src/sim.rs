@@ -4,8 +4,8 @@ use crate::key::{Engine, result_key, seed_key, writes_seed_keys};
 use ply_eval::explore::{Interleaving, Verdict};
 use ply_eval::sim::Access;
 use ply_eval::{Exploration, Machine, Plan, Seed};
-use ply_hash::DefHash;
 use ply_span::Diagnostic;
+use ply_ty::DefHash;
 use std::collections::BTreeMap;
 
 pub fn seed_run(machine: &mut Machine<'_>, seed: &Seed, steps: u32) {

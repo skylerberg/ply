@@ -1,16 +1,16 @@
 //! The front end: the port parses, resolves and checks the program; its answer is kept per module.
 
 use crate::load::{Discovered, LoadError, Loaded, anchor, discover, unreadable};
-use ply_hash::body::StoredBody;
-use ply_hash::{DefHash, HashOutput};
 use ply_prove::prove::{Claims, read_claims};
 use ply_span::frames::Cursor;
 use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
+use ply_store::body::StoredBody;
 use ply_store::{
     CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, ContentHash, DeclBody, DefBody,
     DefEntry, DefKind, FileSpan, Member, NameRef, SourceFingerprint, Store,
 };
-use ply_syntax::ast::ModuleName;
+use ply_ty::ModuleName;
+use ply_ty::{DefHash, HashOutput};
 use ply_ty::{Front, ModuleInfo};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};

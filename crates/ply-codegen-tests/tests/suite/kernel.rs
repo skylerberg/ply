@@ -1,7 +1,7 @@
 use ply_codegen::Unit;
 use ply_eval::{Provider, Value};
 use ply_span::Symbol;
-use ply_syntax::ast::ModuleName;
+use ply_ty::ModuleName;
 
 /// As `ply test benches/kernel` loads it: the project's own `.ply` files, and no standard library.
 fn kernel() -> (&'static ply_ty::Front, &'static Unit) {
