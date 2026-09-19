@@ -153,6 +153,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     let backend = backend.map(|(provider, spec)| provider.attach(&spec));
     // The counters are process-wide and cumulative.
     ply_eval::rc::reset();
+    ply_codegen::rt::set_time_budget(args.timeout);
     let answer = evaluate(
         &loaded,
         name.as_str(),

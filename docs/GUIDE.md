@@ -400,6 +400,7 @@ fn sum_to(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { sum_to(n - 1, acc 
 
 Every other call nests, at most 10,000 deep (then `E0502`): `1 + f(n - 1)`, a
 call inside `handle`, `with_cell` or a lambda, and a call of another function.
+A loop that never ends fails with `E0503` when its time budget is spent (§8.4).
 `map`/`filter`/`fold`/`range` and the byte scanners do not nest calls, and
 `iterate` is a loop with an early exit and a step budget:
 
@@ -568,7 +569,9 @@ Tests whose footprints do not conflict run concurrently; a test whose effects
 are all discharged in a region conflicts with nothing. `--jobs N`/`-j` sets
 workers (default one per core).
 
-A failing deterministic test that has passed before is bisected over the
+`--timeout MS` is the wall clock each test may take (default 60000; `0` is no
+bound); a test past it fails with `E0503`, which is a program error like any
+other. A failing deterministic test that has passed before is bisected over the
 definitions that changed to name a culprit. `--bisect auto|always|never`
 (default `auto`), `--bisect-budget N` (evaluations, default 64), and
 `--trace auto|always|never` (record which definitions a failure entered) control
@@ -702,7 +705,8 @@ There is no induction.
 obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no
 values. Flags: `--prove-cases N` (below 25 kept cases only `example`),
 `--prove-roots N`, `--prove-budget N` (spent reports `property`),
-`--shrink-budget N`, and `--backend`.
+`--shrink-budget N`, `--timeout MS` (wall clock per evaluation, default 5000; an
+evaluation past it leaves the obligation `unattempted`), and `--backend`.
 
 `ply review` reports, per definition changed since the last
 `ply review --accept`, whether the implementation, the spec and the obligations
@@ -1059,14 +1063,14 @@ stdout.
 
 Flag groups: *simulation* (§9), *host* (`--host` and §14's flags except trace
 and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
-`--shrink-budget`), *trace* (`--trace`, `--trace-level`), *drain* (`--drain-ms`,
-`--drain-lead-ms`).
+`--shrink-budget`, `--timeout`), *trace* (`--trace`, `--trace-level`), *drain*
+(`--drain-ms`, `--drain-lead-ms`).
 
 | command | flags |
 | --- | --- |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases; with `--types`, effect sets and provenance), `--no-incremental` |
-| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--no-cache`, `--no-incremental`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--trace auto\|always\|never`, `--backend`, `--profile`, `--std`, host, simulation |
-| `ply run [path]` | `--seed` (one interleaving always), `--backend`, `--profile`, host, trace, drain; a `.plyx` path runs the artifact |
+| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--trace auto\|always\|never`, `--backend`, `--profile`, `--std`, host, simulation |
+| `ply run [path]` | `--seed` (one interleaving always), `--timeout` (default no bound), `--backend`, `--profile`, host, trace, drain; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`, `--backend`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, `--backend`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE`, `--config-schema`, `--db-schema`, `--digest`, `--diff OLD.plyx` |
@@ -1171,6 +1175,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `E0454` | `--fs` root that is not a directory |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit |
+| `E0503` | ran past its time budget |
 | `E0505` | Ply broke one of its own invariants |
 | `W0601` | cache unreadable |
 | `W0602` | cache corrupt |
@@ -1190,8 +1195,8 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
   variables; no exceptions; no typeclasses, implicits or method syntax; no
   modules-as-values, first-class effects or abstraction over resource labels; no
   `unsafe` or FFI.
-* Specs cannot name mutable state. There is no per-test timeout, cycles are not
-  collected, and a task never moves between OS threads.
+* Specs cannot name mutable state. Cycles are not collected, and a task never
+  moves between OS threads.
 * No file handles, streaming, recursive walk, permissions, `stdin`/`stdout` or
   `argv`; no cancellation or backpressure; no migrations or live schema check;
   HTTP/1.1 only; no authentication framework.

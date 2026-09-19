@@ -309,8 +309,12 @@ pub struct ProvePlan {
     pub prove_budget: u32,
     /// Candidate evaluations, not seconds, so the artifact does not vary with machine load.
     pub shrink_budget: u32,
+    /// Wall clock per evaluation of a claim, in milliseconds; 0 is none. In no cache key.
+    pub time_budget_ms: u64,
     pub sim: Plan,
 }
+
+pub const DEFAULT_TIME_BUDGET_MS: u64 = 5_000;
 
 impl Default for ProvePlan {
     fn default() -> ProvePlan {
@@ -319,6 +323,7 @@ impl Default for ProvePlan {
             roots: vec![0],
             prove_budget: DEFAULT_PROVE_BUDGET,
             shrink_budget: DEFAULT_SHRINK_BUDGET,
+            time_budget_ms: DEFAULT_TIME_BUDGET_MS,
             sim: Plan::default(),
         }
     }
