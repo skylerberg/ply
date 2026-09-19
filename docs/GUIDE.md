@@ -1082,6 +1082,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply build [path]` | `--entry NAME`, `-o FILE`, `--config-schema`, `--db-schema`, `--digest`, `--diff OLD.plyx` |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | `--show MODULE`, `--digest`; no path |
+| `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply bootstrap <path>` | writes the front end as C: `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing), `--profile` (default `release`) |
 | `ply cache clear\|stats\|compact [path]` | discard results / report size and reclaimable space / reclaim it |
@@ -1090,6 +1091,8 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 ## 17. Diagnostics
 
 `E` is an error; `W` is a warning and never a fault in your program.
+`ply explain CODE` prints a code's line from this table, and `--all` the whole
+table, from the registry the compiler raises from.
 
 | code | meaning |
 | --- | --- |

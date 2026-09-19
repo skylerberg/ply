@@ -13,6 +13,7 @@ mod desk_operations;
 mod determinism_audit;
 mod effect_set_selection;
 mod effect_sets;
+mod explain;
 mod failure_classification_audit;
 mod http_endpoint;
 mod incremental;
