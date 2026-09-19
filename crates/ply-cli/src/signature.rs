@@ -1,18 +1,14 @@
 //! How `ply check --types` renders a signature, and the effect-set provenance `--explain` adds.
 
 use ply_span::Symbol;
-use ply_syntax::ast::{AtomExpr, Item, ModuleName, Program, QName};
-use ply_syntax::resolve::{Namespace, Resolved};
+use ply_syntax::ast::ModuleName;
 use ply_ty::print::Printer;
-use ply_ty::ty::{EffectAtom, Footprint, Resource, Row, Scheme, Type};
-use ply_ty::{CheckOutput, DefInfo};
+use ply_ty::ty::{Footprint, Row, Scheme, Type};
+use ply_ty::{DefInfo, Front};
 use std::collections::{BTreeSet, HashMap};
 
 /// Counted from the terminal's left edge, so callers subtract their indent.
 pub const WIDTH: usize = 80;
-
-/// The builtin effect, written bare and resolving to itself.
-const CELL: &str = "cell";
 
 /// A signature split at its top-level effect row.
 pub struct Split {
@@ -227,33 +223,14 @@ pub fn provenance(def: &DefInfo) -> Provenance {
     }
 }
 
-pub fn effect_sets(
-    program: &Program,
-    resolved: &Resolved,
-    check: &CheckOutput,
-    module: &ModuleName,
-    defs: &[&DefInfo],
-) -> Vec<EffectSetView> {
-    let Some(index) = resolved.index_of(module) else {
+pub fn effect_sets(front: &Front, module: &ModuleName, defs: &[&DefInfo]) -> Vec<EffectSetView> {
+    let Some(sets) = front.effect_sets.get(module.as_symbol()) else {
         return Vec::new();
     };
-    let Some(ast) = program.modules.get(index) else {
-        return Vec::new();
-    };
-
-    let mut includes: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
-    let mut order = Vec::new();
-    for item in &ast.items {
-        let Item::EffectSet(def) = item else { continue };
-        order.push(def);
-        includes.insert(
-            def.name.name.clone(),
-            def.includes.iter().map(|q| q.symbol().clone()).collect(),
-        );
-    }
-    if order.is_empty() {
-        return Vec::new();
-    }
+    let includes: HashMap<&Symbol, &[Symbol]> = sets
+        .iter()
+        .map(|set| (&set.name, set.includes.as_slice()))
+        .collect();
 
     let mut uses: HashMap<Symbol, usize> = HashMap::new();
     for def in defs {
@@ -272,53 +249,11 @@ pub fn effect_sets(
         }
     }
 
-    order
-        .into_iter()
-        .map(|def| {
-            let atoms: BTreeSet<EffectAtom> = def
-                .expansion
-                .iter()
-                .filter_map(|a| atom_of(a, resolved, check, index))
-                .collect();
-            EffectSetView {
-                name: def.name.name.to_string(),
-                atoms: atoms.iter().map(|a| a.to_string()).collect(),
-                used_by: uses.get(&def.name.name).copied().unwrap_or(0),
-            }
+    sets.iter()
+        .map(|set| EffectSetView {
+            name: set.name.to_string(),
+            atoms: set.atoms.atoms().map(|a| a.to_string()).collect(),
+            used_by: uses.get(&set.name).copied().unwrap_or(0),
         })
         .collect()
-}
-
-fn atom_of(
-    atom: &AtomExpr,
-    resolved: &Resolved,
-    check: &CheckOutput,
-    module: usize,
-) -> Option<EffectAtom> {
-    let effect = effect_name(&atom.effect, resolved, check, module)?;
-    let resource = match &atom.resource {
-        Some(r) => Resource::Named(r.name.clone()),
-        None => Resource::Singleton,
-    };
-    Some(EffectAtom::new(effect, resource, atom.mode))
-}
-
-fn effect_name(
-    q: &QName,
-    resolved: &Resolved,
-    check: &CheckOutput,
-    module: usize,
-) -> Option<Symbol> {
-    if q.is_bare() && q.symbol().as_str() == CELL {
-        return Some(Symbol::new(CELL));
-    }
-    match resolved.lookup(module, Namespace::Effect, q) {
-        Ok(binding) if check.effects.contains_key(&binding.qualified) => {
-            Some(binding.qualified.clone())
-        }
-        _ if q.is_bare() && ply_ty::prelude::is_prelude_effect(q.symbol()) => {
-            Some(q.symbol().clone())
-        }
-        _ => None,
-    }
 }

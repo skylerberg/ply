@@ -23,12 +23,7 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
 
     let warnings = once_each(warnings);
 
-    let broken = crate::costs::promises(&loaded);
-    if !broken.is_empty() {
-        let err = crate::load::LoadError {
-            sources: loaded.sources.clone(),
-            diagnostics: broken,
-        };
+    if let Some(err) = super::test::broken_promises(&loaded) {
         return report_load_error("check", &err, args.json, style);
     }
 
@@ -60,13 +55,9 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
         print_types(&loaded, args.explain, style);
     }
     if args.costs
-        && let Err(failed) = print_costs(&loaded, style)
+        && let Err(err) = print_costs(&loaded, style)
     {
-        let err = crate::load::LoadError {
-            sources: loaded.sources.clone(),
-            diagnostics: vec![failed],
-        };
-        return report_load_error("check", &err, false, style);
+        return report_load_error("check", &err, args.json, style);
     }
     EXIT_OK
 }
@@ -99,8 +90,8 @@ fn check(
 }
 
 /// For every `push`, whether it grows its list in place or copies it.
-fn print_costs(loaded: &Loaded, style: Style) -> Result<(), Diagnostic> {
-    let lines = crate::costs::lines(loaded, style)?;
+fn print_costs(loaded: &Loaded, style: Style) -> Result<(), crate::load::LoadError> {
+    let lines = crate::costs::lines(loaded, style).map_err(|d| loaded.refused(d))?;
     println!();
     match lines {
         Some(lines) => {
@@ -160,13 +151,7 @@ fn print_types(loaded: &Loaded, explain: bool, style: Style) {
         }
 
         let sets = if explain {
-            signature::effect_sets(
-                &loaded.program,
-                &loaded.resolved,
-                &loaded.check,
-                module.name,
-                &defs,
-            )
+            signature::effect_sets(&loaded.front, module.name, &defs)
         } else {
             Vec::new()
         };
@@ -219,22 +204,16 @@ fn attach_provenance(report: &mut Value, loaded: &Loaded) {
         for entry in modules {
             let name = ModuleName::from_dotted(entry["name"].as_str().unwrap_or_default());
             let defs = loaded.defs_of(&name);
-            let sets: Vec<Value> = signature::effect_sets(
-                &loaded.program,
-                &loaded.resolved,
-                &loaded.check,
-                &name,
-                &defs,
-            )
-            .iter()
-            .map(|s| {
-                json!({
-                    "name": s.name,
-                    "expansion": s.atoms,
-                    "used_by": s.used_by,
+            let sets: Vec<Value> = signature::effect_sets(&loaded.front, &name, &defs)
+                .iter()
+                .map(|s| {
+                    json!({
+                        "name": s.name,
+                        "expansion": s.atoms,
+                        "used_by": s.used_by,
+                    })
                 })
-            })
-            .collect();
+                .collect();
             entry["effect_sets"] = Value::Array(sets);
         }
     }

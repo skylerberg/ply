@@ -76,8 +76,18 @@ pub fn discharge(path: &Path, plan: &ProvePlan) -> Result<Discharged> {
             e.diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
         ),
     };
-    let collected = obligations::collect(&loaded.program, &loaded.check, &loaded.hashes);
-    let prover = Prover::new(&loaded.program, &loaded.resolved, &loaded.check);
+    let collected = obligations::collect(&loaded.front, &loaded.check, &loaded.hashes);
+    let prover = match Prover::new(&loaded) {
+        Ok(prover) => prover,
+        Err(e) => bail!(
+            "`{}`: {:?}",
+            path.display(),
+            e.diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        ),
+    };
 
     let started = Instant::now();
     let discharges: Vec<Discharge> = collected
@@ -204,8 +214,7 @@ fn label(blocker: &Blocker) -> String {
         Blocker::StringConcat => "string concatenation",
         Blocker::BitOperator => "bit operator or shift",
         Blocker::Region => "perform, handle or simulate",
-        Blocker::UnexpandedSugar => "a parse-time node expansion should have removed",
-        Blocker::UndecidableMatchArm => "pattern outside the fragment",
+        Blocker::UndecidableMatchArm => "pattern outside the fragment, or a match guard",
         Blocker::DestructuringLet => "destructuring let",
         Blocker::FloatTerm => "a Float term (never proved)",
         Blocker::DecimalArithmetic => "Decimal arithmetic or ordering",

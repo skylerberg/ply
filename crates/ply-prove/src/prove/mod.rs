@@ -1,33 +1,34 @@
 //! The static proof tier: a decision procedure for the decidable fragment.
 
 pub mod arith;
+pub mod claims;
 mod context;
 pub mod egraph;
 mod lower;
 mod solve;
 pub mod term;
 
+pub use claims::{Claims, read_claims};
 pub use context::Context;
 pub use lower::Blocker;
 
 use crate::{Certificate, DEFAULT_PROVE_BUDGET, Rule, UNFOLD_DEPTH};
+use claims::Code;
 use ply_span::Symbol;
-use ply_syntax::ast::Expr;
 use ply_ty::{LawBinder, TyVar, Type};
 use std::collections::BTreeSet;
 
 pub const SPLIT_DEPTH: u32 = 48;
 
+/// Binder `i` is slot `i` of every clause's window.
 pub struct Goal<'a> {
-    /// Index into `Program::modules`; bare names in the expressions resolve against it.
-    pub module: usize,
     /// For an `ensures`, the owner's parameters and `result`; for a law, its `forall` binders.
     pub binders: &'a [LawBinder],
     /// The `requires` clauses beside this one, or a law's `where`.
-    pub guards: &'a [&'a Expr],
-    /// For an `ensures`: the result binder (also in `binders`) and the definition's body.
-    pub result: Option<(Symbol, &'a Expr)>,
-    pub body: &'a Expr,
+    pub guards: &'a [&'a Code],
+    /// For an `ensures`: the definition's body, which the last binder, `result`, equals.
+    pub result: Option<&'a Code>,
+    pub body: &'a Code,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -104,29 +105,26 @@ pub fn decide_and_diagnose(
     limits: &Limits,
 ) -> (Decision, Vec<Blocker>) {
     let mut rules = RuleLog::default();
-    let mut lowering = lower::Lowering::new(ctx, &mut rules, goal.module, limits.unfold_depth);
-    let mut bound: Vec<(Symbol, term::TermId)> = Vec::new();
-    for binder in goal.binders {
-        bound.push((
-            binder.name.clone(),
-            lowering.bind_symbolic(&binder.name, &binder.ty),
-        ));
-    }
+    let mut lowering = lower::Lowering::new(ctx, &mut rules, limits.unfold_depth);
+    let bound: Vec<term::TermId> = goal
+        .binders
+        .iter()
+        .map(|binder| lowering.bind_symbolic(&binder.ty))
+        .collect();
     let mut guards: Vec<term::TermId> = Vec::with_capacity(goal.guards.len());
     for guard in goal.guards {
-        let lowered = lowering.lower(guard);
+        let lowered = lowering.lower_root(guard, &bound);
         // The evaluator stops at the first false `requires`, so a later one may assume the earlier.
         lowering.assume(lowered);
         guards.push(lowered);
     }
     // Requirements before this mark decide the guard, so they may not assume it.
     let guard_requirements = lowering.requirement_mark();
-    let definition = goal.result.as_ref().and_then(|(name, body)| {
-        let value = lowering.lower(body);
-        let symbol = bound.iter().find(|(n, _)| n == name)?.1;
-        Some((symbol, value))
+    let definition = goal.result.and_then(|body| {
+        let (&symbol, parameters) = bound.split_last()?;
+        Some((symbol, lowering.lower_root(body, parameters)))
     });
-    let body = lowering.lower(goal.body);
+    let body = lowering.lower_root(goal.body, &bound);
     let blockers = lowering.blockers().to_vec();
     let requirements = lowering.requirements().to_vec();
     let unsupported = lowering.unsupported();

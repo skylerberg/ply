@@ -1,19 +1,21 @@
 //! Which prover a run drives.
 
+use crate::load::{LoadError, Loaded};
 use ply_eval::host::{HostBinding, HostRuntime};
 use ply_eval::{DEFAULT_MAX_CALLS, Machine, Seed, Value};
 use ply_prove::concurrency::{self, BodyRun, LawSearch, ValueDomain};
 use ply_prove::domain::{self, Finite};
 use ply_prove::property::{self, GenStream, Judge, Outcome, TypeWorld, judge_case, run_property};
-use ply_prove::prove::{self, Blocker, Decision, Goal, Limits, Proof};
+use ply_prove::prove::claims::{Clause, Code, Definition, Law};
+use ply_prove::prove::{self, Blocker, Claims, Decision, Goal, Limits, Proof};
 use ply_prove::{
     Binding, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation, ObligationKind,
     ProvePlan, Rule, Vacuity, VacuityKind,
 };
-use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::{Expr, ExprKind, FnDef, Item, LawDef, Program, SpecKind};
+use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
+use ply_syntax::ast::Program;
 use ply_syntax::resolve::Resolved;
-use ply_ty::{CheckOutput, LawBinder};
+use ply_ty::{CheckOutput, DefInfo, Front, LawBinder, LawInfo, Literal, SpecKind};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -21,62 +23,79 @@ use std::sync::Arc;
 
 /// The discharger this build drives.
 pub fn of<'a>(
-    program: &'a Program,
-    resolved: &'a Resolved,
-    check: &'a CheckOutput,
+    loaded: &'a Loaded,
     hosting: Option<Hosting<'a>>,
     backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
-) -> Box<dyn ply_test::obligation::Discharger + 'a> {
-    let prover = Prover::new(program, resolved, check);
+) -> Result<Box<dyn ply_test::obligation::Discharger + 'a>, LoadError> {
+    let prover = Prover::new(loaded)?;
     let prover = match hosting {
         Some(hosting) => prover.with_hosting(hosting),
         None => prover,
     };
-    Box::new(prover.with_backend(backend))
+    Ok(Box::new(prover.with_backend(backend)))
+}
+
+fn claims_of(loaded: &Loaded) -> Result<Claims, LoadError> {
+    let failed = |why: String| {
+        loaded.refused(
+            Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!("the front end could not lower this program's claims: {why}"),
+            )
+            .primary(Span::DUMMY, "nothing was proved, so nothing is claimed")
+            .note("this is Ply's fault: the compiler's own front end is what failed here"),
+        )
+    };
+    let mut sources = Vec::with_capacity(loaded.check.modules.len());
+    let mut ids: Vec<SourceId> = Vec::with_capacity(loaded.check.modules.len());
+    for info in loaded.check.modules.values() {
+        let file = loaded
+            .sources
+            .get(info.source)
+            .ok_or_else(|| failed(format!("module `{}` has no source text", info.name)))?;
+        sources.push((info.name.to_string(), file.text.to_string()));
+        ids.push(info.source);
+    }
+    let dump =
+        ply_codegen::c::producer::claims_dump(&sources).map_err(|e| failed(format!("{e:#}")))?;
+    prove::read_claims(&dump, &ids).map_err(|e| failed(format!("its answer does not read: {e}")))
 }
 
 /// Where an obligation's claim is written, found once per run.
-enum Claim<'a> {
+enum Claim<'s> {
     Ensures {
-        module: usize,
-        owner: Symbol,
-        def: &'a FnDef,
-        clause: &'a Expr,
+        owner: &'s DefInfo,
+        def: &'s Definition,
+        clause: &'s Clause,
         /// Its place among the owner's `ensures` clauses, which names its root.
         index: usize,
     },
     Law {
-        module: usize,
+        info: &'s LawInfo,
         /// Its place among the module's laws, which names its roots.
         ordinal: usize,
-        def: &'a LawDef,
+        law: &'s Law,
     },
 }
 
-impl<'a> Claim<'a> {
-    fn module(&self) -> usize {
-        match self {
-            Claim::Ensures { module, .. } | Claim::Law { module, .. } => *module,
-        }
-    }
-
+impl<'s> Claim<'s> {
     /// The propositions that narrow the domain: an owner's `requires` clauses, or a law's `where`.
-    fn guards(&self) -> Vec<&'a Expr> {
+    fn guards(&self) -> Vec<&'s Clause> {
         match self {
             Claim::Ensures { def, .. } => def
                 .spec
                 .iter()
-                .filter(|c| c.kind == SpecKind::Requires)
-                .map(|c| &c.expr)
+                .filter(|(kind, _)| *kind == SpecKind::Requires)
+                .map(|(_, clause)| clause)
                 .collect(),
-            Claim::Law { def, .. } => def.guard.iter().collect(),
+            Claim::Law { law, .. } => law.guard.iter().collect(),
         }
     }
 
-    fn body(&self) -> &'a Expr {
+    fn body(&self) -> &'s Code {
         match self {
-            Claim::Ensures { clause, .. } => clause,
-            Claim::Law { def, .. } => &def.body,
+            Claim::Ensures { clause, .. } => &clause.code,
+            Claim::Law { law, .. } => &law.body,
         }
     }
 
@@ -90,11 +109,11 @@ pub struct Prover<'a> {
     program: &'a Program,
     resolved: &'a Resolved,
     check: &'a CheckOutput,
+    front: &'a Front,
     world: TypeWorld,
     /// Built once; `machine()` runs per obligation.
     ctx: prove::Context<'a>,
-    defs: HashMap<Symbol, (usize, &'a FnDef)>,
-    laws: HashMap<Symbol, (usize, usize, &'a LawDef)>,
+    laws: HashMap<Symbol, (usize, &'a LawInfo)>,
     /// What a `law/host` is discharged against.
     hosting: Option<Hosting<'a>>,
     /// A compiled unit holding the laws' and clauses' roots, where those propositions are entered.
@@ -110,39 +129,28 @@ pub struct Hosting<'a> {
 }
 
 impl<'a> Prover<'a> {
-    pub fn new(program: &'a Program, resolved: &'a Resolved, check: &'a CheckOutput) -> Prover<'a> {
-        let mut defs = HashMap::new();
+    pub fn new(loaded: &'a Loaded) -> Result<Prover<'a>, LoadError> {
+        let check = &loaded.check;
+        let tree = loaded.tree().map_err(|d| loaded.refused(d))?;
         let mut laws = HashMap::new();
-        for (index, module) in program.modules.iter().enumerate() {
-            let mut ordinal = 0;
-            for item in &module.items {
-                match item {
-                    Item::Fn(def) => {
-                        defs.insert(module.name.qualify(&def.name.name), (index, &**def));
-                    }
-                    Item::Law(def) => {
-                        laws.insert(
-                            module.name.qualify(&Symbol::new(&def.name)),
-                            (index, ordinal, &**def),
-                        );
-                        ordinal += 1;
-                    }
-                    _ => {}
-                }
-            }
+        let mut ordinals: HashMap<&Symbol, usize> = HashMap::new();
+        for law in &check.laws {
+            let ordinal = ordinals.entry(law.module.as_symbol()).or_default();
+            laws.insert(law.key.clone(), (*ordinal, law));
+            *ordinal += 1;
         }
-        Prover {
-            program,
-            resolved,
+        Ok(Prover {
+            program: &tree.program,
+            resolved: &tree.resolved,
             check,
+            front: &loaded.front,
             world: TypeWorld::new(check.ctors.values()),
-            ctx: prove::Context::new(program, resolved, check),
-            defs,
+            ctx: prove::Context::new(claims_of(loaded)?, check),
             laws,
             hosting: None,
             backend: None,
             region_kinds: ply_eval::region_kind::Kinds::default(),
-        }
+        })
     }
 
     pub fn with_backend(
@@ -172,37 +180,36 @@ impl<'a> Prover<'a> {
     }
 
     /// A proposition's body root: its program-wide name in the unit.
-    fn body_root(&self, claim: &Claim<'a>) -> Symbol {
-        let module = &self.program.modules[claim.module()].name;
+    fn body_root(&self, claim: &Claim<'_>) -> Symbol {
         match claim {
-            Claim::Ensures { def, index, .. } => module.qualify(&ply_codegen::clause_root_name(
-                &def.name.name,
-                "ensures",
-                *index,
-            )),
-            Claim::Law { ordinal, .. } => {
-                module.qualify(&ply_codegen::law_root_name(*ordinal, "body"))
-            }
+            Claim::Ensures { owner, index, .. } => owner.module.qualify(
+                &ply_codegen::clause_root_name(&owner.simple_name, "ensures", *index),
+            ),
+            Claim::Law { info, ordinal, .. } => info
+                .module
+                .qualify(&ply_codegen::law_root_name(*ordinal, "body")),
         }
     }
 
     /// Each guard's compiled root, in [`Claim::guards`] order, which `source.rs` numbers alike.
-    fn guard_roots(&self, claim: &Claim<'a>) -> Vec<Symbol> {
-        let module = &self.program.modules[claim.module()].name;
+    fn guard_roots(&self, claim: &Claim<'_>) -> Vec<Symbol> {
         match claim {
-            Claim::Ensures { def, .. } => (0..claim.guards().len())
+            Claim::Ensures { owner, .. } => (0..claim.guards().len())
                 .map(|k| {
-                    module.qualify(&ply_codegen::clause_root_name(
-                        &def.name.name,
+                    owner.module.qualify(&ply_codegen::clause_root_name(
+                        &owner.simple_name,
                         "requires",
                         k,
                     ))
                 })
                 .collect(),
-            Claim::Law { ordinal, .. } => claim
+            Claim::Law { info, ordinal, .. } => claim
                 .guards()
                 .iter()
-                .map(|_| module.qualify(&ply_codegen::law_root_name(*ordinal, "guard")))
+                .map(|_| {
+                    info.module
+                        .qualify(&ply_codegen::law_root_name(*ordinal, "guard"))
+                })
                 .collect(),
         }
     }
@@ -213,29 +220,29 @@ impl<'a> Prover<'a> {
         self
     }
 
-    fn claim(&self, obligation: &Obligation) -> Option<Claim<'a>> {
+    fn claim(&self, obligation: &Obligation) -> Option<Claim<'_>> {
+        let claims = self.ctx.claims();
         match obligation.kind {
             ObligationKind::Ensures { index } => {
-                let &(module, def) = self.defs.get(&obligation.owner)?;
-                let clause = def
+                let def = claims.defs.get(&obligation.owner)?;
+                let (_, clause) = def
                     .spec
                     .iter()
-                    .filter(|c| c.kind == SpecKind::Ensures)
+                    .filter(|(kind, _)| *kind == SpecKind::Ensures)
                     .nth(index)?;
                 Some(Claim::Ensures {
-                    module,
-                    owner: obligation.owner.clone(),
+                    owner: self.check.defs.get(&obligation.owner)?,
                     def,
-                    clause: &clause.expr,
+                    clause,
                     index,
                 })
             }
             ObligationKind::Law => {
-                let &(module, ordinal, def) = self.laws.get(&obligation.owner)?;
+                let &(ordinal, info) = self.laws.get(&obligation.owner)?;
                 Some(Claim::Law {
-                    module,
+                    info,
                     ordinal,
-                    def,
+                    law: claims.laws.get(&obligation.owner)?,
                 })
             }
         }
@@ -263,21 +270,18 @@ impl<'a> Prover<'a> {
         machine
     }
 
-    fn attempt_static(
+    fn decide(
         &self,
         obligation: &Obligation,
-        claim: &Claim<'a>,
+        claim: &Claim<'_>,
         plan: &ProvePlan,
-    ) -> Static {
-        let guards = claim.guards();
+    ) -> (Decision, Vec<Blocker>) {
+        let guards: Vec<&Code> = claim.guards().into_iter().map(|g| &g.code).collect();
         let result = match claim {
-            Claim::Ensures { def, .. } => obligation
-                .result_binder()
-                .map(|binder| (binder.name.clone(), &def.body)),
+            Claim::Ensures { def, .. } => obligation.result_binder().map(|_| &def.body),
             Claim::Law { .. } => None,
         };
         let goal = Goal {
-            module: claim.module(),
             binders: &obligation.binders,
             guards: &guards,
             result,
@@ -287,7 +291,16 @@ impl<'a> Prover<'a> {
             steps: plan.prove_budget,
             ..Limits::default()
         };
-        match prove::decide(&self.ctx, &goal, &limits) {
+        prove::decide_and_diagnose(&self.ctx, &goal, &limits)
+    }
+
+    fn attempt_static(
+        &self,
+        obligation: &Obligation,
+        claim: &Claim<'_>,
+        plan: &ProvePlan,
+    ) -> Static {
+        match self.decide(obligation, claim, plan).0 {
             Decision::GuardUnsatisfiable { .. } => Static::Vacuous,
             Decision::Proved(proof) => match proof.certify(false) {
                 Some(certificate) => Static::Proved(certificate),
@@ -303,25 +316,7 @@ impl<'a> Prover<'a> {
             return None;
         }
         let claim = self.claim(obligation)?;
-        let guards = claim.guards();
-        let result = match &claim {
-            Claim::Ensures { def, .. } => obligation
-                .result_binder()
-                .map(|binder| (binder.name.clone(), &def.body)),
-            Claim::Law { .. } => None,
-        };
-        let goal = Goal {
-            module: claim.module(),
-            binders: &obligation.binders,
-            guards: &guards,
-            result,
-            body: claim.body(),
-        };
-        let limits = Limits {
-            steps: plan.prove_budget,
-            ..Limits::default()
-        };
-        let (decision, blockers) = prove::decide_and_diagnose(&self.ctx, &goal, &limits);
+        let (decision, blockers) = self.decide(obligation, &claim, plan);
         Some(Reach { decision, blockers })
     }
 }
@@ -419,7 +414,7 @@ impl<'a> Prover<'a> {
     fn discharge_host(
         &self,
         obligation: &Obligation,
-        claim: &Claim<'a>,
+        claim: &Claim<'_>,
         plan: &ProvePlan,
     ) -> Discharge {
         let Some(hosting) = &self.hosting else {
@@ -444,13 +439,10 @@ impl<'a> Prover<'a> {
     fn witness(
         &self,
         obligation: &Obligation,
-        claim: &Claim<'a>,
+        claim: &Claim<'_>,
         cases: &mut Cases<'a>,
     ) -> Option<Vec<Value>> {
-        let mut literals = Literals::default();
-        for guard in claim.guards() {
-            literals.collect(guard);
-        }
+        let literals = self.literals(claim);
         let mut stream = GenStream::new(0, obligation.key);
         let mut columns: Vec<Vec<Value>> = Vec::with_capacity(cases.binders.len());
         let mut points = 1usize;
@@ -480,6 +472,18 @@ impl<'a> Prover<'a> {
             }
         }
         None
+    }
+
+    fn literals(&self, claim: &Claim<'_>) -> Literals {
+        let written = match claim {
+            Claim::Ensures { owner, .. } => self
+                .front
+                .defs_written
+                .get(&owner.name)
+                .map(|w| w.requires_literals.as_slice()),
+            Claim::Law { info, .. } => self.front.law_literals.get(info.index).map(Vec::as_slice),
+        };
+        Literals::of(written.unwrap_or_default())
     }
 
     /// The values one binder is tried at, smallest and most literal first.
@@ -555,9 +559,9 @@ impl<'a> Prover<'a> {
         (!footprint.is_empty()).then(|| footprint.clone())
     }
 
-    fn cases(&self, obligation: &Obligation, claim: &Claim<'a>) -> Result<Cases<'a>, Gap> {
+    fn cases(&self, obligation: &Obligation, claim: &Claim<'_>) -> Result<Cases<'a>, Gap> {
         let call = match claim {
-            Claim::Ensures { owner, .. } => Some(owner.clone()),
+            Claim::Ensures { .. } => Some(obligation.owner.clone()),
             Claim::Law { .. } => None,
         };
         let result = obligation.result_binder().map(|b| b.name.clone());
@@ -584,7 +588,7 @@ impl<'a> Prover<'a> {
     fn enumerate(
         &self,
         obligation: &Obligation,
-        claim: &Claim<'a>,
+        claim: &Claim<'_>,
         finite: &Finite,
         cases: &mut Cases<'a>,
         witness: Option<Proof>,
@@ -658,7 +662,7 @@ impl<'a> Prover<'a> {
     fn search_interleavings(
         &self,
         obligation: &Obligation,
-        claim: &Claim<'a>,
+        claim: &Claim<'_>,
         plan: &ProvePlan,
     ) -> Discharge {
         let mut cases = match self.cases(obligation, claim) {
@@ -765,91 +769,16 @@ struct Literals {
 }
 
 impl Literals {
-    fn collect(&mut self, expr: &Expr) {
-        let mut stack = vec![expr];
-        while let Some(e) = stack.pop() {
-            match &e.kind {
-                ExprKind::Lit(ply_syntax::ast::Lit::Int(k)) => {
-                    if !self.ints.contains(k) {
-                        self.ints.push(*k);
-                    }
-                }
-                ExprKind::Lit(ply_syntax::ast::Lit::Str(s)) => {
-                    if !self.strings.contains(s) {
-                        self.strings.push(s.clone());
-                    }
-                }
-                ExprKind::Lit(ply_syntax::ast::Lit::Bytes(b)) => {
-                    if !self.bytes.contains(b) {
-                        self.bytes.push(b.clone());
-                    }
-                }
-                ExprKind::Lit(_) | ExprKind::Var(_) => {}
-                ExprKind::Binary { lhs, rhs, .. } => {
-                    stack.push(lhs);
-                    stack.push(rhs);
-                }
-                ExprKind::Unary { op, operand } => {
-                    // `-1000000` is a negation in the AST; the search wants the negated value.
-                    if let (
-                        ply_syntax::ast::UnOp::Neg,
-                        ExprKind::Lit(ply_syntax::ast::Lit::Int(k)),
-                    ) = (op, &operand.kind)
-                    {
-                        let negated = k.saturating_neg();
-                        if !self.ints.contains(&negated) {
-                            self.ints.push(negated);
-                        }
-                    }
-                    stack.push(operand);
-                }
-                ExprKind::App { func, args, .. } => {
-                    stack.push(func);
-                    stack.extend(args);
-                }
-                ExprKind::If {
-                    cond,
-                    then_branch,
-                    else_branch,
-                } => {
-                    stack.push(cond);
-                    stack.push(then_branch);
-                    stack.push(else_branch);
-                }
-                ExprKind::Lambda { body, .. } => stack.push(body),
-                ExprKind::Match { scrutinee, arms } => {
-                    stack.push(scrutinee);
-                    for arm in arms {
-                        stack.extend(arm.guard.iter());
-                        stack.push(&arm.body);
-                    }
-                }
-                ExprKind::Block { stmts, tail } => {
-                    for stmt in stmts {
-                        match stmt {
-                            ply_syntax::ast::Stmt::Let { value, .. } => stack.push(value),
-                            ply_syntax::ast::Stmt::Expr(e) => stack.push(e),
-                        }
-                    }
-                    stack.extend(tail.as_deref());
-                }
-                ExprKind::Record { fields } => stack.extend(fields.iter().map(|(_, v)| v)),
-                ExprKind::RecordUpdate { base, fields } => {
-                    stack.push(base);
-                    stack.extend(fields.iter().map(|(_, v)| v));
-                }
-                ExprKind::Field { base, .. } => stack.push(base),
-                ExprKind::Try { operand } => stack.push(operand),
-                ExprKind::List { items } => stack.extend(items),
-                ExprKind::Perform { args, .. } => stack.extend(args),
-                ExprKind::Handle { body, .. } => stack.push(body),
-                ExprKind::WithCell { init, body, .. } => {
-                    stack.push(init);
-                    stack.push(body);
-                }
-                ExprKind::WithRegion { body, .. } | ExprKind::Simulate { body } => stack.push(body),
+    fn of(written: &[Literal]) -> Literals {
+        let mut out = Literals::default();
+        for literal in written {
+            match literal {
+                Literal::Int(k) => out.ints.push(*k),
+                Literal::Str(s) => out.strings.push(s.clone()),
+                Literal::Bytes(b) => out.bytes.push(b.clone()),
             }
         }
+        out
     }
 }
 

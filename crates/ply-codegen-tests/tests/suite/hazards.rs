@@ -86,9 +86,8 @@ struct Harness {
 }
 
 fn harness(loaded: &'static Loaded) -> Harness {
-    let unit: &'static Unit =
-        Unit::over_with_texts(loaded.program, loaded.resolved, loaded.texts.clone())
-            .expect("this host has a C compiler");
+    let unit: &'static Unit = Unit::over_with_texts(loaded.program, loaded.texts.clone())
+        .expect("this host has a C compiler");
     let bodies = unit.bodies().expect("the unit builds");
     let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
     machine.set_compiled(bodies.clone());
