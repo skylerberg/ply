@@ -60,12 +60,6 @@ pub fn hash_ast(module: &Module) -> Result<HashOutput, Vec<Diagnostic>> {
     hash_index(ProgramIndex::single(module)?, None)
 }
 
-pub fn hash_ast_with_bodies(module: &Module) -> Result<(HashOutput, BodySet), Vec<Diagnostic>> {
-    let mut bodies = BodySet::default();
-    let hashes = hash_index(ProgramIndex::single(module)?, Some(&mut bodies))?;
-    Ok((hashes, bodies))
-}
-
 fn hash_index(
     index: ProgramIndex<'_>,
     mut bodies: Option<&mut BodySet>,
@@ -337,16 +331,6 @@ fn slots(order: &[usize]) -> EffectIndex {
         .enumerate()
         .map(|(i, &node)| (node, i as u32))
         .collect()
-}
-
-/// The hash of each member of one strongly connected component.
-pub fn component_hashes(
-    index: &ProgramIndex<'_>,
-    component: &[usize],
-    hashes: &HashTable,
-    effects: &EffectIndex,
-) -> Vec<(usize, DefHash)> {
-    hash_component(index, component, hashes, effects).0
 }
 
 /// A cycle is hashed as a unit; members are indexed by partition refinement, not source position.

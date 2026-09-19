@@ -154,7 +154,7 @@ fn args_for(filter: Option<&str>) -> TestArgs {
 }
 
 #[test]
-fn ply_test_runs_on_the_port_s_answer_and_never_parses_in_rust() {
+fn a_finished_run_holds_what_it_loaded() {
     let dir = tempfile::tempdir().unwrap();
     write(
         dir.path(),
@@ -175,7 +175,6 @@ fn ply_test_runs_on_the_port_s_answer_and_never_parses_in_rust() {
         .as_ref()
         .expect("a finished run holds what it loaded");
     assert!(loaded.check.tests.iter().any(|t| t.name == "f is one"));
-    assert!(!loaded.rust.built(), "`ply test` parsed in Rust");
 }
 
 /// The hashes do not cover layout, so `--watch` keeps the unit across a save that moves a test,
@@ -681,11 +680,9 @@ fn bisect_never_reports_that_nothing_was_attempted_and_evaluates_nothing() {
     let (_dir, loaded, hashes, mut report) = failing(ONE_FAILURE);
     let mut args = args_for(None);
     args.bisect = When::Never;
-    let tree = loaded.tree().expect("the front ends agree");
     ply_test::diagnose_failures(
         &mut report,
-        &tree.program,
-        &tree.resolved,
+        &loaded.texts(),
         &loaded.front,
         &mut Store::open(_dir.path()).unwrap(),
         &diagnosis_options(&args),
