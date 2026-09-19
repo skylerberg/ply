@@ -3,7 +3,7 @@
 
 use ply_hash::HashOutput;
 use ply_hash::body::BodySet;
-use ply_span::{SourceId, Span, Symbol};
+use ply_span::{SourceId, SourceMap, Span, Symbol};
 use ply_syntax::ast::{AtomExpr, Expr, ExprKind, Item, Lit, Program, QName, SpecKind, Stmt, UnOp};
 use ply_syntax::resolve::{Namespace, Resolved};
 use ply_ty::{
@@ -11,6 +11,7 @@ use ply_ty::{
     Ordinal, Resource, Type, TypeDecl, WrittenParam,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::{PoisonError, RwLock};
 
 /// A checked program, borrowed for as long as the unit compiled from it lives.
 pub struct Source {
@@ -18,6 +19,8 @@ pub struct Source {
     /// [`Front::check`].
     pub check: &'static CheckOutput,
     tables: Tables,
+    /// Each root's definition span where failures are reported: `tables.spans` until relocated.
+    placed: RwLock<HashMap<String, Span>>,
     /// Each root's cache key: its hash, plus its definition's own text once attached. Empty: no
     /// caching.
     pub keys: HashMap<String, String>,
@@ -526,6 +529,16 @@ impl Tables {
         t
     }
 
+    /// The text of `root`'s definition in `texts`, which are by module name.
+    fn written<'t>(&self, root: &str, texts: &'t HashMap<String, String>) -> Option<&'t str> {
+        let span = self.spans.get(root)?;
+        let (module, _) = self
+            .modules
+            .iter()
+            .find(|(_, source)| *source == span.source)?;
+        texts.get(module.as_str())?.get(span.range())
+    }
+
     fn note(&mut self, root: String, arity: usize, scalar: bool) {
         if scalar {
             self.scalars.insert(root.clone());
@@ -581,24 +594,22 @@ impl Source {
     }
 
     pub fn from_front(front: &'static Front, keys: HashMap<String, String>) -> Source {
+        let tables = Tables::of(front);
         Source {
             front,
             check: &front.check,
-            tables: Tables::of(front),
+            placed: RwLock::new(tables.spans.clone()),
+            tables,
             keys,
             texts: HashMap::new(),
         }
     }
 
     pub fn with_texts(mut self, texts: HashMap<String, String>) -> Source {
-        let modules: HashMap<SourceId, &Symbol> =
-            self.tables.modules.iter().map(|(m, s)| (*s, m)).collect();
         // A site is an offset into its definition's text, whose layout the hash does not cover, so
         // a root whose text is not here keeps no key.
         let own = |root: &str| -> Option<String> {
-            let span = self.tables.spans.get(root)?;
-            let text = texts.get(modules.get(&span.source)?.as_str())?;
-            let written = text.get(span.range())?;
+            let written = self.tables.written(root, &texts)?;
             Some(blake3::hash(written.as_bytes()).to_hex()[..32].to_string())
         };
         self.keys = std::mem::take(&mut self.keys)
@@ -614,7 +625,31 @@ impl Source {
 
     /// The span of the definition `root` is part of: what its sites are offsets from.
     pub fn span_of(&self, root: &str) -> Option<Span> {
-        self.tables.spans.get(root).copied()
+        self.placed
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(root)
+            .copied()
+    }
+
+    /// Places every root where `front` has it, if each definition's text in `sources` is the one
+    /// this was emitted over: a site is an offset into that text, so any other edit needs a rebuild.
+    pub fn relocate(&self, front: &Front, sources: &SourceMap) -> bool {
+        let now = Tables::of(front);
+        let unchanged = now.roots == self.tables.roots
+            && now.spans.len() == self.tables.spans.len()
+            && self.tables.spans.keys().all(|root| {
+                now.spans.get(root).is_some_and(|span| {
+                    let is = sources
+                        .get(span.source)
+                        .and_then(|file| file.text.get(span.range()));
+                    self.tables.written(root, &self.texts) == is
+                })
+            });
+        if unchanged {
+            *self.placed.write().unwrap_or_else(PoisonError::into_inner) = now.spans;
+        }
+        unchanged
     }
 
     /// Every constructor, by program-wide name, with its arity.
