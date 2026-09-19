@@ -28,7 +28,7 @@ A feature earns its place by one of these. Saving keystrokes does not count.
   cannot drift from the compiler.
 - A program surface for agents: list callers, which tests reach a definition, replace a
   definition by name.
-- Induction in the prover, so recursive definitions can reach `proved`.
+- Induction over lists in the prover, which needs a cons term in its term language.
 - Mutation testing and per-definition coverage over the hash index.
 - A shared result cache, so parallel agents and CI never repeat each other.
 - The compiler's own loop: stage-1 emission cached by source digest and incremental per

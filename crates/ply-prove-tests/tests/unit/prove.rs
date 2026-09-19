@@ -493,6 +493,10 @@ fn three(x: Int) -> Int = two(x) + 1
 fn four(x: Int) -> Int = three(x) + 1
 
 fn countdown(n: Int) -> Int = if n <= 0 { 0 } else { countdown(n - 1) + 1 }
+fn forever(n: Int) -> Int = forever(n)
+fn twice_down(n: Int) -> Int = if n <= 0 { 0 } else { twice_down(n - 2) + 2 }
+fn ping(n: Int) -> Int = if n <= 0 { 0 } else { pong(n - 1) + 1 }
+fn pong(n: Int) -> Int = if n <= 0 { 0 } else { ping(n - 1) + 1 }
 
 law "three unfoldings suffice" forall (x: Int) where x > 0 && x < 1000
   { three(x) == x + 3 }
@@ -501,6 +505,12 @@ law "four unfoldings do not" forall (x: Int) where x > 0 && x < 1000
 law "a recursive call is a function" forall (n: Int) { countdown(n) == countdown(n) }
 law "a recursive definition steps" forall (n: Int) where n > 0
   { countdown(n) == countdown(n - 1) + 1 }
+law "counting down counts" forall (n: Int) where n >= 0 { countdown(n) == n }
+law "counting down is not the identity" forall (n: Int) { countdown(n) == n }
+law "counting down is never negative" forall (n: Int) { countdown(n) >= 0 }
+law "a definition that never returns is not a function" forall (n: Int) { forever(n) == forever(n) }
+law "stepping by two counts" forall (n: Int) where n >= 0 { twice_down(n) == n }
+law "a mutual recursion is not unrolled" forall (n: Int) where n >= 0 { ping(n) == n }
 "#;
 
 #[test]
@@ -521,14 +531,40 @@ fn a_non_recursive_definition_unfolds_to_the_stated_depth() {
 }
 
 #[test]
-fn a_recursive_definition_is_never_unfolded() {
+fn a_recursive_definition_is_unfolded_only_by_induction() {
     let f = fixture(CHAIN);
-    not_proved(&f, "a recursive call is a function");
-    not_proved(&f, "a recursive definition steps");
-
     let ctx = f.context();
     assert!(ctx.unfoldable(&Symbol::new("countdown")).is_none());
     assert!(ctx.unfoldable(&Symbol::new("three")).is_some());
+
+    for label in [
+        "a recursive call is a function",
+        "a recursive definition steps",
+        "counting down counts",
+        "counting down is never negative",
+    ] {
+        let proved = proof(&f, label);
+        assert!(
+            proved
+                .rules
+                .iter()
+                .any(|r| matches!(r, Rule::Induction { binder, def }
+                if binder.as_str() == "n" && def.as_str() == "countdown")),
+            "`{label}`: {:?}",
+            proved.rules
+        );
+    }
+    // The base case is where a claim false below zero fails.
+    not_proved(&f, "counting down is not the identity");
+}
+
+#[test]
+fn induction_needs_a_decreasing_self_call_and_a_step_of_one() {
+    let f = fixture(CHAIN);
+    not_proved(&f, "a definition that never returns is not a function");
+    not_proved(&f, "a mutual recursion is not unrolled");
+    // The recursion steps by two, and the hypothesis is one step down.
+    not_proved(&f, "stepping by two counts");
 }
 
 const EFFECTFUL: &str = r#"

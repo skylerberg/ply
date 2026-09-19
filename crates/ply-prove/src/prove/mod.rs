@@ -4,6 +4,7 @@ pub mod arith;
 pub mod claims;
 mod context;
 pub mod egraph;
+mod induct;
 mod lower;
 mod solve;
 pub mod term;
@@ -196,6 +197,9 @@ pub fn decide_and_diagnose(
     budget = left;
 
     if let Some(reason) = inconclusive(answer) {
+        if let Some(proof) = induct::attempt(ctx, goal, limits, budget, spent, &blockers) {
+            return (Decision::Proved(proof), blockers);
+        }
         return (
             Decision::Unknown {
                 reason,
@@ -449,7 +453,7 @@ impl RuleLog {
         }
     }
 
-    fn into_rules(mut self) -> Vec<Rule> {
+    pub(super) fn into_rules(mut self) -> Vec<Rule> {
         for (def, depth) in self.unfolds {
             self.rules.push(Rule::Unfold { def, depth });
         }
