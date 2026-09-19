@@ -1,17 +1,9 @@
 //! The facts about a program that the prover reads, indexed once per run.
 
+use super::claims::{Claims, Code, Definition};
 use ply_span::Symbol;
-use ply_syntax::ast::{Expr, ExprKind, FnDef, Item, Program, QName, Stmt, TypeDefBody};
-use ply_syntax::resolve::{Namespace, Resolved};
 use ply_ty::{CheckOutput, CtorInfo, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-
-pub struct Unfoldable<'a> {
-    pub name: Symbol,
-    pub def: &'a FnDef,
-    /// Index into `Program::modules`; the body's bare names resolve against it.
-    pub module: usize,
-}
 
 /// The constructors of one sum type, in declaration order.
 pub struct Variants<'a> {
@@ -20,9 +12,8 @@ pub struct Variants<'a> {
 }
 
 pub struct Context<'a> {
-    resolved: &'a Resolved,
+    claims: Claims,
     check: &'a CheckOutput,
-    defs: HashMap<Symbol, (usize, &'a FnDef)>,
     recursive: BTreeSet<Symbol>,
     by_type: BTreeMap<Symbol, Vec<Symbol>>,
     inhabited_types: BTreeSet<Symbol>,
@@ -32,20 +23,7 @@ pub struct Context<'a> {
 }
 
 impl<'a> Context<'a> {
-    pub fn new(
-        program: &'a Program,
-        resolved: &'a Resolved,
-        check: &'a CheckOutput,
-    ) -> Context<'a> {
-        let mut defs: HashMap<Symbol, (usize, &FnDef)> = HashMap::new();
-        for (index, module) in program.modules.iter().enumerate() {
-            for item in &module.items {
-                if let Item::Fn(def) = item {
-                    defs.insert(module.name.qualify(&def.name.name), (index, def));
-                }
-            }
-        }
-
+    pub fn new(claims: Claims, check: &'a CheckOutput) -> Context<'a> {
         let mut by_type: BTreeMap<Symbol, Vec<(usize, Symbol)>> = BTreeMap::new();
         for (name, info) in &check.ctors {
             by_type
@@ -59,22 +37,25 @@ impl<'a> Context<'a> {
             ctors.sort();
             sums.insert(ty, ctors.into_iter().map(|(_, name)| name).collect());
         }
-        drop_incomplete(program, &mut sums);
+        drop_incomplete(&claims, &mut sums);
 
-        let recursive = recursive_definitions(&defs, resolved);
+        let recursive = recursive_definitions(&claims.defs);
         let inhabited_types = inhabited_sum_types(check, &sums);
         let float_types = float_reaching_types(check);
 
         Context {
-            resolved,
+            claims,
             check,
-            defs,
             recursive,
             by_type: sums,
             inhabited_types,
             float_types,
             sort_names: BTreeMap::new(),
         }
+    }
+
+    pub fn claims(&self) -> &Claims {
+        &self.claims
     }
 
     /// Through its arguments, its fields, or its own declaration.
@@ -92,15 +73,6 @@ impl<'a> Context<'a> {
             .get(&v)
             .cloned()
             .unwrap_or_else(|| Symbol::new(Type::Var(v).to_string()))
-    }
-
-    /// `None` when the reference denotes nothing visible; the term then becomes a fresh symbol.
-    pub fn resolve_value(&self, module: usize, q: &QName) -> Option<Symbol> {
-        if let Ok(binding) = self.resolved.lookup(module, Namespace::Value, q) {
-            return Some(binding.qualified.clone());
-        }
-        let bare = q.is_bare().then(|| q.symbol().clone())?;
-        self.check.ctors.contains_key(&bare).then_some(bare)
     }
 
     pub fn ctor(&self, name: &Symbol) -> Option<&'a CtorInfo> {
@@ -152,38 +124,28 @@ impl<'a> Context<'a> {
         self.recursive.contains(name)
     }
 
-    /// Not in a recursive component, and with an empty footprint.
-    pub fn unfoldable(&self, name: &Symbol) -> Option<Unfoldable<'a>> {
+    /// Not in a recursive component, with an empty footprint, and with a body the lowering reached.
+    pub fn unfoldable(&self, name: &Symbol) -> Option<&Definition> {
         if self.recursive.contains(name) {
             return None;
         }
         if !self.check.defs.get(name)?.footprint.is_empty() {
             return None;
         }
-        let (module, def) = self.defs.get(name)?;
-        Some(Unfoldable {
-            name: name.clone(),
-            def,
-            module: *module,
-        })
+        self.claims
+            .defs
+            .get(name)
+            .filter(|def| !matches!(def.body, Code::Unreached))
     }
 }
 
-fn drop_incomplete(program: &Program, sums: &mut BTreeMap<Symbol, Vec<Symbol>>) {
-    let mut declared: BTreeMap<Symbol, usize> = BTreeMap::new();
+fn drop_incomplete(claims: &Claims, sums: &mut BTreeMap<Symbol, Vec<Symbol>>) {
     // The prelude's ADTs have no `type` item, and would otherwise be dropped.
-    for adt in ply_ty::prelude::ADTS {
-        declared.insert(Symbol::new(adt.name), adt.variants.len());
-    }
-    for module in &program.modules {
-        for item in &module.items {
-            if let Item::Type(def) = item
-                && let TypeDefBody::Sum(variants) = &def.body
-            {
-                declared.insert(module.name.qualify(&def.name.name), variants.len());
-            }
-        }
-    }
+    let mut declared: BTreeMap<Symbol, usize> = ply_ty::prelude::ADTS
+        .iter()
+        .map(|adt| (Symbol::new(adt.name), adt.variants.len()))
+        .collect();
+    declared.extend(claims.sums.iter().map(|(ty, n)| (ty.clone(), *n)));
     sums.retain(|ty, ctors| declared.get(ty) == Some(&ctors.len()) && !ctors.is_empty());
 }
 
@@ -274,24 +236,21 @@ fn field_inhabited(
 }
 
 /// Definitions in a call-graph cycle; Tarjan run iteratively so deep programs cannot overflow.
-fn recursive_definitions(
-    defs: &HashMap<Symbol, (usize, &FnDef)>,
-    resolved: &Resolved,
-) -> BTreeSet<Symbol> {
+fn recursive_definitions(defs: &HashMap<Symbol, Definition>) -> BTreeSet<Symbol> {
     let mut names: Vec<Symbol> = defs.keys().cloned().collect();
     names.sort();
     let index: HashMap<&Symbol, usize> = names.iter().enumerate().map(|(i, n)| (n, i)).collect();
 
-    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); names.len()];
-    for (i, name) in names.iter().enumerate() {
-        let (module, def) = defs[name];
-        let mut referenced = BTreeSet::new();
-        collect_references(&def.body, module, resolved, &mut referenced);
-        edges[i] = referenced
-            .iter()
-            .filter_map(|r| index.get(r).copied())
-            .collect();
-    }
+    let edges: Vec<Vec<usize>> = names
+        .iter()
+        .map(|name| {
+            defs[name]
+                .refs
+                .iter()
+                .filter_map(|r| index.get(r).copied())
+                .collect()
+        })
+        .collect();
 
     let mut recursive = BTreeSet::new();
     for component in tarjan(&edges) {
@@ -359,82 +318,4 @@ fn tarjan(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
         }
     }
     components
-}
-
-fn collect_references(expr: &Expr, module: usize, resolved: &Resolved, out: &mut BTreeSet<Symbol>) {
-    let mut stack = vec![expr];
-    while let Some(e) = stack.pop() {
-        match &e.kind {
-            ExprKind::Var(q) => {
-                if let Ok(binding) = resolved.lookup(module, Namespace::Value, q) {
-                    out.insert(binding.qualified.clone());
-                }
-            }
-            ExprKind::Lit(_) => {}
-            ExprKind::Binary { lhs, rhs, .. } => {
-                stack.push(lhs);
-                stack.push(rhs);
-            }
-            ExprKind::Unary { operand, .. } => stack.push(operand),
-            ExprKind::Lambda { body, .. } => stack.push(body),
-            ExprKind::App { func, args, .. } => {
-                stack.push(func);
-                stack.extend(args);
-            }
-            ExprKind::If {
-                cond,
-                then_branch,
-                else_branch,
-            } => {
-                stack.push(cond);
-                stack.push(then_branch);
-                stack.push(else_branch);
-            }
-            ExprKind::Match { scrutinee, arms } => {
-                stack.push(scrutinee);
-                for arm in arms {
-                    if let Some(guard) = &arm.guard {
-                        stack.push(guard);
-                    }
-                    stack.push(&arm.body);
-                }
-            }
-            ExprKind::Block { stmts, tail } => {
-                for stmt in stmts {
-                    match stmt {
-                        Stmt::Let { value, .. } => stack.push(value),
-                        Stmt::Expr(e) => stack.push(e),
-                    }
-                }
-                stack.extend(tail.as_deref());
-            }
-            ExprKind::Record { fields } => stack.extend(fields.iter().map(|(_, v)| v)),
-            ExprKind::RecordUpdate { base, fields } => {
-                stack.push(base);
-                stack.extend(fields.iter().map(|(_, v)| v));
-            }
-            ExprKind::Field { base, .. } => stack.push(base),
-            ExprKind::Try { operand } => stack.push(operand),
-            ExprKind::List { items } => stack.extend(items),
-            ExprKind::Perform { args, .. } => stack.extend(args),
-            ExprKind::Handle {
-                body,
-                clauses,
-                return_clause,
-            } => {
-                stack.push(body);
-                for clause in clauses {
-                    stack.push(&clause.body);
-                }
-                if let Some(r) = return_clause {
-                    stack.push(&r.body);
-                }
-            }
-            ExprKind::WithCell { init, body, .. } => {
-                stack.push(init);
-                stack.push(body);
-            }
-            ExprKind::WithRegion { body, .. } | ExprKind::Simulate { body } => stack.push(body),
-        }
-    }
 }

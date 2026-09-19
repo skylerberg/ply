@@ -1,10 +1,10 @@
-//! Ply expressions into the prover's terms.
+//! The port's lowered claims into the prover's terms.
 
 use super::RuleLog;
-use super::context::{Context, Unfoldable};
+use super::claims::{self, Code, Pat, Stmt};
+use super::context::Context;
 use super::term::{self, Arm, ArmTest, CmpOp, Node, TermId, Terms};
 use ply_span::Symbol;
-use ply_syntax::ast::{Expr, ExprKind, Param, Pattern, PatternKind, QName, Stmt};
 use ply_ty::{BinOp, CtorInfo, Lit, Scheme, TyVar, Type, UnOp};
 use std::collections::BTreeMap;
 
@@ -79,7 +79,6 @@ pub enum Blocker {
     DecimalArithmetic,
     /// `perform`, `handle`, `with_cell` or `simulate`.
     Region,
-    UnexpandedSugar,
     UndecidableMatchArm,
     DestructuringLet,
 }
@@ -99,12 +98,9 @@ pub struct Lowering<'a, 'p> {
     pub terms: Terms,
     ctx: &'a Context<'p>,
     rules: &'a mut RuleLog,
-    module: usize,
     unfold_depth: u32,
     depth: u32,
-    /// `(name, term)` in scope order.
-    frames: Vec<(Symbol, TermId)>,
-    barriers: Vec<usize>,
+    window: Vec<Option<TermId>>,
     blockers: Vec<Blocker>,
     /// What must hold for the lowered expressions not to raise or diverge.
     requirements: Vec<TermId>,
@@ -117,18 +113,15 @@ impl<'a, 'p> Lowering<'a, 'p> {
     pub fn new(
         ctx: &'a Context<'p>,
         rules: &'a mut RuleLog,
-        module: usize,
         unfold_depth: u32,
     ) -> Lowering<'a, 'p> {
         Lowering {
             terms: Terms::new(),
             ctx,
             rules,
-            module,
             unfold_depth,
             depth: 0,
-            frames: Vec::new(),
-            barriers: Vec::new(),
+            window: Vec::new(),
             blockers: Vec::new(),
             requirements: Vec::new(),
             path: Vec::new(),
@@ -273,34 +266,34 @@ impl<'a, 'p> Lowering<'a, 'p> {
         out
     }
 
-    pub fn bind_symbolic(&mut self, name: &Symbol, ty: &Type) -> TermId {
+    pub fn bind_symbolic(&mut self, ty: &Type) -> TermId {
         if self.ctx.reaches_float(ty) {
             self.float();
         }
-        let term = self.terms.sym(Some(ty.clone()));
-        self.frames.push((name.clone(), term));
-        term
+        self.terms.sym(Some(ty.clone()))
     }
 
     pub fn finish(self) -> Terms {
         self.terms
     }
 
-    pub fn lower(&mut self, expr: &Expr) -> TermId {
-        // Expressions may nest as deep as the parser accepted.
-        stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || self.lower_inner(expr))
+    pub fn lower_root(&mut self, code: &Code, binders: &[TermId]) -> TermId {
+        let window = binders.iter().map(|t| Some(*t)).collect();
+        self.within(window, |this| this.lower(code))
     }
 
-    fn lower_inner(&mut self, expr: &Expr) -> TermId {
-        match &expr.kind {
-            ExprKind::Lit(lit) => self.literal(lit),
-            ExprKind::Var(q) => self.variable(q),
+    fn lower(&mut self, code: &Code) -> TermId {
+        // Expressions may nest as deep as the parser accepted.
+        stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || self.lower_inner(code))
+    }
+
+    fn lower_inner(&mut self, code: &Code) -> TermId {
+        match code {
+            Code::Lit(lit) => self.literal(lit),
+            Code::Local(slot) => self.local(*slot),
+            Code::Global(name) => self.global(name),
             // Short-circuit: the right operand owes its requirements only under the left's answer.
-            ExprKind::Binary {
-                op: op @ (BinOp::And | BinOp::Or),
-                lhs,
-                rhs,
-            } => {
+            Code::Binary(op @ (BinOp::And | BinOp::Or), lhs, rhs) => {
                 let l = self.lower(lhs);
                 let reached = if *op == BinOp::And {
                     l
@@ -310,12 +303,12 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 let r = self.under(reached, |this| this.lower(rhs));
                 self.binary(*op, l, r)
             }
-            ExprKind::Binary { op, lhs, rhs } => {
+            Code::Binary(op, lhs, rhs) => {
                 let l = self.lower(lhs);
                 let r = self.lower(rhs);
                 self.binary(*op, l, r)
             }
-            ExprKind::Unary { op, operand } => {
+            Code::Unary(op, operand) => {
                 let t = self.lower(operand);
                 match op {
                     UnOp::Not => self.terms.not(t),
@@ -350,16 +343,12 @@ impl<'a, 'p> Lowering<'a, 'p> {
                     }
                 }
             }
-            ExprKind::Lambda { .. } => {
+            Code::Lambda { .. } => {
                 self.blocked(Blocker::Lambda);
                 self.terms.sym(None)
             }
-            ExprKind::App { func, args, .. } => self.application(func, args),
-            ExprKind::If {
-                cond,
-                then_branch,
-                else_branch,
-            } => {
+            Code::App(func, args) => self.application(func, args),
+            Code::If(cond, then_branch, else_branch) => {
                 let cond = self.lower(cond);
                 let then_branch = self.under(cond, |this| this.lower(then_branch));
                 let otherwise = self.terms.not(cond);
@@ -378,35 +367,31 @@ impl<'a, 'p> Lowering<'a, 'p> {
                     sort,
                 )
             }
-            ExprKind::Match { scrutinee, arms } => self.match_expr(scrutinee, arms),
-            ExprKind::Block { stmts, tail } => self.block(stmts, tail.as_deref()),
-            ExprKind::Record { fields } => {
+            Code::Match(scrutinee, arms) => self.match_expr(scrutinee, arms),
+            Code::Block(stmts, tail) => self.block(stmts, tail.as_deref()),
+            Code::Record(fields) => {
                 let mut lowered: Vec<(Symbol, TermId)> = fields
                     .iter()
-                    .map(|(name, value)| (name.name.clone(), self.lower(value)))
+                    .map(|(name, value)| (name.clone(), self.lower(value)))
                     .collect();
                 lowered.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
                 let sort = self.record_sort(&lowered);
                 self.terms.mk(Node::Record(lowered), sort)
             }
-            ExprKind::Field { base, field } => {
+            Code::Field(base, field) => {
                 let base = self.lower(base);
-                self.terms.field(base, field.name.clone())
+                self.terms.field(base, field.clone())
             }
-            ExprKind::RecordUpdate { .. } | ExprKind::Try { .. } => {
-                self.blocked(Blocker::UnexpandedSugar);
-                self.terms.sym(None)
-            }
-            ExprKind::List { items } => {
+            Code::List(items) => {
                 let items: Vec<TermId> = items.iter().map(|i| self.lower(i)).collect();
                 self.terms.mk(Node::List(items), None)
             }
-            ExprKind::Perform { .. }
-            | ExprKind::Handle { .. }
-            | ExprKind::WithCell { .. }
-            | ExprKind::WithRegion { .. }
-            | ExprKind::Simulate { .. } => {
+            Code::Region => {
                 self.blocked(Blocker::Region);
+                self.terms.sym(None)
+            }
+            Code::Unreached => {
+                self.blocked(Blocker::UndecidableMatchArm);
                 self.terms.sym(None)
             }
         }
@@ -430,16 +415,29 @@ impl<'a, 'p> Lowering<'a, 'p> {
         }
     }
 
-    fn variable(&mut self, q: &QName) -> TermId {
-        if q.is_bare()
-            && let Some(term) = self.lookup(q.symbol())
-        {
-            return term;
+    fn local(&mut self, slot: usize) -> TermId {
+        match self.window.get(slot).copied().flatten() {
+            Some(term) => term,
+            None => self.terms.sym(None),
         }
-        let Some(name) = self.ctx.resolve_value(self.module, q) else {
-            return self.terms.sym(None);
-        };
-        if let Some(ctor) = self.ctx.ctor(&name) {
+    }
+
+    fn bind(&mut self, slot: usize, term: TermId) {
+        if self.window.len() <= slot {
+            self.window.resize(slot + 1, None);
+        }
+        self.window[slot] = Some(term);
+    }
+
+    fn within<T>(&mut self, window: Vec<Option<TermId>>, f: impl FnOnce(&mut Self) -> T) -> T {
+        let outer = std::mem::replace(&mut self.window, window);
+        let out = f(self);
+        self.window = outer;
+        out
+    }
+
+    fn global(&mut self, name: &Symbol) -> TermId {
+        if let Some(ctor) = self.ctx.ctor(name) {
             let sort = scheme_sort(&ctor.scheme);
             if ctor.arity == 0 {
                 return self.terms.mk(
@@ -450,10 +448,14 @@ impl<'a, 'p> Lowering<'a, 'p> {
                     sort,
                 );
             }
-            return self.terms.mk(Node::Opaque(name), sort);
+            return self.terms.mk(Node::Opaque(name.clone()), sort);
         }
-        let sort = self.ctx.scheme(&name).and_then(scheme_sort);
-        self.terms.mk(Node::Opaque(name), sort)
+        match self.ctx.scheme(name) {
+            Some(scheme) => self
+                .terms
+                .mk(Node::Opaque(name.clone()), scheme_sort(scheme)),
+            None => self.terms.sym(None),
+        }
     }
 
     fn operand_type(&self, lhs: TermId, rhs: TermId) -> Option<Numeric> {
@@ -511,15 +513,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
             },
             Some(sort),
         )
-    }
-
-    fn lookup(&self, name: &Symbol) -> Option<TermId> {
-        let floor = self.barriers.last().copied().unwrap_or(0);
-        self.frames[floor..]
-            .iter()
-            .rev()
-            .find(|(n, _)| n == name)
-            .map(|(_, t)| *t)
     }
 
     fn binary(&mut self, op: BinOp, lhs: TermId, rhs: TermId) -> TermId {
@@ -656,16 +649,27 @@ impl<'a, 'p> Lowering<'a, 'p> {
         }
     }
 
-    fn application(&mut self, func: &Expr, args: &[Expr]) -> TermId {
+    fn application(&mut self, func: &Code, args: &[Code]) -> TermId {
         let lowered: Vec<TermId> = args.iter().map(|a| self.lower(a)).collect();
 
-        if let ExprKind::Lambda { params, body, .. } = &func.kind
-            && params.len() == lowered.len()
+        if let Code::Lambda {
+            params,
+            captures,
+            body,
+        } = func
+            && *params == lowered.len()
         {
-            return self.with_frame(params_frame(params, &lowered), |this| this.lower(body));
+            let mut window: Vec<Option<TermId>> = lowered.iter().map(|t| Some(*t)).collect();
+            for &(outer, inner) in captures {
+                let term = self.local(outer);
+                if window.len() <= inner {
+                    window.resize(inner + 1, None);
+                }
+                window[inner] = Some(term);
+            }
+            return self.within(window, |this| this.lower(body));
         }
 
-        // Before lowering the head: a local binder and a same-named definition lower alike.
         let callee = self.callee(func);
 
         let head = self.lower(func);
@@ -714,18 +718,19 @@ impl<'a, 'p> Lowering<'a, 'p> {
         )
     }
 
-    /// Decided from the source, not the lowered head.
-    fn callee(&self, func: &Expr) -> Callee {
-        let ExprKind::Var(q) = &func.kind else {
-            return Callee::Other;
-        };
-        if q.is_bare() && self.lookup(q.symbol()).is_some() {
-            return Callee::Local;
-        }
-        match self.ctx.resolve_value(self.module, q) {
-            Some(name) => Callee::Named(name),
-            None if q.is_bare() => Callee::Unresolved(q.symbol().clone()),
-            None => Callee::Other,
+    /// Decided from the code, not the head's term: a local and a same-named definition lower alike.
+    fn callee(&self, func: &Code) -> Callee {
+        match func {
+            Code::Local(_) => Callee::Local,
+            Code::Global(name)
+                if self.ctx.ctor(name).is_some() || self.ctx.scheme(name).is_some() =>
+            {
+                Callee::Named(name.clone())
+            }
+            // Written `module::name`, and the resolver bound nothing.
+            Code::Global(name) if name.as_str().contains("::") => Callee::Other,
+            Code::Global(name) => Callee::Unresolved(name.clone()),
+            _ => Callee::Other,
         }
     }
 
@@ -764,45 +769,29 @@ impl<'a, 'p> Lowering<'a, 'p> {
         if self.depth >= self.unfold_depth || self.terms.len() >= MAX_TERMS {
             return None;
         }
-        let Unfoldable { def, module, .. } = self.ctx.unfoldable(name)?;
-        if def.params.len() != args.len() {
+        let ctx = self.ctx;
+        let def = ctx.unfoldable(name)?;
+        if def.params != args.len() {
             return None;
         }
         self.rules.unfolded(name.clone(), self.depth + 1);
 
-        let frame = params_frame(&def.params, args);
-        let saved_module = std::mem::replace(&mut self.module, module);
+        let window = args.iter().map(|t| Some(*t)).collect();
         self.depth += 1;
-        self.barriers.push(self.frames.len());
-        let out = self.with_frame(frame, |this| this.lower(&def.body));
-        self.barriers.pop();
+        let out = self.within(window, |this| this.lower(&def.body));
         self.depth -= 1;
-        self.module = saved_module;
         Some(out)
     }
 
-    fn with_frame<T>(&mut self, frame: Vec<(Symbol, TermId)>, f: impl FnOnce(&mut Self) -> T) -> T {
-        let mark = self.frames.len();
-        self.frames.extend(frame);
-        let out = f(self);
-        self.frames.truncate(mark);
-        out
-    }
-
-    fn block(&mut self, stmts: &[Stmt], tail: Option<&Expr>) -> TermId {
-        let mark = self.frames.len();
+    fn block(&mut self, stmts: &[Stmt], tail: Option<&Code>) -> TermId {
         for stmt in stmts {
-            let Stmt::Let { pat, value, .. } = stmt else {
-                continue;
-            };
-            match &pat.kind {
-                PatternKind::Var(name) => {
+            match stmt {
+                Stmt::Let(slot, value) => {
                     let term = self.lower(value);
-                    self.frames.push((name.name.clone(), term));
+                    self.bind(*slot, term);
                 }
-                PatternKind::Wildcard => {}
-                // Bind every introduced name opaquely so none resolves past it to a definition.
-                _ => {
+                Stmt::LetPat(Pat::Wild, _) => {}
+                Stmt::LetPat(pat, value) => {
                     let term = self.lower(value);
                     let sort = self.terms.sort(term).cloned();
                     self.blocked(Blocker::DestructuringLet);
@@ -810,38 +799,30 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 }
             }
         }
-        let out = match tail {
-            Some(expr) => self.lower(expr),
+        match tail {
+            Some(code) => self.lower(code),
             None => self.terms.unit(),
-        };
-        self.frames.truncate(mark);
-        out
+        }
     }
 
-    fn bind_opaque(&mut self, pat: &Pattern, sort: Option<&Type>) {
+    fn bind_opaque(&mut self, pat: &Pat, sort: Option<&Type>) {
         if sort.is_some_and(|s| self.ctx.reaches_float(s)) {
             self.float();
         }
-        for name in pattern_vars(pat) {
+        for slot in pattern_slots(pat) {
             let term = self.terms.sym(None);
-            self.frames.push((name, term));
+            self.bind(slot, term);
         }
     }
 
-    fn match_expr(&mut self, scrutinee: &Expr, arms: &[ply_syntax::ast::MatchArm]) -> TermId {
+    fn match_expr(&mut self, scrutinee: &Code, arms: &[claims::Arm]) -> TermId {
         let scrutinee = self.lower(scrutinee);
         let scrutinee_sort = self.terms.sort(scrutinee).cloned();
         let mut lowered = Vec::with_capacity(arms.len());
         let mut result_sort = None;
 
         for arm in arms {
-            let mark = self.frames.len();
-            let shape = if arm.guard.is_some() {
-                None
-            } else {
-                self.arm_shape(&arm.pat, scrutinee, scrutinee_sort.as_ref())
-            };
-            let (test, binds) = match shape {
+            let (test, binds) = match self.arm_shape(&arm.pat, scrutinee, scrutinee_sort.as_ref()) {
                 Some(shape) => shape,
                 None => {
                     self.blocked(Blocker::UndecidableMatchArm);
@@ -850,7 +831,6 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 }
             };
             let body = self.lower(&arm.body);
-            self.frames.truncate(mark);
             if result_sort.is_none() {
                 result_sort = self.terms.sort(body).cloned();
             }
@@ -868,45 +848,40 @@ impl<'a, 'p> Lowering<'a, 'p> {
 
     fn arm_shape(
         &mut self,
-        pat: &Pattern,
+        pat: &Pat,
         scrutinee: TermId,
         scrutinee_sort: Option<&Type>,
     ) -> Option<(ArmTest, Vec<TermId>)> {
-        match &pat.kind {
-            PatternKind::Wildcard => Some((ArmTest::Always, Vec::new())),
-            PatternKind::Var(name) => {
-                self.frames.push((name.name.clone(), scrutinee));
+        match pat {
+            Pat::Wild => Some((ArmTest::Always, Vec::new())),
+            Pat::Var(slot) => {
+                self.bind(*slot, scrutinee);
                 Some((ArmTest::Always, Vec::new()))
             }
-            PatternKind::Lit(lit) => {
+            Pat::Lit(lit) => {
                 let term = self.literal(lit);
                 Some((ArmTest::Lit(term), Vec::new()))
             }
-            PatternKind::Ctor { name, args } => {
-                let qualified = self.ctx.resolve_value(self.module, name)?;
-                let ctor = self.ctx.ctor(&qualified)?;
+            Pat::Ctor(name, args) => {
+                let ctor = self.ctx.ctor(name)?;
                 if ctor.arity != args.len() {
                     return None;
                 }
-                if !args
-                    .iter()
-                    .all(|a| matches!(a.kind, PatternKind::Wildcard | PatternKind::Var(_)))
-                {
+                if !args.iter().all(|a| matches!(a, Pat::Wild | Pat::Var(_))) {
                     return None;
                 }
                 let sorts = field_sorts(ctor, scrutinee_sort);
                 let mut binds = Vec::with_capacity(args.len());
                 for (arg, sort) in args.iter().zip(sorts) {
                     let field = self.terms.sym(sort);
-                    if let PatternKind::Var(name) = &arg.kind {
-                        self.frames.push((name.name.clone(), field));
+                    if let Pat::Var(slot) = arg {
+                        self.bind(*slot, field);
                     }
                     binds.push(field);
                 }
-                let _ = scrutinee;
-                Some((ArmTest::Ctor(qualified), binds))
+                Some((ArmTest::Ctor(name.clone()), binds))
             }
-            PatternKind::Record { .. } | PatternKind::List { .. } => None,
+            Pat::Nested(_) => None,
         }
     }
 
@@ -927,27 +902,14 @@ enum Callee {
     Other,
 }
 
-fn params_frame(params: &[Param], args: &[TermId]) -> Vec<(Symbol, TermId)> {
-    params
-        .iter()
-        .zip(args)
-        .map(|(p, t)| (p.name.name.clone(), *t))
-        .collect()
-}
-
-fn pattern_vars(pat: &Pattern) -> Vec<Symbol> {
+fn pattern_slots(pat: &Pat) -> Vec<usize> {
     let mut out = Vec::new();
     let mut stack = vec![pat];
     while let Some(p) = stack.pop() {
-        match &p.kind {
-            PatternKind::Var(name) => out.push(name.name.clone()),
-            PatternKind::Ctor { args, .. } => stack.extend(args),
-            PatternKind::Record { fields, .. } => stack.extend(fields.iter().map(|(_, p)| p)),
-            PatternKind::List { items, rest } => {
-                stack.extend(items);
-                stack.extend(rest.as_deref());
-            }
-            PatternKind::Wildcard | PatternKind::Lit(_) => {}
+        match p {
+            Pat::Var(slot) => out.push(*slot),
+            Pat::Ctor(_, inner) | Pat::Nested(inner) => stack.extend(inner),
+            Pat::Wild | Pat::Lit(_) => {}
         }
     }
     out

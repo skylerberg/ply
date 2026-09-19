@@ -43,11 +43,12 @@ impl Run {
         });
         let hashes = loaded.hashes.clone();
         let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
-        let tree = loaded.tree().expect("the front ends agree");
-        let prover = Prover::new(&tree.program, &tree.resolved, &loaded.check).with_backend(
-            ply_cli::commands::common::prover_backend(None, &loaded)
-                .expect("the program compiles to a tier"),
-        );
+        let prover = Prover::new(&loaded)
+            .expect("the port lowers the claims")
+            .with_backend(
+                ply_cli::commands::common::prover_backend(None, &loaded)
+                    .expect("the program compiles to a tier"),
+            );
         let results = collected
             .obligations
             .into_iter()
@@ -312,11 +313,12 @@ fn nothing_proved_here_is_refutable_by_sampling() {
         let loaded = load(dir.path()).expect("the fixture compiles");
         let hashes = loaded.hashes.clone();
         let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
-        let tree = loaded.tree().expect("the front ends agree");
-        let prover = Prover::new(&tree.program, &tree.resolved, &loaded.check).with_backend(
-            ply_cli::commands::common::prover_backend(None, &loaded)
-                .expect("the program compiles to a tier"),
-        );
+        let prover = Prover::new(&loaded)
+            .expect("the port lowers the claims")
+            .with_backend(
+                ply_cli::commands::common::prover_backend(None, &loaded)
+                    .expect("the program compiles to a tier"),
+            );
         for obligation in &collected.obligations {
             if prover
                 .discharge_with(obligation, &ProvePlan::default())
@@ -625,11 +627,12 @@ law \"a divisor is a function\" forall (a: Int, b: Int) { a / b == a / b }
     let hashes = loaded.hashes.clone();
     let laws = ply_test::obligation::Laws::of(&loaded.check, &hashes);
     let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
-    let tree = loaded.tree().expect("the front ends agree");
-    let prover = Prover::new(&tree.program, &tree.resolved, &loaded.check).with_backend(
-        ply_cli::commands::common::prover_backend(None, &loaded)
-            .expect("the program compiles to a tier"),
-    );
+    let prover = Prover::new(&loaded)
+        .expect("the port lowers the claims")
+        .with_backend(
+            ply_cli::commands::common::prover_backend(None, &loaded)
+                .expect("the program compiles to a tier"),
+        );
     let results: Vec<(Obligation, Discharge)> = collected
         .obligations
         .into_iter()
