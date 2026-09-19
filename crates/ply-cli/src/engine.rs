@@ -13,8 +13,6 @@ use ply_prove::{
     ProvePlan, Rule, Vacuity, VacuityKind,
 };
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
-use ply_syntax::ast::Program;
-use ply_syntax::resolve::Resolved;
 use ply_ty::{CheckOutput, DefInfo, Front, LawBinder, LawInfo, Literal, SpecKind};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -106,8 +104,6 @@ impl<'s> Claim<'s> {
 }
 
 pub struct Prover<'a> {
-    program: &'a Program,
-    resolved: &'a Resolved,
     check: &'a CheckOutput,
     front: &'a Front,
     world: TypeWorld,
@@ -118,8 +114,6 @@ pub struct Prover<'a> {
     hosting: Option<Hosting<'a>>,
     /// A compiled unit holding the laws' and clauses' roots, where those propositions are entered.
     backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
-    /// Whole-program, so computed once like `ctx`.
-    region_kinds: ply_eval::region_kind::Kinds,
 }
 
 /// The binding and the reactor a `law/host` runs against.
@@ -131,7 +125,6 @@ pub struct Hosting<'a> {
 impl<'a> Prover<'a> {
     pub fn new(loaded: &'a Loaded) -> Result<Prover<'a>, LoadError> {
         let check = &loaded.check;
-        let tree = loaded.tree().map_err(|d| loaded.refused(d))?;
         let mut laws = HashMap::new();
         let mut ordinals: HashMap<&Symbol, usize> = HashMap::new();
         for law in &check.laws {
@@ -140,8 +133,6 @@ impl<'a> Prover<'a> {
             *ordinal += 1;
         }
         Ok(Prover {
-            program: &tree.program,
-            resolved: &tree.resolved,
             check,
             front: &loaded.front,
             world: TypeWorld::new(check.ctors.values()),
@@ -149,7 +140,6 @@ impl<'a> Prover<'a> {
             laws,
             hosting: None,
             backend: None,
-            region_kinds: ply_eval::region_kind::Kinds::default(),
         })
     }
 
@@ -249,9 +239,7 @@ impl<'a> Prover<'a> {
     }
 
     fn machine(&self) -> Machine<'a> {
-        let mut machine =
-            Machine::new(self.program, self.resolved, self.check).with_max_calls(DEFAULT_MAX_CALLS);
-        machine.share_region_kinds(ply_eval::region_kind::Kinds::clone(&self.region_kinds));
+        let mut machine = Machine::new(self.front).with_max_calls(DEFAULT_MAX_CALLS);
         // An owner is called through the machine to produce `result`, so the machine must hold the
         // tier its propositions are entered on, or that call declines with no body.
         if let Some((provider, spec)) = self.backend.as_ref() {

@@ -296,42 +296,6 @@ fn the_two_allocation_harnesses_are_one_measurement_read_at_two_windows() {
         );
     }
 
-    // A whole-program analysis: a per-site row understates it by splitting one pass across its recursion depths.
-    println!("\n== the hoist candidate, over every site its frames appear in");
-    println!(
-        "  {:>9} {:>10} {:>9} {:>9}  family",
-        "per req", "per Machine", "at n=20", "at n=200"
-    );
-    let (slope, intercept) = fit(HOIST, &small, &large);
-    println!(
-        "  {slope:>9.1} {intercept:>10.0} {:>8.1}% {:>8.1}%  {HOIST}",
-        100.0 * family_count(HOIST, &small) / small.total as f64,
-        100.0 * family_count(HOIST, &large) / large.total as f64,
-    );
-
-    let routing = loaded
-        .full("w6_bench")
-        .expect("the driver declares w6_bench");
-    let iterate = |n: usize| {
-        loaded
-            .pure_call(&routing, vec![Value::Int(3), Value::Int(n as i64)], 1)
-            .expect("the driver runs")
-    };
-    iterate(4);
-    let small_routing = capture(SMALL, || iterate(SMALL));
-    let large_routing = capture(LARGE, || iterate(LARGE));
-    println!(
-        "\n== the same family on the routing rung, a second path\n  \
-         {:>4} iterations: {:>9.1} allocations each\n  \
-         {:>4} iterations: {:>9.1} allocations each",
-        SMALL,
-        small_routing.per_request(),
-        LARGE,
-        large_routing.per_request()
-    );
-    let (slope, intercept) = fit(HOIST, &small_routing, &large_routing);
-    println!("  {slope:>9.1} per iteration {intercept:>10.0} per Machine  {HOIST}");
-
     for window in [&small, &large] {
         let counted = w6_alloc(&counter, window.requests);
         let spread = (window.per_request() - counted).abs() / counted;
@@ -360,27 +324,6 @@ fn the_two_allocation_harnesses_are_one_measurement_read_at_two_windows() {
         "the largest per-request site is `{top}`, not a Ply frame: the build's symbols did not \
          resolve and the ranking names nothing"
     );
-}
-
-const HOIST: &str = "ply_eval::region_kind";
-
-fn family_count(family: &str, window: &Window) -> f64 {
-    window
-        .sites
-        .iter()
-        .filter(|(site, _)| site.contains(family))
-        .map(|(_, v)| v.0 as f64)
-        .sum()
-}
-
-/// A family's per-iteration slope and its per-`Machine` intercept, from the two windows.
-fn fit(family: &str, small: &Window, large: &Window) -> (f64, f64) {
-    let slope = (family_count(family, large) - family_count(family, small))
-        / (large.requests - small.requests) as f64;
-    (
-        slope,
-        family_count(family, small) - slope * small.requests as f64,
-    )
 }
 
 /// The counting binary beside this test binary — `target/<profile>/w6-alloc` against

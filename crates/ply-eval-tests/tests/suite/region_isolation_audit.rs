@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 
 impl Compiled {
     fn footprint(&self, name: &str) -> &Footprint {
-        &self.check.tests[self.index_of(name)].footprint
+        &self.front.check.tests[self.index_of(name)].footprint
     }
 }
 

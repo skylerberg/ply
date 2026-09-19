@@ -60,9 +60,9 @@ fn a_handler_discharges_an_effect_declared_in_another_module() {
              }\n",
         ),
     ]);
-    assert_eq!(compiled.check.tests.len(), 1);
+    assert_eq!(compiled.front.check.tests.len(), 1);
     assert_eq!(
-        compiled.check.tests[0].key.as_str(),
+        compiled.front.check.tests[0].key.as_str(),
         "app.the imported effect is handled here"
     );
     compiled

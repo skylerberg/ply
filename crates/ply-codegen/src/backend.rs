@@ -5,7 +5,7 @@ use crate::source::Source;
 use anyhow::{Context, Result, bail};
 use ply_eval::{Compilation, Counters, Entered, Policed, Provider, Value};
 use ply_span::{Diagnostic, Symbol};
-use ply_syntax::ast::Program;
+use ply_ty::DefHash;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
@@ -46,8 +46,8 @@ impl Declines {
 
 /// One run's compiled unit, shared by every worker's backend.
 pub struct Unit {
-    /// The address of the `Program` the machine is running, for `Compiled::describes`.
-    origin: usize,
+    /// [`ply_ty::HashOutput::digest`] of the program this was built over, for `Compiled::describes`.
+    identity: DefHash,
     source: &'static Source,
     /// The set the emitter compiles as one unit, closed under calls.
     compiled: Vec<String>,
@@ -67,37 +67,14 @@ pub struct Unit {
 }
 
 impl Unit {
-    /// [`Unit::over_front`] over the front end's answer for `texts`.
-    pub fn over_with_texts(
-        program: &Program,
-        texts: HashMap<String, String>,
-    ) -> Result<&'static Unit> {
-        let sources = program
-            .modules
-            .iter()
-            .map(|m| -> Result<(String, String)> {
-                let name = m.name.to_string();
-                let text = texts
-                    .get(&name)
-                    .with_context(|| format!("no source text for module `{name}`"))?;
-                Ok((name, text.clone()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let ids: Vec<ply_span::SourceId> = program.modules.iter().map(|m| m.source).collect();
-        let front = crate::c::producer::checked_front(&sources, &ids)
-            .context("the front end's answer over this program")?;
-        Unit::over_front(program, &front, texts)
-    }
-
-    /// [`Unit::over_with_texts`] over a front end's answer the caller already has.
+    /// `texts` is each module's source by name, which the cache keys cover.
     pub fn over_front(
-        program: &Program,
         front: &ply_ty::Front,
         texts: HashMap<String, String>,
     ) -> Result<&'static Unit> {
+        let identity = front.hashes.digest();
         let front: &'static ply_ty::Front = Box::leak(Box::new(front.clone()));
         let keys = crate::source::emit_keys(front);
-        let origin = std::ptr::from_ref(program) as usize;
         let source: &'static Source =
             Box::leak(Box::new(Source::from_front(front, keys).with_texts(texts)));
         let candidates = source.functions();
@@ -111,7 +88,7 @@ impl Unit {
             .collect();
         let analysis_nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let unit = Unit {
-            origin,
+            identity,
             source,
             compiled,
             members,
@@ -127,15 +104,12 @@ impl Unit {
     }
 
     /// An artifact's unit, produced elsewhere; loaded once here to read its table.
-    pub fn embedded(
-        program: &Program,
-        resolved: &ply_syntax::resolve::Resolved,
-        check: &ply_ty::CheckOutput,
-        text: String,
-    ) -> Result<&'static Unit> {
+    pub fn embedded(front: &ply_ty::Front, text: String) -> Result<&'static Unit> {
         let exports = crate::c::Exports::read(&crate::c::compile_and_load(&text, "artifact")?)?;
-        let origin = std::ptr::from_ref(program) as usize;
-        let source: &'static Source = Box::leak(Box::new(Source::new(program, resolved, check)));
+        let identity = front.hashes.digest();
+        let front: &'static ply_ty::Front = Box::leak(Box::new(front.clone()));
+        let source: &'static Source =
+            Box::leak(Box::new(Source::from_front(front, HashMap::new())));
         let compiled = exports.names();
         let members: BTreeSet<Symbol> = compiled
             .iter()
@@ -143,7 +117,7 @@ impl Unit {
             .map(Symbol::new)
             .collect();
         let unit = Unit {
-            origin,
+            identity,
             source,
             compiled,
             members,
@@ -263,8 +237,8 @@ struct Absent {
 }
 
 impl ply_eval::Compiled for Absent {
-    fn describes(&self, program: &Program) -> bool {
-        self.unit.origin == std::ptr::from_ref(program) as usize
+    fn describes(&self, program: DefHash) -> bool {
+        self.unit.identity == program
     }
 
     fn enter(&self, _name: &Symbol, args: &[Value], _budget: usize) -> Option<Value> {
@@ -526,8 +500,8 @@ impl Run {
 }
 
 impl ply_eval::Compiled for Bodies {
-    fn describes(&self, program: &Program) -> bool {
-        self.unit.origin == std::ptr::from_ref(program) as usize
+    fn describes(&self, program: DefHash) -> bool {
+        self.unit.identity == program
     }
 
     fn enter(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value> {

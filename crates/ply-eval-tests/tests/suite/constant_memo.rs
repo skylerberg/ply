@@ -36,7 +36,7 @@ pub fn probe_over_declared(n: Int) -> Int / {store.read} =
 "#;
 
 fn probe(c: &Compiled, name: &str) -> Result<Value, ply_span::Diagnostic> {
-    let mut machine = Machine::new(&c.program, &c.resolved, &c.check).with_max_calls(BUDGET);
+    let mut machine = Machine::new(&c.front).with_max_calls(BUDGET);
     machine.call(name, vec![Value::Int(400)], Span::DUMMY)
 }
 

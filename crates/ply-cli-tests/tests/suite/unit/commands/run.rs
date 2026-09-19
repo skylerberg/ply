@@ -25,7 +25,7 @@ fn attach_tier(machine: &mut Machine<'_>, loaded: &Loaded) -> Result<(), Diagnos
         return Ok(());
     };
     let texts = module_texts(&loaded.check, &loaded.sources);
-    let provider = build_backend_over(&spec, &loaded.tree()?.program, &loaded.front, texts)?;
+    let provider = build_backend_over(&spec, &loaded.front, texts)?;
     machine.set_compiled(provider.attach(&spec));
     Ok(())
 }
@@ -33,8 +33,7 @@ fn attach_tier(machine: &mut Machine<'_>, loaded: &Loaded) -> Result<(), Diagnos
 fn eval(l: &Loaded) -> Result<String, Diagnostic> {
     let entry = entry_point(l)?;
     let (name, span) = (entry.name.clone(), entry.span);
-    let tree = l.tree()?;
-    let mut machine = Machine::new(&tree.program, &tree.resolved, &l.check);
+    let mut machine = Machine::new(&l.front);
     attach_tier(&mut machine, l)?;
     machine
         .call(name.as_str(), Vec::new(), span)

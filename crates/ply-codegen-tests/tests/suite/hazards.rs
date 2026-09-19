@@ -1,7 +1,7 @@
 use ply_codegen::Unit;
 use ply_eval::{Machine, Value};
 use ply_span::{Span, Symbol};
-use ply_syntax::ast::{ModuleName, Program};
+use ply_syntax::ast::ModuleName;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -13,9 +13,7 @@ fn fixtures() -> PathBuf {
 }
 
 pub struct Loaded {
-    pub program: &'static Program,
-    pub resolved: &'static ply_syntax::resolve::Resolved,
-    pub check: &'static ply_ty::CheckOutput,
+    pub front: ply_ty::Front,
     /// Each module's text by name: what the Ply emitter re-parses to produce.
     pub texts: HashMap<String, String>,
 }
@@ -55,22 +53,12 @@ fn load(dir: &Path) -> Result<Loaded, Vec<ply_span::Diagnostic>> {
         .map(|(_, module, text)| (module.to_string(), (*text).to_string()))
         .collect();
     let ids: Vec<_> = inputs.iter().map(|(id, _, _)| *id).collect();
-    let mut ast = ply_syntax::parse_program(inputs).map_err(|d| d.to_vec())?;
-    let expanded = ply_derive::expand_program(&mut ast);
-    assert!(expanded.is_empty(), "{expanded:?}");
-    let resolved = ply_syntax::resolve::resolve(&mut ast).map_err(|d| d.to_vec())?;
     ply_codegen::c::producer::ensure_default();
     let front = ply_codegen::c::producer::front(&named, &ids).expect("the port answers");
     if front.has_error() {
         return Err(front.diagnostics);
     }
-    let check = front.check;
-    Ok(Loaded {
-        program: Box::leak(Box::new(ast)),
-        resolved: Box::leak(Box::new(resolved)),
-        check: Box::leak(Box::new(check)),
-        texts,
-    })
+    Ok(Loaded { front, texts })
 }
 
 fn hazards() -> &'static Loaded {
@@ -86,10 +74,10 @@ struct Harness {
 }
 
 fn harness(loaded: &'static Loaded) -> Harness {
-    let unit: &'static Unit = Unit::over_with_texts(loaded.program, loaded.texts.clone())
-        .expect("this host has a C compiler");
+    let unit: &'static Unit =
+        Unit::over_front(&loaded.front, loaded.texts.clone()).expect("this host has a C compiler");
     let bodies = unit.bodies().expect("the unit builds");
-    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
+    let mut machine = Machine::new(&loaded.front);
     machine.set_compiled(bodies.clone());
     Harness {
         unit,

@@ -93,20 +93,12 @@ pub struct Front {
     /// The port's whole answer; `check` and `hashes` above are taken from it.
     pub port: ply_ty::Front,
     pub timings: Timings,
-    region_kinds: ply_eval::region_kind::Kinds,
 }
 
 impl Front {
     /// A machine over the program with the default tier attached.
     pub fn machine(&self) -> ply_eval::Machine<'_> {
-        let mut machine =
-            crate::tier_machine(&self.program, &self.resolved, &self.port, &self.sources);
-        machine.share_region_kinds(self.shared_region_kinds());
-        machine
-    }
-
-    pub fn shared_region_kinds(&self) -> ply_eval::region_kind::Kinds {
-        ply_eval::region_kind::Kinds::clone(&self.region_kinds)
+        crate::tier_machine(&self.port, &self.sources)
     }
 }
 
@@ -171,7 +163,6 @@ pub fn front(root: &Path) -> Result<Front> {
         hashes: port.hashes.clone(),
         port,
         timings,
-        region_kinds: ply_eval::region_kind::Kinds::default(),
     })
 }
 
