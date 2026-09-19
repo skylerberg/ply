@@ -149,6 +149,12 @@ fn the_footprints_the_checker_infers_are_the_ones_stated() {
 }
 
 #[test]
+fn the_call_bound_counts_nesting_calls_only_on_both_engines() {
+    check("recursion_raise", false);
+    check("recursion_raise", true);
+}
+
+#[test]
 fn the_numeric_raises_are_the_same_on_both_engines() {
     check("numbers_raise", false);
     check("numbers_raise", true);
