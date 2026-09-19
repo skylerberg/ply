@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use ply_eval::{Fields, Value};
 use ply_span::frames::Cursor;
 use ply_span::{Severity, SourceId, Symbol};
-use ply_ty::{Front, read_front};
+use ply_ty::{Front, Scheme, parse_scheme, read_front};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -501,6 +501,40 @@ const CLAIMS: &str = "front.claims_dump";
 /// Every body, clause and law of a program [`front`] already checked, lowered.
 pub fn claims_dump(sources: &[(String, String)]) -> Result<String> {
     dump_over(CLAIMS, sources)
+}
+
+const BUILTINS: &str = "front.builtins_dump";
+
+/// Every builtin's scheme as the port's checker binds it, in the prelude's order.
+pub fn builtins() -> Result<Vec<(Symbol, Scheme)>> {
+    let answer = call(BUILTINS, &[])?;
+    let Value::Str(dump) = &answer else {
+        bail!(
+            "`{BUILTINS}` answered a {} rather than a string",
+            answer.type_name()
+        );
+    };
+    let mut frames = Cursor::new(dump.as_bytes(), "frame");
+    let mut out = Vec::new();
+    while !frames.done() {
+        let (words, payload) = frames
+            .unit()
+            .map_err(|e| anyhow!("`{BUILTINS}`'s answer: {e}"))?;
+        let ["builtin", name] = words[..] else {
+            bail!("`{BUILTINS}` framed a `{}`", words.join(" "));
+        };
+        let mut fields = Cursor::new(payload, "field");
+        let (key, text) = fields
+            .unit()
+            .map_err(|e| anyhow!("`{name}`'s frame: {e}"))?;
+        if key != ["scheme"] || !fields.done() {
+            bail!("`{name}`'s frame is not one `scheme` field");
+        }
+        let text = std::str::from_utf8(text).context("a builtin's scheme")?;
+        let scheme = parse_scheme(text).map_err(|e| anyhow!("`{name}`'s scheme `{text}`: {e}"))?;
+        out.push((Symbol::new(name), scheme));
+    }
+    Ok(out)
 }
 
 fn dump_over(entry: &str, sources: &[(String, String)]) -> Result<String> {
