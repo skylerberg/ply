@@ -501,10 +501,13 @@ A clause is `effect.op[resource](params) -> body`; an optional
 minus the handled atoms plus every clause's row. A handler discharges an
 **atom**: `recv`, `send` and `close` are all `net.write[conn]`. The body must
 not perform an operation on a handled atom that no clause answers (`E0305`,
-naming the clause to add). The checker follows performs in the body and in
-every named function it calls; an operation reached through a function value
-(a parameter, a field) is not judged, and at run time runs past the `handle`
-to the next handler or the host.
+naming the clause to add), unless the enclosing function's written row keeps
+that atom: then the operation is forwarded to the caller's handler, as
+`std.db`'s `transaction` forwards `begin` and `commit` while answering
+`rollback`. The checker follows performs in the body and in every named
+function it calls; an operation inside a lambda, or reached through a
+function value, is not judged, and at run time runs past the `handle` to the
+next handler or the host.
 
 ### 6.6 `resume`
 
