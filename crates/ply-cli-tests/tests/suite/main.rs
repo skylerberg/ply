@@ -30,6 +30,7 @@ mod refcount_counters;
 mod regressions;
 mod routing_audit;
 mod stdlib;
+mod surface;
 mod text;
 mod tiers;
 mod tls_cli;
