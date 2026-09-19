@@ -54,6 +54,7 @@ fn the_shrink_budget_does_not_move_a_key() {
     let narrow = ProvePlan::default();
     let looser = ProvePlan {
         shrink_budget: narrow.shrink_budget * 4,
+        time_budget_ms: ply_prove::DEFAULT_TIME_BUDGET_MS,
         ..narrow.clone()
     };
     assert_eq!(prove_key(key(), &narrow), prove_key(key(), &looser));
