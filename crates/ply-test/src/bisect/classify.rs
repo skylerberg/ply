@@ -1,6 +1,6 @@
 //! The judgements delta construction cannot make from hashes alone.
 
-use super::{Baseline, DefKey, EraTable, Ns, Renormalizer};
+use super::{DefKey, Ns, Rehashed};
 use ply_hash::DefHash;
 use ply_span::Symbol;
 use ply_store::{Store, canonicalize_scheme};
@@ -30,40 +30,29 @@ pub trait Classify {
 }
 
 pub struct StoreClassify<'a> {
-    renormalizer: &'a Renormalizer<'a>,
-    /// The baseline era's hash for every node, resolved once.
-    table: EraTable,
+    /// The current program against the baseline's table.
+    rehashed: Rehashed,
     store: &'a Store,
     check: &'a CheckOutput,
 }
 
 impl<'a> StoreClassify<'a> {
-    pub fn new(
-        renormalizer: &'a Renormalizer<'a>,
-        baseline: &'a Baseline,
-        store: &'a Store,
-        check: &'a CheckOutput,
-    ) -> StoreClassify<'a> {
+    pub fn new(rehashed: Rehashed, store: &'a Store, check: &'a CheckOutput) -> StoreClassify<'a> {
         StoreClassify {
-            table: renormalizer.era_table(&|key: &DefKey| baseline.hash_of(key)),
-            renormalizer,
+            rehashed,
             store,
             check,
         }
-    }
-
-    pub fn table(&self) -> &EraTable {
-        &self.table
     }
 }
 
 impl Classify for StoreClassify<'_> {
     fn renormalized(&mut self, key: &DefKey) -> Option<DefHash> {
-        self.renormalizer.rehash(key, &self.table)
+        self.rehashed.rehash(key)
     }
 
     fn renormalized_test(&mut self, key: &Symbol) -> Option<DefHash> {
-        self.renormalizer.rehash_test(key, &self.table)
+        self.rehashed.rehash_test(key)
     }
 
     /// Only a `fn` is compared.
@@ -80,11 +69,11 @@ impl Classify for StoreClassify<'_> {
     }
 
     fn component(&mut self, key: &DefKey) -> Vec<DefKey> {
-        self.renormalizer.component_of(key)
+        self.rehashed.component_of(key)
     }
 
     fn baseline_image(&mut self) -> BTreeSet<DefHash> {
-        self.table.image()
+        self.rehashed.image()
     }
 }
 

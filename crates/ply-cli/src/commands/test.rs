@@ -260,14 +260,13 @@ fn iterate(
 
     // After the run, since a pass recorded now is a valid baseline for another test's failure;
     // over the program that ran, since a run-only module's tests are absent from the checked one.
-    warnings.extend(ply_test::diagnose_failures(
+    ply_test::diagnose_failures(
         &mut report,
-        run_program,
-        run_resolved,
+        &loaded.texts(),
         &loaded.front,
         &mut cache.store,
         &diagnosis_options(args),
-    ));
+    );
     // Pass records are read lazily, so an unreadable baseline only surfaces here.
     warnings.extend(cache.store.take_warnings());
     let warnings = once_each(warnings);

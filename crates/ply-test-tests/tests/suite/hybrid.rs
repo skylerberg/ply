@@ -6,8 +6,8 @@ use ply_store::{CachedDef, Outcome, PassRecord, Store};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::Resolved;
 use ply_test::bisect::{
-    Baseline, Budget, Confidence, DepEdges, Regression, Renormalizer, Skipped, StoreClassify,
-    Verdict, bisect, diff,
+    Baseline, Budget, Confidence, DepEdges, Regression, Rehashed, Skipped, StoreClassify, Verdict,
+    bisect, diff,
 };
 use ply_test::{BodyHybrid, Signature, hybrid};
 use ply_ty::CheckOutput;
@@ -59,6 +59,10 @@ impl Compiled {
             self.hashes.clone(),
             Some(&self.bodies),
         )
+    }
+
+    fn sources(&self) -> Vec<(String, String)> {
+        self.texts.clone().into_iter().collect()
     }
 
     fn test_index(&self, key: &str) -> usize {
@@ -156,11 +160,9 @@ fn passed(before: &Compiled, key: &str) -> (TempRoot, Store) {
 fn narrow(before: &Compiled, after: &Compiled, key: &str) -> ply_test::Bisection {
     let (_root, store) = passed(before, key);
     let baseline = before.baseline(key);
-    let test_keys: Vec<Symbol> = after.check.tests.iter().map(|t| t.key.clone()).collect();
-    let renormalizer =
-        Renormalizer::new(&after.program, &after.resolved, &after.hashes, &test_keys)
-            .expect("index the program");
-    let mut classify = StoreClassify::new(&renormalizer, &baseline, &store, &after.check);
+    let rehashed = Rehashed::under(&after.sources(), &baseline)
+        .unwrap_or_else(|e| panic!("the port re-hashes a checked program: {e}"));
+    let mut classify = StoreClassify::new(rehashed, &store, &after.check);
 
     let key = sym(key);
     let regression = Regression {
@@ -410,8 +412,7 @@ test "doubles" { assert_eq(scale(2) + other(0), 5) }
     let (_root, mut store) = passed(&before, "m.doubles");
     ply_test::diagnose_failures(
         &mut report,
-        &after.program,
-        &after.resolved,
+        &after.sources(),
         &after.front(),
         &mut store,
         &ply_test::Options::default(),

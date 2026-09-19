@@ -1,14 +1,13 @@
-//! Definition bodies: the third element of `Hash -> (Definition, Type, Footprint)`.
+//! Definition bodies: the third element of `Hash -> (Definition, Type, Footprint)`, and the port
+//! printing them back to source.
 
-use crate::fixture::port_check;
-use indexmap::IndexMap;
-use ply_hash::body::{BodySet, ItemKind, reconstruct};
-use ply_hash::{DefHash, HashOutput, hash_program_with_bodies};
-use ply_span::{SourceId, Symbol, codes};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::Resolved;
+use crate::fixture::port_front;
+use ply_codegen::c::producer::print_bodies;
+use ply_hash::body::{BodySet, StoredBody};
+use ply_hash::{DefHash, HashOutput};
+use ply_span::{Diagnostic, Symbol, codes};
 use ply_ty::CheckOutput;
-use ply_ty::{EffectAtom, Footprint, Row, RowVar, Scheme, TyVar, Type};
+use ply_ty::{Row, RowVar, Scheme, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet};
 
 struct Checked {
@@ -17,137 +16,35 @@ struct Checked {
     bodies: BodySet,
 }
 
-fn parse(files: &[(&str, &str)]) -> (Program, Resolved) {
-    let inputs = files
-        .iter()
-        .enumerate()
-        .map(|(i, (name, source))| (SourceId(i as u32), ModuleName::from_dotted(name), *source));
-    let mut program = match ply_syntax::parse_program(inputs) {
-        Ok(program) => program,
-        Err(diags) => panic!("program did not parse: {diags:#?}"),
-    };
-    let diags = ply_derive::expand_program(&mut program);
-    if !diags.is_empty() {
-        panic!("program did not expand: {diags:#?}");
-    }
-    let resolved = match ply_syntax::resolve(&mut program) {
-        Ok(resolved) => resolved,
-        Err(diags) => panic!("program did not resolve: {diags:#?}"),
-    };
-    (program, resolved)
-}
-
 fn compile(files: &[(&str, &str)]) -> Checked {
-    let (program, resolved) = parse(files);
-    let check = port_check(files);
-    let (hashes, bodies) =
-        hash_program_with_bodies(&program, &resolved).expect("program should hash");
+    let front = port_front(files);
     Checked {
-        hashes,
-        check,
-        bodies,
+        bodies: ply_hash::body::of_front(&front),
+        hashes: front.hashes,
+        check: front.check,
     }
 }
 
-/// A reconstructed program has no text, so the port checks it printed back to source.
-fn check_printed(program: &Program) -> CheckOutput {
-    let texts = ply_syntax::print::program(program);
-    let files: Vec<(&str, &str)> = texts
-        .iter()
-        .map(|(name, text)| (name.as_str(), text.as_str()))
-        .collect();
-    port_check(&files)
-}
-
-/// Reconstructs, then checks and re-hashes what came back.
-fn rebuild(original: &Checked) -> (Checked, IndexMap<DefHash, Symbol>) {
-    let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
-    let resolved = match ply_syntax::resolve(&mut rebuilt.program) {
-        Ok(resolved) => resolved,
-        Err(diags) => panic!("reconstructed program did not resolve: {diags:#?}"),
-    };
-    let check = check_printed(&rebuilt.program);
-    let (hashes, bodies) =
-        hash_program_with_bodies(&rebuilt.program, &resolved).expect("rebuilt program should hash");
-
-    for (hash, name) in &rebuilt.names {
-        let again = hashes
-            .defs
-            .get(name)
-            .or_else(|| hashes.decls.get(name))
-            .unwrap_or_else(|| panic!("`{name}` is missing from the rebuilt program"));
-        assert_eq!(
-            again, hash,
-            "`{name}` was rebuilt from {hash} and hashes to {again}"
-        );
-    }
-    assert_eq!(
-        hashes.tests, original.hashes.tests,
-        "rebuilt tests hash differently"
-    );
-
-    (
-        Checked {
-            hashes,
-            check,
-            bodies,
-        },
-        rebuilt.names,
-    )
-}
-
-/// Original program-wide name -> the name the reconstruction invented for it.
-fn translation(original: &Checked, names: &IndexMap<DefHash, Symbol>) -> BTreeMap<Symbol, Symbol> {
-    original
+fn names_of(checked: &Checked) -> Vec<(Symbol, DefHash)> {
+    checked
         .hashes
         .defs
         .iter()
-        .chain(original.hashes.decls.iter())
-        .filter_map(|(name, hash)| names.get(hash).map(|to| (name.clone(), to.clone())))
+        .chain(checked.hashes.decls.iter())
+        .map(|(name, hash)| (name.clone(), *hash))
         .collect()
 }
 
-fn rename_type(ty: &Type, map: &BTreeMap<Symbol, Symbol>) -> Type {
-    match ty {
-        Type::Var(v) => Type::Var(*v),
-        Type::Con(name, args) => Type::Con(
-            map.get(name).cloned().unwrap_or_else(|| name.clone()),
-            args.iter().map(|a| rename_type(a, map)).collect(),
-        ),
-        Type::Fn {
-            params,
-            ret,
-            effects,
-        } => Type::Fn {
-            params: params.iter().map(|p| rename_type(p, map)).collect(),
-            ret: Box::new(rename_type(ret, map)),
-            effects: Row {
-                atoms: effects.atoms.iter().map(|a| rename_atom(a, map)).collect(),
-                tail: effects.tail,
-            },
-        },
-        Type::Record(fields) => Type::Record(
-            fields
-                .iter()
-                .map(|(k, v)| (k.clone(), rename_type(v, map)))
-                .collect(),
-        ),
-    }
-}
-
-fn rename_atom(atom: &EffectAtom, map: &BTreeMap<Symbol, Symbol>) -> EffectAtom {
-    EffectAtom {
-        effect: map
-            .get(&atom.effect)
-            .cloned()
-            .unwrap_or_else(|| atom.effect.clone()),
-        resource: atom.resource.clone(),
-        mode: atom.mode,
-    }
-}
-
-fn rename_footprint(f: &Footprint, map: &BTreeMap<Symbol, Symbol>) -> Footprint {
-    Footprint(f.0.iter().map(|a| rename_atom(a, map)).collect())
+/// Every body under `names`, and every test.
+fn print(
+    bodies: &BodySet,
+    names: &[(Symbol, DefHash)],
+    shipped: &[&str],
+) -> Result<Vec<(String, String)>, Diagnostic> {
+    let bytes: Vec<&[u8]> = bodies.defs().map(|(_, body)| body.as_bytes()).collect();
+    let tests: Vec<&[u8]> = bodies.tests().iter().map(StoredBody::as_bytes).collect();
+    let names: Vec<(&str, DefHash)> = names.iter().map(|(n, h)| (n.as_str(), *h)).collect();
+    print_bodies(&bytes, &names, &tests, &[], shipped)
 }
 
 /// Quantified variables renumbered from zero in traversal order.
@@ -215,49 +112,69 @@ fn renumber(
     }
 }
 
-fn assert_interfaces_survive(files: &[(&str, &str)]) -> Checked {
+/// Printed under its own names and checked again: every name, test and interface comes back.
+#[track_caller]
+fn round_trip(files: &[(&str, &str)]) -> (Checked, Vec<(String, String)>) {
     let original = compile(files);
-    let (rebuilt, names) = rebuild(&original);
-    let map = translation(&original, &names);
-    assert!(
-        !map.is_empty(),
-        "nothing was reconstructed, so nothing was proved"
+    let names = names_of(&original);
+    let printed = print(&original.bodies, &names, &[])
+        .unwrap_or_else(|d| panic!("the names say everything: {d:#?}"));
+    let borrowed: Vec<(&str, &str)> = printed
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect();
+    let again = compile(&borrowed);
+    for (name, hash) in &names {
+        let now = again
+            .hashes
+            .defs
+            .get(name)
+            .or_else(|| again.hashes.decls.get(name))
+            .unwrap_or_else(|| panic!("`{name}` did not come back"));
+        assert_eq!(now, hash, "`{name}` came back as a different definition");
+    }
+    let wanted: BTreeSet<&Symbol> = names.iter().map(|(name, _)| name).collect();
+    let rebuilt: BTreeSet<&Symbol> = again
+        .hashes
+        .defs
+        .keys()
+        .chain(again.hashes.decls.keys())
+        .collect();
+    assert_eq!(rebuilt, wanted, "a name was invented or dropped");
+    assert_eq!(
+        again.hashes.tests, original.hashes.tests,
+        "a test came back as another"
     );
 
     for (name, info) in &original.check.defs {
-        let Some(to) = map.get(name) else { continue };
-        let after = rebuilt
-            .check
-            .defs
-            .get(to)
-            .unwrap_or_else(|| panic!("`{name}` came back as `{to}`, which did not check"));
+        let after = &again.check.defs[name];
         assert_eq!(
-            canonical(&Scheme {
-                ty_vars: info.scheme.ty_vars.clone(),
-                row_vars: info.scheme.row_vars.clone(),
-                ty: rename_type(&info.scheme.ty, &map),
-            }),
+            canonical(&info.scheme),
             canonical(&after.scheme),
             "`{name}` came back with a different type"
         );
         assert_eq!(
-            rename_footprint(&info.footprint, &map),
-            after.footprint,
+            info.footprint, after.footprint,
             "`{name}` came back with a different footprint"
         );
     }
-
-    for (index, test) in original.check.tests.iter().enumerate() {
-        let after = &rebuilt.check.tests[index];
+    for (before, after) in original.check.tests.iter().zip(&again.check.tests) {
         assert_eq!(
-            rename_footprint(&test.footprint, &map),
-            after.footprint,
+            before.footprint, after.footprint,
             "test `{}` came back with a different footprint",
-            test.key
+            before.key
         );
-        assert_eq!(test.nondet, after.nondet);
+        assert_eq!(before.nondet, after.nondet);
     }
-    original
+    (original, printed)
+}
+
+fn text_of<'a>(printed: &'a [(String, String)], module: &str) -> &'a str {
+    &printed
+        .iter()
+        .find(|(name, _)| name == module)
+        .unwrap_or_else(|| panic!("`{module}` was not printed"))
+        .1
 }
 
 const EVERY_ITEM_KIND: &str = r#"
@@ -329,80 +246,66 @@ test/nondet "the clock is not deterministic" {
 "#;
 
 const EVERY_OPERATOR: &str = r#"
-fn arithmetic(a, b) = a + b - a * b / a % b
-fn comparison(a, b) = (a == b) && (a != b) || (a < b) && (a <= b) || (a > b) && (a >= b)
-fn concatenation(a, b) = a ++ b
-fn bits(a, b) = a & b | a ^ b
-fn shifts(a, b) = (a << b) + (a >> b) + (a >>> b)
-fn prefixes(a, p) = -a + ~a + (if !p { 1 } else { 0 })
+pub fn arithmetic(a: Int, b: Int) -> Int = a + b - a * b / a % b
+pub fn comparison(a: Int, b: Int) -> Bool = (a == b) && (a != b) || (a < b) && (a <= b) || (a > b) && (a >= b)
+pub fn concatenation(a: String, b: String) -> String = a ++ b
+pub fn bits(a: Int, b: Int) -> Int = a & b | a ^ b
+pub fn shifts(a: Int, b: Int) -> Int = (a << b) + (a >> b) + (a >>> b)
+pub fn prefixes(a: Int, p: Bool) -> Int = -a + ~a + (if !p { 1 } else { 0 })
 "#;
 
-/// Deliberately does not typecheck: the byte table is under test, not the prelude.
 #[test]
-fn every_operator_survives_the_byte_table_and_its_inverse() {
-    let (program, resolved) = parse(&[("m", EVERY_OPERATOR)]);
-    let (before, bodies) =
-        hash_program_with_bodies(&program, &resolved).expect("program should hash");
-    assert_eq!(before.defs.len(), 6, "the sample lost a definition");
-
-    let mut rebuilt = reconstruct(&bodies).expect("bodies should reconstruct");
-    let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
-    let (after, _) =
-        hash_program_with_bodies(&rebuilt.program, &resolved).expect("it should hash again");
-
-    let keys = |out: &HashOutput| {
-        let mut v: Vec<DefHash> = out.defs.values().copied().collect();
-        v.sort();
-        v
-    };
+fn every_operator_survives_printing() {
+    let (original, _) = round_trip(&[("m", EVERY_OPERATOR)]);
     assert_eq!(
-        keys(&before),
-        keys(&after),
-        "a body carrying an operator did not survive the round trip"
+        original.hashes.defs.len(),
+        6,
+        "the sample lost a definition"
     );
 }
 
 #[test]
 fn every_item_kind_round_trips() {
-    let original = assert_interfaces_survive(&[("m", EVERY_ITEM_KIND)]);
-    let rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
-
-    let kinds: Vec<ItemKind> = [
-        "m.db",
-        "m.clock",
-        "m.Colour",
-        "m.Pair",
-        "m.Alias",
-        "m.identity",
-    ]
-    .iter()
-    .map(|name| {
-        let hash = original
-            .hashes
-            .defs
-            .get(&Symbol::new(*name))
-            .or_else(|| original.hashes.decls.get(&Symbol::new(*name)))
-            .unwrap_or_else(|| panic!("`{name}` was not hashed"));
-        rebuilt.kind_of(*hash).expect("a kind for every definition")
-    })
-    .collect();
-    assert_eq!(
-        kinds,
-        vec![
-            ItemKind::Effect,
-            ItemKind::Effect,
-            ItemKind::Type,
-            ItemKind::Type,
-            ItemKind::Type,
-            ItemKind::Fn,
-        ]
-    );
-    assert_eq!(rebuilt.test_keys.len(), 3);
+    let (_, printed) = round_trip(&[("m", EVERY_ITEM_KIND)]);
+    let m = text_of(&printed, "m");
+    for form in [
+        "pub effect db {",
+        "pub nondet effect clock {",
+        "pub type Colour = | Red | Green | Blue(Int) ",
+        "pub type Pair<_t0> = {left: _t0, right: _t0}",
+        "pub type Alias = Int",
+        "pub fn identity<_t0>(_l0: _t0) -> _t0 =",
+    ] {
+        assert!(m.contains(form), "`{form}` is not in:\n{m}");
+    }
+    let tests = text_of(&printed, "ply_tests");
+    assert!(tests.contains("test/nondet \"t2\""), "{tests}");
 }
 
 #[test]
-fn cross_module_references_resolve_after_reconstruction() {
-    assert_interfaces_survive(&[
+fn numeric_literals_and_regions_and_constraints_survive_printing() {
+    round_trip(&[(
+        "m",
+        r#"
+        pub fn neg_zero() -> Float = -0.0
+        pub fn zero() -> Float = 0.0
+        pub fn scaled() -> Decimal = 1.50m
+        pub fn tiny() -> Decimal = -0.000000000000000000000000001m
+        pub fn huge() -> Float = 1e300
+        pub fn tenth() -> Float = 0.1
+        pub fn total(a: Decimal, b: Decimal) -> Decimal = a + b * 2m
+        pub fn rate() -> Float = 1.5 / 0.0
+        pub fn narrow() -> U8 = 255u8
+        pub fn pattern() -> Int = 0xFFFFFFFFFFFFFFFF
+        pub fn shaped() -> Int = with_region[r] { with_cell[r](7) { c -> cell_get(c) } }
+        pub fn keep<a>(x: a) -> a where derivable(ord, a), derivable(eq, a) = x
+        "#,
+    )]);
+}
+
+#[test]
+fn cross_module_references_resolve_once_printed() {
+    round_trip(&[
         (
             "store",
             r#"
@@ -421,7 +324,7 @@ fn cross_module_references_resolve_after_reconstruction() {
             fn value(key: Int) -> Int / {store::db.read[users]} =
               match store::fetch(key) { store::Row(n) -> n }
 
-            test "a cross-module call is reconstructable" {
+            test "a cross-module call is printable" {
               handle {
                 assert_eq(value(1), 7)
               } with { store::db.get[users](k) -> 7 }
@@ -432,40 +335,33 @@ fn cross_module_references_resolve_after_reconstruction() {
 }
 
 #[test]
-fn self_recursion_round_trips() {
-    let original = assert_interfaces_survive(&[(
+fn a_self_recursive_definition_imports_nothing() {
+    let (original, printed) = round_trip(&[(
         "m",
         r#"
-        fn countdown(n: Int) -> Int = if n == 0 { 0 } else { countdown(n - 1) }
+        pub fn countdown(n: Int) -> Int = if n == 0 { 0 } else { countdown(n - 1) }
 
         test "self recursion" { assert_eq(countdown(4), 0) }
         "#,
     )]);
-
     let hash = original.hashes.defs[&Symbol::new("m.countdown")];
-    let body = original.bodies.get(hash).expect("a body for countdown");
-    assert!(body.verify(hash));
-
-    let rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
-    let module = rebuilt
-        .program
-        .modules
-        .iter()
-        .find(|m| m.items.len() == 1)
-        .expect("one module for the component");
-    assert!(module.imports.is_empty());
+    assert!(
+        original
+            .bodies
+            .get(hash)
+            .expect("a body for countdown")
+            .verify(hash)
+    );
+    assert!(!text_of(&printed, "m").contains("import"), "{printed:?}");
 }
 
 #[test]
 fn a_mutually_recursive_component_round_trips_wired_the_way_it_was_written() {
-    let original = compile(&[(
-        "m",
-        r#"
-        fn is_even(n: Int) -> Bool = if n == 0 { true } else { is_odd(n - 1) }
-        fn is_odd(n: Int) -> Bool = if n == 0 { false } else { is_even(n - 1) }
-        "#,
-    )]);
-
+    let src = r#"
+        pub fn is_even(n: Int) -> Bool = if n == 0 { true } else { is_odd(n - 1) }
+        pub fn is_odd(n: Int) -> Bool = if n == 0 { false } else { is_even(n - 1) }
+        "#;
+    let (original, _) = round_trip(&[("m", src)]);
     let even = original.hashes.defs[&Symbol::new("m.is_even")];
     let odd = original.hashes.defs[&Symbol::new("m.is_odd")];
     assert_ne!(even, odd, "the two members are not interchangeable");
@@ -474,48 +370,36 @@ fn a_mutually_recursive_component_round_trips_wired_the_way_it_was_written() {
     let b = original.bodies.get(odd).expect("a body for is_odd");
     assert_ne!(a, b, "one payload, two class indices");
     assert!(a.verify(even) && b.verify(odd));
-
-    let (rebuilt, names) = rebuild(&original);
-    assert_eq!(rebuilt.hashes.defs.len(), 2);
-    assert_eq!(names.len(), 2);
 }
 
 #[test]
 fn two_cycles_wired_in_opposite_directions_do_not_collide() {
-    let clockwise = compile(&[(
-        "m",
-        r#"
-        fn f(n: Int) -> Int = g(n - 1) + 1
-        fn g(n: Int) -> Int = h(n - 1) + 2
-        fn h(n: Int) -> Int = f(n - 1) + 3
-        "#,
-    )]);
-    let widdershins = compile(&[(
-        "m",
-        r#"
-        fn f(n: Int) -> Int = h(n - 1) + 1
-        fn h(n: Int) -> Int = g(n - 1) + 3
-        fn g(n: Int) -> Int = f(n - 1) + 2
-        "#,
-    )]);
-
-    let one: BTreeSet<DefHash> = clockwise.hashes.defs.values().copied().collect();
-    let other: BTreeSet<DefHash> = widdershins.hashes.defs.values().copied().collect();
+    let clockwise = r#"
+        pub fn f(n: Int) -> Int = g(n - 1) + 1
+        pub fn g(n: Int) -> Int = h(n - 1) + 2
+        pub fn h(n: Int) -> Int = f(n - 1) + 3
+        "#;
+    let widdershins = r#"
+        pub fn f(n: Int) -> Int = h(n - 1) + 1
+        pub fn h(n: Int) -> Int = g(n - 1) + 3
+        pub fn g(n: Int) -> Int = f(n - 1) + 2
+        "#;
+    let (one, _) = round_trip(&[("m", clockwise)]);
+    let (other, _) = round_trip(&[("m", widdershins)]);
+    let one: BTreeSet<DefHash> = one.hashes.defs.values().copied().collect();
+    let other: BTreeSet<DefHash> = other.hashes.defs.values().copied().collect();
     assert_eq!(one.len(), 3, "three distinguishable members");
     assert!(
         one.is_disjoint(&other),
         "the two wirings are different computations and must not share a hash"
     );
-
-    rebuild(&clockwise);
-    rebuild(&widdershins);
 }
 
 #[test]
 fn a_body_verifies_only_against_its_own_key() {
     let original = compile(&[(
         "m",
-        "fn f(x: Int) -> Int = x + 1\nfn g(x: Int) -> Int = x + 2\n",
+        "pub fn f(x: Int) -> Int = x + 1\npub fn g(x: Int) -> Int = x + 2\n",
     )]);
     let f = original.hashes.defs[&Symbol::new("m.f")];
     let g = original.hashes.defs[&Symbol::new("m.g")];
@@ -527,41 +411,64 @@ fn a_body_verifies_only_against_its_own_key() {
 }
 
 #[test]
-fn a_truncated_body_is_refused_rather_than_decoded() {
-    let original = compile(&[("m", "fn f(x: Int) -> Int = x + 1\n")]);
+fn a_truncated_body_is_refused_rather_than_printed() {
+    let original = compile(&[("m", "pub fn f(x: Int) -> Int = x + 1\n")]);
     let hash = original.hashes.defs[&Symbol::new("m.f")];
     let mut bytes = original.bodies.get(hash).unwrap().as_bytes().to_vec();
     bytes.truncate(bytes.len() - 1);
+    let body = StoredBody::from_bytes(bytes).expect("still an envelope");
+    let key = body.key().expect("a solo body keys itself");
 
-    let mut set = BodySet::default();
-    set.insert(
-        hash,
-        ply_hash::body::StoredBody::from_bytes(bytes).expect("still an envelope"),
-    );
-    let diags = reconstruct(&set).expect_err("a truncated body must not decode");
+    let refused = print_bodies(&[body.as_bytes()], &[("m.f", key)], &[], &[], &[])
+        .expect_err("a truncated body must not print");
+    assert_eq!(refused.code, codes::ARTIFACT_INVALID);
+}
+
+/// The lexer never produces such a `Decimal`, so a stream carrying one is corrupt.
+#[test]
+fn a_body_carrying_an_out_of_range_decimal_is_refused() {
+    let original = compile(&[("m", "pub fn f() -> Decimal = 1.50m")]);
+    let (_, body) = original.bodies.defs().next().expect("one definition");
+    let mut bytes = body.as_bytes().to_vec();
+    // The scale is the last little-endian `2`: the mantissa's sixteen bytes come before it.
+    let scale = bytes
+        .windows(4)
+        .rposition(|w| w == 2u32.to_le_bytes())
+        .expect("the scale is in the stream");
+    bytes[scale..scale + 4].copy_from_slice(&99u32.to_le_bytes());
+    let body = StoredBody::from_bytes(bytes).expect("still a body envelope");
+    let key = body.key().expect("a solo body keys itself");
+
+    let refused = print_bodies(&[body.as_bytes()], &[("m.f", key)], &[], &[], &[])
+        .expect_err("a scale of 99 is not a `Decimal`");
     assert!(
-        diags
-            .iter()
-            .any(|d| d.code == ply_span::codes::CACHE_CORRUPT)
+        refused.message.contains("not a `Decimal`"),
+        "{}",
+        refused.message
     );
 }
 
 #[test]
-fn a_body_filed_under_the_wrong_key_is_refused() {
+fn a_name_whose_hash_no_body_carries_is_refused() {
     let original = compile(&[(
         "m",
-        "fn f(x: Int) -> Int = x + 1\nfn g(x: Int) -> Int = x + 2\n",
+        "pub fn f(x: Int) -> Int = x + 1\npub fn g(x: Int) -> Int = x + 2\n",
     )]);
     let f = original.hashes.defs[&Symbol::new("m.f")];
     let g = original.hashes.defs[&Symbol::new("m.g")];
 
-    let mut set = BodySet::default();
-    set.insert(g, original.bodies.get(f).unwrap().clone());
-    let diags = reconstruct(&set).expect_err("a misfiled body must not decode");
+    let refused = print_bodies(
+        &[original.bodies.get(f).unwrap().as_bytes()],
+        &[("m.g", g)],
+        &[],
+        &[],
+        &[],
+    )
+    .expect_err("a misfiled body must not print");
     assert!(
-        diags
-            .iter()
-            .any(|d| d.code == ply_span::codes::CACHE_CORRUPT)
+        refused.message.contains("`m.g` has no body"),
+        "{}",
+        refused.message
     );
 }
 
@@ -569,26 +476,40 @@ fn a_body_filed_under_the_wrong_key_is_refused() {
 fn a_reference_with_no_body_is_named_rather_than_guessed() {
     let original = compile(&[(
         "m",
-        "fn helper(x: Int) -> Int = x + 1\nfn caller(x: Int) -> Int = helper(x)\n",
+        "fn helper(x: Int) -> Int = x + 1\npub fn caller(x: Int) -> Int = helper(x)\n",
     )]);
     let caller = original.hashes.defs[&Symbol::new("m.caller")];
+    let helper = original.hashes.defs[&Symbol::new("m.helper")];
 
-    let mut set = BodySet::default();
-    set.insert(caller, original.bodies.get(caller).unwrap().clone());
-    let diags = reconstruct(&set).expect_err("an open set must not reconstruct");
+    let refused = print_bodies(
+        &[original.bodies.get(caller).unwrap().as_bytes()],
+        &[("m.caller", caller)],
+        &[],
+        &[],
+        &[],
+    )
+    .expect_err("an open set must not print");
     assert!(
-        diags
-            .iter()
-            .any(|d| d.code == ply_span::codes::CACHE_UNREADABLE)
+        refused.message.contains("not among the bodies"),
+        "{}",
+        refused.message
+    );
+    assert!(
+        refused.notes.iter().any(|n| n.contains(&helper.short())),
+        "{:?}",
+        refused.notes
     );
 }
 
 #[test]
 fn renaming_changes_no_body() {
-    let before = compile(&[("m", "fn f(x: Int) -> Int = x + 1\nfn g() -> Int = f(1)\n")]);
+    let before = compile(&[(
+        "m",
+        "pub fn f(x: Int) -> Int = x + 1\npub fn g() -> Int = f(1)\n",
+    )]);
     let after = compile(&[(
         "m",
-        "fn renamed(x: Int) -> Int = x + 1\nfn g() -> Int = renamed(1)\n",
+        "pub fn renamed(x: Int) -> Int = x + 1\npub fn g() -> Int = renamed(1)\n",
     )]);
 
     let mut lhs: Vec<_> = before.bodies.defs().map(|(h, b)| (h, b.clone())).collect();
@@ -623,99 +544,6 @@ fn moving_a_definition_between_modules_changes_no_body() {
     assert_eq!(lhs, rhs);
 }
 
-/// A rebuilt program has no text, so the C emitter is handed it printed back to source.
-fn on_the_tier<'a>(
-    program: &'a ply_syntax::ast::Program,
-    resolved: &'a ply_syntax::resolve::Resolved,
-    check: &'a CheckOutput,
-) -> ply_eval::Machine<'a> {
-    let texts: std::collections::HashMap<String, String> =
-        ply_syntax::print::program(program).into_iter().collect();
-    let unit =
-        ply_codegen::Unit::over_with_texts(program, texts).expect("this host has a C compiler");
-    let spec = ply_eval::BackendSpec {
-        kind: ply_eval::BackendKind::C,
-        ..Default::default()
-    };
-    let mut machine = ply_eval::Machine::new(program, resolved, check);
-    machine.set_compiled(ply_eval::Provider::attach(unit, &spec));
-    machine
-}
-
-#[test]
-fn reconstructed_tests_evaluate() {
-    let original = compile(&[(
-        "m",
-        r#"
-        effect db { read get[r](key: Int) -> Int }
-
-        type Colour = | Red | Blue(Int)
-
-        fn shade(c: Colour) -> Int = match c { Red -> 0, Blue(n) -> n }
-
-        fn lookup(key: Int) -> Int / {db.read[users]} = db.get[users](key) + shade(Blue(1))
-
-        test "a handler discharges the effect" {
-          handle {
-            assert_eq(lookup(3), 8)
-          } with { db.get[users](k) -> 7 }
-        }
-
-        test "a pure definition still runs" { assert_eq(shade(Red), 0) }
-        "#,
-    )]);
-
-    let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
-    let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
-    let check = check_printed(&rebuilt.program);
-    let mut interp = on_the_tier(&rebuilt.program, &resolved, &check);
-
-    assert_eq!(interp.test_count(), 2);
-    for index in 0..interp.test_count() {
-        interp
-            .eval_test(index)
-            .unwrap_or_else(|d| panic!("reconstructed test {index} failed: {d}"));
-    }
-}
-
-#[test]
-fn a_reconstructed_program_prints_to_the_source_it_hashes_as() {
-    let files = corpus();
-    let borrowed: Vec<(&str, &str)> = files
-        .iter()
-        .map(|(name, text)| (name.as_str(), text.as_str()))
-        .collect();
-    let original = compile(&borrowed);
-    let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
-    let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
-    let (before, _) =
-        hash_program_with_bodies(&rebuilt.program, &resolved).expect("it should hash");
-
-    let texts = ply_syntax::print::program(&rebuilt.program);
-    let printed: Vec<(&str, &str)> = texts
-        .iter()
-        .map(|(name, text)| (name.as_str(), text.as_str()))
-        .collect();
-    let after = compile(&printed).hashes;
-
-    let hex = |h: &IndexMap<Symbol, DefHash>| -> BTreeMap<String, String> {
-        h.iter().map(|(n, h)| (n.to_string(), h.to_hex())).collect()
-    };
-    assert_eq!(
-        hex(&after.defs),
-        hex(&before.defs),
-        "a definition hashes differently once printed"
-    );
-    assert_eq!(
-        after.tests, before.tests,
-        "a test hashes differently once printed"
-    );
-    assert_eq!(
-        after.laws, before.laws,
-        "a law hashes differently once printed"
-    );
-}
-
 /// The examples and every shipped module: this harness has no import graph to pull in `std.net`.
 fn corpus() -> Vec<(String, String)> {
     let mut files: Vec<(String, String)> = Vec::new();
@@ -734,20 +562,20 @@ fn corpus() -> Vec<(String, String)> {
 }
 
 #[test]
-fn the_examples_reconstruct() {
+fn the_examples_come_back_under_their_own_names() {
     let files = corpus();
     let borrowed: Vec<(&str, &str)> = files
         .iter()
         .map(|(name, text)| (name.as_str(), text.as_str()))
         .collect();
-    assert_interfaces_survive(&borrowed);
+    round_trip(&borrowed);
 }
 
-/// Each mutation is re-filed under its own key, so the decoder rather than the self-check sees it.
+/// Each mutation is filed under its own key, so the printer rather than the name check sees it.
 #[test]
-fn no_mutation_of_a_body_can_abort_the_decoder() {
+fn no_mutation_of_a_body_can_abort_the_printer() {
     let original = compile(&[("m", EVERY_ITEM_KIND)]);
-    let (hash, body) = original.bodies.defs().next().expect("at least one body");
+    let (_, body) = original.bodies.defs().next().expect("at least one body");
     let bytes = body.clone().into_bytes();
     assert!(bytes.len() > 8, "the sample is too small to be a test");
 
@@ -755,53 +583,32 @@ fn no_mutation_of_a_body_can_abort_the_decoder() {
         for mask in [0x01u8, 0x80, 0xff] {
             let mut mutated = bytes.clone();
             mutated[at] ^= mask;
-            let Some(stored) = ply_hash::body::StoredBody::from_bytes(mutated) else {
+            let Some(stored) = StoredBody::from_bytes(mutated) else {
                 continue;
             };
             let Some(key) = stored.key() else { continue };
-            let mut set = BodySet::default();
-            set.insert(key, stored);
-            // Succeeding is allowed: some mutations are still a definition.
-            let _ = reconstruct(&set);
+            // Printing is allowed: some mutations are still a definition.
+            let _ = print_bodies(&[stored.as_bytes()], &[("m.x", key)], &[], &[], &[]);
         }
     }
-    assert!(original.bodies.contains(hash));
 }
 
 #[test]
-fn nothing_reconstructs_into_an_empty_program() {
-    let rebuilt = reconstruct(&BodySet::default()).expect("an empty set is not an error");
-    assert!(rebuilt.program.modules.is_empty());
-    assert!(rebuilt.names.is_empty());
-    assert!(rebuilt.test_keys.is_empty());
-}
-
-#[test]
-fn reconstruction_is_deterministic() {
-    let original = compile(&[("m", EVERY_ITEM_KIND)]);
-    let first = reconstruct(&original.bodies).expect("bodies should reconstruct");
-    let second = reconstruct(&original.bodies).expect("bodies should reconstruct");
+fn nothing_prints_as_no_module() {
     assert_eq!(
-        format!(
-            "{:?}",
-            first
-                .program
-                .modules
-                .iter()
-                .map(|m| (&m.name, m.items.len()))
-                .collect::<Vec<_>>()
-        ),
-        format!(
-            "{:?}",
-            second
-                .program
-                .modules
-                .iter()
-                .map(|m| (&m.name, m.items.len()))
-                .collect::<Vec<_>>()
-        )
+        print_bodies(&[], &[], &[], &[], &[]).expect("an empty set is not an error"),
+        Vec::new()
     );
-    assert_eq!(first.names, second.names);
+}
+
+#[test]
+fn printing_is_deterministic() {
+    let original = compile(&[("m", EVERY_ITEM_KIND)]);
+    let names = names_of(&original);
+    assert_eq!(
+        print(&original.bodies, &names, &[]).expect("printable"),
+        print(&original.bodies, &names, &[]).expect("printable")
+    );
 }
 
 const NAMED: [(&str, &str); 2] = [
@@ -826,51 +633,16 @@ const NAMED: [(&str, &str); 2] = [
     ),
 ];
 
-fn names_of(checked: &Checked) -> Vec<(Symbol, DefHash)> {
-    checked
-        .hashes
-        .defs
-        .iter()
-        .chain(checked.hashes.decls.iter())
-        .map(|(name, hash)| (name.clone(), *hash))
-        .collect()
-}
-
-fn exact_round_trip(original: &Checked) -> Vec<(String, String)> {
-    let names = names_of(original);
-    let program = ply_hash::body::reconstruct_exact(&original.bodies, &names, |_| false)
-        .unwrap_or_else(|diags| panic!("the names say everything: {diags:#?}"));
-    let printed = ply_syntax::print::program(&program);
-    let borrowed: Vec<(&str, &str)> = printed
-        .iter()
-        .map(|(name, text)| (name.as_str(), text.as_str()))
-        .collect();
-    let again = compile(&borrowed).hashes;
-    for (name, hash) in &names {
-        let now = again
-            .defs
-            .get(name)
-            .or_else(|| again.decls.get(name))
-            .unwrap_or_else(|| panic!("`{name}` did not come back"));
-        assert_eq!(now, hash, "`{name}` came back as a different definition");
-    }
-    let wanted: BTreeSet<&Symbol> = names.iter().map(|(name, _)| name).collect();
-    let rebuilt: BTreeSet<&Symbol> = again.defs.keys().chain(again.decls.keys()).collect();
-    assert_eq!(rebuilt, wanted, "a name was invented or dropped");
-    printed
-}
-
 #[test]
 fn a_namespace_restores_the_names_and_the_modules() {
-    let original = compile(&NAMED.map(|(n, s)| (n, s)));
-    let printed = exact_round_trip(&original);
+    let (_, printed) = round_trip(&NAMED);
     let modules: Vec<&str> = printed.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(modules, ["app", "store.wire"], "units were not merged");
 }
 
 #[test]
 fn modules_sharing_a_last_segment_are_imported_under_distinct_binders() {
-    let original = compile(&[
+    let (_, printed) = round_trip(&[
         (
             "left.util",
             "pub type Tally = { v: Int }\npub fn one() -> Int = 1\n",
@@ -888,12 +660,7 @@ fn modules_sharing_a_last_segment_are_imported_under_distinct_binders() {
             "#,
         ),
     ]);
-    let printed = exact_round_trip(&original);
-    let app = &printed
-        .iter()
-        .find(|(name, _)| name == "app")
-        .expect("the app comes back")
-        .1;
+    let app = text_of(&printed, "app");
     assert!(app.contains("import left.util as left_util"), "{app}");
     assert!(app.contains("import right.util as right_util"), "{app}");
 }
@@ -911,12 +678,11 @@ fn every_name_of_one_body_comes_back() {
         pub fn twirl(n: Int) -> Int = if n == 0 { 0 } else { spin(n - 1) }
     "#;
     let a = format!("{pair}{twins}");
-    let original = compile(&[("a", a.as_str()), ("b", pair)]);
+    let (original, _) = round_trip(&[("a", a.as_str()), ("b", pair)]);
     let hash = |name: &str| original.hashes.defs[&Symbol::new(name)];
     assert_eq!(hash("a.one"), hash("a.uno"));
     assert_eq!(hash("a.spin"), hash("a.twirl"));
     assert_eq!(hash("a.even"), hash("b.even"));
-    exact_round_trip(&original);
 }
 
 #[test]
@@ -931,14 +697,13 @@ fn one_body_named_twice_within_a_group_is_refused() {
     )]);
     let hash = |name: &str| original.hashes.defs[&Symbol::new(name)];
     assert_eq!(hash("m.b"), hash("m.c"));
-    let refused =
-        ply_hash::body::reconstruct_exact(&original.bodies, &names_of(&original), |_| false)
-            .expect_err("the names cannot say which member a call reaches");
-    assert_eq!(refused[0].code, codes::ARTIFACT_INVALID);
+    let refused = print(&original.bodies, &names_of(&original), &[])
+        .expect_err("the names cannot say which member a call reaches");
+    assert_eq!(refused.code, codes::ARTIFACT_INVALID);
     assert!(
-        refused[0].message.contains("`m.b`") && refused[0].message.contains("`m.c`"),
+        refused.message.contains("`m.b`") && refused.message.contains("`m.c`"),
         "{}",
-        refused[0].message
+        refused.message
     );
 }
 
@@ -949,25 +714,23 @@ fn one_effect_declaration_named_twice_is_refused() {
         ("b", "pub effect two { read at() -> Int }"),
     ]);
     let names = names_of(&original);
-    let refused = ply_hash::body::reconstruct_exact(&original.bodies, &names, |_| false)
-        .expect_err("two names for one declaration");
+    let refused = print(&original.bodies, &names, &[]).expect_err("two names for one declaration");
     assert!(
-        refused[0].message.contains("`a.one`") && refused[0].message.contains("`b.two`"),
+        refused.message.contains("`a.one`") && refused.message.contains("`b.two`"),
         "{}",
-        refused[0].message
+        refused.message
     );
 
     let once: Vec<(Symbol, DefHash)> = names
         .into_iter()
         .filter(|(name, _)| name.as_str() == "a.one")
         .collect();
-    ply_hash::body::reconstruct_exact(&original.bodies, &once, |_| false)
-        .expect("named once, the declaration is that name's");
+    print(&original.bodies, &once, &[]).expect("named once, the declaration is that name's");
 }
 
 #[test]
 fn names_that_cannot_be_applied_are_refused() {
-    let original = compile(&NAMED.map(|(n, s)| (n, s)));
+    let original = compile(&NAMED);
     let full = names_of(&original);
     for broken in [
         full[1..].to_vec(),
@@ -978,21 +741,17 @@ fn names_that_cannot_be_applied_are_refused() {
             .map(|(_, hash)| (Symbol::new("bare"), *hash))
             .collect(),
     ] {
-        let refused = ply_hash::body::reconstruct_exact(&original.bodies, &broken, |_| false)
-            .expect_err("a namespace that cannot be applied");
-        assert_eq!(refused[0].code, codes::ARTIFACT_INVALID);
+        let refused =
+            print(&original.bodies, &broken, &[]).expect_err("a namespace that cannot be applied");
+        assert_eq!(refused.code, codes::ARTIFACT_INVALID);
     }
 }
 
 #[test]
-fn a_module_named_only_is_imported_and_not_rebuilt() {
-    let original = compile(&NAMED.map(|(n, s)| (n, s)));
-    let program =
-        ply_hash::body::reconstruct_exact(&original.bodies, &names_of(&original), |module| {
-            module.as_str() == "store.wire"
-        })
+fn a_shipped_module_is_imported_and_not_printed() {
+    let original = compile(&NAMED);
+    let printed = print(&original.bodies, &names_of(&original), &["store.wire"])
         .expect("the names say everything");
-    let printed = ply_syntax::print::program(&program);
     assert_eq!(printed.len(), 1);
     assert_eq!(printed[0].0, "app");
     assert!(
@@ -1000,29 +759,6 @@ fn a_module_named_only_is_imported_and_not_rebuilt() {
         "{}",
         printed[0].1
     );
-}
-
-#[test]
-fn the_examples_come_back_under_their_own_names() {
-    let files = corpus();
-    let borrowed: Vec<(&str, &str)> = files
-        .iter()
-        .map(|(name, text)| (name.as_str(), text.as_str()))
-        .collect();
-    exact_round_trip(&compile(&borrowed));
-}
-
-/// Bisection reconstructs without a namespace: a historical set must rebuild without today's names.
-#[test]
-fn reconstruct_without_a_namespace_is_unchanged() {
-    let original = compile(&NAMED.map(|(n, s)| (n, s)));
-    let bare = reconstruct(&original.bodies).expect("bodies should reconstruct");
-    assert!(
-        bare.names.values().all(|n| n.as_str().contains(".d")),
-        "{:?}",
-        bare.names.values().take(4).collect::<Vec<_>>()
-    );
-    assert_eq!(bare.program.modules.len(), original.bodies.len());
 }
 
 #[test]
@@ -1041,8 +777,8 @@ fn two_identical_effect_declarations_are_one_hash() {
 
 /// Slots index one component's effect enumeration, and each test is its own component.
 #[test]
-fn two_tests_that_number_one_effect_differently_both_reconstruct() {
-    let original = compile(&[(
+fn two_tests_that_number_one_effect_differently_both_come_back() {
+    round_trip(&[(
         "m",
         r#"
         effect left  { read one() -> Int }
@@ -1061,15 +797,4 @@ fn two_tests_that_number_one_effect_differently_both_reconstruct() {
         }
         "#,
     )]);
-
-    let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
-    let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
-    let check = check_printed(&rebuilt.program);
-    let mut interp = on_the_tier(&rebuilt.program, &resolved, &check);
-    assert_eq!(interp.test_count(), 2);
-    for index in 0..interp.test_count() {
-        interp
-            .eval_test(index)
-            .unwrap_or_else(|d| panic!("reconstructed test {index} failed: {d}"));
-    }
 }
