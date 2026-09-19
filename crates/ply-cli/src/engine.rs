@@ -608,7 +608,7 @@ impl<'a> Prover<'a> {
                 Outcome::Raised(diagnostic) => {
                     return Discharge::Unattempted(Gap::Raised {
                         bindings: bindings_of(obligation.generated(), &values),
-                        diagnostic,
+                        diagnostic: Box::new(diagnostic),
                     });
                 }
             }
@@ -736,7 +736,7 @@ impl<'a> Prover<'a> {
     fn admits(&self, cases: &mut Cases<'a>, values: &[Value]) -> Result<bool, Gap> {
         cases.guard(values).map_err(|diagnostic| Gap::Raised {
             bindings: bindings_of(&cases.binders, values),
-            diagnostic,
+            diagnostic: Box::new(diagnostic),
         })
     }
 }

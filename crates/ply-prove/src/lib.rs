@@ -174,7 +174,7 @@ pub enum Gap {
     },
     Raised {
         bindings: Vec<Binding>,
-        diagnostic: Diagnostic,
+        diagnostic: Box<Diagnostic>,
     },
     /// The guard kept no case of a full budget, yet admits `witness`.
     GuardNotSampled {
