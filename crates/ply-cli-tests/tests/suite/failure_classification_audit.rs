@@ -72,9 +72,10 @@ fn every_language_defined_runtime_failure_is_a_program_error(index: usize, of: u
             "recursion limit",
         ),
         (
-            "a tail-recursive runaway",
-            "fn spin(n: Int) -> Int = spin(n + 1)\n\
-             test \"spins in tail position\" { assert_eq(spin(0), 0) }\n",
+            "a runaway mutual recursion",
+            "fn spin(n: Int) -> Int = spun(n + 1)\n\
+             fn spun(n: Int) -> Int = spin(n + 1)\n\
+             test \"spins across two definitions\" { assert_eq(spin(0), 0) }\n",
             "recursion limit",
         ),
         (
@@ -183,7 +184,7 @@ fn a_failure_inside_a_handler_clause_body_is_still_the_programs() {
     for (needle, clause) in cases {
         let dir = project(&format!(
             "effect db {{ read all[t]() -> List<Int> }}\n\
-             fn spin(n: Int) -> Int = spin(n + 1)\n\
+             fn spin(n: Int) -> Int = 1 + spin(n + 1)\n\
              fn rows() -> List<Int> = db.all[users]()\n\
              test \"counts\" {{\n\
              \x20 handle {{ assert_eq(len(rows()), 2) }} with {{\n\
@@ -204,8 +205,30 @@ fn a_failure_inside_a_handler_clause_body_is_still_the_programs() {
 }
 
 #[test]
-fn the_recursion_limit_is_a_program_error() {
+fn a_loop_that_never_ends_is_a_program_error_at_its_time_budget() {
     const RUNAWAY: &str = "fn spin(n: Int) -> Int = spin(n + 1)\n\
+                           test \"spins\" { assert_eq(spin(0), 0) }\n";
+    let dir = project(RUNAWAY);
+    let out = ply(dir.path())
+        .args(["test", "--json", "--timeout", "300"])
+        .output()
+        .unwrap();
+    let v = json_of(&out);
+    let failure = &v["failures"][0];
+    assert_eq!(failure["defect"], false, "{failure}");
+    assert_eq!(failure["diagnostic"]["code"], "E0503", "{failure}");
+    assert!(
+        failure["diagnostic"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("time budget of 300 ms"),
+        "{failure}"
+    );
+}
+
+#[test]
+fn the_recursion_limit_is_a_program_error() {
+    const RUNAWAY: &str = "fn spin(n: Int) -> Int = 1 + spin(n + 1)\n\
                            test \"spins\" { assert_eq(spin(0), 0) }\n";
     let dir = project(RUNAWAY);
     let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
@@ -393,7 +416,7 @@ test \"step bottoms out\" { assert_eq(step(3), 0) }
 #[test]
 fn a_nondet_test_that_hits_a_runtime_limit_is_skipped_as_nondet() {
     let dir = project(
-        "fn spin(n: Int) -> Int = spin(n + 1)\n\
+        "fn spin(n: Int) -> Int = 1 + spin(n + 1)\n\
          test/nondet \"spins\" { assert_eq(spin(0), 0) }\n",
     );
     let failure = sole_failure(&dir);
@@ -424,7 +447,7 @@ fn bisect_never_outranks_the_reason_a_runtime_limit_would_have_given() {
 #[test]
 fn a_first_ever_runtime_limit_is_skipped_as_never_passed() {
     let dir = project(
-        "fn spin(n: Int) -> Int = spin(n + 1)\n\
+        "fn spin(n: Int) -> Int = 1 + spin(n + 1)\n\
          test \"spins\" { assert_eq(spin(0), 0) }\n",
     );
     let failure = sole_failure(&dir);

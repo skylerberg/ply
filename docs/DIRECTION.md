@@ -15,19 +15,18 @@ A feature earns its place by one of these. Saving keystrokes does not count.
 - **Compute buys confidence.** More budget on a test, proof or search yields a stronger claim,
   never just a slower run.
 - **One implementation, O(change) everywhere.** Nothing is redone that an edit did not reach,
-  including in the compiler's own loop.
+  including in the compiler's own loop. New code is Ply; Rust is ported as work reaches it.
 
 ## Work
 
-- Guaranteed tail calls, so recursion is the loop.
+- Tail calls across definitions, so mutual recursion is a loop too.
 - Static handler completeness: a `handle` missing an operation's clause is a type error.
 - Fewer rules around `?` and record update; where the shape is inferable, infer it.
 - `ply fmt`, from the printer `ply build` already has.
 - Structured fixes on diagnostics: a machine-applicable suggestion and candidates in the JSON.
 - `ply doc <name>` and `ply explain <code>`, from the tables the compiler uses, so the guide
   cannot drift from the compiler.
-- A program surface for agents: list callers, which tests reach a definition, replace a
-  definition by name.
+- Replace a definition by name, once `ply fmt` exists to print it back.
 - Induction over lists in the prover, which needs a cons term in its term language.
 - Mutation testing and per-definition coverage over the hash index.
 - A shared result cache, so parallel agents and CI never repeat each other.
