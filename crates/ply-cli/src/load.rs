@@ -3,11 +3,9 @@
 use crate::driver::FrontEnd;
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::Resolved;
+use ply_syntax::ast::ModuleName;
 use ply_ty::{CheckOutput, DefInfo, Front, ModuleInfo, TestInfo};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 #[derive(Debug)]
 pub struct Loaded {
@@ -25,25 +23,6 @@ pub struct Loaded {
     pub frontend: FrontEnd,
     /// Whether any module declares a `reuse fn`, so the promise check can be skipped.
     pub promised: bool,
-    /// Empty until [`Loaded::tree`] is first asked.
-    pub rust: RustTree,
-}
-
-/// Every module, the shipped ones included, as the Rust front end parses and resolves them.
-#[derive(Debug)]
-pub struct Tree {
-    pub program: Program,
-    pub resolved: Resolved,
-}
-
-#[derive(Debug, Default)]
-pub struct RustTree(OnceLock<Result<Tree, Diagnostic>>);
-
-impl RustTree {
-    /// Whether anything asked for the tree; a load never does.
-    pub fn built(&self) -> bool {
-        self.0.get().is_some()
-    }
 }
 
 /// Carries the [`SourceMap`]: a parse error is useless without the text its spans point into.
@@ -70,16 +49,6 @@ pub struct ModuleView<'a> {
 }
 
 impl Loaded {
-    /// For what still walks a syntax tree: the texts the port answered for, parsed under the same
-    /// source ids on first use. The port is the authority: what only Rust rejects is Ply's fault.
-    pub fn tree(&self) -> Result<&Tree, Diagnostic> {
-        self.rust
-            .0
-            .get_or_init(|| self.parse())
-            .as_ref()
-            .map_err(Clone::clone)
-    }
-
     /// Reported as a load's diagnostics are, over this program's sources.
     pub fn refused(&self, diagnostic: Diagnostic) -> LoadError {
         LoadError {
@@ -90,58 +59,15 @@ impl Loaded {
 
     /// Every module and its text, in the order the port read them.
     pub fn texts(&self) -> Vec<(String, String)> {
-        self.in_source_order()
-            .into_iter()
-            .map(|m| (m.name.to_string(), self.text_of(m.source).to_string()))
-            .collect()
-    }
-
-    fn in_source_order(&self) -> Vec<&ModuleInfo> {
         let mut modules: Vec<&ModuleInfo> = self.check.modules.values().collect();
         modules.sort_by_key(|m| m.source.0);
         modules
-    }
-
-    fn text_of(&self, source: SourceId) -> &str {
-        self.sources.get(source).map_or("", |f| &*f.text)
-    }
-
-    fn parse(&self) -> Result<Tree, Diagnostic> {
-        let modules = self.in_source_order();
-        let inputs = modules
-            .iter()
-            .map(|m| (m.source, m.name.clone(), self.text_of(m.source)));
-        let mut program =
-            ply_syntax::parse_program(inputs).map_err(|rust| self.disagreement(&rust))?;
-        let expanded = ply_derive::expand_program(&mut program);
-        if !expanded.is_empty() {
-            return Err(self.disagreement(&expanded));
-        }
-        let resolved =
-            ply_syntax::resolve(&mut program).map_err(|rust| self.disagreement(&rust))?;
-        Ok(Tree { program, resolved })
-    }
-
-    fn disagreement(&self, rust: &[Diagnostic]) -> Diagnostic {
-        let span = rust
-            .iter()
-            .find_map(Diagnostic::primary_span)
-            .unwrap_or(Span::DUMMY);
-        let mut diagnostic = Diagnostic::error(
-            codes::INTERNAL_ERROR,
-            format!(
-                "the front ends disagree about `{}`",
-                self.path_of(span.source).display()
-            ),
-        )
-        .primary(
-            span,
-            "the compiler's own front end accepts this and the Rust one does not",
-        );
-        for d in rust {
-            diagnostic = diagnostic.note(format!("the Rust front end: {} [{}]", d.message, d.code));
-        }
-        diagnostic.note("this is Ply's fault, not the program's")
+            .into_iter()
+            .map(|m| {
+                let text = self.sources.get(m.source).map_or("", |f| &*f.text);
+                (m.name.to_string(), text.to_string())
+            })
+            .collect()
     }
 
     pub fn hashes(&self) -> Result<HashOutput, Vec<Diagnostic>> {

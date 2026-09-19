@@ -63,7 +63,6 @@ fn every_hash(hashes: &HashOutput) -> Vec<DefHash> {
         .collect()
 }
 
-/// A later process prints the program back from the store, with no source.
 #[test]
 fn a_stored_definition_set_prints_into_a_program_that_checks() {
     let root = TempRoot::new("rebuild");

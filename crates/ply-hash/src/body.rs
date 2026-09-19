@@ -6,7 +6,6 @@ use ply_span::Symbol;
 
 use crate::DefHash;
 
-/// The generation of the normalized encoding a body holds.
 pub const BODY_ENCODING: u32 = 7;
 
 /// A definition that is its own strongly connected component: the payload is its normalized bytes
@@ -101,7 +100,6 @@ impl StoredBody {
         self.key() == Some(hash)
     }
 
-    /// The component these bytes belong to, and every member's hash in class order.
     pub fn component(&self) -> Option<(DefHash, Vec<DefHash>)> {
         match self.shape()? {
             Shape::Solo(bytes) => {
@@ -111,7 +109,6 @@ impl StoredBody {
             Shape::Member { payload, .. } => {
                 let id = DefHash::of(payload);
                 let count = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
-                // Every member carries a length, so a larger count is corrupt.
                 if count as usize > payload.len() / 4 {
                     return None;
                 }

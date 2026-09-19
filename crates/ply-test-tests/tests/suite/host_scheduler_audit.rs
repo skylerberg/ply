@@ -44,6 +44,7 @@ impl Drop for TempRoot {
 struct Compiled {
     program: Program,
     resolved: Resolved,
+    port: ply_ty::Front,
     check: CheckOutput,
     hashes: HashOutput,
     texts: std::collections::HashMap<String, String>,
@@ -51,7 +52,7 @@ struct Compiled {
 
 impl Compiled {
     fn tier(&self) -> (&'static ply_codegen::Unit, ply_eval::BackendSpec) {
-        let unit = ply_codegen::Unit::over_with_texts(&self.program, self.texts.clone())
+        let unit = ply_codegen::Unit::over_front(&self.port, self.texts.clone())
             .expect("this host has a C compiler");
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,
@@ -65,15 +66,17 @@ fn compile(source: &str) -> Compiled {
     let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), source)];
     let mut program = ply_syntax::parse_program(inputs).expect("the fixture parses");
     let resolved = ply_syntax::resolve(&mut program).expect("the fixture resolves");
-    let check = crate::fixture::port_check(
+    let port = crate::fixture::port_front(
         &[(ModuleName::from_dotted("m").to_string(), source.to_string())],
         &[SourceId(0)],
     );
-    let hashes = ply_hash::hash_program(&program, &resolved, &check).expect("the fixture hashes");
+    let hashes =
+        ply_hash::hash_program(&program, &resolved, &port.check).expect("the fixture hashes");
     Compiled {
         program,
         resolved,
-        check,
+        check: port.check.clone(),
+        port,
         hashes,
         texts: std::collections::HashMap::from([(
             ModuleName::from_dotted("m").to_string(),
@@ -92,7 +95,7 @@ fn run_report(
 ) -> RunReport {
     let (unit, spec) = compiled.tier();
     let executor = TierExecutor(
-        InterpExecutor::new(&compiled.program, &compiled.resolved, &compiled.check)
+        InterpExecutor::new(&compiled.port)
             .with_backend(unit, spec)
             .with_search(search)
             .with_hosts(hosting),

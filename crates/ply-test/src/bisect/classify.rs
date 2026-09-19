@@ -30,7 +30,6 @@ pub trait Classify {
 }
 
 pub struct StoreClassify<'a> {
-    /// The current program against the baseline's table.
     rehashed: Rehashed,
     store: &'a Store,
     check: &'a CheckOutput,

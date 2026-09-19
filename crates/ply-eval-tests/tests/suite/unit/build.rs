@@ -1,6 +1,5 @@
 use ply_span::{SourceId, Span};
 use ply_syntax::ast::*;
-use ply_syntax::resolve::{Resolved, resolve};
 
 pub fn sp() -> Span {
     Span::new(SourceId(0), 0, 1)
@@ -106,10 +105,4 @@ pub fn module(items: Vec<Item>) -> Module {
         imports: Vec::new(),
         items,
     }
-}
-
-pub fn standalone_module(module: Module) -> (Program, Resolved) {
-    let mut program = Program::single(module);
-    let resolved = resolve(&mut program).expect("a module with no imports resolves");
-    (program, resolved)
 }

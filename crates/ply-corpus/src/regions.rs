@@ -73,7 +73,7 @@ pub fn colour(tests: &[(usize, Footprint)], projected: &[Footprint]) -> Vec<Vec<
         .collect()
 }
 
-/// Wall clock for a schedule as `ply_test::run` executes it: groups in turn, `jobs` workers each.
+/// Wall clock for a schedule as `ply_test::run_with` executes it: groups in turn, `jobs` workers each.
 pub fn makespan(groups: &[Vec<usize>], millis: &[f64], jobs: usize, setup_millis: f64) -> f64 {
     let mut total = 0.0;
     for group in groups {
@@ -365,18 +365,10 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
     let (millis, sequential) = run(1)?;
     let (_, measured) = run(jobs)?;
 
-    let tree = loaded
-        .tree()
-        .map_err(|d| anyhow::anyhow!("`{}`: {}", root.display(), d.message))?;
     let setup = (0..3)
         .map(|_| {
             let started = Instant::now();
-            std::hint::black_box(crate::tier_machine(
-                &tree.program,
-                &tree.resolved,
-                &loaded.front,
-                &loaded.sources,
-            ));
+            std::hint::black_box(crate::tier_machine(&loaded.front, &loaded.sources));
             started.elapsed()
         })
         .min()

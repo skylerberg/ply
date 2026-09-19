@@ -402,13 +402,9 @@ fn best_of(repeats: usize, mut run: impl FnMut() -> Result<Duration>) -> Result<
 
 /// A checked endpoint, ready to be called with whatever is underneath it.
 pub struct Program {
-    program: ply_syntax::ast::Program,
-    resolved: ply_syntax::resolve::Resolved,
     check: CheckOutput,
     /// The tier is built from this rather than from a second front end.
     port: ply_ty::Front,
-    /// Shared by every rung's machine.
-    region_kinds: ply_eval::region_kind::Kinds,
     sources: ply_span::SourceMap,
 }
 
@@ -427,38 +423,22 @@ impl Program {
             let id = sources.add(ply_std::pseudo_path(&module), source.to_string());
             inputs.push((id, module, source));
         }
-        // Built before `parse_program` takes `inputs`, and in its order.
         let ordered: Vec<(String, String)> = inputs
             .iter()
             .map(|(_, m, s)| (m.to_string(), s.to_string()))
             .collect();
         let ids: Vec<ply_span::SourceId> = inputs.iter().map(|(id, _, _)| *id).collect();
-        let mut program = ply_syntax::parse_program(inputs)
-            .map_err(|d| diagnostics("parsing the endpoint", &d))?;
-        // Expanded before resolution, as the driver does.
-        let expanded = ply_derive::expand_program(&mut program);
-        if !expanded.is_empty() {
-            return Err(diagnostics("expanding a `derive`", &expanded));
-        }
-        let resolved = ply_syntax::resolve::resolve(&mut program)
-            .map_err(|d| diagnostics("resolving the endpoint", &d))?;
         let port = ply_codegen::c::producer::checked_front(&ordered, &ids)
             .map_err(|e| anyhow::anyhow!("checking the endpoint: {e}"))?;
         Ok(Program {
-            program,
-            resolved,
             check: port.check.clone(),
             port,
-            region_kinds: ply_eval::region_kind::Kinds::default(),
             sources,
         })
     }
 
     fn machine(&self) -> Machine<'_> {
-        let mut machine =
-            crate::tier_machine(&self.program, &self.resolved, &self.port, &self.sources);
-        machine.share_region_kinds(ply_eval::region_kind::Kinds::clone(&self.region_kinds));
-        machine
+        crate::tier_machine(&self.port, &self.sources)
     }
 
     fn footprint(&self, name: &str) -> Option<Footprint> {

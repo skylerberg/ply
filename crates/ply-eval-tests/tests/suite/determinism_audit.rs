@@ -27,7 +27,7 @@ fn render_step(step: &Step) -> String {
 
 impl Compiled {
     fn transcript_of(&self, index: usize, seed: &Seed) -> Transcript {
-        let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
+        let mut machine = Machine::new(&self.front);
         machine.set_seed(seed.clone(), 100_000);
         let outcome = machine.eval_test(index);
         let steps = match machine.simulated() {
@@ -61,7 +61,7 @@ impl Compiled {
 
     /// What the run interleaved, and the world it left behind.
     fn run_at(&self, index: usize, seed: &Seed) -> (Interleaving, Vec<String>) {
-        let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
+        let mut machine = Machine::new(&self.front);
         machine.set_seed(seed.clone(), 100_000);
         let outcome = machine.eval_test(index);
         let world = machine

@@ -307,7 +307,7 @@ fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
         assert!(selection.parallelism.holds());
 
         let executor = TierExecutor(
-            ply_test::InterpExecutor::new(&compiled.program, &compiled.resolved, &compiled.check)
+            ply_test::InterpExecutor::new(&compiled.port)
                 .with_backend(unit, spec.clone())
                 .with_search(ply_test::Search::of(&selection))
                 .with_hosts(ply_test::Hosting::hermetic()),
@@ -519,7 +519,7 @@ fn verdicts_do_not_move_between_one_worker_and_eight() {
             .build()
             .expect("the worker pool");
         let executor = TierExecutor(
-            ply_test::InterpExecutor::new(&compiled.program, &compiled.resolved, &compiled.check)
+            ply_test::InterpExecutor::new(&compiled.port)
                 .with_backend(unit, spec.clone())
                 .with_search(ply_test::Search::of(&selection))
                 .with_hosts(ply_test::Hosting::hermetic()),

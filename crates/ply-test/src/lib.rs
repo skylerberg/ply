@@ -17,8 +17,6 @@ use ply_eval::{Arena, Exploration, Machine, Plan, Race, Seed, TaskRegions, Value
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Symbol, codes};
 use ply_store::{Outcome, PassRecord, Store};
-use ply_syntax::ast::Program;
-use ply_syntax::resolve::Resolved;
 use ply_ty::{CheckOutput, Footprint};
 use serde::Serialize;
 use std::any::Any;
@@ -424,17 +422,12 @@ impl<'a> Hosting<'a> {
 }
 
 pub struct InterpExecutor<'a> {
-    pub program: &'a Program,
-    pub resolved: &'a Resolved,
-    pub check: &'a CheckOutput,
-    /// Per test, its module and its position among that module's tests.
-    addresses: Vec<(Symbol, usize)>,
+    front: &'a ply_ty::Front,
     fixture: Option<&'a (dyn Fn(&mut TaskRegions) -> Value + Sync)>,
     hosts: Hosting<'a>,
     /// The backend this run installs, and which corruption, if any, it is wearing.
     backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
     search: Search,
-    region_kinds: ply_eval::region_kind::Kinds,
 }
 
 pub struct Worker<'a> {
@@ -516,33 +509,13 @@ impl<'a> Worker<'a> {
 }
 
 impl<'a> InterpExecutor<'a> {
-    pub fn new(
-        program: &'a Program,
-        resolved: &'a Resolved,
-        check: &'a CheckOutput,
-    ) -> InterpExecutor<'a> {
-        let mut seen: std::collections::BTreeMap<Symbol, usize> = Default::default();
-        let addresses = check
-            .tests
-            .iter()
-            .map(|t| {
-                let module = t.module.as_symbol().clone();
-                let ordinal = seen.entry(module.clone()).or_default();
-                let at = *ordinal;
-                *ordinal += 1;
-                (module, at)
-            })
-            .collect();
+    pub fn new(front: &'a ply_ty::Front) -> InterpExecutor<'a> {
         InterpExecutor {
-            program,
-            resolved,
-            check,
-            addresses,
+            front,
             fixture: None,
             hosts: Hosting::hermetic(),
             backend: None,
             search: Search::default(),
-            region_kinds: ply_eval::region_kind::Kinds::default(),
         }
     }
 
@@ -578,21 +551,16 @@ impl<'a> InterpExecutor<'a> {
         }
     }
 
-    pub fn shared_region_kinds(&self) -> ply_eval::region_kind::Kinds {
-        ply_eval::region_kind::Kinds::clone(&self.region_kinds)
-    }
-
     fn backend(&self) -> Option<Rc<dyn ply_eval::Compiled>> {
         let (provider, spec) = self.backend.as_ref()?;
         Some(provider.attach(spec))
     }
 
     fn machine(&self, backend: Option<Rc<dyn ply_eval::Compiled>>) -> Box<Machine<'a>> {
-        let mut machine = Machine::new(self.program, self.resolved, self.check);
+        let mut machine = Machine::new(self.front);
         if let Some(backend) = backend {
             machine.set_compiled(backend);
         }
-        machine.share_region_kinds(self.shared_region_kinds());
         if let Some(binding) = &self.hosts.binding {
             machine.set_host_binding(Arc::clone(binding));
         }
@@ -602,23 +570,17 @@ impl<'a> InterpExecutor<'a> {
         Box::new(machine)
     }
 
-    fn run_one(&self, machine: &mut Machine<'a>, index: usize) -> Result<(), Diagnostic> {
-        match self.addresses.get(index) {
-            Some((module, ordinal)) => machine.eval_test_in(module, *ordinal),
-            None => machine.eval_test(index),
-        }
-    }
-
     /// States this entry point's footprint claim, so a host answer outside it is `E0427`.
     fn arm_footprint_check(&self, machine: &mut Machine<'a>, index: usize) {
-        if let Some(test) = self.check.tests.get(index) {
+        if let Some(test) = self.front.check.tests.get(index) {
             machine.set_declared_footprint(test.footprint.clone());
         }
     }
 
     /// Whether this test's outcome depends on a seed, and so is searched rather than run.
     fn searches(&self, index: usize) -> bool {
-        self.check
+        self.front
+            .check
             .tests
             .get(index)
             .is_some_and(|t| is_seeded(&t.footprint))
@@ -654,7 +616,7 @@ impl<'a> InterpExecutor<'a> {
             self.arm_footprint_check(machine.as_mut(), index);
             machine.set_re_executed(re_executed);
             sim::seed_run(machine.as_mut(), seed, plan.steps);
-            let outcome = self.run_one(machine.as_mut(), index);
+            let outcome = machine.eval_test(index);
             if let Some(reached) = machine.host_use() {
                 let into = host.get_or_insert_with(Default::default);
                 into.atoms = into.atoms.union(&reached.atoms);
@@ -769,7 +731,7 @@ impl<'a> InterpExecutor<'a> {
     fn execute_directly(&self, worker: &mut Worker<'a>, index: usize) -> Result<(), Diagnostic> {
         let m = &mut worker.machine;
         self.arm_footprint_check(m.as_mut(), index);
-        self.run_one(m.as_mut(), index)
+        m.eval_test(index)
     }
 }
 
@@ -877,8 +839,7 @@ pub fn select(
     }
 }
 
-/// Turns each failure's raw suspect list into a ranked, annotated attribution; `sources` are the
-/// modules `front` was answered over.
+/// Turns each failure's suspect list into a ranked attribution; `sources` are what `front` read.
 pub fn diagnose_failures(
     report: &mut RunReport,
     sources: &[(String, String)],
@@ -1008,23 +969,6 @@ pub fn diagnose_failures(
     for hash in proved {
         store.put(hash, Outcome::Pass);
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    selection: &Selection,
-    program: &Program,
-    resolved: &Resolved,
-    check: &CheckOutput,
-    hashes: &HashOutput,
-    store: &mut Store,
-    search: Search,
-    hosts: Hosting<'_>,
-) -> RunReport {
-    let executor = InterpExecutor::new(program, resolved, check)
-        .with_search(search)
-        .with_hosts(hosts);
-    run_with(selection, check, hashes, store, &executor)
 }
 
 pub fn run_with<E: Executor>(

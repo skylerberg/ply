@@ -154,6 +154,30 @@ fn args_for(filter: Option<&str>) -> TestArgs {
 }
 
 #[test]
+fn a_finished_run_holds_what_it_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "m.ply",
+        "fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n",
+    );
+    let args = TestArgs {
+        path: dir.path().to_path_buf(),
+        ..args_for(None)
+    };
+    let mut warm = ply_cli::warm::Warm::default();
+    assert_eq!(
+        execute_holding(&args, Style::plain(), &mut warm),
+        exit_code(true)
+    );
+    let loaded = warm
+        .held
+        .as_ref()
+        .expect("a finished run holds what it loaded");
+    assert!(loaded.check.tests.iter().any(|t| t.name == "f is one"));
+}
+
+#[test]
 fn a_cold_cache_selects_everything() {
     let (_dir, loaded, _h, plan) = plan_for(None);
     assert_eq!(plan.selection.total, 4);

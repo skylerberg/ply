@@ -9,12 +9,9 @@ use ply_hash::body::{BodySet, StoredBody};
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, SourceId, Symbol};
 use ply_store::{Outcome, Store};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::Resolved;
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-/// Where the printer puts the one test a mixture carries.
 const HYBRID_TEST: &str = "ply_tests.t0";
 
 /// What makes two failures the same failure.
@@ -221,9 +218,6 @@ impl Hybrid for BodyHybrid<'_> {
         let Ok(front) = ply_codegen::c::producer::checked_front(&printed, &ids) else {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
-        let Ok((program, resolved)) = tree_of(&printed, &ids) else {
-            return Trial::unresolved(Unresolved::DoesNotCheck);
-        };
         let check = &front.check;
         let rehashed = &front.hashes;
         let Some(index) = check
@@ -252,9 +246,9 @@ impl Hybrid for BodyHybrid<'_> {
             // Hermetic always: a search asks this up to `Budget::max_trials` times.
             let texts: std::collections::HashMap<String, String> =
                 printed.iter().cloned().collect();
-            let mut machine = ply_eval::Machine::new(&program, &resolved, check);
-            let unit = ply_codegen::Unit::over_front(&program, &front, texts)
-                .expect("this host has a C compiler");
+            let mut machine = ply_eval::Machine::new(&front);
+            let unit =
+                ply_codegen::Unit::over_front(&front, texts).expect("this host has a C compiler");
             let spec = ply_eval::BackendSpec {
                 kind: ply_eval::BackendKind::C,
                 ..Default::default()
@@ -278,8 +272,7 @@ impl Hybrid for BodyHybrid<'_> {
     }
 }
 
-/// Named by hash, `m<component>.d<member>`, every member of each component: no one era's names fit
-/// a mixture of two.
+/// By hash, `m<component>.d<member>`: neither era's names fit a mixture of both.
 fn hash_names(bodies: &[StoredBody]) -> Option<Vec<(String, DefHash)>> {
     let mut names = BTreeMap::new();
     for body in bodies {
@@ -290,21 +283,6 @@ fn hash_names(bodies: &[StoredBody]) -> Option<Vec<(String, DefHash)>> {
         }
     }
     Some(names.into_iter().map(|(hash, name)| (name, hash)).collect())
-}
-
-/// The evaluator still walks a syntax tree, so the printed mixture is parsed for it too.
-fn tree_of(
-    printed: &[(String, String)],
-    ids: &[SourceId],
-) -> Result<(Program, Resolved), Vec<Diagnostic>> {
-    let mut program = ply_syntax::parse_program(
-        printed
-            .iter()
-            .zip(ids)
-            .map(|((name, text), id)| (*id, ModuleName::from_dotted(name), text.as_str())),
-    )?;
-    let resolved = ply_syntax::resolve(&mut program)?;
-    Ok((program, resolved))
 }
 
 /// Whether a mixture can be built at all; `false` means `no_bodies` rather than a bisection.

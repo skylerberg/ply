@@ -1,59 +1,41 @@
-use crate::fixture::port_check;
+use crate::fixture::port_front;
 use crate::unit::build::*;
 use ply_eval::Value;
 use ply_eval::compiled::*;
 use ply_eval::evaluator::Machine;
 use ply_span::Symbol;
 use ply_span::{Diagnostic, codes};
-use ply_syntax::ast::{BinOp, Item, Program};
-use ply_syntax::resolve::Resolved;
-use ply_ty::CheckOutput;
+use ply_syntax::ast::{BinOp, Item};
+use ply_ty::{DefHash, Front};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
 struct Checked {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
+    front: Front,
 }
 
 fn checked(items: Vec<Item>) -> Checked {
-    let m = module(items);
-    let text = ply_syntax::print::module(&m);
-    let check = port_check(&[("", text.as_str())]);
-    let (program, resolved) = standalone_module(m);
+    let text = ply_syntax::print::module(&module(items));
     Checked {
-        program,
-        resolved,
-        check,
+        front: port_front(&[("", text.as_str())]),
     }
 }
 
 impl Checked {
     fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
+        Machine::new(&self.front)
     }
 
     fn types(&self) -> CarriedTypes {
-        CarriedTypes::over(Some(&self.check))
+        CarriedTypes::over(Some(&self.front.check))
     }
 }
 
 /// From source, because `build::fn_def` cannot write the declared types the argument gate reads.
 fn checked_source(source: &str) -> Checked {
-    let mut program = ply_syntax::parse_program(vec![(
-        ply_span::SourceId(0),
-        ply_syntax::ast::ModuleName::anonymous(),
-        source,
-    )])
-    .expect("the fixture must parse");
-    let resolved = ply_syntax::resolve::resolve(&mut program).expect("the fixture must resolve");
-    let check = port_check(&[("", source)]);
     Checked {
-        program,
-        resolved,
-        check,
+        front: port_front(&[("", source)]),
     }
 }
 
@@ -103,7 +85,7 @@ fn a_world_handle_typed_parameter_is_refused_though_it_is_a_nominal_type() {
     );
     let types = c.types();
     for name in ["holds_cell", "holds_secret", "holds_fn"] {
-        let ty = &c.check.defs[&Symbol::new(name)].scheme.ty;
+        let ty = &c.front.check.defs[&Symbol::new(name)].scheme.ty;
         let ply_ty::Type::Fn { params, .. } = ty else {
             panic!("{name} publishes no function type");
         };
@@ -113,7 +95,8 @@ fn a_world_handle_typed_parameter_is_refused_though_it_is_a_nominal_type() {
             params[0]
         );
     }
-    let ply_ty::Type::Fn { params, .. } = &c.check.defs[&Symbol::new("holds_int")].scheme.ty else {
+    let ply_ty::Type::Fn { params, .. } = &c.front.check.defs[&Symbol::new("holds_int")].scheme.ty
+    else {
         panic!("holds_int publishes no function type");
     };
     assert!(
@@ -177,14 +160,13 @@ fn a_closure_bearing_record_return_is_refused_however_ordinary_the_record_looks(
 }
 
 struct Roots {
-    /// Never dereferenced.
-    program: *const Program,
+    program: DefHash,
     entered: Box<dyn Fn() -> Entered>,
 }
 
 impl Compiled for Roots {
-    fn describes(&self, program: &Program) -> bool {
-        std::ptr::eq(self.program, std::ptr::from_ref(program))
+    fn describes(&self, program: DefHash) -> bool {
+        self.program == program
     }
 
     fn enter(&self, _: &Symbol, _: &[Value], _: usize) -> Option<Value> {
@@ -202,10 +184,10 @@ fn first_test_under(
 ) -> (Result<(), Diagnostic>, (u64, u64)) {
     let mut machine = c.machine();
     machine.set_compiled(Rc::new(Roots {
-        program: &c.program,
+        program: c.front.hashes.digest(),
         entered: Box::new(entered),
     }));
-    let outcome = machine.eval_test_in(c.program.modules[0].name.as_symbol(), 0);
+    let outcome = machine.eval_test(0);
     (outcome, machine.compiled_counts())
 }
 

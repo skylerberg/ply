@@ -82,7 +82,7 @@ pub struct HostOp {
 }
 
 impl HostOp {
-    fn atom(&self, effect: &Symbol, resource: Resource, mode: ply_syntax::ast::Mode) -> EffectAtom {
+    fn atom(&self, effect: &Symbol, resource: Resource, mode: ply_ty::Mode) -> EffectAtom {
         EffectAtom::new(effect.clone(), resource, mode)
     }
 

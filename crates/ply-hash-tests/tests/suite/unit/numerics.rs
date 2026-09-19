@@ -1,5 +1,3 @@
-//! Canonical encoding of the numeric literals.
-
 use ply_hash::{DefHash, hash_program_with_bodies};
 use ply_span::SourceId;
 use ply_syntax::ast::{ModuleName, Program};

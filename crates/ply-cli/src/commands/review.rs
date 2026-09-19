@@ -81,29 +81,23 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
 
     let plan = crate::simulation::prove_plan(&args.prove, &args.simulation);
     let specified = obligation::specified(&scoped, &laws, &collected.obligations);
-    if let Err(diagnostic) = loaded.tree() {
-        return report_load_error("review", &loaded.refused(diagnostic), args.json, style);
-    }
     let backend = match super::common::prover_backend(args.backend.as_ref(), &loaded) {
         Ok(backend) => backend,
         Err(diagnostic) => {
             return report_bind_error("review", &[diagnostic], &loaded.sources, args.json, style);
         }
     };
+    let asked = obligation::Asked::new(collected.obligations, &store, &plan, !args.no_cache);
     // `ply review` binds nothing, so a `law/host` is a gap, as under a hermetic `ply prove`.
-    let engine = match crate::engine::of(&loaded, None, backend) {
-        Ok(engine) => engine,
-        Err(err) => return report_load_error("review", &err, args.json, style),
+    let engine: Box<dyn obligation::Discharger + '_> = if asked.pending() {
+        match crate::engine::of(&loaded, None, backend, &mut store) {
+            Ok(engine) => engine,
+            Err(err) => return report_load_error("review", &err, args.json, style),
+        }
+    } else {
+        Box::new(obligation::Undecided)
     };
-    let mut proved = obligation::prove(
-        collected.obligations,
-        &scoped,
-        &laws,
-        &mut store,
-        &plan,
-        !args.no_cache,
-        engine.as_ref(),
-    );
+    let mut proved = asked.discharge(&scoped, &laws, &mut store, engine.as_ref());
     warnings.append(&mut proved.warnings);
     let report = proved.report;
 

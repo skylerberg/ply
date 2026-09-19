@@ -23,7 +23,6 @@ pub mod memo;
 mod pool;
 pub mod rc;
 pub mod region;
-pub mod region_kind;
 pub mod sched;
 pub mod semantics;
 pub mod sim;
@@ -61,7 +60,6 @@ pub use explore::{
 pub use limit::{DEFAULT_MAX_CALLS, MAX_VALUE_DEPTH};
 pub use rc::Stats as RcStats;
 pub use region::{MachineScheduler, Spawned};
-pub use region_kind::Regions;
 pub use semantics::strict_binary;
 pub use sim::{
     Access, Answer, Clock, Domain, Exploration, Handlers, Naive, OpSignature, Plan, Race, RaceSite,
