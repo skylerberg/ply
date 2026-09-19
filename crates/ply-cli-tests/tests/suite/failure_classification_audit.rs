@@ -394,7 +394,7 @@ test \"step bottoms out\" { assert_eq(step(3), 0) }
 #[test]
 fn a_nondet_test_that_hits_a_runtime_limit_is_skipped_as_nondet() {
     let dir = project(
-        "fn spin(n: Int) -> Int = spin(n + 1)\n\
+        "fn spin(n: Int) -> Int = 1 + spin(n + 1)\n\
          test/nondet \"spins\" { assert_eq(spin(0), 0) }\n",
     );
     let failure = sole_failure(&dir);
@@ -425,7 +425,7 @@ fn bisect_never_outranks_the_reason_a_runtime_limit_would_have_given() {
 #[test]
 fn a_first_ever_runtime_limit_is_skipped_as_never_passed() {
     let dir = project(
-        "fn spin(n: Int) -> Int = spin(n + 1)\n\
+        "fn spin(n: Int) -> Int = 1 + spin(n + 1)\n\
          test \"spins\" { assert_eq(spin(0), 0) }\n",
     );
     let failure = sole_failure(&dir);
