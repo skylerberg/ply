@@ -6,9 +6,6 @@ use ply_eval::arena::Slot;
 use ply_eval::cont::{Frame, Prompt, Stack};
 use ply_eval::{Fixture, Machine, Value};
 use ply_span::{SourceId, SourceMap, Span};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::parse_program;
-use ply_syntax::resolve::{Resolved, resolve};
 use ply_ty::Footprint;
 use serde::Serialize;
 use std::hint::black_box;
@@ -260,21 +257,17 @@ test "the shapes all evaluate" {
 }
 "#;
 
-fn load(name: &str, src: &str) -> Result<(Program, Resolved, ply_ty::Front, ply_span::SourceMap)> {
+fn load(name: &str, src: &str) -> Result<(ply_ty::Front, SourceMap)> {
     let mut map = SourceMap::new();
     let id: SourceId = map.add(format!("{name}.ply"), src.to_string());
-    let mut program = parse_program([(id, ModuleName::from_dotted(name), src)])
-        .map_err(|ds| anyhow::anyhow!("the measurement program must parse: {ds:#?}"))?;
-    let resolved =
-        resolve(&mut program).map_err(|ds| anyhow::anyhow!("it must also resolve: {ds:#?}"))?;
     let port =
         ply_codegen::c::producer::checked_front(&[(name.to_string(), src.to_string())], &[id])?;
-    Ok((program, resolved, port, map))
+    Ok((port, map))
 }
 
 pub fn multi_shot(repeats: usize) -> Result<MultiShot> {
-    let (program, resolved, port, sources) = load("multishot", MULTISHOT_SRC)?;
-    let mut machine = crate::tier_machine(&program, &resolved, &port, &sources);
+    let (port, sources) = load("multishot", MULTISHOT_SRC)?;
+    let mut machine = crate::tier_machine(&port, &sources);
 
     let mut rows: Vec<Resumptions> = Vec::new();
     for (count, name) in [(0usize, "r0"), (1, "r1"), (2, "r2"), (4, "r4")] {

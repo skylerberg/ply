@@ -65,15 +65,14 @@ pub fn run_on_tier(
     store: &mut ply_store::Store,
 ) -> ply_test::RunReport {
     ply_codegen::c::producer::ensure_default();
-    let tree = loaded.tree().unwrap_or_else(|d| panic!("{}", d.message));
     let texts = module_texts(&loaded.check, &loaded.sources);
-    let unit = ply_codegen::Unit::over_front(&tree.program, &loaded.front, texts)
-        .expect("this host has a C compiler");
+    let unit =
+        ply_codegen::Unit::over_front(&loaded.front, texts).expect("this host has a C compiler");
     let spec = ply_eval::BackendSpec {
         kind: ply_eval::BackendKind::C,
         ..Default::default()
     };
-    let executor = ply_test::InterpExecutor::new(&tree.program, &tree.resolved, &loaded.check)
+    let executor = ply_test::InterpExecutor::new(&loaded.front)
         .with_backend(unit, spec)
         .with_search(ply_test::Search::of(selection))
         .with_hosts(hosting);
@@ -106,7 +105,6 @@ pub fn prover_backend(
     };
     let provider = build_backend_over(
         &spec,
-        &loaded.tree()?.program,
         &loaded.front,
         module_texts(&loaded.check, &loaded.sources),
     )?;
@@ -116,13 +114,12 @@ pub fn prover_backend(
 /// Every command that loaded a program uses this, so an invocation runs one front end.
 pub fn build_backend_over(
     spec: &ply_eval::BackendSpec,
-    program: &ply_syntax::ast::Program,
     front: &ply_ty::Front,
     texts: std::collections::HashMap<String, String>,
 ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
     ply_codegen::c::producer::ensure_default();
     match spec.kind {
-        ply_eval::BackendKind::C => ply_codegen::Unit::over_front(program, front, texts)
+        ply_eval::BackendKind::C => ply_codegen::Unit::over_front(front, texts)
             .map(|unit| unit as &'static dyn ply_eval::Provider)
             .map_err(unbuilt),
     }

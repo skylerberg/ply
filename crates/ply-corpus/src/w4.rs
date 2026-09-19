@@ -39,8 +39,6 @@ fn diagnostics(what: &str, diagnostics: &[Diagnostic]) -> anyhow::Error {
 
 /// The checked bench program, and the pieces a run needs off it.
 pub struct Program {
-    program: ply_syntax::ast::Program,
-    resolved: ply_syntax::resolve::Resolved,
     check: CheckOutput,
     /// The tier is built from this rather than from a second front end.
     port: ply_ty::Front,
@@ -49,7 +47,7 @@ pub struct Program {
 
 impl Program {
     fn machine(&self) -> Machine<'_> {
-        crate::tier_machine(&self.program, &self.resolved, &self.port, &self.sources)
+        crate::tier_machine(&self.port, &self.sources)
     }
 
     pub fn parse() -> Result<Program> {
@@ -69,25 +67,15 @@ impl Program {
             let id = sources.add(ply_std::pseudo_path(module), source.to_string());
             inputs.push((id, module.clone(), source));
         }
-        // Built before `parse_program` takes `inputs`; a span's module is its index in this order.
+        // A span's module is its index in this order.
         let ordered: Vec<(String, String)> = inputs
             .iter()
             .map(|(_, m, s)| (m.to_string(), s.to_string()))
             .collect();
         let ids: Vec<ply_span::SourceId> = inputs.iter().map(|(id, _, _)| *id).collect();
-        let mut program = ply_syntax::parse_program(inputs)
-            .map_err(|d| diagnostics("parsing the bench program", &d))?;
-        let expanded = ply_derive::expand_program(&mut program);
-        if !expanded.is_empty() {
-            return Err(diagnostics("expanding a `derive`", &expanded));
-        }
-        let resolved = ply_syntax::resolve::resolve(&mut program)
-            .map_err(|d| diagnostics("resolving the bench program", &d))?;
         let port = ply_codegen::c::producer::checked_front(&ordered, &ids)
             .map_err(|e| anyhow::anyhow!("checking the bench program: {e}"))?;
         Ok(Program {
-            program,
-            resolved,
             check: port.check.clone(),
             port,
             sources,

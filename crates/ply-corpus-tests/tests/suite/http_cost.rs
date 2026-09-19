@@ -1,8 +1,5 @@
 use ply_eval::{Machine, Value};
 use ply_span::Span;
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
-use ply_ty::CheckOutput;
 use std::time::{Duration, Instant};
 
 /// Returns a small answer, so building it is not what is timed.
@@ -17,48 +14,44 @@ pub fn bench(raw: Bytes) -> Int =
   }
 ";
 
+/// The shipped modules and `m`, checked, and the default tier built over them once.
+fn tiered(service: &str) -> (ply_ty::Front, &'static ply_codegen::Unit) {
+    let mut modules: Vec<(String, String)> = ply_std::sources()
+        .map(|(name, src)| (name.to_string(), src.to_string()))
+        .collect();
+    modules.push(("m".to_string(), service.to_string()));
+    let ids: Vec<_> = (0..modules.len())
+        .map(|i| ply_span::SourceId(i as u32))
+        .collect();
+    let front = ply_codegen::c::producer::checked_front(&modules, &ids)
+        .unwrap_or_else(|e| panic!("they check: {e:#}"));
+    let unit = ply_codegen::Unit::over_front(&front, modules.into_iter().collect())
+        .expect("this host has a C compiler");
+    (front, unit)
+}
+
+fn on_tier<'a>(front: &'a ply_ty::Front, unit: &'static ply_codegen::Unit) -> Machine<'a> {
+    let mut machine = Machine::new(front);
+    let spec = ply_eval::BackendSpec {
+        kind: ply_eval::BackendKind::C,
+        ..Default::default()
+    };
+    machine.set_compiled(ply_eval::Provider::attach(unit, &spec));
+    machine
+}
+
 struct Bench {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
+    front: ply_ty::Front,
+    unit: &'static ply_codegen::Unit,
     name: String,
 }
 
 impl Bench {
     fn open() -> Bench {
-        let mut sources: Vec<(&str, String)> = ply_std::sources()
-            .map(|(name, src)| (name, src.to_string()))
-            .collect();
-        sources.push(("m", BENCH.to_string()));
-        let inputs: Vec<_> = sources
-            .iter()
-            .enumerate()
-            .map(|(i, (name, src))| {
-                (
-                    ply_span::SourceId(i as u32),
-                    ModuleName::from_dotted(name),
-                    src.as_str(),
-                )
-            })
-            .collect();
-        let mut program = ply_syntax::parse_program(inputs).expect("the shipped modules parse");
-        let diags = ply_derive::expand_program(&mut program);
-        assert!(diags.is_empty(), "{diags:#?}");
-        let resolved = resolve(&mut program).expect("the shipped modules resolve");
-        let modules: Vec<(String, String)> = sources
-            .iter()
-            .map(|(name, src)| (name.to_string(), src.clone()))
-            .collect();
-        let ids: Vec<_> = (0..modules.len())
-            .map(|i| ply_span::SourceId(i as u32))
-            .collect();
-        let check = ply_codegen::c::producer::checked_front(&modules, &ids)
-            .unwrap_or_else(|e| panic!("they check: {e:#}"))
-            .check;
+        let (front, unit) = tiered(BENCH);
         Bench {
-            program,
-            resolved,
-            check,
+            front,
+            unit,
             name: "m.bench".to_string(),
         }
     }
@@ -67,7 +60,7 @@ impl Bench {
     fn cost(&self, head: &[u8], calls: u32) -> Duration {
         let mut best: Option<Duration> = None;
         for _ in 0..5 {
-            let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
+            let mut machine = on_tier(&self.front, self.unit);
             let arg = Value::bytes(head);
             let started = Instant::now();
             for _ in 0..calls {
@@ -194,43 +187,17 @@ fn a_whole_request_through_the_host_boundary() {
     let request = b"GET /hello HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: ply-bench\r\n\r\n";
     let requests = 500u32;
 
-    let mut sources: Vec<(&str, String)> = ply_std::sources()
-        .map(|(name, src)| (name, src.to_string()))
-        .collect();
-    sources.push(("m", SERVICE.to_string()));
-    let inputs: Vec<_> = sources
-        .iter()
-        .enumerate()
-        .map(|(i, (name, src))| {
-            (
-                ply_span::SourceId(i as u32),
-                ModuleName::from_dotted(name),
-                src.as_str(),
-            )
-        })
-        .collect();
-    let mut program = ply_syntax::parse_program(inputs).expect("it parses");
-    assert!(ply_derive::expand_program(&mut program).is_empty());
-    let resolved = resolve(&mut program).expect("it resolves");
-    let modules: Vec<(String, String)> = sources
-        .iter()
-        .map(|(name, src)| (name.to_string(), src.clone()))
-        .collect();
-    let ids: Vec<_> = (0..modules.len())
-        .map(|i| ply_span::SourceId(i as u32))
-        .collect();
-    let check = ply_codegen::c::producer::checked_front(&modules, &ids)
-        .unwrap_or_else(|e| panic!("{e:#}"))
-        .check;
+    let (front, unit) = tiered(SERVICE);
+    let check = &front.check;
 
     let mut best = f64::MAX;
     for _ in 0..3 {
         let script: Vec<Vec<Vec<u8>>> = (0..requests).map(|_| vec![request.to_vec()]).collect();
         let net: Arc<dyn Net> = Arc::new(SimNet::new(script));
         let binding = ply_host::tcp::registry(net)
-            .bind(&check)
+            .bind(check)
             .expect("the declaration and the registration agree");
-        let mut machine = Machine::new(&program, &resolved, &check);
+        let mut machine = on_tier(&front, unit);
         machine.set_host_binding(Arc::new(binding));
         if let Some(declared) = check
             .defs

@@ -1,8 +1,7 @@
 use ply_eval::{Fixture, Machine};
-use ply_span::{SourceId, SourceMap, Symbol};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::parse_program;
-use ply_syntax::resolve::{Resolved, resolve};
+use ply_span::{SourceId, Symbol};
+use ply_syntax::ast::ModuleName;
+use ply_ty::{DefHash, Front};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -41,61 +40,25 @@ fn subdirectories(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn std_imports(id: SourceId, name: &ModuleName, text: &str) -> Vec<ModuleName> {
-    let Ok(module) = ply_syntax::parse_module(id, name.clone(), text) else {
-        return Vec::new();
-    };
-    module
-        .imports
-        .iter()
-        .map(|i| i.module_name())
-        .filter(ply_std::is_std)
-        .collect()
-}
-
-type Loaded = (Program, Resolved, Vec<(String, String)>, Vec<SourceId>);
-
-fn load(root: &Path, files: &[PathBuf]) -> Option<Loaded> {
-    let mut map = SourceMap::new();
-    let mut loaded = Vec::new();
+/// The port's answer over `files` and the shipped modules they import; `None` if it refuses.
+fn load(root: &Path, files: &[PathBuf]) -> Option<Front> {
+    let mut own = Vec::new();
     for path in files {
         let text = std::fs::read_to_string(path).ok()?;
         let relative = path.strip_prefix(root).unwrap_or(path);
         let name = ModuleName::from_relative_path(relative).ok()?;
-        let id = map.add(path, text.clone());
-        loaded.push((id, name, text));
+        own.push((name.to_string(), text));
     }
-    let mut next = 0;
-    while next < loaded.len() {
-        let (id, name, text) = &loaded[next];
-        next += 1;
-        let wanted = std_imports(*id, name, text);
-        for module in wanted {
-            if loaded.iter().any(|(_, n, _)| *n == module) {
-                continue;
-            }
-            let Some(source) = ply_std::source(&module) else {
-                continue;
-            };
-            let id = map.add(ply_std::pseudo_path(&module), source.to_string());
-            loaded.push((id, module, source.to_string()));
-        }
-    }
-    let inputs: Vec<_> = loaded
-        .iter()
-        .map(|(id, name, text)| (*id, name.clone(), text.as_str()))
+    let shelf: Vec<(String, String)> = ply_std::sources()
+        .map(|(module, text)| (module.to_string(), text.to_string()))
         .collect();
-    let mut program = parse_program(inputs).ok()?;
-    if !ply_derive::expand_program(&mut program).is_empty() {
-        return None;
-    }
-    let resolved = resolve(&mut program).ok()?;
-    let named = loaded
-        .iter()
-        .map(|(_, name, text)| (name.to_string(), text.clone()))
+    ply_codegen::c::producer::ensure_default();
+    let pulled = ply_codegen::c::producer::front_pulling_std(&own, &shelf).ok()?;
+    let ids: Vec<SourceId> = (0..own.len() + pulled.modules.len())
+        .map(|i| SourceId(i as u32))
         .collect();
-    let ids = loaded.iter().map(|(id, _, _)| *id).collect();
-    Some((program, resolved, named, ids))
+    let front = ply_ty::read_front(&pulled.dump, &ids).ok()?;
+    (!front.has_error()).then_some(front)
 }
 
 fn corpora(root: &Path) -> Vec<(String, PathBuf, Vec<PathBuf>)> {
@@ -122,22 +85,22 @@ fn corpora(root: &Path) -> Vec<(String, PathBuf, Vec<PathBuf>)> {
 
 /// Declines everything and counts what it was handed: exactly what `admit` cleared.
 struct Declining {
-    program: usize,
+    program: DefHash,
     offered: Cell<u64>,
 }
 
 impl Declining {
-    fn over(program: &Program) -> Declining {
+    fn over(front: &Front) -> Declining {
         Declining {
-            program: std::ptr::from_ref(program) as usize,
+            program: front.hashes.digest(),
             offered: Cell::new(0),
         }
     }
 }
 
 impl ply_eval::Compiled for Declining {
-    fn describes(&self, program: &Program) -> bool {
-        std::ptr::from_ref(program) as usize == self.program
+    fn describes(&self, program: DefHash) -> bool {
+        program == self.program
     }
     fn enter(&self, _: &Symbol, _: &[ply_eval::Value], _: usize) -> Option<ply_eval::Value> {
         self.offered.set(self.offered.get() + 1);
@@ -232,16 +195,12 @@ fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_
 
     let mut prev = (body0, admitted0, scalar0);
     for (label, dir, files) in selection.corpora() {
-        let Some((program, resolved, named, ids)) = load(&dir, &files) else {
+        let Some(front) = load(&dir, &files) else {
             continue;
         };
-        let Ok(front) = ply_codegen::c::producer::checked_front(&named, &ids) else {
-            continue;
-        };
-        let check = front.check;
-        let backend = std::rc::Rc::new(Declining::over(&program));
+        let backend = std::rc::Rc::new(Declining::over(&front));
         // One machine: `admitted` is process-wide, so a second machine would count every call twice.
-        let mut machine = Machine::new(&program, &resolved, &check);
+        let mut machine = Machine::new(&front);
         machine.set_compiled(backend.clone());
         machine.set_regions(Fixture::empty().open().0);
         let mut ran = 0usize;

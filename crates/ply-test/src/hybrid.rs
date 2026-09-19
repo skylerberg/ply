@@ -201,9 +201,9 @@ impl Hybrid for BodyHybrid<'_> {
         let Ok(mut rebuilt) = reconstruct_relinked(&bodies, &chosen.relink) else {
             return Trial::unresolved(Unresolved::MissingBody);
         };
-        let Ok(resolved) = ply_syntax::resolve(&mut rebuilt.program) else {
+        if ply_syntax::resolve(&mut rebuilt.program).is_err() {
             return Trial::unresolved(Unresolved::DoesNotCheck);
-        };
+        }
         // A mixture has no source text: it is printed once, and that text is checked and built.
         let printed = ply_syntax::print::program(&rebuilt.program);
         // Fresh ids: reconstructed modules all carry `Span::DUMMY.source` and would share one.
@@ -241,9 +241,9 @@ impl Hybrid for BodyHybrid<'_> {
             // Hermetic always: a search asks this up to `Budget::max_trials` times.
             let texts: std::collections::HashMap<String, String> =
                 printed.iter().cloned().collect();
-            let mut machine = ply_eval::Machine::new(&rebuilt.program, &resolved, check);
-            let unit = ply_codegen::Unit::over_front(&rebuilt.program, &front, texts)
-                .expect("this host has a C compiler");
+            let mut machine = ply_eval::Machine::new(&front);
+            let unit =
+                ply_codegen::Unit::over_front(&front, texts).expect("this host has a C compiler");
             let spec = ply_eval::BackendSpec {
                 kind: ply_eval::BackendKind::C,
                 ..Default::default()

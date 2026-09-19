@@ -1,17 +1,20 @@
 use ply_eval::{Machine, Provider};
 use ply_span::{Diagnostic, SourceId};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
-use ply_ty::CheckOutput;
+use ply_syntax::ast::ModuleName;
+use ply_ty::{CheckOutput, Front};
 use std::collections::HashMap;
 
 /// `sources[i]` is `(module name, text)` for `SourceId(i)`.
 #[track_caller]
-pub fn port_check(sources: &[(&str, &str)]) -> CheckOutput {
+pub fn port_front(sources: &[(&str, &str)]) -> Front {
     let (named, ids) = inputs(sources);
     ply_codegen::c::producer::checked_front(&named, &ids)
         .unwrap_or_else(|e| panic!("the fixture must typecheck: {e:#}"))
-        .check
+}
+
+#[track_caller]
+pub fn port_check(sources: &[(&str, &str)]) -> CheckOutput {
+    port_front(sources).check
 }
 
 /// Every diagnostic when any is an error, as a refusing checker answers; empty otherwise.
@@ -43,9 +46,7 @@ fn inputs(sources: &[(&str, &str)]) -> (Vec<(String, String)>, Vec<SourceId>) {
 }
 
 pub struct Compiled {
-    pub program: Program,
-    pub resolved: Resolved,
-    pub check: CheckOutput,
+    pub front: Front,
     /// Keyed by `m.name.to_string()`: the Ply emitter re-parses source text, not the AST.
     pub texts: HashMap<String, String>,
 }
@@ -66,16 +67,7 @@ impl Compiled {
     /// Several modules, each one's `SourceId` its position in `sources`.
     #[track_caller]
     pub fn modules(sources: &[(&str, &str)]) -> Compiled {
-        let inputs: Vec<_> = sources
-            .iter()
-            .enumerate()
-            .map(|(i, (name, src))| (SourceId(i as u32), ModuleName::from_dotted(name), *src))
-            .collect();
-        let mut program = ply_syntax::parse_program(inputs)
-            .unwrap_or_else(|d| panic!("the fixture must parse: {d:#?}"));
-        let resolved =
-            resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = port_check(sources);
+        let front = port_front(sources);
         let texts = sources
             .iter()
             .map(|(name, src)| {
@@ -85,12 +77,7 @@ impl Compiled {
                 )
             })
             .collect();
-        Compiled {
-            program,
-            resolved,
-            check,
-            texts,
-        }
+        Compiled { front, texts }
     }
 
     /// The port's diagnostics, empty if it accepted.
@@ -107,8 +94,9 @@ impl Compiled {
 
     /// A machine with a compiled tier attached: a bare machine holds no evaluator.
     pub fn machine(&self) -> Machine<'_> {
-        let mut m = Machine::new(&self.program, &self.resolved, &self.check);
-        let unit = ply_codegen::Unit::over_with_texts(&self.program, self.texts.clone())
+        ply_codegen::c::producer::ensure_default();
+        let mut m = Machine::new(&self.front);
+        let unit = ply_codegen::Unit::over_front(&self.front, self.texts.clone())
             .expect("this host has a C compiler");
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,
@@ -123,7 +111,8 @@ impl Compiled {
     }
 
     pub fn index_of(&self, name: &str) -> usize {
-        self.check
+        self.front
+            .check
             .tests
             .iter()
             .position(|t| t.name == name)

@@ -5,8 +5,7 @@ use crate::load::Loaded;
 use ply_hash::body::{BodySet, StoredBody};
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Severity, SourceMap, Span, Symbol, codes};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::Resolved;
+use ply_syntax::ast::ModuleName;
 use ply_ty::{DefInfo, Front};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -304,7 +303,7 @@ fn embedded_unit(opened: &Opened, names: &[&str]) -> (Option<EmbeddedUnit>, Vec<
         .filter(|name| opened.front.check.defs.contains_key(&Symbol::new(name)))
         .collect();
     let texts = crate::commands::common::module_texts(&opened.front.check, &opened.sources);
-    let produced = ply_codegen::Unit::over_front(&opened.program, &opened.front, texts)
+    let produced = ply_codegen::Unit::over_front(&opened.front, texts)
         .and_then(|unit| unit.produce(&names))
         .and_then(|produced| {
             let text = ply_codegen::c::bundle::pack(&produced.text)?;
@@ -652,8 +651,6 @@ pub fn read(path: &Path) -> Result<(Artifact, Vec<Diagnostic>), Diagnostic> {
 
 pub struct Opened {
     pub sources: SourceMap,
-    pub program: Program,
-    pub resolved: Resolved,
     pub front: Front,
     /// The name the entry point answers to in this program.
     pub entry: Symbol,
@@ -678,24 +675,36 @@ pub fn open(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnostic>>
     })
 }
 
+/// Shipped modules live in this binary, pinned by the header's `ply_std::digest()`; the port
+/// pulls in the ones the closure imports and places them after it.
 fn ask_the_port(
-    inputs: &[(ply_span::SourceId, ModuleName, String)],
+    own: &[(String, String)],
+    ids: &mut Vec<ply_span::SourceId>,
+    sources: &mut SourceMap,
 ) -> Result<Front, Vec<Diagnostic>> {
     ply_codegen::c::producer::ensure_default();
-    let sources: Vec<(String, String)> = inputs
-        .iter()
-        .map(|(_, name, text)| (name.to_string(), text.clone()))
-        .collect();
-    let ids: Vec<ply_span::SourceId> = inputs.iter().map(|(id, _, _)| *id).collect();
-    let front = ply_codegen::c::producer::front(&sources, &ids).map_err(|e| {
+    let failed = |why: String| {
         vec![
             Diagnostic::error(
                 codes::INTERNAL_ERROR,
-                format!("the front end could not answer for this program: {e:#}"),
+                format!("the front end could not answer for this program: {why}"),
             )
             .note("this is Ply's fault: the compiler's own front end is what failed here"),
         ]
-    })?;
+    };
+    let shelf: Vec<(String, String)> = ply_std::sources()
+        .map(|(module, text)| (module.to_string(), text.to_string()))
+        .collect();
+    let pulled = ply_codegen::c::producer::front_pulling_std(own, &shelf)
+        .map_err(|e| failed(format!("{e:#}")))?;
+    for module in &pulled.modules {
+        let name = ModuleName::from_dotted(module);
+        let text = ply_std::source(&name)
+            .ok_or_else(|| failed(format!("it pulled in `{module}`, which is not shipped")))?;
+        ids.push(sources.add(ply_std::pseudo_path(&name), text));
+    }
+    let front = ply_ty::read_front(&pulled.dump, ids.as_slice())
+        .map_err(|e| failed(format!("the front end's answer does not read: {e}")))?;
     let errors: Vec<Diagnostic> = front
         .diagnostics
         .iter()
@@ -711,7 +720,8 @@ fn ask_the_port(
 
 fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
     let mut sources = SourceMap::new();
-    let mut inputs: Vec<(ply_span::SourceId, ModuleName, String)> = Vec::new();
+    let mut own: Vec<(String, String)> = Vec::new();
+    let mut ids: Vec<ply_span::SourceId> = Vec::new();
     for (file, text) in &artifact.closure {
         let relative = PathBuf::from(file);
         let name = ModuleName::from_relative_path(&relative).map_err(|d| vec![d])?;
@@ -720,49 +730,10 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
                 "the closure carries `{file}`, a module this `ply` ships"
             ))]);
         }
-        let id = sources.add(&relative, text.clone());
-        inputs.push((id, name, text.clone()));
+        ids.push(sources.add(&relative, text.clone()));
+        own.push((name.to_string(), text.clone()));
     }
-
-    // Shipped modules live in this binary, pinned by the header's `ply_std::digest()`.
-    let mut program = parse(&inputs)?;
-    loop {
-        let mut added = false;
-        let present: BTreeSet<Symbol> = program
-            .modules
-            .iter()
-            .map(|m| m.name.as_symbol().clone())
-            .collect();
-        let mut wanted: BTreeSet<ModuleName> = BTreeSet::new();
-        for module in &program.modules {
-            for import in &module.imports {
-                let name = import.module_name();
-                if ply_std::is_std(&name) && !present.contains(name.as_symbol()) {
-                    wanted.insert(name.clone());
-                }
-            }
-        }
-        for name in wanted {
-            let Some(text) = ply_std::source(&name) else {
-                continue;
-            };
-            let id = sources.add(ply_std::pseudo_path(&name), text);
-            inputs.push((id, name, text.to_string()));
-            added = true;
-        }
-        if !added {
-            break;
-        }
-        program = parse(&inputs)?;
-    }
-
-    let diags = ply_derive::expand_program(&mut program);
-    if !diags.is_empty() {
-        return Err(diags);
-    }
-    let resolved = ply_syntax::resolve(&mut program)?;
-
-    let front = ask_the_port(&inputs)?;
+    let front = ask_the_port(&own, &mut ids, &mut sources)?;
 
     let hashes = &front.hashes;
     let bodies = ply_hash::body::of_front(&front);
@@ -809,19 +780,9 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
         .ok_or_else(|| vec![unfaithful("the artifact names no entry point".to_string())])?;
     Ok(Opened {
         sources,
-        program,
-        resolved,
         front,
         entry,
     })
-}
-
-fn parse(inputs: &[(ply_span::SourceId, ModuleName, String)]) -> Result<Program, Vec<Diagnostic>> {
-    ply_syntax::parse_program(
-        inputs
-            .iter()
-            .map(|(id, name, text)| (*id, name.clone(), text.as_str())),
-    )
 }
 
 #[derive(Default, Debug)]
@@ -1113,18 +1074,12 @@ fn tier(
             )
         };
         let text = ply_codegen::c::bundle::unpack(&unit.text).map_err(|e| unit_error(&e))?;
-        let provider: &'static dyn ply_eval::Provider = ply_codegen::Unit::embedded(
-            &opened.program,
-            &opened.resolved,
-            &opened.front.check,
-            text,
-        )
-        .map_err(|e| unit_error(&e))?;
+        let provider: &'static dyn ply_eval::Provider =
+            ply_codegen::Unit::embedded(&opened.front, text).map_err(|e| unit_error(&e))?;
         return Ok(Some((provider, spec)));
     }
     let texts = crate::commands::common::module_texts(&opened.front.check, &opened.sources);
-    let provider =
-        crate::commands::common::build_backend_over(&spec, &opened.program, &opened.front, texts)?;
+    let provider = crate::commands::common::build_backend_over(&spec, &opened.front, texts)?;
     Ok(Some((provider, spec)))
 }
 
@@ -1136,8 +1091,7 @@ fn evaluate(
     declared: Option<&ply_ty::ty::Footprint>,
     tier: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
 ) -> Result<ply_eval::Value, Diagnostic> {
-    let mut machine =
-        ply_eval::Machine::new(&opened.program, &opened.resolved, &opened.front.check);
+    let mut machine = ply_eval::Machine::new(&opened.front);
     if let Some((provider, spec)) = tier {
         machine.set_compiled(provider.attach(&spec));
     }

@@ -2,7 +2,6 @@ use ply_eval::Plan;
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId, Symbol};
 use ply_store::{Outcome, Store};
-use ply_syntax::resolve::Resolved;
 use ply_test::{
     Executor, Hosting, InterpExecutor, Isolation, Parallelism, Reason, Search, Selection, Status,
     group_by_conflict, run_with, select,
@@ -41,7 +40,7 @@ impl Drop for TempRoot {
 
 struct Program {
     program: ply_syntax::ast::Program,
-    resolved: Resolved,
+    port: ply_ty::Front,
     check: CheckOutput,
     hashes: HashOutput,
     src: String,
@@ -53,13 +52,13 @@ impl Program {
         let mut program = ply_syntax::ast::Program::single(module);
         let resolved = ply_syntax::resolve(&mut program)
             .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = crate::fixture::port_check(&[(String::new(), src.to_string())], &[SourceId(0)]);
-        let hashes = ply_hash::hash_program(&program, &resolved, &check)
+        let port = crate::fixture::port_front(&[(String::new(), src.to_string())], &[SourceId(0)]);
+        let hashes = ply_hash::hash_program(&program, &resolved, &port.check)
             .unwrap_or_else(|d| panic!("hash: {d:#?}"));
         Program {
             program,
-            resolved,
-            check,
+            check: port.check.clone(),
+            port,
             hashes,
             src: src.to_string(),
         }
@@ -95,16 +94,16 @@ impl Program {
         )
     }
 
-    /// Runs on the compiled C tier; `Unit::over_with_texts` leaks a `&'static Unit`.
+    /// Runs on the compiled C tier; `Unit::over_front` leaks a `&'static Unit`.
     fn run(&self, selection: &Selection, store: &mut Store) -> ply_test::RunReport {
-        let unit = ply_codegen::Unit::over_with_texts(&self.program, self.texts())
+        let unit = ply_codegen::Unit::over_front(&self.port, self.texts())
             .expect("this host has a C compiler");
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,
             ..Default::default()
         };
         let executor = TierExecutor(
-            InterpExecutor::new(&self.program, &self.resolved, &self.check)
+            InterpExecutor::new(&self.port)
                 .with_backend(unit, spec)
                 .with_hosts(Hosting::hermetic())
                 .with_search(Search::of(selection)),

@@ -81,9 +81,6 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
 
     let plan = crate::simulation::prove_plan(&args.prove, &args.simulation);
     let specified = obligation::specified(&scoped, &laws, &collected.obligations);
-    if let Err(diagnostic) = loaded.tree() {
-        return report_load_error("review", &loaded.refused(diagnostic), args.json, style);
-    }
     let backend = match super::common::prover_backend(args.backend.as_ref(), &loaded) {
         Ok(backend) => backend,
         Err(diagnostic) => {

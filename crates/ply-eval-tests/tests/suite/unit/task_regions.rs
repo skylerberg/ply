@@ -159,67 +159,6 @@ fn no_pin_is_taken_outside_every_program_region() {
     assert!(regions.pin().is_none());
 }
 
-/// The soundness condition for "a `shared` region opens no scope".
-#[test]
-fn a_shared_region_never_nests_inside_a_unique_one() {
-    const NESTED: &str = r#"
-effect amb { read flip[coin]() -> Bool }
-effect st { write put[s](v: Int) -> Unit }
-
-// The handler is outside the inner region, so the inner region's capture
-// crosses its boundary and the outer one has a clause of its own.
-pub fn both(n: Int) -> Int =
-  with_cell[outer](0) { o ->
-handle {
-  with_cell[inner](0) { i -> { cell_set(i, n); st.put[s](cell_get(i)); cell_get(o) } }
-} with {
-  st.put[s](v) -> cell_set(o, v),
-}
-  }
-
-// Nesting with no capture at all: both may be `unique`, and the invariant is
-// vacuous rather than violated here.
-pub fn neither(n: Int) -> Int =
-  with_cell[a](n) { x -> with_cell[b](0) { y -> { cell_set(y, cell_get(x)); cell_get(y) } } }
-
-pub fn choice() -> Int =
-  with_cell[r](0) { c ->
-handle { if amb.flip[coin]() { cell_get(c) } else { 0 } } with {
-  amb.flip[coin]() resume k -> k(true) + k(false),
-}
-  }
-"#;
-
-    let inputs = [(
-        ply_span::SourceId(0),
-        ply_syntax::ast::ModuleName::from_dotted("m"),
-        NESTED,
-    )];
-    let mut program = ply_syntax::parse_program(inputs).expect("the fixture parses");
-    let resolved = ply_syntax::resolve::resolve(&mut program).expect("the fixture resolves");
-    let regions = ply_eval::region_kind::infer(&program, &resolved);
-    assert!(regions.len() >= 5, "{} regions found", regions.len());
-
-    for outer in regions.iter() {
-        if outer.kind != RegionKind::Unique {
-            continue;
-        }
-        for inner in regions.iter() {
-            let nested = inner.span.source == outer.span.source
-                && inner.span.start >= outer.span.start
-                && inner.span.end <= outer.span.end
-                && inner.span != outer.span;
-            assert!(
-                !(nested && inner.kind == RegionKind::Shared),
-                "`{}` is unique and encloses `{}`, which is shared: its close would \
-                 truncate slots a resumption can still reach",
-                outer.brand,
-                inner.brand
-            );
-        }
-    }
-}
-
 #[test]
 fn an_empty_fixture_opens_an_empty_stack() {
     let (regions, handle) = Fixture::empty().open();

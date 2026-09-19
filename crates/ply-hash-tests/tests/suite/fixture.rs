@@ -3,11 +3,15 @@ use ply_ty::CheckOutput;
 
 /// `files[i]` is `(module name, text)` for `SourceId(i)`.
 #[track_caller]
-pub fn port_check(files: &[(&str, &str)]) -> CheckOutput {
+pub fn port_front(files: &[(&str, &str)]) -> ply_ty::Front {
     let (named, ids) = inputs(files);
     ply_codegen::c::producer::checked_front(&named, &ids)
         .unwrap_or_else(|e| panic!("the program must typecheck: {e:#}"))
-        .check
+}
+
+#[track_caller]
+pub fn port_check(files: &[(&str, &str)]) -> CheckOutput {
+    port_front(files).check
 }
 
 /// Every diagnostic when any is an error; empty when the port accepts.

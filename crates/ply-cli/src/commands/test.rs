@@ -23,6 +23,11 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 pub fn execute(args: &TestArgs, style: Style) -> i32 {
+    execute_holding(args, style, &mut crate::warm::Warm::default())
+}
+
+/// [`execute`], leaving what the last iteration loaded and built in `warm`.
+pub fn execute_holding(args: &TestArgs, style: Style, warm: &mut crate::warm::Warm) -> i32 {
     let warnings = Vec::new();
     // Before the store opens, so a refused `--backend` leaves no cache directory behind.
     let backend =
@@ -60,15 +65,10 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
             return EXIT_COMPILE_ERROR;
         }
     };
-    let mut warm = crate::warm::Warm::default();
     if !args.watch {
-        return iterate(
-            args, style, &mut cache, &backend, &engine, &mut warm, warnings,
-        );
+        return iterate(args, style, &mut cache, &backend, &engine, warm, warnings);
     }
-    watch(
-        args, style, &mut cache, &backend, &engine, &mut warm, warnings,
-    )
+    watch(args, style, &mut cache, &backend, &engine, warm, warnings)
 }
 
 /// Re-run whenever the tree moves, holding what the last iteration built.
@@ -163,19 +163,11 @@ fn iterate(
     let schema_named =
         args.config.schema.is_some() || db.as_ref().is_some_and(|c| c.schema.is_some());
     let wanted = backend.as_ref().filter(|_| !nothing_to_run || schema_named);
-    // A backend answers only for the program it was built over, and the machine checks that.
-    let (run_program, run_resolved) = match loaded.tree() {
-        Ok(tree) => (&tree.program, &tree.resolved),
-        Err(diagnostic) => {
-            return report_load_error("test", &loaded.refused(diagnostic), args.json, style);
-        }
-    };
     // The last iteration's unit, when every definition is unchanged.
     let held_unit = wanted.and_then(|spec| warm.unit_for(spec, &hashes));
     let unit = match wanted.filter(|_| held_unit.is_none()).map(|spec| {
         build_backend_over(
             spec,
-            run_program,
             &loaded.front,
             super::common::module_texts(&loaded.check, &loaded.sources),
         )
@@ -238,7 +230,7 @@ fn iterate(
     // A factory: a reactor belongs to its thread, and each worker builds its own machine.
     let runtime = hosts.runtime_factory();
     let mut run = || {
-        let mut executor = ply_test::InterpExecutor::new(run_program, run_resolved, &loaded.check)
+        let mut executor = ply_test::InterpExecutor::new(&loaded.front)
             .with_search(simulation.clone())
             .with_hosts(hosting(&hosts, &runtime));
         if let (Some(provider), Some(spec)) = (provider, backend.clone()) {
@@ -258,16 +250,21 @@ fn iterate(
     };
     warnings.extend(report.warnings.iter().cloned());
 
-    // After the run, since a pass recorded now is a valid baseline for another test's failure;
-    // over the program that ran, since a run-only module's tests are absent from the checked one.
-    warnings.extend(ply_test::diagnose_failures(
-        &mut report,
-        run_program,
-        run_resolved,
-        &loaded.front,
-        &mut cache.store,
-        &diagnosis_options(args),
-    ));
+    // After the run, since a pass recorded now is a valid baseline for another test's failure.
+    // Bisection still walks Rust trees, so only a failure parses one.
+    if !report.failures.is_empty() {
+        match loaded.tree() {
+            Ok(tree) => warnings.extend(ply_test::diagnose_failures(
+                &mut report,
+                &tree.program,
+                &tree.resolved,
+                &loaded.front,
+                &mut cache.store,
+                &diagnosis_options(args),
+            )),
+            Err(disagreement) => warnings.push(disagreement),
+        }
+    }
     // Pass records are read lazily, so an unreadable baseline only surfaces here.
     warnings.extend(cache.store.take_warnings());
     let warnings = once_each(warnings);
