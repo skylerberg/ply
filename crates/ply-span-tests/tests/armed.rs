@@ -77,13 +77,7 @@ const UNARMED_VARIANTS: &[(&str, &str)] = &[
 ];
 
 /// Functions that take a code and hand it to `Diagnostic::error`/`warning` unchanged.
-const CODE_INDIRECTION: &[Indirection] = &[Indirection {
-    file: "crates/ply-syntax/src/lexer.rs",
-    function: "error",
-    reason: "Lexer::error(code, message, span, label) pushes \
-             Diagnostic::error(code, message).primary(span, label) and does \
-             nothing else with the code. Private to the lexer.",
-}];
+const CODE_INDIRECTION: &[Indirection] = &[];
 
 /// Covered enum names that more than one covered enum declares.
 const AMBIGUOUS_ENUM_NAMES: &[(&str, &str)] = &[(

@@ -1,8 +1,8 @@
 use ply_cli::signature::*;
 use ply_span::Symbol;
-use ply_syntax::ast::{Mode, ModuleName};
 use ply_ty::DefInfo;
 use ply_ty::ty::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
+use ply_ty::{Mode, ModuleName};
 
 fn atom(effect: &str, mode: Mode, resource: Option<&str>) -> EffectAtom {
     EffectAtom::new(

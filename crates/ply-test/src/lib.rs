@@ -14,10 +14,10 @@ pub mod slice;
 use ply_eval::explore::{Interleaving, explore, measure_reduction};
 use ply_eval::host::{HostBinding, HostRuntime};
 use ply_eval::{Arena, Exploration, Machine, Plan, Race, Seed, TaskRegions, Value};
-use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Symbol, codes};
 use ply_store::{Outcome, PassRecord, Store};
 use ply_ty::{CheckOutput, Footprint};
+use ply_ty::{DefHash, HashOutput};
 use serde::Serialize;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -855,7 +855,7 @@ pub fn diagnose_failures(
 
     let edges = DepEdges::from(hashes);
 
-    let fresh = ply_hash::body::of_front(front);
+    let fresh = ply_store::body::of_front(front);
 
     // A green hybrid may be cached, but only after the search's borrow on the store ends.
     let mut proved: Vec<DefHash> = Vec::new();

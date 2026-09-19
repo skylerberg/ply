@@ -1,9 +1,9 @@
 //! `Edited` versus `Derived`, exactly: today's bodies hashed as the baseline wrote references.
 
 use super::{Baseline, DefKey, Ns};
-use ply_hash::DefHash;
 use ply_span::Symbol;
 use ply_span::frames::Cursor;
+use ply_ty::DefHash;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Default)]

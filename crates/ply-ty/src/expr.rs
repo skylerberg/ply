@@ -1,4 +1,4 @@
-//! Operators and literals, shared by the syntax tree, checker, evaluator and code generator.
+//! Operators and literals, shared by the evaluator, the prover and the code generator.
 
 use crate::IntTy;
 

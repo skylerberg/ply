@@ -2,7 +2,7 @@ use ply_corpus::regions::{
     Corpus, Hypothetical, analyse, colour, hypothetical, makespan, region_footprint,
 };
 use ply_span::Symbol;
-use ply_syntax::ast::Mode;
+use ply_ty::Mode;
 use ply_ty::{EffectAtom, Footprint, Resource};
 
 fn atom(effect: &str, resource: &str, mode: Mode) -> EffectAtom {

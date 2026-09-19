@@ -114,15 +114,6 @@ fn attempt_for_test(f: &Fixture, label: &str) -> (Decision, Vec<Blocker>) {
     )
 }
 
-#[test]
-fn the_prover_does_not_depend_on_the_rust_syntax_tree() {
-    let manifest = include_str!("../../../ply-prove/Cargo.toml");
-    assert!(
-        !manifest.contains("ply-syntax"),
-        "`ply-prove` depends on `ply-syntax` again; lower what it needs in the port instead"
-    );
-}
-
 #[track_caller]
 fn proof(fixture: &Fixture, label: &str) -> Proof {
     match attempt(fixture, label) {

@@ -598,7 +598,7 @@ fn a_statement_that_could_change_session_state_is_refused(cluster: &Cluster) {
             &scan,
             Op::Query,
             &Resource::Named(Symbol::new("t")),
-            Some(&row([atom("t", ply_syntax::ast::Mode::Read)])),
+            Some(&row([atom("t", ply_ty::Mode::Read)])),
             Span::DUMMY,
         )
         .unwrap_or_else(|d| panic!("`{sql}`: {}", d.message));
@@ -789,7 +789,7 @@ fn every_injection_route_stays_inside_one_statement(cluster: &Cluster) {
         &scan,
         Op::Query,
         &Resource::Named(Symbol::new("t")),
-        Some(&row([atom("t", ply_syntax::ast::Mode::Read)])),
+        Some(&row([atom("t", ply_ty::Mode::Read)])),
         Span::DUMMY,
     )
     .expect_err("`other` is not in the row");
@@ -1089,7 +1089,7 @@ fn finish_shared(cluster: &Cluster, db: Arc<Postgres>) {
     );
 }
 
-fn atom(table: &str, mode: ply_syntax::ast::Mode) -> EffectAtom {
+fn atom(table: &str, mode: ply_ty::Mode) -> EffectAtom {
     EffectAtom::new(
         Symbol::new(db::EFFECT),
         Resource::Named(Symbol::new(table)),

@@ -5,8 +5,8 @@ use crate::cli::HashArgs;
 use crate::load::{Loaded, load};
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_OK};
-use ply_hash::HashOutput;
 use ply_span::Symbol;
+use ply_ty::HashOutput;
 use serde_json::{Value, json};
 
 /// The grouping below is the one thing in this output that could be mistaken for part of a hash.

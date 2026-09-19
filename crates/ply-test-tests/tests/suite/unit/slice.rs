@@ -132,7 +132,7 @@ fn only_performed_atoms_are_observed() {
     let atom = ply_ty::EffectAtom::new(
         "db",
         ply_ty::Resource::Named(Symbol::new("users")),
-        ply_syntax::ast::Mode::Read,
+        ply_ty::Mode::Read,
     );
     let mut b = built(&[enter("f"), Event::Perform(atom.clone())]);
     b.failed();

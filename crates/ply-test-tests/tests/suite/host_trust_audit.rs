@@ -509,7 +509,7 @@ test "the regression" { assert_eq(ask(1), expected()) }
     ply_test::diagnose_failures(
         &mut report,
         &sources,
-        &after.front(),
+        &after.port,
         &mut store,
         &ply_test::Options::default(),
     );

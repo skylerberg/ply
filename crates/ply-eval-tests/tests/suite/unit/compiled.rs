@@ -1,11 +1,9 @@
 use crate::fixture::port_front;
-use crate::unit::build::*;
 use ply_eval::Value;
 use ply_eval::compiled::*;
 use ply_eval::evaluator::Machine;
 use ply_span::Symbol;
 use ply_span::{Diagnostic, codes};
-use ply_syntax::ast::{BinOp, Item};
 use ply_ty::{DefHash, Front};
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -13,13 +11,6 @@ use std::sync::Arc;
 
 struct Checked {
     front: Front,
-}
-
-fn checked(items: Vec<Item>) -> Checked {
-    let text = ply_syntax::print::module(&module(items));
-    Checked {
-        front: port_front(&[("", text.as_str())]),
-    }
 }
 
 impl Checked {
@@ -32,20 +23,10 @@ impl Checked {
     }
 }
 
-/// From source, because `build::fn_def` cannot write the declared types the argument gate reads.
 fn checked_source(source: &str) -> Checked {
     Checked {
         front: port_front(&[("", source)]),
     }
-}
-
-fn double_def() -> Item {
-    fn_def_sig(
-        "double",
-        &[("x", tcon("Int"))],
-        tcon("Int"),
-        bin(BinOp::Mul, var("x"), int(2)),
-    )
 }
 
 #[test]
@@ -191,18 +172,9 @@ fn first_test_under(
     (outcome, machine.compiled_counts())
 }
 
-fn double_doubles(expected: i64) -> Vec<Item> {
-    vec![
-        double_def(),
-        test_def(
-            "double doubles",
-            callv(
-                "assert_eq",
-                vec![callv("double", vec![int(21)]), int(expected)],
-            ),
-        ),
-    ]
-}
+/// A test whose assertion fails: `double(21)` is 42.
+const DOUBLE_DOUBLES: &str =
+    "fn double(x: Int) -> Int = x * 2\n\ntest \"double doubles\" { assert_eq(double(21), 43) }\n";
 
 fn assertion_raised() -> Entered {
     Entered::Raised(Diagnostic::error(codes::RUNTIME_ERROR, "assertion failed"))
@@ -210,7 +182,7 @@ fn assertion_raised() -> Entered {
 
 #[test]
 fn a_test_root_the_backend_raised_in_keeps_the_machines_diagnostic_when_it_raises_too() {
-    let c = checked(double_doubles(43));
+    let c = checked_source(DOUBLE_DOUBLES);
     let (outcome, _) = first_test_under(&c, assertion_raised);
     let d = outcome.expect_err("the assertion fails in the machine");
     assert_eq!(d.code, codes::RUNTIME_ERROR);

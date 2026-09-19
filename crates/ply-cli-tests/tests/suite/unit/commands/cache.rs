@@ -2,8 +2,8 @@ use ply_cli::cli::{CacheScope, InspectArgs};
 use ply_cli::commands::cache::*;
 use ply_cli::style::Style;
 use ply_cli::{EXIT_COMPILE_ERROR, EXIT_OK};
-use ply_hash::DefHash;
 use ply_store::{CacheStats, Outcome, Store};
+use ply_ty::DefHash;
 use std::path::Path;
 
 fn project(files: &[(&str, &str)]) -> tempfile::TempDir {

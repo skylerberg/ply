@@ -6,18 +6,6 @@ use ply_codegen::c::producer::{self, PlyProducer};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-fn repo() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("the crate sits two levels under the repository root")
-        .to_path_buf()
-}
-
-fn ply_compiler_dir() -> String {
-    repo().join("crates/ply-compiler").display().to_string()
-}
-
 fn emitter_source() -> (&'static Source, String) {
     // In `ply_compiler::MODULES`' order, so the identity written into the bundle is the one the producer computes reading it back.
     let modules: Vec<(String, String)> = ply_std::sources()
@@ -25,27 +13,6 @@ fn emitter_source() -> (&'static Source, String) {
         .map(|(m, t)| (m.to_string(), t.to_string()))
         .collect();
     let identity = producer::digest_of(&modules);
-    let mut sources = ply_span::SourceMap::new();
-    let mut inputs = Vec::new();
-    let mut texts: HashMap<String, String> = HashMap::new();
-    for (module, text) in ply_std::sources() {
-        texts.insert(module.to_string(), text.to_string());
-        let module = ply_syntax::ast::ModuleName::from_dotted(module);
-        let id = sources.add(ply_std::pseudo_path(&module), text.to_string());
-        inputs.push((id, module, text));
-    }
-    for (stem, text) in ply_compiler::sources() {
-        texts.insert(stem.to_string(), text.to_string());
-        let id = sources.add(
-            PathBuf::from(format!("{}/ply/{stem}.ply", ply_compiler_dir())),
-            text.to_string(),
-        );
-        inputs.push((id, ply_syntax::ast::ModuleName::from_dotted(stem), text));
-    }
-    let mut ast = ply_syntax::parse_program(inputs).expect("the emitter parses");
-    let expanded = ply_derive::expand_program(&mut ast);
-    assert!(expanded.is_empty(), "{expanded:?}");
-    let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the emitter resolves");
     // No recipe is installed: each round's emitter is handed over in `emit_with`, and a handover wins over an installation.
     let ids: Vec<_> = (0..modules.len())
         .map(|i| ply_span::SourceId(i as u32))
@@ -62,18 +29,10 @@ fn emitter_source() -> (&'static Source, String) {
         "the compiler or the standard library carries definitions nothing reaches; delete them:\n  {}",
         unused.join("\n  ")
     );
-    let check = front.check;
-    let program: &'static ply_syntax::ast::Program = Box::leak(Box::new(ast));
-    let resolved = Box::leak(Box::new(resolved));
-    let check = Box::leak(Box::new(check));
-    let hashes = ply_hash::hash_program(program, resolved, check).expect("the emitter hashes");
-    let keys: HashMap<String, String> = hashes
-        .defs
-        .iter()
-        .map(|(name, h)| (name.to_string(), h.to_hex()))
-        .collect();
+    let front: &'static ply_ty::Front = Box::leak(Box::new(front));
+    let texts: HashMap<String, String> = modules.into_iter().collect();
     let source: &'static Source = Box::leak(Box::new(
-        Source::keyed(program, resolved, check, keys).with_texts(texts),
+        Source::from_front(front, ply_codegen::emit_keys(front)).with_texts(texts),
     ));
     (source, identity)
 }

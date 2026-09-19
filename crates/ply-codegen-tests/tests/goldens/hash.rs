@@ -10,13 +10,13 @@ fn first_difference(reference: &str, actual: &str) -> Option<String> {
         if a != b {
             let from = i.saturating_sub(4);
             let mut report = format!(
-                "record {i} of {} differs\n  rust: {a:?}\n  ply : {b:?}\n  context (rust):\n",
+                "record {i} of {} differs\n  golden: {a:?}\n  port  : {b:?}\n  context (golden):\n",
                 want.len()
             );
             for (j, r) in want.iter().enumerate().skip(from).take(10) {
                 report.push_str(&format!("    {j:>7} {r}\n"));
             }
-            report.push_str("  context (ply):\n");
+            report.push_str("  context (port):\n");
             for (j, r) in got.iter().enumerate().skip(from).take(10) {
                 report.push_str(&format!("    {j:>7} {r}\n"));
             }
@@ -78,7 +78,7 @@ fn std_modules() -> Vec<(String, String)> {
 }
 
 #[test]
-fn the_ply_hasher_matches_its_golden_on_the_standard_library() {
+fn the_hasher_matches_its_golden_on_the_standard_library() {
     compare(
         "std",
         &[("the standard library".to_string(), std_modules())],
@@ -86,7 +86,7 @@ fn the_ply_hasher_matches_its_golden_on_the_standard_library() {
     );
 }
 
-fn the_ply_hasher_matches_its_golden_on_every_example_with_the_standard_library(
+fn the_hasher_matches_its_golden_on_every_example_with_the_standard_library(
     index: usize,
     of: usize,
 ) {
@@ -110,9 +110,9 @@ fn the_ply_hasher_matches_its_golden_on_every_example_with_the_standard_library(
 }
 
 #[test]
-fn the_ply_hasher_matches_its_golden_on_every_example_with_the_standard_library_part_1_of_2() {
+fn the_hasher_matches_its_golden_on_every_example_with_the_standard_library_part_1_of_2() {
     ply_codegen::c::producer::reset_census();
-    the_ply_hasher_matches_its_golden_on_every_example_with_the_standard_library(0, 2);
+    the_hasher_matches_its_golden_on_every_example_with_the_standard_library(0, 2);
     // The standard library is counted once per program, as it is hashed once per program.
     let lines: usize = std_modules().iter().map(|(_, t)| t.lines().count()).sum();
     if let Err(report) = crate::harness::census::hold("hasher-over-std-and-examples-part-1", lines)
@@ -122,12 +122,12 @@ fn the_ply_hasher_matches_its_golden_on_every_example_with_the_standard_library_
 }
 
 #[test]
-fn the_ply_hasher_matches_its_golden_on_every_example_with_the_standard_library_part_2_of_2() {
-    the_ply_hasher_matches_its_golden_on_every_example_with_the_standard_library(1, 2);
+fn the_hasher_matches_its_golden_on_every_example_with_the_standard_library_part_2_of_2() {
+    the_hasher_matches_its_golden_on_every_example_with_the_standard_library(1, 2);
 }
 
 #[test]
-fn the_ply_hasher_matches_its_golden_on_the_bundles() {
+fn the_hasher_matches_its_golden_on_the_bundles() {
     let mut inputs: Vec<(String, Vec<(String, String)>)> = Vec::new();
     for (file, label) in [
         ("resolve-programs.corpus", "resolve-programs"),

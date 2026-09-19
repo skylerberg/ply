@@ -1,6 +1,6 @@
 use ply_cli::load::*;
 use ply_span::{Symbol, codes};
-use ply_syntax::ast::ModuleName;
+use ply_ty::ModuleName;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -245,13 +245,4 @@ fn the_texts_are_every_module_the_port_answered_the_shipped_ones_included() {
         "b".to_string(),
         "import a\nfn b() -> Int = a::a()\n".to_string()
     )));
-}
-
-#[test]
-fn the_cli_has_no_rust_front_end_to_fall_back_on() {
-    let manifest = include_str!("../../../../ply-cli/Cargo.toml");
-    assert!(
-        !manifest.contains("ply-derive"),
-        "`ply-cli` depends on `ply-derive` again; ask the port instead"
-    );
 }

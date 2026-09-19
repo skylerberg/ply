@@ -10,7 +10,7 @@ fn counted<T>(f: impl FnOnce() -> T) -> (T, usize) {
 /// Carries a readable value, so a recycled link is checked for its contents and not just its count.
 fn marker(n: i64) -> Frame {
     Frame::BinaryApply {
-        op: ply_syntax::ast::BinOp::Add,
+        op: ply_ty::BinOp::Add,
         lhs: Value::Int(n),
         lhs_span: Span::DUMMY,
         rhs_span: Span::DUMMY,

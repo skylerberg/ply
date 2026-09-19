@@ -11,7 +11,7 @@ fn con(name: &str) -> Type {
 fn ctor(ty: &str, name: &str, index: usize, fields: Vec<Type>) -> CtorInfo {
     CtorInfo {
         name: Symbol::new(name),
-        module: ply_syntax::ast::ModuleName::anonymous(),
+        module: ply_ty::ModuleName::anonymous(),
         simple_name: Symbol::new(name),
         type_name: Symbol::new(ty),
         index,

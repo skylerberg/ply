@@ -1,6 +1,6 @@
-use ply_hash::DefHash;
 use ply_span::{Diagnostic, Severity, Span, Symbol, codes as span_codes};
 use ply_store::*;
+use ply_ty::DefHash;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -2,10 +2,10 @@
 //! content-addressed store already holds.
 
 use crate::load::Loaded;
-use ply_hash::body::StoredBody;
-use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Severity, SourceMap, Span, Symbol, codes};
-use ply_syntax::ast::ModuleName;
+use ply_store::body::StoredBody;
+use ply_ty::ModuleName;
+use ply_ty::{DefHash, HashOutput};
 use ply_ty::{DefInfo, Front};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -211,7 +211,7 @@ pub fn build(
 ) -> Result<Built, Vec<Diagnostic>> {
     let front = &loaded.front;
     let hashes = &front.hashes;
-    let bodies = ply_hash::body::of_front(front);
+    let bodies = ply_store::body::of_front(front);
     let Some(entry_hash) = hashes.defs.get(&entry.name).copied() else {
         return Err(vec![missing_entry(&entry.name)]);
     };
@@ -737,7 +737,7 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
     let front = ask_the_port(&own, &mut ids, &mut sources)?;
 
     let hashes = &front.hashes;
-    let bodies = ply_hash::body::of_front(&front);
+    let bodies = ply_store::body::of_front(&front);
     let mut rebuilt: BTreeMap<DefHash, StoredBody> = BTreeMap::new();
     for (name, hash) in &artifact.names {
         let symbol = Symbol::new(name);

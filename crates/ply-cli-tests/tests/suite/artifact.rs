@@ -1,8 +1,8 @@
 use assert_cmd::Command;
 use ply_cli::artifact::{self, Artifact};
 use ply_cli::load::{Loaded, load};
-use ply_hash::DefHash;
 use ply_span::codes;
+use ply_ty::DefHash;
 use serde_json::Value;
 use std::path::Path;
 use tempfile::TempDir;
@@ -153,7 +153,7 @@ fn an_artifact_carries_no_test_no_law_and_nothing_unreached() {
 }
 
 #[test]
-fn every_body_is_filed_under_the_hash_ply_hash_prints() {
+fn every_body_is_filed_under_the_hash_the_hash_command_prints() {
     let dir = project(PROGRAM);
     let output = ply(dir.path())
         .args(["hash", ".", "--json"])

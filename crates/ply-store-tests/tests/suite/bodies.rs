@@ -1,10 +1,9 @@
 //! Definition bodies through the store.
 
-use ply_hash::body::BodySet;
-use ply_hash::{DefHash, HashOutput, hash_program_with_bodies};
 use ply_span::{SourceId, Symbol};
+use ply_store::body::{BodySet, of_front};
 use ply_store::{BODY_ENCODING, DefBody, Store};
-use ply_syntax::ast::ModuleName;
+use ply_ty::{DefHash, HashOutput};
 use std::path::{Path, PathBuf};
 
 struct TempRoot(PathBuf);
@@ -47,11 +46,12 @@ fn lookup(key: Int) -> Int / {db.read[users]} = db.get[users](key) + shade(Red)
 "#;
 
 fn compile(source: &str) -> (HashOutput, BodySet) {
-    let mut program =
-        ply_syntax::parse_program([(SourceId(0), ModuleName::from_dotted("m"), source)])
-            .expect("it should parse");
-    let resolved = ply_syntax::resolve(&mut program).expect("it should resolve");
-    hash_program_with_bodies(&program, &resolved).expect("it should hash")
+    let front = ply_codegen::c::producer::checked_front(
+        &[("m".to_string(), source.to_string())],
+        &[SourceId(0)],
+    )
+    .unwrap_or_else(|e| panic!("it should check: {e:#}"));
+    (front.hashes.clone(), of_front(&front))
 }
 
 fn every_hash(hashes: &HashOutput) -> Vec<DefHash> {

@@ -1,4 +1,3 @@
-use ply_hash::{DefHash, HashOutput};
 use ply_span::{Span, Symbol};
 use ply_test::bisect::{
     Baseline, ChangeKind, Classify, Confidence, DefKey, Delta, DepEdges, Hybrid, Mode, Skipped,
@@ -7,6 +6,7 @@ use ply_test::bisect::{
 use ply_test::diagnose::{Evidence, Options, diagnose};
 use ply_test::slice::{CausalSlice, Entered, Frame, Tracing};
 use ply_ty::Footprint;
+use ply_ty::{DefHash, HashOutput};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn sym(s: &str) -> Symbol {
