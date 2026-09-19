@@ -493,6 +493,7 @@ fn three(x: Int) -> Int = two(x) + 1
 fn four(x: Int) -> Int = three(x) + 1
 
 fn countdown(n: Int) -> Int = if n <= 0 { 0 } else { countdown(n - 1) + 1 }
+fn doubled(n: Int) -> Int = if n <= 0 { 0 } else { doubled(n - 1) + 2 }
 fn forever(n: Int) -> Int = forever(n)
 fn twice_down(n: Int) -> Int = if n <= 0 { 0 } else { twice_down(n - 2) + 2 }
 fn ping(n: Int) -> Int = if n <= 0 { 0 } else { pong(n - 1) + 1 }
@@ -506,6 +507,7 @@ law "a recursive call is a function" forall (n: Int) { countdown(n) == countdown
 law "a recursive definition steps" forall (n: Int) where n > 0
   { countdown(n) == countdown(n - 1) + 1 }
 law "counting down counts" forall (n: Int) where n >= 0 { countdown(n) == n }
+law "doubling by recursion" forall (n: Int) where n >= 0 && n < 1000000 { doubled(n) == 2 * n }
 law "counting down is not the identity" forall (n: Int) { countdown(n) == n }
 law "counting down is never negative" forall (n: Int) { countdown(n) >= 0 }
 law "a definition that never returns is not a function" forall (n: Int) { forever(n) == forever(n) }
@@ -537,25 +539,28 @@ fn a_recursive_definition_is_unfolded_only_by_induction() {
     assert!(ctx.unfoldable(&Symbol::new("countdown")).is_none());
     assert!(ctx.unfoldable(&Symbol::new("three")).is_some());
 
-    for label in [
-        "a recursive call is a function",
-        "a recursive definition steps",
-        "counting down counts",
-        "counting down is never negative",
+    for (label, def) in [
+        ("counting down counts", "countdown"),
+        ("doubling by recursion", "doubled"),
     ] {
         let proved = proof(&f, label);
         assert!(
             proved
                 .rules
                 .iter()
-                .any(|r| matches!(r, Rule::Induction { binder, def }
-                if binder.as_str() == "n" && def.as_str() == "countdown")),
+                .any(|r| matches!(r, Rule::Induction { binder, def: d }
+                if binder.as_str() == "n" && d.as_str() == def)),
             "`{label}`: {:?}",
             proved.rules
         );
     }
     // The base case is where a claim false below zero fails.
     not_proved(&f, "counting down is not the identity");
+    // The unrolled body adds one to a value only the hypothesis could bound, and these
+    // hypotheses do not bound it, so its overflow stays undecided.
+    not_proved(&f, "a recursive call is a function");
+    not_proved(&f, "a recursive definition steps");
+    not_proved(&f, "counting down is never negative");
 }
 
 #[test]
