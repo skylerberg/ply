@@ -13,11 +13,6 @@ pub fn port_front(sources: &[(String, String)], ids: &[SourceId]) -> ply_ty::Fro
         .unwrap_or_else(|e| panic!("the fixture must typecheck: {e:#}"))
 }
 
-#[track_caller]
-pub fn port_check(sources: &[(String, String)], ids: &[SourceId]) -> CheckOutput {
-    port_front(sources, ids).check
-}
-
 /// What the port raises over these modules, for a fixture meant to be refused.
 #[track_caller]
 pub fn port_diagnostics(sources: &[(String, String)], ids: &[SourceId]) -> Vec<Diagnostic> {
