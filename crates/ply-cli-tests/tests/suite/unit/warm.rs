@@ -145,6 +145,9 @@ fn a_held_unit_is_dropped_when_a_test_moves() {
         fn offers(&self) -> ply_eval::backend::Offers {
             ply_eval::backend::Offers::default()
         }
+        fn relocate(&self, _: &ply_ty::Front, _: &ply_span::SourceMap) -> bool {
+            true
+        }
     }
     let provider: &'static dyn ply_eval::Provider = Box::leak(Box::new(Nothing));
     let spec = ply_eval::BackendSpec::default();
@@ -153,23 +156,31 @@ fn a_held_unit_is_dropped_when_a_test_moves() {
     hashes.defs.insert(Symbol::new("m.f"), DefHash([1; 32]));
     hashes.tests.push(DefHash([2; 32]));
 
+    let unit_for = |warm: &Warm, hashes: &HashOutput| {
+        let front = ply_ty::Front {
+            hashes: hashes.clone(),
+            ..Default::default()
+        };
+        warm.unit_for(&spec, &front, &ply_span::SourceMap::new())
+    };
+
     warm.keep_unit(&spec, &hashes, provider);
     assert!(
-        warm.unit_for(&spec, &hashes).is_some(),
+        unit_for(&warm, &hashes).is_some(),
         "nothing moved, so the unit still answers for this program"
     );
 
     let mut moved = hashes.clone();
     moved.tests[0] = DefHash([3; 32]);
     assert!(
-        warm.unit_for(&spec, &moved).is_none(),
+        unit_for(&warm, &moved).is_none(),
         "a test moved, so the unit holds the old one and must not be reused"
     );
 
     let mut moved = hashes.clone();
     moved.defs.insert(Symbol::new("m.f"), DefHash([4; 32]));
     assert!(
-        warm.unit_for(&spec, &moved).is_none(),
+        unit_for(&warm, &moved).is_none(),
         "a definition moved, so the unit holds the old one"
     );
 }
