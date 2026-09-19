@@ -2,7 +2,7 @@
 //! content-addressed store already holds.
 
 use crate::load::Loaded;
-use ply_hash::body::{BodySet, StoredBody};
+use ply_hash::body::StoredBody;
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Severity, SourceMap, Span, Symbol, codes};
 use ply_syntax::ast::ModuleName;
@@ -273,23 +273,24 @@ pub fn build(
 }
 
 fn closure_texts(artifact: &Artifact) -> Result<Vec<(String, String)>, Vec<Diagnostic>> {
-    let mut bodies = BodySet::default();
-    for (hash, body) in &artifact.bodies {
-        bodies.insert(*hash, body.clone());
-    }
-    let names: Vec<(Symbol, DefHash)> = artifact
+    let bodies: Vec<&[u8]> = artifact.bodies.values().map(StoredBody::as_bytes).collect();
+    let names: Vec<(&str, DefHash)> = artifact
         .names
         .iter()
-        .map(|(name, hash)| (Symbol::new(name), *hash))
+        .map(|(name, hash)| (name.as_str(), *hash))
         .collect();
-    let program = ply_hash::body::reconstruct_exact(&bodies, &names, ply_std::is_std)?;
-    Ok(program
-        .modules
+    let shipped: BTreeSet<&str> = artifact
+        .names
         .iter()
-        .map(|module| {
-            let path = module.name.segments().collect::<Vec<_>>().join("/");
-            (format!("{path}.ply"), ply_syntax::print::module(module))
-        })
+        .filter_map(|(name, _)| name.rsplit_once('.').map(|(module, _)| module))
+        .filter(|module| ply_std::is_reserved(module))
+        .collect();
+    let shipped: Vec<&str> = shipped.into_iter().collect();
+    let printed = ply_codegen::c::producer::print_bodies(&bodies, &names, &[], &[], &shipped)
+        .map_err(|d| vec![d])?;
+    Ok(printed
+        .into_iter()
+        .map(|(module, text)| (format!("{}.ply", module.replace('.', "/")), text))
         .collect())
 }
 

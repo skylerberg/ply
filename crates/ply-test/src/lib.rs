@@ -17,8 +17,6 @@ use ply_eval::{Arena, Exploration, Machine, Plan, Race, Seed, TaskRegions, Value
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Symbol, codes};
 use ply_store::{Outcome, PassRecord, Store};
-use ply_syntax::ast::Program;
-use ply_syntax::resolve::Resolved;
 use ply_ty::{CheckOutput, Footprint};
 use serde::Serialize;
 use std::any::Any;
@@ -32,9 +30,8 @@ use std::time::{Duration, Instant};
 
 pub use bisect::{
     Baseline, Bisection, Budget, Change, ChangeKind, Classify, Cluster, Confidence, DefKey, Delta,
-    DepEdges, Diff, EraTable, FusionReason, Gate, Hybrid, Mode, Ns, Regression, Renormalizer,
-    SearchStats, Skipped, StoreClassify, Trial, TrialOutcome, Unresolved, Verdict, bisect, diff,
-    precheck,
+    DepEdges, Diff, FusionReason, Gate, Hybrid, Mode, Ns, Regression, Rehashed, SearchStats,
+    Skipped, StoreClassify, Trial, TrialOutcome, Unresolved, Verdict, bisect, diff, precheck,
 };
 pub use diagnose::{Evidence, Options, diagnose};
 pub use hybrid::{BodyHybrid, Mixture, Signature};
@@ -842,28 +839,20 @@ pub fn select(
     }
 }
 
-/// Turns each failure's raw suspect list into a ranked, annotated attribution.
+/// Turns each failure's suspect list into a ranked attribution; `sources` are what `front` read.
 pub fn diagnose_failures(
     report: &mut RunReport,
-    program: &Program,
-    resolved: &Resolved,
+    sources: &[(String, String)],
     front: &ply_ty::Front,
     store: &mut Store,
     options: &Options,
-) -> Vec<Diagnostic> {
+) {
     let check = &front.check;
     let hashes = &front.hashes;
     if report.failures.is_empty() {
-        return Vec::new();
+        return;
     }
 
-    // Built once and shared: re-normalizing the whole program is the expensive half.
-    let test_keys: Vec<Symbol> = check.tests.iter().map(|t| t.key.clone()).collect();
-    let (renormalizer, mut warnings) =
-        match Renormalizer::new(program, resolved, hashes, &test_keys) {
-            Ok(renormalizer) => (Some(renormalizer), Vec::new()),
-            Err(diagnostics) => (None, diagnostics),
-        };
     let edges = DepEdges::from(hashes);
 
     let fresh = ply_hash::body::of_front(front);
@@ -934,15 +923,18 @@ pub fn diagnose_failures(
             _ => None,
         };
 
-        // Without a renormalizer every change stays a candidate: a wider answer, never a wrong one.
+        // Unclassified, every change stays a candidate: a wider answer, never a wrong one.
         let mut unknown = bisect::Unknown;
         let mut store_classify;
-        let classify: &mut dyn Classify = match (&renormalizer, &baseline) {
-            (Some(renormalizer), Some(baseline)) => {
-                store_classify = StoreClassify::new(renormalizer, baseline, store, check);
+        let rehashed = baseline
+            .as_ref()
+            .and_then(|baseline| Rehashed::under(sources, baseline).ok());
+        let classify: &mut dyn Classify = match rehashed {
+            Some(rehashed) => {
+                store_classify = StoreClassify::new(rehashed, store, check);
                 &mut store_classify
             }
-            _ => &mut unknown,
+            None => &mut unknown,
         };
 
         failure.attribution = diagnose(
@@ -977,9 +969,6 @@ pub fn diagnose_failures(
     for hash in proved {
         store.put(hash, Outcome::Pass);
     }
-
-    warnings.retain(|d| d.severity != ply_span::Severity::Error);
-    warnings
 }
 
 pub fn run_with<E: Executor>(

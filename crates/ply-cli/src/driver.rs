@@ -1,6 +1,6 @@
 //! The front end: the port parses, resolves and checks the program; its answer is kept per module.
 
-use crate::load::{Discovered, LoadError, Loaded, RustTree, anchor, discover, unreadable};
+use crate::load::{Discovered, LoadError, Loaded, anchor, discover, unreadable};
 use ply_hash::body::StoredBody;
 use ply_hash::{DefHash, HashOutput};
 use ply_prove::prove::{Claims, read_claims};
@@ -369,7 +369,6 @@ impl<'s> Driver<'s> {
                 warnings,
             },
             promised,
-            rust: RustTree::default(),
         })
     }
 

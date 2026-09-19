@@ -5,12 +5,14 @@ use crate::key::{Engine, result_key};
 use crate::schedule::is_seeded;
 use crate::sim::seed_run;
 use ply_eval::{Plan, Provider, Seed};
-use ply_hash::body::{BodySet, StoredBody, reconstruct_relinked};
+use ply_hash::body::{BodySet, StoredBody};
 use ply_hash::{DefHash, HashOutput};
-use ply_span::{Diagnostic, Symbol};
+use ply_span::{Diagnostic, SourceId, Symbol};
 use ply_store::{Outcome, Store};
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+
+const HYBRID_TEST: &str = "ply_tests.t0";
 
 /// What makes two failures the same failure.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -189,36 +191,39 @@ impl Hybrid for BodyHybrid<'_> {
             Err(why) => return Trial::unresolved(why),
         };
 
-        let mut bodies = BodySet::default();
+        let mut bodies = Vec::with_capacity(chosen.hashes.len());
         for hash in &chosen.hashes {
             match self.body_of(*hash) {
-                Some(body) => bodies.insert(*hash, body),
+                Some(body) => bodies.push(body),
                 None => return Trial::unresolved(Unresolved::MissingBody),
             }
         }
-        bodies.push_test(self.test.clone());
-
-        let Ok(mut rebuilt) = reconstruct_relinked(&bodies, &chosen.relink) else {
+        let Some(names) = hash_names(&bodies) else {
             return Trial::unresolved(Unresolved::MissingBody);
         };
-        if ply_syntax::resolve(&mut rebuilt.program).is_err() {
-            return Trial::unresolved(Unresolved::DoesNotCheck);
-        }
+        let bytes: Vec<&[u8]> = bodies.iter().map(StoredBody::as_bytes).collect();
+        let names: Vec<(&str, DefHash)> = names.iter().map(|(n, h)| (n.as_str(), *h)).collect();
+        let relink: Vec<(DefHash, DefHash)> = chosen.relink.iter().map(|(a, b)| (*a, *b)).collect();
         // A mixture has no source text: it is printed once, and that text is checked and built.
-        let printed = ply_syntax::print::program(&rebuilt.program);
-        // Fresh ids: reconstructed modules all carry `Span::DUMMY.source` and would share one.
-        let ids: Vec<ply_span::SourceId> = (0..printed.len())
-            .map(|i| ply_span::SourceId(i as u32))
-            .collect();
+        let Ok(printed) = ply_codegen::c::producer::print_bodies(
+            &bytes,
+            &names,
+            &[self.test.as_bytes()],
+            &relink,
+            &[],
+        ) else {
+            return Trial::unresolved(Unresolved::MissingBody);
+        };
+        let ids: Vec<SourceId> = (0..printed.len()).map(|i| SourceId(i as u32)).collect();
         let Ok(front) = ply_codegen::c::producer::checked_front(&printed, &ids) else {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
         let check = &front.check;
         let rehashed = &front.hashes;
-        let Some(index) = rebuilt
-            .test_keys
-            .first()
-            .and_then(|key| check.tests.iter().position(|t| &t.key == key))
+        let Some(index) = check
+            .tests
+            .iter()
+            .position(|t| t.key.as_str() == HYBRID_TEST)
         else {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
@@ -265,6 +270,19 @@ impl Hybrid for BodyHybrid<'_> {
             Err(_) => Trial::unresolved(Unresolved::DifferentFailure),
         }
     }
+}
+
+/// By hash, `m<component>.d<member>`: neither era's names fit a mixture of both.
+fn hash_names(bodies: &[StoredBody]) -> Option<Vec<(String, DefHash)>> {
+    let mut names = BTreeMap::new();
+    for body in bodies {
+        let (id, members) = body.component()?;
+        for member in members {
+            let name = format!("m{}.d{}", &id.to_hex()[..16], &member.to_hex()[..16]);
+            names.insert(member, name);
+        }
+    }
+    Some(names.into_iter().map(|(hash, name)| (name, hash)).collect())
 }
 
 /// Whether a mixture can be built at all; `false` means `no_bodies` rather than a bisection.
