@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use ply_eval::{Fields, Value};
 use ply_span::frames::Cursor;
 use ply_span::{Severity, SourceId, Symbol};
-use ply_ty::{Front, read_front};
+use ply_ty::{Front, Scheme, parse_scheme, read_front};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -439,6 +439,8 @@ pub struct Census {
     pub entries: usize,
     /// Modules handed to the front end, summed over its entries.
     pub modules: usize,
+    /// Modules handed to [`claims_dump`], summed over its entries.
+    pub claimed: usize,
     pub allocated: usize,
     pub recycled: usize,
     /// The most chunk bytes any one entry held at its end.
@@ -446,17 +448,23 @@ pub struct Census {
 }
 
 thread_local! {
-    static CENSUS: Cell<Census> = const { Cell::new(Census { entries: 0, modules: 0, allocated: 0, recycled: 0, chunk_bytes: 0 }) };
+    static CENSUS: Cell<Census> = const { Cell::new(Census { entries: 0, modules: 0, claimed: 0, allocated: 0, recycled: 0, chunk_bytes: 0 }) };
+}
+
+fn tally(f: impl FnOnce(&mut Census)) {
+    CENSUS.with(|c| {
+        let mut census = c.get();
+        f(&mut census);
+        c.set(census);
+    });
 }
 
 fn note_census(ctx: &crate::rt::Ctx) {
-    CENSUS.with(|c| {
-        let mut census = c.get();
+    tally(|census| {
         census.entries += 1;
         census.allocated += ctx.heap.allocated();
         census.recycled += ctx.heap.recycled();
         census.chunk_bytes = census.chunk_bytes.max(ctx.heap.chunk_bytes());
-        c.set(census);
     });
 }
 
@@ -488,11 +496,7 @@ pub fn front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
 
 /// The front end's raw answer, before [`read_front`].
 pub fn front_dump(sources: &[(String, String)]) -> Result<String> {
-    CENSUS.with(|c| {
-        let mut census = c.get();
-        census.modules += sources.len();
-        c.set(census);
-    });
+    tally(|census| census.modules += sources.len());
     dump_over(FRONT, sources)
 }
 
@@ -500,7 +504,42 @@ const CLAIMS: &str = "front.claims_dump";
 
 /// Every body, clause and law of a program [`front`] already checked, lowered.
 pub fn claims_dump(sources: &[(String, String)]) -> Result<String> {
+    tally(|census| census.claimed += sources.len());
     dump_over(CLAIMS, sources)
+}
+
+const BUILTINS: &str = "front.builtins_dump";
+
+/// Every builtin's scheme as the port's checker binds it, in the prelude's order.
+pub fn builtins() -> Result<Vec<(Symbol, Scheme)>> {
+    let answer = call(BUILTINS, &[])?;
+    let Value::Str(dump) = &answer else {
+        bail!(
+            "`{BUILTINS}` answered a {} rather than a string",
+            answer.type_name()
+        );
+    };
+    let mut frames = Cursor::new(dump.as_bytes(), "frame");
+    let mut out = Vec::new();
+    while !frames.done() {
+        let (words, payload) = frames
+            .unit()
+            .map_err(|e| anyhow!("`{BUILTINS}`'s answer: {e}"))?;
+        let ["builtin", name] = words[..] else {
+            bail!("`{BUILTINS}` framed a `{}`", words.join(" "));
+        };
+        let mut fields = Cursor::new(payload, "field");
+        let (key, text) = fields
+            .unit()
+            .map_err(|e| anyhow!("`{name}`'s frame: {e}"))?;
+        if key != ["scheme"] || !fields.done() {
+            bail!("`{name}`'s frame is not one `scheme` field");
+        }
+        let text = std::str::from_utf8(text).context("a builtin's scheme")?;
+        let scheme = parse_scheme(text).map_err(|e| anyhow!("`{name}`'s scheme `{text}`: {e}"))?;
+        out.push((Symbol::new(name), scheme));
+    }
+    Ok(out)
 }
 
 fn dump_over(entry: &str, sources: &[(String, String)]) -> Result<String> {
@@ -581,11 +620,7 @@ pub fn front_pulling_std(
                 .to_string(),
         );
     }
-    CENSUS.with(|c| {
-        let mut census = c.get();
-        census.modules += user.len() + modules.len();
-        c.set(census);
-    });
+    tally(|census| census.modules += user.len() + modules.len());
     Ok(Pulled {
         modules,
         dump: answer[frames.at()..].to_string(),
