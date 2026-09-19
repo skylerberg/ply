@@ -1077,52 +1077,20 @@ fn every_builtin_is_reachable_by_the_name_it_reports() {
     }
 }
 
-/// Each builtin's parameter count in the port's prelude, read from `install_prelude`'s table.
-fn prelude_arities() -> std::collections::HashMap<String, usize> {
-    /// The comma-separated items of `s`, up to the bracket that closes what `s` sits inside.
-    fn items(s: &str) -> Vec<&str> {
-        let (mut depth, mut start, mut out) = (0usize, 0, Vec::new());
-        for (i, c) in s.char_indices() {
-            match c {
-                '(' | '[' | '{' => depth += 1,
-                ')' | ']' | '}' if depth == 0 => {
-                    out.push(s[start..i].trim());
-                    break;
-                }
-                ')' | ']' | '}' => depth -= 1,
-                ',' if depth == 0 => {
-                    out.push(s[start..i].trim());
-                    start = i + 1;
-                }
-                _ => {}
-            }
-        }
-        out.retain(|item| !item.is_empty());
-        out
-    }
-
-    let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ply-compiler/ply/infer.ply");
-    let text = std::fs::read_to_string(&path).expect("the port's checker is readable");
-    let mut out = std::collections::HashMap::new();
-    for line in text.lines() {
-        let Some(entry) = line.trim_start().strip_prefix("{ name: b\"") else {
-            continue;
+/// Each builtin's parameter count in the scheme the port's checker binds it to.
+fn prelude_arities() -> std::collections::BTreeMap<String, usize> {
+    let mut out = std::collections::BTreeMap::new();
+    for (name, scheme) in
+        ply_codegen::c::producer::builtins().expect("the port publishes its builtins")
+    {
+        let ply_ty::Type::Fn { params, .. } = &scheme.ty else {
+            panic!(
+                "`{name}`'s scheme `{}` is not a function",
+                ply_ty::print_scheme(&scheme)
+            );
         };
-        let Some((name, scheme)) = entry.split_once("\", sc: ") else {
-            continue;
-        };
-        let (args, params_at) = if let Some(args) = scheme.strip_prefix("mono_fn(") {
-            (args, 0)
-        } else if let Some(args) = scheme.strip_prefix("poly_fn(") {
-            (args, 2)
-        } else {
-            panic!("`{name}`'s scheme is neither `mono_fn` nor `poly_fn`: {line}");
-        };
-        let params = items(args)[params_at]
-            .strip_prefix('[')
-            .unwrap_or_else(|| panic!("`{name}`'s parameters are not a list literal: {line}"));
-        out.insert(name.to_string(), items(params).len());
+        let twice = out.insert(name.to_string(), params.len()).is_some();
+        assert!(!twice, "the prelude binds `{name}` twice");
     }
     out
 }
@@ -1141,20 +1109,15 @@ fn every_builtin_agrees_on_its_arity_everywhere() {
             b.name()
         );
 
-        // A builtin the prelude does not type cannot be called, so the tables cover the same set.
-        let typed = *prelude.get(b.name()).unwrap_or_else(|| {
-            panic!(
-                "`{}` is a builtin with no scheme in the prelude: no program can call it",
+        if let Some(&typed) = prelude.get(b.name()) {
+            assert_eq!(
+                typed,
+                max,
+                "`{}` takes {max} arguments here and {typed} in the prelude's scheme. \
+                 Whichever is larger, the extra arm is unreachable from source.",
                 b.name()
-            )
-        });
-        assert_eq!(
-            typed,
-            max,
-            "`{}` takes {max} arguments here and {typed} in the prelude's scheme. \
-             Whichever is larger, the extra arm is unreachable from source.",
-            b.name()
-        );
+            );
+        }
 
         if let Some((params, defaults)) = ply_syntax::defaults::builtin_shape(b.name()) {
             assert_eq!(
@@ -1172,118 +1135,34 @@ fn every_builtin_agrees_on_its_arity_everywhere() {
     }
 }
 
+/// A builtin with no scheme cannot be called; a scheme with no builtin checks and then fails.
 #[test]
-fn builtin_all_is_complete_and_lists_each_name_once() {
+fn the_runtime_implements_exactly_the_builtins_the_prelude_types() {
     let mut names: Vec<&str> = Builtin::all().iter().map(|b| b.name()).collect();
     names.sort_unstable();
     let mut unique = names.clone();
     unique.dedup();
     assert_eq!(names, unique, "`Builtin::all()` lists a builtin twice");
-    assert_eq!(
-        names,
-        [
-            "assert",
-            "assert_eq",
-            "bits_of_float",
-            "byte_of_int",
-            "bytes_at",
-            "bytes_concat",
-            "bytes_concat_all",
-            "bytes_ends_with",
-            "bytes_index_of",
-            "bytes_index_of_byte",
-            "bytes_index_of_from",
-            "bytes_is_utf8",
-            "bytes_len",
-            "bytes_of_string",
-            "bytes_position",
-            "bytes_scan",
-            "bytes_scan_until",
-            "bytes_slice",
-            "bytes_split",
-            "bytes_starts_with",
-            "bytes_u32_le",
-            "cell_get",
-            "cell_set",
-            "cell_update",
-            "compare",
-            "compare_values",
-            "decimal_div",
-            "decimal_of_float",
-            "decimal_of_int",
-            "decimal_of_string",
-            "decimal_round",
-            "decimal_to_string",
-            "filter",
-            "float_of_bits",
-            "float_of_decimal",
-            "float_of_string",
-            "fold",
-            "i16_of_int",
-            "i32_of_int",
-            "i64_of_int",
-            "i8_of_int",
-            "int_of_decimal",
-            "int_of_i16",
-            "int_of_i32",
-            "int_of_i64",
-            "int_of_i8",
-            "int_of_u16",
-            "int_of_u32",
-            "int_of_u64",
-            "int_of_u8",
-            "int_to_string",
-            "iterate",
-            "len",
-            "list_at",
-            "list_set",
-            "map",
-            "map_contains",
-            "map_entries",
-            "map_fold",
-            "map_get",
-            "map_insert",
-            "map_keys",
-            "map_len",
-            "map_merge",
-            "map_new",
-            "map_of_entries",
-            "map_remove",
-            "map_update",
-            "map_values",
-            "max",
-            "min",
-            "panic",
-            "push",
-            "range",
-            "rotr",
-            "rotr32",
-            "secret_is_empty",
-            "secret_of_string",
-            "secret_verify",
-            "string_concat",
-            "string_contains",
-            "string_ends_with",
-            "string_find",
-            "string_len",
-            "string_lower",
-            "string_of_bytes",
-            "string_of_bytes_lossy",
-            "string_slice",
-            "string_split",
-            "string_starts_with",
-            "string_trim",
-            "string_upper",
-            "u16_of_int",
-            "u32_of_int",
-            "u64_of_int",
-            "u8_of_int",
-            "wrap_add",
-            "wrap_mul",
-            "wrap_sub",
-        ],
-        "a builtin was added to or removed from the enum without `Builtin::all()` being \
-         updated — every table driven by `all()` silently skips it until this list agrees"
+
+    let prelude = prelude_arities();
+    let untyped: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| !prelude.contains_key(*n))
+        .collect();
+    assert!(
+        untyped.is_empty(),
+        "builtins with no scheme in the prelude, so no program can call them: {untyped:?}"
+    );
+    let unimplemented: Vec<&String> = prelude
+        .keys()
+        .filter(|n| names.binary_search(&n.as_str()).is_err())
+        .collect();
+    assert!(
+        unimplemented.is_empty(),
+        "prelude schemes `Builtin::all()` has no builtin for: a call checks and then fails, \
+         or `all()` is missing an enum variant and every table driven by it skips it: \
+         {unimplemented:?}"
     );
 }
 
