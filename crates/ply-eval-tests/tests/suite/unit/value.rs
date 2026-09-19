@@ -66,10 +66,9 @@ fn every_rendered_byte_lexes_back_to_the_byte_it_came_from() {
     let all: Vec<u8> = (0..=255u8).collect();
     for chunk in all.chunks(32) {
         let rendered = Value::bytes(chunk).render();
-        let dump = match ply_codegen::c::producer::call(
-            "lexer.dump",
-            &[Value::bytes(rendered.as_bytes())],
-        ) {
+        let answer =
+            ply_codegen::c::producer::call("lexer.dump", &[Value::bytes(rendered.as_bytes())]);
+        let dump = match &answer {
             Ok(Value::Str(dump)) => dump.to_string(),
             other => panic!("the lexer answered {other:?}"),
         };
