@@ -254,7 +254,7 @@ fn hosting(seed: Int) -> Int =
 
 fn handler(seed: Int) -> Int =
   handle { performer(seed) } with {
-    counter.bump(n) -> match n { x if x > 3 -> x, _ -> 0 },
+    counter.bump(n) -> with_region[r] { n },
   }
 
 fn lonely(n: Int) -> Int / {orphan.write} = orphan.poke(n)
@@ -278,9 +278,9 @@ fn a_performer_keeps_compiling_when_its_handler_is_dropped() {
             .map(|r| r.construct.clone())
             .unwrap_or_else(|| panic!("`{name}` was taken; refusals: {refused:?}"))
     };
-    // A match guard is what the port still refuses, at its lowering; the handler goes with it.
+    // A region is what the port still refuses; the handler goes with it.
     assert!(
-        reason("m.handler").contains("lowering does not reach"),
+        reason("m.handler").contains("does not emit"),
         "{}",
         reason("m.handler")
     );
