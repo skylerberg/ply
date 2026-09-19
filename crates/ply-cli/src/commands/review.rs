@@ -81,26 +81,20 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
 
     let plan = crate::simulation::prove_plan(&args.prove, &args.simulation);
     let specified = obligation::specified(&scoped, &laws, &collected.obligations);
-    let tree = match loaded.tree() {
-        Ok(tree) => tree,
-        Err(diagnostic) => {
-            return report_load_error("review", &loaded.refused(diagnostic), args.json, style);
-        }
-    };
+    if let Err(diagnostic) = loaded.tree() {
+        return report_load_error("review", &loaded.refused(diagnostic), args.json, style);
+    }
     let backend = match super::common::prover_backend(args.backend.as_ref(), &loaded) {
         Ok(backend) => backend,
         Err(diagnostic) => {
             return report_bind_error("review", &[diagnostic], &loaded.sources, args.json, style);
         }
     };
-    let engine = crate::engine::of(
-        &tree.program,
-        &tree.resolved,
-        &loaded.check,
-        // `ply review` binds nothing, so a `law/host` is a gap, as under a hermetic `ply prove`.
-        None,
-        backend,
-    );
+    // `ply review` binds nothing, so a `law/host` is a gap, as under a hermetic `ply prove`.
+    let engine = match crate::engine::of(&loaded, None, backend) {
+        Ok(engine) => engine,
+        Err(err) => return report_load_error("review", &err, args.json, style),
+    };
     let mut proved = obligation::prove(
         collected.obligations,
         &scoped,

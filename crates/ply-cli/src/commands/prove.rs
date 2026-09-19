@@ -85,12 +85,9 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
             return report_bind_error("prove", &diagnostics, &loaded.sources, args.json, style);
         }
     };
-    let tree = match loaded.tree() {
-        Ok(tree) => tree,
-        Err(diagnostic) => {
-            return report_load_error("prove", &loaded.refused(diagnostic), args.json, style);
-        }
-    };
+    if let Err(diagnostic) = loaded.tree() {
+        return report_load_error("prove", &loaded.refused(diagnostic), args.json, style);
+    }
     let backend = match super::common::prover_backend(args.backend.as_ref(), &loaded) {
         Ok(backend) => backend,
         Err(diagnostic) => {
@@ -131,13 +128,10 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
             .as_ref()
             .map(|f| f as &(dyn Fn() -> std::rc::Rc<dyn ply_eval::host::HostRuntime> + Sync)),
     });
-    let engine = crate::engine::of(
-        &tree.program,
-        &tree.resolved,
-        &loaded.check,
-        hosting,
-        backend,
-    );
+    let engine = match crate::engine::of(&loaded, hosting, backend) {
+        Ok(engine) => engine,
+        Err(err) => return report_load_error("prove", &err, args.json, style),
+    };
     let (pool, _workers) = build_pool(args.jobs, &mut warnings);
     let discharge = || {
         obligation::prove(

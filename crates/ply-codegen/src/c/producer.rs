@@ -493,10 +493,21 @@ pub fn front_dump(sources: &[(String, String)]) -> Result<String> {
         census.modules += sources.len();
         c.set(census);
     });
-    let answer = call(FRONT, &[source_list(sources)])?;
+    dump_over(FRONT, sources)
+}
+
+const CLAIMS: &str = "front.claims_dump";
+
+/// Every body, clause and law of a program [`front`] already checked, lowered.
+pub fn claims_dump(sources: &[(String, String)]) -> Result<String> {
+    dump_over(CLAIMS, sources)
+}
+
+fn dump_over(entry: &str, sources: &[(String, String)]) -> Result<String> {
+    let answer = call(entry, &[source_list(sources)])?;
     let Value::Str(dump) = &answer else {
         bail!(
-            "`{FRONT}` answered a {} rather than a string",
+            "`{entry}` answered a {} rather than a string",
             answer.type_name()
         );
     };

@@ -6,101 +6,75 @@ mod egraph;
 mod numerics;
 mod term;
 
+use ply_prove::prove::claims::{Clause, Code, Definition, Law};
 use ply_prove::prove::{
-    Blocker, Context, Decision, Goal, Limits, Proof, Reason, decide, decide_and_diagnose,
+    Blocker, Claims, Context, Decision, Goal, Limits, Proof, Reason, decide, decide_and_diagnose,
+    read_claims,
 };
 use ply_prove::{Rule, UNFOLD_DEPTH};
 use ply_span::{SourceId, Span, Symbol};
-use ply_syntax::ast::{Expr, Item, LawDef, Program, TypeExpr};
-use ply_syntax::resolve::Resolved;
-use ply_ty::{CheckOutput, LawBinder, TyVar, Type};
-use std::collections::BTreeMap;
+use ply_ty::{CheckOutput, DefInfo, LawBinder, SpecKind, Type};
 
 const SRC: SourceId = SourceId(0);
 
 struct Fixture {
-    program: Program,
-    resolved: Resolved,
     check: CheckOutput,
+    claims: Claims,
 }
 
 fn fixture(source: &str) -> Fixture {
-    let module = match ply_syntax::parse(SRC, source) {
-        Ok(module) => module,
-        Err(diagnostics) => panic!("parse: {:?}", messages(&diagnostics)),
-    };
-    let mut program = Program::single(module);
-    let resolved = match ply_syntax::resolve(&mut program) {
-        Ok(resolved) => resolved,
-        Err(diagnostics) => panic!("resolve: {:?}", messages(&diagnostics)),
-    };
     // Anonymous, so the checker's keys are the bare ones `ply-prove`'s API is written against.
-    let check =
-        ply_codegen::c::producer::checked_front(&[(String::new(), source.to_string())], &[SRC])
-            .unwrap_or_else(|e| panic!("check: {e:#}"))
-            .check;
-    Fixture {
-        program,
-        resolved,
-        check,
-    }
-}
-
-fn messages(diagnostics: &[ply_span::Diagnostic]) -> Vec<String> {
-    diagnostics.iter().map(|d| d.message.clone()).collect()
+    let sources = [(String::new(), source.to_string())];
+    let check = ply_codegen::c::producer::checked_front(&sources, &[SRC])
+        .unwrap_or_else(|e| panic!("check: {e:#}"))
+        .check;
+    let dump =
+        ply_codegen::c::producer::claims_dump(&sources).unwrap_or_else(|e| panic!("claims: {e:#}"));
+    let claims = read_claims(&dump, &[SRC]).unwrap_or_else(|e| panic!("claims: {e}"));
+    Fixture { check, claims }
 }
 
 impl Fixture {
     fn context(&self) -> Context<'_> {
-        Context::new(&self.program, &self.resolved, &self.check)
+        Context::new(self.claims.clone(), &self.check)
     }
 
-    fn law(&self, label: &str) -> &LawDef {
-        self.program.modules[0]
-            .items
+    fn law(&self, label: &str) -> (Vec<LawBinder>, &Law) {
+        let info = self
+            .check
+            .laws
             .iter()
-            .find_map(|item| match item {
-                Item::Law(def) if def.name == label => Some(&**def),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("no law labelled `{label}`"))
+            .find(|law| law.name == label)
+            .unwrap_or_else(|| panic!("no law labelled `{label}`"));
+        (info.binders.clone(), &self.claims.laws[&info.key])
+    }
+
+    fn def(&self, name: &str) -> &Definition {
+        &self.claims.defs[&Symbol::new(name)]
     }
 }
 
-fn resolve_type(ty: &TypeExpr, vars: &mut BTreeMap<Symbol, TyVar>) -> Type {
-    match ty {
-        TypeExpr::Var(name) => {
-            let next = vars.len() as u32;
-            Type::Var(*vars.entry(name.name.clone()).or_insert(TyVar(next)))
-        }
-        TypeExpr::Con { name, args, .. } => Type::Con(
-            name.symbol().clone(),
-            args.iter().map(|a| resolve_type(a, vars)).collect(),
-        ),
-        TypeExpr::Fn { params, ret, .. } => Type::Fn {
-            params: params.iter().map(|p| resolve_type(p, vars)).collect(),
-            ret: Box::new(resolve_type(ret, vars)),
-            effects: ply_ty::Row::empty(),
-        },
-        TypeExpr::Record { fields, .. } => Type::Record(
-            fields
-                .iter()
-                .map(|(n, t)| (n.name.clone(), resolve_type(t, vars)))
-                .collect(),
-        ),
-        TypeExpr::Unit { .. } => Type::unit(),
-    }
-}
-
-fn binders(law: &LawDef) -> Vec<LawBinder> {
-    let mut vars = BTreeMap::new();
-    law.binders
+fn clause_binders(info: &DefInfo) -> Vec<LawBinder> {
+    let Type::Fn { params, ret, .. } = &info.scheme.ty else {
+        panic!("`{}` is not a function", info.name);
+    };
+    params
         .iter()
-        .map(|b| LawBinder {
-            name: b.name.name.clone(),
-            ty: resolve_type(&b.ty, &mut vars),
-            span: b.span,
+        .chain([&**ret])
+        .enumerate()
+        .map(|(i, ty)| LawBinder {
+            name: Symbol::new(format!("_{i}")),
+            ty: ty.clone(),
+            span: Span::DUMMY,
         })
+        .collect()
+}
+
+fn clauses(def: &Definition, kind: SpecKind) -> Vec<&Clause> {
+    def.spec
+        .iter()
+        .filter(|(k, _)| *k == kind)
+        .map(|(_, clause)| clause)
         .collect()
 }
 
@@ -110,13 +84,11 @@ fn attempt(fixture: &Fixture, label: &str) -> Decision {
 
 fn attempt_with(fixture: &Fixture, label: &str, limits: &Limits) -> Decision {
     let ctx = fixture.context();
-    let law = fixture.law(label);
-    let binders = binders(law);
-    let guards: Vec<&Expr> = law.guard.iter().collect();
+    let (binders, law) = fixture.law(label);
+    let guards: Vec<&Code> = law.guard.iter().map(|g| &g.code).collect();
     decide(
         &ctx,
         &Goal {
-            module: 0,
             binders: &binders,
             guards: &guards,
             result: None,
@@ -128,13 +100,11 @@ fn attempt_with(fixture: &Fixture, label: &str, limits: &Limits) -> Decision {
 
 fn attempt_for_test(f: &Fixture, label: &str) -> (Decision, Vec<Blocker>) {
     let ctx = f.context();
-    let law = f.law(label);
-    let binders = binders(law);
-    let guards: Vec<&Expr> = law.guard.iter().collect();
+    let (binders, law) = f.law(label);
+    let guards: Vec<&Code> = law.guard.iter().map(|g| &g.code).collect();
     decide_and_diagnose(
         &ctx,
         &Goal {
-            module: 0,
             binders: &binders,
             guards: &guards,
             result: None,
@@ -142,6 +112,15 @@ fn attempt_for_test(f: &Fixture, label: &str) -> (Decision, Vec<Blocker>) {
         },
         &Limits::default(),
     )
+}
+
+#[test]
+fn the_prover_does_not_depend_on_the_rust_syntax_tree() {
+    let manifest = include_str!("../../../ply-prove/Cargo.toml");
+    assert!(
+        !manifest.contains("ply-syntax"),
+        "`ply-prove` depends on `ply-syntax` again; lower what it needs in the port instead"
+    );
 }
 
 #[track_caller]
@@ -567,8 +546,8 @@ effect counter { write next() -> Int }
 
 fn shout(n: Int) -> Int { log.note(n); n }
 fn bump() -> Int = counter.next()
-fn difference() -> Int = bump() - bump()
-fn once() -> Int { let n = counter.next(); n - n }
+fn difference() -> Int ensures result == 0 = bump() - bump()
+fn once() -> Int ensures result == 0 = { let n = counter.next(); n - n }
 "#;
 
 #[test]
@@ -582,31 +561,21 @@ fn two_calls_to_an_effectful_definition_are_not_one_term() {
     assert!(matches!(returns_zero(&f, "once"), Decision::Proved(_)));
 }
 
-/// `ensures result == 0` on a nullary definition of `source`.
-fn returns_zero(fixture: &Fixture, source: &str) -> Decision {
+fn returns_zero(fixture: &Fixture, owner: &str) -> Decision {
     let ctx = fixture.context();
-    let def = fixture.program.modules[0]
-        .items
-        .iter()
-        .find_map(|item| match item {
-            Item::Fn(d) if d.name.name.as_str() == source => Some(&**d),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("no definition named `{source}`"));
+    let def = fixture.def(owner);
     let binders = vec![LawBinder {
         name: Symbol::new("result"),
         ty: Type::int(),
         span: Span::DUMMY,
     }];
-    let body = ply_syntax::parse_expr(SRC, "result == 0").expect("clause parses");
     decide(
         &ctx,
         &Goal {
-            module: 0,
             binders: &binders,
             guards: &[],
-            result: Some((Symbol::new("result"), &def.body)),
-            body: &body,
+            result: Some(&def.body),
+            body: &clauses(def, SpecKind::Ensures)[0].code,
         },
         &Limits::default(),
     )
@@ -668,49 +637,30 @@ type Account = Account(Int, Int)
 fn identifier(a: Account) -> Int = match a { Account(i, _) -> i }
 fn balance(a: Account) -> Int = match a { Account(_, b) -> b }
 
-fn withdraw(acct: Account, amount: Int) -> Account =
-  Account(identifier(acct), balance(acct) - amount)
+fn withdraw(acct: Account, amount: Int) -> Account
+  requires amount > 0
+  ensures balance(result) == balance(acct) - amount
+  ensures identifier(result) == identifier(acct)
+  ensures balance(result) == balance(acct) + amount
+  = Account(identifier(acct), balance(acct) - amount)
 "#;
 
-fn ensures_goal(source: &str, clause: &str) -> Decision {
-    let f = fixture(source);
+fn ensures_goal(index: usize) -> Decision {
+    let f = fixture(LEDGER);
     let ctx = f.context();
-    let def = f.program.modules[0]
-        .items
-        .iter()
-        .find_map(|item| match item {
-            Item::Fn(d) if d.name.name.as_str() == "withdraw" => Some(&**d),
-            _ => None,
-        })
-        .expect("withdraw");
-
-    let mut vars = BTreeMap::new();
-    let mut binders: Vec<LawBinder> = def
-        .params
-        .iter()
-        .map(|p| LawBinder {
-            name: p.name.name.clone(),
-            ty: resolve_type(p.ty.as_ref().expect("annotated"), &mut vars),
-            span: p.span,
-        })
+    let def = f.def("withdraw");
+    let binders = clause_binders(&f.check.defs[&Symbol::new("withdraw")]);
+    let guards: Vec<&Code> = clauses(def, SpecKind::Requires)
+        .into_iter()
+        .map(|g| &g.code)
         .collect();
-    binders.push(LawBinder {
-        name: Symbol::new("result"),
-        ty: resolve_type(def.ret.as_ref().expect("annotated"), &mut vars),
-        span: Span::DUMMY,
-    });
-
-    let body = ply_syntax::parse_expr(SRC, clause).expect("clause parses");
-    let guard = ply_syntax::parse_expr(SRC, "amount > 0").expect("guard parses");
-    let guards = [&guard];
     decide(
         &ctx,
         &Goal {
-            module: 0,
             binders: &binders,
             guards: &guards,
-            result: Some((Symbol::new("result"), &def.body)),
-            body: &body,
+            result: Some(&def.body),
+            body: &clauses(def, SpecKind::Ensures)[index].code,
         },
         &Limits::default(),
     )
@@ -718,59 +668,24 @@ fn ensures_goal(source: &str, clause: &str) -> Decision {
 
 #[test]
 fn a_postcondition_over_a_definition_decides_both_directions() {
-    assert!(matches!(
-        ensures_goal(LEDGER, "balance(result) == balance(acct) - amount"),
-        Decision::Proved(_)
-    ));
-    assert!(matches!(
-        ensures_goal(LEDGER, "identifier(result) == identifier(acct)"),
-        Decision::Proved(_)
-    ));
-    assert!(!matches!(
-        ensures_goal(LEDGER, "balance(result) == balance(acct) + amount"),
-        Decision::Proved(_)
-    ));
+    assert!(matches!(ensures_goal(0), Decision::Proved(_)));
+    assert!(matches!(ensures_goal(1), Decision::Proved(_)));
+    assert!(!matches!(ensures_goal(2), Decision::Proved(_)));
 }
 
 #[test]
 fn a_postcondition_without_the_definition_is_unknown() {
     let f = fixture(LEDGER);
     let ctx = f.context();
-    let mut vars = BTreeMap::new();
-    let account = resolve_type(
-        &TypeExpr::Con {
-            name: ply_syntax::ast::QName::bare(ply_syntax::ast::Ident::new("Account", Span::DUMMY)),
-            args: Vec::new(),
-            span: Span::DUMMY,
-        },
-        &mut vars,
-    );
-    let binders = vec![
-        LawBinder {
-            name: Symbol::new("acct"),
-            ty: account.clone(),
-            span: Span::DUMMY,
-        },
-        LawBinder {
-            name: Symbol::new("amount"),
-            ty: Type::int(),
-            span: Span::DUMMY,
-        },
-        LawBinder {
-            name: Symbol::new("result"),
-            ty: account,
-            span: Span::DUMMY,
-        },
-    ];
-    let body = ply_syntax::parse_expr(SRC, "balance(result) == balance(acct) - amount").unwrap();
+    let def = f.def("withdraw");
+    let binders = clause_binders(&f.check.defs[&Symbol::new("withdraw")]);
     let decision = decide(
         &ctx,
         &Goal {
-            module: 0,
             binders: &binders,
             guards: &[],
             result: None,
-            body: &body,
+            body: &clauses(def, SpecKind::Ensures)[0].code,
         },
         &Limits::default(),
     );

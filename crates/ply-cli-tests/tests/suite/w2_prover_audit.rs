@@ -32,11 +32,12 @@ impl Run {
         });
         let hashes = loaded.hashes.clone();
         let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
-        let tree = loaded.tree().expect("the front ends agree");
-        let prover = Prover::new(&tree.program, &tree.resolved, &loaded.check).with_backend(
-            ply_cli::commands::common::prover_backend(None, &loaded)
-                .expect("the program compiles to a tier"),
-        );
+        let prover = Prover::new(&loaded)
+            .expect("the port lowers the claims")
+            .with_backend(
+                ply_cli::commands::common::prover_backend(None, &loaded)
+                    .expect("the program compiles to a tier"),
+            );
         let results = collected
             .obligations
             .into_iter()
@@ -148,11 +149,12 @@ fn a_certificate_over_a_hidden_float_is_refuted_by_sampling() {
     let loaded = load(dir.path()).expect("the fixture compiles");
     let hashes = loaded.hashes.clone();
     let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
-    let tree = loaded.tree().expect("the front ends agree");
-    let prover = Prover::new(&tree.program, &tree.resolved, &loaded.check).with_backend(
-        ply_cli::commands::common::prover_backend(None, &loaded)
-            .expect("the program compiles to a tier"),
-    );
+    let prover = Prover::new(&loaded)
+        .expect("the port lowers the claims")
+        .with_backend(
+            ply_cli::commands::common::prover_backend(None, &loaded)
+                .expect("the program compiles to a tier"),
+        );
     let wide = ProvePlan {
         cases: 1_000,
         roots: (0..8).collect(),
