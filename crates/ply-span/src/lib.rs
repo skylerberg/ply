@@ -370,6 +370,8 @@ pub mod codes {
     pub const ASSERTION_FAILED: &str = "E0501";
     /// A failure the language defines: `panic`, division by zero, overflow, a resource limit.
     pub const RUNTIME_ERROR: &str = "E0502";
+    /// An entry point, test or evaluation ran past its wall-clock budget.
+    pub const TIME_BUDGET: &str = "E0503";
     pub const INTERNAL_ERROR: &str = "E0505";
     /// Cache codes are warnings: cache trouble is never a fault in the user's program.
     pub const CACHE_UNREADABLE: &str = "W0601";
@@ -649,6 +651,7 @@ mod tests {
             ("FS_ROOT_INVALID", codes::FS_ROOT_INVALID, "E0454"),
             ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
+            ("TIME_BUDGET", codes::TIME_BUDGET, "E0503"),
             ("INTERNAL_ERROR", codes::INTERNAL_ERROR, "E0505"),
             ("CACHE_UNREADABLE", codes::CACHE_UNREADABLE, "W0601"),
             ("CACHE_CORRUPT", codes::CACHE_CORRUPT, "W0602"),

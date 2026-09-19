@@ -205,6 +205,28 @@ fn a_failure_inside_a_handler_clause_body_is_still_the_programs() {
 }
 
 #[test]
+fn a_loop_that_never_ends_is_a_program_error_at_its_time_budget() {
+    const RUNAWAY: &str = "fn spin(n: Int) -> Int = spin(n + 1)\n\
+                           test \"spins\" { assert_eq(spin(0), 0) }\n";
+    let dir = project(RUNAWAY);
+    let out = ply(dir.path())
+        .args(["test", "--json", "--timeout", "300"])
+        .output()
+        .unwrap();
+    let v = json_of(&out);
+    let failure = &v["failures"][0];
+    assert_eq!(failure["defect"], false, "{failure}");
+    assert_eq!(failure["diagnostic"]["code"], "E0503", "{failure}");
+    assert!(
+        failure["diagnostic"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("time budget of 300 ms"),
+        "{failure}"
+    );
+}
+
+#[test]
 fn the_recursion_limit_is_a_program_error() {
     const RUNAWAY: &str = "fn spin(n: Int) -> Int = 1 + spin(n + 1)\n\
                            test \"spins\" { assert_eq(spin(0), 0) }\n";
