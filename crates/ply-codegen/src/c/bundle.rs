@@ -19,34 +19,34 @@ use std::path::Path;
 const UNIT: &str = "unit.c.gz";
 const SOURCES: &str = "SOURCES.digest";
 
-/// Writes the bundle, replacing what was there.
+/// Writes the bundle, replacing what was there; each file lands by a rename, so a reader never
+/// sees half of one.
 pub fn write(dir: &Path, text: &str, sources_digest: &str) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
-    std::fs::write(dir.join(UNIT), pack(text)?)?;
-    std::fs::write(dir.join(SOURCES), format!("{sources_digest}\n"))?;
-    Ok(())
+    let land = |name: &str, bytes: Vec<u8>| -> Result<()> {
+        let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, dir.join(name))?;
+        Ok(())
+    };
+    land(UNIT, pack(text)?)?;
+    land(SOURCES, format!("{sources_digest}\n").into_bytes())
 }
 
 /// A bundle: its C and the digest of the sources it came from. Whether it serves this runtime is
 /// the unit's own answer, given when it is built.
 ///
-/// The embedded one is `ply-compiler`'s, which the binary carries; a directory is a working copy's
-/// own `bootstrap/`, refreshed in place by the fixpoint test.
+/// The embedded one is `ply-compiler`'s, which the binary carries and the fixpoint test refreshes
+/// in place; a stage is what the committed emitter emitted for other sources, kept by their digest.
 pub struct Bundle {
     unit: std::borrow::Cow<'static, [u8]>,
     sources: Option<String>,
-    embedded: bool,
 }
 
-/// The bundle for `src`, or `None` when there is none.
-pub fn of(src: &super::producer::Sources) -> Option<Bundle> {
-    match src {
-        super::producer::Sources::Embedded => Some(Bundle {
-            unit: std::borrow::Cow::Borrowed(ply_compiler::bootstrap::UNIT),
-            sources: Some(ply_compiler::bootstrap::SOURCES.trim().to_string()),
-            embedded: true,
-        }),
-        super::producer::Sources::Directory(dir) => from_dir(&dir.join("bootstrap")),
+pub fn embedded() -> Bundle {
+    Bundle {
+        unit: std::borrow::Cow::Borrowed(ply_compiler::bootstrap::UNIT),
+        sources: Some(ply_compiler::bootstrap::SOURCES.trim().to_string()),
     }
 }
 
@@ -55,8 +55,12 @@ pub fn from_dir(dir: &Path) -> Option<Bundle> {
     Some(Bundle {
         unit: std::borrow::Cow::Owned(std::fs::read(dir.join(UNIT)).ok()?),
         sources: sources_digest(dir),
-        embedded: false,
     })
+}
+
+/// Where the stage emitted for the sources of `identity` is kept between runs, under the unit cache.
+pub fn stage_dir(identity: &str) -> std::path::PathBuf {
+    super::load::cache_dir().join("stage").join(identity)
 }
 
 impl Bundle {
@@ -105,11 +109,11 @@ pub fn exists(dir: &Path) -> bool {
 /// names no place. A bundle emitted against a helper table this runtime's does not start with
 /// fails here with [`super::exports::Unserved`].
 ///
-/// The embedded bundle loads through [`super::upgrade`], except under nextest, where a background
-/// compile would contend with the suite and change which object a later test loads.
+/// A bundle loads through [`super::upgrade`], except under nextest, where a background compile
+/// would contend with the suite and change which object a later test loads.
 pub fn build(bundle: &Bundle) -> Result<(Native, Vec<Refused>)> {
     let text = text_of(bundle)?;
-    let lib = if bundle.embedded && std::env::var_os("NEXTEST").is_none() {
+    let lib = if std::env::var_os("NEXTEST").is_none() {
         super::upgrade::load(&text, "bootstrap")?
     } else {
         super::load::compile_and_load(&text, "bootstrap")?
