@@ -59,8 +59,14 @@ pub fn from_dir(dir: &Path) -> Option<Bundle> {
 }
 
 /// Where the stage emitted for the sources of `identity` is kept between runs, under the unit cache.
+/// A stage is a product of the emitter sources alone, so it lives beside the unit cache rather
+/// than under it: a run with a cache of its own still finds the stage an earlier one wrote.
+/// `PLY_C_STAGE` names another root.
 pub fn stage_dir(identity: &str) -> std::path::PathBuf {
-    super::load::cache_dir().join("stage").join(identity)
+    std::env::var("PLY_C_STAGE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("ply-c-stage"))
+        .join(identity)
 }
 
 impl Bundle {
