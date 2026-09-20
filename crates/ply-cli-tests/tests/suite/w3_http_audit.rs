@@ -204,7 +204,7 @@ fn limits_of(header_bytes: Int) -> Limits =
    max_body: 1048576, max_chunk_size: 1048576, max_chunk_line: 4096, max_trailer_bytes: 8192,
    max_keep_alive: 100, max_stream_chunks: 2048,
    header_timeout_ms: 5000, body_timeout_ms: 30000, idle_timeout_ms: 5000,
-   write_timeout_ms: 30000}}
+   write_timeout_ms: 30000, connect_timeout_ms: 5000}}
 
 // `Host: x` and its CRLF is 9 bytes, `A: ` plus n plus CRLF is n + 5, and the
 // terminator is 2: the block is n + 16 bytes.
@@ -512,7 +512,7 @@ fn wide(n: Int) -> Limits =
    max_body: 1048576, max_chunk_size: 1048576, max_chunk_line: 4096,
    max_trailer_bytes: 8192, max_keep_alive: 100, max_stream_chunks: n,
    header_timeout_ms: 5000, body_timeout_ms: 30000, idle_timeout_ms: 5000,
-   write_timeout_ms: 30000}
+   write_timeout_ms: 30000, connect_timeout_ms: 5000}
 
 fn twenty_thousand(seed: Int) -> Option<{ chunk: Bytes, next: Int }> =
   if seed >= 20000 { None } else { Some({chunk: b"x", next: seed + 1}) }
