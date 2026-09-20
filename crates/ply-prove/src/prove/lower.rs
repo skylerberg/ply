@@ -6,7 +6,7 @@ use super::context::Context;
 use super::term::{self, Arm, ArmTest, CmpOp, Node, TermId, Terms};
 use ply_span::Symbol;
 use ply_ty::{BinOp, CtorInfo, Lit, Scheme, TyVar, Type, UnOp};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_TERMS: usize = 20_000;
 
@@ -81,6 +81,8 @@ pub enum Blocker {
     Region,
     UndecidableMatchArm,
     DestructuringLet,
+    /// Why induction declined: which definition or case, in words.
+    Induction(String),
 }
 
 /// A non-`Int` numeric operand type.
@@ -92,6 +94,15 @@ enum Numeric {
 
 fn is_con(ty: &Type, name: &str) -> bool {
     matches!(ty, Type::Con(n, args) if n.as_str() == name && args.is_empty())
+}
+
+/// A self call whose argument in `slot` must be non-negative and below `bound`, the parameter it
+/// was entered with: what makes a recursive definition terminate.
+#[derive(Clone)]
+pub struct Measure {
+    pub def: Symbol,
+    pub slot: usize,
+    pub bound: TermId,
 }
 
 pub struct Lowering<'a, 'p> {
@@ -107,6 +118,19 @@ pub struct Lowering<'a, 'p> {
     /// Conditions assumed on the way to the expression being lowered.
     path: Vec<TermId>,
     float: bool,
+    /// Recursive definitions shown to terminate, so a call of one is a value.
+    total: BTreeSet<Symbol>,
+    /// Recursive definitions inlined to the depth, each unrolling recorded as an equation.
+    unrolled: BTreeSet<Symbol>,
+    measure: Option<Measure>,
+    /// What each self call under the measure owes: the argument decreases and stays non-negative.
+    measures: Vec<TermId>,
+    /// `f(x̄) == body(x̄)` for each unrolling of a recursive definition.
+    equations: Vec<TermId>,
+    /// The `f(x̄)` of each equation.
+    defined: Vec<TermId>,
+    /// Calls of a total definition left as terms.
+    calls: Vec<TermId>,
 }
 
 impl<'a, 'p> Lowering<'a, 'p> {
@@ -126,7 +150,51 @@ impl<'a, 'p> Lowering<'a, 'p> {
             requirements: Vec::new(),
             path: Vec::new(),
             float: false,
+            total: BTreeSet::new(),
+            unrolled: BTreeSet::new(),
+            measure: None,
+            measures: Vec::new(),
+            equations: Vec::new(),
+            defined: Vec::new(),
+            calls: Vec::new(),
         }
+    }
+
+    pub fn measures(&self) -> &[TermId] {
+        &self.measures
+    }
+
+    pub fn set_total(&mut self, names: BTreeSet<Symbol>) {
+        self.total = names;
+    }
+
+    pub fn set_unrolling(&mut self, names: BTreeSet<Symbol>) {
+        self.unrolled = names;
+    }
+
+    pub fn set_measure(&mut self, measure: Measure) {
+        self.measure = Some(measure);
+    }
+
+    pub fn equations(&self) -> &[TermId] {
+        &self.equations
+    }
+
+    pub fn defined(&self) -> &[TermId] {
+        &self.defined
+    }
+
+    pub fn calls(&self) -> &[TermId] {
+        &self.calls
+    }
+
+    pub fn requirements_since(&self, mark: usize) -> &[TermId] {
+        &self.requirements[mark..]
+    }
+
+    /// Forgets the conditions assumed so far, before lowering a hypothesis instance.
+    pub fn drop_assumptions(&mut self) {
+        self.path.clear();
     }
 
     /// No proof survives a `Float` in the obligation.
@@ -167,12 +235,17 @@ impl<'a, 'p> Lowering<'a, 'p> {
         if cond == self.terms.true_id {
             return;
         }
+        let out = self.under_path(cond);
+        self.requirements.push(out);
+    }
+
+    fn under_path(&mut self, cond: TermId) -> TermId {
         let mut out = cond;
         for i in (0..self.path.len()).rev() {
             let negated = self.terms.not(self.path[i]);
             out = self.terms.mk(Node::Or(negated, out), Some(Type::bool()));
         }
-        self.requirements.push(out);
+        out
     }
 
     fn undefined(&mut self) {
@@ -692,7 +765,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                     );
                 }
             } else {
-                if let Some(term) = self.try_unfold(&name, &lowered) {
+                if let Some(term) = self.try_unfold(&name, head, sort.clone(), &lowered) {
                     return term;
                 }
                 pure &= self.ctx.is_pure(&name);
@@ -700,7 +773,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
             }
         }
 
-        if !self.callee_is_total(&callee, head) {
+        if !self.decreasing_call(&callee, &lowered) && !self.callee_is_total(&callee, head) {
             self.undefined();
         }
 
@@ -709,13 +782,17 @@ impl<'a, 'p> Lowering<'a, 'p> {
             return self.terms.sym(sort);
         }
 
-        self.terms.mk(
+        let call = self.terms.mk(
             Node::App {
                 head,
                 args: lowered,
             },
             sort,
-        )
+        );
+        if matches!(&callee, Callee::Named(name) if self.total.contains(name)) {
+            self.calls.push(call);
+        }
+        call
     }
 
     /// Decided from the code, not the head's term: a local and a same-named definition lower alike.
@@ -741,7 +818,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 Some(Type::Fn { effects, .. }) if effects.is_pure()
             ),
             // A definition whose body was not inlined is not known to be total.
-            Callee::Named(name) => self.ctx.ctor(name).is_some(),
+            Callee::Named(name) => self.ctx.ctor(name).is_some() || self.total.contains(name),
             Callee::Unresolved(name) => TOTAL_BUILTINS.contains(&name.as_str()),
             Callee::Other => false,
         }
@@ -765,12 +842,62 @@ impl<'a, 'p> Lowering<'a, 'p> {
         self.blocked(blocker);
     }
 
-    fn try_unfold(&mut self, name: &Symbol, args: &[TermId]) -> Option<TermId> {
+    /// The self call of the definition under a termination check owes the measure: its argument
+    /// in the measured slot is non-negative and below the parameter the body was entered with.
+    fn decreasing_call(&mut self, callee: &Callee, args: &[TermId]) -> bool {
+        let Some(measure) = self.measure.clone() else {
+            return false;
+        };
+        if !matches!(callee, Callee::Named(name) if *name == measure.def) {
+            return false;
+        }
+        let Some(&arg) = args.get(measure.slot) else {
+            return false;
+        };
+        let zero = self.terms.int_lit(0);
+        let low = self.terms.mk(
+            Node::Cmp {
+                op: CmpOp::Ge,
+                lhs: arg,
+                rhs: zero,
+            },
+            Some(Type::bool()),
+        );
+        let high = self.terms.mk(
+            Node::Cmp {
+                op: CmpOp::Lt,
+                lhs: arg,
+                rhs: measure.bound,
+            },
+            Some(Type::bool()),
+        );
+        let both = self.terms.mk(Node::And(low, high), Some(Type::bool()));
+        let owed = self.under_path(both);
+        self.measures.push(owed);
+        true
+    }
+
+    fn try_unfold(
+        &mut self,
+        name: &Symbol,
+        head: TermId,
+        sort: Option<Type>,
+        args: &[TermId],
+    ) -> Option<TermId> {
         if self.depth >= self.unfold_depth || self.terms.len() >= MAX_TERMS {
             return None;
         }
         let ctx = self.ctx;
-        let def = ctx.unfoldable(name)?;
+        let unrolling = self.unrolled.contains(name);
+        // One step of a recursive definition: the hypothesis speaks about the call that remains.
+        if unrolling && self.depth >= 1 {
+            return None;
+        }
+        let def = match ctx.unfoldable(name) {
+            Some(def) => def,
+            None if unrolling => ctx.self_recursive(name)?,
+            None => return None,
+        };
         if def.params != args.len() {
             return None;
         }
@@ -780,6 +907,18 @@ impl<'a, 'p> Lowering<'a, 'p> {
         self.depth += 1;
         let out = self.within(window, |this| this.lower(&def.body));
         self.depth -= 1;
+        if unrolling {
+            let call = self.terms.mk(
+                Node::App {
+                    head,
+                    args: args.to_vec(),
+                },
+                sort,
+            );
+            let equation = self.terms.eq(call, out);
+            self.equations.push(equation);
+            self.defined.push(call);
+        }
         Some(out)
     }
 

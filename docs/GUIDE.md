@@ -712,8 +712,11 @@ law "a credit and a matching debit leave an account exactly as it was"
 
 `proved` covers ground evaluation, enumeration of finite domains up to 4096
 points, linear `Int` arithmetic, case splits, congruence, constructor
-injectivity, unfolding non-recursive definitions and exhaustive interleaving.
-There is no induction.
+injectivity, unfolding non-recursive definitions, exhaustive interleaving, and
+induction on an `Int` binder: a definition that calls only itself with some
+`Int` argument non-negative and smaller at every self call is unrolled, and the
+claim is proved at `n <= 0` and then at `n > 0` from itself at `n - 1`. There is
+no induction over lists.
 
 `ply prove` reports the definitions carrying no obligation, then each
 obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no

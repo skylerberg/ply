@@ -261,6 +261,10 @@ fn to_cached_rule(rule: &Rule) -> CachedRule {
             def: def.clone(),
             depth: *depth,
         },
+        Rule::Induction { binder, def } => CachedRule::Induction {
+            binder: binder.clone(),
+            def: def.clone(),
+        },
         Rule::ExhaustiveInterleaving { interleavings } => CachedRule::ExhaustiveInterleaving {
             interleavings: *interleavings,
         },
@@ -285,6 +289,10 @@ fn from_cached_rule(rule: &CachedRule) -> Rule {
         CachedRule::Unfold { def, depth } => Rule::Unfold {
             def: def.clone(),
             depth: *depth,
+        },
+        CachedRule::Induction { binder, def } => Rule::Induction {
+            binder: binder.clone(),
+            def: def.clone(),
         },
         CachedRule::ExhaustiveInterleaving { interleavings } => Rule::ExhaustiveInterleaving {
             interleavings: *interleavings,
