@@ -315,6 +315,19 @@ pub struct TestArgs {
     #[arg(long, default_value_t = 64, value_name = "N")]
     pub bisect_budget: usize,
 
+    /// Which tests reach each definition, and the definitions none reaches.
+    #[arg(long)]
+    pub coverage: bool,
+
+    /// After a green run, change each definition (or DEF) one operator or literal at a time and
+    /// re-run the tests that reach it; a mutant every one of them passes is reported.
+    #[arg(long, value_name = "DEF", num_args = 0..=1, default_missing_value = "*")]
+    pub mutate: Option<String>,
+
+    /// Mutants a run may judge; counted, not timed, so runs agree.
+    #[arg(long, default_value_t = 64, value_name = "N")]
+    pub mutate_budget: usize,
+
     /// Record which definitions a failing test entered; `always` also traces the first run.
     #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]
     pub trace: When,

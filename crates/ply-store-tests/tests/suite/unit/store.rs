@@ -2461,7 +2461,8 @@ fn the_result_cache_on_disk_schema_is_pinned() {
                   "message": "expected 0, found -5",
                   "primary": true
                 }],
-                "notes": ["suspects: apply_debit"]
+                "notes": ["suspects: apply_debit"],
+                "fixes": []
               }
             }
           },
