@@ -321,9 +321,10 @@ fn resolve(
             continue;
         }
 
-        let candidates: Vec<Resource> = match &op.resource {
-            HostResource::Only(r) => vec![r.clone()],
-            // A footprint names the operation, or the mode when its row was written that way.
+        // A footprint names the operation, or the mode when its row was written that way; a program
+        // holding both names one label once.
+        let candidates: BTreeSet<Resource> = match &op.resource {
+            HostResource::Only(r) => BTreeSet::from([r.clone()]),
             HostResource::Any => performed
                 .iter()
                 .filter(|a| {

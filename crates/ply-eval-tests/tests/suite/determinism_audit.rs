@@ -421,13 +421,13 @@ effect counter {
   write note[r](v: Int) -> Unit
 }
 
-fn bump() -> Unit / {counter.read[n], counter.write[n], clock.read} = {
+fn bump() -> Unit / {counter.get[n], counter.put[n], clock.now} = {
   let seen = counter.get[n]();
   clock.now();
   counter.put[n](seen + 1)
 }
 
-fn noise() -> Unit / {counter.read[n], counter.write[m], clock.read} = {
+fn noise() -> Unit / {counter.get[n], counter.note[m], clock.now} = {
   let seen = counter.get[n]();
   clock.now();
   counter.note[m](seen)
