@@ -1055,9 +1055,11 @@ fn is_ident_byte(c: Int) -> Bool = is_digit(c) || (c >= 97 && c <= 122) || (c >=
 
 fn skip_ws(p: Pr, i: Int) -> Int = bytes_scan(p.src, i, b" \t\r\n", bytes_len(p.src) - i)
 
-fn back_ws(p: Pr, i: Int) -> Int =
+fn back_ws(p: Pr, i: Int) -> Int = back_blank(p.src, i)
+
+fn back_blank(src: Bytes, i: Int) -> Int =
   iterate(i, i + 1, |k: Int|
-    if k > 0 && (is_blank(bytes_at(p.src, k - 1)) || bytes_at(p.src, k - 1) == 10) { Continue(k - 1) }
+    if k > 0 && (is_blank(bytes_at(src, k - 1)) || bytes_at(src, k - 1) == 10) { Continue(k - 1) }
     else { Stop(k) })
 
 // The resource name of an operation, which the tree keeps only as a flag.
@@ -1147,6 +1149,158 @@ fn law_def(p: Pr, st: St, d: LawDef) -> St = {
         None -> s2,
       };
       block(p, emit(s3, b" "), d.body, if quantified { 2 } else { 0 })
+    },
+  }
+}
+
+// --- One item ---------------------------------------------------------------
+
+type Located = { start: Int, end: Int, item: Item }
+
+fn item_kind(it: Item) -> Bytes =
+  match it {
+    IFn(_) -> b"fn",
+    IType(_) -> b"type",
+    IEffect(_) -> b"effect",
+    ITest(_) -> b"test",
+    ILaw(_) -> b"law",
+    IDerive(_) -> b"derive",
+    IEffectSet(_) -> b"effect set",
+  }
+
+// A test, a law or a derive has no identifier to be found by.
+fn item_name(it: Item) -> Option<Bytes> =
+  match it {
+    IFn(d) -> Some(d.name.name),
+    IType(d) -> Some(d.name.name),
+    IEffect(d) -> Some(d.name.name),
+    IEffectSet(d) -> Some(d.name.name),
+    _ -> None,
+  }
+
+fn item_desc(it: Item) -> Bytes =
+  match item_name(it) {
+    Some(n) -> bytes_concat_all([b"`", item_kind(it), b"` `", n, b"`"]),
+    None -> bytes_concat_all([b"a `", item_kind(it), b"`"]),
+  }
+
+fn is_pub(v: Vis) -> Bool = match v { VPub -> true, VPriv -> false }
+
+fn line_start(src: Bytes, i: Int) -> Int =
+  iterate(i, i + 1, |k: Int| if k > 0 && bytes_at(src, k - 1) != 10 { Continue(k - 1) } else { Stop(k) })
+
+// Past the newline ending the line that holds `i`, or the end of the text.
+fn line_end(src: Bytes, i: Int) -> Int =
+  match bytes_index_of_from(src, b"\n", i) { Some(j) -> j + 1, None -> bytes_len(src) }
+
+// Where the item's own text starts: at its `pub` or `reuse` when it has one, else its keyword.
+fn head_start(src: Bytes, it: Item) -> Int = {
+  let kw = match it {
+    IFn(d) -> match d.reuse { Some(s) -> s.start, None -> d.span.start },
+    _ -> item_span(it).start,
+  };
+  let published = match it {
+    IFn(d) -> is_pub(d.vis),
+    IType(d) -> is_pub(d.vis),
+    IEffect(d) -> is_pub(d.vis),
+    _ -> false,
+  };
+  let j = back_blank(src, kw);
+  if published && j >= 3 && bytes_slice(src, j - 3, j) == b"pub" && (j == 3 || !is_ident_byte(bytes_at(src, j - 4))) {
+    j - 3
+  } else {
+    kw
+  }
+}
+
+// The end of the last item or import that ends at or before `pos`.
+fn floor_before(m: Module, pos: Int) -> Int = {
+  let imported = fold(m.imports, 0, |acc: Int, d: ImportDecl|
+    if d.span.end <= pos && d.span.end > acc { d.span.end } else { acc });
+  fold(m.items, imported, |acc: Int, it: Item| {
+    let e = item_span(it).end;
+    if e <= pos && e > acc { e } else { acc }
+  })
+}
+
+// The start of the first item or import that starts at or after `pos`, else the end of the text.
+fn ceiling_after(src: Bytes, m: Module, pos: Int) -> Int = {
+  let imported = fold(m.imports, bytes_len(src), |acc: Int, d: ImportDecl|
+    if d.span.start >= pos && d.span.start < acc { d.span.start } else { acc });
+  fold(m.items, imported, |acc: Int, it: Item| {
+    let s = head_start(src, it);
+    if s >= pos && s < acc { s } else { acc }
+  })
+}
+
+// The start of the `//` lines directly above `head` with no blank line between, none before `floor`.
+fn doc_start(src: Bytes, head: Int, floor: Int) -> Int = {
+  let first = line_start(src, head);
+  if first < floor { floor } else {
+    iterate(first, head + 1, |ls: Int|
+      if ls <= floor {
+        Stop(ls)
+      } else {
+        let prev = line_start(src, ls - 1);
+        if prev >= floor && bytes_starts_with(trim(bytes_slice(src, prev, ls - 1)), b"//") { Continue(prev) }
+        else { Stop(ls) }
+      })
+  }
+}
+
+fn locate(src: Bytes, name: Bytes) -> Result<Located, Bytes> = {
+  let r = parse(src);
+  match list_at(r.p.diags, 0) {
+    Some(d) -> Err(render_diag(src, d)),
+    None -> {
+      let m = r.node;
+      let found = filter(m.items, |it: Item| match item_name(it) { Some(n) -> n == name, None -> false });
+      if len(found) == 0 {
+        Err(bytes_concat_all([b"no `fn`, `type` or `effect` is named `", name, b"`"]))
+      } else if len(found) > 1 {
+        Err(bytes_concat_all([b"`", name, b"` names ", num(len(found)), b" items"]))
+      } else {
+        let it = at(found, 0);
+        let head = head_start(src, it);
+        let last = item_span(it).end;
+        let start = doc_start(src, head, floor_before(m, head));
+        let end = min(line_end(src, last), ceiling_after(src, m, last));
+        Ok({ start: start, end: end, item: it })
+      }
+    },
+  }
+}
+
+// The bytes of the item named `name`: its comment lines, `pub`, `reuse` and body through the end of
+// its last line, so a comment ending that line comes along. Refused when the name is absent, names
+// two items, or the text does not parse.
+pub fn item_range(src: Bytes, name: Bytes) -> Result<{ start: Int, end: Int }, Bytes> =
+  match locate(src, name) { Ok(l) -> Ok({ start: l.start, end: l.end }), Err(e) -> Err(e) }
+
+// `src` with the item named `name` replaced by `item` formatted; every byte outside its range is kept.
+pub fn replace_item(src: Bytes, name: Bytes, item: Bytes) -> Result<Bytes, Bytes> = {
+  let old = locate(src, name)?;
+  let r = parse(item);
+  match list_at(r.p.diags, 0) {
+    Some(d) -> Err(bytes_concat(b"the replacement does not parse: ", render_diag(item, d))),
+    None -> {
+      let m = r.node;
+      if len(m.imports) > 0 {
+        Err(b"the replacement holds an import; it must be one item")
+      } else if len(m.items) != 1 {
+        Err(bytes_concat_all([b"the replacement holds ", num(len(m.items)), b" items; it must be one"]))
+      } else {
+        let fresh = at(m.items, 0);
+        let same = item_kind(fresh) == item_kind(old.item)
+          && (match item_name(fresh) { Some(n) -> n == name, None -> false });
+        if !same {
+          Err(bytes_concat_all([b"the replacement defines ", item_desc(fresh), b"; expected ", item_desc(old.item)]))
+        } else {
+          let formatted = fmt_source(item)?;
+          let lead = if old.start > 0 && bytes_at(src, old.start - 1) != 10 { b"\n" } else { b"" };
+          Ok(bytes_concat_all([bytes_slice(src, 0, old.start), lead, formatted, bytes_slice(src, old.end, bytes_len(src))]))
+        }
+      }
     },
   }
 }
@@ -1258,4 +1412,53 @@ test "specification clauses go on their own lines before the body" {
   let src = b"fn f(n: Int) -> Int requires n > 0 ensures result > n = n + 1\n";
   assert_eq(formatted(src), b"fn f(n: Int) -> Int\n  requires n > 0\n  ensures result > n\n= n + 1\n");
   assert(stable(src))
+}
+
+fn range_of(src: Bytes, name: Bytes) -> Bytes =
+  match item_range(src, name) {
+    Ok(r) -> bytes_slice(src, r.start, r.end),
+    Err(e) -> panic(string_of_bytes(e)),
+  }
+
+test "an item's range holds its `pub`, its `reuse`, the comment lines above it and a comment ending its last line" {
+  let src = bytes_concat_all([b"import spine (Span)\n\n// first\npub fn a() -> Int = 1  // one\n\n",
+    b"// doc for b\n// on two lines\npub reuse fn b(x: Int) -> Int = x\n",
+    b"type T = { x: Int }\n\n// stray\n\neffect clock { read now() -> Int }\n"]);
+  assert_eq(range_of(src, b"a"), b"// first\npub fn a() -> Int = 1  // one\n");
+  assert_eq(range_of(src, b"b"), b"// doc for b\n// on two lines\npub reuse fn b(x: Int) -> Int = x\n");
+  assert_eq(range_of(src, b"T"), b"type T = { x: Int }\n");
+  assert_eq(range_of(src, b"clock"), b"effect clock { read now() -> Int }\n");
+  let bare = b"fn a() -> Int = 1\nfn b() -> Int = 2";
+  assert_eq(range_of(bare, b"a"), b"fn a() -> Int = 1\n");
+  assert_eq(range_of(bare, b"b"), b"fn b() -> Int = 2")
+}
+
+test "an item that is absent, named twice, or in a text that does not parse is refused" {
+  assert_eq(item_range(b"fn a() -> Int = 1\n", b"b"), Err(b"no `fn`, `type` or `effect` is named `b`"));
+  assert_eq(item_range(b"fn a() -> Int = 1\nfn a() -> Int = 2\n", b"a"), Err(b"`a` names 2 items"));
+  match item_range(b"fn a( = 1\n", b"a") {
+    Ok(_) -> assert(false),
+    Err(e) -> assert(bytes_starts_with(e, b"1:")),
+  }
+}
+
+test "a replacement rewrites the named item alone, formatted, and keeps every other byte" {
+  let src = b"// head\nfn a() -> Int = 1\n\n// doc\npub fn b(x: Int) -> Int = x   // keep\n\nfn c() -> Int = 3  // tail\n";
+  assert_eq(replace_item(src, b"b", b"// new doc\npub fn   b(x: Int)->Int = x+1\n"),
+            Ok(b"// head\nfn a() -> Int = 1\n\n// new doc\npub fn b(x: Int) -> Int = x + 1\n\nfn c() -> Int = 3  // tail\n"));
+  assert_eq(replace_item(src, b"c", b"fn c() -> Int = 4"),
+            Ok(b"// head\nfn a() -> Int = 1\n\n// doc\npub fn b(x: Int) -> Int = x   // keep\n\nfn c() -> Int = 4\n"))
+}
+
+test "a replacement of another kind or name, or holding more than one item, is refused" {
+  let src = b"fn a() -> Int = 1\ntype T = Int\n";
+  assert_eq(replace_item(src, b"a", b"fn c() -> Int = 1\n"), Err(b"the replacement defines `fn` `c`; expected `fn` `a`"));
+  assert_eq(replace_item(src, b"T", b"fn a() -> Int = 1\n"), Err(b"the replacement defines `fn` `a`; expected `type` `T`"));
+  assert_eq(replace_item(src, b"a", b"test \"t\" { assert(true) }\n"), Err(b"the replacement defines a `test`; expected `fn` `a`"));
+  assert_eq(replace_item(src, b"a", b"fn a() -> Int = 1\nfn b() -> Int = 2\n"), Err(b"the replacement holds 2 items; it must be one"));
+  assert_eq(replace_item(src, b"a", b"import std.json\nfn a() -> Int = 1\n"), Err(b"the replacement holds an import; it must be one item"));
+  match replace_item(src, b"a", b"fn a( = 1\n") {
+    Ok(_) -> assert(false),
+    Err(e) -> assert(bytes_starts_with(e, b"the replacement does not parse: 1:")),
+  }
 }

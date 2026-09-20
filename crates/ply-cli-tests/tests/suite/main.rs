@@ -31,6 +31,7 @@ mod prove;
 mod prover_soundness_audit;
 mod refcount_counters;
 mod regressions;
+mod replace;
 mod routing_audit;
 mod stdlib;
 mod surface;
