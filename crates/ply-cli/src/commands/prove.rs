@@ -24,7 +24,11 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
     let mut warnings = Vec::new();
     let root = project_root(&args.path);
     let mut store = match Store::open(&root) {
-        Ok(store) => store,
+        Ok(store) => store.with_upstream(if args.no_cache {
+            None
+        } else {
+            ply_store::Upstream::from_env()
+        }),
         Err(e) => {
             let diagnostic = Diagnostic::error(
                 codes::RUNTIME_ERROR,
@@ -308,6 +312,7 @@ fn describe_rule(rule: &Rule) -> String {
         Rule::Congruence => "congruence".to_string(),
         Rule::Injectivity => "injectivity".to_string(),
         Rule::Unfold { def, depth } => format!("unfold {def} to depth {depth}"),
+        Rule::Induction { binder, def } => format!("induction on {binder}, unrolling {def}"),
         Rule::ExhaustiveInterleaving { interleavings } => format!(
             "exhaustive over {interleavings} {}",
             plural(*interleavings as usize, "interleaving")

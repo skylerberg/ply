@@ -146,6 +146,14 @@ fn the_certificate_audit() {
                                 panic!("`{}`: {why}", obligation.owner);
                             });
                     }
+                    Rule::Induction { def, .. } => assert!(
+                        certificate
+                            .rules
+                            .iter()
+                            .any(|r| matches!(r, Rule::Unfold { def: d, .. } if d == def)),
+                        "`{}` claims induction over `{def}` without unrolling it",
+                        obligation.owner
+                    ),
                     Rule::GroundEvaluation
                     | Rule::LinearArithmetic
                     | Rule::Propositional

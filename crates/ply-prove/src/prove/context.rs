@@ -15,6 +15,8 @@ pub struct Context<'a> {
     claims: Claims,
     check: &'a CheckOutput,
     recursive: BTreeSet<Symbol>,
+    /// A component of one definition calling itself: the shape induction unrolls.
+    self_recursive: BTreeSet<Symbol>,
     by_type: BTreeMap<Symbol, Vec<Symbol>>,
     inhabited_types: BTreeSet<Symbol>,
     /// Nominal types whose declaration reaches a `Float`.
@@ -39,7 +41,7 @@ impl<'a> Context<'a> {
         }
         drop_incomplete(&claims, &mut sums);
 
-        let recursive = recursive_definitions(&claims.defs);
+        let (recursive, self_recursive) = recursive_definitions(&claims.defs);
         let inhabited_types = inhabited_sum_types(check, &sums);
         let float_types = float_reaching_types(check);
 
@@ -47,6 +49,7 @@ impl<'a> Context<'a> {
             claims,
             check,
             recursive,
+            self_recursive,
             by_type: sums,
             inhabited_types,
             float_types,
@@ -129,6 +132,19 @@ impl<'a> Context<'a> {
         if self.recursive.contains(name) {
             return None;
         }
+        self.reached_pure(name)
+    }
+
+    /// Calling only itself, with an empty footprint, and with a body the lowering reached: what
+    /// induction may unroll once it has shown the recursion decreases.
+    pub fn self_recursive(&self, name: &Symbol) -> Option<&Definition> {
+        if !self.self_recursive.contains(name) {
+            return None;
+        }
+        self.reached_pure(name)
+    }
+
+    fn reached_pure(&self, name: &Symbol) -> Option<&Definition> {
         if !self.check.defs.get(name)?.footprint.is_empty() {
             return None;
         }
@@ -235,8 +251,11 @@ fn field_inhabited(
     }
 }
 
-/// Definitions in a call-graph cycle; Tarjan run iteratively so deep programs cannot overflow.
-fn recursive_definitions(defs: &HashMap<Symbol, Definition>) -> BTreeSet<Symbol> {
+/// Definitions in a call-graph cycle, and among them the ones whose cycle is only themselves;
+/// Tarjan run iteratively so deep programs cannot overflow.
+fn recursive_definitions(
+    defs: &HashMap<Symbol, Definition>,
+) -> (BTreeSet<Symbol>, BTreeSet<Symbol>) {
     let mut names: Vec<Symbol> = defs.keys().cloned().collect();
     names.sort();
     let index: HashMap<&Symbol, usize> = names.iter().enumerate().map(|(i, n)| (n, i)).collect();
@@ -253,16 +272,19 @@ fn recursive_definitions(defs: &HashMap<Symbol, Definition>) -> BTreeSet<Symbol>
         .collect();
 
     let mut recursive = BTreeSet::new();
+    let mut alone = BTreeSet::new();
     for component in tarjan(&edges) {
-        let cyclic =
-            component.len() > 1 || component.first().is_some_and(|&v| edges[v].contains(&v));
-        if cyclic {
+        let self_loop = component.first().is_some_and(|&v| edges[v].contains(&v));
+        if component.len() == 1 && self_loop {
+            alone.insert(names[component[0]].clone());
+        }
+        if component.len() > 1 || self_loop {
             for v in component {
                 recursive.insert(names[v].clone());
             }
         }
     }
-    recursive
+    (recursive, alone)
 }
 
 fn tarjan(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {

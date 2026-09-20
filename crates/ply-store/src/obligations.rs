@@ -15,6 +15,7 @@ pub enum CachedRule {
     Congruence,
     Injectivity,
     Unfold { def: Symbol, depth: u32 },
+    Induction { binder: Symbol, def: Symbol },
     ExhaustiveInterleaving { interleavings: u32 },
 }
 
