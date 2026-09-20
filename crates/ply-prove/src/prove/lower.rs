@@ -553,6 +553,9 @@ impl<'a, 'p> Lowering<'a, 'p> {
             Some(scheme) => self
                 .terms
                 .mk(Node::Opaque(name.clone()), scheme_sort(scheme)),
+            None if TOTAL_BUILTINS.contains(&name.as_str()) => {
+                self.terms.opaque(name.as_str(), None)
+            }
             None => self.terms.sym(None),
         }
     }
@@ -777,8 +780,19 @@ impl<'a, 'p> Lowering<'a, 'p> {
             _ => None,
         };
 
-        let mut pure = self.head_is_pure(head);
-        if let Node::Opaque(name) = self.terms.node(head).clone() {
+        // A total builtin is a function of its arguments, so two calls over one argument are one term.
+        let total_builtin =
+            matches!(&callee, Callee::Unresolved(name) if TOTAL_BUILTINS.contains(&name.as_str()));
+        let sort = match &callee {
+            Callee::Unresolved(name) if total_builtin => {
+                builtin_sort(name.as_str(), &lowered, &self.terms)
+            }
+            _ => sort,
+        };
+        let mut pure = total_builtin || self.head_is_pure(head);
+        if let Node::Opaque(name) = self.terms.node(head).clone()
+            && !total_builtin
+        {
             if let Some(ctor) = self.ctx.ctor(&name) {
                 if ctor.arity == lowered.len() {
                     let sort = ctor_result_sort(ctor, &lowered, &self.terms);
@@ -1283,6 +1297,21 @@ fn type_parameters(ctor: &CtorInfo) -> Option<Vec<TyVar>> {
 }
 
 /// Instantiated against the scrutinee's sort when it is known.
+/// What a total builtin answers, read off its arguments' sorts where the answer depends on them.
+fn builtin_sort(name: &str, args: &[TermId], terms: &Terms) -> Option<Type> {
+    let first = args.first().and_then(|a| terms.sort(*a).cloned());
+    match name {
+        "len" | "min" | "max" | "bytes_len" | "string_len" => Some(Type::int()),
+        "int_to_string" => Some(Type::string()),
+        "push" => first,
+        "list_at" => first
+            .as_ref()
+            .and_then(super::term::list_elem)
+            .map(|elem| Type::Con(Symbol::new("Option"), vec![elem.clone()])),
+        _ => None,
+    }
+}
+
 pub(super) fn field_sorts(ctor: &CtorInfo, sort: Option<&Type>) -> Vec<Option<Type>> {
     let subst = match (sort, type_parameters(ctor)) {
         (Some(Type::Con(name, args)), Some(params))
