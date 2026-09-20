@@ -7,6 +7,7 @@ pub mod config;
 pub mod db;
 pub mod fs;
 pub mod pool;
+pub mod process;
 pub mod registry;
 pub mod sched;
 pub mod signal;

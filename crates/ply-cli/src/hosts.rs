@@ -70,10 +70,12 @@ impl Hosts {
             trace,
             reach,
             None,
+            None,
         )
     }
 
-    /// [`Hosts::open`] for a run that listens for a stop; only `ply run`, so ctrl-C ends no test.
+    /// [`Hosts::open`] for a run that listens for a stop and is a process; only `ply run`, so
+    /// ctrl-C ends no test and `process` is withheld from one.
     #[allow(clippy::too_many_arguments)]
     pub fn open_stopping(
         check: &CheckOutput,
@@ -85,6 +87,7 @@ impl Hosts {
         trace: &crate::trace::TraceOptions,
         reach: Option<&Footprint>,
         shutdown: Option<Arc<ply_host::signal::Shutdown>>,
+        process: Option<ply_host::process::ProcessHost>,
     ) -> Result<Hosts, Vec<Diagnostic>> {
         if !host {
             let registry = registry_for(check, None);
@@ -104,38 +107,35 @@ impl Hosts {
         let roots = ply_host::fs::Roots::load(roots, Span::DUMMY).map_err(|d| vec![d])?;
         // Opened only when a `db` operation can reach it, and probed now so an unreachable database
         // fails start-up rather than the first request.
-        let facilities = Arc::new(
-            match db.as_ref().filter(|_| reaches_db(check, reach)) {
-                Some(config) => {
-                    let (url, bounds) = config.pool_config();
-                    ply_host::Host::with_database(
-                        material,
-                        ply_host::db::PoolConfig {
-                            url: url.expose().to_string(),
-                            size: bounds.size,
-                            acquire: bounds.acquire,
-                            statement: bounds.statement,
-                            idle_txn: bounds.idle_txn,
-                            connect: bounds.connect,
-                            statements: bounds.statements,
-                        },
-                    )
-                    .map_err(|d| vec![d])?
-                }
-                None => ply_host::Host::with_credentials(material),
+        let mut facilities = match db.as_ref().filter(|_| reaches_db(check, reach)) {
+            Some(config) => {
+                let (url, bounds) = config.pool_config();
+                ply_host::Host::with_database(
+                    material,
+                    ply_host::db::PoolConfig {
+                        url: url.expose().to_string(),
+                        size: bounds.size,
+                        acquire: bounds.acquire,
+                        statement: bounds.statement,
+                        idle_txn: bounds.idle_txn,
+                        connect: bounds.connect,
+                        statements: bounds.statements,
+                    },
+                )
+                .map_err(|d| vec![d])?
             }
-            .configured(Arc::clone(&config.snapshot))
-            .rooted(roots)
-            .traced(trace.open()),
-        );
-        let facilities = match shutdown {
-            Some(shutdown) => Arc::new(
-                Arc::try_unwrap(facilities)
-                    .unwrap_or_else(|_| unreachable!("the only `Arc` was just built"))
-                    .stopping_on(shutdown),
-            ),
-            None => facilities,
-        };
+            None => ply_host::Host::with_credentials(material),
+        }
+        .configured(Arc::clone(&config.snapshot))
+        .rooted(roots)
+        .traced(trace.open());
+        if let Some(process) = process {
+            facilities = facilities.with_process(process);
+        }
+        if let Some(shutdown) = shutdown {
+            facilities = facilities.stopping_on(shutdown);
+        }
+        let facilities = Arc::new(facilities);
         let registry = facilities.registry();
         let binding = registry.bind(check)?;
         let listing = binding.listing().clone();
@@ -282,6 +282,11 @@ impl Hosts {
 
     pub fn binding(&self) -> Arc<HostBinding> {
         Arc::clone(&self.binding)
+    }
+
+    /// The code `process.exit` asked for, once the run is over.
+    pub fn requested_exit(&self) -> Option<i32> {
+        self.host.as_ref()?.process()?.requested_exit()
     }
 
     pub fn listing(&self) -> &HostListing {

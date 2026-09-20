@@ -369,6 +369,8 @@ pub mod codes {
     pub const FS_FILE_TOO_LARGE: &str = "E0453";
     /// A `--fs NAME=PATH` root that is missing, not a directory, or unresolvable.
     pub const FS_ROOT_INVALID: &str = "E0454";
+    /// `process.exit` was performed: the machine unwinds and `ply run` exits with the code.
+    pub const PROCESS_EXIT: &str = "E0455";
     pub const ASSERTION_FAILED: &str = "E0501";
     /// A failure the language defines: `panic`, division by zero, overflow, a resource limit.
     pub const RUNTIME_ERROR: &str = "E0502";
@@ -548,6 +550,7 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ("E0452", "path leaves its root"),
     ("E0453", "whole-file read over the bound"),
     ("E0454", "`--fs` root that is not a directory"),
+    ("E0455", "the program asked to exit with a code"),
     ("E0501", "assertion failed"),
     (
         "E0502",
@@ -836,6 +839,7 @@ mod tests {
             ("FS_PATH_ESCAPES_ROOT", codes::FS_PATH_ESCAPES_ROOT, "E0452"),
             ("FS_FILE_TOO_LARGE", codes::FS_FILE_TOO_LARGE, "E0453"),
             ("FS_ROOT_INVALID", codes::FS_ROOT_INVALID, "E0454"),
+            ("PROCESS_EXIT", codes::PROCESS_EXIT, "E0455"),
             ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
             ("TIME_BUDGET", codes::TIME_BUDGET, "E0503"),
