@@ -47,6 +47,9 @@ pub struct EffectAtom {
     pub effect: Symbol,
     pub resource: Resource,
     pub mode: Mode,
+    /// `Some` names one operation, which the mode atom of the same effect and resource covers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<Symbol>,
 }
 
 impl EffectAtom {
@@ -55,6 +58,17 @@ impl EffectAtom {
             effect: effect.into(),
             resource,
             mode,
+            op: None,
+        }
+    }
+
+    /// The mode is `Write` until the checker resolves the name against the effect's declaration.
+    pub fn operation(effect: impl Into<Symbol>, resource: Resource, op: impl Into<Symbol>) -> Self {
+        EffectAtom {
+            effect: effect.into(),
+            resource,
+            mode: Mode::Write,
+            op: Some(op.into()),
         }
     }
 
@@ -67,7 +81,10 @@ impl EffectAtom {
 
 impl fmt::Display for EffectAtom {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}{}", self.effect, self.mode.as_str(), self.resource)
+        match &self.op {
+            Some(op) => write!(f, "{}.{}{}", self.effect, op, self.resource),
+            None => write!(f, "{}.{}{}", self.effect, self.mode.as_str(), self.resource),
+        }
     }
 }
 

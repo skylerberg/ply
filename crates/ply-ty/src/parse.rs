@@ -343,14 +343,12 @@ impl<'a> Parser<'a> {
 
     fn atom(&mut self) -> Result<EffectAtom, String> {
         let name = self.name("an effect atom")?;
-        let Some((effect, mode)) = name.rsplit_once('.') else {
-            return Err(self.error(&format!("`{name}` has no `.read` or `.write`")));
+        let Some((effect, access)) = name.rsplit_once('.') else {
+            return Err(self.error(&format!("`{name}` has no `.read`, `.write` or `.op`")));
         };
-        let mode = match mode {
-            "read" => Mode::Read,
-            "write" => Mode::Write,
-            other => return Err(self.error(&format!("`{other}` is not `read` or `write`"))),
-        };
+        if effect.is_empty() || access.is_empty() {
+            return Err(self.error(&format!("`{name}` is not an effect atom")));
+        }
         let resource = if self.rest().starts_with('[') {
             self.at += 1;
             let resource = self.name("a resource")?;
@@ -359,7 +357,11 @@ impl<'a> Parser<'a> {
         } else {
             Resource::Singleton
         };
-        Ok(EffectAtom::new(effect, resource, mode))
+        Ok(match access {
+            "read" => EffectAtom::new(effect, resource, Mode::Read),
+            "write" => EffectAtom::new(effect, resource, Mode::Write),
+            op => EffectAtom::operation(effect, resource, op),
+        })
     }
 }
 
