@@ -1175,14 +1175,20 @@ fn one_bucket_recompiles(program: &dyn Fn(u128) -> String, cache: &std::path::Pa
         assert_eq!(ctx.failed, 0, "`{name}` raised");
         ply_codegen::heap::imm_value(w)
     };
+    // Emitted first, so the emitter this thread builds for it lands its own objects in this cache
+    // before the counts are taken, and the unit says how many parts a cold build compiles.
+    let unit = produced(keyed_by_hash(&program(3), ""));
+    let parts = split(&unit.text).expect("the unit splits on its marks");
+    assert_eq!(parts.buckets.len(), 2, "two names in two buckets");
+    let expected = parts.buckets.len() + 1;
     let (cold_compiled, cold_objects) = (compiled(), objects());
     let Some(first) = build(&program(3)) else {
         return;
     };
     assert_eq!(
         (compiled() - cold_compiled, objects() - cold_objects),
-        (3, 3),
-        "a cold build compiles two buckets and the runtime's object"
+        (expected, expected),
+        "a cold build compiles every bucket and the runtime's object"
     );
     let (before_compiled, before_objects) = (compiled(), objects());
     let second = build(&program(5)).expect("the compiler ran once already");
