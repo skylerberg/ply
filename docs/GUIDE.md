@@ -34,7 +34,12 @@ file.
 
 **The cache.** `.ply-cache/` at the root holds the front-end, result and
 obligation caches and the review baseline. It is safe to delete
-(`ply cache clear`); add it to `.gitignore`.
+(`ply cache clear`); add it to `.gitignore`. `PLY_CACHE_UPSTREAM=DIR` names a
+second cache shared between checkouts and machines, a directory on any storage
+they all reach: the passes and discharged obligations found there count here,
+and this run's are published there (`PLY_CACHE_UPSTREAM_READONLY=1` reads
+only). Entries are keyed by content and by the `ply` version, so nothing
+machine-specific is ever shared; `--no-cache` ignores it.
 
 ## 2. Lexical structure
 
@@ -720,8 +725,11 @@ law "a credit and a matching debit leave an account exactly as it was"
 
 `proved` covers ground evaluation, enumeration of finite domains up to 4096
 points, linear `Int` arithmetic, case splits, congruence, constructor
-injectivity, unfolding non-recursive definitions and exhaustive interleaving.
-There is no induction.
+injectivity, unfolding non-recursive definitions, exhaustive interleaving, and
+induction on an `Int` binder: a definition that calls only itself with some
+`Int` argument non-negative and smaller at every self call is unrolled, and the
+claim is proved at `n <= 0` and then at `n > 0` from itself at `n - 1`. There is
+no induction over lists.
 
 `ply prove` reports the definitions carrying no obligation, then each
 obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no
@@ -880,6 +888,7 @@ prints a source, and a changed standard library warns `W0605`.
 pub nondet effect net {
   write listen[s](port: Int) -> Int
   write listen_tls[s](port: Int, credential: String) -> Int
+  write connect[s](host: String, port: Int, timeout_ms: Int) -> Option<Int>
   write accept[s](listener: Int) -> Int
   write recv[s](conn: Int, max: Int, timeout_ms: Int) -> Option<Bytes>
   write send[s](conn: Int, payload: Bytes, timeout_ms: Int) -> Option<Int>
@@ -891,6 +900,9 @@ pub fn send_all(c: Int, payload: Bytes, timeout_ms: Int) -> Bool / {net.write[co
 
 `None` is a deadline expiring; an empty `Some` is EOF; `timeout_ms <= 0` is a
 runtime error. `send` may write fewer bytes than given; `send_all` loops.
+`connect` resolves the host and tries each address until the deadline; `None`
+is a host not reached for any reason, and the connection it answers is used
+under the label it was opened under.
 
 ### 13.2 `std.http` — HTTP/1.1
 

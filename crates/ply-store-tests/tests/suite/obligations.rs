@@ -87,8 +87,8 @@ fn an_obligation_survives_a_flush_and_a_reopen_with_its_evidence_intact() {
         store.flush().unwrap();
     }
     let store = Store::open(dir.path()).unwrap();
-    assert_eq!(store.obligation(key(1)), Some(&proof()));
-    assert_eq!(store.obligation(key(2)), Some(&sample(200)));
+    assert_eq!(store.obligation(key(1)), Some(proof()));
+    assert_eq!(store.obligation(key(2)), Some(sample(200)));
     assert_eq!(store.obligation(key(3)), None);
     assert_eq!(store.obligations_len(), 2);
 }
@@ -217,8 +217,8 @@ fn a_flush_merges_with_what_another_run_wrote() {
     first.flush().unwrap();
 
     let store = Store::open(dir.path()).unwrap();
-    assert_eq!(store.obligation(key(1)), Some(&proof()));
-    assert_eq!(store.obligation(key(2)), Some(&sample(200)));
+    assert_eq!(store.obligation(key(1)), Some(proof()));
+    assert_eq!(store.obligation(key(2)), Some(sample(200)));
 }
 
 /// A new prover rule must upgrade a tier without invalidating a test result, and vice versa.
