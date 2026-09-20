@@ -22,7 +22,6 @@ A feature earns its place by one of these. Saving keystrokes does not count.
 - Tail calls across definitions, so mutual recursion is a loop too.
 - Rows that name operations, so a signature says `net.send[conn]` rather than `net.write[conn]`
   and a `handle` over a function value is judged too.
-- Fewer rules around `?` and record update; where the shape is inferable, infer it.
 - `ply fmt`, from the printer `ply build` already has.
 - Structured fixes on diagnostics: a machine-applicable suggestion and candidates in the JSON.
 - `ply doc <name>` and `ply explain <code>`, from the tables the compiler uses, so the guide
