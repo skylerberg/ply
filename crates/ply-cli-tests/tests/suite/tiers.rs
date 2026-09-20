@@ -238,10 +238,10 @@ law "excluded middle"
 fn a_ground_law_is_proved_rather_than_exemplified() {
     let dir = project(
         r#"
-fn stock() -> List<Int> = [3, 1, 2]
+fn stock() -> String = "abc"
 
 law "the stock is three deep" {
-  len(stock()) == 3
+  string_len(stock()) == 3
 }
 "#,
     );
@@ -665,7 +665,7 @@ fn disagreement(discharge: &Discharge) -> Option<String> {
 }
 
 #[test]
-fn a_total_index_reaches_property_where_a_raising_one_is_a_gap() {
+fn a_total_index_is_proved_where_a_raising_one_is_a_gap() {
     let dir = project(
         r#"
 fn peek(xs: List<Int>, i: Int) -> Int =
@@ -687,8 +687,8 @@ law "a raising index does not"
     let run = Run::of(dir.path());
     assert_eq!(
         run.tier("a total index peeks at every index"),
-        Some(Tier::Property),
-        "an unguarded `list_at` peek must survive randomized execution: {:?}",
+        Some(Tier::Proved),
+        "an unguarded `list_at` peek is a value, so the claim is a case split over its answer: {:?}",
         run.find("a total index peeks at every index").1
     );
     assert!(

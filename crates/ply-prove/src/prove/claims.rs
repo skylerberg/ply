@@ -42,6 +42,7 @@ pub enum Pat {
     Var(usize),
     Lit(Lit),
     Ctor(Symbol, Vec<Pat>),
+    List(Vec<Pat>, Option<Box<Pat>>),
     Nested(Vec<Pat>),
 }
 
@@ -577,14 +578,16 @@ impl<'a> Dump<'a, '_> {
             return Ok(Pat::Nested(inner));
         }
         if self.eat_str("s:(") {
+            let mut rest = None;
             while !self.eat(b')') {
-                let rest = self.eat_str("..");
-                inner.push(self.pat()?);
-                if !rest {
+                if self.eat_str("..") {
+                    rest = Some(Box::new(self.pat()?));
+                } else {
+                    inner.push(self.pat()?);
                     self.expect(b',')?;
                 }
             }
-            return Ok(Pat::Nested(inner));
+            return Ok(Pat::List(inner, rest));
         }
         self.fail("a pattern")
     }

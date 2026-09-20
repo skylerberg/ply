@@ -364,10 +364,12 @@ and no method syntax.
 ### 5.5 Record update
 
 `{..base, deep: {..base.deep, a: 7}}` copies `base` with fields replaced. It
-expands to a record literal. The base must be a variable or a field path (not a
-call); its shape must be readable from this file's own `type` items and
-annotations (`E0116` otherwise, including for an unannotated `let`); and a field
-it lacks is `E0117`.
+expands to a record literal. The base is a variable, a field path, or a call of
+a `fn` declared in this file with a written return type (the call runs once).
+Its shape must be readable from this file's own `type` items and written types
+(`E0116` otherwise); a `let` without a written type takes the written type of
+its value when that is such a variable, path, call or update. A field the base
+lacks is `E0117`.
 
 ### 5.6 Lists
 
@@ -439,8 +441,8 @@ it and the function's result and everything evaluated before it is pure:
   lambda without a written return type; or where `Ok`/`Err`/`Some`/`None` are
   rebound. A lambda with a written return type exits the lambda.
 * `E0119`: in an `if` branch, `match` arm or right of `&&` not in return
-  position; after an impure argument (`g(h(x), k(x)?)`); in a nested block; or
-  on a `let` with a written type. Bind the value first.
+  position; after an impure argument (`g(h(x), k(x)?)`); or in a nested block.
+  Bind the value first.
 
 ## 6. Effects and handlers
 
@@ -617,7 +619,8 @@ only evaluator. Its passes share the evaluator's cache.
 | --- | --- |
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
-| `PLY_C_CACHE=DIR` | compiled unit cache, and the compiler's own stages (default under the temp directory) |
+| `PLY_C_CACHE=DIR` | compiled unit cache (default under the temp directory) |
+| `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on that cache, oldest entries swept first; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused |
@@ -727,8 +730,11 @@ points, linear `Int` arithmetic, case splits, congruence, constructor
 injectivity, unfolding non-recursive definitions, exhaustive interleaving, and
 induction on an `Int` binder: a definition that calls only itself with some
 `Int` argument non-negative and smaller at every self call is unrolled, and the
-claim is proved at `n <= 0` and then at `n > 0` from itself at `n - 1`. There is
-no induction over lists.
+claim is proved at `n <= 0` and then at `n > 0` from itself at `n - 1`; and
+induction on a `List` binder: a definition whose self calls take a tail its
+list patterns exposed is unrolled, and the claim is proved at `[]` and then at
+`[h, ..t]` from itself at `t`, with `len` and `push` reduced over the spine in
+view and `len` known to lie below `i64::MAX`.
 
 `ply prove` reports the definitions carrying no obligation, then each
 obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no
