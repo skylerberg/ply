@@ -41,6 +41,7 @@ pub type Limits = {
   body_timeout_ms:   Int,
   idle_timeout_ms:   Int,
   write_timeout_ms:  Int,
+  connect_timeout_ms: Int,
 }
 
 pub fn default_limits() -> Limits = {
@@ -57,6 +58,7 @@ pub fn default_limits() -> Limits = {
   body_timeout_ms:   30000,
   idle_timeout_ms:   5000,
   write_timeout_ms:  30000,
+  connect_timeout_ms: 5000,
 }
 
 // A non-positive limit is a configuration mistake, so it panics at `serve` naming the field.
@@ -73,7 +75,8 @@ pub fn check_limits(l: Limits) -> Unit = {
   bad_limit("header_timeout_ms", l.header_timeout_ms);
   bad_limit("body_timeout_ms", l.body_timeout_ms);
   bad_limit("idle_timeout_ms", l.idle_timeout_ms);
-  bad_limit("write_timeout_ms", l.write_timeout_ms)
+  bad_limit("write_timeout_ms", l.write_timeout_ms);
+  bad_limit("connect_timeout_ms", l.connect_timeout_ms)
 }
 
 fn bad_limit(field: String, value: Int) -> Unit =
@@ -98,7 +101,8 @@ pub fn read_size() -> Int = 65536
 // Every framing refusal closes the connection.
 pub type Refusal = { status: Int, reason: String }
 
-pub type Framing = NoBody | Length(Int) | Chunked
+// `UntilClose` is a response without a length field: a client reads it until the server closes.
+pub type Framing = NoBody | Length(Int) | Chunked | UntilClose
 
 pub type Head = {
   request:          Request,
@@ -687,7 +691,19 @@ pub fn body_step(state: BodyState, buf: Bytes) -> BodyStep =
     NoBody -> Complete({consumed: 0, out: b"", trailers: empty_headers()}),
     Length(_) -> length_step(state, buf),
     Chunked -> chunk_step(state, buf, 0, [], chunk_budget()),
+    UntilClose -> until_close_step(state, buf),
   }
+
+// Every byte is body; the reader turns the close into the end.
+fn until_close_step(state: BodyState, buf: Bytes) -> BodyStep = {
+  let n = bytes_len(buf);
+  if state.received + n > state.limits.max_body {
+    Rejected({status: 413,
+              reason: "the body is longer than " ++ int_to_string(state.limits.max_body) ++ " bytes"})
+  } else {
+    Await({state: {..state, received: state.received + n}, consumed: n, out: buf})
+  }
+}
 
 fn length_step(state: BodyState, buf: Bytes) -> BodyStep = {
   let take = min_int(state.remaining, bytes_len(buf));
@@ -1127,13 +1143,234 @@ reuse fn body_more(c: Int, step: { state: BodyState, consumed: Int, out: Bytes }
       None -> body_loop(c, step.state, rest, taken, slice, reads - 1, limits),
       Some(chunk) ->
         if bytes_len(chunk) == 0 {
-          BodyClosed
+          match step.state.framing {
+            UntilClose -> Body({bytes: bytes_concat_all(taken), rest: b"", trailers: empty_headers()}),
+            _ -> BodyClosed,
+          }
         } else {
           body_loop(c, step.state, bytes_concat(rest, chunk), taken, slice, reads - 1, limits)
         },
     }
   }
 }
+
+// --- Responses, as a client reads them --------------------------------------
+
+pub type ResponseHead = {
+  version:    Version,
+  status:     Int,
+  reason:     String,
+  headers:    Headers,
+  framing:    Framing,
+  consumed:   Int,
+  keep_alive: Bool,
+}
+
+pub type ResponseHeadResult =
+  | ResponseIncomplete
+  | ResponseParsed(ResponseHead)
+  | ResponseRefused(Refusal)
+
+// `method` decides the framing: an answer to `HEAD` carries no body whatever its fields say.
+pub fn parse_response_head(buf: Bytes, method: Method, limits: Limits) -> ResponseHeadResult =
+  match read_line(buf, 0, limits.max_request_line) {
+    LineIncomplete -> ResponseIncomplete,
+    LineTooLong -> ResponseRefused({status: 502, reason: "the status line is longer than "
+                                    ++ int_to_string(limits.max_request_line) ++ " bytes"}),
+    LineIllegal(e) -> ResponseRefused({status: 502, reason: e.why}),
+    LineAt(l) -> after_status_line(buf, method, limits, l),
+  }
+
+fn after_status_line(buf: Bytes, method: Method, limits: Limits,
+                     l: { start: Int, stop: Int, next: Int }) -> ResponseHeadResult =
+  match status_line(bytes_slice(buf, l.start, l.stop)) {
+    Err(r) -> ResponseRefused(r),
+    Ok(start) ->
+      match fields(buf, l.next, l.next, limits) {
+        FieldsIncomplete -> ResponseIncomplete,
+        FieldsRefused(r) -> ResponseRefused(relayed(r)),
+        FieldsDone(done) ->
+          match response_framing(method, start.status, done.headers, limits) {
+            Err(r) -> ResponseRefused(relayed(r)),
+            Ok(framing) -> ResponseParsed({
+              version:    start.version,
+              status:     start.status,
+              reason:     start.reason,
+              headers:    done.headers,
+              framing:    framing,
+              consumed:   done.next,
+              keep_alive: keep_alive_of(start.version, done.headers),
+            }),
+          },
+      },
+  }
+
+// A fault in a response is the server's, reported as a gateway would relay it: 502.
+fn relayed(r: Refusal) -> Refusal = {status: 502, reason: r.reason}
+
+type StatusLine = { version: Version, status: Int, reason: String }
+
+// `VERSION SP 3DIGIT SP REASON`; the reason may be empty and may hold spaces.
+fn status_line(line: Bytes) -> Result<StatusLine, Refusal> = {
+  let n = bytes_len(line);
+  let sp = bytes_scan_until(line, 0, b" ", n);
+  if sp >= n {
+    Err({status: 502, reason: "a status line is `VERSION SP STATUS SP REASON`"})
+  } else {
+    let version = response_version(bytes_slice(line, 0, sp))?;
+    let code = bytes_slice(line, sp + 1, min_int(sp + 4, n));
+    let after = sp + 4;
+    if bytes_len(code) != 3 || !all_digits(code) {
+      Err({status: 502, reason: "a status is three digits"})
+    } else if after < n && bytes_at(line, after) != 32 {
+      Err({status: 502, reason: "a status line is `VERSION SP STATUS SP REASON`"})
+    } else {
+      Ok({version: version,
+          status: digits_to_int(code, 0, 0),
+          reason: string_of_bytes_lossy(bytes_slice(line, min_int(after + 1, n), n))})
+    }
+  }
+}
+
+fn response_version(v: Bytes) -> Result<Version, Refusal> =
+  match version_of(v) {
+    Ok(version) -> Ok(version),
+    Err(_) -> Err({status: 502, reason: "a status line begins with `HTTP/1.1` or `HTTP/1.0`"}),
+  }
+
+// 1xx, 204, 304 and any answer to `HEAD` carry no body; without a length field the body runs
+// until the server closes.
+fn response_framing(method: Method, status: Int, h: Headers, limits: Limits)
+  -> Result<Framing, Refusal> =
+  match method {
+    Head -> Ok(NoBody),
+    _ ->
+      if bodiless(status) {
+        Ok(NoBody)
+      } else {
+        match framing_of(h, limits)? {
+          NoBody -> Ok(UntilClose),
+          framing -> Ok(framing),
+        }
+      },
+  }
+
+// --- Requests, as a client sends them ---------------------------------------
+
+// `target` is the path with its query; `authority` is the `Host` the request carries.
+pub fn request_to(method: Method, authority: String, target: String, body: Bytes) -> Request = {
+  let raw = bytes_of_string(target);
+  let split = match bytes_index_of(raw, b"?") {
+    Some(at) -> {path: bytes_slice(raw, 0, at), query: bytes_slice(raw, at + 1, bytes_len(raw))},
+    None -> {path: raw, query: b""},
+  };
+  {method:    method,
+   target:    target,
+   path:      string_of_bytes_lossy(split.path),
+   query:     string_of_bytes_lossy(split.query),
+   authority: authority,
+   version:   Http11,
+   headers:   empty_headers(),
+   trailers:  empty_headers(),
+   body:      body}
+}
+
+// One request per connection, so it says `Connection: close`. Panics on a header the program may
+// not set: `Host` comes from `authority`, and the rest as in `encode`.
+pub reuse fn encode_request(r: Request) -> Bytes = {
+  let line = bytes_of_string(method_name(r.method) ++ " " ++ request_target(r) ++ " HTTP/1.1\r\n");
+  let host = if has_header(r.headers, "host") {
+    panic("`Host` is computed from `Request.authority` and may not be set by the program")
+  } else {
+    bytes_of_string("Host: " ++ r.authority ++ "\r\n")
+  };
+  let fields = fold(map_entries(r.headers), [],
+                    |acc: List<Bytes>, e: { key: String, value: List<String> }|
+                      fold(e.value, acc, |inner: List<Bytes>, v: String|
+                        push(inner, header_bytes(e.key, v))));
+  bytes_concat_all([line, host, bytes_concat_all(fields), request_framing(r),
+                    b"Connection: close\r\n", b"\r\n", r.body])
+}
+
+fn request_target(r: Request) -> String =
+  if string_len(r.target) > 0 {
+    r.target
+  } else if string_len(r.query) > 0 {
+    r.path ++ "?" ++ r.query
+  } else if string_len(r.path) > 0 {
+    r.path
+  } else {
+    "/"
+  }
+
+// A body, or a method that usually carries one, is framed by its length; `GET` without a body is not.
+fn request_framing(r: Request) -> Bytes =
+  if bytes_len(r.body) > 0 || carries_body(r.method) {
+    bytes_of_string("Content-Length: " ++ int_to_string(bytes_len(r.body)) ++ "\r\n")
+  } else {
+    b""
+  }
+
+fn carries_body(m: Method) -> Bool =
+  match m {
+    Post -> true,
+    Put -> true,
+    Patch -> true,
+    _ -> false,
+  }
+
+// --- The client -------------------------------------------------------------
+
+pub type ClientError =
+  | Unreachable
+  | NotSent
+  | TimedOut
+  | Closed
+  | Malformed(Refusal)
+
+// One exchange on a fresh connection, closed afterwards whatever happened. A `1xx` answer is
+// returned as it is.
+pub fn request(host: String, port: Int, req: Request, limits: Limits)
+  -> Result<Response, ClientError> / {net.write[conn]} =
+  match net.connect[conn](host, port, limits.connect_timeout_ms) {
+    None -> Err(Unreachable),
+    Some(c) -> {
+      let answer = exchange(c, req, limits);
+      net.close[conn](c);
+      answer
+    },
+  }
+
+fn exchange(c: Int, req: Request, limits: Limits) -> Result<Response, ClientError>
+  / {net.write[conn]} =
+  if !send_all(c, encode_request(req), limits.write_timeout_ms) {
+    Err(NotSent)
+  } else {
+    match read_head(c, b"", limits, false) {
+      HeadTimedOut -> Err(TimedOut),
+      HeadIdle -> Err(TimedOut),
+      HeadClosed(_) -> Err(Closed),
+      HeadBytes(got) ->
+        match parse_response_head(got.buf, req.method, limits) {
+          ResponseRefused(r) -> Err(Malformed(r)),
+          ResponseIncomplete ->
+            Err(Malformed({status: 502, reason: "the head is longer than "
+                           ++ int_to_string(limits.max_request_line + limits.max_header_bytes)
+                           ++ " bytes"})),
+          ResponseParsed(head) ->
+            read_answer(c, head, bytes_slice(got.buf, head.consumed, bytes_len(got.buf)), limits),
+        },
+    }
+  }
+
+fn read_answer(c: Int, head: ResponseHead, rest: Bytes, limits: Limits)
+  -> Result<Response, ClientError> / {net.write[conn]} =
+  match read_body(c, head.framing, rest, limits) {
+    Body(b) -> Ok({status: head.status, headers: head.headers, body: b.bytes}),
+    BodyRefused(r) -> Err(Malformed(relayed(r))),
+    BodyTimedOut -> Err(TimedOut),
+    BodyClosed -> Err(Closed),
+  }
 
 // --- Serving ----------------------------------------------------------------
 
@@ -2383,4 +2620,173 @@ test "a streamed response to an HTTP/1.0 peer is delimited by the close" {
 fn limits_streaming(n: Int) -> Limits = {
   let base: Limits = default_limits();
   {..base, max_stream_chunks: n}
+}
+
+// --- Tests: the client ------------------------------------------------------
+
+fn client_limits() -> Limits = {
+  let base: Limits = default_limits();
+  {..base, header_timeout_ms: 8, body_timeout_ms: 8}
+}
+
+fn response_head_of(raw: Bytes, method: Method) -> ResponseHead =
+  match parse_response_head(raw, method, default_limits()) {
+    ResponseParsed(h) -> h,
+    ResponseIncomplete -> panic("incomplete"),
+    ResponseRefused(r) -> panic("refused: " ++ r.reason),
+  }
+
+fn response_status_of(raw: Bytes) -> Int =
+  match parse_response_head(raw, Get, default_limits()) {
+    ResponseParsed(h) -> h.status,
+    ResponseIncomplete -> 0,
+    ResponseRefused(r) -> r.status,
+  }
+
+test "a status line is split into version, status and reason" {
+  let h = response_head_of(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", Get);
+  assert_eq(h.version, Http11);
+  assert_eq(h.status, 200);
+  assert_eq(h.reason, "OK");
+  assert_eq(h.framing, Length(5));
+  assert_eq(h.consumed, 38);
+  assert_eq(h.keep_alive, true);
+  assert_eq(response_head_of(b"HTTP/1.0 404 Not Found\r\n\r\n", Get).reason, "Not Found");
+  assert_eq(response_head_of(b"HTTP/1.1 204 \r\n\r\n", Get).reason, "");
+  assert_eq(response_head_of(b"HTTP/1.1 204\r\n\r\n", Get).reason, "")
+}
+
+test "a malformed status line is a 502 to relay" {
+  assert_eq(response_status_of(b"HTTP/2.0 200 OK\r\n\r\n"), 502);
+  assert_eq(response_status_of(b"200 OK\r\n\r\n"), 502);
+  assert_eq(response_status_of(b"HTTP/1.1 20 OK\r\n\r\n"), 502);
+  assert_eq(response_status_of(b"HTTP/1.1 2000 OK\r\n\r\n"), 502);
+  assert_eq(response_status_of(b"HTTP/1.1 abc OK\r\n\r\n"), 502);
+  assert_eq(response_status_of(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n"),
+            502);
+  assert_eq(response_status_of(b"HTTP/1.1 200 OK\r\n"), 0)
+}
+
+test "a response is framed by its length, its coding, its status or the close" {
+  assert_eq(response_head_of(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", Get).framing,
+            Chunked);
+  assert_eq(response_head_of(b"HTTP/1.1 200 OK\r\n\r\n", Get).framing, UntilClose);
+  assert_eq(response_head_of(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", Get).framing,
+            Length(0));
+  assert_eq(response_head_of(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n", Get).framing,
+            NoBody);
+  assert_eq(response_head_of(b"HTTP/1.1 100 Continue\r\n\r\n", Get).framing, NoBody);
+  assert_eq(response_head_of(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", Head).framing,
+            NoBody);
+  assert_eq(response_head_of(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", Get).keep_alive,
+            false)
+}
+
+test "a request encodes with its host, its length and a close" {
+  assert_eq(encode_request(request_to(Get, "example.org", "/a?b=1", b"")),
+            b"GET /a?b=1 HTTP/1.1\r\nHost: example.org\r\nConnection: close\r\n\r\n");
+  assert_eq(encode_request(request_to(Post, "example.org:8080", "/items", b"{}")),
+            b"POST /items HTTP/1.1\r\nHost: example.org:8080\r\nContent-Length: 2\r\n"
+            ++ b"Connection: close\r\n\r\n{}");
+  assert_eq(encode_request(request_to(Put, "h", "/", b"")),
+            b"PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+  let with_header: Request = request_to(Get, "h", "", b"");
+  assert_eq(encode_request({..with_header, headers: set_header(empty_headers(), "Accept", "*/*")}),
+            b"GET / HTTP/1.1\r\nHost: h\r\naccept: */*\r\nConnection: close\r\n\r\n")
+}
+
+test "a request target splits into its path and query" {
+  let r = request_to(Get, "h", "/a/b?c=1&d=2", b"");
+  assert_eq(r.path, "/a/b");
+  assert_eq(r.query, "c=1&d=2");
+  assert_eq(request_to(Get, "h", "/plain", b"").query, "")
+}
+
+test "a request is sent, its answer read, and the connection closed" {
+  with_cell[inbox]([Some(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel"), Some(b"lo")]) { inbox -> {
+  with_cell[outbox](b"") { outbox -> {
+  with_cell[closed](0) { closed -> {
+    let answer = handle {
+      request("example.org", 80, request_to(Get, "example.org", "/a", b""), client_limits())
+    } with {
+      net.connect[conn](host, port, t) -> if host == "example.org" && port == 80 { Some(7) } else { None },
+      net.recv[conn](c, max, t) -> {
+        let queued = cell_get(inbox);
+        cell_set(inbox, rest_answers(queued));
+        next_answer(queued)
+      },
+      net.send[conn](c, payload, t) -> {
+        cell_set(outbox, bytes_concat(cell_get(outbox), payload));
+        Some(bytes_len(payload))
+      },
+      net.close[conn](c) -> cell_set(closed, cell_get(closed) + 1),
+    };
+    assert_eq(cell_get(outbox),
+              b"GET /a HTTP/1.1\r\nHost: example.org\r\nConnection: close\r\n\r\n");
+    assert_eq(answer, Ok({status: 200,
+                          headers: set_header(empty_headers(), "content-length", "5"),
+                          body: b"hello"}));
+    assert_eq(cell_get(closed), 1)
+  } }
+  } }
+  } }
+}
+
+fn fetched(answers: List<Option<Bytes>>, reached: Bool) -> Result<Response, ClientError> =
+  with_cell[inbox](answers) { inbox -> {
+    handle {
+      request("h", 80, request_to(Get, "h", "/", b""), client_limits())
+    } with {
+      net.connect[conn](host, port, t) -> if reached { Some(7) } else { None },
+      net.recv[conn](c, max, t) -> {
+        let queued = cell_get(inbox);
+        cell_set(inbox, rest_answers(queued));
+        next_answer(queued)
+      },
+      net.send[conn](c, payload, t) -> Some(bytes_len(payload)),
+      net.close[conn](c) -> (),
+    }
+  } }
+
+fn body_fetched(answers: List<Option<Bytes>>) -> Bytes =
+  match fetched(answers, true) {
+    Ok(r) -> r.body,
+    Err(_) -> panic("no answer"),
+  }
+
+test "a body without a length runs until the server closes" {
+  assert_eq(body_fetched([Some(b"HTTP/1.1 200 OK\r\n\r\nhel"), Some(b"lo")]), b"hello");
+  assert_eq(body_fetched([Some(b"HTTP/1.1 200 OK\r\n\r\n")]), b"");
+  assert_eq(body_fetched([Some(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"),
+                          Some(b"0\r\n\r\n")]),
+            b"hello");
+  assert_eq(body_fetched([Some(b"HTTP/1.1 204 No Content\r\n\r\n")]), b"")
+}
+
+test "each way an exchange can fail has its own error" {
+  assert_eq(fetched([], false), Err(Unreachable));
+  assert_eq(fetched([Some(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel")], true), Err(Closed));
+  assert_eq(fetched([Some(b"HTTP/1.1 200 OK\r\nContent-Le")], true), Err(Closed));
+  assert_eq(fetched([None, None, None, None, None, None, None, None, None], true), Err(TimedOut));
+  assert_eq(fetched([Some(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"), None, None, None,
+                     None, None, None, None, None, None], true),
+            Err(TimedOut));
+  assert_eq(fetched([Some(b"HTTP/9.9 200 OK\r\n\r\n")], true),
+            Err(Malformed({status: 502,
+                           reason: "a status line begins with `HTTP/1.1` or `HTTP/1.0`"})));
+  assert_eq(fetched([Some(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n")], true),
+            Err(Malformed({status: 502,
+                           reason: "a chunk size is 1 to 16 hexadecimal digits, optionally followed by `;`"})))
+}
+
+test "a peer that stops taking bytes is reported as not sent" {
+  let answer = handle {
+    request("h", 80, request_to(Get, "h", "/", b""), client_limits())
+  } with {
+    net.connect[conn](host, port, t) -> Some(7),
+    net.recv[conn](c, max, t) -> Some(b""),
+    net.send[conn](c, payload, t) -> None,
+    net.close[conn](c) -> (),
+  };
+  assert_eq(answer, Err(NotSent))
 }
