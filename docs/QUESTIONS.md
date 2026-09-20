@@ -25,3 +25,11 @@ definitions. An atom reached through a function value (a parameter, a field, a c
 `let`) is not judged, because a row names atoms, not operations. Making that precise means rows
 that name operations (`net.send[conn]`), a change to the row syntax, the printer, the hash and
 the frames. Assumed: worth doing as its own item, listed in `docs/DIRECTION.md`.
+
+## Record shapes stay file-local
+
+A record update now takes its shape from a call of a `fn` declared in the same file, and a
+`let` without a type takes the written type of such a call, a local or an update. Shapes are
+still never read across a module boundary: the rewrite runs before types exist, and a shape
+read from another file would change this file's hashes without this file changing. Assumed:
+that line stays where it is, and `{..other::make(), x: 1}` keeps needing a local annotation.
