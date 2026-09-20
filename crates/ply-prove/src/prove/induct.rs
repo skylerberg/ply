@@ -23,7 +23,7 @@ pub(super) fn attempt(
     limits: &Limits,
     budget: u32,
     spent: u32,
-    blockers: &[Blocker],
+    blockers: &mut Vec<Blocker>,
 ) -> Option<Proof> {
     let recursive: BTreeSet<Symbol> = blockers
         .iter()
@@ -38,10 +38,18 @@ pub(super) fn attempt(
     let mut budget = budget;
     let mut spent = spent;
     for name in &recursive {
-        let (terminates, used) = terminating(ctx, name, limits, budget)?;
+        let Some((terminates, used)) = terminating(ctx, name, limits, budget) else {
+            blockers.push(Blocker::Induction(format!(
+                "`{name}` is not a pure definition calling only itself"
+            )));
+            return None;
+        };
         spent += used;
         budget -= used;
         if !terminates {
+            blockers.push(Blocker::Induction(format!(
+                "no `Int` argument of `{name}` is non-negative and smaller at every self call"
+            )));
             return None;
         }
     }
@@ -50,7 +58,7 @@ pub(super) fn attempt(
         if !is_int_type(&binder.ty) || Some(slot) == result_slot {
             continue;
         }
-        let (proved, used) = induct_on(ctx, goal, limits, budget, &recursive, slot);
+        let (proved, used) = induct_on(ctx, goal, limits, budget, &recursive, slot, blockers);
         spent += used;
         budget -= used;
         if let Some(mut proof) = proved {
@@ -134,7 +142,12 @@ fn induct_on(
     budget: u32,
     recursive: &BTreeSet<Symbol>,
     slot: usize,
+    blockers: &mut Vec<Blocker>,
 ) -> (Option<Proof>, u32) {
+    let binder = goal.binders[slot].name.clone();
+    let declined = |blockers: &mut Vec<Blocker>, what: &str| {
+        blockers.push(Blocker::Induction(format!("on `{binder}`: {what}")));
+    };
     let mut rules = RuleLog::default();
     let mut lowering = Lowering::new(ctx, &mut rules, limits.unfold_depth);
     lowering.set_total(recursive.clone());
@@ -164,6 +177,7 @@ fn induct_on(
     lowering.set_unrolling(BTreeSet::new());
     let one = lowering.terms.int_lit(1);
     let Some(previous) = lowering.terms.sub(bound[slot], one) else {
+        declined(blockers, "no term for the step down");
         return (None, 0);
     };
     let mut prior = bound.clone();
@@ -187,6 +201,7 @@ fn induct_on(
     let requirements = lowering.requirements().to_vec();
     let equations = lowering.equations().to_vec();
     if lowering.unsupported() {
+        declined(blockers, "a Float");
         return (None, 0);
     }
     let mut terms = lowering.finish();
@@ -212,6 +227,7 @@ fn induct_on(
             &mut spent,
             &assertions,
         ) {
+            declined(blockers, "the guard can raise");
             return (None, spent);
         }
     }
@@ -268,6 +284,7 @@ fn induct_on(
         &mut spent,
         &assertions,
     ) {
+        declined(blockers, "the base case is open");
         return (None, spent);
     }
     let mut assertions = common;
@@ -283,6 +300,7 @@ fn induct_on(
         &mut spent,
         &assertions,
     ) {
+        declined(blockers, "the step is open");
         return (None, spent);
     }
 
