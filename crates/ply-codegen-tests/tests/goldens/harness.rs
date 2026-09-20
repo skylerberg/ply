@@ -355,13 +355,16 @@ pub mod census {
                 .and_then(serde_json::Value::as_f64)
                 .ok_or_else(|| format!("`{key}` in {} has no `{name}`", path().display()))
         };
-        for (name, measured, band) in [
-            ("entries", got.entries as f64, 0.0),
-            ("allocated", got.allocated as f64, 0.01),
-            ("recycled", got.recycled as f64, 0.01),
-            ("chunk_bytes", got.chunk_bytes as f64, 0.25),
+        // Bytes scale with the source, so the entry's ceiling is read per line it was taken over:
+        // the standard library growing does not move the reading, a hasher allocating more does.
+        let per_line = lines as f64 / field("source_lines")?.max(1.0);
+        for (name, measured, band, scaled) in [
+            ("entries", got.entries as f64, 0.0, false),
+            ("allocated", got.allocated as f64, 0.01, true),
+            ("recycled", got.recycled as f64, 0.01, true),
+            ("chunk_bytes", got.chunk_bytes as f64, 0.25, false),
         ] {
-            let ceiling = field(name)?;
+            let ceiling = field(name)? * if scaled { per_line } else { 1.0 };
             if measured > ceiling * (1.0 + band) {
                 return Err(format!(
                     "`{key}` in {} caps {name} at {ceiling:.0} and this tree reads {measured:.0}; lower the reading, or raise the entry if the cost is meant:\n  \"{key}\": {reading}",

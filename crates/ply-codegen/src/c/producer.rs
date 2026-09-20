@@ -792,33 +792,105 @@ pub fn print_bodies(
     Ok(modules)
 }
 
+/// `entry`'s answer, one frame, handed to `read` as its header words and payload.
+fn framed<T>(
+    entry: &str,
+    args: &[Value],
+    read: impl FnOnce(&[&str], &[u8]) -> Result<T>,
+) -> Result<T> {
+    ensure_default();
+    let dump = string_answer(entry, call(entry, args)?)?;
+    let mut frames = Cursor::new(dump.as_bytes(), "frame");
+    let (words, payload) = frames
+        .unit()
+        .map_err(|e| anyhow!("`{entry}`'s answer: {e}"))?;
+    read(&words, payload)
+}
+
+/// The `message` a `refused` frame's payload carries.
+fn refusal(entry: &str, payload: &[u8]) -> Result<String> {
+    let mut fields = Cursor::new(payload, "field");
+    let (key, body) = fields
+        .unit()
+        .map_err(|e| anyhow!("`{entry}`'s refusal: {e}"))?;
+    if key != ["message"] {
+        bail!("`{entry}`'s refusal holds a `{}` field", key.join(" "));
+    }
+    Ok(String::from_utf8_lossy(body).into_owned())
+}
+
 const FMT: &str = "front.fmt_dump";
 
 /// `src` formatted. The outer error is the emitter failing; the inner one is the text the
 /// formatter refused, with the diagnostic that stopped it.
 pub fn fmt_source(src: &str) -> Result<Result<String, String>> {
-    ensure_default();
-    let dump = string_answer(FMT, call(FMT, &[Value::bytes(src.as_bytes())])?)?;
-    let mut frames = Cursor::new(dump.as_bytes(), "frame");
-    let (words, payload) = frames
-        .unit()
-        .map_err(|e| anyhow!("`{FMT}`'s answer: {e}"))?;
-    match words[..] {
-        ["formatted", _] => Ok(Ok(std::str::from_utf8(payload)
-            .context("the formatted text")?
-            .to_string())),
-        ["refused", _] => {
+    framed(
+        FMT,
+        &[Value::bytes(src.as_bytes())],
+        |words, payload| match words {
+            ["formatted", _] => Ok(Ok(std::str::from_utf8(payload)
+                .context("the formatted text")?
+                .to_string())),
+            ["refused", _] => Ok(Err(refusal(FMT, payload)?)),
+            _ => bail!("`{FMT}` framed a `{}`", words.join(" ")),
+        },
+    )
+}
+
+const ITEM_RANGE: &str = "front.item_range_dump";
+
+/// The byte range of the `fn`, `type` or `effect` named `name` in `src`: its comment lines,
+/// `pub` and `reuse` through the end of its last line. The inner error is the front end's refusal.
+pub fn item_range(src: &str, name: &str) -> Result<Result<(usize, usize), String>> {
+    let args = [Value::bytes(src.as_bytes()), Value::bytes(name.as_bytes())];
+    framed(ITEM_RANGE, &args, |words, payload| match words {
+        ["range", _] => {
             let mut fields = Cursor::new(payload, "field");
-            let (key, body) = fields
-                .unit()
-                .map_err(|e| anyhow!("`{FMT}`'s refusal: {e}"))?;
-            if key != ["message"] {
-                bail!("`{FMT}`'s refusal holds a `{}` field", key.join(" "));
+            let (mut start, mut end) = (None, None);
+            while !fields.done() {
+                let (key, body) = fields
+                    .unit()
+                    .map_err(|e| anyhow!("`{ITEM_RANGE}`'s range: {e}"))?;
+                let n: usize = std::str::from_utf8(body)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| {
+                        anyhow!("`{ITEM_RANGE}`'s `{}` is not a number", key.join(" "))
+                    })?;
+                match key[..] {
+                    ["start"] => start = Some(n),
+                    ["end"] => end = Some(n),
+                    _ => bail!("`{ITEM_RANGE}`'s range holds a `{}` field", key.join(" ")),
+                }
             }
-            Ok(Err(String::from_utf8_lossy(body).into_owned()))
+            match (start, end) {
+                (Some(start), Some(end)) => Ok(Ok((start, end))),
+                _ => bail!("`{ITEM_RANGE}`'s range lacks a bound"),
+            }
         }
-        _ => bail!("`{FMT}` framed a `{}`", words.join(" ")),
-    }
+        ["refused", _] => Ok(Err(refusal(ITEM_RANGE, payload)?)),
+        _ => bail!("`{ITEM_RANGE}` framed a `{}`", words.join(" ")),
+    })
+}
+
+const REPLACE: &str = "front.replace_dump";
+
+/// `src` with the item named `name` replaced by `item` formatted, every other byte kept. The
+/// inner error is the front end's refusal: an absent name, a replacement of another kind or
+/// name, or text that does not parse.
+pub fn replace_item(src: &str, name: &str, item: &str) -> Result<Result<String, String>> {
+    let args = [
+        Value::bytes(src.as_bytes()),
+        Value::bytes(name.as_bytes()),
+        Value::bytes(item.as_bytes()),
+    ];
+    framed(REPLACE, &args, |words, payload| match words {
+        ["replaced", _] => Ok(Ok(std::str::from_utf8(payload)
+            .context("the replaced text")?
+            .to_string())),
+        ["refused", _] => Ok(Err(refusal(REPLACE, payload)?)),
+        _ => bail!("`{REPLACE}` framed a `{}`", words.join(" ")),
+    })
 }
 
 /// [`FRONT`], pulling in the shipped modules the program imports itself.
