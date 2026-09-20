@@ -302,7 +302,7 @@ fn hermetic_is_the_default_and_reaches_nothing() {
     let hosts = Hosts::open(
         &program,
         false,
-        &[],
+        &ply_cli::cli::TlsOptions::default(),
         &[],
         None,
         Configuration::default(),
@@ -346,7 +346,7 @@ fn a_host_backed_test_leaves_the_trivially_parallel_count() {
     let hermetic = Hosts::open(
         &program,
         false,
-        &[],
+        &ply_cli::cli::TlsOptions::default(),
         &[],
         None,
         Configuration::default(),
@@ -551,6 +551,7 @@ fn a_program_that_can_listen_over_tls_discloses_the_stack_by_name() {
             "",
             "transport",
             "tls  rustls 0.23.43 · provider ring · TLS 1.3, TLS 1.2 · alpn http/1.1",
+            "roots  webpki-roots 1.0.9 · 0 trusted by `--trust`",
             "",
             "credentials",
             "none — `net.listen_tls` is E0429 until `--tls NAME=CERT,KEY` names one",
@@ -570,6 +571,9 @@ fn a_credential_is_listed_by_name_and_fingerprint() {
         provider: tls::PROVIDER,
         versions: &tls::VERSIONS,
         alpn: &tls::ALPN,
+        roots: tls::ROOTS,
+        roots_version: tls::ROOTS_VERSION,
+        trusted: 0,
         credentials: vec![CredentialView {
             name: "api".to_string(),
             fingerprint: "sha256:9f2c1a4e8b03c7d5e6f70819a2b3c4d5".to_string(),
@@ -600,6 +604,9 @@ fn the_digest_survives_a_rotation_and_moves_when_a_credential_does() {
                 provider: tls::PROVIDER,
                 versions: &tls::VERSIONS,
                 alpn: &tls::ALPN,
+                roots: tls::ROOTS,
+                roots_version: tls::ROOTS_VERSION,
+                trusted: 0,
                 credentials,
             }),
         )
