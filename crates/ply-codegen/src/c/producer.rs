@@ -343,13 +343,11 @@ struct Memo {
     answers: Bodies,
     /// Every root the emitter was entered for: one it did not answer is not asked for again.
     asked: HashSet<String>,
-    /// Whether an entry emitted every root, so a root missing from `answers` was never emitted.
-    whole: bool,
 }
 
 impl Memo {
     fn knows(&self, name: &str) -> bool {
-        self.whole || self.asked.contains(name)
+        self.asked.contains(name)
     }
 }
 
@@ -367,13 +365,10 @@ pub struct PlyProducer {
 /// Entered as `(names, srcs, ctors, builtins, wanted)`: every module at once, so they resolve
 /// together, emitting the roots `wanted` names.
 const ENTRY: &str = "emit.emit_roots";
-/// The entry of an emitter from before `emit_roots`, which emits every root: the committed bundle
-/// is one emitter behind its sources until CI refreshes it.
-const ENTRY_ALL: &str = "emit.emit_unit_all";
 
 impl PlyProducer {
     pub fn new(native: Native) -> Result<PlyProducer> {
-        if native.entry(ENTRY).is_none() && native.entry(ENTRY_ALL).is_none() {
+        if native.entry(ENTRY).is_none() {
             bail!("the unit has no `{ENTRY}`, so it is not the Ply emitter");
         }
         Ok(PlyProducer {
@@ -416,8 +411,7 @@ impl PlyProducer {
         let mut memos = self.memos.borrow_mut();
         let memo = memos.entry(program).or_default();
         match entered {
-            Ok((answers, whole)) => {
-                memo.whole |= whole;
+            Ok(answers) => {
                 memo.answers.extend(answers);
                 let answered = missing
                     .iter()
@@ -447,9 +441,8 @@ impl PlyProducer {
             .cloned()
     }
 
-    /// One entry over the whole program: `wanted`'s roots, or every root and `true` from an
-    /// emitter that emits nothing less.
-    fn enter(&self, loaded: &Source, wanted: &[String]) -> Result<(Bodies, bool)> {
+    /// One entry over the whole program, emitting `wanted`'s roots.
+    fn enter(&self, loaded: &Source, wanted: &[String]) -> Result<Bodies> {
         let mut names = Vec::new();
         let mut srcs = Vec::new();
         for module in loaded.module_names() {
@@ -473,21 +466,20 @@ impl PlyProducer {
                 .map(|b| Value::bytes(b.name().as_bytes()))
                 .collect(),
         );
-        let mut args = vec![Value::list(names), Value::list(srcs), ctors, builtins];
-        let whole = self.native.entry(ENTRY).is_none();
-        let entry = if whole {
-            ENTRY_ALL
-        } else {
-            let roots = wanted.iter().map(|n| Value::bytes(n.as_bytes()));
-            args.push(Value::list(roots.collect()));
-            ENTRY
-        };
+        let roots = wanted.iter().map(|n| Value::bytes(n.as_bytes())).collect();
+        let args = vec![
+            Value::list(names),
+            Value::list(srcs),
+            ctors,
+            builtins,
+            Value::list(roots),
+        ];
         tally(|census| census.wanted.push(wanted.to_vec()));
-        let value = self.call(entry, &args)?;
+        let value = self.call(ENTRY, &args)?;
         let Value::Str(dump) = &value else {
             bail!("the emitter answered something that is not a string");
         };
-        Ok((parse(dump).context("reading the emitter's answer")?, whole))
+        parse(dump).context("reading the emitter's answer")
     }
 
     /// Enters any function of the unit (`module.name`) with `args`, in a fresh context and with
