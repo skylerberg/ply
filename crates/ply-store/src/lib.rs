@@ -14,6 +14,7 @@ mod idx;
 pub mod obligations;
 pub mod reviews;
 pub mod schema;
+pub mod upstream;
 
 use anyhow::Context;
 use ply_span::{Diagnostic, Symbol};
@@ -33,6 +34,7 @@ pub use obligations::{
 };
 pub use reviews::ReviewRecord;
 pub use schema::fingerprint as schema_fingerprint;
+pub use upstream::Upstream;
 
 /// Bumping this discards every cached result; a file from another runtime is never merged.
 pub const RUNTIME_VERSION: &str = "0.14.0";
@@ -306,6 +308,9 @@ pub struct Store {
     claims: answer::Answer,
     warnings: Vec<Diagnostic>,
     stdlib: Stdlib,
+    upstream: Option<Upstream>,
+    /// Passes the upstream already holds, so a flush publishes only what is new to it.
+    shared_passes: std::collections::BTreeSet<DefHash>,
 }
 
 #[derive(Default)]
@@ -655,6 +660,8 @@ impl Store {
             answer,
             claims,
             warnings: frontend_warnings,
+            upstream: None,
+            shared_passes: std::collections::BTreeSet::new(),
             stdlib: Stdlib {
                 path: stdlib_path,
                 ..Stdlib::default()
@@ -683,6 +690,27 @@ impl Store {
         Ok(store)
     }
 
+    /// Reads the upstream's passes in, so this store answers for them; what it learns is written
+    /// locally at the next flush, and what it records is published there.
+    pub fn with_upstream(mut self, upstream: Option<Upstream>) -> Store {
+        if let Some(upstream) = upstream {
+            let passes = upstream.passes();
+            for hash in &passes {
+                if !self.entries.contains_key(hash) {
+                    self.entries.insert(*hash, Outcome::Pass);
+                    self.dirty = true;
+                }
+            }
+            self.shared_passes = passes;
+            self.upstream = Some(upstream);
+        }
+        self
+    }
+
+    pub fn upstream(&self) -> Option<&Upstream> {
+        self.upstream.as_ref()
+    }
+
     pub fn get(&self, hash: DefHash) -> Option<Outcome> {
         self.entries.get(&hash).cloned()
     }
@@ -705,8 +733,12 @@ impl Store {
         self.passes.all().count()
     }
 
-    pub fn obligation(&self, key: DefHash) -> Option<&CachedObligation> {
-        self.obligations.get(&key)
+    /// The local entry, or else the upstream's.
+    pub fn obligation(&self, key: DefHash) -> Option<CachedObligation> {
+        if let Some(entry) = self.obligations.get(&key) {
+            return Some(entry.clone());
+        }
+        self.upstream.as_ref()?.obligation(key)
     }
 
     /// Only a `Held` discharge may be written, and only under its tier's key.
@@ -766,8 +798,15 @@ impl Store {
         self.write_passes()?;
         self.write_results()?;
         let dir = self.dir.clone();
+        let fresh_obligations: Vec<(DefHash, CachedObligation)> = self
+            .obligations
+            .added
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
         self.obligations.write(&dir, disk::save_obligations)?;
         self.reviews.write(&dir, disk::save_reviews)?;
+        self.publish(&fresh_obligations);
 
         if self.frontend.is_dirty() {
             self.frontend
@@ -781,6 +820,48 @@ impl Store {
         self.answer.flush(&self.dir)?;
         self.claims.flush(&self.dir)?;
         Ok(())
+    }
+
+    /// After the local write, so an unreachable upstream never costs a run its own record.
+    fn publish(&mut self, obligations: &[(DefHash, CachedObligation)]) {
+        let Some(upstream) = self.upstream.clone() else {
+            return;
+        };
+        let passes: Vec<DefHash> = self
+            .entries
+            .iter()
+            .filter(|(hash, outcome)| {
+                matches!(outcome, Outcome::Pass) && !self.shared_passes.contains(*hash)
+            })
+            .map(|(hash, _)| *hash)
+            .collect();
+        let mut failed = 0usize;
+        for hash in passes {
+            match upstream.publish_pass(hash) {
+                Ok(()) => {
+                    self.shared_passes.insert(hash);
+                }
+                Err(_) => failed += 1,
+            }
+        }
+        for (hash, entry) in obligations {
+            if upstream.publish_obligation(*hash, entry).is_err() {
+                failed += 1;
+            }
+        }
+        if failed > 0 {
+            self.warnings.push(
+                Diagnostic::warning(
+                    codes::CACHE_UNREADABLE,
+                    format!(
+                        "{failed} {} could not be published to the upstream cache `{}`",
+                        if failed == 1 { "entry" } else { "entries" },
+                        upstream.root().display()
+                    ),
+                )
+                .note("this run is unaffected; the upstream is read and written again next time"),
+            );
+        }
     }
 
     fn write_results(&mut self) -> anyhow::Result<()> {
