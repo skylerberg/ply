@@ -19,7 +19,6 @@ A feature earns its place by one of these. Saving keystrokes does not count.
 
 ## Work
 
-- Tail calls across definitions, so mutual recursion is a loop too.
 - Rows that name operations, so a signature says `net.send[conn]` rather than `net.write[conn]`
   and a `handle` over a function value is judged too.
 - The compiler's own loop: stage-1 emission cached by source digest and incremental per

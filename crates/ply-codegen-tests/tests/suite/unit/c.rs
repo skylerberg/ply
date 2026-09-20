@@ -1215,3 +1215,107 @@ fn one_bucket_recompiles(program: &dyn Fn(u128) -> String, cache: &std::path::Pa
         "the edit did not reach the image"
     );
 }
+
+/// The members of a recursive group share one C function, so a tail call between them is a jump:
+/// the fuel is far below the calls made, and a call that nested would spend it first.
+#[test]
+fn a_tail_call_between_members_of_a_recursive_group_is_a_jump() {
+    let source = r#"
+fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }
+fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }
+pub fn parity(n: Int) -> Bool = even(n)
+"#;
+    let Some((loaded, native)) = tests_support::unit(source) else {
+        return;
+    };
+    let answer = |name: &str, n: i64| -> ply_codegen::heap::Word {
+        let entry: ply_codegen::rt::Entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was not compiled"));
+        let mut ctx = native.context();
+        ctx.fuel = 10_000;
+        let args = [ply_codegen::heap::imm(n)];
+        let w = unsafe { entry(&mut ctx, args.as_ptr()) };
+        assert_eq!(ctx.failed, 0, "`{name}({n})` raised");
+        w
+    };
+    assert_eq!(answer("m.even", 10_000_000), ply_codegen::heap::bool(true));
+    assert_eq!(answer("m.even", 10_000_001), ply_codegen::heap::bool(false));
+    // Entered from outside the group, a member answers through its own symbol.
+    assert_eq!(answer("m.odd", 10_000_001), ply_codegen::heap::bool(true));
+    assert_eq!(answer("m.parity", 7), ply_codegen::heap::bool(false));
+    let _ = loaded;
+}
+
+/// A `handle` lands failures on its own label, so a cycle holding one is emitted definition by definition.
+#[test]
+fn a_recursive_group_holding_a_handle_is_emitted_per_definition() {
+    let source = r#"
+fn a(n: Int) -> Int = if n == 0 { 0 } else if n == 1 { handle { b(0) } with { clock.now() -> 7, } } else { b(n - 1) }
+fn b(n: Int) -> Int = if n == 0 { clock.now() } else { a(n - 1) }
+"#;
+    let Some(loaded) = tests_support::keyed(source) else {
+        return;
+    };
+    let names = loaded.functions();
+    let produced = numbering_support::produce(loaded, &names);
+    let code = numbering_support::code(&produced.text);
+    assert!(
+        !code.contains("ply__group_"),
+        "a member holding a `handle` was grouped:\n{code}"
+    );
+    for symbol in ["ply_m_a", "ply_m_b"] {
+        let _ = numbering_support::body(code, symbol);
+    }
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (native, refused) = {
+        let _config = CONFIG.read().unwrap_or_else(|e| e.into_inner());
+        ply_codegen::c::build(loaded, &refs).expect("builds")
+    };
+    assert!(refused.is_empty(), "{refused:?}");
+    let entry: ply_codegen::rt::Entry = native.entry("m.a").expect("`a` was not compiled");
+    let mut ctx = native.context();
+    ctx.fuel = 10_000;
+    let args = [ply_codegen::heap::imm(5)];
+    let w = unsafe { entry(&mut ctx, args.as_ptr()) };
+    assert_eq!(ctx.failed, 0, "`a` raised");
+    assert_eq!(ply_codegen::heap::imm_value(w), 7);
+}
+
+/// A group's body serves every member and is placed once; the second build reads it from the
+/// cache under each member's key.
+#[test]
+fn a_unit_holding_a_group_is_the_same_bytes_however_its_definitions_are_offered() {
+    let source = r#"
+fn ping(n: Int, acc: Int) -> Int = if n == 0 { acc } else { pong(n - 1, acc + 1) }
+fn pong(n: Int, acc: Int) -> Int = if n == 0 { acc } else { ping(n - 1, acc + 2) }
+pub fn volley(n: Int) -> Int = ping(n, 0)
+pub fn steady() -> Int = 7
+"#;
+    let Some(loaded) = tests_support::keyed(source) else {
+        return;
+    };
+    let forward = loaded.functions();
+    let mut backward = forward.clone();
+    backward.reverse();
+    let first = numbering_support::produce(loaded, &forward);
+    let second = numbering_support::produce(loaded, &backward);
+    assert_eq!(
+        first.text, second.text,
+        "the order the definitions were offered in reached the unit"
+    );
+    let code = numbering_support::code(&first.text);
+    assert_eq!(
+        code.matches("static Word ply__group_").count(),
+        1,
+        "the group's body is placed once:\n{code}"
+    );
+    assert_eq!(
+        code.matches("goto ply_loop;").count(),
+        2,
+        "each member's tail call into the group jumps:\n{code}"
+    );
+    for symbol in ["ply_m_ping", "ply_m_pong", "ply_m_volley"] {
+        let _ = numbering_support::body(code, symbol);
+    }
+}

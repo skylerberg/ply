@@ -15,7 +15,7 @@ fn dir() -> PathBuf {
 pub fn key(def_hash: &str, ctors: &str) -> String {
     let mut h = blake3::Hasher::new();
     for part in [
-        "ply-c-emit-5",
+        "ply-c-emit-6",
         &exe_stamp(),
         &super::exports::helpers_digest(),
         ctors,
@@ -93,7 +93,7 @@ pub fn read(key: &str) -> Option<(String, Tables)> {
     decode(&std::fs::read_to_string(dir().join(format!("{key}.body"))).ok()?)
 }
 
-/// Keep this body; a failed write is ignored.
+/// Keep this body; a failed write is ignored. A group's body is kept under each member's key.
 pub fn write(key: &str, text: &str, tables: &Tables) {
     let d = dir();
     if std::fs::create_dir_all(&d).is_err() {
@@ -120,6 +120,10 @@ pub fn encode(text: &str, t: &Tables) -> String {
     out.push_str(&format!("handles {}\n", t.handles.len()));
     for e in &t.handles {
         out.push_str(&format!("{e}\n"));
+    }
+    out.push_str(&format!("members {}\n", t.members.len()));
+    for m in &t.members {
+        out.push_str(&format!("{m}\n"));
     }
     out.push_str("text\n");
     out.push_str(text);
@@ -267,7 +271,15 @@ pub fn decode(s: &str) -> Option<(String, Tables)> {
     for _ in 0..n {
         t.handles.push(line(s, &mut at)?.to_string());
     }
-    if line(s, &mut at)? != "text" {
+    // The committed emitter stages the sources of one that writes members; its frames have none.
+    let mut next = line(s, &mut at)?;
+    if let Some(n) = count(next, "members") {
+        for _ in 0..n {
+            t.members.push(line(s, &mut at)?.to_string());
+        }
+        next = line(s, &mut at)?;
+    }
+    if next != "text" {
         return None;
     }
     Some((s.get(at..)?.to_string(), t))

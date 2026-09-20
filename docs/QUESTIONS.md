@@ -11,13 +11,6 @@ test 60 s, `ply prove` each evaluation 5 s, `ply run` none, all settable with `-
 past it the entry fails with `E0503`. Say if the defaults should differ, or if you would
 rather bound loops by a step count.
 
-## Tail calls across definitions
-
-Only a call of the enclosing function loops. A tail call of another function still nests.
-Making those loop needs either the C compiler's sibling-call optimisation (not available under
-`tcc` or `-O0`) or compiling a module's mutually recursive group as one C function. Assumed:
-worth doing, as a later item, by the second route.
-
 ## Handler completeness stops at function values
 
 A `handle` is now checked against the operations its body performs, following calls of named

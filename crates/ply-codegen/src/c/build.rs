@@ -110,10 +110,11 @@ fn emit_all(
     // Dropping a body can refuse its callers, so repeat until a round refuses nothing.
     let emitted = loop {
         // The cache answers first; the emitter is entered once for everything it missed.
-        let looked: Vec<Option<Emission>> = taken
+        let mut looked: Vec<Option<Emission>> = taken
             .iter()
-            .map(|name| cached(loaded, &taken, name, ctors_digest, fragment))
+            .map(|name| cached(loaded, name, ctors_digest, fragment))
             .collect();
+        retire_split_groups(&taken, &mut looked);
         let missed: Vec<String> = taken
             .iter()
             .zip(&looked)
@@ -130,10 +131,19 @@ fn emit_all(
         for (name, looked) in taken.iter().zip(looked) {
             let emission = match looked {
                 Some(emission) => emission,
-                None => emit_one(loaded, &taken, name, ctors_digest, fragment),
+                None => emit_one(loaded, name, ctors_digest, fragment),
             };
             match emission {
-                Ok((text, tables)) => emitted.push((name.clone(), text, tables)),
+                Ok((text, tables)) => {
+                    match tables.calls.iter().find(|c| !taken.contains(c)).cloned() {
+                        Some(missing) => round.push(refused(name, not_in_unit(&missing))),
+                        // A group's one body is placed once, where its first member is taken.
+                        None if tables.members.first().is_none_or(|first| first == name) => {
+                            emitted.push((name.clone(), text, tables))
+                        }
+                        None => {}
+                    }
+                }
                 Err(r) => round.push(r),
             }
         }
@@ -165,7 +175,7 @@ fn emit_all(
         emitted
             .into_iter()
             .map(|(name, text, tables)| {
-                let text = resolve(&text, &tables, root_id(&name), &positions);
+                let text = resolve(&text, &tables, &name, &positions);
                 (name, text)
             })
             .collect()
@@ -519,43 +529,50 @@ fn keys_of(
     )
 }
 
-/// What the cache holds for `name` this round: its refusal, or its body only if every callee is
-/// still `taken`, or it would not link; `None` when the emitter must be asked.
-fn cached(
-    loaded: &Source,
-    taken: &[String],
-    name: &str,
-    ctors_digest: &str,
-    fragment: &str,
-) -> Option<Emission> {
+/// What the cache holds for `name`: its refusal or its body; `None` when the emitter must be
+/// asked. Whether the body's callees are still taken is the round's question, not the cache's.
+fn cached(loaded: &Source, name: &str, ctors_digest: &str, fragment: &str) -> Option<Emission> {
     let (key, refusal) = keys_of(loaded, name, ctors_digest, fragment);
     if let Some(k) = &refusal
         && let Some(reason) = super::cache::read_refusal(k)
     {
         return Some(Err(refused(name, reason)));
     }
-    let (text, tables) = super::cache::read(key.as_deref()?)?;
-    Some(match tables.calls.iter().find(|c| !taken.contains(c)) {
-        Some(missing) => Err(refused(name, not_in_unit(missing))),
-        None => Ok((text, tables)),
-    })
+    Some(Ok(super::cache::read(key.as_deref()?)?))
 }
 
-/// The emitter's C for one body, kept in the cache, or its refusal. `taken` is what a body may
-/// call this round.
-fn emit_one(
-    loaded: &'static Source,
-    taken: &[String],
-    name: &str,
-    ctors_digest: &str,
-    fragment: &str,
-) -> Emission {
+/// A group's body serves every member, so one read from the cache stands only when every member
+/// is taken and each one's cache holds that same group; otherwise the whole group is asked again,
+/// and the emitter, seeing what is wanted now, groups it afresh or emits per definition.
+fn retire_split_groups(taken: &[String], looked: &mut [Option<Emission>]) {
+    let at: HashMap<&str, usize> = taken
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i))
+        .collect();
+    let split: Vec<usize> = (0..looked.len())
+        .filter(|&i| {
+            let Some(Ok((_, tables))) = &looked[i] else {
+                return false;
+            };
+            !tables.members.is_empty()
+                && !tables.members.iter().all(|m| {
+                    at.get(m.as_str()).is_some_and(
+                        |&j| matches!(&looked[j], Some(Ok((_, t))) if t.members == tables.members),
+                    )
+                })
+        })
+        .collect();
+    for i in split {
+        looked[i] = None;
+    }
+}
+
+/// The emitter's C for one body, kept in the cache, or its refusal.
+fn emit_one(loaded: &'static Source, name: &str, ctors_digest: &str, fragment: &str) -> Emission {
     let (key, refusal) = keys_of(loaded, name, ctors_digest, fragment);
     match super::producer::with_current(|p| p.body(loaded, name)).flatten() {
         Some(super::producer::Answer::Body(text, tables)) => {
-            if let Some(missing) = tables.calls.iter().find(|c| !taken.contains(c)) {
-                return Err(refused(name, not_in_unit(missing)));
-            }
             if let Some(k) = &key {
                 super::cache::write(k, &text, &tables);
             }
@@ -575,11 +592,12 @@ fn emit_one(
 }
 
 /// Rewrite a body's `@@kN@@` placeholders from its own table positions to the unit's, which
-/// holds everything the body names; `@@r@@` is the body's own root.
+/// holds everything the body names; `@@r@@` is the body's own root, `@@rN@@` a group's `N`th
+/// member.
 fn resolve(
     text: &str,
     tables: &super::tables::Tables,
-    root: u64,
+    name: &str,
     positions: &Positions<'_>,
 ) -> String {
     let named = "the unit's tables hold everything its bodies name";
@@ -619,7 +637,8 @@ fn resolve(
         let (kind, digits) = body[..end].split_at(1);
         let i = || -> usize { digits.parse().expect("an emitted placeholder is numbered") };
         let resolved: u64 = match kind {
-            "r" => root,
+            "r" if digits.is_empty() => root_id(name),
+            "r" => root_id(&tables.members[i()]),
             "c" => consts[i()] as u64,
             "b" => builtins[i()] as u64,
             "f" => fields[i()] as u64,
