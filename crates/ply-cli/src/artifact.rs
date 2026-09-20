@@ -940,6 +940,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         &args.trace,
         declared.as_ref(),
         shutdown.clone(),
+        args.host.then(|| crate::commands::run::process_host(args)),
     ) {
         Ok(hosts) => hosts,
         Err(diagnostics) => {
@@ -1002,6 +1003,28 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         {
             eprintln!("{IND}{}", style.dim(&line));
         }
+    }
+
+    // The program chose its code and returned no value, so none is printed.
+    if let Some(code) = hosts.requested_exit() {
+        if args.json {
+            emit_json(&serde_json::json!({
+                "command": "run",
+                "ok": code == EXIT_OK,
+                "exit_code": code,
+                "artifact": args.path.display().to_string(),
+                "digest": artifact.digest_short(),
+                "entry": artifact.entry_name(),
+                "definitions": artifact.bodies.len(),
+                "binding": hosts.label(),
+                "hosts": hosts.summary_json(),
+                "value": serde_json::Value::Null,
+                "configuration": hosts.configuration().to_json(),
+                "shutdown": teardown_json,
+                "diagnostics": diagnostics_json(&warnings, &empty),
+            }));
+        }
+        return code;
     }
 
     match answer {

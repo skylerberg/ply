@@ -27,6 +27,7 @@ mod map_law;
 mod modules_hash_audit;
 mod mutate;
 mod numerics;
+mod process_cli;
 mod prove;
 mod prover_soundness_audit;
 mod refcount_counters;
