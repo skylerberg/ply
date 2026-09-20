@@ -11,6 +11,7 @@ mod derivation_audit;
 mod derivation_determinism_audit;
 mod desk_operations;
 mod determinism_audit;
+mod doc;
 mod effect_set_selection;
 mod effect_sets;
 mod explain;
