@@ -605,14 +605,20 @@ fn flat_len(p: Pr, e: Expr) -> Int = match flat_expr(p, e) { Some(f) -> bytes_le
 // --- Expressions, broken across lines --------------------------------------
 
 // `indent` is where this node's continuation lines go; `after` is what follows it on its last line.
+// A node that starts mid-line with comments before it moves to a line of its own, one level in,
+// which is where a second pass finds it again.
 fn expr(p: Pr, st: St, e: Expr, indent: Int, after: Int) -> St = {
   let sp = expr_span(e);
-  let s0 = lead(p, st, sp.start, indent);
-  let s1 = match try_flat(p, s0, flat_expr(p, e), sp.end, after) {
-    Some(f) -> emit(s0, f),
-    None -> broken(p, s0, e, indent, after),
-  };
-  absorb(p, s1, sp.end)
+  if st.col > indent && comment_before(p, st, sp.start) {
+    expr(p, nl(st, indent + 2, false), e, indent + 2, after)
+  } else {
+    let s0 = lead(p, st, sp.start, indent);
+    let s1 = match try_flat(p, s0, flat_expr(p, e), sp.end, after) {
+      Some(f) -> emit(s0, f),
+      None -> broken(p, s0, e, indent, after),
+    };
+    absorb(p, s1, sp.end)
+  }
 }
 
 fn operand(p: Pr, st: St, e: Expr, parens: Bool, indent: Int, after: Int) -> St =
@@ -687,8 +693,7 @@ fn stmt(p: Pr, st: St, x: Stmt, indent: Int) -> St =
       let s1 = open_line(p, st, v.span.start, indent, true);
       let ty = match v.ty { Some(t) -> bytes_concat(b": ", type_text(p, t)), None -> b"" };
       let s2 = emit(s1, bytes_concat_all([b"let ", pattern_text(p, v.pat), ty, b" = "]));
-      let s3 = absorb(p, s2, expr_span(v.value).start);
-      let s4 = emit(expr(p, s3, v.value, indent, 1), b";");
+      let s4 = emit(expr(p, s2, v.value, indent, 1), b";");
       trail(p, set_prev(s4, v.span.end), v.span.end)
     },
     SExpr(e) -> {
@@ -821,8 +826,7 @@ fn match_expr(p: Pr, st: St, scrut: Expr, arms: List<MatchArm>, sp: Span, indent
 fn arm(p: Pr, st: St, a: MatchArm, indent: Int) -> St = {
   let s1 = emit(open_line(p, st, a.span.start, indent, false), pattern_text(p, a.pat));
   let s2 = match a.guard { Some(g) -> expr(p, emit(s1, b" if "), g, indent + 2, 3), None -> s1 };
-  let s3 = absorb(p, emit(s2, b" ->"), expr_span(a.body).start);
-  let s4 = emit(arm_body(p, s3, a.body, indent), b",");
+  let s4 = emit(arm_body(p, emit(s2, b" ->"), a.body, indent), b",");
   trail(p, set_prev(s4, a.span.end), a.span.end)
 }
 
@@ -846,14 +850,14 @@ fn handle_expr(p: Pr, st: St, body: Expr, clauses: List<HandleClause>, ret: Opti
   let s3 = emit(s2, b" with {");
   let s4 = fold(clauses, s3, |s: St, c: HandleClause| {
     let o = emit(open_line(p, s, c.span.start, indent + 2, false), bytes_concat(clause_head(c), b" ->"));
-    let bd = emit(arm_body(p, absorb(p, o, expr_span(c.body).start), c.body, indent + 2), b",");
+    let bd = emit(arm_body(p, o, c.body, indent + 2), b",");
     trail(p, set_prev(bd, c.span.end), c.span.end)
   });
   let s5 = match ret {
     Some(r) -> {
       let o = emit(open_line(p, s4, r.span.start, indent + 2, false),
                    bytes_concat_all([b"return ", r.binder.name, b" ->"]));
-      let bd = emit(arm_body(p, absorb(p, o, expr_span(r.body).start), r.body, indent + 2), b",");
+      let bd = emit(arm_body(p, o, r.body, indent + 2), b",");
       trail(p, set_prev(bd, r.span.end), r.span.end)
     },
     None -> s4,
@@ -939,12 +943,16 @@ fn item(p: Pr, st: St, it: Item) -> St = {
 // A body after `= `: on the line when it fits, hugging when it is a block, else on the next.
 fn def_body(p: Pr, st: St, e: Expr, indent: Int) -> St = {
   let sp = expr_span(e);
-  match try_flat(p, st, flat_expr(p, e), sp.end, 0) {
-    Some(f) -> emit(st, f),
-    None -> match e {
-      EBlock(_) -> block(p, st, e, indent),
-      _ -> expr(p, nl(st, indent + 2, false), e, indent + 2, 0),
-    },
+  if comment_before(p, st, sp.start) {
+    expr(p, nl(st, indent + 2, false), e, indent + 2, 0)
+  } else {
+    match try_flat(p, st, flat_expr(p, e), sp.end, 0) {
+      Some(f) -> emit(st, f),
+      None -> match e {
+        EBlock(_) -> block(p, st, e, indent),
+        _ -> expr(p, nl(st, indent + 2, false), e, indent + 2, 0),
+      },
+    }
   }
 }
 
@@ -1229,6 +1237,20 @@ test "a file that does not parse is refused with the first diagnostic, and never
     Ok(_) -> assert(false),
     Err(e) -> assert(bytes_starts_with(e, b"1:")),
   }
+}
+
+// Absorbing such a comment into the line's end put it after the body's opening brace, where the
+// next pass read it as a leading comment of the first arm.
+test "a comment between `=` or `->` and a block-like body keeps a line of its own" {
+  let src = b"fn f(x: Int) -> Int = {\n  let y =\n    // why\n    match x { 1 -> 2, _ -> 3 };\n"
+    ++ b"  match y {\n    2 ->\n      // because\n      if y > 1 { 1 } else { 0 },\n    _ -> 0,\n  }\n}\n";
+  assert_eq(formatted(src),
+            b"fn f(x: Int) -> Int = {\n  let y =\n    // why\n    match x { 1 -> 2, _ -> 3 };\n"
+              ++ b"  match y {\n    2 ->\n      // because\n      if y > 1 { 1 } else { 0 },\n    _ -> 0,\n  }\n}\n");
+  assert(stable(src));
+  let header = b"fn g() -> Int // c\n  = { let z = 1; z }\n";
+  assert_eq(formatted(header), b"fn g() -> Int =\n  // c\n  {\n    let z = 1;\n    z\n  }\n");
+  assert(stable(header))
 }
 
 test "specification clauses go on their own lines before the body" {
