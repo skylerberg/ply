@@ -335,7 +335,7 @@ fn once(root: &Path, backend: Option<&str>) -> Result<(Timings, Shape)> {
                 .map_err(|message| anyhow::anyhow!("`--backend {flag}`: {message}"))?,
         ),
     };
-    let engine = ply_cli::commands::common::engine_of(spec.as_ref());
+    let engine = ply_test::Engine::Evaluator;
 
     let started = Instant::now();
     let mut store = Store::open(root).context("opening the result cache")?;
@@ -378,7 +378,7 @@ fn once(root: &Path, backend: Option<&str>) -> Result<(Timings, Shape)> {
             let executor = ply_test::InterpExecutor::new(&port)
                 .with_search(ply_test::Search::of(&selection))
                 .with_hosts(ply_test::Hosting::hermetic())
-                .with_backend(unit, crate::honest());
+                .with_backend(unit, crate::tier_spec());
             ply_test::run_with(&selection, &check, &hashes, &mut store, &executor)
         }
     };
