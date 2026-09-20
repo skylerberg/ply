@@ -96,7 +96,7 @@ fn json_report(
     let hosts = Hosts::open(
         &loaded.check,
         args.host,
-        &[],
+        &ply_cli::cli::TlsOptions::default(),
         &[],
         None,
         ply_cli::config::Configuration::default(),
@@ -135,6 +135,9 @@ fn args_for(filter: Option<&str>) -> TestArgs {
         jobs: None,
         bisect: When::Auto,
         bisect_budget: 64,
+        coverage: false,
+        mutate: None,
+        mutate_budget: 64,
         trace: When::Auto,
         backend: None,
         host: false,
@@ -1177,7 +1180,7 @@ fn a_hermetic_run_reports_exactly_what_it_did_before() {
     let hosts = Hosts::open(
         &loaded.check,
         false,
-        &[],
+        &ply_cli::cli::TlsOptions::default(),
         &[],
         None,
         ply_cli::config::Configuration::default(),
@@ -1247,7 +1250,7 @@ fn a_cached_pass_over_the_host_fails_the_run_that_wrote_it() {
     let hermetic = Hosts::open(
         &loaded.check,
         false,
-        &[],
+        &ply_cli::cli::TlsOptions::default(),
         &[],
         None,
         ply_cli::config::Configuration::default(),

@@ -593,13 +593,25 @@ this. `--json` prints one object with each failure's diagnostic, values,
 footprint, suspects, culprit and replay command. `--watch` re-runs on every
 `.ply` change, keeping caches in memory.
 
-### 8.5 Compiled backend
+### 8.5 Coverage and mutants
+
+`--coverage` reports, from the hash closure alone, which tests reach each
+definition and which definitions no test reaches. `--mutate [DEF]` runs after a
+green run: each definition (or `DEF`, a program-wide or unique simple name) is
+changed one operator or literal at a time (`+`/`-`, `<`/`<=`, `>`/`>=`,
+`==`/`!=`, `&&`/`||`, `true`/`false`, `!` dropped, an integer raised by one),
+the program is checked again, and the tests that reach the definition run
+against the mutant on a scratch store that never touches the cache. A mutant
+every one of them passes is a survivor, reported with its place and the tests
+that let it through, and fails the run. A mutant that does not check is
+skipped; `--mutate-budget N` (default 64) caps how many are judged.
+
+### 8.6 Compiled backend
 
 `--backend c` compiles the program to C and runs it there: compiled code is the
-only evaluator. Backend results are cached separately.
+only evaluator. Its passes share the evaluator's cache.
 `--profile development` (default; fastest compiler) or `release`
-(`cc -O2`) requires `--backend`. `--backend [c:]wrong:<mutation>` is wrong on
-purpose and never cached.
+(`cc -O2`) requires `--backend`.
 
 | variable | effect |
 | --- | --- |
@@ -876,6 +888,7 @@ pub nondet effect net {
   write listen[s](port: Int) -> Int
   write listen_tls[s](port: Int, credential: String) -> Int
   write connect[s](host: String, port: Int, timeout_ms: Int) -> Option<Int>
+  write connect_tls[s](host: String, port: Int, timeout_ms: Int) -> Option<Int>
   write accept[s](listener: Int) -> Int
   write recv[s](conn: Int, max: Int, timeout_ms: Int) -> Option<Bytes>
   write send[s](conn: Int, payload: Bytes, timeout_ms: Int) -> Option<Int>
@@ -889,7 +902,10 @@ pub fn send_all(c: Int, payload: Bytes, timeout_ms: Int) -> Bool / {net.write[co
 runtime error. `send` may write fewer bytes than given; `send_all` loops.
 `connect` resolves the host and tries each address until the deadline; `None`
 is a host not reached for any reason, and the connection it answers is used
-under the label it was opened under.
+under the label it was opened under. `connect_tls` is the same over TLS: the
+server is verified as `host` against the built-in roots and any `--trust`
+certificate on the first `send` or `recv`, and a failed handshake reads as EOF
+and writes `0`.
 
 ### 13.2 `std.http` — HTTP/1.1
 
@@ -1029,6 +1045,7 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | flag | meaning |
 | --- | --- |
 | `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")`; `E0430` if it does not load, `E0429` if unnamed |
+| `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
 | `--db URL` | database (else `PLY_DB_URL`; password from `PLY_DB_PASSWORD`); `E0431` if absent when used |
 | `--db-pool N` | pool size |
@@ -1090,7 +1107,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | command | flags |
 | --- | --- |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases; with `--types`, effect sets and provenance), `--no-incremental` |
-| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--trace auto\|always\|never`, `--backend`, `--profile`, `--std`, host, simulation |
+| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--trace auto\|always\|never`, `--backend`, `--profile`, `--std`, host, simulation |
 | `ply run [path]` | `--seed` (one interleaving always), `--timeout` (default no bound), `--backend`, `--profile`, host, trace, drain; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`, `--backend`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, `--backend`, prove, simulation |

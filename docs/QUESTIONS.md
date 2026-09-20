@@ -25,3 +25,12 @@ definitions. An atom reached through a function value (a parameter, a field, a c
 `let`) is not judged, because a row names atoms, not operations. Making that precise means rows
 that name operations (`net.send[conn]`), a change to the row syntax, the printer, the hash and
 the frames. Assumed: worth doing as its own item, listed in `docs/DIRECTION.md`.
+
+## Libraries against more than one resource label
+
+`std.http`'s client runs under `[conn]` because a definition cannot be generic over a label:
+`send_all` is written `/ {net.write[conn]}` and a socket is bound to the label it is first used
+under. The direction item wants `fn send_all<[l]>(c: Int, ...) / {net.write[l]}`, a label
+variable instantiated at each call and printed, hashed and scheduled like a named label. It
+interacts with rows that name operations, so it is planned after that item. Say if you would
+rather have labels passed as values, or the standard library duplicated per label.

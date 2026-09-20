@@ -47,8 +47,8 @@ pub fn execute_holding(args: &TestArgs, style: Style, warm: &mut crate::warm::Wa
                 return EXIT_COMPILE_ERROR;
             }
         };
-    let no_cache = cache_bypassed(args);
-    let engine = super::common::engine_of(backend.as_ref());
+    let no_cache = args.no_cache;
+    let engine = ply_test::Engine::Evaluator;
     let mut cache = match Cache::open(&project_root(&args.path), no_cache) {
         Ok(cache) => cache,
         Err(diagnostic) => {
@@ -106,7 +106,7 @@ fn iterate(
     warm: &mut crate::warm::Warm,
     mut warnings: Vec<Diagnostic>,
 ) -> i32 {
-    let no_cache = cache_bypassed(args);
+    let no_cache = args.no_cache;
     warnings.append(&mut cache.warnings);
     let opened = cache.store.take_warnings();
     let migration = crate::migrate::notice(&cache.store, &opened);
@@ -207,7 +207,7 @@ fn iterate(
     let mut hosts = match Hosts::open(
         &loaded.check,
         args.host,
-        &args.tls.tls,
+        &args.tls,
         &args.fs.fs,
         db,
         configuration,
@@ -267,8 +267,30 @@ fn iterate(
     let backend_view = BackendView::of(backend.as_ref(), provider, &report, engine);
     let ok = report.is_success() && view.escapes.is_empty() && backend_view.escapes.is_empty();
 
+    // Only over a green program: a survivor of a red one says nothing.
+    let mutants = match (&args.mutate, ok, &backend) {
+        (Some(query), true, Some(spec)) => match super::mutate::targets(&loaded, query) {
+            Ok(targets) => Some(super::mutate::run(
+                &loaded,
+                &hashes,
+                &targets,
+                args.mutate_budget,
+                &search,
+                engine,
+                spec,
+                &hosts,
+                &runtime,
+            )),
+            Err(diagnostic) => {
+                return report_bind_error("test", &[diagnostic], &loaded.sources, args.json, style);
+            }
+        },
+        _ => None,
+    };
+    let ok = ok && mutants.as_ref().is_none_or(|m| m.survived() == 0);
+
     if args.json {
-        emit_json(&report_json(
+        let mut out = report_json(
             &loaded,
             &hashes,
             &plan,
@@ -279,7 +301,14 @@ fn iterate(
             &view,
             &backend_view,
             ok,
-        ));
+        );
+        if args.coverage {
+            out["coverage"] = super::mutate::coverage_json(&loaded, &hashes);
+        }
+        if let Some(mutants) = &mutants {
+            out["mutants"] = super::mutate::to_json(mutants, &loaded);
+        }
+        emit_json(&out);
     } else {
         print_human(
             &loaded,
@@ -293,6 +322,12 @@ fn iterate(
             &backend_view,
             style,
         );
+        if args.coverage {
+            print_coverage(&loaded, &hashes, style);
+        }
+        if let Some(mutants) = &mutants {
+            print_mutants(mutants, &loaded, style);
+        }
     }
     // Only now: an iteration that returned early leaves no state behind.
     warm.keep(loaded);
@@ -300,7 +335,7 @@ fn iterate(
 }
 
 pub struct BackendView {
-    spec: Option<String>,
+    installed: bool,
     /// Which backend answered, as `--backend` names it.
     name: &'static str,
     /// Definitions the backend had a body for.
@@ -324,7 +359,7 @@ impl BackendView {
     ) -> BackendView {
         let Some(spec) = spec else {
             return BackendView {
-                spec: None,
+                installed: false,
                 name: "",
                 fragment: 0,
                 compiled: None,
@@ -370,7 +405,7 @@ impl BackendView {
             );
         }
         BackendView {
-            spec: Some(spec.describe()),
+            installed: true,
             name: provider.map_or(spec.kind.as_str(), ply_eval::Provider::name),
             fragment: provider.map_or(0, ply_eval::Provider::len),
             compiled: provider.and_then(ply_eval::Provider::compilation),
@@ -379,10 +414,6 @@ impl BackendView {
             declines,
             escapes,
         }
-    }
-
-    fn installed(&self) -> bool {
-        self.spec.is_some()
     }
 }
 
@@ -410,11 +441,9 @@ pub fn backend_escapes(report: &RunReport, selected_under: &ply_test::Engine) ->
             ),
         )
         .note("a `Pass` is a claim about the engine that earned it, so the two must name the same one")
-        .note(
-            "the command names the engine before it builds a provider, because selection decides              whether building one is worth anything; the run names it from the provider it built",
-        )
+        .note("the command names the engine before it builds a provider, because selection decides whether building one is worth anything")
         .note("run `ply cache clear`: this run skipped what one engine proved and recorded it as another's")
-        .note("this is Ply's fault — `common::engine_of` and `Executor::engine` disagree")
+        .note("this is Ply's fault — the command and `Executor::engine` disagree")
     ]
 }
 
@@ -505,18 +534,58 @@ fn cache_escapes(report: &RunReport, check: &CheckOutput, hosts: &Hosts) -> Vec<
         .collect()
 }
 
-/// Only a deliberately corrupt backend bypasses the store: its green run must be evidence.
-fn cache_bypassed(args: &TestArgs) -> bool {
-    args.no_cache || backend_is_corrupt(args)
+fn print_coverage(loaded: &Loaded, hashes: &HashOutput, style: Style) {
+    let coverage = super::mutate::coverage_json(loaded, hashes);
+    let unreached: Vec<&str> = coverage["unreached"]
+        .as_array()
+        .map(|xs| xs.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let total = coverage["definitions"].as_array().map_or(0, Vec::len);
+    println!(
+        "{IND}{} {} of {} definitions reached by a test",
+        style.bold("coverage"),
+        total - unreached.len(),
+        total
+    );
+    for name in unreached {
+        println!(
+            "{IND}{IND}{}",
+            style.dim(&format!("{name}: no test reaches it"))
+        );
+    }
 }
 
-fn backend_is_corrupt(args: &TestArgs) -> bool {
-    args.backend
-        .as_deref()
-        .and_then(|flag| ply_eval::backend::parse(flag).ok())
-        .is_some_and(|spec| {
-            spec.mutation != ply_eval::backend::Mutation::None || spec.target.is_some()
-        })
+fn print_mutants(report: &super::mutate::Report, loaded: &Loaded, style: Style) {
+    let line = format!(
+        "{} killed, {} survived, {} skipped{}",
+        report.killed(),
+        report.survived(),
+        report.skipped() + report.unresolved(),
+        if report.budget_spent {
+            ", budget spent"
+        } else {
+            ""
+        }
+    );
+    println!("{IND}{} {}", style.bold("mutants"), style.bold(&line));
+    for name in &report.unreached {
+        println!(
+            "{IND}{IND}{}",
+            style.dim(&format!("{name}: no test reaches it"))
+        );
+    }
+    for j in &report.judged {
+        if matches!(j.verdict, super::mutate::Verdict::Survived) {
+            let place = location(&loaded.sources, j.mutant.span).unwrap_or_default();
+            println!(
+                "{IND}{IND}{} survives `{}` -> `{}` at {}",
+                style.red(j.mutant.definition.as_str()),
+                j.mutant.from,
+                j.mutant.to,
+                style.dim(&place)
+            );
+        }
+    }
 }
 
 /// `--bisect never` still goes through the diagnosis, so the artifact has one shape.
@@ -664,7 +733,7 @@ impl Cache {
         }
     }
 
-    fn scratch() -> Result<Cache, Diagnostic> {
+    pub(crate) fn scratch() -> Result<Cache, Diagnostic> {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -781,14 +850,13 @@ fn print_human(
     if let Some(line) = report.simulation.line() {
         println!("{IND}{}", style.bold(&line));
     }
-    if let Some(corruption) = &backend.spec {
-        let offers = backend.offers;
+    if backend.installed {
         println!(
             "{IND}{} {} · {} of {} offers entered · {} declined · {} in the fragment",
             style.bold("backend"),
             style.bold(backend.name),
             backend.entries,
-            offers.offered,
+            backend.offers.offered,
             backend.declines,
             backend.fragment,
         );
@@ -804,28 +872,11 @@ fn print_human(
                 ))
             );
         }
-        if corruption != "nothing" {
-            println!(
-                "{IND}{}",
-                style.dim(&format!(
-                    "wrong on purpose: {corruption} · {} {} changed · {} {} of the target",
-                    offers.fired,
-                    plural(offers.fired as usize, "answer"),
-                    offers.offered_target,
-                    plural(offers.offered_target as usize, "offer"),
-                ))
-            );
-        }
     }
-    if cache_bypassed(args) {
-        let why = if args.no_cache {
-            "--no-cache"
-        } else {
-            "--backend"
-        };
+    if args.no_cache {
         println!(
             "{IND}{}",
-            style.dim(&format!("{why}: results were neither read nor recorded"))
+            style.dim("--no-cache: results were neither read nor recorded")
         );
     }
     if plan.filtered_out > 0 {
@@ -1448,7 +1499,7 @@ pub fn report_json(
             "file": m.path.display().to_string(),
         })).collect::<Vec<_>>(),
         "filter": args.filter,
-        "no_cache": cache_bypassed(args),
+        "no_cache": args.no_cache,
         "binding": view.hosts.label(),
         "hosts": view.hosts.summary_json(),
         "workers": workers,
@@ -1474,14 +1525,11 @@ pub fn report_json(
             "exhausted": report.simulation.exhausted,
             "failed": report.simulation.failed,
         },
-        "backend": backend.installed().then(|| json!({
+        "backend": backend.installed.then(|| json!({
             "spec": args.backend,
             "name": backend.name,
-            "corruption": backend.spec,
             "fragment": backend.fragment,
             "offered": backend.offers.offered,
-            "offered_target": backend.offers.offered_target,
-            "fired": backend.offers.fired,
             "analysis_nanos": backend.compiled.map(|c| c.analysis_nanos),
             "codegen_nanos": backend.compiled.map(|c| c.codegen_nanos),
             "units": backend.compiled.map(|c| c.units),
@@ -1598,7 +1646,7 @@ fn status_str(status: Status) -> &'static str {
 }
 
 /// Line and column rather than byte offsets, for editors.
-fn location_json(sources: &SourceMap, span: Span) -> Value {
+pub(crate) fn location_json(sources: &SourceMap, span: Span) -> Value {
     let Some(file) = sources.get(span.source) else {
         return Value::Null;
     };

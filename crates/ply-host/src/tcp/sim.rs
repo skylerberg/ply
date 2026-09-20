@@ -79,6 +79,7 @@ impl Net for SimNet {
             Op::Listen => "ply_host::tcp::sim::listen",
             Op::ListenTls => "ply_host::tls::sim::listen",
             Op::Connect => "ply_host::tcp::sim::connect",
+            Op::ConnectTls => "ply_host::tls::sim::connect",
             Op::Accept => "ply_host::tcp::sim::accept",
             Op::Recv => "ply_host::tcp::sim::recv",
             Op::Send => "ply_host::tcp::sim::send",
@@ -124,6 +125,18 @@ impl Net for SimNet {
         let handle = self.handles.open(Some(at));
         state.conns.insert(handle, chunks);
         Ok(HostAnswer::Value(some(Value::Int(handle))))
+    }
+
+    /// The next scripted connection, as `connect`: TLS changes none of the bytes read.
+    fn connect_tls(
+        &self,
+        at: &Resource,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic> {
+        self.connect(at, host, port, timeout, span)
     }
 
     fn accept(&self, at: &Resource, listener: i64, span: Span) -> Result<HostAnswer, Diagnostic> {

@@ -101,7 +101,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     let mut hosts = match Hosts::open_stopping(
         &loaded.check,
         args.host,
-        &args.tls.tls,
+        &args.tls,
         &args.fs.fs,
         db,
         configuration,

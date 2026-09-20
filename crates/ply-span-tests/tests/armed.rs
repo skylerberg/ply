@@ -1631,13 +1631,10 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
     (
         "crates/ply-test/src/lib.rs",
         "`InterpExecutor::machine`, installing what `InterpExecutor::with_backend` \
-         was handed. It is the route `ply test` has, and it arms the cache rule on it \
-         twice: `run_with` records under `Executor::engine`, so a pass goes into the \
-         installed backend's namespace and never the evaluator's, and `cache_bypassed` \
-         reads the spec so a backend that is wrong on purpose gets no store in either \
-         direction. crates/ply-cli-tests/tests/suite/cli.rs holds both — \
-         `one_engines_pass_is_never_another_engines` and \
-         `a_corrupt_backend_neither_reads_nor_writes_the_cache` — each seen to fail.",
+         was handed. It is the route `ply test` has, and it arms the cache rule on it: \
+         `run_with` records under `Executor::engine`, so a pass goes into the engine's \
+         own namespace. `the_default_tier_and_backend_c_are_one_engine` in \
+         crates/ply-cli-tests/tests/suite/cli.rs was seen to fail.",
     ),
     (
         "crates/ply-cli/src/commands/run.rs",
@@ -1656,12 +1653,10 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
     (
         "crates/ply-cli/src/engine.rs",
         "`Engine::machine`, attaching what the command resolved: the default tier, or \
-         what `--backend` names. `Engine::of_backend` keys an \
-         honest spec as `Evaluator`, so a pass the tier writes is the default run's own \
-         namespace and a spec that is wrong on purpose keeps `c/wrong:..`. \
-         `the_default_tier_and_backend_c_are_one_engine` and \
-         `a_corrupt_backend_neither_reads_nor_writes_the_cache` in \
-         crates/ply-cli-tests/tests/suite/cli.rs, each seen to fail.",
+         what `--backend` names. A compiled backend answers as the evaluator does, so it \
+         keys as `Evaluator` and a pass the tier writes is the default run's own. \
+         `the_default_tier_and_backend_c_are_one_engine` in \
+         crates/ply-cli-tests/tests/suite/cli.rs, seen to fail.",
     ),
     (
         "crates/ply-corpus/src/lib.rs",
@@ -1711,10 +1706,8 @@ fn a_shipping_command_that_installs_a_backend_must_also_bypass_the_cache() {
         "{unlisted:?} installs a compiled backend and is not listed in BACKEND_INSTALLERS.\n\n\
              A run with a backend attached is a second execution strategy, and a cached `Pass` \
              is a claim about the engine that earned it. Every route that can install one owes \
-             both halves of the cache rule: the run must WRITE under that engine's namespace \
-             (`Executor::engine`, which `run_with` passes to `record_under`), and a backend that \
-             is wrong on purpose must get no store at all (a clause `cache_bypassed` can \
-             see).\n\
+             the cache rule: the run must WRITE under that engine's namespace \
+             (`Executor::engine`, which `run_with` passes to `record_under`).\n\
              Add the route here with the reason it is safe, and a test that has been seen to \
              fail. Do NOT loosen this gate to make the entry disappear."
     );
@@ -1725,43 +1718,13 @@ fn a_shipping_command_that_installs_a_backend_must_also_bypass_the_cache() {
          row — an excuse that outlives its fact is what this file exists to prevent."
     );
 
-    let cli = sources
-        .iter()
-        .find(|s| s.rel == "crates/ply-cli/src/commands/test.rs")
-        .expect("ply test is production source");
-    let bypassed = between(&cli.text, b"fn cache_bypassed(", b"\n}");
-    assert!(
-        contains(&bypassed, b"backend"),
-        "`cache_bypassed` cannot see the backend, so a backend that is wrong on purpose would \
-         read and write the result cache: the cache rule.\ncache_bypassed reads: {}",
-        String::from_utf8_lossy(&bypassed)
-    );
-
     let runner = sources
         .iter()
         .find(|s| s.rel == "crates/ply-test/src/lib.rs")
         .expect("the runner is production source");
     assert!(
-        contains(&runner.text, b"Engine::of_backend(provider.name()"),
-        "the runner no longer builds its engine from the installed provider, so a run that \
-         entered native code would record where the evaluator reads. That is the half of the \
-         rule that survives a backend arriving by a route no flag names."
-    );
-    assert!(
         contains(&runner.text, b"record_under(") && contains(&runner.text, b"&engine,"),
         "`run_with` no longer passes an engine to `record_under`, so every engine's passes go \
          into one namespace again."
     );
-}
-
-/// The text between the first `open` and the next `close` after it.
-fn between(text: &[u8], open: &[u8], close: &[u8]) -> Vec<u8> {
-    let Some(&from) = find_all(text, open).first() else {
-        return Vec::new();
-    };
-    let rest = &text[from..];
-    match find_all(rest, close).first() {
-        Some(&to) => rest[..to].to_vec(),
-        None => rest.to_vec(),
-    }
 }
