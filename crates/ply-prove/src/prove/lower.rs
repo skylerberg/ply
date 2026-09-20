@@ -1098,7 +1098,29 @@ impl<'a, 'p> Lowering<'a, 'p> {
             if let Some(guard) = &arm.guard {
                 self.lower(guard);
             }
+            // What a list arm's body owes is owed only where the arm runs: at `[]`, or off it.
+            let taken = match &test {
+                ArmTest::List {
+                    fixed: 0,
+                    rest: false,
+                } => {
+                    let nil = self.terms.nil(scrutinee_sort.clone());
+                    Some(self.terms.eq(scrutinee, nil))
+                }
+                ArmTest::List { .. } => {
+                    let nil = self.terms.nil(scrutinee_sort.clone());
+                    let at_nil = self.terms.eq(scrutinee, nil);
+                    Some(self.terms.not(at_nil))
+                }
+                _ => None,
+            };
+            if let Some(cond) = taken {
+                self.path.push(cond);
+            }
             let body = self.lower(&arm.body);
+            if taken.is_some() {
+                self.path.pop();
+            }
             if result_sort.is_none() {
                 result_sort = self.terms.sort(body).cloned();
             }
