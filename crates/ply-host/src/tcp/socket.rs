@@ -6,6 +6,7 @@ use crate::tls::{self, Credentials, Handshakes};
 use ply_eval::{HostAnswer, HostRuntime, Pending, Value};
 use ply_span::{Diagnostic, Span};
 use ply_ty::Resource;
+use rustls::pki_types::ServerName;
 use rustls::server::ServerConfig;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -167,6 +168,7 @@ impl Net for TcpHost {
             Op::Listen => "ply_host::tcp::listen",
             Op::ListenTls => tls::HANDLER,
             Op::Connect => "ply_host::tcp::connect",
+            Op::ConnectTls => tls::CONNECT_HANDLER,
             Op::Accept => "ply_host::tcp::accept",
             Op::Recv => "ply_host::tcp::recv",
             Op::Send => "ply_host::tcp::send",
@@ -210,18 +212,35 @@ impl Net for TcpHost {
         let host = host.to_string();
         let at = at.clone();
         self.waiting(span, "connect", Op::Connect.what(), move || {
-            use std::net::ToSocketAddrs;
-            let Ok(addrs) = (host.as_str(), port).to_socket_addrs() else {
+            Done::MaybeInt(
+                reach(&host, port, timeout)
+                    .map(|stream| sockets.insert(Some(&at), Sock::Stream(Arc::new(stream)))),
+            )
+        })
+    }
+
+    fn connect_tls(
+        &self,
+        at: &Resource,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic> {
+        let sockets = Arc::clone(&self.sockets);
+        let handshakes = Arc::clone(&self.handshakes);
+        let config = self.credentials.client();
+        let host = host.to_string();
+        let at = at.clone();
+        self.waiting(span, "connect_tls", Op::ConnectTls.what(), move || {
+            // A host that is not a DNS name or an IP address is one no server can be verified as.
+            let Ok(name) = ServerName::try_from(host.clone()) else {
                 return Done::MaybeInt(None);
             };
-            for addr in addrs {
-                if let Ok(stream) = TcpStream::connect_timeout(&addr, timeout) {
-                    return Done::MaybeInt(Some(
-                        sockets.insert(Some(&at), Sock::Stream(Arc::new(stream))),
-                    ));
-                }
-            }
-            Done::MaybeInt(None)
+            Done::MaybeInt(reach(&host, port, timeout).map(|stream| {
+                let session = tls::Session::connect(config, name, Arc::new(stream), handshakes);
+                sockets.insert(Some(&at), Sock::Tls(Arc::new(session)))
+            }))
         })
     }
 
@@ -474,4 +493,14 @@ fn retry_accept(
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Resolution and the connect on the caller's thread; each address the name resolves to gets the
+/// deadline in turn.
+fn reach(host: &str, port: u16, timeout: Duration) -> Option<TcpStream> {
+    use std::net::ToSocketAddrs;
+    let addrs = (host, port).to_socket_addrs().ok()?;
+    addrs
+        .into_iter()
+        .find_map(|addr| TcpStream::connect_timeout(&addr, timeout).ok())
 }

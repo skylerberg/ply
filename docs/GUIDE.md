@@ -873,6 +873,7 @@ pub nondet effect net {
   write listen[s](port: Int) -> Int
   write listen_tls[s](port: Int, credential: String) -> Int
   write connect[s](host: String, port: Int, timeout_ms: Int) -> Option<Int>
+  write connect_tls[s](host: String, port: Int, timeout_ms: Int) -> Option<Int>
   write accept[s](listener: Int) -> Int
   write recv[s](conn: Int, max: Int, timeout_ms: Int) -> Option<Bytes>
   write send[s](conn: Int, payload: Bytes, timeout_ms: Int) -> Option<Int>
@@ -886,7 +887,10 @@ pub fn send_all(c: Int, payload: Bytes, timeout_ms: Int) -> Bool / {net.write[co
 runtime error. `send` may write fewer bytes than given; `send_all` loops.
 `connect` resolves the host and tries each address until the deadline; `None`
 is a host not reached for any reason, and the connection it answers is used
-under the label it was opened under.
+under the label it was opened under. `connect_tls` is the same over TLS: the
+server is verified as `host` against the built-in roots and any `--trust`
+certificate on the first `send` or `recv`, and a failed handshake reads as EOF
+and writes `0`.
 
 ### 13.2 `std.http` — HTTP/1.1
 
@@ -1026,6 +1030,7 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | flag | meaning |
 | --- | --- |
 | `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")`; `E0430` if it does not load, `E0429` if unnamed |
+| `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
 | `--db URL` | database (else `PLY_DB_URL`; password from `PLY_DB_PASSWORD`); `E0431` if absent when used |
 | `--db-pool N` | pool size |
