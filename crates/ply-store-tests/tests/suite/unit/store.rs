@@ -737,6 +737,25 @@ fn rewrite_payload(path: &Path, frame: usize, edit: impl FnOnce(&mut Vec<u8>)) {
 }
 
 #[test]
+fn an_operation_atom_survives_a_round_trip_through_disk() {
+    let root = TempRoot::new("frontend-op-atom");
+    let conn = || Resource::Named(ply_span::Symbol::new("conn"));
+    let footprint = Footprint::from_atoms([
+        EffectAtom::operation("net", conn(), "send"),
+        EffectAtom::new("net", conn(), Mode::Write),
+    ]);
+    assert_eq!(footprint.to_string(), "{net.write[conn], net.send[conn]}");
+
+    let mut store = root.open();
+    store.put_def(hash(1), CachedDef::new(scheme(), footprint.clone()));
+    store.flush().unwrap();
+
+    let reopened = root.open();
+    assert!(reopened.warnings().is_empty());
+    assert_eq!(reopened.def(hash(1)).unwrap().footprint, footprint);
+}
+
+#[test]
 fn a_fingerprint_an_interface_and_a_body_survive_a_round_trip_through_disk() {
     let root = TempRoot::new("frontend-round-trip");
     let file = root.path().join("src/user.ply");

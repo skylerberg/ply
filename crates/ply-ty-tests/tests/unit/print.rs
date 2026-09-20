@@ -48,6 +48,15 @@ fn atoms_and_a_tail_print_together() {
 }
 
 #[test]
+fn an_operation_atom_prints_its_operation_in_place_of_the_mode() {
+    let row = Row::closed([
+        EffectAtom::operation("net", Resource::Named(Symbol::new("conn")), "send"),
+        EffectAtom::new("net", Resource::Named(Symbol::new("conn")), Mode::Write),
+    ]);
+    assert_eq!(print_row(&row), "{net.write[conn], net.send[conn]}");
+}
+
+#[test]
 fn a_cell_hides_its_phantom_region_but_names_the_resource() {
     let cell = Type::Con(
         Symbol::new("Cell"),
