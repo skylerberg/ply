@@ -209,7 +209,9 @@ fn comment_above(loaded: &Loaded, span: ply_span::Span) -> Vec<String> {
     let Some(file) = loaded.sources.containing(span) else {
         return Vec::new();
     };
-    let before = &file.text[..span.start as usize];
+    // The span starts at `fn`, after any `pub`, so the walk starts from that line's beginning.
+    let head = &file.text[..span.start as usize];
+    let before = &head[..head.rfind('\n').map_or(0, |i| i + 1)];
     let mut lines: Vec<String> = Vec::new();
     for line in before.lines().rev() {
         let Some(text) = line.trim().strip_prefix("//") else {
