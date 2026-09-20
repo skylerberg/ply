@@ -114,6 +114,36 @@ fn the_compiled_tier_runs_the_compilers_own_tests_as_the_only_engine() {
     entered(&report, "the compiled tier");
 }
 
+/// `std.json` parses an array by a cycle of tail calls, so on the compiled tier an array's length
+/// is bounded by memory and not by the call budget.
+#[test]
+fn the_compiled_tier_decodes_a_long_array_without_nesting() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("m.ply"),
+        r#"import std.json (parse, Json, Array)
+
+fn long_array(n: Int) -> Bytes =
+  bytes_concat_all([b"[", bytes_concat_all(map(range(0, n), |_i: Int| b"7,")), b"7]"])
+
+test "a long array decodes" {
+  assert_eq(
+    match parse(long_array(100_000)) { Ok(Array(items)) -> len(items), _ -> -1 },
+    100_001)
+}
+"#,
+    )
+    .unwrap();
+    let out = ply(dir.path())
+        .env("PLY_TIER_ONLY", "1")
+        .args(["test", ".", "--no-cache", "--backend", "c", "--json"])
+        .output()
+        .unwrap();
+    let report = json(&out);
+    green(&report, "a long array on the compiled tier");
+    entered(&report, "the compiled tier");
+}
+
 #[test]
 fn the_language_corpus_is_green_on_the_default_tier_and_as_the_only_engine() {
     ply(&repo())

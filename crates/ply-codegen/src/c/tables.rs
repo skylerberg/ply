@@ -22,6 +22,9 @@ pub struct Tables {
     /// Effects performed and handled, under their program-wide names.
     pub performs: Vec<String>,
     pub handles: Vec<String>,
+    /// The definitions this one body serves when it is a recursive group's, in case order; empty
+    /// for a body of its own.
+    pub members: Vec<String>,
 }
 
 /// What an emitted unit accumulates that is not code, with each entry's position. A unit being
