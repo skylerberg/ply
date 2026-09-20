@@ -280,7 +280,10 @@ type. Functions cannot be compared, encoded, ordered or used as map keys.
 * **Written:** every parameter and return type of a top-level `fn` (`E0126`),
   and every `forall` binder type.
 * **Inferred:** effect rows. A written row is an upper bound; the inferred row
-  must fit inside it (`E0302`), and it may be wider than the body needs.
+  must fit inside it (`E0302`), and it may be wider than the body needs. Each
+  written atom covers what it names: the mode atom `net.write[conn]` covers
+  every `write` operation of `net` on `conn`, the operation atom
+  `net.send[conn]` covers `send` alone (§6.2).
 * **Inferred inside bodies:** lambda binders, `let`s, everything else. A local
   `let` is monomorphic, so `let f = |x| x;` used at two types is `E0201`.
 
@@ -471,7 +474,21 @@ set of atoms with an optional tail variable: `/ {db.read[users], clock.read}`,
 `/ {net.write[conn] | e}`, `/ e`, `/ {}`. Qualified atoms use `::`:
 `/ {store::db.read[users]}`. An atom may instead name an operation,
 `net.send[conn]`, which the mode atom of the same effect and resource
-(`net.write[conn]`) covers; a written row does not yet accept one (`E0104`).
+(`net.write[conn]`) covers; naming an operation the effect does not declare is
+`E0104`.
+
+A written row that names operations permits a perform of those operations
+only: under `/ {net.send[conn]}` a body may `net.send[conn](..)` and not
+`net.recv[conn](..)` (`E0302`, naming the operation and offering the atom to
+add). A call is judged by the callee's written row: `/ {net.send[conn]}` fits
+under `/ {net.write[conn]}` and under `/ {net.send[conn]}`, but a callee
+written `/ {net.write[conn]}` may perform any write, so it does not fit under
+`/ {net.send[conn]}` (`E0302`, naming the callee). A perform inside a lambda,
+or reached through a function value or a builtin's arguments, is judged by its
+mode atom and so needs that atom in the row. Inferred rows are made of mode
+atoms; an operation atom enters one only from a callee's written row. Rows in
+types unify atom for atom: a function value whose row names an operation is
+not the same type as one whose row names the mode.
 
 Resource labels are global — two modules writing `[users]` name one resource —
 and cannot be abstracted over. Two atoms **conflict** iff they name the same
@@ -508,15 +525,18 @@ test "expiry is decided against the deadline, not the wall clock" {
 A clause is `effect.op[resource](params) -> body`; an optional
 `return x -> body` clause maps the result. The `handle`'s row is the body's
 minus the handled atoms plus every clause's row. A handler discharges an
-**atom**: `recv`, `send` and `close` are all `net.write[conn]`. The body must
-not perform an operation on a handled atom that no clause answers (`E0305`,
-naming the clause to add), unless the enclosing function's written row keeps
-that atom: then the operation is forwarded to the caller's handler, as
-`std.db`'s `transaction` forwards `begin` and `commit` while answering
-`rollback`. The checker follows performs in the body and in every named
-function it calls; an operation inside a lambda, or reached through a
-function value, is not judged, and at run time runs past the `handle` to the
-next handler or the host.
+**atom**: `recv`, `send` and `close` are all `net.write[conn]`. An operation
+atom the body's row carries from a callee's written row, `net.send[conn]`, is
+discharged by a clause for that operation and by nothing else; with no such
+clause it stays in the row and the operation runs past the `handle`. The body
+must not perform an operation on a handled atom that no clause answers
+(`E0305`, naming the clause to add), unless the enclosing function's written
+row keeps that atom, or names that operation: then the operation is forwarded
+to the caller's handler, as `std.db`'s `transaction` forwards `begin` and
+`commit` while answering `rollback`. The checker follows performs in the body
+and in every named function it calls; an operation inside a lambda, or reached
+through a function value, is not judged, and at run time runs past the
+`handle` to the next handler or the host.
 
 ### 6.6 `resume`
 
@@ -526,7 +546,8 @@ number of times. Without `resume`, a clause's value returns to the perform site.
 
 ### 6.7 Unhandled effects
 
-`E0302`: the body performs an atom its written row forbids. `E0303`: an effect
+`E0302`: the body performs an atom, or an operation, its written row does not
+cover. `E0303`: an effect
 escaped inference (a compiler defect). `E0305`: a `handle` lacks a clause for
 an operation its body performs on an atom it handles. `E0424`: an operation
 reached the host boundary with nothing bound — pass `--host` or handle it

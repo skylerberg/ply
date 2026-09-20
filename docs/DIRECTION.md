@@ -28,8 +28,8 @@ A feature earns its place by one of these. Saving keystrokes does not count.
 - Mutation testing and per-definition coverage over the hash index.
 - The compiler's own loop: stage-1 emission cached by source digest and incremental per
   definition.
-- Reach: an HTTP client over `net.connect`, and a TLS `connect`; libraries usable against more
-  than one resource label; packages with dependencies pinned by content hash.
+- Reach: libraries usable against more than one resource label; packages with dependencies
+  pinned by content hash.
 
 ## Open
 
