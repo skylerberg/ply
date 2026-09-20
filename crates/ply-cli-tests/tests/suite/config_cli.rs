@@ -14,10 +14,10 @@ pub fn spec() -> config::ConfigSpec =
     config::required(\"DESK_API_KEY\", config::SSecret),
   ])
 
-pub fn region() -> Option<String> / {config.read[server]} =
+pub fn region() -> Option<String> / {config.get[server]} =
   config.get[server](\"DESK_REGION\")
 
-fn main() -> Option<String> / {config.read[server]} = region()
+fn main() -> Option<String> / {config.get[server]} = region()
 
 // A `det` test supplies its own values and reaches no host: the row after the
 // handle is empty, so this runs, caches and passes without `--host`.

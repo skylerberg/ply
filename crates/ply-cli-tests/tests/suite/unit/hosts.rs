@@ -161,11 +161,11 @@ fn the_table_is_exactly_the_shape_the_contract_specifies() {
         "\
 3 host handlers · 4 operations · trusted computing base
 
-OPERATION       ATOM              HANDLER                    DET  LINEAR        BLOCKING  SECRETS
-clock.now       clock.read        ply_host::clock::now       no   repeatable    no        no
-db.get[orders]  db.read[orders]   ply_host::postgres::read   no   at-most-once  yes       no
-db.get[users]   db.read[users]    ply_host::postgres::read   no   at-most-once  yes       no
-db.put[orders]  db.write[orders]  ply_host::postgres::write  no   at-most-once  yes       no
+OPERATION       HANDLER                    DET  LINEAR        BLOCKING  SECRETS
+clock.now       ply_host::clock::now       no   repeatable    no        no
+db.get[orders]  ply_host::postgres::read   no   at-most-once  yes       no
+db.get[users]   ply_host::postgres::read   no   at-most-once  yes       no
+db.put[orders]  ply_host::postgres::write  no   at-most-once  yes       no
 "
     );
     assert!(digest[0].starts_with("digest: b3:"), "{digest:?}");
@@ -286,7 +286,10 @@ fn the_json_row_carries_the_declaration_side_of_the_determinism_pair() {
     let rows = rows_json(&listing);
     let clock = &rows[0];
     assert_eq!(clock["triple"], "clock.now");
-    assert_eq!(clock["atom"], "clock.read");
+    assert!(
+        clock.get("atom").is_none(),
+        "the triple is the atom: {clock}"
+    );
     assert_eq!(clock["resource"], Value::Null);
     assert_eq!(clock["linearity"], "repeatable");
     assert_eq!(clock["deterministic"], false);

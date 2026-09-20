@@ -62,20 +62,49 @@ impl EffectAtom {
         }
     }
 
-    /// The mode is `Write` until the checker resolves the name against the effect's declaration.
-    pub fn operation(effect: impl Into<Symbol>, resource: Resource, op: impl Into<Symbol>) -> Self {
+    /// `mode` is the operation's declared mode.
+    pub fn operation(
+        effect: impl Into<Symbol>,
+        resource: Resource,
+        mode: Mode,
+        op: impl Into<Symbol>,
+    ) -> Self {
         EffectAtom {
             effect: effect.into(),
             resource,
-            mode: Mode::Write,
+            mode,
             op: Some(op.into()),
         }
+    }
+
+    /// The mode atom of this atom's effect and resource.
+    pub fn mode_atom(&self) -> EffectAtom {
+        EffectAtom::new(self.effect.clone(), self.resource.clone(), self.mode)
     }
 
     pub fn conflicts_with(&self, other: &EffectAtom) -> bool {
         self.effect == other.effect
             && self.resource == other.resource
             && (self.mode == Mode::Write || other.mode == Mode::Write)
+    }
+
+    /// Whether performing `other` is within what this atom permits: a mode atom covers every
+    /// operation of its mode, and an operation atom covers itself.
+    pub fn covers(&self, other: &EffectAtom) -> bool {
+        self.effect == other.effect
+            && self.resource == other.resource
+            && (self == other || (self.op.is_none() && self.mode == other.mode))
+    }
+
+    /// An operation atom with the mode its declaration gives it; a mode atom is unchanged.
+    pub fn with_declared_mode(
+        mut self,
+        mode_of: &dyn Fn(&Symbol, &Symbol) -> Option<Mode>,
+    ) -> Self {
+        if let Some(mode) = self.op.as_ref().and_then(|op| mode_of(&self.effect, op)) {
+            self.mode = mode;
+        }
+        self
     }
 }
 
@@ -144,6 +173,13 @@ impl Row {
         self.atoms.contains(atom)
     }
 
+    pub fn resolve_modes(&mut self, mode_of: &dyn Fn(&Symbol, &Symbol) -> Option<Mode>) {
+        self.atoms = std::mem::take(&mut self.atoms)
+            .into_iter()
+            .map(|a| a.with_declared_mode(mode_of))
+            .collect();
+    }
+
     /// Discards the tail.
     pub fn to_footprint(&self) -> Footprint {
         Footprint(self.atoms.clone())
@@ -186,6 +222,18 @@ impl Footprint {
         self.0.contains(atom)
     }
 
+    /// Whether some atom here covers `atom` (see [`EffectAtom::covers`]).
+    pub fn covers(&self, atom: &EffectAtom) -> bool {
+        self.0.iter().any(|a| a.covers(atom))
+    }
+
+    pub fn resolve_modes(&mut self, mode_of: &dyn Fn(&Symbol, &Symbol) -> Option<Mode>) {
+        self.0 = std::mem::take(&mut self.0)
+            .into_iter()
+            .map(|a| a.with_declared_mode(mode_of))
+            .collect();
+    }
+
     pub fn union(&self, other: &Footprint) -> Footprint {
         Footprint(self.0.union(&other.0).cloned().collect())
     }
@@ -223,6 +271,23 @@ pub enum Type {
 impl Type {
     pub fn con(name: &str) -> Type {
         Type::Con(Symbol::new(name), Vec::new())
+    }
+    /// Gives every operation atom in every row here its declared mode.
+    pub fn resolve_modes(&mut self, mode_of: &dyn Fn(&Symbol, &Symbol) -> Option<Mode>) {
+        match self {
+            Type::Var(_) => {}
+            Type::Con(_, args) => args.iter_mut().for_each(|t| t.resolve_modes(mode_of)),
+            Type::Fn {
+                params,
+                ret,
+                effects,
+            } => {
+                params.iter_mut().for_each(|t| t.resolve_modes(mode_of));
+                ret.resolve_modes(mode_of);
+                effects.resolve_modes(mode_of);
+            }
+            Type::Record(fields) => fields.values_mut().for_each(|t| t.resolve_modes(mode_of)),
+        }
     }
     pub fn int() -> Type {
         Type::con("Int")

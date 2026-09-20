@@ -866,6 +866,6 @@ fn a_body_edit_that_moves_the_published_row_still_reaches_every_caller() {
         after.check.defs[&Symbol::new("top.top")]
             .footprint
             .to_string(),
-        "{lib.log.write[b]}"
+        "{lib.log.note[b]}"
     );
 }

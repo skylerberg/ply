@@ -165,7 +165,7 @@ pub struct Provenance {
     pub aliases: Vec<String>,
     /// `None` when it equals the declared row.
     pub performed: Option<RowText>,
-    /// Declared minus performed.
+    /// Declared atoms covering nothing the body performed.
     pub unperformed: Vec<String>,
 }
 
@@ -213,7 +213,7 @@ pub fn provenance(def: &DefInfo) -> Provenance {
     let unperformed: Vec<String> = def
         .footprint
         .atoms()
-        .filter(|a| !def.performed.contains(a))
+        .filter(|a| !def.performed.atoms().any(|p| a.covers(p)))
         .map(|a| a.to_string())
         .collect();
     Provenance {

@@ -4,7 +4,7 @@ use ply_eval::host::{
     HostResource, HostRuntime, Linearity,
 };
 use ply_eval::{Plan, Value};
-use ply_span::{Diagnostic, Symbol};
+use ply_span::{Diagnostic, SourceId, Symbol};
 use ply_store::Store;
 use ply_test::{Hosting, InterpExecutor, Record, RunReport, Search, select};
 use ply_ty::Resource;
@@ -324,16 +324,15 @@ fn the_same_det_test_is_refused_hermetically() {
     );
 }
 
-/// A `handle` discharges an **atom**, and an atom names no operation.
-const ATOM_DISCHARGED_OPERATION_ESCAPES: &str = r#"
+/// A `handle` is judged by its body's row, so an operation a partial clause set leaves under
+/// a handled mode atom never reaches a run: the checker refuses it.
+const PARTIAL_CLAUSE_SET: &str = r#"
 effect disk {
   read peek[r](key: Int) -> Int
   read poke[r](key: Int) -> Int
 }
 
-fn ask(k: Int) -> Int / {disk.read[log]} = disk.peek[log](k)
-
-test "the clause set misses an operation of the atom it discharges" {
+test "the clause set misses an operation it performs" {
   let n = handle {
     disk.peek[log](1)
   } with {
@@ -344,55 +343,15 @@ test "the clause set misses an operation of the atom it discharges" {
 "#;
 
 #[test]
-fn an_operation_that_escapes_a_partial_clause_set_is_refused_before_the_handler_runs() {
-    let compiled = Compiled::new(ATOM_DISCHARGED_OPERATION_ESCAPES);
-    let test = compiled
-        .check
-        .tests
-        .iter()
-        .find(|t| t.name.contains("misses an operation"))
-        .expect("the fixture's test");
-    assert!(
-        test.footprint.atoms().next().is_none(),
-        "the fixture only bites if the discharged atom really left the row: {}",
-        test.footprint
-    );
-
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let binding = bind(
-        &compiled,
-        vec![registration(
-            "disk",
-            "peek",
-            "log",
-            Determinism::Deterministic,
-            &calls,
-            99,
-        )],
-    );
-
-    let report = run(&compiled, &mut store, Some(&binding));
-
-    assert_eq!(report.failed, 1, "the escape was reported green");
-    assert_eq!(
-        report.failures[0].diagnostic.code,
-        ply_span::codes::HOST_FOOTPRINT_ESCAPE,
-        "{}",
-        report.failures[0].diagnostic.message
+fn an_operation_a_partial_clause_set_leaves_is_refused_by_the_checker() {
+    let diagnostics = crate::fixture::port_diagnostics(
+        &[("m".to_string(), PARTIAL_CLAUSE_SET.to_string())],
+        &[SourceId(0)],
     );
     assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "the handler ran, so the refusal is a report of an operation already performed"
-    );
-    assert!(
-        report.results[0]
-            .recorded
-            .as_ref()
-            .is_none_or(|r| !r.is_written()),
-        "an escaped run wrote a cache entry"
+        diagnostics.iter().map(|d| d.code).collect::<Vec<_>>(),
+        [ply_span::codes::HANDLER_CLAUSE_MISSING],
+        "{diagnostics:?}"
     );
 }
 
@@ -404,8 +363,8 @@ effect disk {
 
 fn ask(k: Int) -> Int / {disk.read[log]} = disk.peek[log](k)
 
-test "the one that escapes" {
-  let n = handle { disk.peek[log](1) } with { disk.poke[log](k) -> 0, };
+test "the one that handles it" {
+  let n = handle { disk.peek[log](1) } with { disk.peek[log](k) -> 1, };
   assert(n > 0)
 }
 
@@ -415,6 +374,12 @@ test "the one that declares what it does" { assert(ask(1) > 0) }
 #[test]
 fn a_footprint_claim_is_restated_for_every_test_the_worker_runs() {
     let compiled = Compiled::new(TWO_TESTS_ONE_WORKER);
+    let handled = &compiled.check.tests[0];
+    assert!(
+        handled.footprint.atoms().next().is_none(),
+        "the first test's claim is empty: {}",
+        handled.footprint
+    );
     let root = TempRoot::new();
     let mut store = root.store();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -432,16 +397,11 @@ fn a_footprint_claim_is_restated_for_every_test_the_worker_runs() {
 
     let report = run(&compiled, &mut store, Some(&binding));
 
-    assert_eq!(report.failed, 1, "{:?}", report.failures);
-    assert!(
-        report.failures[0].name.contains("escapes"),
-        "the wrong test was refused: {}",
-        report.failures[0].name
-    );
+    assert_eq!(report.failed, 0, "{:?}", report.failures);
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
-        "the test whose footprint does contain the atom must still reach the handler"
+        "the test whose footprint does contain the atom must still reach the handler, after one whose claim is empty"
     );
 }
 
