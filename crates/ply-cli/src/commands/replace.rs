@@ -53,13 +53,13 @@ pub fn execute(args: &ReplaceArgs, style: Style) -> i32 {
         if let Err(diagnostic) = still_the_same_program(&loaded, &place, &text) {
             return refused(diagnostic);
         }
-        if !args.check {
-            if let Err(e) = std::fs::write(&place.file.path, &text) {
-                return refused(Diagnostic::error(
-                    codes::RUNTIME_ERROR,
-                    format!("could not write `{}`: {e}", place.file.path.display()),
-                ));
-            }
+        if !args.check
+            && let Err(e) = std::fs::write(&place.file.path, &text)
+        {
+            return refused(Diagnostic::error(
+                codes::RUNTIME_ERROR,
+                format!("could not write `{}`: {e}", place.file.path.display()),
+            ));
         }
     }
     report(&loaded, args, Some(&place), changed, &[], style)
