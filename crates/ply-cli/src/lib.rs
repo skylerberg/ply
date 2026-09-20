@@ -42,6 +42,7 @@ pub fn execute(cli: Cli) -> i32 {
         Command::Std(args) => commands::stdlib::execute(args, style),
         Command::Explain(args) => commands::explain::execute(args, style),
         Command::Doc(args) => commands::doc::execute(args, style),
+        Command::Fmt(args) => commands::fmt::execute(args, style),
         Command::Hash(args) => commands::hash::execute(args, style),
         Command::Defs(args) => commands::defs::execute(args, style),
         Command::Callers(args) => commands::callers::execute(args, style),
