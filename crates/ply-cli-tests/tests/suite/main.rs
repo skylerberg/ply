@@ -23,6 +23,7 @@ mod lang_fixtures;
 mod map_cache;
 mod map_law;
 mod modules_hash_audit;
+mod mutate;
 mod numerics;
 mod prove;
 mod prover_soundness_audit;
