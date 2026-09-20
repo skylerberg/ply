@@ -425,7 +425,7 @@ pub struct InterpExecutor<'a> {
     front: &'a ply_ty::Front,
     fixture: Option<&'a (dyn Fn(&mut TaskRegions) -> Value + Sync)>,
     hosts: Hosting<'a>,
-    /// The backend this run installs, and which corruption, if any, it is wearing.
+    /// The backend this run installs.
     backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
     search: Search,
 }
@@ -660,14 +660,6 @@ impl<'a> InterpExecutor<'a> {
 
 impl<'a> Executor for InterpExecutor<'a> {
     type Worker = Worker<'a>;
-
-    /// An honest spec keys as `Evaluator`; a spec that is wrong on purpose keeps its own namespace.
-    fn engine(&self) -> Engine {
-        let Some((provider, spec)) = &self.backend else {
-            return Engine::Evaluator;
-        };
-        Engine::of_backend(provider.name(), &provider.variant(), spec)
-    }
 
     fn worker(&self) -> Worker<'a> {
         let backend = self.backend();
