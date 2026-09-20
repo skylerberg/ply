@@ -26,10 +26,11 @@ definitions. An atom reached through a function value (a parameter, a field, a c
 that name operations (`net.send[conn]`), a change to the row syntax, the printer, the hash and
 the frames. Assumed: worth doing as its own item, listed in `docs/DIRECTION.md`.
 
-## Retiring `--backend wrong:<mutation>`
+## Libraries against more than one resource label
 
-That flag corrupts answers at the `Compiled::enter` seam, which no production path enters any
-more: a test is entered whole, so every test under it fails as "no body" and its own suite
-passes for the wrong reason. `ply test --mutate` makes the same claim honestly at the source.
-Assumed: retire the flag, its `Mutant` wrapper and its suite in a follow-up, unless you want
-the seam kept for something else.
+`std.http`'s client runs under `[conn]` because a definition cannot be generic over a label:
+`send_all` is written `/ {net.write[conn]}` and a socket is bound to the label it is first used
+under. The direction item wants `fn send_all<[l]>(c: Int, ...) / {net.write[l]}`, a label
+variable instantiated at each call and printed, hashed and scheduled like a named label. It
+interacts with rows that name operations, so it is planned after that item. Say if you would
+rather have labels passed as values, or the standard library duplicated per label.

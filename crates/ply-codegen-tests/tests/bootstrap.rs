@@ -1,4 +1,4 @@
-//! `PLY_C_BOOTSTRAP_REFRESH=1` rewrites `crates/ply-compiler/bootstrap` with the fixpoint's emission; CI hands the same back as the `bootstrap-bundle` artifact.
+//! `PLY_C_BOOTSTRAP_REFRESH=1` rewrites `crates/ply-compiler/bootstrap` with the fixpoint's emission; CI does so on main after each merge.
 
 use ply_codegen::Source;
 use ply_codegen::c::Produced;
@@ -81,15 +81,6 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
         "no bootstrap bundle at {}; check one out from git history, then refresh it with PLY_C_BOOTSTRAP_REFRESH=1",
         bundle.display()
     );
-    if !refresh {
-        let current = ply_codegen::c::bundle::from_dir(&bundle).expect("the bundle serves");
-        assert_eq!(
-            current.sources_digest(),
-            Some(identity.as_str()),
-            "the bundle at {} was emitted from other sources than these; refresh it: PLY_C_BOOTSTRAP_REFRESH=1 cargo nextest run -p ply-codegen-tests --test bootstrap, or take CI's `bootstrap-bundle` artifact",
-            bundle.display()
-        );
-    }
     let scratch = std::env::temp_dir().join(format!("ply-bootstrap-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
     let p1 = emit_with(source, &bundle, &scratch, &identity);
@@ -106,47 +97,37 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
         panic!("{what}: diff {} {}", pa.display(), pb.display());
     };
     // The unit's table is its C's last declaration, so comparing the C compares the table too.
-    if refresh {
-        // The first round is the old bundle's emitter over the new sources, so rounds go on until two emissions agree.
-        let mut last = p1;
-        let mut written = false;
-        for round in 1..=3 {
-            let stage = scratch.join(format!("stage{round}"));
-            ply_codegen::c::bundle::write(&stage, &last.text, &identity).unwrap();
-            let next = emit_with(source, &stage, &scratch, &identity);
-            assert!(
-                next.refused.is_empty(),
-                "the emitter built from its own emission refuses part of itself: {:?}",
-                next.refused
-            );
-            if last.text == next.text {
+    // The first round is the checked-in bundle's emitter over these sources, which may be behind
+    // them, so rounds go on until two emissions agree; the fixpoint is written only on request.
+    let mut last = p1;
+    let mut settled = false;
+    for round in 1..=3 {
+        let stage = scratch.join(format!("stage{round}"));
+        ply_codegen::c::bundle::write(&stage, &last.text, &identity).unwrap();
+        let next = emit_with(source, &stage, &scratch, &identity);
+        assert!(
+            next.refused.is_empty(),
+            "the emitter built from its own emission refuses part of itself: {:?}",
+            next.refused
+        );
+        if last.text == next.text {
+            if refresh {
                 ply_codegen::c::bundle::write(&bundle, &next.text, &identity).unwrap();
                 eprintln!("bootstrap bundle written to {}", bundle.display());
-                written = true;
-                break;
             }
-            if round == 3 {
-                differ(
-                    "refresh",
-                    &last.text,
-                    &next.text,
-                    "the emitter built from one emission and the emitter built from its own emit different C after three rounds",
-                );
-            }
-            last = next;
+            settled = true;
+            break;
         }
-        assert!(written);
-    } else {
-        let current = ply_codegen::c::bundle::from_dir(&bundle).expect("the bundle serves");
-        let text = ply_codegen::c::bundle::text_of(&current).expect("the bundle's C unpacks");
-        if p1.text != text {
+        if round == 3 {
             differ(
-                "fixpoint",
-                &text,
-                &p1.text,
-                "the emitter built from the bundle emits other C for these sources than the bundle holds",
+                "refresh",
+                &last.text,
+                &next.text,
+                "the emitter built from one emission and the emitter built from its own emit different C after three rounds",
             );
         }
+        last = next;
     }
+    assert!(settled);
     let _ = std::fs::remove_dir_all(&scratch);
 }

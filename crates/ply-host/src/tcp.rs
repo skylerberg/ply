@@ -32,6 +32,7 @@ pub enum Op {
     Listen,
     ListenTls,
     Connect,
+    ConnectTls,
     Accept,
     Recv,
     Send,
@@ -39,10 +40,11 @@ pub enum Op {
 }
 
 impl Op {
-    pub const ALL: [Op; 7] = [
+    pub const ALL: [Op; 8] = [
         Op::Listen,
         Op::ListenTls,
         Op::Connect,
+        Op::ConnectTls,
         Op::Accept,
         Op::Recv,
         Op::Send,
@@ -54,6 +56,7 @@ impl Op {
             Op::Listen => "listen",
             Op::ListenTls => "listen_tls",
             Op::Connect => "connect",
+            Op::ConnectTls => "connect_tls",
             Op::Accept => "accept",
             Op::Recv => "recv",
             Op::Send => "send",
@@ -66,6 +69,7 @@ impl Op {
             Op::Listen => "`net.listen`",
             Op::ListenTls => "`net.listen_tls`",
             Op::Connect => "`net.connect`",
+            Op::ConnectTls => "`net.connect_tls`",
             Op::Accept => "`net.accept`",
             Op::Recv => "`net.recv`",
             Op::Send => "`net.send`",
@@ -77,12 +81,15 @@ impl Op {
         match self {
             Op::Listen | Op::Accept | Op::Close => 1,
             Op::ListenTls => 2,
-            Op::Connect | Op::Recv | Op::Send => 3,
+            Op::Connect | Op::ConnectTls | Op::Recv | Op::Send => 3,
         }
     }
 
     fn waits(self) -> bool {
-        matches!(self, Op::Connect | Op::Accept | Op::Recv | Op::Send)
+        matches!(
+            self,
+            Op::Connect | Op::ConnectTls | Op::Accept | Op::Recv | Op::Send
+        )
     }
 
     pub fn declaration(self, net: &dyn Net) -> HostOp {
@@ -116,6 +123,15 @@ pub trait Net: Send + Sync {
     ) -> Result<HostAnswer, Diagnostic>;
     /// `None` is a host that could not be reached before the deadline, whatever the reason.
     fn connect(
+        &self,
+        at: &Resource,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic>;
+    /// As `connect`, then TLS over it, verifying `host`; a failed handshake ends the connection.
+    fn connect_tls(
         &self,
         at: &Resource,
         host: &str,
@@ -257,6 +273,12 @@ impl HostHandler for Operation {
                 let port = port(self.op, req.args[1].as_int(span, "a port")?, span)?;
                 let timeout = deadline(self.op, req.args[2].as_int(span, "a timeout")?, span)?;
                 self.net.connect(at, host, port, timeout, span)
+            }
+            Op::ConnectTls => {
+                let host = req.args[0].as_str(span, "a host name")?;
+                let port = port(self.op, req.args[1].as_int(span, "a port")?, span)?;
+                let timeout = deadline(self.op, req.args[2].as_int(span, "a timeout")?, span)?;
+                self.net.connect_tls(at, host, port, timeout, span)
             }
             Op::Accept => {
                 let listener = req.args[0].as_int(span, "a socket handle")?;
