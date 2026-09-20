@@ -34,7 +34,7 @@ pub fn execute(args: &DocArgs, style: Style) -> i32 {
         .ok()
         .map(|l| super::callers::resolve(l, &args.query));
     let page = match resolved {
-        Some(Ok(name)) => definition(loaded.as_ref().ok().expect("resolved against it"), &name),
+        Some(Ok(name)) => definition(loaded.as_ref().expect("resolved against it"), &name),
         _ => match builtin(&args.query) {
             Ok(Some(page)) => page,
             Ok(None) => {
