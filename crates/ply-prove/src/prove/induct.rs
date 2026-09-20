@@ -284,7 +284,10 @@ fn induct_on(
         &mut spent,
         &assertions,
     ) {
-        declined(blockers, "the base case is open");
+        declined(
+            blockers,
+            &format!("the base case is open{}", ran_out(budget)),
+        );
         return (None, spent);
     }
     let mut assertions = common;
@@ -300,7 +303,7 @@ fn induct_on(
         &mut spent,
         &assertions,
     ) {
-        declined(blockers, "the step is open");
+        declined(blockers, &format!("the step is open{}", ran_out(budget)));
         return (None, spent);
     }
 
@@ -345,4 +348,12 @@ fn settle(
     *spent += *budget - left;
     *budget = left;
     answer == solve::Answer::Closed
+}
+
+fn ran_out(budget: u32) -> &'static str {
+    if budget == 0 {
+        ", the budget spent"
+    } else {
+        ""
+    }
 }

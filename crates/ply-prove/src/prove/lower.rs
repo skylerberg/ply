@@ -871,6 +871,10 @@ impl<'a, 'p> Lowering<'a, 'p> {
         }
         let ctx = self.ctx;
         let unrolling = self.unrolled.contains(name);
+        // One step of a recursive definition: the hypothesis speaks about the call that remains.
+        if unrolling && self.depth >= 1 {
+            return None;
+        }
         let def = match ctx.unfoldable(name) {
             Some(def) => def,
             None if unrolling => ctx.self_recursive(name)?,
