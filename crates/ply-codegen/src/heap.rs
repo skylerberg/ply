@@ -425,6 +425,10 @@ impl Layouts {
         self.shapes.borrow_mut().intern(fields)
     }
 
+    pub fn shape_count(&self) -> usize {
+        self.shapes.borrow().names.len()
+    }
+
     pub fn shape_names(&self, shape: u32) -> Rc<[Symbol]> {
         self.shapes.borrow().names[shape as usize].clone()
     }

@@ -36,19 +36,6 @@ pub struct Unit {
     pub layouts: Layouts,
     /// Lambda entry symbols; `rt_closure` and `rt_constant` take a position here.
     pub lambdas: Vec<String>,
-    const_at: HashMap<String, usize>,
-    field_at: HashMap<Symbol, usize>,
-    builtin_at: HashMap<&'static str, usize>,
-    shape_at: HashMap<Vec<Symbol>, u32>,
-    lambda_at: HashMap<String, usize>,
-}
-
-fn positions<K: std::hash::Hash + Eq>(keys: impl IntoIterator<Item = K>) -> HashMap<K, usize> {
-    let mut at = HashMap::new();
-    for (i, k) in keys.into_iter().enumerate() {
-        at.entry(k).or_insert(i);
-    }
-    at
 }
 
 fn sorted(names: &[Symbol]) -> Vec<Symbol> {
@@ -109,22 +96,15 @@ impl Unit {
         lambdas: Vec<String>,
     ) -> Option<Unit> {
         let layouts = Layouts::of(ctors, &shapes);
-        for (id, names) in shapes.iter().enumerate() {
-            if layouts.shape(names.clone()) as usize != id {
-                return None;
-            }
+        let placed = layouts.shape_count() >= shapes.len()
+            && shapes
+                .iter()
+                .enumerate()
+                .all(|(id, names)| layouts.shape_names(id as u32)[..] == names[..]);
+        if !placed {
+            return None;
         }
-        let shape_at = shapes
-            .iter()
-            .enumerate()
-            .map(|(id, names)| (sorted(names), id as u32))
-            .collect();
         Some(Unit {
-            const_at: positions(consts.iter().map(encode_const)),
-            field_at: positions(fields.iter().cloned()),
-            builtin_at: positions(builtins.iter().map(|b| b.name())),
-            shape_at,
-            lambda_at: positions(lambdas.iter().cloned()),
             consts,
             fields,
             builtins,
@@ -134,24 +114,59 @@ impl Unit {
         })
     }
 
+    pub fn lambda(&self, symbol: &str) -> Option<usize> {
+        self.lambdas.iter().position(|l| l == symbol)
+    }
+
+    /// Every entry's position, for resolving bodies against this unit.
+    pub fn positions(&self) -> Positions<'_> {
+        Positions {
+            consts: index(self.consts.iter().map(encode_const)),
+            fields: index(self.fields.iter()),
+            builtins: index(self.builtins.iter().map(|b| b.name())),
+            shapes: index(self.shapes.iter().map(|names| sorted(names))),
+            lambdas: index(self.lambdas.iter().map(String::as_str)),
+        }
+    }
+}
+
+fn index<K: std::hash::Hash + Eq>(keys: impl IntoIterator<Item = K>) -> HashMap<K, usize> {
+    let mut at = HashMap::new();
+    for (i, k) in keys.into_iter().enumerate() {
+        at.entry(k).or_insert(i);
+    }
+    at
+}
+
+/// Where each entry of a unit's tables sits, by content; built once per unit resolved, never
+/// for a unit merely loaded.
+pub struct Positions<'a> {
+    consts: HashMap<String, usize>,
+    fields: HashMap<&'a Symbol, usize>,
+    builtins: HashMap<&'static str, usize>,
+    shapes: HashMap<Vec<Symbol>, usize>,
+    lambdas: HashMap<&'a str, usize>,
+}
+
+impl Positions<'_> {
     pub fn constant(&self, v: &Value) -> Option<usize> {
-        self.const_at.get(&encode_const(v)).copied()
+        self.consts.get(&encode_const(v)).copied()
     }
 
     pub fn field(&self, name: &Symbol) -> Option<usize> {
-        self.field_at.get(name).copied()
+        self.fields.get(name).copied()
     }
 
     pub fn builtin(&self, b: Builtin) -> Option<usize> {
-        self.builtin_at.get(b.name()).copied()
+        self.builtins.get(b.name()).copied()
     }
 
     pub fn shape(&self, names: &[Symbol]) -> Option<u32> {
-        self.shape_at.get(&sorted(names)).copied()
+        self.shapes.get(&sorted(names)).map(|id| *id as u32)
     }
 
     pub fn lambda(&self, symbol: &str) -> Option<usize> {
-        self.lambda_at.get(symbol).copied()
+        self.lambdas.get(symbol).copied()
     }
 }
 
