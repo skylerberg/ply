@@ -728,8 +728,11 @@ points, linear `Int` arithmetic, case splits, congruence, constructor
 injectivity, unfolding non-recursive definitions, exhaustive interleaving, and
 induction on an `Int` binder: a definition that calls only itself with some
 `Int` argument non-negative and smaller at every self call is unrolled, and the
-claim is proved at `n <= 0` and then at `n > 0` from itself at `n - 1`. There is
-no induction over lists.
+claim is proved at `n <= 0` and then at `n > 0` from itself at `n - 1`; and
+induction on a `List` binder: a definition whose self calls take a tail its
+list patterns exposed is unrolled, and the claim is proved at `[]` and then at
+`[h, ..t]` from itself at `t`, with `len` and `push` reduced over the spine in
+view and `len` known to lie below `i64::MAX`.
 
 `ply prove` reports the definitions carrying no obligation, then each
 obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no
