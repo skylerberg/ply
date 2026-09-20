@@ -2,7 +2,7 @@
 
 use crate::db::{self, Postgres};
 use crate::signal::{self, Accepting, Shutdown};
-use crate::{config, fs, sched, tcp, trace};
+use crate::{config, fs, process, sched, tcp, trace};
 use ply_eval::Value;
 use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownReport};
 use ply_span::{Diagnostic, Span, codes};
@@ -23,6 +23,8 @@ pub struct Host {
     shutdown: Option<Arc<Shutdown>>,
     /// The roots `--fs NAME=PATH` bound, and the pool their operations wait on; empty if none.
     fs: Arc<fs::FsHost>,
+    /// The arguments and streams `ply run --host` was given; `None` withholds `process`.
+    process: Option<Arc<process::ProcessHost>>,
 }
 
 impl Default for Host {
@@ -44,6 +46,7 @@ impl Host {
             trace: Arc::new(trace::Trace::default()),
             shutdown: None,
             fs: Arc::new(fs::FsHost::new(fs::Roots::new())),
+            process: None,
         }
     }
 
@@ -56,6 +59,17 @@ impl Host {
 
     pub fn roots(&self) -> &fs::Roots {
         self.fs.roots()
+    }
+
+    pub fn with_process(self, process: process::ProcessHost) -> Host {
+        Host {
+            process: Some(Arc::new(process)),
+            ..self
+        }
+    }
+
+    pub fn process(&self) -> Option<&Arc<process::ProcessHost>> {
+        self.process.as_ref()
     }
 
     pub fn traced(self, trace: Arc<trace::Trace>) -> Host {
@@ -85,6 +99,7 @@ impl Host {
             trace: Arc::new(trace::Trace::default()),
             shutdown: None,
             fs: Arc::new(fs::FsHost::new(fs::Roots::new())),
+            process: None,
         })
     }
 
@@ -114,6 +129,7 @@ impl Host {
         // Registered whatever `--fs` said, so a run that bound no root gets `E0451`, not `E0424`.
         fs::register(&mut registry, Arc::clone(&self.fs));
         signal::register(&mut registry, self.shutdown.as_ref());
+        process::register(&mut registry, self.process.as_ref());
         registry
     }
 
@@ -161,6 +177,12 @@ pub fn registry_over(trace: Arc<trace::Trace>, database: bool) -> HostRegistry {
     let mut registry = Host::new()
         .traced(trace)
         .stopping_on(Shutdown::new(signal::Bounds::default()))
+        .with_process(process::ProcessHost::new(
+            Vec::new(),
+            process::Sink::Real {
+                out: process::Stream::Out,
+            },
+        ))
         .registry();
     if database {
         db::register(&mut registry, Arc::new(db::postgres::NotConfigured));

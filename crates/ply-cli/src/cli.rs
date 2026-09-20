@@ -517,6 +517,10 @@ pub struct RunArgs {
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
+    /// What `process.args` answers: everything after `--`.
+    #[arg(last = true, value_name = "ARGS")]
+    pub argv: Vec<String>,
+
     /// Emit one JSON object on stdout and nothing else.
     #[arg(long)]
     pub json: bool,
