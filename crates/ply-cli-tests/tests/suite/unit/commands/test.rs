@@ -1177,7 +1177,7 @@ fn a_hermetic_run_reports_exactly_what_it_did_before() {
     let hosts = Hosts::open(
         &loaded.check,
         false,
-        &[],
+        &ply_cli::cli::TlsOptions::default(),
         &[],
         None,
         ply_cli::config::Configuration::default(),
@@ -1247,7 +1247,7 @@ fn a_cached_pass_over_the_host_fails_the_run_that_wrote_it() {
     let hermetic = Hosts::open(
         &loaded.check,
         false,
-        &[],
+        &ply_cli::cli::TlsOptions::default(),
         &[],
         None,
         ply_cli::config::Configuration::default(),
