@@ -347,6 +347,16 @@ const NO_FIELD: u16 = u16::MAX;
 
 impl Layouts {
     pub fn new(ctors: Vec<(Symbol, usize)>) -> Layouts {
+        Layouts::of(ctors, &[])
+    }
+
+    /// The fields of a `{key, value}` entry.
+    pub fn entry_fields() -> Vec<Symbol> {
+        vec![Symbol::new("key"), Symbol::new("value")]
+    }
+
+    /// With `shapes` interned first, in order, so each one's id is its position.
+    pub fn of(ctors: Vec<(Symbol, usize)>, shapes: &[Vec<Symbol>]) -> Layouts {
         let ctor_ids: HashMap<Symbol, u32> = ctors
             .iter()
             .enumerate()
@@ -355,10 +365,13 @@ impl Layouts {
         let by = |name: &str| ctor_ids.get(&Symbol::new(name)).copied();
         let (some, none, stop, go) = (by("Some"), by("None"), by("Stop"), by("Continue"));
         let (less, equal, greater) = (by("Less"), by("Equal"), by("Greater"));
-        let mut shapes = Shapes::default();
-        let entry_shape = shapes.intern(vec![Symbol::new("key"), Symbol::new("value")]);
+        let mut interned = Shapes::default();
+        for names in shapes {
+            interned.intern(names.clone());
+        }
+        let entry_shape = interned.intern(Layouts::entry_fields());
         Layouts {
-            shapes: RefCell::new(shapes),
+            shapes: RefCell::new(interned),
             ctors,
             ctor_ids,
             some,
@@ -412,14 +425,8 @@ impl Layouts {
         self.shapes.borrow_mut().intern(fields)
     }
 
-    /// Every shape's fields in id order, so a cached unit re-interns them to the ids its C bakes.
-    pub fn all_shape_names(&self) -> Vec<Vec<Symbol>> {
-        self.shapes
-            .borrow()
-            .names
-            .iter()
-            .map(|n| n.to_vec())
-            .collect()
+    pub fn shape_count(&self) -> usize {
+        self.shapes.borrow().names.len()
     }
 
     pub fn shape_names(&self, shape: u32) -> Rc<[Symbol]> {
