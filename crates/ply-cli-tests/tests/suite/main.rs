@@ -15,6 +15,7 @@ mod effect_set_selection;
 mod effect_sets;
 mod explain;
 mod failure_classification_audit;
+mod fmt;
 mod http_endpoint;
 mod incremental;
 mod incremental_audit;
