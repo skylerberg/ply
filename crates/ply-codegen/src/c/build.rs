@@ -418,7 +418,7 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
     bind(&lib)?;
     let Some(unit) = Unit::from_tables(ctors.clone(), consts, fields, builtins, shapes, lambdas)
     else {
-        bail!("a unit's tables are not in the order its C was emitted against");
+        bail!("a unit's shapes do not intern to the ids its C was emitted against");
     };
     let constants = constants_of(&constants, &unit)?;
     let mut functions = Vec::with_capacity(unit.lambdas.len());
