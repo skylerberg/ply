@@ -35,6 +35,7 @@ enum Split {
     },
     Literal(TermId, TermId),
     Disequality(TermId, TermId),
+    List(TermId),
 }
 
 pub struct Solver<'a, 'p> {
@@ -128,6 +129,24 @@ impl<'a, 'p> Solver<'a, 'p> {
                         .collect();
                     let sort = self.terms.sort(scrutinee).cloned();
                     let applied = self.terms.mk(Node::Ctor { name, args }, sort);
+                    let mut child = branch.clone();
+                    child.classes.grow(self.terms.len());
+                    child.classes.union(scrutinee, applied);
+                    children.push(child);
+                }
+            }
+            Split::List(scrutinee) => {
+                self.rules.note(Rule::CaseSplit {
+                    ty: Symbol::new("List"),
+                    arms: 2,
+                });
+                let sort = self.terms.sort(scrutinee).cloned();
+                let elem = sort.as_ref().and_then(super::term::list_elem).cloned();
+                let nil = self.terms.nil(sort.clone());
+                let head = self.terms.sym(elem);
+                let tail = self.terms.sym(sort.clone());
+                let cons = self.terms.cons(head, tail, sort);
+                for applied in [nil, cons] {
                     let mut child = branch.clone();
                     child.classes.grow(self.terms.len());
                     child.classes.union(scrutinee, applied);
@@ -246,7 +265,11 @@ impl<'a, 'p> Solver<'a, 'p> {
                 name: name.clone(),
                 args: args.iter().map(|a| find(*a)).collect(),
             },
-            Node::List(items) => Node::List(items.iter().map(|i| find(*i)).collect()),
+            Node::Nil => Node::Nil,
+            Node::Cons { head, tail } => Node::Cons {
+                head: find(*head),
+                tail: find(*tail),
+            },
             Node::Record(fields) => {
                 Node::Record(fields.iter().map(|(n, v)| (n.clone(), find(*v))).collect())
             }
@@ -330,9 +353,11 @@ impl<'a, 'p> Solver<'a, 'p> {
 
     fn unify_arguments(&self, branch: &mut Branch, a: TermId, b: TermId) -> bool {
         let pairs: Vec<(TermId, TermId)> = match (self.terms.node(a), self.terms.node(b)) {
-            (Node::Ctor { args: xs, .. }, Node::Ctor { args: ys, .. })
-            | (Node::List(xs), Node::List(ys)) => {
+            (Node::Ctor { args: xs, .. }, Node::Ctor { args: ys, .. }) => {
                 xs.iter().copied().zip(ys.iter().copied()).collect()
+            }
+            (Node::Cons { head: h1, tail: t1 }, Node::Cons { head: h2, tail: t2 }) => {
+                vec![(*h1, *h2), (*t1, *t2)]
             }
             (Node::Record(xs), Node::Record(ys)) => xs
                 .iter()
@@ -522,6 +547,25 @@ impl<'a, 'p> Solver<'a, 'p> {
                 changed |= branch.classes.union(*bind, arg);
             }
         }
+        if let ArmTest::List { fixed, rest } = arm.test {
+            let mut at = scrutinee;
+            let mut binds = arm.binds.iter();
+            for _ in 0..fixed {
+                let Some(known) = self.known_list(branch, at) else {
+                    break;
+                };
+                let Node::Cons { head, tail } = self.terms.node(known).clone() else {
+                    break;
+                };
+                if let Some(bind) = binds.next() {
+                    changed |= branch.classes.union(*bind, head);
+                }
+                at = tail;
+            }
+            if rest && let Some(bind) = binds.next() {
+                changed |= branch.classes.union(*bind, at);
+            }
+        }
         changed
     }
 
@@ -545,10 +589,57 @@ impl<'a, 'p> Solver<'a, 'p> {
                     }
                     return Taken::NeedsLiteral(*literal);
                 }
+                ArmTest::List { fixed, rest } => {
+                    match self.list_shape(branch, scrutinee, *fixed, *rest) {
+                        ListShape::Taken => return Taken::Arm(index),
+                        ListShape::Missed => continue,
+                        ListShape::Unknown(at) => return Taken::NeedsList(at),
+                    }
+                }
                 ArmTest::Undecidable => return Taken::Undecidable,
             }
         }
         Taken::Undecidable
+    }
+
+    /// Walks `fixed` conses down from the scrutinee, then asks for a rest or the end.
+    fn list_shape(
+        &self,
+        branch: &Branch,
+        scrutinee: TermId,
+        fixed: usize,
+        rest: bool,
+    ) -> ListShape {
+        let mut at = scrutinee;
+        for _ in 0..fixed {
+            match self
+                .known_list(branch, at)
+                .map(|k| self.terms.node(k).clone())
+            {
+                Some(Node::Cons { tail, .. }) => at = tail,
+                Some(_) => return ListShape::Missed,
+                None => return ListShape::Unknown(at),
+            }
+        }
+        if rest {
+            return ListShape::Taken;
+        }
+        match self
+            .known_list(branch, at)
+            .map(|k| self.terms.node(k).clone())
+        {
+            Some(Node::Nil) => ListShape::Taken,
+            Some(_) => ListShape::Missed,
+            None => ListShape::Unknown(at),
+        }
+    }
+
+    fn known_list(&self, branch: &Branch, term: TermId) -> Option<TermId> {
+        let rep = branch.classes.find(term);
+        (0..self.terms.len()).find(|&t| {
+            branch.classes.find(t) == rep
+                && matches!(self.terms.node(t), Node::Nil | Node::Cons { .. })
+        })
     }
 
     fn known_constructor(&self, branch: &Branch, term: TermId) -> Option<TermId> {
@@ -667,6 +758,7 @@ impl<'a, 'p> Solver<'a, 'p> {
                     Taken::NeedsLiteral(literal) => {
                         return Some(Split::Literal(scrutinee, literal));
                     }
+                    Taken::NeedsList(at) => return Some(Split::List(at)),
                     _ => {}
                 },
                 _ => {}
@@ -864,9 +956,17 @@ impl<'a, 'p> Solver<'a, 'p> {
     }
 }
 
+enum ListShape {
+    Taken,
+    Missed,
+    Unknown(TermId),
+}
+
 enum Taken {
     Arm(usize),
     NeedsConstructor,
+    /// Whether this list is `[]` or a cons decides the arm.
+    NeedsList(TermId),
     NeedsLiteral(TermId),
     Undecidable,
 }

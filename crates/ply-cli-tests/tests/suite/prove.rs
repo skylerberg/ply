@@ -159,7 +159,8 @@ fn prove_json_agrees_across_job_counts_over_real_obligations() {
             .output()
             .unwrap(),
     );
-    assert_eq!(one["summary"]["proved"], 1);
+    // A length is known to be non-negative, so both `ensures` and the first law are proved.
+    assert_eq!(one["summary"]["proved"], 3);
     assert_eq!(one["summary"]["refuted"], 1);
     assert_eq!(one, many);
 }

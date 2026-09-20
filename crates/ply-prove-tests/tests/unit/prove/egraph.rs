@@ -26,7 +26,7 @@ fn an_asserted_disequality_between_equal_terms_contradicts() {
 #[test]
 fn shapes_of_different_kinds_conclude_nothing() {
     assert_eq!(conflict(&Shape::Int(1), &Shape::Bool(true)), None);
-    assert_eq!(conflict(&Shape::List(0), &Shape::Int(0)), None);
+    assert_eq!(conflict(&Shape::Nil, &Shape::Int(0)), None);
     assert_eq!(conflict(&Shape::Int(1), &Shape::Int(2)), Some(true));
     assert_eq!(conflict(&Shape::Int(1), &Shape::Int(1)), Some(false));
 }
