@@ -15,6 +15,8 @@ fn a_body_round_trips_through_the_encoding() {
     t.shapes.push(vec![Symbol::new("text"), Symbol::new("b")]);
     t.calls.push("text".to_string());
     t.lambdas.push("ply_m_f_lambda0".to_string());
+    t.members.push("m.f".to_string());
+    t.members.push("m.g".to_string());
     let text = "Word f(void) {\n  return @@c1@@;\n}\ntext\n";
 
     let (back, out) = decode(&encode(text, &t)).expect("the encoding round trips");
@@ -24,10 +26,25 @@ fn a_body_round_trips_through_the_encoding() {
     assert_eq!(out.calls, t.calls);
     assert_eq!(out.lambdas, t.lambdas);
     assert_eq!(out.builtins, t.builtins);
+    assert_eq!(out.members, t.members);
     assert_eq!(out.consts.len(), 3);
     assert!(matches!(out.consts[0], Value::Unit));
     assert_eq!(
         format!("{:?}", out.consts[1]),
         format!("{:?}", Value::str("hello\nworld"))
     );
+}
+
+/// The committed emitter stages the sources of one that writes a members table; its frames have none.
+#[test]
+fn a_body_framed_without_a_members_table_decodes_as_its_own() {
+    let mut t = Tables::default();
+    t.calls.push("m.g".to_string());
+    let text = "Word f(void) {\n  return 0;\n}\n";
+    let encoded = encode(text, &t).replace("members 0\n", "");
+    assert!(!encoded.contains("members"), "{encoded}");
+    let (back, out) = decode(&encoded).expect("a frame without members decodes");
+    assert_eq!(back, text);
+    assert_eq!(out.calls, t.calls);
+    assert!(out.members.is_empty());
 }
