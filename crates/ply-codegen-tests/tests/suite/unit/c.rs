@@ -3,7 +3,11 @@ mod sweep;
 mod toolchain;
 mod upgrade;
 
-use ply_codegen::c::{HELPERS, Native, PRELUDE, compile_and_load, helper_addresses, runtime_decls};
+use ply_codegen::c::tables::{BUCKETS, bucket_of, mangle};
+use ply_codegen::c::{
+    HELPERS, Native, PRELUDE, RUNTIME_MARK, compile_and_load, helper_addresses, runtime_header,
+    runtime_object, split,
+};
 
 /// A declaration with no address is a null call at run time: a crash rather than a decline.
 #[test]
@@ -41,7 +45,8 @@ fn the_prelude_agrees_with_the_layouts_it_mirrors() {
 #[test]
 fn a_unit_compiles_loads_binds_and_answers() {
     let mut src = String::from(PRELUDE);
-    src.push_str(&runtime_decls());
+    src.push_str(&runtime_header());
+    src.push_str(&runtime_object());
     src.push_str(
         r#"
 Word ply_probe(PlyCtx *ctx, const Word *args) {
@@ -1037,6 +1042,177 @@ pub fn steady() -> Int = 7
     assert_eq!(
         first.text, second.text,
         "the order the definitions were offered in reached the unit"
+    );
+}
+
+/// The unit is one translation unit that is also a partition: its parts concatenate back to it,
+/// and each body sits once, in the bucket its name alone decides.
+#[test]
+fn a_unit_splits_into_its_buckets_and_each_body_sits_in_its_name_s_bucket() {
+    let source = r#"
+type Pair = { left: Int, right: Int }
+fn key(x: Int) -> Int = x + 1
+pub fn sum(xs: List<Int>) -> Int = fold(map(xs, key), 0, |a: Int, x: Int| a + x)
+pub fn pick(p: Pair) -> Bytes = if p.left > p.right { b"left" } else { b"right" }
+pub fn steady() -> Int = 7
+pub fn twice(x: Int) -> Int = key(key(x))
+"#;
+    let Some(loaded) = tests_support::keyed(source) else {
+        return;
+    };
+    let produced = numbering_support::produce(loaded, &loaded.functions());
+    let parts = split(&produced.text).expect("the unit splits on its marks");
+    let joined: String = std::iter::once(parts.header)
+        .chain(parts.buckets.iter().map(|(_, text)| *text))
+        .chain(std::iter::once(parts.tail))
+        .collect();
+    assert_eq!(
+        joined, produced.text,
+        "the parts do not concatenate to the unit"
+    );
+    assert!(parts.tail.starts_with(RUNTIME_MARK));
+    assert!(parts.tail.contains("void ply_bind("));
+    assert!(parts.header.contains("extern Word ply_true"));
+    for (id, _) in &parts.buckets {
+        assert!(u64::from(*id) < BUCKETS);
+    }
+    for name in loaded.functions() {
+        let definition = format!("Word {}(PlyCtx *ctx", mangle(&name));
+        assert!(
+            !parts.header.contains(&definition) && !parts.tail.contains(&definition),
+            "`{name}` sits outside the buckets"
+        );
+        let holding: Vec<u8> = parts
+            .buckets
+            .iter()
+            .filter(|(_, text)| text.contains(&definition))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            holding,
+            vec![bucket_of(&name)],
+            "the buckets holding `{name}`"
+        );
+        let copies: usize = parts
+            .buckets
+            .iter()
+            .map(|(_, text)| text.matches(&definition).count())
+            .sum();
+        assert_eq!(copies, 1, "`{name}` is defined {copies} times");
+    }
+}
+
+/// A body edited and no table moved: of the objects the unit links, the bucket holding that
+/// body is the one compiled again; the other bucket and the runtime's object are reused.
+#[test]
+fn editing_one_body_compiles_its_bucket_alone_and_links_the_rest_from_the_cache() {
+    let nonce = nonce();
+    // Any name in another bucket than `steady`'s; the assertion would hold trivially with both
+    // bodies in one.
+    let edited = [
+        "changed", "altered", "revised", "turned", "moved", "shifted", "swapped",
+    ]
+    .into_iter()
+    .find(|n| bucket_of(&format!("m.{n}")) != bucket_of("m.steady"))
+    .expect("seven names do not all share `steady`'s bucket");
+    let program = |k: u128| {
+        format!(
+            "pub fn steady(x: Int) -> Int = x + {nonce}\n\
+             pub fn {edited}(x: Int) -> Int = x * {k}\n"
+        )
+    };
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    // Writing: a cache of its own, and the counters count every build in the process.
+    let _config = CONFIG.write().unwrap_or_else(|e| e.into_inner());
+    let restore = std::env::var("PLY_C_CACHE").ok();
+    unsafe { std::env::set_var("PLY_C_CACHE", dir.path()) };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        one_bucket_recompiles(&program, dir.path())
+    }));
+    unsafe {
+        match &restore {
+            Some(had) => std::env::set_var("PLY_C_CACHE", had),
+            None => std::env::remove_var("PLY_C_CACHE"),
+        }
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+fn one_bucket_recompiles(program: &dyn Fn(u128) -> String, cache: &std::path::Path) {
+    let compiled =
+        || ply_codegen::c::cache::BUCKETS_COMPILED.load(std::sync::atomic::Ordering::Relaxed);
+    let objects = || -> usize {
+        std::fs::read_dir(cache.join("obj"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "o"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let build = |text: &str| -> Option<Native> {
+        let source = keyed_by_hash(text, "");
+        let names = source.functions();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        match ply_codegen::c::build(source, &refs) {
+            Ok((native, refused)) => {
+                assert!(refused.is_empty(), "{refused:?}");
+                Some(native)
+            }
+            Err(e) if e.to_string().contains("could not run") => None,
+            Err(e) => panic!("{e}"),
+        }
+    };
+    let answer = |native: &Native, name: &str, x: i64| -> i64 {
+        let entry: ply_codegen::rt::Entry = native.entry(name).expect("compiled");
+        let mut ctx = native.context();
+        ctx.fuel = 10_000;
+        let words = [ply_codegen::heap::imm(x)];
+        let w = unsafe { entry(&mut ctx, words.as_ptr()) };
+        assert_eq!(ctx.failed, 0, "`{name}` raised");
+        ply_codegen::heap::imm_value(w)
+    };
+    // Emitted first, so the emitter this thread builds for it lands its own objects in this cache
+    // before the counts are taken, and the unit says how many parts a cold build compiles.
+    let unit = produced(keyed_by_hash(&program(3), ""));
+    let parts = split(&unit.text).expect("the unit splits on its marks");
+    assert_eq!(parts.buckets.len(), 2, "two names in two buckets");
+    let expected = parts.buckets.len() + 1;
+    let (cold_compiled, cold_objects) = (compiled(), objects());
+    let Some(first) = build(&program(3)) else {
+        return;
+    };
+    assert_eq!(
+        (compiled() - cold_compiled, objects() - cold_objects),
+        (expected, expected),
+        "a cold build compiles every bucket and the runtime's object"
+    );
+    let (before_compiled, before_objects) = (compiled(), objects());
+    let second = build(&program(5)).expect("the compiler ran once already");
+    assert_eq!(
+        (compiled() - before_compiled, objects() - before_objects),
+        (1, 1),
+        "editing one body compiled more than the bucket holding it"
+    );
+    let steady = |native: &Native| answer(native, "m.steady", 1);
+    assert_eq!(
+        steady(&first),
+        steady(&second),
+        "`steady` changed under the edit"
+    );
+    let names = keyed_by_hash(&program(5), "").functions();
+    let changed = names
+        .iter()
+        .find(|n| *n != "m.steady")
+        .expect("the program has an edited definition");
+    assert_eq!(answer(&first, changed, 4), 12);
+    assert_eq!(
+        answer(&second, changed, 4),
+        20,
+        "the edit did not reach the image"
     );
 }
 
