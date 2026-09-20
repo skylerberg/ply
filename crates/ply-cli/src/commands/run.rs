@@ -9,6 +9,7 @@ use crate::load::{Loaded, load};
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_DRAIN_INCOMPLETE, EXIT_FAILED, EXIT_OK};
 use ply_eval::{Machine, Plan, Value as PlyValue};
+use ply_host::process::{ProcessHost, Sink, Stream};
 use ply_host::signal::{self, Shutdown};
 use ply_span::{Diagnostic, SourceId, Span, codes};
 use ply_ty::DefInfo;
@@ -108,6 +109,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
         &args.trace,
         declared.as_ref(),
         shutdown.clone(),
+        args.host.then(|| process_host(args)),
     ) {
         Ok(hosts) => hosts,
         Err(diagnostics) => {
@@ -191,6 +193,31 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
         }
     }
 
+    // The program chose its code and returned no value, so none is printed.
+    if let Some(code) = hosts.requested_exit() {
+        if args.json {
+            emit_json(&json!({
+                "command": "run",
+                "ok": code == EXIT_OK,
+                "exit_code": code,
+                "root": loaded.root.display().to_string(),
+                "files": loaded.file_names(),
+                "entry": name,
+                "module": module,
+                "binding": hosts.label(),
+                "counters": counters_value,
+                "hosts": hosts.summary_json(),
+                "value": Value::Null,
+                "configuration": hosts.configuration().to_json(),
+                "shutdown": teardown_json,
+                "diagnostics": config_warnings,
+            }));
+        } else {
+            print_handshakes(&hosts, style);
+        }
+        return code;
+    }
+
     match answer {
         Ok(value) => {
             let rendered = value.to_string();
@@ -260,6 +287,12 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
             code
         }
     }
+}
+
+/// `--json` promises stdout to the one object, so the program's own lines go to stderr instead.
+pub(crate) fn process_host(args: &RunArgs) -> ProcessHost {
+    let out = if args.json { Stream::Err } else { Stream::Out };
+    ProcessHost::new(args.argv.clone(), Sink::Real { out })
 }
 
 /// Rolls back every open transaction, closes spans `Abandoned`, flushes the sink, closes the pool.

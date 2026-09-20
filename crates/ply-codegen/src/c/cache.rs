@@ -15,7 +15,7 @@ fn dir() -> PathBuf {
 pub fn key(def_hash: &str, ctors: &str) -> String {
     let mut h = blake3::Hasher::new();
     for part in [
-        "ply-c-emit-4",
+        "ply-c-emit-5",
         &exe_stamp(),
         &super::exports::helpers_digest(),
         ctors,
@@ -136,15 +136,8 @@ pub(super) fn encode_tables(
 ) -> String {
     let mut out = format!("consts {}\n", consts.len());
     for v in consts {
-        out.push_str(&match v {
-            Value::Unit => "u\n".to_string(),
-            Value::Str(s) => format!("s {}\n", hex(s.as_bytes())),
-            Value::Bytes(b) => format!("b {}\n", hex(b)),
-            Value::Fixed(f) => format!("f {} {}\n", f.ty as u8, f.bits()),
-            Value::Float(x) => format!("x {:016x}\n", x.to_bits()),
-            Value::Decimal(d) => format!("d {} {}\n", d.mantissa(), d.scale()),
-            other => unreachable!("a constant this tier does not pool: {other:?}"),
-        });
+        out.push_str(&encode_const(v));
+        out.push('\n');
     }
     out.push_str(&format!("builtins {}\n", builtins.len()));
     for b in builtins {
@@ -170,6 +163,19 @@ pub(super) fn encode_tables(
         out.push_str(&format!("{l}\n"));
     }
     out
+}
+
+/// One pooled constant's line: its identity, so the pool sorts and deduplicates by it.
+pub(super) fn encode_const(v: &Value) -> String {
+    match v {
+        Value::Unit => "u".to_string(),
+        Value::Str(s) => format!("s {}", hex(s.as_bytes())),
+        Value::Bytes(b) => format!("b {}", hex(b)),
+        Value::Fixed(f) => format!("f {} {}", f.ty as u8, f.bits()),
+        Value::Float(x) => format!("x {:016x}", x.to_bits()),
+        Value::Decimal(d) => format!("d {} {}", d.mantissa(), d.scale()),
+        other => unreachable!("a constant this tier does not pool: {other:?}"),
+    }
 }
 
 /// Inverse of [`encode_tables`]; leaves the cursor after them.

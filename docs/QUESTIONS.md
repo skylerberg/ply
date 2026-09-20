@@ -37,12 +37,12 @@ rather have labels passed as values, or the standard library duplicated per labe
 
 ## Porting the CLI to Ply
 
-The CLI's own shell (arguments, JSON answers, exit codes) is small and would port once Ply
-has a `process` effect for `argv`, stdout, stderr and the exit code, and a way to spawn the
-C compiler. What the CLI mostly does is drive Rust subsystems: the evaluator and compiled
-backend, the test scheduler and bisector, the prover, the store and the hosts. Assumed order,
-if this is wanted: the `process` effect; then the commands that are pure over the compiler's
-answers (`check`, `defs`, `doc`, `explain`, `fmt`, `hash`) as Ply programs behind the same
-command surface; then one subsystem at a time, the prover and the store first as the most
+The CLI's own shell (arguments, JSON answers, exit codes) is small. `std.process` gives a
+program its arguments, stdout, stderr and the exit code; what the port still lacks is a way
+to spawn the C compiler. What the CLI mostly does is drive Rust subsystems: the evaluator
+and compiled backend, the test scheduler and bisector, the prover, the store and the hosts.
+Assumed order, if this is wanted: the commands that are pure over the compiler's answers
+(`check`, `defs`, `doc`, `explain`, `fmt`, `hash`) as Ply programs behind the same command
+surface; then one subsystem at a time, the prover and the store first as the most
 self-contained. Say whether this should come before rows that name operations and label
 abstraction, which are the items left in `docs/DIRECTION.md`.

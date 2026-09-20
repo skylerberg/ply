@@ -1,0 +1,100 @@
+// The process a program runs in, as an effect.
+pub nondet effect process {
+  read args[p]()             -> List<String>
+  write out[p](text: String) -> Unit
+  write err[p](text: String) -> Unit
+  write exit[p](code: Int)   -> Unit
+}
+
+// --- The twin ---------------------------------------------------------------
+
+// What a test hands the clauses below in place of the host: the arguments the
+// program was started with, each stream's lines, and the code it asked to exit with.
+pub type Captured = {
+  args: List<String>,
+  out:  List<String>,
+  err:  List<String>,
+  code: Option<Int>,
+}
+
+pub fn captured(args: List<String>) -> Captured =
+  { args: args, out: [], err: [], code: None }
+
+pub fn args_step(c: Captured) -> List<String> = c.args
+
+pub fn out_step(c: Captured, text: String) -> Captured = { ..c, out: push(c.out, text) }
+
+pub fn err_step(c: Captured, text: String) -> Captured = { ..c, err: push(c.err, text) }
+
+// The first code wins, as it does under the host: the program has stopped by the time a second could run.
+pub fn exit_step(c: Captured, code: Int) -> Captured =
+  match c.code { Some(_) -> c, None -> { ..c, code: Some(code) } }
+
+// --- Tests ------------------------------------------------------------------
+
+fn greet(names: List<String>) -> Unit / {process.write[proc]} =
+  match names {
+    [] -> (),
+    [first, ..rest] -> { process.out[proc]("hello " ++ first); greet(rest) },
+  }
+
+fn greet_all() -> Unit / {process.read[proc], process.write[proc]} = {
+  let names = process.args[proc]();
+  if len(names) == 0 {
+    process.err[proc]("no one to greet");
+    process.exit[proc](2)
+  } else {
+    greet(names);
+    process.exit[proc](0)
+  }
+}
+
+test "a handled program's lines arrive in order, on the stream each was written to" {
+  with_cell[twin](captured(["ada", "bob"])) { s -> {
+    handle {
+      greet_all()
+    } with {
+      process.args[proc]() -> args_step(cell_get(s)),
+      process.out[proc](t) -> cell_set(s, out_step(cell_get(s), t)),
+      process.err[proc](t) -> cell_set(s, err_step(cell_get(s), t)),
+      process.exit[proc](c) -> cell_set(s, exit_step(cell_get(s), c)),
+    };
+    let c = cell_get(s);
+    assert_eq(c.out, ["hello ada", "hello bob"]);
+    assert_eq(c.err, []);
+    assert_eq(c.code, Some(0))
+  } }
+}
+
+// Dropping the continuation ends the program at the exit, as the host does.
+test "an exit clause without a resume ends the program there" {
+  with_cell[twin](captured([])) { s -> {
+    handle {
+      greet_all();
+      process.out[proc]("after the exit")
+    } with {
+      process.args[proc]() -> args_step(cell_get(s)),
+      process.out[proc](t) -> cell_set(s, out_step(cell_get(s), t)),
+      process.err[proc](t) -> cell_set(s, err_step(cell_get(s), t)),
+      process.exit[proc](c) resume k -> cell_set(s, exit_step(cell_get(s), c)),
+    };
+    let c = cell_get(s);
+    assert_eq(c.out, []);
+    assert_eq(c.err, ["no one to greet"]);
+    assert_eq(c.code, Some(2))
+  } }
+}
+
+test "the twin starts with the arguments and nothing written" {
+  let c = captured(["--verbose"]);
+  assert_eq(args_step(c), ["--verbose"]);
+  assert_eq(c.out, []);
+  assert_eq(c.err, []);
+  assert_eq(c.code, None)
+}
+
+test "the first exit code is the one kept" {
+  let once = exit_step(captured([]), 3);
+  assert_eq(once.code, Some(3));
+  assert_eq(exit_step(once, 4).code, Some(3))
+}
