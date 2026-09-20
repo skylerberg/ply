@@ -5,6 +5,7 @@ mod config;
 mod db;
 mod fs;
 mod pool;
+mod process;
 mod registry;
 mod sched;
 mod signal;

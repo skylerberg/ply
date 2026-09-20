@@ -20,7 +20,7 @@ fn main() -> Unit = assert_eq(greeting(), "hello from ply")
 ```
 
 `ply run hello` evaluates `main`, prints the value it returned (`()`) and exits
-`0`. There is no `print`: output is an effect (§6). The everyday commands are
+`0`. There is no `print`: output is the `std.process` effect (§13.9). The everyday commands are
 `ply check` (parse, resolve, typecheck, infer rows), `ply test` and `ply run`.
 Each takes a `.ply` file or a project root, defaulting to `.`.
 `ply check --types` prints every definition's inferred signature.
@@ -1043,7 +1043,29 @@ records with `Sink` and `event_step`, `enter_step`, `exit_step`, `count_step`,
 `--host` (`E0424`). Handle it over a `Stop` value with `running()`,
 `draining(ms)`, `stopping_step`, `deadline_step` and `has_time_for`.
 
-### 13.9 `std.fs`
+### 13.9 `std.process`
+
+```ply
+pub nondet effect process {
+  read args[p]()             -> List<String>
+  write out[p](text: String) -> Unit
+  write err[p](text: String) -> Unit
+  write exit[p](code: Int)   -> Unit
+}
+```
+
+The label names the process, `[proc]` by convention. `args` answers what
+followed `--` on the `ply run` command line, `out` and `err` each write one
+line, and `exit` ends the program there: nothing after it runs, no value is
+printed, and `ply run` exits with the code (`0` to `125`, else `E0502`). It is
+bound only by `ply run --host`; `ply test` withholds it, even with `--host`
+(`E0424`). Under `ply run --json` the lines `out` writes go to stderr, so stdout
+still carries the one object. Handle it over a `Captured` value: `captured(args)`,
+`args_step`, `out_step`, `err_step` and `exit_step` keep each line and the first
+exit code; a clause `process.exit[proc](c) resume k -> ...` that never calls `k`
+ends the handled body as the host would.
+
+### 13.10 `std.fs`
 
 ```ply
 pub nondet effect fs {
@@ -1067,7 +1089,7 @@ the read bound: `E0453`. Different roots do not conflict. Reads are whole-file,
 `mem_size`, `mem_create_dir`, `mem_remove`, `mem_rename`, `mem_modified`); a
 test imports both `std.fs` and `std.fs (fs)` to name the module and the effect.
 
-### 13.10 `std.hash`
+### 13.11 `std.hash`
 
 `pub fn blake3(input: Bytes) -> Bytes` answers 32 bytes. It is written in Ply
 and slow; use it for small inputs.
@@ -1076,7 +1098,9 @@ and slow; use it for small inputs.
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
 handler that would serve it. With `--host`, a test that reaches a bound handler
-always runs and is never cached. All flags below require `--host`.
+always runs and is never cached. `std.signal` and `std.process` are bound only
+by `ply run --host`; `ply test --host` withholds them (`E0424`). All flags
+below require `--host`.
 
 `ply hosts` lists every bindable operation (`effect.op[resource]`, one row per
 resource label the program uses) with its handler, determinism,
@@ -1141,6 +1165,7 @@ stdout.
 | 1 | a test failed, or `main` raised |
 | 2 | the program did not run: bad path, syntax or type error |
 | 3 | the drain deadline expired with requests in flight |
+| *n* | `process.exit[p](n)` under `ply run --host`: the program's own, `0` to `125` |
 
 Flag groups: *simulation* (§9), *host* (`--host` and §14's flags except trace
 and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
@@ -1151,7 +1176,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | --- | --- |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases; with `--types`, effect sets and provenance), `--no-incremental` |
 | `ply test [path]` | `--filter`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--trace auto\|always\|never`, `--backend`, `--profile`, `--std`, host, simulation |
-| `ply run [path]` | `--seed` (one interleaving always), `--timeout` (default no bound), `--backend`, `--profile`, host, trace, drain; a `.plyx` path runs the artifact |
+| `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--timeout` (default no bound), `--backend`, `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`, `--backend`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, `--backend`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE`, `--config-schema`, `--db-schema`, `--digest`, `--diff OLD.plyx` |
@@ -1279,6 +1304,7 @@ the message.
 | `E0452` | path leaves its root |
 | `E0453` | whole-file read over the bound |
 | `E0454` | `--fs` root that is not a directory |
+| `E0455` | the program asked to exit with a code |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | ran past its time budget |
@@ -1303,9 +1329,9 @@ the message.
   `unsafe` or FFI.
 * Specs cannot name mutable state. Cycles are not collected, and a task never
   moves between OS threads.
-* No file handles, streaming, recursive walk, permissions, `stdin`/`stdout` or
-  `argv`; no cancellation or backpressure; no migrations or live schema check;
-  HTTP/1.1 only; no authentication framework.
+* No file handles, streaming, recursive walk, permissions or `stdin`; no
+  cancellation or backpressure; no migrations or live schema check; HTTP/1.1
+  only; no authentication framework.
 
 Sharp edges: `x.f(y)` with a bare variable `x` is a perform; a missing handler
 clause fails at run time; record update needs a locally readable shape; two
