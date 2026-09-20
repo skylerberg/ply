@@ -82,7 +82,7 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
             // A half-written entry belongs to a running process about to rename it.
             if path
                 .extension()
-                .is_some_and(|x| x == "tmp" || x == "rtmp" || x == "utmp")
+                .is_some_and(|x| x == "tmp" || x == "rtmp" || x == "utmp" || x == "otmp")
             {
                 continue;
             }
@@ -100,6 +100,7 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
     };
     walk(root);
     walk(&root.join("emit"));
+    walk(&root.join("obj"));
     if total <= budget {
         return 0;
     }

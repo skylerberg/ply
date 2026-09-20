@@ -15,8 +15,8 @@ pub mod upgrade;
 
 pub use build::{Native, Produced, build, load_unit, produce, served};
 pub use exports::{Exports, Unserved};
-pub use load::{Library, compile_and_load};
-pub use prelude::{HELPERS, PRELUDE, pointer_name, runtime_decls};
+pub use load::{Library, Parts, compile_and_load, split};
+pub use prelude::{HELPERS, PRELUDE, RUNTIME_MARK, pointer_name, runtime_header, runtime_object};
 pub use toolchain::{Profile, select as select_profile};
 
 /// What the emitter refused, and where.

@@ -189,20 +189,34 @@ helpers![
     ("rt_tick", 0, false),
 ];
 
-/// The declarations, function-pointer table and exported binder, all generated from [`HELPERS`].
-pub fn runtime_decls() -> String {
-    let mut out = String::from("\n/* --- the runtime, bound at load --- */\n");
+/// The line that opens the runtime's definitions: everything from it on is the unit's tail, the
+/// one translation unit that defines what [`runtime_header`] declares.
+pub const RUNTIME_MARK: &str = "/* --- the runtime, bound at load --- */";
+
+/// A helper's C return type and parameter list.
+fn signature(h: &Helper) -> (&'static str, String) {
+    let ret = if h.answers { "Word" } else { "void" };
+    let mut params = String::from("PlyCtx*");
+    for _ in 0..h.args {
+        params.push_str(", Word");
+    }
+    (ret, params)
+}
+
+/// What every translation unit of a unit opens with after [`PRELUDE`]: the helper pointers and
+/// singletons declared, and `ply_dec` over them. Declared, not defined, so a unit compiled in
+/// parts binds one table rather than one per part.
+pub fn runtime_header() -> String {
+    let mut out = String::from("\n/* --- the runtime, declared --- */\n");
     for h in HELPERS {
-        let ret = if h.answers { "Word" } else { "void" };
-        let mut params = String::from("PlyCtx*");
-        for _ in 0..h.args {
-            params.push_str(", Word");
-        }
+        let (ret, params) = signature(h);
         out.push_str(&format!(
-            "static {ret} (*{})({params});\n",
+            "extern {ret} (*{})({params});\n",
             pointer_name(h.name)
         ));
     }
+    // Singletons are heap addresses: bound at load, not baked in, or cached objects break.
+    out.push_str("extern Word ply_true, ply_false, ply_unit;\n");
     // Trap: `rt_dec` frees unconditionally (it is `release_last`); only call it once `rc == 1`.
     out.push_str(
         "\nstatic inline void ply_dec(PlyCtx *ctx, Word w) {\n\
@@ -213,18 +227,24 @@ pub fn runtime_decls() -> String {
          \x20 rt_dec_p(ctx, w);\n\
          }\n",
     );
-    // Singletons are heap addresses: bound at load, not baked in, or cached objects break.
-    out.push_str("\nstatic Word ply_true, ply_false, ply_unit;\n");
+    out
+}
+
+/// The runtime's definitions and the exported binders that fill them, generated from
+/// [`HELPERS`]; the unit's tail holds them once.
+pub fn runtime_object() -> String {
+    let mut out = format!("\n{RUNTIME_MARK}\n");
+    for h in HELPERS {
+        let (ret, params) = signature(h);
+        out.push_str(&format!("{ret} (*{})({params});\n", pointer_name(h.name)));
+    }
+    out.push_str("Word ply_true, ply_false, ply_unit;\n");
     out.push_str(
         "void ply_bind_singletons(Word t, Word f, Word u) { ply_true = t; ply_false = f; ply_unit = u; }\n",
     );
     out.push_str("\nvoid ply_bind(void **fns) {\n");
     for (i, h) in HELPERS.iter().enumerate() {
-        let ret = if h.answers { "Word" } else { "void" };
-        let mut params = String::from("PlyCtx*");
-        for _ in 0..h.args {
-            params.push_str(", Word");
-        }
+        let (ret, params) = signature(h);
         out.push_str(&format!(
             "  {} = ({ret} (*)({params}))fns[{i}];\n",
             pointer_name(h.name)
