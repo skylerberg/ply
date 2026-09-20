@@ -29,7 +29,6 @@ A feature earns its place by one of these. Saving keystrokes does not count.
   cannot drift from the compiler.
 - Replace a definition by name, once `ply fmt` exists to print it back.
 - Induction in the prover, so recursive definitions can reach `proved`.
-- Mutation testing and per-definition coverage over the hash index.
 - A shared result cache, so parallel agents and CI never repeat each other.
 - The compiler's own loop: stage-1 emission cached by source digest and incremental per
   definition; the bundle refreshed by CI, not by hand.
