@@ -152,7 +152,7 @@ pub fn decide_and_diagnose(
     let mut spent = 0u32;
     let mut budget = limits.steps;
     let guarded: Vec<(term::TermId, bool)> = guards.iter().map(|g| (*g, true)).collect();
-    let ranges = int_ranges(&mut terms, result_symbol);
+    let ranges = int_ranges(&mut terms, result_symbol, &BTreeSet::new());
 
     // A guard that can raise has no domain, so the obligation is not decided at any tier.
     let (guard_needs, body_needs) = requirements.split_at(guard_requirements);
@@ -253,14 +253,16 @@ fn inconclusive(answer: solve::Answer) -> Option<Reason> {
 }
 
 /// `MIN ≤ t ≤ MAX` for every term that denotes a Ply `Int` whenever it is defined.
+/// Every `Int` atom lies in `i64`, except the `skip`ped ones: a call whose value is in question.
 fn int_ranges(
     terms: &mut term::Terms,
     computed: Option<term::TermId>,
+    skip: &BTreeSet<term::TermId>,
 ) -> Vec<(term::TermId, bool)> {
     let derived = derived_from(terms, computed);
     let mut atoms: Vec<term::TermId> = Vec::new();
     for (id, node) in terms.nodes() {
-        if derived[id] {
+        if derived[id] || skip.contains(&id) {
             continue;
         }
         let atom = match node {
@@ -275,7 +277,14 @@ fn int_ranges(
             atoms.push(id);
         }
     }
+    ranges_of(terms, atoms)
+}
 
+fn ranges_of(
+    terms: &mut term::Terms,
+    atoms: impl IntoIterator<Item = term::TermId>,
+) -> Vec<(term::TermId, bool)> {
+    let atoms: Vec<term::TermId> = atoms.into_iter().collect();
     let min = terms.int_lit(i64::MIN);
     let max = terms.int_lit(i64::MAX);
     let mut out = Vec::with_capacity(atoms.len() * 2);

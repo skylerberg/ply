@@ -127,6 +127,10 @@ pub struct Lowering<'a, 'p> {
     measures: Vec<TermId>,
     /// `f(x̄) == body(x̄)` for each unrolling of a recursive definition.
     equations: Vec<TermId>,
+    /// The `f(x̄)` of each equation.
+    defined: Vec<TermId>,
+    /// Calls of a total definition left as terms.
+    calls: Vec<TermId>,
 }
 
 impl<'a, 'p> Lowering<'a, 'p> {
@@ -151,6 +155,8 @@ impl<'a, 'p> Lowering<'a, 'p> {
             measure: None,
             measures: Vec::new(),
             equations: Vec::new(),
+            defined: Vec::new(),
+            calls: Vec::new(),
         }
     }
 
@@ -172,6 +178,14 @@ impl<'a, 'p> Lowering<'a, 'p> {
 
     pub fn equations(&self) -> &[TermId] {
         &self.equations
+    }
+
+    pub fn defined(&self) -> &[TermId] {
+        &self.defined
+    }
+
+    pub fn calls(&self) -> &[TermId] {
+        &self.calls
     }
 
     pub fn requirements_since(&self, mark: usize) -> &[TermId] {
@@ -768,13 +782,17 @@ impl<'a, 'p> Lowering<'a, 'p> {
             return self.terms.sym(sort);
         }
 
-        self.terms.mk(
+        let call = self.terms.mk(
             Node::App {
                 head,
                 args: lowered,
             },
             sort,
-        )
+        );
+        if matches!(&callee, Callee::Named(name) if self.total.contains(name)) {
+            self.calls.push(call);
+        }
+        call
     }
 
     /// Decided from the code, not the head's term: a local and a same-named definition lower alike.
@@ -899,6 +917,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
             );
             let equation = self.terms.eq(call, out);
             self.equations.push(equation);
+            self.defined.push(call);
         }
         Some(out)
     }
