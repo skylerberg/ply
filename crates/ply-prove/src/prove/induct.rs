@@ -10,7 +10,9 @@
 use super::context::Context;
 use super::lower::{Blocker, Lowering, Measure};
 use super::term::{self, TermId, is_int_type};
-use super::{Goal, Limits, Proof, RuleLog, conjunction, domain_inhabited, int_ranges, run};
+use super::{
+    Goal, Limits, Proof, RuleLog, conjunction, domain_inhabited, int_ranges, ranges_of, run,
+};
 use super::{solve, uninterpreted_sorts};
 use crate::Rule;
 use ply_span::Symbol;
@@ -116,7 +118,7 @@ fn terminating(
         let Some(all) = conjunction(&mut terms, &measures) else {
             continue;
         };
-        let mut assertions = int_ranges(&mut terms, None);
+        let mut assertions = int_ranges(&mut terms, None, &BTreeSet::new());
         assertions.push((all, false));
         let (answer, left) = run(
             &mut terms,
@@ -171,6 +173,7 @@ fn induct_on(
     });
     let body = lowering.lower_root(goal.body, &bound);
     let body_mark = lowering.requirement_mark();
+    let claim_calls = lowering.calls().to_vec();
 
     // The hypothesis: the same claim one step down, its recursive calls left unrolled.
     lowering.drop_assumptions();
@@ -197,6 +200,23 @@ fn induct_on(
     }
     let prior_body = lowering.lower_root(goal.body, &prior);
     let hypothesis_needs = lowering.requirements_since(body_mark).to_vec();
+    // The hypothesis makes values of the calls it reaches; a call it does not reach, and that no
+    // equation defines, is one this induction cannot speak for.
+    let covered: BTreeSet<TermId> = lowering.calls()[claim_calls.len()..]
+        .iter()
+        .copied()
+        .collect();
+    let defined: BTreeSet<TermId> = lowering.defined().iter().copied().collect();
+    if claim_calls
+        .iter()
+        .any(|c| !covered.contains(c) && !defined.contains(c))
+    {
+        declined(
+            blockers,
+            "a remaining call is not one the hypothesis reaches",
+        );
+        return (None, 0);
+    }
 
     let requirements = lowering.requirements().to_vec();
     let equations = lowering.equations().to_vec();
@@ -208,7 +228,8 @@ fn induct_on(
 
     let result_symbol = definition.map(|(symbol, _)| symbol);
     let definition = definition.map(|(symbol, value)| terms.eq(symbol, value));
-    let ranges = int_ranges(&mut terms, result_symbol);
+    let in_question: BTreeSet<TermId> = covered.iter().chain(&defined).copied().collect();
+    let ranges = int_ranges(&mut terms, result_symbol, &in_question);
     let (guard_needs, body_needs) = requirements.split_at(guard_mark);
     let body_needs = &body_needs[..body_mark - guard_mark];
 
@@ -293,6 +314,7 @@ fn induct_on(
     let mut assertions = common;
     assertions.push((step, true));
     assertions.push((hypothesis, true));
+    assertions.extend(ranges_of(&mut terms, covered.iter().copied()));
     assertions.push((claim, false));
     if !settle(
         &mut terms,
