@@ -969,7 +969,7 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value> {
 }
 
 /// `body <name> <n>\n` and then exactly `n` bytes, repeated: the tables in the cache's encoding,
-/// `text\n`, and the C.
+/// `text\n`, and the C. A body whose tables list members is a group's, under its first member.
 fn parse(dump: &str) -> Result<Bodies> {
     let mut out = HashMap::new();
     let bytes = dump.as_bytes();
@@ -995,26 +995,35 @@ fn parse(dump: &str) -> Result<Bodies> {
             bail!("a frame of {n} bytes past the end of the answer");
         }
         let chunk = std::str::from_utf8(&bytes[start..end]).context("a frame that is not UTF-8")?;
-        let answer = match kind {
+        match kind {
             "body" => {
                 let (text, tables) = super::cache::decode(chunk)
                     .ok_or_else(|| anyhow!("`{name}`'s frame does not decode as a body"))?;
-                Answer::Body(text, tables)
+                // A group's one body answers for every member.
+                if tables.members.is_empty() {
+                    out.insert(name.to_string(), Answer::Body(text, tables));
+                } else {
+                    for member in &tables.members {
+                        out.insert(member.clone(), Answer::Body(text.clone(), tables.clone()));
+                    }
+                }
             }
             "refused" => {
                 let (why, handles) = chunk.split_once("\nhandles ").unwrap_or((chunk, ""));
-                Answer::Refused(
-                    why.to_string(),
-                    handles
-                        .split(' ')
-                        .filter(|h| !h.is_empty())
-                        .map(str::to_string)
-                        .collect(),
-                )
+                out.insert(
+                    name.to_string(),
+                    Answer::Refused(
+                        why.to_string(),
+                        handles
+                            .split(' ')
+                            .filter(|h| !h.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                    ),
+                );
             }
             other => bail!("a frame of a kind this seam does not read: {other:?}"),
-        };
-        out.insert(name.to_string(), answer);
+        }
         at = end;
     }
     Ok(out)
