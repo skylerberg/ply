@@ -1080,15 +1080,21 @@ fn every_builtin_is_reachable_by_the_name_it_reports() {
 /// Each builtin's parameter count in the scheme the port's checker binds it to.
 fn prelude_arities() -> std::collections::BTreeMap<String, usize> {
     let mut out = std::collections::BTreeMap::new();
-    for (name, scheme) in
-        ply_codegen::c::producer::builtins().expect("the port publishes its builtins")
-    {
-        let ply_ty::Type::Fn { params, .. } = &scheme.ty else {
+    for builtin in ply_codegen::c::producer::builtins().expect("the port publishes its builtins") {
+        let name = &builtin.name;
+        let ply_ty::Type::Fn { params, .. } = &builtin.scheme.ty else {
             panic!(
                 "`{name}`'s scheme `{}` is not a function",
-                ply_ty::print_scheme(&scheme)
+                ply_ty::print_scheme(&builtin.scheme)
             );
         };
+        assert_eq!(
+            builtin.params.len(),
+            params.len(),
+            "`{name}` is documented with {} parameter names for {} parameters",
+            builtin.params.len(),
+            params.len()
+        );
         let twice = out.insert(name.to_string(), params.len()).is_some();
         assert!(!twice, "the prelude binds `{name}` twice");
     }
