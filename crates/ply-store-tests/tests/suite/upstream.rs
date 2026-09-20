@@ -71,15 +71,15 @@ fn a_pass_recorded_in_one_checkout_is_a_pass_in_another_through_the_upstream() {
     let mut store = Store::open(second.path())
         .unwrap()
         .with_upstream(Some(Upstream::at(shared.path(), true)));
-    assert_eq!(store.get(key(1)), Some(Outcome::Pass));
-    assert_eq!(store.get(key(2)), None, "a failure is never published");
+    assert!(matches!(store.get(key(1)), Some(Outcome::Pass)));
+    assert!(store.get(key(2)).is_none(), "a failure is never published");
     assert_eq!(store.obligation(key(3)), Some(proof()));
     assert_eq!(store.obligation(key(4)), None);
 
     // What was read in is the local cache's own from then on.
     store.flush().unwrap();
     let plain = Store::open(second.path()).unwrap();
-    assert_eq!(plain.get(key(1)), Some(Outcome::Pass));
+    assert!(matches!(plain.get(key(1)), Some(Outcome::Pass)));
 }
 
 #[test]
@@ -118,8 +118,8 @@ fn an_upstream_that_cannot_be_written_is_a_warning_and_not_a_failure() {
         "{}",
         warnings[0].message
     );
-    assert_eq!(
+    assert!(matches!(
         Store::open(mine.path()).unwrap().get(key(6)),
         Some(Outcome::Pass)
-    );
+    ));
 }
