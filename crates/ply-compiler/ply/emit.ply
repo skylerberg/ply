@@ -6,7 +6,7 @@ import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, N
 import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, TypeDefBody, TDAlias, parse, ImportDecl, ImportKind, INames, IModule, IAlias, Binder, SpecClause, SRequires, SEnsures, FnDef)
 import resolve (Mod, Source, Resolved_, Failed, resolve_modules, Resolved, Scope, Binding, ModBind, qualify)
 import derive (expand_derives)
-import infer (pure_definitions)
+import infer (pure_definitions, sccs)
 import exprs (Param, Expr, EHandle, ESimulate, EUnary, EBinary, ELambda, EApp, EIf, EMatch, EBlock, ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EWithCell, EWithRegion, HandleClause, MatchArm, RecField, Stmt, SLet, SExpr)
 import types (MWrite, TypeExpr, TVar, TCon, TRecord)
 import rewrite (expand)
@@ -114,7 +114,9 @@ pub type Em = { out: List<Bytes>, n: Int, conv: List<Conv>, ind: Int, reads: Lis
                 by_root: List<{ root: Bytes, n: Int }>,
                 // Off, every count is held until the entry ends. On: `bound` are locals a slot names, moved only at
                 // a read marked `Owned`; `pinned` are ones a fused loop body may read but never move.
-                release: Bool, pinned: List<Bytes>, bound: List<Bytes> }
+                release: Bool, pinned: List<Bytes>, bound: List<Bytes>,
+                // The full names of the definitions sharing this C function, in case order; empty outside a group.
+                group: List<Bytes> }
 
 // `ret_ty` keeps a record answer's fields so later reads get offsets; `pure` lets a nullary call come from the constant table.
 pub type Def = { name: Bytes, ret: Option<Kind>, ret_ty: Ty, pure: Bool, arity: Int }
@@ -154,13 +156,13 @@ pub type Sink = | ToValue(Bytes) | ToLoop({ state: Bytes, answer: Bytes, stop: I
 
 // Lines are joined once at the end; appending to one string would be quadratic.
 fn line(em: Em, text: Bytes) -> Em =
-  { out: push(em.out, bytes_concat_all([pad(em.ind), text, b"\n"])), n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+  { out: push(em.out, bytes_concat_all([pad(em.ind), text, b"\n"])), n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
 
 fn pad(ind: Int) -> Bytes = if ind <= 0 { b"  " } else { bytes_concat(b"  ", pad(ind - 1)) }
 
-fn indent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind + 1, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+fn indent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind + 1, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
 
-fn outdent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind - 1, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+fn outdent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind - 1, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
 
 // Restoring the node's own `tail` makes an arm a tail again after its scrutinee or condition.
 fn withtail(em: Em, t: Bool) -> Em =
@@ -169,7 +171,7 @@ fn withtail(em: Em, t: Bool) -> Em =
       built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports,
       consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
       builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
-      alias: em.alias, by_root: em.by_root, tail: t, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+      alias: em.alias, by_root: em.by_root, tail: t, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
   }
 
 fn notail(em: Em) -> Em =
@@ -178,14 +180,14 @@ fn notail(em: Em) -> Em =
       built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports,
       consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
       builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
-      alias: em.alias, by_root: em.by_root, tail: false, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+      alias: em.alias, by_root: em.by_root, tail: false, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
   }
 
 // A branch's unboxed temporaries die at its closing brace, so `conv` must be restored after it.
-fn rescope(em: Em, conv: List<Conv>) -> Em = { out: em.out, n: em.n, conv: conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+fn rescope(em: Em, conv: List<Conv>) -> Em = { out: em.out, n: em.n, conv: conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
 
 fn fresh(em: Em) -> { em: Em, name: Bytes } =
-  { em: { out: em.out, n: em.n + 1, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }, name: bytes_concat(b"t", num(em.n + 1)) }
+  { em: { out: em.out, n: em.n + 1, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }, name: bytes_concat(b"t", num(em.n + 1)) }
 
 // The last entry wins: a `let` may shadow a slot an enclosing scope filled.
 fn conv_of(em: Em, slot: Int) -> Option<V> =
@@ -253,7 +255,7 @@ fn with_reads(em: Em, reads: List<Int>) -> Em =
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
     builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
     alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused,
-    deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+    deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
 
 fn with_out(em: Em, out: List<Bytes>) -> Em =
   { out: out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
@@ -261,7 +263,7 @@ fn with_out(em: Em, out: List<Bytes>) -> Em =
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
     builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
     alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused,
-    deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+    deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
 
 fn with_landing(em: Em, landing: Option<Bytes>) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
@@ -269,7 +271,7 @@ fn with_landing(em: Em, landing: Option<Bytes>) -> Em =
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
     builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
     alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused,
-    deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+    deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
 
 fn note_performs(em: Em, eff: Bytes) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
@@ -277,7 +279,7 @@ fn note_performs(em: Em, eff: Bytes) -> Em =
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
     builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
     alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused,
-    deferred: em.deferred, rlocals: em.rlocals, performs: push(em.performs, eff), handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+    deferred: em.deferred, rlocals: em.rlocals, performs: push(em.performs, eff), handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
 
 fn note_handles(em: Em, eff: Bytes) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
@@ -285,7 +287,7 @@ fn note_handles(em: Em, eff: Bytes) -> Em =
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
     builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
     alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused,
-    deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: push(em.handles, eff), landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+    deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: push(em.handles, eff), landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
 
 fn note_deferred(em: Em, d: Deferred) -> Em = note_holder(note_deferred0(em, d), d.name)
 
@@ -296,7 +298,7 @@ fn note_deferred0(em: Em, d: Deferred) -> Em =
     builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
     alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused,
     deferred: push(em.deferred, d), rlocals: push(em.rlocals, d.name),
-    performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+    performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
 
 // A flat record (all widths or `Bool`) built from locals is held back; others are built now, from a reuse token if one fits.
 fn build_record(em: Em, names: List<Bytes>, words: List<Bytes>, kinds: List<Kind>, vals: Option<List<V>>) -> Out = {
@@ -361,7 +363,7 @@ fn note_alias(em: Em, local: Bytes, root: Bytes) -> Em =
     built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports,
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
     builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
-    alias: push(em.alias, { local: local, root: root }), by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+    alias: push(em.alias, { local: local, root: root }), by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
 
 // Charge a slot's reads to the object the local holds, once per (object, slot).
 fn charge(em: Em, slot: Int, local: Bytes) -> Em = {
@@ -375,7 +377,7 @@ fn charge(em: Em, slot: Int, local: Bytes) -> Em = {
       builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
       alias: em.alias,
       by_root: push(push(em.by_root, { root: bytes_concat_all([r, b"#", num(slot)]), n: 0 }),
-                    { root: r, n: count_of(em.reads, slot) }), tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+                    { root: r, n: count_of(em.reads, slot) }), tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
   }
 }
 
@@ -408,7 +410,7 @@ fn poison(em: Em, why: Bytes) -> Em =
   match em.refused {
     Some(_) -> em,
     None -> { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
-      built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: Some(why), deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound },
+      built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: Some(why), deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group },
   }
 
 fn refused(em: Em, why: Bytes) -> Out =
@@ -420,13 +422,13 @@ fn lambda_of(em: Em, sym: Bytes) -> { em: Em, i: Int } =
           match list_at(em.lambdas, i) { Some(x) -> if x == sym { Some(i) } else { acc }, None -> acc }) {
     Some(i) -> { em: em, i: i },
     None -> { em: { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
-                    built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: push(em.lambdas, sym), owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound },
+                    built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: push(em.lambdas, sym), owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group },
               i: len(em.lambdas) },
   }
 
 fn note_call(em: Em, full: Bytes) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
-    built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: push(em.calls, full), refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+    built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: push(em.calls, full), refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
 
 fn spend_made(em: Em, name: Bytes) -> Em =
   { ..em, made: fold(em.made, [], |acc: List<Made>, m: Made| if m.name == name { acc } else { push(acc, m) }) }
@@ -567,8 +569,16 @@ fn owned(em: Em, v: V) -> Out = {
 // when the definition moves; a synthesized node (empty span) has none.
 fn site(em: Em, s: Span) -> Em =
   if s.end <= s.start { em } else {
-    line(em, bytes_concat_all([b"PLY_SITE(ctx, @@r@@, ", num(s.start - em.base), b", ", num(s.end - em.base), b");"]))
+    line(em, bytes_concat_all([b"PLY_SITE(ctx, @@", root_key(em), b"@@, ", num(s.start - em.base), b", ", num(s.end - em.base), b");"]))
   }
+
+// The placeholder the driver resolves to this body's root: a group member's is numbered by its case.
+fn root_key(em: Em) -> Bytes =
+  match position_of(em.group, em.owner) { None -> b"r", Some(i) -> bytes_concat(b"r", num(i)) }
+
+fn position_of(xs: List<Bytes>, x: Bytes) -> Option<Int> =
+  fold(range(0, len(xs)), None, |acc: Option<Int>, i: Int|
+    match acc { Some(_) -> acc, None -> if list_at(xs, i) == Some(x) { Some(i) } else { None } })
 
 fn check(em: Em) -> Em =
   match em.landing {
@@ -720,7 +730,7 @@ fn from_table(em: Em, l: Lit) -> Out = {
 fn const_of(em: Em, l: Lit) -> { em: Em, i: Int } =
   { em: { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads,
           shapes: em.shapes, built: em.built, module: em.module, base: em.base, made: em.made,
-          here: em.here, imports: em.imports, consts: push(em.consts, l), ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound },
+          here: em.here, imports: em.imports, consts: push(em.consts, l), ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group },
     i: len(em.consts) }
 
 // A constructor's tag: this module's own, a qualified one, or one an import brought in bare.
@@ -1394,7 +1404,7 @@ fn builtin_of(em: Em, name: Bytes) -> { em: Em, i: Int } =
                     shapes: em.shapes, built: em.built, module: em.module, base: em.base, made: em.made,
                     here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors,
                     extra: em.extra, lambdas: em.lambdas, owner: em.owner,
-                    builtins: em.builtins, met: push(em.met, name), fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound },
+                    builtins: em.builtins, met: push(em.met, name), fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group },
                i: len(em.met) },
   }
 
@@ -1536,7 +1546,7 @@ fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>
   // Nothing in a lambda's body is a tail, so an update at its end keeps the one-read guard.
   let start = { out: [], n: 0, conv: window, ind: 0, reads: reads, shapes: em.shapes, built: [],
                 module: em.module, base: em.base, made: [], here: em.here, imports: em.imports, consts: em.consts,
-                ctors: em.ctors, extra: b"", lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: [], toks: [], alias: [], by_root: [], tail: false, calls: em.calls, refused: em.refused, deferred: [], rlocals: [], performs: em.performs, handles: em.handles, landing: None, effects: em.effects, release: em.release, pinned: [], bound: [] };
+                ctors: em.ctors, extra: b"", lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: [], toks: [], alias: [], by_root: [], tail: false, calls: em.calls, refused: em.refused, deferred: [], rlocals: [], performs: em.performs, handles: em.handles, landing: None, effects: em.effects, release: em.release, pinned: [], bound: [], group: em.group };
   let charged = fold(window, start, |acc: Em, w: Conv| note_bound(note_holder(charge(acc, w.slot, w.c), w.c), w.c));
   match expr(charged, l.body, []) {
     None -> None,
@@ -1600,7 +1610,7 @@ fn field_of(em: Em, name: Bytes) -> { em: Em, i: Int } =
                     shapes: em.shapes, built: em.built, module: em.module, base: em.base, made: em.made,
                     here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors,
                     extra: em.extra, lambdas: em.lambdas, owner: em.owner,
-                    builtins: em.builtins, met: em.met, fields: push(em.fields, name), released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound },
+                    builtins: em.builtins, met: em.met, fields: push(em.fields, name), released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group },
                i: len(em.fields) },
   }
 
@@ -1616,7 +1626,7 @@ fn built_field(em: Em, local: Bytes, name: Bytes) -> Option<V> =
 
 fn remember_built(em: Em, local: Bytes, names: List<Bytes>, vals: List<V>) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
-    built: push(em.built, { local: local, names: names, vals: vals }), module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+    built: push(em.built, { local: local, names: names, vals: vals }), module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
 
 fn shape_of(em: Em, names: List<Bytes>) -> { em: Em, i: Int } =
   match fold(range(0, len(em.shapes)), None, |acc: Option<Int>, i: Int|
@@ -1626,7 +1636,7 @@ fn shape_of(em: Em, names: List<Bytes>) -> { em: Em, i: Int } =
           }) {
     Some(i) -> { em: em, i: i },
     None -> { em: { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads,
-                    shapes: push(em.shapes, names), built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound },
+                    shapes: push(em.shapes, names), built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group },
               i: len(em.shapes) },
   }
 
@@ -1653,14 +1663,14 @@ fn note_tok(em: Em, w: Int) -> Em =
       built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports,
       consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
       builtins: em.builtins, met: em.met, fields: em.fields, released: em.released,
-      toks: push(em.toks, w), alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+      toks: push(em.toks, w), alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
   }
 
 fn note_released(em: Em, root: Bytes) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
     built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports,
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
-    builtins: em.builtins, met: em.met, fields: em.fields, released: push(em.released, root), toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+    builtins: em.builtins, met: em.met, fields: em.fields, released: push(em.released, root), toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
 
 fn count_of(reads: List<Int>, slot: Int) -> Int =
   fold(reads, 0, |acc: Int, s: Int| if s == slot { acc + 1 } else { acc })
@@ -1912,7 +1922,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                             shapes: sub_out.shapes, built: e.built, module: e.module, base: e.base, made: e.made,
                             here: e.here, imports: e.imports, consts: sub_out.consts, ctors: e.ctors,
                             extra: bytes_concat_all([e.extra, sub_out.text, sub_out.extra]), lambdas: sub_out.lambdas,
-                            owner: e.owner, builtins: e.builtins, met: sub_out.met, fields: sub_out.fields, released: e.released, toks: e.toks, alias: e.alias, by_root: e.by_root, tail: e.tail, calls: sub_out.calls, refused: sub_out.refused, deferred: e.deferred, rlocals: e.rlocals, performs: sub_out.performs, handles: sub_out.handles, landing: e.landing, effects: e.effects, release: e.release, pinned: e.pinned, bound: e.bound };
+                            owner: e.owner, builtins: e.builtins, met: sub_out.met, fields: sub_out.fields, released: e.released, toks: e.toks, alias: e.alias, by_root: e.by_root, tail: e.tail, calls: sub_out.calls, refused: sub_out.refused, deferred: e.deferred, rlocals: e.rlocals, performs: sub_out.performs, handles: sub_out.handles, landing: e.landing, effects: e.effects, release: e.release, pinned: e.pinned, bound: e.bound, group: e.group };
               let o = bind(grown, KBoxed, bytes_concat_all([
                 b"rt_closure_p(ctx, @@l", num(entry.i), b"@@, ", num(l.params),
                 b", (Word)(intptr_t)", arr.name, b", ", num(len(l.caps)), b")"]));
@@ -2160,6 +2170,12 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                     },
                   }
                 }
+                else if em.tail && em.landing == None && group_case(em, fv.name, len(a.args)) != None {
+                  match group_case(em, fv.name, len(a.args)) {
+                    None -> None,
+                    Some(which) -> group_tail(note_call(em, qualify(em.module, fv.name)), fv.name, a.args, params, which),
+                  }
+                }
                 else if em.tail && em.landing == None && self_tail_leaf(em, fv.name, a.args, params) {
                   self_tail(note_call(em, qualify(em.module, fv.name)), fv.name, a.args, params)
                 }
@@ -2226,7 +2242,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                               built: js.em.built, module: js.em.module, base: js.em.base, made: union_made(tt.made, ee.made),
                               here: js.em.here, imports: js.em.imports, consts: js.em.consts,
                               ctors: js.em.ctors, extra: js.em.extra, lambdas: js.em.lambdas,
-                              owner: js.em.owner, builtins: js.em.builtins, met: js.em.met, fields: js.em.fields, released: js.em.released, toks: js.em.toks, alias: js.em.alias, by_root: js.em.by_root, tail: js.em.tail, calls: js.em.calls, refused: js.em.refused, deferred: js.em.deferred, rlocals: js.em.rlocals, performs: js.em.performs, handles: js.em.handles, landing: js.em.landing, effects: js.em.effects, release: js.em.release, pinned: js.em.pinned, bound: js.em.bound },
+                              owner: js.em.owner, builtins: js.em.builtins, met: js.em.met, fields: js.em.fields, released: js.em.released, toks: js.em.toks, alias: js.em.alias, by_root: js.em.by_root, tail: js.em.tail, calls: js.em.calls, refused: js.em.refused, deferred: js.em.deferred, rlocals: js.em.rlocals, performs: js.em.performs, handles: js.em.handles, landing: js.em.landing, effects: js.em.effects, release: js.em.release, pinned: js.em.pinned, bound: js.em.bound, group: js.em.group },
                             names, js.names)
                   },
                   None -> {
@@ -2237,7 +2253,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                                       imports: e.em.imports, consts: e.em.consts, ctors: e.em.ctors,
                                       extra: e.em.extra, lambdas: e.em.lambdas, owner: e.em.owner,
                                       builtins: e.em.builtins, met: e.em.met,
-                                      fields: e.em.fields, released: e.em.released, toks: e.em.toks, alias: e.em.alias, by_root: e.em.by_root, tail: e.em.tail, calls: e.em.calls, refused: e.em.refused, deferred: e.em.deferred, rlocals: e.em.rlocals, performs: e.em.performs, handles: e.em.handles, landing: e.em.landing, effects: e.em.effects, release: e.em.release, pinned: e.em.pinned, bound: e.em.bound },
+                                      fields: e.em.fields, released: e.em.released, toks: e.em.toks, alias: e.em.alias, by_root: e.em.by_root, tail: e.em.tail, calls: e.em.calls, refused: e.em.refused, deferred: e.em.deferred, rlocals: e.em.rlocals, performs: e.em.performs, handles: e.em.handles, landing: e.em.landing, effects: e.em.effects, release: e.em.release, pinned: e.em.pinned, bound: e.em.bound, group: e.em.group },
                                     bytes_concat_all([ctype(kt), b" ", j.name, b" = 0;"]));
                     let ta = assigned(decl, t.em, t.text, decl.ind, kt, t.v, j.name);
                     let ea = assigned(ta.em, e.em, e.text, decl.ind, kt, e.v, j.name);
@@ -2253,7 +2269,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                                  built: fin.built, module: fin.module, base: fin.base, made: union_made(ta.made, ea.made),
                                  here: fin.here, imports: fin.imports, consts: fin.consts,
                                  ctors: fin.ctors, extra: fin.extra, lambdas: fin.lambdas,
-                                 owner: fin.owner, builtins: fin.builtins, met: fin.met, fields: fin.fields, released: fin.released, toks: fin.toks, alias: fin.alias, by_root: fin.by_root, tail: fin.tail, calls: fin.calls, refused: fin.refused, deferred: fin.deferred, rlocals: fin.rlocals, performs: fin.performs, handles: fin.handles, landing: fin.landing, effects: fin.effects, release: fin.release, pinned: fin.pinned, bound: fin.bound };
+                                 owner: fin.owner, builtins: fin.builtins, met: fin.met, fields: fin.fields, released: fin.released, toks: fin.toks, alias: fin.alias, by_root: fin.by_root, tail: fin.tail, calls: fin.calls, refused: fin.refused, deferred: fin.deferred, rlocals: fin.rlocals, performs: fin.performs, handles: fin.handles, landing: fin.landing, effects: fin.effects, release: fin.release, pinned: fin.pinned, bound: fin.bound, group: fin.group };
                     Some({ em: if kt == KBoxed { note_holder(fin_em, j.name) } else { fin_em },
                            v: { k: kt, c: j.name, ty: if t.v.ty == e.v.ty { t.v.ty } else { TyOpen } } })
                   },
@@ -2942,7 +2958,7 @@ fn blank(em: Em) -> Em =
   { out: [], n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
     built: em.built, module: em.module, base: em.base, made: em.made, here: em.here, imports: em.imports,
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
-    builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
+    builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound, group: em.group }
 
 // The shape both arms answer when both built a record of the same shape; otherwise the join is one local.
 fn shared_shape(em: Em, a: V, b: V) -> Option<List<Bytes>> =
@@ -3229,6 +3245,39 @@ fn self_tail(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Option<O
     },
   }
 
+// The case a call of `name` with `nargs` arguments jumps to when this body is a group member and so is the callee.
+fn group_case(em: Em, name: Bytes, nargs: Int) -> Option<Int> =
+  if len(em.group) == 0 { None } else {
+    match position_of(em.group, qualify(em.module, name)) {
+      None -> None,
+      Some(i) -> if fold(em.here, false, |acc: Bool, h: Def| acc || (h.name == name && h.arity == nargs)) { Some(i) } else { None },
+    }
+  }
+
+// The widest arity in this body's group: the group function takes that many words.
+fn group_width(em: Em) -> Int =
+  fold(em.here, 0, |acc: Int, h: Def|
+    if h.arity > acc && position_of(em.group, qualify(em.module, h.name)) != None { h.arity } else { acc })
+
+// A call of a group member in tail position: the arguments are duplicated into the group's parameters, what this pass
+// holds is released, and the callee's case restarts through its own prologue. A self call in a group goes this way too.
+fn group_tail(em: Em, name: Bytes, args: List<Code>, params: List<P>, which: Int) -> Option<Out> =
+  match args_one_pass(em, args, params, 0, []) {
+    None -> None,
+    Some(w) -> {
+      let assigned = fold(range(0, len(w.names)), release_at(w.em, 0), |acc: Em, i: Int|
+        match list_at(w.names, i) {
+          None -> acc,
+          Some(nm) -> line(acc, bytes_concat_all([b"p", num(i), b" = ", nm, b";"])),
+        });
+      let zeroed = fold(range(len(w.names), group_width(em)), assigned, |acc: Em, i: Int|
+        line(acc, bytes_concat_all([b"p", num(i), b" = 0;"])));
+      let d = ret_of(em.here, name);
+      Some({ em: line(line(zeroed, bytes_concat_all([b"which = ", num(which), b";"])), b"goto ply_loop;"),
+             v: { k: match d.k { Some(k) -> k, None -> KBoxed }, c: b"0", ty: d.ty } })
+    },
+  }
+
 // Every parameter is opened at entry, in order, read or not: opening lazily writes the temporaries in a different order.
 fn prologue(em: Em, params: List<P>) -> Em =
   fold(range(0, len(params)), em, |acc: Em, i: Int|
@@ -3364,7 +3413,7 @@ pub fn emit_fn(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: L
 // definition's own name (`m.f`, or a root's `m.f#requires#0`), from which its C symbol is derived.
 pub fn emit_fn_full(module: Bytes, base: Int, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>, full: Bytes, params: List<P>, body: Code, effects: List<EffectName>, release: Bool) -> Option<{ text: Bytes, tables: Bytes }> = {
   let name = mangle(full);
-  let start = { out: [], n: 0, conv: [], ind: 0, reads: slots_read(body), shapes: [], built: [], module: module, base: base, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: [], owner: full, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [], tail: true, calls: [], refused: None, deferred: [], rlocals: [], performs: [], handles: [], landing: None, effects: effects, release: release, pinned: [], bound: [] };
+  let start = { out: [], n: 0, conv: [], ind: 0, reads: slots_read(body), shapes: [], built: [], module: module, base: base, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: [], owner: full, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [], tail: true, calls: [], refused: None, deferred: [], rlocals: [], performs: [], handles: [], landing: None, effects: effects, release: release, pinned: [], bound: [], group: [] };
   match emit_body(start, params, body) {
     None -> None,
     Some(o0) -> if o0.em.refused != None { None } else {
@@ -3392,14 +3441,76 @@ pub fn emit_fn_full(module: Bytes, base: Int, here: List<Def>, imports: List<Imp
 
 // Why a body was refused, or nothing when it was emitted.
 pub fn emit_fn_why(module: Bytes, base: Int, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>, full: Bytes, params: List<P>, body: Code, effects: List<EffectName>, release: Bool) -> Option<Bytes> = {
-  let start = { out: [], n: 0, conv: [], ind: 0, reads: slots_read(body), shapes: [], built: [], module: module, base: base, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: [], owner: full, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [], tail: true, calls: [], refused: None, deferred: [], rlocals: [], performs: [], handles: [], landing: None, effects: effects, release: release, pinned: [], bound: [] };
+  let start = { out: [], n: 0, conv: [], ind: 0, reads: slots_read(body), shapes: [], built: [], module: module, base: base, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: [], owner: full, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [], tail: true, calls: [], refused: None, deferred: [], rlocals: [], performs: [], handles: [], landing: None, effects: effects, release: release, pinned: [], bound: [], group: [] };
   match emit_body(start, params, body) {
     None -> Some(b"refused without a reason"),
     Some(o) -> o.em.refused,
   }
 }
 
-// Five tables, then the calls, each as a count and one entry per line; a constant is its tag and its bytes in hex.
+// One definition of a group: its full name, where its source starts, and its lowered body.
+pub type Member = { full: Bytes, base: Int, params: List<P>, body: Code }
+
+// A tail-recursive group as one C function: `which` picks the member's case, the loop label sits before the switch, and
+// each case opens its own parameters, so a jump to any member restarts through that member's prologue. Every member's
+// own symbol is a wrapper passing its case, and the group's tables list the members its one body serves.
+pub fn emit_group_full(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>,
+                       members: List<Member>, effects: List<EffectName>, release: Bool) -> Option<{ text: Bytes, tables: Bytes }> = {
+  let names = map(members, |m: Member| m.full);
+  let first = match list_at(members, 0) { Some(m) -> m.full, None -> b"" };
+  let gname = bytes_concat(b"ply__group_", mangle(first));
+  let width = fold(members, 0, |acc: Int, m: Member| if len(m.params) > acc { len(m.params) } else { acc });
+  let start: Em = { out: [], n: 0, conv: [], ind: 0, reads: [], shapes: [], built: [], module: module, base: 0, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: [], owner: first, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [], tail: true, calls: [], refused: None, deferred: [], rlocals: [], performs: [], handles: [], landing: None, effects: effects, release: release, pinned: [], bound: [], group: names };
+  match group_cases(start, members, 0) {
+    None -> None,
+    Some(em) -> if em.refused != None { None } else {
+      let sig = bytes_concat_all([b"static Word ", gname, b"(PlyCtx *ctx, int which",
+        fold(range(0, width), b"", |acc: Bytes, i: Int| bytes_concat_all([acc, b", Word p", num(i)])), b") {\n"]);
+      let toks = fold(sorted_widths(em.toks), b"", |acc: Bytes, w: Int| bytes_concat_all([acc, b"  Word tok", num(w), b" = 0;\n"]));
+      let decls = fold(em.rlocals, b"", |acc: Bytes, r: Bytes| bytes_concat_all([acc, b"  Word ", r, b" = 0;\n"]));
+      let wrappers = fold(range(0, len(members)), b"", |acc: Bytes, i: Int|
+        match list_at(members, i) { Some(m) -> bytes_concat(acc, group_wrapper(gname, i, m, width)), None -> acc });
+      Some({ text: bytes_concat_all([sig, fuel_head(), toks, decls,
+               b"  ply_loop: if ((++ctx->ticks & 4095) == 0) { rt_tick_p(ctx); if (ctx->failed) return 0; }\n",
+               b"  switch (which) {\n", bytes_join(em.out, b""), b"  }\n  return 0;\n}\n", wrappers, em.extra]),
+             tables: encode_tables(em, gname) })
+    },
+  }
+}
+
+// Each member's case: its own window over the shared temporaries and tables, closed by its return.
+fn group_cases(em: Em, members: List<Member>, i: Int) -> Option<Em> =
+  if i >= len(members) { Some(em) } else {
+    match list_at(members, i) {
+      None -> None,
+      Some(m) -> {
+        let opened: Em = indent(line(em, bytes_concat_all([b"case ", num(i), b": {"])));
+        let entered: Em = { ..opened, conv: [], reads: slots_read(m.body), built: [], made: [], released: [], alias: [], by_root: [],
+                            deferred: [], pinned: [], bound: [], tail: true, landing: None, owner: m.full, base: m.base };
+        match expr(prologue(entered, m.params), m.body, m.params) {
+          None -> None,
+          Some(o) -> {
+            let w = returned(o.em, o.v);
+            let closed = line(w.em, bytes_concat_all([b"ctx->fuel += 1; return ", w.c, b";"]));
+            group_cases(line(outdent(closed), b"}"), members, i + 1)
+          },
+        }
+      },
+    }
+  }
+
+fn group_wrapper(gname: Bytes, which: Int, m: Member, width: Int) -> Bytes = {
+  let name = mangle(m.full);
+  let n = len(m.params);
+  bytes_concat_all([
+    b"Word ply_", name, b"(PlyCtx *ctx", fold(range(0, n), b"", |acc: Bytes, i: Int| bytes_concat_all([acc, b", Word p", num(i)])), b") {\n",
+    b"  return ", gname, b"(ctx, ", num(which),
+    fold(range(0, width), b"", |acc: Bytes, i: Int| bytes_concat(acc, if i < n { bytes_concat(b", p", num(i)) } else { b", 0" })), b");\n}\n",
+    b"Word ply_", name, b"_entry(PlyCtx *ctx, const Word *args) {\n  return ply_", name,
+    b"(ctx", fold(range(0, n), b"", |acc: Bytes, i: Int| bytes_concat_all([acc, b", args[", num(i), b"]"])), b");\n}\n"])
+}
+
+// Five tables, the calls, the effects and the members, each as a count and one entry per line; a constant is its tag and its bytes in hex.
 fn encode_tables(em: Em, owner: Bytes) -> Bytes =
   bytes_concat_all([
     counted(b"consts", map(em.consts, |l: Lit| match l {
@@ -3421,7 +3532,8 @@ fn encode_tables(em: Em, owner: Bytes) -> Bytes =
     counted(b"lambdas", em.lambdas),
     counted(b"calls", em.calls),
     counted(b"performs", em.performs),
-    counted(b"handles", em.handles)])
+    counted(b"handles", em.handles),
+    counted(b"members", em.group)])
 
 // A negative pattern literal's text runs from its `-`, across any space written after it.
 fn unspaced(s: Bytes) -> Bytes =
@@ -3465,6 +3577,48 @@ test "a self call in tail position restarts the body instead of nesting" {
   assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None, None]);
   assert_eq(map(out, |e: Emitted| bytes_index_of(e.text, b"ply_loop: if") != None), [true, true, true, false, false]);
   assert_eq(map(out, |e: Emitted| bytes_index_of(e.text, b"goto ply_loop;") != None), [true, true, true, false, false])
+}
+
+test "a tail call into a definition's own recursive group jumps instead of nesting" {
+  let src = bytes_concat_all([
+    b"fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\n",
+    b"fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }\n",
+    b"fn parity(n: Int) -> Bool = even(n)\n",
+    b"fn count(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { count(n - 1, acc + n) }\n"]);
+  let out = emit_all_in(b"m", [], [], src, true);
+  assert_eq(map(out, |e: Emitted| e.name), [b"m.even", b"m.parity", b"m.count"]);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None]);
+  let group = match list_at(out, 0) { Some(e) -> e, None -> { name: b"", text: b"", tables: b"", why: None, handles: [] } };
+  assert_eq(bytes_index_of(group.tables, b"members 2\nm.even\nm.odd\n") != None, true);
+  assert_eq(bytes_index_of(group.text, b"static Word ply__group_m_even(PlyCtx *ctx, int which, Word p0) {") != None, true);
+  assert_eq(bytes_index_of(group.text, b"ply_loop: if") != None, true);
+  assert_eq(bytes_index_of(group.text, b"which = 1;\n") != None, true);
+  assert_eq(bytes_index_of(group.text, b"which = 0;\n") != None, true);
+  assert_eq(bytes_index_of(group.text, b"goto ply_loop;") != None, true);
+  assert_eq(bytes_index_of(group.text, b"Word ply_m_odd(PlyCtx *ctx, Word p0) {\n  return ply__group_m_even(ctx, 1, p0);") != None, true);
+  assert_eq(bytes_index_of(group.text, b"Word ply_m_even_entry(PlyCtx *ctx, const Word *args)") != None, true);
+  assert_eq(bytes_index_of(group.text, b"PLY_SITE(ctx, @@r@@") != None, false);
+  // A caller outside the group calls a member's own symbol, and a self loop outside a group keeps its label.
+  let parity = match list_at(out, 1) { Some(e) -> e, None -> group };
+  assert_eq(bytes_index_of(parity.text, b"ply_m_even(ctx, ") != None, true);
+  assert_eq(bytes_index_of(parity.text, b"ply_loop") != None, false);
+  let count = match list_at(out, 2) { Some(e) -> e, None -> group };
+  assert_eq(bytes_index_of(count.text, b"ply_loop: if") != None, true);
+  assert_eq(bytes_index_of(count.text, b"which = ") != None, false);
+  assert_eq(bytes_index_of(count.tables, b"members 0\n") != None, true)
+}
+
+test "a cycle whose member holds a handle, or whose calls are not in tail position, is emitted per definition" {
+  let src = bytes_concat_all([
+    b"fn a(n: Int) -> Int = if n == 0 { 0 } else if n == 1 { handle { b(0) } with { clock.now() -> 7, } } else { b(n - 1) }\n",
+    b"fn b(n: Int) -> Int = if n == 0 { clock.now() } else { a(n - 1) }\n",
+    b"fn c(n: Int) -> Int = if n == 0 { 0 } else { 1 + d(n - 1) }\n",
+    b"fn d(n: Int) -> Int = if n == 0 { 0 } else { c(n - 1) }\n"]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
+  assert_eq(map(out, |e: Emitted| e.name), [b"m.a", b"m.b", b"m.c", b"m.d"]);
+  assert_eq(map(out, |e: Emitted| e.why == None), [true, true, true, true]);
+  assert_eq(map(out, |e: Emitted| bytes_index_of(e.tables, b"members 2") != None), [false, false, false, false]);
+  assert_eq(map(out, |e: Emitted| bytes_index_of(e.text, b"ply__group_") != None), [false, false, false, false])
 }
 
 test "a form this port does not reach is refused" {
@@ -3595,17 +3749,25 @@ fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: Li
                             arity: len(d.params) }),
       _ -> acc,
     });
-  let walked = fold(x.module.items, { out: [], tests: 0, laws: 0 }, |acc: Walk, it: Item|
+  let fns = fold(x.module.items, [], |acc: List<Prepared>, it: Item|
+    match it { IFn(d) -> push(acc, prepare(module, aliases, others, wanted, d)), _ -> acc });
+  let groups = tail_groups(module, here, fns);
+  let walked = fold(x.module.items, { out: [], tests: 0, laws: 0, fns: 0 }, |acc: Walk, it: Item|
     match it {
       IFn(d) -> {
-        let names = map(d.params, |p: Param| p.name.name);
-        let kinds = map(d.params, |p: Param| param_kind_with(aliases, others, p.ty));
-        let known = fold(kinds, true, |acc: Bool, k: Option<{ k: Kind, ty: Ty }>| acc && k != None);
-        let full = qualify(module, d.name.name);
-        let out = if !wants(wanted, full) { acc.out } else {
-          push(acc.out, root_emitted(module, d.span.start, here, imports, ctors, builtins, effects, release, full, names, params_of(names, kinds), known, d.body))
+        let p = match list_at(fns, acc.fns) { Some(q) -> q, None -> prepare(module, aliases, others, wanted, d) };
+        let out = match group_of(groups, acc.fns) {
+          None -> if !wants(wanted, p.full) { acc.out } else {
+            push(acc.out, emitted_from(module, p.base, here, imports, ctors, builtins, effects, release, p.full, p.ps, p.known, p.body, p.code))
+          },
+          // The group is emitted where its first member stands; the others are its cases.
+          Some(g) -> if list_at(g, 0) != Some(acc.fns) { acc.out } else {
+            fold(group_emitted(module, here, imports, ctors, builtins, effects, release,
+                               map(g, |i: Int| match list_at(fns, i) { Some(q) -> q, None -> p })),
+                 acc.out, |a: List<Emitted>, e: Emitted| push(a, e))
+          },
         };
-        clause_roots({ out: out, tests: acc.tests, laws: acc.laws }, d, names, kinds, module, here, imports, ctors, builtins, effects, release, aliases, others, wanted)
+        clause_roots({ out: out, tests: acc.tests, laws: acc.laws, fns: acc.fns + 1 }, d, p.names, p.kinds, module, here, imports, ctors, builtins, effects, release, aliases, others, wanted)
       },
       // A test is a nullary root named by its place among the module's tests.
       ITest(t) -> {
@@ -3613,7 +3775,7 @@ fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: Li
         let out = if !wants(wanted, full) { acc.out } else {
           push(acc.out, root_emitted(module, t.span.start, here, imports, ctors, builtins, effects, release, full, [], [], true, t.body))
         };
-        { out: out, tests: acc.tests + 1, laws: acc.laws }
+        { out: out, tests: acc.tests + 1, laws: acc.laws, fns: acc.fns }
       },
       // A law's guard and body are roots the judge enters with the binders' values.
       ILaw(d) -> {
@@ -3631,7 +3793,7 @@ fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: Li
         { out: if !wants(wanted, part(b".body")) { with_guard } else {
             push(with_guard, root_emitted(module, d.span.start, here, imports, ctors, builtins, effects, release, part(b".body"), names, ps, known, d.body))
           },
-          tests: acc.tests, laws: acc.laws + 1 }
+          tests: acc.tests, laws: acc.laws + 1, fns: acc.fns }
       },
       _ -> acc,
     });
@@ -3641,7 +3803,109 @@ fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: Li
 // `why` is the refusal's reason, and then `text` and `tables` are empty.
 pub type Emitted = { name: Bytes, text: Bytes, tables: Bytes, why: Option<Bytes>, handles: List<Bytes> }
 
-type Walk = { out: List<Emitted>, tests: Int, laws: Int }
+type Walk = { out: List<Emitted>, tests: Int, laws: Int, fns: Int }
+
+// A definition lowered once, for grouping and for emission; `code` is `None` when it is not wanted or does not lower.
+type Prepared = { full: Bytes, base: Int, names: List<Bytes>, kinds: List<Option<{ k: Kind, ty: Ty }>>, ps: List<P>,
+                  known: Bool, body: Expr, code: Option<Code> }
+
+fn prepare(module: Bytes, aliases: List<Alias>, others: List<ModAliases>, wanted: Option<Map<Bytes, Bool>>, d: FnDef) -> Prepared = {
+  let names = map(d.params, |p: Param| p.name.name);
+  let kinds = map(d.params, |p: Param| param_kind_with(aliases, others, p.ty));
+  let known = fold(kinds, true, |acc: Bool, k: Option<{ k: Kind, ty: Ty }>| acc && k != None);
+  let full = qualify(module, d.name.name);
+  { full: full, base: d.span.start, names: names, kinds: kinds, ps: params_of(names, kinds), known: known, body: d.body,
+    code: if known && wants(wanted, full) { match lower_fn(names, d.body) { Some(l) -> Some(l.code), None -> None } } else { None } }
+}
+
+// The module's definitions in tail-call cycles of two or more, each cycle's members in module order: a call in tail
+// position of one member from another is an edge, so a group is exactly what can run as one loop. A member holding a
+// `handle` keeps the whole cycle out, and only wanted, lowered definitions have edges, so every member is emitted.
+fn tail_groups(module: Bytes, here: List<Def>, fns: List<Prepared>) -> List<List<Int>> = {
+  let fulls = map(fns, |p: Prepared| p.full);
+  let adj = map(fns, |p: Prepared| match p.code {
+    None -> [],
+    Some(c) -> fold(tail_callees(here, c, []), [], |acc: List<Int>, nm: Bytes|
+      match position_of(fulls, qualify(module, nm)) {
+        None -> acc,
+        Some(i) -> if fold(acc, false, |seen: Bool, j: Int| seen || j == i) { acc } else { push(acc, i) },
+      }),
+  });
+  filter(map(sccs(len(fns), adj), |c: List<Int>| sorted_widths(c)), |c: List<Int>|
+    len(c) >= 2 && fold(c, true, |ok: Bool, i: Int| ok && loops_as_case(fns, i)))
+}
+
+fn loops_as_case(fns: List<Prepared>, i: Int) -> Bool =
+  match list_at(fns, i) {
+    Some(p) -> match p.code { Some(code) -> !has_handle(code), None -> false },
+    None -> false,
+  }
+
+fn group_of(groups: List<List<Int>>, i: Int) -> Option<List<Int>> =
+  fold(groups, None, |acc: Option<List<Int>>, g: List<Int>|
+    if fold(g, false, |seen: Bool, j: Int| seen || j == i) { Some(g) } else { acc })
+
+// The same-module definitions called in tail position, walking the positions `tail` is kept into.
+fn tail_callees(here: List<Def>, c: Code, acc: List<Bytes>) -> List<Bytes> =
+  match c.node {
+    NApp(a) -> match a.func.node {
+      NVar(fv) -> if fv.slot == None && !is_ctor_name(fv.name)
+                     && fold(here, false, |ok: Bool, h: Def| ok || (h.name == fv.name && h.arity == len(a.args)))
+                  { push(acc, fv.name) } else { acc },
+      _ -> acc,
+    },
+    NBinary(b) -> if b.op == b"and" || b.op == b"or" { tail_callees(here, b.rhs, acc) } else { acc },
+    NIf(i) -> tail_callees(here, i.else_branch, tail_callees(here, i.then_branch, acc)),
+    NBlock(b) -> match b.tail { Some(t) -> tail_callees(here, t, acc), None -> acc },
+    NMatch(m) -> fold(m.arms, acc, |a: List<Bytes>, arm: CArm| tail_callees(here, arm.body, a)),
+    _ -> acc,
+  }
+
+fn has_handle(c: Code) -> Bool = {
+  let within = |xs: List<Code>| fold(xs, false, |acc: Bool, x: Code| acc || has_handle(x));
+  match c.node {
+    NHandle(_) -> true,
+    NUnary(u) -> has_handle(u.operand),
+    NBinary(b) -> within([b.lhs, b.rhs]),
+    NField(f) -> has_handle(f.base),
+    NApp(a) -> within(push(a.args, a.func)),
+    NIf(i) -> within([i.cond, i.then_branch, i.else_branch]),
+    NBlock(b) -> {
+      let tail = match b.tail { Some(t) -> [t], None -> [] };
+      within(fold(b.stmts, tail, |acc: List<Code>, st: CStmt|
+        match st {
+          CLet(l) -> push(acc, l.value),
+          CLetPat(l) -> push(acc, l.value),
+          CDo(d) -> push(acc, d.code),
+        }))
+    },
+    NList(l) -> within(l.items),
+    NRecord(r) -> within(map(r.fields, |f: CField| f.value)),
+    NUpd(u) -> within(push(map(u.sets, |f: CField| f.value), u.base)),
+    NMatch(m) -> within(fold(m.arms, [m.scrutinee], |acc: List<Code>, a: CArm|
+      match a.guard { Some(g) -> push(push(acc, g), a.body), None -> push(acc, a.body) })),
+    NPerform(p) -> within(p.args),
+    NCell(c2) -> within([c2.init, c2.body]),
+    NRegion(r) -> has_handle(r.body),
+    NLambda(l) -> has_handle(l.body),
+    NSim(x) -> has_handle(x.body),
+    _ -> false,
+  }
+}
+
+// A group's one body under its first member's name, or, when a member does not emit, each member on its own.
+fn group_emitted(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>,
+                 effects: List<EffectName>, release: Bool, members: List<Prepared>) -> List<Emitted> = {
+  let ms = fold(members, [], |acc: List<Member>, p: Prepared|
+    match p.code { Some(c) -> push(acc, { full: p.full, base: p.base, params: p.ps, body: c }), None -> acc });
+  let first = match list_at(members, 0) { Some(p) -> p.full, None -> b"" };
+  let whole = if len(ms) == len(members) { emit_group_full(module, here, imports, ctors, builtins, ms, effects, release) } else { None };
+  match whole {
+    Some(c) -> [{ name: first, text: c.text, tables: c.tables, why: None, handles: [] }],
+    None -> map(members, |p: Prepared|
+      emitted_from(module, p.base, here, imports, ctors, builtins, effects, release, p.full, p.ps, p.known, p.body, p.code)),
+  }
+}
 
 fn params_of(names: List<Bytes>, kinds: List<Option<{ k: Kind, ty: Ty }>>) -> List<P> =
   map(range(0, len(names)), |i: Int|
@@ -3653,13 +3917,18 @@ fn params_of(names: List<Bytes>, kinds: List<Option<{ k: Kind, ty: Ty }>>) -> Li
 fn root_emitted(module: Bytes, base: Int, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>,
                 effects: List<EffectName>, release: Bool, full: Bytes,
                 names: List<Bytes>, ps: List<P>, known: Bool, body: Expr) -> Emitted =
-  match if known { lower_fn(names, body) } else { None } {
+  emitted_from(module, base, here, imports, ctors, builtins, effects, release, full, ps, known, body,
+               if known { match lower_fn(names, body) { Some(l) -> Some(l.code), None -> None } } else { None })
+
+fn emitted_from(module: Bytes, base: Int, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>,
+                effects: List<EffectName>, release: Bool, full: Bytes, ps: List<P>, known: Bool, body: Expr, code: Option<Code>) -> Emitted =
+  match code {
     None -> { name: full, text: b"", tables: b"", handles: ast_handles(body, effects),
               why: Some(if known { b"a body the lowering does not reach" } else { b"a parameter with no written type" }) },
-    Some(l) -> match emit_fn_full(module, base, here, imports, ctors, builtins, full, ps, l.code, effects, release) {
-      None -> { name: full, text: b"", tables: b"", handles: walk_handles(l.code, effects),
-                why: emit_fn_why(module, base, here, imports, ctors, builtins, full, ps, l.code, effects, release) },
-      Some(c) -> { name: full, text: c.text, tables: c.tables, why: None, handles: [] },
+    Some(c) -> match emit_fn_full(module, base, here, imports, ctors, builtins, full, ps, c, effects, release) {
+      None -> { name: full, text: b"", tables: b"", handles: walk_handles(c, effects),
+                why: emit_fn_why(module, base, here, imports, ctors, builtins, full, ps, c, effects, release) },
+      Some(o) -> { name: full, text: o.text, tables: o.tables, why: None, handles: [] },
     },
   }
 
@@ -3694,7 +3963,7 @@ fn clause_roots(acc: Walk, d: FnDef, names: List<Bytes>, kinds: List<Option<{ k:
           },
         },
       });
-  { out: walked.out, tests: acc.tests, laws: acc.laws }
+  { out: walked.out, tests: acc.tests, laws: acc.laws, fns: acc.fns }
 }
 
 fn concat_effects(a: List<EffectName>, b: List<EffectName>) -> List<EffectName> =
