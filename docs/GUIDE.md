@@ -34,7 +34,12 @@ file.
 
 **The cache.** `.ply-cache/` at the root holds the front-end, result and
 obligation caches and the review baseline. It is safe to delete
-(`ply cache clear`); add it to `.gitignore`.
+(`ply cache clear`); add it to `.gitignore`. `PLY_CACHE_UPSTREAM=DIR` names a
+second cache shared between checkouts and machines, a directory on any storage
+they all reach: the passes and discharged obligations found there count here,
+and this run's are published there (`PLY_CACHE_UPSTREAM_READONLY=1` reads
+only). Entries are keyed by content and by the `ply` version, so nothing
+machine-specific is ever shared; `--no-cache` ignores it.
 
 ## 2. Lexical structure
 
