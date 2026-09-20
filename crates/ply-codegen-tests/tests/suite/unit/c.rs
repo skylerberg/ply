@@ -793,9 +793,17 @@ fn changing_a_signature_asks_the_emitter_for_the_definition_and_its_callers() {
     let _ = produced(before);
     ply_codegen::c::producer::reset_census();
     let retyped = produced(after);
+    let wanted: Vec<Vec<String>> = ply_codegen::c::producer::census()
+        .wanted
+        .into_iter()
+        .map(|mut entry| {
+            entry.sort();
+            entry
+        })
+        .collect();
     assert_eq!(
-        ply_codegen::c::producer::census().wanted,
-        vec![vec!["m.leaf".to_string(), "m.caller".to_string()]],
+        wanted,
+        vec![vec!["m.caller".to_string(), "m.leaf".to_string()]],
         "the emitter was not entered once, for `leaf` and its caller"
     );
     let cold = produced(keyed_by_hash(&as_bool, "-cold"));

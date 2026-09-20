@@ -48,9 +48,9 @@ pub struct Tables {
     pub memo_words: RefCell<HashMap<Identity, Word>>,
     /// Answers of roots called with only memo words, up to [`CALL_MEMO_LIMIT`].
     pub calls: RefCell<HashMap<(Symbol, Vec<Word>), Word>>,
-    /// Each root's definition span in the text the unit runs over, by `root_id` of its name: a
-    /// site is an offset from its start. Never cached: definitions move.
-    pub roots: HashMap<u64, Span>,
+    /// Each root's definition span in the text the unit runs over, by `root_id` of its name and
+    /// sorted by it: a site is an offset from its start. Never cached: definitions move.
+    pub roots: Vec<(u64, Span)>,
 }
 
 /// How many calls of roots over memo words a unit remembers.
@@ -638,7 +638,11 @@ impl Ctx {
     pub fn site(&self) -> Span {
         let Some(root) = u64::try_from(self.site_root)
             .ok()
-            .and_then(|r| self.tables.roots.get(&r))
+            .and_then(|r| {
+                let roots = &self.tables.roots;
+                let at = roots.binary_search_by_key(&r, |(id, _)| *id).ok()?;
+                Some(&roots[at].1)
+            })
             .filter(|r| !r.is_dummy())
         else {
             return Span::DUMMY;

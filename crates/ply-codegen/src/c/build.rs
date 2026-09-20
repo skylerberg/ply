@@ -4,7 +4,7 @@
 use super::Refused;
 use super::exports::Exports;
 use super::load::{Library, compile_and_load};
-use super::tables::{Unit, mangle, memo_symbol, root_id};
+use super::tables::{Positions, Unit, mangle, memo_symbol, root_id};
 use super::{HELPERS, PRELUDE, helper_addresses, runtime_decls};
 use crate::heap::{Heap, Word, mark_immortal};
 use crate::rt::Entry;
@@ -159,13 +159,16 @@ fn emit_all(
         emitted.iter().map(|(_, _, tables)| tables),
         constants.iter().map(|n| memo_symbol(n)),
     );
-    let bodies: Vec<(String, String)> = emitted
-        .into_iter()
-        .map(|(name, text, tables)| {
-            let text = resolve(&text, &tables, root_id(&name), &unit);
-            (name, text)
-        })
-        .collect();
+    let bodies: Vec<(String, String)> = {
+        let positions = unit.positions();
+        emitted
+            .into_iter()
+            .map(|(name, text, tables)| {
+                let text = resolve(&text, &tables, root_id(&name), &positions);
+                (name, text)
+            })
+            .collect()
+    };
     phases.resolve = started.elapsed() - phases.emit;
 
     if std::env::var("PLY_C_REFUSALS").is_ok() {
@@ -442,14 +445,20 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
             ),
         );
     }
+    let mut roots: Vec<(u64, Span)> = taken
+        .iter()
+        .map(|(name, _)| {
+            let span = source.and_then(|s| s.span_of(name)).unwrap_or(Span::DUMMY);
+            (root_id(name), span)
+        })
+        .collect();
+    roots.sort_by_key(|(id, _)| *id);
+    if roots.windows(2).any(|w| w[0].0 == w[1].0) {
+        bail!("two roots of this unit share a site id");
+    }
     let mut tables = tables_of(unit, &ctors);
     tables.functions = functions;
-    for (name, _) in &taken {
-        let span = source.and_then(|s| s.span_of(name)).unwrap_or(Span::DUMMY);
-        if tables.roots.insert(root_id(name), span).is_some() {
-            bail!("two roots of this unit share a site id");
-        }
-    }
+    tables.roots = roots;
     Ok(Native {
         lib,
         entries,
@@ -558,32 +567,37 @@ fn emit_one(
 
 /// Rewrite a body's `@@kN@@` placeholders from its own table positions to the unit's, which
 /// holds everything the body names; `@@r@@` is the body's own root.
-fn resolve(text: &str, tables: &super::tables::Tables, root: u64, unit: &Unit) -> String {
+fn resolve(
+    text: &str,
+    tables: &super::tables::Tables,
+    root: u64,
+    positions: &Positions<'_>,
+) -> String {
     let named = "the unit's tables hold everything its bodies name";
     let consts: Vec<usize> = tables
         .consts
         .iter()
-        .map(|v| unit.constant(v).expect(named))
+        .map(|v| positions.constant(v).expect(named))
         .collect();
     let builtins: Vec<usize> = tables
         .builtins
         .iter()
-        .map(|b| unit.builtin(*b).expect(named))
+        .map(|b| positions.builtin(*b).expect(named))
         .collect();
     let fields: Vec<usize> = tables
         .fields
         .iter()
-        .map(|f| unit.field(f).expect(named))
+        .map(|f| positions.field(f).expect(named))
         .collect();
     let shapes: Vec<u32> = tables
         .shapes
         .iter()
-        .map(|n| unit.shape(n).expect(named))
+        .map(|n| positions.shape(n).expect(named))
         .collect();
     let lambdas: Vec<usize> = tables
         .lambdas
         .iter()
-        .map(|l| unit.lambda(l).expect(named))
+        .map(|l| positions.lambda(l).expect(named))
         .collect();
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -693,6 +707,6 @@ fn tables_of(mut unit: Unit, ctors: &[(Symbol, usize)]) -> Tables {
         memo_values: Default::default(),
         memo_words: Default::default(),
         calls: Default::default(),
-        roots: HashMap::new(),
+        roots: Vec::new(),
     }
 }
