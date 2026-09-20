@@ -712,8 +712,11 @@ law "a credit and a matching debit leave an account exactly as it was"
 
 `proved` covers ground evaluation, enumeration of finite domains up to 4096
 points, linear `Int` arithmetic, case splits, congruence, constructor
-injectivity, unfolding non-recursive definitions and exhaustive interleaving.
-There is no induction.
+injectivity, unfolding non-recursive definitions, exhaustive interleaving, and
+induction on an `Int` binder: a definition that calls only itself with some
+`Int` argument non-negative and smaller at every self call is unrolled, and the
+claim is proved at `n <= 0` and then at `n > 0` from itself at `n - 1`. There is
+no induction over lists.
 
 `ply prove` reports the definitions carrying no obligation, then each
 obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no
@@ -1111,7 +1114,12 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 
 `E` is an error; `W` is a warning and never a fault in your program.
 `ply explain CODE` prints a code's line from this table, and `--all` the whole
-table, from the registry the compiler raises from.
+table, from the registry the compiler raises from. A diagnostic that knows its
+own remedy carries `fixes` under `--json`: each has a `title` and `edits`, and
+an edit replaces the text between `start` and `end` of `file` (an empty range
+inserts) with `text`. Applied as they are, the edits leave a program the
+diagnostic no longer holds for. On a terminal a fix is the `fix:` line under
+the message.
 
 | code | meaning |
 | --- | --- |

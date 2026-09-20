@@ -24,11 +24,12 @@ A feature earns its place by one of these. Saving keystrokes does not count.
   and a `handle` over a function value is judged too.
 - Fewer rules around `?` and record update; where the shape is inferable, infer it.
 - `ply fmt`, from the printer `ply build` already has.
-- Structured fixes on diagnostics: a machine-applicable suggestion and candidates in the JSON.
+- Fixes on every diagnostic that has one: missing types (`E0126`), rows (`E0302`), match arms
+  (`E0205`), near-miss names (`E0101`), literal suffixes (`E0201`), named arguments (`E0123`).
 - `ply doc <name>` and `ply explain <code>`, from the tables the compiler uses, so the guide
   cannot drift from the compiler.
 - Replace a definition by name, once `ply fmt` exists to print it back.
-- Induction in the prover, so recursive definitions can reach `proved`.
+- Induction over lists in the prover, which needs a cons term in its term language.
 - Mutation testing and per-definition coverage over the hash index.
 - The compiler's own loop: stage-1 emission cached by source digest and incremental per
   definition; the bundle refreshed by CI, not by hand.

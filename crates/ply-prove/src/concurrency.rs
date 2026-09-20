@@ -239,7 +239,7 @@ pub fn discharge(
             return totals.finish(if failing.unwrap_or(Failing::Raised) == Failing::Raised {
                 Discharge::Unattempted(Gap::Raised {
                     bindings: search.bindings(point),
-                    diagnostic,
+                    diagnostic: Box::new(diagnostic),
                 })
             } else {
                 Discharge::Refuted(Counterexample {

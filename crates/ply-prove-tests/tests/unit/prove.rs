@@ -116,9 +116,11 @@ fn attempt_for_test(f: &Fixture, label: &str) -> (Decision, Vec<Blocker>) {
 
 #[track_caller]
 fn proof(fixture: &Fixture, label: &str) -> Proof {
-    match attempt(fixture, label) {
-        Decision::Proved(proof) => proof,
-        other => panic!("`{label}` was expected to be proved, got {other:?}"),
+    match attempt_for_test(fixture, label) {
+        (Decision::Proved(proof), _) => proof,
+        (other, blockers) => {
+            panic!("`{label}` was expected to be proved, got {other:?}; blocked by {blockers:?}")
+        }
     }
 }
 
@@ -493,6 +495,12 @@ fn three(x: Int) -> Int = two(x) + 1
 fn four(x: Int) -> Int = three(x) + 1
 
 fn countdown(n: Int) -> Int = if n <= 0 { 0 } else { countdown(n - 1) + 1 }
+fn doubled(n: Int) -> Int = if n <= 0 { 0 } else { doubled(n - 1) + 2 }
+fn forever(n: Int) -> Int = forever(n)
+fn twice_down(n: Int) -> Int = if n <= 0 { 0 } else { twice_down(n - 2) + 2 }
+fn topped(n: Int) -> Int = if n <= 0 { 9223372036854775807 } else { topped(n - 1) + 1 }
+fn ping(n: Int) -> Int = if n <= 0 { 0 } else { pong(n - 1) + 1 }
+fn pong(n: Int) -> Int = if n <= 0 { 0 } else { ping(n - 1) + 1 }
 
 law "three unfoldings suffice" forall (x: Int) where x > 0 && x < 1000
   { three(x) == x + 3 }
@@ -501,6 +509,14 @@ law "four unfoldings do not" forall (x: Int) where x > 0 && x < 1000
 law "a recursive call is a function" forall (n: Int) { countdown(n) == countdown(n) }
 law "a recursive definition steps" forall (n: Int) where n > 0
   { countdown(n) == countdown(n - 1) + 1 }
+law "counting down counts" forall (n: Int) where n >= 0 { countdown(n) == n }
+law "doubling by recursion" forall (n: Int) where n >= 0 && n < 1000000 { doubled(n) == 2 * n }
+law "counting down is not the identity" forall (n: Int) { countdown(n) == n }
+law "counting down is never negative" forall (n: Int) { countdown(n) >= 0 }
+law "a step off the top overflows" forall (n: Int) where n >= 0 { topped(n + 1) == topped(n) + 1 }
+law "a definition that never returns is not a function" forall (n: Int) { forever(n) == forever(n) }
+law "stepping by two counts" forall (n: Int) where n >= 0 { twice_down(n) == n }
+law "a mutual recursion is not unrolled" forall (n: Int) where n >= 0 { ping(n) == n }
 "#;
 
 #[test]
@@ -521,14 +537,45 @@ fn a_non_recursive_definition_unfolds_to_the_stated_depth() {
 }
 
 #[test]
-fn a_recursive_definition_is_never_unfolded() {
+fn a_recursive_definition_is_unfolded_only_by_induction() {
     let f = fixture(CHAIN);
-    not_proved(&f, "a recursive call is a function");
-    not_proved(&f, "a recursive definition steps");
-
     let ctx = f.context();
     assert!(ctx.unfoldable(&Symbol::new("countdown")).is_none());
     assert!(ctx.unfoldable(&Symbol::new("three")).is_some());
+
+    for (label, def) in [
+        ("counting down counts", "countdown"),
+        ("doubling by recursion", "doubled"),
+    ] {
+        let proved = proof(&f, label);
+        assert!(
+            proved
+                .rules
+                .iter()
+                .any(|r| matches!(r, Rule::Induction { binder, def: d }
+                if binder.as_str() == "n" && d.as_str() == def)),
+            "`{label}`: {:?}",
+            proved.rules
+        );
+    }
+    // The base case is where a claim false below zero fails.
+    not_proved(&f, "counting down is not the identity");
+    // The unrolled body adds one to a value only the hypothesis could bound, and these
+    // hypotheses do not bound it, so its overflow stays undecided.
+    not_proved(&f, "a recursive call is a function");
+    not_proved(&f, "a recursive definition steps");
+    not_proved(&f, "counting down is never negative");
+    // At zero the step lands on the top of `Int`.
+    not_proved(&f, "a step off the top overflows");
+}
+
+#[test]
+fn induction_needs_a_decreasing_self_call_and_a_step_of_one() {
+    let f = fixture(CHAIN);
+    not_proved(&f, "a definition that never returns is not a function");
+    not_proved(&f, "a mutual recursion is not unrolled");
+    // The recursion steps by two, and the hypothesis is one step down.
+    not_proved(&f, "stepping by two counts");
 }
 
 const EFFECTFUL: &str = r#"
