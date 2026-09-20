@@ -123,12 +123,12 @@ cp "$here/desk.ply" "$out/desk.ply"
 
 # The twin's row is narrower than the real desk's — `run_memory` discharges every
 # `db` and `trace` atom itself — so the entry point's annotation moves with the
-# call. Both are one line, deliberately: a rewrite that has to match a wrapped
-# annotation stops matching the first time somebody reflows it.
+# call. The match is the annotation's first line, so a reflow of `main`'s row
+# must be carried here.
 if [ "$memory" -eq 1 ]; then
   rewrite "$out/desk.ply" \
-    "fn main() -> Int / {Serving, config.read[server], net.write[conn], net.write[listener]} = {" \
-    "fn main() -> Int / {config.read[server], config.read[credentials], net.write[conn], net.write[listener]} = {"
+    "  / {Serving, config.get[server], net.listen[listener], net.accept[listener], net.close[listener]," \
+    "  / {config.secret[credentials], config.get[server], net.listen[listener], net.accept[listener], net.close[listener],"
   rewrite "$out/desk.ply" "    run(port, count)" "    run_memory(port, key, count)"
 elif [ "$tls" -eq 1 ]; then
   rewrite "$out/desk.ply" "    run(port, count)" \
