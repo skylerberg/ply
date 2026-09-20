@@ -728,6 +728,35 @@ pub fn print_bodies(
     Ok(modules)
 }
 
+const FMT: &str = "front.fmt_dump";
+
+/// `src` formatted. The outer error is the emitter failing; the inner one is the text the
+/// formatter refused, with the diagnostic that stopped it.
+pub fn fmt_source(src: &str) -> Result<Result<String, String>> {
+    ensure_default();
+    let dump = string_answer(FMT, call(FMT, &[Value::bytes(src.as_bytes())])?)?;
+    let mut frames = Cursor::new(dump.as_bytes(), "frame");
+    let (words, payload) = frames
+        .unit()
+        .map_err(|e| anyhow!("`{FMT}`'s answer: {e}"))?;
+    match words[..] {
+        ["formatted", _] => Ok(Ok(std::str::from_utf8(payload)
+            .context("the formatted text")?
+            .to_string())),
+        ["refused", _] => {
+            let mut fields = Cursor::new(payload, "field");
+            let (key, body) = fields
+                .unit()
+                .map_err(|e| anyhow!("`{FMT}`'s refusal: {e}"))?;
+            if key != ["message"] {
+                bail!("`{FMT}`'s refusal holds a `{}` field", key.join(" "));
+            }
+            Ok(Err(String::from_utf8_lossy(body).into_owned()))
+        }
+        _ => bail!("`{FMT}` framed a `{}`", words.join(" ")),
+    }
+}
+
 /// [`FRONT`], pulling in the shipped modules the program imports itself.
 const FRONT_PULLING: &str = "front.front_pulling_std";
 

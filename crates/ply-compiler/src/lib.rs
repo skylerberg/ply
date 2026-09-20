@@ -36,6 +36,9 @@ pub const COSTS: &str = include_str!("../ply/costs.ply");
 
 pub const EMIT: &str = include_str!("../ply/emit.ply");
 
+/// `ply fmt`: the tree printed back as source.
+pub const FMT: &str = include_str!("../ply/fmt.ply");
+
 /// The order is part of the identity: the producer digests these texts in this order.
 pub const MODULES: &[(&str, &str)] = &[
     ("code", CODE),
@@ -44,6 +47,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("diag", DIAG),
     ("emit", EMIT),
     ("exprs", EXPRS),
+    ("fmt", FMT),
     ("front", FRONT),
     ("hash", HASH),
     ("infer", INFER),
