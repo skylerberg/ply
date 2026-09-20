@@ -69,8 +69,15 @@ fn offered_set<'a>(names: &[&'a str]) -> (Vec<&'a str>, String) {
     (offered, fragment)
 }
 
+/// One body's resolved C and the definitions its text names, which its bucket declares.
+struct Body {
+    name: String,
+    text: String,
+    reaches: Vec<String>,
+}
+
 struct Emitted {
-    bodies: Vec<(String, String)>,
+    bodies: Vec<Body>,
     unit: Unit,
     taken: Vec<String>,
     /// The pure nullary roots among `taken`, which the seam memoizes.
@@ -170,13 +177,18 @@ fn emit_all(
         emitted.iter().map(|(_, _, tables)| tables),
         constants.iter().map(|n| memo_symbol(n)),
     );
-    let bodies: Vec<(String, String)> = {
+    let bodies: Vec<Body> = {
         let positions = unit.positions();
         emitted
             .into_iter()
             .map(|(name, text, tables)| {
                 let text = resolve(&text, &tables, &name, &positions);
-                (name, text)
+                let reaches = reaches_of(&name, &tables);
+                Body {
+                    name,
+                    text,
+                    reaches,
+                }
             })
             .collect()
     };
@@ -199,7 +211,7 @@ fn emit_all(
         if want == "*" {
             let mut sizes: Vec<(usize, &str)> = bodies
                 .iter()
-                .map(|(n, b)| (b.lines().count(), n.as_str()))
+                .map(|b| (b.text.lines().count(), b.name.as_str()))
                 .collect();
             sizes.sort_by(|a, b| b.0.cmp(&a.0));
             let lines: usize = sizes.iter().map(|(n, _)| n).sum();
@@ -208,9 +220,9 @@ fn emit_all(
                 eprintln!("  {n:6} lines  {name}");
             }
         }
-        for (name, body) in &bodies {
-            if *name == want {
-                eprintln!("--- {name} ---\n{body}");
+        for body in &bodies {
+            if body.name == want {
+                eprintln!("--- {} ---\n{}", body.name, body.text);
             }
         }
     }
@@ -591,6 +603,20 @@ fn emit_one(loaded: &'static Source, name: &str, ctors_digest: &str, fragment: &
     }
 }
 
+/// The definitions a body's C names: its own (a group's, every member's) and every call; a
+/// lambda's calls are on its owner.
+fn reaches_of(name: &str, tables: &super::tables::Tables) -> Vec<String> {
+    let mut out = tables.calls.clone();
+    if tables.members.is_empty() {
+        out.push(name.to_string());
+    } else {
+        out.extend(tables.members.iter().cloned());
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Rewrite a body's `@@kN@@` placeholders from its own table positions to the unit's, which
 /// holds everything the body names; `@@r@@` is the body's own root, `@@rN@@` a group's `N`th
 /// member.
@@ -653,40 +679,56 @@ fn resolve(
     out
 }
 
-/// One valid translation unit that is also a partition: the header up to the first bucket mark,
-/// a marked bucket per [`bucket_of`] class of names, and from [`super::RUNTIME_MARK`] the tail
-/// that defines the runtime and embeds `exports` ([`Exports::embed`] is `embedded`).
-/// `super::load::split` cuts it back on those marks.
-fn assemble(bodies: &[(String, String)], exports: &Exports, embedded: &str) -> String {
+/// One valid translation unit that is also a partition: the header up to the first bucket mark
+/// (the prelude and the runtime declared, so it moves only with the runtime), a marked bucket
+/// per [`bucket_of`] class of names opening with the prototypes of what its bodies reach, and
+/// from [`super::RUNTIME_MARK`] the tail that defines the runtime and embeds `exports`
+/// ([`Exports::embed`] is `embedded`). `super::load::split` cuts it back on those marks.
+fn assemble(bodies: &[Body], exports: &Exports, embedded: &str) -> String {
+    let arities: HashMap<&str, usize> = exports
+        .taken
+        .iter()
+        .map(|(name, arity)| (name.as_str(), *arity))
+        .collect();
     let mut out = String::from(PRELUDE);
     out.push_str(&runtime_header());
-    out.push_str("\n/* --- prototypes, so a call between two bodies resolves --- */\n");
-    for (name, arity) in &exports.taken {
-        let params = std::iter::once("PlyCtx*".to_string())
-            .chain((0..*arity).map(|_| "Word".to_string()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        out.push_str(&format!("Word {}({params});\n", mangle(name)));
-    }
     out.push('\n');
-    let mut bucketed: Vec<(u8, &str, &str)> = bodies
+    let mut bucketed: Vec<(u8, &Body)> = bodies
         .iter()
-        .map(|(name, text)| (bucket_of(name), name.as_str(), text.as_str()))
+        .map(|body| (bucket_of(&body.name), body))
         .collect();
-    bucketed.sort_by_key(|(bucket, name, _)| (*bucket, *name));
-    let mut open: Option<u8> = None;
-    for (bucket, _, text) in &bucketed {
-        if open != Some(*bucket) {
-            out.push_str(&bucket_mark(*bucket));
-            out.push('\n');
-            open = Some(*bucket);
-        }
-        out.push_str(text);
+    bucketed.sort_by_key(|&(bucket, body)| (bucket, body.name.as_str()));
+    for placed in bucketed.chunk_by(|a, b| a.0 == b.0) {
+        out.push_str(&bucket_mark(placed[0].0));
         out.push('\n');
+        let mut reached: Vec<&str> = placed
+            .iter()
+            .flat_map(|&(_, body)| body.reaches.iter().map(String::as_str))
+            .collect();
+        reached.sort_unstable();
+        reached.dedup();
+        for name in reached {
+            if let Some(arity) = arities.get(name) {
+                out.push_str(&prototype(name, *arity));
+            }
+        }
+        out.push('\n');
+        for &(_, body) in placed {
+            out.push_str(&body.text);
+            out.push('\n');
+        }
     }
     out.push_str(&runtime_object());
     out.push_str(embedded);
     out
+}
+
+fn prototype(name: &str, arity: usize) -> String {
+    let params = std::iter::once("PlyCtx*")
+        .chain(std::iter::repeat_n("Word", arity))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Word {}({params});\n", mangle(name))
 }
 
 fn bind(lib: &Library) -> Result<()> {

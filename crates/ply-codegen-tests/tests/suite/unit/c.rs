@@ -1107,28 +1107,123 @@ pub fn twice(x: Int) -> Int = key(key(x))
 #[test]
 fn editing_one_body_compiles_its_bucket_alone_and_links_the_rest_from_the_cache() {
     let nonce = nonce();
-    // Any name in another bucket than `steady`'s; the assertion would hold trivially with both
-    // bodies in one.
-    let edited = [
-        "changed", "altered", "revised", "turned", "moved", "shifted", "swapped",
-    ]
-    .into_iter()
-    .find(|n| bucket_of(&format!("m.{n}")) != bucket_of("m.steady"))
-    .expect("seven names do not all share `steady`'s bucket");
+    let edited = apart_from_steady();
     let program = |k: u128| {
         format!(
             "pub fn steady(x: Int) -> Int = x + {nonce}\n\
              pub fn {edited}(x: Int) -> Int = x * {k}\n"
         )
     };
+    in_own_cache(|cache| {
+        // Emitted first, so the emitter this thread builds for it lands its own objects in this
+        // cache before the counts are taken, and the unit says how many parts a cold build
+        // compiles.
+        let unit = produced(keyed_by_hash(&program(3), ""));
+        let parts = split(&unit.text).expect("the unit splits on its marks");
+        assert_eq!(parts.buckets.len(), 2, "two names in two buckets");
+        let expected = parts.buckets.len() + 1;
+        let (cold_compiled, cold_objects) = (compiled(), objects(cache));
+        let Some(first) = built(&program(3)) else {
+            return;
+        };
+        assert_eq!(
+            (compiled() - cold_compiled, objects(cache) - cold_objects),
+            (expected, expected),
+            "a cold build compiles every bucket and the runtime's object"
+        );
+        let (before_compiled, before_objects) = (compiled(), objects(cache));
+        let second = built(&program(5)).expect("the compiler ran once already");
+        assert_eq!(
+            (
+                compiled() - before_compiled,
+                objects(cache) - before_objects
+            ),
+            (1, 1),
+            "editing one body compiled more than the bucket holding it"
+        );
+        assert_eq!(
+            answer(&first, "m.steady", 1),
+            answer(&second, "m.steady", 1),
+            "`steady` changed under the edit"
+        );
+        let changed = format!("m.{edited}");
+        assert_eq!(answer(&first, &changed, 4), 12);
+        assert_eq!(
+            answer(&second, &changed, 4),
+            20,
+            "the edit did not reach the image"
+        );
+    });
+}
+
+/// A definition nobody calls, added in a bucket of its own: that bucket compiles, and the
+/// runtime's object, which embeds the exports; the bucket holding the other body is the same
+/// text as before, since no part outside a bucket declares a definition, and is reused.
+#[test]
+fn adding_a_definition_compiles_its_bucket_and_the_runtime_object_alone() {
+    let nonce = nonce();
+    let added = apart_from_steady();
+    let base = format!("pub fn steady(x: Int) -> Int = x + {nonce}\n");
+    let grown = format!("{base}pub fn {added}(x: Int) -> Int = x * 3\n");
+    in_own_cache(|cache| {
+        let steadys = |unit: &ply_codegen::c::Produced| -> String {
+            let parts = split(&unit.text).expect("the unit splits on its marks");
+            parts
+                .buckets
+                .iter()
+                .find(|(id, _)| *id == bucket_of("m.steady"))
+                .map(|(_, text)| text.to_string())
+                .expect("`steady` has a bucket")
+        };
+        let small = produced(keyed_by_hash(&base, ""));
+        let large = produced(keyed_by_hash(&grown, ""));
+        assert_eq!(
+            steadys(&small),
+            steadys(&large),
+            "adding `{added}` changed the bucket holding `steady`"
+        );
+        let Some(first) = built(&base) else {
+            return;
+        };
+        let before = (compiled(), reused(), objects(cache));
+        let second = built(&grown).expect("the compiler ran once already");
+        assert_eq!(
+            (
+                compiled() - before.0,
+                reused() - before.1,
+                objects(cache) - before.2
+            ),
+            (2, 1, 2),
+            "adding a definition compiled more than its bucket and the runtime's object"
+        );
+        assert_eq!(
+            answer(&first, "m.steady", 1),
+            answer(&second, "m.steady", 1),
+            "`steady` changed under the addition"
+        );
+        assert_eq!(answer(&second, &format!("m.{added}"), 4), 12);
+    });
+}
+
+/// A name in another bucket than `m.steady`'s: an assertion about one bucket would hold
+/// trivially with both bodies in one.
+fn apart_from_steady() -> &'static str {
+    [
+        "changed", "altered", "revised", "turned", "moved", "shifted", "swapped",
+    ]
+    .into_iter()
+    .find(|n| bucket_of(&format!("m.{n}")) != bucket_of("m.steady"))
+    .expect("seven names do not all share `steady`'s bucket")
+}
+
+/// Runs `test` over a cache of its own, holding the configuration for writing: the counters
+/// count every build in the process.
+fn in_own_cache(test: impl FnOnce(&std::path::Path)) {
     let dir = tempfile::tempdir().expect("a scratch directory");
-    // Writing: a cache of its own, and the counters count every build in the process.
     let _config = CONFIG.write().unwrap_or_else(|e| e.into_inner());
     let restore = std::env::var("PLY_C_CACHE").ok();
     unsafe { std::env::set_var("PLY_C_CACHE", dir.path()) };
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        one_bucket_recompiles(&program, dir.path())
-    }));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test(dir.path())));
     unsafe {
         match &restore {
             Some(had) => std::env::set_var("PLY_C_CACHE", had),
@@ -1140,80 +1235,133 @@ fn editing_one_body_compiles_its_bucket_alone_and_links_the_rest_from_the_cache(
     }
 }
 
-fn one_bucket_recompiles(program: &dyn Fn(u128) -> String, cache: &std::path::Path) {
-    let compiled =
-        || ply_codegen::c::cache::BUCKETS_COMPILED.load(std::sync::atomic::Ordering::Relaxed);
-    let objects = || -> usize {
-        std::fs::read_dir(cache.join("obj"))
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|e| e.path().extension().is_some_and(|x| x == "o"))
-                    .count()
-            })
-            .unwrap_or(0)
-    };
-    let build = |text: &str| -> Option<Native> {
-        let source = keyed_by_hash(text, "");
-        let names = source.functions();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        match ply_codegen::c::build(source, &refs) {
-            Ok((native, refused)) => {
-                assert!(refused.is_empty(), "{refused:?}");
-                Some(native)
-            }
-            Err(e) if e.to_string().contains("could not run") => None,
-            Err(e) => panic!("{e}"),
+fn compiled() -> usize {
+    ply_codegen::c::cache::BUCKETS_COMPILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn reused() -> usize {
+    ply_codegen::c::cache::BUCKETS_REUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The objects under `cache`'s `obj/`.
+fn objects(cache: &std::path::Path) -> usize {
+    std::fs::read_dir(cache.join("obj"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "o"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Module `m` built over every root of `text`, or nothing where no C compiler runs.
+fn built(text: &str) -> Option<Native> {
+    let source = keyed_by_hash(text, "");
+    let names = source.functions();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    match ply_codegen::c::build(source, &refs) {
+        Ok((native, refused)) => {
+            assert!(refused.is_empty(), "{refused:?}");
+            Some(native)
         }
-    };
-    let answer = |native: &Native, name: &str, x: i64| -> i64 {
-        let entry: ply_codegen::rt::Entry = native.entry(name).expect("compiled");
-        let mut ctx = native.context();
-        ctx.fuel = 10_000;
-        let words = [ply_codegen::heap::imm(x)];
-        let w = unsafe { entry(&mut ctx, words.as_ptr()) };
-        assert_eq!(ctx.failed, 0, "`{name}` raised");
-        ply_codegen::heap::imm_value(w)
-    };
-    // Emitted first, so the emitter this thread builds for it lands its own objects in this cache
-    // before the counts are taken, and the unit says how many parts a cold build compiles.
-    let unit = produced(keyed_by_hash(&program(3), ""));
-    let parts = split(&unit.text).expect("the unit splits on its marks");
-    assert_eq!(parts.buckets.len(), 2, "two names in two buckets");
-    let expected = parts.buckets.len() + 1;
-    let (cold_compiled, cold_objects) = (compiled(), objects());
-    let Some(first) = build(&program(3)) else {
+        Err(e) if e.to_string().contains("could not run") => None,
+        Err(e) => panic!("{e}"),
+    }
+}
+
+fn answer(native: &Native, name: &str, x: i64) -> i64 {
+    let entry: ply_codegen::rt::Entry = native.entry(name).expect("compiled");
+    let mut ctx = native.context();
+    ctx.fuel = 10_000;
+    let words = [ply_codegen::heap::imm(x)];
+    let w = unsafe { entry(&mut ctx, words.as_ptr()) };
+    assert_eq!(ctx.failed, 0, "`{name}` raised");
+    ply_codegen::heap::imm_value(w)
+}
+
+/// A bucket declares what its bodies reach: their own names, a group's members, and every
+/// call, a lambda's and a definition taken as a value included; a definition none of them
+/// reach is not declared there, or anywhere outside a bucket.
+#[test]
+fn a_bucket_declares_what_its_bodies_reach_and_no_other_definition() {
+    let source = r#"
+fn key(x: Int) -> Int = x + 1
+pub fn sum(xs: List<Int>) -> Int = fold(map(xs, key), 0, |a: Int, x: Int| a + x)
+pub fn each(xs: List<Int>) -> List<Int> = map(xs, |x: Int| key(x))
+pub fn twice(x: Int) -> Int = key(key(x))
+pub fn apart(x: Int) -> Int = x * 2
+fn ping(n: Int, acc: Int) -> Int = if n == 0 { acc } else { pong(n - 1, acc + 1) }
+fn pong(n: Int, acc: Int) -> Int = if n == 0 { acc } else { ping(n - 1, acc + 2) }
+pub fn volley(n: Int) -> Int = ping(n, 0)
+"#;
+    let Some(loaded) = tests_support::keyed(source) else {
         return;
     };
+    let produced = numbering_support::produce(loaded, &loaded.functions());
+    let parts = split(&produced.text).expect("the unit splits on its marks");
+    let group = ["m.ping", "m.pong"]
+        .into_iter()
+        .find(|m| {
+            produced
+                .text
+                .contains(&format!("static Word ply__group_{}(", m.replace('.', "_")))
+        })
+        .expect("`ping` and `pong` are a group");
+    // Each body placed, by the name it sits under, with what it calls.
+    let placed: [(&str, &[&str]); 7] = [
+        ("m.key", &[]),
+        ("m.sum", &["m.key"]),
+        ("m.each", &["m.key"]),
+        ("m.twice", &["m.key"]),
+        ("m.apart", &[]),
+        (group, &["m.ping", "m.pong"]),
+        ("m.volley", &["m.ping"]),
+    ];
+    let names = [
+        "m.key", "m.sum", "m.each", "m.twice", "m.apart", "m.ping", "m.pong", "m.volley",
+    ];
+    let prototype = |name: &str| -> String {
+        let (_, arity) = produced
+            .exports
+            .taken
+            .iter()
+            .find(|(n, _)| n == name)
+            .expect("every definition is taken");
+        let params = std::iter::once("PlyCtx*")
+            .chain(std::iter::repeat_n("Word", *arity))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("Word {}({params});\n", mangle(name))
+    };
+    for name in names {
+        assert!(
+            !parts.header.contains(&prototype(name)) && !parts.tail.contains(&prototype(name)),
+            "`{name}` is declared outside the buckets"
+        );
+    }
+    let mut ids: Vec<u8> = placed.iter().map(|(name, _)| bucket_of(name)).collect();
+    ids.sort_unstable();
+    ids.dedup();
     assert_eq!(
-        (compiled() - cold_compiled, objects() - cold_objects),
-        (expected, expected),
-        "a cold build compiles every bucket and the runtime's object"
+        parts.buckets.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        ids,
+        "the buckets are the placed bodies' buckets, in order"
     );
-    let (before_compiled, before_objects) = (compiled(), objects());
-    let second = build(&program(5)).expect("the compiler ran once already");
-    assert_eq!(
-        (compiled() - before_compiled, objects() - before_objects),
-        (1, 1),
-        "editing one body compiled more than the bucket holding it"
-    );
-    let steady = |native: &Native| answer(native, "m.steady", 1);
-    assert_eq!(
-        steady(&first),
-        steady(&second),
-        "`steady` changed under the edit"
-    );
-    let names = keyed_by_hash(&program(5), "").functions();
-    let changed = names
-        .iter()
-        .find(|n| *n != "m.steady")
-        .expect("the program has an edited definition");
-    assert_eq!(answer(&first, changed, 4), 12);
-    assert_eq!(
-        answer(&second, changed, 4),
-        20,
-        "the edit did not reach the image"
-    );
+    for (id, text) in &parts.buckets {
+        let reached: std::collections::HashSet<&str> = placed
+            .iter()
+            .filter(|(name, _)| bucket_of(name) == *id)
+            .flat_map(|(name, calls)| std::iter::once(*name).chain(calls.iter().copied()))
+            .collect();
+        for name in names {
+            assert_eq!(
+                text.contains(&prototype(name)),
+                reached.contains(name),
+                "bucket {id:02x} and `{name}`:\n{text}"
+            );
+        }
+    }
 }
 
 /// The members of a recursive group share one C function, so a tail call between them is a jump:
