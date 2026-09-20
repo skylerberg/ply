@@ -408,6 +408,11 @@ arm, or the right operand of `&&`/`||`:
 fn sum_to(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { sum_to(n - 1, acc + n) }
 ```
 
+A tail call of another function in the same module is a loop too when the two
+are in one recursive group, a set of definitions whose tail calls lead back to
+each other, so `even`/`odd` mutual recursion does not nest either. A group with
+a `handle` in a member's body is compiled definition by definition and nests.
+
 Every other call nests, at most 10,000 deep (then `E0502`): `1 + f(n - 1)`, a
 call inside `handle`, `with_cell` or a lambda, and a call of another function.
 A loop that never ends fails with `E0503` when its time budget is spent (§8.4).
