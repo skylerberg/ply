@@ -26,6 +26,14 @@ definitions. An atom reached through a function value (a parameter, a field, a c
 that name operations (`net.send[conn]`), a change to the row syntax, the printer, the hash and
 the frames. Assumed: worth doing as its own item, listed in `docs/DIRECTION.md`.
 
+## Record shapes stay file-local
+
+A record update now takes its shape from a call of a `fn` declared in the same file, and a
+`let` without a type takes the written type of such a call, a local or an update. Shapes are
+still never read across a module boundary: the rewrite runs before types exist, and a shape
+read from another file would change this file's hashes without this file changing. Assumed:
+that line stays where it is, and `{..other::make(), x: 1}` keeps needing a local annotation.
+
 ## Libraries against more than one resource label
 
 `std.http`'s client runs under `[conn]` because a definition cannot be generic over a label:
