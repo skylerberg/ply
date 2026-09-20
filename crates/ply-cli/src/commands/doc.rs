@@ -137,8 +137,9 @@ fn definition(loaded: &Loaded, name: &Symbol) -> Page {
     }
 }
 
-fn builtin(query: &str) -> anyhow::Result<Option<Page>> {
-    let Some(b) = ply_codegen::c::producer::builtins()?
+fn builtin(query: &str) -> Result<Option<Page>, String> {
+    let Some(b) = ply_codegen::c::producer::builtins()
+        .map_err(|e| e.to_string())?
         .into_iter()
         .find(|b: &BuiltinInfo| b.name.as_str() == query)
     else {
