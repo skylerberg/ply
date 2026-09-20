@@ -364,10 +364,12 @@ and no method syntax.
 ### 5.5 Record update
 
 `{..base, deep: {..base.deep, a: 7}}` copies `base` with fields replaced. It
-expands to a record literal. The base must be a variable or a field path (not a
-call); its shape must be readable from this file's own `type` items and
-annotations (`E0116` otherwise, including for an unannotated `let`); and a field
-it lacks is `E0117`.
+expands to a record literal. The base is a variable, a field path, or a call of
+a `fn` declared in this file with a written return type (the call runs once).
+Its shape must be readable from this file's own `type` items and written types
+(`E0116` otherwise); a `let` without a written type takes the written type of
+its value when that is such a variable, path, call or update. A field the base
+lacks is `E0117`.
 
 ### 5.6 Lists
 
@@ -439,8 +441,8 @@ it and the function's result and everything evaluated before it is pure:
   lambda without a written return type; or where `Ok`/`Err`/`Some`/`None` are
   rebound. A lambda with a written return type exits the lambda.
 * `E0119`: in an `if` branch, `match` arm or right of `&&` not in return
-  position; after an impure argument (`g(h(x), k(x)?)`); in a nested block; or
-  on a `let` with a written type. Bind the value first.
+  position; after an impure argument (`g(h(x), k(x)?)`); or in a nested block.
+  Bind the value first.
 
 ## 6. Effects and handlers
 

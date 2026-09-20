@@ -499,11 +499,22 @@ pub fn expand_effect_sets(m: Module, diags: List<PDiag>) -> { module: Module, di
 // --- Record update -----------------------------------------------------------------------
 
 type Bound = { name: Bytes, ty: Option<TypeExpr> }
-type RuCx = { types: List<TypeDef>, scope: List<Bound>, diags: List<PDiag> }
+type Sig = { name: Bytes, ret: Option<TypeExpr> }
+type RuCx = { types: List<TypeDef>, sigs: List<Sig>, scope: List<Bound>, diags: List<PDiag>, fresh: Int }
 type RuOut = { cx: RuCx, e: Expr }
 
 // `NoShape` carries the note saying why the base has no field list this file can name.
 type Shape = | Fields(List<{ name: Ident, ty: TypeExpr }>) | NoShape(Bytes)
+
+fn collect_sigs(m: Module) -> List<Sig> =
+  fold(m.items, [], |acc: List<Sig>, it: Item|
+    match it {
+      IFn(d) -> match find_sig(acc, d.name.name) { Some(_) -> acc, None -> push(acc, { name: d.name.name, ret: d.ret }) },
+      _ -> acc,
+    })
+
+fn find_sig(sigs: List<Sig>, name: Bytes) -> Option<Sig> =
+  fold(sigs, None, |acc: Option<Sig>, s: Sig| match acc { Some(_) -> acc, None -> if s.name == name { Some(s) } else { None } })
 
 fn ru_lookup(cx: RuCx, name: Bytes) -> Option<Option<TypeExpr>> =
   fold(cx.scope, None, |acc: Option<Option<TypeExpr>>, b: Bound|
@@ -511,7 +522,7 @@ fn ru_lookup(cx: RuCx, name: Bytes) -> Option<Option<TypeExpr>> =
 
 fn too_deep() -> Bytes = bytes_concat_all([b"more than ", num(max_alias_depth()), b" type aliases deep"])
 
-// The written type of a base that is a local, or a field path from one.
+// The written type of a base: a local, a field path from one, or a call of a `fn` declared here.
 fn type_of_path(cx: RuCx, e: Expr) -> Result<TypeExpr, Bytes> =
   match e {
     EVar(v) -> if !is_bare(v.name) { Err(ru_cross_module()) } else {
@@ -541,7 +552,30 @@ fn type_of_path(cx: RuCx, e: Expr) -> Result<TypeExpr, Bytes> =
           },
       }
     },
+    EApp(a) -> match a.func {
+      EVar(v) -> if !is_bare(v.name) { Err(ru_cross_module()) } else {
+        let n = v.name.name.name;
+        match ru_lookup(cx, n) {
+          Some(_) -> Err(bytes_concat_all([b"`", n, b"` is a local here, and a call of a local has no written result type"])),
+          None -> match find_sig(cx.sigs, n) {
+            None -> Err(bytes_concat_all([b"`", n, b"` is not a `fn` declared in this file, so its result has no type this file can read"])),
+            Some(sig) -> match sig.ret {
+              Some(t) -> Ok(t),
+              None -> Err(bytes_concat_all([b"`", n, b"` writes no `->`, so its result has no type this file can read; write one"])),
+            },
+          },
+        }
+      },
+      _ -> Err(b"only a call of a `fn` declared in this file has a result type this file can read"),
+    },
     _ -> Err(b"the base is not a record"),
+  }
+
+// What a `let` without a written type takes from its value.
+fn written_type_of(cx: RuCx, e: Expr) -> Option<TypeExpr> =
+  match e {
+    ERecordUpdate(r) -> written_type_of(cx, r.base),
+    _ -> match type_of_path(cx, e) { Ok(t) -> Some(t), Err(_) -> None },
   }
 
 fn ru_cross_module() -> Bytes =
@@ -591,9 +625,16 @@ fn ru_bind_pattern(cx: RuCx, p: Pattern) -> RuCx =
 fn ru_truncate(cx: RuCx, mark: Int) -> RuCx = {..cx, scope: take(cx.scope, mark)}
 
 // The literal an update stands for, or the written fields alone with a diagnostic.
-fn expand_update(cx: RuCx, span: Span, base: Expr, written: List<RecField>) -> RuOut = {
+fn expand_update(cx0: RuCx, span: Span, base: Expr, written: List<RecField>) -> RuOut = {
   let base_span = expr_span(base);
-  let shape = match type_of_path(cx, base) { Err(why) -> NoShape(why), Ok(t) -> record_of(cx, t, 0) };
+  let shape = match type_of_path(cx0, base) { Err(why) -> NoShape(why), Ok(t) -> record_of(cx0, t, 0) };
+  // A call is bound to a name first, so it runs once however many fields are copied.
+  let bound: Option<Ident> = match base {
+    EApp(_) -> Some({ name: bytes_concat(b"?u", bytes_of_string(int_to_string(cx0.fresh))), span: base_span }),
+    _ -> None,
+  };
+  let cx: RuCx = match bound { Some(_) -> {..cx0, fresh: cx0.fresh + 1}, None -> cx0 };
+  let source = match bound { Some(b) -> EVar({ span: base_span, name: bare(b) }), None -> base };
   match shape {
     NoShape(why) ->
       { cx: {..cx, diags: push(cx.diags, diag1(b"E0116", base_span,
@@ -615,9 +656,15 @@ fn expand_update(cx: RuCx, span: Span, base: Expr, written: List<RecField>) -> R
         let sorted = fold(copies, [], |acc: List<Bytes>, n: Bytes| insert_bytes(acc, n));
         let copied = map(sorted, |n: Bytes| {
           let field = { name: n, span: base_span };
-          { name: field, value: EField({ span: base_span, base: base, field: field }) }
+          { name: field, value: EField({ span: base_span, base: source, field: field }) }
         });
-        { cx: bad.cx, e: ERecord({ span: span, fields: append(copied, written) }) }
+        let literal = ERecord({ span: span, fields: append(copied, written) });
+        { cx: bad.cx,
+          e: match bound {
+            Some(b) -> EBlock({ span: span, tail: Some(literal),
+                                stmts: [SLet({ span: base_span, pat: PVar({ span: base_span, name: b }), ty: None, value: base })] }),
+            None -> literal,
+          } }
       }
     },
   }
@@ -692,7 +739,7 @@ fn ru_expr(cx: RuCx, e: Expr) -> RuOut =
           SLet(l) -> {
             let v = ru_expr(acc.cx, l.value);
             let bound = match l.pat {
-              PVar(n) -> match l.ty { Some(t) -> ru_bind(v.cx, n.name, Some(t)), None -> ru_bind_pattern(v.cx, l.pat) },
+              PVar(n) -> match l.ty { Some(t) -> ru_bind(v.cx, n.name, Some(t)), None -> ru_bind(v.cx, n.name, written_type_of(v.cx, l.value)) },
               _ -> ru_bind_pattern(v.cx, l.pat),
             };
             { cx: bound, ss: push(acc.ss, SLet({ span: l.span, pat: l.pat, ty: l.ty, value: v.e })) }
@@ -767,7 +814,7 @@ fn ru_item(cx: RuCx, it: Item) -> { cx: RuCx, it: Item } =
   }
 
 pub fn expand_record_updates(m: Module, diags: List<PDiag>) -> { module: Module, diags: List<PDiag> } = {
-  let start = { types: collect_types(m), scope: [], diags: diags };
+  let start = { types: collect_types(m), sigs: collect_sigs(m), scope: [], diags: diags, fresh: 0 };
   let walked = fold(m.items, { cx: start, items: [] }, |acc: { cx: RuCx, items: List<Item> }, it: Item| {
     let o = ru_item(acc.cx, it);
     { cx: o.cx, items: push(acc.items, o.it) }
@@ -1088,11 +1135,16 @@ fn take_stmt(cx: TryCx, st: Stmt) -> Taken =
       match l.value {
         ETry(t) ->
           match l.ty {
+            // The annotation stays: the `let` now binds the success arm's binder.
             Some(_) -> {
-              let d = diag2(b"E0119", t.span, b"a `?` on a `let` with a written type",
-                            b"this `?` would discard the annotation", l.span, b"the type is written here",
-                            [b"`?` splits the block at this statement and the `let` is gone, so there is nothing left to carry the annotation. Write `let x = e?;`, or annotate the value being unwrapped instead"]);
-              { cx: {..cx, diags: push(cx.diags, d)}, stmt: SLet({ span: l.span, pat: l.pat, ty: l.ty, value: t.operand }), take: None }
+              let fb = fresh_binder(cx, t.span);
+              let o = take_try(fb.cx, t.operand, t.span, var_pattern(fb.b));
+              if o.take.consumes {
+                { cx: o.cx, stmt: SLet({ span: l.span, pat: l.pat, ty: l.ty, value: var_of(fb.b) }),
+                  take: Some({ operand: o.take.operand, at: o.take.at, pat: o.take.pat, consumes: false }) }
+              } else {
+                { cx: o.cx, stmt: SLet({ span: l.span, pat: l.pat, ty: l.ty, value: ETry({ span: t.span, operand: o.operand_left }) }), take: Some(o.take) }
+              }
             },
             None -> {
               let o = take_try(cx, t.operand, t.span, l.pat);
@@ -1370,6 +1422,23 @@ test "a `?` in a function with no written return type is refused and unwrapped" 
 test "a record update copies the base's other fields, sorted, over the base's span" {
   assert_eq(dump_expanded(b"type P = { a: Int, b: Int }\nfn f(p: P) -> P = {..p, b: 2}"),
             "#0;#2;0:27:ty;%priv;5:6:ident;@50;#0;%alias;9:27:trec;#2;11:12:ident;@61;14:17:tcon;14:17:qname;?0;14:17:ident;@496e74;#0;19:20:ident;@62;22:25:tcon;22:25:qname;?0;22:25:ident;@496e74;#0;28:57:fn;%priv;?0;31:32:ident;@66;%gen;#0;#0;#1;33:37:prm;33:34:ident;@70;?1;36:37:tcon;36:37:qname;?0;36:37:ident;@50;#0;?0;?1;42:43:tcon;42:43:qname;?0;42:43:ident;@50;#0;?0;#0;#0;46:57:erec;#2;49:50:ident;@61;49:50:efld;49:50:evar;49:50:qname;?0;49:50:ident;@70;49:50:ident;@61;52:53:ident;@62;55:56:elit;%int;@32;#0;")
+}
+
+test "a record update of a call binds the call once, typed by the callee's written `->`" {
+  let out = dump_expanded(b"type P = { a: Int, b: Int }\nfn mk() -> P = { a: 1, b: 2 }\nfn f() -> P = {..mk(), b: 3}");
+  assert(!string_contains(out, "!E0116"));
+  assert(string_contains(out, "@3f7530"))
+}
+
+test "a `let` without a type takes the written type of a call, a local or an update" {
+  let out = dump_expanded(b"type P = { a: Int, b: Int }\nfn mk() -> P = { a: 1, b: 2 }\nfn f(q: P) -> P = { let p = mk(); let r = q; let s = {..r, a: p.a}; {..s, b: 3} }");
+  assert(!string_contains(out, "!E"))
+}
+
+test "a `?` on a `let` with a written type keeps the annotation" {
+  let out = dump_expanded(b"fn f(n: Int) -> Result<Int, Bytes> = { let x: Int = g(n)?; Ok(x + 1) }");
+  assert(!string_contains(out, "!E0119"));
+  assert(string_contains(out, "@3f30"))
 }
 
 test "an effect set expands into every row that names it, and into its own item" {
