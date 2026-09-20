@@ -55,6 +55,8 @@ pub enum Command {
     Explain(ExplainArgs),
     /// A definition or builtin: its signature with parameter names, the comment above it, its place.
     Doc(DocArgs),
+    /// Rewrite `.ply` files in the canonical layout; a file that does not parse is left alone.
+    Fmt(FmtArgs),
     /// Print the content hash of every definition.
     Hash(HashArgs),
     /// Every definition with its place, hash, signature and footprint.
@@ -672,6 +674,21 @@ pub struct DocArgs {
     /// A `.ply` file, or a project root whose `*.ply` files are modules named by path.
     #[arg(default_value = ".")]
     pub path: PathBuf,
+
+    /// Emit one JSON object on stdout and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct FmtArgs {
+    /// `.ply` files, or directories whose `*.ply` files are formatted (`.ply-cache` and `target` skipped).
+    #[arg(default_value = ".")]
+    pub paths: Vec<PathBuf>,
+
+    /// Write nothing; list the files that would change and exit 1 if there are any.
+    #[arg(long)]
+    pub check: bool,
 
     /// Emit one JSON object on stdout and nothing else.
     #[arg(long)]

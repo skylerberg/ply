@@ -7,6 +7,7 @@ pub mod common;
 pub mod defs;
 pub mod doc;
 pub mod explain;
+pub mod fmt;
 pub mod hash;
 pub mod hosts;
 pub mod mutate;
