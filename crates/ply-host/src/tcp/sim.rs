@@ -78,6 +78,7 @@ impl Net for SimNet {
         match op {
             Op::Listen => "ply_host::tcp::sim::listen",
             Op::ListenTls => "ply_host::tls::sim::listen",
+            Op::Connect => "ply_host::tcp::sim::connect",
             Op::Accept => "ply_host::tcp::sim::accept",
             Op::Recv => "ply_host::tcp::sim::recv",
             Op::Send => "ply_host::tcp::sim::send",
@@ -105,6 +106,24 @@ impl Net for SimNet {
             ));
         }
         Ok(HostAnswer::Value(Value::Int(self.bind(at))))
+    }
+
+    /// The next scripted connection, as `accept` would hand it out; none left is a host not reached.
+    fn connect(
+        &self,
+        at: &Resource,
+        _host: &str,
+        _port: u16,
+        _timeout: Duration,
+        _span: Span,
+    ) -> Result<HostAnswer, Diagnostic> {
+        let mut state = lock(&self.state);
+        let Some(chunks) = state.inbound.pop_front() else {
+            return Ok(HostAnswer::Value(Value::ctor("None", Vec::new())));
+        };
+        let handle = self.handles.open(Some(at));
+        state.conns.insert(handle, chunks);
+        Ok(HostAnswer::Value(some(Value::Int(handle))))
     }
 
     fn accept(&self, at: &Resource, listener: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
