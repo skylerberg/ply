@@ -3,9 +3,9 @@
 
 use super::Refused;
 use super::exports::Exports;
-use super::load::{Library, compile_and_load};
-use super::tables::{Positions, Unit, mangle, memo_symbol, root_id};
-use super::{HELPERS, PRELUDE, helper_addresses, runtime_decls};
+use super::load::{Library, compile_and_load, compile_and_load_timed};
+use super::tables::{Positions, Unit, bucket_mark, bucket_of, mangle, memo_symbol, root_id};
+use super::{HELPERS, PRELUDE, helper_addresses, runtime_header, runtime_object};
 use crate::heap::{Heap, Word, mark_immortal};
 use crate::rt::Entry;
 use crate::rt::{Ctx, Tables};
@@ -14,6 +14,7 @@ use anyhow::{Result, bail};
 use ply_span::{Span, Symbol};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 /// A loaded C unit, with the surface `crate::backend::Bodies` asks a compiled unit for.
@@ -355,7 +356,7 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
     {
         let refused = refused_of(&exports);
         if let Ok(native) = finish(lib, exports, Some(loaded)) {
-            super::cache::UNITS_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            super::cache::UNITS_REUSED.fetch_add(1, Relaxed);
             if std::env::var("PLY_C_PHASES").is_ok() {
                 eprintln!(
                     "phases: whole unit from cache, {}ms",
@@ -372,7 +373,11 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
         ..
     } = produced;
     let t_produced = started.elapsed();
-    let lib = compile_and_load(&text, "unit")?;
+    let (compiled_before, reused_before) = (
+        super::cache::BUCKETS_COMPILED.load(Relaxed),
+        super::cache::BUCKETS_REUSED.load(Relaxed),
+    );
+    let (lib, compiling) = compile_and_load_timed(&text, "unit")?;
     let t_cc = started.elapsed();
     if let Some(k) = &unit_key {
         super::cache::write_unit(k, &super::load::object_key(&text));
@@ -382,13 +387,17 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
     let native = finish(lib, exports, Some(loaded))?;
     if std::env::var("PLY_C_PHASES").is_ok() {
         eprintln!(
-            "phases: emit {}ms, resolve {}ms, embed {}ms, assemble {}ms, cc+load {}ms, tables \
-             {}ms, source {}MB, body cache {} hit {} missed",
+            "phases: emit {}ms, resolve {}ms, embed {}ms, assemble {}ms, compile {}ms ({} buckets \
+             built, {} reused), link+load {}ms, tables {}ms, source {}MB, body cache {} hit {} \
+             missed",
             phases.emit.as_millis(),
             phases.resolve.as_millis(),
             phases.embed.as_millis(),
             phases.assemble.as_millis(),
-            (t_cc - t_produced).as_millis(),
+            compiling.as_millis(),
+            super::cache::BUCKETS_COMPILED.load(Relaxed) - compiled_before,
+            super::cache::BUCKETS_REUSED.load(Relaxed) - reused_before,
+            (t_cc - t_produced).saturating_sub(compiling).as_millis(),
             (started.elapsed() - t_cc).as_millis(),
             text.len() / 1_000_000,
             phases.hits,
@@ -625,10 +634,13 @@ fn resolve(
     out
 }
 
-/// `embedded` is [`Exports::embed`] of `exports`, laid out last.
+/// One valid translation unit that is also a partition: the header up to the first bucket mark,
+/// a marked bucket per [`bucket_of`] class of names, and from [`super::RUNTIME_MARK`] the tail
+/// that defines the runtime and embeds `exports` ([`Exports::embed`] is `embedded`).
+/// `super::load::split` cuts it back on those marks.
 fn assemble(bodies: &[(String, String)], exports: &Exports, embedded: &str) -> String {
     let mut out = String::from(PRELUDE);
-    out.push_str(&runtime_decls());
+    out.push_str(&runtime_header());
     out.push_str("\n/* --- prototypes, so a call between two bodies resolves --- */\n");
     for (name, arity) in &exports.taken {
         let params = std::iter::once("PlyCtx*".to_string())
@@ -638,10 +650,22 @@ fn assemble(bodies: &[(String, String)], exports: &Exports, embedded: &str) -> S
         out.push_str(&format!("Word {}({params});\n", mangle(name)));
     }
     out.push('\n');
-    for (_, text) in bodies {
+    let mut bucketed: Vec<(u8, &str, &str)> = bodies
+        .iter()
+        .map(|(name, text)| (bucket_of(name), name.as_str(), text.as_str()))
+        .collect();
+    bucketed.sort_by_key(|(bucket, name, _)| (*bucket, *name));
+    let mut open: Option<u8> = None;
+    for (bucket, _, text) in &bucketed {
+        if open != Some(*bucket) {
+            out.push_str(&bucket_mark(*bucket));
+            out.push('\n');
+            open = Some(*bucket);
+        }
         out.push_str(text);
         out.push('\n');
     }
+    out.push_str(&runtime_object());
     out.push_str(embedded);
     out
 }
