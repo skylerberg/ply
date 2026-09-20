@@ -116,9 +116,11 @@ fn attempt_for_test(f: &Fixture, label: &str) -> (Decision, Vec<Blocker>) {
 
 #[track_caller]
 fn proof(fixture: &Fixture, label: &str) -> Proof {
-    match attempt(fixture, label) {
-        Decision::Proved(proof) => proof,
-        other => panic!("`{label}` was expected to be proved, got {other:?}"),
+    match attempt_for_test(fixture, label) {
+        (Decision::Proved(proof), _) => proof,
+        (other, blockers) => {
+            panic!("`{label}` was expected to be proved, got {other:?}; blocked by {blockers:?}")
+        }
     }
 }
 
