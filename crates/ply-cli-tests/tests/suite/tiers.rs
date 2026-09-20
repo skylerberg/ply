@@ -238,10 +238,10 @@ law "excluded middle"
 fn a_ground_law_is_proved_rather_than_exemplified() {
     let dir = project(
         r#"
-fn stock() -> List<Int> = [3, 1, 2]
+fn stock() -> String = "abc"
 
 law "the stock is three deep" {
-  len(stock()) == 3
+  string_len(stock()) == 3
 }
 "#,
     );
