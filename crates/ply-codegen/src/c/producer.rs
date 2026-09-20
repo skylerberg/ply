@@ -10,7 +10,7 @@ use ply_span::frames::Cursor;
 use ply_span::{Diagnostic, Severity, SourceId, Symbol, codes};
 use ply_ty::{DefHash, Front, Scheme, parse_scheme, read_front};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 /// How a thread builds its producer.
@@ -337,28 +337,48 @@ pub enum Answer {
 
 type Bodies = HashMap<String, Answer>;
 
-/// The compiled Ply emitter, entered once per module of the program being compiled.
+/// The emitter's answers over one program.
+#[derive(Default)]
+struct Memo {
+    answers: Bodies,
+    /// Every root the emitter was entered for: one it did not answer is not asked for again.
+    asked: HashSet<String>,
+    /// Whether an entry emitted every root, so a root missing from `answers` was never emitted.
+    whole: bool,
+}
+
+impl Memo {
+    fn knows(&self, name: &str) -> bool {
+        self.whole || self.asked.contains(name)
+    }
+}
+
+/// The compiled Ply emitter, entered over the whole program for the roots asked of it.
 pub struct PlyProducer {
     native: Native,
-    /// Every body answered, by name, keyed on the program's address; filled on first ask.
-    modules: RefCell<HashMap<usize, Bodies>>,
+    /// By the program's address.
+    memos: RefCell<HashMap<usize, Memo>>,
     asked: Cell<u64>,
     answered: Cell<u64>,
     /// Why the emitter raised over a program, by the program's address.
     failed: RefCell<HashMap<usize, String>>,
 }
 
-/// Entered as `(names, srcs, ctors, builtins)` over every module at once, so they resolve together.
-const ENTRY: &str = "emit.emit_unit_all";
+/// Entered as `(names, srcs, ctors, builtins, wanted)`: every module at once, so they resolve
+/// together, emitting the roots `wanted` names.
+const ENTRY: &str = "emit.emit_roots";
+/// The entry of an emitter from before `emit_roots`, which emits every root: the committed bundle
+/// is one emitter behind its sources until CI refreshes it.
+const ENTRY_ALL: &str = "emit.emit_unit_all";
 
 impl PlyProducer {
     pub fn new(native: Native) -> Result<PlyProducer> {
-        if native.entry(ENTRY).is_none() {
+        if native.entry(ENTRY).is_none() && native.entry(ENTRY_ALL).is_none() {
             bail!("the unit has no `{ENTRY}`, so it is not the Ply emitter");
         }
         Ok(PlyProducer {
             native,
-            modules: RefCell::new(HashMap::new()),
+            memos: RefCell::new(HashMap::new()),
             asked: Cell::new(0),
             answered: Cell::new(0),
             failed: RefCell::new(HashMap::new()),
@@ -371,38 +391,65 @@ impl PlyProducer {
         self.failed.borrow().get(&program).cloned()
     }
 
-    /// Bodies asked for and bodies answered, over this thread's life.
+    /// Roots handed to the emitter and bodies it answered, over this thread's life.
     pub fn counts(&self) -> (u64, u64) {
         (self.asked.get(), self.answered.get())
     }
 
-    /// The emitter's C for `name`; `None` if unreached or failed (see [`PlyProducer::failure`]).
-    pub fn body(&self, loaded: &Source, name: &str) -> Option<Answer> {
-        self.asked.set(self.asked.get() + 1);
+    /// Enters the emitter once for the roots of `wanted` it has not been asked for over `loaded`.
+    pub fn ask(&self, loaded: &Source, wanted: &[String]) {
         let program = std::ptr::from_ref(loaded) as usize;
-        if !self.modules.borrow().contains_key(&program) {
-            let bodies = match self.bodies_of(loaded) {
-                Ok(b) => b,
-                Err(e) => {
-                    self.failed.borrow_mut().insert(program, format!("{e:#}"));
-                    HashMap::new()
-                }
-            };
-            self.modules.borrow_mut().insert(program, bodies);
+        let missing: Vec<String> = {
+            let memos = self.memos.borrow();
+            let known = |name: &str| memos.get(&program).is_some_and(|m| m.knows(name));
+            wanted
+                .iter()
+                .filter(|name| !known(name.as_str()))
+                .cloned()
+                .collect()
+        };
+        if missing.is_empty() {
+            return;
         }
-        let found = self
-            .modules
-            .borrow()
-            .get(&program)
-            .and_then(|m| m.get(name))
-            .cloned();
-        if matches!(found, Some(Answer::Body(..))) {
-            self.answered.set(self.answered.get() + 1);
+        self.asked.set(self.asked.get() + missing.len() as u64);
+        let entered = self.enter(loaded, &missing);
+        let mut memos = self.memos.borrow_mut();
+        let memo = memos.entry(program).or_default();
+        match entered {
+            Ok((answers, whole)) => {
+                memo.whole |= whole;
+                memo.answers.extend(answers);
+                let answered = missing
+                    .iter()
+                    .filter(|name| {
+                        matches!(memo.answers.get(name.as_str()), Some(Answer::Body(..)))
+                    })
+                    .count();
+                self.answered.set(self.answered.get() + answered as u64);
+            }
+            Err(e) => {
+                self.failed.borrow_mut().insert(program, format!("{e:#}"));
+            }
         }
-        found
+        memo.asked.extend(missing);
     }
 
-    fn bodies_of(&self, loaded: &Source) -> Result<Bodies> {
+    /// The emitter's C for `name`, asked for on its own unless [`PlyProducer::ask`] already did;
+    /// `None` if unanswered or failed (see [`PlyProducer::failure`]).
+    pub fn body(&self, loaded: &Source, name: &str) -> Option<Answer> {
+        self.ask(loaded, &[name.to_string()]);
+        let program = std::ptr::from_ref(loaded) as usize;
+        self.memos
+            .borrow()
+            .get(&program)?
+            .answers
+            .get(name)
+            .cloned()
+    }
+
+    /// One entry over the whole program: `wanted`'s roots, or every root and `true` from an
+    /// emitter that emits nothing less.
+    fn enter(&self, loaded: &Source, wanted: &[String]) -> Result<(Bodies, bool)> {
         let mut names = Vec::new();
         let mut srcs = Vec::new();
         for module in loaded.module_names() {
@@ -426,12 +473,21 @@ impl PlyProducer {
                 .map(|b| Value::bytes(b.name().as_bytes()))
                 .collect(),
         );
-        let args = [Value::list(names), Value::list(srcs), ctors, builtins];
-        let value = self.call(ENTRY, &args)?;
+        let mut args = vec![Value::list(names), Value::list(srcs), ctors, builtins];
+        let whole = self.native.entry(ENTRY).is_none();
+        let entry = if whole {
+            ENTRY_ALL
+        } else {
+            let roots = wanted.iter().map(|n| Value::bytes(n.as_bytes()));
+            args.push(Value::list(roots.collect()));
+            ENTRY
+        };
+        tally(|census| census.wanted.push(wanted.to_vec()));
+        let value = self.call(entry, &args)?;
         let Value::Str(dump) = &value else {
             bail!("the emitter answered something that is not a string");
         };
-        parse(dump).context("reading the emitter's answer")
+        Ok((parse(dump).context("reading the emitter's answer")?, whole))
     }
 
     /// Enters any function of the unit (`module.name`) with `args`, in a fresh context and with
@@ -469,7 +525,7 @@ impl PlyProducer {
 }
 
 /// What this thread's entries into the compiled compiler have cost since the last reset.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Census {
     pub entries: usize,
     /// Modules handed to the front end, summed over its entries.
@@ -480,18 +536,26 @@ pub struct Census {
     pub recycled: usize,
     /// The most chunk bytes any one entry held at its end.
     pub chunk_bytes: usize,
+    /// The roots each entry into the emitter was asked for, in entry order.
+    pub wanted: Vec<Vec<String>>,
 }
 
 thread_local! {
-    static CENSUS: Cell<Census> = const { Cell::new(Census { entries: 0, modules: 0, claimed: 0, allocated: 0, recycled: 0, chunk_bytes: 0 }) };
+    static CENSUS: RefCell<Census> = const {
+        RefCell::new(Census {
+            entries: 0,
+            modules: 0,
+            claimed: 0,
+            allocated: 0,
+            recycled: 0,
+            chunk_bytes: 0,
+            wanted: Vec::new(),
+        })
+    };
 }
 
 fn tally(f: impl FnOnce(&mut Census)) {
-    CENSUS.with(|c| {
-        let mut census = c.get();
-        f(&mut census);
-        c.set(census);
-    });
+    CENSUS.with(|c| f(&mut c.borrow_mut()));
 }
 
 fn note_census(ctx: &crate::rt::Ctx) {
@@ -505,11 +569,11 @@ fn note_census(ctx: &crate::rt::Ctx) {
 
 /// Starts this thread's census afresh, so a test reads only what it entered.
 pub fn reset_census() {
-    CENSUS.with(|c| c.set(Census::default()));
+    CENSUS.with(|c| *c.borrow_mut() = Census::default());
 }
 
 pub fn census() -> Census {
-    CENSUS.with(|c| c.get())
+    CENSUS.with(|c| c.borrow().clone())
 }
 
 /// The front end's whole answer, as `ply_ty::front` reads it.
