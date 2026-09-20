@@ -338,6 +338,12 @@ pub fn unit_key(
 /// How many times a unit has been rebuilt from the cache rather than emitted; for tests.
 pub static UNITS_REUSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// How many of a unit's objects (its buckets and its runtime tail) were compiled, and how many
+/// were found under `obj/`; for tests and `PLY_C_PHASES`.
+pub static BUCKETS_COMPILED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static BUCKETS_REUSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// The object a unit key was built as, so a worker skips assembling the C entirely.
 pub fn read_unit(key: &str) -> Option<String> {
     let s = std::fs::read_to_string(dir().join(format!("{key}.unit"))).ok()?;

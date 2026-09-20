@@ -1,10 +1,11 @@
-use ply_codegen::c::{Library, PRELUDE, helper_addresses, runtime_decls, upgrade};
+use ply_codegen::c::{Library, PRELUDE, helper_addresses, runtime_header, runtime_object, upgrade};
 
 /// Whether `n << 40` fits an immediate. Only an optimiser exploiting the signed shift in
 /// `ply_fits_imm` says it does for `n = 2^22`.
 fn probe() -> String {
     let mut src = String::from(PRELUDE);
-    src.push_str(&runtime_decls());
+    src.push_str(&runtime_header());
+    src.push_str(&runtime_object());
     src.push_str(
         r#"
 Word ply_probe(PlyCtx *ctx, const Word *args) {

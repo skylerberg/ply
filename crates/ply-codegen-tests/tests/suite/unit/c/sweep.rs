@@ -4,11 +4,10 @@ use std::time::{Duration, SystemTime};
 
 /// `n` files of `size` bytes, the first written longest ago.
 fn stock(dir: &Path, names: &[&str], size: usize) {
-    std::fs::create_dir_all(dir).unwrap();
-    std::fs::create_dir_all(dir.join("emit")).unwrap();
     let base = SystemTime::now() - Duration::from_secs(10_000);
     for (i, name) in names.iter().enumerate() {
         let path = dir.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, vec![b'x'; size]).unwrap();
         let when = base + Duration::from_secs(i as u64 * 60);
         let f = std::fs::File::options().write(true).open(&path).unwrap();
@@ -52,7 +51,7 @@ fn the_oldest_entries_go_until_the_rest_fits() {
 #[test]
 fn an_object_is_as_removable_as_a_body() {
     let dir = tempfile::tempdir().unwrap();
-    let names = ["old.dylib", "emit/new.body"];
+    let names = ["old.dylib", "obj/older.o", "emit/new.body"];
     stock(dir.path(), &names, 100);
     sweep(dir.path(), 100);
     assert_eq!(
@@ -65,12 +64,17 @@ fn an_object_is_as_removable_as_a_body() {
 #[test]
 fn a_temporary_is_never_swept() {
     let dir = tempfile::tempdir().unwrap();
-    let names = ["emit/a.1234.tmp", "emit/b.body"];
+    let names = [
+        "emit/a.1234.tmp",
+        "obj/c.1234.otmp",
+        "emit/b.body",
+        "obj/d.o",
+    ];
     stock(dir.path(), &names, 100);
     sweep(dir.path(), 0);
     assert_eq!(
         present(dir.path(), &names),
-        vec!["emit/a.1234.tmp".to_string()]
+        vec!["emit/a.1234.tmp".to_string(), "obj/c.1234.otmp".to_string()]
     );
 }
 

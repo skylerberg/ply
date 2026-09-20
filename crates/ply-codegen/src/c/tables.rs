@@ -183,6 +183,24 @@ pub fn root_id(name: &str) -> u64 {
     u64::from_le_bytes(bytes) >> 1
 }
 
+const BUCKET_BITS: u32 = 6;
+
+/// How many buckets a unit's bodies are compiled in, each its own translation unit.
+pub const BUCKETS: u64 = 1 << BUCKET_BITS;
+
+/// The bucket a body compiles in: the top bits of its root id, so it is a function of the name
+/// alone and an edit recompiles the one bucket holding the body.
+pub fn bucket_of(name: &str) -> u8 {
+    (root_id(name) >> (63 - BUCKET_BITS)) as u8
+}
+
+/// What a bucket's marker line opens with; the two hex digits of its id and ` --- */` follow.
+pub const BUCKET_MARK: &str = "/* --- bucket ";
+
+pub fn bucket_mark(id: u8) -> String {
+    format!("{BUCKET_MARK}{id:02x} --- */")
+}
+
 /// The code-table symbol of a pure nullary root's entry, which is also its memo slot.
 pub fn memo_symbol(name: &str) -> String {
     format!("{}_entry", mangle(name))
