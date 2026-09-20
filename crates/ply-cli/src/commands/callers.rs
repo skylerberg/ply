@@ -84,7 +84,7 @@ pub fn execute(args: &CallersArgs, style: Style) -> i32 {
 }
 
 /// A program-wide name, or a simple name that names exactly one definition.
-fn resolve(loaded: &Loaded, query: &str) -> Result<Symbol, Diagnostic> {
+pub(crate) fn resolve(loaded: &Loaded, query: &str) -> Result<Symbol, Diagnostic> {
     let exact = Symbol::new(query);
     if loaded.check.defs.contains_key(&exact) {
         return Ok(exact);
