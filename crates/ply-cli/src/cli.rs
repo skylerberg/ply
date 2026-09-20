@@ -330,7 +330,7 @@ pub struct TestArgs {
     #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]
     pub trace: When,
 
-    /// Attach a compiled backend: `c`, or a deliberately wrong `[c:]wrong:<mutation>[@<def>]`.
+    /// Attach a compiled backend: `c`.
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
 

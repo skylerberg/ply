@@ -251,7 +251,6 @@ impl Hybrid for BodyHybrid<'_> {
                 ply_codegen::Unit::over_front(&front, texts).expect("this host has a C compiler");
             let spec = ply_eval::BackendSpec {
                 kind: ply_eval::BackendKind::C,
-                ..Default::default()
             };
             machine.set_compiled(unit.attach(&spec));
             seed_run(&mut machine, &plan.seeds()[0], plan.steps);

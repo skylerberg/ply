@@ -3,7 +3,7 @@
 use crate::rt::Entry;
 use crate::source::Source;
 use anyhow::{Context, Result, bail};
-use ply_eval::{Compilation, Counters, Entered, Policed, Provider, Value};
+use ply_eval::{Compilation, Counters, Entered, Provider, Value};
 use ply_span::{Diagnostic, Symbol};
 use ply_ty::DefHash;
 use std::cell::{Cell, RefCell};
@@ -191,27 +191,22 @@ impl Unit {
 }
 
 impl Provider for Unit {
-    fn attach(&'static self, spec: &ply_eval::BackendSpec) -> Rc<dyn ply_eval::Compiled> {
+    fn attach(&'static self, _spec: &ply_eval::BackendSpec) -> Rc<dyn ply_eval::Compiled> {
         if self.members.is_empty() {
-            return ply_eval::backend::wrap(Rc::new(Absent { unit: self }), spec);
+            return Rc::new(Absent { unit: self });
         }
         match self.build() {
-            Ok(bodies) => ply_eval::backend::wrap(Rc::new(bodies), spec),
+            Ok(bodies) => Rc::new(bodies),
             Err(e) => {
                 eprintln!("the C tier built no unit for this program: {e:#}");
                 self.poisoned.fetch_add(1, Ordering::Relaxed);
-                ply_eval::backend::wrap(Rc::new(Absent { unit: self }), spec)
+                Rc::new(Absent { unit: self })
             }
         }
     }
 
     fn name(&self) -> &'static str {
         "c"
-    }
-
-    /// The registry width, since it decides which definitions run natively.
-    fn variant(&self) -> String {
-        registry_width().to_string()
     }
 
     fn len(&self) -> usize {
@@ -247,24 +242,6 @@ impl ply_eval::Compiled for Absent {
 
     fn enter(&self, _name: &Symbol, args: &[Value], _budget: usize) -> Option<Value> {
         self.unit.counters.note_offer(args);
-        None
-    }
-}
-
-impl Policed for Absent {
-    fn counters(&self) -> &'static Counters {
-        &self.unit.counters
-    }
-
-    fn holds(&self, _name: &Symbol) -> bool {
-        false
-    }
-
-    fn answer(&self, _name: &Symbol, _args: &[Value], _budget: usize) -> Option<Value> {
-        None
-    }
-
-    fn run_with_fuel(&self, _name: &Symbol, _args: &[Value], _fuel: usize) -> Option<Value> {
         None
     }
 }
@@ -609,33 +586,10 @@ impl ply_eval::Compiled for Bodies {
     }
 }
 
-impl Policed for Bodies {
-    fn counters(&self) -> &'static Counters {
-        &self.unit.counters
-    }
-
-    fn holds(&self, name: &Symbol) -> bool {
-        self.admitted.contains_key(name)
-    }
-
-    fn answer(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value> {
-        self.run(name, args, budget).answer()
-    }
-
-    fn run_with_fuel(&self, name: &Symbol, args: &[Value], fuel: usize) -> Option<Value> {
-        self.run(name, args, fuel).answer()
-    }
-}
-
 /// Which compiled bodies the machine may enter: all, or only scalar signatures under
 /// `PLY_CODEGEN_REGISTER=narrow` (read once per process).
 fn registers(source: &Source, name: &str) -> bool {
     !narrow_registry() || source.scalar_signature(name)
-}
-
-/// Part of this provider's identity, which cached results are namespaced by.
-pub fn registry_width() -> &'static str {
-    if narrow_registry() { "narrow" } else { "wide" }
 }
 
 pub fn narrow_registry() -> bool {

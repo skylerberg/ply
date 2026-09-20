@@ -23,21 +23,6 @@ impl Engine {
         Engine::Backend(tag.into())
     }
 
-    /// Takes the provider's `name` and `variant` so the engine is named before one is built.
-    pub fn of_backend(name: &str, variant: &str, spec: &ply_eval::BackendSpec) -> Engine {
-        // A deliberately wrong backend must never write where an honest one reads.
-        if spec.mutation == ply_eval::backend::Mutation::None && spec.target.is_none() {
-            return Engine::Evaluator;
-        }
-        let mut tag = name.to_string();
-        if !variant.is_empty() {
-            tag.push(':');
-            tag.push_str(variant);
-        }
-        tag.push_str(&format!("/wrong:{:?}:{:?}", spec.mutation, spec.target));
-        Engine::Backend(tag)
-    }
-
     pub fn label(&self) -> &str {
         match self {
             Engine::Evaluator => "evaluator",

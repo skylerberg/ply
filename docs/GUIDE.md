@@ -609,10 +609,9 @@ skipped; `--mutate-budget N` (default 64) caps how many are judged.
 ### 8.6 Compiled backend
 
 `--backend c` compiles the program to C and runs it there: compiled code is the
-only evaluator. Backend results are cached separately.
+only evaluator. Its passes share the evaluator's cache.
 `--profile development` (default; fastest compiler) or `release`
-(`cc -O2`) requires `--backend`. `--backend [c:]wrong:<mutation>` is wrong on
-purpose and never cached.
+(`cc -O2`) requires `--backend`.
 
 | variable | effect |
 | --- | --- |

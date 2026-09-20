@@ -12,18 +12,14 @@ pub fn backend_spec(flag: Option<&String>) -> Result<Option<ply_eval::BackendSpe
     let Some(spec) = flag else {
         return Ok(Some(ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,
-            ..ply_eval::BackendSpec::default()
         }));
     };
-    ply_eval::backend::parse(spec).map(Some).map_err(|message| {
-        Diagnostic::error(codes::BACKEND_UNAVAILABLE, message).note(
-            "a wrong backend is a self-test: it exists so that a green run with a backend \
-             attached can be read as evidence",
-        )
-    })
+    ply_eval::backend::parse(spec)
+        .map(Some)
+        .map_err(|message| Diagnostic::error(codes::BACKEND_UNAVAILABLE, message))
 }
 
-/// Fixes the emitted C tier's toolchain before anything compiles; not part of `Engine`'s variant,
+/// Fixes the emitted C tier's toolchain before anything compiles; not part of the cache key,
 /// because both profiles must answer identically.
 pub fn select_profile(flag: &str) -> Result<(), Diagnostic> {
     let Some(profile) = ply_codegen::Profile::parse(flag) else {
@@ -44,17 +40,6 @@ pub fn select_profile(flag: &str) -> Result<(), Diagnostic> {
     Ok(())
 }
 
-/// Named before a provider exists, since selection decides whether building one is worth it.
-pub fn engine_of(spec: Option<&ply_eval::BackendSpec>) -> ply_test::Engine {
-    let Some(spec) = spec else {
-        return ply_test::Engine::Evaluator;
-    };
-    let (name, variant) = match spec.kind {
-        ply_eval::BackendKind::C => ("c", ply_codegen::backend::registry_width()),
-    };
-    ply_test::Engine::of_backend(name, variant, spec)
-}
-
 pub(crate) use ply_codegen::emit_keys;
 
 /// Runs `selection` on the compiled tier built from `loaded`'s module source texts.
@@ -70,7 +55,6 @@ pub fn run_on_tier(
         ply_codegen::Unit::over_front(&loaded.front, texts).expect("this host has a C compiler");
     let spec = ply_eval::BackendSpec {
         kind: ply_eval::BackendKind::C,
-        ..Default::default()
     };
     let executor = ply_test::InterpExecutor::new(&loaded.front)
         .with_backend(unit, spec)
@@ -287,7 +271,6 @@ pub fn enter_constant(
 ) -> Result<ply_eval::Value, Diagnostic> {
     let spec = ply_eval::BackendSpec {
         kind: ply_eval::BackendKind::C,
-        ..Default::default()
     };
     let name = ply_span::Symbol::new(name);
     let entered = match provider {
