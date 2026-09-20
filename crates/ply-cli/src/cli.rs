@@ -53,8 +53,8 @@ pub enum Command {
     Std(StdArgs),
     /// What a diagnostic code means; `--all` lists every code.
     Explain(ExplainArgs),
-    /// Rewrite `.ply` files in the canonical layout; a file that does not parse is left alone.
-    Fmt(FmtArgs),
+    /// A definition or builtin: its signature with parameter names, the comment above it, its place.
+    Doc(DocArgs),
     /// Print the content hash of every definition.
     Hash(HashArgs),
     /// Every definition with its place, hash, signature and footprint.
@@ -664,14 +664,14 @@ pub struct ExplainArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct FmtArgs {
-    /// `.ply` files, or directories whose `*.ply` files are formatted (`.ply-cache` and `target` skipped).
-    #[arg(default_value = ".")]
-    pub paths: Vec<PathBuf>,
+pub struct DocArgs {
+    /// A program-wide name (`store.orders.place`), a simple name unique in the program, or a builtin.
+    #[arg(value_name = "NAME")]
+    pub query: String,
 
-    /// Write nothing; list the files that would change and exit 1 if there are any.
-    #[arg(long)]
-    pub check: bool,
+    /// A `.ply` file, or a project root whose `*.ply` files are modules named by path.
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
 
     /// Emit one JSON object on stdout and nothing else.
     #[arg(long)]

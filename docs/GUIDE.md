@@ -782,6 +782,8 @@ and `Option<Option<a>>` (`json`).
 
 In scope everywhere; a module may shadow any except `compare_values` (`E0105`).
 Out-of-range indexes and slices raise `E0502` unless noted; nothing is clamped.
+`ply doc NAME` prints any of these from the compiler's own table, which is the
+authority when this page and it disagree.
 
 ### 12.1 Core, lists and maps
 
@@ -1115,17 +1117,13 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | `--show MODULE`, `--digest`; no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
-| `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change |
+| `ply doc NAME [path]` | a definition or builtin: signature with the written parameter names, the `//` lines above it, place, hash, footprint; a builtin's note comes from the compiler's table |
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, test and law whose closure reaches it |
 | `ply bootstrap <path>` | writes the front end as C: `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing), `--profile` (default `release`) |
 | `ply cache clear\|stats\|compact [path]` | discard results / report size and reclaimable space / reclaim it |
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
-
-`ply fmt` keeps comments, the spelling of every literal, and the order of
-imports, items and statements; it prints `formatted PATH` per file it changed
-and leaves a file that does not parse alone, exiting 2 with the diagnostic.
 
 ## 17. Diagnostics
 
