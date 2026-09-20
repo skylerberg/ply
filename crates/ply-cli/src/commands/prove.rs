@@ -110,7 +110,7 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
     let hosts = match Hosts::open(
         &loaded.check,
         args.host,
-        &args.tls.tls,
+        &args.tls,
         &args.fs.fs,
         db,
         configuration,

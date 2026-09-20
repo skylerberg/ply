@@ -169,6 +169,9 @@ pub struct TlsOptions {
         requires = "host",
     )]
     pub tls: Vec<CredentialSpec>,
+    /// A certificate `net.connect_tls` trusts beside the built-in roots. Repeatable.
+    #[arg(long = "trust", value_name = "CERT.pem", requires = "host")]
+    pub trust: Vec<std::path::PathBuf>,
 }
 
 /// Directory roots per resource label; kept out of the program so no path enters a hash.

@@ -207,7 +207,7 @@ fn iterate(
     let mut hosts = match Hosts::open(
         &loaded.check,
         args.host,
-        &args.tls.tls,
+        &args.tls,
         &args.fs.fs,
         db,
         configuration,

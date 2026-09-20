@@ -96,7 +96,7 @@ fn json_report(
     let hosts = Hosts::open(
         &loaded.check,
         args.host,
-        &[],
+        &ply_cli::cli::TlsOptions::default(),
         &[],
         None,
         ply_cli::config::Configuration::default(),
