@@ -49,7 +49,7 @@ impl Material {
     }
 
     fn credentials(&self, name: &str) -> Credentials {
-        Credentials::load(&[self.spec(name)]).expect("the generated material loads")
+        Credentials::load(&[self.spec(name)], &[]).expect("the generated material loads")
     }
 
     fn write(&self, rel: &str, text: &str) -> PathBuf {
@@ -60,7 +60,7 @@ impl Material {
 }
 
 fn load(spec: CredentialSpec) -> Vec<Diagnostic> {
-    Credentials::load(&[spec]).err().unwrap_or_default()
+    Credentials::load(&[spec], &[]).err().unwrap_or_default()
 }
 
 fn one(diagnostics: Vec<Diagnostic>) -> Diagnostic {
@@ -185,7 +185,7 @@ fn every_credential_that_fails_is_reported_rather_than_the_first() {
         certificate: material.dir.path().join("absent.pem"),
         key: material.key.clone(),
     };
-    let diagnostics = Credentials::load(&[absent("a"), absent("b"), material.spec("c")])
+    let diagnostics = Credentials::load(&[absent("a"), absent("b"), material.spec("c")], &[])
         .expect_err("two of the three cannot load");
     assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
     assert!(
@@ -199,7 +199,7 @@ fn every_credential_that_fails_is_reported_rather_than_the_first() {
 fn two_credentials_with_one_name_are_refused_rather_than_one_winning() {
     let material = material();
     let diagnostic = one(
-        Credentials::load(&[material.spec("api"), material.spec("api")])
+        Credentials::load(&[material.spec("api"), material.spec("api")], &[])
             .expect_err("`api` twice is two answers to one question"),
     );
     assert_eq!(diagnostic.code, codes::TLS_CREDENTIAL_INVALID);
