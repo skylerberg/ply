@@ -5,7 +5,7 @@ use crate::frontend::{
     Member, NameRef, SourceFingerprint,
 };
 use crate::{BODY_ENCODING, ContentHash, DefBody, FRONTEND_FORMAT, Outcome};
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_span::{Diagnostic, Edit, Span, Symbol, codes};
 use ply_ty::Mode;
 use ply_ty::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
 use std::collections::BTreeMap;
@@ -157,10 +157,18 @@ pub fn exemplars() -> Exemplars {
             Outcome::Fail {
                 message: "assertion failed: expected 0, found -5".to_string(),
                 diagnostic: Some(
-                    Diagnostic::error(codes::ASSERTION_FAILED, "assertion failed").primary(
-                        Span::new(ply_span::SourceId(3), 88, 97),
-                        "expected 0, found -5",
-                    ),
+                    Diagnostic::error(codes::ASSERTION_FAILED, "assertion failed")
+                        .primary(
+                            Span::new(ply_span::SourceId(3), 88, 97),
+                            "expected 0, found -5",
+                        )
+                        .fix(
+                            "expect -5",
+                            vec![Edit {
+                                span: Span::new(ply_span::SourceId(3), 88, 89),
+                                text: "-5".to_string(),
+                            }],
+                        ),
                 ),
             },
         ],

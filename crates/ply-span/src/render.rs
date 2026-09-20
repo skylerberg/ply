@@ -20,12 +20,32 @@ struct JsonLabel {
 }
 
 #[derive(Serialize)]
+struct JsonEdit {
+    file: String,
+    start: JsonPos,
+    end: JsonPos,
+    text: String,
+}
+
+#[derive(Serialize)]
+struct JsonFix {
+    title: String,
+    edits: Vec<JsonEdit>,
+}
+
+#[derive(Serialize)]
 pub struct JsonDiagnostic {
     severity: Severity,
     code: &'static str,
     message: String,
     labels: Vec<JsonLabel>,
     notes: Vec<String>,
+    fixes: Vec<JsonFix>,
+}
+
+fn pos(file: &crate::SourceFile, offset: u32) -> JsonPos {
+    let (line, col) = file.line_col(offset);
+    JsonPos { line, col, offset }
 }
 
 pub fn to_json(diag: &Diagnostic, sources: &SourceMap) -> JsonDiagnostic {
@@ -55,13 +75,39 @@ pub fn to_json(diag: &Diagnostic, sources: &SourceMap) -> JsonDiagnostic {
         })
         .collect();
 
+    let fixes = diag
+        .fixes
+        .iter()
+        .map(|f| JsonFix {
+            title: f.title.clone(),
+            edits: f
+                .edits
+                .iter()
+                .filter_map(|e| {
+                    let file = sources.containing(e.span)?;
+                    Some(JsonEdit {
+                        file: file.path.display().to_string(),
+                        start: pos(file, e.span.start),
+                        end: pos(file, e.span.end),
+                        text: e.text.clone(),
+                    })
+                })
+                .collect(),
+        })
+        .collect();
     JsonDiagnostic {
         severity: diag.severity,
         code: diag.code,
         message: diag.message.clone(),
         labels,
         notes: diag.notes.clone(),
+        fixes,
     }
+}
+
+/// A fix as a note line: its title, which says what the edits do.
+fn fix_lines(diag: &Diagnostic) -> impl Iterator<Item = String> + '_ {
+    diag.fixes.iter().map(|f| format!("fix: {}", f.title))
 }
 
 /// All-dummy spans, or spans outside their text, still print a header, so a builtin's error is
@@ -82,6 +128,8 @@ pub fn to_terminal(diag: &Diagnostic, sources: &SourceMap) -> String {
         let notes = diag
             .notes
             .iter()
+            .cloned()
+            .chain(fix_lines(diag))
             .map(|n| format!("\n  = {n}"))
             .collect::<String>();
         return format!(
@@ -108,7 +156,7 @@ pub fn to_terminal(diag: &Diagnostic, sources: &SourceMap) -> String {
                 .with_order(if l.primary { 0 } else { 1 }),
         );
     }
-    for n in &diag.notes {
+    for n in diag.notes.iter().cloned().chain(fix_lines(diag)) {
         report = report.with_note(n);
     }
 
