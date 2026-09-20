@@ -14,6 +14,7 @@ use anyhow::{Result, bail};
 use ply_span::{Span, Symbol};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 /// A loaded C unit, with the surface `crate::backend::Bodies` asks a compiled unit for.
 pub struct Native {
@@ -72,7 +73,22 @@ struct Emitted {
     unit: Unit,
     taken: Vec<String>,
     refusals: Vec<Refused>,
+    phases: Phases,
 }
+
+/// How producing a unit spent its time, and how the body cache fared, for `PLY_C_PHASES`.
+#[derive(Default)]
+struct Phases {
+    emit: Duration,
+    resolve: Duration,
+    embed: Duration,
+    assemble: Duration,
+    hits: usize,
+    misses: usize,
+}
+
+/// A body's C with its tables, or its refusal.
+type Emission = std::result::Result<(String, super::tables::Tables), Refused>;
 
 fn emit_all(
     loaded: &'static Source,
@@ -80,21 +96,40 @@ fn emit_all(
     fragment: &str,
     ctors: &[(Symbol, usize)],
     ctors_digest: &str,
-) -> Result<Emitted> {
+) -> Emitted {
     let mut taken: Vec<String> = offered.iter().map(|n| (*n).to_string()).collect();
     let mut refusals: Vec<Refused> = Vec::new();
+    let mut phases = Phases::default();
+    let started = Instant::now();
 
     // Dropping a body can refuse its callers, so repeat until a round refuses nothing.
     let emitted = loop {
+        // The cache answers first; the emitter is entered once for everything it missed.
+        let looked: Vec<Option<Emission>> = taken
+            .iter()
+            .map(|name| cached(loaded, &taken, name, ctors_digest, fragment))
+            .collect();
+        let missed: Vec<String> = taken
+            .iter()
+            .zip(&looked)
+            .filter(|(_, looked)| looked.is_none())
+            .map(|(name, _)| name.clone())
+            .collect();
+        phases.hits += taken.len() - missed.len();
+        phases.misses += missed.len();
+        if !missed.is_empty() {
+            super::producer::with_current(|p| p.ask(loaded, &missed));
+        }
         let mut emitted: Vec<(String, String, super::tables::Tables)> = Vec::new();
         let mut round: Vec<Refused> = Vec::new();
-        for name in &taken {
-            match emit_one(loaded, &taken, name, ctors_digest, fragment) {
+        for (name, looked) in taken.iter().zip(looked) {
+            let emission = match looked {
+                Some(emission) => emission,
+                None => emit_one(loaded, &taken, name, ctors_digest, fragment),
+            };
+            match emission {
                 Ok((text, tables)) => emitted.push((name.clone(), text, tables)),
-                Err(e) => match e.downcast::<Refused>() {
-                    Ok(r) => round.push(r),
-                    Err(other) => return Err(other),
-                },
+                Err(r) => round.push(r),
             }
         }
         if round.is_empty() {
@@ -105,6 +140,7 @@ fn emit_all(
         }
         refusals.extend(round);
     };
+    phases.emit = started.elapsed();
     let mut unit = Unit::new(ctors.to_vec());
     // In `taken`'s order, which `describe` keeps: a body's place here is the root its sites name.
     let bodies: Vec<(String, String)> = emitted
@@ -115,6 +151,7 @@ fn emit_all(
             (name, text)
         })
         .collect();
+    phases.resolve = started.elapsed() - phases.emit;
 
     if std::env::var("PLY_C_REFUSALS").is_ok() {
         for r in &refusals {
@@ -148,12 +185,13 @@ fn emit_all(
             }
         }
     }
-    Ok(Emitted {
+    Emitted {
         bodies,
         unit,
         taken,
         refusals,
-    })
+        phases,
+    }
 }
 
 /// The whole unit as C, uncompiled; the text embeds `exports` so it loads with no source.
@@ -167,7 +205,8 @@ pub fn produce(loaded: &'static Source, names: &[&str]) -> Result<Produced> {
     let ctors = loaded.ctors();
     let ctors_digest = super::cache::ctors_digest(&ctors);
     let (offered, fragment) = offered_set(names);
-    produce_in(loaded, &offered, &fragment, &ctors, &ctors_digest)
+    let (produced, _) = produce_in(loaded, &offered, &fragment, &ctors, &ctors_digest)?;
+    Ok(produced)
 }
 
 fn produce_in(
@@ -176,7 +215,7 @@ fn produce_in(
     fragment: &str,
     ctors: &[(Symbol, usize)],
     ctors_digest: &str,
-) -> Result<Produced> {
+) -> Result<(Produced, Phases)> {
     // Up front, not only when a body misses the cache: a warm cache would otherwise hide it.
     if !offered.is_empty() && loaded.texts.is_empty() {
         bail!("no source text for this program, and the emitter reads a program's text");
@@ -186,18 +225,24 @@ fn produce_in(
         unit,
         taken,
         refusals,
-    } = emit_all(loaded, offered, fragment, ctors, ctors_digest)?;
+        mut phases,
+    } = emit_all(loaded, offered, fragment, ctors, ctors_digest);
     // Never cache a unit over an emitter that raised: fail, and the next run asks again.
     if let Some(why) = super::producer::with_current(|p| p.failure(loaded)).flatten() {
         bail!("the Ply emitter failed over the program: {why}");
     }
+    let started = Instant::now();
     let exports = describe(loaded, unit, taken, &refusals, ctors);
-    let text = assemble(&bodies, &exports);
-    Ok(Produced {
+    let embedded = exports.embed();
+    phases.embed = started.elapsed();
+    let text = assemble(&bodies, &exports, &embedded);
+    phases.assemble = started.elapsed() - phases.embed;
+    let produced = Produced {
         text,
         exports,
         refused: refusals,
-    })
+    };
+    Ok((produced, phases))
 }
 
 /// What the unit says about itself: the only place a source is read, so loading reads none.
@@ -281,7 +326,7 @@ fn refused_of(exports: &Exports) -> Vec<Refused> {
 
 pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Refused>)> {
     super::sweep::once();
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let ctors = loaded.ctors();
     let ctors_digest = super::cache::ctors_digest(&ctors);
     let (offered, fragment) = offered_set(names);
@@ -310,13 +355,13 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
             return Ok((native, refused));
         }
     }
+    let (produced, phases) = produce_in(loaded, &offered, &fragment, &ctors, &ctors_digest)?;
     let Produced {
         text,
         refused: refusals,
         ..
-    } = produce_in(loaded, &offered, &fragment, &ctors, &ctors_digest)?;
-    let t_emit = started.elapsed();
-    let t_assemble = started.elapsed();
+    } = produced;
+    let t_produced = started.elapsed();
     let lib = compile_and_load(&text, "unit")?;
     let t_cc = started.elapsed();
     if let Some(k) = &unit_key {
@@ -327,12 +372,17 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
     let native = finish(lib, exports, Some(loaded))?;
     if std::env::var("PLY_C_PHASES").is_ok() {
         eprintln!(
-            "phases: emit+resolve {}ms, assemble {}ms, cc+load {}ms, tables {}ms, source {}MB",
-            t_emit.as_millis(),
-            (t_assemble - t_emit).as_millis(),
-            (t_cc - t_assemble).as_millis(),
+            "phases: emit {}ms, resolve {}ms, embed {}ms, assemble {}ms, cc+load {}ms, tables \
+             {}ms, source {}MB, body cache {} hit {} missed",
+            phases.emit.as_millis(),
+            phases.resolve.as_millis(),
+            phases.embed.as_millis(),
+            phases.assemble.as_millis(),
+            (t_cc - t_produced).as_millis(),
             (started.elapsed() - t_cc).as_millis(),
             text.len() / 1_000_000,
+            phases.hits,
+            phases.misses,
         );
     }
     Ok((native, refusals))
@@ -419,48 +469,71 @@ fn constants_of(constants: &[String], unit: &mut Unit) -> HashMap<String, usize>
         .collect()
 }
 
-/// The C for one body, or its refusal. `taken` is what a body may call this round.
+fn refused(name: &str, construct: String) -> Refused {
+    Refused {
+        function: name.to_string(),
+        construct,
+    }
+}
+
+fn not_in_unit(callee: &str) -> String {
+    format!("`{callee}`, which is not in this compiled unit")
+}
+
+/// The body's and the refusal's cache keys; none when the root is unkeyed. Keyed by name too:
+/// equal-content definitions share a hash but emit their own symbol.
+fn keys_of(
+    loaded: &Source,
+    name: &str,
+    ctors_digest: &str,
+    fragment: &str,
+) -> (Option<String>, Option<String>) {
+    let Some(h) = loaded.keys.get(name) else {
+        return (None, None);
+    };
+    let root = format!("{name}\0{h}\0{}", super::producer::identity());
+    (
+        Some(super::cache::key(&root, ctors_digest)),
+        Some(super::cache::refusal_key(&root, ctors_digest, fragment)),
+    )
+}
+
+/// What the cache holds for `name` this round: its refusal, or its body only if every callee is
+/// still `taken`, or it would not link; `None` when the emitter must be asked.
+fn cached(
+    loaded: &Source,
+    taken: &[String],
+    name: &str,
+    ctors_digest: &str,
+    fragment: &str,
+) -> Option<Emission> {
+    let (key, refusal) = keys_of(loaded, name, ctors_digest, fragment);
+    if let Some(k) = &refusal
+        && let Some(reason) = super::cache::read_refusal(k)
+    {
+        return Some(Err(refused(name, reason)));
+    }
+    let (text, tables) = super::cache::read(key.as_deref()?)?;
+    Some(match tables.calls.iter().find(|c| !taken.contains(c)) {
+        Some(missing) => Err(refused(name, not_in_unit(missing))),
+        None => Ok((text, tables)),
+    })
+}
+
+/// The emitter's C for one body, kept in the cache, or its refusal. `taken` is what a body may
+/// call this round.
 fn emit_one(
     loaded: &'static Source,
     taken: &[String],
     name: &str,
     ctors_digest: &str,
     fragment: &str,
-) -> Result<(String, super::tables::Tables)> {
-    let refused = |construct: String| -> anyhow::Error {
-        Refused {
-            function: name.to_string(),
-            construct,
-        }
-        .into()
-    };
-    // Keyed by name too: equal-content definitions share a hash but emit their own symbol.
-    // A cached body is only reused if all its callees are still taken, or it would not link.
-    let identity = super::producer::identity();
-    let key = loaded
-        .keys
-        .get(name)
-        .map(|h| super::cache::key(&format!("{name}\0{h}\0{identity}"), ctors_digest));
-    let refusal = loaded.keys.get(name).map(|h| {
-        super::cache::refusal_key(&format!("{name}\0{h}\0{identity}"), ctors_digest, fragment)
-    });
-    if let Some(k) = &refusal
-        && let Some(reason) = super::cache::read_refusal(k)
-    {
-        return Err(refused(reason));
-    }
-    if let Some(k) = &key
-        && let Some((text, tables)) = super::cache::read(k)
-        && tables.calls.iter().all(|c| taken.contains(c))
-    {
-        return Ok((text, tables));
-    }
+) -> Emission {
+    let (key, refusal) = keys_of(loaded, name, ctors_digest, fragment);
     match super::producer::with_current(|p| p.body(loaded, name)).flatten() {
         Some(super::producer::Answer::Body(text, tables)) => {
             if let Some(missing) = tables.calls.iter().find(|c| !taken.contains(c)) {
-                return Err(refused(format!(
-                    "`{missing}`, which is not in this compiled unit"
-                )));
+                return Err(refused(name, not_in_unit(missing)));
             }
             if let Some(k) = &key {
                 super::cache::write(k, &text, &tables);
@@ -471,9 +544,12 @@ fn emit_one(
             if let Some(k) = &refusal {
                 super::cache::write_refusal(k, &why);
             }
-            Err(refused(why))
+            Err(refused(name, why))
         }
-        None => Err(refused("which the Ply emitter did not answer".to_string())),
+        None => Err(refused(
+            name,
+            "which the Ply emitter did not answer".to_string(),
+        )),
     }
 }
 
@@ -515,7 +591,8 @@ fn resolve(text: &str, tables: &super::tables::Tables, root: usize, unit: &mut U
     out
 }
 
-fn assemble(bodies: &[(String, String)], exports: &Exports) -> String {
+/// `embedded` is [`Exports::embed`] of `exports`, laid out last.
+fn assemble(bodies: &[(String, String)], exports: &Exports, embedded: &str) -> String {
     let mut out = String::from(PRELUDE);
     out.push_str(&runtime_decls());
     out.push_str("\n/* --- prototypes, so a call between two bodies resolves --- */\n");
@@ -531,7 +608,7 @@ fn assemble(bodies: &[(String, String)], exports: &Exports) -> String {
         out.push_str(text);
         out.push('\n');
     }
-    out.push_str(&exports.embed());
+    out.push_str(embedded);
     out
 }
 

@@ -626,7 +626,7 @@ only evaluator. Its passes share the evaluator's cache.
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused |
 | `PLY_C_DUMP=NAME` | print one body's emitted C, or `*` for the unit's largest bodies |
 | `PLY_C_ONLY=a,b`, `PLY_C_SKIP=prefix,...` | compile only the named definitions, or drop those with a prefix |
-| `PLY_C_PHASES=1` | print compile phases and allocation counts |
+| `PLY_C_PHASES=1` | print compile phases, body-cache hits and misses, and allocation counts |
 | `PLY_HEAP_POISON=1` | poison released blocks and fail on a read of one |
 | `PLY_HEAP_DELAY=N` | reuse a released block only after `N` more releases |
 | `PLY_C_EMITTER=ply:DIR` | use emitter sources from `DIR` instead of the built-in ones |
