@@ -80,7 +80,7 @@ pub mod golden {
     fn read(path: &Path, index: Option<usize>) -> Option<String> {
         let text = std::fs::read_to_string(path).ok()?;
         let Some(index) = index else {
-            return Some(folded(&text));
+            return Some(super::folded(&text));
         };
         let mut found: Option<String> = None;
         for line in text.split_inclusive('\n') {
@@ -99,7 +99,7 @@ pub mod golden {
             if f.ends_with('\n') {
                 f.pop();
             }
-            folded(&f)
+            super::folded(&f)
         })
     }
 
@@ -109,7 +109,7 @@ pub mod golden {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap_or_else(|e| panic!("{}: {e}", parent.display()));
         }
-        let text = unfolded(text);
+        let text = super::unfolded(text);
         let Some(index) = index else {
             std::fs::write(path, &text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             return;
