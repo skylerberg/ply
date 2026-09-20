@@ -165,7 +165,7 @@ fn lent_to_a_step(n: Int) -> Int = { let p = {x: n, y: 0}; fold(range(0, 3), 0, 
 "#;
 
 pub fn call(unit: &'static Unit, name: &str, args: &[Value]) -> Option<Value> {
-    let backend = unit.attach(&ply_eval::BackendSpec::honest());
+    let backend = unit.attach(&ply_eval::BackendSpec::default());
     backend.enter(&Symbol::new(name), args, 10_000)
 }
 
@@ -551,7 +551,7 @@ fn a_call_of_the_wrong_arity_is_declined() {
 #[test]
 fn a_recursion_past_the_budget_declines_rather_than_running_it() {
     let (_, unit) = unit(ARITHMETIC);
-    let backend = unit.attach(&ply_eval::BackendSpec::honest());
+    let backend = unit.attach(&ply_eval::BackendSpec::default());
     let ladder = Symbol::new("m.ladder");
     assert_eq!(
         backend.enter(&ladder, &[Value::Int(100)], 8),
@@ -578,7 +578,7 @@ fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
     let edited = ARITHMETIC.replace("x * 2", "x * 3");
     assert_ne!(edited, ARITHMETIC, "the fixture spells `double`'s body");
     let other = load(&edited);
-    let backend = unit.attach(&ply_eval::BackendSpec::honest());
+    let backend = unit.attach(&ply_eval::BackendSpec::default());
     assert!(backend.describes(loaded.front.hashes.digest()));
     assert!(!backend.describes(other.front.hashes.digest()));
 }

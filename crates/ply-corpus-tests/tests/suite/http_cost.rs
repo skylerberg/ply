@@ -34,7 +34,6 @@ fn on_tier<'a>(front: &'a ply_ty::Front, unit: &'static ply_codegen::Unit) -> Ma
     let mut machine = Machine::new(front);
     let spec = ply_eval::BackendSpec {
         kind: ply_eval::BackendKind::C,
-        ..Default::default()
     };
     machine.set_compiled(ply_eval::Provider::attach(unit, &spec));
     machine

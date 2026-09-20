@@ -34,8 +34,7 @@ mod value;
 pub use arena::{Arena, RegionKind};
 pub use argv::CLASSES as ARGUMENT_VECTOR_CLASSES;
 pub use backend::{
-    Compilation, Counters, Kind as BackendKind, Mutant, Mutation, Offers, Policed, Provider,
-    Spec as BackendSpec,
+    Compilation, Counters, Kind as BackendKind, Offers, Provider, Spec as BackendSpec,
 };
 pub use builtins::{Builtin, Step, assert_failure, assertion_failure};
 pub use compiled::{Compiled, Entered, mentions_a_width};
