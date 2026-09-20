@@ -30,10 +30,9 @@ use ply_store::Store;
 use std::path::Path;
 
 /// The default tier; a bare machine has no front end and declines everything.
-pub(crate) fn honest() -> ply_eval::BackendSpec {
+pub(crate) fn tier_spec() -> ply_eval::BackendSpec {
     ply_eval::BackendSpec {
         kind: ply_eval::BackendKind::C,
-        ..Default::default()
     }
 }
 
@@ -46,7 +45,7 @@ pub fn tier_machine<'a>(
     let texts = ply_cli::commands::common::module_texts(&port.check, sources);
     let unit = ply_codegen::Unit::over_front(port, texts).expect("this host has a C compiler");
     let mut machine = ply_eval::Machine::new(port);
-    machine.set_compiled(ply_eval::Provider::attach(unit, &honest()));
+    machine.set_compiled(ply_eval::Provider::attach(unit, &tier_spec()));
     machine
 }
 
@@ -63,7 +62,7 @@ pub fn run_on_tier(
     let unit =
         ply_codegen::Unit::over_front(&front.port, texts).expect("this host has a C compiler");
     let executor = ply_test::InterpExecutor::new(&front.port)
-        .with_backend(unit, honest())
+        .with_backend(unit, tier_spec())
         .with_search(search)
         .with_hosts(hosting);
     ply_test::run_with(selection, &front.check, &front.hashes, store, &executor)
