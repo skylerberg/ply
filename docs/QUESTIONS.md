@@ -26,11 +26,10 @@ definitions. An atom reached through a function value (a parameter, a field, a c
 that name operations (`net.send[conn]`), a change to the row syntax, the printer, the hash and
 the frames. Assumed: worth doing as its own item, listed in `docs/DIRECTION.md`.
 
-## Libraries against more than one resource label
+## Record shapes stay file-local
 
-`std.http`'s client runs under `[conn]` because a definition cannot be generic over a label:
-`send_all` is written `/ {net.write[conn]}` and a socket is bound to the label it is first used
-under. The direction item wants `fn send_all<[l]>(c: Int, ...) / {net.write[l]}`, a label
-variable instantiated at each call and printed, hashed and scheduled like a named label. It
-interacts with rows that name operations, so it is planned after that item. Say if you would
-rather have labels passed as values, or the standard library duplicated per label.
+A record update now takes its shape from a call of a `fn` declared in the same file, and a
+`let` without a type takes the written type of such a call, a local or an update. Shapes are
+still never read across a module boundary: the rewrite runs before types exist, and a shape
+read from another file would change this file's hashes without this file changing. Assumed:
+that line stays where it is, and `{..other::make(), x: 1}` keeps needing a local annotation.
