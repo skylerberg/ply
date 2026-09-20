@@ -1,11 +1,12 @@
 //! What a body names of the unit around it, and the unit's tables those names resolve into. A
-//! unit's tables are sorted by content, so a body's resolved C is a function of what the unit
-//! holds and never of the order its definitions were taken in.
+//! unit is built with its tables sorted by content, so a body's resolved C is a function of what
+//! the unit holds and never of the order its definitions were taken in.
 
 use super::cache::encode_const;
 use crate::heap::Layouts;
 use ply_eval::{Builtin, Value};
 use ply_span::Symbol;
+use std::collections::HashMap;
 
 /// What one body names of the unit around it, by the positions its own text uses.
 #[derive(Default, Clone)]
@@ -23,27 +24,42 @@ pub struct Tables {
     pub handles: Vec<String>,
 }
 
-/// What an emitted unit accumulates that is not code: each table sorted and duplicate-free, so
-/// an entry's position is its rank among the entries the unit holds.
+/// What an emitted unit accumulates that is not code, with each entry's position. A unit being
+/// built sorts every table by content, so a position is a rank among what the unit holds; a unit
+/// read back keeps the order its C was emitted against, whatever that was.
 pub struct Unit {
-    /// By [`encode_const`] of the value.
     pub consts: Vec<Value>,
     pub fields: Vec<Symbol>,
-    /// By name.
     pub builtins: Vec<Builtin>,
-    /// Each shape's field names sorted, the shapes sorted; a shape's id is its position.
+    /// Each shape's field names sorted; a shape's id is its position.
     pub shapes: Vec<Vec<Symbol>>,
     pub layouts: Layouts,
     /// Lambda entry symbols; `rt_closure` and `rt_constant` take a position here.
     pub lambdas: Vec<String>,
+    const_at: HashMap<String, usize>,
+    field_at: HashMap<Symbol, usize>,
+    builtin_at: HashMap<&'static str, usize>,
+    shape_at: HashMap<Vec<Symbol>, u32>,
+    lambda_at: HashMap<String, usize>,
 }
 
-fn ascending<T: PartialOrd>(xs: &[T]) -> bool {
-    xs.windows(2).all(|w| w[0] < w[1])
+fn positions<K: std::hash::Hash + Eq>(keys: impl IntoIterator<Item = K>) -> HashMap<K, usize> {
+    let mut at = HashMap::new();
+    for (i, k) in keys.into_iter().enumerate() {
+        at.entry(k).or_insert(i);
+    }
+    at
+}
+
+fn sorted(names: &[Symbol]) -> Vec<Symbol> {
+    let mut names = names.to_vec();
+    names.sort();
+    names
 }
 
 impl Unit {
-    /// The union of what `bodies` name and the lambda symbols given.
+    /// The union of what `bodies` name and the lambda symbols given, each table sorted by
+    /// content and duplicate-free.
     pub fn of<'a>(
         ctors: Vec<(Symbol, usize)>,
         bodies: impl IntoIterator<Item = &'a Tables>,
@@ -58,11 +74,7 @@ impl Unit {
             consts.extend(t.consts.iter().map(|v| (encode_const(v), v.clone())));
             fields.extend(t.fields.iter().cloned());
             builtins.extend(t.builtins.iter().copied());
-            shapes.extend(t.shapes.iter().map(|names| {
-                let mut names = names.clone();
-                names.sort();
-                names
-            }));
+            shapes.extend(t.shapes.iter().map(|names| sorted(names)));
             lambdas.extend(t.lambdas.iter().cloned());
         }
         consts.sort_by(|a, b| a.0.cmp(&b.0));
@@ -83,11 +95,11 @@ impl Unit {
             shapes,
             lambdas,
         )
-        .expect("sorted and deduplicated tables are in order")
+        .expect("a sorted, duplicate-free shape list interns to its positions")
     }
 
-    /// The tables as a unit recorded them; `None` unless each is sorted and duplicate-free, since
-    /// the positions its C bakes are ranks.
+    /// The tables as a unit recorded them, positions as given; `None` if a shape would not
+    /// intern to its position, since those are the ids its C bakes.
     pub fn from_tables(
         ctors: Vec<(Symbol, usize)>,
         consts: Vec<Value>,
@@ -96,19 +108,23 @@ impl Unit {
         shapes: Vec<Vec<Symbol>>,
         lambdas: Vec<String>,
     ) -> Option<Unit> {
-        let const_keys: Vec<String> = consts.iter().map(encode_const).collect();
-        let builtin_names: Vec<&str> = builtins.iter().map(|b| b.name()).collect();
-        let ordered = ascending(&const_keys)
-            && ascending(&fields)
-            && ascending(&builtin_names)
-            && ascending(&shapes)
-            && shapes.iter().all(|names| ascending(names))
-            && ascending(&lambdas);
-        if !ordered {
-            return None;
-        }
         let layouts = Layouts::of(ctors, &shapes);
+        for (id, names) in shapes.iter().enumerate() {
+            if layouts.shape(names.clone()) as usize != id {
+                return None;
+            }
+        }
+        let shape_at = shapes
+            .iter()
+            .enumerate()
+            .map(|(id, names)| (sorted(names), id as u32))
+            .collect();
         Some(Unit {
+            const_at: positions(consts.iter().map(encode_const)),
+            field_at: positions(fields.iter().cloned()),
+            builtin_at: positions(builtins.iter().map(|b| b.name())),
+            shape_at,
+            lambda_at: positions(lambdas.iter().cloned()),
             consts,
             fields,
             builtins,
@@ -119,32 +135,23 @@ impl Unit {
     }
 
     pub fn constant(&self, v: &Value) -> Option<usize> {
-        let key = encode_const(v);
-        self.consts
-            .binary_search_by(|c| encode_const(c).cmp(&key))
-            .ok()
+        self.const_at.get(&encode_const(v)).copied()
     }
 
     pub fn field(&self, name: &Symbol) -> Option<usize> {
-        self.fields.binary_search(name).ok()
+        self.field_at.get(name).copied()
     }
 
     pub fn builtin(&self, b: Builtin) -> Option<usize> {
-        self.builtins
-            .binary_search_by(|x| x.name().cmp(b.name()))
-            .ok()
+        self.builtin_at.get(b.name()).copied()
     }
 
     pub fn shape(&self, names: &[Symbol]) -> Option<u32> {
-        let mut names = names.to_vec();
-        names.sort();
-        self.shapes.binary_search(&names).ok().map(|i| i as u32)
+        self.shape_at.get(&sorted(names)).copied()
     }
 
     pub fn lambda(&self, symbol: &str) -> Option<usize> {
-        self.lambdas
-            .binary_search_by(|l| l.as_str().cmp(symbol))
-            .ok()
+        self.lambda_at.get(symbol).copied()
     }
 }
 
