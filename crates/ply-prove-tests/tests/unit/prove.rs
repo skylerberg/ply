@@ -569,7 +569,7 @@ fn a_recursive_definition_is_unfolded_only_by_induction() {
     not_proved(&f, "a step off the top overflows");
 }
 
-const LISTS: &str = r#"
+const SPINES: &str = r#"
 fn count<a>(xs: List<a>) -> Int = match xs { [] -> 0, [_, ..rest] -> 1 + count(rest) }
 fn total(xs: List<Int>) -> Int = match xs { [] -> 0, [x, ..rest] -> x + total(rest) }
 fn spin(xs: List<Int>) -> Int = match xs { [] -> 0, [_, ..rest] -> spin(xs) }
@@ -587,7 +587,7 @@ law "a pushed literal ends in what was pushed" forall (x: Int) { match push([1],
 
 #[test]
 fn a_recursive_definition_over_a_list_is_proved_by_induction_on_its_spine() {
-    let f = fixture(LISTS);
+    let f = fixture(SPINES);
     let proved = proof(&f, "counting counts");
     assert!(
         proved
@@ -609,7 +609,7 @@ fn a_recursive_definition_over_a_list_is_proved_by_induction_on_its_spine() {
 
 #[test]
 fn list_patterns_over_literal_spines_are_decided_without_induction() {
-    let f = fixture(LISTS);
+    let f = fixture(SPINES);
     proof(&f, "a list pattern takes the head of a literal");
     proof(&f, "a pushed literal ends in what was pushed");
     not_proved(&f, "a list pattern does not confuse the tail");
