@@ -1305,7 +1305,7 @@ pub fn volley(n: Int) -> Int = ping(n, 0)
         .find(|m| {
             produced
                 .text
-                .contains(&format!("static Word ply__group_{}(", mangle(m)))
+                .contains(&format!("static Word ply__group_{}(", m.replace('.', "_")))
         })
         .expect("`ping` and `pong` are a group");
     // Each body placed, by the name it sits under, with what it calls.
