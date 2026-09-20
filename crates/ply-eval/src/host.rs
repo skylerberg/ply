@@ -83,7 +83,7 @@ pub struct HostOp {
 
 impl HostOp {
     fn atom(&self, effect: &Symbol, resource: Resource, mode: ply_ty::Mode) -> EffectAtom {
-        EffectAtom::new(effect.clone(), resource, mode)
+        EffectAtom::operation(effect.clone(), resource, mode, self.op.clone())
     }
 
     fn serves_label(&self, resource: &Resource) -> bool {
@@ -321,11 +321,19 @@ fn resolve(
             continue;
         }
 
-        let candidates: Vec<Resource> = match &op.resource {
-            HostResource::Only(r) => vec![r.clone()],
+        // A footprint names the operation, or the mode when its row was written that way; a program
+        // holding both names one label once.
+        let candidates: BTreeSet<Resource> = match &op.resource {
+            HostResource::Only(r) => BTreeSet::from([r.clone()]),
             HostResource::Any => performed
                 .iter()
-                .filter(|a| a.effect == *name && a.mode == decl.mode)
+                .filter(|a| {
+                    a.effect == *name
+                        && match &a.op {
+                            Some(named) => *named == op.op,
+                            None => a.mode == decl.mode,
+                        }
+                })
                 .map(|a| a.resource.clone())
                 .collect(),
         };
@@ -340,7 +348,9 @@ fn resolve(
             }
             let atom = op.atom(name, resource.clone(), decl.mode);
             // `Only` naming a resource the program never performs is usually an unfollowed rename.
-            if matches!(op.resource, HostResource::Only(_)) && !performed.contains(&atom) {
+            if matches!(op.resource, HostResource::Only(_))
+                && !performed.iter().any(|p| p.covers(&atom))
+            {
                 diagnostics.push(err_unused_resource(op, &atom, effect));
                 continue;
             }
@@ -407,6 +417,7 @@ pub struct HostRow {
     pub effect: Symbol,
     pub op: Symbol,
     pub resource: Resource,
+    /// The operation atom: what the row prints, with the declared mode.
     pub atom: EffectAtom,
     /// Index of the registration that produced this row.
     pub row: usize,
@@ -453,10 +464,9 @@ impl HostListing {
         hasher.update(DIGEST_DOMAIN);
         hasher.update(&(self.rows.len() as u64).to_le_bytes());
         for row in &self.rows {
-            for text in [row.to_string(), row.atom.to_string()] {
-                hasher.update(&(text.len() as u64).to_le_bytes());
-                hasher.update(text.as_bytes());
-            }
+            let text = row.to_string();
+            hasher.update(&(text.len() as u64).to_le_bytes());
+            hasher.update(text.as_bytes());
             hasher.update(&(row.path.len() as u64).to_le_bytes());
             hasher.update(row.path.as_bytes());
             hasher.update(&[
@@ -541,8 +551,9 @@ impl HostBinding {
         &self.footprint
     }
 
+    /// Whether a bound row is within `atom`: the row itself, or an operation a mode atom covers.
     pub fn serves(&self, atom: &EffectAtom) -> bool {
-        self.atoms.contains(atom)
+        self.atoms.iter().any(|row| atom.covers(row))
     }
 
     pub fn reaches(&self, footprint: &Footprint) -> bool {

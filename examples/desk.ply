@@ -2,9 +2,9 @@
 // and which can be started, watched, and stopped without losing a request.
 
 import std.net (net, send_all)
-// Twice, and both are needed: the selective import binds the effect name, so that a row can say
-// `db.read[items]` and a perform can say `db.query[items]`, and the plain import binds the module,
-// so that a type can say `db::Answer` and a call can say `db::transaction`.
+// Twice, and both are needed: the selective import binds the effect name, so that a row and a
+// perform can both say `db.query[items]`, and the plain import binds the module, so that a type
+// can say `db::Answer` and a call can say `db::transaction`.
 import std.db
 import std.db (db)
 import std.json
@@ -23,19 +23,27 @@ import std.signal (signal)
 // The desk used to declare `effect log { write note(line: String) -> Unit }`, a singleton atom for
 // the one audit trail it had.
 effect set Store = {
-  db.read[items], db.write[items],
-  db.read[orders], db.write[orders],
-  db.write,
+  db.query[items], db.execute[items],
+  db.query[orders], db.execute[orders], db.returning[orders],
+  db.begin, db.commit, db.abort, db.rollback,
 }
 
 // Placing an order and cancelling one both read the shelf, write the shelf, read the order book,
 // write the order book, open a transaction, record on the order book's channel and record on the
 // shelf's.
-effect set Desk = { Store, trace.write[orders], trace.write[items] }
+effect set Desk = {
+  Store,
+  trace.enter[orders], trace.exit[orders], trace.event[orders], trace.count[orders],
+  trace.event[items],
+}
 
 // What the *serving* layer performs, which is strictly more: the request span on the `http`
 // channel, the credential the API-key check reads, and the stop flag the readiness route consults.
-effect set Serving = { Desk, trace.write[http], config.read[credentials], signal.read }
+effect set Serving = {
+  Desk,
+  trace.enter[http], trace.exit[http], trace.event[http],
+  config.secret[credentials], signal.stopping,
+}
 
 // --- What the desk sells --------------------------------------------------------
 
@@ -293,13 +301,13 @@ fn head_of<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> No
 fn unavailable(e: db::DbError) -> http::Response =
   problem(503, "the store is unavailable", e.code)
 
-fn shelf() -> Result<List<Item>, http::Response> / {db.read[items]} =
+fn shelf() -> Result<List<Item>, http::Response> / {db.query[items]} =
   rows_of(db.query[items](items_all(), []), item_row())
 
-fn book() -> Result<List<Order>, http::Response> / {db.read[orders]} =
+fn book() -> Result<List<Order>, http::Response> / {db.query[orders]} =
   rows_of(db.query[orders](orders_all(), []), order_row())
 
-fn order_row_of(id: Int) -> Result<Option<Order>, http::Response> / {db.read[orders]} = {
+fn order_row_of(id: Int) -> Result<Option<Order>, http::Response> / {db.query[orders]} = {
   let os = rows_of(db.query[orders](order_by_id(), [db::PInt(id)]), order_row())?;
   Ok(head_of(os))
 }
@@ -447,7 +455,7 @@ pub fn health() -> http::Response =
   json_body(200, {service: "parts desk", routes: len(table())}, health_json())
 
 // 503 while draining, 503 while the store is unreachable, 200 otherwise.
-pub fn ready() -> http::Response / {signal.read, db.read[items]} =
+pub fn ready() -> http::Response / {db.query[items], signal.stopping} =
   if signal.stopping() {
     unready("draining", true)
   } else {
@@ -482,20 +490,20 @@ pub fn docs(params: Map<String, String>) -> http::Response =
       },
   }
 
-pub fn list_items() -> http::Response / {db.read[items]} =
+pub fn list_items() -> http::Response / {db.query[items]} =
   match shelf() {
     Err(r) -> r,
     Ok(rows) -> json_body(200, rows, json::list_json(item_json())),
   }
 
 // Everything the shelf is short of.
-pub fn featured() -> http::Response / {db.read[items]} =
+pub fn featured() -> http::Response / {db.query[items]} =
   match rows_of(db.query[items](items_in_stock(), [db::PInt(0)]), item_row()) {
     Err(r) -> r,
     Ok(rows) -> json_body(200, rows, json::list_json(item_json())),
   }
 
-pub fn get_item(params: Map<String, String>) -> http::Response / {db.read[items]} =
+pub fn get_item(params: Map<String, String>) -> http::Response / {db.query[items]} =
   match map_get(params, "sku") {
     None -> problem(400, "bad request", "no sku was captured"),
     Some(sku) ->
@@ -509,13 +517,13 @@ pub fn get_item(params: Map<String, String>) -> http::Response / {db.read[items]
       },
   }
 
-pub fn list_orders() -> http::Response / {db.read[orders]} =
+pub fn list_orders() -> http::Response / {db.query[orders]} =
   match book() {
     Err(r) -> r,
     Ok(rows) -> json_body(200, rows, json::list_json(order_json())),
   }
 
-pub fn get_order(params: Map<String, String>) -> http::Response / {db.read[orders]} =
+pub fn get_order(params: Map<String, String>) -> http::Response / {db.query[orders]} =
   match order_wanted(params) {
     Err(r) -> r,
     Ok(id) ->
@@ -606,7 +614,7 @@ fn recorded(p: Placement, stock: List<Item>, total: Decimal) -> http::Response /
 // sku named on two lines is one reservation of their sum — which is how a desk avoids selling the
 // same three widgets twice inside one order.
 fn move_stock(stock: List<Item>, lines: List<Line>, sign: Int) -> Unit
-  / {db.write[items], db.write, trace.write[items]} = {
+  / {db.execute[items], db.rollback, trace.event[items]} = {
   let drawn = filter(stock, |i: Item| taken(lines, i.sku) > 0);
   moving(drawn, lines, sign);
   // After the reservations and not before, so the record is a claim that the shelf moved rather
@@ -618,7 +626,7 @@ fn move_stock(stock: List<Item>, lines: List<Line>, sign: Int) -> Unit
 }
 
 fn moving(stock: List<Item>, lines: List<Line>, sign: Int) -> Unit
-  / {db.write[items], db.write} =
+  / {db.execute[items], db.rollback} =
   match stock {
     [i, ..rest] -> {
       reserved(i, i.on_hand - sign * taken(lines, i.sku));
@@ -628,7 +636,7 @@ fn moving(stock: List<Item>, lines: List<Line>, sign: Int) -> Unit
   }
 
 // Three answers, and each one is a different thing to have happened.
-fn reserved(i: Item, to: Int) -> Unit / {db.write[items], db.write} =
+fn reserved(i: Item, to: Int) -> Unit / {db.execute[items], db.rollback} =
   match db.execute[items](item_reserve(),
                           [db::PInt(to), db::PText(i.sku), db::PInt(i.on_hand)]) {
     db::Count(n) -> if n == 1 { () } else { db.rollback(i.sku) },
@@ -761,7 +769,7 @@ pub type Reply =
   | Stream({ head: http::Response, cursor: Cursor })
 
 pub fn receipt(params: Map<String, String>) -> Reply
-  / {db.read[items], db.read[orders]} =
+  / {db.query[items], db.query[orders]} =
   match order_wanted(params) {
     Err(r) -> Buffered(r),
     Ok(id) ->
@@ -779,7 +787,7 @@ pub fn receipt(params: Map<String, String>) -> Reply
 // than out of the database: a receipt of ten thousand lines costs one query and holds one line at a
 // time, and a chunk producer that queried per line would put the database inside `next_chunk`'s row
 // and inside the connection's write loop.
-fn streamed(o: Order) -> Reply / {db.read[items]} =
+fn streamed(o: Order) -> Reply / {db.query[items]} =
   match shelf() {
     Err(r) -> Buffered(r),
     Ok(stock) -> Stream({head: text(200, b""), cursor: cursor_for(o, stock)}),
@@ -861,7 +869,7 @@ fn endpoint_name(e: Endpoint) -> String =
 // Exhaustive by construction: add a variant to `Endpoint` without a route and the table is one line
 // short; add one without an arm here and it is `E0205`.
 fn dispatched(e: Endpoint, req: http::Request, params: Map<String, String>) -> Reply
-  / {Desk, signal.read} =
+  / {Desk, signal.stopping} =
   match e {
     Health -> Buffered(health()),
     Ready -> Buffered(ready()),
@@ -955,7 +963,8 @@ pub fn limits() -> http::Limits = {
   connect_timeout_ms: 5000,
 }
 
-pub fn serve_connection(c: Int, l: http::Limits) -> Unit / {Serving, net.write[conn]} = {
+pub fn serve_connection(c: Int, l: http::Limits) -> Unit
+  / {Serving, net.recv[conn], net.send[conn], net.close[conn]} = {
   // A limit that is zero or negative is a configuration nobody meant, and it is refused here rather
   // than turning into a service that answers 413 to everything.
   http::check_limits(l);
@@ -964,7 +973,7 @@ pub fn serve_connection(c: Int, l: http::Limits) -> Unit / {Serving, net.write[c
 }
 
 fn turn(c: Int, l: http::Limits, carried: Bytes, left: Int, reused: Bool) -> Unit
-  / {Serving, net.write[conn]} =
+  / {Serving, net.recv[conn], net.send[conn]} =
   if left <= 0 {
     ()
   } else {
@@ -982,7 +991,7 @@ fn turn(c: Int, l: http::Limits, carried: Bytes, left: Int, reused: Bool) -> Uni
   }
 
 fn heard(c: Int, l: http::Limits, buf: Bytes, complete: Bool, left: Int) -> Unit
-  / {Serving, net.write[conn]} =
+  / {Serving, net.recv[conn], net.send[conn]} =
   match http::parse_head(buf, l) {
     // The head stopped mid-way with nothing more coming, or it ran past the bound without a
     // terminator.
@@ -1002,7 +1011,7 @@ fn heard(c: Int, l: http::Limits, buf: Bytes, complete: Bool, left: Int) -> Unit
   }
 
 fn continued(c: Int, l: http::Limits, h: http::Head, buf: Bytes, left: Int) -> Unit
-  / {Serving, net.write[conn]} = {
+  / {Serving, net.recv[conn], net.send[conn]} = {
   // A client that waits for a `100` it never gets is a hang, and a hang is the failure shape with
   // nothing to read.
   let told = if h.expects_continue {
@@ -1020,7 +1029,7 @@ fn continued(c: Int, l: http::Limits, h: http::Head, buf: Bytes, left: Int) -> U
 }
 
 fn with_body(c: Int, l: http::Limits, h: http::Head, body: http::BodyResult, left: Int) -> Unit
-  / {Serving, net.write[conn]} =
+  / {Serving, net.recv[conn], net.send[conn]} =
   match body {
     http::BodyTimedOut -> write_out(c, l, h.request.method, h.request.version, false,
       http::text_response(408, "the request body did not arrive\n")),
@@ -1032,7 +1041,7 @@ fn with_body(c: Int, l: http::Limits, h: http::Head, body: http::BodyResult, lef
 
 fn answered(c: Int, l: http::Limits, h: http::Head,
             got: { bytes: Bytes, rest: Bytes, trailers: http::Headers }, left: Int) -> Unit
-  / {Serving, net.write[conn]} = {
+  / {Serving, net.recv[conn], net.send[conn]} = {
   let keep = h.keep_alive && left > 1;
   let reply = answer(whole(h, got.bytes, got.trailers));
   let wrote = match streamable(h.request.method, reply) {
@@ -1074,13 +1083,13 @@ fn whole(h: http::Head, body: Bytes, trailers: http::Headers) -> http::Request =
 }
 
 fn write_out(c: Int, l: http::Limits, m: http::Method, v: http::Version, keep: Bool,
-             r: http::Response) -> Unit / {net.write[conn]} = {
+             r: http::Response) -> Unit / {net.send[conn]} = {
   send_all(c, http::encode(m, v, keep, r), l.write_timeout_ms);
   ()
 }
 
 pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
-  / {Serving, net.write[conn], net.write[listener]} =
+  / {Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn]} =
   if count <= 0 {
     0
   } else {
@@ -1094,7 +1103,8 @@ pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
   }
 
 pub fn listen_and_serve(port: Int, count: Int) -> Int
-  / {Serving, net.write[conn], net.write[listener]} {
+  / {Serving, net.listen[listener], net.accept[listener], net.close[listener],
+     net.recv[conn], net.send[conn], net.close[conn]} {
   let listener = net.listen[listener](port);
   let served = serve(listener, limits(), count);
   net.close[listener](listener);
@@ -1103,7 +1113,8 @@ pub fn listen_and_serve(port: Int, count: Int) -> Int
 
 // The same service over TLS.
 pub fn listen_and_serve_tls(port: Int, credential: String, count: Int) -> Int
-  / {Serving, net.write[conn], net.write[listener]} {
+  / {Serving, net.listen_tls[listener], net.accept[listener], net.close[listener],
+     net.recv[conn], net.send[conn], net.close[conn]} {
   let listener = net.listen_tls[listener](port, credential);
   let served = serve(listener, limits(), count);
   net.close[listener](listener);
@@ -1112,31 +1123,36 @@ pub fn listen_and_serve_tls(port: Int, credential: String, count: Int) -> Int
 
 // --- The desk, stocked and running ----------------------------------------------------
 pub fn run(port: Int, count: Int) -> Int
-  / {Serving, net.write[conn], net.write[listener]} =
+  / {Serving, net.listen[listener], net.accept[listener], net.close[listener],
+     net.recv[conn], net.send[conn], net.close[conn]} =
   listen_and_serve(port, count)
 
 // The same desk, over TLS, differing in one call.
 pub fn run_tls(port: Int, credential: String, count: Int) -> Int
-  / {Serving, net.write[conn], net.write[listener]} =
+  / {Serving, net.listen_tls[listener], net.accept[listener], net.close[listener],
+     net.recv[conn], net.send[conn], net.close[conn]} =
   listen_and_serve_tls(port, credential, count)
 
 // The same desk, over a database that is a value, a sink that is a value and a stop flag that is a
 // value.
 pub fn run_memory(port: Int, api: Option<Secret<String>>, count: Int) -> Int
-  / {net.write[conn], net.write[listener]} =
+  / {net.listen[listener], net.listen_tls[listener], net.accept[listener], net.close[listener],
+     net.recv[conn], net.send[conn], net.close[conn]} =
   memory_serving(port, "", api, count)
 
 // The twin over TLS, which is the same sentence `run_tls` is: the credential decides the handshake
 // and nothing else, and the clauses below are written once rather than once per transport.
 pub fn run_memory_tls(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int
-  / {net.write[conn], net.write[listener]} =
+  / {net.listen[listener], net.listen_tls[listener], net.accept[listener], net.close[listener],
+     net.recv[conn], net.send[conn], net.close[conn]} =
   memory_serving(port, tls, api, count)
 
 // The API key the *tests* drive the twin with.
 pub fn twin_key() -> String = "twin-key-not-a-credential"
 
 fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int
-  / {net.write[conn], net.write[listener]} =
+  / {net.listen[listener], net.listen_tls[listener], net.accept[listener], net.close[listener],
+     net.recv[conn], net.send[conn], net.close[conn]} =
   with_cell[store](stocked(seed_shelf(), seed_orders())) { c -> {
   with_cell[sink](trace::sink()) { t -> {
   with_cell[stop](signal::running()) { s -> {
@@ -1211,7 +1227,9 @@ fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: In
   } }
 
 // The entry point, which is the postgres one.
-fn main() -> Int / {Serving, config.read[server], net.write[conn], net.write[listener]} = {
+fn main() -> Int
+  / {Serving, config.get[server], net.listen[listener], net.accept[listener], net.close[listener],
+     net.recv[conn], net.send[conn], net.close[conn]} = {
   let key = config.secret[credentials](api_key());
   let port = configured(port_of(config.get[server](port_key())));
   let count = configured(connections_of(config.get[server](connections_key())));
@@ -1387,7 +1405,7 @@ pub type Ran<a> = {
 
 // The whole service's world, installed as values.
 fn against<a | e>(d: db::MemDb, values: config::Values,
-                  body: () -> a / {Serving | e}) -> Ran<a> / {signal.read | e} =
+                  body: () -> a / {Serving | e}) -> Ran<a> / {signal.stopping | e} =
   with_cell[store](d) { c -> {
   with_cell[sink](trace::sink()) { t -> {
     let step = |q: db::Stmt, ps: List<db::Param>| {

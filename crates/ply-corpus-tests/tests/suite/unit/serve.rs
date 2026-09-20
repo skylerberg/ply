@@ -94,7 +94,7 @@ fn the_concurrent_variant_changes_only_the_accept_loop() {
     let concurrent = endpoint.concurrent(Parser::Native, 19002, 1).unwrap();
     assert!(concurrent.contains("task.spawn(|| serve_one(c))"));
     for shared in [
-        "fn serve_one(c: Int) -> Unit / {net.write[conn]} {",
+        "fn serve_one(c: Int) -> Unit {",
         "fn answer(head: Bytes) -> Bytes =",
         "fn head_end(head: Bytes) -> Int =",
     ] {

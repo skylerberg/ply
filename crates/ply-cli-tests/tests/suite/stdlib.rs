@@ -38,7 +38,7 @@ fn std_net() -> ModuleName {
 const IMPORTER: &str = "\
 import std.net (net)
 
-fn touch(port: Int) -> Int / {net.write[listener]} {
+fn touch(port: Int) -> Int / {net.listen[listener], net.close[listener]} {
   let l = net.listen[listener](port);
   net.close[listener](l);
   l
@@ -100,7 +100,10 @@ fn a_project_module_can_import_std_net_and_it_checks() {
 
     // The row a host handler binds against, written in the qualified name.
     let touch = &loaded.check.defs[&Symbol::new("app.touch")];
-    assert_eq!(touch.footprint.to_string(), "{std.net.net.write[listener]}");
+    assert_eq!(
+        touch.footprint.to_string(),
+        "{std.net.net.close[listener], std.net.net.listen[listener]}"
+    );
 }
 
 #[test]
@@ -651,7 +654,7 @@ fn editing_one_shipped_definition_moves_exactly_what_reaches_it() {
         dir.path(),
         "reader.ply",
         "import mine (net, drain)\n\
-         pub fn read_all(c: Int) -> Bytes / {net.write[conn]} = drain(c, b\"\", 1000)\n\
+         pub fn read_all(c: Int) -> Bytes / {net.recv[conn]} = drain(c, b\"\", 1000)\n\
          test \"reads\" {\n\
         \x20 handle { assert_eq(read_all(1), b\"\") } with { net.recv[conn](c, m, t) -> Some(b\"\") }\n\
          }\n",

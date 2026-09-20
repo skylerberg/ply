@@ -57,7 +57,7 @@ fn footprint() -> Footprint {
     Footprint::from_atoms([
         atom("db", Resource::Named(sym("users")), Mode::Read),
         atom("clock", Resource::Singleton, Mode::Write),
-        EffectAtom::operation("net", Resource::Named(sym("conn")), "send"),
+        EffectAtom::operation("net", Resource::Named(sym("conn")), Mode::Write, "send"),
     ])
 }
 

@@ -219,10 +219,7 @@ test "a real read" {
     let atoms: Vec<String> = shared.atoms().map(|a| a.to_string()).collect();
     assert_eq!(
         atoms,
-        vec![
-            "cell.read[table]".to_string(),
-            "db.write[users]".to_string()
-        ]
+        vec!["cell.read[table]".to_string(), "db.put[users]".to_string()]
     );
     assert!(shared.conflicts_with(&shared_footprint(&footprints[2])));
 

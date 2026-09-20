@@ -175,7 +175,7 @@ pub fn check_footprint(
 
     if let Some(declared) = declared {
         for atom in &atoms {
-            if declared.atoms().any(|a| a == atom) {
+            if declared.atoms().any(|a| a.mode_atom() == *atom) {
                 continue;
             }
             // A declared read does not cover a write: two readers may run side by side.

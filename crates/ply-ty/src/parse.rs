@@ -360,7 +360,8 @@ impl<'a> Parser<'a> {
         Ok(match access {
             "read" => EffectAtom::new(effect, resource, Mode::Read),
             "write" => EffectAtom::new(effect, resource, Mode::Write),
-            op => EffectAtom::operation(effect, resource, op),
+            // The declaration decides an operation's mode; `read_front` resolves it.
+            op => EffectAtom::operation(effect, resource, Mode::Write, op),
         })
     }
 }

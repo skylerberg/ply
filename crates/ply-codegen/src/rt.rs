@@ -1918,16 +1918,19 @@ pub unsafe extern "C" fn rt_perform(
     let effect = c.tables.fields[effect as usize].clone();
     let op = c.tables.fields[op as usize].clone();
     let resource = (resource >= 0).then(|| c.tables.fields[resource as usize].clone());
-    let atom = EffectAtom::new(
+    let atom = EffectAtom::operation(
         effect.clone(),
         resource
             .clone()
             .map_or(Resource::Singleton, Resource::Named),
         if mode != 0 { Mode::Write } else { Mode::Read },
+        op.clone(),
     );
+    // A step's footprint is what it conflicts on, which is the mode; the scheduled operation's
+    // own access (`OpSignature::step_access`) is that same mode atom.
     if !c.sims.is_empty() {
         c.trail
-            .record_access(ply_eval::sim::Access::Atom(atom.clone()));
+            .record_access(ply_eval::sim::Access::Atom(atom.mode_atom()));
     }
     c.performed.push(atom);
     let mut found = None;

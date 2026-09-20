@@ -160,17 +160,17 @@ impl Endpoint {
     /// The same endpoint with a task spawned per connection.
     pub fn concurrent(&self, parser: Parser, port: u16, connections: u32) -> Result<String> {
         const OLD: &str = "\
-fn serve(server: Int, count: Int) -> Int / {net.write[listener], net.write[conn]} =
+fn serve(server: Int, count: Int) -> Int =
   if count <= 0 {
     0
   } else {
     serve_one(net.accept[listener](server));
     1 + serve(server, count - 1)
   }";
-        // The joins unwind at the end, so up to `count` handlers are in flight at once.
+        // The joins unwind at the end, so up to `count` handlers are in flight at once. The rows
+        // are inferred, so `serve`'s callers gain `task.spawn` and `task.join` without a rewrite.
         const NEW: &str = "\
-fn serve(server: Int, count: Int) -> Int
-  / {task.write, net.write[listener], net.write[conn]} =
+fn serve(server: Int, count: Int) -> Int =
   if count <= 0 {
     0
   } else {
@@ -181,16 +181,6 @@ fn serve(server: Int, count: Int) -> Int
     1 + rest
   }";
         let source = replace(&self.scans(parser)?, OLD, NEW)?;
-        let source = replace(
-            &source,
-            "fn listen_and_serve(port: Int, count: Int) -> Int\n  / {net.write[listener], net.write[conn]} {",
-            "fn listen_and_serve(port: Int, count: Int) -> Int\n  / {task.write, net.write[listener], net.write[conn]} {",
-        )?;
-        let source = replace(
-            &source,
-            "fn main() -> Int / {net.write[listener], net.write[conn]} =",
-            "fn main() -> Int / {task.write, net.write[listener], net.write[conn]} =",
-        )?;
         settings(&source, port, connections)
     }
 }

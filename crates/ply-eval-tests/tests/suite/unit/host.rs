@@ -223,7 +223,7 @@ fn any_expands_to_the_labels_the_program_uses() {
         .iter()
         .map(|r| r.atom.to_string())
         .collect();
-    assert_eq!(atoms, ["db.read[users]", "db.write[orders]"]);
+    assert_eq!(atoms, ["db.get[users]", "db.put[orders]"]);
     assert_eq!(binding.listing().handlers, 2);
     assert!(!atoms.iter().any(|a| a.contains('*')));
 }
@@ -239,7 +239,88 @@ fn any_does_not_cross_modes() {
         .iter()
         .map(|r| r.atom.to_string())
         .collect();
-    assert_eq!(atoms, ["db.read[users]"]);
+    assert_eq!(atoms, ["db.get[users]"]);
+}
+
+/// A written mode atom and an inferred operation atom both name the label; the registration
+/// serves it once rather than claiming it against itself.
+#[test]
+fn a_label_named_by_a_mode_atom_and_an_operation_atom_is_one_row() {
+    let source = r#"
+nondet effect net {
+  write recv[r](max: Int) -> Bytes
+  write send[r](payload: Bytes) -> Int
+}
+
+fn wide(c: Int) -> Bytes / {net.write[c]} = net.recv[c](16)
+
+fn narrow(c: Int) -> Bytes = net.recv[c](16)
+"#;
+    let program = check(source);
+    let binding = registry(vec![
+        op("net", "recv", HostResource::Any),
+        op("net", "send", HostResource::Any),
+    ])
+    .bind(&program)
+    .expect("one label under two atoms is not a conflict");
+    let rows: Vec<String> = binding
+        .listing()
+        .rows
+        .iter()
+        .map(|r| r.to_string())
+        .collect();
+    assert_eq!(rows, ["net.recv[c]", "net.send[c]"]);
+    assert_eq!(binding.footprint().atoms().count(), 2);
+
+    let only = registry(vec![op("net", "recv", named("c"))])
+        .bind(&program)
+        .expect("`Only` names the same label once");
+    assert_eq!(only.listing().rows.len(), 1);
+}
+
+/// A body with no written row publishes the operations it performs, and `Any` expands on those.
+#[test]
+fn any_expands_to_the_labels_an_inferred_row_names_by_operation() {
+    let source = r#"
+nondet effect db {
+  read  get[r](key: Int) -> Int
+  read  peek[r](key: Int) -> Int
+  write put[r](key: Int, value: Int) -> Int
+}
+
+fn lookup(k: Int) -> Int = db.get[users](k)
+
+fn store(k: Int) -> Int = db.put[orders](k, 1)
+"#;
+    let binding = registry(vec![
+        op("db", "get", HostResource::Any),
+        op("db", "peek", HostResource::Any),
+        op("db", "put", HostResource::Any),
+    ])
+    .bind(&check(source))
+    .expect("binds");
+    let rows: Vec<String> = binding
+        .listing()
+        .rows
+        .iter()
+        .map(|r| r.to_string())
+        .collect();
+    assert_eq!(
+        rows,
+        ["db.get[users]", "db.put[orders]"],
+        "`peek` is never performed"
+    );
+    assert!(binding.serves(&EffectAtom::new(
+        "db",
+        Resource::Named(Symbol::new("users")),
+        ply_ty::Mode::Read,
+    )));
+    assert!(!binding.serves(&EffectAtom::operation(
+        "db",
+        Resource::Named(Symbol::new("users")),
+        ply_ty::Mode::Read,
+        "peek",
+    )));
 }
 
 #[test]
@@ -282,9 +363,9 @@ fn the_footprint_is_exactly_what_resolve_answers() {
     );
 }
 
-/// An [`EffectAtom`] carries no operation, so two operations can share one atom.
+/// Two operations under one mode atom are two rows, each its own operation atom.
 #[test]
-fn two_operations_sharing_one_atom_are_not_a_conflict() {
+fn two_operations_under_one_mode_atom_are_not_a_conflict() {
     let source = r#"
 nondet effect db {
   read get[r](key: Int) -> Int
@@ -303,7 +384,7 @@ fn b(k: Int) -> Int / {db.read[users]} = db.peek[users](k)
         .expect("two operations, one atom, no conflict");
 
     assert_eq!(binding.listing().rows.len(), 2);
-    assert_eq!(binding.footprint().atoms().count(), 1);
+    assert_eq!(binding.footprint().atoms().count(), 2);
     assert_eq!(
         binding
             .resolve(

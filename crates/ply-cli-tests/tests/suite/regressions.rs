@@ -126,7 +126,7 @@ fn three_operations_sharing_one_atom_are_three_reachable_clauses() {
         dir.path(),
         "app.ply",
         "import std.net (net)\n\
-         pub fn touch(c: Int) -> Int / {net.write[conn]} = {\n\
+         pub fn touch(c: Int) -> Int / {net.recv[conn]} = {\n\
            let _ = net.recv[conn](c, 16, 1000);\n\
            0\n\
          }\n\
@@ -169,7 +169,7 @@ fn the_same_operation_handled_twice_is_still_reported() {
         dir.path(),
         "app.ply",
         "import std.net (net)\n\
-         pub fn touch(c: Int) -> Int / {net.write[conn]} = {\n\
+         pub fn touch(c: Int) -> Int / {net.recv[conn]} = {\n\
            let _ = net.recv[conn](c, 16, 1000);\n\
            0\n\
          }\n\

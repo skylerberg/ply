@@ -173,14 +173,14 @@ fn explain_prints_the_set_table_the_alias_and_the_difference_it_hides() {
             "     list_orders  : () -> Int",
             "                    / {m.store.read[orders], m.store.read[users]}",
             "       written as     / {Reads}",
-            "       body performs  {m.store.read[orders]}",
+            "       body performs  {m.store.all[orders]}",
             "       declared, not performed: m.store.read[users]",
             "     create_order : () -> Int",
             "                    / {m.store.read[inventory], m.store.read[orders],",
             "                       m.store.write[orders], m.store.read[users]}",
             "       written as     / {Web}",
-            "       body performs  {m.store.read[inventory], m.store.read[orders],",
-            "                       m.store.write[orders]}",
+            "       body performs  {m.store.all[inventory], m.store.all[orders],",
+            "                       m.store.save[orders]}",
             "       declared, not performed: m.store.read[users]",
             "     audit        : () -> Int",
             "                    / {m.store.read[audit], m.store.write[audit]}",
@@ -257,7 +257,7 @@ fn the_json_report_carries_the_provenance_only_under_explain() {
     assert_eq!(orders["written_as"], serde_json::json!(["Reads"]));
     assert_eq!(
         orders["performed"],
-        serde_json::json!(["m.store.read[orders]"])
+        serde_json::json!(["m.store.all[orders]"])
     );
     assert_eq!(
         orders["declared_not_performed"],

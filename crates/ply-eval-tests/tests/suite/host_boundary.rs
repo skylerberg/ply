@@ -178,7 +178,12 @@ fn a_bound_run_reaches_the_handler_and_records_what_it_reached() {
     assert_eq!(machine.host_ops(), 1);
     let used = machine.host_use().expect("the run reached the host");
     assert_eq!(used.operations, 1);
-    assert!(used.atoms.contains(&atom("t.net", "socket", Mode::Write)));
+    assert!(used.atoms.contains(&EffectAtom::operation(
+        "t.net",
+        Resource::Named(Symbol::new("socket")),
+        Mode::Write,
+        "send"
+    )));
 }
 
 #[test]
@@ -401,7 +406,7 @@ fn an_answer_outside_the_declared_footprint_is_refused() {
     let d = diagnostic(machine.eval_test(0));
 
     assert_eq!(d.code, codes::HOST_FOOTPRINT_ESCAPE);
-    assert!(d.message.contains("net.write[socket]"), "{}", d.message);
+    assert!(d.message.contains("net.send[socket]"), "{}", d.message);
     assert_eq!(
         counter.calls(),
         0,
@@ -425,7 +430,44 @@ fn an_answer_inside_the_declared_footprint_is_allowed() {
         "socket",
         Mode::Write,
     )]));
-    machine.eval_test(0).expect("the atom is declared");
+    machine
+        .eval_test(0)
+        .expect("the mode atom covers the operation");
+}
+
+#[test]
+fn a_declared_operation_atom_admits_that_operation_alone() {
+    let compiled = Compiled::named("t", SEND);
+    let bound = || {
+        let registry = registry_of(vec![(
+            op("net", "send", Linearity::AtMostOnce),
+            Arc::new(Counter::default()),
+        )]);
+        let binding = registry.bind(&compiled.front.check).expect("binds");
+        let mut machine = compiled.machine_on_tier();
+        machine.set_host_binding(Arc::new(binding));
+        machine
+    };
+    let named = |op: &str| {
+        Footprint::from_atoms([EffectAtom::operation(
+            "t.net",
+            Resource::Named(Symbol::new("socket")),
+            Mode::Write,
+            op,
+        )])
+    };
+
+    let mut machine = bound();
+    machine.set_declared_footprint(named("send"));
+    machine.eval_test(0).expect("the operation is declared");
+
+    let mut machine = bound();
+    machine.set_declared_footprint(named("recv"));
+    assert_eq!(
+        diagnostic(machine.eval_test(0)).code,
+        codes::HOST_FOOTPRINT_ESCAPE,
+        "an operation atom covers no other operation"
+    );
 }
 
 #[test]
