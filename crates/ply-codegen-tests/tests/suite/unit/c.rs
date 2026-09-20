@@ -606,30 +606,51 @@ pub fn tagged(n: Int) -> Int = label(if n > 0 {{ TB(n) }} else {{ TA }})
     );
 }
 
-/// Keyed as a command keys it, on the front end's hashes; `spare`'s nonce makes the second build miss the unit cache and ask body by body.
-#[test]
-fn a_definition_that_only_moved_is_served_from_the_cache_and_placed_where_it_now_is() {
-    let nonce = std::time::SystemTime::now()
+/// Nanoseconds now: a definition whose text carries it is in no earlier process's cache.
+fn nonce() -> u128 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0)
-        % 1_000_000_000_000_000;
+        % 1_000_000_000_000_000
+}
+
+/// Module `m` keyed as a command keys it, on the front end's hashes; `suffix` turns every key, so a
+/// source keyed apart from the others is built cold.
+fn keyed_by_hash(text: &str, suffix: &str) -> &'static ply_codegen::Source {
+    let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
+    let id = ply_span::SourceId(0);
+    let front =
+        ply_codegen::c::producer::checked_front(&[("m".to_string(), owned.to_string())], &[id])
+            .expect("checks");
+    let front: &'static ply_ty::Front = Box::leak(Box::new(front));
+    let keys = ply_codegen::emit_keys(front)
+        .into_iter()
+        .map(|(name, key)| (name, format!("{key}{suffix}")))
+        .collect();
+    Box::leak(Box::new(
+        ply_codegen::Source::from_front(front, keys).with_texts(std::collections::HashMap::from([
+            ("m".to_string(), owned.to_string()),
+        ])),
+    ))
+}
+
+/// The unit over every root of `source`, body by body: `produce` never reads a whole unit back.
+fn produced(source: &'static ply_codegen::Source) -> ply_codegen::c::Produced {
+    let names = source.functions();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let produced = ply_codegen::c::produce(source, &refs).expect("the program emits");
+    assert!(produced.refused.is_empty(), "{:?}", produced.refused);
+    produced
+}
+
+/// `spare`'s nonce makes the second build miss the unit cache and ask body by body.
+#[test]
+fn a_definition_that_only_moved_is_served_from_the_cache_and_placed_where_it_now_is() {
+    let nonce = nonce();
     let main = "fn main() -> Int = 1 / 0\n";
     let moved = format!("fn spare() -> Int = {nonce}\n\n\n{main}");
-    let hashed = |text: &str| -> &'static ply_codegen::Source {
-        let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
-        let id = ply_span::SourceId(0);
-        let front =
-            ply_codegen::c::producer::checked_front(&[("m".to_string(), owned.to_string())], &[id])
-                .expect("checks");
-        let front: &'static ply_ty::Front = Box::leak(Box::new(front));
-        let keys = ply_codegen::emit_keys(front);
-        Box::leak(Box::new(
-            ply_codegen::Source::from_front(front, keys).with_texts(
-                std::collections::HashMap::from([("m".to_string(), owned.to_string())]),
-            ),
-        ))
-    };
+    let hashed = |text: &str| keyed_by_hash(text, "");
     let failure = |source: &'static ply_codegen::Source| -> Option<ply_span::Span> {
         let names = source.functions();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -683,59 +704,104 @@ fn a_definition_that_only_moved_is_served_from_the_cache_and_placed_where_it_now
     assert_eq!(moved[..after.start as usize].matches('\n').count() + 1, 4);
 }
 
-/// Keyed on the front end's hashes; the nonce keeps both definitions out of any earlier process's cache.
+/// The nonce keeps both definitions out of any earlier process's cache.
 #[test]
 fn an_edited_definition_alone_is_asked_of_the_emitter_and_the_unit_is_the_one_a_cold_build_emits() {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-        % 1_000_000_000_000_000;
+    let nonce = nonce();
     let program = |k: u128| {
         let steady = format!("pub fn steady(x: Int) -> Int = x + {nonce}\n");
         format!("{steady}pub fn changed(x: Int) -> Int = x * {k}\n")
     };
-    // `suffix` turns every key, so a source keyed apart from the others is built cold.
-    let hashed = |text: &str, suffix: &str| -> &'static ply_codegen::Source {
-        let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
-        let id = ply_span::SourceId(0);
-        let front =
-            ply_codegen::c::producer::checked_front(&[("m".to_string(), owned.to_string())], &[id])
-                .expect("checks");
-        let front: &'static ply_ty::Front = Box::leak(Box::new(front));
-        let keys = ply_codegen::emit_keys(front)
-            .into_iter()
-            .map(|(name, key)| (name, format!("{key}{suffix}")))
-            .collect();
-        Box::leak(Box::new(
-            ply_codegen::Source::from_front(front, keys).with_texts(
-                std::collections::HashMap::from([("m".to_string(), owned.to_string())]),
-            ),
-        ))
-    };
-    let produce = |source: &'static ply_codegen::Source| -> ply_codegen::c::Produced {
-        let names = source.functions();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let produced = ply_codegen::c::produce(source, &refs).expect("the program emits");
-        assert!(produced.refused.is_empty(), "{:?}", produced.refused);
-        produced
-    };
 
     let _config = CONFIG.read().unwrap_or_else(|e| e.into_inner());
-    let first = produce(hashed(&program(nonce + 1), ""));
+    let first = produced(keyed_by_hash(&program(nonce + 1), ""));
     let edited_text = program(nonce + 2);
     ply_codegen::c::producer::reset_census();
-    let edited = produce(hashed(&edited_text, ""));
+    let edited = produced(keyed_by_hash(&edited_text, ""));
     assert_eq!(
         ply_codegen::c::producer::census().wanted,
         vec![vec!["m.changed".to_string()]],
         "the emitter was not entered once, for the edited definition alone"
     );
     assert_ne!(first.text, edited.text, "the edit did not reach the unit");
-    let cold = produce(hashed(&edited_text, "-cold"));
+    let cold = produced(keyed_by_hash(&edited_text, "-cold"));
     assert_eq!(
         edited.text, cold.text,
         "a unit with one body served from the cache is not the one a cold build emits"
+    );
+}
+
+/// `caller`'s C reads only `leaf`'s signature, which a body edit keeps, so its key holds and its
+/// body is served from the cache; the nonce in `caller` keeps it out of an earlier process's.
+#[test]
+fn editing_a_body_asks_the_emitter_for_that_definition_and_not_its_callers() {
+    let nonce = nonce();
+    let program = |k: u128| {
+        format!(
+            "pub fn leaf(x: Int) -> Int = x + {k}\n\
+             pub fn caller(x: Int) -> Int = leaf(x) * 2 + {nonce}\n"
+        )
+    };
+
+    let _config = CONFIG.read().unwrap_or_else(|e| e.into_inner());
+    let before = keyed_by_hash(&program(nonce + 1), "");
+    let after = keyed_by_hash(&program(nonce + 2), "");
+    assert_ne!(
+        before.keys.get("m.leaf"),
+        after.keys.get("m.leaf"),
+        "editing `leaf`'s body kept its key"
+    );
+    assert_eq!(
+        before.keys.get("m.caller"),
+        after.keys.get("m.caller"),
+        "editing `leaf`'s body turned `caller`'s key"
+    );
+    let first = produced(before);
+    ply_codegen::c::producer::reset_census();
+    let edited = produced(after);
+    assert_eq!(
+        ply_codegen::c::producer::census().wanted,
+        vec![vec!["m.leaf".to_string()]],
+        "the emitter was not entered once, for `leaf` alone"
+    );
+    assert_ne!(first.text, edited.text, "the edit did not reach the unit");
+    let cold = produced(keyed_by_hash(&program(nonce + 2), "-cold"));
+    assert_eq!(
+        edited.text, cold.text,
+        "a unit with `caller` served from the cache is not the one a cold build emits"
+    );
+}
+
+/// `caller` opens `leaf`'s answer by the kind its signature declares, so a new answer type turns
+/// `caller`'s key too; `len` takes a list of either, so `caller` reads the same both times.
+#[test]
+fn changing_a_signature_asks_the_emitter_for_the_definition_and_its_callers() {
+    let nonce = nonce();
+    let program =
+        |leaf: &str| format!("{leaf}\npub fn caller(x: Int) -> Int = len([leaf(x)]) + {nonce}\n");
+    let as_int = program(&format!("pub fn leaf(x: Int) -> Int = x + {nonce}"));
+    let as_bool = program(&format!("pub fn leaf(x: Int) -> Bool = x > {nonce}"));
+
+    let _config = CONFIG.read().unwrap_or_else(|e| e.into_inner());
+    let before = keyed_by_hash(&as_int, "");
+    let after = keyed_by_hash(&as_bool, "");
+    assert_ne!(
+        before.keys.get("m.caller"),
+        after.keys.get("m.caller"),
+        "retyping `leaf` kept `caller`'s key"
+    );
+    let _ = produced(before);
+    ply_codegen::c::producer::reset_census();
+    let retyped = produced(after);
+    assert_eq!(
+        ply_codegen::c::producer::census().wanted,
+        vec![vec!["m.leaf".to_string(), "m.caller".to_string()]],
+        "the emitter was not entered once, for `leaf` and its caller"
+    );
+    let cold = produced(keyed_by_hash(&as_bool, "-cold"));
+    assert_eq!(
+        retyped.text, cold.text,
+        "the unit is not the one a cold build emits"
     );
 }
 
