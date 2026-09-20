@@ -569,6 +569,52 @@ fn a_recursive_definition_is_unfolded_only_by_induction() {
     not_proved(&f, "a step off the top overflows");
 }
 
+const LISTS: &str = r#"
+fn count<a>(xs: List<a>) -> Int = match xs { [] -> 0, [_, ..rest] -> 1 + count(rest) }
+fn total(xs: List<Int>) -> Int = match xs { [] -> 0, [x, ..rest] -> x + total(rest) }
+fn spin(xs: List<Int>) -> Int = match xs { [] -> 0, [_, ..rest] -> spin(xs) }
+fn count_from<a>(xs: List<a>, k: Int) -> Int = match xs { [] -> k, [_, ..rest] -> count_from(rest, k + 1) }
+
+law "counting counts" forall (xs: List<Int>) { count(xs) == len(xs) }
+law "a total is a total" forall (xs: List<Int>) { total(xs) == total(xs) }
+law "a total of ints is non-negative" forall (xs: List<Int>) { total(xs) >= 0 }
+law "a definition that keeps its list is not a function" forall (xs: List<Int>) { spin(xs) == spin(xs) }
+law "counting from an accumulator counts" forall (xs: List<Int>, k: Int) where k >= 0 && k < 1000 { count_from(xs, k) == len(xs) + k }
+law "a list pattern takes the head of a literal" forall (x: Int) { match [x, 2] { [a, ..] -> a == x, [] -> false } }
+law "a list pattern does not confuse the tail" forall (x: Int) { match [1, x] { [_, b] -> b == 1, _ -> false } }
+law "a pushed literal ends in what was pushed" forall (x: Int) { match push([1], x) { [_, b] -> b == x, _ -> false } }
+"#;
+
+#[test]
+fn a_recursive_definition_over_a_list_is_proved_by_induction_on_its_spine() {
+    let f = fixture(LISTS);
+    let proved = proof(&f, "counting counts");
+    assert!(
+        proved
+            .rules
+            .iter()
+            .any(|r| matches!(r, Rule::Induction { binder, def }
+            if binder.as_str() == "xs" && def.as_str() == "count")),
+        "{:?}",
+        proved.rules
+    );
+    // The unrolled step adds one to a value only the hypothesis could bound, and it does not.
+    not_proved(&f, "a total is a total");
+    not_proved(&f, "a total of ints is non-negative");
+    // The self call keeps the whole list, so no measure decreases.
+    not_proved(&f, "a definition that keeps its list is not a function");
+    // The step needs the claim at `k + 1`, and the hypothesis is at `k`.
+    not_proved(&f, "counting from an accumulator counts");
+}
+
+#[test]
+fn list_patterns_over_literal_spines_are_decided_without_induction() {
+    let f = fixture(LISTS);
+    proof(&f, "a list pattern takes the head of a literal");
+    proof(&f, "a pushed literal ends in what was pushed");
+    not_proved(&f, "a list pattern does not confuse the tail");
+}
+
 #[test]
 fn induction_needs_a_decreasing_self_call_and_a_step_of_one() {
     let f = fixture(CHAIN);
