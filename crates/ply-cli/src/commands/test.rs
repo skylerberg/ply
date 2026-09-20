@@ -267,8 +267,30 @@ fn iterate(
     let backend_view = BackendView::of(backend.as_ref(), provider, &report, engine);
     let ok = report.is_success() && view.escapes.is_empty() && backend_view.escapes.is_empty();
 
+    // Only over a green program: a survivor of a red one says nothing.
+    let mutants = match (&args.mutate, ok, &backend) {
+        (Some(query), true, Some(spec)) => match super::mutate::targets(&loaded, query) {
+            Ok(targets) => Some(super::mutate::run(
+                &loaded,
+                &hashes,
+                &targets,
+                args.mutate_budget,
+                &search,
+                engine,
+                spec,
+                &hosts,
+                &runtime,
+            )),
+            Err(diagnostic) => {
+                return report_bind_error("test", &[diagnostic], &loaded.sources, args.json, style);
+            }
+        },
+        _ => None,
+    };
+    let ok = ok && mutants.as_ref().is_none_or(|m| m.survived() == 0);
+
     if args.json {
-        emit_json(&report_json(
+        let mut out = report_json(
             &loaded,
             &hashes,
             &plan,
@@ -279,7 +301,14 @@ fn iterate(
             &view,
             &backend_view,
             ok,
-        ));
+        );
+        if args.coverage {
+            out["coverage"] = super::mutate::coverage_json(&loaded, &hashes);
+        }
+        if let Some(mutants) = &mutants {
+            out["mutants"] = super::mutate::to_json(mutants, &loaded);
+        }
+        emit_json(&out);
     } else {
         print_human(
             &loaded,
@@ -293,6 +322,12 @@ fn iterate(
             &backend_view,
             style,
         );
+        if args.coverage {
+            print_coverage(&loaded, &hashes, style);
+        }
+        if let Some(mutants) = &mutants {
+            print_mutants(mutants, &loaded, style);
+        }
     }
     // Only now: an iteration that returned early leaves no state behind.
     warm.keep(loaded);
@@ -519,6 +554,60 @@ fn backend_is_corrupt(args: &TestArgs) -> bool {
         })
 }
 
+fn print_coverage(loaded: &Loaded, hashes: &HashOutput, style: Style) {
+    let coverage = super::mutate::coverage_json(loaded, hashes);
+    let unreached: Vec<&str> = coverage["unreached"]
+        .as_array()
+        .map(|xs| xs.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let total = coverage["definitions"].as_array().map_or(0, Vec::len);
+    println!(
+        "{IND}{} {} of {} definitions reached by a test",
+        style.bold("coverage"),
+        total - unreached.len(),
+        total
+    );
+    for name in unreached {
+        println!(
+            "{IND}{IND}{}",
+            style.dim(&format!("{name}: no test reaches it"))
+        );
+    }
+}
+
+fn print_mutants(report: &super::mutate::Report, loaded: &Loaded, style: Style) {
+    let line = format!(
+        "{} killed, {} survived, {} skipped{}",
+        report.killed(),
+        report.survived(),
+        report.skipped() + report.unresolved(),
+        if report.budget_spent {
+            ", budget spent"
+        } else {
+            ""
+        }
+    );
+    println!("{IND}{} {}", style.bold("mutants"), style.bold(&line));
+    for name in &report.unreached {
+        println!(
+            "{IND}{IND}{}",
+            style.dim(&format!("{name}: no test reaches it"))
+        );
+    }
+    for j in &report.judged {
+        if matches!(j.verdict, super::mutate::Verdict::Survived) {
+            let place = location(&loaded.sources, j.mutant.span).unwrap_or_default();
+            println!(
+                "{IND}{IND}{} survives `{}` -> `{}` at {}",
+                style.red(j.mutant.definition.as_str()),
+                j.mutant.from,
+                j.mutant.to,
+                style.dim(&place)
+            );
+        }
+    }
+}
+
 /// `--bisect never` still goes through the diagnosis, so the artifact has one shape.
 pub fn diagnosis_options(args: &TestArgs) -> ply_test::Options {
     ply_test::Options {
@@ -664,7 +753,7 @@ impl Cache {
         }
     }
 
-    fn scratch() -> Result<Cache, Diagnostic> {
+    pub(crate) fn scratch() -> Result<Cache, Diagnostic> {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -1598,7 +1687,7 @@ fn status_str(status: Status) -> &'static str {
 }
 
 /// Line and column rather than byte offsets, for editors.
-fn location_json(sources: &SourceMap, span: Span) -> Value {
+pub(crate) fn location_json(sources: &SourceMap, span: Span) -> Value {
     let Some(file) = sources.get(span.source) else {
         return Value::Null;
     };

@@ -1,7 +1,7 @@
 //! Diagnostics as length-framed text, written and read by one codec so both sides of a
 //! differential encode one way.
 
-use crate::{Diagnostic, Label, Severity, SourceId, Span, codes};
+use crate::{Diagnostic, Edit, Fix, Label, Severity, SourceId, Span, codes};
 
 /// The module index of a span outside every module: [`Span::DUMMY`]'s source.
 const NO_MODULE: u32 = u32::MAX;
@@ -30,6 +30,17 @@ pub fn write_diagnostics(diags: &[Diagnostic], sources: &[SourceId]) -> Result<S
         }
         for n in &d.notes {
             field(&mut payload, "note", n);
+        }
+        for f in &d.fixes {
+            field(&mut payload, "fix", &f.title);
+            for e in &f.edits {
+                let module = module_index(e.span, sources, index)?;
+                field(
+                    &mut payload,
+                    "edit",
+                    &format!("{module} {} {}\n{}", e.span.start, e.span.end, e.text),
+                );
+            }
         }
         out.push_str(&format!("diag {index} {}\n{payload}", payload.len()));
     }
@@ -94,6 +105,7 @@ fn read_one(payload: &[u8], sources: &[SourceId], index: usize) -> Result<Diagno
     let (mut code, mut severity, mut message) = (None, None, None);
     let mut labels = Vec::new();
     let mut notes = Vec::new();
+    let mut fixes: Vec<Fix> = Vec::new();
     while !fields.done() {
         let (words, body) = fields.unit()?;
         let [key] = words[..] else {
@@ -110,6 +122,14 @@ fn read_one(payload: &[u8], sources: &[SourceId], index: usize) -> Result<Diagno
             "message" => once(&mut message, key, text, index)?,
             "label" => labels.push(label(text, sources, index)?),
             "note" => notes.push(text.to_string()),
+            "fix" => fixes.push(Fix {
+                title: text.to_string(),
+                edits: Vec::new(),
+            }),
+            "edit" => match fixes.last_mut() {
+                Some(f) => f.edits.push(edit(text, sources, index)?),
+                None => return Err(format!("diagnostic {index}: an `edit` before any `fix`")),
+            },
             other => return Err(format!("diagnostic {index}: unknown field `{other}`")),
         }
     }
@@ -127,7 +147,40 @@ fn read_one(payload: &[u8], sources: &[SourceId], index: usize) -> Result<Diagno
     d.severity = severity;
     d.labels = labels;
     d.notes = notes;
+    d.fixes = fixes;
     Ok(d)
+}
+
+/// `<module> <start> <end>\n<text>`.
+fn edit(text: &str, sources: &[SourceId], index: usize) -> Result<Edit, String> {
+    let (head, body) = text
+        .split_once('\n')
+        .ok_or_else(|| format!("diagnostic {index}: an edit with no text line"))?;
+    let words: Vec<&str> = head.split(' ').collect();
+    let [module, start, end] = words[..] else {
+        return Err(format!(
+            "diagnostic {index}: edit header `{head}` is not `<module> <start> <end>`"
+        ));
+    };
+    let number = |word: &str| {
+        word.parse::<u32>()
+            .map_err(|_| format!("diagnostic {index}: edit header `{head}` holds `{word}`"))
+    };
+    let module = number(module)?;
+    let source = if module == NO_MODULE {
+        Span::DUMMY.source
+    } else {
+        sources.get(module as usize).copied().ok_or_else(|| {
+            format!(
+                "diagnostic {index} edits module {module}, and only {} sources were handed over",
+                sources.len()
+            )
+        })?
+    };
+    Ok(Edit {
+        span: Span::new(source, number(start)?, number(end)?),
+        text: body.to_string(),
+    })
 }
 
 fn once<'a>(

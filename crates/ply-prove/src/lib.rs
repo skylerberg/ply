@@ -81,6 +81,12 @@ pub enum Rule {
         def: Symbol,
         depth: u32,
     },
+    /// The claim at `binder <= 0`, then at `binder > 0` from itself at `binder - 1`, with `def`
+    /// shown to terminate and unrolled.
+    Induction {
+        binder: Symbol,
+        def: Symbol,
+    },
     ExhaustiveInterleaving {
         interleavings: u32,
     },
@@ -174,7 +180,7 @@ pub enum Gap {
     },
     Raised {
         bindings: Vec<Binding>,
-        diagnostic: Diagnostic,
+        diagnostic: Box<Diagnostic>,
     },
     /// The guard kept no case of a full budget, yet admits `witness`.
     GuardNotSampled {

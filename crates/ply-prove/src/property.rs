@@ -862,7 +862,7 @@ pub fn run_property(
                     if diagnostic.code == ply_span::codes::TIME_BUDGET {
                         return Discharge::Unattempted(Gap::Raised {
                             bindings: bindings(binders, &values),
-                            diagnostic,
+                            diagnostic: Box::new(diagnostic),
                         });
                     }
                     let shrunk = shrink::shrink(
@@ -875,7 +875,7 @@ pub fn run_property(
                     );
                     return Discharge::Unattempted(Gap::Raised {
                         bindings: bindings(binders, &shrunk.values),
-                        diagnostic: shrunk.diagnostic.unwrap_or(diagnostic),
+                        diagnostic: Box::new(shrunk.diagnostic.unwrap_or(diagnostic)),
                     });
                 }
             }

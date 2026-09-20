@@ -593,7 +593,20 @@ this. `--json` prints one object with each failure's diagnostic, values,
 footprint, suspects, culprit and replay command. `--watch` re-runs on every
 `.ply` change, keeping caches in memory.
 
-### 8.5 Compiled backend
+### 8.5 Coverage and mutants
+
+`--coverage` reports, from the hash closure alone, which tests reach each
+definition and which definitions no test reaches. `--mutate [DEF]` runs after a
+green run: each definition (or `DEF`, a program-wide or unique simple name) is
+changed one operator or literal at a time (`+`/`-`, `<`/`<=`, `>`/`>=`,
+`==`/`!=`, `&&`/`||`, `true`/`false`, `!` dropped, an integer raised by one),
+the program is checked again, and the tests that reach the definition run
+against the mutant on a scratch store that never touches the cache. A mutant
+every one of them passes is a survivor, reported with its place and the tests
+that let it through, and fails the run. A mutant that does not check is
+skipped; `--mutate-budget N` (default 64) caps how many are judged.
+
+### 8.6 Compiled backend
 
 `--backend c` compiles the program to C and runs it there: compiled code is the
 only evaluator. Backend results are cached separately.
@@ -712,8 +725,11 @@ law "a credit and a matching debit leave an account exactly as it was"
 
 `proved` covers ground evaluation, enumeration of finite domains up to 4096
 points, linear `Int` arithmetic, case splits, congruence, constructor
-injectivity, unfolding non-recursive definitions and exhaustive interleaving.
-There is no induction.
+injectivity, unfolding non-recursive definitions, exhaustive interleaving, and
+induction on an `Int` binder: a definition that calls only itself with some
+`Int` argument non-negative and smaller at every self call is unrolled, and the
+claim is proved at `n <= 0` and then at `n > 0` from itself at `n - 1`. There is
+no induction over lists.
 
 `ply prove` reports the definitions carrying no obligation, then each
 obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no
@@ -1093,7 +1109,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | command | flags |
 | --- | --- |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases; with `--types`, effect sets and provenance), `--no-incremental` |
-| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--trace auto\|always\|never`, `--backend`, `--profile`, `--std`, host, simulation |
+| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--trace auto\|always\|never`, `--backend`, `--profile`, `--std`, host, simulation |
 | `ply run [path]` | `--seed` (one interleaving always), `--timeout` (default no bound), `--backend`, `--profile`, host, trace, drain; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`, `--backend`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, `--backend`, prove, simulation |
@@ -1112,7 +1128,12 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 
 `E` is an error; `W` is a warning and never a fault in your program.
 `ply explain CODE` prints a code's line from this table, and `--all` the whole
-table, from the registry the compiler raises from.
+table, from the registry the compiler raises from. A diagnostic that knows its
+own remedy carries `fixes` under `--json`: each has a `title` and `edits`, and
+an edit replaces the text between `start` and `end` of `file` (an empty range
+inserts) with `text`. Applied as they are, the edits leave a program the
+diagnostic no longer holds for. On a terminal a fix is the `fix:` line under
+the message.
 
 | code | meaning |
 | --- | --- |

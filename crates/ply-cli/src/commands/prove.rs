@@ -312,6 +312,7 @@ fn describe_rule(rule: &Rule) -> String {
         Rule::Congruence => "congruence".to_string(),
         Rule::Injectivity => "injectivity".to_string(),
         Rule::Unfold { def, depth } => format!("unfold {def} to depth {depth}"),
+        Rule::Induction { binder, def } => format!("induction on {binder}, unrolling {def}"),
         Rule::ExhaustiveInterleaving { interleavings } => format!(
             "exhaustive over {interleavings} {}",
             plural(*interleavings as usize, "interleaving")
