@@ -545,8 +545,17 @@ pub fn claims_dump(sources: &[(String, String)]) -> Result<String> {
 
 const BUILTINS: &str = "front.builtins_dump";
 
-/// Every builtin's scheme as the port's checker binds it, in the prelude's order.
-pub fn builtins() -> Result<Vec<(Symbol, Scheme)>> {
+/// A builtin as the port's checker binds it: its scheme, the names of its parameters and a note.
+#[derive(Clone, Debug)]
+pub struct BuiltinInfo {
+    pub name: Symbol,
+    pub scheme: Scheme,
+    pub params: Vec<String>,
+    pub note: String,
+}
+
+/// Every builtin, in the prelude's order.
+pub fn builtins() -> Result<Vec<BuiltinInfo>> {
     let dump = string_answer(BUILTINS, call(BUILTINS, &[])?)?;
     let mut frames = Cursor::new(dump.as_bytes(), "frame");
     let mut out = Vec::new();
@@ -558,15 +567,35 @@ pub fn builtins() -> Result<Vec<(Symbol, Scheme)>> {
             bail!("`{BUILTINS}` framed a `{}`", words.join(" "));
         };
         let mut fields = Cursor::new(payload, "field");
-        let (key, text) = fields
-            .unit()
-            .map_err(|e| anyhow!("`{name}`'s frame: {e}"))?;
-        if key != ["scheme"] || !fields.done() {
-            bail!("`{name}`'s frame is not one `scheme` field");
+        let mut scheme = None;
+        let mut params = Vec::new();
+        let mut note = String::new();
+        while !fields.done() {
+            let (key, text) = fields
+                .unit()
+                .map_err(|e| anyhow!("`{name}`'s frame: {e}"))?;
+            let text = std::str::from_utf8(text).context("a builtin's field")?;
+            match key[..] {
+                ["scheme"] => {
+                    scheme = Some(
+                        parse_scheme(text)
+                            .map_err(|e| anyhow!("`{name}`'s scheme `{text}`: {e}"))?,
+                    );
+                }
+                ["param"] => params.push(text.to_string()),
+                ["note"] => note = text.to_string(),
+                _ => bail!("`{name}`'s frame has a `{}` field", key.join(" ")),
+            }
         }
-        let text = std::str::from_utf8(text).context("a builtin's scheme")?;
-        let scheme = parse_scheme(text).map_err(|e| anyhow!("`{name}`'s scheme `{text}`: {e}"))?;
-        out.push((Symbol::new(name), scheme));
+        let Some(scheme) = scheme else {
+            bail!("`{name}`'s frame has no `scheme` field");
+        };
+        out.push(BuiltinInfo {
+            name: Symbol::new(name),
+            scheme,
+            params,
+            note,
+        });
     }
     Ok(out)
 }
