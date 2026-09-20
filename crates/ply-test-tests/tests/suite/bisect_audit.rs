@@ -452,8 +452,8 @@ effect db {
   read get[users](key: Int) -> Int
 }
 
-fn lookup(k: Int) -> Int / {db.read[users]} = db.get[users](k)
-fn twice(k: Int) -> Int / {db.read[users]} = lookup(k) + lookup(k)
+fn lookup(k: Int) -> Int / {db.get[users]} = db.get[users](k)
+fn twice(k: Int) -> Int / {db.get[users]} = lookup(k) + lookup(k)
 fn seeded(k: Int) -> Int = handle { twice(k) } with { db.get[users](n) -> n * 10 }
 
 test "handled" {

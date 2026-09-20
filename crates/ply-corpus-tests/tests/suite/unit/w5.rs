@@ -21,7 +21,7 @@ fn the_bench_program_checks_and_publishes_one_channel() {
     assert_eq!(program.footprint("bare").unwrap().to_string(), "{}");
     assert_eq!(
         program.footprint("events").unwrap().to_string(),
-        "{std.trace.trace.write[bench]}"
+        "{std.trace.trace.event[bench]}"
     );
 }
 

@@ -41,11 +41,36 @@ fn json(out: &std::process::Output) -> Value {
 }
 
 fn green(report: &Value, what: &str) {
-    assert_eq!(report["ok"], Value::Bool(true), "{what} is red: {report}");
+    // The whole report is too long for a CI log line; name the failures and their diagnostics.
+    let failures = || -> String {
+        report["failures"]
+            .as_array()
+            .map(|fs| {
+                fs.iter()
+                    .map(|f| {
+                        format!(
+                            "{}: {} {}",
+                            f["name"].as_str().unwrap_or("?"),
+                            f["diagnostic"]["code"].as_str().unwrap_or(""),
+                            f["diagnostic"]["message"].as_str().unwrap_or("")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|| report["summary"].to_string())
+    };
+    assert_eq!(
+        report["ok"],
+        Value::Bool(true),
+        "{what} is red:\n{}",
+        failures()
+    );
     assert_eq!(
         report["summary"]["failed"].as_u64(),
         Some(0),
-        "{what} is red: {report}"
+        "{what} is red:\n{}",
+        failures()
     );
 }
 

@@ -11,14 +11,6 @@ test 60 s, `ply prove` each evaluation 5 s, `ply run` none, all settable with `-
 past it the entry fails with `E0503`. Say if the defaults should differ, or if you would
 rather bound loops by a step count.
 
-## Handler completeness stops at function values
-
-A `handle` is now checked against the operations its body performs, following calls of named
-definitions. An atom reached through a function value (a parameter, a field, a closure held in a
-`let`) is not judged, because a row names atoms, not operations. Making that precise means rows
-that name operations (`net.send[conn]`), a change to the row syntax, the printer, the hash and
-the frames. Assumed: worth doing as its own item, listed in `docs/DIRECTION.md`.
-
 ## Record shapes stay file-local
 
 A record update now takes its shape from a call of a `fn` declared in the same file, and a

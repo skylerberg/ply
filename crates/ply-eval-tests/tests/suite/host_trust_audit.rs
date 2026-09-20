@@ -86,7 +86,12 @@ fn documents_a_read_declared_handler_that_writes_is_recorded_as_a_read() {
     let used = machine.host_use().expect("the run reached the host");
     assert_eq!(
         used.atoms.atoms().cloned().collect::<Vec<_>>(),
-        [atom("t.db", "users", Mode::Read)],
+        [EffectAtom::operation(
+            "t.db",
+            Resource::Named(Symbol::new("users")),
+            Mode::Read,
+            "get"
+        )],
         "the recorded footprint is the registration's claim, not the handler's behaviour"
     );
     assert_eq!(

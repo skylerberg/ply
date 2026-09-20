@@ -177,9 +177,9 @@ fn put_atom(w: &mut Writer, atom: &EffectAtom) {
         }
         Resource::Singleton => w.tag(tag::RESOURCE_SINGLETON),
     }
-    match &atom.op {
-        Some(op) => w.symbol(op),
-        None => put_mode(w, atom.mode),
+    put_mode(w, atom.mode);
+    if let Some(op) = &atom.op {
+        w.symbol(op);
     }
     w.tag(tag::END);
 }
@@ -196,10 +196,11 @@ fn get_atom(r: &mut Reader) -> Decoded<EffectAtom> {
         tag::RESOURCE_SINGLETON => Resource::Singleton,
         _ => return Err(crate::binary::DecodeError { what: WHAT, at: 0 }),
     };
+    let mode = get_mode(r)?;
     let atom = if kind == tag::ATOM_OP {
-        EffectAtom::operation(effect, resource, r.symbol(WHAT)?)
+        EffectAtom::operation(effect, resource, mode, r.symbol(WHAT)?)
     } else {
-        EffectAtom::new(effect, resource, get_mode(r)?)
+        EffectAtom::new(effect, resource, mode)
     };
     r.tag(tag::END, WHAT)?;
     Ok(atom)

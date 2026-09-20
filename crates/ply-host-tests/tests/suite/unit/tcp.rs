@@ -113,17 +113,34 @@ fn inside(v: Value) -> Value {
 }
 
 #[test]
-fn the_declaration_binds_and_names_exactly_the_atoms_the_program_performs() {
+fn the_declaration_binds_and_names_exactly_the_operations_the_program_performs() {
     let binding = bind(Arc::new(TcpHost::new()));
-    let atoms: Vec<String> = binding
+    let mut atoms: Vec<String> = binding
         .footprint()
         .atoms()
         .map(EffectAtom::to_string)
         .collect();
-    assert_eq!(
-        atoms,
-        ["std.net.net.write[conn]", "std.net.net.write[listener]"]
-    );
+    let mut rows: Vec<String> = binding
+        .listing()
+        .rows
+        .iter()
+        .map(|r| r.to_string())
+        .collect();
+    atoms.sort();
+    rows.sort();
+    assert_eq!(atoms, rows);
+    for label in ["conn", "listener"] {
+        assert!(
+            binding.serves(&atom(label)),
+            "the written mode atom reaches every row under `[{label}]`"
+        );
+    }
+    assert!(binding.serves(&EffectAtom::operation(
+        EFFECT,
+        Resource::Named(Symbol::new("conn")),
+        Mode::Write,
+        "send"
+    )));
 }
 
 #[test]
@@ -133,28 +150,34 @@ fn the_listing_is_one_row_per_triple_and_never_a_star() {
         .listing()
         .rows
         .iter()
-        .map(|r| format!("{r} {} {}", r.atom, r.path))
+        .map(|r| {
+            assert_eq!(
+                r.atom.to_string(),
+                r.to_string(),
+                "a row's atom is its operation"
+            );
+            format!("{r} {}", r.path)
+        })
         .collect();
     assert_eq!(
         rows,
         [
-            "std.net.net.accept[conn] std.net.net.write[conn] ply_host::tcp::accept",
-            "std.net.net.accept[listener] std.net.net.write[listener] ply_host::tcp::accept",
-            "std.net.net.close[conn] std.net.net.write[conn] ply_host::tcp::close",
-            "std.net.net.close[listener] std.net.net.write[listener] ply_host::tcp::close",
-            "std.net.net.connect[conn] std.net.net.write[conn] ply_host::tcp::connect",
-            "std.net.net.connect[listener] std.net.net.write[listener] ply_host::tcp::connect",
-            "std.net.net.connect_tls[conn] std.net.net.write[conn] ply_host::tls::connect",
-            "std.net.net.connect_tls[listener] std.net.net.write[listener] ply_host::tls::connect",
-            "std.net.net.listen[conn] std.net.net.write[conn] ply_host::tcp::listen",
-            "std.net.net.listen[listener] std.net.net.write[listener] ply_host::tcp::listen",
-            // The only row saying the program serves TLS; its other is a plain `net.write[..]`.
-            "std.net.net.listen_tls[conn] std.net.net.write[conn] ply_host::tls::listen",
-            "std.net.net.listen_tls[listener] std.net.net.write[listener] ply_host::tls::listen",
-            "std.net.net.recv[conn] std.net.net.write[conn] ply_host::tcp::recv",
-            "std.net.net.recv[listener] std.net.net.write[listener] ply_host::tcp::recv",
-            "std.net.net.send[conn] std.net.net.write[conn] ply_host::tcp::send",
-            "std.net.net.send[listener] std.net.net.write[listener] ply_host::tcp::send",
+            "std.net.net.accept[conn] ply_host::tcp::accept",
+            "std.net.net.accept[listener] ply_host::tcp::accept",
+            "std.net.net.close[conn] ply_host::tcp::close",
+            "std.net.net.close[listener] ply_host::tcp::close",
+            "std.net.net.connect[conn] ply_host::tcp::connect",
+            "std.net.net.connect[listener] ply_host::tcp::connect",
+            "std.net.net.connect_tls[conn] ply_host::tls::connect",
+            "std.net.net.connect_tls[listener] ply_host::tls::connect",
+            "std.net.net.listen[conn] ply_host::tcp::listen",
+            "std.net.net.listen[listener] ply_host::tcp::listen",
+            "std.net.net.listen_tls[conn] ply_host::tls::listen",
+            "std.net.net.listen_tls[listener] ply_host::tls::listen",
+            "std.net.net.recv[conn] ply_host::tcp::recv",
+            "std.net.net.recv[listener] ply_host::tcp::recv",
+            "std.net.net.send[conn] ply_host::tcp::send",
+            "std.net.net.send[listener] ply_host::tcp::send",
         ]
     );
 }

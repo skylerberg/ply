@@ -99,16 +99,16 @@ fn health_has_no_row_and_ready_names_what_it_verifies() {
 
     let ready = signature_of(&types, "ready");
     assert!(
-        ready.contains("std.db.db.read[items]"),
+        ready.contains("std.db.db.query[items]"),
         "a readiness route that does not reach the store checks nothing: {ready}"
     );
     assert!(
-        ready.contains("std.signal.signal.read"),
+        ready.contains("std.signal.signal.stopping"),
         "readiness must also mean `nobody has asked this instance to stop`: {ready}"
     );
     assert!(
-        !ready.contains("write"),
-        "a readiness probe that wrote anything would be a load generator with a \
+        ready.contains("/ {std.db.db.query[items], std.signal.signal.stopping}"),
+        "a readiness probe that performed anything else would be a load generator with a \
          two-second period: {ready}"
     );
 }
@@ -124,7 +124,7 @@ fn a_row_says_which_channels_an_endpoint_records_on() {
         let row = signature_of(&types, endpoint);
         for channel in channels {
             assert!(
-                row.contains(&format!("std.trace.trace.write[{channel}]")),
+                row.contains(&format!("std.trace.trace.event[{channel}]")),
                 "`{endpoint}` must publish the `{channel}` channel it records on: {row}"
             );
         }
@@ -145,8 +145,8 @@ fn a_row_says_which_channels_an_endpoint_records_on() {
     }
 
     // The request span is the serving layer's, so `http` appears where the span is opened and nowhere below.
-    assert!(signature_of(&types, "dispatch").contains("std.trace.trace.write[http]"));
-    assert!(!signature_of(&types, "place_order").contains("trace.write[http]"));
+    assert!(signature_of(&types, "dispatch").contains("std.trace.trace.enter[http]"));
+    assert!(!signature_of(&types, "place_order").contains("[http]"));
 }
 
 /// A singleton `trace.write` would put every recording test in one concurrency group.
@@ -155,7 +155,7 @@ fn two_channels_are_two_atoms_rather_than_one_recording_capability() {
     let types = desk_types();
     let row = signature_of(&types, "move_stock");
     assert!(
-        row.contains("std.trace.trace.write[items]") && !row.contains("trace.write[orders]"),
+        row.contains("std.trace.trace.event[items]") && !row.contains("[orders]"),
         "the shelf's own movement records on the shelf's channel and no other: {row}"
     );
 }
@@ -165,20 +165,20 @@ fn only_the_entry_point_reads_settings_and_only_one_route_reads_a_credential() {
     let types = desk_types();
 
     let main = signature_of(&types, "main");
-    assert!(main.contains("std.config.config.read[server]"), "{main}");
+    assert!(main.contains("std.config.config.get[server]"), "{main}");
     assert!(
-        main.contains("std.config.config.read[credentials]"),
+        main.contains("std.config.config.secret[credentials]"),
         "{main}"
     );
 
     // The serving layer carries the credential namespace, never settings: the port was resolved before a socket existed.
     let dispatch = signature_of(&types, "dispatch");
     assert!(
-        dispatch.contains("std.config.config.read[credentials]"),
+        dispatch.contains("std.config.config.secret[credentials]"),
         "{dispatch}"
     );
     assert!(
-        !dispatch.contains("config.read[server]"),
+        !dispatch.contains("[server]"),
         "a request must not re-read the deployment's settings: {dispatch}"
     );
 
