@@ -24,7 +24,7 @@ import tycore (Resource, RNamed, RSingleton, Atom, Row, Type, TyVar, TyCon, TyFn
                resolve_row, occurs_ty, solve_continuation_row, free_vars, unify, unify_row,
                env_new, env_push, env_pop, env_bind, env_bind_global, env_remove_global,
                env_lookup, env_depth_of, env_locals, instantiate_with, instantiate, rename_scheme,
-               generalize, region_prefix, region_of, atom_text, scheme_text, type_text, row_text,
+               generalize, region_prefix, region_of, atom_text, resource_text, scheme_text, type_text, row_text,
                printer_new, print_ty, print_row)
 import resolve (Mod, Source, Resolved, Scope, Binding, ModBind, Declared, Entry, Diag, Label, Ns, NValue, NType, NEffect,
                 resolve_modules, Resolved_, Failed, Expanded, find, lookup, dlookup, space,
@@ -54,7 +54,17 @@ pub type TestInfo = { name: Bytes, module: Bytes, key: Bytes, index: Int, nondet
 pub type LawBinder = { name: Bytes, ty: Type, span: Span }
 pub type LawInfo = { name: Bytes, module: Bytes, key: Bytes, index: Int, binders: List<LawBinder>, has_guard: Bool, host: Bool,
                      footprint: List<Atom>, at: Loc }
-type PerformSite = { atom: Atom, module: Int, span: Span, direct: Bool }
+// Where an atom entered a body's row: an operation performed here, a named definition's own performs,
+// arguments alone (a builtin or constructor), or a function value nothing can see into.
+type Src = | SDirect(Bytes) | SVia(Bytes) | SArgs | SOpaque
+type PerformSite = { atom: Atom, module: Int, span: Span, source: Src }
+type OpKey = { effect: Bytes, op: Bytes, res: Resource }
+// A `handle` awaiting the whole program: the operations its body performs on the atoms it handles are judged once every definition is summarised.
+// `forwarded`: the atoms the enclosing definition's written row keeps, whose uncovered operations run on to the caller's handler.
+type PendingHandle = { module: Int, span: Span, handled: List<Atom>, covered: List<OpKey>, sites: List<PerformSite>, forwarded: List<Atom> }
+type OpAtom = { atom: Atom, op: Bytes }
+// What a body performs on its atoms: the operations known, and the atoms reached through a function value.
+type Summary = { ops: List<OpAtom>, opaque: List<Atom> }
 type Numeric = { span: Span, op: Bytes, ty: Type }
 // A bit operator's or integer builtin's operand, kept until its type is known. `what` names the site in a diagnostic.
 type BitOp = { span: Span, what: Bytes, ty: Type }
@@ -104,6 +114,10 @@ type Cx = {
   alias_stack: List<Bytes>,
   refused_atoms: List<Span>,
   performs: List<PerformSite>,
+  def_sites: Map<Bytes, List<PerformSite>>,
+  pending_handles: List<PendingHandle>,
+  // The written row of the definition being checked; empty when it wrote none, or for a test or law.
+  declared_atoms: List<Atom>,
   comparisons: List<{ module: Int, span: Span, ty: Type }>,
   scope: Int,
   constraints: Map<Bytes, List<DefConstraint>>,
@@ -1027,8 +1041,23 @@ fn signature(cx0: Cx, def: FnDef) -> { cx: Cx, sig: Sig } = {
 fn lit_type(l: Lit) -> Type =
   match l { LInt(_) -> t_int(), LFixed(ty, _) -> con(bytes_of_string(string_upper(string_of_bytes(ty)))), LBool(_) -> t_bool(), LStr(_) -> t_string(), LBytes(_) -> t_bytes(), LFloat(_) -> t_float(), LDec(_) -> t_decimal(), _ -> t_unit() }
 
-fn record_site(cx: Cx, atom: Atom, span: Span, direct: Bool) -> Cx =
-  if span.start == 0 && span.end == 0 { cx } else { {..cx, performs: push(cx.performs, { atom: atom, module: cx.module, span: span, direct: direct })} }
+fn record_site(cx: Cx, atom: Atom, span: Span, source: Src) -> Cx =
+  if span.start == 0 && span.end == 0 { cx } else { {..cx, performs: push(cx.performs, { atom: atom, module: cx.module, span: span, source: source })} }
+
+fn is_direct(s: PerformSite) -> Bool = match s.source { SDirect(_) -> true, _ -> false }
+
+// A lambda's performs happen where it is called, which may be inside a callee's own handler: they are
+// left opaque for the handlers around its definition.
+fn opaque_since(cx: Cx, mark: Int) -> Cx =
+  {..cx, performs: append(take(cx.performs, mark), map(drop(cx.performs, mark), |s: PerformSite| {..s, source: SOpaque}))}
+
+fn callee_source(cx: Cx, func: Expr) -> Src =
+  match func {
+    EVar(v) ->
+      if is_bare(v.name) && (match env_depth_of(cx.env, v.name.name.name) { Some(d) -> d > 0, None -> false }) { SOpaque }
+      else { match declared_value(cx, v.name) { Some(n) -> SVia(n), None -> SArgs } },
+    _ -> SOpaque,
+  }
 
 fn discharge(cx: Cx, mark: Int, handled: List<Atom>) -> Cx = {
   let before = take(cx.performs, mark);
@@ -1169,11 +1198,13 @@ fn infer(cx: Cx, e: Expr) -> Inferred =
         let t: WithTy = match p.ty { Some(te) -> conv_type(acc.cx, te), None -> new_ty(acc.cx) };
         { cx: {..t.cx, env: env_bind(t.cx.env, p.name.name, mono(t.t))}, ts: push(acc.ts, t.t) }
       });
+      let mark = len(ps.cx.performs);
       let body: Inferred = infer(ps.cx, l.body);
       let checked: Cx = match l.ret {
         Some(written) -> { let w: WithTy = conv_type(body.cx, written); expect(w.cx, expr_span(l.body), w.t, body.ty, b"the lambda's written return type").cx },
         None -> body.cx,
       };
+      let checked: Cx = opaque_since(checked, mark);
       { cx: {..checked, env: env_pop(checked.env)}, ty: t_fn(ps.ts, body.ty, body.row), row: row_empty() }
     },
     EApp(a) -> infer_app(cx, a.span, a.func, a.args),
@@ -1376,7 +1407,8 @@ fn infer_app_general(cx: Cx, span: Span, func: Expr, args: List<Expr>) -> Inferr
             note_bits(checked, span, at(fn_.params, 0), bytes_concat_all([b"`", int_builtin_name(func), b"`"]))
           } else { checked };
         let effects = resolve_r(obliged, fn_.effects);
-        let recorded: Cx = fold(effects.atoms, obliged, |cc: Cx, a: Atom| record_site(cc, a, span, false));
+        let source = callee_source(obliged, func);
+        let recorded: Cx = fold(effects.atoms, obliged, |cc: Cx, a: Atom| record_site(cc, a, span, source));
         let j: WithRow = join(recorded, span, j0.r, effects);
         { cx: j.cx, ty: fn_.ret, row: j.r }
       },
@@ -1431,7 +1463,7 @@ fn infer_cell_op(cx: Cx, span: Span, args: List<Expr>, form: CellForm) -> Inferr
         let modes = match form { CGet -> [MRead], CSet -> [MWrite], CUpdate -> [MRead, MWrite] };
         let out = fold(modes, { cx: after.cx, row: after.row }, |acc: { cx: Cx, row: Row }, m: Mode| {
           let atom = { effect: cell(), resource: RNamed(resource), mode: m };
-          let j: WithRow = join(record_site(acc.cx, atom, span, true), span, acc.row, row_singleton(atom));
+          let j: WithRow = join(record_site(acc.cx, atom, span, SDirect(cell_form_name(form))), span, acc.row, row_singleton(atom));
           { cx: j.cx, row: j.r }
         });
         { cx: out.cx, ty: ret, row: out.row }
@@ -1827,9 +1859,9 @@ fn infer_perform(cx: Cx, span: Span, eff: QName, op: Ident, resource: Option<Ide
             let checked: Cx = fold(range(0, len(args)), shape.cx, |c: Cx, i: Int| expect(c, expr_span(at(args, i)), at(shape.params, i), at(as_.tys, i), b"operation argument").cx);
             let atom = { effect: hit.info.name, resource: resource_, mode: hit.op.mode };
             let noted: Cx = note_handoff(note_spawn(checked, hit.info, hit.op, args, as_.tys), hit.info, hit.op, args, as_.tys);
-            let c1: Cx = record_site(noted, atom, span, true);
+            let c1: Cx = record_site(noted, atom, span, SDirect(hit.op.name));
             let op_row = resolve_r(c1, shape.row);
-            let c2: Cx = fold(op_row.atoms, c1, |c: Cx, a: Atom| record_site(c, a, span, false));
+            let c2: Cx = fold(op_row.atoms, c1, |c: Cx, a: Atom| record_site(c, a, span, SArgs));
             let j1: WithRow = join(c2, span, as_.row, op_row);
             let j2: WithRow = join(j1.cx, span, j1.r, row_singleton(atom));
             { cx: j2.cx, ty: shape.ret, row: j2.r }
@@ -1840,7 +1872,7 @@ fn infer_perform(cx: Cx, span: Span, eff: QName, op: Ident, resource: Option<Ide
   }
 }
 
-type HandleAcc = { cx: Cx, handled: List<Atom>, selected: List<{ effect: Bytes, op: Bytes, res: Resource }>, clause_rows: Row }
+type HandleAcc = { cx: Cx, handled: List<Atom>, selected: List<OpKey>, clause_rows: Row }
 
 fn infer_handle(cx: Cx, span: Span, body: Expr, clauses: List<HandleClause>, ret: Option<ReturnClause>) -> Inferred = {
   let mark = len(cx.performs);
@@ -1866,7 +1898,7 @@ fn infer_handle(cx: Cx, span: Span, body: Expr, clauses: List<HandleClause>, ret
             } else {
               let atom = { effect: hit.info.name, resource: resource_, mode: hit.op.mode };
               let key = { effect: hit.info.name, op: hit.op.name, res: resource_ };
-              let dup = fold(acc.selected, false, |d: Bool, k: { effect: Bytes, op: Bytes, res: Resource }| d || k == key);
+              let dup = fold(acc.selected, false, |d: Bool, k: OpKey| d || k == key);
               let c0: Cx = if dup {
                 let res_text = match clause.resource { Some(r) -> bytes_concat_all([b"[", r.name, b"]"]), None -> b"" };
                 report(shape.cx, { code: b"E0105", notes: 1, labels: [lab(shape.cx.module, clause.span, true, b"this clause is unreachable")], text: b"",
@@ -1901,7 +1933,11 @@ fn infer_handle(cx: Cx, span: Span, body: Expr, clauses: List<HandleClause>, ret
       },
     }
   });
-  let discharged: Cx = discharge(walked.cx, mark, walked.handled);
+  let sites = filter(drop(walked.cx.performs, mark), |s: PerformSite| atoms_contains(walked.handled, s.atom));
+  let pending: PendingHandle = { module: walked.cx.module, span: span, handled: walked.handled, covered: walked.selected, sites: sites,
+                                 forwarded: walked.cx.declared_atoms };
+  let noted: Cx = if len(sites) == 0 { walked.cx } else { {..walked.cx, pending_handles: push(walked.cx.pending_handles, pending)} };
+  let discharged: Cx = discharge(noted, mark, walked.handled);
   let returned = match ret {
     Some(rc) -> {
       let pushed: Cx = {..discharged, env: env_push(discharged.env)};
@@ -2062,7 +2098,7 @@ fn infer_simulate(cx: Cx, span: Span, body: Expr) -> Inferred = {
   let discharged: Cx = discharge(c, mark, handled);
   let noted: Cx = {..discharged, simulations: push(discharged.simulations, { module: discharged.module, span: span, body_span: expr_span(body), body_ty: b.ty, body_row: b.row })};
   let seed = seed_atom();
-  let recorded: Cx = record_site(noted, seed, span, true);
+  let recorded: Cx = record_site(noted, seed, span, SDirect(b"seed"));
   let j: WithRow = join(recorded, span, row_without(resolve_r(recorded, b.row), handled), row_singleton(seed));
   { cx: j.cx, ty: b.ty, row: j.r }
 }
@@ -2257,7 +2293,7 @@ fn check_component_walked(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>, qua
     let def = at(fns, at(comp, slot));
     let sig = at(sigs.sigs, slot);
     let o: WithBodyRow = check_fn_body({..acc.cx, derived: derived_of(m, def)}, def, sig);
-    let walked: Cx = {..o.cx, derived: None};
+    let walked: Cx = {..o.cx, derived: None, def_sites: map_insert(o.cx.def_sites, at(qualified, slot), o.cx.performs)};
     { cx: record_spec_env(walked, def, at(qualified, slot), sig), rows: push(acc.rows, o.row) }
   });
   let settled: Cx = settle_bit_ops(settle_numerics(bodies.cx));
@@ -2309,7 +2345,8 @@ fn dedup_constraints(xs: List<DefConstraint>) -> List<DefConstraint> =
     if len(acc) > 0 && at(acc, len(acc) - 1).param == c.param && same_deriver(at(acc, len(acc) - 1).deriver, c.deriver) { acc } else { push(acc, c) })
 
 fn check_fn_body(cx0: Cx, def: FnDef, sig: Sig) -> { cx: Cx, row: Row } = {
-  let cx: Cx = {..cx0, scope: sig.scope, ty_params: sig.ty_params, row_params: sig.row_params, performs: []};
+  let cx: Cx = {..cx0, scope: sig.scope, ty_params: sig.ty_params, row_params: sig.row_params, performs: [],
+                declared_atoms: match sig.declared { Some(r) -> resolve_r(cx0, r).atoms, None -> [] }};
   let assumed: Cx = {..cx, assumed: constraints_in_force(cx, def.constraints)};
   let defaults: Cx = fold(range(0, len(def.params)), assumed, |c: Cx, i: Int|
     match at(def.params, i).default {
@@ -2491,7 +2528,7 @@ fn check_determinism(cx: Cx, def: TestDef, footprint: List<Atom>) -> Cx =
       Some(info) ->
         if !info.nondet { c } else {
           let site = site_for(c, atom);
-          let (span, direct) = match site { Some(s) -> (s.span, s.direct), None -> (expr_span(def.body), false) };
+          let (span, direct) = match site { Some(s) -> (s.span, is_direct(s)), None -> (expr_span(def.body), false) };
           let a = atom_text(atom);
           let remedy = if contains_bytes(simulated_names(), atom.effect) { b"handle it here, e.g. `simulate { <body> }`" }
                        else { bytes_concat_all([b"handle it here, e.g. `handle <body> with { ", example_clause(c, info, atom), b" }`"]) };
@@ -2695,7 +2732,7 @@ fn check_spec_purity(cx: Cx, site: SpecSite, allowed: List<Atom>, at_: Span, row
   let law_body = match site { SSLawBody -> true, _ -> false };
   let c1: Cx = fold(atoms_difference(row.atoms, allowed), cx, |c: Cx, atom: Atom| {
     let found = site_for(c, atom);
-    let (span, direct) = match found { Some(s) -> (s.span, s.direct), None -> (at_, false) };
+    let (span, direct) = match found { Some(s) -> (s.span, is_direct(s)), None -> (at_, false) };
     let fixed = [b"a claim that can perform an effect can change what it observes: an obligation that writes to the resource it judges reports the post-state it caused",
                  b"and a discharge evaluates it hundreds of times, against a world nothing set up"];
     let carried = fold(allowed, fixed, |acc: List<Bytes>, a: Atom|
@@ -3281,7 +3318,7 @@ fn fresh_cx(r: Resolved, mods: List<Mod>, known: Known) -> Cx =
   install_prelude({ r: r, mods: mods, module: 0, subst: subst_new(), fresh: fresh_new(), env: env_new(), diags: [],
                     types: map_new(), effects: [], effect_index: map_new(), ctors: [], ctor_index: map_new(),
                     defs: [], def_index: map_new(), tests: [], laws: [], ty_params: map_new(), row_params: map_new(),
-                    auto_ty_params: false, alias_stack: [], refused_atoms: [], performs: [], comparisons: [], scope: 0,
+                    auto_ty_params: false, alias_stack: [], refused_atoms: [], performs: [], def_sites: map_new(), pending_handles: [], declared_atoms: [], comparisons: [], scope: 0,
                     constraints: map_new(), numerics: [], bit_ops: [], simulate_depth: 0, open_regions: [], regions: [], simulations: [],
                     map_keys: [], constrained_uses: [], spec_kind: None, spec_envs: [], derived: None, known: known, assumed: [] })
 
@@ -3328,8 +3365,110 @@ pub fn check_program_with(r: Resolved, mods: List<Mod>, known: Known) -> Checked
   let settled: Cx = settle_bit_ops(settle_numerics(tested));
   let constrained: Cx = check_constraints(check_map_keys(check_comparisons(settled)));
   let solved: Cx = check_regions(check_simulations(attribute_generated(check_derives(constrained))));
-  let marked: Cx = mark_internal_effects(solved);
+  let marked: Cx = check_handles(mark_internal_effects(solved));
   { cx: marked, ok: len(marked.diags) == 0 }
+}
+
+// --- Handler completeness -----------------------------------------------------------------------------------
+
+fn ops_insert(xs: List<OpAtom>, x: OpAtom) -> List<OpAtom> =
+  if fold(xs, false, |acc: Bool, y: OpAtom| acc || y == x) { xs } else { push(xs, x) }
+
+// What one site adds to a summary; a call of a definition contributes what that definition performs on the site's atom.
+fn summary_add(s: Summary, site: PerformSite, of: Map<Bytes, Summary>) -> Summary =
+  match site.source {
+    SDirect(op) -> {..s, ops: ops_insert(s.ops, { atom: site.atom, op: op })},
+    SVia(name) -> match map_get(of, name) {
+      Some(t) -> { ops: fold(filter(t.ops, |o: OpAtom| o.atom == site.atom), s.ops, ops_insert),
+                   opaque: if atoms_contains(t.opaque, site.atom) { atoms_insert(s.opaque, site.atom) } else { s.opaque } },
+      None -> s,
+    },
+    SArgs -> s,
+    SOpaque -> {..s, opaque: atoms_insert(s.opaque, site.atom)},
+  }
+
+// Every definition's summary, to a fixed point over calls; a pass that changes nothing ends it.
+fn summaries(cx: Cx) -> Map<Bytes, Summary> = {
+  let names = map_keys(cx.def_sites);
+  let sites_total = fold(names, 0, |acc: Int, name: Bytes| acc + (match map_get(cx.def_sites, name) { Some(s) -> len(s), None -> 0 }));
+  iterate(map_new(), len(names) * sites_total + 3, |of: Map<Bytes, Summary>| {
+    let next = fold(names, of, |acc: Map<Bytes, Summary>, name: Bytes| {
+      let sites = match map_get(cx.def_sites, name) { Some(s) -> s, None -> [] };
+      let start = match map_get(acc, name) { Some(s) -> s, None -> { ops: [], opaque: [] } };
+      map_insert(acc, name, fold(sites, start, |s: Summary, site: PerformSite| summary_add(s, site, acc)))
+    });
+    if next == of { Stop(next) } else { Continue(next) }
+  })
+}
+
+fn covers(keys: List<OpKey>, o: OpAtom) -> Bool =
+  fold(keys, false, |acc: Bool, k: OpKey| acc || (k.effect == o.atom.effect && k.op == o.op && k.res == o.atom.resource))
+
+// A site the operation can be traced to: a perform of it, or else a call of a definition that performs it.
+fn site_of_op(sites: List<PerformSite>, o: OpAtom, of: Map<Bytes, Summary>) -> Option<PerformSite> = {
+  let direct = fold(sites, None, |acc: Option<PerformSite>, s: PerformSite|
+    match acc { Some(_) -> acc, None -> match s.source { SDirect(op) -> if op == o.op && s.atom == o.atom { Some(s) } else { None }, _ -> None } });
+  match direct {
+    Some(_) -> direct,
+    None -> fold(sites, None, |acc: Option<PerformSite>, s: PerformSite|
+      match acc { Some(_) -> acc, None -> match s.source {
+        SVia(name) -> match map_get(of, name) {
+          Some(t) -> if s.atom == o.atom && fold(t.ops, false, |b: Bool, x: OpAtom| b || x == o) { Some(s) } else { None },
+          None -> None,
+        },
+        _ -> None,
+      } }),
+  }
+}
+
+fn op_atom_text(cx: Cx, o: OpAtom) -> Bytes =
+  bytes_concat_all([as_written(cx, o.atom.effect), b".", o.op, resource_text(o.atom.resource)])
+
+// The clause the reader could paste for an operation, with its declared parameter count.
+fn clause_for(cx: Cx, o: OpAtom) -> Bytes = {
+  let params = match effect_of(cx, o.atom.effect) {
+    Some(info) -> fold(info.ops, 0, |acc: Int, op: OpInfo| if op.name == o.op { len(op.params) } else { acc }),
+    None -> 0,
+  };
+  bytes_concat_all([op_atom_text(cx, o), b"(", join_with(map(range(0, params), |i: Int| bytes_concat(b"a", num(i))), b", "), b") -> <value>"])
+}
+
+fn simple_name_of(name: Bytes) -> Bytes =
+  match fold(range(0, bytes_len(name)), None, |acc: Option<Int>, i: Int| if bytes_at(name, i) == 46 { Some(i) } else { acc }) {
+    Some(i) -> bytes_slice(name, i + 1, bytes_len(name)),
+    None -> name,
+  }
+
+// Every `handle` must have a clause for each operation its body can perform on an atom it handles, as far as
+// calls of named definitions show; an atom reached through a function value is not judged.
+fn check_handles(cx: Cx) -> Cx = {
+  let of = summaries(cx);
+  fold(cx.pending_handles, cx, |c0: Cx, h: PendingHandle| {
+    let c: Cx = {..c0, module: h.module};
+    let body: Summary = fold(h.sites, { ops: [], opaque: [] }, |s: Summary, site: PerformSite| summary_add(s, site, of));
+    let missing = filter(body.ops, |o: OpAtom|
+      !atoms_contains(body.opaque, o.atom) && !atoms_contains(h.forwarded, o.atom) && !covers(h.covered, o));
+    if len(missing) == 0 { c0 } else {
+      let names = map(missing, |o: OpAtom| bytes_concat_all([b"`", op_atom_text(c, o), b"`"]));
+      let listed = if len(names) == 1 { at(names, 0) }
+                   else { bytes_concat_all([join_with(take(names, len(names) - 1), b", "), b" and ", at(names, len(names) - 1)]) };
+      let labels = fold(missing, [], |acc: List<Label>, o: OpAtom|
+        match site_of_op(h.sites, o, of) {
+          Some(s) -> push(acc, lab(s.module, s.span, true, match s.source {
+            SVia(name) -> bytes_concat_all([b"reaches `", op_atom_text(c, o), b"` through `", simple_name_of(name), b"`"]),
+            _ -> bytes_concat_all([b"performs `", op_atom_text(c, o), b"`"]),
+          })),
+          None -> acc,
+        });
+      let handled = join_with(map(h.handled, |a: Atom| bytes_concat_all([b"`", atom_text(a), b"`"])), b", ");
+      let notes = map(missing, |o: OpAtom| bytes_concat_all([b"add a clause: `", clause_for(c, o), b"`"]));
+      let reported: Cx = err_labels(c, b"E0305",
+        bytes_concat_all([b"this `handle` has no clause for ", listed, b", which its body performs"]),
+        push(labels, lab(h.module, h.span, false, bytes_concat_all([b"handles ", handled, b" here, so the operation would run past it"]))),
+        notes);
+      {..reported, module: c0.module}
+    }
+  })
 }
 
 // --- The dump -----------------------------------------------------------------------------------------------
@@ -3441,6 +3580,59 @@ test "a definition's scheme is generalized and its footprint inferred" {
 
 test "a unit pattern covers its type" {
   assert_eq(check_dump([{ name: b"m", src: b"fn f(u: Unit) -> Int = match u { () -> 1 }" }]), "K;1;F;m.f;(Unit) -> Int;;;;0;")
+}
+
+// The codes of a one-module program's diagnostics, in order; empty when it checks.
+fn check_codes(src: Bytes) -> List<Bytes> = {
+  let r = parse(src);
+  let x = expand(r.node, r.p.uses_sets, r.p.diags);
+  let d: Expansion = expand_derives(0, x.module);
+  match resolve_modules([{ name: b"m", module: d.module, derived: d.derived }]) {
+    Failed(ds) -> map(ds, |dg: Diag| dg.code),
+    Resolved_(y) -> map(dedup_diags(check_program(y.r, y.mods).cx.diags), |dg: Diag| dg.code),
+  }
+}
+
+fn net_src(rest: Bytes) -> Bytes =
+  bytes_concat(b"effect net { write send[s](payload: Bytes) -> Unit\n write recv[s](max: Int) -> Bytes\n write close[s]() -> Unit\n read peek[s]() -> Int }\n", rest)
+
+test "a handle must have a clause for every operation its body performs on an atom it handles" {
+  assert_eq(check_codes(net_src(b"fn f() -> Bytes = handle { net.send[c](b\"x\"); net.recv[c](4) } with { net.recv[c](n) -> b\"\" }")), [b"E0305"]);
+  assert_eq(check_codes(net_src(b"fn f() -> Bytes = handle { net.send[c](b\"x\"); net.recv[c](4) } with { net.recv[c](n) -> b\"\", net.send[c](p) -> () }")), []);
+  assert_eq(check_codes(net_src(b"fn f() -> Int / {net.write[c]} = handle { net.send[c](b\"x\"); net.peek[c]() } with { net.peek[c]() -> 1 }")), [])
+}
+
+test "the operations a called definition performs count, through any number of calls" {
+  let calls = b"fn push_all(p: Bytes) -> Unit / {net.write[c]} = net.send[c](p)\nfn relay(p: Bytes) -> Unit / {net.write[c]} = push_all(p)\n";
+  assert_eq(check_codes(net_src(bytes_concat(calls, b"fn f() -> Unit = handle { relay(b\"x\") } with { net.recv[c](n) -> b\"\" }"))), [b"E0305"]);
+  assert_eq(check_codes(net_src(bytes_concat(calls, b"fn f() -> Unit = handle { relay(b\"x\") } with { net.send[c](p) -> () }"))), []);
+  assert_eq(check_codes(net_src(bytes_concat(calls, b"fn g() -> Unit / {net.write[c]} = relay(b\"y\")\nfn f() -> Unit = handle { g() } with { net.close[c]() -> () }"))), [b"E0305"])
+}
+
+test "an operation a definition handles itself does not reach its callers' handles" {
+  let src = net_src(b"fn quiet() -> Unit / {net.write[c]} = { handle { net.send[c](b\"x\") } with { net.send[c](p) -> () }; net.close[c]() }\nfn f() -> Unit = handle { quiet() } with { net.close[c]() -> () }");
+  assert_eq(check_codes(src), [])
+}
+
+test "a handle over a function value or a lambda is not judged" {
+  assert_eq(check_codes(net_src(b"fn run(f: () -> Unit / {net.write[c]}) -> Unit = handle { f() } with { net.recv[c](n) -> b\"\" }")), []);
+  assert_eq(check_codes(net_src(b"fn f() -> Int = handle { fold([1, 2], 0, |acc: Int, x: Int| { net.send[c](b\"x\"); acc + x }) } with { net.recv[c](n) -> b\"\" }")), [])
+}
+
+test "an operation the written row keeps is forwarded rather than missing" {
+  assert_eq(check_codes(net_src(b"fn f() -> Unit / {net.write[c]} = handle { net.send[c](b\"x\"); net.close[c]() } with { net.send[c](p) -> () }")), []);
+  assert_eq(check_codes(net_src(b"fn f() -> Unit / {net.read[c]} = handle { net.send[c](b\"x\"); net.close[c]() } with { net.send[c](p) -> () }")), [b"E0305"])
+}
+
+test "the missing clause is named as the module would write it" {
+  let r = parse(net_src(b"fn f() -> Unit = handle { net.send[c](b\"x\"); net.close[c]() } with { net.recv[c](n) -> b\"\" }"));
+  let x = expand(r.node, r.p.uses_sets, r.p.diags);
+  let d: Expansion = expand_derives(0, x.module);
+  let messages = match resolve_modules([{ name: b"m", module: d.module, derived: d.derived }]) {
+    Failed(_) -> [],
+    Resolved_(y) -> map(check_program(y.r, y.mods).cx.diags, |dg: Diag| dg.message),
+  };
+  assert_eq(messages, [b"this `handle` has no clause for `net.send[c]` and `net.close[c]`, which its body performs"])
 }
 
 test "a body that performs more than its signature permits is refused" {
