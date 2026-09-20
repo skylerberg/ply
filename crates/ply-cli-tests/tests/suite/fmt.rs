@@ -144,8 +144,13 @@ fn corpus_round_trip(relative: &str, per_file: bool) {
         match out.status.code() {
             Some(0) => {}
             // A fixture written to exercise the parser's recovery does not parse, and stays as it was.
-            Some(2) if per_file && target.contains("-err-") => {
+            Some(2) if per_file && before.iter().any(|c| c.starts_with('E')) => {
                 assert!(stderr.contains("E0"), "{target}: {stderr}");
+                assert_eq!(
+                    std::fs::read(dir.path().join(target)).unwrap(),
+                    std::fs::read(repo().join(relative).join(target)).unwrap(),
+                    "{target} was rewritten although it does not parse"
+                );
                 continue;
             }
             code => panic!("{relative}/{target}: ply fmt exited {code:?}\n{stderr}"),
