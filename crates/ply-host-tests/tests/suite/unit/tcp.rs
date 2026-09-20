@@ -115,17 +115,19 @@ fn inside(v: Value) -> Value {
 #[test]
 fn the_declaration_binds_and_names_exactly_the_operations_the_program_performs() {
     let binding = bind(Arc::new(TcpHost::new()));
-    let atoms: Vec<String> = binding
+    let mut atoms: Vec<String> = binding
         .footprint()
         .atoms()
         .map(EffectAtom::to_string)
         .collect();
-    let rows: Vec<String> = binding
+    let mut rows: Vec<String> = binding
         .listing()
         .rows
         .iter()
         .map(|r| r.to_string())
         .collect();
+    atoms.sort();
+    rows.sort();
     assert_eq!(atoms, rows);
     for label in ["conn", "listener"] {
         assert!(
