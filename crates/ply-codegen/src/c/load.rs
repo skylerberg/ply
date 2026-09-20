@@ -163,9 +163,10 @@ pub(super) fn which(cc: &str) -> Option<std::path::PathBuf> {
 /// A unit's text cut where `build::assemble` marked it. Each bucket, and the tail, compiles as
 /// the header followed by itself; the pieces concatenate back to the text byte for byte.
 pub struct Parts<'a> {
-    /// Up to the first bucket mark: the prelude, the runtime declared, the prototypes.
+    /// Up to the first bucket mark: the prelude and the runtime declared.
     pub header: &'a str,
-    /// Each bucket's id and its text, from its mark line to the next.
+    /// Each bucket's id and its text, from its mark line to the next: the prototypes of what
+    /// its bodies reach, then the bodies.
     pub buckets: Vec<(u8, &'a str)>,
     /// From [`RUNTIME_MARK`]: the runtime's definitions and the embedded exports.
     pub tail: &'a str,
