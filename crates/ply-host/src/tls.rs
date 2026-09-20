@@ -1,11 +1,12 @@
 //! TLS credentials and sessions, terminated through rustls.
 
 use ply_span::{Diagnostic, Span, codes};
+use rustls::client::ClientConnection;
 use rustls::crypto::CryptoProvider;
 use rustls::crypto::hash::HashAlgorithm;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::server::{ServerConfig, ServerConnection};
-use rustls::{Error as TlsError, PeerIncompatible, StreamOwned};
+use rustls::{ClientConfig, Error as TlsError, PeerIncompatible, RootCertStore, StreamOwned};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, BufReader, Read, Write};
@@ -17,8 +18,15 @@ use std::time::Duration;
 /// The Rust path `ply hosts` prints for `net.listen_tls`; it must name [`listen`].
 pub const HANDLER: &str = "ply_host::tls::listen";
 
+/// The Rust path `ply hosts` prints for `net.connect_tls`; it must name [`connect`].
+pub const CONNECT_HANDLER: &str = "ply_host::tls::connect";
+
 pub const LIBRARY: &str = "rustls";
 pub const VERSION: &str = "0.23.43";
+
+/// The root certificates `net.connect_tls` verifies a server against, beside any `--trust`.
+pub const ROOTS: &str = "webpki-roots";
+pub const ROOTS_VERSION: &str = "1.0.9";
 
 /// `ring`, not rustls's default `aws-lc-rs`, which needs a C toolchain and cmake on some platforms.
 pub const PROVIDER: &str = "ring";
@@ -84,6 +92,9 @@ impl Credential {
 #[derive(Default)]
 pub struct Credentials {
     entries: BTreeMap<String, Credential>,
+    /// What `net.connect_tls` verifies a server against.
+    client: Option<Arc<ClientConfig>>,
+    trusted: usize,
 }
 
 impl Credentials {
@@ -91,9 +102,20 @@ impl Credentials {
         Credentials::default()
     }
 
-    pub fn load(specs: &[CredentialSpec]) -> Result<Credentials, Vec<Diagnostic>> {
+    /// `trusted` names PEM files whose certificates `net.connect_tls` accepts beside the roots.
+    pub fn load(
+        specs: &[CredentialSpec],
+        trusted: &[PathBuf],
+    ) -> Result<Credentials, Vec<Diagnostic>> {
         let mut entries: BTreeMap<String, Credential> = BTreeMap::new();
         let mut diagnostics = Vec::new();
+        let mut anchors = Vec::new();
+        for path in trusted {
+            match certificates(path) {
+                Ok(chain) => anchors.extend(chain),
+                Err(diagnostic) => diagnostics.push(diagnostic),
+            }
+        }
         for spec in specs {
             if entries.contains_key(&spec.name) {
                 diagnostics.push(err_duplicate(&spec.name));
@@ -106,10 +128,28 @@ impl Credentials {
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
         }
-        if diagnostics.is_empty() {
-            Ok(Credentials { entries })
-        } else {
-            Err(diagnostics)
+        if !diagnostics.is_empty() {
+            return Err(diagnostics);
+        }
+        let trusted = anchors.len();
+        let client = client_config(anchors).map_err(|d| vec![d])?;
+        Ok(Credentials {
+            entries,
+            client: Some(client),
+            trusted,
+        })
+    }
+
+    /// How many `--trust` certificates join the roots.
+    pub fn trusted(&self) -> usize {
+        self.trusted
+    }
+
+    /// The configuration `net.connect_tls` verifies a server with; built once per run.
+    pub fn client(&self) -> Arc<ClientConfig> {
+        match &self.client {
+            Some(config) => Arc::clone(config),
+            None => client_config(Vec::new()).expect("the provider supports the versions it names"),
         }
     }
 
@@ -166,6 +206,27 @@ fn load_one(spec: &CredentialSpec) -> Result<Credential, Diagnostic> {
 /// The provider, installed explicitly on each builder.
 pub fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
+}
+
+fn client_config(trusted: Vec<CertificateDer<'static>>) -> Result<Arc<ClientConfig>, Diagnostic> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let (_, ignored) = roots.add_parsable_certificates(trusted);
+    if ignored > 0 {
+        return Err(err_trust(ignored));
+    }
+    let mut config = ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| {
+            Diagnostic::error(
+                codes::TLS_CREDENTIAL_INVALID,
+                format!("the TLS client could not be configured: {e}"),
+            )
+        })?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = ALPN.iter().map(|p| p.as_bytes().to_vec()).collect();
+    Ok(Arc::new(config))
 }
 
 fn certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, Diagnostic> {
@@ -244,9 +305,56 @@ impl Write for Socket {
     }
 }
 
+/// The two ends a session can be; rustls types them apart.
+enum Stream {
+    Server(StreamOwned<ServerConnection, Socket>),
+    Client(StreamOwned<ClientConnection, Socket>),
+}
+
+impl Stream {
+    fn is_handshaking(&self) -> bool {
+        match self {
+            Stream::Server(s) => s.conn.is_handshaking(),
+            Stream::Client(s) => s.conn.is_handshaking(),
+        }
+    }
+
+    fn send_close_notify(&mut self) {
+        match self {
+            Stream::Server(s) => s.conn.send_close_notify(),
+            Stream::Client(s) => s.conn.send_close_notify(),
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Stream::Server(s) => s.read(buf),
+            Stream::Client(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Stream::Server(s) => s.write(buf),
+            Stream::Client(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Stream::Server(s) => s.flush(),
+            Stream::Client(s) => s.flush(),
+        }
+    }
+}
+
 pub struct Session {
     socket: Arc<TcpStream>,
-    session: Mutex<Option<StreamOwned<ServerConnection, Socket>>>,
+    session: Mutex<Option<Stream>>,
     handshakes: Arc<Handshakes>,
 }
 
@@ -256,14 +364,34 @@ impl Session {
         socket: Arc<TcpStream>,
         handshakes: Arc<Handshakes>,
     ) -> Session {
-        let started = match ServerConnection::new(config) {
-            Ok(connection) => Some(StreamOwned::new(connection, Socket(Arc::clone(&socket)))),
-            Err(_) => {
-                handshakes.refused(REASON_CONFIGURATION);
-                let _ = socket.shutdown(Shutdown::Both);
-                None
-            }
-        };
+        let started = ServerConnection::new(config).ok().map(|connection| {
+            Stream::Server(StreamOwned::new(connection, Socket(Arc::clone(&socket))))
+        });
+        Session::started(started, socket, handshakes)
+    }
+
+    /// The client end, verifying `name`; it handshakes on the first read or write, like a server.
+    pub fn connect(
+        config: Arc<ClientConfig>,
+        name: ServerName<'static>,
+        socket: Arc<TcpStream>,
+        handshakes: Arc<Handshakes>,
+    ) -> Session {
+        let started = ClientConnection::new(config, name).ok().map(|connection| {
+            Stream::Client(StreamOwned::new(connection, Socket(Arc::clone(&socket))))
+        });
+        Session::started(started, socket, handshakes)
+    }
+
+    fn started(
+        started: Option<Stream>,
+        socket: Arc<TcpStream>,
+        handshakes: Arc<Handshakes>,
+    ) -> Session {
+        if started.is_none() {
+            handshakes.refused(REASON_CONFIGURATION);
+            let _ = socket.shutdown(Shutdown::Both);
+        }
         Session {
             socket,
             session: Mutex::new(started),
@@ -284,7 +412,7 @@ impl Session {
         let Some(stream) = guard.as_mut() else {
             return Some(Vec::new());
         };
-        let handshaking = stream.conn.is_handshaking();
+        let handshaking = stream.is_handshaking();
         let mut buffer = vec![0u8; max];
         match stream.read(&mut buffer) {
             Ok(0) => {
@@ -311,7 +439,7 @@ impl Session {
         let Some(stream) = guard.as_mut() else {
             return 0;
         };
-        let handshaking = stream.conn.is_handshaking();
+        let handshaking = stream.is_handshaking();
         match stream.write_all(payload).and_then(|()| stream.flush()) {
             Ok(()) => {
                 self.completed(handshaking, stream);
@@ -328,7 +456,7 @@ impl Session {
     pub fn close(&self) {
         if let Ok(mut guard) = self.session.try_lock() {
             if let Some(stream) = guard.as_mut() {
-                stream.conn.send_close_notify();
+                stream.send_close_notify();
                 let _ = stream.flush();
             }
             *guard = None;
@@ -337,17 +465,13 @@ impl Session {
     }
 
     /// A handshake that has just finished, counted once.
-    fn completed(&self, was_handshaking: bool, stream: &StreamOwned<ServerConnection, Socket>) {
-        if was_handshaking && !stream.conn.is_handshaking() {
+    fn completed(&self, was_handshaking: bool, stream: &Stream) {
+        if was_handshaking && !stream.is_handshaking() {
             self.handshakes.completed();
         }
     }
 
-    fn finish(
-        &self,
-        guard: &mut MutexGuard<'_, Option<StreamOwned<ServerConnection, Socket>>>,
-        refused: Option<&'static str>,
-    ) {
+    fn finish(&self, guard: &mut MutexGuard<'_, Option<Stream>>, refused: Option<&'static str>) {
         if let Some(reason) = refused {
             self.handshakes.refused(reason);
         }
@@ -356,7 +480,7 @@ impl Session {
     }
 }
 
-const REASON_CONFIGURATION: &str = "the listener's TLS configuration would not start a session";
+const REASON_CONFIGURATION: &str = "the TLS configuration would not start a session";
 pub const REASON_NOT_TLS: &str = "the peer did not speak TLS, or a record was corrupt";
 pub const REASON_VERSION: &str =
     "no TLS version in common (this listener offers TLS 1.3 and TLS 1.2)";
@@ -547,6 +671,15 @@ fn err_mismatch(spec: &CredentialSpec, error: &TlsError) -> Diagnostic {
     .note(format!("rustls refused the pair: {error}"))
     .note("the private key's public half must match the public key of the first certificate in the chain")
     .note("check that the two files are from the same issuance, and that the chain is leaf first")
+}
+
+#[cold]
+fn err_trust(ignored: usize) -> Diagnostic {
+    Diagnostic::error(
+        codes::TLS_CREDENTIAL_INVALID,
+        format!("{ignored} `--trust` certificate(s) could not be parsed"),
+    )
+    .note("`--trust CERT.pem` wants one or more certificates in PEM, each a root `net.connect_tls` may accept")
 }
 
 #[cold]

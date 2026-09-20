@@ -43,7 +43,7 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
     };
 
     // Loaded even without `--host`: this command answers what a run trusts, and whether it starts.
-    let credentials = match tls::Credentials::load(&args.tls.tls) {
+    let credentials = match tls::Credentials::load(&args.tls.tls, &args.tls.trust) {
         Ok(credentials) => credentials,
         Err(diagnostics) => {
             return report_bind_error("hosts", &diagnostics, &loaded.sources, args.json, style);
