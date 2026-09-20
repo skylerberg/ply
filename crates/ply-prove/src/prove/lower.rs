@@ -1178,16 +1178,33 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 }
                 let elem = scrutinee_sort.and_then(super::term::list_elem).cloned();
                 let mut binds = Vec::with_capacity(items.len() + 1);
+                // A spine in view binds its own heads and tail, so a call over the tail is the
+                // same term wherever the tail is named; a symbol gets fresh fields.
+                let mut at = Some(scrutinee);
                 for item in items {
-                    let field = self.terms.sym(elem.clone());
+                    let field = match at.map(|t| self.terms.node(t).clone()) {
+                        Some(Node::Cons { head, tail }) => {
+                            at = Some(tail);
+                            head
+                        }
+                        _ => {
+                            at = None;
+                            self.terms.sym(elem.clone())
+                        }
+                    };
                     if let Pat::Var(slot) = item {
                         self.bind(*slot, field);
                     }
                     binds.push(field);
                 }
                 if let Some(rest) = rest {
-                    let tail = self.terms.sym(scrutinee_sort.cloned());
-                    self.smaller.push((tail, scrutinee));
+                    let tail = match at {
+                        Some(t) => t,
+                        None => self.terms.sym(scrutinee_sort.cloned()),
+                    };
+                    if tail != scrutinee {
+                        self.smaller.push((tail, scrutinee));
+                    }
                     if let Pat::Var(slot) = &**rest {
                         self.bind(*slot, tail);
                     }
