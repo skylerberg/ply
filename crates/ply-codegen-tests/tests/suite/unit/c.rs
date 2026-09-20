@@ -683,6 +683,62 @@ fn a_definition_that_only_moved_is_served_from_the_cache_and_placed_where_it_now
     assert_eq!(moved[..after.start as usize].matches('\n').count() + 1, 4);
 }
 
+/// Keyed on the front end's hashes; the nonce keeps both definitions out of any earlier process's cache.
+#[test]
+fn an_edited_definition_alone_is_asked_of_the_emitter_and_the_unit_is_the_one_a_cold_build_emits() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        % 1_000_000_000_000_000;
+    let program = |k: u128| {
+        let steady = format!("pub fn steady(x: Int) -> Int = x + {nonce}\n");
+        format!("{steady}pub fn changed(x: Int) -> Int = x * {k}\n")
+    };
+    // `suffix` turns every key, so a source keyed apart from the others is built cold.
+    let hashed = |text: &str, suffix: &str| -> &'static ply_codegen::Source {
+        let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
+        let id = ply_span::SourceId(0);
+        let front =
+            ply_codegen::c::producer::checked_front(&[("m".to_string(), owned.to_string())], &[id])
+                .expect("checks");
+        let front: &'static ply_ty::Front = Box::leak(Box::new(front));
+        let keys = ply_codegen::emit_keys(front)
+            .into_iter()
+            .map(|(name, key)| (name, format!("{key}{suffix}")))
+            .collect();
+        Box::leak(Box::new(
+            ply_codegen::Source::from_front(front, keys).with_texts(
+                std::collections::HashMap::from([("m".to_string(), owned.to_string())]),
+            ),
+        ))
+    };
+    let produce = |source: &'static ply_codegen::Source| -> ply_codegen::c::Produced {
+        let names = source.functions();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let produced = ply_codegen::c::produce(source, &refs).expect("the program emits");
+        assert!(produced.refused.is_empty(), "{:?}", produced.refused);
+        produced
+    };
+
+    let _config = CONFIG.read().unwrap_or_else(|e| e.into_inner());
+    let first = produce(hashed(&program(nonce + 1), ""));
+    let edited_text = program(nonce + 2);
+    ply_codegen::c::producer::reset_census();
+    let edited = produce(hashed(&edited_text, ""));
+    assert_eq!(
+        ply_codegen::c::producer::census().wanted,
+        vec![vec!["m.changed".to_string()]],
+        "the emitter was not entered once, for the edited definition alone"
+    );
+    assert_ne!(first.text, edited.text, "the edit did not reach the unit");
+    let cold = produce(hashed(&edited_text, "-cold"));
+    assert_eq!(
+        edited.text, cold.text,
+        "a unit with one body served from the cache is not the one a cold build emits"
+    );
+}
+
 /// Asserted on the memo, not a clock: without the emitted `rt_constant` the slot stays empty however long the run takes.
 #[test]
 fn a_pure_nullary_root_that_answers_a_handle_is_asked_once() {

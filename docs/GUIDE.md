@@ -649,7 +649,7 @@ only evaluator. Its passes share the evaluator's cache.
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused |
 | `PLY_C_DUMP=NAME` | print one body's emitted C, or `*` for the unit's largest bodies |
 | `PLY_C_ONLY=a,b`, `PLY_C_SKIP=prefix,...` | compile only the named definitions, or drop those with a prefix |
-| `PLY_C_PHASES=1` | print compile phases and allocation counts |
+| `PLY_C_PHASES=1` | print compile phases, body-cache hits and misses, and allocation counts |
 | `PLY_HEAP_POISON=1` | poison released blocks and fail on a read of one |
 | `PLY_HEAP_DELAY=N` | reuse a released block only after `N` more releases |
 | `PLY_C_EMITTER=ply:DIR` | use emitter sources from `DIR` instead of the built-in ones |
@@ -940,17 +940,23 @@ and writes `0`.
 
 ### 13.2 `std.http` — HTTP/1.1
 
-Parsing and encoding are pure; only the serve loop performs `net`. An ambiguous
-message is refused and the connection closed; every loop is bounded by `Limits`.
+Parsing and encoding are pure; the serve loop and the client perform `net`,
+both under `[conn]`. An ambiguous message is refused and the connection closed;
+every loop is bounded by `Limits`.
 Types: `Method`, `Version`, `Headers`, `Request`, `Response`, `Limits`,
-`Refusal`, `Framing`, `Head`, `HeadResult`, `BodyState`, `BodyStep`. Functions:
+`Refusal`, `Framing`, `Head`, `HeadResult`, `BodyState`, `BodyStep`,
+`ResponseHead`, `ResponseHeadResult`, `ClientError`. Functions:
 `default_limits`, `parse_head`, `body_start`, `body_step`, `header`,
 `header_lines`, `has_header`, `set_header`, `add_header`, `response`,
 `text_response`, `refusal_response`, `method_not_allowed`, `reason_phrase`,
 `encode`, `encode_chunked_head`, `encode_chunk`, `last_chunk`,
 `continue_response`, `read_head`, `read_body`, `serve_connection`, `serve`,
-`listen_and_serve`. No TLS above the socket, compression, `Upgrade` or
-`Content-Encoding`.
+`listen_and_serve`, `request_to`, `encode_request`, `parse_response_head`,
+`request`. `request(host, port, req, limits)` opens one connection, sends the
+request with `Connection: close`, reads the answer and closes; a response
+without a length field is `UntilClose` and read until the server closes, up
+to `max_body`. A malformed response is `Malformed` with a 502 refusal. No
+TLS above the socket, compression, `Upgrade` or `Content-Encoding`.
 
 ### 13.3 `std.router` — routes as data
 
