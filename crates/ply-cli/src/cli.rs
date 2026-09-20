@@ -57,6 +57,10 @@ pub enum Command {
     Doc(DocArgs),
     /// Rewrite `.ply` files in the canonical layout; a file that does not parse is left alone.
     Fmt(FmtArgs),
+    /// One `fn` or `type` as its file holds it: the comment lines above it, `pub`, and the body.
+    Show(ShowArgs),
+    /// Rewrite one `fn` or `type` from a file or stdin, formatted, leaving every other byte of the file alone.
+    Replace(ReplaceArgs),
     /// Print the content hash of every definition.
     Hash(HashArgs),
     /// Every definition with its place, hash, signature and footprint.
@@ -687,6 +691,44 @@ pub struct FmtArgs {
     pub paths: Vec<PathBuf>,
 
     /// Write nothing; list the files that would change and exit 1 if there are any.
+    #[arg(long)]
+    pub check: bool,
+
+    /// Emit one JSON object on stdout and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ShowArgs {
+    /// A program-wide name (`store.orders.place`) or a simple name unique in the program: a `fn` or a `type`.
+    #[arg(value_name = "NAME")]
+    pub query: String,
+
+    /// A `.ply` file, or a project root whose `*.ply` files are modules named by path.
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
+
+    /// Emit one JSON object on stdout and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ReplaceArgs {
+    /// A program-wide name (`store.orders.place`) or a simple name unique in the program: a `fn` or a `type`.
+    #[arg(value_name = "NAME")]
+    pub query: String,
+
+    /// The file holding the new definition; stdin when absent.
+    #[arg(long, value_name = "FILE")]
+    pub with: Option<PathBuf>,
+
+    /// A `.ply` file, or a project root whose `*.ply` files are modules named by path.
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
+
+    /// Write nothing; report whether the file would change.
     #[arg(long)]
     pub check: bool,
 
