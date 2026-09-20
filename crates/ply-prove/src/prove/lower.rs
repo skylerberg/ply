@@ -131,6 +131,8 @@ pub struct Lowering<'a, 'p> {
     defined: Vec<TermId>,
     /// Calls of a total definition left as terms.
     calls: Vec<TermId>,
+    /// Each rest binder of a list pattern, with the list it is the tail of.
+    smaller: Vec<(TermId, TermId)>,
 }
 
 impl<'a, 'p> Lowering<'a, 'p> {
@@ -157,6 +159,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
             equations: Vec::new(),
             defined: Vec::new(),
             calls: Vec::new(),
+            smaller: Vec::new(),
         }
     }
 
@@ -186,6 +189,21 @@ impl<'a, 'p> Lowering<'a, 'p> {
 
     pub fn calls(&self) -> &[TermId] {
         &self.calls
+    }
+
+    /// Whether `t` is a tail of `root`, through the list patterns that took it apart.
+    pub fn smaller_than(&self, t: TermId, root: TermId) -> bool {
+        let mut at = t;
+        for _ in 0..=self.smaller.len() {
+            let Some((_, from)) = self.smaller.iter().find(|(tail, _)| *tail == at) else {
+                return false;
+            };
+            if *from == root {
+                return true;
+            }
+            at = *from;
+        }
+        false
     }
 
     pub fn requirements_since(&self, mark: usize) -> &[TermId] {
@@ -457,7 +475,15 @@ impl<'a, 'p> Lowering<'a, 'p> {
             }
             Code::List(items) => {
                 let items: Vec<TermId> = items.iter().map(|i| self.lower(i)).collect();
-                self.terms.mk(Node::List(items), None)
+                let sort = items
+                    .first()
+                    .and_then(|t| self.terms.sort(*t).cloned())
+                    .map(Type::list);
+                let mut out = self.terms.nil(sort.clone());
+                for item in items.into_iter().rev() {
+                    out = self.terms.cons(item, out, sort.clone());
+                }
+                out
             }
             Code::Region => {
                 self.blocked(Blocker::Region);
@@ -527,6 +553,9 @@ impl<'a, 'p> Lowering<'a, 'p> {
             Some(scheme) => self
                 .terms
                 .mk(Node::Opaque(name.clone()), scheme_sort(scheme)),
+            None if TOTAL_BUILTINS.contains(&name.as_str()) => {
+                self.terms.opaque(name.as_str(), None)
+            }
             None => self.terms.sym(None),
         }
     }
@@ -751,8 +780,19 @@ impl<'a, 'p> Lowering<'a, 'p> {
             _ => None,
         };
 
-        let mut pure = self.head_is_pure(head);
-        if let Node::Opaque(name) = self.terms.node(head).clone() {
+        // A total builtin is a function of its arguments, so two calls over one argument are one term.
+        let total_builtin =
+            matches!(&callee, Callee::Unresolved(name) if TOTAL_BUILTINS.contains(&name.as_str()));
+        let sort = match &callee {
+            Callee::Unresolved(name) if total_builtin => {
+                builtin_sort(name.as_str(), &lowered, &self.terms)
+            }
+            _ => sort,
+        };
+        let mut pure = total_builtin || self.head_is_pure(head);
+        if let Node::Opaque(name) = self.terms.node(head).clone()
+            && !total_builtin
+        {
             if let Some(ctor) = self.ctx.ctor(&name) {
                 if ctor.arity == lowered.len() {
                     let sort = ctor_result_sort(ctor, &lowered, &self.terms);
@@ -776,6 +816,11 @@ impl<'a, 'p> Lowering<'a, 'p> {
         if !self.decreasing_call(&callee, &lowered) && !self.callee_is_total(&callee, head) {
             self.undefined();
         }
+        if let Callee::Unresolved(name) = &callee
+            && let Some(term) = self.list_builtin(name.as_str(), head, &lowered)
+        {
+            return term;
+        }
 
         // A call not known to be a function of its arguments gets a fresh symbol per occurrence.
         if !pure {
@@ -793,6 +838,83 @@ impl<'a, 'p> Lowering<'a, 'p> {
             self.calls.push(call);
         }
         call
+    }
+
+    /// `len` and `push` over a list whose spine is in view, structurally; where the spine ends in
+    /// a symbol the call stays, over that symbol.
+    fn list_builtin(&mut self, name: &str, head: TermId, args: &[TermId]) -> Option<TermId> {
+        match (name, args) {
+            ("len", [xs]) => self.list_len(head, *xs),
+            ("push", [xs, x]) => self.list_push(head, *xs, *x),
+            _ => None,
+        }
+    }
+
+    fn list_len(&mut self, head: TermId, xs: TermId) -> Option<TermId> {
+        let mut count = 0i64;
+        let mut at = xs;
+        loop {
+            match self.terms.node(at).clone() {
+                Node::Nil => return Some(self.terms.int_lit(count)),
+                Node::Cons { tail, .. } => {
+                    count += 1;
+                    at = tail;
+                }
+                _ => break,
+            }
+        }
+        if count == 0 {
+            return None;
+        }
+        let rest = self.terms.mk(
+            Node::App {
+                head,
+                args: vec![at],
+            },
+            Some(Type::int()),
+        );
+        let k = self.terms.int_lit(count);
+        let sum = self.terms.add(k, rest)?;
+        self.require_int_range(sum);
+        Some(sum)
+    }
+
+    fn list_push(&mut self, head: TermId, xs: TermId, x: TermId) -> Option<TermId> {
+        let sort = self.terms.sort(xs).cloned();
+        let mut heads = Vec::new();
+        let mut at = xs;
+        loop {
+            match self.terms.node(at).clone() {
+                Node::Nil => break,
+                Node::Cons { head, tail } => {
+                    heads.push(head);
+                    at = tail;
+                }
+                _ => {
+                    if heads.is_empty() {
+                        return None;
+                    }
+                    break;
+                }
+            }
+        }
+        let mut out = match self.terms.node(at).clone() {
+            Node::Nil => {
+                let nil = self.terms.nil(sort.clone());
+                self.terms.cons(x, nil, sort.clone())
+            }
+            _ => self.terms.mk(
+                Node::App {
+                    head,
+                    args: vec![at, x],
+                },
+                sort.clone(),
+            ),
+        };
+        for h in heads.into_iter().rev() {
+            out = self.terms.cons(h, out, sort.clone());
+        }
+        Some(out)
     }
 
     /// Decided from the code, not the head's term: a local and a same-named definition lower alike.
@@ -854,6 +976,19 @@ impl<'a, 'p> Lowering<'a, 'p> {
         let Some(&arg) = args.get(measure.slot) else {
             return false;
         };
+        if self
+            .terms
+            .sort(measure.bound)
+            .is_some_and(|s| super::term::list_elem(s).is_some())
+        {
+            let owed = if self.smaller_than(arg, measure.bound) {
+                self.terms.true_id
+            } else {
+                self.terms.false_id
+            };
+            self.measures.push(owed);
+            return true;
+        }
         let zero = self.terms.int_lit(0);
         let low = self.terms.mk(
             Node::Cmp {
@@ -977,7 +1112,29 @@ impl<'a, 'p> Lowering<'a, 'p> {
             if let Some(guard) = &arm.guard {
                 self.lower(guard);
             }
+            // What a list arm's body owes is owed only where the arm runs: at `[]`, or off it.
+            let taken = match &test {
+                ArmTest::List {
+                    fixed: 0,
+                    rest: false,
+                } => {
+                    let nil = self.terms.nil(scrutinee_sort.clone());
+                    Some(self.terms.eq(scrutinee, nil))
+                }
+                ArmTest::List { .. } => {
+                    let nil = self.terms.nil(scrutinee_sort.clone());
+                    let at_nil = self.terms.eq(scrutinee, nil);
+                    Some(self.terms.not(at_nil))
+                }
+                _ => None,
+            };
+            if let Some(cond) = taken {
+                self.path.push(cond);
+            }
             let body = self.lower(&arm.body);
+            if taken.is_some() {
+                self.path.pop();
+            }
             if result_sort.is_none() {
                 result_sort = self.terms.sort(body).cloned();
             }
@@ -1028,6 +1185,53 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 }
                 Some((ArmTest::Ctor(name.clone()), binds))
             }
+            Pat::List(items, rest) => {
+                let inner = items.iter().chain(rest.iter().map(|r| &**r));
+                if !inner.clone().all(|a| matches!(a, Pat::Wild | Pat::Var(_))) {
+                    return None;
+                }
+                let elem = scrutinee_sort.and_then(super::term::list_elem).cloned();
+                let mut binds = Vec::with_capacity(items.len() + 1);
+                // A spine in view binds its own heads and tail, so a call over the tail is the
+                // same term wherever the tail is named; a symbol gets fresh fields.
+                let mut at = Some(scrutinee);
+                for item in items {
+                    let field = match at.map(|t| self.terms.node(t).clone()) {
+                        Some(Node::Cons { head, tail }) => {
+                            at = Some(tail);
+                            head
+                        }
+                        _ => {
+                            at = None;
+                            self.terms.sym(elem.clone())
+                        }
+                    };
+                    if let Pat::Var(slot) = item {
+                        self.bind(*slot, field);
+                    }
+                    binds.push(field);
+                }
+                if let Some(rest) = rest {
+                    let tail = match at {
+                        Some(t) => t,
+                        None => self.terms.sym(scrutinee_sort.cloned()),
+                    };
+                    if tail != scrutinee {
+                        self.smaller.push((tail, scrutinee));
+                    }
+                    if let Pat::Var(slot) = &**rest {
+                        self.bind(*slot, tail);
+                    }
+                    binds.push(tail);
+                }
+                Some((
+                    ArmTest::List {
+                        fixed: items.len(),
+                        rest: rest.is_some(),
+                    },
+                    binds,
+                ))
+            }
             Pat::Nested(_) => None,
         }
     }
@@ -1056,6 +1260,12 @@ fn pattern_slots(pat: &Pat) -> Vec<usize> {
         match p {
             Pat::Var(slot) => out.push(*slot),
             Pat::Ctor(_, inner) | Pat::Nested(inner) => stack.extend(inner),
+            Pat::List(items, rest) => {
+                stack.extend(items);
+                if let Some(rest) = rest {
+                    stack.push(rest);
+                }
+            }
             Pat::Wild | Pat::Lit(_) => {}
         }
     }
@@ -1087,6 +1297,21 @@ fn type_parameters(ctor: &CtorInfo) -> Option<Vec<TyVar>> {
 }
 
 /// Instantiated against the scrutinee's sort when it is known.
+/// What a total builtin answers, read off its arguments' sorts where the answer depends on them.
+fn builtin_sort(name: &str, args: &[TermId], terms: &Terms) -> Option<Type> {
+    let first = args.first().and_then(|a| terms.sort(*a).cloned());
+    match name {
+        "len" | "min" | "max" | "bytes_len" | "string_len" => Some(Type::int()),
+        "int_to_string" => Some(Type::string()),
+        "push" => first,
+        "list_at" => first
+            .as_ref()
+            .and_then(super::term::list_elem)
+            .map(|elem| Type::Con(Symbol::new("Option"), vec![elem.clone()])),
+        _ => None,
+    }
+}
+
 pub(super) fn field_sorts(ctor: &CtorInfo, sort: Option<&Type>) -> Vec<Option<Type>> {
     let subst = match (sort, type_parameters(ctor)) {
         (Some(Type::Con(name, args)), Some(params))

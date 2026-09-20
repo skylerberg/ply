@@ -121,7 +121,12 @@ pub enum ArmTest {
     Always,
     Ctor(Symbol),
     Lit(TermId),
-    /// A nested constructor, record or list pattern.
+    /// `fixed` heads, then a rest or the end of the list.
+    List {
+        fixed: usize,
+        rest: bool,
+    },
+    /// A nested constructor or record pattern.
     Undecidable,
 }
 
@@ -155,7 +160,11 @@ pub enum Node {
         name: Symbol,
         args: Vec<TermId>,
     },
-    List(Vec<TermId>),
+    Nil,
+    Cons {
+        head: TermId,
+        tail: TermId,
+    },
     /// Ascending by field name.
     Record(Vec<(Symbol, TermId)>),
     Field {
@@ -293,6 +302,14 @@ impl Terms {
         self.mk(Node::Unit, Some(Type::unit()))
     }
 
+    pub fn nil(&mut self, sort: Option<Type>) -> TermId {
+        self.mk(Node::Nil, sort)
+    }
+
+    pub fn cons(&mut self, head: TermId, tail: TermId, sort: Option<Type>) -> TermId {
+        self.mk(Node::Cons { head, tail }, sort)
+    }
+
     pub fn sym(&mut self, sort: Option<Type>) -> TermId {
         let n = self.next_sym;
         self.next_sym += 1;
@@ -404,4 +421,11 @@ impl Terms {
 
 pub fn is_int_type(t: &Type) -> bool {
     matches!(t, Type::Con(name, args) if name.as_str() == "Int" && args.is_empty())
+}
+
+pub fn list_elem(t: &Type) -> Option<&Type> {
+    match t {
+        Type::Con(name, args) if name.as_str() == "List" && args.len() == 1 => Some(&args[0]),
+        _ => None,
+    }
 }
