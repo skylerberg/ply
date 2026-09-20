@@ -159,19 +159,55 @@ fn corpus_round_trip(relative: &str, per_file: bool) {
             .args(["fmt", "--check", target])
             .output()
             .unwrap();
-        assert_eq!(
-            again.status.code(),
-            Some(0),
-            "{relative}/{target} is not a fixed point:\n{}{}",
-            String::from_utf8_lossy(&again.stdout),
-            String::from_utf8_lossy(&again.stderr)
-        );
+        if again.status.code() != Some(0) {
+            let stdout = String::from_utf8_lossy(&again.stdout);
+            let moved: Vec<&str> = stdout
+                .lines()
+                .filter_map(|l| l.strip_prefix("would format "))
+                .collect();
+            let mut report = String::new();
+            for file in moved {
+                let once = std::fs::read_to_string(dir.path().join(file)).unwrap();
+                ply(dir.path()).args(["fmt", file]).output().unwrap();
+                let twice = std::fs::read_to_string(dir.path().join(file)).unwrap();
+                report.push_str(&first_difference(file, &once, &twice));
+            }
+            panic!(
+                "{relative}/{target} is not a fixed point:\n{stdout}{}\n{report}",
+                String::from_utf8_lossy(&again.stderr)
+            );
+        }
         assert_eq!(
             check_codes(dir.path(), target),
             before,
             "{relative}/{target} checks differently after formatting"
         );
     }
+}
+
+/// The first line where a second pass over `file` differs from the first, with five lines of
+/// context from each.
+fn first_difference(file: &str, once: &str, twice: &str) -> String {
+    let a: Vec<&str> = once.lines().collect();
+    let b: Vec<&str> = twice.lines().collect();
+    let at = (0..a.len().max(b.len()))
+        .find(|&i| a.get(i) != b.get(i))
+        .unwrap_or(0);
+    let window = |lines: &[&str]| -> String {
+        let lo = at.saturating_sub(5);
+        let hi = (at + 6).min(lines.len());
+        lines[lo..hi]
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("{:>5} | {l}\n", lo + i + 1))
+            .collect()
+    };
+    format!(
+        "--- {file}: line {} differs\n--- first pass:\n{}--- second pass:\n{}",
+        at + 1,
+        window(&a),
+        window(&b)
+    )
 }
 
 #[test]
