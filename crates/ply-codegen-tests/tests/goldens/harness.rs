@@ -80,7 +80,7 @@ pub mod golden {
     fn read(path: &Path, index: Option<usize>) -> Option<String> {
         let text = std::fs::read_to_string(path).ok()?;
         let Some(index) = index else {
-            return Some(text);
+            return Some(super::folded(&text));
         };
         let mut found: Option<String> = None;
         for line in text.split_inclusive('\n') {
@@ -99,7 +99,7 @@ pub mod golden {
             if f.ends_with('\n') {
                 f.pop();
             }
-            f
+            super::folded(&f)
         })
     }
 
@@ -109,8 +109,9 @@ pub mod golden {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap_or_else(|e| panic!("{}: {e}", parent.display()));
         }
+        let text = super::unfolded(text);
         let Some(index) = index else {
-            std::fs::write(path, text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            std::fs::write(path, &text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             return;
         };
         let mut started = STARTED.lock().unwrap();
@@ -274,6 +275,24 @@ pub mod own {
 
 pub fn records(dump: &str) -> Vec<&str> {
     dump.split_terminator(';').collect()
+}
+
+/// On disk a dump without newlines of its own goes one field per line under a `%;` header, so
+/// two changes to different definitions merge; a dump holding newlines is written as it is.
+const FOLDED: &str = "%;\n";
+
+fn unfolded(text: &str) -> String {
+    if text.contains('\n') {
+        return text.to_string();
+    }
+    format!("{FOLDED}{}", text.replace(';', ";\n"))
+}
+
+fn folded(text: &str) -> String {
+    match text.strip_prefix(FOLDED) {
+        Some(rest) => rest.replace(";\n", ";"),
+        None => text.to_string(),
+    }
 }
 
 pub fn bundle(text: &str) -> Vec<String> {
