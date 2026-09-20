@@ -1125,6 +1125,8 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
 | `ply doc NAME [path]` | a definition or builtin: signature with the written parameter names, the `//` lines above it, place, hash, footprint; a builtin's note comes from the compiler's table |
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change |
+| `ply show NAME [path]` | one `fn` or `type` as its file holds it: the `//` lines above it, `pub`, the body, and a comment ending its last line; `--json` adds the byte range |
+| `ply replace NAME [path]` | rewrite one `fn` or `type` from `--with FILE` or stdin, formatted, every other byte of the file kept; refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash moves; `--check` writes nothing |
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, test and law whose closure reaches it |
@@ -1135,6 +1137,11 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed
 and leaves a file that does not parse alone, exiting 2 with the diagnostic.
+
+`ply show NAME` and `ply replace NAME` are the edit loop for one definition: read
+it, rewrite it, and touch nothing else in the file. The replacement is one item
+of the same kind and name, with its own `//` lines above it; `replace` prints it
+through `ply fmt` into the range `show` reports.
 
 ## 17. Diagnostics
 
@@ -1178,6 +1185,7 @@ the message.
 | `E0125` | parameter left unfilled by a call that used a name |
 | `E0126` | top-level `fn` missing a parameter or return type |
 | `E0127` | `reuse fn` with an append that cannot reuse its list |
+| `E0128` | `ply replace` refused: the result would not check or would move another definition |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
