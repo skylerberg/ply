@@ -13,7 +13,7 @@ import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, L
                  LBytes, LFloat, LDec, LUnit, pat_span)
 import tycore (Resource, RNamed, RSingleton, Atom, Row, Type, TyVar, TyCon, TyFn, TyRecord, Field,
                Scheme, Fresh, Subst, TypeEnv, Free, UnifyError, Mismatch, Arity, OccursTy, OccursRow,
-               RowMismatch, Unified, atom_lt, atoms_insert, atoms_union, atoms_contains,
+               RowMismatch, Unified, atom_lt, atoms_covered, atoms_insert, atoms_union, atoms_contains,
                atoms_difference, row_empty, row_open, row_closed, row_singleton, row_is_pure,
                row_union, row_without, con, con1, t_int, t_bool, t_string, t_bytes, t_float,
                t_decimal, t_unit, t_list, t_option, t_map, t_iter, t_secret, t_fn, mono,
@@ -900,26 +900,41 @@ fn conv_atom(cx: Cx, a: AtomExpr) -> { cx: Cx, atom: Option<Atom> } =
       None -> { cx: {..e.cx, refused_atoms: push(e.cx.refused_atoms, a.span)}, atom: None },
       Some(eff) -> {
         let resource = match a.resource { Some(r) -> RNamed(r.name), None -> RSingleton };
-        let declares_mode = match a.op {
-          Some(_) -> false,
-          None -> match effect_of(e.cx, eff) {
-            Some(info) -> fold(info.ops, false, |acc: Bool, op: OpInfo| acc || mode_eq(op.mode, a.mode)),
-            None -> true,
+        let info = effect_of(e.cx, eff);
+        // An operation atom takes the declared operation's mode; the parser wrote a placeholder.
+        let atom: Option<Atom> = match a.op {
+          Some(op) -> match info {
+            Some(i) -> match op_named(i, op.name) {
+              Some(o) -> Some({ effect: eff, resource: resource, mode: o.mode, op: Some(o.name) }),
+              None -> None,
+            },
+            None -> None,
+          },
+          None -> {
+            let declares_mode = match info {
+              Some(i) -> fold(i.ops, false, |acc: Bool, o: OpInfo| acc || mode_eq(o.mode, a.mode)),
+              None -> true,
+            };
+            if declares_mode { Some({ effect: eff, resource: resource, mode: a.mode, op: None }) } else { None }
           },
         };
-        if !declares_mode {
-          let known = match effect_of(e.cx, eff) { Some(info) -> known_modes(info), None -> [] };
-          let help = if len(known) == 0 { [] } else { [bytes_concat_all([b"`", eff, b"` can perform: ", join_with(known, b", ")])] };
-          let reported: Cx = match a.op {
-            Some(op) -> err1(e.cx, b"E0104", a.span,
-              bytes_concat_all([b"a written row cannot name the operation `", eff, b".", op.name, b"` yet"]),
-              b"name its mode instead", help),
-            None -> err1(e.cx, b"E0104", a.span,
-              bytes_concat_all([b"effect `", eff, b"` declares no `", mode_key(a.mode), b"` operation"]),
-              bytes_concat_all([b"no `", mode_key(a.mode), b"` operation to perform"]), help),
-          };
-          { cx: {..reported, refused_atoms: push(reported.refused_atoms, a.span)}, atom: None }
-        } else { { cx: e.cx, atom: Some({ effect: eff, resource: resource, mode: a.mode, op: None }) } }
+        match atom {
+          Some(_) -> { cx: e.cx, atom: atom },
+          None -> {
+            let known = match info {
+              Some(i) -> match a.op { Some(_) -> append(known_modes(i), known_ops(i)), None -> known_modes(i) },
+              None -> [],
+            };
+            let help = if len(known) == 0 { [] } else { [bytes_concat_all([b"`", eff, b"` can perform: ", join_with(known, b", ")])] };
+            let (message, label) = match a.op {
+              Some(op) -> (bytes_concat_all([b"effect `", eff, b"` declares no operation `", op.name, b"`"]), b"no such operation"),
+              None -> (bytes_concat_all([b"effect `", eff, b"` declares no `", mode_key(a.mode), b"` operation"]),
+                       bytes_concat_all([b"no `", mode_key(a.mode), b"` operation to perform"])),
+            };
+            let reported: Cx = err1(e.cx, b"E0104", a.span, message, label, help);
+            { cx: {..reported, refused_atoms: push(reported.refused_atoms, a.span)}, atom: None }
+          },
+        }
       },
     }
   }
@@ -929,6 +944,12 @@ fn known_modes(info: EffectInfo) -> List<Bytes> =
     let k = bytes_concat_all([info.simple_name, b".", mode_key(op.mode)]);
     if contains_bytes(acc, k) { acc } else { push(acc, k) }
   })
+
+fn known_ops(info: EffectInfo) -> List<Bytes> =
+  map(info.ops, |op: OpInfo| bytes_concat_all([info.simple_name, b".", op.name]))
+
+fn op_named(info: EffectInfo, name: Bytes) -> Option<OpInfo> =
+  fold(info.ops, None, |acc: Option<OpInfo>, o: OpInfo| match acc { Some(_) -> acc, None -> if o.name == name { Some(o) } else { None } })
 
 fn mode_eq(a: Mode, b: Mode) -> Bool = match a { MRead -> (match b { MRead -> true, _ -> false }), MWrite -> (match b { MWrite -> true, _ -> false }), MBad -> false }
 
@@ -1192,11 +1213,21 @@ fn callee_source(cx: Cx, func: Expr) -> Src =
     _ -> SOpaque,
   }
 
-fn discharge(cx: Cx, mark: Int, handled: List<Atom>) -> Cx = {
+// A clause discharges its mode atom, and an operation atom it names.
+fn clause_handles(handled: List<Atom>, keys: List<OpKey>, a: Atom) -> Bool =
+  atoms_contains(handled, a) || (match a.op { Some(op) -> covers(keys, { atom: a, op: op }), None -> false })
+
+fn discharge(cx: Cx, mark: Int, handled: List<Atom>, keys: List<OpKey>) -> Cx = {
   let before = take(cx.performs, mark);
-  let kept = filter(drop(cx.performs, mark), |s: PerformSite| !atoms_contains(handled, s.atom));
+  let kept = filter(drop(cx.performs, mark), |s: PerformSite| !clause_handles(handled, keys, s.atom));
   {..cx, performs: append(before, kept)}
 }
+
+fn op_atom(a: Atom, op: Bytes) -> Atom =
+  { effect: a.effect, resource: a.resource, mode: a.mode, op: Some(op) }
+
+// What a site is known to perform: the operation at a perform, otherwise the atom the callee's row shows.
+fn site_atom(s: PerformSite) -> Atom = match s.source { SDirect(op) -> op_atom(s.atom, op), _ -> s.atom }
 
 fn site_for(cx: Cx, atom: Atom) -> Option<PerformSite> =
   fold(cx.performs, None, |acc: Option<PerformSite>, s: PerformSite| match acc { Some(_) -> acc, None -> if s.atom == atom { Some(s) } else { None } })
@@ -1895,7 +1926,7 @@ fn resolve_op(cx: Cx, eff: QName, op: Ident) -> { cx: Cx, hit: Option<{ info: Ef
                     hit: None }
                 } else { { cx: e.cx, hit: None } },
         Some(info) ->
-          match fold(info.ops, None, |acc: Option<OpInfo>, o: OpInfo| match acc { Some(_) -> acc, None -> if o.name == op.name { Some(o) } else { None } }) {
+          match op_named(info, op.name) {
             Some(o) -> { cx: e.cx, hit: Some({ info: info, op: o }) },
             None -> {
               let known = map(info.ops, |o: OpInfo| o.name);
@@ -2071,7 +2102,7 @@ fn infer_handle(cx: Cx, span: Span, body: Expr, clauses: List<HandleClause>, ret
   let pending: PendingHandle = { module: walked.cx.module, span: span, after: after, handled: walked.handled, covered: walked.selected, sites: sites,
                                  forwarded: walked.cx.declared_atoms };
   let noted: Cx = if len(sites) == 0 { walked.cx } else { {..walked.cx, pending_handles: push(walked.cx.pending_handles, pending)} };
-  let discharged: Cx = discharge(noted, mark, walked.handled);
+  let discharged: Cx = discharge(noted, mark, walked.handled, walked.selected);
   let returned = match ret {
     Some(rc) -> {
       let pushed: Cx = {..discharged, env: env_push(discharged.env)};
@@ -2082,7 +2113,8 @@ fn infer_handle(cx: Cx, span: Span, body: Expr, clauses: List<HandleClause>, ret
     None -> { cx: discharged, ty: b.ty, row: row_empty() },
   };
   let agreed: Cx = match result_var.t { Some(t) -> expect(returned.cx, span, t, returned.ty, b"every clause of a `handle` produces its result").cx, None -> returned.cx };
-  let remaining = row_without(b.row, walked.handled);
+  let body_row = resolve_r(agreed, b.row);
+  let remaining = { atoms: filter(body_row.atoms, |a: Atom| !clause_handles(walked.handled, walked.selected, a)), tail: body_row.tail };
   let j1: WithRow = join(agreed, span, remaining, walked.clause_rows);
   let j2: WithRow = join(j1.cx, span, j1.r, returned.row);
   let solved = match cont.v { Some(v) -> {..j2.cx, subst: solve_continuation_row(j2.cx.subst, v, j2.r)}, None -> j2.cx };
@@ -2193,7 +2225,7 @@ fn infer_with_cell(cx: Cx, span: Span, resource: Ident, init: Expr, binder: Iden
     let b: Inferred = infer(pushed, body);
     let closed: ClosedRegion = close_region({..b.cx, env: env_pop(b.cx.env)});
     let handled = cell_atoms(resource.name);
-    let discharged: Cx = discharge(closed.cx, mark, handled);
+    let discharged: Cx = discharge(closed.cx, mark, handled, []);
     let site: RegionSite = { module: discharged.module, name: resource.name, with_cell: true, span: resource.span, body_span: expr_span(body),
                              body_ty: b.ty, exits: region_exits(body, []), outer: outer, spawns: closed.spawns, handoffs: closed.handoffs };
     let recorded: Cx = {..discharged, regions: push(discharged.regions, site)};
@@ -2217,7 +2249,7 @@ fn infer_with_region(cx: Cx, region: Ident, body: Expr) -> Inferred = {
   let b: Inferred = infer(opened, body);
   let closed: ClosedRegion = close_region(b.cx);
   let handled = cell_atoms(region.name);
-  let discharged: Cx = discharge(closed.cx, mark, handled);
+  let discharged: Cx = discharge(closed.cx, mark, handled, []);
   let site: RegionSite = { module: discharged.module, name: region.name, with_cell: false, span: region.span, body_span: expr_span(body),
                            body_ty: b.ty, exits: region_exits(body, []), outer: outer, spawns: closed.spawns, handoffs: closed.handoffs };
   let recorded: Cx = {..discharged, regions: push(discharged.regions, site)};
@@ -2229,7 +2261,7 @@ fn infer_simulate(cx: Cx, span: Span, body: Expr) -> Inferred = {
   let b: Inferred = infer({..cx, simulate_depth: cx.simulate_depth + 1}, body);
   let c: Cx = {..b.cx, simulate_depth: b.cx.simulate_depth - 1};
   let handled = simulated_atoms();
-  let discharged: Cx = discharge(c, mark, handled);
+  let discharged: Cx = discharge(c, mark, handled, []);
   let noted: Cx = {..discharged, simulations: push(discharged.simulations, { module: discharged.module, span: span, body_span: expr_span(body), body_ty: b.ty, body_row: b.row })};
   let seed = seed_atom();
   let recorded: Cx = record_site(noted, seed, span, SDirect(b"seed"));
@@ -2503,20 +2535,80 @@ fn check_fn_body(cx0: Cx, def: FnDef, sig: Sig) -> { cx: Cx, row: Row } = {
   { cx: {..rowed, ty_params: map_new(), row_params: map_new(), assumed: []}, row: body.row }
 }
 
+type Offence = { atom: Atom, site: Option<PerformSite> }
+
+// An inferred atom the written row does not cover is still permitted when every site that contributed
+// it is: a perform by its operation, a call by the atom the callee's row shows. The first site that is
+// not carries the label; an atom no site explains is refused as it is.
+fn offences(cx: Cx, dec: List<Atom>, inf: List<Atom>) -> List<Offence> =
+  fold(inf, [], |acc: List<Offence>, a: Atom|
+    if atoms_covered(dec, a) { acc } else {
+      let sites = filter(cx.performs, |s: PerformSite| s.atom == a);
+      if len(sites) == 0 { push(acc, { atom: a, site: None }) } else {
+        match list_at(filter(sites, |s: PerformSite| !atoms_covered(dec, site_atom(s))), 0) {
+          Some(s) -> push(acc, { atom: site_atom(s), site: Some(s) }),
+          None -> acc,
+        }
+      }
+    })
+
+// The written atoms of the same effect and resource as `a`.
+fn named_for(dec: List<Atom>, a: Atom) -> List<Atom> =
+  filter(dec, |d: Atom| d.effect == a.effect && d.resource == a.resource)
+
+fn site_label(dec: List<Atom>, s: PerformSite) -> Bytes = {
+  let a = atom_text(site_atom(s));
+  let named = named_for(dec, s.atom);
+  match s.source {
+    SDirect(_) -> bytes_concat_all([b"performs `", a, b"`"]),
+    _ ->
+      if len(named) == 0 { bytes_concat_all([b"reaches `", a, b"`"]) } else {
+        let through = match s.source { SVia(name) -> tick(simple_name_of(name)), SOpaque -> b"a function value", _ -> b"its arguments" };
+        bytes_concat_all([b"reaches `", a, b"` through ", through, b", which may perform any of its operations; this row names only ",
+                          backticked(map(named, atom_text), b", ")])
+      },
+  }
+}
+
+fn narrowed_by_row(dec: List<Atom>, o: Offence) -> Bool =
+  match o.site { Some(s) -> !is_direct(s) && len(named_for(dec, s.atom)) > 0, None -> false }
+
+fn atom_written(cx: Cx, a: Atom) -> Bytes =
+  bytes_concat_all([as_written(cx, a.effect), b".", match a.op { Some(op) -> op, None -> mode_key(a.mode) }, resource_text(a.resource)])
+
+// Where an atom joins a written row: before `}`, after `{` when a tail follows, or braces around a bare variable.
+fn row_edit(cx: Cx, r: RowExpr, text: Bytes) -> Edit =
+  match r.tail {
+    None -> insertion(cx.module, r.span.end - 1, if len(r.atoms) + len(r.aliases) == 0 { text } else { bytes_concat(b", ", text) }),
+    Some(t) ->
+      if t.span == r.span { { module: cx.module, start: r.span.start, end: r.span.end, text: bytes_concat_all([b"{", text, b" | ", t.name, b"}"]) } }
+      else { insertion(cx.module, r.span.start + 1, bytes_concat(text, b", ")) },
+  }
+
 fn check_upper_bound(cx: Cx, def: FnDef, declared: Row, inferred: Row) -> Cx = {
   let ann_span = match def.effects { Some(r) -> r.span, None -> def.span };
   let inf = resolve_r(cx, inferred);
   let dec = resolve_r(cx, declared);
-  let extra = atoms_difference(inf.atoms, dec.atoms);
+  let extra = offences(cx, dec.atoms, inf.atoms);
   let c1: Cx = if len(extra) == 0 { cx } else {
-    let names = backticked(map(extra, atom_text), b", ");
-    let sites = fold(extra, [], |acc: List<Label>, a: Atom|
-      match site_for(cx, a) { Some(s) -> push(acc, lab(s.module, s.span, true, bytes_concat_all([b"performs `", atom_text(a), b"`"]))), None -> acc });
+    let names = backticked(map(extra, |o: Offence| atom_text(o.atom)), b", ");
+    let sites = fold(extra, [], |acc: List<Label>, o: Offence|
+      match o.site { Some(s) -> push(acc, lab(s.module, s.span, true, site_label(dec.atoms, s))), None -> acc });
     let primaries = if len(sites) == 0 { [lab(cx.module, expr_span(def.body), true, b"this body performs more than it declares")] } else { sites };
-    err_labels(cx, b"E0302",
-               bytes_concat_all([b"effect", plural(len(extra)), b" not permitted by the signature of `", def.name.name, b"`: ", names]),
-               push(primaries, lab(cx.module, ann_span, false, bytes_concat(b"declared row is ", row_text(dec)))),
-               [bytes_concat_all([b"add ", names, b" to the `/ {..}` annotation, or handle ", if len(extra) == 1 { b"it" } else { b"them" }, b" inside `", def.name.name, b"`"])])
+    let notes = [bytes_concat_all([b"add ", names, b" to the `/ {..}` annotation, or handle ", if len(extra) == 1 { b"it" } else { b"them" }, b" inside `", def.name.name, b"`"])];
+    let narrowed = fold(extra, false, |acc: Bool, o: Offence| acc || narrowed_by_row(dec.atoms, o));
+    let d: Diag = diag(b"E0302",
+                       bytes_concat_all([b"effect", plural(len(extra)), b" not permitted by the signature of `", def.name.name, b"`: ", names]),
+                       push(primaries, lab(cx.module, ann_span, false, bytes_concat(b"declared row is ", row_text(dec)))),
+                       if narrowed { push(notes, b"a row that names operations permits a call only when the callee's row names them too: widen this row to the mode atom, or narrow the callee's row") } else { notes });
+    let fixed: Diag = match def.effects {
+      Some(r) -> fold(extra, d, |acc: Diag, o: Offence| {
+        let text = atom_written(cx, o.atom);
+        with_fix(acc, bytes_concat_all([b"add `", text, b"` to the row"]), [row_edit(cx, r, text)])
+      }),
+      None -> d,
+    };
+    report(cx, fixed)
   };
   match inf.tail {
     None -> c1,
@@ -3582,7 +3674,7 @@ fn check_handles(cx: Cx) -> Cx = {
     let c: Cx = {..c0, module: h.module};
     let body: Summary = fold(h.sites, { ops: [], opaque: [] }, |s: Summary, site: PerformSite| summary_add(s, site, of));
     let missing = filter(body.ops, |o: OpAtom|
-      !atoms_contains(body.opaque, o.atom) && !atoms_contains(h.forwarded, o.atom) && !covers(h.covered, o));
+      !atoms_contains(body.opaque, o.atom) && !atoms_covered(h.forwarded, op_atom(o.atom, o.op)) && !covers(h.covered, o));
     if len(missing) == 0 { c0 } else {
       let names = map(missing, |o: OpAtom| bytes_concat_all([b"`", op_atom_text(c, o), b"`"]));
       let listed = if len(names) == 1 { at(names, 0) }
@@ -3720,16 +3812,20 @@ test "a unit pattern covers its type" {
   assert_eq(check_dump([{ name: b"m", src: b"fn f(u: Unit) -> Int = match u { () -> 1 }" }]), "K;1;F;m.f;(Unit) -> Int;;;;0;")
 }
 
-// The codes of a one-module program's diagnostics, in order; empty when it checks.
-fn check_codes(src: Bytes) -> List<Bytes> = {
+// A one-module program's diagnostics, in order; empty when it checks.
+fn check_diags(src: Bytes) -> List<Diag> = {
   let r = parse(src);
   let x = expand(r.node, r.p.uses_sets, r.p.diags);
   let d: Expansion = expand_derives(0, x.module);
   match resolve_modules([{ name: b"m", module: d.module, derived: d.derived }]) {
-    Failed(ds) -> map(ds, |dg: Diag| dg.code),
-    Resolved_(y) -> map(dedup_diags(check_program(y.r, y.mods).cx.diags), |dg: Diag| dg.code),
+    Failed(ds) -> ds,
+    Resolved_(y) -> dedup_diags(check_program(y.r, y.mods).cx.diags),
   }
 }
+
+fn check_codes(src: Bytes) -> List<Bytes> = map(check_diags(src), |dg: Diag| dg.code)
+
+fn fixes_of(diags: List<Diag>) -> List<Fix> = fold(diags, [], |acc: List<Fix>, dg: Diag| append(acc, dg.fixes))
 
 fn net_src(rest: Bytes) -> Bytes =
   bytes_concat(b"effect net { write send[s](payload: Bytes) -> Unit\n write recv[s](max: Int) -> Bytes\n write close[s]() -> Unit\n read peek[s]() -> Int }\n", rest)
@@ -3763,20 +3859,55 @@ test "an operation the written row keeps is forwarded rather than missing" {
 }
 
 test "the missing clause is named as the module would write it" {
-  let r = parse(net_src(b"fn f() -> Unit = handle { net.send[c](b\"x\"); net.close[c]() } with { net.recv[c](n) -> b\"\" }"));
-  let x = expand(r.node, r.p.uses_sets, r.p.diags);
-  let d: Expansion = expand_derives(0, x.module);
-  let diags = match resolve_modules([{ name: b"m", module: d.module, derived: d.derived }]) {
-    Failed(_) -> [],
-    Resolved_(y) -> check_program(y.r, y.mods).cx.diags,
-  };
+  let src = net_src(b"fn f() -> Unit = handle { net.send[c](b\"x\"); net.close[c]() } with { net.recv[c](n) -> b\"\" }");
+  let diags = check_diags(src);
   assert_eq(map(diags, |dg: Diag| dg.message), [b"this `handle` has no clause for `net.send[c]` and `net.close[c]`, which its body performs"]);
-  let fixes = fold(diags, [], |acc: List<Fix>, dg: Diag| append(acc, dg.fixes));
+  let fixes = fixes_of(diags);
   assert_eq(map(fixes, |f: Fix| f.title), [b"add a clause for `net.send[c]`", b"add a clause for `net.close[c]`"]);
   assert_eq(map(fixes, |f: Fix| map(f.edits, |e: Edit| e.text)),
             [[b", net.send[c](a0) -> panic(\"net.send[c] is not handled here\")"], [b", net.close[c]() -> panic(\"net.close[c] is not handled here\")"]]);
-  let src = net_src(b"fn f() -> Unit = handle { net.send[c](b\"x\"); net.close[c]() } with { net.recv[c](n) -> b\"\" }");
   assert_eq(map(fixes, |f: Fix| map(f.edits, |e: Edit| bytes_slice(src, e.start - 1, e.end))), [[b"\""], [b"\""]])
+}
+
+test "a written row may name an operation, which permits that operation alone" {
+  assert_eq(check_codes(net_src(b"fn f() -> Unit / {net.send[c]} = net.send[c](b\"x\")")), []);
+  assert_eq(check_codes(net_src(b"fn f() -> Bytes / {net.send[c]} = net.recv[c](4)")), [b"E0302"]);
+  assert_eq(check_codes(net_src(b"fn f() -> Bytes / {net.write[c]} = { net.send[c](b\"x\"); net.recv[c](4) }")), []);
+  assert_eq(check_codes(net_src(b"fn f() -> Int / {net.peek[c]} = net.peek[c]()")), []);
+  assert_eq(check_codes(net_src(b"fn f() -> Unit / {net.emit[c]} = ()")), [b"E0104"])
+}
+
+test "an operation the written row does not name is refused by name, with the atom to add" {
+  let src = net_src(b"fn f() -> Bytes / {net.send[c]} = net.recv[c](4)");
+  let diags = check_diags(src);
+  assert_eq(map(diags, |dg: Diag| dg.message), [b"effect not permitted by the signature of `f`: `m.net.recv[c]`"]);
+  assert_eq(map(diags, |dg: Diag| map(dg.labels, |l: Label| l.text)), [[b"performs `m.net.recv[c]`", b"declared row is {m.net.send[c]}"]]);
+  let fixes = fixes_of(diags);
+  assert_eq(map(fixes, |f: Fix| f.title), [b"add `net.recv[c]` to the row"]);
+  assert_eq(map(fixes, |f: Fix| map(f.edits, |e: Edit| e.text)), [[b", net.recv[c]"]]);
+  assert_eq(map(fixes, |f: Fix| map(f.edits, |e: Edit| bytes_slice(src, e.start, e.end + 1))), [[b"}"]])
+}
+
+test "a caller's mode atom covers a callee's operation atom, and not the reverse" {
+  let narrow = b"fn f() -> Unit / {net.send[c]} = net.send[c](b\"x\")\n";
+  let wide = b"fn f() -> Unit / {net.write[c]} = net.send[c](b\"x\")\n";
+  assert_eq(check_codes(net_src(bytes_concat(narrow, b"fn g() -> Unit / {net.write[c]} = f()"))), []);
+  assert_eq(check_codes(net_src(bytes_concat(narrow, b"fn g() -> Unit / {net.send[c]} = f()"))), []);
+  assert_eq(check_codes(net_src(bytes_concat(narrow, b"fn g() -> Unit = f()\nfn h() -> Unit / {net.write[c]} = g()"))), []);
+  let diags = check_diags(net_src(bytes_concat(wide, b"fn g() -> Unit / {net.send[c]} = f()")));
+  assert_eq(map(diags, |dg: Diag| dg.code), [b"E0302"]);
+  assert_eq(map(diags, |dg: Diag| map(dg.labels, |l: Label| l.text)),
+            [[b"reaches `m.net.write[c]` through `f`, which may perform any of its operations; this row names only `m.net.send[c]`",
+              b"declared row is {m.net.send[c]}"]]);
+  assert_eq(map(fixes_of(diags), |f: Fix| f.title), [b"add `net.write[c]` to the row"])
+}
+
+test "a clause for an operation discharges that operation's atom" {
+  let narrow = b"fn f() -> Unit / {net.send[c]} = net.send[c](b\"x\")\n";
+  assert_eq(check_codes(net_src(bytes_concat(narrow, b"fn g() -> Unit / {} = handle { f() } with { net.send[c](p) -> () }"))), []);
+  assert_eq(check_codes(net_src(bytes_concat(narrow, b"fn g() -> Unit / {} = handle { f() } with { net.recv[c](n) -> b\"\" }"))), [b"E0302"]);
+  assert_eq(check_codes(net_src(b"fn f() -> Unit / {net.send[c]} = handle { net.send[c](b\"x\"); net.close[c]() } with { net.close[c]() -> () }")), []);
+  assert_eq(check_codes(net_src(b"fn f() -> Unit / {net.close[c]} = handle { net.send[c](b\"x\"); net.close[c]() } with { net.close[c]() -> () }")), [b"E0305"])
 }
 
 test "a body that performs more than its signature permits is refused" {

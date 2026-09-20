@@ -2,7 +2,7 @@
 //! Every table here is read from a [`Front`].
 
 use ply_span::{SourceId, SourceMap, Span, Symbol};
-use ply_ty::{CheckOutput, Front, LawInfo, Ordinal, SpecKind, Type};
+use ply_ty::{CheckOutput, DefInfo, Front, LawInfo, Ordinal, Printer, SpecKind, Type};
 use std::collections::{HashMap, HashSet};
 use std::sync::{PoisonError, RwLock};
 
@@ -14,8 +14,8 @@ pub struct Source {
     tables: Tables,
     /// Each root's definition span where failures are reported: `tables.spans` until relocated.
     placed: RwLock<HashMap<String, Span>>,
-    /// Each root's cache key: its hash, plus its definition's own text once attached. Empty: no
-    /// caching.
+    /// Each root's cache key: [`emit_keys`], plus its definition's own text once attached. Empty:
+    /// no caching.
     pub keys: HashMap<String, String>,
     /// Each module's source text, by module name; the emitter requires them.
     pub texts: HashMap<String, String>,
@@ -37,22 +37,26 @@ pub fn clause_root_name(owner: &Symbol, kind: &str, ordinal: usize) -> Symbol {
     Symbol::new(format!("{owner}#{kind}#{ordinal}"))
 }
 
-/// The cache key of each root (definition, spec clause, test, law part), from its hash. Walks
-/// [`Front::ordinals`] in the hasher's order, so `test#N` gets the `N`th test hash.
+/// The cache key of each root (definition, spec clause, test, law part): the hash of its own
+/// text with references by name, then `reads`, so a body edit turns the key of that root alone
+/// and a signature edit turns its callers' too. Walks [`Front::ordinals`] in the hasher's order,
+/// so `law#N` gets the `N`th law hash. A test has no by-name hash: its text, attached by
+/// [`Source::with_texts`], is its identity.
 pub fn emit_keys(front: &Front) -> HashMap<String, String> {
     let laws: HashMap<&Symbol, &LawInfo> = front.check.laws.iter().map(|l| (&l.key, l)).collect();
     let mut keys = HashMap::new();
-    let (mut test_at, mut law_at) = (0, 0);
+    let mut law_at = 0;
     for (module, items) in &front.ordinals {
         let (mut ordinal, mut law_ordinal) = (0, 0);
         for item in items {
             match item {
                 Ordinal::Fn(name, kinds) => {
-                    let Some(h) = front.hashes.defs.get(name) else {
+                    let Some(own) = front.hashes.own.get(name) else {
                         continue;
                     };
-                    // A clause is keyed by its own hash: specs are erased from the owner's hash.
-                    let clauses = front.hashes.specs.get(name);
+                    let read = reads(front, name, Some(name));
+                    // A clause is keyed by its own sentence: specs are erased from the owner's hash.
+                    let sentences = front.hashes.spec_texts.get(name);
                     let (mut requires, mut ensures) = (0, 0);
                     for (i, kind) in kinds.iter().enumerate() {
                         let (kind, k) = match kind {
@@ -65,40 +69,85 @@ pub fn emit_keys(front: &Front) -> HashMap<String, String> {
                                 ("ensures", ensures - 1)
                             }
                         };
-                        let own = clauses.and_then(|cs| cs.get(i)).unwrap_or(h);
+                        let sentence = sentences.and_then(|cs| cs.get(i)).unwrap_or(own);
                         keys.insert(
                             clause_root(name, kind, k),
-                            format!("{}#{kind}#{k}", own.to_hex()),
+                            format!("{}#{kind}#{k}+{read}", sentence.to_hex()),
                         );
                     }
-                    keys.insert(name.to_string(), h.to_hex());
+                    keys.insert(name.to_string(), format!("{}+{read}", own.to_hex()));
                 }
                 Ordinal::Law(key) => {
-                    if let Some(h) = front.hashes.laws.get(law_at) {
+                    if let Some(h) = front.hashes.law_texts.get(law_at) {
+                        let read = reads(front, key, None);
                         for part in ["guard", "body"] {
                             if part == "guard" && !laws.get(key).is_some_and(|l| l.has_guard) {
                                 continue;
                             }
                             keys.insert(
                                 qualified(module, &law_root_name(law_ordinal, part)),
-                                format!("{}#{part}", h.to_hex()),
+                                format!("{}#{part}+{read}", h.to_hex()),
                             );
                         }
                     }
                     law_ordinal += 1;
                     law_at += 1;
                 }
-                Ordinal::Test(_) => {
-                    if let Some(h) = front.hashes.tests.get(test_at) {
-                        keys.insert(qualified(module, &test_root_name(ordinal)), h.to_hex());
-                    }
+                Ordinal::Test(key) => {
+                    let read = reads(front, key, None);
+                    keys.insert(
+                        qualified(module, &test_root_name(ordinal)),
+                        format!("test+{read}"),
+                    );
                     ordinal += 1;
-                    test_at += 1;
                 }
             }
         }
     }
     keys
+}
+
+/// A digest of what emitting the root hashed under `key` reads of the rest of the program: the
+/// signature of `owner` (the root, or a clause's definition), the signature of every definition
+/// it references, and every `type` or `effect` declaration it mentions. Sorted by name, so every
+/// process digests the same bytes.
+fn reads(front: &Front, key: &Symbol, owner: Option<&Symbol>) -> String {
+    let mut h = blake3::Hasher::new();
+    if let Some(d) = owner.and_then(|o| front.check.defs.get(o)) {
+        h.update(published(d).as_bytes());
+    }
+    h.update(&[0]);
+    let mut names: Vec<&Symbol> = front
+        .hashes
+        .deps
+        .get(key)
+        .map(|ds| ds.iter().collect())
+        .unwrap_or_default();
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        h.update(name.as_str().as_bytes());
+        h.update(&[0]);
+        if let Some(d) = front.check.defs.get(name) {
+            h.update(published(d).as_bytes());
+        }
+        if let Some(decl) = front.hashes.decls.get(name) {
+            h.update(&decl.0);
+        }
+        h.update(&[0]);
+    }
+    h.finalize().to_hex()[..32].to_string()
+}
+
+/// What the emitter reads of a definition it emits or calls: the types of its parameters and
+/// answer, which give their kinds and arity, and whether it is pure, which lets a nullary call
+/// come from the constant table.
+fn published(d: &DefInfo) -> String {
+    let (params, ret) = signature(&d.scheme.ty);
+    let mut p = Printer::new();
+    let params: Vec<String> = params.iter().map(|t| p.ty(t)).collect();
+    let pure = d.footprint.is_empty() && d.constraints.is_empty();
+    format!("({}) -> {} {pure}", params.join(", "), p.ty(ret))
 }
 
 /// A program-wide name in `module`, as `ModuleName::qualify` spells it.
