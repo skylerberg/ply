@@ -53,6 +53,8 @@ pub enum Command {
     Std(StdArgs),
     /// What a diagnostic code means; `--all` lists every code.
     Explain(ExplainArgs),
+    /// A definition or builtin: its signature with parameter names, the comment above it, its place.
+    Doc(DocArgs),
     /// Print the content hash of every definition.
     Hash(HashArgs),
     /// Every definition with its place, hash, signature and footprint.
@@ -169,6 +171,9 @@ pub struct TlsOptions {
         requires = "host",
     )]
     pub tls: Vec<CredentialSpec>,
+    /// A certificate `net.connect_tls` trusts beside the built-in roots. Repeatable.
+    #[arg(long = "trust", value_name = "CERT.pem", requires = "host")]
+    pub trust: Vec<std::path::PathBuf>,
 }
 
 /// Directory roots per resource label; kept out of the program so no path enters a hash.
@@ -330,7 +335,7 @@ pub struct TestArgs {
     #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]
     pub trace: When,
 
-    /// Attach a compiled backend: `c`, or a deliberately wrong `[c:]wrong:<mutation>[@<def>]`.
+    /// Attach a compiled backend: `c`.
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
 
@@ -652,6 +657,21 @@ pub struct ExplainArgs {
     /// List every code with its meaning.
     #[arg(long)]
     pub all: bool,
+
+    /// Emit one JSON object on stdout and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DocArgs {
+    /// A program-wide name (`store.orders.place`), a simple name unique in the program, or a builtin.
+    #[arg(value_name = "NAME")]
+    pub query: String,
+
+    /// A `.ply` file, or a project root whose `*.ply` files are modules named by path.
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
 
     /// Emit one JSON object on stdout and nothing else.
     #[arg(long)]

@@ -53,7 +53,7 @@ impl Hosts {
     pub fn open(
         check: &CheckOutput,
         host: bool,
-        credentials: &[tls::CredentialSpec],
+        credentials: &crate::cli::TlsOptions,
         roots: &[ply_host::fs::RootSpec],
         db: Option<DbConfig>,
         config: Configuration,
@@ -78,7 +78,7 @@ impl Hosts {
     pub fn open_stopping(
         check: &CheckOutput,
         host: bool,
-        credentials: &[tls::CredentialSpec],
+        credentials: &crate::cli::TlsOptions,
         roots: &[ply_host::fs::RootSpec],
         db: Option<DbConfig>,
         config: Configuration,
@@ -99,7 +99,7 @@ impl Hosts {
                 shutdown: None,
             });
         }
-        let material = tls::Credentials::load(credentials)?;
+        let material = tls::Credentials::load(&credentials.tls, &credentials.trust)?;
         // Loaded up front so a bad root is `E0454` before anything runs.
         let roots = ply_host::fs::Roots::load(roots, Span::DUMMY).map_err(|d| vec![d])?;
         // Opened only when a `db` operation can reach it, and probed now so an unreachable database
@@ -548,6 +548,10 @@ pub struct Transport {
     pub provider: &'static str,
     pub versions: &'static [&'static str],
     pub alpn: &'static [&'static str],
+    pub roots: &'static str,
+    pub roots_version: &'static str,
+    /// `--trust` certificates joining the roots.
+    pub trusted: usize,
     /// By name, ascending.
     pub credentials: Vec<CredentialView>,
 }
@@ -561,8 +565,11 @@ pub struct CredentialView {
 impl Transport {
     /// `Some` when the program can create a TLS listener or the run was given credentials.
     pub fn of(listing: &HostListing, credentials: Option<&tls::Credentials>) -> Option<Transport> {
-        let reachable = listing.rows.iter().any(|row| row.path == tls::HANDLER);
-        let configured = credentials.is_some_and(|c| !c.is_empty());
+        let reachable = listing
+            .rows
+            .iter()
+            .any(|row| row.path == tls::HANDLER || row.path == tls::CONNECT_HANDLER);
+        let configured = credentials.is_some_and(|c| !c.is_empty() || c.trusted() > 0);
         if !reachable && !configured {
             return None;
         }
@@ -572,6 +579,9 @@ impl Transport {
             provider: tls::PROVIDER,
             versions: &tls::VERSIONS,
             alpn: &tls::ALPN,
+            roots: tls::ROOTS,
+            roots_version: tls::ROOTS_VERSION,
+            trusted: credentials.map_or(0, |c| c.trusted()),
             credentials: credentials
                 .into_iter()
                 .flat_map(|c| c.iter())
@@ -595,6 +605,10 @@ impl Transport {
                 self.provider,
                 self.versions.join(", "),
                 self.alpn.join(", "),
+            ),
+            format!(
+                "roots  {} {} · {} trusted by `--trust`",
+                self.roots, self.roots_version, self.trusted
             ),
             String::new(),
             "credentials".to_string(),
@@ -631,6 +645,7 @@ impl Transport {
             "provider": self.provider,
             "versions": self.versions,
             "alpn": self.alpn,
+            "roots": { "library": self.roots, "version": self.roots_version, "trusted": self.trusted },
             "credentials": self.credentials.iter().map(|c| json!({
                 "name": c.name,
                 "fingerprint": c.fingerprint,
@@ -641,10 +656,17 @@ impl Transport {
 
     /// What the digest covers: the credential *names*, the provider and the library version.
     fn hash_into(&self, hasher: &mut blake3::Hasher) {
-        for text in [self.library, self.version, self.provider] {
+        for text in [
+            self.library,
+            self.version,
+            self.provider,
+            self.roots,
+            self.roots_version,
+        ] {
             hasher.update(&(text.len() as u64).to_le_bytes());
             hasher.update(text.as_bytes());
         }
+        hasher.update(&(self.trusted as u64).to_le_bytes());
         hasher.update(&(self.credentials.len() as u64).to_le_bytes());
         for credential in &self.credentials {
             hasher.update(&(credential.name.len() as u64).to_le_bytes());

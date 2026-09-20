@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::path::Path;
 use tempfile::TempDir;
 
-/// Chosen so that each corruption has something to bite.
+/// Ints, bools, containers, strings and a self-handled effect, so the seam carries each kind.
 const CORPUS: &str = r#"
 effect tally {
   read  base[log]() -> Int
@@ -20,12 +20,8 @@ fn pair(x: Int) -> List<Int> = [x, x]
 
 fn label(x: Int) -> String = "n"
 
-// A carried argument and an answer the seam does not carry: the registry-miss path
-// `wrong:unoffered` corrupts.
 fn grade(x: Int) -> Float = 1.5
 
-// Outside the fragment — a `Float` literal has no path in it — so its name is one the registry
-// lacks however wide the registry is, which is what `wrong:unoffered` answers for.
 fn refused(x: Int) -> Int = if 1.5 > 0.5 { x + 1 } else { x }
 
 fn measured(n: Int) -> Int / {tally.read[log], tally.write[log]} = {
@@ -54,13 +50,6 @@ test "a refused body adds one" { assert_eq(refused(2), 3) }
 test "a label is a word" { assert_eq(label(7), "n") }
 test "a grade is a float" { assert(grade(7) == 1.5) }
 test "a self handled effect still answers" { assert_eq(handled(1), 10) }
-"#;
-
-/// Recursion that outruns the machine's own bound, so `budget` is a number the backend must honour.
-const DEEP: &str = r#"
-fn ladder(n: Int) -> Int = if n <= 0 { 0 } else { 1 + ladder(n - 1) }
-
-test "a ladder past the machine's bound" { assert_eq(ladder(20000), 20000) }
 "#;
 
 fn project(source: &str) -> TempDir {
@@ -98,137 +87,6 @@ fn u64_at(report: &Value, path: &[&str]) -> u64 {
         .unwrap_or_else(|| panic!("`{}` is not a number: {node}", path.join(".")))
 }
 
-/// The failed tests' keys: a corrupt backend is caught by its test being among them.
-fn caught(report: &Value) -> Vec<String> {
-    report["failures"]
-        .as_array()
-        .expect("the artifact carries a failure list")
-        .iter()
-        .map(|f| f["key"].as_str().unwrap_or_default().to_string())
-        .collect()
-}
-
-#[track_caller]
-fn fires_and_is_caught(dir: &Path, backend: &str) -> Vec<String> {
-    let report = run(dir, Some(backend));
-    let failed = u64_at(&report, &["summary", "failed"]);
-    assert!(
-        failed > 0,
-        "`{backend}` left the corpus green, so this run says nothing about a corruption it did \
-         not catch: {report}"
-    );
-    caught(&report)
-}
-
-#[test]
-fn an_off_by_one_in_a_compiled_answer_is_caught_by_ply_test() {
-    let dir = project(CORPUS);
-    let caught = fires_and_is_caught(dir.path(), "wrong:off-by-one");
-    assert!(
-        caught.contains(&"m.double doubles".to_string()),
-        "{caught:?}"
-    );
-}
-
-#[test]
-fn an_inverted_compiled_comparison_is_caught_by_ply_test() {
-    let dir = project(CORPUS);
-    let caught = fires_and_is_caught(dir.path(), "wrong:inverted");
-    assert!(caught.contains(&"m.even is even".to_string()), "{caught:?}");
-}
-
-#[test]
-fn a_stale_compiled_answer_is_caught_by_ply_test() {
-    let dir = project(CORPUS);
-    fires_and_is_caught(dir.path(), "wrong:stale");
-}
-
-#[test]
-fn a_bool_where_an_int_belongs_crosses_the_seam_and_is_caught_by_ply_test() {
-    let dir = project(CORPUS);
-    let caught = fires_and_is_caught(dir.path(), "wrong:wrong-type");
-    assert!(
-        caught.contains(&"m.double doubles".to_string()),
-        "{caught:?}"
-    );
-    // A `String` crosses the seam too, so an `Int` in its place is a caught wrong kind.
-    assert!(
-        caught.contains(&"m.a label is a word".to_string()),
-        "{caught:?}"
-    );
-}
-
-/// `grade`'s argument is carried and its answer is not, so the backend has no body for it.
-#[test]
-fn an_answer_for_a_definition_the_backend_has_no_body_for_is_caught_by_ply_test() {
-    let dir = project(CORPUS);
-    let caught = fires_and_is_caught(dir.path(), "wrong:unoffered");
-    assert!(
-        caught.contains(&"m.a grade is a float".to_string()),
-        "{caught:?}"
-    );
-}
-
-#[test]
-fn a_forged_handle_inside_a_container_answer_is_caught_by_ply_test() {
-    let dir = project(CORPUS);
-    let caught = fires_and_is_caught(dir.path(), "wrong:handle");
-    assert!(
-        caught.contains(&"m.a pair holds its number".to_string()),
-        "{caught:?}"
-    );
-}
-
-#[test]
-fn a_backend_that_runs_past_its_budget_is_caught_by_ply_test() {
-    let dir = project(DEEP);
-    // The corpus outruns the recursion bound on its own, so a red control is expected here.
-    let control = run(dir.path(), None);
-    assert_eq!(u64_at(&control, &["summary", "failed"]), 1, "{control}");
-    assert!(
-        control["failures"][0]["diagnostic"]["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("recursion limit")),
-        "the corpus stopped outrunning the recursion bound, so there is nothing for a budget \
-         mutation to run past: {control}"
-    );
-
-    let caught = fires_and_is_caught(dir.path(), "wrong:exceeds-budget=4");
-    assert_eq!(caught, vec!["m.a ladder past the machine's bound"]);
-}
-
-#[test]
-fn a_backend_that_ignores_its_budget_is_caught_where_the_body_terminates() {
-    let dir = project(DEEP);
-    let caught = fires_and_is_caught(dir.path(), "wrong:exceeds-budget");
-    assert_eq!(caught, vec!["m.a ladder past the machine's bound"]);
-}
-
-#[test]
-fn a_forged_answer_for_a_self_handled_definition_is_caught_by_ply_test() {
-    let dir = project(CORPUS);
-    let caught = fires_and_is_caught(dir.path(), "wrong:answers=99@m.handled");
-    assert!(
-        caught.contains(&"m.a self handled effect still answers".to_string()),
-        "{caught:?}"
-    );
-}
-
-#[test]
-fn an_unknown_backend_is_refused_rather_than_ignored() {
-    let dir = project(CORPUS);
-    let out = ply(dir.path())
-        .arg("test")
-        .arg("--backend")
-        .arg("wrong:off-by-two")
-        .arg("--json")
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(report["ok"], Value::Bool(false), "{report}");
-    assert_eq!(report["diagnostics"][0]["code"], "E0450", "{report}");
-}
-
 #[test]
 fn the_honest_code_generator_agrees_over_the_corpus_and_enters_it() {
     let dir = project(CORPUS);
@@ -237,7 +95,6 @@ fn the_honest_code_generator_agrees_over_the_corpus_and_enters_it() {
     assert_eq!(report["ok"], Value::Bool(true), "{report}");
     assert_eq!(u64_at(&report, &["summary", "failed"]), 0, "{report}");
     assert_eq!(report["backend"]["name"], "c", "{report}");
-    assert_eq!(u64_at(&report, &["backend", "fired"]), 0, "{report}");
     assert!(
         u64_at(&report, &["backend", "entered"]) > 0,
         "the code generator entered nothing, so the seam was never reached: {}",
@@ -273,89 +130,6 @@ fn the_honest_code_generator_agrees_over_the_corpus_and_enters_it() {
         u64_at(&report, &["backend", "units"]) > 0,
         "no unit was compiled, so `c` installed something that is not a code generator: {}",
         report["backend"]
-    );
-}
-
-#[test]
-fn an_off_by_one_in_compiled_code_is_caught_by_ply_test() {
-    let dir = project(CORPUS);
-    let caught = fires_and_is_caught(dir.path(), "c:wrong:off-by-one");
-    assert!(
-        caught.contains(&"m.double doubles".to_string()),
-        "{caught:?}"
-    );
-}
-
-#[test]
-fn an_inverted_comparison_in_compiled_code_is_caught_by_ply_test() {
-    let dir = project(CORPUS);
-    let caught = fires_and_is_caught(dir.path(), "c:wrong:inverted");
-    assert!(caught.contains(&"m.even is even".to_string()), "{caught:?}");
-}
-
-#[test]
-fn a_stale_answer_from_compiled_code_is_caught_by_ply_test() {
-    let dir = project(CORPUS);
-    fires_and_is_caught(dir.path(), "c:wrong:stale");
-}
-
-#[test]
-fn a_wrong_kind_from_compiled_code_is_caught_by_ply_test() {
-    let dir = project(CORPUS);
-    let caught = fires_and_is_caught(dir.path(), "c:wrong:wrong-type");
-    assert!(
-        caught.contains(&"m.double doubles".to_string()),
-        "{caught:?}"
-    );
-    assert!(
-        caught.contains(&"m.a label is a word".to_string()),
-        "{caught:?}"
-    );
-}
-
-/// Every compiled definition is registered, so the name the mutation answers for is one the fragment refused.
-#[test]
-fn an_answer_from_compiled_code_for_a_body_it_lacks_is_caught_by_ply_test() {
-    let dir = project(CORPUS);
-    let caught = fires_and_is_caught(dir.path(), "c:wrong:unoffered");
-    assert!(
-        caught.contains(&"m.a refused body adds one".to_string()),
-        "{caught:?}"
-    );
-}
-
-#[test]
-fn compiled_code_that_runs_past_its_budget_is_caught_by_ply_test() {
-    let dir = project(DEEP);
-    let control = run(dir.path(), Some("c"));
-    assert_eq!(u64_at(&control, &["summary", "failed"]), 1, "{control}");
-    assert!(
-        control["failures"][0]["diagnostic"]["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("recursion limit")),
-        "the honest code generator honours the recursion bound and declines with it, so a red \
-         control here is the corpus outrunning the bound rather than the generator misbehaving: \
-         {control}"
-    );
-
-    let caught = fires_and_is_caught(dir.path(), "c:wrong:exceeds-budget=4");
-    assert_eq!(caught, vec!["m.a ladder past the machine's bound"]);
-}
-
-#[test]
-fn compiled_code_that_ignores_its_budget_is_caught_where_the_body_terminates() {
-    let dir = project(DEEP);
-    let caught = fires_and_is_caught(dir.path(), "c:wrong:exceeds-budget");
-    assert_eq!(caught, vec!["m.a ladder past the machine's bound"]);
-}
-
-#[test]
-fn compiled_code_forging_an_answer_for_a_self_handled_definition_is_caught_by_ply_test() {
-    let dir = project(CORPUS);
-    let caught = fires_and_is_caught(dir.path(), "c:wrong:answers=99@m.handled");
-    assert!(
-        caught.contains(&"m.a self handled effect still answers".to_string()),
-        "{caught:?}"
     );
 }
 
@@ -426,18 +200,9 @@ fn a_backed_run_that_selects_nothing_compiles_nothing() {
 }
 
 #[test]
-fn a_bare_wrong_prefix_names_the_c_backend() {
-    let dir = project(CORPUS);
-    let bare = run(dir.path(), Some("wrong:off-by-one"));
-    assert_eq!(bare["backend"]["name"], "c", "{bare}");
-    let generated = run(dir.path(), Some("c:wrong:off-by-one"));
-    assert_eq!(generated["backend"]["name"], "c", "{generated}");
-}
-
-#[test]
 fn a_backend_name_that_is_not_a_spelling_of_anything_is_refused() {
     let dir = project(CORPUS);
-    for spec in ["c:reference", "clif", "c:wrong:off-by-two"] {
+    for spec in ["c:reference", "clif", "wrong:off-by-one"] {
         let out = ply(dir.path())
             .arg("test")
             .arg("--backend")
