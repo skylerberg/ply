@@ -340,7 +340,6 @@ impl Loaded {
         });
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,
-            ..Default::default()
         };
         machine.set_compiled(unit.attach(&spec));
         machine
