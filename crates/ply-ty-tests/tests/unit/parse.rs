@@ -227,6 +227,32 @@ fn atoms_and_footprints_read_the_check_dumps_form() {
 }
 
 #[test]
+fn an_operation_atom_parses_and_prints_by_its_name() {
+    let send = parse_atom("net.send[conn]").unwrap();
+    assert_eq!(
+        send,
+        EffectAtom::operation("net", Resource::Named(Symbol::new("conn")), "send")
+    );
+    assert_eq!(send.to_string(), "net.send[conn]");
+    let f = parse_footprint("net.write[conn],net.send[conn]").unwrap();
+    assert_eq!(
+        f,
+        Footprint::from_atoms([send, atom("net", Some("conn"), Mode::Write)])
+    );
+    let text = f
+        .atoms()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(text, "net.write[conn],net.send[conn]");
+    assert_eq!(parse_footprint(&text).unwrap(), f);
+    let row = parse_row("{net.send[conn] | e}").unwrap();
+    assert_eq!(print_row(&row), "{net.send[conn] | e}");
+    assert!(parse_atom("net.").is_err());
+    assert!(parse_atom(".send").is_err());
+}
+
+#[test]
 fn malformed_text_is_refused_with_the_position() {
     for (text, expected) in [
         ("List<Int", "expected `>`"),
@@ -246,12 +272,12 @@ fn malformed_text_is_refused_with_the_position() {
     assert!(
         parse_atom("db")
             .unwrap_err()
-            .contains("no `.read` or `.write`")
+            .contains("no `.read`, `.write` or `.op`")
     );
     assert!(
-        parse_atom("db.peek")
+        parse_atom("db.")
             .unwrap_err()
-            .contains("not `read` or `write`")
+            .contains("not an effect atom")
     );
     assert!(parse_row("{db.read | e").is_err());
 }

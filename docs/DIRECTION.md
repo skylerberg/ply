@@ -22,7 +22,6 @@ A feature earns its place by one of these. Saving keystrokes does not count.
 - Tail calls across definitions, so mutual recursion is a loop too.
 - Rows that name operations, so a signature says `net.send[conn]` rather than `net.write[conn]`
   and a `handle` over a function value is judged too.
-- `ply fmt`, from the printer `ply build` already has.
 - Structured fixes on diagnostics: a machine-applicable suggestion and candidates in the JSON.
 - Induction over lists in the prover, which needs a cons term in its term language.
 - Mutation testing and per-definition coverage over the hash index.

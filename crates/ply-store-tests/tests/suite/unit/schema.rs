@@ -1,7 +1,7 @@
 use ply_store::schema::*;
 use ply_store::{BODY_ENCODING, ContentHash, DeclBody, DefKind, FRONTEND_VERSION, Outcome};
 use ply_ty::Mode;
-use ply_ty::{Footprint, Resource, Type};
+use ply_ty::{EffectAtom, Footprint, Resource, Type};
 
 mod variant {
     use super::*;
@@ -26,6 +26,13 @@ mod variant {
         match m {
             Mode::Read => "Mode::Read",
             Mode::Write => "Mode::Write",
+        }
+    }
+
+    pub(super) fn atom(a: &EffectAtom) -> &'static str {
+        match a.op {
+            Some(_) => "EffectAtom::op",
+            None => "EffectAtom::mode",
         }
     }
 
@@ -74,6 +81,7 @@ fn mentioned() -> Vec<&'static str> {
                 params.iter().for_each(|p| walk_ty(p, note));
                 walk_ty(ret, note);
                 for a in &effects.atoms {
+                    note(variant::atom(a));
                     note(variant::resource(&a.resource));
                     note(variant::mode(a.mode));
                 }
@@ -84,6 +92,7 @@ fn mentioned() -> Vec<&'static str> {
 
     fn walk_footprint(f: &Footprint, note: &mut impl FnMut(&'static str)) {
         for a in f.atoms() {
+            note(variant::atom(a));
             note(variant::resource(&a.resource));
             note(variant::mode(a.mode));
         }
@@ -122,7 +131,7 @@ fn mentioned() -> Vec<&'static str> {
 }
 
 /// The digest of the shapes this build stores.
-const PINNED: &str = "f0e6e96838daf4def2c5199004bf9f4aa701618e3082697a5ba508d8ac3a1d33";
+const PINNED: &str = "d22c7184209f3cc833eab28f2f67d21641fda2214256891cb6d2a6515cfa8f5b";
 
 #[test]
 fn the_stored_schema_is_pinned() {
