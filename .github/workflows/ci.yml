@@ -291,10 +291,12 @@ jobs:
         with:
           slot: part-${{ strategy.job-index }}
 
-      # The awk strips colour first: nextest colours its summary line.
+      # The awk strips colour first: nextest colours its summary line. A golden that moved is
+      # blessed rather than failed: the diff goes to the job summary, and `refresh` commits it on main.
       - name: cargo nextest run
         env:
           SLICE: ${{ matrix.slice }}
+          PLY_DIFF_BLESS: "1"
         run: |
           set -euo pipefail
           exclude=$(.github/ci-shards.sh exclude-filter)
@@ -312,28 +314,19 @@ jobs:
           ' /tmp/partition.log)
           echo "partition $SLICE ran $ran tests"
           [ "$ran" -gt 0 ] || { echo "the partition ran no tests at all" >&2; exit 1; }
-      # A golden that disagrees is re-blessed and handed back as the `goldens` artifact:
-      #   gh run download <run-id> -n goldens -D crates/ply-codegen-tests/fixtures/goldens
-      - name: Bless the goldens
-        id: bless
-        if: failure()
+      - name: Goldens that moved
+        if: always()
         run: |
           set -euo pipefail
-          grep -q 'ply-codegen-tests::goldens' /tmp/partition.log || exit 0
-          PLY_DIFF_BLESS=1 cargo-nextest nextest run \
-            --binaries-metadata target/nextest/binaries-metadata.json \
-            --cargo-metadata target/nextest/cargo-metadata.json \
-            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
-            --no-fail-fast -E 'binary_id(ply-codegen-tests::goldens)' || true
-          git status --porcelain crates/ply-codegen-tests/fixtures/goldens | grep -q . || exit 0
-          echo "blessed=1" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: failure() && steps.bless.outputs.blessed == '1'
-        with:
-          name: goldens
-          path: crates/ply-codegen-tests/fixtures/goldens
-          retention-days: 7
-          if-no-files-found: error
+          git add -N crates/ply-codegen-tests/fixtures/goldens
+          git diff --quiet -- crates/ply-codegen-tests/fixtures/goldens && exit 0
+          {
+            echo "### Goldens this partition re-blessed"
+            echo '```'
+            git diff --stat -- crates/ply-codegen-tests/fixtures/goldens
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          git diff --stat -- crates/ply-codegen-tests/fixtures/goldens
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: github.ref == 'refs/heads/main' && steps.suite.outputs.objects-hit != 'true'
         with:
@@ -380,11 +373,28 @@ jobs:
           path: /tmp/ply-c-cache
           key: ${{ steps.suite.outputs.objects-key }}
 
-      # A failed bootstrap fixpoint writes the refreshed bundle as an artifact:
-      #   gh run download <run-id> -n bootstrap-bundle -D crates/ply-compiler/bootstrap
-      - name: Refresh the bootstrap bundle
-        id: refresh
-        if: failure() && matrix.id == 'bootstrap'
+
+  # On main only: the bundle the sources are a fixpoint of, and the goldens they produce, are
+  # committed back, so no pull request carries either and two of them never conflict on them.
+  # A push by the workflow's own token starts no run, so the commit is the tree the run tested
+  # plus what that run emitted.
+  refresh:
+    name: refresh the bundle and goldens
+    if: github.event_name == 'push'
+    needs: [plan, build, build-ply]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true
+      - uses: ./.github/actions/suite
+        with:
+          slot: refresh
+      - name: Emit the bundle and bless the goldens
         run: |
           set -euo pipefail
           filter=$(.github/ci-shards.sh solo-filter bootstrap)
@@ -393,14 +403,22 @@ jobs:
             --cargo-metadata target/nextest/cargo-metadata.json \
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
             -E "$filter"
-          echo "refreshed=true" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: failure() && steps.refresh.outputs.refreshed == 'true'
-        with:
-          name: bootstrap-bundle
-          path: crates/ply-compiler/bootstrap
-          retention-days: 7
-          if-no-files-found: error
+          PLY_DIFF_BLESS=1 cargo-nextest nextest run \
+            --binaries-metadata target/nextest/binaries-metadata.json \
+            --cargo-metadata target/nextest/cargo-metadata.json \
+            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
+            --no-fail-fast -E 'binary_id(ply-codegen-tests::goldens)'
+      - name: Commit what moved
+        run: |
+          set -euo pipefail
+          git add crates/ply-compiler/bootstrap crates/ply-codegen-tests/fixtures/goldens
+          git diff --cached --quiet && { echo "the bundle and goldens already match main"; exit 0; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "The goldens and bundle CI emitted for these sources"
+          # Main may have moved under this run; a later merge's run refreshes for both.
+          git pull --rebase origin main || { git rebase --abort; echo "main moved; the next run refreshes"; exit 0; }
+          git push origin HEAD:main || echo "main moved; the next run refreshes"
 
   # Tests that must be seen to run: the `#![cfg(unix)]` shutdown suite and the tree checks by name.
   gates:

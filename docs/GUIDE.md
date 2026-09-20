@@ -609,10 +609,9 @@ skipped; `--mutate-budget N` (default 64) caps how many are judged.
 ### 8.6 Compiled backend
 
 `--backend c` compiles the program to C and runs it there: compiled code is the
-only evaluator. Backend results are cached separately.
+only evaluator. Its passes share the evaluator's cache.
 `--profile development` (default; fastest compiler) or `release`
-(`cc -O2`) requires `--backend`. `--backend [c:]wrong:<mutation>` is wrong on
-purpose and never cached.
+(`cc -O2`) requires `--backend`.
 
 | variable | effect |
 | --- | --- |
@@ -786,6 +785,8 @@ and `Option<Option<a>>` (`json`).
 
 In scope everywhere; a module may shadow any except `compare_values` (`E0105`).
 Out-of-range indexes and slices raise `E0502` unless noted; nothing is clamped.
+`ply doc NAME` prints any of these from the compiler's own table, which is the
+authority when this page and it disagree.
 
 ### 12.1 Core, lists and maps
 
@@ -892,6 +893,7 @@ pub nondet effect net {
   write listen[s](port: Int) -> Int
   write listen_tls[s](port: Int, credential: String) -> Int
   write connect[s](host: String, port: Int, timeout_ms: Int) -> Option<Int>
+  write connect_tls[s](host: String, port: Int, timeout_ms: Int) -> Option<Int>
   write accept[s](listener: Int) -> Int
   write recv[s](conn: Int, max: Int, timeout_ms: Int) -> Option<Bytes>
   write send[s](conn: Int, payload: Bytes, timeout_ms: Int) -> Option<Int>
@@ -905,7 +907,10 @@ pub fn send_all(c: Int, payload: Bytes, timeout_ms: Int) -> Bool / {net.write[co
 runtime error. `send` may write fewer bytes than given; `send_all` loops.
 `connect` resolves the host and tries each address until the deadline; `None`
 is a host not reached for any reason, and the connection it answers is used
-under the label it was opened under.
+under the label it was opened under. `connect_tls` is the same over TLS: the
+server is verified as `host` against the built-in roots and any `--trust`
+certificate on the first `send` or `recv`, and a failed handshake reads as EOF
+and writes `0`.
 
 ### 13.2 `std.http` — HTTP/1.1
 
@@ -1045,6 +1050,7 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | flag | meaning |
 | --- | --- |
 | `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")`; `E0430` if it does not load, `E0429` if unnamed |
+| `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
 | `--db URL` | database (else `PLY_DB_URL`; password from `PLY_DB_PASSWORD`); `E0431` if absent when used |
 | `--db-pool N` | pool size |
@@ -1114,6 +1120,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | `--show MODULE`, `--digest`; no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
+| `ply doc NAME [path]` | a definition or builtin: signature with the written parameter names, the `//` lines above it, place, hash, footprint; a builtin's note comes from the compiler's table |
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, test and law whose closure reaches it |

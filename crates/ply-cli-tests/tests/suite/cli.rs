@@ -252,33 +252,6 @@ fn the_default_tier_and_backend_c_are_one_engine() {
 }
 
 #[test]
-fn a_corrupt_backend_neither_reads_nor_writes_the_cache() {
-    let dir = project(GREEN);
-    ply(dir.path()).arg("test").assert().success();
-
-    let out = ply(dir.path())
-        .args(["test", "--backend", "wrong:off-by-one"])
-        .output()
-        .unwrap();
-    let text = stdout_of(&out);
-    assert!(
-        text.contains("selected 2 of 2 (0 cached)"),
-        "a corrupt backend skipped a test:\n{text}"
-    );
-
-    // Nothing it did is readable afterwards, by it or by anything else.
-    let out = ply(dir.path())
-        .args(["test", "--backend", "wrong:off-by-one"])
-        .output()
-        .unwrap();
-    let text = stdout_of(&out);
-    assert!(
-        text.contains("selected 2 of 2 (0 cached)"),
-        "a corrupt backend left a cache behind:\n{text}"
-    );
-}
-
-#[test]
 fn watch_reruns_on_a_save_and_keeps_the_front_end_it_already_had() {
     let dir = project(GREEN);
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("ply"))

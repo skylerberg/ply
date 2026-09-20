@@ -108,9 +108,9 @@ fn an_answer_whose_kind_is_not_its_declared_returns_is_refused_unless_it_is_chil
     );
     assert!(
         types.answer_crosses(&scan, &Value::Int(0)),
-        "the childless clause was lost: `Mutation::WrongType` and `Mutation::Answers` both \
-         answer an `Int` for a definition that returns something else, and refusing it here \
-         would police a wrong answer with a kind test"
+        "the childless clause was lost: an `Int` answered for a definition that returns \
+         something else must cross, since refusing it here would police a wrong answer with a \
+         kind test"
     );
 }
 

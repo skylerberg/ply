@@ -100,7 +100,6 @@ impl Compiled {
             .expect("this host has a C compiler");
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,
-            ..Default::default()
         };
         m.set_compiled(unit.attach(&spec));
         m
