@@ -25,3 +25,11 @@ definitions. An atom reached through a function value (a parameter, a field, a c
 `let`) is not judged, because a row names atoms, not operations. Making that precise means rows
 that name operations (`net.send[conn]`), a change to the row syntax, the printer, the hash and
 the frames. Assumed: worth doing as its own item, listed in `docs/DIRECTION.md`.
+
+## Retiring `--backend wrong:<mutation>`
+
+That flag corrupts answers at the `Compiled::enter` seam, which no production path enters any
+more: a test is entered whole, so every test under it fails as "no body" and its own suite
+passes for the wrong reason. `ply test --mutate` makes the same claim honestly at the source.
+Assumed: retire the flag, its `Mutant` wrapper and its suite in a follow-up, unless you want
+the seam kept for something else.
