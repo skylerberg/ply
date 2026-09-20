@@ -144,6 +144,8 @@ fn the_listing_is_one_row_per_triple_and_never_a_star() {
             "std.net.net.close[listener] std.net.net.write[listener] ply_host::tcp::close",
             "std.net.net.connect[conn] std.net.net.write[conn] ply_host::tcp::connect",
             "std.net.net.connect[listener] std.net.net.write[listener] ply_host::tcp::connect",
+            "std.net.net.connect_tls[conn] std.net.net.write[conn] ply_host::tls::connect",
+            "std.net.net.connect_tls[listener] std.net.net.write[listener] ply_host::tls::connect",
             "std.net.net.listen[conn] std.net.net.write[conn] ply_host::tcp::listen",
             "std.net.net.listen[listener] std.net.net.write[listener] ply_host::tcp::listen",
             // The only row saying the program serves TLS; its other is a plain `net.write[..]`.
@@ -978,5 +980,192 @@ fn a_hermetic_run_names_the_tls_handler_it_did_not_bind() {
             Some(&Symbol::new("listener")),
         ),
         Some(ply_host::tls::HANDLER)
+    );
+}
+
+/// A certificate on disk that the host serves under `api` and, through `--trust`, accepts.
+fn issued() -> (
+    tempfile::TempDir,
+    ply_host::tls::CredentialSpec,
+    std::path::PathBuf,
+) {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let issued =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen issues");
+    let certificate = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    std::fs::write(&certificate, issued.cert.pem()).expect("the certificate is written");
+    std::fs::write(&key, issued.signing_key.serialize_pem()).expect("the key is written");
+    let spec = ply_host::tls::CredentialSpec {
+        name: "api".to_string(),
+        certificate: certificate.clone(),
+        key,
+    };
+    (dir, spec, certificate)
+}
+
+/// The host's own TLS listener answers its own TLS client: the bytes cross encrypted.
+#[test]
+fn an_outbound_tls_connection_is_verified_and_served_end_to_end() {
+    let (_dir, spec, certificate) = issued();
+    let credentials = ply_host::tls::Credentials::load(std::slice::from_ref(&spec), &[certificate])
+        .expect("the material loads");
+    let net = Arc::new(TcpHost::with_credentials(credentials));
+    let binding = bind_tls(net.clone());
+    let listener = int(perform(
+        &binding,
+        net.as_ref(),
+        Op::ListenTls,
+        "listener",
+        vec![Value::Int(0), Value::str("api")],
+    )
+    .expect("a TLS listener"));
+    let port = net.local_addr(listener).expect("a bound port").port();
+
+    let server_net = net.clone();
+    let server_binding = bind_tls(server_net.clone());
+    let server = std::thread::spawn(move || {
+        let conn = int(perform(
+            &server_binding,
+            server_net.as_ref(),
+            Op::Accept,
+            "listener",
+            vec![Value::Int(listener)],
+        )
+        .expect("an accept"));
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let chunk = bytes(
+                perform(
+                    &server_binding,
+                    server_net.as_ref(),
+                    Op::Recv,
+                    "conn",
+                    vec![Value::Int(conn), Value::Int(4096), Value::Int(5000)],
+                )
+                .expect("a read"),
+            );
+            assert!(!chunk.is_empty(), "the client has not finished the request");
+            request.extend_from_slice(&chunk);
+        }
+        perform(
+            &server_binding,
+            server_net.as_ref(),
+            Op::Send,
+            "conn",
+            vec![Value::Int(conn), Value::bytes(RESPONSE), Value::Int(5000)],
+        )
+        .expect("a send");
+        close(&server_binding, server_net.as_ref(), conn, "conn");
+        request
+    });
+
+    let conn = int(perform(
+        &binding,
+        net.as_ref(),
+        Op::ConnectTls,
+        "conn",
+        vec![
+            Value::str("localhost"),
+            Value::Int(i64::from(port)),
+            Value::Int(5000),
+        ],
+    )
+    .expect("a connect"));
+    assert!(conn > 0);
+    let sent = int(perform(
+        &binding,
+        net.as_ref(),
+        Op::Send,
+        "conn",
+        vec![Value::Int(conn), Value::bytes(REQUEST), Value::Int(5000)],
+    )
+    .expect("a send"));
+    assert_eq!(sent, REQUEST.len() as i64);
+    assert_eq!(read_to_end(&binding, net.as_ref(), conn), RESPONSE);
+    close(&binding, net.as_ref(), conn, "conn");
+    assert_eq!(server.join().expect("the server finished"), REQUEST);
+    close(&binding, net.as_ref(), listener, "listener");
+    let counts = net.handshakes();
+    assert_eq!(counts.completed, 2, "one handshake at each end");
+    assert_eq!(counts.refused, 0);
+}
+
+/// Without `--trust`, a self-signed server is refused: the connection ends and nothing is read.
+#[test]
+fn an_untrusted_server_ends_the_connection_at_the_handshake() {
+    let (_dir, spec, _certificate) = issued();
+    let credentials = ply_host::tls::Credentials::load(std::slice::from_ref(&spec), &[])
+        .expect("the material loads");
+    let net = Arc::new(TcpHost::with_credentials(credentials));
+    let binding = bind_tls(net.clone());
+    let listener = int(perform(
+        &binding,
+        net.as_ref(),
+        Op::ListenTls,
+        "listener",
+        vec![Value::Int(0), Value::str("api")],
+    )
+    .expect("a TLS listener"));
+    let port = net.local_addr(listener).expect("a bound port").port();
+
+    let server_net = net.clone();
+    let server_binding = bind_tls(server_net.clone());
+    let server = std::thread::spawn(move || {
+        let conn = int(perform(
+            &server_binding,
+            server_net.as_ref(),
+            Op::Accept,
+            "listener",
+            vec![Value::Int(listener)],
+        )
+        .expect("an accept"));
+        let got = bytes(
+            perform(
+                &server_binding,
+                server_net.as_ref(),
+                Op::Recv,
+                "conn",
+                vec![Value::Int(conn), Value::Int(4096), Value::Int(5000)],
+            )
+            .expect("a read"),
+        );
+        close(&server_binding, server_net.as_ref(), conn, "conn");
+        got
+    });
+
+    let conn = int(perform(
+        &binding,
+        net.as_ref(),
+        Op::ConnectTls,
+        "conn",
+        vec![
+            Value::str("localhost"),
+            Value::Int(i64::from(port)),
+            Value::Int(5000),
+        ],
+    )
+    .expect("the TCP connect succeeds; verification happens on the first write"));
+    let sent = int(perform(
+        &binding,
+        net.as_ref(),
+        Op::Send,
+        "conn",
+        vec![Value::Int(conn), Value::bytes(REQUEST), Value::Int(5000)],
+    )
+    .expect("a send"));
+    assert_eq!(sent, 0, "the handshake failed, so nothing was written");
+    assert_eq!(read_to_end(&binding, net.as_ref(), conn), b"");
+    close(&binding, net.as_ref(), conn, "conn");
+    assert_eq!(server.join().expect("the server finished"), b"");
+    close(&binding, net.as_ref(), listener, "listener");
+    let counts = net.handshakes();
+    assert!(
+        counts
+            .reasons
+            .iter()
+            .any(|(reason, _)| *reason == ply_host::tls::REASON_CERTIFICATE),
+        "{:?}",
+        counts.reasons
     );
 }

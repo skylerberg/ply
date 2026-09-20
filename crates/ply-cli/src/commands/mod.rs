@@ -9,6 +9,7 @@ pub mod explain;
 pub mod fmt;
 pub mod hash;
 pub mod hosts;
+pub mod mutate;
 pub mod prove;
 pub mod review;
 pub mod run;

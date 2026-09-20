@@ -171,6 +171,9 @@ pub struct TlsOptions {
         requires = "host",
     )]
     pub tls: Vec<CredentialSpec>,
+    /// A certificate `net.connect_tls` trusts beside the built-in roots. Repeatable.
+    #[arg(long = "trust", value_name = "CERT.pem", requires = "host")]
+    pub trust: Vec<std::path::PathBuf>,
 }
 
 /// Directory roots per resource label; kept out of the program so no path enters a hash.
@@ -315,11 +318,24 @@ pub struct TestArgs {
     #[arg(long, default_value_t = 64, value_name = "N")]
     pub bisect_budget: usize,
 
+    /// Which tests reach each definition, and the definitions none reaches.
+    #[arg(long)]
+    pub coverage: bool,
+
+    /// After a green run, change each definition (or DEF) one operator or literal at a time and
+    /// re-run the tests that reach it; a mutant every one of them passes is reported.
+    #[arg(long, value_name = "DEF", num_args = 0..=1, default_missing_value = "*")]
+    pub mutate: Option<String>,
+
+    /// Mutants a run may judge; counted, not timed, so runs agree.
+    #[arg(long, default_value_t = 64, value_name = "N")]
+    pub mutate_budget: usize,
+
     /// Record which definitions a failing test entered; `always` also traces the first run.
     #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]
     pub trace: When,
 
-    /// Attach a compiled backend: `c`, or a deliberately wrong `[c:]wrong:<mutation>[@<def>]`.
+    /// Attach a compiled backend: `c`.
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
 
