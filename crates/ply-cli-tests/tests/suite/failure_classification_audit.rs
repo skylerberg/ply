@@ -73,8 +73,8 @@ fn every_language_defined_runtime_failure_is_a_program_error(index: usize, of: u
         ),
         (
             "a runaway mutual recursion",
-            "fn spin(n: Int) -> Int = spun(n + 1)\n\
-             fn spun(n: Int) -> Int = spin(n + 1)\n\
+            "fn spin(n: Int) -> Int = 1 + spun(n + 1)\n\
+             fn spun(n: Int) -> Int = 1 + spin(n + 1)\n\
              test \"spins across two definitions\" { assert_eq(spin(0), 0) }\n",
             "recursion limit",
         ),
