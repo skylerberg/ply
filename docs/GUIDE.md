@@ -499,8 +499,15 @@ test "expiry is decided against the deadline, not the wall clock" {
 A clause is `effect.op[resource](params) -> body`; an optional
 `return x -> body` clause maps the result. The `handle`'s row is the body's
 minus the handled atoms plus every clause's row. A handler discharges an
-**atom**, not an operation: `recv`, `send` and `close` are all
-`net.write[conn]`, so a missing `send` clause fails at run time.
+**atom**: `recv`, `send` and `close` are all `net.write[conn]`. The body must
+not perform an operation on a handled atom that no clause answers (`E0305`,
+naming the clause to add), unless the enclosing function's written row keeps
+that atom: then the operation is forwarded to the caller's handler, as
+`std.db`'s `transaction` forwards `begin` and `commit` while answering
+`rollback`. The checker follows performs in the body and in every named
+function it calls; an operation inside a lambda, or reached through a
+function value, is not judged, and at run time runs past the `handle` to the
+next handler or the host.
 
 ### 6.6 `resume`
 
@@ -511,8 +518,10 @@ number of times. Without `resume`, a clause's value returns to the perform site.
 ### 6.7 Unhandled effects
 
 `E0302`: the body performs an atom its written row forbids. `E0303`: an effect
-escaped inference (a compiler defect). `E0424`: an operation reached the host
-boundary with nothing bound — pass `--host` or handle it (§14).
+escaped inference (a compiler defect). `E0305`: a `handle` lacks a clause for
+an operation its body performs on an atom it handles. `E0424`: an operation
+reached the host boundary with nothing bound — pass `--host` or handle it
+(§14).
 
 ## 7. Cells and regions
 
@@ -1136,6 +1145,7 @@ table, from the registry the compiler raises from.
 | `E0302` | effect not permitted by the written row |
 | `E0303` | unhandled effect (compiler defect) |
 | `E0304` | resource label required |
+| `E0305` | `handle` with no clause for an operation its body performs on a handled atom |
 | `E0412` | nondeterministic effect in a deterministic test |
 | `E0413` | `Task` escapes its region |
 | `E0414` | deadlock, or spent step budget |

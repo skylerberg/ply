@@ -275,6 +275,7 @@ fn by_code(code: &str, message: &str) -> Option<Diagnostic> {
         "E0301" => Diagnostic::error(codes::UNBOUND_ROW_VAR, message),
         "E0302" => Diagnostic::error(codes::EFFECT_NOT_PERMITTED, message),
         "E0304" => Diagnostic::error(codes::RESOURCE_REQUIRED, message),
+        "E0305" => Diagnostic::error(codes::HANDLER_CLAUSE_MISSING, message),
         "E0412" => Diagnostic::error(codes::NONDET_IN_DET_TEST, message),
         "E0413" => Diagnostic::error(codes::TASK_ESCAPES_SCOPE, message),
         "E0416" => Diagnostic::error(codes::NESTED_SIMULATION, message),
