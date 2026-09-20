@@ -392,14 +392,11 @@ impl Stack {
 /// `examples/desk.ply` as a project `ply run --host` can be pointed at.
 fn project(dir: &Path, service: &str, stack: Stack, variant: w3::Variant) -> Result<()> {
     // The twin discharges `db`, `trace` and `signal` in Ply, so its entry row is narrower.
-    let spawning = variant == w3::Variant::TaskPerConn;
-    let task = if spawning { "task.write, " } else { "" };
-    let from = format!(
-        "fn main() -> Int / {{Serving, config.read[server], {task}net.write[conn], net.write[listener]}} = {{"
-    );
-    let to = format!(
-        "fn main() -> Int / {{config.read[server], config.read[credentials], {task}net.write[conn], net.write[listener]}} = {{"
-    );
+    let from = match variant {
+        w3::Variant::Sequential => w3::MAIN_ROW,
+        w3::Variant::TaskPerConn => w3::MAIN_ROW_SPAWNING,
+    };
+    let to = from.replace("Serving, ", "config.secret[credentials], ");
     let source = match stack {
         Stack::Postgres => service.to_string(),
         Stack::PostgresTls => replace(
@@ -408,7 +405,7 @@ fn project(dir: &Path, service: &str, stack: Stack, variant: w3::Variant) -> Res
             &format!("    run_tls(port, \"{CREDENTIAL}\", count)"),
         )?,
         Stack::Twin => {
-            let narrowed = replace(service, &from, &to)?;
+            let narrowed = replace(service, from, &to)?;
             replace(
                 &narrowed,
                 "    run(port, count)",

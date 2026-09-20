@@ -25,11 +25,11 @@ const TESTS_MARKER: &str = "// --- Tests: the business, which needs no handler a
 const CREDENTIAL: &str = "desk";
 
 /// `main`'s declared row in `examples/desk.ply`, and the same row once the accept loop spawns.
-const MAIN_ROW: &str = "\
+pub(crate) const MAIN_ROW: &str = "\
 fn main() -> Int
   / {Serving, config.get[server], net.listen[listener], net.accept[listener], net.close[listener],
      net.recv[conn], net.send[conn], net.close[conn]} = {";
-const MAIN_ROW_SPAWNING: &str = "\
+pub(crate) const MAIN_ROW_SPAWNING: &str = "\
 fn main() -> Int
   / {task.write, Serving, config.get[server], net.listen[listener], net.accept[listener], net.close[listener],
      net.recv[conn], net.send[conn], net.close[conn]} = {";
