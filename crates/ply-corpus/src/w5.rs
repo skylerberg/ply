@@ -391,12 +391,11 @@ impl Stack {
 
 /// `examples/desk.ply` as a project `ply run --host` can be pointed at.
 fn project(dir: &Path, service: &str, stack: Stack, variant: w3::Variant) -> Result<()> {
-    // The twin discharges `db`, `trace` and `signal` in Ply, so its entry row is narrower.
     let from = match variant {
         w3::Variant::Sequential => w3::MAIN_ROW,
         w3::Variant::TaskPerConn => w3::MAIN_ROW_SPAWNING,
     };
-    let to = from.replace("Serving, ", "config.secret[credentials], ");
+    let to = w3::twin_entry_row(from);
     let source = match stack {
         Stack::Postgres => service.to_string(),
         Stack::PostgresTls => replace(

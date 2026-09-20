@@ -34,6 +34,17 @@ fn main() -> Int
   / {task.write, Serving, config.get[server], net.listen[listener], net.accept[listener], net.close[listener],
      net.recv[conn], net.send[conn], net.close[conn]} = {";
 
+/// The twin's entry row: `run_memory` discharges `db`, `trace` and `signal` itself, reads the
+/// credential, and may listen over TLS.
+pub(crate) fn twin_entry_row(main_row: &str) -> String {
+    main_row
+        .replace("Serving, ", "config.secret[credentials], ")
+        .replace(
+            "net.listen[listener], ",
+            "net.listen[listener], net.listen_tls[listener], ",
+        )
+}
+
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(20);
 
 const MAX_CONNECTIONS: u32 = 1000;

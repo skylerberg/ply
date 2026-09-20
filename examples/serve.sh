@@ -128,7 +128,7 @@ cp "$here/desk.ply" "$out/desk.ply"
 if [ "$memory" -eq 1 ]; then
   rewrite "$out/desk.ply" \
     "  / {Serving, config.get[server], net.listen[listener], net.accept[listener], net.close[listener]," \
-    "  / {config.secret[credentials], config.get[server], net.listen[listener], net.accept[listener], net.close[listener],"
+    "  / {config.secret[credentials], config.get[server], net.listen[listener], net.listen_tls[listener], net.accept[listener], net.close[listener],"
   rewrite "$out/desk.ply" "    run(port, count)" "    run_memory(port, key, count)"
 elif [ "$tls" -eq 1 ]; then
   rewrite "$out/desk.ply" "    run(port, count)" \

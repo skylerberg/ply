@@ -748,12 +748,7 @@ impl Store {
 /// `examples/desk.ply` as a project `ply run --host` can be pointed at, with its store rewritten.
 fn project(dir: &Path, service: &str, store: Store) -> Result<()> {
     let source = if store == Store::Twin {
-        // The twin discharges `db`, `trace` and `signal` in Ply, so its entry row is narrower.
-        let narrowed = replace(
-            service,
-            w3::MAIN_ROW,
-            &w3::MAIN_ROW.replace("Serving, ", "config.secret[credentials], "),
-        )?;
+        let narrowed = replace(service, w3::MAIN_ROW, &w3::twin_entry_row(w3::MAIN_ROW))?;
         replace(
             &narrowed,
             "    run(port, count)",
