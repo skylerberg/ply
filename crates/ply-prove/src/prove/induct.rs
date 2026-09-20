@@ -512,7 +512,18 @@ fn induct_list(
         &mut spent,
         &assertions,
     ) {
-        declined(blockers, &format!("the step is open{}", ran_out(budget)));
+        let picture: Vec<String> = assertions
+            .iter()
+            .map(|(t, v)| format!("{v}: {:?}", terms.node(*t)))
+            .collect();
+        declined(
+            blockers,
+            &format!(
+                "the step is open{}; covered {covered:?} structural {structural:?} defined {defined:?}; {}",
+                ran_out(budget),
+                picture.join(" | ")
+            ),
+        );
         return (None, spent);
     }
 
