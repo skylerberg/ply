@@ -26,6 +26,7 @@ mod tag {
     pub(super) const ROW: u8 = 0x31;
     pub(super) const FOOTPRINT: u8 = 0x32;
     pub(super) const SCHEME: u8 = 0x33;
+    pub(super) const ATOM_OP: u8 = 0x34;
 
     pub(super) const NAME_REF: u8 = 0x40;
     pub(super) const MEMBER: u8 = 0x41;
@@ -163,7 +164,11 @@ fn get_mode(r: &mut Reader) -> Decoded<Mode> {
 }
 
 fn put_atom(w: &mut Writer, atom: &EffectAtom) {
-    w.tag(tag::ATOM);
+    w.tag(if atom.op.is_some() {
+        tag::ATOM_OP
+    } else {
+        tag::ATOM
+    });
     w.symbol(&atom.effect);
     match &atom.resource {
         Resource::Named(name) => {
@@ -172,26 +177,32 @@ fn put_atom(w: &mut Writer, atom: &EffectAtom) {
         }
         Resource::Singleton => w.tag(tag::RESOURCE_SINGLETON),
     }
-    put_mode(w, atom.mode);
+    match &atom.op {
+        Some(op) => w.symbol(op),
+        None => put_mode(w, atom.mode),
+    }
     w.tag(tag::END);
 }
 
 fn get_atom(r: &mut Reader) -> Decoded<EffectAtom> {
     const WHAT: &str = "malformed effect atom";
-    r.tag(tag::ATOM, WHAT)?;
+    let kind = r.byte(WHAT)?;
+    if kind != tag::ATOM && kind != tag::ATOM_OP {
+        return Err(crate::binary::DecodeError { what: WHAT, at: 0 });
+    }
     let effect = r.symbol(WHAT)?;
     let resource = match r.byte(WHAT)? {
         tag::RESOURCE_NAMED => Resource::Named(r.symbol(WHAT)?),
         tag::RESOURCE_SINGLETON => Resource::Singleton,
         _ => return Err(crate::binary::DecodeError { what: WHAT, at: 0 }),
     };
-    let mode = get_mode(r)?;
+    let atom = if kind == tag::ATOM_OP {
+        EffectAtom::operation(effect, resource, r.symbol(WHAT)?)
+    } else {
+        EffectAtom::new(effect, resource, get_mode(r)?)
+    };
     r.tag(tag::END, WHAT)?;
-    Ok(EffectAtom {
-        effect,
-        resource,
-        mode,
-    })
+    Ok(atom)
 }
 
 fn put_atoms(w: &mut Writer, atoms: &BTreeSet<EffectAtom>) {

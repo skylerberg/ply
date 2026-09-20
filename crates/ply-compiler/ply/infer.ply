@@ -210,7 +210,7 @@ fn prelude_effect_names() -> List<Bytes> = [b"task", b"clock", b"random", b"sim"
 pub fn is_prelude_effect(name: Bytes) -> Bool = contains_bytes(prelude_effect_names(), name)
 fn simulated_names() -> List<Bytes> = [b"task", b"clock", b"random"]
 
-fn seed_atom() -> Atom = { effect: b"sim", resource: RSingleton, mode: MRead }
+fn seed_atom() -> Atom = { effect: b"sim", resource: RSingleton, mode: MRead, op: None }
 
 fn builtin_type_arities() -> List<{ name: Bytes, arity: Int }> =
   [{ name: b"Int", arity: 0 }, { name: b"Bool", arity: 0 }, { name: b"String", arity: 0 }, { name: b"Bytes", arity: 0 },
@@ -300,7 +300,7 @@ fn prelude_effects() -> List<EffectInfo> = {
 fn simulated_atoms() -> List<Atom> =
   fold(prelude_effects(), [], |acc: List<Atom>, e: EffectInfo|
     if contains_bytes(simulated_names(), e.name) {
-      fold(e.ops, acc, |a: List<Atom>, op: OpInfo| atoms_insert(a, { effect: e.name, resource: RSingleton, mode: op.mode }))
+      fold(e.ops, acc, |a: List<Atom>, op: OpInfo| atoms_insert(a, { effect: e.name, resource: RSingleton, mode: op.mode, op: None }))
     } else { acc })
 
 fn mono_fn(params: List<Type>, ret: Type) -> Scheme = mono(t_fn(params, ret, row_empty()))
@@ -900,25 +900,35 @@ fn conv_atom(cx: Cx, a: AtomExpr) -> { cx: Cx, atom: Option<Atom> } =
       None -> { cx: {..e.cx, refused_atoms: push(e.cx.refused_atoms, a.span)}, atom: None },
       Some(eff) -> {
         let resource = match a.resource { Some(r) -> RNamed(r.name), None -> RSingleton };
-        let declares_mode = match effect_of(e.cx, eff) {
-          Some(info) -> fold(info.ops, false, |acc: Bool, op: OpInfo| acc || mode_eq(op.mode, a.mode)),
-          None -> true,
+        let declares_mode = match a.op {
+          Some(_) -> false,
+          None -> match effect_of(e.cx, eff) {
+            Some(info) -> fold(info.ops, false, |acc: Bool, op: OpInfo| acc || mode_eq(op.mode, a.mode)),
+            None -> true,
+          },
         };
         if !declares_mode {
-          let info = match effect_of(e.cx, eff) { Some(i) -> i, None -> panic("just looked up") };
-          let known = fold(info.ops, [], |acc: List<Bytes>, op: OpInfo| {
-            let k = bytes_concat_all([info.simple_name, b".", mode_key(op.mode)]);
-            if contains_bytes(acc, k) { acc } else { push(acc, k) }
-          });
-          let reported: Cx = err1(e.cx, b"E0104", a.span,
-            bytes_concat_all([b"effect `", eff, b"` declares no `", mode_key(a.mode), b"` operation"]),
-            bytes_concat_all([b"no `", mode_key(a.mode), b"` operation to perform"]),
-            [bytes_concat_all([b"`", eff, b"` can perform: ", join_with(known, b", ")])]);
+          let known = match effect_of(e.cx, eff) { Some(info) -> known_modes(info), None -> [] };
+          let help = if len(known) == 0 { [] } else { [bytes_concat_all([b"`", eff, b"` can perform: ", join_with(known, b", ")])] };
+          let reported: Cx = match a.op {
+            Some(op) -> err1(e.cx, b"E0104", a.span,
+              bytes_concat_all([b"a written row cannot name the operation `", eff, b".", op.name, b"` yet"]),
+              b"name its mode instead", help),
+            None -> err1(e.cx, b"E0104", a.span,
+              bytes_concat_all([b"effect `", eff, b"` declares no `", mode_key(a.mode), b"` operation"]),
+              bytes_concat_all([b"no `", mode_key(a.mode), b"` operation to perform"]), help),
+          };
           { cx: {..reported, refused_atoms: push(reported.refused_atoms, a.span)}, atom: None }
-        } else { { cx: e.cx, atom: Some({ effect: eff, resource: resource, mode: a.mode }) } }
+        } else { { cx: e.cx, atom: Some({ effect: eff, resource: resource, mode: a.mode, op: None }) } }
       },
     }
   }
+
+fn known_modes(info: EffectInfo) -> List<Bytes> =
+  fold(info.ops, [], |acc: List<Bytes>, op: OpInfo| {
+    let k = bytes_concat_all([info.simple_name, b".", mode_key(op.mode)]);
+    if contains_bytes(acc, k) { acc } else { push(acc, k) }
+  })
 
 fn mode_eq(a: Mode, b: Mode) -> Bool = match a { MRead -> (match b { MRead -> true, _ -> false }), MWrite -> (match b { MWrite -> true, _ -> false }), MBad -> false }
 
@@ -1585,7 +1595,7 @@ fn infer_cell_op(cx: Cx, span: Span, args: List<Expr>, form: CellForm) -> Inferr
       Some(resource) -> {
         let modes = match form { CGet -> [MRead], CSet -> [MWrite], CUpdate -> [MRead, MWrite] };
         let out = fold(modes, { cx: after.cx, row: after.row }, |acc: { cx: Cx, row: Row }, m: Mode| {
-          let atom = { effect: cell(), resource: RNamed(resource), mode: m };
+          let atom = { effect: cell(), resource: RNamed(resource), mode: m, op: None };
           let j: WithRow = join(record_site(acc.cx, atom, span, SDirect(cell_form_name(form))), span, acc.row, row_singleton(atom));
           { cx: j.cx, row: j.r }
         });
@@ -1980,7 +1990,7 @@ fn infer_perform(cx: Cx, span: Span, eff: QName, op: Ident, resource: Option<Ide
               ty: shape.ret, row: as_.row }
           } else {
             let checked: Cx = fold(range(0, len(args)), shape.cx, |c: Cx, i: Int| expect(c, expr_span(at(args, i)), at(shape.params, i), at(as_.tys, i), b"operation argument").cx);
-            let atom = { effect: hit.info.name, resource: resource_, mode: hit.op.mode };
+            let atom = { effect: hit.info.name, resource: resource_, mode: hit.op.mode, op: None };
             let noted: Cx = note_handoff(note_spawn(checked, hit.info, hit.op, args, as_.tys), hit.info, hit.op, args, as_.tys);
             let c1: Cx = record_site(noted, atom, span, SDirect(hit.op.name));
             let op_row = resolve_r(c1, shape.row);
@@ -2019,7 +2029,7 @@ fn infer_handle(cx: Cx, span: Span, body: Expr, clauses: List<HandleClause>, ret
                  bytes_concat_all([b"the clause for `", hit.info.name, b".", hit.op.name, b"` binds ", num(bound), b" parameter", plural(bound), b", but the operation takes ", num(len(shape.params))]),
                  bytes_concat_all([b"expected ", num(len(shape.params)), b" parameters"]), hit.op.at, b"declared here", [])}
             } else {
-              let atom = { effect: hit.info.name, resource: resource_, mode: hit.op.mode };
+              let atom = { effect: hit.info.name, resource: resource_, mode: hit.op.mode, op: None };
               let key = { effect: hit.info.name, op: hit.op.name, res: resource_ };
               let dup = fold(acc.selected, false, |d: Bool, k: OpKey| d || k == key);
               let c0: Cx = if dup {
@@ -2095,7 +2105,7 @@ fn note_universal_clause(cx: Cx, info: EffectInfo, op: OpInfo) -> Cx = {
 fn region_type(name: Bytes) -> Type = con(bytes_concat(region_prefix(), name))
 
 fn cell_atoms(resource: Bytes) -> List<Atom> =
-  [{ effect: cell(), resource: RNamed(resource), mode: MRead }, { effect: cell(), resource: RNamed(resource), mode: MWrite }]
+  [{ effect: cell(), resource: RNamed(resource), mode: MRead, op: None }, { effect: cell(), resource: RNamed(resource), mode: MWrite, op: None }]
 
 fn region_is_open(cx: Cx, name: Bytes) -> Bool = fold(cx.open_regions, false, |acc: Bool, r: OpenRegion| acc || r.name == name)
 
