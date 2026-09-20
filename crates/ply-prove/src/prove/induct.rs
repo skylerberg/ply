@@ -9,7 +9,7 @@
 
 use super::context::Context;
 use super::lower::{Blocker, Lowering, Measure};
-use super::term::{self, TermId, is_int_type};
+use super::term::{self, Node, TermId, is_int_type, list_elem};
 use super::{
     Goal, Limits, Proof, RuleLog, conjunction, domain_inhabited, int_ranges, ranges_of, run,
 };
@@ -57,10 +57,15 @@ pub(super) fn attempt(
     }
     let result_slot = goal.result.map(|_| goal.binders.len().saturating_sub(1));
     for (slot, binder) in goal.binders.iter().enumerate() {
-        if !is_int_type(&binder.ty) || Some(slot) == result_slot {
+        let over_list = list_elem(&binder.ty).is_some();
+        if !(is_int_type(&binder.ty) || over_list) || Some(slot) == result_slot {
             continue;
         }
-        let (proved, used) = induct_on(ctx, goal, limits, budget, &recursive, slot, blockers);
+        let (proved, used) = if over_list {
+            induct_list(ctx, goal, limits, budget, &recursive, slot, blockers)
+        } else {
+            induct_on(ctx, goal, limits, budget, &recursive, slot, blockers)
+        };
         spent += used;
         budget -= used;
         if let Some(mut proof) = proved {
@@ -97,7 +102,7 @@ fn terminating(
     }
     let mut used = 0u32;
     for (slot, ty) in params.iter().enumerate() {
-        if !is_int_type(ty) || budget <= used {
+        if !(is_int_type(ty) || list_elem(ty).is_some()) || budget <= used {
             continue;
         }
         let mut rules = RuleLog::default();
@@ -354,6 +359,237 @@ fn induct_on(
         }),
         spent,
     )
+}
+
+/// The claim at `[]`, then at `[h, ..t]` from its instance at `t`. Each instance is its own
+/// lowering, so `len` and the matches in reach reduce over the spine they are given.
+fn induct_list(
+    ctx: &Context<'_>,
+    goal: &Goal<'_>,
+    limits: &Limits,
+    budget: u32,
+    recursive: &BTreeSet<Symbol>,
+    slot: usize,
+    blockers: &mut Vec<Blocker>,
+) -> (Option<Proof>, u32) {
+    let binder = goal.binders[slot].name.clone();
+    let declined = |blockers: &mut Vec<Blocker>, what: &str| {
+        blockers.push(Blocker::Induction(format!("on `{binder}`: {what}")));
+    };
+    if goal.result.is_some() {
+        declined(
+            blockers,
+            "a clause with a `result` is not inducted over a list",
+        );
+        return (None, 0);
+    }
+    let mut rules = RuleLog::default();
+    let mut lowering = Lowering::new(ctx, &mut rules, limits.unfold_depth);
+    lowering.set_total(recursive.clone());
+    lowering.set_unrolling(recursive.clone());
+    let bound: Vec<TermId> = goal
+        .binders
+        .iter()
+        .map(|binder| lowering.bind_symbolic(&binder.ty))
+        .collect();
+    let sort = goal.binders[slot].ty.clone();
+    let elem = list_elem(&sort).cloned();
+    let nil = lowering.terms.nil(Some(sort.clone()));
+    let head = lowering.terms.sym(elem);
+    let tail = lowering.terms.sym(Some(sort.clone()));
+    let cons = lowering.terms.cons(head, tail, Some(sort));
+
+    let base = instance(&mut lowering, goal, &bound, slot, nil);
+    let step = instance(&mut lowering, goal, &bound, slot, cons);
+    let claim_calls = lowering.calls().to_vec();
+    // A remaining call over a tail the patterns took off the instance is one the hypothesis speaks for.
+    let structural: BTreeSet<TermId> = claim_calls
+        .iter()
+        .copied()
+        .filter(|c| match lowering.terms.node(*c) {
+            Node::App { args, .. } => args
+                .iter()
+                .any(|a| lowering.smaller_than(*a, cons) || lowering.smaller_than(*a, nil)),
+            _ => false,
+        })
+        .collect();
+
+    lowering.set_unrolling(BTreeSet::new());
+    let hyp = instance(&mut lowering, goal, &bound, slot, tail);
+    let covered: BTreeSet<TermId> = lowering.calls()[claim_calls.len()..]
+        .iter()
+        .copied()
+        .collect();
+    let defined: BTreeSet<TermId> = lowering.defined().iter().copied().collect();
+    if claim_calls
+        .iter()
+        .any(|c| !covered.contains(c) && !defined.contains(c) && !structural.contains(c))
+    {
+        declined(
+            blockers,
+            "a remaining call is not one the hypothesis reaches",
+        );
+        return (None, 0);
+    }
+    let equations = lowering.equations().to_vec();
+    if lowering.unsupported() {
+        declined(blockers, "a Float");
+        return (None, 0);
+    }
+    let mut terms = lowering.finish();
+    let in_question: BTreeSet<TermId> = covered
+        .iter()
+        .chain(&defined)
+        .chain(&structural)
+        .copied()
+        .collect();
+    let ranges = int_ranges(&mut terms, None, &in_question);
+
+    let mut spent = 0u32;
+    let mut budget = budget;
+    for case in [&base, &step] {
+        if let Some(conjoined) = conjunction(&mut terms, &case.guard_needs) {
+            let mut assertions = ranges.clone();
+            assertions.push((conjoined, false));
+            if !settle(
+                &mut terms,
+                ctx,
+                &mut rules,
+                limits,
+                &mut budget,
+                &mut spent,
+                &assertions,
+            ) {
+                declined(blockers, "the guard can raise");
+                return (None, spent);
+            }
+        }
+    }
+    let base_claim = base.claim(&mut terms);
+    let step_claim = step.claim(&mut terms);
+    let hypothesis = {
+        let held = hyp.claim(&mut terms);
+        match conjunction(&mut terms, &hyp.guards) {
+            Some(guard) => {
+                let unguarded = terms.not(guard);
+                terms.mk(term::Node::Or(unguarded, held), Some(Type::bool()))
+            }
+            None => held,
+        }
+    };
+    let mut common = ranges;
+    common.extend(equations.iter().map(|e| (*e, true)));
+
+    let mut assertions = common.clone();
+    assertions.extend(base.guards.iter().map(|g| (*g, true)));
+    assertions.push((base_claim, false));
+    if !settle(
+        &mut terms,
+        ctx,
+        &mut rules,
+        limits,
+        &mut budget,
+        &mut spent,
+        &assertions,
+    ) {
+        declined(
+            blockers,
+            &format!("the base case is open{}", ran_out(budget)),
+        );
+        return (None, spent);
+    }
+    let mut assertions = common;
+    assertions.extend(step.guards.iter().map(|g| (*g, true)));
+    assertions.push((hypothesis, true));
+    assertions.extend(ranges_of(&mut terms, covered.iter().copied()));
+    assertions.push((step_claim, false));
+    if !settle(
+        &mut terms,
+        ctx,
+        &mut rules,
+        limits,
+        &mut budget,
+        &mut spent,
+        &assertions,
+    ) {
+        declined(blockers, &format!("the step is open{}", ran_out(budget)));
+        return (None, spent);
+    }
+
+    let guard_satisfiable = domain_inhabited(ctx, goal.binders)
+        && match conjunction(&mut terms, &step.guards) {
+            None => true,
+            Some(all) => {
+                let mut ignored = RuleLog::default();
+                settle(
+                    &mut terms,
+                    ctx,
+                    &mut ignored,
+                    limits,
+                    &mut budget,
+                    &mut spent,
+                    &[(all, false)],
+                )
+            }
+        };
+    (
+        Some(Proof {
+            rules: rules.into_rules(),
+            steps: spent,
+            sorts: uninterpreted_sorts(ctx, goal.binders),
+            guard_satisfiable,
+        }),
+        spent,
+    )
+}
+
+/// The claim lowered with the binder at `at`: its guards, what they owe, its body and what it owes.
+struct Instance {
+    guards: Vec<TermId>,
+    guard_needs: Vec<TermId>,
+    body: TermId,
+    needs: Vec<TermId>,
+}
+
+impl Instance {
+    fn claim(&self, terms: &mut term::Terms) -> TermId {
+        match conjunction(terms, &self.needs) {
+            Some(needs) => terms.mk(term::Node::And(self.body, needs), Some(Type::bool())),
+            None => self.body,
+        }
+    }
+}
+
+fn instance(
+    lowering: &mut Lowering<'_, '_>,
+    goal: &Goal<'_>,
+    bound: &[TermId],
+    slot: usize,
+    at: TermId,
+) -> Instance {
+    let mut bound = bound.to_vec();
+    bound[slot] = at;
+    lowering.drop_assumptions();
+    let before = lowering.requirement_mark();
+    let guards: Vec<TermId> = goal
+        .guards
+        .iter()
+        .map(|guard| {
+            let lowered = lowering.lower_root(guard, &bound);
+            lowering.assume(lowered);
+            lowered
+        })
+        .collect();
+    let guard_mark = lowering.requirement_mark();
+    let body = lowering.lower_root(goal.body, &bound);
+    let after = lowering.requirement_mark();
+    let requirements = lowering.requirements();
+    Instance {
+        guards,
+        guard_needs: requirements[before..guard_mark].to_vec(),
+        body,
+        needs: requirements[guard_mark..after].to_vec(),
+    }
 }
 
 /// One refutation on the shared budget; `true` when the assertions are contradictory.

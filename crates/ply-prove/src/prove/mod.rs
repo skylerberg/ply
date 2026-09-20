@@ -280,20 +280,31 @@ fn int_ranges(
     ranges_of(terms, atoms)
 }
 
+/// `Int` atoms lie in `i64`; a `len` lies in `[0, i64::MAX)`, since no list has that many elements.
 fn ranges_of(
     terms: &mut term::Terms,
     atoms: impl IntoIterator<Item = term::TermId>,
 ) -> Vec<(term::TermId, bool)> {
-    let atoms: Vec<term::TermId> = atoms.into_iter().collect();
+    let atoms: Vec<term::TermId> = atoms
+        .into_iter()
+        .filter(|a| terms.sort(*a).is_some_and(term::is_int_type))
+        .collect();
     let min = terms.int_lit(i64::MIN);
     let max = terms.int_lit(i64::MAX);
+    let zero = terms.int_lit(0);
+    let below_max = terms.int_lit(i64::MAX - 1);
     let mut out = Vec::with_capacity(atoms.len() * 2);
     for atom in atoms {
+        let (lo, hi) = if is_length(terms, atom) {
+            (zero, below_max)
+        } else {
+            (min, max)
+        };
         let low = terms.mk(
             term::Node::Cmp {
                 op: term::CmpOp::Ge,
                 lhs: atom,
-                rhs: min,
+                rhs: lo,
             },
             Some(Type::bool()),
         );
@@ -301,7 +312,7 @@ fn ranges_of(
             term::Node::Cmp {
                 op: term::CmpOp::Le,
                 lhs: atom,
-                rhs: max,
+                rhs: hi,
             },
             Some(Type::bool()),
         );
@@ -309,6 +320,11 @@ fn ranges_of(
         out.push((high, true));
     }
     out
+}
+
+fn is_length(terms: &term::Terms, t: term::TermId) -> bool {
+    matches!(terms.node(t), term::Node::App { head, .. }
+        if matches!(terms.node(*head), term::Node::Opaque(name) if name.as_str() == "len"))
 }
 
 /// Terms containing `root`, in one pass: the interner builds children before their parents.
@@ -342,7 +358,9 @@ fn children(node: &term::Node) -> Vec<term::TermId> {
             out.extend(args);
             out
         }
-        term::Node::Ctor { args, .. } | term::Node::List(args) => args.clone(),
+        term::Node::Ctor { args, .. } => args.clone(),
+        term::Node::Nil => Vec::new(),
+        term::Node::Cons { head, tail } => vec![*head, *tail],
         term::Node::Record(fields) => fields.iter().map(|(_, v)| *v).collect(),
         term::Node::Field { base, .. } => vec![*base],
         term::Node::Not(a) => vec![*a],

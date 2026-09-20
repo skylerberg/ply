@@ -87,7 +87,8 @@ pub enum Shape<'a> {
     /// Normalized by [`Terms::decimal`](super::term::Terms::decimal): shapes differ iff values do.
     Decimal(i128, u32),
     Ctor(&'a Node),
-    List(usize),
+    Nil,
+    Cons,
     Record(&'a Node),
 }
 
@@ -98,7 +99,12 @@ pub fn shape_of<'a>(terms: &'a Terms, t: TermId) -> Option<Shape<'a>> {
         Node::Str(s) => Some(Shape::Str(s)),
         Node::Decimal { mantissa, scale } => Some(Shape::Decimal(*mantissa, *scale)),
         Node::Ctor { .. } => Some(Shape::Ctor(terms.node(t))),
-        Node::List(items) => Some(Shape::List(items.len())),
+        Node::Nil => Some(Shape::Nil),
+        Node::Cons { .. } => Some(Shape::Cons),
+        // `push` always answers a cons, so its result is never `[]`.
+        Node::App { head, .. } if matches!(terms.node(*head), Node::Opaque(name) if name.as_str() == "push") => {
+            Some(Shape::Cons)
+        }
         Node::Record(_) => Some(Shape::Record(terms.node(t))),
         _ => None,
     }
@@ -111,7 +117,8 @@ pub fn conflict(a: &Shape<'_>, b: &Shape<'_>) -> Option<bool> {
         (Shape::Bool(x), Shape::Bool(y)) => Some(x != y),
         (Shape::Str(x), Shape::Str(y)) => Some(x != y),
         (Shape::Decimal(m1, s1), Shape::Decimal(m2, s2)) => Some((m1, s1) != (m2, s2)),
-        (Shape::List(x), Shape::List(y)) => Some(x != y),
+        (Shape::Nil, Shape::Nil) | (Shape::Cons, Shape::Cons) => Some(false),
+        (Shape::Nil, Shape::Cons) | (Shape::Cons, Shape::Nil) => Some(true),
         (Shape::Ctor(Node::Ctor { name: x, .. }), Shape::Ctor(Node::Ctor { name: y, .. })) => {
             Some(x != y)
         }
