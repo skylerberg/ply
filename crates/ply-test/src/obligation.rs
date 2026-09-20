@@ -147,7 +147,7 @@ impl Answer {
 /// A proof may only sit under the bare key, and a sample only under this plan's key.
 pub fn lookup(store: &Store, key: DefHash, plan: &ProvePlan) -> Answer {
     if let Some(entry) = store.obligation(key) {
-        return match from_cached(entry) {
+        return match from_cached(&entry) {
             Ok(evidence @ Evidence::Proof(_)) => Answer {
                 reason: Reason::Proved,
                 evidence: Some(evidence),
@@ -163,7 +163,7 @@ pub fn lookup(store: &Store, key: DefHash, plan: &ProvePlan) -> Answer {
     let Some(entry) = store.obligation(prove_key(key, plan)) else {
         return Answer::miss(Reason::New);
     };
-    match from_cached(entry) {
+    match from_cached(&entry) {
         Ok(evidence @ Evidence::Cases(_)) => Answer {
             reason: Reason::Sampled,
             evidence: Some(evidence),
