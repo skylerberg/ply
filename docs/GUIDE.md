@@ -469,7 +469,9 @@ function of program state (§8.3). Effects are nominal. `task`, `clock`,
 An atom is `effect.mode[resource]`, or `effect.mode` for a singleton. A row is a
 set of atoms with an optional tail variable: `/ {db.read[users], clock.read}`,
 `/ {net.write[conn] | e}`, `/ e`, `/ {}`. Qualified atoms use `::`:
-`/ {store::db.read[users]}`.
+`/ {store::db.read[users]}`. An atom may instead name an operation,
+`net.send[conn]`, which the mode atom of the same effect and resource
+(`net.write[conn]`) covers; a written row does not yet accept one (`E0104`).
 
 Resource labels are global — two modules writing `[users]` name one resource —
 and cannot be abstracted over. Two atoms **conflict** iff they name the same

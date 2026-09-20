@@ -6,7 +6,8 @@ import types (Mode, MRead, MWrite, MBad)
 
 pub type Resource = | RNamed(Bytes) | RSingleton
 
-pub type Atom = { effect: Bytes, resource: Resource, mode: Mode }
+// `op: None` is the mode atom `effect.mode[resource]`; `Some` names one operation of that effect.
+pub type Atom = { effect: Bytes, resource: Resource, mode: Mode, op: Option<Bytes> }
 
 // `atoms` stays sorted by `atom_lt` and duplicate-free.
 pub type Row = { atoms: List<Atom>, tail: Option<Int> }
@@ -21,10 +22,25 @@ fn resource_lt(a: Resource, b: Resource) -> Bool =
 
 fn mode_rank(m: Mode) -> Int = match m { MRead -> 0, MWrite -> 1, MBad -> 2 }
 
+fn op_lt(a: Option<Bytes>, b: Option<Bytes>) -> Bool =
+  match a {
+    None -> (match b { Some(_) -> true, None -> false }),
+    Some(x) -> (match b { Some(y) -> bytes_lt(x, y), None -> false }),
+  }
+
 pub fn atom_lt(a: Atom, b: Atom) -> Bool =
   bytes_lt(a.effect, b.effect)
   || (a.effect == b.effect && (resource_lt(a.resource, b.resource)
-     || (a.resource == b.resource && mode_rank(a.mode) < mode_rank(b.mode))))
+     || (a.resource == b.resource && (mode_rank(a.mode) < mode_rank(b.mode)
+     || (mode_rank(a.mode) == mode_rank(b.mode) && op_lt(a.op, b.op))))))
+
+// The mode atom of an effect and resource covers every operation atom of the same mode.
+pub fn atom_covers(a: Atom, b: Atom) -> Bool =
+  a.effect == b.effect && a.resource == b.resource
+  && (a == b || (match a.op { None -> mode_rank(a.mode) == mode_rank(b.mode), Some(_) -> false }))
+
+pub fn atoms_covered(xs: List<Atom>, x: Atom) -> Bool =
+  fold(xs, false, |acc: Bool, y: Atom| acc || atom_covers(y, x))
 
 pub fn atom_conflicts(a: Atom, b: Atom) -> Bool =
   a.effect == b.effect && a.resource == b.resource
@@ -506,7 +522,9 @@ pub fn region_of(t: Type) -> Option<Bytes> =
 pub fn resource_text(r: Resource) -> Bytes = match r { RNamed(s) -> bytes_concat_all([b"[", s, b"]"]), RSingleton -> b"" }
 
 pub fn atom_text(a: Atom) -> Bytes =
-  bytes_concat_all([a.effect, b".", match a.mode { MRead -> b"read", MWrite -> b"write", MBad -> b"" }, resource_text(a.resource)])
+  bytes_concat_all([a.effect, b".",
+                    match a.op { Some(op) -> op, None -> match a.mode { MRead -> b"read", MWrite -> b"write", MBad -> b"" } },
+                    resource_text(a.resource)])
 
 fn join_bytes(xs: List<Bytes>, sep: Bytes) -> Bytes =
   fold(range(0, len(xs)), b"", |acc: Bytes, i: Int| if i == 0 { at(xs, i) } else { bytes_concat_all([acc, sep, at(xs, i)]) })
@@ -599,13 +617,30 @@ test "unification binds a variable once and refuses the occurs case" {
 }
 
 test "a row unifies atom-wise and a closed row refuses what it lacks" {
-  let db = { effect: b"db", resource: RNamed(b"users"), mode: MRead };
+  let db = { effect: b"db", resource: RNamed(b"users"), mode: MRead, op: None };
   let f0 = fresh_new();
   let e = fresh_row(f0);
   let u = unify_row(subst_new(), e.f, e.r, row_singleton(db));
   assert_eq(row_text(resolve_row(u.s, e.r)), b"{db.read[users]}");
   let bad = unify_row(u.s, u.f, row_empty(), row_singleton(db));
   assert(match bad.err { Some(RowMismatch(_)) -> true, _ -> false })
+}
+
+test "an operation atom sorts after its mode atom, which covers it" {
+  let wr = { effect: b"net", resource: RNamed(b"conn"), mode: MWrite, op: None };
+  let send = { effect: b"net", resource: RNamed(b"conn"), mode: MWrite, op: Some(b"send") };
+  let recv = { effect: b"net", resource: RNamed(b"conn"), mode: MWrite, op: Some(b"recv") };
+  let rd = { effect: b"net", resource: RNamed(b"conn"), mode: MRead, op: None };
+  assert(atom_lt(wr, send));
+  assert(!atom_lt(send, wr));
+  assert(atom_lt(recv, send));
+  assert_eq(row_text(row_closed([send, wr, recv])), b"{net.write[conn], net.recv[conn], net.send[conn]}");
+  assert(atom_covers(wr, send));
+  assert(atom_covers(send, send));
+  assert(!atom_covers(send, wr));
+  assert(!atom_covers(rd, send));
+  assert(atoms_covered([rd, wr], send));
+  assert(!atoms_covered([rd], send))
 }
 
 test "the printer names variables in the order it meets them, rows apart" {

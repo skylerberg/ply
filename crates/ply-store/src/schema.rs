@@ -20,6 +20,8 @@ pub const COVERED: &[&str] = &[
     "Resource::Singleton",
     "Mode::Read",
     "Mode::Write",
+    "EffectAtom::mode",
+    "EffectAtom::op",
     "DeclBody::Type",
     "DeclBody::Effect",
     "DefKind::Fn",
@@ -55,6 +57,7 @@ fn footprint() -> Footprint {
     Footprint::from_atoms([
         atom("db", Resource::Named(sym("users")), Mode::Read),
         atom("clock", Resource::Singleton, Mode::Write),
+        EffectAtom::operation("net", Resource::Named(sym("conn")), "send"),
     ])
 }
 
