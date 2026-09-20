@@ -367,8 +367,10 @@ fn ply_hosts_lists_the_sink_per_channel_and_names_the_one_that_serves_the_run() 
             && r["blocking"] == false),
         "{listing:#}"
     );
-    // Twelve rows: six operations over the two channels this program records on.
-    assert_eq!(traced.len(), 12, "{listing:#}");
+    // Four rows: `enter`, `exit` and `count` on `orders`, `event` on `items`; an operation the
+    // program never performs on a channel is not a row, and `std.trace`'s own `orders` rows are
+    // the same rows.
+    assert_eq!(traced.len(), 4, "{listing:#}");
 }
 
 #[test]

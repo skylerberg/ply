@@ -1926,9 +1926,11 @@ pub unsafe extern "C" fn rt_perform(
         if mode != 0 { Mode::Write } else { Mode::Read },
         op.clone(),
     );
+    // A step's footprint is what it conflicts on, which is the mode; the scheduled operation's
+    // own access (`OpSignature::step_access`) is that same mode atom.
     if !c.sims.is_empty() {
         c.trail
-            .record_access(ply_eval::sim::Access::Atom(atom.clone()));
+            .record_access(ply_eval::sim::Access::Atom(atom.mode_atom()));
     }
     c.performed.push(atom);
     let mut found = None;

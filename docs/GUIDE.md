@@ -1107,8 +1107,9 @@ always runs and is never cached. `std.signal` and `std.process` are bound only
 by `ply run --host`; `ply test --host` withholds them (`E0424`). All flags
 below require `--host`.
 
-`ply hosts` lists every bindable operation (`effect.op[resource]`, one row per
-resource label the program uses) with its handler, determinism,
+`ply hosts` lists every bindable operation (`effect.op[resource]`: one row per
+operation and label some row of the program names, where a written mode atom
+names every operation of its mode) with its handler, determinism,
 `at-most-once`/`repeatable`, blocking and `Secret` permission, plus the run's
 TLS, filesystem, database, configuration, tracing and shutdown settings;
 `--digest` prints one `b3:` line. A handler for something undeclared is `E0421`,
