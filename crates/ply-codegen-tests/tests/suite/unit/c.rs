@@ -793,9 +793,17 @@ fn changing_a_signature_asks_the_emitter_for_the_definition_and_its_callers() {
     let _ = produced(before);
     ply_codegen::c::producer::reset_census();
     let retyped = produced(after);
+    let wanted: Vec<Vec<String>> = ply_codegen::c::producer::census()
+        .wanted
+        .into_iter()
+        .map(|mut entry| {
+            entry.sort();
+            entry
+        })
+        .collect();
     assert_eq!(
-        ply_codegen::c::producer::census().wanted,
-        vec![vec!["m.leaf".to_string(), "m.caller".to_string()]],
+        wanted,
+        vec![vec!["m.caller".to_string(), "m.leaf".to_string()]],
         "the emitter was not entered once, for `leaf` and its caller"
     );
     let cold = produced(keyed_by_hash(&as_bool, "-cold"));
@@ -904,5 +912,130 @@ pub fn wrap(n: Int) -> List<Bytes> = [byte_of_int(n)]
         text.matches("ply_inc(").count(),
         0,
         "a count was taken on a word the helper had already counted:\n{text}"
+    );
+}
+
+/// The unit's C up to its embedded table, and a body's text within it.
+mod numbering_support {
+    pub fn code(text: &str) -> &str {
+        text.split("/* --- what this unit says about itself")
+            .next()
+            .expect("a split has a first piece")
+    }
+
+    pub fn body<'a>(text: &'a str, symbol: &str) -> &'a str {
+        let at = text
+            .find(&format!("Word {symbol}(PlyCtx *ctx"))
+            .unwrap_or_else(|| panic!("the unit has no body for `{symbol}`"));
+        let body = &text[at..];
+        &body[..body.find("\n}\n").map_or(body.len(), |end| end + 3)]
+    }
+
+    pub fn produce(
+        source: &'static ply_codegen::Source,
+        names: &[String],
+    ) -> ply_codegen::c::Produced {
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let _config = super::CONFIG.read().unwrap_or_else(|e| e.into_inner());
+        let produced = ply_codegen::c::produce(source, &refs).expect("the program emits");
+        assert!(produced.refused.is_empty(), "{:?}", produced.refused);
+        produced
+    }
+}
+
+/// `zz` and everything it adds to the tables sort last, so no rank an earlier body resolved to moves.
+#[test]
+fn a_definition_added_to_a_program_leaves_every_other_body_as_it_was() {
+    let base = r#"
+type Pair = { left: Int, right: Int }
+fn key(x: Int) -> Int = x + 1
+pub fn many(xs: List<Int>) -> Int = fold(map(xs, key), 0, |a: Int, x: Int| a + x)
+pub fn named(p: Pair) -> Bytes = if p.left > p.right { b"alpha" } else { b"beta" }
+"#;
+    let grown = format!(
+        "{base}pub fn zz(xs: List<Int>) -> Bytes = \
+         if fold(xs, many(xs), |a: Int, x: Int| a + x) > 0 {{ b\"~tilde\" }} else {{ b\"alpha\" }}\n"
+    );
+    let (Some(small), Some(large)) = (tests_support::keyed(base), tests_support::keyed(&grown))
+    else {
+        return;
+    };
+    let small = numbering_support::produce(small, &small.functions());
+    let large = numbering_support::produce(large, &large.functions());
+    let kept: std::collections::HashSet<&str> =
+        numbering_support::code(&large.text).lines().collect();
+    let moved: Vec<&str> = numbering_support::code(&small.text)
+        .lines()
+        .filter(|l| !kept.contains(l))
+        .collect();
+    assert!(
+        moved.is_empty(),
+        "adding `zz` changed lines of the unit that are not its own:\n{}",
+        moved.join("\n")
+    );
+    let _ = numbering_support::body(&large.text, "ply_m_zz");
+    assert_eq!(large.exports.consts.len(), small.exports.consts.len() + 1);
+    assert_eq!(large.exports.fields, small.exports.fields);
+    assert_eq!(large.exports.builtins, small.exports.builtins);
+    assert_eq!(large.exports.shapes, small.exports.shapes);
+    assert!(
+        large.exports.lambdas.starts_with(&small.exports.lambdas),
+        "the code table was not appended to: {:?} then {:?}",
+        small.exports.lambdas,
+        large.exports.lambdas
+    );
+}
+
+#[test]
+fn a_constant_two_definitions_share_is_one_entry_of_the_pool() {
+    let source = r#"
+pub fn one(n: Int) -> Bytes = if n > 0 { b"shared-constant" } else { b"one" }
+pub fn two(n: Int) -> Bytes = if n > 0 { b"shared-constant" } else { b"two" }
+"#;
+    let Some(loaded) = tests_support::keyed(source) else {
+        return;
+    };
+    let produced = numbering_support::produce(loaded, &loaded.functions());
+    let shared: Vec<usize> = produced
+        .exports
+        .consts
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| matches!(v, ply_eval::Value::Bytes(b) if &b[..] == b"shared-constant"))
+        .map(|(i, _)| i)
+        .collect();
+    let [at] = shared.as_slice() else {
+        panic!("the pool holds the constant {} times", shared.len());
+    };
+    for symbol in ["ply_m_one", "ply_m_two"] {
+        let body = numbering_support::body(&produced.text, symbol);
+        assert!(
+            body.contains(&format!("rt_lit_p(ctx, {at})")),
+            "`{symbol}` does not read the shared constant from its one entry:\n{body}"
+        );
+    }
+}
+
+#[test]
+fn a_unit_is_the_same_bytes_however_its_definitions_are_offered() {
+    let source = r#"
+type Pair = { left: Int, right: Int }
+fn key(x: Int) -> Int = x + 1
+pub fn sum(xs: List<Int>) -> Int = fold(map(xs, key), 0, |a: Int, x: Int| a + x)
+pub fn pick(p: Pair) -> Bytes = if p.left > p.right { b"left" } else { b"right" }
+pub fn steady() -> Int = 7
+"#;
+    let Some(loaded) = tests_support::keyed(source) else {
+        return;
+    };
+    let forward = loaded.functions();
+    let mut backward = forward.clone();
+    backward.reverse();
+    assert!(forward.len() > 1 && forward != backward);
+    let first = numbering_support::produce(loaded, &forward);
+    let second = numbering_support::produce(loaded, &backward);
+    assert_eq!(
+        first.text, second.text,
+        "the order the definitions were offered in reached the unit"
     );
 }
