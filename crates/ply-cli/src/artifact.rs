@@ -933,7 +933,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     let hosts = match crate::hosts::Hosts::open_stopping(
         &opened.front.check,
         args.host,
-        &args.tls.tls,
+        &args.tls,
         &args.fs.fs,
         db,
         configuration,
