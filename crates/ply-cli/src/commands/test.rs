@@ -734,7 +734,7 @@ impl Cache {
         }
         match Store::open(root) {
             Ok(store) => Ok(Cache {
-                store,
+                store: store.with_upstream(ply_store::Upstream::from_env()),
                 scratch: None,
                 warnings: Vec::new(),
             }),

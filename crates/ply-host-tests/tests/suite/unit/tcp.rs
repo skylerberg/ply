@@ -25,6 +25,9 @@ fn every_op(port: Int, payload: Bytes) -> Int / {net.write[listener], net.write[
   bytes_len(bytes_or_empty(got)) + int_or_zero(sent)
 }
 
+fn client(host: String, port: Int) -> Int / {net.write[conn]} =
+  match net.connect[conn](host, port, 5000) { Some(c) -> c, None -> 0 }
+
 fn bytes_or_empty(answer: Option<Bytes>) -> Bytes =
   match answer { Some(bs) -> bs, None -> b"" }
 
@@ -139,6 +142,8 @@ fn the_listing_is_one_row_per_triple_and_never_a_star() {
             "std.net.net.accept[listener] std.net.net.write[listener] ply_host::tcp::accept",
             "std.net.net.close[conn] std.net.net.write[conn] ply_host::tcp::close",
             "std.net.net.close[listener] std.net.net.write[listener] ply_host::tcp::close",
+            "std.net.net.connect[conn] std.net.net.write[conn] ply_host::tcp::connect",
+            "std.net.net.connect[listener] std.net.net.write[listener] ply_host::tcp::connect",
             "std.net.net.listen[conn] std.net.net.write[conn] ply_host::tcp::listen",
             "std.net.net.listen[listener] std.net.net.write[listener] ply_host::tcp::listen",
             // The only row saying the program serves TLS; its other is a plain `net.write[..]`.
@@ -716,6 +721,98 @@ fn read_to_end(binding: &HostBinding, rt: &dyn HostRuntime, conn: i64) -> Vec<u8
         }
         got.extend_from_slice(&chunk);
     }
+}
+
+#[test]
+fn an_outbound_connection_is_made_and_served_end_to_end() {
+    let net = Arc::new(TcpHost::new());
+    let binding = bind(net.clone());
+    let server = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a port");
+    let port = server.local_addr().expect("an address").port();
+    let peer = std::thread::spawn(move || {
+        let (mut stream, _) = server.accept().expect("the host connects");
+        let mut request = vec![0u8; REQUEST.len()];
+        stream
+            .read_exact(&mut request)
+            .expect("the request arrives");
+        stream.write_all(RESPONSE).expect("the response goes");
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("the peer stops sending");
+        request
+    });
+
+    let conn = int(perform(
+        &binding,
+        net.as_ref(),
+        Op::Connect,
+        "conn",
+        vec![
+            Value::str("localhost"),
+            Value::Int(i64::from(port)),
+            Value::Int(5000),
+        ],
+    )
+    .expect("a connect"));
+    assert!(conn > 0);
+    let sent = int(perform(
+        &binding,
+        net.as_ref(),
+        Op::Send,
+        "conn",
+        vec![Value::Int(conn), Value::bytes(REQUEST), Value::Int(5000)],
+    )
+    .expect("a send"));
+    assert_eq!(sent, REQUEST.len() as i64);
+    assert_eq!(read_to_end(&binding, net.as_ref(), conn), RESPONSE);
+    close(&binding, net.as_ref(), conn, "conn");
+    assert_eq!(peer.join().expect("the peer finished"), REQUEST);
+    assert_eq!(net.outstanding(), 0, "every blocking operation was reaped");
+}
+
+#[test]
+fn a_host_that_cannot_be_reached_is_none_rather_than_a_failure() {
+    let net = Arc::new(TcpHost::new());
+    let binding = bind(net.clone());
+    // A port nothing listens on: bound, then released, so the connect is refused at once.
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("a port")
+        .local_addr()
+        .expect("an address")
+        .port();
+    let answer = perform(
+        &binding,
+        net.as_ref(),
+        Op::Connect,
+        "conn",
+        vec![
+            Value::str("127.0.0.1"),
+            Value::Int(i64::from(port)),
+            Value::Int(2000),
+        ],
+    )
+    .expect("an answer");
+    assert!(
+        matches!(&answer, Value::Ctor { name, .. } if name.as_str() == "None"),
+        "{answer}"
+    );
+    let answer = perform(
+        &binding,
+        net.as_ref(),
+        Op::Connect,
+        "conn",
+        vec![
+            Value::str("no.such.host.invalid"),
+            Value::Int(80),
+            Value::Int(2000),
+        ],
+    )
+    .expect("an answer");
+    assert!(
+        matches!(&answer, Value::Ctor { name, .. } if name.as_str() == "None"),
+        "{answer}"
+    );
+    assert_eq!(net.outstanding(), 0);
 }
 
 fn speak(addr: SocketAddr) -> std::thread::JoinHandle<Vec<u8>> {

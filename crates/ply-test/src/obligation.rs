@@ -147,7 +147,7 @@ impl Answer {
 /// A proof may only sit under the bare key, and a sample only under this plan's key.
 pub fn lookup(store: &Store, key: DefHash, plan: &ProvePlan) -> Answer {
     if let Some(entry) = store.obligation(key) {
-        return match from_cached(entry) {
+        return match from_cached(&entry) {
             Ok(evidence @ Evidence::Proof(_)) => Answer {
                 reason: Reason::Proved,
                 evidence: Some(evidence),
@@ -163,7 +163,7 @@ pub fn lookup(store: &Store, key: DefHash, plan: &ProvePlan) -> Answer {
     let Some(entry) = store.obligation(prove_key(key, plan)) else {
         return Answer::miss(Reason::New);
     };
-    match from_cached(entry) {
+    match from_cached(&entry) {
         Ok(evidence @ Evidence::Cases(_)) => Answer {
             reason: Reason::Sampled,
             evidence: Some(evidence),
@@ -261,6 +261,10 @@ fn to_cached_rule(rule: &Rule) -> CachedRule {
             def: def.clone(),
             depth: *depth,
         },
+        Rule::Induction { binder, def } => CachedRule::Induction {
+            binder: binder.clone(),
+            def: def.clone(),
+        },
         Rule::ExhaustiveInterleaving { interleavings } => CachedRule::ExhaustiveInterleaving {
             interleavings: *interleavings,
         },
@@ -285,6 +289,10 @@ fn from_cached_rule(rule: &CachedRule) -> Rule {
         CachedRule::Unfold { def, depth } => Rule::Unfold {
             def: def.clone(),
             depth: *depth,
+        },
+        CachedRule::Induction { binder, def } => Rule::Induction {
+            binder: binder.clone(),
+            def: def.clone(),
         },
         CachedRule::ExhaustiveInterleaving { interleavings } => Rule::ExhaustiveInterleaving {
             interleavings: *interleavings,

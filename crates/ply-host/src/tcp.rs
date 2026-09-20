@@ -31,6 +31,7 @@ pub const MAX_RECV: usize = 1 << 20;
 pub enum Op {
     Listen,
     ListenTls,
+    Connect,
     Accept,
     Recv,
     Send,
@@ -38,9 +39,10 @@ pub enum Op {
 }
 
 impl Op {
-    pub const ALL: [Op; 6] = [
+    pub const ALL: [Op; 7] = [
         Op::Listen,
         Op::ListenTls,
+        Op::Connect,
         Op::Accept,
         Op::Recv,
         Op::Send,
@@ -51,6 +53,7 @@ impl Op {
         match self {
             Op::Listen => "listen",
             Op::ListenTls => "listen_tls",
+            Op::Connect => "connect",
             Op::Accept => "accept",
             Op::Recv => "recv",
             Op::Send => "send",
@@ -62,6 +65,7 @@ impl Op {
         match self {
             Op::Listen => "`net.listen`",
             Op::ListenTls => "`net.listen_tls`",
+            Op::Connect => "`net.connect`",
             Op::Accept => "`net.accept`",
             Op::Recv => "`net.recv`",
             Op::Send => "`net.send`",
@@ -73,12 +77,12 @@ impl Op {
         match self {
             Op::Listen | Op::Accept | Op::Close => 1,
             Op::ListenTls => 2,
-            Op::Recv | Op::Send => 3,
+            Op::Connect | Op::Recv | Op::Send => 3,
         }
     }
 
     fn waits(self) -> bool {
-        matches!(self, Op::Accept | Op::Recv | Op::Send)
+        matches!(self, Op::Connect | Op::Accept | Op::Recv | Op::Send)
     }
 
     pub fn declaration(self, net: &dyn Net) -> HostOp {
@@ -108,6 +112,15 @@ pub trait Net: Send + Sync {
         at: &Resource,
         port: u16,
         credential: &str,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic>;
+    /// `None` is a host that could not be reached before the deadline, whatever the reason.
+    fn connect(
+        &self,
+        at: &Resource,
+        host: &str,
+        port: u16,
+        timeout: Duration,
         span: Span,
     ) -> Result<HostAnswer, Diagnostic>;
     fn accept(&self, at: &Resource, listener: i64, span: Span) -> Result<HostAnswer, Diagnostic>;
@@ -238,6 +251,12 @@ impl HostHandler for Operation {
                 let port = port(self.op, req.args[0].as_int(span, "a port")?, span)?;
                 let credential = req.args[1].as_str(span, "a credential name")?;
                 self.net.listen_tls(at, port, credential, span)
+            }
+            Op::Connect => {
+                let host = req.args[0].as_str(span, "a host name")?;
+                let port = port(self.op, req.args[1].as_int(span, "a port")?, span)?;
+                let timeout = deadline(self.op, req.args[2].as_int(span, "a timeout")?, span)?;
+                self.net.connect(at, host, port, timeout, span)
             }
             Op::Accept => {
                 let listener = req.args[0].as_int(span, "a socket handle")?;
