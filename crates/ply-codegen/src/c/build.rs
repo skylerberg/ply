@@ -4,7 +4,7 @@
 use super::Refused;
 use super::exports::Exports;
 use super::load::{Library, compile_and_load};
-use super::tables::{Unit, mangle};
+use super::tables::{Unit, mangle, memo_symbol, root_id};
 use super::{HELPERS, PRELUDE, helper_addresses, runtime_decls};
 use crate::heap::{Heap, Word, mark_immortal};
 use crate::rt::Entry;
@@ -72,6 +72,8 @@ struct Emitted {
     bodies: Vec<(String, String)>,
     unit: Unit,
     taken: Vec<String>,
+    /// The pure nullary roots among `taken`, which the seam memoizes.
+    constants: Vec<String>,
     refusals: Vec<Refused>,
     phases: Phases,
 }
@@ -98,6 +100,8 @@ fn emit_all(
     ctors_digest: &str,
 ) -> Emitted {
     let mut taken: Vec<String> = offered.iter().map(|n| (*n).to_string()).collect();
+    // By name, so the unit is the same however the definitions were offered.
+    taken.sort();
     let mut refusals: Vec<Refused> = Vec::new();
     let mut phases = Phases::default();
     let started = Instant::now();
@@ -141,13 +145,24 @@ fn emit_all(
         refusals.extend(round);
     };
     phases.emit = started.elapsed();
-    let mut unit = Unit::new(ctors.to_vec());
-    // In `taken`'s order, which `describe` keeps: a body's place here is the root its sites name.
+    let constants: Vec<String> = taken
+        .iter()
+        .filter(|n| {
+            loaded.arity_of(n) == Some(0)
+                && ply_eval::memo::pure_by_published_row(Some(loaded.check), &Symbol::new(n))
+        })
+        .cloned()
+        .collect();
+    // An uncalled pure nullary root still needs a code-table row for its memo slot.
+    let unit = Unit::of(
+        ctors.to_vec(),
+        emitted.iter().map(|(_, _, tables)| tables),
+        constants.iter().map(|n| memo_symbol(n)),
+    );
     let bodies: Vec<(String, String)> = emitted
         .into_iter()
-        .enumerate()
-        .map(|(root, (name, text, tables))| {
-            let text = resolve(&text, &tables, root, &mut unit);
+        .map(|(name, text, tables)| {
+            let text = resolve(&text, &tables, root_id(&name), &unit);
             (name, text)
         })
         .collect();
@@ -189,6 +204,7 @@ fn emit_all(
         bodies,
         unit,
         taken,
+        constants,
         refusals,
         phases,
     }
@@ -224,6 +240,7 @@ fn produce_in(
         bodies,
         unit,
         taken,
+        constants,
         refusals,
         mut phases,
     } = emit_all(loaded, offered, fragment, ctors, ctors_digest);
@@ -232,7 +249,7 @@ fn produce_in(
         bail!("the Ply emitter failed over the program: {why}");
     }
     let started = Instant::now();
-    let exports = describe(loaded, unit, taken, &refusals, ctors);
+    let exports = describe(loaded, unit, taken, constants, &refusals, ctors);
     let embedded = exports.embed();
     phases.embed = started.elapsed();
     let text = assemble(&bodies, &exports, &embedded);
@@ -248,8 +265,9 @@ fn produce_in(
 /// What the unit says about itself: the only place a source is read, so loading reads none.
 fn describe(
     loaded: &'static Source,
-    mut unit: Unit,
+    unit: Unit,
     taken: Vec<String>,
+    constants: Vec<String>,
     refusals: &[Refused],
     ctors: &[(Symbol, usize)],
 ) -> Exports {
@@ -257,17 +275,6 @@ fn describe(
         .iter()
         .map(|n| (n.clone(), loaded.arity_of(n).unwrap_or(0)))
         .collect();
-    // A pure nullary function answers the same every time, so the seam memoizes it.
-    let constants: Vec<String> = taken
-        .iter()
-        .filter(|n| {
-            loaded.arity_of(n) == Some(0)
-                && ply_eval::memo::pure_by_published_row(Some(loaded.check), &Symbol::new(n))
-        })
-        .cloned()
-        .collect();
-    // For its effect on the code table: `finish` reads the same slots back.
-    let _ = constants_of(&constants, &mut unit);
     Exports {
         helpers: super::exports::runtime_helpers(),
         ctors: ctors.to_vec(),
@@ -281,7 +288,7 @@ fn describe(
         consts: unit.consts,
         fields: unit.fields,
         builtins: unit.builtins,
-        shapes: unit.layouts.all_shape_names(),
+        shapes: unit.shapes,
         lambdas: unit.lambdas,
     }
 }
@@ -409,20 +416,11 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
         lambdas,
     } = exports;
     bind(&lib)?;
-    let mut unit = Unit::new(ctors.clone());
-    unit.consts = consts;
-    unit.fields = fields;
-    unit.builtins = builtins;
-    unit.lambdas = lambdas;
-    // In id order, so the numbers baked into the emitted C still name these shapes.
-    for (id, names) in shapes.iter().enumerate() {
-        let got = unit.layouts.shape(names.clone());
-        if got as usize != id {
-            bail!("a unit's shapes do not intern to the ids its C was emitted against");
-        }
-    }
-    // Before the addresses: an uncalled root still needs a row in the code table for its memo slot.
-    let constants = constants_of(&constants, &mut unit);
+    let Some(unit) = Unit::from_tables(ctors.clone(), consts, fields, builtins, shapes, lambdas)
+    else {
+        bail!("a unit's tables are not in the order its C was emitted against");
+    };
+    let constants = constants_of(&constants, &unit)?;
     let mut functions = Vec::with_capacity(unit.lambdas.len());
     for symbol in &unit.lambdas {
         let Some(p) = lib.symbol(symbol) else {
@@ -432,7 +430,7 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
     }
     let mut entries = HashMap::new();
     for (name, arity) in &taken {
-        let symbol = format!("{}_entry", mangle(name));
+        let symbol = memo_symbol(name);
         let Some(p) = lib.symbol(&symbol) else {
             bail!("the unit the C tier built has no `{symbol}`");
         };
@@ -446,10 +444,12 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
     }
     let mut tables = tables_of(unit, &ctors);
     tables.functions = functions;
-    tables.roots = taken
-        .iter()
-        .map(|(name, _)| source.and_then(|s| s.span_of(name)).unwrap_or(Span::DUMMY))
-        .collect();
+    for (name, _) in &taken {
+        let span = source.and_then(|s| s.span_of(name)).unwrap_or(Span::DUMMY);
+        if tables.roots.insert(root_id(name), span).is_some() {
+            bail!("two roots of this unit share a site id");
+        }
+    }
     Ok(Native {
         lib,
         entries,
@@ -459,12 +459,15 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
 }
 
 /// Each pure nullary root's memo slot: its code-table row, so the seam and `rt_constant` agree.
-fn constants_of(constants: &[String], unit: &mut Unit) -> HashMap<String, usize> {
+fn constants_of(constants: &[String], unit: &Unit) -> Result<HashMap<String, usize>> {
     constants
         .iter()
         .map(|name| {
-            let slot = unit.lambda(&format!("{}_entry", mangle(name)));
-            (name.clone(), slot)
+            let symbol = memo_symbol(name);
+            let Some(slot) = unit.lambda(&symbol) else {
+                bail!("the unit's code table has no `{symbol}`");
+            };
+            Ok((name.clone(), slot))
         })
         .collect()
 }
@@ -553,18 +556,35 @@ fn emit_one(
     }
 }
 
-/// Rewrite a body's `@@kN@@` placeholders from its own table positions to the unit's; `@@r@@`
-/// is the body's own root.
-fn resolve(text: &str, tables: &super::tables::Tables, root: usize, unit: &mut Unit) -> String {
+/// Rewrite a body's `@@kN@@` placeholders from its own table positions to the unit's, which
+/// holds everything the body names; `@@r@@` is the body's own root.
+fn resolve(text: &str, tables: &super::tables::Tables, root: u64, unit: &Unit) -> String {
+    let named = "the unit's tables hold everything its bodies name";
     let consts: Vec<usize> = tables
         .consts
         .iter()
-        .map(|v| unit.constant(v.clone()))
+        .map(|v| unit.constant(v).expect(named))
         .collect();
-    let builtins: Vec<usize> = tables.builtins.iter().map(|b| unit.builtin(*b)).collect();
-    let fields: Vec<usize> = tables.fields.iter().map(|f| unit.field(f)).collect();
-    let shapes: Vec<u32> = tables.shapes.iter().map(|n| unit.shape(n)).collect();
-    let lambdas: Vec<usize> = tables.lambdas.iter().map(|l| unit.lambda(l)).collect();
+    let builtins: Vec<usize> = tables
+        .builtins
+        .iter()
+        .map(|b| unit.builtin(*b).expect(named))
+        .collect();
+    let fields: Vec<usize> = tables
+        .fields
+        .iter()
+        .map(|f| unit.field(f).expect(named))
+        .collect();
+    let shapes: Vec<u32> = tables
+        .shapes
+        .iter()
+        .map(|n| unit.shape(n).expect(named))
+        .collect();
+    let lambdas: Vec<usize> = tables
+        .lambdas
+        .iter()
+        .map(|l| unit.lambda(l).expect(named))
+        .collect();
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find("@@") {
@@ -575,13 +595,13 @@ fn resolve(text: &str, tables: &super::tables::Tables, root: usize, unit: &mut U
             .expect("an emitted placeholder always closes");
         let (kind, digits) = body[..end].split_at(1);
         let i = || -> usize { digits.parse().expect("an emitted placeholder is numbered") };
-        let resolved = match kind {
+        let resolved: u64 = match kind {
             "r" => root,
-            "c" => consts[i()],
-            "b" => builtins[i()],
-            "f" => fields[i()],
-            "s" => shapes[i()] as usize,
-            "l" => lambdas[i()],
+            "c" => consts[i()] as u64,
+            "b" => builtins[i()] as u64,
+            "f" => fields[i()] as u64,
+            "s" => shapes[i()] as u64,
+            "l" => lambdas[i()] as u64,
             other => unreachable!("an emitted placeholder is one of six kinds, not `{other}`"),
         };
         out.push_str(&resolved.to_string());
@@ -673,6 +693,6 @@ fn tables_of(mut unit: Unit, ctors: &[(Symbol, usize)]) -> Tables {
         memo_values: Default::default(),
         memo_words: Default::default(),
         calls: Default::default(),
-        roots: Vec::new(),
+        roots: HashMap::new(),
     }
 }
