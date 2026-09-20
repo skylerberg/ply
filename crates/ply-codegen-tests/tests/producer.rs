@@ -525,7 +525,7 @@ fn the_chain_entered_whole_schedules_as_the_machine_does() {
             vec![Value::Int(100)],
             Value::Int(366),
             0,
-            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"random\", resource: Singleton, mode: Write })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"random\", resource: Singleton, mode: Write })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})"]"#,
+            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"random\", resource: Singleton, mode: Write, op: None })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"random\", resource: Singleton, mode: Write, op: None })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})"]"#,
         ),
         (
             "m.racing",

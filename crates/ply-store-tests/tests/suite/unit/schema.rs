@@ -1,7 +1,7 @@
 use ply_store::schema::*;
 use ply_store::{BODY_ENCODING, ContentHash, DeclBody, DefKind, FRONTEND_VERSION, Outcome};
 use ply_ty::Mode;
-use ply_ty::{Footprint, Resource, Type};
+use ply_ty::{EffectAtom, Footprint, Resource, Type};
 
 mod variant {
     use super::*;
@@ -26,6 +26,13 @@ mod variant {
         match m {
             Mode::Read => "Mode::Read",
             Mode::Write => "Mode::Write",
+        }
+    }
+
+    pub(super) fn atom(a: &EffectAtom) -> &'static str {
+        match a.op {
+            Some(_) => "EffectAtom::op",
+            None => "EffectAtom::mode",
         }
     }
 
@@ -74,6 +81,7 @@ fn mentioned() -> Vec<&'static str> {
                 params.iter().for_each(|p| walk_ty(p, note));
                 walk_ty(ret, note);
                 for a in &effects.atoms {
+                    note(variant::atom(a));
                     note(variant::resource(&a.resource));
                     note(variant::mode(a.mode));
                 }
@@ -84,6 +92,7 @@ fn mentioned() -> Vec<&'static str> {
 
     fn walk_footprint(f: &Footprint, note: &mut impl FnMut(&'static str)) {
         for a in f.atoms() {
+            note(variant::atom(a));
             note(variant::resource(&a.resource));
             note(variant::mode(a.mode));
         }
