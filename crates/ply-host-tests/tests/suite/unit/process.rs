@@ -45,29 +45,33 @@ fn call(
     handlers: &[(HostOp, Arc<dyn HostHandler>)],
     op: Op,
     args: &[Value],
-) -> Result<HostAnswer, Diagnostic> {
+) -> Result<Value, Diagnostic> {
     let (declaration, handler) = handlers
         .iter()
         .find(|(d, _)| d.op.as_str() == op.name())
         .expect("every operation is registered");
-    handler.call(
-        &Nothing,
-        &HostRequest {
-            atom: atom(op),
-            op: declaration,
-            args,
-            span: Span::DUMMY,
-            machine: MachineId(0),
-            task: None,
-            declared: None,
-        },
-    )
+    handler
+        .call(
+            &Nothing,
+            &HostRequest {
+                atom: atom(op),
+                op: declaration,
+                args,
+                span: Span::DUMMY,
+                machine: MachineId(0),
+                task: None,
+                declared: None,
+            },
+        )
+        .map(|answer| match answer {
+            HostAnswer::Value(v) => v,
+            HostAnswer::Pending(_) => panic!("a process operation waits on nothing"),
+        })
 }
 
-fn value(answer: Result<HostAnswer, Diagnostic>) -> Value {
+fn value(answer: Result<Value, Diagnostic>) -> Value {
     match answer {
-        Ok(HostAnswer::Value(v)) => v,
-        Ok(HostAnswer::Pending(_)) => panic!("a process operation waits on nothing"),
+        Ok(v) => v,
         Err(d) => panic!("refused: {} {}", d.code, d.message),
     }
 }
