@@ -1,13 +1,9 @@
-//! `ply test --mutate`: each definition's source is changed one operator or literal at a time,
-//! the program is checked again, and the tests whose closure holds the definition run on a
-//! scratch store. A mutant they all pass is a gap in what they check.
-
 use crate::hosts::{Hosts, hosting};
 use crate::load::Loaded;
 use ply_eval::HostRuntime;
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 use ply_test::{Engine, RunReport};
-use ply_ty::{DefInfo, HashOutput, SourceId};
+use ply_ty::{DefInfo, HashOutput};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -15,7 +11,6 @@ use std::rc::Rc;
 
 pub struct Mutant {
     pub definition: Symbol,
-    /// The replaced text's place in its file.
     pub span: Span,
     pub from: String,
     pub to: String,
