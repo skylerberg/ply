@@ -7,7 +7,7 @@ fn add(a: Int, b: Int) -> Int = a + b
 fn clamp(n: Int) -> Int = if n < 0 { 0 } else { n }
 fn unused(n: Int) -> Int = n * 2 + 0
 test \"add adds\" { assert_eq(add(2, 3), 5); assert_eq(add(0, 1), 1) }
-test \"clamp keeps a positive\" { assert_eq(clamp(5), 5) }
+test \"clamp keeps a positive\" { assert_eq(clamp(5), 5); assert_eq(clamp(-3), 0) }
 ";
 
 fn project() -> tempfile::TempDir {
