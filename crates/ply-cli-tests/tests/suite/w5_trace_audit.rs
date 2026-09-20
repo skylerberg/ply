@@ -32,14 +32,14 @@ const SERVICE: &str = r#"
 import std.trace
 import std.trace (trace)
 
-pub fn place_order(sku: String) -> Int / {trace.write[orders]} {
+pub fn place_order(sku: String) -> Int / {trace.enter[orders], trace.exit[orders], trace.count[orders]} {
   let span = trace.enter[orders]("place_order", map_new());
   trace.count[orders]("orders_placed", 1, map_new());
   trace.exit[orders](span, trace::Ok);
   1
 }
 
-pub fn restock(sku: String) -> Int / {trace.write[items]} {
+pub fn restock(sku: String) -> Int / {trace.event[items]} {
   trace.event[items](trace::Info, "restocked", map_new());
   2
 }
@@ -94,11 +94,13 @@ fn a_functions_row_names_the_channels_it_records_on() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
-        text.contains("place_order : (String) -> Int / {std.trace.trace.write[orders]}"),
+        text.contains(
+            "place_order : (String) -> Int / {std.trace.trace.count[orders], std.trace.trace.enter[orders], std.trace.trace.exit[orders]}"
+        ),
         "{text}"
     );
     assert!(
-        text.contains("restock : (String) -> Int / {std.trace.trace.write[items]}"),
+        text.contains("restock : (String) -> Int / {std.trace.trace.event[items]}"),
         "{text}"
     );
 }
@@ -352,10 +354,11 @@ fn ply_hosts_lists_the_sink_per_channel_and_names_the_one_that_serves_the_run() 
         "`--trace off` is a listed handler, not an empty registry: {listing:#}"
     );
     // One row per channel the program actually records on, never a `*`.
-    let atoms: Vec<&str> = traced.iter().filter_map(|r| r["atom"].as_str()).collect();
+    let atoms: Vec<&str> = traced.iter().filter_map(|r| r["triple"].as_str()).collect();
     assert!(
-        atoms.contains(&"std.trace.trace.write[orders]")
-            && atoms.contains(&"std.trace.trace.write[items]"),
+        atoms.contains(&"std.trace.trace.count[orders]")
+            && atoms.contains(&"std.trace.trace.event[items]")
+            && !atoms.contains(&"std.trace.trace.count[items]"),
         "the listing expands to the channels the program uses: {atoms:?}"
     );
     assert!(

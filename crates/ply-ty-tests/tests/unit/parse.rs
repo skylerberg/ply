@@ -231,7 +231,12 @@ fn an_operation_atom_parses_and_prints_by_its_name() {
     let send = parse_atom("net.send[conn]").unwrap();
     assert_eq!(
         send,
-        EffectAtom::operation("net", Resource::Named(Symbol::new("conn")), "send")
+        EffectAtom::operation(
+            "net",
+            Resource::Named(Symbol::new("conn")),
+            Mode::Write,
+            "send"
+        )
     );
     assert_eq!(send.to_string(), "net.send[conn]");
     let f = parse_footprint("net.write[conn],net.send[conn]").unwrap();

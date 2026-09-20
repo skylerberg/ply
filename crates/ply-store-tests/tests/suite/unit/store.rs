@@ -741,7 +741,7 @@ fn an_operation_atom_survives_a_round_trip_through_disk() {
     let root = TempRoot::new("frontend-op-atom");
     let conn = || Resource::Named(ply_span::Symbol::new("conn"));
     let footprint = Footprint::from_atoms([
-        EffectAtom::operation("net", conn(), "send"),
+        EffectAtom::operation("net", conn(), Mode::Write, "send"),
         EffectAtom::new("net", conn(), Mode::Write),
     ]);
     assert_eq!(footprint.to_string(), "{net.write[conn], net.send[conn]}");

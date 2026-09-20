@@ -979,10 +979,8 @@ fn abbreviate(fingerprint: &str) -> String {
     }
 }
 
-/// The operation says what was bound; the atom is what scheduling and isolation speak in.
-const HEADERS: [&str; 7] = [
+const HEADERS: [&str; 6] = [
     "OPERATION",
-    "ATOM",
     "HANDLER",
     "DET",
     "LINEAR",
@@ -990,10 +988,9 @@ const HEADERS: [&str; 7] = [
     "SECRETS",
 ];
 
-fn cells(row: &HostRow) -> [String; 7] {
+fn cells(row: &HostRow) -> [String; 6] {
     [
         row.to_string(),
-        row.atom.to_string(),
         row.path.to_string(),
         yes_no(row.deterministic),
         row.linearity.as_str().to_string(),
@@ -1020,14 +1017,14 @@ pub fn listing_lines(listing: &HostListing, disclosures: &Disclosures) -> Vec<St
     if listing.rows.is_empty() {
         lines.push(empty_note(listing));
     } else {
-        let rows: Vec<[String; 7]> = listing.rows.iter().map(cells).collect();
+        let rows: Vec<[String; 6]> = listing.rows.iter().map(cells).collect();
         let mut widths = HEADERS.map(str::len);
         for row in &rows {
             for (width, cell) in widths.iter_mut().zip(row) {
                 *width = (*width).max(cell.chars().count());
             }
         }
-        let line = |cells: &[String; 7]| {
+        let line = |cells: &[String; 6]| {
             let mut out = String::new();
             for (i, (cell, width)) in cells.iter().zip(widths).enumerate() {
                 if i + 1 == cells.len() {
@@ -1090,7 +1087,6 @@ pub fn row_json(row: &HostRow) -> Value {
             ply_ty::ty::Resource::Singleton => Value::Null,
         },
         "triple": row.to_string(),
-        "atom": row.atom.to_string(),
         "handler": row.path,
         "deterministic": row.deterministic,
         "linearity": row.linearity.as_json(),

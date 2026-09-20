@@ -352,7 +352,8 @@ fn the_task_registrations_are_what_ply_hosts_prints() {
     let rows: Vec<String> = listing.rows.iter().map(|r| r.to_string()).collect();
     assert_eq!(rows, vec!["task.join", "task.spawn", "task.yield"]);
     for row in &listing.rows {
-        assert_eq!(row.atom.to_string(), "task.write");
+        assert_eq!(row.atom.to_string(), row.to_string());
+        assert_eq!(row.atom.mode, ply_ty::Mode::Write);
         assert!(!row.deterministic);
         assert!(!row.linearity.is_linear());
         assert!(!row.blocking);

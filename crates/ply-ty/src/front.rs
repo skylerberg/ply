@@ -484,6 +484,8 @@ impl Front {
             out.ordinals.extend(part.ordinals);
             out.bodies.extend(part.bodies);
         }
+        // A part read alone knows only its own effects, so its operation atoms wait for the whole.
+        resolve_op_modes(&mut out);
         Ok(out)
     }
 }
@@ -1157,7 +1159,62 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
             front.check.tests.len()
         ));
     }
+    resolve_op_modes(&mut front);
     Ok(front)
+}
+
+/// An operation atom prints without its mode; every row and footprint takes it from the declaration.
+fn resolve_op_modes(front: &mut Front) {
+    let modes: BTreeMap<(Symbol, Symbol), Mode> = front
+        .check
+        .effects
+        .values()
+        .flat_map(|e| {
+            e.ops
+                .values()
+                .map(move |o| ((e.name.clone(), o.name.clone()), o.mode))
+        })
+        .collect();
+    let mode_of = |effect: &Symbol, op: &Symbol| modes.get(&(effect.clone(), op.clone())).copied();
+    for def in front.check.defs.values_mut() {
+        def.footprint.resolve_modes(&mode_of);
+        def.performed.resolve_modes(&mode_of);
+        def.scheme.ty.resolve_modes(&mode_of);
+        for spec in &mut def.spec {
+            spec.footprint.resolve_modes(&mode_of);
+        }
+    }
+    for test in &mut front.check.tests {
+        test.footprint.resolve_modes(&mode_of);
+    }
+    for law in &mut front.check.laws {
+        law.footprint.resolve_modes(&mode_of);
+        for binder in &mut law.binders {
+            binder.ty.resolve_modes(&mode_of);
+        }
+    }
+    for ctor in front.check.ctors.values_mut() {
+        ctor.scheme.ty.resolve_modes(&mode_of);
+        for field in &mut ctor.fields {
+            field.resolve_modes(&mode_of);
+        }
+    }
+    for effect in front.check.effects.values_mut() {
+        for op in effect.ops.values_mut() {
+            for param in &mut op.params {
+                param.resolve_modes(&mode_of);
+            }
+            op.ret.resolve_modes(&mode_of);
+            if let Some(scheme) = &mut op.scheme {
+                scheme.ty.resolve_modes(&mode_of);
+            }
+        }
+    }
+    for sets in front.effect_sets.values_mut() {
+        for set in sets {
+            set.atoms.resolve_modes(&mode_of);
+        }
+    }
 }
 
 fn unknown_field(what: &str, key: &str) -> String {

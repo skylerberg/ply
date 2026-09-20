@@ -101,7 +101,7 @@ pub unsafe fn perform(
     let declaration = bound.op.clone();
     let handler = Arc::clone(bound.handler);
     if let Some(declared) = &c.declared
-        && !declared.contains(&atom)
+        && !declared.covers(&atom)
     {
         return c.fail(err_footprint_escape(
             span,

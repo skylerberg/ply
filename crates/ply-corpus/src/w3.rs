@@ -25,9 +25,14 @@ const TESTS_MARKER: &str = "// --- Tests: the business, which needs no handler a
 const CREDENTIAL: &str = "desk";
 
 /// `main`'s declared row in `examples/desk.ply`, and the same row once the accept loop spawns.
-const MAIN_ROW: &str =
-    "fn main() -> Int / {Serving, config.read[server], net.write[conn], net.write[listener]} = {";
-const MAIN_ROW_SPAWNING: &str = "fn main() -> Int / {Serving, config.read[server], task.write, net.write[conn], net.write[listener]} = {";
+const MAIN_ROW: &str = "\
+fn main() -> Int
+  / {Serving, config.get[server], net.listen[listener], net.accept[listener], net.close[listener],
+     net.recv[conn], net.send[conn], net.close[conn]} = {";
+const MAIN_ROW_SPAWNING: &str = "\
+fn main() -> Int
+  / {task.write, Serving, config.get[server], net.listen[listener], net.accept[listener], net.close[listener],
+     net.recv[conn], net.send[conn], net.close[conn]} = {";
 
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -110,7 +115,7 @@ impl Service {
     fn task_per_connection(&self) -> Result<String> {
         const OLD_SERVE: &str = "\
 pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
-  / {Serving, net.write[conn], net.write[listener]} =
+  / {Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn]} =
   if count <= 0 {
     0
   } else {
@@ -124,7 +129,7 @@ pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
   }";
         const NEW_SERVE: &str = "\
 pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
-  / {Serving, task.write, net.write[conn], net.write[listener]} =
+  / {task.write, Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn]} =
   if count <= 0 {
     0
   } else {
@@ -139,42 +144,21 @@ pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
     }
   }";
         let source = replace(&self.server_only, OLD_SERVE, NEW_SERVE)?;
-        // The rows above and below `serve`, each widened by the one atom spawning adds.
-        let widenings: [(&str, &str); 8] = [
-            (
-                "pub fn listen_and_serve(port: Int, count: Int) -> Int\n  / {Serving, net.write[conn], net.write[listener]} {",
-                "pub fn listen_and_serve(port: Int, count: Int) -> Int\n  / {Serving, task.write, net.write[conn], net.write[listener]} {",
-            ),
-            (
-                "pub fn listen_and_serve_tls(port: Int, credential: String, count: Int) -> Int\n  / {Serving, net.write[conn], net.write[listener]} {",
-                "pub fn listen_and_serve_tls(port: Int, credential: String, count: Int) -> Int\n  / {Serving, task.write, net.write[conn], net.write[listener]} {",
-            ),
-            (
-                "pub fn run(port: Int, count: Int) -> Int\n  / {Serving, net.write[conn], net.write[listener]} =",
-                "pub fn run(port: Int, count: Int) -> Int\n  / {Serving, task.write, net.write[conn], net.write[listener]} =",
-            ),
-            (
-                "pub fn run_tls(port: Int, credential: String, count: Int) -> Int\n  / {Serving, net.write[conn], net.write[listener]} =",
-                "pub fn run_tls(port: Int, credential: String, count: Int) -> Int\n  / {Serving, task.write, net.write[conn], net.write[listener]} =",
-            ),
-            // The twin's entry points are widened too, since this harness drives them.
-            (
-                "pub fn run_memory(port: Int, api: Option<Secret<String>>, count: Int) -> Int\n  / {net.write[conn], net.write[listener]} =",
-                "pub fn run_memory(port: Int, api: Option<Secret<String>>, count: Int) -> Int\n  / {task.write, net.write[conn], net.write[listener]} =",
-            ),
-            (
-                "pub fn run_memory_tls(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int\n  / {net.write[conn], net.write[listener]} =",
-                "pub fn run_memory_tls(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int\n  / {task.write, net.write[conn], net.write[listener]} =",
-            ),
-            (
-                "fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int\n  / {net.write[conn], net.write[listener]} =",
-                "fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int\n  / {task.write, net.write[conn], net.write[listener]} =",
-            ),
-            (MAIN_ROW, MAIN_ROW_SPAWNING),
+        // The rows above and below `serve`, each widened by the one atom spawning adds; the twin's
+        // entry points too, since this harness drives them.
+        const WIDENED: [&str; 8] = [
+            "pub fn listen_and_serve(port: Int, count: Int) -> Int\n  / {",
+            "pub fn listen_and_serve_tls(port: Int, credential: String, count: Int) -> Int\n  / {",
+            "pub fn run(port: Int, count: Int) -> Int\n  / {",
+            "pub fn run_tls(port: Int, credential: String, count: Int) -> Int\n  / {",
+            "pub fn run_memory(port: Int, api: Option<Secret<String>>, count: Int) -> Int\n  / {",
+            "pub fn run_memory_tls(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int\n  / {",
+            "fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int\n  / {",
+            "fn main() -> Int\n  / {",
         ];
-        widenings
-            .iter()
-            .try_fold(source, |acc, (from, to)| replace(&acc, from, to))
+        WIDENED.iter().try_fold(source, |acc, from| {
+            replace(&acc, from, &format!("{from}task.write, "))
+        })
     }
 
     /// A project directory `ply run --host` can be pointed at.
@@ -214,11 +198,13 @@ pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
         Ok(())
     }
 
-    /// Every `/ {Desk}` and `/ {Desk, ..}` row written out as the six atoms the set expands to.
+    /// Every `/ {Desk}` and `/ {Desk, ..}` row written out as the atoms the set expands to.
     pub fn explicit_rows(&self) -> Result<(String, usize)> {
-        const EXPANSION: &str = "db.read[items], db.write[items], \
-             db.read[orders], db.write[orders], db.write, \
-             trace.write[orders], trace.write[items]";
+        const EXPANSION: &str = "db.query[items], db.execute[items], \
+             db.query[orders], db.execute[orders], db.returning[orders], \
+             db.begin, db.commit, db.abort, db.rollback, \
+             trace.enter[orders], trace.exit[orders], trace.event[orders], trace.count[orders], \
+             trace.event[items]";
         let mut out = String::with_capacity(self.server_only.len() + 4096);
         let mut rewritten = 0usize;
         let mut rest = self.server_only.as_str();
@@ -1526,7 +1512,12 @@ pub fn aliases(repo: &Path) -> Result<AliasReport> {
         if info.row_aliases.contains(&desk) {
             naming += 1;
         }
-        if info.module.to_string() == "desk" && info.footprint != info.performed {
+        if info.module.to_string() == "desk"
+            && info
+                .footprint
+                .atoms()
+                .any(|a| !info.performed.atoms().any(|p| a.covers(p)))
+        {
             declared_not_performed.push(info.simple_name.to_string());
         }
         match right.check.defs.get(name) {

@@ -477,18 +477,19 @@ set of atoms with an optional tail variable: `/ {db.read[users], clock.read}`,
 (`net.write[conn]`) covers; naming an operation the effect does not declare is
 `E0104`.
 
-A written row that names operations permits a perform of those operations
-only: under `/ {net.send[conn]}` a body may `net.send[conn](..)` and not
-`net.recv[conn](..)` (`E0302`, naming the operation and offering the atom to
-add). A call is judged by the callee's written row: `/ {net.send[conn]}` fits
-under `/ {net.write[conn]}` and under `/ {net.send[conn]}`, but a callee
-written `/ {net.write[conn]}` may perform any write, so it does not fit under
-`/ {net.send[conn]}` (`E0302`, naming the callee). A perform inside a lambda,
-or reached through a function value or a builtin's arguments, is judged by its
-mode atom and so needs that atom in the row. Inferred rows are made of mode
-atoms; an operation atom enters one only from a callee's written row. Rows in
-types unify atom for atom: a function value whose row names an operation is
-not the same type as one whose row names the mode.
+An inferred row names operations: `net.send[conn](..)` adds `net.send[conn]`,
+a call adds the callee's row as written (a mode atom stays a mode atom), and a
+lambda's type carries the operations its body performs. A definition with a
+written row publishes that row, so a caller of one written `/ {net.write[conn]}`
+gets the mode atom, which says the callee may perform any `write` of `net` on
+`conn`. A written row must cover the inferred one atom by atom: under
+`/ {net.send[conn]}` a body may `net.send[conn](..)` and not `net.recv[conn](..)`
+(`E0302`, naming the operation and offering the atom to add), and may call a
+callee written `/ {net.send[conn]}` but not one written `/ {net.write[conn]}`
+(`E0302`, naming the callee). `ply check --types --explain` prints the inferred
+row as `body performs`. Rows in types unify atom for atom: a function value
+whose row names an operation is not the same type as one whose row names the
+mode.
 
 Resource labels are global — two modules writing `[users]` name one resource —
 and cannot be abstracted over. Two atoms **conflict** iff they name the same
@@ -523,20 +524,22 @@ test "expiry is decided against the deadline, not the wall clock" {
 ```
 
 A clause is `effect.op[resource](params) -> body`; an optional
-`return x -> body` clause maps the result. The `handle`'s row is the body's
-minus the handled atoms plus every clause's row. A handler discharges an
-**atom**: `recv`, `send` and `close` are all `net.write[conn]`. An operation
-atom the body's row carries from a callee's written row, `net.send[conn]`, is
-discharged by a clause for that operation and by nothing else; with no such
-clause it stays in the row and the operation runs past the `handle`. The body
-must not perform an operation on a handled atom that no clause answers
-(`E0305`, naming the clause to add), unless the enclosing function's written
-row keeps that atom, or names that operation: then the operation is forwarded
-to the caller's handler, as `std.db`'s `transaction` forwards `begin` and
-`commit` while answering `rollback`. The checker follows performs in the body
-and in every named function it calls; an operation inside a lambda, or reached
-through a function value, is not judged, and at run time runs past the
-`handle` to the next handler or the host.
+`return x -> body` clause maps the result. A handler discharges an
+**operation**: a clause for `net.send[conn]` removes that atom from the body's
+row, and a clause set covering every operation of a mode (`send`, `recv` and
+`close` for `net.write[conn]`) discharges the mode atom. The `handle`'s row is
+the body's minus what the clauses discharge plus every clause's row. What
+remains under a handled mode atom runs past the `handle`, so it is refused
+(`E0305`, naming the operation, where it is performed or which callee reaches
+it, and the clause to add) unless the enclosing function's written row covers
+it: then it is forwarded to the caller's handler, as `std.db`'s `transaction`,
+written `/ {db.begin, db.commit, db.abort | e}`, forwards `begin`, `commit`
+and `abort` while answering `rollback`. A body that calls a function written
+with a mode atom, or a function value whose type carries one, may perform any
+operation of that mode: `E0305` then names the mode atom, says which callee or
+value reaches it, and offers a clause per operation not yet named. A `handle`
+is judged by rows alone, so a lambda or a function-typed parameter is judged
+by its type.
 
 ### 6.6 `resume`
 
@@ -925,8 +928,8 @@ pub nondet effect net {
   write send[s](conn: Int, payload: Bytes, timeout_ms: Int) -> Option<Int>
   write close[s](socket: Int) -> Unit
 }
-pub fn drain(c: Int, so_far: Bytes, timeout_ms: Int) -> Bytes / {net.write[conn]}
-pub fn send_all(c: Int, payload: Bytes, timeout_ms: Int) -> Bool / {net.write[conn]}
+pub fn drain(c: Int, so_far: Bytes, timeout_ms: Int) -> Bytes / {net.recv[conn]}
+pub fn send_all(c: Int, payload: Bytes, timeout_ms: Int) -> Bool / {net.send[conn]}
 ```
 
 `None` is a deadline expiring; an empty `Some` is EOF; `timeout_ms <= 0` is a
@@ -999,8 +1002,10 @@ pub nondet effect db {
 ```
 
 The resource label is a table (`db.query[items]` is `db.read[items]`).
-Transaction control is the singleton `db.write`, so transactions conflict.
-`transaction` handles `rollback`. SQL errors are values; `is_retryable(e)`
+Transaction control is on the singleton resource, so transactions conflict.
+`transaction` handles `rollback`; a `rollback` performed in its body still
+reaches the caller's row through `e`, so a handler around a transaction names
+it too. SQL errors are values; `is_retryable(e)`
 covers serialization failures. `MemDb` is an in-memory twin (`open`, `step`,
 `begin_step`, `commit_step`, `abort_step`). Statement text the driver cannot
 account for is `E0432`.
@@ -1073,7 +1078,8 @@ Without `--host`, an operation that reaches the boundary is `E0424`, naming the
 handler that would serve it. With `--host`, a test that reaches a bound handler
 always runs and is never cached. All flags below require `--host`.
 
-`ply hosts` lists every bindable handler with its atom, determinism,
+`ply hosts` lists every bindable operation (`effect.op[resource]`, one row per
+resource label the program uses) with its handler, determinism,
 `at-most-once`/`repeatable`, blocking and `Secret` permission, plus the run's
 TLS, filesystem, database, configuration, tracing and shutdown settings;
 `--digest` prints one `b3:` line. A handler for something undeclared is `E0421`,
@@ -1230,7 +1236,7 @@ the message.
 | `E0302` | effect not permitted by the written row |
 | `E0303` | unhandled effect (compiler defect) |
 | `E0304` | resource label required |
-| `E0305` | `handle` with no clause for an operation its body performs on a handled atom |
+| `E0305` | `handle` leaves an operation, or a mode atom, under a handled mode atom unanswered |
 | `E0412` | nondeterministic effect in a deterministic test |
 | `E0413` | `Task` escapes its region |
 | `E0414` | deadlock, or spent step budget |
