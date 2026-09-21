@@ -80,7 +80,7 @@ fn the_two_renderers_write_the_same_bytes_for_one_diagnostic() {
     let answered = machine
         .call("probe.rendered", Vec::new(), Span::DUMMY)
         .expect("the Ply renderer answers");
-    let Value::Str(ply) = answered else {
+    let Value::Str(ply) = &answered else {
         panic!("`probe.rendered` answers a String");
     };
 
