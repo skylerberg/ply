@@ -1516,6 +1516,33 @@ pub fn {caller}(x: Int) -> Int =
     assert_eq!(answer(&native, &format!("m.{caller}"), 1), 2);
 }
 
+/// One recursive group is checked with one label binder, so a call to a sibling passes the
+/// caller's label along: the pair answers under whichever resource fills it, and the call stays
+/// the jump a self call is — 100_000 of them inside one entry's fuel.
+#[test]
+fn a_sibling_call_carries_the_groups_label_through_its_jump() {
+    let source = r#"
+effect net {
+  write send[s](payload: Int) -> Int
+}
+
+fn ping<[l]>(n: Int) -> Int / {net.send[l]} = if n == 0 { net.send[l](0) } else { pong(n - 1) }
+fn pong<[k]>(n: Int) -> Int / {net.send[k]} = if n == 0 { net.send[k](1) } else { ping(n - 1) }
+
+pub fn near(n: Int) -> Int = handle { ping[conn](n) } with { net.send[conn](p) -> p + 10 }
+pub fn far(n: Int) -> Int = handle { ping[upstream](n) } with { net.send[upstream](p) -> p + 20 }
+"#;
+    let Some(native) = built(source) else {
+        return;
+    };
+    assert_eq!(answer(&native, "m.near", 0), 10);
+    assert_eq!(answer(&native, "m.near", 1), 11);
+    assert_eq!(answer(&native, "m.far", 0), 20);
+    assert_eq!(answer(&native, "m.far", 1), 21);
+    assert_eq!(answer(&native, "m.near", 100_000), 10);
+    assert_eq!(answer(&native, "m.far", 100_001), 21);
+}
+
 /// The members of a recursive group share one C function, so a tail call between them is a jump:
 /// the fuel is far below the calls made, and a call that nested would spend it first.
 #[test]
