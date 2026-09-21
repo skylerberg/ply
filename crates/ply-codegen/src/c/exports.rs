@@ -65,15 +65,6 @@ pub struct Taken {
     pub entry: String,
 }
 
-/// How a unit emitted before its symbols were published spells them: `ply_`, then the name with
-/// each dot and `#` as `_`. The committed bootstrap bundle and the bodies it stages are the only
-/// ones read through here, until CI refreshes the bundle on the first merge.
-pub(super) fn unpublished(name: &str) -> Defined {
-    let symbol = format!("ply_{}", name.replace(['.', '#'], "_"));
-    let entry = format!("{symbol}_entry");
-    Defined { symbol, entry }
-}
-
 #[derive(Clone)]
 pub struct Exports {
     pub helpers: Vec<HelperShape>,
@@ -206,13 +197,9 @@ impl Exports {
             let mut parts = line(s, &mut at)?.split(' ');
             let name = parts.next()?.to_string();
             let arity = parts.next()?.parse().ok()?;
-            // A unit emitted before symbols were published names only itself and its arity.
-            let published = match (parts.next(), parts.next()) {
-                (Some(symbol), Some(entry)) => Defined {
-                    symbol: symbol.to_string(),
-                    entry: entry.to_string(),
-                },
-                _ => unpublished(&name),
+            let published = Defined {
+                symbol: parts.next()?.to_string(),
+                entry: parts.next()?.to_string(),
             };
             taken.push(Taken {
                 name,
