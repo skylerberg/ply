@@ -84,8 +84,8 @@ fn the_committed_program_is_what_these_sources_build() {
 #[test]
 fn the_compiler_is_on_the_shelf_under_its_own_root_and_nothing_may_shadow_it() {
     let names: Vec<&str> = shipped::sources().iter().map(|(n, _)| n.as_str()).collect();
-    assert!(names.iter().any(|n| n == "compiler.fmt"), "{names:?}");
-    assert!(names.iter().any(|n| n == "std.path"), "{names:?}");
+    assert!(names.contains(&"compiler.fmt"), "{names:?}");
+    assert!(names.contains(&"std.path"), "{names:?}");
     assert!(shipped::is_shipped_name("compiler.fmt"));
     assert!(shipped::is_shipped_name("std.fs"));
     assert!(!shipped::is_shipped_name("compilers.fmt"));
