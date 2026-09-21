@@ -100,6 +100,17 @@ impl Harness {
             })
     }
 
+    /// One entry under a step budget, which is what `--steps N` gives each of them.
+    fn under_steps(
+        &mut self,
+        budget: i64,
+        name: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, ply_span::Diagnostic> {
+        let machine = &mut self.machine;
+        ply_codegen::rt::with_step_budget(budget, || machine.call(name, args, Span::DUMMY))
+    }
+
     /// The machine's own diagnostic, which a compiled failure has to arrive as.
     fn raises(&mut self, name: &str, args: &[Value], message: &str) {
         let raised = self
@@ -312,7 +323,8 @@ fn a_native_body_runs_under_a_live_handler_stack() {
     }
 }
 
-/// Not in tail position, so it cannot become a loop.
+/// Not in tail position, so it cannot become a loop. Depth is its own bound: a step budget wide
+/// enough for the whole ladder does not save a recursion that nests past ten thousand.
 #[test]
 fn a_compiled_recursion_that_outruns_its_budget_is_the_machines_diagnostic() {
     let mut h = harness(hazards());
@@ -321,6 +333,33 @@ fn a_compiled_recursion_that_outruns_its_budget_is_the_machines_diagnostic() {
         &[Value::Int(1_000_000), Value::Int(0)],
         "recursion limit of",
     );
+}
+
+/// A loop nests nowhere, so only the step budget ends it — at the call the budget names, on any
+/// machine, and at the same call twice.
+#[test]
+fn a_compiled_loop_that_never_ends_stops_at_its_step_budget() {
+    let mut h = harness(hazards());
+    for budget in [10_000i64, 250_000] {
+        let out = h.under_steps(budget, "pure.spin", vec![Value::Int(0)]);
+        let raised = out.expect_err("a loop with no exit cannot answer");
+        assert_eq!(raised.code, ply_span::codes::STEP_BUDGET, "{raised}");
+        let want = format!("budget of {budget} calls");
+        assert!(raised.message.contains(&want), "{raised}");
+    }
+}
+
+/// The budget is a count, so what fits inside it answers whatever else the machine is doing.
+#[test]
+fn a_long_computation_inside_its_step_budget_answers() {
+    let mut h = harness(hazards());
+    let args = vec![Value::Int(500), Value::Int(0)];
+    if let Err(raised) = h.under_steps(1_000, "pure.ladder", args.clone()) {
+        panic!("five hundred nested calls fit in a thousand: {raised}");
+    }
+    let out = h.under_steps(100, "pure.ladder", args);
+    let raised = out.expect_err("a hundred calls is short of five hundred");
+    assert_eq!(raised.code, ply_span::codes::STEP_BUDGET, "{raised}");
 }
 
 /// `Ctx` is one flat frame, so a nested entry would alias the outer one's words.

@@ -568,7 +568,7 @@ impl<'a> Prover<'a> {
             span: obligation.span,
             call,
             result,
-            time_budget_ms: plan.time_budget_ms,
+            step_budget: plan.step_budget,
         })
     }
 
@@ -668,6 +668,7 @@ impl<'a> Prover<'a> {
             binders: obligation.generated().to_vec(),
             points,
             steps: plan.sim.steps,
+            step_budget: plan.step_budget,
             span: obligation.span,
         };
         concurrency::discharge(obligation, &plan.sim, &domain, &mut search).discharge
@@ -809,14 +810,14 @@ struct Cases<'a> {
     /// The definition an `ensures` is attached to, called to produce `result`.
     call: Option<Symbol>,
     result: Option<Symbol>,
-    time_budget_ms: u64,
+    step_budget: i64,
 }
 
 impl Cases<'_> {
     /// The proposition entered on the tier, the only evaluator a proposition has.
     fn on_tier(&self, root: &Symbol, args: &[Value]) -> Result<Value, Diagnostic> {
         let entered = match &self.compiled {
-            Some(compiled) => ply_codegen::rt::with_time_budget(self.time_budget_ms, || {
+            Some(compiled) => ply_codegen::rt::with_step_budget(self.step_budget, || {
                 compiled.enter_whole(root, args, DEFAULT_MAX_CALLS)
             }),
             None => ply_eval::Entered::Declined,
@@ -873,7 +874,10 @@ struct Search {
     binders: Vec<LawBinder>,
     /// The points the guard kept, in order.
     points: Vec<Vec<Value>>,
+    /// A `simulate` region's own budget: scheduling steps, not calls.
     steps: u32,
+    /// Calls one evaluation of the body may make.
+    step_budget: i64,
     span: Span,
 }
 
@@ -884,7 +888,10 @@ impl LawSearch for Search {
         let (value, record) = match &self.compiled {
             Some(compiled) => {
                 compiled.set_seed(seed.clone(), self.steps);
-                match compiled.enter_whole(&self.body_root, &values, DEFAULT_MAX_CALLS) {
+                let entered = ply_codegen::rt::with_step_budget(self.step_budget, || {
+                    compiled.enter_whole(&self.body_root, &values, DEFAULT_MAX_CALLS)
+                });
+                match entered {
                     ply_eval::Entered::Answered(value) => (Ok(value), compiled.simulated()),
                     ply_eval::Entered::Raised(raised) => (Err(raised), compiled.simulated()),
                     ply_eval::Entered::Declined => (Err(declined()), None),
