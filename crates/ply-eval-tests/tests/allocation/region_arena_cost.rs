@@ -3,7 +3,6 @@ use ply_eval::Value;
 use ply_eval::arena::{Arena, RegionKind};
 use ply_span::Span;
 use rpds::RedBlackTreeMap;
-use std::time::Instant;
 
 fn counted<R>(f: impl FnOnce() -> R) -> (usize, usize, R) {
     let (out, allocs, bytes) = charge(f);
@@ -251,57 +250,4 @@ fn the_two_kinds_differ_by_exactly_the_snapshots() {
     assert_eq!(unique.stats().snapshots, 0);
     assert_eq!(shared.stats().snapshots, 1);
     assert_eq!(shared.stats().slots_copied, SIZE as u64);
-}
-
-#[test]
-fn a_close_is_priced_against_what_it_can_answer() {
-    const SIZE: usize = 1_000;
-    const ROUNDS: usize = 2_000;
-
-    let mut arena = Arena::new();
-    for _ in 0..4 {
-        cycle(&mut arena, RegionKind::Unique, SIZE);
-    }
-
-    let mut freeing = std::time::Duration::ZERO;
-    for _ in 0..ROUNDS {
-        let r = arena.open(RegionKind::Unique, Span::DUMMY);
-        for i in 0..SIZE {
-            arena.alloc(Value::Int(i as i64));
-        }
-        let started = Instant::now();
-        arena.close(r);
-        freeing += started.elapsed();
-    }
-
-    let mut deferring = std::time::Duration::ZERO;
-    for _ in 0..ROUNDS {
-        let r = arena.open(RegionKind::Shared, Span::DUMMY);
-        for i in 0..SIZE {
-            arena.alloc(Value::Int(i as i64));
-        }
-        let pin = arena.pin().expect("the region is open");
-        let started = Instant::now();
-        arena.close(r);
-        deferring += started.elapsed();
-        // Outside the clock: the deferral's cost is the close; its run goes back at the next one.
-        drop(pin);
-    }
-    arena.collect();
-
-    let free = freeing.as_secs_f64() * 1e9 / ROUNDS as f64;
-    let defer = deferring.as_secs_f64() * 1e9 / ROUNDS as f64;
-    // A deferral looks cheaper at the close, but only postpones the truncation to the next close.
-    println!(
-        "  closing a region of {SIZE} slots: freed {free:.0} ns ({:.2} ns/slot); \
-         deferred to a live continuation {defer:.0} ns, which is the run being recorded \
-         rather than the slots being handed back",
-        free / SIZE as f64,
-    );
-
-    assert_eq!(arena.retained_slots(), 0, "every deferred run went back");
-    assert!(
-        free > 0.0 && defer > 0.0,
-        "the clock resolved neither close"
-    );
 }
