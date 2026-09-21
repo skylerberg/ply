@@ -160,6 +160,43 @@ fn a_non_error_severity_is_still_a_failure() {
     assert!(!report.failures[0].defect);
 }
 
+/// A wall clock describes the machine, so what it stops decided nothing: no failure to attribute,
+/// nothing to write, and a run that cannot be called a success.
+#[test]
+fn an_abandoned_run_is_no_verdict_and_is_recorded_nowhere() {
+    let root = TempRoot::new();
+    let mut store = root.store();
+    let compiled = Compiled::anonymous(CORPUS);
+    let selection = select(
+        &compiled.check,
+        &compiled.hashes,
+        &store,
+        &Plan::default(),
+        &ply_test::Engine::Evaluator,
+    );
+    let report = run_with(
+        &selection,
+        &compiled.check,
+        &compiled.hashes,
+        &mut store,
+        &Answering {
+            diagnostic: Some(Diagnostic::warning(
+                codes::RUN_ABANDONED,
+                "abandoned after 300 ms of wall clock",
+            )),
+            unwind: false,
+        },
+    );
+    assert_eq!(report.abandoned, 1);
+    assert_eq!(report.failed, 0);
+    assert_eq!(report.passed, 0);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert!(!report.is_success(), "an undecided run is not a success");
+    assert_eq!(report.results[0].status, Status::Abandoned);
+    assert_eq!(report.results[0].recorded, None);
+    assert_eq!(store.len(), 0, "an abandoned run writes no result");
+}
+
 #[test]
 fn a_simulation_divergence_is_a_defect_in_ply() {
     let (defect, status, verdict) = classified(codes::SIMULATION_DIVERGENCE);

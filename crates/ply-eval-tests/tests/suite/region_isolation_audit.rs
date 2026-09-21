@@ -329,7 +329,6 @@ fn a_region_stack_and_the_values_in_it_cannot_cross_a_thread() {
     );
     assert!(!is_send!(ply_eval::Arena));
     assert!(!is_send!(Value), "Value must stay thread-confined");
-    assert!(!is_send!(ply_eval::Continuation));
     assert!(!is_send!(ply_eval::Stack));
     assert!(!is_send!(ply_eval::Fixture));
     assert!(!is_send!(Machine<'static>));

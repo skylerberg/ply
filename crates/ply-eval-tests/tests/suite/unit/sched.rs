@@ -1,7 +1,6 @@
 use ply_eval::Value;
 use ply_eval::arena::Slot;
-use ply_eval::cont::{Continuation, SimId};
-use ply_eval::cont::{Prompt, Stack};
+use ply_eval::cont::SimId;
 use ply_eval::host::{HostRuntime, Pending};
 use ply_eval::region::Trail;
 use ply_eval::sched::*;
@@ -11,15 +10,13 @@ use ply_span::Symbol;
 use ply_span::{Diagnostic, Span, codes};
 use ply_ty::Mode;
 use ply_ty::{EffectAtom, Resource};
-use std::rc::Rc;
 
-type Sched = Scheduler<Continuation, Value>;
-type Choice = Turn<Continuation, Value>;
+type Sched = Scheduler<usize, Value>;
+type Choice = Turn<usize, Value>;
 
-/// No scheduler decision looks inside a continuation, so an empty one stands in for a suspended task.
-fn suspended() -> Continuation {
-    let prompt = Rc::new(Prompt { span: Span::DUMMY });
-    Stack::new().push_prompt(prompt).capture(1, 0).0
+/// No scheduler decision looks inside a continuation, so a bare id stands in for a suspended task.
+fn suspended() -> usize {
+    0
 }
 
 /// What a task does, in the order it does it.

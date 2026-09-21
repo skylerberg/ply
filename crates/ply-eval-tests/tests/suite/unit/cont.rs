@@ -66,81 +66,6 @@ fn an_exhausted_segment_yields_its_prompt_and_then_the_stack_under_it() {
 }
 
 #[test]
-fn capture_takes_the_segments_above_and_including_the_handler() {
-    let s = Stack::new()
-        .push(frame(0))
-        .push_prompt(prompt())
-        .push(frame(1))
-        .push(frame(2));
-    assert_eq!(s.segments(), 2);
-
-    let (k, below) = s.capture(1, 0);
-    assert_eq!(k.frames(), 2);
-    assert_eq!(k.segments(), 1);
-    assert_eq!(below.segments(), 1);
-    assert_eq!(below.frames(), 1);
-}
-
-#[test]
-fn resuming_reinstalls_the_handler_that_delimited_the_capture() {
-    let s = Stack::new().push_prompt(prompt()).push(frame(1));
-    let (k, below) = s.capture(1, 0);
-    assert!(below.prompt().is_none());
-
-    let resumed = below.resume(&k);
-    assert!(resumed.prompt().is_some());
-    assert_eq!(resumed.frames(), 1);
-}
-
-#[test]
-fn a_continuation_may_be_resumed_twice_onto_different_stacks() {
-    let s = Stack::new().push_prompt(prompt()).push(frame(9));
-    let (k, below) = s.capture(1, 0);
-
-    let once = below.resume(&k);
-    let twice = below.push(frame(5)).resume(&k);
-
-    assert_eq!(once.frames(), 1);
-    assert_eq!(twice.frames(), 2);
-
-    let Next::Frame(a, _) = once.next() else {
-        panic!("expected a frame");
-    };
-    let Next::Frame(b, _) = twice.next() else {
-        panic!("expected a frame");
-    };
-    assert_eq!(marker_of(&a), 9);
-    assert_eq!(marker_of(&b), 9);
-}
-
-/// `into_next` moves the frame out when nothing else holds it, so the captured segment must hold it.
-#[test]
-fn popping_a_captured_frame_leaves_the_continuation_able_to_splice_it_again() {
-    let s = Stack::new()
-        .push_prompt(prompt())
-        .push(frame(1))
-        .push(frame(2));
-    let (k, below) = s.capture(1, 0);
-
-    let Next::Frame(first, rest) = below.resume(&k).into_next() else {
-        panic!("expected a frame");
-    };
-    assert_eq!(marker_of(&first), 2);
-    let Next::Frame(second, _) = rest.into_next() else {
-        panic!("expected a frame");
-    };
-    assert_eq!(marker_of(&second), 1);
-
-    assert_eq!(k.frames(), 2);
-    let again = below.resume(&k);
-    assert_eq!(again.frames(), 2);
-    let Next::Frame(replayed, _) = again.into_next() else {
-        panic!("expected a frame");
-    };
-    assert_eq!(marker_of(&replayed), 2);
-}
-
-#[test]
 fn dropping_a_deep_stack_does_not_recurse_through_the_native_stack() {
     std::thread::Builder::new()
         .stack_size(1 << 20)
@@ -155,23 +80,4 @@ fn dropping_a_deep_stack_does_not_recurse_through_the_native_stack() {
         .expect("failed to spawn")
         .join()
         .expect("dropping the stack overflowed the thread stack");
-}
-
-#[test]
-fn capture_crosses_every_handler_between_the_perform_and_its_own() {
-    let s = Stack::new()
-        .push_prompt(prompt())
-        .push(frame(1))
-        .push_prompt(prompt())
-        .push(frame(2))
-        .push_prompt(prompt())
-        .push(frame(3));
-
-    let (k, below) = s.capture(3, 0);
-    assert_eq!(k.segments(), 3);
-    assert_eq!(k.frames(), 3);
-    assert_eq!(below.segments(), 1);
-    assert_eq!(below.frames(), 0);
-
-    assert_eq!(below.resume(&k).segments(), 4);
 }

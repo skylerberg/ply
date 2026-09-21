@@ -123,6 +123,7 @@ fn json_report(
 
 fn args_for(filter: Option<&str>) -> TestArgs {
     TestArgs {
+        steps: ply_eval::DEFAULT_STEP_BUDGET,
         timeout: 60_000,
         profile: "development".to_string(),
         watch: false,
@@ -991,8 +992,35 @@ fn a_reduction_over_a_bounded_naive_count_is_reported_as_a_bound() {
     assert!(bounded.contains(">= 4096× reduction"), "{bounded}");
 }
 
+/// What a person reads when the clock fires: the run was abandoned, and nothing was decided.
 #[test]
-fn the_pass_and_panic_marks_line_up_with_the_failure_mark() {
+fn an_abandoned_test_reads_as_a_run_given_up_on_rather_than_a_wrong_program() {
+    let (_dir, loaded, _hashes) = fixture();
+    let why =
+        ply_span::Diagnostic::warning(codes::RUN_ABANDONED, "abandoned after 300 ms of wall clock")
+            .note("the clock says nothing about the program, so this run decided nothing");
+    let result = TestResult {
+        index: 0,
+        name: "spins".into(),
+        hash: None,
+        group: 0,
+        duration: Duration::from_millis(300),
+        status: Status::Abandoned,
+        failure: Some(why),
+        simulation: None,
+        recorded: None,
+        backend: None,
+    };
+    let lines = abandoned_lines(&result, &loaded, Style::plain()).join("\n");
+    assert!(lines.contains("abandoned"), "{lines}");
+    assert!(lines.contains("300 ms of wall clock"), "{lines}");
+    assert!(lines.contains("decided nothing"), "{lines}");
+    assert!(!lines.contains("culprit"), "{lines}");
+    assert!(!lines.contains("suspects"), "{lines}");
+}
+
+#[test]
+fn every_result_mark_lines_up_with_the_failure_mark() {
     let make = |status| TestResult {
         index: 0,
         name: "n".into(),
@@ -1012,6 +1040,7 @@ fn the_pass_and_panic_marks_line_up_with_the_failure_mark() {
     };
     assert_eq!(column(Status::Passed), column(Status::Failed));
     assert_eq!(column(Status::Passed), column(Status::Panicked));
+    assert_eq!(column(Status::Passed), column(Status::Abandoned));
 }
 
 #[test]
@@ -1133,6 +1162,7 @@ fn report_over(results: Vec<TestResult>) -> RunReport {
         engine: ply_test::Engine::Evaluator,
         passed: 0,
         failed: 0,
+        abandoned: 0,
         cached: 0,
         failures: Vec::new(),
         duration: Duration::ZERO,
