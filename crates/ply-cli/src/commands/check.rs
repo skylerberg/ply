@@ -1,6 +1,7 @@
 //! `ply check` — the front end over a program, and as much of what it inferred as the flags ask for.
 
 use super::shipped_program::{color, rooted, run};
+use crate::artifact::Binds;
 use crate::cli::CheckArgs;
 use crate::style::Style;
 
@@ -21,5 +22,5 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
         argv.push("--json".to_string());
     }
     argv.push(inside);
-    run("check", argv, &root, args.json, style)
+    run("check", argv, &root, Binds::default(), args.json, style)
 }
