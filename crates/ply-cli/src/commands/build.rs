@@ -234,7 +234,7 @@ fn entry_point<'a>(loaded: &'a Loaded, named: Option<&str>) -> Result<&'a DefInf
         .defs
         .values()
         .filter(|d| d.name.as_str() == named || d.simple_name.as_str() == named)
-        .filter(|d| !ply_std::is_std(&d.module))
+        .filter(|d| !crate::shipped::is_shipped(&d.module))
         .collect();
     match matches.as_slice() {
         // An artifact runs by calling its entry point with nothing.
@@ -280,7 +280,7 @@ fn schema_root<'a>(loaded: &'a Loaded, flag: &str, named: &str) -> Result<&'a De
         .defs
         .values()
         .filter(|d| d.name.as_str() == named || d.simple_name.as_str() == named)
-        .filter(|d| !ply_std::is_std(&d.module))
+        .filter(|d| !crate::shipped::is_shipped(&d.module))
         .collect();
     match matches.as_slice() {
         [one] if arity(one) > 0 => Err(Diagnostic::error(

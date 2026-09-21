@@ -24,6 +24,8 @@ pub const HTTP: &str = include_str!("../ply/http.ply");
 
 pub const NET: &str = include_str!("../ply/net.ply");
 
+pub const PATH: &str = include_str!("../ply/path.ply");
+
 pub const PROCESS: &str = include_str!("../ply/process.ply");
 
 pub const ROUTER: &str = include_str!("../ply/router.ply");
@@ -41,6 +43,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("std.http", HTTP),
     ("std.json", JSON),
     ("std.net", NET),
+    ("std.path", PATH),
     ("std.process", PROCESS),
     ("std.router", ROUTER),
     ("std.signal", SIGNAL),
