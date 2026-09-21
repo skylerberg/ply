@@ -13,6 +13,8 @@ pub nondet effect fs {
   write create_dir[r](path: String) -> Bool
   write remove[r](path: String) -> Bool
   write rename[r](from: String, to: String) -> Bool
+  write lock[r](path: String) -> Bool
+  write unlock[r](path: String) -> Bool
 }
 
 // One directory tree, as a value.
@@ -20,6 +22,7 @@ pub type MemFs = {
   files: Map<String, Bytes>,
   dirs: Map<String, Int>,
   modified: Map<String, Int>,
+  locks: Map<String, Int>,
   clock: Int,
 }
 
@@ -27,7 +30,7 @@ pub type MemFs = {
 pub type Written = { fs: MemFs, ok: Bool }
 
 pub fn mem_empty() -> MemFs =
-  { files: map_new(), dirs: map_new(), modified: map_new(), clock: 1 }
+  { files: map_new(), dirs: map_new(), modified: map_new(), locks: map_new(), clock: 1 }
 
 // A tree seeded with files, every parent directory created along the way.
 pub fn mem_of(files: List<{path: String, body: Bytes}>) -> MemFs =
@@ -152,6 +155,38 @@ pub fn mem_rename(f: MemFs, from: String, to: String) -> Written = {
           ok: true,
         }
       },
+  }
+}
+
+// The lock is the file's existence, so a second taker finds it there and gets `false`.
+pub fn mem_lock(f: MemFs, path: String) -> Written = {
+  let key = normal(path);
+  if !mem_confined(path) || key == "" || mem_is_dir(f, path) ||
+     !mem_is_dir(f, parent_of(key)) || map_contains(f.files, key) {
+    { fs: f, ok: false }
+  } else {
+    {
+      fs: {
+        ..f,
+        files: map_insert(f.files, key, b""),
+        modified: map_insert(f.modified, key, f.clock),
+        locks: map_insert(f.locks, key, f.clock),
+        clock: f.clock + 1,
+      },
+      ok: true,
+    }
+  }
+}
+
+// Only what this tree took: a lock left behind by another holder is broken by removing its file.
+pub fn mem_unlock(f: MemFs, path: String) -> Written = {
+  let key = normal(path);
+  if !map_contains(f.locks, key) { { fs: f, ok: false } }
+  else {
+    { fs: { ..f, files: map_remove(f.files, key),
+                 modified: map_remove(f.modified, key),
+                 locks: map_remove(f.locks, key) },
+      ok: true }
   }
 }
 
@@ -338,6 +373,50 @@ test "rename is a move, and it refuses what it cannot place" {
   // Out of the root is not expressible in one atom, so it is not a rename.
   assert(!mem_rename(fixture, "out/a.tmp", "../a.plyx").ok);
   assert(!mem_rename(fixture, "absent", "out/b.plyx").ok)
+}
+
+// What `ply test --jobs` does to a read-merge-write: two runs flush at once and rename loses one.
+test "a lock is held by one taker at a time, and only its holder releases it" {
+  let dir = mem_create_dir(mem_empty(), "cache");
+  let held = mem_lock(dir.fs, "cache/lock");
+  assert(held.ok);
+  assert(mem_exists(held.fs, "cache/lock"));
+  // Asking again, from this run or another, is contention rather than an error.
+  assert(!mem_lock(held.fs, "cache/lock").ok);
+  // A lock file this tree did not take is one it cannot release.
+  assert(!mem_unlock(mem_write(dir.fs, "cache/lock", b"").fs, "cache/lock").ok);
+  let freed = mem_unlock(held.fs, "cache/lock");
+  assert(freed.ok);
+  assert(!mem_exists(freed.fs, "cache/lock"));
+  // Releasing one nothing holds changes nothing, and the next taker gets it.
+  assert(!mem_unlock(freed.fs, "cache/lock").ok);
+  assert(mem_lock(freed.fs, "cache/lock").ok);
+  // A lock needs a directory to sit in, and cannot be taken outside the root.
+  assert(!mem_lock(mem_empty(), "cache/lock").ok);
+  assert(!mem_lock(dir.fs, "../lock").ok)
+}
+
+test "a handled lock serialises a read-merge-write against a second taker" {
+  with_cell[tree](mem_create_dir(mem_empty(), "cache").fs) { t ->
+    handle {
+      assert(fs.lock[cache]("cache/lock"));
+      assert(!fs.lock[cache]("cache/lock"));
+      assert(fs.unlock[cache]("cache/lock"));
+      assert(!fs.unlock[cache]("cache/lock"));
+      assert(fs.lock[cache]("cache/lock"))
+    } with {
+      fs.lock[cache](p) -> {
+        let w = mem_lock(cell_get(t), p);
+        cell_set(t, w.fs);
+        w.ok
+      },
+      fs.unlock[cache](p) -> {
+        let w = mem_unlock(cell_get(t), p);
+        cell_set(t, w.fs);
+        w.ok
+      },
+    }
+  }
 }
 
 test "a path spelled two ways is one file" {

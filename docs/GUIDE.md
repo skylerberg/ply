@@ -1111,11 +1111,16 @@ records with `Sink` and `event_step`, `enter_step`, `exit_step`, `count_step`,
 ### 13.9 `std.process`
 
 ```ply
+pub type Var = { name: String, value: String }
+pub type Ended = Exited(Int) | Signalled(Int)
+pub type Finished = { ended: Ended, out: Bytes, err: Bytes }
+
 pub nondet effect process {
   read args[p]()             -> List<String>
   write out[p](text: String) -> Unit
   write err[p](text: String) -> Unit
   write exit[p](code: Int)   -> Unit
+  write spawn[e](args: List<String>, dir: String, env: List<Var>) -> Finished
 }
 ```
 
@@ -1130,7 +1135,58 @@ still carries the one object. Handle it over a `Captured` value: `captured(args)
 exit code; a clause `process.exit[proc](c) resume k -> ...` that never calls `k`
 ends the handled body as the host would.
 
-### 13.10 `std.fs`
+`spawn` starts another program and waits for it. Its label is not the process
+but the executable: `--exec cc=/usr/bin/cc` binds one program to `cc`, and
+`process.spawn[cc](..)` can start that program and no other. A label with no
+executable bound is `E0456`, and an `--exec` path that is missing, is not a file
+or has no execute bit is `E0457` before anything runs. Nothing in the call names
+a program, so the run decides what a footprint's `process.spawn[cc]` may do.
+
+`args` is the argument vector after the program; `dir` is the working
+directory, and `""` is the run's own. `env` is the *whole* environment: a spawn
+inherits none of the run's, so what the child reads is in the program's text and
+its configuration rather than in the shell that started `ply`. Both streams are
+captured whole — Ply has no file handles, so there is no streaming and no
+interleaving of the two — and a stream over 64MiB is `E0458`. `stdin` is empty.
+`Exited(code)` is the program's own answer and `Signalled(n)` the signal that
+killed it; neither is a diagnostic, because what a compiler says about a source
+file is a value the driver reads. The label is the capability and nothing
+narrower: a spawned process does what that program can do, so `dir` is not
+confined the way an `fs` path is. Handle it over a `Runs` value: `runs(replies)`
+hands out planned `Finished` values in order and records each `Launch`; a spawn
+with no reply planned answers `Exited(127)`, as a shell does for a command it
+could not run. Build replies with `exited(code, out, err)` and
+`signalled(signal, out, err)`, and read one back with `exit_code`.
+
+### 13.10 `std.time`
+
+```ply
+pub nondet effect time {
+  read now_ms()     -> Int
+  read elapsed_ms() -> Int
+}
+pub fn deadline_in(ms: Int) -> Int / {time.elapsed_ms}
+pub fn expired(deadline: Int) -> Bool / {time.elapsed_ms}
+pub fn since(started: Int) -> Int / {time.elapsed_ms}
+```
+
+The host's real time, in two readings, neither a function of the program state,
+so a definition that takes one is `nondet` and a `test` over it must handle it.
+`now_ms` is milliseconds since the Unix epoch: a date to stamp a record with, and
+nothing to measure with, since the system clock can be set backwards.
+`elapsed_ms` counts from the moment the run's host was built and never goes back,
+so the difference of two readings is a span; a single reading means nothing on
+its own. Handle both over a `Ticks` value: `ticks(wall, mono)` reads each list in
+order through `now_step` and `elapsed_step`, each answering a `Tick` of the
+reading and the ticks left, and repeats the last reading once a list runs out.
+
+This is not the language's `clock` (§9), which is virtual time: `clock.sleep`
+arms a timer the scheduler advances, and `clock.now` reads where the schedule has
+got to. `time` is what the operating system says, and nothing advances it. They
+are named apart because they are different things, and a program that wants a
+deadline inside `simulate { .. }` wants `clock`.
+
+### 13.11 `std.fs`
 
 ```ply
 pub type Kind = | File | Dir | Symlink | Missing
@@ -1146,6 +1202,8 @@ pub nondet effect fs {
   write create_dir[r](path: String) -> Bool
   write remove[r](path: String) -> Bool
   write rename[r](from: String, to: String) -> Bool
+  write lock[r](path: String) -> Bool
+  write unlock[r](path: String) -> Bool
 }
 ```
 
@@ -1155,13 +1213,28 @@ the read bound: `E0453`. Different roots do not conflict. Reads are whole-file,
 `list_dir` is one level, `rename` stays in one root. `kind` says what a path
 names in one call and does not follow a symlink, so a walk can pass one over;
 `Missing` is also what this run cannot read. Every other operation follows one.
+
+`lock` and `unlock` serialise a read-merge-write across processes, which a
+`rename` alone cannot: two runs that flush a cache at once lose one of them.
+The path names the lock file itself, under the same root as what it guards.
+`lock` answers `true` when it created that file, and `false` when a holder still
+had it after two seconds of waiting — contention is a value, never a diagnostic.
+There is no reentrancy: a run that asks twice for a lock it already holds waits
+the same two seconds and gets `false`. A lock file older than thirty seconds is
+one whose holder died, and the next taker removes it and takes it. `unlock`
+releases the claim this run took, answering `true`, and answers `false` — and
+removes nothing — for a lock it does not hold, so one run cannot break another's.
+A run that dies holding a lock leaves the file behind, and the stale age is what
+recovers it.
+
 The twin is `MemFs` (`mem_empty`, `mem_of`, `mem_read`, `mem_write`, `mem_list`,
 `mem_kind`, `mem_exists`, `mem_size`, `mem_create_dir`, `mem_remove`,
-`mem_rename`, `mem_modified`); it holds no symlinks, so `mem_kind` never answers
-`Symlink`. A test imports both `std.fs` and `std.fs (fs)` to name the module and
+`mem_rename`, `mem_modified`, `mem_lock`, `mem_unlock`); it holds no symlinks, so
+`mem_kind` never answers `Symlink`, and it has no wall clock, so no lock in it
+goes stale. A test imports both `std.fs` and `std.fs (fs)` to name the module and
 the effect.
 
-### 13.11 `std.path`
+### 13.12 `std.path`
 
 ```ply
 pub fn join(dir: String, name: String) -> String
@@ -1176,7 +1249,7 @@ last segment, `""` for a path ending in a separator. `extension` follows the las
 dot of the file name, and a dotfile has none. `strip_dot` removes a leading
 `./`, so `./m.ply` and `m.ply` are one key in a set.
 
-### 13.12 `std.hash`
+### 13.13 `std.hash`
 
 `pub fn blake3(input: Bytes) -> Bytes` answers 32 bytes. It is written in Ply
 and slow; use it for small inputs.
@@ -1202,6 +1275,7 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")`; `E0430` if it does not load, `E0429` if unnamed |
 | `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
+| `--exec NAME=PATH` | repeatable program a `process.spawn` label may start (`ply run` only); `E0457` if it cannot be executed |
 | `--db URL` | database (else `PLY_DB_URL`; password from `PLY_DB_PASSWORD`); `E0431` if absent when used |
 | `--db-pool N` | pool size |
 | `--db-acquire-ms MS` | wait for a connection before `E0437` |
@@ -1429,6 +1503,9 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0453` | whole-file read over the bound |
 | `E0454` | `--fs` root that is not a directory |
 | `E0455` | the program asked to exit with a code |
+| `E0456` | `process.spawn` label with no executable bound |
+| `E0457` | `--exec` path that cannot be executed |
+| `E0458` | captured output over the bound |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | ran past its time budget |

@@ -9,7 +9,7 @@ use crate::load::{Loaded, load};
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_DRAIN_INCOMPLETE, EXIT_FAILED, EXIT_OK};
 use ply_eval::{Machine, Plan, Value as PlyValue};
-use ply_host::process::{ProcessHost, Sink, Stream};
+use ply_host::process::{Executables, ProcessHost, Sink, Stream};
 use ply_host::signal::{self, Shutdown};
 use ply_span::{Diagnostic, SourceId, Span, codes};
 use ply_ty::DefInfo;
@@ -99,6 +99,18 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
             style,
         );
     }
+    let process = match args.host.then(|| process_host(args)).transpose() {
+        Ok(process) => process,
+        Err(diagnostic) => {
+            return report_bind_error(
+                "run",
+                std::slice::from_ref(&diagnostic),
+                &loaded.sources,
+                args.json,
+                style,
+            );
+        }
+    };
     let mut hosts = match Hosts::open_stopping(
         &loaded.check,
         args.host,
@@ -109,7 +121,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
         &args.trace,
         declared.as_ref(),
         shutdown.clone(),
-        args.host.then(|| process_host(args)),
+        process,
     ) {
         Ok(hosts) => hosts,
         Err(diagnostics) => {
@@ -290,9 +302,11 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
 }
 
 /// `--json` promises stdout to the one object, so the program's own lines go to stderr instead.
-pub(crate) fn process_host(args: &RunArgs) -> ProcessHost {
+/// Loaded up front so an `--exec` that cannot be started is `E0457` before anything runs.
+pub(crate) fn process_host(args: &RunArgs) -> Result<ProcessHost, Diagnostic> {
     let out = if args.json { Stream::Err } else { Stream::Out };
-    ProcessHost::new(args.argv.clone(), Sink::Real { out })
+    let executables = Executables::load(&args.exec.exec, Span::DUMMY)?;
+    Ok(ProcessHost::new(args.argv.clone(), Sink::Real { out }).executing(executables))
 }
 
 /// Rolls back every open transaction, closes spans `Abandoned`, flushes the sink, closes the pool.

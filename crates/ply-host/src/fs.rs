@@ -8,15 +8,25 @@ use ply_eval::host::{
 use ply_eval::{Pending, Value};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_ty::Resource;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Must match the effect `std.fs` declares.
 pub const EFFECT: &str = "fs";
 
 pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How long `fs.lock` waits for a holder to release before answering `false`.
+pub const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+const LOCK_POLL: Duration = Duration::from_millis(2);
+
+/// Far longer than a read-merge-write takes, so only a lock left by a killed process is broken.
+pub const LOCK_STALE_AGE: Duration = Duration::from_secs(30);
 
 /// In the order `std.fs` declares them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,10 +41,12 @@ pub enum Op {
     CreateDir,
     Remove,
     Rename,
+    Lock,
+    Unlock,
 }
 
 impl Op {
-    pub const ALL: [Op; 10] = [
+    pub const ALL: [Op; 12] = [
         Op::ReadFile,
         Op::ListDir,
         Op::Kind,
@@ -45,6 +57,8 @@ impl Op {
         Op::CreateDir,
         Op::Remove,
         Op::Rename,
+        Op::Lock,
+        Op::Unlock,
     ];
 
     pub fn name(self) -> &'static str {
@@ -59,6 +73,8 @@ impl Op {
             Op::CreateDir => "create_dir",
             Op::Remove => "remove",
             Op::Rename => "rename",
+            Op::Lock => "lock",
+            Op::Unlock => "unlock",
         }
     }
 
@@ -74,6 +90,8 @@ impl Op {
             Op::CreateDir => "`fs.create_dir`",
             Op::Remove => "`fs.remove`",
             Op::Rename => "`fs.rename`",
+            Op::Lock => "`fs.lock`",
+            Op::Unlock => "`fs.unlock`",
         }
     }
 
@@ -97,6 +115,8 @@ impl Op {
             Op::CreateDir => "fs-mkdir",
             Op::Remove => "fs-remove",
             Op::Rename => "fs-rename",
+            Op::Lock => "fs-lock",
+            Op::Unlock => "fs-unlock",
         }
     }
 
@@ -214,6 +234,8 @@ impl Roots {
 pub struct FsHost {
     roots: Roots,
     pool: Pool,
+    /// The lock files this run took and has not released; a lock it did not take it cannot release.
+    held: Arc<Mutex<BTreeSet<PathBuf>>>,
 }
 
 impl FsHost {
@@ -221,6 +243,7 @@ impl FsHost {
         FsHost {
             roots,
             pool: Pool::new(FS_FIRST_TOKEN),
+            held: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -264,6 +287,8 @@ impl FsHost {
             Op::CreateDir => "ply_host::fs::create_dir",
             Op::Remove => "ply_host::fs::remove",
             Op::Rename => "ply_host::fs::rename",
+            Op::Lock => "ply_host::fs::lock",
+            Op::Unlock => "ply_host::fs::unlock",
         }
     }
 }
@@ -306,11 +331,12 @@ impl HostHandler for Operation {
         };
 
         let op = self.op;
+        let held = Arc::clone(&self.fs.held);
         let pending = self.fs.pool.submit(
             span,
             op.label(),
             op.what(),
-            Box::new(move || run(op, &root, &first, second, span)),
+            Box::new(move || run(op, &root, &first, second, &held, span)),
         )?;
         Ok(HostAnswer::Pending(pending))
     }
@@ -322,7 +348,14 @@ enum Second {
     Path(String),
 }
 
-fn run(op: Op, root: &Path, path: &str, second: Second, span: Span) -> Done {
+fn run(
+    op: Op,
+    root: &Path,
+    path: &str,
+    second: Second,
+    held: &Mutex<BTreeSet<PathBuf>>,
+    span: Span,
+) -> Done {
     let target = match confine(root, path, span) {
         Ok(target) => target,
         Err(refusal) => return Done::Refused(refusal),
@@ -390,7 +423,57 @@ fn run(op: Op, root: &Path, path: &str, second: Second, span: Span) -> Done {
             },
             _ => Done::Failed("a rename with no destination reached the pool".into()),
         },
+        Op::Lock => Done::Bool(take_lock(&target, held)),
+        Op::Unlock => Done::Bool(drop_lock(&target, held)),
     }
+}
+
+/// `O_CREAT|O_EXCL` on a lock file, waiting out a holder and breaking one a dead run left behind.
+pub fn take_lock(target: &Path, held: &Mutex<BTreeSet<PathBuf>>) -> bool {
+    take_lock_within(target, held, LOCK_WAIT)
+}
+
+/// [`take_lock`] over a wait it does not choose; `fs.lock` always waits [`LOCK_WAIT`].
+pub fn take_lock_within(target: &Path, held: &Mutex<BTreeSet<PathBuf>>, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        match OpenOptions::new().write(true).create_new(true).open(target) {
+            Ok(_) => {
+                lock(held).insert(target.to_path_buf());
+                return true;
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            // No directory to hold it, or no permission: waiting would not change either.
+            Err(_) => return false,
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        if is_older_than(target, LOCK_STALE_AGE) {
+            let _ = std::fs::remove_file(target);
+        }
+        std::thread::sleep(LOCK_POLL);
+    }
+}
+
+/// The claim, not the file, is what a run releases: a lock it never took is not its to break.
+pub fn drop_lock(target: &Path, held: &Mutex<BTreeSet<PathBuf>>) -> bool {
+    if !lock(held).remove(target) {
+        return false;
+    }
+    let _ = std::fs::remove_file(target);
+    true
+}
+
+fn is_older_than(path: &Path, age: Duration) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .is_ok_and(|m| m.elapsed().is_ok_and(|elapsed| elapsed >= age))
+}
+
+/// The guarded set has no invariant a panicking job can break, so recovering is correct.
+fn lock(held: &Mutex<BTreeSet<PathBuf>>) -> MutexGuard<'_, BTreeSet<PathBuf>> {
+    held.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn confine(root: &Path, path: &str, span: Span) -> Result<PathBuf, Diagnostic> {
