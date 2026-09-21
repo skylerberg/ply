@@ -266,6 +266,17 @@ holds, so a row naming `[l]` prints its variable as `[m]` and the two stay
 apart. Filling the wrong number of labels, leaving one unfilled, or
 using a label-generic definition as a value instead of calling it, is `E0306`.
 
+Row parameters are shared the same way: one recursive group is checked with one
+set of row binders, taken in order whatever each member calls them, so a
+definition generic over a row may call a mutually recursive sibling and the row
+crosses the cycle. Members binding different numbers of them are `E0307`, as
+with labels, and a call inside the group keeps the row the group was called
+with: an argument carrying another row is `E0308`. Type parameters are *not*
+shared — each definition keeps its own — so a call inside a group that would
+need the callee's type parameter at another type is polymorphic recursion, which
+Ply does not infer. That is `E0308` as well: break the cycle so the callee is
+checked on its own before the call, or monomorphise it.
+
 ### 4.6 Types the language declares
 
 In scope everywhere; redeclaring one is `E0105`:
@@ -1385,7 +1396,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0304` | resource label required |
 | `E0305` | `handle` leaves an operation, or a mode atom, under a handled mode atom unanswered |
 | `E0306` | label instantiation: a call leaves a label unfilled or writes the wrong number of them, or a label-generic definition is used as a value |
-| `E0307` | mutually recursive definitions binding different label parameters |
+| `E0307` | mutually recursive definitions binding different label or row parameters |
+| `E0308` | polymorphic recursion: a call inside a recursive group asks for another row or type parameter than the group was checked with |
 | `E0412` | nondeterministic effect in a deterministic test |
 | `E0413` | `Task` escapes its region |
 | `E0414` | deadlock, or spent step budget |

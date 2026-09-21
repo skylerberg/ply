@@ -18,14 +18,3 @@ A record update now takes its shape from a call of a `fn` declared in the same f
 still never read across a module boundary: the rewrite runs before types exist, and a shape
 read from another file would change this file's hashes without this file changing. Assumed:
 that line stays where it is, and `{..other::make(), x: 1}` keeps needing a local annotation.
-
-## Row and type parameters still do not share across a recursive group
-
-A recursive component is now checked with one set of label binders, so a definition generic over
-a label may call a mutually recursive sibling. Row and type parameters are not shared the same
-way: two members each get their own rigid `e` and `a`, so `std.http`'s connection loop is still
-one function rather than five (`crates/ply-std/ply/http.ply`). Extending the sharing is not
-mechanical, since a group whose members want *different* instantiations of a type parameter is
-polymorphic recursion, which needs written signatures to stay decidable. Assumed: worth doing for
-rows, where there is no such difficulty, and worth refusing clearly for types. Say whether you
-want both, rows only, or neither.
