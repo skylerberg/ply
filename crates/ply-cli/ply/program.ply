@@ -1,0 +1,175 @@
+// The program a command answers about: the files a path names, the shipped modules they pulled off
+// the shelf, and every table the front end holds for them. One load per invocation, as the Rust
+// driver did one.
+
+import std.fs (fs)
+import compiler.front (Refused, Analysed, Whole, Pulled, analyse_pulling_std)
+import compiler.hash (HashOutput, hex)
+import compiler.items (Item, IFn)
+import compiler.infer (DefInfo, Loc)
+import compiler.resolve (Source, Mod, Diag, qualify)
+import diagnostic (Place, spot_of)
+import sources (File, Project, load, shelf, nothing_here, is_std, is_compiler)
+
+// `whole` is `None` exactly when `diags` holds an error: a stage that reported stopped the rest.
+pub type Program = { files: List<File>, places: List<Place>, diags: List<Diag>, whole: Option<Whole> }
+
+pub type ModuleView = { name: String, path: String }
+
+// --- Where a shipped module's text is said to live ------------------------------
+
+fn joined(segments: List<String>, sep: String) -> String =
+  fold(range(0, len(segments)), "", |acc: String, i: Int|
+    match list_at(segments, i) {
+      Some(s) -> if i == 0 { s } else { acc ++ sep ++ s },
+      None -> acc,
+    })
+
+fn without_first(segments: List<String>) -> List<String> =
+  fold(range(1, len(segments)), [], |acc: List<String>, i: Int|
+    match list_at(segments, i) { Some(s) -> push(acc, s), None -> acc })
+
+// `std.json` is `<std>/json.ply`, as the cache keys it and as a rendered span names it.
+pub fn pseudo_path(name: String) -> String = {
+  let segments = string_split(name, ".");
+  match list_at(segments, 0) {
+    None -> name,
+    Some(root) -> "<" ++ root ++ ">/" ++ joined(without_first(segments), "/") ++ ".ply",
+  }
+}
+
+fn shelf_place(texts: Map<String, Bytes>, name: String) -> Place =
+  { path: pseudo_path(name),
+    text: match map_get(texts, name) { Some(t) -> t, None -> b"" } }
+
+fn appended<a>(head: List<a>, tail: List<a>) -> List<a> = fold(tail, head, |acc: List<a>, x: a| push(acc, x))
+
+// --- Loading --------------------------------------------------------------------
+
+fn broken(project: Project, places: List<Place>, diags: List<Diag>) -> Program =
+  { files: project.files, places: places, diags: diags, whole: None }
+
+fn own_places(project: Project) -> List<Place> =
+  map(project.files, |f: File| { path: f.path, text: f.text })
+
+fn analysed(project: Project, shelved: List<Source>) -> Program = {
+  let texts = fold(shelved, map_new(), |acc: Map<String, Bytes>, s: Source|
+    map_insert(acc, string_of_bytes_lossy(s.name), s.src));
+  let pulled: Pulled = analyse_pulling_std(project.sources, shelved);
+  let places = appended(own_places(project),
+                        map(pulled.pulled, |n: Bytes| shelf_place(texts, string_of_bytes_lossy(n))));
+  match pulled.out {
+    Refused(ds) -> broken(project, places, ds),
+    Analysed(w) -> { files: project.files, places: places, diags: w.warnings, whole: Some(w) },
+  }
+}
+
+pub fn load_program(paths: List<String>) -> Program
+  / {fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.list_dir[shelf], fs.read_file[shelf]} = {
+  let project: Project = load(paths);
+  if len(project.diags) > 0 { broken(project, own_places(project), project.diags) }
+  else if len(project.sources) == 0 {
+    broken(project, [], [nothing_here(match list_at(paths, 0) { Some(p) -> p, None -> "." })])
+  } else { analysed(project, shelf()) }
+}
+
+// --- Reading the tables ----------------------------------------------------------
+
+pub fn modules_of(p: Program, w: Whole) -> List<ModuleView> =
+  map(range(0, len(w.mods)), |i: Int|
+    { name: match list_at(w.mods, i) { Some(mo) -> string_of_bytes_lossy(mo.name), None -> "" },
+      path: match list_at(p.places, i) { Some(place) -> place.path, None -> "" } })
+
+pub fn place_of(p: Program, at: Loc) -> Option<Place> =
+  if at.module == 4294967295 { None } else { list_at(p.places, at.module) }
+
+// `path:line:col`, one-based, as every other command prints a place.
+pub fn location_of(p: Program, at: Loc) -> Option<String> =
+  match place_of(p, at) {
+    None -> None,
+    Some(place) -> {
+      let spot = spot_of(place.text, at.span.start);
+      Some(place.path ++ ":" ++ int_to_string(spot.line) ++ ":" ++ int_to_string(spot.col))
+    },
+  }
+
+type Picking = { seen: Map<Bytes, Bool>, out: List<DefInfo> }
+
+fn pick(acc: Picking, by_name: Map<Bytes, DefInfo>, name: Bytes) -> Picking =
+  match map_get(acc.seen, name) {
+    Some(_) -> acc,
+    None ->
+      match map_get(by_name, name) {
+        None -> acc,
+        Some(d) -> { seen: map_insert(acc.seen, name, true), out: push(acc.out, d) },
+      },
+  }
+
+fn module_fns(acc: List<Bytes>, mo: Mod) -> List<Bytes> =
+  fold(mo.module.items, acc, |a: List<Bytes>, it: Item|
+    match it { IFn(d) -> push(a, qualify(mo.name, d.name.name)), _ -> a })
+
+// Every definition in the order its file declares it, module by module, as `ply defs` lists them
+// and as the driver's `published_order` orders them; anything the tree does not name follows.
+pub fn published(w: Whole) -> List<DefInfo> = {
+  let by_name = fold(w.checked.defs, map_new(), |acc: Map<Bytes, DefInfo>, d: DefInfo| map_insert(acc, d.name, d));
+  let named = fold(w.mods, [], |acc: List<Bytes>, mo: Mod| module_fns(acc, mo));
+  let first: Picking = fold(named, { seen: map_new(), out: [] }, |acc: Picking, name: Bytes| pick(acc, by_name, name));
+  let all: Picking = fold(w.checked.defs, first, |acc: Picking, d: DefInfo| pick(acc, by_name, d.name));
+  all.out
+}
+
+// The hash tables the dump writes as lists, indexed once so a lookup is not a scan.
+pub type Tables = { defs: Map<Bytes, Bytes>, own: Map<Bytes, Bytes>, deps: Map<Bytes, List<Bytes>>,
+                    closure: Map<Bytes, List<Bytes>>, specs: Map<Bytes, Int> }
+
+pub fn tables_of(h: HashOutput) -> Tables =
+  { defs: fold(h.defs, map_new(), |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }| map_insert(acc, x.name, x.hash)),
+    own: fold(h.own, map_new(), |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }| map_insert(acc, x.name, x.hash)),
+    deps: fold(h.deps, map_new(), |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, names: List<Bytes> }| map_insert(acc, x.name, x.names)),
+    closure: fold(h.closure, map_new(), |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, names: Map<Bytes, Bool> }|
+      map_insert(acc, x.name, map_fold(x.names, [], |ns: List<Bytes>, k: Bytes, v: Bool| push(ns, k)))),
+    specs: fold(h.specs, map_new(), |acc: Map<Bytes, Int>, x: { name: Bytes, hashes: List<Bytes> }| map_insert(acc, x.name, len(x.hashes))) }
+
+// A definition's hash as `ply hash` prints it: sixty-four hex characters, or nothing when the
+// program declares the name without hashing a body for it.
+pub fn hash_of(t: Tables, name: Bytes) -> Option<String> =
+  match map_get(t.defs, name) { Some(h) -> Some(string_of_bytes_lossy(hex(h))), None -> None }
+
+pub fn own_of(t: Tables, name: Bytes) -> Option<String> =
+  match map_get(t.own, name) { Some(h) -> Some(string_of_bytes_lossy(hex(h))), None -> None }
+
+pub fn deps_of(t: Tables, name: Bytes) -> List<String> =
+  match map_get(t.deps, name) { Some(ns) -> map(ns, |n: Bytes| string_of_bytes_lossy(n)), None -> [] }
+
+pub fn closure_of(t: Tables, name: Bytes) -> List<String> =
+  match map_get(t.closure, name) { Some(ns) -> map(ns, |n: Bytes| string_of_bytes_lossy(n)), None -> [] }
+
+pub fn specs_of(t: Tables, name: Bytes) -> Int =
+  match map_get(t.specs, name) { Some(n) -> n, None -> 0 }
+
+pub fn short_of(hex_text: String) -> String = string_slice(hex_text, 0, 12)
+
+pub fn is_shipped(module: String) -> Bool = is_std(module) || is_compiler(module)
+
+// --- Tests ------------------------------------------------------------------
+
+test "a shipped module's text is said to live under its root, outside the identifier space" {
+  assert_eq(pseudo_path("std.json"), "<std>/json.ply");
+  assert_eq(pseudo_path("std.http.server"), "<std>/http/server.ply");
+  assert_eq(pseudo_path("compiler.fmt"), "<compiler>/fmt.ply")
+}
+
+test "a shipped module is one under a reserved root and nothing else" {
+  assert(is_shipped("std"));
+  assert(is_shipped("std.json"));
+  assert(is_shipped("compiler.front"));
+  assert(!is_shipped("standard"));
+  assert(!is_shipped("m"))
+}
+
+test "a span outside every module has no place and no location" {
+  let p: Program = { files: [], places: [{ path: "m.ply", text: b"fn f() -> Int = 1\n" }], diags: [], whole: None };
+  assert_eq(location_of(p, { module: 4294967295, span: { start: 0, end: 0 } }), None);
+  assert_eq(location_of(p, { module: 0, span: { start: 3, end: 4 } }), Some("m.ply:1:4"))
+}

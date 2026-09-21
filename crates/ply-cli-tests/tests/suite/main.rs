@@ -1,6 +1,7 @@
 //! One binary. A test that reads process-global state (`#[global_allocator]`, `ply_eval::census`) needs a binary of its own.
 
 mod artifact;
+mod artifact_program;
 mod backend;
 mod bootstrap_archive;
 mod cli;
@@ -17,7 +18,6 @@ mod effect_sets;
 mod explain;
 mod failure_classification_audit;
 mod fmt;
-mod fmt_artifact;
 mod http_endpoint;
 mod incremental;
 mod incremental_audit;

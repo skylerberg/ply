@@ -1,70 +1,13 @@
-// `ply fmt`, as a program. The Rust command builds this into an artifact and enters it with the
-// command line as `process.args` and the working directory bound as the root `cwd`, so every path
-// here is relative to it and one that leaves it is the host's refusal.
+// `ply fmt`, as one command of the program in this directory. The walk is `walk.ply`'s, the
+// command line is `args.ply`'s, and every path here is relative to the working directory the run
+// binds as the root `cwd`, so one that leaves it is the host's refusal.
 
-import std.process (process, Captured, captured, args_step, out_step, err_step, exit_step)
-import std.fs (fs, File, Dir, Symlink, Missing, MemFs, mem_of, mem_read, mem_kind, mem_list, mem_write)
-import std.path (join, extension, strip_dot)
-import std.json (Str, Bool, Number, Array, object, to_string)
+import std.fs (fs, mem_of, mem_read, mem_kind, mem_list, mem_write, MemFs, Written)
+import std.json (Json, Str, Bool, Number, Array, object, to_string)
+import args (Flags, read)
+import report (Answer, schema_version, ok_code, compile_error)
+import walk (Failure, Found, sweep)
 import compiler.fmt (fmt_source)
-
-// --- The command line -------------------------------------------------------
-
-type Flags = { check: Bool, json: Bool, paths: List<String> }
-
-// Every word that is not a flag is a path; `clap` has already refused any other flag.
-fn read_flags(args: List<String>) -> Flags =
-  fold(args, { check: false, json: false, paths: [] }, |acc: Flags, arg: String|
-    if arg == "--check" { {..acc, check: true} }
-    else if arg == "--json" { {..acc, json: true} }
-    else { {..acc, paths: push(acc.paths, strip_dot(arg))} })
-
-// --- Finding the files ------------------------------------------------------
-
-type Failure = { path: String, why: String }
-
-// A set kept as a map: the paths come back sorted and deduped, so `./m.ply` and `m.ply` are one.
-type Found = { files: Map<String, Bool>, errors: List<Failure> }
-
-fn nothing() -> Found = { files: map_new(), errors: [] }
-
-fn keep(found: Found, path: String) -> Found =
-  {..found, files: map_insert(found.files, path, true)}
-
-fn refuse(found: Found, path: String, why: String) -> Found =
-  {..found, errors: push(found.errors, { path: path, why: why })}
-
-// A hidden directory holds caches and VCS metadata, and `target` holds build output.
-fn skipped(name: String) -> Bool = string_starts_with(name, ".") || name == "target"
-
-fn is_ply(name: String) -> Bool = extension(name) == Some("ply")
-
-// A path the command line named: a file is taken whatever it is called, a directory is walked, and
-// a symlink is refused rather than followed, since a rewrite through one leaves the root.
-fn named(found: Found, path: String) -> Found / {fs.kind[cwd], fs.list_dir[cwd]} =
-  match fs.kind[cwd](path) {
-    File -> keep(found, path),
-    Dir -> walk(found, path),
-    Symlink -> refuse(found, path, "a symlink is not formatted"),
-    Missing -> refuse(found, path, "could not read"),
-  }
-
-// One entry of a directory, which the walk never follows and never reports.
-fn entry(found: Found, path: String, name: String) -> Found / {fs.kind[cwd], fs.list_dir[cwd]} =
-  match fs.kind[cwd](path) {
-    File -> if is_ply(name) { keep(found, path) } else { found },
-    Dir -> if skipped(name) { found } else { walk(found, path) },
-    Symlink -> found,
-    Missing -> found,
-  }
-
-fn walk(found: Found, dir: String) -> Found / {fs.kind[cwd], fs.list_dir[cwd]} =
-  match fs.list_dir[cwd](dir) {
-    None -> refuse(found, dir, "could not read"),
-    Some(names) -> fold(names, found, |acc: Found, name: String| entry(acc, join(dir, name), name)),
-  }
-
-// --- Formatting -------------------------------------------------------------
 
 type Outcome = { path: String, changed: Bool }
 
@@ -93,28 +36,23 @@ fn format_one(report: Report, check: Bool, path: String) -> Report
   }
 
 // The paths as given, or `.`; each is found first, so the files are formatted in path order.
-fn sweep(flags: Flags) -> Report
+fn rewrite(flags: Flags) -> Report
   / {fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.write_file[cwd]} = {
-  let wanted = if len(flags.paths) == 0 { ["."] } else { flags.paths };
-  let found: Found = fold(wanted, nothing(), |acc: Found, path: String| named(acc, path));
+  let found: Found = sweep(flags.paths);
   let start: Report = { files: [], errors: found.errors };
   fold(map_keys(found.files), start, |acc: Report, path: String| format_one(acc, flags.check, path))
 }
-
-// --- The report -------------------------------------------------------------
-
-fn schema_version() -> Int = 1
 
 fn changed_of(report: Report) -> List<Outcome> = filter(report.files, |f: Outcome| f.changed)
 
 // An error is `2` whatever else happened; `--check` with work left to do is `1`.
 fn exit_code(report: Report, check: Bool) -> Int =
-  if len(report.errors) > 0 { 2 }
+  if len(report.errors) > 0 { compile_error() }
   else if check && len(changed_of(report)) > 0 { 1 }
-  else { 0 }
+  else { ok_code() }
 
-fn json_report(report: Report, code: Int) -> String =
-  to_string(object([
+fn json_report(report: Report, code: Int) -> Json =
+  object([
     { key: "command", value: Str("fmt") },
     { key: "schema_version", value: Number(decimal_of_int(schema_version())) },
     { key: "ok", value: Bool(code == 0) },
@@ -125,79 +63,43 @@ fn json_report(report: Report, code: Int) -> String =
     { key: "errors", value: Array(map(report.errors, |e: Failure|
         object([{ key: "path", value: Str(e.path) },
                 { key: "error", value: Str(e.why) }]))) },
-  ]))
+  ])
 
-fn say_changed(verb: String, files: List<Outcome>) -> Unit / {process.out[proc]} =
-  match files {
-    [] -> (),
-    [first, ..rest] -> { process.out[proc](verb ++ first.path); say_changed(verb, rest) },
-  }
-
-fn say_errors(errors: List<Failure>) -> Unit / {process.err[proc]} =
-  match errors {
-    [] -> (),
-    [first, ..rest] -> {
-      process.err[proc]("error: " ++ first.path ++ ": " ++ first.why);
-      say_errors(rest)
-    },
-  }
-
-fn say(report: Report, flags: Flags, code: Int) -> Unit / {process.out[proc], process.err[proc]} =
-  if flags.json { process.out[proc](json_report(report, code)) }
-  else {
-    say_changed(if flags.check { "would format " } else { "formatted " }, changed_of(report));
-    say_errors(report.errors)
-  }
-
-fn main() -> Unit
-  / {process.args[proc], process.out[proc], process.err[proc], process.exit[proc], fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.write_file[cwd]} = {
-  let flags = read_flags(process.args[proc]());
-  let report = sweep(flags);
+fn answered(report: Report, flags: Flags) -> Answer = {
   let code = exit_code(report, flags.check);
-  say(report, flags, code);
-  process.exit[proc](code)
+  let verb = if flags.check { "would format " } else { "formatted " };
+  { json: json_report(report, code),
+    lines: map(changed_of(report), |f: Outcome| verb ++ f.path),
+    errs: map(report.errors, |e: Failure| "error: " ++ e.path ++ ": " ++ e.why),
+    code: code }
 }
+
+pub fn run(flags: Flags) -> Answer
+  / {fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.write_file[cwd]} =
+  answered(rewrite(flags), flags)
 
 // --- Tests ------------------------------------------------------------------
 
-// The two twins a run is entered over: one tree, one process.
-type World = { tree: MemFs, io: Captured }
+// One tree, the answer over it, and what was written back.
+type World = { tree: MemFs, answer: Answer }
 
 fn unformatted() -> Bytes = b"fn  add(a: Int,b: Int)->Int = a+b\n"
 
-fn seeded(files: List<{path: String, body: Bytes}>, args: List<String>) -> World =
-  { tree: mem_of(files), io: captured(args) }
-
-// `main` over the twins: the tree it left and every line it wrote.
-fn run_over(files: List<{path: String, body: Bytes}>, args: List<String>) -> World =
-  with_cell[twin](seeded(files, args)) { w -> {
-    handle {
-      main()
+fn run_over(files: List<{path: String, body: Bytes}>, argv: List<String>) -> World =
+  with_cell[twin](mem_of(files)) { w -> {
+    let answer = handle {
+      run(read(argv))
     } with {
-      process.args[proc]() -> args_step(cell_get(w).io),
-      process.out[proc](text) -> {
-        let now: World = cell_get(w);
-        cell_set(w, {..now, io: out_step(now.io, text)})
-      },
-      process.err[proc](text) -> {
-        let now: World = cell_get(w);
-        cell_set(w, {..now, io: err_step(now.io, text)})
-      },
-      process.exit[proc](code) resume k -> {
-        let now: World = cell_get(w);
-        cell_set(w, {..now, io: exit_step(now.io, code)})
-      },
-      fs.kind[cwd](p) -> mem_kind(cell_get(w).tree, p),
-      fs.list_dir[cwd](p) -> mem_list(cell_get(w).tree, p),
-      fs.read_file[cwd](p) -> mem_read(cell_get(w).tree, p),
+      fs.kind[cwd](p) -> mem_kind(cell_get(w), p),
+      fs.list_dir[cwd](p) -> mem_list(cell_get(w), p),
+      fs.read_file[cwd](p) -> mem_read(cell_get(w), p),
       fs.write_file[cwd](p, body) -> {
-        let now: World = cell_get(w);
-        let written = mem_write(now.tree, p, body);
-        cell_set(w, {..now, tree: written.fs});
+        let written: Written = mem_write(cell_get(w), p, body);
+        cell_set(w, written.fs);
         written.ok
       },
     };
-    cell_get(w)
+    { tree: cell_get(w), answer: answer }
   } }
 
 fn line_at(lines: List<String>, i: Int) -> String =
@@ -205,16 +107,16 @@ fn line_at(lines: List<String>, i: Int) -> String =
 
 test "a file is rewritten once, and a second run over the answer changes nothing" {
   let once = run_over([{path: "m.ply", body: unformatted()}], []);
-  assert_eq(once.io.out, ["formatted m.ply"]);
-  assert_eq(once.io.err, []);
-  assert_eq(once.io.code, Some(0));
+  assert_eq(once.answer.lines, ["formatted m.ply"]);
+  assert_eq(once.answer.errs, []);
+  assert_eq(once.answer.code, 0);
   match mem_read(once.tree, "m.ply") {
     None -> panic("the file was written back"),
     Some(body) -> {
       assert(body != unformatted());
       let twice = run_over([{path: "m.ply", body: body}], []);
-      assert_eq(twice.io.out, []);
-      assert_eq(twice.io.code, Some(0));
+      assert_eq(twice.answer.lines, []);
+      assert_eq(twice.answer.code, 0);
       assert_eq(mem_read(twice.tree, "m.ply"), Some(body))
     },
   }
@@ -222,89 +124,37 @@ test "a file is rewritten once, and a second run over the answer changes nothing
 
 test "`--check` names what would change, writes nothing and exits 1" {
   let run = run_over([{path: "m.ply", body: unformatted()}], ["--check"]);
-  assert_eq(run.io.out, ["would format m.ply"]);
-  assert_eq(run.io.code, Some(1));
+  assert_eq(run.answer.lines, ["would format m.ply"]);
+  assert_eq(run.answer.code, 1);
   assert_eq(mem_read(run.tree, "m.ply"), Some(unformatted()))
 }
 
 test "a file that does not parse is reported with its diagnostic and left as it was" {
   let broken = b"fn f( = 1\n";
   let run = run_over([{path: "m.ply", body: broken}], []);
-  assert_eq(run.io.out, []);
-  assert_eq(run.io.code, Some(2));
+  assert_eq(run.answer.lines, []);
+  assert_eq(run.answer.code, 2);
   assert_eq(mem_read(run.tree, "m.ply"), Some(broken));
-  assert_eq(len(run.io.err), 1);
-  assert(string_starts_with(line_at(run.io.err, 0), "error: m.ply: "));
-  assert(string_contains(line_at(run.io.err, 0), "E0001"))
+  assert_eq(len(run.answer.errs), 1);
+  assert(string_starts_with(line_at(run.answer.errs, 0), "error: m.ply: "));
+  assert(string_contains(line_at(run.answer.errs, 0), "E0001"))
 }
 
 test "a path that names nothing is an error, and the run exits 2" {
   let run = run_over([{path: "m.ply", body: unformatted()}], ["absent.ply"]);
-  assert_eq(run.io.out, []);
-  assert_eq(run.io.err, ["error: absent.ply: could not read"]);
-  assert_eq(run.io.code, Some(2));
+  assert_eq(run.answer.lines, []);
+  assert_eq(run.answer.errs, ["error: absent.ply: could not read"]);
+  assert_eq(run.answer.code, 2);
   // Nothing else was reached, so the file the walk would have found is untouched.
   assert_eq(mem_read(run.tree, "m.ply"), Some(unformatted()))
 }
 
 test "the JSON document is one object, its keys in order, and nothing else is written" {
   let run = run_over([{path: "m.ply", body: unformatted()}], ["--json", "--check"]);
-  assert_eq(run.io.err, []);
-  assert_eq(run.io.code, Some(1));
-  assert_eq(run.io.out, [string_of_bytes(
-    b"{\"command\":\"fmt\",\"errors\":[],\"exit_code\":1,\"files\":[{\"changed\":true,\"path\":\"m.ply\"}],\"ok\":false,\"schema_version\":1}")])
-}
-
-test "the walk passes over a symlink, a hidden directory, `target` and anything not `.ply`" {
-  let tree = mem_of([
-    {path: "m.ply", body: b"fn m() -> Int = 1"},
-    {path: "notes.txt", body: b"x"},
-    {path: "sub/deep.ply", body: b"fn d() -> Int = 1"},
-    {path: ".git/config.ply", body: b"fn g() -> Int = 1"},
-    {path: "target/built.ply", body: b"fn b() -> Int = 1"},
-    {path: "link.ply", body: b"fn l() -> Int = 1"},
-  ]);
-  let found = handle {
-    named(nothing(), ".")
-  } with {
-    fs.list_dir[cwd](p) -> mem_list(tree, p),
-    fs.kind[cwd](p) -> if p == "link.ply" { Symlink } else { mem_kind(tree, p) },
-  };
-  assert_eq(map_keys(found.files), ["m.ply", "sub/deep.ply"]);
-  assert_eq(found.errors, [])
-}
-
-test "a named symlink is refused rather than followed" {
-  let found = handle {
-    named(nothing(), "link.ply")
-  } with {
-    fs.kind[cwd](p) -> Symlink,
-    fs.list_dir[cwd](p) -> panic("a symlink is never walked"),
-  };
-  assert_eq(map_keys(found.files), []);
-  assert_eq(found.errors, [{ path: "link.ply", why: "a symlink is not formatted" }])
-}
-
-test "a named file is taken whatever it is called, and a walked one only when it is `.ply`" {
-  let tree = mem_of([{path: "notes.txt", body: b"x"}]);
-  let both = handle {
-    walk(named(nothing(), "notes.txt"), ".")
-  } with {
-    fs.list_dir[cwd](p) -> mem_list(tree, p),
-    fs.kind[cwd](p) -> mem_kind(tree, p),
-  };
-  assert_eq(map_keys(both.files), ["notes.txt"])
-}
-
-test "the flags are read in any order and every other word is a path, with `./` stripped" {
-  let flags = read_flags(["--json", "./a.ply", "--check", "b/c.ply"]);
-  assert(flags.check);
-  assert(flags.json);
-  assert_eq(flags.paths, ["a.ply", "b/c.ply"]);
-  let bare = read_flags([]);
-  assert(!bare.check);
-  assert(!bare.json);
-  assert_eq(bare.paths, [])
+  assert_eq(run.answer.errs, []);
+  assert_eq(run.answer.code, 1);
+  assert_eq(bytes_of_string(to_string(run.answer.json)),
+    b"{\"command\":\"fmt\",\"errors\":[],\"exit_code\":1,\"files\":[{\"changed\":true,\"path\":\"m.ply\"}],\"ok\":false,\"schema_version\":1}")
 }
 
 test "the exit code is 2 for an error, 1 for `--check` with work left, and 0 otherwise" {
