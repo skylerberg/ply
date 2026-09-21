@@ -1033,3 +1033,132 @@ fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
         assert_eq!(got, Value::Bool(want), "`{name}{args:?}`");
     }
 }
+
+/// The standard library as a program of its own, and the definitions nothing in it reaches. The
+/// emitter's program now carries only the shipped modules the compiler imports, so this is where
+/// the rest is checked, and by the compiler these sources build rather than the bundle's.
+fn standard_library() -> (&'static Source, Vec<String>) {
+    let modules: Vec<(String, String)> = ply_std::sources()
+        .map(|(name, text)| (name.to_string(), text.to_string()))
+        .collect();
+    let ids: Vec<SourceId> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
+    let front = producer::checked_front(&modules, &ids).expect("the standard library checks");
+    let unused: Vec<String> = front
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == ply_span::codes::UNUSED_DEFINITION)
+        .map(|d| d.message.clone())
+        .collect();
+    let front: &'static ply_ty::Front = Box::leak(Box::new(front));
+    let source: &'static Source = Box::leak(Box::new(
+        Source::from_front(front, ply_codegen::emit_keys(front))
+            .with_texts(modules.into_iter().collect()),
+    ));
+    (source, unused)
+}
+
+#[test]
+fn the_standard_library_carries_no_definition_nothing_reaches() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
+    let (_, unused) = standard_library();
+    assert!(
+        unused.is_empty(),
+        "the standard library carries definitions nothing reaches; delete them:\n  {}",
+        unused.join("\n  ")
+    );
+}
+
+#[test]
+fn the_emitter_refuses_no_body_or_test_of_the_standard_library() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
+    let (source, _) = standard_library();
+    let names: Vec<String> = source.functions();
+    assert!(!names.is_empty(), "the standard library offered no root");
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let produced = ply_codegen::c::produce(source, &refs).expect("the standard library emits");
+    assert!(
+        produced.refused.is_empty(),
+        "the emitter refuses part of the standard library: {:?}",
+        produced.refused
+    );
+}
+
+/// The emitter's program is closed by reading import lines in Rust, because its identity has to be
+/// known before any compiler runs: `build` needs it to choose between the committed bundle, a
+/// stage and emitting one. The front end reads the same imports when it pulls a user program's
+/// shelf, and that is the definition; this holds the Rust reading to it.
+#[test]
+fn the_emitters_program_is_the_one_the_front_end_pulls() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
+    let own: Vec<(String, String)> = ply_compiler::sources()
+        .map(|(name, text)| (name.to_string(), text.to_string()))
+        .collect();
+    let shelf: Vec<(String, String)> = ply_std::sources()
+        .map(|(name, text)| (name.to_string(), text.to_string()))
+        .collect();
+    let pulled = producer::front_pulling_std(&own, &shelf).expect("the front end pulls the shelf");
+    let program = producer::modules_of(&Sources::Embedded);
+    let mut ours: Vec<&str> = program
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| ply_std::is_reserved(name))
+        .collect();
+    ours.sort_unstable();
+    let mut theirs: Vec<&str> = pulled.modules.iter().map(String::as_str).collect();
+    theirs.sort_unstable();
+    assert_eq!(
+        ours, theirs,
+        "the shipped modules the emitter's program carries are not the ones the front end pulls \
+         for it"
+    );
+    assert_eq!(
+        program.len(),
+        own.len() + theirs.len(),
+        "the emitter's program is its own modules and the ones they import, and nothing else"
+    );
+}
+
+/// `std.hash` is the one shipped module the compiler imports, so it is the one the bundle's
+/// identity and every cache key still cover; the reference implementation says whether it is
+/// BLAKE3, over the published vectors and either side of a block, a chunk and a two-chunk tree.
+#[test]
+fn the_shipped_blake3_is_blake3() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
+    let loaded = load(&[("std.hash", ply_std::HASH)]);
+    let source: &'static Source = Box::leak(Box::new(
+        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
+    ));
+    let names: Vec<String> = source.functions();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the module builds");
+    assert!(refused.is_empty(), "{refused:?}");
+    let entry = native
+        .entry("std.hash.blake3")
+        .expect("`std.hash.blake3` was not compiled");
+    // `b""` and `b"\x00"` are the first two published vectors; the rest bracket 64 and 1024.
+    for length in [0usize, 1, 2, 63, 64, 65, 127, 1023, 1024, 1025, 2048, 2049] {
+        let input: Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
+        let mut ctx = native.context();
+        ctx.begin(i64::MAX / 2);
+        let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
+        let words: [i64; 1] = [ctx
+            .heap
+            .to_word(unsafe { &*layouts }, &Value::bytes(&input))];
+        let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        assert_eq!(
+            ctx.failed, 0,
+            "`std.hash.blake3` raised over {length} bytes"
+        );
+        let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
+        ctx.end();
+        assert_eq!(
+            got,
+            Value::bytes(blake3::hash(&input).as_bytes()),
+            "`std.hash.blake3` is not BLAKE3 over {length} bytes"
+        );
+    }
+}
