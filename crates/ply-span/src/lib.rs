@@ -310,7 +310,7 @@ pub mod codes {
     pub const HOST_DETERMINISM_MISMATCH: &str = "E0423";
     /// An operation reached the host boundary with nothing bound.
     pub const HERMETIC_BOUNDARY: &str = "E0424";
-    /// A host operation reached from a test the search re-runs, in or around a `simulate`.
+    /// A host operation performed inside a `simulate` region, or in a test the search re-runs.
     pub const HOST_IN_SIMULATION: &str = "E0425";
     /// A continuation was resumed a second time across an at-most-once host operation.
     pub const HOST_CONTINUATION_RESUMED: &str = "E0426";
@@ -514,7 +514,7 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ),
     (
         "E0425",
-        "host operation reached from a test the search re-runs",
+        "host operation inside a `simulate` region, or in a test the search re-runs",
     ),
     (
         "E0426",

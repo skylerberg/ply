@@ -67,10 +67,15 @@ pub unsafe fn perform(
     let operation = operation_label(effect, op, resource);
     let binding = Arc::clone(&c.binding);
     let would = binding.would_serve(effect, op, resource);
-    if would.is_some() && crate::simulate::innermost_is_seeded(c) {
-        return c.fail(err_host_in_simulation(span, &operation, Span::DUMMY));
+    let resolved = binding.resolve(effect, op, resource);
+    // Ahead of every other refusal: under a seed the region is re-run per schedule, so an answer
+    // any handler could give -- bound, withheld or hermetic -- would differ between interleavings.
+    if let Some(region) = crate::simulate::seeded_region(c)
+        && (would.is_some() || resolved.is_some())
+    {
+        return c.fail(err_host_in_simulation(span, &operation, region));
     }
-    let Some(bound) = binding.resolve(effect, op, resource) else {
+    let Some(bound) = resolved else {
         let d = match would {
             None => err_unhandled(span, effect, op, resource),
             Some(path) if binding.is_hermetic() => {

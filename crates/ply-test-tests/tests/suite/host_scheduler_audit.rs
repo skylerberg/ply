@@ -269,7 +269,7 @@ test/nondet "a production region beside an abandoned seeded one" {
     let d = ran
         .failure()
         .unwrap_or_else(|| panic!("a discarded region must be reported, not run beside a second"));
-    // `innermost_simulation` finds the abandoned region because it is live, and it shadows the boundary.
+    // The abandoned region is still the innermost one, so the boundary refuses under it.
     assert_eq!(
         d.code,
         codes::HOST_IN_SIMULATION,
