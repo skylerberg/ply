@@ -328,7 +328,7 @@ fn watch_reruns_on_a_save_and_keeps_the_front_end_it_already_had() {
         .spawn()
         .unwrap();
 
-    // The save happens only after the first iteration reports: a save seen mid-run is not a change to notice.
+    // The save waits for the first report, so the second report is the save's iteration.
     let stdout = child.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
