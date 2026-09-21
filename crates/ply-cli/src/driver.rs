@@ -414,10 +414,20 @@ impl<'s> Driver<'s> {
         let Some(store) = self.store.as_deref() else {
             return (defs, tests);
         };
-        for (path, module) in self.fingerprinted() {
-            let Some(fingerprint) = store.fingerprint(&path) else {
-                continue;
-            };
+        let filed: Vec<(ModuleName, Arc<SourceFingerprint>)> = self
+            .fingerprinted()
+            .into_iter()
+            .filter_map(|(path, module)| Some((module, store.fingerprint(&path)?)))
+            .collect();
+        // What each effect hashed to when these rows were filed, which is what witnesses them.
+        let recorded: BTreeMap<Symbol, DefHash> = filed
+            .iter()
+            .flat_map(|(_, f)| f.defs.iter())
+            .filter(|e| e.kind == DefKind::Effect)
+            .map(|e| (e.name.clone(), e.hash))
+            .collect();
+
+        for (module, fingerprint) in &filed {
             for entry in &fingerprint.defs {
                 if entry.kind != DefKind::Fn {
                     continue;
@@ -428,7 +438,7 @@ impl<'s> Driver<'s> {
                 defs.push(KnownDef {
                     name: entry.name.to_string(),
                     hash: entry.hash,
-                    witness: row_witness(&cached),
+                    witness: witness_for(&recorded, &[&cached.footprint, &cached.performed]),
                     footprint: ply_ty::print_footprint(&cached.footprint),
                     performed: ply_ty::print_footprint(&cached.performed),
                 });
@@ -437,6 +447,7 @@ impl<'s> Driver<'s> {
                 tests.push(KnownTest {
                     key: format!("{module}.{}", test.name),
                     hash: test.hash,
+                    witness: witness_for(&recorded, &[&test.footprint]),
                     footprint: ply_ty::print_footprint(&test.footprint),
                 });
             }
@@ -656,21 +667,21 @@ impl<'s> Driver<'s> {
     }
 }
 
-/// The declaration each effect the rows name had, from the witness stored beside the interface. A
-/// prelude effect is declared by no source and has no entry, and cannot be renamed by an edit.
-fn row_witness(cached: &CachedDef) -> Vec<(String, DefHash)> {
-    let named: BTreeSet<&Symbol> = cached
-        .footprint
-        .atoms()
-        .chain(cached.performed.atoms())
+/// The declaration each effect these rows name had, by name and hash. A row is about the program
+/// that filed it only while the effects it names are still those declarations; a prelude effect is
+/// declared by no source, so it has no entry and no edit can rename it.
+fn witness_for(
+    recorded: &BTreeMap<Symbol, DefHash>,
+    rows: &[&ply_ty::Footprint],
+) -> Vec<(String, DefHash)> {
+    let named: BTreeSet<&Symbol> = rows
+        .iter()
+        .flat_map(|row| row.atoms())
         .map(|a| &a.effect)
         .collect();
     named
         .into_iter()
-        .filter_map(|effect| {
-            let held = cached.names.iter().find(|w| &w.name == effect)?;
-            Some((effect.to_string(), held.hash))
-        })
+        .filter_map(|effect| Some((effect.to_string(), *recorded.get(effect)?)))
         .collect()
 }
 
