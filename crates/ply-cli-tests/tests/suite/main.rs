@@ -19,6 +19,7 @@ mod effect_sets;
 mod explain;
 mod failure_classification_audit;
 mod fmt;
+mod front_read;
 mod http_endpoint;
 mod incremental;
 mod incremental_audit;

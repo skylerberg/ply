@@ -12,7 +12,7 @@ import patterns (Lit, LInt, LStr, LBytes)
 import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform, NLabel, NCell,
              NRegion, NLambda, NSim, NHandle, NField, NUpd, CField, CArm, CClause, CStmt, CLet, CLetPat, CDo,
              CPat, CPatField, PxCtor, PxRecord, PxList, lower_fn, dump)
-import tycore (Atom, Resource, RNamed, RSingleton, Type, Scheme, atoms_text, atoms_insert, scheme_text, type_text,
+import tycore (Atom, Resource, RNamed, RSingleton, Scheme, atoms_text, atoms_insert, scheme_text, type_text,
                at, append, take, contains_bytes)
 import resolve (Source, Mod, Diag, Resolved, Resolved_, Failed, Ns, NValue, NEffect, resolve_modules, qualify,
                 lookup, find, is_bare, diag1, backticked, import_module_name, path_span)
@@ -20,13 +20,16 @@ import hash (Index, Entry, EDef, ETest, ELaw, HashOutput, build_index, hash_inde
              Pin, Rehash, Rehashed, rehash_index, Printed, Unprintable, print_bodies)
 import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder, EffectInfo, OpInfo, CtorInfo,
               check_front, deriver_text, is_prelude_effect, builtin_schemes, BuiltinDoc, builtin_docs, find_doc)
-import diag (Parsed, parse_all, parse_at, outside_every_module, frame, field, flag)
+import diag (Parsed, parse_all, parse_at, outside_every_module)
+import read (Dump, At, ModuleRow, DefRow, TypeRow, TestRow, LawRow, OpRow, EffectRow, CtorRow,
+             HashRow, HashFrame, HDef, HTest, HLaw, OrdinalRow, framed, field, framed_diag,
+             dump_text, read_front, split, join)
 import std.hash (blake3)
 import fmt (item_range, replace_item)
 
 fn cat(parts: List<List<Bytes>>) -> List<Bytes> = fold(parts, [], |acc: List<Bytes>, p: List<Bytes>| append(acc, p))
 
-fn join(xs: List<Bytes>, sep: Bytes) -> Bytes =
+fn joined(xs: List<Bytes>, sep: Bytes) -> Bytes =
   fold(range(0, len(xs)), b"", |acc: Bytes, i: Int| if i == 0 { at(xs, i) } else { bytes_concat_all([acc, sep, at(xs, i)]) })
 
 fn mode_text(m: Mode) -> Bytes = match m { MRead -> b"read", MWrite -> b"write", MBad -> b"" }
@@ -36,10 +39,15 @@ fn kind_text(k: SpecKind) -> Bytes = match k { SRequires -> b"requires", SEnsure
 // The module index of a span outside every module; a `(0, 0)` span is `dummy_span`.
 fn no_module() -> Int = 4294967295
 
-fn span_text(module: Int, s: Span) -> Bytes =
-  bytes_concat_all([num(if s.start == 0 && s.end == 0 { no_module() } else { module }), b" ", num(s.start), b" ", num(s.end)])
+fn span_at(module: Int, s: Span) -> At =
+  { module: if s.start == 0 && s.end == 0 { no_module() } else { module }, start: s.start, end: s.end }
 
-fn loc_text(l: Loc) -> Bytes = span_text(l.module, l.span)
+fn loc_at(l: Loc) -> At = span_at(l.module, l.span)
+
+fn span_text(module: Int, s: Span) -> Bytes = {
+  let a = span_at(module, s);
+  bytes_concat_all([num(a.module), b" ", num(a.start), b" ", num(a.end)])
+}
 
 // --- What the source wrote ----------------------------------------------------
 // What the driver reads from the tree that the checker's tables do not keep.
@@ -76,8 +84,6 @@ fn effect_public_of(m: Map<Bytes, Bool>, e: EffectInfo) -> Bool =
   match map_get(m, e.name) { Some(b) -> b, None -> true }
 
 // No table of the checker's holds a `type` declaration, so it is read from the tree.
-type TypeRow = { name: Bytes, module: Bytes, simple_name: Bytes, public: Bool, arity: Int, at: Loc }
-
 fn type_rows(mods: List<Mod>) -> List<TypeRow> =
   fold(range(0, len(mods)), [], |acc: List<TypeRow>, i: Int| {
     let m = at(mods, i);
@@ -85,7 +91,7 @@ fn type_rows(mods: List<Mod>) -> List<TypeRow> =
       match it {
         IType(d) -> push(a, { name: qualify(m.name, d.name.name), module: m.name,
                               simple_name: d.name.name, public: vis_public(d.vis),
-                              arity: len(d.params), at: { module: i, span: d.span } }),
+                              arity: len(d.params), at: span_at(i, d.span) }),
         _ -> a,
       })
   })
@@ -195,102 +201,76 @@ fn set_atoms(r: Resolved, effects: List<EffectInfo>, module: Int, xs: List<AtomE
       None -> acc,
     })
 
-fn set_field(r: Resolved, effects: List<EffectInfo>, module: Int, d: EffectSetDef) -> Bytes =
-  field(b"effect_set", bytes_concat_all([d.name.name, b" ",
-                                         join(map(d.includes, |q: QName| q.name.name), b","), b" ",
-                                         atoms_text(set_atoms(r, effects, module, d.expansion), b",")]))
+fn set_text(r: Resolved, effects: List<EffectInfo>, module: Int, d: EffectSetDef) -> Bytes =
+  bytes_concat_all([d.name.name, b" ",
+                    joined(map(d.includes, |q: QName| q.name.name), b","), b" ",
+                    atoms_text(set_atoms(r, effects, module, d.expansion), b",")])
 
-// --- The frames -------------------------------------------------------------
+// --- The rows the dump holds ------------------------------------------------
 // A test or a law is framed under its index: its key may hold a space or a newline.
 
-fn framed(kind: Bytes, name: Bytes, fields: List<Bytes>) -> Bytes = {
-  let payload = bytes_concat_all(fields);
-  bytes_concat_all([kind, b" ", name, b" ", num(bytes_len(payload)), b"\n", payload])
-}
-
-fn diag_frames(ds: List<Diag>) -> List<Bytes> = map(range(0, len(ds)), |i: Int| frame(i, at(ds, i)))
-
-fn order_frame(order: List<Int>, mods: List<Mod>) -> Bytes =
-  framed(b"order", b"_", map(order, |i: Int| field(b"module", at(mods, i).name)))
-
-fn module_frame(i: Int, m: Mod, r: Resolved, effects: List<EffectInfo>) -> Bytes = {
+fn module_row(i: Int, m: Mod, r: Resolved, effects: List<EffectInfo>) -> ModuleRow = {
   let items = fold(m.module.items, [], |acc: List<Bytes>, it: Item|
     match it {
-      IFn(d) -> push(acc, field(b"item", qualify(m.name, d.name.name))),
+      IFn(d) -> push(acc, qualify(m.name, d.name.name)),
       IType(d) -> {
-        let named = push(acc, field(b"item", qualify(m.name, d.name.name)));
+        let named = push(acc, qualify(m.name, d.name.name));
         match d.body {
-          TDSum(vs) -> fold(vs, named, |a: List<Bytes>, v: VariantDef| push(a, field(b"item", qualify(m.name, v.name.name)))),
+          TDSum(vs) -> fold(vs, named, |a: List<Bytes>, v: VariantDef| push(a, qualify(m.name, v.name.name))),
           _ -> named,
         }
       },
-      IEffect(d) -> push(acc, field(b"item", qualify(m.name, d.name.name))),
+      IEffect(d) -> push(acc, qualify(m.name, d.name.name)),
       _ -> acc,
     });
   let imports = fold(m.module.imports, [], |acc: List<Bytes>, d: ImportDecl| {
-    let name = join(map(d.path, |x: Ident| x.name), b".");
+    let name = joined(map(d.path, |x: Ident| x.name), b".");
     if fold(acc, false, |b: Bool, x: Bytes| b || x == name) { acc } else { push(acc, name) }
   });
   let sets = fold(m.module.items, [], |acc: List<Bytes>, it: Item|
-    match it { IEffectSet(d) -> push(acc, set_field(r, effects, i, d)), _ -> acc });
-  framed(b"module", m.name, cat([[field(b"index", num(i))], items,
-                                 map(imports, |n: Bytes| field(b"import", n)), sets]))
+    match it { IEffectSet(d) -> push(acc, set_text(r, effects, i, d)), _ -> acc });
+  { name: m.name, index: i, items: items, imports: imports, sets: sets }
 }
 
-fn def_frame(d: DefInfo, w: Written) -> Bytes =
-  framed(b"def", d.name, cat([
-    [field(b"module", d.module), field(b"simple_name", d.simple_name),
-     field(b"public", flag(w.public)), field(b"reuse", flag(w.reuse)), field(b"scheme", scheme_text(d.scheme)),
-     field(b"footprint", atoms_text(d.footprint, b",")), field(b"performed", atoms_text(d.performed, b","))],
-    map(d.constraints, |c: DefConstraint| field(b"constraint", bytes_concat_all([deriver_text(c.deriver), b" ", num(c.param)]))),
-    [field(b"internally_effectful", flag(d.internally_effectful))],
-    map(d.row_aliases, |a: Bytes| field(b"row_alias", a)),
-    map(w.params, |p: Param| field(b"param", bytes_concat_all([p.name.name, b" ", span_text(d.at.module, p.span)]))),
-    map(d.spec, |s: SpecInfo| field(b"spec", bytes_concat_all([kind_text(s.kind), b" ", num(s.index), b" ", atoms_text(s.footprint, b","), b"\n", span_text(d.at.module, s.span)]))),
-    [field(b"span", loc_text(d.at))],
-    map(w.literals, |x: Bytes| field(b"literal", x))]))
+fn def_row(d: DefInfo, w: Written) -> DefRow =
+  { name: d.name, module: d.module, simple_name: d.simple_name, public: w.public, reuse: w.reuse,
+    scheme: scheme_text(d.scheme), footprint: atoms_text(d.footprint, b","),
+    performed: atoms_text(d.performed, b","),
+    constraints: map(d.constraints, |c: DefConstraint|
+      bytes_concat_all([deriver_text(c.deriver), b" ", num(c.param)])),
+    internally_effectful: d.internally_effectful,
+    row_aliases: d.row_aliases,
+    params: map(w.params, |p: Param| { name: p.name.name, at: span_at(d.at.module, p.span) }),
+    spec: map(d.spec, |s: SpecInfo| { kind: kind_text(s.kind), index: s.index,
+                                      footprint: atoms_text(s.footprint, b","),
+                                      at: span_at(d.at.module, s.span) }),
+    at: loc_at(d.at), literals: w.literals }
 
-fn type_frame(t: TypeRow) -> Bytes =
-  framed(b"type", t.name,
-    [field(b"module", t.module), field(b"simple_name", t.simple_name), field(b"public", flag(t.public)),
-     field(b"arity", num(t.arity)), field(b"span", loc_text(t.at))])
+fn test_row(t: TestInfo, name_at: Loc) -> TestRow =
+  { key: t.key, name: t.name, module: t.module, index: t.index, nondet: t.nondet,
+    footprint: atoms_text(t.footprint, b","), at: loc_at(t.at), name_at: loc_at(name_at) }
 
-fn test_frame(t: TestInfo, name_at: Loc) -> Bytes =
-  framed(b"test", num(t.index),
-    [field(b"key", t.key), field(b"name", t.name), field(b"module", t.module), field(b"index", num(t.index)),
-     field(b"nondet", flag(t.nondet)), field(b"footprint", atoms_text(t.footprint, b",")), field(b"span", loc_text(t.at)),
-     field(b"name_span", loc_text(name_at))])
+fn law_row(l: LawInfo, lits: List<Bytes>) -> LawRow =
+  { key: l.key, name: l.name, module: l.module, index: l.index,
+    binders: map(l.binders, |b: LawBinder| { name: b.name, at: span_at(l.at.module, b.span),
+                                             ty: type_text(b.ty) }),
+    has_guard: l.has_guard, host: l.host, footprint: atoms_text(l.footprint, b","),
+    at: loc_at(l.at), literals: lits }
 
-fn law_frame(l: LawInfo, lits: List<Bytes>) -> Bytes =
-  framed(b"law", num(l.index), cat([
-    [field(b"key", l.key), field(b"name", l.name), field(b"module", l.module), field(b"index", num(l.index))],
-    map(l.binders, |b: LawBinder| field(b"binder", bytes_concat_all([b.name, b" ", span_text(l.at.module, b.span), b"\n", type_text(b.ty)]))),
-    [field(b"has_guard", flag(l.has_guard)), field(b"host", flag(l.host)), field(b"footprint", atoms_text(l.footprint, b",")),
-     field(b"span", loc_text(l.at))],
-    map(lits, |x: Bytes| field(b"literal", x))]))
+fn op_row(module: Int, o: OpInfo) -> OpRow =
+  { name: o.name, mode: mode_text(o.mode), resource_param: o.resource_param,
+    params: map(o.params, type_text), ret: type_text(o.ret),
+    scheme: match o.scheme { Some(sc) -> Some(scheme_text(sc)), None -> None },
+    at: span_at(module, o.at.span) }
 
-fn op_text(module: Int, o: OpInfo) -> Bytes = {
-  let has_scheme = match o.scheme { Some(_) -> true, None -> false };
-  bytes_concat_all([o.name, b" ", mode_text(o.mode), b" ", flag(o.resource_param), b" ", num(len(o.params)), b" ", flag(has_scheme), b" ",
-                    span_text(module, o.at.span), b"\n",
-                    bytes_concat_all(map(o.params, |p: Type| bytes_concat(type_text(p), b"\n"))),
-                    type_text(o.ret), b"\n",
-                    match o.scheme { Some(sc) -> bytes_concat(scheme_text(sc), b"\n"), None -> b"" }])
-}
+fn effect_row(e: EffectInfo, public: Bool) -> EffectRow =
+  { name: e.name, module: e.module, simple_name: e.simple_name, public: public, nondet: e.nondet,
+    ops: map(e.ops, |o: OpInfo| op_row(e.at.module, o)), at: loc_at(e.at) }
 
-fn effect_frame(e: EffectInfo, public: Bool) -> Bytes =
-  framed(b"effect", e.name, cat([
-    [field(b"module", e.module), field(b"simple_name", e.simple_name), field(b"public", flag(public)),
-     field(b"nondet", flag(e.nondet))],
-    map(e.ops, |o: OpInfo| field(b"op", op_text(e.at.module, o))),
-    [field(b"span", loc_text(e.at))]]))
-
-fn ctor_frame(k: CtorInfo) -> Bytes =
-  framed(b"ctor", k.name, cat([
-    [field(b"module", k.module), field(b"simple_name", k.simple_name), field(b"type_name", k.type_name),
-     field(b"index", num(k.index)), field(b"arity", num(k.arity))],
-    map(k.fields, |t: Type| field(b"field", type_text(t))),
-    [field(b"scheme", scheme_text(k.scheme)), field(b"span", loc_text(k.at))]]))
+fn ctor_row(k: CtorInfo) -> CtorRow =
+  { name: k.name, module: k.module, simple_name: k.simple_name, type_name: k.type_name,
+    index: k.index, arity: k.arity, fields: map(k.fields, type_text),
+    scheme: scheme_text(k.scheme), at: loc_at(k.at) }
 
 // --- The hashes ---------------------------------------------------------------
 // A name declared twice (a `fn` and an `effect` alike) is one frame, as the maps merged it.
@@ -313,81 +293,83 @@ type Tables = { defs: Map<Bytes, Bytes>, own: Map<Bytes, Bytes>, decls: Map<Byte
                 specs: Map<Bytes, List<Bytes>>, spec_texts: Map<Bytes, List<Bytes>>,
                 deps: Map<Bytes, List<Bytes>>, closure: Map<Bytes, List<Bytes>> }
 
-fn tables_of(h: HashOutput) -> Tables =
+fn hash_tables(h: HashOutput) -> Tables =
   { defs: by_name_one(h.defs), own: by_name_one(h.own), decls: by_name_one(h.decls),
     specs: by_name_many(h.specs), spec_texts: by_name_many(h.spec_texts),
     deps: by_name_names(h.deps), closure: by_name_closure(h.closure) }
 
-fn hex_field(key: Bytes, m: Map<Bytes, Bytes>, name: Bytes) -> List<Bytes> =
-  match map_get(m, name) { Some(h) -> [field(key, hex(h))], None -> [] }
+fn hex_one(m: Map<Bytes, Bytes>, name: Bytes) -> Option<Bytes> =
+  match map_get(m, name) { Some(h) -> Some(hex(h)), None -> None }
 
-fn hex_fields(key: Bytes, m: Map<Bytes, List<Bytes>>, name: Bytes) -> List<Bytes> =
-  match map_get(m, name) { Some(hs) -> map(hs, |h: Bytes| field(key, hex(h))), None -> [] }
+fn hex_many(m: Map<Bytes, List<Bytes>>, name: Bytes) -> List<Bytes> =
+  match map_get(m, name) { Some(hs) -> map(hs, hex), None -> [] }
 
-fn name_fields(key: Bytes, m: Map<Bytes, List<Bytes>>, name: Bytes) -> List<Bytes> =
-  match map_get(m, name) { Some(ns) -> map(ns, |n: Bytes| field(key, n)), None -> [] }
+fn names_of(m: Map<Bytes, List<Bytes>>, name: Bytes) -> List<Bytes> =
+  match map_get(m, name) { Some(ns) -> ns, None -> [] }
 
-fn reach_fields(t: Tables, name: Bytes) -> List<Bytes> =
-  append(name_fields(b"dep", t.deps, name), name_fields(b"closure", t.closure, name))
+fn def_hash_row(t: Tables, name: Bytes) -> HashRow =
+  { name: name, def: hex_one(t.defs, name), own: hex_one(t.own, name), decl: hex_one(t.decls, name),
+    specs: hex_many(t.specs, name), spec_texts: hex_many(t.spec_texts, name),
+    deps: names_of(t.deps, name), closure: names_of(t.closure, name) }
 
-fn def_hash_frame(t: Tables, name: Bytes) -> Bytes =
-  framed(b"hash", name, cat([hex_field(b"def", t.defs, name), hex_field(b"own", t.own, name), hex_field(b"decl", t.decls, name),
-                             hex_fields(b"spec", t.specs, name), hex_fields(b"spec_text", t.spec_texts, name), reach_fields(t, name)]))
-
-fn hash_frames(index: Index, h: HashOutput) -> List<Bytes> = {
-  let t = tables_of(h);
-  let walked = fold(index.order, { seen: map_new(), frames: [] }, |acc: { seen: Map<Bytes, Bool>, frames: List<Bytes> }, e: Entry|
+fn hash_rows(index: Index, h: HashOutput) -> List<HashFrame> = {
+  let t = hash_tables(h);
+  let walked = fold(index.order, { seen: map_new(), frames: [] }, |acc: { seen: Map<Bytes, Bool>, frames: List<HashFrame> }, e: Entry|
     match e {
       EDef(v) -> {
         let name = at(index.nodes, v).name;
         match map_get(acc.seen, name) {
           Some(_) -> acc,
-          None -> { seen: map_insert(acc.seen, name, true), frames: push(acc.frames, def_hash_frame(t, name)) },
+          None -> { seen: map_insert(acc.seen, name, true), frames: push(acc.frames, HDef(def_hash_row(t, name))) },
         }
       },
       ETest(i) -> {
         let key = at(index.tests, i).key;
-        {..acc, frames: push(acc.frames, framed(b"testhash", num(i), cat([[field(b"key", key), field(b"hash", hex(at(h.tests, i)))], reach_fields(t, key)])))}
+        {..acc, frames: push(acc.frames, HTest({ index: i, key: key, hash: hex(at(h.tests, i)), text: b"",
+                                                 deps: names_of(t.deps, key), closure: names_of(t.closure, key) }))}
       },
       ELaw(i) -> {
         let key = at(index.laws, i).key;
-        {..acc, frames: push(acc.frames, framed(b"lawhash", num(i), cat([[field(b"key", key), field(b"hash", hex(at(h.laws, i))), field(b"text", hex(at(h.law_texts, i)))],
-                                                                          reach_fields(t, key)])))}
+        {..acc, frames: push(acc.frames, HLaw({ index: i, key: key, hash: hex(at(h.laws, i)),
+                                                text: hex(at(h.law_texts, i)),
+                                                deps: names_of(t.deps, key), closure: names_of(t.closure, key) }))}
       },
     });
   walked.frames
 }
 
 // A `fn` also names its clauses' kinds in order, so each clause's root can be keyed.
-fn ordinal_frame(m: Mod) -> Bytes =
-  framed(b"ordinal", m.name, fold(m.module.items, [], |acc: List<Bytes>, it: Item|
-    match it {
-      IFn(d) -> {
-        let kinds = if len(d.spec) == 0 { b"" } else { bytes_concat(b" ", join(map(d.spec, |c: SpecClause| kind_text(c.kind)), b",")) };
-        push(acc, field(b"item", bytes_concat_all([b"fn ", qualify(m.name, d.name.name), kinds])))
-      },
-      ITest(d) -> push(acc, field(b"item", bytes_concat(b"test ", qualify(m.name, d.name)))),
-      ILaw(d) -> push(acc, field(b"item", bytes_concat(b"law ", qualify(m.name, d.name)))),
-      _ -> acc,
-    }))
+fn ordinal_row(m: Mod) -> OrdinalRow =
+  { module: m.name,
+    items: fold(m.module.items, [], |acc: List<Bytes>, it: Item|
+      match it {
+        IFn(d) -> {
+          let kinds = if len(d.spec) == 0 { b"" } else { bytes_concat(b" ", joined(map(d.spec, |c: SpecClause| kind_text(c.kind)), b",")) };
+          push(acc, bytes_concat_all([b"fn ", qualify(m.name, d.name.name), kinds]))
+        },
+        ITest(d) -> push(acc, bytes_concat(b"test ", qualify(m.name, d.name))),
+        ILaw(d) -> push(acc, bytes_concat(b"law ", qualify(m.name, d.name))),
+        _ -> acc,
+      }) }
 
-fn tables(mods: List<Mod>, r: Resolved, c: Front, index: Index, h: HashOutput) -> List<Bytes> = {
+fn tables(warnings: List<Diag>, mods: List<Mod>, r: Resolved, c: Front, index: Index, h: HashOutput) -> Dump = {
   let fns = fn_written(mods);
   let effs = effect_written(mods);
   let names = test_name_spans(mods);
   let lits = law_literals(mods);
-  cat([[order_frame(r.order, mods)],
-       map(range(0, len(mods)), |i: Int| module_frame(i, at(mods, i), r, c.effects)),
-       map(c.defs, |d: DefInfo| def_frame(d, written_of(fns, d.name))),
-       map(type_rows(mods), type_frame),
-       map(range(0, len(c.tests)), |i: Int| test_frame(at(c.tests, i), at(names, i))),
-       map(range(0, len(c.laws)), |i: Int| law_frame(at(c.laws, i), at(lits, i))),
-       map(c.effects, |e: EffectInfo| effect_frame(e, effect_public_of(effs, e))),
-       map(c.ctors, ctor_frame),
-       hash_frames(index, h),
-       map(mods, ordinal_frame),
-       map(h.bodies, |b: { name: Bytes, body: Bytes }| framed(b"body", b.name, [hex(b.body)])),
-       map(range(0, len(h.test_bodies)), |i: Int| framed(b"testbody", num(i), [hex(at(h.test_bodies, i))]))])
+  { diags: map(warnings, framed_diag),
+    order: map(r.order, |i: Int| at(mods, i).name),
+    modules: map(range(0, len(mods)), |i: Int| module_row(i, at(mods, i), r, c.effects)),
+    defs: map(c.defs, |d: DefInfo| def_row(d, written_of(fns, d.name))),
+    types: type_rows(mods),
+    tests: map(range(0, len(c.tests)), |i: Int| test_row(at(c.tests, i), at(names, i))),
+    laws: map(range(0, len(c.laws)), |i: Int| law_row(at(c.laws, i), at(lits, i))),
+    effects: map(c.effects, |e: EffectInfo| effect_row(e, effect_public_of(effs, e))),
+    ctors: map(c.ctors, ctor_row),
+    hashes: hash_rows(index, h),
+    ordinals: map(mods, ordinal_row),
+    bodies: h.bodies,
+    test_bodies: h.test_bodies }
 }
 
 // Every table the front end holds for a program that checks, for a caller that wants them rather
@@ -417,14 +399,17 @@ pub fn analyse(parsed: List<Parsed>) -> Analysis = {
   }
 }
 
-fn frames_of(a: Analysis) -> List<Bytes> =
+// Every frame the answer writes, as rows: `read.dump_text` frames them and `read.read_front` is
+// its inverse, so a cached answer is the same value a fresh one is.
+pub fn dump_of(a: Analysis) -> Dump =
   match a {
-    Refused(ds) -> diag_frames(ds),
-    Analysed(w) -> append(diag_frames(w.warnings), tables(w.mods, w.r, w.checked, w.index, w.hashes)),
+    Refused(ds) -> { diags: map(ds, framed_diag), order: [], modules: [], defs: [], types: [], tests: [], laws: [],
+                     effects: [], ctors: [], hashes: [], ordinals: [], bodies: [], test_bodies: [] },
+    Analysed(w) -> tables(w.warnings, w.mods, w.r, w.checked, w.index, w.hashes),
   }
 
-// One concatenation over the finished frames; appending per frame is quadratic.
-pub fn front_dump(sources: List<Source>) -> String = string_of_bytes(bytes_concat_all(frames_of(analyse(parse_all(sources)))))
+pub fn front_dump(sources: List<Source>) -> String =
+  string_of_bytes(dump_text(dump_of(analyse(parse_all(sources)))))
 
 // Every builtin's scheme as the checker binds it, its parameter names and its note: one `builtin`
 // frame each.
@@ -674,7 +659,7 @@ pub fn analyse_pulling_std(user: List<Source>, shipped: List<Source>) -> Pulled 
 pub fn front_pulling_std(user: List<Source>, shipped: List<Source>) -> String = {
   let x: Pulled = analyse_pulling_std(user, shipped);
   let head = framed(b"pulled", b"_", map(x.pulled, |n: Bytes| field(b"module", n)));
-  string_of_bytes(bytes_concat_all(cat([[head], frames_of(x.out)])))
+  string_of_bytes(bytes_concat(head, dump_text(dump_of(x.out))))
 }
 
 // --- Tests ------------------------------------------------------------------
@@ -852,4 +837,133 @@ test "a shipped module importing outside the shipped ones is placed in that modu
                               [{ name: b"std.x", src: b"import m\npub fn x() -> Int = 1" }]);
   assert(bytes_starts_with(bytes_of_string(out), b"pulled _ 14\nmodule 5\nstd.xdiag 0 "));
   assert(holds(out, b"message 70\nthe shipped module `std.x` imports `m`, which this build does not shiplabel 65\n1 7 8 1\na stdlib module may import only modules that ship with it"))
+}
+
+// --- Reading an answer back ---------------------------------------------------
+
+fn dumped(sources: List<Source>) -> Bytes = bytes_of_string(front_dump(sources))
+
+fn mentions(b: Bytes, needle: Bytes) -> Bool =
+  match bytes_index_of(b, needle) { Some(_) -> true, None -> false }
+
+// A replacement of the same length, so every frame around it keeps its own.
+fn swapped(d: Bytes, from: Bytes, to: Bytes) -> Bytes =
+  match bytes_index_of(d, from) {
+    Some(i) -> bytes_concat_all([bytes_slice(d, 0, i), to, bytes_slice(d, i + bytes_len(from), bytes_len(d))]),
+    None -> panic("the dump holds the text"),
+  }
+
+fn refusal(d: Bytes) -> Bytes =
+  match read_front(d) { Err(e) -> e, Ok(_) -> panic("the reader was meant to refuse this dump") }
+
+fn at_order(d: Bytes) -> Int =
+  match bytes_index_of(d, b"order _ ") { Some(i) -> i, None -> panic("the dump holds the order frame") }
+
+test "the reader answers exactly the rows the writer framed" {
+  assert_eq(read_front(dumped(program())), Ok(dump_of(analyse(parse_all(program())))));
+  assert_eq(read_front(dumped(specified())), Ok(dump_of(analyse(parse_all(specified())))));
+  assert_eq(read_front(dumped(written())), Ok(dump_of(analyse(parse_all(written())))));
+  assert_eq(read_front(dumped(reachable())), Ok(dump_of(analyse(parse_all(reachable())))))
+}
+
+test "an answer that is an error reads back as the diagnostics it is" {
+  let bad = [{ name: b"m", src: b"fn f() -> Int = \"x\"" }];
+  assert_eq(read_front(dumped(bad)), Ok(dump_of(analyse(parse_all(bad)))))
+}
+
+test "a split into parts joins back into the answer it came from" {
+  let whole: Dump = dump_of(analyse(parse_all(claimed())));
+  match split(whole) {
+    Err(e) -> panic(string_of_bytes(e)),
+    Ok(s) -> {
+      assert_eq(len(s.parts), 2);
+      assert_eq(len(at(s.parts, 0).modules), 1);
+      assert_eq(join(s.program, s.parts), Ok(whole))
+    },
+  }
+}
+
+test "a part is written and read like any other answer" {
+  let whole: Dump = dump_of(analyse(parse_all(claimed())));
+  match split(whole) {
+    Err(e) -> panic(string_of_bytes(e)),
+    Ok(s) -> {
+      let parts = map(s.parts, |p: Dump| match read_front(dump_text(p)) { Ok(x) -> x, Err(e) -> panic(string_of_bytes(e)) });
+      let program: Dump = match read_front(dump_text(s.program)) { Ok(x) -> x, Err(e) -> panic(string_of_bytes(e)) };
+      assert_eq(join(program, parts), Ok(whole))
+    },
+  }
+}
+
+// A program part whose order names a module no part is, and one that leaves a part unnamed.
+fn ordering(program: Dump, order: List<Bytes>) -> Dump =
+  { diags: program.diags, order: order, modules: [], defs: [], types: [], tests: [], laws: [],
+    effects: program.effects, ctors: program.ctors, hashes: [], ordinals: [], bodies: [],
+    test_bodies: [] }
+
+test "a part the program part does not name, and a name no part is, are both refused" {
+  let whole: Dump = dump_of(analyse(parse_all(claimed())));
+  match split(whole) {
+    Err(e) -> panic(string_of_bytes(e)),
+    Ok(s) -> {
+      assert_eq(join(ordering(s.program, [b"base", b"other"]), s.parts),
+                Err(b"the order names `other`, which no part is"));
+      assert_eq(join(ordering(s.program, [b"base"]), s.parts),
+                Err(b"the order does not name every part once"))
+    },
+  }
+}
+
+test "two parts that are the same module are refused rather than joined twice" {
+  let whole: Dump = dump_of(analyse(parse_all(claimed())));
+  match split(whole) {
+    Err(e) -> panic(string_of_bytes(e)),
+    Ok(s) -> {
+      let twice = match join(s.program, [at(s.parts, 0), at(s.parts, 0)]) { Err(e) -> e, Ok(_) -> b"" };
+      assert(mentions(twice, b"two parts are module `base`"))
+    },
+  }
+}
+
+test "bytes after the last frame are refused rather than passed over" {
+  assert(bytes_starts_with(refusal(bytes_concat(dumped(program()), b"and then some")),
+                           b"frame header at byte "))
+}
+
+test "a frame cut short is refused" {
+  let d = dumped(program());
+  assert(mentions(refusal(bytes_slice(d, 0, bytes_len(d) - 3)), b"is truncated"))
+}
+
+test "a frame kind this reader does not know is refused" {
+  assert(mentions(refusal(swapped(dumped(program()), b"def m.say ", b"dxf m.say ")),
+                  b"unknown frame kind `dxf`"))
+}
+
+// The grammar is the only version this format has: a field a later writer added is refused here.
+test "a field this reader does not know is refused" {
+  assert(mentions(refusal(swapped(dumped(program()), b"nondet 1\n0", b"nondxt 1\n0")),
+                  b"unknown field `nondxt`"))
+}
+
+test "a flag that is neither 0 nor 1 is refused" {
+  assert(mentions(refusal(swapped(dumped(program()), b"reuse 1\n0", b"reuse 1\n2")), b"not 0 or 1"))
+}
+
+test "a hash frame for an item that was never declared is refused" {
+  assert(mentions(refusal(swapped(dumped(program()), b"testhash 0 ", b"testhash 1 ")),
+                  b"and only 1 were declared"))
+}
+
+test "a dump that ends after diagnostics, none of which is an error, is refused" {
+  let d = dumped(program());
+  assert_eq(refusal(bytes_slice(d, 0, at_order(d))),
+            b"the dump ends after the diagnostics, none of which is an error")
+}
+
+test "a table after an error diagnostic is refused" {
+  let d = dumped(program());
+  let bad = dumped([{ name: b"m", src: b"fn f() -> Int = \"x\"" }]);
+  assert_eq(refusal(bytes_concat(bad, bytes_slice(d, at_order(d), bytes_len(d)))),
+            b"the dump continues past an error diagnostic, where the front end has no answer")
 }
