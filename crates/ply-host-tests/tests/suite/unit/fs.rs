@@ -1,5 +1,5 @@
 use ply_eval::host::MachineId;
-use ply_eval::{HostAnswer, HostHandler, HostRequest, HostRuntime, Value};
+use ply_eval::{HostAnswer, HostRequest, HostRuntime, Value};
 use ply_host::fs::*;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_ty::{EffectAtom, Mode, Resource};
