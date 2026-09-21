@@ -58,7 +58,6 @@ pub use explore::{
 };
 pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};
 pub use rc::Stats as RcStats;
-pub use region::{MachineScheduler, Spawned};
 pub use semantics::strict_binary;
 pub use sim::{
     Access, Answer, Clock, Domain, Exploration, Handlers, Naive, OpSignature, Plan, Race, RaceSite,

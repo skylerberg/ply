@@ -28,7 +28,7 @@ fn failures(dir: &Path, tier_only: bool) -> Vec<Value> {
     cmd.args(["--color", "never", "test", "--json", "--no-cache"])
         .current_dir(dir);
     if tier_only {
-        cmd.args(["--backend", "c"]).env("PLY_TIER_ONLY", "1").env(
+        cmd.args(["--backend", "c"]).env(
             "PLY_C_EMITTER",
             format!("ply:{}", repo("crates/ply-compiler/ply").display()),
         );

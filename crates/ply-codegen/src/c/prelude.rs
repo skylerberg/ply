@@ -190,6 +190,9 @@ helpers![
     ("rt_list_lookup", 2, true),
     ("rt_map_lookup", 2, true),
     ("rt_tick", 0, false),
+    // Appended, never inserted: a unit binds helpers by position, so a committed bundle serves
+    // only while this table still starts with the one it was emitted against.
+    ("rt_grow", 2, true),
 ];
 
 /// The line that opens the runtime's definitions: everything from it on is the unit's tail, the

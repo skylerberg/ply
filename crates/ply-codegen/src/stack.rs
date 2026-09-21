@@ -15,11 +15,18 @@ pub struct Stack {
 
 impl Stack {
     pub fn new() -> Stack {
+        Stack::reserve().expect("a task stack could not be reserved")
+    }
+
+    /// A stack of its own, or nothing when the platform would map no more.
+    pub fn reserve() -> Option<Stack> {
         let size = STACK_SIZE + GUARD;
         let base = unsafe { mmap_anonymous(size) };
-        assert!(!base.is_null(), "a task stack could not be reserved");
+        if base.is_null() {
+            return None;
+        }
         unsafe { mprotect_none(base, GUARD) };
-        Stack { base, size }
+        Some(Stack { base, size })
     }
 
     /// The lowest address a compiled frame may begin at: the guard, then the Rust frames' margin.
@@ -42,10 +49,13 @@ impl Stack {
         unsafe { lay_out(top, entry as usize, arg) }
     }
 
-    /// The bytes live on this stack when `sp` is its stack pointer: from `sp` to the top.
-    pub fn live(&self, sp: usize) -> &[u8] {
-        debug_assert!(self.holds(sp));
-        unsafe { std::slice::from_raw_parts(sp as *const u8, self.top() - sp) }
+    /// The bytes live on this stack when `sp` is its stack pointer: from `sp` to the top. Nothing
+    /// when `sp` is not this stack's, as it is for a computation that grew onto another.
+    pub fn live(&self, sp: usize) -> Option<&[u8]> {
+        if !self.holds(sp) {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(sp as *const u8, self.top() - sp) })
     }
 
     pub unsafe fn restore(&self, sp: usize, bytes: &[u8]) {

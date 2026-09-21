@@ -130,7 +130,6 @@ fn the_ply_emitter_produces_the_unit_and_examples_runs_green() {
 fn the_compiled_tier_runs_the_compilers_own_tests_as_the_only_engine() {
     let dir = compiler_copy();
     let out = ply(dir.path())
-        .env("PLY_TIER_ONLY", "1")
         .args(["test", ".", "--no-cache", "--backend", "c", "--json"])
         .output()
         .unwrap();
@@ -160,7 +159,6 @@ test "a long array decodes" {
     )
     .unwrap();
     let out = ply(dir.path())
-        .env("PLY_TIER_ONLY", "1")
         .args(["test", ".", "--no-cache", "--backend", "c", "--json"])
         .output()
         .unwrap();
@@ -176,7 +174,6 @@ fn the_language_corpus_is_green_on_the_default_tier_and_as_the_only_engine() {
         .assert()
         .success();
     ply(&repo())
-        .env("PLY_TIER_ONLY", "1")
         .args(["test", "tests/lang", "--backend", "c", "--no-cache"])
         .assert()
         .success();
@@ -186,7 +183,6 @@ fn the_language_corpus_is_green_on_the_default_tier_and_as_the_only_engine() {
 fn the_compiled_tier_is_the_only_engine_over_examples_and_the_standard_library() {
     for corpus in ["examples", "crates/ply-std/ply"] {
         ply(&repo())
-            .env("PLY_TIER_ONLY", "1")
             .args(["test", corpus, "--backend", "c", "--no-cache"])
             .assert()
             .success();
@@ -245,7 +241,6 @@ fn a_served_example_with_the_tier_holding_its_accept_loop() {
 
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("ply"))
         .current_dir(dir.path())
-        .env("PLY_TIER_ONLY", "1")
         .env("PLY_C_CACHE", dir.path().join("cache"))
         .env("PLY_C_REFUSALS", "1")
         .args(["--color", "never", "run", "--host", "--backend", "c"])

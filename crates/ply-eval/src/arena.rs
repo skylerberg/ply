@@ -1,14 +1,10 @@
 //! The region allocator: a bump arena whose scopes are the program's regions.
 
 use crate::value::Value;
-use ply_span::{Diagnostic, Span, codes};
+use ply_span::Span;
 use std::fmt;
-use std::rc::Rc;
 
 pub const CHUNK: usize = 256;
-
-/// Live pins tolerated before [`Arena::pin`] sweeps the dead ones.
-const PIN_PRUNE_AT: usize = 256;
 
 const fn chunk_of(index: usize) -> usize {
     index / CHUNK
@@ -95,73 +91,14 @@ struct Scope {
     kind: RegionKind,
     /// The bump pointer when the region opened.
     mark: usize,
-    /// Regions opened before this one, over the arena's whole life.
-    ordinal: u64,
     span: Span,
-}
-
-/// A live continuation's claim on every region open at its capture.
-#[derive(Clone)]
-pub struct Pin(Rc<PinCore>);
-
-struct PinCore {
-    /// [`Stats::regions_opened`] at the capture.
-    frontier: u64,
-    /// The bump pointer at the capture.
-    top: usize,
-}
-
-impl Pin {
-    pub fn extent(&self) -> usize {
-        self.0.top
-    }
-
-    pub fn frontier(&self) -> u64 {
-        self.0.frontier
-    }
-}
-
-impl fmt::Debug for Pin {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Pin({} slots, {} regions, {} holders)",
-            self.0.top,
-            self.0.frontier,
-            Rc::strong_count(&self.0).saturating_sub(1)
-        )
-    }
-}
-
-/// A run of slots whose regions have closed and whose memory a live [`Pin`] still covers.
-struct Retained {
-    lo: usize,
-    hi: usize,
-    /// The outermost region's ordinal: its close created the run, and pins are tested against it.
-    ordinal: u64,
-    /// Every region in the run, ascending, so reports are deterministic.
-    regions: Vec<RegionId>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Reclaim {
     Freed(usize),
-    Retained(usize),
     /// The region was not open, as when a teardown runs twice.
     NotOpen,
-}
-
-impl Reclaim {
-    pub fn slots(self) -> usize {
-        match self {
-            Reclaim::Freed(n) | Reclaim::Retained(n) => n,
-            Reclaim::NotOpen => 0,
-        }
-    }
-
-    pub fn freed(self) -> bool {
-        matches!(self, Reclaim::Freed(_))
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -174,11 +111,7 @@ pub struct Stats {
     pub slots_copied: u64,
     pub restores: u64,
     pub peak_live: usize,
-    pub pins_taken: u64,
     pub closes_freed: u64,
-    /// Closes that retained their slots for a still-live continuation.
-    pub closes_deferred: u64,
-    pub slots_reclaimed_late: u64,
     /// The size of one stored value.
     pub element: usize,
 }
@@ -245,9 +178,6 @@ pub struct Arena<V = Value> {
     generations: Vec<Vec<u32>>,
     live: usize,
     scopes: Vec<Scope>,
-    /// One end of every [`Pin`] handed out.
-    pins: Vec<Rc<PinCore>>,
-    retained: Vec<Retained>,
     next_region: u32,
     stats: Stats,
     /// Every slot a close reclaimed, in order; `None` unless journalling.
@@ -269,8 +199,6 @@ impl<V: Clone + Default> Arena<V> {
             generations: Vec::new(),
             live: 0,
             scopes: Vec::new(),
-            pins: Vec::new(),
-            retained: Vec::new(),
             next_region: 0,
             stats: Stats {
                 element: std::mem::size_of::<V>(),
@@ -318,7 +246,6 @@ impl<V: Clone + Default> Arena<V> {
             id,
             kind,
             mark: self.live,
-            ordinal: self.stats.regions_opened,
             span,
         });
         self.stats.regions_opened += 1;
@@ -377,7 +304,7 @@ impl<V: Clone + Default> Arena<V> {
         self.chunks[chunk_of(index)].get(offset_of(index))
     }
 
-    /// `false` when the slot's region has closed; the caller reports it with [`stale_slot`].
+    /// `false` when the slot's region has closed.
     pub fn set(&mut self, slot: Slot, value: V) -> bool {
         let Some(index) = self.resolve(slot) else {
             return false;
@@ -414,17 +341,6 @@ impl<V: Clone + Default> Arena<V> {
 
     /// Closes `region` and every region nested inside it.
     pub fn close(&mut self, region: RegionId) -> Reclaim {
-        self.close_at(region, false)
-    }
-
-    /// A close that frees whatever a pin says, for the end of an entry point.
-    pub fn close_final(&mut self, region: RegionId) -> Reclaim {
-        self.close_at(region, true)
-    }
-
-    fn close_at(&mut self, region: RegionId, force: bool) -> Reclaim {
-        // First, so a continuation that died since its capture defers nothing.
-        self.collect();
         let Some(at) = self.scope(region) else {
             return Reclaim::NotOpen;
         };
@@ -434,26 +350,9 @@ impl<V: Clone + Default> Arena<V> {
             "an open region's mark sits above the bump pointer"
         );
         let slots = self.live.saturating_sub(scope.mark);
-        // An empty region has nothing to retain, whoever pins it.
-        if slots > 0 && !force && self.pinned(scope.ordinal) {
-            let closing: Vec<RegionId> = self.scopes[at..].iter().map(|s| s.id).collect();
-            self.scopes.truncate(at);
-            self.retain(scope, closing);
-            return Reclaim::Retained(slots);
-        }
         self.scopes.truncate(at);
         self.stats.closes_freed += 1;
-        // Runs above this mark belong to nested regions, which no pin sparing this one covers.
-        debug_assert!(
-            self.retained
-                .iter()
-                .all(|run| run.hi <= scope.mark || run.lo >= scope.mark),
-            "a retained run straddles a region boundary, so regions did not nest"
-        );
-        self.retained.retain(|run| run.lo < scope.mark);
         self.truncate(scope.mark, true);
-        // The truncation may have exposed an older retained run at the top.
-        self.release();
         Reclaim::Freed(slots)
     }
 
@@ -463,109 +362,12 @@ impl<V: Clone + Default> Arena<V> {
         Some(id)
     }
 
-    pub fn close_current_final(&mut self) -> Option<RegionId> {
-        let id = self.scopes.last()?.id;
-        self.close_final(id);
-        Some(id)
-    }
-
-    pub fn pin(&mut self) -> Option<Pin> {
-        if self.scopes.is_empty() {
-            return None;
-        }
-        // Otherwise dead pins are pruned only at a close.
-        if self.pins.len() >= PIN_PRUNE_AT {
-            self.pins.retain(|core| Rc::strong_count(core) > 1);
-        }
-        let core = Rc::new(PinCore {
-            frontier: self.stats.regions_opened,
-            top: self.live,
-        });
-        self.pins.push(Rc::clone(&core));
-        self.stats.pins_taken += 1;
-        Some(Pin(core))
-    }
-
     pub fn unique_open(&self) -> Option<RegionId> {
         self.scopes
             .iter()
             .rev()
             .find(|s| s.kind == RegionKind::Unique)
             .map(|s| s.id)
-    }
-
-    pub fn abandon_pins(&mut self) {
-        self.pins.clear();
-        self.release();
-    }
-
-    /// Drops dead pins and hands back every run no live pin still covers.
-    pub fn collect(&mut self) {
-        // One owner is this arena's own end; more means a continuation can still resume.
-        self.pins.retain(|core| Rc::strong_count(core) > 1);
-        self.release();
-    }
-
-    pub fn retained_slots(&self) -> usize {
-        self.retained.iter().map(|run| run.hi - run.lo).sum()
-    }
-
-    pub fn retained_regions(&self) -> Vec<RegionId> {
-        let mut out: Vec<RegionId> = self
-            .retained
-            .iter()
-            .flat_map(|run| run.regions.iter().copied())
-            .collect();
-        out.sort_unstable();
-        out
-    }
-
-    pub fn live_pins(&self) -> usize {
-        self.pins
-            .iter()
-            .filter(|core| Rc::strong_count(core) > 1)
-            .count()
-    }
-
-    /// Whether a continuation captured while this region was open is still live.
-    fn pinned(&self, ordinal: u64) -> bool {
-        self.pins
-            .iter()
-            .any(|core| core.frontier > ordinal && Rc::strong_count(core) > 1)
-    }
-
-    /// Holds `scope`'s extent past its close, absorbing the runs nested inside it.
-    fn retain(&mut self, scope: Scope, closing: Vec<RegionId>) {
-        let mut regions = closing;
-        while self.retained.last().is_some_and(|run| run.lo >= scope.mark) {
-            let mut run = self.retained.pop().expect("just tested");
-            regions.append(&mut run.regions);
-        }
-        regions.sort_unstable();
-        self.retained.push(Retained {
-            lo: scope.mark,
-            hi: self.live,
-            ordinal: scope.ordinal,
-            regions,
-        });
-        self.stats.closes_deferred += 1;
-    }
-
-    /// Truncates away every retained run that has become both unpinned and the top of the arena.
-    fn release(&mut self) {
-        let floor = self.scopes.last().map_or(0, |s| s.mark);
-        loop {
-            let Some(run) = self.retained.last() else {
-                return;
-            };
-            if run.hi != self.live || run.lo < floor || self.pinned(run.ordinal) {
-                return;
-            }
-            let lo = run.lo;
-            self.retained.pop();
-            self.stats.slots_reclaimed_late += (self.live - lo) as u64;
-            self.truncate(lo, true);
-        }
     }
 
     pub fn snapshot(&mut self, region: RegionId) -> Option<Snapshot<V>> {
@@ -619,13 +421,7 @@ impl<V: Clone + Default> Arena<V> {
         if self.scopes.get(snapshot.depth).map(|s| s.id) != Some(snapshot.region) {
             return false;
         }
-        self.collect();
-        if self.pins.iter().any(|core| core.top > snapshot.top)
-            || self.retained.iter().any(|run| run.hi > snapshot.base)
-        {
-            return false;
-        }
-        // The snapshot's own slots keep their generations: continuations hold those identities.
+        // The snapshot's own slots keep their generations, so cells made before it still resolve.
         self.truncate(snapshot.top, true);
         self.truncate(snapshot.base, false);
         for (i, value) in snapshot.values.iter().enumerate() {
@@ -703,37 +499,10 @@ impl<V: Clone + Default> fmt::Debug for Arena<V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Arena({} live, {} retained, {} regions open, {} chunks)",
+            "Arena({} live, {} regions open, {} chunks)",
             self.live,
-            self.retained_slots(),
             self.scopes.len(),
             self.chunks.len()
         )
     }
-}
-
-pub fn stale_slot(slot: Slot, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!("slot {slot} belongs to a region whose memory has been reclaimed"),
-    )
-    .primary(span, "this read cannot be answered")
-    .note(
-        "a region's slots are freed at its close unless a continuation captured across it is \
-         still live, so reaching one here means either a value outlived its region or a capture \
-         was not counted",
-    )
-}
-
-pub fn unique_capture(region: RegionId, region_span: Span, capture: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!("a continuation was captured across `{region}`, which is `unique`"),
-    )
-    .primary(capture, "the continuation is captured here")
-    .secondary(region_span, "this region is `unique`")
-    .note(
-        "`unique` is the claim that nothing can reach the region's slots after its close, so the \
-         inference and the machine disagree about what this program does",
-    )
 }
