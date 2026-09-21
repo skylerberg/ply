@@ -1,7 +1,38 @@
-use ply_codegen::c::cache::{decode, encode};
+use ply_codegen::c::cache::{decode, encode, file_digest};
 use ply_codegen::c::tables::{Defined, Tables};
 use ply_eval::Value;
 use ply_span::Symbol;
+
+/// The binary a body is keyed under is identified by its bytes: a build that writes the same ones
+/// keeps the cache it filled, and a change of the same length moves it.
+#[test]
+fn a_binary_is_identified_by_its_bytes_and_not_by_its_timestamp() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let path = dir.path().join("ply");
+    std::fs::write(&path, b"a compiled body\n").expect("the binary is written");
+    let first = file_digest(&path).expect("the binary has an identity");
+
+    let file = std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .expect("the binary opens");
+    file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+        .expect("its modification time moves");
+    assert_eq!(
+        file_digest(&path).as_deref(),
+        Some(first.as_str()),
+        "the same bytes were given two identities"
+    );
+
+    std::fs::write(&path, b"a compiled bodX\n").expect("the binary is rewritten");
+    assert_ne!(
+        file_digest(&path).as_deref(),
+        Some(first.as_str()),
+        "a changed byte kept its identity"
+    );
+
+    assert_eq!(file_digest(&dir.path().join("absent")), None);
+}
 
 /// Table names can be spelled anything, `text` included, so the text's start is an offset rather than a marker.
 #[test]
