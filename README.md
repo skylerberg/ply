@@ -53,9 +53,9 @@ name a server.
 
 The compiler is Ply source under `crates/ply-compiler/ply`, compiled to C and
 committed as `crates/ply-compiler/bootstrap/unit.c.gz` beside `SOURCES.digest`, a
-digest of those sources and `crates/ply-std/ply`. A binary whose bundle is behind
-its sources has the bundle's emitter emit them once, keeps that stage under the unit
-cache, and runs the sources from then on. Editing either makes CI's `bootstrap` job
-fail and upload the regenerated bundle as the `bootstrap-bundle` artifact; bring it
-into the tree with
-`gh run download <run-id> -n bootstrap-bundle -D crates/ply-compiler/bootstrap`.
+digest of those sources and nothing else. A binary whose bundle is behind its
+sources has the bundle's emitter emit them once, keeps that stage under the unit
+cache, and runs the sources from then on. So `crates/ply-compiler/ply` is the only
+Ply in the tree that cannot use a language rule the same change introduces;
+`crates/ply-std/ply` and every other program can. Never commit the bundle: CI
+rebuilds it on main after each merge.
