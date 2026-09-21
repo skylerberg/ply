@@ -924,11 +924,27 @@ pub struct KnownDef {
     pub performed: String,
 }
 
-/// One test's footprint, keyed as `<module>.<label>`, under the hash it had.
+/// One test's footprint, keyed as `<module>.<label>`, under the hash it had. A test's row names its
+/// effects exactly as a definition's does, so it carries the same witness.
 pub struct KnownTest {
     pub key: String,
     pub hash: DefHash,
+    pub witness: Vec<(String, DefHash)>,
     pub footprint: String,
+}
+
+fn witness_list(witness: &[(String, DefHash)]) -> Value {
+    Value::list(
+        witness
+            .iter()
+            .map(|(name, hash)| {
+                record(vec![
+                    ("name", Value::bytes(name.as_bytes())),
+                    ("hash", Value::bytes(hash.0)),
+                ])
+            })
+            .collect(),
+    )
 }
 
 /// What [`front_pulling_std`] answered.
@@ -963,20 +979,7 @@ pub fn front_pulling_std_with(
                 record(vec![
                     ("name", Value::bytes(d.name.as_bytes())),
                     ("hash", Value::bytes(d.hash.0)),
-                    (
-                        "witness",
-                        Value::list(
-                            d.witness
-                                .iter()
-                                .map(|(name, hash)| {
-                                    record(vec![
-                                        ("name", Value::bytes(name.as_bytes())),
-                                        ("hash", Value::bytes(hash.0)),
-                                    ])
-                                })
-                                .collect(),
-                        ),
-                    ),
+                    ("witness", witness_list(&d.witness)),
                     ("footprint", Value::bytes(d.footprint.as_bytes())),
                     ("performed", Value::bytes(d.performed.as_bytes())),
                 ])
@@ -990,6 +993,7 @@ pub fn front_pulling_std_with(
                 record(vec![
                     ("key", Value::bytes(t.key.as_bytes())),
                     ("hash", Value::bytes(t.hash.0)),
+                    ("witness", witness_list(&t.witness)),
                     ("footprint", Value::bytes(t.footprint.as_bytes())),
                 ])
             })

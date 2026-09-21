@@ -455,7 +455,9 @@ fn type_ref(z: Nz, qual: Option<Bytes>, name: Bytes) -> Nz = {
   }
 }
 
-// Effects are nominal: the declaration referenced, then the slot the component's enumeration gave it.
+// Effects are nominal: the declaration referenced, then the slot the component's enumeration gave
+// it. What makes that true is the name in the declaration's own encoding, without which two
+// declarations of one shape would be one declaration here.
 fn effect_ref(z: Nz, q: QName) -> Nz =
   match effect_target(z.index, z.module, q) {
     Some(node) -> u32v(node_ref(z, node), match map_get(z.effects, node) { Some(s) -> s, None -> 0 }),
@@ -520,8 +522,12 @@ fn type_def(z: Nz, d: TypeDef) -> Nz = {
 }
 
 // Operations are looked up by name, so their declaration order is sorted away.
+// An effect is nominal: it is the declaration this name declares, not a shape another declaration
+// could match. Two effects differing only in their names are two effects, so the name is encoded —
+// a published row names its atoms' effects, and nothing else would make a hash pin those names.
 fn effect_def(z: Nz, d: EffectDef) -> Nz = {
-  let z1: Nz = boolv(tag(z, t_effect()), d.is_nondet);
+  let named: Nz = strv(tag(z, t_effect()), qualify(at(z.index.mods, z.module).name, d.name.name));
+  let z1: Nz = boolv(named, d.is_nondet);
   let ops = fold(d.ops, { z: z1, encoded: [] }, |acc: { z: Nz, encoded: List<Bytes> }, op: OpDef| {
     let c: Captured = capture(acc.z, |x: Nz| op_def(x, op));
     { z: c.z, encoded: push(acc.encoded, c.bytes) }
@@ -1883,7 +1889,10 @@ fn p_type_def(x: Pr, d: Dc, name: Bytes) -> Got = {
 }
 
 fn p_effect(x: Pr, d: Dc, name: Bytes) -> Got = {
-  let nd = rd_bool(expect(d, t_effect(), b"an effect"));
+  // The encoding carries the name the declaring program wrote; this printing uses the one it was
+  // asked for, which a relink may have changed.
+  let declared = rd_text(expect(d, t_effect(), b"an effect"));
+  let nd = rd_bool(declared.d);
   let n = rd_count(nd.d);
   let ops = rd_many(n.d, n.v, |g: Dc| {
     let op = rd_text(expect(g, t_op(), b"an operation"));
@@ -1980,11 +1989,10 @@ fn part_in(acc: Parting, c: Comp, named: Map<Bytes, Map<Bytes, Named>>, shipped:
         let all = at(classes, i);
         let h = at(c.hashes, i);
         let kind = bytes_at(at(c.members, i), 0);
+        // An effect declaration carries its own name, so two of them never share a body and a body
+        // that performs one can always say which.
         if len(all) == 0 { {..a, bad: refuse(bytes_concat_all([b"the body `", short_hex(h), b"` has no name"]), [])} }
-        else if kind == t_effect() && len(all) > 1 {
-          {..a, bad: refuse(bytes_concat(listed(all), b" are one effect declaration, so a body cannot say which it performs"),
-                            [b"make the declarations differ, or keep one of them"])}
-        } else {
+        else {
           fold(all, a, |b: Parting, n: Named| {
             let q = qualify(n.module, n.simple);
             let key = bytes_concat(byte_of(kind), q);
@@ -2257,10 +2265,21 @@ test "a label binder, the resources it names and the labels a call fills print b
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
 
-test "one effect declaration under two names is refused, since a body cannot say which it performs" {
+test "two effects that differ only in their names are two declarations" {
   let out = hash_index(indexed([{ name: b"a", src: b"pub effect one { read at() -> Int }" }, { name: b"b", src: b"pub effect two { read at() -> Int }" }]));
-  match print_bodies(map(out.bodies, |b: { name: Bytes, body: Bytes }| b.body), named_hashes(out), [], [], []) {
-    Printed(_) -> panic("two names for one declaration must be refused"),
-    Unprintable(why) -> assert_eq(why.message, b"`a.one`, `b.two` are one effect declaration, so a body cannot say which it performs"),
-  }
+  let named = by_name(named_hashes(out));
+  // Nominal: the shapes match, so only the names tell the two apart, and a hash has to.
+  assert(is_some(map_get(named, b"a.one")));
+  assert(map_get(named, b"a.one") != map_get(named, b"b.two"));
+  let ms = printed_of(out, []);
+  assert_eq(len(ms), 2);
+  assert(holds_text(at(ms, 0).text, b"effect one {"));
+  assert(holds_text(at(ms, 1).text, b"effect two {"))
+}
+
+test "a definition's hash follows the name of the effect it performs" {
+  let one = hash_index(indexed([{ name: b"m", src: b"pub effect log { write put() -> Unit }\npub fn say() -> Unit / {log.write} = log.put()" }]));
+  let other = hash_index(indexed([{ name: b"m", src: b"pub effect trace { write put() -> Unit }\npub fn say() -> Unit / {trace.write} = trace.put()" }]));
+  // The row `say` publishes names its effect, so a hash that ignored the name would not pin the row.
+  assert(map_get(by_name(named_hashes(one)), b"m.say") != map_get(by_name(named_hashes(other)), b"m.say"))
 }

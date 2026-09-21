@@ -399,7 +399,7 @@ pub type Analysis = | Refused(List<Diag>) | Analysed(Whole)
 // those declarations had, and a row whose witness no longer holds is not a row about this program.
 pub type Witness = { name: Bytes, hash: Bytes }
 pub type KnownDefRow = { name: Bytes, hash: Bytes, witness: List<Witness>, footprint: Bytes, performed: Bytes }
-pub type KnownTestRow = { key: Bytes, hash: Bytes, footprint: Bytes }
+pub type KnownTestRow = { key: Bytes, hash: Bytes, witness: List<Witness>, footprint: Bytes }
 
 fn still_hashed(now: Map<Bytes, Bytes>, name: Bytes, was: Bytes) -> Bool =
   match map_get(now, name) { Some(h) -> h == was, None -> false }
@@ -424,15 +424,16 @@ fn test_hashes(index: Index, h: HashOutput) -> Map<Bytes, Bytes> =
   fold(range(0, len(index.tests)), map_new(), |acc: Map<Bytes, Bytes>, i: Int|
     map_insert(acc, at(index.tests, i).key, at(h.tests, i)))
 
-// One slot per `test` of each module, in source order, as `check_tests` walks them.
-fn known_tests(now: Map<Bytes, Bytes>, mods: List<Mod>, rows: List<KnownTestRow>) -> Map<Bytes, List<Option<List<Atom>>>> = {
+// One slot per `test` of each module, in source order, as `check_tests` walks them. A test's row
+// names its effects exactly as a definition's does, so it is witnessed exactly as one.
+fn known_tests(now: Map<Bytes, Bytes>, decls: Map<Bytes, Bytes>, mods: List<Mod>, rows: List<KnownTestRow>) -> Map<Bytes, List<Option<List<Atom>>>> = {
   let by_key = fold(rows, map_new(), |acc: Map<Bytes, KnownTestRow>, r: KnownTestRow| map_insert(acc, r.key, r));
   fold(mods, map_new(), |acc: Map<Bytes, List<Option<List<Atom>>>>, m: Mod|
     map_insert(acc, m.name, fold(m.module.items, [], |slots: List<Option<List<Atom>>>, it: Item|
       match it {
         ITest(d) -> push(slots, match map_get(by_key, qualify(m.name, d.name)) {
           None -> None,
-          Some(r) -> if still_hashed(now, r.key, r.hash) { read_atoms(r.footprint) } else { None },
+          Some(r) -> if still_hashed(now, r.key, r.hash) && witnessed(decls, r.witness) { read_atoms(r.footprint) } else { None },
         }),
         _ -> slots,
       })))
@@ -441,7 +442,7 @@ fn known_tests(now: Map<Bytes, Bytes>, mods: List<Mod>, rows: List<KnownTestRow>
 fn taken(mods: List<Mod>, index: Index, h: HashOutput, defs: List<KnownDefRow>, tests: List<KnownTestRow>) -> Known =
   if len(defs) == 0 && len(tests) == 0 { no_known() } else {
     { defs: known_defs(by_name_one(h.defs), by_name_one(h.decls), defs),
-      tests: known_tests(test_hashes(index, h), mods, tests) }
+      tests: known_tests(test_hashes(index, h), by_name_one(h.decls), mods, tests) }
   }
 
 pub fn analyse(parsed: List<Parsed>) -> Analysis = analyse_with(parsed, [], [])
@@ -1933,7 +1934,8 @@ fn rows_of(sources: List<Source>) -> Rows =
             footprint: atoms_text(d.footprint, b","), performed: atoms_text(d.performed, b",") }),
         tests: map(range(0, len(w.checked.tests)), |i: Int| {
           let t: TestInfo = at(w.checked.tests, i);
-          { key: t.key, hash: at(w.hashes.tests, i), footprint: atoms_text(t.footprint, b",") }
+          { key: t.key, hash: at(w.hashes.tests, i), witness: row_witness(decls, t.footprint),
+            footprint: atoms_text(t.footprint, b",") }
         }) }
     },
   }
@@ -1957,18 +1959,63 @@ test "rows filed under a hash this program no longer has are walked instead" {
             dump_of(analyse(parse_all(effectful()))))
 }
 
-// The same program with the effect under another name. Every definition hashes the same, because a
-// reference is encoded by what it reaches and not by what it is spelled, so only the witness says
-// the rows are about a program this is not.
+// The same program with the effect under another name. An effect is nominal, so `say` and `twice`
+// hash differently here and their filed rows — which name the old effect — are not rows about this.
 fn renamed() -> List<Source> =
   [{ name: b"base", src: b"pub effect trace { write emit(Bytes) -> Unit }\npub fn say(b: Bytes) -> Unit / { trace.write } = trace.emit(b)" },
    { name: b"app", src: b"import base\nfn twice(b: Bytes) -> Unit = base::say(b)\ntest \"says\" { twice(b\"x\") }" }]
 
-test "a row whose effect has been renamed since is not a row about this program" {
+fn test_footprint_of(a: Analysis, key: Bytes) -> Bytes =
+  match a {
+    Refused(_) -> b"<refused>",
+    Analysed(w) -> fold(w.checked.tests, b"", |acc: Bytes, t: TestInfo| if t.key == key { atoms_text(t.footprint, b",") } else { acc }),
+  }
+
+test "a row filed before an effect was renamed is not a row about this program" {
   let rows = rows_of(effectful());
   assert(fold(rows.defs, false, |acc: Bool, r: KnownDefRow| acc || len(r.witness) > 0));
-  assert_eq(dump_of(analyse_with(parse_all(renamed()), rows.defs, rows.tests)),
-            dump_of(analyse(parse_all(renamed()))))
+  assert(fold(rows.tests, false, |acc: Bool, r: KnownTestRow| acc || len(r.witness) > 0));
+  let seeded = analyse_with(parse_all(renamed()), rows.defs, rows.tests);
+  // A test's row names its effects as a definition's does, and goes stale with them.
+  assert_eq(test_footprint_of(seeded, b"app.says"), b"base.trace.write");
+  assert_eq(dump_of(seeded), dump_of(analyse(parse_all(renamed()))))
+}
+
+fn held(m: Map<Bytes, Bytes>, name: Bytes) -> Bytes =
+  match map_get(m, name) { Some(h) -> h, None -> b"" }
+
+fn footprint_of(a: Analysis, name: Bytes) -> Bytes =
+  match a {
+    Refused(_) -> b"<refused>",
+    Analysed(w) -> fold(w.checked.defs, b"", |acc: Bytes, d: DefInfo| if d.name == name { atoms_text(d.footprint, b",") } else { acc }),
+  }
+
+// `say` writes its row and `quiet` leaves its inferred, so one row handed in can unify and the
+// other cannot, in one program and one run.
+fn two_effects() -> List<Source> =
+  [{ name: b"m", src: b"pub effect log { write put() -> Unit }\npub effect other { write put() -> Unit }\npub fn say() -> Unit / {log.write} = log.put()\npub fn quiet(x: Int) -> Int = x" }]
+
+// Both rows are hashed and witnessed as the driver files them, and both name the wrong effect.
+fn wrong_rows(sources: List<Source>) -> List<KnownDefRow> =
+  match analyse(parse_all(sources)) {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) -> {
+      let defs = by_name_one(w.hashes.defs);
+      let witness = [{ name: b"m.other", hash: held(by_name_one(w.hashes.decls), b"m.other") }];
+      map([b"m.say", b"m.quiet"], |n: Bytes|
+        { name: n, hash: held(defs, n), witness: witness,
+          footprint: b"m.other.write", performed: b"m.other.write" })
+    },
+  }
+
+test "a row that will not unify walks the body rather than reporting" {
+  let sources = two_effects();
+  let seeded = analyse_with(parse_all(sources), wrong_rows(sources), []);
+  // The guards passed both rows: `quiet` leaves its row inferred, so the one handed in is taken.
+  assert_eq(footprint_of(seeded, b"m.quiet"), b"m.other.write");
+  // `say` writes `{log.write}`, which the handed row contradicts. Walking it is the whole answer.
+  assert_eq(footprint_of(seeded, b"m.say"), b"m.log.write");
+  assert_eq(footprint_of(seeded, b"m.say"), footprint_of(analyse(parse_all(sources)), b"m.say"))
 }
 
 // Hashed without being checked, so a program that no longer compiles still has hashes to compare.
