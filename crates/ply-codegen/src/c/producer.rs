@@ -811,24 +811,6 @@ fn refusal(entry: &str, payload: &[u8]) -> Result<String> {
     Ok(String::from_utf8_lossy(body).into_owned())
 }
 
-const FMT: &str = "front.fmt_dump";
-
-/// `src` formatted. The outer error is the emitter failing; the inner one is the text the
-/// formatter refused, with the diagnostic that stopped it.
-pub fn fmt_source(src: &str) -> Result<Result<String, String>> {
-    framed(
-        FMT,
-        &[Value::bytes(src.as_bytes())],
-        |words, payload| match words {
-            ["formatted", _] => Ok(Ok(std::str::from_utf8(payload)
-                .context("the formatted text")?
-                .to_string())),
-            ["refused", _] => Ok(Err(refusal(FMT, payload)?)),
-            _ => bail!("`{FMT}` framed a `{}`", words.join(" ")),
-        },
-    )
-}
-
 const ITEM_RANGE: &str = "front.item_range_dump";
 
 /// The byte range of the `fn`, `type` or `effect` named `name` in `src`: its comment lines,

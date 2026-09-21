@@ -23,6 +23,8 @@ pub enum Done {
     MaybeInt(Option<i64>),
     /// `None` when it is not a directory this run can read.
     MaybeStrings(Option<Vec<String>>),
+    /// A constructor with no fields, by the program-wide name the declaring module gives it.
+    Ctor(&'static str),
     /// The operation failed in a way that is neither the peer's doing nor a deadline.
     Failed(String),
     Refused(Diagnostic),
@@ -202,6 +204,7 @@ fn take(state: &mut State, token: u64) -> Taken {
                 Value::list(names.into_iter().map(Value::str).collect())
             })))
         }
+        Done::Ctor(name) => Ok(Value::ctor(name, Vec::new())),
         Done::Refused(diagnostic) => Err(diagnostic),
         Done::Failed(message) => Err(Diagnostic::error(
             codes::RUNTIME_ERROR,

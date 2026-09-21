@@ -288,8 +288,9 @@ impl<'s> Driver<'s> {
         let mut files = Vec::with_capacity(discovered.len());
         for (file, &(source, content)) in discovered.iter().zip(&read) {
             match ModuleName::from_relative_path(&file.relative) {
-                Ok(module) if ply_std::is_reserved(module.as_str()) => {
-                    let diagnostic = ply_std::reserved_diagnostic(&file.path, module.as_str());
+                Ok(module) if crate::shipped::is_shipped_name(module.as_str()) => {
+                    let diagnostic =
+                        crate::shipped::reserved_diagnostic(&file.path, module.as_str());
                     diagnostics.push(anchor(diagnostic, &sources, source));
                 }
                 Ok(module) => files.push(FileState {
@@ -398,10 +399,8 @@ impl<'s> Driver<'s> {
             .iter()
             .map(|f| (f.module.to_string(), f.text.to_string()))
             .collect();
-        let shelf: Vec<(String, String)> = ply_std::sources()
-            .map(|(module, text)| (module.to_string(), text.to_string()))
-            .collect();
-        let pulled = ply_codegen::c::producer::front_pulling_std(&own, &shelf)
+        let shelf = crate::shipped::sources();
+        let pulled = ply_codegen::c::producer::front_pulling_std(&own, shelf)
             .map_err(|e| self.seam_failed(&format!("{e:#}")))?;
         self.place(
             pulled
@@ -567,10 +566,10 @@ impl<'s> Driver<'s> {
         self.files.truncate(own);
         self.sources = self.project.clone();
         for (module, imports) in shipped {
-            let Some(text) = ply_std::source(&module) else {
+            let Some(text) = crate::shipped::source(&module) else {
                 continue;
             };
-            let path = ply_std::pseudo_path(&module);
+            let path = crate::shipped::pseudo_path(&module);
             let content = ContentHash::of(text.as_bytes());
             let source = self.sources.add(&path, text);
             let text = self
@@ -938,7 +937,7 @@ fn shipped_by(
     loop {
         let wanted: BTreeSet<Symbol> = round
             .iter()
-            .filter(|m| ply_std::is_std(m) && !present.contains(m.as_symbol()))
+            .filter(|m| crate::shipped::is_shipped(m) && !present.contains(m.as_symbol()))
             .map(|m| m.as_symbol().clone())
             .collect();
         if wanted.is_empty() {
@@ -947,7 +946,7 @@ fn shipped_by(
         round.clear();
         for name in wanted {
             let module = ModuleName::from_dotted(name.as_str());
-            ply_std::source(&module)?;
+            crate::shipped::source(&module)?;
             let imports = imports_of(&module)?;
             round.extend(imports.iter().cloned());
             present.insert(name);
