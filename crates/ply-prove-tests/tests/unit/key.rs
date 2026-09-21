@@ -48,13 +48,23 @@ fn widening_the_plan_changes_where_a_sample_is_read_from() {
     assert_ne!(prove_key(key(), &narrow), prove_key(key(), &deeper));
 }
 
+/// More budget buys a stronger claim, so a claim decided under one is not a claim under another.
+#[test]
+fn the_step_budget_moves_a_key() {
+    let narrow = ProvePlan::default();
+    let longer = ProvePlan {
+        step_budget: narrow.step_budget * 4,
+        ..narrow.clone()
+    };
+    assert_ne!(prove_key(key(), &narrow), prove_key(key(), &longer));
+}
+
 /// Failures are never cached, so the shrink budget cannot change a cached claim.
 #[test]
 fn the_shrink_budget_does_not_move_a_key() {
     let narrow = ProvePlan::default();
     let looser = ProvePlan {
         shrink_budget: narrow.shrink_budget * 4,
-        time_budget_ms: ply_prove::DEFAULT_TIME_BUDGET_MS,
         ..narrow.clone()
     };
     assert_eq!(prove_key(key(), &narrow), prove_key(key(), &looser));

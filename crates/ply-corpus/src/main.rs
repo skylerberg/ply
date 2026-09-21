@@ -1076,7 +1076,6 @@ fn prove(args: ProveArgs) -> Result<()> {
         cases: args.cases,
         prove_budget: args.prove_budget,
         shrink_budget: args.shrink_budget,
-        time_budget_ms: ply_prove::DEFAULT_TIME_BUDGET_MS,
         ..ply_prove::ProvePlan::default()
     }
     .normalized();

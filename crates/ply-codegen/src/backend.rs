@@ -408,19 +408,7 @@ impl Bodies {
         }
 
         if ctx.failed != 0 {
-            let raised = if ctx.failed == crate::rt::FAILED_OUT_OF_TIME {
-                Some(
-                    ply_span::Diagnostic::error(
-                        ply_span::codes::TIME_BUDGET,
-                        format!(
-                            "ran past the time budget of {} ms",
-                            crate::rt::time_budget_ms()
-                        ),
-                    )
-                    .primary(ctx.site(), "still running here")
-                    .note("`--timeout MS` sets the budget; 0 is none"),
-                )
-            } else if ctx.failed == crate::rt::FAILED_OUT_OF_FUEL {
+            let raised = if ctx.failed == crate::rt::FAILED_OUT_OF_FUEL {
                 // Tier-only: no machine follows, so the budget is reported from here.
                 Some(
                     ply_span::Diagnostic::error(
