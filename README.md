@@ -49,7 +49,8 @@ cargo build --locked --release -p ply-cli --bin ply
 cargo nextest run --workspace
 ```
 
-CI builds one `cargo nextest archive --locked --workspace` and runs it in slices.
+CI builds one `cargo nextest archive --locked --workspace` and runs it in shards
+cut from the durations its last run measured.
 Tests that need a runner of their own are `SOLO` in `.github/ci-shards.sh`; run one
 with `cargo nextest run --workspace -E "$(.github/ci-shards.sh solo-filter <id>)"`.
 The postgres tests in `ply-host-tests` skip unless `PLY_PG_URL` and `PLY_TEST_DB`
