@@ -1,6 +1,7 @@
 //! `ply doc` — one definition or builtin as an agent reads it.
 
 use super::shipped_program::{color, rooted, run};
+use crate::artifact::Binds;
 use crate::cli::DocArgs;
 use crate::style::Style;
 
@@ -13,5 +14,5 @@ pub fn execute(args: &DocArgs, style: Style) -> i32 {
         argv.push("--json".to_string());
     }
     argv.push(inside);
-    run("doc", argv, &root, args.json, style)
+    run("doc", argv, &root, Binds::default(), args.json, style)
 }

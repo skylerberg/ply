@@ -2,6 +2,7 @@
 //! `ply_span::MEANINGS` by a test, so the registry the compiler raises from stays the Rust one.
 
 use super::shipped_program::{color, run};
+use crate::artifact::Binds;
 use crate::cli::ExplainArgs;
 use crate::style::Style;
 use std::path::Path;
@@ -17,5 +18,12 @@ pub fn execute(args: &ExplainArgs, style: Style) -> i32 {
     if let Some(code) = &args.code {
         argv.push(code.clone());
     }
-    run("explain", argv, Path::new("."), args.json, style)
+    run(
+        "explain",
+        argv,
+        Path::new("."),
+        Binds::default(),
+        args.json,
+        style,
+    )
 }

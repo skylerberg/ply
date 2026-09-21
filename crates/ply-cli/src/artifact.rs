@@ -1220,6 +1220,14 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     }
 }
 
+/// What a caller lends an entered program: the roots it may reach and the programs its
+/// `process.spawn` labels may start. What is not lent here, the program cannot reach at all.
+#[derive(Default)]
+pub struct Binds {
+    pub roots: Vec<ply_host::fs::RootSpec>,
+    pub executables: ply_host::process::Executables,
+}
+
 /// One entry into an opened artifact, with no line of its own on either stream: the program's
 /// output is the whole of what a caller sees. The answer is the code `process.exit` asked for,
 /// else `0` for a value returned and the diagnostic for a raise.
@@ -1227,8 +1235,9 @@ pub fn enter(
     artifact: &Artifact,
     opened: &Opened,
     argv: Vec<String>,
-    roots: &[ply_host::fs::RootSpec],
+    binds: Binds,
 ) -> Result<i32, Diagnostic> {
+    let Binds { roots, executables } = binds;
     // A unit built for another runtime is left aside, as `run` leaves it, and the bodies serve.
     let unit = artifact.unit.as_ref().filter(|unit| {
         let served = ply_codegen::c::bundle::unpack(&unit.text)
@@ -1242,22 +1251,24 @@ pub fn enter(
         .get(&opened.entry)
         .map(|d| d.footprint.clone());
     let tier = tier(opened, None, unit)?;
+    let process = ply_host::process::ProcessHost::new(
+        argv,
+        ply_host::process::Sink::Real {
+            out: ply_host::process::Stream::Out,
+        },
+    )
+    .executing(executables);
     let hosts = crate::hosts::Hosts::open_stopping(
         &opened.front.check,
         true,
         &crate::cli::TlsOptions::default(),
-        roots,
+        &roots,
         None,
         crate::config::Configuration::default(),
         &crate::trace::TraceOptions::default(),
         declared.as_ref(),
         None,
-        Some(ply_host::process::ProcessHost::new(
-            argv,
-            ply_host::process::Sink::Real {
-                out: ply_host::process::Stream::Out,
-            },
-        )),
+        Some(process),
     )
     .map_err(|diagnostics| bind_failed(&diagnostics))?;
     let span = opened
