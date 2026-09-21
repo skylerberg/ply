@@ -1257,6 +1257,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         declared.as_ref(),
         shutdown.clone(),
         process,
+        Vec::new(),
     ) {
         Ok(hosts) => hosts,
         Err(diagnostics) => {
@@ -1396,12 +1397,14 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     }
 }
 
-/// What a caller lends an entered program: the roots it may reach and the programs its
-/// `process.spawn` labels may start. What is not lent here, the program cannot reach at all.
+/// What a caller lends an entered program: the roots it may reach, the programs its
+/// `process.spawn` labels may start, and the host operations only this entry may perform. What is
+/// not lent here, the program cannot reach at all.
 #[derive(Default)]
 pub struct Binds {
     pub roots: Vec<ply_host::fs::RootSpec>,
     pub executables: ply_host::process::Executables,
+    pub lent: Vec<crate::hosts::Lent>,
 }
 
 /// One entry into an opened artifact, with no line of its own on either stream: the program's
@@ -1413,7 +1416,11 @@ pub fn enter(
     argv: Vec<String>,
     binds: Binds,
 ) -> Result<i32, Diagnostic> {
-    let Binds { roots, executables } = binds;
+    let Binds {
+        roots,
+        executables,
+        lent,
+    } = binds;
     // A unit built for another runtime is left aside, as `run` leaves it, and the bodies serve.
     let unit = artifact.unit.as_ref().filter(|unit| {
         let served = ply_codegen::c::bundle::unpack(&unit.text)
@@ -1445,6 +1452,7 @@ pub fn enter(
         declared.as_ref(),
         None,
         Some(process),
+        lent,
     )
     .map_err(|diagnostics| bind_failed(&diagnostics))?;
     let span = opened

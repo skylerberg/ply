@@ -110,45 +110,6 @@ impl Configuration {
             || !self.snapshot.files.is_empty()
     }
 
-    /// The `configuration` block of `ply hosts --host`.
-    pub fn lines(&self) -> Vec<String> {
-        let counts = self.snapshot.counts();
-        let mut lines = vec![format!(
-            "sources    --set {} · --config {} {} · environment {} · defaults {}",
-            self.snapshot.sets,
-            self.snapshot.files.len(),
-            crate::commands::common::plural(self.snapshot.files.len(), "file"),
-            self.snapshot.environment,
-            counts.default,
-        )];
-        match &self.schema {
-            None => lines.push(
-                "schema     none — without `--config-schema` a missing key is a `None` at the \
-                 call site, later and per key"
-                    .to_string(),
-            ),
-            Some(view) => lines.push(format!(
-                "schema     {} · {} {} · {} resolved · {} secret",
-                view.name,
-                view.keys.len(),
-                crate::commands::common::plural(view.keys.len(), "key"),
-                counts.keys,
-                counts.secret,
-            )),
-        }
-        if counts.keys > 0 {
-            let keys: Vec<String> = self
-                .snapshot
-                .declared()
-                .map(|(name, resolved)| {
-                    format!("{name}={} ({})", resolved.shown(), resolved.source.as_str())
-                })
-                .collect();
-            lines.push(format!("keys       {}", keys.join(" · ")));
-        }
-        lines
-    }
-
     /// The one line the start-up banner carries.
     pub fn banner(&self) -> String {
         let counts = self.snapshot.counts();
