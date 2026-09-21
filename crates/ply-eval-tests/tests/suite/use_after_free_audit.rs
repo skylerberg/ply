@@ -121,24 +121,41 @@ fn a_region_in_a_law_body_reports_its_escape() {
     );
 }
 
+/// A scheduler older than the region drains what nobody joined, after the region's `}`.
 #[test]
-fn the_same_escape_out_of_a_with_region_is_refused_statically() {
-    let diags = refused(
+fn a_cell_handed_to_a_task_the_region_outlives_is_refused_statically() {
+    for src in [
         r#"
 pub fn attack() -> Int = simulate {
-  { let t = with_region[s] { with_cell[s](11) { c -> task.spawn(|| cell_get(c)) } };
+  { let t = with_cell[s](11) { c -> task.spawn(|| cell_get(c)) };
     task.join(t) }
 }
 "#,
-    );
-    let escape = diags
-        .iter()
-        .find(|d| d.code == codes::REGION_ESCAPE)
-        .unwrap_or_else(|| panic!("a task reached a `with_region`'s cell: {diags:#?}"));
-    assert!(
-        escape.message.contains("sent to another task"),
-        "{}",
-        escape.message
+        // A join inside the region does not license it: no type records the join.
+        r#"
+pub fn attack() -> Int = simulate {
+  with_cell[s](11) { c -> { let t = task.spawn(|| cell_get(c)); task.join(t) } }
+}
+"#,
+    ] {
+        let diags = refused(src);
+        let escape = diags
+            .iter()
+            .find(|d| d.code == codes::REGION_ESCAPE)
+            .unwrap_or_else(|| panic!("a task reached a `with_cell` region's cell: {diags:#?}"));
+        assert!(
+            escape.message.contains("sent to another task"),
+            "{}",
+            escape.message
+        );
+    }
+
+    // The remedy: a scheduler opened inside the region cannot outlive the cell.
+    Compiled::new(
+        r#"
+pub fn guarded() -> Int =
+  with_cell[s](11) { c -> simulate { task.join(task.spawn(|| cell_get(c))) } }
+"#,
     );
 }
 

@@ -772,8 +772,8 @@ type Slot =
   | Peer(Task<Int>)
 
 test \"stuck\" {
-  simulate {
-with_cell[slot](Empty) { peer -> {
+  with_cell[slot](Empty) { peer ->
+simulate {
   let first = task.spawn(|| {
     clock.sleep(1);
     match cell_get(peer) {
@@ -784,7 +784,7 @@ with_cell[slot](Empty) { peer -> {
   let second = task.spawn(|| task.join(first));
   cell_set(peer, Peer(second));
   task.join(first)
-} }
+}
   }
 }
 ";
