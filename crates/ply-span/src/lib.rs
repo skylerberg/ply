@@ -234,7 +234,7 @@ pub mod codes {
     /// A row, or an `effect set` body, naming a set the module does not declare.
     pub const UNKNOWN_EFFECT_SET: &str = "E0114";
     pub const EFFECT_SET_CYCLE: &str = "E0115";
-    /// The base of a record update `{..b, f: e}` has no record shape this module can name.
+    /// The base of a record update `{..b, f: e}` is not a record, or its type is not known there.
     pub const RECORD_UPDATE_SHAPE: &str = "E0116";
     pub const RECORD_UPDATE_FIELD: &str = "E0117";
     /// A `?` whose enclosing function's return type is not readable as `Result` or `Option`.
@@ -271,7 +271,8 @@ pub mod codes {
     pub const ORPHAN_DERIVE: &str = "E0208";
     /// `/` applied to `Decimal`.
     pub const DECIMAL_DIVISION: &str = "E0209";
-    /// An arithmetic or ordered-comparison operand whose numeric type nothing determines.
+    /// An operand whose type nothing determines: an arithmetic or ordered-comparison numeric,
+    /// or the `String`-or-`Bytes` a `++` joins.
     pub const NUMERIC_UNDETERMINED: &str = "E0210";
     /// An integer literal outside the fixed-width type its context gave it.
     pub const LITERAL_OUT_OF_RANGE: &str = "E0211";
@@ -353,8 +354,8 @@ pub mod codes {
     pub const SPAN_UNBALANCED: &str = "E0445";
     /// A value branded with a region's name would outlive the region.
     pub const REGION_ESCAPE: &str = "E0446";
-    /// Two regions in scope at once under one name.
-    pub const REGION_ALREADY_OPEN: &str = "E0447";
+    /// A definition the program reaches that the compiled tier cannot compile.
+    pub const DEFINITION_REFUSED: &str = "E0448";
     /// A region handle crossing a runtime boundary, where no type is left to check.
     pub const REGION_ESCAPE_AT_BOUNDARY: &str = "E0449";
     pub const BACKEND_UNAVAILABLE: &str = "E0450";
@@ -427,7 +428,7 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ("E0115", "`effect set` cycle"),
     (
         "E0116",
-        "record update base with no shape this file can name",
+        "record update base that is not a record of a known type",
     ),
     ("E0117", "record update naming a field the base lacks"),
     (
@@ -474,7 +475,7 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ("E0207", "unknown deriver"),
     ("E0208", "orphan `derive`"),
     ("E0209", "`/` on `Decimal`"),
-    ("E0210", "numeric operand type nothing determines"),
+    ("E0210", "operand type nothing determines"),
     ("E0211", "integer literal out of range for its fixed width"),
     ("E0301", "unbound row variable"),
     ("E0302", "effect not permitted by the written row"),
@@ -560,7 +561,7 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ("E0444", "artifact built under another version"),
     ("E0445", "`trace.exit` of a span not open on this task"),
     ("E0446", "value outlives its region"),
-    ("E0447", "two regions in scope under one name"),
+    ("E0448", "definition the compiled tier cannot compile"),
     ("E0449", "region handle reaching a runtime boundary"),
     ("E0450", "compiled backend cannot be attached"),
     ("E0451", "`fs` label with no root bound"),
@@ -855,7 +856,7 @@ mod tests {
             ("ARTIFACT_VERSION", codes::ARTIFACT_VERSION, "E0444"),
             ("SPAN_UNBALANCED", codes::SPAN_UNBALANCED, "E0445"),
             ("REGION_ESCAPE", codes::REGION_ESCAPE, "E0446"),
-            ("REGION_ALREADY_OPEN", codes::REGION_ALREADY_OPEN, "E0447"),
+            ("DEFINITION_REFUSED", codes::DEFINITION_REFUSED, "E0448"),
             (
                 "REGION_ESCAPE_AT_BOUNDARY",
                 codes::REGION_ESCAPE_AT_BOUNDARY,

@@ -274,7 +274,7 @@ pub fn build(
     // Reopened as a target opens it, so an artifact that builds is one that opens.
     let opened = reopen(&out).map_err(|diags| vec![unreopened(&diags)])?;
     let names: Vec<&str> = out.names.iter().map(|(n, _)| n.as_str()).collect();
-    let emission = embedded_unit(&opened, &opened.entry, &names);
+    let emission = embedded_unit(&opened, &opened.entry, &names).map_err(|d| vec![d])?;
     out.unit = emission.unit;
 
     Ok(Built {
@@ -310,8 +310,9 @@ fn closure_texts(artifact: &Artifact) -> Result<Vec<(String, String)>, Vec<Diagn
         .collect())
 }
 
-/// Embedded so `ply run` need not emit and compile C at every run; a failed production is reported.
-fn embedded_unit(opened: &Opened, entry: &Symbol, names: &[&str]) -> Emission {
+/// Embedded so `ply run` need not emit and compile C at every run; a definition the emitter
+/// refused fails the build, and any other failed production is reported.
+fn embedded_unit(opened: &Opened, entry: &Symbol, names: &[&str]) -> Result<Emission, Diagnostic> {
     ply_codegen::c::producer::ensure_default();
     // Definitions only: no emitter is offered effect or resource declarations.
     let names: Vec<&str> = names
@@ -327,44 +328,32 @@ fn embedded_unit(opened: &Opened, entry: &Symbol, names: &[&str]) -> Emission {
             Ok((produced, text))
         });
     match produced {
-        Ok((produced, text)) => {
-            let refused: Vec<(String, String)> = produced
+        Ok((produced, text)) => Ok(Emission {
+            unit: Some(EmbeddedUnit { text }),
+            entry_compiled: produced.exports.names().iter().any(|n| n == entry.as_str()),
+            refused: produced
                 .refused
                 .iter()
                 .map(|r| (r.function.clone(), r.construct.clone()))
-                .collect();
-            let mut warnings = Vec::new();
-            if !refused.is_empty() {
-                warnings.push(
+                .collect(),
+            warnings: Vec::new(),
+        }),
+        // A refusal is a fact about the program, not about this host's toolchain: it fails the
+        // build rather than landing an artifact whose entry finds no body.
+        Err(e) => match ply_codegen::c::refused_in(&e) {
+            Some(refusals) => Err(refusals.diagnostic().clone()),
+            None => Ok(Emission {
+                unit: None,
+                refused: Vec::new(),
+                entry_compiled: false,
+                warnings: vec![
                     Diagnostic::warning(
                         codes::BACKEND_UNAVAILABLE,
-                        format!(
-                            "the emitter refused {} of the artifact's definitions, which will not run from it",
-                            refused.len()
-                        ),
+                        format!("no compiled unit could be produced for the artifact: {e:#}"),
                     )
-                    .note(refusal_list(&refused))
-                    .note("a refused definition is entered from nothing at run time; make it one the emitter compiles"),
-                );
-            }
-            Emission {
-                unit: Some(EmbeddedUnit { text }),
-                entry_compiled: produced.exports.names().iter().any(|n| n == entry.as_str()),
-                refused,
-                warnings,
-            }
-        }
-        Err(e) => Emission {
-            unit: None,
-            refused: Vec::new(),
-            entry_compiled: false,
-            warnings: vec![
-                Diagnostic::warning(
-                    codes::BACKEND_UNAVAILABLE,
-                    format!("no compiled unit could be produced for the artifact: {e:#}"),
-                )
-                .note("the artifact's bodies are printed back to source and compiled at each run instead"),
-            ],
+                    .note("the artifact's bodies are printed back to source and compiled at each run instead"),
+                ],
+            }),
         },
     }
 }
@@ -777,12 +766,17 @@ fn place_and_read(
 
 /// Where the front end's answer for one artifact is kept: beside the program, under a key that is
 /// the artifact's own bytes plus what reads them.
+/// An artifact's digest covers what it holds, not what it was built against: the shipped library
+/// it closed over sits outside the hashed ranges. A reopened `Front` is an answer over that
+/// library, so the key names it rather than relying on where the file happens to sit.
 fn front_cache(artifact: &Artifact) -> PathBuf {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&artifact.digest());
     hasher.update(ply_store::FRONTEND_VERSION.as_bytes());
     hasher.update(&[0]);
     hasher.update(ply_codegen::c::producer::identity().as_bytes());
+    hasher.update(&[0]);
+    hasher.update(&ply_std::digest());
     crate::shipped::stage().join(format!("front.{}", &hasher.finalize().to_hex()[..16]))
 }
 
@@ -1226,6 +1220,14 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     }
 }
 
+/// What a caller lends an entered program: the roots it may reach and the programs its
+/// `process.spawn` labels may start. What is not lent here, the program cannot reach at all.
+#[derive(Default)]
+pub struct Binds {
+    pub roots: Vec<ply_host::fs::RootSpec>,
+    pub executables: ply_host::process::Executables,
+}
+
 /// One entry into an opened artifact, with no line of its own on either stream: the program's
 /// output is the whole of what a caller sees. The answer is the code `process.exit` asked for,
 /// else `0` for a value returned and the diagnostic for a raise.
@@ -1233,8 +1235,9 @@ pub fn enter(
     artifact: &Artifact,
     opened: &Opened,
     argv: Vec<String>,
-    roots: &[ply_host::fs::RootSpec],
+    binds: Binds,
 ) -> Result<i32, Diagnostic> {
+    let Binds { roots, executables } = binds;
     // A unit built for another runtime is left aside, as `run` leaves it, and the bodies serve.
     let unit = artifact.unit.as_ref().filter(|unit| {
         let served = ply_codegen::c::bundle::unpack(&unit.text)
@@ -1248,22 +1251,24 @@ pub fn enter(
         .get(&opened.entry)
         .map(|d| d.footprint.clone());
     let tier = tier(opened, None, unit)?;
+    let process = ply_host::process::ProcessHost::new(
+        argv,
+        ply_host::process::Sink::Real {
+            out: ply_host::process::Stream::Out,
+        },
+    )
+    .executing(executables);
     let hosts = crate::hosts::Hosts::open_stopping(
         &opened.front.check,
         true,
         &crate::cli::TlsOptions::default(),
-        roots,
+        &roots,
         None,
         crate::config::Configuration::default(),
         &crate::trace::TraceOptions::default(),
         declared.as_ref(),
         None,
-        Some(ply_host::process::ProcessHost::new(
-            argv,
-            ply_host::process::Sink::Real {
-                out: ply_host::process::Stream::Out,
-            },
-        )),
+        Some(process),
     )
     .map_err(|diagnostics| bind_failed(&diagnostics))?;
     let span = opened

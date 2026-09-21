@@ -1,10 +1,8 @@
-//! What a `simulate` region schedules, and the trail every region of one entry point writes into.
+//! The trail every region of one entry point writes into.
 
-use crate::cont::{Continuation, Delimiter};
 use crate::explore::{Interleaving, Step, Verdict};
-use crate::sched::{Scheduler, StepRecord};
+use crate::sched::StepRecord;
 use crate::sim::{Access, Domain, Seed, Stream};
-use crate::value::Value;
 
 use ply_span::{Diagnostic, Span, Symbol};
 
@@ -12,14 +10,6 @@ pub struct StepSite {
     pub definition: Option<Symbol>,
     pub span: Span,
 }
-
-/// A task to start: its body, and the spawning frame's delimiters its stack is installed over.
-pub struct Spawned {
-    pub body: Value,
-    pub over: Vec<Delimiter>,
-}
-
-pub type MachineScheduler = Scheduler<Continuation, Spawned>;
 
 pub struct Trail {
     seed: Seed,
