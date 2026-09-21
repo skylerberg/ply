@@ -347,9 +347,11 @@ impl<K: Clone, B> Scheduler<K, B> {
         Ok(Turn::Run { task, resumption })
     }
 
+    /// Only a production region parks: the boundary refuses a host operation performed under a
+    /// seed before a handler can answer one, so a seeded park is a defect in dispatch.
     pub fn park_on_host(&mut self, k: K, pending: Pending, span: Span) -> Result<(), Diagnostic> {
-        if self.policy != Policy::Host {
-            return Err(err_host_in_simulation(span, &pending, self.span));
+        if let Err(d) = self.require(Policy::Host) {
+            return Err(d.secondary(span, format!("`{pending}` would have parked this task")));
         }
         let at = self.running()?;
         self.tasks[at].state = TaskState::Blocked {
@@ -752,7 +754,7 @@ impl<K: Clone, B> Scheduler<K, B> {
             ),
         )
         .primary(self.span, "this region was opened with the other policy")
-        .note("`Scheduler::next` drives a seeded region and `Scheduler::next_host` drives a production one; the two are never interchangeable")
+        .note("`Scheduler::next` drives a seeded region and the host entry points drive a production one; the two are never interchangeable")
         .note("a seeded region that took real readiness for an answer would stop being a function of its seed"))
     }
 
@@ -810,19 +812,6 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 }
 
 pub const FRUITLESS_PARKS: u32 = 1024;
-
-#[cold]
-#[inline(never)]
-fn err_host_in_simulation(span: Span, pending: &Pending, region: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::HOST_IN_SIMULATION,
-        format!("a host operation — {pending} — was answered inside a `simulate` region"),
-    )
-    .primary(span, "this perform reached the host boundary")
-    .secondary(region, "the region it was performed in")
-    .note("a simulated region is replayed whole per interleaving, so a host operation inside one is performed once per schedule explored")
-    .note("handle the operation inside the region with a test double, or move the region out from under the host binding")
-}
 
 #[cold]
 #[inline(never)]
