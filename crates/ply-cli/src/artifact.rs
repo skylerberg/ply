@@ -2,6 +2,8 @@
 //! content-addressed store already holds.
 
 use crate::load::Loaded;
+use ply_eval::{Fields, Value};
+use ply_span::frames::Cursor;
 use ply_span::{Diagnostic, Severity, SourceMap, Span, Symbol, codes};
 use ply_store::body::StoredBody;
 use ply_ty::ModuleName;
@@ -9,38 +11,16 @@ use ply_ty::{DefHash, HashOutput};
 use ply_ty::{DefInfo, Front};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-
-pub const ARTIFACT_FORMAT: u32 = 4;
+use std::sync::Arc;
 
 pub const EXTENSION: &str = "plyx";
 
-const MAGIC: &[u8; 8] = b"PLYPROG1";
-
-/// So a program digest is never confused with a definition hash or `ply hosts --digest`.
-const DIGEST_DOMAIN: &[u8] = b"ply.program.2";
-
-const FLAG_CLOSURE: u32 = 1;
-const FLAG_UNIT: u32 = 2;
-
-pub const HEADER_LEN: usize = 188;
-pub const DESCRIPTOR_LEN: usize = 24;
-const OFF_FORMAT: usize = 8;
-const OFF_FLAGS: usize = 12;
-const OFF_FRONTEND: usize = 16;
-const OFF_RUNTIME: usize = 48;
-const OFF_BODY_ENC: usize = 80;
-const OFF_STD: usize = 84;
-const OFF_ENTRY: usize = 116;
-const OFF_DIGEST: usize = 148;
-/// The digest covers every byte of the file from here on, plus the entry point.
-pub const OFF_SECTIONS: usize = 180;
-const OFF_RESERVED: usize = 184;
-
-const KIND_BODIES: u32 = 1;
-const KIND_NAMES: u32 = 2;
-const KIND_STRINGS: u32 = 3;
-const KIND_CLOSURE: u32 = 4;
-const KIND_UNIT: u32 = 5;
+/// The container is `crates/ply-compiler/ply/plyx.ply`: the magic, every header offset, the
+/// section table and what a digest covers are written there and nowhere else.
+const ENCODE: &str = "plyx.encode";
+const DECODE: &str = "plyx.decode_dump";
+const PLAN: &str = "plyx.plan_dump";
+const FORMAT: &str = "plyx.format";
 
 /// The emitted C, compressed; left aside when its helper table is not a prefix of this runtime's.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,17 +56,72 @@ impl Artifact {
             .map(|(name, _)| name.as_str())
     }
 
+    /// All zeroes when the container could not be written, as an unwritable artifact has no
+    /// digest to print or to key a cache on.
     pub fn digest(&self) -> [u8; 32] {
-        let bytes = self.encode();
-        digest_of(&bytes).unwrap_or([0; 32])
+        self.encode()
+            .ok()
+            .and_then(|bytes| digest_of(&bytes))
+            .unwrap_or([0; 32])
     }
 
     pub fn digest_short(&self) -> String {
         short(&self.digest())
     }
 
-    pub fn encode(&self) -> Vec<u8> {
-        let mut sections: Vec<(u32, u32, Vec<u8>)> = Vec::with_capacity(4);
+    /// The container `plyx.ply` places these sections in, with its digest written into the field
+    /// no range of the digest covers.
+    pub fn encode(&self) -> Result<Vec<u8>, Diagnostic> {
+        let head = record(vec![
+            ("frontend", Value::bytes(self.frontend)),
+            ("runtime", Value::bytes(self.runtime)),
+            ("body_encoding", Value::Int(i64::from(self.body_encoding))),
+            ("stdlib", Value::bytes(self.std)),
+            ("entry", Value::bytes(self.entry.0)),
+        ]);
+        let sections = Value::list(
+            self.sections()
+                .into_iter()
+                .map(|(name, count, payload)| {
+                    record(vec![
+                        ("name", Value::bytes(name.as_bytes())),
+                        ("count", Value::Int(i64::from(count))),
+                        ("payload", Value::bytes(payload)),
+                    ])
+                })
+                .collect(),
+        );
+        let answered = answer(ENCODE, &[head, sections])?;
+        let Value::Bytes(written) = &answered else {
+            return Err(container_failed(format!(
+                "`{ENCODE}` answered something that is not a byte string"
+            )));
+        };
+        let mut out = written.to_vec();
+        let Some(plan) = plan(out.len())? else {
+            return Err(container_failed(format!(
+                "`{ENCODE}` answered {} bytes, which is no container at all",
+                out.len()
+            )));
+        };
+        let digest = plan.over(&out).ok_or_else(|| {
+            container_failed("the digest plan reaches past the container it is for".to_string())
+        })?;
+        let field = plan
+            .at
+            .checked_add(32)
+            .and_then(|end| out.get_mut(plan.at..end))
+            .ok_or_else(|| {
+                container_failed("the digest plan writes past the container it is for".to_string())
+            })?;
+        field.copy_from_slice(&digest);
+        Ok(out)
+    }
+
+    /// Each section's payload, in the order they are written. The records inside a payload are
+    /// the writer's; `plyx.ply` places the payloads and hands them back.
+    fn sections(&self) -> Vec<(&'static str, u32, Vec<u8>)> {
+        let mut sections: Vec<(&'static str, u32, Vec<u8>)> = Vec::with_capacity(5);
 
         let mut bodies = Vec::new();
         for (hash, body) in &self.bodies {
@@ -94,7 +129,7 @@ impl Artifact {
             bodies.extend_from_slice(&(body.len() as u32).to_le_bytes());
             bodies.extend_from_slice(body.as_bytes());
         }
-        sections.push((KIND_BODIES, self.bodies.len() as u32, bodies));
+        sections.push(("bodies", self.bodies.len() as u32, bodies));
 
         // In record order, so the blob is a function of the record list alone.
         let mut strings: Vec<u8> = Vec::new();
@@ -110,8 +145,8 @@ impl Artifact {
             names.extend_from_slice(&(name.len() as u32).to_le_bytes());
             names.extend_from_slice(&hash.0);
         }
-        sections.push((KIND_NAMES, self.names.len() as u32, names));
-        sections.push((KIND_STRINGS, strings.len() as u32, strings));
+        sections.push(("names", self.names.len() as u32, names));
+        sections.push(("strings", strings.len() as u32, strings));
 
         if !self.closure.is_empty() {
             let mut payload = Vec::new();
@@ -121,68 +156,255 @@ impl Artifact {
                 payload.extend_from_slice(&(text.len() as u32).to_le_bytes());
                 payload.extend_from_slice(text.as_bytes());
             }
-            sections.push((KIND_CLOSURE, self.closure.len() as u32, payload));
+            sections.push(("closure", self.closure.len() as u32, payload));
         }
         if let Some(unit) = &self.unit {
-            fn put(payload: &mut Vec<u8>, bytes: &[u8]) {
-                payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                payload.extend_from_slice(bytes);
-            }
             let mut payload = Vec::new();
-            put(&mut payload, &unit.text);
-            sections.push((KIND_UNIT, 1, payload));
+            payload.extend_from_slice(&(unit.text.len() as u32).to_le_bytes());
+            payload.extend_from_slice(&unit.text);
+            sections.push(("unit", 1, payload));
         }
+        sections
+    }
+}
 
-        let table = HEADER_LEN + DESCRIPTOR_LEN * sections.len();
-        let mut out = vec![0u8; table];
-        out[..8].copy_from_slice(MAGIC);
-        out[OFF_FORMAT..OFF_FORMAT + 4].copy_from_slice(&ARTIFACT_FORMAT.to_le_bytes());
-        let mut flags = if self.closure.is_empty() {
-            0
-        } else {
-            FLAG_CLOSURE
-        };
-        if self.has_unit() {
-            flags |= FLAG_UNIT;
-        }
-        out[OFF_FLAGS..OFF_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
-        out[OFF_FRONTEND..OFF_FRONTEND + 32].copy_from_slice(&self.frontend);
-        out[OFF_RUNTIME..OFF_RUNTIME + 32].copy_from_slice(&self.runtime);
-        out[OFF_BODY_ENC..OFF_BODY_ENC + 4].copy_from_slice(&self.body_encoding.to_le_bytes());
-        out[OFF_STD..OFF_STD + 32].copy_from_slice(&self.std);
-        out[OFF_ENTRY..OFF_ENTRY + 32].copy_from_slice(&self.entry.0);
-        out[OFF_SECTIONS..OFF_SECTIONS + 4].copy_from_slice(&(sections.len() as u32).to_le_bytes());
-        out[OFF_RESERVED..OFF_RESERVED + 4].copy_from_slice(&0u32.to_le_bytes());
-
-        let mut at = table as u64;
-        for (i, (kind, count, payload)) in sections.iter().enumerate() {
-            let d = HEADER_LEN + DESCRIPTOR_LEN * i;
-            out[d..d + 4].copy_from_slice(&kind.to_le_bytes());
-            out[d + 4..d + 8].copy_from_slice(&count.to_le_bytes());
-            out[d + 8..d + 16].copy_from_slice(&at.to_le_bytes());
-            out[d + 16..d + 24].copy_from_slice(&(payload.len() as u64).to_le_bytes());
-            at += payload.len() as u64;
-        }
-        for (_, _, payload) in &sections {
-            out.extend_from_slice(payload);
-        }
-
-        let digest = digest_of(&out).unwrap_or([0; 32]);
-        out[OFF_DIGEST..OFF_DIGEST + 32].copy_from_slice(&digest);
-        out
+/// The container format this `ply` writes and reads.
+pub fn format() -> Result<u32, Diagnostic> {
+    match answer(FORMAT, &[])? {
+        Value::Int(n) if (0..=i64::from(u32::MAX)).contains(&n) => Ok(n as u32),
+        other => Err(container_failed(format!(
+            "`{FORMAT}` answered a {} rather than a format number",
+            other.type_name()
+        ))),
     }
 }
 
 /// Read out of the bytes, so the writer and the reader digest the same thing by construction.
 pub fn digest_of(bytes: &[u8]) -> Option<[u8; 32]> {
-    if bytes.len() < OFF_SECTIONS {
-        return None;
+    plan(bytes.len()).ok().flatten()?.over(bytes)
+}
+
+/// What a program digest is taken over, as `plyx.ply` states it. The hash itself is the host's:
+/// a digest covers the whole artifact, and Ply's own BLAKE3 runs at a few megabytes a second.
+struct Plan {
+    domain: Vec<u8>,
+    /// Where the digest is written, which no range covers.
+    at: usize,
+    covers: Vec<(usize, usize)>,
+}
+
+impl Plan {
+    fn over(&self, bytes: &[u8]) -> Option<[u8; 32]> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.domain);
+        for (at, len) in &self.covers {
+            hasher.update(bytes.get(*at..at.checked_add(*len)?)?);
+        }
+        Some(*hasher.finalize().as_bytes())
     }
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(DIGEST_DOMAIN);
-    hasher.update(&bytes[OFF_ENTRY..OFF_ENTRY + 32]);
-    hasher.update(&bytes[OFF_SECTIONS..]);
-    Some(*hasher.finalize().as_bytes())
+}
+
+/// `None` when a file that long is too short to carry a digest at all.
+fn plan(len: usize) -> Result<Option<Plan>, Diagnostic> {
+    let answered = answer(PLAN, &[Value::Int(len as i64)])?;
+    let Value::Bytes(dump) = &answered else {
+        return Err(container_failed(format!(
+            "`{PLAN}` answered something that is not a byte string"
+        )));
+    };
+    let unreadable = |e: String| container_failed(format!("`{PLAN}`'s answer does not read: {e}"));
+    let mut frames = Cursor::new(dump, "frame");
+    let (words, payload) = frames.unit().map_err(unreadable)?;
+    match words[..] {
+        ["refused", _] => return Ok(None),
+        ["plan", _] => {}
+        _ => return Err(unreadable(format!("a `{}` frame", words.join(" ")))),
+    }
+    // Not defaulted: a plan missing its field would write the digest over the magic.
+    let mut domain = None;
+    let mut at = None;
+    let mut covers = Vec::new();
+    let mut fields = Cursor::new(payload, "field");
+    while !fields.done() {
+        let (key, body) = fields.unit().map_err(unreadable)?;
+        match key[..] {
+            ["domain"] => domain = Some(body.to_vec()),
+            ["at"] => at = Some(number(body).map_err(unreadable)?),
+            ["covers"] => {
+                let text = std::str::from_utf8(body).map_err(|e| unreadable(e.to_string()))?;
+                let Some((start, len)) = text.split_once(' ') else {
+                    return Err(unreadable(format!("a range spelled `{text}`")));
+                };
+                let read = |what: &str, n: &str| {
+                    n.parse::<usize>()
+                        .map_err(|_| unreadable(format!("{what} `{n}`")))
+                };
+                covers.push((read("an offset", start)?, read("a length", len)?));
+            }
+            _ => return Err(unreadable(format!("a `{}` field", key.join(" ")))),
+        }
+    }
+    match (domain, at) {
+        (Some(domain), Some(at)) => Ok(Some(Plan { domain, at, covers })),
+        _ => Err(unreadable(
+            "a plan with no domain or no digest field".to_string(),
+        )),
+    }
+}
+
+/// One section as the container placed it; the records inside its payload are this file's to read.
+struct Placed {
+    name: String,
+    count: usize,
+    at: usize,
+    len: usize,
+}
+
+/// A header read back, and where each of its sections lies.
+struct Container {
+    frontend: [u8; 32],
+    runtime: [u8; 32],
+    body_encoding: u32,
+    std: [u8; 32],
+    entry: DefHash,
+    digest: [u8; 32],
+    sections: Vec<Placed>,
+}
+
+impl Container {
+    fn section(&self, name: &str) -> Option<&Placed> {
+        self.sections.iter().find(|s| s.name == name)
+    }
+}
+
+fn container(bytes: &[u8], path: &Path) -> Result<Container, Diagnostic> {
+    let answered = answer(DECODE, &[Value::bytes(bytes)])?;
+    let Value::Bytes(dump) = &answered else {
+        return Err(container_failed(format!(
+            "`{DECODE}` answered something that is not a byte string"
+        )));
+    };
+    let unreadable =
+        |e: String| container_failed(format!("`{DECODE}`'s answer does not read: {e}"));
+    let mut frames = Cursor::new(dump, "frame");
+    let (words, payload) = frames.unit().map_err(unreadable)?;
+    match words[..] {
+        ["refused", _] => return Err(refused(path, payload, false)?),
+        ["stale", _] => return Err(refused(path, payload, true)?),
+        ["head", _] => {}
+        _ => return Err(unreadable(format!("a `{}` frame", words.join(" ")))),
+    }
+
+    let mut out = Container {
+        frontend: [0; 32],
+        runtime: [0; 32],
+        body_encoding: 0,
+        std: [0; 32],
+        entry: DefHash([0; 32]),
+        digest: [0; 32],
+        sections: Vec::new(),
+    };
+    let mut fields = Cursor::new(payload, "field");
+    while !fields.done() {
+        let (key, body) = fields.unit().map_err(unreadable)?;
+        let hash = |what: &str| {
+            <[u8; 32]>::try_from(body)
+                .map_err(|_| unreadable(format!("a `{what}` of {} bytes", body.len())))
+        };
+        match key[..] {
+            ["frontend"] => out.frontend = hash("frontend")?,
+            ["runtime"] => out.runtime = hash("runtime")?,
+            ["stdlib"] => out.std = hash("stdlib")?,
+            ["entry"] => out.entry = DefHash(hash("entry")?),
+            ["digest"] => out.digest = hash("digest")?,
+            ["body_encoding"] => out.body_encoding = number(body).map_err(unreadable)? as u32,
+            _ => return Err(unreadable(format!("a `{}` field", key.join(" ")))),
+        }
+    }
+
+    while !frames.done() {
+        let (words, payload) = frames.unit().map_err(unreadable)?;
+        if !matches!(words[..], ["section", _]) {
+            return Err(unreadable(format!("a `{}` frame", words.join(" "))));
+        }
+        let mut placed = Placed {
+            name: String::new(),
+            count: 0,
+            at: 0,
+            len: 0,
+        };
+        let mut fields = Cursor::new(payload, "field");
+        while !fields.done() {
+            let (key, body) = fields.unit().map_err(unreadable)?;
+            match key[..] {
+                ["name"] => placed.name = String::from_utf8_lossy(body).into_owned(),
+                ["count"] => placed.count = number(body).map_err(unreadable)?,
+                ["at"] => placed.at = number(body).map_err(unreadable)?,
+                ["len"] => placed.len = number(body).map_err(unreadable)?,
+                _ => return Err(unreadable(format!("a `{}` field", key.join(" ")))),
+            }
+        }
+        out.sections.push(placed);
+    }
+    Ok(out)
+}
+
+/// The container's own refusal, as the diagnostic the reader would have raised: a `stale` one is
+/// a file no transfer will mend, and every other is a file that arrived damaged.
+fn refused(path: &Path, payload: &[u8], stale: bool) -> Result<Diagnostic, Diagnostic> {
+    let unreadable =
+        |e: String| container_failed(format!("`{DECODE}`'s refusal does not read: {e}"));
+    let mut fields = Cursor::new(payload, "field");
+    let mut message = String::new();
+    let mut notes: Vec<String> = Vec::new();
+    while !fields.done() {
+        let (key, body) = fields.unit().map_err(unreadable)?;
+        let text = String::from_utf8_lossy(body).into_owned();
+        match key[..] {
+            ["message"] => message = text,
+            ["note"] => notes.push(text),
+            _ => return Err(unreadable(format!("a `{}` field", key.join(" ")))),
+        }
+    }
+    let base = if stale {
+        version(path, message)
+    } else {
+        invalid(path, message)
+    };
+    Ok(notes.into_iter().fold(base, |d, note| d.note(note)))
+}
+
+fn number(body: &[u8]) -> Result<usize, String> {
+    std::str::from_utf8(body)
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .ok_or_else(|| format!("a number spelled `{}`", String::from_utf8_lossy(body)))
+}
+
+// `Value::Record` holds an `Arc`, and `Fields` is not `Send`; every construction site says so.
+#[allow(clippy::arc_with_non_send_sync)]
+fn record(fields: Vec<(&str, Value)>) -> Value {
+    Value::Record(Arc::new(Fields::from_unsorted(
+        fields
+            .into_iter()
+            .map(|(name, value)| (Symbol::new(name), value))
+            .collect(),
+    )))
+}
+
+fn answer(entry: &str, args: &[Value]) -> Result<Value, Diagnostic> {
+    ply_codegen::c::producer::ensure_default();
+    ply_codegen::c::producer::call(entry, args).map_err(|e| container_failed(format!("{e:#}")))
+}
+
+#[cold]
+fn container_failed(why: String) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("the `.plyx` container could not be read or written: {why}"),
+    )
+    .primary(Span::DUMMY, "no artifact was written or opened")
+    .note("this is Ply's fault: the compiler's own `plyx.ply` is what failed here")
 }
 
 /// `b3:` plus twelve hex characters, as `ply hosts --digest` and `ply std --digest` print.
@@ -415,10 +637,6 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes(self.slice(at, 4)?.try_into().unwrap()))
     }
 
-    fn u64(&self, at: usize) -> Result<u64, Diagnostic> {
-        Ok(u64::from_le_bytes(self.slice(at, 8)?.try_into().unwrap()))
-    }
-
     fn hash32(&self, at: usize) -> Result<[u8; 32], Diagnostic> {
         Ok(self.slice(at, 32)?.try_into().unwrap())
     }
@@ -426,81 +644,36 @@ impl<'a> Reader<'a> {
 
 pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), Diagnostic> {
     let r = Reader { bytes, path };
-    if bytes.len() < HEADER_LEN {
-        return Err(truncated(path, 0, HEADER_LEN, bytes.len()));
-    }
-    if &bytes[..8] != MAGIC {
-        return Err(invalid(path, "this file is not a Ply program artifact")
-            .note("`ply build` writes one; the first eight bytes are `PLYPROG1`"));
-    }
-    let format = r.u32(OFF_FORMAT)?;
-    if format != ARTIFACT_FORMAT {
-        return Err(version(
-            path,
-            format!(
-                "the artifact is format {format} and this `ply` writes and reads format \
-                 {ARTIFACT_FORMAT}"
-            ),
-        ));
-    }
+    let container = container(bytes, path)?;
+    let stated = container.digest;
 
-    let frontend = r.hash32(OFF_FRONTEND)?;
-    let runtime = r.hash32(OFF_RUNTIME)?;
-    let body_encoding = r.u32(OFF_BODY_ENC)?;
-    let std = r.hash32(OFF_STD)?;
-    let entry = DefHash(r.hash32(OFF_ENTRY)?);
-    let stated = r.hash32(OFF_DIGEST)?;
-    let count = r.u32(OFF_SECTIONS)? as usize;
-
-    // Bound before multiplying: a corrupt header's section count could otherwise abort the process.
-    let table = HEADER_LEN.saturating_add(DESCRIPTOR_LEN.saturating_mul(count));
-    if table > bytes.len() {
-        return Err(truncated(path, HEADER_LEN, table - HEADER_LEN, bytes.len()));
-    }
-
-    let mut payloads: BTreeMap<u32, (u32, usize, usize)> = BTreeMap::new();
-    for i in 0..count {
-        let d = HEADER_LEN + DESCRIPTOR_LEN * i;
-        let kind = r.u32(d)?;
-        let records = r.u32(d + 4)?;
-        let offset = r.u64(d + 8)? as usize;
-        let len = r.u64(d + 16)? as usize;
-        if offset < table || offset.checked_add(len).is_none_or(|end| end > bytes.len()) {
-            return Err(invalid(
-                path,
-                format!(
-                    "section {kind} claims bytes {offset}..{} of a {}-byte file",
-                    offset.saturating_add(len),
-                    bytes.len()
-                ),
-            ));
-        }
-        if payloads.insert(kind, (records, offset, len)).is_some() {
-            return Err(invalid(path, format!("section {kind} appears twice")));
-        }
-    }
-
-    check_versions(path, frontend, runtime, body_encoding)?;
+    check_versions(
+        path,
+        container.frontend,
+        container.runtime,
+        container.body_encoding,
+    )?;
     let mut warnings = Vec::new();
-    if std != ply_std::digest() {
+    if container.std != ply_std::digest() {
         warnings.push(stdlib_changed());
     }
 
     let mut out = Artifact {
-        frontend,
-        runtime,
-        body_encoding,
-        std,
-        entry,
+        frontend: container.frontend,
+        runtime: container.runtime,
+        body_encoding: container.body_encoding,
+        std: container.std,
+        entry: container.entry,
         bodies: BTreeMap::new(),
         names: Vec::new(),
         closure: Vec::new(),
         unit: None,
     };
 
-    let (records, offset, len) = *payloads
-        .get(&KIND_BODIES)
+    let placed = container
+        .section("bodies")
         .ok_or_else(|| invalid(path, "the artifact carries no definitions"))?;
+    let (records, offset, len) = (placed.count, placed.at, placed.len);
     let mut at = offset;
     let end = offset + len;
     for _ in 0..records {
@@ -530,15 +703,16 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
         ));
     }
 
-    let strings = match payloads.get(&KIND_STRINGS) {
-        Some(&(_, offset, len)) => r.slice(offset, len)?,
+    let strings = match container.section("strings") {
+        Some(placed) => r.slice(placed.at, placed.len)?,
         None => &[][..],
     };
-    if let Some(&(records, offset, len)) = payloads.get(&KIND_NAMES) {
-        if len != records as usize * 40 {
+    if let Some(placed) = container.section("names") {
+        let (records, offset, len) = (placed.count, placed.at, placed.len);
+        if len != records * 40 {
             return Err(invalid(path, "the namespace section is the wrong size"));
         }
-        for i in 0..records as usize {
+        for i in 0..records {
             let at = offset + i * 40;
             let name_off = r.u32(at)? as usize;
             let name_len = r.u32(at + 4)? as usize;
@@ -552,10 +726,10 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
         }
     }
 
-    if let Some(&(records, offset, len)) = payloads.get(&KIND_CLOSURE) {
-        let mut at = offset;
-        let end = offset + len;
-        for _ in 0..records {
+    if let Some(placed) = container.section("closure") {
+        let mut at = placed.at;
+        let end = placed.at + placed.len;
+        for _ in 0..placed.count {
             let path_len = r.u32(at)? as usize;
             let raw_path = r.slice(at + 4, path_len)?;
             let text_len = r.u32(at + 4 + path_len)? as usize;
@@ -575,9 +749,9 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
         }
     }
 
-    if let Some(&(_, offset, len)) = payloads.get(&KIND_UNIT) {
-        let end = offset + len;
-        let mut at = offset;
+    if let Some(placed) = container.section("unit") {
+        let end = placed.at + placed.len;
+        let mut at = placed.at;
         let text_len = r.u32(at)? as usize;
         let text = r.slice(at + 4, text_len)?.to_vec();
         at += 4 + text_len;
@@ -590,7 +764,9 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
         out.unit = Some(EmbeddedUnit { text });
     }
 
-    let computed = digest_of(bytes).ok_or_else(|| truncated(path, 0, OFF_SECTIONS, bytes.len()))?;
+    let computed = plan(bytes.len())?
+        .and_then(|plan| plan.over(bytes))
+        .ok_or_else(|| invalid(path, "the artifact is too short to carry a digest"))?;
     if computed != stated {
         return Err(invalid(
             path,

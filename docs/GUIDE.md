@@ -1331,6 +1331,21 @@ dot of the file name, and a dotfile has none. `strip_dot` removes a leading
 `pub fn blake3(input: Bytes) -> Bytes` answers 32 bytes. It is written in Ply
 and slow; use it for small inputs.
 
+### 13.14 `std.bytes`
+
+```ply
+pub fn u32_le(n: Int) -> Bytes
+pub fn u64_le(n: Int) -> Bytes
+pub fn u32_at(b: Bytes, at: Int) -> Option<Int>
+pub fn u64_at(b: Bytes, at: Int) -> Option<Int>
+pub fn slice_at(b: Bytes, at: Int, n: Int) -> Option<Bytes>
+```
+
+Little-endian integers in a byte string, which is how a binary format is
+written and read back. The writers take the low four or eight bytes of `n`.
+Nothing here raises: a read past either end is `None`, and so is a `u64` past
+what an `Int` holds, so an answer is never a negative length.
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
