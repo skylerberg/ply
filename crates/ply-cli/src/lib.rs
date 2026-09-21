@@ -1,6 +1,7 @@
 //! The `ply` binary.
 
 pub mod artifact;
+pub mod cache;
 pub mod cli;
 pub mod commands;
 pub mod config;
@@ -12,6 +13,7 @@ pub mod hosts;
 pub mod load;
 pub mod migrate;
 pub mod obligations;
+pub mod payload;
 pub mod shipped;
 pub mod signature;
 pub mod simulation;
@@ -19,7 +21,7 @@ pub mod style;
 pub mod trace;
 pub mod warm;
 
-use cli::{CacheAction, Cli, Command};
+use cli::{Cli, Command};
 use style::Style;
 
 pub const EXIT_OK: i32 = 0;
@@ -50,11 +52,6 @@ pub fn execute(cli: Cli) -> i32 {
         Command::Defs(args) => commands::defs::execute(args, style),
         Command::Callers(args) => commands::callers::execute(args, style),
         Command::Bootstrap(args) => commands::bootstrap::execute(args, style),
-        Command::Cache(args) => match &args.action {
-            CacheAction::Clear(scope) => commands::cache::clear(scope, style),
-            CacheAction::Stats(scope) => commands::cache::stats(scope, style),
-            CacheAction::Compact(scope) => commands::cache::compact(scope, style),
-            CacheAction::Inspect(inspect) => commands::cache::inspect(inspect, style),
-        },
+        Command::Cache(args) => commands::cache::execute(&args.action, style),
     }
 }
