@@ -17,7 +17,7 @@ fn a_body_round_trips_through_the_encoding() {
     t.lambdas.push("ply_m_f_lambda0".to_string());
     t.members.push("m.f".to_string());
     t.members.push("m.g".to_string());
-    for symbol in ["ply_1_m1_f", "ply_1_m1_g"] {
+    for symbol in ["ply_m_1f_1", "ply_m_1g_1"] {
         t.symbols.push(Defined {
             symbol: symbol.to_string(),
             entry: format!("{symbol}_entry"),

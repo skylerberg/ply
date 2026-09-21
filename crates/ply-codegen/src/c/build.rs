@@ -638,7 +638,7 @@ fn emit_one(loaded: &'static Source, name: &str, ctors_digest: &str, fragment: &
             if let Some(k) = &key {
                 super::cache::write(k, &text, &tables);
             }
-            Ok((text, tables))
+            Ok((text, *tables))
         }
         Some(super::producer::Answer::Refused(why, _)) => {
             if let Some(k) = &refusal {
