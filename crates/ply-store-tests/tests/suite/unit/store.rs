@@ -643,6 +643,11 @@ fn footprint() -> Footprint {
     )])
 }
 
+/// A different row from [`footprint`], so a put that transposed the two would be visible.
+fn performed() -> Footprint {
+    Footprint::from_atoms([EffectAtom::new("clock", Resource::Singleton, Mode::Write)])
+}
+
 fn fingerprint(n: u8) -> SourceFingerprint {
     let mut fp = SourceFingerprint::new(content(n));
     fp.defs.push(DefEntry {
@@ -670,7 +675,7 @@ fn body(bytes: &[u8]) -> DefBody {
 }
 
 fn def() -> CachedDef {
-    CachedDef::new(scheme(), footprint())
+    CachedDef::new(scheme(), footprint(), performed())
 }
 
 impl TempRoot {
@@ -748,12 +753,21 @@ fn an_operation_atom_survives_a_round_trip_through_disk() {
     assert_eq!(footprint.to_string(), "{net.write[conn], net.send[conn]}");
 
     let mut store = root.open();
-    store.put_def(hash(1), CachedDef::new(scheme(), footprint.clone()));
+    store.put_def(
+        hash(1),
+        CachedDef::new(scheme(), footprint.clone(), performed()),
+    );
     store.flush().unwrap();
 
     let reopened = root.open();
     assert!(reopened.warnings().is_empty());
-    assert_eq!(reopened.def(hash(1)).unwrap().footprint, footprint);
+    let stored = reopened.def(hash(1)).unwrap();
+    assert_eq!(stored.footprint, footprint);
+    assert_eq!(
+        stored.performed,
+        performed(),
+        "the two rows are stored apart"
+    );
 }
 
 #[test]
@@ -766,7 +780,8 @@ fn a_fingerprint_an_interface_and_a_body_survive_a_round_trip_through_disk() {
     assert!(store.put_source(&file, fingerprint(1)));
     store.put_def(
         hash(1),
-        CachedDef::new(scheme(), footprint()).witnessed_by(vec![NameRef::new("Row", hash(9))]),
+        CachedDef::new(scheme(), footprint(), performed())
+            .witnessed_by(vec![NameRef::new("Row", hash(9))]),
     );
     store.put_decl(
         hash(9),
@@ -829,8 +844,10 @@ fn a_fingerprint_an_interface_and_a_body_survive_a_round_trip_through_disk() {
 fn re_storing_identical_entries_leaves_the_cache_clean() {
     let root = TempRoot::new("frontend-idempotent");
     let file = root.path().join("src/user.ply");
-    let witnessed =
-        || CachedDef::new(scheme(), footprint()).witnessed_by(vec![NameRef::new("m.f", hash(1))]);
+    let witnessed = || {
+        CachedDef::new(scheme(), footprint(), performed())
+            .witnessed_by(vec![NameRef::new("m.f", hash(1))])
+    };
 
     let mut store = root.open();
     store.put_source(&file, fingerprint(1));
@@ -879,12 +896,12 @@ fn two_definitions_sharing_a_hash_each_keep_their_own_interface() {
     let mut store = root.open();
     store.put_def(
         shared,
-        CachedDef::new(scheme(), footprint())
+        CachedDef::new(scheme(), footprint(), performed())
             .witnessed_by(vec![NameRef::new(alpha.clone(), shared)]),
     );
     store.put_def(
         shared,
-        CachedDef::new(other.clone(), Footprint::empty())
+        CachedDef::new(other.clone(), Footprint::empty(), Footprint::empty())
             .witnessed_by(vec![NameRef::new(beta.clone(), shared)]),
     );
     store.flush().unwrap();
@@ -903,7 +920,7 @@ fn two_definitions_sharing_a_hash_each_keep_their_own_interface() {
     let mut store = root.open();
     store.put_def(
         shared,
-        CachedDef::new(other.clone(), footprint())
+        CachedDef::new(other.clone(), footprint(), performed())
             .witnessed_by(vec![NameRef::new(alpha.clone(), shared)]),
     );
     store.flush().unwrap();
@@ -1136,7 +1153,10 @@ fn an_entry_whose_checksum_fails_is_not_cached_and_is_reported() {
     let root = TempRoot::new("frontend-frame-checksum");
     let mut store = root.open();
     store.put_def(hash(1), def());
-    store.put_def(hash(2), CachedDef::new(scheme(), Footprint::empty()));
+    store.put_def(
+        hash(2),
+        CachedDef::new(scheme(), Footprint::empty(), Footprint::empty()),
+    );
     store.flush().unwrap();
 
     let (offset, _, len) = frames(&root.data_file())[0];
@@ -1190,7 +1210,10 @@ fn an_entry_written_but_never_renamed_is_not_observable() {
 
     let ahead = seeded("frontend-crash-window-source");
     let mut moved = ahead.open();
-    moved.put_def(hash(2), CachedDef::new(scheme(), Footprint::empty()));
+    moved.put_def(
+        hash(2),
+        CachedDef::new(scheme(), Footprint::empty(), Footprint::empty()),
+    );
     moved.flush().unwrap();
     let unrenamed = fs::read(ahead.index_file()).unwrap();
     assert_ne!(unrenamed, committed);
@@ -1225,7 +1248,10 @@ fn an_appended_frame_no_index_names_is_not_observable() {
 
     let source = TempRoot::new("frontend-unindexed-frame-source");
     let mut other = source.open();
-    other.put_def(hash(7), CachedDef::new(scheme(), Footprint::empty()));
+    other.put_def(
+        hash(7),
+        CachedDef::new(scheme(), Footprint::empty(), Footprint::empty()),
+    );
     other.flush().unwrap();
     let donor = fs::read(source.data_file()).unwrap();
 
@@ -1889,7 +1915,7 @@ fn a_scheme_is_canonical_by_the_time_it_reaches_the_disk() {
     let mut store = root.open();
     store.put_def(
         hash(1),
-        CachedDef::new(counted_scheme(412, 87), footprint()).witnessed_by(vec![
+        CachedDef::new(counted_scheme(412, 87), footprint(), performed()).witnessed_by(vec![
             NameRef::new("Row", hash(9)),
             NameRef::new("db", hash(8)),
         ]),
@@ -1916,7 +1942,7 @@ fn a_scheme_is_canonical_by_the_time_it_reaches_the_disk() {
     let mut other_store = other.open();
     other_store.put_def(
         hash(1),
-        CachedDef::new(counted_scheme(3, 1), footprint()).witnessed_by(vec![
+        CachedDef::new(counted_scheme(3, 1), footprint(), performed()).witnessed_by(vec![
             NameRef::new("db", hash(8)),
             NameRef::new("Row", hash(9)),
         ]),
@@ -2017,7 +2043,7 @@ fn pin_fingerprint() -> SourceFingerprint {
 }
 
 fn pin_def() -> CachedDef {
-    CachedDef::new(counted_scheme(9, 4), footprint())
+    CachedDef::new(counted_scheme(9, 4), footprint(), performed())
         .witnessed_by(vec![NameRef::new("user.User", hash(3))])
 }
 
@@ -2108,7 +2134,7 @@ fn the_front_end_entry_encoding_is_pinned() {
 }
 
 const PINNED_FINGERPRINT: &str = "300fe8c0ddf5800c064400b08474309dc35cd462cc7543ee6acf4313248b46ed";
-const PINNED_DEF: &str = "f24ab931144fb554c7d18e74f01ee1b0fc8d4c9ae013c322416be59f8681417f";
+const PINNED_DEF: &str = "3786bc4de6b1147d63b2eaa56db0ef47bb0201a5133a04c236146d7a5236d9f3";
 const PINNED_TYPE_DECL: &str = "460a925c3059ec0aed17aa1375a0478bad865749d395c75bac605ea4f5c4f18a";
 const PINNED_EFFECT_DECL: &str = "0b5bc11329b83fd823d762923323c2373dfb1e9e985756570dd709013e1a004d";
 const PINNED_BODY: &str = "adf0f67e207566df6efe0eb0ac42e091e3f554a4d7b36ec34cd37b8306f21900";
@@ -2196,11 +2222,13 @@ fn one_body_serves_every_definition_that_shares_its_hash() {
     let mut store = root.open();
     store.put_def(
         hash(1),
-        CachedDef::new(scheme(), footprint()).witnessed_by(vec![NameRef::new("a.f", hash(1))]),
+        CachedDef::new(scheme(), footprint(), performed())
+            .witnessed_by(vec![NameRef::new("a.f", hash(1))]),
     );
     store.put_def(
         hash(1),
-        CachedDef::new(scheme(), footprint()).witnessed_by(vec![NameRef::new("b.g", hash(1))]),
+        CachedDef::new(scheme(), footprint(), performed())
+            .witnessed_by(vec![NameRef::new("b.g", hash(1))]),
     );
     store.put_body(hash(1), body(b"one computation"));
     store.flush().unwrap();
@@ -2344,7 +2372,8 @@ fn garbage_is_what_no_index_record_names() {
     let mut store = root.open();
     store.put_def(
         hash(1),
-        CachedDef::new(scheme(), footprint()).witnessed_by(vec![NameRef::new("m.f", hash(1))]),
+        CachedDef::new(scheme(), footprint(), performed())
+            .witnessed_by(vec![NameRef::new("m.f", hash(1))]),
     );
     store.flush().unwrap();
     assert_eq!(store.stats().garbage_bytes, Some(0));
@@ -2352,7 +2381,7 @@ fn garbage_is_what_no_index_record_names() {
     let mut store = root.open();
     store.put_def(
         hash(1),
-        CachedDef::new(scheme(), Footprint::empty())
+        CachedDef::new(scheme(), Footprint::empty(), Footprint::empty())
             .witnessed_by(vec![NameRef::new("m.f", hash(1))]),
     );
     store.flush().unwrap();
@@ -2454,7 +2483,8 @@ fn opening_a_ten_thousand_definition_cache_decodes_nothing() {
             });
             store.put_def(
                 hash,
-                CachedDef::new(scheme(), footprint()).witnessed_by(vec![NameRef::new(name, hash)]),
+                CachedDef::new(scheme(), footprint(), performed())
+                    .witnessed_by(vec![NameRef::new(name, hash)]),
             );
             defs.push(hash);
         }
