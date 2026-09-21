@@ -37,7 +37,7 @@ pub use schema::fingerprint as schema_fingerprint;
 pub use upstream::Upstream;
 
 /// Bumping this discards every cached result; a file from another runtime is never merged.
-pub const RUNTIME_VERSION: &str = "0.15.0";
+pub const RUNTIME_VERSION: &str = "0.16.0";
 
 /// Bumping this discards every cached type, footprint, source fingerprint and front-end answer.
 pub const FRONTEND_VERSION: &str = "0.26.0";

@@ -39,6 +39,16 @@ fn the_prelude_agrees_with_the_layouts_it_mirrors() {
         16,
         "PlyCtx.stack_floor"
     );
+    assert_eq!(
+        std::mem::offset_of!(ply_codegen::rt::Ctx, ticks),
+        48,
+        "PlyCtx.ticks"
+    );
+    assert_eq!(
+        std::mem::offset_of!(ply_codegen::rt::Ctx, next_tick),
+        56,
+        "PlyCtx.next_tick"
+    );
     assert!(PRELUDE.contains("#define PLY_HEADER 16"));
 }
 

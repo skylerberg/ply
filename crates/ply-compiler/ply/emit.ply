@@ -3194,10 +3194,10 @@ fn arithmetic(em: Em, op: Bytes, l: V, r: V) -> Out =
   }
 
 // The prologue and the body; a body with a self call in tail position gets the label that call restarts at,
-// where every 4096th pass asks the runtime whether the entry's time budget is spent.
+// where each pass counts one call of the entry's budget, since a restart is what a tail call became.
 fn emit_body(start: Em, params: List<P>, body: Code) -> Option<Out> = {
   let opened = prologue(start, params);
-  let looped = line(opened, b"ply_loop: if ((++ctx->ticks & 4095) == 0) { rt_tick_p(ctx); if (ctx->failed) return 0; }");
+  let looped = line(opened, bytes_concat(b"ply_loop: ", tick_line()));
   expr(if loops_to_self(opened, body, params) { looped } else { opened }, body, params)
 }
 
@@ -3485,7 +3485,7 @@ pub fn emit_group_full(module: Bytes, here: List<Def>, imports: List<Imported>, 
       let wrappers = fold(range(0, len(members)), b"", |acc: Bytes, i: Int|
         match list_at(members, i) { Some(m) -> bytes_concat(acc, group_wrapper(gname, i, m, width)), None -> acc });
       Some({ text: bytes_concat_all([sig, fuel_head(), toks, decls,
-               b"  ply_loop: if ((++ctx->ticks & 4095) == 0) { rt_tick_p(ctx); if (ctx->failed) return 0; }\n",
+               b"  ply_loop: ", tick_line(), b"\n",
                b"  switch (which) {\n", bytes_join(em.out, b""), b"  }\n  return 0;\n}\n", wrappers, em.extra]),
              tables: encode_tables(em, first) })
     },
@@ -3571,18 +3571,25 @@ fn sorted_widths(xs: List<Int>) -> List<Int> =
       None -> acc,
     })
 
-// Spends fuel, and refuses when the native stack is nearly out: a C frame is not a machine frame.
+// Counts the call, spends a unit of fuel, and refuses when the native stack is nearly out: a C frame is not a machine frame.
+// Fuel is depth and comes back on return; a tick is work and never does, so the two bounds are separate counters.
 fn fuel_head() -> Bytes = bytes_concat_all([
   b"  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n",
   b"  { char probe; if ((uintptr_t)&probe < ctx->stack_floor) { rt_no_stack_p(ctx); return 0; } }\n",
+  b"  ", tick_line(), b"\n",
   b"  ctx->fuel -= 1;\n"])
+
+// One call counted against the entry's step budget: in the prologue, and again at every restart of a loop,
+// since a restart is the call a tail call would have made. The runtime is asked only when the count reaches
+// the checkpoint it set, so a call costs an increment and a compare.
+fn tick_line() -> Bytes = b"if (++ctx->ticks >= ctx->next_tick) { rt_tick_p(ctx); if (ctx->failed) return 0; }"
 
 test "a body that answers a literal" {
   let f = symbol_of(b"m.f");
   assert_eq(match emit_fn(b"m", [], [], [], [], b"m.f", [], { own: Borrowed, span: dummy_span(), node: NLit(LInt(7)) }) {
     Some(c) -> c, None -> b"" },
     bytes_concat_all([
-      b"Word ", f, b"(PlyCtx *ctx) {\n  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  { char probe; if ((uintptr_t)&probe < ctx->stack_floor) { rt_no_stack_p(ctx); return 0; } }\n  ctx->fuel -= 1;\n  ctx->fuel += 1;\n  return (ply_fits_imm(INT64_C(7)) ? ply_imm(INT64_C(7)) : rt_box_int_p(ctx, INT64_C(7)));\n}\n",
+      b"Word ", f, b"(PlyCtx *ctx) {\n  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  { char probe; if ((uintptr_t)&probe < ctx->stack_floor) { rt_no_stack_p(ctx); return 0; } }\n  if (++ctx->ticks >= ctx->next_tick) { rt_tick_p(ctx); if (ctx->failed) return 0; }\n  ctx->fuel -= 1;\n  ctx->fuel += 1;\n  return (ply_fits_imm(INT64_C(7)) ? ply_imm(INT64_C(7)) : rt_box_int_p(ctx, INT64_C(7)));\n}\n",
       b"Word ", f, b"_entry(PlyCtx *ctx, const Word *args) {\n  return ", f, b"(ctx);\n}\n"]))
 }
 

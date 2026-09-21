@@ -315,12 +315,11 @@ pub struct ProvePlan {
     pub prove_budget: u32,
     /// Candidate evaluations, not seconds, so the artifact does not vary with machine load.
     pub shrink_budget: u32,
-    /// Wall clock per evaluation of a claim, in milliseconds; 0 is none. In no cache key.
-    pub time_budget_ms: u64,
+    /// Calls per evaluation of a claim; 0 is no bound. It decides what an evaluation reports, so
+    /// it keys the result: a proof means the same thing on every machine.
+    pub step_budget: i64,
     pub sim: Plan,
 }
-
-pub const DEFAULT_TIME_BUDGET_MS: u64 = 5_000;
 
 impl Default for ProvePlan {
     fn default() -> ProvePlan {
@@ -329,7 +328,7 @@ impl Default for ProvePlan {
             roots: vec![0],
             prove_budget: DEFAULT_PROVE_BUDGET,
             shrink_budget: DEFAULT_SHRINK_BUDGET,
-            time_budget_ms: DEFAULT_TIME_BUDGET_MS,
+            step_budget: ply_eval::DEFAULT_STEP_BUDGET,
             sim: Plan::default(),
         }
     }
@@ -350,6 +349,7 @@ impl ProvePlan {
         hasher.update(b"ply.prove.plan.1");
         hasher.update(&plan.cases.to_le_bytes());
         hasher.update(&plan.prove_budget.to_le_bytes());
+        hasher.update(&plan.step_budget.to_le_bytes());
         hasher.update(&(plan.roots.len() as u32).to_le_bytes());
         for root in &plan.roots {
             hasher.update(&root.to_le_bytes());
