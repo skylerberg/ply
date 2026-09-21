@@ -682,3 +682,42 @@ fn a_body_that_opens_a_cell_is_in_the_fragment() {
         );
     }
 }
+
+/// A mutually recursive pair generic over one row: the group is checked with one row binder, which
+/// each member names its own way, and the callback crosses the cycle.
+const GROUP_ROW: &str = "\
+fn ping<|e>(n: Int, f: (Int) -> Int / e, acc: Int) -> Int / e =
+  if n <= 0 { acc } else { pong(n - 1, f, f(acc)) }
+
+fn pong<|t>(n: Int, f: (Int) -> Int / t, acc: Int) -> Int / t =
+  if n <= 0 { acc } else { ping(n - 1, f, acc + 1) }
+
+pub fn bounced(n: Int) -> Int = ping(n, |x: Int| x * 2, 1)
+";
+
+#[test]
+fn a_row_generic_recursive_pair_compiles_and_runs() {
+    let (_, unit) = unit(GROUP_ROW);
+    for name in ["m.ping", "m.pong", "m.bounced"] {
+        assert!(
+            unit.compiled().iter().any(|c| c == name),
+            "`{name}` was refused: {:?}",
+            unit.refusals()
+                .iter()
+                .find(|(f, _)| f == name)
+                .map(|(_, why)| why)
+        );
+    }
+    let cases: &[(&str, Vec<Value>, Value)] = &[
+        ("m.bounced", vec![Value::Int(4)], Value::Int(7)),
+        ("m.bounced", vec![Value::Int(0)], Value::Int(1)),
+    ];
+    for (name, args, want) in cases {
+        let got = call(unit, name, args);
+        assert_eq!(
+            got.as_ref(),
+            Some(want),
+            "`{name}{args:?}` answered {got:?}, not {want:?}"
+        );
+    }
+}
