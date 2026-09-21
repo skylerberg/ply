@@ -15,6 +15,7 @@ pub mod prove;
 pub mod replace;
 pub mod review;
 pub mod run;
+pub mod shipped_program;
 pub mod show;
 pub mod stdlib;
 pub mod test;

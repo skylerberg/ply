@@ -1,0 +1,239 @@
+// A front-end diagnostic as an agent and as a person read it. The JSON half is the shape
+// `ply_span::render::to_json` publishes, key for key. The text half is Ply's own: the header
+// `ply_span` already writes when it can place no label, then one block per label it can place,
+// then the notes. It is not `ariadne`'s art, and the commands that stay in Rust still print that.
+
+import compiler.resolve (Diag, Label, Fix, Edit)
+import std.json (Json, Object, Str, Bool, Number, Array, object)
+
+// A module the label indices point into: the program's files, then the shipped modules it pulled.
+pub type Place = { path: String, text: Bytes }
+
+// The module index a span outside every module carries.
+fn no_module() -> Int = 4294967295
+
+fn place_at(places: List<Place>, module: Int) -> Option<Place> =
+  if module == no_module() { None } else { list_at(places, module) }
+
+// --- Lines and columns ---------------------------------------------------------
+// One-based, with the column counted in characters, as `SourceFile::line_col` counts it.
+
+pub type Spot = { line: Int, col: Int, offset: Int }
+
+fn is_continuation(c: Int) -> Bool = c / 64 == 2
+
+fn line_start(text: Bytes, offset: Int) -> Int =
+  fold(range(0, offset), 0, |s: Int, i: Int| if bytes_at(text, i) == 10 { i + 1 } else { s })
+
+fn line_number(text: Bytes, offset: Int) -> Int =
+  fold(range(0, offset), 1, |n: Int, i: Int| if bytes_at(text, i) == 10 { n + 1 } else { n })
+
+fn chars_between(text: Bytes, from: Int, to: Int) -> Int =
+  fold(range(from, to), 0, |n: Int, i: Int| if is_continuation(bytes_at(text, i)) { n } else { n + 1 })
+
+pub fn spot_of(text: Bytes, offset: Int) -> Spot = {
+  let start = line_start(text, offset);
+  { line: line_number(text, offset), col: chars_between(text, start, offset) + 1, offset: offset }
+}
+
+// The bytes a span covers, or nothing when it is not a range of this text.
+fn slice_of(text: Bytes, start: Int, end: Int) -> Option<Bytes> =
+  if start < 0 || end < start || end > bytes_len(text) { None } else { Some(bytes_slice(text, start, end)) }
+
+// --- JSON -----------------------------------------------------------------------
+
+fn spot_json(s: Spot) -> Json =
+  object([{ key: "line", value: Number(decimal_of_int(s.line)) },
+          { key: "col", value: Number(decimal_of_int(s.col)) },
+          { key: "offset", value: Number(decimal_of_int(s.offset)) }])
+
+// A label whose span is not a range of its module's text is dropped, as `to_json` drops it.
+fn label_json(places: List<Place>, l: Label) -> Option<Json> =
+  match place_at(places, l.module) {
+    None -> None,
+    Some(p) ->
+      match slice_of(p.text, l.start, l.end) {
+        None -> None,
+        Some(text) ->
+          Some(object([{ key: "file", value: Str(p.path) },
+                       { key: "start", value: spot_json(spot_of(p.text, l.start)) },
+                       { key: "end", value: spot_json(spot_of(p.text, l.end)) },
+                       { key: "message", value: Str(string_of_bytes_lossy(l.text)) },
+                       { key: "primary", value: Bool(l.primary) },
+                       { key: "snippet", value: Str(string_of_bytes_lossy(text)) }])),
+      },
+  }
+
+fn edit_json(places: List<Place>, e: Edit) -> Option<Json> =
+  match place_at(places, e.module) {
+    None -> None,
+    Some(p) ->
+      match slice_of(p.text, e.start, e.end) {
+        None -> None,
+        Some(_) ->
+          Some(object([{ key: "file", value: Str(p.path) },
+                       { key: "start", value: spot_json(spot_of(p.text, e.start)) },
+                       { key: "end", value: spot_json(spot_of(p.text, e.end)) },
+                       { key: "text", value: Str(string_of_bytes_lossy(e.text)) }])),
+      },
+  }
+
+fn kept<a>(xs: List<Option<a>>) -> List<a> =
+  fold(xs, [], |acc: List<a>, x: Option<a>| match x { Some(v) -> push(acc, v), None -> acc })
+
+fn fix_json(places: List<Place>, f: Fix) -> Json =
+  object([{ key: "title", value: Str(string_of_bytes_lossy(f.title)) },
+          { key: "edits", value: Array(kept(map(f.edits, |e: Edit| edit_json(places, e)))) }])
+
+pub fn to_json(d: Diag, places: List<Place>) -> Json =
+  object([{ key: "severity", value: Str(string_of_bytes_lossy(d.severity)) },
+          { key: "code", value: Str(string_of_bytes_lossy(d.code)) },
+          { key: "message", value: Str(string_of_bytes_lossy(d.message)) },
+          { key: "labels", value: Array(kept(map(d.labels, |l: Label| label_json(places, l)))) },
+          { key: "notes", value: Array(map(d.notes_text, |n: Bytes| Str(string_of_bytes_lossy(n)))) },
+          { key: "fixes", value: Array(map(d.fixes, |f: Fix| fix_json(places, f))) }])
+
+pub fn all_to_json(ds: List<Diag>, places: List<Place>) -> Json =
+  Array(map(ds, |d: Diag| to_json(d, places)))
+
+// --- Text -----------------------------------------------------------------------
+
+fn titled(severity: Bytes) -> String =
+  if severity == b"error" { "Error" }
+  else if severity == b"warning" { "Warning" }
+  else if severity == b"note" { "Note" }
+  else { string_of_bytes_lossy(severity) }
+
+fn repeated(unit: String, n: Int) -> String =
+  fold(range(0, n), "", |acc: String, i: Int| acc ++ unit)
+
+fn end_of_line(text: Bytes, from: Int) -> Int =
+  match bytes_index_of_from(text, b"\n", from) { Some(i) -> i, None -> bytes_len(text) }
+
+// The line `offset` sits on, without its newline.
+fn line_text(text: Bytes, offset: Int) -> String = {
+  let start = line_start(text, offset);
+  string_of_bytes_lossy(bytes_slice(text, start, end_of_line(text, start)))
+}
+
+// The caret run under one line: the span's own width, or one caret for an empty span, and never
+// past the end of the line the span opens on.
+fn carets(text: Bytes, start: Int, end: Int) -> String = {
+  let from = line_start(text, start);
+  let eol = end_of_line(text, from);
+  let stop = if end > eol { eol } else { end };
+  let width = chars_between(text, start, stop);
+  repeated(" ", chars_between(text, from, start)) ++ repeated("^", if width < 1 { 1 } else { width })
+}
+
+fn placed_lines(p: Place, l: Label) -> List<String> = {
+  let at = spot_of(p.text, l.start);
+  let said = string_of_bytes_lossy(l.text);
+  let tail = if said == "" { "" } else { " " ++ said };
+  ["  --> " ++ p.path ++ ":" ++ int_to_string(at.line) ++ ":" ++ int_to_string(at.col),
+   "   | " ++ line_text(p.text, l.start),
+   "   | " ++ carets(p.text, l.start, l.end) ++ tail]
+}
+
+fn label_lines(places: List<Place>, l: Label) -> List<String> =
+  match place_at(places, l.module) {
+    None -> [],
+    Some(p) -> match slice_of(p.text, l.start, l.end) { None -> [], Some(_) -> placed_lines(p, l) },
+  }
+
+fn appended(a: List<String>, b: List<String>) -> List<String> =
+  fold(b, a, |acc: List<String>, x: String| push(acc, x))
+
+// One diagnostic as lines, none of them ending in a newline.
+pub fn to_text(d: Diag, places: List<Place>) -> List<String> = {
+  let head = [titled(d.severity) ++ "[" ++ string_of_bytes_lossy(d.code) ++ "]: " ++ string_of_bytes_lossy(d.message)];
+  let labelled = fold(d.labels, head, |acc: List<String>, l: Label| appended(acc, label_lines(places, l)));
+  let noted = fold(d.notes_text, labelled, |acc: List<String>, n: Bytes| push(acc, "  = " ++ string_of_bytes_lossy(n)));
+  fold(d.fixes, noted, |acc: List<String>, f: Fix| push(acc, "  = fix: " ++ string_of_bytes_lossy(f.title)))
+}
+
+pub fn all_to_text(ds: List<Diag>, places: List<Place>) -> List<String> =
+  fold(ds, [], |acc: List<String>, d: Diag| appended(acc, to_text(d, places)))
+
+pub fn errors_of(ds: List<Diag>) -> List<Diag> = filter(ds, |d: Diag| d.severity == b"error")
+
+// --- Tests ------------------------------------------------------------------
+
+fn source() -> Bytes = b"fn f() -> Int = \"x\"\nfn g() -> Int = 1\n"
+
+fn one_place() -> List<Place> = [{ path: "m.ply", text: source() }]
+
+fn diag_of(severity: Bytes, code: Bytes, message: Bytes, labels: List<Label>, notes: List<Bytes>,
+           fixes: List<Fix>) -> Diag =
+  { code: code, notes: len(notes), labels: labels, text: b"", message: message, notes_text: notes,
+    severity: severity, fixes: fixes }
+
+fn mismatch() -> Diag =
+  diag_of(b"error", b"E0201", b"type mismatch: function body type",
+          [{ module: 0, start: 16, end: 19, primary: true, text: b"expected `Int`, found `String`" }],
+          [b"the body must answer the written type"], [])
+
+test "a spot is one-based, and a column counts characters rather than bytes" {
+  assert_eq(spot_of(source(), 0), { line: 1, col: 1, offset: 0 });
+  assert_eq(spot_of(source(), 16), { line: 1, col: 17, offset: 16 });
+  // The newline itself closes the line it ends.
+  assert_eq(spot_of(source(), 19), { line: 1, col: 20, offset: 19 });
+  assert_eq(spot_of(source(), 20), { line: 2, col: 1, offset: 20 });
+  assert_eq(spot_of(b"\xc3\xa9x", 2), { line: 1, col: 2, offset: 2 })
+}
+
+test "the JSON is one object per diagnostic, with the label placed and its snippet cut" {
+  assert_eq(to_json(mismatch(), one_place()),
+    object([{ key: "severity", value: Str("error") },
+            { key: "code", value: Str("E0201") },
+            { key: "message", value: Str("type mismatch: function body type") },
+            { key: "labels", value: Array([
+                object([{ key: "file", value: Str("m.ply") },
+                        { key: "start", value: spot_json({ line: 1, col: 17, offset: 16 }) },
+                        { key: "end", value: spot_json({ line: 1, col: 20, offset: 19 }) },
+                        { key: "message", value: Str("expected `Int`, found `String`") },
+                        { key: "primary", value: Bool(true) },
+                        { key: "snippet", value: Str("\"x\"") }])]) },
+            { key: "notes", value: Array([Str("the body must answer the written type")]) },
+            { key: "fixes", value: Array([]) }]))
+}
+
+test "a label outside every module, or outside its text, is dropped rather than placed" {
+  let outside = diag_of(b"error", b"E0201", b"type mismatch: function body type",
+                        [{ module: 4294967295, start: 0, end: 0, primary: true, text: b"nowhere" }], [], []);
+  match to_json(outside, one_place()) {
+    Object(m) -> assert_eq(map_get(m, "labels"), Some(Array([]))),
+    _ -> panic("a diagnostic renders as an object"),
+  };
+  let past = diag_of(b"error", b"E0201", b"type mismatch: function body type",
+                     [{ module: 0, start: 900, end: 901, primary: true, text: b"past the end" }],
+                     [b"the body must answer the written type"], []);
+  assert_eq(to_text(past, one_place()), ["Error[E0201]: type mismatch: function body type",
+                                         "  = the body must answer the written type"])
+}
+
+test "the text names the file, prints the line and underlines the span" {
+  assert_eq(to_text(mismatch(), one_place()),
+    ["Error[E0201]: type mismatch: function body type",
+     "  --> m.ply:1:17",
+     "   | fn f() -> Int = \"x\"",
+     "   |                 ^^^ expected `Int`, found `String`",
+     "  = the body must answer the written type"])
+}
+
+test "an empty span still gets one caret, and a fix is a note of its own" {
+  let insertion = diag_of(b"warning", b"E0126", b"this needs a type",
+                          [{ module: 0, start: 5, end: 5, primary: true, text: b"" }], [],
+                          [{ title: b"add the type", edits: [{ module: 0, start: 5, end: 5, text: b": Int" }] }]);
+  assert_eq(to_text(insertion, one_place()),
+    ["Warning[E0126]: this needs a type",
+     "  --> m.ply:1:6",
+     "   | fn f() -> Int = \"x\"",
+     "   |      ^",
+     "  = fix: add the type"])
+}
+
+test "only the errors are errors" {
+  let warning = diag_of(b"warning", b"W0611", b"never used", [], [], []);
+  assert_eq(len(errors_of([mismatch(), warning])), 1)
+}

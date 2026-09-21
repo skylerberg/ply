@@ -1,0 +1,107 @@
+// Finding the files a path names, under the one root the run binds as `cwd`. A file named on the
+// command line is taken whatever it is called, a directory is walked for `.ply` files, and a
+// symlink is refused rather than followed, since a rewrite through one leaves the root.
+
+import std.fs (fs, File, Dir, Symlink, Missing, mem_of, mem_kind, mem_list)
+import std.path (join, extension)
+
+pub type Failure = { path: String, why: String }
+
+// A set kept as a map: the paths come back sorted and deduped, so `./m.ply` and `m.ply` are one.
+pub type Found = { files: Map<String, Bool>, errors: List<Failure> }
+
+pub fn nothing() -> Found = { files: map_new(), errors: [] }
+
+pub fn keep(found: Found, path: String) -> Found =
+  {..found, files: map_insert(found.files, path, true)}
+
+pub fn refuse(found: Found, path: String, why: String) -> Found =
+  {..found, errors: push(found.errors, { path: path, why: why })}
+
+// A hidden directory holds caches and VCS metadata, and `target` holds build output.
+pub fn skipped(name: String) -> Bool = string_starts_with(name, ".") || name == "target"
+
+pub fn is_ply(name: String) -> Bool = extension(name) == Some("ply")
+
+pub fn named(found: Found, path: String) -> Found / {fs.kind[cwd], fs.list_dir[cwd]} =
+  match fs.kind[cwd](path) {
+    File -> keep(found, path),
+    Dir -> walk(found, path),
+    Symlink -> refuse(found, path, "a symlink is not followed"),
+    Missing -> refuse(found, path, "could not read"),
+  }
+
+// One entry of a directory, which the walk never follows and never reports.
+pub fn entry(found: Found, path: String, name: String) -> Found / {fs.kind[cwd], fs.list_dir[cwd]} =
+  match fs.kind[cwd](path) {
+    File -> if is_ply(name) { keep(found, path) } else { found },
+    Dir -> if skipped(name) { found } else { walk(found, path) },
+    Symlink -> found,
+    Missing -> found,
+  }
+
+pub fn walk(found: Found, dir: String) -> Found / {fs.kind[cwd], fs.list_dir[cwd]} =
+  match fs.list_dir[cwd](dir) {
+    None -> refuse(found, dir, "could not read"),
+    Some(names) -> fold(names, found, |acc: Found, name: String| entry(acc, join(dir, name), name)),
+  }
+
+// The paths as given, or `.`, each found in turn, so the answer is in path order.
+pub fn sweep(paths: List<String>) -> Found / {fs.kind[cwd], fs.list_dir[cwd]} = {
+  let wanted = if len(paths) == 0 { ["."] } else { paths };
+  fold(wanted, nothing(), |acc: Found, path: String| named(acc, path))
+}
+
+// --- Tests ------------------------------------------------------------------
+
+test "the walk passes over a symlink, a hidden directory, `target` and anything not `.ply`" {
+  let tree = mem_of([
+    {path: "m.ply", body: b"fn m() -> Int = 1"},
+    {path: "notes.txt", body: b"x"},
+    {path: "sub/deep.ply", body: b"fn d() -> Int = 1"},
+    {path: ".git/config.ply", body: b"fn g() -> Int = 1"},
+    {path: "target/built.ply", body: b"fn b() -> Int = 1"},
+    {path: "link.ply", body: b"fn l() -> Int = 1"},
+  ]);
+  let found = handle {
+    named(nothing(), ".")
+  } with {
+    fs.list_dir[cwd](p) -> mem_list(tree, p),
+    fs.kind[cwd](p) -> if p == "link.ply" { Symlink } else { mem_kind(tree, p) },
+  };
+  assert_eq(map_keys(found.files), ["m.ply", "sub/deep.ply"]);
+  assert_eq(found.errors, [])
+}
+
+test "a named symlink is refused rather than followed" {
+  let found = handle {
+    named(nothing(), "link.ply")
+  } with {
+    fs.kind[cwd](p) -> Symlink,
+    fs.list_dir[cwd](p) -> panic("a symlink is never walked"),
+  };
+  assert_eq(map_keys(found.files), []);
+  assert_eq(found.errors, [{ path: "link.ply", why: "a symlink is not followed" }])
+}
+
+test "a named file is taken whatever it is called, and a walked one only when it is `.ply`" {
+  let tree = mem_of([{path: "notes.txt", body: b"x"}]);
+  let both = handle {
+    walk(named(nothing(), "notes.txt"), ".")
+  } with {
+    fs.list_dir[cwd](p) -> mem_list(tree, p),
+    fs.kind[cwd](p) -> mem_kind(tree, p),
+  };
+  assert_eq(map_keys(both.files), ["notes.txt"])
+}
+
+test "no path given is the working directory" {
+  let tree = mem_of([{path: "m.ply", body: b"fn m() -> Int = 1"}]);
+  let found = handle {
+    sweep([])
+  } with {
+    fs.list_dir[cwd](p) -> mem_list(tree, p),
+    fs.kind[cwd](p) -> mem_kind(tree, p),
+  };
+  assert_eq(map_keys(found.files), ["m.ply"])
+}

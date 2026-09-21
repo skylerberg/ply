@@ -1,0 +1,112 @@
+// `ply defs` — every definition of the program with its place, hash, signature and footprint.
+
+import args (Flags, style_of)
+import program (Program, Tables, load_program, published, tables_of, location_of, place_of,
+                is_shipped, hash_of, own_of, deps_of, specs_of, short_of)
+import report (Answer, schema_version, ok_code, count_of, ind, refused)
+import style (Style, bold, dim)
+import compiler.infer (DefInfo)
+import compiler.tycore (TyCon, TyFn, row_text, scheme_text)
+import std.fs (fs)
+import std.json (Json, Null, Str, Bool, Number, Array, object)
+
+pub fn scheme_of(d: DefInfo) -> String = string_of_bytes_lossy(scheme_text(d.scheme))
+
+pub fn footprint_of(d: DefInfo) -> String = string_of_bytes_lossy(row_text({ atoms: d.footprint, tail: None }))
+
+pub fn performed_of(d: DefInfo) -> String = string_of_bytes_lossy(row_text({ atoms: d.performed, tail: None }))
+
+fn opt_str(v: Option<String>) -> Json = match v { Some(s) -> Str(s), None -> Null }
+
+fn wanted(f: Flags, d: DefInfo) -> Bool =
+  !is_shipped(string_of_bytes_lossy(d.module)) &&
+  (!f.filtered || string_contains(string_of_bytes_lossy(d.name), f.filter))
+
+fn file_of(p: Program, d: DefInfo) -> Json =
+  match place_of(p, d.at) { Some(place) -> Str(place.path), None -> Null }
+
+fn definition_json(p: Program, t: Tables, d: DefInfo) -> Json =
+  object([{ key: "name", value: Str(string_of_bytes_lossy(d.name)) },
+          { key: "module", value: Str(string_of_bytes_lossy(d.module)) },
+          { key: "simple_name", value: Str(string_of_bytes_lossy(d.simple_name)) },
+          { key: "location", value: opt_str(location_of(p, d.at)) },
+          { key: "file", value: file_of(p, d) },
+          { key: "start", value: Number(decimal_of_int(d.at.span.start)) },
+          { key: "end", value: Number(decimal_of_int(d.at.span.end)) },
+          { key: "hash", value: opt_str(hash_of(t, d.name)) },
+          { key: "own", value: opt_str(own_of(t, d.name)) },
+          { key: "type", value: Str(scheme_of(d)) },
+          { key: "footprint", value: Str(footprint_of(d)) },
+          { key: "performed", value: Str(performed_of(d)) },
+          { key: "specs", value: Number(decimal_of_int(specs_of(t, d.name))) },
+          { key: "deps", value: Array(map(deps_of(t, d.name), |n: String| Str(n))) }])
+
+fn short_or_blank(t: Tables, d: DefInfo) -> String =
+  match hash_of(t, d.name) { Some(h) -> short_of(h), None -> "" }
+
+fn place_or_blank(p: Program, d: DefInfo) -> String =
+  match location_of(p, d.at) { Some(l) -> l, None -> "" }
+
+fn text_lines(s: Style, p: Program, t: Tables, defs: List<DefInfo>) -> List<String> =
+  fold(defs, [""], |acc: List<String>, d: DefInfo|
+    push(push(acc, ind() ++ dim(s, short_or_blank(t, d)) ++ "  " ++ bold(s, string_of_bytes_lossy(d.name))
+                   ++ "  " ++ dim(s, place_or_blank(p, d))),
+              ind() ++ ind() ++ scheme_of(d) ++ " / " ++ footprint_of(d)))
+
+fn answered(s: Style, p: Program, t: Tables, defs: List<DefInfo>) -> Answer =
+  { json: object([{ key: "command", value: Str("defs") },
+                  { key: "schema_version", value: Number(decimal_of_int(schema_version())) },
+                  { key: "ok", value: Bool(true) },
+                  { key: "exit_code", value: Number(decimal_of_int(ok_code())) },
+                  { key: "definitions", value: Array(map(defs, |d: DefInfo| definition_json(p, t, d))) },
+                  { key: "diagnostics", value: Array([]) }]),
+    lines: push(push(text_lines(s, p, t, defs), ""), ind() ++ count_of(len(defs), "definition")),
+    errs: [],
+    code: ok_code() }
+
+pub fn run(flags: Flags) -> Answer
+  / {fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.list_dir[shelf], fs.read_file[shelf]} = {
+  let loaded: Program = load_program(flags.paths);
+  match loaded.whole {
+    None -> refused("defs", loaded.diags, loaded.places),
+    Some(w) -> answered(style_of(flags), loaded, tables_of(w.hashes),
+                        filter(published(w), |d: DefInfo| wanted(flags, d))),
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn nullary(name: Bytes, module: Bytes, simple: Bytes) -> DefInfo =
+  { name: name, module: module, simple_name: simple,
+    scheme: { ty_vars: [], row_vars: [],
+              ty: TyFn({ params: [], ret: TyCon({ name: b"Int", args: [] }), effects: { atoms: [], tail: None } }) },
+    footprint: [], performed: [], row_aliases: [], constraints: [], spec: [],
+    internally_effectful: false, at: { module: 0, span: { start: 20, end: 40 } } }
+
+fn flags_of(text: String, filtered: Bool) -> Flags =
+  { check: false, json: false, all: false, deps: false, color: false,
+    root: ".", query: "", filter: text, filtered: filtered, paths: [] }
+
+test "only the program's own definitions are listed, and `--filter` cuts by program-wide name" {
+  let mine = nullary(b"m.three", b"m", b"three");
+  let shipped = nullary(b"std.json.to_string", b"std.json", b"to_string");
+  assert(wanted(flags_of("", false), mine));
+  assert(!wanted(flags_of("", false), shipped));
+  assert(wanted(flags_of("thr", true), mine));
+  assert(!wanted(flags_of("two", true), mine))
+}
+
+test "a definition with no row and no variables prints the way the reference prints it" {
+  let d = nullary(b"m.two", b"m", b"two");
+  assert_eq(scheme_of(d), "() -> Int");
+  assert_eq(footprint_of(d), "{}");
+  assert_eq(performed_of(d), "{}")
+}
+
+test "a listing opens and closes with a blank line and ends on the tally" {
+  let p: Program = { files: [], places: [{ path: "m.ply", text: b"fn two() -> Int = 1\n" }], diags: [], whole: None };
+  let t: Tables = { defs: map_new(), own: map_new(), deps: map_new(), closure: map_new(), specs: map_new() };
+  let answer = answered(style_of(flags_of("", false)), p, t, [nullary(b"m.two", b"m", b"two")]);
+  assert_eq(answer.code, 0);
+  assert_eq(answer.lines, ["", "     m.two  m.ply:2:1", "      () -> Int / {}", "", "   1 definition"])
+}

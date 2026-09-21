@@ -392,26 +392,41 @@ fn tables(mods: List<Mod>, r: Resolved, c: Front, index: Index, h: HashOutput) -
        map(range(0, len(h.test_bodies)), |i: Int| framed(b"testbody", num(i), [hex(at(h.test_bodies, i))]))])
 }
 
-fn front(parsed: List<Parsed>) -> List<Bytes> = {
+// Every table the front end holds for a program that checks, for a caller that wants them rather
+// than their framing: `ply defs`, `ply hash` and `ply doc` are written against this.
+pub type Whole = { mods: List<Mod>, r: Resolved, checked: Front, index: Index, hashes: HashOutput,
+                   warnings: List<Diag> }
+
+// A stage that reports stops the rest, so a refusal is the diagnostics of exactly one stage.
+pub type Analysis = | Refused(List<Diag>) | Analysed(Whole)
+
+pub fn analyse(parsed: List<Parsed>) -> Analysis = {
   let early = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
-  if len(early) > 0 { diag_frames(early) } else {
+  if len(early) > 0 { Refused(early) } else {
     match resolve_modules(map(parsed, |p: Parsed| p.module)) {
-      Failed(ds) -> diag_frames(map(ds, outside_every_module)),
+      Failed(ds) -> Refused(map(ds, outside_every_module)),
       Resolved_(x) -> {
         let built = build_index(x.mods, x.r);
-        if len(built.diags) > 0 { diag_frames(map(built.diags, outside_every_module)) } else {
+        if len(built.diags) > 0 { Refused(map(built.diags, outside_every_module)) } else {
           let checked: Front = check_front(x.r, x.mods);
-          if !checked.ok { diag_frames(map(checked.diags, outside_every_module)) }
-          else { append(diag_frames(map(unused(built.index), outside_every_module)),
-                        tables(x.mods, x.r, checked, built.index, hash_index(built.index))) }
+          if !checked.ok { Refused(map(checked.diags, outside_every_module)) }
+          else { Analysed({ mods: x.mods, r: x.r, checked: checked, index: built.index,
+                            hashes: hash_index(built.index),
+                            warnings: map(unused(built.index), outside_every_module) }) }
         }
       },
     }
   }
 }
 
+fn frames_of(a: Analysis) -> List<Bytes> =
+  match a {
+    Refused(ds) -> diag_frames(ds),
+    Analysed(w) -> append(diag_frames(w.warnings), tables(w.mods, w.r, w.checked, w.index, w.hashes)),
+  }
+
 // One concatenation over the finished frames; appending per frame is quadratic.
-pub fn front_dump(sources: List<Source>) -> String = string_of_bytes(bytes_concat_all(front(parse_all(sources))))
+pub fn front_dump(sources: List<Source>) -> String = string_of_bytes(bytes_concat_all(frames_of(analyse(parse_all(sources)))))
 
 // Every builtin's scheme as the checker binds it, its parameter names and its note: one `builtin`
 // frame each.
@@ -644,13 +659,22 @@ fn pulling(users: Int, shipped: Map<Bytes, Bytes>, listed: List<Bytes>, x: Pull)
   }
 }
 
-// `front_dump` over `user` and the modules of `shipped` it imports, led by a `pulled` frame naming those in order.
-pub fn front_pulling_std(user: List<Source>, shipped: List<Source>) -> String = {
+// `analyse` over `user` and the modules of `shipped` it imports, with those named in the order they
+// were pulled: a label's module index points into `user` first and then into `pulled`, so a caller
+// that renders one needs both lists.
+pub type Pulled = { pulled: List<Bytes>, out: Analysis }
+
+pub fn analyse_pulling_std(user: List<Source>, shipped: List<Source>) -> Pulled = {
   let texts = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source| map_insert(acc, s.name, s.src));
   let x = pulling(len(user), texts, map(shipped, |s: Source| s.name), { parsed: parse_all(user), pulled: [], diags: [] });
+  { pulled: x.pulled, out: if len(x.diags) > 0 { Refused(x.diags) } else { analyse(x.parsed) } }
+}
+
+// `front_dump` over `user` and the modules of `shipped` it imports, led by a `pulled` frame naming those in order.
+pub fn front_pulling_std(user: List<Source>, shipped: List<Source>) -> String = {
+  let x: Pulled = analyse_pulling_std(user, shipped);
   let head = framed(b"pulled", b"_", map(x.pulled, |n: Bytes| field(b"module", n)));
-  let body = if len(x.diags) > 0 { diag_frames(x.diags) } else { front(x.parsed) };
-  string_of_bytes(bytes_concat_all(cat([[head], body])))
+  string_of_bytes(bytes_concat_all(cat([[head], frames_of(x.out)])))
 }
 
 // --- Tests ------------------------------------------------------------------
