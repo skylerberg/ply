@@ -284,8 +284,11 @@ pub mod codes {
     /// A call leaving a label parameter unfilled by written label or argument row, or passing a
     /// label-generic definition as a value.
     pub const LABEL_INSTANTIATION: &str = "E0306";
-    /// Members of one recursive group binding different numbers of label parameters.
+    /// Members of one recursive group binding different numbers of label or row parameters.
     pub const LABEL_GROUP_BINDERS: &str = "E0307";
+    /// A call inside a recursive group that would instantiate the group's row, or the callee's own
+    /// type parameter, at something else: polymorphic recursion.
+    pub const POLYMORPHIC_RECURSION: &str = "E0308";
     pub const NONDET_IN_DET_TEST: &str = "E0412";
     /// A `Task` in a `simulate` region's result, or a `join` after its region ended.
     pub const TASK_ESCAPES_SCOPE: &str = "E0413";
@@ -481,7 +484,12 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ),
     (
         "E0307",
-        "mutually recursive definitions binding different label parameters",
+        "mutually recursive definitions binding different label or row parameters",
+    ),
+    (
+        "E0308",
+        "polymorphic recursion: a call inside a recursive group asks for another row or type \
+         parameter than the group was checked with",
     ),
     ("E0412", "nondeterministic effect in a deterministic test"),
     ("E0413", "`Task` escapes its region"),
@@ -757,6 +765,11 @@ mod tests {
             ),
             ("LABEL_INSTANTIATION", codes::LABEL_INSTANTIATION, "E0306"),
             ("LABEL_GROUP_BINDERS", codes::LABEL_GROUP_BINDERS, "E0307"),
+            (
+                "POLYMORPHIC_RECURSION",
+                codes::POLYMORPHIC_RECURSION,
+                "E0308",
+            ),
             ("NONDET_IN_DET_TEST", codes::NONDET_IN_DET_TEST, "E0412"),
             ("TASK_ESCAPES_SCOPE", codes::TASK_ESCAPES_SCOPE, "E0413"),
             ("DEADLOCK", codes::DEADLOCK, "E0414"),
