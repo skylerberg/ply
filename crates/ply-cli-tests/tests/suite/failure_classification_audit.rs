@@ -204,26 +204,82 @@ fn a_failure_inside_a_handler_clause_body_is_still_the_programs() {
     }
 }
 
+const SPIN: &str = "fn spin(n: Int) -> Int = spin(n + 1)\n\
+                    test \"spins\" { assert_eq(spin(0), 0) }\n";
+
 #[test]
-fn a_loop_that_never_ends_is_a_program_error_at_its_time_budget() {
-    const RUNAWAY: &str = "fn spin(n: Int) -> Int = spin(n + 1)\n\
-                           test \"spins\" { assert_eq(spin(0), 0) }\n";
-    let dir = project(RUNAWAY);
+fn a_loop_that_never_ends_is_a_program_error_at_its_step_budget() {
+    let dir = project(SPIN);
+    for budget in ["1000", "5000000"] {
+        let out = ply(dir.path())
+            .args(["test", "--json", "--no-cache", "--steps", budget])
+            .output()
+            .unwrap();
+        let v = json_of(&out);
+        let failure = &v["failures"][0];
+        assert_eq!(failure["defect"], false, "{failure}");
+        assert_eq!(failure["diagnostic"]["code"], "E0503", "{failure}");
+        assert_eq!(v["results"][0]["status"], "failed", "{v}");
+        assert!(
+            failure["diagnostic"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&format!("budget of {budget} calls")),
+            "{failure}"
+        );
+    }
+}
+
+/// A budget the loop cannot spend leaves the verdict to the program, and a raised budget is a
+/// stronger claim than a small one: the same run, counted, not timed.
+#[test]
+fn a_long_computation_under_its_step_budget_still_passes() {
+    let dir = project(
+        "fn count(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { count(n - 1, acc + n) }\n\
+         test \"counts\" { assert_eq(count(200000, 0), 20000100000) }\n",
+    );
     let out = ply(dir.path())
-        .args(["test", "--json", "--timeout", "300"])
+        .args(["test", "--json", "--steps", "300000"])
         .output()
         .unwrap();
     let v = json_of(&out);
-    let failure = &v["failures"][0];
-    assert_eq!(failure["defect"], false, "{failure}");
-    assert_eq!(failure["diagnostic"]["code"], "E0503", "{failure}");
-    assert!(
-        failure["diagnostic"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("time budget of 300 ms"),
-        "{failure}"
+    assert_eq!(out.status.code(), Some(0), "{v}");
+    assert_eq!(v["summary"]["passed"], 1, "{v}");
+    assert_eq!(v["summary"]["failed"], 0, "{v}");
+}
+
+/// The clock describes the machine, so what it stops is no verdict: it is not a failure, it is
+/// recorded nowhere, and the run that could not finish it does not pass.
+#[test]
+fn a_run_the_clock_stopped_is_abandoned_rather_than_judged() {
+    let dir = project(SPIN);
+    let out = ply(dir.path())
+        .args(["test", "--json", "--timeout", "300", "--steps", "0"])
+        .output()
+        .unwrap();
+    let v = json_of(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "an unfinished run is not ok: {v}"
     );
+    assert_eq!(v["failures"].as_array().unwrap().len(), 0, "{v}");
+    assert_eq!(v["summary"]["abandoned"], 1, "{v}");
+    assert_eq!(v["summary"]["failed"], 0, "{v}");
+    assert_eq!(v["summary"]["passed"], 0, "{v}");
+    assert_eq!(v["results"][0]["status"], "abandoned", "{v}");
+    assert_eq!(v["results"][0]["cached"], Value::Null, "{v}");
+    assert_eq!(v["results"][0]["diagnostic"]["code"], "W0612", "{v}");
+
+    // Nothing was recorded, so the next run starts the test again rather than believing it.
+    let again = json_of(
+        &ply(dir.path())
+            .args(["test", "--json", "--timeout", "300", "--steps", "0"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(again["summary"]["cached"], 0, "{again}");
+    assert_eq!(again["summary"]["abandoned"], 1, "{again}");
 }
 
 #[test]

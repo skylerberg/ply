@@ -372,6 +372,7 @@ test "doubles" { assert_eq(scale(2) + other(0), 5) }
         engine: ply_test::Engine::Evaluator,
         passed: 0,
         failed: 1,
+        abandoned: 0,
         cached: 0,
         failures: vec![ply_test::Failure {
             name: "doubles".to_string(),

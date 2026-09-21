@@ -22,8 +22,10 @@ typedef struct {
 #define PLY_HEADER 16
 #define PLY_FLAT 1
 
-/* `Ctx`, whose first six fields compiled code reads and writes directly. The rest is opaque: a
-   pointer to it is all the runtime's helpers want. */
+/* `Ctx`, whose first eight fields compiled code reads and writes directly. The rest is opaque: a
+   pointer to it is all the runtime's helpers want. The two bounds are separate counters: `fuel` is
+   how much deeper calls may nest and comes back on return, `ticks` is the calls made and never
+   does, and reaching `next_tick` is what calls `rt_tick` to charge the budget and read the clock. */
 typedef struct {
   int64_t failed;
   int64_t fuel;
@@ -32,6 +34,7 @@ typedef struct {
   int64_t site_start;
   int64_t site_end;
   int64_t ticks;
+  int64_t next_tick;
 } PlyCtx;
 /* Where the body is, stored before a call that can fail so what the runtime raises is placed: its
    root, and bytes from that root's definition, so the C does not change when the definition moves. */

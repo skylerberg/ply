@@ -49,21 +49,19 @@ fn enter(argv: Vec<String>, root: &Path) -> Result<i32, Diagnostic> {
     let path = PathBuf::from(crate::shipped::ARTIFACT);
     let (artifact, _) = crate::artifact::decode(&bytes, &path)?;
     let opened = crate::artifact::open(&artifact, &path).map_err(first_of)?;
-    crate::artifact::enter(
-        &artifact,
-        &opened,
-        argv,
-        &[
-            ply_host::fs::RootSpec {
-                name: "cwd".to_string(),
-                path: root.to_path_buf(),
-            },
-            ply_host::fs::RootSpec {
-                name: "shelf".to_string(),
-                path: shelf,
-            },
-        ],
-    )
+    let roots = [
+        ply_host::fs::RootSpec {
+            name: "cwd".to_string(),
+            path: root.to_path_buf(),
+        },
+        ply_host::fs::RootSpec {
+            name: "shelf".to_string(),
+            path: shelf,
+        },
+    ];
+    // The `ply` program is the tool's own work rather than a program under test, so the budgets
+    // a run gives a program are not its.
+    ply_codegen::rt::unbounded(|| crate::artifact::enter(&artifact, &opened, argv, &roots))
 }
 
 fn first_of(diagnostics: Vec<Diagnostic>) -> Diagnostic {
