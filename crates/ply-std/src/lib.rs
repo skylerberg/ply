@@ -10,6 +10,8 @@ pub const ROOT: &str = "std";
 /// The pseudo-path prefix an embedded module's cache entries are keyed under.
 pub const PSEUDO_ROOT: &str = "<std>";
 
+pub const BYTES: &str = include_str!("../ply/bytes.ply");
+
 pub const CONFIG: &str = include_str!("../ply/config.ply");
 
 pub const DB: &str = include_str!("../ply/db.ply");
@@ -38,6 +40,7 @@ pub const TIME: &str = include_str!("../ply/time.ply");
 
 /// The trusted list, kept sorted and unique.
 pub const MODULES: &[(&str, &str)] = &[
+    ("std.bytes", BYTES),
     ("std.config", CONFIG),
     ("std.db", DB),
     ("std.fs", FS),
