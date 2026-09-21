@@ -1,0 +1,407 @@
+// The `.plyx` container: the magic, the header, the section table, and what a program digest is
+// taken over. A section's payload belongs to its writer; this module places the payloads and
+// hands them back where it put them.
+
+import spine (num)
+import diag (field, framed)
+import std.bytes (u32_le, u64_le, u32_at, u64_at, slice_at)
+
+fn at<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list does not hold") }
+
+fn append<a>(a: List<a>, b: List<a>) -> List<a> = fold(b, a, |acc: List<a>, x: a| push(acc, x))
+
+// --- The layout -------------------------------------------------------------
+
+fn magic() -> Bytes = b"PLYPROG1"
+
+// So a program digest is never confused with a definition hash or `ply hosts --digest`.
+fn domain() -> Bytes = b"ply.program.2"
+
+// The container format this `ply` writes and reads.
+pub fn format() -> Int = 4
+
+fn flag_closure() -> Int = 1
+fn flag_unit() -> Int = 2
+
+fn header_len() -> Int = 188
+fn descriptor_len() -> Int = 24
+
+fn off_format() -> Int = 8
+fn off_flags() -> Int = 12
+fn off_frontend() -> Int = 16
+fn off_runtime() -> Int = 48
+fn off_body_enc() -> Int = 80
+fn off_stdlib() -> Int = 84
+fn off_entry() -> Int = 116
+fn off_digest() -> Int = 148
+// The digest covers every byte of the file from here on, plus the entry point.
+fn off_sections() -> Int = 180
+fn off_reserved() -> Int = 184
+
+fn kind_of(name: Bytes) -> Int =
+  if name == b"bodies" { 1 }
+  else if name == b"names" { 2 }
+  else if name == b"strings" { 3 }
+  else if name == b"closure" { 4 }
+  else if name == b"unit" { 5 }
+  else { 0 }
+
+fn name_of(kind: Int) -> Bytes =
+  if kind == 1 { b"bodies" }
+  else if kind == 2 { b"names" }
+  else if kind == 3 { b"strings" }
+  else if kind == 4 { b"closure" }
+  else if kind == 5 { b"unit" }
+  else { b"" }
+
+// --- What crosses the seam --------------------------------------------------
+
+// What a writer supplies; the format, the flags and the digest are this module's to fill.
+pub type Head = {
+  frontend: Bytes, runtime: Bytes, body_encoding: Int, stdlib: Bytes, entry: Bytes,
+}
+
+// One section as it is written: its payload, and how many records the payload holds.
+pub type Section = { name: Bytes, count: Int, payload: Bytes }
+
+// One section as it is read back: where its payload lies in the file it was read from.
+pub type Placed = { name: Bytes, kind: Int, count: Int, at: Int, len: Int }
+
+pub type Opened = {
+  format: Int, flags: Int, frontend: Bytes, runtime: Bytes, body_encoding: Int,
+  stdlib: Bytes, entry: Bytes, digest: Bytes, sections: List<Placed>,
+}
+
+// `stale` is a file this `ply` will never read whatever is done to it, rather than one that
+// arrived damaged.
+pub type Refusal = { stale: Bool, note: Bytes, message: Bytes }
+
+// A range of the file the digest is taken over.
+pub type Range = { at: Int, len: Int }
+
+// --- Writing ----------------------------------------------------------------
+
+fn zeros(n: Int) -> Bytes = bytes_concat_all(map(range(0, n), |_i: Int| b"\x00"))
+
+// A header field is a fixed width, so a hash of another length would shift every field after it.
+fn fixed(b: Bytes, n: Int) -> Bytes =
+  if bytes_len(b) == n { b }
+  else if bytes_len(b) > n { bytes_slice(b, 0, n) }
+  else { bytes_concat(b, zeros(n - bytes_len(b))) }
+
+fn holds(sections: List<Section>, name: Bytes) -> Bool =
+  len(filter(sections, |s: Section| s.name == name)) > 0
+
+fn flags_of(sections: List<Section>) -> Int =
+  (if holds(sections, b"closure") { flag_closure() } else { 0 })
+  | (if holds(sections, b"unit") { flag_unit() } else { 0 })
+
+fn section_kind(s: Section) -> Int = {
+  let k = kind_of(s.name);
+  if k == 0 { panic("a section this container has no kind for") } else { k }
+}
+
+// The fields in the order the offsets above read them back, with no byte between them.
+fn header(head: Head, sections: List<Section>) -> Bytes =
+  bytes_concat_all([
+    magic(),
+    u32_le(format()),
+    u32_le(flags_of(sections)),
+    fixed(head.frontend, 32),
+    fixed(head.runtime, 32),
+    u32_le(head.body_encoding),
+    fixed(head.stdlib, 32),
+    fixed(head.entry, 32),
+    zeros(32),
+    u32_le(len(sections)),
+    u32_le(0),
+  ])
+
+fn descriptor(s: Section, start: Int) -> Bytes =
+  bytes_concat_all([
+    u32_le(section_kind(s)), u32_le(s.count), u64_le(start), u64_le(bytes_len(s.payload))])
+
+fn starts(table: Int, sections: List<Section>) -> List<Int> = {
+  let walked = fold(sections, { at: table, out: [] },
+    |acc: { at: Int, out: List<Int> }, x: Section|
+      { at: acc.at + bytes_len(x.payload), out: push(acc.out, acc.at) });
+  walked.out
+}
+
+// The whole container, with the digest field left zero: a digest is taken over the finished bytes
+// (see `covers`) and written into a field those bytes do not cover.
+pub fn encode(head: Head, sections: List<Section>) -> Bytes = {
+  let table = header_len() + descriptor_len() * len(sections);
+  let offsets = starts(table, sections);
+  bytes_concat_all(append(
+    append(
+      [header(head, sections)],
+      map(range(0, len(sections)), |i: Int| descriptor(at(sections, i), at(offsets, i)))),
+    map(sections, |s: Section| s.payload)))
+}
+
+// --- Reading ----------------------------------------------------------------
+
+fn broken(message: Bytes) -> Refusal = { stale: false, note: b"", message: message }
+
+fn truncated(offset: Int, wanted: Int, n: Int) -> Refusal =
+  broken(bytes_concat_all([b"the artifact is ", num(n), b" bytes and wants ", num(wanted),
+                           b" more at offset ", num(offset)]))
+
+// Every field these two read sits inside a header, and a shorter file is refused before either.
+fn word(b: Bytes, i: Int) -> Int = match u32_at(b, i) { Some(w) -> w, None -> 0 }
+
+fn hash32(b: Bytes, i: Int) -> Bytes = match slice_at(b, i, 32) { Some(x) -> x, None -> b"" }
+
+fn descriptor_at(b: Bytes, d: Int, k: Int, table: Int, n: Int) -> Result<Placed, Refusal> = {
+  let count = word(b, d + 4);
+  let beyond = broken(bytes_concat_all([
+    b"section ", num(k), b" claims more bytes than a file could hold"]));
+  match u64_at(b, d + 8) {
+    None -> Err(beyond),
+    Some(start) -> match u64_at(b, d + 16) {
+      None -> Err(beyond),
+      Some(size) ->
+        if start < table || start > n || size > n - start {
+          Err(broken(bytes_concat_all([
+            b"section ", num(k), b" claims ", num(size), b" bytes at ", num(start),
+            b" of a ", num(n), b"-byte file"])))
+        } else {
+          Ok({ name: name_of(k), kind: k, count: count, at: start, len: size })
+        },
+    },
+  }
+}
+
+fn table_of(b: Bytes, count: Int, table: Int, n: Int) -> Result<List<Placed>, Refusal> =
+  iterate({ i: 0, out: [] }, count + 1, |s: { i: Int, out: List<Placed> }|
+    if s.i >= count { Stop(Ok(s.out)) } else {
+      let d = header_len() + descriptor_len() * s.i;
+      let k = word(b, d);
+      if len(filter(s.out, |q: Placed| q.kind == k)) > 0 {
+        Stop(Err(broken(bytes_concat_all([b"section ", num(k), b" appears twice"]))))
+      } else {
+        match descriptor_at(b, d, k, table, n) {
+          Err(e) -> Stop(Err(e)),
+          Ok(p) -> Continue({ i: s.i + 1, out: push(s.out, p) }),
+        }
+      }
+    })
+
+// The header and the section table of `b`, believed only as far as `b` reaches.
+pub fn decode(b: Bytes) -> Result<Opened, Refusal> = {
+  let n = bytes_len(b);
+  if n < header_len() { Err(truncated(0, header_len(), n)) }
+  else if slice_at(b, 0, 8) != Some(magic()) {
+    Err({ stale: false,
+          note: b"`ply build` writes one; the first eight bytes are `PLYPROG1`",
+          message: b"this file is not a Ply program artifact" })
+  } else {
+    let written = word(b, off_format());
+    if written != format() {
+      Err({ stale: true, note: b"",
+            message: bytes_concat_all([
+              b"the artifact is format ", num(written),
+              b" and this `ply` writes and reads format ", num(format())]) })
+    } else {
+      let count = word(b, off_sections());
+      let table = header_len() + descriptor_len() * count;
+      if table > n { Err(truncated(header_len(), table - header_len(), n)) }
+      else {
+        match table_of(b, count, table, n) {
+          Err(e) -> Err(e),
+          Ok(sections) -> Ok({
+            format: written,
+            flags: word(b, off_flags()),
+            frontend: hash32(b, off_frontend()),
+            runtime: hash32(b, off_runtime()),
+            body_encoding: word(b, off_body_enc()),
+            stdlib: hash32(b, off_stdlib()),
+            entry: hash32(b, off_entry()),
+            digest: hash32(b, off_digest()),
+            sections: sections,
+          }),
+        }
+      }
+    }
+  }
+}
+
+// --- The digest -------------------------------------------------------------
+
+// The ranges of an `n`-byte artifact a program digest is taken over, after the domain: the entry
+// point, then every byte from the section count on. The digest's own field lies between them, so
+// it is written after the hash is taken and never covers itself.
+pub fn covers(n: Int) -> Option<List<Range>> =
+  if n < off_sections() { None }
+  else { Some([{ at: off_entry(), len: 32 }, { at: off_sections(), len: n - off_sections() }]) }
+
+// --- The seam ---------------------------------------------------------------
+
+fn refused(kind: Bytes, r: Refusal) -> Bytes =
+  framed(kind, b"_", append([field(b"message", r.message)],
+    if r.note == b"" { [] } else { [field(b"note", r.note)] }))
+
+fn head_frame(x: Opened) -> Bytes =
+  framed(b"head", b"_", [
+    field(b"frontend", x.frontend),
+    field(b"runtime", x.runtime),
+    field(b"body_encoding", num(x.body_encoding)),
+    field(b"stdlib", x.stdlib),
+    field(b"entry", x.entry),
+    field(b"digest", x.digest),
+  ])
+
+fn section_frame(s: Placed) -> Bytes =
+  framed(b"section", num(s.kind), [
+    field(b"name", s.name),
+    field(b"count", num(s.count)),
+    field(b"at", num(s.at)),
+    field(b"len", num(s.len)),
+  ])
+
+// One `head` frame and one `section` frame each, or one `refused` frame; `stale` in place of
+// `refused` is a file no transfer will mend.
+pub fn decode_dump(b: Bytes) -> Bytes =
+  match decode(b) {
+    Err(e) -> refused(if e.stale { b"stale" } else { b"refused" }, e),
+    Ok(x) -> bytes_concat_all(append([head_frame(x)], map(x.sections, section_frame))),
+  }
+
+// The domain a program digest is taken under, where it is written, and the ranges of an `n`-byte
+// artifact it covers, so a host hashes what this module says and nothing else.
+pub fn plan_dump(n: Int) -> Bytes =
+  match covers(n) {
+    None -> refused(b"refused", truncated(n, off_sections() - n, n)),
+    Some(rs) -> framed(b"plan", b"_", append(
+      [field(b"domain", domain()), field(b"at", num(off_digest()))],
+      map(rs, |r: Range| field(b"covers", bytes_concat_all([num(r.at), b" ", num(r.len)]))))),
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn fill(byte: Int) -> Bytes = bytes_concat_all(map(range(0, 32), |_i: Int| byte_of_int(byte)))
+
+fn sample() -> Head =
+  { frontend: fill(0x11), runtime: fill(0x22), body_encoding: 7, stdlib: fill(0x33),
+    entry: fill(0x44) }
+
+fn says(message: Bytes, what: Bytes) -> Bool =
+  match bytes_index_of(message, what) { Some(_) -> true, None -> false }
+
+fn opened(b: Bytes) -> Opened =
+  match decode(b) { Ok(x) -> x, Err(_) -> panic("a container this module wrote must read back") }
+
+test "every header field is written where it is read back" {
+  let bytes = encode(sample(), []);
+  assert_eq(bytes_len(bytes), header_len());
+  assert_eq(slice_at(bytes, 0, 8), Some(magic()));
+  assert_eq(u32_at(bytes, off_reserved()), Some(0));
+  let x = opened(bytes);
+  assert_eq(x.format, format());
+  assert_eq(x.flags, 0);
+  assert_eq(x.frontend, fill(0x11));
+  assert_eq(x.runtime, fill(0x22));
+  assert_eq(x.body_encoding, 7);
+  assert_eq(x.stdlib, fill(0x33));
+  assert_eq(x.entry, fill(0x44));
+  assert_eq(x.digest, zeros(32));
+  assert_eq(len(x.sections), 0)
+}
+
+test "a section's payload comes back where it was put" {
+  let sections = [
+    { name: b"bodies", count: 2, payload: b"AABBBB" },
+    { name: b"closure", count: 1, payload: b"CCC" },
+    { name: b"unit", count: 1, payload: b"D" },
+  ];
+  let bytes = encode(sample(), sections);
+  assert_eq(bytes_len(bytes), header_len() + 3 * descriptor_len() + 10);
+  let x = opened(bytes);
+  assert_eq(len(x.sections), 3);
+  assert_eq(x.flags, flag_closure() | flag_unit());
+  let first = at(x.sections, 0);
+  assert_eq(first.name, b"bodies");
+  assert_eq(first.count, 2);
+  assert_eq(slice_at(bytes, first.at, first.len), Some(b"AABBBB"));
+  let last = at(x.sections, 2);
+  assert_eq(last.name, b"unit");
+  assert_eq(slice_at(bytes, last.at, last.len), Some(b"D"))
+}
+
+test "the digest covers the entry point and the sections, and never its own field" {
+  let bytes = encode(sample(), [{ name: b"bodies", count: 1, payload: b"AA" }]);
+  match covers(bytes_len(bytes)) {
+    None -> panic("an artifact this module wrote is long enough to carry a digest"),
+    Some(rs) -> {
+      assert_eq(len(rs), 2);
+      assert_eq(at(rs, 0), { at: off_entry(), len: 32 });
+      assert_eq(at(rs, 1), { at: off_sections(), len: bytes_len(bytes) - off_sections() });
+      assert(off_digest() >= off_entry() + 32);
+      assert(off_digest() + 32 <= off_sections())
+    },
+  }
+}
+
+test "an artifact too short to hold a header has nothing to digest" {
+  assert_eq(covers(0), None);
+  assert_eq(covers(off_sections() - 1), None);
+  assert_eq(covers(off_sections()),
+            Some([{ at: off_entry(), len: 32 }, { at: off_sections(), len: 0 }]))
+}
+
+test "a file that does not open with the magic is refused, and says what one is" {
+  let bytes = encode(sample(), []);
+  let forged = bytes_concat(b"NOTPLY01", bytes_slice(bytes, 8, bytes_len(bytes)));
+  match decode(forged) {
+    Ok(_) -> panic("a file that is not an artifact must be refused"),
+    Err(e) -> {
+      assert_eq(e.stale, false);
+      assert(says(e.message, b"not a Ply program artifact"));
+      assert(says(e.note, b"PLYPROG1"))
+    },
+  }
+}
+
+test "a format this `ply` does not write is stale rather than damaged" {
+  let bytes = encode(sample(), []);
+  let forged = bytes_concat_all([
+    bytes_slice(bytes, 0, off_format()), u32_le(3),
+    bytes_slice(bytes, off_format() + 4, bytes_len(bytes))]);
+  match decode(forged) {
+    Ok(_) -> panic("format 3 is not the format this `ply` reads"),
+    Err(e) -> { assert(e.stale); assert(says(e.message, b"format 3")) },
+  }
+}
+
+test "a section count nothing could hold is refused before a descriptor is read" {
+  let bytes = encode(sample(), []);
+  let forged = bytes_concat_all([
+    bytes_slice(bytes, 0, off_sections()), u32_le(4294967295),
+    bytes_slice(bytes, off_sections() + 4, bytes_len(bytes))]);
+  match decode(forged) {
+    Ok(_) -> panic("a count past the end of the file must be refused"),
+    Err(e) -> { assert_eq(e.stale, false); assert(says(e.message, b"wants")) },
+  }
+}
+
+test "one kind names one section" {
+  match decode(encode(sample(), [
+    { name: b"bodies", count: 1, payload: b"A" },
+    { name: b"bodies", count: 1, payload: b"B" },
+  ])) {
+    Ok(_) -> panic("two sections of one kind must be refused"),
+    Err(e) -> assert(says(e.message, b"appears twice")),
+  }
+}
+
+test "no prefix of an artifact is believed" {
+  let bytes = encode(sample(), [
+    { name: b"bodies", count: 1, payload: b"AAAA" },
+    { name: b"names", count: 1, payload: b"BB" },
+  ]);
+  let believed = filter(range(0, bytes_len(bytes)), |cut: Int|
+    match decode(bytes_slice(bytes, 0, cut)) { Ok(_) -> true, Err(_) -> false });
+  assert_eq(len(believed), 0)
+}
