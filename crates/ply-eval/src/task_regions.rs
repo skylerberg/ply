@@ -111,6 +111,14 @@ impl<V: Clone + Default> TaskRegions<V> {
         }
     }
 
+    /// Closes every region opened since the stack stood `depth` deep, for control that jumped
+    /// back past their closes; a continuation captured across one still defers its slots.
+    pub fn close_regions_above(&mut self, depth: usize) {
+        while self.arena.depth() > depth.max(FLOOR) {
+            self.arena.close_current();
+        }
+    }
+
     pub fn alloc_cell(&mut self, value: V) -> Slot {
         self.arena
             .alloc(value)

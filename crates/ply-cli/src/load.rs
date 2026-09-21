@@ -2,17 +2,38 @@
 
 use crate::driver::FrontEnd;
 use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
+use ply_store::ContentHash;
 use ply_ty::HashOutput;
 use ply_ty::ModuleName;
 use ply_ty::{CheckOutput, DefInfo, Front, ModuleInfo, TestInfo};
 use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
+
+/// Modification time and length: hashing every file on every poll is the cost this avoids.
+pub type Stamp = (Option<SystemTime>, u64);
+
+/// The stamp a path carries now; one no real file has when it cannot be stat'd.
+pub fn stamp_of(path: &Path) -> Stamp {
+    std::fs::metadata(path)
+        .map(|m| (m.modified().ok(), m.len()))
+        .unwrap_or((None, u64::MAX))
+}
+
+/// A file as this load found it: stamped before the read, then the bytes the read got — never a
+/// later look at the disk, which would fold a save made meanwhile into this load's baseline.
+#[derive(Clone, Debug)]
+pub struct Found {
+    pub path: PathBuf,
+    pub stamp: Stamp,
+    pub content: ContentHash,
+}
 
 #[derive(Debug)]
 pub struct Loaded {
     /// What module names are derived relative to, and where the cache lives.
     pub root: PathBuf,
     /// One entry per module, sorted.
-    pub files: Vec<PathBuf>,
+    pub files: Vec<Found>,
     pub sources: SourceMap,
     /// Handed to `ply_codegen::Unit::over_front` so one invocation runs one front end.
     pub front: Front,
@@ -75,7 +96,10 @@ impl Loaded {
     }
 
     pub fn file_names(&self) -> Vec<String> {
-        self.files.iter().map(|f| f.display().to_string()).collect()
+        self.files
+            .iter()
+            .map(|f| f.path.display().to_string())
+            .collect()
     }
 
     pub fn module_count(&self) -> usize {
