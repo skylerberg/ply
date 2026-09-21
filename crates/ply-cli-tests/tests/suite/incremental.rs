@@ -363,21 +363,16 @@ fn a_dependencys_change_reaches_its_dependents() {
 }
 
 #[test]
-fn an_unchanged_project_is_answered_from_the_store_and_an_edit_asks_again() {
-    use ply_codegen::c::producer;
+fn a_warm_load_answers_as_the_cold_one_did_and_an_edit_is_seen() {
     let dir = corpus();
     let load = || {
         let mut store = Store::open(dir.path()).unwrap();
-        producer::reset_census();
-        let loaded = driver::load_incremental(dir.path(), &mut store)
-            .unwrap_or_else(|e| panic!("the load failed: {:?}", codes(&e)));
-        (loaded, producer::census().entries)
+        driver::load_incremental(dir.path(), &mut store)
+            .unwrap_or_else(|e| panic!("the load failed: {:?}", codes(&e)))
     };
 
-    let (cold, entries) = load();
-    assert!(entries > 0, "the first load must ask the port");
-    let (warm, entries) = load();
-    assert_eq!(entries, 0, "an unchanged project entered the port");
+    let cold = load();
+    let warm = load();
     assert_eq!(snapshot(&warm), snapshot(&cold));
 
     let three = ply_span::Symbol::new("leaf.three");
@@ -387,53 +382,47 @@ fn an_unchanged_project_is_answered_from_the_store_and_an_edit_asks_again() {
         "pub fn two()",
         "pub fn three() -> Int = 3\npub fn two()",
     );
-    let (edited, entries) = load();
-    assert!(entries > 0, "an edited project was answered from the store");
+    let edited = load();
     assert!(!warm.check.defs.contains_key(&three));
     assert!(
         edited.check.defs.contains_key(&three),
         "the load after an edit does not see it"
     );
-
-    let (again, entries) = load();
-    assert_eq!(entries, 0, "the answer to the edit was not kept");
-    assert_eq!(snapshot(&again), snapshot(&edited));
+    assert_eq!(snapshot(&load()), snapshot(&edited));
 }
 
 fn answer(loaded: &Loaded) -> String {
     format!("{:?}", loaded.front)
 }
 
+/// Seeding must not change an answer: a load handed what the last one published says exactly what
+/// a load handed nothing says, through every kind of edit.
 #[test]
-fn an_edit_asks_only_the_modules_it_reached_and_answers_as_a_full_load() {
-    use ply_codegen::c::producer;
+fn a_seeded_load_answers_as_a_full_load_through_every_kind_of_edit() {
     let dir = corpus();
-    let step = |what: &str, asked: usize| {
+    let step = |what: &str| {
         let mut store = Store::open(dir.path()).unwrap();
-        producer::reset_census();
         let incremental = driver::load_incremental(dir.path(), &mut store)
             .unwrap_or_else(|e| panic!("{what}: the incremental load failed: {:?}", codes(&e)));
-        let modules = producer::census().modules;
         let full = driver::load_full(dir.path())
             .unwrap_or_else(|e| panic!("{what}: the full load failed: {:?}", codes(&e)));
         assert_eq!(answer(&incremental), answer(&full), "{what}");
-        assert_eq!(modules, asked, "{what}: modules handed to the port");
     };
 
-    step("cold", 3);
-    step("unchanged", 0);
+    step("cold");
+    step("unchanged");
 
     edit(dir.path(), "leaf.ply", "one() + one()", "one() + one() + 0");
-    step("a body edit in a leaf", 1);
+    step("a body edit in a leaf");
     edit(
         dir.path(),
         "leaf.ply",
         "pub fn two() -> Int = one() + one() + 0",
         "pub fn two(k: Int) -> Int = one() + k",
     );
-    step("a signature edit in a leaf", 1);
+    step("a signature edit in a leaf");
     edit(dir.path(), "leaf.ply", "pub fn one()", "fn one()");
-    step("`pub` removed in a leaf", 1);
+    step("`pub` removed in a leaf");
 
     edit(
         dir.path(),
@@ -442,9 +431,7 @@ fn an_edit_asks_only_the_modules_it_reached_and_answers_as_a_full_load() {
         "fn one() -> Int = \"1\"",
     );
     let mut store = Store::open(dir.path()).unwrap();
-    producer::reset_census();
     let incremental = driver::load_incremental(dir.path(), &mut store).expect_err("a type error");
-    assert_eq!(producer::census().modules, 1 + 3);
     let full = driver::load_full(dir.path()).expect_err("a type error");
     assert_eq!(codes(&incremental), codes(&full));
     edit(
@@ -453,24 +440,24 @@ fn an_edit_asks_only_the_modules_it_reached_and_answers_as_a_full_load() {
         "fn one() -> Int = \"1\"",
         "fn one() -> Int = 1",
     );
-    step("the error undone, whose parts were never replaced", 0);
+    step("the error undone");
 
     edit(dir.path(), "core.ply", "pub fn label(", "pub fn title(");
-    step("a rename in a module another imports", 2);
+    step("a rename in a module another imports");
     edit(
         dir.path(),
         "core.ply",
         "Book(_, p) -> p,",
         "Book(_, p) -> p + 0,",
     );
-    step("a body edit in a module another imports", 2);
+    step("a body edit in a module another imports");
     edit(
         dir.path(),
         "shop.ply",
         "acc + core::price(i)",
         "acc + core::price(i) + 0",
     );
-    step("a body edit in a module that imports another", 2);
+    step("a body edit in a module that imports another");
 
     edit(
         dir.path(),
@@ -478,26 +465,25 @@ fn an_edit_asks_only_the_modules_it_reached_and_answers_as_a_full_load() {
         "import core\n",
         "import core\nimport leaf\n",
     );
-    // Asked with the imports it had, which no longer close over it, and then as a whole.
-    step("an import added", 2 + 3);
+    step("an import added");
     edit(
         dir.path(),
         "shop.ply",
         "import core\nimport leaf\n",
         "import core\n",
     );
-    step("an import removed", 3);
+    step("an import removed");
 
     write(
         dir.path(),
         "extra.ply",
         "import leaf\npub fn four() -> Int = leaf::two(2) + 2\n",
     );
-    step("a file added", 4);
+    step("a file added");
     edit(dir.path(), "extra.ply", "+ 2\n", "+ 3\n");
-    step("an edit to the added file, which imports the leaf", 2);
+    step("an edit to the added file, which imports the leaf");
     edit(dir.path(), "leaf.ply", "one() + k", "one() + k + 0");
-    step("an edit to the leaf the added file imports", 2);
+    step("an edit to the leaf the added file imports");
     edit(
         dir.path(),
         "leaf.ply",
@@ -510,14 +496,11 @@ fn an_edit_asks_only_the_modules_it_reached_and_answers_as_a_full_load() {
         "Book(_, p) -> p + 0,",
         "Book(_, p) -> p + 1,",
     );
-    step(
-        "an import added to a module edited with the one it now imports",
-        4,
-    );
+    step("an import added to a module edited with the one it now imports");
     fs::remove_file(dir.path().join("extra.ply")).unwrap();
-    step("the added file deleted", 3);
+    step("the added file deleted");
 
-    step("unchanged again", 0);
+    step("unchanged again");
 }
 
 #[test]

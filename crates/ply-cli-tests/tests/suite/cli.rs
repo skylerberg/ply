@@ -1754,6 +1754,17 @@ fn cache_inspect_accepts_a_hash_prefix_and_emits_json() {
             .unwrap(),
     );
     assert_eq!(by_prefix["matches"][0]["name"], "m.double");
+
+    // A stored span is a range into the bytes as cached, so a same-length edit still invalidates it.
+    std::fs::write(dir.path().join("m.ply"), GREEN.replace("x * 2", "x + 2")).unwrap();
+    let edited = json_of(
+        &ply(dir.path())
+            .args(["cache", "inspect", "double", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(edited["matches"][0]["stale"], true);
+    assert_eq!(edited["matches"][0]["location"], Value::Null);
 }
 
 #[test]
