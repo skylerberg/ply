@@ -3,9 +3,13 @@
 use crate::commands::common::plural;
 use crate::config::Configuration;
 use crate::db::{self, Database, DbConfig};
-use ply_eval::host::{HostBinding, HostListing, HostRegistry, HostRow, HostRuntime};
+use ply_eval::Value as PlyValue;
+use ply_eval::host::{
+    Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
+    HostRequest, HostResource, HostRow, HostRuntime, Linearity,
+};
 use ply_host::tls;
-use ply_span::{Diagnostic, Span};
+use ply_span::{Diagnostic, Severity, SourceMap, Span, Symbol};
 use ply_ty::CheckOutput;
 use ply_ty::ty::Footprint;
 use serde_json::{Value, json};
@@ -16,6 +20,9 @@ use std::sync::Arc;
 pub fn registry() -> HostRegistry {
     ply_host::registry()
 }
+
+/// One host operation and the handler that serves it, as a caller lends it to an entry.
+pub type Lent = (HostOp, Arc<dyn HostHandler>);
 
 fn registry_for(check: &CheckOutput, trace: Option<Arc<ply_host::trace::Trace>>) -> HostRegistry {
     let database = check
@@ -71,11 +78,13 @@ impl Hosts {
             reach,
             None,
             None,
+            Vec::new(),
         )
     }
 
     /// [`Hosts::open`] for a run that listens for a stop and is a process; only `ply run`, so
-    /// ctrl-C ends no test and `process` is withheld from one.
+    /// ctrl-C ends no test and `process` is withheld from one. `lent` joins the registrations
+    /// this binary compiles in, for an entry whose caller serves an effect of its own.
     #[allow(clippy::too_many_arguments)]
     pub fn open_stopping(
         check: &CheckOutput,
@@ -88,9 +97,13 @@ impl Hosts {
         reach: Option<&Footprint>,
         shutdown: Option<Arc<ply_host::signal::Shutdown>>,
         process: Option<ply_host::process::ProcessHost>,
+        lent: Vec<Lent>,
     ) -> Result<Hosts, Vec<Diagnostic>> {
         if !host {
-            let registry = registry_for(check, None);
+            let mut registry = registry_for(check, None);
+            for (op, handler) in lent {
+                registry.register(op, handler);
+            }
             return Ok(Hosts {
                 host: None,
                 binding: Arc::new(HostBinding::hermetic_with(registry)),
@@ -136,7 +149,10 @@ impl Hosts {
             facilities = facilities.stopping_on(shutdown);
         }
         let facilities = Arc::new(facilities);
-        let registry = facilities.registry();
+        let mut registry = facilities.registry();
+        for (op, handler) in lent {
+            registry.register(op, handler);
+        }
         let binding = registry.bind(check)?;
         let listing = binding.listing().clone();
         let schema = db_schema(check, db.as_ref(), &listing, reach)?;
@@ -257,14 +273,6 @@ impl Hosts {
             observability: None,
             shutdown: None,
         })
-    }
-
-    /// Everything the registry resolves to, bound or not: what `ply hosts` prints and digests.
-    pub fn preview(
-        check: &CheckOutput,
-        trace: Option<Arc<ply_host::trace::Trace>>,
-    ) -> Result<HostListing, Vec<Diagnostic>> {
-        registry_for(check, trace).preview(check)
     }
 
     /// A reactor for one machine, on the thread that will drive it.
@@ -506,27 +514,6 @@ impl Filesystem {
         })
     }
 
-    pub fn lines(&self) -> Vec<String> {
-        let mut lines = vec![String::new(), "filesystem".to_string()];
-        if self.roots.is_empty() {
-            lines.push(
-                "none — an `fs` operation is E0451 until `--fs NAME=PATH` binds its label"
-                    .to_string(),
-            );
-            return lines;
-        }
-        let width = self
-            .roots
-            .iter()
-            .map(|r| r.name.chars().count())
-            .max()
-            .unwrap_or(0);
-        for root in &self.roots {
-            lines.push(format!("{:width$}  {}", root.name, root.path));
-        }
-        lines
-    }
-
     pub fn json(&self) -> Value {
         json!({
             "roots": self.roots.iter().map(|r| json!({
@@ -597,50 +584,6 @@ impl Transport {
                 })
                 .collect(),
         })
-    }
-
-    pub fn lines(&self) -> Vec<String> {
-        let mut lines = vec![
-            String::new(),
-            "transport".to_string(),
-            format!(
-                "tls  {} {} · provider {} · {} · alpn {}",
-                self.library,
-                self.version,
-                self.provider,
-                self.versions.join(", "),
-                self.alpn.join(", "),
-            ),
-            format!(
-                "roots  {} {} · {} trusted by `--trust`",
-                self.roots, self.roots_version, self.trusted
-            ),
-            String::new(),
-            "credentials".to_string(),
-        ];
-        if self.credentials.is_empty() {
-            lines.push(
-                "none — `net.listen_tls` is E0429 until `--tls NAME=CERT,KEY` names one"
-                    .to_string(),
-            );
-            return lines;
-        }
-        let width = self
-            .credentials
-            .iter()
-            .map(|c| c.name.chars().count())
-            .max()
-            .unwrap_or(0);
-        for credential in &self.credentials {
-            lines.push(format!(
-                "{:width$}  {}  {} {}",
-                credential.name,
-                abbreviate(&credential.fingerprint),
-                credential.certificates,
-                plural(credential.certificates, "certificate"),
-            ));
-        }
-        lines
     }
 
     pub fn json(&self) -> Value {
@@ -721,19 +664,6 @@ impl Observability {
         })
     }
 
-    fn lines(&self) -> Vec<String> {
-        vec![
-            format!(
-                "sink       {} → {}{}",
-                self.sink,
-                self.destination,
-                self.level_suffix()
-            ),
-            format!("channels   {}", self.channels.join(" ")),
-            "spans      per-task stack · closed at end_entry_point".to_string(),
-        ]
-    }
-
     /// The same three facts on one line, for the start-up banner.
     pub fn banner(&self) -> String {
         format!(
@@ -750,15 +680,6 @@ impl Observability {
             Some(level) => format!(" · level {level}"),
             None => String::new(),
         }
-    }
-
-    pub fn json(&self) -> Value {
-        json!({
-            "sink": self.sink,
-            "destination": self.destination,
-            "level": self.level,
-            "channels": self.channels,
-        })
     }
 
     /// The sink's path, its level and the channel list.
@@ -810,23 +731,6 @@ impl Shutdown {
         self.signals.iter().flatten().copied().collect()
     }
 
-    fn lines(&self) -> Vec<String> {
-        vec![format!(
-            "signals    {} · lead {}ms · drain {}ms · second signal exits 130/143",
-            self.names().join(" "),
-            self.lead_ms,
-            self.drain_ms,
-        )]
-    }
-
-    pub fn json(&self) -> Value {
-        json!({
-            "signals": self.names(),
-            "lead_ms": self.lead_ms,
-            "drain_ms": self.drain_ms,
-        })
-    }
-
     fn hash_into(&self, hasher: &mut blake3::Hasher) {
         for name in self.names() {
             hasher.update(&(name.len() as u64).to_le_bytes());
@@ -853,7 +757,7 @@ pub struct Disclosures {
 impl Disclosures {
     /// For `ply hosts`, which resolves the listing without binding a [`Hosts`].
     #[allow(clippy::too_many_arguments)]
-    pub fn of(
+    fn of(
         listing: &HostListing,
         credentials: Option<&tls::Credentials>,
         roots: Option<&ply_host::fs::Roots>,
@@ -884,35 +788,6 @@ impl Disclosures {
                 .configuration
                 .as_ref()
                 .is_some_and(Configuration::is_pinned)
-    }
-
-    pub fn lines(&self) -> Vec<String> {
-        let mut lines = Vec::new();
-        if let Some(transport) = &self.transport {
-            lines.extend(transport.lines());
-        }
-        if let Some(filesystem) = &self.filesystem {
-            lines.extend(filesystem.lines());
-        }
-        if let Some(database) = &self.database {
-            lines.extend(database.lines());
-        }
-        if let Some(configuration) = &self.configuration {
-            lines.push(String::new());
-            lines.push("configuration".to_string());
-            lines.extend(configuration.lines());
-        }
-        if let Some(observability) = &self.observability {
-            lines.push(String::new());
-            lines.push("observability".to_string());
-            lines.extend(observability.lines());
-        }
-        if let Some(shutdown) = &self.shutdown {
-            lines.push(String::new());
-            lines.push("shutdown".to_string());
-            lines.extend(shutdown.lines());
-        }
-        lines
     }
 }
 
@@ -969,141 +844,598 @@ const CONFIGURATION_DOMAIN: &[u8] = b"ply.hosts.configuration.v1\0";
 const OBSERVABILITY_DOMAIN: &[u8] = b"ply.hosts.observability.v1\0";
 const SHUTDOWN_DOMAIN: &[u8] = b"ply.hosts.shutdown.v1\0";
 
-/// A fingerprint short enough to sit in the table beside the name it belongs to.
-fn abbreviate(fingerprint: &str) -> String {
-    let (scheme, digits) = fingerprint.split_once(':').unwrap_or(("", fingerprint));
-    let short: String = digits.chars().take(12).collect();
-    let elided = if digits.chars().count() > 12 {
-        "…"
-    } else {
-        ""
-    };
-    if scheme.is_empty() {
-        format!("{short}{elided}")
-    } else {
-        format!("{scheme}:{short}{elided}")
-    }
-}
+// --- What `ply hosts` is lent ------------------------------------------------
 
-const HEADERS: [&str; 6] = [
-    "OPERATION",
-    "HANDLER",
-    "DET",
-    "LINEAR",
-    "BLOCKING",
-    "SECRETS",
-];
+/// The effect `crates/ply-cli/ply/hosts.ply` declares. It is lent to that one entry and nowhere
+/// else: what a run would bind is assembled here, and the program is handed what it says.
+const EFFECT: &str = "tcb";
 
-fn cells(row: &HostRow) -> [String; 6] {
-    [
-        row.to_string(),
-        row.path.to_string(),
-        yes_no(row.deterministic),
-        row.linearity.as_str().to_string(),
-        yes_no(row.blocking),
-        yes_no(row.secrets),
+const PREVIEW: &str = "ply_cli::hosts::preview";
+
+const OPEN: &str = "ply_cli::hosts::open";
+
+/// The module the payload's constructors are declared in, as a program-wide name.
+const PAYLOAD: &str = "hosts";
+
+/// Assembled before the program is entered: a load and a backend are the compiler's work, and
+/// the compiler is not something to re-enter from inside a running program.
+pub fn lent(args: &crate::cli::HostsArgs) -> Vec<Lent> {
+    let facility: Arc<dyn HostHandler> = Arc::new(Facility {
+        assembled: Assembled::of(args),
+    });
+    vec![
+        (registration("preview", PREVIEW), Arc::clone(&facility)),
+        (registration("open", OPEN), facility),
     ]
 }
 
-fn yes_no(flag: bool) -> String {
-    if flag { "yes" } else { "no" }.to_string()
+fn registration(op: &str, path: &'static str) -> HostOp {
+    HostOp {
+        effect: Symbol::new(EFFECT),
+        op: Symbol::new(op),
+        resource: HostResource::Any,
+        // The flags, the tree and the process environment are not functions of program state.
+        determinism: Determinism::Nondeterministic,
+        // One binding serves the whole command, so a second perform reads the same one.
+        linearity: Linearity::Repeatable,
+        blocking: false,
+        secrets: false,
+        path,
+    }
 }
 
-/// Every line of `ply hosts --host`, unindented.
-pub fn listing_lines(listing: &HostListing, disclosures: &Disclosures) -> Vec<String> {
-    let mut lines = vec![format!(
-        "{} {} · {} {} · trusted computing base",
-        listing.handlers,
-        plural(listing.handlers, "host handler"),
-        listing.rows.len(),
-        plural(listing.rows.len(), "operation"),
-    )];
-    lines.push(String::new());
+struct Facility {
+    assembled: Assembled,
+}
 
-    if listing.rows.is_empty() {
-        lines.push(empty_note(listing));
-    } else {
-        let rows: Vec<[String; 6]> = listing.rows.iter().map(cells).collect();
-        let mut widths = HEADERS.map(str::len);
-        for row in &rows {
-            for (width, cell) in widths.iter_mut().zip(row) {
-                *width = (*width).max(cell.chars().count());
+impl HostHandler for Facility {
+    fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
+        let value = match req.op.op.as_str() {
+            "preview" => self.assembled.preview(),
+            "open" => self.assembled.binding(),
+            other => return Err(unregistered(other, req.span)),
+        };
+        Ok(HostAnswer::Value(value))
+    }
+}
+
+/// The binding this invocation's flags define, resolved once and then only read.
+struct Assembled {
+    /// The `Stage` constructor the program matches on, by simple name.
+    stage: &'static str,
+    root: String,
+    listing: HostListing,
+    disclosures: Disclosures,
+    digest: String,
+    hermetic: bool,
+    /// The refusal that stopped it, else the warnings the configuration raised.
+    diagnostics: Vec<Diagnostic>,
+    sources: SourceMap,
+}
+
+impl Assembled {
+    fn of(args: &crate::cli::HostsArgs) -> Assembled {
+        let loaded = match crate::load::load(&args.path) {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                return Assembled::refused(
+                    "NotLoaded",
+                    String::new(),
+                    err.diagnostics,
+                    err.sources,
+                );
+            }
+        };
+        let root = loaded.root.display().to_string();
+        match bind(args, &loaded) {
+            Ok(bound) => Assembled {
+                stage: "Bound",
+                root,
+                digest: digest_short(&bound.listing, &bound.disclosures),
+                hermetic: bound.hermetic,
+                listing: bound.listing,
+                disclosures: bound.disclosures,
+                diagnostics: bound.warnings,
+                sources: loaded.sources,
+            },
+            Err((stage, diagnostics)) => {
+                Assembled::refused(stage, root, diagnostics, loaded.sources)
             }
         }
-        let line = |cells: &[String; 6]| {
-            let mut out = String::new();
-            for (i, (cell, width)) in cells.iter().zip(widths).enumerate() {
-                if i + 1 == cells.len() {
-                    out.push_str(cell);
-                } else {
-                    out.push_str(&format!("{cell:<width$}  "));
-                }
-            }
-            out
-        };
-        lines.push(line(&HEADERS.map(str::to_string)));
-        lines.extend(rows.iter().map(line));
     }
 
-    lines.extend(disclosures.lines());
+    fn refused(
+        stage: &'static str,
+        root: String,
+        diagnostics: Vec<Diagnostic>,
+        sources: SourceMap,
+    ) -> Assembled {
+        Assembled {
+            stage,
+            root,
+            listing: HostListing::default(),
+            disclosures: Disclosures::default(),
+            digest: String::new(),
+            hermetic: true,
+            diagnostics,
+            sources,
+        }
+    }
 
-    lines.push(String::new());
-    lines.push(format!("digest: {}", digest_short(listing, disclosures)));
-    lines
-}
+    fn preview(&self) -> PlyValue {
+        let d = &self.disclosures;
+        record(vec![
+            ("stage", PlyValue::ctor(payload(self.stage), Vec::new())),
+            ("root", PlyValue::str(&self.root)),
+            ("handlers", count(self.listing.handlers)),
+            (
+                "rows",
+                PlyValue::list(self.listing.rows.iter().map(row_value).collect()),
+            ),
+            ("digest", PlyValue::str(&self.digest)),
+            (
+                "transport",
+                option(d.transport.as_ref().map(transport_value)),
+            ),
+            (
+                "filesystem",
+                option(d.filesystem.as_ref().map(filesystem_value)),
+            ),
+            ("database", option(d.database.as_ref().map(database_value))),
+            (
+                "configuration",
+                option(d.configuration.as_ref().map(configuration_value)),
+            ),
+            (
+                "observability",
+                option(d.observability.as_ref().map(observability_value)),
+            ),
+            ("shutdown", option(d.shutdown.as_ref().map(shutdown_value))),
+            (
+                "diags",
+                PlyValue::list(self.diagnostics.iter().map(diag_value).collect()),
+            ),
+            ("places", places_value(&self.sources)),
+        ])
+    }
 
-/// Why a bound listing has no rows.
-fn empty_note(listing: &HostListing) -> String {
-    if listing.handlers == 0 {
-        "no host handler is compiled into this binary".to_string()
-    } else {
-        format!(
-            "{} {} registered, and none serves an atom this program performs",
-            listing.handlers,
-            plural(listing.handlers, "handler")
-        )
+    fn binding(&self) -> PlyValue {
+        record(vec![
+            (
+                "label",
+                PlyValue::str(if self.hermetic { "hermetic" } else { "host" }),
+            ),
+            ("hermetic", PlyValue::Bool(self.hermetic)),
+        ])
     }
 }
 
-/// What `ply hosts` says without `--host`.
-pub fn hermetic_lines(listing: &HostListing) -> Vec<String> {
-    let mut lines = vec![
-        "hermetic — no host handler is bound".to_string(),
-        String::new(),
-    ];
-    lines.push(if listing.rows.is_empty() {
-        empty_note(listing)
-    } else {
-        format!(
-            "{} {} would bind under `--host`; run `ply hosts --host` to list them",
-            listing.rows.len(),
-            plural(listing.rows.len(), "operation"),
-        )
-    });
-    lines
+/// What the host flags open, over a program that loaded.
+struct Bound {
+    listing: HostListing,
+    disclosures: Disclosures,
+    hermetic: bool,
+    warnings: Vec<Diagnostic>,
 }
 
-pub fn row_json(row: &HostRow) -> Value {
-    json!({
-        "effect": row.effect.as_str(),
-        "operation": row.op.as_str(),
-        // Null for an operation declared without `[r]`: a singleton, not a resource named that.
-        "resource": match &row.resource {
-            ply_ty::ty::Resource::Named(name) => json!(name.as_str()),
-            ply_ty::ty::Resource::Var(_) | ply_ty::ty::Resource::Singleton => Value::Null,
-        },
-        "triple": row.to_string(),
-        "handler": row.path,
-        "deterministic": row.deterministic,
-        "linearity": row.linearity.as_json(),
-        "blocking": row.blocking,
-        // Whether this operation may be handed a value containing a `Secret`.
-        "secrets": row.secrets,
-        // The other half of the pair E0423 checks.
-        "declared_nondet": row.declared_nondet,
+/// The stage that refused, and why.
+type Refusal = (&'static str, Vec<Diagnostic>);
+
+fn bind(args: &crate::cli::HostsArgs, loaded: &crate::load::Loaded) -> Result<Bound, Refusal> {
+    // Whether or not `--host` was passed: a digest that moved with a flag would pin nothing.
+    let trace = args.trace.open();
+    let stopping = ply_host::signal::Shutdown::new(args.shutdown.bounds());
+    let registry = registry_for(&loaded.check, Some(Arc::clone(&trace)));
+    let listing = registry
+        .preview(&loaded.check)
+        .map_err(|diagnostics| ("NotResolved", diagnostics))?;
+    let binding = if args.host {
+        registry
+            .bind(&loaded.check)
+            .map_err(|diagnostics| ("NotResolved", diagnostics))?
+    } else {
+        HostBinding::hermetic_with(registry)
+    };
+    // Loaded even without `--host`: this command answers what a run trusts, and whether it starts.
+    let credentials = tls::Credentials::load(&args.tls.tls, &args.tls.trust)
+        .map_err(|diagnostics| ("NotBound", diagnostics))?;
+    // Likewise, so an unresolvable root is `E0454` before the listing overstates what is reached.
+    let roots = ply_host::fs::Roots::load(&args.fs.fs, Span::DUMMY)
+        .map_err(|diagnostic| ("NotBound", vec![diagnostic]))?;
+    let db = args
+        .db
+        .resolve(args.host)
+        .map_err(|diagnostics| ("NotBound", diagnostics))?;
+    // Built only for a schema: this command runs nothing else.
+    let constant = |name: &str| {
+        let backend = crate::commands::common::prover_backend(None, loaded)?;
+        crate::commands::common::enter_constant(backend.map(|(provider, _)| provider), name)
+    };
+    let schema = schema_view(&loaded.check, db.as_ref(), &constant)
+        .map_err(|diagnostic| ("NotBound", vec![diagnostic]))?;
+    let (configuration, warnings) =
+        Configuration::open(&loaded.check, args.host, &args.config, &constant)
+            .map_err(|diagnostics| ("NotBound", diagnostics))?;
+    Ok(Bound {
+        disclosures: Disclosures::of(
+            &listing,
+            Some(&credentials),
+            Some(&roots),
+            db,
+            schema,
+            Some(configuration),
+            Some(&trace),
+            args.trace.level_name(),
+            Some(&stopping),
+        ),
+        listing,
+        hermetic: binding.is_hermetic(),
+        warnings,
     })
 }
 
-pub fn rows_json(listing: &HostListing) -> Value {
-    Value::Array(listing.rows.iter().map(row_json).collect())
+/// The `--db-schema` function as this command reports it: named, and evaluated for its shape.
+fn schema_view(
+    check: &CheckOutput,
+    db: Option<&DbConfig>,
+    constant: &dyn Fn(&str) -> Result<ply_eval::Value, Diagnostic>,
+) -> Result<Option<db::schema::SchemaView>, Diagnostic> {
+    let Some(name) = db.and_then(|c| c.schema.as_deref()) else {
+        return Ok(None);
+    };
+    let resolved = db::schema::resolve(check, name)?;
+    let name = resolved.as_str().to_string();
+    let shape = crate::commands::common::materialise_schema(&name, constant);
+    Ok(Some(db::schema::SchemaView {
+        name,
+        shape,
+        state: db::schema::State::Declared,
+    }))
+}
+
+// --- The payload -------------------------------------------------------------
+
+// `Value::Record` holds an `Arc`, and its fields are not `Send`; every construction site says so.
+#[allow(clippy::arc_with_non_send_sync)]
+fn record(fields: Vec<(&str, PlyValue)>) -> PlyValue {
+    PlyValue::Record(Arc::new(
+        fields
+            .into_iter()
+            .map(|(name, value)| (Symbol::new(name), value))
+            .collect(),
+    ))
+}
+
+fn payload(ctor: &str) -> Symbol {
+    Symbol::new(format!("{PAYLOAD}.{ctor}"))
+}
+
+fn option(value: Option<PlyValue>) -> PlyValue {
+    match value {
+        Some(value) => PlyValue::ctor("Some", vec![value]),
+        None => PlyValue::ctor("None", Vec::new()),
+    }
+}
+
+fn count(n: usize) -> PlyValue {
+    PlyValue::Int(n as i64)
+}
+
+fn strings<'a>(items: impl IntoIterator<Item = &'a str>) -> PlyValue {
+    PlyValue::list(items.into_iter().map(PlyValue::str).collect())
+}
+
+fn row_value(row: &HostRow) -> PlyValue {
+    record(vec![
+        ("effect", PlyValue::str(row.effect.as_str())),
+        ("op", PlyValue::str(row.op.as_str())),
+        (
+            "resource",
+            option(match &row.resource {
+                ply_ty::ty::Resource::Named(name) => Some(PlyValue::str(name.as_str())),
+                ply_ty::ty::Resource::Var(_) | ply_ty::ty::Resource::Singleton => None,
+            }),
+        ),
+        ("triple", PlyValue::str(row.to_string())),
+        ("handler", PlyValue::str(row.path)),
+        ("deterministic", PlyValue::Bool(row.deterministic)),
+        ("linear", PlyValue::Bool(row.linearity.is_linear())),
+        ("blocking", PlyValue::Bool(row.blocking)),
+        ("secrets", PlyValue::Bool(row.secrets)),
+        ("declared_nondet", PlyValue::Bool(row.declared_nondet)),
+    ])
+}
+
+fn transport_value(transport: &Transport) -> PlyValue {
+    record(vec![
+        ("library", PlyValue::str(transport.library)),
+        ("version", PlyValue::str(transport.version)),
+        ("provider", PlyValue::str(transport.provider)),
+        ("versions", strings(transport.versions.iter().copied())),
+        ("alpn", strings(transport.alpn.iter().copied())),
+        ("roots", PlyValue::str(transport.roots)),
+        ("roots_version", PlyValue::str(transport.roots_version)),
+        ("trusted", count(transport.trusted)),
+        (
+            "credentials",
+            PlyValue::list(
+                transport
+                    .credentials
+                    .iter()
+                    .map(|c| {
+                        record(vec![
+                            ("name", PlyValue::str(&c.name)),
+                            ("fingerprint", PlyValue::str(&c.fingerprint)),
+                            ("certificates", count(c.certificates)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn filesystem_value(filesystem: &Filesystem) -> PlyValue {
+    record(vec![(
+        "roots",
+        PlyValue::list(
+            filesystem
+                .roots
+                .iter()
+                .map(|r| {
+                    record(vec![
+                        ("name", PlyValue::str(&r.name)),
+                        ("path", PlyValue::str(&r.path)),
+                    ])
+                })
+                .collect(),
+        ),
+    )])
+}
+
+fn database_value(database: &Database) -> PlyValue {
+    let config = database.config.as_ref();
+    record(vec![
+        ("live", PlyValue::Bool(database.is_live())),
+        (
+            "operations",
+            strings(database.operations.iter().map(String::as_str)),
+        ),
+        (
+            "url",
+            option(config.map(|c| PlyValue::str(c.url.redacted()))),
+        ),
+        (
+            "source",
+            option(config.map(|c| PlyValue::str(c.source.as_str()))),
+        ),
+        (
+            "pool",
+            option(config.map(|c| {
+                record(vec![
+                    ("connections", PlyValue::Int(c.pool as i64)),
+                    ("acquire_ms", PlyValue::Int(c.acquire_ms as i64)),
+                    ("statement_ms", PlyValue::Int(c.statement_ms as i64)),
+                    ("idle_txn_ms", PlyValue::Int(c.idle_txn_ms as i64)),
+                    ("connect_ms", PlyValue::Int(c.connect_ms as i64)),
+                    ("statement_cache", PlyValue::Int(c.statement_cache as i64)),
+                ])
+            })),
+        ),
+        ("scanner", PlyValue::str(db::SCANNER)),
+        ("accepts", strings(db::ACCEPTED.split_whitespace())),
+        (
+            "server",
+            option(database.server.as_ref().map(|s| {
+                record(vec![
+                    ("version", PlyValue::str(&s.version)),
+                    ("database", PlyValue::str(&s.database)),
+                    ("collation", PlyValue::str(&s.collation)),
+                    ("encoding", PlyValue::str(&s.encoding)),
+                ])
+            })),
+        ),
+        (
+            "schema",
+            option(database.schema.as_ref().map(|s| {
+                record(vec![
+                    ("function", PlyValue::str(&s.name)),
+                    ("tables", option(s.shape.map(|shape| count(shape.tables)))),
+                    ("columns", option(s.shape.map(|shape| count(shape.columns)))),
+                    ("state", PlyValue::str(s.state.as_str())),
+                ])
+            })),
+        ),
+    ])
+}
+
+fn configuration_value(configuration: &Configuration) -> PlyValue {
+    let snapshot = &configuration.snapshot;
+    let counts = snapshot.counts();
+    record(vec![
+        ("sets", count(snapshot.sets)),
+        (
+            "files",
+            PlyValue::list(
+                snapshot
+                    .files
+                    .iter()
+                    .map(|p| PlyValue::str(p.display().to_string()))
+                    .collect(),
+            ),
+        ),
+        ("environment", count(snapshot.environment)),
+        ("defaults", count(counts.default)),
+        (
+            "schema",
+            option(configuration.schema.as_ref().map(|view| {
+                record(vec![
+                    ("function", PlyValue::str(&view.name)),
+                    (
+                        "keys",
+                        PlyValue::list(
+                            view.keys
+                                .iter()
+                                .map(|(name, shape)| {
+                                    record(vec![
+                                        ("name", PlyValue::str(name)),
+                                        ("shape", PlyValue::str(shape.as_str())),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                ])
+            })),
+        ),
+        ("resolved", count(counts.keys)),
+        ("secret", count(counts.secret)),
+        (
+            "keys",
+            PlyValue::list(
+                snapshot
+                    .declared()
+                    .map(|(name, resolved)| {
+                        record(vec![
+                            ("name", PlyValue::str(name)),
+                            ("value", PlyValue::str(resolved.shown())),
+                            ("source", PlyValue::str(resolved.source.as_str())),
+                            (
+                                "secret",
+                                PlyValue::Bool(
+                                    resolved.shape == Some(ply_host::config::Shape::Secret),
+                                ),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn observability_value(observability: &Observability) -> PlyValue {
+    record(vec![
+        ("sink", PlyValue::str(observability.sink)),
+        ("destination", PlyValue::str(observability.destination)),
+        ("level", option(observability.level.map(PlyValue::str))),
+        (
+            "channels",
+            strings(observability.channels.iter().map(String::as_str)),
+        ),
+    ])
+}
+
+fn shutdown_value(shutdown: &Shutdown) -> PlyValue {
+    record(vec![
+        ("signals", strings(shutdown.names())),
+        ("lead_ms", PlyValue::Int(shutdown.lead_ms as i64)),
+        ("drain_ms", PlyValue::Int(shutdown.drain_ms as i64)),
+    ])
+}
+
+/// `compiler.resolve.Diag`, as `crates/ply-cli/ply/diagnostic.ply` renders it. A label carries
+/// the source id its span names, which is the index of its file in `places`.
+fn diag_value(diagnostic: &Diagnostic) -> PlyValue {
+    record(vec![
+        ("code", PlyValue::bytes(diagnostic.code.as_bytes())),
+        ("notes", count(diagnostic.notes.len())),
+        (
+            "labels",
+            PlyValue::list(
+                diagnostic
+                    .labels
+                    .iter()
+                    .map(|l| {
+                        record(vec![
+                            ("module", PlyValue::Int(l.span.source.0 as i64)),
+                            ("start", PlyValue::Int(l.span.start as i64)),
+                            ("end", PlyValue::Int(l.span.end as i64)),
+                            ("primary", PlyValue::Bool(l.primary)),
+                            ("text", PlyValue::bytes(l.message.as_bytes())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("text", PlyValue::bytes(b"")),
+        ("message", PlyValue::bytes(diagnostic.message.as_bytes())),
+        (
+            "notes_text",
+            PlyValue::list(
+                diagnostic
+                    .notes
+                    .iter()
+                    .map(|n| PlyValue::bytes(n.as_bytes()))
+                    .collect(),
+            ),
+        ),
+        (
+            "severity",
+            PlyValue::bytes(
+                match diagnostic.severity {
+                    Severity::Error => "error",
+                    Severity::Warning => "warning",
+                    Severity::Note => "note",
+                }
+                .as_bytes(),
+            ),
+        ),
+        (
+            "fixes",
+            PlyValue::list(
+                diagnostic
+                    .fixes
+                    .iter()
+                    .map(|f| {
+                        record(vec![
+                            ("title", PlyValue::bytes(f.title.as_bytes())),
+                            (
+                                "edits",
+                                PlyValue::list(
+                                    f.edits
+                                        .iter()
+                                        .map(|e| {
+                                            record(vec![
+                                                ("module", PlyValue::Int(e.span.source.0 as i64)),
+                                                ("start", PlyValue::Int(e.span.start as i64)),
+                                                ("end", PlyValue::Int(e.span.end as i64)),
+                                                ("text", PlyValue::bytes(e.text.as_bytes())),
+                                            ])
+                                        })
+                                        .collect(),
+                                ),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+/// The modules a label can point into, in source-id order, which is what a label's index is.
+fn places_value(sources: &SourceMap) -> PlyValue {
+    PlyValue::list(
+        sources
+            .files()
+            .iter()
+            .map(|f| {
+                record(vec![
+                    ("path", PlyValue::str(f.path.display().to_string())),
+                    ("text", PlyValue::bytes(f.text.as_bytes())),
+                ])
+            })
+            .collect(),
+    )
+}
+
+#[cold]
+fn unregistered(op: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        ply_span::codes::INTERNAL_ERROR,
+        format!("`{EFFECT}.{op}` reached the binding, and nothing here serves it"),
+    )
+    .primary(span, "this perform reached `ply hosts`")
+    .note("the registrations and the handler are written together; this is Ply's fault")
 }

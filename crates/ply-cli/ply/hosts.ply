@@ -1,0 +1,772 @@
+// `ply hosts` — the trusted computing base, enumerable in one command. What a run would bind is
+// assembled on the Rust side and handed over as a value: a reactor belongs to the thread that
+// drives it, and a connection pool is not something a program can hold. Everything below decides
+// what that value says.
+
+import args (Flags, no_flags, style_of)
+import compiler.resolve (Diag)
+import diagnostic (Place, all_to_json, all_to_text)
+import report (Answer, schema_version, ok_code, compile_error, ind, count_of, refused)
+import std.json (Json, Null, Str, Bool, Number, Array, Member, object, to_string)
+import style (Style, red)
+
+// The trusted computing base, as the Rust side assembles it under the host flags.
+pub nondet effect tcb {
+  read  preview[r]() -> Preview
+  write open[r]()    -> Binding
+}
+
+// --- What the Rust side answers with ----------------------------------------
+
+// How far the preview got. Each refusal has a report of its own, because each says something
+// different about where the run stopped.
+pub type Stage = | Bound | NotLoaded | NotResolved | NotBound
+
+// One triple the registry resolved against this program.
+pub type Row = {
+  effect: String,
+  op: String,
+  // `None` for an operation declared without `[r]`: a singleton, not a resource named that.
+  resource: Option<String>,
+  triple: String,
+  handler: String,
+  deterministic: Bool,
+  linear: Bool,
+  blocking: Bool,
+  secrets: Bool,
+  declared_nondet: Bool,
+}
+
+pub type Credential = { name: String, fingerprint: String, certificates: Int }
+
+pub type Transport = {
+  library: String,
+  version: String,
+  provider: String,
+  versions: List<String>,
+  alpn: List<String>,
+  roots: String,
+  roots_version: String,
+  trusted: Int,
+  credentials: List<Credential>,
+}
+
+pub type Root = { name: String, path: String }
+
+pub type Filesystem = { roots: List<Root> }
+
+pub type Pool = {
+  connections: Int,
+  acquire_ms: Int,
+  statement_ms: Int,
+  idle_txn_ms: Int,
+  connect_ms: Int,
+  statement_cache: Int,
+}
+
+pub type Server = { version: String, database: String, collation: String, encoding: String }
+
+pub type DbSchema = { function: String, tables: Option<Int>, columns: Option<Int>, state: String }
+
+pub type Database = {
+  live: Bool,
+  operations: List<String>,
+  url: Option<String>,
+  source: Option<String>,
+  pool: Option<Pool>,
+  scanner: String,
+  accepts: List<String>,
+  server: Option<Server>,
+  schema: Option<DbSchema>,
+}
+
+pub type Key = { name: String, value: String, source: String, secret: Bool }
+
+pub type KeyShape = { name: String, shape: String }
+
+pub type ConfigSchema = { function: String, keys: List<KeyShape> }
+
+pub type Configuration = {
+  sets: Int,
+  files: List<String>,
+  environment: Int,
+  defaults: Int,
+  schema: Option<ConfigSchema>,
+  resolved: Int,
+  secret: Int,
+  keys: List<Key>,
+}
+
+pub type Observability = {
+  sink: String,
+  destination: String,
+  // `None` when the records are discarded, since a level then decides nothing.
+  level: Option<String>,
+  channels: List<String>,
+}
+
+pub type Stopping = { signals: List<String>, lead_ms: Int, drain_ms: Int }
+
+pub type Preview = {
+  stage: Stage,
+  // The root the load was rooted at, as a report prints it.
+  root: String,
+  handlers: Int,
+  rows: List<Row>,
+  digest: String,
+  transport: Option<Transport>,
+  filesystem: Option<Filesystem>,
+  database: Option<Database>,
+  configuration: Option<Configuration>,
+  observability: Option<Observability>,
+  shutdown: Option<Stopping>,
+  diags: List<Diag>,
+  places: List<Place>,
+}
+
+pub type Binding = { label: String, hermetic: Bool }
+
+// --- Small things -----------------------------------------------------------
+
+fn at<a>(xs: List<a>, i: Int, spare: a) -> a = match list_at(xs, i) { Some(x) -> x, None -> spare }
+
+fn repeated(unit: String, n: Int) -> String = fold(range(0, n), "", |acc: String, i: Int| acc ++ unit)
+
+fn padded(text: String, width: Int) -> String = text ++ repeated(" ", width - string_len(text))
+
+fn wider(a: Int, b: Int) -> Int = if a > b { a } else { b }
+
+fn joined(parts: List<String>, sep: String) -> String =
+  fold(range(0, len(parts)), "", |acc: String, i: Int|
+    if i == 0 { at(parts, i, "") } else { acc ++ sep ++ at(parts, i, "") })
+
+fn appended<a>(head: List<a>, tail: List<a>) -> List<a> = fold(tail, head, |acc: List<a>, x: a| push(acc, x))
+
+fn yes_no(flag: Bool) -> String = if flag { "yes" } else { "no" }
+
+// The two spellings of one fact: the table reads, the object keys.
+fn linear_text(linear: Bool) -> String = if linear { "at-most-once" } else { "repeatable" }
+
+fn linear_json(linear: Bool) -> String = if linear { "at_most_once" } else { "repeatable" }
+
+fn opt_str(v: Option<String>) -> Json = match v { Some(s) -> Str(s), None -> Null }
+
+fn opt_int(v: Option<Int>) -> Json = match v { Some(n) -> Number(decimal_of_int(n)), None -> Null }
+
+fn num(n: Int) -> Json = Number(decimal_of_int(n))
+
+fn strings(xs: List<String>) -> Json = Array(map(xs, |x: String| Str(x)))
+
+fn block(fields: List<Member>, key: String, value: Option<Json>) -> List<Member> =
+  match value { Some(j) -> push(fields, { key: key, value: j }), None -> fields }
+
+fn mapped<a>(value: Option<a>, f: (a) -> Json) -> Option<Json> =
+  match value { Some(v) -> Some(f(v)), None -> None }
+
+fn optional<a>(lines: List<String>, value: Option<a>, f: (a) -> List<String>) -> List<String> =
+  match value { Some(v) -> appended(lines, f(v)), None -> lines }
+
+// A fingerprint short enough to sit in the table beside the name it belongs to.
+fn abbreviate(fingerprint: String) -> String = {
+  let parts = string_split(fingerprint, ":");
+  let scheme = if len(parts) < 2 { "" } else { at(parts, 0, "") };
+  let rest = fold(range(1, len(parts)), [], |acc: List<String>, i: Int| push(acc, at(parts, i, "")));
+  let digits = if len(parts) < 2 { fingerprint } else { joined(rest, ":") };
+  let width = string_len(digits);
+  let kept = if width < 12 { width } else { 12 };
+  let short = string_slice(digits, 0, kept);
+  let elided = if width > 12 { "…" } else { "" };
+  if scheme == "" { short ++ elided } else { scheme ++ ":" ++ short ++ elided }
+}
+
+// --- The table --------------------------------------------------------------
+
+fn headers() -> List<String> = ["OPERATION", "HANDLER", "DET", "LINEAR", "BLOCKING", "SECRETS"]
+
+fn cells(r: Row) -> List<String> =
+  [r.triple, r.handler, yes_no(r.deterministic), linear_text(r.linear), yes_no(r.blocking),
+   yes_no(r.secrets)]
+
+fn widths(rows: List<List<String>>) -> List<Int> =
+  fold(rows, map(headers(), |h: String| string_len(h)), |acc: List<Int>, cs: List<String>|
+    map(range(0, len(acc)), |i: Int| wider(at(acc, i, 0), string_len(at(cs, i, "")))))
+
+// Every column but the last is padded; the last ends where its text does.
+fn ruled(ws: List<Int>, cs: List<String>) -> String =
+  fold(range(0, len(cs)), "", |acc: String, i: Int|
+    if i + 1 == len(cs) { acc ++ at(cs, i, "") }
+    else { acc ++ padded(at(cs, i, ""), at(ws, i, 0)) ++ "  " })
+
+fn table(rows: List<Row>) -> List<String> = {
+  let laid = map(rows, cells);
+  let ws = widths(laid);
+  fold(laid, [ruled(ws, headers())], |acc: List<String>, cs: List<String>| push(acc, ruled(ws, cs)))
+}
+
+// Why a bound listing has no rows.
+fn empty_note(handlers: Int) -> String =
+  if handlers == 0 { "no host handler is compiled into this binary" }
+  else { count_of(handlers, "handler") ++ " registered, and none serves an atom this program performs" }
+
+// --- The blocks under the table ---------------------------------------------
+
+fn transport_lines(t: Transport) -> List<String> = {
+  let head =
+    ["", "transport",
+     "tls  " ++ t.library ++ " " ++ t.version ++ " · provider " ++ t.provider ++ " · "
+       ++ joined(t.versions, ", ") ++ " · alpn " ++ joined(t.alpn, ", "),
+     "roots  " ++ t.roots ++ " " ++ t.roots_version ++ " · " ++ int_to_string(t.trusted)
+       ++ " trusted by `--trust`",
+     "", "credentials"];
+  if len(t.credentials) == 0 {
+    push(head, "none — `net.listen_tls` is E0429 until `--tls NAME=CERT,KEY` names one")
+  } else {
+    let width = fold(t.credentials, 0, |acc: Int, c: Credential| wider(acc, string_len(c.name)));
+    fold(t.credentials, head, |acc: List<String>, c: Credential|
+      push(acc, padded(c.name, width) ++ "  " ++ abbreviate(c.fingerprint) ++ "  "
+                ++ count_of(c.certificates, "certificate")))
+  }
+}
+
+fn filesystem_lines(f: Filesystem) -> List<String> =
+  if len(f.roots) == 0 {
+    ["", "filesystem", "none — an `fs` operation is E0451 until `--fs NAME=PATH` binds its label"]
+  } else {
+    let width = fold(f.roots, 0, |acc: Int, r: Root| wider(acc, string_len(r.name)));
+    fold(f.roots, ["", "filesystem"], |acc: List<String>, r: Root|
+      push(acc, padded(r.name, width) ++ "  " ++ r.path))
+  }
+
+fn configured_by(d: Database) -> String = match d.source { Some(s) -> s, None -> "" }
+
+fn server_line(d: Database) -> String =
+  match d.server {
+    Some(f) -> f.version ++ " · database " ++ f.database ++ " · collation " ++ f.collation
+               ++ " · encoding " ++ f.encoding,
+    None ->
+      match d.url {
+        Some(url) -> url ++ " · not connected · configured by " ++ configured_by(d),
+        None -> "none — `--db` is unset, so a `db` operation is E0431 under `--host`",
+      },
+  }
+
+fn pool_line(d: Database) -> String =
+  match d.pool {
+    None -> "none",
+    Some(p) ->
+      count_of(p.connections, "connection") ++ " · acquire " ++ int_to_string(p.acquire_ms)
+      ++ "ms · statement " ++ int_to_string(p.statement_ms) ++ "ms · idle-txn "
+      ++ int_to_string(p.idle_txn_ms) ++ "ms · connect " ++ int_to_string(p.connect_ms)
+      ++ "ms · statements " ++ int_to_string(p.statement_cache),
+  }
+
+fn or_zero(n: Option<Int>) -> Int = match n { Some(v) -> v, None -> 0 }
+
+fn db_schema_line(d: Database) -> String =
+  match d.schema {
+    None -> "none — without `--db-schema` a mismatch is E0433 at prepare time",
+    Some(v) ->
+      match v.tables {
+        None -> v.function ++ " · " ++ v.state,
+        Some(tables) ->
+          v.function ++ " · " ++ count_of(tables, "table") ++ " · "
+          ++ count_of(or_zero(v.columns), "column") ++ " · " ++ v.state,
+      },
+  }
+
+fn database_lines(d: Database) -> List<String> =
+  ["", "database",
+   "server     " ++ server_line(d),
+   "pool       " ++ pool_line(d),
+   "scanner    " ++ d.scanner ++ " · " ++ joined(d.accepts, " "),
+   "schema     " ++ db_schema_line(d)]
+
+fn config_schema_line(c: Configuration) -> String =
+  match c.schema {
+    None -> "schema     none — without `--config-schema` a missing key is a `None` at the call site, later and per key",
+    Some(v) ->
+      "schema     " ++ v.function ++ " · " ++ count_of(len(v.keys), "key") ++ " · "
+      ++ int_to_string(c.resolved) ++ " resolved · " ++ int_to_string(c.secret) ++ " secret",
+  }
+
+fn configuration_lines(c: Configuration) -> List<String> = {
+  let head =
+    ["", "configuration",
+     "sources    --set " ++ int_to_string(c.sets) ++ " · --config " ++ count_of(len(c.files), "file")
+       ++ " · environment " ++ int_to_string(c.environment) ++ " · defaults "
+       ++ int_to_string(c.defaults),
+     config_schema_line(c)];
+  if c.resolved == 0 { head } else {
+    let keys = map(c.keys, |k: Key| k.name ++ "=" ++ k.value ++ " (" ++ k.source ++ ")");
+    push(head, "keys       " ++ joined(keys, " · "))
+  }
+}
+
+fn level_suffix(o: Observability) -> String =
+  match o.level { Some(l) -> " · level " ++ l, None -> "" }
+
+fn observability_lines(o: Observability) -> List<String> =
+  ["", "observability",
+   "sink       " ++ o.sink ++ " → " ++ o.destination ++ level_suffix(o),
+   "channels   " ++ joined(o.channels, " "),
+   "spans      per-task stack · closed at end_entry_point"]
+
+fn shutdown_lines(t: Stopping) -> List<String> =
+  ["", "shutdown",
+   "signals    " ++ joined(t.signals, " ") ++ " · lead " ++ int_to_string(t.lead_ms)
+   ++ "ms · drain " ++ int_to_string(t.drain_ms) ++ "ms · second signal exits 130/143"]
+
+fn disclosure_lines(p: Preview) -> List<String> = {
+  let after_transport = optional([], p.transport, transport_lines);
+  let after_fs = optional(after_transport, p.filesystem, filesystem_lines);
+  let after_db = optional(after_fs, p.database, database_lines);
+  let after_config = optional(after_db, p.configuration, configuration_lines);
+  let after_trace = optional(after_config, p.observability, observability_lines);
+  optional(after_trace, p.shutdown, shutdown_lines)
+}
+
+// --- The two listings -------------------------------------------------------
+
+fn listing_lines(p: Preview) -> List<String> = {
+  let head = [count_of(p.handlers, "host handler") ++ " · " ++ count_of(len(p.rows), "operation")
+              ++ " · trusted computing base", ""];
+  let body = if len(p.rows) == 0 { push(head, empty_note(p.handlers)) } else { appended(head, table(p.rows)) };
+  push(push(appended(body, disclosure_lines(p)), ""), "digest: " ++ p.digest)
+}
+
+fn would_bind(p: Preview) -> String =
+  if len(p.rows) == 0 { empty_note(p.handlers) }
+  else {
+    count_of(len(p.rows), "operation") ++ " would bind under `--host`; run `ply hosts --host` to list them"
+  }
+
+fn hermetic_lines(p: Preview) -> List<String> =
+  ["hermetic — no host handler is bound", "", would_bind(p)]
+
+// --- The JSON ---------------------------------------------------------------
+
+fn row_json(r: Row) -> Json =
+  object([{ key: "effect", value: Str(r.effect) },
+          { key: "operation", value: Str(r.op) },
+          { key: "resource", value: opt_str(r.resource) },
+          { key: "triple", value: Str(r.triple) },
+          { key: "handler", value: Str(r.handler) },
+          { key: "deterministic", value: Bool(r.deterministic) },
+          { key: "linearity", value: Str(linear_json(r.linear)) },
+          { key: "blocking", value: Bool(r.blocking) },
+          { key: "secrets", value: Bool(r.secrets) },
+          { key: "declared_nondet", value: Bool(r.declared_nondet) }])
+
+fn transport_json(t: Transport) -> Json =
+  object([{ key: "library", value: Str(t.library) },
+          { key: "version", value: Str(t.version) },
+          { key: "provider", value: Str(t.provider) },
+          { key: "versions", value: strings(t.versions) },
+          { key: "alpn", value: strings(t.alpn) },
+          { key: "roots", value: object([{ key: "library", value: Str(t.roots) },
+                                         { key: "version", value: Str(t.roots_version) },
+                                         { key: "trusted", value: num(t.trusted) }]) },
+          { key: "credentials",
+            value: Array(map(t.credentials, |c: Credential|
+              object([{ key: "name", value: Str(c.name) },
+                      { key: "fingerprint", value: Str(c.fingerprint) },
+                      { key: "certificates", value: num(c.certificates) }]))) }])
+
+fn filesystem_json(f: Filesystem) -> Json =
+  object([{ key: "roots", value: Array(map(f.roots, |r: Root|
+            object([{ key: "name", value: Str(r.name) }, { key: "path", value: Str(r.path) }]))) }])
+
+fn pool_json(p: Option<Pool>) -> Json =
+  match p {
+    None -> Null,
+    Some(v) ->
+      object([{ key: "connections", value: num(v.connections) },
+              { key: "acquire_ms", value: num(v.acquire_ms) },
+              { key: "statement_ms", value: num(v.statement_ms) },
+              { key: "idle_txn_ms", value: num(v.idle_txn_ms) },
+              { key: "connect_ms", value: num(v.connect_ms) },
+              { key: "statement_cache", value: num(v.statement_cache) }]),
+  }
+
+fn server_json(s: Option<Server>) -> Json =
+  match s {
+    None -> Null,
+    Some(v) ->
+      object([{ key: "version", value: Str(v.version) },
+              { key: "database", value: Str(v.database) },
+              { key: "collation", value: Str(v.collation) },
+              { key: "encoding", value: Str(v.encoding) }]),
+  }
+
+fn db_schema_json(s: Option<DbSchema>) -> Json =
+  match s {
+    None -> Null,
+    Some(v) ->
+      object([{ key: "function", value: Str(v.function) },
+              { key: "tables", value: opt_int(v.tables) },
+              { key: "columns", value: opt_int(v.columns) },
+              { key: "state", value: Str(v.state) }]),
+  }
+
+fn database_json(d: Database) -> Json =
+  object([{ key: "live", value: Bool(d.live) },
+          { key: "operations", value: strings(d.operations) },
+          { key: "url", value: opt_str(d.url) },
+          { key: "source", value: opt_str(d.source) },
+          { key: "pool", value: pool_json(d.pool) },
+          { key: "scanner", value: object([{ key: "handler", value: Str(d.scanner) },
+                                           { key: "accepts", value: strings(d.accepts) }]) },
+          { key: "server", value: server_json(d.server) },
+          { key: "schema", value: db_schema_json(d.schema) }])
+
+fn config_schema_json(s: Option<ConfigSchema>) -> Json =
+  match s {
+    None -> Null,
+    Some(v) ->
+      object([{ key: "function", value: Str(v.function) },
+              { key: "keys", value: Array(map(v.keys, |k: KeyShape|
+                  object([{ key: "name", value: Str(k.name) },
+                          { key: "shape", value: Str(k.shape) }]))) }]),
+  }
+
+fn configuration_json(c: Configuration) -> Json =
+  object([{ key: "sources", value: object([{ key: "set", value: num(c.sets) },
+                                           { key: "files", value: strings(c.files) },
+                                           { key: "environment", value: num(c.environment) }]) },
+          { key: "schema", value: config_schema_json(c.schema) },
+          { key: "resolved", value: num(c.resolved) },
+          { key: "secret", value: num(c.secret) },
+          { key: "keys", value: Array(map(c.keys, |k: Key|
+              object([{ key: "name", value: Str(k.name) },
+                      { key: "value", value: Str(k.value) },
+                      { key: "source", value: Str(k.source) },
+                      { key: "secret", value: Bool(k.secret) }]))) }])
+
+fn observability_json(o: Observability) -> Json =
+  object([{ key: "sink", value: Str(o.sink) },
+          { key: "destination", value: Str(o.destination) },
+          { key: "level", value: opt_str(o.level) },
+          { key: "channels", value: strings(o.channels) }])
+
+fn shutdown_json(t: Stopping) -> Json =
+  object([{ key: "signals", value: strings(t.signals) },
+          { key: "lead_ms", value: num(t.lead_ms) },
+          { key: "drain_ms", value: num(t.drain_ms) }])
+
+fn report_json(p: Preview, b: Binding) -> Json = {
+  let head: List<Member> =
+    [{ key: "command", value: Str("hosts") },
+     { key: "schema_version", value: num(schema_version()) },
+     { key: "ok", value: Bool(true) },
+     { key: "exit_code", value: num(ok_code()) },
+     { key: "root", value: Str(p.root) },
+     { key: "binding", value: Str(b.label) },
+     { key: "handlers", value: num(p.handlers) },
+     { key: "operations", value: num(len(p.rows)) },
+     { key: "digest", value: Str(p.digest) },
+     { key: "hosts", value: Array(map(p.rows, row_json)) }];
+  let after_transport = block(head, "transport", mapped(p.transport, transport_json));
+  let after_fs = block(after_transport, "filesystem", mapped(p.filesystem, filesystem_json));
+  let after_db = block(after_fs, "database", mapped(p.database, database_json));
+  let after_config = block(after_db, "configuration", mapped(p.configuration, configuration_json));
+  let after_trace = block(after_config, "observability", mapped(p.observability, observability_json));
+  let stopping = block(after_trace, "shutdown", mapped(p.shutdown, shutdown_json));
+  object(push(stopping, { key: "diagnostics", value: all_to_json(p.diags, p.places) }))
+}
+
+// --- The three refusals -----------------------------------------------------
+
+// A registration that does not resolve against the program: nothing bound and nothing ran.
+fn unresolved(s: Style, p: Preview) -> Answer =
+  { json: object([{ key: "command", value: Str("hosts") },
+                  { key: "schema_version", value: num(schema_version()) },
+                  { key: "ok", value: Bool(false) },
+                  { key: "exit_code", value: num(compile_error()) },
+                  { key: "root", value: Str(p.root) },
+                  { key: "diagnostics", value: all_to_json(p.diags, p.places) }]),
+    lines: [],
+    errs: all_to_text(s, p.diags, p.places),
+    code: compile_error() }
+
+// A facility the flags named that could not be opened: the same, with the tally under it.
+fn unbound(s: Style, p: Preview) -> Answer = {
+  let tally = ind() ++ red(s, "no host handler was bound") ++ " ("
+              ++ count_of(len(p.diags), "error") ++ ")";
+  { json: object([{ key: "command", value: Str("hosts") },
+                  { key: "ok", value: Bool(false) },
+                  { key: "exit_code", value: num(compile_error()) },
+                  { key: "binding", value: Str("host") },
+                  { key: "diagnostics", value: all_to_json(p.diags, p.places) }]),
+    lines: [],
+    errs: push(all_to_text(s, p.diags, p.places), tally),
+    code: compile_error() }
+}
+
+// --- The command ------------------------------------------------------------
+
+fn indented(lines: List<String>) -> List<String> =
+  map(lines, |l: String| if l == "" { "" } else { ind() ++ l })
+
+// The listing opens on a blank line, as every other report does.
+fn text_lines(p: Preview, b: Binding) -> List<String> = {
+  let body = if b.hermetic { hermetic_lines(p) } else { listing_lines(p) };
+  appended([""], indented(body))
+}
+
+// `--digest` is the one line a CI check pins: not the listing, and not the warnings under it.
+fn answered(s: Style, flags: Flags, p: Preview, b: Binding) -> Answer = {
+  let lines = if flags.digest { [p.digest] } else { text_lines(p, b) };
+  let errs = if flags.digest { [] } else { all_to_text(s, p.diags, p.places) };
+  { json: report_json(p, b), lines: lines, errs: errs, code: ok_code() }
+}
+
+pub fn run(flags: Flags) -> Answer / {tcb.preview[host], tcb.open[host]} = {
+  let p: Preview = tcb.preview[host]();
+  let s: Style = style_of(flags);
+  match p.stage {
+    NotLoaded -> refused(s, "hosts", p.diags, p.places),
+    NotResolved -> unresolved(s, p),
+    NotBound -> unbound(s, p),
+    Bound -> answered(s, flags, p, tcb.open[host]()),
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_row(triple: String, handler: String, linear: Bool, blocking: Bool) -> Row =
+  { effect: "db", op: "get", resource: Some("users"), triple: triple, handler: handler,
+    deterministic: false, linear: linear, blocking: blocking, secrets: false, declared_nondet: true }
+
+fn nothing() -> Preview =
+  { stage: Bound, root: "/p", handlers: 0, rows: [], digest: "b3:000000000000",
+    transport: None, filesystem: None, database: None, configuration: None, observability: None,
+    shutdown: None, diags: [], places: [] }
+
+fn listed() -> Preview =
+  {..nothing(),
+   handlers: 3,
+   rows: [a_row("clock.now", "ply_host::clock::now", false, false),
+          a_row("db.get[orders]", "ply_host::postgres::read", true, true),
+          a_row("db.get[users]", "ply_host::postgres::read", true, true),
+          a_row("db.put[orders]", "ply_host::postgres::write", true, true)],
+   digest: "b3:1f2e3d4c5b6a"}
+
+fn hermetic() -> Binding = { label: "hermetic", hermetic: true }
+
+fn bound() -> Binding = { label: "host", hermetic: false }
+
+fn flags_of(json: Bool, digest: Bool) -> Flags =
+  {..no_flags(), json: json, digest: digest}
+
+fn first(lines: List<String>, n: Int) -> List<String> =
+  fold(range(0, n), [], |acc: List<String>, i: Int| push(acc, at(lines, i, "")))
+
+test "the table is exactly the shape the contract specifies" {
+  let lines = listing_lines(listed());
+  assert_eq(joined(first(lines, len(lines) - 2), "\n"),
+            "3 host handlers · 4 operations · trusted computing base\n" ++
+            "\n" ++
+            "OPERATION       HANDLER                    DET  LINEAR        BLOCKING  SECRETS\n" ++
+            "clock.now       ply_host::clock::now       no   repeatable    no        no\n" ++
+            "db.get[orders]  ply_host::postgres::read   no   at-most-once  yes       no\n" ++
+            "db.get[users]   ply_host::postgres::read   no   at-most-once  yes       no\n" ++
+            "db.put[orders]  ply_host::postgres::write  no   at-most-once  yes       no");
+  assert_eq(at(lines, len(lines) - 1, ""), "digest: b3:1f2e3d4c5b6a")
+}
+
+test "an empty listing says it is empty rather than printing nothing" {
+  assert(string_contains(joined(listing_lines(nothing()), "\n"),
+                         "no host handler is compiled into this binary"));
+  let idle: Preview = {..nothing(), handlers: 2};
+  assert_eq(at(hermetic_lines(idle), 2, ""),
+            "2 handlers registered, and none serves an atom this program performs")
+}
+
+test "hermetic says so and still reports what would bind" {
+  let lines = hermetic_lines(listed());
+  assert_eq(at(lines, 0, ""), "hermetic — no host handler is bound");
+  assert_eq(at(lines, 1, "?"), "");
+  assert_eq(at(lines, 2, ""),
+            "4 operations would bind under `--host`; run `ply hosts --host` to list them")
+}
+
+test "a fingerprint is abbreviated for the table and never for the object" {
+  assert_eq(abbreviate("sha256:9f2c1a4e8b03c7d5e6f70819a2b3c4d5"), "sha256:9f2c1a4e8b03…");
+  assert_eq(abbreviate("sha256:9f2c"), "sha256:9f2c");
+  assert_eq(abbreviate("9f2c1a4e8b03c7d5"), "9f2c1a4e8b03…")
+}
+
+test "a program that can listen over TLS discloses the stack by name" {
+  let t: Transport =
+    { library: "rustls", version: "0.23.43", provider: "ring", versions: ["TLS 1.3", "TLS 1.2"],
+      alpn: ["http/1.1"], roots: "webpki-roots", roots_version: "1.0.9", trusted: 0,
+      credentials: [] };
+  assert_eq(transport_lines(t),
+            ["", "transport",
+             "tls  rustls 0.23.43 · provider ring · TLS 1.3, TLS 1.2 · alpn http/1.1",
+             "roots  webpki-roots 1.0.9 · 0 trusted by `--trust`",
+             "", "credentials",
+             "none — `net.listen_tls` is E0429 until `--tls NAME=CERT,KEY` names one"]);
+  let named: Transport =
+    {..t, credentials: [{ name: "api", fingerprint: "sha256:9f2c1a4e8b03c7d5e6f70819a2b3c4d5",
+                          certificates: 2 }]};
+  assert_eq(at(transport_lines(named), 6, ""), "api  sha256:9f2c1a4e8b03…  2 certificates")
+}
+
+test "an unbound root is named rather than silently absent" {
+  assert_eq(filesystem_lines({ roots: [] }),
+            ["", "filesystem",
+             "none — an `fs` operation is E0451 until `--fs NAME=PATH` binds its label"]);
+  assert_eq(filesystem_lines({ roots: [{ name: "src", path: "/p/crates" },
+                                       { name: "tmp", path: "/p/t" }] }),
+            ["", "filesystem", "src  /p/crates", "tmp  /p/t"])
+}
+
+test "a configured database is reported by its redacted URL and its pool" {
+  let d: Database =
+    { live: true, operations: ["db.get[users]"],
+      url: Some("postgres://ply:****@127.0.0.1:5433/desk"), source: Some("--db"),
+      pool: Some({ connections: 8, acquire_ms: 5000, statement_ms: 30000, idle_txn_ms: 10000,
+                   connect_ms: 5000, statement_cache: 256 }),
+      scanner: "ply_host::db::scan", accepts: ["select", "insert"], server: None, schema: None };
+  let lines = database_lines(d);
+  assert_eq(at(lines, 2, ""),
+            "server     postgres://ply:****@127.0.0.1:5433/desk · not connected · configured by --db");
+  assert_eq(at(lines, 3, ""),
+            "pool       8 connections · acquire 5000ms · statement 30000ms · idle-txn 10000ms · connect 5000ms · statements 256");
+  assert_eq(at(lines, 4, ""), "scanner    ply_host::db::scan · select insert");
+  assert(string_contains(at(lines, 5, ""), "without `--db-schema`"));
+  let described = {..d, schema: Some({ function: "desk.schema", tables: Some(1), columns: Some(4),
+                                       state: "declared" })};
+  assert_eq(at(database_lines(described), 5, ""),
+            "schema     desk.schema · 1 table · 4 columns · declared")
+}
+
+// Server facts come only from a live connection, and they win over the URL the flags named.
+test "a connected database is named by what the server said" {
+  let d: Database =
+    { live: true, operations: ["db.query[items]"], url: Some("postgres://ply:****@h:5433/desk"),
+      source: Some("--db"), pool: None, scanner: "ply_host::db::scan", accepts: ["select"],
+      server: Some({ version: "PostgreSQL 18.3", database: "desk", collation: "C",
+                     encoding: "UTF8" }),
+      schema: Some({ function: "desk.schema", tables: Some(2), columns: Some(11),
+                     state: "verified" }) };
+  let lines = database_lines(d);
+  assert_eq(at(lines, 2, ""),
+            "server     PostgreSQL 18.3 · database desk · collation C · encoding UTF8");
+  assert_eq(at(lines, 3, ""), "pool       none");
+  assert_eq(at(lines, 5, ""), "schema     desk.schema · 2 tables · 11 columns · verified")
+}
+
+test "a database nothing configured says what that costs under `--host`" {
+  assert_eq(at(database_lines({ live: false, operations: ["db.query[items]"], url: None,
+                                source: None, pool: None, scanner: "ply_host::db::scan",
+                                accepts: ["select"], server: None, schema: None }), 2, ""),
+            "server     none — `--db` is unset, so a `db` operation is E0431 under `--host`")
+}
+
+test "a sink that discards names no level" {
+  assert_eq(observability_lines({ sink: "ply_host::trace::discard", destination: "nothing",
+                                  level: None, channels: ["app"] }),
+            ["", "observability",
+             "sink       ply_host::trace::discard → nothing",
+             "channels   app",
+             "spans      per-task stack · closed at end_entry_point"]);
+  assert_eq(at(observability_lines({ sink: "ply_host::trace::json", destination: "stderr",
+                                     level: Some("info"), channels: ["app", "db"] }), 2, ""),
+            "sink       ply_host::trace::json → stderr · level info")
+}
+
+test "the shutdown block says what a second signal does" {
+  assert_eq(at(shutdown_lines({ signals: ["SIGINT", "SIGTERM"], lead_ms: 250, drain_ms: 15000 }), 2, ""),
+            "signals    SIGINT SIGTERM · lead 250ms · drain 15000ms · second signal exits 130/143")
+}
+
+test "the configuration block counts its sources and never prints a secret's value" {
+  let c: Configuration =
+    { sets: 1, files: ["deploy.env"], environment: 40, defaults: 1,
+      schema: Some({ function: "desk.config", keys: [{ name: "port", shape: "SInt" },
+                                                     { name: "token", shape: "SSecret" }] }),
+      resolved: 2, secret: 1,
+      keys: [{ name: "port", value: "8137", source: "--set", secret: false },
+             { name: "token", value: "****", source: "deploy.env", secret: true }] };
+  let lines = configuration_lines(c);
+  assert_eq(at(lines, 2, ""), "sources    --set 1 · --config 1 file · environment 40 · defaults 1");
+  assert_eq(at(lines, 3, ""), "schema     desk.config · 2 keys · 2 resolved · 1 secret");
+  assert_eq(at(lines, 4, ""), "keys       port=8137 (--set) · token=**** (deploy.env)");
+  assert(!string_contains(joined(lines, "\n"), "hunter2"))
+}
+
+// The run's own answer, over a binding the test hands it in place of the Rust side.
+fn answered_over(p: Preview, b: Binding, flags: Flags) -> Answer =
+  handle {
+    run(flags)
+  } with {
+    tcb.preview[host]() -> p,
+    tcb.open[host]() -> b,
+  }
+
+test "the listing opens on a blank line and every other line is indented" {
+  let answer = answered_over(listed(), bound(), flags_of(false, false));
+  assert_eq(answer.code, 0);
+  assert_eq(at(answer.lines, 0, "?"), "");
+  assert_eq(at(answer.lines, 1, ""),
+            ind() ++ "3 host handlers · 4 operations · trusted computing base");
+  assert_eq(at(answer.lines, 2, "?"), "");
+  assert_eq(at(answer.lines, len(answer.lines) - 1, ""), ind() ++ "digest: b3:1f2e3d4c5b6a")
+}
+
+test "`--digest` writes the one line a CI check pins and nothing else" {
+  let answer = answered_over(listed(), bound(), flags_of(false, true));
+  assert_eq(answer.lines, ["b3:1f2e3d4c5b6a"]);
+  assert_eq(answer.errs, []);
+  assert_eq(answer.code, 0)
+}
+
+test "a hermetic run lists nothing and says what would bind" {
+  let answer = answered_over(listed(), hermetic(), flags_of(false, false));
+  assert_eq(at(answer.lines, 1, ""), ind() ++ "hermetic — no host handler is bound");
+  assert_eq(len(answer.lines), 4)
+}
+
+test "the object keys off `command` and `exit_code`, and carries the rows and the binding" {
+  let text = to_string(answered_over(listed(), bound(), flags_of(true, false)).json);
+  assert(string_contains(text, "\"command\":\"hosts\""));
+  assert(string_contains(text, "\"exit_code\":0"));
+  assert(string_contains(text, "\"binding\":\"host\""));
+  assert(string_contains(text, "\"operations\":4"));
+  assert(string_contains(text, "\"handlers\":3"));
+  assert(string_contains(text, "\"linearity\":\"at_most_once\""));
+  assert(string_contains(text, "\"digest\":\"b3:1f2e3d4c5b6a\""))
+}
+
+test "a binding that could not be opened is exit 2 with the tally under it" {
+  let refusal: Diag = { code: b"E0454", notes: 0, labels: [], text: b"",
+                        message: b"`--fs src=./x` does not resolve", notes_text: [],
+                        severity: b"error", fixes: [] };
+  let refused: Preview = {..nothing(), stage: NotBound, diags: [refusal]};
+  let answer = answered_over(refused, bound(), flags_of(false, false));
+  assert_eq(answer.code, 2);
+  assert_eq(answer.lines, []);
+  assert_eq(answer.errs, ["Error[E0454]: `--fs src=./x` does not resolve",
+                          ind() ++ "no host handler was bound (1 error)"])
+}
+
+test "a registration that does not resolve is exit 2 with no tally" {
+  let refusal: Diag = { code: b"E0431", notes: 0, labels: [], text: b"",
+                        message: b"`db.get[users]` has no database", notes_text: [],
+                        severity: b"error", fixes: [] };
+  let refused: Preview = {..nothing(), stage: NotResolved, diags: [refusal]};
+  let answer = answered_over(refused, bound(), flags_of(false, false));
+  assert_eq(answer.code, 2);
+  assert_eq(answer.errs, ["Error[E0431]: `db.get[users]` has no database"])
+}
+
+test "a program that does not load is the load's own refusal" {
+  let broken: Diag = { code: b"E0201", notes: 0, labels: [], text: b"", message: b"type mismatch",
+                       notes_text: [], severity: b"error", fixes: [] };
+  let unloadable: Preview = {..nothing(), stage: NotLoaded, diags: [broken]};
+  let answer = answered_over(unloadable, bound(), flags_of(false, false));
+  assert_eq(answer.code, 2);
+  assert_eq(answer.errs, ["Error[E0201]: type mismatch", ind() ++ "compilation failed (1 error)"])
+}
