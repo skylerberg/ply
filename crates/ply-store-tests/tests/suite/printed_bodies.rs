@@ -740,14 +740,16 @@ fn one_body_named_twice_within_a_group_is_refused() {
 
 #[test]
 fn one_effect_declaration_named_twice_is_refused() {
+    // An effect is nominal in its simple name and not in its module path, so it takes the same name
+    // in two modules to make one declaration that two names claim.
     let original = compile(&[
         ("a", "pub effect one { read at() -> Int }"),
-        ("b", "pub effect two { read at() -> Int }"),
+        ("b", "pub effect one { read at() -> Int }"),
     ]);
     let names = names_of(&original);
     let refused = print(&original.bodies, &names, &[]).expect_err("two names for one declaration");
     assert!(
-        refused.message.contains("`a.one`") && refused.message.contains("`b.two`"),
+        refused.message.contains("`a.one`") && refused.message.contains("`b.one`"),
         "{}",
         refused.message
     );
@@ -794,15 +796,30 @@ fn a_shipped_module_is_imported_and_not_printed() {
 
 #[test]
 fn two_identical_effect_declarations_are_one_hash() {
+    // Identical includes the name an effect is nominal in; the module path it is declared under is
+    // no part of its identity, so declaring it in two modules declares it once.
+    let original = compile(&[
+        ("a", "pub effect one { read at() -> Int }"),
+        ("b", "pub effect one { read at() -> Int }"),
+    ]);
+    let here = original.hashes.decls[&Symbol::new("a.one")];
+    let there = original.hashes.decls[&Symbol::new("b.one")];
+    assert_eq!(
+        here, there,
+        "two byte-identical declarations must hash alike, or content addressing is not what it says"
+    );
+}
+
+#[test]
+fn two_effects_that_differ_only_in_their_names_are_two_declarations() {
     let original = compile(&[
         ("a", "pub effect one { read at() -> Int }"),
         ("b", "pub effect two { read at() -> Int }"),
     ]);
-    let one = original.hashes.decls[&Symbol::new("a.one")];
-    let two = original.hashes.decls[&Symbol::new("b.two")];
-    assert_eq!(
-        one, two,
-        "two byte-identical declarations must hash alike, or content addressing is not what it says"
+    assert_ne!(
+        original.hashes.decls[&Symbol::new("a.one")],
+        original.hashes.decls[&Symbol::new("b.two")],
+        "an effect is the declaration its name declares, not a shape another declaration matches"
     );
 }
 
