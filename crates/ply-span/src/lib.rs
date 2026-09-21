@@ -234,7 +234,7 @@ pub mod codes {
     /// A row, or an `effect set` body, naming a set the module does not declare.
     pub const UNKNOWN_EFFECT_SET: &str = "E0114";
     pub const EFFECT_SET_CYCLE: &str = "E0115";
-    /// The base of a record update `{..b, f: e}` has no record shape this module can name.
+    /// The base of a record update `{..b, f: e}` is not a record, or its type is not known there.
     pub const RECORD_UPDATE_SHAPE: &str = "E0116";
     pub const RECORD_UPDATE_FIELD: &str = "E0117";
     /// A `?` whose enclosing function's return type is not readable as `Result` or `Option`.
@@ -271,7 +271,8 @@ pub mod codes {
     pub const ORPHAN_DERIVE: &str = "E0208";
     /// `/` applied to `Decimal`.
     pub const DECIMAL_DIVISION: &str = "E0209";
-    /// An arithmetic or ordered-comparison operand whose numeric type nothing determines.
+    /// An operand whose type nothing determines: an arithmetic or ordered-comparison numeric,
+    /// or the `String`-or-`Bytes` a `++` joins.
     pub const NUMERIC_UNDETERMINED: &str = "E0210";
     /// An integer literal outside the fixed-width type its context gave it.
     pub const LITERAL_OUT_OF_RANGE: &str = "E0211";
@@ -417,7 +418,7 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ("E0115", "`effect set` cycle"),
     (
         "E0116",
-        "record update base with no shape this file can name",
+        "record update base that is not a record of a known type",
     ),
     ("E0117", "record update naming a field the base lacks"),
     (
@@ -464,7 +465,7 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ("E0207", "unknown deriver"),
     ("E0208", "orphan `derive`"),
     ("E0209", "`/` on `Decimal`"),
-    ("E0210", "numeric operand type nothing determines"),
+    ("E0210", "operand type nothing determines"),
     ("E0211", "integer literal out of range for its fixed width"),
     ("E0301", "unbound row variable"),
     ("E0302", "effect not permitted by the written row"),

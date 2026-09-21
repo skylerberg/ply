@@ -1,6 +1,6 @@
 // The type checker: schemes, footprints and constraints for every definition, test, law, effect and constructor.
 
-import spine (Span, Ident, QName, span_to, dummy_span, num, push_front)
+import spine (Span, Ident, QName, span_to, dummy_span, num, span_key, push_front)
 import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead, MWrite, MBad, ty_span)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
@@ -31,7 +31,7 @@ import resolve (Mod, Source, Resolved, Scope, Binding, ModBind, Declared, Entry,
                 resolve_modules, Resolved_, Failed, Expanded, find, lookup, dlookup, space,
                 qualify, default_binder, dump_diags, diag, diag1, diag2, lab, is_bare,
                 is_ctor_name, backticked, ns_describe, private_name)
-import rewrite (expand)
+import rewrite (expand, expand_record_updates)
 import derive (Why, WFunction, WHandle, WFloatIsNotOrdered, WUnconstrained, WNullInsideOption, WSecret,
                ConShape, Leaf, Structural, Refused, Nominal, con_shape, null_encoded_name, Expansion, expand_derives,
                refusal_note, secret_reason, null_in_option_note)
@@ -63,6 +63,14 @@ type OpKey = { effect: Bytes, op: Bytes, res: Resource }
 type Numeric = { span: Span, op: Bytes, ty: Type }
 // A bit operator's or integer builtin's operand, kept until its type is known. `what` names the site in a diagnostic.
 type BitOp = { span: Span, what: Bytes, ty: Type }
+// The one type both sides of a `++` share, kept until the substitution has it: `String` and `Bytes` both join.
+type ConcatSite = { module: Int, span: Span, ty: Type }
+// A written field of `{..b, f: e}` with the type its value inferred to.
+type UpdField = { name: Bytes, span: Span, ty: Type }
+// An update whose base was still a variable where it was written; `result` is what the site answered.
+type UpdateSite = { module: Int, span: Span, base_span: Span, base: Type, written: List<UpdField>, result: Type }
+// What the lowering needs: the field list of the record an update copies, in the record's own order.
+pub type UpdateShape = { module: Int, span: Span, names: List<Bytes> }
 type Sig = { ty_params: Map<Bytes, Type>, row_params: Map<Bytes, Int>, label_params: Map<Bytes, Int>,
              fn_ty: Type, params: List<Type>,
              ret: Type, declared: Option<Row>, published_row: Row, scope: Int }
@@ -128,6 +136,9 @@ type Cx = {
   constraints: Map<Bytes, List<DefConstraint>>,
   numerics: List<Numeric>,
   bit_ops: List<BitOp>,
+  concats: List<ConcatSite>,
+  updates: List<UpdateSite>,
+  update_shapes: List<UpdateShape>,
   simulate_depth: Int,
   open_regions: List<OpenRegion>,
   regions: List<RegionSite>,
@@ -474,7 +485,7 @@ pub fn builtin_docs() -> List<BuiltinDoc> = [
   bdoc(b"bytes_at", [b"b", b"i"], b"`0..=255`; raises out of range"),
   bdoc(b"bytes_u32_le", [b"b", b"i"], b"four bytes at `i`, little-endian"),
   bdoc(b"bytes_slice", [b"b", b"start", b"end"], b"raises out of range"),
-  bdoc(b"bytes_concat", [b"a", b"b"], b""),
+  bdoc(b"bytes_concat", [b"a", b"b"], b"`a ++ b`"),
   bdoc(b"bytes_concat_all", [b"bs"], b"one allocation"),
   bdoc(b"bytes_of_string", [b"s"], b"UTF-8"),
   bdoc(b"bytes_is_utf8", [b"b"], b""),
@@ -1368,6 +1379,27 @@ fn bits_mismatch(cx: Cx, entry: BitOp, ty: Type) -> Cx = {
 
 fn bool_bits_note() -> Bytes = b"`Bool` has `&&`, `||` and `!`; the bit operators are integers only"
 
+// Both sides of a `++` are one type by then; which of the two joinable ones it is waits for `settle_concats`.
+fn settle_concats(cx: Cx) -> Cx = {
+  let entries = cx.concats;
+  fold(entries, {..cx, concats: []}, |c: Cx, entry: ConcatSite| {
+    let at_: Cx = {..c, module: entry.module};
+    let ty = resolve(at_, entry.ty);
+    let judged: Cx = match concat_name(ty) {
+      Some(_) -> at_,
+      None -> match ty {
+        TyVar(_) -> err1(at_, b"E0210", entry.span, b"the type of this `++` is not determined",
+                         b"nothing here says whether this joins `String`s or `Bytes`",
+                         [b"annotate an operand, or write a literal that pins it"]),
+        other -> err1(at_, b"E0201", entry.span,
+                      bytes_concat_all([b"`++` is not defined on `", type_text(other), b"`"]), b"joined here",
+                      [b"`++` joins two `String`s or two `Bytes`"]),
+      },
+    };
+    {..judged, module: c.module}
+  })
+}
+
 fn bind_all(cx: Cx, bindings: List<{ name: Bytes, ty: Type }>) -> Cx =
   fold(bindings, cx, |c: Cx, b: { name: Bytes, ty: Type }| {..c, env: env_bind(c.env, b.name, mono(b.ty))})
 
@@ -1436,7 +1468,7 @@ fn infer(cx: Cx, e: Expr) -> Inferred =
       });
       { cx: fs.cx, ty: TyRecord(fields_sorted(fs.fs)), row: fs.row }
     },
-    ERecordUpdate(r) -> panic("`{..b, f: e}` is expanded away before the checker runs"),
+    ERecordUpdate(r) -> infer_record_update(cx, r.span, r.base, r.fields),
     ETry(_) -> panic("`e?` is expanded away before the checker runs"),
     EField(f) -> {
       let b: Inferred = infer(cx, f.base);
@@ -1475,6 +1507,70 @@ fn infer(cx: Cx, e: Expr) -> Inferred =
     ESimulate(s) -> infer_simulate(cx, s.span, s.body),
   }
 
+// `{..b, f: e}` answers the base's own record type with the written fields replaced, and publishes the
+// base's field list for the lowering. A base whose type the substitution does not hold yet waits for
+// `settle_updates`, so a lambda parameter the callee only types later still has a shape.
+fn infer_record_update(cx: Cx, span: Span, base: Expr, written: List<RecField>) -> Inferred = {
+  let b: Inferred = infer(cx, base);
+  let fs = fold(written, { cx: b.cx, fs: [], row: b.row }, |acc: { cx: Cx, fs: List<UpdField>, row: Row }, f: RecField| {
+    let o: Inferred = infer(acc.cx, f.value);
+    let j: WithRow = join(o.cx, span, acc.row, o.row);
+    { cx: j.cx, fs: push(acc.fs, { name: f.name.name, span: f.name.span, ty: o.ty }), row: j.r }
+  });
+  let base_span = expr_span(base);
+  match resolve(fs.cx, b.ty) {
+    TyVar(_) -> {
+      let t: WithTy = new_ty(fs.cx);
+      let c: Cx = t.cx;
+      { cx: {..c, updates: push(c.updates, { module: c.module, span: span, base_span: base_span,
+                                             base: b.ty, written: fs.fs, result: t.t })},
+        ty: t.t, row: fs.row }
+    },
+    shape -> {
+      let o: WithTy = update_shape(fs.cx, span, base_span, shape, fs.fs);
+      { cx: o.cx, ty: o.t, row: fs.row }
+    },
+  }
+}
+
+// The type an update answers, and the field list the lowering copies from, once the base's type is known.
+fn update_shape(cx: Cx, span: Span, base_span: Span, base: Type, written: List<UpdField>) -> WithTy =
+  match base {
+    TyRecord(fs) -> {
+      let known = backticked(map(fs, |f: Field| f.name), b", ");
+      let checked: Cx = fold(written, cx, |c: Cx, w: UpdField|
+        match field_get(fs, w.name) {
+          Some(_) -> c,
+          None -> err2(c, b"E0117", w.span,
+                       bytes_concat_all([b"the record being updated has no field `", w.name, b"`"]),
+                       b"not a field of the base", here(c, base_span), b"this is the record being updated",
+                       [bytes_concat(b"an update replaces fields, it does not add them; available fields: ", known)]),
+        });
+      // A name the base lacks is reported, not added: the answer is the base's record either way.
+      let kept = filter(written, |w: UpdField| match field_get(fs, w.name) { Some(_) -> true, None -> false });
+      { cx: {..checked, update_shapes: push(checked.update_shapes,
+                                            { module: checked.module, span: span, names: map(fs, |f: Field| f.name) })},
+        t: TyRecord(fields_sorted(append(fs, map(kept, |w: UpdField| { name: w.name, ty: w.ty })))) }
+    },
+    TyVar(_) -> new_ty(err1(cx, b"E0116", base_span, b"the type of the record being updated is not known here",
+                            b"nothing here says which record this is",
+                            [b"annotate the binder, the lambda parameter or the function this call answers from"])),
+    other -> new_ty(err1(cx, b"E0116", base_span, b"the value being updated is not a record",
+                         bytes_concat_all([b"this has type `", type_text(other), b"`"]),
+                         [b"`{..b, f: e}` replaces fields of a record, and only a record has fields"])),
+  }
+
+// An update whose base was still a variable where it stood: the substitution is complete here.
+fn settle_updates(cx: Cx) -> Cx = {
+  let entries = cx.updates;
+  fold(entries, {..cx, updates: []}, |c: Cx, entry: UpdateSite| {
+    let at_: Cx = {..c, module: entry.module};
+    let o: WithTy = update_shape(at_, entry.span, entry.base_span, resolve(at_, entry.base), entry.written);
+    let unified: Cx = expect(o.cx, entry.span, entry.result, o.t, b"record update").cx;
+    {..unified, module: c.module}
+  })
+}
+
 fn infer_var(cx: Cx, q: QName) -> Inferred = {
   let k: WithKey = value_key(cx, q);
   match k.key {
@@ -1509,6 +1605,29 @@ fn is_arithmetic(op: Bytes) -> Bool = op == b"add" || op == b"sub" || op == b"mu
 fn is_ordered(op: Bytes) -> Bool = op == b"lt" || op == b"le" || op == b"gt" || op == b"ge"
 fn is_bits(op: Bytes) -> Bool = op == b"bitand" || op == b"bitor" || op == b"bitxor" || op == b"shl" || op == b"shr" || op == b"ushr"
 
+// The two types `++` joins, when the substitution already says which one this is.
+fn concat_name(t: Type) -> Option<Bytes> =
+  match t {
+    TyCon(k) -> if len(k.args) == 0 && (k.name == b"String" || k.name == b"Bytes") { Some(k.name) } else { None },
+    _ -> None,
+  }
+
+// `String ++ Bytes` names both sides rather than reporting one against the other; there is no coercion.
+fn mixed_concat(cx: Cx, lspan: Span, lt: Type, rspan: Span, rt: Type) -> Option<Cx> =
+  match concat_name(lt) {
+    None -> None,
+    Some(ln) -> match concat_name(rt) {
+      None -> None,
+      Some(rn) ->
+        if ln == rn { None } else {
+          Some(err_labels(cx, b"E0201", bytes_concat_all([b"`++` cannot join `", ln, b"` and `", rn, b"`"]),
+                          [lab(cx.module, lspan, true, bytes_concat_all([b"this is a `", ln, b"`"])),
+                           lab(cx.module, rspan, false, bytes_concat_all([b"this is a `", rn, b"`"]))],
+                          [b"there is no coercion between them: `bytes_of_string` and `string_of_bytes` cross"]))
+        },
+    },
+  }
+
 fn infer_binary(cx: Cx, span: Span, op: Bytes, lhs: Expr, rhs: Expr) -> Inferred = {
   let l: Inferred = infer(cx, lhs);
   let r: Inferred = infer(l.cx, rhs);
@@ -1537,9 +1656,14 @@ fn infer_binary(cx: Cx, span: Span, op: Bytes, lhs: Expr, rhs: Expr) -> Inferred
     let c2: Cx = expect(c1, expr_span(rhs), t_bool(), r.ty, b"right operand").cx;
     { cx: c2, ty: t_bool(), row: j.r }
   } else if op == b"concat" {
-    let c1: Cx = expect(c, expr_span(lhs), t_string(), l.ty, b"left operand").cx;
-    let c2: Cx = expect(c1, expr_span(rhs), t_string(), r.ty, b"right operand").cx;
-    { cx: c2, ty: t_string(), row: j.r }
+    match mixed_concat(c, expr_span(lhs), resolve(c, l.ty), expr_span(rhs), resolve(c, r.ty)) {
+      Some(reported) -> { cx: reported, ty: l.ty, row: j.r },
+      None -> {
+        let x: Expected = expect(c, expr_span(rhs), l.ty, r.ty, b"both operands of `++` have one type");
+        let noted: Cx = if x.ok { {..x.cx, concats: push(x.cx.concats, { module: x.cx.module, span: span, ty: l.ty })} } else { x.cx };
+        { cx: noted, ty: l.ty, row: j.r }
+      },
+    }
   } else {
     let c1: Cx = expect(c, expr_span(rhs), l.ty, r.ty, b"both sides of a comparison must have one type").cx;
     { cx: {..c1, comparisons: push(c1.comparisons, { module: c1.module, span: span, ty: l.ty })}, ty: t_bool(), row: j.r }
@@ -2679,7 +2803,7 @@ fn check_component_walked(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>, qua
     let walked: Cx = {..o.cx, derived: None};
     { cx: record_spec_env(walked, def, at(qualified, slot), sig), rows: push(acc.rows, o.row) }
   });
-  let settled: Cx = settle_bit_ops(settle_numerics({..bodies.cx, group_labels: []}));
+  let settled: Cx = settle_bit_ops(settle_numerics(settle_concats(settle_updates({..bodies.cx, group_labels: []}))));
   let required: Cx = fold(range(0, len(comp)), settled, |c: Cx, slot: Int| require_written_signature(c, at(fns, at(comp, slot)), at(sigs.sigs, slot)));
   let closed: Cx = fold(sigs.sigs, required, |c: Cx, s: Sig| close_unreachable_row(c, s));
   let removed: Cx = fold(qualified, closed, |c: Cx, name: Bytes| {..c, env: env_remove_global(c.env, name)});
@@ -3771,7 +3895,8 @@ fn fresh_cx(r: Resolved, mods: List<Mod>, known: Known) -> Cx =
                     defs: [], def_index: map_new(), tests: [], laws: [], ty_params: map_new(), row_params: map_new(),
                     label_params: map_new(), label_apps: [], label_sites: [], group_labels: [],
                     auto_ty_params: false, alias_stack: [], refused_atoms: [], performs: [], declared_atoms: [], comparisons: [], scope: 0,
-                    constraints: map_new(), numerics: [], bit_ops: [], simulate_depth: 0, open_regions: [], regions: [], simulations: [],
+                    constraints: map_new(), numerics: [], bit_ops: [], concats: [], updates: [], update_shapes: [],
+                    simulate_depth: 0, open_regions: [], regions: [], simulations: [],
                     map_keys: [], constrained_uses: [], spec_kind: None, spec_envs: [], derived: None, known: known, assumed: [] })
 
 type Checked = { cx: Cx, ok: Bool }
@@ -3796,17 +3921,37 @@ pub fn check_front(r: Resolved, mods: List<Mod>) -> Front = {
 }
 
 // What the emitter needs from the checker: the definitions published as pure (empty footprint, no
-// constraint), for its constant table, and the labels every call fills. `None` if the program fails.
-pub type EmitFacts = { pure: List<Bytes>, label_sites: List<LabelSite> }
+// constraint), for its constant table, the labels every call fills, and the shape of every record
+// update. `None` if the program fails.
+pub type EmitFacts = { pure: List<Bytes>, label_sites: List<LabelSite>, updates: List<UpdateShape> }
 
 pub fn emit_facts(r: Resolved, mods: List<Mod>) -> Option<EmitFacts> = {
   let out = check_program(r, mods);
   if !out.ok { None } else {
     Some({ pure: fold(out.cx.defs, [], |acc: List<Bytes>, d: DefInfo|
              if len(d.footprint) == 0 && len(d.constraints) == 0 { push(acc, d.name) } else { acc }),
-           label_sites: out.cx.label_sites })
+           label_sites: out.cx.label_sites, updates: out.cx.update_shapes })
   }
 }
+
+// The record-update shapes of a checked program, for a caller that lowers bodies but emits no C.
+pub fn update_shapes(r: Resolved, mods: List<Mod>) -> Option<List<UpdateShape>> = {
+  let out = check_program(r, mods);
+  if fold(out.cx.diags, false, |b: Bool, d: Diag| b || d.severity == b"error") { None } else { Some(out.cx.update_shapes) }
+}
+
+// One module's shapes, keyed by the update's span, as `expand_record_updates` reads them.
+fn shapes_in(all: List<UpdateShape>, module: Int) -> Map<Bytes, List<Bytes>> =
+  fold(all, map_new(), |acc: Map<Bytes, List<Bytes>>, s: UpdateShape|
+    if s.module != module { acc } else { map_insert(acc, span_key(s.span), s.names) })
+
+// The modules with every record update written out as the literal it stands for: what the lowering
+// reads, and what only the checker knows.
+pub fn expanded_mods(mods: List<Mod>, shapes: List<UpdateShape>) -> List<Mod> =
+  map(range(0, len(mods)), |i: Int| {
+    let m: Mod = at(mods, i);
+    { name: m.name, module: expand_record_updates(m.module, shapes_in(shapes, i)), derived: m.derived }
+  })
 
 // Every use of a label-generic definition is a call, and every call fills its labels.
 fn check_label_apps(cx0: Cx) -> Cx = {
@@ -3859,7 +4004,7 @@ pub fn check_program_with(r: Resolved, mods: List<Mod>, known: Known) -> Checked
   let checked: Cx = fold(r.order, declared, |c: Cx, i: Int| { let m = at(mods, i); check_specs(check_fns({..c, module: i}, m), m) });
   let tested: Cx = fold(range(0, len(mods)), checked, |c: Cx, i: Int| check_laws(check_tests({..c, module: i}, at(mods, i)), at(mods, i)));
   // Whatever `check_fns` did not drain: a spec clause, a test body, a law.
-  let settled: Cx = settle_bit_ops(settle_numerics(tested));
+  let settled: Cx = settle_bit_ops(settle_numerics(settle_concats(settle_updates(tested))));
   let constrained: Cx = check_constraints(check_map_keys(check_comparisons(check_label_apps(settled))));
   let solved: Cx = check_regions(check_simulations(attribute_generated(check_derives(constrained))));
   let marked: Cx = mark_internal_effects(solved);
@@ -4211,6 +4356,53 @@ test "a cell leaving its region is reported at the exit, under the code its form
 test "a call instantiating a constrained parameter with a function is refused at the call" {
   let dump = check_dump([{ name: b"m", src: b"fn show<a>(x: a) -> String where derivable(json, a) = \"\"\nfn bad() -> String = show(|y: Int| y)" }]);
   assert_eq(dump, "K;1;X;D;1;!E0206:0:78:82:2:1;=0:78:82:1;=0:0:56:0;")
+}
+
+// The code of each error a program raises, in the order the checker reports them.
+fn check_codes(sources: List<Source>) -> List<Bytes> = {
+  let parsed = map(range(0, len(sources)), |i: Int| {
+    let s = at(sources, i);
+    let r = parse(s.src);
+    let x = expand(r.node, r.p.uses_sets, r.p.diags);
+    let d: Expansion = expand_derives(i, x.module);
+    { name: s.name, module: d.module, derived: d.derived, diags: d.diags }
+  });
+  let early = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
+  if len(early) > 0 { map(early, |g: Diag| g.code) } else {
+    match resolve_modules(map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived })) {
+      Failed(ds) -> map(ds, |g: Diag| g.code),
+      Resolved_(x) ->
+        map(filter(dedup_diags(check_program(x.r, x.mods).cx.diags), |g: Diag| g.severity == b"error"), |g: Diag| g.code),
+    }
+  }
+}
+
+test "a record update takes its shape from the base's inferred type, not from where it was written" {
+  let p = b"type P = { a: Int, b: Int }\nfn mk() -> P = { a: 1, b: 2 }\n";
+  assert_eq(check_codes([{ name: b"m", src: bytes_concat(p, b"fn f() -> P = { let q = mk(); {..q, b: 3} }") }]), []);
+  assert_eq(check_codes([{ name: b"m", src: bytes_concat(p, b"fn g(ps: List<P>) -> P = match list_at(ps, 0) { Some(q) -> {..q, b: 3}, None -> mk() }") }]), []);
+  assert_eq(check_codes([{ name: b"m", src: bytes_concat(p, b"fn h(xs: List<Int>) -> P = fold(xs, mk(), |acc, x| {..acc, a: x})") }]), [])
+}
+
+test "a record update may name a record type another module declares" {
+  assert_eq(check_codes([{ name: b"shapes", src: b"pub type P = { a: Int, b: Int }\npub fn mk() -> P = { a: 1, b: 2 }" },
+                         { name: b"m", src: b"import shapes\nfn f() -> shapes::P = { let q = shapes::mk(); {..q, b: 3} }" }]), [])
+}
+
+test "a record update is refused where the base is not a record, or where nothing says what it is" {
+  let p = b"type P = { a: Int, b: Int }\n";
+  assert_eq(check_codes([{ name: b"m", src: bytes_concat(p, b"fn f(n: Int) -> Int = { let q = {..n, a: 1}; 0 }") }]), [b"E0116"]);
+  assert_eq(check_codes([{ name: b"m", src: bytes_concat(p, b"fn f() -> Int = { let g = |s| {..s, a: 1}; 0 }") }]), [b"E0116"]);
+  assert_eq(check_codes([{ name: b"m", src: bytes_concat(p, b"fn f(q: P) -> P = {..q, c: 1}") }]), [b"E0117"])
+}
+
+test "`++` joins two Strings or two Bytes, and refuses one of each" {
+  assert_eq(check_codes([{ name: b"m", src: b"fn f(a: String, b: String) -> String = a ++ b" }]), []);
+  assert_eq(check_codes([{ name: b"m", src: b"fn f(a: Bytes, b: Bytes) -> Bytes = a ++ b" }]), []);
+  assert_eq(check_codes([{ name: b"m", src: b"fn f(xs: List<Bytes>) -> Bytes = fold(xs, b\"\", |acc: Bytes, x: Bytes| acc ++ x)" }]), []);
+  assert_eq(check_codes([{ name: b"m", src: b"fn f(a: String, b: Bytes) -> String = a ++ b" }]), [b"E0201"]);
+  assert_eq(check_codes([{ name: b"m", src: b"fn f(a: Int, b: Int) -> Int = a ++ b" }]), [b"E0201"]);
+  assert_eq(check_codes([{ name: b"m", src: b"fn f() -> Int = { let g = |a, b| a ++ b; 0 }" }]), [b"E0210"])
 }
 
 // The label of each `E0205` a one-module program raises.

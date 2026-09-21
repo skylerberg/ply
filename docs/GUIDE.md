@@ -110,7 +110,7 @@ Loosest to tightest; all binary operators are left-associative:
 | 5 | `^` | integer |
 | 6 | `&` | integer |
 | 7 | `<<` `>>` `>>>` | integer; the count is `Int` |
-| 8 | `++` | `String` |
+| 8 | `++` | `String` or `Bytes` |
 | 9 | `+` `-` | numeric |
 | 10 | `*` `/` `%` | numeric |
 | — | prefix `-` `!` `~` | numeric / `Bool` / integer |
@@ -127,7 +127,9 @@ Loosest to tightest; all binary operators are left-associative:
 * `&&`/`||` short-circuit. `&` `|` `^` `~` are integer-only and act at the
   type's own width (`~0u8` is `255u8`). `>>` is arithmetic, `>>>` logical.
   Shifts are adjacent `<`/`>` tokens, so `Map<Int, List<Int>>` still closes.
-* `++` concatenates `String`s only.
+* `++` joins two `String`s or two `Bytes`, answering their type. One of each
+  is `E0201`; there is no coercion, so cross with `bytes_of_string` or
+  `string_of_bytes`. An operand nothing determines is `E0210`.
 * `::` qualifies through a module binder (`items::price_of`) and does not chain.
 * `?` binds tightest: `f(x)?.field` is `(f(x)?).field`. There is no `?:`.
 
@@ -196,8 +198,8 @@ signatures are checked, not inferred (§4.7).
 
 There is no numeric tower. An operator's operand type is settled from the whole
 definition, so `fn h(a: U32) -> U32 = a + 1u32` checks and `a + 1` does not. An
-operand nothing determines, as in `let g = |a, b| a + b;`, is `E0210`; there is
-no default. Conversions are explicit builtins (§12.3). `u32_of_int` and its
+operand nothing determines, as in `let g = |a, b| a + b;`, is `E0210` — the same
+code a `++` that says neither `String` nor `Bytes` raises; there is no default. Conversions are explicit builtins (§12.3). `u32_of_int` and its
 siblings raise when the value does not fit (mask to truncate:
 `u8_of_int(n & 0xFF)`); two fixed widths convert through `Int`.
 `string_of_bytes` raises on invalid UTF-8.
@@ -384,13 +386,12 @@ and no method syntax.
 
 ### 5.5 Record update
 
-`{..base, deep: {..base.deep, a: 7}}` copies `base` with fields replaced. It
-expands to a record literal. The base is a variable, a field path, or a call of
-a `fn` declared in this file with a written return type (the call runs once).
-Its shape must be readable from this file's own `type` items and written types
-(`E0116` otherwise); a `let` without a written type takes the written type of
-its value when that is such a variable, path, call or update. A field the base
-lacks is `E0117`.
+`{..base, deep: {..base.deep, a: 7}}` copies `base` with the written fields
+replaced, answering a record of the base's field names. The base is a variable,
+a field path, or one call (the call runs once); its fields come from the type
+the checker infers for it, wherever that type was declared — another module's
+`type` included. A base whose type nothing in the program determines is
+`E0116`, and so is one that is not a record. A field the base lacks is `E0117`.
 
 ### 5.6 Lists
 
@@ -911,7 +912,7 @@ Strings are indexed by character, bytes by byte.
 | `bytes_at(b: Bytes, i: Int) -> Int` | `0..=255` |
 | `bytes_u32_le(b: Bytes, i: Int) -> U32` | four bytes, little-endian |
 | `bytes_slice(b: Bytes, start: Int, end: Int) -> Bytes` | |
-| `bytes_concat(a: Bytes, b: Bytes) -> Bytes` | |
+| `bytes_concat(a: Bytes, b: Bytes) -> Bytes` | `a ++ b` |
 | `bytes_concat_all(bs: List<Bytes>) -> Bytes` | one allocation |
 | `byte_of_int(n: Int) -> Bytes` | raises outside `0..=255` |
 | `bytes_of_string(s: String) -> Bytes` | |
@@ -1355,7 +1356,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0113` | project module under the reserved root `std` |
 | `E0114` | unknown `effect set`, including a `pub` or qualified one |
 | `E0115` | `effect set` cycle |
-| `E0116` | record update base with no shape this file can name |
+| `E0116` | record update base that is not a record of a known type |
 | `E0117` | record update naming a field the base lacks |
 | `E0118` | `?` with no written `Result`/`Option` return type to exit through |
 | `E0119` | `?` where its early exit would change what runs or drop an annotation |
@@ -1377,7 +1378,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0207` | unknown deriver |
 | `E0208` | orphan `derive` |
 | `E0209` | `/` on `Decimal` |
-| `E0210` | numeric operand type nothing determines |
+| `E0210` | operand type nothing determines |
 | `E0211` | integer literal out of range for its fixed width |
 | `E0301` | unbound row variable |
 | `E0302` | effect not permitted by the written row |
@@ -1457,8 +1458,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
   only; no authentication framework.
 
 Sharp edges: `x.f(y)` with a bare variable `x` is a perform; a missing handler
-clause fails at run time; record update needs a locally readable shape; two
-allocating tasks are always ordered; `bytes_at`, `bytes_u32_le`, `string_slice`,
+clause fails at run time; a record update needs the base's type to be known
+where it stands; two allocating tasks are always ordered; `bytes_at`, `bytes_u32_le`, `string_slice`,
 `string_find` and `list_set` raise where `list_at` answers `None`.
 
 ## 19. Examples

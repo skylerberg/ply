@@ -1077,10 +1077,12 @@ pub unsafe extern "C" fn rt_equal(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     }
 }
 
-/// `++`: native strings append; anything else raises the interpreter's error. Takes both.
+/// `++`: two strings or two byte strings append natively, answering the kind they share; anything
+/// else raises the interpreter's error. Takes both.
 pub unsafe extern "C" fn rt_concat(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
-    if heap::kind(a) == KIND_STR && heap::kind(b) == KIND_STR {
+    let kind = heap::kind(a);
+    if kind == heap::kind(b) && (kind == KIND_STR || kind == KIND_BYTES) {
         let out = ctx.heap.append(a, unsafe { bytes_of(obj(b)) });
         heap::dec(b);
         return out;
@@ -1088,11 +1090,10 @@ pub unsafe extern "C" fn rt_concat(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     let (l, r) = (ctx.value(a), ctx.value(b));
     heap::dec(a);
     heap::dec(b);
-    let joined = match (l.as_str(Span::DUMMY, "`++`"), r.as_str(Span::DUMMY, "`++`")) {
-        (Ok(x), Ok(y)) => format!("{x}{y}"),
-        (Err(d), _) | (_, Err(d)) => return ctx.fail(d),
-    };
-    ctx.word(&Value::str(joined))
+    match ply_eval::strict_binary(BinOp::Concat, &l, &r, Span::DUMMY, Span::DUMMY, Span::DUMMY) {
+        Ok(v) => ctx.word(&v),
+        Err(d) => ctx.fail(d),
+    }
 }
 
 /// A builtin over taken arguments: natively over words where it can, else the interpreter's.
