@@ -1,13 +1,10 @@
-//! `ply check --costs`: where an append copies, before the program runs.
+//! Whether a `reuse fn` keeps its promise, before the program runs. `ply check --costs` reports
+//! the same pass, in the program that answers it.
 
 use crate::load::Loaded;
-use crate::style::Style;
 use ply_eval::Value;
-use ply_span::{Diagnostic, SourceId, SourceMap, Span, codes};
+use ply_span::{Diagnostic, SourceId, Span, codes};
 use std::collections::HashMap;
-
-/// Where the verdict column starts: wide enough for `stdlib.ply:1234:56`.
-const LOCATION: usize = 22;
 
 const ENTRY: &str = "costs.costs_dump";
 
@@ -28,73 +25,14 @@ struct Site {
 }
 
 struct Definition {
-    kind: String,
     name: String,
-    label: String,
     promise: Option<Span>,
     sites: Vec<Site>,
-}
-
-impl Definition {
-    fn count(&self, v: Verdict) -> usize {
-        self.sites.iter().filter(|s| s.verdict == v).count()
-    }
 }
 
 /// Only definitions with an append.
 struct Report {
     defs: Vec<Definition>,
-    rounds: usize,
-}
-
-/// The whole report, or `None` when the program declares no `push` at all.
-pub fn lines(loaded: &Loaded, style: Style) -> Result<Option<Vec<String>>, Diagnostic> {
-    let report = report(loaded)?;
-    if report.defs.is_empty() {
-        return Ok(None);
-    }
-
-    let mut out = Vec::new();
-    for def in &report.defs {
-        out.push(String::new());
-        let kind = match def.kind.as_str() {
-            "test" => " (test)",
-            "law" => " (law)",
-            _ => "",
-        };
-        out.push(format!(
-            "  {}{}  {}",
-            style.bold(&def.label),
-            style.dim(kind),
-            style.dim(&tally(def)),
-        ));
-        for site in &def.sites {
-            let at = location(site.span, &loaded.sources);
-            let pad = LOCATION.saturating_sub(at.chars().count());
-            let verdict = match site.verdict {
-                Verdict::Reuses => style.green("reuses "),
-                Verdict::Copies => style.red("COPIES "),
-                Verdict::Unknown => style.yellow("unknown"),
-            };
-            out.push(format!(
-                "    {at}{:pad$}  {verdict}  {}",
-                "",
-                site.reason,
-                pad = pad
-            ));
-            if let Some(fix) = &site.fix {
-                out.push(format!(
-                    "    {:LOCATION$}  {}  {}",
-                    "",
-                    " ".repeat(7),
-                    style.dim(&format!("fix: {fix}")),
-                ));
-            }
-        }
-    }
-    out.push(String::new());
-    out.push(format!("  {}", style.dim(&summary(&report))));
-    Ok(Some(out))
 }
 
 /// Each `reuse fn`'s appends must reuse, except onto its own parameter; else E0127.
@@ -155,19 +93,8 @@ fn report(loaded: &Loaded) -> Result<Report, Diagnostic> {
         names.push(Value::bytes(module.name.as_str().as_bytes()));
         texts.push(Value::bytes(file.text.as_bytes()));
     }
-    let builtins = ply_eval::Builtin::all()
-        .iter()
-        .map(|b| Value::bytes(b.name().as_bytes()))
-        .collect();
-    let answer = ply_codegen::c::producer::call(
-        ENTRY,
-        &[
-            Value::list(names),
-            Value::list(texts),
-            Value::list(builtins),
-        ],
-    )
-    .map_err(|e| failed(&format!("{e:#}")))?;
+    let answer = ply_codegen::c::producer::call(ENTRY, &[Value::list(names), Value::list(texts)])
+        .map_err(|e| failed(&format!("{e:#}")))?;
     let Value::Str(dump) = &answer else {
         return Err(failed(&format!(
             "`{ENTRY}` answered a {} rather than a string",
@@ -193,10 +120,11 @@ fn read(dump: &str, sources: &HashMap<String, SourceId>) -> Result<Report, Strin
     let (head, mut rest) = dump
         .split_once('\n')
         .ok_or("an empty answer: the program did not resolve in the port")?;
-    let rounds = head
-        .strip_prefix("rounds ")
-        .and_then(|n| n.parse().ok())
-        .ok_or_else(|| format!("an answer that opens with {head:?}, not `rounds <n>`"))?;
+    if !head.starts_with("rounds ") {
+        return Err(format!(
+            "an answer that opens with {head:?}, not `rounds <n>`"
+        ));
+    }
     let mut defs: Vec<Definition> = Vec::new();
     let mut source = None;
     while !rest.is_empty() {
@@ -205,10 +133,10 @@ fn read(dump: &str, sources: &HashMap<String, SourceId>) -> Result<Report, Strin
             .ok_or("an unterminated frame header")?;
         let fields: Vec<&str> = header.split(' ').collect();
         rest = match fields.as_slice() {
-            ["def", kind, start, end, module, name, label] => {
+            ["def", _kind, start, end, module, name, label] => {
                 let (module, after) = take(after, module)?;
                 let (name, after) = take(after, name)?;
-                let (label, after) = take(after, label)?;
+                let (_label, after) = take(after, label)?;
                 let id = *sources
                     .get(module)
                     .ok_or_else(|| format!("a definition in `{module}`, which was not asked"))?;
@@ -218,9 +146,7 @@ fn read(dump: &str, sources: &HashMap<String, SourceId>) -> Result<Report, Strin
                     _ => Some(Span::new(id, number(start)?, number(end)?)),
                 };
                 defs.push(Definition {
-                    kind: kind.to_string(),
                     name: name.to_string(),
-                    label: label.to_string(),
                     promise,
                     sites: Vec::new(),
                 });
@@ -258,7 +184,7 @@ fn read(dump: &str, sources: &HashMap<String, SourceId>) -> Result<Report, Strin
             }
         };
     }
-    Ok(Report { defs, rounds })
+    Ok(Report { defs })
 }
 
 fn take<'a>(text: &'a str, n: &str) -> Result<(&'a str, &'a str), String> {
@@ -271,51 +197,4 @@ fn take<'a>(text: &'a str, n: &str) -> Result<(&'a str, &'a str), String> {
 
 fn number(text: &str) -> Result<u32, String> {
     text.parse().map_err(|_| format!("an offset {text:?}"))
-}
-
-fn tally(def: &Definition) -> String {
-    let mut parts = Vec::new();
-    for (verdict, word) in [
-        (Verdict::Reuses, "reuses"),
-        (Verdict::Copies, "COPIES"),
-        (Verdict::Unknown, "unknown"),
-    ] {
-        let n = def.count(verdict);
-        if n > 0 {
-            parts.push(format!("{n} {word}"));
-        }
-    }
-    parts.join(", ")
-}
-
-fn summary(report: &Report) -> String {
-    let (mut reuses, mut copies, mut unknown) = (0, 0, 0);
-    for def in &report.defs {
-        reuses += def.count(Verdict::Reuses);
-        copies += def.count(Verdict::Copies);
-        unknown += def.count(Verdict::Unknown);
-    }
-    format!(
-        "{} appends: {reuses} reuse, {copies} copy, {unknown} undecided — {} {}",
-        reuses + copies + unknown,
-        report.rounds,
-        if report.rounds == 1 {
-            "round"
-        } else {
-            "rounds"
-        },
-    )
-}
-
-fn location(span: Span, sources: &SourceMap) -> String {
-    let Some(file) = sources.get(span.source) else {
-        return "<unknown>".to_string();
-    };
-    let (line, col) = file.line_col(span.start);
-    let name = file
-        .path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| file.path.display().to_string());
-    format!("{name}:{line}:{col}")
 }
