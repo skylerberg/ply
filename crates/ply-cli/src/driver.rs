@@ -400,7 +400,7 @@ impl<'s> Driver<'s> {
             .map(|f| (f.module.to_string(), f.text.to_string()))
             .collect();
         let shelf = crate::shipped::sources();
-        let pulled = ply_codegen::c::producer::front_pulling_std(&own, &shelf)
+        let pulled = ply_codegen::c::producer::front_pulling_std(&own, shelf)
             .map_err(|e| self.seam_failed(&format!("{e:#}")))?;
         self.place(
             pulled

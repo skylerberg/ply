@@ -23,11 +23,20 @@ fn the_committed_program_is_what_these_sources_build() {
     let identity = shipped::identity();
     let built = shipped::build().expect("the `ply fmt` program builds");
 
-    // Whatever else moves, the artifact has to carry the entry point the runner enters.
+    // Whatever else moves, the artifact has to carry the entry point the runner enters, and its
+    // unit has to hold a body for it: the runner enters the unit and nothing else.
     let named = PathBuf::from(shipped::ARTIFACT);
     let (decoded, _) = ply_cli::artifact::decode(&built, &named).expect("it decodes");
     assert_eq!(decoded.entry_name(), Some("fmt.main"));
-    assert!(decoded.has_unit(), "no compiled unit was embedded");
+    let unit = decoded
+        .unit
+        .as_ref()
+        .expect("no compiled unit was embedded");
+    let text = ply_codegen::c::bundle::unpack(&unit.text).expect("the unit unpacks");
+    assert!(
+        text.contains("ply_fmt_main("),
+        "the embedded unit holds no body for `fmt.main`, so nothing can be entered from it"
+    );
     ply_cli::artifact::open(&decoded, &named).expect("it opens as the program it names");
 
     let artifact = shipped::committed();
@@ -74,7 +83,7 @@ fn the_committed_program_is_what_these_sources_build() {
 
 #[test]
 fn the_compiler_is_on_the_shelf_under_its_own_root_and_nothing_may_shadow_it() {
-    let names: Vec<String> = shipped::sources().into_iter().map(|(n, _)| n).collect();
+    let names: Vec<&str> = shipped::sources().iter().map(|(n, _)| n.as_str()).collect();
     assert!(names.iter().any(|n| n == "compiler.fmt"), "{names:?}");
     assert!(names.iter().any(|n| n == "std.path"), "{names:?}");
     assert!(shipped::is_shipped_name("compiler.fmt"));
@@ -101,6 +110,26 @@ fn the_compiler_is_on_the_shelf_under_its_own_root_and_nothing_may_shadow_it() {
     let ok = tempfile::tempdir().unwrap();
     write(ok.path(), "compilers.ply", "pub fn f() -> Int = 1\n");
     ply_cli::load::load(ok.path()).expect("`compilers` is an ordinary module name");
+}
+
+/// The shelf hands over text, and the front end and the emitter each parse it: a module filed
+/// under `compiler.x` whose text still imports `x` resolves one way for one reader and another
+/// way for the other, and every body that calls across it is refused.
+#[test]
+fn every_shelved_module_imports_the_shelf_under_the_names_it_files_them_under() {
+    let filed: Vec<&str> = shipped::sources().iter().map(|(n, _)| n.as_str()).collect();
+    for (module, text) in shipped::sources() {
+        for line in text.lines().filter_map(|l| l.strip_prefix("import ")) {
+            let path: &str = line
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                .next()
+                .unwrap_or("");
+            assert!(
+                filed.contains(&path),
+                "`{module}` imports `{path}`, which the shelf files under no such name: {filed:?}"
+            );
+        }
+    }
 }
 
 #[test]
