@@ -289,6 +289,77 @@ fn a_footprints_head_binds_the_labels_its_atoms_name() {
     assert!(parse_footprint("<[l]>").is_err());
 }
 
+/// A label variable may not take the name of a resource in the same text, or the head binds what
+/// the row meant as a resource and the two read back as one; it steps to the next letter instead.
+#[test]
+fn a_label_variable_steps_past_a_resource_of_its_name() {
+    let send = EffectAtom::operation(
+        "net",
+        Resource::Named(Symbol::new("l")),
+        Mode::Write,
+        "send",
+    );
+    let recv = EffectAtom::operation("net", Resource::Var(LabelVar(0)), Mode::Write, "recv");
+    let f = Footprint::from_atoms([send.clone(), recv.clone()]);
+    let text = print_footprint(&f);
+    assert_eq!(text, "<[m]>net.send[l],net.recv[m]");
+    assert_eq!(parse_footprint(&text).unwrap(), f);
+
+    // One operation under a resource and under the variable: two atoms, and two names, or the set
+    // they are read back into holds one.
+    let both = Footprint::from_atoms([
+        send.clone(),
+        EffectAtom::operation("net", Resource::Var(LabelVar(0)), Mode::Write, "send"),
+    ]);
+    let text = print_footprint(&both);
+    assert_eq!(text, "<[m]>net.send[l],net.send[m]");
+    assert_eq!(parse_footprint(&text).unwrap().atoms().count(), 2);
+
+    let scheme = Scheme {
+        ty_vars: vec![],
+        row_vars: vec![],
+        label_vars: vec![LabelVar(0)],
+        ty: Type::Fn {
+            params: vec![],
+            ret: Box::new(Type::unit()),
+            effects: Row {
+                atoms: [send.clone(), recv.clone()].into(),
+                tail: None,
+            },
+        },
+    };
+    let text = print_scheme(&scheme);
+    assert_eq!(text, "<[m]>() -> Unit / {net.send[l], net.recv[m]}");
+    assert_eq!(parse_scheme(&text).unwrap(), scheme);
+
+    // A second name in the way takes the next letter again.
+    let close = EffectAtom::operation(
+        "net",
+        Resource::Named(Symbol::new("m")),
+        Mode::Write,
+        "close",
+    );
+    let crowded = Footprint::from_atoms([send.clone(), close.clone(), recv.clone()]);
+    assert_eq!(
+        print_footprint(&crowded),
+        "<[n]>net.send[l],net.close[m],net.recv[n]"
+    );
+
+    // Every letter held, so the variable takes the round the guide names.
+    let open = EffectAtom::operation(
+        "net",
+        Resource::Named(Symbol::new("n")),
+        Mode::Write,
+        "connect",
+    );
+    let full = Footprint::from_atoms([send, close, open, recv]);
+    assert_eq!(
+        print_footprint(&full),
+        "<[l1]>net.send[l],net.close[m],net.connect[n],net.recv[l1]"
+    );
+    assert_eq!(parse_footprint(&print_footprint(&full)).unwrap(), full);
+}
+
 #[test]
 fn an_operation_atom_parses_and_prints_by_its_name() {
     let send = parse_atom("net.send[conn]").unwrap();

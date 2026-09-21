@@ -544,7 +544,7 @@ impl Entry {
             "location": self.location,
             "stale": self.stale,
             "interface": interface,
-            "footprint": self.footprint.as_ref().map(|f| f.atoms().map(|a| a.to_string()).collect::<Vec<_>>()),
+            "footprint": self.footprint.as_ref().map(|f| ply_ty::Printer::new().atoms(&f.0)),
             "witness": self.witness.iter().map(|n| json!({
                 "name": n.name,
                 "hash": n.hash.to_hex(),
