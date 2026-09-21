@@ -3,7 +3,7 @@
 
 use crate::hash::{DefHash, HashOutput};
 use crate::parse::{parse_footprint, parse_scheme, parse_type};
-use crate::print::{print_scheme, print_type};
+use crate::print::{print_footprint, print_scheme, print_type};
 use crate::{
     CheckOutput, CtorInfo, DefConstraint, DefInfo, Deriver, EffectInfo, Footprint, LawBinder,
     LawInfo, Mode, ModuleInfo, ModuleName, OpInfo, Scheme, SpecInfo, SpecKind, TestInfo, Type,
@@ -587,8 +587,8 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
         p.field("public", flag(written.vis.is_public()));
         p.field("reuse", flag(written.reuse));
         p.field("scheme", &print_scheme(&d.scheme));
-        p.field("footprint", &footprint_text(&d.footprint));
-        p.field("performed", &footprint_text(&d.performed));
+        p.field("footprint", &print_footprint(&d.footprint));
+        p.field("performed", &print_footprint(&d.performed));
         for c in &d.constraints {
             p.field("constraint", &format!("{} {}", c.deriver, c.param));
         }
@@ -609,7 +609,7 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
                     "{} {} {}\n{}",
                     s.kind.as_str(),
                     s.index,
-                    footprint_text(&s.footprint),
+                    print_footprint(&s.footprint),
                     w.span(s.span, &what)?
                 ),
             );
@@ -640,7 +640,7 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
         p.field("module", t.module.as_str());
         p.field("index", &t.index.to_string());
         p.field("nondet", flag(t.nondet));
-        p.field("footprint", &footprint_text(&t.footprint));
+        p.field("footprint", &print_footprint(&t.footprint));
         p.field("span", &w.span(t.span, &what)?);
         p.field("name_span", &w.span(front.test_name_spans[i], &what)?);
         p.frame(&mut out, "test", &i.to_string());
@@ -666,7 +666,7 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
         }
         p.field("has_guard", flag(l.has_guard));
         p.field("host", flag(l.host));
-        p.field("footprint", &footprint_text(&l.footprint));
+        p.field("footprint", &print_footprint(&l.footprint));
         p.field("span", &w.span(l.span, &what)?);
         for literal in &front.law_literals[i] {
             p.field("literal", &literal_text(literal));
@@ -948,15 +948,8 @@ fn effect_set_text(set: &EffectSet) -> String {
         "{} {} {}",
         set.name,
         includes.join(","),
-        footprint_text(&set.atoms)
+        print_footprint(&set.atoms)
     )
-}
-
-fn footprint_text(f: &Footprint) -> String {
-    f.atoms()
-        .map(|a| a.to_string())
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 fn hex(bytes: &[u8]) -> String {
