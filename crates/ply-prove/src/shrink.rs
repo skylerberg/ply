@@ -120,7 +120,7 @@ pub fn size(value: &Value, world: &TypeWorld) -> u64 {
             // Only closures this crate generated carry a size.
             Value::Closure(_) => fn_size(v, world).unwrap_or(1),
             // Never generated: `forall (s: Secret<a>)` is rejected.
-            Value::Cell(_) | Value::Task(_) | Value::Continuation(_) | Value::Secret(_) => 0,
+            Value::Cell(_) | Value::Task(_) | Value::Secret(_) => 0,
         };
         total = total.saturating_add(here);
     }

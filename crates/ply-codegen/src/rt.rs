@@ -193,7 +193,6 @@ pub(crate) fn holds_a_handle(value: &Value) -> Option<&'static str> {
         Value::Secret(_) => Some("a Secret"),
         Value::Cell(_) => Some("a Cell"),
         Value::Task(_) => Some("a Task"),
-        Value::Continuation(_) => Some("a Continuation"),
         Value::Closure(_) => Some("a Closure"),
         Value::List(items) => items.iter().find_map(holds_a_handle),
         Value::Map(entries) => entries
