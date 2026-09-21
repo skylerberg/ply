@@ -1115,22 +1115,21 @@ pub type BodyResult =
 pub fn read_body<[l]>(c: Int, framing: Framing, buf: Bytes, limits: Limits) -> BodyResult
   / {net.recv[l]} =
   body_loop[l](c, body_start(framing, limits), buf, [], slice_ms(limits.body_timeout_ms),
-               read_budget(limits.body_timeout_ms), limits)
+               read_budget(limits.body_timeout_ms))
 
 reuse fn body_loop<[l]>(c: Int, state: BodyState, buf: Bytes, out: List<Bytes>, slice: Int,
-                        reads: Int, limits: Limits) -> BodyResult / {net.recv[l]} =
+                        reads: Int) -> BodyResult / {net.recv[l]} =
   match body_step(state, buf) {
     Rejected(r) -> BodyRefused(r),
     Complete(done) ->
       Body({bytes: bytes_concat_all(push(out, done.out)),
             rest: bytes_slice(buf, done.consumed, bytes_len(buf)),
             trailers: done.trailers}),
-    Await(step) -> body_more(c, step, buf, out, slice, reads, limits),
+    Await(step) -> body_more(c, step, buf, out, slice, reads),
   }
 
-// The calls back into `body_loop` write no label: a group keeps the one it was called with.
 reuse fn body_more<[l]>(c: Int, step: { state: BodyState, consumed: Int, out: Bytes }, buf: Bytes,
-                        out: List<Bytes>, slice: Int, reads: Int, limits: Limits)
+                        out: List<Bytes>, slice: Int, reads: Int)
   -> BodyResult / {net.recv[l]} = {
   let rest = bytes_slice(buf, step.consumed, bytes_len(buf));
   let taken = push(out, step.out);
@@ -1138,10 +1137,10 @@ reuse fn body_more<[l]>(c: Int, step: { state: BodyState, consumed: Int, out: By
     BodyTimedOut
   } else if step.consumed > 0 && bytes_len(rest) > 0 {
     // The chunk budget ran out, not the input: loop without a read, so small chunks share reads.
-    body_loop(c, step.state, rest, taken, slice, reads - 1, limits)
+    body_loop(c, step.state, rest, taken, slice, reads - 1)
   } else {
     match net.recv[l](c, read_size(), slice) {
-      None -> body_loop(c, step.state, rest, taken, slice, reads - 1, limits),
+      None -> body_loop(c, step.state, rest, taken, slice, reads - 1),
       Some(chunk) ->
         if bytes_len(chunk) == 0 {
           match step.state.framing {
@@ -1150,7 +1149,7 @@ reuse fn body_more<[l]>(c: Int, step: { state: BodyState, consumed: Int, out: By
             _ -> BodyClosed,
           }
         } else {
-          body_loop(c, step.state, bytes_concat(rest, chunk), taken, slice, reads - 1, limits)
+          body_loop(c, step.state, bytes_concat(rest, chunk), taken, slice, reads - 1)
         },
     }
   }
@@ -1398,55 +1397,64 @@ fn connection_loop<[l] | e>(c: Int, limits: Limits, app: (Request) -> Response /
       HeadTimedOut ->
         write_response[l](c, limits, Get, Http11, false,
                           text_response(408, "the request head did not arrive\n")),
-      HeadBytes(read) ->
-        match parse_head(read.buf, limits) {
-          // The head stopped midway, or overran the bound without a terminator.
-          Incomplete ->
-            if read.complete {
-              write_response[l](c, limits, Get, Http11, false,
-                                text_response(400, "the request head never ended\n"))
-            } else {
-              write_response[l](c, limits, Get, Http11, false,
-                                text_response(431,
-                                  "the request head never ended within the bound\n"))
-            },
-          Refused(r) -> write_response[l](c, limits, Get, Http11, false, refusal_response(r)),
-          Parsed(head) -> {
-            let rest = bytes_slice(read.buf, head.consumed, bytes_len(read.buf));
-            // The `100` goes out before the body is read, or the client waits for it forever.
-            if head.expects_continue
-               && !send_all[l](c, continue_response(), limits.write_timeout_ms) {
-              ()
-            } else {
-              // Read the body even if the handler ignores it, or it is framed as the next request.
-              match read_body[l](c, head.framing, rest, limits) {
-                BodyTimedOut ->
-                  write_response[l](c, limits, head.request.method, head.request.version, false,
-                                    text_response(408, "the request body did not arrive\n")),
-                BodyClosed -> (),
-                BodyRefused(r) ->
-                  write_response[l](c, limits, head.request.method, head.request.version, false,
-                                    refusal_response(r)),
-                Body(got) -> {
-                  let req = {method: head.request.method, target: head.request.target,
-                             path: head.request.path, query: head.request.query,
-                             authority: head.request.authority, version: head.request.version,
-                             headers: head.request.headers, trailers: got.trailers,
-                             body: got.bytes};
-                  let keep = head.keep_alive && left > 1;
-                  write_response[l](c, limits, req.method, req.version, keep, app(req));
-                  if keep {
-                    connection_loop(c, limits, app, got.rest, left - 1, true)
-                  } else {
-                    ()
-                  }
-                },
-              }
-            }
-          },
-        },
+      HeadBytes(read) -> after_head(c, limits, app, read, left),
     }
   }
+
+fn after_head<[l] | e>(c: Int, limits: Limits, app: (Request) -> Response / e,
+                       read: { buf: Bytes, complete: Bool }, left: Int)
+  -> Unit / {net.recv[l], net.send[l] | e} =
+  match parse_head(read.buf, limits) {
+    // The head stopped midway, or overran the bound without a terminator.
+    Incomplete ->
+      if read.complete {
+        write_response[l](c, limits, Get, Http11, false,
+                          text_response(400, "the request head never ended\n"))
+      } else {
+        write_response[l](c, limits, Get, Http11, false,
+                          text_response(431, "the request head never ended within the bound\n"))
+      },
+    Refused(r) -> write_response[l](c, limits, Get, Http11, false, refusal_response(r)),
+    Parsed(head) ->
+      after_parse(c, limits, app, head,
+                  bytes_slice(read.buf, head.consumed, bytes_len(read.buf)), left),
+  }
+
+fn after_parse<[l] | e>(c: Int, limits: Limits, app: (Request) -> Response / e, head: Head,
+                        rest: Bytes, left: Int) -> Unit / {net.recv[l], net.send[l] | e} =
+  // The `100` goes out before the body is read, or the client waits for it forever.
+  if head.expects_continue && !send_all[l](c, continue_response(), limits.write_timeout_ms) {
+    ()
+  } else {
+    // Read the body even if the handler ignores it, or it is framed as the next request.
+    match read_body[l](c, head.framing, rest, limits) {
+      BodyTimedOut ->
+        write_response[l](c, limits, head.request.method, head.request.version, false,
+                          text_response(408, "the request body did not arrive\n")),
+      BodyClosed -> (),
+      BodyRefused(r) ->
+        write_response[l](c, limits, head.request.method, head.request.version, false,
+                          refusal_response(r)),
+      Body(got) -> after_body(c, limits, app, head, got, left),
+    }
+  }
+
+fn after_body<[l] | e>(c: Int, limits: Limits, app: (Request) -> Response / e, head: Head,
+                       got: { bytes: Bytes, rest: Bytes, trailers: Headers }, left: Int)
+  -> Unit / {net.recv[l], net.send[l] | e} = {
+  let req = {method: head.request.method, target: head.request.target,
+             path: head.request.path, query: head.request.query,
+             authority: head.request.authority, version: head.request.version,
+             headers: head.request.headers, trailers: got.trailers,
+             body: got.bytes};
+  let keep = head.keep_alive && left > 1;
+  write_response[l](c, limits, req.method, req.version, keep, app(req));
+  if keep {
+    connection_loop(c, limits, app, got.rest, left - 1, true)
+  } else {
+    ()
+  }
+}
 
 fn write_response<[l]>(c: Int, limits: Limits, method: Method, version: Version, keep_alive: Bool,
                        r: Response) -> Unit / {net.send[l]} = {
