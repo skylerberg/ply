@@ -36,7 +36,8 @@ pub type RowExpr = { atoms: List<AtomExpr>, aliases: List<QName>,
 
 pub type RowMember = RMAtom(AtomExpr) | RMSet(QName)
 
-pub type Generics = { types: List<Ident>, effects: List<Ident> }
+// `labels` are the bracketed binders: `fn relay<[l] | e>(..)`.
+pub type Generics = { types: List<Ident>, effects: List<Ident>, labels: List<Ident> }
 
 pub fn ty_span(t: TypeExpr) -> Span =
   match t {
@@ -55,7 +56,7 @@ pub fn no_row() -> RowExpr = { atoms: [], aliases: [], tail: None, span: dummy_s
 pub fn no_atom() -> AtomExpr =
   { eff: no_qname(), mode: MBad, op: None, resource: None, span: dummy_span() }
 
-pub fn no_generics() -> Generics = { types: [], effects: [] }
+pub fn no_generics() -> Generics = { types: [], effects: [], labels: [] }
 
 fn is_bare(q: QName) -> Bool = match q.module { None -> true, Some(m) -> false }
 
@@ -280,29 +281,72 @@ fn atom_resource(c: Ctx, p: P) -> Result<R<Option<Ident>>, P> =
 
 type IdAcc = { p: P, out: List<Ident> }
 
-// Not `comma_list`: it stops on `>`, on a not-yet-split `>=`, or on `|`.
+type GenAcc = { p: P, types: List<Ident>, labels: List<Ident> }
+
+type GenOut = { types: List<Ident>, labels: List<Ident> }
+
 pub fn generics(c: Ctx, p: P) -> Result<R<Generics>, P> = {
   let {p, ..} = expect(c, p, t_lt(), b"`<`")?;
-  let {p, node: ts} = generic_names(c, p, true)?;
+  let {p, node: ts} = generic_params(c, p)?;
   let pi = eat(c, p, t_pipe());
-  let opt_es = if pi.ok { generic_names(c, pi.p, false) } else { Ok({ p: pi.p, node: [] }) };
+  let opt_es = if pi.ok { effect_params(c, pi.p) } else { Ok({ p: pi.p, node: [] }) };
   let {p, node: es} = opt_es?;
   let {p, ..} = expect_gt(c, p, b"`>` to close the type parameter list")?;
-  Ok({ p: p, node: { types: ts, effects: es } })
+  Ok({ p: p, node: { types: ts.types, effects: es, labels: ts.labels } })
 }
 
-fn generic_names(c: Ctx, p: P, stop_on_pipe: Bool) -> Result<R<List<Ident>>, P> =
+// Not `comma_list`: it stops on `>`, on a not-yet-split `>=`, or on `|`. A bracketed name binds a label.
+fn generic_params(c: Ctx, p: P) -> Result<R<GenOut>, P> =
+  iterate({ p: p, types: [], labels: [] }, c.ntok - p.pos + 1, |s: GenAcc|
+    if at(c, s.p, t_gt()) || at(c, s.p, t_ge()) || at(c, s.p, t_pipe()) {
+      Stop(Ok({ p: s.p, node: { types: s.types, labels: s.labels } }))
+    }
+    else if at_eof(c, s.p) {
+      Stop(Err(error_here(c, s.p, b"`>` to close the type parameter list")))
+    }
+    else if at(c, s.p, t_lbracket()) {
+      match label_params(c, s.p) {
+        Err(q) -> Stop(Err(q)),
+        Ok(n) -> {
+          let e = eat(c, n.p, t_comma());
+          let ls = fold(n.node, s.labels, |acc: List<Ident>, x: Ident| push(acc, x));
+          if e.ok { Continue({ p: e.p, types: s.types, labels: ls }) }
+          else { Stop(Ok({ p: e.p, node: { types: s.types, labels: ls } })) }
+        },
+      }
+    }
+    else {
+      match expect_ident(c, s.p, b"a type parameter name, or `[l]` for a label") {
+        Err(q) -> Stop(Err(q)),
+        Ok(n) -> {
+          let e = eat(c, n.p, t_comma());
+          if e.ok { Continue({ p: e.p, types: push(s.types, n.node), labels: s.labels }) }
+          else { Stop(Ok({ p: e.p, node: { types: push(s.types, n.node), labels: s.labels } })) }
+        },
+      }
+    })
+
+// One bracket may bind several labels: `<[l, k]>` is `<[l], [k]>`.
+fn label_params(c: Ctx, p: P) -> Result<R<List<Ident>>, P> = {
+  let o = advance(c, p);
+  let {p, node: ns} = comma_list(c, o.p, t_rbracket(), label_name)?;
+  let {p, ..} = expect_close(c, p, t_rbracket(), o.node, b"`]`")?;
+  Ok({ p: p, node: ns })
+}
+
+fn label_name(c: Ctx, p: P) -> Result<R<Ident>, P> =
+  expect_ident(c, p, b"a label name inside `[..]`")
+
+fn effect_params(c: Ctx, p: P) -> Result<R<List<Ident>>, P> =
   iterate({ p: p, out: [] }, c.ntok - p.pos + 1, |s: IdAcc|
-    if at(c, s.p, t_gt()) || at(c, s.p, t_ge())
-       || (stop_on_pipe && at(c, s.p, t_pipe())) {
+    if at(c, s.p, t_gt()) || at(c, s.p, t_ge()) {
       Stop(Ok({ p: s.p, node: s.out }))
     }
     else if at_eof(c, s.p) {
       Stop(Err(error_here(c, s.p, b"`>` to close the type parameter list")))
     }
     else {
-      match expect_ident(c, s.p,
-              if stop_on_pipe { b"a type parameter name" } else { b"an effect parameter name" }) {
+      match expect_ident(c, s.p, b"an effect parameter name") {
         Err(q) -> Stop(Err(q)),
         Ok(n) -> {
           let e = eat(c, n.p, t_comma());
@@ -344,7 +388,7 @@ pub fn dump_mode(m: Mode) -> Bytes =
 // `Generics` has no span, so its dump leads with a word.
 pub fn dump_generics(g: Generics) -> Bytes =
   bytes_concat_all([word(b"gen"), dump_list(g.types, dump_ident),
-                    dump_list(g.effects, dump_ident)])
+                    dump_list(g.effects, dump_ident), dump_list(g.labels, dump_ident)])
 
 // --- The area's own entry point ---------------------------------------------
 
@@ -442,17 +486,26 @@ test "a token that cannot start a type is one diagnostic and no more" {
 }
 
 test "a type parameter list, with and without effect parameters" {
-  assert_eq(dump_generics_of(b"<a>"), "%gen;#1;1:2:ident;@61;#0;#0;");
-  assert_eq(dump_generics_of(b"<a, b>"), "%gen;#2;1:2:ident;@61;4:5:ident;@62;#0;#0;");
-  assert_eq(dump_generics_of(b"<a | e>"), "%gen;#1;1:2:ident;@61;#1;5:6:ident;@65;#0;");
+  assert_eq(dump_generics_of(b"<a>"), "%gen;#1;1:2:ident;@61;#0;#0;#0;");
+  assert_eq(dump_generics_of(b"<a, b>"), "%gen;#2;1:2:ident;@61;4:5:ident;@62;#0;#0;#0;");
+  assert_eq(dump_generics_of(b"<a | e>"), "%gen;#1;1:2:ident;@61;#1;5:6:ident;@65;#0;#0;");
   assert_eq(dump_generics_of(b"<a, b | e, f>"),
-            "%gen;#2;1:2:ident;@61;4:5:ident;@62;#2;8:9:ident;@65;11:12:ident;@66;#0;")
+            "%gen;#2;1:2:ident;@61;4:5:ident;@62;#2;8:9:ident;@65;11:12:ident;@66;#0;#0;")
+}
+
+test "a bracketed name in the type parameter list binds a label" {
+  assert_eq(dump_generics_of(b"<[l]>"), "%gen;#0;#0;#1;2:3:ident;@6c;#0;");
+  assert_eq(dump_generics_of(b"<a, [l] | e>"),
+            "%gen;#1;1:2:ident;@61;#1;10:11:ident;@65;#1;5:6:ident;@6c;#0;");
+  // One bracket may bind several labels, and two brackets bind the same two.
+  assert_eq(dump_generics_of(b"<[l, k]>"), "%gen;#0;#0;#2;2:3:ident;@6c;5:6:ident;@6b;#0;");
+  assert_eq(dump_generics_of(b"<[l], [k]>"), "%gen;#0;#0;#2;2:3:ident;@6c;7:8:ident;@6b;#0;")
 }
 
 test "either half of a type parameter list may be empty" {
-  assert_eq(dump_generics_of(b"<|e>"), "%gen;#0;#1;2:3:ident;@65;#0;");
-  assert_eq(dump_generics_of(b"<>"), "%gen;#0;#0;#0;");
-  assert_eq(dump_generics_of(b"<a"), "%gen;#0;#0;#1;!E0001:2:2:1:0;=2:2:1;")
+  assert_eq(dump_generics_of(b"<|e>"), "%gen;#0;#1;2:3:ident;@65;#0;#0;");
+  assert_eq(dump_generics_of(b"<>"), "%gen;#0;#0;#0;#0;");
+  assert_eq(dump_generics_of(b"<a"), "%gen;#0;#0;#0;#1;!E0001:2:2:1:0;=2:2:1;")
 }
 
 test "an unclosed record type labels its opening brace; a `<` has no opener to label" {

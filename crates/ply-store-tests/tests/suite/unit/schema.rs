@@ -18,6 +18,7 @@ mod variant {
     pub(super) fn resource(r: &Resource) -> &'static str {
         match r {
             Resource::Named(_) => "Resource::Named",
+            Resource::Var(_) => "Resource::Var",
             Resource::Singleton => "Resource::Singleton",
         }
     }

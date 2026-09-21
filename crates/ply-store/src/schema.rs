@@ -7,7 +7,7 @@ use crate::frontend::{
 use crate::{BODY_ENCODING, ContentHash, DefBody, FRONTEND_FORMAT, Outcome};
 use ply_span::{Diagnostic, Edit, Span, Symbol, codes};
 use ply_ty::Mode;
-use ply_ty::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
+use ply_ty::{EffectAtom, Footprint, LabelVar, Resource, Row, RowVar, Scheme, TyVar, Type};
 use std::collections::BTreeMap;
 
 /// Every variant name the exemplars below must between them mention.
@@ -17,6 +17,7 @@ pub const COVERED: &[&str] = &[
     "Type::Fn",
     "Type::Record",
     "Resource::Named",
+    "Resource::Var",
     "Resource::Singleton",
     "Mode::Read",
     "Mode::Write",
@@ -72,7 +73,12 @@ fn every_type() -> Type {
         ],
         ret: Box::new(Type::Var(TyVar(0))),
         effects: Row {
-            atoms: footprint().0,
+            // A row reaches what a footprint cannot: an atom on a label the scheme quantifies.
+            atoms: footprint()
+                .0
+                .into_iter()
+                .chain([atom("net", Resource::Var(LabelVar(0)), Mode::Write)])
+                .collect(),
             tail: Some(RowVar(0)),
         },
     }
@@ -82,6 +88,7 @@ pub fn exemplars() -> Exemplars {
     let scheme = Scheme {
         ty_vars: vec![TyVar(0), TyVar(1)],
         row_vars: vec![RowVar(0)],
+        label_vars: vec![LabelVar(0)],
         ty: every_type(),
     };
     Exemplars {

@@ -626,6 +626,7 @@ fn scheme() -> Scheme {
     Scheme {
         ty_vars: vec![TyVar(0)],
         row_vars: vec![],
+        label_vars: vec![],
         ty: Type::Fn {
             params: vec![Type::Var(TyVar(0))],
             ret: Box::new(Type::int()),
@@ -871,6 +872,7 @@ fn two_definitions_sharing_a_hash_each_keep_their_own_interface() {
     let other = Scheme {
         ty_vars: vec![],
         row_vars: vec![],
+        label_vars: vec![],
         ty: Type::int(),
     };
 
@@ -1841,6 +1843,7 @@ fn counted_scheme(a: u32, e: u32) -> Scheme {
     Scheme {
         ty_vars: vec![TyVar(a)],
         row_vars: vec![ply_ty::RowVar(e)],
+        label_vars: vec![],
         ty: Type::Fn {
             params: vec![Type::Var(TyVar(a))],
             ret: Box::new(Type::Var(TyVar(a))),
@@ -1995,6 +1998,7 @@ fn pin_type_decl() -> CachedDecl {
             scheme: Scheme {
                 ty_vars: vec![TyVar(6)],
                 row_vars: vec![],
+                label_vars: vec![],
                 ty: Type::Fn {
                     params: vec![Type::Var(TyVar(6))],
                     ret: Box::new(Type::Con(

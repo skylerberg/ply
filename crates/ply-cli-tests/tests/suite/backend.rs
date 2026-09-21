@@ -219,6 +219,60 @@ fn a_backend_name_that_is_not_a_spelling_of_anything_is_refused() {
     }
 }
 
+/// A label is a trailing parameter in compiled code and a name in the machine's, so one definition
+/// called under two labels has to answer the same on both.
+const TWO_LABELS: &str = r#"
+effect net {
+  write send[s](payload: Bytes) -> Int
+}
+
+fn relay<[l]>(payload: Bytes) -> Int / {net.send[l]} = net.send[l](payload)
+
+pub fn both(payload: Bytes) -> Int =
+  with_cell[seen](0) { c -> {
+    let sent = handle {
+      relay[conn](payload) + relay[upstream](payload)
+    } with {
+      net.send[conn](p) -> { cell_set(c, cell_get(c) + 1); bytes_len(p) },
+      net.send[upstream](p) -> { cell_set(c, cell_get(c) + 10); bytes_len(p) },
+    };
+    sent + cell_get(c)
+  } }
+
+fn main() -> Int = both(b"ping")
+
+test "each label reaches the clause written for it" { assert_eq(both(b"ping"), 19) }
+"#;
+
+#[test]
+fn a_definition_generic_over_a_label_answers_the_same_on_both_engines() {
+    let dir = project(TWO_LABELS);
+    let engines: [&[&str]; 2] = [&[], &["--backend", "c"]];
+    for engine in engines {
+        let out = ply(dir.path())
+            .arg("run")
+            .arg("--json")
+            .args(engine)
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            report["value"],
+            Value::String("19".into()),
+            "{engine:?}: {report}"
+        );
+        assert!(out.status.success(), "{engine:?}: {report}");
+    }
+
+    let report = run(dir.path(), Some("c"));
+    assert_eq!(report["ok"], Value::Bool(true), "{report}");
+    assert!(
+        u64_at(&report, &["backend", "entered"]) > 0,
+        "the label-generic body never reached the seam: {}",
+        report["backend"]
+    );
+}
+
 #[test]
 fn a_test_body_is_entered_whole_and_a_failing_one_still_fails() {
     let dir = project(

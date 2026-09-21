@@ -1,12 +1,15 @@
 //! Reads back the text [`crate::print`] writes, so `print(parse(print(t))) == print(t)`; the
 //! printer is not injective (`Cell<Int>` hides its region variable).
 
-use crate::ty::{EffectAtom, Footprint, Mode, Resource, Row, RowVar, Scheme, TyVar, Type};
+use crate::ty::{
+    EffectAtom, Footprint, LabelVar, Mode, Resource, Row, RowVar, Scheme, TyVar, Type,
+};
 use ply_span::Symbol;
 use std::collections::BTreeMap;
 
 const TY_LETTERS: &str = "abcdghijklmnopqrsuvwxyz";
 const ROW_LETTERS: &str = "eft";
+const LABEL_LETTERS: &str = "lmn";
 
 pub fn parse_type(text: &str) -> Result<Type, String> {
     let mut p = Parser::new(text);
@@ -53,6 +56,8 @@ struct Parser<'a> {
     at: usize,
     ty_vars: Vec<(String, TyVar)>,
     row_vars: Vec<(String, RowVar)>,
+    /// Bound by the scheme's head; a resource named anything else is a label in its own right.
+    label_vars: Vec<(String, LabelVar)>,
 }
 
 impl<'a> Parser<'a> {
@@ -62,6 +67,7 @@ impl<'a> Parser<'a> {
             at: 0,
             ty_vars: Vec::new(),
             row_vars: Vec::new(),
+            label_vars: Vec::new(),
         }
     }
 
@@ -147,6 +153,15 @@ impl<'a> Parser<'a> {
         v
     }
 
+    fn label_var(&mut self, name: &str) -> LabelVar {
+        if let Some((_, v)) = self.label_vars.iter().find(|(n, _)| n == name) {
+            return *v;
+        }
+        let v = LabelVar(self.label_vars.len() as u32);
+        self.label_vars.push((name.to_string(), v));
+        v
+    }
+
     /// A variable the region of a `Cell<T>` was printed without.
     fn hidden_ty_var(&mut self) -> TyVar {
         let v = TyVar(self.ty_vars.len() as u32);
@@ -155,15 +170,24 @@ impl<'a> Parser<'a> {
     }
 
     fn scheme(&mut self) -> Result<Scheme, String> {
-        let (mut ty_vars, mut row_vars) = (Vec::new(), Vec::new());
+        let (mut ty_vars, mut row_vars, mut label_vars) = (Vec::new(), Vec::new(), Vec::new());
         if self.eat("<") {
             if !self.eat("|") {
                 loop {
-                    let name = self.name("a type variable")?;
-                    if !is_var(name, TY_LETTERS) {
-                        return Err(self.error(&format!("`{name}` is not a type variable")));
+                    if self.eat("[") {
+                        let name = self.name("a label variable")?;
+                        if !is_var(name, LABEL_LETTERS) {
+                            return Err(self.error(&format!("`{name}` is not a label variable")));
+                        }
+                        label_vars.push(self.label_var(name));
+                        self.expect("]")?;
+                    } else {
+                        let name = self.name("a type variable")?;
+                        if !is_var(name, TY_LETTERS) {
+                            return Err(self.error(&format!("`{name}` is not a type variable")));
+                        }
+                        ty_vars.push(self.ty_var(name));
                     }
-                    ty_vars.push(self.ty_var(name));
                     if !self.eat(",") {
                         break;
                     }
@@ -174,6 +198,7 @@ impl<'a> Parser<'a> {
                     return Ok(Scheme {
                         ty_vars,
                         row_vars,
+                        label_vars,
                         ty,
                     });
                 }
@@ -194,6 +219,7 @@ impl<'a> Parser<'a> {
         Ok(Scheme {
             ty_vars,
             row_vars,
+            label_vars,
             ty,
         })
     }
@@ -353,7 +379,10 @@ impl<'a> Parser<'a> {
             self.at += 1;
             let resource = self.name("a resource")?;
             self.expect("]")?;
-            Resource::Named(Symbol::new(resource))
+            match self.label_vars.iter().find(|(n, _)| n == resource) {
+                Some((_, v)) => Resource::Var(*v),
+                None => Resource::Named(Symbol::new(resource)),
+            }
         } else {
             Resource::Singleton
         };
