@@ -29,6 +29,7 @@ mod map_cache;
 mod map_law;
 mod modules_hash_audit;
 mod mutate;
+mod nesting;
 mod numerics;
 mod process_cli;
 mod prove;
