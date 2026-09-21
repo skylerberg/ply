@@ -221,6 +221,9 @@ fn every_ported_command_answers_with_no_path_argument() {
         (vec!["doc", "one"], true),
         (vec!["doc", "one", "--json"], true),
         (vec!["explain", "E0001"], true),
+        (vec!["hosts"], true),
+        (vec!["hosts", "--json"], true),
+        (vec!["hosts", "--digest"], true),
         (vec!["fmt", "--check"], false),
     ] {
         let out = ply(dir.path()).args(&args).output().unwrap();

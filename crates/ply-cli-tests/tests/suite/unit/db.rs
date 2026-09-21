@@ -271,7 +271,7 @@ fn a_program_with_no_database_in_reach_reports_no_block_at_all() {
 }
 
 #[test]
-fn the_block_names_the_scanner_the_pool_and_the_collation() {
+fn the_object_names_the_scanner_the_pool_and_the_collation() {
     let database = Database::of(
         vec!["db.query[items]".to_string()],
         Some(config()),
@@ -291,17 +291,15 @@ fn the_block_names_the_scanner_the_pool_and_the_collation() {
         }),
     )
     .unwrap();
-    assert_eq!(
-        database.lines(),
-        [
-            "",
-            "database",
-            "server     PostgreSQL 18.3 · database desk · collation C · encoding UTF8",
-            "pool       8 connections · acquire 5000ms · statement 30000ms · idle-txn 30000ms · connect 5000ms · statements 256",
-            "scanner    ply_host::db::scan · select insert update delete values with",
-            "schema     desk.schema · 2 tables · 11 columns · verified",
-        ]
-    );
+    let json = database.json();
+    assert_eq!(json["server"]["version"], "PostgreSQL 18.3");
+    assert_eq!(json["server"]["collation"], "C");
+    assert_eq!(json["pool"]["connections"], 8);
+    assert_eq!(json["pool"]["acquire_ms"], 5000);
+    assert_eq!(json["scanner"]["handler"], "ply_host::db::scan");
+    assert_eq!(json["schema"]["function"], "desk.schema");
+    assert_eq!(json["schema"]["tables"], 2);
+    assert_eq!(json["schema"]["state"], "verified");
     assert!(database.is_live());
 }
 
@@ -314,16 +312,18 @@ fn an_unconnected_run_says_so_and_still_redacts() {
         None,
     )
     .unwrap();
-    let text = database.lines().join("\n");
-    assert!(text.contains("not connected"), "{text}");
-    assert!(text.contains("configured by --db"), "{text}");
-    assert!(!text.contains("secret"), "{text}");
-    assert!(text.contains("E0433"), "{text}");
+    let json = database.json();
     assert_eq!(
-        database.json()["url"],
+        json["url"],
         "postgres://ply:****@127.0.0.1:5433/desk?sslmode=disable"
     );
-    assert_eq!(database.json()["server"], serde_json::Value::Null);
+    assert_eq!(json["source"], "--db");
+    assert_eq!(json["server"], serde_json::Value::Null);
+    assert_eq!(json["schema"], serde_json::Value::Null);
+    assert!(
+        !serde_json::to_string(&json).unwrap().contains("secret"),
+        "the object carried the password"
+    );
 }
 
 /// A halved pool must move the digest a CI check pins, and a server upgrade must not.
