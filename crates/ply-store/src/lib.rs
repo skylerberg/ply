@@ -39,7 +39,7 @@ pub use upstream::Upstream;
 pub const RUNTIME_VERSION: &str = "0.16.0";
 
 /// Bumping this discards every cached type, footprint, source fingerprint and front-end answer.
-pub const FRONTEND_VERSION: &str = "0.27.0";
+pub const FRONTEND_VERSION: &str = "0.28.0";
 
 /// Bumping this re-attempts every obligation and re-runs no test.
 pub const PROVER_VERSION: &str = "0.7.0";
