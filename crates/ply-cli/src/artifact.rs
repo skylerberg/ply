@@ -766,12 +766,17 @@ fn place_and_read(
 
 /// Where the front end's answer for one artifact is kept: beside the program, under a key that is
 /// the artifact's own bytes plus what reads them.
+/// An artifact's digest covers what it holds, not what it was built against: the shipped library
+/// it closed over sits outside the hashed ranges. A reopened `Front` is an answer over that
+/// library, so the key names it rather than relying on where the file happens to sit.
 fn front_cache(artifact: &Artifact) -> PathBuf {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&artifact.digest());
     hasher.update(ply_store::FRONTEND_VERSION.as_bytes());
     hasher.update(&[0]);
     hasher.update(ply_codegen::c::producer::identity().as_bytes());
+    hasher.update(&[0]);
+    hasher.update(&ply_std::digest());
     crate::shipped::stage().join(format!("front.{}", &hasher.finalize().to_hex()[..16]))
 }
 
