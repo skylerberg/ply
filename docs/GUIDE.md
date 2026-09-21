@@ -621,8 +621,17 @@ fn counted(n: Int) -> Int =
 the region. `with_region[r] { body }` opens an allocation scope that a
 `with_cell[r]` inside it allocates into. Nest `with_cell`s for several cells.
 
+The scheduler that runs a spawned task must be younger than the region whose
+cell the task is handed: open it inside the region,
+`with_cell[r](init) { c -> simulate { .. } }`, and not around it,
+`simulate { with_cell[r](init) { c -> .. } }`. An older scheduler — an enclosing
+`simulate` region (§9), or the production one under `--host` — drains the tasks
+nobody joined after the region's `}`, and a `task.join` inside the region does
+not license it, because no type records the join.
+
 * `E0446`: a region-branded value outlives the region (returned, stored in an
-  older binding, captured by an escaping closure, or put in a declared type).
+  older binding, captured by an escaping closure, put in a declared type, or
+  handed to a `task.spawn` whose scheduler is older than the region).
 * `E0447`: two regions in scope under one name.
 * `E0449`: a region handle reaches a host operation, a host answer or an entry
   point's argument (at run time).
