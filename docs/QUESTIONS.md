@@ -18,3 +18,14 @@ A record update now takes its shape from a call of a `fn` declared in the same f
 still never read across a module boundary: the rewrite runs before types exist, and a shape
 read from another file would change this file's hashes without this file changing. Assumed:
 that line stays where it is, and `{..other::make(), x: 1}` keeps needing a local annotation.
+
+## A label-generic definition cannot call a mutually recursive sibling
+
+Two definitions in one recursive group each get their own rigid label variable, and two rigid
+variables never unify, so `fn a<[l]>(..) / {net.recv[l]}` cannot call `fn b<[l]>(..)` in its own
+component. A self call is fine: it keeps the labels the definition was called with. Rewriting
+`std.http`'s body reader as one function rather than two was the cost of this. The fix is to
+treat a sibling call in a component like a self call, sharing the binders the component was
+checked with, as a recursive group already does for types. Assumed: worth doing, as its own
+item. Say if you would rather the checker refused such a call with a diagnostic of its own,
+which is what it does today only as an accident of unification.
