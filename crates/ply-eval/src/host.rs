@@ -319,13 +319,15 @@ fn resolve(
         }
 
         // A footprint names the operation, or the mode when its row was written that way; a program
-        // holding both names one label once.
+        // holding both names one label once. A label a caller fills is no resource to serve: the
+        // call that fills it names one, and that atom is what reaches here.
         let candidates: BTreeSet<Resource> = match &op.resource {
             HostResource::Only(r) => BTreeSet::from([r.clone()]),
             HostResource::Any => performed
                 .iter()
                 .filter(|a| {
                     a.effect == *name
+                        && !matches!(a.resource, Resource::Var(_))
                         && match &a.op {
                             Some(named) => *named == op.op,
                             None => a.mode == decl.mode,

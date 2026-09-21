@@ -171,7 +171,7 @@ fn accept_loop(l: Int, count: Int) -> Int / {net.write[listener], net.write[conn
   if count <= 0 {
     0
   } else {
-    serve_connection(net.accept[listener](l), default_limits(), app);
+    serve_connection[conn](net.accept[listener](l), default_limits(), app);
     1 + accept_loop(l, count - 1)
   }
 "#;

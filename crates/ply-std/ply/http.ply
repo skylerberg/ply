@@ -1028,29 +1028,29 @@ pub type HeadRead =
 type Reading = { pieces: List<Bytes>, total: Int, tail: Bytes, found: Bool }
 
 // `idle` is the wait for the first byte of a message on a connection that has already answered one.
-pub fn read_head(c: Int, carried: Bytes, limits: Limits, idle: Bool) -> HeadRead
-  / {net.recv[conn]} = {
+pub fn read_head<[l]>(c: Int, carried: Bytes, limits: Limits, idle: Bool) -> HeadRead
+  / {net.recv[l]} = {
   let cap = limits.max_request_line + limits.max_header_bytes;
   let start = {pieces: [carried], total: bytes_len(carried),
                tail: keep_tail(carried), found: terminated(carried, 0)};
   if idle && bytes_len(carried) == 0 {
-    match net.recv[conn](c, min_int(read_size(), cap), limits.idle_timeout_ms) {
+    match net.recv[l](c, min_int(read_size(), cap), limits.idle_timeout_ms) {
       None -> HeadIdle,
       Some(chunk) ->
         if bytes_len(chunk) == 0 {
           HeadClosed(b"")
         } else {
-          head_deadline(c, limits, cap, absorb(start, chunk))
+          head_deadline[l](c, limits, cap, absorb(start, chunk))
         },
     }
   } else {
-    head_deadline(c, limits, cap, start)
+    head_deadline[l](c, limits, cap, start)
   }
 }
 
-fn head_deadline(c: Int, limits: Limits, cap: Int, r: Reading) -> HeadRead / {net.recv[conn]} =
-  read_head_loop(c, limits, cap, slice_ms(limits.header_timeout_ms),
-                 read_budget(limits.header_timeout_ms), r)
+fn head_deadline<[l]>(c: Int, limits: Limits, cap: Int, r: Reading) -> HeadRead / {net.recv[l]} =
+  read_head_loop[l](c, limits, cap, slice_ms(limits.header_timeout_ms),
+                    read_budget(limits.header_timeout_ms), r)
 
 // Each read waits one slice of the timeout, so the deadline bounds the whole head, not each read.
 fn slice_ms(timeout_ms: Int) -> Int =
@@ -1058,8 +1058,8 @@ fn slice_ms(timeout_ms: Int) -> Int =
 
 fn read_budget(timeout_ms: Int) -> Int = min_int(max_reads(), timeout_ms / slice_ms(timeout_ms))
 
-fn read_head_loop(c: Int, limits: Limits, cap: Int, slice: Int, reads: Int, r: Reading) -> HeadRead
-  / {net.recv[conn]} =
+fn read_head_loop<[l]>(c: Int, limits: Limits, cap: Int, slice: Int, reads: Int, r: Reading)
+  -> HeadRead / {net.recv[l]} =
   if r.found {
     HeadBytes({buf: bytes_concat_all(r.pieces), complete: true})
   } else if r.total >= cap {
@@ -1068,7 +1068,7 @@ fn read_head_loop(c: Int, limits: Limits, cap: Int, slice: Int, reads: Int, r: R
   } else if reads <= 0 {
     HeadTimedOut
   } else {
-    match net.recv[conn](c, min_int(read_size(), cap - r.total), slice) {
+    match net.recv[l](c, min_int(read_size(), cap - r.total), slice) {
       // An empty slice is not the deadline; the deadline is the budget running out, above.
       None -> read_head_loop(c, limits, cap, slice, reads - 1, r),
       Some(chunk) ->
@@ -1112,47 +1112,45 @@ pub type BodyResult =
   | BodyClosed
 
 // The buffered form, for a handler that wants a whole body.
-pub fn read_body(c: Int, framing: Framing, buf: Bytes, limits: Limits) -> BodyResult
-  / {net.recv[conn]} =
-  body_loop(c, body_start(framing, limits), buf, [], slice_ms(limits.body_timeout_ms),
-            read_budget(limits.body_timeout_ms), limits)
+pub fn read_body<[l]>(c: Int, framing: Framing, buf: Bytes, limits: Limits) -> BodyResult
+  / {net.recv[l]} =
+  body_loop[l](c, body_start(framing, limits), buf, [], slice_ms(limits.body_timeout_ms),
+               read_budget(limits.body_timeout_ms), limits)
 
-reuse fn body_loop(c: Int, state: BodyState, buf: Bytes, out: List<Bytes>, slice: Int, reads: Int,
-             limits: Limits) -> BodyResult / {net.recv[conn]} =
+// One function, not two: a helper it recurses with would get a rigid `[l]` that cannot unify.
+reuse fn body_loop<[l]>(c: Int, state: BodyState, buf: Bytes, out: List<Bytes>, slice: Int,
+                        reads: Int, limits: Limits) -> BodyResult / {net.recv[l]} =
   match body_step(state, buf) {
     Rejected(r) -> BodyRefused(r),
     Complete(done) ->
       Body({bytes: bytes_concat_all(push(out, done.out)),
             rest: bytes_slice(buf, done.consumed, bytes_len(buf)),
             trailers: done.trailers}),
-    Await(step) -> body_more(c, step, buf, out, slice, reads, limits),
+    Await(step) -> {
+      let rest = bytes_slice(buf, step.consumed, bytes_len(buf));
+      let taken = push(out, step.out);
+      if reads <= 0 {
+        BodyTimedOut
+      } else if step.consumed > 0 && bytes_len(rest) > 0 {
+        // The chunk budget ran out, not the input: loop without a read, so small chunks share reads.
+        body_loop(c, step.state, rest, taken, slice, reads - 1, limits)
+      } else {
+        match net.recv[l](c, read_size(), slice) {
+          None -> body_loop(c, step.state, rest, taken, slice, reads - 1, limits),
+          Some(chunk) ->
+            if bytes_len(chunk) == 0 {
+              match step.state.framing {
+                UntilClose ->
+                  Body({bytes: bytes_concat_all(taken), rest: b"", trailers: empty_headers()}),
+                _ -> BodyClosed,
+              }
+            } else {
+              body_loop(c, step.state, bytes_concat(rest, chunk), taken, slice, reads - 1, limits)
+            },
+        }
+      }
+    },
   }
-
-reuse fn body_more(c: Int, step: { state: BodyState, consumed: Int, out: Bytes }, buf: Bytes,
-             out: List<Bytes>, slice: Int, reads: Int, limits: Limits) -> BodyResult
-  / {net.recv[conn]} = {
-  let rest = bytes_slice(buf, step.consumed, bytes_len(buf));
-  let taken = push(out, step.out);
-  if reads <= 0 {
-    BodyTimedOut
-  } else if step.consumed > 0 && bytes_len(rest) > 0 {
-    // The chunk budget ran out, not the input: loop without a read, so small chunks share reads.
-    body_loop(c, step.state, rest, taken, slice, reads - 1, limits)
-  } else {
-    match net.recv[conn](c, read_size(), slice) {
-      None -> body_loop(c, step.state, rest, taken, slice, reads - 1, limits),
-      Some(chunk) ->
-        if bytes_len(chunk) == 0 {
-          match step.state.framing {
-            UntilClose -> Body({bytes: bytes_concat_all(taken), rest: b"", trailers: empty_headers()}),
-            _ -> BodyClosed,
-          }
-        } else {
-          body_loop(c, step.state, bytes_concat(rest, chunk), taken, slice, reads - 1, limits)
-        },
-    }
-  }
-}
 
 // --- Responses, as a client reads them --------------------------------------
 
@@ -1330,24 +1328,24 @@ pub type ClientError =
 
 // One exchange on a fresh connection, closed afterwards whatever happened. A `1xx` answer is
 // returned as it is.
-pub fn request(host: String, port: Int, req: Request, limits: Limits)
+pub fn request<[l]>(host: String, port: Int, req: Request, limits: Limits)
   -> Result<Response, ClientError>
-  / {net.connect[conn], net.send[conn], net.recv[conn], net.close[conn]} =
-  match net.connect[conn](host, port, limits.connect_timeout_ms) {
+  / {net.connect[l], net.send[l], net.recv[l], net.close[l]} =
+  match net.connect[l](host, port, limits.connect_timeout_ms) {
     None -> Err(Unreachable),
     Some(c) -> {
-      let answer = exchange(c, req, limits);
-      net.close[conn](c);
+      let answer = exchange[l](c, req, limits);
+      net.close[l](c);
       answer
     },
   }
 
-fn exchange(c: Int, req: Request, limits: Limits) -> Result<Response, ClientError>
-  / {net.send[conn], net.recv[conn]} =
-  if !send_all(c, encode_request(req), limits.write_timeout_ms) {
+fn exchange<[l]>(c: Int, req: Request, limits: Limits) -> Result<Response, ClientError>
+  / {net.send[l], net.recv[l]} =
+  if !send_all[l](c, encode_request(req), limits.write_timeout_ms) {
     Err(NotSent)
   } else {
-    match read_head(c, b"", limits, false) {
+    match read_head[l](c, b"", limits, false) {
       HeadTimedOut -> Err(TimedOut),
       HeadIdle -> Err(TimedOut),
       HeadClosed(_) -> Err(Closed),
@@ -1359,14 +1357,15 @@ fn exchange(c: Int, req: Request, limits: Limits) -> Result<Response, ClientErro
                            ++ int_to_string(limits.max_request_line + limits.max_header_bytes)
                            ++ " bytes"})),
           ResponseParsed(head) ->
-            read_answer(c, head, bytes_slice(got.buf, head.consumed, bytes_len(got.buf)), limits),
+            read_answer[l](c, head, bytes_slice(got.buf, head.consumed, bytes_len(got.buf)),
+                           limits),
         },
     }
   }
 
-fn read_answer(c: Int, head: ResponseHead, rest: Bytes, limits: Limits)
-  -> Result<Response, ClientError> / {net.recv[conn]} =
-  match read_body(c, head.framing, rest, limits) {
+fn read_answer<[l]>(c: Int, head: ResponseHead, rest: Bytes, limits: Limits)
+  -> Result<Response, ClientError> / {net.recv[l]} =
+  match read_body[l](c, head.framing, rest, limits) {
     Body(b) -> Ok({status: head.status, headers: head.headers, body: b.bytes}),
     BodyRefused(r) -> Err(Malformed(relayed(r))),
     BodyTimedOut -> Err(TimedOut),
@@ -1376,55 +1375,55 @@ fn read_answer(c: Int, head: ResponseHead, rest: Bytes, limits: Limits)
 // --- Serving ----------------------------------------------------------------
 
 // One connection: read a head, answer it, then close or go round again with the leftover bytes.
-pub fn serve_connection<| e>(c: Int, limits: Limits, app: (Request) -> Response / e) -> Unit
-  / {net.recv[conn], net.send[conn], net.close[conn] | e} = {
-  connection_loop(c, limits, app, b"", limits.max_keep_alive, false);
-  net.close[conn](c)
+pub fn serve_connection<[l] | e>(c: Int, limits: Limits, app: (Request) -> Response / e) -> Unit
+  / {net.recv[l], net.send[l], net.close[l] | e} = {
+  connection_loop[l](c, limits, app, b"", limits.max_keep_alive, false);
+  net.close[l](c)
 }
 
 // One function, not five: mutually recursive helpers would each get a rigid `e` that cannot unify.
-fn connection_loop<| e>(c: Int, limits: Limits, app: (Request) -> Response / e, carried: Bytes,
-                        left: Int, reused: Bool) -> Unit / {net.recv[conn], net.send[conn] | e} =
+fn connection_loop<[l] | e>(c: Int, limits: Limits, app: (Request) -> Response / e, carried: Bytes,
+                            left: Int, reused: Bool) -> Unit / {net.recv[l], net.send[l] | e} =
   if left <= 0 {
     ()
   } else {
     // The idle timeout runs until the next request's first byte; the header timeout from then.
-    match read_head(c, carried, limits, reused) {
+    match read_head[l](c, carried, limits, reused) {
       // The peer went away, or went quiet between messages.
       HeadClosed(_) -> (),
       HeadIdle -> (),
       HeadTimedOut ->
-        write_response(c, limits, Get, Http11, false,
-                       text_response(408, "the request head did not arrive\n")),
+        write_response[l](c, limits, Get, Http11, false,
+                          text_response(408, "the request head did not arrive\n")),
       HeadBytes(read) ->
         match parse_head(read.buf, limits) {
           // The head stopped midway, or overran the bound without a terminator.
           Incomplete ->
             if read.complete {
-              write_response(c, limits, Get, Http11, false,
-                             text_response(400, "the request head never ended\n"))
+              write_response[l](c, limits, Get, Http11, false,
+                                text_response(400, "the request head never ended\n"))
             } else {
-              write_response(c, limits, Get, Http11, false,
-                             text_response(431,
-                               "the request head never ended within the bound\n"))
+              write_response[l](c, limits, Get, Http11, false,
+                                text_response(431,
+                                  "the request head never ended within the bound\n"))
             },
-          Refused(r) -> write_response(c, limits, Get, Http11, false, refusal_response(r)),
+          Refused(r) -> write_response[l](c, limits, Get, Http11, false, refusal_response(r)),
           Parsed(head) -> {
             let rest = bytes_slice(read.buf, head.consumed, bytes_len(read.buf));
             // The `100` goes out before the body is read, or the client waits for it forever.
             if head.expects_continue
-               && !send_all(c, continue_response(), limits.write_timeout_ms) {
+               && !send_all[l](c, continue_response(), limits.write_timeout_ms) {
               ()
             } else {
               // Read the body even if the handler ignores it, or it is framed as the next request.
-              match read_body(c, head.framing, rest, limits) {
+              match read_body[l](c, head.framing, rest, limits) {
                 BodyTimedOut ->
-                  write_response(c, limits, head.request.method, head.request.version, false,
-                                 text_response(408, "the request body did not arrive\n")),
+                  write_response[l](c, limits, head.request.method, head.request.version, false,
+                                    text_response(408, "the request body did not arrive\n")),
                 BodyClosed -> (),
                 BodyRefused(r) ->
-                  write_response(c, limits, head.request.method, head.request.version, false,
-                                 refusal_response(r)),
+                  write_response[l](c, limits, head.request.method, head.request.version, false,
+                                    refusal_response(r)),
                 Body(got) -> {
                   let req = {method: head.request.method, target: head.request.target,
                              path: head.request.path, query: head.request.query,
@@ -1432,7 +1431,7 @@ fn connection_loop<| e>(c: Int, limits: Limits, app: (Request) -> Response / e, 
                              headers: head.request.headers, trailers: got.trailers,
                              body: got.bytes};
                   let keep = head.keep_alive && left > 1;
-                  write_response(c, limits, req.method, req.version, keep, app(req));
+                  write_response[l](c, limits, req.method, req.version, keep, app(req));
                   if keep {
                     connection_loop(c, limits, app, got.rest, left - 1, true)
                   } else {
@@ -1446,50 +1445,50 @@ fn connection_loop<| e>(c: Int, limits: Limits, app: (Request) -> Response / e, 
     }
   }
 
-fn write_response(c: Int, limits: Limits, method: Method, version: Version, keep_alive: Bool,
-                  r: Response) -> Unit / {net.send[conn]} = {
-  send_all(c, encode(method, version, keep_alive, r), limits.write_timeout_ms);
+fn write_response<[l]>(c: Int, limits: Limits, method: Method, version: Version, keep_alive: Bool,
+                       r: Response) -> Unit / {net.send[l]} = {
+  send_all[l](c, encode(method, version, keep_alive, r), limits.write_timeout_ms);
   ()
 }
 
 // Streams `produce`'s chunks (raw under HTTP/1.0); answers whether the connection may be reused.
-pub fn respond_chunked<s | e>(c: Int, version: Version, r: Response, keep_alive: Bool,
-                             limits: Limits, seed: s,
-                             produce: (s) -> Option<{ chunk: Bytes, next: s }> / e) -> Bool
-  / {net.send[conn] | e} =
+pub fn respond_chunked<s, [l] | e>(c: Int, version: Version, r: Response, keep_alive: Bool,
+                                   limits: Limits, seed: s,
+                                   produce: (s) -> Option<{ chunk: Bytes, next: s }> / e) -> Bool
+  / {net.send[l] | e} =
   match version {
     Http11 ->
-      if !send_all(c, encode_chunked_head(Http11, keep_alive, r), limits.write_timeout_ms) {
+      if !send_all[l](c, encode_chunked_head(Http11, keep_alive, r), limits.write_timeout_ms) {
         false
       } else {
-        stream_chunks(c, limits, seed, produce, limits.max_stream_chunks)
+        stream_chunks[l](c, limits, seed, produce, limits.max_stream_chunks)
       },
     Http10 ->
-      if !send_all(c, encode_chunked_head(Http10, false, r), limits.write_timeout_ms) {
+      if !send_all[l](c, encode_chunked_head(Http10, false, r), limits.write_timeout_ms) {
         false
       } else {
-        stream_raw(c, limits, seed, produce, limits.max_stream_chunks)
+        stream_raw[l](c, limits, seed, produce, limits.max_stream_chunks)
       },
   }
 
 // Always write the terminating chunk: a chunked response without one is response smuggling.
-fn stream_chunks<s | e>(c: Int, limits: Limits, seed: s,
-                       produce: (s) -> Option<{ chunk: Bytes, next: s }> / e, fuel: Int) -> Bool
-  / {net.send[conn] | e} =
+fn stream_chunks<s, [l] | e>(c: Int, limits: Limits, seed: s,
+                             produce: (s) -> Option<{ chunk: Bytes, next: s }> / e, fuel: Int)
+  -> Bool / {net.send[l] | e} =
   if fuel <= 0 {
     // Close the framing even though the body is short, so the client sees where the message ends.
-    send_all(c, last_chunk(), limits.write_timeout_ms);
+    send_all[l](c, last_chunk(), limits.write_timeout_ms);
     false
   } else {
     iterate({ s: seed, left: fuel }, fuel + 1, |it: { s: s, left: Int }|
       if it.left <= 0 {
-        send_all(c, last_chunk(), limits.write_timeout_ms);
+        send_all[l](c, last_chunk(), limits.write_timeout_ms);
         Stop(false)
       } else {
         match produce(it.s) {
-          None -> Stop(send_all(c, last_chunk(), limits.write_timeout_ms)),
+          None -> Stop(send_all[l](c, last_chunk(), limits.write_timeout_ms)),
           Some(step) ->
-            if !send_all(c, encode_chunk(step.chunk), limits.write_timeout_ms) {
+            if !send_all[l](c, encode_chunk(step.chunk), limits.write_timeout_ms) {
               Stop(false)
             } else {
               Continue({ s: step.next, left: it.left - 1 })
@@ -1499,9 +1498,9 @@ fn stream_chunks<s | e>(c: Int, limits: Limits, seed: s,
   }
 
 // HTTP/1.0 has no chunked coding: the body is raw and the close frames it, so this answers `false`.
-fn stream_raw<s | e>(c: Int, limits: Limits, seed: s,
-                    produce: (s) -> Option<{ chunk: Bytes, next: s }> / e, fuel: Int) -> Bool
-  / {net.send[conn] | e} =
+fn stream_raw<s, [l] | e>(c: Int, limits: Limits, seed: s,
+                          produce: (s) -> Option<{ chunk: Bytes, next: s }> / e, fuel: Int)
+  -> Bool / {net.send[l] | e} =
   if fuel <= 0 {
     false
   } else {
@@ -1513,7 +1512,7 @@ fn stream_raw<s | e>(c: Int, limits: Limits, seed: s,
           None -> Stop(false),
           Some(step) ->
             if bytes_len(step.chunk) > 0
-               && !send_all(c, step.chunk, limits.write_timeout_ms) {
+               && !send_all[l](c, step.chunk, limits.write_timeout_ms) {
               Stop(false)
             } else {
               Continue({ s: step.next, left: it.left - 1 })
@@ -1522,29 +1521,30 @@ fn stream_raw<s | e>(c: Int, limits: Limits, seed: s,
       })
   }
 
-// Accept `count` connections and answer each.
-pub fn serve<| e>(listener: Int, count: Int, limits: Limits, app: (Request) -> Response / e) -> Int
-  / {net.accept[listener], net.recv[conn], net.send[conn], net.close[conn] | e} =
+// Accept `count` connections and answer each. `l` is the listener's label and `k` each connection's.
+pub fn serve<[l], [k] | e>(listener: Int, count: Int, limits: Limits,
+                           app: (Request) -> Response / e) -> Int
+  / {net.accept[l], net.recv[k], net.send[k], net.close[k] | e} =
   if count <= 0 {
     0
   } else {
-    let c = net.accept[listener](listener);
+    let c = net.accept[l](listener);
     if c == 0 {
       0
     } else {
-      serve_connection(c, limits, app);
+      serve_connection[k](c, limits, app);
       1 + serve(listener, count - 1, limits, app)
     }
   }
 
-pub fn listen_and_serve<| e>(port: Int, count: Int, limits: Limits,
-                           app: (Request) -> Response / e) -> Int
-  / {net.listen[listener], net.accept[listener], net.close[listener],
-     net.recv[conn], net.send[conn], net.close[conn] | e} = {
+pub fn listen_and_serve<[l], [k] | e>(port: Int, count: Int, limits: Limits,
+                                      app: (Request) -> Response / e) -> Int
+  / {net.listen[l], net.accept[l], net.close[l],
+     net.recv[k], net.send[k], net.close[k] | e} = {
   check_limits(limits);
-  let l = net.listen[listener](port);
-  let served = serve(l, count, limits, app);
-  net.close[listener](l);
+  let socket = net.listen[l](port);
+  let served = serve[l, k](socket, count, limits, app);
+  net.close[l](socket);
   served
 }
 
@@ -2226,7 +2226,7 @@ test "a 1.1 connection is reused and its requests are answered in order" {
   with_cell[outbox](b"") { outbox -> {
   with_cell[closed](0) { closed -> {
     handle {
-      serve_connection(7, default_limits(), echo_app)
+      serve_connection[conn](7, default_limits(), echo_app)
     } with {
       net.recv[conn](c, max, t) -> {
         let queued = cell_get(inbox);
@@ -2247,13 +2247,39 @@ test "a 1.1 connection is reused and its requests are answered in order" {
   } }
 }
 
+// A loop bound to one label would make a program with two kinds of socket write it twice.
+test "a connection is served under whichever label the caller fills" {
+  with_cell[inbox]([Some(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"), None]) { inbox -> {
+  with_cell[outbox](b"") { outbox -> {
+  with_cell[closed](0) { closed -> {
+    handle {
+      serve_connection[upstream](7, default_limits(), echo_app)
+    } with {
+      net.recv[upstream](c, max, t) -> {
+        let queued = cell_get(inbox);
+        cell_set(inbox, rest_answers(queued));
+        next_answer(queued)
+      },
+      net.send[upstream](c, payload, t) -> {
+        cell_set(outbox, bytes_concat(cell_get(outbox), payload));
+        Some(bytes_len(payload))
+      },
+      net.close[upstream](c) -> cell_set(closed, cell_get(closed) + 1),
+    };
+    assert_eq(cell_get(outbox), answer_of(200, "GET /a|", true));
+    assert_eq(cell_get(closed), 1)
+  } }
+  } }
+  } }
+}
+
 test "Connection: close, HTTP/1.0 and the keep-alive bound each end the connection" {
   // Nothing is read after `Connection: close`, so the second scripted request is never seen.
   with_cell[inbox]([Some(b"GET /a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
                     Some(b"GET /b HTTP/1.1\r\nHost: x\r\n\r\n")]) { inbox -> {
   with_cell[outbox](b"") { outbox -> {
     handle {
-      serve_connection(7, default_limits(), echo_app)
+      serve_connection[conn](7, default_limits(), echo_app)
     } with {
       net.recv[conn](c, max, t) -> {
         let queued = cell_get(inbox);
@@ -2276,7 +2302,7 @@ test "Connection: close, HTTP/1.0 and the keep-alive bound each end the connecti
                     Some(b"GET /b HTTP/1.1\r\nHost: x\r\n\r\n")]) { inbox -> {
   with_cell[outbox](b"") { outbox -> {
     handle {
-      serve_connection(7, limits_keeping(1), echo_app)
+      serve_connection[conn](7, limits_keeping(1), echo_app)
     } with {
       net.recv[conn](c, max, t) -> {
         let queued = cell_get(inbox);
@@ -2299,7 +2325,7 @@ test "a body the handler ignores is drained before the next request is framed" {
   with_cell[inbox]([Some(b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\nHost: x\r\n\r\n")]) { inbox -> {
   with_cell[outbox](b"") { outbox -> {
     handle {
-      serve_connection(7, default_limits(), ignore_body_app)
+      serve_connection[conn](7, default_limits(), ignore_body_app)
     } with {
       net.recv[conn](c, max, t) -> {
         let queued = cell_get(inbox);
@@ -2323,7 +2349,7 @@ test "a chunked request is decoded and its trailers reach the handler separately
                     Some(b"6\r\n world\r\n0\r\nX-Checksum: 7\r\n\r\n")]) { inbox -> {
   with_cell[outbox](b"") { outbox -> {
     handle {
-      serve_connection(7, default_limits(), trailer_app)
+      serve_connection[conn](7, default_limits(), trailer_app)
     } with {
       net.recv[conn](c, max, t) -> {
         let queued = cell_get(inbox);
@@ -2351,7 +2377,7 @@ test "a header timeout is 408, a body timeout is 408, and an idle timeout writes
   // Nothing arrives at all.
   with_cell[outbox](b"") { outbox -> {
     handle {
-      serve_connection(7, default_limits(), echo_app)
+      serve_connection[conn](7, default_limits(), echo_app)
     } with {
       net.recv[conn](c, max, t) -> None,
       net.send[conn](c, payload, t) -> {
@@ -2368,7 +2394,7 @@ test "a header timeout is 408, a body timeout is 408, and an idle timeout writes
   with_cell[reads](0) { reads -> {
   with_cell[outbox](b"") { outbox -> {
     handle {
-      serve_connection(7, default_limits(), echo_app)
+      serve_connection[conn](7, default_limits(), echo_app)
     } with {
       net.recv[conn](c, max, t) -> {
         let n = cell_get(reads);
@@ -2395,7 +2421,7 @@ test "a header timeout is 408, a body timeout is 408, and an idle timeout writes
   with_cell[outbox](b"") { outbox -> {
   with_cell[closed](0) { closed -> {
     handle {
-      serve_connection(7, default_limits(), echo_app)
+      serve_connection[conn](7, default_limits(), echo_app)
     } with {
       net.recv[conn](c, max, t) -> {
         let queued = cell_get(inbox);
@@ -2419,7 +2445,7 @@ test "the whole head is bounded by header_timeout_ms and not by each read" {
   with_cell[granted](0) { granted -> {
   with_cell[outbox](b"") { outbox -> {
     handle {
-      serve_connection(7, default_limits(), echo_app)
+      serve_connection[conn](7, default_limits(), echo_app)
     } with {
       // One byte per read, forever: the slow loris.
       net.recv[conn](c, max, t) -> {
@@ -2443,7 +2469,7 @@ test "the whole head is bounded by header_timeout_ms and not by each read" {
   with_cell[reads](0) { reads -> {
   with_cell[outbox](b"") { outbox -> {
     handle {
-      serve_connection(7, default_limits(), echo_app)
+      serve_connection[conn](7, default_limits(), echo_app)
     } with {
       net.recv[conn](c, max, t) -> {
         let n = cell_get(reads);
@@ -2474,7 +2500,7 @@ test "a head arriving in pieces is read to its terminator" {
   with_cell[inbox]([Some(b"GET /a HT"), Some(b"TP/1.1\r\nHost: x\r"), Some(b"\n\r\n")]) { inbox -> {
   with_cell[outbox](b"") { outbox -> {
     handle {
-      serve_connection(7, default_limits(), echo_app)
+      serve_connection[conn](7, default_limits(), echo_app)
     } with {
       net.recv[conn](c, max, t) -> {
         let queued = cell_get(inbox);
@@ -2498,7 +2524,7 @@ test "a framing refusal is answered once and the connection is not reused" {
                     Some(b"GET /b HTTP/1.1\r\nHost: x\r\n\r\n")]) { inbox -> {
   with_cell[outbox](b"") { outbox -> {
     handle {
-      serve_connection(7, default_limits(), echo_app)
+      serve_connection[conn](7, default_limits(), echo_app)
     } with {
       net.recv[conn](c, max, t) -> {
         let queued = cell_get(inbox);
@@ -2525,7 +2551,7 @@ test "a 100-continue is written before the body is read" {
                     Some(b"hello")]) { inbox -> {
   with_cell[outbox](b"") { outbox -> {
     handle {
-      serve_connection(7, default_limits(), echo_app)
+      serve_connection[conn](7, default_limits(), echo_app)
     } with {
       net.recv[conn](c, max, t) -> {
         let queued = cell_get(inbox);
@@ -2557,7 +2583,7 @@ fn counted(seed: Int) -> Option<{ chunk: Bytes, next: Int }> =
 test "a streamed response is chunk-framed and ends with the terminating chunk" {
   with_cell[outbox](b"") { outbox -> {
     handle {
-      assert(respond_chunked(7, Http11, response(200, b""), true, default_limits(), 0, counted))
+      assert(respond_chunked[conn](7, Http11, response(200, b""), true, default_limits(), 0, counted))
     } with {
       net.send[conn](c, payload, t) -> {
         cell_set(outbox, bytes_concat(cell_get(outbox), payload));
@@ -2575,12 +2601,12 @@ test "a streamed response is chunk-framed and ends with the terminating chunk" {
 
 test "a streamed response stops at a dead peer rather than writing into it" {
   handle {
-    assert(!respond_chunked(7, Http11, response(200, b""), true, default_limits(), 0, counted))
+    assert(!respond_chunked[conn](7, Http11, response(200, b""), true, default_limits(), 0, counted))
   } with {
     net.send[conn](c, payload, t) -> Some(0),
   };
   handle {
-    assert(!respond_chunked(7, Http11, response(200, b""), true, default_limits(), 0, counted))
+    assert(!respond_chunked[conn](7, Http11, response(200, b""), true, default_limits(), 0, counted))
   } with {
     net.send[conn](c, payload, t) -> None,
   }
@@ -2594,7 +2620,7 @@ test "a streamed response always ends with its terminating chunk" {
   let small = limits_streaming(4);
   with_cell[outbox](b"") { outbox -> {
     handle {
-      assert(!respond_chunked(7, Http11, response(200, b""), true, small, 0, endless))
+      assert(!respond_chunked[conn](7, Http11, response(200, b""), true, small, 0, endless))
     } with {
       net.send[conn](c, payload, t) -> {
         cell_set(outbox, bytes_concat(cell_get(outbox), payload));
@@ -2608,7 +2634,7 @@ test "a streamed response always ends with its terminating chunk" {
 test "a streamed response to an HTTP/1.0 peer is delimited by the close" {
   with_cell[outbox](b"") { outbox -> {
     handle {
-      assert(!respond_chunked(7, Http10, response(200, b""), true, default_limits(), 0, counted))
+      assert(!respond_chunked[conn](7, Http10, response(200, b""), true, default_limits(), 0, counted))
     } with {
       net.send[conn](c, payload, t) -> {
         cell_set(outbox, bytes_concat(cell_get(outbox), payload));
@@ -2710,7 +2736,7 @@ test "a request is sent, its answer read, and the connection closed" {
   with_cell[outbox](b"") { outbox -> {
   with_cell[closed](0) { closed -> {
     let answer = handle {
-      request("example.org", 80, request_to(Get, "example.org", "/a", b""), client_limits())
+      request[conn]("example.org", 80, request_to(Get, "example.org", "/a", b""), client_limits())
     } with {
       net.connect[conn](host, port, t) -> if host == "example.org" && port == 80 { Some(7) } else { None },
       net.recv[conn](c, max, t) -> {
@@ -2738,7 +2764,7 @@ test "a request is sent, its answer read, and the connection closed" {
 fn fetched(answers: List<Option<Bytes>>, reached: Bool) -> Result<Response, ClientError> =
   with_cell[inbox](answers) { inbox -> {
     handle {
-      request("h", 80, request_to(Get, "h", "/", b""), client_limits())
+      request[conn]("h", 80, request_to(Get, "h", "/", b""), client_limits())
     } with {
       net.connect[conn](host, port, t) -> if reached { Some(7) } else { None },
       net.recv[conn](c, max, t) -> {
@@ -2784,7 +2810,7 @@ test "each way an exchange can fail has its own error" {
 
 test "a peer that stops taking bytes is reported as not sent" {
   let answer = handle {
-    request("h", 80, request_to(Get, "h", "/", b""), client_limits())
+    request[conn]("h", 80, request_to(Get, "h", "/", b""), client_limits())
   } with {
     net.connect[conn](host, port, t) -> Some(7),
     net.recv[conn](c, max, t) -> Some(b""),
