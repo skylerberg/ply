@@ -9,7 +9,6 @@ use std::borrow::Cow;
 pub enum Handle {
     Cell,
     Task,
-    Continuation,
 }
 
 impl Handle {
@@ -17,7 +16,6 @@ impl Handle {
         match self {
             Handle::Cell => "Cell",
             Handle::Task => "Task",
-            Handle::Continuation => "continuation",
         }
     }
 
@@ -30,10 +28,6 @@ impl Handle {
             Handle::Task => {
                 "a `Task` is a key into a scheduler, and the scheduler dies with the region that \
                  opened it"
-            }
-            Handle::Continuation => {
-                "a continuation holds the frames and scopes it was captured over, so it reaches \
-                 every region that was open at the capture"
             }
         }
     }
@@ -204,7 +198,6 @@ fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
     match value {
         Value::Cell(_) => Some(Handle::Cell),
         Value::Task(_) => Some(Handle::Task),
-        Value::Continuation(_) => Some(Handle::Continuation),
 
         Value::Int(_)
         | Value::Fixed(_)

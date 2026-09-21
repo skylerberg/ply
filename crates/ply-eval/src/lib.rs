@@ -1,6 +1,6 @@
 //! The evaluator.
 
-// `Value` mixes `Arc` payloads with `Rc` continuations, so it is never `Send` by design.
+// `Value` mixes `Arc` payloads with `Rc`-backed persistent maps, so it is never `Send` by design.
 #![allow(clippy::arc_with_non_send_sync)]
 
 pub mod arena;
@@ -30,7 +30,7 @@ pub mod task_regions;
 pub mod trace;
 mod value;
 
-// `Slot`, `RegionId` and `Snapshot` stay behind `arena::`: each name means something else here.
+// `Slot` and `RegionId` stay behind `arena::`: each name means something else here.
 pub use arena::{Arena, RegionKind};
 pub use argv::CLASSES as ARGUMENT_VECTOR_CLASSES;
 pub use backend::{
@@ -38,7 +38,7 @@ pub use backend::{
 };
 pub use builtins::{Builtin, Step, assert_failure, assertion_failure};
 pub use compiled::{Compiled, Entered, mentions_a_width};
-pub use cont::{Continuation, Delimiter, Frame, Next, Prompt, Segment, SimId, Stack};
+pub use cont::{Frame, Next, Prompt, Segment, SimId, Stack};
 pub use escape::{Boundary, Escapee, Handle};
 pub use host::{
     Bound, Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,

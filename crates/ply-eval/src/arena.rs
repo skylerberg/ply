@@ -37,10 +37,6 @@ impl RegionKind {
             _ => None,
         }
     }
-
-    pub fn snapshots(self) -> bool {
-        matches!(self, RegionKind::Shared)
-    }
 }
 
 impl fmt::Display for RegionKind {
@@ -107,9 +103,6 @@ pub struct Stats {
     pub chunks_allocated: usize,
     pub allocations: u64,
     pub regions_opened: u64,
-    pub snapshots: u64,
-    pub slots_copied: u64,
-    pub restores: u64,
     pub peak_live: usize,
     pub closes_freed: u64,
     /// The size of one stored value.
@@ -119,54 +112,6 @@ pub struct Stats {
 impl Stats {
     pub fn bytes_reserved(&self) -> usize {
         self.chunks_allocated * CHUNK * (self.element + std::mem::size_of::<u32>())
-    }
-}
-
-/// A region's extent as it stood at some earlier point, and the scopes that were open there.
-pub struct Snapshot<V = Value> {
-    region: RegionId,
-    /// The bump pointer at the snapshot's floor — where restoring truncates to.
-    base: usize,
-    /// The bump pointer when the snapshot was taken.
-    top: usize,
-    /// `values[i]` and `generations[i]` belong to index `base + i`.
-    values: Vec<V>,
-    generations: Vec<u32>,
-    /// The scopes at and above the snapshot's floor, innermost last.
-    scopes: Vec<Scope>,
-    /// Where `scopes` sits in the arena's own stack.
-    depth: usize,
-}
-
-impl<V> Snapshot<V> {
-    /// The outermost region the snapshot covers; its close would discard the snapshot.
-    pub fn region(&self) -> RegionId {
-        self.region
-    }
-
-    pub fn len(&self) -> usize {
-        self.values.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-
-    pub fn regions(&self) -> usize {
-        self.scopes.len()
-    }
-}
-
-impl<V> fmt::Debug for Snapshot<V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Snapshot({}, {}..{}, {} slots)",
-            self.region,
-            self.base,
-            self.top,
-            self.values.len()
-        )
     }
 }
 
@@ -352,7 +297,7 @@ impl<V: Clone + Default> Arena<V> {
         let slots = self.live.saturating_sub(scope.mark);
         self.scopes.truncate(at);
         self.stats.closes_freed += 1;
-        self.truncate(scope.mark, true);
+        self.truncate(scope.mark);
         Reclaim::Freed(slots)
     }
 
@@ -360,82 +305,6 @@ impl<V: Clone + Default> Arena<V> {
         let id = self.scopes.last()?.id;
         self.close(id);
         Some(id)
-    }
-
-    pub fn unique_open(&self) -> Option<RegionId> {
-        self.scopes
-            .iter()
-            .rev()
-            .find(|s| s.kind == RegionKind::Unique)
-            .map(|s| s.id)
-    }
-
-    pub fn snapshot(&mut self, region: RegionId) -> Option<Snapshot<V>> {
-        let at = self.scope(region)?;
-        if self.scopes[at].kind == RegionKind::Unique {
-            return None;
-        }
-        Some(self.snapshot_from(at))
-    }
-
-    pub fn snapshot_open(&mut self) -> Result<Option<Snapshot<V>>, RegionId> {
-        if let Some(scope) = self
-            .scopes
-            .iter()
-            .rev()
-            .find(|s| s.kind == RegionKind::Unique)
-        {
-            return Err(scope.id);
-        }
-        if self.scopes.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(self.snapshot_from(0)))
-    }
-
-    fn snapshot_from(&mut self, at: usize) -> Snapshot<V> {
-        let base = self.scopes[at].mark;
-        let region = self.scopes[at].id;
-        let mut values = Vec::with_capacity(self.live - base);
-        let mut generations = Vec::with_capacity(self.live - base);
-        for index in base..self.live {
-            let (c, o) = (chunk_of(index), offset_of(index));
-            values.push(self.chunks[c][o].clone());
-            generations.push(self.generations[c][o]);
-        }
-        self.stats.snapshots += 1;
-        self.stats.slots_copied += values.len() as u64;
-        Snapshot {
-            region,
-            base,
-            top: self.live,
-            values,
-            generations,
-            scopes: self.scopes[at..].to_vec(),
-            depth: at,
-        }
-    }
-
-    pub fn restore(&mut self, snapshot: &Snapshot<V>) -> bool {
-        // The region must still be open at the depth it was taken from.
-        if self.scopes.get(snapshot.depth).map(|s| s.id) != Some(snapshot.region) {
-            return false;
-        }
-        // The snapshot's own slots keep their generations, so cells made before it still resolve.
-        self.truncate(snapshot.top, true);
-        self.truncate(snapshot.base, false);
-        for (i, value) in snapshot.values.iter().enumerate() {
-            let index = snapshot.base + i;
-            let (c, o) = (chunk_of(index), offset_of(index));
-            self.chunks[c].push(value.clone());
-            self.generations[c][o] = snapshot.generations[i];
-            debug_assert_eq!(self.chunks[c].len(), o + 1);
-        }
-        self.live = snapshot.top;
-        self.scopes.truncate(snapshot.depth);
-        self.scopes.extend_from_slice(&snapshot.scopes);
-        self.stats.restores += 1;
-        true
     }
 
     /// Ascending by index, for deterministic comparison and rendering.
@@ -467,7 +336,7 @@ impl<V: Clone + Default> Arena<V> {
     }
 
     /// Drops every slot at or above `mark`, keeping the chunks.
-    fn truncate(&mut self, mark: usize, invalidate: bool) {
+    fn truncate(&mut self, mark: usize) {
         if mark >= self.live {
             return;
         }
@@ -479,11 +348,9 @@ impl<V: Clone + Default> Arena<V> {
                 journal.push((slot, self.chunks[c][o].clone()));
             }
         }
-        if invalidate {
-            for index in mark..self.live {
-                let (c, o) = (chunk_of(index), offset_of(index));
-                self.generations[c][o] = self.generations[c][o].wrapping_add(1);
-            }
+        for index in mark..self.live {
+            let (c, o) = (chunk_of(index), offset_of(index));
+            self.generations[c][o] = self.generations[c][o].wrapping_add(1);
         }
         let first = chunk_of(mark);
         let last = chunk_of(self.live.saturating_sub(1));
