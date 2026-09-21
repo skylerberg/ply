@@ -814,7 +814,8 @@ fn each_entry_point_refuses_the_other_policys_region() {
     assert!(err.message.contains("host region"), "{}", err.message);
 }
 
-/// Parking on a real token would break seed-determinism while every assertion still passed.
+/// A seeded token would be polled by nothing, and the boundary refuses the operation that would
+/// hand one over (`E0425`) long before this: reaching here is Ply's defect, not the program's.
 #[test]
 fn a_seeded_region_refuses_to_park_a_task_on_a_host_token() {
     let (mut sched, mut clock, mut trail) = solo(0);
@@ -834,7 +835,8 @@ fn a_seeded_region_refuses_to_park_a_task_on_a_host_token() {
             Span::DUMMY,
         )
         .expect_err("a simulated region may not wait on the host");
-    assert_eq!(err.code, codes::HOST_IN_SIMULATION);
+    assert_eq!(err.code, codes::INTERNAL_ERROR);
+    assert!(err.message.contains("seeded region"), "{}", err.message);
     assert!(sched.current().is_some(), "the task was parked anyway");
 }
 

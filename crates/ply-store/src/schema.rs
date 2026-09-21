@@ -62,6 +62,12 @@ fn footprint() -> Footprint {
     ])
 }
 
+/// Narrower than what the same definition publishes, so filing one row where the other belongs
+/// moves the pin.
+fn performed() -> Footprint {
+    Footprint::from_atoms([atom("db", Resource::Named(sym("users")), Mode::Read)])
+}
+
 fn every_type() -> Type {
     Type::Fn {
         params: vec![
@@ -142,7 +148,7 @@ pub fn exemplars() -> Exemplars {
                 },
             }],
         },
-        def: CachedDef::new(scheme.clone(), footprint())
+        def: CachedDef::new(scheme.clone(), footprint(), performed())
             .witnessed_by(vec![NameRef::new("user.User", h(3))]),
         type_decl: CachedDecl::new(DeclBody::Type {
             arity: 1,

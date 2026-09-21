@@ -124,20 +124,25 @@ impl SourceFingerprint {
     }
 }
 
-/// The published interface of one `fn`, keyed by its [`DefHash`].
+/// The published interface of one `fn`, keyed by its [`DefHash`]: everything a check that is
+/// handed this entry instead of the body must answer with.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct CachedDef {
     pub scheme: Scheme,
+    /// The published row: the `/ {..}` annotation if written, else the inferred row.
     pub footprint: Footprint,
+    /// The row inference computed for the body, which an annotation may widen.
+    pub performed: Footprint,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<NameRef>,
 }
 
 impl CachedDef {
-    pub fn new(scheme: Scheme, footprint: Footprint) -> CachedDef {
+    pub fn new(scheme: Scheme, footprint: Footprint, performed: Footprint) -> CachedDef {
         CachedDef {
             scheme,
             footprint,
+            performed,
             names: Vec::new(),
         }
     }
@@ -151,6 +156,7 @@ impl CachedDef {
         CachedDef {
             scheme: canonicalize_scheme(&self.scheme),
             footprint: self.footprint,
+            performed: self.performed,
             names: canonical_names(self.names),
         }
     }

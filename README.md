@@ -1,9 +1,15 @@
 # Ply
 
 Ply is a general-purpose, statically typed programming language with effects in
-every signature. Definitions are content-addressed, so the compiler and the test
-runner redo only what a change affects. The compiler is written in Ply and
-compiles to C.
+every signature. Definitions are content-addressed, and the compiler is written
+in Ply and compiles to C.
+
+Perfect incrementality is the goal the rest is shaped around: a change should
+cost work in proportion to what it reached, and nothing else. Content addressing
+is the mechanism, so the compiler and the test runner can tell what a change
+reached rather than guess from a file's bytes or its timestamp. Where a change
+still redoes more than it touched, that is a defect to fix, not a cost to live
+with.
 
 [`docs/GUIDE.md`](docs/GUIDE.md) is the language manual: syntax, types, effects,
 tests, the standard library, the `ply` command and the diagnostic codes.
@@ -53,9 +59,10 @@ name a server.
 
 The compiler is Ply source under `crates/ply-compiler/ply`, compiled to C and
 committed as `crates/ply-compiler/bootstrap/unit.c.gz` beside `SOURCES.digest`, a
-digest of those sources and `crates/ply-std/ply`. A binary whose bundle is behind
-its sources has the bundle's emitter emit them once, keeps that stage under the unit
-cache, and runs the sources from then on. Editing either makes CI's `bootstrap` job
-fail and upload the regenerated bundle as the `bootstrap-bundle` artifact; bring it
-into the tree with
-`gh run download <run-id> -n bootstrap-bundle -D crates/ply-compiler/bootstrap`.
+digest of those sources and of the shipped modules they import, which the compiler
+pulls from `crates/ply-std/ply` the way it pulls a project's (today `std.hash`
+alone). A binary whose bundle is behind its sources has the bundle's emitter emit
+them once, keeps that stage under the unit cache, and runs the sources from then on.
+So the compiler and what it imports cannot use a language rule the same change
+introduces; the rest of the standard library can. Never commit the bundle: CI
+rebuilds it on main after each merge.

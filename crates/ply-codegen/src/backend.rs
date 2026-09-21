@@ -331,6 +331,11 @@ impl Bodies {
         self.admitted.contains_key(&Symbol::new(name))
     }
 
+    /// The cell arena's `(regions open, slots live)` between entries: what a leak grows.
+    pub fn cell_extent(&self) -> (usize, usize) {
+        self.ctx.borrow().cell_extent()
+    }
+
     pub fn reset_counts(&self) {
         self.entered.set(0);
         self.declines.set(Declines::default());

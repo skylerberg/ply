@@ -465,10 +465,10 @@ pub fn running_task_of_production(c: &Ctx) -> Option<TaskId> {
     sim.running
 }
 
-pub fn innermost_is_seeded(c: &Ctx) -> bool {
-    c.sims
-        .last()
-        .is_some_and(|sim| sim.policy == Policy::Seeded)
+/// The innermost region's site when that region is seeded, so a refusal can name it.
+pub fn seeded_region(c: &Ctx) -> Option<Span> {
+    let sim = c.sims.last()?;
+    (sim.policy == Policy::Seeded).then_some(sim.site)
 }
 
 pub fn cell_access(ctx: &Ctx, b: ply_eval::Builtin, args: &[Word]) -> Option<Access> {

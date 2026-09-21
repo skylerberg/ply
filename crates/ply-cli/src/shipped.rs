@@ -317,7 +317,12 @@ fn refused_entry(built: &crate::artifact::Built) -> Diagnostic {
     } else {
         "no compiled unit could be produced for it at all".to_string()
     };
-    let diagnostic = unbuilt(why);
+    // The production's own account, which is the only thing that says why there is no unit; a
+    // reader left without it can do nothing but guess at which half of the build gave way.
+    let diagnostic = built
+        .warnings
+        .iter()
+        .fold(unbuilt(why), |d, w| d.note(w.message.clone()));
     if built.refused.is_empty() {
         return diagnostic
             .note("the emitter refused nothing, so the entry was never offered to it");

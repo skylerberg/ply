@@ -268,6 +268,17 @@ holds, so a row naming `[l]` prints its variable as `[m]` and the two stay
 apart. Filling the wrong number of labels, leaving one unfilled, or
 using a label-generic definition as a value instead of calling it, is `E0306`.
 
+Row parameters are shared the same way: one recursive group is checked with one
+set of row binders, taken in order whatever each member calls them, so a
+definition generic over a row may call a mutually recursive sibling and the row
+crosses the cycle. Members binding different numbers of them are `E0307`, as
+with labels, and a call inside the group keeps the row the group was called
+with: an argument carrying another row is `E0308`. Type parameters are *not*
+shared — each definition keeps its own — so a call inside a group that would
+need the callee's type parameter at another type is polymorphic recursion, which
+Ply does not infer. That is `E0308` as well: break the cycle so the callee is
+checked on its own before the call, or monomorphise it.
+
 ### 4.6 Types the language declares
 
 In scope everywhere; redeclaring one is `E0105`:
@@ -729,7 +740,9 @@ effect sim           { read  seed() -> Int }
 * A task performs against the handlers around its `task.spawn`; a clause that
   binds `resume` is unreachable from a task (`E0502`).
 * `E0413`: a `Task` escapes. `E0414`: no progress, or a spent step budget.
-  `E0416`: nested `simulate`.
+  `E0416`: nested `simulate`. `E0425`: a host operation inside the region,
+  refused before the handler runs and whether or not it is bound; the region
+  answers `task`, `clock`, `random` and `sim.seed` itself.
 
 Tasks interleave only at `task`, `clock` and `random` operations; any two
 allocations, and two accesses to one cell with a write, are ordered. A
@@ -1112,11 +1125,16 @@ records with `Sink` and `event_step`, `enter_step`, `exit_step`, `count_step`,
 ### 13.9 `std.process`
 
 ```ply
+pub type Var = { name: String, value: String }
+pub type Ended = Exited(Int) | Signalled(Int)
+pub type Finished = { ended: Ended, out: Bytes, err: Bytes }
+
 pub nondet effect process {
   read args[p]()             -> List<String>
   write out[p](text: String) -> Unit
   write err[p](text: String) -> Unit
   write exit[p](code: Int)   -> Unit
+  write spawn[e](args: List<String>, dir: String, env: List<Var>) -> Finished
 }
 ```
 
@@ -1131,38 +1149,143 @@ still carries the one object. Handle it over a `Captured` value: `captured(args)
 exit code; a clause `process.exit[proc](c) resume k -> ...` that never calls `k`
 ends the handled body as the host would.
 
-### 13.10 `std.fs`
+`spawn` starts another program and waits for it. Its label is not the process
+but the executable: `--exec cc=/usr/bin/cc` binds one program to `cc`, and
+`process.spawn[cc](..)` can start that program and no other. A label with no
+executable bound is `E0456`, and an `--exec` path that is missing, is not a file
+or has no execute bit is `E0457` before anything runs. Nothing in the call names
+a program, so the run decides what a footprint's `process.spawn[cc]` may do.
+
+`args` is the argument vector after the program; `dir` is the working
+directory, and `""` is the run's own. `env` is the *whole* environment: a spawn
+inherits none of the run's, so what the child reads is in the program's text and
+its configuration rather than in the shell that started `ply`. Both streams are
+captured whole — Ply has no file handles, so there is no streaming and no
+interleaving of the two — and a stream over 64MiB is `E0458`. `stdin` is empty.
+`Exited(code)` is the program's own answer and `Signalled(n)` the signal that
+killed it; neither is a diagnostic, because what a compiler says about a source
+file is a value the driver reads. The label is the capability and nothing
+narrower: a spawned process does what that program can do, so `dir` is not
+confined the way an `fs` path is. Handle it over a `Runs` value: `runs(replies)`
+hands out planned `Finished` values in order and records each `Launch`; a spawn
+with no reply planned answers `Exited(127)`, as a shell does for a command it
+could not run. Build replies with `exited(code, out, err)` and
+`signalled(signal, out, err)`, and read one back with `exit_code`.
+
+### 13.10 `std.time`
+
+```ply
+pub nondet effect time {
+  read now_ms()     -> Int
+  read elapsed_ms() -> Int
+}
+pub fn deadline_in(ms: Int) -> Int / {time.elapsed_ms}
+pub fn expired(deadline: Int) -> Bool / {time.elapsed_ms}
+pub fn since(started: Int) -> Int / {time.elapsed_ms}
+```
+
+The host's real time, in two readings, neither a function of the program state,
+so a definition that takes one is `nondet` and a `test` over it must handle it.
+`now_ms` is milliseconds since the Unix epoch: a date to stamp a record with, and
+nothing to measure with, since the system clock can be set backwards.
+`elapsed_ms` counts from the moment the run's host was built and never goes back,
+so the difference of two readings is a span; a single reading means nothing on
+its own. Handle both over a `Ticks` value: `ticks(wall, mono)` reads each list in
+order through `now_step` and `elapsed_step`, each answering a `Tick` of the
+reading and the ticks left, and repeats the last reading once a list runs out.
+
+This is not the language's `clock` (§9), which is virtual time: `clock.sleep`
+arms a timer the scheduler advances, and `clock.now` reads where the schedule has
+got to. `time` is what the operating system says, and nothing advances it. They
+are named apart because they are different things, and a program that wants a
+deadline inside `simulate { .. }` wants `clock`.
+
+### 13.11 `std.fs`
 
 ```ply
 pub type Kind = | File | Dir | Symlink | Missing
 
 pub nondet effect fs {
   read  read_file[r](path: String) -> Option<Bytes>
+  read  read_at[r](path: String, offset: Int, len: Int) -> Option<Bytes>
   read  list_dir[r](path: String) -> Option<List<String>>
   read  kind[r](path: String) -> Kind
   read  exists[r](path: String) -> Bool
   read  file_size[r](path: String) -> Option<Int>
   read  modified_ms[r](path: String) -> Option<Int>
   write write_file[r](path: String, body: Bytes) -> Bool
+  write append[r](path: String, body: Bytes) -> Option<Int>
   write create_dir[r](path: String) -> Bool
   write remove[r](path: String) -> Bool
   write rename[r](from: String, to: String) -> Bool
+  write sync[r](path: String) -> Bool
+  write lock[r](path: String) -> Bool
+  write unlock[r](path: String) -> Bool
 }
 ```
 
 The label is a root bound with `--fs NAME=PATH`. Unbound label: `E0451`; a path
-escaping its root (`..`, absolute, or a symlink outside): `E0452`; a file over
-the read bound: `E0453`. Different roots do not conflict. Reads are whole-file,
-`list_dir` is one level, `rename` stays in one root. `kind` says what a path
-names in one call and does not follow a symlink, so a walk can pass one over;
-`Missing` is also what this run cannot read. Every other operation follows one.
+escaping its root (`..`, absolute, or a symlink outside): `E0452`. Different
+roots do not conflict. `list_dir` is one level, `rename` stays in one root.
+`kind` says what a path names in one call and does not follow a symlink, so a
+walk can pass one over; `Missing` is also what this run cannot read. Every other
+operation follows one.
+
+`append` and `read_at` are what make a file a log rather than a value. `append`
+costs the size of what is new rather than the size of the file, creates the file
+if it is not there, and answers the offset the bytes landed at — so a writer
+needs no separate call to find out where its frame went, and a second appender
+racing it moves neither the bytes nor the answer. `read_at` reads `len` bytes
+from `offset`. Together they carry an append-only cache: frames appended and
+their offsets recorded, read back one frame at a time instead of a file at a
+time.
+
+`read_at` answers **what is there**, which may be less than was asked for: a
+range that runs past the end is short, and one that starts at or past the end is
+empty. That is deliberate, and the one place `std.fs` parts company with
+`bytes_slice`, which never clamps a range: a value's length is known and fixed,
+while a file's is neither, so a reader holding an offset it recorded earlier
+would otherwise be raised at for a file that shrank — and a shrunken cache is a
+warning to its reader, not a fault in the program. Compare the answer's length
+with the one you asked for to tell a short read from a whole one. A negative
+offset or length is the other way round: no file can answer it, so it is
+arithmetic that went wrong and raises `E0502`. Two reads of one range may differ;
+the effect is `nondet` and a file can change under it.
+
+`E0453` bounds one call, not a file: `read_file` refuses a file whose whole
+contents would be the answer, and `read_at` refuses a `len`, each above 64 MiB.
+A larger file is read a range at a time.
+
+`sync` makes what was written durable, and is what a paired cache needs to be
+honest rather than lucky. A write reaches the page cache, not the disk, and
+`rename` orders the *name* rather than the bytes behind it — so an index renamed
+into place can name frames a crash then loses. Sync the data file before the
+index that names it. On a directory it flushes the names in it, which is what
+makes a `rename` itself durable. `false` means the path names nothing to flush.
+
+`lock` and `unlock` serialise a read-merge-write across processes, which a
+`rename` alone cannot: two runs that flush a cache at once lose one of them.
+The path names the lock file itself, under the same root as what it guards.
+`lock` answers `true` when it created that file, and `false` when a holder still
+had it after two seconds of waiting — contention is a value, never a diagnostic.
+There is no reentrancy: a run that asks twice for a lock it already holds waits
+the same two seconds and gets `false`. A lock file older than thirty seconds is
+one whose holder died, and the next taker removes it and takes it. `unlock`
+releases the claim this run took, answering `true`, and answers `false` — and
+removes nothing — for a lock it does not hold, so one run cannot break another's.
+A run that dies holding a lock leaves the file behind, and the stale age is what
+recovers it.
+
 The twin is `MemFs` (`mem_empty`, `mem_of`, `mem_read`, `mem_write`, `mem_list`,
 `mem_kind`, `mem_exists`, `mem_size`, `mem_create_dir`, `mem_remove`,
-`mem_rename`, `mem_modified`); it holds no symlinks, so `mem_kind` never answers
-`Symlink`. A test imports both `std.fs` and `std.fs (fs)` to name the module and
-the effect.
+`mem_rename`, `mem_modified`, `mem_read_at`, `mem_append`, `mem_sync`,
+`mem_lock`, `mem_unlock`); it holds no symlinks, so `mem_kind` never answers
+`Symlink`, it has no wall clock, so no lock in it goes stale, and it was never on
+a disk, so `mem_sync` only says whether the path names something. `mem_append`
+answers an `Appended` of the tree and the offset. A test imports both `std.fs`
+and `std.fs (fs)` to name the module and the effect.
 
-### 13.11 `std.path`
+### 13.12 `std.path`
 
 ```ply
 pub fn join(dir: String, name: String) -> String
@@ -1177,7 +1300,7 @@ last segment, `""` for a path ending in a separator. `extension` follows the las
 dot of the file name, and a dotfile has none. `strip_dot` removes a leading
 `./`, so `./m.ply` and `m.ply` are one key in a set.
 
-### 13.12 `std.hash`
+### 13.13 `std.hash`
 
 `pub fn blake3(input: Bytes) -> Bytes` answers 32 bytes. It is written in Ply
 and slow; use it for small inputs.
@@ -1186,7 +1309,9 @@ and slow; use it for small inputs.
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
 handler that would serve it. With `--host`, a test that reaches a bound handler
-always runs and is never cached. `std.signal` and `std.process` are bound only
+always runs and is never cached. An operation performed inside a `simulate`
+region reaches no handler at all: it is `E0425` (§9), since the region is run
+once per interleaving. `std.signal` and `std.process` are bound only
 by `ply run --host`; `ply test --host` withholds them (`E0424`). All flags
 below require `--host`.
 
@@ -1203,6 +1328,7 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")`; `E0430` if it does not load, `E0429` if unnamed |
 | `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
+| `--exec NAME=PATH` | repeatable program a `process.spawn` label may start (`ply run` only); `E0457` if it cannot be executed |
 | `--db URL` | database (else `PLY_DB_URL`; password from `PLY_DB_PASSWORD`); `E0431` if absent when used |
 | `--db-pool N` | pool size |
 | `--db-acquire-ms MS` | wait for a connection before `E0437` |
@@ -1386,7 +1512,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0304` | resource label required |
 | `E0305` | `handle` leaves an operation, or a mode atom, under a handled mode atom unanswered |
 | `E0306` | label instantiation: a call leaves a label unfilled or writes the wrong number of them, or a label-generic definition is used as a value |
-| `E0307` | mutually recursive definitions binding different label parameters |
+| `E0307` | mutually recursive definitions binding different label or row parameters |
+| `E0308` | polymorphic recursion: a call inside a recursive group asks for another row or type parameter than the group was checked with |
 | `E0412` | nondeterministic effect in a deterministic test |
 | `E0413` | `Task` escapes its region |
 | `E0414` | deadlock, or spent step budget |
@@ -1400,7 +1527,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0422` | two host registrations for one atom |
 | `E0423` | host handler determinism disagrees with the declaration |
 | `E0424` | operation reached the host boundary with nothing bound |
-| `E0425` | host operation reached from a test the search re-runs |
+| `E0425` | host operation inside a `simulate` region, or in a test the search re-runs |
 | `E0426` | continuation resumed twice across an at-most-once host operation |
 | `E0427` | host handler answered an atom outside the entry point's footprint |
 | `E0428` | `blocking` host handler answered inline |
@@ -1427,9 +1554,12 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0450` | compiled backend cannot be attached |
 | `E0451` | `fs` label with no root bound |
 | `E0452` | path leaves its root |
-| `E0453` | whole-file read over the bound |
+| `E0453` | read over the bound |
 | `E0454` | `--fs` root that is not a directory |
 | `E0455` | the program asked to exit with a code |
+| `E0456` | `process.spawn` label with no executable bound |
+| `E0457` | `--exec` path that cannot be executed |
+| `E0458` | captured output over the bound |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | ran past its time budget |
@@ -1453,7 +1583,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
   modules-as-values or first-class effects; no `unsafe` or FFI.
 * Specs cannot name mutable state. Cycles are not collected, and a task never
   moves between OS threads.
-* No file handles, streaming, recursive walk, permissions or `stdin`; no
+* No file handles — `fs` reads a range and appends by path, with nothing open
+  between calls — and no recursive walk, permissions or `stdin`; no
   cancellation or backpressure; no migrations or live schema check; HTTP/1.1
   only; no authentication framework.
 

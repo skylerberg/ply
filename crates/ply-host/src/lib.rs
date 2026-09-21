@@ -12,6 +12,7 @@ pub mod registry;
 pub mod sched;
 pub mod signal;
 pub mod tcp;
+pub mod time;
 pub mod tls;
 pub mod trace;
 

@@ -229,24 +229,29 @@ pub struct HandlerFrame {
     simulate: bool,
     /// For a `handle` resuming off the tail: the detached body whose own stack this frame bottoms.
     detached: Option<usize>,
+    /// How deep the region stack stood when this frame went on: an unwind caught at this `handle`
+    /// closes back to here, since the body it abandons never reaches the closes below its jump.
+    regions: usize,
 }
 
 impl HandlerFrame {
-    fn simulate() -> HandlerFrame {
+    fn simulate(regions: usize) -> HandlerFrame {
         HandlerFrame {
             clauses: Vec::new(),
             ret: 0,
             simulate: true,
             detached: None,
+            regions,
         }
     }
 
-    pub(crate) fn detached(clauses: Vec<FrameClause>, id: usize) -> HandlerFrame {
+    pub(crate) fn detached(clauses: Vec<FrameClause>, id: usize, regions: usize) -> HandlerFrame {
         HandlerFrame {
             clauses,
             ret: 0,
             simulate: false,
             detached: Some(id),
+            regions,
         }
     }
 }
@@ -314,6 +319,7 @@ pub(crate) fn clone_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
                 ret: f.ret,
                 simulate: f.simulate,
                 detached: f.detached,
+                regions: f.regions,
             }
         })
         .collect()
@@ -492,8 +498,6 @@ impl Ctx {
 
     /// Between calls, and only between calls.
     pub fn begin(&mut self, fuel: i64) {
-        let arena = self.cells.arena();
-        self.cells_baseline = (arena.depth(), arena.live());
         self.failed = 0;
         self.fuel = fuel;
         self.ticks = 0;
@@ -522,12 +526,21 @@ impl Ctx {
             self.unclosed_entries += 1;
             self.end();
         }
+        // After the recovery above, which gives back what that entry held.
+        self.cells_baseline = self.cell_extent();
         heap::enter(&mut self.heap);
         heap::poison::enter(&raw const self.site_root);
     }
 
     /// The other end of [`Ctx::begin`]: the entry gives back what it used.
     pub fn end(&mut self) {
+        // Only this runs on every exit, so a region a failure or an unwind jumped past closes
+        // here; the cells go back before the heap their words live in.
+        self.cells.close_program_regions();
+        debug_assert!(
+            self.cells_balanced(),
+            "closing the entry's regions left slots the arena did not reclaim"
+        );
         heap::poison::leave();
         heap::leave();
         self.last_entry = self.heap.allocated();
@@ -592,8 +605,17 @@ impl Ctx {
     /// Whether the entry gave back every region it opened and cell slot it took; a cell word in the
     /// answer is refused separately.
     pub fn cells_balanced(&self) -> bool {
-        let arena = self.cells.arena();
-        (arena.depth(), arena.live()) == self.cells_baseline
+        self.cell_extent() == self.cells_baseline
+    }
+
+    /// The cell arena's `(regions open, slots live)`, which an entry has to leave as it found.
+    pub fn cell_extent(&self) -> (usize, usize) {
+        (self.region_depth(), self.cells.arena().live())
+    }
+
+    /// How deep the region stack stands, for a handler frame that closes back to it.
+    pub(crate) fn region_depth(&self) -> usize {
+        self.cells.arena().depth()
     }
 
     /// The singleton a nullary constructor is.
@@ -729,8 +751,8 @@ pub unsafe extern "C" fn rt_region(ctx: *mut Ctx, unique: i64) -> i64 {
     ctx.cells.open_region(kind, Span::DUMMY).0 as i64
 }
 
-/// Closes a region, reclaiming its cells. Only success emits it; a failed body leaves the entry
-/// unbalanced and the seam falls back to the machine.
+/// Closes a region, reclaiming its cells. The emitter puts it after the body, so only a body that
+/// ran to its end reaches it; an abandoned one is closed by its `handle` or by [`Ctx::end`].
 pub unsafe extern "C" fn rt_region_close(ctx: *mut Ctx, region: i64) {
     let ctx = unsafe { &mut *ctx };
     ctx.cells
@@ -1816,12 +1838,14 @@ pub unsafe extern "C" fn rt_handle_push(
 ) -> i64 {
     let c = unsafe { &mut *ctx };
     let clauses = clauses_of(c, clauses, n);
+    let regions = c.region_depth();
     let frames = c.frames();
     frames.push(HandlerFrame {
         clauses,
         ret,
         simulate: false,
         detached: None,
+        regions,
     });
     (frames.len() - 1) as i64
 }
@@ -2051,7 +2075,8 @@ pub unsafe extern "C" fn rt_simulate(ctx: *mut Ctx, body: i64) -> i64 {
     c.trail.enter(site);
     let stack = c.current;
     let depth = c.frames().len();
-    c.frames().push(HandlerFrame::simulate());
+    let regions = c.region_depth();
+    c.frames().push(HandlerFrame::simulate(regions));
     let sim = crate::simulate::Simulation::new(
         ply_eval::sched::Scheduler::new(id, site).with_step_budget(c.sim_steps),
         site,
@@ -2093,6 +2118,9 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
         if target_stack == stack && target == depth {
             c.failed = 0;
             if let Some(f) = mine {
+                // The body is abandoned where it stood, above the closes the emitter put after
+                // the regions it opened; they go back here so the entry stays balanced.
+                c.cells.close_regions_above(f.regions);
                 drop_frame(f);
             }
             return v;

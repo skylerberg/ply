@@ -8,78 +8,111 @@ use ply_eval::host::{
 use ply_eval::{Pending, Value};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_ty::Resource;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Must match the effect `std.fs` declares.
 pub const EFFECT: &str = "fs";
 
-pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// The most one read answers. A larger file is read a range at a time with `fs.read_at`, so this
+/// bounds a single call rather than a file.
+pub const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How long `fs.lock` waits for a holder to release before answering `false`.
+pub const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+const LOCK_POLL: Duration = Duration::from_millis(2);
+
+/// Far longer than a read-merge-write takes, so only a lock left by a killed process is broken.
+pub const LOCK_STALE_AGE: Duration = Duration::from_secs(30);
 
 /// In the order `std.fs` declares them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Op {
     ReadFile,
+    ReadAt,
     ListDir,
     Kind,
     Exists,
     FileSize,
     ModifiedMs,
     WriteFile,
+    Append,
     CreateDir,
     Remove,
     Rename,
+    Sync,
+    Lock,
+    Unlock,
 }
 
 impl Op {
-    pub const ALL: [Op; 10] = [
+    pub const ALL: [Op; 15] = [
         Op::ReadFile,
+        Op::ReadAt,
         Op::ListDir,
         Op::Kind,
         Op::Exists,
         Op::FileSize,
         Op::ModifiedMs,
         Op::WriteFile,
+        Op::Append,
         Op::CreateDir,
         Op::Remove,
         Op::Rename,
+        Op::Sync,
+        Op::Lock,
+        Op::Unlock,
     ];
 
     pub fn name(self) -> &'static str {
         match self {
             Op::ReadFile => "read_file",
+            Op::ReadAt => "read_at",
             Op::ListDir => "list_dir",
             Op::Kind => "kind",
             Op::Exists => "exists",
             Op::FileSize => "file_size",
             Op::ModifiedMs => "modified_ms",
             Op::WriteFile => "write_file",
+            Op::Append => "append",
             Op::CreateDir => "create_dir",
             Op::Remove => "remove",
             Op::Rename => "rename",
+            Op::Sync => "sync",
+            Op::Lock => "lock",
+            Op::Unlock => "unlock",
         }
     }
 
     pub fn what(self) -> &'static str {
         match self {
             Op::ReadFile => "`fs.read_file`",
+            Op::ReadAt => "`fs.read_at`",
             Op::ListDir => "`fs.list_dir`",
             Op::Kind => "`fs.kind`",
             Op::Exists => "`fs.exists`",
             Op::FileSize => "`fs.file_size`",
             Op::ModifiedMs => "`fs.modified_ms`",
             Op::WriteFile => "`fs.write_file`",
+            Op::Append => "`fs.append`",
             Op::CreateDir => "`fs.create_dir`",
             Op::Remove => "`fs.remove`",
             Op::Rename => "`fs.rename`",
+            Op::Sync => "`fs.sync`",
+            Op::Lock => "`fs.lock`",
+            Op::Unlock => "`fs.unlock`",
         }
     }
 
     fn arity(self) -> usize {
         match self {
-            Op::WriteFile | Op::Rename => 2,
+            Op::ReadAt => 3,
+            Op::WriteFile | Op::Append | Op::Rename => 2,
             _ => 1,
         }
     }
@@ -88,15 +121,20 @@ impl Op {
     fn label(self) -> &'static str {
         match self {
             Op::ReadFile => "fs-read",
+            Op::ReadAt => "fs-read-at",
             Op::ListDir => "fs-list",
             Op::Kind => "fs-kind",
             Op::Exists => "fs-exists",
             Op::FileSize => "fs-size",
             Op::ModifiedMs => "fs-modified",
             Op::WriteFile => "fs-write",
+            Op::Append => "fs-append",
             Op::CreateDir => "fs-mkdir",
             Op::Remove => "fs-remove",
             Op::Rename => "fs-rename",
+            Op::Sync => "fs-sync",
+            Op::Lock => "fs-lock",
+            Op::Unlock => "fs-unlock",
         }
     }
 
@@ -214,6 +252,8 @@ impl Roots {
 pub struct FsHost {
     roots: Roots,
     pool: Pool,
+    /// The lock files this run took and has not released; a lock it did not take it cannot release.
+    held: Arc<Mutex<BTreeSet<PathBuf>>>,
 }
 
 impl FsHost {
@@ -221,6 +261,7 @@ impl FsHost {
         FsHost {
             roots,
             pool: Pool::new(FS_FIRST_TOKEN),
+            held: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -255,28 +296,40 @@ impl FsHost {
     fn path(op: Op) -> &'static str {
         match op {
             Op::ReadFile => "ply_host::fs::read_file",
+            Op::ReadAt => "ply_host::fs::read_at",
             Op::ListDir => "ply_host::fs::list_dir",
             Op::Kind => "ply_host::fs::kind",
             Op::Exists => "ply_host::fs::exists",
             Op::FileSize => "ply_host::fs::file_size",
             Op::ModifiedMs => "ply_host::fs::modified_ms",
             Op::WriteFile => "ply_host::fs::write_file",
+            Op::Append => "ply_host::fs::append",
             Op::CreateDir => "ply_host::fs::create_dir",
             Op::Remove => "ply_host::fs::remove",
             Op::Rename => "ply_host::fs::rename",
+            Op::Sync => "ply_host::fs::sync",
+            Op::Lock => "ply_host::fs::lock",
+            Op::Unlock => "ply_host::fs::unlock",
         }
     }
 }
 
+pub fn registrations(fs: &Arc<FsHost>) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
+    Op::ALL
+        .iter()
+        .map(|op| {
+            let handler: Arc<dyn HostHandler> = Arc::new(Operation {
+                op: *op,
+                fs: Arc::clone(fs),
+            });
+            (op.declaration(FsHost::path(*op)), handler)
+        })
+        .collect()
+}
+
 pub fn register(registry: &mut HostRegistry, fs: Arc<FsHost>) {
-    for op in Op::ALL {
-        registry.register(
-            op.declaration(FsHost::path(op)),
-            Arc::new(Operation {
-                op,
-                fs: Arc::clone(&fs),
-            }),
-        );
+    for (op, handler) in registrations(&fs) {
+        registry.register(op, handler);
     }
 }
 
@@ -300,17 +353,32 @@ impl HostHandler for Operation {
 
         let first = req.args[0].as_str(span, "a path")?.to_string();
         let second = match self.op {
-            Op::WriteFile => Second::Body(Arc::clone(req.args[1].as_bytes(span, "a body")?)),
+            Op::WriteFile | Op::Append => {
+                Second::Body(Arc::clone(req.args[1].as_bytes(span, "a body")?))
+            }
             Op::Rename => Second::Path(req.args[1].as_str(span, "a path")?.to_string()),
+            Op::ReadAt => {
+                let offset = req.args[1].as_int(span, "an offset")?;
+                let len = req.args[2].as_int(span, "a length")?;
+                // A file can be any length, but neither of these can be negative whatever it holds.
+                if offset < 0 || len < 0 {
+                    return Err(negative_range(offset, len, span));
+                }
+                if len as u64 > MAX_READ_BYTES {
+                    return Err(too_large(len as u64, &first, span));
+                }
+                Second::Range { offset, len }
+            }
             _ => Second::None,
         };
 
         let op = self.op;
+        let held = Arc::clone(&self.fs.held);
         let pending = self.fs.pool.submit(
             span,
             op.label(),
             op.what(),
-            Box::new(move || run(op, &root, &first, second, span)),
+            Box::new(move || run(op, &root, &first, second, &held, span)),
         )?;
         Ok(HostAnswer::Pending(pending))
     }
@@ -320,9 +388,17 @@ enum Second {
     None,
     Body(Arc<[u8]>),
     Path(String),
+    Range { offset: i64, len: i64 },
 }
 
-fn run(op: Op, root: &Path, path: &str, second: Second, span: Span) -> Done {
+fn run(
+    op: Op,
+    root: &Path,
+    path: &str,
+    second: Second,
+    held: &Mutex<BTreeSet<PathBuf>>,
+    span: Span,
+) -> Done {
     let target = match confine(root, path, span) {
         Ok(target) => target,
         Err(refusal) => return Done::Refused(refusal),
@@ -331,7 +407,9 @@ fn run(op: Op, root: &Path, path: &str, second: Second, span: Span) -> Done {
         Op::ReadFile => match std::fs::metadata(&target) {
             Err(_) => Done::MaybeBytes(None),
             Ok(meta) if !meta.is_file() => Done::MaybeBytes(None),
-            Ok(meta) if meta.len() > MAX_FILE_BYTES => Done::Refused(too_large(&meta, path, span)),
+            Ok(meta) if meta.len() > MAX_READ_BYTES => {
+                Done::Refused(too_large(meta.len(), path, span))
+            }
             Ok(_) => match std::fs::read(&target) {
                 Ok(bytes) => Done::MaybeBytes(Some(bytes)),
                 Err(_) => Done::MaybeBytes(None),
@@ -390,7 +468,114 @@ fn run(op: Op, root: &Path, path: &str, second: Second, span: Span) -> Done {
             },
             _ => Done::Failed("a rename with no destination reached the pool".into()),
         },
+        Op::ReadAt => match second {
+            Second::Range { offset, len } => Done::MaybeBytes(read_range(&target, offset, len)),
+            _ => Done::Failed("a ranged read with no range reached the pool".into()),
+        },
+        Op::Append => match second {
+            Second::Body(body) => Done::MaybeInt(append_to(&target, &body)),
+            _ => Done::Failed("an append with no body reached the pool".into()),
+        },
+        Op::Sync => Done::Bool(sync_path(&target)),
+        Op::Lock => Done::Bool(take_lock(&target, held)),
+        Op::Unlock => Done::Bool(drop_lock(&target, held)),
     }
+}
+
+/// Costs the size of what is new rather than the size of the file, which is the point of it. The
+/// answer is the offset the bytes landed at: `O_APPEND` puts them at the end atomically, and the
+/// descriptor's position afterwards is the end of what *this* write produced, so a second appender
+/// racing this one moves neither the bytes nor the answer.
+fn append_to(target: &Path, body: &[u8]) -> Option<i64> {
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(target)
+        .ok()?;
+    // A write of nothing writes nothing, leaving the descriptor at 0 rather than at the end.
+    if body.is_empty() {
+        return i64::try_from(file.metadata().ok()?.len()).ok();
+    }
+    file.write_all(body).ok()?;
+    let end = file.stream_position().ok()?;
+    i64::try_from(end.checked_sub(body.len() as u64)?).ok()
+}
+
+/// What is there, which may be less than was asked for: a file can end before the range does, and
+/// a reader that recorded an offset cannot be told its cache is short by a diagnostic it cannot
+/// catch. `None` keeps the meaning it has for `read_file`: this path names nothing to read.
+fn read_range(target: &Path, offset: i64, len: i64) -> Option<Vec<u8>> {
+    let mut file = File::open(target).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    file.seek(SeekFrom::Start(offset as u64)).ok()?;
+    let mut out = Vec::new();
+    file.take(len as u64).read_to_end(&mut out).ok()?;
+    Some(out)
+}
+
+/// A file's own bytes, or — for a directory — the names in it, which is what makes a rename
+/// durable. Both are what an append-only store fsyncs before an index is allowed to name them.
+fn sync_path(target: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(target) else {
+        return false;
+    };
+    // A directory cannot be opened for writing, and its entries are what fsync flushes either way.
+    let opened = if meta.is_dir() {
+        File::open(target)
+    } else {
+        OpenOptions::new().write(true).open(target)
+    };
+    opened.and_then(|file| file.sync_all()).is_ok()
+}
+
+/// `O_CREAT|O_EXCL` on a lock file, waiting out a holder and breaking one a dead run left behind.
+pub fn take_lock(target: &Path, held: &Mutex<BTreeSet<PathBuf>>) -> bool {
+    take_lock_within(target, held, LOCK_WAIT)
+}
+
+/// [`take_lock`] over a wait it does not choose; `fs.lock` always waits [`LOCK_WAIT`].
+pub fn take_lock_within(target: &Path, held: &Mutex<BTreeSet<PathBuf>>, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        match OpenOptions::new().write(true).create_new(true).open(target) {
+            Ok(_) => {
+                lock(held).insert(target.to_path_buf());
+                return true;
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            // No directory to hold it, or no permission: waiting would not change either.
+            Err(_) => return false,
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        if is_older_than(target, LOCK_STALE_AGE) {
+            let _ = std::fs::remove_file(target);
+        }
+        std::thread::sleep(LOCK_POLL);
+    }
+}
+
+/// The claim, not the file, is what a run releases: a lock it never took is not its to break.
+pub fn drop_lock(target: &Path, held: &Mutex<BTreeSet<PathBuf>>) -> bool {
+    if !lock(held).remove(target) {
+        return false;
+    }
+    let _ = std::fs::remove_file(target);
+    true
+}
+
+fn is_older_than(path: &Path, age: Duration) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .is_ok_and(|m| m.elapsed().is_ok_and(|elapsed| elapsed >= age))
+}
+
+/// The guarded set has no invariant a panicking job can break, so recovering is correct.
+fn lock(held: &Mutex<BTreeSet<PathBuf>>) -> MutexGuard<'_, BTreeSet<PathBuf>> {
+    held.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn confine(root: &Path, path: &str, span: Span) -> Result<PathBuf, Diagnostic> {
@@ -452,16 +637,26 @@ fn escapes(root: &Path, path: &str, why: &str, span: Span) -> Diagnostic {
 }
 
 #[cold]
-fn too_large(meta: &std::fs::Metadata, path: &str, span: Span) -> Diagnostic {
+fn too_large(bytes: u64, path: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::FS_FILE_TOO_LARGE,
-        format!("`{path}` is {} bytes", meta.len()),
+        format!("a read of `{path}` would answer {bytes} bytes"),
     )
-    .primary(span, "this file is larger than a whole-file read allows")
+    .primary(span, "this is more than one read answers")
     .note(format!(
-        "`fs.read_file` answers with the whole file as one value, and the bound is {MAX_FILE_BYTES} bytes"
+        "a read answers with one whole value, and the bound is {MAX_READ_BYTES} bytes"
     ))
-    .note("there are no file handles and no streaming in v1, so there is no way to read part of it")
+    .note("read it a range at a time with `fs.read_at(path, offset, len)`, which is also what keeps the cost of reading a large file proportional to the part that is wanted")
+}
+
+#[cold]
+fn negative_range(offset: i64, len: i64, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`fs.read_at` was given offset {offset} and length {len}"),
+    )
+    .primary(span, "neither an offset nor a length can be negative")
+    .note("a range running past the end of a file is answered short, because a file can shrink between the call that measured it and the call that reads it; a negative one is arithmetic that went wrong, which no file can answer")
 }
 
 #[cold]
