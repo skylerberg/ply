@@ -29,15 +29,3 @@ mechanical, since a group whose members want *different* instantiations of a typ
 polymorphic recursion, which needs written signatures to stay decidable. Assumed: worth doing for
 rows, where there is no such difficulty, and worth refusing clearly for types. Say whether you
 want both, rows only, or neither.
-
-## A bound host operation is answered for real inside `simulate`
-
-On the interpreter tier, `ply test --host` answers a non-blocking bound host operation inside a
-`simulate` region against the real host, once per interleaving, so a search reports a proof over
-schedules built on readings that differed. The compiled tier refuses every host operation in a
-seeded region (`crates/ply-codegen/src/host.rs`, `innermost_is_seeded`); the interpreter refuses
-only the blocking ones (`crates/ply-eval/src/sched.rs`), which never sees an operation answered
-inline. It reaches `std.config.get` and `std.signal.stopping` today, and `std.time` joins them.
-Assumed: the interpreter should match the compiled tier and refuse them all, rather than
-simulation growing a second notion of each. Say if you would rather a bound operation were
-allowed and the proof narrowed to what it covers.
