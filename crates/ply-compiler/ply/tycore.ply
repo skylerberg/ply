@@ -759,6 +759,51 @@ pub fn atoms_text(atoms: List<Atom>, sep: Bytes) -> Bytes = {
   }
 }
 
+// --- Reading atoms back -------------------------------------------------------------------
+
+fn last_dot(b: Bytes) -> Int =
+  fold(range(0, bytes_len(b)), 0 - 1, |acc: Int, i: Int| if bytes_at(b, i) == 46 { i } else { acc })
+
+type Split = { name: Bytes, resource: Resource }
+
+fn read_atom(text: Bytes) -> Option<Atom> = {
+  let n = bytes_len(text);
+  let split: Option<Split> =
+    match bytes_index_of(text, b"[") {
+      None -> Some({ name: text, resource: RSingleton }),
+      Some(i) ->
+        if n == 0 || bytes_at(text, n - 1) != 93 || i == 0 { None }
+        else { Some({ name: bytes_slice(text, 0, i), resource: RNamed(bytes_slice(text, i + 1, n - 1)) }) },
+    };
+  match split {
+    None -> None,
+    Some(s) -> {
+      let d = last_dot(s.name);
+      if d <= 0 || d >= bytes_len(s.name) - 1 { None } else {
+        let effect = bytes_slice(s.name, 0, d);
+        let access = bytes_slice(s.name, d + 1, bytes_len(s.name));
+        if access == b"read" { Some({ effect: effect, resource: s.resource, mode: MRead, op: None }) }
+        else if access == b"write" { Some({ effect: effect, resource: s.resource, mode: MWrite, op: None }) }
+        // An operation's mode is its declaration's, which this text does not carry; the caller settles it.
+        else { Some({ effect: effect, resource: s.resource, mode: MWrite, op: Some(access) }) }
+      }
+    },
+  }
+}
+
+// The inverse of `atoms_text(_, b",")`. A text that binds label variables names them from the start
+// of the alphabet, so nothing in it says which parameter each one was: that text reads as nothing.
+pub fn read_atoms(text: Bytes) -> Option<List<Atom>> =
+  if bytes_len(text) == 0 { Some([]) }
+  else if bytes_at(text, 0) == 60 { None }
+  else {
+    fold(bytes_split(text, b","), Some([]), |acc: Option<List<Atom>>, piece: Bytes|
+      match acc {
+        None -> None,
+        Some(xs) -> match read_atom(piece) { Some(a) -> Some(push(xs, a)), None -> None },
+      })
+  }
+
 pub fn print_row(p: Printer, r: Row) -> { p: Printer, s: Bytes } = {
   let out = print_atoms(p, r.atoms, b", ");
   match r.tail {
@@ -833,6 +878,22 @@ test "an operation atom sorts after its mode atom, which covers it" {
   assert(!atoms_covered([rd], send));
   assert_eq(row_text(row_without_covered(row_closed([send, wr, recv, rd]), [wr])), b"{net.read[conn]}");
   assert_eq(row_text(row_without_covered(row_closed([send, recv, rd]), [send])), b"{net.read[conn], net.recv[conn]}")
+}
+
+test "atoms read back as the atoms they were printed from" {
+  let rd = { effect: b"m.db", resource: RNamed(b"users"), mode: MRead, op: None };
+  let wr = { effect: b"m.net", resource: RSingleton, mode: MWrite, op: None };
+  let send = { effect: b"m.net", resource: RNamed(b"conn"), mode: MWrite, op: Some(b"send") };
+  assert_eq(read_atoms(b""), Some([]));
+  assert_eq(read_atoms(atoms_text([rd], b",")), Some([rd]));
+  assert_eq(read_atoms(atoms_text([rd, wr], b",")), Some([rd, wr]));
+  assert_eq(read_atoms(atoms_text([send], b",")), Some([send]));
+  // A label variable's name is the printer's, not the parameter's, so a text that binds one is refused.
+  assert_eq(read_atoms(atoms_text([{ effect: b"m.net", resource: RVar(4), mode: MWrite, op: Some(b"send") }], b",")), None);
+  assert_eq(read_atoms(b"db"), None);
+  assert_eq(read_atoms(b".read"), None);
+  assert_eq(read_atoms(b"m.db."), None);
+  assert_eq(read_atoms(b"m.db.read[users"), None)
 }
 
 test "the printer names variables in the order it meets them, rows apart" {
