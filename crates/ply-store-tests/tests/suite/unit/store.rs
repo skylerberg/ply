@@ -1659,8 +1659,8 @@ fn a_root_carrying_a_dot_hands_back_the_spelling_that_was_stored() {
 }
 
 #[test]
-fn only_the_latest_answers_parts_are_kept_and_a_damaged_file_keeps_none() {
-    let root = TempRoot::new("answer-parts");
+fn only_the_latest_claims_parts_are_kept_and_a_damaged_file_keeps_none() {
+    let root = TempRoot::new("claims-parts");
     let parts = |entries: &[(u8, &str)]| {
         entries
             .iter()
@@ -1668,32 +1668,32 @@ fn only_the_latest_answers_parts_are_kept_and_a_damaged_file_keeps_none() {
             .collect::<std::collections::BTreeMap<_, _>>()
     };
     let mut store = root.open();
-    store.put_front_parts(parts(&[(1, "one"), (2, "two 2\nlines")]));
-    assert_eq!(store.front_part(content(1)).as_deref(), Some("one"));
+    store.put_claims_parts(parts(&[(1, "one"), (2, "two 2\nlines")]));
+    assert_eq!(store.claims_part(content(1)).as_deref(), Some("one"));
     store.flush().unwrap();
 
     let mut store = root.open();
     assert_eq!(
-        store.front_part(content(2)).as_deref(),
+        store.claims_part(content(2)).as_deref(),
         Some("two 2\nlines")
     );
-    store.put_front_parts(parts(&[(2, "two 2\nlines"), (3, "three")]));
+    store.put_claims_parts(parts(&[(2, "two 2\nlines"), (3, "three")]));
     store.flush().unwrap();
 
     let store = root.open();
     assert_eq!(
-        store.front_part(content(1)),
+        store.claims_part(content(1)),
         None,
         "an earlier answer's part"
     );
-    assert_eq!(store.front_part(content(3)).as_deref(), Some("three"));
+    assert_eq!(store.claims_part(content(3)).as_deref(), Some("three"));
 
-    let path = root.path().join(CACHE_DIR_NAME).join("frontend.answer");
+    let path = root.path().join(CACHE_DIR_NAME).join("claims.answer");
     let mut bytes = fs::read(&path).unwrap();
     let last = bytes.len() - 1;
     bytes[last] ^= 1;
     fs::write(&path, bytes).unwrap();
-    assert_eq!(root.open().front_part(content(3)), None);
+    assert_eq!(root.open().claims_part(content(3)), None);
 }
 
 #[test]
