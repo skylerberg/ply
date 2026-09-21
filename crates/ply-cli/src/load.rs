@@ -195,12 +195,6 @@ pub(crate) fn discover(path: &Path) -> Result<(PathBuf, Vec<Discovered>), Vec<Di
 
 /// Every `.ply` file under `root`, sorted.
 pub(crate) fn ply_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
-    // A project rooted at `.` has the empty path as its root.
-    let root = if root.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        root
-    };
     let mut files = Vec::new();
     collect(root, &mut files)?;
     files.sort();
@@ -229,9 +223,16 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Strips `./`, which would otherwise show up in every rendered span.
+/// Strips `./`, which would otherwise show up in every rendered span. `.` and `./` strip to
+/// nothing, and the empty path names no directory: it is the working directory, so it stays `.`.
+/// Every caller reads the answer as a directory — the root a `--fs` binding resolves once before
+/// anything runs is one of them, and an empty one is `E0454`.
 pub fn tidy(path: &Path) -> PathBuf {
-    path.strip_prefix("./").unwrap_or(path).to_path_buf()
+    let stripped = path.strip_prefix("./").unwrap_or(path);
+    if stripped.as_os_str().is_empty() {
+        return PathBuf::from(".");
+    }
+    stripped.to_path_buf()
 }
 
 /// [`ModuleName::from_relative_path`] has no source to point at.

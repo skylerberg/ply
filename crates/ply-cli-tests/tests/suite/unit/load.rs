@@ -227,6 +227,14 @@ fn a_leading_dot_slash_never_reaches_a_rendered_span() {
     assert_eq!(tidy(Path::new("src/a.ply")), PathBuf::from("src/a.ply"));
 }
 
+/// An empty path names no directory, and a `--fs` root bound to one resolves against nothing.
+#[test]
+fn the_working_directory_tidies_to_itself_rather_than_to_nothing() {
+    assert_eq!(tidy(Path::new(".")), PathBuf::from("."));
+    assert_eq!(tidy(Path::new("./")), PathBuf::from("."));
+    assert_eq!(project_root(Path::new(".")), PathBuf::from("."));
+}
+
 #[test]
 fn the_texts_are_every_module_the_port_answered_the_shipped_ones_included() {
     let dir = tempfile::tempdir().unwrap();

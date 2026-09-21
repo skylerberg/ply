@@ -167,12 +167,71 @@ fn the_programs_own_tests_pass() {
     let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
     let v: Value = serde_json::from_slice(&out.stdout)
         .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
-    assert_eq!(v["exit_code"], 0, "{v:#}");
-    assert_eq!(v["summary"]["failed"], 0, "{v:#}");
+    assert_eq!(v["exit_code"], 0, "{}", red(&v));
+    assert_eq!(v["summary"]["failed"], 0, "{}", red(&v));
     assert!(
         v["summary"]["passed"].as_u64().unwrap() > 0,
-        "the program declares no test: {v:#}"
+        "the program declares no test: {}",
+        v["summary"]
     );
+}
+
+/// The whole report is a compiled unit's worth of timings; name the tests that failed and what
+/// each said instead.
+fn red(report: &Value) -> String {
+    let Some(failures) = report["failures"].as_array() else {
+        return report["summary"].to_string();
+    };
+    if failures.is_empty() {
+        return report["summary"].to_string();
+    }
+    failures
+        .iter()
+        .map(|f| {
+            format!(
+                "{}: {} {}",
+                f["name"].as_str().unwrap_or("?"),
+                f["diagnostic"]["code"].as_str().unwrap_or(""),
+                f["diagnostic"]["message"].as_str().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The path argument every command defaults to is `.`, and a root bound to what that tidies to has
+/// to be a directory that resolves: an empty one is `E0454` before the program runs at all.
+#[test]
+fn every_ported_command_answers_with_no_path_argument() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "m.ply", "pub fn one() -> Int = 1\n");
+
+    // `ply fmt --check` over a tree that needs no rewriting writes nothing; every other row does.
+    for (args, writes) in [
+        (vec!["defs"], true),
+        (vec!["defs", "--json"], true),
+        (vec!["hash"], true),
+        (vec!["hash", "--json"], true),
+        (vec!["doc", "one"], true),
+        (vec!["doc", "one", "--json"], true),
+        (vec!["explain", "E0001"], true),
+        (vec!["fmt", "--check"], false),
+    ] {
+        let out = ply(dir.path()).args(&args).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "`ply {}` exited {:?}\n{}",
+            args.join(" "),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !writes || !out.stdout.is_empty(),
+            "`ply {}` wrote nothing",
+            args.join(" ")
+        );
+    }
 }
 
 /// The table the shipped program carries is what `ply explain` answers from; the registry the
