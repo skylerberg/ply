@@ -1060,6 +1060,22 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
             style,
         );
     }
+    let process = match args
+        .host
+        .then(|| crate::commands::run::process_host(args))
+        .transpose()
+    {
+        Ok(process) => process,
+        Err(diagnostic) => {
+            return report_bind_error(
+                "run",
+                std::slice::from_ref(&diagnostic),
+                &empty,
+                args.json,
+                style,
+            );
+        }
+    };
     let hosts = match crate::hosts::Hosts::open_stopping(
         &opened.front.check,
         args.host,
@@ -1070,7 +1086,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         &args.trace,
         declared.as_ref(),
         shutdown.clone(),
-        args.host.then(|| crate::commands::run::process_host(args)),
+        process,
     ) {
         Ok(hosts) => hosts,
         Err(diagnostics) => {
