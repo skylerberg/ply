@@ -561,22 +561,33 @@ fn diff_counts_an_addition_and_a_removal() {
 #[test]
 fn a_rename_moves_a_name_and_no_hash() {
     let dir = project("fn helper() -> Int = 1\nfn main() -> Int = helper()\n");
-    let before = artifact_of(dir.path());
+    ply(dir.path())
+        .args(["build", ".", "-o", "old.plyx"])
+        .assert()
+        .success();
+    let (before, _) = artifact::read(&dir.path().join("old.plyx")).unwrap();
     std::fs::write(
         dir.path().join("m.ply"),
         "fn assistant() -> Int = 1\nfn main() -> Int = assistant()\n",
     )
     .unwrap();
-    let (_, after) = built(dir.path());
 
-    let diff = artifact::diff(&before, &after);
-    assert_eq!(diff.added, ["m.assistant"]);
-    assert_eq!(diff.dropped, ["m.helper"]);
-    assert!(diff.changed.is_empty(), "{:?}", diff.changed);
-    assert_eq!(
-        before.bodies, after.artifact.bodies,
-        "a rename may not move a body"
+    let report = json_of(
+        &ply(dir.path())
+            .args(["build", ".", "--diff", "old.plyx", "--json"])
+            .output()
+            .unwrap(),
     );
+    assert_eq!(report["added"], serde_json::json!(["m.assistant"]));
+    assert_eq!(report["dropped"], serde_json::json!(["m.helper"]));
+    assert_eq!(report["changed"], serde_json::json!([]));
+
+    ply(dir.path())
+        .args(["build", ".", "-o", "new.plyx"])
+        .assert()
+        .success();
+    let (after, _) = artifact::read(&dir.path().join("new.plyx")).unwrap();
+    assert_eq!(before.bodies, after.bodies, "a rename may not move a body");
 }
 
 fn runs_as_its_source(dir: &Path) -> Value {

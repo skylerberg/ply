@@ -97,30 +97,12 @@ impl Artifact {
                 "`{ENCODE}` answered something that is not a byte string"
             )));
         };
-        let mut out = written.to_vec();
-        let Some(plan) = plan(out.len())? else {
-            return Err(container_failed(format!(
-                "`{ENCODE}` answered {} bytes, which is no container at all",
-                out.len()
-            )));
-        };
-        let digest = plan.over(&out).ok_or_else(|| {
-            container_failed("the digest plan reaches past the container it is for".to_string())
-        })?;
-        let field = plan
-            .at
-            .checked_add(32)
-            .and_then(|end| out.get_mut(plan.at..end))
-            .ok_or_else(|| {
-                container_failed("the digest plan writes past the container it is for".to_string())
-            })?;
-        field.copy_from_slice(&digest);
-        Ok(out)
+        seal(written.to_vec())
     }
 
     /// Each section's payload, in the order they are written. The records inside a payload are
     /// the writer's; `plyx.ply` places the payloads and hands them back.
-    fn sections(&self) -> Vec<(&'static str, u32, Vec<u8>)> {
+    pub(crate) fn sections(&self) -> Vec<(&'static str, u32, Vec<u8>)> {
         let mut sections: Vec<(&'static str, u32, Vec<u8>)> = Vec::with_capacity(5);
 
         let mut bodies = Vec::new();
@@ -166,6 +148,29 @@ impl Artifact {
         }
         sections
     }
+}
+
+/// A container `plyx.ply` laid out, with its digest written into the field no range of the digest
+/// covers.
+pub fn seal(mut out: Vec<u8>) -> Result<Vec<u8>, Diagnostic> {
+    let Some(plan) = plan(out.len())? else {
+        return Err(container_failed(format!(
+            "a container of {} bytes is no container at all",
+            out.len()
+        )));
+    };
+    let digest = plan.over(&out).ok_or_else(|| {
+        container_failed("the digest plan reaches past the container it is for".to_string())
+    })?;
+    let field = plan
+        .at
+        .checked_add(32)
+        .and_then(|end| out.get_mut(plan.at..end))
+        .ok_or_else(|| {
+            container_failed("the digest plan writes past the container it is for".to_string())
+        })?;
+    field.copy_from_slice(&digest);
+    Ok(out)
 }
 
 /// The container format this `ply` writes and reads.
@@ -841,11 +846,15 @@ fn check_versions(
 }
 
 pub fn read(path: &Path) -> Result<(Artifact, Vec<Diagnostic>), Diagnostic> {
-    let bytes = std::fs::read(path).map_err(|e| {
+    decode(&bytes_of(path)?, path)
+}
+
+/// The container as it lies on disk, before anything is believed about it.
+pub fn bytes_of(path: &Path) -> Result<Vec<u8>, Diagnostic> {
+    std::fs::read(path).map_err(|e| {
         invalid(path, format!("could not read `{}`: {e}", path.display()))
             .note("name the `.plyx` file `ply build` wrote")
-    })?;
-    decode(&bytes, path)
+    })
 }
 
 pub struct Opened {
@@ -1084,52 +1093,6 @@ fn entered(
         front,
         entry,
     })
-}
-
-#[derive(Default, Debug)]
-pub struct Diff {
-    pub added: Vec<String>,
-    pub changed: Vec<String>,
-    pub dropped: Vec<String>,
-    pub unchanged: usize,
-    pub reached: Vec<String>,
-}
-
-pub fn diff(old: &Artifact, built: &Built) -> Diff {
-    let new = &built.artifact;
-    let before: BTreeMap<&str, BTreeSet<DefHash>> = group(&old.names);
-    let after: BTreeMap<&str, BTreeSet<DefHash>> = group(&new.names);
-
-    let mut out = Diff::default();
-    for (name, hashes) in &after {
-        match before.get(name) {
-            None => out.added.push(name.to_string()),
-            Some(was) if was != hashes => out.changed.push(name.to_string()),
-            Some(_) => out.unchanged += 1,
-        }
-    }
-    for name in before.keys() {
-        if !after.contains_key(name) {
-            out.dropped.push(name.to_string());
-        }
-    }
-
-    let moved: BTreeSet<&String> = out.added.iter().chain(out.changed.iter()).collect();
-    out.reached = built
-        .closure
-        .iter()
-        .filter(|(_, reaches)| reaches.iter().any(|n| moved.contains(n)))
-        .map(|(name, _)| name.clone())
-        .collect();
-    out
-}
-
-fn group(names: &[(String, DefHash)]) -> BTreeMap<&str, BTreeSet<DefHash>> {
-    let mut out: BTreeMap<&str, BTreeSet<DefHash>> = BTreeMap::new();
-    for (name, hash) in names {
-        out.entry(name.as_str()).or_default().insert(*hash);
-    }
-    out
 }
 
 pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
