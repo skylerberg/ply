@@ -1193,26 +1193,61 @@ pub type Kind = | File | Dir | Symlink | Missing
 
 pub nondet effect fs {
   read  read_file[r](path: String) -> Option<Bytes>
+  read  read_at[r](path: String, offset: Int, len: Int) -> Option<Bytes>
   read  list_dir[r](path: String) -> Option<List<String>>
   read  kind[r](path: String) -> Kind
   read  exists[r](path: String) -> Bool
   read  file_size[r](path: String) -> Option<Int>
   read  modified_ms[r](path: String) -> Option<Int>
   write write_file[r](path: String, body: Bytes) -> Bool
+  write append[r](path: String, body: Bytes) -> Option<Int>
   write create_dir[r](path: String) -> Bool
   write remove[r](path: String) -> Bool
   write rename[r](from: String, to: String) -> Bool
+  write sync[r](path: String) -> Bool
   write lock[r](path: String) -> Bool
   write unlock[r](path: String) -> Bool
 }
 ```
 
 The label is a root bound with `--fs NAME=PATH`. Unbound label: `E0451`; a path
-escaping its root (`..`, absolute, or a symlink outside): `E0452`; a file over
-the read bound: `E0453`. Different roots do not conflict. Reads are whole-file,
-`list_dir` is one level, `rename` stays in one root. `kind` says what a path
-names in one call and does not follow a symlink, so a walk can pass one over;
-`Missing` is also what this run cannot read. Every other operation follows one.
+escaping its root (`..`, absolute, or a symlink outside): `E0452`. Different
+roots do not conflict. `list_dir` is one level, `rename` stays in one root.
+`kind` says what a path names in one call and does not follow a symlink, so a
+walk can pass one over; `Missing` is also what this run cannot read. Every other
+operation follows one.
+
+`append` and `read_at` are what make a file a log rather than a value. `append`
+costs the size of what is new rather than the size of the file, creates the file
+if it is not there, and answers the offset the bytes landed at — so a writer
+needs no separate call to find out where its frame went, and a second appender
+racing it moves neither the bytes nor the answer. `read_at` reads `len` bytes
+from `offset`. Together they carry an append-only cache: frames appended and
+their offsets recorded, read back one frame at a time instead of a file at a
+time.
+
+`read_at` answers **what is there**, which may be less than was asked for: a
+range that runs past the end is short, and one that starts at or past the end is
+empty. That is deliberate, and the one place `std.fs` parts company with
+`bytes_slice`, which never clamps a range: a value's length is known and fixed,
+while a file's is neither, so a reader holding an offset it recorded earlier
+would otherwise be raised at for a file that shrank — and a shrunken cache is a
+warning to its reader, not a fault in the program. Compare the answer's length
+with the one you asked for to tell a short read from a whole one. A negative
+offset or length is the other way round: no file can answer it, so it is
+arithmetic that went wrong and raises `E0502`. Two reads of one range may differ;
+the effect is `nondet` and a file can change under it.
+
+`E0453` bounds one call, not a file: `read_file` refuses a file whose whole
+contents would be the answer, and `read_at` refuses a `len`, each above 64 MiB.
+A larger file is read a range at a time.
+
+`sync` makes what was written durable, and is what a paired cache needs to be
+honest rather than lucky. A write reaches the page cache, not the disk, and
+`rename` orders the *name* rather than the bytes behind it — so an index renamed
+into place can name frames a crash then loses. Sync the data file before the
+index that names it. On a directory it flushes the names in it, which is what
+makes a `rename` itself durable. `false` means the path names nothing to flush.
 
 `lock` and `unlock` serialise a read-merge-write across processes, which a
 `rename` alone cannot: two runs that flush a cache at once lose one of them.
@@ -1229,10 +1264,12 @@ recovers it.
 
 The twin is `MemFs` (`mem_empty`, `mem_of`, `mem_read`, `mem_write`, `mem_list`,
 `mem_kind`, `mem_exists`, `mem_size`, `mem_create_dir`, `mem_remove`,
-`mem_rename`, `mem_modified`, `mem_lock`, `mem_unlock`); it holds no symlinks, so
-`mem_kind` never answers `Symlink`, and it has no wall clock, so no lock in it
-goes stale. A test imports both `std.fs` and `std.fs (fs)` to name the module and
-the effect.
+`mem_rename`, `mem_modified`, `mem_read_at`, `mem_append`, `mem_sync`,
+`mem_lock`, `mem_unlock`); it holds no symlinks, so `mem_kind` never answers
+`Symlink`, it has no wall clock, so no lock in it goes stale, and it was never on
+a disk, so `mem_sync` only says whether the path names something. `mem_append`
+answers an `Appended` of the tree and the offset. A test imports both `std.fs`
+and `std.fs (fs)` to name the module and the effect.
 
 ### 13.12 `std.path`
 
@@ -1500,7 +1537,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0450` | compiled backend cannot be attached |
 | `E0451` | `fs` label with no root bound |
 | `E0452` | path leaves its root |
-| `E0453` | whole-file read over the bound |
+| `E0453` | read over the bound |
 | `E0454` | `--fs` root that is not a directory |
 | `E0455` | the program asked to exit with a code |
 | `E0456` | `process.spawn` label with no executable bound |
@@ -1529,7 +1566,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
   modules-as-values or first-class effects; no `unsafe` or FFI.
 * Specs cannot name mutable state. Cycles are not collected, and a task never
   moves between OS threads.
-* No file handles, streaming, recursive walk, permissions or `stdin`; no
+* No file handles — `fs` reads a range and appends by path, with nothing open
+  between calls — and no recursive walk, permissions or `stdin`; no
   cancellation or backpressure; no migrations or live schema check; HTTP/1.1
   only; no authentication framework.
 

@@ -359,6 +359,7 @@ pub mod codes {
     pub const FS_ROOT_UNBOUND: &str = "E0451";
     /// A path leaving its label's root via `..`, an absolute path, or a symlink.
     pub const FS_PATH_ESCAPES_ROOT: &str = "E0452";
+    /// A read whose answer would be larger than one value holds; `fs.read_at` reads a range.
     pub const FS_FILE_TOO_LARGE: &str = "E0453";
     /// A `--fs NAME=PATH` root that is missing, not a directory, or unresolvable.
     pub const FS_ROOT_INVALID: &str = "E0454";
@@ -556,7 +557,7 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ("E0450", "compiled backend cannot be attached"),
     ("E0451", "`fs` label with no root bound"),
     ("E0452", "path leaves its root"),
-    ("E0453", "whole-file read over the bound"),
+    ("E0453", "read over the bound"),
     ("E0454", "`--fs` root that is not a directory"),
     ("E0455", "the program asked to exit with a code"),
     ("E0456", "`process.spawn` label with no executable bound"),

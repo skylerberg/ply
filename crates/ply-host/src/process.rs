@@ -537,7 +537,7 @@ fn too_much(program: &Path, out: usize, err: usize, span: Span) -> Diagnostic {
     .note(format!(
         "`process.spawn` answers with each stream whole, and the bound is {MAX_CAPTURE_BYTES} bytes"
     ))
-    .note("there are no file handles and no streaming in v1, so there is no way to read part of it")
+    .note("a spawn answers with each stream whole, and there is no handle to read a child's output through in pieces as `fs.read_at` reads a file")
 }
 
 #[cold]

@@ -4,15 +4,18 @@ pub type Kind = | File | Dir | Symlink | Missing
 // The filesystem effect, rooted: a resource label names a directory the run binds with `--fs`.
 pub nondet effect fs {
   read  read_file[r](path: String) -> Option<Bytes>
+  read  read_at[r](path: String, offset: Int, len: Int) -> Option<Bytes>
   read  list_dir[r](path: String) -> Option<List<String>>
   read  kind[r](path: String) -> Kind
   read  exists[r](path: String) -> Bool
   read  file_size[r](path: String) -> Option<Int>
   read  modified_ms[r](path: String) -> Option<Int>
   write write_file[r](path: String, body: Bytes) -> Bool
+  write append[r](path: String, body: Bytes) -> Option<Int>
   write create_dir[r](path: String) -> Bool
   write remove[r](path: String) -> Bool
   write rename[r](from: String, to: String) -> Bool
+  write sync[r](path: String) -> Bool
   write lock[r](path: String) -> Bool
   write unlock[r](path: String) -> Bool
 }
@@ -28,6 +31,9 @@ pub type MemFs = {
 
 // A write's two answers: the tree it produced and whether it happened.
 pub type Written = { fs: MemFs, ok: Bool }
+
+// An append's two answers: the tree it produced and the offset the bytes landed at.
+pub type Appended = { fs: MemFs, at: Option<Int> }
 
 pub fn mem_empty() -> MemFs =
   { files: map_new(), dirs: map_new(), modified: map_new(), locks: map_new(), clock: 1 }
@@ -53,6 +59,17 @@ pub fn mem_size(f: MemFs, path: String) -> Option<Int> = {
   let body = mem_read(f, path)?;
   Some(bytes_len(body))
 }
+
+// What is there, which may be less than was asked for: a file can end before the range does, and
+// a caller that wanted all of it compares the answer's length with the one it asked for.
+pub fn mem_read_at(f: MemFs, path: String, offset: Int, len: Int) -> Option<Bytes> = {
+  let body = mem_read(f, path)?;
+  let size = bytes_len(body);
+  let start = at_most(offset, size);
+  Some(bytes_slice(body, start, at_most(start + len, size)))
+}
+
+fn at_most(n: Int, hi: Int) -> Int = if n > hi { hi } else { n }
 
 // A directory's stamp is its creation, a file's its last write.
 pub fn mem_modified(f: MemFs, path: String) -> Option<Int> =
@@ -97,6 +114,30 @@ pub fn mem_write(f: MemFs, path: String, body: Bytes) -> Written = {
     }
   }
 }
+
+// Costs what is new rather than what is there, and creates the file, so a log's first frame needs
+// no write before it. `None` is what `mem_write` refuses for, and the offset is where it landed.
+pub fn mem_append(f: MemFs, path: String, body: Bytes) -> Appended = {
+  let key = normal(path);
+  if !mem_confined(path) || key == "" || mem_is_dir(f, path) ||
+     !mem_is_dir(f, parent_of(key)) {
+    { fs: f, at: None }
+  } else {
+    let had = match map_get(f.files, key) { Some(b) -> b, None -> b"" };
+    {
+      fs: {
+        ..f,
+        files: map_insert(f.files, key, bytes_concat(had, body)),
+        modified: map_insert(f.modified, key, f.clock),
+        clock: f.clock + 1,
+      },
+      at: Some(bytes_len(had)),
+    }
+  }
+}
+
+// Nothing in a tree was ever on a disk, so a sync only answers whether the path names something.
+pub fn mem_sync(f: MemFs, path: String) -> Bool = mem_exists(f, path)
 
 // The directory and every missing ancestor, as the host's `create_dir` does.
 pub fn mem_create_dir(f: MemFs, path: String) -> Written =
@@ -373,6 +414,88 @@ test "rename is a move, and it refuses what it cannot place" {
   // Out of the root is not expressible in one atom, so it is not a rename.
   assert(!mem_rename(fixture, "out/a.tmp", "../a.plyx").ok);
   assert(!mem_rename(fixture, "absent", "out/b.plyx").ok)
+}
+
+// An append-only log costs the size of the frame, not the size of the log, which is the whole
+// reason a cache is written this way.
+test "an append creates the file it is given and says where the bytes landed" {
+  let dir = mem_create_dir(mem_empty(), "cache");
+  let first = mem_append(dir.fs, "cache/frontend.dat", b"header");
+  assert_eq(first.at, Some(0));
+  assert(mem_exists(first.fs, "cache/frontend.dat"));
+  let second = mem_append(first.fs, "cache/frontend.dat", b"frame");
+  assert_eq(second.at, Some(6));
+  assert_eq(mem_read(second.fs, "cache/frontend.dat"), Some(b"headerframe"));
+  assert_eq(mem_size(second.fs, "cache/frontend.dat"), Some(11));
+  // An offset is where a frame starts, so reading one back needs no other record.
+  assert_eq(mem_read_at(second.fs, "cache/frontend.dat", 6, 5), Some(b"frame"));
+  // Nothing to append into, and a directory is not a log.
+  assert_eq(mem_append(mem_empty(), "cache/frontend.dat", b"x").at, None);
+  assert_eq(mem_append(dir.fs, "cache", b"x").at, None);
+  assert_eq(mem_append(dir.fs, "../escape.dat", b"x").at, None)
+}
+
+test "appends to two logs under one root do not see each other" {
+  let dir = mem_create_dir(mem_empty(), "cache");
+  let a1 = mem_append(dir.fs, "cache/a.dat", b"aaaa");
+  let b1 = mem_append(a1.fs, "cache/b.dat", b"b");
+  let a2 = mem_append(b1.fs, "cache/a.dat", b"AA");
+  let b2 = mem_append(a2.fs, "cache/b.dat", b"BB");
+  assert_eq(a1.at, Some(0));
+  assert_eq(b1.at, Some(0));
+  assert_eq(a2.at, Some(4));
+  assert_eq(b2.at, Some(1));
+  assert_eq(mem_read(b2.fs, "cache/a.dat"), Some(b"aaaaAA"));
+  assert_eq(mem_read(b2.fs, "cache/b.dat"), Some(b"bBB"))
+}
+
+test "a ranged read answers what is there, and a range past the end is short" {
+  let fixture = mem_of([{path: "cache/a.dat", body: b"0123456789"}]);
+  assert_eq(mem_read_at(fixture, "cache/a.dat", 0, 10), Some(b"0123456789"));
+  assert_eq(mem_read_at(fixture, "cache/a.dat", 3, 4), Some(b"3456"));
+  // Short rather than refused: a file can end before the range a caller recorded does.
+  assert_eq(mem_read_at(fixture, "cache/a.dat", 8, 100), Some(b"89"));
+  assert_eq(mem_read_at(fixture, "cache/a.dat", 10, 5), Some(b""));
+  assert_eq(mem_read_at(fixture, "cache/a.dat", 99, 5), Some(b""));
+  assert_eq(mem_read_at(fixture, "cache/a.dat", 4, 0), Some(b""));
+  // `None` keeps the one meaning it has for `read_file`: this path names nothing to read.
+  assert_eq(mem_read_at(fixture, "cache/absent.dat", 0, 4), None);
+  assert_eq(mem_read_at(fixture, "cache", 0, 4), None);
+  assert_eq(mem_read_at(fixture, "../secrets", 0, 4), None)
+}
+
+// The ordering a paired index depends on: the frames are on the disk before anything names them.
+test "a handled append, sync and rename are the store's flush" {
+  with_cell[tree](mem_create_dir(mem_empty(), "cache").fs) { t ->
+    handle {
+      assert_eq(fs.append[cache]("cache/frontend.dat", b"frame"), Some(0));
+      assert(fs.sync[cache]("cache/frontend.dat"));
+      assert(fs.write_file[cache]("cache/frontend.tmp", b"index"));
+      assert(fs.rename[cache]("cache/frontend.tmp", "cache/frontend.idx"));
+      assert(fs.sync[cache]("cache"));
+      assert_eq(fs.read_at[cache]("cache/frontend.dat", 0, 5), Some(b"frame"));
+      // Nothing was ever written here, so there is nothing to make durable.
+      assert(!fs.sync[cache]("cache/absent.dat"))
+    } with {
+      fs.append[cache](p, body) -> {
+        let a = mem_append(cell_get(t), p, body);
+        cell_set(t, a.fs);
+        a.at
+      },
+      fs.write_file[cache](p, body) -> {
+        let w = mem_write(cell_get(t), p, body);
+        cell_set(t, w.fs);
+        w.ok
+      },
+      fs.rename[cache](from, to) -> {
+        let w = mem_rename(cell_get(t), from, to);
+        cell_set(t, w.fs);
+        w.ok
+      },
+      fs.sync[cache](p) -> mem_sync(cell_get(t), p),
+      fs.read_at[cache](p, offset, len) -> mem_read_at(cell_get(t), p, offset, len),
+    }
+  }
 }
 
 // What `ply test --jobs` does to a read-merge-write: two runs flush at once and rename loses one.
