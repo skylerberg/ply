@@ -510,13 +510,17 @@ fn insert_pair(sorted: List<{ level: Int, deriver: Int }>, x: { level: Int, deri
   }
 }
 
+// A sum is nominal and an alias is transparent, exactly as the checker has them: `conv_type` gives
+// a sum a `TyCon` under its name, which `unify_structural` compares by name, and expands an alias
+// in place, so two aliases of one expansion are one type there and must be one type here. The name
+// is the simple one: a module path is no part of an identity, so vendoring a module moves nothing.
 fn type_def(z: Nz, d: TypeDef) -> Nz = {
   let z0: Nz = tag(z, t_type());
   let z1: Nz = {..z0, ty_params: append(z0.ty_params, map(d.params, |p: Ident| p.name))};
   let z2: Nz = u32v(z1, len(d.params));
   match d.body {
     TDAlias(t) -> type_expr(tag(z2, t_type_alias()), t),
-    TDSum(variants) -> fold(variants, u32v(tag(z2, t_type_sum()), len(variants)), |acc: Nz, v: VariantDef|
+    TDSum(variants) -> fold(variants, u32v(strv(tag(z2, t_type_sum()), d.name.name), len(variants)), |acc: Nz, v: VariantDef|
       fold(v.fields, u32v(strv(tag(acc, t_variant()), v.name.name), len(v.fields)), |a: Nz, f: TypeExpr| type_expr(a, f))),
   }
 }
@@ -1878,7 +1882,10 @@ fn p_type_def(x: Pr, d: Dc, name: Bytes) -> Got = {
   // Every variant keeps its `|`: a single-variant sum without one reads as an alias.
   let body: Got = if k.v == t_type_alias() { p_type(x, k.d) }
     else if k.v == t_type_sum() {
-      let vn = rd_count(k.d);
+      // The encoding carries the name the declaring program wrote; this printing uses the one it
+      // was asked for, which a relink may have changed.
+      let declared = rd_text(k.d);
+      let vn = rd_count(declared.d);
       let vs = rd_many(vn.d, vn.v, |g: Dc| {
         let vname = rd_text(expect(g, t_variant(), b"a variant"));
         let fc = rd_count(vname.d);
@@ -2288,6 +2295,31 @@ test "one effect declaration under two names is refused, since a body cannot say
     Printed(_) -> panic("two names for one declaration must be refused"),
     Unprintable(why) -> assert_eq(why.message, b"`a.one`, `b.one` are one effect declaration, so a body cannot say which it performs"),
   }
+}
+
+test "two sums that differ only in their names are two declarations, and one sum in two modules is one" {
+  let apart = hash_index(indexed([{ name: b"a", src: b"pub type One = | Wrap(Int)" }, { name: b"b", src: b"pub type Two = | Wrap(Int)" }]));
+  let named = by_name(named_hashes(apart));
+  // `unify_structural` compares a `TyCon` by name, so a hash that ignored it would call two types
+  // the checker refuses to unify one type.
+  assert(map_get(named, b"a.One") != None);
+  assert(map_get(named, b"a.One") != map_get(named, b"b.Two"));
+  // The module path is no part of it, so the same declaration in two places is one declaration.
+  let together = by_name(named_hashes(hash_index(indexed([{ name: b"a", src: b"pub type One = | Wrap(Int)" }, { name: b"b", src: b"pub type One = | Wrap(Int)" }]))));
+  assert_eq(map_get(together, b"a.One"), map_get(together, b"b.One"))
+}
+
+test "an alias is transparent, so its name is no part of it" {
+  let m = |src: Bytes| by_name(named_hashes(hash_index(indexed([{ name: b"m", src: src }]))));
+  // `conv_type` expands an alias in place, so these two declare one type and use it alike.
+  let metres = m(b"pub type Metres = Int\npub fn go(x: Metres) -> Metres = x");
+  let feet = m(b"pub type Feet = Int\npub fn go(x: Feet) -> Feet = x");
+  assert_eq(map_get(metres, b"m.Metres"), map_get(feet, b"m.Feet"));
+  assert_eq(map_get(metres, b"m.go"), map_get(feet, b"m.go"));
+  // A record alias is structural in the checker too, so naming one differently changes no use of it.
+  let as_p = m(b"pub type P = { a: Int }\npub fn mk() -> P = { a: 1 }");
+  let as_q = m(b"pub type Q = { a: Int }\npub fn mk() -> Q = { a: 1 }");
+  assert_eq(map_get(as_p, b"m.mk"), map_get(as_q, b"m.mk"))
 }
 
 test "a definition's hash follows the name of the effect it performs" {
