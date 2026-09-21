@@ -7,7 +7,7 @@ use crate::frontend::{
     Member, NameRef, SourceFingerprint,
 };
 use ply_ty::Mode;
-use ply_ty::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
+use ply_ty::{EffectAtom, Footprint, LabelVar, Resource, Row, RowVar, Scheme, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod tag {
@@ -18,6 +18,7 @@ mod tag {
 
     pub(super) const RESOURCE_NAMED: u8 = 0x20;
     pub(super) const RESOURCE_SINGLETON: u8 = 0x21;
+    pub(super) const RESOURCE_VAR: u8 = 0x22;
 
     pub(super) const MODE_READ: u8 = 0x28;
     pub(super) const MODE_WRITE: u8 = 0x29;
@@ -175,6 +176,10 @@ fn put_atom(w: &mut Writer, atom: &EffectAtom) {
             w.tag(tag::RESOURCE_NAMED);
             w.symbol(name);
         }
+        Resource::Var(LabelVar(v)) => {
+            w.tag(tag::RESOURCE_VAR);
+            w.u32(*v);
+        }
         Resource::Singleton => w.tag(tag::RESOURCE_SINGLETON),
     }
     put_mode(w, atom.mode);
@@ -193,6 +198,7 @@ fn get_atom(r: &mut Reader) -> Decoded<EffectAtom> {
     let effect = r.symbol(WHAT)?;
     let resource = match r.byte(WHAT)? {
         tag::RESOURCE_NAMED => Resource::Named(r.symbol(WHAT)?),
+        tag::RESOURCE_VAR => Resource::Var(LabelVar(r.u32(WHAT)?)),
         tag::RESOURCE_SINGLETON => Resource::Singleton,
         _ => return Err(crate::binary::DecodeError { what: WHAT, at: 0 }),
     };
@@ -268,6 +274,10 @@ fn put_scheme(w: &mut Writer, scheme: &Scheme) {
     for RowVar(v) in &scheme.row_vars {
         w.u32(*v);
     }
+    w.count(scheme.label_vars.len());
+    for LabelVar(v) in &scheme.label_vars {
+        w.u32(*v);
+    }
     put_type(w, &scheme.ty);
     w.tag(tag::END);
 }
@@ -285,11 +295,17 @@ fn get_scheme(r: &mut Reader) -> Decoded<Scheme> {
     for _ in 0..count {
         row_vars.push(RowVar(r.u32(WHAT)?));
     }
+    let count = r.count(WHAT)?;
+    let mut label_vars = Vec::with_capacity(count);
+    for _ in 0..count {
+        label_vars.push(LabelVar(r.u32(WHAT)?));
+    }
     let ty = get_type(r)?;
     r.tag(tag::END, WHAT)?;
     Ok(Scheme {
         ty_vars,
         row_vars,
+        label_vars,
         ty,
     })
 }

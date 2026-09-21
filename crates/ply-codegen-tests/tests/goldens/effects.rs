@@ -29,7 +29,8 @@ fn the_corpus_still_exercises_every_effect_construct_a_tier_would_have_to_carry(
             for body in dump.split("f:").skip(1) {
                 bodies += 1;
                 let mut hit = false;
-                for tag in ["perform(", "handle(", "cell(", "sim("] {
+                // `$` is how the lowering spells a resource a label parameter names.
+                for tag in ["perform(", "handle(", "cell(", "sim(", "$"] {
                     if body.contains(tag) {
                         *tally.entry(tag).or_default() += 1;
                         hit = true;
@@ -43,7 +44,7 @@ fn the_corpus_still_exercises_every_effect_construct_a_tier_would_have_to_carry(
     for (k, v) in &tally {
         println!("    {k} {v}");
     }
-    for tag in ["perform(", "handle(", "cell("] {
+    for tag in ["perform(", "handle(", "cell(", "$"] {
         assert!(
             tally.get(tag).copied().unwrap_or(0) > 0,
             "no body in the shipped corpus reaches `{tag}` any more, so nothing here can check an \

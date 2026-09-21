@@ -293,6 +293,9 @@ pub mod codes {
     pub const RESOURCE_REQUIRED: &str = "E0304";
     /// A `handle` whose body performs an operation, on an atom it handles, that no clause answers.
     pub const HANDLER_CLAUSE_MISSING: &str = "E0305";
+    /// A call leaving a label parameter unfilled by written label or argument row, or passing a
+    /// label-generic definition as a value.
+    pub const LABEL_INSTANTIATION: &str = "E0306";
     pub const NONDET_IN_DET_TEST: &str = "E0412";
     /// A `Task` in a `simulate` region's result, or a `join` after its region ended.
     pub const TASK_ESCAPES_SCOPE: &str = "E0413";
@@ -480,6 +483,11 @@ pub const MEANINGS: &[(&str, &str)] = &[
     (
         "E0305",
         "`handle` with no clause for an operation its body performs on a handled atom",
+    ),
+    (
+        "E0306",
+        "label instantiation: a call leaves a label unfilled or writes the wrong number of them, \
+         or a label-generic definition is used as a value",
     ),
     ("E0412", "nondeterministic effect in a deterministic test"),
     ("E0413", "`Task` escapes its region"),
@@ -753,6 +761,7 @@ mod tests {
                 codes::HANDLER_CLAUSE_MISSING,
                 "E0305",
             ),
+            ("LABEL_INSTANTIATION", codes::LABEL_INSTANTIATION, "E0306"),
             ("NONDET_IN_DET_TEST", codes::NONDET_IN_DET_TEST, "E0412"),
             ("TASK_ESCAPES_SCOPE", codes::TASK_ESCAPES_SCOPE, "E0413"),
             ("DEADLOCK", codes::DEADLOCK, "E0414"),

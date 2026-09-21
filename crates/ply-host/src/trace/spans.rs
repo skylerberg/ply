@@ -239,6 +239,6 @@ fn describe(owner: Owner) -> String {
 pub fn label(resource: &Resource) -> &str {
     match resource {
         Resource::Named(name) => name.as_str(),
-        Resource::Singleton => "",
+        Resource::Var(_) | Resource::Singleton => "",
     }
 }

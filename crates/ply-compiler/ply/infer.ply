@@ -11,7 +11,7 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               ReturnClause, RecField, expr_span)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LInt, LFixed, LBool, LStr,
                  LBytes, LFloat, LDec, LUnit, pat_span)
-import tycore (Resource, RNamed, RSingleton, Atom, Row, Type, TyVar, TyCon, TyFn, TyRecord, Field,
+import tycore (Resource, RNamed, RSingleton, RVar, Atom, Row, Type, TyVar, TyCon, TyFn, TyRecord, Field,
                Scheme, Fresh, Subst, TypeEnv, Free, UnifyError, Mismatch, Arity, OccursTy, OccursRow,
                RowMismatch, Unified, atom_lt, atoms_covered, atoms_insert, atoms_union, atoms_contains,
                atoms_difference, row_empty, row_open, row_closed, row_singleton, row_is_pure,
@@ -24,7 +24,8 @@ import tycore (Resource, RNamed, RSingleton, Atom, Row, Type, TyVar, TyCon, TyFn
                resolve_row, occurs_ty, solve_continuation_row, free_vars, unify, unify_row,
                env_new, env_push, env_pop, env_bind, env_bind_global, env_remove_global,
                env_lookup, env_depth_of, env_locals, instantiate_with, instantiate, rename_scheme,
-               generalize, region_prefix, region_of, atom_text, resource_text, scheme_text, type_text, row_text,
+               generalize, region_prefix, region_of, label_type, label_of, resolve_atom,
+               atom_text, atoms_text, resource_text, scheme_text, type_text, row_text,
                printer_new, print_ty, print_row)
 import resolve (Mod, Source, Resolved, Scope, Binding, ModBind, Declared, Entry, Diag, Label, Edit, Fix, with_fix, insertion, Ns, NValue, NType, NEffect,
                 resolve_modules, Resolved_, Failed, Expanded, find, lookup, dlookup, space,
@@ -62,8 +63,15 @@ type OpKey = { effect: Bytes, op: Bytes, res: Resource }
 type Numeric = { span: Span, op: Bytes, ty: Type }
 // A bit operator's or integer builtin's operand, kept until its type is known. `what` names the site in a diagnostic.
 type BitOp = { span: Span, what: Bytes, ty: Type }
-type Sig = { ty_params: Map<Bytes, Type>, row_params: Map<Bytes, Int>, fn_ty: Type, params: List<Type>,
+type Sig = { ty_params: Map<Bytes, Type>, row_params: Map<Bytes, Int>, label_params: Map<Bytes, Int>,
+             fn_ty: Type, params: List<Type>,
              ret: Type, declared: Option<Row>, published_row: Row, scope: Int }
+// One use of a label-generic definition: `vars` are the variables its label parameters became,
+// `called` is false while it is still only a value, and `written` records `f[conn](..)`.
+type LabelApp = { module: Int, span: Span, callee: Bytes, vars: List<Int>, params: Map<Bytes, Int>,
+                  called: Bool }
+// What the emitter needs: the labels a call fills, in declaration order.
+pub type LabelSite = { module: Int, span: Span, labels: List<Bytes> }
 type Assumed = { deriver: Deriver, vars: List<Int> }
 type SpawnSite = { span: Span, ty: Type }
 type HandoffSite = { span: Span, ty: Type, op: Bytes }
@@ -104,6 +112,11 @@ type Cx = {
   laws: List<LawInfo>,
   ty_params: Map<Bytes, Type>,
   row_params: Map<Bytes, Int>,
+  label_params: Map<Bytes, Int>,
+  label_apps: List<LabelApp>,
+  label_sites: List<LabelSite>,
+  // The label parameters of the group being walked: recursion is monomorphic, so a call reuses them.
+  group_labels: List<{ name: Bytes, vars: List<Int> }>,
   auto_ty_params: Bool,
   alias_stack: List<Bytes>,
   refused_atoms: List<Span>,
@@ -238,7 +251,7 @@ fn install_prelude_adts(cx: Cx) -> Cx =
       let v = at(adt.variants, index);
       let fields = map(v.fields, |p: Bytes| TyVar(position_bytes(adt.params, p)));
       let ty = if len(fields) == 0 { result } else { t_fn(fields, result, row_empty()) };
-      let sc = { ty_vars: vars, row_vars: [], ty: ty };
+      let sc = { ty_vars: vars, row_vars: [], label_vars: [], ty: ty };
       add_ctor({..c2, env: env_bind_global(c2.env, v.name, sc)},
                { name: v.name, module: b"", simple_name: v.name, type_name: adt.name, index: index,
                  arity: len(fields), fields: fields, scheme: sc, at: { module: 0, span: dummy_span() } })
@@ -268,7 +281,7 @@ fn set_def(cx: Cx, info: DefInfo) -> Cx =
 
 fn prelude_op(name: Bytes, mode: Mode, ty_vars: List<Int>, row_vars: List<Int>, params: List<Type>, ret: Type, row: Row) -> OpInfo =
   { name: name, mode: mode, resource_param: false, params: params, ret: ret, at: { module: 0, span: dummy_span() },
-    scheme: Some({ ty_vars: ty_vars, row_vars: row_vars, ty: t_fn(params, ret, row) }) }
+    scheme: Some({ ty_vars: ty_vars, row_vars: row_vars, label_vars: [], ty: t_fn(params, ret, row) }) }
 
 fn prelude_effects() -> List<EffectInfo> = {
   let ta = TyVar(0);
@@ -297,7 +310,7 @@ fn simulated_atoms() -> List<Atom> =
 
 fn mono_fn(params: List<Type>, ret: Type) -> Scheme = mono(t_fn(params, ret, row_empty()))
 fn poly_fn(tys: List<Int>, rows: List<Int>, params: List<Type>, ret: Type, eff: Row) -> Scheme =
-  { ty_vars: tys, row_vars: rows, ty: t_fn(params, ret, eff) }
+  { ty_vars: tys, row_vars: rows, label_vars: [], ty: t_fn(params, ret, eff) }
 
 // Every builtin's scheme over the type variables `a`, `b`, `c` and the row variable `e`.
 pub fn builtin_schemes(a: Int, b: Int, c: Int, e: Int) -> List<{ name: Bytes, sc: Scheme }> = {
@@ -891,7 +904,10 @@ fn conv_atom(cx: Cx, a: AtomExpr) -> { cx: Cx, atom: Option<Atom> } =
     match e.name {
       None -> { cx: {..e.cx, refused_atoms: push(e.cx.refused_atoms, a.span)}, atom: None },
       Some(eff) -> {
-        let resource = match a.resource { Some(r) -> RNamed(r.name), None -> RSingleton };
+        let resource = match a.resource {
+          Some(r) -> match map_get(cx.label_params, r.name) { Some(v) -> RVar(v), None -> RNamed(r.name) },
+          None -> RSingleton,
+        };
         let info = effect_of(e.cx, eff);
         // An operation atom takes the declared operation's mode; the parser wrote a placeholder.
         let atom: Option<Atom> = match a.op {
@@ -1084,7 +1100,7 @@ fn collect_ctors(cx: Cx, m: Mod) -> Cx =
                       let fs: WithTys = conv_types(cc, variant.fields);
                       let checked: Cx = fold(range(0, len(fs.ts)), fs.cx, |c3: Cx, i: Int| reject_declared_cell(c3, at(fs.ts, i), ty_expr_span(at(variant.fields, i)), variant.name.name, b"a field"));
                       let ty = if len(fs.ts) == 0 { result } else { t_fn(fs.ts, result, row_empty()) };
-                      let sc = { ty_vars: vars.vars, row_vars: [], ty: ty };
+                      let sc = { ty_vars: vars.vars, row_vars: [], label_vars: [], ty: ty };
                       add_ctor({..checked, env: env_bind_global(checked.env, ctor, sc)},
                                { name: ctor, module: m.name, simple_name: variant.name.name, type_name: type_name, index: index,
                                  arity: len(fs.ts), fields: fs.ts, scheme: sc, at: here(checked, variant.span) })
@@ -1157,7 +1173,7 @@ fn check_where(cx: Cx, def: FnDef) -> Cx =
     })
 
 fn signature(cx0: Cx, def: FnDef) -> { cx: Cx, sig: Sig } = {
-  let cx: Cx = {..cx0, scope: cx0.scope + 1, ty_params: map_new(), row_params: map_new()};
+  let cx: Cx = {..cx0, scope: cx0.scope + 1, ty_params: map_new(), row_params: map_new(), label_params: map_new()};
   let tys: Cx = fold(def.generics.types, cx, |c: Cx, p: Ident| {
     let o: WithVar = new_ty_var(c);
     {..o.cx, subst: mark_rigid_ty(o.cx.subst, o.v), ty_params: map_insert(o.cx.ty_params, p.name, TyVar(o.v))}
@@ -1166,7 +1182,12 @@ fn signature(cx0: Cx, def: FnDef) -> { cx: Cx, sig: Sig } = {
     let o: WithVar = new_row_var(c);
     {..o.cx, subst: mark_rigid_row(o.cx.subst, o.v), row_params: map_insert(o.cx.row_params, p.name, o.v)}
   });
-  let assumed: Cx = {..rows, assumed: constraints_in_force(rows, def.constraints)};
+  // A label parameter is a type variable, rigid in the body, that the row's atoms name.
+  let labels: Cx = fold(def.generics.labels, rows, |c: Cx, p: Ident| {
+    let o: WithVar = new_ty_var(c);
+    {..o.cx, subst: mark_rigid_ty(o.cx.subst, o.v), label_params: map_insert(o.cx.label_params, p.name, o.v)}
+  });
+  let assumed: Cx = {..labels, assumed: constraints_in_force(labels, def.constraints)};
   let checked: Cx = check_where(assumed, def);
   let params = fold(def.params, { cx: checked, ts: [] }, |acc: { cx: Cx, ts: List<Type> }, p: Param|
     match p.ty {
@@ -1177,8 +1198,9 @@ fn signature(cx0: Cx, def: FnDef) -> { cx: Cx, sig: Sig } = {
   let declared: { cx: Cx, r: Option<Row> } = match def.effects { Some(r) -> { let o: WithRow = conv_row(ret.cx, r); { cx: o.cx, r: Some(o.r) } }, None -> { cx: ret.cx, r: None } };
   let row: WithRow = match declared.r { Some(r) -> { cx: declared.cx, r: r }, None -> new_row(declared.cx) };
   let c: Cx = row.cx;
-  { cx: {..c, ty_params: map_new(), row_params: map_new()},
-    sig: { ty_params: c.ty_params, row_params: c.row_params, fn_ty: t_fn(params.ts, ret.t, row.r), params: params.ts,
+  { cx: {..c, ty_params: map_new(), row_params: map_new(), label_params: map_new()},
+    sig: { ty_params: c.ty_params, row_params: c.row_params, label_params: c.label_params,
+           fn_ty: t_fn(params.ts, ret.t, row.r), params: params.ts,
            ret: ret.t, declared: declared.r, published_row: row.r, scope: c.scope } }
 }
 
@@ -1202,7 +1224,7 @@ fn callee_source(cx: Cx, func: Expr) -> Src =
 
 // Drops the sites recorded from `mark` to `until` whose atom `handled` covers.
 fn discharge(cx: Cx, mark: Int, until: Int, handled: List<Atom>) -> Cx = {
-  let kept = filter(take(drop(cx.performs, mark), until - mark), |s: PerformSite| !atoms_covered(handled, s.atom));
+  let kept = filter(take(drop(cx.performs, mark), until - mark), |s: PerformSite| !atoms_covered(handled, resolve_atom(cx.subst, s.atom)));
   {..cx, performs: append(append(take(cx.performs, mark), kept), drop(cx.performs, until))}
 }
 
@@ -1211,7 +1233,7 @@ fn key_named(keys: List<OpKey>, a: Atom) -> Bool =
 
 // The operation atoms a mode atom stands for: the effect's operations of that mode, under the atom's resource.
 fn mode_ops(cx: Cx, a: Atom) -> List<Atom> = {
-  let named = match a.resource { RNamed(_) -> true, RSingleton -> false };
+  let named = match a.resource { RNamed(_) -> true, RVar(_) -> true, RSingleton -> false };
   match effect_of(cx, a.effect) {
     Some(info) -> fold(info.ops, [], |acc: List<Atom>, o: OpInfo|
       if mode_eq(o.mode, a.mode) && o.resource_param == named { push(acc, { effect: a.effect, resource: a.resource, mode: a.mode, op: Some(o.name) }) } else { acc }),
@@ -1227,7 +1249,10 @@ fn clause_discharges(cx: Cx, handled: List<Atom>, keys: List<OpKey>, a: Atom) ->
     None -> atoms_contains(handled, a) && fold(mode_ops(cx, a), true, |acc: Bool, o: Atom| acc && key_named(keys, o)),
   }
 
-fn site_for(cx: Cx, atom: Atom) -> Option<PerformSite> = site_among(cx.performs, atom)
+fn site_for(cx: Cx, atom: Atom) -> Option<PerformSite> = site_among(resolved_sites(cx.subst, cx.performs), atom)
+
+fn resolved_sites(s: Subst, sites: List<PerformSite>) -> List<PerformSite> =
+  map(sites, |x: PerformSite| { atom: resolve_atom(s, x.atom), module: x.module, span: x.span, source: x.source })
 
 fn site_among(sites: List<PerformSite>, atom: Atom) -> Option<PerformSite> =
   fold(sites, None, |acc: Option<PerformSite>, s: PerformSite| match acc { Some(_) -> acc, None -> if s.atom == atom { Some(s) } else { None } })
@@ -1369,7 +1394,7 @@ fn infer(cx: Cx, e: Expr) -> Inferred =
       };
       { cx: {..checked, env: env_pop(checked.env)}, ty: t_fn(ps.ts, body.ty, body.row), row: row_empty() }
     },
-    EApp(a) -> infer_app(cx, a.span, a.func, a.args),
+    EApp(a) -> infer_app(cx, a.span, a.func, a.args, a.labels),
     EIf(i) -> {
       let c: Inferred = infer(cx, i.cond);
       let cc: Cx = expect(c.cx, expr_span(i.cond), t_bool(), c.ty, b"condition of `if`").cx;
@@ -1456,7 +1481,9 @@ fn infer_var(cx: Cx, q: QName) -> Inferred = {
             let inst = instantiate_with(sc, k.cx.fresh);
             let c: Cx = {..k.cx, fresh: inst.f};
             let noted: Cx = note_constraints(note_map_keys(c, q.span, inst.ty), q.span, key.name, inst.args);
-            { cx: noted, ty: inst.ty, row: row_empty() }
+            let group = group_label_vars(noted, key.name);
+            let ls = if len(group) > 0 { map(group, |v: Int| TyVar(v)) } else { inst.labels };
+            { cx: note_labels(noted, q.span, key.name, ls), ty: inst.ty, row: row_empty() }
           },
           None -> { let o: WithTy = new_ty(unknown_name(k.cx, q)); { cx: o.cx, ty: o.t, row: row_empty() } },
         }
@@ -1524,15 +1551,70 @@ fn infer_stmt(cx: Cx, s: Stmt) -> { cx: Cx, row: Row } =
     },
   }
 
-fn infer_app(cx: Cx, span: Span, func: Expr, args: List<Expr>) -> Inferred =
+fn infer_app(cx: Cx, span: Span, func: Expr, args: List<Expr>, labels: List<Ident>) -> Inferred =
   match func {
     EVar(v) ->
       match cell_form(cx, v.name) {
-        Some(form) -> infer_cell_op(cx, span, args, form),
-        None -> infer_app_general(cx, span, func, args),
+        Some(form) -> infer_cell_op(fill_labels(cx, span, labels, None), span, args, form),
+        None -> infer_app_general(cx, span, func, args, labels),
       },
-    _ -> infer_app_general(cx, span, func, args),
+    _ -> infer_app_general(cx, span, func, args, labels),
   }
+
+fn group_label_vars(cx: Cx, name: Bytes) -> List<Int> =
+  fold(cx.group_labels, [], |acc: List<Int>, g: { name: Bytes, vars: List<Int> }| if g.name == name { g.vars } else { acc })
+
+// Every use of a label-generic definition, so a call can fill its labels and a settled component
+// can say which ones it filled them with.
+fn note_labels(cx: Cx, span: Span, callee: Bytes, labels: List<Type>) -> Cx =
+  if len(labels) == 0 { cx } else {
+    {..cx, label_apps: push(cx.label_apps,
+      { module: cx.module, span: span, callee: callee,
+        vars: map(labels, |t: Type| match t { TyVar(v) -> v, _ -> 0 - 1 }),
+        params: cx.label_params, called: false })}
+  }
+
+// The use recorded for the name this call applies, when the callee is label-generic.
+fn callee_labels(cx: Cx, span: Span) -> Option<LabelApp> =
+  match list_at(cx.label_apps, len(cx.label_apps) - 1) {
+    Some(a) -> if a.module == cx.module && a.span == span { Some(a) } else { None },
+    None -> None,
+  }
+
+// The labels written at a call fill the callee's label parameters left to right.
+fn fill_labels(cx: Cx, span: Span, labels: List<Ident>, app: Option<LabelApp>) -> Cx =
+  match app {
+    None -> if len(labels) == 0 { cx } else { wrong_labels(cx, labels, None, 0) },
+    // A count that does not match is reported here, and the use dropped rather than reported twice.
+    Some(a) ->
+      if len(labels) > 0 && len(labels) != len(a.vars) {
+        wrong_labels({..cx, label_apps: take(cx.label_apps, len(cx.label_apps) - 1)}, labels, Some(a.callee), len(a.vars))
+      } else {
+        let marked: Cx = {..cx, label_apps: set_at(cx.label_apps, len(cx.label_apps) - 1,
+          { module: a.module, span: span, callee: a.callee, vars: a.vars, params: a.params, called: true })};
+        // A name a binder holds is that label parameter, as it is inside a row; anything else is a resource.
+        fold(range(0, len(labels)), marked, |c: Cx, i: Int| {
+          let want = match map_get(c.label_params, at(labels, i).name) { Some(w) -> TyVar(w), None -> label_type(at(labels, i).name) };
+          with_unified(c, unify(c.subst, c.fresh, TyVar(at(a.vars, i)), want))
+        })
+      },
+  }
+
+fn wrong_labels(cx: Cx, labels: List<Ident>, callee: Option<Bytes>, want: Int) -> Cx = {
+  let at_ = span_to(at(labels, 0).span, at(labels, len(labels) - 1).span);
+  let who = match callee { Some(n) -> bytes_concat_all([b"`", simple_name_of(n), b"`"]), None -> b"this callee" };
+  let message = if want == 0 { bytes_concat_all([who, b" takes no label parameters"]) }
+                else { bytes_concat_all([who, b" takes ", num(want), b" label parameter", plural(want),
+                                         b", but ", num(len(labels)), b" ", if len(labels) == 1 { b"is" } else { b"are" }, b" written"]) };
+  let help = [b"the labels at a call fill the `[l]` binders of the definition's generic list, left to right"];
+  match callee {
+    Some(n) -> match def_of(cx, n) {
+      Some(d) -> err2(cx, b"E0306", at_, message, b"label instantiation", d.at, b"declared here", help),
+      None -> err1(cx, b"E0306", at_, message, b"label instantiation", help),
+    },
+    None -> err1(cx, b"E0306", at_, message, b"label instantiation", help),
+  }
+}
 
 // Builtins whose first parameter must be an integer type, checked per call: a scheme cannot say "an integer".
 fn int_builtin_name(func: Expr) -> Bytes =
@@ -1546,8 +1628,10 @@ fn is_int_builtin(func: Expr) -> Bool = {
   n == b"wrap_add" || n == b"wrap_sub" || n == b"wrap_mul" || n == b"rotr"
 }
 
-fn infer_app_general(cx: Cx, span: Span, func: Expr, args: List<Expr>) -> Inferred = {
-  let f: Inferred = infer(cx, func);
+fn infer_app_general(cx: Cx, span: Span, func: Expr, args: List<Expr>, labels: List<Ident>) -> Inferred = {
+  let f0: Inferred = infer(cx, func);
+  // Before the arguments, so a written label is what an argument's row is checked against.
+  let f: Inferred = { cx: fill_labels(f0.cx, span, labels, callee_labels(f0.cx, expr_span(func))), ty: f0.ty, row: f0.row };
   let as_: { cx: Cx, tys: List<Type>, row: Row } = infer_all(f.cx, args, span);
   let j0: WithRow = join(as_.cx, span, f.row, as_.row);
   let c: Cx = j0.cx;
@@ -1963,7 +2047,7 @@ fn as_written(cx: Cx, eff: Bytes) -> Bytes = {
 
 fn resource_for(cx: Cx, info: EffectInfo, op: OpInfo, resource: Option<Ident>, span: Span) -> { cx: Cx, res: Option<Resource> } =
   match resource {
-    Some(r) -> if op.resource_param { { cx: cx, res: Some(RNamed(r.name)) } } else {
+    Some(r) -> if op.resource_param { { cx: cx, res: Some(match map_get(cx.label_params, r.name) { Some(v) -> RVar(v), None -> RNamed(r.name) }) } } else {
       { cx: err2(cx, b"E0304", r.span, bytes_concat_all([b"`", info.name, b".", op.name, b"` is not resource-parameterized"]),
                  b"unexpected resource label", op.at, b"declared without `[r]`",
                  [bytes_concat_all([b"drop the label, or declare it as `", mode_key(op.mode), b" ", op.name, b"[r](..)`"])]),
@@ -1983,7 +2067,7 @@ fn op_free_vars(op: OpInfo) -> List<Int> = {
 }
 
 fn op_scheme(op: OpInfo) -> Scheme =
-  match op.scheme { Some(sc) -> sc, None -> { ty_vars: op_free_vars(op), row_vars: [], ty: t_fn(op.params, op.ret, row_empty()) } }
+  match op.scheme { Some(sc) -> sc, None -> { ty_vars: op_free_vars(op), row_vars: [], label_vars: [], ty: t_fn(op.params, op.ret, row_empty()) } }
 
 type OpShape = { cx: Cx, params: List<Type>, ret: Type, row: Row }
 
@@ -1997,7 +2081,7 @@ fn instantiate_op_for_clause(cx: Cx, op: OpInfo) -> OpShape = {
   let sc = op_scheme(op);
   let tys: { cx: Cx, vs: List<Int> } = fold(sc.ty_vars, { cx: cx, vs: [] }, |acc: { cx: Cx, vs: List<Int> }, v: Int| { let o: WithVar = new_ty_var(acc.cx); { cx: {..o.cx, subst: mark_rigid_ty(o.cx.subst, o.v)}, vs: push(acc.vs, o.v) } });
   let rows: { cx: Cx, vs: List<Int> } = fold(sc.row_vars, { cx: tys.cx, vs: [] }, |acc: { cx: Cx, vs: List<Int> }, v: Int| { let o: WithVar = new_row_var(acc.cx); { cx: {..o.cx, subst: mark_rigid_row(o.cx.subst, o.v)}, vs: push(acc.vs, o.v) } });
-  match rename_scheme(sc, tys.vs, rows.vs) { TyFn(f) -> { cx: rows.cx, params: f.params, ret: f.ret, row: f.effects }, _ -> panic("operation schemes are function types") }
+  match rename_scheme(sc, tys.vs, rows.vs, []) { TyFn(f) -> { cx: rows.cx, params: f.params, ret: f.ret, row: f.effects }, _ -> panic("operation schemes are function types") }
 }
 
 fn infer_perform(cx: Cx, span: Span, eff: QName, op: Ident, resource: Option<Ident>, args: List<Expr>) -> Inferred = {
@@ -2111,7 +2195,7 @@ fn infer_handle(cx: Cx, span: Span, body: Expr, clauses: List<HandleClause>, ret
   // An atom the clauses leave under a handled mode atom runs past this `handle`: refused unless the
   // enclosing definition's written row forwards it to the caller's handler.
   let missing = filter(remaining, |a: Atom| atoms_covered(walked.handled, a) && !atoms_covered(agreed.declared_atoms, a));
-  let sites = take(drop(agreed.performs, mark), body_mark - mark);
+  let sites = resolved_sites(agreed.subst, take(drop(agreed.performs, mark), body_mark - mark));
   let after = fold(clauses, span.start, |acc: Int, cl: HandleClause| max(acc, expr_span(cl.body).end));
   let judged: Cx = if len(missing) == 0 { agreed } else { incomplete(agreed, span, after, sites, walked.handled, walked.selected, missing) };
   // A refused atom leaves the row with its report, so the signature is not told about it twice.
@@ -2461,10 +2545,11 @@ fn known_test(cx: Cx, module: Bytes, position: Int) -> Option<List<Atom>> =
 
 // The same scheme with its quantified variables drawn from this run.
 fn adopt(cx: Cx, sc: Scheme) -> { cx: Cx, sc: Scheme } =
-  if len(sc.ty_vars) == 0 && len(sc.row_vars) == 0 { { cx: cx, sc: sc } } else {
+  if len(sc.ty_vars) == 0 && len(sc.row_vars) == 0 && len(sc.label_vars) == 0 { { cx: cx, sc: sc } } else {
     let tys = fold(sc.ty_vars, { cx: cx, vs: [] }, |acc: { cx: Cx, vs: List<Int> }, v: Int| { let o: WithVar = new_ty_var(acc.cx); { cx: o.cx, vs: push(acc.vs, o.v) } });
     let rows = fold(sc.row_vars, { cx: tys.cx, vs: [] }, |acc: { cx: Cx, vs: List<Int> }, v: Int| { let o: WithVar = new_row_var(acc.cx); { cx: o.cx, vs: push(acc.vs, o.v) } });
-    { cx: rows.cx, sc: { ty_vars: tys.vs, row_vars: rows.vs, ty: rename_scheme(sc, tys.vs, rows.vs) } }
+    let labels = fold(sc.label_vars, { cx: rows.cx, vs: [] }, |acc: { cx: Cx, vs: List<Int> }, v: Int| { let o: WithVar = new_ty_var(acc.cx); { cx: o.cx, vs: push(acc.vs, o.v) } });
+    { cx: labels.cx, sc: { ty_vars: tys.vs, row_vars: rows.vs, label_vars: labels.vs, ty: rename_scheme(sc, tys.vs, rows.vs, labels.vs) } }
   }
 
 // Unifying a restored scheme with the fresh signature says which of its variables each constrained parameter is.
@@ -2510,19 +2595,26 @@ fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
 }
 
 fn check_component_walked(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>, qualified: List<Bytes>) -> Cx = {
-  let sigs = fold(range(0, len(comp)), { cx: cx, sigs: [] }, |acc: { cx: Cx, sigs: List<Sig> }, slot: Int| {
+  let sigs: { cx: Cx, sigs: List<Sig> } = fold(range(0, len(comp)), { cx: cx, sigs: [] }, |acc: { cx: Cx, sigs: List<Sig> }, slot: Int| {
     let def = at(fns, at(comp, slot));
     let s: WithSig = signature({..acc.cx, derived: derived_of(m, def)}, def);
     { cx: {..s.cx, derived: None, env: env_bind_global(s.cx.env, at(qualified, slot), mono(s.sig.fn_ty))}, sigs: push(acc.sigs, s.sig) }
   });
-  let bodies = fold(range(0, len(comp)), { cx: sigs.cx, rows: [] }, |acc: { cx: Cx, rows: List<Row> }, slot: Int| {
+  let grouped: Cx = {..sigs.cx, group_labels: fold(range(0, len(comp)), [], |acc: List<{ name: Bytes, vars: List<Int> }>, slot: Int| {
+    let def = at(fns, at(comp, slot));
+    let sig = at(sigs.sigs, slot);
+    let vars = fold(def.generics.labels, [], |vs: List<Int>, p: Ident|
+      match map_get(sig.label_params, p.name) { Some(v) -> push(vs, v), None -> vs });
+    if len(vars) == 0 { acc } else { push(acc, { name: at(qualified, slot), vars: vars }) }
+  })};
+  let bodies: { cx: Cx, rows: List<Row> } = fold(range(0, len(comp)), { cx: grouped, rows: [] }, |acc: { cx: Cx, rows: List<Row> }, slot: Int| {
     let def = at(fns, at(comp, slot));
     let sig = at(sigs.sigs, slot);
     let o: WithBodyRow = check_fn_body({..acc.cx, derived: derived_of(m, def)}, def, sig);
     let walked: Cx = {..o.cx, derived: None};
     { cx: record_spec_env(walked, def, at(qualified, slot), sig), rows: push(acc.rows, o.row) }
   });
-  let settled: Cx = settle_bit_ops(settle_numerics(bodies.cx));
+  let settled: Cx = settle_bit_ops(settle_numerics({..bodies.cx, group_labels: []}));
   let required: Cx = fold(range(0, len(comp)), settled, |c: Cx, slot: Int| require_written_signature(c, at(fns, at(comp, slot)), at(sigs.sigs, slot)));
   let closed: Cx = fold(sigs.sigs, required, |c: Cx, s: Sig| close_unreachable_row(c, s));
   let removed: Cx = fold(qualified, closed, |c: Cx, name: Bytes| {..c, env: env_remove_global(c.env, name)});
@@ -2530,15 +2622,26 @@ fn check_component_walked(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>, qua
     let def = at(fns, at(comp, slot));
     let sig = at(sigs.sigs, slot);
     let g: Generalized = generalize(c.subst, c.env, sig.fn_ty);
+    let sc: Scheme = split_labels(g.sc, def, sig);
     let row = resolve_r(c, sig.published_row);
-    let bound: Cx = {..c, env: env_bind_global(g.e, at(qualified, slot), g.sc), ty_params: sig.ty_params};
-    let constraints = published_constraints(bound, def, g.sc);
+    let bound: Cx = {..c, env: env_bind_global(g.e, at(qualified, slot), sc), ty_params: sig.ty_params};
+    let constraints = published_constraints(bound, def, sc);
     let performed = resolve_r(bound, at(bodies.rows, slot));
     set_def({..bound, ty_params: map_new(), constraints: map_insert(bound.constraints, at(qualified, slot), constraints)},
-            { name: at(qualified, slot), module: m.name, simple_name: def.name.name, scheme: g.sc, footprint: row.atoms,
+            { name: at(qualified, slot), module: m.name, simple_name: def.name.name, scheme: sc, footprint: row.atoms,
               performed: performed.atoms, row_aliases: row_aliases(def), constraints: constraints, spec: [],
               internally_effectful: true, at: here(bound, def.span) })
   })
+}
+
+// The signature's label parameters generalize among the type variables; they belong in their own
+// list, in the order the generic list wrote them, and a phantom one is still a parameter.
+fn split_labels(sc: Scheme, def: FnDef, sig: Sig) -> Scheme = {
+  let ids = fold(def.generics.labels, [], |acc: List<Int>, p: Ident|
+    match map_get(sig.label_params, p.name) { Some(v) -> push(acc, v), None -> acc });
+  if len(ids) == 0 { sc } else {
+    { ty_vars: ints_difference(sc.ty_vars, ids), row_vars: sc.row_vars, label_vars: ids, ty: sc.ty }
+  }
 }
 
 // A generated definition carries its `derive` item's span and nothing hand-written does.
@@ -2571,7 +2674,8 @@ fn dedup_constraints(xs: List<DefConstraint>) -> List<DefConstraint> =
     if len(acc) > 0 && at(acc, len(acc) - 1).param == c.param && same_deriver(at(acc, len(acc) - 1).deriver, c.deriver) { acc } else { push(acc, c) })
 
 fn check_fn_body(cx0: Cx, def: FnDef, sig: Sig) -> { cx: Cx, row: Row } = {
-  let cx: Cx = {..cx0, scope: sig.scope, ty_params: sig.ty_params, row_params: sig.row_params, performs: [],
+  let cx: Cx = {..cx0, scope: sig.scope, ty_params: sig.ty_params, row_params: sig.row_params,
+                label_params: sig.label_params, performs: [],
                 declared_atoms: match sig.declared { Some(r) -> resolve_r(cx0, r).atoms, None -> [] }};
   let assumed: Cx = {..cx, assumed: constraints_in_force(cx, def.constraints)};
   let defaults: Cx = fold(range(0, len(def.params)), assumed, |c: Cx, i: Int|
@@ -2592,7 +2696,7 @@ fn check_fn_body(cx0: Cx, def: FnDef, sig: Sig) -> { cx: Cx, row: Row } = {
       match u.err { Some(e) -> report_unify(c, e, expr_span(def.body), b"inferred effect row"), None -> c }
     },
   };
-  { cx: {..rowed, ty_params: map_new(), row_params: map_new(), assumed: []}, row: body.row }
+  { cx: {..rowed, ty_params: map_new(), row_params: map_new(), label_params: map_new(), assumed: []}, row: body.row }
 }
 
 type Offence = { atom: Atom, site: Option<PerformSite> }
@@ -2780,7 +2884,7 @@ fn check_tests(cx: Cx, m: Mod) -> Cx = {
         let footprint: WithAtoms = match known_test(c, m.name, acc.position) {
           Some(cached) -> { cx: c, atoms: cached },
           None -> {
-            let c1: Cx = {..c, ty_params: map_new(), row_params: map_new(), performs: [], declared_atoms: []};
+            let c1: Cx = {..c, ty_params: map_new(), row_params: map_new(), label_params: map_new(), performs: [], declared_atoms: []};
             let pushed: Cx = {..c1, env: env_push(c1.env)};
             let o: Inferred = infer(pushed, def.body);
             let popped: Cx = {..o.cx, env: env_pop(o.cx.env)};
@@ -2822,7 +2926,7 @@ fn check_determinism(cx: Cx, def: TestDef, footprint: List<Atom>) -> Cx =
 // A clause the reader could paste, for the operation the atom names.
 fn example_clause(cx: Cx, info: EffectInfo, atom: Atom) -> Bytes = {
   let written = as_written(cx, info.name);
-  let named = match atom.resource { RNamed(_) -> true, RSingleton -> false };
+  let named = match atom.resource { RNamed(_) -> true, RVar(_) -> true, RSingleton -> false };
   let first = |ok: (OpInfo) -> Bool| fold(info.ops, None, |acc: Option<OpInfo>, o: OpInfo| match acc { Some(_) -> acc, None -> if ok(o) { Some(o) } else { None } });
   let op = match atom.op {
     Some(name) -> op_named(info, name),
@@ -2833,7 +2937,7 @@ fn example_clause(cx: Cx, info: EffectInfo, atom: Atom) -> Bytes = {
   };
   match op {
     Some(o) -> {
-      let resource = match atom.resource { RNamed(r) -> if o.resource_param { bytes_concat_all([b"[", r, b"]"]) } else { b"" }, RSingleton -> b"" };
+      let resource = if o.resource_param { resource_text(atom.resource) } else { b"" };
       let args = join_with(map(range(0, len(o.params)), |i: Int| bytes_concat(b"a", num(i))), b", ");
       bytes_concat_all([written, b".", o.name, resource, b"(", args, b") -> <value>"])
     },
@@ -2868,7 +2972,7 @@ fn debug_quoted(s: Bytes) -> Bytes =
     b"\""])
 
 fn check_law(cx0: Cx, m: Mod, def: LawDef) -> Cx = {
-  let cx: Cx = {..cx0, ty_params: map_new(), row_params: map_new(), performs: [], declared_atoms: [], auto_ty_params: true};
+  let cx: Cx = {..cx0, ty_params: map_new(), row_params: map_new(), label_params: map_new(), performs: [], declared_atoms: [], auto_ty_params: true};
   let types: WithTys = fold(def.binders, { cx: cx, ts: [] }, |acc: { cx: Cx, ts: List<Type> }, b: Binder| {
     let o: WithTy = law_binder(acc.cx, b);
     { cx: o.cx, ts: push(acc.ts, o.t) }
@@ -3600,6 +3704,7 @@ fn fresh_cx(r: Resolved, mods: List<Mod>, known: Known) -> Cx =
   install_prelude({ r: r, mods: mods, module: 0, subst: subst_new(), fresh: fresh_new(), env: env_new(), diags: [],
                     types: map_new(), effects: [], effect_index: map_new(), ctors: [], ctor_index: map_new(),
                     defs: [], def_index: map_new(), tests: [], laws: [], ty_params: map_new(), row_params: map_new(),
+                    label_params: map_new(), label_apps: [], label_sites: [], group_labels: [],
                     auto_ty_params: false, alias_stack: [], refused_atoms: [], performs: [], declared_atoms: [], comparisons: [], scope: 0,
                     constraints: map_new(), numerics: [], bit_ops: [], simulate_depth: 0, open_regions: [], regions: [], simulations: [],
                     map_keys: [], constrained_uses: [], spec_kind: None, spec_envs: [], derived: None, known: known, assumed: [] })
@@ -3625,14 +3730,59 @@ pub fn check_front(r: Resolved, mods: List<Mod>) -> Front = {
     defs: out.cx.defs, tests: out.cx.tests, laws: out.cx.laws, effects: out.cx.effects, ctors: out.cx.ctors }
 }
 
-// Definitions published as pure (empty footprint, no constraint), for the emitter's constant table; `None` if the program fails.
-pub fn pure_definitions(r: Resolved, mods: List<Mod>) -> Option<List<Bytes>> = {
+// What the emitter needs from the checker: the definitions published as pure (empty footprint, no
+// constraint), for its constant table, and the labels every call fills. `None` if the program fails.
+pub type EmitFacts = { pure: List<Bytes>, label_sites: List<LabelSite> }
+
+pub fn emit_facts(r: Resolved, mods: List<Mod>) -> Option<EmitFacts> = {
   let out = check_program(r, mods);
   if !out.ok { None } else {
-    Some(fold(out.cx.defs, [], |acc: List<Bytes>, d: DefInfo|
-      if len(d.footprint) == 0 && len(d.constraints) == 0 { push(acc, d.name) } else { acc }))
+    Some({ pure: fold(out.cx.defs, [], |acc: List<Bytes>, d: DefInfo|
+             if len(d.footprint) == 0 && len(d.constraints) == 0 { push(acc, d.name) } else { acc }),
+           label_sites: out.cx.label_sites })
   }
 }
+
+// Every use of a label-generic definition is a call, and every call fills its labels.
+fn check_label_apps(cx0: Cx) -> Cx = {
+  let out: Cx = fold(cx0.label_apps, cx0, |c: Cx, a: LabelApp| {
+    let at_: Cx = {..c, module: a.module};
+    let judged: Cx =
+      if !a.called {
+        err1(at_, b"E0306", a.span,
+             bytes_concat_all([b"`", simple_name_of(a.callee), b"` must be called directly"]),
+             b"used as a value",
+             [b"its row names a label the caller fills, so it has no meaning until a call says which resource it touches"])
+      } else {
+        let names = fold(a.vars, [], |acc: List<Bytes>, v: Int|
+          match label_named(at_, a, v) { Some(n) -> push(acc, n), None -> acc });
+        if len(names) < len(a.vars) {
+          err1(at_, b"E0306", a.span,
+               bytes_concat_all([b"this call leaves a label of `", simple_name_of(a.callee), b"` unfilled"]),
+               b"no resource to perform under",
+               [bytes_concat_all([b"write it at the call, as `", simple_name_of(a.callee), b"[<label>](..)`, or pass an argument whose row names it"])])
+        } else {
+          {..at_, label_sites: push(at_.label_sites, { module: a.module, span: a.span, labels: names })}
+        }
+      };
+    {..judged, module: c.module}
+  });
+  {..out, module: cx0.module}
+}
+
+// A settled label is the resource it names, or the enclosing definition's own label parameter.
+fn label_named(cx: Cx, a: LabelApp, v: Int) -> Option<Bytes> =
+  if v < 0 { None } else {
+    let t = shallow(cx.subst, TyVar(v));
+    match label_of(t) {
+      Some(n) -> Some(n),
+      None -> match t { TyVar(w) -> param_named(a.params, w), _ -> None },
+    }
+  }
+
+fn param_named(params: Map<Bytes, Int>, v: Int) -> Option<Bytes> =
+  map_fold(params, None, |acc: Option<Bytes>, k: Bytes, w: Int|
+    match acc { Some(_) -> acc, None -> if w == v { Some(k) } else { None } })
 
 pub fn check_program_with(r: Resolved, mods: List<Mod>, known: Known) -> Checked = {
   let c0 = fresh_cx(r, mods, known);
@@ -3645,7 +3795,7 @@ pub fn check_program_with(r: Resolved, mods: List<Mod>, known: Known) -> Checked
   let tested: Cx = fold(range(0, len(mods)), checked, |c: Cx, i: Int| check_laws(check_tests({..c, module: i}, at(mods, i)), at(mods, i)));
   // Whatever `check_fns` did not drain: a spec clause, a test body, a law.
   let settled: Cx = settle_bit_ops(settle_numerics(tested));
-  let constrained: Cx = check_constraints(check_map_keys(check_comparisons(settled)));
+  let constrained: Cx = check_constraints(check_map_keys(check_comparisons(check_label_apps(settled))));
   let solved: Cx = check_regions(check_simulations(attribute_generated(check_derives(constrained))));
   let marked: Cx = mark_internal_effects(solved);
   { cx: marked, ok: len(marked.diags) == 0 }
@@ -3655,8 +3805,7 @@ pub fn check_program_with(r: Resolved, mods: List<Mod>, known: Known) -> Checked
 
 fn n(v: Int) -> Bytes = num(v)
 
-fn footprint_text(atoms: List<Atom>) -> Bytes =
-  fold(range(0, len(atoms)), b"", |acc: Bytes, i: Int| if i == 0 { atom_text(at(atoms, i)) } else { bytes_concat_all([acc, b",", atom_text(at(atoms, i))]) })
+fn footprint_text(atoms: List<Atom>) -> Bytes = atoms_text(atoms, b",")
 
 fn join_with(xs: List<Bytes>, sep: Bytes) -> Bytes =
   fold(range(0, len(xs)), b"", |acc: Bytes, i: Int| if i == 0 { at(xs, i) } else { bytes_concat_all([acc, sep, at(xs, i)]) })
@@ -3756,6 +3905,44 @@ pub fn check_dump_known(sources: List<Source>) -> String = {
 test "a definition's scheme is generalized and its footprint inferred" {
   let dump = check_dump([{ name: b"m", src: b"pub fn id<a>(x: a) -> a = x\nfn two() -> Int = id(2)\neffect log { write emit(Bytes) -> Unit }\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)" }]);
   assert_eq(dump, "K;1;F;m.id;<a>(a) -> a;;;;0;F;m.two;() -> Int;;;;0;F;m.say;(Bytes) -> Unit / {m.log.write};m.log.write;m.log.emit;;1;E;m.log;0;emit:write:0:Bytes:Unit;")
+}
+
+test "a definition may be generic over a resource label, and a call fills it" {
+  let dump = check_dump([{ name: b"m", src: b"effect net { write send[r](Bytes) -> Unit }\npub fn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\npub fn go(b: Bytes) -> Unit / {net.send[conn]} = relay[conn](b)" }]);
+  assert_eq(dump, "K;1;F;m.relay;<[l]>(Bytes) -> Unit / {m.net.send[l]};m.net.send[l];m.net.send[l];;1;"
+            ++ "F;m.go;(Bytes) -> Unit / {m.net.send[conn]};m.net.send[conn];m.net.send[conn];;1;"
+            ++ "E;m.net;0;send:write:1:Bytes:Unit;")
+}
+
+test "an argument's row fills a label the call does not write" {
+  let dump = check_dump([{ name: b"m", src: b"effect net { write send[r](Bytes) -> Unit }\nfn relay<[l]>(f: () -> Unit / {net.send[l]}) -> Unit / {net.send[l]} = f()\nfn go(f: () -> Unit / {net.send[conn]}) -> Unit / {net.send[conn]} = relay(f)" }]);
+  assert_eq(dump, "K;1;F;m.relay;<[l]>(() -> Unit / {m.net.send[l]}) -> Unit / {m.net.send[l]};m.net.send[l];m.net.send[l];;0;"
+            ++ "F;m.go;(() -> Unit / {m.net.send[conn]}) -> Unit / {m.net.send[conn]};m.net.send[conn];m.net.send[conn];;0;"
+            ++ "E;m.net;0;send:write:1:Bytes:Unit;")
+}
+
+test "a clause on a label parameter discharges what the generic body performs" {
+  let dump = check_dump([{ name: b"m", src: b"effect net { write send[r](Bytes) -> Unit }\nfn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\nfn quiet<[l]>(b: Bytes) -> Unit = handle relay[l](b) with { net.send[l](x) -> () }" }]);
+  assert_eq(dump, "K;1;F;m.relay;<[l]>(Bytes) -> Unit / {m.net.send[l]};m.net.send[l];m.net.send[l];;1;"
+            ++ "F;m.quiet;<[l]>(Bytes) -> Unit;;;;1;"
+            ++ "E;m.net;0;send:write:1:Bytes:Unit;")
+}
+
+test "a label a call cannot fill, a count that does not match, and a use as a value" {
+  let unfilled = check_dump([{ name: b"m", src: b"effect net { write send[r](Bytes) -> Unit }\nfn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\nfn go(b: Bytes) -> Unit / {net.send[conn]} = relay(b)" }]);
+  assert(string_contains(unfilled, "E0306"));
+  let counted = check_dump([{ name: b"m", src: b"effect net { write send[r](Bytes) -> Unit }\nfn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\nfn go(b: Bytes) -> Unit / {net.send[conn]} = relay[conn, other](b)" }]);
+  assert(string_contains(counted, "E0306"));
+  let valued = check_dump([{ name: b"m", src: b"effect net { write send[r](Bytes) -> Unit }\nfn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\nfn go() -> (Bytes) -> Unit / {net.send[conn]} = relay" }]);
+  assert(string_contains(valued, "E0306"));
+  let plain = check_dump([{ name: b"m", src: b"fn id(x: Int) -> Int = x\nfn go(n: Int) -> Int = id[conn](n)" }]);
+  assert(string_contains(plain, "E0306"))
+}
+
+test "two label parameters stay apart, and each names its own atom" {
+  let dump = check_dump([{ name: b"m", src: b"effect net { write send[r](Bytes) -> Unit }\nfn pipe<[l, k]>(b: Bytes) -> Unit / {net.send[l], net.send[k]} = { net.send[l](b); net.send[k](b) }" }]);
+  assert_eq(dump, "K;1;F;m.pipe;<[l], [m]>(Bytes) -> Unit / {m.net.send[l], m.net.send[m]};m.net.send[l],m.net.send[m];m.net.send[l],m.net.send[m];;1;"
+            ++ "E;m.net;0;send:write:1:Bytes:Unit;")
 }
 
 test "a unit pattern covers its type" {
