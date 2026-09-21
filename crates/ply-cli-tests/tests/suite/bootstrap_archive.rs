@@ -43,8 +43,14 @@ fn an_archive_is_written_and_verifies_against_the_tree_it_came_from() {
     assert!(manifest.is_file(), "no manifest was written");
     // The C is the compiler, so it has to contain the definitions rather than merely exist.
     let text = std::fs::read_to_string(&c).expect("read the C");
+    // The symbol as the unit's own table publishes it: `<name> <arity> <symbol> <entry>`.
+    let symbol = text
+        .lines()
+        .find_map(|l| l.strip_prefix("\"m.area ")?.split(' ').nth(1))
+        .expect("the artifact says what it calls `m.area`")
+        .to_string();
     assert!(
-        text.contains("ply_m_area") && text.contains("ply_bind"),
+        text.contains(&format!("Word {symbol}(PlyCtx *ctx")) && text.contains("ply_bind"),
         "the artifact does not hold the program it was made from"
     );
 

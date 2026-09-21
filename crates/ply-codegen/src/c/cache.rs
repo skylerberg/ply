@@ -1,7 +1,7 @@
 //! Emitted bodies and units, kept between runs. A body names tables by its own positions
 //! (`@@c3@@`), so a cached body is a function of the body alone.
 
-use super::tables::Tables;
+use super::tables::{Defined, Tables};
 use ply_eval::Value;
 use ply_span::Symbol;
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ fn dir() -> PathBuf {
 pub fn key(def_hash: &str, ctors: &str) -> String {
     let mut h = blake3::Hasher::new();
     for part in [
-        "ply-c-emit-6",
+        "ply-c-emit-7",
         &exe_stamp(),
         &super::exports::helpers_digest(),
         ctors,
@@ -124,6 +124,10 @@ pub fn encode(text: &str, t: &Tables) -> String {
     out.push_str(&format!("members {}\n", t.members.len()));
     for m in &t.members {
         out.push_str(&format!("{m}\n"));
+    }
+    out.push_str(&format!("symbols {}\n", t.symbols.len()));
+    for d in &t.symbols {
+        out.push_str(&format!("{} {}\n", d.symbol, d.entry));
     }
     out.push_str("text\n");
     out.push_str(text);
@@ -276,6 +280,18 @@ pub fn decode(s: &str) -> Option<(String, Tables)> {
     if let Some(n) = count(next, "members") {
         for _ in 0..n {
             t.members.push(line(s, &mut at)?.to_string());
+        }
+        next = line(s, &mut at)?;
+    }
+    // Likewise for the symbols a body publishes; a frame without them is read at the spelling
+    // that emitted it.
+    if let Some(n) = count(next, "symbols") {
+        for _ in 0..n {
+            let (symbol, entry) = line(s, &mut at)?.split_once(' ')?;
+            t.symbols.push(Defined {
+                symbol: symbol.to_string(),
+                entry: entry.to_string(),
+            });
         }
         next = line(s, &mut at)?;
     }

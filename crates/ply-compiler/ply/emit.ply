@@ -842,8 +842,10 @@ fn def_of(em: Em, name: Bytes) -> Option<{ full: Bytes, c: Bytes, arity: Int }> 
     match target {
       None -> None,
       Some(t) -> match fold(t.defs, None, |acc: Option<Def>, d: Def| if d.name == t.name { Some(d) } else { acc }) {
-        Some(d) -> Some({ full: bytes_concat_all([t.module, b".", t.name]),
-                          c: bytes_concat_all([b"ply_", mangle(t.module), b"_", t.name]), arity: d.arity }),
+        Some(d) -> {
+          let full = bytes_concat_all([t.module, b".", t.name]);
+          Some({ full: full, c: symbol_of(full), arity: d.arity })
+        },
         None -> None,
       },
     }
@@ -1558,7 +1560,7 @@ fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>
       Some({ met: o.em.met, consts: o.em.consts, shapes: o.em.shapes, fields: o.em.fields, lambdas: o.em.lambdas, calls: o.em.calls, performs: o.em.performs, handles: o.em.handles, refused: o.em.refused,
       extra: o.em.extra,
       text: bytes_concat_all([
-      b"Word ply_", name, b"(PlyCtx *ctx",
+      b"Word ", name, b"(PlyCtx *ctx",
       fold(range(0, n), b"", |acc: Bytes, i: Int| bytes_concat_all([acc, b", Word q", num(i)])),
       b") {\n", fuel_head(),
       fold(sorted_widths(o.em.toks), b"", |acc: Bytes, w: Int|
@@ -1566,7 +1568,7 @@ fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>
       fold(o.em.rlocals, b"", |acc: Bytes, r: Bytes| bytes_concat_all([acc, b"  Word ", r, b" = 0;\n"])),
       bytes_join(o.em.out, b""),
       b"  ctx->fuel += 1;\n  return ", w.c, b";\n}\n",
-      b"Word ply_", name, b"_entry(PlyCtx *ctx, const Word *args) {\n  return ply_", name,
+      b"Word ", name, b"_entry(PlyCtx *ctx, const Word *args) {\n  return ", name,
       b"(ctx", fold(range(0, n), b"", |acc: Bytes, i: Int|
         bytes_concat_all([acc, b", args[", num(i), b"]"])), b");\n}\n"]) })
     },
@@ -1910,11 +1912,11 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         None -> None,
         Some(w) -> {
           // Numbered among this body's lambdas; the code table holds constants' entries too.
-          let prefix = bytes_concat_all([b"ply_", mangle(em.owner), b"_lambda"]);
+          let prefix = bytes_concat(symbol_of(em.owner), b"_lambda");
           let idx = fold(w.em.lambdas, 0, |acc: Int, sym: Bytes|
             if bytes_len(sym) >= bytes_len(prefix) && bytes_slice(sym, 0, bytes_len(prefix)) == prefix { acc + 1 } else { acc });
-          let sub = bytes_concat_all([mangle(em.owner), b"_lambda", num(idx)]);
-          let entry = lambda_of(w.em, bytes_concat_all([b"ply_", sub, b"_entry"]));
+          let sub = bytes_concat(prefix, num(idx));
+          let entry = lambda_of(w.em, bytes_concat(sub, b"_entry"));
           match emit_lambda(entry.em, sub, l) {
             None -> None,
             Some(sub_out) -> {
@@ -2106,7 +2108,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
             None -> None,
             Some(k) -> {
               let noted = note_call(em, k.full);
-              let l = lambda_of(noted, bytes_concat_all([b"ply_", mangle(k.full), b"_entry"]));
+              let l = lambda_of(noted, entry_of(k.full));
               let held = bind(l.em, KBoxed, bytes_concat_all([b"rt_constant_p(ctx, @@l", num(l.i), b"@@)"]));
               Some({ em: check(held.em), v: { k: KBoxed, c: held.v.c, ty: k.ty } })
             },
@@ -2146,8 +2148,9 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                         Some(w) -> {
                           let m = imp.module;
                           let callee = match qualified(fv.name) { Some(q) -> q.name, None -> fv.name };
-                          let o = bind(note_call(site(w.em, c.span), bytes_concat_all([m, b".", callee])), KBoxed, bytes_concat_all([
-                            b"ply_", mangle(m), b"_", callee,
+                          let full = bytes_concat_all([m, b".", callee]);
+                          let o = bind(note_call(site(w.em, c.span), full), KBoxed, bytes_concat_all([
+                            symbol_of(full),
                             b"(ctx",
                             fold(w.names, b"", |acc: Bytes, nm: Bytes|
                               bytes_concat_all([acc, b", ", nm])), b")"]));
@@ -2186,7 +2189,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           None -> None,
           Some(w) -> {
             let o = bind(note_call(site(w.em, c.span), qualify(em.module, fv.name)), KBoxed, bytes_concat_all([
-              b"ply_", mangle(qualify(em.module, fv.name)), b"(ctx",
+              symbol_of(qualify(em.module, fv.name)), b"(ctx",
               fold(w.names, b"", |acc: Bytes, nm: Bytes| bytes_concat_all([acc, b", ", nm])),
               b")"]));
             // Opened to the callee's declared type here, so a body whose answer is already a word hands it straight back.
@@ -3424,13 +3427,13 @@ pub fn emit_fn(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: L
 // One definition's C, with its tables encoded as the C tier's body cache keeps them. `full` is the
 // definition's own name (`m.f`, or a root's `m.f#requires#0`), from which its C symbol is derived.
 pub fn emit_fn_full(module: Bytes, base: Int, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>, full: Bytes, params: List<P>, body: Code, effects: List<EffectName>, release: Bool) -> Option<{ text: Bytes, tables: Bytes }> = {
-  let name = mangle(full);
+  let name = symbol_of(full);
   let start = { out: [], n: 0, conv: [], ind: 0, reads: slots_read(body), shapes: [], built: [], module: module, base: base, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: [], owner: full, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [], tail: true, calls: [], refused: None, deferred: [], rlocals: [], performs: [], handles: [], landing: None, effects: effects, release: release, pinned: [], bound: [], group: [] };
   match emit_body(start, params, body) {
     None -> None,
     Some(o0) -> if o0.em.refused != None { None } else {
       let o = o0;
-      let sig = bytes_concat_all([b"Word ply_", name, b"(PlyCtx *ctx",
+      let sig = bytes_concat_all([b"Word ", name, b"(PlyCtx *ctx",
         fold(range(0, len(params)), b"", |acc: Bytes, i: Int|
           bytes_concat_all([acc, b", Word p", num(i)])), b") {\n"]);
       let head = fuel_head();
@@ -3438,7 +3441,7 @@ pub fn emit_fn_full(module: Bytes, base: Int, here: List<Def>, imports: List<Imp
       let o = { em: w.em, v: o.v };
       let epilogue = bytes_concat_all([b"  ctx->fuel += 1;\n  return ", w.c, b";\n}\n"]);
       let entry = bytes_concat_all([
-        b"Word ply_", name, b"_entry(PlyCtx *ctx, const Word *args) {\n  return ply_", name,
+        b"Word ", name, b"_entry(PlyCtx *ctx, const Word *args) {\n  return ", name,
         b"(ctx", fold(range(0, len(params)), b"", |acc: Bytes, i: Int|
           bytes_concat_all([acc, b", args[", num(i), b"]"])), b");\n}\n"]);
       // Token declarations go in front once the body has used them; they take no temporary, so nothing moves.
@@ -3446,7 +3449,7 @@ pub fn emit_fn_full(module: Bytes, base: Int, here: List<Def>, imports: List<Imp
         bytes_concat_all([acc, b"  Word tok", num(w), b" = 0;\n"]));
       let decls = fold(o.em.rlocals, b"", |acc: Bytes, r: Bytes| bytes_concat_all([acc, b"  Word ", r, b" = 0;\n"]));
       Some({ text: bytes_concat_all([sig, head, toks, decls, bytes_join(o.em.out, b""), epilogue, entry, o.em.extra]),
-             tables: encode_tables(o.em, name) })
+             tables: encode_tables(o.em, full) })
     },
   }
 }
@@ -3470,7 +3473,7 @@ pub fn emit_group_full(module: Bytes, here: List<Def>, imports: List<Imported>, 
                        members: List<Member>, effects: List<EffectName>, release: Bool) -> Option<{ text: Bytes, tables: Bytes }> = {
   let names = map(members, |m: Member| m.full);
   let first = match list_at(members, 0) { Some(m) -> m.full, None -> b"" };
-  let gname = bytes_concat(b"ply__group_", mangle(first));
+  let gname = bytes_concat(symbol_of(first), b"_group");
   let width = fold(members, 0, |acc: Int, m: Member| if len(m.params) > acc { len(m.params) } else { acc });
   let start: Em = { out: [], n: 0, conv: [], ind: 0, reads: [], shapes: [], built: [], module: module, base: 0, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: [], owner: first, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [], tail: true, calls: [], refused: None, deferred: [], rlocals: [], performs: [], handles: [], landing: None, effects: effects, release: release, pinned: [], bound: [], group: names };
   match group_cases(start, members, 0) {
@@ -3485,7 +3488,7 @@ pub fn emit_group_full(module: Bytes, here: List<Def>, imports: List<Imported>, 
       Some({ text: bytes_concat_all([sig, fuel_head(), toks, decls,
                b"  ply_loop: if ((++ctx->ticks & 4095) == 0) { rt_tick_p(ctx); if (ctx->failed) return 0; }\n",
                b"  switch (which) {\n", bytes_join(em.out, b""), b"  }\n  return 0;\n}\n", wrappers, em.extra]),
-             tables: encode_tables(em, gname) })
+             tables: encode_tables(em, first) })
     },
   }
 }
@@ -3512,18 +3515,18 @@ fn group_cases(em: Em, members: List<Member>, i: Int) -> Option<Em> =
   }
 
 fn group_wrapper(gname: Bytes, which: Int, m: Member, width: Int) -> Bytes = {
-  let name = mangle(m.full);
+  let name = symbol_of(m.full);
   let n = len(m.params);
   bytes_concat_all([
-    b"Word ply_", name, b"(PlyCtx *ctx", fold(range(0, n), b"", |acc: Bytes, i: Int| bytes_concat_all([acc, b", Word p", num(i)])), b") {\n",
+    b"Word ", name, b"(PlyCtx *ctx", fold(range(0, n), b"", |acc: Bytes, i: Int| bytes_concat_all([acc, b", Word p", num(i)])), b") {\n",
     b"  return ", gname, b"(ctx, ", num(which),
     fold(range(0, width), b"", |acc: Bytes, i: Int| bytes_concat(acc, if i < n { bytes_concat(b", p", num(i)) } else { b", 0" })), b");\n}\n",
-    b"Word ply_", name, b"_entry(PlyCtx *ctx, const Word *args) {\n  return ply_", name,
+    b"Word ", name, b"_entry(PlyCtx *ctx, const Word *args) {\n  return ", name,
     b"(ctx", fold(range(0, n), b"", |acc: Bytes, i: Int| bytes_concat_all([acc, b", args[", num(i), b"]"])), b");\n}\n"])
 }
 
-// Five tables, the calls, the effects and the members, each as a count and one entry per line; a constant is its tag and its bytes in hex.
-fn encode_tables(em: Em, owner: Bytes) -> Bytes =
+// Five tables, the calls, the effects, the members and the symbols, each as a count and one entry per line; a constant is its tag and its bytes in hex.
+fn encode_tables(em: Em, full: Bytes) -> Bytes =
   bytes_concat_all([
     counted(b"consts", map(em.consts, |l: Lit| match l {
       LStr(x) -> bytes_concat(b"s ", hex(x)),
@@ -3545,7 +3548,10 @@ fn encode_tables(em: Em, owner: Bytes) -> Bytes =
     counted(b"calls", em.calls),
     counted(b"performs", em.performs),
     counted(b"handles", em.handles),
-    counted(b"members", em.group)])
+    counted(b"members", em.group),
+    // What this body's C calls each definition it holds, so nothing downstream spells a symbol itself.
+    counted(b"symbols", map(if len(em.group) == 0 { [full] } else { em.group },
+      |m: Bytes| bytes_concat_all([symbol_of(m), b" ", entry_of(m)])))])
 
 // A negative pattern literal's text runs from its `-`, across any space written after it.
 fn unspaced(s: Bytes) -> Bytes =
@@ -3573,9 +3579,20 @@ fn fuel_head() -> Bytes = bytes_concat_all([
   b"  ctx->fuel -= 1;\n"])
 
 test "a body that answers a literal" {
-  assert_eq(string_of_bytes(match emit_fn(b"m", [], [], [], [], b"m.f", [], { own: Borrowed, span: dummy_span(), node: NLit(LInt(7)) }) {
-    Some(c) -> c, None -> b"" }),
-    "Word ply_m_f(PlyCtx *ctx) {\n  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  { char probe; if ((uintptr_t)&probe < ctx->stack_floor) { rt_no_stack_p(ctx); return 0; } }\n  ctx->fuel -= 1;\n  ctx->fuel += 1;\n  return (ply_fits_imm(INT64_C(7)) ? ply_imm(INT64_C(7)) : rt_box_int_p(ctx, INT64_C(7)));\n}\nWord ply_m_f_entry(PlyCtx *ctx, const Word *args) {\n  return ply_m_f(ctx);\n}\n")
+  let f = symbol_of(b"m.f");
+  assert_eq(match emit_fn(b"m", [], [], [], [], b"m.f", [], { own: Borrowed, span: dummy_span(), node: NLit(LInt(7)) }) {
+    Some(c) -> c, None -> b"" },
+    bytes_concat_all([
+      b"Word ", f, b"(PlyCtx *ctx) {\n  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  { char probe; if ((uintptr_t)&probe < ctx->stack_floor) { rt_no_stack_p(ctx); return 0; } }\n  ctx->fuel -= 1;\n  ctx->fuel += 1;\n  return (ply_fits_imm(INT64_C(7)) ? ply_imm(INT64_C(7)) : rt_box_int_p(ctx, INT64_C(7)));\n}\n",
+      b"Word ", f, b"_entry(PlyCtx *ctx, const Word *args) {\n  return ", f, b"(ctx);\n}\n"]))
+}
+
+test "two names an underscore apart spell two symbols" {
+  assert_eq(symbol_of(b"m_a.b") == symbol_of(b"m.a_b"), false);
+  assert_eq(symbol_of(b"m.f"), b"ply_m_1f_1");
+  assert_eq(symbol_of(b"m.f#requires#0"), b"ply_m_1f_1requiresh80h1");
+  // A byte no C identifier holds takes the whole piece into hex.
+  assert_eq(symbol_of(b"m.f\xc3\xa9"), b"ply_m_166c3a9x6")
 }
 
 test "a self call in tail position restarts the body instead of nesting" {
@@ -3602,17 +3619,18 @@ test "a tail call into a definition's own recursive group jumps instead of nesti
   assert_eq(map(out, |e: Emitted| e.why), [None, None, None]);
   let group = match list_at(out, 0) { Some(e) -> e, None -> { name: b"", text: b"", tables: b"", why: None, handles: [] } };
   assert_eq(bytes_index_of(group.tables, b"members 2\nm.even\nm.odd\n") != None, true);
-  assert_eq(bytes_index_of(group.text, b"static Word ply__group_m_even(PlyCtx *ctx, int which, Word p0) {") != None, true);
+  assert_eq(bytes_index_of(group.tables, bytes_concat_all([b"symbols 2\n", symbol_of(b"m.even"), b" ", entry_of(b"m.even"), b"\n", symbol_of(b"m.odd"), b" ", entry_of(b"m.odd"), b"\n"])) != None, true);
+  assert_eq(bytes_index_of(group.text, bytes_concat_all([b"static Word ", symbol_of(b"m.even"), b"_group(PlyCtx *ctx, int which, Word p0) {"])) != None, true);
   assert_eq(bytes_index_of(group.text, b"ply_loop: if") != None, true);
   assert_eq(bytes_index_of(group.text, b"which = 1;\n") != None, true);
   assert_eq(bytes_index_of(group.text, b"which = 0;\n") != None, true);
   assert_eq(bytes_index_of(group.text, b"goto ply_loop;") != None, true);
-  assert_eq(bytes_index_of(group.text, b"Word ply_m_odd(PlyCtx *ctx, Word p0) {\n  return ply__group_m_even(ctx, 1, p0);") != None, true);
-  assert_eq(bytes_index_of(group.text, b"Word ply_m_even_entry(PlyCtx *ctx, const Word *args)") != None, true);
+  assert_eq(bytes_index_of(group.text, bytes_concat_all([b"Word ", symbol_of(b"m.odd"), b"(PlyCtx *ctx, Word p0) {\n  return ", symbol_of(b"m.even"), b"_group(ctx, 1, p0);"])) != None, true);
+  assert_eq(bytes_index_of(group.text, bytes_concat_all([b"Word ", entry_of(b"m.even"), b"(PlyCtx *ctx, const Word *args)"])) != None, true);
   assert_eq(bytes_index_of(group.text, b"PLY_SITE(ctx, @@r@@") != None, false);
   // A caller outside the group calls a member's own symbol, and a self loop outside a group keeps its label.
   let parity = match list_at(out, 1) { Some(e) -> e, None -> group };
-  assert_eq(bytes_index_of(parity.text, b"ply_m_even(ctx, ") != None, true);
+  assert_eq(bytes_index_of(parity.text, bytes_concat(symbol_of(b"m.even"), b"(ctx, ")) != None, true);
   assert_eq(bytes_index_of(parity.text, b"ply_loop") != None, false);
   let count = match list_at(out, 2) { Some(e) -> e, None -> group };
   assert_eq(bytes_index_of(count.text, b"ply_loop: if") != None, true);
@@ -3630,7 +3648,7 @@ test "a cycle whose member holds a handle, or whose calls are not in tail positi
   assert_eq(map(out, |e: Emitted| e.name), [b"m.a", b"m.b", b"m.c", b"m.d"]);
   assert_eq(map(out, |e: Emitted| e.why == None), [true, true, true, true]);
   assert_eq(map(out, |e: Emitted| bytes_index_of(e.tables, b"members 2") != None), [false, false, false, false]);
-  assert_eq(map(out, |e: Emitted| bytes_index_of(e.text, b"ply__group_") != None), [false, false, false, false])
+  assert_eq(map(out, |e: Emitted| bytes_index_of(e.text, b"_group(PlyCtx *ctx, int which") != None), [false, false, false, false])
 }
 
 test "a form this port does not reach is refused" {
@@ -4134,10 +4152,42 @@ pub fn emit_bodies_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, 
       bytes_concat_all([acc, b"body ", e.name, b" ", num(bytes_len(enc)), b"\n", enc])
     }))
 
-// The C identifier a full name becomes: a dot and a root's `#` are not one.
-fn mangle(name: Bytes) -> Bytes =
-  bytes_concat_all(map(range(0, bytes_len(name)), |i: Int|
-    if bytes_at(name, i) == 46 || bytes_at(name, i) == 35 { b"_" } else { bytes_slice(name, i, i + 1) }))
+// The C symbol a full name becomes: the name cut on its dots and its `#`s, each piece written as
+// its bytes, a mode byte (`_` after a dot, `h` after a `#`, `x` and `y` for the same two with the
+// bytes in hex, which a piece holding a byte no C identifier carries takes) and their length.
+// Bytes lead, so symbols collate as their names do and a definition added to a program leaves the
+// code-table ranks before it alone. Every symbol ends in a length behind its mode byte, which
+// nothing suffixed (`_entry`, `_lambda0`, `_group`) and nothing the runtime names (`ply_bind`)
+// does, so no two names spell one symbol and no suffixed symbol is a name's own.
+fn symbol_of(full: Bytes) -> Bytes = bytes_concat(b"ply_", mangled(full, 0, 0, 46, b""))
+
+// The symbol the loader binds a definition by, which is also its memo slot.
+fn entry_of(full: Bytes) -> Bytes = bytes_concat(symbol_of(full), b"_entry")
+
+// `start` opens the piece being scanned and `delim` is the byte that opened it.
+fn mangled(name: Bytes, start: Int, at: Int, delim: Int, acc: Bytes) -> Bytes =
+  if at >= bytes_len(name) { bytes_concat(acc, mangled_part(bytes_slice(name, start, at), delim)) }
+  else if bytes_at(name, at) == 46 || bytes_at(name, at) == 35 {
+    mangled(name, at + 1, at + 1, bytes_at(name, at),
+            bytes_concat(acc, mangled_part(bytes_slice(name, start, at), delim)))
+  }
+  else { mangled(name, start, at + 1, delim, acc) }
+
+fn mangled_part(part: Bytes, delim: Int) -> Bytes =
+  if c_ident_bytes(part, 0) {
+    bytes_concat_all([part, if delim == 35 { b"h" } else { b"_" }, num(bytes_len(part))])
+  } else {
+    let hexed = hex(part);
+    bytes_concat_all([hexed, if delim == 35 { b"y" } else { b"x" }, num(bytes_len(hexed))])
+  }
+
+fn c_ident_bytes(part: Bytes, i: Int) -> Bool =
+  if i >= bytes_len(part) { true }
+  else if c_ident_byte(bytes_at(part, i)) { c_ident_bytes(part, i + 1) }
+  else { false }
+
+fn c_ident_byte(c: Int) -> Bool =
+  (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95
 
 pub fn emit_dump(src: Bytes) -> String = emit_dump_in(b"m", [], [], src)
 

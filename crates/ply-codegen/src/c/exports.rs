@@ -4,6 +4,7 @@
 use super::cache::{count, decode_tables, encode_tables, line};
 use super::load::Library;
 use super::prelude::HELPERS;
+use super::tables::Defined;
 use anyhow::{Result, anyhow};
 use ply_eval::Value;
 use ply_span::Symbol;
@@ -54,13 +55,32 @@ impl std::fmt::Display for Unserved {
 
 impl std::error::Error for Unserved {}
 
+/// One function the unit holds: its Ply name, its arity, and the C the emitter wrote for it, so a
+/// reader of a unit binds and calls what that unit defines rather than a spelling of its own.
+#[derive(Clone)]
+pub struct Taken {
+    pub name: String,
+    pub arity: usize,
+    pub symbol: String,
+    pub entry: String,
+}
+
+/// How a unit emitted before its symbols were published spells them: `ply_`, then the name with
+/// each dot and `#` as `_`. The committed bootstrap bundle and the bodies it stages are the only
+/// ones read through here, until CI refreshes the bundle on the first merge.
+pub(super) fn unpublished(name: &str) -> Defined {
+    let symbol = format!("ply_{}", name.replace(['.', '#'], "_"));
+    let entry = format!("{symbol}_entry");
+    Defined { symbol, entry }
+}
+
 #[derive(Clone)]
 pub struct Exports {
     pub helpers: Vec<HelperShape>,
     /// The constructor table the C's tags index.
     pub ctors: Vec<(Symbol, usize)>,
-    /// Every function the unit holds, with its arity.
-    pub taken: Vec<(String, usize)>,
+    /// Every function the unit holds.
+    pub taken: Vec<Taken>,
     /// The pure nullary functions, which the seam memoizes.
     pub constants: Vec<String>,
     /// How many modules the unit was emitted from.
@@ -76,7 +96,11 @@ pub struct Exports {
 
 impl Exports {
     pub fn names(&self) -> Vec<String> {
-        self.taken.iter().map(|(n, _)| n.clone()).collect()
+        self.taken.iter().map(|t| t.name.clone()).collect()
+    }
+
+    pub fn taken_by_name(&self, name: &str) -> Option<&Taken> {
+        self.taken.iter().find(|t| t.name == name)
     }
 
     /// `None` when the runtime's helper table starts with this unit's.
@@ -126,8 +150,11 @@ impl Exports {
             out.push_str(&format!("{name} {arity}\n"));
         }
         out.push_str(&format!("taken {}\n", self.taken.len()));
-        for (name, arity) in &self.taken {
-            out.push_str(&format!("{name} {arity}\n"));
+        for t in &self.taken {
+            out.push_str(&format!(
+                "{} {} {} {}\n",
+                t.name, t.arity, t.symbol, t.entry
+            ));
         }
         out.push_str(&format!("constants {}\n", self.constants.len()));
         for name in &self.constants {
@@ -176,8 +203,23 @@ impl Exports {
         let n = count(line(s, &mut at)?, "taken")?;
         let mut taken = Vec::with_capacity(n);
         for _ in 0..n {
-            let (name, arity) = line(s, &mut at)?.rsplit_once(' ')?;
-            taken.push((name.to_string(), arity.parse().ok()?));
+            let mut parts = line(s, &mut at)?.split(' ');
+            let name = parts.next()?.to_string();
+            let arity = parts.next()?.parse().ok()?;
+            // A unit emitted before symbols were published names only itself and its arity.
+            let published = match (parts.next(), parts.next()) {
+                (Some(symbol), Some(entry)) => Defined {
+                    symbol: symbol.to_string(),
+                    entry: entry.to_string(),
+                },
+                _ => unpublished(&name),
+            };
+            taken.push(Taken {
+                name,
+                arity,
+                symbol: published.symbol,
+                entry: published.entry,
+            });
         }
         let n = count(line(s, &mut at)?, "constants")?;
         let mut constants = Vec::with_capacity(n);
