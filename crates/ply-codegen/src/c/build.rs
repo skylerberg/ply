@@ -2,9 +2,9 @@
 //! definition it calls is taken, so a set that compiles cannot call out of itself.
 
 use super::Refused;
-use super::exports::Exports;
+use super::exports::{Exports, Taken, unpublished};
 use super::load::{Library, compile_and_load, compile_and_load_timed};
-use super::tables::{Positions, Unit, bucket_mark, bucket_of, mangle, memo_symbol, root_id};
+use super::tables::{Defined, Positions, Unit, bucket_mark, bucket_of, root_id};
 use super::{HELPERS, PRELUDE, helper_addresses, runtime_header, runtime_object};
 use crate::heap::{Heap, Word, mark_immortal};
 use crate::rt::Entry;
@@ -80,6 +80,8 @@ struct Emitted {
     bodies: Vec<Body>,
     unit: Unit,
     taken: Vec<String>,
+    /// The C each taken definition is emitted as, as its body published it.
+    symbols: HashMap<String, Defined>,
     /// The pure nullary roots among `taken`, which the seam memoizes.
     constants: Vec<String>,
     refusals: Vec<Refused>,
@@ -115,7 +117,7 @@ fn emit_all(
     let started = Instant::now();
 
     // Dropping a body can refuse its callers, so repeat until a round refuses nothing.
-    let emitted = loop {
+    let (emitted, symbols) = loop {
         // The cache answers first; the emitter is entered once for everything it missed.
         let mut looked: Vec<Option<Emission>> = taken
             .iter()
@@ -134,6 +136,7 @@ fn emit_all(
             super::producer::with_current(|p| p.ask(loaded, &missed));
         }
         let mut emitted: Vec<(String, String, super::tables::Tables)> = Vec::new();
+        let mut symbols: HashMap<String, Defined> = HashMap::new();
         let mut round: Vec<Refused> = Vec::new();
         for (name, looked) in taken.iter().zip(looked) {
             let emission = match looked {
@@ -144,18 +147,20 @@ fn emit_all(
                 Ok((text, tables)) => {
                     match tables.calls.iter().find(|c| !taken.contains(c)).cloned() {
                         Some(missing) => round.push(refused(name, not_in_unit(&missing))),
-                        // A group's one body is placed once, where its first member is taken.
-                        None if tables.members.first().is_none_or(|first| first == name) => {
-                            emitted.push((name.clone(), text, tables))
+                        None => {
+                            symbols.insert(name.clone(), defines(name, &tables));
+                            // A group's one body is placed once, where its first member is taken.
+                            if tables.members.first().is_none_or(|first| first == name) {
+                                emitted.push((name.clone(), text, tables));
+                            }
                         }
-                        None => {}
                     }
                 }
                 Err(r) => round.push(r),
             }
         }
         if round.is_empty() {
-            break emitted;
+            break (emitted, symbols);
         }
         for r in &round {
             taken.retain(|n| n != &r.function);
@@ -175,7 +180,9 @@ fn emit_all(
     let unit = Unit::of(
         ctors.to_vec(),
         emitted.iter().map(|(_, _, tables)| tables),
-        constants.iter().map(|n| memo_symbol(n)),
+        constants
+            .iter()
+            .map(|n| published(&symbols, n).entry.clone()),
     );
     let bodies: Vec<Body> = {
         let positions = unit.positions();
@@ -230,10 +237,32 @@ fn emit_all(
         bodies,
         unit,
         taken,
+        symbols,
         constants,
         refusals,
         phases,
     }
+}
+
+/// The C the emitter published for `name`: its place among the body's members, or the body's one
+/// definition. A body staged by the committed emitter publishes none.
+fn defines(name: &str, tables: &super::tables::Tables) -> Defined {
+    let at = tables
+        .members
+        .iter()
+        .position(|m| m == name)
+        .unwrap_or_default();
+    tables
+        .symbols
+        .get(at)
+        .cloned()
+        .unwrap_or_else(|| unpublished(name))
+}
+
+fn published<'a>(symbols: &'a HashMap<String, Defined>, name: &str) -> &'a Defined {
+    symbols
+        .get(name)
+        .expect("every definition a unit takes emitted, and an emitted body publishes its C")
 }
 
 /// The whole unit as C, uncompiled; the text embeds `exports` so it loads with no source.
@@ -266,6 +295,7 @@ fn produce_in(
         bodies,
         unit,
         taken,
+        symbols,
         constants,
         refusals,
         mut phases,
@@ -275,7 +305,7 @@ fn produce_in(
         bail!("the Ply emitter failed over the program: {why}");
     }
     let started = Instant::now();
-    let exports = describe(loaded, unit, taken, constants, &refusals, ctors);
+    let exports = describe(loaded, unit, taken, &symbols, constants, &refusals, ctors);
     let embedded = exports.embed();
     phases.embed = started.elapsed();
     let text = assemble(&bodies, &exports, &embedded);
@@ -293,18 +323,27 @@ fn describe(
     loaded: &'static Source,
     unit: Unit,
     taken: Vec<String>,
+    symbols: &HashMap<String, Defined>,
     constants: Vec<String>,
     refusals: &[Refused],
     ctors: &[(Symbol, usize)],
 ) -> Exports {
-    let arities: Vec<(String, usize)> = taken
+    let taken: Vec<Taken> = taken
         .iter()
-        .map(|n| (n.clone(), loaded.arity_of(n).unwrap_or(0)))
+        .map(|name| {
+            let defined = published(symbols, name);
+            Taken {
+                name: name.clone(),
+                arity: loaded.arity_of(name).unwrap_or(0),
+                symbol: defined.symbol.clone(),
+                entry: defined.entry.clone(),
+            }
+        })
         .collect();
     Exports {
         helpers: super::exports::runtime_helpers(),
         ctors: ctors.to_vec(),
-        taken: arities,
+        taken,
         constants,
         modules: loaded.module_count(),
         refusals: refusals
@@ -454,7 +493,7 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
     else {
         bail!("a unit's shapes do not intern to the ids its C was emitted against");
     };
-    let constants = constants_of(&constants, &unit)?;
+    let constants = constants_of(&constants, &taken, &unit)?;
     let mut functions = Vec::with_capacity(unit.lambdas.len());
     for symbol in &unit.lambdas {
         let Some(p) = lib.symbol(symbol) else {
@@ -463,24 +502,25 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
         functions.push(p as usize);
     }
     let mut entries = HashMap::new();
-    for (name, arity) in &taken {
-        let symbol = memo_symbol(name);
-        let Some(p) = lib.symbol(&symbol) else {
-            bail!("the unit the C tier built has no `{symbol}`");
+    for t in &taken {
+        let Some(p) = lib.symbol(&t.entry) else {
+            bail!("the unit the C tier built has no `{}`", t.entry);
         };
         entries.insert(
-            name.clone(),
+            t.name.clone(),
             (
                 unsafe { std::mem::transmute::<*mut std::ffi::c_void, Entry>(p) },
-                *arity,
+                t.arity,
             ),
         );
     }
     let mut roots: Vec<(u64, Span)> = taken
         .iter()
-        .map(|(name, _)| {
-            let span = source.and_then(|s| s.span_of(name)).unwrap_or(Span::DUMMY);
-            (root_id(name), span)
+        .map(|t| {
+            let span = source
+                .and_then(|s| s.span_of(&t.name))
+                .unwrap_or(Span::DUMMY);
+            (root_id(&t.name), span)
         })
         .collect();
     roots.sort_by_key(|(id, _)| *id);
@@ -499,13 +539,23 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
 }
 
 /// Each pure nullary root's memo slot: its code-table row, so the seam and `rt_constant` agree.
-fn constants_of(constants: &[String], unit: &Unit) -> Result<HashMap<String, usize>> {
+fn constants_of(
+    constants: &[String],
+    taken: &[Taken],
+    unit: &Unit,
+) -> Result<HashMap<String, usize>> {
+    let entries: HashMap<&str, &str> = taken
+        .iter()
+        .map(|t| (t.name.as_str(), t.entry.as_str()))
+        .collect();
     constants
         .iter()
         .map(|name| {
-            let symbol = memo_symbol(name);
-            let Some(slot) = unit.lambda(&symbol) else {
-                bail!("the unit's code table has no `{symbol}`");
+            let Some(entry) = entries.get(name.as_str()) else {
+                bail!("the unit calls `{name}` a constant but does not take it");
+            };
+            let Some(slot) = unit.lambda(entry) else {
+                bail!("the unit's code table has no `{entry}`");
             };
             Ok((name.clone(), slot))
         })
@@ -685,11 +735,7 @@ fn resolve(
 /// from [`super::RUNTIME_MARK`] the tail that defines the runtime and embeds `exports`
 /// ([`Exports::embed`] is `embedded`). `super::load::split` cuts it back on those marks.
 fn assemble(bodies: &[Body], exports: &Exports, embedded: &str) -> String {
-    let arities: HashMap<&str, usize> = exports
-        .taken
-        .iter()
-        .map(|(name, arity)| (name.as_str(), *arity))
-        .collect();
+    let taken: HashMap<&str, &Taken> = exports.taken.iter().map(|t| (t.name.as_str(), t)).collect();
     let mut out = String::from(PRELUDE);
     out.push_str(&runtime_header());
     out.push('\n');
@@ -708,8 +754,8 @@ fn assemble(bodies: &[Body], exports: &Exports, embedded: &str) -> String {
         reached.sort_unstable();
         reached.dedup();
         for name in reached {
-            if let Some(arity) = arities.get(name) {
-                out.push_str(&prototype(name, *arity));
+            if let Some(t) = taken.get(name) {
+                out.push_str(&prototype(&t.symbol, t.arity));
             }
         }
         out.push('\n');
@@ -723,12 +769,12 @@ fn assemble(bodies: &[Body], exports: &Exports, embedded: &str) -> String {
     out
 }
 
-fn prototype(name: &str, arity: usize) -> String {
+fn prototype(symbol: &str, arity: usize) -> String {
     let params = std::iter::once("PlyCtx*")
         .chain(std::iter::repeat_n("Word", arity))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("Word {}({params});\n", mangle(name))
+    format!("Word {symbol}({params});\n")
 }
 
 fn bind(lib: &Library) -> Result<()> {
