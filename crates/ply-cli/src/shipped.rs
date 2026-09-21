@@ -280,8 +280,13 @@ fn write_sources(dir: &Path) -> std::io::Result<()> {
 
 fn build_in(dir: &Path) -> Result<Vec<u8>, Diagnostic> {
     let loaded = crate::load::load(dir).map_err(|err| {
+        // Rendered where it happened: this program is only ever built from sources in the tree,
+        // so a refusal is a defect someone has to find, not a user's mistake to summarise.
         unbuilt(match err.diagnostics.first() {
-            Some(d) => format!("it does not check: {} [{}]", d.message, d.code),
+            Some(d) => format!(
+                "it does not check:\n{}",
+                ply_span::render::to_terminal(d, &err.sources)
+            ),
             None => "it does not check, and nothing said why".to_string(),
         })
     })?;
