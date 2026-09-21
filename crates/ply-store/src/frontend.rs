@@ -13,7 +13,7 @@ use ply_ty::Mode;
 use ply_ty::{Footprint, Scheme, Type};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub(crate) const FRONTEND_FILE: &str = idx::INDEX_FILE;
@@ -1044,7 +1044,6 @@ impl Frontend {
 
 /// The cache key for a source file: its path relative to the store root, with `/` separators.
 pub(crate) fn source_key(root: &Path, path: &Path) -> Option<String> {
-    use std::path::Component;
     let rel = path.strip_prefix(root).unwrap_or(path);
     let mut parts: Vec<&str> = Vec::new();
     for component in rel.components() {
@@ -1059,4 +1058,18 @@ pub(crate) fn source_key(root: &Path, path: &Path) -> Option<String> {
     } else {
         Some(parts.join("/"))
     }
+}
+
+/// A key back under its root, spelled as the run that recorded it spelled the path. `source_key`
+/// drops `.` on the way in, so the way out drops it too: `./m.ply` and `m.ply` are one path, but
+/// only one of them is the string a report prints or a prefix test matches.
+pub(crate) fn source_path(root: &Path, key: &str) -> PathBuf {
+    let mut path = PathBuf::new();
+    for component in root.components() {
+        if component != Component::CurDir {
+            path.push(component);
+        }
+    }
+    path.push(key);
+    path
 }

@@ -1,4 +1,4 @@
-//! The committed `ply fmt` program, and the shelf it is built against.
+//! The committed `ply` program, and the shelf it is built against.
 //!
 //! `PLY_C_BOOTSTRAP_REFRESH=1` rewrites `crates/ply-cli/bootstrap` with what these sources build;
 //! CI does so on main after each merge, so no pull request carries the artifact.
@@ -21,21 +21,21 @@ fn write(dir: &Path, name: &str, text: &str) {
 #[test]
 fn the_committed_program_is_what_these_sources_build() {
     let identity = shipped::identity();
-    let built = shipped::build().expect("the `ply fmt` program builds");
+    let built = shipped::build().expect("the `ply` program builds");
 
     // Whatever else moves, the artifact has to carry the entry point the runner enters, and its
     // unit has to hold a body for it: the runner enters the unit and nothing else.
     let named = PathBuf::from(shipped::ARTIFACT);
     let (decoded, _) = ply_cli::artifact::decode(&built, &named).expect("it decodes");
-    assert_eq!(decoded.entry_name(), Some("fmt.main"));
+    assert_eq!(decoded.entry_name(), Some("ply.main"));
     let unit = decoded
         .unit
         .as_ref()
         .expect("no compiled unit was embedded");
     let text = ply_codegen::c::bundle::unpack(&unit.text).expect("the unit unpacks");
     assert!(
-        text.contains("ply_fmt_main("),
-        "the embedded unit holds no body for `fmt.main`, so nothing can be entered from it"
+        text.contains("ply_ply_main("),
+        "the embedded unit holds no body for `ply.main`, so nothing can be entered from it"
     );
     ply_cli::artifact::open(&decoded, &named).expect("it opens as the program it names");
 
@@ -46,7 +46,7 @@ fn the_committed_program_is_what_these_sources_build() {
         std::fs::write(&artifact, &built).unwrap();
         std::fs::write(&digest, format!("{identity}\n")).unwrap();
         eprintln!(
-            "the `ply fmt` program was written to {} ({} bytes)",
+            "the `ply` program was written to {} ({} bytes)",
             artifact.display(),
             built.len()
         );
@@ -155,24 +155,114 @@ fn a_program_may_import_the_formatter_off_the_shelf() {
     assert_eq!(out.status.code(), Some(0), "{v:#}");
 }
 
-/// The program's own tests are the walk's specification, and they need no filesystem.
+/// The program's own tests are the specification of every command it carries, and they need no
+/// filesystem: each runs over a tree and a process the test hands it.
 #[test]
-fn the_fmt_programs_own_tests_pass() {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("the crate lives two levels below the repository root")
-        .join("crates/ply-cli/ply/fmt.ply");
+fn the_programs_own_tests_pass() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::copy(&source, dir.path().join("fmt.ply")).unwrap();
+    for (module, text) in shipped::PROGRAM_SOURCES {
+        write(dir.path(), &format!("{module}.ply"), text);
+    }
 
     let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
     let v: Value = serde_json::from_slice(&out.stdout)
         .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
-    assert_eq!(v["exit_code"], 0, "{v:#}");
-    assert_eq!(v["summary"]["failed"], 0, "{v:#}");
+    assert_eq!(v["exit_code"], 0, "{}", red(&v));
+    assert_eq!(v["summary"]["failed"], 0, "{}", red(&v));
     assert!(
         v["summary"]["passed"].as_u64().unwrap() > 0,
-        "the program declares no test: {v:#}"
+        "the program declares no test: {}",
+        v["summary"]
+    );
+}
+
+/// The whole report is a compiled unit's worth of timings; name the tests that failed and what
+/// each said instead.
+fn red(report: &Value) -> String {
+    let Some(failures) = report["failures"].as_array() else {
+        return report["summary"].to_string();
+    };
+    if failures.is_empty() {
+        return report["summary"].to_string();
+    }
+    failures
+        .iter()
+        .map(|f| {
+            format!(
+                "{}: {} {}",
+                f["name"].as_str().unwrap_or("?"),
+                f["diagnostic"]["code"].as_str().unwrap_or(""),
+                f["diagnostic"]["message"].as_str().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The path argument every command defaults to is `.`, and a root bound to what that tidies to has
+/// to be a directory that resolves: an empty one is `E0454` before the program runs at all.
+#[test]
+fn every_ported_command_answers_with_no_path_argument() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "m.ply", "pub fn one() -> Int = 1\n");
+
+    // `ply fmt --check` over a tree that needs no rewriting writes nothing; every other row does.
+    for (args, writes) in [
+        (vec!["defs"], true),
+        (vec!["defs", "--json"], true),
+        (vec!["hash"], true),
+        (vec!["hash", "--json"], true),
+        (vec!["doc", "one"], true),
+        (vec!["doc", "one", "--json"], true),
+        (vec!["explain", "E0001"], true),
+        (vec!["fmt", "--check"], false),
+    ] {
+        let out = ply(dir.path()).args(&args).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "`ply {}` exited {:?}\n{}",
+            args.join(" "),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !writes || !out.stdout.is_empty(),
+            "`ply {}` wrote nothing",
+            args.join(" ")
+        );
+    }
+}
+
+/// The table the shipped program carries is what `ply explain` answers from; the registry the
+/// compiler raises from is still `ply_span`, so the two have to agree row for row.
+#[test]
+fn the_programs_meanings_table_is_ply_spans() {
+    let source = shipped::PROGRAM_SOURCES
+        .iter()
+        .find(|(name, _)| *name == "explain")
+        .map(|(_, text)| *text)
+        .expect("the program carries `explain`");
+    let row = |line: &str| -> Option<(String, String)> {
+        let rest = line.trim().strip_prefix("m(\"")?;
+        let (code, meaning) = rest.split_once("\", \"")?;
+        let meaning = meaning.strip_suffix("\"),")?;
+        Some((code.to_string(), meaning.to_string()))
+    };
+    let rows: Vec<(String, String)> = source.lines().filter_map(row).collect();
+    let listed: Vec<(String, String)> = ply_span::MEANINGS
+        .iter()
+        .map(|(code, meaning)| ((*code).to_string(), (*meaning).to_string()))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        listed.len(),
+        "`crates/ply-cli/ply/explain.ply` holds {} rows and `ply_span::MEANINGS` holds {}",
+        rows.len(),
+        listed.len()
+    );
+    assert_eq!(
+        rows, listed,
+        "`crates/ply-cli/ply/explain.ply` and `ply_span::MEANINGS` disagree"
     );
 }

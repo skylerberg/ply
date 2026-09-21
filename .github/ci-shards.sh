@@ -24,7 +24,7 @@ PARTITIONS=8
 # Tests that get a runner of their own, as `id:package:target:test`.
 SOLO=(
   "bootstrap:ply-codegen-tests:bootstrap:the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds"
-  "cli-fmt:ply-cli-tests:suite:fmt_artifact::the_committed_program_is_what_these_sources_build"
+  "cli-program:ply-cli-tests:suite:artifact_program::the_committed_program_is_what_these_sources_build"
   "compiler-on-the-tier:ply-cli-tests:suite:corpus::the_compiled_tier_runs_the_compilers_own_tests_as_the_only_engine"
   "archive-round-trip:ply-cli-tests:suite:bootstrap_archive::an_archive_is_written_and_verifies_against_the_tree_it_came_from"
   "archive-tree-moved:ply-cli-tests:suite:bootstrap_archive::an_archive_stops_describing_a_tree_that_moved"

@@ -284,9 +284,10 @@ pub fn enter_constant(
     }
 }
 
-/// The one place a `--json` command writes to stdout.
+/// The one place a `--json` command writes to stdout. Compact, because the answer is for a
+/// machine, and because the commands the shipped program answers write it that way.
 pub fn emit_json(value: &Value) {
-    match serde_json::to_string_pretty(value) {
+    match serde_json::to_string(value) {
         Ok(text) => println!("{text}"),
         // A half-object would break the one guarantee `--json` makes.
         Err(e) => println!("{{\"ok\":false,\"error\":\"could not serialize the report: {e}\"}}"),

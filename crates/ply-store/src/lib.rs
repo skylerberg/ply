@@ -1068,8 +1068,14 @@ impl Store {
         self.frontend
             .source_keys()
             .into_iter()
-            .map(|key| self.root.join(key))
+            .map(|key| frontend::source_path(&self.root, &key))
             .collect()
+    }
+
+    /// The keys themselves, for a caller that recorded a path which is not under the root at all:
+    /// a module this binary ships has no file, and its key is the whole of what names it.
+    pub fn source_keys(&self) -> Vec<String> {
+        self.frontend.source_keys()
     }
 
     pub fn sources_len(&self) -> usize {
@@ -1210,7 +1216,7 @@ impl Store {
         let prefix = hash_prefix(query);
         let mut found = Vec::new();
         for (key, fingerprint) in self.frontend.sources() {
-            let path = self.root.join(key);
+            let path = frontend::source_path(&self.root, &key);
             for def in &fingerprint.defs {
                 if names_match(&def.name, query) || starts_with(def.hash, prefix.as_deref()) {
                     found.push(Found::Def(FoundDef {
