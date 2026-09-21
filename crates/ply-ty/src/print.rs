@@ -1,6 +1,6 @@
 //! Human-facing rendering of types, rows and schemes.
 
-use crate::ty::{Resource, Row, RowVar, Scheme, TyVar, Type};
+use crate::ty::{Footprint, LabelVar, Resource, Row, RowVar, Scheme, TyVar, Type, label_var_name};
 use rustc_hash::FxHashMap;
 
 /// A constructor name no lexer can produce, so a cell's region type never collides with a user's.
@@ -165,4 +165,26 @@ pub fn print_row(r: &Row) -> String {
 
 pub fn print_scheme(s: &Scheme) -> String {
     Printer::new().scheme(s)
+}
+
+/// `atom,atom`, headed by the labels its atoms name as a scheme's head names its own: without the
+/// binders a label a caller fills reads back as a resource of that name.
+pub fn print_footprint(f: &Footprint) -> String {
+    let mut bound: Vec<LabelVar> = Vec::new();
+    for atom in f.atoms() {
+        if let Resource::Var(v) = atom.resource
+            && !bound.contains(&v)
+        {
+            bound.push(v);
+        }
+    }
+    let atoms: Vec<String> = f.atoms().map(|a| a.to_string()).collect();
+    if bound.is_empty() {
+        return atoms.join(",");
+    }
+    let head: Vec<String> = bound
+        .iter()
+        .map(|v| format!("[{}]", label_var_name(*v)))
+        .collect();
+    format!("<{}>{}", head.join(","), atoms.join(","))
 }

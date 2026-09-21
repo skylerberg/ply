@@ -260,6 +260,35 @@ fn atoms_and_footprints_read_the_check_dumps_form() {
     );
 }
 
+/// A footprint carries its binders as a scheme's head does, or a label a caller fills reads back
+/// as a resource of that name.
+#[test]
+fn a_footprints_head_binds_the_labels_its_atoms_name() {
+    let bound = Footprint::from_atoms([
+        EffectAtom::operation("net", Resource::Var(LabelVar(0)), Mode::Write, "recv"),
+        EffectAtom::operation("net", Resource::Var(LabelVar(1)), Mode::Write, "send"),
+        atom("net", Some("conn"), Mode::Write),
+    ]);
+    let text = print_footprint(&bound);
+    assert_eq!(text, "<[l],[m]>net.write[conn],net.recv[l],net.send[m]");
+    assert_eq!(parse_footprint(&text).unwrap(), bound);
+
+    // Nothing binds `l` here, so it names a resource, as it does inside a bare row.
+    let named = parse_footprint("net.send[l]").unwrap();
+    assert_eq!(
+        named.atoms().next().unwrap().resource,
+        Resource::Named(Symbol::new("l"))
+    );
+    assert_eq!(print_footprint(&named), "net.send[l]");
+    assert_eq!(print_footprint(&Footprint::empty()), "");
+    assert!(
+        parse_footprint("<[x]>net.send[x]")
+            .unwrap_err()
+            .contains("not a label variable")
+    );
+    assert!(parse_footprint("<[l]>").is_err());
+}
+
 #[test]
 fn an_operation_atom_parses_and_prints_by_its_name() {
     let send = parse_atom("net.send[conn]").unwrap();

@@ -22,7 +22,7 @@ pub use front::{
 };
 pub use hash::{DefHash, HashOutput};
 pub use parse::{parse_atom, parse_footprint, parse_row, parse_scheme, parse_type};
-pub use print::{Printer, print_row, print_scheme, print_type};
+pub use print::{Printer, print_footprint, print_row, print_scheme, print_type};
 pub use ty::*;
 
 #[derive(Clone, Debug)]
