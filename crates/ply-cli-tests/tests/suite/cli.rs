@@ -143,7 +143,7 @@ fn check_exits_two_on_a_syntax_error() {
     assert!(String::from_utf8(out.stderr).unwrap().contains("E0001"));
 }
 
-/// Run twice with the cache so the second answer is the stored one.
+/// Run twice, so a warning survives whatever the second run answers from.
 #[test]
 fn an_unused_definition_warns_without_failing_check_or_test() {
     let dir = project(
@@ -151,12 +151,7 @@ fn an_unused_definition_warns_without_failing_check_or_test() {
          pub fn live() -> Int = 2\n\
          test \"live is two\" { assert_eq(live(), 2) }\n",
     );
-    for args in [
-        &["check"][..],
-        &["check"][..],
-        &["check", "--no-incremental"][..],
-        &["test"][..],
-    ] {
+    for args in [&["check"][..], &["check"][..], &["test"][..]] {
         let out = ply(dir.path()).args(args).output().unwrap();
         assert_eq!(out.status.code(), Some(0), "{args:?}");
         let text = stdout_of(&out);
@@ -1692,7 +1687,11 @@ fn cache_inspect_prints_a_resolved_type_rather_than_a_serialization() {
         "effect db {\n  read all[t]() -> List<Int>\n}\n\
          fn active(n: Int) -> List<Int> / {db.read[users]} = db.all[users]()\n",
     );
-    ply(dir.path()).arg("check").assert().success();
+    // Populates the front-end cache without running anything, as `ply check` once did.
+    ply(dir.path())
+        .args(["test", "--filter", "nonexistent"])
+        .assert()
+        .success();
 
     let out = ply(dir.path())
         .args(["cache", "inspect", "active"])
@@ -1721,7 +1720,11 @@ fn cache_inspect_prints_a_resolved_type_rather_than_a_serialization() {
 #[test]
 fn cache_inspect_accepts_a_hash_prefix_and_emits_json() {
     let dir = project(GREEN);
-    ply(dir.path()).arg("check").assert().success();
+    // Populates the front-end cache without running anything, as `ply check` once did.
+    ply(dir.path())
+        .args(["test", "--filter", "nonexistent"])
+        .assert()
+        .success();
 
     let v = json_of(
         &ply(dir.path())
@@ -1751,7 +1754,11 @@ fn cache_inspect_accepts_a_hash_prefix_and_emits_json() {
 #[test]
 fn cache_inspect_of_an_unknown_name_is_e0101_and_exits_two() {
     let dir = project(GREEN);
-    ply(dir.path()).arg("check").assert().success();
+    // Populates the front-end cache without running anything, as `ply check` once did.
+    ply(dir.path())
+        .args(["test", "--filter", "nonexistent"])
+        .assert()
+        .success();
 
     let out = ply(dir.path())
         .args(["cache", "inspect", "no_such_thing"])
@@ -1773,7 +1780,11 @@ fn cache_inspect_of_an_unknown_name_is_e0101_and_exits_two() {
 #[test]
 fn cache_inspect_reports_a_test_and_whether_it_is_proven() {
     let dir = project(GREEN);
-    ply(dir.path()).arg("check").assert().success();
+    // Populates the front-end cache without running anything, as `ply check` once did.
+    ply(dir.path())
+        .args(["test", "--filter", "nonexistent"])
+        .assert()
+        .success();
     let v = json_of(
         &ply(dir.path())
             .args(["cache", "inspect", "double doubles", "--json"])
