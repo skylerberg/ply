@@ -30,6 +30,9 @@ SOLO=(
   "archive-tree-moved:ply-cli-tests:suite:bootstrap_archive::an_archive_stops_describing_a_tree_that_moved"
   "corpus-session:ply-cli-tests:suite:incremental::the_example_corpus_agrees_across_a_session"
   "corpus-session-audit:ply-cli-tests:suite:incremental_audit::a_long_session_over_the_example_corpus_agrees_at_every_step"
+  # A partition cannot finish before its slowest test, and these two are twice the next one.
+  "compiler-fmt-fixpoint:ply-cli-tests:suite:fmt::the_compiler_formats_to_a_fixed_point_and_still_checks"
+  "program-own-tests:ply-cli-tests:suite:artifact_program::the_programs_own_tests_pass"
 )
 
 # Their tests skip, passing, without a postgres server; only `test-postgres` runs them.
