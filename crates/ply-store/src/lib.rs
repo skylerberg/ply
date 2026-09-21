@@ -45,7 +45,7 @@ pub const FRONTEND_VERSION: &str = "0.26.0";
 /// Bumping this re-attempts every obligation and re-runs no test.
 pub const PROVER_VERSION: &str = "0.7.0";
 
-pub const FRONTEND_FORMAT: u32 = 8;
+pub const FRONTEND_FORMAT: u32 = 9;
 
 pub const BODY_ENCODING: u32 = 7;
 

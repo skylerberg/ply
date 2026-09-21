@@ -398,7 +398,11 @@ fn stored(before: &Compiled, names: &[&str]) -> (TempRoot, ply_store::Store) {
         let hash = before.hashes.defs[&name];
         store.put_def(
             hash,
-            ply_store::CachedDef::new(info.scheme.clone(), info.footprint.clone()),
+            ply_store::CachedDef::new(
+                info.scheme.clone(),
+                info.footprint.clone(),
+                info.performed.clone(),
+            ),
         );
     }
     (root, store)

@@ -87,6 +87,15 @@ fn footprint() -> Footprint {
     ])
 }
 
+/// A different row from [`footprint`], so a frame that transposed the two would be visible.
+fn performed() -> Footprint {
+    Footprint::from_atoms([EffectAtom::new(
+        "db",
+        Resource::Named(Symbol::new("orders")),
+        Mode::Write,
+    )])
+}
+
 fn scheme() -> Scheme {
     Scheme {
         ty_vars: vec![TyVar(0)],
@@ -101,7 +110,8 @@ fn scheme() -> Scheme {
 }
 
 fn def() -> CachedDef {
-    CachedDef::new(scheme(), footprint()).witnessed_by(vec![NameRef::new("user.User", hash(9))])
+    CachedDef::new(scheme(), footprint(), performed())
+        .witnessed_by(vec![NameRef::new("user.User", hash(9))])
 }
 
 fn decl() -> CachedDecl {
@@ -150,7 +160,10 @@ fn seeded(name: &str) -> TempRoot {
     store.put(hash(200), Outcome::Pass);
     store.put_source(&root.source_file(), fingerprint());
     store.put_def(hash(1), def());
-    store.put_def(hash(2), CachedDef::new(scheme(), Footprint::empty()));
+    store.put_def(
+        hash(2),
+        CachedDef::new(scheme(), Footprint::empty(), Footprint::empty()),
+    );
     store.put_decl(hash(9), decl());
     store.put_body(hash(1), DefBody::new(BODY_ENCODING, vec![0x20, 0xca, 0xfe]));
     store.flush().expect("the seed should flush");
@@ -505,7 +518,9 @@ fn an_index_offset_moved_into_the_interior_of_a_frame_is_refused() {
         for answer in &answers {
             assert!(
                 *answer == def().canonicalized()
-                    || *answer == CachedDef::new(scheme(), Footprint::empty()).canonicalized(),
+                    || *answer
+                        == CachedDef::new(scheme(), Footprint::empty(), Footprint::empty())
+                            .canonicalized(),
                 "slide {slide}: the store answered with a value nobody stored"
             );
         }
@@ -843,7 +858,7 @@ fn shapes_no_schema_exemplar_reaches_still_round_trip() {
         ],
     });
     let bare = SourceFingerprint::new(ContentHash::of(b""));
-    let empty_footprint = CachedDef::new(closed.clone(), Footprint::empty());
+    let empty_footprint = CachedDef::new(closed.clone(), Footprint::empty(), Footprint::empty());
 
     let mut store = root.open();
     store.put_def(hash(1), empty_footprint.clone());
@@ -894,7 +909,7 @@ fn a_scheme_quantified_over_a_label_round_trips_with_its_atoms() {
             },
         },
     };
-    let def = CachedDef::new(generic, footprint());
+    let def = CachedDef::new(generic, footprint(), performed());
 
     let mut store = root.open();
     store.put_def(hash(1), def.clone());
@@ -959,6 +974,7 @@ fn a_deeply_nested_type_round_trips_rather_than_reporting_a_healthy_cache_corrup
                 label_vars: vec![],
                 ty,
             },
+            Footprint::empty(),
             Footprint::empty(),
         );
 
@@ -1067,7 +1083,7 @@ fn concurrent_writers_never_interleave_their_frames() {
                 for i in 0u8..10 {
                     let n = 60 + w * 10 + i;
                     let mut store = root.open();
-                    store.put_def(hash(n), CachedDef::new(scheme(), footprint()));
+                    store.put_def(hash(n), CachedDef::new(scheme(), footprint(), performed()));
                     store.put_body(hash(n), DefBody::new(BODY_ENCODING, vec![n; 8]));
                     store.flush().expect("a writer should flush");
                 }
