@@ -5,6 +5,7 @@
 
 use super::common::{diagnostics_json, emit_json, print_diagnostics};
 use crate::EXIT_FAILED;
+use crate::artifact::Binds;
 use crate::style::Style;
 use ply_span::{Diagnostic, SourceMap};
 use serde_json::json;
@@ -34,36 +35,42 @@ pub fn rooted(path: &Path) -> (PathBuf, String) {
     (root, inside)
 }
 
-/// Runs `argv` with `root` bound as `cwd`, and answers with the code the program asked to exit
-/// with. Only `ply` itself can fail here: the program's own refusals are lines it wrote.
-pub fn run(command: &str, argv: Vec<String>, root: &Path, json: bool, style: Style) -> i32 {
-    match enter(argv, root) {
+/// Runs `argv` with `root` bound as `cwd` and the shelf beside it, plus whatever `binds` lends on
+/// top of those, and answers with the code the program asked to exit with. Only `ply` itself can
+/// fail here: the program's own refusals are lines it wrote.
+pub fn run(
+    command: &str,
+    argv: Vec<String>,
+    root: &Path,
+    binds: Binds,
+    json: bool,
+    style: Style,
+) -> i32 {
+    match enter(argv, root, binds) {
         Ok(code) => code,
         Err(diagnostic) => refuse(command, &diagnostic, json, style),
     }
 }
 
-fn enter(argv: Vec<String>, root: &Path) -> Result<i32, Diagnostic> {
+fn enter(argv: Vec<String>, root: &Path, mut binds: Binds) -> Result<i32, Diagnostic> {
     let bytes = crate::shipped::program()?;
     let shelf = crate::shipped::shelf()?;
     let path = PathBuf::from(crate::shipped::ARTIFACT);
     let (artifact, _) = crate::artifact::decode(&bytes, &path)?;
     let opened = crate::artifact::open(&artifact, &path).map_err(first_of)?;
-    crate::artifact::enter(
-        &artifact,
-        &opened,
-        argv,
-        &[
-            ply_host::fs::RootSpec {
-                name: "cwd".to_string(),
-                path: root.to_path_buf(),
-            },
-            ply_host::fs::RootSpec {
-                name: "shelf".to_string(),
-                path: shelf,
-            },
-        ],
-    )
+    let mut roots = vec![
+        ply_host::fs::RootSpec {
+            name: "cwd".to_string(),
+            path: root.to_path_buf(),
+        },
+        ply_host::fs::RootSpec {
+            name: "shelf".to_string(),
+            path: shelf,
+        },
+    ];
+    roots.append(&mut binds.roots);
+    binds.roots = roots;
+    crate::artifact::enter(&artifact, &opened, argv, binds)
 }
 
 fn first_of(diagnostics: Vec<Diagnostic>) -> Diagnostic {
