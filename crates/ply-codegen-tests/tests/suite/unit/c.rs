@@ -39,6 +39,16 @@ fn the_prelude_agrees_with_the_layouts_it_mirrors() {
         16,
         "PlyCtx.stack_floor"
     );
+    assert_eq!(
+        std::mem::offset_of!(ply_codegen::rt::Ctx, ticks),
+        48,
+        "PlyCtx.ticks"
+    );
+    assert_eq!(
+        std::mem::offset_of!(ply_codegen::rt::Ctx, next_tick),
+        56,
+        "PlyCtx.next_tick"
+    );
     assert!(PRELUDE.contains("#define PLY_HEADER 16"));
 }
 
@@ -149,7 +159,8 @@ fn a_recursion_past_what_the_stack_holds_grows_onto_another_and_answers() {
     );
 }
 
-/// Growing is not a licence to recurse for ever: the fuel is the bound, and it is what fires.
+/// Growing is not a licence to recurse for ever: depth is the fuel's to bound, and at ten
+/// thousand it fires long before the step budget counts the same calls as work.
 #[test]
 fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
     const SPIN: &str = "fn spin(n: Int) -> Int = 1 + spin(n + 1)";

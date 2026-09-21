@@ -704,6 +704,7 @@ pub(crate) fn plan_json(plan: &ProvePlan) -> Value {
         "roots": plan.roots,
         "prove_budget": plan.prove_budget,
         "shrink_budget": plan.shrink_budget,
+        "step_budget": plan.step_budget,
         "sim": {
             "mode": plan.sim.mode.as_str(),
             "roots": plan.sim.roots,

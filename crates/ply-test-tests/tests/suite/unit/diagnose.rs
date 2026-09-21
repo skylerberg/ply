@@ -899,6 +899,7 @@ fn summary_of(attribution: ply_test::Attribution) -> Vec<String> {
         engine: ply_test::Engine::Evaluator,
         passed: 0,
         failed: 1,
+        abandoned: 0,
         cached: 0,
         failures: vec![failure_with(attribution)],
         duration: std::time::Duration::from_millis(1),

@@ -323,7 +323,13 @@ pub struct TestArgs {
     #[arg(long, short = 'j', value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub jobs: Option<u32>,
 
-    /// Wall clock per test, in milliseconds; a test past it fails with E0503. 0 is no bound.
+    /// Calls one test may make; past it the test fails with E0503. 0 is no bound.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(i64).range(0..))]
+    #[arg(default_value_t = ply_eval::DEFAULT_STEP_BUDGET)]
+    pub steps: i64,
+
+    /// Wall clock per test, in milliseconds; past it the run is abandoned rather than judged,
+    /// and nothing it did is recorded. 0 is no clock.
     #[arg(long, value_name = "MS", default_value_t = 60_000)]
     pub timeout: u64,
 
@@ -416,9 +422,9 @@ pub struct ProveOptions {
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub shrink_budget: Option<u32>,
 
-    /// Wall clock per evaluation of a claim, in milliseconds (default 5000); 0 is no bound.
-    #[arg(long, value_name = "MS")]
-    pub timeout: Option<u64>,
+    /// Calls per evaluation of a claim (default 1000000000); 0 is no bound. It keys the result.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(i64).range(0..))]
+    pub prove_steps: Option<i64>,
 }
 
 #[derive(Args, Debug)]
@@ -540,7 +546,14 @@ pub struct RunArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Wall clock for the entry point, in milliseconds; past it the run fails with E0503. 0 is no bound.
+    /// Calls the entry point may make; past it the run fails with E0503. 0 is no bound, which
+    /// is the default: an entry that serves forever is a program, not a runaway.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(i64).range(0..))]
+    #[arg(default_value_t = 0)]
+    pub steps: i64,
+
+    /// Wall clock for the entry point, in milliseconds; past it the run is abandoned rather than
+    /// judged. 0 is no clock.
     #[arg(long, value_name = "MS", default_value_t = 0)]
     pub timeout: u64,
 

@@ -546,7 +546,12 @@ fn a_pipe_gets_ascii_marks_and_a_terminal_would_get_glyphs() {
     let dir = project(GREEN);
 
     let piped = stdout_of(&ply(dir.path()).arg("test").output().unwrap());
-    assert!(piped.contains("ok    double doubles"), "got:\n{piped}");
+    assert!(
+        piped
+            .lines()
+            .any(|l| l.trim_start().starts_with("ok ") && l.contains("double doubles")),
+        "got:\n{piped}"
+    );
     assert!(!piped.contains('✓'));
     assert!(!piped.contains('\x1b'));
 
