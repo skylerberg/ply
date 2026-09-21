@@ -274,7 +274,7 @@ pub fn build(
     // Reopened as a target opens it, so an artifact that builds is one that opens.
     let opened = reopen(&out).map_err(|diags| vec![unreopened(&diags)])?;
     let names: Vec<&str> = out.names.iter().map(|(n, _)| n.as_str()).collect();
-    let emission = embedded_unit(&opened, &opened.entry, &names);
+    let emission = embedded_unit(&opened, &opened.entry, &names).map_err(|d| vec![d])?;
     out.unit = emission.unit;
 
     Ok(Built {
@@ -310,8 +310,9 @@ fn closure_texts(artifact: &Artifact) -> Result<Vec<(String, String)>, Vec<Diagn
         .collect())
 }
 
-/// Embedded so `ply run` need not emit and compile C at every run; a failed production is reported.
-fn embedded_unit(opened: &Opened, entry: &Symbol, names: &[&str]) -> Emission {
+/// Embedded so `ply run` need not emit and compile C at every run; a definition the emitter
+/// refused fails the build, and any other failed production is reported.
+fn embedded_unit(opened: &Opened, entry: &Symbol, names: &[&str]) -> Result<Emission, Diagnostic> {
     ply_codegen::c::producer::ensure_default();
     // Definitions only: no emitter is offered effect or resource declarations.
     let names: Vec<&str> = names
@@ -327,44 +328,32 @@ fn embedded_unit(opened: &Opened, entry: &Symbol, names: &[&str]) -> Emission {
             Ok((produced, text))
         });
     match produced {
-        Ok((produced, text)) => {
-            let refused: Vec<(String, String)> = produced
+        Ok((produced, text)) => Ok(Emission {
+            unit: Some(EmbeddedUnit { text }),
+            entry_compiled: produced.exports.names().iter().any(|n| n == entry.as_str()),
+            refused: produced
                 .refused
                 .iter()
                 .map(|r| (r.function.clone(), r.construct.clone()))
-                .collect();
-            let mut warnings = Vec::new();
-            if !refused.is_empty() {
-                warnings.push(
+                .collect(),
+            warnings: Vec::new(),
+        }),
+        // A refusal is a fact about the program, not about this host's toolchain: it fails the
+        // build rather than landing an artifact whose entry finds no body.
+        Err(e) => match ply_codegen::c::refused_in(&e) {
+            Some(refusals) => Err(refusals.diagnostic().clone()),
+            None => Ok(Emission {
+                unit: None,
+                refused: Vec::new(),
+                entry_compiled: false,
+                warnings: vec![
                     Diagnostic::warning(
                         codes::BACKEND_UNAVAILABLE,
-                        format!(
-                            "the emitter refused {} of the artifact's definitions, which will not run from it",
-                            refused.len()
-                        ),
+                        format!("no compiled unit could be produced for the artifact: {e:#}"),
                     )
-                    .note(refusal_list(&refused))
-                    .note("a refused definition is entered from nothing at run time; make it one the emitter compiles"),
-                );
-            }
-            Emission {
-                unit: Some(EmbeddedUnit { text }),
-                entry_compiled: produced.exports.names().iter().any(|n| n == entry.as_str()),
-                refused,
-                warnings,
-            }
-        }
-        Err(e) => Emission {
-            unit: None,
-            refused: Vec::new(),
-            entry_compiled: false,
-            warnings: vec![
-                Diagnostic::warning(
-                    codes::BACKEND_UNAVAILABLE,
-                    format!("no compiled unit could be produced for the artifact: {e:#}"),
-                )
-                .note("the artifact's bodies are printed back to source and compiled at each run instead"),
-            ],
+                    .note("the artifact's bodies are printed back to source and compiled at each run instead"),
+                ],
+            }),
         },
     }
 }

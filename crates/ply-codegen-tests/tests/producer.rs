@@ -206,7 +206,7 @@ fn the_chain_entered_whole_answers_what_the_machine_answers() {
     built_and_checked();
 }
 
-const DROPPED: &str = r#"
+const UNANSWERED: &str = r#"
 effect counter {
   write bump(n: Int) -> Int
 }
@@ -230,41 +230,36 @@ fn hosting(seed: Int) -> Int =
 
 fn handler(seed: Int) -> Int =
   handle { performer(seed) } with {
-    counter.bump(n) -> with_region[r] { n },
+    counter.bump(n) -> n,
   }
 
 fn lonely(n: Int) -> Int / {orphan.write} = orphan.poke(n)
 "#;
 
+/// A `perform` nothing in the program answers compiles and reaches the host binding from the
+/// runtime, so the fixpoint drops neither the performer nor its handler.
 #[test]
-fn a_performer_keeps_compiling_when_its_handler_is_dropped() {
+fn a_perform_no_handler_in_the_program_answers_still_compiles() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("m", DROPPED)]);
+    let loaded = load(&[("m", UNANSWERED)]);
     let source: &'static Source = Box::leak(Box::new(
         Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (_native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
-    let reason = |name: &str| {
-        refused
-            .iter()
-            .find(|r| r.function == name)
-            .map(|r| r.construct.clone())
-            .unwrap_or_else(|| panic!("`{name}` was taken; refusals: {refused:?}"))
-    };
-    // A region is what the port still refuses; the handler goes with it.
-    assert!(
-        reason("m.handler").contains("does not emit"),
-        "{}",
-        reason("m.handler")
-    );
-    // A `perform` nothing in the program answers compiles and reaches the host binding from the runtime.
-    for taken in ["m.performer", "m.lonely", "m.hosted", "m.hosting"] {
+    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
+    assert!(refused.is_empty(), "{refused:?}");
+    for taken in [
+        "m.performer",
+        "m.lonely",
+        "m.hosted",
+        "m.hosting",
+        "m.handler",
+    ] {
         assert!(
-            !refused.iter().any(|r| r.function == taken),
-            "`{taken}` was refused: {refused:?}"
+            native.entry(taken).is_some(),
+            "`{taken}` is not in the unit"
         );
     }
 }
