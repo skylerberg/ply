@@ -1,10 +1,25 @@
-// The process a program runs in, as an effect.
+// The process a program runs in, as an effect; `spawn` starts another one.
 pub nondet effect process {
   read args[p]()             -> List<String>
   write out[p](text: String) -> Unit
   write err[p](text: String) -> Unit
   write exit[p](code: Int)   -> Unit
+  write spawn[e](args: List<String>, dir: String, env: List<Var>) -> Finished
 }
+
+// One environment variable. A spawn is given the whole environment and inherits none of the run's.
+pub type Var = { name: String, value: String }
+
+pub fn var(name: String, value: String) -> Var = { name: name, value: value }
+
+// How a spawned process ended: its own code, or the signal that killed it.
+pub type Ended = Exited(Int) | Signalled(Int)
+
+// What a spawned process left behind: how it ended and, whole, what it wrote to each stream.
+pub type Finished = { ended: Ended, out: Bytes, err: Bytes }
+
+pub fn exit_code(f: Finished) -> Option<Int> =
+  match f.ended { Exited(code) -> Some(code), Signalled(_) -> None }
 
 // --- The twin ---------------------------------------------------------------
 
@@ -29,6 +44,32 @@ pub fn err_step(c: Captured, text: String) -> Captured = { ..c, err: push(c.err,
 // The first code wins, as it does under the host: the program has stopped by the time a second could run.
 pub fn exit_step(c: Captured, code: Int) -> Captured =
   match c.code { Some(_) -> c, None -> { ..c, code: Some(code) } }
+
+// What one spawn asked for. The executable is not here: the label names it, and the host binds that.
+pub type Launch = { args: List<String>, dir: String, env: List<Var> }
+
+// What a test answers spawns with, and what it has been asked to run; replies are handed out in order.
+pub type Runs = { replies: List<Finished>, launched: List<Launch> }
+
+pub fn runs(replies: List<Finished>) -> Runs = { replies: replies, launched: [] }
+
+// One spawn's answer and the twin that recorded it.
+pub type Ran = { runs: Runs, finished: Finished }
+
+// A spawn a test planned no reply for answers 127, as a shell does for a command it cannot run.
+pub fn spawn_step(r: Runs, launch: Launch) -> Ran =
+  match r.replies {
+    [] -> { runs: { ..r, launched: push(r.launched, launch) },
+            finished: { ended: Exited(127), out: b"", err: b"" } },
+    [first, ..rest] -> { runs: { ..r, replies: rest, launched: push(r.launched, launch) },
+                         finished: first },
+  }
+
+pub fn exited(code: Int, out: Bytes, err: Bytes) -> Finished =
+  { ended: Exited(code), out: out, err: err }
+
+pub fn signalled(signal: Int, out: Bytes, err: Bytes) -> Finished =
+  { ended: Signalled(signal), out: out, err: err }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -97,4 +138,61 @@ test "the first exit code is the one kept" {
   let once = exit_step(captured([]), 3);
   assert_eq(once.code, Some(3));
   assert_eq(exit_step(once, 4).code, Some(3))
+}
+
+// A compiler driver's shape: the label is the compiler, and a failed unit is an answer.
+fn compile(unit: String) -> Result<Bytes, String> / {process.spawn[cc]} = {
+  let done = process.spawn[cc](["-c", unit, "-o", unit ++ ".o"], "build",
+                               [var("LANG", "C"), var("TMPDIR", "/tmp")]);
+  match done.ended {
+    Exited(code) ->
+      if code == 0 { Ok(done.out) } else { Err("cc exited " ++ int_to_string(code)) },
+    Signalled(sig) -> Err("cc was killed by signal " ++ int_to_string(sig)),
+  }
+}
+
+test "a spawn is answered by the twin, which records what it was asked to run" {
+  with_cell[builds](runs([exited(0, b"built", b"")])) { s -> {
+    handle {
+      assert_eq(compile("lexer.c"), Ok(b"built"))
+    } with {
+      process.spawn[cc](args, dir, env) -> {
+        let r = spawn_step(cell_get(s), { args: args, dir: dir, env: env });
+        cell_set(s, r.runs);
+        r.finished
+      },
+    };
+    let seen = cell_get(s);
+    assert_eq(len(seen.launched), 1);
+    match list_at(seen.launched, 0) {
+      None -> panic("the spawn was recorded"),
+      Some(one) -> {
+        assert_eq(one.args, ["-c", "lexer.c", "-o", "lexer.c.o"]);
+        assert_eq(one.dir, "build");
+        assert_eq(one.env, [var("LANG", "C"), var("TMPDIR", "/tmp")])
+      },
+    }
+  } }
+}
+
+// Neither ending is a diagnostic: what the compiler said is the value the driver reads.
+test "a nonzero exit and a signal are both answers" {
+  handle {
+    assert_eq(compile("parser.c"), Err("cc exited 1"))
+  } with {
+    process.spawn[cc](args, dir, env) -> exited(1, b"", b"parser.c:3: expected `;`"),
+  };
+  handle {
+    assert_eq(compile("parser.c"), Err("cc was killed by signal 9"))
+  } with {
+    process.spawn[cc](args, dir, env) -> signalled(9, b"", b""),
+  }
+}
+
+test "a spawn a test planned no reply for is a command that could not be run" {
+  let r = spawn_step(runs([]), { args: [], dir: "", env: [] });
+  assert_eq(exit_code(r.finished), Some(127));
+  assert_eq(r.finished.out, b"");
+  assert_eq(len(r.runs.launched), 1);
+  assert_eq(exit_code(signalled(9, b"", b"")), None)
 }

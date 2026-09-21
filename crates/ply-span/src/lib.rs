@@ -364,6 +364,12 @@ pub mod codes {
     pub const FS_ROOT_INVALID: &str = "E0454";
     /// `process.exit` was performed: the machine unwinds and `ply run` exits with the code.
     pub const PROCESS_EXIT: &str = "E0455";
+    /// `process.spawn` named a resource label the run bound no executable to.
+    pub const PROCESS_EXEC_UNBOUND: &str = "E0456";
+    /// An `--exec NAME=PATH` that is missing, is not a file, or cannot be executed.
+    pub const PROCESS_EXEC_INVALID: &str = "E0457";
+    /// A spawned process wrote more to a stream than one captured value holds.
+    pub const PROCESS_OUTPUT_TOO_LARGE: &str = "E0458";
     pub const ASSERTION_FAILED: &str = "E0501";
     /// A failure the language defines: `panic`, division by zero, overflow, a resource limit.
     pub const RUNTIME_ERROR: &str = "E0502";
@@ -553,6 +559,9 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ("E0453", "whole-file read over the bound"),
     ("E0454", "`--fs` root that is not a directory"),
     ("E0455", "the program asked to exit with a code"),
+    ("E0456", "`process.spawn` label with no executable bound"),
+    ("E0457", "`--exec` path that cannot be executed"),
+    ("E0458", "captured output over the bound"),
     ("E0501", "assertion failed"),
     (
         "E0502",
@@ -844,6 +853,13 @@ mod tests {
             ("FS_FILE_TOO_LARGE", codes::FS_FILE_TOO_LARGE, "E0453"),
             ("FS_ROOT_INVALID", codes::FS_ROOT_INVALID, "E0454"),
             ("PROCESS_EXIT", codes::PROCESS_EXIT, "E0455"),
+            ("PROCESS_EXEC_UNBOUND", codes::PROCESS_EXEC_UNBOUND, "E0456"),
+            ("PROCESS_EXEC_INVALID", codes::PROCESS_EXEC_INVALID, "E0457"),
+            (
+                "PROCESS_OUTPUT_TOO_LARGE",
+                codes::PROCESS_OUTPUT_TOO_LARGE,
+                "E0458",
+            ),
             ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
             ("TIME_BUDGET", codes::TIME_BUDGET, "E0503"),

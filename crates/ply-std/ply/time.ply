@@ -1,0 +1,104 @@
+// The host's time, as an effect: two readings, neither a function of the program state. The
+// language's own `clock` is a different thing: virtual time, which `simulate` advances.
+
+pub nondet effect time {
+  read now_ms()     -> Int
+  read elapsed_ms() -> Int
+}
+
+// A deadline on the monotonic clock, `ms` from this reading of it.
+pub fn deadline_in(ms: Int) -> Int / {time.elapsed_ms} = time.elapsed_ms() + ms
+
+pub fn expired(deadline: Int) -> Bool / {time.elapsed_ms} = time.elapsed_ms() >= deadline
+
+// How long since a monotonic reading; a reading on its own means nothing.
+pub fn since(started: Int) -> Int / {time.elapsed_ms} = time.elapsed_ms() - started
+
+// --- The twin ---------------------------------------------------------------
+
+// The readings a test hands the clauses below in place of the host, each list read in order.
+// The last reading repeats once a list runs out, so a program may read more often than a test says.
+pub type Ticks = {
+  wall: List<Int>,
+  mono: List<Int>,
+  last_wall: Int,
+  last_mono: Int,
+}
+
+// One reading, and the ticks left to hand out.
+pub type Tick = { at: Int, ticks: Ticks }
+
+pub fn ticks(wall: List<Int>, mono: List<Int>) -> Ticks =
+  { wall: wall, mono: mono, last_wall: 0, last_mono: 0 }
+
+pub fn now_step(t: Ticks) -> Tick =
+  match t.wall {
+    [] -> { at: t.last_wall, ticks: t },
+    [first, ..rest] -> { at: first, ticks: { ..t, wall: rest, last_wall: first } },
+  }
+
+pub fn elapsed_step(t: Ticks) -> Tick =
+  match t.mono {
+    [] -> { at: t.last_mono, ticks: t },
+    [first, ..rest] -> { at: first, ticks: { ..t, mono: rest, last_mono: first } },
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn measure() -> Int / {time.elapsed_ms} = {
+  let started = time.elapsed_ms();
+  since(started)
+}
+
+test "a span is the difference of two monotonic readings, and a test supplies both" {
+  with_cell[twin](ticks([], [10, 25])) { s -> {
+    handle {
+      assert_eq(measure(), 15)
+    } with {
+      time.elapsed_ms() -> {
+        let r = elapsed_step(cell_get(s));
+        cell_set(s, r.ticks);
+        r.at
+      },
+    };
+    let left = cell_get(s);
+    assert_eq(left.mono, [])
+  } }
+}
+
+test "a deadline is read against the same clock that set it" {
+  with_cell[twin](ticks([], [1000, 1499, 1500])) { s -> {
+    handle {
+      let deadline = deadline_in(500);
+      assert_eq(deadline, 1500);
+      assert(!expired(deadline));
+      assert(expired(deadline))
+    } with {
+      time.elapsed_ms() -> {
+        let r = elapsed_step(cell_get(s));
+        cell_set(s, r.ticks);
+        r.at
+      },
+    }
+  } }
+}
+
+// Two clocks, so a program that stamps a record and one that measures a span never share a reading.
+test "the wall clock and the monotonic clock are separate streams" {
+  let start = ticks([1700000000000, 1700000000500], [4, 9]);
+  let wall_once = now_step(start);
+  assert_eq(wall_once.at, 1700000000000);
+  assert_eq(wall_once.ticks.mono, [4, 9]);
+  let mono_once = elapsed_step(wall_once.ticks);
+  assert_eq(mono_once.at, 4);
+  assert_eq(now_step(mono_once.ticks).at, 1700000000500);
+  assert_eq(elapsed_step(mono_once.ticks).at, 9)
+}
+
+test "a reading repeats once the list a test wrote runs out" {
+  let spent = elapsed_step(elapsed_step(ticks([], [7])).ticks);
+  assert_eq(spent.at, 7);
+  assert_eq(elapsed_step(spent.ticks).at, 7);
+  // Nothing was written, so a clock nothing seeded reads zero rather than failing.
+  assert_eq(now_step(ticks([], [])).at, 0)
+}

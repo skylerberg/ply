@@ -2,7 +2,7 @@
 
 use crate::db::{self, Postgres};
 use crate::signal::{self, Accepting, Shutdown};
-use crate::{config, fs, process, sched, tcp, trace};
+use crate::{config, fs, process, sched, tcp, time, trace};
 use ply_eval::Value;
 use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownReport};
 use ply_span::{Diagnostic, Span, codes};
@@ -25,6 +25,8 @@ pub struct Host {
     fs: Arc<fs::FsHost>,
     /// The arguments and streams `ply run --host` was given; `None` withholds `process`.
     process: Option<Arc<process::ProcessHost>>,
+    /// The two readings `std.time` answers, counting from when this host was built.
+    time: Arc<time::TimeHost>,
 }
 
 impl Default for Host {
@@ -47,6 +49,7 @@ impl Host {
             shutdown: None,
             fs: Arc::new(fs::FsHost::new(fs::Roots::new())),
             process: None,
+            time: Arc::new(time::TimeHost::new()),
         }
     }
 
@@ -100,6 +103,7 @@ impl Host {
             shutdown: None,
             fs: Arc::new(fs::FsHost::new(fs::Roots::new())),
             process: None,
+            time: Arc::new(time::TimeHost::new()),
         })
     }
 
@@ -128,6 +132,7 @@ impl Host {
         }
         // Registered whatever `--fs` said, so a run that bound no root gets `E0451`, not `E0424`.
         fs::register(&mut registry, Arc::clone(&self.fs));
+        time::register(&mut registry, Arc::clone(&self.time));
         signal::register(&mut registry, self.shutdown.as_ref());
         process::register(&mut registry, self.process.as_ref());
         registry
@@ -139,6 +144,7 @@ impl Host {
             net: Arc::clone(&self.net),
             db: self.db.clone(),
             fs: Arc::clone(&self.fs),
+            process: self.process.clone(),
             trace: Arc::clone(&self.trace),
             shutdown: self.shutdown.clone(),
         })
@@ -200,6 +206,7 @@ struct Facilities {
     net: Arc<tcp::TcpHost>,
     db: Option<Arc<Postgres>>,
     fs: Arc<fs::FsHost>,
+    process: Option<Arc<process::ProcessHost>>,
     trace: Arc<trace::Trace>,
     shutdown: Option<Arc<Shutdown>>,
 }
@@ -216,6 +223,11 @@ impl HostRuntime for Facilities {
         }
         if self.fs.owns(pending) {
             return self.fs.poll(pending);
+        }
+        if let Some(process) = &self.process
+            && process.owns(pending)
+        {
+            return process.poll(pending);
         }
         Err(err_unowned(pending))
     }
@@ -236,6 +248,11 @@ impl HostRuntime for Facilities {
             if self.fs.outstanding() > 0 {
                 return self.fs.park_until(bound);
             }
+            if let Some(process) = &self.process
+                && process.outstanding() > 0
+            {
+                return process.park_until(bound);
+            }
             if let Some(shutdown) = &self.shutdown {
                 shutdown.park(bound);
             }
@@ -248,8 +265,12 @@ impl HostRuntime for Facilities {
             .as_ref()
             .is_some_and(|db| db.reactor().outstanding() > 0);
         let filesystem_waiting = self.fs.outstanding() > 0;
+        let spawn_waiting = self
+            .process
+            .as_ref()
+            .is_some_and(|process| process.outstanding() > 0);
         if self.net.outstanding() > 0 {
-            if database_waiting || filesystem_waiting {
+            if database_waiting || filesystem_waiting || spawn_waiting {
                 return self.net.park_until(ALTERNATE);
             }
             return self.net.park();
@@ -257,14 +278,22 @@ impl HostRuntime for Facilities {
         if let Some(db) = &self.db
             && database_waiting
         {
-            if filesystem_waiting {
+            if filesystem_waiting || spawn_waiting {
                 db.reactor().park_timeout(ALTERNATE)?;
                 return Ok(());
             }
             return db.reactor().park();
         }
         if filesystem_waiting {
+            if spawn_waiting {
+                return self.fs.park_until(ALTERNATE);
+            }
             return self.fs.park();
+        }
+        if let Some(process) = &self.process
+            && spawn_waiting
+        {
+            return process.park();
         }
         Err(err_nothing_outstanding())
     }
@@ -325,6 +354,11 @@ impl HostRuntime for Facilities {
             if self.fs.owns(&pending) {
                 return self.fs.block_on(pending);
             }
+            if let Some(process) = &self.process
+                && process.owns(&pending)
+            {
+                return process.block_on(pending);
+            }
             return Err(err_unowned(&pending));
         };
         loop {
@@ -345,6 +379,11 @@ impl HostRuntime for Facilities {
                     return Ok(value);
                 }
                 self.fs.park_until(signal::DRAIN_POLL)?;
+            } else if let Some(process) = self.process.as_ref().filter(|p| p.owns(&pending)) {
+                if let Some(value) = process.poll(&pending)? {
+                    return Ok(value);
+                }
+                process.park_until(signal::DRAIN_POLL)?;
             } else {
                 return Err(err_unowned(&pending));
             }
