@@ -754,10 +754,14 @@ fn the_worker_count_does_not_reach_a_test_hash() {
 #[test]
 fn a_relative_and_an_absolute_path_share_one_cache() {
     let dir = corpus();
-    ply(dir.path()).args(["check"]).output().unwrap();
+    // The front-end cache is opened by the load, so nothing has to run for this to be about it.
+    ply(dir.path())
+        .args(["test", "--filter", "nonexistent"])
+        .output()
+        .unwrap();
 
     let out = ply(dir.path())
-        .args(["check"])
+        .args(["test", "--filter", "nonexistent"])
         .arg(dir.path())
         .output()
         .unwrap();

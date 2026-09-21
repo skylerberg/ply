@@ -3,11 +3,12 @@
 // driver did one.
 
 import std.fs (fs)
-import compiler.front (Refused, Analysed, Whole, Pulled, analyse_pulling_std)
+import std.time (time)
+import compiler.front (Refused, Analysed, Whole, Pulled, analyse_pulling_std, module_items, module_imports)
 import compiler.hash (HashOutput, hex)
 import compiler.items (Item, IFn)
 import compiler.infer (DefInfo, Loc)
-import compiler.resolve (Source, Mod, Diag, qualify)
+import compiler.resolve (Source, Mod, Diag, Label, qualify)
 import diagnostic (Place, spot_of)
 import sources (File, Project, load, shelf, nothing_here, is_std, is_compiler)
 
@@ -15,6 +16,13 @@ import sources (File, Project, load, shelf, nothing_here, is_std, is_compiler)
 pub type Program = { files: List<File>, places: List<Place>, diags: List<Diag>, whole: Option<Whole> }
 
 pub type ModuleView = { name: String, path: String }
+
+// A module as `ply check` reports it: what it declares and what it imports, beside its place.
+// `index` is the one a label's module points into.
+pub type ModuleFacts = { index: Int, name: String, path: String, imports: List<String>, items: List<String> }
+
+// A load with the clock read between its two halves, for the command that reports where the time went.
+pub type Timed = { program: Program, read_ms: Int, front_ms: Int }
 
 // --- Where a shipped module's text is said to live ------------------------------
 
@@ -64,13 +72,33 @@ fn analysed(project: Project, shelved: List<Source>) -> Program = {
   }
 }
 
-pub fn load_program(paths: List<String>) -> Program
-  / {fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.list_dir[shelf], fs.read_file[shelf]} = {
-  let project: Project = load(paths);
+// A project worth pulling a shelf for: one the walk read whole and that holds at least one module.
+fn usable(project: Project) -> Bool = len(project.diags) == 0 && len(project.sources) > 0
+
+fn assembled(project: Project, shelved: List<Source>, paths: List<String>) -> Program =
   if len(project.diags) > 0 { broken(project, own_places(project), project.diags) }
   else if len(project.sources) == 0 {
     broken(project, [], [nothing_here(match list_at(paths, 0) { Some(p) -> p, None -> "." })])
-  } else { analysed(project, shelf()) }
+  } else { analysed(project, shelved) }
+
+pub fn load_program(paths: List<String>) -> Program
+  / {fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.list_dir[shelf], fs.read_file[shelf]} = {
+  let project: Project = load(paths);
+  let shelved: List<Source> = if usable(project) { shelf() } else { [] };
+  assembled(project, shelved, paths)
+}
+
+// The same load, with the readings a `--explain` run prints: what the walk and the shelf cost, and
+// what the front end cost over them.
+pub fn timed_load(paths: List<String>) -> Timed
+  / {fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.list_dir[shelf], fs.read_file[shelf],
+     time.elapsed_ms} = {
+  let started = time.elapsed_ms();
+  let project: Project = load(paths);
+  let shelved: List<Source> = if usable(project) { shelf() } else { [] };
+  let read_done = time.elapsed_ms();
+  let p: Program = assembled(project, shelved, paths);
+  { program: p, read_ms: read_done - started, front_ms: time.elapsed_ms() - read_done }
 }
 
 // --- Reading the tables ----------------------------------------------------------
@@ -79,6 +107,33 @@ pub fn modules_of(p: Program, w: Whole) -> List<ModuleView> =
   map(range(0, len(w.mods)), |i: Int|
     { name: match list_at(w.mods, i) { Some(mo) -> string_of_bytes_lossy(mo.name), None -> "" },
       path: match list_at(p.places, i) { Some(place) -> place.path, None -> "" } })
+
+fn texts(bs: List<Bytes>) -> List<String> = map(bs, |b: Bytes| string_of_bytes_lossy(b))
+
+pub fn module_facts(p: Program, w: Whole) -> List<ModuleFacts> =
+  map(range(0, len(w.mods)), |i: Int|
+    match list_at(w.mods, i) {
+      None -> { index: i, name: "", path: "", imports: [], items: [] },
+      Some(mo) ->
+        { index: i, name: string_of_bytes_lossy(mo.name),
+          path: match list_at(p.places, i) { Some(place) -> place.path, None -> "" },
+          imports: texts(module_imports(mo)), items: texts(module_items(mo)) },
+    })
+
+// The modules as the front end took them: the project's own files first, then the shelf it pulled,
+// in the order the label indices count.
+pub fn sourced(p: Program, w: Whole) -> List<Source> =
+  map(range(0, len(w.mods)), |i: Int|
+    { name: match list_at(w.mods, i) { Some(mo) -> mo.name, None -> b"" },
+      src: match list_at(p.places, i) { Some(place) -> place.text, None -> b"" } })
+
+fn first_primary(labels: List<Label>) -> Option<Label> =
+  fold(labels, None, |acc: Option<Label>, l: Label|
+    match acc { Some(_) -> acc, None -> if l.primary { Some(l) } else { None } })
+
+// A diagnostic raised inside a module the project did not write, which is the shelf's business.
+pub fn is_shelved(p: Program, d: Diag) -> Bool =
+  match first_primary(d.labels) { Some(l) -> l.module >= len(p.files), None -> false }
 
 pub fn place_of(p: Program, at: Loc) -> Option<Place> =
   if at.module == 4294967295 { None } else { list_at(p.places, at.module) }

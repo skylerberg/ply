@@ -4,6 +4,7 @@ mod artifact;
 mod cli;
 mod commands;
 mod config;
+mod costs;
 mod db;
 mod hosts;
 mod load;
