@@ -224,6 +224,7 @@ fn iterate(
     let hosts = hosts;
     let provider = unit.filter(|_| !nothing_to_run);
 
+    ply_codegen::rt::set_step_budget(args.steps);
     ply_codegen::rt::set_time_budget(args.timeout);
     let (pool, workers) = build_pool(args.jobs, &mut warnings);
     let simulation =
@@ -933,6 +934,15 @@ fn print_human(
         print_failure(failure, loaded, style);
     }
 
+    for result in &report.results {
+        if result.status == Status::Abandoned {
+            println!();
+            for line in abandoned_lines(result, loaded, style) {
+                println!("{IND}{line}");
+            }
+        }
+    }
+
     if selection.total == 0 {
         println!();
         println!("{IND}{}", style.dim(no_tests_note(loaded, args)));
@@ -942,6 +952,30 @@ fn print_human(
         println!();
         print_warnings(warnings, style);
     }
+}
+
+/// A test the clock stopped: no culprit, no suspects, nothing to bisect — the machine ran out of
+/// patience, and what the test would have decided is still unknown.
+pub fn abandoned_lines(result: &TestResult, loaded: &Loaded, style: Style) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{} {}",
+        style.bold(&result.name),
+        style.yellow("abandoned")
+    )];
+    let Some(diagnostic) = &result.failure else {
+        return lines;
+    };
+    lines.push(format!("  {}", diagnostic.message));
+    if let Some(at) = diagnostic
+        .primary_span()
+        .and_then(|s| location(&loaded.sources, s))
+    {
+        lines.push(format!("    at {}", style.dim(&at)));
+    }
+    for note in &diagnostic.notes {
+        lines.push(format!("  {} {note}", style.dim("=")));
+    }
+    lines
 }
 
 /// The culprit before the diff: the culprit is the answer.
@@ -1120,6 +1154,7 @@ pub fn result_line(result: &TestResult, name: &str, name_width: usize, style: St
             Status::Passed => style.green("✓"),
             Status::Failed => style.red("✗"),
             Status::Panicked => style.yellow("!"),
+            Status::Abandoned => style.dim("–"),
         };
         (mark, 1)
     } else {
@@ -1127,8 +1162,9 @@ pub fn result_line(result: &TestResult, name: &str, name_width: usize, style: St
             Status::Passed => "ok",
             Status::Failed => "FAIL",
             Status::Panicked => "PANIC",
+            Status::Abandoned => "GAVE UP",
         };
-        (mark.to_string(), 5)
+        (mark.to_string(), 7)
     };
     // `mark` may carry escapes, and `{:<width$}` counts bytes.
     let pad = " ".repeat(width.saturating_sub(display_width(&mark)));
@@ -1187,8 +1223,12 @@ fn print_summary(report: &RunReport, host: usize, database: bool, style: Style) 
         };
         style.dim(&format!(", {host} host-backed{against} and not cached"))
     };
+    let abandoned = match report.abandoned {
+        0 => String::new(),
+        n => style.yellow(&format!(", {n} abandoned")),
+    };
     println!(
-        "{IND}{failed}, {passed}, {} cached{hosted} ({:.2}s)",
+        "{IND}{failed}, {passed}, {} cached{hosted}{abandoned} ({:.2}s)",
         report.cached,
         report.duration.as_secs_f64()
     );
@@ -1554,6 +1594,7 @@ pub fn report_json(
         "summary": {
             "passed": report.passed,
             "failed": report.failed,
+            "abandoned": report.abandoned,
             "cached": report.cached,
             "duration_ms": millis(report.duration),
         },
@@ -1642,6 +1683,7 @@ fn status_str(status: Status) -> &'static str {
         Status::Passed => "passed",
         Status::Failed => "failed",
         Status::Panicked => "panicked",
+        Status::Abandoned => "abandoned",
     }
 }
 

@@ -166,6 +166,7 @@ impl RunReport {
             "schema_version": SCHEMA_VERSION,
             "passed": self.passed,
             "failed": self.failed,
+            "abandoned": self.abandoned,
             "cached": self.cached,
             "duration_ms": millis(self.duration),
             "success": self.is_success(),
@@ -180,8 +181,12 @@ impl RunReport {
 
     /// One line of counts, then each failure led by its culprit.
     pub fn summary(&self) -> Vec<String> {
+        let abandoned = match self.abandoned {
+            0 => String::new(),
+            n => format!(", {n} abandoned"),
+        };
         let mut lines = vec![format!(
-            "{} failed, {} passed, {} cached ({:.2}s)",
+            "{} failed, {} passed, {} cached{abandoned} ({:.2}s)",
             self.failed,
             self.passed,
             self.cached,
@@ -285,6 +290,7 @@ impl TestResult {
             Status::Passed => "✓",
             Status::Failed => "✗",
             Status::Panicked => "!",
+            Status::Abandoned => "–",
         };
         format!("{mark} {:<40} {:>8.1}ms", self.name, millis(self.duration))
     }
