@@ -91,7 +91,7 @@ fn drive(first: Bytes, more: Bytes) -> { out: Bytes, reads: Int } =
   with_cell[outbox](b"") { outbox -> {
   with_cell[reads](0) { reads -> {
     handle {
-      serve_connection(7, default_limits(), echo)
+      serve_connection[conn](7, default_limits(), echo)
     } with {
       net.recv[conn](c, max, t) -> {
         let n = cell_get(reads);
@@ -270,7 +270,7 @@ fn granted(first: Bytes) -> Int =
   with_cell[total](0) { total -> {
   with_cell[reads](0) { reads -> {
     handle {
-      serve_connection(7, default_limits(), echo)
+      serve_connection[conn](7, default_limits(), echo)
     } with {
       net.recv[conn](c, max, t) -> {
         let n = cell_get(reads);
@@ -360,7 +360,7 @@ fn boom(req: Request) -> Response = panic("the handler had a bug")
 test "a failing handler" {
   with_cell[outbox](b"") { outbox -> {
     handle {
-      serve_connection(7, default_limits(), boom)
+      serve_connection[conn](7, default_limits(), boom)
     } with {
       net.recv[conn](c, max, t) -> Some(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"),
       net.send[conn](c, payload, t) -> {
@@ -481,7 +481,7 @@ fn counted(seed: Int) -> Option<{ chunk: Bytes, next: Int }> =
 test "a producer with more chunks than the stream bound" {
   with_cell[outbox](b"") { outbox -> {
     handle {
-      respond_chunked(7, Http11, response(200, b""), true, default_limits(), 0, counted)
+      respond_chunked[conn](7, Http11, response(200, b""), true, default_limits(), 0, counted)
     } with {
       net.send[conn](c, payload, t) -> {
         cell_set(outbox, bytes_concat(cell_get(outbox), payload));
@@ -520,8 +520,8 @@ fn twenty_thousand(seed: Int) -> Option<{ chunk: Bytes, next: Int }> =
 test "a producer of twenty thousand chunks under a bound of fifty thousand" {
   with_cell[outbox](b"") { outbox -> {
     handle {
-      assert(respond_chunked(7, Http11, response(200, b""), true, wide(50000), 0,
-                             twenty_thousand))
+      assert(respond_chunked[conn](7, Http11, response(200, b""), true, wide(50000), 0,
+                                   twenty_thousand))
     } with {
       net.send[conn](c, payload, t) -> {
         cell_set(outbox, bytes_concat(cell_get(outbox), payload));

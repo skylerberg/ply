@@ -654,7 +654,7 @@ fn editing_one_shipped_definition_moves_exactly_what_reaches_it() {
         dir.path(),
         "reader.ply",
         "import mine (net, drain)\n\
-         pub fn read_all(c: Int) -> Bytes / {net.recv[conn]} = drain(c, b\"\", 1000)\n\
+         pub fn read_all(c: Int) -> Bytes / {net.recv[conn]} = drain[conn](c, b\"\", 1000)\n\
          test \"reads\" {\n\
         \x20 handle { assert_eq(read_all(1), b\"\") } with { net.recv[conn](c, m, t) -> Some(b\"\") }\n\
          }\n",
@@ -672,8 +672,8 @@ fn editing_one_shipped_definition_moves_exactly_what_reaches_it() {
         dir.path(),
         "mine.ply",
         &ply_std::NET.replace(
-            "net.recv[conn](c, 4096, timeout_ms)",
-            "net.recv[conn](c, 8192, timeout_ms)",
+            "net.recv[l](c, 4096, timeout_ms)",
+            "net.recv[l](c, 8192, timeout_ms)",
         ),
     );
     let after = load(dir.path()).unwrap();

@@ -278,6 +278,31 @@ fn narrow(c: Int) -> Bytes = net.recv[c](16)
     assert_eq!(only.listing().rows.len(), 1);
 }
 
+/// A label-generic definition's row names a variable, and no perform ever carries one: the call
+/// that fills it names the resource, and that atom is what a handler is bound against.
+#[test]
+fn a_label_a_caller_fills_is_not_a_row_of_its_own() {
+    let source = r#"
+nondet effect net {
+  write send[r](payload: Bytes) -> Int
+}
+
+fn relay<[l]>(payload: Bytes) -> Int / {net.send[l]} = net.send[l](payload)
+
+fn answer(payload: Bytes) -> Int / {net.send[conn]} = relay[conn](payload)
+"#;
+    let binding = registry(vec![op("net", "send", HostResource::Any)])
+        .bind(&check(source))
+        .expect("the generic row binds nothing of its own");
+    let rows: Vec<String> = binding
+        .listing()
+        .rows
+        .iter()
+        .map(|r| r.to_string())
+        .collect();
+    assert_eq!(rows, ["net.send[conn]"]);
+}
+
 /// A body with no written row publishes the operations it performs, and `Any` expands on those.
 #[test]
 fn any_expands_to_the_labels_an_inferred_row_names_by_operation() {
