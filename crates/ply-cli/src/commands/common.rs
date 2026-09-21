@@ -103,9 +103,14 @@ pub fn build_backend_over(
 ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
     ply_codegen::c::producer::ensure_default();
     match spec.kind {
+        // A refused definition is already a diagnostic about the program; anything else is this
+        // host failing to make a backend at all.
         ply_eval::BackendKind::C => ply_codegen::Unit::over_front(front, texts)
             .map(|unit| unit as &'static dyn ply_eval::Provider)
-            .map_err(unbuilt),
+            .map_err(|error| match ply_codegen::c::refused_in(&error) {
+                Some(refusals) => refusals.diagnostic().clone(),
+                None => unbuilt(&error),
+            }),
     }
 }
 
@@ -115,8 +120,8 @@ fn unbuilt(error: impl std::fmt::Display) -> Diagnostic {
         format!("the C backend could not be built: {error:#}"),
     )
     .note(
-        "a backend that failed to build would decline every call, so the run is refused rather \
-         than reported green over a seam nothing reached",
+        "compiled code is the only evaluator, so a run without a backend would be reported green \
+         over a seam nothing reached",
     )
     .note("this tier shells out to `cc`; `PLY_CC` names another compiler")
 }

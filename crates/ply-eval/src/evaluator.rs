@@ -311,7 +311,11 @@ pub fn err_not_compiled(name: &Symbol, span: Span) -> Diagnostic {
         format!("the compiled tier holds no body for `{name}`"),
     )
     .primary(span, "the compiled tier declined this")
-    .note("attach the compiled tier, or the construct this body uses is one it does not carry yet")
+    .note(
+        "a body the emitter cannot compile is `E0448` where the program is built, so this is the \
+         seam rather than the body: no backend attached, a signature the boundary does not carry, \
+         the wrong number of arguments, or an entry reached while another was running",
+    )
 }
 
 pub fn err_nested_simulation(span: Span, outer: Span) -> Diagnostic {

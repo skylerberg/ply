@@ -2,16 +2,15 @@
 
 use ply_codegen::Source;
 use ply_codegen::c::Produced;
-use ply_codegen::c::producer::{self, PlyProducer};
+use ply_codegen::c::producer::{self, PlyProducer, Sources};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// The emitter's program, from the one place that says what it is: a second list here would be a
+/// second answer, and the identity written into the bundle has to be the one `producer::build`
+/// recomputes reading it back, or no bundle ever matches and every process restages forever.
 fn emitter_source() -> (&'static Source, String) {
-    // In `ply_compiler::MODULES`' order, so the identity written into the bundle is the one the producer computes reading it back.
-    let modules: Vec<(String, String)> = ply_std::sources()
-        .chain(ply_compiler::sources())
-        .map(|(m, t)| (m.to_string(), t.to_string()))
-        .collect();
+    let modules = producer::modules_of(&Sources::Embedded);
     let identity = producer::digest_of(&modules);
     // No recipe is installed: each round's emitter is handed over in `emit_with`, and a handover wins over an installation.
     let ids: Vec<_> = (0..modules.len())
@@ -26,7 +25,7 @@ fn emitter_source() -> (&'static Source, String) {
         .collect();
     assert!(
         unused.is_empty(),
-        "the compiler or the standard library carries definitions nothing reaches; delete them:\n  {}",
+        "the emitter's program carries definitions nothing reaches; delete them:\n  {}",
         unused.join("\n  ")
     );
     let front: &'static ply_ty::Front = Box::leak(Box::new(front));

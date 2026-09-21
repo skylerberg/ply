@@ -148,6 +148,31 @@ fn a_definition_that_opens_its_own_region_runs_compiled_and_gives_the_arena_back
     assert_eq!(h.declines().touched_cells, 0, "{:?}", h.declines());
 }
 
+/// The close a `with_cell` emits sits after the body, and a failure and an unwind both jump past
+/// it: what the entry left open comes back from the runtime, or one region is held per entry.
+#[test]
+fn a_with_cell_abandoned_by_a_failure_or_an_unwind_gives_the_arena_back() {
+    let mut h = harness(hazards());
+    // Warmed, so the extent below is the steady state and not the first entry's.
+    h.raises("cells.failing", &[Value::Int(1)], "division by zero");
+    assert_eq!(h.run("cells.abandoned", &[Value::Int(1)]), Value::Int(-2));
+    let baseline = h.bodies.cell_extent();
+    for n in 0..32 {
+        h.raises("cells.failing", &[Value::Int(n)], "division by zero");
+        assert_eq!(
+            h.run("cells.abandoned", &[Value::Int(n)]),
+            Value::Int(-(n + 1)),
+            "`cells.abandoned({n})`"
+        );
+    }
+    assert_eq!(
+        h.bodies.cell_extent(),
+        baseline,
+        "64 abandoned `with_cell`s left regions or slots behind"
+    );
+    assert_eq!(h.declines().touched_cells, 0, "{:?}", h.declines());
+}
+
 #[test]
 fn a_cell_cannot_be_a_parameter_of_a_function_that_reads_it() {
     let diagnostics = load(&fixtures().join("cell_parameter"))

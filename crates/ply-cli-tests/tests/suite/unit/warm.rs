@@ -1,4 +1,4 @@
-use ply_cli::load::Loaded;
+use ply_cli::load::{Found, Loaded, stamp_of};
 use ply_cli::warm::*;
 use ply_span::Symbol;
 use ply_store::ContentHash;
@@ -12,18 +12,10 @@ fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
     dir
 }
 
-/// A `Loaded` is expensive here, so the state is exercised through the two questions the watch loop asks.
+/// A `Loaded` is expensive here, so the state is exercised through the questions the watch loop asks.
 fn held(root: &std::path::Path, files: &[&str]) -> Warm {
-    let paths: Vec<_> = files.iter().map(|f| root.join(f)).collect();
-    let mut warm = Warm {
-        stamps: stamps(&paths),
-        ..Warm::default()
-    };
-    warm.held = Some(fake_loaded(root, files));
-    warm.content = paths
-        .iter()
-        .filter_map(|p| Some((p.clone(), ContentHash::of(&std::fs::read(p).ok()?))))
-        .collect();
+    let mut warm = Warm::default();
+    warm.keep(fake_loaded(root, files));
     warm
 }
 
@@ -128,6 +120,27 @@ fn a_file_written_with_the_same_bytes_is_reused_whole() {
     assert!(taken.is_some());
 }
 
+/// An iteration reports long after it read the tree, and a save can land in between. The baseline
+/// is the bytes the load read, so that save is a change the next iteration sees; a baseline taken
+/// from the disk at the end of the iteration would swallow it and serve a stale front end.
+#[test]
+fn a_save_made_after_the_load_is_a_change_and_not_the_baseline() {
+    let dir = project(&[("m.ply", "fn a() -> Int = 1\n")]);
+    let mut warm = Warm::default();
+    let loaded = fake_loaded(dir.path(), &["m.ply"]);
+
+    std::fs::write(dir.path().join("m.ply"), "fn a() -> Int = 999999\n").unwrap();
+    warm.keep(loaded);
+
+    assert!(
+        warm.tree_moved(dir.path()),
+        "the save landed inside the iteration and the watcher stopped seeing it"
+    );
+    let (taken, reuse) = warm.take(dir.path());
+    assert!(taken.is_none(), "the edit was folded into the baseline");
+    assert!(matches!(reuse, Reuse::Reloaded { changed: 1 }), "{reuse:?}");
+}
+
 /// Keyed on `defs` alone, an edit to a test would reuse a unit holding the old test.
 #[test]
 fn a_held_unit_is_dropped_when_a_test_moves() {
@@ -185,10 +198,23 @@ fn a_held_unit_is_dropped_when_a_test_moves() {
     );
 }
 
+/// As a load leaves it: each file stamped before its bytes were read.
 fn fake_loaded(root: &std::path::Path, files: &[&str]) -> Loaded {
     Loaded {
         root: root.to_path_buf(),
-        files: files.iter().map(|f| root.join(f)).collect(),
+        files: files
+            .iter()
+            .map(|f| {
+                let path = root.join(f);
+                let stamp = stamp_of(&path);
+                let content = ContentHash::of(&std::fs::read(&path).unwrap_or_default());
+                Found {
+                    path,
+                    stamp,
+                    content,
+                }
+            })
+            .collect(),
         sources: ply_span::SourceMap::new(),
         front: Default::default(),
         check: Default::default(),
