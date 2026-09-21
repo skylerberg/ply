@@ -625,9 +625,18 @@ in an allocation scope named `r` that closes at the body's `}`. `cell_get`,
 Nest `with_cell`s for several cells; reusing the name allocates into the region
 already open.
 
+The scheduler that runs a spawned task must be younger than the region whose
+cell the task is handed: open it inside the region,
+`with_cell[r](init) { c -> simulate { .. } }`, and not around it,
+`simulate { with_cell[r](init) { c -> .. } }`. An older scheduler — an enclosing
+`simulate` region (§9), or the production one under `--host` — drains the tasks
+nobody joined after the region's `}`, and a `task.join` inside the region does
+not license it, because no type records the join.
+
 * `E0201`: the cell escapes its `with_cell[r]` region.
 * `E0446`: a region-branded value outlives the region (stored in an older
-  binding, handed to an operation, or put in a declared type).
+  binding, handed to an operation, put in a declared type, or handed to a
+  `task.spawn` whose scheduler is older than the region).
 * `E0449`: a region handle reaches a host operation, a host answer or an entry
   point's argument (at run time).
 * `W0610`: a reference cycle; cycles are never freed.

@@ -81,11 +81,12 @@ type LabelApp = { module: Int, span: Span, callee: Bytes, vars: List<Int>, param
 // What the emitter needs: the labels a call fills, in declaration order.
 pub type LabelSite = { module: Int, span: Span, labels: List<Bytes> }
 type Assumed = { deriver: Deriver, vars: List<Int> }
+type SpawnSite = { span: Span, ty: Type }
 type HandoffSite = { span: Span, ty: Type, op: Bytes }
-type OpenRegion = { name: Bytes, span: Span, handoffs: List<HandoffSite> }
+type OpenRegion = { name: Bytes, span: Span, simulate_depth: Int, spawns: List<SpawnSite>, handoffs: List<HandoffSite> }
 type OuterBinding = { name: Bytes, ty: Type, site: Span }
 type RegionSite = { module: Int, name: Bytes, span: Span, body_span: Span, body_ty: Type, exits: List<Span>,
-                    outer: List<OuterBinding>, handoffs: List<HandoffSite> }
+                    outer: List<OuterBinding>, spawns: List<SpawnSite>, handoffs: List<HandoffSite> }
 type Simulation = { module: Int, span: Span, body_span: Span, body_ty: Type, body_row: Row }
 // `params` names the signature's rigid type parameters, so a refusal can say which to constrain.
 type RigidParam = { name: Bytes, v: Int }
@@ -2377,7 +2378,7 @@ fn infer_perform(cx: Cx, span: Span, eff: QName, op: Ident, resource: Option<Ide
           } else {
             let checked: Cx = fold(range(0, len(args)), shape.cx, |c: Cx, i: Int| expect(c, expr_span(at(args, i)), at(shape.params, i), at(as_.tys, i), b"operation argument").cx);
             let atom = { effect: hit.info.name, resource: resource_, mode: hit.op.mode, op: Some(hit.op.name) };
-            let noted: Cx = note_handoff(checked, hit.info, hit.op, args, as_.tys);
+            let noted: Cx = note_handoff(note_spawn(checked, hit.info, hit.op, args, as_.tys), hit.info, hit.op, args, as_.tys);
             let c1: Cx = record_site(noted, atom, span, SDirect);
             let op_row = resolve_r(c1, shape.row);
             let c2: Cx = fold(op_row.atoms, c1, |c: Cx, a: Atom| record_site(c, a, span, SArgs));
@@ -2559,15 +2560,26 @@ fn cell_atoms(resource: Bytes) -> List<Atom> =
 fn region_is_open(cx: Cx, name: Bytes) -> Bool = fold(cx.open_regions, false, |acc: Bool, r: OpenRegion| acc || r.name == name)
 
 fn open_region(cx: Cx, name: Bytes, span: Span) -> Cx =
-  {..cx, open_regions: push(cx.open_regions, { name: name, span: span, handoffs: [] })}
+  {..cx, open_regions: push(cx.open_regions, { name: name, span: span, simulate_depth: cx.simulate_depth, spawns: [], handoffs: [] })}
 
-type ClosedRegion = { cx: Cx, handoffs: List<HandoffSite> }
+type ClosedRegion = { cx: Cx, spawns: List<SpawnSite>, handoffs: List<HandoffSite> }
 
 fn close_region(cx: Cx) -> ClosedRegion = {
   let n = len(cx.open_regions);
   let last = at(cx.open_regions, n - 1);
-  { cx: {..cx, open_regions: take(cx.open_regions, n - 1)}, handoffs: last.handoffs }
+  { cx: {..cx, open_regions: take(cx.open_regions, n - 1)}, spawns: last.spawns, handoffs: last.handoffs }
 }
+
+fn sites_of(args: List<Expr>, tys: List<Type>) -> List<SpawnSite> =
+  map(range(0, len(args)), |i: Int| { span: expr_span(at(args, i)), ty: at(tys, i) })
+
+// A `task.spawn` argument is filed against every open region with no `simulate` of its own between
+// the open and the spawn: that scheduler outlives the region, so its task can run past the close.
+fn note_spawn(cx: Cx, info: EffectInfo, op: OpInfo, args: List<Expr>, tys: List<Type>) -> Cx =
+  if info.name != b"task" || op.name != b"spawn" { cx } else {
+    {..cx, open_regions: map(cx.open_regions, |r: OpenRegion|
+      if r.simulate_depth < cx.simulate_depth { r } else { {..r, spawns: append(r.spawns, sites_of(args, tys))} })}
+  }
 
 // Every argument of a user-declared operation, against every open region: its handler can be installed anywhere.
 fn note_handoff(cx: Cx, info: EffectInfo, op: OpInfo, args: List<Expr>, tys: List<Type>) -> Cx =
@@ -2630,7 +2642,7 @@ fn infer_with_cell(cx: Cx, span: Span, resource: Ident, init: Expr, binder: Iden
     let handled = cell_atoms(resource.name);
     let discharged: Cx = discharge(closed.cx, mark, len(closed.cx.performs), handled);
     let site: RegionSite = { module: discharged.module, name: resource.name, span: resource.span, body_span: expr_span(body),
-                             body_ty: b.ty, exits: region_exits(body, []), outer: outer, handoffs: closed.handoffs };
+                             body_ty: b.ty, exits: region_exits(body, []), outer: outer, spawns: closed.spawns, handoffs: closed.handoffs };
     let recorded: Cx = {..discharged, regions: push(discharged.regions, site)};
     let j: WithRow = join(recorded, span, i.row, row_without(b.row, handled));
     { cx: j.cx, ty: b.ty, row: j.r }
@@ -3847,7 +3859,7 @@ fn carries_brand_in_row(t: Type, region: Bytes) -> Bool =
 
 fn check_regions(cx: Cx) -> Cx =
   fold(cx.regions, {..cx, regions: []}, |c: Cx, site: RegionSite|
-    check_region_handoffs(check_region_stores(check_region_exits(c, site), site), site))
+    check_region_handoffs(check_region_spawns(check_region_stores(check_region_exits(c, site), site), site), site))
 
 // The value the region evaluates to; a `with_cell` reports the escape as `E0201`.
 fn check_region_exits(cx: Cx, site: RegionSite) -> Cx = {
@@ -3875,6 +3887,19 @@ fn check_region_stores(cx: Cx, site: RegionSite) -> Cx =
                  [lab(site.module, b.site, true, bytes_concat_all([b"`", b.name, b"` has type `", type_text(ty), b"`, and it was bound before `", site.name, b"` opened"])),
                   lab(site.module, site.span, false, opens_here(site.name))],
                  [bytes_concat_all([b"storing into `", b.name, b"` outlives the region, so what is stored may not mention `", site.name, b"`"])])
+    } else { c }
+  })
+
+fn check_region_spawns(cx: Cx, site: RegionSite) -> Cx =
+  fold(site.spawns, cx, |c: Cx, s: SpawnSite| {
+    let ty = resolve(c, s.ty);
+    if brand_in(ty, site.name) {
+      err_labels(c, b"E0446", bytes_concat_all([b"a value allocated in region `", site.name, b"` is sent to another task"]),
+                 [lab(site.module, s.span, true, bytes_concat_all([b"this has type `", type_text(ty), b"`"])),
+                  lab(site.module, site.span, false, opens_here(site.name))],
+                 [b"the scheduler that runs the task was installed outside the region, so the task can still be running when the region's memory is gone",
+                  b"a `join` inside the region is not enough: nothing in the types says the task was joined, and a task nobody joins runs on after the region's `}`",
+                  bytes_concat_all([b"open the `simulate` region inside `with_cell[", site.name, b"]`, or pass the task something that does not mention `", site.name, b"`"])])
     } else { c }
   })
 
@@ -4485,6 +4510,13 @@ test "functions cannot be compared and a Float cannot key a Map, judged once the
 test "a cell leaving its region is reported at the exit, under the code its form has always used" {
   let dump = check_dump([{ name: b"m", src: b"fn escape() -> Int = { let k = with_cell[r](1) { c -> c }; 0 }" }]);
   assert_eq(dump, "K;1;X;D;1;!E0201:0:54:55:1:1;=0:54:55:1;")
+}
+
+test "a cell reaches a task only where the scheduler cannot outlive the region" {
+  assert_eq(check_codes(b"fn leak() -> Int = { let t = with_cell[s](0) { c -> task.spawn(|| cell_get(c)) }; 0 }"), [b"E0446"]);
+  assert_eq(check_codes(b"fn joined() -> Int = simulate { with_cell[s](0) { c -> { let t = task.spawn(|| cell_get(c)); task.join(t) } } }"), [b"E0446"]);
+  assert_eq(check_codes(b"fn inside() -> Int = with_cell[s](0) { c -> simulate { let t = task.spawn(|| cell_get(c)); task.join(t) } }"), []);
+  assert_eq(check_codes(b"fn data() -> Int = simulate { with_cell[s](0) { c -> { let t = task.spawn(|| 1); cell_get(c) + task.join(t) } } }"), [])
 }
 
 test "a call instantiating a constrained parameter with a function is refused at the call" {
