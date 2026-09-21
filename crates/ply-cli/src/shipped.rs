@@ -21,6 +21,7 @@ const COMPILER_PSEUDO_ROOT: &str = "<compiler>";
 pub const PROGRAM_SOURCES: &[(&str, &str)] = &[
     ("appends", include_str!("../ply/appends.ply")),
     ("args", include_str!("../ply/args.ply")),
+    ("build", include_str!("../ply/build.ply")),
     ("cache", include_str!("../ply/cache.ply")),
     ("check", include_str!("../ply/check.ply")),
     ("defs", include_str!("../ply/defs.ply")),
