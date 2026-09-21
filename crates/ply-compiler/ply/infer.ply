@@ -1172,7 +1172,11 @@ fn check_where(cx: Cx, def: FnDef) -> Cx =
             } else { bytes_concat(b"this signature binds ", backticked(bound, b", ")) }])
     })
 
-fn signature(cx0: Cx, def: FnDef) -> { cx: Cx, sig: Sig } = {
+fn signature(cx0: Cx, def: FnDef) -> { cx: Cx, sig: Sig } = signature_sharing(cx0, def, [])
+
+// `shared` holds the label variables the recursive group is checked with: a member's binders take
+// them in order, so a call inside the group passes the caller's labels along.
+fn signature_sharing(cx0: Cx, def: FnDef, shared: List<Int>) -> { cx: Cx, sig: Sig } = {
   let cx: Cx = {..cx0, scope: cx0.scope + 1, ty_params: map_new(), row_params: map_new(), label_params: map_new()};
   let tys: Cx = fold(def.generics.types, cx, |c: Cx, p: Ident| {
     let o: WithVar = new_ty_var(c);
@@ -1183,10 +1187,15 @@ fn signature(cx0: Cx, def: FnDef) -> { cx: Cx, sig: Sig } = {
     {..o.cx, subst: mark_rigid_row(o.cx.subst, o.v), row_params: map_insert(o.cx.row_params, p.name, o.v)}
   });
   // A label parameter is a type variable, rigid in the body, that the row's atoms name.
-  let labels: Cx = fold(def.generics.labels, rows, |c: Cx, p: Ident| {
-    let o: WithVar = new_ty_var(c);
-    {..o.cx, subst: mark_rigid_ty(o.cx.subst, o.v), label_params: map_insert(o.cx.label_params, p.name, o.v)}
-  });
+  let labels: Cx = fold(range(0, len(def.generics.labels)), rows, |c: Cx, i: Int|
+    match list_at(shared, i) {
+      Some(v) -> {..c, label_params: map_insert(c.label_params, at(def.generics.labels, i).name, v)},
+      None -> {
+        let o: WithVar = new_ty_var(c);
+        {..o.cx, subst: mark_rigid_ty(o.cx.subst, o.v),
+                 label_params: map_insert(o.cx.label_params, at(def.generics.labels, i).name, o.v)}
+      },
+    });
   let assumed: Cx = {..labels, assumed: constraints_in_force(labels, def.constraints)};
   let checked: Cx = check_where(assumed, def);
   let params = fold(def.params, { cx: checked, ts: [] }, |acc: { cx: Cx, ts: List<Type> }, p: Param|
@@ -1592,13 +1601,40 @@ fn fill_labels(cx: Cx, span: Span, labels: List<Ident>, app: Option<LabelApp>) -
       } else {
         let marked: Cx = {..cx, label_apps: set_at(cx.label_apps, len(cx.label_apps) - 1,
           { module: a.module, span: span, callee: a.callee, vars: a.vars, params: a.params, called: true })};
-        // A name a binder holds is that label parameter, as it is inside a row; anything else is a resource.
-        fold(range(0, len(labels)), marked, |c: Cx, i: Int| {
-          let want = match map_get(c.label_params, at(labels, i).name) { Some(w) -> TyVar(w), None -> label_type(at(labels, i).name) };
-          with_unified(c, unify(c.subst, c.fresh, TyVar(at(a.vars, i)), want))
-        })
+        if len(labels) > 0 && is_sibling(marked, a.callee) { group_labels_written(marked, a, labels) } else {
+          // A name a binder holds is that label parameter, as it is inside a row; anything else is a resource.
+          fold(range(0, len(labels)), marked, |c: Cx, i: Int| {
+            let want = match map_get(c.label_params, at(labels, i).name) { Some(w) -> TyVar(w), None -> label_type(at(labels, i).name) };
+            with_unified(c, unify(c.subst, c.fresh, TyVar(at(a.vars, i)), want))
+          })
+        }
       },
   }
+
+// A callee checked in the same recursive group as the body calling it: its labels are the group's.
+fn is_sibling(cx: Cx, name: Bytes) -> Bool = len(group_label_vars(cx, name)) > 0
+
+// A call inside a recursive group keeps the labels the group was called with, so a label written
+// there names the caller's own binder in that place, and anything else is refused.
+fn group_labels_written(cx: Cx, a: LabelApp, labels: List<Ident>) -> Cx =
+  fold(range(0, len(labels)), cx, |c: Cx, i: Int|
+    match map_get(c.label_params, at(labels, i).name) {
+      Some(v) -> if v == at(a.vars, i) { c } else { group_label_refused(c, a, at(labels, i)) },
+      None -> group_label_refused(c, a, at(labels, i)),
+    })
+
+fn group_label_refused(cx: Cx, a: LabelApp, written: Ident) -> Cx = {
+  let own = fold(a.vars, [], |acc: List<Bytes>, v: Int|
+    match param_named(a.params, v) { Some(n) -> push(acc, n), None -> acc });
+  let callee = simple_name_of(a.callee);
+  let help =
+    if len(own) < len(a.vars) { b"a call inside a recursive group passes the caller's labels along, so it writes none of its own" }
+    else { bytes_concat_all([b"write `", callee, b"(..)`, or name this definition's own binders in order, as `",
+                             callee, b"[", join_with(own, b", "), b"](..)`"]) };
+  err1(cx, b"E0306", written.span,
+       bytes_concat_all([b"a call to `", callee, b"` inside its own recursive group keeps the labels the group was called with"]),
+       bytes_concat_all([b"`", written.name, b"` is written here"]), [help])
+}
 
 fn wrong_labels(cx: Cx, labels: List<Ident>, callee: Option<Bytes>, want: Int) -> Cx = {
   let at_ = span_to(at(labels, 0).span, at(labels, len(labels) - 1).span);
@@ -2594,10 +2630,39 @@ fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
   if all_known { publish_known(cx, m, fns, comp, qualified) } else { check_component_walked(cx, m, fns, comp, qualified) }
 }
 
+fn binders_text(def: FnDef) -> Bytes = {
+  let n = len(def.generics.labels);
+  if n == 0 { b"binds no label parameters" } else { bytes_concat_all([b"binds ", num(n), b" label parameter", plural(n)]) }
+}
+
+fn label_binders_differ(cx: Cx, def: FnDef, first: FnDef) -> Cx =
+  err2(cx, b"E0307", def.name.span,
+       bytes_concat_all([b"`", def.name.name, b"` and `", first.name.name,
+                         b"` are mutually recursive, so they are checked with one set of label parameters"]),
+       binders_text(def), here(cx, first.name.span), binders_text(first),
+       [b"a call inside a recursive group passes the caller's labels along, so every member binds the same number, in the same order"])
+
+// The label variables a recursive group is checked with: the first member's binders, taken by
+// every member in order. A member that binds another number of them is refused.
+fn component_labels(cx0: Cx, fns: List<FnDef>, comp: List<Int>) -> { cx: Cx, vars: List<Int> } = {
+  let first: FnDef = at(fns, fold(comp, at(comp, 0), |acc: Int, i: Int| if i < acc { i } else { acc }));
+  let want = len(first.generics.labels);
+  let judged: Cx =
+    if len(comp) < 2 { cx0 } else {
+      fold(comp, cx0, |c: Cx, i: Int|
+        if len(at(fns, i).generics.labels) == want { c } else { label_binders_differ(c, at(fns, i), first) })
+    };
+  fold(first.generics.labels, { cx: judged, vars: [] }, |acc: { cx: Cx, vars: List<Int> }, p: Ident| {
+    let o: WithVar = new_ty_var(acc.cx);
+    { cx: {..o.cx, subst: mark_rigid_ty(o.cx.subst, o.v)}, vars: push(acc.vars, o.v) }
+  })
+}
+
 fn check_component_walked(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>, qualified: List<Bytes>) -> Cx = {
-  let sigs: { cx: Cx, sigs: List<Sig> } = fold(range(0, len(comp)), { cx: cx, sigs: [] }, |acc: { cx: Cx, sigs: List<Sig> }, slot: Int| {
+  let shared: { cx: Cx, vars: List<Int> } = component_labels(cx, fns, comp);
+  let sigs: { cx: Cx, sigs: List<Sig> } = fold(range(0, len(comp)), { cx: shared.cx, sigs: [] }, |acc: { cx: Cx, sigs: List<Sig> }, slot: Int| {
     let def = at(fns, at(comp, slot));
-    let s: WithSig = signature({..acc.cx, derived: derived_of(m, def)}, def);
+    let s: WithSig = signature_sharing({..acc.cx, derived: derived_of(m, def)}, def, shared.vars);
     { cx: {..s.cx, derived: None, env: env_bind_global(s.cx.env, at(qualified, slot), mono(s.sig.fn_ty))}, sigs: push(acc.sigs, s.sig) }
   });
   let grouped: Cx = {..sigs.cx, group_labels: fold(range(0, len(comp)), [], |acc: List<{ name: Bytes, vars: List<Int> }>, slot: Int| {
@@ -3943,6 +4008,52 @@ test "two label parameters stay apart, and each names its own atom" {
   let dump = check_dump([{ name: b"m", src: b"effect net { write send[r](Bytes) -> Unit }\nfn pipe<[l, k]>(b: Bytes) -> Unit / {net.send[l], net.send[k]} = { net.send[l](b); net.send[k](b) }" }]);
   assert_eq(dump, "K;1;F;m.pipe;<[l], [m]>(Bytes) -> Unit / {m.net.send[l], m.net.send[m]};<[l],[m]>m.net.send[l],m.net.send[m];<[l],[m]>m.net.send[l],m.net.send[m];;1;"
             ++ "E;m.net;0;send:write:1:Bytes:Unit;")
+}
+
+// The group's binders are positional, so `pong` takes `ping`'s first, whatever it calls it.
+test "mutually recursive definitions are checked with one set of label binders" {
+  let src = bytes_concat_all([b"effect net { write send[r](Bytes) -> Unit }\n",
+    b"fn ping<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n == 0 { net.send[l](b) } else { pong(n - 1, b) }\n",
+    b"fn pong<[k]>(n: Int, b: Bytes) -> Unit / {net.send[k]} = ping(n - 1, b)\n",
+    b"fn go(b: Bytes) -> Unit / {net.send[conn]} = ping[conn](2, b)"]);
+  let dump = check_dump([{ name: b"m", src: src }]);
+  assert(string_contains(dump, "F;m.ping;<[l]>(Int, Bytes) -> Unit / {m.net.send[l]};<[l]>m.net.send[l];"));
+  assert(string_contains(dump, "F;m.pong;<[l]>(Int, Bytes) -> Unit / {m.net.send[l]};<[l]>m.net.send[l];"));
+  assert(string_contains(dump, "F;m.go;(Bytes) -> Unit / {m.net.send[conn]};m.net.send[conn];"))
+}
+
+test "a call inside a recursive group writes no labels, or the caller's own binders" {
+  let pair = |call: Bytes| bytes_concat_all([b"effect net { write send[r](Bytes) -> Unit }\n",
+    b"fn ping<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n == 0 { net.send[l](b) } else { ", call, b" }\n",
+    b"fn pong<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = ping(n - 1, b)"]);
+  assert_eq(check_codes(pair(b"pong(n - 1, b)")), []);
+  assert_eq(check_codes(pair(b"pong[l](n - 1, b)")), []);
+  assert_eq(check_codes(pair(b"pong[conn](n - 1, b)")), [b"E0306"]);
+  let diags = check_diags(pair(b"pong[conn](n - 1, b)"));
+  assert_eq(map(diags, |dg: Diag| dg.message),
+            [b"a call to `pong` inside its own recursive group keeps the labels the group was called with"]);
+  assert_eq(map(diags, |dg: Diag| dg.notes_text),
+            [[b"write `pong(..)`, or name this definition's own binders in order, as `pong[l](..)`"]]);
+  // A self call is the same rule: its own binder, or nothing.
+  let alone = |call: Bytes| bytes_concat_all([b"effect net { write send[r](Bytes) -> Unit }\n",
+    b"fn walk<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n == 0 { net.send[l](b) } else { ", call, b" }"]);
+  assert_eq(check_codes(alone(b"walk(n - 1, b)")), []);
+  assert_eq(check_codes(alone(b"walk[l](n - 1, b)")), []);
+  assert_eq(check_codes(alone(b"walk[conn](n - 1, b)")), [b"E0306"])
+}
+
+test "the members of a recursive group bind the same label parameters" {
+  let group = |first: Bytes, second: Bytes| bytes_concat_all([b"effect net { write send[r](Bytes) -> Unit }\n",
+    b"fn ping", first, b"(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n == 0 { net.send[l](b) } else { pong(n - 1, b) }\n",
+    b"fn pong", second, b"(n: Int, b: Bytes) -> Unit / {net.send[l]} = ping(n - 1, b)"]);
+  assert_eq(check_codes(group(b"<[l]>", b"<[l]>")), []);
+  assert(contains_bytes(check_codes(group(b"<[l]>", b"")), b"E0307"));
+  assert(contains_bytes(check_codes(group(b"<[l]>", b"<[l, k]>")), b"E0307"));
+  assert(contains_bytes(check_codes(group(b"", b"<[l]>")), b"E0307"));
+  let diags = check_diags(group(b"<[l]>", b""));
+  assert_eq(at(map(diags, |dg: Diag| dg.message), 0),
+            b"`pong` and `ping` are mutually recursive, so they are checked with one set of label parameters");
+  assert_eq(map(at(diags, 0).labels, |l: Label| l.text), [b"binds no label parameters", b"binds 1 label parameter"])
 }
 
 test "a unit pattern covers its type" {
