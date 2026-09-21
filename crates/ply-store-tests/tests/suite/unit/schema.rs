@@ -1,5 +1,7 @@
 use ply_store::schema::*;
-use ply_store::{BODY_ENCODING, ContentHash, DeclBody, DefKind, FRONTEND_VERSION, Outcome};
+use ply_store::{
+    BODY_ENCODING, ContentHash, DeclBody, DefKind, FRONTEND_FORMAT, FRONTEND_VERSION, Outcome,
+};
 use ply_ty::Mode;
 use ply_ty::{EffectAtom, Footprint, Resource, Type};
 
@@ -107,6 +109,7 @@ fn mentioned() -> Vec<&'static str> {
     }
     walk_ty(&e.def.scheme.ty, &mut note);
     walk_footprint(&e.def.footprint, &mut note);
+    walk_footprint(&e.def.performed, &mut note);
     for decl in [&e.type_decl, &e.effect_decl] {
         note(variant::decl_body(&decl.body));
         match &decl.body {
@@ -132,15 +135,17 @@ fn mentioned() -> Vec<&'static str> {
 }
 
 /// The digest of the shapes this build stores.
-const PINNED: &str = "ac43a0815cde75f9e60b0457b72e7af4f6d6132d7dfd70c7e23b89742c1e1ddc";
+const PINNED: &str = "e11f5f899ffa0f1e56e013566a849e631ccdd4df30716e1baf6b8594bf60527f";
 
 #[test]
 fn the_stored_schema_is_pinned() {
     assert_eq!(
         fingerprint().to_hex(),
         PINNED,
-        "the on-disk schema changed. Update PINNED to the digest above and \
-         bump FRONTEND_VERSION (currently `{FRONTEND_VERSION}`)"
+        "the on-disk schema changed. Update PINNED to the digest above and bump the constant it \
+         is keyed on: `FRONTEND_FORMAT` (currently {FRONTEND_FORMAT}) for a change to what an \
+         entry holds, `FRONTEND_VERSION` (currently `{FRONTEND_VERSION}`) for a change to what \
+         the front end answers"
     );
 }
 
@@ -177,6 +182,27 @@ fn the_digest_follows_the_body_encoding_generation() {
         fingerprint_at(BODY_ENCODING - 1)
     );
     assert_eq!(fingerprint_at(BODY_ENCODING), fingerprint());
+}
+
+/// What a body performs and what its signature publishes are two rows, and a seeded check reads
+/// them apart: an encoder that filed one where the other belongs would answer with the wrong one.
+#[test]
+fn a_definitions_published_and_performed_rows_are_not_interchangeable() {
+    let e = exemplars();
+    assert_ne!(
+        e.def.footprint, e.def.performed,
+        "the exemplar decides nothing if the two agree"
+    );
+    let transposed = ply_store::CachedDef::new(
+        e.def.scheme.clone(),
+        e.def.performed.clone(),
+        e.def.footprint.clone(),
+    )
+    .witnessed_by(e.def.names.clone());
+    assert_ne!(
+        ply_store::codec::encode_def(&e.def),
+        ply_store::codec::encode_def(&transposed)
+    );
 }
 
 #[test]

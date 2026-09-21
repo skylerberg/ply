@@ -1074,7 +1074,8 @@ fn interfaces(
         out.push((
             hash,
             Interface::Def(
-                CachedDef::new(d.scheme.clone(), d.footprint.clone()).witnessed_by(names.clone()),
+                CachedDef::new(d.scheme.clone(), d.footprint.clone(), d.performed.clone())
+                    .witnessed_by(names.clone()),
             ),
         ));
     }
