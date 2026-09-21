@@ -343,14 +343,14 @@ nondet effect net {
 
 test/nondet "one send, several schedules" {
   let sent = net.send[socket](1);
-  let raced = simulate {
-    with_cell[n](0) { c -> {
+  let raced = with_cell[n](0) { c ->
+    simulate {
       let a = task.spawn(|| cell_set(c, cell_get(c) + 1));
       let b = task.spawn(|| cell_set(c, cell_get(c) + 2));
       task.join(a);
       task.join(b);
       cell_get(c)
-    } }
+    }
   };
   assert_eq(sent + raced, 4)
 }

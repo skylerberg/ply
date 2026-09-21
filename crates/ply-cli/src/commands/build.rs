@@ -42,7 +42,10 @@ pub fn execute(args: &BuildArgs, style: Style) -> i32 {
             return refuse_all(&loaded.sources, &diagnostics, args.json, style);
         }
     };
-    let bytes = built.artifact.encode();
+    let bytes = match built.artifact.encode() {
+        Ok(bytes) => bytes,
+        Err(diagnostic) => return refuse(&loaded.sources, diagnostic, args.json, style),
+    };
 
     if let Some(old) = &args.diff {
         return report_diff(args, &built, old, &bytes, style);
@@ -66,6 +69,10 @@ pub fn execute(args: &BuildArgs, style: Style) -> i32 {
     }
 
     if args.json {
+        let format = match artifact::format() {
+            Ok(format) => format,
+            Err(diagnostic) => return refuse(&loaded.sources, diagnostic, args.json, style),
+        };
         emit_json(&json!({
             "command": "build",
             "ok": true,
@@ -80,7 +87,7 @@ pub fn execute(args: &BuildArgs, style: Style) -> i32 {
                 .collect::<Vec<String>>(),
             "artifact": out.display().to_string(),
             "digest": built.artifact.digest_short(),
-            "format": artifact::ARTIFACT_FORMAT,
+            "format": format,
             "definitions": built.artifact.bodies.len(),
             "names": built.artifact.names.len(),
             "unit": built.artifact.has_unit(),

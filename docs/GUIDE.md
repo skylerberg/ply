@@ -625,9 +625,18 @@ in an allocation scope named `r` that closes at the body's `}`. `cell_get`,
 Nest `with_cell`s for several cells; reusing the name allocates into the region
 already open.
 
+The scheduler that runs a spawned task must be younger than the region whose
+cell the task is handed: open it inside the region,
+`with_cell[r](init) { c -> simulate { .. } }`, and not around it,
+`simulate { with_cell[r](init) { c -> .. } }`. An older scheduler — an enclosing
+`simulate` region (§9), or the production one under `--host` — drains the tasks
+nobody joined after the region's `}`, and a `task.join` inside the region does
+not license it, because no type records the join.
+
 * `E0201`: the cell escapes its `with_cell[r]` region.
 * `E0446`: a region-branded value outlives the region (stored in an older
-  binding, handed to an operation, or put in a declared type).
+  binding, handed to an operation, put in a declared type, or handed to a
+  `task.spawn` whose scheduler is older than the region).
 * `E0449`: a region handle reaches a host operation, a host answer or an entry
   point's argument (at run time).
 * `W0610`: a reference cycle; cycles are never freed.
@@ -1322,6 +1331,21 @@ dot of the file name, and a dotfile has none. `strip_dot` removes a leading
 `pub fn blake3(input: Bytes) -> Bytes` answers 32 bytes. It is written in Ply
 and slow; use it for small inputs.
 
+### 13.14 `std.bytes`
+
+```ply
+pub fn u32_le(n: Int) -> Bytes
+pub fn u64_le(n: Int) -> Bytes
+pub fn u32_at(b: Bytes, at: Int) -> Option<Int>
+pub fn u64_at(b: Bytes, at: Int) -> Option<Int>
+pub fn slice_at(b: Bytes, at: Int, n: Int) -> Option<Bytes>
+```
+
+Little-endian integers in a byte string, which is how a binary format is
+written and read back. The writers take the low four or eight bytes of `n`.
+Nothing here raises: a read past either end is `None`, and so is a `u64` past
+what an `Int` holds, so an answer is never a negative length.
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
@@ -1406,7 +1430,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 
 | command | flags |
 | --- | --- |
-| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases; with `--types`, effect sets and provenance), `--no-incremental` |
+| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases; with `--types`, effect sets and provenance) |
 | `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--trace auto\|always\|never`, `--backend`, `--profile`, `--std`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--backend`, `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`, `--backend`, host, trace, prove, simulation |
@@ -1426,15 +1450,18 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply cache clear\|stats\|compact [path]` | discard results / report size and reclaimable space / reclaim it |
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 
-`ply fmt`, `ply defs`, `ply hash`, `ply doc` and `ply explain` are one Ply
-program (`crates/ply-cli/ply`, entered at `ply.main`). `ply` parses the command
-line, binds the directory the load is rooted at as the program's one writable
-filesystem root and the modules it ships as a read-only second one, and answers
-with the code the program asked to exit with. A path is therefore relative to
-its root, and one that leaves it is refused with `E0452`. The first run after
-`ply` or the program itself changes compiles the program's unit, which needs the
-C toolchain `ply run` needs and takes a few seconds; every later run loads the
-compiled object and the front end it filed beside it.
+`ply check`, `ply fmt`, `ply defs`, `ply hash`, `ply doc` and `ply explain` are
+one Ply program (`crates/ply-cli/ply`, entered at `ply.main`). `ply` parses the
+command line, binds the directory the load is rooted at as the program's one
+writable filesystem root and the modules it ships as a read-only second one, and
+answers with the code the program asked to exit with. A path is therefore
+relative to its root, and one that leaves it is refused with `E0452`. The first
+run after `ply` or the program itself changes compiles the program's unit, which
+needs the C toolchain `ply run` needs and takes a few seconds; every later run
+loads the compiled object and the front end it filed beside it. These commands
+run the whole front end every time: the front-end cache under `.ply-cache` is
+read and written by `ply test`, `ply prove` and `ply review`, and by nothing
+else.
 
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed

@@ -57,8 +57,12 @@ fn artifact_of(dir: &Path) -> Artifact {
     built(dir).1.artifact
 }
 
+fn written(artifact: &Artifact) -> Vec<u8> {
+    artifact.encode().expect("the container should be written")
+}
+
 fn write_artifact(at: &Path, artifact: &Artifact) {
-    std::fs::write(at, artifact.encode()).unwrap();
+    std::fs::write(at, written(artifact)).unwrap();
 }
 
 fn json_of(output: &std::process::Output) -> Value {
@@ -80,7 +84,7 @@ fn two_builds_from_two_roots_are_byte_identical() {
 
     let first = artifact_of(cold.path());
     let second = artifact_of(warm.path());
-    assert_eq!(first.encode(), second.encode());
+    assert_eq!(written(&first), written(&second));
     assert_eq!(first.digest(), second.digest());
     assert_eq!(first.digest_short(), second.digest_short());
     assert!(first.digest_short().starts_with("b3:"));
@@ -137,7 +141,7 @@ fn an_artifact_carries_no_test_no_law_and_nothing_unreached() {
     assert!(opened.front.check.tests.is_empty(), "a test was deployed");
     assert!(opened.front.check.laws.is_empty(), "a law was deployed");
 
-    let mut shipped = vec![String::from_utf8_lossy(&built.artifact.encode()).into_owned()];
+    let mut shipped = vec![String::from_utf8_lossy(&written(&built.artifact)).into_owned()];
     if let Some(unit) = &built.artifact.unit {
         shipped.push(ply_codegen::c::bundle::unpack(&unit.text).unwrap());
     }
@@ -274,7 +278,7 @@ fn a_closure_that_is_not_the_closure_is_refused() {
 fn a_flipped_bit_in_a_body_is_e0443_naming_the_definition() {
     let dir = project(PROGRAM);
     let artifact = artifact_of(dir.path());
-    let mut bytes = artifact.encode();
+    let mut bytes = written(&artifact);
 
     // The first record starts past the header and section descriptors; its payload, past the 32-byte key and length prefix.
     let sections = u32::from_le_bytes(bytes[180..184].try_into().unwrap()) as usize;
@@ -305,7 +309,7 @@ fn a_flipped_bit_in_a_body_is_e0443_naming_the_definition() {
 #[test]
 fn no_prefix_of_an_artifact_is_believed() {
     let dir = project(PROGRAM);
-    let bytes = artifact_of(dir.path()).encode();
+    let bytes = written(&artifact_of(dir.path()));
     let path = dir.path().join("t.plyx");
     for cut in [0, 1, 100, 187, 188, 200, bytes.len() / 2, bytes.len() - 1] {
         let err = artifact::decode(&bytes[..cut], &path)
@@ -364,12 +368,12 @@ fn a_foreign_encoding_is_e0444_and_not_e0443() {
 
     let mut stale = artifact_of(dir.path());
     stale.frontend = [7; 32];
-    let err = artifact::decode(&stale.encode(), &path).unwrap_err();
+    let err = artifact::decode(&written(&stale), &path).unwrap_err();
     assert_eq!(err.code, codes::ARTIFACT_VERSION);
 
     let mut future = artifact_of(dir.path());
     future.runtime = [7; 32];
-    let err = artifact::decode(&future.encode(), &path).unwrap_err();
+    let err = artifact::decode(&written(&future), &path).unwrap_err();
     assert_eq!(err.code, codes::ARTIFACT_VERSION);
 }
 
@@ -436,7 +440,7 @@ fn the_digest_is_one_line_and_agrees_with_the_build() {
 #[test]
 fn the_digest_moves_with_the_closure_and_with_nothing_else() {
     let dir = project(PROGRAM);
-    let before = artifact_of(dir.path()).encode();
+    let before = written(&artifact_of(dir.path()));
 
     for (what, edited) in [
         (
@@ -466,7 +470,7 @@ fn the_digest_moves_with_the_closure_and_with_nothing_else() {
         assert_ne!(edited, PROGRAM, "{what}: the edit did not apply");
         std::fs::write(dir.path().join("m.ply"), &edited).unwrap();
         assert!(
-            artifact_of(dir.path()).encode() == before,
+            written(&artifact_of(dir.path())) == before,
             "{what} moved the artifact"
         );
     }
@@ -653,7 +657,11 @@ fn the_build_prints_the_artifacts_size_beside_the_binarys() {
             .output()
             .unwrap(),
     );
-    assert_eq!(report["format"], artifact::ARTIFACT_FORMAT, "{report}");
+    assert_eq!(
+        report["format"],
+        artifact::format().expect("the container states its format"),
+        "{report}"
+    );
     assert!(report.get("sources").is_none(), "{report}");
     let artifact_bytes = report["artifact_bytes"].as_u64().unwrap();
     let binary_bytes = report["binary_bytes"].as_u64().unwrap();

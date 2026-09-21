@@ -1,0 +1,200 @@
+// Where an append copies, before the program runs: `ply check --costs` reads it out, and a
+// `reuse fn` whose body copies is refused with it.
+
+import compiler.costs (Report, Costed, Site, costs)
+import compiler.front (Whole)
+import compiler.items (Item, IFn)
+import compiler.resolve (Source, Mod, Diag, diag1, diag2)
+import compiler.spine (Span)
+import diagnostic (Place, spot_of)
+import program (Program, sourced)
+import report (ind, plural)
+import style (Style, bold, dim, red, green, yellow)
+
+// Where the verdict column starts: wide enough for `stdlib.ply:1234:56`.
+fn location_width() -> Int = 22
+
+pub fn costs_of(p: Program, w: Whole) -> Report = {
+  let srcs: List<Source> = sourced(p, w);
+  costs(map(srcs, |s: Source| s.name), map(srcs, |s: Source| s.src))
+}
+
+// Whether any module declares a `reuse fn`, so the promise check can be skipped.
+pub fn promised(w: Whole) -> Bool =
+  fold(w.mods, false, |acc: Bool, m: Mod|
+    fold(m.module.items, acc, |a: Bool, it: Item|
+      match it { IFn(d) -> a || (match d.reuse { Some(_) -> true, None -> false }), _ -> a }))
+
+// --- The listing ------------------------------------------------------------------
+
+fn spaces(n: Int) -> String = fold(range(0, n), "", |acc: String, i: Int| acc ++ " ")
+
+fn basename(path: String) -> String = {
+  let parts = string_split(path, "/");
+  match list_at(parts, len(parts) - 1) { Some(last) -> last, None -> path }
+}
+
+fn located(places: List<Place>, module: Int, offset: Int) -> String =
+  match list_at(places, module) {
+    None -> "<unknown>",
+    Some(place) -> {
+      let spot = spot_of(place.text, offset);
+      basename(place.path) ++ ":" ++ int_to_string(spot.line) ++ ":" ++ int_to_string(spot.col)
+    },
+  }
+
+fn counted(d: Costed, verdict: Bytes) -> Int =
+  fold(d.sites, 0, |acc: Int, s: Site| if s.verdict == verdict { acc + 1 } else { acc })
+
+fn worded(n: Int, word: String, said: String) -> String =
+  if n == 0 { said }
+  else if said == "" { int_to_string(n) ++ " " ++ word }
+  else { said ++ ", " ++ int_to_string(n) ++ " " ++ word }
+
+fn tally(d: Costed) -> String =
+  worded(counted(d, b"unknown"), "unknown",
+         worded(counted(d, b"copies"), "COPIES",
+                worded(counted(d, b"reuses"), "reuses", "")))
+
+fn kind_of(d: Costed) -> String =
+  if d.kind == b"test" { " (test)" } else if d.kind == b"law" { " (law)" } else { "" }
+
+fn painted(s: Style, verdict: Bytes) -> String =
+  if verdict == b"reuses" { green(s, "reuses ") }
+  else if verdict == b"copies" { red(s, "COPIES ") }
+  else { yellow(s, "unknown") }
+
+fn site_lines(s: Style, places: List<Place>, d: Costed, lines: List<String>, site: Site) -> List<String> = {
+  let at = located(places, d.module, site.start);
+  let pad = if string_len(at) >= location_width() { 0 } else { location_width() - string_len(at) };
+  let said = push(lines, "    " ++ at ++ spaces(pad) ++ "  " ++ painted(s, site.verdict) ++ "  "
+                         ++ string_of_bytes_lossy(site.reason));
+  if bytes_len(site.fix) == 0 { said } else {
+    push(said, "    " ++ spaces(location_width()) ++ "  " ++ spaces(7) ++ "  "
+               ++ dim(s, "fix: " ++ string_of_bytes_lossy(site.fix)))
+  }
+}
+
+fn def_lines(s: Style, places: List<Place>, lines: List<String>, d: Costed) -> List<String> = {
+  let head = push(push(lines, ""),
+                  "  " ++ bold(s, string_of_bytes_lossy(d.label)) ++ dim(s, kind_of(d))
+                  ++ "  " ++ dim(s, tally(d)));
+  fold(d.sites, head, |acc: List<String>, site: Site| site_lines(s, places, d, acc, site))
+}
+
+fn total(r: Report, verdict: Bytes) -> Int =
+  fold(r.defs, 0, |acc: Int, d: Costed| acc + counted(d, verdict))
+
+fn summary(r: Report) -> String = {
+  let reuses = total(r, b"reuses");
+  let copies = total(r, b"copies");
+  let undecided = total(r, b"unknown");
+  int_to_string(reuses + copies + undecided) ++ " appends: " ++ int_to_string(reuses) ++ " reuse, "
+    ++ int_to_string(copies) ++ " copy, " ++ int_to_string(undecided) ++ " undecided — "
+    ++ int_to_string(r.rounds) ++ " " ++ plural(r.rounds, "round")
+}
+
+// The whole report, or the one line a program that declares no `push` at all gets.
+pub fn report_lines(s: Style, places: List<Place>, r: Report) -> List<String> =
+  if len(r.defs) == 0 { ["", ind() ++ dim(s, "no appends: nothing to cost")] } else {
+    push(push(fold(r.defs, [""], |acc: List<String>, d: Costed| def_lines(s, places, acc, d)), ""),
+         "  " ++ dim(s, summary(r)))
+  }
+
+// --- The promise ------------------------------------------------------------------
+
+// The program resolved once for the front end, so a pass that cannot resolve it is Ply's fault.
+pub fn unresolved() -> Diag =
+  diag1(b"E0505", 4294967295, { start: 0, end: 0 },
+        b"the compiler could not say where this program's appends copy: it did not resolve in the cost pass",
+        b"no append was costed, so no promise is claimed kept",
+        [b"this is Ply's fault: the compiler's own `costs.ply` is what failed here"])
+
+fn unkept(d: Costed, promise: Span, site: Site) -> Diag = {
+  let what = if site.verdict == b"copies" { b"copies its list" }
+             else { b"cannot be shown to reuse its list" };
+  let note = if bytes_len(site.fix) == 0 {
+    b"no edit inside this body removes the copy; the promise cannot be kept as written, so either restructure the append or drop `reuse`"
+  } else { bytes_concat(b"fix: ", site.fix) };
+  diag2(b"E0127", d.module, { start: site.start, end: site.end },
+        bytes_concat_all([b"`", d.name, b"` is a `reuse fn`, and this append ", what, b": ", site.reason]),
+        b"this append", d.module, promise, b"the promise", [note])
+}
+
+// Each `reuse fn`'s appends must reuse, except onto its own parameter.
+pub fn promises(r: Report) -> List<Diag> =
+  fold(r.defs, [], |acc: List<Diag>, d: Costed|
+    match d.reuse {
+      None -> acc,
+      Some(promise) ->
+        fold(d.sites, acc, |a: List<Diag>, site: Site|
+          if site.verdict == b"reuses" || site.param >= 0 { a } else { push(a, unkept(d, promise, site)) }),
+    })
+
+// --- Tests ------------------------------------------------------------------
+
+fn place() -> List<Place> = [{ path: "src/m.ply", text: b"fn f() -> Int = 1\nfn g() -> Int = 2\n" }]
+
+fn site(verdict: Bytes, reason: Bytes, fix: Bytes, param: Int) -> Site =
+  { start: 18, end: 29, verdict: verdict, reason: reason, fix: fix, param: param }
+
+fn costed(kind: Bytes, sites: List<Site>, reuse: Option<Span>) -> Costed =
+  { kind: kind, module: 0, module_name: b"m", name: b"grow", label: b"m.grow", reuse: reuse,
+    sites: sites }
+
+test "a definition's tally names only the verdicts it has, in one order" {
+  assert_eq(tally(costed(b"fn", [site(b"reuses", b"", b"", 0 - 1)], None)), "1 reuses");
+  assert_eq(tally(costed(b"fn", [site(b"reuses", b"", b"", 0 - 1), site(b"copies", b"", b"", 0 - 1),
+                                 site(b"unknown", b"", b"", 0 - 1)], None)),
+            "1 reuses, 1 COPIES, 1 unknown");
+  assert_eq(tally(costed(b"fn", [], None)), "")
+}
+
+test "a program that appends nowhere is told so on one line" {
+  assert_eq(report_lines({ styled: false }, place(), { ok: true, rounds: 1, defs: [] }),
+            ["", "   no appends: nothing to cost"])
+}
+
+test "a site is placed by its file's base name and the verdict column does not move" {
+  let r: Report = { ok: true, rounds: 2,
+                    defs: [costed(b"fn", [site(b"copies", b"read again", b"bind it first", 0 - 1)], None)] };
+  assert_eq(report_lines({ styled: false }, place(), r),
+            ["",
+             "",
+             "  m.grow  1 COPIES",
+             "    m.ply:2:1               COPIES   read again",
+             "                                     fix: bind it first",
+             "",
+             "  1 appends: 0 reuse, 1 copy, 0 undecided — 2 rounds"])
+}
+
+test "a `reuse fn` is refused for a copy its own body causes and for nothing else" {
+  let promise = Some({ start: 0, end: 5 });
+  let kept: Report = { ok: true, rounds: 1,
+                       defs: [costed(b"fn", [site(b"reuses", b"fine", b"", 0 - 1)], promise)] };
+  assert_eq(promises(kept), []);
+  // An append onto the definition's own parameter is the caller's business, not this body's.
+  let caller: Report = { ok: true, rounds: 1,
+                         defs: [costed(b"fn", [site(b"copies", b"a caller keeps it", b"", 0)], promise)] };
+  assert_eq(promises(caller), []);
+  let broken: Report = { ok: true, rounds: 1,
+                         defs: [costed(b"fn", [site(b"copies", b"read again", b"`map_update`", 0 - 1)], promise)] };
+  let raised = promises(broken);
+  assert_eq(len(raised), 1);
+  let d = match list_at(raised, 0) { Some(x) -> x, None -> panic("one diagnostic") };
+  assert_eq(d.code, b"E0127");
+  assert_eq(d.message, b"`grow` is a `reuse fn`, and this append copies its list: read again");
+  assert_eq(d.notes_text, [b"fix: `map_update`"]);
+  assert_eq(len(d.labels), 2);
+  // A body nothing can be done about says so rather than naming an edit.
+  let hopeless: Report = { ok: true, rounds: 1,
+                           defs: [costed(b"fn", [site(b"unknown", b"a call", b"", 0 - 1)], promise)] };
+  assert_eq(map(promises(hopeless), |x: Diag| x.message),
+            [b"`grow` is a `reuse fn`, and this append cannot be shown to reuse its list: a call"])
+}
+
+test "a definition with no promise is costed and never refused" {
+  let r: Report = { ok: true, rounds: 1,
+                    defs: [costed(b"fn", [site(b"copies", b"read again", b"", 0 - 1)], None)] };
+  assert_eq(promises(r), [])
+}
