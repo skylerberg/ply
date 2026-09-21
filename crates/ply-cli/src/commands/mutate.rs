@@ -69,7 +69,7 @@ pub fn targets<'a>(loaded: &'a Loaded, query: &str) -> Result<Vec<&'a DefInfo>, 
         .check
         .defs
         .values()
-        .filter(|d| !ply_std::is_std(&d.module))
+        .filter(|d| !crate::shipped::is_shipped(&d.module))
         .collect();
     if query == "*" {
         return Ok(project);
@@ -432,7 +432,7 @@ pub fn coverage_json(loaded: &Loaded, hashes: &HashOutput) -> Value {
         .check
         .defs
         .values()
-        .filter(|d| !ply_std::is_std(&d.module))
+        .filter(|d| !crate::shipped::is_shipped(&d.module))
         .map(|d| {
             let tests: Vec<&str> = reaching(loaded, hashes, &d.name)
                 .into_iter()

@@ -31,7 +31,7 @@ pub fn execute(args: &DefsArgs, style: Style) -> i32 {
         .check
         .defs
         .values()
-        .filter(|d| !ply_std::is_std(&d.module))
+        .filter(|d| !crate::shipped::is_shipped(&d.module))
         .filter(|d| {
             args.filter
                 .as_ref()

@@ -1073,9 +1073,12 @@ ends the handled body as the host would.
 ### 13.10 `std.fs`
 
 ```ply
+pub type Kind = | File | Dir | Symlink | Missing
+
 pub nondet effect fs {
   read  read_file[r](path: String) -> Option<Bytes>
   read  list_dir[r](path: String) -> Option<List<String>>
+  read  kind[r](path: String) -> Kind
   read  exists[r](path: String) -> Bool
   read  file_size[r](path: String) -> Option<Int>
   read  modified_ms[r](path: String) -> Option<Int>
@@ -1089,12 +1092,31 @@ pub nondet effect fs {
 The label is a root bound with `--fs NAME=PATH`. Unbound label: `E0451`; a path
 escaping its root (`..`, absolute, or a symlink outside): `E0452`; a file over
 the read bound: `E0453`. Different roots do not conflict. Reads are whole-file,
-`list_dir` is one level, `rename` stays in one root. The twin is `MemFs`
-(`mem_empty`, `mem_of`, `mem_read`, `mem_write`, `mem_list`, `mem_exists`,
-`mem_size`, `mem_create_dir`, `mem_remove`, `mem_rename`, `mem_modified`); a
-test imports both `std.fs` and `std.fs (fs)` to name the module and the effect.
+`list_dir` is one level, `rename` stays in one root. `kind` says what a path
+names in one call and does not follow a symlink, so a walk can pass one over;
+`Missing` is also what this run cannot read. Every other operation follows one.
+The twin is `MemFs` (`mem_empty`, `mem_of`, `mem_read`, `mem_write`, `mem_list`,
+`mem_kind`, `mem_exists`, `mem_size`, `mem_create_dir`, `mem_remove`,
+`mem_rename`, `mem_modified`); it holds no symlinks, so `mem_kind` never answers
+`Symlink`. A test imports both `std.fs` and `std.fs (fs)` to name the module and
+the effect.
 
-### 13.11 `std.hash`
+### 13.11 `std.path`
+
+```ply
+pub fn join(dir: String, name: String) -> String
+pub fn file_name(path: String) -> String
+pub fn extension(path: String) -> Option<String>
+pub fn strip_dot(path: String) -> String
+```
+
+Text, not a filesystem: nothing here performs an effect. `join` places exactly
+one separator and adds none for a root spelled `"."` or `""`. `file_name` is the
+last segment, `""` for a path ending in a separator. `extension` follows the last
+dot of the file name, and a dotfile has none. `strip_dot` removes a leading
+`./`, so `./m.ply` and `m.ply` are one key in a set.
+
+### 13.12 `std.hash`
 
 `pub fn blake3(input: Bytes) -> Bytes` answers 32 bytes. It is written in Ply
 and slow; use it for small inputs.
@@ -1203,6 +1225,14 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed
 and leaves a file that does not parse alone, exiting 2 with the diagnostic.
+It is a Ply program (`crates/ply-cli/ply/fmt.ply`) run over the working
+directory as its one filesystem root, so a path is relative to it and an
+absolute path, or one that leaves it, is refused with `E0452`. A directory whose
+name starts with `.`, and one named `target`, are not walked; a symlink found
+while walking is passed over, and one named on the command line is an error
+rather than a file to rewrite. The first run after `ply` or the program itself
+changes compiles the program's unit, which needs the C toolchain `ply run` needs
+and takes a few seconds; every later run loads the compiled object.
 
 `ply show NAME` and `ply replace NAME` are the edit loop for one definition: read
 it, rewrite it, and touch nothing else in the file. The replacement is one item

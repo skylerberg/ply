@@ -12,6 +12,7 @@ pub mod hosts;
 pub mod load;
 pub mod migrate;
 pub mod obligations;
+pub mod shipped;
 pub mod signature;
 pub mod simulation;
 pub mod style;
