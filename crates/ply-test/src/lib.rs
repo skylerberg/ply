@@ -144,6 +144,9 @@ pub enum Status {
     Failed,
     /// Ply failed rather than the program: the evaluator unwound or reported a broken invariant.
     Panicked,
+    /// The harness stopped the run at its wall clock. The test decided nothing, so nothing about
+    /// it is recorded and the next run starts it again.
+    Abandoned,
 }
 
 #[derive(Clone, Debug)]
@@ -311,6 +314,9 @@ impl Failure {
 pub struct RunReport {
     pub passed: usize,
     pub failed: usize,
+    /// Tests the wall clock stopped. They are not failures, but the run did not decide them, so
+    /// it is not a success either.
+    pub abandoned: usize,
     pub cached: usize,
     pub failures: Vec<Failure>,
     pub duration: Duration,
@@ -326,7 +332,7 @@ pub struct RunReport {
 
 impl RunReport {
     pub fn is_success(&self) -> bool {
-        self.failed == 0
+        self.failed == 0 && self.abandoned == 0
     }
 }
 
@@ -981,6 +987,7 @@ pub fn run_with<E: Executor>(
     let mut failures = Vec::new();
     let mut passed = 0usize;
     let mut failed = 0usize;
+    let mut abandoned = 0usize;
 
     for (group_index, group) in schedule_of(selection, &mut warnings).iter().enumerate() {
         let mut live = Vec::with_capacity(group.len());
@@ -1008,19 +1015,24 @@ pub fn run_with<E: Executor>(
             let hash = test_hash(hashes, index);
             let seeded = is_seeded(&test.footprint);
             let host_backed = executed.host.is_some();
+            let abandoned_run = executed.failure.as_ref().is_some_and(is_abandoned);
             let defect = executed
                 .failure
                 .as_ref()
                 .is_some_and(|d| executed.panicked || is_defect(d));
             let status = match (&executed.failure, defect) {
                 (None, _) => Status::Passed,
+                (Some(_), _) if abandoned_run => Status::Abandoned,
                 (Some(_), false) => Status::Failed,
                 (Some(_), true) => Status::Panicked,
             };
             let exploration = executed.exploration;
             let mut recorded = None;
 
-            if let Some(diagnostic) = &executed.failure {
+            if abandoned_run {
+                // The clock is a fact about this machine: no verdict, no suspects, nothing stored.
+                abandoned += 1;
+            } else if let Some(diagnostic) = &executed.failure {
                 failed += 1;
                 let suspects = suspects_for(hashes, &test.key, &changed);
                 let mut attribution = Attribution::from_suspects(&suspects, hashes);
@@ -1115,6 +1127,7 @@ pub fn run_with<E: Executor>(
     RunReport {
         passed,
         failed,
+        abandoned,
         cached: selection.cached.len(),
         failures,
         duration: started.elapsed(),
@@ -1257,6 +1270,11 @@ fn is_defect(d: &Diagnostic) -> bool {
         || d.code == codes::HOST_FOOTPRINT_ESCAPE
         || d.code == codes::SECRET_TO_HOST
         || d.code == codes::SIMULATION_DIVERGENCE
+}
+
+/// The wall clock stopped this run: it is about the machine, so it is no verdict on the test.
+fn is_abandoned(d: &Diagnostic) -> bool {
+    d.code == codes::RUN_ABANDONED
 }
 
 fn panic_diagnostic(payload: Box<dyn Any + Send>, check: &CheckOutput, index: usize) -> Diagnostic {

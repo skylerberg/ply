@@ -1,9 +1,13 @@
-//! The bound on runaway recursion.
+//! The two bounds on a runaway program: how deep it may nest, and how much work it may do.
 
 use ply_span::{Diagnostic, Span, codes};
 
 /// The most nested calls a program may hold at once.
 pub const DEFAULT_MAX_CALLS: usize = 10_000;
+
+/// The calls one entry may make before it is refused more work; 0 is no bound. A tail call is a
+/// loop, so a call is the unit of work that is already counted on every path.
+pub const DEFAULT_STEP_BUDGET: i64 = 1_000_000_000;
 
 pub const MAX_VALUE_DEPTH: usize = DEFAULT_MAX_CALLS;
 

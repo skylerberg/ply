@@ -167,6 +167,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     let backend = backend.map(|(provider, spec)| provider.attach(&spec));
     // The counters are process-wide and cumulative.
     ply_eval::rc::reset();
+    ply_codegen::rt::set_step_budget(args.steps);
     ply_codegen::rt::set_time_budget(args.timeout);
     let answer = evaluate(
         &loaded,
@@ -288,7 +289,10 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
                 }));
             } else {
                 print_diagnostics(std::slice::from_ref(&diagnostic), &loaded.sources, style);
+                // An abandoned run raised nothing: the clock stopped it where it stood.
+                let abandoned = diagnostic.code == codes::RUN_ABANDONED;
                 if !drained
+                    && !abandoned
                     && let Some(at) = diagnostic
                         .primary_span()
                         .and_then(|s| location(&loaded.sources, s))

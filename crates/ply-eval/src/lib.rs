@@ -56,7 +56,7 @@ pub use explore::{
     Dependence, Explored, Interleaving, Simulation, Verdict, explore, explore_under,
     measure_reduction,
 };
-pub use limit::{DEFAULT_MAX_CALLS, MAX_VALUE_DEPTH};
+pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};
 pub use rc::Stats as RcStats;
 pub use semantics::strict_binary;
 pub use sim::{

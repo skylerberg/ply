@@ -378,8 +378,8 @@ pub mod codes {
     pub const ASSERTION_FAILED: &str = "E0501";
     /// A failure the language defines: `panic`, division by zero, overflow, a resource limit.
     pub const RUNTIME_ERROR: &str = "E0502";
-    /// An entry point, test or evaluation ran past its wall-clock budget.
-    pub const TIME_BUDGET: &str = "E0503";
+    /// An entry point, test or evaluation spent its step budget without finishing.
+    pub const STEP_BUDGET: &str = "E0503";
     pub const INTERNAL_ERROR: &str = "E0505";
     /// Cache codes are warnings: cache trouble is never a fault in the user's program.
     pub const CACHE_UNREADABLE: &str = "W0601";
@@ -401,6 +401,9 @@ pub mod codes {
     pub const SPAN_ABANDONED: &str = "W0609";
     /// A definition no `pub` item, `main`, test or law reaches.
     pub const UNUSED_DEFINITION: &str = "W0611";
+    /// A run the harness stopped at its wall clock: a fact about the machine, not about the
+    /// program, so nothing it did is recorded.
+    pub const RUN_ABANDONED: &str = "W0612";
 }
 
 /// Every published code with its meaning in one line, in the order the guide lists them; a code
@@ -577,7 +580,7 @@ pub const MEANINGS: &[(&str, &str)] = &[
         "E0502",
         "runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit",
     ),
-    ("E0503", "ran past its time budget"),
+    ("E0503", "spent its step budget without finishing"),
     ("E0505", "Ply broke one of its own invariants"),
     ("W0601", "cache unreadable"),
     ("W0602", "cache corrupt"),
@@ -599,6 +602,7 @@ pub const MEANINGS: &[(&str, &str)] = &[
         "W0611",
         "definition no `pub` item, `main`, test or law reaches; a leading `_` in its name keeps it quiet",
     ),
+    ("W0612", "run abandoned at its wall clock; nothing recorded"),
 ];
 
 pub fn meaning(code: &str) -> Option<&'static str> {
@@ -877,7 +881,7 @@ mod tests {
             ),
             ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
-            ("TIME_BUDGET", codes::TIME_BUDGET, "E0503"),
+            ("STEP_BUDGET", codes::STEP_BUDGET, "E0503"),
             ("INTERNAL_ERROR", codes::INTERNAL_ERROR, "E0505"),
             ("CACHE_UNREADABLE", codes::CACHE_UNREADABLE, "W0601"),
             ("CACHE_CORRUPT", codes::CACHE_CORRUPT, "W0602"),
@@ -898,6 +902,7 @@ mod tests {
             ("SPAN_ABANDONED", codes::SPAN_ABANDONED, "W0609"),
             ("REFERENCE_CYCLE", codes::REFERENCE_CYCLE, "W0610"),
             ("UNUSED_DEFINITION", codes::UNUSED_DEFINITION, "W0611"),
+            ("RUN_ABANDONED", codes::RUN_ABANDONED, "W0612"),
         ];
 
         for (name, code, expected) in registry {

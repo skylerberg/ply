@@ -445,7 +445,11 @@ a `handle` in a member's body is compiled definition by definition and nests.
 
 Every other call nests, at most 10,000 deep (then `E0502`): `1 + f(n - 1)`, a
 call inside `handle`, `with_cell` or a lambda, and a call of another function.
-A loop that never ends fails with `E0503` when its time budget is spent (§8.4).
+Depth and work are two bounds: one entry may also make only so many calls — a
+billion by default, and none under `ply run`, where an entry that serves forever
+is a program — and a loop that never ends fails with `E0503` when that budget is
+spent. `--steps N` sets it (`0` is no bound), and the count is the same on every
+machine, so the verdict is too (§8.4).
 `map`/`filter`/`fold`/`range` and the byte scanners do not nest calls, and
 `iterate` is a loop with an early exit and a step budget:
 
@@ -659,9 +663,16 @@ Tests whose footprints do not conflict run concurrently; a test whose effects
 are all discharged in a region conflicts with nothing. `--jobs N`/`-j` sets
 workers (default one per core).
 
-`--timeout MS` is the wall clock each test may take (default 60000; `0` is no
+`--steps N` is the calls each test may make (default 1000000000; `0` is no
 bound); a test past it fails with `E0503`, which is a program error like any
-other. A failing deterministic test that has passed before is bisected over the
+other, and is recorded as one, because the count is a property of the program.
+
+`--timeout MS` is the wall clock each test may take (default 60000; `0` is no
+clock). It is not a verdict: a test past it is *abandoned* (`W0612`), reported
+apart from the failures, recorded nowhere, and run again next time. A run with
+an abandoned test is not a success, since it decided nothing about that test.
+
+A failing deterministic test that has passed before is bisected over the
 definitions that changed to name a culprit. `--bisect auto|always|never`
 (default `auto`), `--bisect-budget N` (evaluations, default 64), and
 `--trace auto|always|never` (record which definitions a failure entered) control
@@ -821,8 +832,10 @@ view and `len` known to lie below `i64::MAX`.
 obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no
 values. Flags: `--prove-cases N` (below 25 kept cases only `example`),
 `--prove-roots N`, `--prove-budget N` (spent reports `property`),
-`--shrink-budget N`, `--timeout MS` (wall clock per evaluation, default 5000; an
-evaluation past it leaves the obligation `unattempted`), and `--backend`.
+`--shrink-budget N`, `--prove-steps N` (calls per evaluation of a claim, default
+1000000000; an evaluation past it leaves the obligation `unattempted`, and the
+number keys the cached result, so more budget is a stronger claim), and
+`--backend`.
 
 `ply review` reports, per definition changed since the last
 `ply review --accept`, whether the implementation, the spec and the obligations
@@ -1388,14 +1401,14 @@ stdout, compact and with its keys sorted.
 
 Flag groups: *simulation* (§9), *host* (`--host` and §14's flags except trace
 and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
-`--shrink-budget`, `--timeout`), *trace* (`--trace`, `--trace-level`), *drain*
-(`--drain-ms`, `--drain-lead-ms`).
+`--shrink-budget`, `--prove-steps`), *trace* (`--trace`, `--trace-level`),
+*drain* (`--drain-ms`, `--drain-lead-ms`).
 
 | command | flags |
 | --- | --- |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases; with `--types`, effect sets and provenance), `--no-incremental` |
-| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--trace auto\|always\|never`, `--backend`, `--profile`, `--std`, host, simulation |
-| `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--timeout` (default no bound), `--backend`, `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
+| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--trace auto\|always\|never`, `--backend`, `--profile`, `--std`, host, simulation |
+| `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--backend`, `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`, `--backend`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, `--backend`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE`, `--config-schema`, `--db-schema`, `--digest`, `--diff OLD.plyx` |
@@ -1566,7 +1579,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0458` | captured output over the bound |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, division by zero, overflow, bad index, spent budget, call limit |
-| `E0503` | ran past its time budget |
+| `E0503` | spent its step budget without finishing |
 | `E0505` | Ply broke one of its own invariants |
 | `W0601` | cache unreadable |
 | `W0602` | cache corrupt |
@@ -1579,6 +1592,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `W0609` | spans still open when an entry point ended |
 | `W0610` | reference cycle, never freed |
 | `W0611` | definition no `pub` item, `main`, test or law reaches; a leading `_` in its name keeps it quiet |
+| `W0612` | run abandoned at its wall clock; nothing recorded |
 
 ## 18. What Ply does not have
 
