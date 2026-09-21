@@ -125,7 +125,7 @@ impl Loaded {
         self.check
             .defs
             .values()
-            .filter(|d| d.simple_name == main && !ply_std::is_std(&d.module))
+            .filter(|d| d.simple_name == main && !crate::shipped::is_shipped(&d.module))
             .collect()
     }
 }

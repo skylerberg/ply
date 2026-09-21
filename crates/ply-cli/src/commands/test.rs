@@ -621,7 +621,7 @@ impl Plan {
         filter: Option<&str>,
         std_tests: bool,
     ) -> Plan {
-        let in_scope = |t: &ply_ty::TestInfo| std_tests || !ply_std::is_std(&t.module);
+        let in_scope = |t: &ply_ty::TestInfo| std_tests || !crate::shipped::is_shipped(&t.module);
         // Against `<module>.<label>`, so `--filter store.` narrows to a module.
         let matches = |t: &ply_ty::TestInfo| filter.is_none_or(|n| t.key.as_str().contains(n));
 

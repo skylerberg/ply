@@ -22,7 +22,7 @@ import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, L
               check_front, deriver_text, is_prelude_effect, builtin_schemes, BuiltinDoc, builtin_docs, find_doc)
 import diag (Parsed, parse_all, parse_at, outside_every_module, frame, field, flag)
 import std.hash (blake3)
-import fmt (fmt_source, item_range, replace_item)
+import fmt (item_range, replace_item)
 
 fn cat(parts: List<List<Bytes>>) -> List<Bytes> = fold(parts, [], |acc: List<Bytes>, p: List<Bytes>| append(acc, p))
 
@@ -565,13 +565,6 @@ pub fn print_dump(bodies: List<Bytes>, names: List<{ name: Bytes, hash: Bytes }>
     Unprintable(why) -> framed(b"refused", b"_", cat([[field(b"message", why.message)], map(why.notes, |n: Bytes| field(b"note", n))])),
   })
 
-// The source formatted, or a `refused` frame with the diagnostic that stopped it.
-pub fn fmt_dump(src: Bytes) -> String =
-  string_of_bytes(match fmt_source(src) {
-    Ok(text) -> framed(b"formatted", b"_", [text]),
-    Err(why) -> framed(b"refused", b"_", [field(b"message", why)]),
-  })
-
 pub fn item_range_dump(src: Bytes, name: Bytes) -> String =
   string_of_bytes(match item_range(src, name) {
     Ok(r) -> framed(b"range", b"_", [field(b"start", num(r.start)), field(b"end", num(r.end))]),
@@ -589,6 +582,27 @@ pub fn replace_dump(src: Bytes, name: Bytes, item: Bytes) -> String =
 
 fn is_std(name: Bytes) -> Bool = name == b"std" || bytes_starts_with(name, b"std.")
 
+// The compiler's own modules, shelved under one reserved root so a program can import the formatter.
+fn is_compiler(name: Bytes) -> Bool = name == b"compiler" || bytes_starts_with(name, b"compiler.")
+
+fn is_shipped(name: Bytes) -> Bool = is_std(name) || is_compiler(name)
+
+// A compiler module names its siblings bare; on the shelf they are `compiler.*`, so its imports are read that way.
+fn shelved_import(d: ImportDecl) -> ImportDecl = {
+  let name = import_module_name(d);
+  if is_std(name) || len(d.path) == 0 { d }
+  else { { path: append([{ name: b"compiler", span: at(d.path, 0).span }], d.path), kind: d.kind, span: d.span } }
+}
+
+fn shelved(p: Parsed) -> Parsed =
+  if !is_compiler(p.name) { p } else {
+    { name: p.name,
+      module: { name: p.module.name,
+                module: { imports: map(p.module.module.imports, shelved_import), items: p.module.module.items },
+                derived: p.module.derived },
+      diags: p.diags }
+  }
+
 fn import_at(imports: List<ImportDecl>, name: Bytes) -> Span = {
   let found = fold(imports, None, |acc: Option<Span>, d: ImportDecl|
     match acc { Some(_) -> acc, None -> if import_module_name(d) == name { Some(path_span(d)) } else { None } });
@@ -597,7 +611,7 @@ fn import_at(imports: List<ImportDecl>, name: Bytes) -> Span = {
 
 fn unknown_shipped(m: Int, at_: Span, name: Bytes, listed: List<Bytes>) -> Diag =
   diag1(b"E0106", m, at_, bytes_concat_all([b"no module named `", name, b"` ships with this compiler"]), b"not found",
-        [bytes_concat(b"the stdlib holds: ", backticked(listed, b", ")),
+        [bytes_concat(b"the stdlib holds: ", backticked(filter(listed, is_std), b", ")),
          b"`ply std` lists them with the digest this binary was built from"])
 
 fn foreign_import(m: Int, at_: Span, importer: Bytes, name: Bytes) -> Diag =
@@ -617,13 +631,13 @@ fn pull_round(users: Int, shipped: Map<Bytes, Bytes>, listed: List<Bytes>, parse
     let ships = i >= users;
     fold(imports, acc, |r: Round, d: ImportDecl| {
       let name = import_module_name(d);
-      if is_std(name) && !map_contains(present, name) {
+      if is_shipped(name) && !map_contains(present, name) {
         match map_get(shipped, name) {
           Some(src) -> {..r, wanted: map_insert(r.wanted, name, src)},
           None -> {..r, diags: push(r.diags, if ships { foreign_import(i, import_at(imports, name), p.name, name) }
                                              else { unknown_shipped(i, import_at(imports, name), name, listed) })},
         }
-      } else if ships && !is_std(name) { {..r, diags: push(r.diags, foreign_import(i, import_at(imports, name), p.name, name))} }
+      } else if ships && !is_shipped(name) { {..r, diags: push(r.diags, foreign_import(i, import_at(imports, name), p.name, name))} }
       else { r }
     })
   })
@@ -639,7 +653,8 @@ fn pulling(users: Int, shipped: Map<Bytes, Bytes>, listed: List<Bytes>, x: Pull)
     else if map_len(r.wanted) == 0 { x }
     else {
       pulling(users, shipped, listed, map_fold(r.wanted, x, |acc: Pull, name: Bytes, src: Bytes|
-        {..acc, parsed: push(acc.parsed, parse_at(len(acc.parsed), { name: name, src: src })), pulled: push(acc.pulled, name)}))
+        {..acc, parsed: push(acc.parsed, shelved(parse_at(len(acc.parsed), { name: name, src: src }))),
+                pulled: push(acc.pulled, name)}))
     }
   }
 }
@@ -804,6 +819,23 @@ test "the shipped modules a program imports follow it a round at a time, each ro
 test "an import of a module that does not ship is reported at the import, listing the ones that do" {
   assert_eq(front_pulling_std([{ name: b"m", src: b"import std.e\npub fn f() -> Int = 1" }], shelf()),
             "pulled _ 0\ndiag 0 245\ncode 5\nE0106severity 5\nerrormessage 48\nno module named `std.e` ships with this compilerlabel 18\n0 7 12 1\nnot foundnote 52\nthe stdlib holds: `std.a`, `std.b`, `std.c`, `std.d`note 63\n`ply std` lists them with the digest this binary was built from")
+}
+
+fn compiler_shelf() -> List<Source> =
+  [{ name: b"compiler.a", src: b"import b (second)\npub fn first() -> Int = second()" },
+   { name: b"compiler.b", src: b"pub fn second() -> Int = 1" }]
+
+test "a shelved compiler module's bare imports are read under the shelf's root" {
+  let out = front_pulling_std([{ name: b"m", src: b"import compiler.a (first)\npub fn f() -> Int = first()" }],
+                              compiler_shelf());
+  assert(bytes_starts_with(bytes_of_string(out), b"pulled _ 40\nmodule 10\ncompiler.amodule 10\ncompiler.border _ "));
+  assert(holds(out, b"def compiler.a.first "))
+}
+
+test "a shelved module importing outside the shelf is the compiler's own defect" {
+  let out = front_pulling_std([{ name: b"m", src: b"import compiler.a (first)\npub fn f() -> Int = first()" }],
+                              [{ name: b"compiler.a", src: b"import std.e (e)\npub fn first() -> Int = e()" }]);
+  assert(holds(out, b"the shipped module `compiler.a` imports `std.e`, which this build does not ship"))
 }
 
 test "a shipped module importing outside the shipped ones is placed in that module, which the answer names" {

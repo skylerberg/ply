@@ -283,7 +283,7 @@ fn closure_texts(artifact: &Artifact) -> Result<Vec<(String, String)>, Vec<Diagn
         .names
         .iter()
         .filter_map(|(name, _)| name.rsplit_once('.').map(|(module, _)| module))
-        .filter(|module| ply_std::is_reserved(module))
+        .filter(|module| crate::shipped::is_shipped_name(module))
         .collect();
     let shipped: Vec<&str> = shipped.into_iter().collect();
     let printed = ply_codegen::c::producer::print_bodies(&bodies, &names, &[], &[], &shipped)
@@ -693,16 +693,14 @@ fn ask_the_port(
             .note("this is Ply's fault: the compiler's own front end is what failed here"),
         ]
     };
-    let shelf: Vec<(String, String)> = ply_std::sources()
-        .map(|(module, text)| (module.to_string(), text.to_string()))
-        .collect();
+    let shelf = crate::shipped::sources();
     let pulled = ply_codegen::c::producer::front_pulling_std(own, &shelf)
         .map_err(|e| failed(format!("{e:#}")))?;
     for module in &pulled.modules {
         let name = ModuleName::from_dotted(module);
-        let text = ply_std::source(&name)
+        let text = crate::shipped::source(&name)
             .ok_or_else(|| failed(format!("it pulled in `{module}`, which is not shipped")))?;
-        ids.push(sources.add(ply_std::pseudo_path(&name), text));
+        ids.push(sources.add(crate::shipped::pseudo_path(&name), text));
     }
     let front = ply_ty::read_front(&pulled.dump, ids.as_slice())
         .map_err(|e| failed(format!("the front end's answer does not read: {e}")))?;
@@ -726,7 +724,7 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
     for (file, text) in &artifact.closure {
         let relative = PathBuf::from(file);
         let name = ModuleName::from_relative_path(&relative).map_err(|d| vec![d])?;
-        if ply_std::is_std(&name) {
+        if crate::shipped::is_shipped(&name) {
             return Err(vec![unfaithful(format!(
                 "the closure carries `{file}`, a module this `ply` ships"
             ))]);
@@ -764,12 +762,9 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
         .iter()
         .map(|(name, _)| name.as_str())
         .collect();
-    if let Some(extra) = hashes
-        .defs
-        .keys()
-        .chain(hashes.decls.keys())
-        .find(|name| !ply_std::is_reserved(name.as_str()) && !named.contains(name.as_str()))
-    {
+    if let Some(extra) = hashes.defs.keys().chain(hashes.decls.keys()).find(|name| {
+        !crate::shipped::is_shipped_name(name.as_str()) && !named.contains(name.as_str())
+    }) {
         return Err(vec![unfaithful(format!(
             "the closure declares `{extra}`, which the artifact does not name"
         ))]);
@@ -1078,6 +1073,71 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
             code
         }
     }
+}
+
+/// One entry into an opened artifact, with no line of its own on either stream: the program's
+/// output is the whole of what a caller sees. The answer is the code `process.exit` asked for,
+/// else `0` for a value returned and the diagnostic for a raise.
+pub fn enter(
+    artifact: &Artifact,
+    opened: &Opened,
+    argv: Vec<String>,
+    roots: &[ply_host::fs::RootSpec],
+) -> Result<i32, Diagnostic> {
+    // A unit built for another runtime is left aside, as `run` leaves it, and the bodies serve.
+    let unit = artifact.unit.as_ref().filter(|unit| {
+        let served = ply_codegen::c::bundle::unpack(&unit.text)
+            .and_then(|text| ply_codegen::c::served(&text, "artifact"));
+        !matches!(&served, Err(e) if e.downcast_ref::<ply_codegen::c::Unserved>().is_some())
+    });
+    let declared = opened
+        .front
+        .check
+        .defs
+        .get(&opened.entry)
+        .map(|d| d.footprint.clone());
+    let tier = tier(opened, None, unit)?;
+    let hosts = crate::hosts::Hosts::open_stopping(
+        &opened.front.check,
+        true,
+        &crate::cli::TlsOptions::default(),
+        roots,
+        None,
+        crate::config::Configuration::default(),
+        &crate::trace::TraceOptions::default(),
+        declared.as_ref(),
+        None,
+        Some(ply_host::process::ProcessHost::new(
+            argv,
+            ply_host::process::Sink::Real {
+                out: ply_host::process::Stream::Out,
+            },
+        )),
+    )
+    .map_err(|diagnostics| bind_failed(&diagnostics))?;
+    let span = opened
+        .front
+        .check
+        .defs
+        .get(&opened.entry)
+        .map(|d| d.span)
+        .unwrap_or(Span::DUMMY);
+    let plan = crate::simulation::run_plan(None);
+    let answer = evaluate(opened, span, &plan, &hosts, declared.as_ref(), tier);
+    let _ = crate::commands::run::teardown(&hosts, None, crate::commands::run::TEARDOWN_FLOOR_MS);
+    match hosts.requested_exit() {
+        Some(code) => Ok(code),
+        None => answer.map(|_| crate::EXIT_OK),
+    }
+}
+
+fn bind_failed(diagnostics: &[Diagnostic]) -> Diagnostic {
+    diagnostics.first().cloned().unwrap_or_else(|| {
+        Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "the artifact's hosts could not be bound, and nothing said why",
+        )
+    })
 }
 
 /// The unit the artifact runs on: its embedded one as built, else one compiled from its bodies.
