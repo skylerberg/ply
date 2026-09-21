@@ -292,13 +292,9 @@ pub struct CheckArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Report which files were parsed and which definitions were rechecked, and why.
+    /// Report where the front end's time went, and where every row came from.
     #[arg(long)]
     pub explain: bool,
-
-    /// Neither read nor write the front-end cache.
-    #[arg(long)]
-    pub no_incremental: bool,
 }
 
 #[derive(Args, Debug)]

@@ -248,14 +248,14 @@ fn weakened_frame(loaded: &Loaded, obligation: &Obligation) -> Vec<String> {
     let Some(def) = loaded.check.defs.get(&obligation.owner) else {
         return Vec::new();
     };
-    let slack = crate::signature::provenance(def);
-    if slack.unperformed.is_empty() {
+    let slack = crate::signature::unperformed(def);
+    if slack.is_empty() {
         return Vec::new();
     }
     crate::signature::fill(
         "frame covers, body never touches: ",
         "  ",
-        &slack.unperformed,
+        &slack,
         "",
         crate::signature::WIDTH - IND.len() - 4,
     )
