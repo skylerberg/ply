@@ -1,4 +1,4 @@
-//! The parts of one of the port's per-module answers, in one file replaced whole.
+//! The parts of the port's per-module claims, in one file replaced whole.
 
 use crate::{ContentHash, FRONTEND_FORMAT, FRONTEND_VERSION, disk};
 use ply_span::frames::Cursor;
@@ -6,8 +6,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-pub(crate) const ANSWER_FILE: &str = "frontend.answer";
-pub(crate) const ANSWER_STEM: &str = "answer";
 pub(crate) const CLAIMS_FILE: &str = "claims.answer";
 pub(crate) const CLAIMS_STEM: &str = "claims";
 

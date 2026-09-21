@@ -1157,3 +1157,83 @@ fn the_shipped_blake3_is_blake3() {
         );
     }
 }
+
+/// What the front end published for each `fn`, by program-wide name.
+fn footprints(dump: &str, count: usize) -> std::collections::BTreeMap<String, String> {
+    let ids: Vec<SourceId> = (0..count).map(|i| SourceId(i as u32)).collect();
+    let front = ply_ty::read_front(dump, &ids).unwrap_or_else(|e| panic!("{e}"));
+    front
+        .check
+        .defs
+        .iter()
+        .map(|(name, d)| (name.to_string(), ply_ty::print_footprint(&d.footprint)))
+        .collect()
+}
+
+/// The recompute unit is the definition, not the module: handing the front end a row for every
+/// definition and then editing one body must leave every definition whose hash did not move
+/// published from its row, including the ones beside the edit and the ones importing them.
+#[test]
+fn an_edit_walks_the_definitions_that_depend_on_it_and_no_others() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
+    // A row nothing performs, so a definition published from its row is told from a walked one.
+    const SENTINEL: &str = "base.probe.read";
+    let base = |body: &str| {
+        format!(
+            "effect probe {{ read peek() -> Int }}\n\
+             pub fn poke() -> Int / {{probe.read}} = probe.peek()\n\
+             pub fn one() -> Int = {body}\n\
+             pub fn two() -> Int = 2\n\
+             pub fn three() -> Int = one() + 1\n"
+        )
+    };
+    const APP: &str = "import base\n\
+                       pub fn four() -> Int = base::one() + 3\n\
+                       pub fn five() -> Int = base::two() + 4\n";
+    let program = |body: &str| {
+        vec![
+            ("base".to_string(), base(body)),
+            ("app".to_string(), APP.to_string()),
+        ]
+    };
+
+    let before = producer::front_pulling_std(&program("1"), &[]).expect("the program checks");
+    let ids: Vec<SourceId> = (0..2).map(|i| SourceId(i as u32)).collect();
+    let checked = ply_ty::read_front(&before.dump, &ids).unwrap_or_else(|e| panic!("{e}"));
+    let known: Vec<producer::KnownDef> = checked
+        .hashes
+        .defs
+        .iter()
+        .map(|(name, hash)| producer::KnownDef {
+            name: name.to_string(),
+            hash: *hash,
+            footprint: SENTINEL.to_string(),
+            performed: SENTINEL.to_string(),
+        })
+        .collect();
+
+    let kept = producer::front_pulling_std_with(&program("1"), &[], &known, &[])
+        .expect("the program checks");
+    for (name, footprint) in footprints(&kept.dump, 2) {
+        assert_eq!(footprint, SENTINEL, "`{name}` was walked, not taken");
+    }
+
+    // One body edited: `one` moves, and with it everything that reaches it, and nothing else.
+    let after = producer::front_pulling_std_with(&program("11"), &[], &known, &[])
+        .expect("the program checks");
+    let walked: Vec<String> = footprints(&after.dump, 2)
+        .into_iter()
+        .filter(|(_, footprint)| footprint != SENTINEL)
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        walked,
+        vec![
+            "app.four".to_string(),
+            "base.one".to_string(),
+            "base.three".to_string()
+        ],
+        "the recompute unit is not the definition"
+    );
+}
