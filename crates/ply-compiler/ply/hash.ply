@@ -193,14 +193,31 @@ fn target(index: Index, module: Int, ns: Int, qual: Option<Bytes>, name: Bytes) 
   }
 }
 
+// `pub` is metadata a definition's own encoding erases, but a reference to one is another matter: a
+// qualified name reaches only what its module exports, so an unexported one denotes nothing, as it
+// already does for a bare name the scope never bound. Without this a reference that stopped being
+// permitted would encode as though it still were, and the caller's hash would not move.
+fn exports(index: Index, qual: Option<Bytes>, node: Int) -> Bool =
+  match qual {
+    None -> true,
+    Some(_) -> match at(index.nodes, node).body { NFn(d) -> is_pub(d.vis), NType(d) -> is_pub(d.vis), NEffect(d) -> is_pub(d.vis) },
+  }
+
+fn exported(index: Index, qual: Option<Bytes>, node: Option<Int>) -> Option<Int> =
+  match node { None -> None, Some(v) -> if exports(index, qual, v) { Some(v) } else { None } }
+
 fn value_target(index: Index, module: Int, q: QName) -> Option<ValueTarget> =
   match target(index, module, 0, qualifier(q), q.name.name) {
     None -> None,
     Some(t) -> {
       let items = at(index.items, t.owner);
-      match map_get(items.fns, t.name) {
+      match exported(index, qualifier(q), map_get(items.fns, t.name)) {
         Some(node) -> Some(VFn(node)),
-        None -> match map_get(items.ctors, t.name) { Some(owner) -> Some(VCtor({ owner: owner, name: t.name })), None -> None },
+        // A variant is exported exactly when the type that declares it is.
+        None -> match exported(index, qualifier(q), map_get(items.ctors, t.name)) {
+          Some(owner) -> Some(VCtor({ owner: owner, name: t.name })),
+          None -> None,
+        },
       }
     },
   }
@@ -208,14 +225,20 @@ fn value_target(index: Index, module: Int, q: QName) -> Option<ValueTarget> =
 fn ctor_target(index: Index, module: Int, q: QName) -> Option<ValueTarget> =
   match target(index, module, 0, qualifier(q), q.name.name) {
     None -> None,
-    Some(t) -> match map_get(at(index.items, t.owner).ctors, t.name) { Some(owner) -> Some(VCtor({ owner: owner, name: t.name })), None -> None },
+    Some(t) -> match exported(index, qualifier(q), map_get(at(index.items, t.owner).ctors, t.name)) {
+      Some(owner) -> Some(VCtor({ owner: owner, name: t.name })),
+      None -> None,
+    },
   }
 
 fn type_target(index: Index, module: Int, qual: Option<Bytes>, name: Bytes) -> Option<Int> =
-  match target(index, module, 1, qual, name) { None -> None, Some(t) -> map_get(at(index.items, t.owner).types, t.name) }
+  match target(index, module, 1, qual, name) { None -> None, Some(t) -> exported(index, qual, map_get(at(index.items, t.owner).types, t.name)) }
 
 fn effect_target(index: Index, module: Int, q: QName) -> Option<Int> =
-  match target(index, module, 2, qualifier(q), q.name.name) { None -> None, Some(t) -> map_get(at(index.items, t.owner).effects, t.name) }
+  match target(index, module, 2, qualifier(q), q.name.name) {
+    None -> None,
+    Some(t) -> exported(index, qualifier(q), map_get(at(index.items, t.owner).effects, t.name)),
+  }
 
 // Tarjan's components, iterative: completion order, each component's members as they left the stack.
 type Tarjan = { index: List<Int>, low: List<Int>, on_stack: List<Bool>, stack: List<Int>, call: List<{ v: Int, edge: Int }>, out: List<List<Int>>, next: Int }
@@ -432,7 +455,9 @@ fn type_ref(z: Nz, qual: Option<Bytes>, name: Bytes) -> Nz = {
   }
 }
 
-// Effects are nominal: the declaration referenced, then the slot the component's enumeration gave it.
+// Effects are nominal: the declaration referenced, then the slot the component's enumeration gave
+// it. What makes that true is the simple name in the declaration's own encoding; its module path is
+// not, so two modules declaring one effect alike declare one effect.
 fn effect_ref(z: Nz, q: QName) -> Nz =
   match effect_target(z.index, z.module, q) {
     Some(node) -> u32v(node_ref(z, node), match map_get(z.effects, node) { Some(s) -> s, None -> 0 }),
@@ -497,8 +522,14 @@ fn type_def(z: Nz, d: TypeDef) -> Nz = {
 }
 
 // Operations are looked up by name, so their declaration order is sorted away.
+// An effect is nominal: it is the declaration this name declares, not a shape another declaration
+// could match. Two effects differing only in their names are two effects, so the name is encoded —
+// a published row names its atoms' effects, and nothing else would make a hash pin those names.
+// The name is the simple one: a module path is no part of an identity here, so the same declaration
+// vendored under another path is still that declaration.
 fn effect_def(z: Nz, d: EffectDef) -> Nz = {
-  let z1: Nz = boolv(tag(z, t_effect()), d.is_nondet);
+  let named: Nz = strv(tag(z, t_effect()), d.name.name);
+  let z1: Nz = boolv(named, d.is_nondet);
   let ops = fold(d.ops, { z: z1, encoded: [] }, |acc: { z: Nz, encoded: List<Bytes> }, op: OpDef| {
     let c: Captured = capture(acc.z, |x: Nz| op_def(x, op));
     { z: c.z, encoded: push(acc.encoded, c.bytes) }
@@ -1860,7 +1891,10 @@ fn p_type_def(x: Pr, d: Dc, name: Bytes) -> Got = {
 }
 
 fn p_effect(x: Pr, d: Dc, name: Bytes) -> Got = {
-  let nd = rd_bool(expect(d, t_effect(), b"an effect"));
+  // The encoding carries the name the declaring program wrote; this printing uses the one it was
+  // asked for, which a relink may have changed.
+  let declared = rd_text(expect(d, t_effect(), b"an effect"));
+  let nd = rd_bool(declared.d);
   let n = rd_count(nd.d);
   let ops = rd_many(n.d, n.v, |g: Dc| {
     let op = rd_text(expect(g, t_op(), b"an operation"));
@@ -1958,6 +1992,8 @@ fn part_in(acc: Parting, c: Comp, named: Map<Bytes, Map<Bytes, Named>>, shipped:
         let h = at(c.hashes, i);
         let kind = bytes_at(at(c.members, i), 0);
         if len(all) == 0 { {..a, bad: refuse(bytes_concat_all([b"the body `", short_hex(h), b"` has no name"]), [])} }
+        // Two modules declaring one effect alike declare one effect, so a body performing it cannot
+        // be printed back under a name: either module's would be a different claim about what it does.
         else if kind == t_effect() && len(all) > 1 {
           {..a, bad: refuse(bytes_concat(listed(all), b" are one effect declaration, so a body cannot say which it performs"),
                             [b"make the declarations differ, or keep one of them"])}
@@ -2234,10 +2270,29 @@ test "a label binder, the resources it names and the labels a call fills print b
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
 
-test "one effect declaration under two names is refused, since a body cannot say which it performs" {
+test "two effects that differ only in their names are two declarations" {
   let out = hash_index(indexed([{ name: b"a", src: b"pub effect one { read at() -> Int }" }, { name: b"b", src: b"pub effect two { read at() -> Int }" }]));
+  let named = by_name(named_hashes(out));
+  // Nominal: the shapes match, so only the names tell the two apart, and a hash has to.
+  assert(map_get(named, b"a.one") != None);
+  assert(map_get(named, b"a.one") != map_get(named, b"b.two"))
+}
+
+test "one effect declaration under two names is refused, since a body cannot say which it performs" {
+  // One simple name in two modules: a module path is no part of an identity, so this is a single
+  // declaration, and naming it twice leaves a body that performs it with no name to be printed under.
+  let out = hash_index(indexed([{ name: b"a", src: b"pub effect one { read at() -> Int }" }, { name: b"b", src: b"pub effect one { read at() -> Int }" }]));
+  let named = by_name(named_hashes(out));
+  assert_eq(map_get(named, b"a.one"), map_get(named, b"b.one"));
   match print_bodies(map(out.bodies, |b: { name: Bytes, body: Bytes }| b.body), named_hashes(out), [], [], []) {
     Printed(_) -> panic("two names for one declaration must be refused"),
-    Unprintable(why) -> assert_eq(why.message, b"`a.one`, `b.two` are one effect declaration, so a body cannot say which it performs"),
+    Unprintable(why) -> assert_eq(why.message, b"`a.one`, `b.one` are one effect declaration, so a body cannot say which it performs"),
   }
+}
+
+test "a definition's hash follows the name of the effect it performs" {
+  let one = hash_index(indexed([{ name: b"m", src: b"pub effect log { write put() -> Unit }\npub fn say() -> Unit / {log.write} = log.put()" }]));
+  let other = hash_index(indexed([{ name: b"m", src: b"pub effect trace { write put() -> Unit }\npub fn say() -> Unit / {trace.write} = trace.put()" }]));
+  // The row `say` publishes names its effect, so a hash that ignored the name would not pin the row.
+  assert(map_get(by_name(named_hashes(one)), b"m.say") != map_get(by_name(named_hashes(other)), b"m.say"))
 }

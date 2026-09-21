@@ -910,7 +910,42 @@ pub fn replace_item(src: &str, name: &str, item: &str) -> Result<Result<String, 
 }
 
 /// [`FRONT`], pulling in the shipped modules the program imports itself.
-const FRONT_PULLING: &str = "front.front_pulling_std";
+const FRONT_PULLING: &str = "front.front_pulling_std_with";
+
+/// One definition's published rows under the hash it had when they were published; the front end
+/// takes them wherever it hashes that definition the same, and walks the rest.
+pub struct KnownDef {
+    pub name: String,
+    pub hash: DefHash,
+    /// The declaration each effect the rows name had, by name and hash: a reference is encoded by
+    /// what it reaches, so renaming an effect moves no hash and only this says the rows are stale.
+    pub witness: Vec<(String, DefHash)>,
+    pub footprint: String,
+    pub performed: String,
+}
+
+/// One test's footprint, keyed as `<module>.<label>`, under the hash it had. A test's row names its
+/// effects exactly as a definition's does, so it carries the same witness.
+pub struct KnownTest {
+    pub key: String,
+    pub hash: DefHash,
+    pub witness: Vec<(String, DefHash)>,
+    pub footprint: String,
+}
+
+fn witness_list(witness: &[(String, DefHash)]) -> Value {
+    Value::list(
+        witness
+            .iter()
+            .map(|(name, hash)| {
+                record(vec![
+                    ("name", Value::bytes(name.as_bytes())),
+                    ("hash", Value::bytes(hash.0)),
+                ])
+            })
+            .collect(),
+    )
+}
 
 /// What [`front_pulling_std`] answered.
 pub struct Pulled {
@@ -920,13 +955,59 @@ pub struct Pulled {
     pub dump: String,
 }
 
-/// [`front_dump`] over `user` plus each module of `shipped` it imports, transitively, placed
-/// as the CLI driver places them: a round of newly imported modules at a time, each in byte order.
+/// [`front_pulling_std_with`] over a front end that has been handed nothing.
 pub fn front_pulling_std(
     user: &[(String, String)],
     shipped: &[(String, String)],
 ) -> Result<Pulled> {
-    let answer = call(FRONT_PULLING, &[source_list(user), source_list(shipped)])?;
+    front_pulling_std_with(user, shipped, &[], &[])
+}
+
+/// [`front_dump`] over `user` plus each module of `shipped` it imports, transitively, placed
+/// as the CLI driver places them: a round of newly imported modules at a time, each in byte order.
+/// `defs` and `tests` carry what a previous answer published, which the front end takes wherever
+/// this program hashes that item the same.
+pub fn front_pulling_std_with(
+    user: &[(String, String)],
+    shipped: &[(String, String)],
+    defs: &[KnownDef],
+    tests: &[KnownTest],
+) -> Result<Pulled> {
+    let known_defs = Value::list(
+        defs.iter()
+            .map(|d| {
+                record(vec![
+                    ("name", Value::bytes(d.name.as_bytes())),
+                    ("hash", Value::bytes(d.hash.0)),
+                    ("witness", witness_list(&d.witness)),
+                    ("footprint", Value::bytes(d.footprint.as_bytes())),
+                    ("performed", Value::bytes(d.performed.as_bytes())),
+                ])
+            })
+            .collect(),
+    );
+    let known_tests = Value::list(
+        tests
+            .iter()
+            .map(|t| {
+                record(vec![
+                    ("key", Value::bytes(t.key.as_bytes())),
+                    ("hash", Value::bytes(t.hash.0)),
+                    ("witness", witness_list(&t.witness)),
+                    ("footprint", Value::bytes(t.footprint.as_bytes())),
+                ])
+            })
+            .collect(),
+    );
+    let answer = call(
+        FRONT_PULLING,
+        &[
+            source_list(user),
+            source_list(shipped),
+            known_defs,
+            known_tests,
+        ],
+    )?;
     let Value::Str(answer) = &answer else {
         bail!(
             "`{FRONT_PULLING}` answered a {} rather than a string",
