@@ -142,7 +142,7 @@ pub fn compact(scope: &CacheScope, style: Style) -> i32 {
                 store
                     .source_paths()
                     .into_iter()
-                    .filter(|p| ply_std::is_pseudo_path(p)),
+                    .filter(|p| crate::shipped::is_pseudo_path(p)),
             );
             keep
         }
