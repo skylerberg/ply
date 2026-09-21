@@ -381,6 +381,8 @@ fn number(body: &[u8]) -> Result<usize, String> {
         .ok_or_else(|| format!("a number spelled `{}`", String::from_utf8_lossy(body)))
 }
 
+// `Value::Record` holds an `Arc`, and `Fields` is not `Send`; every construction site says so.
+#[allow(clippy::arc_with_non_send_sync)]
 fn record(fields: Vec<(&str, Value)>) -> Value {
     Value::Record(Arc::new(Fields::from_unsorted(
         fields
