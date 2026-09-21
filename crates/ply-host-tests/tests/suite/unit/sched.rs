@@ -1,8 +1,8 @@
 use ply_eval::sched::{HostPolicy, Scheduler};
 use ply_eval::sched::{Policy, Resumption, Turn};
 use ply_eval::sim::TASK_OPS;
-use ply_eval::{Continuation, HostRegistry, Pending, Prompt, Stack, TaskId, Value};
 use ply_eval::{HostBinding, HostRequest, HostRuntime, SimId};
+use ply_eval::{HostRegistry, Pending, TaskId, Value};
 use ply_host::sched::*;
 use ply_span::SourceId;
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -10,12 +10,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-type Sched = Scheduler<Continuation, Value>;
+type Sched = Scheduler<usize, Value>;
 
-/// No scheduler decision looks inside a continuation, so an empty segment stands in for a task.
-fn suspended() -> Continuation {
-    let prompt = std::rc::Rc::new(Prompt { span: Span::DUMMY });
-    Stack::new().push_prompt(prompt).capture(1, 0).0
+/// No scheduler decision looks inside a continuation, so a bare id stands in for a task.
+fn suspended() -> usize {
+    0
 }
 
 #[derive(Default)]

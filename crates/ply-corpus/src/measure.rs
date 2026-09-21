@@ -3,14 +3,12 @@
 use crate::pipeline::{Front, front};
 use anyhow::{Context, Result, bail};
 use ply_eval::arena::Slot;
-use ply_eval::cont::{Frame, Prompt, Stack};
 use ply_eval::{Fixture, Machine, Value};
 use ply_span::{SourceId, SourceMap, Span};
 use ply_ty::Footprint;
 use serde::Serialize;
 use std::hint::black_box;
 use std::path::Path;
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 fn best_of(repeats: usize, mut run: impl FnMut() -> Duration) -> Duration {
@@ -208,19 +206,8 @@ pub struct Resumptions {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct StackPoint {
-    pub pending_frames: usize,
-    pub segments: usize,
-    pub capture_nanos: f64,
-    pub resume_nanos: f64,
-    /// What `Continuation::frames` reports: the frames were pending and capture did not walk them.
-    pub captured_frames: usize,
-}
-
-#[derive(Clone, Debug, Serialize)]
 pub struct MultiShot {
     pub resumptions: Vec<Resumptions>,
-    pub stack: Vec<StackPoint>,
 }
 
 /// A handler resuming a fixed residual computation a varying number of times.
@@ -297,52 +284,7 @@ pub fn multi_shot(repeats: usize) -> Result<MultiShot> {
         });
     }
 
-    Ok(MultiShot {
-        resumptions: rows,
-        stack: stack_cost(repeats),
-    })
-}
-
-/// `Stack::capture` and `Stack::resume` against frames pending in the captured segment.
-pub fn stack_cost(repeats: usize) -> Vec<StackPoint> {
-    [8usize, 1_000, 100_000]
-        .into_iter()
-        .map(|pending| {
-            let mut stack = Stack::new().push_prompt(Rc::new(Prompt { span: Span::DUMMY }));
-            for _ in 0..pending {
-                stack = stack.push(Frame::Call {
-                    name: None,
-                    call_site: Span::DUMMY,
-                    memo: false,
-                });
-            }
-            let (k, below) = stack.capture(1, 0);
-
-            let iterations = 100_000;
-            let capture = best_of(repeats, || {
-                let started = Instant::now();
-                for _ in 0..iterations {
-                    black_box(black_box(&stack).capture(1, 0));
-                }
-                started.elapsed() / iterations
-            });
-            let splice = best_of(repeats, || {
-                let started = Instant::now();
-                for _ in 0..iterations {
-                    black_box(black_box(&below).resume(&k));
-                }
-                started.elapsed() / iterations
-            });
-
-            StackPoint {
-                pending_frames: pending,
-                segments: k.segments(),
-                capture_nanos: nanos(capture),
-                resume_nanos: nanos(splice),
-                captured_frames: k.frames(),
-            }
-        })
-        .collect()
+    Ok(MultiShot { resumptions: rows })
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -488,16 +430,6 @@ pub fn render(m: &Measurements) -> String {
             s.push_str(&format!(
                 "  {:>12} {:>12.2} {:>16.2}\n",
                 r.resumptions, r.micros, r.marginal_micros
-            ));
-        }
-        s.push_str(&format!(
-            "  {:>12} {:>10} {:>14} {:>14}\n",
-            "pending", "segments", "capture ns", "resume ns"
-        ));
-        for p in &ms.stack {
-            s.push_str(&format!(
-                "  {:>12} {:>10} {:>14.1} {:>14.1}\n",
-                p.pending_frames, p.segments, p.capture_nanos, p.resume_nanos
             ));
         }
         s.push('\n');

@@ -1,6 +1,5 @@
 use crate::arena::Slot;
 use crate::builtins::Builtin;
-use crate::cont::Continuation;
 use crate::limit::{self, MAX_VALUE_DEPTH, grow};
 use crate::sim::TaskId;
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -16,7 +15,6 @@ thread_local! {
 use std::cmp::Ordering;
 use std::fmt;
 use std::fmt::Write as _;
-use std::rc::Rc;
 use std::sync::Arc;
 
 pub use crate::list::List;
@@ -152,7 +150,6 @@ pub enum Value {
     /// An index and generation, so a cell of a closed region reads `None` instead of aliasing.
     Cell(Slot),
     Task(TaskId),
-    Continuation(Rc<Continuation>),
     /// A credential; a distinct variant rather than a `Ctor`, so no pattern match can unwrap it.
     Secret(Arc<Value>),
 }
@@ -321,7 +318,6 @@ impl Value {
             Value::Closure(_) => "function",
             Value::Cell(_) => "Cell",
             Value::Task(_) => "Task",
-            Value::Continuation(_) => "continuation",
             Value::Secret(_) => "Secret",
         }
     }
@@ -530,9 +526,6 @@ impl Value {
             Value::Task(id) => {
                 let _ = write!(out, "<task {id}>");
             }
-            Value::Continuation(k) => {
-                let _ = write!(out, "<continuation {} frames>", k.frames());
-            }
             // No recursion into the payload, so the redaction holds at any depth.
             Value::Secret(_) => out.push_str(SECRET_REDACTED),
         }
@@ -724,9 +717,8 @@ fn discriminant(v: &Value) -> u8 {
         Value::Closure(_) => 11,
         Value::Cell(_) => 12,
         Value::Task(_) => 13,
-        Value::Continuation(_) => 14,
-        Value::Secret(_) => 15,
-        Value::Fixed(_) => 16,
+        Value::Secret(_) => 14,
+        Value::Fixed(_) => 15,
     }
 }
 
@@ -761,8 +753,7 @@ impl Ord for Value {
             (Value::Task(x), Value::Task(y)) => x.cmp(y),
             // Unreachable from a well-typed program: a `Secret` has no order.
             (Value::Secret(x), Value::Secret(y)) => grow(|| x.cmp(y)),
-            (Value::Closure(_), Value::Closure(_))
-            | (Value::Continuation(_), Value::Continuation(_)) => Ordering::Equal,
+            (Value::Closure(_), Value::Closure(_)) => Ordering::Equal,
             _ => Ordering::Equal,
         }
     }
@@ -958,8 +949,7 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
                 (p, q) => equal_at(p, q, span, depth + 1),
             });
         }
-        (Value::Closure(_) | Value::Continuation(_), _)
-        | (_, Value::Closure(_) | Value::Continuation(_)) => {
+        (Value::Closure(_), _) | (_, Value::Closure(_)) => {
             return Err(Diagnostic::error(
                 codes::RUNTIME_ERROR,
                 "cannot compare functions for equality",

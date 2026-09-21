@@ -1,5 +1,5 @@
 use ply_corpus::build::generate;
-use ply_corpus::measure::{scheduling, stack_cost, throughput};
+use ply_corpus::measure::{scheduling, throughput};
 use ply_corpus::spec::CorpusSpec;
 use ply_corpus::write::write;
 use std::path::Path;
@@ -41,14 +41,6 @@ fn setup_is_reported_apart_from_evaluation() {
         t.pass.first_pass_millis,
         t.pass.steady_pass_millis
     );
-}
-
-#[test]
-fn capture_and_resume_are_flat_in_the_frames_they_move() {
-    let points = stack_cost(3);
-    let large = points.last().expect("a last row");
-    assert_eq!(large.captured_frames, 100_000);
-    assert_eq!(large.segments, 1);
 }
 
 #[test]
