@@ -1,0 +1,333 @@
+// `ply check` — the front end over a program, and as much of what it inferred as the flags ask
+// for. The summary line is the whole answer by default; `--types` prints every module's surface,
+// `--explain` says where the time went and where each row came from, and `--costs` says where an
+// append copies.
+
+import args (Flags, style_of)
+import appends (costs_of, promised, promises, report_lines, unresolved)
+import diagnostic (Place, all_to_json)
+import program (Program, Timed, ModuleFacts, timed_load, module_facts, published, is_shelved)
+import report (Answer, ok_code, count_of, ind, refused)
+import signature (SetLine, definition_lines, effect_sets, provenance, provenance_lines, set_lines)
+import style (Style, bold, dim, red, green, yellow)
+import compiler.costs (Report)
+import compiler.front (Whole, effect_sets_of)
+import compiler.infer (DefInfo, TestInfo, EffectInfo, OpInfo)
+import compiler.resolve (Diag)
+import compiler.tycore (Atom, Type, printer_new, print_atom_list, scheme_text, row_text, type_text,
+                        atom_text, append)
+import compiler.types (Mode, MRead, MWrite, MBad)
+import std.fs (fs)
+import std.json (Json, Member, Str, Bool, Number, Array, object)
+import std.time (time)
+
+// `ind()` plus the two spaces that put a definition under its module heading.
+fn types_indent() -> Int = 5
+
+fn under() -> String = ind() ++ "  "
+
+fn texts(bs: List<Bytes>) -> List<String> = map(bs, |b: Bytes| string_of_bytes_lossy(b))
+
+fn strs(ss: List<String>) -> List<Json> = map(ss, |s: String| Str(s))
+
+fn number(n: Int) -> Json = Number(decimal_of_int(n))
+
+fn spaces(n: Int) -> String = fold(range(0, n), "", |acc: String, i: Int| acc ++ " ")
+
+fn pad_left(s: String, n: Int) -> String =
+  if string_len(s) >= n { s } else { spaces(n - string_len(s)) ++ s }
+
+fn pad_right(s: String, n: Int) -> String =
+  if string_len(s) >= n { s } else { s ++ spaces(n - string_len(s)) }
+
+fn commas(xs: List<String>) -> String =
+  fold(range(0, len(xs)), "", |acc: String, i: Int|
+    match list_at(xs, i) { Some(x) -> if i == 0 { x } else { acc ++ ", " ++ x }, None -> acc })
+
+// As the reference prints a test's name: the bytes, with the ones that would close the quotes escaped.
+fn quoted(s: String) -> String = {
+  let b = bytes_of_string(s);
+  string_of_bytes_lossy(bytes_concat_all([b"\"",
+    bytes_concat_all(map(range(0, bytes_len(b)), |i: Int| {
+      let c = bytes_at(b, i);
+      if c == 34 { b"\\\"" } else if c == 92 { b"\\\\" } else if c == 10 { b"\\n" }
+      else if c == 13 { b"\\r" } else if c == 9 { b"\\t" } else { bytes_slice(b, i, i + 1) }
+    })), b"\""]))
+}
+
+fn mode_text(m: Mode) -> String = match m { MRead -> "read", MWrite -> "write", MBad -> "" }
+
+fn scheme_of(d: DefInfo) -> String = string_of_bytes_lossy(scheme_text(d.scheme))
+
+fn footprint_of(atoms: List<Atom>) -> String =
+  string_of_bytes_lossy(row_text({ atoms: atoms, tail: None }))
+
+fn atoms_of(atoms: List<Atom>) -> List<String> = texts(print_atom_list(printer_new(), atoms).ss)
+
+fn mine(name: String, defs: List<DefInfo>) -> List<DefInfo> =
+  filter(defs, |d: DefInfo| string_of_bytes_lossy(d.module) == name)
+
+// --- The warnings ----------------------------------------------------------------
+// Cache and scheduling trouble is one indented line each, not a full report.
+
+fn severity_label(s: Style, severity: Bytes) -> String =
+  if severity == b"error" { red(s, "error") }
+  else if severity == b"warning" { yellow(s, "warning") }
+  else { dim(s, "note") }
+
+fn warning_lines(s: Style, ds: List<Diag>) -> List<String> =
+  fold(ds, [], |acc: List<String>, d: Diag|
+    fold(d.notes_text, push(acc, ind() ++ severity_label(s, d.severity) ++ ": "
+                                 ++ string_of_bytes_lossy(d.message)),
+         |a: List<String>, n: Bytes| push(a, under() ++ dim(s, "=") ++ " " ++ string_of_bytes_lossy(n))))
+
+// --- Where the time went ----------------------------------------------------------
+// The clock the program reads counts whole milliseconds, so that is what a phase is reported in.
+
+type Phase = { label: String, ms: Int }
+
+fn share(ms: Int, total: Int) -> String = {
+  // Per mille is tenths of a percent, so one division answers both digits.
+  let tenths = if total == 0 { 0 } else { (ms * 1000) / total };
+  pad_left(int_to_string(tenths / 10) ++ "." ++ int_to_string(tenths % 10), 5) ++ "%"
+}
+
+fn phase_line(s: Style, p: Phase, total: Int) -> String =
+  under() ++ pad_right(p.label, 11) ++ " " ++ pad_left(int_to_string(p.ms), 8) ++ "ms "
+  ++ dim(s, share(p.ms, total))
+
+// Longest first, so what dominated a run is read first.
+fn ordered(a: Phase, b: Phase) -> List<Phase> = if b.ms > a.ms { [b, a] } else { [a, b] }
+
+fn phase_lines(s: Style, t: Timed) -> List<String> = {
+  let total = t.read_ms + t.front_ms;
+  let rows = ordered({ label: "read", ms: t.read_ms }, { label: "front", ms: t.front_ms });
+  append(append(["", ind() ++ bold(s, "front-end time")],
+                map(rows, |p: Phase| phase_line(s, p, total))),
+         [under() ++ pad_right("total", 11) ++ " " ++ pad_left(int_to_string(total), 8) ++ "ms"])
+}
+
+fn phases_json(t: Timed) -> Json =
+  object([{ key: "read", value: number(t.read_ms) },
+          { key: "front", value: number(t.front_ms) },
+          { key: "total", value: number(t.read_ms + t.front_ms) }])
+
+// --- `--types` ---------------------------------------------------------------------
+
+fn op_line(s: Style, o: OpInfo) -> String = {
+  let resource = if o.resource_param { "[r]" } else { "" };
+  ind() ++ "    " ++ dim(s, mode_text(o.mode)) ++ " " ++ string_of_bytes_lossy(o.name) ++ resource
+    ++ "(" ++ commas(map(o.params, |t: Type| string_of_bytes_lossy(type_text(t)))) ++ ") -> "
+    ++ string_of_bytes_lossy(type_text(o.ret))
+}
+
+fn effect_lines(s: Style, lines: List<String>, e: EffectInfo) -> List<String> = {
+  let marker = if e.nondet { "nondet effect" } else { "effect" };
+  let head = push(lines, under() ++ dim(s, marker) ++ " " ++ bold(s, string_of_bytes_lossy(e.simple_name)));
+  fold(e.ops, head, |acc: List<String>, o: OpInfo| push(acc, op_line(s, o)))
+}
+
+fn set_block(lines: List<String>, v: SetLine) -> List<String> =
+  fold(set_lines(v, types_indent()), push(lines, ""), |acc: List<String>, l: String| push(acc, under() ++ l))
+
+fn set_blocks(lines: List<String>, sets: List<SetLine>) -> List<String> = {
+  let blocks = fold(sets, lines, set_block);
+  if len(sets) == 0 { blocks } else { push(blocks, "") }
+}
+
+fn widest(defs: List<DefInfo>) -> Int =
+  fold(defs, 0, |acc: Int, d: DefInfo| {
+    let n = string_len(string_of_bytes_lossy(d.simple_name));
+    if n > acc { n } else { acc }
+  })
+
+fn def_block(s: Style, explain: Bool, width: Int, lines: List<String>, d: DefInfo) -> List<String> = {
+  let said = fold(definition_lines(types_indent(), width, string_of_bytes_lossy(d.simple_name), d.scheme),
+                  lines, |acc: List<String>, l: String| push(acc, under() ++ l));
+  if !explain { said } else {
+    fold(provenance_lines(provenance(d), types_indent()), said,
+         |acc: List<String>, l: String| push(acc, under() ++ dim(s, l)))
+  }
+}
+
+fn test_line(s: Style, x: TestInfo) -> String = {
+  let kind = if x.nondet { "test/nondet" } else { "test" };
+  under() ++ dim(s, kind) ++ " " ++ quoted(string_of_bytes_lossy(x.name)) ++ " : "
+    ++ dim(s, footprint_of(x.footprint))
+}
+
+fn module_block(s: Style, explain: Bool, w: Whole, defs: List<DefInfo>, lines: List<String>,
+                mo: ModuleFacts) -> List<String> = {
+  let head = fold(mo.imports, push(push(lines, ""), ind() ++ bold(s, mo.name) ++ " " ++ dim(s, mo.path)),
+                  |acc: List<String>, im: String| push(acc, under() ++ dim(s, "import") ++ " " ++ im));
+  let ours = mine(mo.name, defs);
+  let effected = fold(filter(w.checked.effects, |e: EffectInfo| string_of_bytes_lossy(e.module) == mo.name),
+                      head, |acc: List<String>, e: EffectInfo| effect_lines(s, acc, e));
+  let setted = if !explain { effected } else { set_blocks(effected, sets_of(w, mo, ours)) };
+  let width = widest(ours);
+  let defined = fold(ours, setted, |acc: List<String>, d: DefInfo| def_block(s, explain, width, acc, d));
+  fold(filter(w.checked.tests, |x: TestInfo| string_of_bytes_lossy(x.module) == mo.name), defined,
+       |acc: List<String>, x: TestInfo| push(acc, test_line(s, x)))
+}
+
+fn sets_of(w: Whole, mo: ModuleFacts, defs: List<DefInfo>) -> List<SetLine> =
+  match list_at(w.mods, mo.index) {
+    None -> [],
+    Some(m) -> effect_sets(effect_sets_of(w.r, w.checked.effects, mo.index, m), defs),
+  }
+
+fn type_lines(s: Style, explain: Bool, w: Whole, views: List<ModuleFacts>, defs: List<DefInfo>) -> List<String> =
+  fold(views, [], |acc: List<String>, mo: ModuleFacts| module_block(s, explain, w, defs, acc, mo))
+
+// --- The JSON document ---------------------------------------------------------------
+
+fn set_json(v: SetLine) -> Json =
+  object([{ key: "name", value: Str(v.name) },
+          { key: "expansion", value: Array(strs(v.atoms)) },
+          { key: "used_by", value: number(v.used_by) }])
+
+fn module_json(explain: Bool, w: Whole, defs: List<DefInfo>, mo: ModuleFacts) -> Json = {
+  let named: List<Member> =
+    [{ key: "name", value: Str(mo.name) },
+     { key: "file", value: Str(mo.path) },
+     { key: "imports", value: Array(strs(mo.imports)) },
+     { key: "items", value: Array(strs(mo.items)) }];
+  let fields: List<Member> =
+    if !explain { named }
+    else {
+      push(named, { key: "effect_sets",
+                    value: Array(map(sets_of(w, mo, mine(mo.name, defs)), set_json)) })
+    };
+  object(fields)
+}
+
+fn provenance_fields(d: DefInfo) -> List<Member> =
+  [{ key: "written_as", value: Array(strs(texts(d.row_aliases))) },
+   { key: "performed", value: Array(strs(map(d.performed, |a: Atom| string_of_bytes_lossy(atom_text(a))))) },
+   { key: "declared_not_performed", value: Array(strs(provenance(d).unperformed)) }]
+
+fn definition_json(explain: Bool, d: DefInfo) -> Json = {
+  let named: List<Member> =
+    [{ key: "name", value: Str(string_of_bytes_lossy(d.name)) },
+     { key: "module", value: Str(string_of_bytes_lossy(d.module)) },
+     { key: "simple_name", value: Str(string_of_bytes_lossy(d.simple_name)) },
+     { key: "type", value: Str(scheme_of(d)) },
+     { key: "footprint", value: Str(footprint_of(d.footprint)) },
+     { key: "atoms", value: Array(strs(atoms_of(d.footprint))) }];
+  let fields: List<Member> =
+    if !explain { named }
+    else { fold(provenance_fields(d), named, |acc: List<Member>, f: Member| push(acc, f)) };
+  object(fields)
+}
+
+fn test_json(x: TestInfo) -> Json =
+  object([{ key: "index", value: number(x.index) },
+          { key: "key", value: Str(string_of_bytes_lossy(x.key)) },
+          { key: "name", value: Str(string_of_bytes_lossy(x.name)) },
+          { key: "module", value: Str(string_of_bytes_lossy(x.module)) },
+          { key: "nondet", value: Bool(x.nondet) },
+          { key: "footprint", value: Str(footprint_of(x.footprint)) }])
+
+fn op_json(o: OpInfo) -> Json =
+  object([{ key: "name", value: Str(string_of_bytes_lossy(o.name)) },
+          { key: "mode", value: Str(mode_text(o.mode)) },
+          { key: "resource_param", value: Bool(o.resource_param) },
+          { key: "params", value: Array(strs(map(o.params, |t: Type| string_of_bytes_lossy(type_text(t))))) },
+          { key: "returns", value: Str(string_of_bytes_lossy(type_text(o.ret))) }])
+
+fn effect_json(e: EffectInfo) -> Json =
+  object([{ key: "name", value: Str(string_of_bytes_lossy(e.name)) },
+          { key: "module", value: Str(string_of_bytes_lossy(e.module)) },
+          { key: "simple_name", value: Str(string_of_bytes_lossy(e.simple_name)) },
+          { key: "nondet", value: Bool(e.nondet) },
+          { key: "operations", value: Array(map(e.ops, op_json)) }])
+
+fn document(flags: Flags, t: Timed, w: Whole, views: List<ModuleFacts>, defs: List<DefInfo>,
+            warnings: List<Diag>) -> Json = {
+  let p: Program = t.program;
+  object([{ key: "command", value: Str("check") },
+          { key: "ok", value: Bool(true) },
+          { key: "exit_code", value: number(ok_code()) },
+          { key: "root", value: Str(flags.root) },
+          { key: "files", value: Array(strs(map(p.places, |place: Place| place.path))) },
+          { key: "modules", value: Array(map(views, |mo: ModuleFacts| module_json(flags.explain, w, defs, mo))) },
+          { key: "definitions", value: Array(map(defs, |d: DefInfo| definition_json(flags.explain, d))) },
+          { key: "tests", value: Array(map(w.checked.tests, test_json)) },
+          { key: "effects", value: Array(map(w.checked.effects, effect_json)) },
+          { key: "front_end", value: object([{ key: "phases", value: phases_json(t) }]) },
+          { key: "diagnostics", value: all_to_json(warnings, p.places) }])
+}
+
+// --- The answer -----------------------------------------------------------------------
+
+fn summary(s: Style, w: Whole, defs: List<DefInfo>) -> String =
+  ind() ++ green(s, "checked") ++ " " ++ count_of(len(w.mods), "module") ++ ", "
+  ++ count_of(len(defs), "definition") ++ ", " ++ count_of(len(w.checked.tests), "test")
+
+fn costed(s: Style, flags: Flags, places: List<Place>, r: Report, lines: List<String>) -> List<String> =
+  if !flags.costs { lines } else { append(lines, report_lines(s, places, r)) }
+
+fn answered(s: Style, flags: Flags, t: Timed, w: Whole, r: Report, warnings: List<Diag>) -> Answer = {
+  let views = module_facts(t.program, w);
+  let defs = published(w);
+  let head = append([summary(s, w, defs)], warning_lines(s, warnings));
+  let explained = if flags.explain { append(head, phase_lines(s, t)) } else { head };
+  let typed = if flags.types { append(explained, type_lines(s, flags.explain, w, views, defs)) } else { explained };
+  { json: document(flags, t, w, views, defs, warnings),
+    lines: costed(s, flags, t.program.places, r, typed),
+    errs: [],
+    code: ok_code() }
+}
+
+// The cost pass answers both `--costs` and the `reuse fn` promise, and runs at most once.
+fn checked(s: Style, flags: Flags, t: Timed, w: Whole) -> Answer = {
+  let kept = promised(w);
+  let asked = kept || flags.costs;
+  let nothing: Report = { ok: true, rounds: 0, defs: [] };
+  let r: Report = if asked { costs_of(t.program, w) } else { nothing };
+  let broken = if !r.ok { [unresolved()] } else if kept { promises(r) } else { [] };
+  if len(broken) > 0 { refused(s, "check", broken, t.program.places) }
+  else { answered(s, flags, t, w, r, filter(t.program.diags, |d: Diag| !is_shelved(t.program, d))) }
+}
+
+pub fn run(flags: Flags) -> Answer
+  / {fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.list_dir[shelf], fs.read_file[shelf],
+     time.elapsed_ms} = {
+  let t: Timed = timed_load(flags.paths);
+  match t.program.whole {
+    None -> refused(style_of(flags), "check", t.program.diags, t.program.places),
+    Some(w) -> checked(style_of(flags), flags, t, w),
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn plain() -> Style = { styled: false }
+
+test "a share is a tenth of a percent, and a run that took no time at all is not a division" {
+  assert_eq(share(984, 1000), " 98.4%");
+  assert_eq(share(1, 1000), "  0.1%");
+  assert_eq(share(0, 0), "  0.0%")
+}
+
+test "the longest phase is printed first, and the total accounts for both" {
+  let lines = phase_lines(plain(), { program: { files: [], places: [], diags: [], whole: None },
+                                     read_ms: 2, front_ms: 98 });
+  assert_eq(lines, ["",
+                    "   front-end time",
+                    "     front             98ms  98.0%",
+                    "     read               2ms   2.0%",
+                    "     total            100ms"])
+}
+
+test "a test name is printed as the reference prints it, with the quotes escaped" {
+  assert_eq(quoted("two is two"), "\"two is two\"");
+  assert_eq(quoted("a \"quoted\" name"), "\"a \\\"quoted\\\" name\"")
+}
+
+test "a warning is one indented line, and each note one under it" {
+  let d: Diag = { code: b"W0611", notes: 1, labels: [], text: b"", message: b"fn `m.dead` is never used",
+                  notes_text: [b"delete it or export it"], severity: b"warning", fixes: [] };
+  assert_eq(warning_lines(plain(), [d]),
+            ["   warning: fn `m.dead` is never used", "     = delete it or export it"])
+}

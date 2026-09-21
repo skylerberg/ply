@@ -34,6 +34,9 @@ pub const CODE: &str = include_str!("../ply/code.ply");
 
 pub const COSTS: &str = include_str!("../ply/costs.ply");
 
+/// The `.plyx` container: the header, the section table, and what a program digest covers.
+pub const PLYX: &str = include_str!("../ply/plyx.ply");
+
 pub const EMIT: &str = include_str!("../ply/emit.ply");
 
 /// `ply fmt`: the tree printed back as source.
@@ -54,6 +57,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("items", ITEMS),
     ("lexer", LEXER),
     ("patterns", PATTERNS),
+    ("plyx", PLYX),
     ("resolve", RESOLVE),
     ("rewrite", REWRITE),
     ("spine", SPINE),
