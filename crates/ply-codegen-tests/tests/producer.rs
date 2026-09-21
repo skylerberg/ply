@@ -1035,8 +1035,8 @@ fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
 }
 
 /// The standard library as a program of its own, and the definitions nothing in it reaches. The
-/// emitter's program is the compiler's modules alone, so this is where the standard library is
-/// checked, and by the compiler these sources build rather than the one the bundle carries.
+/// emitter's program now carries only the shipped modules the compiler imports, so this is where
+/// the rest is checked, and by the compiler these sources build rather than the bundle's.
 fn standard_library() -> (&'static Source, Vec<String>) {
     let modules: Vec<(String, String)> = ply_std::sources()
         .map(|(name, text)| (name.to_string(), text.to_string()))
@@ -1085,11 +1085,47 @@ fn the_emitter_refuses_no_body_or_test_of_the_standard_library() {
     );
 }
 
-/// The compiler carries its own BLAKE3 so its program is its modules alone; the two copies are
-/// only safe while they answer alike, on the published vectors and either side of every boundary
-/// a transcription goes wrong at: a block, a chunk, and the tree a second chunk opens.
+/// The emitter's program is closed by reading import lines in Rust, because its identity has to be
+/// known before any compiler runs: `build` needs it to choose between the committed bundle, a
+/// stage and emitting one. The front end reads the same imports when it pulls a user program's
+/// shelf, and that is the definition; this holds the Rust reading to it.
 #[test]
-fn the_compilers_blake3_and_the_standard_librarys_answer_alike() {
+fn the_emitters_program_is_the_one_the_front_end_pulls() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
+    let own: Vec<(String, String)> = ply_compiler::sources()
+        .map(|(name, text)| (name.to_string(), text.to_string()))
+        .collect();
+    let shelf: Vec<(String, String)> = ply_std::sources()
+        .map(|(name, text)| (name.to_string(), text.to_string()))
+        .collect();
+    let pulled = producer::front_pulling_std(&own, &shelf).expect("the front end pulls the shelf");
+    let program = producer::modules_of(&Sources::Embedded);
+    let mut ours: Vec<&str> = program
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .filter(|name| ply_std::is_reserved(name))
+        .collect();
+    ours.sort_unstable();
+    let mut theirs: Vec<&str> = pulled.modules.iter().map(String::as_str).collect();
+    theirs.sort_unstable();
+    assert_eq!(
+        ours, theirs,
+        "the shipped modules the emitter's program carries are not the ones the front end pulls \
+         for it"
+    );
+    assert_eq!(
+        program.len(),
+        own.len() + theirs.len(),
+        "the emitter's program is its own modules and the ones they import, and nothing else"
+    );
+}
+
+/// `std.hash` is the one shipped module the compiler imports, so it is the one the bundle's
+/// identity and every cache key still cover; the reference implementation says whether it is
+/// BLAKE3, over the published vectors and either side of a block, a chunk and a two-chunk tree.
+#[test]
+fn the_shipped_blake3_is_blake3() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
     let loaded = load(&[("std.hash", ply_std::HASH)]);
@@ -1103,31 +1139,26 @@ fn the_compilers_blake3_and_the_standard_librarys_answer_alike() {
     let entry = native
         .entry("std.hash.blake3")
         .expect("`std.hash.blake3` was not compiled");
-    let shipped = |input: &[u8]| -> Value {
-        let mut ctx = native.context();
-        ctx.begin(i64::MAX / 2);
-        let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
-        let words: [i64; 1] = [ctx.heap.to_word(unsafe { &*layouts }, &Value::bytes(input))];
-        let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
-        assert_eq!(ctx.failed, 0, "`std.hash.blake3` raised in the C tier");
-        let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
-        ctx.end();
-        got
-    };
     // `b""` and `b"\x00"` are the first two published vectors; the rest bracket 64 and 1024.
     for length in [0usize, 1, 2, 63, 64, 65, 127, 1023, 1024, 1025, 2048, 2049] {
         let input: Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
-        let ours = producer::call("blake3.blake3", &[Value::bytes(&input)])
-            .expect("the compiler's `blake3` answers");
+        let mut ctx = native.context();
+        ctx.begin(i64::MAX / 2);
+        let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
+        let words: [i64; 1] = [ctx
+            .heap
+            .to_word(unsafe { &*layouts }, &Value::bytes(&input))];
+        let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
         assert_eq!(
-            ours,
-            shipped(&input),
-            "the compiler's `blake3` and `std.hash.blake3` disagree over {length} bytes"
+            ctx.failed, 0,
+            "`std.hash.blake3` raised over {length} bytes"
         );
+        let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
+        ctx.end();
         assert_eq!(
-            ours,
+            got,
             Value::bytes(blake3::hash(&input).as_bytes()),
-            "the compiler's `blake3` is not BLAKE3 over {length} bytes"
+            "`std.hash.blake3` is not BLAKE3 over {length} bytes"
         );
     }
 }

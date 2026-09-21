@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use ply_eval::{Fields, Value};
 use ply_span::frames::Cursor;
 use ply_span::{Diagnostic, Severity, SourceId, Symbol, codes};
-use ply_ty::{DefHash, Front, Scheme, parse_scheme, read_front};
+use ply_ty::{DefHash, Front, ModuleName, Scheme, parse_scheme, read_front};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -17,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 pub type Recipe = Arc<dyn Fn() -> Result<PlyProducer, String> + Send + Sync>;
 
 static RECIPE: OnceLock<Recipe> = OnceLock::new();
-/// A digest of the emitter's own sources, folded into every cache key.
+/// A digest of the emitter's program, folded into every cache key.
 static IDENTITY: OnceLock<String> = OnceLock::new();
 /// What the emitter's answers depend on besides its input: the serving units and helper table.
 static EMITTER: OnceLock<String> = OnceLock::new();
@@ -85,9 +85,51 @@ fn emitter_of(identity: &str) -> String {
     h.finalize().to_hex().to_string()
 }
 
-/// The emitter's own modules, and nothing else; a directory is sorted like the embedded list.
-fn modules_of(src: &Sources) -> Vec<(String, String)> {
-    match src {
+/// The module path each `import` line of `text` opens with. Read here rather than asked of the
+/// front end: the identity has to exist before there is a compiler to ask for it.
+fn imports_of(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("import "))
+        .map(|rest| {
+            rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                .next()
+                .unwrap_or("")
+        })
+        .collect()
+}
+
+/// The shipped modules `own` imports, transitively, in [`ply_std::sources`]' order. A reserved
+/// name nothing ships is left out for the front end to report where it is written.
+fn shipped_closure(own: &[(String, String)]) -> Vec<(String, String)> {
+    let mut wanted: HashSet<String> = HashSet::new();
+    let mut frontier: Vec<String> = own
+        .iter()
+        .flat_map(|(_, text)| imports_of(text))
+        .map(str::to_string)
+        .collect();
+    while let Some(name) = frontier.pop() {
+        if !ply_std::is_reserved(&name) {
+            continue;
+        }
+        let Some(text) = ply_std::source(&ModuleName::from_dotted(&name)) else {
+            continue;
+        };
+        if wanted.insert(name) {
+            frontier.extend(imports_of(text).into_iter().map(str::to_string));
+        }
+    }
+    ply_std::sources()
+        .filter(|(name, _)| wanted.contains(*name))
+        .map(|(name, text)| (name.to_string(), text.to_string()))
+        .collect()
+}
+
+/// The emitter's program: its own modules, then the shipped modules they import, transitively and
+/// placed after them, as the front end places the ones it pulls for a user program. A shipped
+/// module nothing here imports is in neither the identity, the bundle nor a cache key. A directory
+/// is sorted like the embedded list.
+pub fn modules_of(src: &Sources) -> Vec<(String, String)> {
+    let mut program: Vec<(String, String)> = match src {
         Sources::Embedded => ply_compiler::sources()
             .map(|(m, t)| (m.to_string(), t.to_string()))
             .collect(),
@@ -112,7 +154,10 @@ fn modules_of(src: &Sources) -> Vec<(String, String)> {
             found.sort();
             found
         }
-    }
+    };
+    let shipped = shipped_closure(&program);
+    program.extend(shipped);
+    program
 }
 
 /// The emitter for `src`: the committed bundle when it was emitted from these very sources, else
