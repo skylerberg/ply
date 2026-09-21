@@ -120,6 +120,60 @@ pub fn shaped(n: Int) -> Int = { let r = {x: n, y: n + 1}; r.x * 10 + r.y }
     let _ = loaded;
 }
 
+/// A frame that would cross the floor gets a stack of its own, so how deep a program nests is
+/// what its fuel says and not what the thread it runs on happens to have been given. The floor is
+/// moved up to just under this frame, so the guard fires on any machine rather than on a lucky one.
+#[test]
+fn a_recursion_past_what_the_stack_holds_grows_onto_another_and_answers() {
+    const LADDER: &str = "fn ladder(n: Int) -> Int = if n <= 0 { 0 } else { 1 + ladder(n - 1) }";
+    const DEEP: i64 = 20_000;
+    let Some((_loaded, native)) = tests_support::unit(LADDER) else {
+        return;
+    };
+    let entry: ply_codegen::rt::Entry = native.entry("m.ladder").expect("`m.ladder` compiled");
+    let mut ctx = native.context();
+    ctx.begin(DEEP * 2);
+    let here = 0u8;
+    ctx.stack_floor = std::ptr::from_ref(&here) as usize - 64 * 1024;
+    let args = [ply_codegen::heap::imm(DEEP)];
+    let answer = unsafe { entry(&mut ctx, args.as_ptr()) };
+    let (failed, grown) = (ctx.failed, ctx.grown);
+    let raised = ctx.take_failure().map(|d| d.message);
+    let value = ply_codegen::heap::imm_value(answer);
+    ctx.end();
+    assert_eq!(failed, 0, "`m.ladder({DEEP})` raised: {raised:?}");
+    assert_eq!(value, DEEP);
+    assert!(
+        grown > 0,
+        "the call never crossed the floor, so nothing grew"
+    );
+}
+
+/// Growing is not a licence to recurse for ever: the fuel is the bound, and it is what fires.
+#[test]
+fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
+    const SPIN: &str = "fn spin(n: Int) -> Int = 1 + spin(n + 1)";
+    let Some((_loaded, native)) = tests_support::unit(SPIN) else {
+        return;
+    };
+    let entry: ply_codegen::rt::Entry = native.entry("m.spin").expect("`m.spin` compiled");
+    let mut ctx = native.context();
+    ctx.begin(10_000);
+    let here = 0u8;
+    ctx.stack_floor = std::ptr::from_ref(&here) as usize - 64 * 1024;
+    let args = [ply_codegen::heap::imm(0)];
+    let _ = unsafe { entry(&mut ctx, args.as_ptr()) };
+    let failed = ctx.failed;
+    let raised = ctx.take_failure().map(|d| d.message).unwrap_or_default();
+    ctx.end();
+    assert_eq!(
+        failed,
+        ply_codegen::rt::FAILED_OUT_OF_FUEL,
+        "a runaway recursion ended some other way: {raised}"
+    );
+    assert!(raised.contains("bound on nested calls"), "{raised}");
+}
+
 /// `PLY_C_CACHE`, `PLY_C_SKIP` and `cache::UNITS_REUSED` are process-wide: a test that changes or counts them takes this for writing, every other build for reading.
 static CONFIG: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
@@ -520,6 +574,12 @@ pub fn alone(n: Int) -> Int = twice(n)
         refused.iter().any(|r| r.function == "m.both"),
         "`m.both` calls a definition this build was not offered: {refused:?}"
     );
+    // The knob keeps working because the callee it took away is what excuses the refusal: offer
+    // that callee and the same refusal is a build error.
+    assert!(
+        !ply_codegen::c::fatal_refusals(&all, &refused).is_empty(),
+        "a refusal the offer did not cause would have been raised: {refused:?}"
+    );
     assert_eq!(answer(&narrowed, "m.alone", 5), Some(10));
     drop(narrowed);
 
@@ -538,6 +598,86 @@ pub fn alone(n: Int) -> Int = twice(n)
             None => std::env::remove_var("PLY_C_CACHE"),
         }
     }
+}
+
+/// A refusal that survives the fixpoint is a definition nothing can ever enter, so it fails the
+/// build — unless a narrowed offer took its callee out from under it, which is what the debugging
+/// knobs do, transitively.
+#[test]
+fn a_refusal_the_offer_did_not_cause_is_what_fails_the_build() {
+    let refusal = |function: &str, construct: &str, missing: Option<&str>| ply_codegen::Refused {
+        function: function.to_string(),
+        construct: construct.to_string(),
+        missing: missing.map(str::to_string),
+    };
+    let refusals = [
+        refusal(
+            "m.lost_a_callee",
+            "`m.never_offered`, which is not in this compiled unit",
+            Some("m.never_offered"),
+        ),
+        refusal(
+            "m.lost_that_one",
+            "`m.lost_a_callee`, which is not in this compiled unit",
+            Some("m.lost_a_callee"),
+        ),
+        refusal(
+            "m.uncompilable",
+            "a construct this port does not emit",
+            None,
+        ),
+        refusal(
+            "m.calls_it",
+            "`m.uncompilable`, which is not in this compiled unit",
+            Some("m.uncompilable"),
+        ),
+    ];
+    let offered = [
+        "m.lost_a_callee",
+        "m.lost_that_one",
+        "m.uncompilable",
+        "m.calls_it",
+    ];
+    let fatal: Vec<&str> = ply_codegen::c::fatal_refusals(&offered, &refusals)
+        .iter()
+        .map(|r| r.function.as_str())
+        .collect();
+    assert_eq!(fatal, ["m.uncompilable", "m.calls_it"]);
+    // Offer the callee the first two lost and nothing is excused any more.
+    let whole = ["m.never_offered"]
+        .into_iter()
+        .chain(offered)
+        .collect::<Vec<&str>>();
+    assert_eq!(ply_codegen::c::fatal_refusals(&whole, &refusals).len(), 4);
+}
+
+/// The failure is reported where the program is built, against the definition's own place, so
+/// nothing is left for the entry that would find no body.
+#[test]
+fn the_build_error_names_each_refused_definition_and_where_it_sits() {
+    let Some(loaded) = tests_support::keyed("pub fn one() -> Int = 1\n") else {
+        return;
+    };
+    let refusals = [ply_codegen::Refused {
+        function: "m.one".to_string(),
+        construct: "a construct this port does not emit".to_string(),
+        missing: None,
+    }];
+    let borrowed: Vec<&ply_codegen::Refused> = refusals.iter().collect();
+    let diagnostic = ply_codegen::c::Refusals::over(loaded, &borrowed).into_diagnostic();
+    assert_eq!(diagnostic.code, ply_span::codes::DEFINITION_REFUSED);
+    let label = diagnostic.labels.first().expect("the refusal is placed");
+    assert!(label.primary);
+    assert_eq!(label.message, "a construct this port does not emit");
+    assert_eq!(Some(label.span), loaded.span_of("m.one"));
+    assert!(
+        diagnostic
+            .notes
+            .iter()
+            .any(|n| n.contains("`m.one` (a construct this port does not emit)")),
+        "{:?}",
+        diagnostic.notes
+    );
 }
 
 /// Shape ids are baked into the C, so a unit read back must intern them in recorded order; the nonce makes the first build a miss.

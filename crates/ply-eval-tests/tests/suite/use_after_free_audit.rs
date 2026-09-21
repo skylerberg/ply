@@ -111,11 +111,10 @@ fn a_cell_round_tripped_through_a_type_alias_keeps_its_brand() {
 
 #[test]
 fn a_region_in_a_law_body_reports_its_escape() {
-    let diags = refused(
-        r#"law "leak" forall (n: Int) { with_region[r] { with_cell[r](n) { c -> c } } == 0 }"#,
-    );
+    let diags = refused(r#"law "leak" forall (n: Int) { with_cell[r](n) { c -> c } == 0 }"#);
     assert!(
-        diags.iter().any(|d| d.code == codes::REGION_ESCAPE),
+        diags.iter().any(|d| d.code == codes::TYPE_MISMATCH
+            && d.message.contains("escapes its `with_cell[r]` region")),
         "a law's region escaped unchecked: {:?}",
         codes_of(&diags)
     );
@@ -161,35 +160,18 @@ pub fn guarded() -> Int =
 
 /// [`Arena::close`] never reads the region's kind.
 #[test]
-fn what_a_close_reclaims_is_decided_by_the_pin_and_never_by_the_kind() {
+fn what_a_close_reclaims_is_decided_by_the_extent_and_never_by_the_kind() {
     for kind in [RegionKind::Unique, RegionKind::Shared] {
-        for hold in [false, true] {
-            let mut arena = Arena::new();
-            let region = arena.open(kind, Span::DUMMY);
-            let cell = arena.alloc(Value::Int(1)).expect("the region is open");
-            let pin = arena.pin().expect("a region is open");
-            if !hold {
-                drop(pin);
-            }
+        let mut arena = Arena::new();
+        let region = arena.open(kind, Span::DUMMY);
+        let cell = arena.alloc(Value::Int(1)).expect("the region is open");
 
-            let reclaimed = arena.close(region);
-
-            if hold {
-                assert_eq!(
-                    reclaimed,
-                    Reclaim::Retained(1),
-                    "{kind}: a live continuation's claim was ignored because of the kind"
-                );
-                assert_eq!(arena.get(cell), Some(&Value::Int(1)));
-            } else {
-                assert_eq!(
-                    reclaimed,
-                    Reclaim::Freed(1),
-                    "{kind}: nothing can reach these slots and they were kept anyway"
-                );
-                assert_eq!(arena.get(cell), None);
-            }
-        }
+        assert_eq!(
+            arena.close(region),
+            Reclaim::Freed(1),
+            "{kind}: nothing can reach these slots and they were kept anyway"
+        );
+        assert_eq!(arena.get(cell), None, "{kind}");
     }
 }
 

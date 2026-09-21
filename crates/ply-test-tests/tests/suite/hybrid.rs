@@ -117,7 +117,11 @@ fn passed(before: &Compiled, key: &str) -> (TempRoot, Store) {
         if let Some(hash) = before.hashes.defs.get(name) {
             store.put_def(
                 *hash,
-                CachedDef::new(info.scheme.clone(), info.footprint.clone()),
+                CachedDef::new(
+                    info.scheme.clone(),
+                    info.footprint.clone(),
+                    info.performed.clone(),
+                ),
             );
         }
     }

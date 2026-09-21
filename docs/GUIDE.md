@@ -74,7 +74,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `where`, `derivable` | after a signature's row, or after a law's binders |
 | `requires`, `ensures` | between a `fn` header and its body |
 | `resume`, `return` | in a handler clause (§6.5, §6.6) |
-| `with_cell`, `with_region` | before `[` |
+| `with_cell` | before `[` |
 | `simulate` | before `{` where an expression can start |
 
 ### 2.3 Literals
@@ -110,7 +110,7 @@ Loosest to tightest; all binary operators are left-associative:
 | 5 | `^` | integer |
 | 6 | `&` | integer |
 | 7 | `<<` `>>` `>>>` | integer; the count is `Int` |
-| 8 | `++` | `String` |
+| 8 | `++` | `String` or `Bytes` |
 | 9 | `+` `-` | numeric |
 | 10 | `*` `/` `%` | numeric |
 | — | prefix `-` `!` `~` | numeric / `Bool` / integer |
@@ -127,7 +127,9 @@ Loosest to tightest; all binary operators are left-associative:
 * `&&`/`||` short-circuit. `&` `|` `^` `~` are integer-only and act at the
   type's own width (`~0u8` is `255u8`). `>>` is arithmetic, `>>>` logical.
   Shifts are adjacent `<`/`>` tokens, so `Map<Int, List<Int>>` still closes.
-* `++` concatenates `String`s only.
+* `++` joins two `String`s or two `Bytes`, answering their type. One of each
+  is `E0201`; there is no coercion, so cross with `bytes_of_string` or
+  `string_of_bytes`. An operand nothing determines is `E0210`.
 * `::` qualifies through a module binder (`items::price_of`) and does not chain.
 * `?` binds tightest: `f(x)?.field` is `(f(x)?).field`. There is no `?:`.
 
@@ -196,8 +198,8 @@ signatures are checked, not inferred (§4.7).
 
 There is no numeric tower. An operator's operand type is settled from the whole
 definition, so `fn h(a: U32) -> U32 = a + 1u32` checks and `a + 1` does not. An
-operand nothing determines, as in `let g = |a, b| a + b;`, is `E0210`; there is
-no default. Conversions are explicit builtins (§12.3). `u32_of_int` and its
+operand nothing determines, as in `let g = |a, b| a + b;`, is `E0210` — the same
+code a `++` that says neither `String` nor `Bytes` raises; there is no default. Conversions are explicit builtins (§12.3). `u32_of_int` and its
 siblings raise when the value does not fit (mask to truncate:
 `u8_of_int(n & 0xFF)`); two fixed widths convert through `Int`.
 `string_of_bytes` raises on invalid UTF-8.
@@ -325,7 +327,7 @@ Everything is an expression, including `if`, `match`, `handle` and blocks.
 A block `{ statements... tail }` has its tail's value, or `Unit` with no tail.
 `let <pattern> [: Type] = <expr>;` binds once (the `;` is required) and may
 shadow. An expression statement needs `;` unless it is the tail or block-like
-(`if`, `match`, `handle`, a block, `with_cell`, `with_region`, `simulate`).
+(`if`, `match`, `handle`, a block, `with_cell`, `simulate`).
 
 A `let` pattern can take apart a record, which is how a function returns several
 values:
@@ -395,13 +397,12 @@ and no method syntax.
 
 ### 5.5 Record update
 
-`{..base, deep: {..base.deep, a: 7}}` copies `base` with fields replaced. It
-expands to a record literal. The base is a variable, a field path, or a call of
-a `fn` declared in this file with a written return type (the call runs once).
-Its shape must be readable from this file's own `type` items and written types
-(`E0116` otherwise); a `let` without a written type takes the written type of
-its value when that is such a variable, path, call or update. A field the base
-lacks is `E0117`.
+`{..base, deep: {..base.deep, a: 7}}` copies `base` with the written fields
+replaced, answering a record of the base's field names. The base is a variable,
+a field path, or one call (the call runs once); its fields come from the type
+the checker infers for it, wherever that type was declared — another module's
+`type` included. A base whose type nothing in the program determines is
+`E0116`, and so is one that is not a record. A field the base lacks is `E0117`.
 
 ### 5.6 Lists
 
@@ -474,7 +475,7 @@ it and the function's result and everything evaluated before it is pure:
 `let x = e?;`, or `parse_or_more(parse_and(ts)?)`.
 
 * It converts no errors: `Result<_, E1>` inside `-> Result<_, E2>` is `E0201`.
-* `E0118`: inside a `handle`, `with_cell`, `with_region` or `simulate`; inside a
+* `E0118`: inside a `handle`, `with_cell` or `simulate`; inside a
   lambda without a written return type; or where `Ok`/`Err`/`Some`/`None` are
   rebound. A lambda with a written return type exits the lambda.
 * `E0119`: in an `if` branch, `match` arm or right of `&&` not in return
@@ -608,18 +609,17 @@ reached the host boundary with nothing bound — pass `--host` or handle it
 
 ```ply
 fn counted(n: Int) -> Int =
-  with_region[work] {
-    with_cell[work](0) { c -> {
-      cell_set(c, cell_get(c) + n);
-      cell_get(c)
-    } }
-  }
+  with_cell[work](0) { c -> {
+    cell_set(c, cell_get(c) + n);
+    cell_get(c)
+  } }
 ```
 
-`with_cell[r](init) { c -> body }` allocates a cell for the duration of `body`.
-`cell_get`, `cell_set` and `cell_update` are builtins whose atoms never leave
-the region. `with_region[r] { body }` opens an allocation scope that a
-`with_cell[r]` inside it allocates into. Nest `with_cell`s for several cells.
+`with_cell[r](init) { c -> body }` allocates a cell for the duration of `body`,
+in an allocation scope named `r` that closes at the body's `}`. `cell_get`,
+`cell_set` and `cell_update` are builtins whose atoms never leave the region.
+Nest `with_cell`s for several cells; reusing the name allocates into the region
+already open.
 
 The scheduler that runs a spawned task must be younger than the region whose
 cell the task is handed: open it inside the region,
@@ -629,10 +629,10 @@ cell the task is handed: open it inside the region,
 nobody joined after the region's `}`, and a `task.join` inside the region does
 not license it, because no type records the join.
 
-* `E0446`: a region-branded value outlives the region (returned, stored in an
-  older binding, captured by an escaping closure, put in a declared type, or
-  handed to a `task.spawn` whose scheduler is older than the region).
-* `E0447`: two regions in scope under one name.
+* `E0201`: the cell escapes its `with_cell[r]` region.
+* `E0446`: a region-branded value outlives the region (stored in an older
+  binding, handed to an operation, put in a declared type, or handed to a
+  `task.spawn` whose scheduler is older than the region).
 * `E0449`: a region handle reaches a host operation, a host answer or an entry
   point's argument (at run time).
 * `W0610`: a reference cycle; cycles are never freed.
@@ -698,6 +698,12 @@ only evaluator. Its passes share the evaluator's cache.
 `--profile development` (default; fastest compiler) or `release`
 (`cc -O2`) requires `--backend`.
 
+A definition the backend cannot compile is `E0448`, raised where the program is
+built and naming the construct that refused it, since nothing could ever enter
+that body. `PLY_C_ONLY`/`PLY_C_SKIP` below ask for a partial unit on purpose,
+and a definition dropped because one of those took its callee away is reported
+rather than raised.
+
 | variable | effect |
 | --- | --- |
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
@@ -706,14 +712,13 @@ only evaluator. Its passes share the evaluator's cache.
 | `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on that cache, oldest entries swept first; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
-| `PLY_C_REFUSALS=1` | print which definitions the backend refused |
+| `PLY_C_REFUSALS=1` | print which definitions the backend refused, and how many it took |
 | `PLY_C_DUMP=NAME` | print one body's emitted C, or `*` for the unit's largest bodies |
-| `PLY_C_ONLY=a,b`, `PLY_C_SKIP=prefix,...` | compile only the named definitions, or drop those with a prefix |
+| `PLY_C_ONLY=a,b`, `PLY_C_SKIP=prefix,...` | compile only the named definitions, or drop those with a prefix; the unit is then partial and a caller of what was dropped is declined, not raised |
 | `PLY_C_PHASES=1` | print compile phases, body-cache hits and misses, and allocation counts |
 | `PLY_HEAP_POISON=1` | poison released blocks and fail on a read of one |
 | `PLY_HEAP_DELAY=N` | reuse a released block only after `N` more releases |
 | `PLY_C_EMITTER=ply:DIR` | use emitter sources from `DIR` instead of the built-in ones |
-| `PLY_TIER_ONLY=1` | compiled code is the only engine; a missing body is `E0505` |
 | `PLY_CODEGEN_REGISTER=narrow` | enter compiled code only for scalar signatures |
 
 ## 9. Simulation
@@ -933,7 +938,7 @@ Strings are indexed by character, bytes by byte.
 | `bytes_at(b: Bytes, i: Int) -> Int` | `0..=255` |
 | `bytes_u32_le(b: Bytes, i: Int) -> U32` | four bytes, little-endian |
 | `bytes_slice(b: Bytes, start: Int, end: Int) -> Bytes` | |
-| `bytes_concat(a: Bytes, b: Bytes) -> Bytes` | |
+| `bytes_concat(a: Bytes, b: Bytes) -> Bytes` | `a ++ b` |
 | `bytes_concat_all(bs: List<Bytes>) -> Bytes` | one allocation |
 | `byte_of_int(n: Int) -> Bytes` | raises outside `0..=255` |
 | `bytes_of_string(s: String) -> Bytes` | |
@@ -1490,7 +1495,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0113` | project module under the reserved root `std` |
 | `E0114` | unknown `effect set`, including a `pub` or qualified one |
 | `E0115` | `effect set` cycle |
-| `E0116` | record update base with no shape this file can name |
+| `E0116` | record update base that is not a record of a known type |
 | `E0117` | record update naming a field the base lacks |
 | `E0118` | `?` with no written `Result`/`Option` return type to exit through |
 | `E0119` | `?` where its early exit would change what runs or drop an annotation |
@@ -1512,7 +1517,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0207` | unknown deriver |
 | `E0208` | orphan `derive` |
 | `E0209` | `/` on `Decimal` |
-| `E0210` | numeric operand type nothing determines |
+| `E0210` | operand type nothing determines |
 | `E0211` | integer literal out of range for its fixed width |
 | `E0301` | unbound row variable |
 | `E0302` | effect not permitted by the written row |
@@ -1557,7 +1562,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0444` | artifact built under another version |
 | `E0445` | `trace.exit` of a span not open on this task |
 | `E0446` | value outlives its region |
-| `E0447` | two regions in scope under one name |
+| `E0448` | definition the compiled tier cannot compile |
 | `E0449` | region handle reaching a runtime boundary |
 | `E0450` | compiled backend cannot be attached |
 | `E0451` | `fs` label with no root bound |
@@ -1597,8 +1602,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
   only; no authentication framework.
 
 Sharp edges: `x.f(y)` with a bare variable `x` is a perform; a missing handler
-clause fails at run time; record update needs a locally readable shape; two
-allocating tasks are always ordered; `bytes_at`, `bytes_u32_le`, `string_slice`,
+clause fails at run time; a record update needs the base's type to be known
+where it stands; two allocating tasks are always ordered; `bytes_at`, `bytes_u32_le`, `string_slice`,
 `string_find` and `list_set` raise where `list_at` answers `None`.
 
 ## 19. Examples

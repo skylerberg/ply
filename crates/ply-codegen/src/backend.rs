@@ -256,8 +256,6 @@ pub struct Bodies {
     ctx: RefCell<crate::rt::Ctx>,
     entered: Cell<u64>,
     declines: Cell<Declines>,
-    /// `PLY_TIER_ONLY=1`: this backend is the only engine, and the machine evaluates nothing.
-    tier_only: bool,
 }
 
 impl Bodies {
@@ -311,7 +309,6 @@ impl Bodies {
             ctx,
             entered: Cell::new(0),
             declines: Cell::new(Declines::default()),
-            tier_only: std::env::var("PLY_TIER_ONLY").is_ok_and(|v| v == "1"),
         })
     }
 
@@ -329,6 +326,11 @@ impl Bodies {
     /// Whether this backend would be offered `name` at all.
     pub fn admits(&self, name: &str) -> bool {
         self.admitted.contains_key(&Symbol::new(name))
+    }
+
+    /// The cell arena's `(regions open, slots live)` between entries: what a leak grows.
+    pub fn cell_extent(&self) -> (usize, usize) {
+        self.ctx.borrow().cell_extent()
     }
 
     pub fn reset_counts(&self) {
@@ -406,8 +408,6 @@ impl Bodies {
         }
 
         if ctx.failed != 0 {
-            let out_of_stack = ctx.failed == crate::rt::FAILED_OUT_OF_STACK;
-            let out_of_fuel = out_of_stack || ctx.failed == crate::rt::FAILED_OUT_OF_FUEL;
             let raised = if ctx.failed == crate::rt::FAILED_OUT_OF_TIME {
                 Some(
                     ply_span::Diagnostic::error(
@@ -420,8 +420,8 @@ impl Bodies {
                     .primary(ctx.site(), "still running here")
                     .note("`--timeout MS` sets the budget; 0 is none"),
                 )
-            } else if out_of_fuel {
-                // Tier-only: no machine follows, so report the budget even on a stack overflow.
+            } else if ctx.failed == crate::rt::FAILED_OUT_OF_FUEL {
+                // Tier-only: no machine follows, so the budget is reported from here.
                 Some(
                     ply_span::Diagnostic::error(
                         ply_span::codes::RUNTIME_ERROR,
@@ -579,10 +579,6 @@ impl ply_eval::Compiled for Bodies {
             .try_borrow_mut()
             .map(|mut ctx| std::mem::take(&mut ctx.teardown))
             .unwrap_or_default()
-    }
-
-    fn tier_only(&self) -> bool {
-        self.tier_only
     }
 }
 

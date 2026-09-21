@@ -2,13 +2,14 @@
 
 import spine (Span, Ident, QName, num, dummy_span)
 import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform, NCell,
-             NRegion, NLambda, NSim, NHandle, NField, NUpd, NLabel, CStmt, CLet, CLetPat, CDo, CArm, CField, CClause,
+             NLambda, NSim, NHandle, NField, NUpd, NLabel, CStmt, CLet, CLetPat, CDo, CArm, CField, CClause,
              Cap, Own, Owned, pat_slots, lower_fn)
 import items (Module, Derived, Item, IFn, ITest, ILaw, Binder, parse)
 import exprs (Param, Expr)
 import rewrite (expand)
 import derive (expand_derives)
 import resolve (Mod, Resolved, Resolved_, Failed, NValue, resolve_modules, qualify, find)
+import infer (update_shapes, expanded_mods)
 import tycore (at)
 
 type Cause = | CReadAgain | CCell | CMapEntry | CCapture | CCallerKeeps | CElement | CProgram | CCall | CHandler | CClosure
@@ -148,7 +149,6 @@ fn walk(env: Env, c: Code, st: St) -> W =
     },
     NSim(x) -> { st: barrier(env, 0, [], x.body, poison(st, x.caps, x.body)),
                  owner: unknown(CHandler, b"the value a `simulate` answered") },
-    NRegion(r) -> walk(env, r.body, st),
   }
 
 fn join(a: Owner, b: Owner) -> Owner =
@@ -220,7 +220,6 @@ fn children(c: Code) -> List<Code> =
       push(match a.guard { Some(g) -> push(acc, g), None -> acc }, a.body)),
     NPerform(p) -> p.args,
     NCell(cl) -> [cl.init, cl.body],
-    NRegion(r) -> [r.body],
     _ -> [],
   }
 
@@ -493,12 +492,18 @@ fn program_of(names: List<Bytes>, srcs: List<Bytes>, builtins: List<Bytes>) -> O
   if fold(parsed, false, |acc: Bool, p: Parsed| acc || p.bad) { None } else {
     match resolve_modules(map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived })) {
       Failed(_) -> None,
-      Resolved_(x) -> {
-        let defs = fold(x.mods, [], |acc: List<Def>, m: Mod| fold(m.module.items, acc, |a: List<Def>, it: Item|
-          match it { IFn(d) -> push(a, { name: qualify(m.name, d.name.name), arity: len(d.params) }), _ -> a }));
-        let index = fold(range(0, len(defs)), map_new(), |acc: Map<Bytes, Int>, i: Int| map_insert(acc, at(defs, i).name, i));
-        Some({ r: x.r, index: index, defs: defs, bodies: bodies_of(x.mods, index),
-               builtins: fold(builtins, map_new(), |acc: Map<Bytes, Bool>, b: Bytes| map_insert(acc, b, true)) })
+      // A record update stands for a literal only once the checker has the base's shape, and a body
+      // that does not lower has no cost to read.
+      Resolved_(x) -> match update_shapes(x.r, x.mods) {
+        None -> None,
+        Some(shapes) -> {
+          let mods = expanded_mods(x.mods, shapes);
+          let defs = fold(mods, [], |acc: List<Def>, m: Mod| fold(m.module.items, acc, |a: List<Def>, it: Item|
+            match it { IFn(d) -> push(a, { name: qualify(m.name, d.name.name), arity: len(d.params) }), _ -> a }));
+          let index = fold(range(0, len(defs)), map_new(), |acc: Map<Bytes, Int>, i: Int| map_insert(acc, at(defs, i).name, i));
+          Some({ r: x.r, index: index, defs: defs, bodies: bodies_of(mods, index),
+                 builtins: fold(builtins, map_new(), |acc: Map<Bytes, Bool>, b: Bytes| map_insert(acc, b, true)) })
+        },
       },
     }
   }

@@ -6,7 +6,7 @@ import lexer (byte_of, widths)
 import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead, MWrite, MBad)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LInt, LFixed, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
-              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithRegion,
+              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell,
               ESimulate, EBad, Stmt, SLet, SExpr, Param, MatchArm, HandleClause, ReturnClause, RecField)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
@@ -326,7 +326,7 @@ fn t_e_perform() -> Int = 62
 fn t_e_handle() -> Int = 63
 fn t_e_with_cell() -> Int = 64
 fn t_e_simulate() -> Int = 65
-fn t_e_with_region() -> Int = 66
+fn t_e_record_update() -> Int = 67
 fn t_s_let() -> Int = 70
 fn t_s_expr() -> Int = 71
 fn t_p_wildcard() -> Int = 80
@@ -627,7 +627,9 @@ fn expr(z: Nz, e: Expr) -> Nz =
       {..inner, values: acc.values}
     }),
     ERecord(r) -> fold(r.fields, u32v(tag(z, t_e_record()), len(r.fields)), |acc: Nz, f: RecField| expr(strv(acc, f.name.name), f.value)),
-    ERecordUpdate(_) -> panic("`{..b, f: e}` is expanded away before hashing"),
+    // The update is the definition, not the literal it expands to: its meaning follows the base's type.
+    ERecordUpdate(r) -> fold(r.fields, u32v(expr(tag(z, t_e_record_update()), r.base), len(r.fields)),
+                             |acc: Nz, f: RecField| expr(strv(acc, f.name.name), f.value)),
     ETry(_) -> panic("`e?` is expanded away before hashing"),
     EField(f) -> strv(expr(tag(z, t_e_field()), f.base), f.field.name),
     EList(l) -> fold(l.items, u32v(tag(z, t_e_list()), len(l.items)), |acc: Nz, x: Expr| expr(acc, x)),
@@ -658,7 +660,6 @@ fn expr(z: Nz, e: Expr) -> Nz =
       let inner: Nz = expr({..head, values: push(head.values, c.binder.name)}, c.body);
       {..inner, values: head.values}
     },
-    EWithRegion(w) -> expr(strv(tag(z, t_e_with_region()), w.region.name), w.body),
     ESimulate(s) -> expr(tag(z, t_e_simulate()), s.body),
     EBad(_) -> panic("a placeholder reached the hasher"),
   }
@@ -769,7 +770,6 @@ pub fn is_pure(e: Expr) -> Bool =
     EPerform(_) -> false,
     EHandle(_) -> false,
     EWithCell(_) -> false,
-    EWithRegion(_) -> false,
     ESimulate(_) -> false,
     ETry(_) -> false,
     EBad(_) -> false,
@@ -812,7 +812,6 @@ fn mentions(e: Expr, names: List<Bytes>) -> Bool =
       || fold(h.clauses, false, |acc: Bool, c: HandleClause| acc || fold(c.params, false, |b: Bool, p: Ident| b || contains_bytes(names, p.name)) || mentions(c.body, names))
       || (match h.ret { Some(rc) -> contains_bytes(names, rc.binder.name) || mentions(rc.body, names), None -> false }),
     EWithCell(c) -> contains_bytes(names, c.binder.name) || mentions(c.init, names) || mentions(c.body, names),
-    EWithRegion(w) -> mentions(w.body, names),
     ESimulate(s) -> mentions(s.body, names),
   }
 
@@ -1223,7 +1222,6 @@ fn lambda_rets(e: Expr, out: List<TypeExpr>) -> List<TypeExpr> =
       match h.ret { Some(rc) -> lambda_rets(rc.body, clauses), None -> clauses }
     },
     EWithCell(c) -> lambda_rets(c.body, lambda_rets(c.init, out)),
-    EWithRegion(w) -> lambda_rets(w.body, out),
     ESimulate(s) -> lambda_rets(s.body, out),
   }
 
@@ -1743,6 +1741,11 @@ fn p_expr(x: Pr, d: Dc, depth: Int) -> Got = {
     let n = rd_count(e);
     let fs = rd_many(n.d, n.v, |g: Dc| { let f = rd_text(g); let v = p_expr(x, f.d, depth); { d: v.d, t: bytes_concat_all([f.t, b": ", v.t]) } });
     { d: fs.d, t: bytes_concat_all([b"{", joined(fs.ts, b", "), b"}"]) }
+  } else if t.v == t_e_record_update() {
+    let b = p_expr(x, e, depth);
+    let n = rd_count(b.d);
+    let fs = rd_many(n.d, n.v, |g: Dc| { let f = rd_text(g); let v = p_expr(x, f.d, depth); { d: v.d, t: bytes_concat_all([f.t, b": ", v.t]) } });
+    { d: fs.d, t: bytes_concat_all([b"{..", b.t, if n.v > 0 { b", " } else { b"" }, joined(fs.ts, b", "), b"}"]) }
   } else if t.v == t_e_field() {
     let b = parens(p_expr(x, e, depth), is_base(e));
     let f = rd_text(b.d);
@@ -1785,10 +1788,6 @@ fn p_expr(x: Pr, d: Dc, depth: Int) -> Got = {
     let at_ = init.d.values;
     let body: Got = p_expr(x, {..init.d, values: at_ + 1}, inner);
     { d: {..body.d, values: at_}, t: bytes_concat_all([b"with_cell[", r.t, b"](", init.t, b") {", nl(inner), lname(at_), b" -> ", body.t, nl(depth), b"}"]) }
-  } else if t.v == t_e_with_region() {
-    let r = rd_text(e);
-    let body = p_block(x, r.d, depth);
-    { d: body.d, t: bytes_concat_all([b"with_region[", r.t, b"] ", body.t]) }
   } else if t.v == t_e_simulate() { let body = p_block(x, e, depth); { d: body.d, t: bytes_concat(b"simulate ", body.t) } }
   else { panic(string_of_bytes(bytes_concat(b"a tag that does not begin an expression: ", num(t.v)))) }
 }
@@ -2097,19 +2096,37 @@ test "a float literal is read as its correctly rounded bit pattern" {
   assert_eq(bytes_at(parts.mantissa, 0), 150)
 }
 
+// The hash a dump files `name` under.
+fn dumped_hash(dump: String, name: Bytes) -> Bytes = {
+  let d = bytes_of_string(dump);
+  let key = bytes_concat_all([b"H;", name, b";"]);
+  let start = match bytes_index_of(d, key) { Some(i) -> i + bytes_len(key), None -> panic("the dump names the definition") };
+  bytes_slice(d, start, start + 64)
+}
+
 test "renaming a definition does not move its hash, and a change to a callee does" {
   let a = hash_dump([{ name: b"m", src: b"fn helper(x: Int) -> Int = x + 1\nfn f() -> Int = helper(1)" }]);
   let b = hash_dump([{ name: b"m", src: b"fn aide(x: Int) -> Int = x + 1\nfn f() -> Int = aide(1)" }]);
   let c = hash_dump([{ name: b"m", src: b"fn helper(x: Int) -> Int = x + 2\nfn f() -> Int = helper(1)" }]);
-  let hash_of = |dump: String, name: Bytes| {
-    let d = bytes_of_string(dump);
-    let key = bytes_concat_all([b"H;", name, b";"]);
-    let start = match bytes_index_of(d, key) { Some(i) -> i + bytes_len(key), None -> panic("the dump names the definition") };
-    bytes_slice(d, start, start + 64)
-  };
-  assert_eq(hash_of(a, b"m.helper"), hash_of(b, b"m.aide"));
-  assert_eq(hash_of(a, b"m.f"), hash_of(b, b"m.f"));
-  assert(hash_of(a, b"m.f") != hash_of(c, b"m.f"))
+  assert_eq(dumped_hash(a, b"m.helper"), dumped_hash(b, b"m.aide"));
+  assert_eq(dumped_hash(a, b"m.f"), dumped_hash(b, b"m.f"));
+  assert(dumped_hash(a, b"m.f") != dumped_hash(c, b"m.f"))
+}
+
+test "a record update of another module's record hashes stably, and follows that module's type" {
+  let app = b"import shapes\npub fn bumped() -> shapes::P = { let p = shapes::mk(); {..p, a: 3} }";
+  let narrow = [{ name: b"shapes", src: b"pub type P = { a: Int, b: Int }\npub fn mk() -> P = { a: 1, b: 2 }" },
+                { name: b"app", src: app }];
+  let wide = [{ name: b"shapes", src: b"pub type P = { a: Int, b: Int, c: Int }\npub fn mk() -> P = { a: 1, b: 2, c: 3 }" },
+              { name: b"app", src: app }];
+  assert_eq(dumped_hash(hash_dump(narrow), b"app.bumped"), dumped_hash(hash_dump(narrow), b"app.bumped"));
+  // The update means whatever the foreign record is, so a field added there moves this hash.
+  assert(dumped_hash(hash_dump(narrow), b"app.bumped") != dumped_hash(hash_dump(wide), b"app.bumped"));
+  let out = hash_index(indexed(narrow));
+  let ms = printed_of(out, []);
+  assert(holds_text(at(ms, 0).text, b"{.."));
+  let again = hash_index(indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })));
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
 
 test "a mutually recursive pair hashes as one component with two members" {

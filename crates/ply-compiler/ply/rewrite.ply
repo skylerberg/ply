@@ -1,6 +1,7 @@
-// The rewrites applied after the grammar: effect sets, record updates and the try operator.
+// The rewrites over a parsed module: effect sets and the try operator, run with the grammar, and
+// the record update, which needs the checker's answer for its base and so runs after the check.
 
-import spine (Span, Ident, QName, PDiag, Label, span_to, dummy_span, bare, num, diag1, diag2, pdiag, plabel, dump_diags)
+import spine (Span, Ident, QName, PDiag, Label, span_to, dummy_span, bare, num, span_key, diag1, diag2, pdiag, plabel, dump_diags)
 import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead, MWrite, MBad)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet,
               FnDef, TypeDef, TypeDefBody, TDAlias, TDSum, VariantDef, SpecClause, SRequires, SEnsures,
@@ -8,7 +9,7 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               TestDef, LawDef, parse, dump_module)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
-              EWithCell, EWithRegion, ESimulate, EBad, Stmt, SLet, SExpr, Param,
+              EWithCell, ESimulate, EBad, Stmt, SLet, SExpr, Param,
               NamedArg, MatchArm, HandleClause, ReturnClause, RecField, expr_span)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LUnit)
 
@@ -48,7 +49,6 @@ pub fn is_pure(e: Expr) -> Bool =
     EPerform(_) -> false,
     EHandle(_) -> false,
     EWithCell(_) -> false,
-    EWithRegion(_) -> false,
     ESimulate(_) -> false,
     ETry(_) -> false,
     ELit(_) -> true,
@@ -435,7 +435,6 @@ fn walk_expr(s: Sets, e: Expr) -> { s: Sets, e: Expr } =
       let b = walk_expr(i.s, c.body);
       { s: b.s, e: EWithCell({ span: c.span, resource: c.resource, init: i.e, binder: c.binder, body: b.e }) }
     },
-    EWithRegion(w) -> { let o = walk_expr(s, w.body); { s: o.s, e: EWithRegion({ span: w.span, region: w.region, body: o.e }) } },
     ESimulate(x) -> { let o = walk_expr(s, x.body); { s: o.s, e: ESimulate({ span: x.span, body: o.e }) } },
     _ -> { s: s, e: e },
   }
@@ -500,330 +499,105 @@ pub fn expand_effect_sets(m: Module, diags: List<PDiag>) -> { module: Module, di
 }
 
 // --- Record update -----------------------------------------------------------------------
-
-type Bound = { name: Bytes, ty: Option<TypeExpr> }
-type Sig = { name: Bytes, ret: Option<TypeExpr> }
-type RuCx = { types: List<TypeDef>, sigs: List<Sig>, scope: List<Bound>, diags: List<PDiag>, fresh: Int }
-type RuOut = { cx: RuCx, e: Expr }
-
-// `NoShape` carries the note saying why the base has no field list this file can name.
-type Shape = | Fields(List<{ name: Ident, ty: TypeExpr }>) | NoShape(Bytes)
-
-fn collect_sigs(m: Module) -> List<Sig> =
-  fold(m.items, [], |acc: List<Sig>, it: Item|
-    match it {
-      IFn(d) -> match find_sig(acc, d.name.name) { Some(_) -> acc, None -> push(acc, { name: d.name.name, ret: d.ret }) },
-      _ -> acc,
-    })
-
-fn find_sig(sigs: List<Sig>, name: Bytes) -> Option<Sig> =
-  fold(sigs, None, |acc: Option<Sig>, s: Sig| match acc { Some(_) -> acc, None -> if s.name == name { Some(s) } else { None } })
-
-fn ru_lookup(cx: RuCx, name: Bytes) -> Option<Option<TypeExpr>> =
-  fold(cx.scope, None, |acc: Option<Option<TypeExpr>>, b: Bound|
-    if b.name == name { Some(b.ty) } else { acc })
+// `{..b, f: e}` is the literal it stands for. The shape it copies is the checker's answer for the
+// base, keyed by the update's span, so this runs after the check and not with the other rewrites.
 
 fn too_deep() -> Bytes = bytes_concat_all([b"more than ", num(max_alias_depth()), b" type aliases deep"])
 
-// The written type of a base: a local, a field path from one, or a call of a `fn` declared here.
-fn type_of_path(cx: RuCx, e: Expr) -> Result<TypeExpr, Bytes> =
-  match e {
-    EVar(v) -> if !is_bare(v.name) { Err(ru_cross_module()) } else {
-      let n = v.name.name.name;
-      match ru_lookup(cx, n) {
-        Some(bound) -> match bound {
-          Some(t) -> Ok(t),
-          None -> Err(bytes_concat_all([b"`", n, b"` has no written type here; annotate the binder, as in `let ", n, b": T = ...`"])),
-        },
-        None -> Err(bytes_concat_all([b"`", n, b"` is not a local binder with a written type \xe2\x80\x94 a record update reads only annotations written in this file"])),
-      }
-    },
-    EField(f) -> {
-      let outer = type_of_path(cx, f.base)?;
-      match record_of(cx, outer, 0) {
-        NoShape(why) -> Err(why),
-        Fields(fs) ->
-          match fold(fs, None, |acc: Option<TypeExpr>, x: { name: Ident, ty: TypeExpr }|
-                     match acc { Some(_) -> acc, None -> if x.name.name == f.field.name { Some(x.ty) } else { None } }) {
-            Some(t) -> Ok(t),
-            None ->
-              if len(fs) == 0 { Err(bytes_concat_all([b"no field `", f.field.name, b"`; the record has no fields"])) }
-              else {
-                Err(bytes_concat_all([b"no field `", f.field.name, b"`; available fields: ",
-                                      join_backticked(map(fs, |x: { name: Ident, ty: TypeExpr }| x.name.name), b", ")]))
-              },
-          },
-      }
-    },
-    EApp(a) -> match a.func {
-      EVar(v) -> if !is_bare(v.name) { Err(ru_cross_module()) } else {
-        let n = v.name.name.name;
-        match ru_lookup(cx, n) {
-          Some(_) -> Err(bytes_concat_all([b"`", n, b"` is a local here, and a call of a local has no written result type"])),
-          None -> match find_sig(cx.sigs, n) {
-            None -> Err(bytes_concat_all([b"`", n, b"` is not a `fn` declared in this file, so its result has no type this file can read"])),
-            Some(sig) -> match sig.ret {
-              Some(t) -> Ok(t),
-              None -> Err(bytes_concat_all([b"`", n, b"` writes no `->`, so its result has no type this file can read; write one"])),
-            },
-          },
-        }
-      },
-      _ -> Err(b"only a call of a `fn` declared in this file has a result type this file can read"),
-    },
-    _ -> Err(b"the base is not a record"),
-  }
-
-// What a `let` without a written type takes from its value.
-fn written_type_of(cx: RuCx, e: Expr) -> Option<TypeExpr> =
-  match e {
-    ERecordUpdate(r) -> written_type_of(cx, r.base),
-    _ -> match type_of_path(cx, e) { Ok(t) -> Some(t), Err(_) -> None },
-  }
-
-fn ru_cross_module() -> Bytes =
-  b"the base and its type must both be named in this file; a shape read across a module boundary would go stale without this file changing"
-
-fn ru_generic() -> Bytes = b"a generic type has no field list until it is applied; write the fields out"
-
-fn record_of(cx: RuCx, t: TypeExpr, depth: Int) -> Shape =
-  if depth > max_alias_depth() { NoShape(too_deep()) } else {
-    match t {
-      TRecord(r) -> Fields(r.fields),
-      TVar(_) -> NoShape(ru_generic()),
-      TCon(c) ->
-        if !is_bare(c.name) { NoShape(ru_cross_module()) }
-        else if len(c.args) > 0 { NoShape(ru_generic()) }
-        else {
-          let n = c.name.name.name;
-          match find_type(cx.types, n) {
-            None -> NoShape(bytes_concat_all([b"`", n, b"` is not a `type` declared in this file, so its fields are not known here"])),
-            Some(d) -> if len(d.params) > 0 { NoShape(ru_generic()) } else {
-              match d.body {
-                TDSum(_) -> NoShape(bytes_concat_all([b"`", n, b"` is a sum type, and only a record has fields to update"])),
-                TDAlias(inner) -> record_of(cx, inner, depth + 1),
-              }
-            },
-          }
-        },
-      _ -> NoShape(b"the base is not a record"),
-    }
-  }
-
-fn ru_bind(cx: RuCx, name: Ident, ty: Option<TypeExpr>) -> RuCx =
-  {..cx, scope: push(cx.scope, { name: name.name, ty: ty })}
-
-fn ru_bind_pattern(cx: RuCx, p: Pattern) -> RuCx =
-  match p {
-    PVar(v) -> ru_bind(cx, v.name, None),
-    PCtor(c) -> fold(c.args, cx, |acc: RuCx, a: Pattern| ru_bind_pattern(acc, a)),
-    PRecord(r) -> fold(r.fields, cx, |acc: RuCx, f: { name: Ident, pat: Pattern }| ru_bind_pattern(acc, f.pat)),
-    PList(l) -> {
-      let items = fold(l.items, cx, |acc: RuCx, x: Pattern| ru_bind_pattern(acc, x));
-      match l.rest { None -> items, Some(r) -> ru_bind_pattern(items, r) }
-    },
-    _ -> cx,
-  }
-
-fn ru_truncate(cx: RuCx, mark: Int) -> RuCx = {..cx, scope: take(cx.scope, mark)}
-
-// The literal an update stands for, or the written fields alone with a diagnostic.
-fn expand_update(cx0: RuCx, span: Span, base: Expr, written: List<RecField>) -> RuOut = {
+// The literal an update stands for: the base's other fields, in the record's own order, then the
+// written ones. A call is bound to a name first, so it runs once however many fields are copied.
+fn expand_update(span: Span, base: Expr, written: List<RecField>, names: List<Bytes>) -> Expr = {
   let base_span = expr_span(base);
-  let shape = match type_of_path(cx0, base) { Err(why) -> NoShape(why), Ok(t) -> record_of(cx0, t, 0) };
-  // A call is bound to a name first, so it runs once however many fields are copied.
   let bound: Option<Ident> = match base {
-    EApp(_) -> Some({ name: bytes_concat(b"?u", bytes_of_string(int_to_string(cx0.fresh))), span: base_span }),
+    EApp(_) -> Some({ name: bytes_concat(b"?u", num(base_span.start)), span: base_span }),
     _ -> None,
   };
-  let cx: RuCx = match bound { Some(_) -> {..cx0, fresh: cx0.fresh + 1}, None -> cx0 };
   let source = match bound { Some(b) -> EVar({ span: base_span, name: bare(b) }), None -> base };
-  match shape {
-    NoShape(why) ->
-      { cx: {..cx, diags: push(cx.diags, diag1(b"E0116", base_span,
-                                               b"the record being updated has no field list this file can name",
-                                               b"no record shape here", [why]))},
-        e: ERecord({ span: span, fields: written }) },
-    Fields(fs) -> {
-      let known = join_backticked(map(fs, |f: { name: Ident, ty: TypeExpr }| f.name.name), b", ");
-      let bad = fold(written, { cx: cx, bad: false }, |acc: { cx: RuCx, bad: Bool }, w: RecField|
-        if fold(fs, false, |b: Bool, f: { name: Ident, ty: TypeExpr }| b || f.name.name == w.name.name) { acc }
-        else { { cx: {..acc.cx, diags: push(acc.cx.diags, diag2(b"E0117", w.name.span,
-                   bytes_concat_all([b"the record being updated has no field `", w.name.name, b"`"]),
-                   b"not a field of the base", base_span, b"this is the record being updated",
-                   [bytes_concat(b"an update replaces fields, it does not add them; available fields: ", known)]))},
-                 bad: true } });
-      if bad.bad { { cx: bad.cx, e: ERecord({ span: span, fields: written }) } } else {
-        let copies = filter(map(fs, |f: { name: Ident, ty: TypeExpr }| f.name.name), |n: Bytes|
-          !fold(written, false, |b: Bool, w: RecField| b || w.name.name == n));
-        let sorted = fold(copies, [], |acc: List<Bytes>, n: Bytes| insert_bytes(acc, n));
-        let copied = map(sorted, |n: Bytes| {
-          let field = { name: n, span: base_span };
-          { name: field, value: EField({ span: base_span, base: source, field: field }) }
-        });
-        let literal = ERecord({ span: span, fields: append(copied, written) });
-        { cx: bad.cx,
-          e: match bound {
-            Some(b) -> EBlock({ span: span, tail: Some(literal),
-                                stmts: [SLet({ span: base_span, pat: PVar({ span: base_span, name: b }), ty: None, value: base })] }),
-            None -> literal,
-          } }
-      }
-    },
+  let copies = filter(names, |n: Bytes| !fold(written, false, |seen: Bool, w: RecField| seen || w.name.name == n));
+  let copied = map(copies, |n: Bytes| {
+    let field = { name: n, span: base_span };
+    { name: field, value: EField({ span: base_span, base: source, field: field }) }
+  });
+  let literal = ERecord({ span: span, fields: append(copied, written) });
+  match bound {
+    Some(b) -> EBlock({ span: span, tail: Some(literal),
+                        stmts: [SLet({ span: base_span, pat: PVar({ span: base_span, name: b }), ty: None, value: base })] }),
+    None -> literal,
   }
 }
 
-fn insert_bytes(sorted: List<Bytes>, x: Bytes) -> List<Bytes> = {
-  let i = fold(range(0, len(sorted)), len(sorted), |acc: Int, j: Int|
-    if acc < len(sorted) { acc } else if bytes_lt(x, at(sorted, j)) { j } else { acc });
-  append(push(take(sorted, i), x), drop(sorted, i))
-}
+fn ru_exprs(sh: Map<Bytes, List<Bytes>>, xs: List<Expr>) -> List<Expr> = map(xs, |x: Expr| ru_expr(sh, x))
 
-fn ru_exprs(cx: RuCx, xs: List<Expr>) -> { cx: RuCx, xs: List<Expr> } =
-  fold(xs, { cx: cx, xs: [] }, |acc: { cx: RuCx, xs: List<Expr> }, x: Expr| {
-    let o = ru_expr(acc.cx, x);
-    { cx: o.cx, xs: push(acc.xs, o.e) }
-  })
+fn ru_fields(sh: Map<Bytes, List<Bytes>>, fs: List<RecField>) -> List<RecField> =
+  map(fs, |f: RecField| { name: f.name, value: ru_expr(sh, f.value) })
 
-fn ru_fields(cx: RuCx, fs: List<RecField>) -> { cx: RuCx, fs: List<RecField> } =
-  fold(fs, { cx: cx, fs: [] }, |acc: { cx: RuCx, fs: List<RecField> }, f: RecField| {
-    let o = ru_expr(acc.cx, f.value);
-    { cx: o.cx, fs: push(acc.fs, { name: f.name, value: o.e }) }
-  })
+fn ru_opt(sh: Map<Bytes, List<Bytes>>, e: Option<Expr>) -> Option<Expr> =
+  match e { None -> None, Some(x) -> Some(ru_expr(sh, x)) }
 
-fn ru_opt(cx: RuCx, e: Option<Expr>) -> { cx: RuCx, e: Option<Expr> } =
-  match e { None -> { cx: cx, e: None }, Some(x) -> { let o = ru_expr(cx, x); { cx: o.cx, e: Some(o.e) } } }
+fn ru_stmt(sh: Map<Bytes, List<Bytes>>, s: Stmt) -> Stmt =
+  match s {
+    SLet(l) -> SLet({ span: l.span, pat: l.pat, ty: l.ty, value: ru_expr(sh, l.value) }),
+    SExpr(x) -> SExpr(ru_expr(sh, x)),
+  }
 
 // Children first, then this node: a nested update inside a written field expands before its owner.
-fn ru_expr(cx: RuCx, e: Expr) -> RuOut =
+fn ru_expr(sh: Map<Bytes, List<Bytes>>, e: Expr) -> Expr =
   match e {
-    EBinary(b) -> {
-      let l = ru_expr(cx, b.lhs);
-      let r = ru_expr(l.cx, b.rhs);
-      { cx: r.cx, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: r.e }) }
-    },
-    EUnary(u) -> { let o = ru_expr(cx, u.operand); { cx: o.cx, e: EUnary({ span: u.span, op: u.op, operand: o.e }) } },
-    ELambda(l) -> {
-      let mark = len(cx.scope);
-      let inner = fold(l.params, cx, |acc: RuCx, p: Param| ru_bind(acc, p.name, p.ty));
-      let o = ru_expr(inner, l.body);
-      { cx: ru_truncate(o.cx, mark), e: ELambda({ span: l.span, body: o.e, params: l.params, ret: l.ret }) }
-    },
-    EApp(a) -> {
-      let f = ru_expr(cx, a.func);
-      let args = ru_exprs(f.cx, a.args);
-      let named = fold(a.named, { cx: args.cx, ns: [] }, |acc: { cx: RuCx, ns: List<NamedArg> }, n: NamedArg| {
-        let o = ru_expr(acc.cx, n.value);
-        { cx: o.cx, ns: push(acc.ns, { name: n.name, value: o.e, span: n.span }) }
-      });
-      { cx: named.cx, e: EApp({ span: a.span, func: f.e, named: named.ns, args: args.xs, labels: a.labels }) }
-    },
-    EIf(i) -> {
-      let c = ru_expr(cx, i.cond);
-      let t = ru_expr(c.cx, i.then_branch);
-      let el = ru_expr(t.cx, i.else_branch);
-      { cx: el.cx, e: EIf({ span: i.span, cond: c.e, then_branch: t.e, else_branch: el.e }) }
-    },
-    EMatch(m) -> {
-      let sc = ru_expr(cx, m.scrutinee);
-      let arms = fold(m.arms, { cx: sc.cx, arms: [] }, |acc: { cx: RuCx, arms: List<MatchArm> }, arm: MatchArm| {
-        let mark = len(acc.cx.scope);
-        let inner = ru_bind_pattern(acc.cx, arm.pat);
-        let g = ru_opt(inner, arm.guard);
-        let b = ru_expr(g.cx, arm.body);
-        { cx: ru_truncate(b.cx, mark), arms: push(acc.arms, { pat: arm.pat, guard: g.e, body: b.e, span: arm.span }) }
-      });
-      { cx: arms.cx, e: EMatch({ span: m.span, scrutinee: sc.e, arms: arms.arms }) }
-    },
-    EBlock(b) -> {
-      let mark = len(cx.scope);
-      let stmts = fold(b.stmts, { cx: cx, ss: [] }, |acc: { cx: RuCx, ss: List<Stmt> }, st: Stmt|
-        match st {
-          SLet(l) -> {
-            let v = ru_expr(acc.cx, l.value);
-            let bound = match l.pat {
-              PVar(n) -> match l.ty { Some(t) -> ru_bind(v.cx, n.name, Some(t)), None -> ru_bind(v.cx, n.name, written_type_of(v.cx, l.value)) },
-              _ -> ru_bind_pattern(v.cx, l.pat),
-            };
-            { cx: bound, ss: push(acc.ss, SLet({ span: l.span, pat: l.pat, ty: l.ty, value: v.e })) }
-          },
-          SExpr(x) -> { let o = ru_expr(acc.cx, x); { cx: o.cx, ss: push(acc.ss, SExpr(o.e)) } },
-        });
-      let tl = ru_opt(stmts.cx, b.tail);
-      { cx: ru_truncate(tl.cx, mark), e: EBlock({ span: b.span, tail: tl.e, stmts: stmts.ss }) }
-    },
-    ERecord(r) -> { let o = ru_fields(cx, r.fields); { cx: o.cx, e: ERecord({ span: r.span, fields: o.fs }) } },
+    EBinary(b) -> EBinary({ span: b.span, op: b.op, lhs: ru_expr(sh, b.lhs), rhs: ru_expr(sh, b.rhs) }),
+    EUnary(u) -> EUnary({ span: u.span, op: u.op, operand: ru_expr(sh, u.operand) }),
+    ELambda(l) -> ELambda({ span: l.span, body: ru_expr(sh, l.body), params: l.params, ret: l.ret }),
+    EApp(a) -> EApp({ span: a.span, func: ru_expr(sh, a.func),
+                      named: map(a.named, |n: NamedArg| { name: n.name, value: ru_expr(sh, n.value), span: n.span }),
+                      args: ru_exprs(sh, a.args), labels: a.labels }),
+    EIf(i) -> EIf({ span: i.span, cond: ru_expr(sh, i.cond), then_branch: ru_expr(sh, i.then_branch),
+                    else_branch: ru_expr(sh, i.else_branch) }),
+    EMatch(m) -> EMatch({ span: m.span, scrutinee: ru_expr(sh, m.scrutinee),
+                          arms: map(m.arms, |arm: MatchArm|
+                            { pat: arm.pat, guard: ru_opt(sh, arm.guard), body: ru_expr(sh, arm.body), span: arm.span }) }),
+    EBlock(b) -> EBlock({ span: b.span, tail: ru_opt(sh, b.tail), stmts: map(b.stmts, |st: Stmt| ru_stmt(sh, st)) }),
+    ERecord(r) -> ERecord({ span: r.span, fields: ru_fields(sh, r.fields) }),
     ERecordUpdate(r) -> {
-      let b = ru_expr(cx, r.base);
-      let fs = ru_fields(b.cx, r.fields);
-      expand_update(fs.cx, r.span, b.e, fs.fs)
+      let base = ru_expr(sh, r.base);
+      let fs = ru_fields(sh, r.fields);
+      // A span the table does not hold belongs to a program that did not check; the lowering declines it.
+      match map_get(sh, span_key(r.span)) {
+        None -> ERecordUpdate({ span: r.span, base: base, fields: fs }),
+        Some(names) -> expand_update(r.span, base, fs, names),
+      }
     },
-    EField(f) -> { let o = ru_expr(cx, f.base); { cx: o.cx, e: EField({ span: f.span, base: o.e, field: f.field }) } },
-    ETry(t) -> { let o = ru_expr(cx, t.operand); { cx: o.cx, e: ETry({ span: t.span, operand: o.e }) } },
-    EList(l) -> { let o = ru_exprs(cx, l.items); { cx: o.cx, e: EList({ span: l.span, items: o.xs }) } },
-    EPerform(p) -> { let o = ru_exprs(cx, p.args); { cx: o.cx, e: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.xs }) } },
-    EHandle(h) -> {
-      let b = ru_expr(cx, h.body);
-      let cs = fold(h.clauses, { cx: b.cx, cs: [] }, |acc: { cx: RuCx, cs: List<HandleClause> }, c: HandleClause| {
-        let mark = len(acc.cx.scope);
-        let with_params = fold(c.params, acc.cx, |x: RuCx, p: Ident| ru_bind(x, p, None));
-        let with_resume = match c.resume { None -> with_params, Some(k) -> ru_bind(with_params, k, None) };
-        let o = ru_expr(with_resume, c.body);
-        { cx: ru_truncate(o.cx, mark), cs: push(acc.cs, { eff: c.eff, op: c.op, resource: c.resource, resume: c.resume, body: o.e, span: c.span, params: c.params }) }
-      });
-      let r = match h.ret {
-        None -> { cx: cs.cx, r: None },
-        Some(rc) -> {
-          let mark = len(cs.cx.scope);
-          let o = ru_expr(ru_bind(cs.cx, rc.binder, None), rc.body);
-          { cx: ru_truncate(o.cx, mark), r: Some({ binder: rc.binder, body: o.e, span: rc.span }) }
-        },
-      };
-      { cx: r.cx, e: EHandle({ span: h.span, body: b.e, ret: r.r, clauses: cs.cs }) }
-    },
-    EWithCell(c) -> {
-      let i = ru_expr(cx, c.init);
-      let mark = len(i.cx.scope);
-      let o = ru_expr(ru_bind(i.cx, c.binder, None), c.body);
-      { cx: ru_truncate(o.cx, mark), e: EWithCell({ span: c.span, resource: c.resource, init: i.e, binder: c.binder, body: o.e }) }
-    },
-    EWithRegion(w) -> { let o = ru_expr(cx, w.body); { cx: o.cx, e: EWithRegion({ span: w.span, region: w.region, body: o.e }) } },
-    ESimulate(x) -> { let o = ru_expr(cx, x.body); { cx: o.cx, e: ESimulate({ span: x.span, body: o.e }) } },
-    _ -> { cx: cx, e: e },
+    EField(f) -> EField({ span: f.span, base: ru_expr(sh, f.base), field: f.field }),
+    ETry(t) -> ETry({ span: t.span, operand: ru_expr(sh, t.operand) }),
+    EList(l) -> EList({ span: l.span, items: ru_exprs(sh, l.items) }),
+    EPerform(p) -> EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: ru_exprs(sh, p.args) }),
+    EHandle(h) -> EHandle({ span: h.span, body: ru_expr(sh, h.body),
+                            ret: match h.ret {
+                              None -> None,
+                              Some(rc) -> Some({ binder: rc.binder, body: ru_expr(sh, rc.body), span: rc.span }),
+                            },
+                            clauses: map(h.clauses, |c: HandleClause|
+                              { eff: c.eff, op: c.op, resource: c.resource, resume: c.resume,
+                                body: ru_expr(sh, c.body), span: c.span, params: c.params }) }),
+    EWithCell(c) -> EWithCell({ span: c.span, resource: c.resource, init: ru_expr(sh, c.init),
+                                binder: c.binder, body: ru_expr(sh, c.body) }),
+    ESimulate(x) -> ESimulate({ span: x.span, body: ru_expr(sh, x.body) }),
+    _ -> e,
   }
 
-fn ru_item(cx: RuCx, it: Item) -> { cx: RuCx, it: Item } =
+fn ru_item(sh: Map<Bytes, List<Bytes>>, it: Item) -> Item =
   match it {
-    IFn(d) -> {
-      let mark = len(cx.scope);
-      let inner = fold(d.params, cx, |acc: RuCx, p: Param| ru_bind(acc, p.name, p.ty));
-      let spec = fold(d.spec, { cx: inner, xs: [] }, |acc: { cx: RuCx, xs: List<SpecClause> }, c: SpecClause| {
-        let o = ru_expr(acc.cx, c.expr);
-        { cx: o.cx, xs: push(acc.xs, { kind: c.kind, expr: o.e, span: c.span }) }
-      });
-      let b = ru_expr(spec.cx, d.body);
-      { cx: ru_truncate(b.cx, mark), it: IFn({ vis: d.vis, name: d.name, generics: d.generics, params: d.params, ret: d.ret, effects: d.effects,
-                                               constraints: d.constraints, spec: spec.xs, reuse: d.reuse, body: b.e, span: d.span }) }
-    },
-    ITest(d) -> { let o = ru_expr(cx, d.body); { cx: o.cx, it: ITest({ name: d.name, name_span: d.name_span, is_nondet: d.is_nondet, body: o.e, span: d.span }) } },
-    ILaw(d) -> {
-      let mark = len(cx.scope);
-      let inner = fold(d.binders, cx, |acc: RuCx, b: Binder| ru_bind(acc, b.name, Some(b.ty)));
-      let g = ru_opt(inner, d.guard);
-      let b = ru_expr(g.cx, d.body);
-      { cx: ru_truncate(b.cx, mark), it: ILaw({ name: d.name, name_span: d.name_span, host: d.host, binders: d.binders, guard: g.e, body: b.e, span: d.span }) }
-    },
-    _ -> { cx: cx, it: it },
+    IFn(d) -> IFn({ vis: d.vis, name: d.name, generics: d.generics, params: d.params, ret: d.ret, effects: d.effects,
+                    constraints: d.constraints,
+                    spec: map(d.spec, |c: SpecClause| { kind: c.kind, expr: ru_expr(sh, c.expr), span: c.span }),
+                    reuse: d.reuse, body: ru_expr(sh, d.body), span: d.span }),
+    ITest(d) -> ITest({ name: d.name, name_span: d.name_span, is_nondet: d.is_nondet, body: ru_expr(sh, d.body), span: d.span }),
+    ILaw(d) -> ILaw({ name: d.name, name_span: d.name_span, host: d.host, binders: d.binders,
+                      guard: ru_opt(sh, d.guard), body: ru_expr(sh, d.body), span: d.span }),
+    _ -> it,
   }
 
-pub fn expand_record_updates(m: Module, diags: List<PDiag>) -> { module: Module, diags: List<PDiag> } = {
-  let start = { types: collect_types(m), sigs: collect_sigs(m), scope: [], diags: diags, fresh: 0 };
-  let walked = fold(m.items, { cx: start, items: [] }, |acc: { cx: RuCx, items: List<Item> }, it: Item| {
-    let o = ru_item(acc.cx, it);
-    { cx: o.cx, items: push(acc.items, o.it) }
-  });
-  { module: { imports: m.imports, items: walked.items }, diags: walked.cx.diags }
-}
+// Every update of a checked module replaced by the literal it stands for.
+pub fn expand_record_updates(m: Module, shapes: Map<Bytes, List<Bytes>>) -> Module =
+  if !has_update(m) { m } else { { imports: m.imports, items: map(m.items, |it: Item| ru_item(shapes, it)) } }
 
 // --- The try operator ------------------------------------------------------------------------
 
@@ -1295,7 +1069,6 @@ fn sweep_inner(cx: TryCx, e: Expr, scope: Option<Bytes>, barrier: Option<Bytes>)
       let b = sweep(i.cx, c.body, scope, under(barrier, b"a `with_cell` body"));
       { cx: b.cx, e: EWithCell({ span: c.span, resource: c.resource, init: i.e, binder: c.binder, body: b.e }) }
     },
-    EWithRegion(w) -> { let o = sweep(cx, w.body, scope, under(barrier, b"a `with_region` body")); { cx: o.cx, e: EWithRegion({ span: w.span, region: w.region, body: o.e }) } },
     ESimulate(x) -> { let o = sweep(cx, x.body, scope, under(barrier, b"a `simulate` body")); { cx: o.cx, e: ESimulate({ span: x.span, body: o.e }) } },
     _ -> { cx: cx, e: e },
   }
@@ -1387,16 +1160,15 @@ fn any_in(e: Expr, p: (Expr) -> Bool) -> Bool =
     EHandle(h) -> any_in(h.body, p) || fold(h.clauses, false, |b: Bool, c: HandleClause| b || any_in(c.body, p))
                   || (match h.ret { None -> false, Some(rc) -> any_in(rc.body, p) }),
     EWithCell(c) -> any_in(c.init, p) || any_in(c.body, p),
-    EWithRegion(w) -> any_in(w.body, p),
     ESimulate(x) -> any_in(x.body, p),
     _ -> false,
   })
 
-// In this order, each only when the grammar met what it rewrites.
+// In this order, each only when the grammar met what it rewrites. A record update needs the
+// checker's answer for its base, so `expand_record_updates` runs later, over a checked program.
 pub fn expand(m: Module, uses_sets: Bool, diags: List<PDiag>) -> { module: Module, diags: List<PDiag> } = {
   let a = if uses_sets { expand_effect_sets(m, diags) } else { { module: m, diags: diags } };
-  let b = if has_update(a.module) { expand_record_updates(a.module, a.diags) } else { a };
-  if has_try(b.module) { expand_try(b.module, b.diags) } else { b }
+  if has_try(a.module) { expand_try(a.module, a.diags) } else { a }
 }
 
 pub fn dump_expanded(src: Bytes) -> String = {
@@ -1420,22 +1192,6 @@ test "a `?` inside a return-position expression lifts to its head, and an `Optio
 test "a `?` in a function with no written return type is refused and unwrapped" {
   assert_eq(dump_expanded(b"fn f(n: Int) = g(n)?"),
             "#0;#1;0:20:fn;%priv;?0;3:4:ident;@66;%gen;#0;#0;#0;#1;5:11:prm;5:6:ident;@6e;?1;8:11:tcon;8:11:qname;?0;8:11:ident;@496e74;#0;?0;?0;?0;#0;#0;15:19:eapp;15:16:evar;15:16:qname;?0;15:16:ident;@67;#1;17:18:evar;17:18:qname;?0;17:18:ident;@6e;#0;#0;#1;!E0118:15:20:1:1;=15:20:1;")
-}
-
-test "a record update copies the base's other fields, sorted, over the base's span" {
-  assert_eq(dump_expanded(b"type P = { a: Int, b: Int }\nfn f(p: P) -> P = {..p, b: 2}"),
-            "#0;#2;0:27:ty;%priv;5:6:ident;@50;#0;%alias;9:27:trec;#2;11:12:ident;@61;14:17:tcon;14:17:qname;?0;14:17:ident;@496e74;#0;19:20:ident;@62;22:25:tcon;22:25:qname;?0;22:25:ident;@496e74;#0;28:57:fn;%priv;?0;31:32:ident;@66;%gen;#0;#0;#0;#1;33:37:prm;33:34:ident;@70;?1;36:37:tcon;36:37:qname;?0;36:37:ident;@50;#0;?0;?1;42:43:tcon;42:43:qname;?0;42:43:ident;@50;#0;?0;#0;#0;46:57:erec;#2;49:50:ident;@61;49:50:efld;49:50:evar;49:50:qname;?0;49:50:ident;@70;49:50:ident;@61;52:53:ident;@62;55:56:elit;%int;@32;#0;")
-}
-
-test "a record update of a call binds the call once, typed by the callee's written `->`" {
-  let out = dump_expanded(b"type P = { a: Int, b: Int }\nfn mk() -> P = { a: 1, b: 2 }\nfn f() -> P = {..mk(), b: 3}");
-  assert(!string_contains(out, "!E0116"));
-  assert(string_contains(out, "@3f7530"))
-}
-
-test "a `let` without a type takes the written type of a call, a local or an update" {
-  let out = dump_expanded(b"type P = { a: Int, b: Int }\nfn mk() -> P = { a: 1, b: 2 }\nfn f(q: P) -> P = { let p = mk(); let r = q; let s = {..r, a: p.a}; {..s, b: 3} }");
-  assert(!string_contains(out, "!E"))
 }
 
 test "a `?` on a `let` with a written type keeps the annotation" {
