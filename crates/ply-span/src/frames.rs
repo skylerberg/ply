@@ -331,6 +331,7 @@ fn by_code(code: &str, message: &str) -> Option<Diagnostic> {
         "E0305" => Diagnostic::error(codes::HANDLER_CLAUSE_MISSING, message),
         "E0306" => Diagnostic::error(codes::LABEL_INSTANTIATION, message),
         "E0307" => Diagnostic::error(codes::LABEL_GROUP_BINDERS, message),
+        "E0308" => Diagnostic::error(codes::POLYMORPHIC_RECURSION, message),
         "E0412" => Diagnostic::error(codes::NONDET_IN_DET_TEST, message),
         "E0413" => Diagnostic::error(codes::TASK_ESCAPES_SCOPE, message),
         "E0416" => Diagnostic::error(codes::NESTED_SIMULATION, message),
