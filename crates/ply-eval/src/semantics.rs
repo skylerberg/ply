@@ -16,11 +16,22 @@ pub fn strict_binary(
     match op {
         BinOp::Eq => Ok(Value::Bool(values_equal(l, r, span)?)),
         BinOp::Ne => Ok(Value::Bool(!values_equal(l, r, span)?)),
-        BinOp::Concat => {
-            let a = l.as_str(lspan, "`++`")?;
-            let b = r.as_str(rspan, "`++`")?;
-            Ok(Value::str(format!("{a}{b}")))
-        }
+        // Two strings or two byte strings; the checker refuses one of each, so neither side coerces.
+        BinOp::Concat => match (l, r) {
+            (Value::Bytes(a), Value::Bytes(b)) => {
+                let mut out = Vec::with_capacity(a.len() + b.len());
+                out.extend_from_slice(a);
+                out.extend_from_slice(b);
+                Ok(Value::bytes(out))
+            }
+            (Value::Bytes(_), other) => Err(type_error(rspan, "`++`", "Bytes", other)),
+            (other, Value::Bytes(_)) => Err(type_error(lspan, "`++`", "Bytes", other)),
+            _ => {
+                let a = l.as_str(lspan, "`++`")?;
+                let b = r.as_str(rspan, "`++`")?;
+                Ok(Value::str(format!("{a}{b}")))
+            }
+        },
         // IEEE: `NaN < x` and `NaN >= x` are both false; a comparison is not its converse negated.
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
             if let (Value::Float(a), Value::Float(b)) = (l, r) {

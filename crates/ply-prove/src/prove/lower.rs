@@ -73,7 +73,7 @@ pub enum Blocker {
     NonlinearMultiplication,
     CoefficientRange,
     Lambda,
-    StringConcat,
+    Concat,
     BitOperator,
     FloatTerm,
     DecimalArithmetic,
@@ -738,14 +738,19 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 term
             }
             BinOp::Concat => {
-                self.blocked(Blocker::StringConcat);
+                self.blocked(Blocker::Concat);
                 let head = self.terms.opaque(term::CONCAT, None);
+                // Both sides share one sort, so either side that has one gives the answer's.
+                let sort = match self.terms.sort(lhs).or(self.terms.sort(rhs)) {
+                    Some(t) => t.clone(),
+                    None => Type::string(),
+                };
                 self.terms.mk(
                     Node::App {
                         head,
                         args: vec![lhs, rhs],
                     },
-                    Some(Type::string()),
+                    Some(sort),
                 )
             }
         }
