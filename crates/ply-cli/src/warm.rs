@@ -1,14 +1,10 @@
 //! What survives one iteration of a warm process, so the next need not re-establish it.
 
-use crate::load::Loaded;
+use crate::load::{Found, Loaded, Stamp, stamp_of};
 use ply_store::ContentHash;
 use ply_ty::{DefHash, HashOutput};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
-
-/// Modification time and length: hashing every file is the cost this exists to avoid.
-type Stamp = (Option<SystemTime>, u64);
 
 #[derive(Default)]
 pub struct Warm {
@@ -40,7 +36,7 @@ impl Warm {
     /// The state to run against, or `None` to load it; a failed iteration leaves nothing held.
     pub fn take(&mut self, root: &Path) -> (Option<Loaded>, Reuse) {
         let held = self.held.take();
-        let Some(held) = held else {
+        let Some(mut held) = held else {
             return (None, Reuse::Cold);
         };
         // A file appearing or disappearing changes the module set, which no stamp shows.
@@ -69,23 +65,28 @@ impl Warm {
             }
         }
         if changed == 0 {
-            // Re-stamp, or every later iteration rereads these files.
+            // Re-stamp, or every later iteration rereads these files. Onto the held state too,
+            // since it is what the next `keep` writes the baseline back from.
+            for file in &mut held.files {
+                if let Some(stamp) = now.get(&file.path) {
+                    file.stamp = *stamp;
+                }
+            }
             self.stamps = now;
             return (Some(held), Reuse::Whole);
         }
         (None, Reuse::Reloaded { changed })
     }
 
+    /// The next iteration's baseline: what this load read, never a later look at the disk — the
+    /// iteration ends long after the read, and a save in between is the change it exists to catch.
     pub fn keep(&mut self, loaded: Loaded) {
-        self.stamps = stamps(&loaded.files);
-        self.content = loaded
-            .files
-            .iter()
-            .filter_map(|path| {
-                let bytes = std::fs::read(path).ok()?;
-                Some((path.clone(), ContentHash::of(&bytes)))
-            })
-            .collect();
+        self.stamps.clear();
+        self.content.clear();
+        for file in &loaded.files {
+            self.stamps.insert(file.path.clone(), file.stamp);
+            self.content.insert(file.path.clone(), file.content);
+        }
         self.held = Some(loaded);
     }
 
@@ -125,10 +126,7 @@ impl Warm {
             return true;
         }
         for (path, was) in &self.stamps {
-            let now = std::fs::metadata(path)
-                .map(|m| (m.modified().ok(), m.len()))
-                .unwrap_or((None, u64::MAX));
-            if &now != was {
+            if &stamp_of(path) != was {
                 return true;
             }
         }
@@ -136,15 +134,11 @@ impl Warm {
     }
 }
 
-pub fn stamps(files: &[PathBuf]) -> BTreeMap<PathBuf, Stamp> {
+/// What these files stamp now, which the held baseline is compared against.
+pub fn stamps(files: &[Found]) -> BTreeMap<PathBuf, Stamp> {
     files
         .iter()
-        .map(|path| {
-            let stamp = std::fs::metadata(path)
-                .map(|m| (m.modified().ok(), m.len()))
-                .unwrap_or((None, u64::MAX));
-            (path.clone(), stamp)
-        })
+        .map(|f| (f.path.clone(), stamp_of(&f.path)))
         .collect()
 }
 

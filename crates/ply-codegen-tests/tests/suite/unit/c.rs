@@ -520,6 +520,12 @@ pub fn alone(n: Int) -> Int = twice(n)
         refused.iter().any(|r| r.function == "m.both"),
         "`m.both` calls a definition this build was not offered: {refused:?}"
     );
+    // The knob keeps working because the callee it took away is what excuses the refusal: offer
+    // that callee and the same refusal is a build error.
+    assert!(
+        !ply_codegen::c::fatal_refusals(&all, &refused).is_empty(),
+        "a refusal the offer did not cause would have been raised: {refused:?}"
+    );
     assert_eq!(answer(&narrowed, "m.alone", 5), Some(10));
     drop(narrowed);
 
@@ -538,6 +544,86 @@ pub fn alone(n: Int) -> Int = twice(n)
             None => std::env::remove_var("PLY_C_CACHE"),
         }
     }
+}
+
+/// A refusal that survives the fixpoint is a definition nothing can ever enter, so it fails the
+/// build — unless a narrowed offer took its callee out from under it, which is what the debugging
+/// knobs do, transitively.
+#[test]
+fn a_refusal_the_offer_did_not_cause_is_what_fails_the_build() {
+    let refusal = |function: &str, construct: &str, missing: Option<&str>| ply_codegen::Refused {
+        function: function.to_string(),
+        construct: construct.to_string(),
+        missing: missing.map(str::to_string),
+    };
+    let refusals = [
+        refusal(
+            "m.lost_a_callee",
+            "`m.never_offered`, which is not in this compiled unit",
+            Some("m.never_offered"),
+        ),
+        refusal(
+            "m.lost_that_one",
+            "`m.lost_a_callee`, which is not in this compiled unit",
+            Some("m.lost_a_callee"),
+        ),
+        refusal(
+            "m.uncompilable",
+            "a construct this port does not emit",
+            None,
+        ),
+        refusal(
+            "m.calls_it",
+            "`m.uncompilable`, which is not in this compiled unit",
+            Some("m.uncompilable"),
+        ),
+    ];
+    let offered = [
+        "m.lost_a_callee",
+        "m.lost_that_one",
+        "m.uncompilable",
+        "m.calls_it",
+    ];
+    let fatal: Vec<&str> = ply_codegen::c::fatal_refusals(&offered, &refusals)
+        .iter()
+        .map(|r| r.function.as_str())
+        .collect();
+    assert_eq!(fatal, ["m.uncompilable", "m.calls_it"]);
+    // Offer the callee the first two lost and nothing is excused any more.
+    let whole = ["m.never_offered"]
+        .into_iter()
+        .chain(offered)
+        .collect::<Vec<&str>>();
+    assert_eq!(ply_codegen::c::fatal_refusals(&whole, &refusals).len(), 4);
+}
+
+/// The failure is reported where the program is built, against the definition's own place, so
+/// nothing is left for the entry that would find no body.
+#[test]
+fn the_build_error_names_each_refused_definition_and_where_it_sits() {
+    let Some(loaded) = tests_support::keyed("pub fn one() -> Int = 1\n") else {
+        return;
+    };
+    let refusals = [ply_codegen::Refused {
+        function: "m.one".to_string(),
+        construct: "a construct this port does not emit".to_string(),
+        missing: None,
+    }];
+    let borrowed: Vec<&ply_codegen::Refused> = refusals.iter().collect();
+    let diagnostic = ply_codegen::c::Refusals::over(loaded, &borrowed).into_diagnostic();
+    assert_eq!(diagnostic.code, ply_span::codes::DEFINITION_REFUSED);
+    let label = diagnostic.labels.first().expect("the refusal is placed");
+    assert!(label.primary);
+    assert_eq!(label.message, "a construct this port does not emit");
+    assert_eq!(Some(label.span), loaded.span_of("m.one"));
+    assert!(
+        diagnostic
+            .notes
+            .iter()
+            .any(|n| n.contains("`m.one` (a construct this port does not emit)")),
+        "{:?}",
+        diagnostic.notes
+    );
 }
 
 /// Shape ids are baked into the C, so a unit read back must intern them in recorded order; the nonce makes the first build a miss.

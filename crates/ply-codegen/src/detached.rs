@@ -63,10 +63,11 @@ const ONE_SHOT: &str = "the region this continuation was captured in has already
 pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, body: Word) -> Word {
     let c = unsafe { &mut *ctx };
     let id = c.detached.len();
+    let regions = c.region_depth();
     let frames = c.open_stack(Some(c.current));
     c.stacks[frames]
         .list
-        .push(HandlerFrame::detached(clauses, id));
+        .push(HandlerFrame::detached(clauses, id, regions));
     let stack = Stack::new();
     let sp = stack.prepare(entry, ctx as usize);
     let floor = stack.floor();
@@ -329,7 +330,8 @@ extern "C" fn entry(arg: usize) {
     let c = unsafe { &mut *ctx };
     let frames = c.detached[id].frames;
     let frame = c.stacks[frames].list.pop();
-    // A zero-shot clause of this frame unwinds to it; `return` is not applied.
+    // A zero-shot clause of this frame unwinds to it; `return` is not applied. The body's regions
+    // are not closed here: a clause suspended in `resume` may own one and run on past this.
     if c.failed == FAILED_UNWIND
         && let Some((stack, depth, v)) = c.unwind.take()
     {

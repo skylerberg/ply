@@ -353,8 +353,8 @@ pub mod codes {
     pub const SPAN_UNBALANCED: &str = "E0445";
     /// A value branded with a region's name would outlive the region.
     pub const REGION_ESCAPE: &str = "E0446";
-    /// Two regions in scope at once under one name.
-    pub const REGION_ALREADY_OPEN: &str = "E0447";
+    /// A definition the program reaches that the compiled tier cannot compile.
+    pub const DEFINITION_REFUSED: &str = "E0448";
     /// A region handle crossing a runtime boundary, where no type is left to check.
     pub const REGION_ESCAPE_AT_BOUNDARY: &str = "E0449";
     pub const BACKEND_UNAVAILABLE: &str = "E0450";
@@ -560,7 +560,7 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ("E0444", "artifact built under another version"),
     ("E0445", "`trace.exit` of a span not open on this task"),
     ("E0446", "value outlives its region"),
-    ("E0447", "two regions in scope under one name"),
+    ("E0448", "definition the compiled tier cannot compile"),
     ("E0449", "region handle reaching a runtime boundary"),
     ("E0450", "compiled backend cannot be attached"),
     ("E0451", "`fs` label with no root bound"),
@@ -855,7 +855,7 @@ mod tests {
             ("ARTIFACT_VERSION", codes::ARTIFACT_VERSION, "E0444"),
             ("SPAN_UNBALANCED", codes::SPAN_UNBALANCED, "E0445"),
             ("REGION_ESCAPE", codes::REGION_ESCAPE, "E0446"),
-            ("REGION_ALREADY_OPEN", codes::REGION_ALREADY_OPEN, "E0447"),
+            ("DEFINITION_REFUSED", codes::DEFINITION_REFUSED, "E0448"),
             (
                 "REGION_ESCAPE_AT_BOUNDARY",
                 codes::REGION_ESCAPE_AT_BOUNDARY,

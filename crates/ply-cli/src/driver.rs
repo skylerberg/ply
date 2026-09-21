@@ -1,6 +1,8 @@
 //! The front end: the port parses, resolves and checks the program; its answer is kept per module.
 
-use crate::load::{Discovered, LoadError, Loaded, anchor, discover, unreadable};
+use crate::load::{
+    Discovered, Found, LoadError, Loaded, Stamp, anchor, discover, stamp_of, unreadable,
+};
 use ply_prove::prove::{Claims, read_claims};
 use ply_span::frames::Cursor;
 use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
@@ -215,6 +217,8 @@ struct FileState {
     source: SourceId,
     text: Arc<str>,
     content: ContentHash,
+    /// What the file stamped before this load read it, which a watcher compares against.
+    stamp: Stamp,
     /// As the port answered them, or, until it has, as the last filed answer recorded them.
     imports: Vec<ModuleName>,
     /// Embedded in the binary rather than discovered on disk.
@@ -267,11 +271,14 @@ impl<'s> Driver<'s> {
 
         timed(&mut phases.read, || {
             for file in &discovered {
+                // Before the read: a save that lands between the two then moves the stamp away
+                // from what this load recorded, so the next one looks rather than trusts it.
+                let stamp = stamp_of(&file.path);
                 match std::fs::read_to_string(&file.path) {
                     Ok(text) => {
                         let content = ContentHash::of(text.as_bytes());
                         let id = sources.add(&file.path, text);
-                        read.push((id, content));
+                        read.push((id, content, stamp));
                     }
                     Err(e) => diagnostics.push(unreadable(&file.path, &e)),
                 }
@@ -286,7 +293,7 @@ impl<'s> Driver<'s> {
 
         // Checked with the text on hand, so an unusable path is reported against the file.
         let mut files = Vec::with_capacity(discovered.len());
-        for (file, &(source, content)) in discovered.iter().zip(&read) {
+        for (file, &(source, content, stamp)) in discovered.iter().zip(&read) {
             match ModuleName::from_relative_path(&file.relative) {
                 Ok(module) if crate::shipped::is_shipped_name(module.as_str()) => {
                     let diagnostic =
@@ -302,6 +309,7 @@ impl<'s> Driver<'s> {
                         .map(|f| f.text.clone())
                         .unwrap_or_else(|| "".into()),
                     content,
+                    stamp,
                     imports: Vec::new(),
                     shipped: false,
                 }),
@@ -354,7 +362,15 @@ impl<'s> Driver<'s> {
         );
         warnings.extend(cache);
 
-        let files = self.files.iter().map(|f| f.path.clone()).collect();
+        let files = self
+            .files
+            .iter()
+            .map(|f| Found {
+                path: f.path.clone(),
+                stamp: f.stamp,
+                content: f.content,
+            })
+            .collect();
         // Whether the whole-program promise check has anything to check.
         let promised = front.defs_written.values().any(|w| w.reuse);
         Ok(Loaded {
@@ -578,6 +594,7 @@ impl<'s> Driver<'s> {
                 .map(|f| f.text.clone())
                 .unwrap_or_else(|| "".into());
             self.files.push(FileState {
+                stamp: stamp_of(&path),
                 path,
                 module,
                 source,
@@ -1074,7 +1091,8 @@ fn interfaces(
         out.push((
             hash,
             Interface::Def(
-                CachedDef::new(d.scheme.clone(), d.footprint.clone()).witnessed_by(names.clone()),
+                CachedDef::new(d.scheme.clone(), d.footprint.clone(), d.performed.clone())
+                    .witnessed_by(names.clone()),
             ),
         ));
     }
