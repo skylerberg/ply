@@ -5,7 +5,7 @@ use ply_codegen::c::producer::print_bodies;
 use ply_span::{Diagnostic, SourceId, Symbol, codes};
 use ply_store::body::{BodySet, StoredBody};
 use ply_ty::{CheckOutput, DefHash, HashOutput};
-use ply_ty::{Row, RowVar, Scheme, TyVar, Type};
+use ply_ty::{LabelVar, Resource, Row, RowVar, Scheme, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// `files[i]` is `(module name, text)` for `SourceId(i)`.
@@ -60,7 +60,13 @@ fn print(
 fn canonical(scheme: &Scheme) -> Scheme {
     let mut tys: BTreeMap<TyVar, TyVar> = BTreeMap::new();
     let mut rows: BTreeMap<RowVar, RowVar> = BTreeMap::new();
-    let ty = renumber(&scheme.ty, &mut tys, &mut rows);
+    // Labels first, in the head's order: an atom sorts by the number its label holds.
+    let mut labels: BTreeMap<LabelVar, LabelVar> = BTreeMap::new();
+    for v in &scheme.label_vars {
+        let next = LabelVar(labels.len() as u32);
+        labels.entry(*v).or_insert(next);
+    }
+    let ty = renumber(&scheme.ty, &mut tys, &mut rows, &mut labels);
     Scheme {
         ty_vars: scheme
             .ty_vars
@@ -74,6 +80,12 @@ fn canonical(scheme: &Scheme) -> Scheme {
             .filter_map(|v| rows.get(v))
             .copied()
             .collect(),
+        label_vars: scheme
+            .label_vars
+            .iter()
+            .filter_map(|v| labels.get(v))
+            .copied()
+            .collect(),
         ty,
     }
 }
@@ -82,6 +94,7 @@ fn renumber(
     ty: &Type,
     tys: &mut BTreeMap<TyVar, TyVar>,
     rows: &mut BTreeMap<RowVar, RowVar>,
+    labels: &mut BTreeMap<LabelVar, LabelVar>,
 ) -> Type {
     match ty {
         Type::Var(v) => {
@@ -90,32 +103,46 @@ fn renumber(
         }
         Type::Con(name, args) => Type::Con(
             name.clone(),
-            args.iter().map(|a| renumber(a, tys, rows)).collect(),
+            args.iter()
+                .map(|a| renumber(a, tys, rows, labels))
+                .collect(),
         ),
         Type::Fn {
             params,
             ret,
             effects,
         } => {
-            let params = params.iter().map(|p| renumber(p, tys, rows)).collect();
-            let ret = Box::new(renumber(ret, tys, rows));
+            let params = params
+                .iter()
+                .map(|p| renumber(p, tys, rows, labels))
+                .collect();
+            let ret = Box::new(renumber(ret, tys, rows, labels));
             let tail = effects.tail.map(|t| {
                 let next = RowVar(rows.len() as u32);
                 *rows.entry(t).or_insert(next)
             });
+            let atoms = effects
+                .atoms
+                .iter()
+                .map(|atom| {
+                    let mut out = atom.clone();
+                    if let Resource::Var(v) = atom.resource {
+                        let next = LabelVar(labels.len() as u32);
+                        out.resource = Resource::Var(*labels.entry(v).or_insert(next));
+                    }
+                    out
+                })
+                .collect();
             Type::Fn {
                 params,
                 ret,
-                effects: Row {
-                    atoms: effects.atoms.clone(),
-                    tail,
-                },
+                effects: Row { atoms, tail },
             }
         }
         Type::Record(fields) => Type::Record(
             fields
                 .iter()
-                .map(|(k, v)| (k.clone(), renumber(v, tys, rows)))
+                .map(|(k, v)| (k.clone(), renumber(v, tys, rows, labels)))
                 .collect(),
         ),
     }

@@ -23,6 +23,23 @@ fn a_code_is_explained_in_one_line_and_as_json() {
 }
 
 #[test]
+fn the_label_instantiation_code_is_explained_like_any_other() {
+    let out = ply().args(["explain", "E0306"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "E0306 label instantiation: a call leaves a label unfilled or writes the wrong number \
+         of them, or a label-generic definition is used as a value\n"
+    );
+
+    let out = ply().args(["explain", "e0306", "--json"]).output().unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["code"], "E0306");
+    assert_eq!(v["severity"], "error");
+    assert_eq!(v["meaning"], ply_span::meaning("E0306").unwrap());
+}
+
+#[test]
 fn a_code_nothing_raises_exits_two_and_points_at_the_list() {
     let out = ply().args(["explain", "E9999"]).output().unwrap();
     assert_eq!(out.status.code(), Some(2));

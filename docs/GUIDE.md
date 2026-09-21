@@ -248,6 +248,17 @@ lowercase names in `<...>`, and row parameters follow `|` (`<| e>` if there are
 no type parameters); a row variable among the type parameters is `E0301`.
 Aliases may be parameterized: `pub type Route<a> = { ... endpoint: a }`.
 
+A bracketed name binds a resource label:
+`fn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)`. Binders sit
+among the type parameters and before the `|` — `fn serve<a, [l], [k] | e>(..)` —
+and one bracket may hold several, so `<[l, k]>` is `<[l], [k]>`. A call fills
+them left to right, either written, `relay[conn](b)`, or from an argument whose
+row names one (§6.2); a recursive call reuses its own and writes none. A printed
+signature shows the binders, `<[l]>(Bytes) -> Unit / {net.send[l]}` and
+`<a, [l] | e>(a) -> Unit / {net.send[l] | e}`, naming label variables `l`, `m`,
+`n`, then `l2`. Filling the wrong number of labels, leaving one unfilled, or
+using a label-generic definition as a value instead of calling it, is `E0306`.
+
 ### 4.6 Types the language declares
 
 In scope everywhere; redeclaring one is `E0105`:
@@ -497,8 +508,17 @@ whose row names an operation is not the same type as one whose row names the
 mode.
 
 Resource labels are global — two modules writing `[users]` name one resource —
-and cannot be abstracted over. Two atoms **conflict** iff they name the same
-resource of the same effect and one is a `write`.
+and a definition may be generic over one (§4.5). Its binder shadows that global
+namespace inside the body: under `fn relay<[l]>`, the `[l]` of a row, of a
+perform `net.send[l](b)`, of a handler clause `net.send[l](x) -> ..` and of a
+nested call `inner[l](..)` is that parameter, while a label no binder holds is
+the global one of that name. A call fills it with a label it writes,
+`relay[conn](b)`, or with the one an argument's row names: a parameter typed
+`() -> Unit / {net.send[l]}` given an argument whose row is `{net.send[conn]}`
+fills `l` with `conn`. A label left unfilled is `E0306`.
+
+Two atoms **conflict** iff they name the same resource of the same effect and
+one is a `write`.
 
 ### 6.3 Performing
 
@@ -1298,6 +1318,7 @@ the message.
 | `E0303` | unhandled effect (compiler defect) |
 | `E0304` | resource label required |
 | `E0305` | `handle` leaves an operation, or a mode atom, under a handled mode atom unanswered |
+| `E0306` | label instantiation: a call leaves a label unfilled or writes the wrong number of them, or a label-generic definition is used as a value |
 | `E0412` | nondeterministic effect in a deterministic test |
 | `E0413` | `Task` escapes its region |
 | `E0414` | deadlock, or spent step budget |
@@ -1361,8 +1382,7 @@ the message.
 
 * No loops, `break` or `return` (`?` is the only early exit); no mutable
   variables; no exceptions; no typeclasses, implicits or method syntax; no
-  modules-as-values, first-class effects or abstraction over resource labels; no
-  `unsafe` or FFI.
+  modules-as-values or first-class effects; no `unsafe` or FFI.
 * Specs cannot name mutable state. Cycles are not collected, and a task never
   moves between OS threads.
 * No file handles, streaming, recursive walk, permissions or `stdin`; no
@@ -1380,6 +1400,7 @@ In `examples/`: `clock.ply` (a `nondet` effect, a handler, `test/nondet`);
 `ledger.ply` and `report.ply` (modules, specs, laws); `pipeline.ply`, `bank.ply`
 and `timeout.ply` (simulation, a race and its fix, a virtual clock); `echo.ply`
 and `hello.ply` (sockets, an HTTP endpoint); `orders.ply` (`derive json`);
+`relay.ply` (one forwarder generic over the label it writes under);
 `store.ply` (a handler as a capability grant); `agreement.ply` and
 `twin_divergence_audit.ply` (`std.db`'s twin against recorded PostgreSQL
 answers); `desk.ply` (a PostgreSQL service with TLS, config, tracing and

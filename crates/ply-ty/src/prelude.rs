@@ -119,6 +119,7 @@ pub fn ctors() -> IndexMap<Symbol, CtorInfo> {
                     scheme: Scheme {
                         ty_vars: vars.clone(),
                         row_vars: vec![],
+                        label_vars: vec![],
                         ty,
                     },
                     span: Span::DUMMY,
@@ -323,6 +324,7 @@ fn op(
         scheme: Some(Scheme {
             ty_vars,
             row_vars,
+            label_vars: Vec::new(),
             ty: Type::Fn {
                 params,
                 ret: Box::new(ret),

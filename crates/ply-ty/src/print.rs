@@ -1,6 +1,6 @@
 //! Human-facing rendering of types, rows and schemes.
 
-use crate::ty::{Row, RowVar, Scheme, TyVar, Type};
+use crate::ty::{Resource, Row, RowVar, Scheme, TyVar, Type};
 use rustc_hash::FxHashMap;
 
 /// A constructor name no lexer can produce, so a cell's region type never collides with a user's.
@@ -25,6 +25,7 @@ pub struct Printer {
 
 const TY_LETTERS: &[u8] = b"abcdghijklmnopqrsuvwxyz";
 const ROW_LETTERS: &[u8] = b"eft";
+pub(crate) const LABEL_LETTERS: &[u8] = b"lmn";
 
 impl Printer {
     pub fn new() -> Self {
@@ -119,14 +120,15 @@ impl Printer {
 
     pub fn scheme(&mut self, s: &Scheme) -> String {
         let body = self.ty(&s.ty);
-        if s.ty_vars.is_empty() && s.row_vars.is_empty() {
+        if s.ty_vars.is_empty() && s.label_vars.is_empty() && s.row_vars.is_empty() {
             return body;
         }
-        let tys: Vec<String> = s.ty_vars.iter().map(|v| self.ty_name(*v)).collect();
+        let mut params: Vec<String> = s.ty_vars.iter().map(|v| self.ty_name(*v)).collect();
+        params.extend(s.label_vars.iter().map(|v| Resource::Var(*v).to_string()));
         let rows: Vec<String> = s.row_vars.iter().map(|v| self.row_name(*v)).collect();
-        let head = match (tys.is_empty(), rows.is_empty()) {
-            (false, false) => format!("<{} | {}>", tys.join(", "), rows.join(", ")),
-            (false, true) => format!("<{}>", tys.join(", ")),
+        let head = match (params.is_empty(), rows.is_empty()) {
+            (false, false) => format!("<{} | {}>", params.join(", "), rows.join(", ")),
+            (false, true) => format!("<{}>", params.join(", ")),
             (true, false) => format!("<| {}>", rows.join(", ")),
             (true, true) => unreachable!(),
         };
@@ -143,7 +145,7 @@ fn as_cell(t: &Type) -> Option<(&Type, &Type)> {
     }
 }
 
-fn letter_name(letters: &[u8], i: usize) -> String {
+pub(crate) fn letter_name(letters: &[u8], i: usize) -> String {
     let c = letters[i % letters.len()] as char;
     let round = i / letters.len();
     if round == 0 {

@@ -29,7 +29,10 @@ pub type Node =
   | NList({ items: List<Code> })
   | NRecord({ fields: List<CField> })
   | NMatch({ scrutinee: Code, arms: List<CArm> })
-  | NPerform({ effect: Bytes, op: Bytes, resource: Bytes, args: List<Code> })
+  // `label` is the read of the label parameter the resource names, when a binder holds it.
+  | NPerform({ effect: Bytes, op: Bytes, resource: Bytes, label: Option<Code>, args: List<Code> })
+  // One label argument of a call: the field-table entry of a resource named here.
+  | NLabel(Bytes)
   | NCell({ resource: Bytes, binder: Bytes, slot: Option<Int>, init: Code, body: Code })
   | NRegion({ body: Code })
   | NLambda({ params: Int, size: Int, caps: List<Cap>, body: Code })
@@ -58,7 +61,7 @@ pub type CArm = { pat: CPat, guard: Option<Code>, body: Code }
 pub type Cap = { src: Int, dst: Int, own: Own }
 
 // A handler clause opens its own barrier: its parameters and `resume` binder take the leading slots.
-pub type CClause = { effect: Bytes, op: Bytes, resource: Bytes, params: Int,
+pub type CClause = { effect: Bytes, op: Bytes, resource: Bytes, label: Option<Code>, params: Int,
                      resume: Bool, size: Int, caps: List<Cap>, body: Code }
 
 pub type CRet = { size: Int, caps: List<Cap>, body: Code }
@@ -72,6 +75,13 @@ pub type CStmt =
 
 // --- the dump ---------------------------------------------------------------
 // `ply_prove::prove::claims` reads this back, so every spelling here is load-bearing.
+
+// A resource a label parameter names is the slot it reads, which stays one comma-free word.
+fn res_tag(name: Bytes, label: Option<Code>) -> Bytes =
+  match label {
+    None -> name,
+    Some(c) -> match c.node { NVar(v) -> bytes_concat(b"$", slot_tag(v.slot)), _ -> name },
+  }
 
 pub fn dump_lit(l: Lit) -> Bytes =
   match l {
@@ -176,8 +186,9 @@ fn dump_node(n: Node) -> Bytes =
                                             match a.guard { Some(g) -> dump(g), None -> b"-" },
                                             b",", dump(a.body), b")"])),
                         b")"]),
+    NLabel(n) -> bytes_concat_all([b"label(", n, b")"]),
     NPerform(p) ->
-      bytes_concat_all([b"perform(", p.effect, b",", p.op, b",", p.resource,
+      bytes_concat_all([b"perform(", p.effect, b",", p.op, b",", res_tag(p.resource, p.label),
                         fold(p.args, b"", |acc: Bytes, a: Code| bytes_concat_all([acc, b",", dump(a)])),
                         b")"]),
     NCell(c) ->
@@ -189,7 +200,7 @@ fn dump_node(n: Node) -> Bytes =
     NHandle(h) ->
       bytes_concat_all([b"handle(", dump(h.body),
                         fold(h.clauses, b"", |acc: Bytes, c: CClause|
-                          bytes_concat_all([acc, b",cl(", c.effect, b",", c.op, b",", c.resource, b",",
+                          bytes_concat_all([acc, b",cl(", c.effect, b",", c.op, b",", res_tag(c.resource, c.label), b",",
                                             num(c.params), b",", if c.resume { b"true" } else { b"false" },
                                             b",", num(c.size), b",", dump_caps(c.caps), b",",
                                             dump(c.body), b")"])),
@@ -228,7 +239,7 @@ fn find(f: Frame, name: Bytes) -> Option<Int> =
     if b.name == name { Some(b.slot) } else { acc })
 
 // The barriers in scope, innermost last. A free name is threaded through every barrier between use and binding.
-type Stack = { frames: List<Frame> }
+type Stack = { frames: List<Frame>, labels: List<Bytes>, sites: Map<Bytes, List<Bytes>> }
 
 fn st_top(st: Stack) -> Frame =
   match list_at(st.frames, len(st.frames) - 1) { Some(f) -> f, None -> empty_frame() }
@@ -239,14 +250,14 @@ fn st_at(st: Stack, i: Int) -> Frame =
   match list_at(st.frames, i) { Some(f) -> f, None -> empty_frame() }
 
 fn st_set(st: Stack, i: Int, f: Frame) -> Stack =
-  { frames: map(range(0, len(st.frames)), |j: Int| if j == i { f } else { st_at(st, j) }) }
+  { frames: map(range(0, len(st.frames)), |j: Int| if j == i { f } else { st_at(st, j) }), labels: st.labels, sites: st.sites }
 
 fn st_top_set(st: Stack, f: Frame) -> Stack = st_set(st, len(st.frames) - 1, f)
 
-fn st_push(st: Stack, f: Frame) -> Stack = { frames: push(st.frames, f) }
+fn st_push(st: Stack, f: Frame) -> Stack = { frames: push(st.frames, f), labels: st.labels, sites: st.sites }
 
 fn st_pop(st: Stack) -> Stack =
-  { frames: map(range(0, len(st.frames) - 1), |j: Int| st_at(st, j)) }
+  { frames: map(range(0, len(st.frames) - 1), |j: Int| st_at(st, j)), labels: st.labels, sites: st.sites }
 
 // The depth whose barrier has `name` in scope or already captures it, innermost first.
 fn st_depth(st: Stack, name: Bytes) -> Option<Int> =
@@ -283,6 +294,26 @@ fn resolve(st: Stack, name: Bytes) -> Resolved =
         })
     },
   }
+
+// A resource a label binder holds is read like any other name, captures threaded and all.
+fn label_code(st: Stack, name: Bytes) -> Option<Out> =
+  if !has_bytes(st.labels, name) { None } else {
+    let r = resolve(st, name);
+    Some({ code: { own: Borrowed, span: dummy_span(), node: NVar({ name: name, slot: r.slot }) }, st: r.st })
+  }
+
+fn site_key(s: Span) -> Bytes = bytes_concat_all([num(s.start), b":", num(s.end)])
+
+type Labels = { codes: List<Code>, st: Stack }
+
+// The labels a call fills: this body's own parameter, or a field-table entry of the name.
+fn label_args(st: Stack, s: Span) -> Labels =
+  fold(match map_get(st.sites, site_key(s)) { Some(xs) -> xs, None -> [] },
+       { codes: [], st: st }, |acc: Labels, n: Bytes|
+    match label_code(acc.st, n) {
+      Some(o) -> { codes: push(acc.codes, o.code), st: o.st },
+      None -> { codes: push(acc.codes, { own: Borrowed, span: dummy_span(), node: NLabel(n) }), st: acc.st },
+    })
 
 // A block's binders leave scope at its end, but the slots they took are never reused.
 fn bind_st(st: Stack, name: Bytes) -> Stack = st_top_set(st, bind(st_top(st), name))
@@ -390,7 +421,12 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
         match lower_in(x.func, st) {
           None -> None,
           Some(fu) -> match lower_seq(x.args, fu.st) {
-            Some(r) -> Some({ code: { own: Borrowed, span: expr_span(e), node: NApp({ func: fu.code, args: r.codes }) }, st: r.st }),
+            Some(r) -> {
+              let ls = label_args(r.st, expr_span(e));
+              Some({ code: { own: Borrowed, span: expr_span(e),
+                             node: NApp({ func: fu.code, args: fold(ls.codes, r.codes, |acc: List<Code>, cd: Code| push(acc, cd)) }) },
+                     st: ls.st })
+            },
             None -> None,
           },
         }
@@ -426,12 +462,16 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
     },
     EPerform(x) -> match lower_seq(x.args, st) {
       None -> None,
-      Some(r) -> Some({
-        code: { own: Borrowed, span: expr_span(e), node: NPerform({
-          effect: qname_text(x.eff), op: x.op.name,
-          resource: match x.resource { Some(id) -> id.name, None -> b"" },
-          args: r.codes }) },
-        st: r.st }),
+      Some(r) -> {
+        let name = match x.resource { Some(id) -> id.name, None -> b"" };
+        let lb = label_code(r.st, name);
+        Some({
+          code: { own: Borrowed, span: expr_span(e), node: NPerform({
+            effect: qname_text(x.eff), op: x.op.name, resource: name,
+            label: match lb { Some(o) -> Some(o.code), None -> None },
+            args: r.codes }) },
+          st: match lb { Some(o) -> o.st, None -> r.st } })
+      },
     },
     // The binder is in scope for the body only; the init is evaluated before it exists.
     EWithCell(x) -> match lower_in(x.init, st) {
@@ -480,13 +520,17 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
                 None -> map(c.params, |i: Ident| i.name),
               };
               let inner = fold(names, empty_frame(), |g: Frame, n: Bytes| bind(g, n));
-              match lower_in(c.body, st_push(acc.st, inner)) {
+              // The clause's resource is read where the table is built, outside the clause's own barrier.
+              let res = match c.resource { Some(id) -> id.name, None -> b"" };
+              let lb = label_code(acc.st, res);
+              let outer = match lb { Some(o) -> o.st, None -> acc.st };
+              match lower_in(c.body, st_push(outer, inner)) {
                 None -> { clauses: acc.clauses, st: acc.st, ok: false },
                 Some(cb) -> {
                   let f = st_top(cb.st);
                   { clauses: push(acc.clauses, {
                       effect: qname_text(c.eff), op: c.op.name,
-                      resource: match c.resource { Some(id) -> id.name, None -> b"" },
+                      resource: res, label: match lb { Some(o) -> Some(o.code), None -> None },
                       params: len(c.params), resume: match c.resume { Some(_) -> true, None -> false },
                       size: len(f.names), caps: f.caps,
                       body: mark(cb.code, []).code }),
@@ -838,6 +882,7 @@ fn base_slot(c: Code) -> Option<Int> =
 pub fn mark(c: Code, live: List<Int>) -> Marked =
   match c.node {
     NLit(_) -> { code: c, live: live },
+    NLabel(_) -> { code: c, live: live },
     NVar(v) -> match v.slot {
       None -> { code: c, live: live },
       Some(s) -> {
@@ -936,9 +981,10 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
     },
     NPerform(p) -> {
       let r = mark_seq(p.args, live);
+      let lb = match p.label { Some(x) -> { code: Some(mark(x, r.live).code), live: mark(x, r.live).live }, None -> { code: None, live: r.live } };
       { code: { own: Borrowed, span: c.span, node: NPerform({ effect: p.effect, op: p.op, resource: p.resource,
-                                                args: r.codes }) },
-        live: r.live }
+                                                label: lb.code, args: r.codes }) },
+        live: lb.live }
     },
     // The binder dies at the `with_cell`, as a `let`'s does at its `let`.
     NCell(cl) -> {
@@ -1052,9 +1098,10 @@ fn rev_stmts(xs: List<CStmt>) -> List<CStmt> =
 pub type LowerOut = { dump: Bytes, lowered: Int, skipped: Int }
 
 // One function body: slots resolved forwards, then ownership marked backwards.
-pub fn lower_fn(params: List<Bytes>, body: Expr) -> Option<{ code: Code, size: Int }> = {
+// `params` ends with `labels`, the hidden trailing parameters a label-generic definition takes.
+pub fn lower_fn(params: List<Bytes>, labels: List<Bytes>, sites: Map<Bytes, List<Bytes>>, body: Expr) -> Option<{ code: Code, size: Int }> = {
   let start = fold(params, { names: [], scope: [], caps: [], capnames: [] }, |f: Frame, p: Bytes| bind(f, p));
-  match lower_in(body, { frames: [start] }) {
+  match lower_in(body, { frames: [start], labels: labels, sites: sites }) {
     None -> None,
     Some(o) -> Some({ code: mark(o.code, []).code, size: len(st_top(o.st).names) }),
   }
@@ -1066,17 +1113,20 @@ pub fn lower_module(src: Bytes) -> LowerOut = {
   fold(x.module.items, { dump: b"L;1;", lowered: 0, skipped: 0 },
     |acc: LowerOut, it: Item|
       match it {
-        IFn(d) ->
-          match lower_fn(map(d.params, |p: Param| p.name.name), d.body) {
+        IFn(d) -> {
+          let labels = map(d.generics.labels, |g: Ident| g.name);
+          let names = fold(labels, map(d.params, |p: Param| p.name.name), |xs: List<Bytes>, n: Bytes| push(xs, n));
+          match lower_fn(names, labels, map_new(), d.body) {
             None -> { dump: acc.dump, lowered: acc.lowered, skipped: acc.skipped + 1 },
             Some(l) -> {
               dump: bytes_concat_all([acc.dump, b"f:m.", d.name.name, b":",
-                                      num(len(d.params)), b":", num(l.size), b";",
+                                      num(len(names)), b":", num(l.size), b";",
                                       dump(l.code), b";"]),
               lowered: acc.lowered + 1,
               skipped: acc.skipped,
             },
-          },
+          }
+        },
         _ -> acc,
       })
 }

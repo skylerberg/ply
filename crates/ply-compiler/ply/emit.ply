@@ -2,11 +2,11 @@
 // Output is diffed byte for byte against the Rust back end, so emission order and temporary numbering are load-bearing.
 
 import spine (num, Ident, Span, dummy_span)
-import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NUpd, NApp, NRecord, NMatch, CPat, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, CPatField, NPerform, NCell, NRegion, NLambda, NSim, NHandle, CStmt, CLet, CLetPat, CDo, pat_slots, CField, CArm, Cap, CClause, CRet, Own, Borrowed, Owned, lower_fn, qname_text)
+import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NUpd, NApp, NRecord, NMatch, CPat, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, CPatField, NPerform, NLabel, NCell, NRegion, NLambda, NSim, NHandle, CStmt, CLet, CLetPat, CDo, pat_slots, CField, CArm, Cap, CClause, CRet, Own, Borrowed, Owned, lower_fn, qname_text)
 import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, TypeDefBody, TDAlias, parse, ImportDecl, ImportKind, INames, IModule, IAlias, Binder, SpecClause, SRequires, SEnsures, FnDef)
 import resolve (Mod, Source, Resolved_, Failed, resolve_modules, Resolved, Scope, Binding, ModBind, qualify)
 import derive (expand_derives)
-import infer (pure_definitions, sccs)
+import infer (emit_facts, LabelSite, sccs)
 import exprs (Param, Expr, EHandle, ESimulate, EUnary, EBinary, ELambda, EApp, EIf, EMatch, EBlock, ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EWithCell, EWithRegion, HandleClause, MatchArm, RecField, Stmt, SLet, SExpr)
 import types (MWrite, TypeExpr, TVar, TCon, TRecord)
 import rewrite (expand)
@@ -697,7 +697,8 @@ fn slots_read(c: Code) -> List<Int> =
       fold(m.arms, [], |acc: List<Int>, a: CArm| concat(acc, concat(
         match a.guard { Some(g) -> slots_read(g), None -> [] }, slots_read(a.body))))),
     NUpd(u) -> concat(slots_read(u.base), all_read(map(u.sets, |f: CField| f.value))),
-    NPerform(p) -> all_read(p.args),
+    NLabel(_) -> [],
+    NPerform(p) -> concat(match p.label { Some(x) -> slots_read(x), None -> [] }, all_read(p.args)),
     NCell(c2) -> concat(slots_read(c2.init), slots_read(c2.body)),
     NRegion(r) -> slots_read(r.body),
     // A capture read inside a lambda is a read of the object it copies; the lambda's own parameter is not a read here.
@@ -705,7 +706,8 @@ fn slots_read(c: Code) -> List<Int> =
     NSim(x) -> concat(map(x.caps, |c2: Cap| c2.src), slots_read(x.body)),
     NHandle(h) -> concat(slots_read(h.body), concat(
       fold(h.clauses, [], |acc: List<Int>, cl: CClause|
-        concat(acc, through_caps(slots_read(cl.body), cl.caps))),
+        concat(concat(acc, match cl.label { Some(x) -> slots_read(x), None -> [] }),
+               through_caps(slots_read(cl.body), cl.caps))),
       match h.ret { Some(r) -> through_caps(slots_read(r.body), r.caps), None -> [] })),
   }
 
@@ -1742,6 +1744,7 @@ pub fn covers() -> List<Bytes> =
 
 fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
   match c.node {
+    NLabel(n) -> { let f = field_of(em, n); Some({ em: f.em, v: { k: KInt, c: field_ref(f.i), ty: TyOpen } }) },
     NLit(l) -> match l {
       LInt(n) -> Some({ em: em, v: { k: KInt, c: int_lit(n), ty: TyOpen } }),
       // A `Bool` is C's 1 or 0 until something asks for its word.
@@ -2289,17 +2292,21 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           let global = en.global;
           let ef = field_of(w.em, global);
           let op = field_of(ef.em, p.op);
-          let res = if p.resource == b"" { None } else { Some(field_of(op.em, p.resource)) };
-          let after = match res { Some(r) -> r.em, None -> op.em };
+          // A resource a label parameter names is read from its slot; anything else is a field-table entry.
+          let lb: Option<Out> = match p.label { None -> None, Some(x) -> expr(notail(op.em), x, params) };
+          let wanted = match p.label { None -> false, Some(_) -> true };
+          let missed = wanted && (match lb { Some(_) -> false, None -> true });
+          let res = if wanted { None } else if p.resource == b"" { None } else { Some(field_of(op.em, p.resource)) };
+          let after = match lb { Some(o) -> o.em, None -> match res { Some(r) -> r.em, None -> op.em } };
           let arr = fresh(after);
           let e = line(arr.em, bytes_concat_all([b"Word ", arr.name, b"[] = {",
             if len(w.names) == 0 { b"0" } else { bytes_join(w.names, b", ") }, b"};"]));
           let o = bind(note_performs(site(e, c.span), bytes_concat_all([global, b"#", p.op])), KBoxed, bytes_concat_all([
             b"rt_perform_p(ctx, ", field_ref(ef.i), b", ", field_ref(op.i), b", ",
-            match res { Some(r) -> field_ref(r.i), None -> b"-1" }, b", ",
+            match lb { Some(o) -> as_int(o.v), None -> match res { Some(r) -> field_ref(r.i), None -> b"-1" } }, b", ",
             if op_writes(en, p.op) { b"1" } else { b"0" },
             b", (Word)(intptr_t)", arr.name, b", ", num(len(p.args)), b")"]));
-          Some({ em: check(o.em), v: o.v })
+          if missed { None } else { Some({ em: check(o.em), v: o.v }) }
         },
       },
     },
@@ -2438,13 +2445,18 @@ fn handle_site(em: Em, body: Code, clauses: List<CClause>, ret: Option<CRet>, pa
               Some(cl) -> {
                 let held = owned(cl.em, cl.v);
                 let ef = field_of(held.em, x.global);
-                let res = if x.c.resource == b"" { None } else { Some(field_of(ef.em, x.c.resource)) };
-                let op = field_of(match res { Some(r) -> r.em, None -> ef.em }, x.c.op);
-                Some({ em: note_handles(op.em, bytes_concat_all([x.global, b"#", x.c.op])),
-                       entries: push(st.entries, bytes_concat_all([field_ref(ef.i), b", ",
-                         match res { Some(r) -> field_ref(r.i), None -> b"-1" }, b", ", field_ref(op.i), b", ",
-                         held.v.c, b", ",
-                         if !x.c.resume { b"0" } else if resume_in_tail_only(x.c.body, x.c.params) { b"1" } else { b"2" }])) })
+                // A clause on a label parameter keys on the slot, read where the table is built.
+                let lb: Option<Out> = match x.c.label { None -> None, Some(cd) -> expr(notail(ef.em), cd, params) };
+                let wanted = match x.c.label { None -> false, Some(_) -> true };
+                let res = if wanted { None } else if x.c.resource == b"" { None } else { Some(field_of(ef.em, x.c.resource)) };
+                let op = field_of(match lb { Some(o) -> o.em, None -> match res { Some(r) -> r.em, None -> ef.em } }, x.c.op);
+                if wanted && (match lb { Some(_) -> false, None -> true }) { None } else {
+                  Some({ em: note_handles(op.em, bytes_concat_all([x.global, b"#", x.c.op])),
+                         entries: push(st.entries, bytes_concat_all([field_ref(ef.i), b", ",
+                           match lb { Some(o) -> as_int(o.v), None -> match res { Some(r) -> field_ref(r.i), None -> b"-1" } }, b", ", field_ref(op.i), b", ",
+                           held.v.c, b", ",
+                           if !x.c.resume { b"0" } else if resume_in_tail_only(x.c.body, x.c.params) { b"1" } else { b"2" }])) })
+                }
               },
             }
           },
@@ -3637,7 +3649,7 @@ test "guarded arms and every literal pattern are emitted rather than refused" {
 fn emit_all_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, src: Bytes, release: Bool) -> List<Emitted> = {
   let r = parse(src);
   let x = expand(r.node, r.p.uses_sets, r.p.diags);
-  emit_module(module, x.module, ctors, builtins, [], [], [], release, None)
+  emit_module(module, x.module, ctors, builtins, [], [], [], release, None, map_new())
 }
 
 fn aliases_in(m: Module) -> List<Alias> =
@@ -3671,7 +3683,7 @@ fn defs_in(module: Bytes, m: Module, pure: List<Bytes>, program: List<ModDefs>) 
                             ret: match param_kind_with(aliases, others, d.ret) { Some(r) -> Some(r.k), None -> None },
                             ret_ty: match param_kind_with(aliases, others, d.ret) { Some(r) -> r.ty, None -> TyOpen },
                             pure: fold(pure, false, |acc: Bool, n: Bytes| acc || n == qualify(module, d.name.name)),
-                            arity: len(d.params) }),
+                            arity: len(d.params) + len(d.generics.labels) }),
       _ -> acc,
     })
 }
@@ -3693,15 +3705,16 @@ fn emit_program(sources: List<Source>, ctors: List<Bytes>, builtins: List<Bytes>
     match resolve_modules(map(parsed, |p: { name: Bytes, module: Module, derived: List<Derived>, bad: Bool }|
                                { name: p.name, module: p.module, derived: p.derived })) {
       Failed(_) -> [],
-      Resolved_(x) -> match pure_definitions(x.r, x.mods) {
+      Resolved_(x) -> match emit_facts(x.r, x.mods) {
         None -> [],
-        Some(pure) -> {
+        Some(facts) -> {
+          let pure = facts.pure;
           let with_aliases = map(x.mods, |m: Mod| { module: m.name, defs: [], aliases: aliases_in(m.module) });
           let program = map(x.mods, |m: Mod| { module: m.name, defs: defs_in(m.name, m.module, pure, with_aliases), aliases: aliases_in(m.module) });
           fold(range(0, len(x.mods)), [], |acc: List<Emitted>, i: Int|
             match list_at(x.mods, i) {
               None -> acc,
-              Some(m) -> fold(emit_module(m.name, m.module, ctors, builtins, program, pure, effects_in(x.r, i, x.mods), release, wanted), acc, |a: List<Emitted>, e: Emitted| push(a, e)),
+              Some(m) -> fold(emit_module(m.name, m.module, ctors, builtins, program, pure, effects_in(x.r, i, x.mods), release, wanted, sites_in(facts.label_sites, i)), acc, |a: List<Emitted>, e: Emitted| push(a, e)),
             })
         },
       },
@@ -3709,10 +3722,17 @@ fn emit_program(sources: List<Source>, ctors: List<Bytes>, builtins: List<Bytes>
   }
 }
 
+// The labels each call in this module fills, keyed by the call's span, which the lowering reads.
+fn sites_in(all: List<LabelSite>, module: Int) -> Map<Bytes, List<Bytes>> =
+  fold(all, map_new(), |acc: Map<Bytes, List<Bytes>>, s: LabelSite|
+    if s.module != module { acc } else {
+      map_insert(acc, bytes_concat_all([num(s.span.start), b":", num(s.span.end)]), s.labels)
+    })
+
 fn wants(wanted: Option<Map<Bytes, Bool>>, name: Bytes) -> Bool =
   match wanted { None -> true, Some(m) -> map_contains(m, name) }
 
-fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: List<Bytes>, program: List<ModDefs>, pure: List<Bytes>, effects: List<EffectName>, release: Bool, wanted: Option<Map<Bytes, Bool>>) -> List<Emitted> = {
+fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: List<Bytes>, program: List<ModDefs>, pure: List<Bytes>, effects: List<EffectName>, release: Bool, wanted: Option<Map<Bytes, Bool>>, sites: Map<Bytes, List<Bytes>>) -> List<Emitted> = {
   let x = { module: x_module };
   let defs_of = |path: Bytes| fold(program, [], |acc: List<Def>, md: ModDefs| if md.module == path { md.defs } else { acc });
   let others = others_of(x.module, program);
@@ -3746,16 +3766,16 @@ fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: Li
                             ret: match param_kind_with(aliases, others, d.ret) { Some(r) -> Some(r.k), None -> None },
                             ret_ty: match param_kind_with(aliases, others, d.ret) { Some(r) -> r.ty, None -> TyOpen },
                             pure: fold(pure, false, |acc: Bool, n: Bytes| acc || n == qualify(module, d.name.name)),
-                            arity: len(d.params) }),
+                            arity: len(d.params) + len(d.generics.labels) }),
       _ -> acc,
     });
   let fns = fold(x.module.items, [], |acc: List<Prepared>, it: Item|
-    match it { IFn(d) -> push(acc, prepare(module, aliases, others, wanted, d)), _ -> acc });
+    match it { IFn(d) -> push(acc, prepare(module, aliases, others, wanted, sites, d)), _ -> acc });
   let groups = tail_groups(module, here, fns);
   let walked = fold(x.module.items, { out: [], tests: 0, laws: 0, fns: 0 }, |acc: Walk, it: Item|
     match it {
       IFn(d) -> {
-        let p = match list_at(fns, acc.fns) { Some(q) -> q, None -> prepare(module, aliases, others, wanted, d) };
+        let p = match list_at(fns, acc.fns) { Some(q) -> q, None -> prepare(module, aliases, others, wanted, sites, d) };
         let out = match group_of(groups, acc.fns) {
           None -> if !wants(wanted, p.full) { acc.out } else {
             push(acc.out, emitted_from(module, p.base, here, imports, ctors, builtins, effects, release, p.full, p.ps, p.known, p.body, p.code))
@@ -3767,13 +3787,13 @@ fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: Li
                  acc.out, |a: List<Emitted>, e: Emitted| push(a, e))
           },
         };
-        clause_roots({ out: out, tests: acc.tests, laws: acc.laws, fns: acc.fns + 1 }, d, p.names, p.kinds, module, here, imports, ctors, builtins, effects, release, aliases, others, wanted)
+        clause_roots({ out: out, tests: acc.tests, laws: acc.laws, fns: acc.fns + 1 }, d, p.names, p.kinds, module, here, imports, ctors, builtins, effects, release, aliases, others, wanted, sites)
       },
       // A test is a nullary root named by its place among the module's tests.
       ITest(t) -> {
         let full = qualify(module, bytes_concat_all([b"test#", num(acc.tests)]));
         let out = if !wants(wanted, full) { acc.out } else {
-          push(acc.out, root_emitted(module, t.span.start, here, imports, ctors, builtins, effects, release, full, [], [], true, t.body))
+          push(acc.out, root_emitted(module, t.span.start, here, imports, ctors, builtins, effects, release, full, [], [], true, sites, t.body))
         };
         { out: out, tests: acc.tests + 1, laws: acc.laws, fns: acc.fns }
       },
@@ -3787,11 +3807,11 @@ fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: Li
         let with_guard = match d.guard {
           None -> acc.out,
           Some(g) -> if !wants(wanted, part(b".guard")) { acc.out } else {
-            push(acc.out, root_emitted(module, d.span.start, here, imports, ctors, builtins, effects, release, part(b".guard"), names, ps, known, g))
+            push(acc.out, root_emitted(module, d.span.start, here, imports, ctors, builtins, effects, release, part(b".guard"), names, ps, known, sites, g))
           },
         };
         { out: if !wants(wanted, part(b".body")) { with_guard } else {
-            push(with_guard, root_emitted(module, d.span.start, here, imports, ctors, builtins, effects, release, part(b".body"), names, ps, known, d.body))
+            push(with_guard, root_emitted(module, d.span.start, here, imports, ctors, builtins, effects, release, part(b".body"), names, ps, known, sites, d.body))
           },
           tests: acc.tests, laws: acc.laws + 1, fns: acc.fns }
       },
@@ -3809,13 +3829,18 @@ type Walk = { out: List<Emitted>, tests: Int, laws: Int, fns: Int }
 type Prepared = { full: Bytes, base: Int, names: List<Bytes>, kinds: List<Option<{ k: Kind, ty: Ty }>>, ps: List<P>,
                   known: Bool, body: Expr, code: Option<Code> }
 
-fn prepare(module: Bytes, aliases: List<Alias>, others: List<ModAliases>, wanted: Option<Map<Bytes, Bool>>, d: FnDef) -> Prepared = {
+// A label parameter is a hidden trailing `Int`: the caller passes the resource's field-table entry.
+fn prepare(module: Bytes, aliases: List<Alias>, others: List<ModAliases>, wanted: Option<Map<Bytes, Bool>>,
+           sites: Map<Bytes, List<Bytes>>, d: FnDef) -> Prepared = {
   let names = map(d.params, |p: Param| p.name.name);
   let kinds = map(d.params, |p: Param| param_kind_with(aliases, others, p.ty));
+  let labels = map(d.generics.labels, |g: Ident| g.name);
+  let all_names = fold(labels, names, |acc: List<Bytes>, n: Bytes| push(acc, n));
+  let all_kinds = fold(labels, kinds, |acc: List<Option<{ k: Kind, ty: Ty }>>, n: Bytes| push(acc, Some({ k: KInt, ty: TyOpen })));
   let known = fold(kinds, true, |acc: Bool, k: Option<{ k: Kind, ty: Ty }>| acc && k != None);
   let full = qualify(module, d.name.name);
-  { full: full, base: d.span.start, names: names, kinds: kinds, ps: params_of(names, kinds), known: known, body: d.body,
-    code: if known && wants(wanted, full) { match lower_fn(names, d.body) { Some(l) -> Some(l.code), None -> None } } else { None } }
+  { full: full, base: d.span.start, names: names, kinds: kinds, ps: params_of(all_names, all_kinds), known: known, body: d.body,
+    code: if known && wants(wanted, full) { match lower_fn(all_names, labels, sites, d.body) { Some(l) -> Some(l.code), None -> None } } else { None } }
 }
 
 // The module's definitions in tail-call cycles of two or more, each cycle's members in module order: a call in tail
@@ -3916,9 +3941,9 @@ fn params_of(names: List<Bytes>, kinds: List<Option<{ k: Kind, ty: Ty }>>) -> Li
 // One root's emission, definition, test or proposition alike. An unlowered body's handled operations are read off its source, so the fixpoint still drops their performers.
 fn root_emitted(module: Bytes, base: Int, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>,
                 effects: List<EffectName>, release: Bool, full: Bytes,
-                names: List<Bytes>, ps: List<P>, known: Bool, body: Expr) -> Emitted =
+                names: List<Bytes>, ps: List<P>, known: Bool, sites: Map<Bytes, List<Bytes>>, body: Expr) -> Emitted =
   emitted_from(module, base, here, imports, ctors, builtins, effects, release, full, ps, known, body,
-               if known { match lower_fn(names, body) { Some(l) -> Some(l.code), None -> None } } else { None })
+               if known { match lower_fn(names, [], sites, body) { Some(l) -> Some(l.code), None -> None } } else { None })
 
 fn emitted_from(module: Bytes, base: Int, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>,
                 effects: List<EffectName>, release: Bool, full: Bytes, ps: List<P>, known: Bool, body: Expr, code: Option<Code>) -> Emitted =
@@ -3936,7 +3961,7 @@ fn emitted_from(module: Bytes, base: Int, here: List<Def>, imports: List<Importe
 fn clause_roots(acc: Walk, d: FnDef, names: List<Bytes>, kinds: List<Option<{ k: Kind, ty: Ty }>>, module: Bytes,
                 here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>,
                 effects: List<EffectName>, release: Bool, aliases: List<Alias>, others: List<ModAliases>,
-                wanted: Option<Map<Bytes, Bool>>) -> Walk = {
+                wanted: Option<Map<Bytes, Bool>>, sites: Map<Bytes, List<Bytes>>) -> Walk = {
   let known = fold(kinds, true, |acc2: Bool, k: Option<{ k: Kind, ty: Ty }>| acc2 && k != None);
   let clause = |kind: Bytes, k: Int| qualify(module, bytes_concat_all([d.name.name, b"#", kind, b"#", num(k)]));
   let walked = fold(d.spec, { out: acc.out, requires: 0, ensures: 0 },
@@ -3945,7 +3970,7 @@ fn clause_roots(acc: Walk, d: FnDef, names: List<Bytes>, kinds: List<Option<{ k:
         SRequires -> {
           let full = clause(b"requires", s.requires);
           { out: if !wants(wanted, full) { s.out } else {
-              push(s.out, root_emitted(module, d.span.start, here, imports, ctors, builtins, effects, release, full, names, params_of(names, kinds), known, c.expr))
+              push(s.out, root_emitted(module, d.span.start, here, imports, ctors, builtins, effects, release, full, names, params_of(names, kinds), known, sites, c.expr))
             },
             requires: s.requires + 1, ensures: s.ensures }
         },
@@ -3957,7 +3982,7 @@ fn clause_roots(acc: Walk, d: FnDef, names: List<Bytes>, kinds: List<Option<{ k:
             let rkinds = push(kinds, param_kind_with(aliases, others, Some(r)));
             let rknown = known && param_kind_with(aliases, others, Some(r)) != None;
             { out: if !wants(wanted, full) { s.out } else {
-                push(s.out, root_emitted(module, d.span.start, here, imports, ctors, builtins, effects, release, full, rnames, params_of(rnames, rkinds), rknown, c.expr))
+                push(s.out, root_emitted(module, d.span.start, here, imports, ctors, builtins, effects, release, full, rnames, params_of(rnames, rkinds), rknown, sites, c.expr))
               },
               requires: s.requires, ensures: s.ensures + 1 }
           },
