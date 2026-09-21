@@ -256,7 +256,9 @@ them left to right, either written, `relay[conn](b)`, or from an argument whose
 row names one (§6.2); a recursive call reuses its own and writes none. A printed
 signature shows the binders, `<[l]>(Bytes) -> Unit / {net.send[l]}` and
 `<a, [l] | e>(a) -> Unit / {net.send[l] | e}`, naming label variables `l`, `m`,
-`n`, then `l2`. Filling the wrong number of labels, leaving one unfilled, or
+`n`, then `l1` — stepping past any of those a resource in the same signature
+holds, so a row naming `[l]` prints its variable as `[m]` and the two stay
+apart. Filling the wrong number of labels, leaving one unfilled, or
 using a label-generic definition as a value instead of calling it, is `E0306`.
 
 ### 4.6 Types the language declares
@@ -516,6 +518,11 @@ the global one of that name. A call fills it with a label it writes,
 `relay[conn](b)`, or with the one an argument's row names: a parameter typed
 `() -> Unit / {net.send[l]}` given an argument whose row is `{net.send[conn]}`
 fills `l` with `conn`. A label left unfilled is `E0306`.
+
+The standard library is generic over its labels: `std.net` and `std.http` name
+no resource of their own, so a program may answer its connections under one
+label and talk upstream under another, over one serve loop and one writer
+(§13.1, §13.2).
 
 Two atoms **conflict** iff they name the same resource of the same effect and
 one is a `write`.
@@ -953,10 +960,12 @@ pub nondet effect net {
   write send[s](conn: Int, payload: Bytes, timeout_ms: Int) -> Option<Int>
   write close[s](socket: Int) -> Unit
 }
-pub fn drain(c: Int, so_far: Bytes, timeout_ms: Int) -> Bytes / {net.recv[conn]}
-pub fn send_all(c: Int, payload: Bytes, timeout_ms: Int) -> Bool / {net.send[conn]}
+pub fn drain<[l]>(c: Int, so_far: Bytes, timeout_ms: Int) -> Bytes / {net.recv[l]}
+pub fn send_all<[l]>(c: Int, payload: Bytes, timeout_ms: Int) -> Bool / {net.send[l]}
 ```
 
+Both take their label from the caller (§6.2): `send_all[conn](..)` writes to a
+connection this program answered, `send_all[upstream](..)` to one it opened.
 `None` is a deadline expiring; an empty `Some` is EOF; `timeout_ms <= 0` is a
 runtime error. `send` may write fewer bytes than given; `send_all` loops.
 `connect` resolves the host and tries each address until the deadline; `None`
@@ -968,9 +977,35 @@ and writes `0`.
 
 ### 13.2 `std.http` — HTTP/1.1
 
-Parsing and encoding are pure; the serve loop and the client perform `net`,
-both under `[conn]`. An ambiguous message is refused and the connection closed;
-every loop is bounded by `Limits`.
+Parsing and encoding are pure; the serve loop and the client perform `net`
+under the labels a caller fills. An ambiguous message is refused and the
+connection closed; every loop is bounded by `Limits`.
+
+```ply
+pub fn read_head<[l]>(c: Int, carried: Bytes, limits: Limits, idle: Bool)
+  -> HeadRead / {net.recv[l]}
+pub fn read_body<[l]>(c: Int, framing: Framing, buf: Bytes, limits: Limits)
+  -> BodyResult / {net.recv[l]}
+pub fn serve_connection<[l] | e>(c: Int, limits: Limits, app: (Request) -> Response / e)
+  -> Unit / {net.recv[l], net.send[l], net.close[l] | e}
+pub fn serve<[l], [k] | e>(listener: Int, count: Int, limits: Limits,
+                           app: (Request) -> Response / e)
+  -> Int / {net.accept[l], net.recv[k], net.send[k], net.close[k] | e}
+pub fn listen_and_serve<[l], [k] | e>(port: Int, count: Int, limits: Limits,
+                                      app: (Request) -> Response / e)
+  -> Int / {net.listen[l], net.accept[l], net.close[l],
+            net.recv[k], net.send[k], net.close[k] | e}
+pub fn respond_chunked<s, [l] | e>(c: Int, version: Version, r: Response, keep_alive: Bool,
+                                   limits: Limits, seed: s,
+                                   produce: (s) -> Option<{ chunk: Bytes, next: s }> / e)
+  -> Bool / {net.send[l] | e}
+pub fn request<[l]>(host: String, port: Int, req: Request, limits: Limits)
+  -> Result<Response, ClientError>
+  / {net.connect[l], net.send[l], net.recv[l], net.close[l]}
+```
+
+`serve` and `listen_and_serve` take two labels, the listener's and then each
+accepted connection's: `listen_and_serve[listener, conn](8080, 64, l, app)`.
 Types: `Method`, `Version`, `Headers`, `Request`, `Response`, `Limits`,
 `Refusal`, `Framing`, `Head`, `HeadResult`, `BodyState`, `BodyStep`,
 `ResponseHead`, `ResponseHeadResult`, `ClientError`. Functions:
@@ -980,10 +1015,10 @@ Types: `Method`, `Version`, `Headers`, `Request`, `Response`, `Limits`,
 `encode`, `encode_chunked_head`, `encode_chunk`, `last_chunk`,
 `continue_response`, `read_head`, `read_body`, `serve_connection`, `serve`,
 `listen_and_serve`, `request_to`, `encode_request`, `parse_response_head`,
-`request`. `request(host, port, req, limits)` opens one connection, sends the
-request with `Connection: close`, reads the answer and closes; a response
-without a length field is `UntilClose` and read until the server closes, up
-to `max_body`. A malformed response is `Malformed` with a 502 refusal. No
+`request`. `request[upstream](host, port, req, limits)` opens one connection,
+sends the request with `Connection: close`, reads the answer and closes; a
+response without a length field is `UntilClose` and read until the server
+closes, up to `max_body`. A malformed response is `Malformed` with a 502 refusal. No
 TLS above the socket, compression, `Upgrade` or `Content-Encoding`.
 
 ### 13.3 `std.router` — routes as data

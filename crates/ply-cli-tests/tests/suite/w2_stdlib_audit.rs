@@ -48,7 +48,7 @@ fn hash_of(loaded: &Loaded, name: &str) -> String {
 const IMPORTER: &str = "\
 import std.net (net, drain)
 
-pub fn read_all(c: Int) -> Bytes / {net.recv[conn]} = drain(c, b\"\", 1000)
+pub fn read_all(c: Int) -> Bytes / {net.recv[conn]} = drain[conn](c, b\"\", 1000)
 
 test \"reads to the end\" {
   handle { assert_eq(read_all(1), b\"\") } with { net.recv[conn](c, m, t) -> Some(b\"\") }
@@ -338,7 +338,7 @@ fn renaming_a_shipped_definition_moves_no_hash() {
         dir.path(),
         "reader.ply",
         "import mine (net, drain)\n\
-         pub fn read_all(c: Int) -> Bytes / {net.recv[conn]} = drain(c, b\"\", 1000)\n\
+         pub fn read_all(c: Int) -> Bytes / {net.recv[conn]} = drain[conn](c, b\"\", 1000)\n\
          test \"reads\" {\n\
         \x20 handle { assert_eq(read_all(1), b\"\") } with { net.recv[conn](c, m, t) -> Some(b\"\") }\n\
          }\n",
@@ -355,7 +355,7 @@ fn renaming_a_shipped_definition_moves_no_hash() {
         dir.path(),
         "reader.ply",
         "import mine (net, read_to_end)\n\
-         pub fn read_all(c: Int) -> Bytes / {net.recv[conn]} = read_to_end(c, b\"\", 1000)\n\
+         pub fn read_all(c: Int) -> Bytes / {net.recv[conn]} = read_to_end[conn](c, b\"\", 1000)\n\
          test \"reads\" {\n\
         \x20 handle { assert_eq(read_all(1), b\"\") } with { net.recv[conn](c, m, t) -> Some(b\"\") }\n\
          }\n",

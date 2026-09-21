@@ -73,7 +73,8 @@ fn every_type() -> Type {
         ],
         ret: Box::new(Type::Var(TyVar(0))),
         effects: Row {
-            // A row reaches what a footprint cannot: an atom on a label the scheme quantifies.
+            // An atom on a label the scheme quantifies; a footprint holds one too, through the
+            // same atom encoding.
             atoms: footprint()
                 .0
                 .into_iter()

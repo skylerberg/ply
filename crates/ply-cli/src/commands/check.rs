@@ -268,7 +268,7 @@ pub fn report_json(loaded: &Loaded, warnings: &[Diagnostic]) -> Value {
                 "simple_name": d.simple_name,
                 "type": print_scheme(&d.scheme),
                 "footprint": d.footprint.to_string(),
-                "atoms": d.footprint.atoms().map(|a| a.to_string()).collect::<Vec<_>>(),
+                "atoms": ply_ty::Printer::new().atoms(&d.footprint.0),
             })
         })
         .collect();
