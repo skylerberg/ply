@@ -19,7 +19,9 @@ const COMPILER_PSEUDO_ROOT: &str = "<compiler>";
 /// The program `ply` runs, one module per file of `crates/ply-cli/ply`, each named by its stem.
 /// The entry point is `ply.main`, which dispatches on the command word.
 pub const PROGRAM_SOURCES: &[(&str, &str)] = &[
+    ("appends", include_str!("../ply/appends.ply")),
     ("args", include_str!("../ply/args.ply")),
+    ("check", include_str!("../ply/check.ply")),
     ("defs", include_str!("../ply/defs.ply")),
     ("diagnostic", include_str!("../ply/diagnostic.ply")),
     ("doc", include_str!("../ply/doc.ply")),
@@ -30,6 +32,7 @@ pub const PROGRAM_SOURCES: &[(&str, &str)] = &[
     ("ply", include_str!("../ply/ply.ply")),
     ("program", include_str!("../ply/program.ply")),
     ("report", include_str!("../ply/report.ply")),
+    ("signature", include_str!("../ply/signature.ply")),
     ("sources", include_str!("../ply/sources.ply")),
     ("style", include_str!("../ply/style.ply")),
     ("walk", include_str!("../ply/walk.ply")),
@@ -305,7 +308,7 @@ fn build_in(dir: &Path) -> Result<Vec<u8>, Diagnostic> {
     if !built.entry_compiled {
         return Err(refused_entry(&built));
     }
-    Ok(built.artifact.encode())
+    built.artifact.encode()
 }
 
 #[cold]

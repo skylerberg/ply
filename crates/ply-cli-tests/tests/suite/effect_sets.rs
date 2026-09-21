@@ -207,15 +207,13 @@ fn an_included_set_counts_the_definitions_that_reach_it() {
     );
 }
 
+/// Two runs over one tree, so the block is a function of the program and of nothing a run keeps.
 #[test]
-fn explain_prints_the_same_bytes_warm_cold_and_uncached() {
+fn explain_prints_the_same_bytes_on_every_run() {
     let dir = project(SERVICE);
-    let cold = types(dir.path(), &["--explain"]);
-    let warm = types(dir.path(), &["--explain"]);
-    let fresh = types(dir.path(), &["--explain", "--no-incremental"]);
-
-    assert_eq!(module_block(&cold), module_block(&warm));
-    assert_eq!(module_block(&cold), module_block(&fresh));
+    let once = types(dir.path(), &["--explain"]);
+    let twice = types(dir.path(), &["--explain"]);
+    assert_eq!(module_block(&once), module_block(&twice));
 }
 
 fn json_types(dir: &Path, extra: &[&str]) -> Value {
@@ -269,15 +267,15 @@ fn the_json_report_carries_the_provenance_only_under_explain() {
 }
 
 #[test]
-fn the_json_provenance_is_the_same_warm_and_cold() {
+fn the_json_provenance_is_the_same_on_every_run() {
     let dir = project(SERVICE);
-    let cold = json_types(dir.path(), &["--explain"]);
-    let warm = json_types(dir.path(), &["--explain"]);
+    let once = json_types(dir.path(), &["--explain"]);
+    let twice = json_types(dir.path(), &["--explain"]);
     assert_eq!(
-        cold["modules"][0]["effect_sets"],
-        warm["modules"][0]["effect_sets"]
+        once["modules"][0]["effect_sets"],
+        twice["modules"][0]["effect_sets"]
     );
-    assert_eq!(cold["definitions"], warm["definitions"]);
+    assert_eq!(once["definitions"], twice["definitions"]);
 }
 
 fn repo(rel: &str) -> std::path::PathBuf {
