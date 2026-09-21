@@ -29,19 +29,3 @@ mechanical, since a group whose members want *different* instantiations of a typ
 polymorphic recursion, which needs written signatures to stay decidable. Assumed: worth doing for
 rows, where there is no such difficulty, and worth refusing clearly for types. Say whether you
 want both, rows only, or neither.
-
-## A definition too deeply nested exhausts the emitter rather than being refused
-
-The emitter walks an expression recursively and is itself compiled, so a sufficiently nested
-definition runs its native stack out while the bundle is being built. It is not a property of the
-program: the depth that fails depends on the emitter's frame size and the stack the thread was
-given, so the same source can compile on one build and not another. A reader in `front.ply` hit
-it at depth 44 where the previous deepest definition in the tree was 28, and the failure arrived
-as an exhausted stack inside `emit.emit_roots` with no name attached.
-
-A test now measures depth over every shipped source and refuses past a proxy bound, which catches
-it in a partition rather than in the fixpoint. That is a guard, not a fix. The two real options
-are a depth budget the emitter checks as it walks, so it refuses by name, or an iterative walk
-for the nesting-heavy node kinds, which removes the limit instead of documenting it. Assumed: the
-budget, since it is contained and the message is the thing that was missing. Say if you would
-rather have the walker rewritten.
