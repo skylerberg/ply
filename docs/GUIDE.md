@@ -1318,10 +1318,12 @@ Error[E0201]: type mismatch: function body type
 The heading is the severity, the code and the message. Then one block per label:
 where it points, the line it points into, and a caret run under the span — one
 caret for an empty span, and never past the end of the line the span opens on. A
-label whose span is not a range of its file is dropped, as it is under `--json`,
-and a diagnostic left with no label is its heading and notes alone. Each note is
-a `  = ` line. Colour is paint on that shape and never changes it: a pipe,
-`NO_COLOR` or `--color never` leaves exactly these bytes.
+label whose span runs past the end of its file, or names no file at all, is
+dropped, as it is under `--json`; one that cuts a character in half is still
+placed, on the line it opens. A diagnostic left with no label is its heading and
+notes alone, and each note is a `  = ` line. Colour is paint on that shape and
+never changes it: the heading and the caret run take the severity's colour, and a
+pipe, `NO_COLOR` or `--color never` leaves exactly these bytes.
 
 A diagnostic that knows its own remedy carries `fixes` under `--json`: each has a
 `title` and `edits`, and an edit replaces the text between `start` and `end` of
