@@ -533,7 +533,9 @@ test \"deep values compare\" { assert_eq(stack(20000), stack(20000)) }
     }
 }
 
-/// No recursion in the program: 3,000 terms of `+`, which `ply run` evaluates on the main thread.
+/// No recursion in the program: a chain of `+` whose tree the front end and the emitter each walk
+/// once per term. Nothing in the compiler bounds how deep a definition may be; a walk that would
+/// cross the floor of the stack it is on is given another.
 #[test]
 fn a_deeply_nested_expression_runs_rather_than_aborting_the_run() {
     let mut source = String::from("fn deep() -> Int = 1");

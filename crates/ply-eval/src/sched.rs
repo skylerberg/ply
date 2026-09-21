@@ -1,6 +1,5 @@
 //! The deterministic scheduler.
 
-use crate::arena::Pin;
 use crate::cont::SimId;
 use crate::host::{HostBinding, HostRuntime, Pending};
 use crate::region::Trail;
@@ -77,9 +76,6 @@ enum TaskState<K, B> {
 struct Task<K, B> {
     state: TaskState<K, B>,
     origin: Span,
-    /// This task's claim on the regions that were open at its `spawn`.
-    #[allow(dead_code)]
-    pin: Option<Pin>,
 }
 
 pub struct StepRecord {
@@ -147,8 +143,6 @@ impl<K: Clone, B> Scheduler<K, B> {
             tasks: vec![Task {
                 state: TaskState::Ready(Resumption::Enter),
                 origin: span,
-                // The region outlives its root task, so the root needs no claim.
-                pin: None,
             }],
             clocks: vec![vec![0]],
             max_steps,
@@ -193,24 +187,6 @@ impl<K: Clone, B> Scheduler<K, B> {
 
     pub fn current(&self) -> Option<TaskId> {
         self.current
-    }
-
-    pub fn task_count(&self) -> usize {
-        self.tasks.len()
-    }
-
-    pub fn holds(&self, task: TaskId) -> bool {
-        (task.0 as usize) < self.tasks.len()
-    }
-
-    /// The tasks that have not finished, ascending.
-    pub fn unfinished(&self) -> Vec<TaskId> {
-        self.tasks
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| !matches!(t.state, TaskState::Done(_) | TaskState::Failed))
-            .map(|(i, _)| TaskId(i as u32))
-            .collect()
     }
 
     pub fn next(&mut self, clock: &mut Clock, trail: &mut Trail) -> Result<Turn<K, B>, Diagnostic> {
@@ -424,12 +400,11 @@ impl<K: Clone, B> Scheduler<K, B> {
     }
 
     /// Leaves the current task running: the caller must hand the id to [`Scheduler::suspend`].
-    pub fn spawn(&mut self, body: B, span: Span, pin: Option<Pin>) -> TaskId {
+    pub fn spawn(&mut self, body: B, span: Span) -> TaskId {
         let id = TaskId(self.tasks.len() as u32);
         self.tasks.push(Task {
             state: TaskState::Ready(Resumption::Start { body, span }),
             origin: span,
-            pin,
         });
         let inherited = match (self.policy, self.current) {
             (Policy::Seeded, Some(parent)) => self.clocks[parent.0 as usize].clone(),

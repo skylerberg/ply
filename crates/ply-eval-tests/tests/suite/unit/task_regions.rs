@@ -106,27 +106,10 @@ fn a_reset_closes_a_region_the_last_entry_point_abandoned() {
 }
 
 #[test]
-fn a_shared_regions_close_keeps_the_slots_a_live_continuation_can_reach() {
+fn a_shared_region_reclaims_its_slots_at_its_close() {
     let mut regions: TaskRegions = TaskRegions::new();
     let id = regions.open_region(RegionKind::Shared, Span::DUMMY);
     let cell = regions.alloc_cell(Value::Int(1));
-    let pin = regions.pin().expect("a program region is open");
-
-    regions.close_region(id);
-
-    assert!(
-        regions.contains(cell),
-        "a continuation resumed after the region closed still reads it"
-    );
-    drop(pin);
-}
-
-#[test]
-fn a_shared_region_no_continuation_outlives_still_reclaims_at_its_close() {
-    let mut regions: TaskRegions = TaskRegions::new();
-    let id = regions.open_region(RegionKind::Shared, Span::DUMMY);
-    let cell = regions.alloc_cell(Value::Int(1));
-    drop(regions.pin().expect("a program region is open"));
 
     regions.close_region(id);
 
@@ -146,17 +129,6 @@ fn a_unique_region_hands_its_slots_back_at_its_close() {
     assert!(regions.contains(outer));
     assert!(!regions.contains(inner));
     assert_eq!(regions.live(), 1);
-}
-
-/// Otherwise every `perform` in a program without `with_cell` would pay an `Rc` allocation for nothing.
-#[test]
-fn no_pin_is_taken_outside_every_program_region() {
-    let mut regions: TaskRegions = TaskRegions::new();
-    assert!(regions.pin().is_none());
-    let id = regions.open_region(RegionKind::Shared, Span::DUMMY);
-    assert!(regions.pin().is_some());
-    regions.close_region(id);
-    assert!(regions.pin().is_none());
 }
 
 #[test]

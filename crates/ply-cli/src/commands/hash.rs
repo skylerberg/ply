@@ -1,6 +1,7 @@
 //! `ply hash` — every definition and test under the hash content addressing keys it by.
 
 use super::shipped_program::{color, rooted, run};
+use crate::artifact::Binds;
 use crate::cli::HashArgs;
 use crate::style::Style;
 
@@ -15,5 +16,5 @@ pub fn execute(args: &HashArgs, style: Style) -> i32 {
         argv.push("--json".to_string());
     }
     argv.push(inside);
-    run("hash", argv, &root, args.json, style)
+    run("hash", argv, &root, Binds::default(), args.json, style)
 }

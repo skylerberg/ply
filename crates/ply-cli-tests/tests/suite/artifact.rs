@@ -1,7 +1,8 @@
 use assert_cmd::Command;
-use ply_cli::artifact::{self, Artifact};
+use ply_cli::artifact::{self, Artifact, Binds};
 use ply_cli::load::{Loaded, load};
-use ply_span::codes;
+use ply_host::process::Executables;
+use ply_span::{Span, codes};
 use ply_ty::DefHash;
 use serde_json::Value;
 use std::path::Path;
@@ -1033,4 +1034,51 @@ fn a_unit_built_for_another_runtime_is_left_aside_with_a_warning() {
             .unwrap(),
     );
     assert_eq!(v["value"], "42", "{v}");
+}
+
+/// Exits with the code of whatever `cc` names, so nothing but the caller's binding decides what
+/// ran.
+const SPAWNS: &str = r#"
+import std.process (process, exit_code)
+
+fn main() -> Unit / {process.spawn[cc], process.exit[proc]} = {
+  let done = process.spawn[cc](["-c", "exit 7"], "", []);
+  match exit_code(done) {
+    Some(code) -> process.exit[proc](code),
+    None -> process.exit[proc](9),
+  }
+}
+"#;
+
+fn spawning() -> (TempDir, Artifact, artifact::Opened) {
+    let dir = project(SPAWNS);
+    let artifact = artifact_of(dir.path());
+    let opened = artifact::open(&artifact, Path::new("spawns.plyx")).expect("it opens");
+    (dir, artifact, opened)
+}
+
+/// What the five ported commands are entered with: the label is the capability, and a caller that
+/// binds no program hands the program none to start.
+#[test]
+fn an_entered_program_cannot_spawn_a_label_nothing_bound() {
+    let (_dir, artifact, opened) = spawning();
+    let entered = artifact::enter(&artifact, &opened, Vec::new(), Binds::default());
+    let refused = entered.expect_err("`cc` is bound to nothing");
+    assert_eq!(refused.code, codes::PROCESS_EXEC_UNBOUND);
+}
+
+#[test]
+fn an_entered_program_starts_what_its_caller_bound_to_the_label() {
+    let (_dir, artifact, opened) = spawning();
+    let mut executables = Executables::new();
+    executables
+        .bind("cc", Path::new("/bin/sh"), Span::DUMMY)
+        .expect("a shell is a program");
+    let binds = Binds {
+        roots: Vec::new(),
+        executables,
+    };
+    let entered = artifact::enter(&artifact, &opened, Vec::new(), binds);
+    let code = entered.expect("the program runs");
+    assert_eq!(code, 7, "the child's own code is what came back");
 }
