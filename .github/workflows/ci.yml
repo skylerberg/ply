@@ -276,9 +276,34 @@ jobs:
           retention-days: 2
           if-no-files-found: error
 
+  # Emitting the compiler's own unit is the same work whichever slice runs next, and it is minutes
+  # of it. One job does it and every suite job restores what it left. It runs the archive's own
+  # binary because a compiled body is keyed by the binary that emitted it, so a stage emitted by
+  # any other copy of `ply` would be restored and never read.
+  stage:
+    name: the emitter's stage
+    needs: [build, build-ply]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/suite
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/ply-c-cache
+          key: ply-c-stage-run-${{ github.run_id }}
+      # Across runs as well as within one, so a run whose sources are unchanged emits nothing.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.ref == 'refs/heads/main'
+        with:
+          path: /tmp/ply-c-cache
+          key: ply-c-stage-${{ hashFiles('crates/ply-codegen/src/**', 'crates/ply-compiler/**', 'crates/ply-std/**', 'crates/ply-cli/ply/**') }}
+
   test:
     name: test ${{ matrix.slice }}
-    needs: [plan, build, build-ply]
+    needs: [plan, build, build-ply, stage]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -289,9 +314,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/suite
-        id: suite
-        with:
-          slot: part-${{ strategy.job-index }}
 
       # The awk strips colour first: nextest colours its summary line. A golden that moved is
       # blessed rather than failed: the diff goes to the job summary, and `refresh` commits it on main.
@@ -329,15 +351,10 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           git diff --stat -- crates/ply-codegen-tests/fixtures/goldens
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main' && steps.suite.outputs.objects-hit != 'true'
-        with:
-          path: /tmp/ply-c-cache
-          key: ${{ steps.suite.outputs.objects-key }}
 
   solo:
     name: test ${{ matrix.id }}
-    needs: [plan, build, build-ply]
+    needs: [plan, build, build-ply, stage]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -348,9 +365,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/suite
-        id: suite
-        with:
-          slot: solo-${{ matrix.id }}
 
       - name: cargo nextest run
         env:
@@ -369,11 +383,6 @@ jobs:
             END { print n + 0 }
           ' /tmp/solo.log)
           [ "$ran" -eq 1 ] || { echo "solo test '$ID' selected $ran tests rather than one: the table names a test the binary does not have" >&2; exit 1; }
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main' && steps.suite.outputs.objects-hit != 'true'
-        with:
-          path: /tmp/ply-c-cache
-          key: ${{ steps.suite.outputs.objects-key }}
 
 
   # On main only: the bundle the sources are a fixpoint of, the `ply fmt` program they build, and
@@ -384,7 +393,7 @@ jobs:
   refresh:
     name: refresh the bundle, the fmt program and the goldens
     if: github.event_name == 'push'
-    needs: [plan, build, build-ply]
+    needs: [plan, build, build-ply, stage]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -395,8 +404,6 @@ jobs:
         with:
           persist-credentials: true
       - uses: ./.github/actions/suite
-        with:
-          slot: refresh
       - name: Emit the bundle and the `ply` program, and bless the goldens
         run: |
           set -euo pipefail
@@ -432,7 +439,7 @@ jobs:
   # Tests that must be seen to run: the `#![cfg(unix)]` shutdown suite and the tree checks by name.
   gates:
     name: test gates
-    needs: [plan, build, build-ply]
+    needs: [plan, build, build-ply, stage]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -440,9 +447,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/suite
-        id: suite
-        with:
-          slot: gates
 
       - name: cargo nextest run
         run: |
@@ -482,15 +486,10 @@ jobs:
             exit 1
           }
           echo "w5_shutdown: $w5 test(s) ran"
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main' && steps.suite.outputs.objects-hit != 'true'
-        with:
-          path: /tmp/ply-c-cache
-          key: ${{ steps.suite.outputs.objects-key }}
 
   test-postgres:
     name: test ply-host (postgres)
-    needs: [build, build-ply]
+    needs: [build, build-ply, stage]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -519,9 +518,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/suite
-        id: suite
-        with:
-          slot: postgres
 
       # The cluster tests start their own server from these, and skip and pass without them.
       - name: Put initdb, postgres and psql on PATH, or fail
@@ -605,11 +601,6 @@ jobs:
           chmod +x target/release/ply
           touch target/release/ply target/release/ply.d
           PLY_BIN="$GITHUB_WORKSPACE/target/release/ply" ./examples/same-tests.sh --db "$PLY_TEST_DB" --reset --no-build
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main' && steps.suite.outputs.objects-hit != 'true'
-        with:
-          path: /tmp/ply-c-cache
-          key: ${{ steps.suite.outputs.objects-key }}
 
   ucontext-probe:
     name: ./probes/ucontext/run.sh
@@ -632,6 +623,7 @@ jobs:
         clippy,
         build,
         build-ply,
+        stage,
         test,
         solo,
         gates,
