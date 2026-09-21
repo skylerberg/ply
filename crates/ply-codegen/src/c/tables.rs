@@ -8,6 +8,14 @@ use ply_eval::{Builtin, Value};
 use ply_span::Symbol;
 use std::collections::HashMap;
 
+/// What the emitter named one definition's C: the function its callers write and the entry the
+/// loader binds, which is also its memo slot. Published by the body that defines them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Defined {
+    pub symbol: String,
+    pub entry: String,
+}
+
 /// What one body names of the unit around it, by the positions its own text uses.
 #[derive(Default, Clone)]
 pub struct Tables {
@@ -25,6 +33,9 @@ pub struct Tables {
     /// The definitions this one body serves when it is a recursive group's, in case order; empty
     /// for a body of its own.
     pub members: Vec<String>,
+    /// The C this body defines for each definition it holds: one per entry of `members`, in that
+    /// order, or one for a body of its own.
+    pub symbols: Vec<Defined>,
 }
 
 /// What an emitted unit accumulates that is not code, with each entry's position. A unit being
@@ -199,22 +210,4 @@ pub const BUCKET_MARK: &str = "/* --- bucket ";
 
 pub fn bucket_mark(id: u8) -> String {
     format!("{BUCKET_MARK}{id:02x} --- */")
-}
-
-/// The code-table symbol of a pure nullary root's entry, which is also its memo slot.
-pub fn memo_symbol(name: &str) -> String {
-    format!("{}_entry", mangle(name))
-}
-
-/// A name the emitted C can carry: a Ply name holds dots, and a C identifier may not.
-pub fn mangle(name: &str) -> String {
-    let mut out = String::from("ply_");
-    for c in name.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c);
-        } else {
-            out.push('_');
-        }
-    }
-    out
 }

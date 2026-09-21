@@ -33,8 +33,14 @@ fn the_committed_program_is_what_these_sources_build() {
         .as_ref()
         .expect("no compiled unit was embedded");
     let text = ply_codegen::c::bundle::unpack(&unit.text).expect("the unit unpacks");
+    // The symbol as the unit's own table publishes it: `<name> <arity> <symbol> <entry>`.
+    let symbol = text
+        .lines()
+        .find_map(|l| l.strip_prefix("\"ply.main ")?.split(' ').nth(1))
+        .expect("the embedded unit says what it calls `ply.main`")
+        .to_string();
     assert!(
-        text.contains("ply_ply_main("),
+        text.contains(&format!("Word {symbol}(PlyCtx *ctx")),
         "the embedded unit holds no body for `ply.main`, so nothing can be entered from it"
     );
     ply_cli::artifact::open(&decoded, &named).expect("it opens as the program it names");

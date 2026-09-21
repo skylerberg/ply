@@ -3,7 +3,7 @@ mod sweep;
 mod toolchain;
 mod upgrade;
 
-use ply_codegen::c::tables::{BUCKETS, bucket_of, mangle};
+use ply_codegen::c::tables::{BUCKETS, bucket_of};
 use ply_codegen::c::{
     HELPERS, Native, PRELUDE, RUNTIME_MARK, compile_and_load, helper_addresses, runtime_header,
     runtime_object, split,
@@ -903,12 +903,10 @@ pub fn wrap(n: Int) -> List<Bytes> = [byte_of_int(n)]
         let _config = CONFIG.read().unwrap_or_else(|e| e.into_inner());
         ply_codegen::c::produce(loaded, &["m.wrap"]).expect("`wrap` emits")
     };
-    let body = produced
-        .text
-        .find("Word ply_m_wrap(PlyCtx *ctx")
-        .map(|at| &produced.text[at..])
-        .expect("the unit has a body for `wrap`");
-    let text = &body[..body.find("\n}\n").map_or(body.len(), |end| end + 3)];
+    let text = numbering_support::body(
+        &produced.text,
+        &numbering_support::symbol(&produced, "m.wrap"),
+    );
     assert!(
         text.contains("rt_byte_of_int_p") && text.contains("rt_list_p"),
         "the body no longer has the shape this test is about:\n{text}"
@@ -934,6 +932,16 @@ mod numbering_support {
             .unwrap_or_else(|| panic!("the unit has no body for `{symbol}`"));
         let body = &text[at..];
         &body[..body.find("\n}\n").map_or(body.len(), |end| end + 3)]
+    }
+
+    /// The C the unit published for `name`; a test reads a symbol rather than spelling one.
+    pub fn symbol(produced: &ply_codegen::c::Produced, name: &str) -> String {
+        produced
+            .exports
+            .taken_by_name(name)
+            .unwrap_or_else(|| panic!("the unit does not take `{name}`"))
+            .symbol
+            .clone()
     }
 
     pub fn produce(
@@ -978,7 +986,7 @@ pub fn named(p: Pair) -> Bytes = if p.left > p.right { b"alpha" } else { b"beta"
         "adding `zz` changed lines of the unit that are not its own:\n{}",
         moved.join("\n")
     );
-    let _ = numbering_support::body(&large.text, "ply_m_zz");
+    let _ = numbering_support::body(&large.text, &numbering_support::symbol(&large, "m.zz"));
     assert_eq!(large.exports.consts.len(), small.exports.consts.len() + 1);
     assert_eq!(large.exports.fields, small.exports.fields);
     assert_eq!(large.exports.builtins, small.exports.builtins);
@@ -1012,11 +1020,12 @@ pub fn two(n: Int) -> Bytes = if n > 0 { b"shared-constant" } else { b"two" }
     let [at] = shared.as_slice() else {
         panic!("the pool holds the constant {} times", shared.len());
     };
-    for symbol in ["ply_m_one", "ply_m_two"] {
-        let body = numbering_support::body(&produced.text, symbol);
+    for name in ["m.one", "m.two"] {
+        let symbol = numbering_support::symbol(&produced, name);
+        let body = numbering_support::body(&produced.text, &symbol);
         assert!(
             body.contains(&format!("rt_lit_p(ctx, {at})")),
-            "`{symbol}` does not read the shared constant from its one entry:\n{body}"
+            "`{name}` does not read the shared constant from its one entry:\n{body}"
         );
     }
 }
@@ -1077,7 +1086,10 @@ pub fn twice(x: Int) -> Int = key(key(x))
         assert!(u64::from(*id) < BUCKETS);
     }
     for name in loaded.functions() {
-        let definition = format!("Word {}(PlyCtx *ctx", mangle(&name));
+        let definition = format!(
+            "Word {}(PlyCtx *ctx",
+            numbering_support::symbol(&produced, &name)
+        );
         assert!(
             !parts.header.contains(&definition) && !parts.tail.contains(&definition),
             "`{name}` sits outside the buckets"
@@ -1280,6 +1292,101 @@ fn answer(native: &Native, name: &str, x: i64) -> i64 {
     ply_codegen::heap::imm_value(w)
 }
 
+/// Several modules of one program, keyed as a command keys them.
+fn keyed_modules(modules: &[(&str, &str)]) -> &'static ply_codegen::Source {
+    let owned: Vec<(String, String)> = modules
+        .iter()
+        .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
+        .collect();
+    let ids: Vec<ply_span::SourceId> = (0..owned.len())
+        .map(|i| ply_span::SourceId(i as u32))
+        .collect();
+    let front = ply_codegen::c::producer::checked_front(&owned, &ids).expect("checks");
+    let front: &'static ply_ty::Front = Box::leak(Box::new(front));
+    let keys = ply_codegen::emit_keys(front);
+    Box::leak(Box::new(
+        ply_codegen::Source::from_front(front, keys).with_texts(owned.into_iter().collect()),
+    ))
+}
+
+/// A module's name is its path, so `m_a/b.ply` and `m/a_b.ply` are a program apart; a symbol that
+/// turned a dot into `_` spelled both of them `ply_m_a_b`, and the unit held one definition of it.
+#[test]
+fn two_definitions_a_dot_apart_answer_as_themselves() {
+    let source = keyed_modules(&[
+        ("m_a", "pub fn b(x: Int) -> Int = x + 1\n"),
+        ("m", "pub fn a_b(x: Int) -> Int = x + 2\n"),
+    ]);
+    let names = source.functions();
+    let produced = numbering_support::produce(source, &names);
+    let apart = produced
+        .exports
+        .taken_by_name("m_a.b")
+        .expect("`b` is taken");
+    let together = produced
+        .exports
+        .taken_by_name("m.a_b")
+        .expect("`a_b` is taken");
+    assert_ne!(
+        apart.symbol, together.symbol,
+        "`m_a.b` and `m.a_b` are emitted as one C function"
+    );
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (native, refused) = {
+        let _config = CONFIG.read().unwrap_or_else(|e| e.into_inner());
+        match ply_codegen::c::build(source, &refs) {
+            Ok(built) => built,
+            Err(e) if e.to_string().contains("could not run") => return,
+            Err(e) => panic!("{e}"),
+        }
+    };
+    assert!(refused.is_empty(), "{refused:?}");
+    assert_eq!(answer(&native, "m_a.b", 10), 11);
+    assert_eq!(answer(&native, "m.a_b", 10), 12);
+}
+
+/// The unit binds and calls by the symbols it publishes, so each one has to be the symbol its C
+/// defines, and no two definitions may share one.
+#[test]
+fn a_unit_publishes_the_symbols_its_c_defines() {
+    let source = keyed_modules(&[
+        ("m_a", "pub fn b(x: Int) -> Int = x + 1\n"),
+        (
+            "m",
+            r#"
+fn key(x: Int) -> Int = x + 1
+pub fn a_b(xs: List<Int>) -> Int = fold(map(xs, key), 0, |a: Int, x: Int| a + x)
+pub fn ping(n: Int, acc: Int) -> Int = if n == 0 { acc } else { pong(n - 1, acc + 1) }
+fn pong(n: Int, acc: Int) -> Int = if n == 0 { acc } else { ping(n - 1, acc + 2) }
+pub fn steady() -> Int = 7
+"#,
+        ),
+    ]);
+    let produced = numbering_support::produce(source, &source.functions());
+    let code = numbering_support::code(&produced.text);
+    let mut spelled: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for taken in &produced.exports.taken {
+        assert!(
+            code.contains(&format!("Word {}(PlyCtx *ctx", taken.symbol)),
+            "the unit publishes `{}` for `{}` and defines no such function",
+            taken.symbol,
+            taken.name
+        );
+        assert!(
+            code.contains(&format!(
+                "Word {}(PlyCtx *ctx, const Word *args)",
+                taken.entry
+            )),
+            "the unit publishes `{}` as the entry of `{}` and defines no such function",
+            taken.entry,
+            taken.name
+        );
+        if let Some(other) = spelled.insert(taken.symbol.as_str(), taken.name.as_str()) {
+            panic!("`{other}` and `{}` are both `{}`", taken.name, taken.symbol);
+        }
+    }
+}
+
 /// A bucket declares what its bodies reach: their own names, a group's members, and every
 /// call, a lambda's and a definition taken as a value included; a definition none of them
 /// reach is not declared there, or anywhere outside a bucket.
@@ -1303,9 +1410,10 @@ pub fn volley(n: Int) -> Int = ping(n, 0)
     let group = ["m.ping", "m.pong"]
         .into_iter()
         .find(|m| {
-            produced
-                .text
-                .contains(&format!("static Word ply__group_{}(", m.replace('.', "_")))
+            produced.text.contains(&format!(
+                "static Word {}_group(",
+                numbering_support::symbol(&produced, m)
+            ))
         })
         .expect("`ping` and `pong` are a group");
     // Each body placed, by the name it sits under, with what it calls.
@@ -1322,17 +1430,15 @@ pub fn volley(n: Int) -> Int = ping(n, 0)
         "m.key", "m.sum", "m.each", "m.twice", "m.apart", "m.ping", "m.pong", "m.volley",
     ];
     let prototype = |name: &str| -> String {
-        let (_, arity) = produced
+        let taken = produced
             .exports
-            .taken
-            .iter()
-            .find(|(n, _)| n == name)
+            .taken_by_name(name)
             .expect("every definition is taken");
         let params = std::iter::once("PlyCtx*")
-            .chain(std::iter::repeat_n("Word", *arity))
+            .chain(std::iter::repeat_n("Word", taken.arity))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("Word {}({params});\n", mangle(name))
+        format!("Word {}({params});\n", taken.symbol)
     };
     for name in names {
         assert!(
@@ -1388,15 +1494,13 @@ pub fn {caller}(x: Int) -> Int =
 "#
     );
     let emitted = produced(keyed_by_hash(&source, ""));
-    let (_, arity) = emitted
+    let relay = emitted
         .exports
-        .taken
-        .iter()
-        .find(|(n, _)| n == "m.relay")
+        .taken_by_name("m.relay")
         .expect("`relay` is taken");
-    assert_eq!(*arity, 2, "`relay` takes its payload and its label");
+    assert_eq!(relay.arity, 2, "`relay` takes its payload and its label");
     let parts = split(&emitted.text).expect("the unit splits on its marks");
-    let prototype = format!("Word {}(PlyCtx*, Word, Word);\n", mangle("m.relay"));
+    let prototype = format!("Word {}(PlyCtx*, Word, Word);\n", relay.symbol);
     let (_, bucket) = parts
         .buckets
         .iter()
@@ -1457,11 +1561,11 @@ fn b(n: Int) -> Int = if n == 0 { clock.now() } else { a(n - 1) }
     let produced = numbering_support::produce(loaded, &names);
     let code = numbering_support::code(&produced.text);
     assert!(
-        !code.contains("ply__group_"),
+        !code.contains("_group(PlyCtx *ctx, int which"),
         "a member holding a `handle` was grouped:\n{code}"
     );
-    for symbol in ["ply_m_a", "ply_m_b"] {
-        let _ = numbering_support::body(code, symbol);
+    for name in ["m.a", "m.b"] {
+        let _ = numbering_support::body(code, &numbering_support::symbol(&produced, name));
     }
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (native, refused) = {
@@ -1502,7 +1606,7 @@ pub fn steady() -> Int = 7
     );
     let code = numbering_support::code(&first.text);
     assert_eq!(
-        code.matches("static Word ply__group_").count(),
+        code.matches("_group(PlyCtx *ctx, int which").count(),
         1,
         "the group's body is placed once:\n{code}"
     );
@@ -1511,7 +1615,7 @@ pub fn steady() -> Int = 7
         2,
         "each member's tail call into the group jumps:\n{code}"
     );
-    for symbol in ["ply_m_ping", "ply_m_pong", "ply_m_volley"] {
-        let _ = numbering_support::body(code, symbol);
+    for name in ["m.ping", "m.pong", "m.volley"] {
+        let _ = numbering_support::body(code, &numbering_support::symbol(&first, name));
     }
 }
