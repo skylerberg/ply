@@ -468,6 +468,57 @@ fn a_front_writes_reads_and_writes_to_the_same_text() {
     assert_eq!(some.arity, 1);
 }
 
+/// Without the binders in the text, a label a caller fills comes back as a resource of that name,
+/// and nothing downstream can tell a generic definition from a program that uses a label called
+/// `l`.
+#[test]
+fn a_footprint_on_a_bound_label_reads_back_as_a_variable() {
+    let mut front = sample();
+    let send = EffectAtom::operation("std.net", Resource::Var(LabelVar(0)), Mode::Write, "send");
+    let mut relay = front.check.defs[&sym("m.count")].clone();
+    relay.name = sym("m.relay");
+    relay.simple_name = sym("relay");
+    relay.scheme = Scheme {
+        ty_vars: vec![],
+        row_vars: vec![],
+        label_vars: vec![LabelVar(0)],
+        ty: Type::Fn {
+            params: vec![Type::bytes()],
+            ret: Box::new(Type::unit()),
+            effects: Row {
+                atoms: [send.clone()].into(),
+                tail: None,
+            },
+        },
+    };
+    relay.footprint = Footprint::from_atoms([send.clone()]);
+    relay.performed = Footprint::from_atoms([send.clone()]);
+    relay.row_aliases = vec![];
+    relay.constraints = vec![];
+    relay.spec = vec![];
+    let written = front.defs_written[&sym("m.count")].clone();
+    front.check.defs.insert(sym("m.relay"), relay);
+    front.defs_written.insert(sym("m.relay"), written);
+
+    let text = write_front(&front, &SOURCES).unwrap();
+    assert!(
+        text.contains("footprint 20\n<[l]>std.net.send[l]"),
+        "the binders are missing from the text:\n{text}"
+    );
+    let back = read_front(&text, &SOURCES).unwrap_or_else(|e| panic!("{e}\n{text}"));
+    let relay = &back.check.defs[&sym("m.relay")];
+    assert_eq!(relay.footprint, Footprint::from_atoms([send.clone()]));
+    assert_eq!(relay.performed, Footprint::from_atoms([send]));
+    assert_eq!(write_front(&back, &SOURCES).unwrap(), text);
+
+    // A label no head binds is a resource of that name, as it is inside a row.
+    let unbound = parse_footprint("std.net.send[l]").unwrap();
+    assert_eq!(
+        unbound.atoms().next().unwrap().resource,
+        Resource::Named(sym("l"))
+    );
+}
+
 #[test]
 fn an_error_diagnostic_ends_the_dump() {
     let mut front = sample();

@@ -39,16 +39,16 @@ pub fn parse_atom(text: &str) -> Result<EffectAtom, String> {
     Ok(a)
 }
 
-/// `atom,atom`, with no spaces, or nothing at all for the empty footprint.
+/// `atom,atom`, with no spaces, optionally headed by the labels its atoms bind (`<[l]>a,b`), or
+/// nothing at all for the empty footprint.
 pub fn parse_footprint(text: &str) -> Result<Footprint, String> {
     if text.is_empty() {
         return Ok(Footprint::empty());
     }
-    let mut atoms = Vec::new();
-    for piece in text.split(',') {
-        atoms.push(parse_atom(piece)?);
-    }
-    Ok(Footprint::from_atoms(atoms))
+    let mut p = Parser::new(text);
+    let f = p.footprint()?;
+    p.end()?;
+    Ok(f)
 }
 
 struct Parser<'a> {
@@ -167,6 +167,33 @@ impl<'a> Parser<'a> {
         let v = TyVar(self.ty_vars.len() as u32);
         self.ty_vars.push((String::new(), v));
         v
+    }
+
+    /// The binders come first, so an atom's `[l]` is read against them as it is inside a scheme.
+    fn footprint(&mut self) -> Result<Footprint, String> {
+        if self.eat("<") {
+            loop {
+                self.expect("[")?;
+                let name = self.name("a label variable")?;
+                if !is_var(name, LABEL_LETTERS) {
+                    return Err(self.error(&format!("`{name}` is not a label variable")));
+                }
+                self.label_var(name);
+                self.expect("]")?;
+                if !self.eat(",") {
+                    break;
+                }
+            }
+            self.expect(">")?;
+        }
+        let mut atoms = Vec::new();
+        loop {
+            atoms.push(self.atom()?);
+            if !self.eat(",") {
+                break;
+            }
+        }
+        Ok(Footprint::from_atoms(atoms))
     }
 
     fn scheme(&mut self) -> Result<Scheme, String> {

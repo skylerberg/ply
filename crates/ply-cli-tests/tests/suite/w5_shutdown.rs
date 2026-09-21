@@ -23,7 +23,7 @@ fn answer(c: Int) -> Unit / {net.write[conn], signal.read} = {
   let head = bytes_concat(
     b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: ",
     bytes_concat(bytes_of_string(int_to_string(bytes_len(payload))), b"\r\n\r\n"));
-  let _ = net::send_all(c, bytes_concat(head, payload), 20000);
+  let _ = net::send_all[conn](c, bytes_concat(head, payload), 20000);
   net.close[conn](c)
 }
 
@@ -431,7 +431,7 @@ fn answer(c: Int) -> Int / {net.write[conn], signal.read} = {
   let head = bytes_concat(
     b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: ",
     bytes_concat(bytes_of_string(int_to_string(bytes_len(payload))), b"\r\n\r\n"));
-  let _ = net::send_all(c, bytes_concat(head, payload), 20000);
+  let _ = net::send_all[conn](c, bytes_concat(head, payload), 20000);
   net.close[conn](c);
   1
 }

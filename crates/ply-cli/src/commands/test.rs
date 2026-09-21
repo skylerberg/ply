@@ -1626,7 +1626,7 @@ pub fn failure_json(
 }
 
 fn atoms(footprint: &Footprint) -> Vec<String> {
-    footprint.atoms().map(|a| a.to_string()).collect()
+    ply_ty::Printer::new().atoms(&footprint.0)
 }
 
 fn status_of(report: &RunReport, index: usize) -> Option<Status> {

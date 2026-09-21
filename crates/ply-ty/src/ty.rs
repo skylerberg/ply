@@ -47,7 +47,8 @@ impl fmt::Display for Resource {
     }
 }
 
-/// The name a label variable prints under: `l`, `m`, `n`, then a round (`l2`).
+/// The name a label variable on its own prints under: `l`, `m`, `n`, then a round (`l1`). Inside a
+/// row, a scheme or a footprint it is [`crate::Printer`] that names it, against what else is there.
 pub fn label_var_name(v: LabelVar) -> String {
     crate::print::letter_name(crate::print::LABEL_LETTERS, v.0 as usize)
 }
@@ -117,14 +118,20 @@ impl EffectAtom {
         }
         self
     }
+
+    /// The atom with its resource already written: a label variable's name depends on the text it
+    /// is printed in, which [`fmt::Display`] cannot see and [`crate::Printer`] can.
+    pub fn text_with(&self, resource: &str) -> String {
+        match &self.op {
+            Some(op) => format!("{}.{}{resource}", self.effect, op),
+            None => format!("{}.{}{resource}", self.effect, self.mode.as_str()),
+        }
+    }
 }
 
 impl fmt::Display for EffectAtom {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.op {
-            Some(op) => write!(f, "{}.{}{}", self.effect, op, self.resource),
-            None => write!(f, "{}.{}{}", self.effect, self.mode.as_str(), self.resource),
-        }
+        f.write_str(&self.text_with(&self.resource.to_string()))
     }
 }
 
@@ -199,7 +206,7 @@ impl Row {
 
 impl fmt::Display for Row {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let atoms: Vec<String> = self.atoms.iter().map(|a| a.to_string()).collect();
+        let atoms = crate::print::Printer::new().atoms(&self.atoms);
         match self.tail {
             None => write!(f, "{{{}}}", atoms.join(", ")),
             Some(RowVar(v)) if atoms.is_empty() => write!(f, "{{| e{v}}}"),
@@ -262,7 +269,8 @@ impl Footprint {
 
 impl fmt::Display for Footprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let atoms: Vec<String> = self.0.iter().map(|a| a.to_string()).collect();
+        // Through a printer, which alone can keep a label variable off a resource's name.
+        let atoms = crate::print::Printer::new().atoms(&self.0);
         write!(f, "{{{}}}", atoms.join(", "))
     }
 }
