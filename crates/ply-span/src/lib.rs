@@ -285,8 +285,11 @@ pub mod codes {
     /// A call leaving a label parameter unfilled by written label or argument row, or passing a
     /// label-generic definition as a value.
     pub const LABEL_INSTANTIATION: &str = "E0306";
-    /// Members of one recursive group binding different numbers of label parameters.
+    /// Members of one recursive group binding different numbers of label or row parameters.
     pub const LABEL_GROUP_BINDERS: &str = "E0307";
+    /// A call inside a recursive group that would instantiate the group's row, or the callee's own
+    /// type parameter, at something else: polymorphic recursion.
+    pub const POLYMORPHIC_RECURSION: &str = "E0308";
     pub const NONDET_IN_DET_TEST: &str = "E0412";
     /// A `Task` in a `simulate` region's result, or a `join` after its region ended.
     pub const TASK_ESCAPES_SCOPE: &str = "E0413";
@@ -311,7 +314,7 @@ pub mod codes {
     pub const HOST_DETERMINISM_MISMATCH: &str = "E0423";
     /// An operation reached the host boundary with nothing bound.
     pub const HERMETIC_BOUNDARY: &str = "E0424";
-    /// A host operation reached from a test the search re-runs, in or around a `simulate`.
+    /// A host operation performed inside a `simulate` region, or in a test the search re-runs.
     pub const HOST_IN_SIMULATION: &str = "E0425";
     /// A continuation was resumed a second time across an at-most-once host operation.
     pub const HOST_CONTINUATION_RESUMED: &str = "E0426";
@@ -360,11 +363,18 @@ pub mod codes {
     pub const FS_ROOT_UNBOUND: &str = "E0451";
     /// A path leaving its label's root via `..`, an absolute path, or a symlink.
     pub const FS_PATH_ESCAPES_ROOT: &str = "E0452";
+    /// A read whose answer would be larger than one value holds; `fs.read_at` reads a range.
     pub const FS_FILE_TOO_LARGE: &str = "E0453";
     /// A `--fs NAME=PATH` root that is missing, not a directory, or unresolvable.
     pub const FS_ROOT_INVALID: &str = "E0454";
     /// `process.exit` was performed: the machine unwinds and `ply run` exits with the code.
     pub const PROCESS_EXIT: &str = "E0455";
+    /// `process.spawn` named a resource label the run bound no executable to.
+    pub const PROCESS_EXEC_UNBOUND: &str = "E0456";
+    /// An `--exec NAME=PATH` that is missing, is not a file, or cannot be executed.
+    pub const PROCESS_EXEC_INVALID: &str = "E0457";
+    /// A spawned process wrote more to a stream than one captured value holds.
+    pub const PROCESS_OUTPUT_TOO_LARGE: &str = "E0458";
     pub const ASSERTION_FAILED: &str = "E0501";
     /// A failure the language defines: `panic`, division by zero, overflow, a resource limit.
     pub const RUNTIME_ERROR: &str = "E0502";
@@ -482,7 +492,12 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ),
     (
         "E0307",
-        "mutually recursive definitions binding different label parameters",
+        "mutually recursive definitions binding different label or row parameters",
+    ),
+    (
+        "E0308",
+        "polymorphic recursion: a call inside a recursive group asks for another row or type \
+         parameter than the group was checked with",
     ),
     ("E0412", "nondeterministic effect in a deterministic test"),
     ("E0413", "`Task` escapes its region"),
@@ -508,7 +523,7 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ),
     (
         "E0425",
-        "host operation reached from a test the search re-runs",
+        "host operation inside a `simulate` region, or in a test the search re-runs",
     ),
     (
         "E0426",
@@ -551,9 +566,12 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ("E0450", "compiled backend cannot be attached"),
     ("E0451", "`fs` label with no root bound"),
     ("E0452", "path leaves its root"),
-    ("E0453", "whole-file read over the bound"),
+    ("E0453", "read over the bound"),
     ("E0454", "`--fs` root that is not a directory"),
     ("E0455", "the program asked to exit with a code"),
+    ("E0456", "`process.spawn` label with no executable bound"),
+    ("E0457", "`--exec` path that cannot be executed"),
+    ("E0458", "captured output over the bound"),
     ("E0501", "assertion failed"),
     (
         "E0502",
@@ -758,6 +776,11 @@ mod tests {
             ),
             ("LABEL_INSTANTIATION", codes::LABEL_INSTANTIATION, "E0306"),
             ("LABEL_GROUP_BINDERS", codes::LABEL_GROUP_BINDERS, "E0307"),
+            (
+                "POLYMORPHIC_RECURSION",
+                codes::POLYMORPHIC_RECURSION,
+                "E0308",
+            ),
             ("NONDET_IN_DET_TEST", codes::NONDET_IN_DET_TEST, "E0412"),
             ("TASK_ESCAPES_SCOPE", codes::TASK_ESCAPES_SCOPE, "E0413"),
             ("DEADLOCK", codes::DEADLOCK, "E0414"),
@@ -845,6 +868,13 @@ mod tests {
             ("FS_FILE_TOO_LARGE", codes::FS_FILE_TOO_LARGE, "E0453"),
             ("FS_ROOT_INVALID", codes::FS_ROOT_INVALID, "E0454"),
             ("PROCESS_EXIT", codes::PROCESS_EXIT, "E0455"),
+            ("PROCESS_EXEC_UNBOUND", codes::PROCESS_EXEC_UNBOUND, "E0456"),
+            ("PROCESS_EXEC_INVALID", codes::PROCESS_EXEC_INVALID, "E0457"),
+            (
+                "PROCESS_OUTPUT_TOO_LARGE",
+                codes::PROCESS_OUTPUT_TOO_LARGE,
+                "E0458",
+            ),
             ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
             ("TIME_BUDGET", codes::TIME_BUDGET, "E0503"),

@@ -2,6 +2,7 @@ use crate::style::ColorChoice;
 use clap::{Args, Parser, Subcommand};
 use ply_eval::Seed;
 use ply_host::fs::RootSpec;
+use ply_host::process::ExecSpec;
 use ply_host::tls::CredentialSpec;
 use std::path::PathBuf;
 
@@ -195,6 +196,19 @@ pub struct FsOptions {
     pub fs: Vec<RootSpec>,
 }
 
+/// One program per resource label; only `ply run --host` starts a process, so only it binds one.
+#[derive(Args, Clone, Debug, Default)]
+pub struct ExecOptions {
+    /// Program a `process.spawn` label may start: `--exec cc=/usr/bin/cc`. Repeatable.
+    #[arg(
+        long = "exec",
+        value_name = "NAME=PATH",
+        value_parser = parse_executable,
+        requires = "host",
+    )]
+    pub exec: Vec<ExecSpec>,
+}
+
 /// What a `SIGINT` or a `SIGTERM` does to a serving run.
 #[derive(Args, Clone, Debug)]
 pub struct ShutdownOptions {
@@ -243,6 +257,11 @@ fn parse_credential(text: &str) -> Result<CredentialSpec, String> {
 /// A bad shape is a usage error; `E0454` is for a root that does not resolve.
 fn parse_root(text: &str) -> Result<RootSpec, String> {
     RootSpec::parse(text)
+}
+
+/// A bad shape is a usage error; `E0457` is for a program that cannot be executed.
+fn parse_executable(text: &str) -> Result<ExecSpec, String> {
+    ExecSpec::parse(text)
 }
 
 /// Refuses non-canonical forms: a loosely parsed seed would replay the wrong interleaving.
@@ -542,6 +561,9 @@ pub struct RunArgs {
 
     #[command(flatten)]
     pub fs: FsOptions,
+
+    #[command(flatten)]
+    pub exec: ExecOptions,
 
     #[command(flatten)]
     pub db: crate::db::DbOptions,
