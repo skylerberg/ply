@@ -75,7 +75,7 @@ fn a_missing_main_never_points_at_an_unrelated_definition() {
         l.sources
             .snippet(*items.iter().find(|i| span.start < i.end).unwrap()),
     );
-    assert!(!ply_span::render::to_terminal(&d, &l.sources).is_empty());
+    assert!(!ply_span::render::to_terminal(&d, &l.sources, false).is_empty());
 }
 
 /// Labelling one file would be picking by load order, which `ply run` refuses to do for two `main`s.
@@ -90,7 +90,7 @@ fn a_missing_main_across_several_modules_labels_no_file_at_all() {
     assert!(d.labels.is_empty(), "labels: {:?}", d.labels);
     assert!(d.notes.iter().any(|n| n.contains("a, b")), "{:?}", d.notes);
     assert!(
-        ply_span::render::to_terminal(&d, &l.sources).contains("E0101"),
+        ply_span::render::to_terminal(&d, &l.sources, false).contains("E0101"),
         "an unlabelled diagnostic still has to render"
     );
 }

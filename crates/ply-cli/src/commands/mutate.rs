@@ -238,7 +238,8 @@ fn sites(text: &str) -> Vec<Site> {
 
 /// Every mutant of `def`, in source order.
 pub fn mutants(loaded: &Loaded, def: &DefInfo) -> Vec<Mutant> {
-    let text = loaded.sources.snippet(def.span);
+    let source = loaded.sources.snippet(def.span);
+    let text: &str = &source;
     sites(text)
         .into_iter()
         .map(|s| Mutant {

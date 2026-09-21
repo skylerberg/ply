@@ -285,7 +285,7 @@ fn build_in(dir: &Path) -> Result<Vec<u8>, Diagnostic> {
         unbuilt(match err.diagnostics.first() {
             Some(d) => format!(
                 "it does not check:\n{}",
-                ply_span::render::to_terminal(d, &err.sources)
+                ply_span::render::to_terminal(d, &err.sources, false)
             ),
             None => "it does not check, and nothing said why".to_string(),
         })
