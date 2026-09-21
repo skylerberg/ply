@@ -10,5 +10,6 @@ mod registry;
 mod sched;
 mod signal;
 mod tcp;
+mod time;
 mod tls;
 mod trace;
