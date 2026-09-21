@@ -256,7 +256,9 @@ them left to right, either written, `relay[conn](b)`, or from an argument whose
 row names one (§6.2); a recursive call reuses its own and writes none. A printed
 signature shows the binders, `<[l]>(Bytes) -> Unit / {net.send[l]}` and
 `<a, [l] | e>(a) -> Unit / {net.send[l] | e}`, naming label variables `l`, `m`,
-`n`, then `l2`. Filling the wrong number of labels, leaving one unfilled, or
+`n`, then `l1` — stepping past any of those a resource in the same signature
+holds, so a row naming `[l]` prints its variable as `[m]` and the two stay
+apart. Filling the wrong number of labels, leaving one unfilled, or
 using a label-generic definition as a value instead of calling it, is `E0306`.
 
 ### 4.6 Types the language declares

@@ -3,7 +3,7 @@
 use ply_span::Symbol;
 use ply_ty::ModuleName;
 use ply_ty::print::Printer;
-use ply_ty::ty::{Footprint, Row, Scheme, Type};
+use ply_ty::ty::{EffectAtom, Footprint, Row, Scheme, Type};
 use ply_ty::{DefInfo, Front};
 use std::collections::{BTreeSet, HashMap};
 
@@ -26,8 +26,9 @@ pub struct RowText {
 
 impl RowText {
     fn of_row(row: &Row, printer: &mut Printer) -> RowText {
+        let atoms = printer.atoms(&row.atoms);
         RowText {
-            atoms: row.atoms.iter().map(|a| a.to_string()).collect(),
+            atoms,
             // A tail alone prints as the name this printer chose for it.
             tail: row.tail.map(|v| {
                 printer.row(&Row {
@@ -40,7 +41,7 @@ impl RowText {
 
     fn of_footprint(footprint: &Footprint) -> RowText {
         RowText {
-            atoms: footprint.atoms().map(|a| a.to_string()).collect(),
+            atoms: Printer::new().atoms(&footprint.0),
             tail: None,
         }
     }
@@ -64,6 +65,9 @@ pub fn split(scheme: &Scheme) -> Split {
                     effects: Row::empty(),
                 },
             };
+            // The row is printed apart from the head it was lifted out of, so the printer is told
+            // what it holds before it names a label of its own.
+            printer.reserve_row(effects);
             let head = printer.scheme(&head);
             let row = RowText::of_row(effects, &mut printer);
             Split {
@@ -211,12 +215,13 @@ impl Provenance {
 
 pub fn provenance(def: &DefInfo) -> Provenance {
     let aliases: Vec<String> = def.row_aliases.iter().map(|a| a.to_string()).collect();
-    let unperformed: Vec<String> = def
+    let undone: BTreeSet<EffectAtom> = def
         .footprint
         .atoms()
         .filter(|a| !def.performed.atoms().any(|p| a.covers(p)))
-        .map(|a| a.to_string())
+        .cloned()
         .collect();
+    let unperformed: Vec<String> = Printer::new().atoms(&undone);
     Provenance {
         aliases,
         performed: (!unperformed.is_empty()).then(|| RowText::of_footprint(&def.performed)),

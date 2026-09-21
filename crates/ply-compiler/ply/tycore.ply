@@ -572,9 +572,12 @@ pub fn generalize(s: Subst, e: TypeEnv, t: Type) -> { e: TypeEnv, sc: Scheme } =
 
 // --- The printer --------------------------------------------------------------------------
 
-pub type Printer = { ty_names: Map<Int, Bytes>, row_names: Map<Int, Bytes>, label_names: Map<Int, Bytes> }
+// `taken` holds the concrete resource names the text names: a label variable may take none of them.
+pub type Printer = { ty_names: Map<Int, Bytes>, row_names: Map<Int, Bytes>, label_names: Map<Int, Bytes>,
+                     taken: Map<Bytes, Bool> }
 
-pub fn printer_new() -> Printer = { ty_names: map_new(), row_names: map_new(), label_names: map_new() }
+pub fn printer_new() -> Printer =
+  { ty_names: map_new(), row_names: map_new(), label_names: map_new(), taken: map_new() }
 
 fn ty_letters() -> Bytes = b"abcdghijklmnopqrsuvwxyz"
 fn row_letters() -> Bytes = b"eft"
@@ -591,7 +594,7 @@ fn ty_name(p: Printer, v: Int) -> { p: Printer, name: Bytes } =
     Some(n) -> { p: p, name: n },
     None -> {
       let name = letter_name(ty_letters(), map_len(p.ty_names));
-      { p: { ty_names: map_insert(p.ty_names, v, name), row_names: p.row_names, label_names: p.label_names }, name: name }
+      { p: {..p, ty_names: map_insert(p.ty_names, v, name)}, name: name }
     },
   }
 
@@ -600,7 +603,7 @@ fn row_name(p: Printer, v: Int) -> { p: Printer, name: Bytes } =
     Some(n) -> { p: p, name: n },
     None -> {
       let name = letter_name(row_letters(), map_len(p.row_names));
-      { p: { ty_names: p.ty_names, row_names: map_insert(p.row_names, v, name), label_names: p.label_names }, name: name }
+      { p: {..p, row_names: map_insert(p.row_names, v, name)}, name: name }
     },
   }
 
@@ -608,9 +611,38 @@ fn label_name(p: Printer, v: Int) -> { p: Printer, name: Bytes } =
   match map_get(p.label_names, v) {
     Some(n) -> { p: p, name: n },
     None -> {
-      let name = letter_name(label_letters(), map_len(p.label_names));
-      { p: { ty_names: p.ty_names, row_names: p.row_names, label_names: map_insert(p.label_names, v, name) }, name: name }
+      let name = free_label(p, 0);
+      { p: {..p, label_names: map_insert(p.label_names, v, name)}, name: name }
     },
+  }
+
+// The first label letter, then round, that no resource in this text and no other label holds, so
+// `[l]` in a printed row or footprint means one thing.
+fn free_label(p: Printer, i: Int) -> Bytes = {
+  let name = letter_name(label_letters(), i);
+  if map_contains(p.taken, name) || label_held(p.label_names, name) { free_label(p, i + 1) } else { name }
+}
+
+fn label_held(names: Map<Int, Bytes>, name: Bytes) -> Bool =
+  map_fold(names, false, |acc: Bool, v: Int, held: Bytes| acc || held == name)
+
+// Every concrete resource a text names, gathered before a label variable in it is given a name.
+fn reserve_resource(p: Printer, r: Resource) -> Printer =
+  match r {
+    RNamed(n) -> {..p, taken: map_insert(p.taken, n, true)},
+    _ -> p,
+  }
+
+fn reserve_atoms(p: Printer, atoms: List<Atom>) -> Printer =
+  fold(atoms, p, |acc: Printer, a: Atom| reserve_resource(acc, a.resource))
+
+fn reserve_ty(p: Printer, t: Type) -> Printer =
+  match t {
+    TyVar(_) -> p,
+    TyCon(c) -> fold(c.args, p, |acc: Printer, a: Type| reserve_ty(acc, a)),
+    TyFn(f) -> reserve_atoms(reserve_ty(fold(f.params, p, |acc: Printer, x: Type| reserve_ty(acc, x)), f.ret),
+                             f.effects.atoms),
+    TyRecord(fs) -> fold(fs, p, |acc: Printer, f: Field| reserve_ty(acc, f.ty)),
   }
 
 pub fn region_prefix() -> Bytes = b"#region:"
@@ -644,7 +676,8 @@ pub fn resource_text(r: Resource) -> Bytes = print_resource(printer_new(), r).s
 fn join_bytes(xs: List<Bytes>, sep: Bytes) -> Bytes =
   fold(range(0, len(xs)), b"", |acc: Bytes, i: Int| if i == 0 { at(xs, i) } else { bytes_concat_all([acc, sep, at(xs, i)]) })
 
-pub fn print_ty(p: Printer, t: Type) -> { p: Printer, s: Bytes } =
+pub fn print_ty(p0: Printer, t: Type) -> { p: Printer, s: Bytes } = {
+  let p = reserve_ty(p0, t);
   match t {
     TyVar(v) -> { let o = ty_name(p, v); { p: o.p, s: o.name } },
     TyCon(c) ->
@@ -682,6 +715,7 @@ pub fn print_ty(p: Printer, t: Type) -> { p: Printer, s: Bytes } =
         },
       },
   }
+}
 
 fn print_tys(p: Printer, ts: List<Type>) -> { p: Printer, ss: List<Bytes> } =
   fold(ts, { p: p, ss: [] }, |acc: { p: Printer, ss: List<Bytes> }, t: Type| {
@@ -690,7 +724,8 @@ fn print_tys(p: Printer, ts: List<Type>) -> { p: Printer, ss: List<Bytes> } =
   })
 
 // One printer for the whole list, so two label variables in it are told apart.
-pub fn print_atoms(p: Printer, atoms: List<Atom>, sep: Bytes) -> { p: Printer, s: Bytes } = {
+pub fn print_atoms(p0: Printer, atoms: List<Atom>, sep: Bytes) -> { p: Printer, s: Bytes } = {
+  let p = reserve_atoms(p0, atoms);
   let out = fold(atoms, { p: p, ss: [] }, |acc: { p: Printer, ss: List<Bytes> }, a: Atom| {
     let o = print_atom(acc.p, a);
     { p: o.p, ss: push(acc.ss, o.s) }
@@ -732,8 +767,10 @@ pub fn print_row(p: Printer, r: Row) -> { p: Printer, s: Bytes } = {
   }
 }
 
-pub fn print_scheme(p: Printer, sc: Scheme) -> { p: Printer, s: Bytes } = {
-  // Labels are named in the order a call fills them, so the head and the body read the same there.
+pub fn print_scheme(p0: Printer, sc: Scheme) -> { p: Printer, s: Bytes } = {
+  // Named in the order a call fills them, against every resource the body names, so the head and
+  // the body read the same there.
+  let p = reserve_ty(p0, sc.ty);
   let body = print_ty(fold(sc.label_vars, p, |acc: Printer, v: Int| label_name(acc, v).p), sc.ty);
   if len(sc.ty_vars) == 0 && len(sc.row_vars) == 0 && len(sc.label_vars) == 0 { body } else {
     let tys = fold(sc.ty_vars, { p: body.p, ss: [] }, |acc: { p: Printer, ss: List<Bytes> }, v: Int| {
@@ -822,6 +859,28 @@ test "a footprint's text binds the labels its atoms name" {
   assert_eq(atoms_text([], b","), b"");
   assert_eq(atoms_text([first, second, first], b","), b"<[l],[m]>net.recv[l],net.send[m],net.recv[l]");
   assert_eq(atoms_text([named, second], b","), b"<[l]>net.send[conn],net.send[l]")
+}
+
+// The shape `crates/ply-ty-tests` pins for the Rust printer: the two must answer it alike, or a
+// text one of them wrote reads back as something else in the other.
+test "a label variable steps past a resource of its name" {
+  let named = { effect: b"net", resource: RNamed(b"l"), mode: MWrite, op: Some(b"send") };
+  let var_ = { effect: b"net", resource: RVar(4), mode: MWrite, op: Some(b"recv") };
+  assert_eq(atoms_text([named, var_], b","), b"<[m]>net.send[l],net.recv[m]");
+  assert_eq(row_text(row_closed([named, var_])), b"{net.send[l], net.recv[m]}");
+  // One operation under a resource and under the variable: two atoms, and two names.
+  let same_op = { effect: b"net", resource: RVar(4), mode: MWrite, op: Some(b"send") };
+  assert_eq(atoms_text([named, same_op], b","), b"<[m]>net.send[l],net.send[m]");
+  let sc = { ty_vars: [], row_vars: [], label_vars: [4],
+             ty: t_fn([], t_unit(), row_closed([named, var_])) };
+  assert_eq(scheme_text(sc), b"<[m]>() -> Unit / {net.send[l], net.recv[m]}");
+  // A second name in the way takes the next letter again.
+  let held = { effect: b"net", resource: RNamed(b"m"), mode: MWrite, op: Some(b"close") };
+  assert_eq(atoms_text([named, held, var_], b","), b"<[n]>net.send[l],net.close[m],net.recv[n]");
+  // Every letter held, so the variable takes the round.
+  let last = { effect: b"net", resource: RNamed(b"n"), mode: MWrite, op: Some(b"connect") };
+  assert_eq(atoms_text([named, held, last, var_], b","),
+            b"<[l1]>net.send[l],net.close[m],net.connect[n],net.recv[l1]")
 }
 
 test "a free label variable takes the resource the other row names for its operation" {
