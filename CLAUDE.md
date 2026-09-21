@@ -43,8 +43,9 @@ the runtime and the CLI.
   `main` after each merge (the `refresh` job), and a pull request runs its sources through the
   checked-in bundle as a stage. A golden that moved is listed in the partition job's summary;
   read it, since nothing fails on it.
-- The bundle carries `crates/ply-compiler/ply` alone, so that directory is the only Ply that
-  cannot use a language rule the same pull request introduces. `crates/ply-std/ply` can.
+- The bundle carries `crates/ply-compiler/ply` and the shipped modules it imports, pulled as a
+  project's are (today `std.hash` alone), so only those cannot use a language rule the same pull
+  request introduces. The rest of `crates/ply-std/ply` can.
 - `docs/GUIDE.md` is the user manual. A change to syntax, types, builtins, the standard library,
   CLI commands, flags or exit codes, or diagnostic codes updates it in the same PR.
 
