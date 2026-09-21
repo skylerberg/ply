@@ -1,6 +1,5 @@
 //! The `.ply-cache` directory: results keyed by `(RUNTIME_VERSION, DefHash)`, and the front end
-//! keyed by `(FRONTEND_VERSION, path | DefHash)`, beside the parts of its last answer and of the
-//! last claims it lowered.
+//! keyed by `(FRONTEND_VERSION, path | DefHash)`, beside the parts of the last claims it lowered.
 
 mod answer;
 mod binary;
@@ -40,7 +39,7 @@ pub use upstream::Upstream;
 pub const RUNTIME_VERSION: &str = "0.16.0";
 
 /// Bumping this discards every cached type, footprint, source fingerprint and front-end answer.
-pub const FRONTEND_VERSION: &str = "0.26.0";
+pub const FRONTEND_VERSION: &str = "0.27.0";
 
 /// Bumping this re-attempts every obligation and re-runs no test.
 pub const PROVER_VERSION: &str = "0.7.0";
@@ -304,7 +303,6 @@ pub struct Store {
     frontend_path: PathBuf,
     frontend_data_path: PathBuf,
     frontend: frontend::Frontend,
-    answer: answer::Answer,
     claims: answer::Answer,
     warnings: Vec<Diagnostic>,
     stdlib: Stdlib,
@@ -605,8 +603,8 @@ fn names_match(name: &Symbol, query: &str) -> bool {
     name.as_str() == query || name.as_str().rsplit('.').next() == Some(query)
 }
 
-/// An obsolete front-end cache file, removed whenever the front end is written.
-const LEGACY_FRONTEND_FILE: &str = "frontend.json";
+/// Obsolete front-end cache files, removed whenever the front end is written.
+const RETIRED_FRONTEND_FILES: [&str; 2] = ["frontend.json", "frontend.answer"];
 
 impl Store {
     pub fn open(root: &Path) -> anyhow::Result<Store> {
@@ -621,11 +619,6 @@ impl Store {
         let frontend_path = dir.join(frontend::FRONTEND_FILE);
         let frontend_data_path = dir.join(frontend::FRONTEND_DATA_FILE);
         let stdlib_path = dir.join(disk::STDLIB_FILE);
-        let answer = answer::Answer::new(
-            dir.join(answer::ANSWER_FILE),
-            answer::ANSWER_STEM,
-            "front-end answer",
-        );
         let claims = answer::Answer::new(
             dir.join(answer::CLAIMS_FILE),
             answer::CLAIMS_STEM,
@@ -657,7 +650,6 @@ impl Store {
             frontend_path,
             frontend_data_path,
             frontend,
-            answer,
             claims,
             warnings: frontend_warnings,
             upstream: None,
@@ -774,7 +766,6 @@ impl Store {
             && !self.reviews.dirty
             && !self.frontend.is_dirty()
             && self.stdlib.pending.is_none()
-            && !self.answer.is_pending()
             && !self.claims.is_pending()
         {
             return Ok(());
@@ -811,13 +802,12 @@ impl Store {
         if self.frontend.is_dirty() {
             self.frontend
                 .flush(&self.dir, &self.frontend_path, &self.frontend_data_path)?;
-            let _ = std::fs::remove_file(self.dir.join(LEGACY_FRONTEND_FILE));
+            self.forget_retired();
         }
         if let Some(digest) = self.stdlib.pending.take() {
             disk::save_stdlib(&self.dir, &self.stdlib.path, &digest)?;
             self.stdlib.stored = OnceLock::from(Some(digest));
         }
-        self.answer.flush(&self.dir)?;
         self.claims.flush(&self.dir)?;
         Ok(())
     }
@@ -925,9 +915,8 @@ impl Store {
         remove(&self.obligations.path, "obligation cache")?;
         remove(&self.frontend_path, "front-end cache")?;
         remove(&self.frontend_data_path, "front-end cache")?;
-        self.answer.clear()?;
         self.claims.clear()?;
-        remove(&self.dir.join(LEGACY_FRONTEND_FILE), "front-end cache")?;
+        self.forget_retired();
         disk::sweep_temps(&self.dir, None);
         Ok(())
     }
@@ -1017,20 +1006,17 @@ impl Store {
         self.stdlib.pending = Some(digest);
     }
 
-    pub fn front_part(&self, key: ContentHash) -> Option<String> {
-        self.answer.part(key)
-    }
-
-    /// Replaces every part on disk at the next flush, unless these are the parts already there.
-    pub fn put_front_parts(&mut self, parts: std::collections::BTreeMap<ContentHash, String>) {
-        self.answer.put(parts);
+    fn forget_retired(&self) {
+        for name in RETIRED_FRONTEND_FILES {
+            let _ = std::fs::remove_file(self.dir.join(name));
+        }
     }
 
     pub fn claims_part(&self, key: ContentHash) -> Option<String> {
         self.claims.part(key)
     }
 
-    /// As [`Store::put_front_parts`], for the claims `ply prove` lowers.
+    /// Replaces every part on disk at the next flush, unless these are the parts already there.
     pub fn put_claims_parts(&mut self, parts: std::collections::BTreeMap<ContentHash, String>) {
         self.claims.put(parts);
     }
@@ -1183,7 +1169,7 @@ impl Store {
         self.write_results()?;
         self.frontend
             .compact(&self.dir, &self.frontend_path, &self.frontend_data_path)?;
-        let _ = std::fs::remove_file(self.dir.join(LEGACY_FRONTEND_FILE));
+        self.forget_retired();
         Ok(Compaction {
             dropped,
             bytes_before,
@@ -1249,7 +1235,7 @@ impl Store {
     }
 
     pub fn frontend_is_empty(&self) -> bool {
-        self.frontend.is_empty() && self.answer.is_empty() && self.claims.is_empty()
+        self.frontend.is_empty() && self.claims.is_empty()
     }
 
     pub fn frontend_is_dirty(&self) -> bool {
