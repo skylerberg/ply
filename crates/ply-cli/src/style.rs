@@ -65,15 +65,6 @@ impl Style {
     pub fn yellow(self, text: &str) -> String {
         self.paint("33", text)
     }
-
-    /// `ariadne` colours diagnostics unasked, so unstyled output has to strip them.
-    pub fn sanitize(self, text: &str) -> String {
-        if self.styled {
-            text.to_string()
-        } else {
-            strip_ansi(text)
-        }
-    }
 }
 
 /// Drops CSI and two-character escapes; anything else after an `ESC` passes through.
