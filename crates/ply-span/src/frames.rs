@@ -337,7 +337,6 @@ fn by_code(code: &str, message: &str) -> Option<Diagnostic> {
         "E0417" => Diagnostic::error(codes::EFFECT_IN_SPEC, message),
         "E0418" => Diagnostic::error(codes::UNQUANTIFIABLE_TYPE, message),
         "E0446" => Diagnostic::error(codes::REGION_ESCAPE, message),
-        "E0447" => Diagnostic::error(codes::REGION_ALREADY_OPEN, message),
         "E0505" => Diagnostic::error(codes::INTERNAL_ERROR, message),
         "W0611" => Diagnostic::warning(codes::UNUSED_DEFINITION, message),
         _ => return None,

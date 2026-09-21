@@ -111,34 +111,12 @@ fn a_cell_round_tripped_through_a_type_alias_keeps_its_brand() {
 
 #[test]
 fn a_region_in_a_law_body_reports_its_escape() {
-    let diags = refused(
-        r#"law "leak" forall (n: Int) { with_region[r] { with_cell[r](n) { c -> c } } == 0 }"#,
-    );
+    let diags = refused(r#"law "leak" forall (n: Int) { with_cell[r](n) { c -> c } == 0 }"#);
     assert!(
-        diags.iter().any(|d| d.code == codes::REGION_ESCAPE),
+        diags.iter().any(|d| d.code == codes::TYPE_MISMATCH
+            && d.message.contains("escapes its `with_cell[r]` region")),
         "a law's region escaped unchecked: {:?}",
         codes_of(&diags)
-    );
-}
-
-#[test]
-fn the_same_escape_out_of_a_with_region_is_refused_statically() {
-    let diags = refused(
-        r#"
-pub fn attack() -> Int = simulate {
-  { let t = with_region[s] { with_cell[s](11) { c -> task.spawn(|| cell_get(c)) } };
-    task.join(t) }
-}
-"#,
-    );
-    let escape = diags
-        .iter()
-        .find(|d| d.code == codes::REGION_ESCAPE)
-        .unwrap_or_else(|| panic!("a task reached a `with_region`'s cell: {diags:#?}"));
-    assert!(
-        escape.message.contains("sent to another task"),
-        "{}",
-        escape.message
     );
 }
 

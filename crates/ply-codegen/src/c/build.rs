@@ -146,7 +146,7 @@ fn emit_all(
             match emission {
                 Ok((text, tables)) => {
                     match tables.calls.iter().find(|c| !taken.contains(c)).cloned() {
-                        Some(missing) => round.push(refused(name, not_in_unit(&missing))),
+                        Some(missing) => round.push(dropped(name, missing)),
                         None => {
                             symbols.insert(name.clone(), defines(name, &tables));
                             // A group's one body is placed once, where its first member is taken.
@@ -269,6 +269,7 @@ fn published<'a>(symbols: &'a HashMap<String, Defined>, name: &str) -> &'a Defin
 pub struct Produced {
     pub text: String,
     pub exports: Exports,
+    /// Only what a narrowed offer dropped: any other refusal failed this call.
     pub refused: Vec<Refused>,
 }
 
@@ -303,6 +304,10 @@ fn produce_in(
     // Never cache a unit over an emitter that raised: fail, and the next run asks again.
     if let Some(why) = super::producer::with_current(|p| p.failure(loaded)).flatten() {
         bail!("the Ply emitter failed over the program: {why}");
+    }
+    let unrunnable = super::fatal_refusals(offered, &refusals);
+    if !unrunnable.is_empty() {
+        return Err(super::Refusals::over(loaded, &unrunnable).into());
     }
     let started = Instant::now();
     let exports = describe(loaded, unit, taken, &symbols, constants, &refusals, ctors);
@@ -392,6 +397,7 @@ fn refused_of(exports: &Exports) -> Vec<Refused> {
         .map(|(function, construct)| Refused {
             function: function.clone(),
             construct: construct.clone(),
+            missing: None,
         })
         .collect()
 }
@@ -566,11 +572,18 @@ fn refused(name: &str, construct: String) -> Refused {
     Refused {
         function: name.to_string(),
         construct,
+        missing: None,
     }
 }
 
-fn not_in_unit(callee: &str) -> String {
-    format!("`{callee}`, which is not in this compiled unit")
+/// A body the fixpoint dropped because `callee` is not in the unit, rather than one the emitter
+/// refused outright.
+fn dropped(name: &str, callee: String) -> Refused {
+    Refused {
+        function: name.to_string(),
+        construct: format!("`{callee}`, which is not in this compiled unit"),
+        missing: Some(callee),
+    }
 }
 
 /// The body's and the refusal's cache keys; none when the root is unkeyed. Keyed by name too:
