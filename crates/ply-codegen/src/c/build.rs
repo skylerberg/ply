@@ -2,7 +2,7 @@
 //! definition it calls is taken, so a set that compiles cannot call out of itself.
 
 use super::Refused;
-use super::exports::{Exports, Taken, unpublished};
+use super::exports::{Exports, Taken};
 use super::load::{Library, compile_and_load, compile_and_load_timed};
 use super::tables::{Defined, Positions, Unit, bucket_mark, bucket_of, root_id};
 use super::{HELPERS, PRELUDE, helper_addresses, runtime_header, runtime_object};
@@ -245,7 +245,7 @@ fn emit_all(
 }
 
 /// The C the emitter published for `name`: its place among the body's members, or the body's one
-/// definition. A body staged by the committed emitter publishes none.
+/// definition.
 fn defines(name: &str, tables: &super::tables::Tables) -> Defined {
     let at = tables
         .members
@@ -256,7 +256,7 @@ fn defines(name: &str, tables: &super::tables::Tables) -> Defined {
         .symbols
         .get(at)
         .cloned()
-        .unwrap_or_else(|| unpublished(name))
+        .expect("an emitted body publishes the C it defines")
 }
 
 fn published<'a>(symbols: &'a HashMap<String, Defined>, name: &str) -> &'a Defined {
