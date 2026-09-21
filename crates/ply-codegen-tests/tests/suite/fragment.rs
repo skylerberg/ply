@@ -80,6 +80,9 @@ fn listed(n: Int) -> Int = match [Ok(n), Err(2)] { [Ok(a), Err(b)] -> a + b, _ -
 
 fn joined(n: Int) -> Int = if "ab" ++ "cd" == "abcd" { n } else { 0 - n }
 
+fn byte_joined(n: Int) -> Int =
+  if b"ab" ++ b"cd" == bytes_concat(b"ab", b"cd") { n + bytes_len(b"" ++ b"xyz") } else { 0 - n }
+
 fn let_taken(n: Int) -> Int = { let {value, next} = step(n); value + next }
 
 fn let_rest(n: Int) -> Int = { let {value: v, ..} = step(n); v }
@@ -284,6 +287,8 @@ fn a_compiled_body_answers_over_concat_and_nested_patterns() {
         ("m.aliased", vec![Value::Int(4)], Value::Int(103)),
         ("m.listed", vec![Value::Int(5)], Value::Int(7)),
         ("m.joined", vec![Value::Int(11)], Value::Int(11)),
+        // `++` on Bytes is the join `bytes_concat` names, native word path included.
+        ("m.byte_joined", vec![Value::Int(11)], Value::Int(14)),
         // Rebuilt from a dying record of its width reuses its memory; a held, differently shaped or later-read base is built as written.
         ("m.spun", vec![Value::Int(1)], Value::Int(4_140)),
         ("m.shared", vec![Value::Int(3)], Value::Int(3_023)),

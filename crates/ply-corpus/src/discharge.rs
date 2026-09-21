@@ -211,7 +211,7 @@ fn label(blocker: &Blocker) -> String {
         Blocker::NonlinearMultiplication => "multiplication of two symbolics",
         Blocker::CoefficientRange => "coefficient left range",
         Blocker::Lambda => "lambda",
-        Blocker::StringConcat => "string concatenation",
+        Blocker::Concat => "concatenation",
         Blocker::BitOperator => "bit operator or shift",
         Blocker::Region => "perform, handle or simulate",
         Blocker::UndecidableMatchArm => "pattern outside the fragment, or a match guard",
