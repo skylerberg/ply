@@ -253,8 +253,13 @@ A bracketed name binds a resource label:
 among the type parameters and before the `|` — `fn serve<a, [l], [k] | e>(..)` —
 and one bracket may hold several, so `<[l, k]>` is `<[l], [k]>`. A call fills
 them left to right, either written, `relay[conn](b)`, or from an argument whose
-row names one (§6.2); a recursive call reuses its own and writes none. A printed
-signature shows the binders, `<[l]>(Bytes) -> Unit / {net.send[l]}` and
+row names one (§6.2). A call inside a recursive group — to the definition itself
+or to one it is mutually recursive with — keeps the labels the group was called
+with: it writes none, or names this definition's own binders in order, and any
+other label there is `E0306`. The members of such a group are checked with one
+set of binders, positionally, whatever each calls them, so each binds the same
+number of them; members that disagree are `E0307`. A printed signature shows
+the binders, `<[l]>(Bytes) -> Unit / {net.send[l]}` and
 `<a, [l] | e>(a) -> Unit / {net.send[l] | e}`, naming label variables `l`, `m`,
 `n`, then `l1` — stepping past any of those a resource in the same signature
 holds, so a row naming `[l]` prints its variable as `[m]` and the two stay
@@ -1364,6 +1369,7 @@ the message.
 | `E0304` | resource label required |
 | `E0305` | `handle` leaves an operation, or a mode atom, under a handled mode atom unanswered |
 | `E0306` | label instantiation: a call leaves a label unfilled or writes the wrong number of them, or a label-generic definition is used as a value |
+| `E0307` | mutually recursive definitions binding different label parameters |
 | `E0412` | nondeterministic effect in a deterministic test |
 | `E0413` | `Task` escapes its region |
 | `E0414` | deadlock, or spent step budget |

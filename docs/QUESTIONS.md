@@ -19,13 +19,13 @@ still never read across a module boundary: the rewrite runs before types exist, 
 read from another file would change this file's hashes without this file changing. Assumed:
 that line stays where it is, and `{..other::make(), x: 1}` keeps needing a local annotation.
 
-## A label-generic definition cannot call a mutually recursive sibling
+## Row and type parameters still do not share across a recursive group
 
-Two definitions in one recursive group each get their own rigid label variable, and two rigid
-variables never unify, so `fn a<[l]>(..) / {net.recv[l]}` cannot call `fn b<[l]>(..)` in its own
-component. A self call is fine: it keeps the labels the definition was called with. Rewriting
-`std.http`'s body reader as one function rather than two was the cost of this. The fix is to
-treat a sibling call in a component like a self call, sharing the binders the component was
-checked with, as a recursive group already does for types. Assumed: worth doing, as its own
-item. Say if you would rather the checker refused such a call with a diagnostic of its own,
-which is what it does today only as an accident of unification.
+A recursive component is now checked with one set of label binders, so a definition generic over
+a label may call a mutually recursive sibling. Row and type parameters are not shared the same
+way: two members each get their own rigid `e` and `a`, so `std.http`'s connection loop is still
+one function rather than five (`crates/ply-std/ply/http.ply`). Extending the sharing is not
+mechanical, since a group whose members want *different* instantiations of a type parameter is
+polymorphic recursion, which needs written signatures to stay decidable. Assumed: worth doing for
+rows, where there is no such difficulty, and worth refusing clearly for types. Say whether you
+want both, rows only, or neither.

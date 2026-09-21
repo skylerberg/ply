@@ -226,6 +226,33 @@ fn a_call_that_does_not_settle_a_label_is_refused_with_its_own_code() {
     }
 }
 
+/// The members of a recursive group are checked with one set of label binders, so a member that
+/// binds another number of them is refused where it is declared, against the member it agrees with.
+#[test]
+fn mutually_recursive_definitions_that_bind_different_labels_are_refused() {
+    let source = "effect net {\n  write send[s](payload: Bytes) -> Unit\n}\n\
+                  fn ping<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} =\n  \
+                  if n == 0 { net.send[l](b) } else { pong(n - 1, b) }\n\
+                  fn pong(n: Int, b: Bytes) -> Unit / {net.send[conn]} = ping(n - 1, b)\n";
+    let dir = project(source);
+    let out = ply(dir.path()).args(["check", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let v = json_of(&out);
+    let raised = v["diagnostics"]
+        .as_array()
+        .expect("a diagnostics array")
+        .iter()
+        .find(|d| d["code"] == "E0307")
+        .unwrap_or_else(|| panic!("no E0307: {v}"));
+    assert_eq!(
+        raised["message"],
+        "`pong` and `ping` are mutually recursive, so they are checked with one set of label \
+         parameters"
+    );
+    assert_eq!(raised["labels"][0]["message"], "binds no label parameters");
+    assert_eq!(raised["labels"][1]["message"], "binds 1 label parameter");
+}
+
 #[test]
 fn test_leads_with_the_selection_line() {
     let dir = project(GREEN);
