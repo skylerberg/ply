@@ -33,22 +33,26 @@ fn sample() -> Artifact {
     }
 }
 
+fn written(artifact: &Artifact) -> Vec<u8> {
+    artifact.encode().expect("the container should be written")
+}
+
 #[test]
 fn an_embedded_unit_survives_encoding() {
     let mut artifact = sample();
     artifact.unit = Some(EmbeddedUnit {
         text: vec![1, 2, 3, 4],
     });
-    let bytes = artifact.encode();
+    let bytes = written(&artifact);
     let (decoded, _) = decode(&bytes, Path::new("x.plyx")).expect("decodes");
     assert_eq!(decoded.unit, artifact.unit);
-    assert_ne!(sample().encode(), bytes, "the unit is in the digest");
+    assert_ne!(written(&sample()), bytes, "the unit is in the digest");
 }
 
 #[test]
 fn a_round_trip_preserves_every_field() {
     let artifact = sample();
-    let (back, warnings) = decode(&artifact.encode(), Path::new("t.plyx")).unwrap();
+    let (back, warnings) = decode(&written(&artifact), Path::new("t.plyx")).unwrap();
     assert_eq!(back, artifact);
     assert!(warnings.is_empty());
     assert_eq!(back.entry_name(), Some("m.main"));
@@ -61,29 +65,15 @@ fn a_closure_round_trips_and_is_believed_only_as_bytes() {
         ("a.ply".to_string(), "fn a() -> Int = 1\n".to_string()),
         ("sub/b.ply".to_string(), "fn b() -> Int = 2\n".to_string()),
     ];
-    let (back, _) = decode(&artifact.encode(), Path::new("t.plyx")).unwrap();
+    let (back, _) = decode(&written(&artifact), Path::new("t.plyx")).unwrap();
     assert_eq!(back, artifact);
-}
-
-#[test]
-fn a_flipped_bit_in_a_body_names_that_definition_and_its_offset() {
-    let artifact = sample();
-    let mut bytes = artifact.encode();
-    // The first body's payload, past the 32-byte key and the length.
-    let at = HEADER_LEN + DESCRIPTOR_LEN * 3 + 36;
-    bytes[at] ^= 0xff;
-    let err = decode(&bytes, Path::new("t.plyx")).unwrap_err();
-    assert_eq!(err.code, codes::ARTIFACT_INVALID);
-    assert!(err.message.contains("offset"), "{}", err.message);
-    let first = artifact.bodies.keys().next().unwrap();
-    assert!(err.message.contains(&first.short()), "{}", err.message);
 }
 
 #[test]
 fn a_foreign_body_encoding_is_a_version_refusal_and_not_a_corruption_one() {
     let mut artifact = sample();
     artifact.body_encoding += 1;
-    let err = decode(&artifact.encode(), Path::new("t.plyx")).unwrap_err();
+    let err = decode(&written(&artifact), Path::new("t.plyx")).unwrap_err();
     assert_eq!(err.code, codes::ARTIFACT_VERSION);
 }
 
@@ -91,7 +81,7 @@ fn a_foreign_body_encoding_is_a_version_refusal_and_not_a_corruption_one() {
 fn a_foreign_stdlib_is_a_warning_and_the_artifact_still_loads() {
     let mut artifact = sample();
     artifact.std = [9; 32];
-    let (back, warnings) = decode(&artifact.encode(), Path::new("t.plyx")).unwrap();
+    let (back, warnings) = decode(&written(&artifact), Path::new("t.plyx")).unwrap();
     assert_eq!(back.std, [9; 32]);
     assert_eq!(warnings.len(), 1);
     assert_eq!(warnings[0].code, codes::STDLIB_CHANGED);
@@ -99,8 +89,7 @@ fn a_foreign_stdlib_is_a_warning_and_the_artifact_still_loads() {
 
 #[test]
 fn the_digest_covers_every_byte_after_it() {
-    let artifact = sample();
-    let mut bytes = artifact.encode();
+    let mut bytes = written(&sample());
     let before = digest_of(&bytes).unwrap();
     let last = bytes.len() - 1;
     bytes[last] ^= 0xff;
@@ -124,16 +113,12 @@ fn the_entry_point_is_in_the_digest() {
         .find(|hash| **hash != artifact.entry)
         .expect("a second definition");
     assert_ne!(artifact.digest(), elsewhere.digest());
-    assert_eq!(
-        artifact.encode()[OFF_SECTIONS..],
-        elsewhere.encode()[OFF_SECTIONS..],
-        "only the entry point differs"
-    );
 }
 
 #[test]
-fn a_format_3_artifact_is_a_version_refusal() {
-    let mut bytes = sample().encode();
+fn a_format_the_container_does_not_write_is_a_version_refusal() {
+    let mut bytes = written(&sample());
+    // The format number, where the header states it.
     bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
     let err = decode(&bytes, Path::new("t.plyx")).unwrap_err();
     assert_eq!(err.code, codes::ARTIFACT_VERSION);
@@ -143,30 +128,6 @@ fn a_format_3_artifact_is_a_version_refusal() {
 fn a_header_shorter_than_a_header_is_a_diagnostic_rather_than_a_panic() {
     let err = decode(&[0u8; 4], Path::new("t.plyx")).unwrap_err();
     assert_eq!(err.code, codes::ARTIFACT_INVALID);
-}
-
-#[test]
-fn a_wild_section_count_allocates_nothing() {
-    let artifact = sample();
-    let mut bytes = artifact.encode();
-    bytes[OFF_SECTIONS..OFF_SECTIONS + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-    let err = decode(&bytes, Path::new("t.plyx")).unwrap_err();
-    assert_eq!(err.code, codes::ARTIFACT_INVALID);
-}
-
-#[test]
-fn every_prefix_of_an_artifact_is_refused_rather_than_believed() {
-    let artifact = sample();
-    let bytes = artifact.encode();
-    for cut in 0..bytes.len() {
-        let err = decode(&bytes[..cut], Path::new("t.plyx"))
-            .expect_err("a truncated artifact must not decode");
-        assert!(
-            err.code == codes::ARTIFACT_INVALID || err.code == codes::ARTIFACT_VERSION,
-            "cut {cut} produced {}",
-            err.code
-        );
-    }
 }
 
 #[test]

@@ -1123,7 +1123,7 @@ fn the_emitters_program_is_the_one_the_front_end_pulls() {
 fn the_shipped_blake3_is_blake3() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
-    let loaded = load(&[("std.hash", ply_std::HASH)]);
+    let loaded = load(&[("std.bytes", ply_std::BYTES), ("std.hash", ply_std::HASH)]);
     let source: &'static Source = Box::leak(Box::new(
         Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
     ));

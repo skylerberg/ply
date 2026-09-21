@@ -304,7 +304,7 @@ fn build_in(dir: &Path) -> Result<Vec<u8>, Diagnostic> {
     if !built.entry_compiled {
         return Err(refused_entry(&built));
     }
-    Ok(built.artifact.encode())
+    built.artifact.encode()
 }
 
 #[cold]
