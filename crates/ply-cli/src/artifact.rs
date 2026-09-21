@@ -709,34 +709,59 @@ pub fn open(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnostic>>
     })
 }
 
+fn front_failed(why: String) -> Vec<Diagnostic> {
+    vec![
+        Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            format!("the front end could not answer for this program: {why}"),
+        )
+        .note("this is Ply's fault: the compiler's own front end is what failed here"),
+    ]
+}
+
+/// What the port answered, kept whole so it can be filed and rebuilt without asking again.
+struct Answered {
+    front: Front,
+    modules: Vec<String>,
+    dump: String,
+}
+
 /// Shipped modules live in this binary, pinned by the header's `ply_std::digest()`; the port
 /// pulls in the ones the closure imports and places them after it.
 fn ask_the_port(
     own: &[(String, String)],
     ids: &mut Vec<ply_span::SourceId>,
     sources: &mut SourceMap,
-) -> Result<Front, Vec<Diagnostic>> {
+) -> Result<Answered, Vec<Diagnostic>> {
     ply_codegen::c::producer::ensure_default();
-    let failed = |why: String| {
-        vec![
-            Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                format!("the front end could not answer for this program: {why}"),
-            )
-            .note("this is Ply's fault: the compiler's own front end is what failed here"),
-        ]
-    };
     let shelf = crate::shipped::sources();
     let pulled = ply_codegen::c::producer::front_pulling_std(own, shelf)
-        .map_err(|e| failed(format!("{e:#}")))?;
-    for module in &pulled.modules {
+        .map_err(|e| front_failed(format!("{e:#}")))?;
+    let front = place_and_read(&pulled.modules, &pulled.dump, ids, sources)?;
+    Ok(Answered {
+        front,
+        modules: pulled.modules,
+        dump: pulled.dump,
+    })
+}
+
+/// The shipped modules the port pulled in, placed after the closure's files so the dump's source
+/// indexes land where it wrote them, and the dump read back against those very ids.
+fn place_and_read(
+    modules: &[String],
+    dump: &str,
+    ids: &mut Vec<ply_span::SourceId>,
+    sources: &mut SourceMap,
+) -> Result<Front, Vec<Diagnostic>> {
+    for module in modules {
         let name = ModuleName::from_dotted(module);
-        let text = crate::shipped::source(&name)
-            .ok_or_else(|| failed(format!("it pulled in `{module}`, which is not shipped")))?;
+        let text = crate::shipped::source(&name).ok_or_else(|| {
+            front_failed(format!("it pulled in `{module}`, which is not shipped"))
+        })?;
         ids.push(sources.add(crate::shipped::pseudo_path(&name), text));
     }
-    let front = ply_ty::read_front(&pulled.dump, ids.as_slice())
-        .map_err(|e| failed(format!("the front end's answer does not read: {e}")))?;
+    let front = ply_ty::read_front(dump, ids.as_slice())
+        .map_err(|e| front_failed(format!("the front end's answer does not read: {e}")))?;
     let errors: Vec<Diagnostic> = front
         .diagnostics
         .iter()
@@ -747,6 +772,69 @@ fn ask_the_port(
         Ok(front)
     } else {
         Err(errors)
+    }
+}
+
+/// Where the front end's answer for one artifact is kept: beside the program, under a key that is
+/// the artifact's own bytes plus what reads them.
+fn front_cache(artifact: &Artifact) -> PathBuf {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&artifact.digest());
+    hasher.update(ply_store::FRONTEND_VERSION.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(ply_codegen::c::producer::identity().as_bytes());
+    crate::shipped::stage().join(format!("front.{}", &hasher.finalize().to_hex()[..16]))
+}
+
+/// The pulled module names, then the dump: the two halves a `Front` is rebuilt from in process.
+fn file_front(at: &Path, modules: &[String], dump: &str) {
+    let Some(parent) = at.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let mut bytes = format!("{}\n", modules.len()).into_bytes();
+    for module in modules {
+        bytes.extend_from_slice(module.as_bytes());
+        bytes.push(b'\n');
+    }
+    bytes.extend_from_slice(dump.as_bytes());
+    let tmp = parent.join(format!("front.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, at).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn split_front(text: &str) -> Option<(Vec<String>, &str)> {
+    let (count, mut rest) = text.split_once('\n')?;
+    let count: usize = count.parse().ok()?;
+    let mut modules = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (name, tail) = rest.split_once('\n')?;
+        modules.push(name.to_string());
+        rest = tail;
+    }
+    Some((modules, rest))
+}
+
+/// The `Front` an earlier run answered for this very artifact. A hit skips the check below that
+/// the closure rebuilds the artifact's bodies: the key is the digest of those very bytes, and the
+/// file is only ever written after that check passed on this machine.
+fn cached_front(
+    at: &Path,
+    ids: &mut Vec<ply_span::SourceId>,
+    sources: &mut SourceMap,
+) -> Option<Front> {
+    let text = std::fs::read_to_string(at).ok()?;
+    let (modules, dump) = split_front(&text)?;
+    let kept_ids = ids.clone();
+    let kept_sources = sources.clone();
+    match place_and_read(&modules, dump, ids, sources) {
+        Ok(front) => Some(front),
+        Err(_) => {
+            *ids = kept_ids;
+            *sources = kept_sources;
+            None
+        }
     }
 }
 
@@ -765,7 +853,12 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
         ids.push(sources.add(&relative, text.clone()));
         own.push((name.to_string(), text.clone()));
     }
-    let front = ask_the_port(&own, &mut ids, &mut sources)?;
+    let filed = front_cache(artifact);
+    if let Some(front) = cached_front(&filed, &mut ids, &mut sources) {
+        return entered(artifact, sources, front);
+    }
+    let answered = ask_the_port(&own, &mut ids, &mut sources)?;
+    let front = answered.front;
 
     let hashes = &front.hashes;
     let bodies = ply_store::body::of_front(&front);
@@ -803,6 +896,15 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
         ))]);
     }
 
+    file_front(&filed, &answered.modules, &answered.dump);
+    entered(artifact, sources, front)
+}
+
+fn entered(
+    artifact: &Artifact,
+    sources: SourceMap,
+    front: Front,
+) -> Result<Opened, Vec<Diagnostic>> {
     let entry = artifact
         .entry_name()
         .map(Symbol::new)

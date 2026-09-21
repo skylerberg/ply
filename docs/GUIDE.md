@@ -1205,7 +1205,7 @@ members of one recursive group); an artifact from another version is `E0444`.
 `ply [--color auto|always|never] <command> [path] [options]`. `--color` is
 global; `auto` colours only a terminal with `NO_COLOR` unset. The path defaults
 to `.`. Every command takes `--json` and then prints exactly one JSON object on
-stdout.
+stdout, compact and with its keys sorted.
 
 | exit | meaning |
 | --- | --- |
@@ -1242,17 +1242,27 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply cache clear\|stats\|compact [path]` | discard results / report size and reclaimable space / reclaim it |
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 
+`ply fmt`, `ply defs`, `ply hash`, `ply doc` and `ply explain` are one Ply
+program (`crates/ply-cli/ply`, entered at `ply.main`). `ply` parses the command
+line, binds the directory the load is rooted at as the program's one writable
+filesystem root and the modules it ships as a read-only second one, and answers
+with the code the program asked to exit with. A path is therefore relative to
+its root, and one that leaves it is refused with `E0452`. The first run after
+`ply` or the program itself changes compiles the program's unit, which needs the
+C toolchain `ply run` needs and takes a few seconds; every later run loads the
+compiled object and the front end it filed beside it.
+
+Those five render a diagnostic in Ply's own shape — the severity, the code and
+the message, then `--> path:line:col` with the source line and a caret run per
+label it can place, then `= ` notes. `ply check`, `ply run` and `ply test` still
+render through `ariadne`; the two do not yet agree.
+
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed
-and leaves a file that does not parse alone, exiting 2 with the diagnostic.
-It is a Ply program (`crates/ply-cli/ply/fmt.ply`) run over the working
-directory as its one filesystem root, so a path is relative to it and an
-absolute path, or one that leaves it, is refused with `E0452`. A directory whose
-name starts with `.`, and one named `target`, are not walked; a symlink found
-while walking is passed over, and one named on the command line is an error
-rather than a file to rewrite. The first run after `ply` or the program itself
-changes compiles the program's unit, which needs the C toolchain `ply run` needs
-and takes a few seconds; every later run loads the compiled object.
+and leaves a file that does not parse alone, exiting 2 with the diagnostic. A
+directory whose name starts with `.`, and one named `target`, are not walked; a
+symlink found while walking is passed over, and one named on the command line is
+an error rather than a file to rewrite.
 
 `ply show NAME` and `ply replace NAME` are the edit loop for one definition: read
 it, rewrite it, and touch nothing else in the file. The replacement is one item

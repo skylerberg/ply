@@ -227,6 +227,65 @@ fn a_leading_dot_slash_never_reaches_a_rendered_span() {
     assert_eq!(tidy(Path::new("src/a.ply")), PathBuf::from("src/a.ply"));
 }
 
+/// An empty path names no directory, and a `--fs` root bound to one resolves against nothing.
+#[test]
+fn the_working_directory_tidies_to_itself_rather_than_to_nothing() {
+    assert_eq!(tidy(Path::new(".")), PathBuf::from("."));
+    assert_eq!(tidy(Path::new("./")), PathBuf::from("."));
+    assert_eq!(project_root(Path::new(".")), PathBuf::from("."));
+}
+
+/// The root and the file paths a load answers with are what the cache records and what a span
+/// renders, so their spelling is a fact about the argument and not about how rooting is written.
+/// `Path` equality normalises `.` away, so these compare the text.
+#[test]
+fn every_shape_of_argument_records_the_paths_it_names_and_no_others() {
+    let spelling = |loaded: &Loaded| -> (String, Vec<String>) {
+        (loaded.root.display().to_string(), loaded.file_names())
+    };
+    let plain = |paths: &[String]| {
+        for path in paths {
+            assert!(
+                !path.starts_with("./") && !path.contains("/./"),
+                "a recorded path carries a `.` component: {path}"
+            );
+        }
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "m.ply", "pub fn m() -> Int = 1\n");
+    write(dir.path(), "src/a.ply", "pub fn a() -> Int = 1\n");
+    write(dir.path(), "src/z.ply", "pub fn z() -> Int = 2\n");
+
+    // A directory argument, which is also the absolute one: a temp directory is absolute.
+    let (root, files) = spelling(&load(dir.path()).unwrap());
+    assert_eq!(root, dir.path().display().to_string());
+    plain(&files);
+    let nested: Vec<String> = files
+        .iter()
+        .map(|f| {
+            f.trim_start_matches(&root)
+                .trim_start_matches('/')
+                .to_string()
+        })
+        .collect();
+    assert_eq!(nested, vec!["m.ply", "src/a.ply", "src/z.ply"]);
+
+    // A file argument: the root is the directory it sits in, and it is the only module.
+    let one = dir.path().join("src/a.ply");
+    let (root, files) = spelling(&load(&one).unwrap());
+    assert_eq!(root, dir.path().join("src").display().to_string());
+    plain(&files);
+    assert_eq!(files, vec![one.display().to_string()]);
+
+    // A directory named with a trailing `./`, which strips to the directory itself.
+    let dotted = dir.path().join("./src");
+    let (root, files) = spelling(&load(&dotted).unwrap());
+    plain(std::slice::from_ref(&root));
+    plain(&files);
+    assert_eq!(root, dir.path().join("src").display().to_string());
+}
+
 #[test]
 fn the_texts_are_every_module_the_port_answered_the_shipped_ones_included() {
     let dir = tempfile::tempdir().unwrap();

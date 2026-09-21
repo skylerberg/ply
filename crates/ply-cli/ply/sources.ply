@@ -1,0 +1,194 @@
+// A path on the command line turned into the front end's input: the files under it, each named by
+// its place relative to the root, and the shipped modules the run binds as the root `shelf`.
+
+import std.fs (fs)
+import compiler.resolve (Source, Diag, diag1)
+import walk (Failure, Found, sweep, is_ply)
+
+// One module of the program: where it was read from, what it is called, and its bytes.
+pub type File = { path: String, module: String, text: Bytes }
+
+// The program as the front end takes it, with whatever the walk could not turn into a module.
+pub type Project = { files: List<File>, sources: List<Source>, diags: List<Diag> }
+
+// --- Module names -------------------------------------------------------------
+// A module is a file: `store/orders.ply` is `store.orders`, relative to the project root.
+
+fn start_ok(c: Int) -> Bool = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95
+
+fn continue_ok(c: Int) -> Bool = start_ok(c) || (c >= 48 && c <= 57)
+
+fn ident_ok(segment: String) -> Bool = {
+  let b = bytes_of_string(segment);
+  if bytes_len(b) == 0 { false }
+  else {
+    start_ok(bytes_at(b, 0)) &&
+    fold(range(1, bytes_len(b)), true, |ok: Bool, i: Int| ok && continue_ok(bytes_at(b, i)))
+  }
+}
+
+fn drop_extension(path: String) -> String =
+  if string_ends_with(path, ".ply") { string_slice(path, 0, string_len(path) - 4) } else { path }
+
+fn dotted(segments: List<String>) -> String =
+  fold(range(0, len(segments)), "", |acc: String, i: Int|
+    match list_at(segments, i) {
+      Some(s) -> if i == 0 { s } else { acc ++ "." ++ s },
+      None -> acc,
+    })
+
+// The first segment that is not an identifier, which is what a refusal names.
+fn bad_segment(segments: List<String>) -> Option<String> =
+  fold(segments, None, |acc: Option<String>, s: String|
+    match acc { Some(_) -> acc, None -> if ident_ok(s) { None } else { Some(s) } })
+
+pub fn module_of(path: String) -> Result<String, String> = {
+  let segments = string_split(drop_extension(path), "/");
+  match bad_segment(segments) {
+    Some(s) -> Err("`" ++ s ++ "` is not an identifier"),
+    None -> if len(segments) == 0 { Err("it has no name") } else { Ok(dotted(segments)) },
+  }
+}
+
+pub fn is_std(name: String) -> Bool = name == "std" || string_starts_with(name, "std.")
+
+pub fn is_compiler(name: String) -> Bool = name == "compiler" || string_starts_with(name, "compiler.")
+
+// --- Reading them ---------------------------------------------------------------
+
+// A file the walk could not turn into a module never enters the source list, so nothing a label
+// could point into holds it: the message names the path and the rest is notes.
+fn outside() -> Int = 4294967295
+
+fn nowhere(code: Bytes, message: String, label: Bytes, notes: List<Bytes>) -> Diag =
+  diag1(code, outside(), { start: 0, end: 0 }, bytes_of_string(message), label, notes)
+
+fn unaddressable(path: String, why: String) -> Diag =
+  nowhere(b"E0111", "`" ++ path ++ "` cannot be a module: " ++ why,
+          b"this file is not addressable as a module",
+          [b"rename it so every directory and the file stem is a plain identifier"])
+
+fn shadows_std(path: String, name: String) -> Diag =
+  nowhere(b"E0113", "`" ++ path ++ "` would be the module `" ++ name ++ "`, and `std` is reserved",
+          b"this file would shadow the modules that ship with the compiler",
+          [b"`std` and everything under it name the modules embedded in `ply`; run `ply std` to list them",
+           b"rename the file or the directory it sits in"])
+
+fn shadows_compiler(path: String, name: String) -> Diag =
+  nowhere(b"E0113", "`" ++ path ++ "` would be the module `" ++ name ++ "`, and `compiler` is reserved",
+          b"this file would shadow the compiler's own modules",
+          [b"`compiler` and everything under it name the compiler modules embedded in `ply`; `compiler.fmt` is the formatter `ply fmt` runs",
+           b"rename the file or the directory it sits in"])
+
+fn unreadable(path: String) -> Diag =
+  nowhere(b"E0502", "could not read `" ++ path ++ "`",
+          b"this path could not be loaded",
+          [b"pass a `.ply` file or a directory containing one; the default is `.`"])
+
+pub fn nothing_here(path: String) -> Diag =
+  nowhere(b"E0502", "no `.ply` files under `" ++ path ++ "`",
+          b"nothing to compile",
+          [b"name a `.ply` file, or a directory that contains one",
+           b"directories whose name starts with `.` are not searched"])
+
+fn placed(p: Project, path: String, text: Bytes) -> Project =
+  match module_of(path) {
+    Err(why) -> {..p, diags: push(p.diags, unaddressable(path, why))},
+    Ok(name) ->
+      if is_std(name) { {..p, diags: push(p.diags, shadows_std(path, name))} }
+      else if is_compiler(name) { {..p, diags: push(p.diags, shadows_compiler(path, name))} }
+      else {
+        { files: push(p.files, { path: path, module: name, text: text }),
+          sources: push(p.sources, { name: bytes_of_string(name), src: text }),
+          diags: p.diags }
+      },
+  }
+
+fn one_file(p: Project, path: String) -> Project / {fs.read_file[cwd]} =
+  match fs.read_file[cwd](path) {
+    None -> {..p, diags: push(p.diags, unreadable(path))},
+    Some(text) -> placed(p, path, text),
+  }
+
+// Every `.ply` file the paths name, in path order, with the ones that cannot be modules refused.
+pub fn read(found: Found) -> Project / {fs.read_file[cwd]} = {
+  let start: Project = { files: [], sources: [], diags: [] };
+  let filed: Project = fold(map_keys(found.files), start, |acc: Project, path: String| one_file(acc, path));
+  fold(found.errors, filed, |acc: Project, e: Failure|
+    {..acc, diags: push(acc.diags, unreadable(e.path))})
+}
+
+pub fn load(paths: List<String>) -> Project / {fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd]} =
+  read(sweep(paths))
+
+// --- The shelf ----------------------------------------------------------------
+// The modules this binary ships, one flat directory of `<dotted name>.ply`, bound as `shelf`.
+
+fn stem(name: String) -> String = string_slice(name, 0, string_len(name) - 4)
+
+pub fn shelf() -> List<Source> / {fs.list_dir[shelf], fs.read_file[shelf]} =
+  match fs.list_dir[shelf](".") {
+    None -> [],
+    Some(names) -> fold(names, [], |acc: List<Source>, name: String|
+      if !is_ply(name) { acc } else {
+        match fs.read_file[shelf](name) {
+          None -> acc,
+          Some(src) -> push(acc, { name: bytes_of_string(stem(name)), src: src }),
+        }
+      }),
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+test "a path names a module by its place, and a segment that is not an identifier does not" {
+  assert_eq(module_of("m.ply"), Ok("m"));
+  assert_eq(module_of("store/orders.ply"), Ok("store.orders"));
+  assert_eq(module_of("a/b/c.ply"), Ok("a.b.c"));
+  assert_eq(module_of("_kept.ply"), Ok("_kept"));
+  assert_eq(module_of("my-file.ply"), Err("`my-file` is not an identifier"));
+  assert_eq(module_of("9lives.ply"), Err("`9lives` is not an identifier"));
+  assert_eq(module_of("a b/c.ply"), Err("`a b` is not an identifier"))
+}
+
+test "the reserved roots are the ones this binary ships under" {
+  assert(is_std("std"));
+  assert(is_std("std.json"));
+  assert(!is_std("standard"));
+  assert(is_compiler("compiler"));
+  assert(is_compiler("compiler.fmt"));
+  assert(!is_compiler("compilers"))
+}
+
+test "a file that cannot be a module is refused and does not reach the front end" {
+  let found: Found = { files: map_insert(map_insert(map_new(), "m.ply", true), "my-file.ply", true), errors: [] };
+  let p = handle {
+    read(found)
+  } with {
+    fs.read_file[cwd](path) -> Some(b"fn f() -> Int = 1\n"),
+  };
+  assert_eq(len(p.files), 1);
+  assert_eq(len(p.sources), 1);
+  assert_eq(len(p.diags), 1);
+  assert_eq(match list_at(p.diags, 0) { Some(d) -> d.code, None -> b"" }, b"E0111")
+}
+
+test "a project file under a reserved root is refused, naming the root" {
+  let found: Found = { files: map_insert(map_new(), "std/json.ply", true), errors: [] };
+  let p = handle {
+    read(found)
+  } with {
+    fs.read_file[cwd](path) -> Some(b"fn f() -> Int = 1\n"),
+  };
+  assert_eq(len(p.sources), 0);
+  assert_eq(match list_at(p.diags, 0) { Some(d) -> d.code, None -> b"" }, b"E0113")
+}
+
+test "the shelf hands back one source per `.ply` file, named by its stem" {
+  let out = handle {
+    shelf()
+  } with {
+    fs.list_dir[shelf](p) -> Some(["std.json.ply", "README.md", "compiler.fmt.ply"]),
+    fs.read_file[shelf](p) -> Some(bytes_of_string(p)),
+  };
+  assert_eq(map(out, |s: Source| s.name), [b"std.json", b"compiler.fmt"])
+}

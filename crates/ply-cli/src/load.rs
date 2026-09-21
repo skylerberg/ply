@@ -5,7 +5,7 @@ use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
 use ply_ty::HashOutput;
 use ply_ty::ModuleName;
 use ply_ty::{CheckOutput, DefInfo, Front, ModuleInfo, TestInfo};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug)]
 pub struct Loaded {
@@ -195,12 +195,6 @@ pub(crate) fn discover(path: &Path) -> Result<(PathBuf, Vec<Discovered>), Vec<Di
 
 /// Every `.ply` file under `root`, sorted.
 pub(crate) fn ply_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
-    // A project rooted at `.` has the empty path as its root.
-    let root = if root.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        root
-    };
     let mut files = Vec::new();
     collect(root, &mut files)?;
     files.sort();
@@ -229,9 +223,22 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Strips `./`, which would otherwise show up in every rendered span.
+/// A path with every `.` component dropped, which is how it is recorded, rendered in a span and
+/// keyed in the cache: `./m.ply` and `m.ply` are one file, and only one of them is a spelling a
+/// reader can compare. A path that is nothing but `.` keeps it — the empty path names no
+/// directory, and the root a `--fs` binding resolves before anything runs is `E0454` when it is
+/// one. This is `ply_store`'s `source_key` rule, on the argument side of the same boundary.
 pub fn tidy(path: &Path) -> PathBuf {
-    path.strip_prefix("./").unwrap_or(path).to_path_buf()
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        if component != Component::CurDir {
+            out.push(component);
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return PathBuf::from(".");
+    }
+    out
 }
 
 /// [`ModuleName::from_relative_path`] has no source to point at.
