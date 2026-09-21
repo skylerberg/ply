@@ -1,7 +1,7 @@
-//! Every diagnostic renders two ways from one value: `ariadne` for a terminal and JSON for an
-//! agent.
+//! Every diagnostic renders two ways from one value: lines for a terminal and JSON for an agent.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -129,22 +129,6 @@ impl SourceFile {
             .count();
         (line as u32 + 1, col as u32 + 1)
     }
-
-    pub fn line_text(&self, line: u32) -> &str {
-        let idx = (line.saturating_sub(1)) as usize;
-        let Some(&start) = self.line_starts.get(idx) else {
-            return "";
-        };
-        let end = self
-            .line_starts
-            .get(idx + 1)
-            .map(|&e| e as usize)
-            .unwrap_or(self.text.len());
-        self.text
-            .get(start as usize..end)
-            .unwrap_or("")
-            .trim_end_matches(['\n', '\r'])
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -183,15 +167,19 @@ impl SourceMap {
         &self.files
     }
 
-    pub fn snippet(&self, span: Span) -> &str {
-        self.get(span.source)
-            .and_then(|f| f.text.get(span.range()))
-            .unwrap_or("")
+    pub fn snippet(&self, span: Span) -> Cow<'_, str> {
+        match self.containing(span) {
+            Some(f) => String::from_utf8_lossy(&f.text.as_bytes()[span.range()]),
+            None => Cow::Borrowed(""),
+        }
     }
 
+    /// The file a span is a byte range of. A span that cuts a character in half is a defect in
+    /// whoever built it, and the line it points at is worth more to a reader than a dropped
+    /// label, so the only bound is the text's length.
     pub fn containing(&self, span: Span) -> Option<&SourceFile> {
         self.get(span.source)
-            .filter(|f| f.text.get(span.range()).is_some())
+            .filter(|f| span.start <= span.end && span.end as usize <= f.text.len())
     }
 }
 
@@ -894,15 +882,5 @@ mod tests {
             numbers.len(),
             "two constants share one number: {numbers:?}"
         );
-    }
-
-    #[test]
-    fn line_text_strips_terminator() {
-        let mut sm = SourceMap::new();
-        let id = sm.add("t.ply", "one\ntwo\r\nthree");
-        let f = sm.get(id).unwrap();
-        assert_eq!(f.line_text(1), "one");
-        assert_eq!(f.line_text(2), "two");
-        assert_eq!(f.line_text(3), "three");
     }
 }

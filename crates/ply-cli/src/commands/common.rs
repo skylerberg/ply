@@ -142,8 +142,10 @@ pub fn location(sources: &SourceMap, span: Span) -> Option<String> {
 }
 
 pub fn print_diagnostics(diagnostics: &[Diagnostic], sources: &SourceMap, style: Style) {
-    let rendered = ply_span::render::all_to_terminal(diagnostics, sources);
-    eprint!("{}", style.sanitize(&rendered));
+    eprint!(
+        "{}",
+        ply_span::render::all_to_terminal(diagnostics, sources, style.is_styled())
+    );
 }
 
 /// A lazy read and a later flush can each report the same unreadable file.

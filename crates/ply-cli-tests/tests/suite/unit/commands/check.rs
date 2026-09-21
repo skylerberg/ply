@@ -240,7 +240,7 @@ fn a_definition_no_root_reaches_is_warned_once_at_its_name() {
          test \"calls it\" { assert_eq(tested(), 3) }\n\
          law \"it is the identity\" forall (x: Int) { lawful(x) == x }\n",
     );
-    let unused: Vec<(&str, &str)> = loaded
+    let named: Vec<(&str, String)> = loaded
         .frontend
         .warnings
         .iter()
@@ -248,9 +248,10 @@ fn a_definition_no_root_reaches_is_warned_once_at_its_name() {
         .inspect(|d| assert_eq!(d.severity, ply_span::Severity::Warning))
         .map(|d| {
             let at = d.primary_span().expect("the name is labelled");
-            (d.message.as_str(), loaded.sources.snippet(at))
+            (d.message.as_str(), loaded.sources.snippet(at).into_owned())
         })
         .collect();
+    let unused: Vec<(&str, &str)> = named.iter().map(|(m, s)| (*m, s.as_str())).collect();
     assert_eq!(
         unused,
         [

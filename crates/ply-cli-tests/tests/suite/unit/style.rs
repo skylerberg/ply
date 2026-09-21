@@ -33,13 +33,6 @@ fn strip_ansi_is_a_no_op_on_ordinary_text() {
 }
 
 #[test]
-fn sanitize_only_strips_when_unstyled() {
-    let painted = "\x1b[31mno\x1b[0m";
-    assert_eq!(Style::plain().sanitize(painted), "no");
-    assert_eq!(Style::new(true).sanitize(painted), painted);
-}
-
-#[test]
 fn never_beats_a_terminal_and_always_beats_a_pipe() {
     assert!(!Style::detect(ColorChoice::Never).is_styled());
     assert!(Style::detect(ColorChoice::Always).is_styled());
