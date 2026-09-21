@@ -8,7 +8,6 @@ use ply_host::tls;
 use ply_span::{SourceId, Symbol};
 use ply_ty::CheckOutput;
 use ply_ty::ty::{Footprint, Resource};
-use serde_json::Value;
 
 /// A registry whose handlers must never be called, for the tests that only report on a binding.
 pub mod fixture {
@@ -148,27 +147,6 @@ fn the_listing_names_every_resource_an_any_handler_got() {
         ]
     );
     assert_eq!(listing.handlers, 3);
-    let text = listing_lines(&listing, &Disclosures::default()).join("\n");
-    assert!(!text.contains('*'), "a resource was hidden:\n{text}");
-}
-
-#[test]
-fn the_table_is_exactly_the_shape_the_contract_specifies() {
-    let lines = listing_lines(&listing(), &Disclosures::default());
-    let (rendered, digest) = lines.split_at(lines.len() - 1);
-    assert_eq!(
-        rendered.join("\n"),
-        "\
-3 host handlers · 4 operations · trusted computing base
-
-OPERATION       HANDLER                    DET  LINEAR        BLOCKING  SECRETS
-clock.now       ply_host::clock::now       no   repeatable    no        no
-db.get[orders]  ply_host::postgres::read   no   at-most-once  yes       no
-db.get[users]   ply_host::postgres::read   no   at-most-once  yes       no
-db.put[orders]  ply_host::postgres::write  no   at-most-once  yes       no
-"
-    );
-    assert!(digest[0].starts_with("digest: b3:"), "{digest:?}");
 }
 
 #[test]
@@ -176,12 +154,8 @@ fn the_listing_and_its_digest_are_stable_across_runs() {
     let program = check(DB);
     let once = full().preview(&program).unwrap();
     let twice = full().preview(&program).unwrap();
-    assert_eq!(
-        listing_lines(&once, &Disclosures::default()),
-        listing_lines(&twice, &Disclosures::default())
-    );
+    assert_eq!(once.rows, twice.rows);
     assert_eq!(once.digest_short(), twice.digest_short());
-    assert_eq!(rows_json(&once), rows_json(&twice));
 }
 
 #[test]
@@ -226,10 +200,7 @@ fn the_digest_moves_when_a_flag_alone_moves() {
         secrets.digest_short(),
         "the secrets column alone must move the digest"
     );
-    let text = listing_lines(&secrets, &Disclosures::default()).join("\n");
-    assert!(text.contains("SECRETS"), "{text}");
-    assert!(text.lines().any(|l| l.ends_with("yes")), "{text}");
-    assert_eq!(row_json(&secrets.rows[0])["secrets"], true);
+    assert!(secrets.rows[0].secrets);
 }
 
 #[test]
@@ -243,24 +214,13 @@ fn no_shipped_registration_declares_that_it_may_receive_a_credential() {
     assert!(claiming.is_empty(), "{claiming:?}");
 }
 
+/// A registry with nothing in it and one nothing in the program reaches are both empty listings,
+/// and the report tells them apart by the handler count.
 #[test]
-fn hermetic_says_so_and_still_reports_what_would_bind() {
-    let lines = hermetic_lines(&listing());
-    assert_eq!(lines[0], "hermetic — no host handler is bound");
-    assert!(lines[2].contains("4 operations would bind"), "{lines:?}");
-    assert!(lines[2].contains("--host"));
-}
-
-/// An empty listing is indistinguishable from a registry that failed to load.
-#[test]
-fn an_empty_registry_says_it_is_empty_rather_than_printing_nothing() {
+fn an_empty_registry_and_an_idle_one_are_told_apart_by_the_handler_count() {
     let empty = HostRegistry::new().preview(&check(DB)).unwrap();
-    assert!(hermetic_lines(&empty)[2].contains("no host handler is compiled"));
-    assert!(
-        listing_lines(&empty, &Disclosures::default())
-            .iter()
-            .any(|l| l.contains("no host handler is compiled"))
-    );
+    assert!(empty.rows.is_empty());
+    assert_eq!(empty.handlers, 0);
 
     let idle = registry(vec![op(
         "db",
@@ -274,29 +234,24 @@ fn an_empty_registry_says_it_is_empty_rather_than_printing_nothing() {
     let quiet = check("nondet effect db {\n  read get[r](key: Int) -> Int\n}\nfn f() -> Int = 1\n");
     let idle = idle.preview(&quiet).unwrap();
     assert!(idle.rows.is_empty());
-    assert!(
-        hermetic_lines(&idle)[2].contains("none serves an atom"),
-        "{idle:?}"
-    );
+    assert_eq!(idle.handlers, 1);
 }
 
 #[test]
-fn the_json_row_carries_the_declaration_side_of_the_determinism_pair() {
+fn a_row_carries_the_declaration_side_of_the_determinism_pair() {
     let listing = listing();
-    let rows = rows_json(&listing);
-    let clock = &rows[0];
-    assert_eq!(clock["triple"], "clock.now");
-    assert!(
-        clock.get("atom").is_none(),
-        "the triple is the atom: {clock}"
+    let clock = &listing.rows[0];
+    assert_eq!(clock.to_string(), "clock.now");
+    assert_eq!(clock.resource, Resource::Singleton);
+    assert_eq!(clock.linearity, Linearity::Repeatable);
+    assert!(!clock.deterministic);
+    assert!(clock.declared_nondet);
+    assert_eq!(
+        listing.rows[1].resource,
+        Resource::Named(Symbol::new("orders"))
     );
-    assert_eq!(clock["resource"], Value::Null);
-    assert_eq!(clock["linearity"], "repeatable");
-    assert_eq!(clock["deterministic"], false);
-    assert_eq!(clock["declared_nondet"], true);
-    assert_eq!(rows[1]["resource"], "orders");
-    assert_eq!(rows[1]["handler"], "ply_host::postgres::read");
-    assert_eq!(rows[1]["blocking"], true);
+    assert_eq!(listing.rows[1].path, "ply_host::postgres::read");
+    assert!(listing.rows[1].blocking);
 }
 
 #[test]
@@ -443,17 +398,13 @@ fn a_configured_run_says_it_reached_a_real_database_and_never_says_the_password(
     assert!(line.contains("configured by --db"), "{line}");
     assert!(!line.contains("hunter2"), "{line}");
 
-    let text = listing_lines(hosts.listing(), &hosts.disclosures()).join("\n");
+    let summary = serde_json::to_string(&hosts.summary_json()).unwrap();
     assert!(
-        text.contains("ply_host::db::scan · select insert"),
-        "{text}"
+        summary.contains("\"connections\":8"),
+        "the pool is not disclosed: {summary}"
     );
-    assert!(text.contains("8 connections · acquire 5000ms"), "{text}");
-    assert!(!text.contains("hunter2"), "{text}");
     assert!(
-        !serde_json::to_string(&hosts.summary_json())
-            .unwrap()
-            .contains("hunter2"),
+        !summary.contains("hunter2"),
         "the `--json` object carried the password"
     );
 }
@@ -537,37 +488,24 @@ fn a_plaintext_program_reports_no_transport_and_keeps_its_digest() {
         digest_short(&listing, &Disclosures::default()),
         listing.digest_short()
     );
-    assert!(
-        !listing_lines(&listing, &Disclosures::default())
-            .join("\n")
-            .contains("transport")
-    );
 }
 
 #[test]
 fn a_program_that_can_listen_over_tls_discloses_the_stack_by_name() {
     let listing = tls_listing();
     let transport = Transport::of(&listing, None).expect("the tls handler is in the listing");
-    assert_eq!(
-        transport.lines(),
-        [
-            "",
-            "transport",
-            "tls  rustls 0.23.43 · provider ring · TLS 1.3, TLS 1.2 · alpn http/1.1",
-            "roots  webpki-roots 1.0.9 · 0 trusted by `--trust`",
-            "",
-            "credentials",
-            "none — `net.listen_tls` is E0429 until `--tls NAME=CERT,KEY` names one",
-        ]
-    );
-    let text = listing_lines(&listing, &transport_only(transport)).join("\n");
-    assert!(text.contains(tls::HANDLER), "{text}");
-    assert!(text.contains("alpn http/1.1"), "{text}");
+    let json = transport.json();
+    assert_eq!(json["library"], "rustls");
+    assert_eq!(json["provider"], "ring");
+    assert_eq!(json["alpn"][0], "http/1.1");
+    assert_eq!(json["roots"]["trusted"], 0);
+    assert!(transport.credentials.is_empty());
+    assert!(listing.rows.iter().any(|row| row.path == tls::HANDLER));
 }
 
-/// The table carries enough of the fingerprint to recognise and not enough to push the columns out.
+/// The table carries enough of the fingerprint to recognise; the object carries all of it.
 #[test]
-fn a_credential_is_listed_by_name_and_fingerprint() {
+fn the_object_carries_a_credentials_whole_fingerprint() {
     let transport = Transport {
         library: tls::LIBRARY,
         version: tls::VERSION,
@@ -583,10 +521,6 @@ fn a_credential_is_listed_by_name_and_fingerprint() {
             certificates: 2,
         }],
     };
-    assert_eq!(
-        transport.lines().last().unwrap(),
-        "api  sha256:9f2c1a4e8b03…  2 certificates"
-    );
     assert_eq!(
         transport.json()["credentials"][0]["fingerprint"],
         "sha256:9f2c1a4e8b03c7d5e6f70819a2b3c4d5",

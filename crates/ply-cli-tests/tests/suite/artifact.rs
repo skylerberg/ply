@@ -1075,8 +1075,8 @@ fn an_entered_program_starts_what_its_caller_bound_to_the_label() {
         .bind("cc", Path::new("/bin/sh"), Span::DUMMY)
         .expect("a shell is a program");
     let binds = Binds {
-        roots: Vec::new(),
         executables,
+        ..Binds::default()
     };
     let entered = artifact::enter(&artifact, &opened, Vec::new(), binds);
     let code = entered.expect("the program runs");

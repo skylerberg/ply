@@ -308,26 +308,24 @@ fn no_projection_of_a_report_carries_a_secrets_value() {
         ],
     );
 
-    let human = configuration.lines().join("\n");
     let banner = configuration.banner();
     let json = serde_json::to_string(&configuration.to_json()).expect("it serializes");
-    for rendered in [&human, &banner, &json] {
+    for rendered in [&banner, &json] {
         assert!(
             !rendered.contains("s3cret-value"),
             "a credential reached a report: {rendered}"
         );
     }
 
-    assert!(human.contains("DESK_API_KEY=****"), "{human}");
-    assert!(human.contains("DESK_REGION=eu"), "{human}");
-    assert!(human.contains("(--set)"), "{human}");
+    assert!(json.contains("\"value\":\"****\""), "{json}");
+    assert!(json.contains("\"source\":\"--set\""), "{json}");
     assert!(banner.contains("2 keys"), "{banner}");
     assert!(banner.contains("1 secrets (values not shown)"), "{banner}");
     assert!(json.contains("\"secret\":true"), "{json}");
 }
 
 #[test]
-fn a_run_with_no_schema_says_what_that_costs() {
+fn a_run_with_no_schema_is_still_an_opened_configuration() {
     let sources = Sources::read_with(&["K=v".to_string()], &[], &[], &|_| {
         Err(std::io::Error::other("no files"))
     })
@@ -340,9 +338,7 @@ fn a_run_with_no_schema_says_what_that_costs() {
         ),
         schema: None,
     };
-    let lines = configuration.lines().join("\n");
-    assert!(lines.contains("schema     none"), "{lines}");
-    assert!(lines.contains("`--config-schema`"), "{lines}");
+    assert_eq!(configuration.to_json()["schema"], serde_json::Value::Null);
     assert!(configuration.is_opened(), "a `--set` opened a source");
 }
 

@@ -122,6 +122,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
         declared.as_ref(),
         shutdown.clone(),
         process,
+        Vec::new(),
     ) {
         Ok(hosts) => hosts,
         Err(diagnostics) => {

@@ -772,66 +772,6 @@ impl Database {
         self.config.is_some() && !self.operations.is_empty()
     }
 
-    pub fn lines(&self) -> Vec<String> {
-        let mut lines = vec![String::new(), "database".to_string()];
-        lines.push(format!("server     {}", self.server_line()));
-        lines.push(format!("pool       {}", self.pool_line()));
-        lines.push(format!("scanner    {SCANNER} · {ACCEPTED}"));
-        lines.push(format!("schema     {}", self.schema_line()));
-        lines
-    }
-
-    fn server_line(&self) -> String {
-        match (&self.server, &self.config) {
-            (Some(facts), _) => format!(
-                "{} · database {} · collation {} · encoding {}",
-                facts.version, facts.database, facts.collation, facts.encoding
-            ),
-            (None, Some(config)) => format!(
-                "{} · not connected · configured by {}",
-                config.url.redacted(),
-                config.source.as_str()
-            ),
-            (None, None) => {
-                "none — `--db` is unset, so a `db` operation is E0431 under `--host`".to_string()
-            }
-        }
-    }
-
-    fn pool_line(&self) -> String {
-        match &self.config {
-            Some(config) => format!(
-                "{} connection{} · acquire {}ms · statement {}ms · idle-txn {}ms · connect {}ms · statements {}",
-                config.pool,
-                if config.pool == 1 { "" } else { "s" },
-                config.acquire_ms,
-                config.statement_ms,
-                config.idle_txn_ms,
-                config.connect_ms,
-                config.statement_cache,
-            ),
-            None => "none".to_string(),
-        }
-    }
-
-    fn schema_line(&self) -> String {
-        let Some(view) = &self.schema else {
-            return "none — without `--db-schema` a mismatch is E0433 at prepare time".to_string();
-        };
-        match view.shape {
-            Some(shape) => format!(
-                "{} · {} table{} · {} column{} · {}",
-                view.name,
-                shape.tables,
-                if shape.tables == 1 { "" } else { "s" },
-                shape.columns,
-                if shape.columns == 1 { "" } else { "s" },
-                view.state.as_str(),
-            ),
-            None => format!("{} · {}", view.name, view.state.as_str()),
-        }
-    }
-
     pub fn json(&self) -> serde_json::Value {
         use serde_json::json;
         json!({
