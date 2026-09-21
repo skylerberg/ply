@@ -1095,6 +1095,8 @@ fn schema_view(
 
 // --- The payload -------------------------------------------------------------
 
+// `Value::Record` holds an `Arc`, and its fields are not `Send`; every construction site says so.
+#[allow(clippy::arc_with_non_send_sync)]
 fn record(fields: Vec<(&str, PlyValue)>) -> PlyValue {
     PlyValue::Record(Arc::new(
         fields
