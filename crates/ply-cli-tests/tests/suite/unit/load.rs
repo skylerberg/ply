@@ -281,7 +281,7 @@ fn every_shape_of_argument_records_the_paths_it_names_and_no_others() {
     // A directory named with a trailing `./`, which strips to the directory itself.
     let dotted = dir.path().join("./src");
     let (root, files) = spelling(&load(&dotted).unwrap());
-    plain(&[root.clone()]);
+    plain(std::slice::from_ref(&root));
     plain(&files);
     assert_eq!(root, dir.path().join("src").display().to_string());
 }
