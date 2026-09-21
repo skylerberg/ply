@@ -1,5 +1,5 @@
 use ply_eval::sched::{HostPolicy, Scheduler};
-use ply_eval::sched::{Policy, ROOT, Resumption, Turn};
+use ply_eval::sched::{Policy, Resumption, Turn};
 use ply_eval::sim::TASK_OPS;
 use ply_eval::{Continuation, HostRegistry, Pending, Prompt, Stack, TaskId, Value};
 use ply_eval::{HostBinding, HostRequest, HostRuntime, SimId};
@@ -202,7 +202,7 @@ fn run(program: &Program, rt: &dyn HostRuntime) -> Result<Run, Diagnostic> {
                         }
                         Act::Yield => sched.suspend(suspended(), Value::Unit)?,
                         Act::Spawn(index) => {
-                            let id = sched.spawn(Value::Int(index as i64), Span::DUMMY, None);
+                            let id = sched.spawn(Value::Int(index as i64), Span::DUMMY);
                             while script.len() <= id.0 as usize {
                                 script.push(0);
                                 pc.push(0);
@@ -295,27 +295,17 @@ fn permit() -> HostPolicy {
 }
 
 #[test]
-fn a_hermetic_binding_mints_no_permit_and_opens_no_region() {
+fn a_hermetic_binding_mints_no_permit() {
     let hermetic = HostBinding::hermetic_with(registry());
     assert!(hermetic.is_hermetic());
     assert!(
         HostPolicy::of(&hermetic).is_none(),
         "a hermetic binding minted a permit for the production scheduler"
     );
-
-    let err = refused(open(&hermetic, SimId(0), Span::DUMMY), "nothing is bound");
-    assert_eq!(err.code, codes::HERMETIC_BOUNDARY);
-    assert!(
-        err.notes.iter().any(|n| n.contains("simulate")),
-        "the refusal does not name the seeded alternative: {:?}",
-        err.notes
-    );
-    assert!(
-        err.notes
-            .iter()
-            .any(|n| n.contains("ply_host::sched::spawn")),
-        "the refusal does not name the handler that would have served it: {:?}",
-        err.notes
+    assert_eq!(
+        hermetic.would_serve(&Symbol::new("task"), &Symbol::new("spawn"), None),
+        Some("ply_host::sched::spawn"),
+        "the refusal has no handler path to name"
     );
 }
 
@@ -326,15 +316,14 @@ fn the_default_binding_is_the_one_that_refuses() {
 
 #[test]
 fn a_bound_binding_opens_a_production_region() {
-    let sched = open(&bound(), SimId(0), Span::DUMMY).expect("bound");
+    let sched: Sched = Scheduler::production(SimId(0), Span::DUMMY, permit());
     assert_eq!(sched.policy(), Policy::Host);
     assert!(!sched.records_steps());
-    assert!(sched.holds(ROOT));
 }
 
 #[test]
 fn a_production_region_answers_task_and_not_the_clock() {
-    let sched = open(&bound(), SimId(0), Span::DUMMY).expect("bound");
+    let sched: Sched = Scheduler::production(SimId(0), Span::DUMMY, permit());
     for op in TASK_OPS {
         assert!(sched.answers("task", op), "task.{op}");
     }

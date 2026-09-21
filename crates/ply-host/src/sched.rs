@@ -1,13 +1,10 @@
 //! The production task scheduler's half of the boundary.
 
-use ply_eval::MachineScheduler;
-use ply_eval::sched::{HostPolicy, Scheduler};
 use ply_eval::sim::TASK_OPS;
 use ply_eval::{
-    Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRequest, HostResource,
-    HostRuntime, Linearity, SimId,
+    Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_span::{Diagnostic, Symbol, codes};
 use std::sync::Arc;
 
 const TASK: &str = "task";
@@ -42,17 +39,6 @@ fn path_of(op: &str) -> &'static str {
     }
 }
 
-pub fn open(
-    binding: &HostBinding,
-    region: SimId,
-    span: Span,
-) -> Result<MachineScheduler, Diagnostic> {
-    match HostPolicy::of(binding) {
-        Some(permit) => Ok(Scheduler::production(region, span, permit)),
-        None => Err(err_hermetic(span, binding)),
-    }
-}
-
 /// The handler registered against `task.*`, which exists to be listed and to refuse.
 struct Scheduled;
 
@@ -69,22 +55,4 @@ impl HostHandler for Scheduled {
         .note("a task is a suspended machine state, so `task.*` is answered by the scheduler the machine opens rather than by a handler that sees only values")
         .note("this is a defect in Ply's host dispatch rather than in the program"))
     }
-}
-
-#[cold]
-#[inline(never)]
-fn err_hermetic(span: Span, binding: &HostBinding) -> Diagnostic {
-    let spawn = Symbol::new("spawn");
-    let effect = Symbol::new(TASK);
-    let mut diagnostic = Diagnostic::error(
-        codes::HERMETIC_BOUNDARY,
-        "`task.spawn` reached the host boundary in a hermetic run",
-    )
-    .primary(span, "no handler here, and no production scheduler is bound")
-    .note("`ply test` is hermetic: it binds simulated handlers and refuses real ones")
-    .note("wrap this in `simulate { .. }` to get the seeded scheduler, or run with `--host` for real concurrency");
-    if let Some(path) = binding.would_serve(&effect, &spawn, None) {
-        diagnostic = diagnostic.note(format!("`{path}` would serve this under `--host`"));
-    }
-    diagnostic
 }

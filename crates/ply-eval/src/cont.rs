@@ -459,13 +459,6 @@ impl Continuation {
         self.segments.len()
     }
 
-    pub fn delimiters(&self) -> Vec<Delimiter> {
-        self.segments
-            .iter()
-            .filter_map(|s| s.delimiter.clone())
-            .collect()
-    }
-
     pub fn sim(&self) -> Option<SimId> {
         self.sim_at().map(|(id, _)| id)
     }

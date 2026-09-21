@@ -710,7 +710,6 @@ rather than raised.
 | `PLY_HEAP_POISON=1` | poison released blocks and fail on a read of one |
 | `PLY_HEAP_DELAY=N` | reuse a released block only after `N` more releases |
 | `PLY_C_EMITTER=ply:DIR` | use emitter sources from `DIR` instead of the built-in ones |
-| `PLY_TIER_ONLY=1` | compiled code is the only engine; a missing body is `E0502` |
 | `PLY_CODEGEN_REGISTER=narrow` | enter compiled code only for scalar signatures |
 
 ## 9. Simulation
