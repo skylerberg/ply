@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 Ply is a general-purpose programming language. Its compiler is written in Ply
 (`crates/ply-compiler/ply`), compiled to C and committed as a bootstrap bundle. The Rust crates are
