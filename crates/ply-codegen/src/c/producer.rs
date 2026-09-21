@@ -327,10 +327,11 @@ pub fn with_current<T>(f: impl FnOnce(&PlyProducer) -> T) -> Option<T> {
     })
 }
 
-/// What the emitter said about one definition.
+/// What the emitter said about one definition. A body's tables are nine tables wide, so they are
+/// held behind a pointer rather than in every `Answer` a refusal fills.
 #[derive(Clone)]
 pub enum Answer {
-    Body(String, Tables),
+    Body(String, Box<Tables>),
     /// The reason, and the operations the body would have handled, as `effect#op`.
     Refused(String, Vec<String>),
 }
@@ -981,6 +982,7 @@ fn parse(dump: &str) -> Result<Bodies> {
             "body" => {
                 let (text, tables) = super::cache::decode(chunk)
                     .ok_or_else(|| anyhow!("`{name}`'s frame does not decode as a body"))?;
+                let tables = Box::new(tables);
                 // A group's one body answers for every member.
                 if tables.members.is_empty() {
                     out.insert(name.to_string(), Answer::Body(text, tables));
