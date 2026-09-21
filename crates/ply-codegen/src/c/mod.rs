@@ -1,5 +1,5 @@
 //! The compiled tier: the machine's lowered `Code`, emitted as C and handed to `cc`.
-//! `PLY_C_*`, `PLY_CC*`, `PLY_HEAP_*` and `PLY_TIER_ONLY` knobs never change a program's meaning.
+//! `PLY_C_*`, `PLY_CC*` and `PLY_HEAP_*` knobs never change a program's meaning.
 
 mod build;
 pub mod bundle;
@@ -153,6 +153,7 @@ pub fn helper_addresses() -> Vec<*mut std::ffi::c_void> {
             "rt_unbox_bool" => rt::rt_unbox_bool as *const (),
             "rt_no_fuel" => rt::rt_no_fuel as *const (),
             "rt_no_stack" => rt::rt_no_stack as *const (),
+            "rt_grow" => rt::rt_grow as *const (),
             "rt_tick" => rt::rt_tick as *const (),
             "rt_binary" => rt::rt_binary as *const (),
             "rt_negate" => rt::rt_negate as *const (),

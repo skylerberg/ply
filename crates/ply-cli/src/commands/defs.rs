@@ -1,6 +1,7 @@
 //! `ply defs` — every definition with its place, hash, signature and footprint.
 
 use super::shipped_program::{color, rooted, run};
+use crate::artifact::Binds;
 use crate::cli::DefsArgs;
 use crate::style::Style;
 
@@ -15,5 +16,5 @@ pub fn execute(args: &DefsArgs, style: Style) -> i32 {
         argv.push("--json".to_string());
     }
     argv.push(inside);
-    run("defs", argv, &root, args.json, style)
+    run("defs", argv, &root, Binds::default(), args.json, style)
 }

@@ -16,7 +16,7 @@ pub const TYCORE: &str = include_str!("../ply/tycore.ply");
 
 pub const RESOLVE: &str = include_str!("../ply/resolve.ply");
 
-/// Defaults, record update, and the `?` operator.
+/// Effect sets, the `?` operator, and the record update a checked program writes out.
 pub const REWRITE: &str = include_str!("../ply/rewrite.ply");
 
 pub const INFER: &str = include_str!("../ply/infer.ply");
