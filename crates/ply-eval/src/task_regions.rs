@@ -1,6 +1,6 @@
 //! The region stack a task allocates in, and the fixture it starts from.
 
-use crate::arena::{Arena, Pin, Reclaim, RegionId, RegionKind, Slot};
+use crate::arena::{Arena, Reclaim, RegionId, RegionKind, Slot};
 use crate::value::Value;
 use ply_span::Span;
 use std::fmt;
@@ -68,8 +68,7 @@ impl<V: Clone + Default> TaskRegions<V> {
     }
 
     pub fn reset(&mut self) {
-        // Also closes regions abandoned by a handler that discarded its continuation.
-        self.arena.close_final(self.entry);
+        self.arena.close(self.entry);
         for (slot, value) in self.base_slots.iter().zip(self.base.iter()) {
             let restored = self.arena.set(*slot, value.clone());
             debug_assert!(restored, "the fixture's slots sit below every truncation");
@@ -95,24 +94,14 @@ impl<V: Clone + Default> TaskRegions<V> {
         self.arena.close(region)
     }
 
-    /// A continuation's claim on every region open at this capture.
-    pub fn pin(&mut self) -> Option<Pin> {
-        if self.arena.depth() <= FLOOR {
-            return None;
-        }
-        self.arena.pin()
-    }
-
     pub fn close_program_regions(&mut self) {
-        // Pins first: they are claims by control that will never run again.
-        self.arena.abandon_pins();
         while self.arena.depth() > FLOOR {
-            self.arena.close_current_final();
+            self.arena.close_current();
         }
     }
 
     /// Closes every region opened since the stack stood `depth` deep, for control that jumped
-    /// back past their closes; a continuation captured across one still defers its slots.
+    /// back past their closes.
     pub fn close_regions_above(&mut self, depth: usize) {
         while self.arena.depth() > depth.max(FLOOR) {
             self.arena.close_current();
