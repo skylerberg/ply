@@ -728,7 +728,9 @@ effect sim           { read  seed() -> Int }
 * A task performs against the handlers around its `task.spawn`; a clause that
   binds `resume` is unreachable from a task (`E0502`).
 * `E0413`: a `Task` escapes. `E0414`: no progress, or a spent step budget.
-  `E0416`: nested `simulate`.
+  `E0416`: nested `simulate`. `E0425`: a host operation inside the region,
+  refused before the handler runs and whether or not it is bound; the region
+  answers `task`, `clock`, `random` and `sim.seed` itself.
 
 Tasks interleave only at `task`, `clock` and `random` operations; any two
 allocations, and two accesses to one cell with a write, are ordered. A
@@ -1295,7 +1297,9 @@ and slow; use it for small inputs.
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
 handler that would serve it. With `--host`, a test that reaches a bound handler
-always runs and is never cached. `std.signal` and `std.process` are bound only
+always runs and is never cached. An operation performed inside a `simulate`
+region reaches no handler at all: it is `E0425` (§9), since the region is run
+once per interleaving. `std.signal` and `std.process` are bound only
 by `ply run --host`; `ply test --host` withholds them (`E0424`). All flags
 below require `--host`.
 
@@ -1510,7 +1514,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0422` | two host registrations for one atom |
 | `E0423` | host handler determinism disagrees with the declaration |
 | `E0424` | operation reached the host boundary with nothing bound |
-| `E0425` | host operation reached from a test the search re-runs |
+| `E0425` | host operation inside a `simulate` region, or in a test the search re-runs |
 | `E0426` | continuation resumed twice across an at-most-once host operation |
 | `E0427` | host handler answered an atom outside the entry point's footprint |
 | `E0428` | `blocking` host handler answered inline |

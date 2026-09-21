@@ -41,6 +41,26 @@ impl HostHandler for Waits {
     }
 }
 
+/// Counts its calls and answers either way, so a refusal can be shown to precede the handler.
+struct Answers {
+    calls: AtomicU64,
+    token: bool,
+}
+
+impl HostHandler for Answers {
+    fn call(&self, _: &dyn HostRuntime, _: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(if self.token {
+            HostAnswer::Pending(Pending {
+                token: 7,
+                label: "send",
+            })
+        } else {
+            HostAnswer::Value(Value::Int(1))
+        })
+    }
+}
+
 /// A runtime whose tokens are already resolved.
 struct Resolved7;
 
@@ -343,6 +363,117 @@ test/nondet "hermetic, in a region" {
     assert_eq!(
         diagnostic(machine.eval_test(0)).code,
         codes::HOST_IN_SIMULATION
+    );
+}
+
+/// The boundary refuses before the handler is asked, so what the handler would answer -- a value
+/// on the spot or a token to park on -- cannot change the verdict.
+#[test]
+fn a_region_refuses_the_boundary_whatever_the_handler_would_answer() {
+    for blocking in [false, true] {
+        let compiled = Compiled::named(
+            "t",
+            r#"
+nondet effect net {
+  write send[s](payload: Int) -> Int
+}
+
+test/nondet "a socket under a seed" {
+  simulate { net.send[socket](1) }
+}
+"#,
+        );
+        let handler = Arc::new(Answers {
+            calls: AtomicU64::new(0),
+            token: blocking,
+        });
+        let mut registration = op("net", "send", Linearity::AtMostOnce);
+        registration.blocking = blocking;
+        let registry = registry_of(vec![(registration, handler.clone())]);
+        let binding = registry.bind(&compiled.front.check).expect("binds");
+
+        let mut machine = compiled.machine_on_tier();
+        machine.set_host_binding(Arc::new(binding));
+        machine.set_host_runtime(std::rc::Rc::new(Resolved7));
+        let d = diagnostic(machine.eval_test(0));
+        assert_eq!(
+            d.code,
+            codes::HOST_IN_SIMULATION,
+            "blocking: {blocking}: {}",
+            d.message
+        );
+        assert!(
+            d.message.contains("net.send[socket]"),
+            "blocking: {blocking}: {}",
+            d.message
+        );
+        assert!(
+            d.labels
+                .iter()
+                .any(|l| !l.primary && !l.span.is_dummy() && l.message.contains("interleaving")),
+            "blocking: {blocking}: the refusal must name the region as well as the operation: {:?}",
+            d.labels
+                .iter()
+                .map(|l| (&l.message, l.span.is_dummy()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            handler.calls.load(Ordering::SeqCst),
+            0,
+            "blocking: {blocking}: the refusal precedes the handler"
+        );
+    }
+}
+
+/// `sim::SEEDED_OPS` and `sim::TASK_OPS` are the table of what a region answers itself; those never
+/// reach the boundary, so a handler bound for them is shadowed rather than refused.
+#[test]
+fn a_region_answers_the_operations_it_schedules_even_when_they_are_bound() {
+    let compiled = Compiled::named(
+        "t",
+        r#"
+fn outside() -> Int / {task.write, clock.read, clock.write, random.write} = {
+  let t = task.spawn(|| clock.now());
+  clock.sleep(1);
+  task.join(t) + random.below(2)
+}
+
+test/nondet "the region's own handlers answer" {
+  let answered = simulate {
+    let t = task.spawn(|| clock.now() + random.below(4));
+    clock.sleep(5);
+    let mine = random.below(4);
+    task.join(t) + mine + clock.now()
+  };
+  assert(answered > -1)
+}
+"#,
+    );
+    let counter = Arc::new(Counter::default());
+    let registry = registry_of(vec![
+        (op("task", "spawn", Linearity::Repeatable), counter.clone()),
+        (op("task", "join", Linearity::Repeatable), counter.clone()),
+        (op("clock", "now", Linearity::Repeatable), counter.clone()),
+        (op("clock", "sleep", Linearity::Repeatable), counter.clone()),
+        (
+            op("random", "below", Linearity::Repeatable),
+            counter.clone(),
+        ),
+    ]);
+    let binding = registry.bind(&compiled.front.check).expect("binds");
+    assert_eq!(
+        binding.listing().rows.len(),
+        5,
+        "every scheduled operation must really be bound for the shadowing to mean anything"
+    );
+
+    let mut machine = compiled.machine_on_tier();
+    machine.set_host_binding(Arc::new(binding));
+    machine.eval_test(0).expect("the seeded handlers answer");
+    assert_eq!(counter.calls(), 0, "a bound handler was reached");
+    assert!(
+        machine.simulated().is_some(),
+        "the run went through a seeded region"
     );
 }
 
