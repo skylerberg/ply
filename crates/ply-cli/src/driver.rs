@@ -428,6 +428,7 @@ impl<'s> Driver<'s> {
                 defs.push(KnownDef {
                     name: entry.name.to_string(),
                     hash: entry.hash,
+                    witness: row_witness(&cached),
                     footprint: ply_ty::print_footprint(&cached.footprint),
                     performed: ply_ty::print_footprint(&cached.performed),
                 });
@@ -653,6 +654,24 @@ impl<'s> Driver<'s> {
         }
         Some(fingerprint)
     }
+}
+
+/// The declaration each effect the rows name had, from the witness stored beside the interface. A
+/// prelude effect is declared by no source and has no entry, and cannot be renamed by an edit.
+fn row_witness(cached: &CachedDef) -> Vec<(String, DefHash)> {
+    let named: BTreeSet<&Symbol> = cached
+        .footprint
+        .atoms()
+        .chain(cached.performed.atoms())
+        .map(|a| &a.effect)
+        .collect();
+    named
+        .into_iter()
+        .filter_map(|effect| {
+            let held = cached.names.iter().find(|w| &w.name == effect)?;
+            Some((effect.to_string(), held.hash))
+        })
+        .collect()
 }
 
 /// `from` and every module it imports, transitively, in order.
