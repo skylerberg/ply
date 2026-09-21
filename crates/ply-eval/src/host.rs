@@ -97,10 +97,7 @@ impl HostOp {
 impl fmt::Display for HostOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.resource {
-            HostResource::Only(Resource::Singleton) => write!(f, "{}.{}", self.effect, self.op),
-            HostResource::Only(Resource::Named(r)) => {
-                write!(f, "{}.{}[{r}]", self.effect, self.op)
-            }
+            HostResource::Only(r) => write!(f, "{}.{}{r}", self.effect, self.op),
             HostResource::Any => write!(f, "{}.{}[..]", self.effect, self.op),
         }
     }
@@ -438,10 +435,7 @@ impl HostRow {
 
 impl fmt::Display for HostRow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.resource {
-            Resource::Singleton => write!(f, "{}.{}", self.effect, self.op),
-            Resource::Named(r) => write!(f, "{}.{}[{r}]", self.effect, self.op),
-        }
+        write!(f, "{}.{}{}", self.effect, self.op, self.resource)
     }
 }
 

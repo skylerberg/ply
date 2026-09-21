@@ -109,6 +109,42 @@ fn a_builtin_is_documented_from_the_compilers_table_with_names_and_a_note() {
     assert_eq!(v["signature"], "len<a>(xs: List<a>) -> Int");
 }
 
+const LABEL_GENERIC: &str = "\
+effect net {
+  write send[s](payload: Bytes) -> Int
+}
+
+// Writes under the resource its caller fills.
+pub fn relay<[l]>(payload: Bytes) -> Int / {net.send[l]} = net.send[l](payload)
+";
+
+#[test]
+fn a_label_generic_definition_documents_the_binder_it_leaves_to_its_caller() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("m.ply"), LABEL_GENERIC).unwrap();
+
+    let out = ply(dir.path())
+        .args(["doc", "relay", "--json"])
+        .output()
+        .unwrap();
+    let v = json_of(&out);
+    assert_eq!(v["exit_code"], 0, "{v}");
+    assert_eq!(
+        v["signature"],
+        "pub fn relay<[l]>(payload: Bytes) -> Int / {m.net.send[l]}"
+    );
+    assert_eq!(v["type"], "<[l]>(Bytes) -> Int / {m.net.send[l]}");
+    assert_eq!(v["params"][0]["name"], "payload");
+    assert_eq!(v["doc"], "Writes under the resource its caller fills.");
+
+    let out = ply(dir.path()).args(["doc", "relay"]).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("pub fn relay<[l]>(payload: Bytes) -> Int"),
+        "{text}"
+    );
+}
+
 #[test]
 fn a_name_that_is_neither_exits_two_with_the_unknown_name_code() {
     let dir = project();

@@ -186,6 +186,46 @@ fn check_json_is_a_single_object_even_when_the_module_is_broken() {
     assert_eq!(v["diagnostics"][0]["labels"][0]["start"]["line"], 1);
 }
 
+/// Three ways a call can fail to settle a label, all one code: nothing written and nothing to
+/// infer it from, a count that does not match the binders, and a use as a value instead of a call.
+#[test]
+fn a_call_that_does_not_settle_a_label_is_refused_with_its_own_code() {
+    let generic = "effect net {\n  write send[s](payload: Bytes) -> Unit\n}\n\
+                   fn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\n";
+    let cases = [
+        (
+            "fn go(b: Bytes) -> Unit / {net.send[conn]} = relay(b)\n",
+            "this call leaves a label of `relay` unfilled",
+        ),
+        (
+            "fn go(b: Bytes) -> Unit / {net.send[conn]} = relay[conn, spare](b)\n",
+            "`relay` takes 1 label parameter, but 2 are written",
+        ),
+        (
+            "fn as_value() -> (Bytes) -> Unit / {net.send[conn]} = relay\n",
+            "`relay` must be called directly",
+        ),
+    ];
+    for (tail, message) in cases {
+        let dir = project(&format!("{generic}{tail}"));
+        let out = ply(dir.path()).args(["check", "--json"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{tail}");
+        let v = json_of(&out);
+        assert_eq!(v["ok"], false, "{tail}");
+        let raised = v["diagnostics"]
+            .as_array()
+            .expect("a diagnostics array")
+            .iter()
+            .find(|d| d["code"] == "E0306")
+            .unwrap_or_else(|| panic!("{tail} raised no E0306: {v}"));
+        assert_eq!(raised["message"], message, "{tail}");
+        assert!(
+            !raised["notes"].as_array().expect("notes").is_empty(),
+            "{tail} left the reader nothing to do: {raised}"
+        );
+    }
+}
+
 #[test]
 fn test_leads_with_the_selection_line() {
     let dir = project(GREEN);

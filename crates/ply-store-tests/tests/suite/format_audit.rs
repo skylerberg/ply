@@ -7,7 +7,7 @@ use ply_store::{
 };
 use ply_ty::DefHash;
 use ply_ty::Mode;
-use ply_ty::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
+use ply_ty::{EffectAtom, Footprint, LabelVar, Resource, Row, RowVar, Scheme, TyVar, Type};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -91,6 +91,7 @@ fn scheme() -> Scheme {
     Scheme {
         ty_vars: vec![TyVar(0)],
         row_vars: vec![RowVar(0)],
+        label_vars: vec![],
         ty: Type::Fn {
             params: vec![Type::Var(TyVar(0))],
             ret: Box::new(Type::int()),
@@ -793,6 +794,7 @@ fn shapes_no_schema_exemplar_reaches_still_round_trip() {
     let closed = Scheme {
         ty_vars: vec![],
         row_vars: vec![],
+        label_vars: vec![],
         // `Row::empty` — a closed row. Every exemplar's row carries a tail.
         ty: Type::Fn {
             params: vec![],
@@ -871,6 +873,38 @@ fn shapes_no_schema_exemplar_reaches_still_round_trip() {
     );
 }
 
+/// A definition generic over a label: the atom's resource is a variable the head binds.
+#[test]
+fn a_scheme_quantified_over_a_label_round_trips_with_its_atoms() {
+    let root = TempRoot::new("label-scheme");
+    let generic = Scheme {
+        ty_vars: vec![],
+        row_vars: vec![RowVar(0)],
+        label_vars: vec![LabelVar(0)],
+        ty: Type::Fn {
+            params: vec![Type::int()],
+            ret: Box::new(Type::unit()),
+            effects: Row {
+                atoms: [
+                    EffectAtom::operation("net", Resource::Var(LabelVar(0)), Mode::Write, "send"),
+                    EffectAtom::new("net", Resource::Var(LabelVar(0)), Mode::Read),
+                ]
+                .into(),
+                tail: Some(RowVar(0)),
+            },
+        },
+    };
+    let def = CachedDef::new(generic, footprint());
+
+    let mut store = root.open();
+    store.put_def(hash(1), def.clone());
+    store.flush().expect("it should flush");
+
+    let reopened = root.open();
+    assert!(reopened.warnings().is_empty(), "{:?}", reopened.warnings());
+    assert_eq!(reopened.def(hash(1)).as_deref(), Some(&def.canonicalized()));
+}
+
 /// A symbol is length-prefixed UTF-8, and a span is a pair of `u32`s.
 #[test]
 fn the_edges_of_every_scalar_field_survive_a_round_trip() {
@@ -922,6 +956,7 @@ fn a_deeply_nested_type_round_trips_rather_than_reporting_a_healthy_cache_corrup
             Scheme {
                 ty_vars: vec![],
                 row_vars: vec![],
+                label_vars: vec![],
                 ty,
             },
             Footprint::empty(),

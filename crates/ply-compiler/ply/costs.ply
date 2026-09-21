@@ -1,8 +1,8 @@
 // Whether an append copies, read off the lowering the emitter compiles so a move here is a move there.
 
-import spine (Span, QName, num, dummy_span)
+import spine (Span, Ident, QName, num, dummy_span)
 import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform, NCell,
-             NRegion, NLambda, NSim, NHandle, NField, NUpd, CStmt, CLet, CLetPat, CDo, CArm, CField, CClause,
+             NRegion, NLambda, NSim, NHandle, NField, NUpd, NLabel, CStmt, CLet, CLetPat, CDo, CArm, CField, CClause,
              Cap, Own, Owned, pat_slots, lower_fn)
 import items (Module, Derived, Item, IFn, ITest, ILaw, Binder, parse)
 import exprs (Param, Expr)
@@ -85,6 +85,7 @@ fn with_chain(st: St, chain: List<Bind>) -> St = { ..st, chain: chain }
 fn walk(env: Env, c: Code, st: St) -> W =
   match c.node {
     NLit(_) -> fresh(st),
+    NLabel(_) -> fresh(st),
     NVar(v) -> var_owner(env, v.name, v.slot, c.own, st),
     NUnary(u) -> fresh(walk(env, u.operand, st).st),
     NBinary(b) -> fresh(walk(env, b.rhs, walk(env, b.lhs, st).st).st),
@@ -127,7 +128,7 @@ fn walk(env: Env, c: Code, st: St) -> W =
       }
     },
     NList(l) -> fresh(fold(l.items, st, |acc: St, x: Code| walk(env, x, acc).st)),
-    NPerform(p) -> { st: fold(p.args, st, |acc: St, x: Code| walk(env, x, acc).st),
+    NPerform(p) -> { st: fold(p.args, match p.label { Some(x) -> walk(env, x, st).st, None -> st }, |acc: St, x: Code| walk(env, x, acc).st),
                      owner: unknown(CHandler, b"the value a handler answered, which the handler may still hold") },
     NHandle(h) -> {
       let caught = fold(h.clauses, st, |acc: St, cl: CClause| poison(acc, cl.caps, cl.body));
@@ -454,28 +455,29 @@ fn quoted(s: Bytes) -> Bytes =
     else if c == 9 { b"\\t" } else { bytes_slice(s, i, i + 1) }
   })), b"\""])
 
-fn lowered(names: List<Bytes>, body: Expr) -> Option<Code> =
-  match lower_fn(names, body) { Some(l) -> Some(l.code), None -> None }
+fn lowered(names: List<Bytes>, labels: List<Bytes>, body: Expr) -> Option<Code> =
+  match lower_fn(names, labels, map_new(), body) { Some(l) -> Some(l.code), None -> None }
 
 fn bodies_of(mods: List<Mod>, index: Map<Bytes, Int>) -> List<Body> =
   fold(range(0, len(mods)), [], |acc: List<Body>, i: Int| {
     let m: Mod = at(mods, i);
     fold(m.module.items, acc, |a: List<Body>, it: Item| match it {
       IFn(d) -> {
-        let names = map(d.params, |p: Param| p.name.name);
+        let labels = map(d.generics.labels, |g: Ident| g.name);
+        let names = fold(labels, map(d.params, |p: Param| p.name.name), |xs: List<Bytes>, n: Bytes| push(xs, n));
         push(a, { kind: b"fn", module: i, module_name: m.name, name: d.name.name,
                   label: bytes_concat_all([m.name, b".", d.name.name]),
                   def: match map_get(index, qualify(m.name, d.name.name)) { Some(k) -> k, None -> 0 - 1 },
-                  arity: len(names), code: lowered(names, d.body), reuse: d.reuse })
+                  arity: len(names), code: lowered(names, labels, d.body), reuse: d.reuse })
       },
       ITest(t) -> push(a, { kind: b"test", module: i, module_name: m.name, name: t.name,
                             label: bytes_concat_all([m.name, b": test ", quoted(t.name)]),
-                            def: 0 - 1, arity: 0, code: lowered([], t.body), reuse: None }),
+                            def: 0 - 1, arity: 0, code: lowered([], [], t.body), reuse: None }),
       ILaw(l) -> {
         let names = map(l.binders, |bd: Binder| bd.name.name);
         push(a, { kind: b"law", module: i, module_name: m.name, name: l.name,
                   label: bytes_concat_all([m.name, b": law ", quoted(l.name)]),
-                  def: 0 - 1, arity: len(names), code: lowered(names, l.body), reuse: None })
+                  def: 0 - 1, arity: len(names), code: lowered(names, [], l.body), reuse: None })
       },
       _ -> a,
     })

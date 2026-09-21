@@ -57,6 +57,7 @@ pub fn split(scheme: &Scheme) -> Split {
             let head = Scheme {
                 ty_vars: scheme.ty_vars.clone(),
                 row_vars: scheme.row_vars.clone(),
+                label_vars: scheme.label_vars.clone(),
                 ty: Type::Fn {
                     params: params.clone(),
                     ret: ret.clone(),

@@ -26,6 +26,7 @@ fn fn_scheme(row: Row, row_vars: Vec<RowVar>) -> Scheme {
     Scheme {
         ty_vars: Vec::new(),
         row_vars,
+        label_vars: Vec::new(),
         ty: Type::Fn {
             params: vec![Type::Con(Symbol::new("Request"), Vec::new())],
             ret: Box::new(Type::Con(Symbol::new("Response"), Vec::new())),
@@ -106,6 +107,7 @@ fn a_type_variable_keeps_its_letter_across_the_split() {
     let scheme = Scheme {
         ty_vars: vec![t],
         row_vars: vec![v],
+        label_vars: vec![],
         ty: Type::Fn {
             params: vec![Type::Var(t)],
             ret: Box::new(Type::Var(t)),
