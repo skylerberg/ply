@@ -23,6 +23,7 @@ pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub enum Op {
     ReadFile,
     ListDir,
+    Kind,
     Exists,
     FileSize,
     ModifiedMs,
@@ -33,9 +34,10 @@ pub enum Op {
 }
 
 impl Op {
-    pub const ALL: [Op; 9] = [
+    pub const ALL: [Op; 10] = [
         Op::ReadFile,
         Op::ListDir,
+        Op::Kind,
         Op::Exists,
         Op::FileSize,
         Op::ModifiedMs,
@@ -49,6 +51,7 @@ impl Op {
         match self {
             Op::ReadFile => "read_file",
             Op::ListDir => "list_dir",
+            Op::Kind => "kind",
             Op::Exists => "exists",
             Op::FileSize => "file_size",
             Op::ModifiedMs => "modified_ms",
@@ -63,6 +66,7 @@ impl Op {
         match self {
             Op::ReadFile => "`fs.read_file`",
             Op::ListDir => "`fs.list_dir`",
+            Op::Kind => "`fs.kind`",
             Op::Exists => "`fs.exists`",
             Op::FileSize => "`fs.file_size`",
             Op::ModifiedMs => "`fs.modified_ms`",
@@ -85,6 +89,7 @@ impl Op {
         match self {
             Op::ReadFile => "fs-read",
             Op::ListDir => "fs-list",
+            Op::Kind => "fs-kind",
             Op::Exists => "fs-exists",
             Op::FileSize => "fs-size",
             Op::ModifiedMs => "fs-modified",
@@ -251,6 +256,7 @@ impl FsHost {
         match op {
             Op::ReadFile => "ply_host::fs::read_file",
             Op::ListDir => "ply_host::fs::list_dir",
+            Op::Kind => "ply_host::fs::kind",
             Op::Exists => "ply_host::fs::exists",
             Op::FileSize => "ply_host::fs::file_size",
             Op::ModifiedMs => "ply_host::fs::modified_ms",
@@ -343,6 +349,13 @@ fn run(op: Op, root: &Path, path: &str, second: Second, span: Span) -> Done {
                 Done::MaybeStrings(Some(names))
             }
         },
+        // `symlink_metadata` does not follow, so a symlink is reported as one rather than as its target.
+        Op::Kind => Done::Ctor(match std::fs::symlink_metadata(&target) {
+            Ok(meta) if meta.is_symlink() => "std.fs.Symlink",
+            Ok(meta) if meta.is_dir() => "std.fs.Dir",
+            Ok(meta) if meta.is_file() => "std.fs.File",
+            _ => "std.fs.Missing",
+        }),
         Op::Exists => Done::Bool(std::fs::symlink_metadata(&target).is_ok()),
         Op::FileSize => Done::MaybeInt(
             std::fs::metadata(&target)

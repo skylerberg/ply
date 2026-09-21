@@ -18,8 +18,12 @@ pub fn project_view(check: &CheckOutput, std: bool) -> std::borrow::Cow<'_, Chec
         return std::borrow::Cow::Borrowed(check);
     }
     let mut scoped = check.clone();
-    scoped.defs.retain(|_, info| !ply_std::is_std(&info.module));
-    scoped.laws.retain(|law| !ply_std::is_std(&law.module));
+    scoped
+        .defs
+        .retain(|_, info| !crate::shipped::is_shipped(&info.module));
+    scoped
+        .laws
+        .retain(|law| !crate::shipped::is_shipped(&law.module));
     std::borrow::Cow::Owned(scoped)
 }
 

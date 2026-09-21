@@ -200,7 +200,21 @@ pub struct Built {
     /// In the order they were named.
     pub startup: Vec<Symbol>,
     pub closure: BTreeMap<String, BTreeSet<String>>,
+    /// What the emitter refused, as `(definition, the construct that refused it)`, in the order
+    /// the fixpoint dropped them: the first are the causes, the rest what those causes carried.
+    pub refused: Vec<(String, String)>,
+    /// Whether the embedded unit holds a body for the entry point. Without one nothing enters it,
+    /// so a caller that can only run from the unit has to refuse the artifact rather than land it.
+    pub entry_compiled: bool,
     pub warnings: Vec<Diagnostic>,
+}
+
+/// What the emitter made of an artifact's definitions.
+struct Emission {
+    unit: Option<EmbeddedUnit>,
+    refused: Vec<(String, String)>,
+    entry_compiled: bool,
+    warnings: Vec<Diagnostic>,
 }
 
 /// The transitive closure of the entry point and of the run's start-up definitions.
@@ -260,15 +274,17 @@ pub fn build(
     // Reopened as a target opens it, so an artifact that builds is one that opens.
     let opened = reopen(&out).map_err(|diags| vec![unreopened(&diags)])?;
     let names: Vec<&str> = out.names.iter().map(|(n, _)| n.as_str()).collect();
-    let (unit, warnings) = embedded_unit(&opened, &names);
-    out.unit = unit;
+    let emission = embedded_unit(&opened, &opened.entry, &names);
+    out.unit = emission.unit;
 
     Ok(Built {
         artifact: out,
         entry_name: entry.name.clone(),
         startup: startup.iter().map(|d| d.name.clone()).collect(),
         closure: restricted_closure(hashes, &reachable),
-        warnings,
+        refused: emission.refused,
+        entry_compiled: emission.entry_compiled,
+        warnings: emission.warnings,
     })
 }
 
@@ -283,7 +299,7 @@ fn closure_texts(artifact: &Artifact) -> Result<Vec<(String, String)>, Vec<Diagn
         .names
         .iter()
         .filter_map(|(name, _)| name.rsplit_once('.').map(|(module, _)| module))
-        .filter(|module| ply_std::is_reserved(module))
+        .filter(|module| crate::shipped::is_shipped_name(module))
         .collect();
     let shipped: Vec<&str> = shipped.into_iter().collect();
     let printed = ply_codegen::c::producer::print_bodies(&bodies, &names, &[], &[], &shipped)
@@ -295,7 +311,7 @@ fn closure_texts(artifact: &Artifact) -> Result<Vec<(String, String)>, Vec<Diagn
 }
 
 /// Embedded so `ply run` need not emit and compile C at every run; a failed production is reported.
-fn embedded_unit(opened: &Opened, names: &[&str]) -> (Option<EmbeddedUnit>, Vec<Diagnostic>) {
+fn embedded_unit(opened: &Opened, entry: &Symbol, names: &[&str]) -> Emission {
     ply_codegen::c::producer::ensure_default();
     // Definitions only: no emitter is offered effect or resource declarations.
     let names: Vec<&str> = names
@@ -312,38 +328,55 @@ fn embedded_unit(opened: &Opened, names: &[&str]) -> (Option<EmbeddedUnit>, Vec<
         });
     match produced {
         Ok((produced, text)) => {
+            let refused: Vec<(String, String)> = produced
+                .refused
+                .iter()
+                .map(|r| (r.function.clone(), r.construct.clone()))
+                .collect();
             let mut warnings = Vec::new();
-            if !produced.refused.is_empty() {
-                let listed: Vec<String> = produced
-                    .refused
-                    .iter()
-                    .map(|r| format!("`{}` ({})", r.function, r.construct))
-                    .collect();
+            if !refused.is_empty() {
                 warnings.push(
                     Diagnostic::warning(
                         codes::BACKEND_UNAVAILABLE,
                         format!(
-                            "the emitter refused {} of the artifact's definitions, which will not run from it: {}",
-                            listed.len(),
-                            listed.join(", ")
+                            "the emitter refused {} of the artifact's definitions, which will not run from it",
+                            refused.len()
                         ),
                     )
+                    .note(refusal_list(&refused))
                     .note("a refused definition is entered from nothing at run time; make it one the emitter compiles"),
                 );
             }
-            (Some(EmbeddedUnit { text }), warnings)
+            Emission {
+                unit: Some(EmbeddedUnit { text }),
+                entry_compiled: produced.exports.names().iter().any(|n| n == entry.as_str()),
+                refused,
+                warnings,
+            }
         }
-        Err(e) => (
-            None,
-            vec![
+        Err(e) => Emission {
+            unit: None,
+            refused: Vec::new(),
+            entry_compiled: false,
+            warnings: vec![
                 Diagnostic::warning(
                     codes::BACKEND_UNAVAILABLE,
                     format!("no compiled unit could be produced for the artifact: {e:#}"),
                 )
                 .note("the artifact's bodies are printed back to source and compiled at each run instead"),
             ],
-        ),
+        },
     }
+}
+
+/// Every refusal, in the order the fixpoint dropped them: a cascade names its cause first and
+/// then each body that lost a callee, so reading from the top is reading the reason.
+pub fn refusal_list(refused: &[(String, String)]) -> String {
+    let mut out = String::from("the emitter refused, in the order it dropped them:");
+    for (function, construct) in refused {
+        out.push_str(&format!("\n  `{function}` ({construct})"));
+    }
+    out
 }
 
 fn stale_unit() -> Diagnostic {
@@ -693,16 +726,14 @@ fn ask_the_port(
             .note("this is Ply's fault: the compiler's own front end is what failed here"),
         ]
     };
-    let shelf: Vec<(String, String)> = ply_std::sources()
-        .map(|(module, text)| (module.to_string(), text.to_string()))
-        .collect();
-    let pulled = ply_codegen::c::producer::front_pulling_std(own, &shelf)
+    let shelf = crate::shipped::sources();
+    let pulled = ply_codegen::c::producer::front_pulling_std(own, shelf)
         .map_err(|e| failed(format!("{e:#}")))?;
     for module in &pulled.modules {
         let name = ModuleName::from_dotted(module);
-        let text = ply_std::source(&name)
+        let text = crate::shipped::source(&name)
             .ok_or_else(|| failed(format!("it pulled in `{module}`, which is not shipped")))?;
-        ids.push(sources.add(ply_std::pseudo_path(&name), text));
+        ids.push(sources.add(crate::shipped::pseudo_path(&name), text));
     }
     let front = ply_ty::read_front(&pulled.dump, ids.as_slice())
         .map_err(|e| failed(format!("the front end's answer does not read: {e}")))?;
@@ -726,7 +757,7 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
     for (file, text) in &artifact.closure {
         let relative = PathBuf::from(file);
         let name = ModuleName::from_relative_path(&relative).map_err(|d| vec![d])?;
-        if ply_std::is_std(&name) {
+        if crate::shipped::is_shipped(&name) {
             return Err(vec![unfaithful(format!(
                 "the closure carries `{file}`, a module this `ply` ships"
             ))]);
@@ -764,12 +795,9 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
         .iter()
         .map(|(name, _)| name.as_str())
         .collect();
-    if let Some(extra) = hashes
-        .defs
-        .keys()
-        .chain(hashes.decls.keys())
-        .find(|name| !ply_std::is_reserved(name.as_str()) && !named.contains(name.as_str()))
-    {
+    if let Some(extra) = hashes.defs.keys().chain(hashes.decls.keys()).find(|name| {
+        !crate::shipped::is_shipped_name(name.as_str()) && !named.contains(name.as_str())
+    }) {
         return Err(vec![unfaithful(format!(
             "the closure declares `{extra}`, which the artifact does not name"
         ))]);
@@ -1078,6 +1106,71 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
             code
         }
     }
+}
+
+/// One entry into an opened artifact, with no line of its own on either stream: the program's
+/// output is the whole of what a caller sees. The answer is the code `process.exit` asked for,
+/// else `0` for a value returned and the diagnostic for a raise.
+pub fn enter(
+    artifact: &Artifact,
+    opened: &Opened,
+    argv: Vec<String>,
+    roots: &[ply_host::fs::RootSpec],
+) -> Result<i32, Diagnostic> {
+    // A unit built for another runtime is left aside, as `run` leaves it, and the bodies serve.
+    let unit = artifact.unit.as_ref().filter(|unit| {
+        let served = ply_codegen::c::bundle::unpack(&unit.text)
+            .and_then(|text| ply_codegen::c::served(&text, "artifact"));
+        !matches!(&served, Err(e) if e.downcast_ref::<ply_codegen::c::Unserved>().is_some())
+    });
+    let declared = opened
+        .front
+        .check
+        .defs
+        .get(&opened.entry)
+        .map(|d| d.footprint.clone());
+    let tier = tier(opened, None, unit)?;
+    let hosts = crate::hosts::Hosts::open_stopping(
+        &opened.front.check,
+        true,
+        &crate::cli::TlsOptions::default(),
+        roots,
+        None,
+        crate::config::Configuration::default(),
+        &crate::trace::TraceOptions::default(),
+        declared.as_ref(),
+        None,
+        Some(ply_host::process::ProcessHost::new(
+            argv,
+            ply_host::process::Sink::Real {
+                out: ply_host::process::Stream::Out,
+            },
+        )),
+    )
+    .map_err(|diagnostics| bind_failed(&diagnostics))?;
+    let span = opened
+        .front
+        .check
+        .defs
+        .get(&opened.entry)
+        .map(|d| d.span)
+        .unwrap_or(Span::DUMMY);
+    let plan = crate::simulation::run_plan(None);
+    let answer = evaluate(opened, span, &plan, &hosts, declared.as_ref(), tier);
+    let _ = crate::commands::run::teardown(&hosts, None, crate::commands::run::TEARDOWN_FLOOR_MS);
+    match hosts.requested_exit() {
+        Some(code) => Ok(code),
+        None => answer.map(|_| crate::EXIT_OK),
+    }
+}
+
+fn bind_failed(diagnostics: &[Diagnostic]) -> Diagnostic {
+    diagnostics.first().cloned().unwrap_or_else(|| {
+        Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "the artifact's hosts could not be bound, and nothing said why",
+        )
+    })
 }
 
 /// The unit the artifact runs on: its embedded one as built, else one compiled from its bodies.

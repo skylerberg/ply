@@ -690,7 +690,8 @@ pub struct DocArgs {
 
 #[derive(Args, Debug)]
 pub struct FmtArgs {
-    /// `.ply` files, or directories whose `*.ply` files are formatted (`.ply-cache` and `target` skipped).
+    /// `.ply` files, or directories whose `*.ply` files are formatted, under the working directory
+    /// (a hidden directory, one named `target`, and a symlink are passed over).
     #[arg(default_value = ".")]
     pub paths: Vec<PathBuf>,
 
