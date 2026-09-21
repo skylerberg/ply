@@ -1560,9 +1560,10 @@ fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>
       Some({ met: o.em.met, consts: o.em.consts, shapes: o.em.shapes, fields: o.em.fields, lambdas: o.em.lambdas, calls: o.em.calls, performs: o.em.performs, handles: o.em.handles, refused: o.em.refused,
       extra: o.em.extra,
       text: bytes_concat_all([
+      b"Word ", name, b"_entry(PlyCtx *ctx, const Word *args);\n",
       b"Word ", name, b"(PlyCtx *ctx",
       fold(range(0, n), b"", |acc: Bytes, i: Int| bytes_concat_all([acc, b", Word q", num(i)])),
-      b") {\n", fuel_head(),
+      b") {\n", fuel_head(bytes_concat(name, b"_entry"), param_names(b"q", n)),
       fold(sorted_widths(o.em.toks), b"", |acc: Bytes, w: Int|
         bytes_concat_all([acc, b"  Word tok", num(w), b" = 0;\n"])),
       fold(o.em.rlocals, b"", |acc: Bytes, r: Bytes| bytes_concat_all([acc, b"  Word ", r, b" = 0;\n"])),
@@ -3433,10 +3434,12 @@ pub fn emit_fn_full(module: Bytes, base: Int, here: List<Def>, imports: List<Imp
     None -> None,
     Some(o0) -> if o0.em.refused != None { None } else {
       let o = o0;
-      let sig = bytes_concat_all([b"Word ", name, b"(PlyCtx *ctx",
+      let sig = bytes_concat_all([
+        b"Word ", name, b"_entry(PlyCtx *ctx, const Word *args);\n",
+        b"Word ", name, b"(PlyCtx *ctx",
         fold(range(0, len(params)), b"", |acc: Bytes, i: Int|
           bytes_concat_all([acc, b", Word p", num(i)])), b") {\n"]);
-      let head = fuel_head();
+      let head = fuel_head(bytes_concat(name, b"_entry"), param_names(b"p", len(params)));
       let w = returned(o.em, o.v);
       let o = { em: w.em, v: o.v };
       let epilogue = bytes_concat_all([b"  ctx->fuel += 1;\n  return ", w.c, b";\n}\n"]);
@@ -3479,15 +3482,23 @@ pub fn emit_group_full(module: Bytes, here: List<Def>, imports: List<Imported>, 
   match group_cases(start, members, 0) {
     None -> None,
     Some(em) -> if em.refused != None { None } else {
-      let sig = bytes_concat_all([b"static Word ", gname, b"(PlyCtx *ctx, int which",
+      let gentry = bytes_concat(gname, b"_entry");
+      let sig = bytes_concat_all([
+        b"static Word ", gentry, b"(PlyCtx *ctx, const Word *args);\n",
+        b"static Word ", gname, b"(PlyCtx *ctx, int which",
         fold(range(0, width), b"", |acc: Bytes, i: Int| bytes_concat_all([acc, b", Word p", num(i)])), b") {\n"]);
       let toks = fold(sorted_widths(em.toks), b"", |acc: Bytes, w: Int| bytes_concat_all([acc, b"  Word tok", num(w), b" = 0;\n"]));
       let decls = fold(em.rlocals, b"", |acc: Bytes, r: Bytes| bytes_concat_all([acc, b"  Word ", r, b" = 0;\n"]));
+      let entered = bytes_concat_all([
+        b"static Word ", gentry, b"(PlyCtx *ctx, const Word *args) {\n  return ", gname,
+        b"(ctx, (int)args[0]",
+        fold(range(0, width), b"", |acc: Bytes, i: Int| bytes_concat_all([acc, b", args[", num(i + 1), b"]"])),
+        b");\n}\n"]);
       let wrappers = fold(range(0, len(members)), b"", |acc: Bytes, i: Int|
         match list_at(members, i) { Some(m) -> bytes_concat(acc, group_wrapper(gname, i, m, width)), None -> acc });
-      Some({ text: bytes_concat_all([sig, fuel_head(), toks, decls,
+      Some({ text: bytes_concat_all([sig, fuel_head(gentry, group_args(width)), toks, decls,
                b"  ply_loop: if ((++ctx->ticks & 4095) == 0) { rt_tick_p(ctx); if (ctx->failed) return 0; }\n",
-               b"  switch (which) {\n", bytes_join(em.out, b""), b"  }\n  return 0;\n}\n", wrappers, em.extra]),
+               b"  switch (which) {\n", bytes_join(em.out, b""), b"  }\n  return 0;\n}\n", entered, wrappers, em.extra]),
              tables: encode_tables(em, first) })
     },
   }
@@ -3572,19 +3583,54 @@ fn sorted_widths(xs: List<Int>) -> List<Int> =
       None -> acc,
     })
 
-// Spends fuel, and refuses when the native stack is nearly out: a C frame is not a machine frame.
-fn fuel_head() -> Bytes = bytes_concat_all([
+// Spends fuel, and hands the call a stack of its own when this thread's is nearly out: a C frame
+// is not a machine frame, so what bounds nesting is the fuel rather than the machine it runs on.
+fn fuel_head(entry: Bytes, args: List<Bytes>) -> Bytes = bytes_concat_all([
   b"  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n",
-  b"  { char probe; if ((uintptr_t)&probe < ctx->stack_floor) { rt_no_stack_p(ctx); return 0; } }\n",
+  b"  { char probe; if ((uintptr_t)&probe < ctx->stack_floor) { ", grow_call(entry, args), b" } }\n",
   b"  ctx->fuel -= 1;\n"])
+
+// The same call once more, on the stack `rt_grow` reserves for it. The arguments travel as an
+// array in this frame, which outlives the call that runs above it.
+fn grow_call(entry: Bytes, args: List<Bytes>) -> Bytes =
+  if len(args) == 0 {
+    bytes_concat_all([b"return rt_grow_p(ctx, (Word)(intptr_t)&", entry, b", 0);"])
+  } else {
+    bytes_concat_all([
+      b"Word ply_grown[", num(len(args)), b"];",
+      fold(range(0, len(args)), b"", |acc: Bytes, i: Int|
+        bytes_concat_all([acc, b" ply_grown[", num(i), b"] = ",
+          match list_at(args, i) { Some(a) -> a, None -> b"" }, b";"])),
+      b" return rt_grow_p(ctx, (Word)(intptr_t)&", entry, b", (Word)(intptr_t)ply_grown);"])
+  }
+
+// The names a prologue still holds its arguments under, before any loop has reassigned them.
+fn param_names(prefix: Bytes, n: Int) -> List<Bytes> =
+  map(range(0, n), |i: Int| bytes_concat(prefix, num(i)))
+
+// A group's are its case selector and the widest member's parameters.
+fn group_args(width: Int) -> List<Bytes> =
+  fold(range(0, width), [b"which"], |acc: List<Bytes>, i: Int| push(acc, bytes_concat(b"p", num(i))))
 
 test "a body that answers a literal" {
   let f = symbol_of(b"m.f");
   assert_eq(match emit_fn(b"m", [], [], [], [], b"m.f", [], { own: Borrowed, span: dummy_span(), node: NLit(LInt(7)) }) {
     Some(c) -> c, None -> b"" },
     bytes_concat_all([
-      b"Word ", f, b"(PlyCtx *ctx) {\n  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  { char probe; if ((uintptr_t)&probe < ctx->stack_floor) { rt_no_stack_p(ctx); return 0; } }\n  ctx->fuel -= 1;\n  ctx->fuel += 1;\n  return (ply_fits_imm(INT64_C(7)) ? ply_imm(INT64_C(7)) : rt_box_int_p(ctx, INT64_C(7)));\n}\n",
+      b"Word ", f, b"_entry(PlyCtx *ctx, const Word *args);\n",
+      b"Word ", f, b"(PlyCtx *ctx) {\n  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  { char probe; if ((uintptr_t)&probe < ctx->stack_floor) { return rt_grow_p(ctx, (Word)(intptr_t)&",
+      f, b"_entry, 0); } }\n  ctx->fuel -= 1;\n  ctx->fuel += 1;\n  return (ply_fits_imm(INT64_C(7)) ? ply_imm(INT64_C(7)) : rt_box_int_p(ctx, INT64_C(7)));\n}\n",
       b"Word ", f, b"_entry(PlyCtx *ctx, const Word *args) {\n  return ", f, b"(ctx);\n}\n"]))
+}
+
+test "a body that would overrun this thread's stack runs the same call on a stack of its own" {
+  let out = emit_all_in(b"m", [], [], b"fn g(n: Int) -> Int = n + 1\n", true);
+  let text = match list_at(out, 0) { Some(e) -> e.text, None -> b"" };
+  assert_eq(bytes_index_of(text, bytes_concat_all([
+    b"{ char probe; if ((uintptr_t)&probe < ctx->stack_floor) { Word ply_grown[1];",
+    b" ply_grown[0] = p0; return rt_grow_p(ctx, (Word)(intptr_t)&", symbol_of(b"m.g"),
+    b"_entry, (Word)(intptr_t)ply_grown); } }"])) != None, true);
+  assert_eq(bytes_index_of(text, b"rt_no_stack_p") != None, false)
 }
 
 test "two names an underscore apart spell two symbols" {

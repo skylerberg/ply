@@ -206,11 +206,16 @@ fn finish(d: &mut Detached) {
 /// Records the stop the body just made and answers its capture's index.
 fn capture_stop(c: &mut Ctx, id: usize) -> usize {
     let d = &c.detached[id];
-    let own = d.saved_current == d.frames;
     let (sp, floor) = (d.sp, d.saved_floor);
-    let (bytes, frames, pins) = if own {
-        let stack = d.stack.as_ref().expect("a suspended body has a stack");
-        let bytes = stack.live(sp).to_vec();
+    // A stop from a task's stack has none to copy, and so has one the body grew onto: the frames
+    // waiting there are not the ones a restore would write back.
+    let live = if d.saved_current == d.frames {
+        d.stack.as_ref().and_then(|stack| stack.live(sp))
+    } else {
+        None
+    };
+    let (bytes, frames, pins) = if let Some(live) = live {
+        let bytes = live.to_vec();
         let mut pins = Vec::new();
         for chunk in bytes.chunks_exact(8) {
             let w = Word::from_ne_bytes(chunk.try_into().expect("eight bytes"));

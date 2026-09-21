@@ -87,7 +87,10 @@ fn a_snapshot_restored_in_place_resumes_the_same_frame_again() {
     run();
     assert_eq!(with(|p| p.log.clone()), [10]);
     let captured = with(|p| p.task);
-    let snapshot = stack.live(captured).to_vec();
+    let snapshot = stack
+        .live(captured)
+        .expect("the task stopped on the stack it was given")
+        .to_vec();
     run();
     assert_eq!(with(|p| p.log.clone()), [10, 20]);
     unsafe { stack.restore(captured, &snapshot) };
@@ -101,4 +104,14 @@ fn a_snapshot_restored_in_place_resumes_the_same_frame_again() {
     run();
     assert_eq!(with(|p| p.log.clone()), [10, 20, 20, 0]);
     PONG.with(|p| *p.borrow_mut() = None);
+}
+
+/// A computation that grows stops on a stack its own does not hold, and a snapshot taken there
+/// would restore the wrong frames; `live` says so rather than reading past the mapping.
+#[test]
+fn a_stack_pointer_another_stack_holds_has_nothing_live_on_this_one() {
+    let stack = Stack::new();
+    let other = Stack::new();
+    assert!(stack.live(other.top() - 64).is_none());
+    assert_eq!(stack.live(stack.top() - 64).map(|b| b.len()), Some(64));
 }
