@@ -2,7 +2,7 @@
 // its place relative to the root, and the shipped modules the run binds as the root `shelf`.
 
 import std.fs (fs)
-import compiler.resolve (Source, Diag, diag1)
+import compiler.resolve (Source, Diag, Label, diag1)
 import walk (Failure, Found, sweep, is_ply)
 
 // One module of the program: where it was read from, what it is called, and its bytes.
@@ -56,26 +56,28 @@ pub fn is_compiler(name: String) -> Bool = name == "compiler" || string_starts_w
 
 // --- Reading them ---------------------------------------------------------------
 
-// A file the walk could not turn into a module never enters the source list, so nothing a label
-// could point into holds it: the message names the path and the rest is notes.
 fn outside() -> Int = 4294967295
 
 fn nowhere(code: Bytes, message: String, label: Bytes, notes: List<Bytes>) -> Diag =
   diag1(code, outside(), { start: 0, end: 0 }, bytes_of_string(message), label, notes)
 
-fn unaddressable(path: String, why: String) -> Diag =
-  nowhere(b"E0111", "`" ++ path ++ "` cannot be a module: " ++ why,
+// A refused file is recorded for its place alone, so the label names it; `m` is that place.
+fn at_file(code: Bytes, m: Int, message: String, label: Bytes, notes: List<Bytes>) -> Diag =
+  diag1(code, m, { start: 0, end: 0 }, bytes_of_string(message), label, notes)
+
+fn unaddressable(m: Int, path: String, why: String) -> Diag =
+  at_file(b"E0111", m, "`" ++ path ++ "` cannot be a module: " ++ why,
           b"this file is not addressable as a module",
           [b"rename it so every directory and the file stem is a plain identifier"])
 
-fn shadows_std(path: String, name: String) -> Diag =
-  nowhere(b"E0113", "`" ++ path ++ "` would be the module `" ++ name ++ "`, and `std` is reserved",
+fn shadows_std(m: Int, path: String, name: String) -> Diag =
+  at_file(b"E0113", m, "`" ++ path ++ "` would be the module `" ++ name ++ "`, and `std` is reserved",
           b"this file would shadow the modules that ship with the compiler",
           [b"`std` and everything under it name the modules embedded in `ply`; run `ply std` to list them",
            b"rename the file or the directory it sits in"])
 
-fn shadows_compiler(path: String, name: String) -> Diag =
-  nowhere(b"E0113", "`" ++ path ++ "` would be the module `" ++ name ++ "`, and `compiler` is reserved",
+fn shadows_compiler(m: Int, path: String, name: String) -> Diag =
+  at_file(b"E0113", m, "`" ++ path ++ "` would be the module `" ++ name ++ "`, and `compiler` is reserved",
           b"this file would shadow the compiler's own modules",
           [b"`compiler` and everything under it name the compiler modules embedded in `ply`; `compiler.fmt` is the formatter `ply fmt` runs",
            b"rename the file or the directory it sits in"])
@@ -91,18 +93,24 @@ pub fn nothing_here(path: String) -> Diag =
           [b"name a `.ply` file, or a directory that contains one",
            b"directories whose name starts with `.` are not searched"])
 
-fn placed(p: Project, path: String, text: Bytes) -> Project =
+// A refused file joins `files` so a label can point at it, and never joins `sources`.
+fn refused_file(p: Project, path: String, text: Bytes, d: Diag) -> Project =
+  { ..p, files: push(p.files, { path: path, module: "", text: text }), diags: push(p.diags, d) }
+
+fn placed(p: Project, path: String, text: Bytes) -> Project = {
+  let here = len(p.files);
   match module_of(path) {
-    Err(why) -> {..p, diags: push(p.diags, unaddressable(path, why))},
+    Err(why) -> refused_file(p, path, text, unaddressable(here, path, why)),
     Ok(name) ->
-      if is_std(name) { {..p, diags: push(p.diags, shadows_std(path, name))} }
-      else if is_compiler(name) { {..p, diags: push(p.diags, shadows_compiler(path, name))} }
+      if is_std(name) { refused_file(p, path, text, shadows_std(here, path, name)) }
+      else if is_compiler(name) { refused_file(p, path, text, shadows_compiler(here, path, name)) }
       else {
         { files: push(p.files, { path: path, module: name, text: text }),
           sources: push(p.sources, { name: bytes_of_string(name), src: text }),
           diags: p.diags }
       },
   }
+}
 
 fn one_file(p: Project, path: String) -> Project / {fs.read_file[cwd]} =
   match fs.read_file[cwd](path) {
@@ -166,10 +174,12 @@ test "a file that cannot be a module is refused and does not reach the front end
   } with {
     fs.read_file[cwd](path) -> Some(b"fn f() -> Int = 1\n"),
   };
-  assert_eq(len(p.files), 1);
   assert_eq(len(p.sources), 1);
   assert_eq(len(p.diags), 1);
-  assert_eq(match list_at(p.diags, 0) { Some(d) -> d.code, None -> b"" }, b"E0111")
+  assert_eq(match list_at(p.diags, 0) { Some(d) -> d.code, None -> b"" }, b"E0111");
+  // The refused file is kept only so the label can name it.
+  assert_eq(map(p.files, |f: File| f.path), ["m.ply", "my-file.ply"]);
+  assert_eq(match list_at(p.diags, 0) { Some(d) -> map(d.labels, |l: Label| l.module), None -> [] }, [1])
 }
 
 test "a project file under a reserved root is refused, naming the root" {
