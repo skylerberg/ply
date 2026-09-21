@@ -1208,6 +1208,10 @@ fn an_edit_walks_the_definitions_that_depend_on_it_and_no_others() {
         .map(|(name, hash)| producer::KnownDef {
             name: name.to_string(),
             hash: *hash,
+            witness: vec![(
+                "base.probe".to_string(),
+                checked.hashes.decls[&ply_span::Symbol::new("base.probe")],
+            )],
             footprint: SENTINEL.to_string(),
             performed: SENTINEL.to_string(),
         })

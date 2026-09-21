@@ -917,6 +917,9 @@ const FRONT_PULLING: &str = "front.front_pulling_std_with";
 pub struct KnownDef {
     pub name: String,
     pub hash: DefHash,
+    /// The declaration each effect the rows name had, by name and hash: a reference is encoded by
+    /// what it reaches, so renaming an effect moves no hash and only this says the rows are stale.
+    pub witness: Vec<(String, DefHash)>,
     pub footprint: String,
     pub performed: String,
 }
@@ -960,6 +963,20 @@ pub fn front_pulling_std_with(
                 record(vec![
                     ("name", Value::bytes(d.name.as_bytes())),
                     ("hash", Value::bytes(d.hash.0)),
+                    (
+                        "witness",
+                        Value::list(
+                            d.witness
+                                .iter()
+                                .map(|(name, hash)| {
+                                    record(vec![
+                                        ("name", Value::bytes(name.as_bytes())),
+                                        ("hash", Value::bytes(hash.0)),
+                                    ])
+                                })
+                                .collect(),
+                        ),
+                    ),
                     ("footprint", Value::bytes(d.footprint.as_bytes())),
                     ("performed", Value::bytes(d.performed.as_bytes())),
                 ])
