@@ -136,12 +136,14 @@ pub fn compact(scope: &CacheScope, style: Style) -> i32 {
 
     // Compaction drops what surviving files do not name, so a partial walk would delete silently.
     let keep = match crate::load::ply_files(store.root()) {
-        // A shipped module has no file on disk, but its entry is live.
+        // A shipped module has no file on disk, and its key is not a place under the root: it is
+        // the whole of what names it, whatever the root of this run happens to be.
         Ok(mut keep) => {
             keep.extend(
                 store
-                    .source_paths()
+                    .source_keys()
                     .into_iter()
+                    .map(PathBuf::from)
                     .filter(|p| crate::shipped::is_pseudo_path(p)),
             );
             keep

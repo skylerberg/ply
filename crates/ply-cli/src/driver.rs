@@ -740,7 +740,8 @@ impl<'s> Driver<'s> {
         }
 
         let mut moved: BTreeSet<Symbol> = BTreeSet::new();
-        for path in store.source_paths() {
+        // Keyed, not placed: a shipped module's key is not relative to this run's root.
+        for path in store.source_keys().into_iter().map(PathBuf::from) {
             if !ply_std::is_pseudo_path(&path) {
                 continue;
             }

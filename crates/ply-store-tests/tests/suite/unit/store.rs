@@ -1601,6 +1601,37 @@ fn source_paths_round_trip_back_to_the_paths_that_were_stored() {
     assert_eq!(paths, vec![flat, nested]);
 }
 
+/// `Path` equality normalises `.` away, so a root carrying one hands back a path that *is* the one
+/// that was stored and yet prints and prefix-matches as something else. Both readers are real: a
+/// report prints the path, and `ply` tests it for the `<std>/` a shipped module is keyed under.
+#[test]
+fn a_root_carrying_a_dot_hands_back_the_spelling_that_was_stored() {
+    let root = TempRoot::new("frontend-dotted-root");
+    let mut store = Store::open(&root.path().join(".")).unwrap();
+    let file = root.path().join("m.ply");
+    let shipped = PathBuf::from("<std>/net.ply");
+    store.put_source(&file, fingerprint(1));
+    store.put_source(&shipped, fingerprint(2));
+
+    let printed: Vec<String> = store
+        .source_paths()
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    for path in &printed {
+        assert!(
+            !path.contains("/./"),
+            "a handed-back path carries a `.`: {path}"
+        );
+    }
+
+    // A shipped module is keyed by what names it, not by a place under this run's root.
+    let mut keys = store.source_keys();
+    keys.sort();
+    assert_eq!(keys, vec!["<std>/net.ply".to_string(), "m.ply".to_string()]);
+    assert!(store.fingerprint(&shipped).is_some());
+}
+
 #[test]
 fn only_the_latest_answers_parts_are_kept_and_a_damaged_file_keeps_none() {
     let root = TempRoot::new("answer-parts");
