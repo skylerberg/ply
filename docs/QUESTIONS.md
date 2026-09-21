@@ -29,13 +29,3 @@ mechanical, since a group whose members want *different* instantiations of a typ
 polymorphic recursion, which needs written signatures to stay decidable. Assumed: worth doing for
 rows, where there is no such difficulty, and worth refusing clearly for types. Say whether you
 want both, rows only, or neither.
-
-## A part of a cached answer is spelled differently by each side
-
-The Ply compiler now reads, splits and joins a front-end answer. A *whole* dump is byte-identical
-whichever side wrote it, but a *part* is not: Rust writes a part with only that file's source in
-scope, which renumbers every span to module 0, while the Ply split keeps the indices the whole
-had. Nothing in Ply files parts yet, so nothing is broken today, and `ply check` is the first
-thing that would. Assumed: the split should relocate spans exactly as Rust's caller does, so a
-part written by either side reads on both. Say if you would rather parts kept the whole's
-numbering and the Rust caller stopped renumbering, which is the same fix from the other end.

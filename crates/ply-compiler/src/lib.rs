@@ -10,9 +10,6 @@ pub const ITEMS: &str = include_str!("../ply/items.ply");
 
 pub const PATTERNS: &str = include_str!("../ply/patterns.ply");
 
-/// The dump `front` writes, read back, and the split into per-module parts a cached `check` joins.
-pub const READ: &str = include_str!("../ply/read.ply");
-
 pub const TYPES: &str = include_str!("../ply/types.ply");
 
 pub const TYCORE: &str = include_str!("../ply/tycore.ply");
@@ -57,7 +54,6 @@ pub const MODULES: &[(&str, &str)] = &[
     ("items", ITEMS),
     ("lexer", LEXER),
     ("patterns", PATTERNS),
-    ("read", READ),
     ("resolve", RESOLVE),
     ("rewrite", REWRITE),
     ("spine", SPINE),
