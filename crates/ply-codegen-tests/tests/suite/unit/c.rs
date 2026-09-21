@@ -1364,6 +1364,54 @@ pub fn volley(n: Int) -> Int = ping(n, 0)
     }
 }
 
+/// A label binder is a trailing `Word` of the emitted body, so every reader of the published
+/// arity has to count it: a caller in another bucket writes the prototype from that arity, and a
+/// narrower one is a redefinition the C compiler refuses for the whole unit.
+#[test]
+fn a_label_generic_body_and_a_caller_in_another_bucket_agree_on_its_width() {
+    let caller = [
+        "driver", "sender", "harness", "runner", "outer", "wrapper", "feeder",
+    ]
+    .into_iter()
+    .find(|n| bucket_of(&format!("m.{n}")) != bucket_of("m.relay"))
+    .expect("seven names do not all share `relay`'s bucket");
+    let source = format!(
+        r#"
+effect net {{
+  write send[s](payload: Int) -> Int
+}}
+
+fn relay<[l]>(payload: Int) -> Int / {{net.send[l]}} = net.send[l](payload)
+
+pub fn {caller}(x: Int) -> Int =
+  handle {{ relay[conn](x) }} with {{ net.send[conn](p) -> p + 1 }}
+"#
+    );
+    let emitted = produced(keyed_by_hash(&source, ""));
+    let (_, arity) = emitted
+        .exports
+        .taken
+        .iter()
+        .find(|(n, _)| n == "m.relay")
+        .expect("`relay` is taken");
+    assert_eq!(*arity, 2, "`relay` takes its payload and its label");
+    let parts = split(&emitted.text).expect("the unit splits on its marks");
+    let prototype = format!("Word {}(PlyCtx*, Word, Word);\n", mangle("m.relay"));
+    let (_, bucket) = parts
+        .buckets
+        .iter()
+        .find(|(id, _)| *id == bucket_of(&format!("m.{caller}")))
+        .expect("the caller's bucket");
+    assert!(
+        bucket.contains(&prototype),
+        "the caller's bucket declares `relay` narrower than it is emitted:\n{bucket}"
+    );
+    let Some(native) = built(&source) else {
+        return;
+    };
+    assert_eq!(answer(&native, &format!("m.{caller}"), 1), 2);
+}
+
 /// The members of a recursive group share one C function, so a tail call between them is a jump:
 /// the fuel is far below the calls made, and a call that nested would spend it first.
 #[test]

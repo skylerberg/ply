@@ -207,7 +207,10 @@ impl Tables {
                         t.spans.insert(root.clone(), def.span);
                         let (params, ret) = signature(&def.scheme.ty);
                         let scalar_params = params.iter().all(is_scalar);
-                        t.note(root.clone(), params.len(), scalar_params && is_scalar(ret));
+                        // A label parameter is a trailing `Word` of the emitted body, so the
+                        // prototype and the entry seam count it too.
+                        let arity = params.len() + def.scheme.label_vars.len();
+                        t.note(root.clone(), arity, scalar_params && is_scalar(ret));
                         let (mut requires, mut ensures) = (0, 0);
                         for kind in kinds {
                             // `ensures` also takes `result`.
