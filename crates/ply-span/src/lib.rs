@@ -1,6 +1,7 @@
 //! Every diagnostic renders two ways from one value: lines for a terminal and JSON for an agent.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -166,15 +167,19 @@ impl SourceMap {
         &self.files
     }
 
-    pub fn snippet(&self, span: Span) -> &str {
-        self.get(span.source)
-            .and_then(|f| f.text.get(span.range()))
-            .unwrap_or("")
+    pub fn snippet(&self, span: Span) -> Cow<'_, str> {
+        match self.containing(span) {
+            Some(f) => String::from_utf8_lossy(&f.text.as_bytes()[span.range()]),
+            None => Cow::Borrowed(""),
+        }
     }
 
+    /// The file a span is a byte range of. A span that cuts a character in half is a defect in
+    /// whoever built it, and the line it points at is worth more to a reader than a dropped
+    /// label, so the only bound is the text's length.
     pub fn containing(&self, span: Span) -> Option<&SourceFile> {
         self.get(span.source)
-            .filter(|f| f.text.get(span.range()).is_some())
+            .filter(|f| span.start <= span.end && span.end as usize <= f.text.len())
     }
 }
 

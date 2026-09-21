@@ -70,7 +70,7 @@ pub fn to_json(diag: &Diagnostic, sources: &SourceMap) -> JsonDiagnostic {
                 },
                 message: l.message.clone(),
                 primary: l.primary,
-                snippet: sources.snippet(l.span).to_string(),
+                snippet: sources.snippet(l.span).into_owned(),
             })
         })
         .collect();
@@ -132,33 +132,45 @@ fn painted(styled: bool, severity: Severity, text: &str) -> String {
     format!("\x1b[{code}m{text}\x1b[0m")
 }
 
-/// Where the line holding `offset` begins.
-fn line_start(text: &str, offset: usize) -> usize {
-    text[..offset].rfind('\n').map_or(0, |i| i + 1)
+/// Bytes, not characters, because a span that cuts a character in half is still placed; the only
+/// offsets that are known to be character boundaries are the line's own ends.
+fn line_start(text: &[u8], offset: usize) -> usize {
+    text[..offset]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |i| i + 1)
 }
 
 /// The newline closing the line that begins at `from`, or the end of the text.
-fn end_of_line(text: &str, from: usize) -> usize {
-    text[from..].find('\n').map_or(text.len(), |i| from + i)
+fn end_of_line(text: &[u8], from: usize) -> usize {
+    text[from..]
+        .iter()
+        .position(|b| *b == b'\n')
+        .map_or(text.len(), |i| from + i)
+}
+
+/// Characters, counted as the bytes that are not the tail of one.
+fn chars_between(text: &[u8], from: usize, to: usize) -> usize {
+    text[from..to].iter().filter(|b| *b & 0xc0 != 0x80).count()
 }
 
 /// The caret run under one line: the span's own width, or one caret for an empty span, and never
 /// past the end of the line the span opens on.
-fn carets(text: &str, start: usize, end: usize) -> String {
+fn carets(text: &[u8], start: usize, end: usize) -> String {
     let from = line_start(text, start);
     let stop = end.min(end_of_line(text, from));
-    let width = text[start..stop].chars().count().max(1);
+    let width = chars_between(text, start, stop).max(1);
     format!(
         "{}{}",
-        " ".repeat(text[from..start].chars().count()),
+        " ".repeat(chars_between(text, from, start)),
         "^".repeat(width)
     )
 }
 
 /// One diagnostic: the heading, a block per label it can place, then a line per note and fix.
-/// A label whose span is not a range of its file is dropped, as `to_json` drops it, and a
-/// diagnostic left with none is still its heading, so a builtin's error is never silently lost.
-/// The shape is `crates/ply-cli/ply/diagnostic.ply`'s, byte for byte.
+/// A label whose span [`SourceMap::containing`] cannot place is dropped, as `to_json` drops it,
+/// and a diagnostic left with none is still its heading, so a builtin's error is never silently
+/// lost. The shape is `crates/ply-cli/ply/diagnostic.ply`'s, byte for byte.
 pub fn to_terminal(diag: &Diagnostic, sources: &SourceMap, styled: bool) -> String {
     let heading = format!("{}[{}]", titled(diag.severity), diag.code);
     let mut out = String::new();
@@ -172,7 +184,7 @@ pub fn to_terminal(diag: &Diagnostic, sources: &SourceMap, styled: bool) -> Stri
         let Some(file) = sources.containing(l.span) else {
             continue;
         };
-        let text = &*file.text;
+        let text = file.text.as_bytes();
         let start = l.span.start as usize;
         let from = line_start(text, start);
         let (line, col) = file.line_col(l.span.start);
@@ -182,7 +194,11 @@ pub fn to_terminal(diag: &Diagnostic, sources: &SourceMap, styled: bool) -> Stri
             format!(" {}", l.message)
         };
         let _ = writeln!(out, "  --> {}:{line}:{col}", file.path.display());
-        let _ = writeln!(out, "   | {}", &text[from..end_of_line(text, from)]);
+        let _ = writeln!(
+            out,
+            "   | {}",
+            String::from_utf8_lossy(&text[from..end_of_line(text, from)])
+        );
         let _ = writeln!(
             out,
             "   | {}{said}",
@@ -326,11 +342,7 @@ mod tests {
     fn a_span_outside_its_text_renders_without_its_label() {
         let mut sm = SourceMap::new();
         let id = sm.add("t.ply", "fn f() = \"é\"\n");
-        for span in [
-            Span::new(id, 21, 26),
-            Span::new(id, 11, 12),
-            Span::new(id, 5, 2),
-        ] {
+        for span in [Span::new(id, 21, 26), Span::new(id, 5, 2)] {
             assert_eq!(sm.snippet(span), "");
             let d = Diagnostic::error(codes::RUNTIME_ERROR, "boom").primary(span, "here");
             let v = serde_json::to_value(to_json(&d, &sm)).unwrap();
@@ -340,6 +352,30 @@ mod tests {
             let file = sm.get(id).unwrap();
             let _ = (file.line_col(span.start), file.line_col(span.end));
         }
+    }
+
+    /// A span that cuts a character in half is a defect in whoever built it; the label is still
+    /// placed, on the line it opens, and the snippet is what those bytes lossily say.
+    #[test]
+    fn a_span_cutting_a_character_in_half_is_still_placed() {
+        let mut sm = SourceMap::new();
+        let id = sm.add("t.ply", "fn f() = \"é\"\n");
+        let span = Span::new(id, 11, 12);
+        let d = Diagnostic::error(codes::RUNTIME_ERROR, "boom").primary(span, "here");
+
+        assert_eq!(sm.snippet(span), "\u{fffd}");
+        let v = serde_json::to_value(to_json(&d, &sm)).unwrap();
+        assert_eq!(v["labels"].as_array().map(Vec::len), Some(1), "{v}");
+        assert_eq!(v["labels"][0]["snippet"], "\u{fffd}");
+        assert_eq!(
+            to_terminal(&d, &sm, false),
+            text(&[
+                "Error[E0502]: boom",
+                "  --> t.ply:1:12",
+                "   | fn f() = \"é\"",
+                "   |            ^ here",
+            ])
+        );
     }
 
     #[test]
