@@ -462,7 +462,7 @@ impl<'s> Driver<'s> {
         let own = self.own();
         self.files.truncate(own);
         self.sources = self.project.clone();
-        for module in shipped.iter().map(|m| ModuleName::from_dotted(m)) {
+        for module in shipped.iter().map(ModuleName::from_dotted) {
             let Some(text) = crate::shipped::source(&module) else {
                 continue;
             };
