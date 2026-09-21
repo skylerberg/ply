@@ -176,31 +176,3 @@ impl CheckOutput {
         self.effects.get(&atom.effect).is_some_and(|e| e.nondet)
     }
 }
-
-/// A published interface a caller already holds.
-#[derive(Clone, Debug)]
-pub struct KnownDef {
-    pub scheme: Scheme,
-    pub footprint: Footprint,
-    /// What the body performed when it was last walked.
-    pub performed: Footprint,
-}
-
-#[derive(Clone, Debug)]
-pub struct KnownTest {
-    pub footprint: Footprint,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Known {
-    /// Program-wide name -> interface.
-    pub defs: IndexMap<Symbol, KnownDef>,
-    /// Module name -> one slot per `test` in that module, in source order.
-    pub tests: IndexMap<Symbol, Vec<Option<KnownTest>>>,
-}
-
-impl Known {
-    pub fn is_empty(&self) -> bool {
-        self.defs.is_empty() && self.tests.is_empty()
-    }
-}

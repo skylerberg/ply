@@ -12,15 +12,15 @@ import patterns (Lit, LInt, LStr, LBytes)
 import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform, NLabel, NCell,
              NLambda, NSim, NHandle, NField, NUpd, CField, CArm, CClause, CStmt, CLet, CLetPat, CDo,
              CPat, CPatField, PxCtor, PxRecord, PxList, lower_fn, dump)
-import tycore (Atom, Resource, RNamed, RSingleton, Scheme, atoms_text, atoms_insert, scheme_text, type_text,
+import tycore (Atom, Resource, RNamed, RSingleton, Scheme, atoms_text, atoms_insert, read_atoms, scheme_text, type_text,
                at, append, take, contains_bytes, contains_int)
 import resolve (Source, Mod, Diag, Label, Edit, Fix, Resolved, Resolved_, Failed, Ns, NValue, NEffect, resolve_modules, qualify,
                 lookup, find, is_bare, diag1, backticked, import_module_name, path_span)
-import hash (Index, Entry, EDef, ETest, ELaw, HashOutput, build_index, hash_index, hex, unused,
+import hash (Index, Entry, EDef, ETest, ELaw, TestNode, HashOutput, build_index, hash_index, hex, unused,
              Pin, Rehash, Rehashed, rehash_index, Printed, Unprintable, print_bodies)
 import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder, EffectInfo, OpInfo, CtorInfo,
-              update_shapes, expanded_mods,
-              check_front, deriver_text, is_prelude_effect, builtin_schemes, BuiltinDoc, builtin_docs, find_doc)
+              Known, KnownDef, no_known, update_shapes, expanded_mods,
+              check_front_with, deriver_text, is_prelude_effect, builtin_schemes, BuiltinDoc, builtin_docs, find_doc)
 import diag (Parsed, parse_all, parse_at, outside_every_module, frame, framed, field, flag)
 import std.hash (blake3)
 import fmt (item_range, replace_item)
@@ -392,7 +392,62 @@ pub type Whole = { mods: List<Mod>, r: Resolved, checked: Front, index: Index, h
 // A stage that reports stops the rest, so a refusal is the diagnostics of exactly one stage.
 pub type Analysis = | Refused(List<Diag>) | Analysed(Whole)
 
-pub fn analyse(parsed: List<Parsed>) -> Analysis = {
+// A definition's or a test's published rows as the last answer wrote them, under the hash it had
+// then: the checker takes them wherever this program hashes that item the same, and walks the rest.
+// A row's atoms name their effects, which a hash does not pin — a reference is encoded by the hash
+// of what it reaches, so renaming an effect moves nothing. `witness` is the name and hash each of
+// those declarations had, and a row whose witness no longer holds is not a row about this program.
+pub type Witness = { name: Bytes, hash: Bytes }
+pub type KnownDefRow = { name: Bytes, hash: Bytes, witness: List<Witness>, footprint: Bytes, performed: Bytes }
+pub type KnownTestRow = { key: Bytes, hash: Bytes, witness: List<Witness>, footprint: Bytes }
+
+fn still_hashed(now: Map<Bytes, Bytes>, name: Bytes, was: Bytes) -> Bool =
+  match map_get(now, name) { Some(h) -> h == was, None -> false }
+
+fn witnessed(decls: Map<Bytes, Bytes>, witness: List<Witness>) -> Bool =
+  fold(witness, true, |acc: Bool, w: Witness| acc && still_hashed(decls, w.name, w.hash))
+
+fn known_defs(now: Map<Bytes, Bytes>, decls: Map<Bytes, Bytes>, rows: List<KnownDefRow>) -> Map<Bytes, KnownDef> =
+  fold(rows, map_new(), |acc: Map<Bytes, KnownDef>, r: KnownDefRow|
+    if !still_hashed(now, r.name, r.hash) || !witnessed(decls, r.witness) { acc } else {
+      match read_atoms(r.footprint) {
+        None -> acc,
+        Some(footprint) -> match read_atoms(r.performed) {
+          None -> acc,
+          Some(performed) -> map_insert(acc, r.name, { footprint: footprint, performed: performed }),
+        },
+      }
+    })
+
+// Every test's hash this run, by the key `<module>.<label>` a row names it under.
+fn test_hashes(index: Index, h: HashOutput) -> Map<Bytes, Bytes> =
+  fold(range(0, len(index.tests)), map_new(), |acc: Map<Bytes, Bytes>, i: Int|
+    map_insert(acc, at(index.tests, i).key, at(h.tests, i)))
+
+// One slot per `test` of each module, in source order, as `check_tests` walks them. A test's row
+// names its effects exactly as a definition's does, so it is witnessed exactly as one.
+fn known_tests(now: Map<Bytes, Bytes>, decls: Map<Bytes, Bytes>, mods: List<Mod>, rows: List<KnownTestRow>) -> Map<Bytes, List<Option<List<Atom>>>> = {
+  let by_key = fold(rows, map_new(), |acc: Map<Bytes, KnownTestRow>, r: KnownTestRow| map_insert(acc, r.key, r));
+  fold(mods, map_new(), |acc: Map<Bytes, List<Option<List<Atom>>>>, m: Mod|
+    map_insert(acc, m.name, fold(m.module.items, [], |slots: List<Option<List<Atom>>>, it: Item|
+      match it {
+        ITest(d) -> push(slots, match map_get(by_key, qualify(m.name, d.name)) {
+          None -> None,
+          Some(r) -> if still_hashed(now, r.key, r.hash) && witnessed(decls, r.witness) { read_atoms(r.footprint) } else { None },
+        }),
+        _ -> slots,
+      })))
+}
+
+fn taken(mods: List<Mod>, index: Index, h: HashOutput, defs: List<KnownDefRow>, tests: List<KnownTestRow>) -> Known =
+  if len(defs) == 0 && len(tests) == 0 { no_known() } else {
+    { defs: known_defs(by_name_one(h.defs), by_name_one(h.decls), defs),
+      tests: known_tests(test_hashes(index, h), by_name_one(h.decls), mods, tests) }
+  }
+
+pub fn analyse(parsed: List<Parsed>) -> Analysis = analyse_with(parsed, [], [])
+
+pub fn analyse_with(parsed: List<Parsed>, defs: List<KnownDefRow>, tests: List<KnownTestRow>) -> Analysis = {
   let early = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
   if len(early) > 0 { Refused(early) } else {
     match resolve_modules(map(parsed, |p: Parsed| p.module)) {
@@ -400,10 +455,12 @@ pub fn analyse(parsed: List<Parsed>) -> Analysis = {
       Resolved_(x) -> {
         let built = build_index(x.mods, x.r);
         if len(built.diags) > 0 { Refused(map(built.diags, outside_every_module)) } else {
-          let checked: Front = check_front(x.r, x.mods);
+          // Hashing reads the tree, not the checker, so what has moved is known before anything is checked.
+          let hashes: HashOutput = hash_index(built.index);
+          let checked: Front = check_front_with(x.r, x.mods, taken(x.mods, built.index, hashes, defs, tests));
           if !checked.ok { Refused(map(checked.diags, outside_every_module)) }
           else { Analysed({ mods: x.mods, r: x.r, checked: checked, index: built.index,
-                            hashes: hash_index(built.index),
+                            hashes: hashes,
                             warnings: map(unused(built.index), outside_every_module) }) }
         }
       },
@@ -420,8 +477,12 @@ pub fn dump_of(a: Analysis) -> Dump =
     Analysed(w) -> tables(w.warnings, w.mods, w.r, w.checked, w.index, w.hashes),
   }
 
-pub fn front_dump(sources: List<Source>) -> String =
-  string_of_bytes(dump_text(dump_of(analyse(parse_all(sources)))))
+pub fn front_dump(sources: List<Source>) -> String = front_dump_with(sources, [], [])
+
+// The front end handed the rows the last answer published: what this program hashes the same is
+// taken from them, and only what moved is walked.
+pub fn front_dump_with(sources: List<Source>, defs: List<KnownDefRow>, tests: List<KnownTestRow>) -> String =
+  string_of_bytes(dump_text(dump_of(analyse_with(parse_all(sources), defs, tests))))
 
 // Every builtin's scheme as the checker binds it, its parameter names and its note: one `builtin`
 // frame each.
@@ -663,15 +724,23 @@ fn pulling(users: Int, shipped: Map<Bytes, Bytes>, listed: List<Bytes>, x: Pull)
 // that renders one needs both lists.
 pub type Pulled = { pulled: List<Bytes>, out: Analysis }
 
-pub fn analyse_pulling_std(user: List<Source>, shipped: List<Source>) -> Pulled = {
+pub fn analyse_pulling_std(user: List<Source>, shipped: List<Source>) -> Pulled =
+  analyse_pulling_std_with(user, shipped, [], [])
+
+pub fn analyse_pulling_std_with(user: List<Source>, shipped: List<Source>,
+                                defs: List<KnownDefRow>, tests: List<KnownTestRow>) -> Pulled = {
   let texts = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source| map_insert(acc, s.name, s.src));
   let x = pulling(len(user), texts, map(shipped, |s: Source| s.name), { parsed: parse_all(user), pulled: [], diags: [] });
-  { pulled: x.pulled, out: if len(x.diags) > 0 { Refused(x.diags) } else { analyse(x.parsed) } }
+  { pulled: x.pulled, out: if len(x.diags) > 0 { Refused(x.diags) } else { analyse_with(x.parsed, defs, tests) } }
 }
 
 // `front_dump` over `user` and the modules of `shipped` it imports, led by a `pulled` frame naming those in order.
-pub fn front_pulling_std(user: List<Source>, shipped: List<Source>) -> String = {
-  let x: Pulled = analyse_pulling_std(user, shipped);
+pub fn front_pulling_std(user: List<Source>, shipped: List<Source>) -> String =
+  front_pulling_std_with(user, shipped, [], [])
+
+pub fn front_pulling_std_with(user: List<Source>, shipped: List<Source>,
+                              defs: List<KnownDefRow>, tests: List<KnownTestRow>) -> String = {
+  let x: Pulled = analyse_pulling_std_with(user, shipped, defs, tests);
   let head = framed(b"pulled", b"_", map(x.pulled, |n: Bytes| field(b"module", n)));
   string_of_bytes(bytes_concat(head, dump_text(dump_of(x.out))))
 }
@@ -1586,508 +1655,6 @@ pub fn read_front(text: Bytes) -> Result<Dump, Bytes> =
               match unit(text, s.at, b"frame") { Err(e) -> Stop(Err(e)), Ok(u) -> frame_step(s, u) }
             })
 
-// --- The split into a program part and one per module -------------------------
-
-pub type Split = { program: Dump, parts: List<Dump> }
-
-type Spread = { parts: List<Dump>, program: Dump, laid: Int, err: Option<Bytes> }
-
-type Seat = { part: Int, index: Int }
-
-type Seating = { s: Spread, seats: List<Seat> }
-
-fn failed(s: Spread, e: Bytes) -> Spread = {..s, err: Some(e)}
-
-// A table is laid out one module at a time; a row that steps back is a dump no join could rebuild.
-fn lay(s: Spread, what: Bytes, group: Int) -> Spread =
-  if group < s.laid { {..s, err: Some(bytes_concat_all([b"the ", what, b" are not grouped by module"]))} }
-  else { {..s, laid: group} }
-
-fn into(s: Spread, i: Int, f: (Dump) -> Dump) -> Spread = {
-  let part: Dump = at(s.parts, i);
-  {..s, parts: list_set(s.parts, i, f(part))}
-}
-
-fn into_program(s: Spread, f: (Dump) -> Dump) -> Spread = {
-  let p: Dump = s.program;
-  {..s, program: f(p)}
-}
-
-fn no_frame(module: Bytes) -> Bytes =
-  bytes_concat_all([b"`", module, b"` declares entries but has no module frame"])
-
-fn count_tests(hs: List<HashFrame>) -> Int =
-  fold(hs, 0, |n: Int, f: HashFrame| match f { HTest(_) -> n + 1, _ -> n })
-
-fn count_laws(hs: List<HashFrame>) -> Int =
-  fold(hs, 0, |n: Int, f: HashFrame| match f { HLaw(_) -> n + 1, _ -> n })
-
-fn claim(acc: Result<Map<Bytes, Int>, Bytes>, place: Map<Bytes, Int>, name: Bytes, module: Bytes)
-  -> Result<Map<Bytes, Int>, Bytes> =
-  match acc {
-    Err(e) -> Err(e),
-    Ok(m) ->
-      match map_get(place, module) {
-        None -> Err(no_frame(module)),
-        Some(i) ->
-          match map_get(m, name) {
-            Some(j) -> if j == i { Ok(m) } else { Err(bytes_concat_all([b"`", name, b"` is claimed by two modules"])) },
-            None -> Ok(map_insert(m, name, i)),
-          },
-      },
-  }
-
-// A diagnostic belongs to the one module its labels name: a part is keyed by its module and what
-// that imports, so a warning must not depend on the modules that import it.
-fn diag_part_of(by_index: Map<Int, Int>, g: Diag) -> Result<Int, Bytes> = {
-  let named = fold(g.labels, [], |acc: List<Int>, l: Label|
-    if l.module == no_module() || contains_int(acc, l.module) { acc } else { push(acc, l.module) });
-  if len(named) == 0 {
-    Err(bytes_concat_all([b"diagnostic `", g.code,
-                          b"` names no module, and the part no module declares is keyed by the import graph alone"]))
-  } else if len(named) > 1 {
-    Err(bytes_concat_all([b"diagnostic `", g.code, b"` labels two modules"]))
-  } else {
-    match map_get(by_index, at(named, 0)) {
-      Some(i) -> Ok(i),
-      None -> Err(bytes_concat_all([b"diagnostic `", g.code, b"` labels source ", num(at(named, 0)),
-                                    b", which no module is"])),
-    }
-  }
-}
-
-fn lay_into(s: Spread, place: Map<Bytes, Int>, module: Bytes, what: Bytes, rank: List<Int>, by_rank: Bool,
-            f: (Dump) -> Dump) -> Spread =
-  match map_get(place, module) {
-    None -> failed(s, no_frame(module)),
-    Some(i) -> into(lay(s, what, if by_rank { at(rank, i) } else { i }), i, f),
-  }
-
-fn spread_tests(d: Dump, place: Map<Bytes, Int>, s0: Spread) -> Seating =
-  fold(d.tests, { s: s0, seats: [] }, |acc: Seating, t: TestRow|
-    match acc.s.err {
-      Some(_) -> acc,
-      None ->
-        match map_get(place, t.module) {
-          None -> { s: failed(acc.s, no_frame(t.module)), seats: acc.seats },
-          Some(i) -> {
-            let laid: Spread = lay(acc.s, b"tests", i);
-            let part: Dump = at(laid.parts, i);
-            let local = len(part.tests);
-            let body = at(d.test_bodies, len(acc.seats));
-            { s: into(laid, i, |p: Dump|
-                {..p, tests: push(p.tests, { key: t.key, name: t.name, module: t.module, index: local,
-                                             nondet: t.nondet, footprint: t.footprint, at: t.at,
-                                             name_at: t.name_at }),
-                      test_bodies: push(p.test_bodies, body)}),
-              seats: push(acc.seats, { part: i, index: local }) }
-          },
-        },
-    })
-
-fn spread_laws(d: Dump, place: Map<Bytes, Int>, s0: Spread) -> Seating =
-  fold(d.laws, { s: s0, seats: [] }, |acc: Seating, l: LawRow|
-    match acc.s.err {
-      Some(_) -> acc,
-      None ->
-        match map_get(place, l.module) {
-          None -> { s: failed(acc.s, no_frame(l.module)), seats: acc.seats },
-          Some(i) -> {
-            let laid: Spread = lay(acc.s, b"laws", i);
-            let part: Dump = at(laid.parts, i);
-            let local = len(part.laws);
-            { s: into(laid, i, |p: Dump|
-                {..p, laws: push(p.laws, { key: l.key, name: l.name, module: l.module, index: local,
-                                           binders: l.binders, has_guard: l.has_guard, host: l.host,
-                                           footprint: l.footprint, at: l.at, literals: l.literals })}),
-              seats: push(acc.seats, { part: i, index: local }) }
-          },
-        },
-    })
-
-fn spread_hash(s: Spread, owner: Map<Bytes, Int>, tested: List<Seat>, lawful: List<Seat>, f: HashFrame) -> Spread =
-  match f {
-    HDef(r) ->
-      match map_get(owner, r.name) {
-        None -> failed(s, bytes_concat_all([b"`", r.name, b"` is hashed but no module declares it"])),
-        Some(i) -> into(lay(s, b"hashed items", i), i, |p: Dump| {..p, hashes: push(p.hashes, HDef(r))}),
-      },
-    HTest(r) ->
-      match list_at(tested, r.index) {
-        None -> failed(s, bytes_concat_all([b"the hash order names test ", num(r.index), b", which there is not"])),
-        Some(seat) -> into(lay(s, b"hashed items", seat.part), seat.part, |p: Dump|
-          {..p, hashes: push(p.hashes, HTest({ index: seat.index, key: r.key, hash: r.hash, text: r.text,
-                                               deps: r.deps, closure: r.closure }))}),
-      },
-    HLaw(r) ->
-      match list_at(lawful, r.index) {
-        None -> failed(s, bytes_concat_all([b"the hash order names law ", num(r.index), b", which there is not"])),
-        Some(seat) -> into(lay(s, b"hashed items", seat.part), seat.part, |p: Dump|
-          {..p, hashes: push(p.hashes, HLaw({ index: seat.index, key: r.key, hash: r.hash, text: r.text,
-                                              deps: r.deps, closure: r.closure }))}),
-      },
-  }
-
-// Who declares each hashed name: a test keyed like another module's definition would otherwise
-// share its hash entries across two parts.
-fn owners(d: Dump, place: Map<Bytes, Int>) -> Result<Map<Bytes, Int>, Bytes> = {
-  let defs = fold(d.defs, Ok(map_new()), |acc: Result<Map<Bytes, Int>, Bytes>, x: DefRow| claim(acc, place, x.name, x.module));
-  let types = fold(d.types, defs, |acc: Result<Map<Bytes, Int>, Bytes>, x: TypeRow| claim(acc, place, x.name, x.module));
-  let effects = fold(d.effects, types, |acc: Result<Map<Bytes, Int>, Bytes>, x: EffectRow|
-    if x.module == b"" { acc } else { claim(acc, place, x.name, x.module) });
-  let tests = fold(d.tests, effects, |acc: Result<Map<Bytes, Int>, Bytes>, x: TestRow| claim(acc, place, x.key, x.module));
-  fold(d.laws, tests, |acc: Result<Map<Bytes, Int>, Bytes>, x: LawRow| claim(acc, place, x.key, x.module))
-}
-
-// --- A part that stands on its own --------------------------------------------
-// A part is keyed by its module and what that module reaches, never by the whole it came from, so
-// its bytes must not depend on that whole either: two programs that key a part alike would
-// otherwise store two spellings under one key, and whichever lost would hand back spans pointing
-// at the wrong module. So a part carries its module as source 0, as `write_front` over one source
-// does on the Rust side, and the join puts every span back where the whole expects it.
-
-fn seen_module(acc: List<Int>, m: Int) -> List<Int> =
-  if m == no_module() || contains_int(acc, m) { acc } else { push(acc, m) }
-
-fn at_seen(acc: List<Int>, a: At) -> List<Int> = seen_module(acc, a.module)
-
-fn diag_seen(acc: List<Int>, g: Diag) -> List<Int> = {
-  let labelled = fold(g.labels, acc, |ms: List<Int>, l: Label| seen_module(ms, l.module));
-  fold(g.fixes, labelled, |ms: List<Int>, f: Fix|
-    fold(f.edits, ms, |es: List<Int>, e: Edit| seen_module(es, e.module)))
-}
-
-// Every module a dump's spans name, each once; one outside every module names none.
-fn modules_named(d: Dump) -> List<Int> = {
-  let framed_at = fold(d.modules, [], |acc: List<Int>, m: ModuleRow| seen_module(acc, m.index));
-  let reported = fold(d.diags, framed_at, diag_seen);
-  let defined = fold(d.defs, reported, |acc: List<Int>, x: DefRow| {
-    let params = fold(x.params, at_seen(acc, x.at), |ms: List<Int>, p: ParamRow| at_seen(ms, p.at));
-    fold(x.spec, params, |ms: List<Int>, s: SpecRow| at_seen(ms, s.at))
-  });
-  let typed = fold(d.types, defined, |acc: List<Int>, x: TypeRow| at_seen(acc, x.at));
-  let tested = fold(d.tests, typed, |acc: List<Int>, x: TestRow| at_seen(at_seen(acc, x.at), x.name_at));
-  let lawful = fold(d.laws, tested, |acc: List<Int>, x: LawRow|
-    fold(x.binders, at_seen(acc, x.at), |ms: List<Int>, b: BinderRow| at_seen(ms, b.at)));
-  let performed = fold(d.effects, lawful, |acc: List<Int>, x: EffectRow|
-    fold(x.ops, at_seen(acc, x.at), |ms: List<Int>, o: OpRow| at_seen(ms, o.at)));
-  fold(d.ctors, performed, |acc: List<Int>, x: CtorRow| at_seen(acc, x.at))
-}
-
-fn renumbered_at(a: At, from: Int, to: Int) -> At =
-  if a.module == from { { module: to, start: a.start, end: a.end } } else { a }
-
-fn renumbered_diag(g: Diag, from: Int, to: Int) -> Diag =
-  { code: g.code, notes: g.notes,
-    labels: map(g.labels, |l: Label|
-      if l.module == from { { module: to, start: l.start, end: l.end, primary: l.primary, text: l.text } }
-      else { l }),
-    text: g.text, message: g.message, notes_text: g.notes_text, severity: g.severity,
-    fixes: map(g.fixes, |f: Fix|
-      { title: f.title,
-        edits: map(f.edits, |e: Edit|
-          if e.module == from { { module: to, start: e.start, end: e.end, text: e.text } } else { e }) }) }
-
-fn renumbered_def(x: DefRow, from: Int, to: Int) -> DefRow =
-  { name: x.name, module: x.module, simple_name: x.simple_name, public: x.public, reuse: x.reuse,
-    scheme: x.scheme, footprint: x.footprint, performed: x.performed, constraints: x.constraints,
-    internally_effectful: x.internally_effectful, row_aliases: x.row_aliases,
-    params: map(x.params, |p: ParamRow| { name: p.name, at: renumbered_at(p.at, from, to) }),
-    spec: map(x.spec, |s: SpecRow| { kind: s.kind, index: s.index, footprint: s.footprint,
-                                     at: renumbered_at(s.at, from, to) }),
-    at: renumbered_at(x.at, from, to), literals: x.literals }
-
-fn renumbered_type(x: TypeRow, from: Int, to: Int) -> TypeRow =
-  { name: x.name, module: x.module, simple_name: x.simple_name, public: x.public, arity: x.arity,
-    at: renumbered_at(x.at, from, to) }
-
-fn renumbered_test(x: TestRow, from: Int, to: Int) -> TestRow =
-  { key: x.key, name: x.name, module: x.module, index: x.index, nondet: x.nondet,
-    footprint: x.footprint, at: renumbered_at(x.at, from, to),
-    name_at: renumbered_at(x.name_at, from, to) }
-
-fn renumbered_law(x: LawRow, from: Int, to: Int) -> LawRow =
-  { key: x.key, name: x.name, module: x.module, index: x.index,
-    binders: map(x.binders, |b: BinderRow| { name: b.name, at: renumbered_at(b.at, from, to), ty: b.ty }),
-    has_guard: x.has_guard, host: x.host, footprint: x.footprint,
-    at: renumbered_at(x.at, from, to), literals: x.literals }
-
-fn renumbered_effect(x: EffectRow, from: Int, to: Int) -> EffectRow =
-  { name: x.name, module: x.module, simple_name: x.simple_name, public: x.public, nondet: x.nondet,
-    ops: map(x.ops, |o: OpRow| { name: o.name, mode: o.mode, resource_param: o.resource_param,
-                                 params: o.params, ret: o.ret, scheme: o.scheme,
-                                 at: renumbered_at(o.at, from, to) }),
-    at: renumbered_at(x.at, from, to) }
-
-fn renumbered_ctor(x: CtorRow, from: Int, to: Int) -> CtorRow =
-  { name: x.name, module: x.module, simple_name: x.simple_name, type_name: x.type_name,
-    index: x.index, arity: x.arity, fields: x.fields, scheme: x.scheme,
-    at: renumbered_at(x.at, from, to) }
-
-// The hashes, the ordinals and the bodies name no module, so a renumbering passes over them.
-fn renumbered(d: Dump, from: Int, to: Int) -> Dump =
-  { diags: map(d.diags, |g: Diag| renumbered_diag(g, from, to)),
-    order: d.order,
-    modules: map(d.modules, |m: ModuleRow|
-      { name: m.name, index: if m.index == from { to } else { m.index },
-        items: m.items, imports: m.imports, sets: m.sets }),
-    defs: map(d.defs, |x: DefRow| renumbered_def(x, from, to)),
-    types: map(d.types, |x: TypeRow| renumbered_type(x, from, to)),
-    tests: map(d.tests, |x: TestRow| renumbered_test(x, from, to)),
-    laws: map(d.laws, |x: LawRow| renumbered_law(x, from, to)),
-    effects: map(d.effects, |x: EffectRow| renumbered_effect(x, from, to)),
-    ctors: map(d.ctors, |x: CtorRow| renumbered_ctor(x, from, to)),
-    hashes: d.hashes, ordinals: d.ordinals, bodies: d.bodies, test_bodies: d.test_bodies }
-
-// `from` is the one module a part may span and `to` is where it goes. A span outside every module
-// stays there; one naming any other module is a part that could not be written on its own, which
-// is what `write_front` refuses on the Rust side rather than guessing a source for it.
-fn standing(who: Bytes, d: Dump, from: Int, to: Int) -> Result<Dump, Bytes> = {
-  let elsewhere = filter(modules_named(d), |m: Int| m != from);
-  if len(elsewhere) > 0 {
-    Err(bytes_concat_all([who, b" names module ", num(at(elsewhere, 0)), b", which it does not carry"]))
-  } else { Ok(renumbered(d, from, to)) }
-}
-
-fn part_named(p: Dump) -> Bytes = if len(p.modules) == 1 { at(p.modules, 0).name } else { b"_" }
-
-fn part_module(p: Dump) -> Int = if len(p.modules) == 1 { at(p.modules, 0).index } else { no_module() }
-
-fn part_of_one(p: Dump) -> Bytes = bytes_concat_all([b"the part for `", part_named(p), b"`"])
-
-// The part no module declares carries no span of any module, so it moves nothing.
-fn program_part() -> Bytes = b"the part no module declares"
-
-fn alone(p: Dump) -> Result<Dump, Bytes> = standing(part_of_one(p), p, part_module(p), 0)
-
-fn back_home(i: Int, p: Dump) -> Result<Dump, Bytes> = standing(part_of_one(p), p, 0, i)
-
-fn each_part(ps: List<Dump>, f: (Int, Dump) -> Result<Dump, Bytes>) -> Result<List<Dump>, Bytes> =
-  fold(range(0, len(ps)), Ok([]), |acc: Result<List<Dump>, Bytes>, i: Int|
-    match acc {
-      Err(e) -> Err(e),
-      Ok(xs) -> match f(i, at(ps, i)) { Err(e) -> Err(e), Ok(x) -> Ok(push(xs, x)) },
-    })
-
-// A part loses the whole's numbering and the join takes it back from the part's place, so a module
-// frame's number has to be that place. Empty when every frame is where its number says.
-fn misnumbered(ms: List<ModuleRow>) -> Bytes =
-  fold(range(0, len(ms)), b"", |acc: Bytes, i: Int|
-    if bytes_len(acc) > 0 || at(ms, i).index == i { acc }
-    else {
-      bytes_concat_all([b"module frame ", num(i), b" is numbered ", num(at(ms, i).index),
-                        b"; a module frame is numbered by its place among them"])
-    })
-
-// The part no module declares, then one per module in source order, each spanning its own module as
-// source 0; `Err` when no join could rebuild the whole from them.
-pub fn split(d: Dump) -> Result<Split, Bytes> = {
-  let numbering = misnumbered(d.modules);
-  if has_error(d.diags) { Err(b"an answer with an error does not split") }
-  else if len(d.test_bodies) != len(d.tests) || count_tests(d.hashes) != len(d.tests)
-          || count_laws(d.hashes) != len(d.laws) {
-    Err(b"a table beside the tests or the laws is not parallel to them")
-  } else if bytes_len(numbering) > 0 { Err(numbering) }
-  else {
-    let place = fold(range(0, len(d.modules)), map_new(), |acc: Map<Bytes, Int>, i: Int|
-      map_insert(acc, at(d.modules, i).name, i));
-    let by_index = fold(range(0, len(d.modules)), map_new(), |acc: Map<Int, Int>, i: Int|
-      map_insert(acc, at(d.modules, i).index, i));
-    let ranked = fold(range(0, len(d.order)), Ok(map(d.modules, |m: ModuleRow| 0)),
-      |acc: Result<List<Int>, Bytes>, k: Int|
-        match acc {
-          Err(e) -> Err(e),
-          Ok(rs) ->
-            match map_get(place, at(d.order, k)) {
-              None -> Err(no_frame(at(d.order, k))),
-              Some(i) -> Ok(list_set(rs, i, k + 1)),
-            },
-        });
-    let rank = ranked?;
-    if len(d.order) != len(d.modules) || contains_int(rank, 0) {
-      Err(b"the order does not name every module once")
-    } else {
-      let owner = owners(d, place)?;
-      let seeded: Spread =
-        { parts: map(d.modules, |m: ModuleRow|
-            { diags: [], order: [], modules: [m], defs: [], types: [], tests: [], laws: [], effects: [],
-              ctors: [], hashes: [], ordinals: [], bodies: [], test_bodies: [] }),
-          program: { diags: [], order: d.order, modules: [], defs: [], types: [], tests: [], laws: [],
-                     effects: [], ctors: [], hashes: [], ordinals: [], bodies: [], test_bodies: [] },
-          laid: 0, err: None };
-      let s1: Spread = fold(d.diags, seeded, |s: Spread, g: Diag|
-        match s.err {
-          Some(_) -> s,
-          None ->
-            match diag_part_of(by_index, g) {
-              Err(e) -> failed(s, e),
-              Ok(i) -> into(lay(s, b"diagnostics", i), i, |p: Dump| {..p, diags: push(p.diags, g)}),
-            },
-        });
-      let s2: Spread = fold(d.defs, {..s1, laid: 0}, |s: Spread, x: DefRow|
-        match s.err {
-          Some(_) -> s,
-          None -> lay_into(s, place, x.module, b"definitions", rank, true, |p: Dump| {..p, defs: push(p.defs, x)}),
-        });
-      let s3: Spread = fold(d.types, {..s2, laid: 0}, |s: Spread, x: TypeRow|
-        match s.err {
-          Some(_) -> s,
-          None -> lay_into(s, place, x.module, b"types", rank, false, |p: Dump| {..p, types: push(p.types, x)}),
-        });
-      let t4: Seating = spread_tests(d, place, {..s3, laid: 0});
-      let s4: Spread = t4.s;
-      let t5: Seating = spread_laws(d, place, {..s4, laid: 0});
-      let s5: Spread = t5.s;
-      let s6: Spread = fold(d.effects, {..s5, laid: 0}, |s: Spread, x: EffectRow|
-        match s.err {
-          Some(_) -> s,
-          None ->
-            if x.module == b"" { into_program(lay(s, b"effects", 0), |p: Dump| {..p, effects: push(p.effects, x)}) }
-            else { lay_into(s, place, x.module, b"effects", rank, true, |p: Dump| {..p, effects: push(p.effects, x)}) },
-        });
-      let s7: Spread = fold(d.ctors, {..s6, laid: 0}, |s: Spread, x: CtorRow|
-        match s.err {
-          Some(_) -> s,
-          None ->
-            if x.module == b"" { into_program(lay(s, b"constructors", 0), |p: Dump| {..p, ctors: push(p.ctors, x)}) }
-            else { lay_into(s, place, x.module, b"constructors", rank, true, |p: Dump| {..p, ctors: push(p.ctors, x)}) },
-        });
-      let s8: Spread = fold(d.hashes, {..s7, laid: 0}, |s: Spread, f: HashFrame|
-        match s.err { Some(_) -> s, None -> spread_hash(s, owner, t4.seats, t5.seats, f) });
-      let s9: Spread = fold(d.ordinals, {..s8, laid: 0}, |s: Spread, x: OrdinalRow|
-        match s.err {
-          Some(_) -> s,
-          None -> lay_into(s, place, x.module, b"ordinals", rank, false, |p: Dump| {..p, ordinals: push(p.ordinals, x)}),
-        });
-      let s10: Spread = fold(d.bodies, {..s9, laid: 0}, |s: Spread, x: BodyRow|
-        match s.err {
-          Some(_) -> s,
-          None ->
-            match map_get(owner, x.name) {
-              None -> failed(s, bytes_concat_all([b"`", x.name, b"` is hashed but no module declares it"])),
-              Some(i) -> into(lay(s, b"bodies", i), i, |p: Dump| {..p, bodies: push(p.bodies, x)}),
-            },
-        });
-      match s10.err {
-        Some(e) -> Err(e),
-        None -> {
-          let program = standing(program_part(), s10.program, no_module(), no_module())?;
-          let parts = each_part(s10.parts, |i: Int, p: Dump| alone(p))?;
-          Ok({ program: program, parts: parts })
-        },
-      }
-    }
-  }
-}
-
-// --- The join that undoes it --------------------------------------------------
-
-type Joining = { out: Dump, hashed: Map<Bytes, Bool>, err: Option<Bytes> }
-
-fn hashed_names(hs: List<HashFrame>) -> List<Bytes> =
-  fold(hs, [], |acc: List<Bytes>, f: HashFrame|
-    match f {
-      HDef(r) -> if contains_bytes(acc, r.name) { acc } else { push(acc, r.name) },
-      HTest(r) -> if contains_bytes(acc, r.key) { acc } else { push(acc, r.key) },
-      HLaw(r) -> if contains_bytes(acc, r.key) { acc } else { push(acc, r.key) },
-    })
-
-fn shifted(f: HashFrame, tests: Int, laws: Int) -> HashFrame =
-  match f {
-    HDef(r) -> HDef(r),
-    HTest(r) -> HTest({ index: tests + r.index, key: r.key, hash: r.hash, text: r.text,
-                        deps: r.deps, closure: r.closure }),
-    HLaw(r) -> HLaw({ index: laws + r.index, key: r.key, hash: r.hash, text: r.text,
-                      deps: r.deps, closure: r.closure }),
-  }
-
-fn joined_part(s: Joining, p: Dump) -> Joining =
-  match s.err {
-    Some(_) -> s,
-    None -> {
-      let names = hashed_names(p.hashes);
-      let clash = fold(names, None, |acc: Option<Bytes>, n: Bytes|
-        match acc { Some(_) -> acc, None -> if map_contains(s.hashed, n) { Some(n) } else { None } });
-      match clash {
-        Some(n) -> { out: s.out, hashed: s.hashed,
-                     err: Some(bytes_concat_all([b"`", n, b"` is hashed in two parts"])) },
-        None -> {
-          let out: Dump = s.out;
-          let tests = len(out.tests);
-          let laws = len(out.laws);
-          { out: {..out,
-                  diags: append(out.diags, p.diags),
-                  modules: append(out.modules, p.modules),
-                  types: append(out.types, p.types),
-                  tests: append(out.tests, map(range(0, len(p.tests)), |k: Int| {
-                    let t: TestRow = at(p.tests, k);
-                    { key: t.key, name: t.name, module: t.module, index: tests + k, nondet: t.nondet,
-                      footprint: t.footprint, at: t.at, name_at: t.name_at }
-                  })),
-                  test_bodies: append(out.test_bodies, p.test_bodies),
-                  laws: append(out.laws, map(range(0, len(p.laws)), |k: Int| {
-                    let l: LawRow = at(p.laws, k);
-                    { key: l.key, name: l.name, module: l.module, index: laws + k, binders: l.binders,
-                      has_guard: l.has_guard, host: l.host, footprint: l.footprint, at: l.at,
-                      literals: l.literals }
-                  })),
-                  hashes: append(out.hashes, map(p.hashes, |f: HashFrame| shifted(f, tests, laws))),
-                  ordinals: append(out.ordinals, p.ordinals),
-                  bodies: append(out.bodies, p.bodies)},
-            hashed: fold(names, s.hashed, |m: Map<Bytes, Bool>, n: Bytes| map_insert(m, n, true)),
-            err: None }
-        },
-      }
-    },
-  }
-
-// Undoes `split`; `parts` are in source order, not the program's order, and each comes back from
-// its own source 0 to the place that order gives it.
-pub fn join(program: Dump, parts: List<Dump>) -> Result<Dump, Bytes> = {
-  let placed = fold(range(0, len(parts)), Ok(map_new()), |acc: Result<Map<Bytes, Int>, Bytes>, i: Int|
-    match acc {
-      Err(e) -> Err(e),
-      Ok(m) -> {
-        let p: Dump = at(parts, i);
-        if len(p.modules) != 1 { Err(bytes_concat_all([b"part ", num(i), b" is not one module"])) }
-        else {
-          let name = at(p.modules, 0).name;
-          if map_contains(m, name) { Err(bytes_concat_all([b"two parts are module `", name, b"`"])) }
-          else { Ok(map_insert(m, name, i)) }
-        }
-      },
-    });
-  let place = placed?;
-  let home: Dump = standing(program_part(), program, no_module(), no_module())?;
-  let homed = each_part(parts, back_home)?;
-  let distinct = fold(home.order, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true));
-  if map_len(distinct) != len(homed) || len(home.order) != len(homed) {
-    Err(b"the order does not name every part once")
-  } else {
-    let ordered = fold(home.order, Ok([]), |acc: Result<List<Int>, Bytes>, n: Bytes|
-      match acc {
-        Err(e) -> Err(e),
-        Ok(xs) ->
-          match map_get(place, n) {
-            None -> Err(bytes_concat_all([b"the order names `", n, b"`, which no part is"])),
-            Some(i) -> Ok(push(xs, i)),
-          },
-      });
-    let by_order = ordered?;
-    let first: Dump = fold(by_order,
-      { diags: home.diags, order: home.order, modules: [], defs: [], types: [], tests: [], laws: [],
-        effects: home.effects, ctors: home.ctors, hashes: [], ordinals: [], bodies: [], test_bodies: [] },
-      |acc: Dump, i: Int| {
-        let p: Dump = at(homed, i);
-        {..acc, defs: append(acc.defs, p.defs), effects: append(acc.effects, p.effects),
-                ctors: append(acc.ctors, p.ctors)}
-      });
-    let walked = fold(homed, { out: first, hashed: map_new(), err: None },
-                      |s: Joining, p: Dump| joined_part(s, p));
-    match walked.err { Some(e) -> Err(e), None -> Ok(walked.out) }
-  }
-}
-
 // --- Tests ------------------------------------------------------------------
 
 fn program() -> List<Source> =
@@ -2302,66 +1869,6 @@ test "an answer that is an error reads back as the diagnostics it is" {
   assert_eq(read_front(dumped(bad)), Ok(dump_of(analyse(parse_all(bad)))))
 }
 
-test "a split into parts joins back into the answer it came from" {
-  let whole: Dump = dump_of(analyse(parse_all(claimed())));
-  match split(whole) {
-    Err(e) -> panic(string_of_bytes(e)),
-    Ok(s) -> {
-      assert_eq(len(s.parts), 2);
-      assert_eq(len(at(s.parts, 0).modules), 1);
-      // The second module is source 1 in the whole and source 0 in its own part.
-      assert_eq(at(whole.defs, 1).at.module, 1);
-      assert_eq(at(at(s.parts, 1).modules, 0).index, 0);
-      assert_eq(at(at(s.parts, 1).defs, 0).at.module, 0);
-      // A prelude item was outside every module and stays there.
-      assert_eq(at(s.program.effects, 0).at.module, no_module());
-      assert_eq(join(s.program, s.parts), Ok(whole))
-    },
-  }
-}
-
-test "a part is written and read like any other answer" {
-  let whole: Dump = dump_of(analyse(parse_all(claimed())));
-  match split(whole) {
-    Err(e) -> panic(string_of_bytes(e)),
-    Ok(s) -> {
-      let parts = map(s.parts, |p: Dump| match read_front(dump_text(p)) { Ok(x) -> x, Err(e) -> panic(string_of_bytes(e)) });
-      let program: Dump = match read_front(dump_text(s.program)) { Ok(x) -> x, Err(e) -> panic(string_of_bytes(e)) };
-      assert_eq(join(program, parts), Ok(whole))
-    },
-  }
-}
-
-// A program part whose order names a module no part is, and one that leaves a part unnamed.
-fn ordering(program: Dump, order: List<Bytes>) -> Dump =
-  { diags: program.diags, order: order, modules: [], defs: [], types: [], tests: [], laws: [],
-    effects: program.effects, ctors: program.ctors, hashes: [], ordinals: [], bodies: [],
-    test_bodies: [] }
-
-test "a part the program part does not name, and a name no part is, are both refused" {
-  let whole: Dump = dump_of(analyse(parse_all(claimed())));
-  match split(whole) {
-    Err(e) -> panic(string_of_bytes(e)),
-    Ok(s) -> {
-      assert_eq(join(ordering(s.program, [b"base", b"other"]), s.parts),
-                Err(b"the order names `other`, which no part is"));
-      assert_eq(join(ordering(s.program, [b"base"]), s.parts),
-                Err(b"the order does not name every part once"))
-    },
-  }
-}
-
-test "two parts that are the same module are refused rather than joined twice" {
-  let whole: Dump = dump_of(analyse(parse_all(claimed())));
-  match split(whole) {
-    Err(e) -> panic(string_of_bytes(e)),
-    Ok(s) -> {
-      let twice = match join(s.program, [at(s.parts, 0), at(s.parts, 0)]) { Err(e) -> e, Ok(_) -> b"" };
-      assert(mentions(twice, b"two parts are module `base`"))
-    },
-  }
-}
-
 test "bytes after the last frame are refused rather than passed over" {
   assert(bytes_starts_with(refusal(bytes_concat(dumped(program()), b"and then some")),
                            b"frame header at byte "))
@@ -2405,65 +1912,131 @@ test "a table after an error diagnostic is refused" {
             b"the dump continues past an error diagnostic, where the front end has no answer")
 }
 
-// Two modules, a type in each and one more outside every module, which is the smallest answer a
-// split has anything to move.
-fn two_modules() -> Dump =
-  { diags: [], order: [b"a", b"b"],
-    modules: [{ name: b"a", index: 0, items: [b"a.T"], imports: [], sets: [] },
-              { name: b"b", index: 1, items: [b"b.U", b"b.V"], imports: [b"a"], sets: [] }],
-    defs: [],
-    types: [{ name: b"a.T", module: b"a", simple_name: b"T", public: true, arity: 0,
-              at: { module: 0, start: 5, end: 6 } },
-            { name: b"b.U", module: b"b", simple_name: b"U", public: true, arity: 0,
-              at: { module: 1, start: 7, end: 8 } },
-            { name: b"b.V", module: b"b", simple_name: b"V", public: true, arity: 0,
-              at: { module: no_module(), start: 0, end: 0 } }],
-    tests: [], laws: [], effects: [], ctors: [], hashes: [], ordinals: [], bodies: [],
-    test_bodies: [] }
+type Rows = { defs: List<KnownDefRow>, tests: List<KnownTestRow> }
 
-test "a part carries its own module as source 0, and the join puts it back" {
-  let whole: Dump = two_modules();
-  match split(whole) {
-    Err(e) -> panic(string_of_bytes(e)),
-    Ok(s) -> {
-      let second: Dump = at(s.parts, 1);
-      assert_eq(at(second.modules, 0).index, 0);
-      assert_eq(at(second.types, 0).at.module, 0);
-      // A span outside every module was never in one, so a part leaves it there.
-      assert_eq(at(second.types, 1).at.module, no_module());
-      assert_eq(at(at(s.parts, 0).types, 0).at.module, 0);
-      assert_eq(join(s.program, s.parts), Ok(whole))
+// Each effect a row names, under the hash its declaration has: what the driver files beside a row.
+fn row_witness(decls: Map<Bytes, Bytes>, atoms: List<Atom>) -> List<Witness> =
+  map_fold(fold(atoms, map_new(), |acc: Map<Bytes, Bytes>, a: Atom|
+             match map_get(decls, a.effect) { Some(h) -> map_insert(acc, a.effect, h), None -> acc }),
+           [], |acc: List<Witness>, name: Bytes, hash: Bytes| push(acc, { name: name, hash: hash }))
+
+// What the driver files after a run, built the way it builds it: each published row under the hash
+// the definition or test had, and the declarations the row's atoms name.
+fn rows_of(sources: List<Source>) -> Rows =
+  match analyse(parse_all(sources)) {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) -> {
+      let hashed = by_name_one(w.hashes.defs);
+      let decls = by_name_one(w.hashes.decls);
+      { defs: map(w.checked.defs, |d: DefInfo|
+          { name: d.name, hash: match map_get(hashed, d.name) { Some(x) -> x, None -> b"" },
+            witness: row_witness(decls, append(d.footprint, d.performed)),
+            footprint: atoms_text(d.footprint, b","), performed: atoms_text(d.performed, b",") }),
+        tests: map(range(0, len(w.checked.tests)), |i: Int| {
+          let t: TestInfo = at(w.checked.tests, i);
+          { key: t.key, hash: at(w.hashes.tests, i), witness: row_witness(decls, t.footprint),
+            footprint: atoms_text(t.footprint, b",") }
+        }) }
     },
   }
+
+fn effectful() -> List<Source> =
+  [{ name: b"base", src: b"pub effect log { write emit(Bytes) -> Unit }\npub fn say(b: Bytes) -> Unit / { log.write } = log.emit(b)" },
+   { name: b"app", src: b"import base\nfn twice(b: Bytes) -> Unit = base::say(b)\ntest \"says\" { twice(b\"x\") }" }]
+
+test "a definition whose hash has not moved is published from its rows, not from its body" {
+  let rows = rows_of(effectful());
+  assert(len(rows.defs) > 0);
+  assert(len(rows.tests) > 0);
+  assert_eq(dump_of(analyse_with(parse_all(effectful()), rows.defs, rows.tests)),
+            dump_of(analyse(parse_all(effectful()))))
 }
 
-test "a part that names a module it does not carry is refused" {
-  let whole: Dump = two_modules();
-  let crossed: Dump = {..whole, types: [{ name: b"a.T", module: b"a", simple_name: b"T",
-                                          public: true, arity: 0,
-                                          at: { module: 1, start: 5, end: 6 } }]};
-  assert_eq(split(crossed), Err(b"the part for `a` names module 1, which it does not carry"))
+test "rows filed under a hash this program no longer has are walked instead" {
+  let rows = rows_of(effectful());
+  let stale = map(rows.defs, |r: KnownDefRow| {..r, hash: b"moved", footprint: b"nowhere.read", performed: b"nowhere.read"});
+  assert_eq(dump_of(analyse_with(parse_all(effectful()), stale, [])),
+            dump_of(analyse(parse_all(effectful()))))
 }
 
-test "a part still numbered as the whole numbered it does not join" {
-  let whole: Dump = two_modules();
-  match split(whole) {
-    Err(e) -> panic(string_of_bytes(e)),
-    Ok(s) -> {
-      let second: Dump = at(s.parts, 1);
-      let stale: Dump = {..second, modules: [{ name: b"b", index: 1, items: [b"b.U", b"b.V"],
-                                               imports: [b"a"], sets: [] }]};
-      assert_eq(join(s.program, [at(s.parts, 0), stale]),
-                Err(b"the part for `b` names module 1, which it does not carry"))
+// The same program with the effect under another name. An effect is nominal, so `say` and `twice`
+// hash differently here and their filed rows — which name the old effect — are not rows about this.
+fn renamed() -> List<Source> =
+  [{ name: b"base", src: b"pub effect trace { write emit(Bytes) -> Unit }\npub fn say(b: Bytes) -> Unit / { trace.write } = trace.emit(b)" },
+   { name: b"app", src: b"import base\nfn twice(b: Bytes) -> Unit = base::say(b)\ntest \"says\" { twice(b\"x\") }" }]
+
+fn test_footprint_of(a: Analysis, key: Bytes) -> Bytes =
+  match a {
+    Refused(_) -> b"<refused>",
+    Analysed(w) -> fold(w.checked.tests, b"", |acc: Bytes, t: TestInfo| if t.key == key { atoms_text(t.footprint, b",") } else { acc }),
+  }
+
+test "a row filed before an effect was renamed is not a row about this program" {
+  let rows = rows_of(effectful());
+  assert(fold(rows.defs, false, |acc: Bool, r: KnownDefRow| acc || len(r.witness) > 0));
+  assert(fold(rows.tests, false, |acc: Bool, r: KnownTestRow| acc || len(r.witness) > 0));
+  let seeded = analyse_with(parse_all(renamed()), rows.defs, rows.tests);
+  // A test's row names its effects as a definition's does, and goes stale with them.
+  assert_eq(test_footprint_of(seeded, b"app.says"), b"base.trace.write");
+  assert_eq(dump_of(seeded), dump_of(analyse(parse_all(renamed()))))
+}
+
+fn held(m: Map<Bytes, Bytes>, name: Bytes) -> Bytes =
+  match map_get(m, name) { Some(h) -> h, None -> b"" }
+
+fn footprint_of(a: Analysis, name: Bytes) -> Bytes =
+  match a {
+    Refused(_) -> b"<refused>",
+    Analysed(w) -> fold(w.checked.defs, b"", |acc: Bytes, d: DefInfo| if d.name == name { atoms_text(d.footprint, b",") } else { acc }),
+  }
+
+// `say` writes its row and `quiet` leaves its inferred, so one row handed in can unify and the
+// other cannot, in one program and one run.
+fn two_effects() -> List<Source> =
+  [{ name: b"m", src: b"pub effect log { write put() -> Unit }\npub effect other { write put() -> Unit }\npub fn say() -> Unit / {log.write} = log.put()\npub fn quiet(x: Int) -> Int = x" }]
+
+// Both rows are hashed and witnessed as the driver files them, and both name the wrong effect.
+fn wrong_rows(sources: List<Source>) -> List<KnownDefRow> =
+  match analyse(parse_all(sources)) {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) -> {
+      let defs = by_name_one(w.hashes.defs);
+      let witness = [{ name: b"m.other", hash: held(by_name_one(w.hashes.decls), b"m.other") }];
+      map([b"m.say", b"m.quiet"], |n: Bytes|
+        { name: n, hash: held(defs, n), witness: witness,
+          footprint: b"m.other.write", performed: b"m.other.write" })
     },
   }
+
+test "a row that will not unify walks the body rather than reporting" {
+  let sources = two_effects();
+  let seeded = analyse_with(parse_all(sources), wrong_rows(sources), []);
+  // The guards passed both rows: `quiet` leaves its row inferred, so the one handed in is taken.
+  assert_eq(footprint_of(seeded, b"m.quiet"), b"m.other.write");
+  // `say` writes `{log.write}`, which the handed row contradicts. Walking it is the whole answer.
+  assert_eq(footprint_of(seeded, b"m.say"), b"m.log.write");
+  assert_eq(footprint_of(seeded, b"m.say"), footprint_of(analyse(parse_all(sources)), b"m.say"))
 }
 
-test "a module frame numbered out of its place is refused" {
-  let whole: Dump = two_modules();
-  let shuffled: Dump = {..whole,
-    modules: [{ name: b"a", index: 1, items: [], imports: [], sets: [] },
-              { name: b"b", index: 0, items: [], imports: [], sets: [] }]};
-  assert_eq(split(shuffled),
-            Err(b"module frame 0 is numbered 1; a module frame is numbered by its place among them"))
+// Hashed without being checked, so a program that no longer compiles still has hashes to compare.
+fn hash_of(sources: List<Source>, name: Bytes) -> Bytes =
+  match resolve_modules(map(parse_all(sources), |p: Parsed| p.module)) {
+    Failed(_) -> b"",
+    Resolved_(x) ->
+      match map_get(by_name_one(hash_index(build_index(x.mods, x.r).index).defs), name) {
+        Some(h) -> h,
+        None -> b"",
+      },
+  }
+
+test "a qualified name that is not exported moves the hash of everything that names it" {
+  let caller = b"import a\npub fn two() -> Int = a::one()";
+  let exported = [{ name: b"a", src: b"pub fn one() -> Int = 1" }, { name: b"b", src: caller }];
+  let shut = [{ name: b"a", src: b"fn one() -> Int = 1" }, { name: b"b", src: caller }];
+  assert(hash_of(exported, b"b.two") != b"");
+  // `b.two` no longer compiles, so its hash must not say it still means what it meant while it did.
+  assert(hash_of(shut, b"b.two") != hash_of(exported, b"b.two"));
+  // `a.one` itself is untouched: `pub` is metadata its own encoding erases.
+  assert_eq(hash_of(shut, b"a.one"), hash_of(exported, b"a.one"))
 }
+
