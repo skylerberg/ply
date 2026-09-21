@@ -122,35 +122,18 @@ fn a_region_in_a_law_body_reports_its_escape() {
 
 /// [`Arena::close`] never reads the region's kind.
 #[test]
-fn what_a_close_reclaims_is_decided_by_the_pin_and_never_by_the_kind() {
+fn what_a_close_reclaims_is_decided_by_the_extent_and_never_by_the_kind() {
     for kind in [RegionKind::Unique, RegionKind::Shared] {
-        for hold in [false, true] {
-            let mut arena = Arena::new();
-            let region = arena.open(kind, Span::DUMMY);
-            let cell = arena.alloc(Value::Int(1)).expect("the region is open");
-            let pin = arena.pin().expect("a region is open");
-            if !hold {
-                drop(pin);
-            }
+        let mut arena = Arena::new();
+        let region = arena.open(kind, Span::DUMMY);
+        let cell = arena.alloc(Value::Int(1)).expect("the region is open");
 
-            let reclaimed = arena.close(region);
-
-            if hold {
-                assert_eq!(
-                    reclaimed,
-                    Reclaim::Retained(1),
-                    "{kind}: a live continuation's claim was ignored because of the kind"
-                );
-                assert_eq!(arena.get(cell), Some(&Value::Int(1)));
-            } else {
-                assert_eq!(
-                    reclaimed,
-                    Reclaim::Freed(1),
-                    "{kind}: nothing can reach these slots and they were kept anyway"
-                );
-                assert_eq!(arena.get(cell), None);
-            }
-        }
+        assert_eq!(
+            arena.close(region),
+            Reclaim::Freed(1),
+            "{kind}: nothing can reach these slots and they were kept anyway"
+        );
+        assert_eq!(arena.get(cell), None, "{kind}");
     }
 }
 

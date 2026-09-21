@@ -143,7 +143,7 @@ fn run_with(program: &Program, seed: Seed, budget: u32) -> Result<Run, Diagnosti
                         }
                         Act::Yield => sched.suspend(suspended(), Value::Unit)?,
                         Act::Spawn(index) => {
-                            let id = sched.spawn(Value::Int(index as i64), Span::DUMMY, None);
+                            let id = sched.spawn(Value::Int(index as i64), Span::DUMMY);
                             while script.len() <= id.0 as usize {
                                 script.push(0);
                                 pc.push(0);
@@ -560,8 +560,6 @@ fn joining_a_task_this_region_never_created_is_a_scope_error() {
         .expect_err("no such task");
     assert_eq!(err.code, codes::TASK_ESCAPES_SCOPE);
     assert!(err.message.contains("@7"));
-    assert!(!sched.holds(TaskId(7)));
-    assert!(sched.holds(ROOT));
 }
 
 #[test]
@@ -860,8 +858,8 @@ fn the_production_scheduler_starves_nobody() {
         panic!("expected the root's step");
     };
     assert_eq!(task, ROOT);
-    sched.spawn(Value::Unit, Span::DUMMY, None);
-    sched.spawn(Value::Unit, Span::DUMMY, None);
+    sched.spawn(Value::Unit, Span::DUMMY);
+    sched.spawn(Value::Unit, Span::DUMMY);
     sched.suspend(suspended(), Value::Unit).expect("running");
 
     let mut order = Vec::new();
@@ -882,7 +880,7 @@ fn a_lazily_opened_region_roots_on_the_control_that_opened_it() {
     assert_eq!(sched.current(), Some(ROOT));
 
     // Answered through the same path every later perform takes, so `spawn` means one thing.
-    let child = sched.spawn(Value::Unit, Span::DUMMY, None);
+    let child = sched.spawn(Value::Unit, Span::DUMMY);
     sched
         .suspend(suspended(), Value::Task(child))
         .expect("the root is running");
@@ -952,7 +950,7 @@ impl HostRuntime for Stopping {
 
 /// Two tasks each waiting on the other, with no host wait and no virtual clock.
 fn deadlock(sched: &mut Sched) {
-    let other = sched.spawn(Value::Unit, Span::DUMMY, None);
+    let other = sched.spawn(Value::Unit, Span::DUMMY);
     sched
         .join(suspended(), other, Span::DUMMY)
         .expect("the root is running");

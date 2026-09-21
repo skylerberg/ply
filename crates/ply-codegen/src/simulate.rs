@@ -277,7 +277,7 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
     let k = sim.tasks[at].sp;
     let applied = match request {
         Request::Spawn(closure, from) => {
-            let id = sim.sched.spawn(closure, site, None);
+            let id = sim.sched.spawn(closure, site);
             sim.tasks.push(TaskStack {
                 inherits: Some(from),
                 ..TaskStack::default()
