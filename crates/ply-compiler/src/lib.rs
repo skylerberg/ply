@@ -1,5 +1,8 @@
 //! The compiler written in Ply, embedded as source text so a `ply` binary carries its own compiler.
 
+/// BLAKE3, the compiler's own, so its program pulls in no standard library.
+pub const BLAKE3: &str = include_str!("../ply/blake3.ply");
+
 pub const LEXER: &str = include_str!("../ply/lexer.ply");
 
 pub const SPINE: &str = include_str!("../ply/spine.ply");
@@ -41,6 +44,7 @@ pub const FMT: &str = include_str!("../ply/fmt.ply");
 
 /// The order is part of the identity: the producer digests these texts in this order.
 pub const MODULES: &[(&str, &str)] = &[
+    ("blake3", BLAKE3),
     ("code", CODE),
     ("costs", COSTS),
     ("derive", DERIVE),

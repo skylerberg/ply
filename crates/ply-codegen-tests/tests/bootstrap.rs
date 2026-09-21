@@ -6,10 +6,11 @@ use ply_codegen::c::producer::{self, PlyProducer};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// The emitter's program: exactly what `producer::modules_of` hands the front end, in
+/// `ply_compiler::MODULES`' order, so the identity written into the bundle is the one the producer
+/// computes reading it back. Nothing else belongs here: the standard library is not the compiler's.
 fn emitter_source() -> (&'static Source, String) {
-    // In `ply_compiler::MODULES`' order, so the identity written into the bundle is the one the producer computes reading it back.
-    let modules: Vec<(String, String)> = ply_std::sources()
-        .chain(ply_compiler::sources())
+    let modules: Vec<(String, String)> = ply_compiler::sources()
         .map(|(m, t)| (m.to_string(), t.to_string()))
         .collect();
     let identity = producer::digest_of(&modules);
@@ -26,7 +27,7 @@ fn emitter_source() -> (&'static Source, String) {
         .collect();
     assert!(
         unused.is_empty(),
-        "the compiler or the standard library carries definitions nothing reaches; delete them:\n  {}",
+        "the compiler carries definitions nothing reaches; delete them:\n  {}",
         unused.join("\n  ")
     );
     let front: &'static ply_ty::Front = Box::leak(Box::new(front));

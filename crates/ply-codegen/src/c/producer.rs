@@ -85,15 +85,12 @@ fn emitter_of(identity: &str) -> String {
     h.finalize().to_hex().to_string()
 }
 
-/// The standard library, then the emitter's modules; a directory is sorted like the embedded list.
+/// The emitter's own modules, and nothing else; a directory is sorted like the embedded list.
 fn modules_of(src: &Sources) -> Vec<(String, String)> {
-    let mut modules: Vec<(String, String)> = ply_std::sources()
-        .map(|(m, t)| (m.to_string(), t.to_string()))
-        .collect();
     match src {
-        Sources::Embedded => {
-            modules.extend(ply_compiler::sources().map(|(m, t)| (m.to_string(), t.to_string())))
-        }
+        Sources::Embedded => ply_compiler::sources()
+            .map(|(m, t)| (m.to_string(), t.to_string()))
+            .collect(),
         Sources::Directory(dir) => {
             let mut found: Vec<(String, String)> = Vec::new();
             if let Ok(entries) = std::fs::read_dir(dir) {
@@ -113,10 +110,9 @@ fn modules_of(src: &Sources) -> Vec<(String, String)> {
                 }
             }
             found.sort();
-            modules.extend(found);
+            found
         }
     }
-    modules
 }
 
 /// The emitter for `src`: the committed bundle when it was emitted from these very sources, else

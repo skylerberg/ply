@@ -1033,3 +1033,101 @@ fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
         assert_eq!(got, Value::Bool(want), "`{name}{args:?}`");
     }
 }
+
+/// The standard library as a program of its own, and the definitions nothing in it reaches. The
+/// emitter's program is the compiler's modules alone, so this is where the standard library is
+/// checked, and by the compiler these sources build rather than the one the bundle carries.
+fn standard_library() -> (&'static Source, Vec<String>) {
+    let modules: Vec<(String, String)> = ply_std::sources()
+        .map(|(name, text)| (name.to_string(), text.to_string()))
+        .collect();
+    let ids: Vec<SourceId> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
+    let front = producer::checked_front(&modules, &ids).expect("the standard library checks");
+    let unused: Vec<String> = front
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == ply_span::codes::UNUSED_DEFINITION)
+        .map(|d| d.message.clone())
+        .collect();
+    let front: &'static ply_ty::Front = Box::leak(Box::new(front));
+    let source: &'static Source = Box::leak(Box::new(
+        Source::from_front(front, ply_codegen::emit_keys(front))
+            .with_texts(modules.into_iter().collect()),
+    ));
+    (source, unused)
+}
+
+#[test]
+fn the_standard_library_carries_no_definition_nothing_reaches() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
+    let (_, unused) = standard_library();
+    assert!(
+        unused.is_empty(),
+        "the standard library carries definitions nothing reaches; delete them:\n  {}",
+        unused.join("\n  ")
+    );
+}
+
+#[test]
+fn the_emitter_refuses_no_body_or_test_of_the_standard_library() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
+    let (source, _) = standard_library();
+    let names: Vec<String> = source.functions();
+    assert!(!names.is_empty(), "the standard library offered no root");
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let produced = ply_codegen::c::produce(source, &refs).expect("the standard library emits");
+    assert!(
+        produced.refused.is_empty(),
+        "the emitter refuses part of the standard library: {:?}",
+        produced.refused
+    );
+}
+
+/// The compiler carries its own BLAKE3 so its program is its modules alone; the two copies are
+/// only safe while they answer alike, on the published vectors and either side of every boundary
+/// a transcription goes wrong at: a block, a chunk, and the tree a second chunk opens.
+#[test]
+fn the_compilers_blake3_and_the_standard_librarys_answer_alike() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    let _held = producer::hand_over(emitter().expect("the emitter builds"), emitter_identity());
+    let loaded = load(&[("std.hash", ply_std::HASH)]);
+    let source: &'static Source = Box::leak(Box::new(
+        Source::from_front(loaded.front, HashMap::new()).with_texts(loaded.texts.clone()),
+    ));
+    let names: Vec<String> = source.functions();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the module builds");
+    assert!(refused.is_empty(), "{refused:?}");
+    let entry = native
+        .entry("std.hash.blake3")
+        .expect("`std.hash.blake3` was not compiled");
+    let shipped = |input: &[u8]| -> Value {
+        let mut ctx = native.context();
+        ctx.begin(i64::MAX / 2);
+        let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
+        let words: [i64; 1] = [ctx.heap.to_word(unsafe { &*layouts }, &Value::bytes(input))];
+        let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        assert_eq!(ctx.failed, 0, "`std.hash.blake3` raised in the C tier");
+        let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
+        ctx.end();
+        got
+    };
+    // `b""` and `b"\x00"` are the first two published vectors; the rest bracket 64 and 1024.
+    for length in [0usize, 1, 2, 63, 64, 65, 127, 1023, 1024, 1025, 2048, 2049] {
+        let input: Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
+        let ours = producer::call("blake3.blake3", &[Value::bytes(&input)])
+            .expect("the compiler's `blake3` answers");
+        assert_eq!(
+            ours,
+            shipped(&input),
+            "the compiler's `blake3` and `std.hash.blake3` disagree over {length} bytes"
+        );
+        assert_eq!(
+            ours,
+            Value::bytes(blake3::hash(&input).as_bytes()),
+            "the compiler's `blake3` is not BLAKE3 over {length} bytes"
+        );
+    }
+}
