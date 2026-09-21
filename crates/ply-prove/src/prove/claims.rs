@@ -313,6 +313,11 @@ impl<'a> Dump<'a, '_> {
         self.expect(b'(')?;
         let out = match head {
             "lit" => Code::Lit(self.lit(b")")?),
+            // A label argument is the field-table entry of a resource: opaque here, like a perform.
+            "label" => {
+                self.word(b")")?;
+                Code::Region
+            }
             "var" => {
                 let name = self.word(b",")?;
                 self.expect(b',')?;

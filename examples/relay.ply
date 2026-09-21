@@ -1,0 +1,90 @@
+// One forwarder against two resources: `relay` is generic over the resource label it writes under,
+// so the client socket and the upstream socket share a definition rather than a copy each.
+
+import std.net (net)
+
+fn deadline_ms() -> Int = 5000
+
+// The most `net.send` calls one `relay` makes, so a peer that takes a byte at a time is bounded
+// here rather than by the entry's time budget.
+fn max_writes() -> Int = 4096
+
+// Every byte of `payload`, under whichever resource the caller fills `[l]` with. `false` is a peer
+// that stopped taking bytes, or one that took them too slowly to finish inside `max_writes`.
+pub fn relay<[l]>(socket: Int, payload: Bytes) -> Bool / {net.send[l]} =
+  relay_from[l](socket, payload, 0, max_writes())
+
+// The recursive call needs no brackets: it fills the labels this definition was called with.
+fn relay_from<[l]>(socket: Int, payload: Bytes, at: Int, left: Int) -> Bool / {net.send[l]} =
+  if at >= bytes_len(payload) {
+    true
+  } else if left <= 0 {
+    false
+  } else {
+    match net.send[l](socket, bytes_slice(payload, at, bytes_len(payload)), deadline_ms()) {
+      None -> false,
+      Some(n) -> if n <= 0 { false } else { relay_from(socket, payload, at + n, left - 1) },
+    }
+  }
+
+// The request goes upstream and the answer goes back to the client, each written by the same
+// forwarder under the label of the socket it is written to. The row names both resources, so which
+// bytes reach which peer is in the type rather than in the body.
+pub fn exchange(client: Int, server: Int, request: Bytes, answer: Bytes) -> Bool
+  / {net.send[upstream], net.send[conn]} = {
+  let asked = relay[upstream](server, request);
+  let told = relay[conn](client, answer);
+  asked && told
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_request() -> Bytes = b"GET /price HTTP/1.1\r\nHost: upstream\r\n\r\n"
+
+fn an_answer() -> Bytes = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n42"
+
+test "one forwarder writes under two labels, and each clause sees only its own" {
+  with_cell[client]([]) { client -> {
+  with_cell[server]([]) { server -> {
+    handle {
+      assert(exchange(3, 4, a_request(), an_answer()))
+    } with {
+      net.send[upstream](c, payload, timeout_ms) -> {
+        cell_set(server, push(cell_get(server), payload));
+        Some(bytes_len(payload))
+      },
+      net.send[conn](c, payload, timeout_ms) -> {
+        cell_set(client, push(cell_get(client), payload));
+        Some(bytes_len(payload))
+      },
+    };
+    assert_eq(cell_get(server), [a_request()]);
+    assert_eq(cell_get(client), [an_answer()])
+  } }
+  } }
+}
+
+// `send` may write fewer bytes than it is given, and looping over that is what the two labels
+// share: a socket bound to one label would have needed this written twice.
+test "a partial write is retried under the label the call filled" {
+  with_cell[written]([]) { written -> {
+    handle {
+      assert(relay[upstream](4, a_request()))
+    } with {
+      net.send[upstream](c, payload, timeout_ms) -> {
+        cell_set(written, push(cell_get(written), bytes_slice(payload, 0, 1)));
+        Some(1)
+      },
+    };
+    assert_eq(len(cell_get(written)), bytes_len(a_request()));
+    assert_eq(list_at(cell_get(written), 0), Some(b"G"))
+  } }
+}
+
+test "a peer that takes nothing ends the forward rather than looping" {
+  handle {
+    assert(!relay[conn](7, a_request()))
+  } with {
+    net.send[conn](c, payload, timeout_ms) -> Some(0),
+  }
+}

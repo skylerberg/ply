@@ -18,6 +18,7 @@ mod variant {
     pub(super) fn resource(r: &Resource) -> &'static str {
         match r {
             Resource::Named(_) => "Resource::Named",
+            Resource::Var(_) => "Resource::Var",
             Resource::Singleton => "Resource::Singleton",
         }
     }
@@ -131,7 +132,7 @@ fn mentioned() -> Vec<&'static str> {
 }
 
 /// The digest of the shapes this build stores.
-const PINNED: &str = "fe9b416c61f06ed380b2708544e748dd1710046236eb8798306a89ee170e3bf5";
+const PINNED: &str = "ac43a0815cde75f9e60b0457b72e7af4f6d6132d7dfd70c7e23b89742c1e1ddc";
 
 #[test]
 fn the_stored_schema_is_pinned() {

@@ -1,6 +1,6 @@
 //! Canonical form for a stored interface.
 
-use ply_ty::{Row, RowVar, Scheme, TyVar, Type};
+use ply_ty::{EffectAtom, LabelVar, Resource, Row, RowVar, Scheme, TyVar, Type};
 use std::collections::HashMap;
 
 use crate::frontend::{CachedCtor, CachedOp, DeclBody};
@@ -18,6 +18,7 @@ pub fn canonicalize_decl_body(body: &DeclBody) -> DeclBody {
 struct Renumber {
     tys: HashMap<TyVar, TyVar>,
     rows: HashMap<RowVar, RowVar>,
+    labels: HashMap<LabelVar, LabelVar>,
 }
 
 impl Renumber {
@@ -29,6 +30,11 @@ impl Renumber {
     fn row_var(&mut self, v: RowVar) -> RowVar {
         let next = RowVar(self.rows.len() as u32);
         *self.rows.entry(v).or_insert(next)
+    }
+
+    fn label_var(&mut self, v: LabelVar) -> LabelVar {
+        let next = LabelVar(self.labels.len() as u32);
+        *self.labels.entry(v).or_insert(next)
     }
 
     fn ty(&mut self, ty: &Type) -> Type {
@@ -62,13 +68,28 @@ impl Renumber {
 
     fn row(&mut self, row: &Row) -> Row {
         Row {
-            atoms: row.atoms.clone(),
+            atoms: row.atoms.iter().map(|a| self.atom(a)).collect(),
             tail: row.tail.map(|t| self.row_var(t)),
         }
     }
 
+    fn atom(&mut self, atom: &EffectAtom) -> EffectAtom {
+        let mut out = atom.clone();
+        if let Resource::Var(v) = atom.resource {
+            out.resource = Resource::Var(self.label_var(v));
+        }
+        out
+    }
+
     fn scheme(&mut self, scheme: &Scheme) -> Scheme {
-        // Body first, so the quantifier list's order cannot change the numbering.
+        // Labels first, in the order a call fills them: an atom sorts by the number its label
+        // holds, so numbering them from the body would let the old numbers decide the new ones.
+        let mut label_vars: Vec<LabelVar> = scheme
+            .label_vars
+            .iter()
+            .map(|v| self.label_var(*v))
+            .collect();
+        // Then the body, so the type and row quantifier lists' order cannot change the numbering.
         let ty = self.ty(&scheme.ty);
         let mut ty_vars: Vec<TyVar> = scheme.ty_vars.iter().map(|v| self.ty_var(*v)).collect();
         let mut row_vars: Vec<RowVar> = scheme.row_vars.iter().map(|v| self.row_var(*v)).collect();
@@ -76,9 +97,12 @@ impl Renumber {
         ty_vars.dedup();
         row_vars.sort_unstable();
         row_vars.dedup();
+        label_vars.sort_unstable();
+        label_vars.dedup();
         Scheme {
             ty_vars,
             row_vars,
+            label_vars,
             ty,
         }
     }

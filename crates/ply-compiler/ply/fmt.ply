@@ -246,6 +246,10 @@ fn mode_text(m: Mode) -> Bytes = match m { MRead -> b"read", MWrite -> b"write",
 fn resource_text(r: Option<Ident>) -> Bytes =
   match r { Some(i) -> bytes_concat_all([b"[", i.name, b"]"]), None -> b"" }
 
+// One bracket holds every label a call fills: `relay[conn](c)`, `f[a, b](x)`.
+fn call_labels(ls: List<Ident>) -> Bytes =
+  if len(ls) == 0 { b"" } else { bytes_concat_all([b"[", join(map(ls, |i: Ident| i.name), b", "), b"]"]) }
+
 fn atom_text(a: AtomExpr) -> Bytes =
   bytes_concat_all([qname_text(a.eff), b".", match a.op { Some(o) -> o.name, None -> mode_text(a.mode) }, resource_text(a.resource)])
 
@@ -319,13 +323,15 @@ fn type_text(p: Pr, t: TypeExpr) -> Bytes =
 fn ty_field_text(p: Pr, f: { name: Ident, ty: TypeExpr }) -> Bytes =
   bytes_concat_all([f.name.name, b": ", type_text(p, f.ty)])
 
+// A label binder is bracketed among the type parameters, one bracket each: `<a, [l], [k] | e>`.
 fn generics_text(g: Generics) -> Bytes =
-  if len(g.types) == 0 && len(g.effects) == 0 { b"" }
+  if len(g.types) == 0 && len(g.effects) == 0 && len(g.labels) == 0 { b"" }
   else {
-    let ts = join(map(g.types, |i: Ident| i.name), b", ");
+    let ts = join(fold(g.labels, map(g.types, |i: Ident| i.name), |acc: List<Bytes>, i: Ident|
+                         push(acc, bytes_concat_all([b"[", i.name, b"]"]))), b", ");
     let es = join(map(g.effects, |i: Ident| i.name), b", ");
     if len(g.effects) == 0 { bytes_concat_all([b"<", ts, b">"]) }
-    else if len(g.types) == 0 { bytes_concat_all([b"<| ", es, b">"]) }
+    else if bytes_len(ts) == 0 { bytes_concat_all([b"<| ", es, b">"]) }
     else { bytes_concat_all([b"<", ts, b" | ", es, b">"]) }
   }
 
@@ -556,7 +562,7 @@ fn flat_expr(p: Pr, e: Expr) -> Option<Bytes> =
     EUnary(v) -> cat([Some(unary_text(v.op)), wrap(flat_expr(p, v.operand), parens_unary(v.operand))]),
     ELambda(v) -> cat([Some(lambda_head(p, v.params, v.ret)), Some(b" "), flat_expr(p, v.body)]),
     EApp(v) ->
-      cat([wrap(flat_expr(p, v.func), parens_callee(v.func)), Some(b"("),
+      cat([wrap(flat_expr(p, v.func), parens_callee(v.func)), Some(call_labels(v.labels)), Some(b"("),
            flat_args(p, v.args, v.named), Some(b")")]),
     EIf(v) ->
       cat([Some(b"if "), flat_scrutinee(p, v.cond), Some(b" "), flat_expr(p, v.then_branch),
@@ -640,8 +646,9 @@ fn broken(p: Pr, st: St, e: Expr, indent: Int, after: Int) -> St =
     EUnary(v) -> operand(p, emit(st, unary_text(v.op)), v.operand, parens_unary(v.operand), indent, after),
     ELambda(v) -> lambda(p, st, v.params, v.ret, v.body, indent, after),
     EApp(v) -> {
-      let s1 = operand(p, st, v.func, parens_callee(v.func), indent, 1);
-      call(p, s1, v.args, v.named, v.span, indent, after)
+      let ls = call_labels(v.labels);
+      let s1 = operand(p, st, v.func, parens_callee(v.func), indent, 1 + bytes_len(ls));
+      call(p, emit(s1, ls), v.args, v.named, v.span, indent, after)
     },
     EIf(_) -> if_chain(p, st, e, indent),
     EMatch(v) -> match_expr(p, st, v.scrutinee, v.arms, v.span, indent),
@@ -1371,6 +1378,25 @@ test "a row naming operations prints them back, and a `let` bound to a `handle` 
   assert(stable(src));
   assert(string_contains(string_of_bytes(formatted(src)), "/ {db.get[users], db.begin, db.write}"));
   assert(string_contains(string_of_bytes(formatted(src)), "{db.begin, db.get[users]}"))
+}
+
+test "a label binder prints bracketed among the type parameters, and a call prints its labels" {
+  let src = bytes_concat_all([b"fn relay<[l]>(c: Int) -> Unit / {net.send[l]} = ()\n",
+    b"fn g<a, [l], [k] | e>(x: a) -> a / e = x\n",
+    b"fn h(c: Int) -> Unit / {net.send[conn]} = relay[conn](c)\n",
+    b"fn k(c: Int) -> Unit = pair[a, b](c)\n"]);
+  assert_eq(formatted(src), src)
+}
+
+test "a `handle`, a `match` or an `if` may stand as a scrutinee" {
+  let held = b"fn f(k: Int) -> Int = match handle { g(k) } with { db.get(n) -> n } { 0 -> 1, n -> n }\n";
+  assert_eq(formatted(held), held);
+  let nested = b"fn f(x: Int) -> Int = if match x { 0 -> true, _ -> false } { 1 } else { 2 }\n";
+  assert_eq(formatted(nested), nested);
+  let broken_up = bytes_concat_all([b"fn f(k: Int) -> Int = match handle { some_call(k) } with ",
+    b"{ db.get[users](n) resume q -> q(n), db.put[users](n) -> n + 1 } { 0 -> 1, n -> n }\n"]);
+  assert(stable(broken_up));
+  assert(string_contains(string_of_bytes(formatted(broken_up)), "match handle {"))
 }
 
 test "every expression kind prints back to the same tree" {

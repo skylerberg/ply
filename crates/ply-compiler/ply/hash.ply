@@ -338,6 +338,7 @@ fn t_p_list() -> Int = 85
 fn t_row() -> Int = 90
 fn t_atom() -> Int = 91
 fn t_atom_op() -> Int = 97
+fn t_label_param() -> Int = 98
 fn t_arm() -> Int = 92
 fn t_clause() -> Int = 93
 fn t_return_clause() -> Int = 94
@@ -361,13 +362,13 @@ fn deriver_byte(d: Deriver) -> Int = deriver_tag(d) + 1
 // `out` is chunks concatenated once at the end; `refs` is first-mention order; the binder lists are de Bruijn levels.
 type Nz = { index: Index, module: Int, hashes: Map<Int, Bytes>, component: Map<Int, Int>, effects: Map<Int, Int>,
             out: List<Bytes>, refs: List<Int>, seen: Map<Int, Bool>, values: List<Bytes>, ty_params: List<Bytes>, row_params: List<Bytes>,
-            by_name: Bool, deferred: Option<List<Int>> }
+            label_params: List<Bytes>, by_name: Bool, deferred: Option<List<Int>> }
 
 type Finished = { bytes: Bytes, refs: List<Int> }
 
 fn new_nz(index: Index, module: Int, hashes: Map<Int, Bytes>, component: Map<Int, Int>, effects: Map<Int, Int>) -> Nz =
   { index: index, module: module, hashes: hashes, component: component, effects: effects, out: [], refs: [], seen: map_new(),
-    values: [], ty_params: [], row_params: [], by_name: false, deferred: None }
+    values: [], ty_params: [], row_params: [], label_params: [], by_name: false, deferred: None }
 
 fn finish(z: Nz) -> Finished = { bytes: bytes_concat_all(z.out), refs: z.refs }
 
@@ -441,16 +442,24 @@ fn effect_ref(z: Nz, q: QName) -> Nz =
 fn ctor_ref(z: Nz, q: QName) -> Nz =
   match ctor_target(z.index, z.module, q) { Some(VCtor(c)) -> ctor_bytes(z, c.owner, c.name), _ -> free_ref(z, qualifier(q), q.name.name) }
 
+// A resource the signature binds is a level, so renaming the binder is not an edit; a real one stays a name.
+fn label_ref(z: Nz, l: Ident) -> Nz =
+  match rposition(z.label_params, l.name) {
+    Some(level) -> u32v(tag(z, t_label_param()), level),
+    None -> strv(tag(z, t_free()), l.name),
+  }
+
 fn opt_type(z: Nz, t: Option<TypeExpr>) -> Nz = match t { None -> tag(z, t_none()), Some(te) -> type_expr(tag(z, t_some()), te) }
 fn opt_row(z: Nz, r: Option<RowExpr>) -> Nz = match r { None -> tag(z, t_none()), Some(row) -> row_expr(tag(z, t_some()), row) }
 fn opt_expr(z: Nz, e: Option<Expr>) -> Nz = match e { None -> tag(z, t_none()), Some(x) -> expr(tag(z, t_some()), x) }
-fn opt_name(z: Nz, i: Option<Ident>) -> Nz = match i { None -> tag(z, t_none()), Some(x) -> strv(tag(z, t_some()), x.name) }
+fn opt_label(z: Nz, i: Option<Ident>) -> Nz = match i { None -> tag(z, t_none()), Some(x) -> label_ref(tag(z, t_some()), x) }
 
 fn push_generics(z: Nz, def: FnDef) -> Nz =
-  {..z, ty_params: append(z.ty_params, map(def.generics.types, |g: Ident| g.name)), row_params: append(z.row_params, map(def.generics.effects, |g: Ident| g.name))}
+  {..z, ty_params: append(z.ty_params, map(def.generics.types, |g: Ident| g.name)), row_params: append(z.row_params, map(def.generics.effects, |g: Ident| g.name)),
+        label_params: append(z.label_params, map(def.generics.labels, |g: Ident| g.name))}
 
 fn fn_def(z: Nz, d: FnDef) -> Nz = {
-  let z1: Nz = push_generics(u32v(u32v(tag(z, t_fn()), len(d.generics.types)), len(d.generics.effects)), d);
+  let z1: Nz = push_generics(u32v(u32v(u32v(tag(z, t_fn()), len(d.generics.types)), len(d.generics.effects)), len(d.generics.labels)), d);
   // Before the parameter names reach `values`: a default is closed.
   let z2: Nz = fold(d.params, u32v(z1, len(d.params)), |acc: Nz, p: Param|
     match p.default { Some(dflt) -> expr(opt_type(tag(acc, t_param_default()), p.ty), dflt), None -> opt_type(acc, p.ty) });
@@ -523,7 +532,7 @@ pub fn law_def(z: Nz, d: LawDef) -> Nz = {
 
 // In its owner's scope: generics, parameters, and `result` for an `ensures`. Parameter defaults are not written.
 pub fn spec_clause(z: Nz, owner: FnDef, clause: SpecClause) -> Nz = {
-  let z1: Nz = push_generics(u32v(u32v(emit(tag(z, t_spec()), byte_of(spec_tag(clause.kind))), len(owner.generics.types)), len(owner.generics.effects)), owner);
+  let z1: Nz = push_generics(u32v(u32v(u32v(emit(tag(z, t_spec()), byte_of(spec_tag(clause.kind))), len(owner.generics.types)), len(owner.generics.effects)), len(owner.generics.labels)), owner);
   let counted: Nz = u32v(z1, len(owner.params));
   let z2: Nz = {..counted, values: append(counted.values, map(owner.params, |p: Param| p.name.name))};
   let z3: Nz = match clause.kind { SEnsures -> {..z2, values: push(z2.values, b"result")}, SRequires -> z2 };
@@ -591,8 +600,8 @@ fn insert_atom(sorted: List<AtomEncoding>, x: AtomEncoding) -> List<AtomEncoding
 
 fn atom(z: Nz, a: AtomExpr) -> Nz =
   match a.op {
-    None -> opt_name(emit(effect_ref(tag(z, t_atom()), a.eff), byte_of(mode_byte(a.mode))), a.resource),
-    Some(op) -> opt_name(strv(effect_ref(tag(z, t_atom_op()), a.eff), op.name), a.resource),
+    None -> opt_label(emit(effect_ref(tag(z, t_atom()), a.eff), byte_of(mode_byte(a.mode))), a.resource),
+    Some(op) -> opt_label(strv(effect_ref(tag(z, t_atom_op()), a.eff), op.name), a.resource),
   }
 
 fn expr(z: Nz, e: Expr) -> Nz =
@@ -608,7 +617,10 @@ fn expr(z: Nz, e: Expr) -> Nz =
       let inner: Nz = expr({..z1, values: append(z1.values, map(l.params, |p: Param| p.name.name))}, l.body);
       {..inner, values: z1.values}
     },
-    EApp(a) -> fold(a.args, u32v(expr(tag(z, t_e_app()), a.func), len(a.args)), |acc: Nz, x: Expr| expr(acc, x)),
+    EApp(a) -> {
+      let called: Nz = fold(a.args, u32v(expr(tag(z, t_e_app()), a.func), len(a.args)), |acc: Nz, x: Expr| expr(acc, x));
+      fold(a.labels, u32v(called, len(a.labels)), label_ref)
+    },
     EIf(i) -> expr(expr(expr(tag(z, t_e_if()), i.cond), i.then_branch), i.else_branch),
     EMatch(m) -> fold(m.arms, u32v(expr(tag(z, t_e_match()), m.scrutinee), len(m.arms)), |acc: Nz, arm: MatchArm| {
       let inner: Nz = expr(opt_expr(pattern(tag(acc, t_arm()), arm.pat), arm.guard), arm.body);
@@ -619,10 +631,10 @@ fn expr(z: Nz, e: Expr) -> Nz =
     ETry(_) -> panic("`e?` is expanded away before hashing"),
     EField(f) -> strv(expr(tag(z, t_e_field()), f.base), f.field.name),
     EList(l) -> fold(l.items, u32v(tag(z, t_e_list()), len(l.items)), |acc: Nz, x: Expr| expr(acc, x)),
-    EPerform(p) -> fold(p.args, u32v(opt_name(strv(effect_ref(tag(z, t_e_perform()), p.eff), p.op.name), p.resource), len(p.args)), |acc: Nz, x: Expr| expr(acc, x)),
+    EPerform(p) -> fold(p.args, u32v(opt_label(strv(effect_ref(tag(z, t_e_perform()), p.eff), p.op.name), p.resource), len(p.args)), |acc: Nz, x: Expr| expr(acc, x)),
     EHandle(h) -> {
       let clauses: Nz = fold(h.clauses, u32v(expr(tag(z, t_e_handle()), h.body), len(h.clauses)), |acc: Nz, c: HandleClause| {
-        let head: Nz = u32v(opt_name(strv(effect_ref(tag(acc, t_clause()), c.eff), c.op.name), c.resource), len(c.params));
+        let head: Nz = u32v(opt_label(strv(effect_ref(tag(acc, t_clause()), c.eff), c.op.name), c.resource), len(c.params));
         let bound: Nz = {..head, values: append(head.values, map(c.params, |p: Ident| p.name))};
         // Whether a clause binds a continuation is part of what the definition is.
         let resumed: Nz = match c.resume {
@@ -1292,7 +1304,7 @@ type Part = { members: List<Bytes>, hashes: List<Bytes>, names: List<Bytes>, mod
 type Slot = { part: Int, class: Int }
 type Layout = { parts: List<Part>, by_hash: Map<Bytes, List<Slot>>, relink: Map<Bytes, Bytes> }
 type Pr = { layout: Layout, part: Int, own: Bytes }
-type Dc = { b: Bytes, pos: Int, values: Int, typs: Int, rows: Int, imports: Map<Bytes, Bytes>, missing: Map<Bytes, Bool>, slots: Map<Bytes, Int> }
+type Dc = { b: Bytes, pos: Int, values: Int, typs: Int, rows: Int, labels: Int, imports: Map<Bytes, Bytes>, missing: Map<Bytes, Bool>, slots: Map<Bytes, Int> }
 type Got = { d: Dc, t: Bytes }
 type Rd = { d: Dc, v: Int }
 type Flag = { d: Dc, v: Bool }
@@ -1300,7 +1312,7 @@ type Opt = { d: Dc, t: Bytes, some: Bool }
 type Many = { d: Dc, ts: List<Bytes> }
 type Rf = { d: Dc, hash: Bytes, class: Int }
 
-fn cursor(b: Bytes, missing: Map<Bytes, Bool>) -> Dc = { b: b, pos: 0, values: 0, typs: 0, rows: 0, imports: map_new(), missing: missing, slots: map_new() }
+fn cursor(b: Bytes, missing: Map<Bytes, Bool>) -> Dc = { b: b, pos: 0, values: 0, typs: 0, rows: 0, labels: 0, imports: map_new(), missing: missing, slots: map_new() }
 
 fn rd_bytes(d: Dc, n: Int) -> Got =
   if d.pos + n > bytes_len(d.b) { panic("a stored body ends inside a value") }
@@ -1351,6 +1363,7 @@ fn bracketed(o: Opt) -> Bytes = if o.some { bytes_concat_all([b"[", o.t, b"]"]) 
 fn lname(level: Int) -> Bytes = bytes_concat(b"_l", num(level))
 fn tname(level: Int) -> Bytes = bytes_concat(b"_t", num(level))
 fn ename(level: Int) -> Bytes = bytes_concat(b"_e", num(level))
+fn rname(level: Int) -> Bytes = bytes_concat(b"_r", num(level))
 
 fn nl(depth: Int) -> Bytes = bytes_concat(b"\n", bytes_concat_all(map(range(0, depth), |i: Int| b"  ")))
 
@@ -1465,18 +1478,27 @@ fn rd_mode(d: Dc) -> Got = {
   if m.v == 0 { { d: m.d, t: b"read" } } else if m.v == 1 { { d: m.d, t: b"write" } } else { panic("a byte that is not an access mode") }
 }
 
+fn rd_label(d: Dc) -> Got = {
+  let k = rd_u8(d);
+  if k.v == t_label_param() {
+    let l = rd_u32(k.d);
+    if l.v >= d.labels { panic("a label parameter that is not in scope") } else { { d: l.d, t: rname(l.v) } }
+  } else if k.v == t_free() { rd_text(k.d) }
+  else { panic("a tag that is not a resource label") }
+}
+
 fn p_row(x: Pr, d: Dc) -> Got = {
   let n = rd_count(expect(d, t_row(), b"an effect row"));
   let atoms = rd_many(n.d, n.v, |e: Dc| {
     if peek(e) == t_atom_op() {
       let eff = rd_effect(x, expect(e, t_atom_op(), b"an operation atom"));
       let op = rd_text(eff.d);
-      let r = rd_opt(op.d, rd_text);
+      let r = rd_opt(op.d, rd_label);
       { d: r.d, t: bytes_concat_all([eff.t, b".", op.t, bracketed(r)]) }
     } else {
       let eff = rd_effect(x, expect(e, t_atom(), b"an effect atom"));
       let m = rd_mode(eff.d);
-      let r = rd_opt(m.d, rd_text);
+      let r = rd_opt(m.d, rd_label);
       { d: r.d, t: bytes_concat_all([eff.t, b".", m.t, bracketed(r)]) }
     }
   });
@@ -1697,7 +1719,10 @@ fn p_expr(x: Pr, d: Dc, depth: Int) -> Got = {
     let f = parens(p_expr(x, e, depth), peek(e) == t_e_var());
     let n = rd_count(f.d);
     let args = rd_many(n.d, n.v, |g: Dc| p_expr(x, g, depth));
-    { d: args.d, t: bytes_concat_all([f.t, b"(", joined(args.ts, b", "), b")"]) }
+    let ln = rd_count(args.d);
+    let ls = rd_many(ln.d, ln.v, rd_label);
+    { d: ls.d, t: bytes_concat_all([f.t, if ln.v == 0 { b"" } else { bytes_concat_all([b"[", joined(ls.ts, b", "), b"]"]) },
+                                    b"(", joined(args.ts, b", "), b")"]) }
   } else if t.v == t_e_if() { p_if(x, e, depth) }
   else if t.v == t_e_match() {
     let s = p_operand(x, e, depth);
@@ -1729,7 +1754,7 @@ fn p_expr(x: Pr, d: Dc, depth: Int) -> Got = {
   } else if t.v == t_e_perform() {
     let eff = rd_effect(x, e);
     let op = rd_text(eff.d);
-    let r = rd_opt(op.d, rd_text);
+    let r = rd_opt(op.d, rd_label);
     let n = rd_count(r.d);
     let args = rd_many(n.d, n.v, |g: Dc| p_expr(x, g, depth));
     { d: args.d, t: bytes_concat_all([eff.t, b".", op.t, bracketed(r), b"(", joined(args.ts, b", "), b")"]) }
@@ -1739,7 +1764,7 @@ fn p_expr(x: Pr, d: Dc, depth: Int) -> Got = {
     let clauses = rd_many(n.d, n.v, |g: Dc| {
       let eff = rd_effect(x, expect(g, t_clause(), b"a handler clause"));
       let op = rd_text(eff.d);
-      let r = rd_opt(op.d, rd_text);
+      let r = rd_opt(op.d, rd_label);
       let k: Rd = rd_binders(r.d);
       let bound = g.values + k.v;
       let resumed: Opt = rd_opt({..k.d, values: bound}, |h: Dc| { d: h, t: bytes_concat(b" resume ", lname(bound)) });
@@ -1800,9 +1825,12 @@ fn p_constraint(d: Dc) -> Got = {
 fn p_fn(x: Pr, d: Dc, name: Bytes) -> Got = {
   let tc = rd_binders(expect(d, t_fn(), b"a function"));
   let ec: Rd = rd_binders(tc.d);
-  let generics = if tc.v == 0 && ec.v == 0 { b"" } else {
-    bytes_concat_all([b"<", joined(map(range(0, tc.v), tname), b", "), if ec.v > 0 { bytes_concat(b" | ", joined(map(range(0, ec.v), ename), b", ")) } else { b"" }, b">"]) };
-  let n = rd_count({..ec.d, typs: tc.v, rows: ec.v});
+  let lc: Rd = rd_binders(ec.d);
+  let generics = if tc.v == 0 && ec.v == 0 && lc.v == 0 { b"" } else {
+    bytes_concat_all([b"<", joined(append(map(range(0, tc.v), tname),
+                                          map(range(0, lc.v), |i: Int| bytes_concat_all([b"[", rname(i), b"]"]))), b", "),
+                      if ec.v > 0 { bytes_concat(b" | ", joined(map(range(0, ec.v), ename), b", ")) } else { b"" }, b">"]) };
+  let n = rd_count({..lc.d, typs: tc.v, rows: ec.v, labels: lc.v});
   let ps = rd_many(n.d, n.v, |g: Dc| p_param_slot(x, g));
   let ret = rd_opt(ps.d, |g: Dc| p_ret(x, g));
   let row = rd_opt(ret.d, |g: Dc| p_row(x, g));
@@ -1995,7 +2023,7 @@ fn print_parts(l: Layout) -> { modules: Map<Bytes, Sheet>, missing: Map<Bytes, B
     if !p.printed { acc } else {
       let x = { layout: l, part: u, own: p.module };
       let walked = fold(range(0, len(p.members)), { d: cursor(b"", acc.missing), ts: [] }, |s: Many, c: Int| {
-        let g = p_item(x, {..s.d, b: at(p.members, c), pos: 0, values: 0, typs: 0, rows: 0}, at(p.names, c));
+        let g = p_item(x, {..s.d, b: at(p.members, c), pos: 0, values: 0, typs: 0, rows: 0, labels: 0}, at(p.names, c));
         { d: g.d, ts: push(s.ts, g.t) }
       });
       let had = match map_get(acc.modules, p.module) { Some(m) -> m, None -> { items: [], imports: map_new() } };
@@ -2009,7 +2037,7 @@ fn print_tests(l: Layout, tests: List<Bytes>, missing: Map<Bytes, Bool>) -> Many
   fold(range(0, len(tests)), { d: cursor(b"", missing), ts: [] }, |s: Many, i: Int| {
     let body = at(tests, i);
     if bytes_len(body) == 0 || bytes_at(body, 0) != 0 { panic("a test body that is not a solo body") } else {
-      let g = p_test(x, {..s.d, b: bytes_slice(body, 1, bytes_len(body)), pos: 0, values: 0, typs: 0, rows: 0, slots: map_new()}, bytes_concat(b"t", num(i)));
+      let g = p_test(x, {..s.d, b: bytes_slice(body, 1, bytes_len(body)), pos: 0, values: 0, typs: 0, rows: 0, labels: 0, slots: map_new()}, bytes_concat(b"t", num(i)));
       { d: g.d, ts: push(s.ts, g.t) }
     }
   })
@@ -2150,6 +2178,43 @@ test "an operation atom hashes apart from its mode atom and prints back as writt
   let again = hash_index(indexed([{ name: b"m", src: at(ms, 0).text }]));
   assert_eq(hash_of(again), hash_of(out));
   assert(hash_of(out) != hash_of(hash_index(indexed([{ name: b"m", src: src(b"write") }]))))
+}
+
+test "renaming a label binder does not move a hash, and renaming a real resource does" {
+  let bound = |label: Bytes| bytes_concat_all([b"pub effect net { write send[c](x: Int) -> Int }\n",
+    b"pub fn relay<[", label, b"]>(x: Int) -> Int / {net.send[", label, b"]} = net.send[", label, b"](x)\n",
+    b"pub fn outer<[", label, b"]>(x: Int) -> Int / {net.send[", label, b"]} = relay[", label, b"](x)\n",
+    b"pub fn caught<[", label, b"]>(x: Int) -> Int = handle { relay[", label, b"](x) } with { net.send[", label, b"](n) -> n }"]);
+  let loose = |res: Bytes| bytes_concat_all([b"pub effect net { write send[c](x: Int) -> Int }\n",
+    b"pub fn relay(x: Int) -> Int / {net.send[", res, b"]} = net.send[", res, b"](x)"]);
+  let hash_of = |src: Bytes, name: Bytes| {
+    let out = hash_index(indexed([{ name: b"m", src: src }]));
+    match map_get(by_name(named_hashes(out)), name) { Some(h) -> h, None -> panic("the index names the definition") }
+  };
+  assert_eq(hash_of(bound(b"l"), b"m.relay"), hash_of(bound(b"k"), b"m.relay"));
+  assert_eq(hash_of(bound(b"l"), b"m.outer"), hash_of(bound(b"k"), b"m.outer"));
+  assert_eq(hash_of(bound(b"l"), b"m.caught"), hash_of(bound(b"k"), b"m.caught"));
+  assert(hash_of(loose(b"conn"), b"m.relay") != hash_of(loose(b"sock"), b"m.relay"));
+  assert(hash_of(bound(b"l"), b"m.relay") != hash_of(loose(b"l"), b"m.relay"))
+}
+
+test "a label binder, the resources it names and the labels a call fills print back under their levels" {
+  let out = hash_index(indexed([{ name: b"m", src: bytes_concat_all([
+    b"pub effect net { write send[c](x: Int) -> Int }\n",
+    b"pub fn relay<[l]>(x: Int) -> Int / {net.send[l]} = net.send[l](x)\n",
+    b"pub fn outer<[l]>(x: Int) -> Int / {net.send[l]} = relay[l](x)\n",
+    b"pub fn caught<[l]>(x: Int) -> Int = handle { relay[l](x) } with { net.send[l](n) -> n }\n",
+    b"pub fn plain(x: Int) -> Int / {net.send[conn]} = relay[conn](x)"]) }]));
+  let ms = printed_of(out, []);
+  assert(holds_text(at(ms, 0).text, b"fn relay<[_r0]>"));
+  assert(holds_text(at(ms, 0).text, b"/ {net.send[_r0]}"));
+  assert(holds_text(at(ms, 0).text, b"net.send[_r0](_l0)"));
+  assert(holds_text(at(ms, 0).text, b"relay[_r0](_l0)"));
+  assert(holds_text(at(ms, 0).text, b"net.send[_r0](_l1) -> _l1"));
+  assert(holds_text(at(ms, 0).text, b"/ {net.send[conn]}"));
+  assert(holds_text(at(ms, 0).text, b"relay[conn](_l0)"));
+  let again = hash_index(indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })));
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
 
 test "one effect declaration under two names is refused, since a body cannot say which it performs" {

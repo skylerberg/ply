@@ -1,7 +1,7 @@
 use ply_span::Symbol;
 use ply_store::{CachedCtor, CachedOp, DeclBody, canonicalize_decl_body, canonicalize_scheme};
 use ply_ty::Mode;
-use ply_ty::{EffectAtom, Resource, Row, RowVar, Scheme, TyVar, Type};
+use ply_ty::{EffectAtom, LabelVar, Resource, Row, RowVar, Scheme, TyVar, Type};
 use std::collections::BTreeMap;
 
 fn var(n: u32) -> Type {
@@ -13,6 +13,7 @@ fn identity_pair(a: u32, b: u32, e: u32) -> Scheme {
     Scheme {
         ty_vars: vec![TyVar(a), TyVar(b)],
         row_vars: vec![RowVar(e)],
+        label_vars: vec![],
         ty: Type::Fn {
             params: vec![var(a), var(b)],
             ret: Box::new(var(a)),
@@ -45,6 +46,7 @@ fn variables_are_numbered_by_first_use_not_by_the_quantifier_list() {
     let listed_backwards = Scheme {
         ty_vars: vec![TyVar(9), TyVar(4)],
         row_vars: vec![],
+        label_vars: vec![],
         ty: Type::Fn {
             params: vec![var(4)],
             ret: Box::new(var(9)),
@@ -72,11 +74,13 @@ fn a_quantified_variable_the_body_never_mentions_still_gets_a_number() {
     let phantom = Scheme {
         ty_vars: vec![TyVar(2), TyVar(8)],
         row_vars: vec![],
+        label_vars: vec![],
         ty: var(8),
     };
     let reordered = Scheme {
         ty_vars: vec![TyVar(8), TyVar(2)],
         row_vars: vec![],
+        label_vars: vec![],
         ty: var(8),
     };
     assert_eq!(canonicalize_scheme(&phantom).ty, var(0));
@@ -95,6 +99,7 @@ fn a_difference_that_is_not_a_renaming_survives() {
     let shared = Scheme {
         ty_vars: vec![TyVar(0)],
         row_vars: vec![],
+        label_vars: vec![],
         ty: Type::Fn {
             params: vec![var(0)],
             ret: Box::new(var(0)),
@@ -104,6 +109,7 @@ fn a_difference_that_is_not_a_renaming_survives() {
     let distinct = Scheme {
         ty_vars: vec![TyVar(0), TyVar(1)],
         row_vars: vec![],
+        label_vars: vec![],
         ty: Type::Fn {
             params: vec![var(0)],
             ret: Box::new(var(1)),
@@ -114,6 +120,43 @@ fn a_difference_that_is_not_a_renaming_survives() {
         canonicalize_scheme(&shared),
         canonicalize_scheme(&distinct),
         "`(a) -> a` and `(a) -> b` are not alpha-equivalent"
+    );
+}
+
+#[test]
+fn a_label_parameter_is_renumbered_by_the_position_a_call_fills() {
+    // `fn f<[l], [m]>() -> Unit / {net.send[l], net.recv[m]}`, twice over different numbers.
+    let relay = |l: u32, m: u32| Scheme {
+        ty_vars: vec![],
+        row_vars: vec![],
+        label_vars: vec![LabelVar(l), LabelVar(m)],
+        ty: Type::Fn {
+            params: vec![],
+            ret: Box::new(Type::unit()),
+            effects: Row::closed([
+                EffectAtom::operation("net", Resource::Var(LabelVar(m)), Mode::Write, "recv"),
+                EffectAtom::operation("net", Resource::Var(LabelVar(l)), Mode::Write, "send"),
+            ]),
+        },
+    };
+    let canonical = canonicalize_scheme(&relay(5, 2));
+    assert_eq!(
+        canonical,
+        canonicalize_scheme(&relay(40, 41)),
+        "the numbers a run handed out must not survive, in either order"
+    );
+    assert_eq!(canonical.label_vars, vec![LabelVar(0), LabelVar(1)]);
+    let Type::Fn { effects, .. } = &canonical.ty else {
+        panic!("shape must be preserved");
+    };
+    assert_eq!(
+        effects
+            .atoms
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>(),
+        ["net.send[l]", "net.recv[m]"],
+        "the first parameter is `l` however the run numbered it"
     );
 }
 
@@ -167,6 +210,7 @@ fn one_numbering_spans_a_declaration_so_its_constructors_stay_related() {
                 scheme: Scheme {
                     ty_vars: vec![TyVar(a), TyVar(b)],
                     row_vars: vec![],
+                    label_vars: vec![],
                     ty: Type::Fn {
                         params: vec![var(a), var(b)],
                         ret: Box::new(Type::Con(Symbol::new("Pair"), vec![var(a), var(b)])),
@@ -179,6 +223,7 @@ fn one_numbering_spans_a_declaration_so_its_constructors_stay_related() {
                 scheme: Scheme {
                     ty_vars: vec![TyVar(a), TyVar(b)],
                     row_vars: vec![],
+                    label_vars: vec![],
                     ty: Type::Fn {
                         params: vec![var(b)],
                         ret: Box::new(Type::Con(Symbol::new("Pair"), vec![var(a), var(b)])),

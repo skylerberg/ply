@@ -19,10 +19,7 @@ A feature earns its place by one of these. Saving keystrokes does not count.
 
 ## Work
 
-- The compiler's own loop: stage-1 emission cached by source digest and incremental per
-  definition.
-- Reach: libraries usable against more than one resource label; packages with dependencies
-  pinned by content hash.
+- Reach: packages with dependencies pinned by content hash.
 
 ## Open
 

@@ -54,6 +54,7 @@ fn sample() -> Front {
     let scheme = Scheme {
         ty_vars: vec![TyVar(3)],
         row_vars: vec![RowVar(1)],
+        label_vars: vec![],
         ty: Type::Fn {
             params: vec![Type::list(Type::Var(TyVar(3)))],
             ret: Box::new(Type::int()),
@@ -164,6 +165,7 @@ fn sample() -> Front {
             scheme: Some(Scheme {
                 ty_vars: vec![TyVar(0)],
                 row_vars: vec![RowVar(0)],
+                label_vars: vec![],
                 ty: Type::Fn {
                     params: vec![Type::Fn {
                         params: vec![],
@@ -218,6 +220,7 @@ fn sample() -> Front {
             scheme: Scheme {
                 ty_vars: vec![TyVar(0)],
                 row_vars: vec![],
+                label_vars: vec![],
                 ty: Type::Fn {
                     params: vec![Type::Var(TyVar(0))],
                     ret: Box::new(Type::option(Type::Var(TyVar(0)))),
