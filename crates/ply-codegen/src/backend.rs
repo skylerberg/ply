@@ -256,8 +256,6 @@ pub struct Bodies {
     ctx: RefCell<crate::rt::Ctx>,
     entered: Cell<u64>,
     declines: Cell<Declines>,
-    /// `PLY_TIER_ONLY=1`: this backend is the only engine, and the machine evaluates nothing.
-    tier_only: bool,
 }
 
 impl Bodies {
@@ -311,7 +309,6 @@ impl Bodies {
             ctx,
             entered: Cell::new(0),
             declines: Cell::new(Declines::default()),
-            tier_only: std::env::var("PLY_TIER_ONLY").is_ok_and(|v| v == "1"),
         })
     }
 
@@ -582,10 +579,6 @@ impl ply_eval::Compiled for Bodies {
             .try_borrow_mut()
             .map(|mut ctx| std::mem::take(&mut ctx.teardown))
             .unwrap_or_default()
-    }
-
-    fn tier_only(&self) -> bool {
-        self.tier_only
     }
 }
 

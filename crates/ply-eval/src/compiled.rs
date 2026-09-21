@@ -54,11 +54,6 @@ pub trait Compiled {
     fn take_teardown(&self) -> Vec<Diagnostic> {
         Vec::new()
     }
-
-    /// A test or entry this backend does not hold fails rather than falling to the machine.
-    fn tier_only(&self) -> bool {
-        false
-    }
 }
 
 #[derive(Debug)]
