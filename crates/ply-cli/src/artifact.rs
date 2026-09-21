@@ -91,7 +91,8 @@ impl Artifact {
                 })
                 .collect(),
         );
-        let Value::Bytes(written) = answer(ENCODE, &[head, sections])? else {
+        let answered = answer(ENCODE, &[head, sections])?;
+        let Value::Bytes(written) = &answered else {
             return Err(container_failed(format!(
                 "`{ENCODE}` answered something that is not a byte string"
             )));
@@ -205,13 +206,14 @@ impl Plan {
 
 /// `None` when a file that long is too short to carry a digest at all.
 fn plan(len: usize) -> Result<Option<Plan>, Diagnostic> {
-    let Value::Bytes(dump) = answer(PLAN, &[Value::Int(len as i64)])? else {
+    let answered = answer(PLAN, &[Value::Int(len as i64)])?;
+    let Value::Bytes(dump) = &answered else {
         return Err(container_failed(format!(
             "`{PLAN}` answered something that is not a byte string"
         )));
     };
     let unreadable = |e: String| container_failed(format!("`{PLAN}`'s answer does not read: {e}"));
-    let mut frames = Cursor::new(&dump, "frame");
+    let mut frames = Cursor::new(dump, "frame");
     let (words, payload) = frames.unit().map_err(unreadable)?;
     match words[..] {
         ["refused", _] => return Ok(None),
@@ -276,14 +278,15 @@ impl Container {
 }
 
 fn container(bytes: &[u8], path: &Path) -> Result<Container, Diagnostic> {
-    let Value::Bytes(dump) = answer(DECODE, &[Value::bytes(bytes)])? else {
+    let answered = answer(DECODE, &[Value::bytes(bytes)])?;
+    let Value::Bytes(dump) = &answered else {
         return Err(container_failed(format!(
             "`{DECODE}` answered something that is not a byte string"
         )));
     };
     let unreadable =
         |e: String| container_failed(format!("`{DECODE}`'s answer does not read: {e}"));
-    let mut frames = Cursor::new(&dump, "frame");
+    let mut frames = Cursor::new(dump, "frame");
     let (words, payload) = frames.unit().map_err(unreadable)?;
     match words[..] {
         ["refused", _] => return Err(refused(path, payload, false)?),
