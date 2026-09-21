@@ -1,5 +1,4 @@
-//! Every diagnostic renders two ways from one value: `ariadne` for a terminal and JSON for an
-//! agent.
+//! Every diagnostic renders two ways from one value: lines for a terminal and JSON for an agent.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -128,22 +127,6 @@ impl SourceFile {
             .take_while(|&(i, _)| line_start + i < end)
             .count();
         (line as u32 + 1, col as u32 + 1)
-    }
-
-    pub fn line_text(&self, line: u32) -> &str {
-        let idx = (line.saturating_sub(1)) as usize;
-        let Some(&start) = self.line_starts.get(idx) else {
-            return "";
-        };
-        let end = self
-            .line_starts
-            .get(idx + 1)
-            .map(|&e| e as usize)
-            .unwrap_or(self.text.len());
-        self.text
-            .get(start as usize..end)
-            .unwrap_or("")
-            .trim_end_matches(['\n', '\r'])
     }
 }
 
@@ -887,15 +870,5 @@ mod tests {
             numbers.len(),
             "two constants share one number: {numbers:?}"
         );
-    }
-
-    #[test]
-    fn line_text_strips_terminator() {
-        let mut sm = SourceMap::new();
-        let id = sm.add("t.ply", "one\ntwo\r\nthree");
-        let f = sm.get(id).unwrap();
-        assert_eq!(f.line_text(1), "one");
-        assert_eq!(f.line_text(2), "two");
-        assert_eq!(f.line_text(3), "three");
     }
 }

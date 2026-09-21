@@ -1287,11 +1287,6 @@ its root, and one that leaves it is refused with `E0452`. The first run after
 C toolchain `ply run` needs and takes a few seconds; every later run loads the
 compiled object and the front end it filed beside it.
 
-Those five render a diagnostic in Ply's own shape — the severity, the code and
-the message, then `--> path:line:col` with the source line and a caret run per
-label it can place, then `= ` notes. `ply check`, `ply run` and `ply test` still
-render through `ariadne`; the two do not yet agree.
-
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed
 and leaves a file that does not parse alone, exiting 2 with the diagnostic. A
@@ -1308,12 +1303,31 @@ through `ply fmt` into the range `show` reports.
 
 `E` is an error; `W` is a warning and never a fault in your program.
 `ply explain CODE` prints a code's line from this table, and `--all` the whole
-table, from the registry the compiler raises from. A diagnostic that knows its
-own remedy carries `fixes` under `--json`: each has a `title` and `edits`, and
-an edit replaces the text between `start` and `end` of `file` (an empty range
-inserts) with `text`. Applied as they are, the edits leave a program the
-diagnostic no longer holds for. On a terminal a fix is the `fix:` line under
-the message.
+table, from the registry the compiler raises from.
+
+Every command writes a diagnostic the same way, in one shape:
+
+```
+Error[E0201]: type mismatch: function body type
+  --> app.ply:1:17
+   | fn f() -> Int = "x"
+   |                 ^^^ expected `Int`, found `String`
+  = the body must answer the written type
+```
+
+The heading is the severity, the code and the message. Then one block per label:
+where it points, the line it points into, and a caret run under the span — one
+caret for an empty span, and never past the end of the line the span opens on. A
+label whose span is not a range of its file is dropped, as it is under `--json`,
+and a diagnostic left with no label is its heading and notes alone. Each note is
+a `  = ` line. Colour is paint on that shape and never changes it: a pipe,
+`NO_COLOR` or `--color never` leaves exactly these bytes.
+
+A diagnostic that knows its own remedy carries `fixes` under `--json`: each has a
+`title` and `edits`, and an edit replaces the text between `start` and `end` of
+`file` (an empty range inserts) with `text`. Applied as they are, the edits leave
+a program the diagnostic no longer holds for. On a terminal a fix is a
+`= fix:` line under the message.
 
 | code | meaning |
 | --- | --- |

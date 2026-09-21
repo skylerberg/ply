@@ -26,9 +26,9 @@ const UNARMED_CODES: &[(&str, &str)] = &[
 const UNARMED_VARIANTS: &[(&str, &str)] = &[
     (
         "Severity::Note",
-        "Two renderers and no producer: crates/ply-span/src/render.rs:73 maps \
-         it to ariadne's ReportKind::Advice, crates/ply-cli/src/commands/common.rs:55 \
-         to a dim \"note\". \
+        "Two consumers and no producer: crates/ply-span/src/render.rs heads a \
+         rendered diagnostic \"Note\", and crates/ply-cli/src/commands/common.rs \
+         writes a dim \"note\". \
          Nothing builds one. Severity also derives Deserialize, so a Note could \
          in principle arrive from a stored diagnostic rather than from a \
          constructor — nothing in the workspace writes one, and the gate cannot \

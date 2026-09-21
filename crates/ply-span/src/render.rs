@@ -1,6 +1,6 @@
 use crate::{Diagnostic, Severity, SourceMap};
-use ariadne::{Color, Config, Label as ALabel, Report, ReportKind};
 use serde::Serialize;
+use std::fmt::Write as _;
 
 #[derive(Serialize)]
 struct JsonPos {
@@ -110,82 +110,106 @@ fn fix_lines(diag: &Diagnostic) -> impl Iterator<Item = String> + '_ {
     diag.fixes.iter().map(|f| format!("fix: {}", f.title))
 }
 
-/// All-dummy spans, or spans outside their text, still print a header, so a builtin's error is
-/// never silently dropped.
-pub fn to_terminal(diag: &Diagnostic, sources: &SourceMap) -> String {
-    let kind = match diag.severity {
-        Severity::Error => ReportKind::Error,
-        Severity::Warning => ReportKind::Warning,
-        Severity::Note => ReportKind::Advice,
+fn titled(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Error => "Error",
+        Severity::Warning => "Warning",
+        Severity::Note => "Note",
+    }
+}
+
+/// Colour is paint on the shape and nothing else: strip the escapes and the styled render is the
+/// plain one, byte for byte.
+fn painted(styled: bool, severity: Severity, text: &str) -> String {
+    if !styled {
+        return text.to_string();
+    }
+    let code = match severity {
+        Severity::Error => "31",
+        Severity::Warning => "33",
+        Severity::Note => "2",
     };
+    format!("\x1b[{code}m{text}\x1b[0m")
+}
 
-    let Some((anchor, anchor_file)) = diag
-        .labels
-        .iter()
-        .filter(|l| !l.span.is_dummy())
-        .find_map(|l| Some((l.span, sources.containing(l.span)?)))
-    else {
-        let notes = diag
-            .notes
-            .iter()
-            .cloned()
-            .chain(fix_lines(diag))
-            .map(|n| format!("\n  = {n}"))
-            .collect::<String>();
-        return format!(
-            "{:?}[{}]: {}{}\n",
-            diag.severity, diag.code, diag.message, notes
-        );
-    };
+/// Where the line holding `offset` begins.
+fn line_start(text: &str, offset: usize) -> usize {
+    text[..offset].rfind('\n').map_or(0, |i| i + 1)
+}
 
-    let anchor_path = anchor_file.path.display().to_string();
-    let mut report = Report::build(kind, (anchor_path.clone(), anchor.range()))
-        .with_code(diag.code)
-        .with_message(&diag.message)
-        .with_config(Config::default().with_index_type(ariadne::IndexType::Byte));
+/// The newline closing the line that begins at `from`, or the end of the text.
+fn end_of_line(text: &str, from: usize) -> usize {
+    text[from..].find('\n').map_or(text.len(), |i| from + i)
+}
 
+/// The caret run under one line: the span's own width, or one caret for an empty span, and never
+/// past the end of the line the span opens on.
+fn carets(text: &str, start: usize, end: usize) -> String {
+    let from = line_start(text, start);
+    let stop = end.min(end_of_line(text, from));
+    let width = text[start..stop].chars().count().max(1);
+    format!(
+        "{}{}",
+        " ".repeat(text[from..start].chars().count()),
+        "^".repeat(width)
+    )
+}
+
+/// One diagnostic: the heading, a block per label it can place, then a line per note and fix.
+/// A label whose span is not a range of its file is dropped, as `to_json` drops it, and a
+/// diagnostic left with none is still its heading, so a builtin's error is never silently lost.
+/// The shape is `crates/ply-cli/ply/diagnostic.ply`'s, byte for byte.
+pub fn to_terminal(diag: &Diagnostic, sources: &SourceMap, styled: bool) -> String {
+    let heading = format!("{}[{}]", titled(diag.severity), diag.code);
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{}: {}",
+        painted(styled, diag.severity, &heading),
+        diag.message
+    );
     for l in &diag.labels {
         let Some(file) = sources.containing(l.span) else {
             continue;
         };
-        let path = file.path.display().to_string();
-        report = report.with_label(
-            ALabel::new((path, l.span.range()))
-                .with_message(&l.message)
-                .with_color(if l.primary { Color::Red } else { Color::Blue })
-                .with_order(if l.primary { 0 } else { 1 }),
+        let text = &*file.text;
+        let start = l.span.start as usize;
+        let from = line_start(text, start);
+        let (line, col) = file.line_col(l.span.start);
+        let said = if l.message.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", l.message)
+        };
+        let _ = writeln!(out, "  --> {}:{line}:{col}", file.path.display());
+        let _ = writeln!(out, "   | {}", &text[from..end_of_line(text, from)]);
+        let _ = writeln!(
+            out,
+            "   | {}{said}",
+            painted(
+                styled,
+                diag.severity,
+                &carets(text, start, l.span.end as usize)
+            )
         );
     }
     for n in diag.notes.iter().cloned().chain(fix_lines(diag)) {
-        report = report.with_note(n);
+        let _ = writeln!(out, "  = {n}");
     }
-
-    let cache = ariadne::sources(
-        sources
-            .files()
-            .iter()
-            .map(|f| (f.path.display().to_string(), &*f.text)),
-    );
-
-    let mut out = Vec::new();
-    match report.finish().write(cache, &mut out) {
-        Ok(()) => String::from_utf8_lossy(&out).into_owned(),
-        Err(_) => format!("[{}] {}\n", diag.code, diag.message),
-    }
+    out
 }
 
-pub fn all_to_terminal(diags: &[Diagnostic], sources: &SourceMap) -> String {
+pub fn all_to_terminal(diags: &[Diagnostic], sources: &SourceMap, styled: bool) -> String {
     diags
         .iter()
-        .map(|d| to_terminal(d, sources))
-        .collect::<Vec<_>>()
-        .join("")
+        .map(|d| to_terminal(d, sources, styled))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Span, codes};
+    use crate::{Edit, Span, codes};
 
     fn fixture() -> (SourceMap, Diagnostic) {
         let mut sm = SourceMap::new();
@@ -199,9 +223,92 @@ mod tests {
     #[test]
     fn terminal_render_includes_code_and_label() {
         let (sm, d) = fixture();
-        let out = to_terminal(&d, &sm);
+        let out = to_terminal(&d, &sm, false);
         assert!(out.contains("E0201"));
         assert!(out.contains("expected Int, found Bool"));
+    }
+
+    const TWO_LINES: &str = "fn f() -> Int = \"x\"\nfn g() -> Int = 1\n";
+
+    /// Lines with the newline that ends each of them, as the renderer writes them.
+    fn text(lines: &[&str]) -> String {
+        lines.iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    /// The shape, spelled out: it is the one `crates/ply-cli/ply/diagnostic.ply` writes, whose own
+    /// tests spell out these same lines for this same diagnostic.
+    #[test]
+    fn a_placed_label_is_a_heading_a_place_the_line_and_a_caret_run() {
+        let mut sm = SourceMap::new();
+        let id = sm.add("m.ply", TWO_LINES);
+        let d = Diagnostic::error(codes::TYPE_MISMATCH, "type mismatch: function body type")
+            .primary(Span::new(id, 16, 19), "expected `Int`, found `String`")
+            .note("the body must answer the written type");
+        assert_eq!(
+            to_terminal(&d, &sm, false),
+            text(&[
+                "Error[E0201]: type mismatch: function body type",
+                "  --> m.ply:1:17",
+                "   | fn f() -> Int = \"x\"",
+                "   |                 ^^^ expected `Int`, found `String`",
+                "  = the body must answer the written type",
+            ])
+        );
+    }
+
+    #[test]
+    fn an_empty_span_gets_one_caret_and_a_fix_is_a_note_of_its_own() {
+        let mut sm = SourceMap::new();
+        let id = sm.add("m.ply", TWO_LINES);
+        let d = Diagnostic::warning(codes::MISSING_SIGNATURE, "this needs a type")
+            .primary(Span::new(id, 5, 5), "")
+            .fix(
+                "add the type",
+                vec![Edit {
+                    span: Span::new(id, 5, 5),
+                    text: ": Int".to_string(),
+                }],
+            );
+        assert_eq!(
+            to_terminal(&d, &sm, false),
+            text(&[
+                "Warning[E0126]: this needs a type",
+                "  --> m.ply:1:6",
+                "   | fn f() -> Int = \"x\"",
+                "   |      ^",
+                "  = fix: add the type",
+            ])
+        );
+    }
+
+    /// A span over several lines underlines the line it opens on and stops at its newline.
+    #[test]
+    fn a_caret_run_never_leaves_the_line_the_span_opens_on() {
+        let mut sm = SourceMap::new();
+        let id = sm.add("m.ply", TWO_LINES);
+        let d = Diagnostic::error(codes::TYPE_MISMATCH, "over two lines")
+            .primary(Span::new(id, 16, 25), "from here");
+        assert_eq!(
+            to_terminal(&d, &sm, false),
+            text(&[
+                "Error[E0201]: over two lines",
+                "  --> m.ply:1:17",
+                "   | fn f() -> Int = \"x\"",
+                "   |                 ^^^ from here",
+            ])
+        );
+    }
+
+    /// Colour is paint on one shape: strip the escapes and the styled render is the plain one.
+    #[test]
+    fn styling_a_render_changes_nothing_but_the_escapes() {
+        let (sm, d) = fixture();
+        let styled = to_terminal(&d, &sm, true);
+        assert!(styled.contains("\x1b[31mError[E0201]\x1b[0m"), "{styled}");
+        assert_eq!(
+            styled.replace("\x1b[31m", "").replace("\x1b[0m", ""),
+            to_terminal(&d, &sm, false)
+        );
     }
 
     #[test]
@@ -228,7 +335,7 @@ mod tests {
             let d = Diagnostic::error(codes::RUNTIME_ERROR, "boom").primary(span, "here");
             let v = serde_json::to_value(to_json(&d, &sm)).unwrap();
             assert_eq!(v["labels"].as_array().map(Vec::len), Some(0), "{v}");
-            let out = to_terminal(&d, &sm);
+            let out = to_terminal(&d, &sm, false);
             assert!(out.contains("E0502") && out.contains("boom"), "{out}");
             let file = sm.get(id).unwrap();
             let _ = (file.line_col(span.start), file.line_col(span.end));
@@ -239,7 +346,7 @@ mod tests {
     fn dummy_span_still_renders_a_header() {
         let sm = SourceMap::new();
         let d = Diagnostic::error(codes::RUNTIME_ERROR, "boom").primary(Span::DUMMY, "here");
-        let out = to_terminal(&d, &sm);
+        let out = to_terminal(&d, &sm, false);
         assert!(out.contains("E0502"));
         assert!(out.contains("boom"));
     }
