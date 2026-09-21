@@ -1,9 +1,15 @@
 # Ply
 
 Ply is a general-purpose, statically typed programming language with effects in
-every signature. Definitions are content-addressed, so the compiler and the test
-runner redo only what a change affects. The compiler is written in Ply and
-compiles to C.
+every signature. Definitions are content-addressed, and the compiler is written
+in Ply and compiles to C.
+
+Perfect incrementality is the goal the rest is shaped around: a change should
+cost work in proportion to what it reached, and nothing else. Content addressing
+is the mechanism, so the compiler and the test runner can tell what a change
+reached rather than guess from a file's bytes or its timestamp. Where a change
+still redoes more than it touched, that is a defect to fix, not a cost to live
+with.
 
 [`docs/GUIDE.md`](docs/GUIDE.md) is the language manual: syntax, types, effects,
 tests, the standard library, the `ply` command and the diagnostic codes.
