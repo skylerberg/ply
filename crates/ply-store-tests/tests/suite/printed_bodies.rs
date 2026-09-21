@@ -332,7 +332,7 @@ fn numeric_literals_and_regions_and_constraints_survive_printing() {
         pub fn rate() -> Float = 1.5 / 0.0
         pub fn narrow() -> U8 = 255u8
         pub fn pattern() -> Int = 0xFFFFFFFFFFFFFFFF
-        pub fn shaped() -> Int = with_region[r] { with_cell[r](7) { c -> cell_get(c) } }
+        pub fn shaped() -> Int = with_cell[r](7) { c -> cell_get(c) }
         pub fn keep<a>(x: a) -> a where derivable(ord, a), derivable(eq, a) = x
         "#,
     )]);
