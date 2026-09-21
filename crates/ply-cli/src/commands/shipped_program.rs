@@ -70,7 +70,9 @@ fn enter(argv: Vec<String>, root: &Path, mut binds: Binds) -> Result<i32, Diagno
     ];
     roots.append(&mut binds.roots);
     binds.roots = roots;
-    crate::artifact::enter(&artifact, &opened, argv, binds)
+    // The `ply` program is the tool's own work rather than a program under test, so the budgets
+    // a run gives a program are not its.
+    ply_codegen::rt::unbounded(|| crate::artifact::enter(&artifact, &opened, argv, binds))
 }
 
 fn first_of(diagnostics: Vec<Diagnostic>) -> Diagnostic {

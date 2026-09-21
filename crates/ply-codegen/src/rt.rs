@@ -193,7 +193,6 @@ pub(crate) fn holds_a_handle(value: &Value) -> Option<&'static str> {
         Value::Secret(_) => Some("a Secret"),
         Value::Cell(_) => Some("a Cell"),
         Value::Task(_) => Some("a Task"),
-        Value::Continuation(_) => Some("a Continuation"),
         Value::Closure(_) => Some("a Closure"),
         Value::List(items) => items.iter().find_map(holds_a_handle),
         Value::Map(entries) => entries
@@ -218,8 +217,10 @@ pub const FAILED_OUT_OF_FUEL: i64 = 2;
 pub const FAILED_OUT_OF_STACK: i64 = 3;
 /// A clause answered without resuming: `Ctx::unwind` carries its value to its `handle`.
 pub const FAILED_UNWIND: i64 = 4;
-/// The entry ran past its time budget.
-pub const FAILED_OUT_OF_TIME: i64 = 5;
+/// The harness stopped the entry at its wall clock, which is not a verdict on the program.
+pub const FAILED_ABANDONED: i64 = 5;
+/// The entry spent its step budget without finishing.
+pub const FAILED_OUT_OF_STEPS: i64 = 6;
 
 /// An installed handler: pushed by a `handle` site, searched innermost-out by a `perform`.
 pub struct HandlerFrame {
@@ -395,8 +396,13 @@ pub struct Ctx {
     pub site_root: i64,
     pub site_start: i64,
     pub site_end: i64,
-    /// Loop passes since the entry began; every 4096th samples the clock against the deadline.
+    /// Calls this entry has made: the prologue counts one, and so does every pass of a loop.
     pub ticks: i64,
+    /// The tick at which compiled code calls [`rt_tick`] back; `i64::MAX` when neither the budget
+    /// nor the clock bounds this entry, so nothing calls back at all.
+    pub next_tick: i64,
+    /// The calls this entry may make; 0 is no bound.
+    step_budget: i64,
     /// Stacks this entry has been given beyond the one it started on, so growing is observable.
     pub grown: u64,
     /// When the running entry's time budget is spent, if it has one.
@@ -463,6 +469,8 @@ impl Ctx {
             site_start: 0,
             site_end: 0,
             ticks: 0,
+            next_tick: i64::MAX,
+            step_budget: 0,
             grown: 0,
             deadline: None,
             time_budget_ms: 0,
@@ -505,11 +513,13 @@ impl Ctx {
         self.failed = 0;
         self.fuel = fuel;
         self.ticks = 0;
+        self.step_budget = step_budget();
         self.grown = 0;
         self.time_budget_ms = time_budget_ms();
         self.deadline = (self.time_budget_ms > 0).then(|| {
             std::time::Instant::now() + std::time::Duration::from_millis(self.time_budget_ms)
         });
+        self.arm_tick();
         self.stack_floor = stack_floor();
         self.site_root = -1;
         self.last_linear = None;
@@ -535,6 +545,49 @@ impl Ctx {
         self.cells_baseline = self.cell_extent();
         heap::enter(&mut self.heap);
         heap::poison::enter(&raw const self.site_root);
+    }
+
+    /// When compiled code must call back next: the call one past the budget, the end of this
+    /// chunk, or never, when the entry is bounded by neither the budget nor a clock.
+    fn arm_tick(&mut self) {
+        let chunk = self.ticks.saturating_add(TICK_CHUNK);
+        self.next_tick = match (self.step_budget > 0, self.deadline.is_some()) {
+            (true, _) => self.step_budget.saturating_add(1).min(chunk),
+            (false, true) => chunk,
+            (false, false) => i64::MAX,
+        };
+    }
+
+    /// The call counter reached [`Ctx::next_tick`]: charge the budget, read the clock, and say
+    /// when to call back. Both bounds are decided here, so a call itself costs one increment and
+    /// one compare, and the clock is read once every [`TICK_CHUNK`] calls rather than on any.
+    fn tick(&mut self) {
+        if self.step_budget > 0 && self.ticks > self.step_budget {
+            let budget = self.step_budget;
+            let d = Diagnostic::error(
+                codes::STEP_BUDGET,
+                format!("did not finish within its budget of {budget} calls"),
+            )
+            .primary(Span::DUMMY, "still running here")
+            .note("`--steps N` raises the budget; 0 is no bound");
+            self.fail_with(FAILED_OUT_OF_STEPS, d);
+            return;
+        }
+        if let Some(deadline) = self.deadline
+            && std::time::Instant::now() > deadline
+        {
+            let ms = self.time_budget_ms;
+            let d = Diagnostic::warning(
+                codes::RUN_ABANDONED,
+                format!("abandoned after {ms} ms of wall clock"),
+            )
+            .primary(Span::DUMMY, "still running here")
+            .note("the clock says nothing about the program, so this run decided nothing")
+            .note("`--timeout MS` sets the clock; 0 is no clock");
+            self.fail_with(FAILED_ABANDONED, d);
+            return;
+        }
+        self.arm_tick();
     }
 
     /// The other end of [`Ctx::begin`]: the entry gives back what it used.
@@ -958,27 +1011,52 @@ pub unsafe extern "C" fn rt_grow(ctx: *mut Ctx, entry: i64, args: i64) -> i64 {
     unsafe { (*handover).answer }
 }
 
-/// A loop's periodic check: past the entry's deadline, the body stops where it is.
+/// The callback the counter reaching [`Ctx::next_tick`] makes: the entry gets more work, or it
+/// gets none.
 pub unsafe extern "C" fn rt_tick(ctx: *mut Ctx) {
     let ctx = unsafe { &mut *ctx };
-    if let Some(deadline) = ctx.deadline
-        && std::time::Instant::now() > deadline
-    {
-        let d = error(format!(
-            "ran past the time budget of {} ms",
-            ctx.time_budget_ms
-        ));
-        ctx.fail_with(FAILED_OUT_OF_TIME, d);
-    }
+    ctx.tick();
 }
 
-/// The wall-clock budget an entry begins with, in milliseconds; 0 is none. A command sets the
-/// process's, and a caller that wants one evaluation bounded differently sets its thread's.
-/// The default bounds a harness that never asked, so a loop that never ends fails there too.
-static TIME_BUDGET_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(DEFAULT_TIME_BUDGET_MS);
+/// Calls between two callbacks while an entry is still within its bounds.
+const TICK_CHUNK: i64 = 4096;
 
-pub const DEFAULT_TIME_BUDGET_MS: u64 = 60_000;
+/// The calls one entry may make; 0 is no bound. A command sets the process's, and a caller that
+/// wants one evaluation bounded differently sets its thread's.
+static STEP_BUDGET: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(ply_eval::DEFAULT_STEP_BUDGET);
+
+thread_local! {
+    static THREAD_STEP_BUDGET: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+pub fn set_step_budget(steps: i64) {
+    STEP_BUDGET.store(steps.max(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Runs `f` with entries on this thread bounded by `steps` rather than by the process's budget.
+pub fn with_step_budget<R>(steps: i64, f: impl FnOnce() -> R) -> R {
+    let before = THREAD_STEP_BUDGET.with(|t| t.replace(Some(steps.max(0))));
+    let out = f();
+    THREAD_STEP_BUDGET.with(|t| t.set(before));
+    out
+}
+
+pub fn step_budget() -> i64 {
+    THREAD_STEP_BUDGET
+        .with(|t| t.get())
+        .unwrap_or_else(|| STEP_BUDGET.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Runs `f` with entries on this thread bounded by neither budget: the compiler's own work is
+/// not the program's, so the program's bounds are not its.
+pub fn unbounded<R>(f: impl FnOnce() -> R) -> R {
+    with_step_budget(0, || with_time_budget(0, f))
+}
+
+/// The wall clock an entry may take, in milliseconds; 0 is none. It abandons a run rather than
+/// judging it, so only a harness that will say so sets one.
+static TIME_BUDGET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 thread_local! {
     static THREAD_TIME_BUDGET_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };

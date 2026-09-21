@@ -1502,9 +1502,8 @@ fn rank(w: Word) -> u8 {
                 Value::Closure(_) => 11,
                 Value::Cell(_) => 12,
                 Value::Task(_) => 13,
-                Value::Continuation(_) => 14,
-                Value::Secret(_) => 15,
-                Value::Fixed(_) => 16,
+                Value::Secret(_) => 14,
+                Value::Fixed(_) => 15,
             },
             other => panic!("a word of kind {other} was ordered after its object died"),
         }

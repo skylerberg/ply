@@ -1,10 +1,9 @@
-//! The explicit control stack, and the delimited continuations cut out of it.
+//! The explicit control stack, and the prompts that delimit it.
 
 use crate::pool::{self, Free, Link, Pooled};
 use crate::value::{List, Value};
 use ply_span::{Span, Symbol};
 use ply_ty::BinOp;
-use std::cell::Cell;
 use std::rc::Rc;
 
 #[derive(Clone)]
@@ -85,15 +84,9 @@ pub struct Prompt {
     pub span: Span,
 }
 
-/// A [`Delimiter::Sim`]'s region: its ordinal among the regions one entry point has entered.
+/// A `simulate` region: its ordinal among the regions one entry point has entered.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct SimId(pub u32);
-
-#[derive(Clone)]
-pub enum Delimiter {
-    Ply(Rc<Prompt>),
-    Sim(SimId),
-}
 
 /// A persistent stack, shared by pointer.
 struct Chain<T: Pooled> {
@@ -120,15 +113,6 @@ impl<T: Pooled> Chain<T> {
             head: Some(pool::link(value, self.head.take())),
             len,
         }
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &T> {
-        let mut cur = self.head.as_deref();
-        std::iter::from_fn(move || {
-            let link = cur?;
-            cur = link.next.as_deref();
-            link.value.as_ref()
-        })
     }
 }
 
@@ -204,54 +188,12 @@ impl Pooled for Segment {
 #[derive(Clone, Default)]
 pub struct Segment {
     frames: Chain<Frame>,
-    delimiter: Option<Delimiter>,
-    calls: usize,
-}
-
-impl Segment {
-    pub fn base() -> Segment {
-        Segment::default()
-    }
-
-    pub fn under(prompt: Rc<Prompt>) -> Segment {
-        Segment::below(Delimiter::Ply(prompt))
-    }
-
-    pub fn below(delimiter: Delimiter) -> Segment {
-        Segment {
-            frames: Chain::new(),
-            delimiter: Some(delimiter),
-            calls: 0,
-        }
-    }
-
-    pub fn delimiter(&self) -> Option<&Delimiter> {
-        self.delimiter.as_ref()
-    }
-
-    pub fn prompt(&self) -> Option<&Rc<Prompt>> {
-        match &self.delimiter {
-            Some(Delimiter::Ply(prompt)) => Some(prompt),
-            _ => None,
-        }
-    }
-
-    pub fn frames(&self) -> usize {
-        self.frames.len()
-    }
-
-    pub fn calls(&self) -> usize {
-        self.calls
-    }
-}
-
-fn is_call(frame: &Frame) -> usize {
-    usize::from(matches!(frame, Frame::Call { .. }))
+    prompt: Option<Rc<Prompt>>,
 }
 
 pub enum Next {
     Frame(Frame, Stack),
-    Leave(Delimiter, Stack),
+    Leave(Rc<Prompt>, Stack),
     Done,
 }
 
@@ -261,7 +203,6 @@ pub struct Stack {
     top: Segment,
     under: Chain<Segment>,
     frames: usize,
-    calls: usize,
 }
 
 impl Stack {
@@ -271,10 +212,6 @@ impl Stack {
 
     pub fn frames(&self) -> usize {
         self.frames
-    }
-
-    pub fn calls(&self) -> usize {
-        self.calls
     }
 
     pub fn segments(&self) -> usize {
@@ -290,65 +227,22 @@ impl Stack {
     }
 
     pub fn pushed(mut self, frame: Frame) -> Stack {
-        let calls = is_call(&frame);
         self.top.frames = std::mem::take(&mut self.top.frames).push(frame);
-        self.top.calls += calls;
         self.frames += 1;
-        self.calls += calls;
         self
     }
 
     pub fn push_prompt(&self, prompt: Rc<Prompt>) -> Stack {
-        self.push_delimiter(Delimiter::Ply(prompt))
-    }
-
-    pub fn push_sim(&self, region: SimId) -> Stack {
-        self.push_delimiter(Delimiter::Sim(region))
-    }
-
-    pub fn push_delimiter(&self, delimiter: Delimiter) -> Stack {
         let mut out = self.clone();
-        let displaced = std::mem::replace(&mut out.top, Segment::below(delimiter));
+        let displaced = std::mem::replace(
+            &mut out.top,
+            Segment {
+                frames: Chain::new(),
+                prompt: Some(prompt),
+            },
+        );
         out.under = std::mem::take(&mut out.under).push(displaced);
         out
-    }
-
-    pub fn holds_sim(&self, region: SimId) -> bool {
-        self.segments_iter()
-            .any(|s| matches!(s.delimiter(), Some(Delimiter::Sim(r)) if *r == region))
-    }
-
-    /// Segments [`Stack::capture`] takes to cut through the innermost region delimiter.
-    pub fn sim_depth(&self) -> Option<usize> {
-        self.segments_iter()
-            .position(|s| matches!(s.delimiter(), Some(Delimiter::Sim(_))))
-            .map(|depth| depth + 1)
-    }
-
-    pub fn into_task(mut self, region: SimId, born: u64) -> Continuation {
-        let (frames, calls) = (self.frames, self.calls);
-        let mut taken = Vec::with_capacity(self.segments());
-        loop {
-            match self.under.pop_front() {
-                Some(below) => taken.push(std::mem::replace(&mut self.top, below)),
-                None => {
-                    self.top.delimiter = Some(Delimiter::Sim(region));
-                    taken.push(self.top);
-                    break;
-                }
-            }
-        }
-        Continuation {
-            segments: Rc::new(taken),
-            frames,
-            calls,
-            born,
-            resumes: Rc::new(Cell::new(0)),
-        }
-    }
-
-    pub fn prompt(&self) -> Option<&Rc<Prompt>> {
-        self.top.prompt()
     }
 
     pub fn next(&self) -> Next {
@@ -357,125 +251,18 @@ impl Stack {
 
     pub fn into_next(mut self) -> Next {
         if let Some(frame) = self.top.frames.pop_front() {
-            let calls = is_call(&frame);
-            self.top.calls -= calls;
             self.frames -= 1;
-            self.calls -= calls;
             return Next::Frame(frame, self);
         }
-        match self.top.delimiter.take() {
-            Some(delimiter) => {
+        match self.top.prompt.take() {
+            Some(prompt) => {
                 self.top = self
                     .under
                     .pop_front()
-                    .expect("only the base segment has no delimiter, and it is the outermost");
-                Next::Leave(delimiter, self)
+                    .expect("only the base segment has no prompt, and it is the outermost");
+                Next::Leave(prompt, self)
             }
             None => Next::Done,
         }
-    }
-
-    fn segments_iter(&self) -> impl Iterator<Item = &Segment> {
-        std::iter::once(&self.top).chain(self.under.iter())
-    }
-
-    pub fn capture(&self, segments: usize, born: u64) -> (Continuation, Stack) {
-        let mut taken = Vec::with_capacity(segments);
-        let mut rest = self.clone();
-        let mut frames = 0;
-        let mut calls = 0;
-        for _ in 0..segments {
-            let below = rest
-                .under
-                .pop_front()
-                .expect("capture never crosses the base segment");
-            let cut = std::mem::replace(&mut rest.top, below);
-            frames += cut.frames();
-            calls += cut.calls();
-            rest.frames -= cut.frames();
-            rest.calls -= cut.calls();
-            taken.push(cut);
-        }
-        (
-            Continuation {
-                segments: Rc::new(taken),
-                frames,
-                calls,
-                born,
-                resumes: Rc::new(Cell::new(0)),
-            },
-            rest,
-        )
-    }
-
-    pub fn resume(&self, k: &Continuation) -> Stack {
-        self.spliced(&k.segments)
-    }
-
-    /// `segments` are innermost first, the order [`Stack::capture`] produced.
-    fn spliced(&self, segments: &[Segment]) -> Stack {
-        let mut out = self.clone();
-        for segment in segments.iter().rev() {
-            let displaced = std::mem::replace(&mut out.top, segment.clone());
-            out.under = std::mem::take(&mut out.under).push(displaced);
-            out.frames += segment.frames();
-            out.calls += segment.calls();
-        }
-        out
-    }
-}
-
-/// The control captured at a `perform`, down to and including the handler that answered it.
-#[derive(Clone)]
-pub struct Continuation {
-    /// Innermost first.
-    segments: Rc<Vec<Segment>>,
-    frames: usize,
-    calls: usize,
-    /// The machine's at-most-once host-operation count when this was captured.
-    born: u64,
-    resumes: Rc<Cell<u32>>,
-}
-
-impl Continuation {
-    pub fn frames(&self) -> usize {
-        self.frames
-    }
-
-    pub fn born(&self) -> u64 {
-        self.born
-    }
-
-    pub fn resumes(&self) -> u32 {
-        self.resumes.get()
-    }
-
-    /// The calls a resumption re-installs against the call budget.
-    pub fn calls(&self) -> usize {
-        self.calls
-    }
-
-    pub fn segments(&self) -> usize {
-        self.segments.len()
-    }
-
-    pub fn sim(&self) -> Option<SimId> {
-        self.sim_at().map(|(id, _)| id)
-    }
-
-    /// The stack below this continuation's `Sim` delimiter once spliced onto `stack`.
-    pub fn under_sim(&self, stack: &Stack) -> Option<Stack> {
-        let (_, at) = self.sim_at()?;
-        Some(stack.spliced(&self.segments[at + 1..]))
-    }
-
-    fn sim_at(&self) -> Option<(SimId, usize)> {
-        self.segments
-            .iter()
-            .enumerate()
-            .find_map(|(i, s)| match s.delimiter {
-                Some(Delimiter::Sim(id)) => Some((id, i)),
-                _ => None,
-            })
     }
 }
