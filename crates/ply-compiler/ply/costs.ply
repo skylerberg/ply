@@ -9,7 +9,8 @@ import exprs (Param, Expr)
 import rewrite (expand)
 import derive (expand_derives)
 import resolve (Mod, Resolved, Resolved_, Failed, NValue, resolve_modules, qualify, find)
-import tycore (at)
+import infer (builtin_schemes)
+import tycore (Scheme, at)
 
 type Cause = | CReadAgain | CCell | CMapEntry | CCapture | CCallerKeeps | CElement | CProgram | CCall | CHandler | CClosure
 
@@ -417,34 +418,46 @@ fn fix(c: Option<Cause>) -> Bytes =
     _ -> b"",
   }
 
-fn site_frame(s: Span, verdict: Bytes, reason: Bytes, cause: Option<Cause>, param: Int) -> Bytes = {
-  let f = fix(cause);
-  bytes_concat_all([b"site ", num(s.start), b" ", num(s.end), b" ", verdict, b" ",
-                    if param < 0 { b"-" } else { num(param) }, b" ", num(bytes_len(reason)), b" ", num(bytes_len(f)), b"\n",
-                    reason, f])
-}
+// One `push`: where it stands in its module's text, what it costs, why, the edit that would
+// remove a copy, and the parameter the list is at its last use, or -1 for none.
+pub type Site = { start: Int, end: Int, verdict: Bytes, reason: Bytes, fix: Bytes, param: Int }
 
-fn finish(raw: Raw, def: Int, t: Tables) -> Bytes =
+// A definition, test or law with at least one append. `module` indexes the sources handed over.
+pub type Costed = { kind: Bytes, module: Int, module_name: Bytes, name: Bytes, label: Bytes,
+                    reuse: Option<Span>, sites: List<Site> }
+
+// `ok` is false for a program that did not resolve, which costs nothing rather than nothing costing.
+pub type Report = { ok: Bool, rounds: Int, defs: List<Costed> }
+
+fn sited(s: Span, verdict: Bytes, reason: Bytes, cause: Option<Cause>, param: Int) -> Site =
+  { start: s.start, end: s.end, verdict: verdict, reason: reason, fix: fix(cause), param: param }
+
+fn finish(raw: Raw, def: Int, t: Tables) -> Site =
   match raw.owner {
-    OFresh -> site_frame(raw.span, b"reuses", b"the list reaches `push` at one owner", None, 0 - 1),
-    OBlocked(w) -> site_frame(raw.span, b"copies", w.text, Some(w.cause), 0 - 1),
-    OUnknown(w) -> site_frame(raw.span, b"unknown", w.text, Some(w.cause), 0 - 1),
+    OFresh -> sited(raw.span, b"reuses", b"the list reaches `push` at one owner", None, 0 - 1),
+    OBlocked(w) -> sited(raw.span, b"copies", w.text, Some(w.cause), 0 - 1),
+    OUnknown(w) -> sited(raw.span, b"unknown", w.text, Some(w.cause), 0 - 1),
     OParam(k) -> {
       let head = bytes_concat_all([b"the list is parameter ", num(k)]);
       match param_at(t, def, k) {
-        Some(PSole) -> site_frame(raw.span, b"reuses", bytes_concat(head, b", and every call site hands one over and stops reading it"), None, k),
-        Some(PShared(w)) -> site_frame(raw.span, b"copies", bytes_concat_all([head, b", and a caller keeps it: ", w.text]), Some(CCallerKeeps), k),
-        Some(PUnsure(w)) -> site_frame(raw.span, b"unknown", bytes_concat_all([head, b", and a call site is undecided: ", w.text]), Some(w.cause), k),
-        None -> site_frame(raw.span, b"unknown", bytes_concat(head, b" of a definition this pass cannot name"), Some(CCallerKeeps), k),
+        Some(PSole) -> sited(raw.span, b"reuses", bytes_concat(head, b", and every call site hands one over and stops reading it"), None, k),
+        Some(PShared(w)) -> sited(raw.span, b"copies", bytes_concat_all([head, b", and a caller keeps it: ", w.text]), Some(CCallerKeeps), k),
+        Some(PUnsure(w)) -> sited(raw.span, b"unknown", bytes_concat_all([head, b", and a call site is undecided: ", w.text]), Some(w.cause), k),
+        None -> sited(raw.span, b"unknown", bytes_concat(head, b" of a definition this pass cannot name"), Some(CCallerKeeps), k),
       }
     },
   }
 
-fn def_frame(b: Body) -> Bytes =
-  bytes_concat_all([b"def ", b.kind, b" ",
-                    match b.reuse { Some(s) -> bytes_concat_all([num(s.start), b" ", num(s.end)]), None -> b"- -" },
-                    b" ", num(bytes_len(b.module_name)), b" ", num(bytes_len(b.name)), b" ", num(bytes_len(b.label)), b"\n",
-                    b.module_name, b.name, b.label])
+fn site_frame(s: Site) -> Bytes =
+  bytes_concat_all([b"site ", num(s.start), b" ", num(s.end), b" ", s.verdict, b" ",
+                    if s.param < 0 { b"-" } else { num(s.param) }, b" ",
+                    num(bytes_len(s.reason)), b" ", num(bytes_len(s.fix)), b"\n", s.reason, s.fix])
+
+fn def_frame(d: Costed) -> Bytes =
+  bytes_concat_all([b"def ", d.kind, b" ",
+                    match d.reuse { Some(s) -> bytes_concat_all([num(s.start), b" ", num(s.end)]), None -> b"- -" },
+                    b" ", num(bytes_len(d.module_name)), b" ", num(bytes_len(d.name)), b" ", num(bytes_len(d.label)), b"\n",
+                    d.module_name, d.name, d.label])
 
 fn quoted(s: Bytes) -> Bytes =
   bytes_concat_all([b"\"", bytes_concat_all(map(range(0, bytes_len(s)), |i: Int| {
@@ -481,7 +494,12 @@ fn bodies_of(mods: List<Mod>, index: Map<Bytes, Int>) -> List<Body> =
     })
   })
 
-fn program_of(names: List<Bytes>, srcs: List<Bytes>, builtins: List<Bytes>) -> Option<Prog> = {
+// Every name the checker binds as a builtin, which is what tells a call to `push` from a call to
+// a definition.
+fn builtins() -> List<Bytes> =
+  map(builtin_schemes(0, 1, 2, 0), |x: { name: Bytes, sc: Scheme }| x.name)
+
+fn program_of(names: List<Bytes>, srcs: List<Bytes>) -> Option<Prog> = {
   let parsed = map(range(0, len(names)), |i: Int| {
     let r = parse(at(srcs, i));
     let x = expand(r.node, r.p.uses_sets, r.p.diags);
@@ -496,26 +514,39 @@ fn program_of(names: List<Bytes>, srcs: List<Bytes>, builtins: List<Bytes>) -> O
           match it { IFn(d) -> push(a, { name: qualify(m.name, d.name.name), arity: len(d.params) }), _ -> a }));
         let index = fold(range(0, len(defs)), map_new(), |acc: Map<Bytes, Int>, i: Int| map_insert(acc, at(defs, i).name, i));
         Some({ r: x.r, index: index, defs: defs, bodies: bodies_of(x.mods, index),
-               builtins: fold(builtins, map_new(), |acc: Map<Bytes, Bool>, b: Bytes| map_insert(acc, b, true)) })
+               builtins: fold(builtins(), map_new(), |acc: Map<Bytes, Bool>, b: Bytes| map_insert(acc, b, true)) })
       },
     }
   }
 }
 
-// `rounds <n>\n`, then per definition with an append a `def` frame and its `site` frames, each text length-prefixed in its header.
-pub fn costs_dump(names: List<Bytes>, srcs: List<Bytes>, builtins: List<Bytes>) -> String =
-  match program_of(names, srcs, builtins) {
-    None -> string_of_bytes(b""),
+// Every append of the program with its verdict, for a caller that wants the answer rather than
+// its framing.
+pub fn costs(names: List<Bytes>, srcs: List<Bytes>) -> Report =
+  match program_of(names, srcs) {
+    None -> { ok: false, rounds: 0, defs: [] },
     Some(p) -> {
       let settled = fixpoint(p, start_tables(p.defs), 0);
       // Verdicts come from a walk under the settled tables, not the round that produced them.
       let found = round(p, settled.tables);
-      string_of_bytes(bytes_concat_all(fold(range(0, len(p.bodies)), [bytes_concat_all([b"rounds ", num(settled.rounds), b"\n"])],
-        |acc: List<Bytes>, i: Int| {
+      { ok: true, rounds: settled.rounds,
+        defs: fold(range(0, len(p.bodies)), [], |acc: List<Costed>, i: Int| {
           let b: Body = at(p.bodies, i);
           let f: Found = at(found, i);
           if len(f.sites) == 0 { acc }
-          else { fold(f.sites, push(acc, def_frame(b)), |a: List<Bytes>, raw: Raw| push(a, finish(raw, b.def, settled.tables))) }
-        })))
+          else { push(acc, { kind: b.kind, module: b.module, module_name: b.module_name, name: b.name,
+                             label: b.label, reuse: b.reuse,
+                             sites: map(f.sites, |raw: Raw| finish(raw, b.def, settled.tables)) }) }
+        }) }
     },
   }
+
+// `rounds <n>\n`, then per definition with an append a `def` frame and its `site` frames, each text length-prefixed in its header.
+pub fn costs_dump(names: List<Bytes>, srcs: List<Bytes>) -> String = {
+  let r: Report = costs(names, srcs);
+  if !r.ok { string_of_bytes(b"") } else {
+    string_of_bytes(bytes_concat_all(fold(r.defs, [bytes_concat_all([b"rounds ", num(r.rounds), b"\n"])],
+      |acc: List<Bytes>, d: Costed|
+        fold(d.sites, push(acc, def_frame(d)), |a: List<Bytes>, s: Site| push(a, site_frame(s))))))
+  }
+}

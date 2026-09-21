@@ -1,0 +1,294 @@
+// How `ply check --types` lays a signature out, and the effect-set provenance `--explain` adds.
+// The width is fixed rather than the terminal's, because this output is diffed.
+
+import compiler.tycore (Atom, Row, RNamed, RSingleton, Type, TyVar, TyCon, TyFn, Scheme,
+                        Printer, printer_new, reserve_atoms, print_atom_list, print_row,
+                        print_scheme, atom_text, atom_covers, row_empty, row_closed, row_is_pure,
+                        append)
+import compiler.types (Mode, MRead, MWrite)
+import compiler.infer (DefInfo)
+import compiler.front (SetView)
+import report (count_of)
+
+// Counted from the terminal's left edge, so callers subtract their indent.
+pub fn width() -> Int = 80
+
+// A row as separate atoms, so no atom is ever broken across a line. `tail` is named by the same
+// printer as the head it was lifted out of, so the two agree on it.
+pub type RowText = { atoms: List<String>, tail: Option<String> }
+
+// A signature split at its top-level effect row; `row` is `None` for a pure definition, which
+// prints no row at all.
+pub type Split = { head: String, row: Option<RowText> }
+
+// One `effect set` as `--explain` reports it.
+pub type SetLine = { name: String, atoms: List<String>, used_by: Int }
+
+// What a definition's row was written as, and what its body actually performed. `performed` is
+// `None` when it equals the declared row.
+pub type Provenance = { aliases: List<String>, performed: Option<List<String>>, unperformed: List<String> }
+
+fn text_of(b: Bytes) -> String = string_of_bytes_lossy(b)
+
+fn texts(bs: List<Bytes>) -> List<String> = map(bs, |b: Bytes| text_of(b))
+
+pub fn spaces(n: Int) -> String = fold(range(0, n), "", |acc: String, i: Int| acc ++ " ")
+
+fn pad_right(s: String, n: Int) -> String =
+  if string_len(s) >= n { s } else { s ++ spaces(n - string_len(s)) }
+
+fn trim_end(s: String) -> String =
+  if string_ends_with(s, " ") { trim_end(string_slice(s, 0, string_len(s) - 1)) } else { s }
+
+// --- The split ------------------------------------------------------------------
+
+fn whole(sc: Scheme) -> Split = { head: text_of(print_scheme(printer_new(), sc).s), row: None }
+
+fn lifted(sc: Scheme, params: List<Type>, ret: Type, effects: Row) -> Split = {
+  // The row is printed apart from the head it was lifted out of, so the printer is told what it
+  // holds before it names a label of its own.
+  let reserved: Printer = reserve_atoms(printer_new(), effects.atoms);
+  let head = print_scheme(reserved,
+    { ty_vars: sc.ty_vars, row_vars: sc.row_vars, label_vars: sc.label_vars,
+      ty: TyFn({ params: params, ret: ret, effects: row_empty() }) });
+  let listed = print_atom_list(head.p, effects.atoms);
+  let tail = match effects.tail {
+    None -> None,
+    Some(v) -> Some(text_of(print_row(listed.p, { atoms: [], tail: Some(v) }).s)),
+  };
+  { head: text_of(head.s), row: Some({ atoms: texts(listed.ss), tail: tail }) }
+}
+
+pub fn split(sc: Scheme) -> Split =
+  match sc.ty {
+    TyFn(f) -> if row_is_pure(f.effects) { whole(sc) } else { lifted(sc, f.params, f.ret, f.effects) },
+    _ -> whole(sc),
+  }
+
+// --- Placing items across lines --------------------------------------------------
+
+type Filling = { lines: List<String>, line: String, col: Int }
+
+// Places `items` across lines, `first` before the first line and `rest` before every other.
+pub fn fill(first: String, rest: String, items: List<String>, suffix: String, width: Int) -> List<String> =
+  if len(items) == 0 { [first ++ suffix] } else {
+    let start = string_len(rest);
+    let opened = string_len(first);
+    let empty: Filling = { lines: [], line: first, col: opened };
+    let out = fold(range(0, len(items)), empty, |acc: Filling, i: Int| {
+      let item = match list_at(items, i) { Some(x) -> x, None -> "" };
+      let last = i + 1 == len(items);
+      let piece = if last { item ++ suffix } else { item ++ ", " };
+      // The separator's trailing space may overflow, so an exact fit is not wrapped.
+      let printed = if last { string_len(piece) } else { string_len(piece) - 1 };
+      let fresh = if len(acc.lines) == 0 { opened } else { start };
+      let placed: Filling =
+        if acc.col > fresh && acc.col + printed > width {
+          { lines: push(acc.lines, trim_end(acc.line)), line: rest, col: start }
+        } else { acc };
+      { lines: placed.lines, line: placed.line ++ piece, col: placed.col + string_len(piece) }
+    });
+    push(out.lines, trim_end(out.line))
+  }
+
+// `/ {a, b, c}`, wrapped, with continuations aligned inside the brace.
+fn row_lines(indent: Int, gutter: String, r: RowText) -> List<String> =
+  match r.tail {
+    Some(t) ->
+      if len(r.atoms) == 0 { [gutter ++ "/ " ++ t] }
+      else { fill(gutter ++ "/ {", gutter ++ "   ", r.atoms, " | " ++ t ++ "}", width() - indent) },
+    None -> fill(gutter ++ "/ {", gutter ++ "   ", r.atoms, "}", width() - indent),
+  }
+
+pub fn definition_lines(indent: Int, label_width: Int, label: String, sc: Scheme) -> List<String> = {
+  let sp: Split = split(sc);
+  let head = pad_right(label, label_width) ++ " : " ++ sp.head;
+  match sp.row {
+    None -> [head],
+    Some(r) -> {
+      let held = if label_width > string_len(label) { label_width } else { string_len(label) };
+      append([head], row_lines(indent, spaces(held + 3), r))
+    },
+  }
+}
+
+// --- Effect sets ------------------------------------------------------------------
+
+fn includes_of(sets: List<SetView>, name: Bytes) -> List<Bytes> =
+  fold(sets, [], |acc: List<Bytes>, s: SetView| if s.name == name { s.includes } else { acc })
+
+fn with_name(names: List<Bytes>, name: Bytes) -> List<Bytes> =
+  if fold(names, false, |acc: Bool, n: Bytes| acc || n == name) { names } else { push(names, name) }
+
+fn one_round(sets: List<SetView>, seen: List<Bytes>) -> List<Bytes> =
+  fold(seen, seen, |acc: List<Bytes>, n: Bytes|
+    fold(includes_of(sets, n), acc, |a: List<Bytes>, x: Bytes| with_name(a, x)))
+
+// Every set a row reaches, directly or through another set. A set cannot include itself, so the
+// number of sets bounds the rounds.
+fn reached(sets: List<SetView>, aliases: List<Bytes>) -> List<Bytes> =
+  fold(range(0, len(sets) + 1), fold(aliases, [], with_name), |acc: List<Bytes>, i: Int| one_round(sets, acc))
+
+fn bumped(uses: Map<Bytes, Int>, name: Bytes) -> Map<Bytes, Int> =
+  match map_get(uses, name) {
+    Some(k) -> map_insert(uses, name, k + 1),
+    None -> map_insert(uses, name, 1),
+  }
+
+fn counted(sets: List<SetView>, defs: List<DefInfo>) -> Map<Bytes, Int> =
+  fold(defs, map_new(), |acc: Map<Bytes, Int>, d: DefInfo|
+    fold(reached(sets, d.row_aliases), acc, bumped))
+
+// The sets a module declares, each with the definitions whose written row named it.
+pub fn effect_sets(sets: List<SetView>, defs: List<DefInfo>) -> List<SetLine> = {
+  let uses = counted(sets, defs);
+  map(sets, |s: SetView|
+    { name: text_of(s.name),
+      atoms: map(s.atoms, |a: Atom| text_of(atom_text(a))),
+      used_by: match map_get(uses, s.name) { Some(k) -> k, None -> 0 } })
+}
+
+pub fn set_lines(v: SetLine, indent: Int) -> List<String> =
+  append(append(["effect set " ++ v.name], fill("  = {", "     ", v.atoms, "}", width() - indent)),
+         ["  used by " ++ count_of(v.used_by, "definition")])
+
+// --- Provenance --------------------------------------------------------------------
+
+fn performs(performed: List<Atom>, declared: Atom) -> Bool =
+  fold(performed, false, |acc: Bool, p: Atom| acc || atom_covers(declared, p))
+
+pub fn provenance(d: DefInfo) -> Provenance = {
+  // Declared atoms covering nothing the body performed.
+  let undone = filter(d.footprint, |a: Atom| !performs(d.performed, a));
+  let unperformed = texts(print_atom_list(printer_new(), undone).ss);
+  let performed: Option<List<String>> =
+    if len(unperformed) == 0 { None } else { Some(texts(print_atom_list(printer_new(), d.performed).ss)) };
+  { aliases: texts(d.row_aliases), performed: performed, unperformed: unperformed }
+}
+
+pub fn is_bare(p: Provenance) -> Bool =
+  len(p.aliases) == 0 && (match p.performed { None -> true, Some(_) -> false })
+
+pub fn provenance_lines(p: Provenance, indent: Int) -> List<String> = {
+  let room = width() - indent;
+  let written = if len(p.aliases) == 0 { [] }
+                else { fill("  written as     / {", "                     ", p.aliases, "}", room) };
+  let performed = match p.performed {
+    None -> written,
+    Some(atoms) -> append(written, fill("  body performs  {", "                  ", atoms, "}", room)),
+  };
+  if len(p.unperformed) == 0 { performed }
+  else { append(performed, fill("  declared, not performed: ", "    ", p.unperformed, "", room)) }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn tycon(name: Bytes) -> Type = TyCon({ name: name, args: [] })
+
+fn fn_scheme(effects: Row, row_vars: List<Int>) -> Scheme =
+  { ty_vars: [], row_vars: row_vars, label_vars: [],
+    ty: TyFn({ params: [tycon(b"Request")], ret: tycon(b"Response"), effects: effects }) }
+
+fn named(effect: Bytes, mode: Mode, resource: Option<Bytes>) -> Atom =
+  { effect: effect, mode: mode, op: None,
+    resource: match resource { Some(r) -> RNamed(r), None -> RSingleton } }
+
+test "a pure definition prints no row at all" {
+  assert_eq(definition_lines(5, 12, "endpoint_of", fn_scheme(row_empty(), [])),
+            ["endpoint_of  : (Request) -> Response"])
+}
+
+// Wrapped at a fixed column, with the atoms hanging under the first rather than run off the edge.
+test "a long row wraps inside the brace and aligns" {
+  let row = row_closed([named(b"db", MRead, Some(b"inventory")), named(b"db", MRead, Some(b"orders")),
+                        named(b"db", MRead, Some(b"users")), named(b"db", MWrite, Some(b"orders")),
+                        named(b"http", MWrite, Some(b"outbound")), named(b"log", MWrite, None)]);
+  assert_eq(definition_lines(5, 12, "create_order", fn_scheme(row, [])),
+            ["create_order : (Request) -> Response",
+             "               / {db.read[inventory], db.read[orders], db.write[orders],",
+             "                  db.read[users], http.write[outbound], log.write}"])
+}
+
+// A row variable is named once, by one printer, so the quantifier and the row cannot drift apart.
+test "a row variable survives the split with one name" {
+  let row: Row = { atoms: [named(b"net", MWrite, Some(b"conn"))], tail: Some(3) };
+  assert_eq(definition_lines(5, 4, "serve", fn_scheme(row, [3])),
+            ["serve : <| e>(Request) -> Response", "        / {net.write[conn] | e}"]);
+  assert_eq(definition_lines(5, 3, "run", fn_scheme({ atoms: [], tail: Some(0) }, [0])),
+            ["run : <| e>(Request) -> Response", "      / e"])
+}
+
+test "a type variable keeps its letter across the split" {
+  let sc: Scheme = { ty_vars: [1], row_vars: [2], label_vars: [],
+                     ty: TyFn({ params: [TyVar(1)], ret: TyVar(1),
+                                effects: { atoms: [named(b"log", MWrite, None)], tail: Some(2) } }) };
+  assert_eq(definition_lines(5, 2, "id", sc), ["id : <a | e>(a) -> a", "     / {log.write | e}"])
+}
+
+test "filling never splits an item, even when one item is too wide" {
+  let wide = fold(range(0, 90), "", |acc: String, i: Int| acc ++ "a");
+  assert_eq(fill("[", " ", [wide, "b"], "]", 20), ["[" ++ wide ++ ",", " b]"]);
+  assert_eq(fill("= {", "   ", [], "}", 40), ["= {}"])
+}
+
+test "the set block names the set and spells out its expansion" {
+  let view: SetLine = { name: "Web", used_by: 4,
+                        atoms: ["db.read[inventory]", "db.read[orders]", "db.read[users]",
+                                "db.write[orders]", "http.write[outbound]", "log.write"] };
+  assert_eq(set_lines(view, 5),
+            ["effect set Web",
+             "  = {db.read[inventory], db.read[orders], db.read[users], db.write[orders],",
+             "     http.write[outbound], log.write}",
+             "  used by 4 definitions"]);
+  assert_eq(set_lines({ name: "Web", atoms: ["log.write"], used_by: 1 }, 5),
+            ["effect set Web", "  = {log.write}", "  used by 1 definition"])
+}
+
+fn def_of(aliases: List<Bytes>, declared: List<Atom>, performed: List<Atom>) -> DefInfo =
+  { name: b"m.create_order", module: b"m", simple_name: b"create_order",
+    scheme: fn_scheme(row_empty(), []), footprint: declared, performed: performed,
+    row_aliases: aliases, constraints: [], spec: [], internally_effectful: true,
+    at: { module: 0, span: { start: 0, end: 0 } } }
+
+test "provenance names the alias and the difference the alias hides" {
+  let p = provenance(def_of([b"Web"],
+                            [named(b"db", MRead, Some(b"orders")), named(b"db", MRead, Some(b"users")),
+                             named(b"log", MWrite, None)],
+                            [named(b"db", MRead, Some(b"users")), named(b"log", MWrite, None)]));
+  assert_eq(provenance_lines(p, 5),
+            ["  written as     / {Web}",
+             "  body performs  {db.read[users], log.write}",
+             "  declared, not performed: db.read[orders]"])
+}
+
+test "an alias the body uses completely reports only how it was written" {
+  let exact = [named(b"log", MWrite, None)];
+  let p = provenance(def_of([b"Web"], exact, exact));
+  assert_eq(provenance_lines(p, 5), ["  written as     / {Web}"]);
+  assert_eq(p.unperformed, []);
+  let bare = provenance(def_of([], [], []));
+  assert(is_bare(bare));
+  assert_eq(provenance_lines(bare, 5), [])
+}
+
+test "a written row wider than its body is reported without any alias" {
+  let p = provenance(def_of([], [named(b"db", MRead, Some(b"orders")), named(b"log", MWrite, None)],
+                            [named(b"log", MWrite, None)]));
+  assert_eq(provenance_lines(p, 5),
+            ["  body performs  {log.write}", "  declared, not performed: db.read[orders]"])
+}
+
+test "a set is used by every definition that reaches it, through another set or not" {
+  let reads: SetView = { name: b"Reads", includes: [],
+                         atoms: [named(b"m.store", MRead, Some(b"orders"))] };
+  let web: SetView = { name: b"Web", includes: [b"Reads"],
+                       atoms: [named(b"m.store", MRead, Some(b"orders")),
+                               named(b"m.store", MWrite, Some(b"orders"))] };
+  let unused: SetView = { name: b"Unused", includes: [], atoms: [] };
+  let lines = effect_sets([reads, web, unused],
+                          [def_of([b"Reads"], [], []), def_of([b"Web"], [], [])]);
+  assert_eq(map(lines, |l: SetLine| l.name), ["Reads", "Web", "Unused"]);
+  assert_eq(map(lines, |l: SetLine| l.used_by), [2, 1, 0]);
+  assert_eq(match list_at(lines, 1) { Some(l) -> l.atoms, None -> [] },
+            ["m.store.read[orders]", "m.store.write[orders]"])
+}

@@ -1393,7 +1393,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 
 | command | flags |
 | --- | --- |
-| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases; with `--types`, effect sets and provenance), `--no-incremental` |
+| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases; with `--types`, effect sets and provenance) |
 | `ply test [path]` | `--filter`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--trace auto\|always\|never`, `--backend`, `--profile`, `--std`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--timeout` (default no bound), `--backend`, `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`, `--backend`, host, trace, prove, simulation |
@@ -1413,15 +1413,18 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply cache clear\|stats\|compact [path]` | discard results / report size and reclaimable space / reclaim it |
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 
-`ply fmt`, `ply defs`, `ply hash`, `ply doc` and `ply explain` are one Ply
-program (`crates/ply-cli/ply`, entered at `ply.main`). `ply` parses the command
-line, binds the directory the load is rooted at as the program's one writable
-filesystem root and the modules it ships as a read-only second one, and answers
-with the code the program asked to exit with. A path is therefore relative to
-its root, and one that leaves it is refused with `E0452`. The first run after
-`ply` or the program itself changes compiles the program's unit, which needs the
-C toolchain `ply run` needs and takes a few seconds; every later run loads the
-compiled object and the front end it filed beside it.
+`ply check`, `ply fmt`, `ply defs`, `ply hash`, `ply doc` and `ply explain` are
+one Ply program (`crates/ply-cli/ply`, entered at `ply.main`). `ply` parses the
+command line, binds the directory the load is rooted at as the program's one
+writable filesystem root and the modules it ships as a read-only second one, and
+answers with the code the program asked to exit with. A path is therefore
+relative to its root, and one that leaves it is refused with `E0452`. The first
+run after `ply` or the program itself changes compiles the program's unit, which
+needs the C toolchain `ply run` needs and takes a few seconds; every later run
+loads the compiled object and the front end it filed beside it. These commands
+run the whole front end every time: the front-end cache under `.ply-cache` is
+read and written by `ply test`, `ply prove` and `ply review`, and by nothing
+else.
 
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed
