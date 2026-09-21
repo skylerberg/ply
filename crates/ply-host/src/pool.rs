@@ -2,8 +2,8 @@
 //! One [`Pool`] per facility, minting in disjoint token ranges.
 
 use ply_eval::{Pending, Value};
-use ply_span::{Diagnostic, Span, codes};
-use std::collections::HashMap;
+use ply_span::{Diagnostic, Span, Symbol, codes};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -15,6 +15,15 @@ pub const NET_FIRST_TOKEN: u64 = 1;
 /// Far enough above [`NET_FIRST_TOKEN`] that the two ranges never meet.
 pub const FS_FIRST_TOKEN: u64 = 1 << 62;
 
+/// Far enough above [`FS_FIRST_TOKEN`] that the two ranges never meet.
+pub const PROCESS_FIRST_TOKEN: u64 = 1 << 63;
+
+/// How a spawned process ended: its own code, or the signal that killed it.
+pub enum Ended {
+    Exited(i64),
+    Signalled(i64),
+}
+
 pub enum Done {
     Int(i64),
     /// Whether a write happened; a filesystem's state is not the program's error.
@@ -25,6 +34,12 @@ pub enum Done {
     MaybeStrings(Option<Vec<String>>),
     /// A constructor with no fields, by the program-wide name the declaring module gives it.
     Ctor(&'static str),
+    /// A `std.process.Finished`: how a spawned process ended and what it wrote to each stream.
+    Spawned {
+        ended: Ended,
+        out: Vec<u8>,
+        err: Vec<u8>,
+    },
     /// The operation failed in a way that is neither the peer's doing nor a deadline.
     Failed(String),
     Refused(Diagnostic),
@@ -205,6 +220,7 @@ fn take(state: &mut State, token: u64) -> Taken {
             })))
         }
         Done::Ctor(name) => Ok(Value::ctor(name, Vec::new())),
+        Done::Spawned { ended, out, err } => Ok(finished(ended, out, err)),
         Done::Refused(diagnostic) => Err(diagnostic),
         Done::Failed(message) => Err(Diagnostic::error(
             codes::RUNTIME_ERROR,
@@ -212,6 +228,20 @@ fn take(state: &mut State, token: u64) -> Taken {
         )
         .primary(span, "this operation reached the host and the host refused")),
     })
+}
+
+/// The record `std.process.Finished` names, built where the `Value` will live.
+fn finished(ended: Ended, out: Vec<u8>, err: Vec<u8>) -> Value {
+    let ended = match ended {
+        Ended::Exited(code) => Value::ctor("std.process.Exited", vec![Value::Int(code)]),
+        Ended::Signalled(signal) => Value::ctor("std.process.Signalled", vec![Value::Int(signal)]),
+    };
+    let fields: BTreeMap<Symbol, Value> = BTreeMap::from([
+        (Symbol::new("ended"), ended),
+        (Symbol::new("err"), Value::bytes(err)),
+        (Symbol::new("out"), Value::bytes(out)),
+    ]);
+    Value::Record(Arc::new(fields.into_iter().collect()))
 }
 
 /// Built on the polling thread: a `Value` holds `Rc` and never crosses threads.

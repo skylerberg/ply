@@ -34,6 +34,8 @@ pub const TRACE: &str = include_str!("../ply/trace.ply");
 
 pub const SIGNAL: &str = include_str!("../ply/signal.ply");
 
+pub const TIME: &str = include_str!("../ply/time.ply");
+
 /// The trusted list, kept sorted and unique.
 pub const MODULES: &[(&str, &str)] = &[
     ("std.config", CONFIG),
@@ -47,6 +49,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("std.process", PROCESS),
     ("std.router", ROUTER),
     ("std.signal", SIGNAL),
+    ("std.time", TIME),
     ("std.trace", TRACE),
 ];
 
