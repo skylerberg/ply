@@ -626,6 +626,7 @@ fn scheme() -> Scheme {
     Scheme {
         ty_vars: vec![TyVar(0)],
         row_vars: vec![],
+        label_vars: vec![],
         ty: Type::Fn {
             params: vec![Type::Var(TyVar(0))],
             ret: Box::new(Type::int()),
@@ -871,6 +872,7 @@ fn two_definitions_sharing_a_hash_each_keep_their_own_interface() {
     let other = Scheme {
         ty_vars: vec![],
         row_vars: vec![],
+        label_vars: vec![],
         ty: Type::int(),
     };
 
@@ -1841,6 +1843,7 @@ fn counted_scheme(a: u32, e: u32) -> Scheme {
     Scheme {
         ty_vars: vec![TyVar(a)],
         row_vars: vec![ply_ty::RowVar(e)],
+        label_vars: vec![],
         ty: Type::Fn {
             params: vec![Type::Var(TyVar(a))],
             ret: Box::new(Type::Var(TyVar(a))),
@@ -1995,6 +1998,7 @@ fn pin_type_decl() -> CachedDecl {
             scheme: Scheme {
                 ty_vars: vec![TyVar(6)],
                 row_vars: vec![],
+                label_vars: vec![],
                 ty: Type::Fn {
                     params: vec![Type::Var(TyVar(6))],
                     ret: Box::new(Type::Con(
@@ -2073,8 +2077,8 @@ fn the_front_end_entry_encoding_is_pinned() {
 }
 
 const PINNED_FINGERPRINT: &str = "300fe8c0ddf5800c064400b08474309dc35cd462cc7543ee6acf4313248b46ed";
-const PINNED_DEF: &str = "6d1312f0f06072ba7f40f0b201b0a2f8005d0d0fe1d3b44c110f8b6b15a99644";
-const PINNED_TYPE_DECL: &str = "563d17593d11975f979c1714dbf0845f19433439fd5517b15d8d7750dd2d6d91";
+const PINNED_DEF: &str = "f24ab931144fb554c7d18e74f01ee1b0fc8d4c9ae013c322416be59f8681417f";
+const PINNED_TYPE_DECL: &str = "460a925c3059ec0aed17aa1375a0478bad865749d395c75bac605ea4f5c4f18a";
 const PINNED_EFFECT_DECL: &str = "0b5bc11329b83fd823d762923323c2373dfb1e9e985756570dd709013e1a004d";
 const PINNED_BODY: &str = "adf0f67e207566df6efe0eb0ac42e091e3f554a4d7b36ec34cd37b8306f21900";
 

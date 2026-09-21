@@ -338,7 +338,7 @@ fn the_footprint_is_exactly_what_resolve_answers() {
     for row in &binding.listing().rows {
         let resource = match &row.resource {
             Resource::Named(r) => Some(r.clone()),
-            Resource::Singleton => None,
+            Resource::Var(_) | Resource::Singleton => None,
         };
         let bound = binding
             .resolve(&row.effect, &row.op, resource.as_ref())

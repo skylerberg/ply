@@ -84,9 +84,9 @@ fn the_examples_suite_loses_nothing_to_the_region_model() {
     );
 
     let cost = regions::analyse(&corpus, 8);
-    assert_eq!(cost.tests, 186);
-    assert_eq!(cost.isolated_today, 176);
-    assert_eq!(cost.pure, 165);
+    assert_eq!(cost.tests, 189);
+    assert_eq!(cost.isolated_today, 179);
+    assert_eq!(cost.pure, 168);
     assert_eq!(cost.seeded_only, 11);
     assert_eq!(cost.world_backed, 0);
     assert_eq!(cost.newly_serialized, 0);

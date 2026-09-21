@@ -25,10 +25,15 @@ pub struct TyVar(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct RowVar(pub u32);
 
-/// The resource an atom touches.
+/// A resource label a definition is generic over, filled at each call.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub struct LabelVar(pub u32);
+
+/// The resource an atom touches; the variant order is the atom order the compiler sorts rows by.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum Resource {
     Named(Symbol),
+    Var(LabelVar),
     Singleton,
 }
 
@@ -36,9 +41,15 @@ impl fmt::Display for Resource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Resource::Named(s) => write!(f, "[{s}]"),
+            Resource::Var(v) => write!(f, "[{}]", label_var_name(*v)),
             Resource::Singleton => Ok(()),
         }
     }
+}
+
+/// The name a label variable prints under: `l`, `m`, `n`, then a round (`l2`).
+pub fn label_var_name(v: LabelVar) -> String {
+    crate::print::letter_name(crate::print::LABEL_LETTERS, v.0 as usize)
 }
 
 /// Ordering is structural so rows are canonical, which content addressing depends on.
@@ -390,11 +401,12 @@ impl fmt::Display for Type {
     }
 }
 
-/// Row variables generalize alongside type variables.
+/// Row and label variables generalize alongside type variables.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Scheme {
     pub ty_vars: Vec<TyVar>,
     pub row_vars: Vec<RowVar>,
+    pub label_vars: Vec<LabelVar>,
     pub ty: Type,
 }
 
@@ -403,6 +415,7 @@ impl Scheme {
         Scheme {
             ty_vars: Vec::new(),
             row_vars: Vec::new(),
+            label_vars: Vec::new(),
             ty,
         }
     }

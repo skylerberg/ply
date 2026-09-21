@@ -4,7 +4,8 @@ import types (Mode, MRead, MWrite, MBad)
 
 // --- Atoms and rows ---------------------------------------------------------------
 
-pub type Resource = | RNamed(Bytes) | RSingleton
+// `RVar` is a label a definition is generic over: the id is a type variable, bound to `label_type`.
+pub type Resource = | RNamed(Bytes) | RSingleton | RVar(Int)
 
 // `op: None` is the mode atom `effect.mode[resource]`; `Some` names one operation of that effect.
 pub type Atom = { effect: Bytes, resource: Resource, mode: Mode, op: Option<Bytes> }
@@ -16,7 +17,8 @@ pub fn bytes_lt(a: Bytes, b: Bytes) -> Bool = match compare(a, b) { Less -> true
 
 fn resource_lt(a: Resource, b: Resource) -> Bool =
   match a {
-    RNamed(x) -> match b { RNamed(y) -> bytes_lt(x, y), RSingleton -> true },
+    RNamed(x) -> match b { RNamed(y) -> bytes_lt(x, y), RVar(_) -> true, RSingleton -> true },
+    RVar(x) -> match b { RNamed(_) -> false, RVar(y) -> x < y, RSingleton -> true },
     RSingleton -> false,
   }
 
@@ -89,7 +91,7 @@ pub type Type =
   // Sorted by field name.
   | TyRecord(List<Field>)
 
-pub type Scheme = { ty_vars: List<Int>, row_vars: List<Int>, ty: Type }
+pub type Scheme = { ty_vars: List<Int>, row_vars: List<Int>, label_vars: List<Int>, ty: Type }
 
 pub fn con(name: Bytes) -> Type = TyCon({ name: name, args: [] })
 pub fn con1(name: Bytes, a: Type) -> Type = TyCon({ name: name, args: [a] })
@@ -106,7 +108,7 @@ pub fn t_map(k: Type, v: Type) -> Type = TyCon({ name: b"Map", args: [k, v] })
 pub fn t_iter(s: Type, r: Type) -> Type = TyCon({ name: b"Iter", args: [s, r] })
 pub fn t_secret(a: Type) -> Type = con1(b"Secret", a)
 pub fn t_fn(params: List<Type>, ret: Type, effects: Row) -> Type = TyFn({ params: params, ret: ret, effects: effects })
-pub fn mono(t: Type) -> Scheme = { ty_vars: [], row_vars: [], ty: t }
+pub fn mono(t: Type) -> Scheme = { ty_vars: [], row_vars: [], label_vars: [], ty: t }
 
 pub fn fields_sorted(fs: List<Field>) -> List<Field> =
   fold(fs, [], |acc: List<Field>, f: Field| field_insert(acc, f))
@@ -219,9 +221,11 @@ pub fn resolved_tail(s: Subst, r: Row) -> Option<Int> = {
     })
 }
 
+// A label variable bound since the atom was built may now name the same resource as another atom,
+// so the atoms are rebuilt through `atoms_insert` rather than kept.
 pub fn resolve_row(s: Subst, r: Row) -> Row = {
   let bound = map_len(s.row);
-  iterate({ atoms: r.atoms, tail: r.tail, seen: [] }, bound + 2, |st: { atoms: List<Atom>, tail: Option<Int>, seen: List<Int> }|
+  let walked = iterate({ atoms: r.atoms, tail: r.tail, seen: [] }, bound + 2, |st: { atoms: List<Atom>, tail: Option<Int>, seen: List<Int> }|
     match st.tail {
       None -> Stop({ atoms: st.atoms, tail: None }),
       Some(v) ->
@@ -231,8 +235,36 @@ pub fn resolve_row(s: Subst, r: Row) -> Row = {
             None -> Stop({ atoms: st.atoms, tail: st.tail }),
           }
         },
-    })
+    });
+  if !fold(walked.atoms, false, |acc: Bool, a: Atom| acc || (match a.resource { RVar(_) -> true, _ -> false })) { walked }
+  else {
+    { atoms: fold(walked.atoms, [], |acc: List<Atom>, a: Atom| atoms_insert(acc, resolve_atom(s, a))),
+      tail: walked.tail }
+  }
 }
+
+// The label prefix marks the nullary constructor a bound label variable stands for, as regions do.
+pub fn label_prefix() -> Bytes = b"#label:"
+
+pub fn label_type(name: Bytes) -> Type = con(bytes_concat(label_prefix(), name))
+
+pub fn label_of(t: Type) -> Option<Bytes> =
+  match t {
+    TyCon(c) -> if len(c.args) == 0 && bytes_starts_with(c.name, label_prefix()) { Some(bytes_slice(c.name, bytes_len(label_prefix()), bytes_len(c.name))) } else { None },
+    _ -> None,
+  }
+
+pub fn resolve_atom(s: Subst, a: Atom) -> Atom =
+  match a.resource {
+    RVar(v) -> { effect: a.effect, resource: resource_of(shallow(s, TyVar(v)), v), mode: a.mode, op: a.op },
+    _ -> a,
+  }
+
+fn resource_of(t: Type, v: Int) -> Resource =
+  match label_of(t) {
+    Some(n) -> RNamed(n),
+    None -> match t { TyVar(w) -> RVar(w), _ -> RVar(v) },
+  }
 
 pub fn occurs_ty(v: Int, t: Type) -> Bool =
   match t {
@@ -282,7 +314,10 @@ pub fn free_vars(s: Subst, t: Type, acc: Free) -> Free =
     TyFn(fn_) -> {
       let ps = fold(fn_.params, acc, |a: Free, x: Type| free_vars(s, x, a));
       let r = free_vars(s, fn_.ret, ps);
-      match resolved_tail(s, fn_.effects) { Some(v) -> { tys: r.tys, rows: ints_insert(r.rows, v) }, None -> r }
+      let row = resolve_row(s, fn_.effects);
+      let ls = fold(row.atoms, r, |a: Free, x: Atom|
+        match x.resource { RVar(v) -> { tys: ints_insert(a.tys, v), rows: a.rows }, _ -> a });
+      match row.tail { Some(v) -> { tys: ls.tys, rows: ints_insert(ls.rows, v) }, None -> ls }
     },
     TyRecord(fs) -> fold(fs, acc, |a: Free, f: Field| free_vars(s, f.ty, a)),
   }
@@ -344,9 +379,46 @@ fn unify_all(s: Subst, f: Fresh, xs: List<Type>, ys: List<Type>) -> Unified =
   fold(range(0, len(xs)), ok(s, f), |acc: Unified, i: Int|
     match acc.err { Some(_) -> acc, None -> unify(acc.s, acc.f, at(xs, i), at(ys, i)) })
 
-pub fn unify_row(s: Subst, f: Fresh, expected: Row, found: Row) -> Unified = {
-  let a = resolve_row(s, expected);
-  let b = resolve_row(s, found);
+// A free label variable takes the resource the other row names for the same operation, so a
+// caller's concrete label reaches a callee's generic one through an argument's row.
+fn bind_labels(s: Subst, xs: List<Atom>, ys: List<Atom>) -> Subst =
+  fold(xs, s, |acc: Subst, x: Atom| {
+    let a = resolve_atom(acc, x);
+    match a.resource {
+      RVar(v) ->
+        if is_rigid_ty(acc, v) { acc } else {
+          match partner(acc, ys, a, v) {
+            None -> acc,
+            Some(t) -> { ty: map_insert(acc.ty, v, t), row: acc.row, rigid_ty: acc.rigid_ty, rigid_row: acc.rigid_row },
+          }
+        },
+      _ -> acc,
+    }
+  })
+
+fn partner(s: Subst, ys: List<Atom>, x: Atom, v: Int) -> Option<Type> =
+  fold(ys, None, |acc: Option<Type>, y: Atom|
+    match acc {
+      Some(_) -> acc,
+      None -> {
+        let b = resolve_atom(s, y);
+        if b.effect == x.effect && mode_rank(b.mode) == mode_rank(x.mode) && b.op == x.op {
+          match b.resource {
+            RNamed(n) -> Some(label_type(n)),
+            RVar(w) -> if w == v { None } else { Some(TyVar(w)) },
+            RSingleton -> None,
+          }
+        } else { None }
+      },
+    })
+
+pub fn unify_row(s0: Subst, f: Fresh, expected: Row, found: Row) -> Unified = {
+  let x = resolve_row(s0, expected);
+  let y = resolve_row(s0, found);
+  let s = bind_labels(bind_labels(s0, x.atoms, y.atoms), y.atoms, x.atoms);
+  let moved = map_len(s.ty) != map_len(s0.ty);
+  let a = if moved { resolve_row(s, x) } else { x };
+  let b = if moved { resolve_row(s, y) } else { y };
   let only_a = atoms_difference(a.atoms, b.atoms);
   let only_b = atoms_difference(b.atoms, a.atoms);
   let bad = RowMismatch({ expected: a, found: b });
@@ -422,7 +494,7 @@ pub fn env_locals(e: TypeEnv) -> List<{ name: Bytes, sc: Scheme }> =
 
 fn scheme_free(s: Subst, sc: Scheme) -> Free = {
   let fv = free_vars(s, sc.ty, { tys: [], rows: [] });
-  { tys: ints_difference(fv.tys, sc.ty_vars), rows: ints_difference(fv.rows, sc.row_vars) }
+  { tys: ints_difference(ints_difference(fv.tys, sc.ty_vars), sc.label_vars), rows: ints_difference(fv.rows, sc.row_vars) }
 }
 
 // Also closes every binding that reaches no free variable.
@@ -447,48 +519,66 @@ fn rename(t: Type, tys: Map<Int, Type>, rows: Map<Int, Int>) -> Type =
     TyVar(v) -> match map_get(tys, v) { Some(x) -> x, None -> t },
     TyCon(c) -> TyCon({ name: c.name, args: map(c.args, |a: Type| rename(a, tys, rows)) }),
     TyFn(f) -> TyFn({ params: map(f.params, |p: Type| rename(p, tys, rows)), ret: rename(f.ret, tys, rows),
-                      effects: { atoms: f.effects.atoms, tail: match f.effects.tail { None -> None, Some(v) -> Some(match map_get(rows, v) { Some(w) -> w, None -> v }) } } }),
+                      effects: { atoms: fold(f.effects.atoms, [], |acc: List<Atom>, a: Atom| atoms_insert(acc, rename_atom(a, tys))),
+                                 tail: match f.effects.tail { None -> None, Some(v) -> Some(match map_get(rows, v) { Some(w) -> w, None -> v }) } } }),
     TyRecord(fs) -> TyRecord(map(fs, |x: Field| { name: x.name, ty: rename(x.ty, tys, rows) })),
   }
 
-pub type Instantiated = { f: Fresh, ty: Type, args: List<Type> }
+fn rename_atom(a: Atom, tys: Map<Int, Type>) -> Atom =
+  match a.resource {
+    RVar(v) ->
+      match map_get(tys, v) {
+        Some(t) -> { effect: a.effect, resource: resource_of(t, v), mode: a.mode, op: a.op },
+        None -> a,
+      },
+    _ -> a,
+  }
+
+// `labels` are the fresh variables the scheme's label parameters became, in declaration order.
+pub type Instantiated = { f: Fresh, ty: Type, args: List<Type>, labels: List<Type> }
 
 pub fn instantiate_with(sc: Scheme, f: Fresh) -> Instantiated =
-  if len(sc.ty_vars) == 0 && len(sc.row_vars) == 0 { { f: f, ty: sc.ty, args: [] } } else {
+  if len(sc.ty_vars) == 0 && len(sc.row_vars) == 0 && len(sc.label_vars) == 0 { { f: f, ty: sc.ty, args: [], labels: [] } } else {
     let tys = fold(sc.ty_vars, { f: f, m: map_new(), args: [] }, |acc: { f: Fresh, m: Map<Int, Type>, args: List<Type> }, v: Int| {
       let o = fresh_ty(acc.f);
       { f: o.f, m: map_insert(acc.m, v, o.t), args: push(acc.args, o.t) }
     });
-    let rows = fold(sc.row_vars, { f: tys.f, m: map_new() }, |acc: { f: Fresh, m: Map<Int, Int> }, v: Int| {
+    let labels = fold(sc.label_vars, { f: tys.f, m: tys.m, args: [] }, |acc: { f: Fresh, m: Map<Int, Type>, args: List<Type> }, v: Int| {
+      let o = fresh_ty(acc.f);
+      { f: o.f, m: map_insert(acc.m, v, o.t), args: push(acc.args, o.t) }
+    });
+    let rows = fold(sc.row_vars, { f: labels.f, m: map_new() }, |acc: { f: Fresh, m: Map<Int, Int> }, v: Int| {
       let o = fresh_row_var(acc.f);
       { f: o.f, m: map_insert(acc.m, v, o.v) }
     });
-    { f: rows.f, ty: rename(sc.ty, tys.m, rows.m), args: tys.args }
+    { f: rows.f, ty: rename(sc.ty, labels.m, rows.m), args: tys.args, labels: labels.args }
   }
 
 pub fn instantiate(sc: Scheme, f: Fresh) -> { f: Fresh, ty: Type } = { let o = instantiate_with(sc, f); { f: o.f, ty: o.ty } }
 
-pub fn rename_scheme(sc: Scheme, ty_vars: List<Int>, row_vars: List<Int>) -> Type = {
+pub fn rename_scheme(sc: Scheme, ty_vars: List<Int>, row_vars: List<Int>, label_vars: List<Int>) -> Type = {
   let tys = fold(range(0, len(sc.ty_vars)), map_new(), |m: Map<Int, Type>, i: Int| map_insert(m, at(sc.ty_vars, i), TyVar(at(ty_vars, i))));
+  let both = fold(range(0, len(sc.label_vars)), tys, |m: Map<Int, Type>, i: Int| map_insert(m, at(sc.label_vars, i), TyVar(at(label_vars, i))));
   let rows = fold(range(0, len(sc.row_vars)), map_new(), |m: Map<Int, Int>, i: Int| map_insert(m, at(sc.row_vars, i), at(row_vars, i)));
-  rename(sc.ty, tys, rows)
+  rename(sc.ty, both, rows)
 }
 
 pub fn generalize(s: Subst, e: TypeEnv, t: Type) -> { e: TypeEnv, sc: Scheme } = {
   let ty = resolve_ty(s, t);
   let env = env_free_vars(s, e);
   let fv = free_vars(s, ty, { tys: [], rows: [] });
-  { e: env.e, sc: { ty_vars: ints_difference(fv.tys, env.free.tys), row_vars: ints_difference(fv.rows, env.free.rows), ty: ty } }
+  { e: env.e, sc: { ty_vars: ints_difference(fv.tys, env.free.tys), row_vars: ints_difference(fv.rows, env.free.rows), label_vars: [], ty: ty } }
 }
 
 // --- The printer --------------------------------------------------------------------------
 
-pub type Printer = { ty_names: Map<Int, Bytes>, row_names: Map<Int, Bytes> }
+pub type Printer = { ty_names: Map<Int, Bytes>, row_names: Map<Int, Bytes>, label_names: Map<Int, Bytes> }
 
-pub fn printer_new() -> Printer = { ty_names: map_new(), row_names: map_new() }
+pub fn printer_new() -> Printer = { ty_names: map_new(), row_names: map_new(), label_names: map_new() }
 
 fn ty_letters() -> Bytes = b"abcdghijklmnopqrsuvwxyz"
 fn row_letters() -> Bytes = b"eft"
+fn label_letters() -> Bytes = b"lmn"
 
 fn letter_name(letters: Bytes, i: Int) -> Bytes = {
   let n = bytes_len(letters);
@@ -501,7 +591,7 @@ fn ty_name(p: Printer, v: Int) -> { p: Printer, name: Bytes } =
     Some(n) -> { p: p, name: n },
     None -> {
       let name = letter_name(ty_letters(), map_len(p.ty_names));
-      { p: { ty_names: map_insert(p.ty_names, v, name), row_names: p.row_names }, name: name }
+      { p: { ty_names: map_insert(p.ty_names, v, name), row_names: p.row_names, label_names: p.label_names }, name: name }
     },
   }
 
@@ -510,7 +600,16 @@ fn row_name(p: Printer, v: Int) -> { p: Printer, name: Bytes } =
     Some(n) -> { p: p, name: n },
     None -> {
       let name = letter_name(row_letters(), map_len(p.row_names));
-      { p: { ty_names: p.ty_names, row_names: map_insert(p.row_names, v, name) }, name: name }
+      { p: { ty_names: p.ty_names, row_names: map_insert(p.row_names, v, name), label_names: p.label_names }, name: name }
+    },
+  }
+
+fn label_name(p: Printer, v: Int) -> { p: Printer, name: Bytes } =
+  match map_get(p.label_names, v) {
+    Some(n) -> { p: p, name: n },
+    None -> {
+      let name = letter_name(label_letters(), map_len(p.label_names));
+      { p: { ty_names: p.ty_names, row_names: p.row_names, label_names: map_insert(p.label_names, v, name) }, name: name }
     },
   }
 
@@ -522,12 +621,25 @@ pub fn region_of(t: Type) -> Option<Bytes> =
     _ -> None,
   }
 
-pub fn resource_text(r: Resource) -> Bytes = match r { RNamed(s) -> bytes_concat_all([b"[", s, b"]"]), RSingleton -> b"" }
+pub fn print_resource(p: Printer, r: Resource) -> { p: Printer, s: Bytes } =
+  match r {
+    RNamed(n) -> { p: p, s: bytes_concat_all([b"[", n, b"]"]) },
+    RVar(v) -> { let o = label_name(p, v); { p: o.p, s: bytes_concat_all([b"[", o.name, b"]"]) } },
+    RSingleton -> { p: p, s: b"" },
+  }
 
-pub fn atom_text(a: Atom) -> Bytes =
-  bytes_concat_all([a.effect, b".",
-                    match a.op { Some(op) -> op, None -> match a.mode { MRead -> b"read", MWrite -> b"write", MBad -> b"" } },
-                    resource_text(a.resource)])
+pub fn print_atom(p: Printer, a: Atom) -> { p: Printer, s: Bytes } = {
+  let r = print_resource(p, a.resource);
+  { p: r.p,
+    s: bytes_concat_all([a.effect, b".",
+                         match a.op { Some(op) -> op, None -> match a.mode { MRead -> b"read", MWrite -> b"write", MBad -> b"" } },
+                         r.s]) }
+}
+
+// A fresh printer, so a lone atom names its label from the start of the alphabet.
+pub fn atom_text(a: Atom) -> Bytes = print_atom(printer_new(), a).s
+
+pub fn resource_text(r: Resource) -> Bytes = print_resource(printer_new(), r).s
 
 fn join_bytes(xs: List<Bytes>, sep: Bytes) -> Bytes =
   fold(range(0, len(xs)), b"", |acc: Bytes, i: Int| if i == 0 { at(xs, i) } else { bytes_concat_all([acc, sep, at(xs, i)]) })
@@ -577,27 +689,41 @@ fn print_tys(p: Printer, ts: List<Type>) -> { p: Printer, ss: List<Bytes> } =
     { p: o.p, ss: push(acc.ss, o.s) }
   })
 
+// One printer for the whole list, so two label variables in it are told apart.
+pub fn print_atoms(p: Printer, atoms: List<Atom>, sep: Bytes) -> { p: Printer, s: Bytes } = {
+  let out = fold(atoms, { p: p, ss: [] }, |acc: { p: Printer, ss: List<Bytes> }, a: Atom| {
+    let o = print_atom(acc.p, a);
+    { p: o.p, ss: push(acc.ss, o.s) }
+  });
+  { p: out.p, s: join_bytes(out.ss, sep) }
+}
+
+pub fn atoms_text(atoms: List<Atom>, sep: Bytes) -> Bytes = print_atoms(printer_new(), atoms, sep).s
+
 pub fn print_row(p: Printer, r: Row) -> { p: Printer, s: Bytes } = {
-  let atoms = join_bytes(map(r.atoms, atom_text), b", ");
+  let out = print_atoms(p, r.atoms, b", ");
   match r.tail {
-    None -> { p: p, s: bytes_concat_all([b"{", atoms, b"}"]) },
+    None -> { p: out.p, s: bytes_concat_all([b"{", out.s, b"}"]) },
     Some(v) -> {
-      let n = row_name(p, v);
+      let n = row_name(out.p, v);
       if len(r.atoms) == 0 { { p: n.p, s: n.name } }
-      else { { p: n.p, s: bytes_concat_all([b"{", atoms, b" | ", n.name, b"}"]) } }
+      else { { p: n.p, s: bytes_concat_all([b"{", out.s, b" | ", n.name, b"}"]) } }
     },
   }
 }
 
 pub fn print_scheme(p: Printer, sc: Scheme) -> { p: Printer, s: Bytes } = {
-  let body = print_ty(p, sc.ty);
-  if len(sc.ty_vars) == 0 && len(sc.row_vars) == 0 { body } else {
+  // Labels are named in the order a call fills them, so the head and the body read the same there.
+  let body = print_ty(fold(sc.label_vars, p, |acc: Printer, v: Int| label_name(acc, v).p), sc.ty);
+  if len(sc.ty_vars) == 0 && len(sc.row_vars) == 0 && len(sc.label_vars) == 0 { body } else {
     let tys = fold(sc.ty_vars, { p: body.p, ss: [] }, |acc: { p: Printer, ss: List<Bytes> }, v: Int| {
       let o = ty_name(acc.p, v); { p: o.p, ss: push(acc.ss, o.name) } });
-    let rows = fold(sc.row_vars, { p: tys.p, ss: [] }, |acc: { p: Printer, ss: List<Bytes> }, v: Int| {
+    let labels = fold(sc.label_vars, tys, |acc: { p: Printer, ss: List<Bytes> }, v: Int| {
+      let o = label_name(acc.p, v); { p: o.p, ss: push(acc.ss, bytes_concat_all([b"[", o.name, b"]"])) } });
+    let rows = fold(sc.row_vars, { p: labels.p, ss: [] }, |acc: { p: Printer, ss: List<Bytes> }, v: Int| {
       let o = row_name(acc.p, v); { p: o.p, ss: push(acc.ss, o.name) } });
-    let head = if len(tys.ss) > 0 && len(rows.ss) > 0 { bytes_concat_all([b"<", join_bytes(tys.ss, b", "), b" | ", join_bytes(rows.ss, b", "), b">"]) }
-               else if len(tys.ss) > 0 { bytes_concat_all([b"<", join_bytes(tys.ss, b", "), b">"]) }
+    let head = if len(labels.ss) > 0 && len(rows.ss) > 0 { bytes_concat_all([b"<", join_bytes(labels.ss, b", "), b" | ", join_bytes(rows.ss, b", "), b">"]) }
+               else if len(labels.ss) > 0 { bytes_concat_all([b"<", join_bytes(labels.ss, b", "), b">"]) }
                else { bytes_concat_all([b"<| ", join_bytes(rows.ss, b", "), b">"]) };
     { p: rows.p, s: bytes_concat(head, body.s) }
   }
@@ -649,9 +775,57 @@ test "an operation atom sorts after its mode atom, which covers it" {
 }
 
 test "the printer names variables in the order it meets them, rows apart" {
-  let sc = { ty_vars: [7, 3], row_vars: [2], ty: t_fn([TyVar(3), TyVar(7)], t_list(TyVar(3)), row_open(2)) };
+  let sc = { ty_vars: [7, 3], row_vars: [2], label_vars: [], ty: t_fn([TyVar(3), TyVar(7)], t_list(TyVar(3)), row_open(2)) };
   assert_eq(scheme_text(sc), b"<b, a | e>(a, b) -> List<a> / e");
   assert_eq(type_text(TyRecord(fields_sorted([{ name: b"_1", ty: t_int() }, { name: b"_0", ty: t_bool() }]))), b"(Bool, Int)")
+}
+
+test "a label variable sorts between a name and the singleton, and resolves to what it binds" {
+  let named = { effect: b"net", resource: RNamed(b"conn"), mode: MWrite, op: Some(b"send") };
+  let var_ = { effect: b"net", resource: RVar(4), mode: MWrite, op: Some(b"send") };
+  let single = { effect: b"net", resource: RSingleton, mode: MWrite, op: Some(b"send") };
+  assert(atom_lt(named, var_));
+  assert(atom_lt(var_, single));
+  assert_eq(row_text(row_closed([single, var_, named])), b"{net.send[conn], net.send[l], net.send}");
+  // Bound to the label `conn`, the variable atom is the named one and the row holds it once.
+  let s = { ty: map_insert(map_new(), 4, label_type(b"conn")), row: map_new(), rigid_ty: map_new(), rigid_row: map_new() };
+  assert_eq(atom_text(resolve_atom(s, var_)), b"net.send[conn]");
+  assert_eq(row_text(resolve_row(s, row_closed([var_, named]))), b"{net.send[conn]}")
+}
+
+test "a free label variable takes the resource the other row names for its operation" {
+  let f0 = fresh_new();
+  let v = fresh_ty_var(f0);
+  let generic = row_closed([{ effect: b"net", resource: RVar(v.v), mode: MWrite, op: Some(b"send") }]);
+  let concrete = row_closed([{ effect: b"net", resource: RNamed(b"conn"), mode: MWrite, op: Some(b"send") }]);
+  let u = unify_row(subst_new(), v.f, generic, concrete);
+  assert(match u.err { None -> true, Some(_) -> false });
+  assert_eq(row_text(resolve_row(u.s, generic)), b"{net.send[conn]}");
+  // A rigid one is the definition's own label and unifies with nothing else.
+  let bad = unify_row(mark_rigid_ty(subst_new(), v.v), v.f, generic, concrete);
+  assert(match bad.err { Some(RowMismatch(_)) -> true, _ -> false })
+}
+
+test "a scheme prints its label parameters bracketed, among the type parameters" {
+  let atom = { effect: b"net", resource: RVar(5), mode: MWrite, op: Some(b"send") };
+  let sc = { ty_vars: [1], row_vars: [2], label_vars: [5],
+             ty: t_fn([TyVar(1)], t_unit(), { atoms: [atom], tail: Some(2) }) };
+  assert_eq(scheme_text(sc), b"<a, [l] | e>(a) -> Unit / {net.send[l] | e}");
+  // Renaming the label variable leaves the printed scheme alone.
+  let other = { ty_vars: [1], row_vars: [2], label_vars: [9],
+                ty: t_fn([TyVar(1)], t_unit(), { atoms: [{ effect: b"net", resource: RVar(9), mode: MWrite, op: Some(b"send") }], tail: Some(2) }) };
+  assert_eq(scheme_text(other), scheme_text(sc))
+}
+
+test "instantiating a scheme freshens its label parameters and hands them back" {
+  let atom = { effect: b"net", resource: RVar(5), mode: MWrite, op: Some(b"send") };
+  let sc = { ty_vars: [], row_vars: [], label_vars: [5], ty: t_fn([], t_unit(), row_closed([atom])) };
+  let inst = instantiate_with(sc, fresh_new());
+  assert_eq(len(inst.labels), 1);
+  let bound = match at(inst.labels, 0) { TyVar(v) -> v, _ -> 0 - 1 };
+  assert(bound >= 0);
+  let s = { ty: map_insert(map_new(), bound, label_type(b"conn")), row: map_new(), rigid_ty: map_new(), rigid_row: map_new() };
+  assert_eq(type_text(resolve_ty(s, inst.ty)), b"() -> Unit / {net.send[conn]}")
 }
 
 test "generalization skips what the environment still reaches" {

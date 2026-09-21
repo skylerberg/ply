@@ -28,7 +28,9 @@ pub type Expr =
   | EBinary({ span: Span, op: Bytes, lhs: Expr, rhs: Expr })
   | EUnary({ span: Span, op: Bytes, operand: Expr })
   | ELambda({ span: Span, body: Expr, params: List<Param>, ret: Option<TypeExpr> })
-  | EApp({ span: Span, func: Expr, named: List<NamedArg>, args: List<Expr> })
+  // `labels` are the resource labels written at the call: `relay[conn](c)`.
+  | EApp({ span: Span, func: Expr, named: List<NamedArg>, args: List<Expr>,
+           labels: List<Ident> })
   | EIf({ span: Span, cond: Expr, then_branch: Expr, else_branch: Expr })
   | EMatch({ span: Span, scrutinee: Expr, arms: List<MatchArm> })
   | EBlock({ span: Span, tail: Option<Expr>, stmts: List<Stmt> })
@@ -108,7 +110,7 @@ fn set_span(e: Expr, s: Span) -> Expr =
     EBinary(v) -> EBinary({ span: s, op: v.op, lhs: v.lhs, rhs: v.rhs }),
     EUnary(v) -> EUnary({ span: s, op: v.op, operand: v.operand }),
     ELambda(v) -> ELambda({ span: s, body: v.body, params: v.params, ret: v.ret }),
-    EApp(v) -> EApp({ span: s, func: v.func, named: v.named, args: v.args }),
+    EApp(v) -> EApp({ span: s, func: v.func, named: v.named, args: v.args, labels: v.labels }),
     EIf(v) -> EIf({ span: s, cond: v.cond, then_branch: v.then_branch,
                     else_branch: v.else_branch }),
     EMatch(v) -> EMatch({ span: s, scrutinee: v.scrutinee, arms: v.arms }),
@@ -189,10 +191,11 @@ fn src_over(c: Ctx, s: Span) -> Bytes = bytes_slice(c.src, s.start, s.end)
 
 pub fn expr(c: Ctx, p: P) -> Result<R<Expr>, P> = bin_expr(c, p, 1)
 
-// In a scrutinee a `{` opens the arm block, never a record or a block expression.
+// In a scrutinee a `{` opens the arm block, never a record or a block expression — except at the
+// very start, where nothing else can stand and the arms are the `{` after it.
 pub fn scrutinee(c: Ctx, p: P) -> Result<R<Expr>, P> = {
   let saved = p.no_brace;
-  match expr(c, with_no_brace(p, true)) {
+  match expr(c, with_no_brace(p, !at(c, p, t_lbrace()))) {
     Err(q) -> Err(with_no_brace(q, saved)),
     Ok(r) -> Ok({ p: with_no_brace(r.p, saved), node: r.node }),
   }
@@ -252,7 +255,13 @@ fn postfix_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
         Ok(a) ->
           Continue({p: a.p,
                     node: EApp({ span: span_to(expr_span(s.node), a.close),
-                                 func: s.node, named: a.named, args: a.args })}),
+                                 func: s.node, named: a.named, args: a.args,
+                                 labels: [] })}),
+      }
+    } else if at_label_args(c, s) {
+      match label_call(c, s) {
+        Err(q) -> Stop(Err(q)),
+        Ok(r) -> Continue(r),
       }
     } else if at(c, s.p, t_dot()) {
       match postfix_dot(c, s) {
@@ -299,6 +308,36 @@ fn postfix_dot(c: Ctx, s: R<Expr>) -> Result<R<Expr>, P> = {
 }
 
 fn follows_op(k: Tok) -> Bool = k == t_lbracket() || k == t_lparen()
+
+// `relay[conn](c)`: a `[` after a name, holding names, then `(`, fills the callee's label parameters.
+fn at_label_args(c: Ctx, s: R<Expr>) -> Bool =
+  match s.node {
+    EVar(v) -> at(c, s.p, t_lbracket()) && label_args_ahead(c, s.p),
+    _ -> false,
+  }
+
+fn label_args_ahead(c: Ctx, p: P) -> Bool =
+  iterate(1, c.ntok - p.pos + 1, |i: Int|
+    match kind_at(c, p, i) {
+      TIdent(n) ->
+        if kind_at(c, p, i + 1) == t_comma() { Continue(i + 2) }
+        else { Stop(kind_at(c, p, i + 1) == t_rbracket()
+                    && kind_at(c, p, i + 2) == t_lparen()) },
+      _ -> Stop(false),
+    })
+
+fn label_call(c: Ctx, s: R<Expr>) -> Result<R<Expr>, P> = {
+  let o = advance(c, s.p);
+  let {p, node: ls} = comma_list(c, o.p, t_rbracket(), label_name)?;
+  let {p, ..} = expect_close(c, p, t_rbracket(), o.node, b"`]`")?;
+  let a = call_args(c, p)?;
+  Ok({ p: a.p,
+       node: EApp({ span: span_to(expr_span(s.node), a.close), func: s.node,
+                    named: a.named, args: a.args, labels: ls }) })
+}
+
+fn label_name(c: Ctx, p: P) -> Result<R<Ident>, P> =
+  expect_ident(c, p, b"a label name inside `[..]`")
 
 fn opt_resource(c: Ctx, p: P) -> Result<R<Option<Ident>>, P> =
   if !at(c, p, t_lbracket()) { Ok({ p: p, node: None }) } else {
@@ -549,7 +588,8 @@ fn record_update_base(c: Ctx, p: P) -> Result<R<Expr>, P> = {
     if at(c, path.p, t_lparen()) {
       let a = call_args(c, path.p)?;
       Ok({ p: a.p, node: EApp({ span: span_to(expr_span(path.node), a.close),
-                                func: path.node, named: a.named, args: a.args }) })
+                                func: path.node, named: a.named, args: a.args,
+                                labels: [] }) })
     } else {
       Ok(path)
     }
@@ -991,7 +1031,8 @@ pub fn dump_expr(e: Expr) -> Bytes =
                                     dump_expr(v.body)]),
     EApp(v) -> bytes_concat_all([rec(v.span, b"eapp"), dump_expr(v.func),
                                  dump_list(v.args, dump_expr),
-                                 dump_list(v.named, dump_named)]),
+                                 dump_list(v.named, dump_named),
+                                 dump_list(v.labels, dump_ident)]),
     EIf(v) -> bytes_concat_all([rec(v.span, b"eif"), dump_expr(v.cond),
                                 dump_expr(v.then_branch), dump_expr(v.else_branch)]),
     EMatch(v) -> bytes_concat_all([rec(v.span, b"emat"), dump_expr(v.scrutinee),
@@ -1204,11 +1245,11 @@ test "the base of a record update is a path and not an expression" {
 test "a named argument is a node with its own span, its name and its value" {
   assert_eq(dump_expr_of(b"f(1, b: 2)"),
             "0:10:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;2:3:elit;%int;@31;"
-            ++ "#1;5:9:narg;5:6:ident;@62;8:9:elit;%int;@32;#0;");
+            ++ "#1;5:9:narg;5:6:ident;@62;8:9:elit;%int;@32;#0;#0;");
   // The two-token lookahead: `f(x)` is positional and `f(x: 1)` is not.
   assert_eq(dump_expr_of(b"f(x)"),
             "0:4:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;2:3:evar;2:3:qname;?0;"
-            ++ "2:3:ident;@78;#0;#0;")
+            ++ "2:3:ident;@78;#0;#0;#0;")
 }
 
 // Neither `E0124` nor `E0123` fails the parse, so the call is still built and dumped.
@@ -1216,11 +1257,11 @@ test "a positional argument after a named one is refused, once each" {
   // Each offending positional points back at the first named argument.
   assert_eq(dump_expr_of(b"f(a: 1, 2)"),
             "0:10:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;8:9:elit;%int;@32;"
-            ++ "#1;2:6:narg;2:3:ident;@61;5:6:elit;%int;@31;"
+            ++ "#1;2:6:narg;2:3:ident;@61;5:6:elit;%int;@31;#0;"
             ++ "#1;!E0124:8:9:2:1;=8:9:1;=2:6:0;");
   assert_eq(dump_expr_of(b"f(a: 1, 2, 3)"),
             "0:13:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#2;8:9:elit;%int;@32;"
-            ++ "11:12:elit;%int;@33;#1;2:6:narg;2:3:ident;@61;5:6:elit;%int;@31;"
+            ++ "11:12:elit;%int;@33;#1;2:6:narg;2:3:ident;@61;5:6:elit;%int;@31;#0;"
             ++ "#2;!E0124:8:9:2:1;=8:9:1;=2:6:0;!E0124:11:12:2:1;=11:12:1;=2:6:0;")
 }
 
@@ -1289,7 +1330,7 @@ test "a unary operator nests, and a `-` before a literal is an operator here" {
 
 test "application and field access chain left to right" {
   assert_eq(dump_expr_of(b"f(1)(2)"),
-            "0:7:eapp;0:4:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;2:3:elit;%int;@31;#0;#1;5:6:elit;%int;@32;#0;#0;");
+            "0:7:eapp;0:4:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;2:3:elit;%int;@31;#0;#0;#1;5:6:elit;%int;@32;#0;#0;#0;");
   assert_eq(dump_expr_of(b"r.a.b"),
             "0:5:efld;0:3:efld;0:1:evar;0:1:qname;?0;0:1:ident;@72;2:3:ident;@61;4:5:ident;@62;#0;");
 }
@@ -1301,6 +1342,34 @@ test "a `.` before a name and an argument list is a perform, not a field read" {
             "0:9:eprf;0:2:qname;?0;0:2:ident;@6462;3:6:ident;@676574;?0;#1;7:8:evar;7:8:qname;?0;7:8:ident;@6b;#0;");
   assert_eq(dump_expr_of(b"db.get"),
             "0:6:efld;0:2:evar;0:2:qname;?0;0:2:ident;@6462;3:6:ident;@676574;#0;");
+}
+
+test "a call may name the labels it fills" {
+  assert_eq(dump_expr_of(b"relay[conn](c)"),
+            "0:14:eapp;0:5:evar;0:5:qname;?0;0:5:ident;@72656c6179;#1;12:13:evar;"
+            ++ "12:13:qname;?0;12:13:ident;@63;#0;#1;6:10:ident;@636f6e6e;#0;");
+  assert_eq(dump_expr_of(b"f[a, b](x)"),
+            "0:10:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#1;8:9:evar;8:9:qname;?0;"
+            ++ "8:9:ident;@78;#0;#2;2:3:ident;@61;5:6:ident;@62;#0;");
+  // With no call after it the bracket is not a label list, and the expression ends at the name.
+  assert(string_contains(dump_expr_of(b"f[a]"), "!E0001:1:2:"))
+}
+
+// `simulate` stays a name in a scrutinee, which the test below this one holds.
+test "a block-like expression may be a scrutinee or a condition" {
+  let handled = dump_expr_of(b"match handle { g() } with { e.op(x) resume k -> 0 } { y -> y }");
+  assert(!string_contains(handled, "!E"));
+  assert(string_contains(handled, ":emat;"));
+  assert(string_contains(handled, ":ehnd;"));
+  let branched = dump_expr_of(b"match if c { 1 } else { 2 } { y -> y }");
+  assert(!string_contains(branched, "!E"));
+  assert(string_contains(branched, ":eif;"));
+  let nested = dump_expr_of(b"match match x { _ -> 1 } { y -> y }");
+  assert(!string_contains(nested, "!E"));
+  let blocked = dump_expr_of(b"match { x } { y -> y }");
+  assert(!string_contains(blocked, "!E"));
+  assert(string_contains(blocked, ":eblk;"));
+  assert(!string_contains(dump_expr_of(b"if { x } { 1 }"), "!E"))
 }
 
 test "a brace after an `if` scrutinee opens the block, never a record" {
@@ -1356,7 +1425,7 @@ test "a match arm takes a guard and needs a comma unless its body is block-like"
 
 test "a handler takes clauses, a resume binder and at most one `return`" {
   assert_eq(dump_expr_of(b"handle f() with { e.op(a) resume k -> k(a), return v -> v }"),
-            "0:59:ehnd;7:10:eapp;7:8:evar;7:8:qname;?0;7:8:ident;@66;#0;#0;#1;18:42:hcl;18:19:qname;?0;18:19:ident;@65;20:22:ident;@6f70;?0;#1;23:24:ident;@61;?1;33:34:ident;@6b;38:42:eapp;38:39:evar;38:39:qname;?0;38:39:ident;@6b;#1;40:41:evar;40:41:qname;?0;40:41:ident;@61;#0;?1;44:57:rcl;51:52:ident;@76;56:57:evar;56:57:qname;?0;56:57:ident;@76;#0;");
+            "0:59:ehnd;7:10:eapp;7:8:evar;7:8:qname;?0;7:8:ident;@66;#0;#0;#0;#1;18:42:hcl;18:19:qname;?0;18:19:ident;@65;20:22:ident;@6f70;?0;#1;23:24:ident;@61;?1;33:34:ident;@6b;38:42:eapp;38:39:evar;38:39:qname;?0;38:39:ident;@6b;#1;40:41:evar;40:41:qname;?0;40:41:ident;@61;#0;#0;?1;44:57:rcl;51:52:ident;@76;56:57:evar;56:57:qname;?0;56:57:ident;@76;#0;");
   let two = dump_expr_of(b"handle f() with { return a -> a, return b -> b }");
   assert(string_contains(two, "!E0001:33:46:2:0;=33:46:1;=18:31:0;"));
 }
@@ -1382,7 +1451,7 @@ test "in a scrutinee a `{` is the arm block, so `simulate` is a name there" {
 
 test "an argument list clears no_brace so a record may be written inside one" {
   assert_eq(dump_expr_of(b"if f({a: 1}) { 2 }"),
-            "0:18:eif;3:12:eapp;3:4:evar;3:4:qname;?0;3:4:ident;@66;#1;5:11:erec;#1;6:7:ident;@61;9:10:elit;%int;@31;#0;13:18:eblk;#0;?1;15:16:elit;%int;@32;18:18:elit;%unit;#0;");
+            "0:18:eif;3:12:eapp;3:4:evar;3:4:qname;?0;3:4:ident;@66;#1;5:11:erec;#1;6:7:ident;@61;9:10:elit;%int;@31;#0;#0;13:18:eblk;#0;?1;15:16:elit;%int;@32;18:18:elit;%unit;#0;");
 }
 
 test "a list expression, an empty one, and a qualified name" {
@@ -1390,7 +1459,7 @@ test "a list expression, an empty one, and a qualified name" {
             "0:6:elst;#2;1:2:elit;%int;@31;4:5:elit;%int;@32;#0;");
   assert_eq(dump_expr_of(b"[]"), "0:2:elst;#0;#0;");
   assert_eq(dump_expr_of(b"m::f(1)"),
-            "0:7:eapp;0:4:evar;0:4:qname;?1;0:1:ident;@6d;3:4:ident;@66;#1;5:6:elit;%int;@31;#0;#0;");
+            "0:7:eapp;0:4:evar;0:4:qname;?1;0:1:ident;@6d;3:4:ident;@66;#1;5:6:elit;%int;@31;#0;#0;#0;");
 }
 
 test "a parenthesized expression takes the parentheses into its span" {

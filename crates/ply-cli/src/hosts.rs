@@ -703,7 +703,8 @@ impl Observability {
             .filter(|row| row.effect.as_str() == ply_host::trace::EFFECT)
             .filter_map(|row| match &row.resource {
                 ply_ty::ty::Resource::Named(name) => Some(name.as_str().to_string()),
-                ply_ty::ty::Resource::Singleton => None,
+                // A host row names a resource or none; nothing holds a label a caller fills.
+                ply_ty::ty::Resource::Var(_) | ply_ty::ty::Resource::Singleton => None,
             })
             .collect();
         channels.sort();
@@ -1089,7 +1090,7 @@ pub fn row_json(row: &HostRow) -> Value {
         // Null for an operation declared without `[r]`: a singleton, not a resource named that.
         "resource": match &row.resource {
             ply_ty::ty::Resource::Named(name) => json!(name.as_str()),
-            ply_ty::ty::Resource::Singleton => Value::Null,
+            ply_ty::ty::Resource::Var(_) | ply_ty::ty::Resource::Singleton => Value::Null,
         },
         "triple": row.to_string(),
         "handler": row.path,

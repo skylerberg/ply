@@ -148,6 +148,7 @@ fn schemes_read_their_quantifiers_back_in_head_order() {
     let s = Scheme {
         ty_vars: vec![TyVar(7), TyVar(2)],
         row_vars: vec![RowVar(9)],
+        label_vars: vec![],
         ty: func(
             vec![Type::Var(TyVar(2))],
             Type::Var(TyVar(7)),
@@ -178,11 +179,44 @@ fn a_scheme_head_may_quantify_a_variable_the_body_never_uses() {
     let s = Scheme {
         ty_vars: vec![TyVar(0), TyVar(1)],
         row_vars: vec![],
+        label_vars: vec![],
         ty: Type::Var(TyVar(1)),
     };
     let text = print_scheme(&s);
     assert_eq!(text, "<b, a>a");
     assert_eq!(print_scheme(&parse_scheme(text.as_str()).unwrap()), text);
+}
+
+#[test]
+fn a_head_binds_its_label_parameters_and_a_bare_row_names_resources() {
+    let text = "<a, [l] | e>(a) -> Unit / {net.send[l] | e}";
+    let s = parse_scheme(text).unwrap();
+    assert_eq!(s.label_vars, vec![LabelVar(0)]);
+    assert_eq!(print_scheme(&s), text);
+
+    let Type::Fn { effects, .. } = &s.ty else {
+        panic!("not a function");
+    };
+    assert_eq!(
+        effects.atoms.iter().next().unwrap().resource,
+        Resource::Var(LabelVar(0))
+    );
+    for text in ["<[l]>() -> Unit / {net.send[l]}", "<[l], [m]>() -> Unit"] {
+        assert_eq!(print_scheme(&parse_scheme(text).unwrap()), text);
+    }
+
+    // Nothing binds `l` here, so it names a resource like any other label.
+    let bare = parse_row("{net.send[l]}").unwrap();
+    assert_eq!(
+        bare.atoms.iter().next().unwrap().resource,
+        Resource::Named(Symbol::new("l"))
+    );
+    assert_eq!(print_row(&bare), "{net.send[l]}");
+    assert!(
+        parse_scheme("<[x]>Int")
+            .unwrap_err()
+            .contains("not a label variable")
+    );
 }
 
 #[test]

@@ -77,6 +77,7 @@ fn a_scheme_prints_its_quantifiers() {
     let s = Scheme {
         ty_vars: vec![TyVar(0), TyVar(1)],
         row_vars: vec![RowVar(0)],
+        label_vars: vec![],
         ty: Type::Fn {
             params: vec![Type::Var(TyVar(0))],
             ret: Box::new(Type::Var(TyVar(1))),
