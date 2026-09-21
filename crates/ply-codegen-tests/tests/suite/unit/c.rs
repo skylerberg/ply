@@ -120,6 +120,60 @@ pub fn shaped(n: Int) -> Int = { let r = {x: n, y: n + 1}; r.x * 10 + r.y }
     let _ = loaded;
 }
 
+/// A frame that would cross the floor gets a stack of its own, so how deep a program nests is
+/// what its fuel says and not what the thread it runs on happens to have been given. The floor is
+/// moved up to just under this frame, so the guard fires on any machine rather than on a lucky one.
+#[test]
+fn a_recursion_past_what_the_stack_holds_grows_onto_another_and_answers() {
+    const LADDER: &str = "fn ladder(n: Int) -> Int = if n <= 0 { 0 } else { 1 + ladder(n - 1) }";
+    const DEEP: i64 = 20_000;
+    let Some((_loaded, native)) = tests_support::unit(LADDER) else {
+        return;
+    };
+    let entry: ply_codegen::rt::Entry = native.entry("m.ladder").expect("`m.ladder` compiled");
+    let mut ctx = native.context();
+    ctx.begin(DEEP * 2);
+    let here = 0u8;
+    ctx.stack_floor = std::ptr::from_ref(&here) as usize - 64 * 1024;
+    let args = [ply_codegen::heap::imm(DEEP)];
+    let answer = unsafe { entry(&mut ctx, args.as_ptr()) };
+    let (failed, grown) = (ctx.failed, ctx.grown);
+    let raised = ctx.take_failure().map(|d| d.message);
+    let value = ply_codegen::heap::imm_value(answer);
+    ctx.end();
+    assert_eq!(failed, 0, "`m.ladder({DEEP})` raised: {raised:?}");
+    assert_eq!(value, DEEP);
+    assert!(
+        grown > 0,
+        "the call never crossed the floor, so nothing grew"
+    );
+}
+
+/// Growing is not a licence to recurse for ever: the fuel is the bound, and it is what fires.
+#[test]
+fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
+    const SPIN: &str = "fn spin(n: Int) -> Int = 1 + spin(n + 1)";
+    let Some((_loaded, native)) = tests_support::unit(SPIN) else {
+        return;
+    };
+    let entry: ply_codegen::rt::Entry = native.entry("m.spin").expect("`m.spin` compiled");
+    let mut ctx = native.context();
+    ctx.begin(10_000);
+    let here = 0u8;
+    ctx.stack_floor = std::ptr::from_ref(&here) as usize - 64 * 1024;
+    let args = [ply_codegen::heap::imm(0)];
+    let _ = unsafe { entry(&mut ctx, args.as_ptr()) };
+    let failed = ctx.failed;
+    let raised = ctx.take_failure().map(|d| d.message).unwrap_or_default();
+    ctx.end();
+    assert_eq!(
+        failed,
+        ply_codegen::rt::FAILED_OUT_OF_FUEL,
+        "a runaway recursion ended some other way: {raised}"
+    );
+    assert!(raised.contains("bound on nested calls"), "{raised}");
+}
+
 /// `PLY_C_CACHE`, `PLY_C_SKIP` and `cache::UNITS_REUSED` are process-wide: a test that changes or counts them takes this for writing, every other build for reading.
 static CONFIG: std::sync::RwLock<()> = std::sync::RwLock::new(());
 

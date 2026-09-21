@@ -8,6 +8,7 @@ use crate::heap::{
 };
 use crate::list;
 use crate::map;
+use crate::stack::{Stack, switch};
 use ply_eval::arena::Slot;
 use ply_eval::builtins::{cell_in_update, no_such_cell};
 use ply_eval::{Builtin, Closure, ClosureKind, Step, Value, values_equal};
@@ -213,7 +214,7 @@ pub(crate) fn holds_a_handle(value: &Value) -> Option<&'static str> {
 
 /// `Ctx::failed` when the fuel ran out.
 pub const FAILED_OUT_OF_FUEL: i64 = 2;
-/// The prologue found the native stack nearly out before the fuel was.
+/// A call that had to grow the stack could not be given one.
 pub const FAILED_OUT_OF_STACK: i64 = 3;
 /// A clause answered without resuming: `Ctx::unwind` carries its value to its `handle`.
 pub const FAILED_UNWIND: i64 = 4;
@@ -390,6 +391,8 @@ pub struct Ctx {
     pub site_end: i64,
     /// Loop passes since the entry began; every 4096th samples the clock against the deadline.
     pub ticks: i64,
+    /// Stacks this entry has been given beyond the one it started on, so growing is observable.
+    pub grown: u64,
     /// When the running entry's time budget is spent, if it has one.
     deadline: Option<std::time::Instant>,
     time_budget_ms: u64,
@@ -454,6 +457,7 @@ impl Ctx {
             site_start: 0,
             site_end: 0,
             ticks: 0,
+            grown: 0,
             deadline: None,
             time_budget_ms: 0,
             heap: Heap::new(),
@@ -497,6 +501,7 @@ impl Ctx {
         self.failed = 0;
         self.fuel = fuel;
         self.ticks = 0;
+        self.grown = 0;
         self.time_budget_ms = time_budget_ms();
         self.deadline = (self.time_budget_ms > 0).then(|| {
             std::time::Instant::now() + std::time::Duration::from_millis(self.time_budget_ms)
@@ -533,10 +538,11 @@ impl Ctx {
         self.last_entry = self.heap.allocated();
         if std::env::var("PLY_C_PHASES").is_ok() {
             eprintln!(
-                "entry: {} objects allocated, {} recycled, {}MB of chunks",
+                "entry: {} objects allocated, {} recycled, {}MB of chunks, {} stacks grown",
                 self.heap.allocated(),
                 self.heap.recycled(),
-                self.heap.chunk_bytes() / 1_000_000
+                self.heap.chunk_bytes() / 1_000_000,
+                self.grown
             );
             let by_kind = self.heap.allocated_by_kind();
             let mut kinds: Vec<(usize, usize)> = (0..16).map(|k| (k, by_kind[k])).collect();
@@ -868,11 +874,66 @@ pub unsafe extern "C" fn rt_no_fuel(ctx: *mut Ctx) {
     ctx.fail_with(FAILED_OUT_OF_FUEL, d);
 }
 
-/// The prologue's other refusal: this call would nest past what this thread's stack holds.
+/// What a growth that could not be given a stack raises: the one bound left is the platform's.
 pub unsafe extern "C" fn rt_no_stack(ctx: *mut Ctx) {
     let ctx = unsafe { &mut *ctx };
     let d = error("this call would nest past what the native stack holds");
     ctx.fail_with(FAILED_OUT_OF_STACK, d);
+}
+
+/// The handover a grown call runs from: what to enter, with what, where its answer goes, and the
+/// stack pointer to come back to. It lives in [`rt_grow`]'s frame, which the new stack outlives.
+struct Grown {
+    ctx: *mut Ctx,
+    entry: Entry,
+    args: *const i64,
+    answer: i64,
+    back: usize,
+}
+
+/// The new stack's first and only frame: the call, then back to whoever grew it. Nothing switches
+/// into this stack again, so where its own pointer lands is spent with it.
+extern "C" fn run_grown(arg: usize) {
+    let g = arg as *mut Grown;
+    let (ctx, entry, args) = unsafe { ((*g).ctx, (*g).entry, (*g).args) };
+    let answer = unsafe { entry(ctx, args) };
+    let to = unsafe {
+        (*g).answer = answer;
+        (*g).back
+    };
+    let mut spent = 0;
+    unsafe { switch(&mut spent, to) };
+    std::process::abort();
+}
+
+/// The prologue's answer to a frame that would cross the floor: the call runs on a stack of its
+/// own, so how deep a program nests is the fuel's answer and never this thread's. `entry` is the
+/// callee's own `(ctx, args)` form and `args` its arguments, both still held by the caller's frame.
+pub unsafe extern "C" fn rt_grow(ctx: *mut Ctx, entry: i64, args: i64) -> i64 {
+    let Some(stack) = Stack::reserve() else {
+        unsafe { rt_no_stack(ctx) };
+        return 0;
+    };
+    let mut grown = Grown {
+        ctx,
+        // SAFETY: the emitter passes the address of a compiled function's own `(ctx, args)` entry.
+        entry: unsafe { std::mem::transmute::<usize, Entry>(entry as usize) },
+        args: args as usize as *const i64,
+        answer: 0,
+        back: 0,
+    };
+    let handover = &raw mut grown;
+    let sp = stack.prepare(run_grown, handover as usize);
+    let floor = {
+        let c = unsafe { &mut *ctx };
+        c.grown += 1;
+        std::mem::replace(&mut c.stack_floor, stack.floor())
+    };
+    let from = unsafe { &mut (*handover).back };
+    unsafe { switch(from, sp) };
+    let c = unsafe { &mut *ctx };
+    c.stack_floor = floor;
+    unsafe { (*handover).answer }
 }
 
 /// A loop's periodic check: past the entry's deadline, the body stops where it is.
