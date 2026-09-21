@@ -925,6 +925,30 @@ fn each<a>(xs: List<Bytes>, f: (Bytes) -> Result<a, Bytes>) -> Result<List<a>, B
       Ok(ys) -> match f(x) { Err(e) -> Err(e), Ok(y) -> Ok(push(ys, y)) },
     })
 
+// One field read whole. The emitter walks an expression by recursion and each `?` expands to a
+// `match` wrapping the rest of its block, so a reader that wants ten fields nests ten levels and
+// not twenty.
+fn fields(what: Bytes, body: Bytes, keys: List<Bytes>) -> Result<List<KV>, Bytes> =
+  known(what, fields_of(body)?, keys)
+
+fn flagged(what: Bytes, fs: List<KV>, key: Bytes) -> Result<Bool, Bytes> =
+  flag_of(what, key, one_of(what, fs, key)?)
+
+fn counted(what: Bytes, fs: List<KV>, key: Bytes) -> Result<Int, Bytes> =
+  number(what, key, one_of(what, fs, key)?)
+
+fn spanned(what: Bytes, fs: List<KV>, key: Bytes) -> Result<At, Bytes> =
+  at_of(what, one_of(what, fs, key)?)
+
+fn hashed(what: Bytes, fs: List<KV>, key: Bytes) -> Result<Bytes, Bytes> =
+  hash_text(what, key, one_of(what, fs, key)?)
+
+fn hashed_opt(what: Bytes, fs: List<KV>, key: Bytes) -> Result<Option<Bytes>, Bytes> =
+  opt_hash(what, key, opt_of(what, fs, key)?)
+
+fn at_index(what: Bytes, fs: List<KV>, want: Int) -> Result<Int, Bytes> =
+  indexed(what, one_of(what, fs, b"index")?, want)
+
 fn number(what: Bytes, key: Bytes, text: Bytes) -> Result<Int, Bytes> =
   match number_of(text) {
     Some(v) -> Ok(v),
@@ -1033,7 +1057,8 @@ fn diag_part(about: Bytes, acc: DiagParts, f: KV) -> DiagParts =
 
 fn read_diag(index: Int, body: Bytes) -> Result<Diag, Bytes> = {
   let about = bytes_concat(b"diagnostic ", num(index));
-  let fs = known(about, fields_of(body)?, [b"code", b"severity", b"message", b"label", b"note", b"fix", b"edit"])?;
+  let fs = fields(about, body, [b"code", b"severity", b"message", b"label", b"note", b"fix",
+                                b"edit"])?;
   let code = one_of(about, fs, b"code")?;
   let severity = one_of(about, fs, b"severity")?;
   let message = one_of(about, fs, b"message")?;
@@ -1045,7 +1070,8 @@ fn read_diag(index: Int, body: Bytes) -> Result<Diag, Bytes> = {
     match walked.err {
       Some(e) -> Err(e),
       None -> Ok({ code: code, notes: len(walked.notes), labels: walked.labels, text: b"",
-                   message: message, notes_text: walked.notes, severity: severity, fixes: walked.fixes }),
+                   message: message, notes_text: walked.notes, severity: severity,
+                   fixes: walked.fixes }),
     }
   }
 }
@@ -1059,11 +1085,11 @@ fn read_set(what: Bytes, text: Bytes) -> Result<Bytes, Bytes> =
   else { Err(bytes_concat_all([what, b": effect set `", text, b"` is not `<name> <includes> <atoms>`"])) }
 
 fn read_module(name: Bytes, body: Bytes, what: Bytes) -> Result<ModuleRow, Bytes> = {
-  let fs = known(what, fields_of(body)?, [b"index", b"item", b"import", b"effect_set"])?;
-  let text = one_of(what, fs, b"index")?;
-  let index = number(what, b"index", text)?;
-  let sets = each(all_of(fs, b"effect_set"), |s: Bytes| read_set(what, s))?;
-  Ok({ name: name, index: index, items: all_of(fs, b"item"), imports: all_of(fs, b"import"), sets: sets })
+  let fs = fields(what, body, [b"index", b"item", b"import", b"effect_set"])?;
+  let index = counted(what, fs, b"index")?;
+  let sets = each(all_of(fs, b"effect_set"), |x: Bytes| read_set(what, x))?;
+  Ok({ name: name, index: index, items: all_of(fs, b"item"), imports: all_of(fs, b"import"),
+       sets: sets })
 }
 
 fn read_constraint(what: Bytes, text: Bytes) -> Result<Bytes, Bytes> =
@@ -1121,36 +1147,48 @@ fn read_spec(what: Bytes, text: Bytes) -> Result<SpecRow, Bytes> =
     },
   }
 
-fn read_def(name: Bytes, body: Bytes, what: Bytes) -> Result<DefRow, Bytes> = {
-  let fs = known(what, fields_of(body)?,
-                 [b"module", b"simple_name", b"public", b"reuse", b"scheme", b"footprint", b"performed",
-                  b"constraint", b"internally_effectful", b"row_alias", b"param", b"spec", b"span", b"literal"])?;
+// What a `def` frame says once. Read together so no one reader nests a `?` for every field.
+type DefSaid = { module: Bytes, simple: Bytes, public: Bool, reuse: Bool, scheme: Bytes,
+                 footprint: Bytes, performed: Bytes, effectful: Bool, at: At }
+
+fn def_said(what: Bytes, fs: List<KV>) -> Result<DefSaid, Bytes> = {
   let module = one_of(what, fs, b"module")?;
   let simple = one_of(what, fs, b"simple_name")?;
-  let public = flag_of(what, b"public", one_of(what, fs, b"public")?)?;
-  let reused = flag_of(what, b"reuse", one_of(what, fs, b"reuse")?)?;
+  let public = flagged(what, fs, b"public")?;
+  let reused = flagged(what, fs, b"reuse")?;
   let scheme = one_of(what, fs, b"scheme")?;
   let footprint = one_of(what, fs, b"footprint")?;
   let performed = one_of(what, fs, b"performed")?;
-  let effectful = flag_of(what, b"internally_effectful", one_of(what, fs, b"internally_effectful")?)?;
+  let effectful = flagged(what, fs, b"internally_effectful")?;
+  let a = spanned(what, fs, b"span")?;
+  Ok({ module: module, simple: simple, public: public, reuse: reused, scheme: scheme,
+       footprint: footprint, performed: performed, effectful: effectful, at: a })
+}
+
+fn read_def(name: Bytes, body: Bytes, what: Bytes) -> Result<DefRow, Bytes> = {
+  let fs = fields(what, body,
+                  [b"module", b"simple_name", b"public", b"reuse", b"scheme", b"footprint",
+                   b"performed", b"constraint", b"internally_effectful", b"row_alias", b"param",
+                   b"spec", b"span", b"literal"])?;
+  let said = def_said(what, fs)?;
   let constraints = each(all_of(fs, b"constraint"), |c: Bytes| read_constraint(what, c))?;
   let params = each(all_of(fs, b"param"), |p: Bytes| read_param(what, p))?;
-  let specs = each(all_of(fs, b"spec"), |s: Bytes| read_spec(what, s))?;
+  let specs = each(all_of(fs, b"spec"), |x: Bytes| read_spec(what, x))?;
   let literals = each(all_of(fs, b"literal"), |l: Bytes| read_literal(what, l))?;
-  let a = at_of(what, one_of(what, fs, b"span")?)?;
-  Ok({ name: name, module: module, simple_name: simple, public: public, reuse: reused, scheme: scheme,
-       footprint: footprint, performed: performed, constraints: constraints,
-       internally_effectful: effectful, row_aliases: all_of(fs, b"row_alias"), params: params,
-       spec: specs, at: a, literals: literals })
+  Ok({ name: name, module: said.module, simple_name: said.simple, public: said.public,
+       reuse: said.reuse, scheme: said.scheme, footprint: said.footprint,
+       performed: said.performed, constraints: constraints,
+       internally_effectful: said.effectful, row_aliases: all_of(fs, b"row_alias"),
+       params: params, spec: specs, at: said.at, literals: literals })
 }
 
 fn read_type(name: Bytes, body: Bytes, what: Bytes) -> Result<TypeRow, Bytes> = {
-  let fs = known(what, fields_of(body)?, [b"module", b"simple_name", b"public", b"arity", b"span"])?;
+  let fs = fields(what, body, [b"module", b"simple_name", b"public", b"arity", b"span"])?;
   let module = one_of(what, fs, b"module")?;
   let simple = one_of(what, fs, b"simple_name")?;
-  let public = flag_of(what, b"public", one_of(what, fs, b"public")?)?;
-  let arity = number(what, b"arity", one_of(what, fs, b"arity")?)?;
-  let a = at_of(what, one_of(what, fs, b"span")?)?;
+  let public = flagged(what, fs, b"public")?;
+  let arity = counted(what, fs, b"arity")?;
+  let a = spanned(what, fs, b"span")?;
   Ok({ name: name, module: module, simple_name: simple, public: public, arity: arity, at: a })
 }
 
@@ -1163,16 +1201,16 @@ fn indexed(what: Bytes, text: Bytes, want: Int) -> Result<Int, Bytes> = {
 }
 
 fn read_test(body: Bytes, what: Bytes, want: Int) -> Result<TestRow, Bytes> = {
-  let fs = known(what, fields_of(body)?,
-                 [b"key", b"name", b"module", b"index", b"nondet", b"footprint", b"span", b"name_span"])?;
+  let fs = fields(what, body, [b"key", b"name", b"module", b"index", b"nondet", b"footprint",
+                               b"span", b"name_span"])?;
   let key = one_of(what, fs, b"key")?;
   let name = one_of(what, fs, b"name")?;
   let module = one_of(what, fs, b"module")?;
-  let index = indexed(what, one_of(what, fs, b"index")?, want)?;
-  let marked = flag_of(what, b"nondet", one_of(what, fs, b"nondet")?)?;
+  let index = at_index(what, fs, want)?;
+  let marked = flagged(what, fs, b"nondet")?;
   let footprint = one_of(what, fs, b"footprint")?;
-  let a = at_of(what, one_of(what, fs, b"span")?)?;
-  let name_at = at_of(what, one_of(what, fs, b"name_span")?)?;
+  let a = spanned(what, fs, b"span")?;
+  let name_at = spanned(what, fs, b"name_span")?;
   Ok({ key: key, name: name, module: module, index: index, nondet: marked, footprint: footprint,
        at: a, name_at: name_at })
 }
@@ -1187,22 +1225,32 @@ fn read_binder(what: Bytes, text: Bytes) -> Result<BinderRow, Bytes> =
       },
   }
 
-fn read_law(body: Bytes, what: Bytes, want: Int) -> Result<LawRow, Bytes> = {
-  let fs = known(what, fields_of(body)?,
-                 [b"key", b"name", b"module", b"index", b"binder", b"has_guard", b"host", b"footprint",
-                  b"span", b"literal"])?;
+// What a `law` frame says once, beside the binders and literals it repeats.
+type LawSaid = { key: Bytes, name: Bytes, module: Bytes, index: Int, has_guard: Bool, host: Bool,
+                 footprint: Bytes, at: At }
+
+fn law_said(what: Bytes, fs: List<KV>, want: Int) -> Result<LawSaid, Bytes> = {
   let key = one_of(what, fs, b"key")?;
   let name = one_of(what, fs, b"name")?;
   let module = one_of(what, fs, b"module")?;
-  let index = indexed(what, one_of(what, fs, b"index")?, want)?;
-  let binders = each(all_of(fs, b"binder"), |b: Bytes| read_binder(what, b))?;
-  let has_guard = flag_of(what, b"has_guard", one_of(what, fs, b"has_guard")?)?;
-  let hosted = flag_of(what, b"host", one_of(what, fs, b"host")?)?;
+  let index = at_index(what, fs, want)?;
+  let guarded = flagged(what, fs, b"has_guard")?;
+  let hosted = flagged(what, fs, b"host")?;
   let footprint = one_of(what, fs, b"footprint")?;
+  let a = spanned(what, fs, b"span")?;
+  Ok({ key: key, name: name, module: module, index: index, has_guard: guarded, host: hosted,
+       footprint: footprint, at: a })
+}
+
+fn read_law(body: Bytes, what: Bytes, want: Int) -> Result<LawRow, Bytes> = {
+  let fs = fields(what, body, [b"key", b"name", b"module", b"index", b"binder", b"has_guard",
+                               b"host", b"footprint", b"span", b"literal"])?;
+  let said = law_said(what, fs, want)?;
+  let binders = each(all_of(fs, b"binder"), |b: Bytes| read_binder(what, b))?;
   let literals = each(all_of(fs, b"literal"), |l: Bytes| read_literal(what, l))?;
-  let a = at_of(what, one_of(what, fs, b"span")?)?;
-  Ok({ key: key, name: name, module: module, index: index, binders: binders, has_guard: has_guard,
-       host: hosted, footprint: footprint, at: a, literals: literals })
+  Ok({ key: said.key, name: said.name, module: said.module, index: said.index, binders: binders,
+       has_guard: said.has_guard, host: said.host, footprint: said.footprint, at: said.at,
+       literals: literals })
 }
 
 fn read_op(what: Bytes, text: Bytes) -> Result<OpRow, Bytes> =
@@ -1236,42 +1284,48 @@ fn read_op(what: Bytes, text: Bytes) -> Result<OpRow, Bytes> =
   }
 
 fn read_effect(name: Bytes, body: Bytes, what: Bytes) -> Result<EffectRow, Bytes> = {
-  let fs = known(what, fields_of(body)?, [b"module", b"simple_name", b"public", b"nondet", b"op", b"span"])?;
+  let fs = fields(what, body, [b"module", b"simple_name", b"public", b"nondet", b"op", b"span"])?;
   let module = one_of(what, fs, b"module")?;
   let simple = one_of(what, fs, b"simple_name")?;
-  let public = flag_of(what, b"public", one_of(what, fs, b"public")?)?;
-  let marked = flag_of(what, b"nondet", one_of(what, fs, b"nondet")?)?;
+  let public = flagged(what, fs, b"public")?;
+  let marked = flagged(what, fs, b"nondet")?;
   let ops = each(all_of(fs, b"op"), |o: Bytes| read_op(what, o))?;
-  let a = at_of(what, one_of(what, fs, b"span")?)?;
-  let twice = fold(ops, { seen: map_new(), twice: false },
-                   |acc: { seen: Map<Bytes, Bool>, twice: Bool }, o: OpRow|
-                     { seen: map_insert(acc.seen, o.name, true), twice: acc.twice || map_contains(acc.seen, o.name) });
-  if twice.twice { Err(bytes_concat(what, b" declares one operation twice")) }
+  let a = spanned(what, fs, b"span")?;
+  if twice_named(ops) { Err(bytes_concat(what, b" declares one operation twice")) }
   else {
-    Ok({ name: name, module: module, simple_name: simple, public: public, nondet: marked, ops: ops, at: a })
+    Ok({ name: name, module: module, simple_name: simple, public: public, nondet: marked,
+         ops: ops, at: a })
   }
 }
 
+fn twice_named(ops: List<OpRow>) -> Bool = {
+  let walked = fold(ops, { seen: map_new(), twice: false },
+                    |acc: { seen: Map<Bytes, Bool>, twice: Bool }, o: OpRow|
+                      { seen: map_insert(acc.seen, o.name, true),
+                        twice: acc.twice || map_contains(acc.seen, o.name) });
+  walked.twice
+}
+
 fn read_ctor(name: Bytes, body: Bytes, what: Bytes) -> Result<CtorRow, Bytes> = {
-  let fs = known(what, fields_of(body)?,
-                 [b"module", b"simple_name", b"type_name", b"index", b"arity", b"field", b"scheme", b"span"])?;
+  let fs = fields(what, body, [b"module", b"simple_name", b"type_name", b"index", b"arity",
+                               b"field", b"scheme", b"span"])?;
   let module = one_of(what, fs, b"module")?;
   let simple = one_of(what, fs, b"simple_name")?;
   let type_name = one_of(what, fs, b"type_name")?;
-  let index = number(what, b"index", one_of(what, fs, b"index")?)?;
-  let arity = number(what, b"arity", one_of(what, fs, b"arity")?)?;
+  let index = counted(what, fs, b"index")?;
+  let arity = counted(what, fs, b"arity")?;
   let scheme = one_of(what, fs, b"scheme")?;
-  let a = at_of(what, one_of(what, fs, b"span")?)?;
+  let a = spanned(what, fs, b"span")?;
   Ok({ name: name, module: module, simple_name: simple, type_name: type_name, index: index,
        arity: arity, fields: all_of(fs, b"field"), scheme: scheme, at: a })
 }
 
 fn read_hash(name: Bytes, body: Bytes, what: Bytes) -> Result<HashRow, Bytes> = {
-  let fs = known(what, fields_of(body)?,
-                 [b"def", b"own", b"decl", b"spec", b"spec_text", b"dep", b"closure"])?;
-  let def = opt_hash(what, b"def", opt_of(what, fs, b"def")?)?;
-  let own = opt_hash(what, b"own", opt_of(what, fs, b"own")?)?;
-  let decl = opt_hash(what, b"decl", opt_of(what, fs, b"decl")?)?;
+  let fs = fields(what, body, [b"def", b"own", b"decl", b"spec", b"spec_text", b"dep",
+                               b"closure"])?;
+  let def = hashed_opt(what, fs, b"def")?;
+  let own = hashed_opt(what, fs, b"own")?;
+  let decl = hashed_opt(what, fs, b"decl")?;
   let specs = each(all_of(fs, b"spec"), |h: Bytes| hash_text(what, b"spec", h))?;
   let spec_texts = each(all_of(fs, b"spec_text"), |h: Bytes| hash_text(what, b"spec_text", h))?;
   Ok({ name: name, def: def, own: own, decl: decl, specs: specs, spec_texts: spec_texts,
@@ -1288,17 +1342,21 @@ fn opt_hash(what: Bytes, key: Bytes, h: Option<Bytes>) -> Result<Option<Bytes>, 
 fn item_text(what: Bytes, fs: List<KV>, law: Bool) -> Result<Bytes, Bytes> =
   if law { hash_text(what, b"text", one_of(what, fs, b"text")?) } else { Ok(b"") }
 
+fn item_hash_row(what: Bytes, fs: List<KV>, index: Int, key: Bytes, law: Bool) -> Result<ItemHashRow, Bytes> = {
+  let h = hashed(what, fs, b"hash")?;
+  let text = item_text(what, fs, law)?;
+  Ok({ index: index, key: key, hash: h, text: text, deps: all_of(fs, b"dep"),
+       closure: all_of(fs, b"closure") })
+}
+
 fn read_item_hash(body: Bytes, what: Bytes, index: Int, key: Bytes, law: Bool) -> Result<ItemHashRow, Bytes> = {
-  let keys = if law { [b"key", b"hash", b"text", b"dep", b"closure"] } else { [b"key", b"hash", b"dep", b"closure"] };
-  let fs = known(what, fields_of(body)?, keys)?;
+  let keys = if law { [b"key", b"hash", b"text", b"dep", b"closure"] }
+             else { [b"key", b"hash", b"dep", b"closure"] };
+  let fs = fields(what, body, keys)?;
   let written = one_of(what, fs, b"key")?;
   if written != key {
     Err(bytes_concat_all([what, b" is keyed `", written, b"`, but the item it numbers is `", key, b"`"]))
-  } else {
-    let h = hash_text(what, b"hash", one_of(what, fs, b"hash")?)?;
-    let text = item_text(what, fs, law)?;
-    Ok({ index: index, key: key, hash: h, text: text, deps: all_of(fs, b"dep"), closure: all_of(fs, b"closure") })
-  }
+  } else { item_hash_row(what, fs, index, key, law) }
 }
 
 fn read_ordinal_item(what: Bytes, text: Bytes) -> Result<Bytes, Bytes> =
@@ -1341,72 +1399,112 @@ fn missing(seen: Map<Int, Bool>, n: Int) -> Option<Int> =
   fold(range(0, n), None, |acc: Option<Int>, i: Int|
     match acc { Some(_) -> acc, None -> if map_contains(seen, i) { None } else { Some(i) } })
 
-fn table_frame(s: Frames, kind: Bytes, name: Bytes, u: Frame) -> Result<Frames, Bytes> = {
-  let d: Dump = s.dump;
-  let what = what_of(kind, name);
-  let moved: Frames = { at: u.next, index: s.index + 1, leading: false, dump: d, named: s.named,
-                      tested: s.tested, lawed: s.lawed };
-  if kind == b"order" {
-    let fs = known(what, fields_of(u.body)?, [b"module"])?;
-    Ok({..moved, dump: {..d, order: append(d.order, all_of(fs, b"module"))}})
-  } else if kind == b"module" {
+// The frame kinds, in the order their tags number them.
+fn frame_kinds() -> List<Bytes> =
+  [b"order", b"module", b"def", b"type", b"test", b"law", b"effect", b"ctor",
+   b"hash", b"testhash", b"lawhash", b"ordinal", b"body", b"testbody"]
+
+// A kind's tag, or -1 for one this reader does not know. Looked up rather than compared down a
+// chain of `else if`, which nests as deeply as the chain is long and is what the emitter walks.
+fn frame_tag(kind: Bytes) -> Int = {
+  let names = frame_kinds();
+  fold(range(0, len(names)), 0 - 1, |acc: Int, i: Int|
+    if acc >= 0 || at(names, i) != kind { acc } else { i })
+}
+
+fn declared_row(d: Dump, tag: Int, name: Bytes, u: Frame, what: Bytes) -> Result<Dump, Bytes> =
+  if tag == 0 {
+    let fs = fields(what, u.body, [b"module"])?;
+    Ok({..d, order: append(d.order, all_of(fs, b"module"))})
+  } else if tag == 1 {
     let row = read_module(name, u.body, what)?;
-    Ok({..moved, dump: {..d, modules: push(d.modules, row)}})
-  } else if kind == b"def" {
+    Ok({..d, modules: push(d.modules, row)})
+  } else if tag == 2 {
     let row = read_def(name, u.body, what)?;
-    Ok({..moved, dump: {..d, defs: push(d.defs, row)}})
-  } else if kind == b"type" {
+    Ok({..d, defs: push(d.defs, row)})
+  } else {
     let row = read_type(name, u.body, what)?;
-    Ok({..moved, dump: {..d, types: push(d.types, row)}})
-  } else if kind == b"test" {
+    Ok({..d, types: push(d.types, row)})
+  }
+
+fn item_row(d: Dump, tag: Int, name: Bytes, u: Frame, what: Bytes) -> Result<Dump, Bytes> =
+  if tag == 4 {
     let want = numbered(what, name, len(d.tests))?;
     let row = read_test(u.body, what, want)?;
-    Ok({..moved, dump: {..d, tests: push(d.tests, row)}})
-  } else if kind == b"law" {
+    Ok({..d, tests: push(d.tests, row)})
+  } else if tag == 5 {
     let want = numbered(what, name, len(d.laws))?;
     let row = read_law(u.body, what, want)?;
-    Ok({..moved, dump: {..d, laws: push(d.laws, row)}})
-  } else if kind == b"effect" {
+    Ok({..d, laws: push(d.laws, row)})
+  } else if tag == 6 {
     let row = read_effect(name, u.body, what)?;
-    Ok({..moved, dump: {..d, effects: push(d.effects, row)}})
-  } else if kind == b"ctor" {
+    Ok({..d, effects: push(d.effects, row)})
+  } else {
     let row = read_ctor(name, u.body, what)?;
-    Ok({..moved, dump: {..d, ctors: push(d.ctors, row)}})
-  } else if kind == b"hash" {
-    if map_contains(s.named, name) { Err(bytes_concat(what, b" is written twice")) } else {
-      let row = read_hash(name, u.body, what)?;
-      Ok({..moved, named: map_insert(s.named, name, true), dump: {..d, hashes: push(d.hashes, HDef(row))}})
-    }
-  } else if kind == b"testhash" {
-    let i = item_index(what, name, len(d.tests), b"test")?;
-    if map_contains(s.tested, i) { Err(bytes_concat(what, b" is written twice")) } else {
-      let row = read_item_hash(u.body, what, i, at(d.tests, i).key, false)?;
-      Ok({..moved, tested: map_insert(s.tested, i, true), dump: {..d, hashes: push(d.hashes, HTest(row))}})
-    }
-  } else if kind == b"lawhash" {
-    let i = item_index(what, name, len(d.laws), b"law")?;
-    if map_contains(s.lawed, i) { Err(bytes_concat(what, b" is written twice")) } else {
-      let row = read_item_hash(u.body, what, i, at(d.laws, i).key, true)?;
-      Ok({..moved, lawed: map_insert(s.lawed, i, true), dump: {..d, hashes: push(d.hashes, HLaw(row))}})
-    }
-  } else if kind == b"ordinal" {
-    let fs = known(what, fields_of(u.body)?, [b"item"])?;
+    Ok({..d, ctors: push(d.ctors, row)})
+  }
+
+fn bulk_row(d: Dump, tag: Int, name: Bytes, u: Frame, what: Bytes) -> Result<Dump, Bytes> =
+  if tag == 11 {
+    let fs = fields(what, u.body, [b"item"])?;
     let items = each(all_of(fs, b"item"), |x: Bytes| read_ordinal_item(what, x))?;
-    Ok({..moved, dump: {..d, ordinals: push(d.ordinals, { module: name, items: items })}})
-  } else if kind == b"body" {
+    Ok({..d, ordinals: push(d.ordinals, { module: name, items: items })})
+  } else if tag == 12 {
     let bytes = unhexed(what, u.body)?;
-    Ok({..moved, dump: {..d, bodies: push(d.bodies, { name: name, body: bytes })}})
-  } else if kind == b"testbody" {
+    Ok({..d, bodies: push(d.bodies, { name: name, body: bytes })})
+  } else {
     match numbered(what, name, len(d.test_bodies)) {
       Err(e) -> Err(e),
       Ok(_) -> {
         let bytes = unhexed(what, u.body)?;
-        Ok({..moved, dump: {..d, test_bodies: push(d.test_bodies, bytes)}})
+        Ok({..d, test_bodies: push(d.test_bodies, bytes)})
       },
     }
-  } else {
-    Err(bytes_concat_all([b"frame ", num(s.index), b": unknown frame kind `", kind, b"`"]))
   }
+
+// The kinds that only add a row to one table, so the walk's own bookkeeping stays out of them.
+fn table_row(moved: Frames, d: Dump, tag: Int, name: Bytes, u: Frame, what: Bytes) -> Result<Frames, Bytes> = {
+  let row = if tag < 4 { declared_row(d, tag, name, u, what) }
+            else if tag < 8 { item_row(d, tag, name, u, what) }
+            else { bulk_row(d, tag, name, u, what) };
+  match row { Err(e) -> Err(e), Ok(next) -> Ok({..moved, dump: next}) }
+}
+
+// A name is hashed once, and a test's or a law's hash frame names one an earlier frame declared.
+fn hashed_row(s: Frames, moved: Frames, tag: Int, name: Bytes, u: Frame, what: Bytes) -> Result<Frames, Bytes> = {
+  let d: Dump = s.dump;
+  if tag == 8 {
+    if map_contains(s.named, name) { Err(bytes_concat(what, b" is written twice")) } else {
+      let row = read_hash(name, u.body, what)?;
+      Ok({..moved, named: map_insert(s.named, name, true),
+                   dump: {..d, hashes: push(d.hashes, HDef(row))}})
+    }
+  } else if tag == 9 {
+    let i = item_index(what, name, len(d.tests), b"test")?;
+    if map_contains(s.tested, i) { Err(bytes_concat(what, b" is written twice")) } else {
+      let row = read_item_hash(u.body, what, i, at(d.tests, i).key, false)?;
+      Ok({..moved, tested: map_insert(s.tested, i, true),
+                   dump: {..d, hashes: push(d.hashes, HTest(row))}})
+    }
+  } else {
+    let i = item_index(what, name, len(d.laws), b"law")?;
+    if map_contains(s.lawed, i) { Err(bytes_concat(what, b" is written twice")) } else {
+      let row = read_item_hash(u.body, what, i, at(d.laws, i).key, true)?;
+      Ok({..moved, lawed: map_insert(s.lawed, i, true),
+                   dump: {..d, hashes: push(d.hashes, HLaw(row))}})
+    }
+  }
+}
+
+fn table_frame(s: Frames, kind: Bytes, name: Bytes, u: Frame) -> Result<Frames, Bytes> = {
+  let what = what_of(kind, name);
+  let moved: Frames = { at: u.next, index: s.index + 1, leading: false, dump: s.dump,
+                        named: s.named, tested: s.tested, lawed: s.lawed };
+  let tag = frame_tag(kind);
+  if tag < 0 {
+    Err(bytes_concat_all([b"frame ", num(s.index), b": unknown frame kind `", kind, b"`"]))
+  } else if tag >= 8 && tag <= 10 { hashed_row(s, moved, tag, name, u, what) }
+  else { table_row(moved, s.dump, tag, name, u, what) }
 }
 
 fn finish(s: Frames) -> Result<Dump, Bytes> =
