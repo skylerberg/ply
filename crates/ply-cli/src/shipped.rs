@@ -8,6 +8,7 @@ use ply_codegen::c::{bundle, producer};
 use ply_span::{Diagnostic, Span, codes};
 use ply_ty::ModuleName;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// The reserved first segment the compiler's own modules answer to.
 pub const COMPILER_ROOT: &str = "compiler";
@@ -42,25 +43,62 @@ pub fn is_shipped_name(name: &str) -> bool {
     ply_std::is_reserved(name) || is_compiler(name)
 }
 
-/// The whole shelf the port pulls from, in the order the two tables hold it.
-pub fn sources() -> Vec<(String, String)> {
-    ply_std::sources()
-        .map(|(name, text)| (name.to_string(), text.to_string()))
-        .chain(
-            ply_compiler::sources()
-                .map(|(name, text)| (format!("{COMPILER_ROOT}.{name}"), text.to_string())),
-        )
-        .collect()
+/// The whole shelf the port pulls from, in the order the two tables hold it. Built once: the
+/// front end and the emitter must be handed the same bytes, or they resolve the same module two
+/// ways.
+pub fn sources() -> &'static [(String, String)] {
+    static SHELF: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    SHELF.get_or_init(|| {
+        ply_std::sources()
+            .map(|(name, text)| (name.to_string(), text.to_string()))
+            .chain(
+                ply_compiler::sources()
+                    .map(|(name, text)| (format!("{COMPILER_ROOT}.{name}"), shelved(text))),
+            )
+            .collect()
+    })
 }
 
 pub fn source(module: &ModuleName) -> Option<&'static str> {
-    match module.as_str().strip_prefix("compiler.") {
-        Some(rest) => ply_compiler::MODULES
-            .iter()
-            .find(|(name, _)| *name == rest)
-            .map(|(_, text)| *text),
-        None => ply_std::source(module),
+    sources()
+        .iter()
+        .find(|(name, _)| name == module.as_str())
+        .map(|(_, text)| text.as_str())
+}
+
+/// The compiler names its siblings bare; on the shelf they answer to `compiler.<name>`, so each
+/// import of one is rewritten here. It has to be the text: the front end parses it to resolve the
+/// import and the emitter parses it again to name the call, and a rename either one makes on its
+/// own is a rename the other never sees.
+fn shelved(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 512);
+    for line in text.split_inclusive('\n') {
+        match line.strip_prefix("import ") {
+            Some(rest) if is_compiler_module(head_segment(rest)) => {
+                out.push_str("import ");
+                out.push_str(COMPILER_ROOT);
+                out.push('.');
+                out.push_str(rest);
+            }
+            _ => out.push_str(line),
+        }
     }
+    out
+}
+
+/// The first dotted segment of the module path an import line opens with.
+fn head_segment(rest: &str) -> &str {
+    let path = rest
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+        .next()
+        .unwrap_or("");
+    path.split('.').next().unwrap_or("")
+}
+
+fn is_compiler_module(name: &str) -> bool {
+    ply_compiler::MODULES
+        .iter()
+        .any(|(module, _)| *module == name)
 }
 
 pub fn pseudo_path(module: &ModuleName) -> PathBuf {
@@ -99,13 +137,15 @@ pub fn reserved_diagnostic(file: &Path, name: &str) -> Diagnostic {
 
 // --- The `ply fmt` program ---------------------------------------------------
 
-/// What the built program is a function of: its source, the compiler and standard library that
-/// compiled it, and the three store versions a decode refuses a mismatch of.
+/// What the built program is a function of: its source, the shelf it is closed over as the shelf
+/// hands it out, the emitter that compiled it, and the three store versions a decode refuses a
+/// mismatch of.
 pub fn identity() -> String {
     let program = producer::digest_of(&[(FMT_MODULE.to_string(), FMT_SOURCE.to_string())]);
     let mut hasher = blake3::Hasher::new();
     for part in [
         program.as_str(),
+        producer::digest_of(sources()).as_str(),
         producer::identity().as_str(),
         ply_store::FRONTEND_VERSION,
         ply_store::RUNTIME_VERSION,
@@ -184,7 +224,31 @@ fn build_in(dir: &Path) -> Result<Vec<u8>, Diagnostic> {
             None => "nothing said why".to_string(),
         })
     })?;
+    // `ply fmt` enters the artifact's own unit and nothing else, so an artifact whose unit holds
+    // no body for `main` cannot run. It is not landed: the failure belongs to the build, where the
+    // emitter's reasons are still in hand, not to the next run, which would have none.
+    if !built.entry_compiled {
+        return Err(refused_entry(&built));
+    }
     Ok(built.artifact.encode())
+}
+
+#[cold]
+fn refused_entry(built: &crate::artifact::Built) -> Diagnostic {
+    let why = if built.artifact.has_unit() {
+        format!(
+            "its compiled unit holds no body for `{}`, so nothing could be entered",
+            built.entry_name
+        )
+    } else {
+        "no compiled unit could be produced for it at all".to_string()
+    };
+    let diagnostic = unbuilt(why);
+    if built.refused.is_empty() {
+        return diagnostic
+            .note("the emitter refused nothing, so the entry was never offered to it");
+    }
+    diagnostic.note(crate::artifact::refusal_list(&built.refused))
 }
 
 /// By a rename, so a reader never sees half of one.

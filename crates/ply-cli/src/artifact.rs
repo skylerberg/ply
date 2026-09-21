@@ -200,7 +200,21 @@ pub struct Built {
     /// In the order they were named.
     pub startup: Vec<Symbol>,
     pub closure: BTreeMap<String, BTreeSet<String>>,
+    /// What the emitter refused, as `(definition, the construct that refused it)`, in the order
+    /// the fixpoint dropped them: the first are the causes, the rest what those causes carried.
+    pub refused: Vec<(String, String)>,
+    /// Whether the embedded unit holds a body for the entry point. Without one nothing enters it,
+    /// so a caller that can only run from the unit has to refuse the artifact rather than land it.
+    pub entry_compiled: bool,
     pub warnings: Vec<Diagnostic>,
+}
+
+/// What the emitter made of an artifact's definitions.
+struct Emission {
+    unit: Option<EmbeddedUnit>,
+    refused: Vec<(String, String)>,
+    entry_compiled: bool,
+    warnings: Vec<Diagnostic>,
 }
 
 /// The transitive closure of the entry point and of the run's start-up definitions.
@@ -260,15 +274,17 @@ pub fn build(
     // Reopened as a target opens it, so an artifact that builds is one that opens.
     let opened = reopen(&out).map_err(|diags| vec![unreopened(&diags)])?;
     let names: Vec<&str> = out.names.iter().map(|(n, _)| n.as_str()).collect();
-    let (unit, warnings) = embedded_unit(&opened, &names);
-    out.unit = unit;
+    let emission = embedded_unit(&opened, &opened.entry, &names);
+    out.unit = emission.unit;
 
     Ok(Built {
         artifact: out,
         entry_name: entry.name.clone(),
         startup: startup.iter().map(|d| d.name.clone()).collect(),
         closure: restricted_closure(hashes, &reachable),
-        warnings,
+        refused: emission.refused,
+        entry_compiled: emission.entry_compiled,
+        warnings: emission.warnings,
     })
 }
 
@@ -295,7 +311,7 @@ fn closure_texts(artifact: &Artifact) -> Result<Vec<(String, String)>, Vec<Diagn
 }
 
 /// Embedded so `ply run` need not emit and compile C at every run; a failed production is reported.
-fn embedded_unit(opened: &Opened, names: &[&str]) -> (Option<EmbeddedUnit>, Vec<Diagnostic>) {
+fn embedded_unit(opened: &Opened, entry: &Symbol, names: &[&str]) -> Emission {
     ply_codegen::c::producer::ensure_default();
     // Definitions only: no emitter is offered effect or resource declarations.
     let names: Vec<&str> = names
@@ -312,38 +328,55 @@ fn embedded_unit(opened: &Opened, names: &[&str]) -> (Option<EmbeddedUnit>, Vec<
         });
     match produced {
         Ok((produced, text)) => {
+            let refused: Vec<(String, String)> = produced
+                .refused
+                .iter()
+                .map(|r| (r.function.clone(), r.construct.clone()))
+                .collect();
             let mut warnings = Vec::new();
-            if !produced.refused.is_empty() {
-                let listed: Vec<String> = produced
-                    .refused
-                    .iter()
-                    .map(|r| format!("`{}` ({})", r.function, r.construct))
-                    .collect();
+            if !refused.is_empty() {
                 warnings.push(
                     Diagnostic::warning(
                         codes::BACKEND_UNAVAILABLE,
                         format!(
-                            "the emitter refused {} of the artifact's definitions, which will not run from it: {}",
-                            listed.len(),
-                            listed.join(", ")
+                            "the emitter refused {} of the artifact's definitions, which will not run from it",
+                            refused.len()
                         ),
                     )
+                    .note(refusal_list(&refused))
                     .note("a refused definition is entered from nothing at run time; make it one the emitter compiles"),
                 );
             }
-            (Some(EmbeddedUnit { text }), warnings)
+            Emission {
+                unit: Some(EmbeddedUnit { text }),
+                entry_compiled: produced.exports.names().iter().any(|n| n == entry.as_str()),
+                refused,
+                warnings,
+            }
         }
-        Err(e) => (
-            None,
-            vec![
+        Err(e) => Emission {
+            unit: None,
+            refused: Vec::new(),
+            entry_compiled: false,
+            warnings: vec![
                 Diagnostic::warning(
                     codes::BACKEND_UNAVAILABLE,
                     format!("no compiled unit could be produced for the artifact: {e:#}"),
                 )
                 .note("the artifact's bodies are printed back to source and compiled at each run instead"),
             ],
-        ),
+        },
     }
+}
+
+/// Every refusal, in the order the fixpoint dropped them: a cascade names its cause first and
+/// then each body that lost a callee, so reading from the top is reading the reason.
+pub fn refusal_list(refused: &[(String, String)]) -> String {
+    let mut out = String::from("the emitter refused, in the order it dropped them:");
+    for (function, construct) in refused {
+        out.push_str(&format!("\n  `{function}` ({construct})"));
+    }
+    out
 }
 
 fn stale_unit() -> Diagnostic {
@@ -694,7 +727,7 @@ fn ask_the_port(
         ]
     };
     let shelf = crate::shipped::sources();
-    let pulled = ply_codegen::c::producer::front_pulling_std(own, &shelf)
+    let pulled = ply_codegen::c::producer::front_pulling_std(own, shelf)
         .map_err(|e| failed(format!("{e:#}")))?;
     for module in &pulled.modules {
         let name = ModuleName::from_dotted(module);
