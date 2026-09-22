@@ -48,7 +48,9 @@ fn ply(dir: &Path) -> Command {
 
 fn built(dir: &Path) -> (Loaded, artifact::Built) {
     let loaded = load(dir).expect("the corpus should load");
-    let entry = ply_cli::commands::run::entry_point(&loaded).expect("`main` is the entry point");
+    let entry = loaded
+        .sole_entry_point()
+        .expect("`main` is the entry point");
     let built = artifact::build(&loaded, entry, &[]).expect("the closure should build");
     (loaded, built)
 }

@@ -532,7 +532,7 @@ pub struct ReviewArgs {
     pub simulation: SimOptions,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Clone, Debug)]
 pub struct RunArgs {
     /// A `.ply` file, or a project root whose `*.ply` files are modules named by path.
     #[arg(default_value = ".")]

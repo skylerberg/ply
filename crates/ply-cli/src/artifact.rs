@@ -617,7 +617,7 @@ pub fn refusal_list(refused: &[(String, String)]) -> String {
     out
 }
 
-fn stale_unit() -> Diagnostic {
+pub(crate) fn stale_unit() -> Diagnostic {
     Diagnostic::warning(
         codes::ARTIFACT_VERSION,
         "the artifact's compiled unit was built for another runtime and is left aside",
@@ -1120,271 +1120,6 @@ fn entered(
     })
 }
 
-pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
-    use crate::commands::common::{
-        IND, diagnostic_json, diagnostics_json, emit_json, print_diagnostics, print_warnings,
-        report_bind_error,
-    };
-    use crate::{EXIT_COMPILE_ERROR, EXIT_FAILED, EXIT_OK};
-
-    // A closure's positions are in text printed at build, which no reader wrote.
-    let empty = SourceMap::new();
-    let refuse = |diagnostics: &[Diagnostic]| -> i32 {
-        if args.json {
-            emit_json(&serde_json::json!({
-                "command": "run",
-                "ok": false,
-                "exit_code": EXIT_COMPILE_ERROR,
-                "artifact": args.path.display().to_string(),
-                "diagnostics": diagnostics_json(diagnostics, &empty),
-            }));
-        } else {
-            print_diagnostics(diagnostics, &empty, style);
-        }
-        EXIT_COMPILE_ERROR
-    };
-
-    let (artifact, mut warnings) = match read(&args.path) {
-        Ok(pair) => pair,
-        Err(diagnostic) => return refuse(std::slice::from_ref(&diagnostic)),
-    };
-    let opened = match open(&artifact, &args.path) {
-        Ok(opened) => opened,
-        Err(diagnostics) => return refuse(&diagnostics),
-    };
-    // The object is cached, so `evaluate` loading it again costs nothing. A broken, rather than
-    // foreign, unit is passed on and refused loudly there.
-    let unit = match &artifact.unit {
-        Some(unit) => {
-            let served = ply_codegen::c::bundle::unpack(&unit.text)
-                .and_then(|text| ply_codegen::c::served(&text, "artifact"));
-            match served {
-                Err(e) if e.downcast_ref::<ply_codegen::c::Unserved>().is_some() => {
-                    warnings.push(stale_unit());
-                    None
-                }
-                _ => Some(unit),
-            }
-        }
-        None => None,
-    };
-
-    let db = match args.db.resolve(args.host) {
-        Ok(db) => db,
-        Err(diagnostics) => {
-            return report_bind_error("run", &diagnostics, &empty, args.json, style);
-        }
-    };
-    let declared = opened
-        .front
-        .check
-        .defs
-        .get(&opened.entry)
-        .map(|d| d.footprint.clone());
-    // Before the configuration: its schema is entered on this unit.
-    let tier = tier(&opened, args.backend.as_ref(), unit);
-    let constant = |name: &str| match &tier {
-        Ok(tier) => crate::commands::common::enter_constant(
-            tier.as_ref().map(|(provider, _)| *provider),
-            name,
-        ),
-        Err(diagnostic) => Err(diagnostic.clone()),
-    };
-    let (configuration, config_warnings) = match crate::config::Configuration::open(
-        &opened.front.check,
-        args.host,
-        &args.config,
-        &constant,
-    ) {
-        Ok(resolved) => resolved,
-        Err(diagnostics) => {
-            return report_bind_error("run", &diagnostics, &empty, args.json, style);
-        }
-    };
-    if !args.json {
-        print_diagnostics(&config_warnings, &empty, style);
-    }
-    let shutdown = args
-        .host
-        .then(|| ply_host::signal::Shutdown::new(args.shutdown.bounds()));
-    if let Some(shutdown) = &shutdown
-        && let Err(diagnostic) = ply_host::signal::listen(shutdown)
-    {
-        return report_bind_error(
-            "run",
-            std::slice::from_ref(&diagnostic),
-            &empty,
-            args.json,
-            style,
-        );
-    }
-    let process = match args
-        .host
-        .then(|| crate::commands::run::process_host(args))
-        .transpose()
-    {
-        Ok(process) => process,
-        Err(diagnostic) => {
-            return report_bind_error(
-                "run",
-                std::slice::from_ref(&diagnostic),
-                &empty,
-                args.json,
-                style,
-            );
-        }
-    };
-    let hosts = match crate::hosts::Hosts::open_stopping(
-        &opened.front.check,
-        args.host,
-        &args.tls,
-        &args.fs.fs,
-        db,
-        configuration,
-        &args.trace,
-        declared.as_ref(),
-        shutdown.clone(),
-        process,
-        Vec::new(),
-    ) {
-        Ok(hosts) => hosts,
-        Err(diagnostics) => {
-            return report_bind_error("run", &diagnostics, &empty, args.json, style);
-        }
-    };
-    if !args.json {
-        print_warnings(&warnings, style);
-        crate::commands::run::print_binding(&hosts, style);
-        println!(
-            "{IND}{}",
-            style.dim(&format!(
-                "program {} · {} definitions · {}",
-                artifact.digest_short(),
-                artifact.bodies.len(),
-                if unit.is_some() {
-                    "compiled unit embedded"
-                } else {
-                    "no compiled unit: compiled from its bodies at each run"
-                }
-            ))
-        );
-        if let Some(shutdown) = &shutdown {
-            eprintln!(
-                "{IND}{}",
-                style.dim(&format!(
-                    "shutdown    signals {} · lead {}ms · drain {}ms · second signal exits 130/143",
-                    shutdown
-                        .signals()
-                        .iter()
-                        .map(|s| s.name())
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    args.shutdown.drain_lead_ms,
-                    args.shutdown.drain_ms,
-                ))
-            );
-        }
-    }
-
-    let span = opened
-        .front
-        .check
-        .defs
-        .get(&opened.entry)
-        .map(|d| d.span)
-        .unwrap_or(Span::DUMMY);
-    let plan = crate::simulation::run_plan(args.seed.as_ref());
-    let answer =
-        tier.and_then(|tier| evaluate(&opened, span, &plan, &hosts, declared.as_ref(), tier));
-
-    // On the machine's own thread, never from a signal handler.
-    let teardown =
-        crate::commands::run::teardown(&hosts, shutdown.as_ref(), args.shutdown.drain_ms);
-    let teardown_json =
-        crate::commands::run::teardown_json(shutdown.as_ref(), teardown.as_ref(), &args.shutdown);
-    if !args.json {
-        for line in
-            crate::commands::run::stop_lines(&hosts, shutdown.as_ref(), teardown.as_ref(), &answer)
-        {
-            eprintln!("{IND}{}", style.dim(&line));
-        }
-    }
-
-    // The program chose its code and returned no value, so none is printed.
-    if let Some(code) = hosts.requested_exit() {
-        if args.json {
-            emit_json(&serde_json::json!({
-                "command": "run",
-                "ok": code == EXIT_OK,
-                "exit_code": code,
-                "artifact": args.path.display().to_string(),
-                "digest": artifact.digest_short(),
-                "entry": artifact.entry_name(),
-                "definitions": artifact.bodies.len(),
-                "binding": hosts.label(),
-                "hosts": hosts.summary_json(),
-                "value": serde_json::Value::Null,
-                "configuration": hosts.configuration().to_json(),
-                "shutdown": teardown_json,
-                "diagnostics": diagnostics_json(&warnings, &empty),
-            }));
-        }
-        return code;
-    }
-
-    match answer {
-        Ok(value) => {
-            let rendered = value.to_string();
-            if args.json {
-                emit_json(&serde_json::json!({
-                    "command": "run",
-                    "ok": true,
-                    "exit_code": EXIT_OK,
-                    "artifact": args.path.display().to_string(),
-                    "digest": artifact.digest_short(),
-                    "entry": artifact.entry_name(),
-                    "definitions": artifact.bodies.len(),
-                    "binding": hosts.label(),
-                    "hosts": hosts.summary_json(),
-                    "value": rendered,
-                    "configuration": hosts.configuration().to_json(),
-                    "shutdown": teardown_json,
-                    "diagnostics": diagnostics_json(&warnings, &empty),
-                }));
-            } else {
-                println!("{IND}{rendered}");
-            }
-            EXIT_OK
-        }
-        Err(diagnostic) => {
-            // An expired drain is the configuration's fault; exit `3` says requests were lost.
-            let code = if ply_eval::is_drain_incomplete(&diagnostic) {
-                crate::EXIT_DRAIN_INCOMPLETE
-            } else {
-                EXIT_FAILED
-            };
-            if args.json {
-                emit_json(&serde_json::json!({
-                    "command": "run",
-                    "ok": false,
-                    "exit_code": code,
-                    "artifact": args.path.display().to_string(),
-                    "digest": artifact.digest_short(),
-                    "entry": artifact.entry_name(),
-                    "binding": hosts.label(),
-                    "configuration": hosts.configuration().to_json(),
-                    "value": serde_json::Value::Null,
-                    "shutdown": teardown_json,
-                    "diagnostics": [diagnostic_json(&diagnostic, &empty)],
-                }));
-            } else {
-                print_diagnostics(std::slice::from_ref(&diagnostic), &empty, style);
-            }
-            code
-        }
-    }
-}
-
 /// What a caller lends an entered program: the roots it may reach, the programs its
 /// `process.spawn` labels may start, and the host operations only this entry may perform. What is
 /// not lent here, the program cannot reach at all.
@@ -1409,12 +1144,12 @@ pub fn enter(
         executables,
         lent,
     } = binds;
-    // A unit built for another runtime is left aside, as `run` leaves it, and the bodies serve.
-    let unit = artifact.unit.as_ref().filter(|unit| {
-        let served = ply_codegen::c::bundle::unpack(&unit.text)
-            .and_then(|text| ply_codegen::c::served(&text, "artifact"));
-        !matches!(&served, Err(e) if e.downcast_ref::<ply_codegen::c::Unserved>().is_some())
-    });
+    // A unit built for another runtime is left aside and the bodies serve.
+    let unit = if servable(artifact) {
+        artifact.unit.as_ref()
+    } else {
+        None
+    };
     let declared = opened
         .front
         .check
@@ -1452,7 +1187,7 @@ pub fn enter(
         .unwrap_or(Span::DUMMY);
     let plan = crate::simulation::run_plan(None);
     let answer = evaluate(opened, span, &plan, &hosts, declared.as_ref(), tier);
-    let _ = crate::commands::run::teardown(&hosts, None, crate::commands::run::TEARDOWN_FLOOR_MS);
+    let _ = crate::run::teardown(&hosts, None, crate::run::TEARDOWN_FLOOR_MS);
     match hosts.requested_exit() {
         Some(code) => Ok(code),
         None => answer.map(|_| crate::EXIT_OK),
@@ -1468,8 +1203,19 @@ fn bind_failed(diagnostics: &[Diagnostic]) -> Diagnostic {
     })
 }
 
+/// Whether the artifact's embedded unit is one this runtime can enter. One built for another
+/// runtime is left aside; one that is broken rather than foreign is passed on and refused loudly.
+pub(crate) fn servable(artifact: &Artifact) -> bool {
+    let Some(unit) = &artifact.unit else {
+        return false;
+    };
+    let served = ply_codegen::c::bundle::unpack(&unit.text)
+        .and_then(|text| ply_codegen::c::served(&text, "artifact"));
+    !matches!(&served, Err(e) if e.downcast_ref::<ply_codegen::c::Unserved>().is_some())
+}
+
 /// The unit the artifact runs on: its embedded one as built, else one compiled from its bodies.
-fn tier(
+pub(crate) fn tier(
     opened: &Opened,
     backend: Option<&String>,
     unit: Option<&EmbeddedUnit>,

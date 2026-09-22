@@ -10,7 +10,7 @@ use crate::artifact::{self, Built};
 use crate::cli::BuildArgs;
 use crate::hosts::Lent;
 use crate::load::{LoadError, Loaded, load};
-use crate::payload::{count, diag_value, diags_value, option, places_value, record};
+use crate::payload::{count, diags_value, option, places_value, record};
 use ply_eval::Value as PlyValue;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
@@ -173,7 +173,8 @@ impl Site {
             vec![record(vec![
                 ("root", PlyValue::str(loaded.root.display().to_string())),
                 ("defs", PlyValue::list(defs)),
-                ("main", main_value(loaded)),
+                ("mains", crate::run::mains_value(loaded)),
+                ("modules", crate::run::modules_value(loaded)),
                 ("places", places_value(&loaded.sources)),
                 ("binary_bytes", option(binary_bytes().map(size))),
                 ("version", PlyValue::str(env!("CARGO_PKG_VERSION"))),
@@ -212,15 +213,6 @@ fn arity(def: &DefInfo) -> usize {
     match &def.scheme.ty {
         ply_ty::ty::Type::Fn { params, .. } => params.len(),
         _ => 0,
-    }
-}
-
-/// The entry a build with no `--entry` takes: the question `ply run` asks, answered where it is
-/// answered once.
-fn main_value(loaded: &Loaded) -> PlyValue {
-    match crate::commands::run::entry_point(loaded) {
-        Ok(def) => PlyValue::ctor("Ok", vec![PlyValue::str(def.name.as_str())]),
-        Err(diagnostic) => PlyValue::ctor("Err", vec![diag_value(&diagnostic)]),
     }
 }
 

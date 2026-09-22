@@ -143,6 +143,20 @@ impl Loaded {
             .collect()
     }
 
+    /// The one `main` this program declares. Which entry `ply run` takes, and what a program
+    /// with none or two of them is told, is `crates/ply-cli/ply/run.ply`'s; this is for the `ply`
+    /// program itself, which declares exactly one.
+    pub fn sole_entry_point(&self) -> Result<&DefInfo, Diagnostic> {
+        let mut candidates = self.entry_points();
+        match candidates.len() {
+            1 => Ok(candidates.remove(0)),
+            n => Err(Diagnostic::error(
+                codes::AMBIGUOUS_ENTRY_POINT,
+                format!("{n} definitions are named `main`, and exactly one was wanted"),
+            )),
+        }
+    }
+
     /// Every non-std definition named `main`.
     pub fn entry_points(&self) -> Vec<&DefInfo> {
         let main = Symbol::new("main");
