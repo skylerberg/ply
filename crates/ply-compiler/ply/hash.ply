@@ -1333,7 +1333,8 @@ pub fn hash_dump(sources: List<Source>) -> String = {
 pub type Refusal = { message: Bytes, notes: List<Bytes> }
 pub type Printing = | Printed(List<{ module: Bytes, text: Bytes }>) | Unprintable(Refusal)
 
-type Part = { members: List<Bytes>, hashes: List<Bytes>, names: List<Bytes>, module: Bytes, binder: Bytes, printed: Bool }
+type Part = { members: List<Bytes>, hashes: List<Bytes>, names: List<Bytes>, public: List<Bool>,
+              module: Bytes, binder: Bytes, printed: Bool }
 type Slot = { part: Int, class: Int }
 type Layout = { parts: List<Part>, by_hash: Map<Bytes, List<Slot>>, relink: Map<Bytes, Bytes> }
 type Pr = { layout: Layout, part: Int, own: Bytes }
@@ -1417,18 +1418,33 @@ fn rd_ref(x: Pr, d: Dc) -> Rf = {
   } else { panic(string_of_bytes(bytes_concat(b"a reference of tag ", num(t.v)))) }
 }
 
+// A name the module being printed may write: its own needs no export, a printed module is reprinted
+// `pub` throughout, and any other is reached as `binder::name`, which is what its own `pub` permits.
+fn nameable(l: Layout, s: Slot, own: Bytes) -> Bool = {
+  let p = at(l.parts, s.part);
+  p.module == own || p.printed || at(p.public, s.class)
+}
+
+// Two definitions alike are one body under two names, and only some of those names are in reach:
+// an unreachable one is no candidate at all, since printing it names something that will not
+// resolve rather than something merely further away.
 fn pick(l: Layout, h: Bytes, own: Bytes) -> Option<Slot> = {
   let score = |s: Slot| { let p = at(l.parts, s.part); (if p.module == own { 0 } else { 2 }) + (if p.printed { 0 } else { 1 }) };
   match map_get(l.by_hash, h) {
     None -> None,
-    Some(found) -> fold(found, None, |best: Option<Slot>, s: Slot| match best { Some(b) -> if score(s) < score(b) { Some(s) } else { best }, None -> Some(s) }),
+    Some(found) -> fold(filter(found, |s: Slot| nameable(l, s, own)), None,
+                        |best: Option<Slot>, s: Slot| match best { Some(b) -> if score(s) < score(b) { Some(s) } else { best }, None -> Some(s) }),
   }
 }
 
 fn qname(x: Pr, r: Rf, ctor: Option<Bytes>) -> Got = {
   let found = if r.class >= 0 { Some({ part: x.part, class: r.class }) } else { pick(x.layout, r.hash, x.own) };
   match found {
-    None -> { d: r.d, t: match ctor { Some(c) -> c, None -> short_hex(r.hash) } },
+    // A body with no name this module may write is filed with the ones it has no body for: either
+    // way the reference cannot be printed, and a refusal names it rather than a hex string standing
+    // in for it.
+    None -> { d: {..r.d, missing: map_insert(r.d.missing, r.hash, true)},
+              t: match ctor { Some(c) -> c, None -> short_hex(r.hash) } },
     Some(s) -> {
       let p = at(x.layout.parts, s.part);
       let name = match ctor { Some(c) -> c, None -> at(p.names, s.class) };
@@ -1930,9 +1946,9 @@ fn p_test(x: Pr, d: Dc, label: Bytes) -> Got = {
   else { { d: body.d, t: bytes_concat_all([if nd.v { b"test/nondet " } else { b"test " }, str_lit(label), b" ", body.t]) } }
 }
 
-type Named = { module: Bytes, simple: Bytes }
+type Named = { module: Bytes, simple: Bytes, public: Bool }
 type Comp = { members: List<Bytes>, hashes: List<Bytes>, id: Bytes, key: Bytes }
-type Copied = { module: Bytes, names: List<Bytes> }
+type Copied = { module: Bytes, names: List<Bytes>, public: List<Bool> }
 type Parting = { seen: Map<Bytes, Bool>, declared: Map<Bytes, Bytes>, parts: List<Part>, bad: Option<Refusal> }
 type Sheet = { items: List<Bytes>, imports: Map<Bytes, Bytes> }
 
@@ -1955,8 +1971,8 @@ fn comp_of(body: Bytes) -> Comp = {
 
 fn listed(ns: List<Named>) -> Bytes = backticked(map(ns, |n: Named| qualify(n.module, n.simple)), b", ")
 
-fn named_of(names: List<{ name: Bytes, hash: Bytes }>, keys: Map<Bytes, Bool>) -> { named: Map<Bytes, Map<Bytes, Named>>, bad: Option<Refusal> } =
-  fold(names, { named: map_new(), bad: None }, |acc: { named: Map<Bytes, Map<Bytes, Named>>, bad: Option<Refusal> }, n: { name: Bytes, hash: Bytes }|
+fn named_of(names: List<{ name: Bytes, hash: Bytes, public: Bool }>, keys: Map<Bytes, Bool>) -> { named: Map<Bytes, Map<Bytes, Named>>, bad: Option<Refusal> } =
+  fold(names, { named: map_new(), bad: None }, |acc: { named: Map<Bytes, Map<Bytes, Named>>, bad: Option<Refusal> }, n: { name: Bytes, hash: Bytes, public: Bool }|
     match acc.bad {
       Some(_) -> acc,
       None -> {
@@ -1966,25 +1982,27 @@ fn named_of(names: List<{ name: Bytes, hash: Bytes }>, keys: Map<Bytes, Bool>) -
         else {
           let module = bytes_slice(n.name, 0, bytes_len(n.name) - bytes_len(simple) - 1);
           let had = match map_get(acc.named, n.hash) { Some(m) -> m, None -> map_new() };
-          {..acc, named: map_insert(acc.named, n.hash, map_insert(had, bytes_concat_all([module, b"\x00", simple]), { module: module, simple: simple }))}
+          {..acc, named: map_insert(acc.named, n.hash, map_insert(had, bytes_concat_all([module, b"\x00", simple]), { module: module, simple: simple, public: n.public }))}
         }
       },
     })
 
 fn copies(classes: List<List<Named>>) -> Option<List<Copied>> =
-  if len(classes) == 1 { Some(map(at(classes, 0), |n: Named| { module: n.module, names: [n.simple] })) } else {
-    let by_module = fold(range(0, len(classes)), map_new(), |acc: Map<Bytes, List<List<Bytes>>>, c: Int|
-      fold(at(classes, c), acc, |a: Map<Bytes, List<List<Bytes>>>, n: Named| {
+  if len(classes) == 1 { Some(map(at(classes, 0), |n: Named| { module: n.module, names: [n.simple], public: [n.public] })) } else {
+    let by_module = fold(range(0, len(classes)), map_new(), |acc: Map<Bytes, List<List<Named>>>, c: Int|
+      fold(at(classes, c), acc, |a: Map<Bytes, List<List<Named>>>, n: Named| {
         let rows = match map_get(a, n.module) { Some(r) -> r, None -> map(classes, |k: List<Named>| []) };
-        map_insert(a, n.module, set_at(rows, c, push(at(rows, c), n.simple)))
+        map_insert(a, n.module, set_at(rows, c, push(at(rows, c), n)))
       }));
-    map_fold(by_module, Some([]), |acc: Option<List<Copied>>, m: Bytes, rows: List<List<Bytes>>|
+    map_fold(by_module, Some([]), |acc: Option<List<Copied>>, m: Bytes, rows: List<List<Named>>|
       match acc {
         None -> None,
         Some(out) -> {
           let count = len(at(rows, 0));
-          if fold(rows, false, |b: Bool, r: List<Bytes>| b || len(r) != count) { None }
-          else { Some(fold(range(0, count), out, |o: List<Copied>, k: Int| push(o, { module: m, names: map(rows, |r: List<Bytes>| at(r, k)) }))) }
+          if fold(rows, false, |b: Bool, r: List<Named>| b || len(r) != count) { None }
+          else { Some(fold(range(0, count), out, |o: List<Copied>, k: Int|
+            push(o, { module: m, names: map(rows, |r: List<Named>| at(r, k).simple),
+                      public: map(rows, |r: List<Named>| at(r, k).public) }))) }
         },
       })
   }
@@ -2023,7 +2041,8 @@ fn part_in(acc: Parting, c: Comp, named: Map<Bytes, Map<Bytes, Named>>, shipped:
                                                    b" are a mutually recursive group in which two definitions share one body, so a call cannot say which it reaches"),
                                       [b"make the definitions differ, or keep one of them"])},
       Some(cs) -> {..checked, parts: fold(cs, checked.parts, |ps: List<Part>, cp: Copied|
-        push(ps, { members: c.members, hashes: c.hashes, names: cp.names, module: cp.module, binder: default_binder(cp.module), printed: !contains_bytes(shipped, cp.module) }))},
+        push(ps, { members: c.members, hashes: c.hashes, names: cp.names, public: cp.public,
+                   module: cp.module, binder: default_binder(cp.module), printed: !contains_bytes(shipped, cp.module) }))},
     },
   }
 }
@@ -2091,8 +2110,12 @@ fn sheet_text(s: Sheet) -> Bytes =
       push(acc, bytes_concat_all([b"import ", m, if b == default_binder(m) { b"" } else { bytes_concat(b" as ", b) }, b"\n"]))),
     map(s.items, |it: Bytes| bytes_concat_all([b"\n", it, b"\n"]))))
 
-pub fn print_bodies(bodies: List<Bytes>, names: List<{ name: Bytes, hash: Bytes }>, tests: List<Bytes>,
-                    relink: List<{ from: Bytes, to: Bytes }>, shipped: List<Bytes>) -> Printing = {
+// `public` is what the name's own module exports: a reference from a module that is printed reaches
+// a shipped one only through it, so a name filed without it is never the one a reference is printed
+// under.
+pub fn print_bodies(bodies: List<Bytes>, names: List<{ name: Bytes, hash: Bytes, public: Bool }>,
+                    tests: List<Bytes>, relink: List<{ from: Bytes, to: Bytes }>,
+                    shipped: List<Bytes>) -> Printing = {
   let comps = map(bodies, comp_of);
   let n = named_of(names, fold(comps, map_new(), |acc: Map<Bytes, Bool>, c: Comp| map_insert(acc, c.key, true)));
   let parted: Parting = match n.bad {
@@ -2108,7 +2131,7 @@ pub fn print_bodies(bodies: List<Bytes>, names: List<{ name: Bytes, hash: Bytes 
       let t = print_tests(l, tests, printed.missing);
       let missing = map_keys(t.d.missing);
       if len(missing) > 0 {
-        Unprintable({ message: bytes_concat(num(len(missing)), b" definitions a body refers to are not among the bodies"),
+        Unprintable({ message: bytes_concat(num(len(missing)), b" definitions a body refers to are not among the bodies it can name"),
                       notes: [bytes_concat(b"missing: ", joined(map(take(missing, min(8, len(missing))), short_hex), b", "))] })
       } else {
         let texts = map_fold(printed.modules, [], |acc: List<{ module: Bytes, text: Bytes }>, m: Bytes, s: Sheet| push(acc, { module: m, text: sheet_text(s) }));
@@ -2204,11 +2227,15 @@ fn indexed(sources: List<Source>) -> Index =
 
 fn named_hashes(out: HashOutput) -> List<{ name: Bytes, hash: Bytes }> = append(out.defs, out.decls)
 
+// The fixtures below write `pub` throughout, so every name is one a reference may be printed under.
+fn all_public(xs: List<{ name: Bytes, hash: Bytes }>) -> List<{ name: Bytes, hash: Bytes, public: Bool }> =
+  map(xs, |x: { name: Bytes, hash: Bytes }| { name: x.name, hash: x.hash, public: true })
+
 fn by_name(xs: List<{ name: Bytes, hash: Bytes }>) -> Map<Bytes, Bytes> =
   fold(xs, map_new(), |m: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }| map_insert(m, x.name, x.hash))
 
 fn printed_of(out: HashOutput, shipped: List<Bytes>) -> List<{ module: Bytes, text: Bytes }> =
-  match print_bodies(map(out.bodies, |b: { name: Bytes, body: Bytes }| b.body), named_hashes(out), [], [], shipped) {
+  match print_bodies(map(out.bodies, |b: { name: Bytes, body: Bytes }| b.body), all_public(named_hashes(out)), [], [], shipped) {
     Printed(ms) -> ms,
     Unprintable(why) -> panic(string_of_bytes(why.message)),
   }
@@ -2227,6 +2254,28 @@ test "printed bodies hash back to what they were stored under, under their own n
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)));
   let shipped = printed_of(out, [b"left.util"]);
   assert_eq(map(shipped, |m: { module: Bytes, text: Bytes }| m.module), [b"app", b"right.util"])
+}
+
+test "a reference is printed under a name the module holding it exports" {
+  // One body under two names, in modules that ship rather than print: which name a reference is
+  // printed under is a choice, and only one of them is a name another module may write.
+  let out = hash_index(indexed([
+    { name: b"hidden", src: b"fn span() -> Int = 4\npub fn stride() -> Int = span() + 1" },
+    { name: b"shelf", src: b"pub fn width() -> Int = 4" },
+    { name: b"app", src: b"import shelf\npub fn wide() -> Int = shelf::width()" }]));
+  let named = by_name(named_hashes(out));
+  assert_eq(map_get(named, b"shelf.width"), map_get(named, b"hidden.span"));
+  let names = map(named_hashes(out), |x: { name: Bytes, hash: Bytes }|
+    { name: x.name, hash: x.hash, public: x.name != b"hidden.span" });
+  match print_bodies(map(out.bodies, |b: { name: Bytes, body: Bytes }| b.body), names, [], [],
+                     [b"hidden", b"shelf"]) {
+    Unprintable(why) -> panic(string_of_bytes(why.message)),
+    Printed(ms) -> {
+      assert_eq(map(ms, |m: { module: Bytes, text: Bytes }| m.module), [b"app"]);
+      assert(holds_text(at(ms, 0).text, b"shelf::width()"));
+      assert(!holds_text(at(ms, 0).text, b"hidden::"))
+    },
+  }
 }
 
 test "an operation atom hashes apart from its mode atom and prints back as written" {
@@ -2291,7 +2340,7 @@ test "one effect declaration under two names is refused, since a body cannot say
   let out = hash_index(indexed([{ name: b"a", src: b"pub effect one { read at() -> Int }" }, { name: b"b", src: b"pub effect one { read at() -> Int }" }]));
   let named = by_name(named_hashes(out));
   assert_eq(map_get(named, b"a.one"), map_get(named, b"b.one"));
-  match print_bodies(map(out.bodies, |b: { name: Bytes, body: Bytes }| b.body), named_hashes(out), [], [], []) {
+  match print_bodies(map(out.bodies, |b: { name: Bytes, body: Bytes }| b.body), all_public(named_hashes(out)), [], [], []) {
     Printed(_) -> panic("two names for one declaration must be refused"),
     Unprintable(why) -> assert_eq(why.message, b"`a.one`, `b.one` are one effect declaration, so a body cannot say which it performs"),
   }

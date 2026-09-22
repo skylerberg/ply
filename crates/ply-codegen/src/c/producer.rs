@@ -758,10 +758,19 @@ pub fn rehash_dump(
 
 const PRINT: &str = "front.print_dump";
 
+/// One name a body may be printed under: the program-wide name, its body's hash, and whether the
+/// module it is in exports it. A reference from another module is printed `binder::name`, so a name
+/// its own module keeps private is one no other module's body can be printed under.
+pub struct PrintedName<'a> {
+    pub name: &'a str,
+    pub hash: DefHash,
+    pub public: bool,
+}
+
 /// `(module, text)` in byte order, then `tests` as `ply_tests.t<i>`; `shipped` is only imported.
 pub fn print_bodies(
     bodies: &[&[u8]],
-    names: &[(&str, DefHash)],
+    names: &[PrintedName<'_>],
     tests: &[&[u8]],
     relink: &[(DefHash, DefHash)],
     shipped: &[&str],
@@ -772,10 +781,11 @@ pub fn print_bodies(
         Value::list(
             names
                 .iter()
-                .map(|(name, hash)| {
+                .map(|named| {
                     record(vec![
-                        ("name", Value::bytes(name.as_bytes())),
-                        ("hash", Value::bytes(hash.0)),
+                        ("name", Value::bytes(named.name.as_bytes())),
+                        ("hash", Value::bytes(named.hash.0)),
+                        ("public", Value::Bool(named.public)),
                     ])
                 })
                 .collect(),
