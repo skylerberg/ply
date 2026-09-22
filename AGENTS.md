@@ -36,8 +36,8 @@ the runtime and the CLI.
 
 - Tests live in sibling `<crate>-tests` crates, so a `pub` change can break crates you didn't
   touch. Run `cargo fmt --all` before pushing; CI runs clippy with `-D warnings`.
-- CI is `.github/workflows/ci.yml`; its partitions, solo jobs and gates are tables in
-  `.github/ci-shards.sh`.
+- CI is `.github/workflows/ci.yml`; `.github/ci-shards.sh` holds its solo and gate tables and cuts
+  the test partitions from the durations CI measured.
 - Never commit `crates/ply-compiler/bootstrap`, `crates/ply-cli/bootstrap` or
   `crates/ply-codegen-tests/fixtures/goldens` in a pull request: CI regenerates all three on
   `main` after each merge (the `refresh` job), and a pull request runs its sources through the
