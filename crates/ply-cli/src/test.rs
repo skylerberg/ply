@@ -136,15 +136,19 @@ impl Site {
         }
     }
 
-    /// How the tree stamps now, one line per `.ply` file under the root. It reaches no machine: a
-    /// watching run asks for this between reports, and a walk is not a front end.
+    /// How the tree stamps now, one line per `.ply` file under the root, or `None` when the walk
+    /// could not read a directory. It reaches no machine: a watching run asks for this between
+    /// reports, and a walk is not a front end.
     fn stamped(&self) -> PlyValue {
-        let stamps = crate::warm::tree_stamps(&project_root(&self.args.path));
-        PlyValue::list(
-            stamps
-                .iter()
-                .map(|(path, stamp)| PlyValue::str(stamp_line(path, stamp)))
-                .collect(),
+        crate::payload::option(
+            crate::warm::tree_stamps(&project_root(&self.args.path)).map(|stamps| {
+                PlyValue::list(
+                    stamps
+                        .iter()
+                        .map(|(path, stamp)| PlyValue::str(stamp_line(path, stamp)))
+                        .collect(),
+                )
+            }),
         )
     }
 

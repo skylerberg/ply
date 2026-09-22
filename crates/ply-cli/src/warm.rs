@@ -171,14 +171,17 @@ fn sources_under(root: &Path) -> Option<Vec<PathBuf>> {
     Some(found)
 }
 
-/// How the tree stamps now, for a caller that watches it without holding a front end.
-pub fn tree_stamps(root: &Path) -> BTreeMap<PathBuf, Stamp> {
-    sources_under(root)
-        .unwrap_or_else(|| vec![root.to_path_buf()])
-        .into_iter()
-        .map(|path| {
-            let stamp = stamp_of(&path);
-            (path, stamp)
-        })
-        .collect()
+/// How the tree stamps now, for a caller that watches it without holding a front end, or `None`
+/// when a directory could not be read. The two are not the same answer: a walk that failed has
+/// seen nothing, and a watcher told the tree is empty stops noticing saves to it.
+pub fn tree_stamps(root: &Path) -> Option<BTreeMap<PathBuf, Stamp>> {
+    Some(
+        sources_under(root)?
+            .into_iter()
+            .map(|path| {
+                let stamp = stamp_of(&path);
+                (path, stamp)
+            })
+            .collect(),
+    )
 }
