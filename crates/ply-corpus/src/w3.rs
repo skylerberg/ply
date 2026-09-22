@@ -24,15 +24,10 @@ const TESTS_MARKER: &str = "// --- Tests: the business, which needs no handler a
 
 const CREDENTIAL: &str = "desk";
 
-/// `main`'s declared row in `examples/desk.ply`, and the same row once the accept loop spawns.
-pub(crate) const MAIN_ROW: &str = "\
-fn main() -> Int
-  / {Serving, config.get[server], net.listen[listener], net.accept[listener], net.close[listener],
-     net.recv[conn], net.send[conn], net.close[conn]} = {";
-pub(crate) const MAIN_ROW_SPAWNING: &str = "\
-fn main() -> Int
-  / {task.write, Serving, config.get[server], net.listen[listener], net.accept[listener], net.close[listener],
-     net.recv[conn], net.send[conn], net.close[conn]} = {";
+/// `main`'s signature in `source`, as written: its declaration through the `=` that ends it.
+pub(crate) fn main_header(source: &str) -> Result<&str> {
+    Ok(&source[header_span(source, "main")?])
+}
 
 /// The twin's entry row: `run_memory` discharges `db`, `trace` and `signal` itself, reads the
 /// credential, and may listen over TLS.
@@ -43,6 +38,52 @@ pub(crate) fn twin_entry_row(main_row: &str) -> String {
             "net.listen[listener], ",
             "net.listen[listener], net.listen_tls[listener], ",
         )
+}
+
+/// The span of `name`'s signature in `source`: its declaration through the `=` that ends it.
+fn header_span(source: &str, name: &str) -> Result<std::ops::Range<usize>> {
+    let start = ["fn ", "pub fn "]
+        .into_iter()
+        .find_map(|keyword| {
+            let declaration = format!("{keyword}{name}(");
+            if source.starts_with(&declaration) {
+                Some(0)
+            } else {
+                source.find(&format!("\n{declaration}")).map(|at| at + 1)
+            }
+        })
+        .with_context(|| {
+            format!(
+                "`examples/desk.ply` no longer defines `{name}`; this harness rewrites it and \
+                 must be updated with it rather than measuring a program it guessed at"
+            )
+        })?;
+    let bytes = source.as_bytes();
+    let end = (start + 1..bytes.len())
+        .find(|&i| {
+            bytes[i] == b'='
+                && bytes.get(i + 1) != Some(&b'=')
+                && !matches!(bytes[i - 1], b'=' | b'!' | b'<' | b'>')
+        })
+        .with_context(|| format!("`{name}` in `examples/desk.ply` has no body"))?;
+    Ok(start..end + 1)
+}
+
+/// Adds `atoms` to the head of the effect row `name` declares.
+fn widen_row(source: &str, name: &str, atoms: &str) -> Result<String> {
+    let header = header_span(source, name)?;
+    let row = source[header.clone()].find("/ {").with_context(|| {
+        format!(
+            "`{name}` in `examples/desk.ply` no longer declares an effect row; this harness \
+             widens it and must be updated with it rather than measuring a program it guessed at"
+        )
+    })?;
+    let at = header.start + row + "/ {".len();
+    let mut out = String::with_capacity(source.len() + atoms.len());
+    out.push_str(&source[..at]);
+    out.push_str(atoms);
+    out.push_str(&source[at..]);
+    Ok(out)
 }
 
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -124,52 +165,33 @@ impl Service {
     }
 
     fn task_per_connection(&self) -> Result<String> {
-        const OLD_SERVE: &str = "\
-pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
-  / {Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn]} =
-  if count <= 0 {
-    0
-  } else {
-    let c = net.accept[listener](listener);
-    if c == 0 {
-      0
-    } else {
-      serve_connection(c, l);
-      1 + serve(listener, l, count - 1)
-    }
-  }";
-        const NEW_SERVE: &str = "\
-pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
-  / {task.write, Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn]} =
-  if count <= 0 {
-    0
-  } else {
-    let c = net.accept[listener](listener);
-    if c == 0 {
-      0
-    } else {
-      let t = task.spawn(|| serve_connection(c, l));
-      let rest = serve(listener, l, count - 1);
-      task.join(t);
-      1 + rest
-    }
-  }";
-        let source = replace(&self.server_only, OLD_SERVE, NEW_SERVE)?;
-        // The rows above and below `serve`, each widened by the one atom spawning adds; the twin's
-        // entry points too, since this harness drives them.
-        const WIDENED: [&str; 8] = [
-            "pub fn listen_and_serve(port: Int, count: Int) -> Int\n  / {",
-            "pub fn listen_and_serve_tls(port: Int, credential: String, count: Int) -> Int\n  / {",
-            "pub fn run(port: Int, count: Int) -> Int\n  / {",
-            "pub fn run_tls(port: Int, credential: String, count: Int) -> Int\n  / {",
-            "pub fn run_memory(port: Int, api: Option<Secret<String>>, count: Int) -> Int\n  / {",
-            "pub fn run_memory_tls(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int\n  / {",
-            "fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int\n  / {",
-            "fn main() -> Int\n  / {",
+        // The joins unwind at the end of the loop, so up to `count` handlers are in flight at once.
+        let source = replace(
+            &self.server_only,
+            "serve_connection(c, l);",
+            "let t = task.spawn(|| serve_connection(c, l));",
+        )?;
+        let source = replace(
+            &source,
+            "1 + serve(listener, l, count - 1)",
+            "let rest = serve(listener, l, count - 1);\n      task.join(t);\n      1 + rest",
+        )?;
+        // The accept loop and the rows above and below it, each widened by the one atom spawning
+        // adds; the twin's entry points too, since this harness drives them.
+        const WIDENED: [&str; 9] = [
+            "serve",
+            "listen_and_serve",
+            "listen_and_serve_tls",
+            "run",
+            "run_tls",
+            "run_memory",
+            "run_memory_tls",
+            "memory_serving",
+            "main",
         ];
-        WIDENED.iter().try_fold(source, |acc, from| {
-            replace(&acc, from, &format!("{from}task.write, "))
-        })
+        WIDENED
+            .iter()
+            .try_fold(source, |acc, name| widen_row(&acc, name, "task.write, "))
     }
 
     /// A project directory `ply run --host` can be pointed at.
@@ -183,10 +205,6 @@ pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
     ) -> Result<()> {
         // Rewritten in place: `desk.ply` declares its own `main`, and a second one is `E0112`.
         let source = self.source(variant)?;
-        let header = match variant {
-            Variant::Sequential => MAIN_ROW,
-            Variant::TaskPerConn => MAIN_ROW_SPAWNING,
-        };
         let spawning = match variant {
             Variant::Sequential => "",
             Variant::TaskPerConn => "task.write, ",
@@ -200,7 +218,6 @@ pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
         };
         let source = replace_entry_point(
             &source,
-            header,
             &format!(
                 "fn main() -> Int / {{{spawning}net.write[conn], net.write[listener]}} =\n  {call}"
             ),
@@ -251,19 +268,14 @@ pub fn serve(listener: Int, l: http::Limits, count: Int) -> Int
 }
 
 /// Replaces `main`, declaration to closing `}`, with an entry point that drives the twin.
-fn replace_entry_point(source: &str, header: &str, to: &str) -> Result<String> {
-    let at = source.find(header).with_context(|| {
-        format!(
-            "`examples/desk.ply` no longer contains:\n{header}\nthis harness rewrites its entry \
-             point and must be updated with it rather than measuring a program it guessed at"
-        )
-    })?;
-    let body = &source[at + header.len()..];
+fn replace_entry_point(source: &str, to: &str) -> Result<String> {
+    let header = header_span(source, "main")?;
+    let body = &source[header.end..];
     let close = body
         .find("\n}\n")
         .context("`desk.ply`'s `main` has no closing brace at column zero")?;
     let mut out = String::with_capacity(source.len());
-    out.push_str(&source[..at]);
+    out.push_str(&source[..header.start]);
     out.push_str(to);
     out.push_str(&body[close + "\n}".len()..]);
     Ok(out)
