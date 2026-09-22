@@ -1,5 +1,6 @@
-# `build` compiles the workspace into one nextest archive; every test job runs a slice of it, cut
-# by `.github/ci-shards.sh`. `ci` is the one required check.
+# `build` compiles the workspace into one nextest archive; every test job runs a shard of it, cut
+# by `.github/ci-shards.sh` from the durations the last run measured. `ci` is the one
+# required check.
 # The toolchain pin recurs in every workflow under .github/: raise it everywhere at once.
 
 name: CI
@@ -35,13 +36,50 @@ jobs:
     outputs:
       partitions: ${{ steps.tables.outputs.partitions }}
       solo: ${{ steps.tables.outputs.solo }}
+      shards: ${{ steps.cut.outputs.shards }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Every crate is built and every named test exists
+      # What the partitions of the last run measured, this branch's own or main's. A first run, an
+      # evicted entry or a fork with no access leaves nothing here, and the partitions are cut by
+      # test count instead.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/ply-test-timings
+          key: test-timings-${{ github.run_id }}
+          restore-keys: test-timings-
+
+      - name: Every crate is built, every named test exists, the shards are total
         run: .github/ci-shards.sh verify
+
+      # One job cuts the shards, and every partition runs the cut it left: two that cut their own
+      # from tables a run apart could agree on no test at all.
+      - name: The shards those durations cut
+        id: cut
+        run: |
+          set -euo pipefail
+          rc=0
+          .github/ci-shards.sh shard-configs /tmp/ply-shards || rc=$?
+          case "$rc" in
+            0) echo "shards=true" >> "$GITHUB_OUTPUT" ;;
+            3) echo "shards=false" >> "$GITHUB_OUTPUT" ;;
+            *) exit "$rc" ;;
+          esac
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.cut.outputs.shards == 'true'
+        with:
+          path: /tmp/ply-shards
+          key: test-shards-${{ github.run_id }}
+      # A save that cannot reserve its key only warns; fail here rather than in every partition.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.cut.outputs.shards == 'true'
+        with:
+          path: /tmp/ply-shards
+          key: test-shards-${{ github.run_id }}
+          lookup-only: true
+          fail-on-cache-miss: true
 
       - name: Emit the matrices
         id: tables
@@ -309,7 +347,7 @@ jobs:
           key: ply-c-stage-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/ply-compiler/ply/**', 'crates/ply-std/ply/**', 'crates/ply-cli/ply/**') }}
 
   test:
-    name: test ${{ matrix.slice }}
+    name: test ${{ matrix.shard }}/${{ matrix.of }}
     needs: [plan, build, build-ply, stage]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -320,31 +358,76 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: needs.plan.outputs.shards == 'true'
+        with:
+          path: /tmp/ply-shards
+          key: test-shards-${{ github.run_id }}
+          fail-on-cache-miss: true
       - uses: ./.github/actions/suite
 
+      # A shard's profile names the tests it runs, except the catch-all's, which is the negation of
+      # every other shard: a test the durations do not name runs there, and only there.
       # The awk strips colour first: nextest colours its summary line. A golden that moved is
       # blessed rather than failed: the diff goes to the job summary, and `refresh` commits it on main.
       - name: cargo nextest run
+        id: run
         env:
-          SLICE: ${{ matrix.slice }}
+          SHARD: ${{ matrix.shard }}
+          OF: ${{ matrix.of }}
+          SHARDS: ${{ needs.plan.outputs.shards }}
           PLY_DIFF_BLESS: "1"
         run: |
           set -euo pipefail
           exclude=$(.github/ci-shards.sh exclude-filter)
           [ -n "$exclude" ] || { echo "the exclude filter is empty" >&2; exit 1; }
+          config=/tmp/ply-shards/shard-$SHARD.toml
+          if [ "$SHARDS" = true ]; then
+            [ -f "$config" ] || { echo "the plan cut the shards and $config did not come back" >&2; exit 1; }
+            profile=shard$SHARD
+            cut=(--profile "$profile" --tool-config-file "shards:$config")
+          else
+            profile=default
+            cut=(--partition "slice:$SHARD/$OF")
+          fi
           cargo-nextest nextest run \
             --binaries-metadata target/nextest/binaries-metadata.json \
             --cargo-metadata target/nextest/cargo-metadata.json \
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
-            --no-fail-fast --partition "slice:$SLICE" \
+            --no-fail-fast "${cut[@]}" \
             -E "not ($exclude)" 2>&1 | tee /tmp/partition.log
           ran=$(awk '
             { gsub(/\033\[[0-9;]*m/, "") }
             /^ *Summary \[/ { for (i = 1; i <= NF; i++) if ($i == "tests" || $i == "test") { n = $(i - 1) } }
             END { print n + 0 }
           ' /tmp/partition.log)
-          echo "partition $SLICE ran $ran tests"
-          [ "$ran" -gt 0 ] || { echo "the partition ran no tests at all" >&2; exit 1; }
+          echo "shard $SHARD ran $ran tests"
+          [ "$ran" -gt 0 ] || { echo "the shard ran no tests at all" >&2; exit 1; }
+          echo "profile=$profile" >> "$GITHUB_OUTPUT"
+          echo "ran=$ran" >> "$GITHUB_OUTPUT"
+
+      # What the next run cuts its shards from.
+      - name: The durations this shard measured
+        env:
+          SHARD: ${{ matrix.shard }}
+          PROFILE: ${{ steps.run.outputs.profile }}
+          RAN: ${{ steps.run.outputs.ran }}
+        run: |
+          set -euo pipefail
+          .github/ci-shards.sh durations "target/nextest/$PROFILE/junit.xml" > "/tmp/timings-$SHARD.tsv"
+          lines=$(grep -c . "/tmp/timings-$SHARD.tsv" || true)
+          [ "$lines" -eq "$RAN" ] || {
+            echo "the report has $lines durations and the shard ran $RAN tests" >&2
+            exit 1
+          }
+          echo "$lines durations"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: timings-${{ matrix.shard }}
+          path: /tmp/timings-${{ matrix.shard }}.tsv
+          retention-days: 1
+          if-no-files-found: error
+
       - name: Goldens that moved
         if: always()
         run: |
@@ -358,6 +441,36 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           git diff --stat -- crates/ply-codegen-tests/fixtures/goldens
+
+  # The table the next run cuts its shards from. It needs every partition, so a run that went red
+  # leaves the last whole one in place rather than a table missing whatever did not report. A pull
+  # request writes one too, into its own cache: a branch cuts by what its own tree measured, and
+  # main is never cut by a branch's.
+  timings:
+    name: what this run's tests cost
+    needs: [test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: timings-*
+          merge-multiple: true
+          path: /tmp/ply-timings-parts
+      - name: One duration per test
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ply-test-timings
+          find /tmp/ply-timings-parts -name '*.tsv' -exec cat {} + |
+            LC_ALL=C sort -t"$(printf '\t')" -k1,1 -k2,2 -k3,3nr |
+            awk -F'\t' '!seen[$1 FS $2]++' > /tmp/ply-test-timings/timings.tsv
+          lines=$(grep -c . /tmp/ply-test-timings/timings.tsv || true)
+          [ "$lines" -gt 0 ] || { echo "no durations came back from the partitions" >&2; exit 1; }
+          echo "$lines test durations"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/ply-test-timings
+          key: test-timings-${{ github.run_id }}
 
   solo:
     name: test ${{ matrix.id }}
