@@ -140,7 +140,7 @@ fn iterate(
     let selected = ply_test::select(&loaded.check, &hashes, &cache.store, &search, engine);
     let plan = Plan::new(selected, &loaded.check, args.filter.as_deref(), args.std);
 
-    if let Some(err) = broken_promises(&loaded) {
+    if let Some(err) = crate::costs::broken_promises(&loaded) {
         return report_load_error("test", &err, args.json, style);
     }
 
@@ -1705,16 +1705,4 @@ pub(crate) fn location_json(sources: &SourceMap, span: Span) -> Value {
 
 fn display_width(s: &str) -> usize {
     crate::style::strip_ansi(s).chars().count()
-}
-
-/// A `reuse fn` whose promise the cost checker cannot show stops the run, as under `ply check`.
-pub(crate) fn broken_promises(loaded: &Loaded) -> Option<crate::load::LoadError> {
-    if !loaded.promised {
-        return None;
-    }
-    let diagnostics = crate::costs::promises(loaded);
-    (!diagnostics.is_empty()).then(|| crate::load::LoadError {
-        sources: loaded.sources.clone(),
-        diagnostics,
-    })
 }
