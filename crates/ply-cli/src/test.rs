@@ -1587,7 +1587,7 @@ fn ran_value(over: &Over) -> PlyValue {
                     ("declined", tally(b.declined)),
                     ("converted_in", tally(b.converted_in)),
                     ("converted_out", tally(b.converted_out)),
-                    ("units", option(b.units.map(count))),
+                    ("units", option(b.units.map(tally))),
                     ("analysis_nanos", option(b.analysis_nanos.map(tally))),
                     ("codegen_nanos", option(b.codegen_nanos.map(tally))),
                 ])
