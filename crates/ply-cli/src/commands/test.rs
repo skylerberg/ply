@@ -17,8 +17,10 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
 /// polls for years inside its own entry would hold a frame per reading.
 fn watch(args: &TestArgs, style: Style) -> i32 {
     let root = crate::load::project_root(&args.path);
-    once(args, style);
+    // Stamped before the run, never after: a walk after it folds a save made while it ran into the
+    // baseline, and that save is exactly the one the next iteration exists to notice.
     let mut baseline = crate::warm::tree_stamps(&root);
+    once(args, style);
     loop {
         // Polling: the walk is owed anyway, so a watcher would add a dependency for no latency.
         std::thread::sleep(std::time::Duration::from_millis(120));
@@ -26,6 +28,7 @@ fn watch(args: &TestArgs, style: Style) -> i32 {
         if now == baseline {
             continue;
         }
+        // `now` was read before this run, so a save made during it still differs next time.
         baseline = now;
         if !args.json {
             println!();
