@@ -243,6 +243,18 @@ fn serve(args: &TestArgs, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>)
     warnings.extend(cache.store.take_warnings());
     warnings.extend(loaded.frontend.warnings.iter().cloned());
 
+    // A query naming nothing is wrong whatever the run does, so it refuses before anything runs
+    // rather than being reported after a suite the user did not ask for.
+    if let Some(query) = &args.mutate {
+        if let Err(diagnostic) = crate::commands::mutate::targets(&loaded, query) {
+            let _ = told.send(Step::Loaded(Box::new(Err(Refused {
+                diagnostics: vec![diagnostic],
+                sources: loaded.sources.clone(),
+            }))));
+            return;
+        }
+    }
+
     // Part of a simulated test's cache key, so decided before selection.
     let search = crate::simulation::plan(&args.simulation);
     let engine = ply_test::Engine::Evaluator;
@@ -455,8 +467,9 @@ fn execute(
     }
     let mutants = match mutants {
         Some(Ok(report)) => Some(mutants_view(&report, loaded)),
+        // The query was resolved before the run, so this is a target that moved under it.
         Some(Err(diagnostic)) => {
-            warnings.push(diagnostic);
+            escapes.push(diagnostic);
             None
         }
         None => None,
