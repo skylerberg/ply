@@ -2,9 +2,16 @@
 # The tables CI's test jobs are cut from, and the check that the cut is total.
 #
 #   ci-shards.sh verify          every crate is a member, every test named here
-#                                exists, and every `probes/` directory is run by
-#                                a job the `ci` aggregate requires
-#   ci-shards.sh partitions      the JSON matrix of partition slices
+#                                exists, every `probes/` directory is run by a
+#                                job the `ci` aggregate requires, and the shards
+#                                run every test exactly once
+#   ci-shards.sh partitions      the JSON matrix of partitions
+#   ci-shards.sh shard-configs D the nextest config each partition runs under,
+#                                cut from the durations CI measured; 3 when
+#                                there are none and the partitions fall back to
+#                                slicing by test count
+#   ci-shards.sh durations FILE  `binary_id test milliseconds` per test in a
+#                                nextest JUnit report
 #   ci-shards.sh solo-matrix     the JSON matrix of tests that run alone
 #   ci-shards.sh solo-filter ID  the nextest filterset selecting one solo test
 #   ci-shards.sh exclude-filter  the filterset a partition leaves to the other
@@ -21,6 +28,11 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 PARTITIONS=8
 
+# What the partitions of the last run measured, restored from the cache by the `plan` job.
+TIMINGS=/tmp/ply-test-timings/timings.tsv
+
+TAB=$'\t'
+
 # Tests that get a runner of their own, as `id:package:target:test`.
 SOLO=(
   "bootstrap:ply-codegen-tests:bootstrap:the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds"
@@ -30,12 +42,6 @@ SOLO=(
   "archive-tree-moved:ply-cli-tests:suite:bootstrap_archive::an_archive_stops_describing_a_tree_that_moved"
   "corpus-session:ply-cli-tests:suite:incremental::the_example_corpus_agrees_across_a_session"
   "corpus-session-audit:ply-cli-tests:suite:incremental_audit::a_long_session_over_the_example_corpus_agrees_at_every_step"
-  # A partition cannot finish before its slowest test. Each of these runs longer than a balanced
-  # partition of everything else, so each would otherwise decide when the suite finished.
-  "compiler-fmt-fixpoint:ply-cli-tests:suite:fmt::the_compiler_formats_to_a_fixed_point_and_still_checks"
-  "program-own-tests:ply-cli-tests:suite:artifact_program::the_programs_own_tests_pass"
-  "examples-fmt-fixpoint:ply-cli-tests:suite:fmt::the_examples_format_to_a_fixed_point_and_still_check"
-  "fixtures-fmt-fixpoint:ply-cli-tests:suite:fmt::the_parser_fixtures_format_to_a_fixed_point_and_still_check"
 )
 
 # Their tests skip, passing, without a postgres server; only `test-postgres` runs them.
@@ -155,10 +161,144 @@ cmd_partitions() {
   printf '{"include":['
   for ((i = 1; i <= PARTITIONS; i++)); do
     ((i > 1)) && printf ','
-    printf '{"slice":"%d/%d"}' "$i" "$PARTITIONS"
+    printf '{"shard":"%d","of":"%d"}' "$i" "$PARTITIONS"
   done
   printf ']}\n'
 }
+
+# `binary_id test milliseconds` per testcase in a nextest JUnit report.
+cmd_durations() {
+  awk '
+    function attribute(line, key,   mark) {
+      mark = " " key "=\""
+      if (!match(line, mark)) return ""
+      line = substr(line, RSTART + length(mark))
+      if (!match(line, "\"")) return ""
+      return substr(line, 1, RSTART - 1)
+    }
+    /<testcase / {
+      id = attribute($0, "classname")
+      name = attribute($0, "name")
+      if (id != "" && name != "") printf "%s\t%s\t%d\n", id, name, attribute($0, "time") * 1000 + 0.5
+    }
+  ' "$@"
+}
+
+# `t shard binary test ms` per timed test, longest first onto the least loaded shard, then
+# `load shard ms tests` per shard and `catchall shard`: the shard with the most room left, which
+# is the one that runs what no other shard names.
+assign() {
+  LC_ALL=C sort -t"$TAB" -k3,3nr -k1,1 -k2,2 "$1" |
+    awk -F"$TAB" -v n="$PARTITIONS" '
+      {
+        best = 1
+        for (i = 2; i <= n; i++) if (load[i] < load[best]) best = i
+        load[best] += $3
+        held[best]++
+        printf "t\t%d\t%s\t%s\t%d\n", best, $1, $2, $3
+      }
+      END {
+        least = 1
+        for (i = 2; i <= n; i++) if (load[i] < load[least]) least = i
+        for (i = 1; i <= n; i++) printf "load\t%d\t%d\t%d\n", i, load[i] + 0, held[i] + 0
+        printf "catchall\t%d\n", least
+      }
+    '
+}
+
+# `(binary_id(=b) & (test(=x) | test(=y))) | ...` over `binary test` lines on stdin, unterminated.
+grouped_filter() {
+  LC_ALL=C sort -t"$TAB" -k1,1 -k2,2 | awk -F"$TAB" '
+    $1 != id {
+      if (open) printf ")) | "
+      printf "(binary_id(=%s) & (", $1
+      id = $1
+      open = 1
+      first = 1
+    }
+    { if (!first) printf " | "; printf "test(=%s)", $2; first = 0 }
+    END { if (open) printf "))" }
+  '
+}
+
+# The overrides that start a shard's tests longest first, spread over nextest's range so that a
+# test with no measured duration keeps the default 0 and starts among the middle of them.
+priority_blocks() {
+  local dir=$1 priority
+  LC_ALL=C sort -t"$TAB" -k3,3nr -k1,1 -k2,2 | awk -F"$TAB" -v dir="$dir" '
+    { id[NR] = $1; name[NR] = $2 }
+    END {
+      for (r = 1; r <= NR; r++) {
+        p = (NR > 1) ? 100 - 200 * (r - 1) / (NR - 1) : 100
+        p = int(p / 10 + (p >= 0 ? 0.5 : -0.5)) * 10
+        if (p != 0) printf("%s\t%s\n", id[r], name[r]) > (dir "/bucket." p)
+      }
+    }
+  '
+  for ((priority = 100; priority >= -100; priority -= 10)); do
+    [[ -s "$dir/bucket.$priority" ]] || continue
+    printf '\n[[profile.default.overrides]]\n'
+    printf "filter = '''%s'''\n" "$(grouped_filter < "$dir/bucket.$priority")"
+    printf 'priority = %d\n' "$priority"
+  done
+}
+
+# One `shard-<i>.toml` per partition: the tests it runs as its profile's `default-filter`, and the
+# order to start them in. 3 when there is nothing measured to cut, so the caller slices by count.
+shard_configs() {
+  local dir=$1 timings=$2 tmp catchall first i
+  if [[ ! -s $timings ]]; then
+    echo "no measured durations at $timings" >&2
+    return 3
+  fi
+  if ! awk -F"$TAB" 'NF != 3 || $3 !~ /^[0-9]+$/ { exit 1 }' "$timings"; then
+    echo "FAIL: $timings is not one 'binary_id<TAB>test<TAB>milliseconds' line per test" >&2
+    return 1
+  fi
+  tmp=$(mktemp -d)
+  assign "$timings" > "$tmp/assigned"
+  catchall=$(awk -F"$TAB" '$1 == "catchall" { print $2 }' "$tmp/assigned")
+  if awk -F"$TAB" '$1 == "load" && $4 == 0 { bare = 1 } END { exit !bare }' "$tmp/assigned"; then
+    echo "$(grep -c . "$timings") measured tests do not fill $PARTITIONS partitions" >&2
+    rm -rf "$tmp"
+    return 3
+  fi
+  mkdir -p "$dir"
+  for ((i = 1; i <= PARTITIONS; i++)); do
+    mkdir -p "$tmp/order.$i"
+    awk -F"$TAB" -v s="$i" '$1 == "t" && $2 == s { printf "%s\t%s\t%s\n", $3, $4, $5 }' \
+      "$tmp/assigned" > "$tmp/held.$i"
+    cut -f1,2 "$tmp/held.$i" | grouped_filter > "$tmp/filter.$i"
+  done
+  {
+    printf 'not ('
+    first=1
+    for ((i = 1; i <= PARTITIONS; i++)); do
+      [[ $i -eq $catchall ]] && continue
+      ((first)) || printf ' | '
+      first=0
+      printf '%s' "$(cat "$tmp/filter.$i")"
+    done
+    printf ')'
+  } > "$tmp/negation"
+  mv "$tmp/negation" "$tmp/filter.$catchall"
+  for ((i = 1; i <= PARTITIONS; i++)); do
+    {
+      printf '[profile.shard%d]\n' "$i"
+      printf "default-filter = '''%s'''\n" "$(cat "$tmp/filter.$i")"
+      priority_blocks "$tmp/order.$i" < "$tmp/held.$i"
+    } > "$dir/shard-$i.toml"
+  done
+  awk -F"$TAB" -v catchall="$catchall" '
+    $1 == "load" {
+      printf "shard %s: %d tests, %.1fs%s\n", $2, $4, $3 / 1000,
+        ($2 == catchall ? ", and every test with no measured duration" : "")
+    }
+  ' "$tmp/assigned"
+  rm -rf "$tmp"
+}
+
+cmd_shard_configs() { shard_configs "${1:?a directory to write the configs to}" "$TIMINGS"; }
 
 cmd_solo_matrix() {
   local id package target test first=1
@@ -191,6 +331,79 @@ members_outside_crates() {
   sed -n '/^members = \[/,/^]/p' "$root/Cargo.toml" |
     sed -n 's#.*"\([^"]*\)".*#\1#p' |
     grep -v '^crates/' || true
+}
+
+# The tests a shard config's `default-filter` names, as `binary_id test`. The `tr` is what keeps
+# awk off a record hundreds of kilobytes long: every `|` of the filterset starts a new one.
+named_by() {
+  grep '^default-filter = ' "$1" | tr '|' '\n' | awk '
+    {
+      if (match($0, "binary_id\\(=[^)]*\\)")) {
+        token = substr($0, RSTART, RLENGTH)
+        id = substr(token, 12, length(token) - 12)
+      }
+      if (match($0, "test\\(=[^)]*\\)")) {
+        token = substr($0, RSTART, RLENGTH)
+        printf "%s\t%s\n", id, substr(token, 7, length(token) - 7)
+      }
+    }
+  '
+}
+
+# The shards a table cuts run every test exactly once: no two name the same test, and one is the
+# negation of all the others, so a test none of them names — a test added since the table was
+# measured — runs there and nowhere else.
+check_shards() {
+  local what=$1 timings=$2 tmp dir catchall seen bad=0 rc=0 i
+  tmp=$(mktemp -d)
+  dir=$tmp/configs
+  shard_configs "$dir" "$timings" > /dev/null || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    rm -rf "$tmp"
+    # A measured table too small to fill the partitions is the fallback, not a failure.
+    if [[ $rc -eq 3 && $what == measured ]]; then
+      return 0
+    fi
+    echo "FAIL: the $what durations cut no shards, so nothing here is checked" >&2
+    return 1
+  fi
+  catchall=
+  seen=0
+  for ((i = 1; i <= PARTITIONS; i++)); do
+    if [[ ! -f "$dir/shard-$i.toml" ]]; then
+      echo "FAIL: the $what durations cut no shard $i, and a partition job runs one" >&2
+      bad=1
+      continue
+    fi
+    if ! grep -q "^\[profile\.shard$i\]$" "$dir/shard-$i.toml"; then
+      echo "FAIL: $dir/shard-$i.toml declares no [profile.shard$i], which is the profile its job runs" >&2
+      bad=1
+    fi
+    if grep -q "^default-filter = '''not (" "$dir/shard-$i.toml"; then
+      catchall=$i
+      seen=$((seen + 1))
+    else
+      named_by "$dir/shard-$i.toml" >> "$tmp/others"
+    fi
+  done
+  if [[ $seen -ne 1 ]]; then
+    echo "FAIL: $seen of the $what shards are the negation of the rest, and exactly one has to be: a test with no measured duration runs there" >&2
+    bad=1
+  fi
+  if [[ $bad -eq 0 ]]; then
+    named_by "$dir/shard-$catchall.toml" | LC_ALL=C sort > "$tmp/caught"
+    LC_ALL=C sort "$tmp/others" > "$tmp/named"
+    if [[ -n $(LC_ALL=C uniq -d "$tmp/named") ]]; then
+      echo "FAIL: two of the $what shards name $(LC_ALL=C uniq -d "$tmp/named" | head -1), so it would run twice" >&2
+      bad=1
+    fi
+    if ! cmp -s "$tmp/caught" "$tmp/named"; then
+      echo "FAIL: the $what catch-all shard's negation is not what the other shards name, so a test runs twice or not at all" >&2
+      bad=1
+    fi
+  fi
+  rm -rf "$tmp"
+  return "$bad"
 }
 
 # Whether a `package target test` triple names a test that exists; prints the problem otherwise.
@@ -321,6 +534,24 @@ cmd_verify() {
     failures=$((failures + 1))
   fi
 
+  # --- the shards the durations cut -----------------------------------------
+  local made_up made_up_test
+  if [[ $PARTITIONS -lt 2 ]]; then
+    echo "FAIL: PARTITIONS is $PARTITIONS, and one shard is the negation of the others" >&2
+    failures=$((failures + 1))
+  else
+    made_up=$(mktemp -d)
+    for ((made_up_test = 1; made_up_test <= PARTITIONS + 4; made_up_test++)); do
+      printf 'made-up::suite%d\tmade_up::test_%d\t%d\n' \
+        $((made_up_test % 3 + 1)) "$made_up_test" $((made_up_test * 37 + 1)) >> "$made_up/timings.tsv"
+    done
+    check_shards made-up "$made_up/timings.tsv" || failures=$((failures + 1))
+    rm -rf "$made_up"
+    if [[ -s $TIMINGS ]]; then
+      check_shards measured "$TIMINGS" || failures=$((failures + 1))
+    fi
+  fi
+
   # --- probes ---------------------------------------------------------------
   local workflow="$root/.github/workflows/ci.yml"
   local -a probe_listed=()
@@ -387,12 +618,16 @@ cmd_verify() {
     echo "$failures problem(s) in the CI tables" >&2
     return 1
   fi
-  echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#SOLO[@]} solo tests, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $PARTITIONS partitions"
+  local cut="by test count, with nothing measured"
+  [[ -s $TIMINGS ]] && cut="from $(grep -c . "$TIMINGS") measured durations"
+  echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#SOLO[@]} solo tests, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $PARTITIONS partitions cut $cut"
 }
 
 case "${1:-}" in
   verify) cmd_verify ;;
   partitions) cmd_partitions ;;
+  shard-configs) cmd_shard_configs "${2:-}" ;;
+  durations) cmd_durations "${2:?a nextest JUnit report}" ;;
   solo-matrix) cmd_solo_matrix ;;
   solo-filter) cmd_solo_filter "${2:?a solo id}" ;;
   exclude-filter) cmd_exclude_filter ;;
@@ -401,7 +636,7 @@ case "${1:-}" in
   tree-checks) cmd_tree_checks ;;
   tree-check-filter) cmd_tree_check_filter ;;
   *)
-    echo "usage: ci-shards.sh {verify|partitions|solo-matrix|solo-filter ID|exclude-filter|gate-filter|postgres-filter|tree-checks|tree-check-filter}" >&2
+    echo "usage: ci-shards.sh {verify|partitions|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|exclude-filter|gate-filter|postgres-filter|tree-checks|tree-check-filter}" >&2
     exit 2
     ;;
 esac
