@@ -357,25 +357,3 @@ pub fn build_pool(
 pub fn exit_code(ok: bool) -> i32 {
     if ok { EXIT_OK } else { crate::EXIT_FAILED }
 }
-
-pub fn counters_json(stats: &ply_eval::rc::Stats) -> Value {
-    json!({
-        "updates": stats.updates,
-        "updates_in_place": stats.updates_in_place,
-        "in_place": stats.in_place(),
-        "cycles": stats.cycles,
-    })
-}
-
-pub fn counters_line(stats: &ply_eval::rc::Stats) -> String {
-    let pct = |v: Option<f64>| match v {
-        Some(v) => format!("{:.1}%", v * 100.0),
-        None => "n/a".to_string(),
-    };
-    format!(
-        "counters    in place {} of {} ({})",
-        stats.updates_in_place,
-        stats.updates,
-        pct(stats.in_place()),
-    )
-}
