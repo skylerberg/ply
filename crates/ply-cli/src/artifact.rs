@@ -97,30 +97,12 @@ impl Artifact {
                 "`{ENCODE}` answered something that is not a byte string"
             )));
         };
-        let mut out = written.to_vec();
-        let Some(plan) = plan(out.len())? else {
-            return Err(container_failed(format!(
-                "`{ENCODE}` answered {} bytes, which is no container at all",
-                out.len()
-            )));
-        };
-        let digest = plan.over(&out).ok_or_else(|| {
-            container_failed("the digest plan reaches past the container it is for".to_string())
-        })?;
-        let field = plan
-            .at
-            .checked_add(32)
-            .and_then(|end| out.get_mut(plan.at..end))
-            .ok_or_else(|| {
-                container_failed("the digest plan writes past the container it is for".to_string())
-            })?;
-        field.copy_from_slice(&digest);
-        Ok(out)
+        seal(written.to_vec())
     }
 
     /// Each section's payload, in the order they are written. The records inside a payload are
     /// the writer's; `plyx.ply` places the payloads and hands them back.
-    fn sections(&self) -> Vec<(&'static str, u32, Vec<u8>)> {
+    pub(crate) fn sections(&self) -> Vec<(&'static str, u32, Vec<u8>)> {
         let mut sections: Vec<(&'static str, u32, Vec<u8>)> = Vec::with_capacity(5);
 
         let mut bodies = Vec::new();
@@ -166,6 +148,29 @@ impl Artifact {
         }
         sections
     }
+}
+
+/// A container `plyx.ply` laid out, with its digest written into the field no range of the digest
+/// covers.
+pub fn seal(mut out: Vec<u8>) -> Result<Vec<u8>, Diagnostic> {
+    let Some(plan) = plan(out.len())? else {
+        return Err(container_failed(format!(
+            "a container of {} bytes is no container at all",
+            out.len()
+        )));
+    };
+    let digest = plan.over(&out).ok_or_else(|| {
+        container_failed("the digest plan reaches past the container it is for".to_string())
+    })?;
+    let field = plan
+        .at
+        .checked_add(32)
+        .and_then(|end| out.get_mut(plan.at..end))
+        .ok_or_else(|| {
+            container_failed("the digest plan writes past the container it is for".to_string())
+        })?;
+    field.copy_from_slice(&digest);
+    Ok(out)
 }
 
 /// The container format this `ply` writes and reads.
@@ -492,7 +497,7 @@ pub fn build(
     out.names.sort();
     out.names.dedup();
 
-    out.closure = closure_texts(&out)?;
+    out.closure = closure_texts(&out, front)?;
     // Reopened as a target opens it, so an artifact that builds is one that opens.
     let opened = reopen(&out).map_err(|diags| vec![unreopened(&diags)])?;
     let names: Vec<&str> = out.names.iter().map(|(n, _)| n.as_str()).collect();
@@ -510,12 +515,34 @@ pub fn build(
     })
 }
 
-fn closure_texts(artifact: &Artifact) -> Result<Vec<(String, String)>, Vec<Diagnostic>> {
+/// Whether the module that holds `name` exports it; a prelude effect has no entry and is public.
+fn exports(front: &Front, name: &str) -> bool {
+    let symbol = Symbol::new(name);
+    if let Some(written) = front.defs_written.get(&symbol) {
+        return written.vis.is_public();
+    }
+    if let Some(declared) = front.types.get(&symbol) {
+        return declared.vis.is_public();
+    }
+    front
+        .effects_written
+        .get(&symbol)
+        .is_none_or(|vis| vis.is_public())
+}
+
+fn closure_texts(
+    artifact: &Artifact,
+    front: &Front,
+) -> Result<Vec<(String, String)>, Vec<Diagnostic>> {
     let bodies: Vec<&[u8]> = artifact.bodies.values().map(StoredBody::as_bytes).collect();
-    let names: Vec<(&str, DefHash)> = artifact
+    let names: Vec<ply_codegen::c::producer::PrintedName<'_>> = artifact
         .names
         .iter()
-        .map(|(name, hash)| (name.as_str(), *hash))
+        .map(|(name, hash)| ply_codegen::c::producer::PrintedName {
+            name: name.as_str(),
+            hash: *hash,
+            public: exports(front, name),
+        })
         .collect();
     let shipped: BTreeSet<&str> = artifact
         .names
@@ -841,11 +868,15 @@ fn check_versions(
 }
 
 pub fn read(path: &Path) -> Result<(Artifact, Vec<Diagnostic>), Diagnostic> {
-    let bytes = std::fs::read(path).map_err(|e| {
+    decode(&bytes_of(path)?, path)
+}
+
+/// The container as it lies on disk, before anything is believed about it.
+pub fn bytes_of(path: &Path) -> Result<Vec<u8>, Diagnostic> {
+    std::fs::read(path).map_err(|e| {
         invalid(path, format!("could not read `{}`: {e}", path.display()))
             .note("name the `.plyx` file `ply build` wrote")
-    })?;
-    decode(&bytes, path)
+    })
 }
 
 pub struct Opened {
@@ -1027,7 +1058,10 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
     if let Some(front) = cached_front(&filed, &mut ids, &mut sources) {
         return entered(artifact, sources, front);
     }
-    let answered = ask_the_port(&own, &mut ids, &mut sources)?;
+    let answered = match ask_the_port(&own, &mut ids, &mut sources) {
+        Ok(answered) => answered,
+        Err(diags) => return Err(over_printed(diags, &sources)),
+    };
     let front = answered.front;
 
     let hashes = &front.hashes;
@@ -1084,52 +1118,6 @@ fn entered(
         front,
         entry,
     })
-}
-
-#[derive(Default, Debug)]
-pub struct Diff {
-    pub added: Vec<String>,
-    pub changed: Vec<String>,
-    pub dropped: Vec<String>,
-    pub unchanged: usize,
-    pub reached: Vec<String>,
-}
-
-pub fn diff(old: &Artifact, built: &Built) -> Diff {
-    let new = &built.artifact;
-    let before: BTreeMap<&str, BTreeSet<DefHash>> = group(&old.names);
-    let after: BTreeMap<&str, BTreeSet<DefHash>> = group(&new.names);
-
-    let mut out = Diff::default();
-    for (name, hashes) in &after {
-        match before.get(name) {
-            None => out.added.push(name.to_string()),
-            Some(was) if was != hashes => out.changed.push(name.to_string()),
-            Some(_) => out.unchanged += 1,
-        }
-    }
-    for name in before.keys() {
-        if !after.contains_key(name) {
-            out.dropped.push(name.to_string());
-        }
-    }
-
-    let moved: BTreeSet<&String> = out.added.iter().chain(out.changed.iter()).collect();
-    out.reached = built
-        .closure
-        .iter()
-        .filter(|(_, reaches)| reaches.iter().any(|n| moved.contains(n)))
-        .map(|(name, _)| name.clone())
-        .collect();
-    out
-}
-
-fn group(names: &[(String, DefHash)]) -> BTreeMap<&str, BTreeSet<DefHash>> {
-    let mut out: BTreeMap<&str, BTreeSet<DefHash>> = BTreeMap::new();
-    for (name, hash) in names {
-        out.entry(name.as_str()).or_default().insert(*hash);
-    }
-    out
 }
 
 pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
@@ -1541,20 +1529,41 @@ fn unfaithful(message: String) -> Diagnostic {
     Diagnostic::error(codes::ARTIFACT_INVALID, message)
 }
 
+/// A refusal over text no caller holds. The spans point into the closure printed a moment ago, so
+/// this is the only place they mean anything; rendered here, the reason survives as a note.
+fn over_printed(diags: Vec<Diagnostic>, sources: &SourceMap) -> Vec<Diagnostic> {
+    diags
+        .into_iter()
+        .map(|d| {
+            let shown = ply_span::render::to_terminal(&d, sources, false);
+            d.note(shown.trim_end().to_string())
+        })
+        .collect()
+}
+
 fn first_of(diags: &[Diagnostic]) -> String {
     diags.first().map_or_else(
         || "no reason was given".to_string(),
-        |d| format!("{}: {}", d.code, d.message),
+        |d| match d.labels.iter().find(|l| l.primary && !l.message.is_empty()) {
+            Some(l) => format!("{}: {} ({})", d.code, d.message, l.message),
+            None => format!("{}: {}", d.code, d.message),
+        },
     )
 }
 
 fn unreopened(diags: &[Diagnostic]) -> Diagnostic {
-    Diagnostic::error(
+    let named = Diagnostic::error(
         codes::INTERNAL_ERROR,
         "the closure printed back to source does not open as the program it was printed from",
     )
-    .note(first_of(diags))
-    .note("this is Ply's fault, not the program's, and nothing was built")
+    .note(first_of(diags));
+    diags
+        .first()
+        .map(|d| d.notes.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .fold(named, |out, note| out.note(note.clone()))
+        .note("this is Ply's fault, not the program's, and nothing was built")
 }
 
 fn version(path: &Path, message: impl Into<String>) -> Diagnostic {

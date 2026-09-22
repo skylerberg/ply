@@ -22,6 +22,7 @@ pub const PROGRAM_SOURCES: &[(&str, &str)] = &[
     ("appends", include_str!("../ply/appends.ply")),
     ("args", include_str!("../ply/args.ply")),
     ("bootstrap", include_str!("../ply/bootstrap.ply")),
+    ("build", include_str!("../ply/build.ply")),
     ("cache", include_str!("../ply/cache.ply")),
     ("callers", include_str!("../ply/callers.ply")),
     ("check", include_str!("../ply/check.ply")),
@@ -302,12 +303,18 @@ fn build_in(dir: &Path) -> Result<Vec<u8>, Diagnostic> {
     })?;
     let entry = crate::commands::run::entry_point(&loaded)
         .map_err(|d| unbuilt(format!("{} [{}]", d.message, d.code)))?;
-    let built = crate::artifact::build(&loaded, entry, &[]).map_err(|diagnostics| {
-        unbuilt(match diagnostics.first() {
-            Some(d) => format!("{} [{}]", d.message, d.code),
-            None => "nothing said why".to_string(),
-        })
-    })?;
+    // With its notes: a refusal here states the symptom and carries the reason in a note, so
+    // dropping them leaves a reader the one thing that cannot be acted on.
+    let built =
+        crate::artifact::build(&loaded, entry, &[]).map_err(|diagnostics| {
+            match diagnostics.first() {
+                Some(d) => d.notes.iter().fold(
+                    unbuilt(format!("{} [{}]", d.message, d.code)),
+                    |out, note| out.note(note.clone()),
+                ),
+                None => unbuilt("nothing said why".to_string()),
+            }
+        })?;
     // `ply` enters the artifact's own unit and nothing else, so an artifact whose unit holds no
     // body for `main` cannot run. It is not landed: the failure belongs to the build, where the
     // emitter's reasons are still in hand, not to the next run, which would have none.
