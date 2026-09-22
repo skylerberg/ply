@@ -45,17 +45,26 @@ const OPERATIONS: [(&str, &str); 3] = [
 /// kilobytes. Reserved, not committed.
 const RUN_STACK: usize = 256 << 20;
 
-/// The load, the store and the binding are opened on a thread of their own, so the flags the
-/// machine reads are all this side keeps.
-pub fn lent(args: &TestArgs) -> Vec<Lent> {
-    let site: Arc<dyn HostHandler> = Arc::new(Site {
-        args: args.clone(),
-        machine: Mutex::new(None),
-    });
-    OPERATIONS
-        .into_iter()
-        .map(|(op, path)| (registration(op, path), Arc::clone(&site)))
-        .collect()
+/// One process's machine. The load, the store and the binding are opened on a thread of their own
+/// and live as long as this does, so a `--watch` iteration over an unmoved tree re-derives nothing.
+pub struct Session(Arc<Site>);
+
+impl Session {
+    pub fn new(args: &TestArgs) -> Session {
+        Session(Arc::new(Site {
+            args: args.clone(),
+            machine: Mutex::new(None),
+        }))
+    }
+
+    /// What one entry into the program is lent. Every iteration is lent the same machine.
+    pub fn lent(&self) -> Vec<Lent> {
+        let site: Arc<dyn HostHandler> = Arc::clone(&self.0) as Arc<dyn HostHandler>;
+        OPERATIONS
+            .into_iter()
+            .map(|(op, path)| (registration(op, path), Arc::clone(&site)))
+            .collect()
+    }
 }
 
 fn registration(op: &str, path: &'static str) -> HostOp {
@@ -105,6 +114,7 @@ impl Site {
             *held = Some(Machine::start(self.args.clone())?);
         }
         let machine = held.as_ref().ok_or_else(|| unstarted("loaded"))?;
+        machine.ask(Go::Load)?;
         match machine.step()? {
             Step::Loaded(found) => Ok(answered((*found).map(found_value))),
             _ => Err(out_of_step("loaded")),
@@ -124,15 +134,12 @@ impl Site {
         }
     }
 
+    /// The machine is left running: the next iteration is lent the front end this one built.
     fn ran(&self) -> Result<PlyValue, Diagnostic> {
-        let mut held = self.held();
-        let step = {
-            let machine = held.as_ref().ok_or_else(|| unstarted("ran"))?;
-            machine.ask(Go::Run)?;
-            machine.step()?
-        };
-        // The report is written: the thread it was measured on is joined here.
-        held.take();
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("ran"))?;
+        machine.ask(Go::Run)?;
+        let step = machine.step()?;
         match step {
             Step::Ran(over) => Ok(ran_value(&over)),
             _ => Err(out_of_step("ran")),
@@ -151,6 +158,7 @@ fn answered(answer: Result<PlyValue, Refused>) -> PlyValue {
 // --- The thread the corpus runs on --------------------------------------------
 
 enum Go {
+    Load,
     Bind,
     Run,
 }
@@ -161,10 +169,11 @@ enum Step {
     Ran(Box<Over>),
 }
 
-/// The thread this run's machine lives on. The `ply` program performing these operations is itself
-/// inside an entry; two entries do not nest on one thread, and a bisection and a mutation each
-/// evaluate a program of their own. The load, the store, the binding, the pool and the diagnosis
-/// all happen here, and only what a report is written from crosses back.
+/// The thread this process's machine lives on. The `ply` program performing these operations is
+/// itself inside an entry; two entries do not nest on one thread, and a bisection and a mutation
+/// each evaluate a program of their own. The load, the store, the binding, the pool and the
+/// diagnosis all happen here, and only what a report is written from crosses back — which is also
+/// what lets the front end outlive an iteration: it never leaves this thread.
 struct Machine {
     go: Option<mpsc::Sender<Go>>,
     steps: mpsc::Receiver<Step>,
@@ -209,29 +218,50 @@ impl Drop for Machine {
     }
 }
 
+/// One store and one warm front end for the whole process, however many reports are asked of it.
 fn serve(args: &TestArgs, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
-    let mut cache = match Cache::open(&project_root(&args.path), args.no_cache) {
-        Ok(cache) => cache,
-        Err(diagnostic) => {
-            let _ = told.send(Step::Loaded(Box::new(Err(Refused {
-                diagnostics: vec![diagnostic],
-                sources: SourceMap::new(),
-            }))));
-            return;
+    let mut cache = Cache::open(&project_root(&args.path), args.no_cache);
+    let mut warm = crate::warm::Warm::default();
+    while asked.recv().is_ok() {
+        match &mut cache {
+            Ok(cache) => iterate(args, cache, &mut warm, told, asked),
+            Err(diagnostic) => {
+                let _ = told.send(Step::Loaded(Box::new(Err(Refused {
+                    diagnostics: vec![diagnostic.clone()],
+                    sources: SourceMap::new(),
+                }))));
+            }
         }
-    };
-    let mut warnings = cache.warnings.clone();
+    }
+}
+
+fn iterate(
+    args: &TestArgs,
+    cache: &mut Cache,
+    warm: &mut crate::warm::Warm,
+    told: &mpsc::Sender<Step>,
+    asked: &mpsc::Receiver<Go>,
+) {
+    let mut warnings = std::mem::take(&mut cache.warnings);
     let opened = cache.store.take_warnings();
     warnings.extend(crate::migrate::notice(&cache.store, &opened));
     warnings.extend(opened);
 
-    let loaded = if args.no_cache {
-        load(&args.path)
-    } else {
-        crate::driver::load_incremental(&args.path, &mut cache.store)
+    // The front end is a function of the sources, so an unmoved tree reuses it whole.
+    let (held, reuse) = warm.take(&project_root(&args.path));
+    let loaded = match held {
+        Some(loaded) => Ok(loaded),
+        None if args.no_cache => load(&args.path),
+        None => crate::driver::load_incremental(&args.path, &mut cache.store),
     };
     let loaded = match loaded {
-        Ok(loaded) => loaded,
+        Ok(mut loaded) => {
+            if reuse == crate::warm::Reuse::Whole {
+                // Nothing was re-derived, so this iteration reports no phase time.
+                loaded.frontend.phases = crate::driver::Phases::default();
+            }
+            loaded
+        }
         Err(err) => {
             let _ = told.send(Step::Loaded(Box::new(Err(Refused {
                 diagnostics: err.diagnostics,
@@ -276,28 +306,34 @@ fn serve(args: &TestArgs, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>)
     let Ok(Go::Bind) = asked.recv() else {
         return;
     };
-    bind(
-        args, &mut cache, loaded, hashes, plan, &search, engine, told, asked,
-    );
+    if bind(
+        args, cache, warm, &loaded, &hashes, plan, &search, engine, told, asked,
+    ) {
+        // Only over a report that was written: an iteration that returned early leaves nothing held.
+        warm.keep(loaded);
+    }
 }
 
+/// Whether a report was written, which is what decides if this front end is worth holding.
 #[allow(clippy::too_many_arguments)]
 fn bind(
     args: &TestArgs,
     cache: &mut Cache,
-    loaded: Loaded,
-    hashes: HashOutput,
+    warm: &mut crate::warm::Warm,
+    loaded: &Loaded,
+    hashes: &HashOutput,
     plan: Plan,
     search: &ply_eval::Plan,
     engine: ply_test::Engine,
     told: &mpsc::Sender<Step>,
     asked: &mpsc::Receiver<Go>,
-) {
+) -> bool {
     let refuse = |diagnostics: Vec<Diagnostic>| {
         let _ = told.send(Step::Bound(Box::new(Some(Refused {
             diagnostics,
             sources: loaded.sources.clone(),
         }))));
+        false
     };
     let backend =
         match select_profile(&args.profile).and_then(|()| backend_spec(args.backend.as_ref())) {
@@ -321,15 +357,22 @@ fn bind(
     let schema_named =
         args.config.schema.is_some() || db.as_ref().is_some_and(|c| c.schema.is_some());
     let wanted = backend.as_ref().filter(|_| !nothing_to_run || schema_named);
-    let unit = match wanted.map(|spec| {
+    // The last iteration's unit, moved to this layout, when no definition's text changed.
+    let held_unit = wanted.and_then(|spec| warm.unit_for(spec, &loaded.front, &loaded.sources));
+    let unit = match wanted.filter(|_| held_unit.is_none()).map(|spec| {
         build_backend_over(
             spec,
             &loaded.front,
             module_texts(&loaded.check, &loaded.sources),
         )
     }) {
-        None => None,
-        Some(Ok(provider)) => Some(provider),
+        None => held_unit,
+        Some(Ok(provider)) => {
+            if let Some(spec) = backend.as_ref() {
+                warm.keep_unit(spec, hashes, provider);
+            }
+            Some(provider)
+        }
         Some(Err(diagnostic)) => return refuse(vec![diagnostic]),
     };
     let constant = |name: &str| enter_constant(unit, name);
@@ -357,13 +400,13 @@ fn bind(
     describe_schema(&mut hosts, &constant);
     let _ = told.send(Step::Bound(Box::new(None)));
     let Ok(Go::Run) = asked.recv() else {
-        return;
+        return false;
     };
     let over = execute(
         args,
         cache,
-        &loaded,
-        &hashes,
+        loaded,
+        hashes,
         &plan,
         search,
         &engine,
@@ -373,6 +416,7 @@ fn bind(
         config_warnings,
     );
     let _ = told.send(Step::Ran(Box::new(over)));
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
