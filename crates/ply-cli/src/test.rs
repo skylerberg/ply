@@ -35,10 +35,11 @@ use std::sync::{Arc, Mutex, mpsc};
 /// else: no other command runs a corpus.
 const EFFECT: &str = "tester";
 
-const OPERATIONS: [(&str, &str); 3] = [
+const OPERATIONS: [(&str, &str); 4] = [
     ("loaded", "ply_cli::test::loaded"),
     ("bound", "ply_cli::test::bound"),
     ("ran", "ply_cli::test::ran"),
+    ("stamped", "ply_cli::test::stamped"),
 ];
 
 /// A compiled body honours its call bound on the native stack, where unoptimised frames run to
@@ -74,7 +75,7 @@ fn registration(op: &str, path: &'static str) -> HostOp {
         resource: HostResource::Any,
         // A tree, a clock and a cache are not functions of program state.
         determinism: Determinism::Nondeterministic,
-        // One report per entry, and `--watch` enters the program again rather than replaying.
+        // A watching run asks for report after report from inside one entry.
         linearity: Linearity::Repeatable,
         // The answer is in hand when the operation returns: this thread waits for the one the
         // corpus runs on rather than being handed a token to poll.
@@ -97,6 +98,7 @@ impl HostHandler for Site {
             "loaded" => self.loaded()?,
             "bound" => self.bound()?,
             "ran" => self.ran()?,
+            "stamped" => self.stamped(),
             other => return Err(unasked(other, span)),
         };
         Ok(HostAnswer::Value(value))
@@ -134,6 +136,18 @@ impl Site {
         }
     }
 
+    /// How the tree stamps now, one line per `.ply` file under the root. It reaches no machine: a
+    /// watching run asks for this between reports, and a walk is not a front end.
+    fn stamped(&self) -> PlyValue {
+        let stamps = crate::warm::tree_stamps(&project_root(&self.args.path));
+        PlyValue::list(
+            stamps
+                .iter()
+                .map(|(path, stamp)| PlyValue::str(stamp_line(path, stamp)))
+                .collect(),
+        )
+    }
+
     /// The machine is left running: the next iteration is lent the front end this one built.
     fn ran(&self) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
@@ -145,6 +159,16 @@ impl Site {
             _ => Err(out_of_step("ran")),
         }
     }
+}
+
+/// One file's stamp, whole: the modification time to the nanosecond and the length. Two walks that
+/// render the same line found the same file, which is the only question asked of it.
+fn stamp_line(path: &Path, (modified, len): &crate::load::Stamp) -> String {
+    let at = modified
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_nanos().to_string())
+        .unwrap_or_else(|| "-".to_string());
+    format!("{} {at} {len}", path.display())
 }
 
 /// `Ok(v)` or `Err(Refusal)`, as the program reads an operation's answer.
