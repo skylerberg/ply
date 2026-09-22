@@ -40,8 +40,6 @@ pub fn select_profile(flag: &str) -> Result<(), Diagnostic> {
     Ok(())
 }
 
-pub(crate) use ply_codegen::emit_keys;
-
 /// Runs `selection` on the compiled tier built from `loaded`'s module source texts.
 pub fn run_on_tier(
     loaded: &crate::load::Loaded,
@@ -175,27 +173,6 @@ pub fn print_warnings(warnings: &[Diagnostic], style: Style) {
             println!("{IND}  {} {note}", style.dim("="));
         }
     }
-}
-
-/// Diagnostics after a successful load, in the command's own shape; always exit 2.
-pub fn report_diagnostics(
-    command: &str,
-    diagnostics: &[Diagnostic],
-    loaded: &crate::load::Loaded,
-    json: bool,
-    style: Style,
-) -> i32 {
-    if json {
-        emit_json(&json!({
-            "command": command,
-            "ok": false,
-            "exit_code": EXIT_COMPILE_ERROR,
-            "diagnostics": diagnostics_json(diagnostics, &loaded.sources),
-        }));
-    } else {
-        print_diagnostics(diagnostics, &loaded.sources, style);
-    }
-    EXIT_COMPILE_ERROR
 }
 
 /// One shape for every command, so an agent can key off `command` and `exit_code`.
