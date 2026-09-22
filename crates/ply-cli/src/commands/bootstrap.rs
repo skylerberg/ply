@@ -1,164 +1,38 @@
-//! The front end, written out as the C that builds it. The source digest names the version;
-//! the artifact digest is what `--verify` checks.
+//! `ply bootstrap` — the runner for the `bootstrap` command of the program in
+//! `crates/ply-cli/ply`.
 
-use super::common::{diagnostics_json, emit_json, emit_keys, print_diagnostics, report_load_error};
+use super::shipped_program::{color, run};
+use crate::artifact::Binds;
 use crate::cli::BootstrapArgs;
-use crate::load::load;
 use crate::style::Style;
-use crate::{EXIT_COMPILE_ERROR, EXIT_OK};
-use serde_json::json;
-
-/// Written beside the C and read back by `--verify`.
-fn manifest(source: &str, artifact: &str, definitions: usize, refused: usize) -> serde_json::Value {
-    json!({
-        "source": source,
-        "artifact": artifact,
-        "definitions": definitions,
-        "refused": refused,
-    })
-}
+use std::path::Path;
 
 pub fn execute(args: &BootstrapArgs, style: Style) -> i32 {
-    if let Err(d) = super::common::select_profile(&args.profile) {
-        print_diagnostics(std::slice::from_ref(&d), &ply_span::SourceMap::new(), style);
-        return EXIT_COMPILE_ERROR;
-    }
-    let loaded = match load(&args.path) {
-        Ok(loaded) => loaded,
-        Err(err) => return report_load_error("bootstrap", &err, args.json, style),
+    // The emitter is worked here, behind the effect the program performs; the program is lent
+    // what it came to and reaches no tree of its own.
+    let binds = Binds {
+        lent: crate::bootstrap::lent(args),
+        ..Binds::default()
     };
-    // The call is the guard: it reports the hashing's diagnostics and stops.
-    let _hashes = match loaded.hashes() {
-        Ok(hashes) => hashes,
-        Err(diagnostics) => {
-            if args.json {
-                emit_json(&json!({
-                    "command": "bootstrap",
-                    "ok": false,
-                    "exit_code": EXIT_COMPILE_ERROR,
-                    "diagnostics": diagnostics_json(&diagnostics, &loaded.sources),
-                }));
-            } else {
-                print_diagnostics(&diagnostics, &loaded.sources, style);
-            }
-            return EXIT_COMPILE_ERROR;
-        }
-    };
-    // The load's own answer: asking again would run a second front end.
-    let front = Box::leak(Box::new(loaded.front.clone()));
+    run(
+        "bootstrap",
+        argv(args, style),
+        Path::new("."),
+        binds,
+        args.json,
+        style,
+    )
+}
 
-    // Sorted by name, so moving a definition between files does not rename the compiler.
-    let mut pairs: Vec<(String, String)> = front
-        .hashes
-        .defs
-        .iter()
-        .map(|(name, h)| (name.to_string(), h.to_hex()))
-        .collect();
-    pairs.sort();
-    let mut h = blake3::Hasher::new();
-    for (name, hash) in &pairs {
-        h.update(name.as_bytes());
-        h.update(&[0]);
-        h.update(hash.as_bytes());
-        h.update(&[0]);
-    }
-    let source_digest = h.finalize().to_hex().to_string();
-
-    // Without the module texts the port answers no bodies, and the archive would be empty.
-    let src: &'static ply_codegen::Source = Box::leak(Box::new(
-        ply_codegen::Source::from_front(front, emit_keys(front)).with_texts(
-            crate::commands::common::module_texts(&loaded.check, &loaded.sources),
-        ),
-    ));
-    let names: Vec<String> = src.functions();
-    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (text, refused) = match ply_codegen::c::produce(src, &refs) {
-        Ok(produced) => (produced.text, produced.refused),
-        Err(e) => {
-            eprintln!("the front end could not be emitted: {e:#}");
-            return EXIT_COMPILE_ERROR;
-        }
-    };
-    let artifact_digest = blake3::hash(text.as_bytes()).to_hex().to_string();
-    let manifest = manifest(&source_digest, &artifact_digest, names.len(), refused.len());
-
-    let dir = args.out.clone();
-    let c_path = dir.join("frontend.c");
-    let manifest_path = dir.join("manifest.json");
-
-    if args.verify {
-        let Ok(recorded) = std::fs::read_to_string(&manifest_path) else {
-            eprintln!("no archive at {}", manifest_path.display());
-            return EXIT_COMPILE_ERROR;
-        };
-        let recorded: serde_json::Value = match serde_json::from_str(&recorded) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("{}: {e}", manifest_path.display());
-                return EXIT_COMPILE_ERROR;
-            }
-        };
-        if recorded != manifest {
-            if args.json {
-                emit_json(&json!({
-                    "command": "bootstrap",
-                    "ok": false,
-                    "exit_code": EXIT_COMPILE_ERROR,
-                    "recorded": recorded,
-                    "emitted": manifest,
-                }));
-            } else {
-                eprintln!(
-                    "the archive does not describe this tree:\n  recorded {recorded}\n  emitted  {manifest}"
-                );
-            }
-            return EXIT_COMPILE_ERROR;
-        }
-        if args.json {
-            emit_json(
-                &json!({ "command": "bootstrap", "ok": true, "exit_code": EXIT_OK, "verified": manifest }),
-            );
-        } else {
-            println!("the archive describes this tree: {source_digest}");
-        }
-        return EXIT_OK;
-    }
-
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("{}: {e}", dir.display());
-        return EXIT_COMPILE_ERROR;
-    }
-    // The C first, so a manifest never describes an artifact that is not on disk.
-    if let Err(e) = std::fs::write(&c_path, &text) {
-        eprintln!("{}: {e}", c_path.display());
-        return EXIT_COMPILE_ERROR;
-    }
-    let rendered = format!(
-        "{}\n",
-        serde_json::to_string_pretty(&manifest).unwrap_or_default()
-    );
-    if let Err(e) = std::fs::write(&manifest_path, rendered) {
-        eprintln!("{}: {e}", manifest_path.display());
-        return EXIT_COMPILE_ERROR;
-    }
+/// What `process.args` answers: the command word, then the flags the program reads.
+fn argv(args: &BootstrapArgs, style: Style) -> Vec<String> {
+    let mut argv = vec![
+        "bootstrap".to_string(),
+        color(style),
+        format!("--action={}", if args.verify { "verify" } else { "write" }),
+    ];
     if args.json {
-        emit_json(&json!({
-            "command": "bootstrap",
-            "ok": true,
-            "exit_code": EXIT_OK,
-            "wrote": [c_path.display().to_string(), manifest_path.display().to_string()],
-            "manifest": manifest,
-        }));
-    } else {
-        println!(
-            "{} definitions, {} refused, {} bytes of C",
-            names.len(),
-            refused.len(),
-            text.len()
-        );
-        println!("source   {source_digest}");
-        println!("artifact {artifact_digest}");
-        println!("wrote    {}", c_path.display());
+        argv.push("--json".to_string());
     }
-    EXIT_OK
+    argv
 }
