@@ -7,7 +7,7 @@ import std.process (process, Captured, captured, args_step, out_step, err_step, 
 import std.fs (fs)
 import std.json (Json, Str, Bool, Number, object, to_string)
 import std.time (time)
-import args (Flags, read, style_of)
+import args (Flags, read, style_of, takes_value)
 import report (Answer, compile_error, schema_version)
 import style (Style, red)
 import bootstrap
@@ -119,6 +119,27 @@ fn unknown_flag(s: Style, command: String, flag: String) -> Answer = {
 fn joined(words: List<String>) -> String =
   match words { [] -> "", [last] -> last, [first, ..rest] -> first ++ ", " ++ joined(rest) }
 
+// The command word is the first word that is neither a flag nor a flag's value, so
+// `ply --color never test` names `test`. Every other word is a flag for the command to read,
+// wherever it stood. The Rust side puts the command first today; a command line need not.
+fn appended<a>(head: List<a>, tail: List<a>) -> List<a> =
+  fold(tail, head, |acc: List<a>, x: a| push(acc, x))
+
+fn commanded(argv: List<String>) -> Option<{ command: String, rest: List<String> }> =
+  match found(argv, []) { None -> None, Some(f) -> Some({ command: f.command, rest: f.rest }) }
+
+fn found(
+  argv: List<String>,
+  seen: List<String>,
+) -> Option<{ command: String, rest: List<String> }> =
+  match argv {
+    [] -> None,
+    [word, ..more] -> if takes_value(word) {
+      match more { [] -> None, [value, ..after] -> found(after, push(push(seen, word), value)) }
+    } else if string_starts_with(word, "-") && word != "-" { found(more, push(seen, word)) }
+    else { Some({ command: word, rest: appended(seen, more) }) },
+  }
+
 fn say(lines: List<String>) -> Unit / {process.out[proc]} =
   match lines {
     [] -> (),
@@ -186,9 +207,11 @@ fn watched(
 fn dispatch(
   argv: List<String>,
 ) -> Int / {process.out[proc], process.err[proc], fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.write_file[cwd], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.sleep_ms, hosts::tcb.preview[host], hosts::tcb.open[host], cache::store.statistics[cache], cache::store.matches[cache], cache::store.compacted[cache], cache::store.cleared[cache], replace::edit.item[replace], bootstrap::archive.emitted[bootstrap], bootstrap::archive.land[bootstrap], build::builder.loaded[build], build::builder.made[build], build::builder.sealed[build], build::builder.previous[build], build::builder.stored[build], run::runner.loaded[run], run::runner.bound[run], run::runner.entered[run], tests::tester.loaded[corpus], tests::tester.bound[corpus], tests::tester.ran[corpus], tests::tester.stamped[corpus], prover.collected[claims], prover.discharged[claims], prover.reviewed[claims], prover.accepted[claims]} =
-  match argv {
-    [] -> compile_error(),
-    [command, ..rest] -> {
+  match commanded(argv) {
+    None -> compile_error(),
+    Some(line) -> {
+      let command = line.command;
+      let rest = line.rest;
       let flags: Flags = read(rest);
       match flags.unknown {
         [first, ..rest_unknown] -> {
@@ -332,6 +355,23 @@ test "a path that begins with a dash is still a path when it follows `--`" {
   let flags = read(["--", "-weird.ply"]);
   assert_eq(flags.unknown, []);
   assert_eq(flags.paths, ["-weird.ply"])
+}
+
+test "a global flag may stand before the command word" {
+  // `ply --color never explain E0302` names `explain`, not `--color`.
+  let led = explained(["--color", "never", "explain", "E0302"]);
+  assert_eq(led.code, Some(0));
+  let plain = explained(["explain", "E0302"]);
+  assert_eq(led.out, plain.out);
+  // A flag's value is skipped with it: `never` is not mistaken for the command.
+  let fused = explained(["--color=never", "explain", "E0302"]);
+  assert_eq(fused.out, plain.out)
+}
+
+test "a line with no word that is not a flag names no command" {
+  let only_flags = explained(["--json", "--color", "never"]);
+  assert_eq(only_flags.out, []);
+  assert_eq(only_flags.code, Some(2))
 }
 
 test "no command word at all is a refusal, and nothing is written" {
