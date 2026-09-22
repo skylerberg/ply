@@ -252,6 +252,37 @@ fn every_ported_command_answers_with_no_path_argument() {
     }
 }
 
+/// The `(code, meaning)` of every `m(...)` row, read as two string literals rather than as a line,
+/// so a row the formatter had to wrap is still one row.
+fn meaning_rows(source: &str) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    let mut rest = source;
+    while let Some(at) = rest.find("m(") {
+        rest = &rest[at + "m(".len()..];
+        let Some((code, after)) = literal(rest) else {
+            continue;
+        };
+        let Some((meaning, after)) = literal(after) else {
+            continue;
+        };
+        rows.push((code, meaning));
+        rest = after;
+    }
+    rows
+}
+
+/// The string literal `text` opens with, and what follows it. Only whitespace and a comma may
+/// stand before it, so `fn m(code: String, ...)` is not read as a row.
+fn literal(text: &str) -> Option<(String, &str)> {
+    let open = text.find('"')?;
+    if text[..open].chars().any(|c| !c.is_whitespace() && c != ',') {
+        return None;
+    }
+    let rest = &text[open + 1..];
+    let close = rest.find('"')?;
+    Some((rest[..close].to_string(), &rest[close + 1..]))
+}
+
 /// The table the shipped program carries is what `ply explain` answers from; the registry the
 /// compiler raises from is still `ply_span`, so the two have to agree row for row.
 #[test]
@@ -261,13 +292,7 @@ fn the_programs_meanings_table_is_ply_spans() {
         .find(|(name, _)| *name == "explain")
         .map(|(_, text)| *text)
         .expect("the program carries `explain`");
-    let row = |line: &str| -> Option<(String, String)> {
-        let rest = line.trim().strip_prefix("m(\"")?;
-        let (code, meaning) = rest.split_once("\", \"")?;
-        let meaning = meaning.strip_suffix("\"),")?;
-        Some((code.to_string(), meaning.to_string()))
-    };
-    let rows: Vec<(String, String)> = source.lines().filter_map(row).collect();
+    let rows = meaning_rows(source);
     let listed: Vec<(String, String)> = ply_span::MEANINGS
         .iter()
         .map(|(code, meaning)| ((*code).to_string(), (*meaning).to_string()))
