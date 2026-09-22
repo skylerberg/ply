@@ -64,6 +64,7 @@ TREE_CHECKS=(
   "ply-span-tests:armed:the_code_registry_table_is_total_over_the_codes_module"
   "ply-span-tests:armed:no_allowlist_entry_has_outlived_its_reason"
   "ply-span-tests:armed:ambiguous_enum_names_are_declared"
+  "ply-cli-tests:suite:fmt::the_maintained_sources_are_committed_formatted"
 )
 
 # `probes/` directories no cargo build reaches, as `dir:job`; the job must be in `ci`'s `needs`.

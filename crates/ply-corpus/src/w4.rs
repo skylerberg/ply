@@ -748,7 +748,8 @@ impl Store {
 /// `examples/desk.ply` as a project `ply run --host` can be pointed at, with its store rewritten.
 fn project(dir: &Path, service: &str, store: Store) -> Result<()> {
     let source = if store == Store::Twin {
-        let narrowed = replace(service, w3::MAIN_ROW, &w3::twin_entry_row(w3::MAIN_ROW))?;
+        let from = w3::main_header(service)?;
+        let narrowed = replace(service, from, &w3::twin_entry_row(from))?;
         replace(
             &narrowed,
             "    run(port, count)",

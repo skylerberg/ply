@@ -862,8 +862,24 @@ fn a_shipped_definition_the_project_never_touched_is_not_a_suspect() {
     );
 }
 
-fn shipped_http() -> &'static str {
-    ply_std::source(&ModuleName::from_dotted("std.http")).expect("std.http ships")
+/// `std.http` with each run of whitespace squeezed to one space, and to none inside a brace, so
+/// that the scrapes below ask what it says rather than how the formatter laid it out.
+fn shipped_http() -> String {
+    let source = ply_std::source(&ModuleName::from_dotted("std.http")).expect("std.http ships");
+    let mut out = String::with_capacity(source.len());
+    for c in source.chars() {
+        if c.is_whitespace() {
+            if !(out.is_empty() || out.ends_with(' ') || out.ends_with('{')) {
+                out.push(' ');
+            }
+        } else {
+            if c == '}' && out.ends_with(' ') {
+                out.pop();
+            }
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn limits_fields() -> Vec<String> {

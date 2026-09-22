@@ -390,12 +390,7 @@ impl Stack {
 }
 
 /// `examples/desk.ply` as a project `ply run --host` can be pointed at.
-fn project(dir: &Path, service: &str, stack: Stack, variant: w3::Variant) -> Result<()> {
-    let from = match variant {
-        w3::Variant::Sequential => w3::MAIN_ROW,
-        w3::Variant::TaskPerConn => w3::MAIN_ROW_SPAWNING,
-    };
-    let to = w3::twin_entry_row(from);
+fn project(dir: &Path, service: &str, stack: Stack) -> Result<()> {
     let source = match stack {
         Stack::Postgres => service.to_string(),
         Stack::PostgresTls => replace(
@@ -404,7 +399,8 @@ fn project(dir: &Path, service: &str, stack: Stack, variant: w3::Variant) -> Res
             &format!("    run_tls(port, \"{CREDENTIAL}\", count)"),
         )?,
         Stack::Twin => {
-            let narrowed = replace(service, from, &to)?;
+            let from = w3::main_header(service)?;
+            let narrowed = replace(service, from, &w3::twin_entry_row(from))?;
             replace(
                 &narrowed,
                 "    run(port, count)",
@@ -451,7 +447,7 @@ impl Serving {
         let service = w3::Service::open(repo)?.source(variant)?;
         let dir = tempfile::tempdir().context("a temp dir for the served project")?;
         let port = reserve_port()?;
-        project(dir.path(), &service, stack, variant)?;
+        project(dir.path(), &service, stack)?;
 
         let port_set = format!("DESK_PORT={port}");
         let conns_set = format!("DESK_CONNECTIONS={connections}");
@@ -688,12 +684,7 @@ fn one_drain(
     let service = w3::Service::open(repo)?.source(w3::Variant::TaskPerConn)?;
     let dir = tempfile::tempdir().context("a temp dir for the served project")?;
     let port = reserve_port()?;
-    project(
-        dir.path(),
-        &service,
-        Stack::Postgres,
-        w3::Variant::TaskPerConn,
-    )?;
+    project(dir.path(), &service, Stack::Postgres)?;
 
     let sets = [
         format!("DESK_PORT={port}"),
@@ -854,12 +845,7 @@ pub fn transaction_at_deadline(
     let service = w3::Service::open(repo)?.source(w3::Variant::TaskPerConn)?;
     let dir = tempfile::tempdir().context("a temp dir for the served project")?;
     let port = reserve_port()?;
-    project(
-        dir.path(),
-        &service,
-        Stack::Postgres,
-        w3::Variant::TaskPerConn,
-    )?;
+    project(dir.path(), &service, Stack::Postgres)?;
 
     let sets = [
         format!("DESK_PORT={port}"),
