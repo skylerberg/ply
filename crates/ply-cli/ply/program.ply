@@ -8,7 +8,8 @@ import compiler.front (Refused, Analysed, Whole, Pulled, analyse_pulling_std, mo
 import compiler.hash (HashOutput, hex)
 import compiler.items (Item, IFn)
 import compiler.infer (DefInfo, Loc)
-import compiler.resolve (Source, Mod, Diag, Label, qualify)
+import compiler.resolve (Source, Mod, Diag, Label, diag1, qualify)
+import compiler.tycore (TyCon, TyFn)
 import diagnostic (Place, spot_of)
 import sources (File, Project, load, shelf, nothing_here, is_std, is_compiler)
 
@@ -135,8 +136,11 @@ fn first_primary(labels: List<Label>) -> Option<Label> =
 pub fn is_shelved(p: Program, d: Diag) -> Bool =
   match first_primary(d.labels) { Some(l) -> l.module >= len(p.files), None -> false }
 
+// The module index a span outside every module carries.
+pub fn outside() -> Int = 4294967295
+
 pub fn place_of(p: Program, at: Loc) -> Option<Place> =
-  if at.module == 4294967295 { None } else { list_at(p.places, at.module) }
+  if at.module == outside() { None } else { list_at(p.places, at.module) }
 
 // `path:line:col`, one-based, as every other command prints a place.
 pub fn location_of(p: Program, at: Loc) -> Option<String> =
@@ -173,6 +177,45 @@ pub fn published(w: Whole) -> List<DefInfo> = {
   let all: Picking = fold(w.checked.defs, first, |acc: Picking, d: DefInfo| pick(acc, by_name, d.name));
   all.out
 }
+
+// --- Naming one definition --------------------------------------------------------
+
+// The definition a query names: a program-wide name, or a simple name that names exactly one.
+// `Err` holds the program-wide names a simple name matched, and is empty when nothing matched.
+pub fn resolve_def(defs: List<DefInfo>, query: String) -> Result<DefInfo, List<String>> = {
+  let exact = fold(defs, None, |acc: Option<DefInfo>, d: DefInfo|
+    match acc { Some(_) -> acc, None -> if string_of_bytes_lossy(d.name) == query { Some(d) } else { None } });
+  match exact {
+    Some(d) -> Ok(d),
+    None -> {
+      let matching = filter(defs, |d: DefInfo| string_of_bytes_lossy(d.simple_name) == query);
+      match list_at(matching, 0) {
+        None -> Err([]),
+        Some(d) ->
+          if len(matching) == 1 { Ok(d) }
+          else { Err(map(matching, |x: DefInfo| string_of_bytes_lossy(x.name))) },
+      }
+    },
+  }
+}
+
+// What [`resolve_def`] refused, as a diagnostic: nothing of that name, or more than one.
+pub fn unknown_def(query: String, names: List<String>) -> Diag =
+  if len(names) == 0 {
+    diag1(b"E0101", outside(), { start: 0, end: 0 },
+          bytes_of_string("no definition is named `" ++ query ++ "`"),
+          b"not a definition of this program",
+          [b"the query is a program-wide name such as `store.orders.place`, or a simple name unique in the program"])
+  } else {
+    diag1(b"E0101", outside(), { start: 0, end: 0 },
+          bytes_of_string("`" ++ query ++ "` names " ++ int_to_string(len(names)) ++ " definitions"),
+          b"say which",
+          [bytes_of_string("one of: " ++ joined(names, ", "))])
+  }
+
+// One more note under a diagnostic, counted as the constructor counts them.
+pub fn noted(d: Diag, note: Bytes) -> Diag =
+  {..d, notes: d.notes + 1, notes_text: push(d.notes_text, note)}
 
 // The hash tables the dump writes as lists, indexed once so a lookup is not a scan.
 pub type Tables = { defs: Map<Bytes, Bytes>, own: Map<Bytes, Bytes>, deps: Map<Bytes, List<Bytes>>,
@@ -221,6 +264,30 @@ test "a shipped module is one under a reserved root and nothing else" {
   assert(is_shipped("compiler.front"));
   assert(!is_shipped("standard"));
   assert(!is_shipped("m"))
+}
+
+fn named(name: Bytes, simple: Bytes) -> DefInfo =
+  { name: name, module: b"m", simple_name: simple,
+    scheme: { ty_vars: [], row_vars: [], label_vars: [],
+              ty: TyFn({ params: [], ret: TyCon({ name: b"Int", args: [] }), effects: { atoms: [], tail: None } }) },
+    footprint: [], performed: [], row_aliases: [], constraints: [], spec: [],
+    internally_effectful: false, at: { module: 0, span: { start: 0, end: 0 } } }
+
+test "a query is a program-wide name, or a simple name that names exactly one definition" {
+  let defs = [named(b"a.total", b"total"), named(b"b.total", b"total"), named(b"a.one", b"one")];
+  assert_eq(match resolve_def(defs, "a.total") { Ok(d) -> d.name, Err(_) -> b"" }, b"a.total");
+  assert_eq(match resolve_def(defs, "one") { Ok(d) -> d.name, Err(_) -> b"" }, b"a.one");
+  assert_eq(match resolve_def(defs, "total") { Ok(_) -> [], Err(ns) -> ns }, ["a.total", "b.total"]);
+  assert_eq(match resolve_def(defs, "absent") { Ok(_) -> ["found"], Err(ns) -> ns }, [])
+}
+
+test "a name nothing declares is `E0101`, and an ambiguous one says which" {
+  assert_eq(unknown_def("absent", []).code, b"E0101");
+  assert_eq(unknown_def("absent", []).message, b"no definition is named `absent`");
+  let many = unknown_def("total", ["a.total", "b.total"]);
+  assert_eq(many.message, b"`total` names 2 definitions");
+  assert_eq(many.notes_text, [b"one of: a.total, b.total"]);
+  assert_eq(noted(many, b"and one more").notes, 2)
 }
 
 test "a span outside every module has no place and no location" {

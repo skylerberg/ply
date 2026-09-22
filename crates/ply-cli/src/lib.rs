@@ -1,6 +1,7 @@
 //! The `ply` binary.
 
 pub mod artifact;
+pub mod bootstrap;
 pub mod cache;
 pub mod cli;
 pub mod commands;

@@ -1,0 +1,181 @@
+// `ply callers` — what mentions a definition: directly, and through any number of calls.
+
+import args (Flags, style_of)
+import program (Program, Tables, load_program, published, tables_of, location_of, resolve_def,
+                unknown_def)
+import report (Answer, schema_version, ok_code, ind, count_of, refused, reported)
+import style (Style, bold)
+import compiler.front (Whole)
+import compiler.infer (DefInfo, TestInfo, LawInfo)
+import std.fs (fs)
+import std.json (Json, Null, Str, Bool, Number, Array, object)
+
+// The keys that mention a definition, sorted into what each one names. A key that is none of the
+// three is a declaration and is dropped.
+type Group = { definitions: List<DefInfo>, tests: List<TestInfo>, laws: List<LawInfo> }
+
+type Index = { defs: Map<Bytes, DefInfo>, tests: Map<Bytes, TestInfo>, laws: Map<Bytes, LawInfo> }
+
+fn indexed(w: Whole) -> Index =
+  { defs: fold(w.checked.defs, map_new(), |acc: Map<Bytes, DefInfo>, d: DefInfo| map_insert(acc, d.name, d)),
+    tests: fold(w.checked.tests, map_new(), |acc: Map<Bytes, TestInfo>, x: TestInfo| map_insert(acc, x.key, x)),
+    laws: fold(w.checked.laws, map_new(), |acc: Map<Bytes, LawInfo>, x: LawInfo| map_insert(acc, x.key, x)) }
+
+fn holds(names: List<Bytes>, name: Bytes) -> Bool =
+  fold(names, false, |acc: Bool, n: Bytes| acc || n == name)
+
+// Every key whose own references name it.
+fn referrers(t: Tables, name: Bytes) -> List<Bytes> =
+  map_fold(t.deps, [], |acc: List<Bytes>, key: Bytes, names: List<Bytes>|
+    if holds(names, name) { push(acc, key) } else { acc })
+
+// Every key whose closure holds it, other than the key itself.
+fn reached(t: Tables, name: Bytes) -> List<Bytes> =
+  map_fold(t.closure, [], |acc: List<Bytes>, key: Bytes, names: List<Bytes>|
+    if key != name && holds(names, name) { push(acc, key) } else { acc })
+
+fn sorted_into(ix: Index, keys: List<Bytes>) -> Group =
+  fold(keys, { definitions: [], tests: [], laws: [] }, |acc: Group, key: Bytes|
+    match map_get(ix.defs, key) {
+      Some(d) -> {..acc, definitions: push(acc.definitions, d)},
+      None ->
+        match map_get(ix.tests, key) {
+          Some(x) -> {..acc, tests: push(acc.tests, x)},
+          None ->
+            match map_get(ix.laws, key) {
+              Some(x) -> {..acc, laws: push(acc.laws, x)},
+              None -> acc,
+            },
+        },
+    })
+
+fn summary(g: Group) -> String =
+  count_of(len(g.definitions), "definition") ++ ", " ++ count_of(len(g.tests), "test") ++ ", "
+  ++ count_of(len(g.laws), "law")
+
+// --- The listing ------------------------------------------------------------
+
+fn quoted(name: Bytes) -> String = "\"" ++ string_of_bytes_lossy(name) ++ "\""
+
+fn group_lines(title: String, g: Group, lines: List<String>) -> List<String> = {
+  let head = push(lines, ind() ++ title ++ ": " ++ summary(g));
+  let after_defs = fold(g.definitions, head, |acc: List<String>, d: DefInfo|
+    push(acc, ind() ++ ind() ++ string_of_bytes_lossy(d.name)));
+  let after_tests = fold(g.tests, after_defs, |acc: List<String>, x: TestInfo|
+    push(acc, ind() ++ ind() ++ "test " ++ quoted(x.name)));
+  fold(g.laws, after_tests, |acc: List<String>, x: LawInfo|
+    push(acc, ind() ++ ind() ++ "law " ++ quoted(x.name)))
+}
+
+fn text_lines(s: Style, name: Bytes, direct: Group, transitive: Group) -> List<String> =
+  group_lines("reached from", transitive,
+    group_lines("mentioned by", direct, ["", ind() ++ bold(s, string_of_bytes_lossy(name))]))
+
+// --- The document -----------------------------------------------------------
+
+fn opt_str(v: Option<String>) -> Json = match v { Some(x) -> Str(x), None -> Null }
+
+fn definition_json(p: Program, d: DefInfo) -> Json =
+  object([{ key: "name", value: Str(string_of_bytes_lossy(d.name)) },
+          { key: "location", value: opt_str(location_of(p, d.at)) }])
+
+fn test_json(p: Program, x: TestInfo) -> Json =
+  object([{ key: "index", value: Number(decimal_of_int(x.index)) },
+          { key: "key", value: Str(string_of_bytes_lossy(x.key)) },
+          { key: "name", value: Str(string_of_bytes_lossy(x.name)) },
+          { key: "module", value: Str(string_of_bytes_lossy(x.module)) },
+          { key: "location", value: opt_str(location_of(p, x.at)) }])
+
+fn law_json(p: Program, x: LawInfo) -> Json =
+  object([{ key: "index", value: Number(decimal_of_int(x.index)) },
+          { key: "key", value: Str(string_of_bytes_lossy(x.key)) },
+          { key: "name", value: Str(string_of_bytes_lossy(x.name)) },
+          { key: "module", value: Str(string_of_bytes_lossy(x.module)) },
+          { key: "location", value: opt_str(location_of(p, x.at)) }])
+
+fn group_json(p: Program, g: Group) -> Json =
+  object([{ key: "definitions", value: Array(map(g.definitions, |d: DefInfo| definition_json(p, d))) },
+          { key: "tests", value: Array(map(g.tests, |x: TestInfo| test_json(p, x))) },
+          { key: "laws", value: Array(map(g.laws, |x: LawInfo| law_json(p, x)))}])
+
+fn answered(s: Style, p: Program, d: DefInfo, direct: Group, transitive: Group) -> Answer =
+  { json: object([{ key: "command", value: Str("callers") },
+                  { key: "schema_version", value: Number(decimal_of_int(schema_version())) },
+                  { key: "ok", value: Bool(true) },
+                  { key: "exit_code", value: Number(decimal_of_int(ok_code())) },
+                  { key: "definition", value: object([
+                      { key: "name", value: Str(string_of_bytes_lossy(d.name)) },
+                      { key: "module", value: Str(string_of_bytes_lossy(d.module)) },
+                      { key: "location", value: opt_str(location_of(p, d.at)) }]) },
+                  { key: "direct", value: group_json(p, direct) },
+                  { key: "transitive", value: group_json(p, transitive) },
+                  { key: "diagnostics", value: Array([]) }]),
+    lines: text_lines(s, d.name, direct, transitive),
+    errs: [],
+    code: ok_code() }
+
+fn mentioned(s: Style, p: Program, w: Whole, d: DefInfo) -> Answer = {
+  let t: Tables = tables_of(w.hashes);
+  let ix: Index = indexed(w);
+  answered(s, p, d, sorted_into(ix, referrers(t, d.name)), sorted_into(ix, reached(t, d.name)))
+}
+
+pub fn run(flags: Flags) -> Answer
+  / {fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.list_dir[shelf], fs.read_file[shelf]} = {
+  let loaded: Program = load_program(flags.paths);
+  let s = style_of(flags);
+  match loaded.whole {
+    None -> refused(s, "callers", loaded.diags, loaded.places),
+    Some(w) ->
+      match resolve_def(published(w), flags.query) {
+        Err(names) -> reported(s, "callers", [unknown_def(flags.query, names)], loaded.places),
+        Ok(d) -> mentioned(s, loaded, w, d),
+      },
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_test(name: Bytes, key: Bytes, index: Int) -> TestInfo =
+  { name: name, module: b"m", key: key, index: index, nondet: false, footprint: [],
+    at: { module: 0, span: { start: 0, end: 0 } } }
+
+fn a_law(name: Bytes, key: Bytes, index: Int) -> LawInfo =
+  { name: name, module: b"m", key: key, index: index, binders: [], has_guard: false, host: false,
+    footprint: [], at: { module: 0, span: { start: 0, end: 0 } } }
+
+fn edges(pairs: List<{ name: Bytes, names: List<Bytes> }>) -> Map<Bytes, List<Bytes>> =
+  fold(pairs, map_new(), |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, names: List<Bytes> }|
+    map_insert(acc, x.name, x.names))
+
+fn a_table() -> Tables =
+  { defs: map_new(), own: map_new(),
+    deps: edges([{ name: b"m.two", names: [b"m.one"] }, { name: b"m.three", names: [b"m.two"] }]),
+    closure: edges([{ name: b"m.two", names: [b"m.one"] },
+                    { name: b"m.three", names: [b"m.one", b"m.two"] },
+                    { name: b"m.one", names: [b"m.one"] }]),
+    specs: map_new() }
+
+test "what mentions a definition is what names it, and what reaches it is every closure holding it" {
+  assert_eq(referrers(a_table(), b"m.one"), [b"m.two"]);
+  assert_eq(referrers(a_table(), b"m.three"), []);
+  // A key whose own closure holds it is not one of its own callers.
+  assert_eq(reached(a_table(), b"m.one"), [b"m.three", b"m.two"])
+}
+
+test "a key that names no definition, test or law is a declaration and is dropped" {
+  let ix: Index = { defs: map_new(),
+                    tests: map_insert(map_new(), b"m.two is two", a_test(b"two is two", b"m.two is two", 0)),
+                    laws: map_insert(map_new(), b"m.three", a_law(b"three is three", b"m.three", 0)) };
+  let g = sorted_into(ix, [b"m.two is two", b"m.three", b"m.Shape"]);
+  assert_eq(len(g.definitions), 0);
+  assert_eq(map(g.tests, |x: TestInfo| x.name), [b"two is two"]);
+  assert_eq(map(g.laws, |x: LawInfo| x.name), [b"three is three"]);
+  assert_eq(summary(g), "0 definitions, 1 test, 1 law")
+}
+
+test "a group is titled, counted, and one indented line each" {
+  let g: Group = { definitions: [], tests: [a_test(b"two is two", b"m.two is two", 0)], laws: [] };
+  assert_eq(group_lines("mentioned by", g, []),
+            ["   mentioned by: 0 definitions, 1 test, 0 laws", "      test \"two is two\""])
+}
