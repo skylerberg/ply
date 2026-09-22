@@ -742,6 +742,119 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Every `.ply` source a workspace member ships, which is production the same way `src/` is.
+fn ply_sources(root: &Path) -> Vec<Source> {
+    let mut out = Vec::new();
+    for member in workspace_members(root) {
+        let dir = root.join("crates").join(&member).join("ply");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "ply"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Ok(text) = std::fs::read(&path) else {
+                continue;
+            };
+            let rel = format!(
+                "crates/{member}/ply/{}",
+                path.file_name().unwrap().to_string_lossy()
+            );
+            let masked = ply_item_bodies_masked(&text);
+            out.push(Source { rel, text, masked });
+        }
+    }
+    out
+}
+
+/// True where a byte sits inside a `test` or `law` body, which is not production any more than
+/// `#[cfg(test)]` is. Brace-counted from the item's `{`, with string and byte literals skipped so a
+/// brace inside one cannot close it.
+fn ply_item_bodies_masked(text: &[u8]) -> Vec<bool> {
+    let mut masked = vec![false; text.len()];
+    let mut starts: Vec<usize> = Vec::new();
+    for keyword in [&b"test "[..], &b"law "[..]] {
+        for at in find_all(text, keyword) {
+            // Only an item at the start of a line declares one.
+            if at == 0 || text[at - 1] == b'\n' {
+                starts.push(at);
+            }
+        }
+    }
+    for at in starts {
+        let mut i = at;
+        while i < text.len() && text[i] != b'{' {
+            if text[i] == b'\n' && i > at {
+                break;
+            }
+            i += 1;
+        }
+        if i >= text.len() || text[i] != b'{' {
+            continue;
+        }
+        let mut depth = 0usize;
+        while i < text.len() {
+            match text[i] {
+                b'"' => {
+                    i += 1;
+                    while i < text.len() && text[i] != b'"' {
+                        i += if text[i] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                b'/' if text.get(i + 1) == Some(&b'/') => {
+                    // A brace in a comment closes nothing.
+                    while i < text.len() && text[i] != b'\n' {
+                        masked[i] = true;
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        masked[i] = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            if i < text.len() {
+                masked[i] = true;
+            }
+            i += 1;
+        }
+    }
+    masked
+}
+
+/// A code a `.ply` source raises. Ply passes the code as a byte literal — `diag1(b"E0128", ..)`,
+/// `err1(cx, b"E0201", ..)` — so the number itself is the arming, and a plain `"E0128"` in a
+/// rendered-text assertion or in `explain`'s table is not one.
+fn ply_armed_numbers(sources: &[Source]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for source in sources {
+        for at in find_all(&source.text, b"b\"") {
+            let body = at + 2;
+            if body + 5 > source.text.len() || source.masked[at] {
+                continue;
+            }
+            let number = &source.text[body..body + 5];
+            let shaped = matches!(number[0], b'E' | b'W')
+                && number[1..].iter().all(|b| b.is_ascii_digit())
+                && source.text.get(body + 5) == Some(&b'"');
+            if shaped {
+                out.insert(String::from_utf8_lossy(number).to_string());
+            }
+        }
+    }
+    out
+}
+
 fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return Vec::new();
@@ -1027,7 +1140,15 @@ fn tree() -> &'static Tree {
         let sources = production_sources(&root);
         let declared = declared_codes(&root);
         let rows = registry_rows(&root);
-        let armed = armed_codes(&sources);
+        // A Ply source raises a code by its number, so an arming there is matched against the
+        // registry rather than against `codes::NAME`.
+        let raised_in_ply = ply_armed_numbers(&ply_sources(&root));
+        let mut armed = armed_codes(&sources);
+        for (name, (number, _)) in &declared {
+            if raised_in_ply.contains(number) {
+                armed.insert(name.clone());
+            }
+        }
         let covered = covered_enums(&sources);
         let paths = path_occurrences(&sources);
         let calls = constructor_calls(&sources);
@@ -1099,11 +1220,13 @@ fn every_registered_code_is_constructed_in_production() {
             );
         }
         message.push_str(
-            "\nA code is ARMED iff a production source calls Diagnostic::error(codes::NAME, ..) \
+            "\nA code is ARMED iff a production Rust source calls Diagnostic::error(codes::NAME, ..) \
              or Diagnostic::warning(codes::NAME, ..), or passes codes::NAME to a wrapper listed \
-             in CODE_INDIRECTION. A row in the registry table, an entry in \
-             crates/ply-eval/src/host.rs's RESERVED_CODES, and any mention under #[cfg(test)] \
-             or crates/*/tests/ are NOT armings.",
+             in CODE_INDIRECTION, or a `.ply` source a member ships raises its number as a byte \
+             literal, as `diag1(b\"E0128\", ..)` does. A row in the registry table, an entry in \
+             crates/ply-eval/src/host.rs's RESERVED_CODES, a `\"E0128\"` string rather than a byte \
+             literal, and any mention under #[cfg(test)], inside a Ply `test` or `law` body, or \
+             under crates/*/tests/ are NOT armings.",
         );
         message.push_str(&how_to_fix(
             "raise it where the condition it names is detected",
