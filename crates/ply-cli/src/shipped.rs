@@ -44,6 +44,7 @@ pub const PROGRAM_SOURCES: &[(&str, &str)] = &[
     ("sources", include_str!("../ply/sources.ply")),
     ("stdlib", include_str!("../ply/stdlib.ply")),
     ("style", include_str!("../ply/style.ply")),
+    ("tests", include_str!("../ply/tests.ply")),
     ("walk", include_str!("../ply/walk.ply")),
 ];
 
