@@ -297,7 +297,7 @@ pub struct CheckArgs {
     pub explain: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Clone, Debug)]
 pub struct TestArgs {
     /// A `.ply` file, or a project root whose `*.ply` files are modules named by path.
     #[arg(default_value = ".")]
@@ -332,10 +332,6 @@ pub struct TestArgs {
     /// and nothing it did is recorded. 0 is no clock.
     #[arg(long, value_name = "MS", default_value_t = 60_000)]
     pub timeout: u64,
-
-    /// Neither read nor write the front-end cache; the result cache is untouched.
-    #[arg(long)]
-    pub no_incremental: bool,
 
     /// Attribute a failure to its change; `auto` bisects only a det test that has passed before.
     #[arg(long, value_enum, default_value_t = When::Auto, value_name = "WHEN")]

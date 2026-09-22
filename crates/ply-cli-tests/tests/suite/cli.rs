@@ -2052,25 +2052,6 @@ fn an_unknown_subcommand_is_rejected() {
 }
 
 #[test]
-fn test_no_incremental_still_selects_the_same_tests() {
-    let dir = project(
-        "fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n\
-         test \"f is not two\" { assert(f() != 2) }\n",
-    );
-    ply(dir.path()).arg("test").assert().success();
-
-    let out = ply(dir.path())
-        .args(["test", "--no-incremental"])
-        .output()
-        .unwrap();
-    let text = stdout_of(&out);
-    assert!(
-        text.contains("2 cached"),
-        "the result cache survives --no-incremental:\n{text}"
-    );
-}
-
-#[test]
 fn the_front_end_reports_where_its_time_went() {
     let dir = project("fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n");
     ply(dir.path()).arg("test").assert().success();

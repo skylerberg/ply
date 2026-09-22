@@ -658,8 +658,8 @@ imports, `pub`, specs and test labels are erased, and references are replaced by
 their referent's hash. A test runs exactly when its hash has no recorded pass,
 so renames and comment edits run nothing. `ply hash` prints the hashes.
 `--explain` says why each test was selected; `--filter SUBSTRING` matches
-`<module>.<label>`; `--no-cache` and `--no-incremental` bypass the result and
-front-end caches.
+`<module>.<label>`; `--no-cache` bypasses both the result and the front-end
+cache.
 
 ### 8.3 Determinism
 
@@ -1431,7 +1431,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | command | flags |
 | --- | --- |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases; with `--types`, effect sets and provenance) |
-| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--trace auto\|always\|never`, `--backend`, `--profile`, `--std`, host, simulation |
+| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--trace auto\|always\|never`, `--backend`, `--profile`, `--std`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--backend`, `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`, `--backend`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, `--backend`, prove, simulation |

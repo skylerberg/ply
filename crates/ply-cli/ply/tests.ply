@@ -1,0 +1,1415 @@
+// `ply test` — which tests this run had to execute, what each of them did, and what the run
+// exits with. The load, the result cache, the selection it answers, the conflict grouping, the
+// compiled backend, the host binding, the worker pool, the per-test unwind catching and the
+// bisection are the Rust side's: a front end is not a value a program can hold, a Rust unwind is
+// not a Ply value, and a reader of the store's on-disk format written here would be a second
+// implementation of it. Everything below decides what is said about all of that, in both forms,
+// and the code it exits with.
+
+import args (Flags, read, style_of)
+import compiler.resolve (Diag, Label)
+import diagnostic (Place, Spot, spot_of, all_to_json, all_to_text)
+import entry (At, no_module)
+import report (Answer, ind, ok_code, compile_error, count_of, plural, refused, warning_lines)
+import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, to_string)
+import style (Style, plain, bold, dim, green, red, yellow)
+
+// What the Rust side loads, binds and runs, in that order and each once per report. A run that
+// refuses at either of the first two ran nothing, which is why binding and running are two
+// operations rather than one.
+pub nondet effect tester {
+  read loaded[r]() -> Result<Program, Refusal>
+  read bound[r]()  -> Result<Unit, Refusal>
+  read ran[r]()    -> Ran
+}
+
+// --- What the Rust side answers with ----------------------------------------
+
+pub type Refusal = { diags: List<Diag>, places: List<Place> }
+
+// Whole microseconds, as the clock the runner reads counts them: every reading in both forms is
+// printed from the same integer, so a line and its document cannot disagree by a rounding.
+pub type Phases = { read_us: Int, front_us: Int, write_back_us: Int }
+
+// The search every seeded test is keyed on. Each field is in that test's cache key.
+// `budget` and `steps` are the bounds as the search prints them, which is all a report does with
+// them; the document carries the machine's own numbers under `options`.
+pub type Plan = { mode: String, seeds: Int, budget: String, steps: String }
+
+pub type ModuleView = { name: String, file: String }
+
+// One test still in scope, and what the store said about it. `test` is a reserved word, so a
+// single one of them is a case.
+pub type Case = {
+  index: Int,
+  key: String,
+  name: String,
+  module: String,
+  nondet: Bool,
+  // `None` when the front end produced no hash, which is what `unhashed` means.
+  hash: Option<String>,
+  footprint: String,
+  // The atoms that can contend across tests: the footprint minus the inputs only this test is handed.
+  shared: String,
+  atoms: List<String>,
+  // Contention a rename would remove, as opposed to one that needs a database.
+  region_only: Bool,
+  seeded: Bool,
+  isolated: Bool,
+  // `new`, `nondet`, `previous failure`, `cached` or `unhashed`.
+  reason: String,
+  // Seed roots this test still owes, when the cache already covers part of the plan.
+  owed: Int,
+  group: Option<Int>,
+}
+
+pub type Group = { tests: List<Int>, footprint: String }
+
+// How much of the corpus is trivially parallel, and what the rest costs.
+pub type Parallelism = {
+  total: Int, isolated: Int, shared: Int, region_contended: Int, scheduled: Int, groups: Int,
+  shared_groups: Int,
+}
+
+// How the corpus splits once the binding is taken into account: a test the binding can reach is
+// never isolated and never cached, so it counts only under `host`.
+pub type Counts = { total: Int, isolated: Int, shared: Int, host: Int }
+
+pub type Program = {
+  // The root the load was rooted at, as a report prints it.
+  root: String,
+  files: List<String>,
+  places: List<Place>,
+  modules: List<ModuleView>,
+  incremental: Bool,
+  phases: Phases,
+  // Every test the program declares, which is what "no `test` items" is decided over.
+  declared: Int,
+  // The tests still in scope, in ascending index order.
+  cases: List<Case>,
+  total: Int,
+  selected: Int,
+  cached: Int,
+  filtered_out: Int,
+  groups: List<Group>,
+  parallelism: Parallelism,
+  plan: Plan,
+  warnings: List<Diag>,
+  // What the machine was configured with, placed under the key this report gives it.
+  options: Json,
+}
+
+pub type Backend = {
+  // Which backend answered, as `--backend` names it.
+  name: String,
+  spec: Option<String>,
+  fragment: Int,
+  offered: Int,
+  entered: Int,
+  declined: Int,
+  converted_in: Int,
+  converted_out: Int,
+  // Absent unless the provider compiled something: analysis is paid once, code generation per worker.
+  units: Option<Int>,
+  analysis_nanos: Option<Int>,
+  codegen_nanos: Option<Int>,
+}
+
+pub type Naive = { explored: Int, bounded: Bool, rendered: String }
+
+// What one test's search did. Absent, never zeroed, on a test that reached no `simulate` region.
+pub type Explored = {
+  explored: Int,
+  exhaustive: Bool,
+  exhausted: Bool,
+  naive: Option<Naive>,
+  // Tenths, so one division answers both the line and the document.
+  reduction_tenths: Option<Int>,
+  steps: Int,
+  virtual_time_ns: Int,
+  failing_seed: Option<String>,
+}
+
+pub type Outcome = {
+  index: Int,
+  name: String,
+  hash: Option<String>,
+  group: Int,
+  duration_us: Int,
+  // `passed`, `failed`, `panicked` or `abandoned`.
+  status: String,
+  diagnostic: Option<Diag>,
+  search: Option<Explored>,
+  // `None` when nothing was written: a spent budget or an unobserved search proved nothing.
+  cached: Option<Bool>,
+}
+
+pub type Suspect = {
+  name: String,
+  // `None` when the configurations were never compared, so an edit looks like a moved hash.
+  change: Option<String>,
+  // `None` when the failing execution was not traced.
+  ran: Option<Bool>,
+  // Distance above the failing frame, zero being where it happened.
+  depth: Option<Int>,
+  culprit: Bool,
+}
+
+pub type Culprit = { names: List<String>, at: Option<At> }
+
+pub type Bisect = { conclusive: Bool, requested: Bool, reason: String, culprits: List<Culprit> }
+
+// The definitions the failing execution entered, when it was traced.
+pub type Slice = { traced: Bool, reproduced: Bool, path: List<String> }
+
+pub type Site = { task: String, definition: Option<String>, access: String, at: Option<At> }
+
+// The two steps whose reordering flipped a passing interleaving to this one.
+pub type Race = { left: Site, right: Site }
+
+pub type Fault = {
+  key: String,
+  diagnostic: Diag,
+  bisect: Bisect,
+  slice: Option<Slice>,
+  suspects: List<Suspect>,
+  // Nothing in this test's closure changed, which is not the same as nothing being ranked.
+  unchanged: Bool,
+  seed: Option<String>,
+  race: Option<Race>,
+  replay: Option<String>,
+  // What the runner publishes about this failure, placed under the keys this report gives it.
+  artifact: Json,
+  module: Option<String>,
+  test_hash: Option<String>,
+  nondet: Option<Bool>,
+  status: Option<String>,
+  declared: Option<List<String>>,
+  // `None` rather than empty when untraced: unwatched differs from performing nothing.
+  observed: Option<List<String>>,
+}
+
+pub type Mutant = { definition: String, from: String, to: String, at: Option<At> }
+
+pub type Mutants = {
+  killed: Int,
+  survived: Int,
+  skipped: Int,
+  budget_spent: Bool,
+  unreached: List<String>,
+  survivors: List<Mutant>,
+  json: Json,
+}
+
+pub type Coverage = { definitions: Int, unreached: List<String>, json: Json }
+
+pub type Summary = { passed: Int, failed: Int, abandoned: Int, cached: Int, duration_us: Int }
+
+pub type Simulated = {
+  simulated: Int, total: Int, seeds: Int, interleavings: Int, exhaustive: Int, exhausted: Int,
+  failed: Int,
+}
+
+pub type Ran = {
+  hermetic: Bool,
+  // `hermetic` or `host`.
+  label: String,
+  operations: Int,
+  digest: String,
+  database: Option<String>,
+  live_database: Bool,
+  handshakes: List<String>,
+  hosts: Json,
+  // The tests this binding can reach, by index, ascending.
+  reaches: List<Int>,
+  counts: Counts,
+  workers: Int,
+  backend: Option<Backend>,
+  results: List<Outcome>,
+  failures: List<Fault>,
+  summary: Summary,
+  simulation: Simulated,
+  // Not warnings: every later run believes an escaped cache entry.
+  escapes: List<Diag>,
+  warnings: List<Diag>,
+  mutants: Option<Mutants>,
+  coverage: Option<Coverage>,
+}
+
+// --- Small things -----------------------------------------------------------
+
+fn at<a>(xs: List<a>, i: Int, spare: a) -> a = match list_at(xs, i) { Some(x) -> x, None -> spare }
+
+fn appended<a>(head: List<a>, tail: List<a>) -> List<a> = fold(tail, head, |acc: List<a>, x: a| push(acc, x))
+
+fn repeated(text: String, n: Int) -> String = fold(range(0, n), "", |acc: String, i: Int| acc ++ text)
+
+fn joined(parts: List<String>, sep: String) -> String =
+  fold(range(0, len(parts)), "", |acc: String, i: Int|
+    if i == 0 { at(parts, i, "") } else { acc ++ sep ++ at(parts, i, "") })
+
+fn padded(text: String, width: Int) -> String =
+  if string_len(text) >= width { text } else { text ++ repeated(" ", width - string_len(text)) }
+
+fn aligned(text: String, width: Int) -> String =
+  if string_len(text) >= width { text } else { repeated(" ", width - string_len(text)) ++ text }
+
+fn num(n: Int) -> Json = Number(decimal_of_int(n))
+
+fn opt_num(v: Option<Int>) -> Json = match v { Some(n) -> num(n), None -> Null }
+
+fn opt_str(v: Option<String>) -> Json = match v { Some(s) -> Str(s), None -> Null }
+
+fn opt_bool(v: Option<Bool>) -> Json = match v { Some(b) -> Bool(b), None -> Null }
+
+fn strings(xs: List<String>) -> Json = Array(map(xs, |x: String| Str(x)))
+
+fn opt_strings(v: Option<List<String>>) -> Json = match v { Some(xs) -> strings(xs), None -> Null }
+
+fn covers(xs: List<Int>, wanted: Int) -> Bool = len(filter(xs, |x: Int| x == wanted)) > 0
+
+fn said(lines: List<String>, wanted: String) -> Bool = len(filter(lines, |l: String| l == wanted)) > 0
+
+fn no_group() -> Group = { tests: [], footprint: "" }
+
+fn no_culprit() -> Culprit = { names: [], at: None }
+
+// --- Fixed point ------------------------------------------------------------
+
+fn pow10(k: Int) -> Int = fold(range(0, k), 1, |acc: Int, i: Int| acc * 10)
+
+fn zeroed(text: String, width: Int) -> String =
+  if string_len(text) >= width { text } else { repeated("0", width - string_len(text)) ++ text }
+
+fn fixed(scaled: Int, digits: Int) -> String = {
+  let unit = pow10(digits);
+  let whole = scaled / unit;
+  if digits == 0 { int_to_string(whole) }
+  else { int_to_string(whole) ++ "." ++ zeroed(int_to_string(scaled - whole * unit), digits) }
+}
+
+fn ms1(us: Int) -> String = fixed((us + 50) / 100, 1)
+
+fn ms2(us: Int) -> String = fixed((us + 5) / 10, 2)
+
+fn ms3(us: Int) -> String = fixed(us, 3)
+
+fn secs2(us: Int) -> String = fixed((us + 5000) / 10000, 2)
+
+fn nanos_ms1(ns: Int) -> String = fixed((ns + 50000) / 100000, 1)
+
+// Per mille is tenths of a percent, so one division answers both digits.
+fn share(part: Int, total: Int) -> String =
+  aligned(fixed(if total == 0 { 0 } else { (part * 1000) / total }, 1), 5) ++ "%"
+
+fn decimal(text: String) -> Decimal =
+  match decimal_of_string(text) { Some(d) -> d, None -> decimal_of_int(0) }
+
+fn millis(us: Int) -> Json = Number(decimal(ms3(us)))
+
+// --- Naming and placing -----------------------------------------------------
+
+// The label in a single-module run, `<module>.<label>` otherwise.
+fn display_of(p: Program, c: Case) -> String = if len(p.modules) > 1 { c.key } else { c.name }
+
+fn short_of(hash: Option<String>) -> String =
+  match hash { Some(h) -> string_slice(h, 0, 12), None -> repeated("-", 12) }
+
+// `path:line:col`, one-based, as every other command prints a place.
+fn located(places: List<Place>, a: At) -> Option<String> =
+  if a.module == no_module() { None } else {
+    match list_at(places, a.module) {
+      None -> None,
+      Some(place) -> {
+        let spot: Spot = spot_of(place.text, a.start);
+        Some(place.path ++ ":" ++ int_to_string(spot.line) ++ ":" ++ int_to_string(spot.col))
+      },
+    }
+  }
+
+fn dim_place(s: Style, places: List<Place>, a: Option<At>) -> String =
+  match a {
+    None -> "",
+    Some(spot) -> match located(places, spot) { Some(text) -> "   " ++ dim(s, text), None -> "" },
+  }
+
+fn primary_of(d: Diag) -> Option<Label> =
+  fold(d.labels, None, |acc: Option<Label>, l: Label|
+    match acc { Some(_) -> acc, None -> if l.primary { Some(l) } else { None } })
+
+fn label_at(l: Label) -> At = { module: l.module, start: l.start, end: l.end }
+
+// Line and column rather than byte offsets, for editors.
+fn place_json(places: List<Place>, a: At) -> Json =
+  if a.module == no_module() { Null } else {
+    match list_at(places, a.module) {
+      None -> Null,
+      Some(place) -> {
+        let from: Spot = spot_of(place.text, a.start);
+        let to: Spot = spot_of(place.text, a.end);
+        object([{ key: "file", value: Str(place.path) },
+                { key: "line", value: num(from.line) },
+                { key: "column", value: num(from.col) },
+                { key: "end_line", value: num(to.line) },
+                { key: "end_column", value: num(to.col) }])
+      },
+    }
+  }
+
+fn location_json(places: List<Place>, d: Diag) -> Json =
+  match primary_of(d) { None -> Null, Some(l) -> place_json(places, label_at(l)) }
+
+fn one_diagnostic(d: Diag, places: List<Place>) -> Json =
+  match all_to_json([d], places) { Array(xs) -> at(xs, 0, Null), other -> other }
+
+// --- What the selection decided ---------------------------------------------
+
+fn runs(reason: String) -> Bool = reason != "cached"
+
+// The document spells a reason as one word, so the halves of a name are joined rather than spaced.
+fn keyed(reason: String) -> String = joined(string_split(reason, " "), "_")
+
+fn why(reason: String) -> String =
+  if reason == "new" { "this hash has never gone green, so nothing is known about it" }
+  else if reason == "nondet" { "`test/nondet` always runs and is never cached" }
+  else if reason == "previous failure" { "the cache holds a failure, and a failure is never trusted" }
+  else if reason == "cached" { "this exact hash already passed; re-running cannot reveal anything new" }
+  else { "no hash was produced, so the cache cannot answer for it" }
+
+// `region`, `shared` or `host`: a socket lives outside every region, so a host-backed test is
+// neither isolated nor cached.
+fn isolation_of(r: Ran, c: Case) -> String =
+  if covers(r.reaches, c.index) { "host" }
+  else if c.isolated { "region" } else { "shared" }
+
+// --- The head ---------------------------------------------------------------
+
+fn selected_line(s: Style, p: Program) -> String =
+  ind() ++ bold(s, "selected") ++ " " ++ bold(s, int_to_string(p.selected)) ++ " of "
+  ++ int_to_string(p.total) ++ " (" ++ int_to_string(p.cached) ++ " cached)"
+
+fn group_line(p: Program, r: Ran) -> List<String> =
+  if p.selected == 0 { [] } else {
+    [ind() ++ count_of(len(p.groups), "group") ++ " · " ++ count_of(r.workers, "worker")]
+  }
+
+fn isolated_line(s: Style, r: Ran) -> List<String> =
+  if r.counts.total == 0 { [] } else {
+    let contending =
+      if r.counts.shared == 0 { "" }
+      else { dim(s, " · " ++ count_of(r.counts.shared, "test") ++ " can contend") };
+    [ind() ++ bold(s, "isolated") ++ " " ++ bold(s, int_to_string(r.counts.isolated)) ++ " of "
+     ++ int_to_string(r.counts.total) ++ contending]
+  }
+
+fn binding_lines(s: Style, r: Ran) -> List<String> =
+  if r.hermetic { [] } else {
+    let head =
+      [ind() ++ bold(s, "host") ++ " " ++ bold(s, int_to_string(r.counts.host)) ++ " of "
+       ++ int_to_string(r.counts.total) ++ " · " ++ dim(s, "not cached"),
+       ind() ++ dim(s, "binding host · " ++ count_of(r.operations, "operation") ++ " · " ++ r.digest)];
+    let shaken = appended(head, map(r.handshakes, |line: String| ind() ++ dim(s, line)));
+    match r.database { Some(line) -> push(shaken, ind() ++ dim(s, line)), None -> shaken }
+  }
+
+// `simulated: 3 of 47 · 61 interleavings · 3 exhaustive`.
+fn simulation_line(s: Style, r: Ran) -> List<String> =
+  if r.simulation.simulated == 0 { [] } else {
+    let c = r.simulation;
+    let head = "simulated: " ++ int_to_string(c.simulated) ++ " of " ++ int_to_string(c.total)
+               ++ " · " ++ count_of(c.interleavings, "interleaving");
+    let thorough = if c.exhaustive == 0 { head }
+                   else { head ++ " · " ++ int_to_string(c.exhaustive) ++ " exhaustive" };
+    let spent = if c.exhausted == 0 { thorough }
+                else { thorough ++ " · " ++ int_to_string(c.exhausted) ++ " budget spent, not cached" };
+    [ind() ++ bold(s, spent)]
+  }
+
+// Apart from the entry counts: analysis is paid once, code generation per worker.
+fn compiled_line(s: Style, b: Backend) -> List<String> =
+  match b.units {
+    None -> [],
+    Some(units) ->
+      [ind() ++ dim(s, "compiled " ++ int_to_string(units) ++ " unit(s) in "
+                      ++ nanos_ms1(match b.codegen_nanos { Some(n) -> n, None -> 0 })
+                      ++ "ms, after "
+                      ++ nanos_ms1(match b.analysis_nanos { Some(n) -> n, None -> 0 })
+                      ++ "ms deciding what to compile")],
+  }
+
+fn backend_lines(s: Style, r: Ran) -> List<String> =
+  match r.backend {
+    None -> [],
+    Some(b) ->
+      appended([ind() ++ bold(s, "backend") ++ " " ++ bold(s, b.name) ++ " · "
+                ++ int_to_string(b.entered) ++ " of " ++ int_to_string(b.offered)
+                ++ " offers entered · " ++ int_to_string(b.declined) ++ " declined · "
+                ++ int_to_string(b.fragment) ++ " in the fragment"],
+               compiled_line(s, b)),
+  }
+
+fn bypass_lines(s: Style, flags: Flags) -> List<String> =
+  if !flags.no_cache { [] } else {
+    [ind() ++ dim(s, "--no-cache: results were neither read nor recorded")]
+  }
+
+fn filtered_lines(s: Style, p: Program) -> List<String> =
+  if p.filtered_out == 0 { [] } else {
+    [ind() ++ dim(s, "--filter hid " ++ count_of(p.filtered_out, "test"))]
+  }
+
+fn head_lines(s: Style, flags: Flags, p: Program, r: Ran) -> List<String> =
+  appended(appended(appended(appended(appended(appended(appended(
+    [selected_line(s, p)], group_line(p, r)), isolated_line(s, r)), binding_lines(s, r)),
+    simulation_line(s, r)), backend_lines(s, r)), bypass_lines(s, flags)), filtered_lines(s, p))
+
+// --- Where the time went ----------------------------------------------------
+
+type Phase = { label: String, us: Int }
+
+// Longest first, so what dominated a run is read first, and ties stay in the order measured.
+fn ordered(rows: List<Phase>) -> List<Phase> =
+  fold(rows, [], |acc: List<Phase>, p: Phase|
+    appended(push(filter(acc, |q: Phase| q.us >= p.us), p), filter(acc, |q: Phase| q.us < p.us)))
+
+fn phase_rows(f: Phases) -> List<Phase> =
+  ordered([{ label: "read", us: f.read_us }, { label: "front", us: f.front_us },
+           { label: "write back", us: f.write_back_us }])
+
+fn phase_total(f: Phases) -> Int = f.read_us + f.front_us + f.write_back_us
+
+fn phase_line(s: Style, p: Phase, total: Int) -> String =
+  ind() ++ "  " ++ padded(p.label, 11) ++ " " ++ aligned(ms2(p.us), 8) ++ "ms "
+  ++ dim(s, share(p.us, total))
+
+fn phase_lines(s: Style, f: Phases) -> List<String> = {
+  let total = phase_total(f);
+  appended(appended(["", ind() ++ bold(s, "front-end time")],
+                    map(phase_rows(f), |p: Phase| phase_line(s, p, total))),
+           [ind() ++ "  " ++ padded("total", 11) ++ " " ++ aligned(ms2(total), 8) ++ "ms"])
+}
+
+// --- `--explain` ------------------------------------------------------------
+
+fn explain_atoms(iso: String, c: Case) -> String =
+  if iso == "region" { "" }
+  else if c.region_only { " " ++ c.shared ++ " (region labels)" }
+  else { " " ++ c.shared }
+
+fn case_line(s: Style, p: Program, r: Ran, c: Case) -> String = {
+  let iso = isolation_of(r, c);
+  let verb = if runs(c.reason) { bold(s, "run ") } else { dim(s, "skip") };
+  ind() ++ verb ++ " " ++ dim(s, short_of(c.hash)) ++ " " ++ padded(c.reason, 16) ++ " "
+    ++ padded(display_of(p, c), 40) ++ " "
+    ++ dim(s, "isolation: " ++ iso ++ explain_atoms(iso, c)
+              ++ (if c.seeded { " · searched" } else { "" }))
+}
+
+fn reasons_seen(p: Program) -> List<String> =
+  fold(p.cases, [], |acc: List<String>, c: Case|
+    if said(acc, c.reason) { acc } else { push(acc, c.reason) })
+
+fn why_lines(s: Style, p: Program) -> List<String> = {
+  let seen = reasons_seen(p);
+  if len(seen) == 0 { [] } else {
+    appended(["", ind() ++ dim(s, "why")],
+             map(seen, |reason: String|
+               ind() ++ "  " ++ padded(reason, 16) ++ " " ++ dim(s, why(reason))))
+  }
+}
+
+fn owed_line(s: Style, p: Program, c: Case) -> List<String> =
+  if c.owed == p.plan.seeds { [] } else {
+    [ind() ++ "  " ++ dim(s, display_of(p, c) ++ ": " ++ int_to_string(c.owed) ++ " of "
+                          ++ count_of(p.plan.seeds, "seed")
+                          ++ " still owed; the rest already passed on their own")]
+  }
+
+// What the seeded tests will search, and what each of them still owes.
+fn search_lines(s: Style, p: Program) -> List<String> = {
+  let seeded = filter(p.cases, |c: Case| c.seeded);
+  if len(seeded) == 0 { [] } else {
+    let head =
+      ["", ind() ++ dim(s, "search"),
+       ind() ++ "  " ++ dim(s, p.plan.mode ++ " · " ++ count_of(p.plan.seeds, "seed")
+                             ++ " · budget " ++ p.plan.budget ++ " · steps " ++ p.plan.steps),
+       ind() ++ "  " ++ dim(s, int_to_string(len(seeded)) ++ " of "
+                             ++ count_of(len(p.cases), "test")
+                             ++ " keyed on this plan and never on their bare hash")];
+    fold(seeded, head, |acc: List<String>, c: Case| appended(acc, owed_line(s, p, c)))
+  }
+}
+
+// Grouped like any other test, but a host-backed test is never free.
+fn group_tally(s: Style, p: Program, r: Ran) -> String = {
+  let hosted = if r.counts.host == 0 { "" }
+               else { " · " ++ int_to_string(r.counts.host) ++ " host-backed and never free" };
+  let regioned = if p.parallelism.region_contended == 0 { "" }
+                 else { " · " ++ int_to_string(p.parallelism.region_contended)
+                        ++ " of them only over a region label" };
+  ind() ++ "  " ++ dim(s, int_to_string(r.counts.isolated) ++ " of "
+                        ++ int_to_string(r.counts.total) ++ " region-isolated and free · "
+                        ++ count_of(p.parallelism.shared_groups, "group") ++ " for the "
+                        ++ int_to_string(r.counts.shared) ++ " shared "
+                        ++ plural(r.counts.shared, "test") ++ regioned ++ hosted)
+}
+
+fn named_of(p: Program, index: Int) -> String =
+  fold(p.cases, "", |acc: String, c: Case| if c.index == index { display_of(p, c) } else { acc })
+
+fn group_block(s: Style, p: Program, lines: List<String>, i: Int) -> List<String> = {
+  let g: Group = at(p.groups, i, no_group());
+  let head = push(lines, ind() ++ "  group " ++ int_to_string(i) ++ " · "
+                         ++ count_of(len(g.tests), "test") ++ " · " ++ dim(s, g.footprint));
+  fold(g.tests, head, |acc: List<String>, index: Int| {
+    let named = named_of(p, index);
+    if named == "" { acc } else { push(acc, ind() ++ "    " ++ named) }
+  })
+}
+
+fn concurrency_lines(s: Style, p: Program, r: Ran) -> List<String> =
+  if len(p.groups) == 0 { [] } else {
+    fold(range(0, len(p.groups)),
+         ["", ind() ++ dim(s, "concurrency groups"), group_tally(s, p, r)],
+         |acc: List<String>, i: Int| group_block(s, p, acc, i))
+  }
+
+fn explain_lines(s: Style, p: Program, r: Ran) -> List<String> =
+  appended(appended(appended(appended(
+    appended([""], map(p.cases, |c: Case| case_line(s, p, r, c))),
+    why_lines(s, p)), search_lines(s, p)), concurrency_lines(s, p, r)), phase_lines(s, p.phases))
+
+// --- One test's line --------------------------------------------------------
+
+fn glyph_of(status: String) -> String =
+  if status == "passed" { "✓" } else if status == "failed" { "✗" }
+  else if status == "panicked" { "!" } else { "–" }
+
+fn word_of(status: String) -> String =
+  if status == "passed" { "ok" } else if status == "failed" { "FAIL" }
+  else if status == "panicked" { "PANIC" } else { "GAVE UP" }
+
+fn painted_glyph(s: Style, status: String) -> String = {
+  let glyph = glyph_of(status);
+  if status == "passed" { green(s, glyph) }
+  else if status == "failed" { red(s, glyph) }
+  else if status == "panicked" { yellow(s, glyph) }
+  else { dim(s, glyph) }
+}
+
+// A styled mark is one glyph wide whatever escapes it carries, so the column is measured over the
+// word rather than over the paint.
+fn marked(s: Style, status: String) -> String =
+  if s.styled { painted_glyph(s, status) } else { padded(word_of(status), 7) }
+
+fn result_name(p: Program, o: Outcome) -> String =
+  fold(p.cases, o.name, |acc: String, c: Case| if c.index == o.index { display_of(p, c) } else { acc })
+
+fn name_column(p: Program, r: Ran) -> Int = {
+  let widest = fold(r.results, 0, |acc: Int, o: Outcome| {
+    let n = string_len(result_name(p, o));
+    if n > acc { n } else { acc }
+  });
+  if widest < 24 { 24 } else if widest > 64 { 64 } else { widest }
+}
+
+fn result_line(s: Style, p: Program, o: Outcome, width: Int) -> String =
+  ind() ++ marked(s, o.status) ++ " " ++ padded(result_name(p, o), width) ++ " "
+  ++ aligned(ms1(o.duration_us), 8) ++ "ms"
+
+// A bounded naive count makes the ratio a lower bound.
+fn reduction_part(e: Explored, naive: Naive) -> List<String> =
+  match e.reduction_tenths {
+    None -> [],
+    Some(tenths) ->
+      [(if naive.bounded { ">= " } else { "" }) ++ fixed((tenths + 5) / 10, 0) ++ "× reduction"],
+  }
+
+// What one test's search did, under its result line.
+fn search_parts(e: Explored) -> List<String> = {
+  let head = [count_of(e.explored, "interleaving")];
+  let thorough = if e.exhaustive { push(head, "exhaustive") } else { head };
+  let spent = if e.exhausted { push(thorough, "budget spent — not cached") } else { thorough };
+  match e.naive {
+    None -> spent,
+    Some(naive) -> appended(push(spent, "naive " ++ naive.rendered), reduction_part(e, naive)),
+  }
+}
+
+fn result_lines(s: Style, p: Program, r: Ran) -> List<String> = {
+  let width = name_column(p, r);
+  fold(r.results, [], |acc: List<String>, o: Outcome| {
+    let listed = push(acc, result_line(s, p, o, width));
+    match o.search {
+      None -> listed,
+      Some(e) -> push(listed, ind() ++ "    " ++ dim(s, joined(search_parts(e), " · "))),
+    }
+  })
+}
+
+// --- The summary ------------------------------------------------------------
+
+// `host` sits beside `cached` so "0 cached" is not misread as selection working.
+fn summary_line(s: Style, r: Ran) -> String = {
+  let c = r.summary;
+  let failures = int_to_string(c.failed) ++ " failed";
+  let passes = int_to_string(c.passed) ++ " passed";
+  let hosted =
+    if r.counts.host == 0 { "" }
+    else {
+      dim(s, ", " ++ int_to_string(r.counts.host) ++ " host-backed"
+             ++ (if r.live_database { " against a real database" } else { "" })
+             ++ " and not cached")
+    };
+  let given_up = if c.abandoned == 0 { "" }
+                 else { yellow(s, ", " ++ int_to_string(c.abandoned) ++ " abandoned") };
+  ind() ++ (if c.failed > 0 { red(s, failures) } else { dim(s, failures) }) ++ ", "
+    ++ (if c.passed > 0 { green(s, passes) } else { dim(s, passes) }) ++ ", "
+    ++ int_to_string(c.cached) ++ " cached" ++ hosted ++ given_up
+    ++ " (" ++ secs2(c.duration_us) ++ "s)"
+}
+
+// --- One failure ------------------------------------------------------------
+
+fn culprit_line(s: Style, places: List<Place>, c: Culprit, first: Bool) -> String =
+  "  " ++ red(s, if first { "culprit:" } else { "        " }) ++ " " ++ joined(c.names, " + ")
+  ++ dim_place(s, places, c.at)
+
+// The culprit before the diff: the culprit is the answer.
+fn bisect_lines(s: Style, places: List<Place>, b: Bisect) -> List<String> =
+  if b.conclusive {
+    push(fold(range(0, len(b.culprits)), [], |acc: List<String>, i: Int|
+           push(acc, culprit_line(s, places, at(b.culprits, i, no_culprit()), i == 0))),
+         "    " ++ dim(s, b.reason))
+  }
+  // Silent when no bisection was asked for.
+  else if !b.requested { [] }
+  else { ["  " ++ dim(s, "no culprit:") ++ " " ++ b.reason] }
+
+fn note_lines(s: Style, d: Diag) -> List<String> =
+  map(d.notes_text, |n: Bytes| "  " ++ dim(s, "=") ++ " " ++ string_of_bytes_lossy(n))
+
+// A deadlock's cycle lives only in its secondary labels.
+fn secondary_lines(s: Style, places: List<Place>, d: Diag) -> List<String> =
+  map(filter(d.labels, |l: Label| !l.primary), |l: Label|
+    "    " ++ string_of_bytes_lossy(l.text) ++ dim_place(s, places, Some(label_at(l))))
+
+fn at_lines(s: Style, places: List<Place>, d: Diag) -> List<String> =
+  match primary_of(d) {
+    None -> [],
+    Some(l) ->
+      match located(places, label_at(l)) {
+        None -> [],
+        Some(text) -> ["    at " ++ dim(s, text)],
+      },
+  }
+
+fn site_line(s: Style, places: List<Place>, site: Site, first: Bool) -> String =
+  "  " ++ yellow(s, if first { "race:" } else { "     " }) ++ " " ++ site.task ++ "  "
+  ++ (match site.definition { Some(d) -> d, None -> "-" }) ++ "   " ++ site.access
+  ++ dim_place(s, places, site.at)
+
+fn race_lines(s: Style, places: List<Place>, f: Fault) -> List<String> =
+  match f.race {
+    None -> [],
+    Some(race) -> [site_line(s, places, race.left, true), site_line(s, places, race.right, false)],
+  }
+
+fn replay_lines(s: Style, f: Fault) -> List<String> =
+  match f.replay { None -> [], Some(command) -> ["  " ++ dim(s, "replay:") ++ " " ++ command] }
+
+// The repro, which is a seed rather than a stack trace.
+fn seed_lines(s: Style, places: List<Place>, f: Fault) -> List<String> =
+  match f.seed {
+    None -> [],
+    Some(seed) ->
+      appended(appended(["  " ++ dim(s, "seed:") ++ " " ++ seed], race_lines(s, places, f)),
+               replay_lines(s, f)),
+  }
+
+fn ran_lines(s: Style, f: Fault) -> List<String> =
+  match f.slice {
+    None -> [],
+    Some(slice) ->
+      if !slice.traced || len(slice.path) == 0 { [] }
+      else if slice.reproduced { ["  " ++ dim(s, "ran:") ++ " " ++ joined(slice.path, " → ")] }
+      else {
+        ["  " ++ dim(s, "ran:") ++ " " ++ joined(slice.path, " → "),
+         "    " ++ yellow(s, "the replay did not reproduce this failure; treat the path as evidence about a different execution")]
+      },
+  }
+
+fn described(x: Suspect) -> String = {
+  let changed = match x.change { Some(c) -> [c], None -> [] };
+  let noted =
+    match x.ran {
+      Some(true) -> match x.depth { None -> push(changed, "ran, then returned"), Some(_) -> changed },
+      Some(false) -> push(changed, "did not run"),
+      None -> changed,
+    };
+  if len(noted) == 0 { x.name } else { x.name ++ " (" ++ joined(noted, ", ") ++ ")" }
+}
+
+fn suspect_lines(s: Style, f: Fault) -> List<String> = {
+  let rest = map(filter(f.suspects, |x: Suspect| !x.culprit), described);
+  if len(rest) > 0 { ["  " ++ yellow(s, "suspects:") ++ " " ++ joined(rest, ", ")] }
+  else if f.unchanged {
+    ["  " ++ dim(s, "suspects: none — nothing in this test's closure changed")]
+  } else { [] }
+}
+
+fn failure_lines(s: Style, places: List<Place>, f: Fault) -> List<String> =
+  appended(appended(appended(appended(appended(appended(appended(
+    [bold(s, f.key)], bisect_lines(s, places, f.bisect)),
+    ["  " ++ string_of_bytes_lossy(f.diagnostic.message)]),
+    at_lines(s, places, f.diagnostic)),
+    secondary_lines(s, places, f.diagnostic)),
+    note_lines(s, f.diagnostic)),
+    appended(seed_lines(s, places, f), ran_lines(s, f))),
+    suspect_lines(s, f))
+
+fn failure_blocks(s: Style, p: Program, r: Ran) -> List<String> =
+  fold(r.failures, [], |acc: List<String>, f: Fault|
+    appended(push(acc, ""), map(failure_lines(s, p.places, f), |l: String| ind() ++ l)))
+
+// A test the clock stopped: no culprit, no suspects, nothing to bisect — the machine ran out of
+// patience, and what the test would have decided is still unknown.
+fn abandoned_lines(s: Style, places: List<Place>, o: Outcome) -> List<String> = {
+  let head = [bold(s, o.name) ++ " " ++ yellow(s, "abandoned")];
+  match o.diagnostic {
+    None -> head,
+    Some(d) ->
+      appended(appended(push(head, "  " ++ string_of_bytes_lossy(d.message)),
+                        at_lines(s, places, d)),
+               note_lines(s, d)),
+  }
+}
+
+fn abandoned_blocks(s: Style, p: Program, r: Ran) -> List<String> =
+  fold(filter(r.results, |o: Outcome| o.status == "abandoned"), [],
+       |acc: List<String>, o: Outcome|
+         appended(push(acc, ""), map(abandoned_lines(s, p.places, o), |l: String| ind() ++ l)))
+
+// --- Coverage and mutants ---------------------------------------------------
+
+fn unreached_lines(s: Style, names: List<String>) -> List<String> =
+  map(names, |n: String| ind() ++ ind() ++ dim(s, n ++ ": no test reaches it"))
+
+fn coverage_lines(s: Style, r: Ran) -> List<String> =
+  match r.coverage {
+    None -> [],
+    Some(c) ->
+      appended([ind() ++ bold(s, "coverage") ++ " "
+                ++ int_to_string(c.definitions - len(c.unreached)) ++ " of "
+                ++ int_to_string(c.definitions) ++ " definitions reached by a test"],
+               unreached_lines(s, c.unreached)),
+  }
+
+fn survivor_line(s: Style, places: List<Place>, m: Mutant) -> String = {
+  let spot = match m.at {
+    None -> "",
+    Some(a) -> match located(places, a) { Some(text) -> text, None -> "" },
+  };
+  ind() ++ ind() ++ red(s, m.definition) ++ " survives `" ++ m.from ++ "` -> `" ++ m.to ++ "` at "
+    ++ dim(s, spot)
+}
+
+fn mutant_lines(s: Style, p: Program, r: Ran) -> List<String> =
+  match r.mutants {
+    None -> [],
+    Some(m) -> {
+      let tally = int_to_string(m.killed) ++ " killed, " ++ int_to_string(m.survived)
+                  ++ " survived, " ++ int_to_string(m.skipped) ++ " skipped"
+                  ++ (if m.budget_spent { ", budget spent" } else { "" });
+      appended(appended([ind() ++ bold(s, "mutants") ++ " " ++ bold(s, tally)],
+                        unreached_lines(s, m.unreached)),
+               map(m.survivors, |x: Mutant| survivor_line(s, p.places, x)))
+    },
+  }
+
+fn no_tests_note(flags: Flags, p: Program) -> String =
+  if p.declared == 0 { "no `test` items in this program" }
+  else if flags.filtered { "no test key contains that substring; nothing was verified" }
+  else { "nothing to report" }
+
+// --- The document -----------------------------------------------------------
+
+fn case_json(r: Ran, c: Case) -> Json =
+  object([{ key: "index", value: num(c.index) },
+          { key: "key", value: Str(c.key) },
+          { key: "name", value: Str(c.name) },
+          { key: "module", value: Str(c.module) },
+          { key: "hash", value: opt_str(c.hash) },
+          { key: "nondet", value: Bool(c.nondet) },
+          { key: "selected", value: Bool(runs(c.reason)) },
+          { key: "reason", value: Str(keyed(c.reason)) },
+          { key: "why", value: Str(why(c.reason)) },
+          { key: "group", value: opt_num(c.group) },
+          { key: "footprint", value: Str(c.footprint) },
+          { key: "isolation", value: Str(isolation_of(r, c)) },
+          // Whether this test reaches the binding, and so always runs uncached.
+          { key: "host", value: Bool(covers(r.reaches, c.index)) },
+          { key: "shared_atoms", value: strings(c.atoms) }])
+
+fn group_json(p: Program, i: Int) -> Json = {
+  let g: Group = at(p.groups, i, no_group());
+  object([{ key: "index", value: num(i) },
+          { key: "tests", value: Array(map(g.tests, |x: Int| num(x))) },
+          { key: "footprint", value: Str(g.footprint) }])
+}
+
+fn naive_json(v: Option<Naive>) -> Json =
+  match v {
+    None -> Null,
+    Some(n) ->
+      object([{ key: "explored", value: num(n.explored) },
+              { key: "bounded", value: Bool(n.bounded) },
+              { key: "rendered", value: Str(n.rendered) }]),
+  }
+
+fn search_json(e: Explored) -> Json =
+  object([{ key: "explored", value: num(e.explored) },
+          { key: "exhaustive", value: Bool(e.exhaustive) },
+          { key: "exhausted", value: Bool(e.exhausted) },
+          { key: "naive", value: naive_json(e.naive) },
+          { key: "reduction",
+            value: match e.reduction_tenths { Some(t) -> Number(decimal(fixed(t, 1))), None -> Null } },
+          { key: "steps", value: num(e.steps) },
+          { key: "virtual_time_ns", value: num(e.virtual_time_ns) },
+          { key: "failing_seed", value: opt_str(e.failing_seed) }])
+
+fn case_of(p: Program, index: Int) -> Option<Case> =
+  fold(p.cases, None, |acc: Option<Case>, c: Case|
+    match acc { Some(_) -> acc, None -> if c.index == index { Some(c) } else { None } })
+
+fn outcome_json(p: Program, o: Outcome) -> Json = {
+  let named = case_of(p, o.index);
+  object([{ key: "index", value: num(o.index) },
+          { key: "key", value: match named { Some(c) -> Str(c.key), None -> Null } },
+          { key: "name", value: Str(match named { Some(c) -> c.name, None -> o.name }) },
+          { key: "module", value: match named { Some(c) -> Str(c.module), None -> Null } },
+          { key: "hash", value: opt_str(o.hash) },
+          { key: "group", value: num(o.group) },
+          { key: "status", value: Str(o.status) },
+          { key: "duration_ms", value: millis(o.duration_us) },
+          { key: "diagnostic",
+            value: match o.diagnostic { Some(d) -> one_diagnostic(d, p.places), None -> Null } },
+          // Absent, never zeroed, when no region was reached.
+          { key: "simulation", value: match o.search { Some(e) -> search_json(e), None -> Null } },
+          { key: "cached", value: opt_bool(o.cached) }])
+}
+
+// The keys this report gives the runner's own failure artifact, placed onto it.
+fn with_members(doc: Json, extra: List<Member>) -> Json =
+  match doc {
+    Object(m) ->
+      Object(fold(extra, m, |acc: Map<String, Json>, x: Member| map_insert(acc, x.key, x.value))),
+    _ -> object(extra),
+  }
+
+fn fault_json(p: Program, f: Fault) -> Json =
+  with_members(f.artifact,
+               [{ key: "diagnostic", value: one_diagnostic(f.diagnostic, p.places) },
+                { key: "module", value: opt_str(f.module) },
+                { key: "test_hash", value: opt_str(f.test_hash) },
+                { key: "nondet", value: opt_bool(f.nondet) },
+                { key: "status", value: opt_str(f.status) },
+                { key: "location", value: location_json(p.places, f.diagnostic) },
+                { key: "footprint",
+                  value: object([{ key: "declared", value: opt_strings(f.declared) },
+                                 { key: "observed", value: opt_strings(f.observed) }]) }])
+
+fn parallelism_json(v: Parallelism) -> Json =
+  object([{ key: "total", value: num(v.total) },
+          { key: "isolated", value: num(v.isolated) },
+          { key: "shared", value: num(v.shared) },
+          { key: "region_contended", value: num(v.region_contended) },
+          { key: "scheduled", value: num(v.scheduled) },
+          { key: "groups", value: num(v.groups) },
+          { key: "shared_groups", value: num(v.shared_groups) }])
+
+fn phases_json(f: Phases) -> Json =
+  object([{ key: "read", value: millis(f.read_us) },
+          { key: "front", value: millis(f.front_us) },
+          { key: "write_back", value: millis(f.write_back_us) },
+          { key: "total", value: millis(phase_total(f)) }])
+
+fn selection_json(p: Program, r: Ran) -> Json =
+  object([{ key: "total", value: num(p.total) },
+          { key: "selected", value: num(p.selected) },
+          { key: "cached", value: num(p.cached) },
+          { key: "filtered_out", value: num(p.filtered_out) },
+          { key: "groups", value: Array(map(range(0, len(p.groups)), |i: Int| group_json(p, i))) },
+          // A host-backed test counts only under `host`, since it is not isolated.
+          { key: "isolated", value: num(r.counts.isolated) },
+          { key: "shared", value: num(r.counts.shared) },
+          { key: "host", value: num(r.counts.host) },
+          { key: "parallelism", value: parallelism_json(p.parallelism) },
+          { key: "tests", value: Array(map(p.cases, |c: Case| case_json(r, c))) }])
+
+fn summary_json(c: Summary) -> Json =
+  object([{ key: "passed", value: num(c.passed) },
+          { key: "failed", value: num(c.failed) },
+          { key: "abandoned", value: num(c.abandoned) },
+          { key: "cached", value: num(c.cached) },
+          { key: "duration_ms", value: millis(c.duration_us) }])
+
+fn simulated_json(c: Simulated) -> Json =
+  object([{ key: "simulated", value: num(c.simulated) },
+          { key: "seeds", value: num(c.seeds) },
+          { key: "interleavings", value: num(c.interleavings) },
+          { key: "exhaustive", value: num(c.exhaustive) },
+          { key: "exhausted", value: num(c.exhausted) },
+          { key: "failed", value: num(c.failed) }])
+
+fn backend_json(r: Ran) -> Json =
+  match r.backend {
+    None -> Null,
+    Some(b) ->
+      object([{ key: "spec", value: opt_str(b.spec) },
+              { key: "name", value: Str(b.name) },
+              { key: "fragment", value: num(b.fragment) },
+              { key: "offered", value: num(b.offered) },
+              { key: "analysis_nanos", value: opt_num(b.analysis_nanos) },
+              { key: "codegen_nanos", value: opt_num(b.codegen_nanos) },
+              { key: "units", value: opt_num(b.units) },
+              { key: "entered", value: num(b.entered) },
+              { key: "declined", value: num(b.declined) },
+              { key: "converted_in", value: num(b.converted_in) },
+              { key: "converted_out", value: num(b.converted_out) }]),
+  }
+
+// The two documents `--coverage` and `--mutate` add, each written by the pass that measured it.
+fn extra_documents(r: Ran) -> List<Member> = {
+  let covered = match r.coverage { None -> [], Some(c) -> [{ key: "coverage", value: c.json }] };
+  match r.mutants { None -> covered, Some(m) -> push(covered, { key: "mutants", value: m.json }) }
+}
+
+// Bumped whenever a field in the failure artifact changes meaning or leaves.
+fn artifact_schema() -> Int = 4
+
+fn document(flags: Flags, p: Program, r: Ran, warnings: List<Diag>, ok: Bool) -> Json =
+  object(appended(
+    [{ key: "command", value: Str("test") },
+     { key: "schema_version", value: num(artifact_schema()) },
+     { key: "front_end",
+       value: object([{ key: "incremental", value: Bool(p.incremental) },
+                      { key: "phases", value: phases_json(p.phases) }]) },
+     { key: "ok", value: Bool(ok) },
+     { key: "exit_code", value: num(if ok { ok_code() } else { run_failed() }) },
+     { key: "root", value: Str(p.root) },
+     { key: "files", value: strings(p.files) },
+     { key: "modules",
+       value: Array(map(p.modules, |m: ModuleView|
+         object([{ key: "name", value: Str(m.name) },
+                 { key: "file", value: Str(m.file) }]))) },
+     { key: "filter", value: if flags.filtered { Str(flags.filter) } else { Null } },
+     { key: "no_cache", value: Bool(flags.no_cache) },
+     { key: "binding", value: Str(r.label) },
+     { key: "hosts", value: r.hosts },
+     { key: "workers", value: num(r.workers) },
+     { key: "options", value: p.options },
+     { key: "simulation", value: simulated_json(r.simulation) },
+     { key: "backend", value: backend_json(r) },
+     { key: "selection", value: selection_json(p, r) },
+     { key: "summary", value: summary_json(r.summary) },
+     { key: "results", value: Array(map(r.results, |o: Outcome| outcome_json(p, o))) },
+     { key: "failures", value: Array(map(r.failures, |f: Fault| fault_json(p, f))) },
+     // Not a warning: every later run believes an escaped entry.
+     { key: "diagnostics", value: all_to_json(r.escapes, p.places) },
+     { key: "warnings", value: all_to_json(warnings, p.places) }],
+    extra_documents(r)))
+
+// --- The answer -------------------------------------------------------------
+
+// A test failed, was abandoned, a pass escaped into the cache, or a mutant lived.
+fn run_failed() -> Int = 1
+
+fn survived(r: Ran) -> Bool = match r.mutants { Some(m) -> m.survived > 0, None -> false }
+
+fn green_run(r: Ran) -> Bool =
+  r.summary.failed == 0 && r.summary.abandoned == 0 && len(r.escapes) == 0 && !survived(r)
+
+fn warned(s: Style, warnings: List<Diag>) -> List<String> =
+  if len(warnings) == 0 { [] } else { appended([""], warning_lines(s, warnings)) }
+
+fn explained(s: Style, flags: Flags, p: Program, r: Ran) -> List<String> =
+  if !flags.explain { [] } else { explain_lines(s, p, r) }
+
+fn listed(s: Style, p: Program, r: Ran) -> List<String> =
+  if len(r.results) == 0 { [] } else { appended([""], result_lines(s, p, r)) }
+
+fn nothing_lines(s: Style, flags: Flags, p: Program) -> List<String> =
+  if p.total > 0 { [] } else { ["", ind() ++ dim(s, no_tests_note(flags, p))] }
+
+fn lines_of(s: Style, flags: Flags, p: Program, r: Ran, warnings: List<Diag>) -> List<String> =
+  appended(appended(appended(appended(appended(appended(appended(appended(appended(
+    head_lines(s, flags, p, r), explained(s, flags, p, r)), listed(s, p, r)),
+    ["", summary_line(s, r)]),
+    warned(s, r.escapes)),
+    failure_blocks(s, p, r)),
+    abandoned_blocks(s, p, r)),
+    nothing_lines(s, flags, p)),
+    warned(s, warnings)),
+    appended(coverage_lines(s, r), mutant_lines(s, p, r)))
+
+// A lazy read and a later flush can each report the same unreadable file.
+fn collected(p: Program, r: Ran) -> List<Diag> =
+  fold(appended(p.warnings, r.warnings), [], |acc: List<Diag>, d: Diag|
+    if len(filter(acc, |x: Diag| x.code == d.code && x.message == d.message)) > 0 { acc }
+    else { push(acc, d) })
+
+fn answered(s: Style, flags: Flags, p: Program, r: Ran) -> Answer = {
+  let warnings = collected(p, r);
+  let ok = green_run(r);
+  { json: document(flags, p, r, warnings, ok),
+    lines: lines_of(s, flags, p, r, warnings),
+    errs: [],
+    code: if ok { ok_code() } else { run_failed() } }
+}
+
+// A registration that does not match the program is a start-up failure: nothing ran.
+fn unbound(s: Style, refusal: Refusal) -> Answer = {
+  let tally = ind() ++ red(s, "no host handler was bound") ++ " ("
+              ++ count_of(len(refusal.diags), "error") ++ ")";
+  { json: object([{ key: "command", value: Str("test") },
+                  { key: "ok", value: Bool(false) },
+                  { key: "exit_code", value: num(compile_error()) },
+                  { key: "binding", value: Str("host") },
+                  { key: "diagnostics", value: all_to_json(refusal.diags, refusal.places) }]),
+    lines: [],
+    errs: push(all_to_text(s, refusal.diags, refusal.places), tally),
+    code: compile_error() }
+}
+
+pub fn run(flags: Flags) -> Answer
+  / {tester.loaded[corpus], tester.bound[corpus], tester.ran[corpus]} = {
+  let s: Style = style_of(flags);
+  match tester.loaded[corpus]() {
+    Err(refusal) -> refused(s, "test", refusal.diags, refusal.places),
+    Ok(p) ->
+      match tester.bound[corpus]() {
+        Err(refusal) -> unbound(s, refusal),
+        Ok(_) -> answered(s, flags, p, tester.ran[corpus]()),
+      },
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_diag(code: Bytes, message: Bytes, labels: List<Label>, notes: List<Bytes>) -> Diag =
+  { code: code, notes: len(notes), labels: labels, text: b"", message: message,
+    notes_text: notes, severity: b"error", fixes: [] }
+
+fn a_place() -> List<Place> =
+  [{ path: "m.ply", text: b"test \"two is two\" { assert_eq(1 + 1, 2) }\n" }]
+
+fn no_phases() -> Phases = { read_us: 0, front_us: 0, write_back_us: 0 }
+
+fn no_parallelism() -> Parallelism =
+  { total: 0, isolated: 0, shared: 0, region_contended: 0, scheduled: 0, groups: 0,
+    shared_groups: 0 }
+
+fn a_hash() -> String = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+
+fn a_case(index: Int, name: String, reason: String) -> Case =
+  { index: index, key: "m." ++ name, name: name, module: "m", nondet: false, hash: Some(a_hash()),
+    footprint: "{}", shared: "{}", atoms: [], region_only: false, seeded: false, isolated: true,
+    reason: reason, owed: 1, group: Some(0) }
+
+fn a_program(cases: List<Case>) -> Program =
+  { root: "/p", files: ["m.ply"], places: a_place(), modules: [{ name: "m", file: "m.ply" }],
+    incremental: true, phases: no_phases(), declared: len(cases), cases: cases,
+    total: len(cases), selected: len(filter(cases, |c: Case| runs(c.reason))),
+    cached: len(filter(cases, |c: Case| !runs(c.reason))), filtered_out: 0,
+    groups: [{ tests: map(cases, |c: Case| c.index), footprint: "{}" }],
+    parallelism: { ..no_parallelism(), total: len(cases), isolated: len(cases),
+                   scheduled: len(cases), groups: 1 },
+    plan: { mode: "one", seeds: 1, budget: "64", steps: "1000" }, warnings: [], options: Null }
+
+fn an_outcome(index: Int, name: String, status: String) -> Outcome =
+  { index: index, name: name, hash: None, group: 0, duration_us: 1500, status: status,
+    diagnostic: None, search: None, cached: Some(true) }
+
+fn no_counts() -> Counts = { total: 0, isolated: 0, shared: 0, host: 0 }
+
+fn a_run(results: List<Outcome>, failures: List<Fault>) -> Ran =
+  { hermetic: true, label: "hermetic", operations: 0, digest: "", database: None,
+    live_database: false, handshakes: [], hosts: Null, reaches: [], counts: no_counts(),
+    workers: 4, backend: None, results: results, failures: failures,
+    summary: { passed: len(filter(results, |o: Outcome| o.status == "passed")),
+               failed: len(failures),
+               abandoned: len(filter(results, |o: Outcome| o.status == "abandoned")),
+               cached: 0, duration_us: 20000 },
+    simulation: { simulated: 0, total: len(results), seeds: 0, interleavings: 0, exhaustive: 0,
+                  exhausted: 0, failed: 0 },
+    escapes: [], warnings: [], mutants: None, coverage: None }
+
+fn no_bisect() -> Bisect = { conclusive: false, requested: false, reason: "", culprits: [] }
+
+fn a_fault() -> Fault =
+  { key: "m.two is two", diagnostic: a_diag(b"E0502", b"assertion failed", [], []),
+    bisect: no_bisect(), slice: None, suspects: [], unchanged: false, seed: None, race: None,
+    replay: None, artifact: Null, module: Some("m"), test_hash: None, nondet: Some(false),
+    status: Some("failed"), declared: None, observed: None }
+
+fn a_suspect(name: String) -> Suspect =
+  { name: name, change: None, ran: None, depth: None, culprit: false }
+
+test "a green run is exit 0, and the head says what was selected of what" {
+  let p = a_program([a_case(0, "one", "new"), a_case(1, "two", "cached")]);
+  let answer = answered(plain(), read([]), p, a_run([an_outcome(0, "one", "passed")], []));
+  assert_eq(answer.code, 0);
+  assert_eq(at(answer.lines, 0, ""), "   selected 1 of 2 (1 cached)");
+  assert_eq(at(answer.lines, 1, ""), "   1 group · 4 workers");
+  assert_eq(answer.errs, [])
+}
+
+test "a failure is exit 1 and the culprit is printed before the diff" {
+  let p = a_program([a_case(0, "two is two", "new")]);
+  let culprit = { ..a_fault(),
+                  bisect: { ..no_bisect(), conclusive: true, requested: true,
+                            reason: "narrowed to one body",
+                            culprits: [{ names: ["m.total"], at: None }] } };
+  let answer = answered(plain(), read([]), p,
+                        a_run([an_outcome(0, "two is two", "failed")], [culprit]));
+  assert_eq(answer.code, 1);
+  assert(said(answer.lines, "   m.two is two"));
+  assert(said(answer.lines, "     culprit: m.total"));
+  assert(said(answer.lines, "       narrowed to one body"));
+  assert(said(answer.lines, "     assertion failed"))
+}
+
+test "a bisection nobody asked for says nothing, and one that failed says why" {
+  assert_eq(bisect_lines(plain(), a_place(), no_bisect()), []);
+  assert_eq(bisect_lines(plain(), a_place(),
+                         { ..no_bisect(), requested: true, reason: "no baseline to compare" }),
+            ["  no culprit: no baseline to compare"])
+}
+
+test "a test the clock stopped is abandoned rather than judged, and the run is not a success" {
+  let p = a_program([a_case(0, "slow", "new")]);
+  let stopped = { ..an_outcome(0, "slow", "abandoned"),
+                  diagnostic: Some(a_diag(b"E0504", b"the run was abandoned", [],
+                                          [b"raise the clock"])) };
+  let answer = answered(plain(), read([]), p, a_run([stopped], []));
+  assert_eq(answer.code, 1);
+  assert(said(answer.lines, "   slow abandoned"));
+  assert(said(answer.lines, "     the run was abandoned"));
+  assert(said(answer.lines, "     = raise the clock"))
+}
+
+// A pass a later hermetic run would believe is not a warning: the run is red over it.
+test "an escaped cache entry fails the run even with every test green" {
+  let p = a_program([a_case(0, "one", "new")]);
+  let escaped = { ..a_run([an_outcome(0, "one", "passed")], []),
+                  escapes: [a_diag(b"E0001", b"`m.one` can reach the host binding", [], [])] };
+  assert_eq(answered(plain(), read([]), p, escaped).code, 1)
+}
+
+test "a mutant no test kills fails the run and is named with what it changed" {
+  let p = a_program([a_case(0, "one", "new")]);
+  let mutated =
+    { ..a_run([an_outcome(0, "one", "passed")], []),
+      mutants: Some({ killed: 2, survived: 1, skipped: 0, budget_spent: false, unreached: [],
+                      survivors: [{ definition: "m.total", from: "+", to: "-", at: None }],
+                      json: Null }) };
+  let answer = answered(plain(), read([]), p, mutated);
+  assert_eq(answer.code, 1);
+  assert(said(answer.lines, "   mutants 2 killed, 1 survived, 0 skipped"));
+  assert(said(answer.lines, "      m.total survives `+` -> `-` at "))
+}
+
+test "the mark is a word in a plain run and one glyph in a styled one" {
+  assert_eq(marked(plain(), "passed"), "ok     ");
+  assert_eq(marked(plain(), "failed"), "FAIL   ");
+  assert_eq(marked(plain(), "panicked"), "PANIC  ");
+  assert_eq(marked(plain(), "abandoned"), "GAVE UP");
+  assert_eq(bytes_of_string(marked({ styled: true }, "passed")), b"\x1b[32m\xe2\x9c\x93\x1b[0m")
+}
+
+test "a result line pads the name to the column and the reading to one decimal" {
+  let p = a_program([a_case(0, "two is two", "new")]);
+  assert_eq(result_line(plain(), p, an_outcome(0, "two is two", "passed"), 24),
+            "   ok      two is two                    1.5ms")
+}
+
+// The column never narrows below 24 and never widens past 64, so long names still line up.
+test "the name column is the widest name, clamped" {
+  let p = a_program([]);
+  assert_eq(name_column(p, a_run([], [])), 24);
+  assert_eq(name_column(p, a_run([an_outcome(0, repeated("x", 30), "passed")], [])), 30);
+  assert_eq(name_column(p, a_run([an_outcome(0, repeated("x", 90), "passed")], [])), 64)
+}
+
+test "the summary counts what was decided and how long it took" {
+  let r = a_run([an_outcome(0, "one", "passed")], []);
+  assert_eq(summary_line(plain(), r), "   0 failed, 1 passed, 0 cached (0.02s)");
+  let hosted = { ..r, counts: { ..no_counts(), total: 1, host: 1 }, live_database: true };
+  assert(string_contains(summary_line(plain(), hosted),
+                         "1 host-backed against a real database and not cached"))
+}
+
+test "a reason is spaced in the line and joined in the document" {
+  assert_eq(keyed("previous failure"), "previous_failure");
+  assert_eq(keyed("new"), "new");
+  assert(runs("new"));
+  assert(!runs("cached"))
+}
+
+test "`--explain` says why each test ran, once per reason, and how the groups formed" {
+  let p = a_program([a_case(0, "one", "new"), a_case(1, "two", "cached")]);
+  let lines = explain_lines(plain(), p, a_run([], []));
+  assert(string_contains(at(lines, 1, ""), "run  abcdef012345 new "));
+  assert(string_contains(at(lines, 1, ""), "isolation: region"));
+  assert(string_contains(at(lines, 2, ""), "skip abcdef012345 cached "));
+  assert(said(lines, "   why"));
+  assert(said(lines, "   concurrency groups"));
+  assert(said(lines, "     group 0 · 2 tests · {}"));
+  assert(said(lines, "       one"))
+}
+
+test "the document keys off `command` and `exit_code` and names the schema it publishes" {
+  let p = a_program([a_case(0, "one", "new")]);
+  let text = to_string(answered(plain(), read(["--json"]), p,
+                                a_run([an_outcome(0, "one", "passed")], [])).json);
+  assert(string_contains(text, "\"command\":\"test\""));
+  assert(string_contains(text, "\"exit_code\":0"));
+  assert(string_contains(text, "\"schema_version\":4"));
+  assert(string_contains(text, "\"binding\":\"hermetic\""));
+  assert(string_contains(text, "\"root\":\"/p\""));
+  assert(string_contains(text, "\"duration_ms\":1.5"));
+  assert(string_contains(text, "\"reason\":\"new\""))
+}
+
+// The artifact the runner publishes is placed rather than re-derived, so a key it grows arrives
+// without this report being taught about it.
+test "a failure's own artifact is carried, with this report's keys placed onto it" {
+  let p = a_program([a_case(0, "two is two", "new")]);
+  let carried = { ..a_fault(),
+                  artifact: object([{ key: "key", value: Str("m.two is two") },
+                                    { key: "defect", value: Bool(false) }]) };
+  let text = to_string(fault_json(p, carried));
+  assert(string_contains(text, "\"defect\":false"));
+  assert(string_contains(text, "\"key\":\"m.two is two\""));
+  assert(string_contains(text, "\"module\":\"m\""));
+  assert(string_contains(text, "\"status\":\"failed\""));
+  assert(string_contains(text, "\"nondet\":false"))
+}
+
+test "a program with no tests at all says so, and one narrowed to none says that instead" {
+  let empty = { ..a_program([]), declared: 0 };
+  assert(said(answered(plain(), read([]), empty, a_run([], [])).lines,
+              "   no `test` items in this program"));
+  let hidden = { ..a_program([]), declared: 3, filtered_out: 3 };
+  assert(said(answered(plain(), read(["--filter=none"]), hidden, a_run([], [])).lines,
+              "   no test key contains that substring; nothing was verified"))
+}
+
+test "a suspect is named with what changed and whether it ran" {
+  assert_eq(described(a_suspect("m.total")), "m.total");
+  assert_eq(described({ ..a_suspect("m.total"), change: Some("edited"), ran: Some(false) }),
+            "m.total (edited, did not run)");
+  assert_eq(described({ ..a_suspect("m.total"), ran: Some(true) }), "m.total (ran, then returned)");
+  assert_eq(described({ ..a_suspect("m.total"), ran: Some(true), depth: Some(2) }), "m.total")
+}
+
+test "the repro is a seed and the command that replays it" {
+  let f = { ..a_fault(), seed: Some("0:0.1.0.2"),
+            replay: Some("ply test --seed 0:0.1.0.2 --filter \"two is two\"") };
+  assert_eq(seed_lines(plain(), a_place(), f),
+            ["  seed: 0:0.1.0.2",
+             "  replay: ply test --seed 0:0.1.0.2 --filter \"two is two\""])
+}
+
+test "a search says what it explored and what an unpruned one would have cost" {
+  let e: Explored = { explored: 12, exhaustive: true, exhausted: false,
+                      naive: Some({ explored: 120, bounded: false, rendered: "120" }),
+                      reduction_tenths: Some(100), steps: 8, virtual_time_ns: 0,
+                      failing_seed: None };
+  assert_eq(joined(search_parts(e), " · "),
+            "12 interleavings · exhaustive · naive 120 · 10× reduction")
+}
+
+test "a phase reading is two decimals of a millisecond, longest phase first" {
+  assert_eq(phase_lines(plain(), { ..no_phases(), read_us: 2000, front_us: 98000 }),
+            ["",
+             "   front-end time",
+             "     front          98.00ms  98.0%",
+             "     read            2.00ms   2.0%",
+             "     write back      0.00ms   0.0%",
+             "     total         100.00ms"])
+}
+
+// A socket lives outside every region, so a test the binding can reach is neither isolated nor
+// cached, whatever its footprint says.
+test "a test the binding can reach is host rather than isolated" {
+  let c = a_case(0, "one", "new");
+  let hermetic = a_run([], []);
+  assert_eq(isolation_of(hermetic, c), "region");
+  assert_eq(isolation_of({ ..hermetic, reaches: [0] }, c), "host");
+  assert_eq(isolation_of(hermetic, { ..c, isolated: false }), "shared")
+}
+
+test "a bound run says how many tests reach the host, what it bound and what it shook hands on" {
+  let bound =
+    { ..a_run([], []), hermetic: false, label: "host", operations: 7, digest: "b3:aabbccddeeff",
+      handshakes: ["handshakes: 1 completed, 0 refused"],
+      database: Some("database postgres://db/app · 3 operations · configured by --db"),
+      counts: { ..no_counts(), total: 3, isolated: 1, host: 2 } };
+  assert_eq(binding_lines(plain(), bound),
+            ["   host 2 of 3 · not cached",
+             "   binding host · 7 operations · b3:aabbccddeeff",
+             "   handshakes: 1 completed, 0 refused",
+             "   database postgres://db/app · 3 operations · configured by --db"]);
+  assert_eq(binding_lines(plain(), a_run([], [])), [])
+}
+
+test "a label is bare in a single-module run and qualified across several" {
+  let one = a_program([a_case(0, "same", "new")]);
+  let c = at(one.cases, 0, a_case(0, "", ""));
+  assert_eq(display_of(one, c), "same");
+  let two = { ..one, modules: [{ name: "alpha", file: "alpha.ply" },
+                               { name: "beta", file: "beta.ply" }] };
+  assert_eq(display_of(two, c), "m.same")
+}
+
+// A deadlock's cycle lives only in its secondary labels, so each is printed where it points.
+test "a failure's other labels are printed under it, each with its own place" {
+  let d = a_diag(b"E0414", b"these tasks are deadlocked",
+                 [{ module: 0, start: 0, end: 4, primary: true, text: b"here" },
+                  { module: 0, start: 5, end: 16, primary: false, text: b"waits on `b`" }], []);
+  assert_eq(at_lines(plain(), a_place(), d), ["    at m.ply:1:1"]);
+  assert_eq(secondary_lines(plain(), a_place(), d), ["    waits on `b`   m.ply:1:6"])
+}
+
+test "a bounded naive count makes the ratio a lower bound" {
+  let e: Explored = { explored: 12, exhaustive: false, exhausted: false,
+                      naive: Some({ explored: 4096, bounded: true, rendered: ">= 4096" }),
+                      reduction_tenths: Some(3413), steps: 8, virtual_time_ns: 0,
+                      failing_seed: None };
+  assert_eq(joined(search_parts(e), " · "),
+            "12 interleavings · naive >= 4096 · >= 341× reduction")
+}
+
+test "every reason has an explanation of its own" {
+  let lines = map(["new", "nondet", "previous failure", "cached", "unhashed"], why);
+  assert_eq(len(lines), 5);
+  assert_eq(len(filter(range(0, 5), |i: Int|
+              len(filter(range(0, 5), |j: Int| at(lines, i, "") == at(lines, j, ""))) == 1)),
+            5)
+}
+
+test "a load that refuses tallies its errors and binds nothing" {
+  let answer = refused(plain(), "test", [a_diag(b"E0201", b"type mismatch", [], [])], []);
+  assert_eq(answer.code, 2);
+  assert_eq(answer.errs, ["Error[E0201]: type mismatch", "   compilation failed (1 error)"])
+}
+
+test "a binding that does not match the program is a start-up failure naming no line" {
+  let answer = unbound(plain(), { diags: [a_diag(b"E0431", b"no database was configured", [], [])],
+                                  places: [] });
+  assert_eq(answer.code, 2);
+  assert_eq(answer.errs, ["Error[E0431]: no database was configured",
+                          "   no host handler was bound (1 error)"])
+}

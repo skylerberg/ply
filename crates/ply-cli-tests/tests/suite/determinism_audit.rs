@@ -184,7 +184,7 @@ fn running_a_test_alone_reports_what_it_reports_in_company() {
 #[test]
 fn a_warm_front_end_cache_does_not_change_an_interleaving() {
     let dir = project(CORPUS);
-    let cold = artifact(dir.path(), &["--no-incremental"]);
+    let cold = artifact(dir.path(), &[]);
     // Populate the front-end cache, then run against it.
     ply(dir.path()).args(["test", "--json"]).output().unwrap();
     let warm = artifact(dir.path(), &[]);
