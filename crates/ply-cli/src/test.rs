@@ -245,14 +245,14 @@ fn serve(args: &TestArgs, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>)
 
     // A query naming nothing is wrong whatever the run does, so it refuses before anything runs
     // rather than being reported after a suite the user did not ask for.
-    if let Some(query) = &args.mutate {
-        if let Err(diagnostic) = crate::commands::mutate::targets(&loaded, query) {
-            let _ = told.send(Step::Loaded(Box::new(Err(Refused {
-                diagnostics: vec![diagnostic],
-                sources: loaded.sources.clone(),
-            }))));
-            return;
-        }
+    if let Some(query) = &args.mutate
+        && let Err(diagnostic) = crate::commands::mutate::targets(&loaded, query)
+    {
+        let _ = told.send(Step::Loaded(Box::new(Err(Refused {
+            diagnostics: vec![diagnostic],
+            sources: loaded.sources.clone(),
+        }))));
+        return;
     }
 
     // Part of a simulated test's cache key, so decided before selection.
