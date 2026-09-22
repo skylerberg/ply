@@ -1241,6 +1241,7 @@ pub nondet effect fs {
   read  read_at[r](path: String, offset: Int, len: Int) -> Option<Bytes>
   read  list_dir[r](path: String) -> Option<List<String>>
   read  kind[r](path: String) -> Kind
+  read  resolved[r](path: String) -> Kind
   read  exists[r](path: String) -> Bool
   read  file_size[r](path: String) -> Option<Int>
   read  modified_ms[r](path: String) -> Option<Int>
@@ -1273,6 +1274,12 @@ time.
 
 `read_at` answers **what is there**, which may be less than was asked for: a
 range that runs past the end is short, and one that starts at or past the end is
+`kind` does not follow a symlink: it answers `Symlink` for one, so a walk that
+must not leave the root can refuse it. `resolved` follows, and answers what the
+path names at the end — `File`, `Dir` or `Missing`, never `Symlink`. Following
+cannot leave the root either way, because a path resolving outside it is refused
+before any operation runs.
+
 empty. That is deliberate, and the one place `std.fs` parts company with
 `bytes_slice`, which never clamps a range: a value's length is known and fixed,
 while a file's is neither, so a reader holding an offset it recorded earlier
