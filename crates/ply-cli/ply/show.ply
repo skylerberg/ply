@@ -1,0 +1,186 @@
+// `ply show` — one definition's text as its file holds it: the comment lines above it, its
+// `pub`, and its body through the end of its last line.
+
+import args (Flags, style_of)
+import program (Program, load_program, published, place_of, resolve_def, unknown_def, outside)
+import report (Answer, schema_version, ok_code, refused, reported)
+import compiler.front (Whole)
+import compiler.fmt (item_range)
+import compiler.infer (Loc)
+import compiler.items (Item, IType)
+import compiler.resolve (Diag, diag1, qualify)
+import std.fs (fs)
+import std.json (Str, Bool, Number, object)
+
+// A `fn` or a `type` the query named, and where the tree declares it.
+pub type Named = { name: String, simple: String, at: Loc }
+
+// One definition and the range of its file that holds it.
+pub type Shown = { name: String, simple: String, at: Loc, path: String, text: Bytes,
+                   start: Int, end: Int }
+
+pub fn source_of(shown: Shown) -> String =
+  string_of_bytes_lossy(bytes_slice(shown.text, shown.start, shown.end))
+
+// --- Naming a `type` ------------------------------------------------------------
+// No table of the checker's holds a `type` declaration, so it is read from the tree.
+
+type Lookup = | NoType | OneType(Named) | ManyTypes(List<String>)
+
+fn declared_types(w: Whole) -> List<Named> =
+  fold(range(0, len(w.mods)), [], |acc: List<Named>, i: Int|
+    match list_at(w.mods, i) {
+      None -> acc,
+      Some(mo) ->
+        fold(mo.module.items, acc, |a: List<Named>, it: Item|
+          match it {
+            IType(d) -> push(a, { name: string_of_bytes_lossy(qualify(mo.name, d.name.name)),
+                                  simple: string_of_bytes_lossy(d.name.name),
+                                  at: { module: i, span: d.span } }),
+            _ -> a,
+          }),
+    })
+
+fn type_named(w: Whole, query: String) -> Lookup = {
+  let all = declared_types(w);
+  let exact = fold(all, None, |acc: Option<Named>, t: Named|
+    match acc { Some(_) -> acc, None -> if t.name == query { Some(t) } else { None } });
+  match exact {
+    Some(t) -> OneType(t),
+    None -> {
+      let matching = filter(all, |t: Named| t.simple == query);
+      match list_at(matching, 0) {
+        None -> NoType,
+        Some(t) ->
+          if len(matching) == 1 { OneType(t) }
+          else { ManyTypes(map(matching, |x: Named| x.name)) },
+      }
+    },
+  }
+}
+
+fn commas(names: List<String>) -> String =
+  fold(range(0, len(names)), "", |acc: String, i: Int|
+    match list_at(names, i) { Some(n) -> if i == 0 { n } else { acc ++ ", " ++ n }, None -> acc })
+
+fn many_types(query: String, names: List<String>) -> Diag =
+  diag1(b"E0101", outside(), { start: 0, end: 0 },
+        bytes_of_string("`" ++ query ++ "` names " ++ int_to_string(len(names)) ++ " types"),
+        b"say which",
+        [bytes_of_string("one of: " ++ commas(names))])
+
+// --- Where the file holds it -------------------------------------------------------
+
+fn no_text(name: String, at: Loc) -> Diag =
+  diag1(b"E0505", at.module, at.span,
+        bytes_of_string("`" ++ name ++ "` has no source text"), b"declared here", [])
+
+fn unplaced(name: String, why: String, at: Loc) -> Diag =
+  diag1(b"E0101", at.module, at.span,
+        bytes_of_string("`" ++ name ++ "`: " ++ why), b"declared here", [])
+
+fn placed(p: Program, found: Named) -> Result<Shown, Diag> =
+  match place_of(p, found.at) {
+    None -> Err(no_text(found.name, found.at)),
+    Some(place) ->
+      match item_range(place.text, bytes_of_string(found.simple)) {
+        Err(why) -> Err(unplaced(found.name, string_of_bytes_lossy(why), found.at)),
+        Ok(r) -> Ok({ name: found.name, simple: found.simple, at: found.at, path: place.path,
+                      text: place.text, start: r.start, end: r.end }),
+      },
+  }
+
+// The `fn` or `type` the query names, by a program-wide name or a simple name unique in the
+// program, and where its file holds it.
+pub fn locate(p: Program, w: Whole, query: String) -> Result<Shown, Diag> =
+  match resolve_def(published(w), query) {
+    Ok(d) -> placed(p, { name: string_of_bytes_lossy(d.name),
+                         simple: string_of_bytes_lossy(d.simple_name), at: d.at }),
+    Err(names) ->
+      match type_named(w, query) {
+        OneType(t) -> placed(p, t),
+        ManyTypes(ns) -> Err(many_types(query, ns)),
+        NoType -> Err(unknown_def(query, names)),
+      },
+  }
+
+// --- The answer -------------------------------------------------------------------
+
+// The text as lines, since each is written with the newline that ended it.
+pub fn source_lines(text: String) -> List<String> = {
+  let parts = string_split(text, "\n");
+  let n = len(parts);
+  if n > 0 && match list_at(parts, n - 1) { Some(l) -> l == "", None -> false } {
+    fold(range(0, n - 1), [], |acc: List<String>, i: Int|
+      match list_at(parts, i) { Some(l) -> push(acc, l), None -> acc })
+  } else { parts }
+}
+
+pub fn answered(shown: Shown) -> Answer = {
+  let source = source_of(shown);
+  { json: object([{ key: "command", value: Str("show") },
+                  { key: "schema_version", value: Number(decimal_of_int(schema_version())) },
+                  { key: "ok", value: Bool(true) },
+                  { key: "exit_code", value: Number(decimal_of_int(ok_code())) },
+                  { key: "name", value: Str(shown.name) },
+                  { key: "file", value: Str(shown.path) },
+                  { key: "start", value: Number(decimal_of_int(shown.start)) },
+                  { key: "end", value: Number(decimal_of_int(shown.end)) },
+                  { key: "source", value: Str(source) }]),
+    lines: source_lines(source),
+    errs: [],
+    code: ok_code() }
+}
+
+pub fn run(flags: Flags) -> Answer
+  / {fs.kind[cwd], fs.list_dir[cwd], fs.read_file[cwd], fs.list_dir[shelf], fs.read_file[shelf]} = {
+  let loaded: Program = load_program(flags.paths);
+  let s = style_of(flags);
+  match loaded.whole {
+    None -> refused(s, "show", loaded.diags, loaded.places),
+    Some(w) ->
+      match locate(loaded, w, flags.query) {
+        Err(d) -> reported(s, "show", [d], loaded.places),
+        Ok(shown) -> answered(shown),
+      },
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_file() -> Bytes =
+  b"// The base.\nfn one() -> Int = 1\n\n// Doubles the base.\npub fn two() -> Int = one() + one()  // twice\n"
+
+fn shown_of(start: Int, end: Int) -> Shown =
+  { name: "m.two", simple: "two", at: { module: 0, span: { start: 54, end: 98 } }, path: "m.ply",
+    text: a_file(), start: start, end: end }
+
+test "the text shown is the item's range of its file, comment lines and all" {
+  match item_range(a_file(), b"two") {
+    Err(e) -> panic(string_of_bytes(e)),
+    Ok(r) -> assert_eq(source_of(shown_of(r.start, r.end)),
+                       "// Doubles the base.\npub fn two() -> Int = one() + one()  // twice\n"),
+  }
+}
+
+test "the text is written back as the lines it is made of, the last newline ending the last" {
+  assert_eq(source_lines("a\nb\n"), ["a", "b"]);
+  assert_eq(source_lines("a\nb"), ["a", "b"]);
+  assert_eq(source_lines("\n"), [""]);
+  assert_eq(source_lines(""), [])
+}
+
+test "the answer carries the byte range and the text, and exits 0" {
+  let answer = answered(shown_of(0, 13));
+  assert_eq(answer.code, 0);
+  assert_eq(answer.errs, []);
+  assert_eq(answer.lines, ["// The base."])
+}
+
+test "a query that names several types says which, and one that names nothing is `E0101`" {
+  let many = many_types("Shape", ["a.Shape", "b.Shape"]);
+  assert_eq(many.code, b"E0101");
+  assert_eq(many.message, b"`Shape` names 2 types");
+  assert_eq(many.notes_text, [b"one of: a.Shape, b.Shape"]);
+  assert_eq(unknown_def("Shape", []).code, b"E0101")
+}
