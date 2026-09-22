@@ -386,7 +386,7 @@ fn execute(
     // `ply` program performing this is inside a scope that zeroed the thread-local ones, and the
     // lookup prefers a thread-local to the process value. The diagnosis below evaluates hybrid
     // programs, so it is inside the same scope rather than beside it.
-    let (mut report, mutants) = ply_codegen::rt::with_step_budget(args.steps, || {
+    let (report, mutants) = ply_codegen::rt::with_step_budget(args.steps, || {
         ply_codegen::rt::with_time_budget(args.timeout, || {
             let mut run = || {
                 let mut executor = ply_test::InterpExecutor::new(&loaded.front)
@@ -876,7 +876,7 @@ struct BackendView {
     declined: u64,
     converted_in: u64,
     converted_out: u64,
-    units: Option<usize>,
+    units: Option<u64>,
     analysis_nanos: Option<u64>,
     codegen_nanos: Option<u64>,
 }
@@ -900,7 +900,7 @@ struct SearchView {
     naive: Option<(u64, bool, String)>,
     reduction_tenths: Option<i64>,
     steps: u64,
-    virtual_time_ns: u64,
+    virtual_time_ns: i64,
     failing_seed: Option<String>,
 }
 
@@ -1439,7 +1439,7 @@ fn search_value(search: &SearchView) -> PlyValue {
             option(search.reduction_tenths.map(PlyValue::Int)),
         ),
         ("steps", tally(search.steps)),
-        ("virtual_time_ns", tally(search.virtual_time_ns)),
+        ("virtual_time_ns", PlyValue::Int(search.virtual_time_ns)),
         (
             "failing_seed",
             option(search.failing_seed.as_deref().map(PlyValue::str)),
