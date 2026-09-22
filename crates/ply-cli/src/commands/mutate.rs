@@ -310,7 +310,7 @@ where
     }
     report.generated = queue.len();
     queue.sort_by_key(|(reached, _)| reached.len());
-    let scratch = super::test::Cache::scratch();
+    let scratch = crate::test::Cache::scratch();
     let Ok(mut scratch) = scratch else {
         return report;
     };
@@ -401,7 +401,7 @@ pub fn to_json(report: &Report, loaded: &Loaded) -> Value {
                     "definition": j.mutant.definition.as_str(),
                     "from": j.mutant.from,
                     "to": j.mutant.to,
-                    "location": super::test::location_json(&loaded.sources, j.mutant.span),
+                    "location": crate::test::location_json(&loaded.sources, j.mutant.span),
                     "tests": j.tests.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
                     "why": match &j.verdict {
                         Verdict::Skipped(why) | Verdict::Unresolved(why) => Value::String((*why).to_string()),
