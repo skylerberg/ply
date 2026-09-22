@@ -1,0 +1,131 @@
+// Which definition a run enters, and what a program that declares no `main`, or two, says about
+// it. `ply build` with no `--entry` takes the same answer, so it is answered here once.
+
+import compiler.resolve (Diag, Label, diag)
+import report (count_of)
+
+// Where a definition is written, as a label points at it.
+pub type At = { module: Int, start: Int, end: Int }
+
+// One definition named `main`, with the file its module was read from.
+pub type Main = { name: String, module: String, path: String, at: At }
+
+// One module the load read, and the empty position at the end of its file: where the entry point
+// it does not declare would be written.
+pub type Module = { name: String, path: String, at: At }
+
+// The module index a span outside every module carries.
+pub fn no_module() -> Int = 4294967295
+
+pub fn nowhere() -> At = { module: no_module(), start: 0, end: 0 }
+
+pub fn marked(a: At, primary: Bool, text: Bytes) -> Label =
+  { module: a.module, start: a.start, end: a.end, primary: primary, text: text }
+
+fn commas(names: List<String>) -> String =
+  fold(range(0, len(names)), "", |acc: String, i: Int|
+    match list_at(names, i) { Some(n) -> if i == 0 { n } else { acc ++ ", " ++ n }, None -> acc })
+
+fn advice() -> Bytes = b"`ply test` runs the tests; `ply run` runs `main`"
+
+fn added_to(module: String) -> Bytes =
+  bytes_of_string("add `fn main() -> Unit = ...` to `" ++ module ++ "`")
+
+fn lonely(only: Module) -> Diag =
+  diag(b"E0101", b"no `main` to run",
+       [marked(only.at, true, bytes_of_string("`" ++ only.name ++ "` declares no entry point"))],
+       [advice(), added_to(only.name)])
+
+// Labelling one file of several would be picking by load order, which is the thing two `main`s
+// are refused for.
+fn searched(modules: List<Module>) -> Diag =
+  diag(b"E0101", b"no `main` to run", [],
+       [advice(),
+        b"add `fn main() -> Unit = ...` to one of the loaded modules",
+        bytes_of_string("modules loaded: " ++ commas(map(modules, |m: Module| m.name)))])
+
+fn no_main(modules: List<Module>) -> Diag =
+  match list_at(modules, 0) {
+    Some(only) -> if len(modules) == 1 { lonely(only) } else { searched(modules) },
+    None -> searched(modules),
+  }
+
+fn declarations(mains: List<Main>) -> List<Label> =
+  fold(mains, [], |acc: List<Label>, m: Main|
+    push(acc, marked(m.at, len(acc) == 0,
+                     bytes_of_string("`" ++ m.module ++ "` declares `main` here"))))
+
+fn ambiguous_main(mains: List<Main>) -> Diag =
+  diag(b"E0112",
+       bytes_of_string(count_of(len(mains), "module") ++ " declare `main`"),
+       declarations(mains),
+       push(map(mains, |m: Main| bytes_of_string("run it with `ply run " ++ m.path ++ "`")),
+            b"a directory is a whole program, so `ply run` will not pick one for you"))
+
+// Every name already resolves, so a missing `main` is a missing entry point.
+pub fn entry_point(mains: List<Main>, modules: List<Module>) -> Result<Main, Diag> =
+  match list_at(mains, 0) {
+    None -> Err(no_main(modules)),
+    Some(only) -> if len(mains) == 1 { Ok(only) } else { Err(ambiguous_main(mains)) },
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_main(module: String) -> Main =
+  { name: module ++ ".main", module: module, path: module ++ ".ply",
+    at: { module: 0, start: 3, end: 7 } }
+
+fn a_module(name: String, index: Int, end: Int) -> Module =
+  { name: name, path: name ++ ".ply", at: { module: index, start: end, end: end } }
+
+fn first_label(d: Diag) -> Label =
+  match list_at(d.labels, 0) { Some(l) -> l, None -> marked(nowhere(), false, b"") }
+
+test "the one `main` a program declares is its entry point" {
+  let one = [a_main("app")];
+  assert_eq(entry_point(one, [a_module("app", 0, 40)]), Ok(a_main("app")))
+}
+
+test "a program with no `main` is pointed at the end of its one file" {
+  match entry_point([], [a_module("m", 0, 40)]) {
+    Ok(_) -> panic("no definition named `main` is no entry point"),
+    Err(d) -> {
+      assert_eq(d.code, b"E0101");
+      assert_eq(d.message, b"no `main` to run");
+      assert_eq(len(d.labels), 1);
+      assert_eq(first_label(d).start, 40);
+      assert_eq(first_label(d).end, 40);
+      assert_eq(d.notes_text, [b"`ply test` runs the tests; `ply run` runs `main`",
+                               b"add `fn main() -> Unit = ...` to `m`"])
+    },
+  }
+}
+
+test "a program of several modules with no `main` labels none of them and lists them all" {
+  match entry_point([], [a_module("a", 0, 18), a_module("b", 1, 18)]) {
+    Ok(_) -> panic("no definition named `main` is no entry point"),
+    Err(d) -> {
+      assert_eq(d.code, b"E0101");
+      assert_eq(d.labels, []);
+      assert_eq(d.notes_text, [b"`ply test` runs the tests; `ply run` runs `main`",
+                               b"add `fn main() -> Unit = ...` to one of the loaded modules",
+                               b"modules loaded: a, b"])
+    },
+  }
+}
+
+test "two modules that declare `main` are reported rather than resolved by load order" {
+  let both = [a_main("one"), a_main("two")];
+  match entry_point(both, [a_module("one", 0, 20), a_module("two", 1, 20)]) {
+    Ok(_) -> panic("two definitions named `main` is not one entry point"),
+    Err(d) -> {
+      assert_eq(d.code, b"E0112");
+      assert_eq(d.message, b"2 modules declare `main`");
+      assert_eq(len(d.labels), 2);
+      assert_eq(first_label(d).primary, true);
+      assert_eq(d.notes_text, [b"run it with `ply run one.ply`",
+                               b"run it with `ply run two.ply`",
+                               b"a directory is a whole program, so `ply run` will not pick one for you"])
+    },
+  }
+}

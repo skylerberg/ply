@@ -27,6 +27,7 @@ pub const PROGRAM_SOURCES: &[(&str, &str)] = &[
     ("defs", include_str!("../ply/defs.ply")),
     ("diagnostic", include_str!("../ply/diagnostic.ply")),
     ("doc", include_str!("../ply/doc.ply")),
+    ("entry", include_str!("../ply/entry.ply")),
     ("explain", include_str!("../ply/explain.ply")),
     ("fmt", include_str!("../ply/fmt.ply")),
     ("hashes", include_str!("../ply/hashes.ply")),
@@ -34,6 +35,7 @@ pub const PROGRAM_SOURCES: &[(&str, &str)] = &[
     ("ply", include_str!("../ply/ply.ply")),
     ("program", include_str!("../ply/program.ply")),
     ("report", include_str!("../ply/report.ply")),
+    ("run", include_str!("../ply/run.ply")),
     ("signature", include_str!("../ply/signature.ply")),
     ("sources", include_str!("../ply/sources.ply")),
     ("style", include_str!("../ply/style.ply")),
@@ -296,7 +298,8 @@ fn build_in(dir: &Path) -> Result<Vec<u8>, Diagnostic> {
             None => "it does not check, and nothing said why".to_string(),
         })
     })?;
-    let entry = crate::commands::run::entry_point(&loaded)
+    let entry = loaded
+        .sole_entry_point()
         .map_err(|d| unbuilt(format!("{} [{}]", d.message, d.code)))?;
     // With its notes: a refusal here states the symptom and carries the reason in a note, so
     // dropping them leaves a reader the one thing that cannot be acted on.
