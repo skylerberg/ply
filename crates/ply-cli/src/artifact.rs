@@ -492,7 +492,7 @@ pub fn build(
     out.names.sort();
     out.names.dedup();
 
-    out.closure = closure_texts(&out)?;
+    out.closure = closure_texts(&out, front)?;
     // Reopened as a target opens it, so an artifact that builds is one that opens.
     let opened = reopen(&out).map_err(|diags| vec![unreopened(&diags)])?;
     let names: Vec<&str> = out.names.iter().map(|(n, _)| n.as_str()).collect();
@@ -510,12 +510,34 @@ pub fn build(
     })
 }
 
-fn closure_texts(artifact: &Artifact) -> Result<Vec<(String, String)>, Vec<Diagnostic>> {
+/// Whether the module that holds `name` exports it; a prelude effect has no entry and is public.
+fn exports(front: &Front, name: &str) -> bool {
+    let symbol = Symbol::new(name);
+    if let Some(written) = front.defs_written.get(&symbol) {
+        return written.vis.is_public();
+    }
+    if let Some(declared) = front.types.get(&symbol) {
+        return declared.vis.is_public();
+    }
+    front
+        .effects_written
+        .get(&symbol)
+        .is_none_or(|vis| vis.is_public())
+}
+
+fn closure_texts(
+    artifact: &Artifact,
+    front: &Front,
+) -> Result<Vec<(String, String)>, Vec<Diagnostic>> {
     let bodies: Vec<&[u8]> = artifact.bodies.values().map(StoredBody::as_bytes).collect();
-    let names: Vec<(&str, DefHash)> = artifact
+    let names: Vec<ply_codegen::c::producer::PrintedName<'_>> = artifact
         .names
         .iter()
-        .map(|(name, hash)| (name.as_str(), *hash))
+        .map(|(name, hash)| ply_codegen::c::producer::PrintedName {
+            name: name.as_str(),
+            hash: *hash,
+            public: exports(front, name),
+        })
         .collect();
     let shipped: BTreeSet<&str> = artifact
         .names
