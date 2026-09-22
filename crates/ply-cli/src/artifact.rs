@@ -1036,7 +1036,10 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
     if let Some(front) = cached_front(&filed, &mut ids, &mut sources) {
         return entered(artifact, sources, front);
     }
-    let answered = ask_the_port(&own, &mut ids, &mut sources)?;
+    let answered = match ask_the_port(&own, &mut ids, &mut sources) {
+        Ok(answered) => answered,
+        Err(diags) => return Err(over_printed(diags, &sources)),
+    };
     let front = answered.front;
 
     let hashes = &front.hashes;
@@ -1504,20 +1507,41 @@ fn unfaithful(message: String) -> Diagnostic {
     Diagnostic::error(codes::ARTIFACT_INVALID, message)
 }
 
+/// A refusal over text no caller holds. The spans point into the closure printed a moment ago, so
+/// this is the only place they mean anything; rendered here, the reason survives as a note.
+fn over_printed(diags: Vec<Diagnostic>, sources: &SourceMap) -> Vec<Diagnostic> {
+    diags
+        .into_iter()
+        .map(|d| {
+            let shown = ply_span::render::to_terminal(&d, sources, false);
+            d.note(shown.trim_end().to_string())
+        })
+        .collect()
+}
+
 fn first_of(diags: &[Diagnostic]) -> String {
     diags.first().map_or_else(
         || "no reason was given".to_string(),
-        |d| format!("{}: {}", d.code, d.message),
+        |d| match d.labels.iter().find(|l| l.primary && !l.message.is_empty()) {
+            Some(l) => format!("{}: {} ({})", d.code, d.message, l.message),
+            None => format!("{}: {}", d.code, d.message),
+        },
     )
 }
 
 fn unreopened(diags: &[Diagnostic]) -> Diagnostic {
-    Diagnostic::error(
+    let named = Diagnostic::error(
         codes::INTERNAL_ERROR,
         "the closure printed back to source does not open as the program it was printed from",
     )
-    .note(first_of(diags))
-    .note("this is Ply's fault, not the program's, and nothing was built")
+    .note(first_of(diags));
+    diags
+        .first()
+        .map(|d| d.notes.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .fold(named, |out, note| out.note(note.clone()))
+        .note("this is Ply's fault, not the program's, and nothing was built")
 }
 
 fn version(path: &Path, message: impl Into<String>) -> Diagnostic {
