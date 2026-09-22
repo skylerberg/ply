@@ -314,7 +314,7 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
             &Plan::default(),
             &ply_test::Engine::Evaluator,
         );
-        ply_cli::commands::test::Plan::new(bare, &loaded.check, None, std_tests)
+        ply_cli::test::Plan::new(bare, &loaded.check, None, std_tests)
     };
 
     let visible = plan_of(&mut store).visible;
