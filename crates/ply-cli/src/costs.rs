@@ -35,6 +35,18 @@ struct Report {
     defs: Vec<Definition>,
 }
 
+/// A `reuse fn` whose promise the cost checker cannot show stops the run, as under `ply check`.
+pub fn broken_promises(loaded: &Loaded) -> Option<crate::load::LoadError> {
+    if !loaded.promised {
+        return None;
+    }
+    let diagnostics = promises(loaded);
+    (!diagnostics.is_empty()).then(|| crate::load::LoadError {
+        sources: loaded.sources.clone(),
+        diagnostics,
+    })
+}
+
 /// Each `reuse fn`'s appends must reuse, except onto its own parameter; else E0127.
 pub fn promises(loaded: &Loaded) -> Vec<Diagnostic> {
     if !loaded.promised {
