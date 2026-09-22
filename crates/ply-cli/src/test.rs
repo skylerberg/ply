@@ -382,10 +382,13 @@ fn execute(
         ply_test::Search::of(&plan.selection).measuring(args.simulation.measure_reduction);
     // A factory: a reactor belongs to its thread, and each worker builds its own machine.
     let runtime = hosts.runtime_factory();
-    // The budgets a test is given are set on the thread it is measured on and nowhere else: the
-    // `ply` program performing this is inside a scope that zeroed the thread-local ones, and the
-    // lookup prefers a thread-local to the process value. The diagnosis below evaluates hybrid
-    // programs, so it is inside the same scope rather than beside it.
+    // A pooled test is measured on a worker thread of rayon's, which holds no thread-local budget
+    // and reads the process's, so the process's is what bounds a run. The diagnosis and the
+    // mutation below are measured on this thread, which sits inside the scope the `ply` program
+    // was entered under -- one that zeroed the thread-local budgets -- and the lookup prefers a
+    // thread-local to the process value, so those two need the scope as well as the setters.
+    ply_codegen::rt::set_step_budget(args.steps);
+    ply_codegen::rt::set_time_budget(args.timeout);
     let (report, mutants) = ply_codegen::rt::with_step_budget(args.steps, || {
         ply_codegen::rt::with_time_budget(args.timeout, || {
             let mut run = || {
