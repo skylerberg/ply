@@ -1,4 +1,5 @@
-//! The `time` effect: a wall-clock reading and a monotonic one, both of the host's real time.
+//! The `time` effect: a wall-clock reading, a monotonic one and a wait, all of the host's real
+//! time.
 
 use ply_eval::host::HostRegistry;
 use ply_eval::{
@@ -7,7 +8,7 @@ use ply_eval::{
 };
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The Ply declaration the registrations below are checked against.
 pub const DECLARATION: &str = ply_std::TIME;
@@ -20,15 +21,17 @@ pub const EFFECT: &str = "std.time.time";
 pub enum Op {
     NowMs,
     ElapsedMs,
+    SleepMs,
 }
 
 impl Op {
-    pub const ALL: [Op; 2] = [Op::NowMs, Op::ElapsedMs];
+    pub const ALL: [Op; 3] = [Op::NowMs, Op::ElapsedMs, Op::SleepMs];
 
     pub fn name(self) -> &'static str {
         match self {
             Op::NowMs => "now_ms",
             Op::ElapsedMs => "elapsed_ms",
+            Op::SleepMs => "sleep_ms",
         }
     }
 
@@ -36,6 +39,7 @@ impl Op {
         match self {
             Op::NowMs => "`time.now_ms`",
             Op::ElapsedMs => "`time.elapsed_ms`",
+            Op::SleepMs => "`time.sleep_ms`",
         }
     }
 
@@ -43,6 +47,15 @@ impl Op {
         match self {
             Op::NowMs => "ply_host::time::now_ms",
             Op::ElapsedMs => "ply_host::time::elapsed_ms",
+            Op::SleepMs => "ply_host::time::sleep_ms",
+        }
+    }
+
+    /// What the declaration in `std.time` gives the operation, which inference has already checked.
+    pub fn arity(self) -> usize {
+        match self {
+            Op::NowMs | Op::ElapsedMs => 0,
+            Op::SleepMs => 1,
         }
     }
 
@@ -52,8 +65,13 @@ impl Op {
             op: Symbol::new(self.name()),
             resource: HostResource::Any,
             determinism: Determinism::Nondeterministic,
-            // A reading consumes nothing, so a continuation may cross one more than once.
-            linearity: Linearity::Repeatable,
+            linearity: match self {
+                // A reading consumes nothing, so a continuation may cross one more than once.
+                Op::NowMs | Op::ElapsedMs => Linearity::Repeatable,
+                // A wait crossed twice waits twice, as a line written twice is written twice.
+                Op::SleepMs => Linearity::AtMostOnce,
+            },
+            // The thread that performs the wait is the one that owes it: nothing is dispatched.
             blocking: false,
             secrets: false,
             path: self.path(),
@@ -92,6 +110,12 @@ impl TimeHost {
     pub fn elapsed_ms(&self) -> i64 {
         i64::try_from(self.started.elapsed().as_millis()).unwrap_or(i64::MAX)
     }
+
+    /// Parks this thread for `ms`; a span no clock can run backwards over, so a negative one is no
+    /// wait at all rather than a refusal.
+    pub fn sleep_ms(&self, ms: i64) {
+        std::thread::sleep(Duration::from_millis(u64::try_from(ms).unwrap_or(0)));
+    }
 }
 
 pub fn registrations(time: &Arc<TimeHost>) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
@@ -120,13 +144,17 @@ struct Operation {
 
 impl HostHandler for Operation {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
-        if !req.args.is_empty() {
+        if req.args.len() != self.op.arity() {
             return Err(arity(self.op, req.args.len(), req.span));
         }
-        Ok(HostAnswer::Value(Value::Int(match self.op {
-            Op::NowMs => self.time.now_ms(),
-            Op::ElapsedMs => self.time.elapsed_ms(),
-        })))
+        Ok(HostAnswer::Value(match self.op {
+            Op::NowMs => Value::Int(self.time.now_ms()),
+            Op::ElapsedMs => Value::Int(self.time.elapsed_ms()),
+            Op::SleepMs => {
+                self.time.sleep_ms(req.args[0].as_int(req.span, "a wait")?);
+                Value::Unit
+            }
+        }))
     }
 }
 
@@ -135,8 +163,9 @@ fn arity(op: Op, got: usize, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
         format!(
-            "{} was performed with {got} argument(s) and takes none",
-            op.what()
+            "{} was performed with {got} argument(s) and takes {}",
+            op.what(),
+            op.arity()
         ),
     )
     .primary(span, "this perform reached the host handler")
