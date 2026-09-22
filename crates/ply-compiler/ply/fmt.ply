@@ -435,16 +435,31 @@ fn op_text(op: Bytes) -> Bytes = {
 
 fn unary_text(op: Bytes) -> Bytes = if op == b"neg" { b"-" } else if op == b"not" { b"!" } else { b"~" }
 
-// A binary operand: a looser operator, the same one on the right, or a lambda, whose body would swallow the rest.
-fn parens_operand(e: Expr, parent: Bytes, rhs: Bool) -> Bool =
+// A form with no closer of its own to read: where it ends is worked out rather than seen.
+fn runs_on(e: Expr) -> Bool =
   match e {
-    EBinary(v) -> bp(v.op) < bp(parent) || (bp(v.op) == bp(parent) && rhs),
     ELambda(_) -> true,
+    EIf(_) -> true,
+    EMatch(_) -> true,
+    EHandle(_) -> true,
+    EWithCell(_) -> true,
+    ESimulate(_) -> true,
     _ -> false,
   }
 
+// A binary operand: a looser operator, the same one on the right, `&&` under `||`, or a form that
+// runs on. The brackets `&&` binding tighter than `||` makes redundant are still written, so what
+// an edit to one of them would mean is read rather than recalled.
+fn parens_operand(e: Expr, parent: Bytes, rhs: Bool) -> Bool =
+  match e {
+    EBinary(v) ->
+      bp(v.op) < bp(parent) || (bp(v.op) == bp(parent) && rhs)
+        || (v.op == b"and" && parent == b"or"),
+    _ -> runs_on(e),
+  }
+
 fn parens_unary(e: Expr) -> Bool =
-  match e { EBinary(_) -> true, EUnary(_) -> true, ELambda(_) -> true, _ -> false }
+  match e { EBinary(_) -> true, EUnary(_) -> true, _ -> runs_on(e) }
 
 // What a call, a field read or `?` may follow without parentheses.
 fn parens_postfix(e: Expr) -> Bool =
@@ -609,9 +624,14 @@ fn flat_len(p: Pr, e: Expr) -> Int = match flat_expr(p, e) { Some(f) -> bytes_le
 // --- Expressions, broken across lines --------------------------------------
 
 // `indent` is where this node's continuation lines go; `after` is what follows it on its last line.
+fn expr(p: Pr, st: St, e: Expr, indent: Int, after: Int) -> St =
+  laid(p, st, e, indent, indent + 2, after)
+
+// `cont` is where a broken operator chain puts its lines: one level in from where the chain began,
+// and that level however its operators nest, so a wrapped chain does not step rightwards.
 // A node that starts mid-line with comments before it moves to a line of its own, one level in,
 // which is where a second pass finds it again.
-fn expr(p: Pr, st: St, e: Expr, indent: Int, after: Int) -> St = {
+fn laid(p: Pr, st: St, e: Expr, indent: Int, cont: Int, after: Int) -> St = {
   let sp = expr_span(e);
   if st.col > indent && comment_before(p, st, sp.start) {
     expr(p, nl(st, indent + 2, false), e, indent + 2, after)
@@ -619,7 +639,7 @@ fn expr(p: Pr, st: St, e: Expr, indent: Int, after: Int) -> St = {
     let s0 = lead(p, st, sp.start, indent);
     let s1 = match try_flat(p, s0, flat_expr(p, e), sp.end, after) {
       Some(f) -> emit(s0, f),
-      None -> broken(p, s0, e, indent, after),
+      None -> broken(p, s0, e, indent, cont, after),
     };
     absorb(p, s1, sp.end)
   }
@@ -632,15 +652,23 @@ fn operand(p: Pr, st: St, e: Expr, parens: Bool, indent: Int, after: Int) -> St 
 fn scrutinee(p: Pr, st: St, e: Expr, indent: Int, after: Int) -> St =
   operand(p, st, e, starts_with_brace(e), indent, after)
 
-fn broken(p: Pr, st: St, e: Expr, indent: Int, after: Int) -> St =
+// The operator opens every line of a broken chain after the first, and each of them sits at `cont`,
+// whether what nests there is a tighter operator or a bracketed group.
+fn chain(p: Pr, st: St, lhs: Expr, op: Bytes, rhs: Expr, cont: Int, after: Int) -> St = {
+  let s1 = chain_operand(p, st, lhs, parens_operand(lhs, op, false), cont, 0);
+  let s2 = emit(nl(s1, cont, false), bytes_concat(op_text(op), b" "));
+  chain_operand(p, s2, rhs, parens_operand(rhs, op, true), cont, after)
+}
+
+fn chain_operand(p: Pr, st: St, e: Expr, parens: Bool, cont: Int, after: Int) -> St =
+  if parens { emit(laid(p, emit(st, b"("), e, cont, cont, after + 1), b")") }
+  else { laid(p, st, e, cont, cont, after) }
+
+fn broken(p: Pr, st: St, e: Expr, indent: Int, cont: Int, after: Int) -> St =
   match e {
     ELit(v) -> emit(st, lit_text(p, v.span, v.lit)),
     EVar(v) -> emit(st, qname_text(v.name)),
-    EBinary(v) -> {
-      let s1 = operand(p, st, v.lhs, parens_operand(v.lhs, v.op, false), indent, 0);
-      let s2 = emit(nl(s1, indent + 2, false), bytes_concat(op_text(v.op), b" "));
-      operand(p, s2, v.rhs, parens_operand(v.rhs, v.op, true), indent + 2, after)
-    },
+    EBinary(v) -> chain(p, st, v.lhs, v.op, v.rhs, cont, after),
     EUnary(v) -> operand(p, emit(st, unary_text(v.op)), v.operand, parens_unary(v.operand), indent, after),
     ELambda(v) -> lambda(p, st, v.params, v.ret, v.body, indent, after),
     EApp(v) -> {
@@ -648,7 +676,7 @@ fn broken(p: Pr, st: St, e: Expr, indent: Int, after: Int) -> St =
       let s1 = operand(p, st, v.func, parens_callee(v.func), indent, 1 + bytes_len(ls));
       call(p, emit(s1, ls), v.args, v.named, v.span, indent, after)
     },
-    EIf(_) -> if_chain(p, st, e, indent),
+    EIf(_) -> if_chain(p, st, e, indent, after),
     EMatch(v) -> match_expr(p, st, v.scrutinee, v.arms, v.span, indent),
     EBlock(_) -> block(p, st, e, indent),
     ERecord(v) ->
@@ -807,18 +835,52 @@ fn record(p: Pr, st: St, base: Option<Expr>, fields: List<RecField>, sp: Span, i
   close(p, s3, sp.end, indent, b"}")
 }
 
-fn if_chain(p: Pr, st: St, e: Expr, indent: Int) -> St =
+// A printed branch and whether its body had to open a block rather than stay on the branch's line.
+type Branch = { opened: Bool, st: St }
+
+fn branch(p: Pr, st: St, e: Expr, indent: Int, after: Int) -> Branch = {
+  let sp = expr_span(e);
+  match try_flat(p, st, flat_expr(p, e), sp.end, after) {
+    Some(f) -> { opened: false, st: emit(st, f) },
+    None -> { opened: true, st: block(p, st, e, indent) },
+  }
+}
+
+// The line an `else` would open: a further `if` down to its own branch, or the branch alone.
+fn else_head(p: Pr, e: Expr) -> Option<Bytes> =
+  match e {
+    EIf(v) ->
+      cat([Some(b"if "), flat_scrutinee(p, v.cond), Some(b" "), flat_expr(p, v.then_branch)]),
+    _ -> flat_expr(p, e),
+  }
+
+// `else` opens a line of its own between two branches that each stay on one, so a chain of short
+// branches reads one to a line; a branch that opened a block takes the keyword onto its brace's
+// line, on whichever side of it that branch is. Comments above the `else` keep their lines above it
+// rather than landing inside the branch that follows, which is not where a second pass finds them.
+fn otherwise(p: Pr, b: Branch, e: Expr, indent: Int) -> St = {
+  let start = expr_span(e).start;
+  let alone = !b.opened
+    && (match else_head(p, e) { Some(f) -> indent + 5 + bytes_len(f) <= width(), None -> false });
+  if comment_before(p, b.st, start) { emit(open_line(p, b.st, start, indent, false), b"else ") }
+  else if alone { emit(nl(b.st, indent, false), b"else ") }
+  else { emit(b.st, b" else ") }
+}
+
+// A chain the width forced open, one branch to a line.
+fn if_chain(p: Pr, st: St, e: Expr, indent: Int, after: Int) -> St =
   match e {
     EIf(v) -> {
       let s1 = scrutinee(p, emit(st, b"if "), v.cond, indent + 2, 2);
-      let s2 = block(p, emit(s1, b" "), v.then_branch, indent);
-      match v.else_branch {
-        ELit(_) -> s2,
-        EIf(_) -> if_chain(p, emit(s2, b" else "), v.else_branch, indent),
-        _ -> block(p, emit(s2, b" else "), v.else_branch, indent),
+      let b = branch(p, emit(s1, b" "), v.then_branch, indent, 0);
+      let o = v.else_branch;
+      match o {
+        ELit(_) -> b.st,
+        EIf(_) -> if_chain(p, otherwise(p, b, o, indent), o, indent, after),
+        _ -> branch(p, otherwise(p, b, o, indent), o, indent, after).st,
       }
     },
-    _ -> expr(p, st, e, indent, 0),
+    _ -> expr(p, st, e, indent, after),
   }
 
 fn match_expr(p: Pr, st: St, scrut: Expr, arms: List<MatchArm>, sp: Span, indent: Int) -> St = {
@@ -1348,6 +1410,53 @@ test "a call past the width breaks one argument per line, and a lambda hugs the 
             b"fn g(xs: List<Int>) -> Int =\n  fold(xs, 0, |acc: Int, x: Int|\n    if x > acc { acc + x * x * x * x * x * x * x * x * x * x } else { acc - x })\n");
   assert(stable(long));
   assert(stable(hug))
+}
+
+test "a chain past the width keeps every line it opens at one level, however its operators nest" {
+  let src = bytes_concat(b"fn ordered(a: Int, b: Int, c: Int) -> Bool =\n  first_reading(a, b) || ",
+    b"(second_reading(a, b) && (third_reading(b, c) || (fourth_reading(b, c) && fifth_reading(a, c))))\n");
+  assert_eq(formatted(src),
+    bytes_concat(b"fn ordered(a: Int, b: Int, c: Int) -> Bool =\n  first_reading(a, b)\n    || (second_reading(a, b)\n",
+                 b"    && (third_reading(b, c) || (fourth_reading(b, c) && fifth_reading(a, c))))\n"));
+  assert(stable(src))
+}
+
+test "`&&` under `||`, and a form that runs on, are bracketed wherever an operator bounds them" {
+  let src = bytes_concat(b"fn holds(x: Option<Int>, n: Int) -> Bool =\n",
+    b"  n > 0 || n < 0 && match x { Some(k) -> k > n, None -> false }\n");
+  assert_eq(formatted(src),
+    bytes_concat(b"fn holds(x: Option<Int>, n: Int) -> Bool =\n",
+                 b"  n > 0 || (n < 0 && (match x { Some(k) -> k > n, None -> false }))\n"));
+  assert_eq(formatted(b"fn kept(n: Int) -> Bool = !(n > 0) && n + 1 > 0 || n == 0\n"),
+            b"fn kept(n: Int) -> Bool = (!(n > 0) && n + 1 > 0) || n == 0\n");
+  assert(stable(src))
+}
+
+test "an `if` chain past the width takes one branch to a line, its body on that line while it fits" {
+  let src = bytes_concat(b"fn pick(n: Int) -> Bytes =\n  if n == 0 { b\"zero\" } else if n == 1 { b\"one\" } ",
+    b"else if n == 2 { b\"two\" } else if n == 3 { b\"three\" } else { b\"many\" }\n");
+  assert_eq(formatted(src),
+    bytes_concat(b"fn pick(n: Int) -> Bytes =\n  if n == 0 { b\"zero\" }\n  else if n == 1 { b\"one\" }\n",
+                 b"  else if n == 2 { b\"two\" }\n  else if n == 3 { b\"three\" }\n  else { b\"many\" }\n"));
+  assert(stable(src));
+  // A branch that has to open a block takes the `else` on either side of it onto its brace's line.
+  let wide = bytes_concat(b"fn pick(n: Int, xs: List<Int>) -> Bytes =\n  if n == 0 { b\"zero\" } else if n == 1 { b\"one\" } ",
+    b"else if n == 2 { let m = fold(xs, 0, |acc: Int, x: Int| acc + x); b\"two\" } else { b\"many\" }\n");
+  assert_eq(formatted(wide),
+    bytes_concat_all([b"fn pick(n: Int, xs: List<Int>) -> Bytes =\n  if n == 0 { b\"zero\" }\n",
+                      b"  else if n == 1 { b\"one\" } else if n == 2 {\n",
+                      b"    let m = fold(xs, 0, |acc: Int, x: Int| acc + x);\n    b\"two\"\n",
+                      b"  } else { b\"many\" }\n"]));
+  assert(stable(wide))
+}
+
+// Absorbed into the branch that followed it, the comment came back above a different `else` on the
+// next pass, so formatting twice was not formatting once.
+test "a comment written above an `else` keeps its line above it" {
+  let src = bytes_concat(b"fn pick(n: Int) -> Bytes =\n  if n == 0 { b\"zero\" }\n  else if n == 1 { b\"one\" }\n",
+                         b"  // the rest are the same\n  else { b\"many\" }\n");
+  assert_eq(formatted(src), src);
+  assert(stable(src))
 }
 
 test "every item kind prints back to the same tree" {
