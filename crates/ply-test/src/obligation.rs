@@ -97,16 +97,6 @@ impl Reason {
     pub fn hit(self) -> bool {
         matches!(self, Reason::Proved | Reason::Sampled)
     }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Reason::New => "new",
-            Reason::Proved => "cached proof",
-            Reason::Sampled => "cached sample",
-            Reason::Uncached => "uncached",
-            Reason::Refused => "cache refused",
-        }
-    }
 }
 
 pub struct Answer {
@@ -553,16 +543,6 @@ pub enum Moved {
     Never,
 }
 
-impl Moved {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Moved::Unchanged => "unchanged",
-            Moved::Changed => "changed",
-            Moved::Never => "never reviewed",
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Reviewed {
     pub name: Symbol,
@@ -611,48 +591,6 @@ impl ReviewReport {
 
     pub fn unspecified(&self) -> usize {
         self.changed.len() - self.specified()
-    }
-
-    pub fn headline(&self) -> String {
-        if self.changed.is_empty() {
-            return "no definition changed since the last accepted review".to_string();
-        }
-        let changed = self.changed.len();
-        let unspecified = self.unspecified();
-        let claim = if self.broken > 0 && self.broken == self.undischarged {
-            // Never discharged is not "no longer holds": nothing established it in the first place.
-            format!(
-                "{} obligation{} on a changed definition {} not discharged, so nothing here was established",
-                self.broken,
-                if self.broken == 1 { "" } else { "s" },
-                if self.broken == 1 { "was" } else { "were" }
-            )
-        } else if self.broken > 0 {
-            format!(
-                "{} obligation{} on a changed definition no longer hold",
-                self.broken,
-                if self.broken == 1 { "" } else { "s" }
-            )
-        } else if self.specified() == 0 {
-            "no specified behaviour changed".to_string()
-        } else {
-            format!(
-                "no specified behaviour changed: every obligation on the {} specified of them still holds",
-                self.specified()
-            )
-        };
-        if unspecified == 0 {
-            return claim;
-        }
-        let count = if unspecified == changed {
-            format!("all {changed} of them")
-        } else {
-            format!("{unspecified} of {changed}")
-        };
-        format!(
-            "{claim} · {count} carry no obligation that holds, so this run says nothing about \
-             whether their behaviour changed"
-        )
     }
 }
 
