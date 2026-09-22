@@ -1321,15 +1321,18 @@ and `std.fs (fs)` to name the module and the effect.
 ```ply
 pub fn join(dir: String, name: String) -> String
 pub fn file_name(path: String) -> String
+pub fn parent(path: String) -> String
 pub fn extension(path: String) -> Option<String>
 pub fn strip_dot(path: String) -> String
 ```
 
 Text, not a filesystem: nothing here performs an effect. `join` places exactly
 one separator and adds none for a root spelled `"."` or `""`. `file_name` is the
-last segment, `""` for a path ending in a separator. `extension` follows the last
-dot of the file name, and a dotfile has none. `strip_dot` removes a leading
-`./`, so `./m.ply` and `m.ply` are one key in a set.
+last segment, `""` for a path ending in a separator. `parent` is the directory
+holding the path, `"."` for a name with no separator and for a root, so
+`join(parent(p), file_name(p))` puts back what the two took apart. `extension`
+follows the last dot of the file name, and a dotfile has none. `strip_dot`
+removes a leading `./`, so `./m.ply` and `m.ply` are one key in a set.
 
 ### 13.13 `std.hash`
 
