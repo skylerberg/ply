@@ -37,6 +37,7 @@ pub enum Op {
     ReadAt,
     ListDir,
     Kind,
+    Resolved,
     Exists,
     FileSize,
     ModifiedMs,
@@ -51,11 +52,12 @@ pub enum Op {
 }
 
 impl Op {
-    pub const ALL: [Op; 15] = [
+    pub const ALL: [Op; 16] = [
         Op::ReadFile,
         Op::ReadAt,
         Op::ListDir,
         Op::Kind,
+        Op::Resolved,
         Op::Exists,
         Op::FileSize,
         Op::ModifiedMs,
@@ -75,6 +77,7 @@ impl Op {
             Op::ReadAt => "read_at",
             Op::ListDir => "list_dir",
             Op::Kind => "kind",
+            Op::Resolved => "resolved",
             Op::Exists => "exists",
             Op::FileSize => "file_size",
             Op::ModifiedMs => "modified_ms",
@@ -95,6 +98,7 @@ impl Op {
             Op::ReadAt => "`fs.read_at`",
             Op::ListDir => "`fs.list_dir`",
             Op::Kind => "`fs.kind`",
+            Op::Resolved => "`fs.resolved`",
             Op::Exists => "`fs.exists`",
             Op::FileSize => "`fs.file_size`",
             Op::ModifiedMs => "`fs.modified_ms`",
@@ -124,6 +128,7 @@ impl Op {
             Op::ReadAt => "fs-read-at",
             Op::ListDir => "fs-list",
             Op::Kind => "fs-kind",
+            Op::Resolved => "fs-resolved",
             Op::Exists => "fs-exists",
             Op::FileSize => "fs-size",
             Op::ModifiedMs => "fs-modified",
@@ -299,6 +304,7 @@ impl FsHost {
             Op::ReadAt => "ply_host::fs::read_at",
             Op::ListDir => "ply_host::fs::list_dir",
             Op::Kind => "ply_host::fs::kind",
+            Op::Resolved => "ply_host::fs::resolved",
             Op::Exists => "ply_host::fs::exists",
             Op::FileSize => "ply_host::fs::file_size",
             Op::ModifiedMs => "ply_host::fs::modified_ms",
@@ -430,6 +436,13 @@ fn run(
         // `symlink_metadata` does not follow, so a symlink is reported as one rather than as its target.
         Op::Kind => Done::Ctor(match std::fs::symlink_metadata(&target) {
             Ok(meta) if meta.is_symlink() => "std.fs.Symlink",
+            Ok(meta) if meta.is_dir() => "std.fs.Dir",
+            Ok(meta) if meta.is_file() => "std.fs.File",
+            _ => "std.fs.Missing",
+        }),
+        // `metadata` follows, so this answers what the path resolves to. `confine` has already
+        // refused a target that resolves outside the root, so following one cannot leave it.
+        Op::Resolved => Done::Ctor(match std::fs::metadata(&target) {
             Ok(meta) if meta.is_dir() => "std.fs.Dir",
             Ok(meta) if meta.is_file() => "std.fs.File",
             _ => "std.fs.Missing",
