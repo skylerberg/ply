@@ -339,10 +339,30 @@ fn watch_reruns_on_a_save_and_keeps_the_front_end_it_already_had() {
         .recv_timeout(window)
         .expect("`--watch` reported its first iteration");
     // Saved byte for byte as it is: the common case, and the one that must not cost a front end.
-    std::fs::write(dir.path().join("m.ply"), GREEN).unwrap();
-    let second = rx
-        .recv_timeout(window)
-        .expect("`--watch` ran again when the tree moved");
+    // Written until the modification time moves, which is the whole signal an unchanged save
+    // leaves: a filesystem that stamps coarsely would otherwise hand the watcher two equal walks
+    // and this would time out on it rather than on anything it means to test.
+    let path = dir.path().join("m.ply");
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let stamped = std::time::Instant::now();
+    let after = loop {
+        std::fs::write(&path, GREEN).unwrap();
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        if after != before {
+            break after;
+        }
+        assert!(
+            stamped.elapsed() < window,
+            "a save never moved the modification time off {before:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let second = rx.recv_timeout(window).unwrap_or_else(|err| {
+        panic!(
+            "`--watch` ran again when the tree moved: {err}; the save moved m.ply from \
+             {before:?} to {after:?}"
+        )
+    });
     let _ = child.kill();
     let _ = child.wait();
     let reports = [first, second];
