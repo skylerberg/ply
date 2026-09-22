@@ -19,6 +19,16 @@ fn held(root: &std::path::Path, files: &[&str]) -> Warm {
     warm
 }
 
+/// A walk that read nothing must not answer like a walk that found a tree, or the watcher polling
+/// it compares two such answers, finds them equal and stops noticing saves.
+#[test]
+fn a_tree_that_cannot_be_walked_is_not_a_tree_that_has_not_moved() {
+    let dir = project(&[("m.ply", "fn a() -> Int = 1\n")]);
+    let walked = tree_stamps(dir.path()).expect("a readable tree stamps");
+    assert_eq!(walked.len(), 1);
+    assert_eq!(tree_stamps(&dir.path().join("gone")), None);
+}
+
 #[test]
 fn an_unmoved_tree_has_not_moved() {
     let dir = project(&[("m.ply", "fn a() -> Int = 1\n")]);
