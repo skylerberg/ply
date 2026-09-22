@@ -748,7 +748,7 @@ fn the_worker_count_does_not_reach_a_test_hash() {
     let one = test_hashes(dir.path(), &["--jobs", "1"]);
     let many = test_hashes(dir.path(), &["--jobs", "10"]);
     assert_eq!(one, many);
-    assert_eq!(one, test_hashes(dir.path(), &["--no-incremental"]));
+    assert_eq!(one, test_hashes(dir.path(), &["--no-cache"]));
 }
 
 #[test]

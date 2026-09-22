@@ -22,6 +22,7 @@ pub mod shipped;
 pub mod signature;
 pub mod simulation;
 pub mod style;
+pub mod test;
 pub mod trace;
 pub mod warm;
 
