@@ -70,7 +70,8 @@ fn registration() -> HostOp {
         determinism: Determinism::Nondeterministic,
         // Reading stdin consumes it, and a second read would answer with nothing.
         linearity: Linearity::AtMostOnce,
-        blocking: true,
+        // The handler reads it here rather than dispatching: one entry, no other task to stall.
+        blocking: false,
         secrets: false,
         path: ITEM,
     }
