@@ -277,7 +277,7 @@ impl Target {
             sources: err.sources,
             artifact: None,
         })?;
-        match crate::commands::test::broken_promises(&loaded) {
+        match crate::costs::broken_promises(&loaded) {
             Some(err) => Err(Refused {
                 diagnostics: err.diagnostics,
                 sources: err.sources,
