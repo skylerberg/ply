@@ -1124,7 +1124,7 @@ fn outcome(result: &TestResult) -> OutcomeView {
                 .map(|naive| (u64::from(naive.explored), naive.bounded, naive.to_string())),
             // Tenths, so one division answers both the line and the document.
             reduction_tenths: e.reduction().map(|r| (r * 10.0).round() as i64),
-            steps: u64::from(e.steps),
+            steps: e.steps,
             virtual_time_ns: e.virtual_time,
             failing_seed: e.failure.as_ref().map(|s| s.to_string()),
         }),

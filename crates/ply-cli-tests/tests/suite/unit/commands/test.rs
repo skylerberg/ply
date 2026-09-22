@@ -181,7 +181,7 @@ fn the_filter_renarrows_the_denominator_and_regroups() {
 
 #[test]
 fn a_filter_matching_nothing_selects_nothing_and_says_so() {
-    let (_dir, loaded, _h, plan) = plan_for(Some("no such test"));
+    let (_dir, _loaded, _h, plan) = plan_for(Some("no such test"));
     assert_eq!(plan.selection.total, 0);
     assert!(plan.selection.to_run.is_empty());
     assert!(plan.selection.groups.is_empty());
@@ -406,7 +406,7 @@ const ONE_FAILURE: &str = "fn f() -> Int = 1\ntest \"wrong\" { assert_eq(f(), 2)
 
 #[test]
 fn bisect_never_reports_that_nothing_was_attempted_and_evaluates_nothing() {
-    let (_dir, loaded, hashes, mut report) = failing(ONE_FAILURE);
+    let (_dir, loaded, _hashes, mut report) = failing(ONE_FAILURE);
     let mut args = args_for(None);
     args.bisect = When::Never;
     ply_test::diagnose_failures(
@@ -602,7 +602,7 @@ fn index_of(loaded: &Loaded, name: &str) -> usize {
 
 #[test]
 fn a_cached_pass_over_the_host_fails_the_run_that_wrote_it() {
-    let (_dir, loaded, hashes, plan) = plan_for(None);
+    let (_dir, loaded, hashes, _plan) = plan_for(None);
     let hosts = bound(&loaded);
     let index = index_of(&loaded, "reads orders only");
 
