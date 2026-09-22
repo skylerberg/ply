@@ -202,7 +202,15 @@ impl Hybrid for BodyHybrid<'_> {
             return Trial::unresolved(Unresolved::MissingBody);
         };
         let bytes: Vec<&[u8]> = bodies.iter().map(StoredBody::as_bytes).collect();
-        let names: Vec<(&str, DefHash)> = names.iter().map(|(n, h)| (n.as_str(), *h)).collect();
+        // Nothing here is shipped, so every module is printed and reprinted `pub` throughout.
+        let names: Vec<ply_codegen::c::producer::PrintedName<'_>> = names
+            .iter()
+            .map(|(n, h)| ply_codegen::c::producer::PrintedName {
+                name: n.as_str(),
+                hash: *h,
+                public: true,
+            })
+            .collect();
         let relink: Vec<(DefHash, DefHash)> = chosen.relink.iter().map(|(a, b)| (*a, *b)).collect();
         // A mixture has no source text: it is printed once, and that text is checked and built.
         let Ok(printed) = ply_codegen::c::producer::print_bodies(
