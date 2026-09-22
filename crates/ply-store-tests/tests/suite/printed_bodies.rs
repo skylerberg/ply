@@ -1,7 +1,7 @@
 //! Definition bodies printed back to source: the third element of `Hash -> (Definition, Type,
 //! Footprint)`.
 
-use ply_codegen::c::producer::print_bodies;
+use ply_codegen::c::producer::{PrintedName, print_bodies};
 use ply_span::{Diagnostic, SourceId, Symbol, codes};
 use ply_store::body::{BodySet, StoredBody};
 use ply_ty::{CheckOutput, DefHash, HashOutput};
@@ -45,6 +45,16 @@ fn names_of(checked: &Checked) -> Vec<(Symbol, DefHash)> {
         .collect()
 }
 
+/// A name a printed module publishes: everything `print` is handed here is printed, and a printed
+/// module is reprinted `pub` throughout.
+fn public(name: &str, hash: DefHash) -> PrintedName<'_> {
+    PrintedName {
+        name,
+        hash,
+        public: true,
+    }
+}
+
 fn print(
     bodies: &BodySet,
     names: &[(Symbol, DefHash)],
@@ -52,7 +62,7 @@ fn print(
 ) -> Result<Vec<(String, String)>, Diagnostic> {
     let bytes: Vec<&[u8]> = bodies.defs().map(|(_, body)| body.as_bytes()).collect();
     let tests: Vec<&[u8]> = bodies.tests().iter().map(StoredBody::as_bytes).collect();
-    let names: Vec<(&str, DefHash)> = names.iter().map(|(n, h)| (n.as_str(), *h)).collect();
+    let names: Vec<PrintedName<'_>> = names.iter().map(|(n, h)| public(n.as_str(), *h)).collect();
     print_bodies(&bytes, &names, &tests, &[], shipped)
 }
 
@@ -369,6 +379,51 @@ fn cross_module_references_resolve_once_printed() {
     ]);
 }
 
+/// One body under two names, one of which its own module keeps private, in modules that ship
+/// rather than print. The reference has to be printed under the exported name: `binder::name`
+/// reaches only what a module exports, so naming the private twin prints something that will not
+/// compile, and both names are equally far away by every other measure.
+#[test]
+fn a_reference_is_printed_under_a_name_its_module_exports() {
+    const SHELF: &str = "pub fn width() -> Int = 4\n";
+    const HIDDEN: &str = "fn span() -> Int = 4\npub fn stride() -> Int = span() + 1\n";
+    const APP: &str = "import shelf\n\npub fn wide() -> Int = shelf::width()\n";
+
+    let original = compile(&[("hidden", HIDDEN), ("shelf", SHELF), ("app", APP)]);
+    let width = original.hashes.defs[&Symbol::new("shelf.width")];
+    assert_eq!(
+        width,
+        original.hashes.defs[&Symbol::new("hidden.span")],
+        "the two are one body, which is what makes the name a choice"
+    );
+
+    let named = names_of(&original);
+    let names: Vec<PrintedName<'_>> = named
+        .iter()
+        .map(|(name, hash)| PrintedName {
+            name: name.as_str(),
+            hash: *hash,
+            public: name.as_str() != "hidden.span",
+        })
+        .collect();
+    let bytes: Vec<&[u8]> = original
+        .bodies
+        .defs()
+        .map(|(_, body)| body.as_bytes())
+        .collect();
+    let printed = print_bodies(&bytes, &names, &[], &[], &["hidden", "shelf"])
+        .unwrap_or_else(|d| panic!("the closure should print: {d:#?}"));
+
+    let app = text_of(&printed, "app");
+    assert!(app.contains("shelf::width()"), "{app}");
+    assert!(
+        !app.contains("hidden::"),
+        "a name its own module keeps private is no name to print: {app}"
+    );
+    // The whole of it: the printed text checks against the modules it says it imports.
+    port_front(&[("hidden", HIDDEN), ("shelf", SHELF), ("app", app)]);
+}
+
 #[test]
 fn a_self_recursive_definition_imports_nothing() {
     let (original, printed) = round_trip(&[(
@@ -454,7 +509,7 @@ fn a_truncated_body_is_refused_rather_than_printed() {
     let body = StoredBody::from_bytes(bytes).expect("still an envelope");
     let key = body.key().expect("a solo body keys itself");
 
-    let refused = print_bodies(&[body.as_bytes()], &[("m.f", key)], &[], &[], &[])
+    let refused = print_bodies(&[body.as_bytes()], &[public("m.f", key)], &[], &[], &[])
         .expect_err("a truncated body must not print");
     assert_eq!(refused.code, codes::ARTIFACT_INVALID);
 }
@@ -472,7 +527,7 @@ fn a_body_carrying_an_out_of_range_decimal_is_refused() {
     let body = StoredBody::from_bytes(bytes).expect("still a body envelope");
     let key = body.key().expect("a solo body keys itself");
 
-    let refused = print_bodies(&[body.as_bytes()], &[("m.f", key)], &[], &[], &[])
+    let refused = print_bodies(&[body.as_bytes()], &[public("m.f", key)], &[], &[], &[])
         .expect_err("a scale of 99 is not a `Decimal`");
     assert!(
         refused.message.contains("not a `Decimal`"),
@@ -492,7 +547,7 @@ fn a_name_whose_hash_no_body_carries_is_refused() {
 
     let refused = print_bodies(
         &[original.bodies.get(f).unwrap().as_bytes()],
-        &[("m.g", g)],
+        &[public("m.g", g)],
         &[],
         &[],
         &[],
@@ -516,7 +571,7 @@ fn a_reference_with_no_body_is_named_rather_than_guessed() {
 
     let refused = print_bodies(
         &[original.bodies.get(caller).unwrap().as_bytes()],
-        &[("m.caller", caller)],
+        &[public("m.caller", caller)],
         &[],
         &[],
         &[],
@@ -619,7 +674,7 @@ fn no_mutation_of_a_body_can_abort_the_printer() {
                 continue;
             };
             let Some(key) = stored.key() else { continue };
-            let _ = print_bodies(&[stored.as_bytes()], &[("m.x", key)], &[], &[], &[]);
+            let _ = print_bodies(&[stored.as_bytes()], &[public("m.x", key)], &[], &[], &[]);
         }
     }
 }

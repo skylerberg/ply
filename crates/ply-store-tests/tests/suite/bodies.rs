@@ -1,5 +1,6 @@
 //! Definition bodies through the store.
 
+use ply_codegen::c::producer::PrintedName;
 use ply_span::{SourceId, Symbol};
 use ply_store::body::{BodySet, of_front};
 use ply_store::{BODY_ENCODING, DefBody, Store};
@@ -79,11 +80,16 @@ fn a_stored_definition_set_prints_into_a_program_that_checks() {
     let (set, missing) = reopened.body_set(every_hash(&hashes));
     assert!(missing.is_empty(), "{missing:?}");
     let stored: Vec<&[u8]> = set.defs().map(|(_, body)| body.as_bytes()).collect();
-    let names: Vec<(&str, DefHash)> = hashes
+    // Nothing here is shipped, so every module is printed and reprinted `pub` throughout.
+    let names: Vec<PrintedName<'_>> = hashes
         .defs
         .iter()
         .chain(hashes.decls.iter())
-        .map(|(name, hash)| (name.as_str(), *hash))
+        .map(|(name, hash)| PrintedName {
+            name: name.as_str(),
+            hash: *hash,
+            public: true,
+        })
         .collect();
     let printed = ply_codegen::c::producer::print_bodies(&stored, &names, &[], &[], &[])
         .unwrap_or_else(|d| panic!("the stored bodies should print: {d:#?}"));
