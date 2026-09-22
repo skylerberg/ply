@@ -17,10 +17,9 @@ fn both_variants_are_produced_from_the_example_and_typecheck() {
     assert!(concurrent.contains("task.spawn(|| serve_connection(c, l))"));
     // Everything below the accept loop is the same program.
     for shared in [
-        "pub fn serve_connection(",
-        "-> Unit / {Serving, net.recv[conn], net.send[conn], net.close[conn]} = {",
+        "pub fn serve_connection(c: Int, l: http::Limits) -> Unit\n  / {Serving, net.recv[conn], net.send[conn], net.close[conn]} = {",
         "pub fn answer(req: http::Request) -> Reply / {Serving} =",
-        "pub fn table() -> List<router::Route<Endpoint>> =",
+        "pub fn table() -> List<router::Route<Endpoint>> = [",
     ] {
         assert!(concurrent.contains(shared), "{shared}");
     }

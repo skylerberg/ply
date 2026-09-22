@@ -72,7 +72,10 @@ fn index_of(hay: Bytes, set: Bytes, from: Int) -> Int =
     (
         "\
 fn head_end(head: Bytes) -> Int =
-  match bytes_index_of(head, b\"\\r\\n\\r\\n\") { Some(at) -> at + 4, None -> -1 }",
+  match bytes_index_of(head, b\"\\r\\n\\r\\n\") {
+    Some(at) -> at + 4,
+    None -> -1,
+  }",
         "\
 fn head_end(head: Bytes) -> Int =
   fold(range(0, bytes_len(head)), -1, |best: Int, i: Int|

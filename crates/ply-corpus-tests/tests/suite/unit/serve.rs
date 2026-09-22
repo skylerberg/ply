@@ -56,10 +56,10 @@ fn the_w1_reconstruction_replaces_every_scan_and_nothing_else() {
         "the native variant stopped calling the builtins it is measuring"
     );
     for shared in [
-        "fn parse(head: Bytes) -> Parsed",
-        "fn request_line(line: Bytes) -> Parsed",
-        "fn answer(head: Bytes) -> Bytes",
-        "fn response(status: String, body: String) -> Bytes",
+        "fn parse(head: Bytes) -> Parsed {",
+        "fn request_line(line: Bytes) -> Parsed {",
+        "fn answer(head: Bytes) -> Bytes =",
+        "fn response(status: String, body: String) -> Bytes =",
     ] {
         assert!(native.contains(shared), "{shared}");
         assert!(folds.contains(shared), "{shared}");
@@ -94,9 +94,9 @@ fn the_concurrent_variant_changes_only_the_accept_loop() {
     let concurrent = endpoint.concurrent(Parser::Native, 19002, 1).unwrap();
     assert!(concurrent.contains("task.spawn(|| serve_one(c))"));
     for shared in [
-        "fn serve_one(c: Int) -> Unit",
-        "fn answer(head: Bytes) -> Bytes",
-        "fn head_end(head: Bytes) -> Int",
+        "fn serve_one(c: Int) -> Unit {",
+        "fn answer(head: Bytes) -> Bytes =",
+        "fn head_end(head: Bytes) -> Int =",
     ] {
         assert!(sequential.contains(shared), "{shared}");
         assert!(concurrent.contains(shared), "{shared}");
