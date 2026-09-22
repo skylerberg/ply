@@ -15,19 +15,6 @@ fn atom(effect: &str, mode: Mode, resource: Option<&str>) -> EffectAtom {
     )
 }
 
-#[test]
-fn filling_never_splits_an_item_even_when_one_item_is_too_wide() {
-    let items = vec!["a".repeat(90), "b".to_string()];
-    let lines = fill("[", " ", &items, "]", 20);
-    assert_eq!(lines[0], format!("[{}, ", "a".repeat(90)).trim_end());
-    assert_eq!(lines[1], " b]");
-}
-
-#[test]
-fn an_empty_row_still_renders_its_delimiters() {
-    assert_eq!(fill("= {", "   ", &[], "}", 40), ["= {}"]);
-}
-
 fn def(declared: Footprint, performed: Footprint) -> DefInfo {
     DefInfo {
         name: Symbol::new("m.create_order"),

@@ -1,0 +1,797 @@
+// The obligations a project carries, and what became of each: what `ply prove` and `ply review`
+// are both about. The load, the store, the prover and the review baseline are the Rust side's — a
+// front end is not a value a program can hold, discharging a claim enters compiled bodies, and an
+// entry does not nest on the thread this program is itself running on. Which claims are asked for,
+// every line and key of both reports, and the code each run exits with are decided here.
+
+import compiler.resolve (Diag, diag1)
+import diagnostic (Place, Spot, spot_of)
+import report (Answer, ind, ok_code, count_of, plural, reported, refused)
+import std.json (Json, Null, Str, Bool, Number, Array, Object, Member, object)
+import style (Style, plain, dim, red, green, yellow)
+
+// What the Rust side collects, discharges, reviews and accepts, in that order. Collecting comes
+// first and once; a run then either accepts a baseline or discharges what it was asked for, and
+// only a discharged run has a review to read.
+pub nondet effect prover {
+  read collected[claims]()                   -> Result<Collection, Refusal>
+  read discharged[claims](wanted: List<Int>) -> Result<Verdicts, Refusal>
+  read reviewed[claims]()                    -> Changes
+  read accepted[claims]()                    -> Accepted
+}
+
+// --- What the Rust side answers with ----------------------------------------
+
+// Where a claim is written, as a label points at it.
+pub type Loc = { module: Int, start: Int, end: Int }
+
+pub type Refused = { diags: List<Diag>, places: List<Place> }
+
+// Three refusals, because each owes a reader a different last line: a program that did not
+// compile, a registration that does not match it, and a cache that would not open at all.
+pub type Refusal =
+  | Broken(Refused)
+  | Unbound(Refused)
+  | Trouble(Refused)
+
+// An `ensures` is one of its owner's clauses, in the order they are written; a law is the label it
+// was written with, when it has one.
+pub type Kind =
+  | Ensures(Int)
+  | Law(Option<String>)
+
+// What a definition leaves alone, from its checked footprint.
+pub type Frame =
+  | Pure
+  | Writes(List<String>)
+
+pub type Claim = {
+  key: String,
+  owner: String,
+  kind: Kind,
+  guarded: Bool,
+  frame: Frame,
+  at: Loc,
+  // Declared atoms the owner's body never touched, which `--explain` lays out under the row.
+  unperformed: List<String>,
+}
+
+pub type Sim = { mode: String, roots: List<Int>, budget: Int, steps: Int }
+
+// What an obligation weaker than a proof was discharged against, and cached under.
+pub type Plan = {
+  cases: Int, roots: List<Int>, prove_budget: Int, shrink_budget: Int, step_budget: Int, sim: Sim,
+}
+
+pub type Collection = {
+  places: List<Place>,
+  warnings: List<Diag>,
+  claims: List<Claim>,
+  // Definitions carrying at least one obligation, whatever became of it.
+  specified: Int,
+  plan: Plan,
+}
+
+// The strength of what a run established, which decides what it may be cached under.
+pub type Tier =
+  | Proved
+  | Property
+  | Example
+
+// The rules are the prover's own document, placed under `rules` as it wrote them: a certificate
+// crosses once, and what a rule is called is its business rather than this report's.
+pub type Certificate = { rules: Json, steps: Int, guard_satisfiable: Bool, sorts: List<String> }
+
+pub type Instantiation = { var: String, ty: String }
+
+pub type Cases = {
+  generated: Int, kept: Int, rejected: Int, roots: List<Int>,
+  instantiations: List<Instantiation>,
+}
+
+pub type Evidence =
+  | Proof(Certificate)
+  | Sampled(Cases)
+
+pub type Binding = { name: String, ty: String, rendered: String }
+
+pub type Counter = {
+  bindings: List<Binding>, original: List<Binding>, shrinks: Int, root: Int, case: Int,
+  seed: Option<String>,
+}
+
+pub type Vacuity =
+  | Unsatisfiable
+  | NoCaseKept(Int)
+
+pub type Gap =
+  // `None` when the owner's row is empty, which names nothing to hold a handler for.
+  | UnhandledEffect(Option<String>)
+  | Ungeneratable({ param: String, ty: String })
+  | Raised({ message: String, bindings: List<Binding> })
+  | GuardNotSampled({ generated: Int, witness: List<Binding> })
+  | ReachesHost(String)
+
+pub type Outcome =
+  | Held({ tier: Tier, evidence: Evidence })
+  | Refuted(Counter)
+  | Vacuous({ guard: Loc, why: Vacuity })
+  | Unattempted(Gap)
+
+// Where one answer came from, which `--explain` prints under its row.
+pub type Reason =
+  | Fresh
+  | FromProof
+  | FromSample
+  | Uncached
+  | CacheRefused
+
+// The review surface: how much of the program a reader still has to read line by line.
+pub type Coverage = {
+  definitions: Int, covered: Int, uncovered: List<String>, by_tier: List<{ tier: Tier, count: Int }>,
+}
+
+pub type Verdicts = {
+  // Parallel to the indices the run asked for.
+  outcomes: List<Outcome>,
+  reasons: List<Reason>,
+  coverage: Coverage,
+  cached: Int,
+  duration_ms: Decimal,
+  warnings: List<Diag>,
+}
+
+// Whether something moved since the baseline a reader accepted.
+pub type Moved =
+  | Unchanged
+  | Changed
+  | Never
+
+pub type Change = {
+  name: String,
+  implementation: Moved,
+  spec: Moved,
+  // Indices into the run's own rows, in report order.
+  obligations: List<Int>,
+  // How many of them the machine actually established.
+  holding: Int,
+}
+
+// The coverage and the definition count are the run's own, from the verdicts it read them off.
+pub type Changes = {
+  // Definitions with a baseline at all.
+  reviewed: Int,
+  changed: List<Change>,
+  // Obligations attached to a changed definition that did not hold.
+  broken: Int,
+  // How many of those were never discharged at all, rather than refuted or found vacuous.
+  undischarged: Int,
+  duration_ms: Decimal,
+}
+
+pub type Accepted = { definitions: Int, stored: Bool, warnings: List<Diag> }
+
+// One claim and what became of it, which is what every row and every object is written from.
+pub type Row = { claim: Claim, outcome: Outcome, reason: Reason }
+
+// --- Small things -----------------------------------------------------------
+
+pub fn num(n: Int) -> Json = Number(decimal_of_int(n))
+
+pub fn nth(xs: List<String>, i: Int) -> String = match list_at(xs, i) { Some(x) -> x, None -> "" }
+
+pub fn joined(parts: List<String>, sep: String) -> String =
+  fold(range(0, len(parts)), "", |acc: String, i: Int|
+    if i == 0 { nth(parts, i) } else { acc ++ sep ++ nth(parts, i) })
+
+pub fn also<a>(head: List<a>, tail: List<a>) -> List<a> =
+  fold(tail, head, |acc: List<a>, x: a| push(acc, x))
+
+pub fn spaces(n: Int) -> String = fold(range(0, n), "", |acc: String, i: Int| acc ++ " ")
+
+pub fn pad_right(s: String, n: Int) -> String =
+  if string_len(s) >= n { s } else { s ++ spaces(n - string_len(s)) }
+
+pub fn texts(xs: List<String>) -> Json = Array(map(xs, |x: String| Str(x)))
+
+fn two_places(n: Int) -> String = if n < 10 { "0" ++ int_to_string(n) } else { int_to_string(n) }
+
+// Seconds to two places, as a reading rather than a measurement to compare. Counted in
+// hundredths, because a quotient's own scale is what it divides out to and not what it is read at.
+pub fn seconds(ms: Decimal) -> String = {
+  let hundredths =
+    match int_of_decimal(decimal_div(ms, 10m, 0, HalfUp), Down) { Some(n) -> n, None -> 0 };
+  int_to_string(hundredths / 100) ++ "." ++ two_places(hundredths % 100)
+}
+
+// A lazy read and a later flush can each report the same unreadable file, and a reader is owed
+// the trouble once.
+pub fn once_each(ds: List<Diag>) -> List<Diag> =
+  fold(ds, [], |acc: List<Diag>, d: Diag|
+    if fold(acc, false, |seen: Bool, k: Diag| seen || (k.code == d.code && k.message == d.message)) {
+      acc
+    } else { push(acc, d) })
+
+// The module index a span outside every module carries.
+fn outside() -> Int = 4294967295
+
+// `path:line:col`, one-based, as every other command prints a place.
+pub fn located(places: List<Place>, at: Loc) -> Option<String> =
+  if at.module == outside() { None } else {
+    match list_at(places, at.module) {
+      None -> None,
+      Some(p) -> {
+        let spot: Spot = spot_of(p.text, at.start);
+        Some(p.path ++ ":" ++ int_to_string(spot.line) ++ ":" ++ int_to_string(spot.col))
+      },
+    }
+  }
+
+// As Rust prints a string it is quoting: the escapes a label could carry, and nothing else.
+fn escaped(text: String) -> String =
+  fold(string_split(text, "\\"), "",
+       |acc: String, part: String| if acc == "" { part } else { acc ++ "\\\\" ++ part })
+
+pub fn quoted(text: String) -> String = {
+  let parts = string_split(escaped(text), "\"");
+  "\"" ++ fold(range(0, len(parts)), "",
+               |acc: String, i: Int|
+                 if i == 0 { nth(parts, i) } else { acc ++ "\\\"" ++ nth(parts, i) }) ++ "\""
+}
+
+// --- Naming a claim ---------------------------------------------------------
+
+pub fn label_of(c: Claim) -> String =
+  match c.kind {
+    Ensures(index) -> c.owner ++ " ensures #" ++ int_to_string(index),
+    Law(named) ->
+      match named { Some(label) -> "law " ++ quoted(label), None -> "law " ++ c.owner },
+  }
+
+pub fn kind_word(c: Claim) -> String = match c.kind { Ensures(_) -> "ensures", Law(_) -> "law" }
+
+pub fn tier_word(t: Tier) -> String =
+  match t { Proved -> "proved", Property -> "property", Example -> "example" }
+
+pub fn outcome_word(o: Outcome) -> String =
+  match o {
+    Held(h) -> tier_word(h.tier),
+    Refuted(_) -> "refuted",
+    Vacuous(_) -> "vacuous",
+    Unattempted(_) -> "unattempted",
+  }
+
+pub fn holds(o: Outcome) -> Bool = match o { Held(_) -> true, _ -> false }
+
+pub fn tier_of(o: Outcome) -> Option<Tier> = match o { Held(h) -> Some(h.tier), _ -> None }
+
+pub fn reason_word(r: Reason) -> String =
+  match r {
+    Fresh -> "new",
+    FromProof -> "cached proof",
+    FromSample -> "cached sample",
+    Uncached -> "uncached",
+    CacheRefused -> "cache refused",
+  }
+
+// --- What a discharge has to say for itself ---------------------------------
+
+fn field(fields: Map<String, Json>, key: String) -> Json =
+  match map_get(fields, key) { Some(v) -> v, None -> Null }
+
+fn text_at(fields: Map<String, Json>, key: String) -> String =
+  match field(fields, key) { Str(s) -> s, _ -> "" }
+
+fn int_at(fields: Map<String, Json>, key: String) -> Int =
+  match field(fields, key) {
+    Number(d) -> match int_of_decimal(d, Down) { Some(n) -> n, None -> 0 },
+    _ -> 0,
+  }
+
+// A rule the prover named with fields carries them under its own tag, and one that needs none is
+// the tag alone.
+type Tagged = { tag: String, body: Map<String, Json> }
+
+fn no_fields() -> Map<String, Json> = map_new()
+
+fn tagged(m: Map<String, Json>) -> Tagged =
+  map_fold(m, { tag: "", body: no_fields() }, |acc: Tagged, k: String, v: Json|
+    if acc.tag == "" { { tag: k, body: match v { Object(fs) -> fs, _ -> no_fields() } } } else { acc })
+
+fn spaced(tag: String) -> String = joined(string_split(tag, "_"), " ")
+
+fn rule_tag(r: Json) -> String =
+  match r { Str(tag) -> tag, Object(m) -> tagged(m).tag, _ -> "" }
+
+fn unfolds(r: Json) -> Bool = rule_tag(r) == "unfold"
+
+// An unfolding is counted rather than named, so a certificate that unfolded a hundred times is
+// still one line.
+fn rule_text(r: Json) -> String =
+  match r {
+    Str(tag) -> spaced(tag),
+    Object(m) -> {
+      let t: Tagged = tagged(m);
+      if t.tag == "exhaustive_enumeration" {
+        let points = int_at(t.body, "points");
+        "exhaustive over " ++ int_to_string(points) ++ " " ++ plural(points, "point") ++ " of "
+          ++ text_at(t.body, "domain")
+      } else if t.tag == "case_split" {
+        "case analysis over " ++ text_at(t.body, "ty") ++ " ("
+          ++ int_to_string(int_at(t.body, "arms")) ++ " arms)"
+      } else if t.tag == "induction" {
+        "induction on " ++ text_at(t.body, "binder") ++ ", unrolling " ++ text_at(t.body, "def")
+      } else if t.tag == "exhaustive_interleaving" {
+        let n = int_at(t.body, "interleavings");
+        "exhaustive over " ++ int_to_string(n) ++ " " ++ plural(n, "interleaving")
+      } else { spaced(t.tag) }
+    },
+    _ -> "",
+  }
+
+fn rules_of(c: Certificate) -> List<Json> = match c.rules { Array(rs) -> rs, _ -> [] }
+
+fn named_once(parts: List<String>, part: String) -> List<String> =
+  if fold(parts, false, |seen: Bool, p: String| seen || p == part) { parts } else { push(parts, part) }
+
+pub fn certificate_summary(c: Certificate) -> String = {
+  let rules = rules_of(c);
+  let named = fold(rules, [], |acc: List<String>, r: Json|
+    if unfolds(r) { acc } else { named_once(acc, rule_text(r)) });
+  let unfoldings = len(filter(rules, |r: Json| unfolds(r)));
+  let counted = if unfoldings > 0 {
+    push(named, int_to_string(unfoldings) ++ " " ++ plural(unfoldings, "unfolding"))
+  } else { named };
+  let sorted = if len(c.sorts) > 0 {
+    push(counted, "uninterpreted " ++ joined(c.sorts, ", "))
+  } else { counted };
+  joined(push(sorted, int_to_string(c.steps) ++ " steps"), " · ")
+}
+
+// Below the property tier a run has concrete cases and no coverage claim, so it says how many of
+// what it drew the guard let through.
+pub fn cases_summary(tier: Tier, c: Cases) -> String = {
+  let head =
+    match tier {
+      Example ->
+        int_to_string(c.kept) ++ " of " ++ int_to_string(c.generated) ++ " cases kept · guard rejected "
+          ++ int_to_string(c.rejected),
+      _ ->
+        int_to_string(c.kept) ++ " " ++ plural(c.kept, "case") ++ " · " ++ int_to_string(c.rejected)
+          ++ " rejected",
+    };
+  let rooted = if len(c.roots) > 1 { head ++ " · " ++ int_to_string(len(c.roots)) ++ " roots" } else { head };
+  fold(c.instantiations, rooted, |acc: String, i: Instantiation| acc ++ " · " ++ i.var ++ " := " ++ i.ty)
+}
+
+pub fn evidence_summary(tier: Tier, e: Evidence) -> String =
+  match e { Proof(c) -> certificate_summary(c), Sampled(c) -> cases_summary(tier, c) }
+
+pub fn gap_summary(g: Gap) -> String =
+  match g {
+    UnhandledEffect(row) ->
+      match row {
+        None -> "no handler for what it performs",
+        Some(text) -> "performs " ++ text ++ ": no handler",
+      },
+    Ungeneratable(u) -> "no value of `" ++ u.ty ++ "` can be generated for `" ++ u.param ++ "`",
+    Raised(r) -> "raised: " ++ r.message,
+    GuardNotSampled(g2) ->
+      "the guard kept none of " ++ int_to_string(g2.generated)
+        ++ " cases, but it does admit a value",
+    ReachesHost(row) -> "reaches the host (" ++ row ++ "); run `ply prove --host`",
+  }
+
+pub fn vacuity_summary(v: Vacuity) -> String =
+  match v {
+    Unsatisfiable -> "the guard admits no value",
+    NoCaseKept(generated) -> "the guard kept none of " ++ int_to_string(generated) ++ " cases",
+  }
+
+pub fn frame_summary(f: Frame) -> String =
+  match f { Pure -> "pure", Writes(named) -> "writes " ++ joined(named, ", ") }
+
+pub fn rendered(bindings: List<Binding>) -> String =
+  joined(map(bindings, |b: Binding| b.name ++ " = " ++ b.rendered), ", ")
+
+pub fn quantifier(c: Claim, bindings: List<Binding>) -> String =
+  if len(bindings) == 0 { "no binders" } else {
+    "forall (" ++ joined(map(bindings, |b: Binding| b.name ++ ": " ++ b.ty), ", ") ++ ")"
+  }
+
+// What a row says after the tier and the claim's name.
+pub fn detail_of(r: Row, places: List<Place>) -> String =
+  match r.outcome {
+    Held(h) -> evidence_summary(h.tier, h.evidence),
+    Unattempted(gap) -> gap_summary(gap),
+    Vacuous(v) -> vacuity_summary(v.why),
+    Refuted(_) -> match located(places, r.claim.at) { Some(at) -> at, None -> "" },
+  }
+
+pub fn mark_of(s: Style, o: Outcome) -> String =
+  match o {
+    Held(_) -> green(s, "✓"),
+    Unattempted(_) -> yellow(s, "~"),
+    _ -> red(s, "✗"),
+  }
+
+// --- Counting ---------------------------------------------------------------
+
+pub fn count_where(rows: List<Row>, want: (Outcome) -> Bool) -> Int =
+  len(filter(rows, |r: Row| want(r.outcome)))
+
+pub fn at_tier(rows: List<Row>, tier: Tier) -> Int =
+  count_where(rows, |o: Outcome| tier_of(o) == Some(tier))
+
+pub fn refuted_of(rows: List<Row>) -> Int =
+  count_where(rows, |o: Outcome| match o { Refuted(_) -> true, _ -> false })
+
+pub fn vacuous_of(rows: List<Row>) -> Int =
+  count_where(rows, |o: Outcome| match o { Vacuous(_) -> true, _ -> false })
+
+pub fn unattempted_of(rows: List<Row>) -> Int =
+  count_where(rows, |o: Outcome| match o { Unattempted(_) -> true, _ -> false })
+
+pub fn held_of(rows: List<Row>) -> Int = count_where(rows, |o: Outcome| holds(o))
+
+// A refuted or vacuous claim is a failure; a gap is not one, and never was.
+pub fn failed(rows: List<Row>) -> Bool = refuted_of(rows) > 0 || vacuous_of(rows) > 0
+
+// At least one claim the program makes does not hold.
+pub fn failure() -> Int = 1
+
+pub fn code_of(rows: List<Row>) -> Int = if failed(rows) { failure() } else { ok_code() }
+
+// The rows a run reports on: the claims it asked for, paired with what came back for each.
+pub fn rows_of(claims: List<Claim>, wanted: List<Int>, v: Verdicts) -> List<Row> =
+  fold(range(0, len(wanted)), [], |acc: List<Row>, i: Int|
+    match list_at(claims, match list_at(wanted, i) { Some(k) -> k, None -> -1 }) {
+      None -> acc,
+      Some(c) ->
+        match list_at(v.outcomes, i) {
+          None -> acc,
+          Some(o) ->
+            push(acc, { claim: c, outcome: o,
+                        reason: match list_at(v.reasons, i) { Some(r) -> r, None -> Fresh } }),
+        },
+    })
+
+// --- The lines a reader reads ------------------------------------------------
+
+// How much of the program carries a claim at all, then what is left to read line by line.
+pub fn coverage_lines(s: Style, cov: Coverage, specified: Int, explain: Bool) -> List<String> = {
+  let unspecified = if cov.definitions > specified { cov.definitions - specified } else { 0 };
+  let head = ind() ++ count_of(cov.definitions, "definition") ++ " · " ++ int_to_string(specified)
+             ++ " carry an obligation · " ++ int_to_string(unspecified) ++ " do not";
+  if len(cov.uncovered) == 0 { [head] } else {
+    let shown = if explain || len(cov.uncovered) < 6 { len(cov.uncovered) } else { 6 };
+    let rest = len(cov.uncovered) - shown;
+    let tail = if rest > 0 { ", and " ++ int_to_string(rest) ++ " more (`--explain` for all)" } else { "" };
+    let names = joined(map(range(0, shown), |i: Int| nth(cov.uncovered, i)), ", ");
+    [head, ind() ++ dim(s, int_to_string(len(cov.uncovered)) ++ " not covered by a claim that holds: "
+                           ++ names ++ tail)]
+  }
+}
+
+// `~` for a gap, because a gap is not a failure: nothing was established, and nothing was refuted.
+pub fn row_head(s: Style, r: Row, places: List<Place>) -> String = {
+  let detail = detail_of(r, places);
+  let painted = match r.outcome { Vacuous(_) -> detail, _ -> dim(s, detail) };
+  ind() ++ mark_of(s, r.outcome) ++ " " ++ pad_right(outcome_word(r.outcome), 11) ++ " "
+    ++ pad_right(label_of(r.claim), 40) ++ " " ++ painted
+}
+
+pub fn under() -> String = ind() ++ "    "
+
+// --- The document ------------------------------------------------------------
+
+pub fn bindings_json(bindings: List<Binding>) -> Json =
+  Array(map(bindings, |b: Binding|
+    object([{ key: "name", value: Str(b.name) },
+            { key: "type", value: Str(b.ty) },
+            { key: "value", value: Str(b.rendered) }])))
+
+fn instantiations_json(xs: List<Instantiation>) -> Json =
+  Array(map(xs, |x: Instantiation|
+    object([{ key: "var", value: Str(x.var) }, { key: "type", value: Str(x.ty) }])))
+
+fn certificate_json(c: Certificate) -> Json =
+  object([{ key: "rules", value: c.rules },
+          { key: "steps", value: num(c.steps) },
+          { key: "guard_satisfiable", value: Bool(c.guard_satisfiable) },
+          { key: "sorts", value: texts(c.sorts) },
+          { key: "summary", value: Str(certificate_summary(c)) }])
+
+fn cases_json(tier: Tier, c: Cases) -> Json =
+  object([{ key: "generated", value: num(c.generated) },
+          { key: "kept", value: num(c.kept) },
+          { key: "rejected", value: num(c.rejected) },
+          { key: "roots", value: Array(map(c.roots, |r: Int| num(r))) },
+          { key: "instantiations", value: instantiations_json(c.instantiations) },
+          { key: "summary", value: Str(cases_summary(tier, c)) }])
+
+fn counterexample_json(cx: Counter) -> Json =
+  object([{ key: "bindings", value: bindings_json(cx.bindings) },
+          { key: "original", value: bindings_json(cx.original) },
+          { key: "shrinks", value: num(cx.shrinks) },
+          { key: "root", value: num(cx.root) },
+          { key: "case", value: num(cx.case) },
+          { key: "seed", value: match cx.seed { Some(text) -> Str(text), None -> Null } }])
+
+// What the outcome adds to the object every row writes.
+fn outcome_members(o: Outcome) -> List<Member> =
+  match o {
+    Held(h) ->
+      match h.evidence {
+        Proof(c) -> [{ key: "certificate", value: certificate_json(c) }],
+        Sampled(c) -> [{ key: "cases", value: cases_json(h.tier, c) }],
+      },
+    Refuted(cx) -> [{ key: "counterexample", value: counterexample_json(cx) }],
+    Vacuous(v) -> [{ key: "vacuity", value: Str(vacuity_summary(v.why)) }],
+    Unattempted(gap) ->
+      match gap {
+        Raised(r) ->
+          if len(r.bindings) == 0 { [{ key: "gap", value: Str(gap_summary(gap)) }] }
+          else {
+            [{ key: "gap", value: Str(gap_summary(gap)) },
+             { key: "raised_at", value: bindings_json(r.bindings) }]
+          },
+        _ -> [{ key: "gap", value: Str(gap_summary(gap)) }],
+      },
+  }
+
+fn index_members(c: Claim) -> List<Member> =
+  match c.kind { Ensures(index) -> [{ key: "index", value: num(index) }], Law(_) -> [] }
+
+pub fn obligation_json(r: Row, places: List<Place>) -> Json =
+  object(also(also([{ key: "key", value: Str(r.claim.key) },
+                    { key: "owner", value: Str(r.claim.owner) },
+                    { key: "label", value: Str(label_of(r.claim)) },
+                    { key: "kind", value: Str(kind_word(r.claim)) },
+                    { key: "guarded", value: Bool(r.claim.guarded) },
+                    { key: "frame", value: Str(frame_summary(r.claim.frame)) },
+                    { key: "location",
+                      value: match located(places, r.claim.at) { Some(at) -> Str(at), None -> Null } },
+                    { key: "outcome", value: Str(outcome_word(r.outcome)) },
+                    { key: "tier",
+                      value: match tier_of(r.outcome) { Some(t) -> Str(tier_word(t)), None -> Null } }],
+                   index_members(r.claim)),
+              outcome_members(r.outcome)))
+
+pub fn coverage_json(cov: Coverage) -> Json =
+  object([{ key: "definitions", value: num(cov.definitions) },
+          { key: "covered", value: num(cov.covered) },
+          { key: "uncovered", value: texts(cov.uncovered) },
+          { key: "by_tier",
+            value: object(map(cov.by_tier, |b: { tier: Tier, count: Int }|
+              { key: tier_word(b.tier), value: num(b.count) })) }])
+
+fn sim_json(s: Sim) -> Json =
+  object([{ key: "mode", value: Str(s.mode) },
+          { key: "roots", value: Array(map(s.roots, |r: Int| num(r))) },
+          { key: "budget", value: num(s.budget) },
+          { key: "steps", value: num(s.steps) }])
+
+pub fn plan_json(p: Plan) -> Json =
+  object([{ key: "cases", value: num(p.cases) },
+          { key: "roots", value: Array(map(p.roots, |r: Int| num(r))) },
+          { key: "prove_budget", value: num(p.prove_budget) },
+          { key: "shrink_budget", value: num(p.shrink_budget) },
+          { key: "step_budget", value: num(p.step_budget) },
+          { key: "sim", value: sim_json(p.sim) }])
+
+// --- What a run raises about the claims that did not hold ---------------------
+
+fn span_of(at: Loc) -> { start: Int, end: Int } = { start: at.start, end: at.end }
+
+fn refutation(r: Row, cx: Counter) -> Diag = {
+  let shrank = "shrank from " ++ rendered(cx.original) ++ " in " ++ int_to_string(cx.shrinks) ++ " "
+               ++ plural(cx.shrinks, "step");
+  let notes = [bytes_of_string(quantifier(r.claim, cx.bindings)), bytes_of_string(shrank),
+               bytes_of_string("root " ++ int_to_string(cx.root) ++ " · case " ++ int_to_string(cx.case))];
+  diag1(b"E0419", r.claim.at.module, span_of(r.claim.at),
+        bytes_of_string(label_of(r.claim) ++ " is false at " ++ rendered(cx.bindings)),
+        b"this claim does not hold",
+        match cx.seed {
+          Some(seed) -> push(notes, bytes_of_string("replay with `--seed " ++ seed ++ "`")),
+          None -> notes,
+        })
+}
+
+fn vacuity(r: Row, guard: Loc, why: Vacuity) -> Diag =
+  diag1(b"E0420", guard.module, span_of(guard),
+        bytes_of_string(label_of(r.claim) ++ " is vacuous: " ++ vacuity_summary(why)),
+        b"this guard admits nothing",
+        [b"an obligation over an empty domain is trivially valid and says nothing",
+         b"widen the guard, or delete the claim"])
+
+// A gap is a warning: nothing was refuted, and nothing was established either.
+fn undischarged(r: Row, gap: Gap) -> Diag = {
+  let noted =
+    match gap {
+      Raised(raise) ->
+        if len(raise.bindings) == 0 { [] }
+        else { [bytes_of_string("shrunk to " ++ rendered(raise.bindings) ++ ", which still raises")] },
+      GuardNotSampled(g) ->
+        [bytes_of_string("the guard admits " ++ rendered(g.witness)),
+         b"the generator draws from the whole type, so a narrow guard is a gap in the search rather than a defect in the spec"],
+      _ -> [],
+    };
+  let d: Diag =
+    diag1(b"W0604", r.claim.at.module, span_of(r.claim.at),
+          bytes_of_string(label_of(r.claim) ++ " was not discharged: " ++ gap_summary(gap)),
+          b"no tier is claimed for this",
+          also([b"this definition is not covered; a reader still has to read it"], noted));
+  {..d, severity: b"warning"}
+}
+
+pub fn diagnostics_of(rows: List<Row>) -> List<Diag> =
+  fold(rows, [], |acc: List<Diag>, r: Row|
+    match r.outcome {
+      Held(_) -> acc,
+      Refuted(cx) -> push(acc, refutation(r, cx)),
+      Vacuous(v) -> push(acc, vacuity(r, v.guard, v.why)),
+      Unattempted(gap) -> push(acc, undischarged(r, gap)),
+    })
+
+// --- Refusals -----------------------------------------------------------------
+
+// A registration that does not match the program is a start-up failure: nothing was discharged.
+fn unbound(s: Style, command: String, why: Refused) -> Answer = {
+  let answer: Answer = reported(s, command, why.diags, why.places);
+  let tally = ind() ++ red(s, "no host handler was bound") ++ " ("
+              ++ count_of(len(why.diags), "error") ++ ")";
+  { ..answer,
+    json: match answer.json {
+      Object(m) -> Object(map_insert(m, "binding", Str("host"))),
+      other -> other,
+    },
+    errs: push(answer.errs, tally) }
+}
+
+pub fn refusal(s: Style, command: String, why: Refusal) -> Answer =
+  match why {
+    Broken(r) -> refused(s, command, r.diags, r.places),
+    Unbound(r) -> unbound(s, command, r),
+    Trouble(r) -> reported(s, command, r.diags, r.places),
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+pub fn a_loc() -> Loc = { module: 0, start: 3, end: 7 }
+
+pub fn a_claim(owner: String, kind: Kind) -> Claim =
+  { key: "abcd", owner: owner, kind: kind, guarded: false, frame: Pure, at: a_loc(),
+    unperformed: [] }
+
+pub fn a_place() -> Place = { path: "m.ply", text: b"fn f() -> Int = 1\nfn g() -> Int = 2\n" }
+
+pub fn a_plan() -> Plan =
+  { cases: 200, roots: [0], prove_budget: 10000, shrink_budget: 500, step_budget: 1000000000,
+    sim: { mode: "dpor", roots: [0], budget: 256, steps: 100000 } }
+
+pub fn proved(rules: Json, steps: Int) -> Outcome =
+  Held({ tier: Proved, evidence: Proof({ rules: rules, steps: steps, guard_satisfiable: true, sorts: [] }) })
+
+pub fn a_counter() -> Counter =
+  { bindings: [{ name: "xs", ty: "List<Int>", rendered: "[0, 0]" }],
+    original: [{ name: "xs", ty: "List<Int>", rendered: "[7, 9]" }],
+    shrinks: 2, root: 0, case: 11, seed: None }
+
+test "a claim is named by its clause's place among its owner's, or by the law's own label" {
+  assert_eq(label_of(a_claim("m.one", Ensures(0))), "m.one ensures #0");
+  assert_eq(label_of(a_claim("m.short", Law(Some("a batch is small")))), "law \"a batch is small\"");
+  assert_eq(label_of(a_claim("m.nameless", Law(None))), "law m.nameless");
+  assert_eq(kind_word(a_claim("m.one", Ensures(0))), "ensures");
+  assert_eq(kind_word(a_claim("m.one", Law(None))), "law")
+}
+
+test "a label is quoted as Rust quotes it, with a quote and a backslash escaped" {
+  assert_eq(quoted("plain"), "\"plain\"");
+  assert_eq(quoted("say \"hi\""), "\"say \\\"hi\\\"\"");
+  assert_eq(quoted("a\\b"), "\"a\\\\b\"")
+}
+
+test "a certificate names each rule once, counts the unfoldings, and ends in its steps" {
+  let rules = Array([Str("propositional"), Str("linear_arithmetic"), Str("propositional"),
+                     Object(map_insert(map_new(), "unfold",
+                                       object([{ key: "def", value: Str("m.double") },
+                                               { key: "depth", value: num(1) }])))]);
+  assert_eq(certificate_summary({ rules: rules, steps: 179, guard_satisfiable: true, sorts: [] }),
+            "propositional · linear arithmetic · 1 unfolding · 179 steps");
+  let none = Array([]);
+  assert_eq(certificate_summary({ rules: none, steps: 1, guard_satisfiable: true, sorts: ["a"] }),
+            "uninterpreted a · 1 steps")
+}
+
+test "a rule with fields of its own is read from the tag the prover wrote it under" {
+  let enumerated = Array([Object(map_insert(map_new(), "exhaustive_enumeration",
+                                            object([{ key: "domain", value: Str("Bool") },
+                                                    { key: "points", value: num(2) }])))]);
+  assert_eq(certificate_summary({ rules: enumerated, steps: 2, guard_satisfiable: true, sorts: [] }),
+            "exhaustive over 2 points of Bool · 2 steps");
+  let split = Array([Object(map_insert(map_new(), "case_split",
+                                       object([{ key: "ty", value: Str("Colour") },
+                                               { key: "arms", value: num(3) }])))]);
+  assert_eq(certificate_summary({ rules: split, steps: 4, guard_satisfiable: true, sorts: [] }),
+            "case analysis over Colour (3 arms) · 4 steps")
+}
+
+// The property tier claims coverage; below it a run has concrete cases and says so.
+test "how a sampled discharge reads depends on whether it kept enough to claim coverage" {
+  let kept: Cases = { generated: 200, kept: 200, rejected: 0, roots: [0], instantiations: [] };
+  assert_eq(cases_summary(Property, kept), "200 cases · 0 rejected");
+  let few: Cases = { generated: 200, kept: 3, rejected: 197, roots: [0, 1],
+                     instantiations: [{ var: "a", ty: "Int" }] };
+  assert_eq(cases_summary(Example, few),
+            "3 of 200 cases kept · guard rejected 197 · 2 roots · a := Int")
+}
+
+test "a gap says what stopped it, and a vacuity what the guard admits" {
+  assert_eq(gap_summary(UnhandledEffect(None)), "no handler for what it performs");
+  assert_eq(gap_summary(UnhandledEffect(Some("{db.read[rows]}"))),
+            "performs {db.read[rows]}: no handler");
+  assert_eq(gap_summary(ReachesHost("{db.read[users]}")),
+            "reaches the host ({db.read[users]}); run `ply prove --host`");
+  assert_eq(gap_summary(Ungeneratable({ param: "f", ty: "(Int) -> Int" })),
+            "no value of `(Int) -> Int` can be generated for `f`");
+  assert_eq(vacuity_summary(Unsatisfiable), "the guard admits no value");
+  assert_eq(vacuity_summary(NoCaseKept(200)), "the guard kept none of 200 cases")
+}
+
+test "a row is the tier, the claim and what it rests on, in fixed columns" {
+  let r: Row = { claim: a_claim("m.one", Ensures(0)), outcome: proved(Array([Str("congruence")]), 2),
+                 reason: Fresh };
+  assert_eq(row_head(plain(), r, [a_place()]),
+            "   ✓ proved      m.one ensures #0                         congruence · 2 steps")
+}
+
+test "a refuted claim is E0419 over the claim, and a gap is W0604 over the same place" {
+  let refuted: Row = { claim: a_claim("m.short", Law(Some("a batch is small"))),
+                       outcome: Refuted(a_counter()), reason: Fresh };
+  let ds = diagnostics_of([refuted]);
+  assert_eq(len(ds), 1);
+  let d: Diag = match list_at(ds, 0) { Some(x) -> x, None -> panic("one diagnostic") };
+  assert_eq(d.code, b"E0419");
+  assert_eq(d.severity, b"error");
+  assert_eq(d.message, b"law \"a batch is small\" is false at xs = [0, 0]");
+  assert_eq(d.notes_text,
+            [b"forall (xs: List<Int>)", b"shrank from xs = [7, 9] in 2 steps", b"root 0 \xc2\xb7 case 11"]);
+  let gap: Row = { claim: a_claim("m.stored", Ensures(0)),
+                   outcome: Unattempted(UnhandledEffect(Some("{db.read[rows]}"))), reason: Fresh };
+  let warnings = diagnostics_of([gap]);
+  let w: Diag = match list_at(warnings, 0) { Some(x) -> x, None -> panic("one diagnostic") };
+  assert_eq(w.code, b"W0604");
+  assert_eq(w.severity, b"warning");
+  assert_eq(w.message, b"m.stored ensures #0 was not discharged: performs {db.read[rows]}: no handler")
+}
+
+test "a claim that holds raises nothing at all" {
+  let held: Row = { claim: a_claim("m.one", Ensures(0)), outcome: proved(Array([]), 1),
+                    reason: FromProof };
+  assert_eq(len(diagnostics_of([held])), 0)
+}
+
+test "the coverage line leads with the surface, and names what is left to read" {
+  let cov: Coverage = { definitions: 3, covered: 0, uncovered: ["m.double", "m.main", "m.triple"],
+                        by_tier: [] };
+  assert_eq(coverage_lines(plain(), cov, 0, false),
+            ["   3 definitions · 0 carry an obligation · 3 do not",
+             "   3 not covered by a claim that holds: m.double, m.main, m.triple"])
+}
+
+test "past six uncovered definitions the rest are counted rather than listed" {
+  let names = map(range(0, 8), |i: Int| "m.d" ++ int_to_string(i));
+  let cov: Coverage = { definitions: 8, covered: 0, uncovered: names, by_tier: [] };
+  let lines = coverage_lines(plain(), cov, 0, false);
+  assert(string_contains(nth(lines, 1), "and 2 more (`--explain` for all)"));
+  assert(!string_contains(nth(lines, 1), "m.d6"));
+  assert(string_contains(nth(coverage_lines(plain(), cov, 0, true), 1), "m.d7"))
+}
+
+test "seconds are two places, whatever the clock read" {
+  assert_eq(seconds(0.974m), "0.00");
+  assert_eq(seconds(1500m), "1.50");
+  assert_eq(seconds(12345.6m), "12.35");
+  assert_eq(seconds(decimal_of_int(0)), "0.00")
+}
