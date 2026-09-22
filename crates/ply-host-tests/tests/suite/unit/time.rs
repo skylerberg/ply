@@ -21,11 +21,11 @@ impl HostRuntime for Nothing {
     }
 }
 
-fn call(
+fn answer(
     handlers: &[(HostOp, Arc<dyn HostHandler>)],
     op: Op,
     args: &[Value],
-) -> Result<i64, Diagnostic> {
+) -> Result<Value, Diagnostic> {
     let (declaration, handler) = handlers
         .iter()
         .find(|(d, _)| d.op.as_str() == op.name())
@@ -43,9 +43,17 @@ fn call(
         },
     )?;
     match answer {
-        HostAnswer::Value(v) => v.as_int(Span::DUMMY, "a reading"),
-        HostAnswer::Pending(_) => panic!("a time reading waits on nothing"),
+        HostAnswer::Value(v) => Ok(v),
+        HostAnswer::Pending(_) => panic!("a time operation waits on nothing the runtime polls"),
     }
+}
+
+fn call(
+    handlers: &[(HostOp, Arc<dyn HostHandler>)],
+    op: Op,
+    args: &[Value],
+) -> Result<i64, Diagnostic> {
+    answer(handlers, op, args)?.as_int(Span::DUMMY, "a reading")
 }
 
 fn read(handlers: &[(HostOp, Arc<dyn HostHandler>)], op: Op) -> i64 {
@@ -60,16 +68,24 @@ fn the_registrations_declare_what_a_reviewer_relies_on() {
     for (op, _) in &handlers {
         assert_eq!(op.effect.as_str(), EFFECT);
         assert_eq!(op.determinism, Determinism::Nondeterministic);
-        // A reading consumes nothing, so a continuation may cross one more than once.
-        assert_eq!(op.linearity, Linearity::Repeatable, "{op}");
         assert!(!op.blocking, "{op}");
         assert!(!op.secrets, "a time is never a credential");
         assert!(op.path.starts_with("ply_host::time::"));
     }
+    // A reading consumes nothing, so a continuation may cross one more than once; a wait crossed
+    // twice waits twice.
+    for (op, _) in &handlers {
+        let repeatable = op.op.as_str() != Op::SleepMs.name();
+        assert_eq!(op.linearity == Linearity::Repeatable, repeatable, "{op}");
+    }
     assert!(DECLARATION.contains("pub nondet effect time"));
     for op in Op::ALL {
+        let declared = match op.arity() {
+            0 => format!(" {}()", op.name()),
+            _ => format!(" {}(", op.name()),
+        };
         assert!(
-            DECLARATION.contains(&format!(" {}()", op.name())),
+            DECLARATION.contains(&declared),
             "`{}` is not declared in std.time",
             op.name()
         );
@@ -117,13 +133,32 @@ fn the_monotonic_clock_counts_from_the_run_and_never_goes_back() {
     assert!(read(&handlers, Op::NowMs) > second);
 }
 
+/// The wait is the one operation a caller is owed time by, and the only one that takes an argument.
+#[test]
+fn a_wait_parks_for_the_span_it_was_given_and_answers_nothing() {
+    let time = Arc::new(TimeHost::new());
+    let handlers = registrations(&time);
+    let before = time.elapsed_ms();
+    let answered = answer(&handlers, Op::SleepMs, &[Value::Int(20)]).expect("a wait answers");
+    assert!(matches!(answered, Value::Unit), "a wait reads nothing back");
+    let after = time.elapsed_ms();
+    assert!(
+        after >= before + 20,
+        "{before} to {after} is not a 20ms wait"
+    );
+    // A span no clock can run backwards over is no wait at all rather than a refusal.
+    answer(&handlers, Op::SleepMs, &[Value::Int(-1)]).expect("a negative span waits for nothing");
+}
+
 // Arity is inference's, so the wrong count means the module was never checked.
 #[test]
 fn the_wrong_arity_is_a_dispatch_defect() {
     let time = Arc::new(TimeHost::new());
     let handlers = registrations(&time);
     for op in Op::ALL {
-        let refused = call(&handlers, op, &[Value::Unit]).expect_err("a reading takes nothing");
+        let given = vec![Value::Unit; op.arity() + 1];
+        let refused =
+            answer(&handlers, op, &given).expect_err("an operation takes what it declares");
         assert_eq!(refused.code, codes::INTERNAL_ERROR, "{}", op.name());
     }
 }
