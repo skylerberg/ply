@@ -112,3 +112,105 @@ fn the_bisection_switches_default_to_auto_and_reject_a_fourth_word() {
     assert!(Cli::try_parse_from(["ply", "test", "--bisect", "sometimes"]).is_err());
     assert!(Cli::try_parse_from(["ply", "test", "--bisect", "never"]).is_ok());
 }
+
+/// Every long flag `clap` declares anywhere in the command tree, and whether it takes a value.
+fn clap_flags() -> Vec<(String, bool)> {
+    fn walk(cmd: &clap::Command, out: &mut Vec<(String, bool)>) {
+        for arg in cmd.get_arguments() {
+            if let Some(long) = arg.get_long() {
+                let takes = matches!(
+                    arg.get_action(),
+                    clap::ArgAction::Set | clap::ArgAction::Append
+                );
+                out.push((format!("--{long}"), takes));
+            }
+        }
+        for sub in cmd.get_subcommands() {
+            walk(sub, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&Cli::command(), &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The string literals of one `fn` in `args.ply`, however the formatter laid the list out.
+fn ply_list(name: &str) -> Vec<String> {
+    let source = ply_cli::shipped::PROGRAM_SOURCES
+        .iter()
+        .find(|(module, _)| *module == "args")
+        .map(|(_, text)| *text)
+        .expect("the program carries `args`");
+    let at = source
+        .find(&format!("fn {name}()"))
+        .unwrap_or_else(|| panic!("`args.ply` defines `{name}`"));
+    let body = &source[at..];
+    let close = body.find(']').expect("the list closes");
+    body[..close]
+        .match_indices('"')
+        .step_by(2)
+        .map(|(open, _)| {
+            let rest = &body[open + 1..];
+            rest[..rest.find('"').expect("the literal closes")].to_string()
+        })
+        .collect()
+}
+
+/// `args.ply` must know every flag `clap` declares: one it does not know is read as a path, or
+/// refused, and its value is read as a path either way.
+#[test]
+fn the_ply_parser_knows_every_flag_clap_declares() {
+    let mut known: Vec<(String, bool)> = ply_list("machine_valued")
+        .into_iter()
+        .map(|f| (f, true))
+        .chain(ply_list("valued").into_iter().map(|f| (f, true)))
+        .chain(ply_list("machine_bool").into_iter().map(|f| (f, false)))
+        .collect();
+    // The flags the program reads for itself are spelled out in `one`, not in a list.
+    for flag in [
+        "--all",
+        "--check",
+        "--costs",
+        "--deps",
+        "--digest",
+        "--explain",
+        "--json",
+        "--no-cache",
+        "--types",
+        "--watch",
+    ] {
+        known.push((flag.to_string(), false));
+    }
+    known.sort();
+    known.dedup();
+
+    let declared = clap_flags();
+    let missing: Vec<&String> = declared
+        .iter()
+        .map(|(name, _)| name)
+        .filter(|name| !known.iter().any(|(k, _)| k == *name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "`clap` declares flags `args.ply` does not know, so a real command line carrying one \
+         would be refused or read as a path: {missing:?}"
+    );
+
+    let disagreed: Vec<(String, bool, bool)> = declared
+        .iter()
+        .filter_map(|(name, takes)| {
+            known
+                .iter()
+                .find(|(k, _)| k == name)
+                .filter(|(_, mine)| mine != takes)
+                .map(|(_, mine)| (name.clone(), *takes, *mine))
+        })
+        .collect();
+    assert!(
+        disagreed.is_empty(),
+        "`args.ply` disagrees with `clap` about whether these take a value (flag, clap, ply): \
+         {disagreed:?}"
+    );
+}
