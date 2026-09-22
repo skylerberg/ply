@@ -1202,23 +1202,28 @@ could not run. Build replies with `exited(code, out, err)` and
 
 ```ply
 pub nondet effect time {
-  read now_ms()     -> Int
-  read elapsed_ms() -> Int
+  read now_ms()           -> Int
+  read elapsed_ms()       -> Int
+  write sleep_ms(ms: Int) -> Unit
 }
 pub fn deadline_in(ms: Int) -> Int / {time.elapsed_ms}
 pub fn expired(deadline: Int) -> Bool / {time.elapsed_ms}
 pub fn since(started: Int) -> Int / {time.elapsed_ms}
 ```
 
-The host's real time, in two readings, neither a function of the program state,
-so a definition that takes one is `nondet` and a `test` over it must handle it.
-`now_ms` is milliseconds since the Unix epoch: a date to stamp a record with, and
-nothing to measure with, since the system clock can be set backwards.
-`elapsed_ms` counts from the moment the run's host was built and never goes back,
-so the difference of two readings is a span; a single reading means nothing on
-its own. Handle both over a `Ticks` value: `ticks(wall, mono)` reads each list in
-order through `now_step` and `elapsed_step`, each answering a `Tick` of the
-reading and the ticks left, and repeats the last reading once a list runs out.
+The host's real time, in two readings and a wait, none of them a function of the
+program state, so a definition that takes one is `nondet` and a `test` over it
+must handle it. `now_ms` is milliseconds since the Unix epoch: a date to stamp a
+record with, and nothing to measure with, since the system clock can be set
+backwards. `elapsed_ms` counts from the moment the run's host was built and never
+goes back, so the difference of two readings is a span; a single reading means
+nothing on its own. Handle both over a `Ticks` value: `ticks(wall, mono)` reads
+each list in order through `now_step` and `elapsed_step`, each answering a `Tick`
+of the reading and the ticks left, and repeats the last reading once a list runs
+out. `sleep_ms` parks the thread that performs it for that many milliseconds — a
+span no clock can run backwards over, so a negative one is no wait at all — and a
+test handles it with a clause of its own, so a program that polls is tested
+without waiting.
 
 This is not the language's `clock` (§9), which is virtual time: `clock.sleep`
 arms a timer the scheduler advances, and `clock.now` reads where the schedule has
