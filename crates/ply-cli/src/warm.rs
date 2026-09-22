@@ -144,13 +144,19 @@ pub fn stamps(files: &[Found]) -> BTreeMap<PathBuf, Stamp> {
 
 /// Whether the tree's `.ply` count differs from the held state's.
 fn discovered_more(root: &Path, known: &BTreeMap<PathBuf, Stamp>) -> bool {
-    let mut seen = 0usize;
+    match sources_under(root) {
+        // A single-file root, or a tree that moved; the load path reports either.
+        None => root.is_file() && !known.contains_key(root),
+        Some(found) => found.len() != known.len(),
+    }
+}
+
+/// Every `.ply` file under `root`, or `None` when a directory could not be read.
+fn sources_under(root: &Path) -> Option<Vec<PathBuf>> {
+    let mut found = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            // A single-file root, or a tree that moved; the load path reports either.
-            return dir == root && root.is_file() && !known.contains_key(root);
-        };
+        let entries = std::fs::read_dir(&dir).ok()?;
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -158,9 +164,21 @@ fn discovered_more(root: &Path, known: &BTreeMap<PathBuf, Stamp>) -> bool {
                     stack.push(path);
                 }
             } else if path.extension().is_some_and(|e| e == "ply") {
-                seen += 1;
+                found.push(path);
             }
         }
     }
-    seen != known.len()
+    Some(found)
+}
+
+/// How the tree stamps now, for a caller that watches it without holding a front end.
+pub fn tree_stamps(root: &Path) -> BTreeMap<PathBuf, Stamp> {
+    sources_under(root)
+        .unwrap_or_else(|| vec![root.to_path_buf()])
+        .into_iter()
+        .map(|path| {
+            let stamp = stamp_of(&path);
+            (path, stamp)
+        })
+        .collect()
 }
