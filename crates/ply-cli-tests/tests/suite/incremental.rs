@@ -508,6 +508,8 @@ fn prove_asks_for_claims_only_when_something_is_discharged_and_only_where_an_edi
     use clap::Parser;
     use ply_cli::cli::{Cli, Command};
     use ply_codegen::c::producer;
+    use ply_prove::ProvePlan;
+    use ply_test::obligation::Asked;
     let dir = tempfile::tempdir().unwrap();
     write(
         dir.path(),
@@ -542,32 +544,58 @@ fn zero(x: Int) -> Int
 = x - x
 ",
     );
-    let path = dir.path().to_str().unwrap().to_string();
-    let prove = |what: &str, flags: &[&str], claimed: usize| {
-        let mut argv = vec!["ply", "prove"];
-        argv.extend_from_slice(flags);
-        argv.push(&path);
-        let Command::Prove(args) = Cli::parse_from(argv).command else {
-            panic!("`ply prove` parsed as another command");
-        };
+
+    // `ply prove` lowers claims on the thread its prover runs on, and the port's census is that
+    // thread's, so it is read here, where the claims are asked for.
+    let lowered = |what: &str, claimed: usize| {
+        let mut store = Store::open(dir.path()).unwrap();
+        let loaded = driver::load_incremental(dir.path(), &mut store).expect("the project loads");
         producer::reset_census();
-        let code = ply_cli::commands::prove::execute(&args, ply_cli::style::Style::plain());
-        assert_eq!(code, ply_cli::EXIT_OK, "{what}: every claim holds");
+        driver::claims(&loaded, Some(&mut store)).expect("the claims lower");
         assert_eq!(
             producer::census().claimed,
             claimed,
             "{what}: modules whose claims the port was asked for"
         );
+        store.flush().unwrap();
     };
 
-    prove("cold", &[], 3);
-    prove("every obligation discharged again", &["--no-cache"], 0);
+    lowered("cold", 3);
+    lowered("nothing edited", 0);
     edit(dir.path(), "side.ply", "x - x", "x - x + 0");
-    prove("an edit to a module nothing imports", &[], 1);
+    lowered("an edit to a module nothing imports", 1);
     edit(dir.path(), "base.ply", "x + one()", "x + one() + 0");
-    prove("an edit to a module another imports", &[], 2);
+    lowered("an edit to a module another imports", 2);
+
+    let path = dir.path().to_str().unwrap().to_string();
+    let prove = |what: &str| {
+        let Command::Prove(args) = Cli::parse_from(["ply", "prove", &path]).command else {
+            panic!("`ply prove` parsed as another command");
+        };
+        let code = ply_cli::commands::prove::execute(&args, ply_cli::style::Style::plain());
+        assert_eq!(code, ply_cli::EXIT_OK, "{what}: every claim holds");
+    };
+    prove("cold");
+    prove("warm");
+
+    // What the run reads the cache for: every obligation answered is a run that builds no prover,
+    // and so lowers no claims however stale the answer file is.
     fs::remove_file(dir.path().join(".ply-cache/claims.answer")).unwrap();
-    prove("every obligation answered from the cache", &[], 0);
+    let mut store = Store::open(dir.path()).unwrap();
+    let loaded = driver::load_incremental(dir.path(), &mut store).expect("the project loads");
+    let scoped = ply_cli::obligations::project_view(&loaded.check, false);
+    let collected = ply_cli::obligations::collect(&loaded.front, &scoped, &loaded.hashes);
+    assert_eq!(collected.obligations.len(), 3);
+    let asked = Asked::new(
+        collected.obligations,
+        &store,
+        &ProvePlan::default().normalized(),
+        true,
+    );
+    assert!(
+        !asked.pending(),
+        "every obligation is answered from the cache, so no prover is built"
+    );
 }
 
 #[test]
