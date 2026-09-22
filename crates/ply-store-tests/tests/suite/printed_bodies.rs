@@ -811,6 +811,52 @@ fn two_identical_effect_declarations_are_one_hash() {
 }
 
 #[test]
+fn two_sums_that_differ_only_in_their_names_are_two_declarations() {
+    let original = compile(&[
+        ("a", "pub type One = | Wrap(Int)"),
+        ("b", "pub type Two = | Wrap(Int)"),
+    ]);
+    assert_ne!(
+        original.hashes.decls[&Symbol::new("a.One")],
+        original.hashes.decls[&Symbol::new("b.Two")],
+        "`unify_structural` compares a named type by name, so a hash may not ignore it"
+    );
+}
+
+#[test]
+fn one_sum_declared_in_two_modules_is_one_declaration() {
+    let original = compile(&[
+        ("a", "pub type One = | Wrap(Int)"),
+        ("b", "pub type One = | Wrap(Int)"),
+    ]);
+    assert_eq!(
+        original.hashes.decls[&Symbol::new("a.One")],
+        original.hashes.decls[&Symbol::new("b.One")],
+        "a module path is no part of an identity, so vendoring a module must move nothing"
+    );
+}
+
+/// An alias is expanded by `conv_type` before anything unifies, so the checker has no name to
+/// compare and a hash that carried one would be finer than the identity it is for.
+#[test]
+fn an_alias_is_transparent_so_its_name_is_no_part_of_it() {
+    let metres = compile(&[(
+        "m",
+        "pub type Metres = Int\npub fn go(x: Metres) -> Metres = x",
+    )]);
+    let feet = compile(&[("m", "pub type Feet = Int\npub fn go(x: Feet) -> Feet = x")]);
+    assert_eq!(
+        metres.hashes.decls[&Symbol::new("m.Metres")],
+        feet.hashes.decls[&Symbol::new("m.Feet")]
+    );
+    assert_eq!(
+        metres.hashes.defs[&Symbol::new("m.go")],
+        feet.hashes.defs[&Symbol::new("m.go")],
+        "the two definitions have one type, so they are one definition"
+    );
+}
+
+#[test]
 fn two_effects_that_differ_only_in_their_names_are_two_declarations() {
     let original = compile(&[
         ("a", "pub effect one { read at() -> Int }"),
