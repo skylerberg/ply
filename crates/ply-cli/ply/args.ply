@@ -102,12 +102,91 @@ fn carried(acc: Flags, arg: String) -> Flags =
     ) { { ..acc, db_schema: Some(value_of(arg, "--db-schema=")) } }
   else if string_starts_with(arg, "--out=") { { ..acc, out: Some(value_of(arg, "--out=")) } }
   else if string_starts_with(arg, "--diff=") { { ..acc, diff: Some(value_of(arg, "--diff=")) } }
-  else { { ..acc, paths: push(acc.paths, strip_dot(arg)) } }
+  else { as_path(acc, arg) }
 
+fn as_path(acc: Flags, arg: String) -> Flags = { ..acc, paths: push(acc.paths, strip_dot(arg)) }
+
+// The flags whose value may stand in the next word instead of their own. A word here is never a
+// path, so the word after it is never read as one either.
+fn valued() -> List<String> =
+  [
+    "--root",
+    "--action",
+    "--query",
+    "--shipped-digest",
+    "--filter",
+    "--entry",
+    "--config-schema",
+    "--db-schema",
+    "--out",
+    "--diff",
+    "--color",
+  ]
+
+fn names(list: List<String>, want: String) -> Bool =
+  fold(list, false, |acc: Bool, s: String| acc || s == want)
+
+// The long spelling a short flag stands for.
+fn long_of(arg: String) -> Option<String> = if arg == "-o" { Some("--out") } else { None }
+
+// Where the reading has got to: the flags so far, a flag still owed its value, and whether `--`
+// has been passed, after which every word is a path whatever it looks like.
+type Reading = { flags: Flags, owed: Option<String>, ended: Bool }
+
+// A value in the next word is read as the word it would have been fused into, so a flag is
+// spelled out in one place however it was written.
+fn step(r: Reading, arg: String) -> Reading =
+  match r.owed {
+    Some(key) -> { ..r, flags: one(r.flags, key ++ "=" ++ arg), owed: None },
+    None -> if r.ended { { ..r, flags: as_path(r.flags, arg) } }
+    else if arg == "--" { { ..r, ended: true } } else {
+      match long_of(arg) {
+        Some(long) -> { ..r, owed: Some(long) },
+        None -> if names(valued(), arg) { { ..r, owed: Some(arg) } }
+        else { { ..r, flags: one(r.flags, arg) } },
+      }
+    },
+  }
+
+// A flag left owed a value at the end of the line is dropped; refusing it is the same work as
+// refusing an unknown flag, and belongs with it.
 pub fn read(args: List<String>) -> Flags =
-  fold(args, no_flags(), |acc: Flags, arg: String| one(acc, arg))
+  fold(args, { flags: no_flags(), owed: None, ended: false }, |r: Reading, arg: String|
+    step(r, arg)).flags
 
 // --- Tests ------------------------------------------------------------------
+
+test "a flag's value may stand in the next word as well as in its own" {
+  let fused = read(["--filter=thr", "--root=/w", "--out=a.plyx", "--color=never"]);
+  let spaced = read(["--filter", "thr", "--root", "/w", "--out", "a.plyx", "--color", "never"]);
+  assert_eq(spaced.filter, fused.filter);
+  assert_eq(spaced.root, fused.root);
+  assert_eq(spaced.out, fused.out);
+  assert_eq(spaced.color, fused.color);
+  // The value is never mistaken for a path, whichever way it was written.
+  assert_eq(spaced.paths, []);
+  assert_eq(fused.paths, [])
+}
+
+test "`-o` is `--out`, and takes the word after it" {
+  let short = read(["-o", "out.plyx"]);
+  assert_eq(short.out, Some("out.plyx"));
+  assert_eq(short.paths, [])
+}
+
+test "after `--` every word is a path, whatever it looks like" {
+  let flags = read(["--json", "--", "--json", "-o", "m.ply"]);
+  assert(flags.json);
+  assert_eq(flags.paths, ["--json", "-o", "m.ply"]);
+  // The `-o` past `--` took no value with it.
+  assert_eq(flags.out, None)
+}
+
+test "a value that looks like a flag is still that flag's value" {
+  let flags = read(["--filter", "--json"]);
+  assert_eq(flags.filter, "--json");
+  assert(!flags.json)
+}
 
 test "the flags are read in any order and every other word is a path, with `./` stripped" {
   let flags = read(["--json", "./a.ply", "--check", "b/c.ply"]);
