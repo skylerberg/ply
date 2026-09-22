@@ -16,6 +16,7 @@ pub mod load;
 pub mod migrate;
 pub mod obligations;
 pub mod payload;
+pub mod run;
 pub mod shipped;
 pub mod signature;
 pub mod simulation;

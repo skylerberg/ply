@@ -1760,11 +1760,12 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
          crates/ply-cli-tests/tests/suite/cli.rs was seen to fail.",
     ),
     (
-        "crates/ply-cli/src/commands/run.rs",
-        "`evaluate`, installing what `ply run --backend` names on the machine that runs \
-         `main`. `ply run` has no result cache: nothing it answers is a `Pass`, nothing is \
-         read before `main` and nothing is recorded after it, so neither half of the rule \
-         has a route to break. `run_attaches_a_backend_to_main_and_refuses_a_spec_it_cannot_parse` \
+        "crates/ply-cli/src/run.rs",
+        "`evaluate`, installing what `ply run --backend` names on the machine that runs the \
+         entry, over a project or over a `.plyx`. `ply run` has no result cache: nothing it \
+         answers is a `Pass`, nothing is read before the entry and nothing is recorded after \
+         it, so neither half of the rule has a route to break. \
+         `run_attaches_a_backend_to_main_and_refuses_a_spec_it_cannot_parse` \
          in crates/ply-cli-tests/tests/suite/backend.rs runs `main` under both backends and was \
          seen to fail, on the seam memo walking a scalar answer for parts.",
     ),

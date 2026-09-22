@@ -35,6 +35,37 @@ pub fn strings<'a>(items: impl IntoIterator<Item = &'a str>) -> PlyValue {
     PlyValue::list(items.into_iter().map(PlyValue::str).collect())
 }
 
+/// A document this side wrote as `std.json.Json`: what a facility discloses about itself, which
+/// the program places under the keys its own report gives it.
+pub fn json(value: &serde_json::Value) -> PlyValue {
+    match value {
+        serde_json::Value::Null => ctor("std.json", "Null", Vec::new()),
+        serde_json::Value::Bool(b) => ctor("std.json", "Bool", vec![PlyValue::Bool(*b)]),
+        serde_json::Value::Number(n) => ctor("std.json", "Number", vec![number(n)]),
+        serde_json::Value::String(s) => ctor("std.json", "Str", vec![PlyValue::str(s)]),
+        serde_json::Value::Array(items) => ctor(
+            "std.json",
+            "Array",
+            vec![PlyValue::list(items.iter().map(json).collect())],
+        ),
+        serde_json::Value::Object(fields) => ctor(
+            "std.json",
+            "Object",
+            vec![PlyValue::map(
+                fields
+                    .iter()
+                    .map(|(key, value)| (PlyValue::str(key), json(value))),
+            )],
+        ),
+    }
+}
+
+/// A number written back through `Decimal`, which is what a `Json` number is. A magnitude it
+/// cannot hold is no count or ratio this side ever writes.
+fn number(n: &serde_json::Number) -> PlyValue {
+    PlyValue::Decimal(n.to_string().parse().unwrap_or_default())
+}
+
 /// `compiler.resolve.Diag`, as `crates/ply-cli/ply/diagnostic.ply` renders it. A label carries
 /// the source id its span names, which is the index of its file in `places`.
 pub fn diag_value(diagnostic: &Diagnostic) -> PlyValue {

@@ -995,6 +995,44 @@ fn a_raising_main_exits_one() {
     assert!(String::from_utf8(out.stderr).unwrap().contains("nope"));
 }
 
+const SPINS: &str = "fn spin(n: Int) -> Int = spin(n + 1)\nfn main() -> Int = spin(0)\n";
+
+/// The entry is bounded by the flags and by nothing else. A bound that reached the entry from
+/// somewhere other than these two flags — a process-wide default, or the scope the tool's own
+/// program runs in — would make `--steps` and `--timeout` quietly stop working.
+#[test]
+fn the_entry_is_bounded_by_the_steps_the_flag_names() {
+    let dir = project(SPINS);
+    let out = ply(dir.path())
+        .args(["run", "--json", "--steps", "1000"])
+        .output()
+        .unwrap();
+    let v = json_of(&out);
+    assert_eq!(out.status.code(), Some(1), "{v}");
+    assert_eq!(v["diagnostics"][0]["code"], "E0503", "{v}");
+    assert!(
+        v["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("budget of 1000 calls"),
+        "{v}"
+    );
+}
+
+/// The clock describes the machine, so what it stops is no verdict: the run is abandoned where it
+/// stood and attributed to no line of the program.
+#[test]
+fn the_entry_is_bounded_by_the_clock_the_flag_names() {
+    let dir = project(SPINS);
+    let out = ply(dir.path())
+        .args(["run", "--json", "--timeout", "300"])
+        .output()
+        .unwrap();
+    let v = json_of(&out);
+    assert_eq!(out.status.code(), Some(1), "{v}");
+    assert_eq!(v["diagnostics"][0]["code"], "W0612", "{v}");
+}
+
 #[test]
 fn run_finds_the_one_main_wherever_it_lives() {
     let dir = tempfile::tempdir().unwrap();
