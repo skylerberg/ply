@@ -210,6 +210,37 @@ fn first_difference(file: &str, once: &str, twice: &str) -> String {
     )
 }
 
+/// Every `.ply` source the repository maintains, as against the fixtures written to be malformed
+/// or to pin a golden.
+const MAINTAINED: [&str; 6] = [
+    "crates/ply-compiler/ply",
+    "crates/ply-cli/ply",
+    "crates/ply-std/ply",
+    "crates/ply-corpus/ply",
+    "examples",
+    "benches",
+];
+
+/// A layout only a scratch copy is ever held to is not canonical. A source committed unformatted
+/// puts its reformatting into the next change that touches it, where it is indistinguishable from
+/// that change.
+#[test]
+fn the_maintained_sources_are_committed_formatted() {
+    let out = ply(&repo())
+        .arg("fmt")
+        .arg("--check")
+        .args(MAINTAINED)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "`ply fmt` would rewrite sources that are committed as they are; run it and commit that:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
 #[test]
 fn the_examples_format_to_a_fixed_point_and_still_check() {
     corpus_round_trip("examples", true);
