@@ -49,7 +49,8 @@ fn registration(op: &str, path: &'static str) -> HostOp {
         // A tree and the files beside it are not functions of program state.
         determinism: Determinism::Nondeterministic,
         linearity: Linearity::AtMostOnce,
-        blocking: true,
+        // The work is done before the program is entered, so the handler answers, not dispatches.
+        blocking: false,
         secrets: false,
         path,
     }
