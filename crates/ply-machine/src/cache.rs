@@ -56,10 +56,11 @@ const OPERATIONS: [(&str, &str); 4] = [
     ("cleared", "ply_cli::cache::cleared"),
 ];
 
-/// The action runs here, before the program is entered: a handler is handed `&self`, and a store
-/// that compacts or clears is worked with `&mut`.
-pub fn lent(action: &CacheAction) -> Vec<Lent> {
-    let done: Arc<dyn HostHandler> = Arc::new(Did::of(action));
+/// The ops and the one handler serving them: the action runs where the program asks for it, with
+/// the path it names. A handler is handed `&self`, and a store that compacts or clears is worked
+/// with `&mut`.
+pub fn lent() -> Vec<Lent> {
+    let done: Arc<dyn HostHandler> = Arc::new(Did);
     OPERATIONS
         .into_iter()
         .map(|(op, path)| (registration(op, path), Arc::clone(&done)))
@@ -81,50 +82,59 @@ fn registration(op: &str, path: &'static str) -> HostOp {
     }
 }
 
-/// The one action this invocation ran, and what it came back with.
-enum Did {
-    Statistics(Result<Stats, Refused>),
-    Matches(Result<Matches, Refused>),
-    Compacted(Result<Compacted, Refused>),
-    Cleared(Result<Cleared, Refused>),
-}
-
-impl Did {
-    fn of(action: &CacheAction) -> Did {
-        match action {
-            CacheAction::Stats(scope) => Did::Statistics(statistics(scope)),
-            CacheAction::Compact(scope) => Did::Compacted(compacted(scope)),
-            CacheAction::Clear(scope) => Did::Cleared(cleared(scope)),
-            CacheAction::Inspect(args) => Did::Matches(matches(args)),
-        }
-    }
-
-    fn op(&self) -> &'static str {
-        match self {
-            Did::Statistics(_) => "statistics",
-            Did::Matches(_) => "matches",
-            Did::Compacted(_) => "compacted",
-            Did::Cleared(_) => "cleared",
-        }
-    }
-
-    fn value(&self) -> PlyValue {
-        match self {
-            Did::Statistics(answer) => answered(answer, statistics_value),
-            Did::Matches(answer) => answered(answer, matches_value),
-            Did::Compacted(answer) => answered(answer, compacted_value),
-            Did::Cleared(answer) => answered(answer, cleared_value),
-        }
-    }
-}
+/// The one handler: the action runs where the program asks for it.
+struct Did;
 
 impl HostHandler for Did {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
-        if req.op.op.as_str() != self.op() {
-            return Err(unasked(req.op.op.as_str(), self.op(), req.span));
-        }
-        Ok(HostAnswer::Value(self.value()))
+        let span = req.span;
+        let path = |value: &PlyValue| -> Result<PathBuf, Diagnostic> {
+            Ok(PathBuf::from(value.as_str(span, "the project's path")?))
+        };
+        let value = match (req.op.op.as_str(), req.args) {
+            ("statistics", [p]) => answered(
+                &statistics(&CacheScope {
+                    path: path(p)?,
+                    json: false,
+                }),
+                statistics_value,
+            ),
+            ("matches", [query, p]) => answered(
+                &matches(&InspectOptions {
+                    query: query
+                        .as_str(span, "the definition asked about")?
+                        .to_string(),
+                    path: path(p)?,
+                    json: false,
+                }),
+                matches_value,
+            ),
+            ("compacted", [p]) => answered(
+                &compacted(&CacheScope {
+                    path: path(p)?,
+                    json: false,
+                }),
+                compacted_value,
+            ),
+            ("cleared", [p]) => answered(
+                &cleared(&CacheScope {
+                    path: path(p)?,
+                    json: false,
+                }),
+                cleared_value,
+            ),
+            (other, _) => return Err(unasked(other, span)),
+        };
+        Ok(HostAnswer::Value(value))
     }
+}
+
+fn unasked(op: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("`store.{op}` reached the binding, and `ply cache` serves no such operation"),
+    )
+    .primary(span, "this is Ply's fault")
 }
 
 // --- Opening -----------------------------------------------------------------
@@ -733,14 +743,4 @@ fn shown(path: &Path) -> String {
 /// A byte count the program reads as an `Int`; no cache comes near `i64`.
 fn size(n: u64) -> PlyValue {
     PlyValue::Int(n as i64)
-}
-
-#[cold]
-fn unasked(op: &str, ran: &str, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!("`{EFFECT}.{op}` reached the binding, and this run did `{EFFECT}.{ran}`"),
-    )
-    .primary(span, "this perform reached `ply cache`")
-    .note("the subcommand and the operation are written together; this is Ply's fault")
 }

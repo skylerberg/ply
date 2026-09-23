@@ -1,6 +1,13 @@
 use ply_cli::driver;
 use ply_cli::load::Loaded;
 use ply_store::Store;
+
+/// The binary, at the directory under test.
+fn ply(dir: &Path) -> assert_cmd::Command {
+    let mut cmd = assert_cmd::Command::cargo_bin("ply").expect("the binary");
+    cmd.current_dir(dir);
+    cmd
+}
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -505,8 +512,6 @@ fn a_seeded_load_answers_as_a_full_load_through_every_kind_of_edit() {
 
 #[test]
 fn prove_asks_for_claims_only_when_something_is_discharged_and_only_where_an_edit_reached() {
-    use clap::Parser;
-    use ply_cli::cli::{Cli, Command};
     use ply_codegen::c::producer;
     use ply_prove::ProvePlan;
     use ply_test::obligation::Asked;
@@ -567,13 +572,9 @@ fn zero(x: Int) -> Int
     edit(dir.path(), "base.ply", "x + one()", "x + one() + 0");
     lowered("an edit to a module another imports", 2);
 
-    let path = dir.path().to_str().unwrap().to_string();
     let prove = |what: &str| {
-        let Command::Prove(args) = Cli::parse_from(["ply", "prove", &path]).command else {
-            panic!("`ply prove` parsed as another command");
-        };
-        let code = ply_cli::commands::prove::execute(&args, ply_cli::style::Style::plain());
-        assert_eq!(code, ply_cli::EXIT_OK, "{what}: every claim holds");
+        ply(dir.path()).args(["prove", "."]).assert().success();
+        let _ = what;
     };
     prove("cold");
     prove("warm");

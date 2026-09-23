@@ -1,20 +1,28 @@
-// `ply`, as a program: one artifact, one entry point, one command word. The Rust side parses the
-// command line with `clap`, so an unknown flag never reaches here; it hands over the command, the
-// flags this program reads, and the paths relative to the root it bound as `cwd`. The modules this
-// binary ships are bound as the root `shelf`, since a program cannot read the binary it runs in.
+// `ply`, as a program: one artifact, one entry point, one command word. The line is this
+// program's to read — `surface.ply` declares it and `cmdline.ply` parses it, so an unknown flag is
+// refused before any command runs. The launcher hands over the raw argument vector and binds the
+// working directory as `cwd`, the filesystem's root as `abs`, and the shipped modules as `shelf`.
 
 import std.process (process, Captured, captured, args_step, out_step, err_step, exit_step)
-import std.fs (fs)
+import std.fs (fs, Dir)
 import std.json (Json, Str, Bool, Number, object, to_string)
 import std.time (time)
-import args (Flags, read, style_of, takes_value)
-import report (Answer, compile_error, schema_version)
+import args
+import cmdline
+import args (Flags, read, style_of)
+import cmdline (Help, Parsed, Refused, Run, Version, parse, value)
+import env
+import env (env)
+import paths
+import surface (spec)
+import report (Answer, compile_error, ok_code, schema_version)
 import style (Style, red)
 import bootstrap
 import build
 import cache
 import callers
 import check
+import claims
 import claims (prover)
 import defs
 import doc
@@ -36,7 +44,8 @@ import tests
 fn answer_of(
   command: String,
   flags: Flags,
-) -> Answer / {process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, hosts::tcb.preview[host], hosts::tcb.open[host], cache::store.statistics[cache], cache::store.matches[cache], cache::store.compacted[cache], cache::store.cleared[cache], replace::edit.item[replace], bootstrap::archive.emitted[bootstrap], bootstrap::archive.land[bootstrap], build::builder.loaded[build], build::builder.made[build], build::builder.previous[build], build::builder.stored[build], machine::machine.load[run], machine::machine.reload[run], machine::machine.bound[run], machine::machine.enter[run], machine::machine.drop[run], tests::tester.loaded[corpus], tests::tester.bound[corpus], tests::tester.ran[corpus], prover.collected[claims], prover.discharged[claims], prover.reviewed[claims], prover.accepted[claims]} =
+  p: Parsed,
+) -> Answer / {process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.resolved[cwd], fs.resolved[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, machine::machine.configure[run], tests::tester.configure[corpus], prover.configure[claims], hosts::tcb.preview[host], hosts::tcb.open[host], cache::store.statistics[cache], cache::store.matches[cache], cache::store.compacted[cache], cache::store.cleared[cache], replace::edit.item[replace], bootstrap::archive.emitted[bootstrap], bootstrap::archive.land[bootstrap], build::builder.loaded[build], build::builder.made[build], build::builder.previous[build], build::builder.stored[build], machine::machine.load[run], machine::machine.reload[run], machine::machine.bound[run], machine::machine.enter[run], machine::machine.drop[run], tests::tester.loaded[corpus], tests::tester.bound[corpus], tests::tester.ran[corpus], prover.collected[claims], prover.discharged[claims], prover.reviewed[claims], prover.accepted[claims]} =
   if command == "bootstrap" { bootstrap::run(flags) }
   else if command == "build" { build::run(flags) }
   else if command == "cache" { cache::run(flags) }
@@ -46,16 +55,16 @@ fn answer_of(
   else if command == "hash" { hashes::run(flags) }
   else if command == "doc" { doc::run(flags) }
   else if command == "explain" { explain::run(flags) }
-  else if command == "hosts" { hosts::run(flags) }
-  else if command == "prove" { prove::run(flags) }
+  else if command == "hosts" { hosts::run(flags, machine::options_from(p)) }
+  else if command == "prove" { prove::run(flags, claims::options_from(p, root_of_flags(flags))) }
   else if command == "replace" { replace::run(flags) }
-  else if command == "review" { review::run(flags) }
-  else if command == "run" { run::run(flags) }
+  else if command == "review" { review::run(flags, claims::options_from(p, root_of_flags(flags))) }
+  else if command == "run" { run::run(flags, machine::options_from(p)) }
   else if command == "show" { show::run(flags) }
   else if command == "std" { stdlib::run(flags) }
-  else if command == "test" { tests::run(flags) }
+  else if command == "test" { tests::run(flags, tests::options_from(p, root_of_flags(flags))) }
   else if command == "fmt" { fmt::run(flags) }
-  else { unknown_command(style_of(flags), command) }
+  else { panic("the parser refused the word first; `cmdline` owns this refusal") }
 
 // Every command this program answers, in the order `dispatch` tries them.
 fn commands() -> List<String> =
@@ -80,66 +89,14 @@ fn commands() -> List<String> =
     "test",
   ]
 
+// The target path the command loads, as the machine names it: the resolved root's absolute form.
+fn root_of_flags(flags: Flags) -> String =
+  match list_at(flags.paths, 0) { Some(r) -> r.machine, None -> "." }
+
 // A word no arm claims is refused rather than dispatched. `fmt` has an arm of its own, so no word
 // may reach it by falling through: `ply frobnicate` would otherwise rewrite the tree.
-fn unknown_command(s: Style, command: String) -> Answer = {
-  let message = "`" ++ command ++ "` is not a `ply` command; try one of " ++ joined(commands());
-  {
-    json: object([
-      { key: "command", value: Str(command) },
-      { key: "schema_version", value: Number(decimal_of_int(schema_version())) },
-      { key: "ok", value: Bool(false) },
-      { key: "exit_code", value: Number(decimal_of_int(compile_error())) },
-      { key: "error", value: Str(message) },
-    ]),
-    lines: [],
-    errs: [red(s, "error") ++ ": " ++ message],
-    code: compile_error(),
-  }
-}
-
-// A word spelled like a flag that no command reads. Named one at a time: the first is the one to
-// fix, and a line of them is a line of guesses about the rest.
-fn unknown_flag(s: Style, command: String, flag: String) -> Answer = {
-  let message = "`" ++ flag ++ "` is not a flag `ply " ++ command
-    ++ "` reads; a path that begins with `-` goes after `--`";
-  {
-    json: object([
-      { key: "command", value: Str(command) },
-      { key: "schema_version", value: Number(decimal_of_int(schema_version())) },
-      { key: "ok", value: Bool(false) },
-      { key: "exit_code", value: Number(decimal_of_int(compile_error())) },
-      { key: "error", value: Str(message) },
-    ]),
-    lines: [],
-    errs: [red(s, "error") ++ ": " ++ message],
-    code: compile_error(),
-  }
-}
-
 fn joined(words: List<String>) -> String =
   match words { [] -> "", [last] -> last, [first, ..rest] -> first ++ ", " ++ joined(rest) }
-
-// The command word is the first word that is neither a flag nor a flag's value, so
-// `ply --color never test` names `test`. Every other word is a flag for the command to read,
-// wherever it stood. The Rust side puts the command first today; a command line need not.
-fn appended<a>(head: List<a>, tail: List<a>) -> List<a> =
-  fold(tail, head, |acc: List<a>, x: a| push(acc, x))
-
-fn commanded(argv: List<String>) -> Option<{ command: String, rest: List<String> }> =
-  match found(argv, []) { None -> None, Some(f) -> Some({ command: f.command, rest: f.rest }) }
-
-fn found(
-  argv: List<String>,
-  seen: List<String>,
-) -> Option<{ command: String, rest: List<String> }> =
-  match argv {
-    [] -> None,
-    [word, ..more] -> if takes_value(word) {
-      match more { [] -> None, [value, ..after] -> found(after, push(push(seen, word), value)) }
-    } else if string_starts_with(word, "-") && word != "-" { found(more, push(seen, word)) }
-    else { Some({ command: word, rest: appended(seen, more) }) },
-  }
 
 fn say(lines: List<String>) -> Unit / {process.out[proc]} =
   match lines {
@@ -178,10 +135,11 @@ fn parted(flags: Flags) -> Unit / {process.out[proc]} =
 // the baseline, and that save is the one the next report exists to notice.
 fn watching(
   flags: Flags,
-) -> Int / {process.out[proc], process.err[proc], time.sleep_ms, tests::tester.loaded[corpus], tests::tester.bound[corpus], tests::tester.ran[corpus], tests::tester.stamped[corpus]} = {
+  options: tests::Options,
+) -> Int / {process.out[proc], process.err[proc], time.sleep_ms, tests::tester.configure[corpus], tests::tester.loaded[corpus], tests::tester.bound[corpus], tests::tester.ran[corpus], tests::tester.stamped[corpus]} = {
   let baseline: Option<List<String>> = tests::tester.stamped[corpus]();
-  said(tests::run(flags), flags);
-  watched(flags, baseline)
+  said(tests::run(flags, options), flags);
+  watched(flags, options, baseline)
 }
 
 // A walk that failed reports `None`, and two of those are not a tree that held still: the report
@@ -194,44 +152,60 @@ fn moved(now: Option<List<String>>, baseline: Option<List<String>>) -> Bool =
 
 fn watched(
   flags: Flags,
+  options: tests::Options,
   baseline: Option<List<String>>,
-) -> Int / {process.out[proc], process.err[proc], time.sleep_ms, tests::tester.loaded[corpus], tests::tester.bound[corpus], tests::tester.ran[corpus], tests::tester.stamped[corpus]} = {
+) -> Int / {process.out[proc], process.err[proc], time.sleep_ms, tests::tester.configure[corpus], tests::tester.loaded[corpus], tests::tester.bound[corpus], tests::tester.ran[corpus], tests::tester.stamped[corpus]} = {
   time.sleep_ms(poll_ms());
   let now: Option<List<String>> = tests::tester.stamped[corpus]();
   if moved(now, baseline) {
     parted(flags);
-    said(tests::run(flags), flags);
-    watched(flags, now)
-  } else { watched(flags, baseline) }
+    said(tests::run(flags, options), flags);
+    watched(flags, options, now)
+  } else { watched(flags, options, baseline) }
 }
 
 fn dispatch(
-  argv: List<String>,
-) -> Int / {process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.sleep_ms, hosts::tcb.preview[host], hosts::tcb.open[host], cache::store.statistics[cache], cache::store.matches[cache], cache::store.compacted[cache], cache::store.cleared[cache], replace::edit.item[replace], bootstrap::archive.emitted[bootstrap], bootstrap::archive.land[bootstrap], build::builder.loaded[build], build::builder.made[build], build::builder.previous[build], build::builder.stored[build], machine::machine.load[run], machine::machine.reload[run], machine::machine.bound[run], machine::machine.enter[run], machine::machine.drop[run], tests::tester.loaded[corpus], tests::tester.bound[corpus], tests::tester.ran[corpus], tests::tester.stamped[corpus], prover.collected[claims], prover.discharged[claims], prover.reviewed[claims], prover.accepted[claims]} =
-  match commanded(argv) {
-    None -> compile_error(),
-    Some(line) -> {
-      let command = line.command;
-      let rest = line.rest;
-      let flags: Flags = read(rest);
-      match flags.unknown {
-        [first, ..rest_unknown] -> {
-          let answer: Answer = unknown_flag(style_of(flags), command, first);
-          said(answer, flags);
-          answer.code
-        },
-        // `--watch` is `ply test`'s alone, and a run carrying it writes reports until it is killed.
-        [] -> if flags.watch { watching(flags) } else {
-          let answer: Answer = answer_of(command, flags);
-          said(answer, flags);
-          answer.code
-        },
-      }
+  p: Parsed,
+  styled: Bool,
+) -> Int / {process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.resolved[cwd], fs.resolved[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.sleep_ms, env.var[sys], env.terminal[sys], env.binary_version[sys], env.pwd[sys], machine::machine.configure[run], tests::tester.configure[corpus], prover.configure[claims], hosts::tcb.preview[host], hosts::tcb.open[host], cache::store.statistics[cache], cache::store.matches[cache], cache::store.compacted[cache], cache::store.cleared[cache], replace::edit.item[replace], bootstrap::archive.emitted[bootstrap], bootstrap::archive.land[bootstrap], build::builder.loaded[build], build::builder.made[build], build::builder.previous[build], build::builder.stored[build], machine::machine.configure[run], machine::machine.load[run], machine::machine.reload[run], machine::machine.bound[run], machine::machine.enter[run], machine::machine.drop[run], tests::tester.configure[corpus], tests::tester.loaded[corpus], tests::tester.bound[corpus], tests::tester.ran[corpus], tests::tester.stamped[corpus], prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.reviewed[claims], prover.accepted[claims]} = {
+  let command = cmdline::nth_of(p.path, 0, "");
+  let resolved = paths::resolve_all(command, p);
+  let display = match cmdline::nth_of(p.path, 0, "") {
+    _ -> match list_at(resolved, 0) { Some(r) -> r.display, None -> "." },
+  };
+  let flags: Flags = args::from_parsed(p, styled, display, resolved);
+  if flags.watch { watching(flags, tests::options_from(p, root_of_flags(flags))) } else {
+    let answer: Answer = answer_of(command, flags, p);
+    said(answer, flags);
+    answer.code
+  }
+}
+
+// The whole line is the program's to read now: the surface is `surface.ply`'s declaration of it,
+// and a refusal is clap's shape — the error, the usage, and the way to help. Help and version
+// print and exit 0; a refusal never runs a command.
+fn main() -> Unit / {process.args[proc], process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.resolved[cwd], fs.resolved[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.sleep_ms, env.var[sys], env.terminal[sys], env.binary_version[sys], env.pwd[sys], machine::machine.configure[run], tests::tester.configure[corpus], prover.configure[claims], hosts::tcb.preview[host], hosts::tcb.open[host], cache::store.statistics[cache], cache::store.matches[cache], cache::store.compacted[cache], cache::store.cleared[cache], replace::edit.item[replace], bootstrap::archive.emitted[bootstrap], bootstrap::archive.land[bootstrap], build::builder.loaded[build], build::builder.made[build], build::builder.previous[build], build::builder.stored[build], machine::machine.configure[run], machine::machine.load[run], machine::machine.reload[run], machine::machine.bound[run], machine::machine.enter[run], machine::machine.drop[run], tests::tester.configure[corpus], tests::tester.loaded[corpus], tests::tester.bound[corpus], tests::tester.ran[corpus], tests::tester.stamped[corpus], prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.reviewed[claims], prover.accepted[claims], process.exit[proc]} = {
+  let argv = process.args[proc]();
+  let version = env.binary_version[sys]();
+  match parse(spec(version), argv) {
+    Help(text) -> {
+      process.out[proc](text);
+      process.exit[proc](ok_code())
+    },
+    Version(text) -> {
+      process.out[proc](text);
+      process.exit[proc](ok_code())
+    },
+    Refused(text) -> {
+      complain([text]);
+      process.exit[proc](compile_error())
+    },
+    Run(parsed) -> {
+      let styled = env::styled(value(parsed, "color"));
+      process.exit[proc](dispatch(parsed, styled))
     },
   }
-
-fn main() -> Unit / {process.args[proc], process.out[proc], process.err[proc], process.exit[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shelf], fs.read_file[shelf], time.elapsed_ms, time.sleep_ms, hosts::tcb.preview[host], hosts::tcb.open[host], cache::store.statistics[cache], cache::store.matches[cache], cache::store.compacted[cache], cache::store.cleared[cache], replace::edit.item[replace], bootstrap::archive.emitted[bootstrap], bootstrap::archive.land[bootstrap], build::builder.loaded[build], build::builder.made[build], build::builder.previous[build], build::builder.stored[build], machine::machine.load[run], machine::machine.reload[run], machine::machine.bound[run], machine::machine.enter[run], machine::machine.drop[run], tests::tester.loaded[corpus], tests::tester.bound[corpus], tests::tester.ran[corpus], tests::tester.stamped[corpus], prover.collected[claims], prover.discharged[claims], prover.reviewed[claims], prover.accepted[claims]} =
-  process.exit[proc](dispatch(process.args[proc]()))
+}
 
 // --- Tests ------------------------------------------------------------------
 
@@ -245,8 +219,14 @@ fn explained(argv: List<String>) -> Captured =
       process.out[proc](text) -> cell_set(io, out_step(cell_get(io), text)),
       process.err[proc](text) -> cell_set(io, err_step(cell_get(io), text)),
       process.exit[proc](code) resume k -> cell_set(io, exit_step(cell_get(io), code)),
+      env.var[sys](name) -> None,
+      env.terminal[sys](stream) -> false,
+      env.binary_version[sys]() -> "0.0.0-test",
+      env.pwd[sys]() -> "/w",
       fs.kind[cwd](p) -> panic("`ply explain` reaches no tree"),
       fs.kind[abs](p) -> panic("`ply explain` reaches no tree"),
+      fs.resolved[cwd](p) -> Dir,
+      fs.resolved[abs](p) -> panic("`ply explain` reaches no tree"),
       fs.list_dir[cwd](p) -> panic("`ply explain` reaches no tree"),
       fs.list_dir[abs](p) -> panic("`ply explain` reaches no tree"),
       fs.read_file[cwd](p) -> panic("`ply explain` reaches no tree"),
@@ -257,24 +237,28 @@ fn explained(argv: List<String>) -> Captured =
       fs.read_file[shelf](p) -> panic("`ply explain` reaches no shelf"),
       time.elapsed_ms() -> 0,
       time.sleep_ms(ms) -> panic("`ply explain` waits for nothing"),
-      hosts::tcb.preview[host]() -> panic("`ply explain` binds no host"),
-      hosts::tcb.open[host]() -> panic("`ply explain` binds no host"),
-      cache::store.statistics[cache]() -> panic("`ply explain` opens no store"),
-      cache::store.matches[cache]() -> panic("`ply explain` opens no store"),
-      cache::store.compacted[cache]() -> panic("`ply explain` opens no store"),
-      cache::store.cleared[cache]() -> panic("`ply explain` opens no store"),
-      replace::edit.item[replace]() -> panic("`ply explain` reads no replacement"),
-      bootstrap::archive.emitted[bootstrap]() -> panic("`ply explain` emits no archive"),
-      bootstrap::archive.land[bootstrap](manifest) -> panic("`ply explain` writes no archive"),
-      build::builder.loaded[build]() -> panic("`ply explain` builds nothing"),
+      hosts::tcb.preview[host](root, options) -> panic("`ply explain` binds no host"),
+      hosts::tcb.open[host](root, options) -> panic("`ply explain` binds no host"),
+      cache::store.statistics[cache](root) -> panic("`ply explain` opens no store"),
+      cache::store.matches[cache](query, root) -> panic("`ply explain` opens no store"),
+      cache::store.compacted[cache](root) -> panic("`ply explain` opens no store"),
+      cache::store.cleared[cache](root) -> panic("`ply explain` opens no store"),
+      replace::edit.item[replace](item) -> panic("`ply explain` reads no replacement"),
+      bootstrap::archive.emitted[bootstrap](options) -> panic("`ply explain` emits no archive"),
+      bootstrap::archive.land[bootstrap](options, manifest) ->
+        panic("`ply explain` writes no archive"),
+      build::builder.loaded[build](root) -> panic("`ply explain` builds nothing"),
       build::builder.made[build](entry, startup, reaches) -> panic("`ply explain` builds nothing"),
-      build::builder.previous[build]() -> panic("`ply explain` builds nothing"),
+      build::builder.previous[build](diff) -> panic("`ply explain` builds nothing"),
       build::builder.stored[build](path, body) -> panic("`ply explain` builds nothing"),
       prover.collected[claims]() -> panic("`ply explain` collects no claims"),
       prover.discharged[claims](wanted) -> panic("`ply explain` discharges nothing"),
       prover.reviewed[claims]() -> panic("`ply explain` reviews nothing"),
       prover.accepted[claims]() -> panic("`ply explain` accepts no baseline"),
+      machine::machine.configure[run](options) -> (),
       machine::machine.load[run](root) -> panic("`ply explain` runs no program"),
+      tests::tester.configure[corpus](options) -> (),
+      prover.configure[claims](options) -> (),
       machine::machine.reload[run]() -> panic("`ply explain` runs no program"),
       machine::machine.bound[run](entry) -> panic("`ply explain` binds no host"),
       machine::machine.enter[run]() -> panic("`ply explain` runs no program"),
@@ -333,7 +317,7 @@ test "a word that is no command is refused, never run as `ply fmt`" {
   assert_eq(answer.code, Some(2));
   let said = match list_at(answer.err, 0) { Some(l) -> l, None -> "" };
   assert(string_contains(said, "frobnicate"));
-  assert(string_contains(said, "is not a `ply` command"))
+  assert(string_contains(said, "unrecognized subcommand"))
 }
 
 test "every command the dispatch answers is one `commands` lists" {
@@ -351,16 +335,7 @@ test "a flag no command reads is refused, never taken as a path" {
   assert_eq(answer.code, Some(2));
   let said = match list_at(answer.err, 0) { Some(l) -> l, None -> "" };
   assert(string_contains(said, "--frobnicate"));
-  assert(string_contains(said, "is not a flag"));
-  // The way to name a path that begins with `-` is in the message, since that is the mistake
-  // this refusal is most likely to be reporting.
-  assert(string_contains(said, "--"))
-}
-
-test "a path that begins with a dash is still a path when it follows `--`" {
-  let flags = read(["--", "-weird.ply"]);
-  assert_eq(flags.unknown, []);
-  assert_eq(flags.paths, ["-weird.ply"])
+  assert(string_contains(said, "unexpected argument"))
 }
 
 test "a global flag may stand before the command word" {
@@ -383,6 +358,7 @@ test "a line with no word that is not a flag names no command" {
 test "no command word at all is a refusal, and nothing is written" {
   let empty = explained([]);
   assert_eq(empty.out, []);
-  assert_eq(empty.err, []);
+  let said = match list_at(empty.err, 0) { Some(l) -> l, None -> "" };
+  assert(string_contains(said, "requires a subcommand"));
   assert_eq(empty.code, Some(2))
 }

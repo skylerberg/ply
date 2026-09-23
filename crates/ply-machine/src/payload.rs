@@ -1,7 +1,7 @@
 //! Ply values, as a lent effect hands them to the program in `crates/ply-cli/ply`.
 
 use ply_eval::Value as PlyValue;
-use ply_span::{Diagnostic, Severity, SourceMap, Symbol};
+use ply_span::{Diagnostic, Severity, SourceMap, Span, Symbol, codes};
 use std::sync::Arc;
 
 /// `Value::Record` holds an `Arc`, and its fields are not `Send`; every construction site says so.
@@ -163,5 +163,77 @@ pub fn places_value(sources: &SourceMap) -> PlyValue {
                 ])
             })
             .collect(),
+    )
+}
+
+// --- Reading records the program hands the machine -------------------------------------------
+
+pub fn field_of<'a>(
+    value: &'a PlyValue,
+    name: &str,
+    span: Span,
+) -> Result<&'a PlyValue, Diagnostic> {
+    match value {
+        PlyValue::Record(fields) => fields
+            .iter()
+            .find(|(k, _)| k.as_str() == name)
+            .map(|(_, value)| value)
+            .ok_or_else(|| missing(name, span)),
+        _ => Err(missing(name, span)),
+    }
+}
+
+pub fn opt_str_at(value: &PlyValue, name: &str, span: Span) -> Result<Option<String>, Diagnostic> {
+    match field_of(value, name, span)? {
+        PlyValue::Ctor { name, args } if name.as_str() == "Some" => Ok(args
+            .first()
+            .map(|v| v.as_str(span, "a value").map(str::to_string))
+            .transpose()?),
+        PlyValue::Ctor { name, .. } if name.as_str() == "None" => Ok(None),
+        other => Err(shape(other, span)),
+    }
+}
+
+pub fn opt_int_at(value: &PlyValue, name: &str, span: Span) -> Result<Option<i64>, Diagnostic> {
+    match field_of(value, name, span)? {
+        PlyValue::Ctor { name, args } if name.as_str() == "Some" => Ok(args
+            .first()
+            .map(|v| v.as_int(span, "a number"))
+            .transpose()?),
+        PlyValue::Ctor { name, .. } if name.as_str() == "None" => Ok(None),
+        other => Err(shape(other, span)),
+    }
+}
+
+pub fn str_list_at(value: &PlyValue, name: &str, span: Span) -> Result<Vec<String>, Diagnostic> {
+    field_of(value, name, span)?
+        .as_list(span, name)?
+        .iter()
+        .map(|v| v.as_str(span, "an entry").map(str::to_string))
+        .collect::<Result<Vec<String>, Diagnostic>>()
+}
+
+pub fn missing(name: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("the options record has no `{name}`"),
+    )
+    .primary(
+        span,
+        "the program and the machine agree on the record; this is Ply's fault",
+    )
+}
+
+pub fn shape(value: &PlyValue, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!(
+            "the machine read a {} where an Option was expected",
+            value.type_name()
+        ),
+    )
+    .primary(
+        span,
+        "the program and the machine agree on the record; this is Ply's fault",
     )
 }

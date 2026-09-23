@@ -2,6 +2,11 @@
 // every value it takes travels in the flag's own word, so a word that is not a flag named here is
 // a positional path.
 
+import cmdline
+import cmdline (Parsed, has, nth_of, value)
+import paths
+import paths (Resolved)
+import surface
 import std.path (strip_dot)
 import style (Style)
 
@@ -31,8 +36,9 @@ pub type Flags = {
   config_schema: Option<String>,
   db_schema: Option<String>,
   out: Option<String>,
+  profile: Option<String>,
   diff: Option<String>,
-  paths: List<String>,
+  paths: List<Resolved>,
   // Words spelled like flags that no arm above claims. A path is never one of these: `--` is how
   // a path that begins with `-` is written.
   unknown: List<String>,
@@ -61,6 +67,7 @@ pub fn no_flags() -> Flags =
     config_schema: None,
     db_schema: None,
     out: None,
+    profile: None,
     diff: None,
     paths: [],
     unknown: [],
@@ -115,7 +122,7 @@ fn carried(acc: Flags, arg: String) -> Flags =
 fn fused_machine(arg: String) -> Bool =
   fold(machine_valued(), false, |acc: Bool, f: String| acc || string_starts_with(arg, f ++ "="))
 
-fn as_path(acc: Flags, arg: String) -> Flags = { ..acc, paths: push(acc.paths, strip_dot(arg)) }
+fn as_path(acc: Flags, arg: String) -> Flags = acc
 
 // The flags whose value may stand in the next word instead of their own. A word here is never a
 // path, so the word after it is never read as one either.
@@ -233,18 +240,6 @@ pub fn read(args: List<String>) -> Flags =
 
 // --- Tests ------------------------------------------------------------------
 
-test "a flag's value may stand in the next word as well as in its own" {
-  let fused = read(["--filter=thr", "--root=/w", "--out=a.plyx", "--color=never"]);
-  let spaced = read(["--filter", "thr", "--root", "/w", "--out", "a.plyx", "--color", "never"]);
-  assert_eq(spaced.filter, fused.filter);
-  assert_eq(spaced.root, fused.root);
-  assert_eq(spaced.out, fused.out);
-  assert_eq(spaced.color, fused.color);
-  // The value is never mistaken for a path, whichever way it was written.
-  assert_eq(spaced.paths, []);
-  assert_eq(fused.paths, [])
-}
-
 test "`-o`, `--out` and `--output` name one field, however they are written" {
   let short = read(["-o", "out.plyx"]);
   assert_eq(short.out, Some("out.plyx"));
@@ -257,41 +252,10 @@ test "`-o`, `--out` and `--output` name one field, however they are written" {
   assert_eq(read(["--output", "out.plyx"]).unknown, [])
 }
 
-test "after `--` every word is a path, whatever it looks like" {
-  let flags = read(["--json", "--", "--json", "-o", "m.ply"]);
-  assert(flags.json);
-  assert_eq(flags.paths, ["--json", "-o", "m.ply"]);
-  // The `-o` past `--` took no value with it.
-  assert_eq(flags.out, None)
-}
-
 test "a value that looks like a flag is still that flag's value" {
   let flags = read(["--filter", "--json"]);
   assert_eq(flags.filter, "--json");
   assert(!flags.json)
-}
-
-test "a flag that configures the machine is consumed, and its value is never a path" {
-  // The program reads none of these; the parser must still know them, or the value lands in
-  // `paths` and the run checks a file called `4`.
-  let flags = read(["--jobs", "4", "--steps=1000", "--host", "m.ply"]);
-  assert_eq(flags.paths, ["m.ply"]);
-  assert_eq(flags.unknown, []);
-  let spaced = read(["--timeout", "30", "--sim", "random", "--backend", "c", "a.ply"]);
-  assert_eq(spaced.paths, ["a.ply"]);
-  assert_eq(spaced.unknown, [])
-}
-
-test "the flags are read in any order and every other word is a path, with `./` stripped" {
-  let flags = read(["--json", "./a.ply", "--check", "b/c.ply"]);
-  assert(flags.check);
-  assert(flags.json);
-  assert_eq(flags.paths, ["a.ply", "b/c.ply"]);
-  let bare = read([]);
-  assert(!bare.check);
-  assert(!bare.json);
-  assert_eq(bare.paths, []);
-  assert_eq(bare.root, ".")
 }
 
 test "colour is the Rust side's answer, since a program has no terminal to ask" {
@@ -367,3 +331,63 @@ test "the flags a build is named with are absent until they are written" {
   assert_eq(flags.diff, Some("old.plyx"));
   assert_eq(flags.paths, [])
 }
+
+// --- The adapter: a parsed line as the Flags the commands read -----------------------------
+
+// What the parser's positionals mean depends on the command: a query command's first is the name
+// it looks up, and every command's path is the last one standing.
+fn query_of(command: String, p: Parsed) -> String =
+  if command == "doc" || command == "show" || command == "callers" || command == "replace" {
+    nth_of(p.positionals, 0, "")
+  } else if command == "explain" { nth_of(p.positionals, 0, "") }
+  else if command == "cache" && nth_of(p.path, 1, "") == "inspect" { nth_of(p.positionals, 0, "") }
+  else { "" }
+
+pub fn from_parsed(p: Parsed, styled: Bool, root: String, resolved: List<Resolved>) -> Flags = {
+  let command = nth_of(p.path, 0, "");
+  {
+    check: has(p, "check"),
+    json: has(p, "json"),
+    all: has(p, "all"),
+    deps: has(p, "deps"),
+    types: has(p, "types"),
+    costs: has(p, "costs"),
+    explain: has(p, "explain"),
+    color: styled,
+    digest: has(p, "digest"),
+    no_cache: has(p, "no-cache"),
+    watch: has(p, "watch"),
+    root: root,
+    action: match nth_of(p.path, 1, "") {
+      "" -> if has(p, "verify") { "verify" } else if has(p, "accept") { "accept" } else { "" },
+      sub -> sub,
+    },
+    query: query_of(command, p),
+    filter: match value(p, "filter") { Some(f) -> f, None -> "" },
+    filtered: has(p, "filter"),
+    shipped_digest: "",
+    entry: value(p, "entry"),
+    config_schema: value(p, "config-schema"),
+    db_schema: value(p, "db-schema"),
+    out: match value(p, "output") {
+      Some(o) -> Some(o),
+      None -> if command == "replace" { value(p, "with") } else { value(p, "out") },
+    },
+    profile: value(p, "profile"),
+    diff: value(p, "diff"),
+    paths: resolved,
+    unknown: [],
+  }
+}
+
+// The Flags for a test's line, parsed as the launcher parses it: the command word leads, as on
+// the line itself.
+pub fn from_argv(command: String, argv: List<String>) -> Flags =
+  match cmdline::parse(
+      surface::spec("0.0.0-test"),
+      fold(argv, [command], |acc: List<String>, w: String| push(acc, w)),
+    ) {
+    cmdline::Run(p) ->
+      from_parsed(p, false, ".", map(p.positionals, |spelling: String| paths::at_cwd(spelling))),
+    _ -> no_flags(),
+  }

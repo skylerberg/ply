@@ -18,6 +18,7 @@ use ply_eval::host::{
 use ply_span::{Diagnostic, Severity, Span, Symbol, codes};
 use ply_ty::{DefHash, DefInfo};
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// The effect `crates/ply-cli/ply/build.ply` declares. It is lent to that one entry and nowhere
@@ -43,13 +44,12 @@ pub struct BuildOptions {
     pub diff: Option<std::path::PathBuf>,
 }
 
-/// The load and the deployed artifact `--diff` names are read here, before the program is entered,
-/// as every other command's are. The build itself cannot be: it is the closure of the entry point
-/// the program picks.
-pub fn lent(args: &BuildOptions) -> Vec<Lent> {
+/// The ops and the one handler serving them. Nothing is read before the program asks: `loaded`
+/// loads the path it is handed, `previous` the artifact it names.
+pub fn lent() -> Vec<Lent> {
     let site: Arc<dyn HostHandler> = Arc::new(Site {
-        program: Mutex::new(load(&args.path)),
-        deployed: args.diff.as_deref().map(deployed),
+        program: Mutex::new(None),
+        deployed: Mutex::new(None),
     });
     OPERATIONS
         .into_iter()
@@ -72,27 +72,34 @@ fn registration(op: &str, path: &'static str) -> HostOp {
     }
 }
 
+#[derive(Default)]
 struct Site {
-    program: Mutex<Result<Loaded, LoadError>>,
-    /// `None` without `--diff`, which is the one run that asks nothing of a deployed artifact.
-    deployed: Option<Result<Deployed, Diagnostic>>,
+    program: Mutex<Option<Result<Loaded, LoadError>>>,
+    /// `None` while `--diff`'s artifact has not been asked for.
+    deployed: Mutex<Option<Result<Deployed, Diagnostic>>>,
 }
 
 impl HostHandler for Site {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let value = match (req.op.op.as_str(), req.args) {
-            ("loaded", _) => self.loaded(),
+            ("loaded", [path]) => {
+                let path = PathBuf::from(path.as_str(span, "the program's root")?);
+                let loaded = self.load_once(path);
+                self.loaded(loaded)
+            }
             ("made", [entry, startup, reaches]) => self.made(
                 entry.as_str(span, "an entry point's name")?,
                 &texts(startup, span)?,
                 reaches.as_bool(span, "whether the closure is wanted")?,
             ),
-            ("previous", _) => answered(match &self.deployed {
-                Some(Ok(old)) => Ok(deployed_value(old)),
-                Some(Err(diagnostic)) => Err(diagnostic.clone()),
-                None => Err(undeployed()),
-            }),
+            ("previous", [diff]) => {
+                let deployed = self.deployed_once(diff, span)?;
+                answered(match deployed.as_ref().expect("the diff was read") {
+                    Ok(old) => Ok(deployed_value(old)),
+                    Err(diagnostic) => Err(diagnostic.clone()),
+                })
+            }
             ("stored", [path, body]) => answered(
                 stored(
                     Path::new(path.as_str(span, "a file to write")?),
@@ -150,9 +157,51 @@ fn answered(answer: Result<PlyValue, Diagnostic>) -> PlyValue {
 // --- The program as it loaded -------------------------------------------------
 
 impl Site {
-    fn loaded(&self) -> PlyValue {
-        let program = self.program.lock().unwrap_or_else(|e| e.into_inner());
-        let loaded = match &*program {
+    /// The deployed artifact `--diff` names is read at most once, on the op that asks for it.
+    fn deployed_once(
+        &self,
+        diff: &PlyValue,
+        span: Span,
+    ) -> Result<std::sync::MutexGuard<'_, Option<Result<Deployed, Diagnostic>>>, Diagnostic> {
+        let mut deployed = self.deployed.lock().unwrap_or_else(|e| e.into_inner());
+        if deployed.is_none() {
+            let read = match diff {
+                PlyValue::Ctor { name, args } if name.as_str() == "Some" => args
+                    .first()
+                    .map(|v| {
+                        v.as_str(span, "the deployed artifact's path")
+                            .map(str::to_string)
+                    })
+                    .transpose()?,
+                PlyValue::Ctor { name, .. } if name.as_str() == "None" => None,
+                _ => None,
+            };
+            *deployed = Some(match read {
+                Some(path) => read_deployed(Path::new(&path)),
+                None => Err(undeployed()),
+            });
+        }
+        Ok(deployed)
+    }
+
+    /// The load runs at most once, on the op that asks for it.
+    fn load_once(
+        &self,
+        path: PathBuf,
+    ) -> std::sync::MutexGuard<'_, Option<Result<Loaded, LoadError>>> {
+        let mut program = self.program.lock().unwrap_or_else(|e| e.into_inner());
+        if program.is_none() {
+            *program = Some(load(&path));
+        }
+        program
+    }
+
+    fn loaded(
+        &self,
+        program: std::sync::MutexGuard<'_, Option<Result<Loaded, LoadError>>>,
+    ) -> PlyValue {
+        let program = program;
+        let loaded = match program.as_ref().expect("the load ran") {
             Ok(loaded) => loaded,
             Err(err) => {
                 return PlyValue::ctor(
@@ -187,7 +236,7 @@ impl Site {
 
     fn made(&self, entry: &str, startup: &[String], reaches: bool) -> PlyValue {
         let program = self.program.lock().unwrap_or_else(|e| e.into_inner());
-        let Ok(loaded) = &*program else {
+        let Some(Ok(loaded)) = &*program else {
             return answered(Err(unloaded()));
         };
         let built = aside(|| build(loaded, entry, startup));
@@ -331,7 +380,7 @@ struct Deployed {
     warnings: Vec<Diagnostic>,
 }
 
-fn deployed(path: &Path) -> Result<Deployed, Diagnostic> {
+fn read_deployed(path: &Path) -> Result<Deployed, Diagnostic> {
     let bytes = artifact::bytes_of(path)?;
     let (old, warnings) = artifact::decode(&bytes, path)?;
     let digest = artifact::digest_of(&bytes).unwrap_or([0; 32]);

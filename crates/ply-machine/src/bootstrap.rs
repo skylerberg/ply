@@ -37,11 +37,9 @@ pub struct BootstrapOptions {
 
 /// The emission runs here, before the program is entered: a handler is handed `&self`, and the
 /// front end and the emitter are the compiler's own work.
-pub fn lent(args: &BootstrapOptions) -> Vec<Lent> {
+pub fn lent() -> Vec<Lent> {
     let archive: Arc<dyn HostHandler> = Arc::new(Archive {
-        c: c_path(args),
-        manifest: manifest_path(args),
-        emitted: emit(args),
+        done: std::sync::Mutex::new(None),
     });
     OPERATIONS
         .into_iter()
@@ -73,6 +71,7 @@ fn c_path(args: &BootstrapOptions) -> PathBuf {
 }
 
 /// What the emission came to, as `bootstrap.ply` reads it.
+#[derive(Clone)]
 struct Emitted {
     source: String,
     artifact: String,
@@ -85,6 +84,7 @@ struct Emitted {
 
 /// Why nothing was emitted. `compilation` is a program that did not check, which is the user's to
 /// fix and is tallied as such.
+#[derive(Clone)]
 struct Refused {
     diagnostics: Vec<Diagnostic>,
     sources: SourceMap,
@@ -102,38 +102,68 @@ impl Refused {
 }
 
 struct Archive {
-    c: PathBuf,
-    manifest: PathBuf,
-    emitted: Result<Emitted, Refused>,
+    /// The emission, once the program has asked for it.
+    done: std::sync::Mutex<Option<Result<Emitted, Refused>>>,
 }
 
 impl Archive {
-    fn land(&self, document: &str) -> PlyValue {
-        let (c, manifest) = (
-            self.c.display().to_string(),
-            self.manifest.display().to_string(),
-        );
-        match std::fs::write(&self.manifest, document) {
-            Ok(()) => PlyValue::ctor("Ok", vec![strings([c.as_str(), manifest.as_str()])]),
-            Err(e) => PlyValue::ctor("Err", vec![PlyValue::str(format!("{manifest}: {e}"))]),
+    /// The emission runs when the program performs `emitted`, and once only.
+    fn emitted(
+        &self,
+        options: &PlyValue,
+        span: Span,
+    ) -> Result<Result<Emitted, Refused>, Diagnostic> {
+        let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        if done.is_none() {
+            *done = Some(match options_of(options, span) {
+                Ok(o) => emit(&o),
+                Err(diagnostic) => Err(Refused::bare(diagnostic)),
+            });
         }
+        Ok(done.as_ref().unwrap().clone())
+    }
+
+    fn land(&self, options: &PlyValue, document: &str, span: Span) -> Result<PlyValue, Diagnostic> {
+        let o = options_of(options, span)?;
+        let manifest = manifest_path(&o);
+        let c = c_path(&o);
+        Ok(match std::fs::write(&manifest, document) {
+            Ok(()) => PlyValue::ctor(
+                "Ok",
+                vec![strings(
+                    [c.display().to_string(), manifest.display().to_string()]
+                        .iter()
+                        .map(String::as_str),
+                )],
+            ),
+            Err(e) => PlyValue::ctor(
+                "Err",
+                vec![PlyValue::str(format!("{}: {e}", manifest.display()))],
+            ),
+        })
     }
 }
 
 impl HostHandler for Archive {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let value = match req.op.op.as_str() {
-            "emitted" => match &self.emitted {
-                Ok(emitted) => PlyValue::ctor("Ok", vec![emitted_value(emitted)]),
-                Err(why) => PlyValue::ctor("Err", vec![refusal_value(why)]),
-            },
+            "emitted" => {
+                match self.emitted(req.args.first().unwrap_or(&PlyValue::Unit), req.span)? {
+                    Ok(emitted) => PlyValue::ctor("Ok", vec![emitted_value(&emitted)]),
+                    Err(why) => PlyValue::ctor("Err", vec![refusal_value(&why)]),
+                }
+            }
             "land" => {
-                let document = req
+                let options = req
                     .args
                     .first()
+                    .ok_or_else(|| unregistered("land", req.span))?;
+                let document = req
+                    .args
+                    .get(1)
                     .ok_or_else(|| unregistered("land", req.span))?
                     .as_str(req.span, "the manifest to write")?;
-                self.land(document)
+                self.land(options, document, req.span)?
             }
             other => return Err(unregistered(other, req.span)),
         };
@@ -262,4 +292,18 @@ fn unregistered(op: &str, span: Span) -> Diagnostic {
     )
     .primary(span, "performed here")
     .note("this is a defect in Ply's host dispatch rather than in the program")
+}
+
+// The options record the program parsed: the path, the output directory, `--verify`, `--profile`.
+fn options_of(v: &PlyValue, span: Span) -> Result<BootstrapOptions, Diagnostic> {
+    use crate::payload::{field_of, str_list_at};
+    let _ = str_list_at;
+    Ok(BootstrapOptions {
+        path: PathBuf::from(field_of(v, "path", span)?.as_str(span, "the program's root")?),
+        out: PathBuf::from(field_of(v, "out", span)?.as_str(span, "the archive's directory")?),
+        verify: field_of(v, "verify", span)?.as_bool(span, "verify")?,
+        profile: field_of(v, "profile", span)?
+            .as_str(span, "the toolchain profile")?
+            .to_string(),
+    })
 }

@@ -499,7 +499,21 @@ pub fn build(
 
     out.closure = closure_texts(&out, front)?;
     // Reopened as a target opens it, so an artifact that builds is one that opens.
-    let opened = reopen(&out).map_err(|diags| vec![unreopened(&diags)])?;
+    let opened = match reopen(&out) {
+        Ok(opened) => opened,
+        Err(diags) => {
+            if let Ok(dir) = std::env::var("PLY_DUMP_CLOSURE") {
+                let dir = std::path::PathBuf::from(dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                for (file, text) in &out.closure {
+                    let at = dir.join(file);
+                    std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+                    std::fs::write(&at, text).unwrap();
+                }
+            }
+            return Err(vec![unreopened(&diags)]);
+        }
+    };
     let names: Vec<&str> = out.names.iter().map(|(n, _)| n.as_str()).collect();
     let emission = embedded_unit(&opened, &opened.entry, &names).map_err(|d| vec![d])?;
     out.unit = emission.unit;
