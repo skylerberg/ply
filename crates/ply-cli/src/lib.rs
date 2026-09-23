@@ -1,6 +1,5 @@
 //! The `ply` binary.
 
-pub mod cache;
 pub mod cli;
 pub mod commands;
 pub mod shipped;
@@ -16,7 +15,7 @@ pub use ply_machine::{
     artifact, config, costs, db, driver, hosts, load, migrate, payload, simulation, trace, warm,
 };
 pub use ply_machine::{
-    bootstrap, builder as build, claims, engine, mutate, obligations, signature,
+    bootstrap, builder as build, cache, claims, engine, mutate, obligations, signature,
 };
 use style::Style;
 
