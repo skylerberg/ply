@@ -1,8 +1,8 @@
 //! What `ply build` loads, builds, hashes and writes, as the program in `crates/ply-cli/ply`
 //! performs it.
 //!
-//! The front end, the emitter and BLAKE3 stay here: a compiled unit is not a value a program can
-//! hold, and Ply's own BLAKE3 runs at a few megabytes a second. Which entry is built, what the
+//! The front end and the emitter stay here: a front end or a compiled unit is not a value a
+//! program can hold. Which entry is built, what the
 //! container carries, where it lands and what the report says are the program's, in
 //! `crates/ply-cli/ply/build.ply`.
 
