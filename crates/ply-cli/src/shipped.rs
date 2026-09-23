@@ -71,17 +71,18 @@ pub fn program_sources() -> Vec<(String, String)> {
 pub fn identity() -> String {
     let program = producer::digest_of(&program_sources());
     let mut hasher = blake3::Hasher::new();
+    let (frontend_version, runtime_version, body_encoding) = ply_machine::shelf::store_versions();
     for part in [
         program.as_str(),
         producer::digest_of(ply_machine::shelf::sources()).as_str(),
         producer::identity().as_str(),
-        ply_store::FRONTEND_VERSION,
-        ply_store::RUNTIME_VERSION,
+        frontend_version,
+        runtime_version,
     ] {
         hasher.update(part.as_bytes());
         hasher.update(&[0]);
     }
-    hasher.update(&ply_store::BODY_ENCODING.to_le_bytes());
+    hasher.update(&body_encoding.to_le_bytes());
     hasher.finalize().to_hex()[..16].to_string()
 }
 
