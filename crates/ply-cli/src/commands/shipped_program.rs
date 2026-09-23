@@ -77,36 +77,16 @@ pub fn run(
     }
 }
 
-fn enter(argv: Vec<String>, root: &Path, mut binds: Binds) -> Result<i32, Diagnostic> {
+fn enter(argv: Vec<String>, root: &Path, binds: Binds) -> Result<i32, Diagnostic> {
     let bytes = crate::shipped::program()?;
-    let shelf = crate::shipped::shelf()?;
-    let path = PathBuf::from(crate::shipped::ARTIFACT);
-    let (artifact, _) = crate::artifact::decode(&bytes, &path)?;
-    let opened = crate::artifact::open(&artifact, &path).map_err(first_of)?;
-    let mut roots = vec![
-        ply_host::fs::RootSpec {
-            name: "cwd".to_string(),
-            path: root.to_path_buf(),
-        },
-        ply_host::fs::RootSpec {
-            name: "shelf".to_string(),
-            path: shelf,
-        },
-    ];
-    roots.append(&mut binds.roots);
-    binds.roots = roots;
-    // The `ply` program is the tool's own work rather than a program under test, so the budgets
-    // a run gives a program are not its.
-    ply_codegen::rt::unbounded(|| crate::artifact::enter(&artifact, &opened, argv, binds))
-}
-
-fn first_of(diagnostics: Vec<Diagnostic>) -> Diagnostic {
-    diagnostics.into_iter().next().unwrap_or_else(|| {
-        Diagnostic::error(
-            ply_span::codes::INTERNAL_ERROR,
-            "the `ply` program did not open, and nothing said why",
-        )
-    })
+    let program = ply_launcher::Program {
+        artifact: bytes,
+        artifact_name: crate::shipped::ARTIFACT.to_string(),
+        shelf: ply_machine::shelf::sources().to_vec(),
+        stage: format!("cli-{}", crate::shipped::identity()),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    ply_launcher::run(&program, root, argv, binds)
 }
 
 fn refuse(command: &str, diagnostic: &Diagnostic, json: bool, style: Style) -> i32 {
