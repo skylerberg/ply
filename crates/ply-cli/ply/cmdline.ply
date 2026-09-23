@@ -1,0 +1,1103 @@
+// A command line as a declaration: one `Spec` says what the commands, flags and positionals are,
+// and the parser, validator and help renderer here are all functions of it. Written to carry the
+// surface `clap` declares for `ply` today (`surface.ply`), generic enough for any tool's line.
+//
+// The parser is the line's whole grammar: `--flag=value` and `--flag value`, shorts fused or
+// spaced, `--` ending the flags, a trailing argument vector, help and version at any level, and
+// every refusal `clap` would make — an unknown flag or command, a missing or invalid value, a
+// duplicate, a conflict, an unmet requirement — as an `error:` line, a usage line, and the way to
+// `--help`: the shape a command-line reader already knows.
+
+// What a flag's value must be to parse. `Nat` is zero or more, `Pos` is one or more; anything
+// further (a seed, a credential) is the flag's `check`.
+pub type Kind = | Switch | Text | Nat | Pos | Choice(List<String>)
+
+// One flag a command reads. `short` is one letter or "". `default` is printed in the help and
+// answers nothing — the command's own defaults are its business. `bare_value` is what a valued
+// flag means written with no value (`--mutate` is `--mutate=*`); "" means the value is owed.
+// `requires` and `conflicts` name other longs. `check` is the shape rule past the kind.
+pub type Flag = {
+  long: String,
+  short: String,
+  kind: Kind,
+  value_name: String,
+  default: String,
+  aliases: List<String>,
+  help: String,
+  repeatable: Bool,
+  bare_value: String,
+  requires: List<String>,
+  conflicts: List<String>,
+  check: (String) -> Result<Unit, String>,
+}
+
+pub fn ok_any(_any: String) -> Result<Unit, String> = Ok(())
+
+pub fn switch(long: String, help: String) -> Flag =
+  {
+    long: long,
+    short: "",
+    kind: Switch,
+    value_name: "",
+    default: "",
+    aliases: [],
+    help: help,
+    repeatable: false,
+    bare_value: "",
+    requires: [],
+    conflicts: [],
+    check: ok_any,
+  }
+
+pub fn valued(long: String, value_name: String, kind: Kind, help: String) -> Flag = {
+  let base: Flag = switch(long, help);
+  { ..base, kind: kind, value_name: value_name }
+}
+
+// A bare word a command takes. `default` nonempty means it may be left off; `unless` names a flag
+// whose presence excuses it (`explain`'s code, when `--all` is given); `many` takes the rest.
+pub type Positional = {
+  name: String,
+  help: String,
+  default: String,
+  required: Bool,
+  many: Bool,
+  unless: String,
+}
+
+pub fn positional(name: String, help: String) -> Positional =
+  { name: name, help: help, default: "", required: true, many: false, unless: "" }
+
+pub fn defaulted(name: String, help: String, default: String) -> Positional = {
+  let base: Positional = positional(name, help);
+  { ..base, default: default, required: false }
+}
+
+// --- The combinators a spec is written with -------------------------------------
+
+pub fn with_short(f: Flag, short: String) -> Flag = { ..f, short: short }
+
+pub fn with_default(f: Flag, default: String) -> Flag = { ..f, default: default }
+
+pub fn with_alias(f: Flag, alias: String) -> Flag = { ..f, aliases: push(f.aliases, alias) }
+
+pub fn repeated(f: Flag) -> Flag = { ..f, repeatable: true }
+
+// What the flag means written with no value: `--mutate` is `--mutate=*`.
+pub fn bare(f: Flag, value: String) -> Flag = { ..f, bare_value: value }
+
+pub fn requiring(f: Flag, longs: List<String>) -> Flag = { ..f, requires: longs }
+
+pub fn conflicting(f: Flag, longs: List<String>) -> Flag = { ..f, conflicts: longs }
+
+pub fn checking(f: Flag, check: (String) -> Result<Unit, String>) -> Flag = { ..f, check: check }
+
+// One word of the line: a command. A record alias cannot recurse, so the body is one variant's
+// payload: `subs` are the commands under it, `trailing` whether the words after `--` are the
+// program's own argument vector, and `extra` the cross-check no flag-local rule can say (a flag
+// against another flag's value).
+pub type Command = | Cmd(Body)
+
+pub type Body = {
+  name: String,
+  about: String,
+  flags: List<Flag>,
+  positionals: List<Positional>,
+  subs: List<Command>,
+  trailing: Bool,
+  extra: (Parsed) -> Result<Unit, String>,
+}
+
+pub fn body(cmd: Command) -> Body = match cmd { Cmd(b) -> b }
+
+pub fn ok_command(_any: Parsed) -> Result<Unit, String> = Ok(())
+
+pub fn command(name: String, about: String, flags: List<Flag>) -> Command =
+  Cmd({
+    name: name,
+    about: about,
+    flags: flags,
+    positionals: [],
+    subs: [],
+    trailing: false,
+    extra: ok_command,
+  })
+
+pub fn with_positionals(cmd: Command, positionals: List<Positional>) -> Command = {
+  let base: Body = body(cmd);
+  Cmd({ ..base, positionals: positionals })
+}
+
+pub fn with_subs(cmd: Command, subs: List<Command>) -> Command = {
+  let base: Body = body(cmd);
+  Cmd({ ..base, subs: subs })
+}
+
+pub fn with_trailing(cmd: Command) -> Command = {
+  let base: Body = body(cmd);
+  Cmd({ ..base, trailing: true })
+}
+
+pub fn with_extra(cmd: Command, extra: (Parsed) -> Result<Unit, String>) -> Command = {
+  let base: Body = body(cmd);
+  Cmd({ ..base, extra: extra })
+}
+
+// A positional excused by a flag: `explain`'s code is owed unless `--all` is given.
+pub fn excused(p: Positional, long: String) -> Positional = { ..p, unless: long }
+
+// A positional that takes every remaining word.
+pub fn many(p: Positional) -> Positional = { ..p, many: true }
+
+// The whole line: the binary's name and version, and the root command, whose `subs` are the
+// commands and whose `flags` are the globals every command also reads.
+pub type Spec = { bin: String, version: String, root: Command }
+
+// One flag as it was written: its long name, and the value if it takes one.
+pub type Given = { long: String, value: Option<String> }
+
+// A line that parsed. `path` is the command words (`["cache", "stats"]`), `flags` every flag in
+// the order written, `positionals` the bare words (defaults filled), `argv` what followed `--`
+// under a trailing command.
+pub type Parsed = {
+  path: List<String>,
+  flags: List<Given>,
+  positionals: List<String>,
+  argv: List<String>,
+}
+
+// What one line comes to: a run, or an answer the caller prints — help and a version exit 0, a
+// refusal is the whole stderr text and exits 2.
+pub type Outcome = | Run(Parsed) | Help(String) | Version(String) | Refused(String)
+
+// --- Lookups ------------------------------------------------------------------
+
+// The body of the command a path of words names; the root is the empty path.
+pub fn node_at(root: Command, path: List<String>) -> Option<Body> =
+  match path {
+    [] -> Some(body(root)),
+    [first, ..rest] -> match find_sub(body(root), first) {
+      Some(sub) -> node_at(sub, rest),
+      None -> None,
+    },
+  }
+
+fn find_sub(cmd: Body, name: String) -> Option<Command> = scan_subs(cmd.subs, name)
+
+fn scan_subs(subs: List<Command>, name: String) -> Option<Command> =
+  match subs {
+    [] -> None,
+    [sub, ..rest] -> if body(sub).name == name { Some(sub) } else { scan_subs(rest, name) },
+  }
+
+// A flag by its long name or an alias, the command's own first, then the globals.
+fn find_long(root: Command, node: Body, name: String) -> Option<Flag> =
+  match scan_long(node.flags, name) {
+    Some(f) -> Some(f),
+    None -> scan_long(body(root).flags, name),
+  }
+
+fn scan_long(flags: List<Flag>, name: String) -> Option<Flag> =
+  match flags {
+    [] -> None,
+    [f, ..rest] -> if f.long == name || member(f.aliases, name) { Some(f) }
+    else { scan_long(rest, name) },
+  }
+
+fn find_short(root: Command, node: Body, letter: String) -> Option<Flag> =
+  match scan_short(node.flags, letter) {
+    Some(f) -> Some(f),
+    None -> scan_short(body(root).flags, letter),
+  }
+
+fn scan_short(flags: List<Flag>, letter: String) -> Option<Flag> =
+  match flags {
+    [] -> None,
+    [f, ..rest] -> if f.short == letter { Some(f) } else { scan_short(rest, letter) },
+  }
+
+fn member(xs: List<String>, want: String) -> Bool =
+  match xs { [] -> false, [x, ..rest] -> x == want || member(rest, want) }
+
+// The name a refusal calls a flag by: `--jobs <N>`, or `--json` for a switch.
+fn called(f: Flag) -> String =
+  if f.kind == Switch { "--" ++ f.long } else { "--" ++ f.long ++ " <" ++ f.value_name ++ ">" }
+
+// --- Words to values ------------------------------------------------------------
+
+// Where the reading stands. `stop` is set by help, version, and a trailing command past `--`,
+// which end the line where they stand.
+type Reading = {
+  path: List<String>,
+  flags: List<Given>,
+  positionals: List<String>,
+  argv: List<String>,
+  pending: Option<Flag>,
+  after_dd: Bool,
+  stop: String,
+}
+
+fn start() -> Reading =
+  { path: [], flags: [], positionals: [], argv: [], pending: None, after_dd: false, stop: "" }
+
+// The first `=` parts a fused flag from its value; a value may hold `=` of its own.
+pub fn cut_once(s: String, sep: String) -> Option<{ head: String, tail: String }> =
+  if string_contains(s, sep) {
+    let at = string_find(s, sep);
+    Some({
+      head: string_slice(s, 0, at),
+      tail: string_slice(s, at + string_len(sep), string_len(s)),
+    })
+  } else { None }
+
+fn is_flag_word(w: String) -> Bool = string_starts_with(w, "-") && w != "-"
+
+pub fn parse(spec: Spec, argv: List<String>) -> Outcome =
+  match words(spec, spec.root, start(), argv) {
+    Ok(outcome) -> outcome,
+    Err(refusal) -> Refused(refusal),
+  }
+
+fn words(spec: Spec, root: Command, r: Reading, argv: List<String>) -> Result<Outcome, String> =
+  if r.stop != "" { finish(spec, root, r) } else {
+    match argv {
+      [] -> finish(spec, root, r),
+      [w, ..rest] -> words(spec, root, word(spec, root, r, w, rest)?, rest),
+    }
+  }
+
+fn word(
+  spec: Spec,
+  root: Command,
+  r: Reading,
+  w: String,
+  rest: List<String>,
+) -> Result<Reading, String> = {
+  let node: Body = match node_at(root, r.path) { Some(n) -> n, None -> body(root) };
+  match r.pending {
+    Some(f) -> if is_flag_word(w) {
+      if f.bare_value == "" {
+        Err(
+          refused(
+            spec,
+            r.path,
+            "a value is required for '" ++ called(f) ++ "' but none was supplied",
+          ),
+        )
+      } else {
+        // The flag stood bare, so it takes its bare value, and this word is read fresh.
+        word(spec, root, record(spec, r, f, Some(f.bare_value))?, w, rest)
+      }
+    } else { given(spec, r, f, w) },
+    None -> flag_or_word(spec, root, node, r, w, rest),
+  }
+}
+
+fn flag_or_word(
+  spec: Spec,
+  root: Command,
+  node: Body,
+  r: Reading,
+  w: String,
+  rest: List<String>,
+) -> Result<Reading, String> =
+  if r.after_dd { Ok({ ..r, positionals: push(r.positionals, w) }) } else if w == "--" {
+    if node.trailing { Ok({ ..r, argv: rest, stop: "run" }) } else { Ok({ ..r, after_dd: true }) }
+  } else if w == "-h" || w == "--help" { Ok({ ..r, stop: "help" }) }
+  else if w == "-V" || w == "--version" { Ok({ ..r, stop: "version" }) } else if w == "help"
+      && len(node.subs) > 0
+      && len(r.positionals) == 0 { help_path(spec, root, r, rest) }
+  else if string_starts_with(w, "--") { long_flag(spec, root, node, r, w) }
+  else if is_flag_word(w) { short_flag(spec, root, node, r, w) }
+  else { bare_word(spec, root, node, r, w) }
+
+// `ply help test` is `ply test --help`: the words after `help` are a command path to answer for.
+fn help_path(spec: Spec, root: Command, r: Reading, rest: List<String>) -> Result<Reading, String> = {
+  let path = fold(rest, r.path, |acc: List<String>, w: String| push(acc, w));
+  match node_at(root, path) {
+    Some(_) -> Ok({ ..r, path: path, stop: "help" }),
+    None -> match rest {
+      [first, ..] ->
+        Err(
+          refused(
+            spec,
+            r.path,
+            "unrecognized subcommand '" ++ first ++ "'" ++ sub_tip(root, r.path, first),
+          ),
+        ),
+      [] -> Ok({ ..r, stop: "help" }),
+    },
+  }
+}
+
+fn long_flag(
+  spec: Spec,
+  root: Command,
+  node: Body,
+  r: Reading,
+  w: String,
+) -> Result<Reading, String> = {
+  let text = string_slice(w, 2, string_len(w));
+  let cut = cut_once(text, "=");
+  let name = match cut { Some(c) -> c.head, None -> text };
+  match find_long(root, node, name) {
+    None ->
+      Err(
+        refused(
+          spec,
+          r.path,
+          "unexpected argument '--" ++ name ++ "' found" ++ flag_tip(root, node, name),
+        ),
+      ),
+    Some(f) -> match f.kind {
+      Switch -> match cut {
+        Some(c) ->
+          Err(
+            refused(
+              spec,
+              r.path,
+              "unexpected value '" ++ c.tail ++ "' for '--" ++ f.long ++ "' found",
+            ),
+          ),
+        None -> record(spec, r, f, None),
+      },
+      _ -> match cut {
+        Some(c) -> given(spec, r, f, c.tail),
+        None -> Ok({ ..r, pending: Some(f) }),
+      },
+    },
+  }
+}
+
+fn short_flag(
+  spec: Spec,
+  root: Command,
+  node: Body,
+  r: Reading,
+  w: String,
+) -> Result<Reading, String> = {
+  let letter = string_slice(w, 1, 2);
+  match find_short(root, node, letter) {
+    None -> Err(refused(spec, r.path, "unexpected argument '-" ++ letter ++ "' found")),
+    Some(f) -> {
+      let attached = string_slice(w, 2, string_len(w));
+      match f.kind {
+        Switch -> if attached == "" { record(spec, r, f, None) } else {
+          Err(
+            refused(
+              spec,
+              r.path,
+              "unexpected value '" ++ attached ++ "' for '-" ++ letter ++ "' found",
+            ),
+          )
+        },
+        _ -> if attached == "" { Ok({ ..r, pending: Some(f) }) } else if string_starts_with(
+            attached,
+            "=",
+          ) { given(spec, r, f, string_slice(attached, 1, string_len(attached))) }
+        else { given(spec, r, f, attached) },
+      }
+    },
+  }
+}
+
+// A word that is no flag: a subcommand to descend to where one is owed, else a positional.
+fn bare_word(
+  spec: Spec,
+  root: Command,
+  node: Body,
+  r: Reading,
+  w: String,
+) -> Result<Reading, String> =
+  match find_sub(node, w) {
+    Some(sub) -> if len(r.positionals) == 0 { Ok({ ..r, path: push(r.path, body(sub).name) }) }
+    else { Err(refused(spec, r.path, "unexpected argument '" ++ w ++ "' found")) },
+    None -> if room_for_positional(node, r) { Ok({ ..r, positionals: push(r.positionals, w) }) } else if len(
+          node.subs,
+        )
+        > 0
+        && len(r.positionals) == 0 {
+      Err(
+        refused(spec, r.path, "unrecognized subcommand '" ++ w ++ "'" ++ sub_tip(root, r.path, w)),
+      )
+    } else { Err(refused(spec, r.path, "unexpected argument '" ++ w ++ "' found")) },
+  }
+
+fn room_for_positional(node: Body, r: Reading) -> Bool =
+  is_many(node) || len(r.positionals) < len(node.positionals)
+
+fn is_many(node: Body) -> Bool =
+  match list_at(node.positionals, len(node.positionals) - 1) {
+    Some(last) -> last.many,
+    None -> false,
+  }
+
+// A flag's value, validated and recorded.
+fn given(spec: Spec, r: Reading, f: Flag, value: String) -> Result<Reading, String> =
+  match bad_value(f, value) {
+    Some(why) -> Err(refused(spec, r.path, why)),
+    None -> record(spec, r, f, Some(value)),
+  }
+
+fn record(spec: Spec, r: Reading, f: Flag, value: Option<String>) -> Result<Reading, String> =
+  if !f.repeatable && has_flag(r.flags, f.long) {
+    Err(refused(spec, r.path, "the argument '" ++ called(f) ++ "' was provided more than once"))
+  } else { Ok({ ..r, flags: push(r.flags, { long: f.long, value: value }), pending: None }) }
+
+fn has_flag(flags: List<Given>, long: String) -> Bool =
+  match flags { [] -> false, [g, ..rest] -> g.long == long || has_flag(rest, long) }
+
+// What a value must not be, as the refusal's message; `None` is a value that parses.
+fn bad_value(f: Flag, value: String) -> Option<String> =
+  match f.kind {
+    Switch -> None,
+    Text -> checked(f, value),
+    Nat -> match parse_nat(value) {
+      Some(_) -> checked(f, value),
+      None ->
+        Some("invalid value '" ++ value ++ "' for '" ++ called(f) ++ "': a number is required"),
+    },
+    Pos -> match parse_nat(value) {
+      Some(n) -> if n >= 1 { checked(f, value) }
+      else { Some("invalid value '" ++ value ++ "' for '" ++ called(f) ++ "': 0 is not in 1..") },
+      None ->
+        Some("invalid value '" ++ value ++ "' for '" ++ called(f) ++ "': a number is required"),
+    },
+    Choice(choices) -> if member(choices, value) { checked(f, value) } else {
+      Some(
+        "invalid value '" ++ value ++ "' for '" ++ called(f) ++ "'\n  [possible values: "
+          ++ joined(choices)
+          ++ "]",
+      )
+    },
+  }
+
+fn checked(f: Flag, value: String) -> Option<String> =
+  match (f.check)(value) {
+    Ok(_unit) -> None,
+    Err(why) -> Some("invalid value '" ++ value ++ "' for '" ++ called(f) ++ "': " ++ why),
+  }
+
+// A non-negative decimal integer; `None` for anything else, including one past `Int`'s top.
+pub fn parse_nat(text: String) -> Option<Int> =
+  if string_len(text) == 0 { None } else { digits(text, 0, 0) }
+
+fn digits(text: String, at: Int, acc: Int) -> Option<Int> =
+  if at >= string_len(text) { Some(acc) } else {
+    match digit(string_slice(text, at, at + 1)) {
+      None -> None,
+      Some(d) -> if acc > 922337203685477580 || (acc == 922337203685477580 && d > 7) { None }
+      else { digits(text, at + 1, acc * 10 + d) },
+    }
+  }
+
+fn digit(c: String) -> Option<Int> =
+  if c == "0" { Some(0) }
+  else if c == "1" { Some(1) }
+  else if c == "2" { Some(2) }
+  else if c == "3" { Some(3) }
+  else if c == "4" { Some(4) }
+  else if c == "5" { Some(5) }
+  else if c == "6" { Some(6) }
+  else if c == "7" { Some(7) }
+  else if c == "8" { Some(8) }
+  else if c == "9" { Some(9) }
+  else { None }
+
+// --- The line judged whole --------------------------------------------------------
+
+fn finish(spec: Spec, root: Command, r: Reading) -> Result<Outcome, String> =
+  if r.stop == "help" { Ok(Help(help_of(spec, r.path))) }
+  else if r.stop == "version" { Ok(Version(spec.bin ++ " " ++ spec.version)) }
+  else { finish_run(spec, root, r) }
+
+fn finish_run(spec: Spec, root: Command, r: Reading) -> Result<Outcome, String> =
+  match r.pending {
+    Some(f) -> if f.bare_value == "" {
+      Err(
+        refused(
+          spec,
+          r.path,
+          "a value is required for '" ++ called(f) ++ "' but none was supplied",
+        ),
+      )
+    } else {
+      finish_run(spec, root, {
+        ..r,
+        pending: None,
+        flags: push(r.flags, { long: f.long, value: Some(f.bare_value) }),
+      })
+    },
+    None -> {
+      let node: Body = match node_at(root, r.path) { Some(n) -> n, None -> body(root) };
+      if len(node.subs) > 0 { Err(missing_sub(spec, node, r)) } else { judge(spec, node, r) }
+    },
+  }
+
+fn judge(spec: Spec, node: Body, r: Reading) -> Result<Outcome, String> = {
+  let parsed: Parsed = {
+    path: r.path,
+    flags: r.flags,
+    positionals: fill_defaults(node, r.positionals),
+    argv: r.argv,
+  };
+  match missing_requirement(node, parsed) {
+    Some(why) -> Err(refused(spec, r.path, why)),
+    None -> match conflict_of(node, parsed) {
+      Some(why) -> Err(refused(spec, r.path, why)),
+      None -> match missing_positional(node, r) {
+        Some(why) -> Err(refused(spec, r.path, why)),
+        None -> match excess_positional(node, r) {
+          Some(why) -> Err(refused(spec, r.path, why)),
+          None -> match (node.extra)(parsed) {
+            Ok(_unit) -> Ok(Run(parsed)),
+            Err(why) -> Err(refused(spec, r.path, why)),
+          },
+        },
+      },
+    },
+  }
+}
+
+fn missing_sub(spec: Spec, node: Body, r: Reading) -> String =
+  if len(r.path) == 0 {
+    refused(spec, [], "'" ++ spec.bin ++ "' requires a subcommand but one was not provided")
+  } else {
+    refused(
+      spec,
+      r.path,
+      "'" ++ joined_path(r.path) ++ "' requires a subcommand but one was not provided; try one of "
+        ++ joined(map(node.subs, |s: Command| body(s).name)),
+    )
+  }
+
+fn joined_path(path: List<String>) -> String =
+  fold(path, "", |acc: String, w: String| if acc == "" { w } else { acc ++ " " ++ w })
+
+// The first flag given whose `requires` is not also given.
+fn missing_requirement(node: Body, parsed: Parsed) -> Option<String> =
+  fold(node.flags, None, |acc: Option<String>, f: Flag|
+    match acc {
+      Some(found) -> Some(found),
+      None -> if has(parsed, f.long) { unmet(f, parsed) } else { None },
+    })
+
+fn unmet(f: Flag, parsed: Parsed) -> Option<String> =
+  fold(f.requires, None, |acc: Option<String>, req: String|
+    match acc {
+      Some(found) -> Some(found),
+      None -> if has(parsed, req) { None }
+      else { Some("the argument '" ++ called(f) ++ "' requires '--" ++ req ++ "'") },
+    })
+
+// A flag given beside one it conflicts with.
+fn conflict_of(node: Body, parsed: Parsed) -> Option<String> =
+  fold(node.flags, None, |acc: Option<String>, f: Flag|
+    match acc {
+      Some(found) -> Some(found),
+      None -> if has(parsed, f.long) { conflicted(f, parsed) } else { None },
+    })
+
+fn conflicted(f: Flag, parsed: Parsed) -> Option<String> =
+  fold(f.conflicts, None, |acc: Option<String>, other: String|
+    match acc {
+      Some(found) -> Some(found),
+      None -> if has(parsed, other) {
+        Some("the argument '" ++ called(f) ++ "' cannot be used with '--" ++ other ++ "'")
+      } else { None },
+    })
+
+// The required positionals never written, unless excused by the flag they name.
+fn missing_positional(node: Body, r: Reading) -> Option<String> = {
+  let missing = filter(node.positionals, |p: Positional|
+    p.required && !positional_filled(node, p, r)
+      && !(p.unless != "" && has_flag(r.flags, p.unless)));
+  if len(missing) == 0 { None } else {
+    Some(
+      "the following required arguments were not provided:"
+        ++ fold(missing, "", |acc: String, p: Positional| acc ++ "\n  <" ++ p.name ++ ">"),
+    )
+  }
+}
+
+// Positionals fill in order, so the one at index `i` is filled when that many were given.
+fn positional_filled(node: Body, p: Positional, r: Reading) -> Bool =
+  match index_of(node.positionals, p.name, 0) { None -> true, Some(i) -> len(r.positionals) > i }
+
+fn index_of(positionals: List<Positional>, name: String, at: Int) -> Option<Int> =
+  match list_at(positionals, at) {
+    None -> None,
+    Some(p) -> if p.name == name { Some(at) } else { index_of(positionals, name, at + 1) },
+  }
+
+// Words past `--` land in `positionals` unchecked; the first one past the arity is unexpected.
+fn excess_positional(node: Body, r: Reading) -> Option<String> =
+  if is_many(node) || len(r.positionals) <= len(node.positionals) { None } else {
+    match list_at(r.positionals, len(node.positionals)) {
+      Some(extra) -> Some("unexpected argument '" ++ extra ++ "' found"),
+      None -> None,
+    }
+  }
+
+// The positionals a command answers with, defaults filled for the ones left off. A `many`
+// positional left off fills once: no paths is the default path.
+fn fill_defaults(node: Body, given: List<String>) -> List<String> =
+  if is_many(node) {
+    if len(given) > 0 { given } else {
+      match list_at(node.positionals, len(node.positionals) - 1) {
+        Some(last) -> if last.default != "" { [last.default] } else { given },
+        None -> given,
+      }
+    }
+  } else if len(given) >= len(node.positionals) { given } else {
+    match list_at(node.positionals, len(given)) {
+      Some(p) -> if p.default != "" { fill_defaults(node, push(given, p.default)) } else { given },
+      None -> given,
+    }
+  }
+
+// --- What a reader is told ------------------------------------------------------
+
+// A refusal is the error, the usage, and the way to help: the shape `clap` writes, which a
+// command-line reader already knows.
+fn refused(spec: Spec, path: List<String>, message: String) -> String =
+  "error: " ++ message ++ "\n\n" ++ usage_of(spec, path)
+    ++ "\n\nFor more information, try '--help'."
+
+// The nearest flag to what was written, when one is near: an edit away is a typo, not a guess.
+fn flag_tip(root: Command, node: Body, name: String) -> String =
+  match nearest(name, appended(long_names(node.flags), long_names(body(root).flags))) {
+    Some(near) -> "\n\n  tip: a similar argument exists: '--" ++ near ++ "'",
+    None -> "",
+  }
+
+fn sub_tip(root: Command, path: List<String>, name: String) -> String =
+  match node_at(root, path) {
+    Some(node) -> match nearest(name, map(node.subs, |s: Command| body(s).name)) {
+      Some(near) -> "\n\n  tip: a similar subcommand exists: '" ++ near ++ "'",
+      None -> "",
+    },
+    None -> "",
+  }
+
+fn long_names(flags: List<Flag>) -> List<String> = map(flags, |f: Flag| f.long)
+
+fn appended<a>(head: List<a>, tail: List<a>) -> List<a> =
+  fold(tail, head, |acc: List<a>, x: a| push(acc, x))
+
+// Levenshtein's distance over characters; both words are flag names, so this stays small.
+pub fn distance(a: String, b: String) -> Int =
+  last_of(
+    fold(range(0, string_len(b)), row_zero(string_len(a)), |row: List<Int>, j: Int|
+      step_row(a, b, j, row)),
+  )
+
+fn row_zero(width: Int) -> List<Int> = map(range(0, width + 1), |i: Int| i)
+
+fn step_row(a: String, b: String, j: Int, prev: List<Int>) -> List<Int> =
+  fold(range(0, string_len(a)), [j + 1], |row: List<Int>, i: Int|
+    push(row, cell(a, b, i, j, prev, row)))
+
+fn cell(a: String, b: String, i: Int, j: Int, prev: List<Int>, row: List<Int>) -> Int = {
+  let deletion = at_or(prev, i + 1, 0) + 1;
+  let insertion = at_or(row, i, 0) + 1;
+  let same = string_slice(a, i, i + 1) == string_slice(b, j, j + 1);
+  let substitution = at_or(prev, i, 0) + (if same { 0 } else { 1 });
+  min(deletion, min(insertion, substitution))
+}
+
+fn at_or(xs: List<Int>, i: Int, default: Int) -> Int =
+  match list_at(xs, i) { Some(x) -> x, None -> default }
+
+fn last_of(row: List<Int>) -> Int = match list_at(row, len(row) - 1) { Some(x) -> x, None -> 0 }
+
+// A suggestion at distance three or less, which is what "did you mean" means for a flag name.
+fn nearest(name: String, candidates: List<String>) -> Option<String> =
+  match candidates {
+    [] -> None,
+    [candidate, ..rest] -> if distance(name, candidate) <= 3 { Some(candidate) }
+    else { nearest(name, rest) },
+  }
+
+fn joined(words: List<String>) -> String =
+  fold(words, "", |acc: String, w: String| if acc == "" { w } else { acc ++ ", " ++ w })
+
+// --- Help and usage ---------------------------------------------------------------
+
+pub fn help_of(spec: Spec, path: List<String>) -> String = {
+  let node: Body = match node_at(spec.root, path) { Some(n) -> n, None -> body(spec.root) };
+  let sections = [
+    about_line(node.about),
+    usage_of(spec, path),
+    arguments_section(node),
+    options_section(spec, node),
+    commands_section(node),
+  ];
+  string_trim_end(
+    fold(sections, "", |acc: String, part: String|
+      if part == "" { acc } else { acc ++ part ++ "\n\n" }),
+  )
+}
+
+fn arguments_section(node: Body) -> String =
+  if len(node.positionals) == 0 { "" } else {
+    "Arguments:\n"
+      ++ aligned(map(node.positionals, |p: Positional| { left: positional_left(p), right: p.help }))
+  }
+
+fn positional_left(p: Positional) -> String = {
+  let inner = if p.required { "<" ++ p.name ++ ">" } else { "[" ++ p.name ++ "]" };
+  if p.many { inner ++ "..." } else { inner }
+}
+
+fn options_section(spec: Spec, node: Body) -> String = {
+  let flags = appended(node.flags, body(spec.root).flags);
+  let rows = map(flags, |f: Flag| { left: flag_left(f), right: flag_help(f) });
+  let builtin = [
+    { left: "-h, --help", right: "Print help" },
+    { left: "-V, --version", right: "Print version" },
+  ];
+  "Options:\n" ++ aligned(appended(rows, builtin))
+}
+
+// `help` is a command the parser answers, so the listing names it like any other.
+fn commands_section(node: Body) -> String =
+  if len(node.subs) == 0 { "" } else {
+    let rows = map(node.subs, |s: Command|
+      { left: body(s).name, right: about_line(body(s).about) });
+    "Commands:\n"
+      ++ aligned(
+        push(rows, {
+          left: "help",
+          right: "Print this message or the help of the given subcommand(s)",
+        }),
+      )
+  }
+
+// The about is written with its sentence's period; a listing strips it.
+fn about_line(about: String) -> String =
+  if string_ends_with(about, ".") { string_slice(about, 0, string_len(about) - 1) } else { about }
+
+// The flag as the left column of the help writes it: the short slot is four wide whether or not
+// there is one, so the longs align.
+fn flag_left(f: Flag) -> String = {
+  let short = if f.short == "" { "    " } else { "-" ++ f.short ++ ", " };
+  let value = if f.kind == Switch { "" } else { " <" ++ f.value_name ++ ">" };
+  short ++ "--" ++ f.long ++ value
+}
+
+fn flag_help(f: Flag) -> String = {
+  let with_default = if f.default != "" { ["[default: " ++ f.default ++ "]"] } else { [] };
+  let with_choices = match f.kind {
+    Choice(choices) -> push(with_default, "[possible values: " ++ joined(choices) ++ "]"),
+    _ -> with_default,
+  };
+  let parts = if len(f.aliases) > 0 {
+    push(with_choices, "[aliases: " ++ joined(map(f.aliases, |a: String| "--" ++ a)) ++ "]")
+  } else { with_choices };
+  fold(parts, f.help, |acc: String, part: String| acc ++ " " ++ part)
+}
+
+// A two-column block: every right side starts one padding past the widest left.
+fn aligned(rows: List<{ left: String, right: String }>) -> String = {
+  let width = fold(rows, 0, |acc: Int, r: { left: String, right: String }|
+    max(acc, string_len(r.left)));
+  string_trim_end(
+    fold(rows, "", |acc: String, r: { left: String, right: String }|
+      acc ++ "  " ++ r.left ++ pad(width - string_len(r.left) + 2) ++ r.right ++ "\n"),
+  )
+}
+
+fn string_trim_end(s: String) -> String =
+  if string_ends_with(s, "\n") { string_slice(s, 0, string_len(s) - 1) } else { s }
+
+fn pad(n: Int) -> String = if n <= 0 { "" } else { " " ++ pad(n - 1) }
+
+pub fn usage_of(spec: Spec, path: List<String>) -> String = {
+  let node: Body = match node_at(spec.root, path) { Some(n) -> n, None -> body(spec.root) };
+  let line = spec.bin ++ prefixed(path) ++ " [OPTIONS]";
+  let with_positionals = fold(node.positionals, line, |acc: String, p: Positional|
+    acc ++ " " ++ positional_left(p));
+  let with_subs = if len(node.subs) > 0 { with_positionals ++ " <COMMAND>" }
+  else { with_positionals };
+  "Usage: " ++ (if node.trailing { with_subs ++ " [-- ARGS]" } else { with_subs })
+}
+
+fn prefixed(path: List<String>) -> String = fold(path, "", |acc: String, w: String| acc ++ " " ++ w)
+
+// --- Reading a parse --------------------------------------------------------------
+
+// Whether the flag was written at all, valued or not.
+pub fn has(p: Parsed, long: String) -> Bool = has_flag(p.flags, long)
+
+// The last value a flag was written with; duplicates are refused before this is read.
+pub fn value(p: Parsed, long: String) -> Option<String> =
+  fold(p.flags, None, |acc: Option<String>, g: Given| if g.long == long { g.value } else { acc })
+
+// Every value a repeatable flag was written with, in order.
+pub fn values_of(p: Parsed, long: String) -> List<String> =
+  fold(p.flags, [], |acc: List<String>, g: Given|
+    match g.value { Some(v) -> if g.long == long { push(acc, v) } else { acc }, None -> acc })
+
+// The first positional, or the command's default for it.
+pub fn path_of(p: Parsed) -> String =
+  match list_at(p.positionals, 0) { Some(first) -> first, None -> "." }
+
+// --- Tests ----------------------------------------------------------------------
+
+// A fixture with a global choice flag, local flags of every kind, a repeatable, a defaulted and a
+// required positional, a subcommanded command, and a trailing one.
+fn fixture() -> Spec = {
+  let run = with_trailing(
+    with_positionals(
+      command("run", "Run it.", [
+        switch("verbose", "Say more."),
+        with_short(valued("jobs", "N", Pos, "Worker threads."), "j"),
+        valued("name", "NAME", Text, "A name."),
+        with_default(valued("when", "WHEN", Choice(["auto", "never"]), "When."), "auto"),
+        repeated(valued("dep", "DEP", Text, "A dependency.")),
+      ]),
+      [defaulted("PATH", "Where.", ".")],
+    ),
+  );
+  let clear = with_positionals(command("clear", "Discard it.", [switch("json", "As JSON.")]), [
+    defaulted("PATH", "Where.", "."),
+  ]);
+  let inspect = with_positionals(command("inspect", "Look.", []), [positional("DEF", "Which.")]);
+  let cache = with_subs(command("cache", "The cache.", []), [clear, inspect]);
+  let root = command("", "the fixture tool", [
+    with_default(valued("color", "COLOR", Choice(["auto", "always", "never"]), "Colour."), "auto"),
+  ]);
+  {
+    bin: "fx",
+    version: "1.2.3",
+    root: with_subs(root, [
+      run,
+      cache,
+      command("build", "Build it.", [switch("json", "As JSON.")]),
+    ]),
+  }
+}
+
+fn run_of(outcome: Outcome) -> Parsed =
+  match outcome { Run(p) -> p, _ -> panic("the line was refused, not run") }
+
+fn refused_of(outcome: Outcome) -> String =
+  match outcome { Refused(text) -> text, _ -> panic("the line ran, was not refused") }
+
+test "a bare command line parses with the defaults" {
+  let p = run_of(parse(fixture(), ["run"]));
+  assert_eq(p.path, ["run"]);
+  assert_eq(p.positionals, ["."]);
+  assert_eq(p.argv, []);
+  assert(!has(p, "verbose"));
+  assert_eq(value(p, "jobs"), None)
+}
+
+test "flags parse fused and spaced, and a global reads at either side of the command" {
+  let p = run_of(
+    parse(fixture(), ["--color", "never", "run", "--verbose", "--jobs=4", "--name", "x"]),
+  );
+  assert(has(p, "verbose"));
+  assert_eq(value(p, "color"), Some("never"));
+  assert_eq(value(p, "jobs"), Some("4"));
+  assert_eq(value(p, "name"), Some("x"));
+  let fused = run_of(parse(fixture(), ["run", "--color=never"]));
+  assert_eq(value(fused, "color"), Some("never"))
+}
+
+test "a short flag takes its value fused, after `=`, or in the next word" {
+  assert_eq(value(run_of(parse(fixture(), ["run", "-j4"])), "jobs"), Some("4"));
+  assert_eq(value(run_of(parse(fixture(), ["run", "-j=4"])), "jobs"), Some("4"));
+  assert_eq(value(run_of(parse(fixture(), ["run", "-j", "4"])), "jobs"), Some("4"))
+}
+
+test "a repeatable flag collects every value in order" {
+  let p = run_of(parse(fixture(), ["run", "--dep", "a", "--dep=b"]));
+  assert_eq(values_of(p, "dep"), ["a", "b"]);
+  assert_eq(values_of(p, "jobs"), [])
+}
+
+test "everything after `--` under a trailing command is the program's" {
+  let p = run_of(parse(fixture(), ["run", "m.ply", "--", "--json", "-x"]));
+  assert_eq(p.positionals, ["m.ply"]);
+  assert_eq(p.argv, ["--json", "-x"]);
+  assert(!has(p, "json"))
+}
+
+test "after `--` under a plain command every word is a positional" {
+  let p = run_of(parse(fixture(), ["cache", "clear", "--", "--json"]));
+  assert_eq(p.positionals, ["--json"]);
+  assert(!has(p, "json"))
+}
+
+test "an unknown flag is refused with a suggestion when one is near" {
+  let text = refused_of(parse(fixture(), ["run", "--job"]));
+  assert(string_contains(text, "unexpected argument '--job' found"));
+  assert(string_contains(text, "tip: a similar argument exists: '--jobs'"));
+  assert(string_contains(text, "Usage: fx run"));
+  assert(string_ends_with(string_trim(text), "For more information, try '--help'."))
+}
+
+test "an unknown flag far from every name gets no tip" {
+  let text = refused_of(parse(fixture(), ["run", "--frobnicate"]));
+  assert(string_contains(text, "unexpected argument '--frobnicate' found"));
+  assert(!string_contains(text, "tip:"))
+}
+
+test "an unknown command is refused, and a near one is suggested" {
+  let text = refused_of(parse(fixture(), ["rn"]));
+  assert(string_contains(text, "unrecognized subcommand 'rn'"));
+  assert(string_contains(text, "tip: a similar subcommand exists: 'run'"));
+  let far = refused_of(parse(fixture(), ["frobnicate"]));
+  assert(string_contains(far, "unrecognized subcommand 'frobnicate'"));
+  assert(!string_contains(far, "tip:"))
+}
+
+test "a valued flag owed its value is refused, and a flag word is not the value" {
+  let text = refused_of(parse(fixture(), ["run", "--jobs"]));
+  assert(string_contains(text, "a value is required for '--jobs <N>' but none was supplied"));
+  let next = refused_of(parse(fixture(), ["run", "--jobs", "--verbose"]));
+  assert(string_contains(next, "a value is required for '--jobs <N>'"))
+}
+
+test "a switch takes no value" {
+  let text = refused_of(parse(fixture(), ["run", "--verbose=yes"]));
+  assert(string_contains(text, "unexpected value 'yes' for '--verbose' found"))
+}
+
+test "a number flag refuses a word, and a positive one refuses zero" {
+  let word = refused_of(parse(fixture(), ["run", "--jobs", "four"]));
+  assert(string_contains(word, "invalid value 'four' for '--jobs <N>'"));
+  let zero = refused_of(parse(fixture(), ["run", "--jobs", "0"]));
+  assert(string_contains(zero, "invalid value '0' for '--jobs <N>'"))
+}
+
+test "a choice flag names the values it takes" {
+  let text = refused_of(parse(fixture(), ["run", "--when", "sometimes"]));
+  assert(string_contains(text, "invalid value 'sometimes' for '--when <WHEN>'"));
+  assert(string_contains(text, "[possible values: auto, never]"))
+}
+
+test "a flag written twice is refused unless it repeats" {
+  let text = refused_of(parse(fixture(), ["run", "--jobs", "4", "--jobs", "8"]));
+  assert(string_contains(text, "the argument '--jobs <N>' was provided more than once"));
+  let both = refused_of(parse(fixture(), ["run", "--verbose", "--verbose"]));
+  assert(string_contains(both, "the argument '--verbose' was provided more than once"))
+}
+
+test "a subcommand parses under its command, with its own flags and positionals" {
+  let p = run_of(parse(fixture(), ["cache", "clear", "--json", "tmp"]));
+  assert_eq(p.path, ["cache", "clear"]);
+  assert_eq(p.positionals, ["tmp"]);
+  assert(has(p, "json"))
+}
+
+test "a subcommanded command without one is refused, naming them" {
+  let text = refused_of(parse(fixture(), ["cache"]));
+  assert(string_contains(text, "requires a subcommand but one was not provided"));
+  assert(string_contains(text, "clear, inspect"));
+  let root = refused_of(parse(fixture(), []));
+  assert(string_contains(root, "'fx' requires a subcommand but one was not provided"))
+}
+
+test "a required positional is owed" {
+  let text = refused_of(parse(fixture(), ["cache", "inspect"]));
+  assert(string_contains(text, "the following required arguments were not provided:"));
+  assert(string_contains(text, "<DEF>"))
+}
+
+test "one positional too many is unexpected" {
+  let text = refused_of(parse(fixture(), ["cache", "clear", "a", "b"]));
+  assert(string_contains(text, "unexpected argument 'b' found"))
+}
+
+test "help answers at any level and stops the parse" {
+  match parse(fixture(), ["--help"]) {
+    Help(text) -> {
+      assert(string_contains(text, "the fixture tool"));
+      assert(string_contains(text, "Usage: fx [OPTIONS] <COMMAND>"));
+      assert(string_contains(text, "run"));
+      assert(string_contains(text, "--color"))
+    },
+    _ -> panic("--help is help"),
+  };
+  match parse(fixture(), ["run", "--help"]) {
+    Help(text) -> {
+      assert(string_contains(text, "Run it"));
+      assert(string_contains(text, "Usage: fx run [OPTIONS] [PATH] [-- ARGS]"));
+      assert(string_contains(text, "-j, --jobs <N>"));
+      assert(string_contains(text, "[default: auto]"));
+      assert(string_contains(text, "[possible values: auto, never]"));
+      assert(string_contains(text, "Print help"))
+    },
+    _ -> panic("run --help is help"),
+  };
+  // A bad word after `--help` is never read.
+  match parse(fixture(), ["run", "--help", "--frobnicate"]) {
+    Help(_) -> (),
+    _ -> panic("help stops the parse"),
+  }
+}
+
+test "help as a word descends to the command it names" {
+  match parse(fixture(), ["help", "cache", "clear"]) {
+    Help(text) -> assert(string_contains(text, "Discard it")),
+    _ -> panic("help cache clear is help"),
+  };
+  match parse(fixture(), ["help"]) {
+    Help(text) -> assert(string_contains(text, "the fixture tool")),
+    _ -> panic("bare help is the top help"),
+  }
+}
+
+test "version answers at any level" {
+  match parse(fixture(), ["--version"]) {
+    Version(text) -> assert_eq(text, "fx 1.2.3"),
+    _ -> panic("--version is the version"),
+  };
+  match parse(fixture(), ["run", "-V"]) {
+    Version(text) -> assert_eq(text, "fx 1.2.3"),
+    _ -> panic("-V is the version"),
+  }
+}
+
+test "the usage line says what the command takes" {
+  assert_eq(usage_of(fixture(), []), "Usage: fx [OPTIONS] <COMMAND>");
+  assert_eq(usage_of(fixture(), ["run"]), "Usage: fx run [OPTIONS] [PATH] [-- ARGS]");
+  assert_eq(usage_of(fixture(), ["cache"]), "Usage: fx cache [OPTIONS] <COMMAND>");
+  assert_eq(usage_of(fixture(), ["cache", "inspect"]), "Usage: fx cache inspect [OPTIONS] <DEF>")
+}
+
+test "the distance a suggestion is allowed is an edit of three" {
+  assert_eq(distance("job", "jobs"), 1);
+  assert_eq(distance("rn", "run"), 1);
+  assert_eq(distance("frobnicate", "verbose"), 8);
+  assert_eq(nearest("verbse", ["verbose", "jobs"]), Some("verbose"));
+  assert_eq(nearest("xyzzy", ["verbose", "jobs"]), None)
+}
+
+test "a number that overflows the integer is not one" {
+  assert_eq(parse_nat("0"), Some(0));
+  assert_eq(parse_nat("9223372036854775807"), Some(9223372036854775807));
+  assert_eq(parse_nat("9223372036854775808"), None);
+  assert_eq(parse_nat(""), None);
+  assert_eq(parse_nat("4x"), None);
+  assert_eq(parse_nat(" 4"), None)
+}
+
+test "the commands listing names `help`, and abouts lose their sentence's period" {
+  match parse(fixture(), ["--help"]) {
+    Help(text) -> {
+      assert(string_contains(text, "Print this message or the help of the given subcommand(s)"));
+      assert(string_contains(text, "Run it"));
+      assert(!string_contains(text, "Run it."));
+      // The command's own page leads with the about, period stripped as well.
+      match parse(fixture(), ["run", "--help"]) {
+        Help(page) -> assert(string_starts_with(page, "Run it\n")),
+        _ -> panic("run --help is help"),
+      }
+    },
+    _ -> panic("--help is help"),
+  }
+}
