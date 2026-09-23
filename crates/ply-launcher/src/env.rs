@@ -1,6 +1,7 @@
 //! The environment a launched program runs in, as a lent effect: the variables, whether the
-//! streams are terminals, and the binary's own version. Bound by the launcher for the program it
-//! enters — user programs read configuration, not the environment.
+//! streams are terminals, the working directory, and the binary's own version and shipped digest.
+//! Bound by the launcher for the program it enters — user programs read configuration, not the
+//! environment.
 //!
 //! Colour is decided here and nowhere else: a program has no terminal to ask.
 
@@ -16,11 +17,12 @@ use std::sync::Arc;
 /// `env.binary_version[e]()`.
 pub const EFFECT: &str = "env";
 
-const OPERATIONS: [(&str, &str); 4] = [
+const OPERATIONS: [(&str, &str); 5] = [
     ("var", "ply_launcher::env::var"),
     ("terminal", "ply_launcher::env::terminal"),
     ("binary_version", "ply_launcher::env::binary_version"),
     ("pwd", "ply_launcher::env::pwd"),
+    ("shipped_digest", "ply_launcher::env::shipped_digest"),
 ];
 
 /// The ops and the handler, lent with the binary's version.
@@ -74,6 +76,9 @@ impl HostHandler for Site {
                 Value::Bool(terminal)
             }
             ("binary_version", []) => Value::str(&self.version),
+            // The digest the committed CLI artifact is gated on: the build of the program's own
+            // sources writes it beside the artifact.
+            ("shipped_digest", []) => Value::str(crate::shipped::identity()),
             // The working directory the `cwd` root is bound to, as the program resolves paths.
             ("pwd", []) => Value::str(
                 std::env::current_dir()

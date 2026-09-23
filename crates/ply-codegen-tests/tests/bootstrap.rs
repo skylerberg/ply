@@ -1,4 +1,5 @@
-//! `PLY_C_BOOTSTRAP_REFRESH=1` rewrites `crates/ply-compiler/bootstrap` with the fixpoint's emission; CI does so on main after each merge.
+//! The bundle is the fixpoint's emission; CI's `refresh` job rewrites it on main with
+//! `ply bootstrap crates/ply-compiler/ply --out crates/ply-compiler/bootstrap`.
 
 use ply_codegen::Source;
 use ply_codegen::c::Produced;
@@ -44,7 +45,7 @@ fn build_from(dir: &Path) -> Result<PlyProducer, String> {
             format!(
                 "{e:#}; this runtime cannot build the emitter from the bundle at {}: check out an \
                  older bundle it serves from git history, then refresh it with \
-                 PLY_C_BOOTSTRAP_REFRESH=1",
+                 `ply bootstrap crates/ply-compiler/ply --out crates/ply-compiler/bootstrap`",
                 dir.display()
             )
         } else {
@@ -74,10 +75,10 @@ fn emit_with(source: &'static Source, from: &Path, scratch: &Path, identity: &st
 fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
     let (source, identity) = emitter_source();
     let bundle = PathBuf::from(ply_compiler::bootstrap::DIR);
-    let refresh = std::env::var("PLY_C_BOOTSTRAP_REFRESH").is_ok();
     assert!(
         ply_codegen::c::bundle::exists(&bundle),
-        "no bootstrap bundle at {}; check one out from git history, then refresh it with PLY_C_BOOTSTRAP_REFRESH=1",
+        "no bootstrap bundle at {}; check one out from git history, then refresh it with \
+         `ply bootstrap crates/ply-compiler/ply --out crates/ply-compiler/bootstrap`",
         bundle.display()
     );
     let scratch = std::env::temp_dir().join(format!("ply-bootstrap-{}", std::process::id()));
@@ -97,7 +98,7 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
     };
     // The unit's table is its C's last declaration, so comparing the C compares the table too.
     // The first round is the checked-in bundle's emitter over these sources, which may be behind
-    // them, so rounds go on until two emissions agree; the fixpoint is written only on request.
+    // them, so rounds go on until two emissions agree.
     let mut last = p1;
     let mut settled = false;
     for round in 1..=3 {
@@ -110,10 +111,6 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
             next.refused
         );
         if last.text == next.text {
-            if refresh {
-                ply_codegen::c::bundle::write(&bundle, &next.text, &identity).unwrap();
-                eprintln!("bootstrap bundle written to {}", bundle.display());
-            }
             settled = true;
             break;
         }

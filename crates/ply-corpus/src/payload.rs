@@ -1,8 +1,8 @@
 //! What payload types cost: JSON codecs, maps and derivation.
 
 use anyhow::{Context, Result, bail};
-use ply_machine::driver;
 use ply_eval::{Machine, Value};
+use ply_machine::driver;
 use ply_span::Span;
 use ply_store::Store;
 use serde::Serialize;

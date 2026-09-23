@@ -445,6 +445,27 @@ struct Emission {
 }
 
 /// The transitive closure of the entry point and of the run's start-up definitions.
+/// What a build of a program is a function of, as one digest: its sources (already digested),
+/// the shelf, the emitter and the store versions a decode refuses a mismatch of. The launcher
+/// gates the committed CLI artifact on this: behind the sources, a binary runs the sources
+/// instead.
+pub fn toolchain_stamp(program_digest: &str) -> String {
+    let (frontend_version, runtime_version, body_encoding) = crate::shelf::store_versions();
+    let mut hasher = blake3::Hasher::new();
+    for part in [
+        program_digest,
+        ply_codegen::c::producer::digest_of(crate::shelf::sources()).as_str(),
+        ply_codegen::c::producer::identity().as_str(),
+        frontend_version,
+        runtime_version,
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update(&[0]);
+    }
+    hasher.update(&body_encoding.to_le_bytes());
+    hasher.finalize().to_hex()[..16].to_string()
+}
+
 pub fn build(
     loaded: &Loaded,
     entry: &DefInfo,

@@ -1,10 +1,10 @@
 use self::fixture::{op, receives_secrets, registry};
-use ply_machine::config::Configuration;
-use ply_machine::db::DbConfig;
-use ply_machine::hosts::*;
 use ply_codegen::c::producer;
 use ply_eval::host::{HostListing, HostRegistry, HostResource, Linearity};
 use ply_host::tls;
+use ply_machine::config::Configuration;
+use ply_machine::db::DbConfig;
+use ply_machine::hosts::*;
 use ply_span::{SourceId, Symbol};
 use ply_ty::CheckOutput;
 use ply_ty::ty::{Footprint, Resource};
