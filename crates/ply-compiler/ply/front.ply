@@ -1,6 +1,6 @@
 // The front end's answer for the driver: the errors, or else the warnings and every table it reads, in `diag.ply`'s framing.
 
-import spine (Span, Ident, QName, dummy_span, num)
+import spine (Span, Ident, QName, PDiag, dummy_span, num)
 import lexer (byte_of)
 import items (Item, IFn, IType, IEffect, ITest, ILaw, IEffectSet, TDSum, VariantDef, SpecClause,
               SpecKind, SRequires, SEnsures, ImportDecl, Vis, VPub, VPriv, FnDef, LawDef, Binder)
@@ -23,8 +23,10 @@ import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, L
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, no_known, update_shapes, expanded_mods,
               check_front_with, deriver_text, is_prelude_effect, builtin_schemes, BuiltinDoc,
               builtin_docs, find_doc)
-import diag (Parsed, parse_all, parse_at, outside_every_module, frame, framed, field, flag)
+import diag (Parsed, parse_all, parse_at, outside_every_module, frame, framed, field, flag, placed)
+import pkg (check_source)
 import std.hash (blake3)
+import std.pkg (Manifest)
 import fmt (item_range, replace_item)
 
 fn cat(parts: List<List<Bytes>>) -> List<Bytes> =
@@ -555,6 +557,8 @@ pub type Whole = {
   index: Index,
   hashes: HashOutput,
   warnings: List<Diag>,
+  // The project's `ply.pkg`, decoded; `None` is the anonymous package.
+  manifest: Option<Manifest>,
 }
 
 // A stage that reports stops the rest, so a refusal is the diagnostics of exactly one stage.
@@ -651,33 +655,42 @@ pub fn analyse_with(
   parsed: List<Parsed>,
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
+  manifest: Option<Bytes> = None,
 ) -> Analysis = {
-  let early = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
-  if len(early) > 0 { Refused(early) } else {
-    match resolve_modules(map(parsed, |p: Parsed| p.module)) {
-      Failed(ds) -> Refused(map(ds, outside_every_module)),
-      Resolved_(x) -> {
-        let built = build_index(x.mods, x.r);
-        if len(built.diags) > 0 { Refused(map(built.diags, outside_every_module)) } else {
-          // Hashing reads the tree, not the checker, so what has moved is known before anything is checked.
-          let hashes: HashOutput = hash_index(built.index);
-          let checked: Front = check_front_with(
-            x.r,
-            x.mods,
-            taken(x.mods, built.index, hashes, defs, tests),
-          );
-          if !checked.ok { Refused(map(checked.diags, outside_every_module)) } else {
-            Analysed({
-              mods: x.mods,
-              r: x.r,
-              checked: checked,
-              index: built.index,
-              hashes: hashes,
-              warnings: map(unused(built.index), outside_every_module),
-            })
+  // The package's identity reports ahead of anything the program text has to say.
+  let pkg = match manifest {
+    None -> { manifest: None, diags: [] },
+    Some(src) -> check_source(src),
+  };
+  if len(pkg.diags) > 0 { Refused(map(pkg.diags, |d: PDiag| placed(len(parsed), d))) } else {
+    let early = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
+    if len(early) > 0 { Refused(early) } else {
+      match resolve_modules(map(parsed, |p: Parsed| p.module)) {
+        Failed(ds) -> Refused(map(ds, outside_every_module)),
+        Resolved_(x) -> {
+          let built = build_index(x.mods, x.r);
+          if len(built.diags) > 0 { Refused(map(built.diags, outside_every_module)) } else {
+            // Hashing reads the tree, not the checker, so what has moved is known before anything is checked.
+            let hashes: HashOutput = hash_index(built.index);
+            let checked: Front = check_front_with(
+              x.r,
+              x.mods,
+              taken(x.mods, built.index, hashes, defs, tests),
+            );
+            if !checked.ok { Refused(map(checked.diags, outside_every_module)) } else {
+              Analysed({
+                mods: x.mods,
+                r: x.r,
+                checked: checked,
+                index: built.index,
+                hashes: hashes,
+                warnings: map(unused(built.index), outside_every_module),
+                manifest: pkg.manifest,
+              })
+            }
           }
-        }
-      },
+        },
+      }
     }
   }
 }
@@ -1121,6 +1134,7 @@ pub fn analyse_pulling_std_with(
   shipped: List<Source>,
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
+  manifest: Option<Bytes> = None,
 ) -> Pulled = {
   let texts = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
     map_insert(acc, s.name, s.src));
@@ -1131,7 +1145,8 @@ pub fn analyse_pulling_std_with(
   });
   {
     pulled: x.pulled,
-    out: if len(x.diags) > 0 { Refused(x.diags) } else { analyse_with(x.parsed, defs, tests) },
+    out: if len(x.diags) > 0 { Refused(x.diags) }
+    else { analyse_with(x.parsed, defs, tests, manifest) },
   }
 }
 
@@ -1144,8 +1159,9 @@ pub fn front_pulling_std_with(
   shipped: List<Source>,
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
+  manifest: Option<Bytes> = None,
 ) -> String = {
-  let x: Pulled = analyse_pulling_std_with(user, shipped, defs, tests);
+  let x: Pulled = analyse_pulling_std_with(user, shipped, defs, tests, manifest);
   let head = framed(b"pulled", b"_", map(x.pulled, |n: Bytes| field(b"module", n)));
   string_of_bytes(bytes_concat(head, dump_text(dump_of(x.out))))
 }
@@ -3239,4 +3255,32 @@ test "a qualified name that is not exported moves the hash of everything that na
   assert(hash_of(shut, b"b.two") != hash_of(exported, b"b.two"));
   // `a.one` itself is untouched: `pub` is metadata its own encoding erases.
   assert_eq(hash_of(shut, b"a.one"), hash_of(exported, b"a.one"))
+}
+
+test "a project's manifest is checked ahead of the program and carried decoded" {
+  let good = analyse_with(
+    parse_all(program()),
+    [],
+    [],
+    Some(
+      b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"m\", version: {major: 0, minor: 1, patch: 0}, prefix: None, runtime: {major: 0, minor: 1, patch: 0}, dependencies: [], entry: None}",
+    ),
+  );
+  match good {
+    Refused(ds) -> assert_eq(map(ds, |d: Diag| d.code), []),
+    Analysed(w) -> match w.manifest { None -> assert(false), Some(m) -> assert_eq(m.name, "m") },
+  };
+  let malformed = analyse_with(parse_all(program()), [], [], Some(b"fn package() -> Int = 1"));
+  match malformed {
+    Analysed(_) -> assert(false),
+    Refused(ds) -> {
+      assert_eq(at(ds, 0).code, b"E0129");
+      // One module of program text, so the manifest's label points one past it.
+      assert_eq(at(at(ds, 0).labels, 0).module, 1)
+    },
+  };
+  match analyse_with(parse_all(program()), [], []) {
+    Refused(_) -> assert(false),
+    Analysed(w) -> assert_eq(w.manifest, None),
+  }
 }
