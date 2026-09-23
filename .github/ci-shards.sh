@@ -246,6 +246,33 @@ priority_blocks() {
 
 # One `shard-<i>.toml` per partition: the tests it runs as its profile's `default-filter`, and the
 # order to start them in. 3 when there is nothing measured to cut, so the caller slices by count.
+# The rows of $1 whose binary and test the tree still has, on $2. A rename or a deletion leaves
+# stale rows in the cached table, and a filter naming a binary id nothing builds is a nextest
+# error; what the table does not name, the catch-all shard runs.
+living_durations() {
+  local id test ms package target file dropped=0
+  : > "$2"
+  while IFS="$TAB" read -r id test ms; do
+    case "$id" in
+      *::*) package=${id%%::*}; target=${id#*::} ;;
+      *) package=$id; target=lib ;;
+    esac
+    if [[ $target == lib ]]; then
+      [[ -d $root/crates/$package/src ]] || { dropped=$((dropped + 1)); continue; }
+    elif [[ $target == bin/* ]]; then
+      name=${target#bin/}
+      [[ -f $root/crates/$package/src/main.rs || -f $root/crates/$package/src/bin/$name.rs || -f $root/crates/$package/src/bin/$name/main.rs ]] \
+        || grep -q "name = \"$name\"" "$root/crates/$package/Cargo.toml" 2>/dev/null \
+        || { dropped=$((dropped + 1)); continue; }
+    else
+      file=$(test_source_file "$package" "$target" "$test")
+      [[ -f $file ]] || { dropped=$((dropped + 1)); continue; }
+    fi
+    printf '%s\t%s\t%s\n' "$id" "$test" "$ms" >> "$2"
+  done < "$1"
+  [[ $dropped -eq 0 ]]     || echo "$dropped measured row(s) name tests the tree no longer has; left to the catch-all" >&2
+}
+
 shard_configs() {
   local dir=$1 timings=$2 tmp catchall first i
   if [[ ! -s $timings ]]; then
@@ -257,6 +284,13 @@ shard_configs() {
     return 1
   fi
   tmp=$(mktemp -d)
+  living_durations "$timings" "$tmp/living"
+  if [[ ! -s $tmp/living ]]; then
+    echo "no measured durations name a test the tree still has" >&2
+    rm -rf "$tmp"
+    return 3
+  fi
+  timings=$tmp/living
   assign "$timings" > "$tmp/assigned"
   catchall=$(awk -F"$TAB" '$1 == "catchall" { print $2 }' "$tmp/assigned")
   if awk -F"$TAB" '$1 == "load" && $4 == 0 { bare = 1 } END { exit !bare }' "$tmp/assigned"; then
@@ -529,9 +563,9 @@ cmd_verify() {
     echo "FAIL: W5_FILTER names crates/ply-cli-tests/tests/suite/w5_shutdown.rs, which does not exist" >&2
     failures=$((failures + 1))
   fi
-  # Cargo builds `ply` for ply-cli-tests only if ply-cli has an integration test of its own.
-  if ! ls "$root"/crates/ply-cli/tests/*.rs >/dev/null 2>&1; then
-    echo "FAIL: crates/ply-cli/tests/ has no .rs file, so cargo builds no 'ply' for ply-cli-tests' suite to run" >&2
+  # Cargo builds `ply` for ply-cli-tests only if ply-launcher has an integration test of its own.
+  if ! ls "$root"/crates/ply-launcher/tests/*.rs >/dev/null 2>&1; then
+    echo "FAIL: crates/ply-launcher/tests/ has no .rs file, so cargo builds no 'ply' for ply-cli-tests' suite to run" >&2
     failures=$((failures + 1))
   fi
 
@@ -542,9 +576,17 @@ cmd_verify() {
     failures=$((failures + 1))
   else
     made_up=$(mktemp -d)
-    for ((made_up_test = 1; made_up_test <= PARTITIONS + 4; made_up_test++)); do
-      printf 'made-up::suite%d\tmade_up::test_%d\t%d\n' \
-        $((made_up_test % 3 + 1)) "$made_up_test" $((made_up_test * 37 + 1)) >> "$made_up/timings.tsv"
+    # Real tests with invented costs: the cut drops durations for tests the tree no longer has,
+    # so a table it can check has to name ones it has.
+    made_up_count=0
+    for made_up_file in "$root"/crates/ply-cli-tests/tests/suite/*.rs; do
+      made_up_mod=${made_up_file##*/}; made_up_mod=${made_up_mod%.rs}
+      while read -r made_up_fn; do
+        made_up_count=$((made_up_count + 1))
+        printf 'ply-cli-tests::suite\t%s::%s\t%d\n' \
+          "$made_up_mod" "$made_up_fn" $((made_up_count * 37 + 1)) >> "$made_up/timings.tsv"
+        [[ $made_up_count -ge $((PARTITIONS + 4)) ]] && break 2
+      done < <(sed -n 's/^fn \([a-z0-9_]*\)(.*/\1/p' "$made_up_file")
     done
     check_shards made-up "$made_up/timings.tsv" || failures=$((failures + 1))
     rm -rf "$made_up"
