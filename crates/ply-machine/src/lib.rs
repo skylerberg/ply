@@ -11,6 +11,7 @@
 pub mod artifact;
 pub mod bootstrap;
 pub mod builder;
+pub mod cache;
 pub mod claims;
 pub mod config;
 pub mod costs;
