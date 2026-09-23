@@ -14,6 +14,7 @@ nondet effect env {
   read var[e](name: String) -> Option<String>
   read terminal[e](stream: String) -> Bool
   read binary_version[e]() -> String
+  read pwd[e]() -> String
 }
 
 fn main() -> String / {env.var[e], env.terminal[e], env.binary_version[e]} = {
