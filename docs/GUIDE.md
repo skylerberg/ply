@@ -152,7 +152,9 @@ fn credit(a: Account, amount: Int, note: Option<String> = None) -> Account {
 
 A body is `= expression`, or a block with no `=`. There is no `return`. Every
 parameter and return type of a top-level `fn` must be written (`E0126`, which
-names the inferred type).
+names the inferred type). A parameter the body never names may be written `_`,
+in a `fn`, a lambda or a handler clause, as in a pattern; it binds nothing and
+may repeat.
 
 A parameter default lets a call omit the argument. It must be a value — a
 literal, a constructor over literals, a record or a list — and may not name
