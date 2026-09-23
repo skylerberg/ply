@@ -860,8 +860,7 @@ const PAYLOAD: &str = "hosts";
 
 /// Assembled before the program is entered: a load and a backend are the compiler's work, and
 /// the compiler is not something to re-enter from inside a running program.
-/// What `ply hosts` is configured with, as plain data: the shell's parsed flags convert into
-/// this.
+/// What `ply hosts` is configured with, as plain data: the program's parse converts into this.
 #[derive(Clone, Debug)]
 pub struct HostsOptions {
     pub path: std::path::PathBuf,
@@ -876,9 +875,33 @@ pub struct HostsOptions {
     pub shutdown: crate::options::ShutdownOptions,
 }
 
-pub fn lent(args: &crate::hosts::HostsOptions) -> Vec<Lent> {
+/// The ops and the one handler serving them: nothing is assembled before the program asks, and
+/// its path and options come with the asking.
+impl HostsOptions {
+    /// The preview is hermetic: nothing is bound.
+    pub fn hermetic(path: std::path::PathBuf) -> HostsOptions {
+        HostsOptions::of(path, crate::drive::RunOptions::default())
+    }
+
+    pub fn of(path: std::path::PathBuf, o: crate::drive::RunOptions) -> HostsOptions {
+        HostsOptions {
+            path,
+            host: o.host,
+            json: false,
+            digest: false,
+            tls: o.tls,
+            fs: o.fs,
+            db: o.db,
+            config: o.config,
+            trace: o.trace,
+            shutdown: o.shutdown,
+        }
+    }
+}
+
+pub fn lent() -> Vec<Lent> {
     let facility: Arc<dyn HostHandler> = Arc::new(Facility {
-        assembled: Assembled::of(args),
+        assembled: std::sync::Mutex::new(None),
     });
     vec![
         (registration("preview", PREVIEW), Arc::clone(&facility)),
@@ -902,15 +925,47 @@ fn registration(op: &str, path: &'static str) -> HostOp {
 }
 
 struct Facility {
-    assembled: Assembled,
+    assembled: std::sync::Mutex<Option<Assembled>>,
+}
+
+impl Facility {
+    fn assembled(&self, options: HostsOptions) -> std::sync::MutexGuard<'_, Option<Assembled>> {
+        let mut held = self.assembled.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_none() {
+            *held = Some(Assembled::of(&options));
+        }
+        held
+    }
 }
 
 impl HostHandler for Facility {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
-        let value = match req.op.op.as_str() {
-            "preview" => self.assembled.preview(),
-            "open" => self.assembled.binding(),
-            other => return Err(unregistered(other, req.span)),
+        let span = req.span;
+        let value = match (req.op.op.as_str(), req.args) {
+            ("preview", [path, options]) => {
+                let o = crate::drive::run_options_of(options, span)?;
+                let options = HostsOptions::of(
+                    std::path::PathBuf::from(path.as_str(span, "the project's path")?),
+                    o,
+                );
+                self.assembled(options)
+                    .as_ref()
+                    .expect("assembled")
+                    .preview()
+            }
+            ("open", [path, options]) => {
+                let mut o = crate::drive::run_options_of(options, span)?;
+                o.host = true;
+                let options = HostsOptions::of(
+                    std::path::PathBuf::from(path.as_str(span, "the project's path")?),
+                    o,
+                );
+                self.assembled(options)
+                    .as_ref()
+                    .expect("assembled")
+                    .binding()
+            }
+            (other, _) => return Err(unregistered(other, span)),
         };
         Ok(HostAnswer::Value(value))
     }

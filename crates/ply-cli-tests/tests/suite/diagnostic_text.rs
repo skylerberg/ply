@@ -100,7 +100,7 @@ fn through_ply(machine: &mut Machine<'_>, entry: &str) -> String {
 fn the_two_renderers_write_the_same_bytes_for_one_diagnostic() {
     let dir = tempfile::tempdir().unwrap();
     for module in CARRIED {
-        let text = ply_cli::shipped::PROGRAM_SOURCES
+        let text = ply_launcher::shipped::PROGRAM_SOURCES
             .iter()
             .find(|(name, _)| *name == module)
             .map(|(_, text)| *text)

@@ -448,6 +448,7 @@ type TraceOpts = { sink: String, level: String }
 
 type Options = {
   host: Bool,
+  json: Bool,
   tls: List<TlsCred>,
   trust: List<String>,
   fs: List<Named>,
@@ -514,6 +515,7 @@ type Ended = { exit: Option<Int>, value: Option<String>, raised: Option<Diag>, r
 fn opts(host: Bool) -> Options =
   {
     host: host,
+    json: false,
     tls: [],
     trust: [],
     fs: [],

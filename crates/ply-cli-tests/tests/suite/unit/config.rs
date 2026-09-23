@@ -1,70 +1,9 @@
-use clap::Parser;
-use ply_cli::cli::{Cli, Command};
 use ply_cli::config::*;
 use ply_eval::Value;
 use ply_host::config::{Key, Shape, Snapshot, Sources, Spec};
 use ply_span::{SourceId, Symbol, codes};
 use std::path::PathBuf;
 use std::sync::Arc;
-
-#[test]
-fn the_three_sources_parse_and_repeat() {
-    let args = match Cli::parse_from([
-        "ply",
-        "run",
-        "--host",
-        "--set",
-        "DESK_REGION=eu",
-        "--set",
-        "DESK_PORT=8137",
-        "--config",
-        "base.env",
-        "--config",
-        "override.env",
-        "--config-schema",
-        "desk.config",
-    ])
-    .command
-    {
-        Command::Run(args) => args,
-        other => panic!("expected `run`, got {other:?}"),
-    };
-    assert_eq!(args.config.set, ["DESK_REGION=eu", "DESK_PORT=8137"]);
-    assert_eq!(
-        args.config.files,
-        [PathBuf::from("base.env"), PathBuf::from("override.env")]
-    );
-    assert_eq!(args.config.schema.as_deref(), Some("desk.config"));
-}
-
-#[test]
-fn configuration_without_host_is_refused_rather_than_ignored() {
-    for flag in [
-        vec!["--set", "K=v"],
-        vec!["--config", "deploy.env"],
-        vec!["--config-schema", "desk.config"],
-    ] {
-        let mut argv = vec!["ply", "run"];
-        argv.extend(flag.iter().copied());
-        assert!(
-            Cli::try_parse_from(&argv).is_err(),
-            "{flag:?} must not be accepted without `--host`"
-        );
-        let mut with_host = vec!["ply", "run", "--host"];
-        with_host.extend(flag.iter().copied());
-        assert!(Cli::try_parse_from(&with_host).is_ok(), "{flag:?}");
-    }
-}
-
-#[test]
-fn every_binding_command_accepts_configuration() {
-    for command in ["run", "test", "prove", "hosts"] {
-        assert!(
-            Cli::try_parse_from(["ply", command, "--host", "--set", "K=v"]).is_ok(),
-            "`ply {command}` does not accept `--set`"
-        );
-    }
-}
 
 #[test]
 fn a_hermetic_run_opens_no_source() {
