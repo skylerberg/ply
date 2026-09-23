@@ -29,6 +29,7 @@ of it next.
 | `crates/ply-test` | test selection, scheduling and running |
 | `crates/ply-prove` | specification obligations and their discharge |
 | `crates/ply-host` | the Rust handlers effects resolve to (db, fs, tcp, tls, ...) |
+| `crates/ply-machine` | the nested-entry capability: a program loading and entering another program |
 | `crates/ply-std` | the standard library, as Ply source in `ply/` |
 | `crates/ply-cli` | the `ply` binary |
 | `crates/ply-corpus` | synthetic projects and the benchmark harnesses |
