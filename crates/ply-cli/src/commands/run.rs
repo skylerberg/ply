@@ -9,8 +9,7 @@ use std::path::Path;
 pub fn execute(args: &RunArgs, style: Style) -> i32 {
     // The load, the artifact, the host binding and the entry itself stay behind the effect the
     // program performs; the program is lent what each step did and enters nothing of its own.
-    let options = ply_machine::runner::RunOptions {
-        path: args.path.clone(),
+    let options = ply_machine::drive::RunOptions {
         argv: args.argv.clone(),
         json: args.json,
         steps: args.steps,
@@ -26,9 +25,10 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
         shutdown: (&args.shutdown).into(),
         backend: args.backend.clone(),
         profile: args.profile.clone(),
+        cache: false,
     };
     let binds = Binds {
-        lent: crate::run::lent(&options),
+        lent: ply_machine::registrations_with(options),
         ..Binds::default()
     };
     run(
@@ -49,5 +49,7 @@ fn argv(args: &RunArgs, style: Style) -> Vec<String> {
     if args.json {
         argv.push("--json".to_string());
     }
+    // The program names the target to `machine.load` itself.
+    argv.push(args.path.display().to_string());
     argv
 }
