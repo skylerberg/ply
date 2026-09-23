@@ -65,7 +65,7 @@ fn the_two_implementations_read_and_write_one_dump_alike() {
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("probe.ply"), PROBE).unwrap();
-    let loaded = ply_cli::load::load(dir.path()).expect("the probe checks against the shelf");
+    let loaded = ply_machine::load::load(dir.path()).expect("the probe checks against the shelf");
     let spec = BackendSpec {
         kind: BackendKind::C,
     };

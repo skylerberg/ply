@@ -1,6 +1,6 @@
-use ply_cli::engine::Prover;
-use ply_cli::load::load;
-use ply_cli::obligations;
+use ply_machine::engine::Prover;
+use ply_machine::load::load;
+use ply_machine::obligations;
 use ply_prove::{
     Certificate, Discharge, Evidence, Gap, Obligation, ObligationKind, ProvePlan, Rule, Tier,
     UNFOLD_DEPTH,

@@ -1,4 +1,4 @@
-use ply_cli::migrate::*;
+use ply_machine::migrate::*;
 use ply_span::codes;
 use ply_store::Store;
 

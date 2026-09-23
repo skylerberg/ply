@@ -38,7 +38,7 @@ the runtime and the CLI.
   touch. Run `cargo fmt --all` before pushing; CI runs clippy with `-D warnings`.
 - CI is `.github/workflows/ci.yml`; `.github/ci-shards.sh` holds its solo and gate tables and cuts
   the test partitions from the durations CI measured.
-- Never commit `crates/ply-compiler/bootstrap`, `crates/ply-launcher/bootstrap` or
+- Never commit `crates/ply-compiler/bootstrap`, `crates/ply-cli/bootstrap` or
   `crates/ply-codegen-tests/fixtures/goldens` in a pull request: CI regenerates all three on
   `main` after each merge (the `refresh` job), and a pull request runs its sources through the
   checked-in bundle as a stage. A golden that moved is listed in the partition job's summary;
@@ -46,6 +46,9 @@ the runtime and the CLI.
 - The bundle carries `crates/ply-compiler/ply` and the shipped modules it imports, pulled as a
   project's are (today `std.hash` alone), so only those cannot use a language rule the same pull
   request introduces. The rest of `crates/ply-std/ply` can.
+- `crates/ply-cli` is the CLI as a Ply program plus the artifact `ply build` makes of it
+  (`bootstrap/ply.plyx`); it is not a cargo crate. The `refresh` job rebuilds the artifact on
+  main by driving the released binary, so the checkout can rebuild itself without cargo.
 - `docs/GUIDE.md` is the user manual. A change to syntax, types, builtins, the standard library,
   CLI commands, flags or exit codes, or diagnostic codes updates it in the same PR.
 

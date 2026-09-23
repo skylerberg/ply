@@ -1,4 +1,4 @@
-use ply_cli::load::*;
+use ply_machine::load::*;
 use ply_span::{Symbol, codes};
 use ply_ty::ModuleName;
 use std::fs;

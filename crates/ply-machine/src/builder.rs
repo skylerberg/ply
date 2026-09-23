@@ -26,10 +26,10 @@ use std::sync::{Arc, Mutex};
 const EFFECT: &str = "builder";
 
 const OPERATIONS: [(&str, &str); 4] = [
-    ("loaded", "ply_cli::build::loaded"),
-    ("made", "ply_cli::build::made"),
-    ("previous", "ply_cli::build::previous"),
-    ("stored", "ply_cli::build::stored"),
+    ("loaded", "ply_machine::build::loaded"),
+    ("made", "ply_machine::build::made"),
+    ("previous", "ply_machine::build::previous"),
+    ("stored", "ply_machine::build::stored"),
 ];
 
 /// An entry into a compiled unit does not nest on a thread, and a build enters the emitter's while

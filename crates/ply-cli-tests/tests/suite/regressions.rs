@@ -1,5 +1,5 @@
-use ply_cli::driver;
-use ply_cli::load::{Loaded, load};
+use ply_machine::driver;
+use ply_machine::load::{Loaded, load};
 use ply_span::{Symbol, codes};
 use ply_store::Store;
 use std::fs;

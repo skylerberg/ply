@@ -745,7 +745,12 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// Every `.ply` source a workspace member ships, which is production the same way `src/` is.
 fn ply_sources(root: &Path) -> Vec<Source> {
     let mut out = Vec::new();
-    for member in workspace_members(root) {
+    // ply-cli is the CLI's sources without a crate of its own; ply-launcher ships them, so its
+    // directory answers for both.
+    let mut owners: Vec<String> = workspace_members(root);
+    owners.retain(|member| member != "ply-launcher");
+    owners.push("ply-cli".to_string());
+    for member in owners {
         let dir = root.join("crates").join(&member).join("ply");
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
