@@ -1773,7 +1773,7 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
          under the backend, and an artifact run has no result cache either.",
     ),
     (
-        "crates/ply-cli/src/engine.rs",
+        "crates/ply-machine/src/engine.rs",
         "`Engine::machine`, attaching what the command resolved: the default tier, or \
          what `--backend` names. A compiled backend answers as the evaluator does, so it \
          keys as `Evaluator` and a pass the tier writes is the default run's own. \
