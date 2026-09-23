@@ -4,7 +4,28 @@
 //! written in Ply would be a second implementation of it. What each subcommand *says* is the
 //! program's, in `crates/ply-cli/ply/cache.ply`; this hands it the action's result as a value.
 
-use crate::cli::{CacheAction, CacheScope, InspectArgs};
+/// The cache subcommand, as plain data the machine reads; the shell's parsed flags convert into
+/// this.
+#[derive(Clone, Debug)]
+pub enum CacheAction {
+    Clear(CacheScope),
+    Stats(CacheScope),
+    Compact(CacheScope),
+    Inspect(InspectOptions),
+}
+
+#[derive(Clone, Debug)]
+pub struct CacheScope {
+    pub path: std::path::PathBuf,
+    pub json: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct InspectOptions {
+    pub query: String,
+    pub path: std::path::PathBuf,
+    pub json: bool,
+}
 use crate::hosts::Lent;
 use crate::payload::{count, ctor, diags_value, option, record};
 use ply_eval::Value as PlyValue;
@@ -248,7 +269,7 @@ fn compacted(scope: &CacheScope) -> Result<Compacted, Refused> {
                     .source_keys()
                     .into_iter()
                     .map(PathBuf::from)
-                    .filter(|p| ply_machine::shelf::is_pseudo_path(p)),
+                    .filter(|p| crate::shelf::is_pseudo_path(p)),
             );
             keep
         }
@@ -411,7 +432,7 @@ struct Operation {
     ret: String,
 }
 
-fn matches(args: &InspectArgs) -> Result<Matches, Refused> {
+fn matches(args: &InspectOptions) -> Result<Matches, Refused> {
     let scope = CacheScope {
         path: args.path.clone(),
         json: args.json,
