@@ -1361,6 +1361,29 @@ written and read back. The writers take the low four or eight bytes of `n`.
 Nothing here raises: a read past either end is `None`, and so is a `u64` past
 what an `Int` holds, so an answer is never a negative length.
 
+### 13.15 `std.pkg`
+
+```ply
+type Version = { major: Int, minor: Int, patch: Int }
+type Source = | Path(String) | Git(String, String) | Registry
+type Dep = { name: String, prefix: Option<String>, min: Version, source: Source }
+type Manifest = {
+  name: String,
+  version: Version,
+  prefix: Option<String>,
+  runtime: Version,
+  dependencies: List<Dep>,
+  entry: Option<String>,
+}
+```
+
+The package manifest as typed data: a `ply.pkg` file is one literal of
+`Manifest`, checked with the same judgment §3.1 states for parameter defaults
+(`E0129`–`E0131` when it is not). Every type derives `json`; `Version` also
+derives `ord`, ordered major, then minor, then patch. `prefix_of` and
+`entry_of` answer the defaults (`name` and `main`), and `render_version`
+writes a version dotted.
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
@@ -1561,6 +1584,9 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0126` | top-level `fn` missing a parameter or return type |
 | `E0127` | `reuse fn` with an append that cannot reuse its list |
 | `E0128` | `ply replace` refused: the result would not check or would move another definition |
+| `E0129` | a `ply.pkg` that is not exactly one `fn package` returning `Manifest` |
+| `E0130` | a manifest body that runs rather than being a value |
+| `E0131` | a manifest field that does not decode or fails validation |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
