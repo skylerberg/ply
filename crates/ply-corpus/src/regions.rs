@@ -282,7 +282,7 @@ pub fn analyse(corpus: &Corpus, jobs: usize) -> IsolationCost {
 
 /// Loads a project as `ply` does (std resolves, unlike `pipeline::front`) and times every test.
 pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
-    let loaded = ply_cli::load::load(root).map_err(|e| {
+    let loaded = ply_machine::load::load(root).map_err(|e| {
         anyhow::anyhow!(
             "`{}` does not compile ({} diagnostic(s)): {}",
             root.display(),
@@ -314,7 +314,7 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
             &Plan::default(),
             &ply_test::Engine::Evaluator,
         );
-        ply_cli::test::Plan::new(bare, &loaded.check, None, std_tests)
+        ply_machine::tester::Plan::new(bare, &loaded.check, None, std_tests)
     };
 
     let visible = plan_of(&mut store).visible;

@@ -1,4 +1,4 @@
-use ply_cli::signature::*;
+use ply_machine::signature::*;
 use ply_span::Symbol;
 use ply_ty::DefInfo;
 use ply_ty::ty::{EffectAtom, Footprint, Resource, Row, Scheme, Type};

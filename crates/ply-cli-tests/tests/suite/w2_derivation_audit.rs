@@ -37,7 +37,7 @@ fn run_main(source: &str) -> String {
 fn codes_of(source: &str) -> Vec<String> {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "m.ply", source);
-    let loaded = ply_cli::load::load(dir.path());
+    let loaded = ply_machine::load::load(dir.path());
     match loaded {
         Ok(_) => Vec::new(),
         Err(e) => e.diagnostics.iter().map(|d| d.code.to_string()).collect(),
@@ -143,7 +143,7 @@ fn a_constraint_is_in_the_hash_and_its_spelling_is_not() {
     let hashes = |source: &str| -> Vec<String> {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "m.ply", source);
-        let loaded = ply_cli::load::load(dir.path()).expect("it checks");
+        let loaded = ply_machine::load::load(dir.path()).expect("it checks");
         loaded.hashes.defs.values().map(|h| h.to_hex()).collect()
     };
     let bare = hashes("fn f<a>(x: a) -> Int = 1\n");

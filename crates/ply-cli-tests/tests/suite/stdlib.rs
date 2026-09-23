@@ -1,6 +1,6 @@
 use assert_cmd::prelude::*;
-use ply_cli::driver;
-use ply_cli::load::{LoadError, Loaded, load};
+use ply_machine::driver;
+use ply_machine::load::{LoadError, Loaded, load};
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 use ply_store::{ContentHash, Store};
 use ply_ty::ModuleName;

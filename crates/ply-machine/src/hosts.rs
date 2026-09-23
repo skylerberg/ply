@@ -851,9 +851,9 @@ const SHUTDOWN_DOMAIN: &[u8] = b"ply.hosts.shutdown.v1\0";
 /// else: what a run would bind is assembled here, and the program is handed what it says.
 const EFFECT: &str = "tcb";
 
-const PREVIEW: &str = "ply_cli::hosts::preview";
+const PREVIEW: &str = "ply_machine::hosts::preview";
 
-const OPEN: &str = "ply_cli::hosts::open";
+const OPEN: &str = "ply_machine::hosts::open";
 
 /// The module the payload's constructors are declared in, as a program-wide name.
 const PAYLOAD: &str = "hosts";

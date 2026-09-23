@@ -50,10 +50,10 @@ const PAYLOAD: &str = "cache";
 
 /// One registration per subcommand: the operation the program performs names what was done.
 const OPERATIONS: [(&str, &str); 4] = [
-    ("statistics", "ply_cli::cache::statistics"),
-    ("matches", "ply_cli::cache::matches"),
-    ("compacted", "ply_cli::cache::compacted"),
-    ("cleared", "ply_cli::cache::cleared"),
+    ("statistics", "ply_machine::cache::statistics"),
+    ("matches", "ply_machine::cache::matches"),
+    ("compacted", "ply_machine::cache::compacted"),
+    ("cleared", "ply_machine::cache::cleared"),
 ];
 
 /// The ops and the one handler serving them: the action runs where the program asks for it, with

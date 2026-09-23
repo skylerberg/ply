@@ -1,5 +1,5 @@
-use ply_cli::driver;
-use ply_cli::load::Loaded;
+use ply_machine::driver;
+use ply_machine::load::Loaded;
 use ply_store::Store;
 use std::collections::BTreeMap;
 use std::fs;
@@ -54,7 +54,7 @@ fn agree(dir: &Path, what: &str) {
     );
 }
 
-fn codes(e: &ply_cli::load::LoadError) -> Vec<String> {
+fn codes(e: &ply_machine::load::LoadError) -> Vec<String> {
     e.diagnostics
         .iter()
         .map(|d| format!("{}: {}", d.code, d.message))

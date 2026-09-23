@@ -1,9 +1,9 @@
 //! What the spec tier buys, measured on a project.
 
 use anyhow::{Result, bail};
-use ply_cli::engine::{Prover, Reach};
-use ply_cli::load::load;
-use ply_cli::obligations;
+use ply_machine::engine::{Prover, Reach};
+use ply_machine::load::load;
+use ply_machine::obligations;
 use ply_prove::prove::{Blocker, Decision, Reason};
 use ply_prove::{Discharge, Evidence, Gap, Obligation, ProvePlan, Tier};
 use serde::Serialize;
