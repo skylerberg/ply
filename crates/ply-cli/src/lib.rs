@@ -1,32 +1,26 @@
 //! The `ply` binary.
 
-pub mod artifact;
 pub mod bootstrap;
 pub mod build;
 pub mod cache;
 pub mod claims;
 pub mod cli;
 pub mod commands;
-pub mod config;
-pub mod costs;
-pub mod db;
 pub mod engine;
-pub mod hosts;
 pub mod obligations;
-pub mod payload;
-pub mod run;
 pub mod shipped;
 pub mod signature;
-pub mod simulation;
 pub mod style;
 pub mod test;
-pub mod trace;
 
 use cli::{Cli, Command};
 
 // The incremental front end and its store moved to the runtime: they serve any tool that loads a
 // program, not just this binary. Re-exported so the suite's unit tests read as they did.
-pub use ply_machine::{driver, load, migrate, warm};
+pub use ply_machine::runner as run;
+pub use ply_machine::{
+    artifact, config, costs, db, driver, hosts, load, migrate, payload, simulation, trace, warm,
+};
 use style::Style;
 
 pub const EXIT_OK: i32 = 0;

@@ -2,8 +2,8 @@
 //! in Ply. Each has to read what the other wrote and write back the same bytes, since the two will
 //! be reading each other's cache files for as long as the port is half done.
 
-use ply_cli::commands::common::{build_backend_over, module_texts};
 use ply_eval::{BackendKind, BackendSpec, Machine, Value};
+use ply_machine::support::{build_backend_over, module_texts};
 use ply_span::{SourceId, Span};
 
 const BASE: &str = "pub fn one() -> Int = 1\npub type Coin = | Heads | Tails\n";

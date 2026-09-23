@@ -32,7 +32,10 @@ fn job(args: &ReviewArgs) -> Job {
         std: args.std,
         jobs: None,
         backend: args.backend.clone(),
-        plan: crate::simulation::prove_plan(&args.prove, &args.simulation),
+        plan: ply_machine::simulation::prove_plan(
+            &(&args.prove).into(),
+            &(&args.simulation).into(),
+        ),
         binding: None,
     }
 }

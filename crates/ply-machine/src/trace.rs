@@ -1,35 +1,18 @@
 //! Which sink a run writes its records to, and at what level.
 
-use clap::{Args, ValueEnum};
 use ply_host::trace::{Discard, Json, Level, Sink, Text, Trace};
 use std::sync::Arc;
 
-#[derive(Args, Clone, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct TraceOptions {
     /// Where a `trace` record goes: `json` lines or `text` lines on stderr, or `off`.
-    #[arg(
-        id = "trace_sink",
-        long = "trace",
-        value_enum,
-        default_value_t = SinkArg::Json,
-        value_name = "SINK",
-        requires = "host",
-    )]
     pub sink: SinkArg,
 
     /// The lowest level the sink writes; spans and metrics are `info`.
-    #[arg(
-        id = "trace_level",
-        long = "trace-level",
-        value_enum,
-        default_value_t = LevelArg::Info,
-        value_name = "LEVEL",
-        requires = "host",
-    )]
     pub level: LevelArg,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum SinkArg {
     #[default]
     Json,
@@ -37,7 +20,7 @@ pub enum SinkArg {
     Off,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum LevelArg {
     Debug,
     #[default]
