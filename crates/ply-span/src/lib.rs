@@ -259,6 +259,12 @@ pub mod codes {
     pub const REUSE_BROKEN: &str = "E0127";
     /// A `ply replace` whose result would not check, or would move a definition it did not name.
     pub const REPLACEMENT_REFUSED: &str = "E0128";
+    /// A `ply.pkg` that is not exactly one `fn package` returning std.pkg's `Manifest`.
+    pub const MANIFEST_SHAPE: &str = "E0129";
+    /// A manifest body that runs rather than being a literal, a constructor, a record or a list.
+    pub const MANIFEST_NOT_LITERAL: &str = "E0130";
+    /// A manifest literal that does not decode, or whose fields fail validation.
+    pub const MANIFEST_FIELD: &str = "E0131";
     pub const TYPE_MISMATCH: &str = "E0201";
     pub const ARITY_MISMATCH: &str = "E0202";
     pub const OCCURS_CHECK: &str = "E0203";
@@ -468,6 +474,18 @@ pub const MEANINGS: &[(&str, &str)] = &[
     (
         "E0128",
         "`ply replace` refused: the result would not check or would move another definition",
+    ),
+    (
+        "E0129",
+        "a `ply.pkg` that is not exactly one `fn package` returning `Manifest`",
+    ),
+    (
+        "E0130",
+        "a manifest body that runs rather than being a value",
+    ),
+    (
+        "E0131",
+        "a manifest field that does not decode or fails validation",
     ),
     ("E0201", "type mismatch"),
     ("E0202", "arity mismatch"),
@@ -758,6 +776,9 @@ mod tests {
             ("MISSING_SIGNATURE", codes::MISSING_SIGNATURE, "E0126"),
             ("REUSE_BROKEN", codes::REUSE_BROKEN, "E0127"),
             ("REPLACEMENT_REFUSED", codes::REPLACEMENT_REFUSED, "E0128"),
+            ("MANIFEST_SHAPE", codes::MANIFEST_SHAPE, "E0129"),
+            ("MANIFEST_NOT_LITERAL", codes::MANIFEST_NOT_LITERAL, "E0130"),
+            ("MANIFEST_FIELD", codes::MANIFEST_FIELD, "E0131"),
             ("TYPE_MISMATCH", codes::TYPE_MISMATCH, "E0201"),
             ("ARITY_MISMATCH", codes::ARITY_MISMATCH, "E0202"),
             ("OCCURS_CHECK", codes::OCCURS_CHECK, "E0203"),

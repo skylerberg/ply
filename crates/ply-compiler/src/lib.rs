@@ -10,6 +10,8 @@ pub const ITEMS: &str = include_str!("../ply/items.ply");
 
 pub const PATTERNS: &str = include_str!("../ply/patterns.ply");
 
+pub const PKG: &str = include_str!("../ply/pkg.ply");
+
 pub const TYPES: &str = include_str!("../ply/types.ply");
 
 pub const TYCORE: &str = include_str!("../ply/tycore.ply");
@@ -57,6 +59,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("items", ITEMS),
     ("lexer", LEXER),
     ("patterns", PATTERNS),
+    ("pkg", PKG),
     ("plyx", PLYX),
     ("resolve", RESOLVE),
     ("rewrite", REWRITE),
