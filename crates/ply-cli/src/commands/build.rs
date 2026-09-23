@@ -10,7 +10,10 @@ pub fn execute(args: &BuildArgs, style: Style) -> i32 {
     // The load, the emitter and BLAKE3 stay here, behind the effect the program performs; the
     // program is lent what each step did and reaches no tree of its own.
     let binds = Binds {
-        lent: crate::build::lent(args),
+        lent: crate::build::lent(&ply_machine::builder::BuildOptions {
+            path: args.path.clone(),
+            diff: args.diff.clone(),
+        }),
         ..Binds::default()
     };
     run(

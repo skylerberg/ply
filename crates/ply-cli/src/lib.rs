@@ -1,7 +1,5 @@
 //! The `ply` binary.
 
-pub mod bootstrap;
-pub mod build;
 pub mod cache;
 pub mod claims;
 pub mod cli;
@@ -21,6 +19,7 @@ pub use ply_machine::drive as run;
 pub use ply_machine::{
     artifact, config, costs, db, driver, hosts, load, migrate, payload, simulation, trace, warm,
 };
+pub use ply_machine::{bootstrap, builder as build};
 use style::Style;
 
 pub const EXIT_OK: i32 = 0;

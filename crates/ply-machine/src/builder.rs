@@ -7,7 +7,7 @@
 //! `crates/ply-cli/ply/build.ply`.
 
 use crate::artifact::{self, Built};
-use crate::cli::BuildArgs;
+
 use crate::hosts::Lent;
 use crate::load::{LoadError, Loaded, load};
 use crate::payload::{count, diags_value, option, places_value, record};
@@ -24,10 +24,9 @@ use std::sync::{Arc, Mutex};
 /// else: `ply run` and the shipped program open artifacts too, and neither is a program.
 const EFFECT: &str = "builder";
 
-const OPERATIONS: [(&str, &str); 5] = [
+const OPERATIONS: [(&str, &str); 4] = [
     ("loaded", "ply_cli::build::loaded"),
     ("made", "ply_cli::build::made"),
-    ("sealed", "ply_cli::build::sealed"),
     ("previous", "ply_cli::build::previous"),
     ("stored", "ply_cli::build::stored"),
 ];
@@ -36,10 +35,18 @@ const OPERATIONS: [(&str, &str); 5] = [
 /// the program's own entry is live; the stack is a front end's, not a report's.
 const BUILD_STACK: usize = 256 << 20;
 
+/// What `ply build` is configured with, as plain data: the shell's parsed flags convert into
+/// this.
+#[derive(Clone, Debug, Default)]
+pub struct BuildOptions {
+    pub path: std::path::PathBuf,
+    pub diff: Option<std::path::PathBuf>,
+}
+
 /// The load and the deployed artifact `--diff` names are read here, before the program is entered,
 /// as every other command's are. The build itself cannot be: it is the closure of the entry point
 /// the program picks.
-pub fn lent(args: &BuildArgs) -> Vec<Lent> {
+pub fn lent(args: &BuildOptions) -> Vec<Lent> {
     let site: Arc<dyn HostHandler> = Arc::new(Site {
         program: Mutex::new(load(&args.path)),
         deployed: args.diff.as_deref().map(deployed),
@@ -81,10 +88,6 @@ impl HostHandler for Site {
                 &texts(startup, span)?,
                 reaches.as_bool(span, "whether the closure is wanted")?,
             ),
-            ("sealed", [container]) => {
-                let container = container.as_bytes(span, "a container")?.to_vec();
-                answered(aside(move || artifact::seal(container)).map(|b| sealed_value(&b)))
-            }
             ("previous", _) => answered(match &self.deployed {
                 Some(Ok(old)) => Ok(deployed_value(old)),
                 Some(Err(diagnostic)) => Err(diagnostic.clone()),
@@ -165,7 +168,7 @@ impl Site {
             .check
             .defs
             .values()
-            .filter(|d| !ply_machine::shelf::is_shipped(&d.module))
+            .filter(|d| !crate::shelf::is_shipped(&d.module))
             .map(def_value)
             .collect();
         PlyValue::ctor(
@@ -173,8 +176,8 @@ impl Site {
             vec![record(vec![
                 ("root", PlyValue::str(loaded.root.display().to_string())),
                 ("defs", PlyValue::list(defs)),
-                ("mains", crate::run::mains_value(loaded)),
-                ("modules", crate::run::modules_value(loaded)),
+                ("mains", crate::drive::mains_value(loaded)),
+                ("modules", crate::drive::modules_value(loaded)),
                 ("places", places_value(&loaded.sources)),
                 ("binary_bytes", option(binary_bytes().map(size))),
                 ("version", PlyValue::str(env!("CARGO_PKG_VERSION"))),
@@ -318,14 +321,6 @@ fn named_value(names: &[(String, DefHash)]) -> PlyValue {
             })
             .collect(),
     )
-}
-
-fn sealed_value(bytes: &[u8]) -> PlyValue {
-    let digest = artifact::digest_of(bytes).unwrap_or([0; 32]);
-    record(vec![
-        ("bytes", PlyValue::bytes(bytes)),
-        ("digest", PlyValue::str(artifact::short(&digest))),
-    ])
 }
 
 // --- The artifact `--diff` measures against -----------------------------------
