@@ -2250,7 +2250,9 @@ type Part = {
 }
 type Slot = { part: Int, class: Int }
 type Layout = { parts: List<Part>, by_hash: Map<Bytes, List<Slot>>, relink: Map<Bytes, Bytes> }
-type Pr = { layout: Layout, part: Int, own: Bytes }
+// The import graph the print has laid down so far travels with the printer: a home is chosen
+// with it in view, so a reference never closes a cycle the source did not have.
+type Pr = { layout: Layout, part: Int, own: Bytes, graph: Map<Bytes, List<Bytes>> }
 type Dc = {
   b: Bytes,
   pos: Int,
@@ -2392,25 +2394,49 @@ fn nameable(l: Layout, s: Slot, own: Bytes) -> Bool = {
 // Two definitions alike are one body under two names, and only some of those names are in reach:
 // an unreachable one is no candidate at all, since printing it names something that will not
 // resolve rather than something merely further away.
-fn pick(l: Layout, h: Bytes, own: Bytes) -> Option<Slot> = {
+// Whether `from` reaches `target` along the import edges laid down, `seen` against looping.
+fn reaches(g: Map<Bytes, List<Bytes>>, from: Bytes, target: Bytes, seen: List<Bytes>) -> Bool =
+  if from == target { true }
+  else if contains_bytes(seen, from) { false } else {
+    let next = match map_get(g, from) { Some(xs) -> xs, None -> [] };
+    fold(next, false, |found: Bool, m: Bytes| found || reaches(g, m, target, push(seen, from)))
+  }
+
+fn pick(
+  l: Layout,
+  g: Map<Bytes, List<Bytes>>,
+  mine: Map<Bytes, Bytes>,
+  h: Bytes,
+  own: Bytes,
+) -> Option<Slot> = {
+  // A home is safe when pointing at it adds no import edge that closes a cycle: the module's own,
+  // one it already imports, or one that cannot reach it in the print so far. When every home
+  // would close a cycle the nearest name stands and the print fails downstream as before; a
+  // choice that is only worse is still better than a cycle.
+  let edges = map_insert(g, own, map_keys(mine));
+  let safe = |s: Slot| {
+    let p = at(l.parts, s.part);
+    p.module == own || map_contains(mine, p.module) || !reaches(edges, p.module, own, [])
+  };
   let score = |s: Slot| {
     let p = at(l.parts, s.part);
-    (if p.module == own { 0 } else { 2 }) + (if p.printed { 0 } else { 1 })
+    (if p.module == own { 0 } else { 4 }) + (if map_contains(mine, p.module) { 0 } else { 2 })
+      + (if p.printed { 0 } else { 1 })
   };
   match map_get(l.by_hash, h) {
     None -> None,
-    Some(found) ->
-      fold(filter(found, |s: Slot| nameable(l, s, own)), None, |best: Option<Slot>, s: Slot|
-        match best {
-          Some(b) -> if score(s) < score(b) { Some(s) } else { best },
-          None -> Some(s),
-        }),
+    Some(found) -> {
+      let named = filter(found, |s: Slot| nameable(l, s, own));
+      let pool = match filter(named, safe) { [] -> named, homes -> homes };
+      fold(pool, None, |best: Option<Slot>, s: Slot|
+        match best { Some(b) -> if score(s) < score(b) { Some(s) } else { best }, None -> Some(s) })
+    },
   }
 }
 
 fn qname(x: Pr, r: Rf, ctor: Option<Bytes>) -> Got = {
   let found = if r.class >= 0 { Some({ part: x.part, class: r.class }) }
-  else { pick(x.layout, r.hash, x.own) };
+  else { pick(x.layout, x.graph, r.d.imports, r.hash, x.own) };
   match found {
     // A body with no name this module may write is filed with the ones it has no body for: either
     // way the reference cannot be printed, and a refusal names it rather than a hex string standing
@@ -3561,14 +3587,16 @@ fn layout_of(parts: List<Part>, relink: Map<Bytes, Bytes>) -> Layout = {
   }
 }
 
-fn print_parts(l: Layout) -> { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool> } =
+fn print_parts(
+  l: Layout,
+) -> { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool>, graph: Map<Bytes, List<Bytes>> } =
   fold(
     range(0, len(l.parts)),
-    { modules: map_new(), missing: map_new() },
-    |acc: { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool> }, u: Int| {
+    { modules: map_new(), missing: map_new(), graph: map_new() },
+    |acc: { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool>, graph: Map<Bytes, List<Bytes>> }, u: Int| {
       let p = at(l.parts, u);
       if !p.printed { acc } else {
-        let x = { layout: l, part: u, own: p.module };
+        let x = { layout: l, part: u, own: p.module, graph: acc.graph };
         let walked = fold(
           range(0, len(p.members)),
           { d: cursor(b"", acc.missing), ts: [] },
@@ -3585,19 +3613,26 @@ fn print_parts(l: Layout) -> { modules: Map<Bytes, Sheet>, missing: Map<Bytes, B
           Some(m) -> m,
           None -> { items: [], imports: map_new() },
         };
+        let imports = map_merge(had.imports, map_remove(walked.d.imports, p.module));
         {
           modules: map_insert(acc.modules, p.module, {
             items: append(had.items, walked.ts),
-            imports: map_merge(had.imports, map_remove(walked.d.imports, p.module)),
+            imports: imports,
           }),
           missing: walked.d.missing,
+          graph: map_insert(acc.graph, p.module, map_keys(imports)),
         }
       }
     },
   )
 
-fn print_tests(l: Layout, tests: List<Bytes>, missing: Map<Bytes, Bool>) -> Many = {
-  let x = { layout: l, part: 0 - 1, own: b"" };
+fn print_tests(
+  l: Layout,
+  g: Map<Bytes, List<Bytes>>,
+  tests: List<Bytes>,
+  missing: Map<Bytes, Bool>,
+) -> Many = {
+  let x = { layout: l, part: 0 - 1, own: b"", graph: g };
   fold(range(0, len(tests)), { d: cursor(b"", missing), ts: [] }, |s: Many, i: Int| {
     let body = at(tests, i);
     if bytes_len(body) == 0 || bytes_at(body, 0) != 0 {
@@ -3674,7 +3709,7 @@ pub fn print_bodies(
           map_insert(acc, r.from, r.to)),
       );
       let printed = print_parts(l);
-      let t = print_tests(l, tests, printed.missing);
+      let t = print_tests(l, printed.graph, tests, printed.missing);
       let missing = map_keys(t.d.missing);
       if len(missing) > 0 {
         Unprintable({

@@ -463,6 +463,41 @@ fn a_mutually_recursive_component_round_trips_wired_the_way_it_was_written() {
 }
 
 #[test]
+fn a_shared_body_is_homed_where_no_import_cycle_forms() {
+    // `p` and `r` define `T1` alike, `q` and `s` define `f2` alike, and every name is reached.
+    // Homing `f2` in `q` and `T1` in `p` prints `p -> q -> p` from an acyclic source: the home
+    // must be chosen with the graph in view.
+    let p = r#"
+        import s
+        pub type T1 = { wide: Int, tall: Int }
+        pub fn mk() -> T1 = { wide: 3, tall: 4 }
+        pub fn use_f2(n: Int) -> Int = s::f2(n) + 1
+        "#;
+    let r = r#"
+        pub type T1 = { wide: Int, tall: Int }
+        pub fn rt() -> T1 = { wide: 1, tall: 2 }
+        "#;
+    let q = r#"
+        import r
+        pub fn f2(n: Int) -> Int = n + 1
+        pub fn use_t1(t: r::T1) -> Int = t.wide
+        "#;
+    let s = r#"
+        pub fn f2(n: Int) -> Int = n + 1
+        pub fn s_dummy() -> Int = 0
+        "#;
+    let main = r#"
+        import p
+        import q
+        import r
+        import s
+        pub fn main() -> Int =
+            p::use_f2(q::f2(q::use_t1(p::mk()))) + q::use_t1(r::rt()) + s::s_dummy()
+        "#;
+    round_trip(&[("p", p), ("q", q), ("r", r), ("s", s), ("main", main)]);
+}
+
+#[test]
 fn two_cycles_wired_in_opposite_directions_do_not_collide() {
     let clockwise = r#"
         pub fn f(n: Int) -> Int = g(n - 1) + 1
