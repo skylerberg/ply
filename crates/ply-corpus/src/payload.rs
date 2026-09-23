@@ -707,12 +707,8 @@ pub fn run_tests(loaded: &ply_cli::load::Loaded, store: &mut Store) -> Result<Du
     );
     let plan = ply_cli::test::Plan::new(selection, &loaded.check, None, false);
     let selection = plan.selection;
-    let report = ply_cli::commands::common::run_on_tier(
-        loaded,
-        &selection,
-        ply_test::Hosting::hermetic(),
-        store,
-    );
+    let report =
+        ply_machine::support::run_on_tier(loaded, &selection, ply_test::Hosting::hermetic(), store);
     if report.failed > 0 {
         bail!(
             "{} of the measurement project's tests failed; the number would be about failure \

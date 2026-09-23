@@ -8,16 +8,16 @@
 //! What is said about all of it, in both forms, and the code the run exits with are the program's.
 
 use crate::cli::{TestArgs, When};
-use crate::commands::common::{
-    backend_spec, build_backend_over, build_pool, describe_schema, enter_constant, module_texts,
-    once_each, select_profile,
-};
 use crate::hosts::{self, Hosts, Lent, hosting};
 use crate::load::{Loaded, load, project_root};
 use crate::payload::{count, diag_value, diags_value, json, option, places_value, record, strings};
 use ply_eval::Value as PlyValue;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
+};
+use ply_machine::support::{
+    backend_spec, build_backend_over, build_pool, describe_schema, enter_constant, module_texts,
+    once_each, select_profile,
 };
 use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
 use ply_store::Store;
@@ -314,7 +314,7 @@ fn iterate(
     }
 
     // Part of a simulated test's cache key, so decided before selection.
-    let search = crate::simulation::plan(&args.simulation);
+    let search = ply_machine::simulation::plan(&(&args.simulation).into());
     let engine = ply_test::Engine::Evaluator;
     let hashes = loaded.hashes.clone();
     let selected = ply_test::select(&loaded.check, &hashes, &cache.store, &search, &engine);
@@ -369,7 +369,8 @@ fn bind(
             Err(diagnostic) => return refuse(vec![diagnostic]),
         };
     // Before anything runs, so no test touches a resource the program does not declare.
-    let db = match args.db.resolve(args.host) {
+    let db_options: ply_machine::db::DbOptions = (&args.db).into();
+    let db = match db_options.resolve(args.host) {
         Ok(db) => db,
         Err(diagnostics) => return refuse(diagnostics),
     };
@@ -405,16 +406,20 @@ fn bind(
     };
     let constant = |name: &str| enter_constant(unit, name);
     // Before binding, so a missing required key fails before any host test runs.
-    let (configuration, config_warnings) =
-        match crate::config::Configuration::open(&loaded.check, args.host, &args.config, &constant)
-        {
-            Ok(resolved) => resolved,
-            Err(diagnostics) => return refuse(diagnostics),
-        };
+    let config_options: ply_machine::config::ConfigOptions = (&args.config).into();
+    let (configuration, config_warnings) = match crate::config::Configuration::open(
+        &loaded.check,
+        args.host,
+        &config_options,
+        &constant,
+    ) {
+        Ok(resolved) => resolved,
+        Err(diagnostics) => return refuse(diagnostics),
+    };
     let mut hosts = match Hosts::open(
         &loaded.check,
         args.host,
-        &args.tls,
+        &ply_machine::options::TlsOptions::from(&args.tls),
         &args.fs.fs,
         db,
         configuration,

@@ -33,7 +33,10 @@ fn job(args: &ProveArgs) -> Job {
         std: args.std,
         jobs: args.jobs,
         backend: args.backend.clone(),
-        plan: crate::simulation::prove_plan(&args.prove, &args.simulation),
+        plan: ply_machine::simulation::prove_plan(
+            &(&args.prove).into(),
+            &(&args.simulation).into(),
+        ),
         binding: Some(Binding {
             host: args.host,
             tls: args.tls.clone(),

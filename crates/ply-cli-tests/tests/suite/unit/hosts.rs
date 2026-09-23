@@ -260,11 +260,11 @@ fn hermetic_is_the_default_and_reaches_nothing() {
     let hosts = Hosts::open(
         &program,
         false,
-        &ply_cli::cli::TlsOptions::default(),
+        &ply_machine::options::TlsOptions::default(),
         &[],
         None,
         Configuration::default(),
-        &ply_cli::trace::TraceOptions::silent(),
+        &ply_machine::trace::TraceOptions::silent(),
         None,
     )
     .unwrap();
@@ -304,11 +304,11 @@ fn a_host_backed_test_leaves_the_trivially_parallel_count() {
     let hermetic = Hosts::open(
         &program,
         false,
-        &ply_cli::cli::TlsOptions::default(),
+        &ply_machine::options::TlsOptions::default(),
         &[],
         None,
         Configuration::default(),
-        &ply_cli::trace::TraceOptions::silent(),
+        &ply_machine::trace::TraceOptions::silent(),
         None,
     )
     .unwrap();
@@ -334,10 +334,10 @@ fn postgres(op_name: &'static str, path: &'static str) -> HostRegistry {
 }
 
 fn configured(schema: Option<&str>) -> DbConfig {
-    ply_cli::db::DbOptions {
+    ply_machine::db::DbOptions {
         url: Some("postgres://ply:hunter2@127.0.0.1:5433/desk".to_string()),
         schema: schema.map(str::to_string),
-        ..ply_cli::db::DbOptions::default()
+        ..ply_machine::db::DbOptions::default()
     }
     .resolve_with(true, &|_| None)
     .expect("the fixture URL parses")

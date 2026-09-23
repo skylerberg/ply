@@ -1,9 +1,10 @@
 use ply_cli::cli::{TestArgs, When};
-use ply_cli::commands::common::{exit_code, run_on_tier};
+use ply_cli::commands::common::exit_code;
 use ply_cli::hosts::Hosts;
 use ply_cli::load::{Loaded, load};
 use ply_cli::test::*;
 use ply_eval::Plan as SimPlan;
+use ply_machine::support::run_on_tier;
 use ply_span::codes;
 use ply_store::{Outcome, Store};
 use ply_test::{Reason, Record, RunReport, Selection, Skipped, Status, TestResult, Verdict};
@@ -101,8 +102,8 @@ fn args_for(filter: Option<&str>) -> TestArgs {
         host: false,
         tls: ply_cli::cli::TlsOptions::default(),
         fs: ply_cli::cli::FsOptions::default(),
-        db: ply_cli::db::DbOptions::default(),
-        config: ply_cli::config::ConfigOptions::default(),
+        db: ply_cli::cli::DbOptions::default(),
+        config: ply_cli::cli::ConfigOptions::default(),
         std: false,
         simulation: ply_cli::cli::SimOptions {
             seed: None,
@@ -642,11 +643,11 @@ fn a_cached_pass_over_the_host_fails_the_run_that_wrote_it() {
     let hermetic = Hosts::open(
         &loaded.check,
         false,
-        &ply_cli::cli::TlsOptions::default(),
+        &ply_machine::options::TlsOptions::default(),
         &[],
         None,
         ply_cli::config::Configuration::default(),
-        &ply_cli::trace::TraceOptions::silent(),
+        &ply_machine::trace::TraceOptions::silent(),
         None,
     )
     .unwrap();

@@ -8,12 +8,11 @@
 //! `crates/ply-cli/ply/run.ply`.
 
 use crate::artifact::{self, Artifact};
-use crate::cli::RunArgs;
-use crate::commands::common::{describe_schema, enter_constant, prover_backend, select_profile};
 use crate::config::Configuration;
 use crate::hosts::{Hosts, Lent};
 use crate::load::Loaded;
 use crate::payload::{count, diags_value, json, option, record, strings};
+use crate::support::{describe_schema, enter_constant, prover_backend, select_profile};
 use ply_eval::Value as PlyValue;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
@@ -24,6 +23,27 @@ use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
 use ply_ty::{CheckOutput, Front, ModuleName};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+
+/// What `ply run` is configured with, as plain data: the shell's parsed flags convert into this.
+#[derive(Clone, Debug)]
+pub struct RunOptions {
+    pub path: std::path::PathBuf,
+    pub argv: Vec<String>,
+    pub json: bool,
+    pub steps: i64,
+    pub timeout: u64,
+    pub seed: Option<ply_eval::Seed>,
+    pub host: bool,
+    pub tls: crate::options::TlsOptions,
+    pub fs: Vec<ply_host::fs::RootSpec>,
+    pub exec: Vec<ply_host::process::ExecSpec>,
+    pub db: crate::db::DbOptions,
+    pub config: crate::config::ConfigOptions,
+    pub trace: crate::trace::TraceOptions,
+    pub shutdown: crate::options::ShutdownOptions,
+    pub backend: Option<String>,
+    pub profile: String,
+}
 
 /// The effect `crates/ply-cli/ply/run.ply` declares. It is lent to that one entry and nowhere
 /// else: this is the only command that enters a program of somebody else's.
@@ -40,7 +60,7 @@ const OPERATIONS: [(&str, &str); 3] = [
 const RUN_STACK: usize = 256 << 20;
 
 /// Rolls back every open transaction, closes spans `Abandoned`, flushes the sink, closes the pool.
-pub(crate) fn teardown(
+pub fn teardown(
     hosts: &Hosts,
     shutdown: Option<&Arc<Shutdown>>,
     drain_ms: u64,
@@ -55,19 +75,19 @@ pub(crate) fn teardown(
     hosts.runtime().map(|rt| rt.shutdown(budget))
 }
 
-pub(crate) const TEARDOWN_FLOOR_MS: u64 = 1_000;
+pub const TEARDOWN_FLOOR_MS: u64 = 1_000;
 
 /// `--json` promises stdout to the one object, so the program's own lines go to stderr instead.
 /// Loaded up front so an `--exec` that cannot be started is `E0457` before anything runs.
-fn process_host(args: &RunArgs) -> Result<ProcessHost, Diagnostic> {
+fn process_host(args: &RunOptions) -> Result<ProcessHost, Diagnostic> {
     let out = if args.json { Stream::Err } else { Stream::Out };
-    let executables = Executables::load(&args.exec.exec, Span::DUMMY)?;
+    let executables = Executables::load(&args.exec, Span::DUMMY)?;
     Ok(ProcessHost::new(args.argv.clone(), Sink::Real { out }).executing(executables))
 }
 
 /// The load and the artifact are read on the machine's own thread, so the flags it reads are all
 /// this side keeps.
-pub fn lent(args: &RunArgs) -> Vec<Lent> {
+pub fn lent(args: &RunOptions) -> Vec<Lent> {
     let site: Arc<dyn HostHandler> = Arc::new(Site {
         args: args.clone(),
         machine: Mutex::new(None),
@@ -96,7 +116,7 @@ fn registration(op: &str, path: &'static str) -> HostOp {
 }
 
 struct Site {
-    args: RunArgs,
+    args: RunOptions,
     /// Started by the first operation and joined by the last.
     machine: Mutex<Option<Machine>>,
 }
@@ -192,7 +212,7 @@ struct Machine {
 }
 
 impl Machine {
-    fn start(args: RunArgs) -> Result<Machine, Diagnostic> {
+    fn start(args: RunOptions) -> Result<Machine, Diagnostic> {
         let (go, asked) = mpsc::channel();
         let (told, steps) = mpsc::channel();
         let thread = std::thread::Builder::new()
@@ -229,7 +249,7 @@ impl Drop for Machine {
     }
 }
 
-fn serve(args: &RunArgs, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
+fn serve(args: &RunOptions, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
     let target = match Target::open(args) {
         Ok(target) => target,
         Err(refused) => {
@@ -264,7 +284,7 @@ struct Deployment {
 
 impl Target {
     /// An artifact runs out of its own verified definitions, not a source tree.
-    fn open(args: &RunArgs) -> Result<Target, Refused> {
+    fn open(args: &RunOptions) -> Result<Target, Refused> {
         if args
             .path
             .extension()
@@ -329,7 +349,7 @@ impl Target {
     /// The unit this run evaluates on: an artifact's own as built, else one over the sources.
     fn tier(
         &self,
-        args: &RunArgs,
+        args: &RunOptions,
     ) -> Result<Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>, Diagnostic> {
         select_profile(&args.profile)?;
         match self {
@@ -346,7 +366,7 @@ impl Target {
     }
 }
 
-fn deployment(args: &RunArgs) -> Result<Deployment, Refused> {
+fn deployment(args: &RunOptions) -> Result<Deployment, Refused> {
     let about = |diagnostics: Vec<Diagnostic>| Refused {
         diagnostics,
         sources: SourceMap::new(),
@@ -370,11 +390,11 @@ fn deployment(args: &RunArgs) -> Result<Deployment, Refused> {
 
 /// Every definition named `main`, as `crates/ply-cli/ply/entry.ply` reads them. `ply build` with
 /// no `--entry` asks the same question of the same list.
-pub(crate) fn mains_value(loaded: &Loaded) -> PlyValue {
+pub fn mains_value(loaded: &Loaded) -> PlyValue {
     named_values(&mains_of(loaded))
 }
 
-pub(crate) fn modules_value(loaded: &Loaded) -> PlyValue {
+pub fn modules_value(loaded: &Loaded) -> PlyValue {
     placed_values(&modules_of(loaded))
 }
 
@@ -428,7 +448,7 @@ fn file_of(loaded: &Loaded, module: &ModuleName) -> String {
 // --- The binding, held while the entry runs -----------------------------------
 
 fn bind(
-    args: &RunArgs,
+    args: &RunOptions,
     target: &Target,
     entry: &str,
     told: &mpsc::Sender<Step>,
@@ -478,7 +498,7 @@ fn bind(
         target.check(),
         args.host,
         &args.tls,
-        &args.fs.fs,
+        &args.fs,
         db,
         configuration,
         &args.trace,
@@ -513,7 +533,7 @@ fn bind(
 }
 
 fn disclosed(
-    args: &RunArgs,
+    args: &RunOptions,
     hosts: &Hosts,
     shutdown: Option<&Arc<Shutdown>>,
     warnings: Vec<Diagnostic>,
@@ -544,7 +564,7 @@ fn disclosed(
 }
 
 fn enter(
-    args: &RunArgs,
+    args: &RunOptions,
     target: &Target,
     entry: &str,
     hosts: &Hosts,

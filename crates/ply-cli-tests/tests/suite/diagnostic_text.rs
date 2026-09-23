@@ -2,8 +2,8 @@
 //! `crates/ply-cli/ply/diagnostic.ply`'s `to_text` in Ply. The bytes have to be the same, painted
 //! or plain, so neither shape can drift away from the other.
 
-use ply_cli::commands::common::{build_backend_over, module_texts};
 use ply_eval::{BackendKind, BackendSpec, Machine, Value};
+use ply_machine::support::{build_backend_over, module_texts};
 use ply_span::{Diagnostic, Edit, SourceId, SourceMap, Span, codes};
 
 /// The modules the probe needs beside itself.

@@ -1,5 +1,5 @@
 use crate::style::ColorChoice;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use ply_eval::Seed;
 use ply_host::fs::RootSpec;
 use ply_host::process::ExecSpec;
@@ -196,6 +196,115 @@ pub struct FsOptions {
     pub fs: Vec<RootSpec>,
 }
 
+/// The database knobs, on every command that can bind a host handler.
+#[derive(clap::Args, Clone, Debug, Default)]
+pub struct DbOptions {
+    /// The database URL; defaults to `PLY_DB_URL`, with the password from `PLY_DB_PASSWORD`.
+    #[arg(long = "db", value_name = "URL", requires = "host")]
+    pub url: Option<String>,
+
+    /// Connections in the pool.
+    #[arg(long = "db-pool", value_name = "N", requires = "host", value_parser = clap::value_parser!(u32).range(1..))]
+    pub pool: Option<u32>,
+
+    /// Milliseconds a `db` operation may wait for a connection before `E0437`.
+    #[arg(long = "db-acquire-ms", value_name = "MS", requires = "host", value_parser = clap::value_parser!(u64).range(1..))]
+    pub acquire_ms: Option<u64>,
+
+    /// Server-side `statement_timeout`, set on every connection at checkout.
+    #[arg(long = "db-statement-ms", value_name = "MS", requires = "host", value_parser = clap::value_parser!(u64).range(1..))]
+    pub statement_ms: Option<u64>,
+
+    /// Server-side `idle_in_transaction_session_timeout`.
+    #[arg(long = "db-idle-txn-ms", value_name = "MS", requires = "host", value_parser = clap::value_parser!(u64).range(1..))]
+    pub idle_txn_ms: Option<u64>,
+
+    /// Milliseconds to establish a connection.
+    #[arg(long = "db-connect-ms", value_name = "MS", requires = "host", value_parser = clap::value_parser!(u64).range(1..))]
+    pub connect_ms: Option<u64>,
+
+    /// Prepared statements kept per connection.
+    #[arg(long = "db-statement-cache", value_name = "N", requires = "host", value_parser = clap::value_parser!(u32).range(1..))]
+    pub statement_cache: Option<u32>,
+
+    /// `<module>.<fn>`: a nullary pure function returning a `Schema` (not checked live).
+    #[arg(long = "db-schema", value_name = "MODULE.FN", requires = "host")]
+    pub schema: Option<String>,
+}
+
+/// Configuration sources; the environment is read with no `PLY_` prefix or case translation.
+#[derive(Args, Clone, Debug, Default)]
+pub struct ConfigOptions {
+    /// A configuration value: `--set DESK_REGION=eu`. Repeatable; highest precedence, last wins.
+    #[arg(
+        id = "config_set",
+        long = "set",
+        value_name = "KEY=VALUE",
+        requires = "host"
+    )]
+    pub set: Vec<String>,
+
+    /// A `KEY=VALUE` file, one pair per line, no quoting. Repeatable; a later file wins.
+    #[arg(
+        id = "config_files",
+        long = "config",
+        value_name = "PATH",
+        requires = "host"
+    )]
+    pub files: Vec<PathBuf>,
+
+    /// `<module>.<fn>`: a nullary pure function returning a `ConfigSpec`, checked at start-up.
+    #[arg(
+        id = "config_schema",
+        long = "config-schema",
+        value_name = "MODULE.FN",
+        requires = "host"
+    )]
+    pub schema: Option<String>,
+}
+
+#[derive(Args, Clone, Debug, Default)]
+pub struct TraceOptions {
+    /// Where a `trace` record goes: `json` lines or `text` lines on stderr, or `off`.
+    #[arg(
+        id = "trace_sink",
+        long = "trace",
+        value_enum,
+        default_value_t = SinkArg::Json,
+        value_name = "SINK",
+        requires = "host",
+    )]
+    pub sink: SinkArg,
+
+    /// The lowest level the sink writes; spans and metrics are `info`.
+    #[arg(
+        id = "trace_level",
+        long = "trace-level",
+        value_enum,
+        default_value_t = LevelArg::Info,
+        value_name = "LEVEL",
+        requires = "host",
+    )]
+    pub level: LevelArg,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, ValueEnum)]
+pub enum SinkArg {
+    #[default]
+    Json,
+    Text,
+    Off,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, ValueEnum)]
+pub enum LevelArg {
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
 /// One program per resource label; only `ply run --host` starts a process, so only it binds one.
 #[derive(Args, Clone, Debug, Default)]
 pub struct ExecOptions {
@@ -386,10 +495,10 @@ pub struct TestArgs {
     pub fs: FsOptions,
 
     #[command(flatten)]
-    pub db: crate::db::DbOptions,
+    pub db: DbOptions,
 
     #[command(flatten)]
-    pub config: crate::config::ConfigOptions,
+    pub config: ConfigOptions,
 
     /// Also select the tests declared by the modules that ship with the compiler.
     #[arg(long)]
@@ -472,13 +581,13 @@ pub struct ProveArgs {
     pub fs: FsOptions,
 
     #[command(flatten)]
-    pub db: crate::db::DbOptions,
+    pub db: DbOptions,
 
     #[command(flatten)]
-    pub config: crate::config::ConfigOptions,
+    pub config: ConfigOptions,
 
     #[command(flatten)]
-    pub trace: crate::trace::TraceOptions,
+    pub trace: TraceOptions,
 
     #[command(flatten)]
     pub prove: ProveOptions,
@@ -571,13 +680,13 @@ pub struct RunArgs {
     pub exec: ExecOptions,
 
     #[command(flatten)]
-    pub db: crate::db::DbOptions,
+    pub db: DbOptions,
 
     #[command(flatten)]
-    pub config: crate::config::ConfigOptions,
+    pub config: ConfigOptions,
 
     #[command(flatten)]
-    pub trace: crate::trace::TraceOptions,
+    pub trace: TraceOptions,
 
     #[command(flatten)]
     pub shutdown: ShutdownOptions,
@@ -648,13 +757,13 @@ pub struct HostsArgs {
     pub fs: FsOptions,
 
     #[command(flatten)]
-    pub db: crate::db::DbOptions,
+    pub db: DbOptions,
 
     #[command(flatten)]
-    pub config: crate::config::ConfigOptions,
+    pub config: ConfigOptions,
 
     #[command(flatten)]
-    pub trace: crate::trace::TraceOptions,
+    pub trace: TraceOptions,
 
     /// Accepted here as well as on `ply run` because the drain bounds are in the digest.
     #[command(flatten)]
@@ -878,4 +987,92 @@ pub struct BootstrapArgs {
     /// Emit one JSON object on stdout and nothing else.
     #[arg(long)]
     pub json: bool,
+}
+
+// --- Conversions into the runtime's plain options -----------------------------------------------
+
+impl From<&TlsOptions> for ply_machine::options::TlsOptions {
+    fn from(args: &TlsOptions) -> Self {
+        ply_machine::options::TlsOptions {
+            tls: args.tls.clone(),
+            trust: args.trust.clone(),
+        }
+    }
+}
+
+impl From<&ShutdownOptions> for ply_machine::options::ShutdownOptions {
+    fn from(args: &ShutdownOptions) -> Self {
+        ply_machine::options::ShutdownOptions {
+            drain_ms: args.drain_ms,
+            drain_lead_ms: args.drain_lead_ms,
+        }
+    }
+}
+
+impl From<&DbOptions> for ply_machine::db::DbOptions {
+    fn from(args: &DbOptions) -> Self {
+        ply_machine::db::DbOptions {
+            url: args.url.clone(),
+            pool: args.pool,
+            acquire_ms: args.acquire_ms,
+            statement_ms: args.statement_ms,
+            idle_txn_ms: args.idle_txn_ms,
+            connect_ms: args.connect_ms,
+            statement_cache: args.statement_cache,
+            schema: args.schema.clone(),
+        }
+    }
+}
+
+impl From<&ConfigOptions> for ply_machine::config::ConfigOptions {
+    fn from(args: &ConfigOptions) -> Self {
+        ply_machine::config::ConfigOptions {
+            set: args.set.clone(),
+            files: args.files.clone(),
+            schema: args.schema.clone(),
+        }
+    }
+}
+
+impl From<&TraceOptions> for ply_machine::trace::TraceOptions {
+    fn from(args: &TraceOptions) -> Self {
+        ply_machine::trace::TraceOptions {
+            sink: match args.sink {
+                SinkArg::Json => ply_machine::trace::SinkArg::Json,
+                SinkArg::Text => ply_machine::trace::SinkArg::Text,
+                SinkArg::Off => ply_machine::trace::SinkArg::Off,
+            },
+            level: match args.level {
+                LevelArg::Debug => ply_machine::trace::LevelArg::Debug,
+                LevelArg::Info => ply_machine::trace::LevelArg::Info,
+                LevelArg::Warn => ply_machine::trace::LevelArg::Warn,
+                LevelArg::Error => ply_machine::trace::LevelArg::Error,
+            },
+        }
+    }
+}
+
+impl From<&SimOptions> for ply_machine::simulation::SimOptions {
+    fn from(args: &SimOptions) -> Self {
+        ply_machine::simulation::SimOptions {
+            seed: args.seed.clone(),
+            sim: args.sim.into(),
+            seeds: args.seeds,
+            sim_budget: args.sim_budget,
+            sim_steps: args.sim_steps,
+            measure_reduction: args.measure_reduction,
+        }
+    }
+}
+
+impl From<&ProveOptions> for ply_machine::simulation::ProveOptions {
+    fn from(args: &ProveOptions) -> Self {
+        ply_machine::simulation::ProveOptions {
+            prove_cases: args.prove_cases,
+            prove_roots: args.prove_roots,
+            prove_budget: args.prove_budget,
+            shrink_budget: args.shrink_budget,
+            prove_steps: args.prove_steps,
+        }
+    }
 }

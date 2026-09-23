@@ -42,7 +42,7 @@ pub fn tier_machine<'a>(
     sources: &ply_span::SourceMap,
 ) -> ply_eval::Machine<'a> {
     ply_codegen::c::producer::ensure_default();
-    let texts = ply_cli::commands::common::module_texts(&port.check, sources);
+    let texts = ply_machine::support::module_texts(&port.check, sources);
     let unit = ply_codegen::Unit::over_front(port, texts).expect("this host has a C compiler");
     let mut machine = ply_eval::Machine::new(port);
     machine.set_compiled(ply_eval::Provider::attach(unit, &tier_spec()));
@@ -58,7 +58,7 @@ pub fn run_on_tier(
     hosting: ply_test::Hosting<'_>,
 ) -> ply_test::RunReport {
     ply_codegen::c::producer::ensure_default();
-    let texts = ply_cli::commands::common::module_texts(&front.check, &front.sources);
+    let texts = ply_machine::support::module_texts(&front.check, &front.sources);
     let unit =
         ply_codegen::Unit::over_front(&front.port, texts).expect("this host has a C compiler");
     let executor = ply_test::InterpExecutor::new(&front.port)
