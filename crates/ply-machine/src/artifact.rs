@@ -1191,7 +1191,7 @@ pub fn enter(
         .unwrap_or(Span::DUMMY);
     let plan = crate::simulation::run_plan(None);
     let answer = evaluate(opened, span, &plan, &hosts, declared.as_ref(), tier);
-    let _ = crate::runner::teardown(&hosts, None, crate::runner::TEARDOWN_FLOOR_MS);
+    let _ = crate::drive::teardown(&hosts, None, crate::drive::TEARDOWN_FLOOR_MS);
     match hosts.requested_exit() {
         Some(code) => Ok(code),
         None => answer.map(|_| EXIT_OK),

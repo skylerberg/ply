@@ -1760,14 +1760,12 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
          crates/ply-cli-tests/tests/suite/cli.rs was seen to fail.",
     ),
     (
-        "crates/ply-machine/src/runner.rs",
-        "`evaluate`, installing what `ply run --backend` names on the machine that runs the \
-         entry, over a project or over a `.plyx`. `ply run` has no result cache: nothing it \
-         answers is a `Pass`, nothing is read before the entry and nothing is recorded after \
-         it, so neither half of the rule has a route to break. \
-         `run_attaches_a_backend_to_main_and_refuses_a_spec_it_cannot_parse` \
-         in crates/ply-cli-tests/tests/suite/backend.rs runs `main` under both backends and was \
-         seen to fail, on the seam memo walking a scalar answer for parts.",
+        "crates/ply-machine/src/drive.rs",
+        "`Drive::bound`/`Drive::enter`, installing what the run's backend flags name on the \
+         machine that runs the entry, over a project or over a `.plyx`. This is the nested-entry \
+         route: it enters entry points, never tests, and holds no result cache, so neither half \
+         of the rule has a route to break. `a_program_loads_binds_and_enters_a_program` in \
+         crates/ply-machine-tests/tests/suite.rs runs the route and was seen to fail.",
     ),
     (
         "crates/ply-machine/src/artifact.rs",
@@ -1790,15 +1788,6 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
          `w6_request_cost::entering_the_machine_allocates_a_bounded_amount` in \
          crates/ply-corpus-tests/tests/allocation was seen to fail when the route \
          declined instead of attaching.",
-    ),
-    (
-        "crates/ply-machine/src/lib.rs",
-        "`Machine::enter`, attaching the compiled tier to the machine a nested entry runs on. \
-         The capability enters entry points, never tests, and holds no result cache: nothing it \
-         answers is recorded anywhere, so neither half of the rule has a route to break. \
-         `a_program_loads_and_enters_a_program` in crates/ply-machine-tests/tests/suite.rs runs \
-         the route and was seen to fail (a deadlock, then a miscoded exit), which is what the \
-         route existing looks like.",
     ),
     (
         "crates/ply-corpus/src/w3.rs",
