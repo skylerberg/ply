@@ -5,11 +5,13 @@
 // the magic, the header and the section table.
 
 import args (Flags, no_flags, style_of)
-import compiler.plyx (Head, Section, encode, format)
+import compiler.hash (hex)
+import compiler.plyx (Head, Section, Range, covers, domain, encode, format, off_digest)
 import compiler.resolve (Diag, Label, diag, diag1)
 import diagnostic (Place, all_to_json, all_to_text)
 import entry (At, Main, Module, entry_point, marked, no_module, nowhere)
 import report (Answer, ind, ok_code, count_of, plural, refused, reported, warning_lines)
+import std.hash (blake3)
 import std.json (Json, Null, Str, Bool, Number, Array, object, to_string)
 import style (Style, plain, bold, green, red)
 
@@ -18,7 +20,6 @@ import style (Style, plain, bold, green, red)
 pub nondet effect builder {
   read loaded[r]() -> Result<Loaded, Refusal>
   read made[r](entry: String, startup: List<String>, reaches: Bool) -> Result<Made, Refusal>
-  read sealed[r](container: Bytes) -> Result<Sealed, Refusal>
   // The artifact `--diff` names, read before the program was entered; only `--diff` asks.
   read previous[r]() -> Result<Previous, Refusal>
   write stored[r](path: String, body: Bytes) -> Result<Unit, Refusal>
@@ -68,6 +69,40 @@ pub type Made = {
 
 // The container with its digest written into the field no range of the digest covers.
 pub type Sealed = { bytes: Bytes, digest: String }
+
+// The digest is the writer's own work: `compiler.plyx` says the domain, the field and the ranges,
+// and the hash is `std.hash`'s. Sealing is hashing and a splice, so the program does it itself.
+fn seal(container: Bytes) -> Result<Sealed, Refusal> =
+  match covers(bytes_len(container)) {
+    None ->
+      Err({
+        diags: [
+          diag(
+            b"E0443",
+            bytes_of_string(
+              "a container of " ++ int_to_string(bytes_len(container))
+                ++ " bytes is no container at all",
+            ),
+            [],
+            [],
+          ),
+        ],
+        places: [],
+      }),
+    Some(ranges) -> {
+      let parts = map(ranges, |r: Range| bytes_slice(container, r.at, r.at + r.len));
+      let digest = blake3(bytes_concat_all(appended([domain()], parts)));
+      let at = off_digest();
+      Ok({
+        bytes: bytes_concat_all([
+          bytes_slice(container, 0, at),
+          digest,
+          bytes_slice(container, at + 32, bytes_len(container)),
+        ]),
+        digest: "b3:" ++ string_of_bytes(hex(digest)),
+      })
+    },
+  }
 
 pub type Previous = { digest: String, names: List<Named>, warnings: List<Diag> }
 
@@ -481,10 +516,10 @@ fn assembled(
   p: Loaded,
   entry: String,
   startup: List<String>,
-) -> Answer / {builder.made[build], builder.sealed[build], builder.previous[build], builder.stored[build]} =
+) -> Answer / {builder.made[build], builder.previous[build], builder.stored[build]} =
   match builder.made[build](entry, startup, is_diffed(flags)) {
     Err(why) -> reported(s, "build", why.diags, p.places),
-    Ok(m) -> match builder.sealed[build](encode(m.head, m.sections)) {
+    Ok(m) -> match seal(encode(m.head, m.sections)) {
       Err(why) -> reported(s, "build", why.diags, p.places),
       Ok(x) -> delivered(s, flags, p, m, x),
     },
@@ -494,7 +529,7 @@ fn chosen(
   s: Style,
   flags: Flags,
   p: Loaded,
-) -> Answer / {builder.made[build], builder.sealed[build], builder.previous[build], builder.stored[build]} =
+) -> Answer / {builder.made[build], builder.previous[build], builder.stored[build]} =
   match entry_of(p, flags) {
     Err(d) -> reported(s, "build", [d], p.places),
     Ok(entry) -> match startup_of(p, flags) {
@@ -505,7 +540,7 @@ fn chosen(
 
 pub fn run(
   flags: Flags,
-) -> Answer / {builder.loaded[build], builder.made[build], builder.sealed[build], builder.previous[build], builder.stored[build]} = {
+) -> Answer / {builder.loaded[build], builder.made[build], builder.previous[build], builder.stored[build]} = {
   let s: Style = style_of(flags);
   match builder.loaded[build]() {
     Err(why) -> refused(s, "build", why.diags, why.places),
@@ -555,8 +590,6 @@ fn a_made() -> Made =
     reaches: [],
     warnings: [],
   }
-
-fn a_sealed() -> Sealed = { bytes: b"0123456789", digest: "b3:1f2e3d4c5b6a" }
 
 fn flags_of(json: Bool) -> Flags = { ..no_flags(), json: json }
 
@@ -700,7 +733,6 @@ fn answered_over(
   flags: Flags,
   p: Result<Loaded, Refusal>,
   m: Result<Made, Refusal>,
-  x: Result<Sealed, Refusal>,
   was: Result<Previous, Refusal>,
   put: Result<Unit, Refusal>,
 ) -> Answer =
@@ -709,7 +741,6 @@ fn answered_over(
   } with {
     builder.loaded[build]() -> p,
     builder.made[build](entry, startup, reaches) -> m,
-    builder.sealed[build](container) -> x,
     builder.previous[build]() -> was,
     builder.stored[build](path, body) -> put,
   }
@@ -717,15 +748,15 @@ fn answered_over(
 fn nothing() -> Refusal = { diags: [], places: [] }
 
 fn a_build(flags: Flags) -> Answer =
-  answered_over(flags, Ok(a_load()), Ok(a_made()), Ok(a_sealed()), Err(nothing()), Ok(()))
+  answered_over(flags, Ok(a_load()), Ok(a_made()), Err(nothing()), Ok(()))
 
 test "a build says what it wrote, where, and what the artifact and the binary weigh" {
   let answer = a_build(flags_of(false));
   assert_eq(answer.code, 0);
   assert_eq(answer.errs, []);
   assert_eq(answer.lines, [
-    "   built m.main · b3:1f2e3d4c5b6a",
-    "   artifact 1 definition · 10 B · m.plyx",
+    "   built m.main · b3:228aebf2be538821d3d0d678e52a90712271eb77e773e594e97d0632504611ab",
+    "   artifact 1 definition · 214 B · m.plyx",
     "   binary ply 0.16.0 · 12.0 MB",
     "   startup none — this artifact cannot be run with `--config-schema` or `--db-schema`",
   ])
@@ -737,18 +768,23 @@ test "the object keys off `command` and `exit_code`, and names the file it wrote
   assert(string_contains(text, "\"exit_code\":0"));
   assert(string_contains(text, "\"entry\":\"m.main\""));
   assert(string_contains(text, "\"artifact\":\"m.plyx\""));
-  assert(string_contains(text, "\"digest\":\"b3:1f2e3d4c5b6a\""));
+  assert(
+    string_contains(
+      text,
+      "\"digest\":\"b3:228aebf2be538821d3d0d678e52a90712271eb77e773e594e97d0632504611ab\"",
+    ),
+  );
   assert(string_contains(text, "\"definitions\":1"));
   assert(string_contains(text, "\"names\":1"));
   assert(string_contains(text, "\"unit\":true"));
-  assert(string_contains(text, "\"artifact_bytes\":10"));
+  assert(string_contains(text, "\"artifact_bytes\":214"));
   assert(string_contains(text, "\"root\":\"/p\""));
   assert(string_contains(text, "\"format\":" ++ int_to_string(format())))
 }
 
 test "`-o` names the file, and the entry's module names it otherwise" {
   let answer = a_build({ ..no_flags(), out: Some("dist/app.plyx") });
-  assert_eq(at(answer.lines, 1, ""), "   artifact 1 definition · 10 B · dist/app.plyx")
+  assert_eq(at(answer.lines, 1, ""), "   artifact 1 definition · 214 B · dist/app.plyx")
 }
 
 test "`--digest` writes the one line a deployment pins and nothing else" {
@@ -756,11 +792,10 @@ test "`--digest` writes the one line a deployment pins and nothing else" {
     { ..no_flags(), digest: true },
     Ok(a_load()),
     Ok(a_made()),
-    Ok(a_sealed()),
     Err(nothing()),
     Err(nothing()),
   );
-  assert_eq(answer.lines, ["b3:1f2e3d4c5b6a"]);
+  assert_eq(answer.lines, ["b3:228aebf2be538821d3d0d678e52a90712271eb77e773e594e97d0632504611ab"]);
   assert_eq(answer.errs, []);
   assert_eq(answer.code, 0)
 }
@@ -775,7 +810,6 @@ test "`--diff` reports against a deployed artifact and writes no file" {
     { ..no_flags(), diff: Some("old.plyx"), json: true },
     Ok(a_load()),
     Ok(a_made()),
-    Ok(a_sealed()),
     Ok(was),
     Err(nothing()),
   );
@@ -783,7 +817,12 @@ test "`--diff` reports against a deployed artifact and writes no file" {
   let text = to_string(answer.json);
   assert(string_contains(text, "\"against\":\"old.plyx\""));
   assert(string_contains(text, "\"was\":\"b3:000000000000\""));
-  assert(string_contains(text, "\"now\":\"b3:1f2e3d4c5b6a\""));
+  assert(
+    string_contains(
+      text,
+      "\"now\":\"b3:228aebf2be538821d3d0d678e52a90712271eb77e773e594e97d0632504611ab\"",
+    ),
+  );
   assert(string_contains(text, "\"added\":[\"m.main\"]"));
   assert(string_contains(text, "\"dropped\":[\"m.helper\"]"))
 }
@@ -810,7 +849,6 @@ test "a program that does not load is the load's own refusal, with the tally und
     Err(nothing()),
     Err(nothing()),
     Err(nothing()),
-    Err(nothing()),
   );
   assert_eq(answer.code, 2);
   assert_eq(answer.lines, []);
@@ -833,14 +871,7 @@ test "a refusal after the load is exit 2 with no tally, and writes no file" {
     ],
     places: [],
   };
-  let answer = answered_over(
-    flags_of(false),
-    Ok(a_load()),
-    Ok(a_made()),
-    Ok(a_sealed()),
-    Err(nothing()),
-    Err(why),
-  );
+  let answer = answered_over(flags_of(false), Ok(a_load()), Ok(a_made()), Err(nothing()), Err(why));
   assert_eq(answer.code, 2);
   assert_eq(answer.lines, []);
   assert_eq(answer.errs, ["Error[E0502]: could not write `dist/m.plyx`"])
@@ -850,7 +881,6 @@ test "an entry point the flags name badly stops the build before anything is mad
   let answer = answered_over(
     { ..no_flags(), entry: Some("serve") },
     Ok(a_load()),
-    Err(nothing()),
     Err(nothing()),
     Err(nothing()),
     Err(nothing()),

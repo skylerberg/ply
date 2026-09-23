@@ -6,7 +6,6 @@
 //! `crates/ply-cli/ply/bootstrap.ply`; this hands it the emission as a value and lands the
 //! document it answers with.
 
-use crate::cli::BootstrapArgs;
 use crate::hosts::Lent;
 use crate::payload::{count, diags_value, option, places_value, record, strings};
 use ply_eval::Value as PlyValue;
@@ -27,9 +26,18 @@ const OPERATIONS: [(&str, &str); 2] = [
     ("land", "ply_cli::bootstrap::land"),
 ];
 
+/// What `ply bootstrap` is configured with, as plain data: the shell's parsed flags convert.
+#[derive(Clone, Debug)]
+pub struct BootstrapOptions {
+    pub path: std::path::PathBuf,
+    pub out: std::path::PathBuf,
+    pub verify: bool,
+    pub profile: String,
+}
+
 /// The emission runs here, before the program is entered: a handler is handed `&self`, and the
 /// front end and the emitter are the compiler's own work.
-pub fn lent(args: &BootstrapArgs) -> Vec<Lent> {
+pub fn lent(args: &BootstrapOptions) -> Vec<Lent> {
     let archive: Arc<dyn HostHandler> = Arc::new(Archive {
         c: c_path(args),
         manifest: manifest_path(args),
@@ -56,11 +64,11 @@ fn registration(op: &str, path: &'static str) -> HostOp {
     }
 }
 
-fn manifest_path(args: &BootstrapArgs) -> PathBuf {
+fn manifest_path(args: &BootstrapOptions) -> PathBuf {
     args.out.join("manifest.json")
 }
 
-fn c_path(args: &BootstrapArgs) -> PathBuf {
+fn c_path(args: &BootstrapOptions) -> PathBuf {
     args.out.join("frontend.c")
 }
 
@@ -135,8 +143,8 @@ impl HostHandler for Archive {
 
 // --- Emitting -----------------------------------------------------------------
 
-fn emit(args: &BootstrapArgs) -> Result<Emitted, Refused> {
-    if let Err(diagnostic) = ply_machine::support::select_profile(&args.profile) {
+fn emit(args: &BootstrapOptions) -> Result<Emitted, Refused> {
+    if let Err(diagnostic) = crate::support::select_profile(&args.profile) {
         return Err(Refused::bare(diagnostic));
     }
     let loaded = match crate::load::load(&args.path) {
@@ -154,9 +162,8 @@ fn emit(args: &BootstrapArgs) -> Result<Emitted, Refused> {
     let source = source_digest(front);
     // Without the module texts the port answers no bodies, and the archive would be empty.
     let src: &'static ply_codegen::Source = Box::leak(Box::new(
-        ply_codegen::Source::from_front(front, ply_codegen::emit_keys(front)).with_texts(
-            ply_machine::support::module_texts(&loaded.check, &loaded.sources),
-        ),
+        ply_codegen::Source::from_front(front, ply_codegen::emit_keys(front))
+            .with_texts(crate::support::module_texts(&loaded.check, &loaded.sources)),
     ));
     let names: Vec<String> = src.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
