@@ -3,21 +3,27 @@
 //! The `ply` program's commands run other Ply programs — `run` enters one, `test` and `prove`
 //! evaluate bodies, `build` enters the emitter. A compiled body entered while another entry holds
 //! the thread is declined, so the machine these operations drive lives on a thread of its own per
-//! resource label, parked on a channel between operations: `load[m]` fronts the program and
-//! answers what it found, `enter[m]` runs one of its entries and answers how it ended, `drop[m]`
-//! lets the thread go.
+//! resource label, parked on a channel between operations: `load[m]` fronts the program rooted at
+//! a path, incrementally over the store it keeps (`reload[m]` asks again), `enter[m]` runs one of
+//! its entries and answers how it ended, `drop[m]` lets the thread go.
 //!
 //! A nested run is hermetic but for `process`, whose lines are captured into the answer rather
 //! than written: a program's output is its caller's to place.
+
+pub mod driver;
+pub mod load;
+pub mod migrate;
+pub mod shelf;
+pub mod warm;
 
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity,
 };
 use ply_eval::{Provider, Value};
-use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
+use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -25,8 +31,9 @@ use std::sync::{Arc, Mutex};
 /// `machine.drop[m]()`.
 pub const EFFECT: &str = "machine";
 
-const OPERATIONS: [(&str, &str); 3] = [
+const OPERATIONS: [(&str, &str); 4] = [
     ("load", "ply_machine::load"),
+    ("reload", "ply_machine::reload"),
     ("enter", "ply_machine::enter"),
     ("drop", "ply_machine::drop"),
 ];
@@ -99,31 +106,6 @@ fn err(value: Value) -> Value {
     Value::ctor("Err", vec![value])
 }
 
-fn field<'a>(value: &'a Value, name: &str, span: Span) -> Result<&'a Value, Diagnostic> {
-    let Value::Record(fields) = value else {
-        return Err(shape(value, span, "a record"));
-    };
-    fields
-        .iter()
-        .find(|(key, _)| key.as_str() == name)
-        .map(|(_, value)| value)
-        .ok_or_else(|| shape(value, span, &format!("a record with `{name}`")))
-}
-
-fn shape(value: &Value, span: Span, what: &str) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!(
-            "`machine` was handed {} where {what} was expected",
-            value.type_name()
-        ),
-    )
-    .primary(
-        span,
-        "the program and the machine it drives are written together; this is Ply's fault",
-    )
-}
-
 // --- The handler --------------------------------------------------------
 
 #[derive(Default)]
@@ -160,6 +142,9 @@ enum Go {
         argv: Vec<String>,
         reply: Sender<Entered>,
     },
+    Reload {
+        reply: Sender<Opened>,
+    },
 }
 
 /// What an entry came to, as plain data: the `Value` is built on the calling thread, since a
@@ -172,12 +157,6 @@ struct Entered {
     raised: Option<String>,
 }
 
-struct Loaded {
-    modules: Vec<String>,
-    definitions: usize,
-    tests: usize,
-}
-
 enum Opened {
     Ready(Box<Loaded>),
     Refused(Vec<String>),
@@ -188,7 +167,8 @@ impl HostHandler for Site {
         let span = req.span;
         let label = label_of(req, span)?;
         let value = match (req.op.op.as_str(), req.args) {
-            ("load", [modules]) => self.load(&label, modules, span)?,
+            ("load", [root]) => self.load(&label, root, span)?,
+            ("reload", []) => self.reload(&label, span)?,
             ("enter", [entry, argv]) => self.enter(&label, entry, argv, span)?,
             ("drop", []) => self.drop(&label),
             (other, _) => {
@@ -218,13 +198,8 @@ fn label_of(req: &HostRequest<'_>, span: Span) -> Result<String, Diagnostic> {
 }
 
 impl Site {
-    fn load(&self, label: &str, modules: &Value, span: Span) -> Result<Value, Diagnostic> {
-        let mut own = Vec::new();
-        for module in modules.as_list(span, "the program's modules")?.iter() {
-            let name = field(module, "name", span)?.as_str(span, "a module's name")?;
-            let text = field(module, "text", span)?.as_str(span, "a module's text")?;
-            own.push((name.to_string(), text.to_string()));
-        }
+    fn load(&self, label: &str, root: &Value, span: Span) -> Result<Value, Diagnostic> {
+        let root = root.as_str(span, "the program's root")?.to_string();
         if self
             .labels
             .lock()
@@ -242,7 +217,7 @@ impl Site {
         let thread = std::thread::Builder::new()
             .name(format!("machine-{label}"))
             .stack_size(STACK)
-            .spawn(move || serve(own, reply, hearing))
+            .spawn(move || serve(PathBuf::from(root), reply, hearing))
             .map_err(|e| unspawned(label, &e))?;
         let opened = answered.recv().map_err(|_| unanswered(label))?;
         let value = match opened {
@@ -257,11 +232,7 @@ impl Site {
                     },
                 );
                 drop(previous);
-                ok(record(vec![
-                    ("modules", strings(loaded.modules)),
-                    ("definitions", Value::Int(loaded.definitions as i64)),
-                    ("tests", Value::Int(loaded.tests as i64)),
-                ]))
+                ok(loaded_value(&loaded))
             }
             Opened::Refused(diagnostics) => {
                 err(record(vec![("diagnostics", strings(diagnostics))]))
@@ -320,6 +291,33 @@ impl Site {
         }
         Value::Unit
     }
+
+    fn reload(&self, label: &str, span: Span) -> Result<Value, Diagnostic> {
+        let (reply, answered) = mpsc::channel();
+        {
+            let labels = self.labels.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(machine) = labels.get(label) else {
+                return Err(Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    format!("`machine.reload[{label}]` before `machine.load[{label}]`"),
+                )
+                .primary(span, "a machine answers for the program it was loaded with"));
+            };
+            machine
+                .go
+                .as_ref()
+                .ok_or_else(|| unanswered(label))?
+                .send(Go::Reload { reply })
+                .map_err(|_| unanswered(label))?;
+        }
+        let opened = answered.recv().map_err(|_| unanswered(label))?;
+        Ok(match opened {
+            Opened::Ready(loaded) => ok(loaded_value(&loaded)),
+            Opened::Refused(diagnostics) => {
+                err(record(vec![("diagnostics", strings(diagnostics))]))
+            }
+        })
+    }
 }
 
 fn unspawned(label: &str, e: &std::io::Error) -> Diagnostic {
@@ -340,19 +338,36 @@ fn unanswered(label: &str) -> Diagnostic {
 
 // --- The thread the machine lives on -----------------------------------------------
 
-/// The loaded program: a front end and its module texts, plus the compiled tier, built lazily on
-/// the first entry and reused after.
+/// The loaded program: its incremental load, the store that served it, and the compiled tier,
+/// built lazily on the first entry and reused after.
 struct Machine {
-    front: ply_ty::Front,
-    texts: HashMap<String, String>,
+    loaded: crate::load::Loaded,
+    store: ply_store::Store,
     unit: Option<&'static ply_codegen::Unit>,
 }
 
-fn serve(own: Vec<(String, String)>, reply: Sender<Opened>, hearing: mpsc::Receiver<Go>) {
-    match load(&own) {
-        Ok((machine, loaded)) => {
-            let _ = reply.send(Opened::Ready(Box::new(loaded)));
-            park(machine, hearing);
+fn serve(root: PathBuf, reply: Sender<Opened>, hearing: mpsc::Receiver<Go>) {
+    let mut store = match ply_store::Store::open(&root) {
+        Ok(store) => store.with_upstream(ply_store::Upstream::from_env()),
+        Err(e) => {
+            let _ = reply.send(Opened::Refused(vec![format!(
+                "the store under `{}` did not open: {e:#}",
+                root.join(".ply-cache").display()
+            )]));
+            return;
+        }
+    };
+    match load(&root, &mut store) {
+        Ok((loaded, summary)) => {
+            let _ = reply.send(Opened::Ready(summary));
+            park(
+                Machine {
+                    loaded,
+                    store,
+                    unit: None,
+                },
+                hearing,
+            );
         }
         Err(diagnostics) => {
             let _ = reply.send(Opened::Refused(diagnostics));
@@ -366,70 +381,94 @@ fn park(mut machine: Machine, hearing: mpsc::Receiver<Go>) {
             Go::Enter { entry, argv, reply } => {
                 let _ = reply.send(machine.enter(&entry, argv));
             }
+            Go::Reload { reply } => {
+                let _ = reply.send(machine.reload());
+            }
         }
     }
 }
 
-fn load(own: &[(String, String)]) -> Result<(Machine, Loaded), Vec<String>> {
-    let shelf: Vec<(String, String)> = ply_std::sources()
-        .map(|(name, text)| (name.to_string(), text.to_string()))
-        .collect();
-    ply_codegen::c::producer::ensure_default();
-    let pulled = ply_codegen::c::producer::front_pulling_std(own, &shelf)
-        .map_err(|e| vec![format!("the front end did not answer: {e:#}")])?;
-    let mut sources = SourceMap::new();
-    let mut ids = Vec::new();
-    for (name, text) in own {
-        ids.push(sources.add(PathBuf::from(name), text.clone()));
-    }
-    for module in &pulled.modules {
-        let name = ply_ty::ModuleName::from_dotted(module);
-        let text = ply_std::source(&name).unwrap_or_default();
-        ids.push(sources.add(ply_std::pseudo_path(&name), text.to_string()));
-    }
-    let front = ply_ty::read_front(&pulled.dump, &ids)
-        .map_err(|e| vec![format!("the front end's answer does not read: {e}")])?;
-    let errors: Vec<String> = front
-        .diagnostics
-        .iter()
-        .filter(|d| d.severity == ply_span::Severity::Error)
-        .map(|d| ply_span::render::to_terminal(d, &sources, false))
-        .collect();
-    if !errors.is_empty() {
-        return Err(errors);
-    }
-    let loaded = Loaded {
-        modules: own.iter().map(|(name, _)| name.clone()).collect(),
-        definitions: front.check.defs.len(),
-        tests: front.check.tests.len(),
+/// The incremental load the store makes warm; a refusal renders with the program's own sources.
+fn load(
+    root: &Path,
+    store: &mut ply_store::Store,
+) -> Result<(crate::load::Loaded, Box<Loaded>), Vec<String>> {
+    let loaded = match crate::driver::load_incremental(root, store) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            return Err(err
+                .diagnostics
+                .iter()
+                .map(|d| ply_span::render::to_terminal(d, &err.sources, false))
+                .collect());
+        }
     };
-    let texts: HashMap<String, String> = front
-        .check
-        .modules
-        .values()
-        .filter_map(|m| {
-            sources
-                .get(m.source)
-                .map(|f| (m.name.to_string(), f.text.to_string()))
-        })
+    let warnings = store
+        .take_warnings()
+        .iter()
+        .chain(loaded.frontend.warnings.iter())
+        .map(|d| ply_span::render::to_terminal(d, &loaded.sources, false))
         .collect();
-    Ok((
-        Machine {
-            front,
-            texts,
-            unit: None,
-        },
-        loaded,
-    ))
+    let summary = Box::new(Loaded {
+        modules: loaded.check.modules.keys().map(|m| m.to_string()).collect(),
+        definitions: loaded.check.defs.len(),
+        tests: loaded.check.tests.len(),
+        warnings,
+    });
+    Ok((loaded, summary))
+}
+
+/// What a load answers with: the program's shape, and what degraded on the way.
+struct Loaded {
+    modules: Vec<String>,
+    definitions: usize,
+    tests: usize,
+    warnings: Vec<String>,
+}
+
+fn loaded_value(loaded: &Loaded) -> Value {
+    record(vec![
+        ("modules", strings(loaded.modules.iter().cloned())),
+        ("definitions", Value::Int(loaded.definitions as i64)),
+        ("tests", Value::Int(loaded.tests as i64)),
+        ("warnings", strings(loaded.warnings.iter().cloned())),
+    ])
 }
 
 impl Machine {
+    fn reload(&mut self) -> Opened {
+        let root = self.loaded.root.clone();
+        match load(&root, &mut self.store) {
+            Ok((loaded, summary)) => {
+                self.loaded = loaded;
+                self.unit = None;
+                Opened::Ready(summary)
+            }
+            Err(diagnostics) => Opened::Refused(diagnostics),
+        }
+    }
+
+    /// Each module's source by name, as the emitter's cache keys cover.
+    fn texts(&self) -> HashMap<String, String> {
+        self.loaded
+            .check
+            .modules
+            .values()
+            .filter_map(|m| {
+                self.loaded
+                    .sources
+                    .get(m.source)
+                    .map(|f| (m.name.to_string(), f.text.to_string()))
+            })
+            .collect()
+    }
+
     fn enter(&mut self, entry: &str, argv: Vec<String>) -> Entered {
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,
         };
         if self.unit.is_none() {
-            match ply_codegen::Unit::over_front(&self.front, self.texts.clone()) {
+            match ply_codegen::Unit::over_front(&self.loaded.front, self.texts()) {
                 Ok(unit) => self.unit = Some(unit),
                 Err(e) => {
                     return Entered {
@@ -442,7 +481,7 @@ impl Machine {
                 }
             }
         }
-        let mut machine = ply_eval::Machine::new(&self.front);
+        let mut machine = ply_eval::Machine::new(&self.loaded.front);
         if let Some(unit) = &self.unit {
             machine.set_compiled(unit.attach(&spec));
         }
@@ -452,7 +491,7 @@ impl Machine {
         ));
         let mut registry = HostRegistry::new();
         ply_host::process::register(&mut registry, Some(&process));
-        let binding = match registry.bind(&self.front.check) {
+        let binding = match registry.bind(&self.loaded.front.check) {
             Ok(binding) => binding,
             Err(diagnostics) => {
                 return Entered {
@@ -472,6 +511,7 @@ impl Machine {
         };
         machine.set_host_binding(Arc::new(binding));
         let span = self
+            .loaded
             .front
             .check
             .defs

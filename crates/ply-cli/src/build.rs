@@ -165,7 +165,7 @@ impl Site {
             .check
             .defs
             .values()
-            .filter(|d| !crate::shipped::is_shipped(&d.module))
+            .filter(|d| !ply_machine::shelf::is_shipped(&d.module))
             .map(def_value)
             .collect();
         PlyValue::ctor(
