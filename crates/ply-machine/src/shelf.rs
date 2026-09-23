@@ -123,3 +123,12 @@ pub fn reserved_diagnostic(file: &Path, name: &str) -> Diagnostic {
     .note("`compiler` and everything under it name the compiler modules embedded in `ply`; `compiler.fmt` is the formatter `ply fmt` runs")
     .note("rename the file or the directory it sits in")
 }
+
+/// The three store versions a decode refuses a mismatch of, as the runtime's store keeps them.
+pub fn store_versions() -> (&'static str, &'static str, u32) {
+    (
+        ply_store::FRONTEND_VERSION,
+        ply_store::RUNTIME_VERSION,
+        ply_store::BODY_ENCODING,
+    )
+}
