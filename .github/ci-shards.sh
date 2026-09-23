@@ -529,9 +529,9 @@ cmd_verify() {
     echo "FAIL: W5_FILTER names crates/ply-cli-tests/tests/suite/w5_shutdown.rs, which does not exist" >&2
     failures=$((failures + 1))
   fi
-  # Cargo builds `ply` for ply-cli-tests only if ply-cli has an integration test of its own.
-  if ! ls "$root"/crates/ply-cli/tests/*.rs >/dev/null 2>&1; then
-    echo "FAIL: crates/ply-cli/tests/ has no .rs file, so cargo builds no 'ply' for ply-cli-tests' suite to run" >&2
+  # Cargo builds `ply` for ply-cli-tests only if ply-launcher has an integration test of its own.
+  if ! ls "$root"/crates/ply-launcher/tests/*.rs >/dev/null 2>&1; then
+    echo "FAIL: crates/ply-launcher/tests/ has no .rs file, so cargo builds no 'ply' for ply-cli-tests' suite to run" >&2
     failures=$((failures + 1))
   fi
 
