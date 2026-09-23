@@ -378,39 +378,25 @@ pub struct PoolBounds {
     pub statements: usize,
 }
 
-/// The database knobs, on every command that can bind a host handler.
-#[derive(clap::Args, Clone, Debug, Default)]
+/// The database knobs, on every command that can bind a host handler. Plain data: the shell's
+/// flags convert into this.
+#[derive(Clone, Debug, Default)]
 pub struct DbOptions {
     /// The database URL; defaults to `PLY_DB_URL`, with the password from `PLY_DB_PASSWORD`.
-    #[arg(long = "db", value_name = "URL", requires = "host")]
     pub url: Option<String>,
-
     /// Connections in the pool.
-    #[arg(long = "db-pool", value_name = "N", requires = "host", value_parser = clap::value_parser!(u32).range(1..))]
     pub pool: Option<u32>,
-
     /// Milliseconds a `db` operation may wait for a connection before `E0437`.
-    #[arg(long = "db-acquire-ms", value_name = "MS", requires = "host", value_parser = clap::value_parser!(u64).range(1..))]
     pub acquire_ms: Option<u64>,
-
     /// Server-side `statement_timeout`, set on every connection at checkout.
-    #[arg(long = "db-statement-ms", value_name = "MS", requires = "host", value_parser = clap::value_parser!(u64).range(1..))]
     pub statement_ms: Option<u64>,
-
     /// Server-side `idle_in_transaction_session_timeout`.
-    #[arg(long = "db-idle-txn-ms", value_name = "MS", requires = "host", value_parser = clap::value_parser!(u64).range(1..))]
     pub idle_txn_ms: Option<u64>,
-
     /// Milliseconds to establish a connection.
-    #[arg(long = "db-connect-ms", value_name = "MS", requires = "host", value_parser = clap::value_parser!(u64).range(1..))]
     pub connect_ms: Option<u64>,
-
     /// Prepared statements kept per connection.
-    #[arg(long = "db-statement-cache", value_name = "N", requires = "host", value_parser = clap::value_parser!(u32).range(1..))]
     pub statement_cache: Option<u32>,
-
     /// `<module>.<fn>`: a nullary pure function returning a `Schema` (not checked live).
-    #[arg(long = "db-schema", value_name = "MODULE.FN", requires = "host")]
     pub schema: Option<String>,
 }
 

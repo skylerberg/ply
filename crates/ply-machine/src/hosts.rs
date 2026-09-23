@@ -1,9 +1,9 @@
 //! The trusted computing base, as the CLI reads and reports it.
 
-use crate::commands::common::plural;
 use crate::config::Configuration;
 use crate::db::{self, Database, DbConfig};
 use crate::payload::{count, diags_value, option, places_value, record, strings};
+use crate::support::plural;
 use ply_eval::Value as PlyValue;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
@@ -61,7 +61,7 @@ impl Hosts {
     pub fn open(
         check: &CheckOutput,
         host: bool,
-        credentials: &crate::cli::TlsOptions,
+        credentials: &crate::options::TlsOptions,
         roots: &[ply_host::fs::RootSpec],
         db: Option<DbConfig>,
         config: Configuration,
@@ -90,7 +90,7 @@ impl Hosts {
     pub fn open_stopping(
         check: &CheckOutput,
         host: bool,
-        credentials: &crate::cli::TlsOptions,
+        credentials: &crate::options::TlsOptions,
         roots: &[ply_host::fs::RootSpec],
         db: Option<DbConfig>,
         config: Configuration,
@@ -860,7 +860,23 @@ const PAYLOAD: &str = "hosts";
 
 /// Assembled before the program is entered: a load and a backend are the compiler's work, and
 /// the compiler is not something to re-enter from inside a running program.
-pub fn lent(args: &crate::cli::HostsArgs) -> Vec<Lent> {
+/// What `ply hosts` is configured with, as plain data: the shell's parsed flags convert into
+/// this.
+#[derive(Clone, Debug)]
+pub struct HostsOptions {
+    pub path: std::path::PathBuf,
+    pub host: bool,
+    pub json: bool,
+    pub digest: bool,
+    pub tls: crate::options::TlsOptions,
+    pub fs: Vec<ply_host::fs::RootSpec>,
+    pub db: crate::db::DbOptions,
+    pub config: crate::config::ConfigOptions,
+    pub trace: crate::trace::TraceOptions,
+    pub shutdown: crate::options::ShutdownOptions,
+}
+
+pub fn lent(args: &crate::hosts::HostsOptions) -> Vec<Lent> {
     let facility: Arc<dyn HostHandler> = Arc::new(Facility {
         assembled: Assembled::of(args),
     });
@@ -915,7 +931,7 @@ struct Assembled {
 }
 
 impl Assembled {
-    fn of(args: &crate::cli::HostsArgs) -> Assembled {
+    fn of(args: &crate::hosts::HostsOptions) -> Assembled {
         let loaded = match crate::load::load(&args.path) {
             Ok(loaded) => loaded,
             Err(err) => {
@@ -1019,7 +1035,7 @@ struct Bound {
 /// The stage that refused, and why.
 type Refusal = (&'static str, Vec<Diagnostic>);
 
-fn bind(args: &crate::cli::HostsArgs, loaded: &crate::load::Loaded) -> Result<Bound, Refusal> {
+fn bind(args: &crate::hosts::HostsOptions, loaded: &crate::load::Loaded) -> Result<Bound, Refusal> {
     // Whether or not `--host` was passed: a digest that moved with a flag would pin nothing.
     let trace = args.trace.open();
     let stopping = ply_host::signal::Shutdown::new(args.shutdown.bounds());
@@ -1038,7 +1054,7 @@ fn bind(args: &crate::cli::HostsArgs, loaded: &crate::load::Loaded) -> Result<Bo
     let credentials = tls::Credentials::load(&args.tls.tls, &args.tls.trust)
         .map_err(|diagnostics| ("NotBound", diagnostics))?;
     // Likewise, so an unresolvable root is `E0454` before the listing overstates what is reached.
-    let roots = ply_host::fs::Roots::load(&args.fs.fs, Span::DUMMY)
+    let roots = ply_host::fs::Roots::load(&args.fs, Span::DUMMY)
         .map_err(|diagnostic| ("NotBound", vec![diagnostic]))?;
     let db = args
         .db
@@ -1046,8 +1062,8 @@ fn bind(args: &crate::cli::HostsArgs, loaded: &crate::load::Loaded) -> Result<Bo
         .map_err(|diagnostics| ("NotBound", diagnostics))?;
     // Built only for a schema: this command runs nothing else.
     let constant = |name: &str| {
-        let backend = crate::commands::common::prover_backend(None, loaded)?;
-        crate::commands::common::enter_constant(backend.map(|(provider, _)| provider), name)
+        let backend = crate::support::prover_backend(None, loaded)?;
+        crate::support::enter_constant(backend.map(|(provider, _)| provider), name)
     };
     let schema = schema_view(&loaded.check, db.as_ref(), &constant)
         .map_err(|diagnostic| ("NotBound", vec![diagnostic]))?;
@@ -1083,7 +1099,7 @@ fn schema_view(
     };
     let resolved = db::schema::resolve(check, name)?;
     let name = resolved.as_str().to_string();
-    let shape = crate::commands::common::materialise_schema(&name, constant);
+    let shape = crate::support::materialise_schema(&name, constant);
     Ok(Some(db::schema::SchemaView {
         name,
         shape,

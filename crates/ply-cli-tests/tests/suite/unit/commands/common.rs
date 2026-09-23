@@ -1,4 +1,5 @@
 use ply_cli::commands::common::*;
+use ply_machine::support::plural;
 use ply_span::{Diagnostic, SourceMap, Span, codes};
 
 #[test]

@@ -136,7 +136,7 @@ impl HostHandler for Archive {
 // --- Emitting -----------------------------------------------------------------
 
 fn emit(args: &BootstrapArgs) -> Result<Emitted, Refused> {
-    if let Err(diagnostic) = crate::commands::common::select_profile(&args.profile) {
+    if let Err(diagnostic) = ply_machine::support::select_profile(&args.profile) {
         return Err(Refused::bare(diagnostic));
     }
     let loaded = match crate::load::load(&args.path) {
@@ -155,7 +155,7 @@ fn emit(args: &BootstrapArgs) -> Result<Emitted, Refused> {
     // Without the module texts the port answers no bodies, and the archive would be empty.
     let src: &'static ply_codegen::Source = Box::leak(Box::new(
         ply_codegen::Source::from_front(front, ply_codegen::emit_keys(front)).with_texts(
-            crate::commands::common::module_texts(&loaded.check, &loaded.sources),
+            ply_machine::support::module_texts(&loaded.check, &loaded.sources),
         ),
     ));
     let names: Vec<String> = src.functions();

@@ -102,7 +102,7 @@ impl Artifact {
 
     /// Each section's payload, in the order they are written. The records inside a payload are
     /// the writer's; `plyx.ply` places the payloads and hands them back.
-    pub(crate) fn sections(&self) -> Vec<(&'static str, u32, Vec<u8>)> {
+    pub fn sections(&self) -> Vec<(&'static str, u32, Vec<u8>)> {
         let mut sections: Vec<(&'static str, u32, Vec<u8>)> = Vec::with_capacity(5);
 
         let mut bodies = Vec::new();
@@ -548,7 +548,7 @@ fn closure_texts(
         .names
         .iter()
         .filter_map(|(name, _)| name.rsplit_once('.').map(|(module, _)| module))
-        .filter(|module| ply_machine::shelf::is_shipped_name(module))
+        .filter(|module| crate::shelf::is_shipped_name(module))
         .collect();
     let shipped: Vec<&str> = shipped.into_iter().collect();
     let printed = ply_codegen::c::producer::print_bodies(&bodies, &names, &[], &[], &shipped)
@@ -569,7 +569,7 @@ fn embedded_unit(opened: &Opened, entry: &Symbol, names: &[&str]) -> Result<Emis
         .copied()
         .filter(|name| opened.front.check.defs.contains_key(&Symbol::new(name)))
         .collect();
-    let texts = crate::commands::common::module_texts(&opened.front.check, &opened.sources);
+    let texts = crate::support::module_texts(&opened.front.check, &opened.sources);
     let produced = ply_codegen::Unit::over_front(&opened.front, texts)
         .and_then(|unit| unit.produce(&names))
         .and_then(|produced| {
@@ -930,7 +930,7 @@ fn ask_the_port(
     sources: &mut SourceMap,
 ) -> Result<Answered, Vec<Diagnostic>> {
     ply_codegen::c::producer::ensure_default();
-    let shelf = ply_machine::shelf::sources();
+    let shelf = crate::shelf::sources();
     let pulled = ply_codegen::c::producer::front_pulling_std(own, shelf)
         .map_err(|e| front_failed(format!("{e:#}")))?;
     let front = place_and_read(&pulled.modules, &pulled.dump, ids, sources)?;
@@ -951,10 +951,10 @@ fn place_and_read(
 ) -> Result<Front, Vec<Diagnostic>> {
     for module in modules {
         let name = ModuleName::from_dotted(module);
-        let text = ply_machine::shelf::source(&name).ok_or_else(|| {
+        let text = crate::shelf::source(&name).ok_or_else(|| {
             front_failed(format!("it pulled in `{module}`, which is not shipped"))
         })?;
-        ids.push(sources.add(ply_machine::shelf::pseudo_path(&name), text));
+        ids.push(sources.add(crate::shelf::pseudo_path(&name), text));
     }
     let front = ply_ty::read_front(dump, ids.as_slice())
         .map_err(|e| front_failed(format!("the front end's answer does not read: {e}")))?;
@@ -984,7 +984,8 @@ fn front_cache(artifact: &Artifact) -> PathBuf {
     hasher.update(ply_codegen::c::producer::identity().as_bytes());
     hasher.update(&[0]);
     hasher.update(&ply_std::digest());
-    crate::shipped::stage().join(format!("front.{}", &hasher.finalize().to_hex()[..16]))
+    ply_codegen::c::bundle::stage_dir("artifact-fronts")
+        .join(format!("front.{}", &hasher.finalize().to_hex()[..16]))
 }
 
 /// The pulled module names, then the dump: the two halves a `Front` is rebuilt from in process.
@@ -1046,7 +1047,7 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
     for (file, text) in &artifact.closure {
         let relative = PathBuf::from(file);
         let name = ModuleName::from_relative_path(&relative).map_err(|d| vec![d])?;
-        if ply_machine::shelf::is_shipped(&name) {
+        if crate::shelf::is_shipped(&name) {
             return Err(vec![unfaithful(format!(
                 "the closure carries `{file}`, a module this `ply` ships"
             ))]);
@@ -1093,7 +1094,7 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
         .map(|(name, _)| name.as_str())
         .collect();
     if let Some(extra) = hashes.defs.keys().chain(hashes.decls.keys()).find(|name| {
-        !ply_machine::shelf::is_shipped_name(name.as_str()) && !named.contains(name.as_str())
+        !crate::shelf::is_shipped_name(name.as_str()) && !named.contains(name.as_str())
     }) {
         return Err(vec![unfaithful(format!(
             "the closure declares `{extra}`, which the artifact does not name"
@@ -1133,6 +1134,9 @@ pub struct Binds {
 /// One entry into an opened artifact, with no line of its own on either stream: the program's
 /// output is the whole of what a caller sees. The answer is the code `process.exit` asked for,
 /// else `0` for a value returned and the diagnostic for a raise.
+/// The code an entry answers with when it asked for none.
+pub const EXIT_OK: i32 = 0;
+
 pub fn enter(
     artifact: &Artifact,
     opened: &Opened,
@@ -1167,7 +1171,7 @@ pub fn enter(
     let hosts = crate::hosts::Hosts::open_stopping(
         &opened.front.check,
         true,
-        &crate::cli::TlsOptions::default(),
+        &crate::options::TlsOptions::default(),
         &roots,
         None,
         crate::config::Configuration::default(),
@@ -1187,10 +1191,10 @@ pub fn enter(
         .unwrap_or(Span::DUMMY);
     let plan = crate::simulation::run_plan(None);
     let answer = evaluate(opened, span, &plan, &hosts, declared.as_ref(), tier);
-    let _ = crate::run::teardown(&hosts, None, crate::run::TEARDOWN_FLOOR_MS);
+    let _ = crate::runner::teardown(&hosts, None, crate::runner::TEARDOWN_FLOOR_MS);
     match hosts.requested_exit() {
         Some(code) => Ok(code),
-        None => answer.map(|_| crate::EXIT_OK),
+        None => answer.map(|_| EXIT_OK),
     }
 }
 
@@ -1220,7 +1224,7 @@ pub(crate) fn tier(
     backend: Option<&String>,
     unit: Option<&EmbeddedUnit>,
 ) -> Result<Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>, Diagnostic> {
-    let Some(spec) = crate::commands::common::backend_spec(backend)? else {
+    let Some(spec) = crate::support::backend_spec(backend)? else {
         return Ok(None);
     };
     // Entered as built: no producer is asked.
@@ -1236,8 +1240,8 @@ pub(crate) fn tier(
             ply_codegen::Unit::embedded(&opened.front, text).map_err(|e| unit_error(&e))?;
         return Ok(Some((provider, spec)));
     }
-    let texts = crate::commands::common::module_texts(&opened.front.check, &opened.sources);
-    let provider = crate::commands::common::build_backend_over(&spec, &opened.front, texts)?;
+    let texts = crate::support::module_texts(&opened.front.check, &opened.sources);
+    let provider = crate::support::build_backend_over(&spec, &opened.front, texts)?;
     Ok(Some((provider, spec)))
 }
 

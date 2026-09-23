@@ -10,10 +10,21 @@
 //! A nested run is hermetic but for `process`, whose lines are captured into the answer rather
 //! than written: a program's output is its caller's to place.
 
+pub mod artifact;
+pub mod config;
+pub mod costs;
+pub mod db;
 pub mod driver;
+pub mod hosts;
 pub mod load;
 pub mod migrate;
+pub mod options;
+pub mod payload;
+pub mod runner;
 pub mod shelf;
+pub mod simulation;
+pub mod support;
+pub mod trace;
 pub mod warm;
 
 use ply_eval::host::{

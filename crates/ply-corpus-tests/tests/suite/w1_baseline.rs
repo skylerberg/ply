@@ -44,7 +44,7 @@ fn the_reconstructed_parser_passes_every_test_the_shipped_one_does() {
         selection.total
     );
 
-    let report = ply_cli::commands::common::run_on_tier(
+    let report = ply_machine::support::run_on_tier(
         &loaded,
         &selection,
         ply_test::Hosting::hermetic(),

@@ -1,12 +1,23 @@
-use ply_cli::cli::{SimArg, SimOptions};
 use ply_cli::simulation::*;
 use ply_eval::sim::{DEFAULT_BUDGET, DEFAULT_RANDOM_ROOTS, DEFAULT_STEPS};
 use ply_eval::{Plan, Seed, SimMode};
+use ply_machine::simulation::SimOptions;
+
+fn cli_options() -> ply_cli::cli::SimOptions {
+    ply_cli::cli::SimOptions {
+        seed: None,
+        sim: ply_cli::cli::SimArg::default(),
+        seeds: None,
+        sim_budget: None,
+        sim_steps: None,
+        measure_reduction: false,
+    }
+}
 
 fn options() -> SimOptions {
     SimOptions {
         seed: None,
-        sim: SimArg::default(),
+        sim: SimMode::default(),
         seeds: None,
         sim_budget: None,
         sim_steps: None,
@@ -33,7 +44,7 @@ fn seeds_widens_the_root_set_under_either_mode() {
     assert_eq!(built.roots, (0..8).collect::<Vec<u64>>());
 
     let sampled = plan(&SimOptions {
-        sim: SimArg::Random,
+        sim: SimMode::Random,
         ..options()
     });
     assert_eq!(sampled.roots.len(), DEFAULT_RANDOM_ROOTS as usize);
@@ -68,19 +79,19 @@ fn a_replay_keeps_its_step_bound() {
 #[test]
 fn a_budget_under_random_is_refused() {
     assert!(
-        SimOptions {
-            sim: SimArg::Random,
+        ply_cli::cli::SimOptions {
+            sim: ply_cli::cli::SimArg::Random,
             sim_budget: Some(16),
-            ..options()
+            ..cli_options()
         }
         .conflict()
         .is_some()
     );
-    assert!(options().conflict().is_none());
+    assert!(cli_options().conflict().is_none());
     assert!(
-        SimOptions {
+        ply_cli::cli::SimOptions {
             sim_budget: Some(16),
-            ..options()
+            ..cli_options()
         }
         .conflict()
         .is_none()
@@ -104,7 +115,7 @@ fn every_flag_that_widens_the_search_changes_the_key() {
             ..options()
         }),
         plan(&SimOptions {
-            sim: SimArg::Random,
+            sim: SimMode::Random,
             ..options()
         }),
         plan(&SimOptions {

@@ -9,8 +9,20 @@ use std::path::Path;
 pub fn execute(args: &HostsArgs, style: Style) -> i32 {
     // The flags that name a host facility stay here, behind the effect the program performs; the
     // program is lent the binding they define and reaches no tree of its own.
+    let options = ply_machine::hosts::HostsOptions {
+        path: args.path.clone(),
+        host: args.host,
+        json: args.json,
+        digest: args.digest,
+        tls: (&args.tls).into(),
+        fs: args.fs.fs.clone(),
+        db: (&args.db).into(),
+        config: (&args.config).into(),
+        trace: (&args.trace).into(),
+        shutdown: (&args.shutdown).into(),
+    };
     let binds = Binds {
-        lent: crate::hosts::lent(args),
+        lent: crate::hosts::lent(&options),
         ..Binds::default()
     };
     run(

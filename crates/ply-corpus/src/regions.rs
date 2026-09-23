@@ -339,7 +339,7 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
             .context("building the worker pool")?;
         let started = Instant::now();
         let report = pool.install(|| {
-            ply_cli::commands::common::run_on_tier(
+            ply_machine::support::run_on_tier(
                 &loaded,
                 &plan.selection,
                 ply_test::Hosting::hermetic(),
