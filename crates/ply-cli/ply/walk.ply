@@ -2,7 +2,7 @@
 // command line is taken whatever it is called, a directory is walked for `.ply` files, and a
 // symlink is refused rather than followed, since a rewrite through one leaves the root.
 
-import std.fs (fs, File, Dir, Symlink, Missing, mem_of, mem_kind, mem_list)
+import std.fs (fs, Kind, File, Dir, Symlink, Missing, mem_of, mem_kind, mem_list)
 import std.path (join, extension)
 
 pub type Failure = { path: String, why: String }
@@ -23,33 +23,81 @@ pub fn skipped(name: String) -> Bool = string_starts_with(name, ".") || name == 
 
 pub fn is_ply(name: String) -> Bool = extension(name) == Some("ply")
 
-pub fn named(found: Found, path: String) -> Found / {fs.kind[cwd], fs.list_dir[cwd]} =
-  match fs.kind[cwd](path) {
+// The label a read spells: `cwd` under the working directory, `abs` for a path that leaves it.
+// Both atoms sit in every row here so the one walk serves either.
+fn kind_at(label: String, path: String) -> Kind / {fs.kind[cwd], fs.kind[abs]} =
+  if label == "cwd" { fs.kind[cwd](path) } else { fs.kind[abs](path) }
+
+fn listed(
+  label: String,
+  path: String,
+) -> Option<List<String>> / {fs.list_dir[cwd], fs.list_dir[abs]} =
+  if label == "cwd" { fs.list_dir[cwd](path) } else { fs.list_dir[abs](path) }
+
+pub fn named(
+  found: Found,
+  path: String,
+) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} =
+  named_l("cwd", found, path)
+
+pub fn named_l(
+  label: String,
+  found: Found,
+  path: String,
+) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} =
+  match kind_at(label, path) {
     File -> keep(found, path),
-    Dir -> walk(found, path),
+    Dir -> walk_l(label, found, path),
     Symlink -> refuse(found, path, "a symlink is not followed"),
     Missing -> refuse(found, path, "could not read"),
   }
 
 // One entry of a directory, which the walk never follows and never reports.
-pub fn entry(found: Found, path: String, name: String) -> Found / {fs.kind[cwd], fs.list_dir[cwd]} =
-  match fs.kind[cwd](path) {
+fn entry_l(
+  label: String,
+  found: Found,
+  path: String,
+  name: String,
+) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} =
+  match kind_at(label, path) {
     File -> if is_ply(name) { keep(found, path) } else { found },
-    Dir -> if skipped(name) { found } else { walk(found, path) },
+    Dir -> if skipped(name) { found } else { walk_l(label, found, path) },
     Symlink -> found,
     Missing -> found,
   }
 
-pub fn walk(found: Found, dir: String) -> Found / {fs.kind[cwd], fs.list_dir[cwd]} =
-  match fs.list_dir[cwd](dir) {
+pub fn walk_l(
+  label: String,
+  found: Found,
+  dir: String,
+) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} =
+  match listed(label, dir) {
     None -> refuse(found, dir, "could not read"),
-    Some(names) -> fold(names, found, |acc: Found, name: String| entry(acc, join(dir, name), name)),
+    Some(names) ->
+      fold(names, found, |acc: Found, name: String| entry_l(label, acc, join(dir, name), name)),
   }
 
+pub fn walk(
+  found: Found,
+  dir: String,
+) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} =
+  walk_l("cwd", found, dir)
+
 // The paths as given, or `.`, each found in turn, so the answer is in path order.
-pub fn sweep(paths: List<String>) -> Found / {fs.kind[cwd], fs.list_dir[cwd]} = {
+pub fn sweep(
+  paths: List<String>,
+) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} = {
   let wanted = if len(paths) == 0 { ["."] } else { paths };
   fold(wanted, nothing(), |acc: Found, path: String| named(acc, path))
+}
+
+// The same under a label that may leave the working directory.
+pub fn sweep_l(
+  label: String,
+  paths: List<String>,
+) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} = {
+  let wanted = if len(paths) == 0 { ["."] } else { paths };
+  fold(wanted, nothing(), |acc: Found, path: String| named_l(label, acc, path))
 }
 
 // --- Tests ------------------------------------------------------------------
@@ -67,7 +115,9 @@ test "the walk passes over a symlink, a hidden directory, `target` and anything 
     named(nothing(), ".")
   } with {
     fs.list_dir[cwd](p) -> mem_list(tree, p),
+    fs.list_dir[abs](p) -> mem_list(tree, p),
     fs.kind[cwd](p) -> if p == "link.ply" { Symlink } else { mem_kind(tree, p) },
+    fs.kind[abs](p) -> if p == "link.ply" { Symlink } else { mem_kind(tree, p) },
   };
   assert_eq(map_keys(found.files), ["m.ply", "sub/deep.ply"]);
   assert_eq(found.errors, [])
@@ -78,7 +128,9 @@ test "a named symlink is refused rather than followed" {
     named(nothing(), "link.ply")
   } with {
     fs.kind[cwd](p) -> Symlink,
+    fs.kind[abs](p) -> Symlink,
     fs.list_dir[cwd](p) -> panic("a symlink is never walked"),
+    fs.list_dir[abs](p) -> panic("a symlink is never walked"),
   };
   assert_eq(map_keys(found.files), []);
   assert_eq(found.errors, [{ path: "link.ply", why: "a symlink is not followed" }])
@@ -90,7 +142,9 @@ test "a named file is taken whatever it is called, and a walked one only when it
     walk(named(nothing(), "notes.txt"), ".")
   } with {
     fs.list_dir[cwd](p) -> mem_list(tree, p),
+    fs.list_dir[abs](p) -> mem_list(tree, p),
     fs.kind[cwd](p) -> mem_kind(tree, p),
+    fs.kind[abs](p) -> mem_kind(tree, p),
   };
   assert_eq(map_keys(both.files), ["notes.txt"])
 }
@@ -101,7 +155,9 @@ test "no path given is the working directory" {
     sweep([])
   } with {
     fs.list_dir[cwd](p) -> mem_list(tree, p),
+    fs.list_dir[abs](p) -> mem_list(tree, p),
     fs.kind[cwd](p) -> mem_kind(tree, p),
+    fs.kind[abs](p) -> mem_kind(tree, p),
   };
   assert_eq(map_keys(found.files), ["m.ply"])
 }

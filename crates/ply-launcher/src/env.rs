@@ -16,10 +16,11 @@ use std::sync::Arc;
 /// `env.binary_version[e]()`.
 pub const EFFECT: &str = "env";
 
-const OPERATIONS: [(&str, &str); 3] = [
+const OPERATIONS: [(&str, &str); 4] = [
     ("var", "ply_launcher::env::var"),
     ("terminal", "ply_launcher::env::terminal"),
     ("binary_version", "ply_launcher::env::binary_version"),
+    ("pwd", "ply_launcher::env::pwd"),
 ];
 
 /// The ops and the handler, lent with the binary's version.
@@ -73,6 +74,12 @@ impl HostHandler for Site {
                 Value::Bool(terminal)
             }
             ("binary_version", []) => Value::str(&self.version),
+            // The working directory the `cwd` root is bound to, as the program resolves paths.
+            ("pwd", []) => Value::str(
+                std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| ".".to_string()),
+            ),
             (other, _) => {
                 return Err(Diagnostic::error(
                     codes::INTERNAL_ERROR,
