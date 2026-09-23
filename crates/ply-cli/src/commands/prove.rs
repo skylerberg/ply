@@ -39,11 +39,11 @@ fn job(args: &ProveArgs) -> Job {
         ),
         binding: Some(Binding {
             host: args.host,
-            tls: args.tls.clone(),
-            fs: args.fs.clone(),
-            db: args.db.clone(),
-            config: args.config.clone(),
-            trace: args.trace.clone(),
+            tls: (&args.tls).into(),
+            fs: args.fs.fs.clone(),
+            db: (&args.db).into(),
+            config: (&args.config).into(),
+            trace: (&args.trace).into(),
         }),
     }
 }

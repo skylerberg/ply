@@ -11,11 +11,11 @@ use crate::config::Configuration;
 use crate::hosts::{Hosts, Lent};
 use crate::load::{LoadError, Loaded};
 use crate::payload::{count, ctor, diags_value, option, places_value, record, strings};
+use crate::support::{build_pool, enter_constant, prover_backend};
 use ply_eval::Value as PlyValue;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
-use ply_machine::support::{build_pool, enter_constant, prover_backend};
 use ply_prove::{
     Discharge, Evidence, Frame, Gap, Obligation, ObligationKind, ProvePlan, ProveReport, Tier,
     Vacuity, VacuityKind,
@@ -63,11 +63,11 @@ pub struct Job {
 /// What a `law/host` is discharged against, and what a hermetic run refuses to reach.
 pub struct Binding {
     pub host: bool,
-    pub tls: crate::cli::TlsOptions,
-    pub fs: crate::cli::FsOptions,
-    pub db: crate::cli::DbOptions,
-    pub config: crate::cli::ConfigOptions,
-    pub trace: crate::cli::TraceOptions,
+    pub tls: crate::options::TlsOptions,
+    pub fs: Vec<ply_host::fs::RootSpec>,
+    pub db: crate::db::DbOptions,
+    pub config: crate::config::ConfigOptions,
+    pub trace: crate::trace::TraceOptions,
 }
 
 pub fn lent(job: Job) -> Vec<Lent> {
@@ -416,15 +416,10 @@ fn discharge(
     let hosts = match &job.binding {
         None => None,
         Some(binding) => {
-            let db_options: ply_machine::db::DbOptions = (&binding.db).into();
-            let db = db_options.resolve(binding.host).map_err(&unbound)?;
-            let (configuration, opened) = Configuration::open(
-                &loaded.check,
-                binding.host,
-                &(&binding.config).into(),
-                &constant,
-            )
-            .map_err(&unbound)?;
+            let db = binding.db.resolve(binding.host).map_err(&unbound)?;
+            let (configuration, opened) =
+                Configuration::open(&loaded.check, binding.host, &binding.config, &constant)
+                    .map_err(&unbound)?;
             warnings.extend(opened);
             // A file whose laws are all hermetic binds nothing.
             let reach = ply_ty::ty::Footprint::from_atoms(
@@ -438,11 +433,11 @@ fn discharge(
                 Hosts::open(
                     &loaded.check,
                     binding.host,
-                    &ply_machine::options::TlsOptions::from(&binding.tls),
-                    &binding.fs.fs,
+                    &binding.tls,
+                    &binding.fs,
                     db,
                     configuration,
-                    &ply_machine::trace::TraceOptions::from(&binding.trace),
+                    &binding.trace,
                     Some(&reach),
                 )
                 .map_err(&unbound)?,
