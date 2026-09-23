@@ -1,22 +1,20 @@
-// `ply bootstrap` — the front end written out as the C that builds it. Producing that C, hashing
-// it and landing the two files is the emitter's work, which is the host's side of this command;
-// the manifest, what `--verify` compares it against and what either run says are here.
+// `ply bootstrap` — the front end written out as the bundle the runtime builds it from: the C
+// gzipped as `unit.c.gz`, beside the `SOURCES.digest` of the modules it came from. Producing
+// that C, hashing it and landing the two files is the emitter's work, which is the host's side
+// of this command; what `--verify` makes of it and what either run says are here.
 
 import args (Flags, style_of)
 import diagnostic (Place)
 import program (outside)
 import report (Answer, ok_code, compile_error, refused, reported)
-import style (Style)
+import style (Style, plain)
 import compiler.resolve (Diag, diag1)
-import std.json (Json, Str, Bool, Number, Array, object, parse_string, to_string, error_to_string)
+import std.json (Json, Str, Bool, Number, Array, object)
 
-// The emission, and the landing of what it came to. `emitted` has already run when the program
-// performs it, so what comes back is what was done: the C is beside the manifest before there is
-// a manifest to describe it. `land` writes the document this program built, and answers with the
-// files the archive now holds or with why it holds none.
+// The emission. `emitted` has already run when the program performs it, so what comes back is
+// what was done: the bundle is on disk beside whatever `--verify` read back from it.
 pub nondet effect archive {
   write emitted[r](options: Options) -> Result<Emitted, Refusal>
-  write land[r](options: Options, manifest: String) -> Result<List<String>, String>
 }
 
 // What `ply bootstrap` is configured with, as the program parses it.
@@ -26,28 +24,29 @@ pub type Options = { path: String, out: String, verify: Bool, profile: String }
 // fix and is tallied as such.
 pub type Refusal = { diags: List<Diag>, places: List<Place>, compilation: Bool }
 
+// The two digests an archive is described by: over the sources it came from, and over the
+// gzipped C it holds.
+pub type Described = { source: String, artifact: String }
+
 pub type Emitted = {
-  // Over every definition's name and hash, sorted: the version the archive is of.
+  // Over the module texts, sorted: the version the archive is of, which `SOURCES.digest` holds.
   source: String,
-  // Over the C itself, which is what `--verify` checks.
+  // Over `unit.c.gz`, which is what `--verify` checks.
   artifact: String,
   definitions: Int,
   refusals: Int,
   bytes: Int,
-  // Where the manifest lives, whether or not one is there.
+  // Where the bundle lives, whether or not one is there.
   at: String,
-  // The manifest beside the C as its file reads; `None` when the archive holds none.
-  recorded: Option<String>,
+  // The bundle on disk as `--verify` read it; `None` when there is none, and on a run that wrote.
+  recorded: Option<Described>,
 }
 
-// Written beside the C and read back by `--verify`.
-fn manifest(e: Emitted) -> Json =
-  object([
-    { key: "source", value: Str(e.source) },
-    { key: "artifact", value: Str(e.artifact) },
-    { key: "definitions", value: Number(decimal_of_int(e.definitions)) },
-    { key: "refused", value: Number(decimal_of_int(e.refusals)) },
-  ])
+fn described(e: Emitted) -> Json =
+  object([{ key: "source", value: Str(e.source) }, { key: "artifact", value: Str(e.artifact) }])
+
+fn described_json(d: Described) -> Json =
+  object([{ key: "source", value: Str(d.source) }, { key: "artifact", value: Str(d.artifact) }])
 
 // --- Refusals -----------------------------------------------------------------
 
@@ -56,9 +55,6 @@ fn nowhere(message: String, label: Bytes) -> Diag =
 
 fn no_archive(at: String) -> Diag =
   nowhere("no archive at " ++ at, b"`--verify` compares against an archive already written")
-
-fn unreadable(at: String, why: String) -> Diag =
-  nowhere(at ++ ": " ++ why, b"this is not a manifest")
 
 fn stopped(s: Style, why: Refusal) -> Answer =
   if why.compilation { refused(s, "bootstrap", why.diags, why.places) }
@@ -75,27 +71,27 @@ fn agrees(e: Emitted) -> Answer =
       { key: "command", value: Str("bootstrap") },
       { key: "ok", value: Bool(true) },
       { key: "exit_code", value: Number(decimal_of_int(ok_code())) },
-      { key: "verified", value: manifest(e) },
+      { key: "verified", value: described(e) },
     ]),
     lines: ["the archive describes this tree: " ++ e.source],
     errs: [],
     code: ok_code(),
   }
 
-fn differs(e: Emitted, recorded: Json) -> Answer =
+fn differs(e: Emitted, recorded: Described) -> Answer =
   {
     json: object([
       { key: "command", value: Str("bootstrap") },
       { key: "ok", value: Bool(false) },
       { key: "exit_code", value: Number(decimal_of_int(compile_error())) },
-      { key: "recorded", value: recorded },
-      { key: "emitted", value: manifest(e) },
+      { key: "recorded", value: described_json(recorded) },
+      { key: "emitted", value: described(e) },
     ]),
     lines: [],
     errs: [
       "the archive does not describe this tree:",
-      "  recorded " ++ to_string(recorded),
-      "  emitted  " ++ to_string(manifest(e)),
+      "  recorded " ++ recorded.source ++ " " ++ recorded.artifact,
+      "  emitted  " ++ e.source ++ " " ++ e.artifact,
     ],
     code: compile_error(),
   }
@@ -103,25 +99,20 @@ fn differs(e: Emitted, recorded: Json) -> Answer =
 fn verified(s: Style, e: Emitted) -> Answer =
   match e.recorded {
     None -> refusing(s, no_archive(e.at)),
-    Some(text) -> match parse_string(text) {
-      Err(why) -> refusing(s, unreadable(e.at, error_to_string(why))),
-      Ok(recorded) -> if to_string(recorded) == to_string(manifest(e)) { agrees(e) }
-      else { differs(e, recorded) },
-    },
+    Some(d) -> if d.source == e.source && d.artifact == e.artifact { agrees(e) }
+    else { differs(e, d) },
   }
 
 // --- The archive a run writes -------------------------------------------------------
 
-fn first_of(paths: List<String>) -> String = match list_at(paths, 0) { Some(p) -> p, None -> "" }
-
-pub fn wrote(e: Emitted, paths: List<String>) -> Answer =
+pub fn wrote(e: Emitted) -> Answer =
   {
     json: object([
       { key: "command", value: Str("bootstrap") },
       { key: "ok", value: Bool(true) },
       { key: "exit_code", value: Number(decimal_of_int(ok_code())) },
-      { key: "wrote", value: Array(map(paths, |p: String| Str(p))) },
-      { key: "manifest", value: manifest(e) },
+      { key: "wrote", value: Str(e.at) },
+      { key: "archive", value: described(e) },
     ]),
     lines: [
       int_to_string(e.definitions) ++ " definitions, " ++ int_to_string(e.refusals) ++ " refused, "
@@ -129,31 +120,24 @@ pub fn wrote(e: Emitted, paths: List<String>) -> Answer =
         ++ " bytes of C",
       "source   " ++ e.source,
       "artifact " ++ e.artifact,
-      "wrote    " ++ first_of(paths),
+      "wrote    " ++ e.at,
     ],
     errs: [],
     code: ok_code(),
   }
 
-// The manifest is this program's document, so the archive holds the one it wrote and no other.
-fn landed(s: Style, flags: Flags, e: Emitted) -> Answer / {archive.land[bootstrap]} =
-  match archive.land[bootstrap](options_of(flags), to_string(manifest(e)) ++ "\n") {
-    Err(why) -> refusing(s, nowhere(why, b"the archive could not be written")),
-    Ok(paths) -> wrote(e, paths),
-  }
-
-pub fn run(flags: Flags) -> Answer / {archive.emitted[bootstrap], archive.land[bootstrap]} = {
+pub fn run(flags: Flags) -> Answer / {archive.emitted[bootstrap]} = {
   let s = style_of(flags);
   match archive.emitted[bootstrap](options_of(flags)) {
     Err(why) -> stopped(s, why),
-    Ok(e) -> if flags.action == "verify" { verified(s, e) } else { landed(s, flags, e) },
+    Ok(e) -> if flags.action == "verify" { verified(s, e) } else { wrote(e) },
   }
 }
 
 // The options the archive is written under, from the parsed line.
 fn options_of(flags: Flags) -> Options =
   {
-    path: match list_at(flags.paths, 0) { Some(r) -> r.absolute, None -> "." },
+    path: match list_at(flags.paths, 0) { Some(r) -> r.machine, None -> "." },
     out: match flags.out { Some(o) -> o, None -> "bootstrap" },
     verify: flags.action == "verify",
     profile: match flags.profile { Some(p) -> p, None -> "release" },
@@ -168,49 +152,33 @@ fn an_archive() -> Emitted =
     definitions: 12,
     refusals: 0,
     bytes: 4096,
-    at: "bootstrap/manifest.json",
+    at: "bootstrap",
     recorded: None,
   }
 
-test "the manifest names the two digests and the two counts, and nothing else" {
-  assert_eq(
-    to_string(manifest(an_archive())),
-    "{\"artifact\":\"3c4d\",\"definitions\":12,\"refused\":0,\"source\":\"1a2b\"}",
-  )
-}
-
-test "a run that wrote the archive reports both digests and the C it landed" {
-  let answer = wrote(an_archive(), ["bootstrap/frontend.c", "bootstrap/manifest.json"]);
+test "a run that wrote the archive reports both digests and where it landed" {
+  let answer = wrote(an_archive());
   assert_eq(answer.code, 0);
   assert_eq(answer.lines, [
     "12 definitions, 0 refused, 4096 bytes of C",
     "source   1a2b",
     "artifact 3c4d",
-    "wrote    bootstrap/frontend.c",
+    "wrote    bootstrap",
   ])
 }
 
 test "`--verify` takes an archive that says what this tree emits, and refuses one that does not" {
-  let same = { ..an_archive(), recorded: Some(to_string(manifest(an_archive()))) };
-  assert_eq(verified({ styled: false }, same).code, 0);
-  assert_eq(verified({ styled: false }, same).lines, ["the archive describes this tree: 1a2b"]);
-  let stale = {
-    ..an_archive(),
-    recorded: Some("{\"artifact\":\"9999\",\"definitions\":12,\"refused\":0,\"source\":\"1a2b\"}"),
-  };
-  let answer = verified({ styled: false }, stale);
-  assert_eq(answer.code, 2);
-  assert_eq(
-    match list_at(answer.errs, 0) { Some(l) -> l, None -> "" },
-    "the archive does not describe this tree:",
-  )
+  let s = plain();
+  let same = verified(s, { ..an_archive(), recorded: Some({ source: "1a2b", artifact: "3c4d" }) });
+  assert_eq(same.code, 0);
+  assert_eq(same.lines, ["the archive describes this tree: 1a2b"]);
+  let moved = verified(s, { ..an_archive(), recorded: Some({ source: "ffff", artifact: "3c4d" }) });
+  assert_eq(moved.code, 2);
+  assert_eq(list_at(moved.errs, 0), Some("the archive does not describe this tree:"))
 }
 
 test "`--verify` with no archive to compare against says where it looked" {
-  let answer = verified({ styled: false }, an_archive());
+  let answer = verified(plain(), an_archive());
   assert_eq(answer.code, 2);
-  assert_eq(
-    match list_at(answer.errs, 0) { Some(l) -> l, None -> "" },
-    "Error[E0502]: no archive at bootstrap/manifest.json",
-  )
+  assert(answer.errs != [])
 }

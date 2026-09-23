@@ -31,7 +31,8 @@ of it next.
 | `crates/ply-host` | the Rust handlers effects resolve to (db, fs, tcp, tls, ...) |
 | `crates/ply-machine` | the nested-entry capability: a program loading and entering another program |
 | `crates/ply-std` | the standard library, as Ply source in `ply/` |
-| `crates/ply-cli` | the `ply` binary |
+| `crates/ply-cli` | the `ply` program, as Ply source in `ply/` and the artifact it builds (`bootstrap/`); not a cargo crate |
+| `crates/ply-launcher` | the `ply` binary: enters the program the artifact holds |
 | `crates/ply-corpus` | synthetic projects and the benchmark harnesses |
 | `crates/<crate>-tests` | that crate's tests |
 | `examples/`, `tests/lang/`, `tests/fixtures/` | Ply programs the suite runs |
@@ -46,7 +47,7 @@ CI is the verifier; every pull request runs these checks and the whole suite:
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo build --locked --release -p ply-cli --bin ply
+cargo build --locked --release -p ply-launcher --bin ply
 cargo nextest run --workspace
 ```
 

@@ -189,7 +189,7 @@ fn emit_stage(
         format!(
             "the committed bundle does not serve this runtime: {e:#}. Check out an older bundle \
              this runtime serves from git history, then refresh it with \
-             `PLY_C_BOOTSTRAP_REFRESH=1 cargo nextest run -p ply-codegen-tests --test bootstrap`"
+             `ply bootstrap crates/ply-compiler/ply --out crates/ply-compiler/bootstrap`"
         )
     })?;
     let first = PlyProducer::new(native).map_err(|e| format!("{e:#}"))?;

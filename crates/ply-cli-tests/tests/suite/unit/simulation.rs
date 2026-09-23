@@ -1,7 +1,7 @@
-use ply_machine::simulation::*;
 use ply_eval::sim::{DEFAULT_BUDGET, DEFAULT_RANDOM_ROOTS, DEFAULT_STEPS};
 use ply_eval::{Plan, Seed, SimMode};
 use ply_machine::simulation::SimOptions;
+use ply_machine::simulation::*;
 
 fn options() -> SimOptions {
     SimOptions {

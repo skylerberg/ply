@@ -1,7 +1,7 @@
 //! The committed `ply` program, and the shelf it is built against.
 //!
-//! `PLY_C_BOOTSTRAP_REFRESH=1` rewrites `crates/ply-cli/bootstrap` with what these sources build;
-//! CI does so on main after each merge, so no pull request carries the artifact.
+//! CI's `refresh` job rebuilds the artifact and its digest on main with `ply build`, so no pull
+//! request carries either.
 
 use assert_cmd::Command;
 use ply_launcher::shipped;
@@ -47,21 +47,11 @@ fn the_committed_program_is_what_these_sources_build() {
 
     let artifact = shipped::committed();
     let digest = Path::new(shipped::DIR).join(shipped::DIGEST);
-    if std::env::var("PLY_C_BOOTSTRAP_REFRESH").is_ok() {
-        std::fs::create_dir_all(shipped::DIR).unwrap();
-        std::fs::write(&artifact, &built).unwrap();
-        std::fs::write(&digest, format!("{identity}\n")).unwrap();
-        eprintln!(
-            "the `ply` program was written to {} ({} bytes)",
-            artifact.display(),
-            built.len()
-        );
-        return;
-    }
     if !artifact.is_file() {
         eprintln!(
             "no committed program at {}: a pull request carries none, and CI's `refresh` job \
-             writes it on main. Build it here with PLY_C_BOOTSTRAP_REFRESH=1.",
+             writes it on main. Build it here with `ply build crates/ply-cli/ply --entry ply.main \
+             -o crates/ply-cli/bootstrap/ply.plyx --stamp crates/ply-cli/bootstrap/ply.digest`.",
             artifact.display()
         );
         return;
