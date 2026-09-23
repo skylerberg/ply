@@ -9,6 +9,8 @@
 //! go. The run flow itself — targets, bindings, teardown — is `crate::drive`.
 
 pub mod artifact;
+pub mod bootstrap;
+pub mod builder;
 pub mod config;
 pub mod costs;
 pub mod db;
