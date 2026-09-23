@@ -17,7 +17,7 @@ use cli::{Cli, Command};
 
 // The incremental front end and its store moved to the runtime: they serve any tool that loads a
 // program, not just this binary. Re-exported so the suite's unit tests read as they did.
-pub use ply_machine::runner as run;
+pub use ply_machine::drive as run;
 pub use ply_machine::{
     artifact, config, costs, db, driver, hosts, load, migrate, payload, simulation, trace, warm,
 };

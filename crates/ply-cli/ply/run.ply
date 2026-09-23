@@ -18,110 +18,17 @@ import std.json (Json, Null, Str, Bool, Number, Array, Member, object, to_string
 import std.process (process, Captured, captured, out_step, err_step)
 import style (Style, dim, red)
 
-// What the Rust side loads, binds, enters and tears down, in that order and each once. The
-// binding lives on the thread the entry runs on, which is why opening it and entering it are two
-// operations: what a run may reach has to be disclosed before it reaches any of it.
-pub nondet effect runner {
-  read loaded[r]() -> Result<Target, Refusal>
-  read bound[r](named: String) -> Result<Bound, Refusal>
-  read entered[r]() -> Ended
-}
+// The machine the run drives is the runtime's; the effect is `machine`'s. The `root` it loads is
+// the path the line named, or `.`.
 
-// --- What the Rust side answers with ----------------------------------------
-
-pub type Refusal = {
-  diags: List<Diag>,
-  places: List<Place>,
-  // The file the refusal is about, when a `.plyx` was named and is not one. A program that does
-  // not compile is refused over its own sources instead, and names no file here.
-  artifact: Option<String>,
-}
-
-// What this run runs: a project the front end loaded, or an artifact opened from a file.
-pub type Target = | Project(Program) | Deployed(Artifact)
-
-pub type Program = {
-  // The root the load was rooted at, as a report prints it.
-  root: String,
-  files: List<String>,
-  places: List<Place>,
-  mains: List<Main>,
-  modules: List<Module>,
-}
-
-pub type Artifact = {
-  path: String,
-  digest: String,
-  entry: String,
-  definitions: Int,
-  // Whether the container carries a compiled unit this runtime can enter.
-  unit: Bool,
-  warnings: List<Diag>,
-}
-
-// What the binding discloses before anything runs. A hermetic run discloses nothing, because
-// there is nothing it could reach.
-pub type Bound = {
-  hermetic: Bool,
-  operations: Int,
-  digest: String,
-  // The banner each facility that discloses one writes for itself.
-  config: Option<String>,
-  trace: Option<String>,
-  database: Option<String>,
-  // Only `--host` listens for a signal.
-  signals: Option<Signals>,
-  // An undeclared `--set` is a classic silent deploy failure, so it is always reported.
-  warnings: List<Diag>,
-}
-
-pub type Signals = { names: List<String>, lead_ms: Int, drain_ms: Int }
-
-// What the machine reused. `in_place` is `None` when nothing was updated at all, which is not a
-// ratio of zero.
-pub type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
-
-// What was in flight when a signal asked the run to stop; `None` when nobody asked.
-pub type Stopping = {
-  signal: Option<String>,
-  listeners: Int,
-  connections: Int,
-  scopes: Int,
-  elapsed_ms: Int,
-}
-
-// What the run was given to stop in, and what the teardown did with it.
-pub type Teardown = {
-  lead_ms: Int,
-  drain_ms: Int,
-  transactions_rolled_back: Int,
-  connections_closed: Int,
-  spans_abandoned: Int,
-  problems: List<String>,
-}
-
-pub type Trace = { events: Int, spans: Int, abandoned: Int, flushed: Bool }
-
-// What the entry did, once the binding is torn down.
-pub type Ended = {
-  // The code `process.exit` asked for: the program chose it and returned no value.
-  exit: Option<Int>,
-  // The value the entry answered with, as the reference prints it.
-  value: Option<String>,
-  raised: Option<Diag>,
-  counters: Counters,
-  // A cycle among escaped values is never collected, so only this run can report it.
-  cycles: List<Diag>,
-  stopping: Option<Stopping>,
-  teardown: Teardown,
-  trace: Option<Trace>,
-  handshakes: List<String>,
-  // The host's own disclosure documents, placed under the keys this report gives them.
-  hosts: Json,
-  configuration: Json,
-}
+import machine (Artifact, Deployed, Bound, Counters, Ended, Program, Project, Refusal, Signals,
+                Stopping, Target, Teardown, Trace, machine)
 
 // --- Small things -----------------------------------------------------------
+
+// The target's root is the line's first positional, or the working directory.
+fn root_of(flags: Flags) -> String =
+  match list_at(flags.paths, 0) { Some(path) -> path, None -> "." }
 
 // `main` raised, which is the one failure a run of a checked program can have.
 fn failed() -> Int = 1
@@ -546,12 +453,12 @@ fn started(
   flags: Flags,
   t: Target,
   en: String,
-) -> Answer / {runner.bound[run], runner.entered[run], process.out[proc], process.err[proc]} =
-  match runner.bound[run](en) {
+) -> Answer / {machine.bound[run], machine.enter[run], process.out[proc], process.err[proc]} =
+  match machine.bound[run](en) {
     Err(why) -> unbound(s, why),
     Ok(b) -> {
       disclosed(s, flags, t, b);
-      ended(s, t, en, b, runner.entered[run]())
+      ended(s, t, en, b, machine.enter[run]())
     },
   }
 
@@ -559,14 +466,17 @@ fn chosen(
   s: Style,
   flags: Flags,
   t: Target,
-) -> Answer / {runner.bound[run], runner.entered[run], process.out[proc], process.err[proc]} =
+) -> Answer / {machine.bound[run], machine.enter[run], process.out[proc], process.err[proc]} =
   match entry_of(t) { Err(d) -> unentered(s, t, d), Ok(en) -> started(s, flags, t, en) }
 
 pub fn run(
   flags: Flags,
-) -> Answer / {runner.loaded[run], runner.bound[run], runner.entered[run], process.out[proc], process.err[proc]} = {
+) -> Answer / {machine.load[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc]} = {
   let s: Style = style_of(flags);
-  match runner.loaded[run]() { Err(why) -> unloaded(s, why), Ok(t) -> chosen(s, flags, t) }
+  match machine.load[run](root_of(flags)) {
+    Err(why) -> unloaded(s, why),
+    Ok(t) -> chosen(s, flags, t),
+  }
 }
 
 // --- Tests ------------------------------------------------------------------
@@ -667,9 +577,9 @@ fn ran_over(flags: Flags, t: Result<Target, Refusal>, b: Result<Bound, Refusal>,
     let answer: Answer = handle {
       run(flags)
     } with {
-      runner.loaded[run]() -> t,
-      runner.bound[run](named) -> b,
-      runner.entered[run]() -> e,
+      machine.load[run](_root) -> t,
+      machine.bound[run](named) -> b,
+      machine.enter[run]() -> e,
       process.out[proc](text) -> cell_set(io, out_step(cell_get(io), text)),
       process.err[proc](text) -> cell_set(io, err_step(cell_get(io), text)),
     };
