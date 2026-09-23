@@ -970,7 +970,7 @@ pub fn front_pulling_std(
     user: &[(String, String)],
     shipped: &[(String, String)],
 ) -> Result<Pulled> {
-    front_pulling_std_with(user, shipped, &[], &[])
+    front_pulling_std_with(user, shipped, &[], &[], None)
 }
 
 /// [`front_dump`] over `user` plus each module of `shipped` it imports, transitively, placed
@@ -982,6 +982,7 @@ pub fn front_pulling_std_with(
     shipped: &[(String, String)],
     defs: &[KnownDef],
     tests: &[KnownTest],
+    manifest: Option<&str>,
 ) -> Result<Pulled> {
     let known_defs = Value::list(
         defs.iter()
@@ -1016,6 +1017,10 @@ pub fn front_pulling_std_with(
             source_list(shipped),
             known_defs,
             known_tests,
+            match manifest {
+                Some(src) => Value::ctor("Some", vec![Value::bytes(src.as_bytes())]),
+                None => Value::ctor("None", Vec::new()),
+            },
         ],
     )?;
     let Value::Str(answer) = &answer else {

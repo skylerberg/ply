@@ -232,6 +232,8 @@ struct Driver<'s> {
     whole_project: bool,
     /// The project's own files, which every placement of the shipped modules follows.
     project: SourceMap,
+    /// The root's `ply.pkg`, when there is one: the front end checks it and places it last.
+    manifest: Option<(PathBuf, Arc<str>)>,
     sources: SourceMap,
     files: Vec<FileState>,
     phases: Phases,
@@ -309,11 +311,24 @@ impl<'s> Driver<'s> {
             });
         }
 
+        let manifest_path = root.join("ply.pkg");
+        let manifest = match std::fs::read_to_string(&manifest_path) {
+            Ok(text) => Some((manifest_path, Arc::from(text.as_str()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(LoadError {
+                    sources,
+                    diagnostics: vec![unreadable(&manifest_path, &e)],
+                });
+            }
+        };
+
         let mut driver = Driver {
             root,
             mode,
             store,
             whole_project,
+            manifest,
             project: sources.clone(),
             sources,
             files,
@@ -394,9 +409,27 @@ impl<'s> Driver<'s> {
             .collect();
         let shelf = crate::shelf::sources();
         let (defs, tests) = self.known();
-        let pulled = ply_codegen::c::producer::front_pulling_std_with(&own, shelf, &defs, &tests)
-            .map_err(|e| self.seam_failed(&format!("{e:#}")))?;
+        let pulled = ply_codegen::c::producer::front_pulling_std_with(
+            &own,
+            shelf,
+            &defs,
+            &tests,
+            self.manifest.as_ref().map(|(_, text)| text.as_ref()),
+        )
+        .map_err(|e| self.seam_failed(&format!("{e:#}")))?;
         self.place(&pulled.modules);
+        if let Some((path, text)) = &self.manifest {
+            let source = self.sources.add(path, text.to_string());
+            self.files.push(FileState {
+                stamp: stamp_of(path),
+                path: path.clone(),
+                module: ModuleName::from_dotted("pkg"),
+                source,
+                text: text.clone(),
+                content: ContentHash::of(text.as_bytes()),
+                shipped: false,
+            });
+        }
         let ids: Vec<SourceId> = self.files.iter().map(|f| f.source).collect();
         ply_ty::read_front(&pulled.dump, &ids)
             .map_err(|e| self.seam_failed(&format!("the front end's answer does not read: {e}")))

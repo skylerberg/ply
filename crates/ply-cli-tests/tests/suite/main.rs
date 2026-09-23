@@ -25,6 +25,7 @@ mod incremental;
 mod incremental_audit;
 mod json_endpoint;
 mod lang_fixtures;
+mod manifest;
 mod map_cache;
 mod map_law;
 mod modules_hash_audit;
