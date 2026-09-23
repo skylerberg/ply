@@ -141,8 +141,8 @@ fn widening_a_set_selects_exactly_the_tests_that_reach_it() {
 /// A cold cache never exercises an invalidation, and an invalidation is the only thing that can be wrong.
 #[test]
 fn incremental_and_from_scratch_agree_across_a_sequence_of_set_edits() {
-    use ply_cli::driver;
-    use ply_cli::load::Loaded;
+    use ply_machine::driver;
+    use ply_machine::load::Loaded;
     use ply_store::Store;
     use std::collections::BTreeMap;
 

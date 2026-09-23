@@ -1,4 +1,4 @@
-use ply_cli::config::*;
+use ply_machine::config::*;
 use ply_eval::Value;
 use ply_host::config::{Key, Shape, Snapshot, Sources, Spec};
 use ply_span::{SourceId, Symbol, codes};

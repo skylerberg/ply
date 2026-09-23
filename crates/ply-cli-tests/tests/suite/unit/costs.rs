@@ -1,4 +1,4 @@
-use ply_cli::load::{Loaded, load};
+use ply_machine::load::{Loaded, load};
 
 fn fixture(text: &str) -> (tempfile::TempDir, Loaded) {
     let dir = tempfile::tempdir().unwrap();
@@ -15,7 +15,7 @@ fn a_reuse_fn_is_refused_only_for_a_copy_its_own_body_causes() {
          fn keep(xs: List<Int>) -> Int = len(grow(xs, 1)) + len(xs)\n",
     );
     assert!(loaded.promised);
-    assert!(ply_cli::costs::promises(&loaded).is_empty());
+    assert!(ply_machine::costs::promises(&loaded).is_empty());
 
     // Broken: the binding is read again after the append, inside the promised body.
     let (_dir, loaded) = fixture(
@@ -24,7 +24,7 @@ fn a_reuse_fn_is_refused_only_for_a_copy_its_own_body_causes() {
          \x20 if len(xs) < 0 { xs } else { ys }\n\
          }\n",
     );
-    let broken = ply_cli::costs::promises(&loaded);
+    let broken = ply_machine::costs::promises(&loaded);
     assert_eq!(broken.len(), 1, "{broken:#?}");
     assert_eq!(broken[0].code, ply_span::codes::REUSE_BROKEN);
     assert!(broken[0].message.contains("`grow` is a `reuse fn`"));
@@ -38,7 +38,7 @@ fn a_reuse_fn_is_refused_only_for_a_copy_its_own_body_causes() {
          }\n",
     );
     assert!(!loaded.promised);
-    assert!(ply_cli::costs::promises(&loaded).is_empty());
+    assert!(ply_machine::costs::promises(&loaded).is_empty());
 }
 
 #[test]
@@ -50,13 +50,13 @@ fn the_port_keeps_a_promise_over_a_fresh_list_and_refuses_one_over_a_map_entry()
          }\n",
     );
     assert!(loaded.promised);
-    assert!(ply_cli::costs::promises(&loaded).is_empty());
+    assert!(ply_machine::costs::promises(&loaded).is_empty());
 
     let (_dir, loaded) = fixture(
         "reuse fn grow(m: Map<Int, List<Int>>, n: Int) -> List<Int> =\n\
          \x20 match map_get(m, 0) { Some(xs) -> push(xs, n), None -> [] }\n",
     );
-    let broken = ply_cli::costs::promises(&loaded);
+    let broken = ply_machine::costs::promises(&loaded);
     assert_eq!(broken.len(), 1, "{broken:#?}");
     let d = &broken[0];
     assert_eq!(d.code, ply_span::codes::REUSE_BROKEN);

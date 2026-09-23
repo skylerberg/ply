@@ -22,8 +22,8 @@ const EFFECT: &str = "archive";
 
 /// One registration per operation: the emission, which has already run, and the landing.
 const OPERATIONS: [(&str, &str); 2] = [
-    ("emitted", "ply_cli::bootstrap::emitted"),
-    ("land", "ply_cli::bootstrap::land"),
+    ("emitted", "ply_machine::bootstrap::emitted"),
+    ("land", "ply_machine::bootstrap::land"),
 ];
 
 /// What `ply bootstrap` is configured with, as plain data: the shell's parsed flags convert.

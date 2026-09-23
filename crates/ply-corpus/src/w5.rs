@@ -1102,9 +1102,9 @@ pub fn deploy(repo: &Path, ply: &Path, edit: (&str, &str)) -> Result<DeployRepor
 
     let reproducible = std::fs::read(&one.path)? == std::fs::read(&again.path)?;
 
-    let (old, _) = ply_cli::artifact::read(&one.path)
+    let (old, _) = ply_machine::artifact::read(&one.path)
         .map_err(|d| anyhow::anyhow!("reading the first artifact: {}", d.message))?;
-    let (new, _) = ply_cli::artifact::read(&two.path)
+    let (new, _) = ply_machine::artifact::read(&two.path)
         .map_err(|d| anyhow::anyhow!("reading the second artifact: {}", d.message))?;
 
     let changed: Vec<_> = new

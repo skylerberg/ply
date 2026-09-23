@@ -18,7 +18,7 @@ fn the_reconstructed_parser_passes_every_test_the_shipped_one_does() {
     )
     .unwrap();
 
-    let loaded = match ply_cli::driver::load_full(dir.path()) {
+    let loaded = match ply_machine::driver::load_full(dir.path()) {
         Ok(loaded) => loaded,
         Err(e) => panic!(
             "the reconstruction does not compile: {}",

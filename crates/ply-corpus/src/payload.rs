@@ -1,7 +1,7 @@
 //! What payload types cost: JSON codecs, maps and derivation.
 
 use anyhow::{Context, Result, bail};
-use ply_cli::driver;
+use ply_machine::driver;
 use ply_eval::{Machine, Value};
 use ply_span::Span;
 use ply_store::Store;
@@ -33,7 +33,7 @@ fn millis(d: Duration) -> f64 {
 }
 
 pub struct Checked {
-    pub loaded: ply_cli::load::Loaded,
+    pub loaded: ply_machine::load::Loaded,
 }
 
 impl Checked {
@@ -696,7 +696,7 @@ fn one_derivation_point(
 }
 
 /// Every test the *project* declares, which is what `ply test` runs.
-pub fn run_tests(loaded: &ply_cli::load::Loaded, store: &mut Store) -> Result<Duration> {
+pub fn run_tests(loaded: &ply_machine::load::Loaded, store: &mut Store) -> Result<Duration> {
     let started = Instant::now();
     let selection = ply_test::select(
         &loaded.check,
@@ -705,7 +705,7 @@ pub fn run_tests(loaded: &ply_cli::load::Loaded, store: &mut Store) -> Result<Du
         &ply_eval::Plan::default(),
         &ply_test::Engine::Evaluator,
     );
-    let plan = ply_cli::test::Plan::new(selection, &loaded.check, None, false);
+    let plan = ply_machine::tester::Plan::new(selection, &loaded.check, None, false);
     let selection = plan.selection;
     let report =
         ply_machine::support::run_on_tier(loaded, &selection, ply_test::Hosting::hermetic(), store);
@@ -727,7 +727,7 @@ fn write_files(files: &[(String, String)]) -> Result<tempfile::TempDir> {
     Ok(dir)
 }
 
-fn compile_error(e: &ply_cli::load::LoadError) -> anyhow::Error {
+fn compile_error(e: &ply_machine::load::LoadError) -> anyhow::Error {
     let shown: Vec<String> = e
         .diagnostics
         .iter()

@@ -1,4 +1,4 @@
-use ply_cli::artifact::*;
+use ply_machine::artifact::*;
 use ply_span::codes;
 use ply_store::body::StoredBody;
 use ply_ty::DefHash;

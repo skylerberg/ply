@@ -1,6 +1,6 @@
 use assert_cmd::Command;
-use ply_cli::artifact::{self, Artifact, Binds};
-use ply_cli::load::{Loaded, load};
+use ply_machine::artifact::{self, Artifact, Binds};
+use ply_machine::load::{Loaded, load};
 use ply_host::process::Executables;
 use ply_span::{Span, codes};
 use ply_ty::DefHash;

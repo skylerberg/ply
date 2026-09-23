@@ -1,6 +1,6 @@
 use assert_cmd::Command;
-use ply_cli::driver;
-use ply_cli::load::{LoadError, Loaded};
+use ply_machine::driver;
+use ply_machine::load::{LoadError, Loaded};
 use ply_span::Symbol;
 use ply_store::Store;
 use std::collections::BTreeMap;

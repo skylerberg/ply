@@ -26,7 +26,7 @@ fn the_committed_program_is_what_these_sources_build() {
     // Whatever else moves, the artifact has to carry the entry point the runner enters, and its
     // unit has to hold a body for it: the runner enters the unit and nothing else.
     let named = PathBuf::from(shipped::ARTIFACT);
-    let (decoded, _) = ply_cli::artifact::decode(&built, &named).expect("it decodes");
+    let (decoded, _) = ply_machine::artifact::decode(&built, &named).expect("it decodes");
     assert_eq!(decoded.entry_name(), Some("ply.main"));
     let unit = decoded
         .unit
@@ -43,7 +43,7 @@ fn the_committed_program_is_what_these_sources_build() {
         text.contains(&format!("Word {symbol}(PlyCtx *ctx")),
         "the embedded unit holds no body for `ply.main`, so nothing can be entered from it"
     );
-    ply_cli::artifact::open(&decoded, &named).expect("it opens as the program it names");
+    ply_machine::artifact::open(&decoded, &named).expect("it opens as the program it names");
 
     let artifact = shipped::committed();
     let digest = Path::new(shipped::DIR).join(shipped::DIGEST);
@@ -107,7 +107,7 @@ fn the_compiler_is_on_the_shelf_under_its_own_root_and_nothing_may_shadow_it() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("compiler")).unwrap();
     write(dir.path(), "compiler/fmt.ply", "pub fn f() -> Int = 1\n");
-    let err = ply_cli::load::load(dir.path()).expect_err("`compiler` is reserved");
+    let err = ply_machine::load::load(dir.path()).expect_err("`compiler` is reserved");
     assert_eq!(err.diagnostics.len(), 1);
     assert_eq!(
         err.diagnostics[0].code,
@@ -122,7 +122,7 @@ fn the_compiler_is_on_the_shelf_under_its_own_root_and_nothing_may_shadow_it() {
     // A name that merely starts with the letters is not reserved.
     let ok = tempfile::tempdir().unwrap();
     write(ok.path(), "compilers.ply", "pub fn f() -> Int = 1\n");
-    ply_cli::load::load(ok.path()).expect("`compilers` is an ordinary module name");
+    ply_machine::load::load(ok.path()).expect("`compilers` is an ordinary module name");
 }
 
 /// The shelf hands over text, and the front end and the emitter each parse it: a module filed

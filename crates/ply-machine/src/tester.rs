@@ -37,10 +37,10 @@ const EFFECT: &str = "tester";
 
 const OPERATIONS: [(&str, &str); 5] = [
     ("configure", "ply_machine::tester::configure"),
-    ("loaded", "ply_cli::test::loaded"),
-    ("bound", "ply_cli::test::bound"),
-    ("ran", "ply_cli::test::ran"),
-    ("stamped", "ply_cli::test::stamped"),
+    ("loaded", "ply_machine::test::loaded"),
+    ("bound", "ply_machine::test::bound"),
+    ("ran", "ply_machine::test::ran"),
+    ("stamped", "ply_machine::test::stamped"),
 ];
 
 /// A compiled body honours its call bound on the native stack, where unoptimised frames run to
