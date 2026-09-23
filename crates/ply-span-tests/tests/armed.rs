@@ -1792,6 +1792,15 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
          declined instead of attaching.",
     ),
     (
+        "crates/ply-machine/src/lib.rs",
+        "`Machine::enter`, attaching the compiled tier to the machine a nested entry runs on. \
+         The capability enters entry points, never tests, and holds no result cache: nothing it \
+         answers is recorded anywhere, so neither half of the rule has a route to break. \
+         `a_program_loads_and_enters_a_program` in crates/ply-machine-tests/tests/suite.rs runs \
+         the route and was seen to fail (a deadlock, then a miscoded exit), which is what the \
+         route existing looks like.",
+    ),
+    (
         "crates/ply-corpus/src/w3.rs",
         "the W3 harness's in-process machine over the desk service, honest spec, no result \
          cache: it prices a request and records nothing a later run reads. \
