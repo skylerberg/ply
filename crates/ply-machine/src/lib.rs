@@ -49,7 +49,8 @@ use std::sync::{Arc, Mutex};
 /// `machine.enter[m]()`, `machine.reload[m]()`, `machine.drop[m]()`.
 pub const EFFECT: &str = "machine";
 
-const OPERATIONS: [(&str, &str); 5] = [
+const OPERATIONS: [(&str, &str); 6] = [
+    ("configure", "ply_machine::configure"),
     ("load", "ply_machine::load"),
     ("reload", "ply_machine::reload"),
     ("bound", "ply_machine::bound"),
@@ -65,6 +66,7 @@ pub fn registrations_with(options: drive::RunOptions) -> Vec<(HostOp, Arc<dyn Ho
     let site: Arc<dyn HostHandler> = Arc::new(Site {
         options,
         labels: Mutex::new(HashMap::new()),
+        configured: Mutex::new(HashMap::new()),
     });
     OPERATIONS
         .into_iter()
@@ -123,6 +125,8 @@ fn refused_value(refused: &drive::Refused) -> Value {
 struct Site {
     options: drive::RunOptions,
     labels: Mutex<HashMap<String, Labelled>>,
+    /// What a label was configured with before it loaded, if it was.
+    configured: Mutex<HashMap<String, drive::RunOptions>>,
 }
 
 /// A label's machine: the channel to its thread, and the join on the way out.
@@ -168,6 +172,7 @@ impl HostHandler for Site {
         let span = req.span;
         let label = label_of(req, span)?;
         let value = match (req.op.op.as_str(), req.args) {
+            ("configure", [options]) => self.configure(&label, options, span)?,
             ("load", [root]) => self.load(&label, root, span)?,
             ("reload", []) => {
                 let answer: Result<drive::FoundData, drive::Refused> =
@@ -219,6 +224,16 @@ fn label_of(req: &HostRequest<'_>, span: Span) -> Result<String, Diagnostic> {
 }
 
 impl Site {
+    /// The program parsed the line; the machine reads the record.
+    fn configure(&self, label: &str, options: &Value, span: Span) -> Result<Value, Diagnostic> {
+        let parsed = drive::run_options_of(options, span)?;
+        self.configured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(label.to_string(), parsed);
+        Ok(Value::Unit)
+    }
+
     fn load(&self, label: &str, root: &Value, span: Span) -> Result<Value, Diagnostic> {
         let root = root.as_str(span, "the program's root")?.to_string();
         if self
@@ -235,7 +250,12 @@ impl Site {
         }
         let (reply, answered) = mpsc::channel();
         let (go, hearing) = mpsc::channel();
-        let options = self.options.clone();
+        let options = self
+            .configured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(label)
+            .unwrap_or_else(|| self.options.clone());
         let path = PathBuf::from(root);
         let thread = std::thread::Builder::new()
             .name(format!("machine-{label}"))

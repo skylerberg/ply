@@ -13,12 +13,16 @@ use std::sync::Arc;
 /// that ended. The effect, and the record shapes crossing it, are the program's own declarations.
 const OUTER: &str = r#"
 nondet effect machine {
+  write configure[m](options: Options) -> Unit
   read load[m](root: String) -> Result<Target, Refusal>
   read reload[m]() -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
   write drop[m]() -> Unit
 }
+
+type Options = { host: Bool, trace: TraceOpts, cache: Bool }
+type TraceOpts = { sink: String, level: String }
 
 type At = { module: Int, start: Int, end: Int }
 type Main = { name: String, module: String, path: String, at: At }
@@ -284,12 +288,16 @@ fn a_program_that_does_not_check_is_refused_with_its_diagnostics() {
 /// program's, and the store the first load wrote is what the second read.
 const OUTER_TWICE: &str = r#"
 nondet effect machine {
+  write configure[m](options: Options) -> Unit
   read load[m](root: String) -> Result<Target, Refusal>
   read reload[m]() -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
   write drop[m]() -> Unit
 }
+
+type Options = { host: Bool, trace: TraceOpts, cache: Bool }
+type TraceOpts = { sink: String, level: String }
 
 type At = { module: Int, start: Int, end: Int }
 type Main = { name: String, module: String, path: String, at: At }
@@ -407,4 +415,172 @@ fn a_reload_after_an_edit_enters_the_new_program() {
         Some("2"),
         "the reload read the edited program"
     );
+}
+
+/// `configure` before `load`: the program parsed the line and the machine reads the record. A
+/// configured `--host` binds the nested program's `process`, which a hermetic run refuses.
+#[test]
+fn a_configured_machine_binds_what_the_options_say() {
+    let outer = r#"
+nondet effect machine {
+  write configure[m](options: Options) -> Unit
+  read load[m](root: String) -> Result<Target, Refusal>
+  read reload[m]() -> Result<Target, Refusal>
+  read bound[m](entry: String) -> Result<Bound, Refusal>
+  write enter[m]() -> Ended
+  write drop[m]() -> Unit
+}
+
+type TlsCred = { name: String, cert: String, key: String }
+type Named = { name: String, path: String }
+type DbOpts = {
+  url: Option<String>,
+  pool: Option<Int>,
+  acquire_ms: Option<Int>,
+  statement_ms: Option<Int>,
+  idle_txn_ms: Option<Int>,
+  connect_ms: Option<Int>,
+  statement_cache: Option<Int>,
+  schema: Option<String>,
+}
+type ConfigOpts = { set: List<String>, files: List<String>, schema: Option<String> }
+type TraceOpts = { sink: String, level: String }
+
+type Options = {
+  host: Bool,
+  tls: List<TlsCred>,
+  trust: List<String>,
+  fs: List<Named>,
+  exec: List<Named>,
+  db: DbOpts,
+  config: ConfigOpts,
+  trace: TraceOpts,
+  drain_ms: Int,
+  drain_lead_ms: Int,
+  steps: Int,
+  timeout: Int,
+  seed: Option<String>,
+  backend: Option<String>,
+  profile: String,
+  argv: List<String>,
+  cache: Bool,
+}
+
+type At = { module: Int, start: Int, end: Int }
+type Main = { name: String, module: String, path: String, at: At }
+type Module = { name: String, path: String, at: At }
+type Place = { path: String, text: Bytes }
+type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
+type Diag = {
+  code: Bytes,
+  notes: Int,
+  labels: List<Label>,
+  text: Bytes,
+  message: Bytes,
+  notes_text: List<Bytes>,
+  severity: Bytes,
+  fixes: Int,
+}
+type Target = | Project(Program) | Deployed(Artifact)
+type Program = {
+  root: String,
+  files: List<String>,
+  places: List<Place>,
+  mains: List<Main>,
+  modules: List<Module>,
+}
+type Artifact = {
+  path: String,
+  digest: String,
+  entry: String,
+  definitions: Int,
+  unit: Bool,
+  warnings: List<Diag>,
+}
+type Signals = { names: List<String>, lead_ms: Int, drain_ms: Int }
+type Bound = {
+  hermetic: Bool,
+  operations: Int,
+  digest: String,
+  config: Option<String>,
+  trace: Option<String>,
+  database: Option<String>,
+  signals: Option<Signals>,
+  warnings: List<Diag>,
+}
+type Refusal = { diags: List<Diag>, places: List<Place>, artifact: Option<String> }
+type Ended = { exit: Option<Int>, value: Option<String>, raised: Option<Diag>, rest: Int }
+
+fn opts(host: Bool) -> Options =
+  {
+    host: host,
+    tls: [],
+    trust: [],
+    fs: [],
+    exec: [],
+    db: {
+      url: None,
+      pool: None,
+      acquire_ms: None,
+      statement_ms: None,
+      idle_txn_ms: None,
+      connect_ms: None,
+      statement_cache: None,
+      schema: None,
+    },
+    config: { set: [], files: [], schema: None },
+    trace: { sink: "json", level: "info" },
+    drain_ms: 30000,
+    drain_lead_ms: 0,
+    steps: 0,
+    timeout: 0,
+    seed: None,
+    backend: None,
+    profile: "development",
+    argv: [],
+    cache: false,
+  }
+
+fn main(root: String) -> Bool / {machine.configure[m], machine.load[m], machine.bound[m], machine.enter[m], machine.drop[m]} = {
+  machine.configure[m](opts(true));
+  match machine.load[m](root) {
+    Err(_) -> false,
+    Ok(_t) -> {
+      let bound = machine.bound[m]("inner.main");
+      match bound {
+        Err(_) -> false,
+        Ok(b) -> {
+          let ended = machine.enter[m]();
+          machine.drop[m]();
+          !b.hermetic && ended.value == Some("77")
+        },
+      }
+    },
+  }
+}
+"#;
+
+    let project = tempfile::tempdir().expect("a temporary directory");
+    std::fs::write(project.path().join("inner.ply"), "fn main() -> Int = 77\n").unwrap();
+
+    let front = front_of(outer);
+    let texts: HashMap<String, String> =
+        [("m".to_string(), outer.to_string())].into_iter().collect();
+    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let mut machine = Machine::new(&front);
+    machine.set_compiled(unit.attach(&BackendSpec {
+        kind: BackendKind::C,
+    }));
+    let mut registry = HostRegistry::new();
+    ply_machine::register(&mut registry);
+    let binding = registry.bind(&front.check).expect("the machine ops bind");
+    machine.set_host_binding(Arc::new(binding));
+    let answer = machine
+        .call(
+            "m.main",
+            vec![Value::str(project.path().display().to_string())],
+            Span::DUMMY,
+        )
+        .expect("the outer main ran");
+    assert_eq!(answer.to_string(), "true", "the configured host bound");
 }
