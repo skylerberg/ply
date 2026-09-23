@@ -10,7 +10,7 @@ pub fn execute(action: &CacheAction, style: Style) -> i32 {
     // The store is opened, worked and flushed here, behind the effect the program performs; the
     // program is lent what the action did and reaches no tree of its own.
     let binds = Binds {
-        lent: crate::cache::lent(action),
+        lent: crate::cache::lent(&cache_options(action)),
         ..Binds::default()
     };
     run(
@@ -54,5 +54,28 @@ fn json(action: &CacheAction) -> bool {
             scope.json
         }
         CacheAction::Inspect(args) => args.json,
+    }
+}
+
+/// The parsed action as the runtime's plain options.
+fn cache_options(action: &CacheAction) -> ply_machine::cache::CacheAction {
+    match action {
+        CacheAction::Clear(scope) => ply_machine::cache::CacheAction::Clear(scope_of(scope)),
+        CacheAction::Stats(scope) => ply_machine::cache::CacheAction::Stats(scope_of(scope)),
+        CacheAction::Compact(scope) => ply_machine::cache::CacheAction::Compact(scope_of(scope)),
+        CacheAction::Inspect(args) => {
+            ply_machine::cache::CacheAction::Inspect(ply_machine::cache::InspectOptions {
+                query: args.query.clone(),
+                path: args.path.clone(),
+                json: args.json,
+            })
+        }
+    }
+}
+
+fn scope_of(scope: &crate::cli::CacheScope) -> ply_machine::cache::CacheScope {
+    ply_machine::cache::CacheScope {
+        path: scope.path.clone(),
+        json: scope.json,
     }
 }
