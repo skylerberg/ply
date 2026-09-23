@@ -136,16 +136,17 @@ fn clap_flags() -> Vec<(String, bool)> {
     out
 }
 
-/// The string literals of one `fn` in `args.ply`, however the formatter laid the list out.
-fn ply_list(name: &str) -> Vec<String> {
+/// The string literals of one `fn` in a module of the shipped program, however the formatter
+/// laid the list out.
+fn ply_list_in(module: &str, name: &str) -> Vec<String> {
     let source = ply_cli::shipped::PROGRAM_SOURCES
         .iter()
-        .find(|(module, _)| *module == "args")
+        .find(|(m, _)| *m == module)
         .map(|(_, text)| *text)
-        .expect("the program carries `args`");
+        .unwrap_or_else(|| panic!("the program carries `{module}`"));
     let at = source
         .find(&format!("fn {name}()"))
-        .unwrap_or_else(|| panic!("`args.ply` defines `{name}`"));
+        .unwrap_or_else(|| panic!("`{module}.ply` defines `{name}`"));
     let body = &source[at..];
     let close = body.find(']').expect("the list closes");
     body[..close]
@@ -156,6 +157,11 @@ fn ply_list(name: &str) -> Vec<String> {
             rest[..rest.find('"').expect("the literal closes")].to_string()
         })
         .collect()
+}
+
+/// The string literals of one `fn` in `args.ply`, however the formatter laid the list out.
+fn ply_list(name: &str) -> Vec<String> {
+    ply_list_in("args", name)
 }
 
 /// `args.ply` must know every flag `clap` declares: one it does not know is read as a path, or
@@ -212,5 +218,75 @@ fn the_ply_parser_knows_every_flag_clap_declares() {
         disagreed.is_empty(),
         "`args.ply` disagrees with `clap` about whether these take a value (flag, clap, ply): \
          {disagreed:?}"
+    );
+}
+
+/// One line per flag `clap` declares, in `surface.ply`'s drift-index shape:
+/// `command|long|short|shape`, where the command is dotted for a subcommand (`cache.clear`) and
+/// `ply` for the global, and shape is `switch`, `value`, or `choice:` with the values.
+fn clap_index() -> Vec<String> {
+    fn shape(arg: &clap::Arg) -> String {
+        let takes = matches!(
+            arg.get_action(),
+            clap::ArgAction::Set | clap::ArgAction::Append
+        );
+        if !takes {
+            return "switch".to_string();
+        }
+        match arg.get_value_parser().possible_values() {
+            Some(values) => {
+                let names: Vec<String> = values.map(|v| v.get_name().to_string()).collect();
+                format!("choice:{}", names.join(","))
+            }
+            None => "value".to_string(),
+        }
+    }
+    fn walk(cmd: &clap::Command, path: &str, out: &mut Vec<String>) {
+        for arg in cmd.get_arguments() {
+            let Some(long) = arg.get_long() else { continue };
+            // The global is counted at the root, not under every command it propagates to.
+            if path != "ply" && arg.is_global_set() {
+                continue;
+            }
+            let short = arg.get_short().map(|c| c.to_string()).unwrap_or_default();
+            let mut line = format!("{path}|{long}|{short}|{}", shape(arg));
+            if let Some(aliases) = arg.get_aliases() {
+                for alias in aliases {
+                    line.push_str(&format!("|alias:{alias}"));
+                }
+            }
+            out.push(line);
+        }
+        for sub in cmd.get_subcommands() {
+            let name = if path == "ply" {
+                sub.get_name().to_string()
+            } else {
+                format!("{path}.{}", sub.get_name())
+            };
+            walk(sub, &name, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&Cli::command(), "ply", &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// `surface.ply`'s spec is the surface `clap` declares, flag for flag, until the Rust shell is
+/// retired and the spec is the only one. The literals are pinned to the spec by a test in
+/// `surface.ply` itself; this pins them to `clap`.
+#[test]
+fn the_surface_spec_agrees_with_clap() {
+    let mut declared = ply_list_in("surface", "drift_index");
+    declared.sort();
+    declared.dedup();
+    let declared = declared;
+    let clap = clap_index();
+    let only_spec: Vec<&String> = declared.iter().filter(|l| !clap.contains(l)).collect();
+    let only_clap: Vec<&String> = clap.iter().filter(|l| !declared.contains(l)).collect();
+    assert!(
+        only_spec.is_empty() && only_clap.is_empty(),
+        "the surface spec and clap disagree\nonly in surface.ply: {only_spec:?}\nonly in clap: {only_clap:?}"
     );
 }
