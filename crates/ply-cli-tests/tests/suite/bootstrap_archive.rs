@@ -37,12 +37,13 @@ fn an_archive_is_written_and_verifies_against_the_tree_it_came_from() {
     let wrote: Value = serde_json::from_slice(&first.stdout).expect("json");
     assert_eq!(wrote["ok"], Value::Bool(true));
 
-    let c = out.join("frontend.c");
-    let manifest = out.join("manifest.json");
-    assert!(c.is_file(), "no C was written");
-    assert!(manifest.is_file(), "no manifest was written");
-    // The C is the compiler, so it has to contain the definitions rather than merely exist.
-    let text = std::fs::read_to_string(&c).expect("read the C");
+    let unit = out.join("unit.c.gz");
+    let sources = out.join("SOURCES.digest");
+    assert!(unit.is_file(), "no bundle was written");
+    assert!(sources.is_file(), "no sources digest was written");
+    // The C is the program, so it has to contain the definitions rather than merely exist.
+    let bundle = ply_codegen::c::bundle::from_dir(&out).expect("the directory holds a bundle");
+    let text = ply_codegen::c::bundle::text_of(&bundle).expect("the unit unpacks");
     // The symbol as the unit's own table publishes it: `<name> <arity> <symbol> <entry>`.
     let symbol = text
         .lines()
@@ -54,13 +55,11 @@ fn an_archive_is_written_and_verifies_against_the_tree_it_came_from() {
         "the artifact does not hold the program it was made from"
     );
 
-    let recorded: Value =
-        serde_json::from_str(&std::fs::read_to_string(&manifest).expect("read the manifest"))
-            .expect("json");
+    let recorded: Value = serde_json::from_str(&wrote["archive"].to_string()).expect("json");
     assert_eq!(
         recorded["artifact"],
-        Value::String(blake3::hash(text.as_bytes()).to_hex().to_string()),
-        "the manifest does not describe the C beside it"
+        Value::String(blake3::hash(bundle.unit_bytes()).to_hex().to_string()),
+        "the report does not describe the bundle beside it"
     );
 
     let verify = Command::cargo_bin("ply")

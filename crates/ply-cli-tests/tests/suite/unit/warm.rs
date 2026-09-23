@@ -1,5 +1,5 @@
-use ply_cli::load::{Found, Loaded, stamp_of};
-use ply_cli::warm::*;
+use ply_machine::load::{Found, Loaded, stamp_of};
+use ply_machine::warm::*;
 use ply_span::Symbol;
 use ply_store::ContentHash;
 use ply_ty::{DefHash, HashOutput};

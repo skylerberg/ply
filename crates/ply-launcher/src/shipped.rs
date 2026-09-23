@@ -50,7 +50,7 @@ pub const PROGRAM_SOURCES: &[(&str, &str)] = &[
 ];
 
 /// Where the built program and the digest of the sources it was built from are committed.
-pub const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bootstrap");
+pub const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../ply-cli/bootstrap");
 
 pub const ARTIFACT: &str = "ply.plyx";
 
@@ -72,23 +72,9 @@ pub fn program_sources() -> Vec<(String, String)> {
 
 /// What the built program is a function of: its sources, the shelf it is closed over as the shelf
 /// hands it out, the emitter that compiled it, and the three store versions a decode refuses a
-/// mismatch of.
+/// mismatch of. The artifact the program is built into carries the same digest as its stamp.
 pub fn identity() -> String {
-    let program = producer::digest_of(&program_sources());
-    let mut hasher = blake3::Hasher::new();
-    let (frontend_version, runtime_version, body_encoding) = ply_machine::shelf::store_versions();
-    for part in [
-        program.as_str(),
-        producer::digest_of(ply_machine::shelf::sources()).as_str(),
-        producer::identity().as_str(),
-        frontend_version,
-        runtime_version,
-    ] {
-        hasher.update(part.as_bytes());
-        hasher.update(&[0]);
-    }
-    hasher.update(&body_encoding.to_le_bytes());
-    hasher.finalize().to_hex()[..16].to_string()
+    ply_machine::artifact::toolchain_stamp(&producer::digest_of(&program_sources()))
 }
 
 /// Where a program built for `identity` is kept between runs, beside the emitter's own stages. The
@@ -150,8 +136,7 @@ pub fn committed() -> PathBuf {
 /// stage an earlier run kept for them, else one built now and kept there. A binary whose committed
 /// artifact is behind its sources therefore runs the sources, never the artifact.
 pub fn program() -> Result<Vec<u8>, Diagnostic> {
-    let identity = identity();
-    if committed_digest().as_deref() == Some(identity.as_str())
+    if committed_digest().as_deref() == Some(identity().as_str())
         && let Ok(bytes) = std::fs::read(committed())
     {
         return Ok(bytes);

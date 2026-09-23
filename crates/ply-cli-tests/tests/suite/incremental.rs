@@ -1,5 +1,5 @@
-use ply_cli::driver;
-use ply_cli::load::Loaded;
+use ply_machine::driver;
+use ply_machine::load::Loaded;
 use ply_store::Store;
 
 /// The binary, at the directory under test.
@@ -87,7 +87,7 @@ fn agree(dir: &Path, what: &str) -> Loaded {
     incremental
 }
 
-fn codes(e: &ply_cli::load::LoadError) -> Vec<String> {
+fn codes(e: &ply_machine::load::LoadError) -> Vec<String> {
     e.diagnostics
         .iter()
         .map(|d| format!("{}: {}", d.code, d.message))
@@ -584,8 +584,8 @@ fn zero(x: Int) -> Int
     fs::remove_file(dir.path().join(".ply-cache/claims.answer")).unwrap();
     let mut store = Store::open(dir.path()).unwrap();
     let loaded = driver::load_incremental(dir.path(), &mut store).expect("the project loads");
-    let scoped = ply_cli::obligations::project_view(&loaded.check, false);
-    let collected = ply_cli::obligations::collect(&loaded.front, &scoped, &loaded.hashes);
+    let scoped = ply_machine::obligations::project_view(&loaded.check, false);
+    let collected = ply_machine::obligations::collect(&loaded.front, &scoped, &loaded.hashes);
     assert_eq!(collected.obligations.len(), 3);
     let asked = Asked::new(
         collected.obligations,
@@ -991,7 +991,7 @@ fn a_promise_is_known_on_every_run_and_still_refused() {
     let second = agree(dir, "second run");
     assert!(second.promised, "the promise was lost on the second run");
 
-    let broken = ply_cli::costs::promises(&second);
+    let broken = ply_machine::costs::promises(&second);
     assert_eq!(broken.len(), 1, "{broken:#?}");
     assert_eq!(broken[0].code, ply_span::codes::REUSE_BROKEN);
 }

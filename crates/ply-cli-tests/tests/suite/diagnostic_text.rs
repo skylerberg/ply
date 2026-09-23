@@ -108,7 +108,7 @@ fn the_two_renderers_write_the_same_bytes_for_one_diagnostic() {
         std::fs::write(dir.path().join(format!("{module}.ply")), text).unwrap();
     }
     std::fs::write(dir.path().join("probe.ply"), PROBE).unwrap();
-    let loaded = ply_cli::load::load(dir.path()).expect("the probe checks against the shelf");
+    let loaded = ply_machine::load::load(dir.path()).expect("the probe checks against the shelf");
 
     let spec = BackendSpec {
         kind: BackendKind::C,

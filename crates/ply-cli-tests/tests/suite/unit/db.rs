@@ -1,4 +1,4 @@
-use ply_cli::db::*;
+use ply_machine::db::*;
 use ply_span::codes;
 use std::collections::BTreeMap;
 

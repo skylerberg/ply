@@ -25,8 +25,8 @@ fn ply(dir: &Path) -> Command {
         .arg("never")
         .current_dir(dir)
         // Inherited values would make every assertion below depend on the machine the suite ran on.
-        .env_remove(ply_cli::db::URL_ENV)
-        .env_remove(ply_cli::db::PASSWORD_ENV);
+        .env_remove(ply_machine::db::URL_ENV)
+        .env_remove(ply_machine::db::PASSWORD_ENV);
     cmd
 }
 
@@ -154,8 +154,8 @@ fn the_environment_cannot_cause_a_binding() {
     let dir = project(HOSTED);
     let output = ply(dir.path())
         .args(["test", "--json"])
-        .env(ply_cli::db::URL_ENV, "this is not a connection string")
-        .env(ply_cli::db::PASSWORD_ENV, PASSWORD)
+        .env(ply_machine::db::URL_ENV, "this is not a connection string")
+        .env(ply_machine::db::PASSWORD_ENV, PASSWORD)
         .output()
         .expect("ply runs");
     assert!(
@@ -174,11 +174,11 @@ fn the_environment_supplies_the_url_under_host_and_the_report_says_so() {
     let dir = project(HOSTED);
     let output = ply(dir.path())
         .args(["hosts", "--host", "--json"])
-        .env(ply_cli::db::URL_ENV, URL)
+        .env(ply_machine::db::URL_ENV, URL)
         .output()
         .expect("ply runs");
     let report: Value = serde_json::from_str(&stdout_of(&output)).expect("one object");
-    assert_eq!(report["database"]["source"], ply_cli::db::URL_ENV);
+    assert_eq!(report["database"]["source"], ply_machine::db::URL_ENV);
     assert_eq!(
         report["database"]["url"],
         "postgres://ply@127.0.0.1:5433/desk?sslmode=disable"
@@ -190,12 +190,12 @@ fn a_malformed_environment_url_names_the_variable_rather_than_the_flag() {
     let dir = project(HOSTED);
     let output = ply(dir.path())
         .args(["hosts", "--host"])
-        .env(ply_cli::db::URL_ENV, "postgres://ply@host")
+        .env(ply_machine::db::URL_ENV, "postgres://ply@host")
         .output()
         .expect("ply runs");
     let rendered = stderr_of(&output);
     assert!(rendered.contains("E0431"), "{rendered}");
-    assert!(rendered.contains(ply_cli::db::URL_ENV), "{rendered}");
+    assert!(rendered.contains(ply_machine::db::URL_ENV), "{rendered}");
 }
 
 #[test]
@@ -203,7 +203,7 @@ fn the_password_reaches_no_output_and_no_cache() {
     let dir = project(HOSTED);
     let output = ply(dir.path())
         .args(["test", "--host", "--db", URL, "--explain"])
-        .env(ply_cli::db::PASSWORD_ENV, PASSWORD)
+        .env(ply_machine::db::PASSWORD_ENV, PASSWORD)
         .output()
         .expect("ply runs");
     let rendered = format!("{}{}", stdout_of(&output), stderr_of(&output));
@@ -253,7 +253,7 @@ fn a_password_in_both_places_is_refused() {
             "--db",
             "postgres://ply:in-the-url@127.0.0.1:5433/desk",
         ])
-        .env(ply_cli::db::PASSWORD_ENV, PASSWORD)
+        .env(ply_machine::db::PASSWORD_ENV, PASSWORD)
         .output()
         .expect("ply runs");
     let rendered = stderr_of(&output);
@@ -274,8 +274,8 @@ fn no_credential_reaches_a_definition_s_hash() {
         .expect("ply runs");
     let configured = ply(dir.path())
         .args(["hash", "--json"])
-        .env(ply_cli::db::URL_ENV, URL)
-        .env(ply_cli::db::PASSWORD_ENV, PASSWORD)
+        .env(ply_machine::db::URL_ENV, URL)
+        .env(ply_machine::db::PASSWORD_ENV, PASSWORD)
         .output()
         .expect("ply runs");
     assert_eq!(

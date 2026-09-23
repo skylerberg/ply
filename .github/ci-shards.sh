@@ -47,6 +47,10 @@ SOLO=(
 # Their tests skip, passing, without a postgres server; only `test-postgres` runs them.
 POSTGRES_PACKAGES=(ply-host-tests)
 
+# `-tests` packages with no same-named crate: the CLI's suite drives ply-launcher's binary, and
+# ply-cli is the program's sources, not a crate.
+UNPAIRED_TESTS=(ply-cli-tests)
+
 # `#![cfg(unix)]`, so the gates job asserts it ran.
 W5_FILTER='binary_id(=ply-cli-tests::suite) & test(/^w5_shutdown::/)'
 
@@ -487,7 +491,8 @@ cmd_verify() {
       echo "FAIL: Cargo.toml has no [profile.dev.package.$member] override, so its suite compiles at the library's opt-level" >&2
       failures=$((failures + 1))
     fi
-    if ! printf '%s\n' "${all_members[@]}" | grep -qx "${member%-tests}"; then
+    if ! printf '%s\n' "${all_members[@]}" | grep -qx "${member%-tests}" \
+      && ! printf '%s\n' "${UNPAIRED_TESTS[@]}" | grep -qx "$member"; then
       echo "FAIL: '$member' is a member and '${member%-tests}' is not, so its tests run without that crate's binaries beside them" >&2
       failures=$((failures + 1))
     fi

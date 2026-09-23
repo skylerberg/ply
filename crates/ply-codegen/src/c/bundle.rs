@@ -71,6 +71,11 @@ pub fn stage_dir(identity: &str) -> std::path::PathBuf {
 
 impl Bundle {
     /// The digest of the emitter sources this was emitted from.
+    /// The gzipped C as it sits in the bundle, which is what an archive digest is taken over.
+    pub fn unit_bytes(&self) -> &[u8] {
+        &self.unit
+    }
+
     pub fn sources_digest(&self) -> Option<&str> {
         self.sources.as_deref()
     }

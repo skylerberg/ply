@@ -1,10 +1,10 @@
 use self::fixture::{op, receives_secrets, registry};
-use ply_cli::config::Configuration;
-use ply_cli::db::DbConfig;
-use ply_cli::hosts::*;
 use ply_codegen::c::producer;
 use ply_eval::host::{HostListing, HostRegistry, HostResource, Linearity};
 use ply_host::tls;
+use ply_machine::config::Configuration;
+use ply_machine::db::DbConfig;
+use ply_machine::hosts::*;
 use ply_span::{SourceId, Symbol};
 use ply_ty::CheckOutput;
 use ply_ty::ty::{Footprint, Resource};
@@ -207,7 +207,7 @@ fn the_digest_moves_when_a_flag_alone_moves() {
 
 #[test]
 fn no_shipped_registration_declares_that_it_may_receive_a_credential() {
-    let claiming: Vec<&str> = ply_cli::hosts::registry()
+    let claiming: Vec<&str> = ply_machine::hosts::registry()
         .ops()
         .chain(ply_host::registry_with_database().ops())
         .filter(|op| op.secrets)

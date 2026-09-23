@@ -1450,7 +1450,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--backend`, `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`, `--backend`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, `--backend`, prove, simulation |
-| `ply build [path]` | `--entry NAME`, `-o FILE`, `--config-schema`, `--db-schema`, `--digest`, `--diff OLD.plyx` |
+| `ply build [path]` | `--entry NAME`, `-o FILE`, `--config-schema`, `--db-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | `--show MODULE`, `--digest`; no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
@@ -1461,29 +1461,29 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, test and law whose closure reaches it |
-| `ply bootstrap <path>` | writes the front end as C: `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing), `--profile` (default `release`) |
+| `ply bootstrap <path>` | writes the front end as the bundle the runtime builds it from: `unit.c.gz` beside `SOURCES.digest`; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing), `--profile` (default `release`) |
 | `ply cache clear\|stats\|compact [path]` | discard results / report size and reclaimable space / reclaim it |
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 
 `ply check`, `ply fmt`, `ply defs`, `ply hash`, `ply doc`, `ply show`,
 `ply replace`, `ply callers`, `ply std`, `ply explain`, `ply hosts`, `ply cache`
 and `ply bootstrap` are one Ply program (`crates/ply-cli/ply`, entered
-at `ply.main`). `ply` parses the command line, binds the directory the load is
-rooted at as the program's one writable filesystem root and the modules it ships
-as a read-only second one, and answers with the code the program asked to exit
-with. A path is therefore relative to its root, and one that leaves it is
-refused with `E0452`. `ply hosts`, `ply cache` and `ply bootstrap` reach no tree
-of their own: what a run would bind, what the store holds, and the C the emitter
-produced are assembled by `ply` and lent to the program as an effect, and
-`ply replace` is lent the text it puts in a definition's place, from
-`--with FILE` or stdin. `ply std` needs no project: it reads the shipped modules
-off that second root. The first run after `ply` or the program itself
-changes compiles the program's unit, which needs the C toolchain `ply run`
-needs and takes a few seconds; every later run loads the compiled object and the
-front end it filed beside it. The ones that load a program run the whole front
-end every time: the front-end cache under `.ply-cache` is written by `ply test`,
-`ply prove` and `ply review`, read back by them and by `ply cache`, and by
-nothing else.
+at `ply.main`). The program itself parses the command line, prints help and
+refusals, and resolves the paths it is given against the working directory — a
+relative path reads under it, an absolute one reads where it points. The binary
+answers with the code the program asked to exit with. What a command needs of
+the machine is lent to the program as an effect: `ply run`, `ply test` and
+`ply prove` drive a nested program on a machine of their own, `ply hosts`,
+`ply cache` and `ply bootstrap` are answered what a run would bind, what the
+store holds and the bundle the emitter produced, and `ply replace` is lent the
+text it puts in a definition's place, from `--with FILE` or stdin. `ply std`
+needs no project: it reads the shipped modules off a second, read-only root. The
+first run after `ply` or the program itself changes compiles the program's unit,
+which needs the C toolchain `ply run` needs and takes a few seconds; every later
+run loads the compiled object and the front end it filed beside it. The ones
+that load a program run the whole front end every time: the front-end cache
+under `.ply-cache` is written by `ply test`, `ply prove` and `ply review`, read
+back by them and by `ply cache`, and by nothing else.
 
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements; it prints `formatted PATH` per file it changed

@@ -36,11 +36,11 @@ const EFFECT: &str = "prover";
 const PAYLOAD: &str = "claims";
 
 const OPERATIONS: [(&str, &str); 5] = [
-    ("configure", "ply_cli::claims::configure"),
-    ("collected", "ply_cli::claims::collected"),
-    ("discharged", "ply_cli::claims::discharged"),
-    ("reviewed", "ply_cli::claims::reviewed"),
-    ("accepted", "ply_cli::claims::accepted"),
+    ("configure", "ply_machine::claims::configure"),
+    ("collected", "ply_machine::claims::collected"),
+    ("discharged", "ply_machine::claims::discharged"),
+    ("reviewed", "ply_machine::claims::reviewed"),
+    ("accepted", "ply_machine::claims::accepted"),
 ];
 
 /// A compiled body honours its call bound on the native stack, where unoptimised frames run to
