@@ -1760,7 +1760,7 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
          crates/ply-cli-tests/tests/suite/cli.rs was seen to fail.",
     ),
     (
-        "crates/ply-cli/src/run.rs",
+        "crates/ply-machine/src/runner.rs",
         "`evaluate`, installing what `ply run --backend` names on the machine that runs the \
          entry, over a project or over a `.plyx`. `ply run` has no result cache: nothing it \
          answers is a `Pass`, nothing is read before the entry and nothing is recorded after \
@@ -1770,7 +1770,7 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
          seen to fail, on the seam memo walking a scalar answer for parts.",
     ),
     (
-        "crates/ply-cli/src/artifact.rs",
+        "crates/ply-machine/src/artifact.rs",
         "`evaluate`, the same flag over a `.plyx`: the artifact's verified definitions run \
          under the backend, and an artifact run has no result cache either.",
     ),
