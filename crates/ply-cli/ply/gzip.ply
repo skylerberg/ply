@@ -1,0 +1,652 @@
+// gzip, written in Ply: the encoder the artifact writer seals units with, and a decoder that
+// makes the codec self-verifying — `gunzip(gzip(x))` is `x`, and the decoder reads what any
+// other gzip wrote (stored, fixed and dynamic deflate alike), which a pure-Ply reader of an
+// existing artifact wants.
+//
+// The encoder is greedy LZ77 over a hash table, with fixed-Huffman codes: the simple end of
+// deflate, within a fifth of `gzip -9` on the emitter's C, which is what a bundle carries.
+
+// --- CRC32 (IEEE), table-driven -------------------------------------------------
+
+fn crc_entry(n: Int) -> Int =
+  fold(range(0, 8), n, |acc: Int, _i: Int|
+    if acc & 1 == 1 { 0xEDB8_8320 ^ acc >>> 1 } else { acc >>> 1 })
+
+fn crc_table() -> List<Int> =
+  fold(range(0, 256), [], |acc: List<Int>, n: Int| push(acc, crc_entry(n)))
+
+// The CRC as a non-negative Int (it fits: 32 bits).
+pub fn crc32(data: Bytes) -> Int = crc_loop(crc_table(), data, 0, 0xFFFF_FFFF) ^ 0xFFFF_FFFF
+
+fn crc_loop(table: List<Int>, data: Bytes, i: Int, acc: Int) -> Int =
+  if i >= bytes_len(data) { acc } else {
+    match list_at(table, (acc ^ bytes_at(data, i)) & 0xFF) {
+      Some(entry) -> crc_loop(table, data, i + 1, entry ^ acc >>> 8),
+      None -> acc,
+    }
+  }
+
+// --- The bit writer: bits pack LSB-first into bytes -------------------------------
+
+// `buf` holds `bits` not-yet-written bits, the next one at the bottom. Codes never exceed 18
+// bits and the buffer drains below 8 after every write, so the shift never nears the top.
+type Out = { chunks: List<Bytes>, chunk: List<Int>, buf: Int, bits: Int }
+
+fn out_new() -> Out = { chunks: [], chunk: [], buf: 0, bits: 0 }
+
+fn emit(out: Out, value: Int, n: Int) -> Out =
+  drain({ ..out, buf: out.buf | value << out.bits, bits: out.bits + n })
+
+fn drain(out: Out) -> Out =
+  if out.bits >= 8 {
+    drain({ ..out, chunk: push(out.chunk, out.buf & 255), buf: out.buf >>> 8, bits: out.bits - 8 })
+  } else if len(out.chunk) >= 8192 { flush_chunk(out) }
+  else { out }
+
+fn flush_chunk(out: Out) -> Out =
+  if len(out.chunk) == 0 { out }
+  else { { ..out, chunks: push(out.chunks, bytes_of_ints(out.chunk)), chunk: [] } }
+
+fn bytes_of_ints(xs: List<Int>) -> Bytes = bytes_concat_all(map(xs, |b: Int| byte_of_int(b)))
+
+fn finish_out(out: Out) -> Bytes = {
+  let padded = if out.bits > 0 { { ..out, chunk: push(out.chunk, out.buf & 255), buf: 0, bits: 0 } }
+  else { out };
+  bytes_concat_all(flush_chunk(padded).chunks)
+}
+
+// --- Fixed-Huffman codes ------------------------------------------------------------
+
+// The code for a literal/length symbol, before the bit-reversal deflate writes them in.
+fn lit_code(sym: Int) -> { code: Int, bits: Int } =
+  if sym < 144 { { code: 0x30 + sym, bits: 8 } }
+  else if sym < 256 { { code: 0x190 + (sym - 144), bits: 9 } }
+  else if sym < 280 { { code: sym - 256, bits: 7 } }
+  else { { code: 0xC0 + (sym - 280), bits: 8 } }
+
+fn reverse_bits(x: Int, n: Int) -> Int =
+  if n <= 0 { 0 } else { (x & 1) << n - 1 | reverse_bits(x >>> 1, n - 1) }
+
+// A Huffman code, most-significant bit first, as deflate packs it.
+fn emit_code(out: Out, code: Int, n: Int) -> Out = emit(out, reverse_bits(code, n), n)
+
+fn emit_lit(out: Out, sym: Int) -> Out = {
+  let c = lit_code(sym);
+  emit_code(out, c.code, c.bits)
+}
+
+// The length and distance tables, index-aligned: base value and extra-bit count per code.
+fn len_base() -> List<Int> =
+  [
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    13,
+    15,
+    17,
+    19,
+    23,
+    27,
+    31,
+    35,
+    43,
+    51,
+    59,
+    67,
+    83,
+    99,
+    115,
+    131,
+    163,
+    195,
+    227,
+    258,
+  ]
+
+fn len_extra() -> List<Int> =
+  [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+
+fn dist_base() -> List<Int> =
+  [
+    1,
+    2,
+    3,
+    4,
+    5,
+    7,
+    9,
+    13,
+    17,
+    25,
+    33,
+    49,
+    65,
+    97,
+    129,
+    193,
+    257,
+    385,
+    513,
+    769,
+    1025,
+    1537,
+    2049,
+    3073,
+    4097,
+    6145,
+    8193,
+    12289,
+    16385,
+    24577,
+  ]
+
+fn dist_extra() -> List<Int> =
+  [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+
+// The table index of the code covering `v`: the last whose base does not exceed it.
+fn code_index(base: List<Int>, v: Int, at: Int, best: Int) -> Int =
+  match list_at(base, at) {
+    None -> best,
+    Some(b) -> if b <= v { code_index(base, v, at + 1, at) } else { best },
+  }
+
+fn emit_match(out: Out, length: Int, dist: Int) -> Out = {
+  let li = code_index(len_base(), length, 0, 0);
+  let le = match list_at(len_extra(), li) { Some(e) -> e, None -> 0 };
+  let lb = match list_at(len_base(), li) { Some(b) -> b, None -> 3 };
+  let out1 = emit_lit(out, 257 + li);
+  let out2 = emit(out1, length - lb, le);
+  let di = code_index(dist_base(), dist, 0, 0);
+  let de = match list_at(dist_extra(), di) { Some(e) -> e, None -> 0 };
+  let db = match list_at(dist_base(), di) { Some(b) -> b, None -> 1 };
+  let out3 = emit_code(out2, di, 5);
+  emit(out3, dist - db, de)
+}
+
+// --- The encoder: greedy LZ77 over a hash of three bytes ------------------------------
+
+// The table is one entry of `None` per hash; positions are stored +1 so 0 reads as empty.
+fn table_new() -> List<Int> = map(range(0, 32768), |_i: Int| -1)
+
+fn hash3(data: Bytes, i: Int) -> Int =
+  wrap_mul(bytes_at(data, i) | bytes_at(data, i + 1) << 8 | bytes_at(data, i + 2) << 16, 2654435761)
+    >>> 13
+    & 32767
+
+fn match_len(data: Bytes, a: Int, b: Int, max: Int, acc: Int) -> Int =
+  if acc >= max { acc }
+  else if bytes_at(data, a + acc) == bytes_at(data, b + acc) { match_len(data, a, b, max, acc + 1) }
+  else { acc }
+
+fn insert1(table: List<Int>, data: Bytes, i: Int, n: Int) -> List<Int> =
+  if i + 3 > n { table } else { list_set(table, hash3(data, i), i + 1) }
+
+// The positions a match of `l` at `i` crosses, each into the table: the next scan finds them.
+fn insert_span(table: List<Int>, data: Bytes, from: Int, to: Int, n: Int) -> List<Int> =
+  if from >= to { table }
+  else if from + 3 > n { table }
+  else { insert_span(list_set(table, hash3(data, from), from + 1), data, from + 1, to, n) }
+
+type Scan = { out: Out, table: List<Int>, i: Int }
+
+fn scan(data: Bytes, s: Scan) -> Out = {
+  let n = bytes_len(data);
+  if s.i >= n { s.out }
+  else if s.i + 3 > n { scan(data, { ..s, out: emit_lit(s.out, bytes_at(data, s.i)), i: s.i + 1 }) } else {
+    let h = hash3(data, s.i);
+    let cand = (match list_at(s.table, h) { Some(p) -> p, None -> -1 }) - 1;
+    let ahead = n - s.i;
+    let best = if cand >= 0 && s.i - cand <= 32768 {
+      match_len(data, cand, s.i, min(258, ahead), 0)
+    } else { 0 };
+    if best >= 3 && s.i + 3 < n
+        && match_at(data, insert1(s.table, data, s.i, n), s.i + 1, n) > best {
+      // A longer match starts one byte later: this byte goes out as a literal instead.
+      scan(data, {
+        out: emit_lit(s.out, bytes_at(data, s.i)),
+        table: insert1(s.table, data, s.i, n),
+        i: s.i + 1,
+      })
+    } else if best >= 3 {
+      scan(data, {
+        out: emit_match(s.out, best, s.i - cand),
+        table: insert_span(s.table, data, s.i, s.i + best, n),
+        i: s.i + best,
+      })
+    } else {
+      scan(data, {
+        out: emit_lit(s.out, bytes_at(data, s.i)),
+        table: list_set(s.table, h, s.i + 1),
+        i: s.i + 1,
+      })
+    }
+  }
+}
+
+// The match at the next position, when one is on the table: lazy matching's one look ahead.
+fn match_at(data: Bytes, table: List<Int>, i: Int, n: Int) -> Int = {
+  let h = hash3(data, i);
+  let cand = (match list_at(table, h) { Some(p) -> p, None -> -1 }) - 1;
+  if cand >= 0 && i - cand <= 32768 { match_len(data, cand, i, min(258, n - i), 0) } else { 0 }
+}
+
+// One final fixed-Huffman block for the whole input: artifacts are one unit, so no streaming.
+fn deflate(data: Bytes) -> Bytes = {
+  // BFINAL = 1, then BTYPE = 01 (fixed) in two bits, LSB-first.
+  let out = emit(out_new(), 1, 1);
+  let out1 = emit(out, 1, 2);
+  let body = scan(data, { out: out1, table: table_new(), i: 0 });
+  let ended = emit_lit(body, 256);
+  finish_out(ended)
+}
+
+// --- The gzip wrapper -----------------------------------------------------------------
+
+fn header() -> Bytes = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff"
+
+fn le32(n: Int) -> Bytes =
+  bytes_concat_all([
+    byte_of_int(n & 255),
+    byte_of_int(n >>> 8 & 255),
+    byte_of_int(n >>> 16 & 255),
+    byte_of_int(n >>> 24 & 255),
+  ])
+
+pub fn gzip(data: Bytes) -> Bytes =
+  bytes_concat_all([header(), deflate(data), le32(crc32(data)), le32(bytes_len(data) % 4294967296)])
+
+// --- The bit reader: an absolute bit position into the bytes ---------------------------
+
+fn read_bit(data: Bytes, bit: Int) -> Int = bytes_at(data, bit / 8) >>> bit % 8 & 1
+
+// `n` bits packed LSB-first, and the position past them.
+fn read_bits(data: Bytes, bit: Int, n: Int) -> { bit: Int, value: Int } =
+  fold(range(0, n), { bit: bit, value: 0 }, |acc: { bit: Int, value: Int }, i: Int|
+    { bit: acc.bit + 1, value: acc.value | read_bit(data, acc.bit) << i })
+
+// --- Canonical Huffman, from a length per symbol ------------------------------------------
+
+// Indexed by code length (1..=15; index 0 goes unused): `counts` how many symbols have it,
+// `firsts` the first code of it canonically, `offsets` where its symbols start in `syms`, which
+// holds every symbol sorted by (length, symbol).
+type Huff = { counts: List<Int>, firsts: List<Int>, offsets: List<Int>, syms: List<Int> }
+
+fn zeros(n: Int) -> List<Int> = map(range(0, n), |_i: Int| 0)
+
+fn push_front(x: Int, xs: List<Int>) -> List<Int> =
+  fold(xs, [x], |acc: List<Int>, y: Int| push(acc, y))
+
+fn at_or0(xs: List<Int>, i: Int) -> Int = match list_at(xs, i) { Some(x) -> x, None -> 0 }
+
+fn count_lengths(lengths: List<Int>, at: Int, counts: List<Int>) -> List<Int> =
+  match list_at(lengths, at) {
+    None -> counts,
+    Some(l) -> if l == 0 { count_lengths(lengths, at + 1, counts) }
+    else { count_lengths(lengths, at + 1, list_set(counts, l, at_or0(counts, l) + 1)) },
+  }
+
+// The canonical first codes, indexed by length: code = (code + count of the length before) << 1.
+fn first_codes(counts: List<Int>, l: Int, code: Int, acc: List<Int>) -> List<Int> =
+  if l > 15 { acc } else {
+    let next = code + at_or0(counts, l - 1) << 1;
+    first_codes(counts, l + 1, next, push(acc, next))
+  }
+
+// Where each length's symbols start in `syms`, indexed by length.
+fn offsets_of(counts: List<Int>, l: Int, at: Int, acc: List<Int>) -> List<Int> =
+  if l > 15 { acc } else {
+    let here = at + at_or0(counts, l - 1);
+    offsets_of(counts, l + 1, here, push(acc, here))
+  }
+
+// The symbols in (length, symbol) order: a stable placement pass over the lengths.
+fn place_syms(lengths: List<Int>, at: Int, next: List<Int>, syms: List<Int>) -> List<Int> =
+  match list_at(lengths, at) {
+    None -> syms,
+    Some(l) -> if l == 0 { place_syms(lengths, at + 1, next, syms) } else {
+      place_syms(
+        lengths,
+        at + 1,
+        list_set(next, l, at_or0(next, l) + 1),
+        list_set(syms, at_or0(next, l), at),
+      )
+    },
+  }
+
+fn build_huff(lengths: List<Int>) -> Huff = {
+  let counts = count_lengths(lengths, 0, zeros(16));
+  let firsts = push_front(0, first_codes(counts, 1, 0, []));
+  let offsets = push_front(0, offsets_of(counts, 1, 0, []));
+  let syms = place_syms(lengths, 0, offsets, zeros(len(lengths)));
+  { counts: counts, firsts: firsts, offsets: offsets, syms: syms }
+}
+
+// One symbol: a bit at a time, most-significant first, until the code lands in a length's span.
+fn decode_sym(
+  data: Bytes,
+  bit: Int,
+  h: Huff,
+  len: Int,
+  code: Int,
+) -> Option<{ bit: Int, sym: Int }> =
+  if len > 15 { None } else {
+    let c = code * 2 + read_bit(data, bit);
+    let first = at_or0(h.firsts, len);
+    if c >= first && c - first < at_or0(h.counts, len) {
+      match list_at(h.syms, at_or0(h.offsets, len) + c - first) {
+        Some(sym) -> Some({ bit: bit + 1, sym: sym }),
+        None -> None,
+      }
+    } else { decode_sym(data, bit + 1, h, len + 1, c) }
+  }
+
+// --- The output window: every byte written, and the last 32768 of them ---------------------
+
+type Window = { chunks: List<Bytes>, chunk: List<Int>, ring: List<Int>, pos: Int }
+
+fn window_new() -> Window = { chunks: [], chunk: [], ring: zeros(32768), pos: 0 }
+
+fn emit_byte(w: Window, b: Int) -> Window = {
+  let with_chunk = push_chunk_if_full({ ..w, chunk: push(w.chunk, b) });
+  {
+    ..with_chunk,
+    ring: list_set(with_chunk.ring, with_chunk.pos % 32768, b),
+    pos: with_chunk.pos + 1,
+  }
+}
+
+fn push_chunk_if_full(w: Window) -> Window =
+  if len(w.chunk) >= 8192 { { ..w, chunks: push(w.chunks, bytes_of_ints(w.chunk)), chunk: [] } }
+  else { w }
+
+fn ring_at(w: Window, back: Int) -> Int =
+  match list_at(w.ring, (w.pos - back) % 32768) { Some(b) -> b, None -> 0 }
+
+// A match copies from the window a byte at a time, so overlap (dist < length) repeats, as it must.
+fn copy_match(w: Window, dist: Int, length: Int, k: Int) -> Window =
+  if k >= length { w } else { copy_match(emit_byte(w, ring_at(w, dist)), dist, length, k + 1) }
+
+fn window_bytes(w: Window) -> Bytes = bytes_concat_all(push(w.chunks, bytes_of_ints(w.chunk)))
+
+// --- The deflate blocks ---------------------------------------------------------------------
+
+// Fixed-block code lengths: literals 0-143 in 8 bits, 144-255 in 9, 256-279 in 7, 280-287 in 8;
+// distances all in 5.
+fn fixed_lit_lengths() -> List<Int> =
+  map(range(0, 288), |i: Int|
+    if i < 144 { 8 } else if i < 256 { 9 } else if i < 280 { 7 } else { 8 })
+
+fn fixed_dist_lengths() -> List<Int> = map(range(0, 30), |_i: Int| 5)
+
+type Inflated = { bit: Int, window: Window }
+
+fn inflate(data: Bytes, bit: Int) -> Result<Bytes, String> =
+  match blocks(data, bit, window_new()) {
+    Ok(done) -> Ok(window_bytes(done.window)),
+    Err(why) -> Err(why),
+  }
+
+fn blocks(data: Bytes, bit: Int, w: Window) -> Result<Inflated, String> = {
+  let head = read_bits(data, bit, 3);
+  let final = head.value & 1;
+  let btype = head.value >>> 1;
+  match block(data, head.bit, btype, w) {
+    Ok(next) -> if final == 1 { Ok(next) } else { blocks(data, next.bit, next.window) },
+    Err(why) -> Err(why),
+  }
+}
+
+fn block(data: Bytes, bit: Int, btype: Int, w: Window) -> Result<Inflated, String> =
+  if btype == 0 { stored_block(data, bit, w) } else if btype == 1 {
+    symbols(data, bit, w, build_huff(fixed_lit_lengths()), build_huff(fixed_dist_lengths()))
+  } else if btype == 2 { dynamic_block(data, bit, w) }
+  else { Err("a deflate block of type 3 is not deflate") }
+
+// Stored: to the next byte, then LEN bytes verbatim (NLEN is its complement).
+fn stored_block(data: Bytes, bit: Int, w: Window) -> Result<Inflated, String> = {
+  let at = (bit + 7) / 8;
+  if at + 4 > bytes_len(data) { Err("a stored block without its length") } else {
+    let len = bytes_at(data, at) | bytes_at(data, at + 1) << 8;
+    let nlen = bytes_at(data, at + 2) | bytes_at(data, at + 3) << 8;
+    if len ^ nlen != 65535 { Err("a stored block whose NLEN is not its LEN's complement") }
+    else { Ok({ bit: (at + 4 + len) * 8, window: copy_verbatim(w, data, at + 4, len) }) }
+  }
+}
+
+fn copy_verbatim(w: Window, data: Bytes, at: Int, left: Int) -> Window =
+  if left <= 0 { w }
+  else { copy_verbatim(emit_byte(w, bytes_at(data, at)), data, at + 1, left - 1) }
+
+fn symbols(data: Bytes, bit: Int, w: Window, lit: Huff, dist: Huff) -> Result<Inflated, String> =
+  match decode_sym(data, bit, lit, 1, 0) {
+    None -> Err("a Huffman code no table holds"),
+    Some(found) -> if found.sym < 256 {
+      symbols(data, found.bit, emit_byte(w, found.sym), lit, dist)
+    } else if found.sym == 256 { Ok({ bit: found.bit, window: w }) } else {
+      match match_bounds(data, found.bit, found.sym - 257, dist) {
+        None -> Err("a match code no table holds"),
+        Some(m) -> symbols(data, m.bit, copy_match(w, m.dist, m.length, 0), lit, dist),
+      }
+    },
+  }
+
+fn match_bounds(
+  data: Bytes,
+  bit: Int,
+  li: Int,
+  dist: Huff,
+) -> Option<{ bit: Int, length: Int, dist: Int }> = {
+  let le = at_or0(len_extra(), li);
+  let lb = at_or0(len_base(), li);
+  let length = read_bits(data, bit, le);
+  match decode_sym(data, length.bit, dist, 1, 0) {
+    None -> None,
+    Some(ds) -> {
+      let de = at_or0(dist_extra(), ds.sym);
+      let db = at_or0(dist_base(), ds.sym);
+      let d = read_bits(data, ds.bit, de);
+      Some({ bit: d.bit, length: lb + length.value, dist: db + d.value })
+    },
+  }
+}
+
+// Dynamic: the two alphabets' code lengths are themselves Huffman-coded.
+fn dynamic_block(data: Bytes, bit: Int, w: Window) -> Result<Inflated, String> = {
+  let counts = read_bits(data, bit, 14);
+  let hlit = (counts.value & 31) + 257;
+  let hdist = (counts.value >>> 5 & 31) + 1;
+  let hclen = (counts.value >>> 10 & 15) + 4;
+  let cl_lengths = read_code_lengths(data, counts.bit, hclen, 0, zeros(19));
+  let cl = build_huff(cl_lengths);
+  match read_lengths(data, counts.bit + hclen * 3, cl, hlit + hdist, []) {
+    None -> Err("dynamic block code lengths that do not parse"),
+    Some(all) -> if len(all.lengths) != hlit + hdist {
+      Err("a dynamic block short of its code lengths")
+    } else {
+      symbols(
+        data,
+        all.bit,
+        w,
+        build_huff(take(all.lengths, hlit)),
+        build_huff(drop_take(all.lengths, hlit)),
+      )
+    },
+  }
+}
+
+// The code-length code's lengths, in their permuted order: 16, 17, 18, 0, 8, 7, 9, ...
+fn cl_order() -> List<Int> = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+fn read_code_lengths(data: Bytes, bit: Int, left: Int, at: Int, acc: List<Int>) -> List<Int> =
+  if left <= 0 { acc } else {
+    let v = read_bits(data, bit, 3);
+    match list_at(cl_order(), at) {
+      Some(slot) -> read_code_lengths(data, v.bit, left - 1, at + 1, list_set(acc, slot, v.value)),
+      None -> acc,
+    }
+  }
+
+// The lit/dist code lengths: a length, a repeat of the one before (16), or a run of zeros
+// (17, 18).
+fn read_lengths(
+  data: Bytes,
+  bit: Int,
+  cl: Huff,
+  want: Int,
+  acc: List<Int>,
+) -> Option<{ bit: Int, lengths: List<Int> }> =
+  if len(acc) >= want { Some({ bit: bit, lengths: acc }) } else {
+    match decode_sym(data, bit, cl, 1, 0) {
+      None -> None,
+      Some(found) -> if found.sym < 16 {
+        read_lengths(data, found.bit, cl, want, push(acc, found.sym))
+      } else if found.sym == 16 {
+        match list_at(acc, len(acc) - 1) {
+          None -> None,
+          Some(prev) -> {
+            let extra = read_bits(data, found.bit, 2);
+            read_lengths(data, extra.bit, cl, want, append_n(acc, prev, 3 + extra.value))
+          },
+        }
+      } else if found.sym == 17 {
+        let extra = read_bits(data, found.bit, 3);
+        read_lengths(data, extra.bit, cl, want, append_n(acc, 0, 3 + extra.value))
+      } else {
+        let extra = read_bits(data, found.bit, 7);
+        read_lengths(data, extra.bit, cl, want, append_n(acc, 0, 11 + extra.value))
+      },
+    }
+  }
+
+fn append_n(acc: List<Int>, v: Int, n: Int) -> List<Int> =
+  if n <= 0 { acc } else { append_n(push(acc, v), v, n - 1) }
+
+fn take(xs: List<Int>, n: Int) -> List<Int> =
+  if n <= 0 { [] } else { match xs { [] -> [], [x, ..rest] -> push(take(rest, n - 1), x) } }
+
+fn drop_take(xs: List<Int>, n: Int) -> List<Int> =
+  if n <= 0 { xs } else { match xs { [] -> [], [_x, ..rest] -> drop_take(rest, n - 1) } }
+
+// --- The gzip wrapper, read back ---------------------------------------------------------------
+
+pub fn gunzip(data: Bytes) -> Result<Bytes, String> =
+  match header_end(data, 10) {
+    Err(why) -> Err(why),
+    Ok(at) -> match inflate(data, at * 8) {
+      Err(why) -> Err(why),
+      Ok(out) -> check_trailer(data, out),
+    },
+  }
+
+fn header_end(data: Bytes, at: Int) -> Result<Int, String> =
+  if bytes_len(data) < 18 { Err("too short to be gzip") }
+  else if bytes_at(data, 0) != 0x1F || bytes_at(data, 1) != 0x8B { Err("not gzip: bad magic") }
+  else if bytes_at(data, 2) != 8 { Err("not gzip: the method is not deflate") } else {
+    let flags = bytes_at(data, 3);
+    skip_extras(data, at, flags)
+  }
+
+fn skip_extras(data: Bytes, at: Int, flags: Int) -> Result<Int, String> =
+
+  // FEXTRA(4) carries a length; FNAME(8) and FCOMMENT(16) end at a zero; FHCRC(2) is two bytes.
+  if flags & 4 == 4 {
+    let len = bytes_at(data, at) | bytes_at(data, at + 1) << 8;
+    skip_extras(data, at + 2 + len, flags - 4)
+  } else if flags & 8 == 8 { skip_zeroed(data, at, flags - 8) }
+  else if flags & 16 == 16 { skip_zeroed(data, at, flags - 16) }
+  else if flags & 2 == 2 { Ok(at + 2) }
+  else { Ok(at) }
+
+fn skip_zeroed(data: Bytes, at: Int, flags: Int) -> Result<Int, String> =
+  if at >= bytes_len(data) { Err("a gzip header field without its zero") }
+  else if bytes_at(data, at) == 0 { skip_extras(data, at + 1, flags) }
+  else { skip_zeroed(data, at + 1, flags) }
+
+fn check_trailer(data: Bytes, out: Bytes) -> Result<Bytes, String> = {
+  let n = bytes_len(data);
+  let crc = bytes_at(data, n - 8) | bytes_at(data, n - 7) << 8 | bytes_at(data, n - 6) << 16
+    | bytes_at(data, n - 5) << 24;
+  let size = bytes_at(data, n - 4) | bytes_at(data, n - 3) << 8 | bytes_at(data, n - 2) << 16
+    | bytes_at(data, n - 1) << 24;
+  if crc32(out) != crc { Err("the CRC32 does not match: the stream is not whole") }
+  else if size != bytes_len(out) % 4294967296 { Err("the size does not match") }
+  else { Ok(out) }
+}
+
+// --- Tests ------------------------------------------------------------------------
+
+fn roundtrip(data: Bytes) -> Bool =
+  match gunzip(gzip(data)) { Ok(back) -> back == data, Err(_) -> false }
+
+fn repeat(unit: Bytes, n: Int) -> Bytes = bytes_concat_all(map(range(0, n), |_i: Int| unit))
+
+test "crc32 of the known vector" { assert_eq(crc32(b"123456789"), 0xCBF4_3926) }
+
+test "the empty input round-trips" {
+  assert(roundtrip(b""));
+  assert_eq(bytes_len(gzip(b"")), 20)
+}
+
+test "a literal-only input round-trips" {
+  assert(roundtrip(b"hello, world"));
+  assert(roundtrip(b"abcdefghijklmnop"))
+}
+
+test "a repetitive input matches and round-trips" {
+  let text = repeat(b"the rain in spain falls mainly on the plain. ", 400);
+  assert(roundtrip(text));
+  // 18KB of that compresses to far less than half.
+  assert(bytes_len(gzip(text)) < 9000)
+}
+
+test "an overlapping match round-trips: the copy reads what it just wrote" {
+  assert(roundtrip(repeat(b"abc", 2000)));
+  assert(roundtrip(repeat(b"x", 70000)))
+}
+
+test "every byte value, cycling, round-trips" {
+  let all = bytes_concat_all(map(range(0, 256), |i: Int| byte_of_int(i)));
+  assert(roundtrip(bytes_concat_all(map(range(0, 40), |_i: Int| all))))
+}
+
+test "a long match crosses the 258 cap and the chunk flush" {
+  assert(roundtrip(repeat(b"0123456789", 12000)))
+}
+
+test "the decoder reads a stored block" {
+  let got = gunzip(
+    b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x04\xff\x01\x1a\x00\xe5\xff\x73\x74\x6f\x72\x65\x64\x20\x62\x79\x74\x65\x73\x2c\x20\x75\x6e\x63\x6f\x6d\x70\x72\x65\x73\x73\x65\x64\xe4\x81\x41\x55\x1a\x00\x00\x00",
+  );
+  assert_eq(got, Ok(b"stored bytes, uncompressed"))
+}
+
+test "the decoder reads a dynamic-Huffman stream another gzip wrote" {
+  let got = gunzip(
+    b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x0b\xc9\x48\x55\x28\x2c\xcd\x4c\xce\x56\x48\x2a\xca\x2f\xcf\x53\x48\xcb\xaf\x50\xc8\x2a\xcd\x2d\x28\x56\xc8\x2f\x4b\x2d\x52\x28\x01\x4a\xe7\x24\x56\x55\x2a\xa4\xe4\xa7\xeb\x29\x84\x0c\x0e\xc5\x00\x1b\x8d\xff\x44\xb4\x00\x00\x00",
+  );
+  assert_eq(got, Ok(repeat(b"The quick brown fox jumps over the lazy dog. ", 4)))
+}
+
+test "a corrupt trailer is refused" {
+  let good = gzip(b"check me");
+  let bad = bytes_concat(
+    bytes_slice(good, 0, bytes_len(good) - 8),
+    b"\x00\x00\x00\x00\x00\x00\x00\x00",
+  );
+  match gunzip(bad) { Err(_) -> (), Ok(_) -> panic("a zeroed trailer must not verify") }
+}
+
+test "a header carrying a name is read past" {
+  // FLG=8 (FNAME), then "name.gz\0", then the stream of `gzip(b"hi")` with its header cut.
+  let named = bytes_concat_all([
+    b"\x1f\x8b\x08\x08\x00\x00\x00\x00\x00\xffname.gz\x00",
+    bytes_slice(gzip(b"hi"), 10, bytes_len(gzip(b"hi"))),
+  ]);
+  assert_eq(gunzip(named), Ok(b"hi"))
+}

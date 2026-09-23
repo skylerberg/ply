@@ -34,6 +34,7 @@ pub const PROGRAM_SOURCES: &[(&str, &str)] = &[
     ("entry", include_str!("../ply/entry.ply")),
     ("explain", include_str!("../ply/explain.ply")),
     ("fmt", include_str!("../ply/fmt.ply")),
+    ("gzip", include_str!("../ply/gzip.ply")),
     ("hashes", include_str!("../ply/hashes.ply")),
     ("hosts", include_str!("../ply/hosts.ply")),
     ("ply", include_str!("../ply/ply.ply")),
