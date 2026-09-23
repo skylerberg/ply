@@ -1,6 +1,5 @@
 //! How a run is told what its configuration is, and what it refuses before it starts.
 
-use clap::Args;
 use ply_host::config::{Key, Shape, Snapshot, Sources, Spec};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_ty::CheckOutput;
@@ -9,34 +8,14 @@ use serde_json::{Value as Json, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Configuration sources; the environment is read with no `PLY_` prefix or case translation.
-#[derive(Args, Clone, Debug, Default)]
+/// Configuration sources, as plain data the machines read; the shell's flags convert into this.
+#[derive(Clone, Debug, Default)]
 pub struct ConfigOptions {
     /// A configuration value: `--set DESK_REGION=eu`. Repeatable; highest precedence, last wins.
-    #[arg(
-        id = "config_set",
-        long = "set",
-        value_name = "KEY=VALUE",
-        requires = "host"
-    )]
     pub set: Vec<String>,
-
     /// A `KEY=VALUE` file, one pair per line, no quoting. Repeatable; a later file wins.
-    #[arg(
-        id = "config_files",
-        long = "config",
-        value_name = "PATH",
-        requires = "host"
-    )]
     pub files: Vec<PathBuf>,
-
     /// `<module>.<fn>`: a nullary pure function returning a `ConfigSpec`, checked at start-up.
-    #[arg(
-        id = "config_schema",
-        long = "config-schema",
-        value_name = "MODULE.FN",
-        requires = "host"
-    )]
     pub schema: Option<String>,
 }
 
@@ -116,7 +95,7 @@ impl Configuration {
         let mut parts = vec![format!(
             "{} {}",
             counts.keys,
-            crate::commands::common::plural(counts.keys, "key")
+            crate::support::plural(counts.keys, "key")
         )];
         for (n, what) in [
             (counts.environment, "environment"),

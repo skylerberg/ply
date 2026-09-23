@@ -35,7 +35,7 @@ impl Run {
         let prover = Prover::new(&loaded)
             .expect("the port lowers the claims")
             .with_backend(
-                ply_cli::commands::common::prover_backend(None, &loaded)
+                ply_machine::support::prover_backend(None, &loaded)
                     .expect("the program compiles to a tier"),
             );
         let results = collected
@@ -152,7 +152,7 @@ fn a_certificate_over_a_hidden_float_is_refuted_by_sampling() {
     let prover = Prover::new(&loaded)
         .expect("the port lowers the claims")
         .with_backend(
-            ply_cli::commands::common::prover_backend(None, &loaded)
+            ply_machine::support::prover_backend(None, &loaded)
                 .expect("the program compiles to a tier"),
         );
     let wide = ProvePlan {

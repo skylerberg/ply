@@ -9,8 +9,26 @@ use std::path::Path;
 pub fn execute(args: &RunArgs, style: Style) -> i32 {
     // The load, the artifact, the host binding and the entry itself stay behind the effect the
     // program performs; the program is lent what each step did and enters nothing of its own.
+    let options = ply_machine::runner::RunOptions {
+        path: args.path.clone(),
+        argv: args.argv.clone(),
+        json: args.json,
+        steps: args.steps,
+        timeout: args.timeout,
+        seed: args.seed.clone(),
+        host: args.host,
+        tls: (&args.tls).into(),
+        fs: args.fs.fs.clone(),
+        exec: args.exec.exec.clone(),
+        db: (&args.db).into(),
+        config: (&args.config).into(),
+        trace: (&args.trace).into(),
+        shutdown: (&args.shutdown).into(),
+        backend: args.backend.clone(),
+        profile: args.profile.clone(),
+    };
     let binds = Binds {
-        lent: crate::run::lent(args),
+        lent: crate::run::lent(&options),
         ..Binds::default()
     };
     run(
