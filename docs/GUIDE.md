@@ -179,6 +179,31 @@ Items are private unless `pub` (`E0107`). `pub` applies to `fn`, `type` and
 binders are separate namespaces, so `fn size`, `type Size` and `effect size`
 coexist.
 
+### 3.3 Packages and the manifest
+
+A project root may hold a `ply.pkg` file: the package's manifest, exactly one
+definition whose body is a literal of `std.pkg`'s `Manifest` (§13.15):
+
+```ply
+import std.pkg (Manifest)
+
+fn package() -> Manifest = {
+  name: "orders",
+  version: {major: 0, minor: 1, patch: 0},
+  prefix: None,
+  runtime: {major: 0, minor: 1, patch: 0},
+  dependencies: [],
+  entry: None,
+}
+```
+
+The body is data, not code: a literal, a constructor applied to literals, a
+record or a list — the judgment §3.1 states for parameter defaults — refused
+with `E0130` otherwise, as a manifest with any other shape is `E0129` and a
+field that does not decode or fails validation is `E0131`. A project without
+`ply.pkg` is the anonymous package. The manifest is checked on every load;
+its fields become meaningful as the package system grows.
+
 ## 4. Types
 
 Types are inferred by Hindley–Milner unification with row polymorphism. Written
