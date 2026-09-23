@@ -248,7 +248,7 @@ fn compacted(scope: &CacheScope) -> Result<Compacted, Refused> {
                     .source_keys()
                     .into_iter()
                     .map(PathBuf::from)
-                    .filter(|p| crate::shipped::is_pseudo_path(p)),
+                    .filter(|p| ply_machine::shelf::is_pseudo_path(p)),
             );
             keep
         }
