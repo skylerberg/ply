@@ -28,6 +28,8 @@ pub const NET: &str = include_str!("../ply/net.ply");
 
 pub const PATH: &str = include_str!("../ply/path.ply");
 
+pub const PKG: &str = include_str!("../ply/pkg.ply");
+
 pub const PROCESS: &str = include_str!("../ply/process.ply");
 
 pub const ROUTER: &str = include_str!("../ply/router.ply");
@@ -49,6 +51,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("std.json", JSON),
     ("std.net", NET),
     ("std.path", PATH),
+    ("std.pkg", PKG),
     ("std.process", PROCESS),
     ("std.router", ROUTER),
     ("std.signal", SIGNAL),
