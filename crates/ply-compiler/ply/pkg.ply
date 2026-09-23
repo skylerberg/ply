@@ -1,0 +1,330 @@
+// The manifest: a `ply.pkg` file is one literal of std.pkg's Manifest, checked here so the
+// driver and `ply resolve` read a value rather than a parse tree. The literal judgment is the
+// one §3.1 states for parameter defaults: a literal, a constructor applied to literals, a
+// record or a list.
+
+import spine (Span, PDiag, diag1, dummy_span)
+import items (Module, IFn, FnDef, item_span, parse)
+import exprs (Expr, ELit, EVar, EApp, ERecord, EList, RecField, expr_span)
+import patterns (LInt, LBool, LStr, LUnit)
+import types (TCon, ty_span)
+import std.json (Json, Null, Bool, Number, Str, Member, object, array, variant, error_to_string)
+import std.pkg (Manifest, Version, Dep, Path, Registry, manifest_json)
+
+pub type Checked = { manifest: Option<Manifest>, diags: List<PDiag> }
+
+pub fn check_source(src: Bytes) -> Checked = check(parse(src).node)
+
+fn at<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the tables do not hold") }
+
+pub fn check(m: Module) -> Checked =
+  match m.items {
+    [one] -> match one {
+      IFn(d) -> if d.name.name == b"package" { check_fn(d) }
+      else { refused(shape(d.name.span, b"a manifest's one definition is named `package`")) },
+      _ -> refused(shape(item_span(one), b"a manifest holds a `fn package`, nothing else")),
+    },
+    [] -> refused(shape(dummy_span(), b"a manifest defines `package`; this file defines nothing")),
+    [_, two, ..rest] ->
+      refused(shape(item_span(two), b"a manifest defines `package` and nothing else")),
+  }
+
+fn refused(d: PDiag) -> Checked = { manifest: None, diags: [d] }
+
+fn shape(here: Span, message: Bytes) -> PDiag =
+  diag1(b"E0129", here, message, b"not the shape a manifest takes", [
+    b"a `ply.pkg` file is exactly `fn package() -> Manifest = ...`, with std.pkg's Manifest",
+  ])
+
+fn cat(xs: List<PDiag>, ys: List<PDiag>) -> List<PDiag> =
+  fold(ys, xs, |acc: List<PDiag>, y: PDiag| push(acc, y))
+
+fn check_fn(d: FnDef) -> Checked = {
+  let ret_diags = match d.ret {
+    None ->
+      [
+        shape_msg(
+          d.name.span,
+          b"`package` declares its return type, std.pkg's `Manifest`",
+          b"no return type written",
+        ),
+      ],
+    Some(t) -> match t {
+      TCon(c) -> if c.name.name.name == b"Manifest" { [] } else {
+        [shape_msg(ty_span(t), b"`package` returns std.pkg's `Manifest`", b"not the manifest type")]
+      },
+      _ ->
+        [
+          shape_msg(
+            ty_span(t),
+            b"`package` returns std.pkg's `Manifest`",
+            b"not the manifest type",
+          ),
+        ],
+    },
+  };
+  let param_diags = if len(d.params) == 0 { [] } else {
+    [
+      shape_msg(
+        d.name.span,
+        b"`package` takes no parameters",
+        b"a manifest is data; nothing is passed in",
+      ),
+    ]
+  };
+  let diags = cat(ret_diags, param_diags);
+  if len(diags) > 0 { { manifest: None, diags: diags } } else { check_body(d) }
+}
+
+fn shape_msg(here: Span, message: Bytes, label: Bytes) -> PDiag =
+  diag1(b"E0129", here, message, label, [])
+
+fn check_body(d: FnDef) -> Checked =
+  match literal_json(d.body) {
+    Err(s) ->
+      {
+        manifest: None,
+        diags: [
+          diag1(
+            b"E0130",
+            s,
+            b"a manifest is a value, not something that runs",
+            b"not manifest data",
+            [b"a literal, a constructor applied to literals, a record or a list is fine"],
+          ),
+        ],
+      },
+    Ok(j) -> match manifest_json().decode(j) {
+      Err(e) ->
+        {
+          manifest: None,
+          diags: [
+            diag1(
+              b"E0131",
+              expr_span(d.body),
+              bytes_of_string(error_to_string(e)),
+              b"the manifest does not decode",
+              [],
+            ),
+          ],
+        },
+      Ok(m) -> validate(m, expr_span(d.body)),
+    },
+  }
+
+// `None` and `Some` encode the way the json derive encodes `Option`: null and the bare value.
+fn literal_json(e: Expr) -> Result<Json, Span> =
+  match e {
+    ELit(v) -> match v.lit {
+      LInt(n) -> Ok(Number(decimal_of_int(n))),
+      LBool(b) -> Ok(Bool(b)),
+      LStr(s) -> Ok(Str(string_of_bytes(s))),
+      LUnit -> Ok(Null),
+      _ -> Err(v.span),
+    },
+    ERecord(r) -> fields_json(r.fields, []),
+    EList(l) -> match items_json(l.items, []) { Err(s) -> Err(s), Ok(items) -> Ok(array(items)) },
+    EApp(a) -> match a.func {
+      EVar(f) -> if len(a.named) == 0 && len(a.labels) == 0 && is_ctor(f.name.name.name) {
+        ctor_json(a.span, f.name.name.name, a.args)
+      } else { Err(a.span) },
+      _ -> Err(a.span),
+    },
+    EVar(v) -> if v.name.name.name == b"None" { Ok(Null) }
+    else if is_ctor(v.name.name.name) { Ok(variant(string_of_bytes(v.name.name.name), [])) }
+    else { Err(v.span) },
+    _ -> Err(expr_span(e)),
+  }
+
+fn ctor_json(here: Span, tag: Bytes, args: List<Expr>) -> Result<Json, Span> =
+  if tag == b"Some" { match args { [x] -> literal_json(x), _ -> Err(here) } } else {
+    match items_json(args, []) {
+      Err(s) -> Err(s),
+      Ok(values) -> Ok(variant(string_of_bytes(tag), values)),
+    }
+  }
+
+fn items_json(xs: List<Expr>, acc: List<Json>) -> Result<List<Json>, Span> =
+  match xs {
+    [] -> Ok(acc),
+    [x, ..rest] -> match literal_json(x) {
+      Err(s) -> Err(s),
+      Ok(j) -> items_json(rest, push(acc, j)),
+    },
+  }
+
+fn fields_json(fs: List<RecField>, acc: List<Member>) -> Result<Json, Span> =
+  match fs {
+    [] -> Ok(object(acc)),
+    [f, ..rest] -> match literal_json(f.value) {
+      Err(s) -> Err(s),
+      Ok(j) -> fields_json(rest, push(acc, { key: string_of_bytes(f.name.name), value: j })),
+    },
+  }
+
+fn is_ctor(name: Bytes) -> Bool =
+  bytes_len(name) > 0 && bytes_at(name, 0) >= 65 && bytes_at(name, 0) <= 90
+
+fn validate(m: Manifest, here: Span) -> Checked = {
+  let bad = field_diag(here);
+  let name_diags = if bytes_len(bytes_of_string(m.name)) == 0 {
+    [bad(b"a manifest's `name` must not be empty")]
+  } else { [] };
+  let prefix = match m.prefix { None -> m.name, Some(p) -> p };
+  let prefix_diags = if is_dotted_path(prefix) { [] }
+  else { [bad(b"a manifest's `prefix` is lower-case identifier segments joined by dots")] };
+  let version_diags = if version_ok(m.version) { [] }
+  else { [bad(b"a manifest's `version` counts up from zero, never below")] };
+  let base = cat(name_diags, cat(prefix_diags, version_diags));
+  {
+    manifest: if len(base) == 0 { Some(m) } else { None },
+    diags: deps_ok(m.dependencies, [], base, bad),
+  }
+}
+
+fn field_diag(here: Span) -> (Bytes) -> PDiag =
+  |message: Bytes| diag1(b"E0131", here, message, b"not a field a manifest accepts", [])
+
+fn version_ok(v: Version) -> Bool = v.major >= 0 && v.minor >= 0 && v.patch >= 0
+
+fn deps_ok(
+  deps: List<Dep>,
+  seen: List<Bytes>,
+  diags: List<PDiag>,
+  bad: (Bytes) -> PDiag,
+) -> List<PDiag> =
+  match deps {
+    [] -> diags,
+    [d, ..rest] -> {
+      let here = if bytes_len(bytes_of_string(d.name)) == 0 {
+        push(diags, bad(b"a dependency's `name` must not be empty"))
+      } else if has(seen, bytes_of_string(d.name)) {
+        push(
+          diags,
+          bad(
+            bytes_concat_all([b"the dependency `", bytes_of_string(d.name), b"` is listed twice"]),
+          ),
+        )
+      } else if !version_ok(d.min) {
+        push(
+          diags,
+          bad(
+            bytes_concat_all([
+              b"the dependency `",
+              bytes_of_string(d.name),
+              b"` asks for a version below zero",
+            ]),
+          ),
+        )
+      } else { diags };
+      deps_ok(rest, push(seen, bytes_of_string(d.name)), here, bad)
+    },
+  }
+
+fn has(xs: List<Bytes>, x: Bytes) -> Bool =
+  match xs { [] -> false, [y, ..rest] -> if y == x { true } else { has(rest, x) } }
+
+// Lower-case identifier segments joined by single dots: the shape a module path takes.
+fn is_dotted_path(s: String) -> Bool = {
+  let bs = bytes_of_string(s);
+  bytes_len(bs) > 0 && scan_path(bs, 0, true)
+}
+
+fn scan_path(bs: Bytes, i: Int, seg_start: Bool) -> Bool =
+  if i >= bytes_len(bs) { !seg_start } else {
+    let b = bytes_at(bs, i);
+    if seg_start { if b >= 97 && b <= 122 { scan_path(bs, i + 1, false) } else { false } }
+    else if b == 46 { scan_path(bs, i + 1, true) }
+    else if (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95 { scan_path(bs, i + 1, false) }
+    else { false }
+  }
+
+test "a well-formed manifest checks and decodes" {
+  let got = check_source(
+    b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"corpus\", version: {major: 0, minor: 1, patch: 0}, prefix: None, runtime: {major: 0, minor: 1, patch: 0}, dependencies: [{name: \"cli\", prefix: None, min: {major: 1, minor: 2, patch: 3}, source: Path(\"../cli\")}, {name: \"gitlib\", prefix: Some(\"gl\"), min: {major: 0, minor: 0, patch: 1}, source: Git(\"https://example.com/gitlib\", \"deadbee\")}, {name: \"reglib\", prefix: None, min: {major: 2, minor: 0, patch: 0}, source: Registry}], entry: Some(\"app.serve\")}",
+  );
+  assert_eq(got.diags, []);
+  match got.manifest {
+    None -> assert(false),
+    Some(m) -> {
+      assert_eq(m.name, "corpus");
+      assert_eq(m.entry, Some("app.serve"));
+      assert_eq(len(m.dependencies), 3);
+      assert_eq(at(m.dependencies, 0).source, Path("../cli"));
+      assert_eq(at(m.dependencies, 1).prefix, Some("gl"));
+      assert_eq(at(m.dependencies, 2).source, Registry)
+    },
+  }
+}
+
+test "a manifest with anything but one fn named package is refused" {
+  assert_eq(at(check_source(b"type X = {a: Int}").diags, 0).code, b"E0129");
+  assert_eq(at(check_source(b"fn other() -> Int = 1").diags, 0).code, b"E0129");
+  assert_eq(at(check_source(b"fn package() -> Int = 1").diags, 0).code, b"E0129");
+  assert_eq(
+    at(
+      check_source(
+        b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"a\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None}\nfn extra() -> Int = 1",
+      ).diags,
+      0,
+    ).code,
+    b"E0129",
+  )
+}
+
+test "a manifest body that runs is not a value" {
+  let head = b"import std.pkg (Manifest)\nfn package() -> Manifest = ";
+  assert_eq(
+    at(
+      check_source(
+        head
+          ++ b"{name: greet(\"x\"), version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None}",
+      ).diags,
+      0,
+    ).code,
+    b"E0130",
+  );
+  assert_eq(
+    at(
+      check_source(
+        head
+          ++ b"{name: \"a\", version: {major: 0, minor: 0, patch: 1 + 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None}",
+      ).diags,
+      0,
+    ).code,
+    b"E0130",
+  );
+  assert_eq(
+    at(
+      check_source(
+        head
+          ++ b"{ let x = 1; {name: \"a\", version: {major: 0, minor: 0, patch: x}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None} }",
+      ).diags,
+      0,
+    ).code,
+    b"E0130",
+  )
+}
+
+test "fields that fail validation are named" {
+  let head = b"import std.pkg (Manifest)\nfn package() -> Manifest = ";
+  let tail = b", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None}";
+  assert_eq(at(check_source(head ++ b"{name: \"\"" ++ tail).diags, 0).code, b"E0131");
+  assert_eq(at(check_source(head ++ b"{name: \"Not A Path\"" ++ tail).diags, 0).code, b"E0131");
+  assert_eq(at(check_source(head ++ b"{name: 3" ++ tail).diags, 0).code, b"E0131");
+  let dup = b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"a\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [{name: \"d\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Registry}, {name: \"d\", prefix: None, min: {major: 0, minor: 0, patch: 2}, source: Registry}], entry: None}";
+  assert_eq(at(check_source(dup).diags, 0).code, b"E0131")
+}
+
+test "a module path scans segments, not just characters" {
+  assert(is_dotted_path("cli"));
+  assert(is_dotted_path("std.pkg"));
+  assert(is_dotted_path("a1.b_2.c"));
+  assert(!is_dotted_path(""));
+  assert(!is_dotted_path("Std"));
+  assert(!is_dotted_path("a..b"));
+  assert(!is_dotted_path("a."));
+  assert(!is_dotted_path(".a"));
+  assert(!is_dotted_path("a-b"))
+}
