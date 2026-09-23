@@ -6,7 +6,10 @@
 // implementation of it. Everything below decides what is said about all of that, in both forms,
 // and the code it exits with.
 
-import args (Flags, read, style_of)
+import args (Flags, from_argv, read, style_of)
+import cmdline
+import cmdline (Parsed, has, value, values_of)
+import machine
 import compiler.resolve (Diag, Label)
 import diagnostic (Place, Spot, spot_of, all_to_json, all_to_text)
 import entry (At, no_module)
@@ -20,7 +23,47 @@ import style (Style, plain, bold, dim, green, red, yellow)
 // watching run decides there is another report to write; the walk is the host's and the deciding
 // is not. It answers `None` when a directory would not be read, which a watcher must not read as
 // a tree that has not moved.
+// What the test run is configured with: the report flags, the machine's budgets and bounds, and
+// the host it may bind — the program parses the line and hands the record over.
+pub type Options = {
+  path: String,
+  json: Bool,
+  explain: Bool,
+  no_cache: Bool,
+  filter: Option<String>,
+  jobs: Option<Int>,
+  steps: Int,
+  timeout: Int,
+  bisect: String,
+  bisect_budget: Int,
+  coverage: Bool,
+  mutate: Option<String>,
+  mutate_budget: Int,
+  trace: String,
+  backend: Option<String>,
+  profile: String,
+  watch: Bool,
+  std: Bool,
+  host: Bool,
+  tls: List<machine::TlsCred>,
+  trust: List<String>,
+  fs: List<machine::Named>,
+  db: machine::DbOpts,
+  config: machine::ConfigOpts,
+  sim: SimOpts,
+}
+
+pub type SimOpts = {
+  seed: Option<String>,
+  mode: String,
+  seeds: Option<Int>,
+  budget: Option<Int>,
+  steps: Option<Int>,
+  measure_reduction: Bool,
+}
+
 pub nondet effect tester {
+  write configure[corpus](options: Options) -> Unit
   read loaded[r]() -> Result<Program, Refusal>
   read bound[r]() -> Result<Unit, Refusal>
   read ran[r]() -> Ran
@@ -28,6 +71,57 @@ pub nondet effect tester {
 }
 
 // --- What the Rust side answers with ----------------------------------------
+
+// The options record, built from the parsed line.
+pub fn options_from(p: Parsed, root: String) -> Options = {
+  let machine_options = machine::options_from(p);
+  {
+    path: root,
+    json: has(p, "json"),
+    explain: has(p, "explain"),
+    no_cache: has(p, "no-cache"),
+    filter: value(p, "filter"),
+    jobs: match value(p, "jobs") { Some(v) -> cmdline::parse_nat(v), None -> None },
+    steps: match value(p, "steps") {
+      Some(v) -> match cmdline::parse_nat(v) { Some(n) -> n, None -> 0 },
+      None -> 1000000000,
+    },
+    timeout: match value(p, "timeout") {
+      Some(v) -> match cmdline::parse_nat(v) { Some(n) -> n, None -> 0 },
+      None -> 60000,
+    },
+    bisect: match value(p, "bisect") { Some(v) -> v, None -> "auto" },
+    bisect_budget: match value(p, "bisect-budget") {
+      Some(v) -> match cmdline::parse_nat(v) { Some(n) -> n, None -> 0 },
+      None -> 64,
+    },
+    coverage: has(p, "coverage"),
+    mutate: value(p, "mutate"),
+    mutate_budget: match value(p, "mutate-budget") {
+      Some(v) -> match cmdline::parse_nat(v) { Some(n) -> n, None -> 0 },
+      None -> 64,
+    },
+    trace: match value(p, "trace") { Some(v) -> v, None -> "auto" },
+    backend: value(p, "backend"),
+    profile: machine_options.profile,
+    watch: has(p, "watch"),
+    std: has(p, "std"),
+    host: machine_options.host,
+    tls: machine_options.tls,
+    trust: machine_options.trust,
+    fs: machine_options.fs,
+    db: machine_options.db,
+    config: machine_options.config,
+    sim: {
+      seed: value(p, "seed"),
+      mode: match value(p, "sim") { Some(v) -> v, None -> "dpor" },
+      seeds: match value(p, "seeds") { Some(v) -> cmdline::parse_nat(v), None -> None },
+      budget: match value(p, "sim-budget") { Some(v) -> cmdline::parse_nat(v), None -> None },
+      steps: match value(p, "sim-steps") { Some(v) -> cmdline::parse_nat(v), None -> None },
+      measure_reduction: has(p, "measure-reduction"),
+    },
+  }
+}
 
 pub type Refusal = { diags: List<Diag>, places: List<Place> }
 
@@ -1295,8 +1389,10 @@ fn unbound(s: Style, refusal: Refusal) -> Answer = {
 
 pub fn run(
   flags: Flags,
-) -> Answer / {tester.loaded[corpus], tester.bound[corpus], tester.ran[corpus]} = {
+  options: Options,
+) -> Answer / {tester.configure[corpus], tester.loaded[corpus], tester.bound[corpus], tester.ran[corpus]} = {
   let s: Style = style_of(flags);
+  tester.configure[corpus](options);
   match tester.loaded[corpus]() {
     Err(refusal) -> refused(s, "test", refusal.diags, refusal.places),
     Ok(p) -> match tester.bound[corpus]() {
@@ -1609,7 +1705,12 @@ test "`--explain` says why each test ran, once per reason, and how the groups fo
 test "the document keys off `command` and `exit_code` and names the schema it publishes" {
   let p = a_program([a_case(0, "one", "new")]);
   let text = to_string(
-    answered(plain(), read(["--json"]), p, a_run([an_outcome(0, "one", "passed")], [])).json,
+    answered(
+      plain(),
+      from_argv("test", ["--json"]),
+      p,
+      a_run([an_outcome(0, "one", "passed")], []),
+    ).json,
   );
   assert(string_contains(text, "\"command\":\"test\""));
   assert(string_contains(text, "\"exit_code\":0"));
@@ -1650,7 +1751,7 @@ test "a program with no tests at all says so, and one narrowed to none says that
   let hidden = { ..a_program([]), declared: 3, filtered_out: 3 };
   assert(
     said(
-      answered(plain(), read(["--filter=none"]), hidden, a_run([], [])).lines,
+      answered(plain(), from_argv("test", ["--filter=none"]), hidden, a_run([], [])).lines,
       "   no test key contains that substring; nothing was verified",
     ),
   )

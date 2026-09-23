@@ -35,7 +35,8 @@ const EFFECT: &str = "prover";
 /// The module the payload's constructors are declared in, as a program-wide name.
 const PAYLOAD: &str = "claims";
 
-const OPERATIONS: [(&str, &str); 4] = [
+const OPERATIONS: [(&str, &str); 5] = [
+    ("configure", "ply_cli::claims::configure"),
     ("collected", "ply_cli::claims::collected"),
     ("discharged", "ply_cli::claims::discharged"),
     ("reviewed", "ply_cli::claims::reviewed"),
@@ -70,9 +71,9 @@ pub struct Binding {
     pub trace: crate::trace::TraceOptions,
 }
 
-pub fn lent(job: Job) -> Vec<Lent> {
+pub fn lent() -> Vec<Lent> {
     let site: Arc<dyn HostHandler> = Arc::new(Site {
-        job: Mutex::new(Some(job)),
+        job: Mutex::new(None),
         machine: Mutex::new(None),
     });
     OPERATIONS
@@ -108,6 +109,10 @@ impl HostHandler for Site {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let value = match (req.op.op.as_str(), req.args) {
+            ("configure", [options]) => {
+                *self.job.lock().unwrap_or_else(|e| e.into_inner()) = Some(job_of(options, span)?);
+                PlyValue::Unit
+            }
             ("collected", _) => self.collected()?,
             ("discharged", [wanted]) => self.discharged(&indices(wanted, span)?)?,
             ("reviewed", _) => self.reviewed()?,
@@ -1084,4 +1089,128 @@ fn unasked(op: &str, span: Span) -> Diagnostic {
     )
     .primary(span, "this perform reached `ply prove`")
     .note("the effect and its handler are written together; this is Ply's fault")
+}
+
+// --- The job the program parses ---------------------------------------------------
+
+/// The job record as the program builds it from the parsed line, read field by field.
+fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
+    use crate::payload::{field_of, opt_int_at, opt_str_at, str_list_at};
+    let bool_at = |name: &str| field_of(v, name, span)?.as_bool(span, name);
+    let str_at = |name: &str| {
+        field_of(v, name, span)?
+            .as_str(span, name)
+            .map(str::to_string)
+    };
+    let sim = field_of(v, "sim", span)?;
+    let prove = field_of(v, "prove", span)?;
+    let prove_opts = crate::simulation::ProveOptions {
+        prove_cases: opt_int_at(prove, "cases", span)?.map(|n| n as u32),
+        prove_roots: opt_int_at(prove, "roots", span)?.map(|n| n as u32),
+        prove_budget: opt_int_at(prove, "budget", span)?.map(|n| n as u32),
+        shrink_budget: opt_int_at(prove, "shrink_budget", span)?.map(|n| n as u32),
+        prove_steps: opt_int_at(prove, "steps", span)?,
+    };
+    let sim_opts = crate::simulation::SimOptions {
+        seed: match opt_str_at(sim, "seed", span)? {
+            Some(text) => Some(
+                ply_eval::Seed::parse(&text)
+                    .ok_or_else(|| crate::payload::missing("a parsed seed", span))?,
+            ),
+            None => None,
+        },
+        sim: match field_of(sim, "mode", span)?.as_str(span, "the simulation's mode")? {
+            "once" => ply_eval::SimMode::Once,
+            "random" => ply_eval::SimMode::Random,
+            _ => ply_eval::SimMode::Dpor,
+        },
+        seeds: opt_int_at(sim, "seeds", span)?.map(|n| n as u32),
+        sim_budget: opt_int_at(sim, "budget", span)?.map(|n| n as u32),
+        sim_steps: opt_int_at(sim, "steps", span)?.map(|n| n as u32),
+        measure_reduction: field_of(sim, "measure_reduction", span)?
+            .as_bool(span, "measure_reduction")?,
+    };
+    let host = bool_at("host")?;
+    let binding = if host {
+        let tls_list = field_of(v, "tls", span)?;
+        let mut tls = Vec::new();
+        for item in tls_list.as_list(span, "tls")?.iter() {
+            tls.push(ply_host::tls::CredentialSpec {
+                name: field_of(item, "name", span)?
+                    .as_str(span, "a name")?
+                    .to_string(),
+                certificate: PathBuf::from(
+                    field_of(item, "cert", span)?.as_str(span, "a certificate")?,
+                ),
+                key: PathBuf::from(field_of(item, "key", span)?.as_str(span, "a key")?),
+            });
+        }
+        let fs_list = field_of(v, "fs", span)?;
+        let mut fs = Vec::new();
+        for item in fs_list.as_list(span, "fs")?.iter() {
+            fs.push(ply_host::fs::RootSpec {
+                name: field_of(item, "name", span)?
+                    .as_str(span, "a name")?
+                    .to_string(),
+                path: PathBuf::from(field_of(item, "path", span)?.as_str(span, "a path")?),
+            });
+        }
+        let db = field_of(v, "db", span)?;
+        let config = field_of(v, "config", span)?;
+        let trace = field_of(v, "trace", span)?;
+        Some(Binding {
+            host,
+            tls: crate::options::TlsOptions {
+                tls,
+                trust: str_list_at(v, "trust", span)?
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect(),
+            },
+            fs,
+            db: crate::db::DbOptions {
+                url: opt_str_at(db, "url", span)?,
+                pool: opt_int_at(db, "pool", span)?.map(|n| n as u32),
+                acquire_ms: opt_int_at(db, "acquire_ms", span)?.map(|n| n as u64),
+                statement_ms: opt_int_at(db, "statement_ms", span)?.map(|n| n as u64),
+                idle_txn_ms: opt_int_at(db, "idle_txn_ms", span)?.map(|n| n as u64),
+                connect_ms: opt_int_at(db, "connect_ms", span)?.map(|n| n as u64),
+                statement_cache: opt_int_at(db, "statement_cache", span)?.map(|n| n as u32),
+                schema: opt_str_at(db, "schema", span)?,
+            },
+            config: crate::config::ConfigOptions {
+                set: str_list_at(config, "set", span)?,
+                files: str_list_at(config, "files", span)?
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect(),
+                schema: opt_str_at(config, "schema", span)?,
+            },
+            trace: crate::trace::TraceOptions {
+                sink: match field_of(trace, "sink", span)?.as_str(span, "the trace sink")? {
+                    "text" => crate::trace::SinkArg::Text,
+                    "off" => crate::trace::SinkArg::Off,
+                    _ => crate::trace::SinkArg::Json,
+                },
+                level: match field_of(trace, "level", span)?.as_str(span, "the trace level")? {
+                    "debug" => crate::trace::LevelArg::Debug,
+                    "warn" => crate::trace::LevelArg::Warn,
+                    "error" => crate::trace::LevelArg::Error,
+                    _ => crate::trace::LevelArg::Info,
+                },
+            },
+        })
+    } else {
+        None
+    };
+    Ok(Job {
+        path: PathBuf::from(str_at("path")?),
+        incremental: !bool_at("no_incremental")?,
+        use_cache: !bool_at("no_cache")?,
+        std: bool_at("std")?,
+        jobs: opt_int_at(v, "jobs", span)?.map(|n| n as u32),
+        backend: opt_str_at(v, "backend", span)?,
+        plan: crate::simulation::prove_plan(&prove_opts, &sim_opts),
+        binding,
+    })
 }

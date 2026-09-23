@@ -18,6 +18,7 @@ pub mod costs;
 pub mod db;
 pub mod drive;
 pub mod driver;
+pub mod edit;
 pub mod engine;
 pub mod hosts;
 pub mod load;

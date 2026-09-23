@@ -3,17 +3,6 @@ use ply_eval::sim::{DEFAULT_BUDGET, DEFAULT_RANDOM_ROOTS, DEFAULT_STEPS};
 use ply_eval::{Plan, Seed, SimMode};
 use ply_machine::simulation::SimOptions;
 
-fn cli_options() -> ply_cli::cli::SimOptions {
-    ply_cli::cli::SimOptions {
-        seed: None,
-        sim: ply_cli::cli::SimArg::default(),
-        seeds: None,
-        sim_budget: None,
-        sim_steps: None,
-        measure_reduction: false,
-    }
-}
-
 fn options() -> SimOptions {
     SimOptions {
         seed: None,
@@ -74,28 +63,6 @@ fn a_replay_keeps_its_step_bound() {
     });
     assert_eq!(built.steps, 64);
     assert_eq!(built.mode, SimMode::Once);
-}
-
-#[test]
-fn a_budget_under_random_is_refused() {
-    assert!(
-        ply_cli::cli::SimOptions {
-            sim: ply_cli::cli::SimArg::Random,
-            sim_budget: Some(16),
-            ..cli_options()
-        }
-        .conflict()
-        .is_some()
-    );
-    assert!(cli_options().conflict().is_none());
-    assert!(
-        ply_cli::cli::SimOptions {
-            sim_budget: Some(16),
-            ..cli_options()
-        }
-        .conflict()
-        .is_none()
-    );
 }
 
 #[test]

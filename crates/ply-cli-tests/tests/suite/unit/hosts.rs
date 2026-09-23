@@ -60,11 +60,13 @@ pub mod fixture {
         op
     }
 
+    #[allow(dead_code)]
     pub fn named(label: &str) -> HostResource {
         HostResource::Only(Resource::Named(Symbol::new(label)))
     }
 
     /// Declared deterministic, which binds against an effect the program did not mark `nondet`.
+    #[allow(dead_code)]
     pub fn deterministic(mut op: HostOp) -> HostOp {
         op.determinism = Determinism::Deterministic;
         op

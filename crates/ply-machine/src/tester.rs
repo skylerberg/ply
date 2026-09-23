@@ -35,7 +35,8 @@ use std::sync::{Arc, Mutex, mpsc};
 /// else: no other command runs a corpus.
 const EFFECT: &str = "tester";
 
-const OPERATIONS: [(&str, &str); 4] = [
+const OPERATIONS: [(&str, &str); 5] = [
+    ("configure", "ply_machine::tester::configure"),
     ("loaded", "ply_cli::test::loaded"),
     ("bound", "ply_cli::test::bound"),
     ("ran", "ply_cli::test::ran"),
@@ -84,7 +85,7 @@ pub struct Session(Arc<Site>);
 impl Session {
     pub fn new(args: &TestOptions) -> Session {
         Session(Arc::new(Site {
-            args: args.clone(),
+            args: Mutex::new(args.clone()),
             machine: Mutex::new(None),
         }))
     }
@@ -117,7 +118,7 @@ fn registration(op: &str, path: &'static str) -> HostOp {
 }
 
 struct Site {
-    args: TestOptions,
+    args: Mutex<TestOptions>,
     /// Started by the first operation and joined by the last.
     machine: Mutex<Option<Machine>>,
 }
@@ -126,6 +127,15 @@ impl HostHandler for Site {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let value = match req.op.op.as_str() {
+            "configure" => {
+                let options = req
+                    .args
+                    .first()
+                    .ok_or_else(|| unasked("configure", req.span))?;
+                *self.args.lock().unwrap_or_else(|e| e.into_inner()) =
+                    test_options_of(options, req.span)?;
+                ply_eval::Value::Unit
+            }
             "loaded" => self.loaded()?,
             "bound" => self.bound()?,
             "ran" => self.ran()?,
@@ -144,7 +154,9 @@ impl Site {
     fn loaded(&self) -> Result<PlyValue, Diagnostic> {
         let mut held = self.held();
         if held.is_none() {
-            *held = Some(Machine::start(self.args.clone())?);
+            *held = Some(Machine::start(
+                self.args.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            )?);
         }
         let machine = held.as_ref().ok_or_else(|| unstarted("loaded"))?;
         machine.ask(Go::Load)?;
@@ -171,8 +183,14 @@ impl Site {
     /// could not read a directory. It reaches no machine: a watching run asks for this between
     /// reports, and a walk is not a front end.
     fn stamped(&self) -> PlyValue {
+        let path = self
+            .args
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .path
+            .clone();
         crate::payload::option(
-            crate::warm::tree_stamps(&project_root(&self.args.path)).map(|stamps| {
+            crate::warm::tree_stamps(&project_root(&path)).map(|stamps| {
                 PlyValue::list(
                     stamps
                         .iter()
@@ -1842,4 +1860,162 @@ fn unasked(op: &str, span: Span) -> Diagnostic {
     )
     .primary(span, "this perform reached `ply test`")
     .note("the effect and its handler are written together; this is Ply's fault")
+}
+
+// --- The options the program parses -----------------------------------------------
+
+/// The options record as the program builds it from the parsed line, read field by field. The
+/// program validated already, so a bad value here is an internal error.
+pub fn test_options_of(v: &PlyValue, span: Span) -> Result<TestOptions, Diagnostic> {
+    if std::env::var("PLY_DEBUG_OPTIONS").is_ok() {
+        eprintln!("{v}");
+    }
+    use crate::payload::{field_of, missing, opt_int_at, opt_str_at, str_list_at};
+    let bool_at = |name: &str| field_of(v, name, span)?.as_bool(span, name);
+    let int_at = |name: &str| field_of(v, name, span)?.as_int(span, name);
+    let str_at = |name: &str| {
+        field_of(v, name, span)?
+            .as_str(span, name)
+            .map(str::to_string)
+    };
+    let when_at = |name: &str| -> Result<When, Diagnostic> {
+        Ok(match str_at(name)?.as_str() {
+            "always" => When::Always,
+            "never" => When::Never,
+            _ => When::Auto,
+        })
+    };
+    let named_list = |name: &str| -> Result<Vec<(String, String)>, Diagnostic> {
+        let mut out = Vec::new();
+        for item in field_of(v, name, span)?.as_list(span, name)?.iter() {
+            let name = field_of(item, "name", span)?
+                .as_str(span, "a name")?
+                .to_string();
+            let path = field_of(item, "path", span)?
+                .as_str(span, "a path")?
+                .to_string();
+            out.push((name, path));
+        }
+        Ok(out)
+    };
+    let cred_list = |name: &str| -> Result<Vec<ply_host::tls::CredentialSpec>, Diagnostic> {
+        let mut out = Vec::new();
+        for item in field_of(v, name, span)?.as_list(span, name)?.iter() {
+            out.push(ply_host::tls::CredentialSpec {
+                name: field_of(item, "name", span)?
+                    .as_str(span, "a name")?
+                    .to_string(),
+                certificate: std::path::PathBuf::from(
+                    field_of(item, "cert", span)?.as_str(span, "a certificate")?,
+                ),
+                key: std::path::PathBuf::from(field_of(item, "key", span)?.as_str(span, "a key")?),
+            });
+        }
+        Ok(out)
+    };
+    let sim = field_of(v, "sim", span)?;
+    let db = field_of(v, "db", span)?;
+    let config = field_of(v, "config", span)?;
+    Ok(TestOptions {
+        path: std::path::PathBuf::from(str_at("path")?),
+        json: bool_at("json")?,
+        explain: bool_at("explain")?,
+        no_cache: bool_at("no_cache")?,
+        filter: opt_str_at(v, "filter", span)?,
+        jobs: opt_int_at(v, "jobs", span)?.map(|n| n as u32),
+        steps: int_at("steps")?,
+        timeout: int_at("timeout")? as u64,
+        bisect: when_at("bisect")?,
+        bisect_budget: int_at("bisect_budget")? as usize,
+        coverage: bool_at("coverage")?,
+        mutate: opt_str_at(v, "mutate", span)?,
+        mutate_budget: int_at("mutate_budget")? as usize,
+        trace: when_at("trace")?,
+        backend: opt_str_at(v, "backend", span)?,
+        profile: str_at("profile")?,
+        watch: bool_at("watch")?,
+        host: bool_at("host")?,
+        tls: crate::options::TlsOptions {
+            tls: cred_list("tls")?,
+            trust: str_list_at(v, "trust", span)?
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+        },
+        fs: named_list("fs")?
+            .into_iter()
+            .map(|(name, path)| ply_host::fs::RootSpec {
+                name,
+                path: std::path::PathBuf::from(path),
+            })
+            .collect(),
+        db: crate::db::DbOptions {
+            url: opt_str_at(db, "url", span)?,
+            pool: opt_int_at(db, "pool", span)?.map(|n| n as u32),
+            acquire_ms: opt_int_at(db, "acquire_ms", span)?.map(|n| n as u64),
+            statement_ms: opt_int_at(db, "statement_ms", span)?.map(|n| n as u64),
+            idle_txn_ms: opt_int_at(db, "idle_txn_ms", span)?.map(|n| n as u64),
+            connect_ms: opt_int_at(db, "connect_ms", span)?.map(|n| n as u64),
+            statement_cache: opt_int_at(db, "statement_cache", span)?.map(|n| n as u32),
+            schema: opt_str_at(db, "schema", span)?,
+        },
+        config: crate::config::ConfigOptions {
+            set: str_list_at(config, "set", span)?,
+            files: str_list_at(config, "files", span)?
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect(),
+            schema: opt_str_at(config, "schema", span)?,
+        },
+        std: bool_at("std")?,
+        simulation: crate::simulation::SimOptions {
+            seed: match opt_str_at(sim, "seed", span)? {
+                Some(text) => Some(
+                    ply_eval::Seed::parse(&text).ok_or_else(|| missing("a parsed seed", span))?,
+                ),
+                None => None,
+            },
+            sim: match field_of(sim, "mode", span)?.as_str(span, "the simulation's mode")? {
+                "once" => ply_eval::SimMode::Once,
+                "random" => ply_eval::SimMode::Random,
+                _ => ply_eval::SimMode::Dpor,
+            },
+            seeds: opt_int_at(sim, "seeds", span)?.map(|n| n as u32),
+            sim_budget: opt_int_at(sim, "budget", span)?.map(|n| n as u32),
+            sim_steps: opt_int_at(sim, "steps", span)?.map(|n| n as u32),
+            measure_reduction: field_of(sim, "measure_reduction", span)?
+                .as_bool(span, "measure_reduction")?,
+        },
+    })
+}
+
+impl Default for TestOptions {
+    fn default() -> TestOptions {
+        TestOptions {
+            path: std::path::PathBuf::from("."),
+            json: false,
+            explain: false,
+            no_cache: false,
+            filter: None,
+            jobs: None,
+            steps: ply_eval::DEFAULT_STEP_BUDGET,
+            timeout: 60_000,
+            bisect: When::Auto,
+            bisect_budget: 64,
+            coverage: false,
+            mutate: None,
+            mutate_budget: 64,
+            trace: When::Auto,
+            backend: None,
+            profile: "development".to_string(),
+            watch: false,
+            host: false,
+            tls: crate::options::TlsOptions::default(),
+            fs: Vec::new(),
+            db: crate::db::DbOptions::default(),
+            config: crate::config::ConfigOptions::default(),
+            std: false,
+            simulation: crate::simulation::SimOptions::default(),
+        }
+    }
 }
