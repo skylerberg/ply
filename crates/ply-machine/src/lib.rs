@@ -19,11 +19,13 @@ pub mod driver;
 pub mod hosts;
 pub mod load;
 pub mod migrate;
+pub mod mutate;
 pub mod options;
 pub mod payload;
 pub mod shelf;
 pub mod simulation;
 pub mod support;
+pub mod tester;
 pub mod trace;
 pub mod warm;
 
