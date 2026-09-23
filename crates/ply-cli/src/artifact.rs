@@ -189,8 +189,8 @@ pub fn digest_of(bytes: &[u8]) -> Option<[u8; 32]> {
     plan(bytes.len()).ok().flatten()?.over(bytes)
 }
 
-/// What a program digest is taken over, as `plyx.ply` states it. The hash itself is the host's:
-/// a digest covers the whole artifact, and Ply's own BLAKE3 runs at a few megabytes a second.
+/// What a program digest is taken over, as `plyx.ply` states it. The hash itself is the host's,
+/// as the decode that verifies it is.
 struct Plan {
     domain: Vec<u8>,
     /// Where the digest is written, which no range covers.
