@@ -69,7 +69,7 @@ pub fn targets<'a>(loaded: &'a Loaded, query: &str) -> Result<Vec<&'a DefInfo>, 
         .check
         .defs
         .values()
-        .filter(|d| !ply_machine::shelf::is_shipped(&d.module))
+        .filter(|d| !crate::shelf::is_shipped(&d.module))
         .collect();
     if query == "*" {
         return Ok(project);
@@ -310,7 +310,7 @@ where
     }
     report.generated = queue.len();
     queue.sort_by_key(|(reached, _)| reached.len());
-    let scratch = crate::test::Cache::scratch();
+    let scratch = crate::tester::Cache::scratch();
     let Ok(mut scratch) = scratch else {
         return report;
     };
@@ -401,7 +401,7 @@ pub fn to_json(report: &Report, loaded: &Loaded) -> Value {
                     "definition": j.mutant.definition.as_str(),
                     "from": j.mutant.from,
                     "to": j.mutant.to,
-                    "location": crate::test::location_json(&loaded.sources, j.mutant.span),
+                    "location": crate::tester::location_json(&loaded.sources, j.mutant.span),
                     "tests": j.tests.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
                     "why": match &j.verdict {
                         Verdict::Skipped(why) | Verdict::Unresolved(why) => Value::String((*why).to_string()),
@@ -433,7 +433,7 @@ pub fn coverage_json(loaded: &Loaded, hashes: &HashOutput) -> Value {
         .check
         .defs
         .values()
-        .filter(|d| !ply_machine::shelf::is_shipped(&d.module))
+        .filter(|d| !crate::shelf::is_shipped(&d.module))
         .map(|d| {
             let tests: Vec<&str> = reaching(loaded, hashes, &d.name)
                 .into_iter()

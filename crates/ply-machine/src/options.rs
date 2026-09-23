@@ -35,3 +35,22 @@ impl ShutdownOptions {
         }
     }
 }
+
+/// A three-way switch for work a run may do on its own behalf.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum When {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl When {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            When::Auto => "auto",
+            When::Always => "always",
+            When::Never => "never",
+        }
+    }
+}

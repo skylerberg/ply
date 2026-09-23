@@ -7,17 +7,17 @@
 //! reader of the store's on-disk format written in Ply would be a second implementation of it.
 //! What is said about all of it, in both forms, and the code the run exits with are the program's.
 
-use crate::cli::{TestArgs, When};
 use crate::hosts::{self, Hosts, Lent, hosting};
 use crate::load::{Loaded, load, project_root};
+use crate::options::When;
 use crate::payload::{count, diag_value, diags_value, json, option, places_value, record, strings};
+use crate::support::{
+    backend_spec, build_backend_over, build_pool, describe_schema, enter_constant, module_texts,
+    once_each, select_profile,
+};
 use ply_eval::Value as PlyValue;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
-};
-use ply_machine::support::{
-    backend_spec, build_backend_over, build_pool, describe_schema, enter_constant, module_texts,
-    once_each, select_profile,
 };
 use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
 use ply_store::Store;
@@ -48,10 +48,41 @@ const RUN_STACK: usize = 256 << 20;
 
 /// One process's machine. The load, the store and the binding are opened on a thread of their own
 /// and live as long as this does, so a `--watch` iteration over an unmoved tree re-derives nothing.
+/// What `ply test` is configured with, as plain data: the shell's parsed flags convert into
+/// this.
+#[derive(Clone, Debug)]
+pub struct TestOptions {
+    pub path: std::path::PathBuf,
+    pub json: bool,
+    pub explain: bool,
+    pub no_cache: bool,
+    pub filter: Option<String>,
+    pub jobs: Option<u32>,
+    pub steps: i64,
+    pub timeout: u64,
+    pub bisect: When,
+    pub bisect_budget: usize,
+    pub coverage: bool,
+    pub mutate: Option<String>,
+    pub mutate_budget: usize,
+    /// This command's `--trace` is the definition trace, never the record sink.
+    pub trace: When,
+    pub backend: Option<String>,
+    pub profile: String,
+    pub watch: bool,
+    pub host: bool,
+    pub tls: crate::options::TlsOptions,
+    pub fs: Vec<ply_host::fs::RootSpec>,
+    pub db: crate::db::DbOptions,
+    pub config: crate::config::ConfigOptions,
+    pub std: bool,
+    pub simulation: crate::simulation::SimOptions,
+}
+
 pub struct Session(Arc<Site>);
 
 impl Session {
-    pub fn new(args: &TestArgs) -> Session {
+    pub fn new(args: &TestOptions) -> Session {
         Session(Arc::new(Site {
             args: args.clone(),
             machine: Mutex::new(None),
@@ -86,7 +117,7 @@ fn registration(op: &str, path: &'static str) -> HostOp {
 }
 
 struct Site {
-    args: TestArgs,
+    args: TestOptions,
     /// Started by the first operation and joined by the last.
     machine: Mutex<Option<Machine>>,
 }
@@ -209,7 +240,7 @@ struct Machine {
 }
 
 impl Machine {
-    fn start(args: TestArgs) -> Result<Machine, Diagnostic> {
+    fn start(args: TestOptions) -> Result<Machine, Diagnostic> {
         let (go, asked) = mpsc::channel();
         let (told, steps) = mpsc::channel();
         let thread = std::thread::Builder::new()
@@ -247,7 +278,7 @@ impl Drop for Machine {
 }
 
 /// One store and one warm front end for the whole process, however many reports are asked of it.
-fn serve(args: &TestArgs, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
+fn serve(args: &TestOptions, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
     let mut cache = Cache::open(&project_root(&args.path), args.no_cache);
     let mut warm = crate::warm::Warm::default();
     while asked.recv().is_ok() {
@@ -264,7 +295,7 @@ fn serve(args: &TestArgs, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>)
 }
 
 fn iterate(
-    args: &TestArgs,
+    args: &TestOptions,
     cache: &mut Cache,
     warm: &mut crate::warm::Warm,
     told: &mpsc::Sender<Step>,
@@ -304,7 +335,7 @@ fn iterate(
     // A query naming nothing is wrong whatever the run does, so it refuses before anything runs
     // rather than being reported after a suite the user did not ask for.
     if let Some(query) = &args.mutate
-        && let Err(diagnostic) = crate::commands::mutate::targets(&loaded, query)
+        && let Err(diagnostic) = crate::mutate::targets(&loaded, query)
     {
         let _ = told.send(Step::Loaded(Box::new(Err(Refused {
             diagnostics: vec![diagnostic],
@@ -314,7 +345,7 @@ fn iterate(
     }
 
     // Part of a simulated test's cache key, so decided before selection.
-    let search = ply_machine::simulation::plan(&(&args.simulation).into());
+    let search = crate::simulation::plan(&args.simulation);
     let engine = ply_test::Engine::Evaluator;
     let hashes = loaded.hashes.clone();
     let selected = ply_test::select(&loaded.check, &hashes, &cache.store, &search, &engine);
@@ -345,7 +376,7 @@ fn iterate(
 /// Whether a report was written, which is what decides if this front end is worth holding.
 #[allow(clippy::too_many_arguments)]
 fn bind(
-    args: &TestArgs,
+    args: &TestOptions,
     cache: &mut Cache,
     warm: &mut crate::warm::Warm,
     loaded: &Loaded,
@@ -369,8 +400,7 @@ fn bind(
             Err(diagnostic) => return refuse(vec![diagnostic]),
         };
     // Before anything runs, so no test touches a resource the program does not declare.
-    let db_options: ply_machine::db::DbOptions = (&args.db).into();
-    let db = match db_options.resolve(args.host) {
+    let db = match args.db.resolve(args.host) {
         Ok(db) => db,
         Err(diagnostics) => return refuse(diagnostics),
     };
@@ -406,21 +436,17 @@ fn bind(
     };
     let constant = |name: &str| enter_constant(unit, name);
     // Before binding, so a missing required key fails before any host test runs.
-    let config_options: ply_machine::config::ConfigOptions = (&args.config).into();
-    let (configuration, config_warnings) = match crate::config::Configuration::open(
-        &loaded.check,
-        args.host,
-        &config_options,
-        &constant,
-    ) {
-        Ok(resolved) => resolved,
-        Err(diagnostics) => return refuse(diagnostics),
-    };
+    let (configuration, config_warnings) =
+        match crate::config::Configuration::open(&loaded.check, args.host, &args.config, &constant)
+        {
+            Ok(resolved) => resolved,
+            Err(diagnostics) => return refuse(diagnostics),
+        };
     let mut hosts = match Hosts::open(
         &loaded.check,
         args.host,
-        &ply_machine::options::TlsOptions::from(&args.tls),
-        &args.fs.fs,
+        &args.tls,
+        &args.fs,
         db,
         configuration,
         // `--trace` on this command names the definition trace, so records are discarded.
@@ -454,7 +480,7 @@ fn bind(
 
 #[allow(clippy::too_many_arguments)]
 fn execute(
-    args: &TestArgs,
+    args: &TestOptions,
     cache: &mut Cache,
     loaded: &Loaded,
     hashes: &HashOutput,
@@ -511,22 +537,20 @@ fn execute(
             let ok = report.is_success() && escapes.is_empty();
             // Only over a green program: a survivor of a red one says nothing.
             let mutants = match (&args.mutate, ok, &backend) {
-                (Some(query), true, Some(spec)) => {
-                    match crate::commands::mutate::targets(loaded, query) {
-                        Ok(targets) => Some(Ok(crate::commands::mutate::run(
-                            loaded,
-                            hashes,
-                            &targets,
-                            args.mutate_budget,
-                            search,
-                            engine,
-                            spec,
-                            hosts,
-                            &runtime,
-                        ))),
-                        Err(diagnostic) => Some(Err(diagnostic)),
-                    }
-                }
+                (Some(query), true, Some(spec)) => match crate::mutate::targets(loaded, query) {
+                    Ok(targets) => Some(Ok(crate::mutate::run(
+                        loaded,
+                        hashes,
+                        &targets,
+                        args.mutate_budget,
+                        search,
+                        engine,
+                        spec,
+                        hosts,
+                        &runtime,
+                    ))),
+                    Err(diagnostic) => Some(Err(diagnostic)),
+                },
                 _ => None,
             };
             (report, mutants)
@@ -584,12 +608,12 @@ fn execute(
         mutants,
         coverage: args
             .coverage
-            .then(|| crate::commands::mutate::coverage_json(loaded, hashes)),
+            .then(|| crate::mutate::coverage_json(loaded, hashes)),
     }
 }
 
 /// `--bisect never` still goes through the diagnosis, so the artifact has one shape.
-pub fn diagnosis_options(args: &TestArgs) -> ply_test::Options {
+pub fn diagnosis_options(args: &TestOptions) -> ply_test::Options {
     ply_test::Options {
         bisect: match args.bisect {
             When::Auto => ply_test::Mode::Auto,
@@ -623,8 +647,7 @@ impl Plan {
         filter: Option<&str>,
         std_tests: bool,
     ) -> Plan {
-        let in_scope =
-            |t: &ply_ty::TestInfo| std_tests || !ply_machine::shelf::is_shipped(&t.module);
+        let in_scope = |t: &ply_ty::TestInfo| std_tests || !crate::shelf::is_shipped(&t.module);
         // Against `<module>.<label>`, so `--filter store.` narrows to a module.
         let matches = |t: &ply_ty::TestInfo| filter.is_none_or(|n| t.key.as_str().contains(n));
 
@@ -1064,7 +1087,7 @@ fn report_summary(report: &RunReport) -> SummaryView {
 }
 
 fn found(
-    args: &TestArgs,
+    args: &TestOptions,
     loaded: &Loaded,
     hashes: &HashOutput,
     plan: &Plan,
@@ -1160,7 +1183,7 @@ fn backend_view(
     spec: &ply_eval::BackendSpec,
     provider: Option<&'static dyn ply_eval::Provider>,
     report: &RunReport,
-    args: &TestArgs,
+    args: &TestOptions,
 ) -> BackendView {
     let offers = provider.map_or_else(Default::default, ply_eval::Provider::offers);
     let compiled = provider.and_then(ply_eval::Provider::compilation);
@@ -1328,7 +1351,7 @@ fn atoms(footprint: &Footprint) -> Vec<String> {
     ply_ty::Printer::new().atoms(&footprint.0)
 }
 
-fn mutants_view(report: &crate::commands::mutate::Report, loaded: &Loaded) -> MutantsView {
+fn mutants_view(report: &crate::mutate::Report, loaded: &Loaded) -> MutantsView {
     MutantsView {
         killed: report.killed(),
         survived: report.survived(),
@@ -1338,7 +1361,7 @@ fn mutants_view(report: &crate::commands::mutate::Report, loaded: &Loaded) -> Mu
         survivors: report
             .judged
             .iter()
-            .filter(|j| matches!(j.verdict, crate::commands::mutate::Verdict::Survived))
+            .filter(|j| matches!(j.verdict, crate::mutate::Verdict::Survived))
             .map(|j| {
                 (
                     j.mutant.definition.as_str().to_string(),
@@ -1348,7 +1371,7 @@ fn mutants_view(report: &crate::commands::mutate::Report, loaded: &Loaded) -> Mu
                 )
             })
             .collect(),
-        json: crate::commands::mutate::to_json(report, loaded),
+        json: crate::mutate::to_json(report, loaded),
     }
 }
 
