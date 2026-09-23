@@ -11,7 +11,7 @@
 //! and the stack it runs on. It is the cheap statement that nothing has become unusually deeper
 //! than everything that compiles today.
 
-use ply_cli::shipped;
+use ply_launcher::shipped;
 
 /// Just past the deepest definition the compiler, the standard library and the program hold.
 /// Raising it asks the emitter to recurse further than it ever has; flatten the definition

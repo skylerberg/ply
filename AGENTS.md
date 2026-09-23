@@ -38,7 +38,7 @@ the runtime and the CLI.
   touch. Run `cargo fmt --all` before pushing; CI runs clippy with `-D warnings`.
 - CI is `.github/workflows/ci.yml`; `.github/ci-shards.sh` holds its solo and gate tables and cuts
   the test partitions from the durations CI measured.
-- Never commit `crates/ply-compiler/bootstrap`, `crates/ply-cli/bootstrap` or
+- Never commit `crates/ply-compiler/bootstrap`, `crates/ply-launcher/bootstrap` or
   `crates/ply-codegen-tests/fixtures/goldens` in a pull request: CI regenerates all three on
   `main` after each merge (the `refresh` job), and a pull request runs its sources through the
   checked-in bundle as a stage. A golden that moved is listed in the partition job's summary;

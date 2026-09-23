@@ -101,10 +101,12 @@ impl Target {
             return deployment(path).map(|d| (Target::Deployed(Box::new(d)), None));
         }
         let loaded = if cache {
-            let mut store = ply_store::Store::open(path)
+            // The store is the project's, so a file path roots at the file's directory.
+            let root = crate::load::project_root(path);
+            let mut store = ply_store::Store::open(&root)
                 .map(|store| store.with_upstream(ply_store::Upstream::from_env()))
                 .map_err(|e| Refused {
-                    diagnostics: vec![unopened(path, &e)],
+                    diagnostics: vec![unopened(&root, &e)],
                     sources: SourceMap::new(),
                     artifact: None,
                 })?;
@@ -945,8 +947,8 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
                 .iter()
                 .find(|(k, _)| k.as_str() == name)
                 .map(|(_, value)| value)
-                .ok_or_else(|| missing(name, span)),
-            _ => Err(missing(name, span)),
+                .ok_or_else(|| crate::payload::missing(name, span)),
+            _ => Err(crate::payload::missing(name, span)),
         }
     };
     let bool_at = |name: &str| get(name).and_then(|v| v.as_bool(span, name));
@@ -959,7 +961,7 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
                 .map(|v| v.as_str(span, "a value").map(str::to_string))
                 .transpose()?),
             PlyValue::Ctor { name, .. } if name.as_str() == "None" => Ok(None),
-            other => Err(shape(other, span)),
+            other => Err(crate::payload::shape(other, span)),
         }
     };
     let str_list = |name: &str| -> Result<Vec<String>, Diagnostic> {
@@ -972,10 +974,10 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
     let named_list = |name: &str| -> Result<Vec<(String, String)>, Diagnostic> {
         let mut out = Vec::new();
         for item in get(name)?.as_list(span, name)?.iter() {
-            let name = field_of(item, "name", span)?
+            let name = crate::payload::field_of(item, "name", span)?
                 .as_str(span, "a name")?
                 .to_string();
-            let path = field_of(item, "path", span)?
+            let path = crate::payload::field_of(item, "path", span)?
                 .as_str(span, "a path")?
                 .to_string();
             out.push((name, path));
@@ -985,13 +987,13 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
     let cred_list = |name: &str| -> Result<Vec<(String, String, String)>, Diagnostic> {
         let mut out = Vec::new();
         for item in get(name)?.as_list(span, name)?.iter() {
-            let name = field_of(item, "name", span)?
+            let name = crate::payload::field_of(item, "name", span)?
                 .as_str(span, "a name")?
                 .to_string();
-            let cert = field_of(item, "cert", span)?
+            let cert = crate::payload::field_of(item, "cert", span)?
                 .as_str(span, "a certificate")?
                 .to_string();
-            let key = field_of(item, "key", span)?
+            let key = crate::payload::field_of(item, "key", span)?
                 .as_str(span, "a key")?
                 .to_string();
             out.push((name, cert, key));
@@ -1014,7 +1016,7 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
     let trace_v = get("trace")?;
     Ok(RunOptions {
         argv: str_list("argv")?,
-        json: false,
+        json: bool_at("json")?,
         steps: int_at("steps")?,
         timeout: int_at("timeout")? as u64,
         seed,
@@ -1048,30 +1050,35 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
             })
             .collect(),
         db: crate::db::DbOptions {
-            url: opt_str_at(db_v, "url", span)?,
-            pool: opt_int_at(db_v, "pool", span)?.map(|n| n as u32),
-            acquire_ms: opt_int_at(db_v, "acquire_ms", span)?.map(|n| n as u64),
-            statement_ms: opt_int_at(db_v, "statement_ms", span)?.map(|n| n as u64),
-            idle_txn_ms: opt_int_at(db_v, "idle_txn_ms", span)?.map(|n| n as u64),
-            connect_ms: opt_int_at(db_v, "connect_ms", span)?.map(|n| n as u64),
-            statement_cache: opt_int_at(db_v, "statement_cache", span)?.map(|n| n as u32),
-            schema: opt_str_at(db_v, "schema", span)?,
+            url: crate::payload::opt_str_at(db_v, "url", span)?,
+            pool: crate::payload::opt_int_at(db_v, "pool", span)?.map(|n| n as u32),
+            acquire_ms: crate::payload::opt_int_at(db_v, "acquire_ms", span)?.map(|n| n as u64),
+            statement_ms: crate::payload::opt_int_at(db_v, "statement_ms", span)?.map(|n| n as u64),
+            idle_txn_ms: crate::payload::opt_int_at(db_v, "idle_txn_ms", span)?.map(|n| n as u64),
+            connect_ms: crate::payload::opt_int_at(db_v, "connect_ms", span)?.map(|n| n as u64),
+            statement_cache: crate::payload::opt_int_at(db_v, "statement_cache", span)?
+                .map(|n| n as u32),
+            schema: crate::payload::opt_str_at(db_v, "schema", span)?,
         },
         config: crate::config::ConfigOptions {
-            set: str_list_at(config_v, "set", span)?,
-            files: str_list_at(config_v, "files", span)?
+            set: crate::payload::str_list_at(config_v, "set", span)?,
+            files: crate::payload::str_list_at(config_v, "files", span)?
                 .into_iter()
                 .map(std::path::PathBuf::from)
                 .collect(),
-            schema: opt_str_at(config_v, "schema", span)?,
+            schema: crate::payload::opt_str_at(config_v, "schema", span)?,
         },
         trace: crate::trace::TraceOptions {
-            sink: match field_of(trace_v, "sink", span)?.as_str(span, "the trace sink")? {
+            sink: match crate::payload::field_of(trace_v, "sink", span)?
+                .as_str(span, "the trace sink")?
+            {
                 "text" => crate::trace::SinkArg::Text,
                 "off" => crate::trace::SinkArg::Off,
                 _ => crate::trace::SinkArg::Json,
             },
-            level: match field_of(trace_v, "level", span)?.as_str(span, "the trace level")? {
+            level: match crate::payload::field_of(trace_v, "level", span)?
+                .as_str(span, "the trace level")?
+            {
                 "debug" => crate::trace::LevelArg::Debug,
                 "warn" => crate::trace::LevelArg::Warn,
                 "error" => crate::trace::LevelArg::Error,
@@ -1086,70 +1093,4 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
         profile: str_at("profile")?,
         cache: bool_at("cache")?,
     })
-}
-
-fn field_of<'a>(value: &'a PlyValue, name: &str, span: Span) -> Result<&'a PlyValue, Diagnostic> {
-    match value {
-        PlyValue::Record(fields) => fields
-            .iter()
-            .find(|(k, _)| k.as_str() == name)
-            .map(|(_, value)| value)
-            .ok_or_else(|| missing(name, span)),
-        _ => Err(missing(name, span)),
-    }
-}
-
-fn opt_str_at(value: &PlyValue, name: &str, span: Span) -> Result<Option<String>, Diagnostic> {
-    match field_of(value, name, span)? {
-        PlyValue::Ctor { name, args } if name.as_str() == "Some" => Ok(args
-            .first()
-            .map(|v| v.as_str(span, "a value").map(str::to_string))
-            .transpose()?),
-        PlyValue::Ctor { name, .. } if name.as_str() == "None" => Ok(None),
-        other => Err(shape(other, span)),
-    }
-}
-
-fn opt_int_at(value: &PlyValue, name: &str, span: Span) -> Result<Option<i64>, Diagnostic> {
-    match field_of(value, name, span)? {
-        PlyValue::Ctor { name, args } if name.as_str() == "Some" => Ok(args
-            .first()
-            .map(|v| v.as_int(span, "a number"))
-            .transpose()?),
-        PlyValue::Ctor { name, .. } if name.as_str() == "None" => Ok(None),
-        other => Err(shape(other, span)),
-    }
-}
-
-fn str_list_at(value: &PlyValue, name: &str, span: Span) -> Result<Vec<String>, Diagnostic> {
-    field_of(value, name, span)?
-        .as_list(span, name)?
-        .iter()
-        .map(|v| v.as_str(span, "an entry").map(str::to_string))
-        .collect::<Result<Vec<String>, Diagnostic>>()
-}
-
-fn missing(name: &str, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!("the options record has no `{name}`"),
-    )
-    .primary(
-        span,
-        "the program and the machine agree on the record; this is Ply's fault",
-    )
-}
-
-fn shape(value: &PlyValue, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!(
-            "the machine read a {} where an Option was expected",
-            value.type_name()
-        ),
-    )
-    .primary(
-        span,
-        "the program and the machine agree on the record; this is Ply's fault",
-    )
 }

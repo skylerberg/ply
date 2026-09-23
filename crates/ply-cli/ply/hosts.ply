@@ -8,12 +8,13 @@ import compiler.resolve (Diag)
 import diagnostic (Place, all_to_json, all_to_text)
 import report (Answer, schema_version, ok_code, compile_error, ind, count_of, refused)
 import std.json (Json, Null, Str, Bool, Number, Array, Member, object, to_string)
+import machine
 import style (Style, red)
 
 // The trusted computing base, as the Rust side assembles it under the host flags.
 pub nondet effect tcb {
-  read preview[r]() -> Preview
-  write open[r]() -> Binding
+  read preview[r](root: String, options: machine::Options) -> Preview
+  write open[r](root: String, options: machine::Options) -> Binding
 }
 
 // --- What the Rust side answers with ----------------------------------------
@@ -51,9 +52,7 @@ pub type Transport = {
   credentials: List<Credential>,
 }
 
-pub type Root = { name: String, path: String }
-
-pub type Filesystem = { roots: List<Root> }
+pub type Filesystem = { roots: List<machine::Named> }
 
 pub type Pool = {
   connections: Int,
@@ -250,8 +249,8 @@ fn filesystem_lines(f: Filesystem) -> List<String> =
   if len(f.roots) == 0 {
     ["", "filesystem", "none — an `fs` operation is E0451 until `--fs NAME=PATH` binds its label"]
   } else {
-    let width = fold(f.roots, 0, |acc: Int, r: Root| wider(acc, string_len(r.name)));
-    fold(f.roots, ["", "filesystem"], |acc: List<String>, r: Root|
+    let width = fold(f.roots, 0, |acc: Int, r: machine::Named| wider(acc, string_len(r.name)));
+    fold(f.roots, ["", "filesystem"], |acc: List<String>, r: machine::Named|
       push(acc, padded(r.name, width) ++ "  " ++ r.path))
   }
 
@@ -441,7 +440,7 @@ fn filesystem_json(f: Filesystem) -> Json =
     {
       key: "roots",
       value: Array(
-        map(f.roots, |r: Root|
+        map(f.roots, |r: machine::Named|
           object([{ key: "name", value: Str(r.name) }, { key: "path", value: Str(r.path) }])),
       ),
     },
@@ -642,14 +641,17 @@ fn answered(s: Style, flags: Flags, p: Preview, b: Binding) -> Answer = {
   { json: report_json(p, b), lines: lines, errs: errs, code: ok_code() }
 }
 
-pub fn run(flags: Flags) -> Answer / {tcb.preview[host], tcb.open[host]} = {
-  let p: Preview = tcb.preview[host]();
+pub fn run(
+  flags: Flags,
+  options: machine::Options,
+) -> Answer / {tcb.preview[host], tcb.open[host]} = {
+  let p: Preview = tcb.preview[host](root_of(flags), options);
   let s: Style = style_of(flags);
   match p.stage {
     NotLoaded -> refused(s, "hosts", p.diags, p.places),
     NotResolved -> unresolved(s, p),
     NotBound -> unbound(s, p),
-    Bound -> answered(s, flags, p, tcb.open[host]()),
+    Bound -> answered(s, flags, p, tcb.open[host](root_of(flags), options)),
   }
 }
 
@@ -956,7 +958,12 @@ test "the configuration block counts its sources and never prints a secret's val
 
 // The run's own answer, over a binding the test hands it in place of the Rust side.
 fn answered_over(p: Preview, b: Binding, flags: Flags) -> Answer =
-  handle { run(flags) } with { tcb.preview[host]() -> p, tcb.open[host]() -> b }
+  handle {
+    run(flags, machine::no_options())
+  } with {
+    tcb.preview[host](root, options) -> p,
+    tcb.open[host](root, options) -> b,
+  }
 
 test "the listing opens on a blank line and every other line is indented" {
   let answer = answered_over(listed(), bound(), flags_of(false, false));
@@ -1048,3 +1055,7 @@ test "a program that does not load is the load's own refusal" {
   assert_eq(answer.code, 2);
   assert_eq(answer.errs, ["Error[E0201]: type mismatch", ind() ++ "compilation failed (1 error)"])
 }
+
+// The path the listing answers about, resolved, or the working directory.
+fn root_of(flags: Flags) -> String =
+  match list_at(flags.paths, 0) { Some(r) -> r.machine, None -> "." }

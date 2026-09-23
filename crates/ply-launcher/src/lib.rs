@@ -92,6 +92,12 @@ pub fn run(
             name: "shelf".to_string(),
             path: shelf,
         },
+        // The program is the tool: a path that leaves the working directory is addressed under
+        // `abs`, the filesystem's root.
+        ply_host::fs::RootSpec {
+            name: "abs".to_string(),
+            path: PathBuf::from("/"),
+        },
     ];
     roots.append(&mut binds.roots);
     binds.roots = roots;
@@ -121,3 +127,4 @@ pub fn run(
 }
 
 pub mod env;
+pub mod shipped;

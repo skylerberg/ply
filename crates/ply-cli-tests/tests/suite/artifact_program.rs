@@ -4,7 +4,7 @@
 //! CI does so on main after each merge, so no pull request carries the artifact.
 
 use assert_cmd::Command;
-use ply_cli::shipped;
+use ply_launcher::shipped;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
