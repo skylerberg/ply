@@ -283,9 +283,8 @@ impl<'s> Driver<'s> {
         let mut files = Vec::with_capacity(discovered.len());
         for (file, &(source, content, stamp)) in discovered.iter().zip(&read) {
             match ModuleName::from_relative_path(&file.relative) {
-                Ok(module) if crate::shipped::is_shipped_name(module.as_str()) => {
-                    let diagnostic =
-                        crate::shipped::reserved_diagnostic(&file.path, module.as_str());
+                Ok(module) if crate::shelf::is_shipped_name(module.as_str()) => {
+                    let diagnostic = crate::shelf::reserved_diagnostic(&file.path, module.as_str());
                     diagnostics.push(anchor(diagnostic, &sources, source));
                 }
                 Ok(module) => files.push(FileState {
@@ -393,7 +392,7 @@ impl<'s> Driver<'s> {
             .iter()
             .map(|f| (f.module.to_string(), f.text.to_string()))
             .collect();
-        let shelf = crate::shipped::sources();
+        let shelf = crate::shelf::sources();
         let (defs, tests) = self.known();
         let pulled = ply_codegen::c::producer::front_pulling_std_with(&own, shelf, &defs, &tests)
             .map_err(|e| self.seam_failed(&format!("{e:#}")))?;
@@ -462,9 +461,9 @@ impl<'s> Driver<'s> {
             .iter()
             .map(|f| (f.path.clone(), f.module.clone()))
             .collect();
-        out.extend(crate::shipped::sources().iter().map(|(name, _)| {
+        out.extend(crate::shelf::sources().iter().map(|(name, _)| {
             let module = ModuleName::from_dotted(name);
-            (crate::shipped::pseudo_path(&module), module)
+            (crate::shelf::pseudo_path(&module), module)
         }));
         out
     }
@@ -475,10 +474,10 @@ impl<'s> Driver<'s> {
         self.files.truncate(own);
         self.sources = self.project.clone();
         for module in shipped.iter().map(ModuleName::from_dotted) {
-            let Some(text) = crate::shipped::source(&module) else {
+            let Some(text) = crate::shelf::source(&module) else {
                 continue;
             };
-            let path = crate::shipped::pseudo_path(&module);
+            let path = crate::shelf::pseudo_path(&module);
             let content = ContentHash::of(text.as_bytes());
             let source = self.sources.add(&path, text);
             let text = self

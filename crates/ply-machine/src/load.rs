@@ -163,7 +163,7 @@ impl Loaded {
         self.check
             .defs
             .values()
-            .filter(|d| d.simple_name == main && !crate::shipped::is_shipped(&d.module))
+            .filter(|d| d.simple_name == main && !crate::shelf::is_shipped(&d.module))
             .collect()
     }
 }
@@ -232,7 +232,7 @@ pub(crate) fn discover(path: &Path) -> Result<(PathBuf, Vec<Discovered>), Vec<Di
 }
 
 /// Every `.ply` file under `root`, sorted.
-pub(crate) fn ply_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+pub fn ply_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect(root, &mut files)?;
     files.sort();

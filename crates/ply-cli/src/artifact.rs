@@ -548,7 +548,7 @@ fn closure_texts(
         .names
         .iter()
         .filter_map(|(name, _)| name.rsplit_once('.').map(|(module, _)| module))
-        .filter(|module| crate::shipped::is_shipped_name(module))
+        .filter(|module| ply_machine::shelf::is_shipped_name(module))
         .collect();
     let shipped: Vec<&str> = shipped.into_iter().collect();
     let printed = ply_codegen::c::producer::print_bodies(&bodies, &names, &[], &[], &shipped)
@@ -930,7 +930,7 @@ fn ask_the_port(
     sources: &mut SourceMap,
 ) -> Result<Answered, Vec<Diagnostic>> {
     ply_codegen::c::producer::ensure_default();
-    let shelf = crate::shipped::sources();
+    let shelf = ply_machine::shelf::sources();
     let pulled = ply_codegen::c::producer::front_pulling_std(own, shelf)
         .map_err(|e| front_failed(format!("{e:#}")))?;
     let front = place_and_read(&pulled.modules, &pulled.dump, ids, sources)?;
@@ -951,10 +951,10 @@ fn place_and_read(
 ) -> Result<Front, Vec<Diagnostic>> {
     for module in modules {
         let name = ModuleName::from_dotted(module);
-        let text = crate::shipped::source(&name).ok_or_else(|| {
+        let text = ply_machine::shelf::source(&name).ok_or_else(|| {
             front_failed(format!("it pulled in `{module}`, which is not shipped"))
         })?;
-        ids.push(sources.add(crate::shipped::pseudo_path(&name), text));
+        ids.push(sources.add(ply_machine::shelf::pseudo_path(&name), text));
     }
     let front = ply_ty::read_front(dump, ids.as_slice())
         .map_err(|e| front_failed(format!("the front end's answer does not read: {e}")))?;
@@ -1046,7 +1046,7 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
     for (file, text) in &artifact.closure {
         let relative = PathBuf::from(file);
         let name = ModuleName::from_relative_path(&relative).map_err(|d| vec![d])?;
-        if crate::shipped::is_shipped(&name) {
+        if ply_machine::shelf::is_shipped(&name) {
             return Err(vec![unfaithful(format!(
                 "the closure carries `{file}`, a module this `ply` ships"
             ))]);
@@ -1093,7 +1093,7 @@ fn reopen(artifact: &Artifact) -> Result<Opened, Vec<Diagnostic>> {
         .map(|(name, _)| name.as_str())
         .collect();
     if let Some(extra) = hashes.defs.keys().chain(hashes.decls.keys()).find(|name| {
-        !crate::shipped::is_shipped_name(name.as_str()) && !named.contains(name.as_str())
+        !ply_machine::shelf::is_shipped_name(name.as_str()) && !named.contains(name.as_str())
     }) {
         return Err(vec![unfaithful(format!(
             "the closure declares `{extra}`, which the artifact does not name"

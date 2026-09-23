@@ -20,10 +20,10 @@ pub fn project_view(check: &CheckOutput, std: bool) -> std::borrow::Cow<'_, Chec
     let mut scoped = check.clone();
     scoped
         .defs
-        .retain(|_, info| !crate::shipped::is_shipped(&info.module));
+        .retain(|_, info| !ply_machine::shelf::is_shipped(&info.module));
     scoped
         .laws
-        .retain(|law| !crate::shipped::is_shipped(&law.module));
+        .retain(|law| !ply_machine::shelf::is_shipped(&law.module));
     std::borrow::Cow::Owned(scoped)
 }
 

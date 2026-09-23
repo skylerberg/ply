@@ -103,7 +103,7 @@ fn no_shipped_definition_nests_deeper_than_the_emitter_walks() {
         .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
         .collect();
     let mut deepest: Vec<(usize, String, String)> = Vec::new();
-    for (module, text) in shipped::sources().iter().chain(&program) {
+    for (module, text) in ply_machine::shelf::sources().iter().chain(&program) {
         for (name, body) in items(text) {
             deepest.push((depth(&body), module.clone(), name));
         }

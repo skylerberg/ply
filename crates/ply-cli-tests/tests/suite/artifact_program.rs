@@ -93,13 +93,16 @@ fn the_committed_program_is_what_these_sources_build() {
 
 #[test]
 fn the_compiler_is_on_the_shelf_under_its_own_root_and_nothing_may_shadow_it() {
-    let names: Vec<&str> = shipped::sources().iter().map(|(n, _)| n.as_str()).collect();
+    let names: Vec<&str> = ply_machine::shelf::sources()
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect();
     assert!(names.contains(&"compiler.fmt"), "{names:?}");
     assert!(names.contains(&"std.path"), "{names:?}");
-    assert!(shipped::is_shipped_name("compiler.fmt"));
-    assert!(shipped::is_shipped_name("std.fs"));
-    assert!(!shipped::is_shipped_name("compilers.fmt"));
-    assert!(!shipped::is_shipped_name("fmt"));
+    assert!(ply_machine::shelf::is_shipped_name("compiler.fmt"));
+    assert!(ply_machine::shelf::is_shipped_name("std.fs"));
+    assert!(!ply_machine::shelf::is_shipped_name("compilers.fmt"));
+    assert!(!ply_machine::shelf::is_shipped_name("fmt"));
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("compiler")).unwrap();
@@ -127,8 +130,11 @@ fn the_compiler_is_on_the_shelf_under_its_own_root_and_nothing_may_shadow_it() {
 /// way for the other, and every body that calls across it is refused.
 #[test]
 fn every_shelved_module_imports_the_shelf_under_the_names_it_files_them_under() {
-    let filed: Vec<&str> = shipped::sources().iter().map(|(n, _)| n.as_str()).collect();
-    for (module, text) in shipped::sources() {
+    let filed: Vec<&str> = ply_machine::shelf::sources()
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .collect();
+    for (module, text) in ply_machine::shelf::sources() {
         for line in text.lines().filter_map(|l| l.strip_prefix("import ")) {
             let path: &str = line
                 .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
