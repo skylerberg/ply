@@ -50,7 +50,7 @@ pub const PROGRAM_SOURCES: &[(&str, &str)] = &[
 ];
 
 /// Where the built program and the digest of the sources it was built from are committed.
-pub const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bootstrap");
+pub const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../ply-cli/bootstrap");
 
 pub const ARTIFACT: &str = "ply.plyx";
 
