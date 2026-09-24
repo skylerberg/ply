@@ -4,7 +4,7 @@
 use crate::load::{
     Discovered, Found, LoadError, Loaded, Stamp, anchor, discover, stamp_of, unreadable,
 };
-use ply_codegen::c::producer::{KnownDef, KnownTest};
+use ply_codegen::c::producer::{self, KnownDef, KnownTest};
 use ply_prove::prove::{Claims, read_claims};
 use ply_span::frames::Cursor;
 use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
@@ -127,7 +127,13 @@ pub fn claims(loaded: &Loaded, store: Option<&mut Store>) -> Result<Claims, Stri
             .iter()
             .map(|&i| (modules[i].name.to_string(), texts[i].to_string()))
             .collect();
-        let dump = ply_codegen::c::producer::claims_dump(&sources).map_err(|e| format!("{e:#}"))?;
+        let mod_pkg: Vec<usize> = asked
+            .iter()
+            .map(|&i| loaded.front.mod_pkg.get(i).copied().unwrap_or(0))
+            .collect();
+        let dump =
+            ply_codegen::c::producer::claims_dump(&sources, &loaded.front.packages, &mod_pkg)
+                .map_err(|e| format!("{e:#}"))?;
         let items: HashMap<&str, usize> = modules
             .iter()
             .enumerate()
@@ -234,9 +240,82 @@ struct Driver<'s> {
     project: SourceMap,
     /// The root's `ply.pkg`, when there is one: the front end checks it and places it last.
     manifest: Option<(PathBuf, Arc<str>)>,
+    /// The packages the walk reached, in walk order: each root's manifest text and its
+    /// modules as `(file, name relative to the package root, text)`.
+    packages: Vec<DepPackage>,
     sources: SourceMap,
     files: Vec<FileState>,
     phases: Phases,
+}
+
+/// One dependency package of the walk: its manifest text, and its modules by file.
+struct DepPackage {
+    root: String,
+    manifest: Option<String>,
+    files: Vec<(PathBuf, String, Arc<str>)>,
+}
+
+/// The modules a package root holds, named relative to it; a root with no readable `ply.pkg`
+/// answers nothing, and the front end's `E0135` says why.
+fn read_package(root: &str) -> DepPackage {
+    let dir = Path::new(root);
+    let manifest = std::fs::read_to_string(dir.join("ply.pkg")).ok();
+    let files = if manifest.is_some() {
+        let mut out = Vec::new();
+        if let Ok(paths) = crate::load::ply_files(dir) {
+            for path in paths {
+                let Ok(relative) = path.strip_prefix(dir) else {
+                    continue;
+                };
+                let Ok(module) = ModuleName::from_relative_path(relative) else {
+                    continue;
+                };
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    out.push((path, module.to_string(), Arc::from(text.as_str())));
+                }
+            }
+        }
+        out
+    } else {
+        Vec::new()
+    };
+    DepPackage {
+        root: root.to_string(),
+        manifest,
+        files,
+    }
+}
+
+/// What the manifests on hand ask for, round by round, until nothing is new: the closure of
+/// the root package's path dependencies.
+fn walk_packages(
+    root: &Path,
+    manifest: &Option<(PathBuf, Arc<str>)>,
+) -> Result<Vec<DepPackage>, String> {
+    let root_key = root.to_string_lossy().into_owned();
+    let mut known = vec![root_key.clone()];
+    let mut manifests = vec![producer::SuppliedPackage {
+        root: root_key,
+        manifest: manifest.as_ref().map(|(_, text)| text.to_string()),
+        modules: Vec::new(),
+    }];
+    let mut packages = Vec::new();
+    loop {
+        let wanted = producer::pkg_wants(&known, &manifests).map_err(|e| format!("{e:#}"))?;
+        if wanted.is_empty() {
+            return Ok(packages);
+        }
+        for w in wanted {
+            known.push(w.clone());
+            let package = read_package(&w);
+            manifests.push(producer::SuppliedPackage {
+                root: w.clone(),
+                manifest: package.manifest.clone(),
+                modules: Vec::new(),
+            });
+            packages.push(package);
+        }
+    }
 }
 
 fn timed<T>(slot: &mut Duration, f: impl FnOnce() -> T) -> T {
@@ -323,7 +402,15 @@ impl<'s> Driver<'s> {
             }
         };
 
+        let packages = walk_packages(&root, &manifest).map_err(|e| LoadError {
+            sources: sources.clone(),
+            diagnostics: vec![Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!("the package walk could not answer for this project: {e}"),
+            )],
+        })?;
         let mut driver = Driver {
+            packages,
             root,
             mode,
             store,
@@ -345,6 +432,22 @@ impl<'s> Driver<'s> {
                 sources: self.sources.clone(),
                 diagnostics: front.diagnostics,
             });
+        }
+
+        // The front end named the dependency modules by prefix; take the names it gave them,
+        // matched by source, so cache fingerprints key the same modules it answered for.
+        for i in self.own()..self.files.len() {
+            if self.files[i].shipped {
+                continue;
+            }
+            if let Some(info) = front
+                .check
+                .modules
+                .values()
+                .find(|m| m.source == self.files[i].source)
+            {
+                self.files[i].module = info.name.clone();
+            }
         }
 
         let stdlib = self.stdlib_notice(&front.hashes);
@@ -409,15 +512,47 @@ impl<'s> Driver<'s> {
             .collect();
         let shelf = crate::shelf::sources();
         let (defs, tests) = self.known();
-        let pulled = ply_codegen::c::producer::front_pulling_std_with(
-            &own,
-            shelf,
-            &defs,
-            &tests,
-            self.manifest.as_ref().map(|(_, text)| text.as_ref()),
-        )
-        .map_err(|e| self.seam_failed(&format!("{e:#}")))?;
+        let packages = producer::Packages {
+            root: self.root.to_string_lossy().into_owned(),
+            manifest: self.manifest.as_ref().map(|(_, text)| text.to_string()),
+            supplied: self
+                .packages
+                .iter()
+                .map(|p| producer::SuppliedPackage {
+                    root: p.root.clone(),
+                    manifest: p.manifest.clone(),
+                    modules: p
+                        .files
+                        .iter()
+                        .map(|(_, name, text)| (name.clone(), text.to_string()))
+                        .collect(),
+                })
+                .collect(),
+        };
+        let pulled =
+            ply_codegen::c::producer::front_pulling_std_with(&own, shelf, &defs, &tests, &packages)
+                .map_err(|e| self.seam_failed(&format!("{e:#}")))?;
         self.place(&pulled.modules);
+        // The front end parses the root's modules, then the dependency modules in walk order,
+        // then the pulled shelf; the manifest slots follow them all.
+        let pulled_files = self.files.split_off(self.own());
+        for package in &self.packages {
+            for (path, name, text) in &package.files {
+                let source = self.sources.add(path, text.to_string());
+                self.files.push(FileState {
+                    stamp: stamp_of(path),
+                    path: path.clone(),
+                    module: ModuleName::from_dotted(name),
+                    source,
+                    text: text.clone(),
+                    content: ContentHash::of(text.as_bytes()),
+                    shipped: false,
+                });
+            }
+        }
+        self.files.extend(pulled_files);
+        // Manifest slots: the root's first, then each supplied package's in walk order, so a
+        // manifest diagnostic's module index lands on its own file.
         if let Some((path, text)) = &self.manifest {
             let source = self.sources.add(path, text.to_string());
             self.files.push(FileState {
@@ -426,6 +561,22 @@ impl<'s> Driver<'s> {
                 module: ModuleName::from_dotted("pkg"),
                 source,
                 text: text.clone(),
+                content: ContentHash::of(text.as_bytes()),
+                shipped: false,
+            });
+        }
+        for package in &self.packages {
+            let Some(text) = &package.manifest else {
+                continue;
+            };
+            let path = PathBuf::from(&package.root).join("ply.pkg");
+            let source = self.sources.add(&path, text.to_string());
+            self.files.push(FileState {
+                stamp: stamp_of(&path),
+                path,
+                module: ModuleName::from_dotted("pkg"),
+                source,
+                text: Arc::from(text.as_str()),
                 content: ContentHash::of(text.as_bytes()),
                 shipped: false,
             });

@@ -8,8 +8,10 @@ import items (Module, IFn, FnDef, item_span, parse)
 import exprs (Expr, ELit, EVar, EApp, ERecord, EList, RecField, expr_span)
 import patterns (LInt, LBool, LStr, LUnit)
 import types (TCon, ty_span)
-import std.json (Json, Null, Bool, Number, Str, Member, object, array, variant, error_to_string)
-import std.pkg (Manifest, Version, Dep, Path, Registry, manifest_json)
+import resolve (Source)
+import std.json (Json, Null, Bool, Number, Str, Member, object, array, variant, error_to_string,
+                 to_string)
+import std.pkg (Manifest, Version, Dep, Path, Git, Registry, manifest_json, prefix_of)
 
 pub type Checked = { manifest: Option<Manifest>, diags: List<PDiag> }
 
@@ -341,3 +343,471 @@ test "a module path scans segments, not just characters" {
   assert(!is_dotted_path(".a"));
   assert(!is_dotted_path("a-b"))
 }
+
+// --- The closure --------------------------------------------------------------
+// The packages a load pulls in: manifests checked, the graph judged, and every dependency's
+// modules named for the front end. A walker supplies raw texts and reads named sources back;
+// every package judgment lives here so the driver and the CLI share the one implementation.
+
+// A package as a walker supplies it: the root it was found at, its manifest text when the
+// root holds one (`None` marks a wanted root that had none), and its modules named relative.
+pub type Supplied = { root: Bytes, manifest: Option<Bytes>, modules: List<Source> }
+
+// The packages one load is made of: the root's own manifest (`None` is the anonymous
+// package) and everything the walk reached from it.
+pub type Pkgs = { root: Bytes, manifest: Option<Bytes>, supplied: List<Supplied> }
+
+// One package of the settled closure: its granted module prefix, the prefixes it declares,
+// and its decoded manifest (`None` when the root held none or the text did not check).
+pub type Package = { root: Bytes, prefix: Bytes, deps: List<Bytes>, manifest: Option<Manifest> }
+
+pub type Closure = {
+  packages: List<Package>,
+  // The dependency modules in supplied order, each named `<prefix>.<relative>` beside the
+  // package it belongs to; a package with no decoded manifest keeps its names bare, so the
+  // count and order a walker placed them in still holds.
+  modules: List<{ pkg: Int, src: Source }>,
+  // Diagnostics by the slot the manifest's text takes after every module (0-based).
+  diags: List<{ slot: Int, diag: PDiag }>,
+}
+
+fn head_of<a>(xs: List<a>, n: Int) -> List<a> = map(range(0, n), |i: Int| at(xs, i))
+
+fn join_bytes(xs: List<Bytes>, sep: Bytes) -> Bytes =
+  match xs {
+    [] -> b"",
+    [x, ..rest] -> fold(rest, x, |acc: Bytes, y: Bytes| bytes_concat_all([acc, sep, y])),
+  }
+
+// `base` joined with `rel`, then `.` and `..` segments folded out textually, so two spellings
+// of one directory key the same package.
+fn join_normalized(base: Bytes, rel: Bytes) -> Bytes =
+  normalize(bytes_concat_all([base, b"/", rel]), [], 0)
+
+fn normalize(path: Bytes, out: List<Bytes>, i: Int) -> Bytes =
+  if i >= bytes_len(path) {
+    let joined = join_bytes(out, b"/");
+    if bytes_len(path) > 0 && bytes_at(path, 0) == 47 { bytes_concat(b"/", joined) } else { joined }
+  } else {
+    let end = match bytes_index_of_from(path, b"/", i) { Some(j) -> j, None -> bytes_len(path) };
+    let seg = bytes_slice(path, i, end);
+    let next = end + 1;
+    if seg == b"." || seg == b"" { normalize(path, out, next) } else if seg == b".." {
+      if len(out) == 0 || at(out, len(out) - 1) == b".." { normalize(path, push(out, b".."), next) }
+      else { normalize(path, head_of(out, len(out) - 1), next) }
+    } else { normalize(path, push(out, seg), next) }
+  }
+
+// The root keys a set of manifests asks for beyond the ones already known: what a walker
+// reads next. Malformed manifests ask for nothing; their refusal is the final pass's to say.
+pub fn wants(known: List<Bytes>, manifests: List<Supplied>) -> List<Bytes> =
+  fold(manifests, [], |acc: List<Bytes>, s: Supplied|
+    match s.manifest {
+      None -> acc,
+      Some(src) -> match check_source(src).manifest {
+        None -> acc,
+        Some(m) ->
+          fold(m.dependencies, acc, |acc2: List<Bytes>, d: Dep|
+            match d.source {
+              Path(p) -> {
+                let root = join_normalized(s.root, bytes_of_string(p));
+                if has(known, root) || has(acc2, root) { acc2 } else { push(acc2, root) }
+              },
+              _ -> acc2,
+            }),
+      },
+    })
+
+// The walk's next reads as JSON: `{"wants": ["root", ...]}`, for the driver to serve.
+pub fn wants_dump(known: List<Bytes>, manifests: List<Supplied>) -> String =
+  to_string(
+    object([
+      {
+        key: "wants",
+        value: array(map(wants(known, manifests), |r: Bytes| Str(string_of_bytes_lossy(r)))),
+      },
+    ]),
+  )
+
+fn slot_of(manifests: List<Option<Bytes>>, i: Int) -> Int = {
+  let before = head_of(manifests, i);
+  fold(before, 0, |acc: Int, m: Option<Bytes>| match m { None -> acc, Some(_) -> acc + 1 })
+}
+
+// Every manifest checked, in package order; slot `s` of a diag is the count of present
+// manifest texts before it, so the front end can place it after every module.
+fn checked_manifests(
+  texts: List<Option<Bytes>>,
+) -> { manifests: List<Option<Manifest>>, diags: List<{ slot: Int, diag: PDiag }> } =
+  fold(
+    range(0, len(texts)),
+    { manifests: [], diags: [] },
+    |acc: { manifests: List<Option<Manifest>>, diags: List<{ slot: Int, diag: PDiag }> }, i: Int|
+      match at(texts, i) {
+        None -> { ..acc, manifests: push(acc.manifests, None) },
+        Some(src) -> {
+          let c = check_source(src);
+          let slot = slot_of(texts, i);
+          {
+            manifests: push(acc.manifests, c.manifest),
+            diags: fold(c.diags, acc.diags, |ds: List<{ slot: Int, diag: PDiag }>, d: PDiag|
+              push(ds, { slot: slot, diag: d })),
+          }
+        },
+      },
+  )
+
+fn pkg_diag(slot: Int, code: Bytes, message: Bytes) -> { slot: Int, diag: PDiag } =
+  { slot: slot, diag: diag1(code, dummy_span(), message, b"in this package's manifest", []) }
+
+// The packages of one load, judged: dependencies usable, prefixes unique, the graph acyclic,
+// and the dependency modules named. `root_modules` are the root package's own module names,
+// whose first segments may not squat on a dependency's prefix.
+pub fn empty() -> Pkgs = { root: b"", manifest: None, supplied: [] }
+
+pub fn closure(pkgs: Pkgs, root_modules: List<Bytes>) -> Closure = {
+  let texts: List<Option<Bytes>> = fold(
+    pkgs.supplied,
+    [pkgs.manifest],
+    |acc: List<Option<Bytes>>, s: Supplied| push(acc, s.manifest),
+  );
+  let roots: List<Bytes> = fold(pkgs.supplied, [pkgs.root], |acc: List<Bytes>, s: Supplied|
+    push(acc, s.root));
+  let checked = checked_manifests(texts);
+  let packages = map(range(0, len(roots)), |i: Int| {
+    let m = at(checked.manifests, i);
+    {
+      root: at(roots, i),
+      prefix: match m { None -> b"", Some(x) -> bytes_of_string(prefix_of(x)) },
+      deps: [],
+      manifest: m,
+    }
+  });
+  let judged = judge(texts, roots, checked.manifests, packages, root_modules, checked.diags);
+  {
+    packages: judged.packages,
+    modules: name_modules(judged.packages, pkgs.supplied, 1, []),
+    diags: judged.diags,
+  }
+}
+
+// Dependency modules in supplied order, named by their package's prefix when it decoded;
+// the count and order a walker supplied in is the count and order named here.
+fn name_modules(
+  packages: List<Package>,
+  supplied: List<Supplied>,
+  i: Int,
+  out: List<{ pkg: Int, src: Source }>,
+) -> List<{ pkg: Int, src: Source }> =
+  if i > len(supplied) { out } else {
+    let p = at(packages, i);
+    let named = match p.manifest {
+      None ->
+        fold(at(supplied, i - 1).modules, out, |o: List<{ pkg: Int, src: Source }>, s: Source|
+          push(o, { pkg: i, src: s })),
+      Some(_) ->
+        fold(at(supplied, i - 1).modules, out, |o: List<{ pkg: Int, src: Source }>, s: Source|
+          push(o, {
+            pkg: i,
+            src: { name: bytes_concat_all([p.prefix, b".", s.name]), src: s.src },
+          })),
+    };
+    name_modules(packages, supplied, i + 1, named)
+  }
+
+// --- The graph's judgments ------------------------------------------------------
+
+type Judged = { packages: List<Package>, diags: List<{ slot: Int, diag: PDiag }> }
+
+type Pending = {
+  packages: List<Package>,
+  diags: List<{ slot: Int, diag: PDiag }>,
+  edges: List<{ from: Int, target: Int }>,
+}
+
+fn set_at<a>(xs: List<a>, i: Int, v: a) -> List<a> = list_set(xs, i, v)
+
+fn root_index(roots: List<Bytes>, key: Bytes, i: Int) -> Option<Int> =
+  if i >= len(roots) { None }
+  else if at(roots, i) == key { Some(i) }
+  else { root_index(roots, key, i + 1) }
+
+fn judge(
+  texts: List<Option<Bytes>>,
+  roots: List<Bytes>,
+  manifests: List<Option<Manifest>>,
+  packages: List<Package>,
+  root_modules: List<Bytes>,
+  diags: List<{ slot: Int, diag: PDiag }>,
+) -> Judged = {
+  let built = fold(
+    range(0, len(packages)),
+    { packages: packages, diags: diags, edges: [] },
+    |acc: Pending, i: Int|
+      match at(manifests, i) {
+        None -> acc,
+        Some(m) ->
+          fold(m.dependencies, acc, |a: Pending, d: Dep| one_dep(texts, roots, manifests, i, a, d)),
+      },
+  );
+  let collided = prefix_judgments(texts, roots, built.packages, root_modules, built.diags);
+  let cycled = match find_cycle(len(roots), built.edges) {
+    None -> collided,
+    Some(c) ->
+      push(collided, {
+        slot: slot_of(texts, at(c, 0)),
+        diag: diag1(
+          b"E0134",
+          dummy_span(),
+          bytes_concat_all([b"packages depend on one another in a cycle: ", cycle_text(roots, c)]),
+          b"in this package's manifest",
+          [b"break the cycle: a package may not reach itself through its dependencies"],
+        ),
+      }),
+  };
+  { packages: built.packages, diags: cycled }
+}
+
+fn cycle_text(roots: List<Bytes>, c: List<Int>) -> Bytes =
+  join_bytes(map(push(c, at(c, 0)), |i: Int| at(roots, i)), b" -> ")
+
+fn one_dep(
+  texts: List<Option<Bytes>>,
+  roots: List<Bytes>,
+  manifests: List<Option<Manifest>>,
+  i: Int,
+  acc: Pending,
+  d: Dep,
+) -> Pending = {
+  let slot = slot_of(texts, i);
+  let name = bytes_of_string(d.name);
+  match d.source {
+    Git(_, _) ->
+      push_diag_text(
+        acc,
+        slot,
+        b"E0135",
+        bytes_concat_all([
+          b"the dependency `",
+          name,
+          b"` comes from git; only path dependencies resolve today",
+        ]),
+      ),
+    Registry ->
+      push_diag_text(
+        acc,
+        slot,
+        b"E0135",
+        bytes_concat_all([
+          b"the dependency `",
+          name,
+          b"` comes from the registry; only path dependencies resolve today",
+        ]),
+      ),
+    Path(p) -> {
+      let target = join_normalized(at(roots, i), bytes_of_string(p));
+      match root_index(roots, target, 0) {
+        None ->
+          push_diag_text(
+            acc,
+            slot,
+            b"E0135",
+            bytes_concat_all([b"the dependency `", name, b"` at `", target, b"` was not read"]),
+          ),
+        Some(j) -> match at(texts, j) {
+          None ->
+            push_diag_text(
+              acc,
+              slot,
+              b"E0135",
+              bytes_concat_all([
+                b"the dependency `",
+                name,
+                b"` at `",
+                target,
+                b"` holds no ply.pkg; a package that is depended on must declare one",
+              ]),
+            ),
+          Some(_) -> match at(manifests, j) {
+            None -> acc,
+            Some(tm) -> {
+              let granted = bytes_of_string(prefix_of(tm));
+              let aliased = match d.prefix { None -> granted, Some(a) -> bytes_of_string(a) };
+              if aliased != granted {
+                push_diag_text(
+                  acc,
+                  slot,
+                  b"E0133",
+                  bytes_concat_all([
+                    b"the dependency `",
+                    name,
+                    b"` is granted the prefix `",
+                    aliased,
+                    b"` here, but calls itself `",
+                    granted,
+                    b"`",
+                  ]),
+                )
+              } else {
+                {
+                  packages: set_at(acc.packages, i, {
+                    ..at(acc.packages, i),
+                    deps: push(at(acc.packages, i).deps, granted),
+                  }),
+                  diags: acc.diags,
+                  edges: push(acc.edges, { from: i, target: j }),
+                }
+              }
+            },
+          },
+        },
+      }
+    },
+  }
+}
+
+fn push_diag_text(acc: Pending, slot: Int, code: Bytes, message: Bytes) -> Pending =
+  { ..acc, diags: push(acc.diags, pkg_diag(slot, code, message)) }
+
+// Every granted prefix is unique and neither reserved root, and no root module squats on one.
+fn prefix_judgments(
+  texts: List<Option<Bytes>>,
+  roots: List<Bytes>,
+  packages: List<Package>,
+  root_modules: List<Bytes>,
+  diags: List<{ slot: Int, diag: PDiag }>,
+) -> List<{ slot: Int, diag: PDiag }> = {
+  let reserved = fold(
+    range(0, len(packages)),
+    diags,
+    |acc: List<{ slot: Int, diag: PDiag }>, i: Int| {
+      let p = at(packages, i);
+      if p.manifest == None || bytes_len(p.prefix) == 0 { acc } else {
+        let with_reserved = if p.prefix == b"std" || p.prefix == b"compiler" {
+          push(acc, {
+            slot: slot_of(texts, i),
+            diag: diag1(
+              b"E0133",
+              dummy_span(),
+              bytes_concat_all([
+                b"the package at `",
+                p.root,
+                b"` grants the prefix `",
+                p.prefix,
+                b"`, which is reserved",
+              ]),
+              b"in this package's manifest",
+              [b"`std` and `compiler` name the modules the toolchain ships"],
+            ),
+          })
+        } else { acc };
+        fold(
+          range(i + 1, len(packages)),
+          with_reserved,
+          |acc2: List<{ slot: Int, diag: PDiag }>, j: Int| {
+            let q = at(packages, j);
+            if q.manifest == None || p.prefix != q.prefix { acc2 } else {
+              push(acc2, {
+                slot: slot_of(texts, j),
+                diag: diag1(
+                  b"E0133",
+                  dummy_span(),
+                  bytes_concat_all([
+                    b"the packages at `",
+                    p.root,
+                    b"` and `",
+                    q.root,
+                    b"` both grant the prefix `",
+                    p.prefix,
+                    b"`",
+                  ]),
+                  b"in this package's manifest",
+                  [b"a module prefix names one package in a closure"],
+                ),
+              })
+            }
+          },
+        )
+      }
+    },
+  );
+  fold(root_modules, reserved, |acc: List<{ slot: Int, diag: PDiag }>, m: Bytes| {
+    let seg = first_segment(m);
+    match find_prefix(packages, seg, 1) {
+      None -> acc,
+      Some(j) ->
+        push(acc, {
+          slot: slot_of(texts, j),
+          diag: diag1(
+            b"E0133",
+            dummy_span(),
+            bytes_concat_all([
+              b"`",
+              m,
+              b"` is a module of the root package, but `",
+              seg,
+              b"` is granted by the package at `",
+              at(packages, j).root,
+              b"`",
+            ]),
+            b"in this package's manifest",
+            [b"rename the directory, or the dependency's prefix"],
+          ),
+        }),
+    }
+  })
+}
+
+fn first_segment(name: Bytes) -> Bytes =
+  match bytes_index_of(name, b".") { None -> name, Some(i) -> bytes_slice(name, 0, i) }
+
+fn find_prefix(packages: List<Package>, prefix: Bytes, i: Int) -> Option<Int> =
+  if i >= len(packages) { None }
+  else if at(packages, i).manifest != None && at(packages, i).prefix == prefix { Some(i) }
+  else { find_prefix(packages, prefix, i + 1) }
+
+// A back edge in a depth-first walk, as the stack from the gray node; white 0, gray 1, black 2.
+fn find_cycle(n: Int, edges: List<{ from: Int, target: Int }>) -> Option<List<Int>> =
+  visit(range(0, n), edges, map(range(0, n), |_i: Int| 0), [], 0)
+
+fn visit(
+  nodes: List<Int>,
+  edges: List<{ from: Int, target: Int }>,
+  colors: List<Int>,
+  stack: List<Int>,
+  _u: Int,
+) -> Option<List<Int>> =
+  match nodes {
+    [] -> None,
+    [u, ..rest] -> if at(colors, u) != 0 { visit(rest, edges, colors, stack, 0) } else {
+      match dfs(u, edges, list_set(colors, u, 1), push(stack, u)) {
+        { colors: c2, cycle: Some(c) } -> Some(c),
+        { colors: c2, cycle: None } -> visit(rest, edges, list_set(c2, u, 2), stack, 0),
+      }
+    },
+  }
+
+fn dfs(
+  u: Int,
+  edges: List<{ from: Int, target: Int }>,
+  colors: List<Int>,
+  stack: List<Int>,
+) -> { colors: List<Int>, cycle: Option<List<Int>> } =
+  fold(
+    edges,
+    { colors: colors, cycle: None },
+    |acc: { colors: List<Int>, cycle: Option<List<Int>> }, e: { from: Int, target: Int }|
+      match acc.cycle {
+        Some(_) -> acc,
+        None -> if e.from != u { acc } else if at(acc.colors, e.target) == 1 {
+          { colors: acc.colors, cycle: Some(stack_from(stack, e.target)) }
+        } else if at(acc.colors, e.target) == 0 {
+          match dfs(e.target, edges, list_set(acc.colors, e.target, 1), push(stack, e.target)) {
+            { colors: c2, cycle: c } -> { colors: c2, cycle: c },
+          }
+        } else { acc },
+      },
+  )
+
+fn stack_from(stack: List<Int>, u: Int) -> List<Int> =
+  match stack { [] -> [u], [x, ..rest] -> if x == u { stack } else { stack_from(rest, u) } }

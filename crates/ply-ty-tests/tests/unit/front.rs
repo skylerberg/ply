@@ -263,6 +263,8 @@ fn sample() -> Front {
     }
 
     Front {
+        packages: Vec::new(),
+        mod_pkg: Vec::new(),
         diagnostics: vec![
             Diagnostic::warning(codes::UNKNOWN_NAME, "a warning that does not stop the dump")
                 .primary(span(1, 0, 1), "here"),
