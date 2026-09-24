@@ -32,6 +32,7 @@ mod modules_hash_audit;
 mod mutate;
 mod nesting;
 mod numerics;
+mod packages;
 mod process_cli;
 mod prove;
 mod prover_soundness_audit;

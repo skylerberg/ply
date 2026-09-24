@@ -28,8 +28,8 @@ fn fixture(source: &str) -> Fixture {
     let check = ply_codegen::c::producer::checked_front(&sources, &[SRC])
         .unwrap_or_else(|e| panic!("check: {e:#}"))
         .check;
-    let dump =
-        ply_codegen::c::producer::claims_dump(&sources, &[], &[]).unwrap_or_else(|e| panic!("claims: {e:#}"));
+    let dump = ply_codegen::c::producer::claims_dump(&sources, &[], &[])
+        .unwrap_or_else(|e| panic!("claims: {e:#}"));
     let claims = read_claims(&dump, &[SRC]).unwrap_or_else(|e| panic!("claims: {e}"));
     Fixture { check, claims }
 }
