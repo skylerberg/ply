@@ -509,12 +509,49 @@ impl PlyProducer {
                 .collect(),
         );
         let roots = wanted.iter().map(|n| Value::bytes(n.as_bytes())).collect();
+        let front = loaded.front;
+        let (pkgs, mod_pkg) = if front.packages.is_empty() {
+            (
+                vec![record(vec![
+                    ("prefix", Value::bytes(b"")),
+                    ("deps", Value::list(Vec::new())),
+                ])],
+                Value::list(names.iter().map(|_| Value::Int(0)).collect()),
+            )
+        } else {
+            (
+                front
+                    .packages
+                    .iter()
+                    .map(|(prefix, deps)| {
+                        record(vec![
+                            ("prefix", Value::bytes(prefix.as_bytes())),
+                            (
+                                "deps",
+                                Value::list(
+                                    deps.iter().map(|d| Value::bytes(d.as_bytes())).collect(),
+                                ),
+                            ),
+                        ])
+                    })
+                    .collect(),
+                Value::list(
+                    front
+                        .mod_pkg
+                        .iter()
+                        .map(|i| Value::Int(*i as i64))
+                        .collect(),
+                ),
+            )
+        };
         let args = vec![
             Value::list(names),
             Value::list(srcs),
             ctors,
             builtins,
             Value::list(roots),
+            Value::list(pkgs),
+            mod_pkg,
         ];
         tally(|census| census.wanted.push(wanted.to_vec()));
         let value = self.call(ENTRY, &args)?;
@@ -635,10 +672,47 @@ pub fn front_dump(sources: &[(String, String)]) -> Result<String> {
 
 const CLAIMS: &str = "front.claims_dump";
 
-/// Every body, clause and law of a program [`front`] already checked, lowered.
-pub fn claims_dump(sources: &[(String, String)]) -> Result<String> {
+/// Every body, clause and law of a program [`front`] already checked, lowered, resolving the
+/// way the front end did: `packages` and `mod_pkg` are what it published, or empty for a
+/// program without packages.
+pub fn claims_dump(
+    sources: &[(String, String)],
+    packages: &[(String, Vec<String>)],
+    mod_pkg: &[usize],
+) -> Result<String> {
     tally(|census| census.claimed += sources.len());
-    dump_over(CLAIMS, sources)
+    let (pkgs, mods, shelf) = if packages.is_empty() {
+        (
+            Value::list(Vec::new()),
+            Value::list(Vec::new()),
+            Value::Int(0),
+        )
+    } else {
+        (
+            Value::list(
+                packages
+                    .iter()
+                    .map(|(prefix, deps)| {
+                        record(vec![
+                            ("prefix", Value::bytes(prefix.as_bytes())),
+                            (
+                                "deps",
+                                Value::list(
+                                    deps.iter().map(|d| Value::bytes(d.as_bytes())).collect(),
+                                ),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+            Value::list(mod_pkg.iter().map(|i| Value::Int(*i as i64)).collect()),
+            Value::Int(packages.len() as i64),
+        )
+    };
+    string_answer(
+        CLAIMS,
+        call(CLAIMS, &[source_list(sources), pkgs, mods, shelf])?,
+    )
 }
 
 const BUILTINS: &str = "front.builtins_dump";
@@ -965,24 +1039,137 @@ pub struct Pulled {
     pub dump: String,
 }
 
+const WANTS: &str = "pkg.wants_dump";
+
+/// What the manifests on hand ask for beyond `known`: the walk's next reads, as root keys.
+pub fn pkg_wants(known: &[String], manifests: &[SuppliedPackage]) -> Result<Vec<String>> {
+    let answer = call(
+        WANTS,
+        &[
+            Value::list(known.iter().map(|r| Value::bytes(r.as_bytes())).collect()),
+            Value::list(
+                manifests
+                    .iter()
+                    .map(|s| {
+                        record(vec![
+                            ("root", Value::bytes(s.root.as_bytes())),
+                            (
+                                "manifest",
+                                match &s.manifest {
+                                    Some(src) => {
+                                        Value::ctor("Some", vec![Value::bytes(src.as_bytes())])
+                                    }
+                                    None => Value::ctor("None", Vec::new()),
+                                },
+                            ),
+                            ("modules", source_list(&s.modules)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ],
+    )?;
+    let Value::Str(json) = &answer else {
+        bail!(
+            "`{WANTS}` answered a {} rather than a string",
+            answer.type_name()
+        );
+    };
+    let parsed: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| anyhow!("`{WANTS}` answered JSON that does not read: {e}"))?;
+    let Some(wants) = parsed.get("wants").and_then(|w| w.as_array()) else {
+        bail!("`{WANTS}` answered JSON without a `wants` array");
+    };
+    wants
+        .iter()
+        .map(|w| {
+            w.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("`{WANTS}` answered a want that is not a string"))
+        })
+        .collect()
+}
+
 /// [`front_pulling_std_with`] over a front end that has been handed nothing.
 pub fn front_pulling_std(
     user: &[(String, String)],
     shipped: &[(String, String)],
 ) -> Result<Pulled> {
-    front_pulling_std_with(user, shipped, &[], &[], None)
+    front_pulling_std_with(user, shipped, &[], &[], &Packages::anonymous(String::new()))
 }
 
 /// [`front_dump`] over `user` plus each module of `shipped` it imports, transitively, placed
 /// as the CLI driver places them: a round of newly imported modules at a time, each in byte order.
 /// `defs` and `tests` carry what a previous answer published, which the front end takes wherever
 /// this program hashes that item the same.
+/// A dependency package the walk read: its root, its manifest text when the root holds one,
+/// and its modules named relative to the root.
+pub struct SuppliedPackage {
+    pub root: String,
+    pub manifest: Option<String>,
+    pub modules: Vec<(String, String)>,
+}
+
+/// The packages of one load, as `pkg.Pkgs` takes them.
+pub struct Packages {
+    pub root: String,
+    pub manifest: Option<String>,
+    pub supplied: Vec<SuppliedPackage>,
+}
+
+impl Packages {
+    /// The root package only, with no manifest read: what a project without packages is.
+    pub fn anonymous(root: String) -> Packages {
+        Packages {
+            root,
+            manifest: None,
+            supplied: Vec::new(),
+        }
+    }
+
+    fn value(&self) -> Value {
+        record(vec![
+            ("root", Value::bytes(self.root.as_bytes())),
+            (
+                "manifest",
+                match &self.manifest {
+                    Some(src) => Value::ctor("Some", vec![Value::bytes(src.as_bytes())]),
+                    None => Value::ctor("None", Vec::new()),
+                },
+            ),
+            (
+                "supplied",
+                Value::list(
+                    self.supplied
+                        .iter()
+                        .map(|s| {
+                            record(vec![
+                                ("root", Value::bytes(s.root.as_bytes())),
+                                (
+                                    "manifest",
+                                    match &s.manifest {
+                                        Some(src) => {
+                                            Value::ctor("Some", vec![Value::bytes(src.as_bytes())])
+                                        }
+                                        None => Value::ctor("None", Vec::new()),
+                                    },
+                                ),
+                                ("modules", source_list(&s.modules)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+        ])
+    }
+}
+
 pub fn front_pulling_std_with(
     user: &[(String, String)],
     shipped: &[(String, String)],
     defs: &[KnownDef],
     tests: &[KnownTest],
-    manifest: Option<&str>,
+    packages: &Packages,
 ) -> Result<Pulled> {
     let known_defs = Value::list(
         defs.iter()
@@ -1017,10 +1204,7 @@ pub fn front_pulling_std_with(
             source_list(shipped),
             known_defs,
             known_tests,
-            match manifest {
-                Some(src) => Value::ctor("Some", vec![Value::bytes(src.as_bytes())]),
-                None => Value::ctor("None", Vec::new()),
-            },
+            packages.value(),
         ],
     )?;
     let Value::Str(answer) = &answer else {

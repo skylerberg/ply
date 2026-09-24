@@ -146,7 +146,12 @@ fn emit_all(
             match emission {
                 Ok((text, tables)) => {
                     match tables.calls.iter().find(|c| !taken.contains(c)).cloned() {
-                        Some(missing) => round.push(dropped(name, missing)),
+                        Some(missing) => {
+                            if std::env::var("PLY_EMIT_DEBUG").is_ok() {
+                                eprintln!("drop {name}: calls {missing}");
+                            }
+                            round.push(dropped(name, missing));
+                        }
                         None => {
                             symbols.insert(name.clone(), defines(name, &tables));
                             // A group's one body is placed once, where its first member is taken.

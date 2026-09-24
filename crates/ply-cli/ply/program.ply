@@ -6,6 +6,7 @@ import std.fs (fs)
 import std.time (time)
 import compiler.front (Refused, Analysed, Whole, Pulled, analyse_pulling_std_with, module_items,
                        module_imports)
+import compiler.pkg (Pkgs, Supplied)
 import compiler.hash (HashOutput, hex)
 import compiler.items (Item, IFn)
 import compiler.infer (DefInfo, Loc)
@@ -13,7 +14,8 @@ import compiler.resolve (Source, Mod, Diag, Label, diag1, qualify)
 import compiler.tycore (TyCon, TyFn)
 import diagnostic (Place, spot_of)
 import paths
-import sources (File, Project, load, load_resolved, shelf, nothing_here, is_std, is_compiler)
+import sources (File, Project, DepPackage, load, load_resolved, shelf, nothing_here, is_std,
+                is_compiler)
 
 // `whole` is `None` exactly when `diags` holds an error: a stage that reported stopped the rest.
 pub type Program = {
@@ -71,21 +73,48 @@ fn broken(project: Project, places: List<Place>, diags: List<Diag>) -> Program =
 fn own_places(project: Project) -> List<Place> =
   map(project.files, |f: File| { path: f.path, text: f.text })
 
+fn supplied(project: Project) -> List<Supplied> =
+  map(project.packages, |p: DepPackage|
+    {
+      root: bytes_of_string(p.root),
+      manifest: p.manifest,
+      modules: map(p.files, |f: File| { name: bytes_of_string(f.module), src: f.text }),
+    })
+
+fn dep_places(project: Project) -> List<Place> =
+  fold(project.packages, [], |acc: List<Place>, p: DepPackage|
+    fold(p.files, acc, |acc2: List<Place>, f: File| push(acc2, { path: f.path, text: f.text })))
+
+// Manifest places in slot order: the root's first, then each dependency's in walk order.
+fn manifest_places(project: Project) -> List<Place> = {
+  let deps = fold(project.packages, [], |acc: List<Place>, p: DepPackage|
+    match p.manifest {
+      None -> acc,
+      Some(text) -> push(acc, { path: p.root ++ "/ply.pkg", text: text }),
+    });
+  match project.manifest {
+    None -> deps,
+    Some(f) -> {
+      let root: List<Place> = [{ path: f.path, text: f.text }];
+      fold(deps, root, |acc: List<Place>, pl: Place| push(acc, pl))
+    },
+  }
+}
+
 fn analysed(project: Project, shelved: List<Source>) -> Program = {
   let texts = fold(shelved, map_new(), |acc: Map<String, Bytes>, s: Source|
     map_insert(acc, string_of_bytes_lossy(s.name), s.src));
-  let pulled: Pulled = analyse_pulling_std_with(
-    project.sources,
-    shelved,
-    [],
-    [],
-    match project.manifest { None -> None, Some(f) -> Some(f.text) },
-  );
-  let shelved_places = map(pulled.pulled, |n: Bytes| shelf_place(texts, string_of_bytes_lossy(n)));
-  let places = match project.manifest {
-    None -> appended(own_places(project), shelved_places),
-    Some(f) -> push(appended(own_places(project), shelved_places), { path: f.path, text: f.text }),
+  let pkgs: Pkgs = {
+    root: bytes_of_string(project.root_key),
+    manifest: match project.manifest { None -> None, Some(f) -> Some(f.text) },
+    supplied: supplied(project),
   };
+  let pulled: Pulled = analyse_pulling_std_with(project.sources, shelved, [], [], pkgs);
+  let shelved_places = map(pulled.pulled, |n: Bytes| shelf_place(texts, string_of_bytes_lossy(n)));
+  let places = appended(
+    appended(appended(own_places(project), dep_places(project)), shelved_places),
+    manifest_places(project),
+  );
   match pulled.out {
     Refused(ds) -> broken(project, places, ds),
     Analysed(w) -> { files: project.files, places: places, diags: w.warnings, whole: Some(w) },

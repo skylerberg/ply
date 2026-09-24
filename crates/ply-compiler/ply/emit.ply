@@ -10,7 +10,7 @@ import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, Ty
               parse, ImportDecl, ImportKind, INames, IModule, IAlias, Binder, SpecClause, SRequires,
               SEnsures, FnDef)
 import resolve (Mod, Source, Resolved_, Failed, resolve_modules, Resolved, Scope, Binding, ModBind,
-                qualify)
+                Pkg, resolve_packaged, no_pkgs, default_binder, find_modbind, qualify)
 import derive (expand_derives)
 import infer (emit_facts, LabelSite, expanded_mods, sccs)
 import exprs (Param, Expr, EHandle, ESimulate, EUnary, EBinary, ELambda, EApp, EIf, EMatch, EBlock,
@@ -225,6 +225,9 @@ fn line(em: Em, text: Bytes) -> Em =
     bound: em.bound,
     group: em.group,
   }
+
+fn at<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the tables do not hold") }
 
 fn pad(ind: Int) -> Bytes = if ind <= 0 { b"  " } else { bytes_concat(b"  ", pad(ind - 1)) }
 
@@ -7173,7 +7176,7 @@ fn emit_all_in(
 ) -> List<Emitted> = {
   let r = parse(src);
   let x = expand(r.node, r.p.uses_sets, r.p.diags);
-  emit_module(module, x.module, ctors, builtins, [], [], [], release, None, map_new())
+  emit_module(module, x.module, ctors, builtins, [], [], [], release, None, map_new(), None, 0, [])
 }
 
 fn aliases_in(m: Module) -> List<Alias> =
@@ -7222,16 +7225,20 @@ fn emit_all_program(
   ctors: List<Bytes>,
   builtins: List<Bytes>,
   release: Bool,
-) -> List<Emitted> = emit_program(sources, ctors, builtins, release, None)
+) -> List<Emitted> = emit_program(sources, ctors, builtins, release, None, [], [])
 
 // Resolved together first, so defaults are filled and derives expanded; a program that does not resolve emits nothing.
 // Every root is resolved against, but only those `wanted` names are emitted; `None` wants them all.
+// `pkgs` and `mod_pkg` are the program's package tables, empty for one without packages:
+// resolution then treats every module as one package's, which is what no packages means.
 fn emit_program(
   sources: List<Source>,
   ctors: List<Bytes>,
   builtins: List<Bytes>,
   release: Bool,
   wanted: Option<Map<Bytes, Bool>>,
+  pkgs: List<Pkg>,
+  mod_pkg: List<Int>,
 ) -> List<Emitted> = {
   let parsed = map(range(0, len(sources)), |i: Int| {
     let s = match list_at(sources, i) { Some(x) -> x, None -> { name: b"", src: b"" } };
@@ -7246,10 +7253,14 @@ fn emit_program(
       |acc: Bool, p: { name: Bytes, module: Module, derived: List<Derived>, bad: Bool }|
         acc || p.bad,
     ) { [] } else {
-    match resolve_modules(
-        map(parsed, |p: { name: Bytes, module: Module, derived: List<Derived>, bad: Bool }|
-          { name: p.name, module: p.module, derived: p.derived }),
-      ) {
+    let mods0: List<Mod> = map(
+      parsed,
+      |p: { name: Bytes, module: Module, derived: List<Derived>, bad: Bool }|
+        { name: p.name, module: p.module, derived: p.derived },
+    );
+    let packaged = if len(pkgs) == 0 { no_pkgs(mods0) }
+    else { { pkgs: pkgs, mod_pkg: mod_pkg, shelf: len(pkgs) } };
+    match resolve_packaged(mods0, packaged.pkgs, packaged.mod_pkg, packaged.shelf) {
       Failed(_) -> [],
       Resolved_(x) -> match emit_facts(x.r, x.mods) {
         None -> [],
@@ -7281,6 +7292,9 @@ fn emit_program(
                     release,
                     wanted,
                     sites_in(facts.label_sites, i),
+                    Some(x.r),
+                    i,
+                    mods,
                   ),
                   acc,
                   |a: List<Emitted>, e: Emitted| push(a, e),
@@ -7290,6 +7304,38 @@ fn emit_program(
       },
     }
   }
+}
+
+// One import's module as it is written and as it resolves: a dependency's sibling import is
+// written bare and means the module of the same package, which the scope's binders name.
+fn resolved_imports(
+  r: Resolved,
+  index: Int,
+  mods: List<Mod>,
+  x_module: Module,
+  defs_of: (Bytes) -> List<Def>,
+) -> List<Imported> = {
+  let full_of = |j: Int, written: Bytes|
+    match list_at(at(r.imports, index), j) { Some(t) -> at(mods, t).name, None -> written };
+  fold(range(0, len(x_module.imports)), [], |acc: List<Imported>, j: Int| {
+    let im = at(x_module.imports, j);
+    match im.kind {
+      INames(ns) -> {
+        let full = full_of(j, bytes_join_dots(map(im.path, |i: Ident| i.name)));
+        fold(ns, acc, |a: List<Imported>, n: Ident|
+          push(a, { name: n.name, module: full, defs: defs_of(full) }))
+      },
+      // A whole module binds under its last segment or alias; the binder goes under the empty name so one table answers both spellings.
+      IModule -> {
+        let full = full_of(j, bytes_join_dots(map(im.path, |i: Ident| i.name)));
+        push(acc, { name: last_segment(im.path), module: full, defs: defs_of(full) })
+      },
+      IAlias(a2) -> {
+        let full = full_of(j, bytes_join_dots(map(im.path, |i: Ident| i.name)));
+        push(acc, { name: a2.name, module: full, defs: defs_of(full) })
+      },
+    }
+  })
 }
 
 // The labels each call in this module fills, keyed by the call's span, which the lowering reads.
@@ -7311,28 +7357,18 @@ fn emit_module(
   release: Bool,
   wanted: Option<Map<Bytes, Bool>>,
   sites: Map<Bytes, List<Bytes>>,
+  resolved: Option<Resolved>,
+  index: Int,
+  mods: List<Mod>,
 ) -> List<Emitted> = {
   let x = { module: x_module };
   let defs_of = |path: Bytes|
     fold(program, [], |acc: List<Def>, md: ModDefs| if md.module == path { md.defs } else { acc });
   let others = others_of(x.module, program);
-  let imports = fold(x.module.imports, [], |acc: List<Imported>, im: ImportDecl|
-    match im.kind {
-      INames(ns) -> {
-        let path = bytes_join_dots(map(im.path, |i: Ident| i.name));
-        fold(ns, acc, |a: List<Imported>, n: Ident|
-          push(a, { name: n.name, module: path, defs: defs_of(path) }))
-      },
-      // A whole module binds under its last segment or alias; the binder goes under the empty name so one table answers both spellings.
-      IModule -> {
-        let path = bytes_join_dots(map(im.path, |i: Ident| i.name));
-        push(acc, { name: last_segment(im.path), module: path, defs: defs_of(path) })
-      },
-      IAlias(a2) -> {
-        let path = bytes_join_dots(map(im.path, |i: Ident| i.name));
-        push(acc, { name: a2.name, module: path, defs: defs_of(path) })
-      },
-    });
+  let imports = match resolved {
+    None -> [],
+    Some(r) -> resolved_imports(r, index, mods, x_module, defs_of),
+  };
   let aliases = fold(x.module.items, [], |acc: List<Alias>, it: Item|
     match it {
       IType(t) -> match t.body {
@@ -8045,6 +8081,8 @@ pub fn emit_roots(
   ctors: List<Bytes>,
   builtins: List<Bytes>,
   wanted: List<Bytes>,
+  pkgs: List<Pkg>,
+  mod_pkg: List<Int>,
 ) -> String =
   unit_frames(
     emit_program(
@@ -8053,6 +8091,8 @@ pub fn emit_roots(
       builtins,
       true,
       Some(fold(wanted, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true))),
+      pkgs,
+      mod_pkg,
     ),
   )
 
