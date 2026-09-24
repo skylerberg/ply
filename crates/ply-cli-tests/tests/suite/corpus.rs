@@ -167,6 +167,39 @@ test "a long array decodes" {
     entered(&report, "the compiled tier");
 }
 
+/// `|>` is sugar for the call it writes, so a piped program runs on both tiers.
+#[test]
+fn a_piped_program_runs_the_call_it_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("m.ply"),
+        r#"fn inc(x: Int) -> Int = x + 1
+fn add(a: Int, b: Int) -> Int = a + b
+fn sum(xs: List<Int>) -> Int = fold(xs, 0, add)
+
+test "a pipe is the call it writes" {
+  assert_eq(1 |> inc() |> add(10), add(inc(1), 10));
+  assert_eq(5 |> add(100, _), 105);
+  assert_eq([1, 2, 3] |> sum(), 6);
+  assert_eq(range(0, 5) |> map(inc) |> sum(), 15)
+}
+"#,
+    )
+    .unwrap();
+    let out = ply(dir.path())
+        .args(["test", ".", "--no-cache", "--json"])
+        .output()
+        .unwrap();
+    green(&json(&out), "a piped program on the evaluator");
+    let out = ply(dir.path())
+        .args(["test", ".", "--no-cache", "--backend", "c", "--json"])
+        .output()
+        .unwrap();
+    let report = json(&out);
+    green(&report, "a piped program on the compiled tier");
+    entered(&report, "the compiled tier");
+}
+
 #[test]
 fn the_language_corpus_is_green_on_the_default_tier_and_as_the_only_engine() {
     ply(&repo())
