@@ -106,16 +106,23 @@ Loosest to tightest; all binary operators are left-associative:
 | 1 | `\|\|` | `Bool` |
 | 2 | `&&` | `Bool` |
 | 3 | `==` `!=` `<` `<=` `>` `>=` | see below |
-| 4 | `\|` | integer |
-| 5 | `^` | integer |
-| 6 | `&` | integer |
-| 7 | `<<` `>>` `>>>` | integer; the count is `Int` |
-| 8 | `++` | `String` or `Bytes` |
-| 9 | `+` `-` | numeric |
-| 10 | `*` `/` `%` | numeric |
+| 4 | `\|>` | left operand piped into the right-hand call |
+| 5 | `\|` | integer |
+| 6 | `^` | integer |
+| 7 | `&` | integer |
+| 8 | `<<` `>>` `>>>` | integer; the count is `Int` |
+| 9 | `++` | `String` or `Bytes` |
+| 10 | `+` `-` | numeric |
+| 11 | `*` `/` `%` | numeric |
 | — | prefix `-` `!` `~` | numeric / `Bool` / integer |
 | — | postfix `f(x)` `r.field` `e.op[r](x)` `e?` | |
 
+* `x |> f(a, b)` calls `f(x, a, b)`: the left operand is the call's first
+  argument, and `_` stands for it once when it goes elsewhere (`x |> g(a, _)`
+  is `g(a, x)`). The right operand is a call or a name, not a general
+  expression, so `x |> f(a) + 1` is `f(x, a) + 1` and `a == b |> f()` is
+  `a == f(b)`. The pipe is tighter than the comparisons and looser than `|`.
+  The piped and written spellings build one definition and hash alike.
 * `==`/`!=` are structural at every type except functions. `Float` equality is
   IEEE, so `NaN != NaN`. `<` `<=` `>` `>=` work only on numeric types; order
   anything else with `compare`.
@@ -413,7 +420,8 @@ it.
 
 A bare variable followed by `.name(` is an effect perform, so a function in a
 record field is called as `(codec.decode)(json)`; `int_json().decode(j)` needs
-no parentheses because its base is a call.
+no parentheses because its base is a call. When the value to pass is the one
+being computed, `x |> f(a, b)` is the same call as `f(x, a, b)` (§2.4).
 
 Positional arguments fill parameters left to right; the rest must be named
 (`greet("ada", greeting: "hey")`) or defaulted. A positional argument after a
@@ -1540,7 +1548,8 @@ imports, items and statements; it prints `formatted PATH` per file it changed
 and leaves a file that does not parse alone, exiting 2 with the diagnostic. A
 directory whose name starts with `.`, and one named `target`, are not walked; a
 symlink found while walking is passed over, and one named on the command line is
-an error rather than a file to rewrite.
+an error rather than a file to rewrite. A `|>` is sugar for the call it writes,
+so `ply fmt` prints the call, not the pipe.
 
 `ply show NAME` and `ply replace NAME` are the edit loop for one definition: read
 it, rewrite it, and touch nothing else in the file. The replacement is one item
