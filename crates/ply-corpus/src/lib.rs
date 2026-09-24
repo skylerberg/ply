@@ -68,22 +68,6 @@ pub fn run_on_tier(
     ply_test::run_with(selection, &front.check, &front.hashes, store, &executor)
 }
 
-/// Runs `f` on a thread with a stack deep enough for the tier's longest legal recursion.
-/// The compiled tier recurses on the native stack; this mirrors `ply-cli`'s `WORKER_STACK`.
-pub fn on_deep_stack<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    const DEEP_STACK: usize = 256 << 20;
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(DEEP_STACK)
-            .spawn_scoped(scope, f)
-            .expect("a deep-stack thread")
-            .join()
-            .unwrap_or_else(|_| {
-                std::panic::resume_unwind(Box::new("the deep-stack thread panicked"))
-            })
-    })
-}
-
 #[derive(Clone, Debug)]
 pub struct Verified {
     pub definitions: usize,
