@@ -1217,15 +1217,27 @@ fn an_edit_walks_the_definitions_that_depend_on_it_and_no_others() {
         })
         .collect();
 
-    let kept = producer::front_pulling_std_with(&program("1"), &[], &known, &[], None)
-        .expect("the program checks");
+    let kept = producer::front_pulling_std_with(
+        &program("1"),
+        &[],
+        &known,
+        &[],
+        &producer::Packages::anonymous(String::new()),
+    )
+    .expect("the program checks");
     for (name, footprint) in footprints(&kept.dump, 2) {
         assert_eq!(footprint, SENTINEL, "`{name}` was walked, not taken");
     }
 
     // One body edited: `one` moves, and with it everything that reaches it, and nothing else.
-    let after = producer::front_pulling_std_with(&program("11"), &[], &known, &[], None)
-        .expect("the program checks");
+    let after = producer::front_pulling_std_with(
+        &program("11"),
+        &[],
+        &known,
+        &[],
+        &producer::Packages::anonymous(String::new()),
+    )
+    .expect("the program checks");
     let walked: Vec<String> = footprints(&after.dump, 2)
         .into_iter()
         .filter(|(_, footprint)| footprint != SENTINEL)

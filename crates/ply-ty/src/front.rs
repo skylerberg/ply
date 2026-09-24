@@ -93,6 +93,12 @@ pub struct Front {
     pub diagnostics: Vec<Diagnostic>,
     /// Dependency-first module order, by module name.
     pub order: Vec<Symbol>,
+    /// The closure's packages as `(prefix, declared dep prefixes)`; empty for a project
+    /// without packages.
+    pub packages: Vec<(String, Vec<String>)>,
+    /// Each module's package, in program order: an index into `packages`, or one past the end
+    /// for a module the toolchain ships.
+    pub mod_pkg: Vec<usize>,
     pub check: CheckOutput,
     pub hashes: HashOutput,
     /// The hasher's item order: every hashed name, test and law, as the `hash` frames are written.
@@ -156,6 +162,19 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
         p.field("module", m.as_str());
     }
     p.frame(&mut out, "order", "_");
+
+    for (prefix, deps) in &front.packages {
+        let mut p = Payload::default();
+        for dep in deps {
+            p.field("dep", dep.as_str());
+        }
+        p.frame(&mut out, "pkg", prefix.as_str());
+    }
+    let mut p = Payload::default();
+    for i in &front.mod_pkg {
+        p.field("pkg", &i.to_string());
+    }
+    p.frame(&mut out, "modpkg", "_");
 
     for (name, m) in &front.check.modules {
         let mut p = Payload::default();
@@ -612,6 +631,25 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
                 for (key, text) in Fields::of(payload, &what)?.all() {
                     match key {
                         "module" => front.order.push(Symbol::new(text)),
+                        other => return Err(unknown_field(&what, other)),
+                    }
+                }
+            }
+            "pkg" => {
+                let mut deps = Vec::new();
+                for (key, text) in Fields::of(payload, &what)?.all() {
+                    match key {
+                        "dep" => deps.push(text.to_string()),
+                        other => return Err(unknown_field(&what, other)),
+                    }
+                }
+                front.packages.push((name.to_string(), deps));
+            }
+            "modpkg" => {
+                let fields = Fields::of(payload, &what)?;
+                for (key, text) in fields.all() {
+                    match key {
+                        "pkg" => front.mod_pkg.push(fields.number(text, "pkg")?),
                         other => return Err(unknown_field(&what, other)),
                     }
                 }

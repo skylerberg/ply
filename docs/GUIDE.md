@@ -203,8 +203,28 @@ The body is data, not code: a literal, a constructor applied to literals, a
 record or a list — the judgment §3.1 states for parameter defaults — refused
 with `E0130` otherwise, as a manifest with any other shape is `E0129` and a
 field that does not decode or fails validation is `E0131`. A project without
-`ply.pkg` is the anonymous package. The manifest is checked on every load;
-its fields become meaningful as the package system grows.
+`ply.pkg` is the anonymous package.
+
+Each dependency grants its package's module prefix, and only what is declared
+may be imported. A package's own modules answer to its sibling names:
+
+```ply
+import store.orders        // a module of this package, as before
+import cli.cmdline         // a module of the declared dependency `cli`
+```
+
+A dependency is another package root: `Path("../cli")` names the directory
+its `ply.pkg` stands in, and the dependency must hold one (`E0135`). Its
+modules answer to `<prefix>.<name>` for every package that declares it — the
+same dependency's own `import args` means *its* sibling `args`, never the
+importing package's. Reaching a package the manifest does not declare is
+`E0132`, two packages granting one prefix is `E0133` — as is a module of the
+root package squatting on a dependency's prefix — and a cycle of packages is
+`E0134`. `Git` and `Registry` sources are checked and refused for now: only
+path dependencies resolve.
+
+The manifest is checked on every load; the `min` version and the lockfile
+arrive with resolution (a `Path` dependency is exactly what is on disk).
 
 ## 4. Types
 
