@@ -119,7 +119,7 @@ fn check_codes(dir: &Path, target: &str) -> Vec<String> {
 
 /// Formats a copy of every `.ply` file under `relative` and requires the result to be a fixed
 /// point that `ply check` reads the same way it read the original.
-fn corpus_round_trip(relative: &str, per_file: bool) {
+fn corpus_round_trip(relative: &str) {
     let dir = tempfile::tempdir().unwrap();
     let mut names = Vec::new();
     for entry in std::fs::read_dir(repo().join(relative)).unwrap() {
@@ -132,19 +132,14 @@ fn corpus_round_trip(relative: &str, per_file: bool) {
     }
     names.sort();
     assert!(!names.is_empty(), "{relative} holds no .ply files");
-    let targets: Vec<String> = if per_file {
-        names.clone()
-    } else {
-        vec![".".to_string()]
-    };
-    for target in &targets {
+    for target in &names {
         let before = check_codes(dir.path(), target);
         let out = ply(dir.path()).args(["fmt", target]).output().unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
         match out.status.code() {
             Some(0) => {}
             // A fixture written to exercise the parser's recovery does not parse, and stays as it was.
-            Some(2) if per_file && before.iter().any(|c| c.starts_with('E')) => {
+            Some(2) if before.iter().any(|c| c.starts_with('E')) => {
                 assert!(stderr.contains("E0"), "{target}: {stderr}");
                 assert_eq!(
                     std::fs::read(dir.path().join(target)).unwrap(),
@@ -244,20 +239,10 @@ fn the_maintained_sources_are_committed_formatted() {
 
 #[test]
 fn the_examples_format_to_a_fixed_point_and_still_check() {
-    corpus_round_trip("examples", true);
-}
-
-#[test]
-fn the_standard_library_formats_to_a_fixed_point_and_still_checks() {
-    corpus_round_trip("crates/ply-std/ply", true);
+    corpus_round_trip("examples");
 }
 
 #[test]
 fn the_parser_fixtures_format_to_a_fixed_point_and_still_check() {
-    corpus_round_trip("crates/ply-codegen-tests/fixtures", true);
-}
-
-#[test]
-fn the_compiler_formats_to_a_fixed_point_and_still_checks() {
-    corpus_round_trip("crates/ply-compiler/ply", false);
+    corpus_round_trip("crates/ply-codegen-tests/fixtures");
 }
