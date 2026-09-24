@@ -3,11 +3,16 @@
 
 import std.fs (fs)
 import compiler.resolve (Source, Diag, Label, diag1)
+import compiler.pkg (Supplied, wants)
 import paths
 import walk (Failure, Found, sweep, sweep_l, is_ply)
 
 // One module of the program: where it was read from, what it is called, and its bytes.
 pub type File = { path: String, module: String, text: Bytes }
+
+// A dependency package the walk read: its manifest text and its modules, as files for
+// placing and as sources for the front end.
+pub type DepPackage = { root: String, manifest: Option<Bytes>, files: List<File> }
 
 // The program as the front end takes it, with whatever the walk could not turn into a module.
 pub type Project = {
@@ -15,6 +20,9 @@ pub type Project = {
   sources: List<Source>,
   diags: List<Diag>,
   manifest: Option<File>,
+  packages: List<DepPackage>,
+  // The key the package walk rooted at, which dependency paths resolve against.
+  root_key: String,
 }
 
 // --- Module names -------------------------------------------------------------
@@ -156,7 +164,14 @@ fn one_file_l(
 
 // Every `.ply` file the paths name, in path order, with the ones that cannot be modules refused.
 pub fn read(found: Found) -> Project / {fs.read_file[cwd], fs.read_file[abs]} = {
-  let start: Project = { files: [], sources: [], diags: [], manifest: None };
+  let start: Project = {
+    files: [],
+    sources: [],
+    diags: [],
+    manifest: None,
+    packages: [],
+    root_key: "",
+  };
   let filed: Project = fold(map_keys(found.files), start, |acc: Project, path: String|
     one_file(acc, path));
   fold(found.errors, filed, |acc: Project, e: Failure|
@@ -175,7 +190,14 @@ pub fn load_l(
   paths: List<String>,
 ) -> Project / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]} = {
   let found = sweep_l(label, paths);
-  let start: Project = { files: [], sources: [], diags: [], manifest: None };
+  let start: Project = {
+    files: [],
+    sources: [],
+    diags: [],
+    manifest: None,
+    packages: [],
+    root_key: "",
+  };
   let filed: Project = fold(map_keys(found.files), start, |acc: Project, path: String|
     one_file_l(label, root, acc, path));
   fold(found.errors, filed, |acc: Project, e: Failure|
@@ -187,11 +209,101 @@ pub fn load_resolved(
   rs: List<paths::Resolved>,
 ) -> Project / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]} = {
   let rs = if len(rs) == 0 { [paths::here()] } else { rs };
-  fold(
+  let merged = fold(
     rs,
-    { files: [], sources: [], diags: [], manifest: None },
+    { files: [], sources: [], diags: [], manifest: None, packages: [], root_key: "" },
     |acc: Project, r: paths::Resolved|
       merge(acc, with_manifest(r, load_l(r.label, paths::root_prefix(r), [paths::address(r)]))),
+  );
+  match list_at(rs, 0) {
+    None -> merged,
+    Some(first) ->
+      {
+        ..merged,
+        packages: walk_packages(first.absolute, merged.manifest),
+        root_key: first.absolute,
+      },
+  }
+}
+
+// --- The package walk ---------------------------------------------------------
+// What the root's manifest asks for, round by round, under `abs` so a sibling directory is
+// as reachable as a child one. All judgments about the graph are the front end's; this walk
+// only reads what `wants` names.
+
+fn read_dep_modules(
+  root: String,
+) -> List<File> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]} = {
+  let swept = under_abs(root);
+  let found = sweep_l("abs", [swept]);
+  let ordered = map_keys(found.files);
+  fold(ordered, [], |acc: List<File>, path: String|
+    match paths::strip_prefix(path, swept) {
+      None -> acc,
+      Some(rest) -> match read_at("abs", path) {
+        None -> acc,
+        Some(text) -> match module_of(rest) {
+          Err(_) -> acc,
+          Ok(name) -> push(acc, { path: root ++ "/" ++ rest, module: name, text: text }),
+        },
+      },
+    })
+}
+
+// `abs` is rooted at the filesystem's root and takes paths relative to it, so an absolute key
+// reads as its own spelling without the leading slash.
+fn under_abs(path: String) -> String =
+  if string_starts_with(path, "/") { string_slice(path, 1, string_len(path)) } else { path }
+
+fn read_dep(
+  root: Bytes,
+) -> DepPackage / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]} = {
+  let here = string_of_bytes_lossy(root);
+  match read_at("abs", under_abs(here) ++ "/ply.pkg") {
+    None -> { root: here, manifest: None, files: [] },
+    Some(text) -> { root: here, manifest: Some(text), files: read_dep_modules(here) },
+  }
+}
+
+fn walk_round(
+  known: List<Bytes>,
+  manifests: List<Supplied>,
+  supplied: List<DepPackage>,
+) -> List<DepPackage> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]} =
+  match wants(known, manifests) {
+    [] -> supplied,
+    wanted -> {
+      let next = fold(
+        wanted,
+        { known: known, manifests: manifests, supplied: supplied },
+        |acc: { known: List<Bytes>, manifests: List<Supplied>, supplied: List<DepPackage> }, root: Bytes| {
+          let package = read_dep(root);
+          {
+            known: push(acc.known, root),
+            manifests: push(acc.manifests, { root: root, manifest: package.manifest, modules: [] }),
+            supplied: push(acc.supplied, package),
+          }
+        },
+      );
+      walk_round(next.known, next.manifests, next.supplied)
+    },
+  }
+
+fn walk_packages(
+  root: String,
+  manifest: Option<File>,
+) -> List<DepPackage> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]} = {
+  let root_key = bytes_of_string(root);
+  walk_round(
+    [root_key],
+    [
+      {
+        root: root_key,
+        manifest: match manifest { None -> None, Some(f) -> Some(f.text) },
+        modules: [],
+      },
+    ],
+    [],
   )
 }
 
@@ -222,6 +334,8 @@ fn merge(a: Project, b: Project) -> Project = {
     sources: sources,
     diags: fold(b.diags, a.diags, |acc: List<Diag>, d: Diag| push(acc, d)),
     manifest: match a.manifest { Some(_) -> a.manifest, None -> b.manifest },
+    packages: fold(b.packages, a.packages, |acc: List<DepPackage>, p: DepPackage| push(acc, p)),
+    root_key: if a.root_key == "" { b.root_key } else { a.root_key },
   }
 }
 

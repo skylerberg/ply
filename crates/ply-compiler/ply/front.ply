@@ -24,7 +24,8 @@ import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, L
               check_front_with, deriver_text, is_prelude_effect, builtin_schemes, BuiltinDoc,
               builtin_docs, find_doc)
 import diag (Parsed, parse_all, parse_at, outside_every_module, frame, framed, field, flag, placed)
-import pkg (check_source)
+import pkg (Pkgs, Closure, Package, closure, empty)
+import resolve (Pkg, resolve_packaged, no_pkgs)
 import std.hash (blake3)
 import std.pkg (Manifest)
 import fmt (item_range, replace_item)
@@ -526,6 +527,8 @@ fn tables(
   c: Front,
   index: Index,
   h: HashOutput,
+  packages: List<Pkg>,
+  mod_pkg: List<Int>,
 ) -> Dump = {
   let fns = fn_written(mods);
   let effs = effect_written(mods);
@@ -534,6 +537,8 @@ fn tables(
   {
     diags: map(warnings, framed_diag),
     order: map(r.order, |i: Int| at(mods, i).name),
+    packages: packages,
+    mod_pkg: mod_pkg,
     modules: map(range(0, len(mods)), |i: Int| module_row(i, at(mods, i), r, c.effects)),
     defs: map(c.defs, |d: DefInfo| def_row(d, written_of(fns, d.name))),
     types: type_rows(mods),
@@ -559,6 +564,10 @@ pub type Whole = {
   warnings: List<Diag>,
   // The project's `ply.pkg`, decoded; `None` is the anonymous package.
   manifest: Option<Manifest>,
+  // The closure's packages and each module's package, so the emitter and the claims lowerer
+  // resolve imports the way the front end did.
+  packages: List<Pkg>,
+  mod_pkg: List<Int>,
 }
 
 // A stage that reports stops the rest, so a refusal is the diagnostics of exactly one stage.
@@ -655,17 +664,52 @@ pub fn analyse_with(
   parsed: List<Parsed>,
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
-  manifest: Option<Bytes> = None,
+  pkgs: Pkgs = { root: b"", manifest: None, supplied: [] },
 ) -> Analysis = {
-  // The package's identity reports ahead of anything the program text has to say.
-  let pkg = match manifest {
-    None -> { manifest: None, diags: [] },
-    Some(src) -> check_source(src),
-  };
-  if len(pkg.diags) > 0 { Refused(map(pkg.diags, |d: PDiag| placed(len(parsed), d))) } else {
+  let clo = closure(pkgs, map(parsed, |p: Parsed| p.name));
+  let all = fold(clo.modules, parsed, |acc: List<Parsed>, m: { pkg: Int, src: Source }|
+    push(acc, parse_at(len(acc), m.src)));
+  analyse_closure(all, clo, defs, tests, len(parsed))
+}
+
+// The packages of a load as the front end's tables take them: the root package first, the
+// shelf one past the end, and every module mapped to the package it was parsed from. The
+// order is the root's modules, then the closure's dependency modules, then the pulled shelf.
+fn pkg_tables(
+  total: Int,
+  root_count: Int,
+  clo: Closure,
+) -> { pkgs: List<Pkg>, mod_pkg: List<Int>, shelf: Int } =
+  {
+    pkgs: map(clo.packages, |p: Package| { prefix: p.prefix, deps: p.deps }),
+    mod_pkg: map(range(0, total), |i: Int|
+      if i < root_count { 0 }
+      else if i < root_count + len(clo.modules) { at(clo.modules, i - root_count).pkg }
+      else { len(clo.packages) }),
+    shelf: len(clo.packages),
+  }
+
+fn analyse_closure(
+  parsed: List<Parsed>,
+  clo: Closure,
+  defs: List<KnownDefRow>,
+  tests: List<KnownTestRow>,
+  root_count: Int,
+) -> Analysis = {
+  // The packages' identity reports ahead of anything the program text has to say: manifest
+  // and graph diags point one slot past every module, in manifest order.
+  if len(clo.diags) > 0 {
+    Refused(map(clo.diags, |sd: { slot: Int, diag: PDiag }| placed(len(parsed) + sd.slot, sd.diag)))
+  } else {
     let early = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
     if len(early) > 0 { Refused(early) } else {
-      match resolve_modules(map(parsed, |p: Parsed| p.module)) {
+      let tables = pkg_tables(len(parsed), root_count, clo);
+      match resolve_packaged(
+          map(parsed, |p: Parsed| p.module),
+          tables.pkgs,
+          tables.mod_pkg,
+          tables.shelf,
+        ) {
         Failed(ds) -> Refused(map(ds, outside_every_module)),
         Resolved_(x) -> {
           let built = build_index(x.mods, x.r);
@@ -685,7 +729,9 @@ pub fn analyse_with(
                 index: built.index,
                 hashes: hashes,
                 warnings: map(unused(built.index), outside_every_module),
-                manifest: pkg.manifest,
+                manifest: at(clo.packages, 0).manifest,
+                packages: tables.pkgs,
+                mod_pkg: tables.mod_pkg,
               })
             }
           }
@@ -703,6 +749,8 @@ pub fn dump_of(a: Analysis) -> Dump =
       {
         diags: map(ds, framed_diag),
         order: [],
+        packages: [],
+        mod_pkg: [],
         modules: [],
         defs: [],
         types: [],
@@ -715,7 +763,8 @@ pub fn dump_of(a: Analysis) -> Dump =
         bodies: [],
         test_bodies: [],
       },
-    Analysed(w) -> tables(w.warnings, w.mods, w.r, w.checked, w.index, w.hashes),
+    Analysed(w) ->
+      tables(w.warnings, w.mods, w.r, w.checked, w.index, w.hashes, w.packages, w.mod_pkg),
   }
 
 pub fn front_dump(sources: List<Source>) -> String = front_dump_with(sources, [], [])
@@ -937,8 +986,16 @@ fn claim_frames(mods: List<Mod>, r: Resolved) -> List<Bytes> = {
   walked.frames
 }
 
-pub fn claims_dump(sources: List<Source>) -> String =
-  match resolve_modules(map(parse_all(sources), |p: Parsed| p.module)) {
+pub fn claims_dump(
+  sources: List<Source>,
+  pkgs: List<Pkg> = [],
+  mod_pkg: List<Int> = [],
+  shelf: Int = 0,
+) -> String = {
+  let mods = map(parse_all(sources), |p: Parsed| p.module);
+  let packaged = if len(pkgs) == 0 { no_pkgs(mods) }
+  else { { pkgs: pkgs, mod_pkg: mod_pkg, shelf: shelf } };
+  match resolve_packaged(mods, packaged.pkgs, packaged.mod_pkg, packaged.shelf) {
     Failed(_) -> panic("a program the front end checked does not resolve"),
     Resolved_(x) -> match update_shapes(x.r, x.mods) {
       None -> panic("a program the front end checked does not check"),
@@ -946,6 +1003,7 @@ pub fn claims_dump(sources: List<Source>) -> String =
         string_of_bytes(bytes_concat_all(claim_frames(expanded_mods(x.mods, shapes), x.r))),
     },
   }
+}
 
 pub fn rehash_dump(sources: List<Source>, pins: List<Pin>) -> String =
   match resolve_modules(map(parse_all(sources), |p: Parsed| p.module)) {
@@ -1134,19 +1192,25 @@ pub fn analyse_pulling_std_with(
   shipped: List<Source>,
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
-  manifest: Option<Bytes> = None,
+  pkgs: Pkgs = { root: b"", manifest: None, supplied: [] },
 ) -> Pulled = {
+  let clo = closure(pkgs, map(user, |s: Source| s.name));
   let texts = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
     map_insert(acc, s.name, s.src));
-  let x = pulling(len(user), texts, map(shipped, |s: Source| s.name), {
-    parsed: parse_all(user),
+  let assembled = fold(
+    clo.modules,
+    parse_all(user),
+    |acc: List<Parsed>, m: { pkg: Int, src: Source }| push(acc, parse_at(len(acc), m.src)),
+  );
+  let x = pulling(len(assembled), texts, map(shipped, |s: Source| s.name), {
+    parsed: assembled,
     pulled: [],
     diags: [],
   });
   {
     pulled: x.pulled,
     out: if len(x.diags) > 0 { Refused(x.diags) }
-    else { analyse_with(x.parsed, defs, tests, manifest) },
+    else { analyse_closure(x.parsed, clo, defs, tests, len(user)) },
   }
 }
 
@@ -1159,9 +1223,9 @@ pub fn front_pulling_std_with(
   shipped: List<Source>,
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
-  manifest: Option<Bytes> = None,
+  pkgs: Pkgs = { root: b"", manifest: None, supplied: [] },
 ) -> String = {
-  let x: Pulled = analyse_pulling_std_with(user, shipped, defs, tests, manifest);
+  let x: Pulled = analyse_pulling_std_with(user, shipped, defs, tests, pkgs);
   let head = framed(b"pulled", b"_", map(x.pulled, |n: Bytes| field(b"module", n)));
   string_of_bytes(bytes_concat(head, dump_text(dump_of(x.out))))
 }
@@ -1302,6 +1366,8 @@ pub type BodyRow = { name: Bytes, body: Bytes }
 pub type Dump = {
   diags: List<Diag>,
   order: List<Bytes>,
+  packages: List<Pkg>,
+  mod_pkg: List<Int>,
   modules: List<ModuleRow>,
   defs: List<DefRow>,
   types: List<TypeRow>,
@@ -1318,6 +1384,8 @@ pub type Dump = {
 pub fn empty_dump() -> Dump =
   {
     diags: [],
+    packages: [],
+    mod_pkg: [],
     order: [],
     modules: [],
     defs: [],
@@ -1534,6 +1602,9 @@ fn ordinal_frame(o: OrdinalRow) -> Bytes =
 fn table_frames(d: Dump) -> List<Bytes> =
   cat([
     [framed(b"order", b"_", map(d.order, |m: Bytes| field(b"module", m)))],
+    map(d.packages, |p: Pkg|
+      framed(b"pkg", p.prefix, map(p.deps, |dep: Bytes| field(b"dep", dep)))),
+    [framed(b"modpkg", b"_", map(d.mod_pkg, |i: Int| field(b"pkg", num(i))))],
     map(d.modules, module_frame),
     map(d.defs, def_frame),
     map(d.types, type_frame),
@@ -2426,6 +2497,8 @@ fn frame_kinds() -> List<Bytes> =
     b"ordinal",
     b"body",
     b"testbody",
+    b"pkg",
+    b"modpkg",
   ]
 
 // A kind's tag, or -1 for one this reader does not know. Looked up rather than compared down a
@@ -2469,7 +2542,18 @@ fn item_row(d: Dump, tag: Int, name: Bytes, u: Frame, what: Bytes) -> Result<Dum
   }
 
 fn bulk_row(d: Dump, tag: Int, name: Bytes, u: Frame, what: Bytes) -> Result<Dump, Bytes> =
-  if tag == 11 {
+  if tag == 14 {
+    let fs = fields(what, u.body, [b"dep"])?;
+    Ok({ ..d, packages: push(d.packages, { prefix: name, deps: all_of(fs, b"dep") }) })
+  } else if tag == 15 {
+    let fs = fields(what, u.body, [b"pkg"])?;
+    let pkgs = each(all_of(fs, b"pkg"), |x: Bytes|
+      match number_of(x) {
+        Some(v) -> Ok(v),
+        None -> Err(bytes_concat_all([what, b" holds `", x, b"`, which is not a count"])),
+      })?;
+    Ok({ ..d, mod_pkg: append(d.mod_pkg, pkgs) })
+  } else if tag == 11 {
     let fs = fields(what, u.body, [b"item"])?;
     let items = each(all_of(fs, b"item"), |x: Bytes| read_ordinal_item(what, x))?;
     Ok({ ..d, ordinals: push(d.ordinals, { module: name, items: items }) })
@@ -2696,7 +2780,7 @@ test "the warnings come first, then the order and the module frame" {
   assert(
     bytes_starts_with(
       bytes_of_string(front_dump(program())),
-      b"diag 0 98\ncode 5\nW0611severity 7\nwarningmessage 28\ntype `m.Shape` is never usedlabel 20\n0 46 51 1\nnever usedorder _ 10\nmodule 1\nmmodule m 72\nindex 1\n0item 5\nm.logitem 7\nm.Shapeitem 5\nm.Dotitem 6\nm.Lineitem 5\nm.saydef m.say ",
+      b"diag 0 98\ncode 5\nW0611severity 7\nwarningmessage 28\ntype `m.Shape` is never usedlabel 20\n0 46 51 1\nnever usedorder _ 10\nmodule 1\nmpkg  0\nmodpkg _ 7\npkg 1\n0module m 72\nindex 1\n0item 5\nm.logitem 7\nm.Shapeitem 5\nm.Dotitem 6\nm.Lineitem 5\nm.saydef m.say ",
     ),
   )
 }
@@ -3258,19 +3342,22 @@ test "a qualified name that is not exported moves the hash of everything that na
 }
 
 test "a project's manifest is checked ahead of the program and carried decoded" {
-  let good = analyse_with(
-    parse_all(program()),
-    [],
-    [],
-    Some(
+  let good = analyse_with(parse_all(program()), [], [], {
+    root: b".",
+    manifest: Some(
       b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"m\", version: {major: 0, minor: 1, patch: 0}, prefix: None, runtime: {major: 0, minor: 1, patch: 0}, dependencies: [], entry: None}",
     ),
-  );
+    supplied: [],
+  });
   match good {
     Refused(ds) -> assert_eq(map(ds, |d: Diag| d.code), []),
     Analysed(w) -> match w.manifest { None -> assert(false), Some(m) -> assert_eq(m.name, "m") },
   };
-  let malformed = analyse_with(parse_all(program()), [], [], Some(b"fn package() -> Int = 1"));
+  let malformed = analyse_with(parse_all(program()), [], [], {
+    root: b".",
+    manifest: Some(b"fn package() -> Int = 1"),
+    supplied: [],
+  });
   match malformed {
     Analysed(_) -> assert(false),
     Refused(ds) -> {
@@ -3284,3 +3371,100 @@ test "a project's manifest is checked ahead of the program and carried decoded" 
     Analysed(w) -> assert_eq(w.manifest, None),
   }
 }
+
+// A root package with one path dependency: `lib` grants its prefix, and its modules answer to
+// `lib.<name>` for the root that declares it.
+fn with_lib(user: List<Source>) -> Pkgs =
+  {
+    root: b"app",
+    manifest: Some(
+      b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"app\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [{name: \"lib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Path(\"../lib\")}], entry: None}",
+    ),
+    supplied: [
+      {
+        root: b"lib",
+        manifest: Some(
+          b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"lib\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None}",
+        ),
+        modules: [
+          { name: b"answer", src: b"pub fn answer() -> Int = 42" },
+          { name: b"extra", src: b"fn hidden() -> Int = 1" },
+        ],
+      },
+    ],
+  }
+
+test "a declared dependency's modules answer under its prefix" {
+  let user = [{ name: b"m", src: b"import lib.answer\nfn main() -> Int = answer::answer()" }];
+  match analyse_with(parse_all(user), [], [], with_lib(user)) {
+    Refused(ds) -> assert_eq(map(ds, |d: Diag| d.code), []),
+    Analysed(_) -> assert(true),
+  }
+}
+
+test "an undeclared dependency's modules refuse, naming holder and importer" {
+  let user = [{ name: b"m", src: b"import lib.answer\nfn main() -> Int = answer::answer()" }];
+  let pkgs = with_lib(user);
+  let undeclared = analyse_with(parse_all(user), [], [], {
+    root: b"app",
+    manifest: Some(
+      b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"app\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None}",
+    ),
+    supplied: pkgs.supplied,
+  });
+  match undeclared {
+    Analysed(_) -> assert(false),
+    Refused(ds) -> assert_eq(at(ds, 0).code, b"E0132"),
+  }
+}
+
+test "a dependency's own imports are siblings of its prefix, not of the root" {
+  let user = [{ name: b"m", src: b"import lib.answer\nfn main() -> Int = answer::answer()" }];
+  let pkgs = with_lib(user);
+  let supplied = [
+    {
+      root: b"lib",
+      manifest: at(pkgs.supplied, 0).manifest,
+      modules: [
+        { name: b"answer", src: b"import extra\npub fn answer() -> Int = extra::hidden()" },
+        { name: b"extra", src: b"fn hidden() -> Int = 1" },
+      ],
+    },
+  ];
+  let clo = closure({ ..pkgs, supplied: supplied }, map(user, |s: Source| s.name));
+  assert_eq(clo.diags, []);
+  assert_eq(map(clo.modules, |m: { pkg: Int, src: Source }| m.src.name), [
+    b"lib.answer",
+    b"lib.extra",
+  ])
+}
+
+test "a missing dependency manifest is unusable where it is declared" {
+  let user = [{ name: b"m", src: b"fn main() -> Int = 1" }];
+  let pkgs = with_lib(user);
+  let clo = closure(
+    { ..pkgs, supplied: [{ root: b"lib", manifest: None, modules: [] }] },
+    map(user, |s: Source| s.name),
+  );
+  assert_eq(at(clo.diags, 0).diag.code, b"E0135")
+}
+
+test "a cycle of packages is refused, naming the cycle" {
+  let user = [{ name: b"m", src: b"fn main() -> Int = 1" }];
+  let manifest_dep = b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"n\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [{name: \"other\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Path(\"../other\")}], entry: None}";
+  let clo = closure(
+    {
+      root: b"a",
+      manifest: Some(manifest_dep),
+      supplied: [
+        { root: b"other", manifest: Some(manifest_dep), modules: [] },
+        { root: b"other/other", manifest: Some(manifest_dep), modules: [] },
+      ],
+    },
+    [],
+  );
+  assert(has_diag(clo.diags, b"E0134"))
+}
+
+fn has_diag(diags: List<{ slot: Int, diag: PDiag }>, code: Bytes) -> Bool =
+  fold(diags, false, |acc: Bool, sd: { slot: Int, diag: PDiag }| acc || sd.diag.code == code)

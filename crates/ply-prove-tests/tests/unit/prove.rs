@@ -29,7 +29,7 @@ fn fixture(source: &str) -> Fixture {
         .unwrap_or_else(|e| panic!("check: {e:#}"))
         .check;
     let dump =
-        ply_codegen::c::producer::claims_dump(&sources).unwrap_or_else(|e| panic!("claims: {e:#}"));
+        ply_codegen::c::producer::claims_dump(&sources, &[], &[]).unwrap_or_else(|e| panic!("claims: {e:#}"));
     let claims = read_claims(&dump, &[SRC]).unwrap_or_else(|e| panic!("claims: {e}"));
     Fixture { check, claims }
 }

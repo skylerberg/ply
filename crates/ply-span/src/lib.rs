@@ -265,6 +265,14 @@ pub mod codes {
     pub const MANIFEST_NOT_LITERAL: &str = "E0130";
     /// A manifest literal that does not decode, or whose fields fail validation.
     pub const MANIFEST_FIELD: &str = "E0131";
+    /// An import reaching a package the importing module's manifest does not declare.
+    pub const DEPENDENCY_NOT_DECLARED: &str = "E0132";
+    /// Two packages granting one module prefix, or a package's files claiming another's.
+    pub const PREFIX_COLLISION: &str = "E0133";
+    /// `ply.pkg` files depending on one another in a cycle.
+    pub const DEPENDENCY_CYCLE: &str = "E0134";
+    /// A dependency whose path is missing, that holds no `ply.pkg`, or that is not a path.
+    pub const DEPENDENCY_UNUSABLE: &str = "E0135";
     pub const TYPE_MISMATCH: &str = "E0201";
     pub const ARITY_MISMATCH: &str = "E0202";
     pub const OCCURS_CHECK: &str = "E0203";
@@ -486,6 +494,16 @@ pub const MEANINGS: &[(&str, &str)] = &[
     (
         "E0131",
         "a manifest field that does not decode or fails validation",
+    ),
+    (
+        "E0132",
+        "an import of a package the manifest does not declare as a dependency",
+    ),
+    ("E0133", "two packages granting one module prefix"),
+    ("E0134", "packages depending on one another in a cycle"),
+    (
+        "E0135",
+        "a dependency that is missing, unmanifested or not a path",
     ),
     ("E0201", "type mismatch"),
     ("E0202", "arity mismatch"),
@@ -779,6 +797,14 @@ mod tests {
             ("MANIFEST_SHAPE", codes::MANIFEST_SHAPE, "E0129"),
             ("MANIFEST_NOT_LITERAL", codes::MANIFEST_NOT_LITERAL, "E0130"),
             ("MANIFEST_FIELD", codes::MANIFEST_FIELD, "E0131"),
+            (
+                "DEPENDENCY_NOT_DECLARED",
+                codes::DEPENDENCY_NOT_DECLARED,
+                "E0132",
+            ),
+            ("PREFIX_COLLISION", codes::PREFIX_COLLISION, "E0133"),
+            ("DEPENDENCY_CYCLE", codes::DEPENDENCY_CYCLE, "E0134"),
+            ("DEPENDENCY_UNUSABLE", codes::DEPENDENCY_UNUSABLE, "E0135"),
             ("TYPE_MISMATCH", codes::TYPE_MISMATCH, "E0201"),
             ("ARITY_MISMATCH", codes::ARITY_MISMATCH, "E0202"),
             ("OCCURS_CHECK", codes::OCCURS_CHECK, "E0203"),

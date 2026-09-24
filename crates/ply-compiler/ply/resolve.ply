@@ -70,6 +70,9 @@ pub type Resolved = {
   declarations: List<Decls>,
   declared: List<Bindings>,
   order: List<Int>,
+  // Each module's imports, one target module index per declaration, in source order: a
+  // dependency's sibling import and two selective imports sharing a binder both name exactly.
+  imports: List<List<Int>>,
 }
 
 fn no_decls() -> Decls =
@@ -312,7 +315,19 @@ type World = {
   names: List<Entry>,
   declarations: List<Decls>,
   declared: List<Bindings>,
+  // The packages of the closure: 0 is the root package, and `mod_pkg` maps a module to one.
+  // A `mod_pkg` of `shelf` is a module the toolchain ships, which any package may import.
+  pkgs: List<Pkg>,
+  mod_pkg: List<Int>,
+  shelf: Int,
 }
+
+// A package for import resolution: the module prefix it grants and the prefixes it declares.
+pub type Pkg = { prefix: Bytes, deps: List<Bytes> }
+
+// Every module one unnamed package, as projects without packages resolve.
+pub fn no_pkgs(mods: List<Mod>) -> { pkgs: List<Pkg>, mod_pkg: List<Int>, shelf: Int } =
+  { pkgs: [{ prefix: b"", deps: [] }], mod_pkg: map(mods, |_m: Mod| 0), shelf: 1 }
 
 fn index_of(names: List<Entry>, name: Bytes) -> Option<Int> =
   fold(names, None, |acc: Option<Int>, e: Entry|
@@ -320,8 +335,7 @@ fn index_of(names: List<Entry>, name: Bytes) -> Option<Int> =
 
 fn one_import(w: World, i: Int, b: Builder, d: ImportDecl) -> Builder =
   match target(w, i, b, d) {
-    None -> b,
-    Some(t) -> {
+    Found(t) -> {
       let b2: Builder = { ..b, edges: push(b.edges, { from: i, target: t, span: path_span(d) }) };
       match d.kind {
         INames(names) -> {
@@ -336,24 +350,87 @@ fn one_import(w: World, i: Int, b: Builder, d: ImportDecl) -> Builder =
         _ -> bind_module(w, i, b2, d, t),
       }
     },
+    _ -> b,
   }
 
-// The module an import names, or `E0106` with one note either way.
-fn target(w: World, i: Int, b: Builder, d: ImportDecl) -> Option<Int> = {
+// What an import aims at: a module it may use, no such module, or a module of a package its
+// manifest does not declare (naming the importer and the holder).
+type Aim = | Found(Int) | Missing | Undeclared({ importer: Int, holder: Int })
+
+// The module an import names, judged against the package table.
+fn target(w: World, i: Int, b: Builder, d: ImportDecl) -> Aim = {
   let name = import_module_name(d);
-  let hit = if bytes_len(name) == 0 { None } else {
+  if bytes_len(name) == 0 { Missing } else {
     match index_of(w.names, name) {
-      Some(t) -> if bytes_len(at(w.mods, t).name) == 0 { None } else { Some(t) },
-      None -> None,
+      Some(t) -> if bytes_len(at(w.mods, t).name) == 0 { Missing } else { declared(w, i, t) },
+      None -> sibling(w, i, name),
     }
-  };
-  hit
+  }
+}
+
+// A sibling within the importing module's own package: a dependency's `import args` means
+// `<its prefix>.args`, never another package's bare `args`.
+fn sibling(w: World, i: Int, name: Bytes) -> Aim = {
+  let p = at(w.mod_pkg, i);
+  if p >= w.shelf || p >= len(w.pkgs) { Missing } else {
+    let prefix = at(w.pkgs, p).prefix;
+    if bytes_len(prefix) == 0 || bytes_starts_with(name, bytes_concat(prefix, b".")) { Missing } else {
+      match index_of(w.names, bytes_concat_all([prefix, b".", name])) {
+        Some(t) -> if bytes_len(at(w.mods, t).name) == 0 { Missing } else { Found(t) },
+        None -> Missing,
+      }
+    }
+  }
+}
+
+// An exact hit is usable when it is the importer's own package, the shelf, or a package the
+// importer's manifest declares; anything else is E0132, naming who holds it and who wants it.
+fn declared(w: World, i: Int, t: Int) -> Aim = {
+  let p = at(w.mod_pkg, i);
+  let q = at(w.mod_pkg, t);
+  if q == p || q >= w.shelf || p >= w.shelf { Found(t) } else {
+    let prefix = at(w.pkgs, q).prefix;
+    if contains_bytes(at(w.pkgs, p).deps, prefix) { Found(t) }
+    else { Undeclared({ importer: p, holder: q }) }
+  }
 }
 
 fn target_or_report(w: World, i: Int, b: Builder, d: ImportDecl) -> { b: Builder, t: Option<Int> } =
   match target(w, i, b, d) {
-    Some(t) -> { b: b, t: Some(t) },
-    None -> {
+    Found(t) -> { b: b, t: Some(t) },
+    Undeclared(u) -> {
+      let name = import_module_name(d);
+      let message = if u.holder == 0 {
+        bytes_concat_all([
+          b"`",
+          name,
+          b"` belongs to the package being loaded; a dependency may not reach back into it",
+        ])
+      } else {
+        bytes_concat_all([
+          b"`",
+          name,
+          b"` belongs to the package `",
+          at(w.pkgs, u.holder).prefix,
+          b"`, which `",
+          at(w.pkgs, u.importer).prefix,
+          b"` does not declare as a dependency",
+        ])
+      };
+      {
+        b: {
+          ..b,
+          diags: push(
+            b.diags,
+            diag1(b"E0132", i, path_span(d), message, b"not a declared dependency", [
+              b"add it to that package's ply.pkg dependencies to import it",
+            ]),
+          ),
+        },
+        t: None,
+      }
+    },
+    Missing -> {
       let name = import_module_name(d);
       let near = fold(w.names, [], |acc: List<Bytes>, e: Entry|
         if bytes_len(e.name) > 0 && bytes_ends_with(e.name, default_binder(name)) {
@@ -1736,12 +1813,25 @@ pub fn resolve(sources: List<Source>) -> Outcome =
   )
 
 // Over modules already parsed and, for the checker, already rewritten.
-pub fn resolve_modules(mods: List<Mod>) -> Outcome = resolve_with(mods, true)
+pub fn resolve_modules(mods: List<Mod>) -> Outcome = resolve_with(mods, no_pkgs(mods), true)
 
 // The tables without the defaults pass, so the two can be timed apart.
-pub fn resolve_tables(mods: List<Mod>) -> Outcome = resolve_with(mods, false)
+pub fn resolve_tables(mods: List<Mod>) -> Outcome = resolve_with(mods, no_pkgs(mods), false)
 
-fn resolve_with(mods: List<Mod>, defaults: Bool) -> Outcome = {
+// Resolution against a package closure: `mod_pkg[i]` is the package of module `i`, and `shelf`
+// marks the modules the toolchain ships, which any package may import.
+pub fn resolve_packaged(
+  mods: List<Mod>,
+  pkgs: List<Pkg>,
+  mod_pkg: List<Int>,
+  shelf: Int,
+) -> Outcome = resolve_with(mods, { pkgs: pkgs, mod_pkg: mod_pkg, shelf: shelf }, true)
+
+fn resolve_with(
+  mods: List<Mod>,
+  packages: { pkgs: List<Pkg>, mod_pkg: List<Int>, shelf: Int },
+  defaults: Bool,
+) -> Outcome = {
   let n = len(mods);
   // The index: the first module of each name; a second non-anonymous one is `E0105`.
   let indexed = fold(
@@ -1772,7 +1862,15 @@ fn resolve_with(mods: List<Mod>, defaults: Bool) -> Outcome = {
   );
   let declarations = map(mods, declarations_of);
   let declared = map(range(0, n), |i: Int| bindings_of(i, at(declarations, i)));
-  let w = { mods: mods, names: indexed.names, declarations: declarations, declared: declared };
+  let w = {
+    mods: mods,
+    names: indexed.names,
+    declarations: declarations,
+    declared: declared,
+    pkgs: packages.pkgs,
+    mod_pkg: packages.mod_pkg,
+    shelf: packages.shelf,
+  };
   let built = map(range(0, n), |i: Int| build_scope_reporting(w, i));
   let scopes = map(built, |b: Builder| b.scope);
   let edges = map(built, |b: Builder| b.edges);
@@ -1788,6 +1886,8 @@ fn resolve_with(mods: List<Mod>, defaults: Bool) -> Outcome = {
       declarations: declarations,
       declared: declared,
       order: dfs.order,
+      imports: map(edges, |es: List<{ from: Int, target: Int, span: Span }>|
+        map(es, |e: { from: Int, target: Int, span: Span }| e.target)),
     };
     if !defaults { Resolved_({ r: r, mods: mods, diags: [] }) } else {
       let x = expand(r, mods, []);
