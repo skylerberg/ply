@@ -1,7 +1,6 @@
 use anyhow::Result;
 use ply_corpus::{w3, w6_run};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -70,76 +69,4 @@ fn remembering_a_constant_changes_no_byte_of_any_response() {
             "`{what}` answered differently once its constants were remembered"
         );
     }
-}
-
-#[test]
-fn what_remembering_the_constants_is_worth_per_request() {
-    let (memoized, control) = variants().expect("both variants load");
-    // `limits().max_keep_alive` is 100: more requests than that would close the connection part way.
-    let per_conn = 32usize;
-    let connections = 16usize;
-    let requests = per_conn * connections;
-    let rounds = 7;
-
-    for (what, request) in [
-        ("/health", w3::request("GET", "/health", None, false, 0, 0)),
-        ("/items", w3::request("GET", "/items", None, false, 0, 0)),
-    ] {
-        let run = |service: &w3::Loaded| -> Duration {
-            let script = (0..connections)
-                .map(|_| (0..per_conn).map(|_| request.clone()).collect())
-                .collect();
-            service.over_sim(script).expect("the twin serves").0
-        };
-        let mut best_memo = Duration::MAX;
-        let mut best_control = Duration::MAX;
-        for _ in 0..rounds {
-            best_memo = best_memo.min(run(&memoized));
-            best_control = best_control.min(run(&control));
-        }
-        let per = |d: Duration| d.as_secs_f64() * 1e6 / requests as f64;
-        let (a, b) = (per(best_memo), per(best_control));
-        println!(
-            "{what}: {b:.1}us/request without the memo, {a:.1}us with it — {:.2}x, \
-             {:.0} req/s against {:.0} req/s (best of {rounds} x {requests})",
-            b / a,
-            1e6 / a,
-            1e6 / b,
-        );
-    }
-}
-
-#[test]
-fn what_the_route_table_costs_to_rebuild() {
-    let loaded = w6_run::program(&repo()).expect("the ladder's driver loads");
-    let bench = loaded.full("w6_bench").expect("the driver is present");
-    let iterations = 2000u32;
-    // The tier compiles the tail-recursive loop to native C frames, which overflow a test thread's stack.
-    let (empty, table, routed, hoisted) = ply_corpus::on_deep_stack(|| {
-        let mode = |m: i64| -> f64 {
-            let mut best = f64::MAX;
-            for _ in 0..7 {
-                let taken = loaded
-                    .pure_call(
-                        &bench,
-                        vec![
-                            ply_eval::Value::Int(m),
-                            ply_eval::Value::Int(iterations as i64),
-                        ],
-                        1,
-                    )
-                    .expect("the driver runs")
-                    .0;
-                best = best.min(taken.as_secs_f64() * 1e6 / iterations as f64);
-            }
-            best
-        };
-        (mode(0), mode(5), mode(3), mode(4))
-    });
-    println!(
-        "table(): {:.2}us per build over the empty loop; routing rung {routed:.1}us against \
-         {hoisted:.1}us with the table hoisted — {:.2}us for the rebuild",
-        table - empty,
-        routed - hoisted,
-    );
 }
