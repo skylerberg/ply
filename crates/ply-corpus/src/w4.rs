@@ -55,26 +55,10 @@ impl Program {
     }
 
     fn parse_source(path: &str, source: &str) -> Result<Program> {
-        let mut sources = ply_span::SourceMap::new();
-        let id = sources.add(Path::new(path), source.to_string());
         let name = ModuleName::from_relative_path(Path::new(path))
             .map_err(|d| anyhow::anyhow!("{}", d.message))?;
-        let mut inputs = vec![(id, name, source)];
-        let shipped: Vec<(ModuleName, &'static str)> = ply_std::sources()
-            .map(|(module, source)| (ModuleName::from_dotted(module), source))
-            .collect();
-        for (module, source) in &shipped {
-            let id = sources.add(ply_std::pseudo_path(module), source.to_string());
-            inputs.push((id, module.clone(), source));
-        }
-        // A span's module is its index in this order.
-        let ordered: Vec<(String, String)> = inputs
-            .iter()
-            .map(|(_, m, s)| (m.to_string(), s.to_string()))
-            .collect();
-        let ids: Vec<ply_span::SourceId> = inputs.iter().map(|(id, _, _)| *id).collect();
-        let port = ply_codegen::c::producer::checked_front(&ordered, &ids)
-            .map_err(|e| anyhow::anyhow!("checking the bench program: {e}"))?;
+        let (port, sources) = crate::checked_front_with_std(Path::new(path), name.as_str(), source)
+            .map_err(|e| anyhow::anyhow!("checking the bench program: {e:#}"))?;
         Ok(Program {
             check: port.check.clone(),
             port,

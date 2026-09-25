@@ -53,26 +53,10 @@ impl Program {
 
     pub fn parse() -> Result<Program> {
         let path = "bench.ply";
-        let mut sources = ply_span::SourceMap::new();
-        let id = sources.add(Path::new(path), BENCH.to_string());
         let name = ModuleName::from_relative_path(Path::new(path))
             .map_err(|d| anyhow::anyhow!("{}", d.message))?;
-        let mut inputs = vec![(id, name, BENCH)];
-        let shipped: Vec<(ModuleName, &'static str)> = ply_std::sources()
-            .map(|(module, source)| (ModuleName::from_dotted(module), source))
-            .collect();
-        for (module, source) in &shipped {
-            let id = sources.add(ply_std::pseudo_path(module), source.to_string());
-            inputs.push((id, module.clone(), source));
-        }
-        // In `inputs` order: a span names its module by position.
-        let ordered: Vec<(String, String)> = inputs
-            .iter()
-            .map(|(_, m, s)| (m.to_string(), s.to_string()))
-            .collect();
-        let ids: Vec<ply_span::SourceId> = inputs.iter().map(|(id, _, _)| *id).collect();
-        let port = ply_codegen::c::producer::checked_front(&ordered, &ids)
-            .map_err(|e| anyhow::anyhow!("checking the bench program: {e}"))?;
+        let (port, sources) = crate::checked_front_with_std(Path::new(path), name.as_str(), BENCH)
+            .map_err(|e| anyhow::anyhow!("checking the bench program: {e:#}"))?;
         Ok(Program {
             check: port.check.clone(),
             port,
@@ -393,11 +377,21 @@ impl Stack {
 fn project(dir: &Path, service: &str, stack: Stack) -> Result<()> {
     let source = match stack {
         Stack::Postgres => service.to_string(),
-        Stack::PostgresTls => replace(
-            service,
-            "    run(port, count)",
-            &format!("    run_tls(port, \"{CREDENTIAL}\", count)"),
-        )?,
+        Stack::PostgresTls => {
+            // `run_tls` performs what `run` performs plus the handshake, so the entry row
+            // widens with it.
+            let from = w3::main_header(service)?;
+            let row = from.replace(
+                "net.listen[listener],",
+                "net.listen[listener], net.listen_tls[listener],",
+            );
+            let widened = replace(service, from, &row)?;
+            replace(
+                &widened,
+                "    run(port, count)",
+                &format!("    run_tls(port, \"{CREDENTIAL}\", count)"),
+            )?
+        }
         Stack::Twin => {
             let from = w3::main_header(service)?;
             let narrowed = replace(service, from, &w3::twin_entry_row(from))?;

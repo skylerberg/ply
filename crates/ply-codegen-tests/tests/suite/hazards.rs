@@ -1,6 +1,6 @@
 use ply_codegen::Unit;
 use ply_eval::{Machine, Value};
-use ply_span::{Span, Symbol};
+use ply_span::{SourceId, Span, Symbol};
 use ply_ty::ModuleName;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,14 +26,7 @@ fn load(dir: &Path) -> Result<Loaded, Vec<ply_span::Diagnostic>> {
         .collect();
     files.sort();
 
-    let mut sources = ply_span::SourceMap::new();
-    let mut inputs = Vec::new();
-    for (module, text) in ply_std::sources() {
-        let text: &'static str = text;
-        let module = ModuleName::from_dotted(module);
-        let id = sources.add(ply_std::pseudo_path(&module), text.to_string());
-        inputs.push((id, module, text));
-    }
+    let mut user = Vec::new();
     for path in &files {
         let stem = path.file_stem().and_then(|s| s.to_str()).expect("a stem");
         let text: &'static str = Box::leak(
@@ -41,24 +34,30 @@ fn load(dir: &Path) -> Result<Loaded, Vec<ply_span::Diagnostic>> {
                 .expect("the fixture is readable")
                 .into_boxed_str(),
         );
-        let id = sources.add(path.clone(), text.to_string());
-        inputs.push((id, ModuleName::from_dotted(stem), text));
+        user.push((stem.to_string(), text.to_string()));
     }
-    let texts: HashMap<String, String> = inputs
-        .iter()
-        .map(|(_, module, text)| (module.to_string(), (*text).to_string()))
+    let shipped: Vec<(String, String)> = ply_std::sources()
+        .map(|(module, text)| (module.to_string(), text.to_string()))
         .collect();
-    let named: Vec<(String, String)> = inputs
+    let pulled =
+        ply_codegen::c::producer::front_pulling_std(&user, &shipped).expect("the port answers");
+    let mut modules = user
         .iter()
-        .map(|(_, module, text)| (module.to_string(), (*text).to_string()))
-        .collect();
-    let ids: Vec<_> = inputs.iter().map(|(id, _, _)| *id).collect();
-    ply_codegen::c::producer::ensure_default();
-    let front = ply_codegen::c::producer::front(&named, &ids).expect("the port answers");
+        .map(|(name, text)| (name.clone(), text.clone()))
+        .collect::<Vec<_>>();
+    for name in &pulled.modules {
+        let text = ply_std::source(&ModuleName::from_dotted(name)).expect("it ships");
+        modules.push((name.clone(), text.to_string()));
+    }
+    let ids: Vec<_> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
+    let front = ply_ty::read_front(&pulled.dump, &ids).expect("the dump reads");
     if front.has_error() {
         return Err(front.diagnostics);
     }
-    Ok(Loaded { front, texts })
+    Ok(Loaded {
+        front,
+        texts: modules.into_iter().collect(),
+    })
 }
 
 fn hazards() -> &'static Loaded {
