@@ -13,11 +13,15 @@ use std::path::{Path, PathBuf};
 fn emitter_source() -> (&'static Source, String) {
     let modules = producer::modules_of(&Sources::Embedded);
     let identity = producer::digest_of(&modules);
+    // The compiler's modules are the program's own; the std ones it imports pull as the
+    // built-in package rather than inline.
+    let (own, _std): (Vec<_>, Vec<_>) = modules
+        .iter()
+        .partition(|(name, _)| !ply_std::is_reserved(name));
+    let own: Vec<_> = own.into_iter().cloned().collect();
     // No recipe is installed: each round's emitter is handed over in `emit_with`, and a handover wins over an installation.
-    let ids: Vec<_> = (0..modules.len())
-        .map(|i| ply_span::SourceId(i as u32))
-        .collect();
-    let front = producer::checked_front(&modules, &ids).expect("the emitter checks");
+    let answered = producer::checked_front_with_std(&own).expect("the emitter checks");
+    let front = answered.front;
     let unused: Vec<&str> = front
         .diagnostics
         .iter()
@@ -30,7 +34,7 @@ fn emitter_source() -> (&'static Source, String) {
         unused.join("\n  ")
     );
     let front: &'static ply_ty::Front = Box::leak(Box::new(front));
-    let texts: HashMap<String, String> = modules.into_iter().collect();
+    let texts: HashMap<String, String> = answered.modules.into_iter().collect();
     let source: &'static Source = Box::leak(Box::new(
         Source::from_front(front, ply_codegen::emit_keys(front)).with_texts(texts),
     ));

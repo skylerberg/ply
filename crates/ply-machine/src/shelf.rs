@@ -104,11 +104,9 @@ pub fn is_pseudo_path(path: &Path) -> bool {
             .is_some_and(|p| p.starts_with(&format!("{COMPILER_PSEUDO_ROOT}/")))
 }
 
-/// A project file whose path would name a shelved module, which nothing may shadow.
+/// A project file whose path would name a shelved compiler module, which nothing may shadow;
+/// `std` is the built-in package's prefix, colliding with which is the front end's to report.
 pub fn reserved_diagnostic(file: &Path, name: &str) -> Diagnostic {
-    if ply_std::is_reserved(name) {
-        return ply_std::reserved_diagnostic(file, name);
-    }
     Diagnostic::error(
         codes::RESERVED_MODULE_NAME,
         format!(

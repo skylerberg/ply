@@ -28,9 +28,11 @@ Each takes a `.ply` file or a project root, defaulting to `.`.
 **Projects.** Every `*.ply` file under the root, except inside directories whose
 name starts with `.`, is a module named by its relative path with `/` → `.` and
 `.ply` dropped: `store/orders/place.ply` is `store.orders.place`. Every
-directory name and file stem must be an identifier (`E0111`); `std` is reserved
-(`E0113`). Naming a single file makes its parent the root and loads only that
-file.
+directory name and file stem must be an identifier (`E0111`). `std` is the
+built-in package: a module named under it collides with its prefix (`E0133`),
+as does one under `compiler`, which is reserved while the compiler's own
+modules shelve there (`E0113`). Naming a single file makes its parent the root
+and loads only that file.
 
 **The cache.** `.ply-cache/` at the root holds the front-end, result and
 obligation caches and the review baseline. It is safe to delete
@@ -1035,9 +1037,11 @@ Strings are indexed by character, bytes by byte.
 
 ## 13. The standard library
 
-Shipped inside `ply`; `import std.<name>`. Their tests and obligations are
-skipped unless you pass `--std`. `ply std` lists them, `ply std --show std.json`
-prints a source, and a changed standard library warns `W0605`.
+The built-in package, shipped inside `ply` and pre-seeded for every load — an
+implicit dependency of every package, no declaration needed: `import
+std.<name>`. Its tests and obligations are skipped unless you pass `--std`.
+`ply std` lists it, `ply std --show std.json` prints a source, and a changed
+standard library warns `W0605`.
 
 ### 13.1 `std.net` — sockets
 
@@ -1615,7 +1619,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0110` | duplicate import |
 | `E0111` | file path that cannot name a module |
 | `E0112` | ambiguous entry point |
-| `E0113` | project module under the reserved root `std` |
+| `E0113` | project module under the reserved root `compiler` |
 | `E0114` | unknown `effect set`, including a `pub` or qualified one |
 | `E0115` | `effect set` cycle |
 | `E0116` | record update base that is not a record of a known type |
