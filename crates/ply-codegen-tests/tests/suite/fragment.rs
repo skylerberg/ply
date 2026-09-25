@@ -1,6 +1,6 @@
 use ply_codegen::Unit;
 use ply_eval::{Provider, Value};
-use ply_span::{SourceId, Symbol};
+use ply_span::Symbol;
 use std::collections::HashMap;
 
 pub struct Loaded {
@@ -9,19 +9,14 @@ pub struct Loaded {
     pub texts: HashMap<String, String>,
 }
 
-/// The shipped standard library plus `source` as a module named `m`.
+/// `source` as a module named `m`, with the standard library pulled as the built-in package.
 fn load(source: &str) -> Loaded {
-    let mut named: Vec<(String, String)> = ply_std::sources()
-        .map(|(module, text)| (module.to_string(), text.to_string()))
-        .collect();
-    named.push(("m".to_string(), source.to_string()));
-    let ids: Vec<SourceId> = (0..named.len()).map(|i| SourceId(i as u32)).collect();
-    let front: &'static ply_ty::Front = Box::leak(Box::new(
-        ply_codegen::c::producer::checked_front(&named, &ids).expect("the corpus checks"),
-    ));
+    let answered =
+        ply_codegen::c::producer::checked_front_with_std(&[("m".to_string(), source.to_string())])
+            .expect("the corpus checks");
     Loaded {
-        front,
-        texts: named.into_iter().collect(),
+        front: Box::leak(Box::new(answered.front)),
+        texts: answered.modules.into_iter().collect(),
     }
 }
 
@@ -34,6 +29,14 @@ pub fn unit(source: &str) -> (&'static Loaded, &'static Unit) {
 }
 
 const ARITHMETIC: &str = r#"
+import std.config
+import std.db
+import std.http
+import std.json
+import std.process
+import std.router
+import std.time
+
 fn double(x: Int) -> Int = x * 2
 
 fn even(x: Int) -> Bool = x % 2 == 0

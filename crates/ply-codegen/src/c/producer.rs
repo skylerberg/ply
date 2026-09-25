@@ -1265,6 +1265,43 @@ pub fn checked_front(sources: &[(String, String)], ids: &[SourceId]) -> Result<F
     Ok(front)
 }
 
+/// A checked front end, and every module of the program in program order.
+pub struct FrontWithStd {
+    pub front: Front,
+    /// The caller's modules, then the pulled std modules, as `(name, text)` in program order.
+    pub modules: Vec<(String, String)>,
+}
+
+/// [`checked_front`] over the caller's own sources, with the standard library pulled as the
+/// built-in package rather than inlined: the pattern every harness that composes a program
+/// out of its own modules and the toolchain's shares.
+pub fn checked_front_with_std(user: &[(String, String)]) -> Result<FrontWithStd> {
+    let shipped: Vec<(String, String)> = ply_std::sources()
+        .map(|(name, text)| (name.to_string(), text.to_string()))
+        .collect();
+    let pulled = front_pulling_std(user, &shipped)?;
+    let mut modules: Vec<(String, String)> = user.to_vec();
+    for name in &pulled.modules {
+        let Some(text) = ply_std::source(&ply_ty::ModuleName::from_dotted(name)) else {
+            bail!("the front end pulled `{name}`, which does not ship");
+        };
+        modules.push((name.clone(), text.to_string()));
+    }
+    let ids: Vec<SourceId> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
+    let front = ply_ty::read_front(&pulled.dump, &ids)
+        .map_err(|e| anyhow!("the front end's answer does not read: {e}"))?;
+    let errors: Vec<String> = front
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .map(|d| format!("{} [{}]", d.message, d.code))
+        .collect();
+    if !errors.is_empty() {
+        bail!("the program does not check: {}", errors.join("; "));
+    }
+    Ok(FrontWithStd { front, modules })
+}
+
 /// Enters `name` in this thread's compiled emitter, building it first when the thread has none.
 pub fn call(name: &str, args: &[Value]) -> Result<Value> {
     with_current(|p| p.call(name, args)).unwrap_or_else(|| {

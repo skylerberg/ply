@@ -392,24 +392,11 @@ impl Program {
     pub fn load(root: &Path) -> Result<Program> {
         let path = root.join("hello.ply");
         let text = std::fs::read_to_string(&path)?;
-        let mut sources = ply_span::SourceMap::new();
-        let id = sources.add(&path, text.clone());
         let name = ModuleName::from_relative_path(Path::new("hello.ply"))
             .map_err(|d| anyhow::anyhow!("{}", d.message))?;
         // The endpoint imports `std.net`.
-        let mut inputs = vec![(id, name, text.as_str())];
-        for (module, source) in ply_std::sources() {
-            let module = ModuleName::from_dotted(module);
-            let id = sources.add(ply_std::pseudo_path(&module), source.to_string());
-            inputs.push((id, module, source));
-        }
-        let ordered: Vec<(String, String)> = inputs
-            .iter()
-            .map(|(_, m, s)| (m.to_string(), s.to_string()))
-            .collect();
-        let ids: Vec<ply_span::SourceId> = inputs.iter().map(|(id, _, _)| *id).collect();
-        let port = ply_codegen::c::producer::checked_front(&ordered, &ids)
-            .map_err(|e| anyhow::anyhow!("checking the endpoint: {e}"))?;
+        let (port, sources) = crate::checked_front_with_std(&path, name.as_str(), &text)
+            .map_err(|e| anyhow::anyhow!("checking the endpoint: {e:#}"))?;
         Ok(Program {
             check: port.check.clone(),
             port,
