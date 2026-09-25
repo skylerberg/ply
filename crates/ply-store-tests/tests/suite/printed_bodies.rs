@@ -842,8 +842,13 @@ fn one_body_named_twice_within_a_group_is_refused() {
     )]);
     let hash = |name: &str| original.hashes.defs[&Symbol::new(name)];
     assert_eq!(hash("m.b"), hash("m.c"));
-    let refused = print(&original.bodies, &names_of(&original), &[], &original.check.tests)
-        .expect_err("the names cannot say which member a call reaches");
+    let refused = print(
+        &original.bodies,
+        &names_of(&original),
+        &[],
+        &original.check.tests,
+    )
+    .expect_err("the names cannot say which member a call reaches");
     assert_eq!(refused.code, codes::ARTIFACT_INVALID);
     assert!(
         refused.message.contains("`m.b`") && refused.message.contains("`m.c`"),
@@ -890,9 +895,8 @@ fn names_that_cannot_be_applied_are_refused() {
             .map(|(_, hash)| (Symbol::new("bare"), *hash))
             .collect(),
     ] {
-        let refused =
-            print(&original.bodies, &broken, &[], &original.check.tests)
-                .expect_err("a namespace that cannot be applied");
+        let refused = print(&original.bodies, &broken, &[], &original.check.tests)
+            .expect_err("a namespace that cannot be applied");
         assert_eq!(refused.code, codes::ARTIFACT_INVALID);
     }
 }
@@ -900,8 +904,13 @@ fn names_that_cannot_be_applied_are_refused() {
 #[test]
 fn a_shipped_module_is_imported_and_not_printed() {
     let original = compile(&NAMED);
-    let printed = print(&original.bodies, &names_of(&original), &["store.wire"], &original.check.tests)
-        .expect("the names say everything");
+    let printed = print(
+        &original.bodies,
+        &names_of(&original),
+        &["store.wire"],
+        &original.check.tests,
+    )
+    .expect("the names say everything");
     assert_eq!(printed.len(), 1);
     assert_eq!(printed[0].0, "app");
     assert!(
