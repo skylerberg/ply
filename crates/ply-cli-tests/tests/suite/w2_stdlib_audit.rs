@@ -70,7 +70,7 @@ fn nothing_a_project_can_name_lands_under_the_reserved_root() {
         assert!(
             err.diagnostics
                 .iter()
-                .any(|d| d.code == codes::RESERVED_MODULE_NAME),
+                .any(|d| d.code == codes::PREFIX_COLLISION),
             "`{rel}` would be `{expected}` and was accepted: {:?}",
             err.diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
         );
