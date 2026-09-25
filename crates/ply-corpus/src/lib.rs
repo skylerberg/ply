@@ -36,6 +36,31 @@ pub(crate) fn tier_spec() -> ply_eval::BackendSpec {
     }
 }
 
+/// The front end over one caller-written module that imports the standard library: the
+/// caller's source alone, with the shipped std pulled as the built-in package rather than
+/// inlined, and the sources placed the way the front end places them. Errors raise the way
+/// [`ply_codegen::c::producer::checked_front`] raises them.
+pub fn checked_front_with_std(
+    path: &Path,
+    module: &str,
+    text: &str,
+) -> Result<(ply_ty::Front, ply_span::SourceMap)> {
+    let answered = ply_codegen::c::producer::checked_front_with_std(&[(
+        module.to_string(),
+        text.to_string(),
+    )])?;
+    let mut sources = ply_span::SourceMap::new();
+    for (name, text) in &answered.modules {
+        let path = if ply_std::is_reserved(name) {
+            ply_std::pseudo_path(&ply_ty::ModuleName::from_dotted(name))
+        } else {
+            path.to_path_buf()
+        };
+        sources.add(&path, text.clone());
+    }
+    Ok((answered.front, sources))
+}
+
 /// A machine over the program with the default tier attached.
 pub fn tier_machine<'a>(
     port: &'a ply_ty::Front,

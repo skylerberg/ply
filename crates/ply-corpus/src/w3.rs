@@ -304,29 +304,15 @@ pub struct Loaded {
 }
 
 impl Loaded {
-    /// One `.ply` source as the module `desk`, plus the shipped stdlib.
+    /// One `.ply` source as the module `desk`, with the standard library pulled as the
+    /// built-in package rather than inlined.
     pub fn parse(desk: &str) -> Result<Loaded> {
-        let mut sources = ply_span::SourceMap::new();
-        let id = sources.add(Path::new("desk.ply"), desk.to_string());
         let name = ModuleName::from_relative_path(Path::new("desk.ply"))
             .map_err(|d| anyhow::anyhow!("{}", d.message))?;
-        let mut inputs = vec![(id, name, desk)];
-        let shipped: Vec<(ModuleName, &'static str)> = ply_std::sources()
-            .map(|(module, source)| (ModuleName::from_dotted(module), source))
-            .collect();
-        for (module, source) in &shipped {
-            let id = sources.add(ply_std::pseudo_path(module), source.to_string());
-            inputs.push((id, module.clone(), source));
-        }
-        // The port needs these pairs in program order, which is how a span names its module.
-        let ordered: Vec<(String, String)> = inputs
-            .iter()
-            .map(|(_, name, source)| (name.to_string(), (*source).to_string()))
-            .collect();
-        let ids: Vec<ply_span::SourceId> = inputs.iter().map(|(id, _, _)| *id).collect();
-        let texts = ordered.iter().cloned().collect();
-        let port = ply_codegen::c::producer::checked_front(&ordered, &ids)
-            .map_err(|e| anyhow::anyhow!("checking the service: {e}"))?;
+        let (port, sources) =
+            crate::checked_front_with_std(Path::new("desk.ply"), name.as_str(), desk)
+                .map_err(|e| anyhow::anyhow!("checking the service: {e:#}"))?;
+        let texts = ply_machine::support::module_texts(&port.check, &sources);
         Ok(Loaded {
             check: port.check.clone(),
             port,

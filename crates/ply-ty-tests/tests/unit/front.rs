@@ -739,14 +739,13 @@ fn ply_files(dir: &std::path::Path) -> Vec<(String, String)> {
 #[test]
 fn a_real_answer_is_written_and_read_back_byte_for_byte() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut program: Vec<(String, String)> = ply_std::sources()
-        .map(|(name, text)| (name.to_string(), text.to_string()))
-        .collect();
-    program.extend(ply_files(&root.join("examples")));
-    program.extend(ply_files(&root.join("crates/ply-compiler/ply")));
-    let ids: Vec<SourceId> = (0..program.len()).map(|i| SourceId(i as u32)).collect();
-    let front = ply_codegen::c::producer::checked_front(&program, &ids)
+    let mut user = ply_files(&root.join("examples"));
+    user.extend(ply_files(&root.join("crates/ply-compiler/ply")));
+    let answered = ply_codegen::c::producer::checked_front_with_std(&user)
         .unwrap_or_else(|e| panic!("the corpus does not check: {e:#}"));
+    let front = answered.front;
+    let program = answered.modules;
+    let ids: Vec<SourceId> = (0..program.len()).map(|i| SourceId(i as u32)).collect();
     let whole = write_front(&front, &ids).unwrap();
 
     let back = read_front(&whole, &ids).unwrap_or_else(|e| panic!("{e}"));

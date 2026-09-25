@@ -14,18 +14,14 @@ pub fn bench(raw: Bytes) -> Int =
   }
 ";
 
-/// The shipped modules and `m`, checked, and the default tier built over them once.
+/// `m` checked with the standard library pulled as the built-in package, and the default
+/// tier built over them once.
 fn tiered(service: &str) -> (ply_ty::Front, &'static ply_codegen::Unit) {
-    let mut modules: Vec<(String, String)> = ply_std::sources()
-        .map(|(name, src)| (name.to_string(), src.to_string()))
-        .collect();
-    modules.push(("m".to_string(), service.to_string()));
-    let ids: Vec<_> = (0..modules.len())
-        .map(|i| ply_span::SourceId(i as u32))
-        .collect();
-    let front = ply_codegen::c::producer::checked_front(&modules, &ids)
-        .unwrap_or_else(|e| panic!("they check: {e:#}"));
-    let unit = ply_codegen::Unit::over_front(&front, modules.into_iter().collect())
+    let answered =
+        ply_codegen::c::producer::checked_front_with_std(&[("m".to_string(), service.to_string())])
+            .unwrap_or_else(|e| panic!("they check: {e:#}"));
+    let front = answered.front;
+    let unit = ply_codegen::Unit::over_front(&front, answered.modules.into_iter().collect())
         .expect("this host has a C compiler");
     (front, unit)
 }
