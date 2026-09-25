@@ -2,7 +2,7 @@
 //! Footprint)`.
 
 use ply_codegen::c::producer::{PrintedName, print_bodies};
-use ply_span::{Diagnostic, SourceId, Symbol, codes};
+use ply_span::{Diagnostic, Symbol, codes};
 use ply_store::body::{BodySet, StoredBody};
 use ply_ty::{CheckOutput, DefHash, HashOutput};
 use ply_ty::{LabelVar, Resource, Row, RowVar, Scheme, TyVar, Type};
@@ -11,13 +11,15 @@ use std::collections::{BTreeMap, BTreeSet};
 /// `files[i]` is `(module name, text)` for `SourceId(i)`.
 #[track_caller]
 fn port_front(files: &[(&str, &str)]) -> ply_ty::Front {
+    // A printed program carries the toolchain's modules inline; re-fronting pulls them.
     let named: Vec<(String, String)> = files
         .iter()
+        .filter(|(name, _)| ply_std::source(&ply_ty::ModuleName::from_dotted(name)).is_none())
         .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
         .collect();
-    let ids: Vec<SourceId> = (0..files.len()).map(|i| SourceId(i as u32)).collect();
-    ply_codegen::c::producer::checked_front(&named, &ids)
+    ply_codegen::c::producer::checked_front_with_std(&named)
         .unwrap_or_else(|e| panic!("the program must typecheck: {e:#}"))
+        .front
 }
 
 struct Checked {
@@ -36,12 +38,24 @@ fn compile(files: &[(&str, &str)]) -> Checked {
 }
 
 fn names_of(checked: &Checked) -> Vec<(Symbol, DefHash)> {
+    // Toolchain modules come from the shelf, not the printer: `shipped` to `print`, and out of
+    // the round trip's comparison.
     checked
         .hashes
         .defs
         .iter()
         .chain(checked.hashes.decls.iter())
         .map(|(name, hash)| (name.clone(), *hash))
+        .collect()
+}
+
+fn is_shipped(name: &str) -> bool {
+    ply_std::is_reserved(name) || name.starts_with("compiler.") || name.starts_with("ply_tests")
+}
+
+fn shipped_names() -> Vec<String> {
+    ply_std::sources()
+        .map(|(name, _)| name.to_string())
         .collect()
 }
 
@@ -59,9 +73,18 @@ fn print(
     bodies: &BodySet,
     names: &[(Symbol, DefHash)],
     shipped: &[&str],
+    checked_tests: &[ply_ty::TestInfo],
 ) -> Result<Vec<(String, String)>, Diagnostic> {
     let bytes: Vec<&[u8]> = bodies.defs().map(|(_, body)| body.as_bytes()).collect();
-    let tests: Vec<&[u8]> = bodies.tests().iter().map(StoredBody::as_bytes).collect();
+    // A toolchain test prints into `ply_tests` with a call to a shelf private; it stays on
+    // the shelf like its module.
+    let tests: Vec<&[u8]> = bodies
+        .tests()
+        .iter()
+        .zip(checked_tests)
+        .filter(|(_, t)| !is_shipped(t.module.as_str()))
+        .map(|(b, _)| b.as_bytes())
+        .collect();
     let names: Vec<PrintedName<'_>> = names.iter().map(|(n, h)| public(n.as_str(), *h)).collect();
     print_bodies(&bytes, &names, &tests, &[], shipped)
 }
@@ -162,7 +185,9 @@ fn renumber(
 fn round_trip(files: &[(&str, &str)]) -> (Checked, Vec<(String, String)>) {
     let original = compile(files);
     let names = names_of(&original);
-    let printed = print(&original.bodies, &names, &[])
+    let shipped_owned = shipped_names();
+    let shipped: Vec<&str> = shipped_owned.iter().map(String::as_str).collect();
+    let printed = print(&original.bodies, &names, &shipped, &original.check.tests)
         .unwrap_or_else(|d| panic!("the names say everything: {d:#?}"));
     let borrowed: Vec<(&str, &str)> = printed
         .iter()
@@ -667,7 +692,7 @@ fn moving_a_definition_between_modules_changes_no_body() {
     assert_eq!(lhs, rhs);
 }
 
-/// The examples and every shipped module: this harness has no import graph to pull in `std.net`.
+/// The examples, with the standard library pulled as the built-in package rather than inlined.
 fn corpus() -> Vec<(String, String)> {
     let mut files: Vec<(String, String)> = Vec::new();
     for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples")).unwrap()
@@ -680,7 +705,6 @@ fn corpus() -> Vec<(String, String)> {
     }
     files.sort();
     assert!(!files.is_empty(), "the examples moved");
-    files.extend(ply_std::sources().map(|(name, source)| (name.to_string(), source.to_string())));
     files
 }
 
@@ -727,8 +751,8 @@ fn printing_is_deterministic() {
     let original = compile(&[("m", EVERY_ITEM_KIND)]);
     let names = names_of(&original);
     assert_eq!(
-        print(&original.bodies, &names, &[]).expect("printable"),
-        print(&original.bodies, &names, &[]).expect("printable")
+        print(&original.bodies, &names, &[], &original.check.tests).expect("printable"),
+        print(&original.bodies, &names, &[], &original.check.tests).expect("printable")
     );
 }
 
@@ -818,7 +842,7 @@ fn one_body_named_twice_within_a_group_is_refused() {
     )]);
     let hash = |name: &str| original.hashes.defs[&Symbol::new(name)];
     assert_eq!(hash("m.b"), hash("m.c"));
-    let refused = print(&original.bodies, &names_of(&original), &[])
+    let refused = print(&original.bodies, &names_of(&original), &[], &original.check.tests)
         .expect_err("the names cannot say which member a call reaches");
     assert_eq!(refused.code, codes::ARTIFACT_INVALID);
     assert!(
@@ -837,7 +861,8 @@ fn one_effect_declaration_named_twice_is_refused() {
         ("b", "pub effect one { read at() -> Int }"),
     ]);
     let names = names_of(&original);
-    let refused = print(&original.bodies, &names, &[]).expect_err("two names for one declaration");
+    let refused = print(&original.bodies, &names, &[], &original.check.tests)
+        .expect_err("two names for one declaration");
     assert!(
         refused.message.contains("`a.one`") && refused.message.contains("`b.one`"),
         "{}",
@@ -848,7 +873,8 @@ fn one_effect_declaration_named_twice_is_refused() {
         .into_iter()
         .filter(|(name, _)| name.as_str() == "a.one")
         .collect();
-    print(&original.bodies, &once, &[]).expect("named once, the declaration is that name's");
+    print(&original.bodies, &once, &[], &original.check.tests)
+        .expect("named once, the declaration is that name's");
 }
 
 #[test]
@@ -865,7 +891,8 @@ fn names_that_cannot_be_applied_are_refused() {
             .collect(),
     ] {
         let refused =
-            print(&original.bodies, &broken, &[]).expect_err("a namespace that cannot be applied");
+            print(&original.bodies, &broken, &[], &original.check.tests)
+                .expect_err("a namespace that cannot be applied");
         assert_eq!(refused.code, codes::ARTIFACT_INVALID);
     }
 }
@@ -873,7 +900,7 @@ fn names_that_cannot_be_applied_are_refused() {
 #[test]
 fn a_shipped_module_is_imported_and_not_printed() {
     let original = compile(&NAMED);
-    let printed = print(&original.bodies, &names_of(&original), &["store.wire"])
+    let printed = print(&original.bodies, &names_of(&original), &["store.wire"], &original.check.tests)
         .expect("the names say everything");
     assert_eq!(printed.len(), 1);
     assert_eq!(printed[0].0, "app");
