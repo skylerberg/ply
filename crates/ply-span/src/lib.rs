@@ -229,8 +229,6 @@ pub mod codes {
     pub const DUPLICATE_IMPORT: &str = "E0110";
     pub const INVALID_MODULE_PATH: &str = "E0111";
     pub const AMBIGUOUS_ENTRY_POINT: &str = "E0112";
-    /// A project file whose path would name a module under a reserved root such as `std`.
-    pub const RESERVED_MODULE_NAME: &str = "E0113";
     /// A row, or an `effect set` body, naming a set the module does not declare.
     pub const UNKNOWN_EFFECT_SET: &str = "E0114";
     pub const EFFECT_SET_CYCLE: &str = "E0115";
@@ -437,7 +435,6 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ("E0110", "duplicate import"),
     ("E0111", "file path that cannot name a module"),
     ("E0112", "ambiguous entry point"),
-    ("E0113", "project module under the reserved root `std`"),
     (
         "E0114",
         "unknown `effect set`, including a `pub` or qualified one",
@@ -774,7 +771,6 @@ mod tests {
                 codes::AMBIGUOUS_ENTRY_POINT,
                 "E0112",
             ),
-            ("RESERVED_MODULE_NAME", codes::RESERVED_MODULE_NAME, "E0113"),
             ("UNKNOWN_EFFECT_SET", codes::UNKNOWN_EFFECT_SET, "E0114"),
             ("EFFECT_SET_CYCLE", codes::EFFECT_SET_CYCLE, "E0115"),
             ("RECORD_UPDATE_SHAPE", codes::RECORD_UPDATE_SHAPE, "E0116"),

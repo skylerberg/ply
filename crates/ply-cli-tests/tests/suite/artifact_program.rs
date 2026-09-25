@@ -97,27 +97,25 @@ fn the_compiler_is_on_the_shelf_under_its_own_root_and_nothing_may_shadow_it() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("compiler")).unwrap();
     write(dir.path(), "compiler/fmt.ply", "pub fn f() -> Int = 1\n");
-    let err = ply_machine::load::load(dir.path()).expect_err("`compiler` is reserved");
+    let err = ply_machine::load::load(dir.path())
+        .expect_err("`compiler` is the built-in package's prefix");
     assert_eq!(err.diagnostics.len(), 1);
-    assert_eq!(
-        err.diagnostics[0].code,
-        ply_span::codes::RESERVED_MODULE_NAME
-    );
+    assert_eq!(err.diagnostics[0].code, ply_span::codes::PREFIX_COLLISION);
     assert!(
         err.diagnostics[0].message.contains("compiler.fmt"),
         "{:?}",
         err.diagnostics[0].message
     );
 
-    // A name that merely starts with the letters is not reserved.
+    // A name that merely starts with the letters is no collision.
     let ok = tempfile::tempdir().unwrap();
     write(ok.path(), "compilers.ply", "pub fn f() -> Int = 1\n");
     ply_machine::load::load(ok.path()).expect("`compilers` is an ordinary module name");
 }
 
-/// The shelf hands over text, and the front end and the emitter each parse it: a module filed
-/// under `compiler.x` whose text still imports `x` resolves one way for one reader and another
-/// way for the other, and every body that calls across it is refused.
+/// The shelf hands over text, and the front end and the emitter each parse it: every import a
+/// shelved module makes must resolve there — an import of another package in full, or the
+/// compiler package's own sibling.
 #[test]
 fn every_shelved_module_imports_the_shelf_under_the_names_it_files_them_under() {
     let filed: Vec<&str> = ply_machine::shelf::sources()
@@ -130,8 +128,11 @@ fn every_shelved_module_imports_the_shelf_under_the_names_it_files_them_under() 
                 .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
                 .next()
                 .unwrap_or("");
+            let resolves = filed.contains(&path)
+                || (module.starts_with("compiler.")
+                    && filed.contains(&format!("compiler.{path}").as_str()));
             assert!(
-                filed.contains(&path),
+                resolves,
                 "`{module}` imports `{path}`, which the shelf files under no such name: {filed:?}"
             );
         }

@@ -364,10 +364,6 @@ impl<'s> Driver<'s> {
         let mut files = Vec::with_capacity(discovered.len());
         for (file, &(source, content, stamp)) in discovered.iter().zip(&read) {
             match ModuleName::from_relative_path(&file.relative) {
-                Ok(module) if crate::shelf::is_compiler(module.as_str()) => {
-                    let diagnostic = crate::shelf::reserved_diagnostic(&file.path, module.as_str());
-                    diagnostics.push(anchor(diagnostic, &sources, source));
-                }
                 Ok(module) => files.push(FileState {
                     path: file.path.clone(),
                     module,
