@@ -161,32 +161,32 @@ fn ply_hosts_binds_the_shipped_declaration_under_its_qualified_name() {
 }
 
 #[test]
-fn a_project_file_under_std_is_e0113_against_the_file() {
+fn a_project_file_under_std_collides_with_the_built_in_package() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "std/json.ply", "pub fn parse() -> Int = 1\n");
 
-    let err = load(dir.path()).expect_err("`std` is reserved");
+    let err = load(dir.path()).expect_err("`std` is the built-in package's prefix");
     assert_eq!(err.diagnostics.len(), 1);
-    assert_eq!(err.diagnostics[0].code, codes::RESERVED_MODULE_NAME);
+    assert_eq!(err.diagnostics[0].code, codes::PREFIX_COLLISION);
     assert!(
         err.diagnostics[0].message.contains("std.json"),
         "{:?}",
         err.diagnostics[0].message
     );
     let span = err.diagnostics[0].primary_span().unwrap();
-    assert!(!span.is_dummy(), "E0113 must point at the file it is about");
+    assert!(!span.is_dummy(), "E0133 must point at the file it is about");
     assert!(err.sources.get(span.source).is_some());
 }
 
 /// Easy to miss when the rule is written as a prefix check.
 #[test]
-fn a_project_file_named_std_is_also_e0113() {
+fn a_project_file_named_std_also_collides() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "std.ply", "pub fn f() -> Int = 1\n");
-    let err = load(dir.path()).expect_err("`std` is reserved");
-    assert_eq!(err.diagnostics[0].code, codes::RESERVED_MODULE_NAME);
+    let err = load(dir.path()).expect_err("`std` is the built-in package's prefix");
+    assert_eq!(err.diagnostics[0].code, codes::PREFIX_COLLISION);
 
-    // And a name that merely starts with the letters is not reserved.
+    // And a name that merely starts with the letters is no collision.
     let ok = tempfile::tempdir().unwrap();
     write(ok.path(), "stdlib.ply", "pub fn f() -> Int = 1\n");
     load(ok.path()).expect("`stdlib` is an ordinary module name");

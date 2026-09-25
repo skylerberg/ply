@@ -1,5 +1,6 @@
 // The front end's answer for the driver: the errors, or else the warnings and every table it reads, in `diag.ply`'s framing.
 
+import spine
 import spine (Span, Ident, QName, PDiag, dummy_span, num)
 import lexer (byte_of)
 import items (Item, IFn, IType, IEffect, ITest, ILaw, IEffectSet, TDSum, VariantDef, SpecClause,
@@ -669,24 +670,71 @@ pub fn analyse_with(
   let clo = closure(pkgs, map(parsed, |p: Parsed| p.name));
   let all = fold(clo.modules, parsed, |acc: List<Parsed>, m: { pkg: Int, src: Source }|
     push(acc, parse_at(len(acc), m.src)));
-  analyse_closure(all, clo, defs, tests, len(parsed))
+  // The toolchain's own tree loads without its implicit self; this path has no shelf list to
+  // check the coverage half of that against, and only the toolchain's listings use it.
+  let toolchain = fold(parsed, true, |acc: Bool, p: Parsed| acc && is_std(p.name));
+  analyse_closure(all, clo, defs, tests, len(parsed), toolchain)
 }
 
 // The packages of a load as the front end's tables take them: the root package first, the
 // shelf one past the end, and every module mapped to the package it was parsed from. The
 // order is the root's modules, then the closure's dependency modules, then the pulled shelf.
+// The built-in package: every package's implicit dependency, pulled on demand like the
+// shelf but owned as a package — the first the runtime pre-seeds.
+pub fn std_pkg() -> Pkg = { prefix: b"std", deps: [] }
+
+fn has(xs: List<Bytes>, x: Bytes) -> Bool =
+  match xs { [] -> false, [y, ..rest] -> if y == x { true } else { has(rest, x) } }
+
+// The packages of a load as the front end's tables take them: the root package first, then
+// the closure's, then the built-in std, with the shelf past the end, and every module mapped
+// to the package it was parsed from. The order is the root's modules, then the closure's
+// dependency modules, then the pulled toolchain modules.
 fn pkg_tables(
-  total: Int,
+  parsed: List<Parsed>,
   root_count: Int,
   clo: Closure,
-) -> { pkgs: List<Pkg>, mod_pkg: List<Int>, shelf: Int } =
+  toolchain: Bool,
+) -> { pkgs: List<Pkg>, mod_pkg: List<Int>, std: Int, shelf: Int } = {
+  let std = if toolchain { 0 - 1 } else { len(clo.packages) };
   {
-    pkgs: map(clo.packages, |p: Package| { prefix: p.prefix, deps: p.deps }),
-    mod_pkg: map(range(0, total), |i: Int|
+    pkgs: if toolchain { map(clo.packages, |p: Package| { prefix: p.prefix, deps: p.deps }) }
+    else { push(map(clo.packages, |p: Package| { prefix: p.prefix, deps: p.deps }), std_pkg()) },
+    mod_pkg: map(range(0, len(parsed)), |i: Int|
       if i < root_count { 0 }
       else if i < root_count + len(clo.modules) { at(clo.modules, i - root_count).pkg }
-      else { len(clo.packages) }),
-    shelf: len(clo.packages),
+      else if toolchain { len(clo.packages) }
+      else if is_std(at(parsed, i).name) { std }
+      else { std + 1 }),
+    std: std,
+    shelf: if toolchain { len(clo.packages) } else { std + 1 },
+  }
+}
+
+// A root module under the built-in package's prefix, which no user's file may claim; the
+// toolchain's own tree is the one load that may, and it announces itself by covering the
+// whole shipped set.
+fn std_squats(
+  parsed: List<Parsed>,
+  root_count: Int,
+  toolchain: Bool,
+) -> List<{ slot: Int, diag: PDiag }> =
+  if toolchain { [] } else {
+    fold(range(0, root_count), [], |acc: List<{ slot: Int, diag: PDiag }>, i: Int| {
+      let n = at(parsed, i).name;
+      if !is_std(n) { acc } else {
+        push(acc, {
+          slot: 0 - i - 1,
+          diag: spine::diag1(
+            b"E0133",
+            dummy_span(),
+            bytes_concat_all([b"`", n, b"` would shadow the built-in package `std`"]),
+            b"this file claims a module under the toolchain's own prefix",
+            [b"`std` names the modules the toolchain ships; rename the file or the directory"],
+          ),
+        })
+      }
+    })
   }
 
 fn analyse_closure(
@@ -695,19 +743,30 @@ fn analyse_closure(
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
   root_count: Int,
+  toolchain: Bool,
 ) -> Analysis = {
   // The packages' identity reports ahead of anything the program text has to say: manifest
   // and graph diags point one slot past every module, in manifest order.
-  if len(clo.diags) > 0 {
-    Refused(map(clo.diags, |sd: { slot: Int, diag: PDiag }| placed(len(parsed) + sd.slot, sd.diag)))
+  let pkg_diags = fold(
+    std_squats(parsed, root_count, toolchain),
+    clo.diags,
+    |acc: List<{ slot: Int, diag: PDiag }>, sd: { slot: Int, diag: PDiag }| push(acc, sd),
+  );
+  if len(pkg_diags) > 0 {
+    Refused(
+      map(pkg_diags, |sd: { slot: Int, diag: PDiag }|
+        if sd.slot < 0 { placed(0 - sd.slot - 1, sd.diag) }
+        else { placed(len(parsed) + sd.slot, sd.diag) }),
+    )
   } else {
     let early = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
     if len(early) > 0 { Refused(early) } else {
-      let tables = pkg_tables(len(parsed), root_count, clo);
+      let tables = pkg_tables(parsed, root_count, clo, toolchain);
       match resolve_packaged(
           map(parsed, |p: Parsed| p.module),
           tables.pkgs,
           tables.mod_pkg,
+          tables.std,
           tables.shelf,
         ) {
         Failed(ds) -> Refused(map(ds, outside_every_module)),
@@ -993,9 +1052,10 @@ pub fn claims_dump(
   shelf: Int = 0,
 ) -> String = {
   let mods = map(parse_all(sources), |p: Parsed| p.module);
+  // The published table ends with the built-in std package; the shelf sits one past it.
   let packaged = if len(pkgs) == 0 { no_pkgs(mods) }
-  else { { pkgs: pkgs, mod_pkg: mod_pkg, shelf: shelf } };
-  match resolve_packaged(mods, packaged.pkgs, packaged.mod_pkg, packaged.shelf) {
+  else { { pkgs: pkgs, mod_pkg: mod_pkg, std: shelf - 1, shelf: shelf } };
+  match resolve_packaged(mods, packaged.pkgs, packaged.mod_pkg, packaged.std, packaged.shelf) {
     Failed(_) -> panic("a program the front end checked does not resolve"),
     Resolved_(x) -> match update_shapes(x.r, x.mods) {
       None -> panic("a program the front end checked does not check"),
@@ -1202,6 +1262,11 @@ pub fn analyse_pulling_std_with(
     parse_all(user),
     |acc: List<Parsed>, m: { pkg: Int, src: Source }| push(acc, parse_at(len(acc), m.src)),
   );
+  // The toolchain's own tree loads without its implicit self: every root module under `std`
+  // with the whole shipped set among them is the built-in package's sources.
+  let toolchain = fold(user, true, |acc: Bool, s: Source| acc && is_std(s.name))
+    && fold(shipped, true, |acc: Bool, s: Source|
+      acc && (!is_std(s.name) || has(map(user, |u: Source| u.name), s.name)));
   let x = pulling(len(assembled), texts, map(shipped, |s: Source| s.name), {
     parsed: assembled,
     pulled: [],
@@ -1210,7 +1275,7 @@ pub fn analyse_pulling_std_with(
   {
     pulled: x.pulled,
     out: if len(x.diags) > 0 { Refused(x.diags) }
-    else { analyse_closure(x.parsed, clo, defs, tests, len(user)) },
+    else { analyse_closure(x.parsed, clo, defs, tests, len(user), toolchain) },
   }
 }
 
@@ -2780,7 +2845,7 @@ test "the warnings come first, then the order and the module frame" {
   assert(
     bytes_starts_with(
       bytes_of_string(front_dump(program())),
-      b"diag 0 98\ncode 5\nW0611severity 7\nwarningmessage 28\ntype `m.Shape` is never usedlabel 20\n0 46 51 1\nnever usedorder _ 10\nmodule 1\nmpkg  0\nmodpkg _ 7\npkg 1\n0module m 72\nindex 1\n0item 5\nm.logitem 7\nm.Shapeitem 5\nm.Dotitem 6\nm.Lineitem 5\nm.saydef m.say ",
+      b"diag 0 98\ncode 5\nW0611severity 7\nwarningmessage 28\ntype `m.Shape` is never usedlabel 20\n0 46 51 1\nnever usedorder _ 10\nmodule 1\nmpkg  0\npkg std 0\nmodpkg _ 7\npkg 1\n0module m 72\nindex 1\n0item 5\nm.logitem 7\nm.Shapeitem 5\nm.Dotitem 6\nm.Lineitem 5\nm.saydef m.say ",
     ),
   )
 }
