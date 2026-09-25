@@ -116,16 +116,6 @@ pub fn digest_short() -> String {
     out
 }
 
-pub fn reserved_diagnostic(path: &Path, name: &str) -> Diagnostic {
-    Diagnostic::error(
-        codes::RESERVED_MODULE_NAME,
-        format!("`{}` would be the module `{name}`, and `std` is reserved", path.display()),
-    )
-    .primary(Span::DUMMY, "this file would shadow the modules that ship with the compiler")
-    .note("`std` and everything under it name the modules embedded in `ply`; run `ply std` to list them")
-    .note("rename the file or the directory it sits in")
-}
-
 pub fn unknown_module(name: &ModuleName, span: Span) -> Diagnostic {
     let listed: Vec<String> = MODULES.iter().map(|(n, _)| format!("`{n}`")).collect();
     Diagnostic::error(

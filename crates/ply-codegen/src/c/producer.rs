@@ -672,16 +672,13 @@ pub fn front_dump(sources: &[(String, String)]) -> Result<String> {
 
 const CLAIMS: &str = "front.claims_dump";
 
-/// Every body, clause and law of a program [`front`] already checked, lowered, resolving the
-/// way the front end did: `packages` and `mod_pkg` are what it published, or empty for a
-/// program without packages.
-pub fn claims_dump(
-    sources: &[(String, String)],
+/// The package tables a caller passes to a resolving entry, as values: what [`Front`]
+/// publishes, or empty lists for a program without packages.
+pub fn package_tables(
     packages: &[(String, Vec<String>)],
     mod_pkg: &[usize],
-) -> Result<String> {
-    tally(|census| census.claimed += sources.len());
-    let (pkgs, mods, shelf) = if packages.is_empty() {
+) -> (Value, Value, Value) {
+    if packages.is_empty() {
         (
             Value::list(Vec::new()),
             Value::list(Vec::new()),
@@ -708,7 +705,19 @@ pub fn claims_dump(
             Value::list(mod_pkg.iter().map(|i| Value::Int(*i as i64)).collect()),
             Value::Int(packages.len() as i64),
         )
-    };
+    }
+}
+
+/// Every body, clause and law of a program [`front`] already checked, lowered, resolving the
+/// way the front end did: `packages` and `mod_pkg` are what it published, or empty for a
+/// program without packages.
+pub fn claims_dump(
+    sources: &[(String, String)],
+    packages: &[(String, Vec<String>)],
+    mod_pkg: &[usize],
+) -> Result<String> {
+    tally(|census| census.claimed += sources.len());
+    let (pkgs, mods, shelf) = package_tables(packages, mod_pkg);
     string_answer(
         CLAIMS,
         call(CLAIMS, &[source_list(sources), pkgs, mods, shelf])?,
