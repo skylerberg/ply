@@ -218,7 +218,9 @@ A dependency is another package root: `Path("../cli")` names the directory
 its `ply.pkg` stands in, and the dependency must hold one (`E0135`). Its
 modules answer to `<prefix>.<name>` for every package that declares it — the
 same dependency's own `import args` means *its* sibling `args`, never the
-importing package's. Reaching a package the manifest does not declare is
+importing package's. A bare import inside a dependency names that package's
+own modules only: the loading package's bare modules are unreachable from a
+dependency. Reaching a package the manifest does not declare is
 `E0132`, two packages granting one prefix is `E0133` — as is a module of the
 root package squatting on a dependency's prefix — and a cycle of packages is
 `E0134`. `Git` and `Registry` sources are checked and refused for now: only
