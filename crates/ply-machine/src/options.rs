@@ -1,5 +1,5 @@
 //! What a run is configured with, as plain data: the machines read these, and the shell's parsed
-//! flags convert into them. Nothing here knows about clap.
+//! flags convert into them.
 
 use ply_host::tls::CredentialSpec;
 use std::path::PathBuf;
