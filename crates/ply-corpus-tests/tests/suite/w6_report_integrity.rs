@@ -229,7 +229,9 @@ fn neither_shipped_measurement_file_carries_a_verdict_or_a_criterion() {
 fn the_shipped_ladder_still_describes_the_tree_it_ships_in() {
     let report = shipped();
     let ladder = report.ladder().expect("the shipped ladder assembles");
-    let fresh = ply_corpus::w6_run::in_process(&repo(), 256, 500, 2)
+    // 20,000 iterations, not 500: the endpoint rung answers in tens of nanoseconds, so at 500
+    // its whole run is a scheduler quantum and one hiccup on a shared runner is the measurement.
+    let fresh = ply_corpus::w6_run::in_process(&repo(), 256, 20_000, 2)
         .expect("the in-process rungs re-take without a database");
 
     let taken: Vec<(Layer, f64)> = vec![

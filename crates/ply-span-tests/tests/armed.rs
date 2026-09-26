@@ -1809,6 +1809,13 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
          `hybrid::one_culprit_among_five_edits_is_named_within_the_logarithmic_budget` in \
          crates/ply-test-tests/tests/suite runs it and was seen to fail.",
     ),
+    (
+        "crates/ply-corpus/src/cmd.rs",
+        "`dispatch`, attaching the corpus front door's own compiled unit: the artifact the \
+         stage built for these very sources, so the unit is the sources. It parses argv and \
+         answers a plan; it never runs a test and holds no result cache, so there is no \
+         namespace the rule could want it under.",
+    ),
 ];
 
 #[test]
