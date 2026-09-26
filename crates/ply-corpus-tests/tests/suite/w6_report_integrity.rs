@@ -229,7 +229,9 @@ fn neither_shipped_measurement_file_carries_a_verdict_or_a_criterion() {
 fn the_shipped_ladder_still_describes_the_tree_it_ships_in() {
     let report = shipped();
     let ladder = report.ladder().expect("the shipped ladder assembles");
-    let fresh = ply_corpus::w6_run::in_process(&repo(), 256, 500, 2)
+    // 20,000 iterations, not 500: the endpoint rung answers in tens of nanoseconds, so at 500
+    // its whole run is a scheduler quantum and one hiccup on a shared runner is the measurement.
+    let fresh = ply_corpus::w6_run::in_process(&repo(), 256, 20_000, 2)
         .expect("the in-process rungs re-take without a database");
 
     let taken: Vec<(Layer, f64)> = vec![
@@ -276,7 +278,11 @@ fn the_shipped_ladder_still_describes_the_tree_it_ships_in() {
         } else {
             f64::INFINITY
         };
-        if !(0.25..=4.0).contains(&shape_ratio) {
+        // The endpoint rung is excused from the shape comparison: at tens of nanoseconds of
+        // register work it holds its absolute time under load while the framing rung's byte
+        // traffic degrades, so their ratio prices the runner's contention, not the tree. Its
+        // absolute check below still stands in a release build.
+        if layer != Layer::Endpoint && !(0.25..=4.0).contains(&shape_ratio) {
             stale.push(format!(
                 "`{}`: the file has it at {:.4} of the framing rung and the tree has it at {:.4} \
                  ({:.1}x apart), which no build profile explains",

@@ -3,6 +3,7 @@
 
 pub mod bench;
 pub mod build;
+pub mod cmd;
 pub mod discharge;
 pub mod emit;
 pub mod measure;
