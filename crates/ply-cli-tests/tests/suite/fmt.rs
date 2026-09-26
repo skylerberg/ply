@@ -1,21 +1,7 @@
-use assert_cmd::Command;
+use crate::harness::{ply, repo};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-
-fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("the crate lives two levels below the repository root")
-        .to_path_buf()
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
+use std::path::Path;
 
 const UNFORMATTED: &str = "\
 // A leading comment.

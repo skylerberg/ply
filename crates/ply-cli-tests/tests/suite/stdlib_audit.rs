@@ -1,25 +1,10 @@
-use assert_cmd::prelude::*;
+use crate::harness::{ply, write};
 use ply_machine::driver;
 use ply_machine::load::{Loaded, load};
 use ply_span::{Symbol, codes};
 use ply_store::{ContentHash, DefEntry, Store};
 use ply_ty::ModuleName;
 use std::path::Path;
-use std::process::Command;
-
-fn write(dir: &Path, rel: &str, text: &str) {
-    let path = dir.join(rel);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    std::fs::write(path, text).unwrap();
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
 
 fn output(out: &std::process::Output) -> String {
     format!(

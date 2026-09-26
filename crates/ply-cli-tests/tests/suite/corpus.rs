@@ -1,23 +1,8 @@
-use assert_cmd::Command;
+use crate::harness::{ply, process, repo};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("the crate lives two levels below the repository root")
-        .to_path_buf()
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
 
 fn compiler_copy() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -239,8 +224,7 @@ fn a_served_example_with_the_tier_holding_its_accept_loop() {
         );
     std::fs::write(dir.path().join("hello.ply"), source).unwrap();
 
-    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("ply"))
-        .current_dir(dir.path())
+    let mut child = process(dir.path())
         .env("PLY_C_CACHE", dir.path().join("cache"))
         .env("PLY_C_REFUSALS", "1")
         .args(["--color", "never", "run", "--host", "--backend", "c"])

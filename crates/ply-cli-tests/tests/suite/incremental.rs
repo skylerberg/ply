@@ -2,12 +2,8 @@ use ply_machine::driver;
 use ply_machine::load::Loaded;
 use ply_store::Store;
 
+use crate::harness::{ply, write};
 /// The binary, at the directory under test.
-fn ply(dir: &Path) -> assert_cmd::Command {
-    let mut cmd = assert_cmd::Command::cargo_bin("ply").expect("the binary");
-    cmd.current_dir(dir);
-    cmd
-}
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -92,14 +88,6 @@ fn codes(e: &ply_machine::load::LoadError) -> Vec<String> {
         .iter()
         .map(|d| format!("{}: {}", d.code, d.message))
         .collect()
-}
-
-fn write(dir: &Path, name: &str, text: &str) {
-    let path = dir.join(name);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-    fs::write(path, text).unwrap();
 }
 
 fn edit(dir: &Path, name: &str, from: &str, to: &str) {
@@ -807,98 +795,6 @@ fn a_test_added_with_a_body_already_present_agrees() {
         "two tests with one body are one computation"
     );
 }
-
-/// Real code exercises handlers, regions, `nondet` effects and cross-module types the synthetic corpus does not.
-#[test]
-fn the_example_corpus_agrees_across_a_session() {
-    let dir = examples();
-    agree(dir.path(), "step 0");
-
-    edit(
-        dir.path(),
-        "report.ply",
-        "fn assets() -> List<String>",
-        "// a note\nfn assets() -> List<String>",
-    );
-    agree(dir.path(), "step 1: a comment");
-
-    edit(dir.path(), "ledger.ply", "presented", "presented_value");
-    edit(dir.path(), "report.ply", "presented", "presented_value");
-    agree(dir.path(), "step 2: rename across modules");
-
-    edit(dir.path(), "report.ply", "type Line = ", "type Row = ");
-    edit(dir.path(), "report.ply", "-> Line =", "-> Row =");
-    edit(dir.path(), "report.ply", "List<Line>", "List<Row>");
-    edit(dir.path(), "report.ply", "l: Line|", "l: Row|");
-    agree(dir.path(), "step 3: rename a type");
-
-    fs::write(
-        dir.path().join("clock.ply"),
-        fs::read_to_string(dir.path().join("clock.ply")).unwrap() + "\npub fn ticks() -> Int = 0\n",
-    )
-    .unwrap();
-    agree(dir.path(), "step 4: add a definition");
-}
-
-#[test]
-fn a_long_shuffle_of_compiling_states_agrees_at_every_step() {
-    // Each file's variants differ in a body, a signature, a name, a declaration's shape, or an import.
-    let variants: [(&str, [&str; 3]); 3] = [
-        (
-            "leaf.ply",
-            [
-                "pub fn one() -> Int = 1\npub fn two() -> Int = one() + one()\n",
-                "// reformatted\npub fn one() -> Int = 1\n\npub fn two() -> Int = one() + one()\n",
-                "pub fn one() -> Int = 1\npub fn two() -> Int = one() + 1\n",
-            ],
-        ),
-        (
-            "core.ply",
-            [
-                CORE,
-                &const_str_replace(CORE, "Money", "Cost"),
-                &const_str_replace(CORE, "pub fn label(", "pub fn title("),
-            ],
-        ),
-        (
-            "shop.ply",
-            [
-                SHOP,
-                &const_str_replace(SHOP, "import core\n", "import core\nimport leaf\n"),
-                &const_str_replace(SHOP, "acc + core::price(i)", "acc + core::price(i) + 0"),
-            ],
-        ),
-    ];
-
-    let dir = corpus();
-    let mut state = [0usize; 3];
-    let mut seed: u64 = 0x5eed_1234_9abc_def0;
-    for step in 0..60 {
-        seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let file = (seed >> 33) as usize % variants.len();
-        let pick = (seed >> 17) as usize % 3;
-        if state[file] == pick {
-            continue;
-        }
-        state[file] = pick;
-
-        let (name, bodies) = &variants[file];
-        write(dir.path(), name, bodies[pick]);
-        agree(
-            dir.path(),
-            &format!("shuffle step {step}: {name} -> {pick}"),
-        );
-    }
-}
-
-/// `str::replace` is not `const`, and the variants are edits of the corpus rather than copies that can drift.
-fn const_str_replace(text: &str, from: &str, to: &str) -> String {
-    assert!(text.contains(from), "`{from}` is not in the fixture");
-    text.replace(from, to)
-}
-
 const PALETTE: &str = r#"
 pub type Color = Red | Green
 

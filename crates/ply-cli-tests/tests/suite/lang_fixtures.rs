@@ -1,16 +1,8 @@
 //! A fixture under `tests/fixtures/lang/` states in `// raises <test> :: <text>` lines which tests fail with `E0502` carrying `<text>`.
 
-use assert_cmd::Command;
+use crate::harness::{ply, repo};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
-
-fn repo(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(relative)
-        .canonicalize()
-        .expect("the repository path exists")
-}
+use std::path::Path;
 
 fn expectations(source: &str) -> Vec<(String, String)> {
     source
@@ -24,13 +16,12 @@ fn expectations(source: &str) -> Vec<(String, String)> {
 }
 
 fn failures(dir: &Path, tier_only: bool) -> Vec<Value> {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.args(["--color", "never", "test", "--json", "--no-cache"])
-        .current_dir(dir);
+    let mut cmd = ply(dir);
+    cmd.args(["test", "--json", "--no-cache"]);
     if tier_only {
         cmd.args(["--backend", "c"]).env(
             "PLY_C_EMITTER",
-            format!("ply:{}", repo("crates/ply-compiler/ply").display()),
+            format!("ply:{}", repo().join("crates/ply-compiler/ply").display()),
         );
     }
     let out = cmd.output().unwrap();
@@ -52,7 +43,7 @@ fn failures(dir: &Path, tier_only: bool) -> Vec<Value> {
 }
 
 fn check(fixture: &str, tier_only: bool) {
-    let source = std::fs::read_to_string(repo(&format!("tests/fixtures/lang/{fixture}.ply")))
+    let source = std::fs::read_to_string(repo().join(format!("tests/fixtures/lang/{fixture}.ply")))
         .expect("the fixture is part of the repository");
     let expected = expectations(&source);
     assert!(!expected.is_empty(), "{fixture} states no raises");
@@ -121,18 +112,13 @@ fn footprints(source: &str) -> Vec<(String, String)> {
 
 #[test]
 fn the_footprints_the_checker_infers_are_the_ones_stated() {
-    let source = std::fs::read_to_string(repo("tests/fixtures/lang/footprints.ply"))
+    let source = std::fs::read_to_string(repo().join("tests/fixtures/lang/footprints.ply"))
         .expect("the fixture is part of the repository");
     let expected = footprints(&source);
     assert!(!expected.is_empty());
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("m.ply"), &source).unwrap();
-    let out = Command::cargo_bin("ply")
-        .unwrap()
-        .args(["--color", "never", "check", "--json"])
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
+    let out = ply(dir.path()).args(["check", "--json"]).output().unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
     let report: Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
     let defs = report["definitions"]

@@ -1,7 +1,6 @@
-use assert_cmd::Command;
+use crate::harness::{ply, project};
 use serde_json::{Map, Value};
 use std::path::Path;
-use tempfile::TempDir;
 
 /// Failures, exhaustive searches and ordinary cached tests at once, so a difference in any of them shows.
 const CORPUS: &str = r#"
@@ -59,18 +58,6 @@ test "a sleeper costs no wall clock" {
 
 test "the arithmetic is not concurrent" { assert_eq(1 + 1, 2) }
 "#;
-
-fn project(source: &str) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("m.ply"), source).unwrap();
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
 
 /// Everything a run is allowed to differ in, and nothing else.
 fn scrub(value: &Value) -> Value {

@@ -1,5 +1,4 @@
-use assert_cmd::Command;
-use std::path::Path;
+use crate::harness::ply;
 use tempfile::TempDir;
 
 const GOOD: &str = r#"import std.pkg (Manifest)
@@ -13,12 +12,6 @@ fn project(manifest: Option<&str>) -> TempDir {
         std::fs::write(dir.path().join("ply.pkg"), text).expect("the manifest");
     }
     dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").expect("the binary is built");
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
 }
 
 #[test]

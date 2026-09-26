@@ -1,25 +1,4 @@
-use assert_cmd::Command;
-use serde_json::Value;
-use std::path::Path;
-use tempfile::TempDir;
-
-fn project(source: &str) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("m.ply"), source).unwrap();
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
-
-fn json_of(output: &std::process::Output) -> Value {
-    let text = String::from_utf8(output.stdout.clone()).unwrap();
-    serde_json::from_str(&text)
-        .unwrap_or_else(|e| panic!("stdout was not one JSON object: {e}\n---\n{text}\n---"))
-}
+use crate::harness::{json_of, ply, project};
 
 const HOLDS: &str = "\
 fn size(m: Map<String, Int>) -> Int = map_len(m)

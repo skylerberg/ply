@@ -1,7 +1,6 @@
-use assert_cmd::Command;
+use crate::harness::{ply, project, stderr_of, stdout_of};
 use serde_json::Value;
 use std::path::Path;
-use tempfile::TempDir;
 
 /// A program that performs nothing at all.
 const HOSTED: &str = "\
@@ -12,31 +11,6 @@ test \"arithmetic still works\" { assert_eq(1 + 1, 2) }
 
 const URL: &str = "postgres://ply@127.0.0.1:5433/desk?sslmode=disable";
 const PASSWORD: &str = "correct-horse-battery-staple";
-
-fn project(source: &str) -> TempDir {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    std::fs::write(dir.path().join("m.ply"), source).expect("the fixture is written");
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").expect("the binary is built");
-    cmd.arg("--color")
-        .arg("never")
-        .current_dir(dir)
-        // Inherited values would make every assertion below depend on the machine the suite ran on.
-        .env_remove(ply_machine::db::URL_ENV)
-        .env_remove(ply_machine::db::PASSWORD_ENV);
-    cmd
-}
-
-fn stdout_of(output: &std::process::Output) -> String {
-    String::from_utf8(output.stdout.clone()).expect("stdout is utf-8")
-}
-
-fn stderr_of(output: &std::process::Output) -> String {
-    String::from_utf8(output.stderr.clone()).expect("stderr is utf-8")
-}
 
 fn bytes_under(dir: &Path) -> String {
     let mut out = String::new();

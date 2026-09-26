@@ -1,12 +1,5 @@
-use assert_cmd::Command;
-use std::path::Path;
+use crate::harness::ply;
 use tempfile::TempDir;
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").expect("the binary is built");
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
 
 fn manifest(name: &str, deps: &str) -> String {
     format!(

@@ -1,16 +1,10 @@
+use crate::harness::{process, repo};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const STARTUP: Duration = Duration::from_secs(30);
-
-fn repo(rel: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(rel)
-}
 
 fn reserve_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral port");
@@ -20,7 +14,8 @@ fn reserve_port() -> u16 {
 /// Plus the `main` the example deliberately lacks: `examples/hello.ply` holds the only one under `examples/`.
 fn project(port: u16, connections: u32) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("a temp dir");
-    let orders = std::fs::read_to_string(repo("examples/orders.ply")).expect("examples/orders.ply");
+    let orders =
+        std::fs::read_to_string(repo().join("examples/orders.ply")).expect("examples/orders.ply");
     assert!(
         orders.contains("derive json for Order"),
         "`examples/orders.ply` no longer derives its codec, which is the whole claim here"
@@ -40,12 +35,6 @@ fn project(port: u16, connections: u32) -> tempfile::TempDir {
     dir
 }
 
-fn ply(dir: &std::path::Path) -> Command {
-    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("ply"));
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
-
 struct Server {
     child: Option<Child>,
     addr: SocketAddr,
@@ -53,7 +42,7 @@ struct Server {
 
 impl Server {
     fn start(dir: &std::path::Path, port: u16) -> Server {
-        let child = ply(dir)
+        let child = process(dir)
             .args(["run", "--host"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
