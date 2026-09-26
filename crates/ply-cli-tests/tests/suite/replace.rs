@@ -1,5 +1,4 @@
-use assert_cmd::Command;
-use serde_json::Value;
+use crate::harness::{json_of, ply, project};
 use std::path::Path;
 
 const SOURCE: &str = "\
@@ -13,23 +12,6 @@ fn three() -> Int = two() + 1
 ";
 
 const TWO: &str = "// Doubles the base.\npub fn two() -> Int = one() + one()  // twice\n";
-
-fn project() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("m.ply"), SOURCE).unwrap();
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
-
-fn json_of(out: &std::process::Output) -> Value {
-    serde_json::from_slice(&out.stdout)
-        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)))
-}
 
 /// Every definition's `own` hash, by name.
 fn own_hashes(dir: &Path) -> Vec<(String, String)> {
@@ -51,7 +33,7 @@ fn own_hashes(dir: &Path) -> Vec<(String, String)> {
 
 #[test]
 fn show_prints_the_definition_with_the_comment_above_it_and_its_place() {
-    let dir = project();
+    let dir = project(SOURCE);
     let out = ply(dir.path()).args(["show", "two"]).output().unwrap();
     assert_eq!(
         out.status.code(),
@@ -88,7 +70,7 @@ fn show_prints_the_definition_with_the_comment_above_it_and_its_place() {
 
 #[test]
 fn replace_rewrites_only_the_named_definition_and_moves_no_other_hash() {
-    let dir = project();
+    let dir = project(SOURCE);
     let before = own_hashes(dir.path());
     std::fs::write(
         dir.path().join("two.txt"),
@@ -145,7 +127,7 @@ fn three() -> Int = two() + 1
 
 #[test]
 fn a_replacement_that_renames_or_breaks_the_program_is_refused_and_writes_nothing() {
-    let dir = project();
+    let dir = project(SOURCE);
     let out = ply(dir.path())
         .args(["replace", "two"])
         .write_stdin("pub fn twice() -> Int = one() * 2\n")
@@ -179,7 +161,7 @@ fn a_replacement_that_renames_or_breaks_the_program_is_refused_and_writes_nothin
 
 #[test]
 fn check_reports_the_file_that_would_change_and_writes_nothing() {
-    let dir = project();
+    let dir = project(SOURCE);
     let out = ply(dir.path())
         .args(["replace", "two", "--check"])
         .write_stdin("pub fn two() -> Int = one() * 2\n")

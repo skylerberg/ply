@@ -40,7 +40,6 @@ SOLO=(
   "compiler-on-the-tier:ply-cli-tests:suite:corpus::the_compiled_tier_runs_the_compilers_own_tests_as_the_only_engine"
   "archive-round-trip:ply-cli-tests:suite:bootstrap_archive::an_archive_is_written_and_verifies_against_the_tree_it_came_from"
   "archive-tree-moved:ply-cli-tests:suite:bootstrap_archive::an_archive_stops_describing_a_tree_that_moved"
-  "corpus-session:ply-cli-tests:suite:incremental::the_example_corpus_agrees_across_a_session"
   "corpus-session-audit:ply-cli-tests:suite:incremental_audit::a_long_session_over_the_example_corpus_agrees_at_every_step"
 )
 
@@ -52,7 +51,7 @@ POSTGRES_PACKAGES=(ply-host-tests)
 UNPAIRED_TESTS=(ply-cli-tests)
 
 # `#![cfg(unix)]`, so the gates job asserts it ran.
-W5_FILTER='binary_id(=ply-cli-tests::suite) & test(/^w5_shutdown::/)'
+SHUTDOWN_FILTER='binary_id(=ply-cli-tests::suite) & test(/^shutdown::/)'
 
 # Crate directories that are deliberately not workspace members, as `name:why`.
 # Expanded as ${KNOWN_OUTSIDE[@]+...}: bash 3.2 treats an empty array as unset under `set -u`.
@@ -69,6 +68,8 @@ TREE_CHECKS=(
   "ply-span-tests:armed:no_allowlist_entry_has_outlived_its_reason"
   "ply-span-tests:armed:ambiguous_enum_names_are_declared"
   "ply-cli-tests:suite:fmt::the_maintained_sources_are_committed_formatted"
+  "ply-cli-tests:suite:tree::every_test_file_is_declared_and_every_declaration_has_a_file"
+  "ply-cli-tests:suite:tree::the_harness_is_the_only_place_the_ply_binary_is_named"
 )
 
 # `probes/` directories no cargo build reaches, as `dir:job`; the job must be in `ci`'s `needs`.
@@ -153,12 +154,12 @@ cmd_tree_check_filter() {
 }
 
 cmd_gate_filter() {
-  printf '%s | %s\n' "$W5_FILTER" "$(cmd_tree_check_filter)"
+  printf '%s | %s\n' "$SHUTDOWN_FILTER" "$(cmd_tree_check_filter)"
 }
 
 # Solo tests are excluded by name, so a new test in one of their binaries still runs in a partition.
 cmd_exclude_filter() {
-  printf '%s | %s | %s\n' "$(cmd_solo | cut -d' ' -f2- | filter_of)" "$W5_FILTER" "$(cmd_postgres_filter)"
+  printf '%s | %s | %s\n' "$(cmd_solo | cut -d' ' -f2- | filter_of)" "$SHUTDOWN_FILTER" "$(cmd_postgres_filter)"
 }
 
 cmd_partitions() {
@@ -564,8 +565,8 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done < <(cmd_solo)
-  if [[ ! -f $(test_source_file ply-cli-tests suite w5_shutdown::x) ]]; then
-    echo "FAIL: W5_FILTER names crates/ply-cli-tests/tests/suite/w5_shutdown.rs, which does not exist" >&2
+  if [[ ! -f $(test_source_file ply-cli-tests suite shutdown::x) ]]; then
+    echo "FAIL: SHUTDOWN_FILTER names crates/ply-cli-tests/tests/suite/shutdown.rs, which does not exist" >&2
     failures=$((failures + 1))
   fi
   # Cargo builds `ply` for ply-cli-tests only if ply-launcher has an integration test of its own.

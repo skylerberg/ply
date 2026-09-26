@@ -113,7 +113,7 @@ fn the_drain_never_commits_and_never_leaks() {
         );
         return;
     }
-    let cluster = Cluster::start("w5_shutdown");
+    let cluster = Cluster::start("shutdown");
     cluster.psql(&cluster.database, SCHEMA);
 
     an_open_transaction_at_shutdown_is_rolled_back(&cluster);

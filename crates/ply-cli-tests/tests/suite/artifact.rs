@@ -1,4 +1,4 @@
-use assert_cmd::Command;
+use crate::harness::{json_of, ply, project};
 use ply_host::process::Executables;
 use ply_machine::artifact::{self, Artifact, Binds};
 use ply_machine::load::{Loaded, load};
@@ -34,18 +34,6 @@ law "even and odd disagree"
   }
 "#;
 
-fn project(source: &str) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("m.ply"), source).unwrap();
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
-
 fn built(dir: &Path) -> (Loaded, artifact::Built) {
     let loaded = load(dir).expect("the corpus should load");
     let entry = loaded
@@ -65,11 +53,6 @@ fn written(artifact: &Artifact) -> Vec<u8> {
 
 fn write_artifact(at: &Path, artifact: &Artifact) {
     std::fs::write(at, written(artifact)).unwrap();
-}
-
-fn json_of(output: &std::process::Output) -> Value {
-    let text = String::from_utf8(output.stdout.clone()).unwrap();
-    serde_json::from_str(&text).unwrap_or_else(|e| panic!("stdout was not one object: {e}\n{text}"))
 }
 
 #[test]

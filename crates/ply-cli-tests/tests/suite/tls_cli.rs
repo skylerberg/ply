@@ -1,7 +1,6 @@
-use assert_cmd::Command;
+use crate::harness::{ply, project, stderr_of, stdout_of};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use tempfile::TempDir;
 
 /// Can create a TLS listener, which is what puts `ply_host::tls::listen` into the listing.
 const SECURE: &str = "\
@@ -29,26 +28,6 @@ fn main() -> Int / {net::net.write[listener]} = {
 const NO_SOCKET: &str = "\
 fn main() -> Int = simulate { spawn { 1 }; 2 }
 ";
-
-fn project(source: &str) -> TempDir {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    std::fs::write(dir.path().join("m.ply"), source).expect("the fixture is written");
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").expect("the binary is built");
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
-
-fn stdout_of(output: &std::process::Output) -> String {
-    String::from_utf8(output.stdout.clone()).expect("stdout is utf-8")
-}
-
-fn stderr_of(output: &std::process::Output) -> String {
-    String::from_utf8(output.stderr.clone()).expect("stderr is utf-8")
-}
 
 /// Generated rather than checked in: a private key in a repository leaks.
 fn credential(dir: &Path, name: &str) -> (PathBuf, PathBuf) {

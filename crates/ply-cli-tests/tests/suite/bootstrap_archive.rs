@@ -1,6 +1,5 @@
-use assert_cmd::Command;
+use crate::harness::{json_of, ply, project};
 use serde_json::Value;
-use tempfile::TempDir;
 
 const PROGRAM: &str = r#"
 type Shape = { wide: Int, tall: Int }
@@ -8,22 +7,15 @@ pub fn area(s: Shape) -> Int = s.wide * s.tall
 pub fn twice(n: Int) -> Int = area({ wide: n, tall: 2 })
 "#;
 
-fn project(dir: &TempDir, source: &str) -> std::path::PathBuf {
-    let path = dir.path().join("m.ply");
-    std::fs::write(&path, source).expect("write the project");
-    dir.path().to_path_buf()
-}
-
 #[test]
 fn an_archive_is_written_and_verifies_against_the_tree_it_came_from() {
-    let dir = TempDir::new().expect("a scratch directory");
-    let root = project(&dir, PROGRAM);
+    let dir = project(PROGRAM);
+    let root = dir.path();
     let out = dir.path().join("archive");
 
-    let first = Command::cargo_bin("ply")
-        .expect("the binary")
+    let first = ply(root)
         .args(["bootstrap"])
-        .arg(&root)
+        .arg(root)
         .arg("--out")
         .arg(&out)
         .arg("--json")
@@ -34,7 +26,7 @@ fn an_archive_is_written_and_verifies_against_the_tree_it_came_from() {
         "{}",
         String::from_utf8_lossy(&first.stderr)
     );
-    let wrote: Value = serde_json::from_slice(&first.stdout).expect("json");
+    let wrote = json_of(&first);
     assert_eq!(wrote["ok"], Value::Bool(true));
 
     let unit = out.join("unit.c.gz");
@@ -62,10 +54,9 @@ fn an_archive_is_written_and_verifies_against_the_tree_it_came_from() {
         "the report does not describe the bundle beside it"
     );
 
-    let verify = Command::cargo_bin("ply")
-        .expect("the binary")
+    let verify = ply(root)
         .args(["bootstrap"])
-        .arg(&root)
+        .arg(root)
         .arg("--out")
         .arg(&out)
         .arg("--verify")
@@ -80,14 +71,13 @@ fn an_archive_is_written_and_verifies_against_the_tree_it_came_from() {
 
 #[test]
 fn an_archive_stops_describing_a_tree_that_moved() {
-    let dir = TempDir::new().expect("a scratch directory");
-    let root = project(&dir, PROGRAM);
+    let dir = project(PROGRAM);
+    let root = dir.path();
     let out = dir.path().join("archive");
 
-    let write = Command::cargo_bin("ply")
-        .expect("the binary")
+    let write = ply(root)
         .args(["bootstrap"])
-        .arg(&root)
+        .arg(root)
         .arg("--out")
         .arg(&out)
         .output()
@@ -100,10 +90,9 @@ fn an_archive_stops_describing_a_tree_that_moved() {
     )
     .expect("edit the project");
 
-    let verify = Command::cargo_bin("ply")
-        .expect("the binary")
+    let verify = ply(root)
         .args(["bootstrap"])
-        .arg(&root)
+        .arg(root)
         .arg("--out")
         .arg(&out)
         .arg("--verify")
