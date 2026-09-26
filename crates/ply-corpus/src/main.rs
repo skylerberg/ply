@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use ply_corpus::bench;
 use ply_corpus::build::generate;
 use ply_corpus::measure;
 use ply_corpus::regions;
@@ -954,13 +953,7 @@ fn run_plan(plan: serde_json::Value) -> Result<()> {
         "gen" => generate_corpus(serde_json::from_value(args)?),
         "bench" => {
             let args: BenchArgs = serde_json::from_value(args)?;
-            let report = bench::run(
-                &args.corpus,
-                &bench::Options {
-                    repeats: args.repeats,
-                    backend: args.backend.clone(),
-                },
-            )?;
+            let report = bench_report(&args.corpus, args.repeats, args.backend.as_deref())?;
             emit_report(&report, args.json)
         }
         "sweep" => sweep(serde_json::from_value(args)?),
@@ -1107,13 +1100,7 @@ fn sweep(args: SweepArgs) -> Result<()> {
         write::write(&root, &spec, &generate(&spec))?;
         ply_corpus::verify(&root)
             .with_context(|| format!("the corpus for `{size}` does not compile"))?;
-        reports.push(bench::run(
-            &root,
-            &bench::Options {
-                repeats: args.repeats,
-                backend: args.backend.clone(),
-            },
-        )?);
+        reports.push(bench_report(&root, args.repeats, args.backend.as_deref())?);
     }
 
     if args.json {
@@ -1121,9 +1108,52 @@ fn sweep(args: SweepArgs) -> Result<()> {
         return Ok(());
     }
     for report in &reports {
-        println!("{}", bench::render(report));
+        print!(
+            "{}",
+            report["rendered"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("the bench's report carries no rendered text"))?
+        );
     }
     Ok(())
+}
+
+/// The bench, run in the corpus package: the corpus drives the real `ply` and reads its
+/// reports. Answers the report as decoded JSON; its `rendered` member is the text form.
+fn bench_report(
+    corpus: &std::path::Path,
+    repeats: usize,
+    backend: Option<&str>,
+) -> Result<serde_json::Value> {
+    let corpus = &corpus
+        .canonicalize()
+        .with_context(|| format!("`{}` does not exist", corpus.display()))?;
+    let value = ply_corpus::cmd::run_ply_subcommand(
+        "bench.run",
+        vec![
+            ply_eval::Value::str(corpus.to_string_lossy()),
+            ply_eval::Value::Int(repeats as i64),
+            ply_eval::Value::str(backend.unwrap_or("")),
+        ],
+        corpus,
+        &std::path::PathBuf::from(ply_corpus::cmd::ply_binary()?),
+    )?;
+    let answered: String = match &value {
+        ply_eval::Value::Ctor { name, args } if name.as_str() == "Ok" && args.len() == 1 => {
+            match &args[0] {
+                ply_eval::Value::Str(text) => Ok::<String, anyhow::Error>(text.to_string()),
+                other => anyhow::bail!("`bench.run` answered {other}, not the report's text"),
+            }
+        }
+        ply_eval::Value::Ctor { name, args } if name.as_str() == "Err" && args.len() == 1 => {
+            match &args[0] {
+                ply_eval::Value::Str(why) => anyhow::bail!("{why}"),
+                other => anyhow::bail!("`bench.run` refused with {other}"),
+            }
+        }
+        other => anyhow::bail!("`bench.run` answered {other}, not an `Ok` or an `Err`"),
+    }?;
+    serde_json::from_str(&answered).context("the bench's report is not JSON")
 }
 
 /// Parses `modules,defs_per_module,tests`.
@@ -1148,11 +1178,16 @@ fn parse_size(size: &str, seed: u64) -> Result<CorpusSpec> {
     })
 }
 
-fn emit_report(report: &bench::Report, json: bool) -> Result<()> {
+fn emit_report(report: &serde_json::Value, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(report)?);
     } else {
-        print!("{}", bench::render(report));
+        print!(
+            "{}",
+            report["rendered"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("the bench's report carries no rendered text"))?
+        );
     }
     Ok(())
 }

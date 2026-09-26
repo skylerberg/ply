@@ -1,0 +1,544 @@
+// The bench: where a `ply test` run's time goes, answered from the product's own reports.
+// Every scenario declares its criterion up front; the report is the verdicts with the numbers
+// attached. The old in-process phase split is gone on purpose: what `ply` does not report,
+// this bench does not know.
+
+import spine
+import std.json (Json, Str, Number, Bool, Null, Object, object, array)
+import std.json
+import std.fs (fs)
+import std.fs
+import std.process (process)
+import std.time (time)
+import cli.env (env)
+
+// --- The generated corpus's own description ------------------------------------------
+
+pub type EditSite = { path: String, find: String, replace: String, dependents: Int }
+
+pub type Corpus = {
+  modules: Int,
+  definitions: Int,
+  tests: Int,
+  bytes: Int,
+  leaf: EditSite,
+  hub: EditSite,
+  rename_symbol: String,
+  rename_replacement: String,
+}
+
+pub fn corpus_at(dir: String) -> Result<Corpus, String> / {fs.read_file[cwd]} =
+  match fs.read_file[cwd]("corpus.json") {
+    None -> Err("`" ++ dir ++ "` is not a generated corpus: no corpus.json"),
+    Some(bytes) -> match json::parse(bytes) {
+      Err(e) -> Err("the corpus manifest is not JSON: " ++ e.message),
+      Ok(Object(m)) -> {
+        let edit = |key: String|
+          match map_get(m, key) {
+            Some(Object(e)) ->
+              Ok({
+                path: str_field(e, "path"),
+                find: str_field(e, "find"),
+                replace: str_field(e, "replace"),
+                dependents: spine::int_field(e, "dependents"),
+              }),
+            _ -> Err("the manifest's `" ++ key ++ "` is not an edit site"),
+          };
+        match edit("leaf_edit") {
+          Err(e) -> Err(e),
+          Ok(leaf) -> match edit("hub_edit") {
+            Err(e) -> Err(e),
+            Ok(hub) -> match map_get(m, "rename") {
+              Some(Object(r)) ->
+                Ok({
+                  modules: spine::int_field(m, "modules"),
+                  definitions: spine::int_field(m, "definitions"),
+                  tests: spine::int_field(m, "tests"),
+                  bytes: spine::int_field(m, "bytes"),
+                  leaf: leaf,
+                  hub: hub,
+                  rename_symbol: str_field(r, "symbol"),
+                  rename_replacement: str_field(r, "replacement"),
+                }),
+              _ -> Err("the manifest carries no `rename`"),
+            },
+          },
+        }
+      },
+      _ -> Err("the corpus manifest is not an object"),
+    },
+  }
+
+fn str_field(m: Map<String, Json>, key: String) -> String =
+  match map_get(m, key) { Some(Str(s)) -> s, _ -> "" }
+
+// --- Mutations, applied and undone ----------------------------------------------------
+
+pub type Applied = List<{ path: String, text: Bytes }>
+
+// The rename is a whole-corpus textual substitution; the edit is one site, once. Both answer
+// what they changed so the scenario can put it back.
+// Every `.ply` file under the corpus root, as a path relative to it: the walk `ply test`
+// itself takes.
+pub fn ply_files() -> List<String> / {fs.list_dir[cwd], fs.kind[cwd]} = walk(".", [])
+
+fn walk(dir: String, acc: List<String>) -> List<String> / {fs.list_dir[cwd], fs.kind[cwd]} =
+  match fs.list_dir[cwd](dir) {
+    None -> acc,
+    Some(names) ->
+      fold(names, acc, |inner: List<String>, name: String|
+        if name == ".ply-cache" { inner } else {
+          let path = if dir == "." { name } else { dir ++ "/" ++ name };
+          match fs.kind[cwd](path) {
+            fs::Dir -> walk(path, inner),
+            _ -> if bytes_ends_with(bytes_of_string(name), b".ply") { push(inner, path) }
+            else { inner },
+          }
+        }),
+  }
+
+pub fn apply_rename(
+  dir: String,
+  from: String,
+  to: String,
+) -> Result<Applied, String> / {fs.list_dir[cwd], fs.kind[cwd], fs.read_file[cwd], fs.write_file[cwd]} = {
+  let applied = fold(ply_files(), [], |acc: Applied, path: String|
+    match fs.read_file[cwd](path) {
+      None -> acc,
+      Some(text) -> if bytes_index_of(text, bytes_of_string(from)) != None {
+        push(acc, { path: path, text: text })
+      } else { acc },
+    });
+  if len(applied) == 0 {
+    Err("`" ++ from ++ "` does not occur in the corpus; the manifest is stale")
+  } else {
+    let _ = map(applied, |a: { path: String, text: Bytes }|
+      fs.write_file[cwd](a.path, replace_all(a.text, bytes_of_string(from), bytes_of_string(to))));
+    Ok(applied)
+  }
+}
+
+pub fn apply_edit(
+  dir: String,
+  site: EditSite,
+) -> Result<Applied, String> / {fs.read_file[cwd], fs.write_file[cwd]} = {
+  let path = site.path;
+  match fs.read_file[cwd](path) {
+    None -> Err("the edit site `" ++ site.path ++ "` is not in the corpus"),
+    Some(text) -> {
+      let find = bytes_of_string(site.find);
+      let count = occurrences(text, find);
+      if count != 1 {
+        Err(
+          "the edit site occurs " ++ int_to_string(count) ++ " times in `" ++ site.path
+            ++ "`, not once",
+        )
+      } else {
+        let _ = fs.write_file[cwd](path, replace_first(text, find, bytes_of_string(site.replace)));
+        Ok([{ path: path, text: text }])
+      }
+    },
+  }
+}
+
+pub fn undo(applied: Applied) -> Unit / {fs.write_file[cwd]} = {
+  let _ = map(applied, |a: { path: String, text: Bytes }| fs.write_file[cwd](a.path, a.text));
+  ()
+}
+
+pub fn replace_all(text: Bytes, find: Bytes, replacement: Bytes) -> Bytes =
+  match bytes_index_of(text, find) {
+    None -> text,
+    Some(i) ->
+      bytes_concat_all([
+        bytes_slice(text, 0, i),
+        replacement,
+        replace_all(bytes_slice(text, i + bytes_len(find), bytes_len(text)), find, replacement),
+      ]),
+  }
+
+fn replace_first(text: Bytes, find: Bytes, replacement: Bytes) -> Bytes =
+  match bytes_index_of(text, find) {
+    None -> text,
+    Some(i) ->
+      bytes_concat_all([
+        bytes_slice(text, 0, i),
+        replacement,
+        bytes_slice(text, i + bytes_len(find), bytes_len(text)),
+      ]),
+  }
+
+fn occurrences(text: Bytes, find: Bytes) -> Int =
+  match bytes_index_of(text, find) {
+    None -> 0,
+    Some(i) -> 1 + occurrences(bytes_slice(text, i + bytes_len(find), bytes_len(text)), find),
+  }
+
+// --- The scenarios ---------------------------------------------------------------------
+
+// The result cache under a corpus root, held whole in memory so restoring it is not measured
+// as disk work.
+pub type Snapshot = List<{ name: String, body: Bytes }>
+
+pub fn take_snapshot(
+  dir: String,
+) -> Snapshot / {fs.list_dir[cwd], fs.read_file[cwd], fs.kind[cwd]} = {
+  let cache = ".ply-cache";
+  match fs.list_dir[cwd](cache) {
+    None -> [],
+    Some(names) ->
+      fold(names, [], |acc: Snapshot, name: String|
+        match fs.read_file[cwd](cache ++ "/" ++ name) {
+          Some(body) -> push(acc, { name: name, body: body }),
+          None -> acc,
+        }),
+  }
+}
+
+pub fn restore_snapshot(
+  dir: String,
+  snap: Snapshot,
+) -> Unit / {fs.list_dir[cwd], fs.remove[cwd], fs.create_dir[cwd], fs.write_file[cwd]} = {
+  let cache = ".ply-cache";
+  clear_dir(cache);
+  let _ = fs.create_dir[cwd](cache);
+  let _ = map(snap, |f: { name: String, body: Bytes }|
+    fs.write_file[cwd](cache ++ "/" ++ f.name, f.body));
+  ()
+}
+
+fn clear_dir(dir: String) -> Unit / {fs.list_dir[cwd], fs.remove[cwd]} = {
+  let _ = match fs.list_dir[cwd](dir) {
+    None -> [],
+    Some(names) -> map(names, |name: String| fs.remove[cwd](dir ++ "/" ++ name)),
+  };
+  ()
+}
+
+pub fn clear_cache(dir: String) -> Unit / {fs.list_dir[cwd], fs.remove[cwd]} =
+  clear_dir(".ply-cache")
+
+// One measured run of the product over the corpus.
+pub fn once(
+  dir: String,
+  backend: String,
+) -> Result<spine::TestReport, String> / {process.spawn[ply], env.var[sys], time.elapsed_ms} = {
+  let args = cats([["test", dir, "--json", "--color", "never"], backend_args(backend)]);
+  let started = time.elapsed_ms();
+  let done = spine::ply(args, dir);
+  // The wall, not the report's own clock: the user waits for the process.
+  let wall_ms = time.elapsed_ms() - started;
+  match spine::report_json(done) {
+    Err(why) -> Err(why),
+    Ok(j) -> match spine::test_report(j) {
+      Err(e) -> Err(e),
+      Ok(r) -> Ok({ ..r, duration_ms: wall_ms }),
+    },
+  }
+}
+
+fn backend_args(backend: String) -> List<String> =
+  if backend == "" { [] } else { ["--backend", backend] }
+
+fn cats(xss: List<List<String>>) -> List<String> =
+  fold(xss, [], |acc: List<String>, xs: List<String>|
+    fold(xs, acc, |a: List<String>, x: String| push(a, x)))
+
+// The scenarios, in order: each resets what it must, repeats, and keeps its fastest run.
+pub fn run(
+  dir: String,
+  repeats: Int,
+  backend: String,
+) -> Result<String, String> / {process.spawn[ply], env.var[sys], time.elapsed_ms, fs.list_dir[cwd], fs.read_file[cwd], fs.write_file[cwd], fs.kind[cwd], fs.remove[cwd], fs.create_dir[cwd]} =
+  match corpus_at(dir) {
+    Err(why) -> Err(why),
+    Ok(corpus) -> {
+      let cold = go_repeat(dir, repeats, "clear", backend, []);
+      let warm = go_repeat(dir, repeats, "none", backend, []);
+      let rename = mutated_scenario(rename_scenario(), dir, corpus, repeats, backend, "rename");
+      let leaf = mutated_scenario(leaf_scenario(), dir, corpus, repeats, backend, "leaf");
+      let hub = mutated_scenario(hub_scenario(), dir, corpus, repeats, backend, "hub");
+      match cold {
+        Err(e) -> Err(e),
+        Ok(c) -> match warm {
+          Err(e) -> Err(e),
+          Ok(w) -> match rename {
+            Err(e) -> Err(e),
+            Ok(r) -> match leaf {
+              Err(e) -> Err(e),
+              Ok(l) -> match hub {
+                Err(e) -> Err(e),
+                Ok(h) ->
+                  Ok(
+                    json::to_string(
+                      report_json(dir, corpus, [
+                        { ..cold_scenario(), runs: c },
+                        { ..warm_scenario(), runs: w },
+                        r,
+                        l,
+                        h,
+                      ]),
+                    ),
+                  ),
+              },
+            },
+          },
+        },
+      }
+    },
+  }
+
+// --- Verdicts ------------------------------------------------------------------------------
+
+// The rows and their criteria, judged on each scenario's fastest run.
+fn rows_of(corpus: Corpus, scenarios: List<Scenario>) -> List<spine::Row> =
+  map(scenarios, |s: Scenario| {
+    let best = spine::best_of(s.runs);
+    { name: s.name, criterion: s.criterion, best: best, verdict: (s.judge)(best, corpus) }
+  })
+
+pub type Scenario = {
+  name: String,
+  criterion: String,
+  runs: List<spine::TestReport>,
+  judge: (spine::TestReport, Corpus) -> Result<Unit, String>,
+}
+
+fn cold_scenario() -> Scenario =
+  {
+    name: "cold",
+    criterion: "empty cache: every test runs, and passes",
+    runs: [],
+    judge: |r: spine::TestReport, c: Corpus|
+      if !r.ok { Err("the run failed") } else if r.cached != 0 {
+        Err(int_to_string(r.cached) ++ " were served from a cache that was cleared")
+      } else if r.passed != r.total { Err(int_to_string(r.failed) ++ " failed") }
+      else { Ok(()) },
+  }
+
+fn warm_scenario() -> Scenario =
+  {
+    name: "warm",
+    criterion: "nothing changed: every test is a cache hit",
+    runs: [],
+    judge: |r: spine::TestReport, c: Corpus|
+      if !r.ok { Err("the run failed") } else if r.selected != 0 {
+        Err(int_to_string(r.selected) ++ " ran again though nothing changed")
+      } else { Ok(()) },
+  }
+
+fn rename_scenario() -> Scenario =
+  {
+    name: "rename",
+    criterion: "a rename selects nothing",
+    runs: [],
+    judge: |r: spine::TestReport, c: Corpus|
+      if !r.ok { Err("the run failed") } else if r.selected != 0 {
+        Err(int_to_string(r.selected) ++ " selected by a rename, which no body hash covers")
+      } else { Ok(()) },
+  }
+
+fn leaf_scenario() -> Scenario =
+  {
+    name: "edit-leaf",
+    criterion: "editing a leaf selects what it reaches and no more",
+    runs: [],
+    judge: |r: spine::TestReport, c: Corpus|
+      if !r.ok { Err("the run failed") }
+      else if r.selected == 0 { Err("an edit selected nothing") }
+      else if r.selected * 2 > r.total { Err("a leaf edit re-ran most of the corpus") }
+      else { Ok(()) },
+  }
+
+fn hub_scenario() -> Scenario =
+  {
+    name: "edit-hub",
+    criterion: "a hub edit re-runs at least its dependents' share of the tests",
+    runs: [],
+    judge: |r: spine::TestReport, c: Corpus|
+      if !r.ok { Err("the run failed") } else if r.selected * c.definitions
+          < c.hub.dependents * r.total {
+        Err(
+          "a hub edit re-ran " ++ int_to_string(r.selected) ++ " of " ++ int_to_string(r.total)
+            ++ " tests, under the "
+            ++ int_to_string(c.hub.dependents)
+            ++ " dependent(s) the manifest counts",
+        )
+      } else { Ok(()) },
+  }
+
+// --- The runs -------------------------------------------------------------------------------
+
+fn go_repeat(
+  dir: String,
+  left: Int,
+  reset: String,
+  backend: String,
+  acc: List<spine::TestReport>,
+) -> Result<List<spine::TestReport>, String> / {process.spawn[ply], env.var[sys], time.elapsed_ms, fs.list_dir[cwd], fs.remove[cwd]} =
+  if left <= 0 { Ok(acc) } else {
+    let _ = if reset == "clear" { clear_cache(dir) } else { () };
+    match once(dir, backend) {
+      Err(e) -> Err(e),
+      Ok(r) -> go_repeat(dir, left - 1, reset, backend, push(acc, r)),
+    }
+  }
+
+// A scenario with the corpus mutated: the warm cache restored before each repeat, the mutation
+// undone after, so the next scenario starts from the state everyone chose.
+fn mutated_scenario(
+  base: Scenario,
+  dir: String,
+  corpus: Corpus,
+  repeats: Int,
+  backend: String,
+  which: String,
+) -> Result<Scenario, String> / {process.spawn[ply], env.var[sys], time.elapsed_ms, fs.list_dir[cwd], fs.read_file[cwd], fs.write_file[cwd], fs.kind[cwd], fs.remove[cwd], fs.create_dir[cwd]} = {
+  let snap = take_snapshot(dir);
+  match apply_mutation(dir, corpus, which) {
+    Err(e) -> Err(e),
+    Ok(applied) -> {
+      let runs = go_mutation(if repeats < 1 { 1 } else { repeats }, dir, snap, backend, []);
+      undo(applied);
+      let _ = restore_snapshot(dir, snap);
+      match runs { Err(e) -> Err(e), Ok(rs) -> Ok({ ..base, runs: rs }) }
+    },
+  }
+}
+
+fn go_mutation(
+  left: Int,
+  dir: String,
+  snap: Snapshot,
+  backend: String,
+  acc: List<spine::TestReport>,
+) -> Result<List<spine::TestReport>, String> / {process.spawn[ply], env.var[sys], time.elapsed_ms, fs.list_dir[cwd], fs.remove[cwd], fs.create_dir[cwd], fs.write_file[cwd]} =
+  if left <= 0 { Ok(acc) } else {
+    let _ = restore_snapshot(dir, snap);
+    match once(dir, backend) {
+      Err(e) -> Err(e),
+      Ok(r) -> go_mutation(left - 1, dir, snap, backend, push(acc, r)),
+    }
+  }
+
+fn apply_mutation(
+  dir: String,
+  corpus: Corpus,
+  which: String,
+) -> Result<Applied, String> / {fs.list_dir[cwd], fs.kind[cwd], fs.read_file[cwd], fs.write_file[cwd]} =
+  if which == "rename" { apply_rename(dir, corpus.rename_symbol, corpus.rename_replacement) }
+  else if which == "leaf" { apply_edit(dir, corpus.leaf) }
+  else { apply_edit(dir, corpus.hub) }
+
+// --- The report -------------------------------------------------------------------------------
+
+pub fn report_json(dir: String, corpus: Corpus, scenarios: List<Scenario>) -> Json = {
+  let rows = rows_of(corpus, scenarios);
+  object([
+    { key: "root", value: Str(dir) },
+    { key: "modules", value: Number(decimal_of_int(corpus.modules)) },
+    { key: "definitions", value: Number(decimal_of_int(corpus.definitions)) },
+    { key: "tests", value: Number(decimal_of_int(corpus.tests)) },
+    { key: "source_bytes", value: Number(decimal_of_int(corpus.bytes)) },
+    { key: "ok", value: Bool(all_pass(rows)) },
+    { key: "scenarios", value: array(map(rows, |row: spine::Row| scenario_json(row))) },
+    { key: "rendered", value: Str(render(dir, corpus, rows)) },
+  ])
+}
+
+fn scenario_json(row: spine::Row) -> Json = {
+  let best = row.best;
+  object([
+    { key: "name", value: Str(row.name) },
+    { key: "criterion", value: Str(row.criterion) },
+    { key: "verdict", value: Str(spine::verdict_text(row.verdict)) },
+    { key: "total_ms", value: Number(decimal_of_int(best.duration_ms)) },
+    { key: "tests_total", value: Number(decimal_of_int(best.total)) },
+    { key: "tests_selected", value: Number(decimal_of_int(best.selected)) },
+    { key: "tests_cached", value: Number(decimal_of_int(best.cached)) },
+    { key: "groups", value: Number(decimal_of_int(best.groups)) },
+    { key: "passed", value: Number(decimal_of_int(best.passed)) },
+    { key: "failed", value: Number(decimal_of_int(best.failed)) },
+    {
+      key: "phases",
+      value: object([
+        { key: "read", value: Number(decimal_of_int(best.read_ms)) },
+        { key: "front", value: Number(decimal_of_int(best.front_ms)) },
+        { key: "write_back", value: Number(decimal_of_int(best.write_back_ms)) },
+      ]),
+    },
+  ])
+}
+
+fn all_pass(rows: List<spine::Row>) -> Bool =
+  fold(rows, true, |acc: Bool, row: spine::Row| acc && spine::passed(row))
+
+pub fn render(dir: String, corpus: Corpus, rows: List<spine::Row>) -> String = {
+  let title = dir ++ "\n" ++ int_to_string(corpus.modules) ++ " modules · "
+    ++ int_to_string(corpus.definitions)
+    ++ " definitions · "
+    ++ int_to_string(corpus.tests)
+    ++ " tests · "
+    ++ int_to_string(corpus.bytes / 1024)
+    ++ " KiB of source";
+  let head = title ++ "\n\n";
+  fold(zip_rows(rows), head, |acc: String, line: String| acc ++ line)
+}
+
+fn zip_rows(rows: List<spine::Row>) -> List<String> =
+  map(rows, |row: spine::Row| {
+    let best = row.best;
+    "  " ++ spine::verdict_text(row.verdict) ++ "  " ++ row.name ++ "  "
+      ++ spine::ms(best.duration_ms)
+      ++ "  selected "
+      ++ int_to_string(best.selected)
+      ++ " of "
+      ++ int_to_string(best.total)
+      ++ " ("
+      ++ int_to_string(best.cached)
+      ++ " cached) — "
+      ++ row.criterion
+      ++ "\n"
+  })
+
+// --- Tests -------------------------------------------------------------------------------------
+
+test "the manifest's edit sites decode" {
+  let m = "{\"modules\": 2, \"definitions\": 5, \"tests\": 4, \"bytes\": 100, \"leaf_edit\": {\"path\": \"a.ply\", \"find\": \"x\", \"replace\": \"y\", \"dependents\": 1}, \"hub_edit\": {\"path\": \"b.ply\", \"find\": \"p\", \"replace\": \"q\", \"dependents\": 4}, \"rename\": {\"symbol\": \"s\", \"replacement\": \"t\"}}";
+  match json::parse(bytes_of_string(m)) { Ok(Object(_)) -> assert(true), _ -> assert(false) }
+}
+
+test "replace_all substitutes every occurrence" {
+  assert_eq(replace_all(b"a.b.c", b".", b"-"), b"a-b-c");
+  assert_eq(replace_all(b"nothing here", b"zzz", b"y"), b"nothing here");
+}
+
+test "the rename row's criterion fires" {
+  let s = rename_scenario();
+  let r: spine::TestReport = {
+    ok: true,
+    duration_ms: 1,
+    total: 4,
+    selected: 2,
+    passed: 4,
+    failed: 0,
+    cached: 2,
+    groups: 1,
+    read_ms: 0,
+    front_ms: 1,
+    write_back_ms: 0,
+  };
+  let c: Corpus = {
+    modules: 1,
+    definitions: 1,
+    tests: 4,
+    bytes: 1,
+    leaf: { path: "a", find: "x", replace: "y", dependents: 1 },
+    hub: { path: "b", find: "p", replace: "q", dependents: 3 },
+    rename_symbol: "s",
+    rename_replacement: "t",
+  };
+  assert(match (s.judge)(r, c) { Err(_) -> true, Ok(_) -> false });
+  let clear: spine::TestReport = { ..r, selected: 0, cached: 4 };
+  assert(match (s.judge)(clear, c) { Ok(_) -> true, Err(_) -> false });
+}

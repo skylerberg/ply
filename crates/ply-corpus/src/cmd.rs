@@ -5,10 +5,14 @@
 //! `cmd.dispatch` for the plan, which the Rust half only ever decodes.
 
 use anyhow::{Context, Result, anyhow, bail};
+use ply_eval::Value;
 use ply_span::Span;
 use std::path::{Path, PathBuf};
 
 include!(concat!(env!("OUT_DIR"), "/corpus_sources.rs"));
+
+/// The corpus package's subcommand entries, kept in the artifact as startup roots.
+const SUBCOMMAND_ENTRIES: &[&str] = &["bench.run"];
 
 /// What `cmd.dispatch` answered: the plan, or text for the user and the code to exit with.
 pub enum Outcome {
@@ -71,6 +75,94 @@ pub fn dispatch(argv: &[String]) -> Result<Outcome> {
     }
 }
 
+/// Run a corpus subcommand whose implementation lives in the corpus package: `entry` is the
+/// definition to call, `args` its arguments, and `cwd` the directory bound as the program's
+/// `cwd` root (the corpus the subcommand measures).
+pub fn run_ply_subcommand(entry: &str, args: Vec<Value>, cwd: &Path, ply: &Path) -> Result<Value> {
+    let stage = stage_dir();
+    let artifact_path = stage.join("corpus.plyx");
+    let bytes = match std::fs::read(&artifact_path) {
+        Ok(bytes) => bytes,
+        Err(_) => build(&stage, &artifact_path)?,
+    };
+    let (artifact, _) = ply_machine::artifact::decode(&bytes, &artifact_path)
+        .map_err(|d| anyhow!("the corpus's own front door does not decode: {}", d.message))?;
+    let opened = ply_machine::artifact::open(&artifact, &artifact_path).map_err(|diagnostics| {
+        anyhow!(
+            "the corpus's own front door does not open: {}",
+            diagnostics
+                .first()
+                .map(|d| d.message.clone())
+                .unwrap_or_else(|| "nothing said why".to_string())
+        )
+    })?;
+    let name = opened
+        .front
+        .check
+        .defs
+        .values()
+        .find(|d| d.name.as_str() == entry)
+        .map(|d| d.name.to_string())
+        .ok_or_else(|| anyhow!("the corpus package declares no `{entry}`"))?;
+    let mut machine = ply_eval::Machine::new(&opened.front);
+    if let Some(unit) = artifact.unit.as_ref() {
+        let text = ply_codegen::c::bundle::unpack(&unit.text)
+            .map_err(|e| anyhow!("the front door's compiled unit would not unpack: {e:#}"))?;
+        let unit =
+            ply_codegen::Unit::embedded(&opened.front, text).map_err(|e| anyhow!("{e:#}"))?;
+        machine.set_compiled(ply_eval::Provider::attach(unit, &crate::tier_spec()));
+    }
+    let host = std::sync::Arc::new(
+        ply_host::Host::new()
+            .rooted(ply_host::fs::Roots::load(
+                &[ply_host::fs::RootSpec {
+                    name: "cwd".to_string(),
+                    path: cwd.to_path_buf(),
+                }],
+                Span::DUMMY,
+            )?)
+            .with_process(
+                ply_host::process::ProcessHost::new(
+                    Vec::new(),
+                    ply_host::process::Sink::Real {
+                        out: ply_host::process::Stream::Out,
+                    },
+                )
+                .executing(ply_host::process::Executables::load(
+                    &[
+                        ply_host::process::ExecSpec::parse(&format!("ply={}", ply.display()))
+                            .map_err(|e| anyhow!("the `ply` executable spec: {e}"))?,
+                    ],
+                    Span::DUMMY,
+                )?),
+            ),
+    );
+    let mut registry = host.registry();
+    for (op, handler) in ply_launcher::env::registrations(env!("CARGO_PKG_VERSION")) {
+        registry.register(op, handler);
+    }
+    let binding = registry.bind(&opened.front.check).map_err(|d| {
+        anyhow!(
+            "binding the host: {}",
+            d.first().map(|x| x.message.clone()).unwrap_or_default()
+        )
+    })?;
+    machine.set_host_binding(std::sync::Arc::new(binding));
+    machine.set_host_runtime(host.runtime());
+    machine
+        .call(&name, args, Span::DUMMY)
+        .map_err(|d| anyhow!("`{entry}` raised [{}]: {}", d.code, d.message))
+}
+
+/// The `ply` binary a subcommand drives: `PLY_CORPUS_PLY` if set, else this binary's sibling.
+pub fn ply_binary() -> Result<String> {
+    if let Ok(p) = std::env::var("PLY_CORPUS_PLY") {
+        return Ok(p);
+    }
+    let exe = std::env::current_exe().context("where the corpus binary is")?;
+    Ok(exe.with_file_name("ply").to_string_lossy().into_owned())
+}
+
 fn text(plan: &serde_json::Value, key: &str) -> Result<String> {
     plan[key]
         .as_str()
@@ -95,7 +187,16 @@ fn build(stage: &Path, artifact_path: &Path) -> Result<Vec<u8>> {
     let entry = loaded
         .sole_entry_point()
         .map_err(|d| anyhow!("the corpus's command line has no one entry: {}", d.message))?;
-    let built = ply_machine::artifact::build(&loaded, entry, &[]).map_err(|diagnostics| {
+    // The subcommands the corpus package implements are roots of their own: nothing in the
+    // front door's entry reaches them, so they would be pruned from the closure.
+    let startup: Vec<_> = loaded
+        .front
+        .check
+        .defs
+        .values()
+        .filter(|d| SUBCOMMAND_ENTRIES.contains(&d.name.as_str()))
+        .collect();
+    let built = ply_machine::artifact::build(&loaded, entry, &startup).map_err(|diagnostics| {
         anyhow!(
             "the corpus's command line would not build: {}",
             diagnostics
