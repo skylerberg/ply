@@ -10,8 +10,8 @@
 # answered (no binary, no dep-info).
 #
 # Checks rustc's dep-info (`<binary>.d`), the stdlib bytes the binary embeds
-# (`ply std --show`, so `ply` only), and cargo's own inputs, which no dep-info
-# lists. An mtime equal to the binary's counts as stale.
+# (`ply std --show`, one run for the whole shelf, so `ply` only), and cargo's own
+# inputs, which no dep-info lists. An mtime equal to the binary's counts as stale.
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -78,10 +78,21 @@ check_depinfo() {                    # $1 binary, $2 dep-info, $3 scratch
 }
 
 # 2. content: the stdlib bytes inside the binary against the bytes in directory $2.
+#
+# `ply std --show` with no module prints every shipped source, in name order, which
+# is the order `$2`'s glob expands to; so a shelf that matches costs one spawn, not
+# one per module. A mismatch pays a spawn per module up to the first that differs.
 check_embedded_stdlib() {            # $1 binary, $2 stdlib dir
-  local bin="$1" dir="$2" bad=0 f name
-  if ! "$bin" std --digest >/dev/null 2>&1; then
-    echo "  NOTE     no content check for $(rel "$bin") -- no \`std --show\`; its embedded .ply are on dep-info mtimes alone"
+  local bin="$1" dir="$2" dumped want f name named=0
+  dumped=$(mktemp); want=$(mktemp)
+  if ! "$bin" std --show >"$dumped" 2>/dev/null; then
+    rm -f "$dumped" "$want"
+    echo "  NOTE     no content check for $(rel "$bin") -- no bare \`std --show\`; its embedded .ply are on dep-info mtimes alone"
+    return 0
+  fi
+  cat "$dir"/*.ply > "$want" 2>/dev/null || true
+  if diff -q "$dumped" "$want" >/dev/null 2>&1; then
+    rm -f "$dumped" "$want"
     return 0
   fi
   for f in "$dir"/*.ply; do
@@ -89,10 +100,14 @@ check_embedded_stdlib() {            # $1 binary, $2 stdlib dir
     name=$(basename "$f" .ply)
     if ! "$bin" std --show "std.$name" 2>/dev/null | diff -q - "$f" >/dev/null 2>&1; then
       echo "  EMBEDDED std.$name differs from $(rel "$f") -- the binary holds other bytes"
-      bad=1
+      named=1
+      break
     fi
   done
-  return "$bad"
+  # Differing and naming no module: the two shelves hold a different set of them.
+  [ "$named" -eq 1 ] || echo "  EMBEDDED the shelf differs from $(rel "$dir") -- not one module's bytes, but which modules there are"
+  rm -f "$dumped" "$want"
+  return 1
 }
 
 # 3. cargo's inputs, which rustc never sees and no `.d` file lists.

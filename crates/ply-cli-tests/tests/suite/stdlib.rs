@@ -428,6 +428,35 @@ fn ply_std_lists_the_modules_and_prints_a_stable_digest() {
 }
 
 #[test]
+fn ply_std_show_written_bare_prints_every_shipped_source() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "app.ply", "fn f() -> Int = 1\n");
+
+    let out = ply(dir.path()).args(["std", "--show"]).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "got:\n{text}");
+    let every: String = ply_std::sources().map(|(_, source)| source).collect();
+    assert_eq!(
+        text, every,
+        "`--show` did not print every source, back to back"
+    );
+
+    let out = ply(dir.path())
+        .args(["std", "--show", "--json"])
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let listed: Vec<&str> = v["sources"]
+        .as_array()
+        .expect("an array of sources")
+        .iter()
+        .map(|s| s["module"].as_str().expect("a name"))
+        .collect();
+    let shipped: Vec<String> = ply_std::modules().map(|m| m.to_string()).collect();
+    assert_eq!(listed, shipped, "got:\n{text}");
+}
+
+#[test]
 fn a_cache_written_under_another_digest_warns_once_and_says_how_much_moved() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "app.ply", IMPORTER);
