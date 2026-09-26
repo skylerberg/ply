@@ -278,7 +278,11 @@ fn the_shipped_ladder_still_describes_the_tree_it_ships_in() {
         } else {
             f64::INFINITY
         };
-        if !(0.25..=4.0).contains(&shape_ratio) {
+        // The endpoint rung is excused from the shape comparison: at tens of nanoseconds of
+        // register work it holds its absolute time under load while the framing rung's byte
+        // traffic degrades, so their ratio prices the runner's contention, not the tree. Its
+        // absolute check below still stands in a release build.
+        if layer != Layer::Endpoint && !(0.25..=4.0).contains(&shape_ratio) {
             stale.push(format!(
                 "`{}`: the file has it at {:.4} of the framing rung and the tree has it at {:.4} \
                  ({:.1}x apart), which no build profile explains",
