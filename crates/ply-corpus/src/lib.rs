@@ -1,12 +1,9 @@
 //! A synthetic but realistic Ply project, at whatever scale a benchmark needs, and a harness that
 //! says which compiler phase the time went to.
 
-pub mod build;
 pub mod cmd;
 pub mod discharge;
-pub mod emit;
 pub mod measure;
-pub mod model;
 pub mod payload;
 pub mod pipeline;
 pub mod r4;
@@ -20,7 +17,6 @@ pub mod w4;
 pub mod w5;
 pub mod w6;
 pub mod w6_run;
-pub mod write;
 
 pub use spec::CorpusSpec;
 

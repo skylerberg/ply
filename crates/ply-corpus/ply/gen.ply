@@ -1,0 +1,253 @@
+// The generator: a spec and a seed to a corpus on disk, verified by the product. The corpus is
+// a function of its seed, so the seed is the artifact worth keeping rather than the megabytes
+// it expands to.
+
+import rng
+import gmodel
+import gbuild
+import gemit
+import gwrite
+import std.json (Json, Str, Number, Bool, Null, Object, object, array)
+import std.json
+import std.fs (fs)
+import std.fs
+import std.process (process)
+import std.process
+import std.time (time)
+import cli.env (env)
+
+// --- The spec, decoded from the JSON the command line carries --------------------------------
+
+pub fn spec_from_json(text: String) -> Result<gbuild::Spec, String> =
+  match json::parse(bytes_of_string(text)) {
+    Err(e) -> Err("the spec is not JSON: " ++ e.message),
+    Ok(Object(m)) ->
+      validate({
+        seed: int_field(m, "seed"),
+        modules: int_field(m, "modules"),
+        defs_per_module: int_field(m, "defs_per_module"),
+        tests: int_field(m, "tests"),
+        depth: int_field(m, "depth"),
+        tables: int_field(m, "tables"),
+        regions: int_field(m, "regions"),
+        effect_fraction: float_field(m, "effect_fraction"),
+        nondet_fraction: float_field(m, "nondet_fraction"),
+        hub_modules: int_field(m, "hub_modules"),
+        max_weight: int_field(m, "max_weight"),
+        concurrent_tests: int_field(m, "concurrent_tests"),
+        tasks_per_test: int_field(m, "tasks_per_test"),
+        steps_per_task: int_field(m, "steps_per_task"),
+        conflict_density: float_field(m, "conflict_density"),
+        spec_fraction: float_field(m, "spec_fraction"),
+        specimens_per_module: int_field(m, "specimens_per_module"),
+      }),
+    _ -> Err("the spec is not an object"),
+  }
+
+fn validate(spec: gbuild::Spec) -> Result<gbuild::Spec, String> =
+  if spec.modules == 0 { Err("a corpus needs at least one module") }
+  else if spec.defs_per_module == 0 { Err("a module needs at least one definition") }
+  else if spec.depth == 0 { Err("`--depth` must be at least 1") } else if spec.depth
+      > spec.modules {
+    Err(
+      "`--depth " ++ int_to_string(spec.depth) ++ "` exceeds `--modules "
+        ++ int_to_string(spec.modules)
+        ++ "`: every layer must hold at least one module",
+    )
+  } else if spec.tables == 0 { Err("`--tables` must be at least 1") }
+  else if spec.regions == 0 { Err("`--regions` must be at least 1") } else if spec.effect_fraction
+      < 0.0
+      || spec.effect_fraction > 1.0 { Err("`--effect-fraction` must be between 0 and 1") } else if spec.nondet_fraction
+      < 0.0
+      || spec.nondet_fraction > 1.0 { Err("`--nondet-fraction` must be between 0 and 1") }
+  else if spec.max_weight < 8 { Err("`--max-weight` below 8 leaves no room for a call graph") } else if spec.concurrent_tests
+      > 0
+      && spec.tasks_per_test < 2 { Err("`--tasks-per-test` below 2 has nothing to interleave") }
+  else { Ok(spec) }
+
+fn int_field(m: Map<String, Json>, key: String) -> Int =
+  match map_get(m, key) {
+    Some(Number(d)) -> match int_of_decimal(d, Down) { Some(n) -> n, None -> 0 },
+    _ -> 0,
+  }
+
+fn float_field(m: Map<String, Json>, key: String) -> Float =
+  match map_get(m, key) { Some(Number(d)) -> float_of_decimal(d), _ -> 0.0 }
+
+// --- The dump, for checking a port against the Rust generator byte for byte ---------------------
+
+pub fn dump(spec_text: String) -> Result<String, String> =
+  match spec_from_json(spec_text) {
+    Err(e) -> Err(e),
+    Ok(spec) -> {
+      let corpus = gbuild::generate(spec);
+      let files = gemit::emit(corpus);
+      let bytes = fold(files, 0, |acc: Int, f: gemit::Emitted|
+        acc + bytes_len(bytes_of_string(f.text)));
+      match gwrite::manifest_for(spec, corpus, len(files), bytes) {
+        Err(e) -> Err(e),
+        Ok(manifest) ->
+          Ok(
+            json::to_string(
+              object([
+                {
+                  key: "files",
+                  value: array(
+                    map(files, |f: gemit::Emitted|
+                      object([
+                        { key: "path", value: Str(f.path) },
+                        { key: "text", value: Str(f.text) },
+                      ])),
+                  ),
+                },
+                { key: "manifest", value: gwrite::manifest_json(spec, corpus, manifest) },
+              ]),
+            ),
+          ),
+      }
+    },
+  }
+
+// --- The subcommand --------------------------------------------------------------------------------
+
+// Write the corpus, then compile and run it to prove it is real — unless told to skip the
+// proof. `dir` is the corpus's path relative to the bound root, which the filesystem answers
+// for; `at` is its absolute spelling, which the spawned `ply` and the report's display take.
+pub fn run(
+  dir: String,
+  at: String,
+  spec_text: String,
+  no_verify: Bool,
+) -> Result<String, String> / {fs.read_file[cwd], fs.list_dir[cwd], fs.kind[cwd], fs.resolved[cwd], fs.write_file[cwd], fs.create_dir[cwd], fs.remove[cwd], process.spawn[ply], env.var[sys], time.elapsed_ms} =
+  match spec_from_json(spec_text) {
+    Err(e) -> Err(e),
+    Ok(spec) -> {
+      let corpus = gbuild::generate(spec);
+      let files = gemit::emit(corpus);
+      let bytes = fold(files, 0, |acc: Int, f: gemit::Emitted|
+        acc + bytes_len(bytes_of_string(f.text)));
+      match prepare(dir) {
+        Err(e) -> Err(e),
+        Ok(_) -> match gwrite::manifest_for(spec, corpus, len(files), bytes) {
+          Err(e) -> Err(e),
+          Ok(manifest) -> {
+            let _ = map(files, |f: gemit::Emitted| write_at(dir, f));
+            let manifest_json = gwrite::manifest_json(spec, corpus, manifest);
+            let _ = fs.write_file[cwd](
+              dir ++ "/corpus.json",
+              bytes_of_string(json::to_string(manifest_json) ++ "\n"),
+            );
+            let verified = if no_verify { Ok(false) } else { verify(at) };
+            match verified {
+              Err(e) -> Err(e),
+              Ok(v) ->
+                Ok(
+                  json::to_string(
+                    object([
+                      { key: "root", value: Str(at) },
+                      { key: "manifest", value: manifest_json },
+                      { key: "verified", value: Bool(v) },
+                    ]),
+                  ),
+                ),
+            }
+          },
+        },
+      }
+    },
+  }
+
+fn write_at(dir: String, f: gemit::Emitted) -> Bool / {fs.write_file[cwd], fs.create_dir[cwd]} = {
+  let path = dir ++ "/" ++ f.path;
+  let parent = parent_of(path);
+  let _ = fs.create_dir[cwd](parent);
+  fs.write_file[cwd](path, bytes_of_string(f.text))
+}
+
+fn parent_of(path: String) -> String = {
+  let b = bytes_of_string(path);
+  let slashes = fold(range(0, bytes_len(b)), [], |acc: List<Int>, i: Int|
+    if bytes_at(b, i) == 47 { push(acc, i) } else { acc });
+  match list_at(slashes, len(slashes) - 1) {
+    Some(i) -> string_of_bytes(bytes_slice(b, 0, i)),
+    None -> ".",
+  }
+}
+
+// The directory must be empty, or a corpus this tool already wrote.
+fn prepare(
+  dir: String,
+) -> Result<Unit, String> / {fs.read_file[cwd], fs.list_dir[cwd], fs.kind[cwd], fs.resolved[cwd], fs.remove[cwd], fs.create_dir[cwd]} =
+  match fs.resolved[cwd](dir) {
+    fs::Missing -> Ok(mk_dirs(dir)),
+    fs::Dir -> {
+      let ours = fs.kind[cwd](dir ++ "/corpus.json");
+      let entries = match fs.list_dir[cwd](dir) { Some(e) -> e, None -> [] };
+      if ours != fs::File && len(entries) > 0 {
+        Err("`" ++ dir ++ "` is not empty and holds no `corpus.json`; refusing to overwrite it")
+      } else {
+        let _ = map(entries, |name: String| remove_at(dir ++ "/" ++ name));
+        Ok(())
+      }
+    },
+    _ -> Err("`" ++ dir ++ "` exists and is not a directory"),
+  }
+
+fn mk_dirs(dir: String) -> Unit / {fs.create_dir[cwd]} = {
+  let b = bytes_of_string(dir);
+  let _ = fold(range(0, bytes_len(b)), 0, |acc: Int, i: Int|
+    if bytes_at(b, i) == 47 && fs.create_dir[cwd](string_of_bytes(bytes_slice(b, 0, i))) { acc + 1 }
+    else { acc });
+  let _ = fs.create_dir[cwd](dir);
+  ()
+}
+
+fn remove_at(path: String) -> Unit / {fs.kind[cwd], fs.list_dir[cwd], fs.remove[cwd]} =
+  match fs.kind[cwd](path) {
+    fs::Dir -> {
+      let entries = match fs.list_dir[cwd](path) { Some(e) -> e, None -> [] };
+      let _ = map(entries, |name: String| remove_at(path ++ "/" ++ name));
+      let _ = fs.remove[cwd](path);
+      ()
+    },
+    _ -> {
+      let _ = fs.remove[cwd](path);
+      ()
+    },
+  }
+
+// Compile and run it, the way a user would.
+pub fn verify(
+  dir: String,
+) -> Result<Bool, String> / {process.spawn[ply], env.var[sys], time.elapsed_ms} = {
+  let done = spawn_ply(["test", dir, "--json", "--color", "never"], dir);
+  match exit_of(done) {
+    Some(0) -> Ok(true),
+    Some(code) ->
+      Err(
+        "the corpus does not check: ply test exited " ++ int_to_string(code) ++ "\n"
+          ++ string_of_bytes_lossy(done.err),
+      ),
+    None -> Err("ply was signalled: " ++ string_of_bytes_lossy(done.err)),
+  }
+}
+
+fn spawn_ply(
+  args: List<String>,
+  dir: String,
+) -> process::Finished / {process.spawn[ply], env.var[sys]} = {
+  let env_vars = fold(["HOME", "TMPDIR", "PATH"], [], |acc: List<process::Var>, name: String|
+    match env.var[sys](name) { Some(v) -> push(acc, process::var(name, v)), None -> acc });
+  process.spawn[ply](args, dir, env_vars)
+}
+
+fn exit_of(f: process::Finished) -> Option<Int> = process::exit_code(f)
+
+test "a small spec generates" {
+  match dump(
+      "{\"seed\":1,\"modules\":4,\"defs_per_module\":5,\"tests\":8,\"depth\":2,\"tables\":3,\"regions\":2,\"effect_fraction\":0.35,\"nondet_fraction\":0.03,\"hub_modules\":3,\"max_weight\":192,\"concurrent_tests\":0,\"tasks_per_test\":3,\"steps_per_task\":2,\"conflict_density\":0.5,\"spec_fraction\":0.0,\"specimens_per_module\":0}",
+    ) {
+    Ok(text) -> assert(string_contains(text, "store0")),
+    Err(_) -> assert(false),
+  }
+}

@@ -1,0 +1,561 @@
+// The corpus as data, plus the reference evaluator: the same shapes the Rust model held, so a
+// shape drives both the emitted source and the expected values, and they cannot drift.
+
+// `prim::clamp`'s modulus.
+pub fn clamp(v: Int) -> Int = v % 100003
+
+pub fn mix(a: Int, b: Int) -> Int = clamp(a * 31 + b * 17 + 7)
+
+pub fn weigh(id: Int, weight: Int) -> Int = clamp(id * 11 + weight)
+
+pub fn total(xs: List<Int>) -> Int = fold(xs, 0, |acc: Int, v: Int| clamp(acc + v))
+
+// --- Effects and footprints -------------------------------------------------------
+
+pub type Eff = | Db | Cache | Clock | Counter
+
+pub type Atom = { eff: Eff, resource: Option<String>, write: Bool }
+
+pub fn read(e: Eff, resource: String) -> Atom = { eff: e, resource: Some(resource), write: false }
+
+pub fn write(e: Eff, resource: String) -> Atom = { eff: e, resource: Some(resource), write: true }
+
+pub fn singleton_read(e: Eff) -> Atom = { eff: e, resource: None, write: false }
+
+pub type Footprint = List<Atom>
+
+pub fn empty_footprint() -> Footprint = []
+
+// A footprint is the set the Rust's BTreeSet was: kept sorted in the same order (effect, then
+// resource, then write), so emitted rows come out byte-identical.
+pub fn atom_in_pub(fp: Footprint, atom: Atom) -> Bool = atom_in(fp, atom)
+
+pub fn atom_insert(fp: Footprint, atom: Atom) -> Footprint =
+  if atom_in(fp, atom) { fp } else { insert_sorted(fp, atom, []) }
+
+fn atom_in(fp: Footprint, atom: Atom) -> Bool =
+  fold(fp, false, |acc: Bool, a: Atom| acc || atom_eq(a, atom))
+
+fn atom_eq(a: Atom, b: Atom) -> Bool =
+  eff_ord(a.eff) == eff_ord(b.eff) && a.resource == b.resource && a.write == b.write
+
+fn eff_ord(e: Eff) -> Int = match e { Db -> 0, Cache -> 1, Clock -> 2, Counter -> 3 }
+
+fn string_leq(x: String, y: String) -> Bool = string_less(x, y) || x == y
+
+fn string_less(x: String, y: String) -> Bool =
+  bytes_less_at(bytes_of_string(x), bytes_of_string(y), 0)
+
+fn bytes_less_at(bx: Bytes, by: Bytes, i: Int) -> Bool =
+  if i >= bytes_len(bx) { i < bytes_len(by) }
+  else if i >= bytes_len(by) { false }
+  else if bytes_at(bx, i) != bytes_at(by, i) { bytes_at(bx, i) < bytes_at(by, i) }
+  else { bytes_less_at(bx, by, i + 1) }
+
+fn atom_leq(a: Atom, b: Atom) -> Bool =
+  if eff_ord(a.eff) != eff_ord(b.eff) { eff_ord(a.eff) < eff_ord(b.eff) } else if a.resource
+      != b.resource {
+    match ((a.resource, b.resource)) {
+      (None, _) -> true,
+      (Some(_), None) -> false,
+      (Some(x), Some(y)) -> string_leq(x, y),
+    }
+  } else { !a.write || b.write }
+
+fn insert_sorted(fp: Footprint, atom: Atom, acc: Footprint) -> Footprint =
+  match fp {
+    [] -> push(acc, atom),
+    [a, ..rest] -> if atom_leq(atom, a) { cat_atoms(push(push(acc, atom), a), rest) }
+    else { insert_sorted(rest, atom, push(acc, a)) },
+  }
+
+fn cat_atoms(xs: Footprint, ys: Footprint) -> Footprint =
+  fold(ys, xs, |acc: Footprint, a: Atom| push(acc, a))
+
+pub fn atom_union(a: Footprint, b: Footprint) -> Footprint =
+  fold(b, a, |acc: Footprint, atom: Atom| atom_insert(acc, atom))
+
+pub fn render_atom(a: Atom) -> String = {
+  let mode = if a.write { "write" } else { "read" };
+  match a.resource {
+    Some(r) -> "effects::" ++ eff_str(a.eff) ++ "." ++ mode ++ "[" ++ r ++ "]",
+    None -> "effects::" ++ eff_str(a.eff) ++ "." ++ mode,
+  }
+}
+
+pub fn eff_str(e: Eff) -> String =
+  match e { Db -> "db", Cache -> "cache", Clock -> "clock", Counter -> "counter" }
+
+// --- Definitions and shapes ---------------------------------------------------------
+
+pub type Call = { target: Int, offset: Int }
+
+pub type Shape =
+  | Arith(Int, Int)
+  | Compose(Call, Call)
+  | Guard(Int, Call, Int)
+  | Fold(Int, Int)
+  | Record(Int, Int)
+  | Sum(Int, Call, Int)
+  | Chain(Call, Int, Int)
+  | ListMap(Int, Int)
+  | Pair(Call, Int, Int)
+  | TableCount(Int, Int, Call)
+  | TableSum(Int, Int)
+  | TableAppend(Int, Int, Int)
+  | CachePeek(Int, Int)
+  | CachePoke(Int, Int)
+  | Now(Int)
+
+pub type Claim = { intent: Intent }
+
+pub type Intent = | Decided | Sampled | Gap
+
+pub type Def = {
+  id: Int,
+  module: Int,
+  name: String,
+  arity: Int,
+  shape: Shape,
+  extras: List<Call>,
+  footprint: Footprint,
+  weight: Int,
+  public: Bool,
+  claim: Option<Claim>,
+}
+
+pub fn shape_calls(s: Shape) -> List<Call> =
+  match s {
+    Compose(f, g) -> [f, g],
+    Guard(_, f, _) -> [f],
+    Sum(_, f, _) -> [f],
+    Chain(inner, outer, _) -> [inner, { target: outer, offset: 0 }],
+    Pair(f, _, _) -> [f],
+    TableCount(_, _, f) -> [f],
+    _ -> [],
+  }
+
+pub fn own_atoms(s: Shape, tables: List<String>, regions: List<String>) -> Footprint =
+  match s {
+    TableCount(t, _, _) -> [read(Db, at_str(tables, t))],
+    TableSum(t, _) -> [read(Db, at_str(tables, t))],
+    TableAppend(t, _, _) ->
+      insert_sorted([read(Db, at_str(tables, t))], write(Db, at_str(tables, t)), []),
+    CachePeek(r, _) -> [read(Cache, at_str(regions, r))],
+    CachePoke(r, _) ->
+      insert_sorted([read(Cache, at_str(regions, r))], write(Cache, at_str(regions, r)), []),
+    Now(_) -> [singleton_read(Clock)],
+    _ -> [],
+  }
+
+fn at_str(xs: List<String>, i: Int) -> String = match list_at(xs, i) { Some(s) -> s, None -> "" }
+
+pub fn is_block(s: Shape) -> Bool =
+  match s { TableAppend(_, _, _) -> true, CachePoke(_, _) -> true, _ -> false }
+
+pub fn is_one_liner(s: Shape) -> Bool =
+  !is_block(s) && (match s { Sum(_, _, _) -> false, _ -> true })
+
+// --- Modules, helpers, specimens, laws -----------------------------------------------
+
+pub type Helper = { name: String, m: Int, b: Int }
+
+pub type Module = {
+  id: Int,
+  name: String,
+  path: String,
+  layer: Int,
+  imports: List<Int>,
+  defs: List<Int>,
+  helper: Helper,
+  status_type: String,
+  ctor_ready: String,
+  ctor_idle: String,
+  needs_effects: Bool,
+}
+
+// The name other modules use: the last path segment.
+pub fn binder(m: Module) -> String = {
+  let b = bytes_of_string(m.name);
+  let dots = fold(range(0, bytes_len(b)), [], |acc: List<Int>, i: Int|
+    if bytes_at(b, i) == 46 { push(acc, i) } else { acc });
+  match list_at(dots, len(dots) - 1) {
+    Some(dot) -> string_slice(m.name, dot + 1, string_len(m.name)),
+    None -> m.name,
+  }
+}
+
+pub type Specimen = { id: Int, module: Int, name: String, kind: SpecimenKind }
+
+pub type SpecimenKind = | Linear(Int, Int) | Status | Length
+
+pub fn specimen_intent(k: SpecimenKind) -> Intent =
+  match k { Linear(_, _) -> Decided, Status -> Decided, Length -> Sampled }
+
+pub type Law = { module: Int, label: String, kind: LawKind }
+
+pub type LawKind = | Ground(Int, Int) | Finite | LawLength(Int)
+
+pub fn law_intent(k: LawKind) -> Intent =
+  match k { Ground(_, _) -> Decided, Finite -> Decided, LawLength(_) -> Sampled }
+
+// --- Tests, worlds, the mirror ---------------------------------------------------------
+
+pub type World = {
+  tables: List<(Int, List<Int>)>,
+  regions: List<(Int, Int)>,
+  clock: Int,
+  touched: Footprint,
+}
+
+pub fn empty_world(clock: Int) -> World = { tables: [], regions: [], clock: clock, touched: [] }
+
+pub fn world_table(w: World, index: Int) -> List<Int> =
+  match fold(w.tables, None, |acc: Option<List<Int>>, t: (Int, List<Int>)|
+      match acc {
+        Some(_) -> acc,
+        None -> match t { (i, rows) -> if i == index { Some(rows) } else { None } },
+      }) {
+    Some(rows) -> rows,
+    None -> [],
+  }
+
+fn world_read_table(w: World, label: String, index: Int) -> (World, List<Int>) =
+  ({ ..w, touched: atom_insert(w.touched, read(Db, label)) }, world_table(w, index))
+
+fn world_table_push(w: World, index: Int, row: Int) -> World = {
+  let tables = if fold(w.tables, false, |acc: Bool, t: (Int, List<Int>)|
+      match t { (i, _) -> acc || i == index }) {
+    map(w.tables, |t: (Int, List<Int>)|
+      match t { (i, rows) -> if i == index { (i, push(rows, row)) } else { t } })
+  } else { push(w.tables, (index, [row])) };
+  { ..w, tables: tables }
+}
+
+pub fn world_region(w: World, index: Int) -> Int =
+  match fold(w.regions, None, |acc: Option<Int>, r: (Int, Int)|
+      match acc {
+        Some(_) -> acc,
+        None -> match r { (i, v) -> if i == index { Some(v) } else { None } },
+      }) {
+    Some(v) -> v,
+    None -> 0,
+  }
+
+fn world_read_region(w: World, label: String, index: Int) -> (World, Int) =
+  ({ ..w, touched: atom_insert(w.touched, read(Cache, label)) }, world_region(w, index))
+
+fn world_set_region(w: World, index: Int, value: Int) -> World = {
+  let regions = if fold(w.regions, false, |acc: Bool, r: (Int, Int)|
+      match r { (i, _) -> acc || i == index }) {
+    map(w.regions, |r: (Int, Int)| match r { (i, v) -> if i == index { (i, value) } else { r } })
+  } else { push(w.regions, (index, value)) };
+  { ..w, regions: regions }
+}
+
+pub type Test = {
+  module: Int,
+  label: String,
+  nondet: Bool,
+  root: Int,
+  calls: List<List<Int>>,
+  expected: List<Int>,
+  world: World,
+  granted: Footprint,
+  final_table_len: List<(Int, Int)>,
+  final_region: List<(Int, Int)>,
+}
+
+// One task of a concurrent test: bumps one shard `steps.len()` times, yielding in between.
+pub type TaskBody = { name: String, shard: Int, steps: List<Int> }
+
+pub fn contributed(t: TaskBody) -> Int = total(t.steps)
+
+pub type ConcurrentTest = { module: Int, label: String, tasks: List<TaskBody>, shards: List<Int> }
+
+pub fn shard_total(ct: ConcurrentTest, shard: Int) -> Int =
+  fold(ct.tasks, 0, |acc: Int, t: TaskBody|
+    if t.shard == shard { acc + contributed(t) } else { acc })
+
+pub fn concurrent_total(ct: ConcurrentTest) -> Int =
+  fold(ct.tasks, 0, |acc: Int, t: TaskBody| acc + contributed(t))
+
+pub fn contention(ct: ConcurrentTest) -> Float =
+  if len(ct.tasks) == 0 { 0.0 } else {
+    let shared = fold(ct.tasks, 0, |acc: Int, t: TaskBody|
+      if fold(ct.tasks, 0, |n: Int, o: TaskBody| if o.shard == t.shard { n + 1 } else { n }) > 1 {
+        acc + 1
+      } else { acc });
+    float_of_decimal(decimal_div(decimal_of_int(shared), decimal_of_int(len(ct.tasks)), 10, HalfUp))
+  }
+
+// --- The corpus and its evaluator --------------------------------------------------------
+
+pub type Corpus = {
+  modules: List<Module>,
+  defs: List<Def>,
+  tests: List<Test>,
+  concurrent: List<ConcurrentTest>,
+  specimens: List<Specimen>,
+  laws: List<Law>,
+  tables: List<String>,
+  regions: List<String>,
+  shards: List<String>,
+}
+
+pub fn empty_corpus(tables: List<String>, regions: List<String>, shards: List<String>) -> Corpus =
+  {
+    modules: [],
+    defs: [],
+    tests: [],
+    concurrent: [],
+    specimens: [],
+    laws: [],
+    tables: tables,
+    regions: regions,
+    shards: shards,
+  }
+
+pub fn effectful_defs(c: Corpus) -> Int =
+  fold(c.defs, 0, |acc: Int, d: Def| if len(d.footprint) > 0 { acc + 1 } else { acc })
+
+// `def(args)` under `world`, which receives exactly the writes the definition performs.
+pub fn eval(c: Corpus, id: Int, args: List<Int>, world: World) -> (World, Int) = {
+  let def = at_def(c, id);
+  let p0 = match list_at(args, 0) { Some(x) -> x, None -> 0 };
+  let p1 = match list_at(args, 1) { Some(x) -> x, None -> 0 };
+  let (w2, core) = eval_shape(c, def, p0, p1, world);
+  if len(def.extras) == 0 { (w2, core) } else {
+    let (w3, sum) = fold(def.extras, (w2, 0), |acc: (World, Int), extra: Call|
+      match acc {
+        (w, sum) -> {
+          let (w_next, v) = invoke(c, extra, p0, w);
+          (w_next, sum + v)
+        },
+      });
+    (w3, mix(core, sum))
+  }
+}
+
+pub fn at_def_pub(c: Corpus, id: Int) -> Def = at_def(c, id)
+
+fn at_def(c: Corpus, id: Int) -> Def =
+  match list_at(c.defs, id) { Some(d) -> d, None -> panic("eval: no such definition") }
+
+fn at_module(c: Corpus, id: Int) -> Module =
+  match list_at(c.modules, id) { Some(m) -> m, None -> panic("eval: no such module") }
+
+fn eval_shape(c: Corpus, def: Def, p0: Int, p1: Int, world: World) -> (World, Int) =
+  match def.shape {
+    Arith(a, b) -> (world, clamp(p0 * a + b)),
+    Compose(f, g) -> {
+      let (w1, left) = invoke(c, f, p0, world);
+      let (w2, right) = invoke(c, g, p0, w1);
+      (w2, mix(left, right))
+    },
+    Guard(m, f, b) -> if p0 % m == 0 { invoke(c, f, p0, world) } else { (world, clamp(p0 + b)) },
+    Fold(n, k) -> (world, fold(range(0, n), 0, |acc: Int, v: Int| clamp(acc + v * k + p0))),
+    Record(m, k) -> (world, weigh(p0 % m, clamp(p0 * k))),
+    Sum(off, f, idle) -> {
+      let module = at_module(c, def.module);
+      let x = p0 + off;
+      if x % module.helper.m == 0 { (world, idle) }
+      else { invoke(c, f, clamp(x + module.helper.b), world) }
+    },
+    Chain(inner, outer, b) -> {
+      let (w1, v) = invoke(c, inner, p0, world);
+      invoke_with(c, { target: outer, offset: 0 }, v + b, w1)
+    },
+    ListMap(n, k) -> (world, total(map(range(0, n), |v: Int| clamp(v * k + p0)))),
+    Pair(f, a, b) -> {
+      let (w1, left) = invoke(c, f, p0, world);
+      (w1, mix(left, p1 * a + b))
+    },
+    TableCount(table, a, f) -> {
+      let label = at_str(c.tables, table);
+      let (w1, rows) = world_read_table(world, label, table);
+      let (w2, rest) = invoke(c, f, p0, w1);
+      (w2, clamp(len(rows) * a + rest))
+    },
+    TableSum(table, a) -> {
+      let label = at_str(c.tables, table);
+      let (w1, rows) = world_read_table(world, label, table);
+      (w1, clamp(total(rows) + p0 * a))
+    },
+    TableAppend(table, a, b) -> {
+      let label = at_str(c.tables, table);
+      let (w1, rows) = world_read_table(world, label, table);
+      let before = len(rows);
+      let pushed = clamp(p0 * a);
+      let w2 = { ..w1, touched: atom_insert(w1.touched, write(Db, label)) };
+      let w3 = world_table_push(w2, table, pushed);
+      (w3, clamp(before * b + p0))
+    },
+    CachePeek(region, a) -> {
+      let label = at_str(c.regions, region);
+      let (w1, seen) = world_read_region(world, label, region);
+      (w1, clamp(seen + p0 * a))
+    },
+    CachePoke(region, a) -> {
+      let label = at_str(c.regions, region);
+      let (w1, seen) = world_read_region(world, label, region);
+      let w2 = { ..w1, touched: atom_insert(w1.touched, write(Cache, label)) };
+      let w3 = world_set_region(w2, region, clamp(seen + p0));
+      (w3, clamp(seen * a + p0))
+    },
+    Now(a) -> {
+      let w1 = { ..world, touched: atom_insert(world.touched, singleton_read(Clock)) };
+      (w1, clamp(world.clock % a + p0))
+    },
+  }
+
+fn invoke(c: Corpus, call: Call, p0: Int, world: World) -> (World, Int) =
+  invoke_with(c, call, p0 + call.offset, world)
+
+fn invoke_with(c: Corpus, call: Call, arg: Int, world: World) -> (World, Int) =
+  eval(c, call.target, call_args(at_def(c, call.target).arity, arg, call.offset), world)
+
+// The second parameter derives from the call's offset, so emission and evaluation agree.
+pub fn call_args(arity: Int, first: Int, offset: Int) -> List<Int> =
+  if arity >= 2 { [first, second_arg(offset)] } else { [first] }
+
+pub fn second_arg(offset: Int) -> Int = offset * 7 % 97 + 3
+
+// --- The obligations the corpus carries ---------------------------------------------------
+
+pub fn obligations_by_intent(c: Corpus) -> (Int, Int, Int) = {
+  let claims = fold(c.defs, (0, 0, 0), |acc: (Int, Int, Int), d: Def|
+    match d.claim { None -> acc, Some(cl) -> bump(acc, cl.intent) });
+  let with_specimens = fold(c.specimens, claims, |acc: (Int, Int, Int), s: Specimen|
+    bump(acc, specimen_intent(s.kind)));
+  fold(c.laws, with_specimens, |acc: (Int, Int, Int), l: Law| bump(acc, law_intent(l.kind)))
+}
+
+fn bump(acc: (Int, Int, Int), intent: Intent) -> (Int, Int, Int) =
+  match acc {
+    (decided, sampled, gap) -> match intent {
+      Decided -> (decided + 1, sampled, gap),
+      Sampled -> (decided, sampled + 1, gap),
+      Gap -> (decided, sampled, gap + 1),
+    },
+  }
+
+pub fn specified_defs(c: Corpus) -> Int =
+  fold(c.defs, 0, |acc: Int, d: Def| match d.claim { Some(_) -> acc + 1, None -> acc })
+
+// --- Tests --------------------------------------------------------------------------------
+
+test "the mirror agrees with a worked example" {
+  let c: Corpus = {
+    modules: [
+      {
+        id: 0,
+        name: "store0.core_0",
+        path: "store0/core_0.ply",
+        layer: 0,
+        imports: [],
+        defs: [0, 1],
+        helper: { name: "stage_0", m: 3, b: 7 },
+        status_type: "Status0",
+        ctor_ready: "Ready0",
+        ctor_idle: "Idle0",
+        needs_effects: false,
+      },
+    ],
+    defs: [
+      {
+        id: 0,
+        module: 0,
+        name: "apply_0",
+        arity: 1,
+        shape: Arith(3, 5),
+        extras: [],
+        footprint: [],
+        weight: 1,
+        public: false,
+        claim: None,
+      },
+      {
+        id: 1,
+        module: 0,
+        name: "render_1",
+        arity: 1,
+        shape: Compose({ target: 0, offset: 2 }, { target: 0, offset: 0 }),
+        extras: [],
+        footprint: [],
+        weight: 2,
+        public: false,
+        claim: None,
+      },
+    ],
+    tests: [],
+    concurrent: [],
+    specimens: [],
+    laws: [],
+    tables: [],
+    regions: [],
+    shards: [],
+  };
+  let (_, v) = eval(c, 0, [4], empty_world(0));
+  assert_eq(v, 17);
+  let (_, w) = eval(c, 1, [4], empty_world(0));
+  // compose(f=x+2, g=x): f(4) = apply_0(6) = 23, g(4) = 17; mix = clamp(23*31 + 17*17 + 7)
+  assert_eq(w, (23 * 31 + 17 * 17 + 7) % 100003);
+}
+
+test "a table append touches the world the handler will grant" {
+  let c: Corpus = {
+    modules: [
+      {
+        id: 0,
+        name: "store0.core_0",
+        path: "store0/core_0.ply",
+        layer: 0,
+        imports: [],
+        defs: [0],
+        helper: { name: "stage_0", m: 3, b: 7 },
+        status_type: "Status0",
+        ctor_ready: "Ready0",
+        ctor_idle: "Idle0",
+        needs_effects: false,
+      },
+    ],
+    defs: [
+      {
+        id: 0,
+        module: 0,
+        name: "apply_0",
+        arity: 1,
+        shape: TableAppend(0, 2, 3),
+        extras: [],
+        footprint: [read(Db, "orders"), write(Db, "orders")],
+        weight: 1,
+        public: false,
+        claim: None,
+      },
+    ],
+    tests: [],
+    concurrent: [],
+    specimens: [],
+    laws: [],
+    tables: ["orders"],
+    regions: [],
+    shards: [],
+  };
+  let w0 = { tables: [(0, [10, 20])], regions: [], clock: 0, touched: [] };
+  let (w1, v) = eval(c, 0, [5], w0);
+  assert_eq(v, 2 * 3 + 5);
+  assert_eq(world_table(w1, 0), [10, 20, 10]);
+  assert_eq(len(w1.touched), 2);
+}
+
+test "footprints stay in the BTreeSet's order" {
+  let fp = atom_insert(atom_insert(empty_footprint(), write(Db, "orders")), read(Db, "items"));
+  let fp2 = atom_insert(fp, singleton_read(Clock));
+  assert_eq(render_atom(at_fp(fp2, 0)), "effects::db.read[items]");
+  assert_eq(render_atom(at_fp(fp2, 1)), "effects::db.write[orders]");
+  assert_eq(render_atom(at_fp(fp2, 2)), "effects::clock.read");
+}
+
+fn at_fp(fp: Footprint, i: Int) -> Atom =
+  match list_at(fp, i) { Some(a) -> a, None -> panic("no atom") }
