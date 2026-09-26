@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 fn repo() -> PathBuf {
@@ -117,8 +118,25 @@ fn check_codes(dir: &Path, target: &str) -> Vec<String> {
     codes
 }
 
+/// A `ply fmt` over `dir`, as JSON. `check` asks what would move instead of moving it.
+fn fmt_json(dir: &Path, check: bool) -> Value {
+    let mut cmd = ply(dir);
+    cmd.arg("fmt");
+    if check {
+        cmd.arg("--check");
+    }
+    let out = cmd.arg("--json").output().unwrap();
+    serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)))
+}
+
 /// Formats a copy of every `.ply` file under `relative` and requires the result to be a fixed
 /// point that `ply check` reads the same way it read the original.
+///
+/// One `ply fmt` over the corpus, not one per file: the command walks the tree and reports every
+/// file it took, so the per-file answer is already in its report. The `check` runs are kept for
+/// the files the formatter touches, since an untouched file's diagnostics were read off the same
+/// bytes they are read off after.
 fn corpus_round_trip(relative: &str) {
     let dir = tempfile::tempdir().unwrap();
     let mut names = Vec::new();
@@ -132,50 +150,99 @@ fn corpus_round_trip(relative: &str) {
     }
     names.sort();
     assert!(!names.is_empty(), "{relative} holds no .ply files");
-    for target in &names {
-        let before = check_codes(dir.path(), target);
-        let out = ply(dir.path()).args(["fmt", target]).output().unwrap();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        match out.status.code() {
-            Some(0) => {}
-            // A fixture written to exercise the parser's recovery does not parse, and stays as it was.
-            Some(2) if before.iter().any(|c| c.starts_with('E')) => {
-                assert!(stderr.contains("E0"), "{target}: {stderr}");
-                assert_eq!(
-                    std::fs::read(dir.path().join(target)).unwrap(),
-                    std::fs::read(repo().join(relative).join(target)).unwrap(),
-                    "{target} was rewritten although it does not parse"
-                );
-                continue;
-            }
-            code => panic!("{relative}/{target}: ply fmt exited {code:?}\n{stderr}"),
-        }
-        let again = ply(dir.path())
-            .args(["fmt", "--check", target])
-            .output()
-            .unwrap();
-        if again.status.code() != Some(0) {
-            let stdout = String::from_utf8_lossy(&again.stdout);
-            let moved: Vec<&str> = stdout
-                .lines()
-                .filter_map(|l| l.strip_prefix("would format "))
-                .collect();
-            let mut report = String::new();
-            for file in moved {
-                let once = std::fs::read_to_string(dir.path().join(file)).unwrap();
-                ply(dir.path()).args(["fmt", file]).output().unwrap();
-                let twice = std::fs::read_to_string(dir.path().join(file)).unwrap();
-                report.push_str(&first_difference(file, &once, &twice));
-            }
-            panic!(
-                "{relative}/{target} is not a fixed point:\n{stdout}{}\n{report}",
-                String::from_utf8_lossy(&again.stderr)
-            );
-        }
+
+    // What the formatter would move, and what it will not parse.
+    let planned = fmt_json(dir.path(), true);
+    let reported: BTreeSet<String> = planned["files"]
+        .as_array()
+        .expect("a files array")
+        .iter()
+        .map(|f| f["path"].as_str().unwrap().to_string())
+        .collect();
+    let moving: BTreeSet<String> = planned["files"]
+        .as_array()
+        .expect("a files array")
+        .iter()
+        .filter(|f| f["changed"].as_bool() == Some(true))
+        .map(|f| f["path"].as_str().unwrap().to_string())
+        .collect();
+    let refused: BTreeMap<String, String> = planned["errors"]
+        .as_array()
+        .expect("an errors array")
+        .iter()
+        .map(|e| {
+            (
+                e["path"].as_str().unwrap().to_string(),
+                e["error"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+
+    // Every file is one the formatter named or one it refused.
+    for name in &names {
+        assert!(
+            reported.contains(name) || refused.contains_key(name),
+            "{relative}/{name}: ply fmt --check named neither that it would move nor that it refused"
+        );
+    }
+
+    // A fixture written to exercise the parser's recovery does not parse, and stays as it was.
+    for (name, why) in &refused {
+        assert!(why.contains("E0"), "{relative}/{name}: {why}");
         assert_eq!(
-            check_codes(dir.path(), target),
-            before,
-            "{relative}/{target} checks differently after formatting"
+            std::fs::read(dir.path().join(name)).unwrap(),
+            std::fs::read(repo().join(relative).join(name)).unwrap(),
+            "{relative}/{name} was rewritten although it does not parse"
+        );
+    }
+
+    // What `ply check` said about every file the formatter will touch.
+    let before: BTreeMap<String, Vec<String>> = moving
+        .iter()
+        .chain(refused.keys())
+        .map(|name| (name.clone(), check_codes(dir.path(), name)))
+        .collect();
+    for (name, why) in &refused {
+        assert!(
+            before[name].iter().any(|c| c.starts_with('E')),
+            "{relative}/{name}: ply fmt refused it ({why}) but `ply check` raised no error"
+        );
+    }
+
+    // One `ply fmt` over the corpus.
+    let done = fmt_json(dir.path(), false);
+    assert_eq!(
+        done["ok"].as_bool(),
+        Some(refused.is_empty()),
+        "{relative}: ply fmt answered {done}"
+    );
+
+    // The answer is a fixed point: a second check finds nothing left to move.
+    let again = fmt_json(dir.path(), true);
+    let moved: Vec<String> = again["files"]
+        .as_array()
+        .expect("a files array")
+        .iter()
+        .filter(|f| f["changed"].as_bool() == Some(true))
+        .map(|f| f["path"].as_str().unwrap().to_string())
+        .collect();
+    if !moved.is_empty() {
+        let mut report = String::new();
+        for file in &moved {
+            let once = std::fs::read_to_string(dir.path().join(file)).unwrap();
+            ply(dir.path()).args(["fmt", file]).output().unwrap();
+            let twice = std::fs::read_to_string(dir.path().join(file)).unwrap();
+            report.push_str(&first_difference(file, &once, &twice));
+        }
+        panic!("{relative} is not a fixed point:\n{again}\n{report}");
+    }
+
+    // Formatting moved no diagnostic, for every file it touched.
+    for name in &moving {
+        assert_eq!(
+            check_codes(dir.path(), name),
+            before[name],
+            "{relative}/{name} checks differently after formatting"
         );
     }
 }
