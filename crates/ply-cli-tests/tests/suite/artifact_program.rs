@@ -19,6 +19,21 @@ fn write(dir: &Path, name: &str, text: &str) {
 }
 
 #[test]
+fn the_cli_tree_is_a_package() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ply-cli/ply");
+    let loaded = ply_machine::load::load(&dir).expect("the CLI tree loads");
+    assert_eq!(
+        loaded.front.packages,
+        vec![
+            ("ply".to_string(), Vec::new()),
+            ("std".to_string(), Vec::new()),
+            ("compiler".to_string(), vec!["std".to_string()]),
+        ],
+        "the CLI tree's ply.pkg names it the `ply` package, closed over the two built-ins"
+    );
+}
+
+#[test]
 fn the_committed_program_is_what_these_sources_build() {
     let identity = shipped::identity();
     let built = shipped::build().expect("the `ply` program builds");

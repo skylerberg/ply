@@ -57,10 +57,12 @@ deps_of() {
 
 rel() { printf '%s' "${1#"$root"/}"; }
 
-# 1. dep-info: a listed input that is gone, or not older than the binary.
+# 1. dep-info: a listed input that is gone, or not older than the binary. Paths under the
+# target dir are cargo's own derived outputs (a build script's generated source), which any
+# rebuild regenerates; their real inputs are listed in their own right.
 check_depinfo() {                    # $1 binary, $2 dep-info, $3 scratch
   local bin="$1" dep="$2" tmp="$3" bad=0 d
-  deps_of "$dep" | sort -u > "$tmp/deps"
+  deps_of "$dep" | grep -v "^$root/target/" | sort -u > "$tmp/deps"
   : > "$tmp/present"
   while IFS= read -r d; do
     if [ -e "$d" ]; then printf '%s\0' "$d" >> "$tmp/present"
