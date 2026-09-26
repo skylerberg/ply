@@ -129,7 +129,14 @@ fn shipped_closure(own: &[(String, String)]) -> Vec<(String, String)> {
 /// module nothing here imports is in neither the identity, the bundle nor a cache key. A directory
 /// is sorted like the embedded list.
 pub fn modules_of(src: &Sources) -> Vec<(String, String)> {
-    let mut program: Vec<(String, String)> = match src {
+    let mut program = own_sources(src);
+    program.extend(shipped_closure(&program));
+    program
+}
+
+/// The program's own modules, before the shipped closure is pulled in.
+fn own_sources(src: &Sources) -> Vec<(String, String)> {
+    match src {
         Sources::Embedded => ply_compiler::sources()
             .map(|(m, t)| (m.to_string(), t.to_string()))
             .collect(),
@@ -154,10 +161,7 @@ pub fn modules_of(src: &Sources) -> Vec<(String, String)> {
             found.sort();
             found
         }
-    };
-    let shipped = shipped_closure(&program);
-    program.extend(shipped);
-    program
+    }
 }
 
 /// The emitter for `src`: the committed bundle when it was emitted from these very sources, else
@@ -234,9 +238,34 @@ fn emit_stage(
 /// The emitter's own program through the front end, modules as `SourceId(0..n)` in `modules_of`'s
 /// order; the answer comes from the emitter handed over by [`build`].
 fn front_end(src: &Sources) -> Result<&'static Source, String> {
-    let modules = modules_of(src);
-    let ids: Vec<SourceId> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
-    let front = front(&modules, &ids).map_err(|e| format!("{e:#}"))?;
+    let own = own_sources(src);
+    let shipped = shipped_closure(&own);
+    // The shipped modules are pulled, not inlined: inlined they would be root modules named
+    // `std.*`, which the front end's built-in-package check refuses.
+    let pulled = front_pulling_std_with(
+        &own,
+        &shipped,
+        &[],
+        &[],
+        &Packages::anonymous(String::new()),
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    let ids: Vec<SourceId> = (0..own.len() + pulled.modules.len())
+        .map(|i| SourceId(i as u32))
+        .collect();
+    let front = read_front(&pulled.dump, &ids).map_err(|e| format!("{e:#}"))?;
+    let mut texts: HashMap<String, String> = own.iter().cloned().collect();
+    texts.extend(shipped.iter().cloned());
+    // Diagnostics index modules in the dump's order: the program's own, then the pulled ones.
+    let modules: Vec<(String, String)> = own
+        .iter()
+        .map(|(name, _)| name.clone())
+        .chain(pulled.modules.iter().cloned())
+        .map(|name| {
+            let text = texts.get(&name).cloned().unwrap_or_default();
+            (name, text)
+        })
+        .collect();
     if let Some(error) = front
         .diagnostics
         .iter()
@@ -246,7 +275,6 @@ fn front_end(src: &Sources) -> Result<&'static Source, String> {
     }
     let front: &'static Front = Box::leak(Box::new(front));
     let keys = crate::source::emit_keys(front);
-    let texts: HashMap<String, String> = modules.iter().cloned().collect();
     Ok(Box::leak(Box::new(
         Source::from_front(front, keys).with_texts(texts),
     )))
@@ -672,16 +700,13 @@ pub fn front_dump(sources: &[(String, String)]) -> Result<String> {
 
 const CLAIMS: &str = "front.claims_dump";
 
-/// Every body, clause and law of a program [`front`] already checked, lowered, resolving the
-/// way the front end did: `packages` and `mod_pkg` are what it published, or empty for a
-/// program without packages.
-pub fn claims_dump(
-    sources: &[(String, String)],
+/// The package tables a caller passes to a resolving entry, as values: what [`Front`]
+/// publishes, or empty lists for a program without packages.
+pub fn package_tables(
     packages: &[(String, Vec<String>)],
     mod_pkg: &[usize],
-) -> Result<String> {
-    tally(|census| census.claimed += sources.len());
-    let (pkgs, mods, shelf) = if packages.is_empty() {
+) -> (Value, Value, Value) {
+    if packages.is_empty() {
         (
             Value::list(Vec::new()),
             Value::list(Vec::new()),
@@ -708,7 +733,19 @@ pub fn claims_dump(
             Value::list(mod_pkg.iter().map(|i| Value::Int(*i as i64)).collect()),
             Value::Int(packages.len() as i64),
         )
-    };
+    }
+}
+
+/// Every body, clause and law of a program [`front`] already checked, lowered, resolving the
+/// way the front end did: `packages` and `mod_pkg` are what it published, or empty for a
+/// program without packages.
+pub fn claims_dump(
+    sources: &[(String, String)],
+    packages: &[(String, Vec<String>)],
+    mod_pkg: &[usize],
+) -> Result<String> {
+    tally(|census| census.claimed += sources.len());
+    let (pkgs, mods, shelf) = package_tables(packages, mod_pkg);
     string_answer(
         CLAIMS,
         call(CLAIMS, &[source_list(sources), pkgs, mods, shelf])?,

@@ -28,11 +28,10 @@ Each takes a `.ply` file or a project root, defaulting to `.`.
 **Projects.** Every `*.ply` file under the root, except inside directories whose
 name starts with `.`, is a module named by its relative path with `/` → `.` and
 `.ply` dropped: `store/orders/place.ply` is `store.orders.place`. Every
-directory name and file stem must be an identifier (`E0111`). `std` is the
-built-in package: a module named under it collides with its prefix (`E0133`),
-as does one under `compiler`, which is reserved while the compiler's own
-modules shelve there (`E0113`). Naming a single file makes its parent the root
-and loads only that file.
+directory name and file stem must be an identifier (`E0111`). `std` and
+`compiler` are the built-in packages, pre-seeded for every load: a module
+named under either collides with its prefix (`E0133`). Naming a single file
+makes its parent the root and loads only that file.
 
 **The cache.** `.ply-cache/` at the root holds the front-end, result and
 obligation caches and the review baseline. It is safe to delete
@@ -219,7 +218,9 @@ A dependency is another package root: `Path("../cli")` names the directory
 its `ply.pkg` stands in, and the dependency must hold one (`E0135`). Its
 modules answer to `<prefix>.<name>` for every package that declares it — the
 same dependency's own `import args` means *its* sibling `args`, never the
-importing package's. Reaching a package the manifest does not declare is
+importing package's. A bare import inside a dependency names that package's
+own modules only: the loading package's bare modules are unreachable from a
+dependency. Reaching a package the manifest does not declare is
 `E0132`, two packages granting one prefix is `E0133` — as is a module of the
 root package squatting on a dependency's prefix — and a cycle of packages is
 `E0134`. `Git` and `Registry` sources are checked and refused for now: only
@@ -1619,7 +1620,6 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0110` | duplicate import |
 | `E0111` | file path that cannot name a module |
 | `E0112` | ambiguous entry point |
-| `E0113` | project module under the reserved root `compiler` |
 | `E0114` | unknown `effect set`, including a `pub` or qualified one |
 | `E0115` | `effect set` cycle |
 | `E0116` | record update base that is not a record of a known type |

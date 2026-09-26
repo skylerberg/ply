@@ -678,9 +678,11 @@ pub fn analyse_with(
 // The packages of a load as the front end's tables take them: the root package first, the
 // shelf one past the end, and every module mapped to the package it was parsed from. The
 // order is the root's modules, then the closure's dependency modules, then the pulled shelf.
-// The built-in package: every package's implicit dependency, pulled on demand like the
-// shelf but owned as a package — the first the runtime pre-seeds.
+// The built-in packages: every package's implicit dependencies, pulled on demand like the
+// shelf but owned as packages — the two the runtime pre-seeds.
 pub fn std_pkg() -> Pkg = { prefix: b"std", deps: [] }
+
+pub fn compiler_pkg() -> Pkg = { prefix: b"compiler", deps: [b"std"] }
 
 fn has(xs: List<Bytes>, x: Bytes) -> Bool =
   match xs { [] -> false, [y, ..rest] -> if y == x { true } else { has(rest, x) } }
@@ -694,25 +696,35 @@ fn pkg_tables(
   root_count: Int,
   clo: Closure,
   toolchain: Bool,
-) -> { pkgs: List<Pkg>, mod_pkg: List<Int>, std: Int, shelf: Int } = {
+) -> { pkgs: List<Pkg>, mod_pkg: List<Int>, std: Int, compiler: Int, shelf: Int } = {
   let std = if toolchain { 0 - 1 } else { len(clo.packages) };
+  let compiler = if toolchain { 0 - 1 } else { std + 1 };
   {
-    pkgs: if toolchain { map(clo.packages, |p: Package| { prefix: p.prefix, deps: p.deps }) }
-    else { push(map(clo.packages, |p: Package| { prefix: p.prefix, deps: p.deps }), std_pkg()) },
-    // Pulled toolchain modules all publish as the shelf: an older emitter knows the shelf,
-    // and std's implicit reach is declared's to answer, not the index's.
+    pkgs: if toolchain { map(clo.packages, |p: Package| { prefix: p.prefix, deps: p.deps }) } else {
+      push(
+        push(map(clo.packages, |p: Package| { prefix: p.prefix, deps: p.deps }), std_pkg()),
+        compiler_pkg(),
+      )
+    },
+    // Pulled std publishes as the shelf (its internal imports are qualified), and pulled
+    // compiler as its own package, which its bare sibling imports resolve against.
     mod_pkg: map(range(0, len(parsed)), |i: Int|
       if i < root_count { 0 }
       else if i < root_count + len(clo.modules) { at(clo.modules, i - root_count).pkg }
       else if toolchain { len(clo.packages) }
-      else { std + 1 }),
+      else if is_compiler(at(parsed, i).name) { std + 1 }
+      else { std + 2 }),
     std: std,
-    shelf: if toolchain { len(clo.packages) } else { std + 1 },
+    compiler: compiler,
+    shelf: if toolchain { len(clo.packages) } else { std + 2 },
   }
 }
 
-// A root module under the built-in package's prefix, which no user's file may claim; the
-// toolchain's own tree is the one load that may, and it announces itself by covering the
+fn first_segment(name: Bytes) -> Bytes =
+  match bytes_index_of(name, b".") { None -> name, Some(i) -> bytes_slice(name, 0, i) }
+
+// A root module under a built-in package's prefix, which no user's file may claim; the
+// toolchain's own std tree is the one load that may, and it announces itself by covering the
 // whole shipped set.
 fn std_squats(
   parsed: List<Parsed>,
@@ -722,12 +734,13 @@ fn std_squats(
   if toolchain { [] } else {
     fold(range(0, root_count), [], |acc: List<{ slot: Int, diag: PDiag }>, i: Int| {
       let n = at(parsed, i).name;
-      if !is_std(n) { acc } else {
+      let seg = first_segment(n);
+      if seg != b"std" && seg != b"compiler" { acc } else {
         push(acc, {
           slot: 0 - i - 1,
           diag: pdiag(
             b"E0133",
-            bytes_concat_all([b"`", n, b"` would shadow the built-in package `std`"]),
+            bytes_concat_all([b"`", n, b"` would shadow the built-in package `", seg, b"`"]),
             [
               plabel(
                 dummy_span(),
@@ -735,7 +748,9 @@ fn std_squats(
                 b"this file claims a module under the toolchain's own prefix",
               ),
             ],
-            [b"`std` names the modules the toolchain ships; rename the file or the directory"],
+            [
+              b"`std` and `compiler` name the modules the toolchain ships; rename the file or the directory",
+            ],
           ),
         })
       }
@@ -772,6 +787,7 @@ fn analyse_closure(
           tables.pkgs,
           tables.mod_pkg,
           tables.std,
+          tables.compiler,
           tables.shelf,
         ) {
         Failed(ds) -> Refused(map(ds, outside_every_module)),
@@ -1057,10 +1073,17 @@ pub fn claims_dump(
   shelf: Int = 0,
 ) -> String = {
   let mods = map(parse_all(sources), |p: Parsed| p.module);
-  // The published table ends with the built-in std package; the shelf sits one past it.
+  // The published table ends with the built-in packages; the shelf sits one past them.
   let packaged = if len(pkgs) == 0 { no_pkgs(mods) }
-  else { { pkgs: pkgs, mod_pkg: mod_pkg, std: shelf - 1, shelf: shelf } };
-  match resolve_packaged(mods, packaged.pkgs, packaged.mod_pkg, packaged.std, packaged.shelf) {
+  else { { pkgs: pkgs, mod_pkg: mod_pkg, std: shelf - 2, compiler: shelf - 1, shelf: shelf } };
+  match resolve_packaged(
+      mods,
+      packaged.pkgs,
+      packaged.mod_pkg,
+      packaged.std,
+      packaged.compiler,
+      packaged.shelf,
+    ) {
     Failed(_) -> panic("a program the front end checked does not resolve"),
     Resolved_(x) -> match update_shapes(x.r, x.mods) {
       None -> panic("a program the front end checked does not check"),
@@ -1215,7 +1238,19 @@ fn pull_round(
             },
         }
       } else if ships && !is_shipped(name) {
-        { ..r, diags: push(r.diags, foreign_import(i, import_at(imports, name), p.name, name)) }
+        // The compiler package's internal import: `compiler.costs` means `compiler.spine`.
+        let internal = bytes_concat(b"compiler.", name);
+        if map_contains(present, internal) { r } else {
+          match map_get(shipped, internal) {
+            Some(src) -> { ..r, wanted: map_insert(r.wanted, internal, src) },
+            None -> if is_compiler(p.name) { r } else {
+              {
+                ..r,
+                diags: push(r.diags, foreign_import(i, import_at(imports, name), p.name, name)),
+              }
+            },
+          }
+        }
       } else { r }
     })
   })
@@ -2850,7 +2885,7 @@ test "the warnings come first, then the order and the module frame" {
   assert(
     bytes_starts_with(
       bytes_of_string(front_dump(program())),
-      b"diag 0 98\ncode 5\nW0611severity 7\nwarningmessage 28\ntype `m.Shape` is never usedlabel 20\n0 46 51 1\nnever usedorder _ 10\nmodule 1\nmpkg  0\npkg std 0\nmodpkg _ 7\npkg 1\n0module m 72\nindex 1\n0item 5\nm.logitem 7\nm.Shapeitem 5\nm.Dotitem 6\nm.Lineitem 5\nm.saydef m.say ",
+      b"diag 0 98\ncode 5\nW0611severity 7\nwarningmessage 28\ntype `m.Shape` is never usedlabel 20\n0 46 51 1\nnever usedorder _ 10\nmodule 1\nmpkg  0\npkg std 0\npkg compiler 9\ndep 3\nstdmodpkg _ 7\npkg 1\n0module m 72\nindex 1\n0item 5\nm.logitem 7\nm.Shapeitem 5\nm.Dotitem 6\nm.Lineitem 5\nm.saydef m.say ",
     ),
   )
 }

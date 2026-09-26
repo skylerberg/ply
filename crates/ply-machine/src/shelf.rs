@@ -1,10 +1,9 @@
-//! The shelf the port pulls from: the standard library, and the compiler's own modules shelved
-//! under `compiler.<name>`.
+//! The shelf the port pulls from: the built-in packages' modules, the standard library's
+//! and the compiler's own under `compiler.<name>`.
 //!
 //! A shelved module is resolved by its full dotted name like any other, is kept out of a
 //! program's listings and closures, and cannot be shadowed by a file in a project.
 
-use ply_span::{Diagnostic, Span, codes};
 use ply_ty::ModuleName;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -39,7 +38,7 @@ pub fn sources() -> &'static [(String, String)] {
             .map(|(name, text)| (name.to_string(), text.to_string()))
             .chain(
                 ply_compiler::sources()
-                    .map(|(name, text)| (format!("{COMPILER_ROOT}.{name}"), shelved(text))),
+                    .map(|(name, text)| (format!("{COMPILER_ROOT}.{name}"), text.to_string())),
             )
             .collect()
     })
@@ -50,41 +49,6 @@ pub fn source(module: &ModuleName) -> Option<&'static str> {
         .iter()
         .find(|(name, _)| name == module.as_str())
         .map(|(_, text)| text.as_str())
-}
-
-/// The compiler names its siblings bare; on the shelf they answer to `compiler.<name>`, so each
-/// import of one is rewritten here. It has to be the text: the front end parses it to resolve the
-/// import and the emitter parses it again to name the call, and a rename either one makes on its
-/// own is a rename the other never sees.
-fn shelved(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 512);
-    for line in text.split_inclusive('\n') {
-        match line.strip_prefix("import ") {
-            Some(rest) if is_compiler_module(head_segment(rest)) => {
-                out.push_str("import ");
-                out.push_str(COMPILER_ROOT);
-                out.push('.');
-                out.push_str(rest);
-            }
-            _ => out.push_str(line),
-        }
-    }
-    out
-}
-
-/// The first dotted segment of the module path an import line opens with.
-fn head_segment(rest: &str) -> &str {
-    let path = rest
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
-        .next()
-        .unwrap_or("");
-    path.split('.').next().unwrap_or("")
-}
-
-fn is_compiler_module(name: &str) -> bool {
-    ply_compiler::MODULES
-        .iter()
-        .any(|(module, _)| *module == name)
 }
 
 pub fn pseudo_path(module: &ModuleName) -> PathBuf {
@@ -102,24 +66,6 @@ pub fn is_pseudo_path(path: &Path) -> bool {
         || path
             .to_str()
             .is_some_and(|p| p.starts_with(&format!("{COMPILER_PSEUDO_ROOT}/")))
-}
-
-/// A project file whose path would name a shelved compiler module, which nothing may shadow;
-/// `std` is the built-in package's prefix, colliding with which is the front end's to report.
-pub fn reserved_diagnostic(file: &Path, name: &str) -> Diagnostic {
-    Diagnostic::error(
-        codes::RESERVED_MODULE_NAME,
-        format!(
-            "`{}` would be the module `{name}`, and `{COMPILER_ROOT}` is reserved",
-            file.display()
-        ),
-    )
-    .primary(
-        Span::DUMMY,
-        "this file would shadow the compiler's own modules",
-    )
-    .note("`compiler` and everything under it name the compiler modules embedded in `ply`; `compiler.fmt` is the formatter `ply fmt` runs")
-    .note("rename the file or the directory it sits in")
 }
 
 /// The three store versions a decode refuses a mismatch of, as the runtime's store keeps them.

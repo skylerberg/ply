@@ -163,15 +163,22 @@ fn a_non_path_dependency_is_told_what_resolves_today() {
 #[test]
 fn a_dependency_may_not_reach_back_into_the_root_package() {
     let dir = graph();
-    std::fs::write(dir.path().join("app/extra.ply"), "fn shared() -> Int = 9\n").unwrap();
+    // `onlyroot` exists only in the root package. A bare import inside a dependency names
+    // that package's own modules and nothing else, so the root's module is invisible to
+    // `lib`: the import simply finds no module.
+    std::fs::write(
+        dir.path().join("app/onlyroot.ply"),
+        "fn shared() -> Int = 9\n",
+    )
+    .unwrap();
     std::fs::write(
         dir.path().join("lib/answer.ply"),
-        "import extra\npub fn answer() -> Int = extra::shared()\n",
+        "import onlyroot\npub fn answer() -> Int = onlyroot::shared()\n",
     )
     .unwrap();
     let out = ply(dir.path()).args(["check", "app"]).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("E0132"), "{err}");
-    assert!(err.contains("reach back"), "{err}");
+    assert!(err.contains("E0106"), "{err}");
+    assert!(err.contains("no module named `onlyroot`"), "{err}");
 }
