@@ -1117,8 +1117,8 @@ fn bind(args: &crate::hosts::HostsOptions, loaded: &crate::load::Loaded) -> Resu
         .map_err(|diagnostics| ("NotBound", diagnostics))?;
     // Built only for a schema: this command runs nothing else.
     let constant = |name: &str| {
-        let backend = crate::support::prover_backend(None, loaded)?;
-        crate::support::enter_constant(backend.map(|(provider, _)| provider), name)
+        let backend = crate::support::prover_backend(loaded)?;
+        crate::support::enter_constant(Some(backend), name)
     };
     let schema = schema_view(&loaded.check, db.as_ref(), &constant)
         .map_err(|diagnostic| ("NotBound", vec![diagnostic]))?;

@@ -3,7 +3,7 @@
 //! caller reads, and the load incremental over the project's own store.
 
 use ply_eval::host::HostRegistry;
-use ply_eval::{BackendKind, BackendSpec, Machine, Provider, Value};
+use ply_eval::{Machine, Provider, Value};
 use ply_span::{SourceId, Span};
 use ply_ty::Front;
 use std::collections::HashMap;
@@ -156,9 +156,7 @@ fn entered_with(inner: &str, host: bool) -> Value {
         [("m".to_string(), OUTER.to_string())].into_iter().collect();
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
     let mut machine = Machine::new(&front);
-    machine.set_compiled(unit.attach(&BackendSpec {
-        kind: BackendKind::C,
-    }));
+    machine.set_compiled(unit.attach());
     let mut registry = HostRegistry::new();
     ply_machine::register_with(
         &mut registry,
@@ -266,9 +264,7 @@ fn a_program_that_does_not_check_is_refused_with_its_diagnostics() {
         [("m".to_string(), OUTER.to_string())].into_iter().collect();
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
     let mut machine = Machine::new(&front);
-    machine.set_compiled(unit.attach(&BackendSpec {
-        kind: BackendKind::C,
-    }));
+    machine.set_compiled(unit.attach());
     let mut registry = HostRegistry::new();
     ply_machine::register(&mut registry);
     let binding = registry.bind(&front.check).expect("the machine ops bind");
@@ -390,9 +386,7 @@ fn a_reload_after_an_edit_enters_the_new_program() {
 
     let call = |entry: &str, arg: Option<String>| {
         let mut machine = Machine::new(&front);
-        machine.set_compiled(unit.attach(&BackendSpec {
-            kind: BackendKind::C,
-        }));
+        machine.set_compiled(unit.attach());
         machine.set_host_binding(Arc::clone(&binding));
         let args = arg.iter().map(Value::str).collect::<Vec<Value>>();
         machine
@@ -570,9 +564,7 @@ fn main(root: String) -> Bool / {machine.configure[m], machine.load[m], machine.
         [("m".to_string(), outer.to_string())].into_iter().collect();
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
     let mut machine = Machine::new(&front);
-    machine.set_compiled(unit.attach(&BackendSpec {
-        kind: BackendKind::C,
-    }));
+    machine.set_compiled(unit.attach());
     let mut registry = HostRegistry::new();
     ply_machine::register(&mut registry);
     let binding = registry.bind(&front.check).expect("the machine ops bind");

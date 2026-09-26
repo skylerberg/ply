@@ -1,4 +1,4 @@
-use crate::fixture::{Compiled, TierExecutor};
+use crate::fixture::Compiled;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
@@ -90,24 +90,16 @@ fn bind(compiled: &Compiled, entries: Vec<(HostOp, Arc<dyn HostHandler>)>) -> Ar
 }
 
 fn run(compiled: &Compiled, store: &mut Store, binding: Option<&Arc<HostBinding>>) -> RunReport {
-    let selection = select(
-        &compiled.check,
-        &compiled.hashes,
-        store,
-        &Plan::default(),
-        &ply_test::Engine::Evaluator,
-    );
+    let selection = select(&compiled.check, &compiled.hashes, store, &Plan::default());
     let hosting = match binding {
         Some(binding) => Hosting::hermetic().with_binding(Arc::clone(binding)),
         None => Hosting::hermetic(),
     };
-    let (unit, spec) = compiled.tier();
-    let executor = TierExecutor(
-        InterpExecutor::new(&compiled.port)
-            .with_backend(unit, spec)
-            .with_search(Search::default())
-            .with_hosts(hosting),
-    );
+    let unit = compiled.tier();
+    let executor = InterpExecutor::new(&compiled.port)
+        .with_backend(unit)
+        .with_search(Search::default())
+        .with_hosts(hosting);
     ply_test::run_with(
         &selection,
         &compiled.check,

@@ -273,13 +273,7 @@ fn attaching_a_spec_to_every_definition_selects_no_test() {
 
     let front = front(&root).unwrap();
     let store = Store::open(&root).unwrap();
-    let selection = ply_test::select(
-        &front.check,
-        &front.hashes,
-        &store,
-        &Plan::default(),
-        &ply_test::Engine::Evaluator,
-    );
+    let selection = ply_test::select(&front.check, &front.hashes, &store, &Plan::default());
     let nondet = front.check.tests.iter().filter(|t| t.nondet).count();
     assert_eq!(
         selection.to_run.len(),
@@ -362,13 +356,7 @@ fn a_second_run_over_an_unchanged_corpus_selects_nothing() {
 
     let front = front(&root).unwrap();
     let store = Store::open(&root).unwrap();
-    let selection = ply_test::select(
-        &front.check,
-        &front.hashes,
-        &store,
-        &Plan::default(),
-        &ply_test::Engine::Evaluator,
-    );
+    let selection = ply_test::select(&front.check, &front.hashes, &store, &Plan::default());
     let nondet = front.check.tests.iter().filter(|t| t.nondet).count();
     assert_eq!(
         selection.to_run.len(),

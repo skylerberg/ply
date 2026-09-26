@@ -1,4 +1,4 @@
-use crate::fixture::{Compiled, TierExecutor};
+use crate::fixture::Compiled;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
@@ -45,13 +45,11 @@ fn run_report(
     search: Search,
     hosting: Hosting<'_>,
 ) -> RunReport {
-    let (unit, spec) = compiled.tier();
-    let executor = TierExecutor(
-        InterpExecutor::new(&compiled.port)
-            .with_backend(unit, spec)
-            .with_search(search)
-            .with_hosts(hosting),
-    );
+    let unit = compiled.tier();
+    let executor = InterpExecutor::new(&compiled.port)
+        .with_backend(unit)
+        .with_search(search)
+        .with_hosts(hosting);
     ply_test::run_with(
         selection,
         &compiled.check,
@@ -134,13 +132,7 @@ fn run_hosted(source: &str, tasks: bool) -> Ran {
         .unwrap_or_else(|d| panic!("the registry binds: {d:#?}"));
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = select(
-        &compiled.check,
-        &compiled.hashes,
-        &store,
-        &Plan::default(),
-        &ply_test::Engine::Evaluator,
-    );
+    let selection = select(&compiled.check, &compiled.hashes, &store, &Plan::default());
     let search = Search::of(&selection);
     let report = run_report(
         &compiled,
@@ -389,13 +381,7 @@ fn under_simulation_once_the_same_send_runs_exactly_once_and_is_not_cached() {
     let root = TempRoot::new();
     let mut store = root.store();
     let plan = Plan::once(ply_eval::Seed::default());
-    let selection = select(
-        &compiled.check,
-        &compiled.hashes,
-        &store,
-        &plan,
-        &ply_test::Engine::Evaluator,
-    );
+    let selection = select(&compiled.check, &compiled.hashes, &store, &plan);
     assert!(
         !plan.re_executes(),
         "the fixture only bites if this plan really runs the test once"
@@ -434,13 +420,7 @@ fn a_hermetic_refusal_says_that_host_would_not_repair_a_searched_test() {
     let counter = Arc::new(Counting::default());
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = select(
-        &compiled.check,
-        &compiled.hashes,
-        &store,
-        &Plan::default(),
-        &ply_test::Engine::Evaluator,
-    );
+    let selection = select(&compiled.check, &compiled.hashes, &store, &Plan::default());
     let report = run_report(
         &compiled,
         &mut store,
@@ -474,13 +454,7 @@ fn measure_reduction_re_executes_a_once_plan_and_is_refused() {
     let root = TempRoot::new();
     let mut store = root.store();
     let plan = Plan::once(ply_eval::Seed::default());
-    let selection = select(
-        &compiled.check,
-        &compiled.hashes,
-        &store,
-        &plan,
-        &ply_test::Engine::Evaluator,
-    );
+    let selection = select(&compiled.check, &compiled.hashes, &store, &plan);
     let report = run_report(
         &compiled,
         &mut store,
@@ -521,13 +495,7 @@ test "a det test over a deterministic host handler" {
 
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = select(
-        &compiled.check,
-        &compiled.hashes,
-        &store,
-        &Plan::default(),
-        &ply_test::Engine::Evaluator,
-    );
+    let selection = select(&compiled.check, &compiled.hashes, &store, &Plan::default());
     let search = Search::of(&selection);
     let report = run_report(
         &compiled,
@@ -589,13 +557,7 @@ test/nondet "spawns without a binding" {
     let counter = Arc::new(Counting::default());
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = select(
-        &compiled.check,
-        &compiled.hashes,
-        &store,
-        &Plan::default(),
-        &ply_test::Engine::Evaluator,
-    );
+    let selection = select(&compiled.check, &compiled.hashes, &store, &Plan::default());
     let search = Search::of(&selection);
     let report = run_report(
         &compiled,

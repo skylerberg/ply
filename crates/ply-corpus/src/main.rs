@@ -91,8 +91,6 @@ struct BenchArgs {
     corpus: PathBuf,
     /// Repeats per scenario; the fastest run is reported.
     repeats: usize,
-    /// Attach a compiled backend, as `ply test --backend` spells it.
-    backend: Option<String>,
     json: bool,
 }
 
@@ -102,8 +100,6 @@ struct SweepArgs {
     out: PathBuf,
     /// Sizes to sweep, each `modules,defs_per_module,tests`.
     sizes: Vec<String>,
-    /// Attach a compiled backend to every size, as `ply test --backend` spells it.
-    backend: Option<String>,
     seed: u64,
     repeats: usize,
     json: bool,
@@ -951,7 +947,7 @@ fn run_plan(plan: serde_json::Value) -> Result<()> {
         "gen" => generate_corpus(serde_json::from_value(args)?),
         "bench" => {
             let args: BenchArgs = serde_json::from_value(args)?;
-            let report = bench_report(&args.corpus, args.repeats, args.backend.as_deref())?;
+            let report = bench_report(&args.corpus, args.repeats)?;
             emit_report(&report, args.json)
         }
         "sweep" => sweep(serde_json::from_value(args)?),
@@ -1148,7 +1144,7 @@ fn sweep(args: SweepArgs) -> Result<()> {
         ));
         gen_report(&root, &shape_of(&spec), false)
             .with_context(|| format!("the corpus for `{size}` does not compile"))?;
-        reports.push(bench_report(&root, args.repeats, args.backend.as_deref())?);
+        reports.push(bench_report(&root, args.repeats)?);
     }
 
     if args.json {
@@ -1168,11 +1164,7 @@ fn sweep(args: SweepArgs) -> Result<()> {
 
 /// The bench, run in the corpus package: the corpus drives the real `ply` and reads its
 /// reports. Answers the report as decoded JSON; its `rendered` member is the text form.
-fn bench_report(
-    corpus: &std::path::Path,
-    repeats: usize,
-    backend: Option<&str>,
-) -> Result<serde_json::Value> {
+fn bench_report(corpus: &std::path::Path, repeats: usize) -> Result<serde_json::Value> {
     let corpus = &corpus
         .canonicalize()
         .with_context(|| format!("`{}` does not exist", corpus.display()))?;
@@ -1181,7 +1173,6 @@ fn bench_report(
         vec![
             ply_eval::Value::str(corpus.to_string_lossy()),
             ply_eval::Value::Int(repeats as i64),
-            ply_eval::Value::str(backend.unwrap_or("")),
         ],
         corpus,
         &std::path::PathBuf::from(ply_corpus::cmd::ply_binary()?),

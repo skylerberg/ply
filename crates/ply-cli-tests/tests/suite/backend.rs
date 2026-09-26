@@ -64,12 +64,9 @@ fn ply(dir: &Path) -> Command {
     cmd
 }
 
-fn run(dir: &Path, backend: Option<&str>) -> Value {
+fn run(dir: &Path) -> Value {
     let mut cmd = ply(dir);
     cmd.arg("test").arg("-j").arg("1").arg("--json");
-    if let Some(backend) = backend {
-        cmd.arg("--backend").arg(backend);
-    }
     let out = cmd.output().unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
     serde_json::from_str(&text)
@@ -90,7 +87,7 @@ fn u64_at(report: &Value, path: &[&str]) -> u64 {
 #[test]
 fn the_honest_code_generator_agrees_over_the_corpus_and_enters_it() {
     let dir = project(CORPUS);
-    let report = run(dir.path(), Some("c"));
+    let report = run(dir.path());
 
     assert_eq!(report["ok"], Value::Bool(true), "{report}");
     assert_eq!(u64_at(&report, &["summary", "failed"]), 0, "{report}");
@@ -134,40 +131,20 @@ fn the_honest_code_generator_agrees_over_the_corpus_and_enters_it() {
 }
 
 #[test]
-fn run_attaches_a_backend_to_main_and_refuses_a_spec_it_cannot_parse() {
+fn run_attaches_a_backend_to_main() {
     let dir = project(
         "fn double(x: Int) -> Int = x * 2\nfn main() -> Int = fold(range(0, 10), 0, |acc: Int, i: Int| acc + double(i))\n",
     );
-    let out = ply(dir.path())
-        .arg("run")
-        .arg("--json")
-        .arg("--backend")
-        .arg("c")
-        .output()
-        .unwrap();
+    let out = ply(dir.path()).arg("run").arg("--json").output().unwrap();
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["value"], Value::String("90".into()), "{report}");
     assert!(out.status.success(), "{report}");
-
-    let out = ply(dir.path())
-        .arg("run")
-        .arg("--json")
-        .arg("--backend")
-        .arg("nonsense")
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let text = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        text.contains(ply_span::codes::BACKEND_UNAVAILABLE),
-        "{text}"
-    );
 }
 
 #[test]
 fn a_backed_run_that_selects_nothing_compiles_nothing() {
     let dir = project(CORPUS);
-    let report = run(dir.path(), Some("c"));
+    let report = run(dir.path());
     assert!(
         u64_at(&report, &["backend", "fragment"]) > 0,
         "the control did not compile a fragment, so the next assertion proves nothing: {}",
@@ -176,8 +153,6 @@ fn a_backed_run_that_selects_nothing_compiles_nothing() {
 
     let out = ply(dir.path())
         .arg("test")
-        .arg("--backend")
-        .arg("c")
         .arg("--filter")
         .arg("nothing-matches-this")
         .arg("--json")
@@ -197,26 +172,6 @@ fn a_backed_run_that_selects_nothing_compiles_nothing() {
             .is_some_and(|d| d.is_empty()),
         "a run that built no backend reported a disagreement about which engine it was: {report}"
     );
-}
-
-#[test]
-fn a_backend_name_that_is_not_a_spelling_of_anything_is_refused() {
-    let dir = project(CORPUS);
-    for spec in ["c:reference", "clif", "wrong:off-by-one"] {
-        let out = ply(dir.path())
-            .arg("test")
-            .arg("--backend")
-            .arg(spec)
-            .arg("--json")
-            .output()
-            .unwrap();
-        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(report["ok"], Value::Bool(false), "`{spec}`: {report}");
-        assert_eq!(
-            report["diagnostics"][0]["code"], "E0450",
-            "`{spec}`: {report}"
-        );
-    }
 }
 
 /// A label is a trailing parameter in compiled code and a name in the machine's, so one definition
@@ -245,26 +200,14 @@ test "each label reaches the clause written for it" { assert_eq(both(b"ping"), 1
 "#;
 
 #[test]
-fn a_definition_generic_over_a_label_answers_the_same_on_both_engines() {
+fn a_definition_generic_over_a_label_answers_through_the_compiled_tier() {
     let dir = project(TWO_LABELS);
-    let engines: [&[&str]; 2] = [&[], &["--backend", "c"]];
-    for engine in engines {
-        let out = ply(dir.path())
-            .arg("run")
-            .arg("--json")
-            .args(engine)
-            .output()
-            .unwrap();
-        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(
-            report["value"],
-            Value::String("19".into()),
-            "{engine:?}: {report}"
-        );
-        assert!(out.status.success(), "{engine:?}: {report}");
-    }
+    let out = ply(dir.path()).arg("run").arg("--json").output().unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["value"], Value::String("19".into()), "{report}");
+    assert!(out.status.success(), "{report}");
 
-    let report = run(dir.path(), Some("c"));
+    let report = run(dir.path());
     assert_eq!(report["ok"], Value::Bool(true), "{report}");
     assert!(
         u64_at(&report, &["backend", "entered"]) > 0,
@@ -284,7 +227,7 @@ test "doubles" { assert_eq(double(21), 42) }
 test "wrong" { assert_eq(double(21), 41) }
 "#,
     );
-    let report = run(dir.path(), Some("c"));
+    let report = run(dir.path());
     assert_eq!(u64_at(&report, &["summary", "failed"]), 1, "{report}");
     assert_eq!(
         u64_at(&report, &["backend", "entered"]),
