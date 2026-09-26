@@ -5,49 +5,7 @@ use ply_codegen::c::{bundle, producer};
 use ply_span::{Diagnostic, Span, codes};
 use std::path::{Path, PathBuf};
 
-/// The program `ply` runs, one module per file of `crates/ply-cli/ply`, each named by its stem.
-/// The entry point is `ply.main`, which dispatches on the command word.
-pub const PROGRAM_SOURCES: &[(&str, &str)] = &[
-    ("appends", include_str!("../../ply-cli/ply/appends.ply")),
-    ("args", include_str!("../../ply-cli/ply/args.ply")),
-    ("bootstrap", include_str!("../../ply-cli/ply/bootstrap.ply")),
-    ("build", include_str!("../../ply-cli/ply/build.ply")),
-    ("cache", include_str!("../../ply-cli/ply/cache.ply")),
-    ("callers", include_str!("../../ply-cli/ply/callers.ply")),
-    ("check", include_str!("../../ply-cli/ply/check.ply")),
-    ("claims", include_str!("../../ply-cli/ply/claims.ply")),
-    ("cmdline", include_str!("../../ply-cli/ply/cmdline.ply")),
-    ("defs", include_str!("../../ply-cli/ply/defs.ply")),
-    (
-        "diagnostic",
-        include_str!("../../ply-cli/ply/diagnostic.ply"),
-    ),
-    ("doc", include_str!("../../ply-cli/ply/doc.ply")),
-    ("entry", include_str!("../../ply-cli/ply/entry.ply")),
-    ("explain", include_str!("../../ply-cli/ply/explain.ply")),
-    ("fmt", include_str!("../../ply-cli/ply/fmt.ply")),
-    ("gzip", include_str!("../../ply-cli/ply/gzip.ply")),
-    ("hashes", include_str!("../../ply-cli/ply/hashes.ply")),
-    ("env", include_str!("../../ply-cli/ply/env.ply")),
-    ("machine", include_str!("../../ply-cli/ply/machine.ply")),
-    ("hosts", include_str!("../../ply-cli/ply/hosts.ply")),
-    ("paths", include_str!("../../ply-cli/ply/paths.ply")),
-    ("ply", include_str!("../../ply-cli/ply/ply.ply")),
-    ("program", include_str!("../../ply-cli/ply/program.ply")),
-    ("prove", include_str!("../../ply-cli/ply/prove.ply")),
-    ("replace", include_str!("../../ply-cli/ply/replace.ply")),
-    ("report", include_str!("../../ply-cli/ply/report.ply")),
-    ("review", include_str!("../../ply-cli/ply/review.ply")),
-    ("run", include_str!("../../ply-cli/ply/run.ply")),
-    ("show", include_str!("../../ply-cli/ply/show.ply")),
-    ("signature", include_str!("../../ply-cli/ply/signature.ply")),
-    ("sources", include_str!("../../ply-cli/ply/sources.ply")),
-    ("stdlib", include_str!("../../ply-cli/ply/stdlib.ply")),
-    ("surface", include_str!("../../ply-cli/ply/surface.ply")),
-    ("style", include_str!("../../ply-cli/ply/style.ply")),
-    ("tests", include_str!("../../ply-cli/ply/tests.ply")),
-    ("walk", include_str!("../../ply-cli/ply/walk.ply")),
-];
+include!(concat!(env!("OUT_DIR"), "/program_sources.rs"));
 
 /// Where the built program and the digest of the sources it was built from are committed.
 pub const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../ply-cli/bootstrap");
@@ -74,7 +32,9 @@ pub fn program_sources() -> Vec<(String, String)> {
 /// hands it out, the emitter that compiled it, and the three store versions a decode refuses a
 /// mismatch of. The artifact the program is built into carries the same digest as its stamp.
 pub fn identity() -> String {
-    ply_machine::artifact::toolchain_stamp(&producer::digest_of(&program_sources()))
+    let mut inputs = program_sources();
+    inputs.push(("ply.pkg".to_string(), PROGRAM_MANIFEST.to_string()));
+    ply_machine::artifact::toolchain_stamp(&producer::digest_of(&inputs))
 }
 
 /// Where a program built for `identity` is kept between runs, beside the emitter's own stages. The
@@ -170,6 +130,7 @@ fn write_sources(dir: &Path) -> std::io::Result<()> {
     for (name, text) in PROGRAM_SOURCES {
         std::fs::write(dir.join(format!("{name}.ply")), text)?;
     }
+    std::fs::write(dir.join("ply.pkg"), PROGRAM_MANIFEST)?;
     Ok(())
 }
 
