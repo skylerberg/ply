@@ -1041,8 +1041,8 @@ Strings are indexed by character, bytes by byte.
 The built-in package, shipped inside `ply` and pre-seeded for every load — an
 implicit dependency of every package, no declaration needed: `import
 std.<name>`. Its tests and obligations are skipped unless you pass `--std`.
-`ply std` lists it, `ply std --show std.json` prints a source, and a changed
-standard library warns `W0605`.
+`ply std` lists it, `ply std --show std.json` prints one source and `ply std
+--show` alone prints every one; a changed standard library warns `W0605`.
 
 ### 13.1 `std.net` — sockets
 
@@ -1527,7 +1527,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, `--backend`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE`, `--config-schema`, `--db-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
-| `ply std` | `--show MODULE`, `--digest`; no path |
+| `ply std` | `--show [MODULE]`, `--digest`; no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
 | `ply doc NAME [path]` | a definition or builtin: signature with the written parameter names, the `//` lines above it, place, hash, footprint; a builtin's note comes from the compiler's table |
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change |
