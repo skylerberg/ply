@@ -968,6 +968,11 @@ fn run_plan(plan: serde_json::Value) -> Result<()> {
         "w6" => w6(serde_json::from_value(args)?),
         "w6-ladder" => w6_ladder(serde_json::from_value(args)?),
         "regions" => regions(serde_json::from_value(args)?),
+        "real" => {
+            let args: RealArgs = serde_json::from_value(args)?;
+            let report = real_report(!args.no_tests)?;
+            emit_report(&report, args.json)
+        }
         other => anyhow::bail!("the corpus has no `{other}` command"),
     }
 }
@@ -1154,6 +1159,56 @@ fn bench_report(
         other => anyhow::bail!("`bench.run` answered {other}, not an `Ok` or an `Err`"),
     }?;
     serde_json::from_str(&answered).context("the bench's report is not JSON")
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RealArgs {
+    #[serde(default)]
+    no_tests: bool,
+    #[serde(default)]
+    json: bool,
+}
+
+/// The real-code row: the compiler and the CLI themselves, front-ended and tested, pinned by
+/// digest. Run in the corpus package; answers the report as decoded JSON.
+fn real_report(tests: bool) -> Result<serde_json::Value> {
+    let members = ply_corpus::cmd::real_members()?;
+    let [(cname, cdir, cdigest), (lname, ldir, ldigest)] = members;
+    let stage = cdir
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("the real trees have no stage"))?
+        .to_path_buf();
+    let value = ply_corpus::cmd::run_ply_subcommand(
+        "real.run",
+        vec![
+            ply_eval::Value::str(cname),
+            ply_eval::Value::str(cdir.to_string_lossy()),
+            ply_eval::Value::str(cdigest),
+            ply_eval::Value::str(lname),
+            ply_eval::Value::str(ldir.to_string_lossy()),
+            ply_eval::Value::str(ldigest),
+            ply_eval::Value::Bool(tests),
+        ],
+        &stage,
+        &std::path::PathBuf::from(ply_corpus::cmd::ply_binary()?),
+    )?;
+    let answered: String = match &value {
+        ply_eval::Value::Ctor { name, args } if name.as_str() == "Ok" && args.len() == 1 => {
+            match &args[0] {
+                ply_eval::Value::Str(text) => Ok::<String, anyhow::Error>(text.to_string()),
+                other => anyhow::bail!("`real.run` answered {other}, not the report's text"),
+            }
+        }
+        ply_eval::Value::Ctor { name, args } if name.as_str() == "Err" && args.len() == 1 => {
+            match &args[0] {
+                ply_eval::Value::Str(why) => anyhow::bail!("{why}"),
+                other => anyhow::bail!("`real.run` refused with {other}"),
+            }
+        }
+        other => anyhow::bail!("`real.run` answered {other}, not an `Ok` or an `Err`"),
+    }?;
+    serde_json::from_str(&answered).context("the real-code report is not JSON")
 }
 
 /// Parses `modules,defs_per_module,tests`.
