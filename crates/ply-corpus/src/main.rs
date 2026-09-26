@@ -1,9 +1,7 @@
 use anyhow::{Context, Result};
-use ply_corpus::build::generate;
 use ply_corpus::measure;
 use ply_corpus::regions;
 use ply_corpus::spec::CorpusSpec;
-use ply_corpus::write;
 use std::path::PathBuf;
 
 #[derive(Debug, serde::Deserialize)]
@@ -23,7 +21,7 @@ struct RegionsArgs {
     json: bool,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ShapeArgs {
     seed: u64,
     modules: usize,
@@ -1015,82 +1013,128 @@ fn regions(args: RegionsArgs) -> Result<()> {
 }
 
 fn generate_corpus(args: GenArgs) -> Result<()> {
-    let spec: CorpusSpec = args.shape.into();
-    spec.validate()?;
-
-    let corpus = generate(&spec);
-    let written = write::write(&args.out, &spec, &corpus)?;
-    let manifest = written.manifest;
-
-    let verified = if args.no_verify {
-        None
-    } else {
-        Some(ply_corpus::verify(&args.out).context("the generated corpus does not compile")?)
-    };
+    let report = gen_report(&args.out, &args.shape, args.no_verify)?;
+    let manifest = &report["manifest"];
+    let verified = report["verified"].as_bool().unwrap_or(false);
 
     if args.json {
-        let value = serde_json::json!({
-            "root": args.out.display().to_string(),
-            "manifest": manifest,
-            "verified": verified.as_ref().map(|v| serde_json::json!({
-                "definitions": v.definitions,
-                "tests": v.tests,
-                "passed": v.passed,
-                "groups": v.groups,
-                "largest_group": v.largest_group,
-                "seeded": v.seeded,
-            })),
-        });
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
 
     println!("wrote {}", args.out.display());
     println!(
         "  {} modules · {} definitions ({} effectful) · {} tests ({} nondet)",
-        manifest.modules,
-        manifest.definitions,
-        manifest.effectful_definitions,
-        manifest.tests,
-        manifest.nondet_tests
+        manifest["modules"].as_i64().unwrap_or(0),
+        manifest["definitions"].as_i64().unwrap_or(0),
+        manifest["effectful_definitions"].as_i64().unwrap_or(0),
+        manifest["tests"].as_i64().unwrap_or(0),
+        manifest["nondet_tests"].as_i64().unwrap_or(0),
     );
-    if manifest.concurrency.tests > 0 {
-        let c = &manifest.concurrency;
+    if manifest["concurrency"]["tests"].as_i64().unwrap_or(0) > 0 {
+        let c = &manifest["concurrency"];
         println!(
             "  {} concurrent tests · {} tasks × {} steps over {} shards · contention {:.2} (asked {:.2})",
-            c.tests,
-            c.tasks_per_test,
-            c.steps_per_task,
-            c.shards_per_test,
-            c.contention,
-            c.conflict_density
+            c["tests"].as_i64().unwrap_or(0),
+            c["tasks_per_test"].as_i64().unwrap_or(0),
+            c["steps_per_task"].as_i64().unwrap_or(0),
+            c["shards_per_test"].as_i64().unwrap_or(0),
+            c["contention"].as_f64().unwrap_or(0.0),
+            c["conflict_density"].as_f64().unwrap_or(0.0),
         );
     }
-    if manifest.specs.obligations > 0 {
-        let s = &manifest.specs;
+    if manifest["specs"]["obligations"].as_i64().unwrap_or(0) > 0 {
+        let sp = &manifest["specs"];
         println!(
             "  {} definitions carry an obligation · {} do not",
-            s.specified_definitions, s.unspecified_definitions
+            sp["specified_definitions"].as_i64().unwrap_or(0),
+            sp["unspecified_definitions"].as_i64().unwrap_or(0),
         );
         println!(
             "  {} obligations ({} laws) · built to be {} decided · {} sampled · {} gaps",
-            s.obligations, s.laws, s.decided, s.sampled, s.gaps
+            sp["obligations"].as_i64().unwrap_or(0),
+            sp["laws"].as_i64().unwrap_or(0),
+            sp["decided"].as_i64().unwrap_or(0),
+            sp["sampled"].as_i64().unwrap_or(0),
+            sp["gaps"].as_i64().unwrap_or(0),
         );
     }
     println!(
         "  {} KiB of source · mean out-degree {:.2} · {} distinct resources",
-        manifest.bytes / 1024,
-        manifest.mean_out_degree,
-        manifest.distinct_resources
+        manifest["bytes"].as_i64().unwrap_or(0) / 1024,
+        manifest["mean_out_degree"].as_f64().unwrap_or(0.0),
+        manifest["distinct_resources"].as_i64().unwrap_or(0),
     );
-    match verified {
-        Some(v) => println!(
-            "  verified: {} tests passed in {} concurrency group(s), largest {}",
-            v.passed, v.groups, v.largest_group
-        ),
-        None => println!("  not verified (--no-verify)"),
+    if verified {
+        println!("  verified: the corpus compiles and its tests pass");
+    } else if !args.no_verify {
+        println!("  not verified");
+    } else {
+        println!("  not verified (--no-verify)");
     }
     Ok(())
+}
+
+/// The generator, run in the corpus package: the corpus written and (unless asked otherwise)
+/// verified by the product. Answers the report as decoded JSON: root, manifest, verified.
+fn gen_report(
+    out: &std::path::Path,
+    shape: &ShapeArgs,
+    no_verify: bool,
+) -> Result<serde_json::Value> {
+    // The filesystem root is the deepest ancestor of `out` that exists (the generator creates
+    // the rest); the program works with `out` relative to it, and spawns `ply` at the
+    // absolute spelling.
+    let mut ancestor = out.to_path_buf();
+    let mut relative = std::path::PathBuf::new();
+    loop {
+        if ancestor.exists() {
+            break;
+        }
+        relative = match ancestor.file_name() {
+            Some(name) => std::path::PathBuf::from(name).join(&relative),
+            None => std::path::PathBuf::new(),
+        };
+        if !ancestor.pop() {
+            break;
+        }
+    }
+    let root = ancestor
+        .canonicalize()
+        .with_context(|| format!("no ancestor of `{}` exists to write under", out.display()))?;
+    let absolute = root.join(&relative);
+    let dir = if relative.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        relative.to_string_lossy().into_owned()
+    };
+    let value = ply_corpus::cmd::run_ply_subcommand(
+        "gen.run",
+        vec![
+            ply_eval::Value::str(dir),
+            ply_eval::Value::str(absolute.to_string_lossy()),
+            ply_eval::Value::str(serde_json::to_string(shape)?),
+            ply_eval::Value::Bool(no_verify),
+        ],
+        &root,
+        &std::path::PathBuf::from(ply_corpus::cmd::ply_binary()?),
+    )?;
+    let answered: String = match &value {
+        ply_eval::Value::Ctor { name, args } if name.as_str() == "Ok" && args.len() == 1 => {
+            match &args[0] {
+                ply_eval::Value::Str(text) => Ok::<String, anyhow::Error>(text.to_string()),
+                other => anyhow::bail!("`gen.run` answered {other}, not the report's text"),
+            }
+        }
+        ply_eval::Value::Ctor { name, args } if name.as_str() == "Err" && args.len() == 1 => {
+            match &args[0] {
+                ply_eval::Value::Str(why) => anyhow::bail!("{why}"),
+                other => anyhow::bail!("`gen.run` refused with {other}"),
+            }
+        }
+        other => anyhow::bail!("`gen.run` answered {other}, not an `Ok` or an `Err`"),
+    }?;
+    serde_json::from_str(&answered).context("the generator's report is not JSON")
 }
 
 fn sweep(args: SweepArgs) -> Result<()> {
@@ -1102,8 +1146,7 @@ fn sweep(args: SweepArgs) -> Result<()> {
             "m{}_d{}_t{}",
             spec.modules, spec.defs_per_module, spec.tests
         ));
-        write::write(&root, &spec, &generate(&spec))?;
-        ply_corpus::verify(&root)
+        gen_report(&root, &shape_of(&spec), false)
             .with_context(|| format!("the corpus for `{size}` does not compile"))?;
         reports.push(bench_report(&root, args.repeats, args.backend.as_deref())?);
     }
@@ -1209,6 +1252,29 @@ fn real_report(tests: bool) -> Result<serde_json::Value> {
         other => anyhow::bail!("`real.run` answered {other}, not an `Ok` or an `Err`"),
     }?;
     serde_json::from_str(&answered).context("the real-code report is not JSON")
+}
+
+/// The shape flags a sweep size carries, for the generator's spec JSON.
+fn shape_of(spec: &CorpusSpec) -> ShapeArgs {
+    ShapeArgs {
+        seed: spec.seed,
+        modules: spec.modules,
+        defs_per_module: spec.defs_per_module,
+        tests: spec.tests,
+        depth: spec.depth,
+        tables: spec.tables,
+        regions: spec.regions,
+        effect_fraction: spec.effect_fraction,
+        nondet_fraction: spec.nondet_fraction,
+        hub_modules: spec.hub_modules,
+        max_weight: spec.max_weight,
+        concurrent_tests: spec.concurrent_tests,
+        tasks_per_test: spec.tasks_per_test,
+        steps_per_task: spec.steps_per_task,
+        conflict_density: spec.conflict_density,
+        spec_fraction: spec.spec_fraction,
+        specimens_per_module: spec.specimens_per_module,
+    }
 }
 
 /// Parses `modules,defs_per_module,tests`.

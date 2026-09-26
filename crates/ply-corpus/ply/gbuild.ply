@@ -1,0 +1,987 @@
+// Turning a spec and a seed into a corpus. Every choice flows through the seeded SplitMix64 in
+// rng.ply, in the same order the Rust build drew it, so a seed's corpus is the same corpus.
+
+import rng
+import gmodel
+
+pub type Spec = {
+  seed: Int,
+  modules: Int,
+  defs_per_module: Int,
+  tests: Int,
+  depth: Int,
+  tables: Int,
+  regions: Int,
+  effect_fraction: Float,
+  nondet_fraction: Float,
+  hub_modules: Int,
+  max_weight: Int,
+  concurrent_tests: Int,
+  tasks_per_test: Int,
+  steps_per_task: Int,
+  conflict_density: Float,
+  spec_fraction: Float,
+  specimens_per_module: Int,
+}
+
+pub fn packages() -> List<String> =
+  ["store", "billing", "auth", "search", "report", "ingest", "sched", "audit", "mailer", "index"]
+
+pub fn units() -> List<String> =
+  ["core", "api", "model", "rules", "view", "sync", "calc", "state", "query", "admin"]
+
+pub fn verbs() -> List<String> =
+  [
+    "apply",
+    "render",
+    "collect",
+    "resolve",
+    "merge",
+    "score",
+    "tally",
+    "expand",
+    "prune",
+    "align",
+    "stage",
+    "commit",
+    "gather",
+    "rank",
+    "batch",
+    "flush",
+  ]
+
+pub fn table_words() -> List<String> =
+  [
+    "users",
+    "orders",
+    "items",
+    "invoices",
+    "sessions",
+    "events",
+    "prices",
+    "shipments",
+    "carts",
+    "refunds",
+    "coupons",
+    "reviews",
+    "vendors",
+    "payouts",
+    "tickets",
+    "audits",
+  ]
+
+pub fn region_words() -> List<String> =
+  ["hot", "warm", "cold", "edge", "shard", "digest", "window", "bucket"]
+
+pub fn shard_words() -> List<String> =
+  ["lane", "mile", "berth", "slot", "track", "gate", "dock", "aisle"]
+
+// How many calls a definition makes beyond what its shape already requires.
+pub fn max_extras() -> Int = 3
+
+pub fn generate(spec: Spec) -> gmodel::Corpus = {
+  let tables = labels(table_words(), spec.tables);
+  let regions = labels(region_words(), spec.regions);
+  let shards = labels(shard_words(), shards_per_test(spec));
+  let root = rng::new(spec.seed);
+
+  let planned = plan_modules(spec, root);
+  let built = fold(
+    range(0, len(planned)),
+    (planned, gmodel::empty_corpus(tables, regions, shards)),
+    |acc: (List<gmodel::Module>, gmodel::Corpus), id: Int| {
+      let (mods, corpus) = acc;
+      let module = at_mod(mods, id);
+      let (corpus2, defs) = generate_module_defs(spec, root, corpus, mods, id);
+      let module2 = {
+        ..module,
+        defs: defs,
+        needs_effects: fold(defs, false, |acc2: Bool, d: Int|
+          acc2 || len(gmodel::at_def_pub(corpus2, d).footprint) > 0),
+      };
+      (set_mod(mods, id, module2), { ..corpus2, modules: push(corpus2.modules, module2) })
+    },
+  );
+  let corpus1 = mark_public(match built { (_, c) -> c });
+  let corpus2 = attach_claims(spec, root, corpus1);
+  let corpus3 = { ..corpus2, specimens: generate_specimens(spec, corpus2) };
+  let corpus4 = { ..corpus3, laws: generate_laws(root, corpus3) };
+  let corpus5 = { ..corpus4, tests: generate_tests(spec, root, corpus4) };
+  let concurrent = generate_concurrent_tests(spec, root, corpus5);
+  let modules = map(corpus5.modules, |m: gmodel::Module|
+    if fold(concurrent, false, |acc: Bool, t: gmodel::ConcurrentTest| acc || t.module == m.id) {
+      { ..m, needs_effects: true }
+    } else { m });
+  { ..corpus5, concurrent: concurrent, modules: modules }
+}
+
+fn at_mod(mods: List<gmodel::Module>, i: Int) -> gmodel::Module =
+  match list_at(mods, i) { Some(m) -> m, None -> panic("no module") }
+
+fn set_mod(mods: List<gmodel::Module>, i: Int, m: gmodel::Module) -> List<gmodel::Module> =
+  map(range(0, len(mods)), |j: Int| if j == i { m } else { at_mod(mods, j) })
+
+// `count` labels: the vocabulary first, then numbered extensions of it.
+pub fn labels(words: List<String>, count: Int) -> List<String> =
+  map(range(0, count), |i: Int| {
+    let word = at_str(words, i % len(words));
+    if i < len(words) { word } else { word ++ int_to_string(i / len(words)) }
+  })
+
+fn at_str(xs: List<String>, i: Int) -> String = match list_at(xs, i) { Some(s) -> s, None -> "" }
+
+pub fn shards_per_test(spec: Spec) -> Int = {
+  let tasks = if spec.tasks_per_test > 1 { spec.tasks_per_test } else { 1 };
+  1 + round_to_int((1.0 - spec.conflict_density) * float_of_decimal(decimal_of_int(tasks - 1)))
+}
+
+fn round_to_int(f: Float) -> Int =
+  match decimal_of_float(f) {
+    Some(d) -> match int_of_decimal(d, HalfUp) { Some(n) -> n, None -> 0 },
+    None -> 0,
+  }
+
+fn plan_modules(spec: Spec, root: rng::Rng) -> List<gmodel::Module> = {
+  let hub_count = if spec.hub_modules < spec.modules { spec.hub_modules } else { spec.modules };
+  fold(range(0, spec.modules), [], |planned: List<gmodel::Module>, id: Int| {
+    let layer = id * spec.depth / spec.modules;
+    let package = at_str(packages(), layer % len(packages()));
+    let unit = at_str(units(), id % len(units()));
+    let name = package ++ int_to_string(layer) ++ "." ++ unit ++ "_" ++ int_to_string(id);
+    let path = package ++ int_to_string(layer) ++ "/" ++ unit ++ "_" ++ int_to_string(id) ++ ".ply";
+    let r = rng::fork(root, 4096 + id);
+    let (r1, imports) = choose_imports(r, planned, layer, range(0, hub_count));
+    let (r2, m) = rng::between(r1, 2, 5);
+    let (r3, b) = rng::between(r2, 1, 40);
+    push(planned, {
+      id: id,
+      name: name,
+      path: path,
+      layer: layer,
+      imports: imports,
+      defs: [],
+      helper: { name: "stage_" ++ int_to_string(id), m: m, b: b },
+      status_type: "Status" ++ int_to_string(id),
+      ctor_ready: "Ready" ++ int_to_string(id),
+      ctor_idle: "Idle" ++ int_to_string(id),
+      needs_effects: false,
+    })
+  })
+}
+
+// Imports run strictly downward through the layers, so the module graph is acyclic: a skewed
+// few of the layer above, plus the hubs, each at a coin's chance.
+fn choose_imports(
+  r: rng::Rng,
+  planned: List<gmodel::Module>,
+  layer: Int,
+  hubs: List<Int>,
+) -> (rng::Rng, List<Int>) =
+  if layer == 0 { (r, []) } else {
+    let previous = fold(planned, [], |acc: List<Int>, m: gmodel::Module|
+      if m.layer + 1 == layer { push(acc, m.id) } else { acc });
+    let reachable_hubs = fold(hubs, [], |acc: List<Int>, h: Int|
+      match list_at(planned, h) {
+        Some(m) -> if m.layer < layer { push(acc, h) } else { acc },
+        None -> acc,
+      });
+    let (r1, wanted) = rng::between(r, 2, 4);
+    let (r2, chosen) = fold(range(0, wanted), (r1, []), |acc: (rng::Rng, List<Int>), _: Int| {
+      let (r_acc, chosen) = acc;
+      // The chance is drawn only when a hub is there to take, as the Rust short-circuits it.
+      let (r3, from_hub) = if len(reachable_hubs) > 0 { rng::chance(r_acc, 0.45) }
+      else { (r_acc, false) };
+      if from_hub {
+        let (r4, pick_idx) = rng::below(r3, len(reachable_hubs));
+        (
+          r4,
+          if has_int(chosen, at_int(reachable_hubs, pick_idx)) { chosen }
+          else { push(chosen, at_int(reachable_hubs, pick_idx)) },
+        )
+      } else if len(previous) > 0 {
+        let (r4, pick_idx) = rng::skewed_below(r3, len(previous), 1);
+        (
+          r4,
+          if has_int(chosen, at_int(previous, pick_idx)) { chosen }
+          else { push(chosen, at_int(previous, pick_idx)) },
+        )
+      } else if len(reachable_hubs) > 0 {
+        let (r4, pick_idx) = rng::below(r3, len(reachable_hubs));
+        (
+          r4,
+          if has_int(chosen, at_int(reachable_hubs, pick_idx)) { chosen }
+          else { push(chosen, at_int(reachable_hubs, pick_idx)) },
+        )
+      } else { (r3, chosen) }
+    });
+    let chosen = if len(chosen) == 0 {
+      match list_at(previous, 0) {
+        Some(id) -> [id],
+        None -> match list_at(reachable_hubs, 0) { Some(id) -> [id], None -> [] },
+      }
+    } else { chosen };
+    (r2, sort_ints(chosen))
+  }
+
+fn sort_ints(xs: List<Int>) -> List<Int> =
+  fold(xs, [], |acc: List<Int>, x: Int| insert_sorted_int(acc, x))
+
+fn insert_sorted_int(acc: List<Int>, x: Int) -> List<Int> =
+  match acc {
+    [] -> [x],
+    [y, ..rest] -> if x <= y { cat_ints([x, y], rest) }
+    else { cat_ints([y], insert_sorted_int(rest, x)) },
+  }
+
+fn has_int(xs: List<Int>, v: Int) -> Bool = fold(xs, false, |acc: Bool, x: Int| acc || x == v)
+
+fn callable(
+  corpus: gmodel::Corpus,
+  modules: List<gmodel::Module>,
+  module: Int,
+  own: List<Int>,
+) -> List<Int> = {
+  let imports = at_mod(modules, module).imports;
+  cat_defs(
+    own,
+    fold(imports, [], |acc: List<Int>, m: Int|
+      match list_at(corpus.modules, m) { Some(built) -> cat_defs(acc, built.defs), None -> acc }),
+  )
+}
+
+fn cat_defs(a: List<Int>, b: List<Int>) -> List<Int> =
+  fold(b, a, |acc: List<Int>, x: Int| push(acc, x))
+
+fn generate_module_defs(
+  spec: Spec,
+  root: rng::Rng,
+  corpus: gmodel::Corpus,
+  modules: List<gmodel::Module>,
+  module: Int,
+) -> (gmodel::Corpus, List<Int>) =
+  fold(
+    range(0, spec.defs_per_module),
+    (corpus, []),
+    |acc: (gmodel::Corpus, List<Int>), index: Int| {
+      let (c, own) = acc;
+      let id = len(c.defs);
+      let r = rng::fork(root, 0x20000000 ^ module * 16777216 ^ index);
+      let pool = callable(c, modules, module, own);
+      let (r1, two) = rng::chance(r, 0.12);
+      let arity = if two { 2 } else { 1 };
+      let (r2, shape) = choose_shape(spec, r1, c, pool, arity);
+      let (r3, extras) = choose_extras(spec, r2, c, pool, shape);
+      let footprint = fold(
+        cat_calls(gmodel::shape_calls(shape), extras),
+        gmodel::own_atoms(shape, c.tables, c.regions),
+        |fp: gmodel::Footprint, call: gmodel::Call|
+          gmodel::atom_union(fp, gmodel::at_def_pub(c, call.target).footprint),
+      );
+      let weight = fold(
+        cat_calls(gmodel::shape_calls(shape), extras),
+        1,
+        |w: Int, call: gmodel::Call| {
+          let cw = gmodel::at_def_pub(c, call.target).weight;
+          if w + cw > 4294967295 { 4294967295 } else { w + cw }
+        },
+      );
+      let verb = at_str(verbs(), index % len(verbs()));
+      let def: gmodel::Def = {
+        id: id,
+        module: module,
+        name: verb ++ "_" ++ int_to_string(id),
+        arity: arity,
+        shape: shape,
+        extras: extras,
+        footprint: footprint,
+        weight: weight,
+        public: false,
+        claim: None,
+      };
+      ({ ..c, defs: push(c.defs, def) }, push(own, id))
+    },
+  )
+
+fn cat_calls(a: List<gmodel::Call>, b: List<gmodel::Call>) -> List<gmodel::Call> =
+  fold(b, a, |acc: List<gmodel::Call>, x: gmodel::Call| push(acc, x))
+
+fn choose_shape(
+  spec: Spec,
+  r: rng::Rng,
+  corpus: gmodel::Corpus,
+  pool: List<Int>,
+  arity: Int,
+) -> (rng::Rng, gmodel::Shape) = {
+  let (r0, is_effect) = rng::chance(r, spec.effect_fraction);
+  if is_effect {
+    let (r1, pick) = rng::below(r0, 100);
+    effect_shape(spec, r1, corpus, pool, pick)
+  } else if arity >= 2 {
+    match affordable(r0, corpus, pool, spec.max_weight, 1) {
+      (r1, Some(calls)) -> {
+        let f = at_call(calls, 0);
+        let (r2, a) = rng::between(r1, 2, 9);
+        let (r3, b) = rng::between(r2, 0, 40);
+        (r3, gmodel::Pair(f, a, b))
+      },
+      (r1, None) -> {
+        let (r2, a) = rng::between(r1, 2, 9);
+        let (r3, b) = rng::between(r2, 0, 40);
+        (r3, gmodel::Arith(a, b))
+      },
+    }
+  } else {
+    let (r1, pick) = rng::below(r0, 100);
+    pure_shape(spec, r1, corpus, pool, pick)
+  }
+}
+
+fn at_call(calls: List<gmodel::Call>, i: Int) -> gmodel::Call =
+  match list_at(calls, i) { Some(c) -> c, None -> panic("no call") }
+
+fn effect_shape(
+  spec: Spec,
+  r: rng::Rng,
+  corpus: gmodel::Corpus,
+  pool: List<Int>,
+  pick: Int,
+) -> (rng::Rng, gmodel::Shape) =
+  if pick < 30 {
+    let (r1, table) = rng::below(r, len(corpus.tables));
+    match affordable(r1, corpus, pool, spec.max_weight, 1) {
+      (r2, Some(calls)) -> {
+        let (r3, a) = rng::between(r2, 2, 9);
+        (r3, gmodel::TableCount(table, a, at_call(calls, 0)))
+      },
+      (r2, None) -> {
+        let (r3, a) = rng::between(r2, 2, 9);
+        (r3, gmodel::TableSum(table, a))
+      },
+    }
+  } else if pick < 50 {
+    let (r1, table) = rng::below(r, len(corpus.tables));
+    let (r2, a) = rng::between(r1, 2, 9);
+    (r2, gmodel::TableSum(table, a))
+  } else if pick < 75 {
+    let (r1, table) = rng::below(r, len(corpus.tables));
+    let (r2, a) = rng::between(r1, 2, 9);
+    let (r3, b) = rng::between(r2, 2, 9);
+    (r3, gmodel::TableAppend(table, a, b))
+  } else if pick < 85 {
+    let (r1, region) = rng::below(r, len(corpus.regions));
+    let (r2, a) = rng::between(r1, 2, 9);
+    (r2, gmodel::CachePeek(region, a))
+  } else if pick < 97 {
+    let (r1, region) = rng::below(r, len(corpus.regions));
+    let (r2, a) = rng::between(r1, 2, 9);
+    (r2, gmodel::CachePoke(region, a))
+  } else {
+    let (r1, a) = rng::between(r, 3, 97);
+    (r1, gmodel::Now(a))
+  }
+
+fn pure_shape(
+  spec: Spec,
+  r: rng::Rng,
+  corpus: gmodel::Corpus,
+  pool: List<Int>,
+  pick: Int,
+) -> (rng::Rng, gmodel::Shape) =
+  if pick < 18 { arith(r) }
+  else if pick < 30 { fold_shape(r) }
+  else if pick < 40 { record_shape(r) }
+  else if pick < 50 { list_map(r) } else if pick < 64 {
+    match affordable(r, corpus, pool, spec.max_weight, 1) {
+      (r1, Some(calls)) -> {
+        let (r2, m) = rng::between(r1, 2, 6);
+        let (r3, b) = rng::between(r2, 0, 40);
+        (r3, gmodel::Guard(m, at_call(calls, 0), b))
+      },
+      (r1, None) -> arith(r1),
+    }
+  } else if pick < 76 {
+    match affordable(r, corpus, pool, spec.max_weight, 1) {
+      (r1, Some(calls)) -> {
+        let (r2, off) = rng::between(r1, 0, 20);
+        let (r3, idle) = rng::between(r2, 0, 90);
+        (r3, gmodel::Sum(off, at_call(calls, 0), idle))
+      },
+      (r1, None) -> fold_shape(r1),
+    }
+  } else if pick < 89 {
+    match affordable(r, corpus, pool, spec.max_weight, 2) {
+      (r1, Some(calls)) -> (r1, gmodel::Compose(at_call(calls, 0), at_call(calls, 1))),
+      (r1, None) -> arith(r1),
+    }
+  } else {
+    match affordable(r, corpus, pool, spec.max_weight, 2) {
+      (r1, Some(calls)) -> {
+        let (r2, b) = rng::between(r1, 0, 30);
+        (r2, gmodel::Chain(at_call(calls, 0), at_call(calls, 1).target, b))
+      },
+      (r1, None) -> list_map(r1),
+    }
+  }
+
+fn arith(r: rng::Rng) -> (rng::Rng, gmodel::Shape) = {
+  let (r1, a) = rng::between(r, 2, 9);
+  let (r2, b) = rng::between(r1, 0, 40);
+  (r2, gmodel::Arith(a, b))
+}
+
+fn fold_shape(r: rng::Rng) -> (rng::Rng, gmodel::Shape) = {
+  let (r1, n) = rng::between(r, 2, 8);
+  let (r2, k) = rng::between(r1, 2, 9);
+  (r2, gmodel::Fold(n, k))
+}
+
+fn record_shape(r: rng::Rng) -> (rng::Rng, gmodel::Shape) = {
+  let (r1, m) = rng::between(r, 2, 9);
+  let (r2, k) = rng::between(r1, 2, 9);
+  (r2, gmodel::Record(m, k))
+}
+
+fn list_map(r: rng::Rng) -> (rng::Rng, gmodel::Shape) = {
+  let (r1, n) = rng::between(r, 2, 8);
+  let (r2, k) = rng::between(r1, 2, 9);
+  (r2, gmodel::ListMap(n, k))
+}
+
+// Picks `n` distinct callees fitting `budget`, preferring the pool's front so hubs form.
+fn affordable(
+  r: rng::Rng,
+  corpus: gmodel::Corpus,
+  pool: List<Int>,
+  budget: Int,
+  n: Int,
+) -> (rng::Rng, Option<List<gmodel::Call>>) =
+  if len(pool) == 0 { (r, None) } else {
+    let (r1, chosen) = fold(range(0, n), (r, []), |acc: (rng::Rng, List<gmodel::Call>), _: Int| {
+      let (r_acc, chosen) = acc;
+      let used = fold(chosen, 1, |u: Int, c: gmodel::Call|
+        u + gmodel::at_def_pub(corpus, c.target).weight);
+      let (r2, best) = fold(range(0, 4), (r_acc, None), |inner: (rng::Rng, Option<Int>), _: Int| {
+        let (r_in, best_so_far) = inner;
+        let (r3, draw) = rng::skewed_below(r_in, len(pool), 2);
+        let candidate = at_int(pool, draw);
+        let already = fold(chosen, false, |acc2: Bool, c: gmodel::Call|
+          acc2 || c.target == candidate);
+        let weight = gmodel::at_def_pub(corpus, candidate).weight;
+        let over = used + weight > budget;
+        let better = match best_so_far {
+          None -> !already && !over,
+          Some(current) -> !already && !over && gmodel::at_def_pub(corpus, current).weight > weight,
+        };
+        (r3, if better { Some(candidate) } else { best_so_far })
+      });
+      match best {
+        None -> (r2, chosen),
+        Some(target) -> {
+          let (r3, offset) = rng::between(r2, 0, 30);
+          (r3, push(chosen, { target: target, offset: offset }))
+        },
+      }
+    });
+    if len(chosen) == n { (r1, Some(chosen)) } else { (r1, None) }
+  }
+
+fn at_int(xs: List<Int>, i: Int) -> Int = match list_at(xs, i) { Some(x) -> x, None -> 0 }
+
+fn choose_extras(
+  spec: Spec,
+  r: rng::Rng,
+  corpus: gmodel::Corpus,
+  pool: List<Int>,
+  shape: gmodel::Shape,
+) -> (rng::Rng, List<gmodel::Call>) =
+  if len(pool) == 0 { (r, []) } else {
+    let (r1, wanted_pick) = rng::below(r, 100);
+    let wanted = if wanted_pick < 20 { 0 }
+    else if wanted_pick < 55 { 1 }
+    else if wanted_pick < 85 { 2 }
+    else { max_extras() };
+    let (r2, extras) = fold(
+      range(0, wanted),
+      (r1, []),
+      |acc: (rng::Rng, List<gmodel::Call>), _: Int| {
+        let (r_acc, extras) = acc;
+        let (r3, draw) = rng::skewed_below(r_acc, len(pool), 2);
+        let candidate = at_int(pool, draw);
+        let in_shape = fold(gmodel::shape_calls(shape), false, |acc2: Bool, c: gmodel::Call|
+          acc2 || c.target == candidate);
+        let in_extras = fold(extras, false, |acc2: Bool, c: gmodel::Call|
+          acc2 || c.target == candidate);
+        let used = fold(
+          cat_calls(gmodel::shape_calls(shape), extras),
+          1,
+          |u: Int, c: gmodel::Call| u + gmodel::at_def_pub(corpus, c.target).weight,
+        );
+        let weight = gmodel::at_def_pub(corpus, candidate).weight;
+        if in_shape || in_extras || used + weight > spec.max_weight { (r3, extras) } else {
+          let (r4, offset) = rng::between(r3, 0, 30);
+          (r4, push(extras, { target: candidate, offset: offset }))
+        }
+      },
+    );
+    (r2, extras)
+  }
+
+// A definition is `pub` exactly when another module reaches it, so visibility stays tested.
+fn mark_public(corpus: gmodel::Corpus) -> gmodel::Corpus = {
+  let exported = fold(corpus.defs, [], |acc: List<Int>, def: gmodel::Def|
+    fold(
+      cat_calls(gmodel::shape_calls(def.shape), def.extras),
+      acc,
+      |inner: List<Int>, call: gmodel::Call|
+        if gmodel::at_def_pub(corpus, call.target).module != def.module { push(inner, call.target) }
+        else { inner },
+    ));
+  { ..corpus, defs: map(corpus.defs, |d: gmodel::Def| { ..d, public: has_int(exported, d.id) }) }
+}
+
+// Claims are keyed per definition, so raising the density adds claims without moving others.
+fn attach_claims(spec: Spec, root: rng::Rng, corpus: gmodel::Corpus) -> gmodel::Corpus =
+  if spec.spec_fraction <= 0.0 { corpus } else {
+    {
+      ..corpus,
+      defs: map(corpus.defs, |d: gmodel::Def| {
+        let (_, hit) = rng::chance(rng::fork(root, 0x50000000 + d.id), spec.spec_fraction);
+        if !hit { d } else {
+          let intent = if len(d.footprint) == 0 { gmodel::Sampled } else { gmodel::Gap };
+          { ..d, claim: Some({ intent: intent }) }
+        }
+      }),
+    }
+  }
+
+// One specimen per index, cycling the three shapes.
+fn generate_specimens(spec: Spec, corpus: gmodel::Corpus) -> List<gmodel::Specimen> =
+  match fold(
+      corpus.modules,
+      (0, []),
+      |acc: (Int, List<gmodel::Specimen>), module: gmodel::Module|
+        fold(
+          range(0, spec.specimens_per_module),
+          acc,
+          |inner: (Int, List<gmodel::Specimen>), index: Int| {
+            let (next_id, out) = inner;
+            let id = next_id;
+            let kind = if index % 3 == 0 {
+              gmodel::Linear(2 + (module.id + index) % 7, 1 + id * 7 % 40)
+            } else if index % 3 == 1 { gmodel::Status }
+            else { gmodel::Length };
+            (
+              id + 1,
+              push(out, {
+                id: id,
+                module: module.id,
+                name: specimen_verb(kind) ++ "_" ++ int_to_string(id),
+                kind: kind,
+              }),
+            )
+          },
+        ),
+    ) {
+    (_, out) -> out,
+  }
+
+fn specimen_verb(kind: gmodel::SpecimenKind) -> String =
+  match kind {
+    gmodel::Linear(_, _) -> "quote",
+    gmodel::Status -> "grade",
+    gmodel::Length -> "depth",
+  }
+
+// One law per specimen.
+fn generate_laws(root: rng::Rng, corpus: gmodel::Corpus) -> List<gmodel::Law> =
+  map(corpus.specimens, |specimen: gmodel::Specimen| {
+    let kind = match specimen.kind {
+      gmodel::Linear(_, _) -> {
+        let r = rng::fork(root, 0x60000000 + specimen.id);
+        let (r1, a) = rng::between(r, 2, 40);
+        let (_, b) = rng::between(r1, 1, 90);
+        gmodel::Ground(a, b)  // no further draws: the fork is discarded here
+      },
+      gmodel::Status -> gmodel::Finite,
+      gmodel::Length -> gmodel::LawLength(specimen.id),
+    };
+    {
+      module: specimen.module,
+      label: law_phrase(kind) ++ " (case " ++ int_to_string(specimen.id) ++ ")",
+      kind: kind,
+    }
+  })
+
+fn law_phrase(kind: gmodel::LawKind) -> String =
+  match kind {
+    gmodel::Ground(_, _) -> "the arithmetic closes without running anything",
+    gmodel::Finite -> "either flag settles the pair",
+    gmodel::LawLength(_) -> "a walk down a list never comes back negative",
+  }
+
+fn generate_tests(spec: Spec, root: rng::Rng, corpus: gmodel::Corpus) -> List<gmodel::Test> =
+  if len(corpus.defs) == 0 { [] } else {
+    fold(range(0, spec.tests), [], |acc: List<gmodel::Test>, index: Int| {
+      let module = index % len(corpus.modules);
+      let defs = at_mod(corpus.modules, module).defs;
+      if len(defs) == 0 { acc } else {
+        let r = rng::fork(root, 0x30000000 + index);
+        let (r1, draw) = rng::below(r, len(defs));
+        let root_def = at_int(defs, (index / len(corpus.modules) + draw) % len(defs));
+        push(acc, build_test(spec, r1, corpus, module, root_def, index))
+      }
+    })
+  }
+
+fn build_test(
+  spec: Spec,
+  r: rng::Rng,
+  corpus: gmodel::Corpus,
+  module: Int,
+  root: Int,
+  index: Int,
+) -> gmodel::Test = {
+  let footprint = gmodel::at_def_pub(corpus, root).footprint;
+  let (r1, clock_off) = rng::between(r, 0, 5000);
+  let (r2, world0) = seed_world(r1, corpus, footprint, [], [], 1700000000 + clock_off);
+  let arity = gmodel::at_def_pub(corpus, root).arity;
+  let (r3, call_count) = rng::between(r2, 1, 2);
+  let (r4, calls, expected, live) = fold(
+    range(0, call_count),
+    (r3, [], [], world0),
+    |acc: (rng::Rng, List<List<Int>>, List<Int>, gmodel::World), _: Int| {
+      let (r_acc, calls, expected, live) = acc;
+      let (r5, args) = draw_args(r_acc, arity, []);
+      let (live2, v) = gmodel::eval(corpus, root, args, live);
+      (r5, push(calls, args), push(expected, v), live2)
+    },
+  );
+  let granted = live.touched;
+  let written_tables = fold(granted, [], |acc: List<Int>, a: gmodel::Atom|
+    if a.write && a.eff == gmodel::Db {
+      match a.resource { Some(label) -> push(acc, index_of(corpus.tables, label)), None -> acc }
+    } else { acc });
+  let written_regions = fold(granted, [], |acc: List<Int>, a: gmodel::Atom|
+    if a.write && a.eff == gmodel::Cache {
+      match a.resource { Some(label) -> push(acc, index_of(corpus.regions, label)), None -> acc }
+    } else { acc });
+  let final_table_len = map(written_tables, |t: Int| (t, len(gmodel::world_table(live, t))));
+  let final_region = map(written_regions, |rg: Int| (rg, gmodel::world_region(live, rg)));
+  let undischarged_clock = fold(footprint, false, |acc: Bool, a: gmodel::Atom|
+    acc || (a.eff == gmodel::Clock && !gmodel::atom_in_pub(granted, a)));
+  let (r5, nondet_draw) = rng::chance(r4, spec.nondet_fraction);
+  {
+    module: module,
+    label: gmodel::at_def_pub(corpus, root).name ++ " "
+      ++ phrase(r5, gmodel::at_def_pub(corpus, root).shape)
+      ++ " (case "
+      ++ int_to_string(index)
+      ++ ")",
+    nondet: undischarged_clock || nondet_draw,
+    root: root,
+    calls: calls,
+    expected: expected,
+    world: world0,
+    granted: granted,
+    final_table_len: final_table_len,
+    final_region: final_region,
+  }
+}
+
+fn draw_args(r: rng::Rng, left: Int, acc: List<Int>) -> (rng::Rng, List<Int>) =
+  if left <= 0 { (r, acc) } else {
+    let (r1, v) = rng::between(r, 1, 60);
+    draw_args(r1, left - 1, push(acc, v))
+  }
+
+fn seed_world(
+  r: rng::Rng,
+  corpus: gmodel::Corpus,
+  footprint: gmodel::Footprint,
+  tables: List<(Int, List<Int>)>,
+  regions: List<(Int, Int)>,
+  clock: Int,
+) -> (rng::Rng, gmodel::World) =
+  match fold(
+      footprint,
+      (r, tables, regions),
+      |acc: (rng::Rng, List<(Int, List<Int>)>, List<(Int, Int)>), a: gmodel::Atom| {
+        let (r_acc, tables, regions) = acc;
+        match ((a.eff, a.resource)) {
+          (gmodel::Db, Some(label)) -> {
+            let table = index_of(corpus.tables, label);
+            if fold(tables, false, |seen: Bool, t: (Int, List<Int>)|
+                match t { (i, _) -> seen || i == table }) { (r_acc, tables, regions) } else {
+              let (r1, count) = rng::between(r_acc, 1, 4);
+              let (r2, rows) = fold(
+                range(0, count),
+                (r1, []),
+                |inner: (rng::Rng, List<Int>), k: Int|
+                  match inner {
+                    (ri, rows) -> {
+                      let (r3, base) = rng::between(ri, 1, 90);
+                      (r3, push(rows, base + k))
+                    },
+                  },
+              );
+              (r2, push(tables, (table, rows)), regions)
+            }
+          },
+          (gmodel::Cache, Some(label)) -> {
+            let region = index_of(corpus.regions, label);
+            if fold(regions, false, |seen: Bool, rg: (Int, Int)|
+                match rg { (i, _) -> seen || i == region }) { (r_acc, tables, regions) } else {
+              let (r1, v) = rng::between(r_acc, 1, 90);
+              (r1, tables, push(regions, (region, v)))
+            }
+          },
+          _ -> (r_acc, tables, regions),
+        }
+      },
+    ) {
+    (r1, tables, regions) ->
+      (
+        r1,
+        { tables: sort_pairs(tables), regions: sort_int_pairs(regions), clock: clock, touched: [] },
+      ),
+  }
+
+fn sort_pairs(xs: List<(Int, List<Int>)>) -> List<(Int, List<Int>)> =
+  fold(xs, [], |acc: List<(Int, List<Int>)>, x: (Int, List<Int>)| insert_pair(acc, x))
+
+fn insert_pair(acc: List<(Int, List<Int>)>, x: (Int, List<Int>)) -> List<(Int, List<Int>)> =
+  match acc {
+    [] -> [x],
+    [y, ..rest] -> match ((x, y)) {
+      ((xi, _), (yi, _)) -> if xi <= yi { cat_pairs([x, y], rest) }
+      else { cat_pairs([y], insert_pair(rest, x)) },
+    },
+  }
+
+fn cat_pairs(a: List<(Int, List<Int>)>, b: List<(Int, List<Int>)>) -> List<(Int, List<Int>)> =
+  fold(b, a, |acc: List<(Int, List<Int>)>, x: (Int, List<Int>)| push(acc, x))
+
+fn sort_int_pairs(xs: List<(Int, Int)>) -> List<(Int, Int)> =
+  fold(xs, [], |acc: List<(Int, Int)>, x: (Int, Int)| insert_int_pair(acc, x))
+
+fn insert_int_pair(acc: List<(Int, Int)>, x: (Int, Int)) -> List<(Int, Int)> =
+  match acc {
+    [] -> [x],
+    [y, ..rest] -> match ((x, y)) {
+      ((xi, _), (yi, _)) -> if xi <= yi { cat_int_pairs([x, y], rest) }
+      else { cat_int_pairs([y], insert_int_pair(rest, x)) },
+    },
+  }
+
+fn cat_int_pairs(a: List<(Int, Int)>, b: List<(Int, Int)>) -> List<(Int, Int)> =
+  fold(b, a, |acc: List<(Int, Int)>, x: (Int, Int)| push(acc, x))
+
+fn generate_concurrent_tests(
+  spec: Spec,
+  root: rng::Rng,
+  corpus: gmodel::Corpus,
+) -> List<gmodel::ConcurrentTest> =
+  if spec.tasks_per_test < 2 || len(corpus.modules) == 0 || len(corpus.shards) == 0 { [] } else {
+    let shard_count = if shards_per_test(spec) < len(corpus.shards) { shards_per_test(spec) }
+    else { len(corpus.shards) };
+    map(range(0, spec.concurrent_tests), |index: Int| {
+      let module = index % len(corpus.modules);
+      let r = rng::fork(root, 0x40000000 + index);
+      let tasks = match fold(
+          range(0, spec.tasks_per_test),
+          (r, []),
+          |acc: (rng::Rng, List<gmodel::TaskBody>), i: Int| {
+            let (r_acc, tasks) = acc;
+            let (r1, steps) = fold(
+              range(0, spec.steps_per_task),
+              (r_acc, []),
+              |inner: (rng::Rng, List<Int>), _: Int| {
+                let (r_in, steps) = inner;
+                let (r2, step) = rng::between(r_in, 1, 9);
+                (r2, push(steps, step))
+              },
+            );
+            (
+              r1,
+              push(tasks, {
+                name: "worker_" ++ int_to_string(index) ++ "_" ++ int_to_string(i),
+                shard: i % shard_count,
+                steps: steps,
+              }),
+            )
+          },
+        ) {
+        (_, tasks) -> tasks,
+      };
+      let shards = dedup_sorted(
+        fold(tasks, [], |acc: List<Int>, t: gmodel::TaskBody| push(acc, t.shard)),
+      );
+      {
+        module: module,
+        label: int_to_string(len(tasks)) ++ " tasks over " ++ int_to_string(len(shards)) ++ " shard"
+          ++ (if len(shards) == 1 { "" } else { "s" })
+          ++ " (case "
+          ++ int_to_string(index)
+          ++ ")",
+        tasks: tasks,
+        shards: shards,
+      }
+    })
+  }
+
+fn dedup_sorted(xs: List<Int>) -> List<Int> =
+  fold(sort_ints(xs), [], |acc: List<Int>, x: Int| if has_int(acc, x) { acc } else { push(acc, x) })
+
+fn cat_ints(a: List<Int>, b: List<Int>) -> List<Int> =
+  fold(b, a, |acc: List<Int>, x: Int| push(acc, x))
+
+pub fn phrase(r: rng::Rng, shape: gmodel::Shape) -> String = {
+  let generic = [
+    "agrees with its worked example",
+    "holds for a seeded fixture",
+    "returns the figure the spec names",
+  ];
+  match shape {
+    gmodel::TableAppend(_, _, _) -> "appends exactly one row",
+    gmodel::TableCount(_, _, _) -> "reads the table it declares",
+    gmodel::TableSum(_, _) -> "reads the table it declares",
+    gmodel::CachePoke(_, _) -> "writes the region back",
+    gmodel::CachePeek(_, _) -> "reads the region it declares",
+    gmodel::Now(_) -> "is stable under a pinned clock",
+    _ -> {
+      let (_, pick) = rng::below(r, len(generic));
+      at_str(generic, pick)
+    },
+  }
+}
+
+pub fn index_of(labels: List<String>, label: String) -> Int =
+  match fold(labels, (0, 0), |acc: (Int, Int), l: String|
+      match acc {
+        (i, found) -> if found == 1 { (i, found) }
+        else if l == label { (i, 1) }
+        else { (i + 1, 0) },
+      }) {
+    (i, _) -> i,
+  }
+
+test "the probe spec's first module" {
+  let spec: Spec = {
+    seed: 1,
+    modules: 4,
+    defs_per_module: 5,
+    tests: 8,
+    depth: 2,
+    tables: 3,
+    regions: 2,
+    effect_fraction: 0.35,
+    nondet_fraction: 0.03,
+    hub_modules: 3,
+    max_weight: 192,
+    concurrent_tests: 0,
+    tasks_per_test: 3,
+    steps_per_task: 2,
+    conflict_density: 0.5,
+    spec_fraction: 0.0,
+    specimens_per_module: 0,
+  };
+  let corpus = generate(spec);
+  let def1 = gmodel::at_def_pub(corpus, 1);
+  assert_eq(def1.name, "render_1");
+  assert_eq(len(def1.extras), 1);
+  match list_at(def1.extras, 0) {
+    Some(c) -> {
+      assert_eq(c.target, 0);
+      assert_eq(c.offset, 9);
+    },
+    None -> assert(false),
+  }
+}
+
+test "def one's real path through shape and extras" {
+  let spec: Spec = {
+    seed: 1,
+    modules: 4,
+    defs_per_module: 5,
+    tests: 8,
+    depth: 2,
+    tables: 3,
+    regions: 2,
+    effect_fraction: 0.35,
+    nondet_fraction: 0.03,
+    hub_modules: 3,
+    max_weight: 192,
+    concurrent_tests: 0,
+    tasks_per_test: 3,
+    steps_per_task: 2,
+    conflict_density: 0.5,
+    spec_fraction: 0.0,
+    specimens_per_module: 0,
+  };
+  let corpus: gmodel::Corpus = {
+    modules: [
+      {
+        id: 0,
+        name: "store0.core_0",
+        path: "store0/core_0.ply",
+        layer: 0,
+        imports: [],
+        defs: [0],
+        helper: { name: "stage_0", m: 3, b: 7 },
+        status_type: "Status0",
+        ctor_ready: "Ready0",
+        ctor_idle: "Idle0",
+        needs_effects: false,
+      },
+    ],
+    defs: [
+      {
+        id: 0,
+        module: 0,
+        name: "apply_0",
+        arity: 1,
+        shape: gmodel::Arith(3, 5),
+        extras: [],
+        footprint: [],
+        weight: 1,
+        public: false,
+        claim: None,
+      },
+    ],
+    tests: [],
+    concurrent: [],
+    specimens: [],
+    laws: [],
+    tables: ["users", "orders", "items"],
+    regions: ["hot", "warm"],
+    shards: [],
+  };
+  let r = rng::fork(rng::new(1), 0x20000001);
+  assert_eq(r.state, 6055186609805135146);
+  let (r1, two) = rng::chance(r, 0.12);
+  assert_eq(r1.state, -990842644581217985);
+  let (r2, shape) = choose_shape(spec, r1, corpus, [0], if two { 2 } else { 1 });
+  // The fork's state advances by the SplitMix64 increment once per draw; after arity + effect +
+  // pick + n + k it has moved five times.
+  let (r2b, _) = rng::chance(r1, 0.35);
+  let (r2c, _) = rng::below(r2b, 100);
+  let (r2d, _) = rng::between(r2c, 2, 8);
+  let (r2e, _) = rng::between(r2d, 2, 9);
+  assert_eq(r2.state, r2e.state);
+  match shape {
+    gmodel::ListMap(n, k) -> {
+      assert_eq(n, 7);
+      assert_eq(k, 2);
+    },
+    _ -> assert(false),
+  };
+  let (_, extras) = choose_extras(spec, r2, corpus, [0], shape);
+  assert_eq(len(extras), 1);
+  match list_at(extras, 0) { Some(c) -> assert_eq(c.offset, 9), None -> assert(false) }
+}
+
+test "index_of finds the label's place" {
+  assert_eq(index_of(["users", "orders", "items"], "orders"), 1);
+  assert_eq(index_of(["users", "orders", "items"], "users"), 0);
+  assert_eq(index_of(["users", "orders", "items"], "items"), 2);
+}

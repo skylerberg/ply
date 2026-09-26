@@ -1,0 +1,674 @@
+// The corpus as Ply source. Byte-identical to what the Rust emitter wrote: a seed's corpus is
+// the same files, so the benches that consumed them mean the same thing.
+
+import gmodel
+
+pub fn effects_path() -> String = "core/effects.ply"
+pub fn prim_path() -> String = "core/prim.ply"
+
+pub fn effects_source() -> String =
+  "// The capabilities the whole corpus is written against. Resource labels are\n// shared program-wide on purpose: conflict is a claim about the world, so two\n// modules writing `[orders]` must serialize even though nothing links them.\n\npub effect db {\n  read  all[table]() -> List<Int>\n  write save[table](rows: List<Int>) -> Unit\n}\n\npub effect cache {\n  read  peek[region]() -> Int\n  write poke[region](value: Int) -> Unit\n}\n\npub nondet effect clock {\n  read now() -> Int\n}\n\n// One operation, so a handler's read-modify-write of the backing cell is one\n// step and no schedule can split it. What a concurrent test then measures is the\n// *order* its tasks ran in, which is the only thing left to explore.\npub effect counter {\n  write bump[shard](by: Int) -> Unit\n}\n"
+
+pub fn prim_source() -> String =
+  "// Arithmetic every generated definition funnels through. `clamp` is what keeps\n// an intermediate inside `Int` no matter how deep the call graph goes.\n\npub type Weighted = { id: Int, weight: Int }\n\npub fn clamp(x: Int) -> Int = x % 100003\n\npub fn mix(x: Int, y: Int) -> Int = clamp(x * 31 + y * 17 + 7)\n\npub fn total(xs: List<Int>) -> Int = fold(xs, 0, |acc, v| clamp(acc + v))\n\npub fn weigh(w: Weighted) -> Int = clamp(w.id * 11 + w.weight)\n"
+
+pub type Emitted = { path: String, text: String }
+
+pub fn emit(c: gmodel::Corpus) -> List<Emitted> =
+  fold(
+    c.modules,
+    [{ path: effects_path(), text: effects_source() }, { path: prim_path(), text: prim_source() }],
+    |acc: List<Emitted>, m: gmodel::Module| push(acc, { path: m.path, text: emit_module(c, m) }),
+  )
+
+pub fn emit_module(c: gmodel::Corpus, m: gmodel::Module) -> String = {
+  let head = "// Layer " ++ int_to_string(m.layer) ++ " of the corpus. "
+    ++ int_to_string(len(m.defs))
+    ++ " definitions, "
+    ++ int_to_string(len(m.imports))
+    ++ " imported module(s).\n\n";
+  let imports = "import core.prim\n" ++ (if m.needs_effects { "import core.effects\n" } else { "" })
+    ++ fold(m.imports, "", |acc: String, i: Int| acc ++ "import " ++ at_mod(c, i).name ++ "\n")
+    ++ "\n";
+  let status = "type " ++ m.status_type ++ " =\n  | " ++ m.ctor_ready ++ "(Int)\n  | "
+    ++ m.ctor_idle
+    ++ "\n\n";
+  let helper = "fn " ++ m.helper.name ++ "(x: Int) -> " ++ m.status_type ++ " =\n  if x % "
+    ++ int_to_string(m.helper.m)
+    ++ " == 0 { "
+    ++ m.ctor_idle
+    ++ " } else { "
+    ++ m.ctor_ready
+    ++ "(prim::clamp(x + "
+    ++ int_to_string(m.helper.b)
+    ++ ")) }\n\n";
+  let defs = fold(m.defs, "", |acc: String, id: Int| acc ++ emit_def(c, at_def(c, id)) ++ "\n");
+  let specimens = fold(specimens_in(c, m.id), "", |acc: String, s: gmodel::Specimen|
+    acc ++ emit_specimen(c, s) ++ "\n");
+  let laws = fold(laws_in(c, m.id), "", |acc: String, l: gmodel::Law|
+    acc ++ emit_law(c, l) ++ "\n");
+  let specimen_test = if len(specimens_in(c, m.id)) > 0 { emit_specimen_test(c, m) ++ "\n" }
+  else { "" };
+  let tests = fold(c.tests, "", |acc: String, t: gmodel::Test|
+    if t.module == m.id { acc ++ emit_test(c, t) ++ "\n" } else { acc });
+  let concurrent = fold(concurrent_in(c, m.id), "", |acc: String, t: gmodel::ConcurrentTest| {
+    let tasks = fold(t.tasks, acc, |inner: String, task: gmodel::TaskBody|
+      inner ++ emit_task(c, task) ++ "\n");
+    tasks ++ emit_concurrent_test(c, t) ++ "\n"
+  });
+  head ++ imports ++ status ++ helper ++ defs ++ specimens ++ laws ++ specimen_test ++ tests
+    ++ concurrent
+}
+
+fn at_mod(c: gmodel::Corpus, i: Int) -> gmodel::Module =
+  match list_at(c.modules, i) { Some(m) -> m, None -> panic("no module") }
+
+fn at_def(c: gmodel::Corpus, i: Int) -> gmodel::Def = gmodel::at_def_pub(c, i)
+
+fn specimens_in(c: gmodel::Corpus, module: Int) -> List<gmodel::Specimen> =
+  fold(c.specimens, [], |acc: List<gmodel::Specimen>, s: gmodel::Specimen|
+    if s.module == module { push(acc, s) } else { acc })
+
+fn laws_in(c: gmodel::Corpus, module: Int) -> List<gmodel::Law> =
+  fold(c.laws, [], |acc: List<gmodel::Law>, l: gmodel::Law|
+    if l.module == module { push(acc, l) } else { acc })
+
+fn concurrent_in(c: gmodel::Corpus, module: Int) -> List<gmodel::ConcurrentTest> =
+  fold(c.concurrent, [], |acc: List<gmodel::ConcurrentTest>, t: gmodel::ConcurrentTest|
+    if t.module == module { push(acc, t) } else { acc })
+
+fn params(arity: Int) -> String = if arity >= 2 { "x: Int, y: Int" } else { "x: Int" }
+
+fn row(footprint: gmodel::Footprint) -> String =
+  if len(footprint) == 0 { "" } else {
+    " / {"
+      ++ fold(footprint, "", |acc: String, a: gmodel::Atom|
+        (if acc == "" { acc } else { acc ++ ", " }) ++ gmodel::render_atom(a))
+      ++ "}"
+  }
+
+// The largest argument a specified definition's precondition admits.
+pub fn arg_bound() -> Int = 1000
+
+fn clauses(def: gmodel::Def) -> String =
+  match def.claim {
+    None -> "",
+    Some(_) -> {
+      let domain = "x > 0 && x < " ++ int_to_string(arg_bound())
+        ++ (if def.arity >= 2 { " && y > 0 && y < " ++ int_to_string(arg_bound()) } else { "" });
+      "\n  requires " ++ domain ++ "\n  ensures result < 100003 && result > -100003"
+    },
+  }
+
+pub fn emit_def(c: gmodel::Corpus, def: gmodel::Def) -> String = {
+  let visibility = if def.public { "pub " } else { "" };
+  let head = visibility ++ "fn " ++ def.name ++ "(" ++ params(def.arity) ++ ") -> Int"
+    ++ row(def.footprint)
+    ++ clauses(def);
+  match def.shape {
+    gmodel::TableAppend(table, a, b) -> {
+      let t = at_str(c.tables, table);
+      let core = "prim::clamp(len(rows) * " ++ int_to_string(b) ++ " + x)";
+      head ++ " {\n" ++ "  let rows = effects::db.all[" ++ t ++ "]();\n" ++ "  effects::db.save["
+        ++ t
+        ++ "](push(rows, prim::clamp(x * "
+        ++ int_to_string(a)
+        ++ ")));\n"
+        ++ "  "
+        ++ combine(c, def, core)
+        ++ "\n"
+        ++ "}\n"
+    },
+    gmodel::CachePoke(region, a) -> {
+      let r = at_str(c.regions, region);
+      let core = "prim::clamp(seen * " ++ int_to_string(a) ++ " + x)";
+      head ++ " {\n" ++ "  let seen = effects::cache.peek[" ++ r ++ "]();\n"
+        ++ "  effects::cache.poke["
+        ++ r
+        ++ "](prim::clamp(seen + x));\n"
+        ++ "  "
+        ++ combine(c, def, core)
+        ++ "\n"
+        ++ "}\n"
+    },
+    gmodel::Sum(off, f, idle) -> {
+      let m = at_mod(c, def.module);
+      let arms = "match " ++ m.helper.name ++ "(x + " ++ int_to_string(off) ++ ") {\n" ++ "  "
+        ++ m.ctor_ready
+        ++ "(v) -> "
+        ++ call_expr(c, def.module, f, "v")
+        ++ ",\n"
+        ++ "  "
+        ++ m.ctor_idle
+        ++ " -> "
+        ++ int_to_string(idle)
+        ++ ",\n"
+        ++ "}";
+      if len(def.extras) == 0 { assign(head) ++ "\n" ++ indent(arms, 2) ++ "\n" } else {
+        head ++ " {\n" ++ "  let core = " ++ indent_tail(arms, 2) ++ ";\n" ++ "  "
+          ++ combine(c, def, "core")
+          ++ "\n"
+          ++ "}\n"
+      }
+    },
+    other -> assign(head) ++ "\n  " ++ combine(c, def, core_expr(c, def, other)) ++ "\n",
+  }
+}
+
+// A spec clause ends a line, so the body's `=` goes on the next one.
+fn assign(head: String) -> String =
+  if string_contains(head, "\n") { head ++ "\n=" } else { head ++ " =" }
+
+fn combine(c: gmodel::Corpus, def: gmodel::Def, core: String) -> String =
+  if len(def.extras) == 0 { core } else {
+    let sum = fold(def.extras, "", |acc: String, call: gmodel::Call|
+      (if acc == "" { acc } else { acc ++ " + " }) ++ call_expr(c, def.module, call, "x"));
+    "prim::mix(" ++ core ++ ", " ++ sum ++ ")"
+  }
+
+fn core_expr(c: gmodel::Corpus, def: gmodel::Def, shape: gmodel::Shape) -> String =
+  match shape {
+    gmodel::Arith(a, b) ->
+      "prim::clamp(x * " ++ int_to_string(a) ++ " + " ++ int_to_string(b) ++ ")",
+    gmodel::Compose(f, g) ->
+      "prim::mix(" ++ call_expr(c, def.module, f, "x") ++ ", " ++ call_expr(c, def.module, g, "x")
+        ++ ")",
+    gmodel::Guard(m, f, b) ->
+      "if x % " ++ int_to_string(m) ++ " == 0 { " ++ call_expr(c, def.module, f, "x")
+        ++ " } else { prim::clamp(x + "
+        ++ int_to_string(b)
+        ++ ") }",
+    gmodel::Fold(n, k) ->
+      "fold(range(0, " ++ int_to_string(n) ++ "), 0, |acc, v| prim::clamp(acc + v * "
+        ++ int_to_string(k)
+        ++ " + x))",
+    gmodel::Record(m, k) ->
+      "prim::weigh({id: x % " ++ int_to_string(m) ++ ", weight: prim::clamp(x * "
+        ++ int_to_string(k)
+        ++ ")})",
+    gmodel::Chain(inner, outer, b) -> {
+      let arg = call_expr(c, def.module, inner, "x") ++ " + " ++ int_to_string(b);
+      call_expr(c, def.module, { target: outer, offset: 0 }, arg)
+    },
+    gmodel::ListMap(n, k) ->
+      "prim::total(map(range(0, " ++ int_to_string(n) ++ "), |v| prim::clamp(v * "
+        ++ int_to_string(k)
+        ++ " + x)))",
+    gmodel::Pair(f, a, b) ->
+      "prim::mix(" ++ call_expr(c, def.module, f, "x") ++ ", y * " ++ int_to_string(a) ++ " + "
+        ++ int_to_string(b)
+        ++ ")",
+    gmodel::TableCount(table, a, f) ->
+      "prim::clamp(len(effects::db.all[" ++ at_str(c.tables, table) ++ "]()) * " ++ int_to_string(a)
+        ++ " + "
+        ++ call_expr(c, def.module, f, "x")
+        ++ ")",
+    gmodel::TableSum(table, a) ->
+      "prim::clamp(prim::total(effects::db.all[" ++ at_str(c.tables, table) ++ "]()) + x * "
+        ++ int_to_string(a)
+        ++ ")",
+    gmodel::CachePeek(region, a) ->
+      "prim::clamp(effects::cache.peek[" ++ at_str(c.regions, region) ++ "]() + x * "
+        ++ int_to_string(a)
+        ++ ")",
+    gmodel::Now(a) -> "prim::clamp(effects::clock.now() % " ++ int_to_string(a) ++ " + x)",
+    gmodel::Sum(_, _, _) -> panic("block-shaped bodies are emitted by emit_def"),
+    gmodel::TableAppend(_, _, _) -> panic("block-shaped bodies are emitted by emit_def"),
+    gmodel::CachePoke(_, _) -> panic("block-shaped bodies are emitted by emit_def"),
+  }
+
+// `base` is the callee's first argument before the call's own offset is added.
+pub fn call_expr(c: gmodel::Corpus, here: Int, call: gmodel::Call, base: String) -> String = {
+  let callee = at_def(c, call.target);
+  let qualifier = qualify(c, here, call.target);
+  let first = if call.offset == 0 { base } else { base ++ " + " ++ int_to_string(call.offset) };
+  if callee.arity >= 2 {
+    qualifier ++ callee.name ++ "(" ++ first ++ ", "
+      ++ int_to_string(gmodel::second_arg(call.offset))
+      ++ ")"
+  } else { qualifier ++ callee.name ++ "(" ++ first ++ ")" }
+}
+
+// Same-module references are bare (a module has no binder for itself); others are `m::x`.
+fn qualify(c: gmodel::Corpus, here: Int, target: Int) -> String = {
+  let owner = at_def(c, target).module;
+  if owner == here { "" } else { gmodel::binder(at_mod(c, owner)) ++ "::" }
+}
+
+fn at_str(xs: List<String>, i: Int) -> String = match list_at(xs, i) { Some(s) -> s, None -> "" }
+
+pub fn emit_test(c: gmodel::Corpus, t: gmodel::Test) -> String = {
+  let keyword = if t.nondet { "test/nondet" } else { "test" };
+  let assertions = fold(range(0, len(t.calls)), [], |acc: List<String>, i: Int| {
+    let args = match list_at(t.calls, i) { Some(a) -> a, None -> [] };
+    let expected = match list_at(t.expected, i) { Some(v) -> v, None -> 0 };
+    let call = at_def(c, t.root).name ++ "(" ++ join_ints(args, ", ") ++ ")";
+    push(acc, "assert_eq(" ++ call ++ ", " ++ int_to_string(expected) ++ ")")
+  });
+  let with_tables = fold(t.final_table_len, assertions, |acc: List<String>, pair: (Int, Int)|
+    match pair {
+      (table, length) ->
+        push(
+          acc,
+          "assert_eq(len(cell_get(t" ++ int_to_string(table) ++ ")), " ++ int_to_string(length)
+            ++ ")",
+        ),
+    });
+  let with_regions = fold(t.final_region, with_tables, |acc: List<String>, pair: (Int, Int)|
+    match pair {
+      (region, value) ->
+        push(
+          acc,
+          "assert_eq(cell_get(r" ++ int_to_string(region) ++ "), " ++ int_to_string(value) ++ ")",
+        ),
+    });
+  let inner0 = join_lines(with_regions, ";\n");
+  let inner1 = if len(t.granted) == 0 { inner0 } else {
+    "handle {\n" ++ indent(inner0, 2) ++ "\n} with {\n"
+      ++ fold(handler_clauses(c, t, t.granted), "", |acc: String, cl: String|
+        acc ++ "  " ++ cl ++ ",\n")
+      ++ "}"
+  };
+  let inner2 = fold(reverse_pairs(t.final_table_len), inner1, |inner: String, pair: (Int, Int)|
+    match pair {
+      (table, _) ->
+        "with_cell[" ++ at_str(c.tables, table) ++ "]("
+          ++ literal_list(gmodel::world_table(t.world, table))
+          ++ ") { t"
+          ++ int_to_string(table)
+          ++ " ->\n"
+          ++ indent(inner, 2)
+          ++ "\n}",
+    });
+  let inner3 = fold(reverse_pairs(t.final_region), inner2, |inner: String, pair: (Int, Int)|
+    match pair {
+      (region, _) ->
+        "with_cell[" ++ at_str(c.regions, region) ++ "]("
+          ++ int_to_string(gmodel::world_region(t.world, region))
+          ++ ") { r"
+          ++ int_to_string(region)
+          ++ " ->\n"
+          ++ indent(inner, 2)
+          ++ "\n}",
+    });
+  keyword ++ " \"" ++ escape(t.label) ++ "\" {\n" ++ indent(inner3, 2) ++ "\n}\n"
+}
+
+fn reverse_pairs(xs: List<(Int, Int)>) -> List<(Int, Int)> =
+  fold(xs, [], |acc: List<(Int, Int)>, x: (Int, Int)| cat_pairs([x], acc))
+
+fn cat_pairs(a: List<(Int, Int)>, b: List<(Int, Int)>) -> List<(Int, Int)> =
+  fold(b, a, |acc: List<(Int, Int)>, x: (Int, Int)| push(acc, x))
+
+pub fn handler_clauses(
+  c: gmodel::Corpus,
+  t: gmodel::Test,
+  footprint: gmodel::Footprint,
+) -> List<String> =
+  fold(footprint, [], |acc: List<String>, a: gmodel::Atom| {
+    let written_table = |index: Int|
+      fold(t.final_table_len, false, |hit: Bool, pair: (Int, Int)|
+        match pair { (i, _) -> hit || i == index });
+    let written_region = |index: Int|
+      fold(t.final_region, false, |hit: Bool, pair: (Int, Int)|
+        match pair { (i, _) -> hit || i == index });
+    match ((a.eff, a.resource, a.write)) {
+      (gmodel::Db, Some(label), false) -> {
+        let index = position(c.tables, label);
+        let body = if written_table(index) { "cell_get(t" ++ int_to_string(index) ++ ")" }
+        else { literal_list(gmodel::world_table(t.world, index)) };
+        push(acc, "effects::db.all[" ++ label ++ "]() -> " ++ body)
+      },
+      (gmodel::Db, Some(label), true) -> {
+        let index = position(c.tables, label);
+        push(
+          acc,
+          "effects::db.save[" ++ label ++ "](rows) -> cell_set(t" ++ int_to_string(index)
+            ++ ", rows)",
+        )
+      },
+      (gmodel::Cache, Some(label), false) -> {
+        let index = position(c.regions, label);
+        let body = if written_region(index) { "cell_get(r" ++ int_to_string(index) ++ ")" }
+        else { int_to_string(gmodel::world_region(t.world, index)) };
+        push(acc, "effects::cache.peek[" ++ label ++ "]() -> " ++ body)
+      },
+      (gmodel::Cache, Some(label), true) -> {
+        let index = position(c.regions, label);
+        push(
+          acc,
+          "effects::cache.poke[" ++ label ++ "](v) -> cell_set(r" ++ int_to_string(index) ++ ", v)",
+        )
+      },
+      (gmodel::Clock, _, _) ->
+        push(acc, "effects::clock.now() -> " ++ int_to_string(t.world.clock)),
+      _ -> acc,
+    }
+  })
+
+fn position(labels: List<String>, label: String) -> Int =
+  match fold(labels, (0, 0), |acc: (Int, Int), l: String|
+      match acc {
+        (i, found) -> if found == 1 { (i, found) }
+        else if l == label { (i, 1) }
+        else { (i + 1, 0) },
+      }) {
+    (i, _) -> i,
+  }
+
+fn literal_list(values: List<Int>) -> String = "[" ++ join_ints(values, ", ") ++ "]"
+
+fn join_ints(xs: List<Int>, sep: String) -> String =
+  fold(xs, "", |acc: String, v: Int| (if acc == "" { acc } else { acc ++ sep }) ++ int_to_string(v))
+
+pub fn indent(text: String, by: Int) -> String =
+  join_lines(map(string_lines(text), |l: String| spaces(by) ++ l), "\n")
+
+// Indents every line but the first, for text spliced after something already on the line.
+fn indent_tail(text: String, by: Int) -> String =
+  match string_lines(text) {
+    [] -> "",
+    [first, ..rest] -> fold(rest, first, |acc: String, l: String| acc ++ "\n" ++ spaces(by) ++ l),
+  }
+
+fn join_lines(xs: List<String>, sep: String) -> String =
+  fold(xs, "", |acc: String, l: String| (if acc == "" { acc } else { acc ++ sep }) ++ l)
+
+fn string_lines(text: String) -> List<String> = go_lines(bytes_of_string(text), 0, 0, [])
+
+fn go_lines(b: Bytes, from: Int, i: Int, acc: List<String>) -> List<String> =
+  if i >= bytes_len(b) {
+    if from >= bytes_len(b) { acc }
+    else { push(acc, string_of_bytes(bytes_slice(b, from, bytes_len(b)))) }
+  } else if bytes_at(b, i) == 10 {
+    go_lines(b, i + 1, i + 1, push(acc, string_of_bytes(bytes_slice(b, from, i))))
+  } else { go_lines(b, from, i + 1, acc) }
+
+fn spaces(n: Int) -> String =
+  match n { 0 -> "", 2 -> "  ", 4 -> "    ", 6 -> "      ", 8 -> "        ", _ -> spaces_go(n, "") }
+
+fn spaces_go(n: Int, acc: String) -> String =
+  if n <= 0 { acc } else { spaces_go(n - 1, acc ++ " ") }
+
+pub fn escape(label: String) -> String =
+  replace_all_text(replace_all_text(label, "\\", "\\\\"), "\"", "\\\"")
+
+fn replace_all_text(text: String, find: String, replacement: String) -> String = {
+  let (b, f) = (bytes_of_string(text), bytes_of_string(find));
+  match bytes_index_of(b, f) {
+    None -> text,
+    Some(i) ->
+      string_of_bytes(
+        bytes_concat_all([
+          bytes_slice(b, 0, i),
+          bytes_of_string(replacement),
+          bytes_of_string(
+            replace_all_text(
+              string_of_bytes(bytes_slice(b, i + bytes_len(f), bytes_len(b))),
+              find,
+              replacement,
+            ),
+          ),
+        ]),
+      ),
+  }
+}
+
+pub fn emit_specimen(c: gmodel::Corpus, specimen: gmodel::Specimen) -> String = {
+  let m = at_mod(c, specimen.module);
+  match specimen.kind {
+    gmodel::Linear(a, b) ->
+      "fn " ++ specimen.name ++ "(x: Int) -> Int\n  ensures result - " ++ int_to_string(b)
+        ++ " == x * "
+        ++ int_to_string(a)
+        ++ "\n= x * "
+        ++ int_to_string(a)
+        ++ " + "
+        ++ int_to_string(b)
+        ++ "\n",
+    gmodel::Status ->
+      "fn " ++ specimen.name ++ "(s: " ++ m.status_type
+        ++ ") -> Int\n  ensures result == 1 || result == 0\n= match s {\n    "
+        ++ m.ctor_ready
+        ++ "(_) -> 1,\n    "
+        ++ m.ctor_idle
+        ++ " -> 0,\n  }\n",
+    gmodel::Length ->
+      "fn " ++ specimen.name
+        ++ "(xs: List<Int>) -> Int\n  ensures result >= 0\n= match xs {\n    [_, ..rest] -> 1 + "
+        ++ specimen.name
+        ++ "(rest),\n    _ -> 0,\n  }\n",
+  }
+}
+
+pub fn emit_law(c: gmodel::Corpus, law: gmodel::Law) -> String = {
+  let body = match law.kind {
+    gmodel::Ground(a, b) ->
+      int_to_string(a) ++ " * 3 + " ++ int_to_string(b) ++ " == " ++ int_to_string(a * 3 + b),
+    gmodel::Finite -> "(ready && paid) == !(!ready || !paid)",
+    gmodel::LawLength(specimen) -> at_specimen(c, specimen).name ++ "(xs) >= 0",
+  };
+  let label = escape(law.label);
+  match law.kind {
+    gmodel::Ground(_, _) -> "law \"" ++ label ++ "\" {\n  " ++ body ++ "\n}\n",
+    gmodel::Finite ->
+      "law \"" ++ label ++ "\"\n  forall (ready: Bool, paid: Bool) {\n    " ++ body ++ "\n  }\n",
+    gmodel::LawLength(_) ->
+      "law \"" ++ label ++ "\"\n  forall (xs: List<Int>) {\n    " ++ body ++ "\n  }\n",
+  }
+}
+
+fn at_specimen(c: gmodel::Corpus, id: Int) -> gmodel::Specimen =
+  match list_at(c.specimens, id) { Some(s) -> s, None -> panic("no specimen") }
+
+pub fn emit_specimen_test(c: gmodel::Corpus, m: gmodel::Module) -> String = {
+  let body = fold(specimens_in(c, m.id), [], |acc: List<String>, specimen: gmodel::Specimen|
+    match specimen.kind {
+      gmodel::Linear(a, b) ->
+        push(acc, "assert_eq(" ++ specimen.name ++ "(7), " ++ int_to_string(7 * a + b) ++ ")"),
+      gmodel::Status ->
+        push(
+          acc,
+          "assert_eq(" ++ specimen.name ++ "(" ++ m.ctor_ready ++ "(1)), 1);\nassert_eq("
+            ++ specimen.name
+            ++ "("
+            ++ m.ctor_idle
+            ++ "), 0)",
+        ),
+      gmodel::Length ->
+        push(
+          acc,
+          "assert_eq(" ++ specimen.name ++ "([4, 5, 6]), 3);\nassert_eq(" ++ specimen.name
+            ++ "([]), 0)",
+        ),
+    });
+  "test \"the specified definitions of " ++ m.name ++ " return what their claims say\" {\n"
+    ++ indent(join_lines(body, ";\n"), 2)
+    ++ "\n}\n"
+}
+
+pub fn emit_task(c: gmodel::Corpus, task: gmodel::TaskBody) -> String = {
+  let label = at_str(c.shards, task.shard);
+  let steps = fold(range(0, len(task.steps)), "", |acc: String, i: Int| {
+    let step = match list_at(task.steps, i) { Some(v) -> v, None -> 0 };
+    acc ++ (if i > 0 { "  task.yield();\n" } else { "" }) ++ "  effects::counter.bump[" ++ label
+      ++ "]("
+      ++ int_to_string(step)
+      ++ ");\n"
+  });
+  "fn " ++ task.name ++ "() -> Int / {effects::counter.write[" ++ label ++ "], task.write} {\n"
+    ++ steps
+    ++ "  "
+    ++ int_to_string(gmodel::contributed(task))
+    ++ "\n}\n"
+}
+
+// One cell and handler clause per shard, asserting only what holds under every interleaving.
+pub fn emit_concurrent_test(c: gmodel::Corpus, t: gmodel::ConcurrentTest) -> String = {
+  let spawns = fold(range(0, len(t.tasks)), [], |acc: List<String>, i: Int|
+    push(acc, "let t" ++ int_to_string(i) ++ " = task.spawn(|| " ++ at_task(t, i).name ++ "());"));
+  let joins = fold(range(0, len(t.tasks)), "", |acc: String, i: Int|
+    (if acc == "" { acc } else { acc ++ " + " }) ++ "task.join(t" ++ int_to_string(i) ++ ")");
+  let total_assert = "assert_eq(" ++ joins ++ ", " ++ int_to_string(gmodel::concurrent_total(t))
+    ++ ");";
+  let shard_asserts = fold(t.shards, [], |acc: List<String>, shard: Int|
+    push(
+      acc,
+      "assert_eq(cell_get(c" ++ int_to_string(shard) ++ "), "
+        ++ int_to_string(gmodel::shard_total(t, shard))
+        ++ ")",
+    ));
+  let body = cat_strings(spawns, [total_assert, join_lines(shard_asserts, ";\n")]);
+  let clauses = fold(t.shards, "", |acc: String, shard: Int|
+    acc ++ "  effects::counter.bump[" ++ at_str(c.shards, shard) ++ "](n) -> cell_set(c"
+      ++ int_to_string(shard)
+      ++ ", cell_get(c"
+      ++ int_to_string(shard)
+      ++ ") + n),\n");
+  let handled = "handle {\n  simulate {\n" ++ indent(join_lines(body, "\n"), 4)
+    ++ "\n  }\n} with {\n"
+    ++ clauses
+    ++ "}";
+  let with_cells = fold(reverse_ints(t.shards), handled, |inner: String, shard: Int|
+    "with_cell[" ++ at_str(c.shards, shard) ++ "](0) { c" ++ int_to_string(shard) ++ " ->\n"
+      ++ indent(inner, 2)
+      ++ "\n}");
+  "test \"" ++ escape(t.label) ++ "\" {\n" ++ indent(with_cells, 2) ++ "\n}\n"
+}
+
+fn cat_strings(a: List<String>, b: List<String>) -> List<String> =
+  fold(b, a, |acc: List<String>, x: String| push(acc, x))
+
+fn reverse_ints(xs: List<Int>) -> List<Int> =
+  fold(xs, [], |acc: List<Int>, x: Int| cat_ints([x], acc))
+
+fn cat_ints(a: List<Int>, b: List<Int>) -> List<Int> =
+  fold(b, a, |acc: List<Int>, x: Int| push(acc, x))
+
+fn at_task(t: gmodel::ConcurrentTest, i: Int) -> gmodel::TaskBody =
+  match list_at(t.tasks, i) { Some(task) -> task, None -> panic("no task") }
+
+// Wraps a one-line definition body in another `prim::clamp`.
+pub fn wrap_body(text: String) -> Option<String> = {
+  let lines = string_lines(text);
+  let last = len(lines) - 1;
+  if last < 1 { None } else {
+    let body = match list_at(lines, last) { Some(l) -> l, None -> "" };
+    let head = match list_at(lines, last - 1) { Some(l) -> l, None -> "" };
+    if !bytes_ends_with(bytes_of_string(head), bytes_of_string("=")) { None } else {
+      let kept = fold(range(0, last), [], |acc: List<String>, i: Int|
+        push(acc, match list_at(lines, i) { Some(l) -> l, None -> "" }));
+      Some(
+        join_lines(cat_strings(kept, ["  prim::clamp(" ++ string_trim(body) ++ ")"]), "\n") ++ "\n",
+      )
+    }
+  }
+}
+
+fn string_trim(s: String) -> String = string_of_bytes(trim_bytes(bytes_of_string(s)))
+
+fn trim_bytes(b: Bytes) -> Bytes = {
+  let start = fold(range(0, bytes_len(b)), 0, |acc: Int, i: Int|
+    if acc == i && (bytes_at(b, i) == 32 || bytes_at(b, i) == 9) { i + 1 } else { acc });
+  let end = fold(range(0, bytes_len(b)), bytes_len(b), |acc: Int, i: Int| {
+    let j = bytes_len(b) - 1 - i;
+    if acc == j + 1 && (bytes_at(b, j) == 32 || bytes_at(b, j) == 9) { j } else { acc }
+  });
+  bytes_slice(b, start, end)
+}
+
+// --- Tests -----------------------------------------------------------------------------
+
+test "an arith def emits like the Rust" {
+  let c: gmodel::Corpus = {
+    modules: [
+      {
+        id: 0,
+        name: "store0.core_0",
+        path: "store0/core_0.ply",
+        layer: 0,
+        imports: [],
+        defs: [0],
+        helper: { name: "stage_0", m: 3, b: 7 },
+        status_type: "Status0",
+        ctor_ready: "Ready0",
+        ctor_idle: "Idle0",
+        needs_effects: false,
+      },
+    ],
+    defs: [
+      {
+        id: 0,
+        module: 0,
+        name: "apply_0",
+        arity: 1,
+        shape: gmodel::Arith(3, 5),
+        extras: [],
+        footprint: [],
+        weight: 1,
+        public: false,
+        claim: None,
+      },
+    ],
+    tests: [],
+    concurrent: [],
+    specimens: [],
+    laws: [],
+    tables: [],
+    regions: [],
+    shards: [],
+  };
+  assert_eq(emit_def(c, at_def(c, 0)), "fn apply_0(x: Int) -> Int =\n  prim::clamp(x * 3 + 5)\n");
+}
+
+test "a claimed def carries its requires and ensures" {
+  let c: gmodel::Corpus = {
+    modules: [
+      {
+        id: 0,
+        name: "store0.core_0",
+        path: "store0/core_0.ply",
+        layer: 0,
+        imports: [],
+        defs: [0],
+        helper: { name: "stage_0", m: 3, b: 7 },
+        status_type: "Status0",
+        ctor_ready: "Ready0",
+        ctor_idle: "Idle0",
+        needs_effects: false,
+      },
+    ],
+    defs: [
+      {
+        id: 0,
+        module: 0,
+        name: "apply_0",
+        arity: 1,
+        shape: gmodel::Arith(3, 5),
+        extras: [],
+        footprint: [],
+        weight: 1,
+        public: false,
+        claim: Some({ intent: gmodel::Sampled }),
+      },
+    ],
+    tests: [],
+    concurrent: [],
+    specimens: [],
+    laws: [],
+    tables: [],
+    regions: [],
+    shards: [],
+  };
+  let out = emit_def(c, at_def(c, 0));
+  assert(string_contains(out, "requires x > 0 && x < 1000"));
+  assert(string_contains(out, "ensures result < 100003 && result > -100003"));
+}
+
+test "wrap_body clamps the one-liner's last line" {
+  let text = "fn apply_0(x: Int) -> Int =\n  prim::clamp(x * 3 + 5)\n";
+  match wrap_body(text) {
+    Some(wrapped) -> assert(string_contains(wrapped, "  prim::clamp(prim::clamp(x * 3 + 5))")),
+    None -> assert(false),
+  }
+}

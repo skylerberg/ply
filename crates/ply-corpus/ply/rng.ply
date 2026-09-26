@@ -1,0 +1,150 @@
+// SplitMix64, written out so a seed's corpus stays byte-identical across dependency upgrades —
+// and now across runtimes: the same stream the Rust generator produced, bit for bit. `Int`
+// carries the bits; `wrap_add`/`wrap_mul` keep the arithmetic modular, and the logical shifts
+// and unsigned remainders are spelled out where a signed `Int` would read them wrong.
+
+pub type Rng = { state: Int }
+
+pub fn new(seed: Int) -> Rng = { state: wrap_add(seed, 0x9E3779B97F4A7C15) }
+
+// A sub-stream keyed by `tag`.
+pub fn fork(r: Rng, tag: Int) -> Rng = new(r.state ^ wrap_mul(tag, 0xD1B54A32D192ED03))
+
+pub fn next_u64(r: Rng) -> (Rng, Int) = {
+  let state = wrap_add(r.state, 0x9E3779B97F4A7C15);
+  let z1 = wrap_mul(state ^ lsr(state, 30), 0xBF58476D1CE4E5B9);
+  let z2 = wrap_mul(z1 ^ lsr(z1, 27), 0x94D049BB133111EB);
+  ({ state: state }, z2 ^ lsr(z2, 31))
+}
+
+// The logical shift right the stream wants: the bit pattern shifted, not the sign extended.
+// Only the shifts SplitMix64 makes (27, 30 and 31) pass through here.
+pub fn lsr(z: Int, k: Int) -> Int =
+  if z >= 0 { z / pow2(k) } else { wrap_add((z - pow2(k) + 1) / pow2(k), pow2(64 - k)) }
+
+fn pow2(k: Int) -> Int =
+  match k {
+    1 -> 2,
+    11 -> 2048,
+    27 -> 134217728,
+    30 -> 1073741824,
+    31 -> 2147483648,
+    33 -> 8589934592,
+    34 -> 17179869184,
+    37 -> 137438953472,
+    53 -> 9007199254740992,
+    _ -> panic("pow2: a shift of " ++ int_to_string(k)),
+  }
+
+// The unsigned remainder: the bits as a count, mod `n`. Signed `%` reads a negative high bit
+// as a negative count; this does not.
+pub fn umod(v: Int, n: Int) -> Int =
+  if v >= 0 { v % n } else {
+    // v as u64 is u64::MAX - (-v - 1), and u64::MAX is 2 * (2^63 - 1) + 1.
+    let max = (2 * (9223372036854775807 % n) + 1) % n;
+    let w = (-v - 1) % n;
+    (max - w + n) % n
+  }
+
+// Uniform in `0..n`; 0 when `n` is 0, rather than dividing by zero.
+pub fn below(r: Rng, n: Int) -> (Rng, Int) = {
+  let (next, v) = next_u64(r);
+  (next, if n <= 0 { 0 } else { umod(v, n) })
+}
+
+// Inclusive on both ends.
+pub fn between(r: Rng, lo: Int, hi: Int) -> (Rng, Int) = {
+  let (next, v) = next_u64(r);
+  (next, if hi <= lo { lo } else { lo + umod(v, hi - lo + 1) })
+}
+
+pub fn chance(r: Rng, p: Float) -> (Rng, Bool) = {
+  let (next, v) = next_u64(r);
+  let u = float_of_decimal(decimal_of_int(lsr(v, 11))) / 9007199254740992.0;
+  (next, u < clamp01(p))
+}
+
+fn clamp01(p: Float) -> Float = if p < 0.0 { 0.0 } else if p > 1.0 { 1.0 } else { p }
+
+// The smallest of `bias + 1` uniform draws from `0..n`.
+pub fn skewed_below(r: Rng, n: Int, bias: Int) -> (Rng, Int) = {
+  let (r1, first) = below(r, n);
+  skew_go(r1, n, bias, first)
+}
+
+fn skew_go(r: Rng, n: Int, left: Int, best: Int) -> (Rng, Int) =
+  if left <= 0 { (r, best) } else {
+    let (r1, draw) = below(r, n);
+    skew_go(r1, n, left - 1, if draw < best { draw } else { best })
+  }
+
+// --- Tests -----------------------------------------------------------------------
+
+test "the stream is SplitMix64's, bit for bit" {
+  let (r1, a) = next_u64(new(42));
+  let (r2, b) = next_u64(r1);
+  let (r3, c) = next_u64(r2);
+  let (r4, d) = next_u64(r3);
+  let (r5, e) = next_u64(r4);
+  let (_, f) = next_u64(r5);
+  assert_eq(a, 2949826092126892291);
+  assert_eq(b, 5139283748462763858);
+  assert_eq(c, 6349198060258255764);
+  assert_eq(d, 701532786141963250);
+  assert_eq(e, -2430762948046562554);
+  assert_eq(f, 4028864712777624925);
+  let (_, h) = next_u64(fork(new(42), 7));
+  assert_eq(h, 1121485713539611027);
+  let (_, z) = next_u64(new(0));
+  assert_eq(z, 7960286522194355700);
+}
+
+test "the helpers read the stream the way the Rust did" {
+  let (r1, lo) = below(new(42), 100);
+  let (r2, mid) = between(r1, 1, 60);
+  let (r3, c) = chance(r2, 0.5);
+  let (_, skew) = skewed_below(r3, 50, 3);
+  assert_eq(lo, 91);
+  assert_eq(mid, 19);
+  assert(c);
+  assert_eq(skew, 0);
+}
+
+test "umod reads the high bit as count, not sign" {
+  assert_eq(umod(-2430762948046562554, 100), 62);
+  assert_eq(umod(7, 3), 1);
+  assert_eq(umod(-1, 2), 1);
+}
+
+test "the def fork's stream" {
+  let r = fork(new(1), 0x20000000);
+  let (r1, a) = next_u64(r);
+  let (r2, b) = next_u64(r1);
+  let (r3, c) = next_u64(r2);
+  let (r4, d) = next_u64(r3);
+  assert_eq(a, -5754630906580299942);
+  assert_eq(b, -5391728252474553473);
+  assert_eq(c, -6396616370773976215);
+  assert_eq(d, 6909043414471030925);
+}
+
+test "the def-one replay" {
+  let r = fork(new(1), 0x20000001);
+  let (r1, arity) = chance(r, 0.12);
+  let (r2, eff) = chance(r1, 0.35);
+  let (r3, pick) = below(r2, 100);
+  let (r4, n) = between(r3, 2, 8);
+  let (r5, k) = between(r4, 2, 9);
+  let (r6, extras) = below(r5, 100);
+  let (r7, s1) = skewed_below(r6, 1, 2);
+  let (r8, off1) = between(r7, 0, 30);
+  let (r9, s2) = skewed_below(r8, 1, 2);
+  let _ = (r9, arity, eff);
+  assert_eq(pick, 41);
+  assert_eq(n, 7);
+  assert_eq(k, 2);
+  assert_eq(extras, 61);
+  assert_eq(s1, 0);
+  assert_eq(off1, 9);
+  assert_eq(s2, 0);
+}

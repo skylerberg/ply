@@ -1,15 +1,10 @@
 //! The bench, end to end: a tiny generated corpus, the corpus package's own `bench.run`
 //! driving the real `ply`, and the scenarios judged from the report it answers.
 
-use ply_corpus::build::generate;
+use crate::support::{generate, ply};
 use ply_corpus::cmd::run_ply_subcommand;
 use ply_corpus::spec::CorpusSpec;
-use ply_corpus::write::write;
-use std::path::{Path, PathBuf};
-
-fn ply() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/ply")
-}
+use std::path::Path;
 
 fn corpus_at(root: &Path) {
     let spec = CorpusSpec {
@@ -20,7 +15,7 @@ fn corpus_at(root: &Path) {
         depth: 2,
         ..CorpusSpec::default()
     };
-    write(root, &spec, &generate(&spec)).unwrap();
+    generate(root, &spec);
 }
 
 fn bench(root: &Path) -> serde_json::Value {

@@ -1,0 +1,314 @@
+// The corpus's manifest: the edit sites and the shape tallies, computed from the graph the
+// build made. The JSON is what `bench` and the sweeps read back.
+
+import gmodel
+import gbuild
+import gemit
+import std.json (Json, Str, Number, Bool, Null, object, array)
+import std.json
+
+pub type EditSite = { path: String, find: String, replace: String, dependents: Int }
+
+pub type Manifest = {
+  files: Int,
+  modules: Int,
+  definitions: Int,
+  effectful_definitions: Int,
+  tests: Int,
+  nondet_tests: Int,
+  bytes: Int,
+  distinct_resources: Int,
+  max_call_weight: Int,
+  hub_edit: EditSite,
+  leaf_edit: EditSite,
+  rename_symbol: String,
+  rename_replacement: String,
+}
+
+pub fn manifest_for(
+  spec: gbuild::Spec,
+  c: gmodel::Corpus,
+  files: Int,
+  bytes: Int,
+) -> Result<Manifest, String> = {
+  let callers = reverse_edges(c);
+  let tested = fold(c.tests, [], |acc: List<Int>, t: gmodel::Test| push(acc, t.root));
+  match pick(c, callers, tested, true) {
+    None -> Err("corpus holds no one-line definition to use as an edit site"),
+    Some(hub) -> match pick(c, callers, tested, false) {
+      None -> Err("corpus holds no one-line definition to use as an edit site"),
+      Some(leaf) -> match edit_site(c, callers, hub) {
+        Err(e) -> Err(e),
+        Ok(hub_edit) -> match edit_site(c, callers, leaf) {
+          Err(e) -> Err(e),
+          Ok(leaf_edit) ->
+            Ok({
+              files: files,
+              modules: len(c.modules),
+              definitions: len(c.defs),
+              effectful_definitions: gmodel::effectful_defs(c),
+              tests: len(c.tests),
+              nondet_tests: fold(c.tests, 0, |acc: Int, t: gmodel::Test|
+                if t.nondet { acc + 1 } else { acc }),
+              bytes: bytes,
+              distinct_resources: len(c.tables) + len(c.regions),
+              max_call_weight: fold(c.defs, 0, |acc: Int, d: gmodel::Def|
+                if d.weight > acc { d.weight } else { acc }),
+              hub_edit: hub_edit,
+              leaf_edit: leaf_edit,
+              rename_symbol: gmodel::at_def_pub(c, leaf).name,
+              rename_replacement: gmodel::at_def_pub(c, leaf).name ++ "_renamed",
+            }),
+        },
+      },
+    },
+  }
+}
+
+pub fn reverse_edges(c: gmodel::Corpus) -> List<List<Int>> = {
+  let seeded = map(c.defs, |_: gmodel::Def| []);
+  fold(c.defs, seeded, |acc: List<List<Int>>, def: gmodel::Def|
+    fold(
+      cat_calls(gmodel::shape_calls(def.shape), def.extras),
+      acc,
+      |inner: List<List<Int>>, call: gmodel::Call|
+        map(range(0, len(inner)), |i: Int|
+          if i == call.target { push(at_lists(inner, i), def.id) } else { at_lists(inner, i) }),
+    ))
+}
+
+fn at_lists(xs: List<List<Int>>, i: Int) -> List<Int> =
+  match list_at(xs, i) { Some(l) -> l, None -> [] }
+
+fn cat_calls(a: List<gmodel::Call>, b: List<gmodel::Call>) -> List<gmodel::Call> =
+  fold(b, a, |acc: List<gmodel::Call>, x: gmodel::Call| push(acc, x))
+
+// The most, or least, depended upon one-line definition that some test roots at.
+pub fn pick(
+  c: gmodel::Corpus,
+  callers: List<List<Int>>,
+  tested: List<Int>,
+  most: Bool,
+) -> Option<Int> =
+  match fold(c.defs, None, |best: Option<(Int, Int)>, d: gmodel::Def|
+      if !gmodel::is_one_liner(d.shape) || !has_int(tested, d.id) { best } else {
+        let reach = len(at_lists(callers, d.id));
+        let better = match best {
+          None -> true,
+          Some(pair) -> match pair {
+            (count, _) -> if most { reach > count } else { reach < count },
+          },
+        };
+        if better { Some((reach, d.id)) } else { best }
+      }) {
+    Some(pair) -> match pair { (_, id) -> Some(id) },
+    None -> None,
+  }
+
+fn has_int(xs: List<Int>, v: Int) -> Bool = fold(xs, false, |acc: Bool, x: Int| acc || x == v)
+
+pub fn transitive_dependents(callers: List<List<Int>>, from: Int) -> Int = {
+  let seen = reach_from(callers, [from], []);
+  len(seen)
+}
+
+fn reach_from(callers: List<List<Int>>, stack: List<Int>, seen: List<Int>) -> List<Int> =
+  match stack {
+    [] -> seen,
+    [id, ..rest] -> if has_int(seen, id) { reach_from(callers, rest, seen) }
+    else { reach_from(callers, cat_ints(rest, at_lists(callers, id)), push(seen, id)) },
+  }
+
+fn cat_ints(a: List<Int>, b: List<Int>) -> List<Int> =
+  fold(b, a, |acc: List<Int>, x: Int| push(acc, x))
+
+fn edit_site(c: gmodel::Corpus, callers: List<List<Int>>, target: Int) -> Result<EditSite, String> = {
+  let def = gmodel::at_def_pub(c, target);
+  let find = gemit::emit_def(c, def);
+  match gemit::wrap_body(find) {
+    None -> Err("`" ++ def.name ++ "` is not a one-line definition after all"),
+    Some(replace) ->
+      Ok({
+        path: (match list_at(c.modules, def.module) {
+          Some(m) -> m,
+          None -> panic("no module"),
+        }).path,
+        find: find,
+        replace: replace,
+        dependents: transitive_dependents(callers, target),
+      }),
+  }
+}
+
+// --- The JSON the readers decode -----------------------------------------------------------
+
+pub fn manifest_json(spec: gbuild::Spec, c: gmodel::Corpus, m: Manifest) -> Json = {
+  let (decided, sampled, gaps) = gmodel::obligations_by_intent(c);
+  let specified = gmodel::specified_defs(c) + len(c.specimens);
+  object([
+    { key: "spec", value: spec_json(spec) },
+    { key: "files", value: num(m.files) },
+    { key: "modules", value: num(m.modules) },
+    { key: "definitions", value: num(m.definitions) },
+    { key: "effectful_definitions", value: num(m.effectful_definitions) },
+    { key: "tests", value: num(m.tests) },
+    { key: "nondet_tests", value: num(m.nondet_tests) },
+    {
+      key: "concurrency",
+      value: object([
+        { key: "tests", value: num(len(c.concurrent)) },
+        { key: "tasks_per_test", value: num(spec.tasks_per_test) },
+        { key: "steps_per_task", value: num(spec.steps_per_task) },
+        { key: "shards_per_test", value: num(gbuild::shards_per_test(spec)) },
+        { key: "conflict_density", value: float_json(spec.conflict_density) },
+        { key: "contention", value: float_json(mean_contention(c)) },
+      ]),
+    },
+    {
+      key: "specs",
+      value: object([
+        { key: "specified_definitions", value: num(specified) },
+        { key: "unspecified_definitions", value: num(len(c.defs) + len(c.specimens) - specified) },
+        { key: "obligations", value: num(decided + sampled + gaps) },
+        { key: "laws", value: num(len(c.laws)) },
+        { key: "specimens", value: num(len(c.specimens)) },
+        { key: "decided", value: num(decided) },
+        { key: "sampled", value: num(sampled) },
+        { key: "gaps", value: num(gaps) },
+      ]),
+    },
+    { key: "bytes", value: num(m.bytes) },
+    { key: "distinct_resources", value: num(m.distinct_resources) },
+    { key: "mean_out_degree", value: float_json(mean_out_degree(c)) },
+    { key: "max_call_weight", value: num(m.max_call_weight) },
+    { key: "hub_edit", value: edit_json(m.hub_edit) },
+    { key: "leaf_edit", value: edit_json(m.leaf_edit) },
+    {
+      key: "rename",
+      value: object([
+        { key: "symbol", value: Str(m.rename_symbol) },
+        { key: "replacement", value: Str(m.rename_replacement) },
+      ]),
+    },
+  ])
+}
+
+fn num(n: Int) -> Json = Number(decimal_of_int(n))
+
+fn float_json(f: Float) -> Json = match decimal_of_float(f) { Some(d) -> Number(d), None -> Null }
+
+fn edit_json(e: EditSite) -> Json =
+  object([
+    { key: "path", value: Str(e.path) },
+    { key: "find", value: Str(e.find) },
+    { key: "replace", value: Str(e.replace) },
+    { key: "dependents", value: num(e.dependents) },
+  ])
+
+fn mean_out_degree(c: gmodel::Corpus) -> Float = {
+  let edges = fold(c.defs, 0, |acc: Int, d: gmodel::Def|
+    acc + len(gmodel::shape_calls(d.shape)) + len(d.extras));
+  let defs = if len(c.defs) > 0 { len(c.defs) } else { 1 };
+  float_of_decimal(decimal_div(decimal_of_int(edges), decimal_of_int(defs), 10, HalfUp))
+}
+
+fn mean_contention(c: gmodel::Corpus) -> Float =
+  if len(c.concurrent) == 0 { 0.0 } else {
+    let total = fold(c.concurrent, 0.0, |acc: Float, t: gmodel::ConcurrentTest|
+      acc + gmodel::contention(t));
+    total / float_of_decimal(decimal_of_int(len(c.concurrent)))
+  }
+
+fn spec_json(spec: gbuild::Spec) -> Json =
+  object([
+    { key: "seed", value: num(spec.seed) },
+    { key: "modules", value: num(spec.modules) },
+    { key: "defs_per_module", value: num(spec.defs_per_module) },
+    { key: "tests", value: num(spec.tests) },
+    { key: "depth", value: num(spec.depth) },
+    { key: "tables", value: num(spec.tables) },
+    { key: "regions", value: num(spec.regions) },
+    { key: "effect_fraction", value: float_json(spec.effect_fraction) },
+    { key: "nondet_fraction", value: float_json(spec.nondet_fraction) },
+    { key: "hub_modules", value: num(spec.hub_modules) },
+    { key: "max_weight", value: num(spec.max_weight) },
+    { key: "concurrent_tests", value: num(spec.concurrent_tests) },
+    { key: "tasks_per_test", value: num(spec.tasks_per_test) },
+    { key: "steps_per_task", value: num(spec.steps_per_task) },
+    { key: "conflict_density", value: float_json(spec.conflict_density) },
+    { key: "spec_fraction", value: float_json(spec.spec_fraction) },
+    { key: "specimens_per_module", value: num(spec.specimens_per_module) },
+  ])
+
+// --- Tests ---------------------------------------------------------------------------------
+
+test "the reverse graph counts dependents" {
+  let c: gmodel::Corpus = {
+    modules: [
+      {
+        id: 0,
+        name: "store0.core_0",
+        path: "store0/core_0.ply",
+        layer: 0,
+        imports: [],
+        defs: [0, 1, 2],
+        helper: { name: "stage_0", m: 3, b: 7 },
+        status_type: "Status0",
+        ctor_ready: "Ready0",
+        ctor_idle: "Idle0",
+        needs_effects: false,
+      },
+    ],
+    defs: [
+      {
+        id: 0,
+        module: 0,
+        name: "a",
+        arity: 1,
+        shape: gmodel::Arith(1, 1),
+        extras: [],
+        footprint: [],
+        weight: 1,
+        public: false,
+        claim: None,
+      },
+      {
+        id: 1,
+        module: 0,
+        name: "b",
+        arity: 1,
+        shape: gmodel::Compose({ target: 0, offset: 0 }, { target: 0, offset: 1 }),
+        extras: [],
+        footprint: [],
+        weight: 2,
+        public: false,
+        claim: None,
+      },
+      {
+        id: 2,
+        module: 0,
+        name: "c",
+        arity: 1,
+        shape: gmodel::Guard(2, { target: 1, offset: 0 }, 3),
+        extras: [],
+        footprint: [],
+        weight: 3,
+        public: false,
+        claim: None,
+      },
+    ],
+    tests: [],
+    concurrent: [],
+    specimens: [],
+    laws: [],
+    tables: [],
+    regions: [],
+    shards: [],
+  };
+  let callers = reverse_edges(c);
+  assert_eq(transitive_dependents(callers, 0), 3);
+  assert_eq(transitive_dependents(callers, 1), 2);
+  assert_eq(transitive_dependents(callers, 2), 1);
+  assert_eq(pick(c, callers, [0, 1, 2], true), Some(0));
+  assert_eq(pick(c, callers, [0, 1, 2], false), Some(2));
+}

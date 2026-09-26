@@ -1,7 +1,6 @@
-use ply_corpus::build::generate;
+use crate::support::generate as generate_corpus;
 use ply_corpus::simulate::{Trial, race_power, reduction, seed_rate, stat, summarize};
 use ply_corpus::spec::CorpusSpec;
-use ply_corpus::write;
 
 fn corpus(density: f64, tasks: usize) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -17,7 +16,7 @@ fn corpus(density: f64, tasks: usize) -> tempfile::TempDir {
         conflict_density: density,
         ..CorpusSpec::default()
     };
-    write::write(dir.path(), &spec, &generate(&spec)).unwrap();
+    generate_corpus(dir.path(), &spec);
     dir
 }
 

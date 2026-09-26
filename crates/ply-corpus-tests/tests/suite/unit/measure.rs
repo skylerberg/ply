@@ -1,7 +1,7 @@
-use ply_corpus::build::generate;
+use crate::support::generate as generate_corpus;
 use ply_corpus::measure::{scheduling, throughput};
 use ply_corpus::spec::CorpusSpec;
-use ply_corpus::write::write;
+
 use std::path::Path;
 
 fn corpus_at(root: &Path) {
@@ -13,7 +13,7 @@ fn corpus_at(root: &Path) {
         depth: 2,
         ..CorpusSpec::default()
     };
-    write(root, &spec, &generate(&spec)).unwrap();
+    generate_corpus(root, &spec);
 }
 
 #[test]
