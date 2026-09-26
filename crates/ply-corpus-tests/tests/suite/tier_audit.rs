@@ -1,4 +1,5 @@
-use ply_corpus::{CorpusSpec, build::generate, write};
+use crate::support::generate;
+use ply_corpus::CorpusSpec;
 use ply_machine::engine::Prover;
 use ply_machine::load::load;
 use ply_machine::obligations;
@@ -25,7 +26,7 @@ fn every_proof_a_generated_corpus_produces_survives_a_wide_sample() {
             specimens_per_module: 3,
             ..CorpusSpec::default()
         };
-        write::write(&root, &spec, &generate(&spec)).unwrap();
+        generate(&root, &spec);
 
         let loaded = load(&root).expect("a generated corpus compiles");
         let hashes = loaded.hashes.clone();
