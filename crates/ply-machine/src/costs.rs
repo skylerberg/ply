@@ -105,8 +105,19 @@ fn report(loaded: &Loaded) -> Result<Report, Diagnostic> {
         names.push(Value::bytes(module.name.as_str().as_bytes()));
         texts.push(Value::bytes(file.text.as_bytes()));
     }
-    let answer = ply_codegen::c::producer::call(ENTRY, &[Value::list(names), Value::list(texts)])
-        .map_err(|e| failed(&format!("{e:#}")))?;
+    let (packages, mod_pkg, shelf) =
+        ply_codegen::c::producer::package_tables(&loaded.front.packages, &loaded.front.mod_pkg);
+    let answer = ply_codegen::c::producer::call(
+        ENTRY,
+        &[
+            Value::list(names),
+            Value::list(texts),
+            packages,
+            mod_pkg,
+            shelf,
+        ],
+    )
+    .map_err(|e| failed(&format!("{e:#}")))?;
     let Value::Str(dump) = &answer else {
         return Err(failed(&format!(
             "`{ENTRY}` answered a {} rather than a string",
