@@ -157,13 +157,31 @@ impl Loaded {
         }
     }
 
-    /// Every non-std definition named `main`.
+    /// Every root-package definition named `main`. A dependency's `main` is its own business:
+    /// only the package being loaded offers an entry point. A project without packages keeps the
+    /// old rule, every module the toolchain does not ship.
     pub fn entry_points(&self) -> Vec<&DefInfo> {
         let main = Symbol::new("main");
+        let packaged = !self.front.packages.is_empty();
+        let roots: std::collections::HashSet<String> = self
+            .front
+            .ordinals
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.front.mod_pkg.get(*i) == Some(&0))
+            .map(|(_, (module, _))| module.to_string())
+            .collect();
         self.check
             .defs
             .values()
-            .filter(|d| d.simple_name == main && !crate::shelf::is_shipped(&d.module))
+            .filter(|d| {
+                d.simple_name == main
+                    && if packaged {
+                        roots.contains(d.module.as_str())
+                    } else {
+                        !crate::shelf::is_shipped(&d.module)
+                    }
+            })
             .collect()
     }
 }
