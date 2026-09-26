@@ -1,7 +1,6 @@
 //! A synthetic but realistic Ply project, at whatever scale a benchmark needs, and a harness that
 //! says which compiler phase the time went to.
 
-pub mod bench;
 pub mod build;
 pub mod cmd;
 pub mod discharge;
