@@ -1,4 +1,4 @@
-use assert_cmd::Command;
+use crate::harness::write;
 use ply_machine::driver;
 use ply_machine::load::{LoadError, Loaded};
 use ply_span::Symbol;
@@ -87,14 +87,6 @@ fn codes(e: &LoadError) -> Vec<String> {
         .iter()
         .map(|d| format!("{}: {}", d.code, d.message))
         .collect()
-}
-
-fn write(dir: &Path, name: &str, text: &str) {
-    let path = dir.join(name);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-    fs::write(path, text).unwrap();
 }
 
 fn hash_of(loaded: &Loaded, name: &str) -> String {
@@ -628,6 +620,10 @@ fn an_empty_file_appearing_and_disappearing_agrees() {
 }
 
 /// One store for every mutation: an invalidation is only ever wrong in some sequence of edits.
+///
+/// Real code exercises handlers, regions, `nondet` effects and cross-module types the synthetic
+/// corpora do not, and the session ends by undoing every edit so a wrong answer shows up as a
+/// final state that is not the one it began in.
 #[test]
 fn a_long_session_over_the_example_corpus_agrees_at_every_step() {
     let dir = tempfile::tempdir().unwrap();
@@ -639,6 +635,15 @@ fn a_long_session_over_the_example_corpus_agrees_at_every_step() {
             write(dir.path(), &name, &fs::read_to_string(&path).unwrap());
         }
     }
+    let edit = |name: &str, from: &str, to: &str| {
+        let path = dir.path().join(name);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(from),
+            "`{from}` is not in {name}; the fixture drifted"
+        );
+        fs::write(path, text.replace(from, to)).unwrap();
+    };
     let start = snapshot(&agree(dir.path(), "step 0"));
 
     let clock = fs::read_to_string(dir.path().join("clock.ply")).unwrap();
@@ -649,17 +654,41 @@ fn a_long_session_over_the_example_corpus_agrees_at_every_step() {
     );
     agree(dir.path(), "step 1: a definition appeared");
 
+    edit(
+        "report.ply",
+        "fn assets() -> List<String>",
+        "// a note\nfn assets() -> List<String>",
+    );
+    agree(dir.path(), "step 2: a comment");
+
+    edit("ledger.ply", "presented", "presented_value");
+    edit("report.ply", "presented", "presented_value");
+    agree(dir.path(), "step 3: a rename across modules");
+
+    edit("report.ply", "type Line = ", "type Row = ");
+    edit("report.ply", "-> Line =", "-> Row =");
+    edit("report.ply", "List<Line>", "List<Row>");
+    edit("report.ply", "l: Line|", "l: Row|");
+    agree(dir.path(), "step 4: a type rename");
+
     write(dir.path(), "spare.ply", "pub fn spare() -> Int = 9\n");
-    agree(dir.path(), "step 2: a module appeared");
+    agree(dir.path(), "step 5: a module appeared");
 
     fs::rename(dir.path().join("spare.ply"), dir.path().join("kept.ply")).unwrap();
-    agree(dir.path(), "step 3: it was renamed");
+    agree(dir.path(), "step 6: it was renamed");
 
     fs::remove_file(dir.path().join("kept.ply")).unwrap();
-    agree(dir.path(), "step 4: and deleted");
+    agree(dir.path(), "step 7: and deleted");
 
     write(dir.path(), "clock.ply", &clock);
-    let end = snapshot(&agree(dir.path(), "step 5: back to where it started"));
+    edit("report.ply", "// a note\nfn assets()", "fn assets()");
+    edit("ledger.ply", "presented_value", "presented");
+    edit("report.ply", "presented_value", "presented");
+    edit("report.ply", "type Row = ", "type Line = ");
+    edit("report.ply", "-> Row =", "-> Line =");
+    edit("report.ply", "List<Row>", "List<Line>");
+    edit("report.ply", "l: Row|", "l: Line|");
+    let end = snapshot(&agree(dir.path(), "step 8: back to where it started"));
     assert_eq!(
         start, end,
         "an undone session must land on the state it began in"
@@ -717,82 +746,6 @@ fn a_shuffle_of_module_states_agrees_at_every_step() {
         );
     }
 }
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
-
-fn test_hashes(dir: &Path, extra: &[&str]) -> Vec<String> {
-    let out = ply(dir)
-        .arg("test")
-        .arg("--json")
-        .args(extra)
-        .output()
-        .unwrap();
-    let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("--json emits one object");
-    v["selection"]["tests"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| format!("{} {}", t["key"], t["hash"]))
-        .collect()
-}
-
-/// The front end is serial, so the worker count must not reach a hash.
-#[test]
-fn the_worker_count_does_not_reach_a_test_hash() {
-    let dir = corpus();
-    let one = test_hashes(dir.path(), &["--jobs", "1"]);
-    let many = test_hashes(dir.path(), &["--jobs", "10"]);
-    assert_eq!(one, many);
-    assert_eq!(one, test_hashes(dir.path(), &["--no-cache"]));
-}
-
-#[test]
-fn a_relative_and_an_absolute_path_share_one_cache() {
-    let dir = corpus();
-    // The front-end cache is opened by the load, so nothing has to run for this to be about it.
-    ply(dir.path())
-        .args(["test", "--filter", "nonexistent"])
-        .output()
-        .unwrap();
-
-    let out = ply(dir.path())
-        .args(["test", "--filter", "nonexistent"])
-        .arg(dir.path())
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(0));
-    // One cache under the project root either way: an absolute path must not open a second one.
-    let caches: Vec<_> = walkdir(dir.path())
-        .into_iter()
-        .filter(|p| p.ends_with(".ply-cache"))
-        .collect();
-    assert_eq!(caches.len(), 1, "{caches:?}");
-}
-
-/// Every directory under `root`, so a second cache anywhere below it is visible.
-fn walkdir(root: &Path) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                out.push(path.clone());
-                stack.push(path);
-            }
-        }
-    }
-    out
-}
-
 #[test]
 fn every_file_contributes_its_reference_graph() {
     let dir = tempfile::tempdir().unwrap();

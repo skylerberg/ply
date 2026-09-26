@@ -1,6 +1,4 @@
-use assert_cmd::prelude::*;
-use std::path::Path;
-use std::process::Command;
+use crate::harness::{ply, write};
 
 struct Outcome {
     passed: bool,
@@ -29,14 +27,10 @@ fn ply_test(source: &str) -> Outcome {
 
 fn ply_test_with(source: &str, flags: &[&str]) -> Outcome {
     let dir = tempfile::tempdir().expect("a temp dir");
-    write(dir.path(), source);
-    let out = Command::cargo_bin("ply")
-        .unwrap()
-        .arg("--color")
-        .arg("never")
+    write(dir.path(), "main.ply", source);
+    let out = ply(dir.path())
         .arg("test")
         .args(flags)
-        .current_dir(dir.path())
         .output()
         .expect("`ply test` ran");
     Outcome {
@@ -47,10 +41,6 @@ fn ply_test_with(source: &str, flags: &[&str]) -> Outcome {
             String::from_utf8_lossy(&out.stderr)
         ),
     }
-}
-
-fn write(dir: &Path, source: &str) {
-    std::fs::write(dir.join("main.ply"), source).unwrap();
 }
 
 /// The status an input earns, `-1` for "still arriving" and `0` for accepted.

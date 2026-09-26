@@ -1,6 +1,15 @@
 //! The nested-entry capability, end to end: a program performs `machine.load`/`machine.bound`/
 //! `machine.enter` over a project on disk, and another program has run — its ending a value the
 //! caller reads, and the load incremental over the project's own store.
+//!
+//! One binary. The engine's own unit tests, one per module of `crates/ply-machine/src`, are in
+//! `tests/unit`.
+
+mod fixture;
+mod front_read;
+mod modules_hash_audit;
+mod prover_soundness_audit;
+mod tiers;
 
 use ply_eval::host::HostRegistry;
 use ply_eval::{BackendKind, BackendSpec, Machine, Provider, Value};

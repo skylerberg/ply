@@ -1,17 +1,6 @@
-use assert_cmd::Command;
+use crate::harness::{ply, stdout_of};
 use serde_json::Value;
-use std::path::Path;
 use tempfile::TempDir;
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").expect("the `ply` binary is built");
-    cmd.current_dir(dir);
-    cmd
-}
-
-fn stdout_of(out: &std::process::Output) -> String {
-    String::from_utf8_lossy(&out.stdout).to_string()
-}
 
 fn combined(out: &std::process::Output) -> String {
     format!("{}{}", stdout_of(out), String::from_utf8_lossy(&out.stderr))
