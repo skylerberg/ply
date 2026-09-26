@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 include!(concat!(env!("OUT_DIR"), "/corpus_sources.rs"));
 
 /// The corpus package's subcommand entries, kept in the artifact as startup roots.
-const SUBCOMMAND_ENTRIES: &[&str] = &["bench.run"];
+const SUBCOMMAND_ENTRIES: &[&str] = &["bench.run", "real.run"];
 
 /// What `cmd.dispatch` answered: the plan, or text for the user and the code to exit with.
 pub enum Outcome {
@@ -213,6 +213,31 @@ fn build(stage: &Path, artifact_path: &Path) -> Result<Vec<u8>> {
     std::fs::write(&tmp, &bytes)?;
     std::fs::rename(&tmp, artifact_path)?;
     Ok(bytes)
+}
+
+/// The toolchain's own trees as corpus members: the compiler's modules as bare-named files
+/// (as its own tree holds them) and the CLI package, with the digests they are pinned by.
+/// Laid out beside the front door, so what `real` measures is what was shipped.
+pub fn real_members() -> Result<[(String, PathBuf, String); 2]> {
+    let stage = stage_dir();
+    let compiler = stage.join("real/compiler");
+    let marker = stage.join("REAL.out");
+    if !marker.exists() {
+        std::fs::create_dir_all(&compiler)?;
+        for (name, text) in ply_compiler::sources() {
+            std::fs::write(compiler.join(format!("{name}.ply")), text)?;
+        }
+        std::fs::write(&marker, b"")?;
+    }
+    let cli = lay_out(&stage)?;
+    Ok([
+        (
+            "compiler".to_string(),
+            compiler,
+            ply_codegen::c::producer::identity_of(&ply_codegen::c::producer::Sources::Embedded),
+        ),
+        ("cli".to_string(), cli, ply_launcher::shipped::identity()),
+    ])
 }
 
 /// The corpus package, then the CLI package, as `crates/ply-corpus/ply` and
