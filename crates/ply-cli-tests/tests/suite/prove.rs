@@ -1,7 +1,6 @@
-use assert_cmd::Command;
+use crate::harness::{json_of, ply, project, stdout_of};
 use serde_json::Value;
 use std::path::Path;
-use tempfile::TempDir;
 
 const UNSPECIFIED: &str = "\
 fn double(x: Int) -> Int = x * 2
@@ -10,28 +9,6 @@ fn triple(x: Int) -> Int = x * 3
 
 fn main() -> Int = double(21)
 ";
-
-fn project(source: &str) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("m.ply"), source).unwrap();
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
-
-fn stdout_of(output: &std::process::Output) -> String {
-    String::from_utf8(output.stdout.clone()).unwrap()
-}
-
-fn json_of(output: &std::process::Output) -> Value {
-    let text = stdout_of(output);
-    serde_json::from_str(&text)
-        .unwrap_or_else(|e| panic!("stdout was not one JSON object: {e}\n---\n{text}\n---"))
-}
 
 #[test]
 fn prove_leads_with_the_review_surface() {
@@ -521,4 +498,79 @@ law \"an ordinary claim\" forall (k: Int) { k == k }
         .expect("the host law is reported");
     assert_eq!(hosted["outcome"], "unattempted");
     assert!(hosted["tier"].is_null(), "{hosted}");
+}
+
+/// A cached proof survives every plan widening, so only a key over the whole transitive closure keeps it current.
+#[test]
+fn editing_what_a_proof_rests_on_re_opens_it() {
+    fn outcomes(dir: &Path) -> Vec<(String, String)> {
+        let json = json_of(&ply(dir).args(["prove", "--json"]).output().unwrap());
+        json["obligations"]
+            .as_array()
+            .expect("an obligation array")
+            .iter()
+            .map(|o| {
+                (
+                    o["label"].as_str().unwrap_or_default().to_string(),
+                    o["outcome"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    // Two links between the claim and its value, so the second edit tests the transitive half.
+    let good = "\
+fn leaf() -> Int = 1
+
+fn base() -> Int = leaf()
+
+fn shift(x: Int) -> Int
+  requires x > 0 && x < 1000
+  ensures result == x + 1
+= x + base()
+
+law \"shift agrees with base\" forall (x: Int) where x > 0 && x < 1000
+  { shift(x) == x + base() }
+";
+    let edits: &[(&str, &str, &[&str])] = &[
+        ("the body", "= x + base()\n", &["ensures", "law"]),
+        ("the spec", "ensures result == x + 1", &["ensures"]),
+        (
+            "a transitive dependency",
+            "fn leaf() -> Int = 1",
+            &["ensures"],
+        ),
+    ];
+    for (what, needle, expect_refuted) in edits {
+        let dir = project(good);
+        let first = outcomes(dir.path());
+        assert!(
+            first.iter().all(|(_, outcome)| outcome == "proved"),
+            "the baseline is two proofs: {first:?}"
+        );
+
+        let broken = match *what {
+            "the body" => good.replace(needle, "= x + base() + 1\n"),
+            "the spec" => good.replace(needle, "ensures result == x + 3"),
+            _ => good.replace(needle, "fn leaf() -> Int = 2"),
+        };
+        assert_ne!(broken, good, "the edit to {what} matched nothing");
+        std::fs::write(dir.path().join("m.ply"), &broken).unwrap();
+
+        let after = outcomes(dir.path());
+        for kind in *expect_refuted {
+            let found = after
+                .iter()
+                .find(|(label, _)| label.contains(kind))
+                .unwrap_or_else(|| {
+                    panic!("no `{kind}` obligation after editing {what}: {after:?}")
+                });
+            assert_eq!(
+                found.1, "refuted",
+                "editing {what} left `{}` cached as `{}`, which is a proof of something no \
+                 longer true",
+                found.0, found.1
+            );
+        }
+    }
 }

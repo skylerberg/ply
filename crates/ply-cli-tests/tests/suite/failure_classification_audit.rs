@@ -1,33 +1,6 @@
-use assert_cmd::Command;
+use crate::harness::{json_of, ply, project, stdout_of, write};
 use serde_json::Value;
-use std::path::Path;
 use tempfile::TempDir;
-
-fn project(source: &str) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("m.ply"), source).unwrap();
-    dir
-}
-
-fn write(dir: &TempDir, source: &str) {
-    std::fs::write(dir.path().join("m.ply"), source).unwrap();
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
-
-fn stdout_of(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn json_of(output: &std::process::Output) -> Value {
-    let text = stdout_of(output);
-    serde_json::from_str(&text)
-        .unwrap_or_else(|e| panic!("stdout was not one JSON object: {e}\n---\n{text}\n---"))
-}
 
 fn sole_failure(dir: &TempDir) -> Value {
     let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
@@ -346,7 +319,8 @@ fn runaway_recursion_introduced_by_an_edit_is_bisected_to_the_culprit() {
     let dir = project(RECURSION);
     ply(dir.path()).arg("test").assert().success();
     write(
-        &dir,
+        dir.path(),
+        "m.ply",
         &RECURSION
             .replace("step(n - 1)", "step(n + 1)")
             .replace("(a * b) + 0", "0 + (a * b)"),
@@ -369,7 +343,8 @@ fn an_overflow_introduced_by_an_edit_is_bisected_to_the_culprit() {
     let dir = project(OVERFLOW);
     ply(dir.path()).arg("test").assert().success();
     write(
-        &dir,
+        dir.path(),
+        "m.ply",
         &OVERFLOW
             .replace("n * 2", "n * 4611686018427387904")
             .replace("(n + 0) * 1", "1 * (n + 0)"),
@@ -396,7 +371,8 @@ fn a_pattern_that_stops_matching_is_bisected_to_the_culprit() {
     let dir = project(MATCHING);
     ply(dir.path()).arg("test").assert().success();
     write(
-        &dir,
+        dir.path(),
+        "m.ply",
         &MATCHING
             .replace("if n <= 0 { Circle(1) }", "if n < 0 { Circle(1) }")
             .replace(
@@ -420,7 +396,11 @@ test \"the picked shape has an area\" { assert_eq(area(pick(1)), 1) }
 ";
     let dir = project(EXHAUSTIVE);
     ply(dir.path()).arg("test").assert().success();
-    write(&dir, &EXHAUSTIVE.replace(", Tri(b) -> b", ""));
+    write(
+        dir.path(),
+        "m.ply",
+        &EXHAUSTIVE.replace(", Tri(b) -> b", ""),
+    );
 
     let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
     let v = json_of(&out);
@@ -449,7 +429,8 @@ test \"step bottoms out\" { assert_eq(step(3), 0) }
     let dir = project(BOTH);
     ply(dir.path()).arg("test").assert().success();
     write(
-        &dir,
+        dir.path(),
+        "m.ply",
         &BOTH
             .replace("step(n - 1)", "step(n + 1)")
             .replace("(a * b) + 0", "0 + (a * b)"),
@@ -485,7 +466,11 @@ fn a_nondet_test_that_hits_a_runtime_limit_is_skipped_as_nondet() {
 fn bisect_never_outranks_the_reason_a_runtime_limit_would_have_given() {
     let dir = project(RECURSION);
     ply(dir.path()).arg("test").assert().success();
-    write(&dir, &RECURSION.replace("step(n - 1)", "step(n + 1)"));
+    write(
+        dir.path(),
+        "m.ply",
+        &RECURSION.replace("step(n - 1)", "step(n + 1)"),
+    );
 
     let v = json_of(
         &ply(dir.path())
@@ -526,7 +511,8 @@ fn a_pruned_body_store_says_no_bodies_and_not_no_hybrids() {
     std::fs::remove_file(cache.join("frontend.dat")).expect("the body data exists");
 
     write(
-        &dir,
+        dir.path(),
+        "m.ply",
         &RECURSION
             .replace("step(n - 1)", "step(n + 1)")
             .replace("(a * b) + 0", "0 + (a * b)"),

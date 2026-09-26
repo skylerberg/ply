@@ -1,6 +1,4 @@
-use assert_cmd::Command;
-use serde_json::Value;
-use std::path::Path;
+use crate::harness::{json_of, ply, project};
 
 const SOURCE: &str = "\
 fn one() -> Int = 1
@@ -12,26 +10,9 @@ test \"alone is three\" { assert_eq(alone(), 3) }
 law \"three is three\" { three() == 3 }
 ";
 
-fn project() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("m.ply"), SOURCE).unwrap();
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
-
-fn json_of(out: &std::process::Output) -> Value {
-    serde_json::from_slice(&out.stdout)
-        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)))
-}
-
 #[test]
 fn defs_lists_every_definition_with_its_place_hash_signature_and_references() {
-    let dir = project();
+    let dir = project(SOURCE);
     let out = ply(dir.path()).args(["defs", "--json"]).output().unwrap();
     let v = json_of(&out);
     assert_eq!(v["exit_code"], 0);
@@ -62,7 +43,7 @@ fn defs_lists_every_definition_with_its_place_hash_signature_and_references() {
 
 #[test]
 fn callers_names_what_mentions_a_definition_and_what_reaches_it() {
-    let dir = project();
+    let dir = project(SOURCE);
     let out = ply(dir.path())
         .args(["callers", "one", "--json"])
         .output()

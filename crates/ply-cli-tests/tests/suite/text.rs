@@ -1,6 +1,4 @@
-use assert_cmd::Command;
-use std::path::Path;
-use tempfile::TempDir;
+use crate::harness::{ply, project, stdout_of};
 
 const SERVER: &str = r#"
 fn head(a: Bytes, b: Bytes, c: Bytes) -> Bytes =
@@ -61,22 +59,6 @@ test "a slice past the end is refused" {
   assert_eq(bytes_len(bytes_slice(b"abc", 0, 4)), 0)
 }
 "#;
-
-fn project(source: &str) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("m.ply"), source).unwrap();
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
-
-fn stdout_of(output: &std::process::Output) -> String {
-    String::from_utf8(output.stdout.clone()).unwrap()
-}
 
 #[test]
 fn a_program_over_bytes_and_text_passes() {

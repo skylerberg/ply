@@ -1,6 +1,5 @@
-use assert_cmd::Command;
+use crate::harness::{json_of, ply, process, project, stdout_of};
 use serde_json::Value;
-use std::path::Path;
 use tempfile::TempDir;
 
 const GREEN: &str = "\
@@ -26,28 +25,6 @@ test \"this one is fine\" { assert_eq(1 + 1, 2) }
 const BROKEN: &str = "fn f() -> Int = true\n";
 
 const UNPARSEABLE: &str = "fn f(( = )\n";
-
-fn project(source: &str) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("m.ply"), source).unwrap();
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
-
-fn stdout_of(output: &std::process::Output) -> String {
-    String::from_utf8(output.stdout.clone()).unwrap()
-}
-
-fn json_of(output: &std::process::Output) -> Value {
-    let text = stdout_of(output);
-    serde_json::from_str(&text)
-        .unwrap_or_else(|e| panic!("stdout was not one JSON object: {e}\n---\n{text}\n---"))
-}
 
 #[test]
 fn check_accepts_a_good_module() {
@@ -316,9 +293,8 @@ fn the_default_tier_and_backend_c_are_one_engine() {
 #[test]
 fn watch_reruns_on_a_save_and_keeps_the_front_end_it_already_had() {
     let dir = project(GREEN);
-    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("ply"))
-        .current_dir(dir.path())
-        .args(["--color", "never", "test", "--watch", "--json"])
+    let mut child = process(dir.path())
+        .args(["test", "--watch", "--json"])
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -577,9 +553,7 @@ fn a_pipe_gets_ascii_marks_and_a_terminal_would_get_glyphs() {
 
     let dir = project(GREEN);
     let forced = stdout_of(
-        &Command::cargo_bin("ply")
-            .unwrap()
-            .current_dir(dir.path())
+        &ply(dir.path())
             .args(["test", "--color", "always"])
             .output()
             .unwrap(),

@@ -1,22 +1,10 @@
+use crate::fixture::{project, repo};
 use ply_eval::Plan;
 use ply_machine::engine::Prover;
 use ply_machine::load::load;
 use ply_machine::obligations;
 use ply_prove::{Discharge, Evidence, Gap, Obligation, ProvePlan, Rule, Tier, VacuityKind};
-use std::path::{Path, PathBuf};
-use tempfile::TempDir;
-
-fn repo(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(relative)
-}
-
-fn project(source: &str) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("m.ply"), source).unwrap();
-    dir
-}
+use std::path::Path;
 
 struct Run {
     results: Vec<(Obligation, Discharge)>,
@@ -422,7 +410,7 @@ fn a_concurrency_law_is_proved_only_when_both_domains_were_covered() {
 #[test]
 fn an_int_binder_drops_a_concurrency_law_to_property() {
     let run = Run::at(
-        &repo("tests/fixtures/concurrency_law_binder.ply"),
+        &repo().join("tests/fixtures/concurrency_law_binder.ply"),
         &ProvePlan::default(),
     );
     assert_eq!(run.tier("no interleaving"), Some(Tier::Property));
@@ -480,95 +468,6 @@ law \"sometimes concurrent\" forall (flip: Bool) {
 ";
     never_proved(SOURCE, "sometimes concurrent");
 }
-
-/// A cached proof survives every plan widening, so only a key over the whole transitive closure keeps it current.
-#[test]
-fn editing_what_a_proof_rests_on_re_opens_it() {
-    use assert_cmd::Command;
-    use serde_json::Value;
-
-    fn outcomes(dir: &Path) -> Vec<(String, String)> {
-        let out = Command::cargo_bin("ply")
-            .unwrap()
-            .arg("--color")
-            .arg("never")
-            .current_dir(dir)
-            .arg("prove")
-            .arg("--json")
-            .output()
-            .unwrap();
-        let text = String::from_utf8(out.stdout).unwrap();
-        let json: Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"));
-        json["obligations"]
-            .as_array()
-            .expect("an obligation array")
-            .iter()
-            .map(|o| {
-                (
-                    o["label"].as_str().unwrap_or_default().to_string(),
-                    o["outcome"].as_str().unwrap_or_default().to_string(),
-                )
-            })
-            .collect()
-    }
-
-    // Two links between the claim and its value, so the second edit tests the transitive half.
-    let good = "\
-fn leaf() -> Int = 1
-
-fn base() -> Int = leaf()
-
-fn shift(x: Int) -> Int
-  requires x > 0 && x < 1000
-  ensures result == x + 1
-= x + base()
-
-law \"shift agrees with base\" forall (x: Int) where x > 0 && x < 1000
-  { shift(x) == x + base() }
-";
-    let edits: &[(&str, &str, &[&str])] = &[
-        ("the body", "= x + base()\n", &["ensures", "law"]),
-        ("the spec", "ensures result == x + 1", &["ensures"]),
-        (
-            "a transitive dependency",
-            "fn leaf() -> Int = 1",
-            &["ensures"],
-        ),
-    ];
-    for (what, needle, expect_refuted) in edits {
-        let dir = project(good);
-        let first = outcomes(dir.path());
-        assert!(
-            first.iter().all(|(_, outcome)| outcome == "proved"),
-            "the baseline is two proofs: {first:?}"
-        );
-
-        let broken = match *what {
-            "the body" => good.replace(needle, "= x + base() + 1\n"),
-            "the spec" => good.replace(needle, "ensures result == x + 3"),
-            _ => good.replace(needle, "fn leaf() -> Int = 2"),
-        };
-        assert_ne!(broken, good, "the edit to {what} matched nothing");
-        std::fs::write(dir.path().join("m.ply"), &broken).unwrap();
-
-        let after = outcomes(dir.path());
-        for kind in *expect_refuted {
-            let found = after
-                .iter()
-                .find(|(label, _)| label.contains(kind))
-                .unwrap_or_else(|| {
-                    panic!("no `{kind}` obligation after editing {what}: {after:?}")
-                });
-            assert_eq!(
-                found.1, "refuted",
-                "editing {what} left `{}` cached as `{}`, which is a proof of something no \
-                 longer true",
-                found.0, found.1
-            );
-        }
-    }
-}
-
 #[test]
 fn gap_a_proved_obligation_may_raise_at_the_int_boundary() {
     const SOURCE: &str = "\
@@ -710,4 +609,242 @@ fn gap_a_one_point_domain_fails_the_interleaving_audit() {
             .iter()
             .all(|r| !matches!(r, Rule::ExhaustiveEnumeration { .. }))
     );
+}
+
+/// `==` on `Float` is not reflexive, so congruence closure over it is unsound.
+#[test]
+fn no_obligation_that_can_reach_a_float_is_proved() {
+    let claims: &[(&str, &str)] = &[
+        (
+            "visible binder",
+            "law \"visible binder\" forall (x: Float) { x == x }",
+        ),
+        (
+            "visible literal",
+            "law \"visible literal\" forall (n: Int) { 1.5 == 1.5 }",
+        ),
+        (
+            "visible container",
+            "law \"visible container\" forall (xs: List<Float>) { xs == xs }",
+        ),
+        (
+            "visible map",
+            "law \"visible map\" forall (m: Map<String, Float>) { m == m }",
+        ),
+        (
+            "visible alias",
+            "type Rate = Float\nlaw \"visible alias\" forall (r: Rate) { r == r }",
+        ),
+        (
+            "visible parameter",
+            "type Box<a> = B(a)\nlaw \"visible parameter\" forall (b: Box<Float>) { b == b }",
+        ),
+        // The four below reach a `Float` through a declaration rather than the binder's written type.
+        (
+            "hidden in a variant",
+            "type Money = Cents(Float)\nlaw \"hidden in a variant\" forall (m: Money) { m == m }",
+        ),
+        (
+            "hidden in a record type",
+            "type Row = R({rate: Float})\n\
+             law \"hidden in a record type\" forall (r: Row) { r == r }",
+        ),
+        (
+            "hidden behind a list",
+            "type Money = Cents(Float)\n\
+             law \"hidden behind a list\" forall (xs: List<Money>) { xs == xs }",
+        ),
+        (
+            "hidden behind an option",
+            "type Money = Cents(Float)\n\
+             law \"hidden behind an option\" forall (o: Option<Money>) { o == o }",
+        ),
+    ];
+    let mut over_claimed = Vec::new();
+    for (needle, source) in claims {
+        if Run::of(source).tier(needle) == Some(Tier::Proved) {
+            over_claimed.push(*needle);
+        }
+    }
+    assert!(
+        over_claimed.is_empty(),
+        "these obligations mention a `Float` and came back proved: {over_claimed:?}"
+    );
+}
+
+#[test]
+fn a_certificate_over_a_hidden_float_is_refuted_by_sampling() {
+    let source = "type Money = Cents(Float)\n\
+                  type Row = R({rate: Float})\n\
+                  law \"hidden in a variant\" forall (m: Money) { m == m }\n\
+                  law \"hidden in a record type\" forall (r: Row) { r == r }\n";
+    let dir = project(source);
+    let loaded = load(dir.path()).expect("the fixture compiles");
+    let hashes = loaded.hashes.clone();
+    let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
+    let prover = Prover::new(&loaded)
+        .expect("the port lowers the claims")
+        .with_backend(
+            ply_machine::support::prover_backend(None, &loaded)
+                .expect("the program compiles to a tier"),
+        );
+    let wide = ProvePlan {
+        cases: 1_000,
+        roots: (0..8).collect(),
+        ..ProvePlan::default()
+    };
+
+    let mut lies = Vec::new();
+    for obligation in &collected.obligations {
+        if prover
+            .discharge_with(obligation, &ProvePlan::default())
+            .tier()
+            != Some(Tier::Proved)
+        {
+            continue;
+        }
+        match prover.resample(obligation, &wide) {
+            Discharge::Refuted(counterexample) => lies.push(format!(
+                "`{}` is proved and sampling refutes it at {:?}",
+                obligation.owner,
+                counterexample
+                    .bindings
+                    .iter()
+                    .map(|b| format!("{} = {}", b.name, b.rendered))
+                    .collect::<Vec<_>>()
+            )),
+            Discharge::Unattempted(Gap::Raised { diagnostic, .. }) => lies.push(format!(
+                "`{}` is proved and sampling raises `{}`",
+                obligation.owner, diagnostic.message
+            )),
+            _ => {}
+        }
+    }
+    assert!(
+        lies.is_empty(),
+        "a certificate is covering a false claim:\n{}",
+        lies.join("\n")
+    );
+}
+
+#[test]
+fn an_ensures_over_a_hidden_float_is_not_proved() {
+    let run = Run::of(
+        "pub type Money = Cents(Float)\n\
+         pub fn keep(m: Money) -> Money\n\
+        \x20 ensures result == m\n\
+         = m\n\
+         law \"destructured\" forall (m: Money) { match m { Cents(x) -> x == x } }\n",
+    );
+    assert_ne!(
+        run.tier("keep"),
+        Some(Tier::Proved),
+        "an `ensures` false at `Cents(NaN)` carries a certificate"
+    );
+    assert_ne!(
+        run.tier("destructured"),
+        Some(Tier::Proved),
+        "the destructured form must stay refused as well"
+    );
+}
+
+/// `Decimal`'s `==` is an equivalence relation, so congruence over it is sound.
+#[test]
+fn decimal_is_congruent_and_never_arithmetic() {
+    let run = Run::of(
+        "fn scaled(d: Decimal) -> Decimal = d\n\
+         law \"congruence\" forall (x: Decimal) { scaled(x) == scaled(x) }\n\
+         law \"additive\" forall (x: Decimal) { x + 0m == x }\n\
+         law \"commutes\" forall (x: Decimal, y: Decimal) { x + y == y + x }\n\
+         law \"ordered\" forall (x: Decimal) { x >= x }\n\
+         law \"scale is value\" forall (n: Int) { 1.5m == 1.50m }\n",
+    );
+    assert_eq!(run.tier("congruence"), Some(Tier::Proved));
+    assert_eq!(run.tier("scale is value"), Some(Tier::Proved));
+    for needle in ["additive", "commutes", "ordered"] {
+        assert_ne!(
+            run.tier(needle),
+            Some(Tier::Proved),
+            "`{needle}` grew the arithmetic fragment"
+        );
+    }
+}
+
+/// There is no theory of arrays: nothing about `map_get` after `map_insert`, or about `map_len`, may be concluded.
+#[test]
+fn a_map_is_opaque_to_the_prover() {
+    let run = Run::of(
+        "law \"reflexive\" forall (m: Map<String, Int>) { m == m }\n\
+         law \"get after insert\" forall (m: Map<String, Int>, k: String, v: Int) \
+           { map_get(map_insert(m, k, v), k) == Some(v) }\n\
+         law \"insert grows\" forall (m: Map<String, Int>, k: String, v: Int) \
+           { map_len(map_insert(m, k, v)) == map_len(m) + 1 }\n\
+         law \"keys match len\" forall (m: Map<String, Int>) \
+           { len(map_keys(m)) == map_len(m) }\n",
+    );
+    assert_eq!(run.tier("reflexive"), Some(Tier::Proved));
+    for needle in ["get after insert", "insert grows", "keys match len"] {
+        assert_ne!(
+            run.tier(needle),
+            Some(Tier::Proved),
+            "`{needle}` was decided by a theory of maps that does not exist"
+        );
+    }
+}
+
+#[test]
+fn the_byte_builtins_are_uninterpreted() {
+    for (needle, source) in [
+        (
+            "index of self",
+            "law \"index of self\" forall (b: Bytes) { bytes_index_of(b, b) == Some(0) }",
+        ),
+        (
+            "empty needle",
+            "law \"empty needle\" forall (b: Bytes) { bytes_index_of(b, b\"\") == Some(0) }",
+        ),
+        (
+            "starts with itself",
+            "law \"starts with itself\" forall (b: Bytes) { bytes_starts_with(b, b) }",
+        ),
+        (
+            "scan is bounded",
+            "law \"scan is bounded\" forall (b: Bytes, f: Int, s: Bytes, m: Int) \
+               { bytes_scan(b, f, s, m) <= f + m }",
+        ),
+        (
+            "split rejoins",
+            "law \"split rejoins\" forall (b: Bytes) { len(bytes_split(b, b\",\")) >= 1 }",
+        ),
+    ] {
+        never_proved(source, needle);
+    }
+
+    // Two occurrences of one `Bytes` literal are deliberately not one term, so even this is `property`.
+    never_proved(
+        "law \"two literals\" forall (n: Int) { b\"ab\" == b\"ab\" }",
+        "two literals",
+    );
+}
+
+/// A derived dictionary is an ordinary record of closures, outside the fragment.
+#[test]
+fn a_derived_dictionary_carries_no_proof() {
+    for (needle, source) in [
+        (
+            "eq is reflexive",
+            "pub type Point = P(Int)\n\
+             derive eq for Point\n\
+             law \"eq is reflexive\" forall (p: Point) { (point_eq().eq)(p, p) }",
+        ),
+        (
+            "ord is reflexive",
+            "pub type Point = P(Int)\n\
+             derive ord for Point\n\
+             law \"ord is reflexive\" forall (p: Point) \
+               { (point_ord().compare)(p, p) == Equal }",
+        ),
+    ] {
+        never_proved(source, needle);
+    }
 }

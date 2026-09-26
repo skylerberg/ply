@@ -1,4 +1,4 @@
-use assert_cmd::prelude::*;
+use crate::harness::{ply, repo, write};
 use ply_machine::driver;
 use ply_machine::load::{LoadError, Loaded, load};
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
@@ -6,21 +6,6 @@ use ply_store::{ContentHash, Store};
 use ply_ty::ModuleName;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-
-fn write(dir: &Path, rel: &str, text: &str) {
-    let path = dir.join(rel);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    std::fs::write(path, text).unwrap();
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
 
 fn output(out: &std::process::Output) -> String {
     format!(
@@ -521,14 +506,6 @@ fn a_cold_cache_does_not_warn_about_the_stdlib() {
     );
 }
 
-fn repo(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(relative)
-        .canonicalize()
-        .expect("the repository path exists")
-}
-
 /// The port's answer over a flat directory, pulling in the shipped modules itself, and the driver's.
 fn pulled_and_loaded(dir: &Path) -> (Vec<String>, ply_ty::Front, Result<Loaded, LoadError>) {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -598,7 +575,7 @@ fn the_driver_places_the_shipped_modules_the_port_pulls_in_and_answers_as_it_doe
     // A round's imports follow the round before it, so the whole is not in byte order.
     let rounds: &[&str] = &["std.router", "std.trace", "std.http", "std.json", "std.net"];
     for (dir, pulls) in [
-        (repo("examples"), None),
+        (repo().join("examples"), None),
         (chain.path().to_path_buf(), Some(rounds)),
         (plain.path().to_path_buf(), Some(&[][..])),
     ] {
@@ -660,7 +637,7 @@ fn the_driver_refuses_with_the_port_s_diagnostics_alone() {
         "import std.json\nfn f() -> Int = )\n",
     );
     let fixtures = ["ambiguous_import", "module_cycle", "duplicate_import"]
-        .map(|f| repo(&format!("tests/fixtures/{f}")));
+        .map(|f| repo().join(format!("tests/fixtures/{f}")));
     for dir in fixtures.iter().map(PathBuf::as_path).chain([broken.path()]) {
         let (_, ours, theirs) = pulled_and_loaded(dir);
         let err = theirs
