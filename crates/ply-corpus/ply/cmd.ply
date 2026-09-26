@@ -1,0 +1,842 @@
+// The corpus's command line, declared once as a cmdline spec: argument parsing for the corpus
+// binary is the CLI package's library, not a copy of it. `dispatch` turns argv into the JSON
+// plan the binary reads; `main` makes the front door an ordinary runnable program.
+
+import cli.cmdline
+import std.json (Json, Str, Number, Bool, Null, object, array)
+import std.process (process)
+import std.json
+
+fn cats<a>(xss: List<List<a>>) -> List<a> =
+  fold(xss, [], |acc: List<a>, xs: List<a>| fold(xs, acc, |acc2: List<a>, x: a| push(acc2, x)))
+
+// --- Flags, as the corpus writes them -----------------------------------------
+
+fn sw(long: String, help: String) -> cmdline::Flag = cmdline::switch(long, help)
+
+fn nat(long: String, default: Int, help: String) -> cmdline::Flag =
+  cmdline::with_default(cmdline::valued(long, "N", cmdline::Nat, help), int_to_string(default))
+
+fn text(long: String, default: String, help: String) -> cmdline::Flag =
+  cmdline::with_default(cmdline::valued(long, "TEXT", cmdline::Text, help), default)
+
+fn opt(long: String, help: String) -> cmdline::Flag =
+  cmdline::valued(long, "TEXT", cmdline::Text, help)
+
+fn nats(long: String, default: String, help: String) -> cmdline::Flag =
+  cmdline::with_default(cmdline::valued(long, "N,N,…", cmdline::Text, help), default)
+
+fn texts(long: String, help: String) -> cmdline::Flag =
+  cmdline::repeated(cmdline::valued(long, "TEXT", cmdline::Text, help))
+
+fn is_a_number(v: String) -> Result<Unit, String> =
+  match decimal_of_string(v) { Some(_) -> Ok(()), None -> Err("not a number: " ++ v) }
+
+fn float(long: String, default: String, help: String) -> cmdline::Flag =
+  cmdline::checking(
+    cmdline::with_default(cmdline::valued(long, "F", cmdline::Text, help), default),
+    is_a_number,
+  )
+
+fn json_switch() -> cmdline::Flag = sw("json", "The measurements as JSON rather than a table")
+
+// The knobs a generated corpus's shape takes; `gen` and the sizes half of `sweep` share them.
+fn shape_flags() -> List<cmdline::Flag> =
+  [
+    nat("seed", 1, "The seed the corpus is a function of"),
+    nat("modules", 20, "Modules in the generated corpus"),
+    nat("defs-per-module", 25, "Definitions per module"),
+    nat("tests", 200, "Tests in the generated corpus"),
+    nat("depth", 4, "Import depth of the generated module graph"),
+    nat("tables", 12, "Tables in the generated schema"),
+    nat("regions", 6, "Regions in the generated effect map"),
+    float("effect-fraction", "0.35", "Definitions that perform effects"),
+    float("nondet-fraction", "0.03", "Definitions that perform nondeterministically"),
+    nat("hub-modules", 3, "Modules everything else imports"),
+    nat("max-weight", 192, "The largest one definition weighs"),
+    nat("concurrent-tests", 0, "Tests that run tasks concurrently"),
+    nat("tasks-per-test", 3, "Tasks each concurrent test spawns"),
+    nat("steps-per-task", 2, "Steps each spawned task takes"),
+    float("conflict-density", "0.5", "How often concurrent tasks contend"),
+    float("spec-fraction", "0.0", "Definitions carrying a spec the prover reads"),
+    nat("specimens-per-module", 0, "Specimen definitions per module"),
+  ]
+
+fn serve_flags() -> List<cmdline::Flag> =
+  [
+    text("repo", ".", "The repository root the fixtures are read from"),
+    opt("ply", "The `ply` binary the load tables drive; this binary's sibling when left off"),
+    nat("requests", 2000, "Requests per point"),
+    nat("repeats", 3, "Repeats per point; the fastest is reported"),
+    json_switch(),
+  ]
+
+// --- The spec --------------------------------------------------------------------
+
+pub fn spec() -> cmdline::Spec =
+  {
+    bin: "ply-corpus",
+    version: "0.1.0",
+    root: cmdline::with_subs(
+      cmdline::command(
+        "ply-corpus",
+        "Generate a scale corpus for Ply, and measure where a run's time goes",
+        [],
+      ),
+      [
+        cmdline::command(
+          "gen",
+          "Write a synthetic project, then compile and run it to prove it is real",
+          cats([
+            shape_flags(),
+            [
+              opt("out", "Where to write it; must be empty, or a corpus this tool wrote"),
+              sw("no-verify", "Write the corpus without compiling it"),
+              json_switch(),
+            ],
+          ]),
+        ),
+        cmdline::with_positionals(
+          cmdline::command(
+            "bench",
+            "Time discovery, cache lookup, selection, compilation and execution over a corpus",
+            [
+              nat("repeats", 3, "Repeats per scenario; the fastest run is reported"),
+              opt("backend", "Attach a compiled backend, as `ply test --backend` spells it"),
+              json_switch(),
+            ],
+          ),
+          [cmdline::positional("corpus", "A directory a previous `gen` wrote")],
+        ),
+        cmdline::command(
+          "sweep",
+          "Generate and benchmark at several sizes, for one comparison table",
+          [
+            text("out", "", "A directory to hold one sub-directory per size"),
+            texts("sizes", "A size to sweep, `modules,defs_per_module,tests`; repeat for each"),
+            opt(
+              "backend",
+              "Attach a compiled backend to every size, as `ply test --backend` spells it",
+            ),
+            nat("seed", 1, "The seed every size is a function of"),
+            nat("repeats", 3, "Repeats per scenario; the fastest run is reported"),
+            json_switch(),
+          ],
+        ),
+        cmdline::with_positionals(
+          cmdline::command(
+            "measure",
+            "Price interpreter throughput, fixture open against rebuild, and resumption cost",
+            [
+              nat("repeats", 3, "Repeats per measurement; the fastest is reported"),
+              nats(
+                "cells",
+                "1,100,1000,10000,100000",
+                "Fixture sizes for the open-against-rebuild comparison",
+              ),
+              sw("only-throughput", "Skip everything but the throughput table"),
+              json_switch(),
+            ],
+          ),
+          [
+            cmdline::defaulted(
+              "corpus",
+              "A directory a previous `gen` wrote; omit it for fixture and resumption cost",
+              "",
+            ),
+          ],
+        ),
+        cmdline::with_positionals(
+          cmdline::command(
+            "sim",
+            "Price the search: pruning, seeds to the first failure, and seeds per second",
+            [
+              nat("trials", 32, "Roots per strategy in the race-finding table; zero drops it"),
+              nat("budget", 4096, "Interleavings a search may run per root, pruned or not"),
+              nat("steps", 100000, "Scheduling steps one interleaving may take"),
+              nat("rate-seeds", 64, "Seeds the throughput table times"),
+              sw("no-reduction", "Drop the reduction table, which is the expensive one"),
+              json_switch(),
+            ],
+          ),
+          [cmdline::positional("corpus", "A `.ply` file, or a directory a previous `gen` wrote")],
+        ),
+        cmdline::with_positionals(
+          cmdline::command(
+            "prove",
+            "Price the spec tier: where obligations land, why some fell short, what shrinking bought",
+            [
+              nat("cases", 200, "Cases the prover generates per obligation"),
+              nat("prove-budget", 10000, "The prover's budget per obligation"),
+              nat("shrink-budget", 500, "The shrinker's budget per failure"),
+              json_switch(),
+            ],
+          ),
+          [
+            cmdline::many(
+              cmdline::positional(
+                "projects",
+                "`.ply` files or directories, each reported on its own row",
+              ),
+            ),
+          ],
+        ),
+        cmdline::command(
+          "serve",
+          "Price a request: its cost per layer, and what the endpoint sustains under load",
+          cats([
+            serve_flags(),
+            [
+              nat("ladder-requests", 2000, "Requests per ladder rung; each is one connection"),
+              nats("concurrency", "1,2,4,8,16,32,64", "Simultaneous client connections to sweep"),
+              nats(
+                "load-headers",
+                "0",
+                "Filler header lines the client's request carries, per load point",
+              ),
+              sw("no-ladder", "Drop the per-request ladder, which is the slow half"),
+              sw("no-load", "Drop the load table, which is the half that needs a built `ply`"),
+              sw(
+                "baseline",
+                "Also measure the endpoint with `fold`-based scans instead of the byte builtins",
+              ),
+            ],
+          ]),
+        ),
+        cmdline::command(
+          "payload",
+          "Price a derived JSON codec, `Map`, and what derivation costs the front end and cache",
+          [
+            nats("lines", "1,10,40,200,1000", "Line items per JSON payload"),
+            nat("iterations", 200, "Encodes and decodes per payload size"),
+            nats(
+              "shape",
+              "40:0,40:100,40:400,40:1600",
+              "`lines:pad` pairs separating a decode's per-field cost from its per-byte one",
+            ),
+            nats("entries", "16,256,4096,65536", "Entries per `Map` measurement"),
+            nats("types", "50,200,500", "Type counts the derivation comparison is taken at"),
+            nat("types-per-module", 10, "Types per module in that comparison"),
+            nat(
+              "processes",
+              4,
+              "Processes the `map_keys` order check spawns; two is the minimum to see a hasher seed",
+            ),
+            opt(
+              "ply",
+              "The `ply` binary the order check drives; this binary's sibling when left off",
+            ),
+            nat("repeats", 3, "Repeats per point; the fastest is reported"),
+            sw("no-derivation", "Drop the derivation comparison, the slow half"),
+            json_switch(),
+          ],
+        ),
+        cmdline::command(
+          "w3",
+          "Price routing, HTTP/1.1 framing, keep-alive and TLS on the request path",
+          cats([
+            serve_flags(),
+            [
+              nat("per-conn", 32, "Requests one connection carries in the throughput sweep"),
+              nat(
+                "requests-per-point",
+                4000,
+                "Requests per point in the throughput sweep, held constant across concurrencies",
+              ),
+              nat("ladder-requests", 3200, "Requests per point in the keep-alive and TLS ladders"),
+              nat("ladder-concurrency", 8, "Client threads in the keep-alive and TLS ladders"),
+              nats("concurrency", "1,2,4,8,16,32,64", "Simultaneous client connections to sweep"),
+              sw("concurrent", "Also serve the task-per-connection variant"),
+              sw("w2-baseline", "Also re-take W2's single-endpoint load number on this machine"),
+              sw("no-load", "Drop the load tables"),
+              sw("no-shape", "Drop the per-route and shape tables"),
+              sw("no-tls", "Drop the TLS ladder"),
+            ],
+          ]),
+        ),
+        cmdline::command(
+          "w4",
+          "Price a statement through the effect boundary against one with no Ply in the path",
+          [
+            text(
+              "repo",
+              ".",
+              "The repository root, where `examples/desk.ply` is read from for `crud`",
+            ),
+            text(
+              "db",
+              "",
+              "The database; its own `part` table is created and dropped, and `crud` needs the desk schema",
+            ),
+            opt(
+              "ply",
+              "The `ply` binary the load table drives; this binary's sibling when left off",
+            ),
+            nats("concurrency", "1,2,4,8,16", "Concurrent tasks in the `ops` sweep"),
+            nat("operations", 400, "Statements per point in the `ops` sweep"),
+            nats("rows", "8,32,128,512", "Table sizes the `sizes` section sweeps, in rows"),
+            nats("pool-sizes", "1,2,4,8,16", "Pool sizes the `pool` section sweeps"),
+            nat("pool", 16, "Connections the `ops` sweep's pool holds, constant across its rows"),
+            nat("repeats", 3, "Repeats per point; the fastest is reported"),
+            nats("load-concurrency", "1,8,32", "Client concurrencies in the `crud` section"),
+            nat("per-conn", 32, "Requests one connection carries in the load table"),
+            nat("requests-per-point", 3000, "Requests per point in the load table"),
+            sw("no-ops", "Drop the `ops` sweep"),
+            sw("no-sizes", "Drop the `sizes` section"),
+            sw("no-pool", "Drop the `pool` section"),
+            sw("no-load", "Drop the `crud` load table"),
+            json_switch(),
+          ],
+        ),
+        cmdline::command(
+          "w5",
+          "Price tracing, a drain with requests in flight, the deadline, and a deploy",
+          [
+            text("repo", ".", "The repository root, where `examples/desk.ply` is read from"),
+            opt(
+              "ply",
+              "The `ply` binary the served sections drive; this binary's sibling when left off",
+            ),
+            opt(
+              "db",
+              "The database the served sections run against; it must hold the desk's schema",
+            ),
+            nat("operations", 20000, "Trace operations per point in the `events` table"),
+            nat(
+              "twin-operations",
+              200,
+              "Operations per twin point; small because `Sink` appends are quadratic in records held",
+            ),
+            nat("repeats", 3, "Repeats per point; the fastest is reported"),
+            nats("concurrency", "1,8,32", "Client concurrencies in the `served` table"),
+            nat("per-conn", 32, "Requests one connection carries in the served table"),
+            nat("requests-per-point", 3000, "Requests per point in the served table"),
+            nats("in-flight", "1,8,32", "Requests in flight when the signal arrives"),
+            nat("drain-ms", 5000, "The drain's deadline, in milliseconds"),
+            nat(
+              "hold-ms",
+              500,
+              "How long a client holds its half-sent request before finishing it",
+            ),
+            text("api-key", "bench-key", "The credential the served desk is configured with"),
+            sw("concurrent", "Serve the `served` table from the task-per-connection accept loop"),
+            sw("no-events", "Drop the `events` table"),
+            sw("no-served", "Drop the `served` table"),
+            sw("no-drain", "Drop the drain measurement"),
+            sw("no-transaction", "Drop the transaction measurement"),
+            sw("no-deploy", "Drop the deploy measurement"),
+            json_switch(),
+          ],
+        ),
+        cmdline::with_positionals(
+          cmdline::command("w6", "Assemble the W6 report and apply the M9 criteria to it", [
+            sw("strict", "Exit non-zero when the report is incomplete"),
+            json_switch(),
+          ]),
+          [
+            cmdline::many(
+              cmdline::positional(
+                "reports",
+                "Measurement files, each a report fragment; later files win per field",
+              ),
+            ),
+          ],
+        ),
+        cmdline::command(
+          "w6-ladder",
+          "Take the W6 ladder, writing the measurement half of a report that `w6` judges",
+          [
+            text("repo", ".", "The repository root, where `examples/desk.ply` is read from"),
+            opt(
+              "ply",
+              "The `ply` binary the served rungs drive; this binary's sibling when left off",
+            ),
+            text(
+              "db",
+              "",
+              "The database the served rungs run against; it must hold the desk's schema",
+            ),
+            nat("requests", 2000, "Requests per in-process point"),
+            nat("iterations", 2000, "Iterations of the in-Ply loop rungs 2, 3 and 4 are read off"),
+            nat("repeats", 3, "Repeats per point; the fastest is reported"),
+            nats(
+              "concurrency",
+              "1,2,4,8,16,32",
+              "Client concurrencies the served sweep takes; the total uses the fastest",
+            ),
+            nat("per-conn", 32, "Requests one connection carries"),
+            nat("requests-per-point", 3000, "Requests per point in the served sweep"),
+            text("api-key", "bench-key", "The credential the served desk is configured with"),
+            text(
+              "machine",
+              "unnamed",
+              "The machine the numbers were taken on, for the provenance line",
+            ),
+            opt("postgres", "The postgres version, for the same line"),
+            sw("no-served", "Drop the served half, for a run pointed at the in-process rungs"),
+            opt(
+              "only",
+              "Run one phase alone for a profiler: `sim`, `socket`, `routed`, `endpoint` or `items`",
+            ),
+            nat("rounds", 1, "Rounds of `--only`, each of `--requests` requests"),
+            text(
+              "accept",
+              "sequential",
+              "Which accept loop the ladder is read off; spawning disables the constant memo",
+            ),
+            nat("other-repeats", 1, "Repeats of the sweep on the loop the ladder is not read off"),
+            nat(
+              "served-repeats",
+              3,
+              "Repeats of the whole served sweep, so rung differences have a width",
+            ),
+            sw("no-levers", "Skip the constant memo's end-to-end pricing"),
+            opt("out", "Where the report fragment is written"),
+            opt("detail", "Where the per-rung detail is written"),
+            opt("write-control", "Where the control measurement is written"),
+          ],
+        ),
+        cmdline::with_positionals(
+          cmdline::command(
+            "regions",
+            "Price region isolation: colour the tests with and without the world-backed exemption",
+            [
+              nat(
+                "jobs",
+                8,
+                "Workers the wall-clock columns are modelled at and the suite is measured with",
+              ),
+              texts(
+                "hypothetical",
+                "A hypothetical footprint, `cells:labels`; repeat for each row",
+              ),
+              nat(
+                "hypothetical-shared",
+                10,
+                "Tests carrying a contending resource atom in each hypothetical row",
+              ),
+              nat("hypothetical-pure", 165, "Pure tests in each hypothetical row"),
+              sw("std", "Include shipped modules' tests, as `ply test --std` does"),
+              json_switch(),
+            ],
+          ),
+          [
+            cmdline::many(
+              cmdline::defaulted(
+                "roots",
+                "Projects to analyse, each loaded the way `ply` loads one",
+                "",
+              ),
+            ),
+          ],
+        ),
+      ],
+    ),
+  }
+
+// --- The plan a run materializes ------------------------------------------------
+
+fn str_flag(p: cmdline::Parsed, long: String) -> Json =
+  match cmdline::value(p, long) { Some(v) -> Str(v), None -> Null }
+
+fn int_flag(p: cmdline::Parsed, long: String) -> Json =
+  match cmdline::value(p, long) {
+    Some(v) -> match cmdline::parse_nat(v) { Some(n) -> Number(decimal_of_int(n)), None -> Null },
+    None -> Null,
+  }
+
+fn float_flag(p: cmdline::Parsed, long: String) -> Json =
+  match cmdline::value(p, long) {
+    Some(v) -> match decimal_of_string(v) { Some(d) -> Number(d), None -> Null },
+    None -> Null,
+  }
+
+fn bool_flag(p: cmdline::Parsed, long: String) -> Json = Bool(cmdline::has(p, long))
+
+fn split_commas(text: String) -> List<String> =
+  if text == "" { [] } else { split_from(bytes_of_string(text), 0, []) }
+
+fn split_from(b: Bytes, from: Int, acc: List<String>) -> List<String> =
+  match bytes_index_of(bytes_slice(b, from, bytes_len(b)), b",") {
+    None -> push(acc, string_of_bytes(bytes_slice(b, from, bytes_len(b)))),
+    Some(i) ->
+      split_from(b, from + i + 1, push(acc, string_of_bytes(bytes_slice(b, from, from + i)))),
+  }
+
+fn nats_json(text: String) -> Json =
+  array(
+    map(split_commas(text), |s: String|
+      match cmdline::parse_nat(s) { Some(n) -> Number(decimal_of_int(n)), None -> Null }),
+  )
+
+fn list_flag(p: cmdline::Parsed, long: String) -> Json =
+  match cmdline::value(p, long) { Some(v) -> nats_json(v), None -> array([]) }
+
+fn repeated_json(p: cmdline::Parsed, long: String) -> Json =
+  array(map(cmdline::values_of(p, long), |s: String| Str(s)))
+
+fn positionals_json(p: cmdline::Parsed) -> Json = array(map(p.positionals, |s: String| Str(s)))
+
+// The shape knobs, one member list, shared by `gen`.
+fn shape_args(p: cmdline::Parsed) -> List<{ key: String, value: Json }> =
+  [
+    { key: "seed", value: int_flag(p, "seed") },
+    { key: "modules", value: int_flag(p, "modules") },
+    { key: "defs_per_module", value: int_flag(p, "defs-per-module") },
+    { key: "tests", value: int_flag(p, "tests") },
+    { key: "depth", value: int_flag(p, "depth") },
+    { key: "tables", value: int_flag(p, "tables") },
+    { key: "regions", value: int_flag(p, "regions") },
+    { key: "effect_fraction", value: float_flag(p, "effect-fraction") },
+    { key: "nondet_fraction", value: float_flag(p, "nondet-fraction") },
+    { key: "hub_modules", value: int_flag(p, "hub-modules") },
+    { key: "max_weight", value: int_flag(p, "max-weight") },
+    { key: "concurrent_tests", value: int_flag(p, "concurrent-tests") },
+    { key: "tasks_per_test", value: int_flag(p, "tasks-per-test") },
+    { key: "steps_per_task", value: int_flag(p, "steps-per-task") },
+    { key: "conflict_density", value: float_flag(p, "conflict-density") },
+    { key: "spec_fraction", value: float_flag(p, "spec-fraction") },
+    { key: "specimens_per_module", value: int_flag(p, "specimens-per-module") },
+  ]
+
+fn serve_args(p: cmdline::Parsed) -> List<{ key: String, value: Json }> =
+  [
+    { key: "repo", value: str_flag(p, "repo") },
+    { key: "ply", value: str_flag(p, "ply") },
+    { key: "requests", value: int_flag(p, "requests") },
+    { key: "repeats", value: int_flag(p, "repeats") },
+    { key: "json", value: bool_flag(p, "json") },
+  ]
+
+fn plan(command: String, args: List<{ key: String, value: Json }>) -> Json =
+  object([
+    { key: "outcome", value: Str("run") },
+    { key: "command", value: Str(command) },
+    { key: "args", value: object(args) },
+  ])
+
+fn refused_plan(why: String) -> Json =
+  object([{ key: "outcome", value: Str("refused") }, { key: "why", value: Str(why) }])
+
+// A valued flag that must be written: the plan is a refusal when it was not, rendered the
+// library's way.
+fn required(p: cmdline::Parsed, long: String) -> Result<String, String> =
+  match cmdline::value(p, long) {
+    Some(v) -> Ok(v),
+    None ->
+      Err(
+        cmdline::refused(
+          spec(),
+          p.path,
+          "a value is required for '--" ++ long ++ "' but none was supplied",
+        ),
+      ),
+  }
+
+fn run_plan(p: cmdline::Parsed) -> Result<Json, String> =
+  match cmdline::nth_of(p.path, 0, "") {
+    "gen" -> match required(p, "out") {
+      Err(why) -> Err(why),
+      Ok(_) ->
+        Ok(
+          plan(
+            "gen",
+            cats([
+              shape_args(p),
+              [
+                { key: "out", value: str_flag(p, "out") },
+                { key: "no_verify", value: bool_flag(p, "no-verify") },
+                { key: "json", value: bool_flag(p, "json") },
+              ],
+            ]),
+          ),
+        ),
+    },
+    "bench" ->
+      Ok(
+        plan("bench", [
+          { key: "corpus", value: Str(cmdline::nth_of(p.positionals, 0, "")) },
+          { key: "repeats", value: int_flag(p, "repeats") },
+          { key: "backend", value: str_flag(p, "backend") },
+          { key: "json", value: bool_flag(p, "json") },
+        ]),
+      ),
+    "sweep" -> match required(p, "out") {
+      Err(why) -> Err(why),
+      Ok(_) ->
+        Ok(
+          plan("sweep", [
+            { key: "out", value: str_flag(p, "out") },
+            { key: "sizes", value: repeated_json(p, "sizes") },
+            { key: "backend", value: str_flag(p, "backend") },
+            { key: "seed", value: int_flag(p, "seed") },
+            { key: "repeats", value: int_flag(p, "repeats") },
+            { key: "json", value: bool_flag(p, "json") },
+          ]),
+        ),
+    },
+    "measure" ->
+      Ok(
+        plan("measure", [
+          {
+            key: "corpus",
+            value: match list_at(p.positionals, 0) {
+              Some(c) -> if c == "" { Null } else { Str(c) },
+              None -> Null,
+            },
+          },
+          { key: "repeats", value: int_flag(p, "repeats") },
+          { key: "cells", value: list_flag(p, "cells") },
+          { key: "only_throughput", value: bool_flag(p, "only-throughput") },
+          { key: "json", value: bool_flag(p, "json") },
+        ]),
+      ),
+    "sim" ->
+      Ok(
+        plan("sim", [
+          { key: "corpus", value: Str(cmdline::nth_of(p.positionals, 0, "")) },
+          { key: "trials", value: int_flag(p, "trials") },
+          { key: "budget", value: int_flag(p, "budget") },
+          { key: "steps", value: int_flag(p, "steps") },
+          { key: "rate_seeds", value: int_flag(p, "rate-seeds") },
+          { key: "no_reduction", value: bool_flag(p, "no-reduction") },
+          { key: "json", value: bool_flag(p, "json") },
+        ]),
+      ),
+    "prove" ->
+      Ok(
+        plan("prove", [
+          { key: "projects", value: positionals_json(p) },
+          { key: "cases", value: int_flag(p, "cases") },
+          { key: "prove_budget", value: int_flag(p, "prove-budget") },
+          { key: "shrink_budget", value: int_flag(p, "shrink-budget") },
+          { key: "json", value: bool_flag(p, "json") },
+        ]),
+      ),
+    "serve" ->
+      Ok(
+        plan(
+          "serve",
+          cats([
+            serve_args(p),
+            [
+              { key: "ladder_requests", value: int_flag(p, "ladder-requests") },
+              { key: "concurrency", value: list_flag(p, "concurrency") },
+              { key: "load_headers", value: list_flag(p, "load-headers") },
+              { key: "no_ladder", value: bool_flag(p, "no-ladder") },
+              { key: "no_load", value: bool_flag(p, "no-load") },
+              { key: "baseline", value: bool_flag(p, "baseline") },
+            ],
+          ]),
+        ),
+      ),
+    "payload" ->
+      Ok(
+        plan("payload", [
+          { key: "lines", value: list_flag(p, "lines") },
+          { key: "iterations", value: int_flag(p, "iterations") },
+          { key: "shape", value: list_flag(p, "shape") },
+          { key: "entries", value: list_flag(p, "entries") },
+          { key: "types", value: list_flag(p, "types") },
+          { key: "types_per_module", value: int_flag(p, "types-per-module") },
+          { key: "processes", value: int_flag(p, "processes") },
+          { key: "ply", value: str_flag(p, "ply") },
+          { key: "repeats", value: int_flag(p, "repeats") },
+          { key: "no_derivation", value: bool_flag(p, "no-derivation") },
+          { key: "json", value: bool_flag(p, "json") },
+        ]),
+      ),
+    "w3" ->
+      Ok(
+        plan(
+          "w3",
+          cats([
+            serve_args(p),
+            [
+              { key: "per_conn", value: int_flag(p, "per-conn") },
+              { key: "requests_per_point", value: int_flag(p, "requests-per-point") },
+              { key: "ladder_requests", value: int_flag(p, "ladder-requests") },
+              { key: "ladder_concurrency", value: int_flag(p, "ladder-concurrency") },
+              { key: "concurrency", value: list_flag(p, "concurrency") },
+              { key: "concurrent", value: bool_flag(p, "concurrent") },
+              { key: "w2_baseline", value: bool_flag(p, "w2-baseline") },
+              { key: "no_load", value: bool_flag(p, "no-load") },
+              { key: "no_shape", value: bool_flag(p, "no-shape") },
+              { key: "no_tls", value: bool_flag(p, "no-tls") },
+            ],
+          ]),
+        ),
+      ),
+    "w4" -> match required(p, "db") {
+      Err(why) -> Err(why),
+      Ok(_) ->
+        Ok(
+          plan("w4", [
+            { key: "repo", value: str_flag(p, "repo") },
+            { key: "db", value: str_flag(p, "db") },
+            { key: "ply", value: str_flag(p, "ply") },
+            { key: "concurrency", value: list_flag(p, "concurrency") },
+            { key: "operations", value: int_flag(p, "operations") },
+            { key: "rows", value: list_flag(p, "rows") },
+            { key: "pool_sizes", value: list_flag(p, "pool-sizes") },
+            { key: "pool", value: int_flag(p, "pool") },
+            { key: "repeats", value: int_flag(p, "repeats") },
+            { key: "load_concurrency", value: list_flag(p, "load-concurrency") },
+            { key: "per_conn", value: int_flag(p, "per-conn") },
+            { key: "requests_per_point", value: int_flag(p, "requests-per-point") },
+            { key: "no_ops", value: bool_flag(p, "no-ops") },
+            { key: "no_sizes", value: bool_flag(p, "no-sizes") },
+            { key: "no_pool", value: bool_flag(p, "no-pool") },
+            { key: "no_load", value: bool_flag(p, "no-load") },
+            { key: "json", value: bool_flag(p, "json") },
+          ]),
+        ),
+    },
+    "w5" ->
+      Ok(
+        plan("w5", [
+          { key: "repo", value: str_flag(p, "repo") },
+          { key: "ply", value: str_flag(p, "ply") },
+          { key: "db", value: str_flag(p, "db") },
+          { key: "operations", value: int_flag(p, "operations") },
+          { key: "twin_operations", value: int_flag(p, "twin-operations") },
+          { key: "repeats", value: int_flag(p, "repeats") },
+          { key: "concurrency", value: list_flag(p, "concurrency") },
+          { key: "per_conn", value: int_flag(p, "per-conn") },
+          { key: "requests_per_point", value: int_flag(p, "requests-per-point") },
+          { key: "in_flight", value: list_flag(p, "in-flight") },
+          { key: "drain_ms", value: int_flag(p, "drain-ms") },
+          { key: "hold_ms", value: int_flag(p, "hold-ms") },
+          { key: "api_key", value: str_flag(p, "api-key") },
+          { key: "concurrent", value: bool_flag(p, "concurrent") },
+          { key: "no_events", value: bool_flag(p, "no-events") },
+          { key: "no_served", value: bool_flag(p, "no-served") },
+          { key: "no_drain", value: bool_flag(p, "no-drain") },
+          { key: "no_transaction", value: bool_flag(p, "no-transaction") },
+          { key: "no_deploy", value: bool_flag(p, "no-deploy") },
+          { key: "json", value: bool_flag(p, "json") },
+        ]),
+      ),
+    "w6" ->
+      Ok(
+        plan("w6", [
+          { key: "reports", value: positionals_json(p) },
+          { key: "strict", value: bool_flag(p, "strict") },
+          { key: "json", value: bool_flag(p, "json") },
+        ]),
+      ),
+    "w6-ladder" -> match required(p, "db") {
+      Err(why) -> Err(why),
+      Ok(_) ->
+        Ok(
+          plan("w6-ladder", [
+            { key: "repo", value: str_flag(p, "repo") },
+            { key: "ply", value: str_flag(p, "ply") },
+            { key: "db", value: str_flag(p, "db") },
+            { key: "requests", value: int_flag(p, "requests") },
+            { key: "iterations", value: int_flag(p, "iterations") },
+            { key: "repeats", value: int_flag(p, "repeats") },
+            { key: "concurrency", value: list_flag(p, "concurrency") },
+            { key: "per_conn", value: int_flag(p, "per-conn") },
+            { key: "requests_per_point", value: int_flag(p, "requests-per-point") },
+            { key: "api_key", value: str_flag(p, "api-key") },
+            { key: "machine", value: str_flag(p, "machine") },
+            { key: "postgres", value: str_flag(p, "postgres") },
+            { key: "no_served", value: bool_flag(p, "no-served") },
+            { key: "only", value: str_flag(p, "only") },
+            { key: "rounds", value: int_flag(p, "rounds") },
+            { key: "accept", value: str_flag(p, "accept") },
+            { key: "other_repeats", value: int_flag(p, "other-repeats") },
+            { key: "served_repeats", value: int_flag(p, "served-repeats") },
+            { key: "no_levers", value: bool_flag(p, "no-levers") },
+            { key: "out", value: str_flag(p, "out") },
+            { key: "detail", value: str_flag(p, "detail") },
+            { key: "write_control", value: str_flag(p, "write-control") },
+          ]),
+        ),
+    },
+    "regions" ->
+      Ok(
+        plan("regions", [
+          { key: "roots", value: positionals_json(p) },
+          { key: "jobs", value: int_flag(p, "jobs") },
+          { key: "hypothetical", value: repeated_json(p, "hypothetical") },
+          { key: "hypothetical_shared", value: int_flag(p, "hypothetical-shared") },
+          { key: "hypothetical_pure", value: int_flag(p, "hypothetical-pure") },
+          { key: "std", value: bool_flag(p, "std") },
+          { key: "json", value: bool_flag(p, "json") },
+        ]),
+      ),
+    _ -> Err("no command named " ++ cmdline::nth_of(p.path, 0, "")),
+  }
+
+// --- The front door --------------------------------------------------------------
+
+// argv as the binary's own, minus its name: the JSON plan the Rust half reads. A run plan's
+// `args` carries every knob materialized -- defaults filled, nats and floats parsed, comma
+// lists split -- so the Rust half only ever decodes.
+pub fn dispatch(argv: List<String>) -> String =
+  encode(match cmdline::parse(spec(), argv) {
+    cmdline::Run(p) -> match run_plan(p) { Ok(j) -> j, Err(why) -> refused_plan(why) },
+    cmdline::Help(text) ->
+      object([{ key: "outcome", value: Str("help") }, { key: "text", value: Str(text) }]),
+    cmdline::Version(text) ->
+      object([{ key: "outcome", value: Str("version") }, { key: "text", value: Str(text) }]),
+    cmdline::Refused(text) ->
+      object([{ key: "outcome", value: Str("refused") }, { key: "why", value: Str(text) }]),
+  })
+
+fn encode(j: Json) -> String = json::to_string(j)
+
+pub fn main() -> Unit / {process.args[proc], process.out[proc]} = {
+  let argv: List<String> = process.args[proc]();
+  process.out[proc](dispatch(drop_first(argv)))
+}
+
+fn drop_first(xs: List<String>) -> List<String> = match xs { [] -> [], [_, ..rest] -> rest }
+
+// --- Tests -----------------------------------------------------------------------
+
+test "a bare word is refused with the help in it" {
+  match cmdline::parse(spec(), ["nonsense"]) {
+    cmdline::Refused(text) -> assert(string_contains(text, "unrecognized subcommand")),
+    _ -> assert(false),
+  }
+}
+
+test "gen fills the shape's defaults" {
+  let out = dispatch(["gen", "--out", "gen-out"]);
+  assert(string_contains(out, "\"command\":\"gen\""));
+  assert(string_contains(out, "\"seed\":1"));
+  assert(string_contains(out, "\"effect_fraction\":0.35"));
+  assert(string_contains(out, "\"no_verify\":false"));
+  assert(string_contains(out, "\"out\":\"gen-out\""));
+}
+
+test "gen refuses without --out" {
+  let out = dispatch(["gen"]);
+  assert(string_contains(out, "\"outcome\":\"refused\""));
+  assert(string_contains(out, "--out"));
+}
+
+test "w4 refuses without --db" {
+  let out = dispatch(["w4"]);
+  assert(string_contains(out, "\"outcome\":\"refused\""));
+  assert(string_contains(out, "--db"));
+}
+
+test "w6-ladder reads a comma list of concurrencies" {
+  let out = dispatch(["w6-ladder", "--db", "pg://x", "--concurrency", "1,16,64"]);
+  assert(string_contains(out, "\"concurrency\":[1,16,64]"));
+}
+
+test "an unknown flag is a refusal, not a panic" {
+  let out = dispatch(["bench", "some-corpus", "--bogus"]);
+  assert(string_contains(out, "\"outcome\":\"refused\""));
+}
+
+test "help is its own outcome" {
+  let out = dispatch(["--help"]);
+  assert(string_contains(out, "\"outcome\":\"help\""));
+  assert(string_contains(out, "w6-ladder"));
+}

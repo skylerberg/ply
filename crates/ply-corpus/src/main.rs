@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
 use ply_corpus::bench;
 use ply_corpus::build::generate;
 use ply_corpus::measure;
@@ -8,115 +7,49 @@ use ply_corpus::spec::CorpusSpec;
 use ply_corpus::write;
 use std::path::PathBuf;
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "ply-corpus",
-    about = "Generate a scale corpus for Ply, and measure where a run's time goes"
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand, Debug)]
-enum Command {
-    /// Write a synthetic project, then compile and run it to prove it is real.
-    Gen(GenArgs),
-    /// Time discovery, cache lookup, selection, compilation and execution over a corpus.
-    Bench(BenchArgs),
-    /// Generate and benchmark at several sizes, for one comparison table.
-    Sweep(SweepArgs),
-    /// Price interpreter throughput, fixture open against rebuild, and resumption cost.
-    Measure(MeasureArgs),
-    /// Price the search: pruning, seeds to the first failure, and seeds per second.
-    Sim(SimArgs),
-    /// Price the spec tier: where obligations land, why some fell short, what shrinking bought.
-    Prove(ProveArgs),
-    /// Price a request: its cost per layer, and what the endpoint sustains under load.
-    Serve(ServeArgs),
-    /// Price a derived JSON codec, `Map`, and what derivation costs the front end and cache.
-    Payload(PayloadArgs),
-    /// Price routing, HTTP/1.1 framing, keep-alive and TLS on the request path.
-    W3(W3Args),
-    /// Price a statement through the effect boundary against one with no Ply in the path.
-    W4(W4Args),
-    /// Price tracing, a drain with requests in flight, the deadline, and a deploy.
-    W5(W5Args),
-    /// Assemble the W6 report and apply the M9 criteria to it.
-    W6(W6Args),
-    /// Take the W6 ladder, writing the measurement half of a report that `w6` judges.
-    W6Ladder(W6LadderArgs),
-    /// Price region isolation: colour the tests with and without the world-backed exemption.
-    Regions(RegionsArgs),
-}
-
-#[derive(Args, Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct RegionsArgs {
     /// Projects to analyse, each loaded the way `ply` loads one.
-    #[arg(required = false)]
     roots: Vec<PathBuf>,
     /// Workers the wall-clock columns are modelled at and the suite is measured with.
-    #[arg(long, default_value_t = 8)]
     jobs: usize,
     /// Hypothetical footprints, `cells:labels`, appended as their own rows.
-    #[arg(long, value_delimiter = ',')]
     hypothetical: Vec<String>,
     /// Tests carrying a contending resource atom in each hypothetical row.
-    #[arg(long, default_value_t = 10)]
     hypothetical_shared: usize,
     /// Pure tests in each hypothetical row.
-    #[arg(long, default_value_t = 165)]
     hypothetical_pure: usize,
     /// Include shipped modules' tests, as `ply test --std` does.
-    #[arg(long)]
     std: bool,
-    #[arg(long)]
     json: bool,
 }
 
-#[derive(Args, Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 struct ShapeArgs {
-    #[arg(long, default_value_t = 1)]
     seed: u64,
-    #[arg(long, default_value_t = 20)]
     modules: usize,
-    #[arg(long, default_value_t = 25)]
     defs_per_module: usize,
-    #[arg(long, default_value_t = 200)]
     tests: usize,
     /// Layers in the module import DAG.
-    #[arg(long, default_value_t = 4)]
     depth: usize,
     /// Distinct `db` resource labels, shared across the whole corpus.
-    #[arg(long, default_value_t = 12)]
     tables: usize,
     /// Distinct `cache` resource labels.
-    #[arg(long, default_value_t = 6)]
     regions: usize,
-    #[arg(long, default_value_t = 0.35)]
     effect_fraction: f64,
-    #[arg(long, default_value_t = 0.03)]
     nondet_fraction: f64,
-    #[arg(long, default_value_t = 3)]
     hub_modules: usize,
-    #[arg(long, default_value_t = 192)]
     max_weight: u32,
     /// `simulate` tests, on top of `--tests`.
-    #[arg(long, default_value_t = 0)]
     concurrent_tests: usize,
-    #[arg(long, default_value_t = 3)]
     tasks_per_test: usize,
     /// `counter.bump` calls per task, separated by a `task.yield()`.
-    #[arg(long, default_value_t = 2)]
     steps_per_task: usize,
     /// 0.0 gives every task its own resource; 1.0 puts every task on one.
-    #[arg(long, default_value_t = 0.5)]
     conflict_density: f64,
     /// Fraction of generated definitions carrying a `requires`/`ensures` pair.
-    #[arg(long, default_value_t = 0.0)]
     spec_fraction: f64,
     /// Definitions per module written for their obligation, each with a law.
-    #[arg(long, default_value_t = 0)]
     specimens_per_module: usize,
 }
 
@@ -144,90 +77,68 @@ impl From<ShapeArgs> for CorpusSpec {
     }
 }
 
-#[derive(Args, Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct GenArgs {
     /// Where to write it. Must be empty, or a corpus this tool already wrote.
-    #[arg(long)]
     out: PathBuf,
-    #[command(flatten)]
+    #[serde(flatten)]
     shape: ShapeArgs,
     /// Write the corpus without compiling it.
-    #[arg(long)]
     no_verify: bool,
-    #[arg(long)]
     json: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct BenchArgs {
     /// A directory a previous `gen` wrote.
     corpus: PathBuf,
     /// Repeats per scenario; the fastest run is reported.
-    #[arg(long, default_value_t = 3)]
     repeats: usize,
     /// Attach a compiled backend, as `ply test --backend` spells it.
-    #[arg(long, value_name = "BACKEND")]
     backend: Option<String>,
-    #[arg(long)]
     json: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct SweepArgs {
     /// A directory to hold one sub-directory per size.
-    #[arg(long)]
     out: PathBuf,
     /// Sizes to sweep, each `modules,defs_per_module,tests`.
-    #[arg(long, value_name = "M,D,T", num_args = 1.., value_delimiter = ' ')]
     sizes: Vec<String>,
     /// Attach a compiled backend to every size, as `ply test --backend` spells it.
-    #[arg(long, value_name = "BACKEND")]
     backend: Option<String>,
-    #[arg(long, default_value_t = 1)]
     seed: u64,
-    #[arg(long, default_value_t = 3)]
     repeats: usize,
-    #[arg(long)]
     json: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct MeasureArgs {
     /// A directory a previous `gen` wrote. Omit it for fixture and resumption cost.
     corpus: Option<PathBuf>,
     /// Repeats per measurement; the fastest is reported.
-    #[arg(long, default_value_t = 3)]
     repeats: usize,
     /// Fixture sizes for the open-against-rebuild comparison.
-    #[arg(long, value_delimiter = ',', default_values_t = [1usize, 100, 1_000, 10_000, 100_000])]
     cells: Vec<usize>,
     /// Skip everything but the throughput table.
-    #[arg(long)]
     only_throughput: bool,
-    #[arg(long)]
     json: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct SimArgs {
     /// A `.ply` file, or a directory a previous `gen` wrote.
     corpus: PathBuf,
     /// Roots per strategy in the race-finding table. Zero drops that table.
-    #[arg(long, default_value_t = 32)]
     trials: u32,
     /// Interleavings a search may run per root, pruned or not.
-    #[arg(long, default_value_t = 4096)]
     budget: u32,
     /// Scheduling steps one interleaving may take.
-    #[arg(long, default_value_t = ply_eval::sim::DEFAULT_STEPS)]
     steps: u32,
     /// Seeds the throughput table times.
-    #[arg(long, default_value_t = 64)]
     rate_seeds: u32,
     /// Drop the reduction table, which is the expensive one.
-    #[arg(long)]
     no_reduction: bool,
-    #[arg(long)]
     json: bool,
 }
 
@@ -258,39 +169,28 @@ fn simulate(args: SimArgs) -> Result<()> {
     Ok(())
 }
 
-#[derive(Args, Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct ServeArgs {
     /// The repository root, where `examples/hello.ply` is read from.
-    #[arg(long, default_value = ".")]
     repo: PathBuf,
     /// The `ply` binary the load table drives. Defaults to this binary's sibling.
-    #[arg(long)]
     ply: Option<PathBuf>,
     /// Requests per ladder rung. Each is one connection.
-    #[arg(long, default_value_t = 2000)]
     ladder_requests: u32,
     /// Repeats per rung; the fastest is reported.
-    #[arg(long, default_value_t = 3)]
     repeats: usize,
     /// Requests per load point.
-    #[arg(long, default_value_t = 2000)]
     requests: u32,
     /// Simultaneous client connections to sweep.
-    #[arg(long, value_delimiter = ',', default_values_t = [1u32, 2, 4, 8, 16, 32, 64])]
     concurrency: Vec<u32>,
     /// Filler header lines the client's request carries, per load point.
-    #[arg(long, value_delimiter = ',', default_values_t = [0usize])]
     load_headers: Vec<usize>,
     /// Drop the per-request ladder, which is the slow half.
-    #[arg(long)]
     no_ladder: bool,
     /// Drop the load table, which is the half that needs a built `ply`.
-    #[arg(long)]
     no_load: bool,
     /// Also measure the endpoint with `fold`-based scans instead of the byte builtins.
-    #[arg(long)]
     baseline: bool,
-    #[arg(long)]
     json: bool,
 }
 
@@ -376,49 +276,34 @@ fn serve(args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
-#[derive(Args, Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct W3Args {
     /// The repository root, where `examples/desk.ply` is read from.
-    #[arg(long, default_value = ".")]
     repo: PathBuf,
     /// The `ply` binary the load tables drive. Defaults to this binary's sibling.
-    #[arg(long)]
     ply: Option<PathBuf>,
     /// Simultaneous client connections to sweep.
-    #[arg(long, value_delimiter = ',', default_values_t = [1u32, 2, 4, 8, 16, 32, 64])]
     concurrency: Vec<u32>,
     /// Requests one connection carries in the throughput sweep.
-    #[arg(long, default_value_t = 32)]
     per_conn: u32,
     /// Requests per point in the throughput sweep, held constant across concurrencies.
-    #[arg(long, default_value_t = 4000)]
     requests_per_point: u32,
     /// Requests per point in the keep-alive and TLS ladders.
-    #[arg(long, default_value_t = 3200)]
     ladder_requests: u32,
     /// Client threads in the keep-alive and TLS ladders.
-    #[arg(long, default_value_t = 8)]
     ladder_concurrency: u32,
     /// Requests per in-process point, for the per-route and shape tables.
-    #[arg(long, default_value_t = 2000)]
     requests: u32,
     /// Repeats per in-process point; the fastest is reported.
-    #[arg(long, default_value_t = 3)]
     repeats: usize,
     /// Also serve the task-per-connection variant.
-    #[arg(long)]
     concurrent: bool,
     /// Also re-take W2's single-endpoint load number on this machine.
-    #[arg(long)]
     w2_baseline: bool,
     /// Sections to drop, for a run pointed at one question.
-    #[arg(long)]
     no_load: bool,
-    #[arg(long)]
     no_shape: bool,
-    #[arg(long)]
     no_tls: bool,
-    #[arg(long)]
     json: bool,
 }
 
@@ -491,51 +376,34 @@ fn w3(args: W3Args) -> Result<()> {
     Ok(())
 }
 
-#[derive(Args, Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct W4Args {
     /// The repository root, where `examples/desk.ply` is read from for `crud`.
-    #[arg(long, default_value = ".")]
     repo: PathBuf,
     /// The database; its own `part` table is created and dropped, and `crud` needs the desk schema.
-    #[arg(long)]
     db: String,
-    #[arg(long)]
     ply: Option<PathBuf>,
     /// Concurrent tasks in the `ops` sweep.
-    #[arg(long, value_delimiter = ',', default_values_t = [1u32, 2, 4, 8, 16])]
     concurrency: Vec<u32>,
     /// Statements per point in the `ops` sweep.
-    #[arg(long, default_value_t = 400)]
     operations: u32,
     /// Table sizes the `sizes` section sweeps, in rows.
-    #[arg(long, value_delimiter = ',', default_values_t = [8u32, 32, 128, 512])]
     rows: Vec<u32>,
     /// Pool sizes the `pool` section sweeps.
-    #[arg(long, value_delimiter = ',', default_values_t = [1usize, 2, 4, 8, 16])]
     pool_sizes: Vec<usize>,
     /// Connections the `ops` sweep's pool holds, constant across its rows.
-    #[arg(long, default_value_t = 16)]
     pool: usize,
     /// Repeats per point; the fastest is reported.
-    #[arg(long, default_value_t = 3)]
     repeats: usize,
     /// Client concurrencies in the `crud` section.
-    #[arg(long, value_delimiter = ',', default_values_t = [1u32, 8, 32])]
     load_concurrency: Vec<u32>,
-    #[arg(long, default_value_t = 32)]
     per_conn: u32,
-    #[arg(long, default_value_t = 3000)]
     requests_per_point: u32,
     /// Sections to drop, for a run pointed at one question.
-    #[arg(long)]
     no_ops: bool,
-    #[arg(long)]
     no_sizes: bool,
-    #[arg(long)]
     no_pool: bool,
-    #[arg(long)]
     no_load: bool,
-    #[arg(long)]
     json: bool,
 }
 
@@ -594,57 +462,37 @@ fn w4(args: W4Args) -> Result<()> {
     Ok(())
 }
 
-#[derive(Args, Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct W5Args {
     /// The repository root, where `examples/desk.ply` is read from.
-    #[arg(long, default_value = ".")]
     repo: PathBuf,
-    #[arg(long)]
     ply: Option<PathBuf>,
     /// The database the served sections run against. It must hold the desk's schema.
-    #[arg(long)]
     db: Option<String>,
     /// Trace operations per point in the `events` table.
-    #[arg(long, default_value_t = 20_000)]
     operations: u32,
     /// Operations per twin point. Small because `Sink` appends are quadratic in records held.
-    #[arg(long, default_value_t = 200)]
     twin_operations: u32,
-    #[arg(long, default_value_t = 3)]
     repeats: usize,
     /// Client concurrencies in the `served` table.
-    #[arg(long, value_delimiter = ',', default_values_t = [1u32, 8, 32])]
     concurrency: Vec<u32>,
-    #[arg(long, default_value_t = 32)]
     per_conn: u32,
-    #[arg(long, default_value_t = 3000)]
     requests_per_point: u32,
     /// Requests in flight when the signal arrives.
-    #[arg(long, value_delimiter = ',', default_values_t = [1u32, 8, 32])]
     in_flight: Vec<u32>,
-    #[arg(long, default_value_t = 5_000)]
     drain_ms: u64,
     /// How long a client holds its half-sent request before finishing it.
-    #[arg(long, default_value_t = 500)]
     hold_ms: u64,
     /// The credential the served desk is configured with.
-    #[arg(long, default_value = "bench-key")]
     api_key: String,
     /// Serve the `served` table from the task-per-connection accept loop.
-    #[arg(long)]
     concurrent: bool,
     /// Sections to drop, for a run pointed at one question.
-    #[arg(long)]
     no_events: bool,
-    #[arg(long)]
     no_served: bool,
-    #[arg(long)]
     no_drain: bool,
-    #[arg(long)]
     no_transaction: bool,
-    #[arg(long)]
     no_deploy: bool,
-    #[arg(long)]
     json: bool,
 }
 
@@ -738,70 +586,48 @@ fn w5(args: W5Args) -> Result<()> {
     Ok(())
 }
 
-#[derive(Args, Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct W6LadderArgs {
     /// The repository root, where `examples/desk.ply` is read from.
-    #[arg(long, default_value = ".")]
     repo: PathBuf,
     /// The `ply` binary the served rungs drive. Defaults to this binary's sibling.
-    #[arg(long)]
     ply: Option<PathBuf>,
     /// The database the served rungs run against. It must hold the desk's schema.
-    #[arg(long)]
     db: String,
     /// Requests per in-process point: over `SimNet`, a real listener, and the Rust floor.
-    #[arg(long, default_value_t = 2000)]
     requests: u32,
     /// Iterations of the in-Ply loop rungs 2, 3 and 4 are read off.
-    #[arg(long, default_value_t = 2000)]
     iterations: u32,
-    #[arg(long, default_value_t = 3)]
     repeats: usize,
     /// Client concurrencies the served sweep takes; the total uses the fastest.
-    #[arg(long, num_args = 1.., default_values_t = [1u32, 2, 4, 8, 16, 32])]
     concurrency: Vec<u32>,
-    #[arg(long, default_value_t = 32)]
     per_conn: u32,
-    #[arg(long, default_value_t = 3000)]
     requests_per_point: u32,
     /// The credential the served desk is configured with.
-    #[arg(long, default_value = "bench-key")]
     api_key: String,
     /// The machine the numbers were taken on, for the provenance line.
-    #[arg(long, default_value = "unnamed")]
     machine: String,
     /// The postgres version, for the same line.
-    #[arg(long)]
     postgres: Option<String>,
     /// Drop the served half, for a run pointed at the in-process rungs.
-    #[arg(long)]
     no_served: bool,
     /// Run one phase alone for a profiler: `sim`, `socket`, `routed`, `endpoint` or `items`.
-    #[arg(long)]
     only: Option<String>,
     /// Rounds of `--only`, each of `--requests` requests.
-    #[arg(long, default_value_t = 1)]
     rounds: usize,
     /// Which accept loop the ladder is read off. Spawning disables the constant memo.
-    #[arg(long, default_value = "sequential")]
     accept: String,
     /// Repeats of the sweep on the loop the ladder is not read off.
-    #[arg(long, default_value_t = 1)]
     other_repeats: usize,
     /// Repeats of the whole served sweep, so rung differences have a width.
-    #[arg(long, default_value_t = 3)]
     served_repeats: usize,
     /// Skip the constant memo's end-to-end pricing.
-    #[arg(long)]
     no_levers: bool,
     /// Where to write the report. Defaults to stdout.
-    #[arg(long)]
     out: Option<PathBuf>,
     /// Where to write the raw rows the report is read off.
-    #[arg(long)]
     detail: Option<PathBuf>,
     /// Write the constant memo's control program into this directory, and stop.
-    #[arg(long)]
     write_control: Option<PathBuf>,
 }
 
@@ -923,15 +749,12 @@ fn w6_ladder(args: W6LadderArgs) -> Result<()> {
     Ok(())
 }
 
-#[derive(Args, Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct W6Args {
     /// Measurement files, each a `ply_corpus::w6::Report` fragment; later files win per field.
-    #[arg(required = true)]
     reports: Vec<PathBuf>,
     /// Exit non-zero when the report is incomplete.
-    #[arg(long)]
     strict: bool,
-    #[arg(long)]
     json: bool,
 }
 
@@ -971,43 +794,27 @@ fn w6(args: W6Args) -> Result<()> {
     Ok(())
 }
 
-#[derive(Args, Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct PayloadArgs {
     /// Line items per JSON payload.
-    #[arg(long, value_delimiter = ',', default_values_t = [1usize, 10, 40, 200, 1000])]
     lines: Vec<usize>,
     /// Encodes and decodes per payload size.
-    #[arg(long, default_value_t = 200)]
     iterations: u32,
     /// `lines:pad` pairs separating a decode's per-field cost from its per-byte one.
-    #[arg(long, value_delimiter = ',', default_values_t = [
-        String::from("40:0"),
-        String::from("40:100"),
-        String::from("40:400"),
-        String::from("40:1600"),
-    ])]
     shape: Vec<String>,
     /// Entries per `Map` measurement.
-    #[arg(long, value_delimiter = ',', default_values_t = [16usize, 256, 4_096, 65_536])]
     entries: Vec<usize>,
     /// Type counts the derivation comparison is taken at.
-    #[arg(long, value_delimiter = ',', default_values_t = [50usize, 200, 500])]
     types: Vec<usize>,
     /// Types per module in that comparison.
-    #[arg(long, default_value_t = 10)]
     types_per_module: usize,
     /// Processes the `map_keys` order check spawns; two is the minimum to see a hasher seed.
-    #[arg(long, default_value_t = 4)]
     processes: usize,
     /// The `ply` binary the order check drives.
-    #[arg(long)]
     ply: Option<PathBuf>,
-    #[arg(long, default_value_t = 3)]
     repeats: usize,
     /// Drop the derivation comparison, the slow half.
-    #[arg(long)]
     no_derivation: bool,
-    #[arg(long)]
     json: bool,
 }
 
@@ -1056,18 +863,13 @@ fn parse_shape(point: &str) -> Result<(usize, usize)> {
     ))
 }
 
-#[derive(Args, Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct ProveArgs {
     /// `.ply` files or directories, each reported on its own row.
-    #[arg(required = true)]
     projects: Vec<PathBuf>,
-    #[arg(long, default_value_t = ply_prove::DEFAULT_CASES)]
     cases: u32,
-    #[arg(long, default_value_t = ply_prove::DEFAULT_PROVE_BUDGET)]
     prove_budget: u32,
-    #[arg(long, default_value_t = ply_prove::DEFAULT_SHRINK_BUDGET)]
     shrink_budget: u32,
-    #[arg(long)]
     json: bool,
 }
 
@@ -1130,9 +932,28 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    match Cli::parse().command {
-        Command::Gen(args) => generate_corpus(args),
-        Command::Bench(args) => {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match ply_corpus::cmd::dispatch(&argv)? {
+        ply_corpus::cmd::Outcome::Help(text) => println!("{text}"),
+        ply_corpus::cmd::Outcome::Version(text) => println!("{text}"),
+        ply_corpus::cmd::Outcome::Refused(why) => {
+            eprint!("{why}");
+            std::process::exit(2);
+        }
+        ply_corpus::cmd::Outcome::Run(plan) => run_plan(plan)?,
+    }
+    Ok(())
+}
+
+fn run_plan(plan: serde_json::Value) -> Result<()> {
+    let command = plan["command"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("the plan carries no command"))?;
+    let args = plan["args"].clone();
+    match command {
+        "gen" => generate_corpus(serde_json::from_value(args)?),
+        "bench" => {
+            let args: BenchArgs = serde_json::from_value(args)?;
             let report = bench::run(
                 &args.corpus,
                 &bench::Options {
@@ -1142,18 +963,19 @@ fn run() -> Result<()> {
             )?;
             emit_report(&report, args.json)
         }
-        Command::Sweep(args) => sweep(args),
-        Command::Measure(args) => measure(args),
-        Command::Sim(args) => simulate(args),
-        Command::Prove(args) => prove(args),
-        Command::Serve(args) => serve(args),
-        Command::Payload(args) => payload(args),
-        Command::W3(args) => w3(args),
-        Command::W4(args) => w4(args),
-        Command::W5(args) => w5(args),
-        Command::W6(args) => w6(args),
-        Command::W6Ladder(args) => w6_ladder(args),
-        Command::Regions(args) => regions(args),
+        "sweep" => sweep(serde_json::from_value(args)?),
+        "measure" => measure(serde_json::from_value(args)?),
+        "sim" => simulate(serde_json::from_value(args)?),
+        "prove" => prove(serde_json::from_value(args)?),
+        "serve" => serve(serde_json::from_value(args)?),
+        "payload" => payload(serde_json::from_value(args)?),
+        "w3" => w3(serde_json::from_value(args)?),
+        "w4" => w4(serde_json::from_value(args)?),
+        "w5" => w5(serde_json::from_value(args)?),
+        "w6" => w6(serde_json::from_value(args)?),
+        "w6-ladder" => w6_ladder(serde_json::from_value(args)?),
+        "regions" => regions(serde_json::from_value(args)?),
+        other => anyhow::bail!("the corpus has no `{other}` command"),
     }
 }
 
@@ -1338,12 +1160,6 @@ fn emit_report(report: &bench::Report, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
-
-    #[test]
-    fn the_command_tree_is_well_formed() {
-        Cli::command().debug_assert();
-    }
 
     #[test]
     fn a_size_is_three_numbers_and_nothing_else() {
