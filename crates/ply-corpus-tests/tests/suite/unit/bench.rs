@@ -25,7 +25,6 @@ fn bench(root: &Path) -> serde_json::Value {
         vec![
             ply_eval::Value::str(root.to_string_lossy()),
             ply_eval::Value::Int(1),
-            ply_eval::Value::str(""),
         ],
         root,
         &ply(),
@@ -121,7 +120,6 @@ fn a_stale_edit_site_is_an_error_rather_than_a_silent_no_op() {
         vec![
             ply_eval::Value::str(root.to_string_lossy()),
             ply_eval::Value::Int(1),
-            ply_eval::Value::str(""),
         ],
         &root.canonicalize().unwrap(),
         &ply(),
