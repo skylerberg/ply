@@ -45,10 +45,10 @@ impl Run {
         let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
         let prover = Prover::new(&loaded)
             .expect("the port lowers the claims")
-            .with_backend(
-                ply_machine::support::prover_backend(None, &loaded)
+            .with_backend(Some(
+                ply_machine::support::prover_backend(&loaded)
                     .expect("the program compiles to a tier"),
-            );
+            ));
         let results = collected
             .obligations
             .into_iter()
@@ -315,10 +315,10 @@ fn nothing_proved_here_is_refutable_by_sampling() {
         let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
         let prover = Prover::new(&loaded)
             .expect("the port lowers the claims")
-            .with_backend(
-                ply_machine::support::prover_backend(None, &loaded)
+            .with_backend(Some(
+                ply_machine::support::prover_backend(&loaded)
                     .expect("the program compiles to a tier"),
-            );
+            ));
         for obligation in &collected.obligations {
             if prover
                 .discharge_with(obligation, &ProvePlan::default())
@@ -629,10 +629,9 @@ law \"a divisor is a function\" forall (a: Int, b: Int) { a / b == a / b }
     let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
     let prover = Prover::new(&loaded)
         .expect("the port lowers the claims")
-        .with_backend(
-            ply_machine::support::prover_backend(None, &loaded)
-                .expect("the program compiles to a tier"),
-        );
+        .with_backend(Some(
+            ply_machine::support::prover_backend(&loaded).expect("the program compiles to a tier"),
+        ));
     let results: Vec<(Obligation, Discharge)> = collected
         .obligations
         .into_iter()

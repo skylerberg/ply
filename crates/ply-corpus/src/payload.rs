@@ -703,7 +703,6 @@ pub fn run_tests(loaded: &ply_machine::load::Loaded, store: &mut Store) -> Resul
         &loaded.hashes,
         store,
         &ply_eval::Plan::default(),
-        &ply_test::Engine::Evaluator,
     );
     let plan = ply_machine::tester::Plan::new(selection, &loaded.check, None, false);
     let selection = plan.selection;

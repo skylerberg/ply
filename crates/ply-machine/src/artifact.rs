@@ -1195,7 +1195,7 @@ pub fn enter(
         .defs
         .get(&opened.entry)
         .map(|d| d.footprint.clone());
-    let tier = tier(opened, None, unit)?;
+    let tier = tier(opened, unit)?;
     let process = ply_host::process::ProcessHost::new(
         argv,
         ply_host::process::Sink::Real {
@@ -1256,12 +1256,8 @@ pub(crate) fn servable(artifact: &Artifact) -> bool {
 /// The unit the artifact runs on: its embedded one as built, else one compiled from its bodies.
 pub(crate) fn tier(
     opened: &Opened,
-    backend: Option<&String>,
     unit: Option<&EmbeddedUnit>,
-) -> Result<Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>, Diagnostic> {
-    let Some(spec) = crate::support::backend_spec(backend)? else {
-        return Ok(None);
-    };
+) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
     // Entered as built: no producer is asked.
     if let Some(unit) = unit {
         let unit_error = |e: &dyn std::fmt::Display| {
@@ -1273,11 +1269,10 @@ pub(crate) fn tier(
         let text = ply_codegen::c::bundle::unpack(&unit.text).map_err(|e| unit_error(&e))?;
         let provider: &'static dyn ply_eval::Provider =
             ply_codegen::Unit::embedded(&opened.front, text).map_err(|e| unit_error(&e))?;
-        return Ok(Some((provider, spec)));
+        return Ok(provider);
     }
     let texts = crate::support::module_texts(&opened.front.check, &opened.sources);
-    let provider = crate::support::build_backend_over(&spec, &opened.front, texts)?;
-    Ok(Some((provider, spec)))
+    crate::support::build_backend_over(&opened.front, texts)
 }
 
 fn evaluate(
@@ -1286,12 +1281,10 @@ fn evaluate(
     plan: &ply_eval::Plan,
     hosts: &crate::hosts::Hosts,
     declared: Option<&ply_ty::ty::Footprint>,
-    tier: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
+    tier: &'static dyn ply_eval::Provider,
 ) -> Result<ply_eval::Value, Diagnostic> {
     let mut machine = ply_eval::Machine::new(&opened.front);
-    if let Some((provider, spec)) = tier {
-        machine.set_compiled(provider.attach(&spec));
-    }
+    machine.set_compiled(tier.attach());
     machine.set_host_binding(hosts.binding());
     if let Some(runtime) = hosts.runtime() {
         machine.set_host_runtime(runtime);

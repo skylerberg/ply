@@ -25,13 +25,6 @@ use ply_eval::Plan;
 use ply_store::Store;
 use std::path::Path;
 
-/// The default tier; a bare machine has no front end and declines everything.
-pub(crate) fn tier_spec() -> ply_eval::BackendSpec {
-    ply_eval::BackendSpec {
-        kind: ply_eval::BackendKind::C,
-    }
-}
-
 /// The front end over one caller-written module that imports the standard library: the
 /// caller's source alone, with the shipped std pulled as the built-in package rather than
 /// inlined, and the sources placed the way the front end places them. Errors raise the way
@@ -66,7 +59,7 @@ pub fn tier_machine<'a>(
     let texts = ply_machine::support::module_texts(&port.check, sources);
     let unit = ply_codegen::Unit::over_front(port, texts).expect("this host has a C compiler");
     let mut machine = ply_eval::Machine::new(port);
-    machine.set_compiled(ply_eval::Provider::attach(unit, &tier_spec()));
+    machine.set_compiled(ply_eval::Provider::attach(unit));
     machine
 }
 
@@ -83,7 +76,7 @@ pub fn run_on_tier(
     let unit =
         ply_codegen::Unit::over_front(&front.port, texts).expect("this host has a C compiler");
     let executor = ply_test::InterpExecutor::new(&front.port)
-        .with_backend(unit, tier_spec())
+        .with_backend(unit)
         .with_search(search)
         .with_hosts(hosting);
     ply_test::run_with(selection, &front.check, &front.hashes, store, &executor)
@@ -107,13 +100,7 @@ pub fn verify(root: &Path) -> Result<Verified> {
     let mut store = Store::open(root)?;
     store.clear()?;
 
-    let selection = ply_test::select(
-        &front.check,
-        &front.hashes,
-        &store,
-        &Plan::default(),
-        &ply_test::Engine::Evaluator,
-    );
+    let selection = ply_test::select(&front.check, &front.hashes, &store, &Plan::default());
     let report = run_on_tier(
         &front,
         &selection,

@@ -28,10 +28,7 @@ fn tiered(service: &str) -> (ply_ty::Front, &'static ply_codegen::Unit) {
 
 fn on_tier<'a>(front: &'a ply_ty::Front, unit: &'static ply_codegen::Unit) -> Machine<'a> {
     let mut machine = Machine::new(front);
-    let spec = ply_eval::BackendSpec {
-        kind: ply_eval::BackendKind::C,
-    };
-    machine.set_compiled(ply_eval::Provider::attach(unit, &spec));
+    machine.set_compiled(ply_eval::Provider::attach(unit));
     machine
 }
 

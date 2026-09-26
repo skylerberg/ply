@@ -896,7 +896,6 @@ fn failure_with(attribution: ply_test::Attribution) -> ply_test::Failure {
 
 fn summary_of(attribution: ply_test::Attribution) -> Vec<String> {
     ply_test::RunReport {
-        engine: ply_test::Engine::Evaluator,
         passed: 0,
         failed: 1,
         abandoned: 0,

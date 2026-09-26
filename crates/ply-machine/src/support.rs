@@ -19,18 +19,6 @@ fn unbuilt(error: impl std::fmt::Display) -> Diagnostic {
     .note("this tier shells out to `cc`; `PLY_CC` names another compiler")
 }
 
-/// `--backend`'s value as a spec, or the diagnostic that refuses it.
-pub fn backend_spec(flag: Option<&String>) -> Result<Option<ply_eval::BackendSpec>, Diagnostic> {
-    let Some(spec) = flag else {
-        return Ok(Some(ply_eval::BackendSpec {
-            kind: ply_eval::BackendKind::C,
-        }));
-    };
-    ply_eval::backend::parse(spec)
-        .map(Some)
-        .map_err(|message| Diagnostic::error(codes::BACKEND_UNAVAILABLE, message))
-}
-
 /// Fixes the emitted C tier's toolchain before anything compiles; not part of the cache key,
 /// because both profiles must answer identically.
 pub fn select_profile(flag: &str) -> Result<(), Diagnostic> {
@@ -63,11 +51,8 @@ pub fn run_on_tier(
     let texts = module_texts(&loaded.check, &loaded.sources);
     let unit =
         ply_codegen::Unit::over_front(&loaded.front, texts).expect("this host has a C compiler");
-    let spec = ply_eval::BackendSpec {
-        kind: ply_eval::BackendKind::C,
-    };
     let executor = ply_test::InterpExecutor::new(&loaded.front)
-        .with_backend(unit, spec)
+        .with_backend(unit)
         .with_search(ply_test::Search::of(selection))
         .with_hosts(hosting);
     ply_test::run_with(selection, &loaded.check, &loaded.hashes, store, &executor)
@@ -90,38 +75,26 @@ pub fn module_texts(
 
 /// The unit over the whole program, its laws' and clauses' roots included.
 pub fn prover_backend(
-    flag: Option<&String>,
     loaded: &crate::load::Loaded,
-) -> Result<Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>, Diagnostic> {
+) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
     ply_codegen::c::producer::ensure_default();
-    let Some(spec) = backend_spec(flag)? else {
-        return Ok(None);
-    };
-    let provider = build_backend_over(
-        &spec,
-        &loaded.front,
-        module_texts(&loaded.check, &loaded.sources),
-    )?;
-    Ok(Some((provider, spec)))
+    build_backend_over(&loaded.front, module_texts(&loaded.check, &loaded.sources))
 }
 
 /// Every command that loaded a program uses this, so an invocation runs one front end.
 pub fn build_backend_over(
-    spec: &ply_eval::BackendSpec,
     front: &ply_ty::Front,
     texts: std::collections::HashMap<String, String>,
 ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
     ply_codegen::c::producer::ensure_default();
-    match spec.kind {
-        // A refused definition is already a diagnostic about the program; anything else is this
-        // host failing to make a backend at all.
-        ply_eval::BackendKind::C => ply_codegen::Unit::over_front(front, texts)
-            .map(|unit| unit as &'static dyn ply_eval::Provider)
-            .map_err(|error| match ply_codegen::c::refused_in(&error) {
-                Some(refusals) => refusals.diagnostic().clone(),
-                None => unbuilt(&error),
-            }),
-    }
+    // A refused definition is already a diagnostic about the program; anything else is this
+    // host failing to make a backend at all.
+    ply_codegen::Unit::over_front(front, texts)
+        .map(|unit| unit as &'static dyn ply_eval::Provider)
+        .map_err(|error| match ply_codegen::c::refused_in(&error) {
+            Some(refusals) => refusals.diagnostic().clone(),
+            None => unbuilt(&error),
+        })
 }
 
 pub fn describe_schema(
@@ -149,12 +122,9 @@ pub fn enter_constant(
     provider: Option<&'static dyn ply_eval::Provider>,
     name: &str,
 ) -> Result<ply_eval::Value, Diagnostic> {
-    let spec = ply_eval::BackendSpec {
-        kind: ply_eval::BackendKind::C,
-    };
     let name = ply_span::Symbol::new(name);
     let entered = match provider {
-        Some(provider) => provider.attach(&spec).enter_whole(&name, &[], 10_000),
+        Some(provider) => provider.attach().enter_whole(&name, &[], 10_000),
         None => ply_eval::Entered::Declined,
     };
     match entered {

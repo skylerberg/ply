@@ -1,4 +1,4 @@
-//! The compiled tier behind `ply test --backend c`: the machine's lowered `Code` emitted as C.
+//! The compiled tier behind `ply test`: the machine's lowered `Code` emitted as C.
 
 // `Value` holds `Arc`s but is not `Send`; raw-pointer helpers share the contract in `heap.rs`.
 #![allow(clippy::arc_with_non_send_sync)]

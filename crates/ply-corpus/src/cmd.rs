@@ -55,7 +55,7 @@ pub fn dispatch(argv: &[String]) -> Result<Outcome> {
             .map_err(|e| anyhow!("the front door's compiled unit would not unpack: {e:#}"))?;
         let unit =
             ply_codegen::Unit::embedded(&opened.front, text).map_err(|e| anyhow!("{e:#}"))?;
-        machine.set_compiled(ply_eval::Provider::attach(unit, &crate::tier_spec()));
+        machine.set_compiled(ply_eval::Provider::attach(unit));
     }
     let argv_value = ply_eval::Value::list(argv.iter().map(ply_eval::Value::str).collect());
     let value = machine
@@ -110,7 +110,7 @@ pub fn run_ply_subcommand(entry: &str, args: Vec<Value>, cwd: &Path, ply: &Path)
             .map_err(|e| anyhow!("the front door's compiled unit would not unpack: {e:#}"))?;
         let unit =
             ply_codegen::Unit::embedded(&opened.front, text).map_err(|e| anyhow!("{e:#}"))?;
-        machine.set_compiled(ply_eval::Provider::attach(unit, &crate::tier_spec()));
+        machine.set_compiled(ply_eval::Provider::attach(unit));
     }
     let host = std::sync::Arc::new(
         ply_host::Host::new()

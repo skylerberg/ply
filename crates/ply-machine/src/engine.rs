@@ -24,7 +24,7 @@ use std::sync::Arc;
 pub fn of<'a>(
     loaded: &'a Loaded,
     hosting: Option<Hosting<'a>>,
-    backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
+    backend: Option<&'static dyn ply_eval::Provider>,
     store: &mut Store,
 ) -> Result<Box<dyn ply_test::obligation::Discharger + 'a>, LoadError> {
     let prover = Prover::over(loaded, Some(store))?;
@@ -102,7 +102,7 @@ pub struct Prover<'a> {
     /// What a `law/host` is discharged against.
     hosting: Option<Hosting<'a>>,
     /// A compiled unit holding the laws' and clauses' roots, where those propositions are entered.
-    backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
+    backend: Option<&'static dyn ply_eval::Provider>,
 }
 
 /// The binding and the reactor a `law/host` runs against.
@@ -136,10 +136,7 @@ impl<'a> Prover<'a> {
         })
     }
 
-    pub fn with_backend(
-        mut self,
-        backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
-    ) -> Prover<'a> {
+    pub fn with_backend(mut self, backend: Option<&'static dyn ply_eval::Provider>) -> Prover<'a> {
         self.backend = backend;
         self
     }
@@ -150,13 +147,13 @@ impl<'a> Prover<'a> {
             static ATTACHED: RefCell<Vec<(usize, Rc<dyn ply_eval::Compiled>)>> =
                 const { RefCell::new(Vec::new()) };
         }
-        let (provider, spec) = self.backend.as_ref()?;
+        let provider = self.backend.as_ref()?;
         let key = std::ptr::from_ref(*provider).cast::<()>() as usize;
         ATTACHED.with(|attached| {
             if let Some((_, c)) = attached.borrow().iter().find(|(k, _)| *k == key) {
                 return Some(Rc::clone(c));
             }
-            let c = provider.attach(spec);
+            let c = provider.attach();
             attached.borrow_mut().push((key, Rc::clone(&c)));
             Some(c)
         })
@@ -235,8 +232,8 @@ impl<'a> Prover<'a> {
         let mut machine = Machine::new(self.front).with_max_calls(DEFAULT_MAX_CALLS);
         // An owner is called through the machine to produce `result`, so the machine must hold the
         // tier its propositions are entered on, or that call declines with no body.
-        if let Some((provider, spec)) = self.backend.as_ref() {
-            machine.set_compiled(provider.attach(spec));
+        if let Some(provider) = self.backend.as_ref() {
+            machine.set_compiled(provider.attach());
         }
         machine
     }

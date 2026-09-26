@@ -37,7 +37,6 @@ pub struct RunOptions {
     pub config: crate::config::ConfigOptions,
     pub trace: crate::trace::TraceOptions,
     pub shutdown: crate::options::ShutdownOptions,
-    pub backend: Option<String>,
     pub profile: String,
     /// A project load that reads and writes the store; off for a plain `run`.
     pub cache: bool,
@@ -59,7 +58,6 @@ impl Default for RunOptions {
             config: crate::config::ConfigOptions::default(),
             trace: crate::trace::TraceOptions::default(),
             shutdown: crate::options::ShutdownOptions::default(),
-            backend: None,
             profile: "development".to_string(),
             cache: false,
         }
@@ -185,20 +183,17 @@ impl Target {
     }
 
     /// The unit this run evaluates on: an artifact's own as built, else one over the sources.
-    fn tier(
-        &self,
-        options: &RunOptions,
-    ) -> Result<Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>, Diagnostic> {
+    fn tier(&self, options: &RunOptions) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
         select_profile(&options.profile)?;
         match self {
-            Target::Project(loaded) => prover_backend(options.backend.as_ref(), loaded),
+            Target::Project(loaded) => prover_backend(loaded),
             Target::Deployed(d) => {
                 let unit = if d.unit {
                     d.artifact.unit.as_ref()
                 } else {
                     None
                 };
-                artifact::tier(&d.opened, options.backend.as_ref(), unit)
+                artifact::tier(&d.opened, unit)
             }
         }
     }
@@ -240,7 +235,7 @@ fn deployment(path: &std::path::Path) -> Result<Deployment, Refused> {
 pub struct Bound {
     hosts: Hosts,
     declared: Option<ply_ty::ty::Footprint>,
-    tier: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
+    tier: &'static dyn ply_eval::Provider,
     shutdown: Option<Arc<Shutdown>>,
 }
 
@@ -311,8 +306,7 @@ impl Drive {
             Ok(tier) => tier,
             Err(diagnostic) => return Err(refuse(vec![diagnostic])),
         };
-        let constant =
-            |name: &str| enter_constant(tier.as_ref().map(|(provider, _)| *provider), name);
+        let constant = |name: &str| enter_constant(Some(tier), name);
         let (configuration, warnings) =
             match Configuration::open(target.check(), options.host, &options.config, &constant) {
                 Ok(resolved) => resolved,
@@ -375,7 +369,7 @@ impl Drive {
             .map(|d| d.span)
             .unwrap_or(Span::DUMMY);
         let plan = crate::simulation::run_plan(options.seed.as_ref());
-        let compiled = bound.tier.map(|(provider, spec)| provider.attach(&spec));
+        let compiled = bound.tier.attach();
         // The counters are per thread, and this is the thread the entry runs on.
         ply_eval::rc::reset();
         // The `ply` program performing this is inside a scope that zeroed the thread-local
@@ -522,12 +516,10 @@ fn evaluate(
     plan: &ply_eval::Plan,
     hosts: &Hosts,
     declared: Option<&ply_ty::ty::Footprint>,
-    compiled: Option<std::rc::Rc<dyn ply_eval::Compiled>>,
+    compiled: std::rc::Rc<dyn ply_eval::Compiled>,
 ) -> Result<PlyValue, Diagnostic> {
     let mut machine = ply_eval::Machine::new(front);
-    if let Some(compiled) = compiled {
-        machine.set_compiled(compiled);
-    }
+    machine.set_compiled(compiled);
     machine.set_host_binding(hosts.binding());
     if let Some(runtime) = hosts.runtime() {
         machine.set_host_runtime(runtime);
@@ -1089,7 +1081,6 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
             drain_ms: int_at("drain_ms")? as u64,
             drain_lead_ms: int_at("drain_lead_ms")? as u64,
         },
-        backend: opt_str("backend")?,
         profile: str_at("profile")?,
         cache: bool_at("cache")?,
     })

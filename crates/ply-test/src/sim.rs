@@ -1,6 +1,6 @@
 //! What a run's searches are written under, and what it reports about them.
 
-use crate::key::{Engine, result_key, seed_key, writes_seed_keys};
+use crate::key::{result_key, seed_key, writes_seed_keys};
 use ply_eval::explore::{Interleaving, Verdict};
 use ply_eval::sim::Access;
 use ply_eval::{Exploration, Machine, Plan, Seed};
@@ -56,7 +56,6 @@ pub fn record_under(
     run: &Plan,
     ran: &Plan,
     exploration: Option<&Exploration>,
-    engine: &Engine,
 ) -> Record {
     if seeded && exploration.is_none() {
         return Record::Unobserved;
@@ -66,17 +65,17 @@ pub fn record_under(
         return Record::Exhausted;
     }
     if !seeded {
-        return Record::Under(vec![result_key(test_hash, false, run, engine)]);
+        return Record::Under(vec![result_key(test_hash, false, run)]);
     }
     let mut keys = Vec::with_capacity(ran.roots.len() + 1);
     if writes_seed_keys(run) {
         keys.extend(
             ran.roots
                 .iter()
-                .map(|&root| seed_key(test_hash, &Seed::root(root), engine)),
+                .map(|&root| seed_key(test_hash, &Seed::root(root))),
         );
     }
-    keys.push(result_key(test_hash, true, run, engine));
+    keys.push(result_key(test_hash, true, run));
     Record::Under(keys)
 }
 

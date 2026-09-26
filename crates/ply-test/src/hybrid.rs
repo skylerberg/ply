@@ -1,7 +1,7 @@
 //! Building and running one mixed definition graph.
 
 use crate::bisect::{DefKey, Delta, Hybrid, Trial, Unresolved};
-use crate::key::{Engine, result_key};
+use crate::key::result_key;
 use crate::schedule::is_seeded;
 use crate::sim::seed_run;
 use ply_eval::{Plan, Provider, Seed};
@@ -241,8 +241,7 @@ impl Hybrid for BodyHybrid<'_> {
         let hash = rehashed
             .tests
             .first()
-            // The evaluator's namespace whatever the run installed: the trial runs the evaluator.
-            .map(|hash| result_key(*hash, seeded, &self.plan, &Engine::Evaluator));
+            .map(|hash| result_key(*hash, seeded, &self.plan));
         if let Some(hash) = hash
             && matches!(self.store.get(hash), Some(Outcome::Pass))
         {
@@ -257,10 +256,7 @@ impl Hybrid for BodyHybrid<'_> {
             let mut machine = ply_eval::Machine::new(&front);
             let unit =
                 ply_codegen::Unit::over_front(&front, texts).expect("this host has a C compiler");
-            let spec = ply_eval::BackendSpec {
-                kind: ply_eval::BackendKind::C,
-            };
-            machine.set_compiled(unit.attach(&spec));
+            machine.set_compiled(unit.attach());
             seed_run(&mut machine, &plan.seeds()[0], plan.steps);
             machine.eval_test(index)
         }));

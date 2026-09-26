@@ -2,7 +2,7 @@
 //! in Ply. Each has to read what the other wrote and write back the same bytes, since the two will
 //! be reading each other's cache files for as long as the port is half done.
 
-use ply_eval::{BackendKind, BackendSpec, Machine, Value};
+use ply_eval::{Machine, Value};
 use ply_machine::support::{build_backend_over, module_texts};
 use ply_span::{SourceId, Span};
 
@@ -66,14 +66,10 @@ fn the_two_implementations_read_and_write_one_dump_alike() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("probe.ply"), PROBE).unwrap();
     let loaded = ply_machine::load::load(dir.path()).expect("the probe checks against the shelf");
-    let spec = BackendSpec {
-        kind: BackendKind::C,
-    };
     let texts = module_texts(&loaded.check, &loaded.sources);
-    let provider =
-        build_backend_over(&spec, &loaded.front, texts).expect("this host has a C compiler");
+    let provider = build_backend_over(&loaded.front, texts).expect("this host has a C compiler");
     let mut machine = Machine::new(&loaded.front);
-    machine.set_compiled(provider.attach(&spec));
+    machine.set_compiled(provider.attach());
 
     // Rust wrote that dump; Ply reads it and answers what Rust's own reader answers.
     let ply_answer = through_ply(&mut machine, "probe.round_trip", &rust_dump);
