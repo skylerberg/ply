@@ -3,6 +3,7 @@
 mod constant_memo_service;
 mod http_cost;
 mod region_isolation_cost;
+mod support;
 mod tier_audit;
 mod unit;
 mod w1_baseline;

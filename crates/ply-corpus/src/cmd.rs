@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 include!(concat!(env!("OUT_DIR"), "/corpus_sources.rs"));
 
 /// The corpus package's subcommand entries, kept in the artifact as startup roots.
-const SUBCOMMAND_ENTRIES: &[&str] = &["bench.run", "real.run"];
+const SUBCOMMAND_ENTRIES: &[&str] = &["bench.run", "real.run", "gen.dump", "gen.run"];
 
 /// What `cmd.dispatch` answered: the plan, or text for the user and the code to exit with.
 pub enum Outcome {
