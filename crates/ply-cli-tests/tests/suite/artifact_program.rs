@@ -25,11 +25,27 @@ fn the_cli_tree_is_a_package() {
     assert_eq!(
         loaded.front.packages,
         vec![
-            ("ply".to_string(), Vec::new()),
+            ("cli".to_string(), Vec::new()),
             ("std".to_string(), Vec::new()),
             ("compiler".to_string(), vec!["std".to_string()]),
         ],
-        "the CLI tree's ply.pkg names it the `ply` package, closed over the two built-ins"
+        "the CLI tree's ply.pkg names it the `cli` package, closed over the two built-ins"
+    );
+}
+
+#[test]
+fn the_corpus_tree_is_a_package_over_the_cli() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ply-corpus/ply");
+    let loaded = ply_machine::load::load(&dir).expect("the corpus tree loads");
+    assert_eq!(
+        loaded.front.packages,
+        vec![
+            ("corpus".to_string(), vec!["cli".to_string()]),
+            ("cli".to_string(), Vec::new()),
+            ("std".to_string(), Vec::new()),
+            ("compiler".to_string(), vec!["std".to_string()]),
+        ],
+        "the corpus tree's ply.pkg names it the `corpus` package over the CLI's"
     );
 }
 
