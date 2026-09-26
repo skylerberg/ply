@@ -380,3 +380,4 @@ fn a_second_run_over_an_unchanged_corpus_selects_nothing() {
         selection.to_run.len()
     );
 }
+mod real;
