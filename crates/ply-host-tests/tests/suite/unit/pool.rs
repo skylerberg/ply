@@ -6,7 +6,6 @@ fn no_two_facilities_mint_the_same_token() {
     let ranges = [
         ("net", NET_FIRST_TOKEN),
         ("fs", FS_FIRST_TOKEN),
-        ("db", ply_host::db::pool::FIRST_TOKEN),
     ];
     for (i, (whose, first)) in ranges.iter().enumerate() {
         assert!(

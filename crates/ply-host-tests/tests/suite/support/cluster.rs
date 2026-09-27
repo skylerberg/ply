@@ -33,10 +33,6 @@ pub struct Cluster {
 }
 
 impl Cluster {
-    pub fn start(database: &str) -> Cluster {
-        Cluster::launch(database, &["--auth=trust"], None)
-    }
-
     /// A cluster whose TCP connections have to prove a password, which is what SCRAM is for.
     /// The local socket stays trust, so the harness can set the password up.
     pub fn start_with_password(database: &str, password: &str) -> Cluster {
@@ -116,17 +112,6 @@ impl Cluster {
 
     pub fn port(&self) -> u16 {
         self.port
-    }
-
-    pub fn url(&self) -> String {
-        self.url_for(&self.database)
-    }
-
-    pub fn url_for(&self, database: &str) -> String {
-        format!(
-            "postgresql://ply@127.0.0.1:{}/{database}?sslmode=disable&application_name=ply",
-            self.port
-        )
     }
 
     pub fn psql(&self, database: &str, sql: &str) -> String {
