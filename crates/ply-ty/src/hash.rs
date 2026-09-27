@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeSet;
 use std::fmt;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub struct DefHash(pub [u8; 32]);
 
 impl DefHash {
@@ -85,41 +85,4 @@ pub struct HashOutput {
     pub deps: IndexMap<Symbol, Vec<Symbol>>,
     /// Transitive closure, including the definition itself.
     pub closure: IndexMap<Symbol, BTreeSet<Symbol>>,
-}
-
-const HASHES_DOMAIN: &[u8] = b"ply.hashes.1";
-
-impl HashOutput {
-    /// Every published hash in order: what a compiled unit and the machine entering it agree on.
-    pub fn digest(&self) -> DefHash {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(HASHES_DOMAIN);
-        let count = |hasher: &mut blake3::Hasher, n: usize| {
-            hasher.update(&(n as u64).to_le_bytes());
-        };
-        for named in [&self.defs, &self.decls] {
-            count(&mut hasher, named.len());
-            for (name, hash) in named {
-                count(&mut hasher, name.as_str().len());
-                hasher.update(name.as_str().as_bytes());
-                hasher.update(&hash.0);
-            }
-        }
-        count(&mut hasher, self.specs.len());
-        for (name, clauses) in &self.specs {
-            count(&mut hasher, name.as_str().len());
-            hasher.update(name.as_str().as_bytes());
-            count(&mut hasher, clauses.len());
-            for hash in clauses {
-                hasher.update(&hash.0);
-            }
-        }
-        for listed in [&self.tests, &self.laws] {
-            count(&mut hasher, listed.len());
-            for hash in listed {
-                hasher.update(&hash.0);
-            }
-        }
-        DefHash(*hasher.finalize().as_bytes())
-    }
 }

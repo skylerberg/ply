@@ -2,7 +2,7 @@
 
 use crate::load::{Found, Loaded, Stamp, stamp_of};
 use ply_store::ContentHash;
-use ply_ty::{DefHash, HashOutput};
+use ply_ty::DefHash;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -96,15 +96,13 @@ impl Warm {
         sources: &ply_span::SourceMap,
     ) -> Option<&'static dyn ply_eval::Provider> {
         let held = self.unit.as_ref()?;
-        (held.key == front.hashes.digest() && held.provider.relocate(front, sources))
+        (held.key == front.hashes_digest && held.provider.relocate(front, sources))
             .then_some(held.provider)
     }
 
-    pub fn keep_unit(&mut self, hashes: &HashOutput, provider: &'static dyn ply_eval::Provider) {
-        self.unit = Some(HeldUnit {
-            provider,
-            key: hashes.digest(),
-        });
+    /// The compiled unit, keyed by the digest of the program it was compiled from.
+    pub fn keep_unit(&mut self, key: DefHash, provider: &'static dyn ply_eval::Provider) {
+        self.unit = Some(HeldUnit { provider, key });
     }
 }
 
