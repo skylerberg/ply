@@ -1,0 +1,341 @@
+// `measure` — how fast the machine is, in-process.
+//
+// A number about the interpreter has to come from *inside* the process: a subprocess costs
+// milliseconds before a program does anything, and the things worth measuring — a continuation
+// resumed, a definition called, a cell opened — take microseconds. So each scenario writes a small
+// fixture, drives it through the machine the corpus program itself holds, and reads both the clock
+// and the accounting the runtime keeps. Every measured value is pinned with `observe`, so a tier
+// that can see through the work still has to do it.
+//
+// The fixtures are Ply, and they *are* the artifact: `multi_shot` resumes a handler's continuation
+// 0, 1, 2 and 4 times, so the difference between two rows is what one resumption costs.
+
+import cli.machine
+import cli.machine (Accounting, Options, Value, VInt, VUnit, default_options, machine, no_options)
+import compiler.resolve (Diag)
+import std.fs (fs)
+import std.fs
+import std.json (Json, Str, Number, Bool, Null, Object, object, array)
+import std.json
+import std.process (process)
+import std.time (time)
+
+// One point on a curve: the count that names it, and what one call cost. Wall time and the runtime's
+// own step count say different things — one is what a user feels, the other is the work done.
+pub type Point = {
+  n: Int,
+  /// Nanoseconds a call took, from the fastest of several rounds.
+  nanos: Int,
+  /// Runtime steps a call took.
+  steps: Int,
+  /// What this point cost over the previous one, per unit of `n`.
+  marginal_nanos: Int,
+  marginal_steps: Int,
+}
+
+pub type Curve = { label: String, unit: String, points: List<Point> }
+
+// How much work one round does. A round has to be long enough that the clock sees it: two hundred
+// calls of a few microseconds each is a millisecond, which even a microsecond clock resolves.
+fn calls_per_round() -> Int = 200
+
+fn rounds() -> Int = 8
+
+// --- The fixtures -----------------------------------------------------------
+
+/// The same residual computation, resumed a varying number of times. This is the whole experiment:
+/// `r0` resumes nothing, `r4` resumes four times, and the rest of each body is identical.
+pub fn resumption_source() -> String =
+  "effect amb { read pick[coin]() -> Int }\n" ++ "\n"
+    ++ "fn residual(b: Int) -> Int = fold(range(0, 200), 0, |acc, x| acc + x + b)\n"
+    ++ "\n"
+    ++ "pub fn r0() -> Int = handle { residual(amb.pick[coin]()) } with {\n"
+    ++ "  amb.pick[coin]() resume k -> 7,\n"
+    ++ "  return x -> x\n"
+    ++ "}\n"
+    ++ "\n"
+    ++ "pub fn r1() -> Int = handle { residual(amb.pick[coin]()) } with {\n"
+    ++ "  amb.pick[coin]() resume k -> k(1),\n"
+    ++ "  return x -> x\n"
+    ++ "}\n"
+    ++ "\n"
+    ++ "pub fn r2() -> Int = handle { residual(amb.pick[coin]()) } with {\n"
+    ++ "  amb.pick[coin]() resume k -> k(1) + k(2),\n"
+    ++ "  return x -> x\n"
+    ++ "}\n"
+    ++ "\n"
+    ++ "pub fn r4() -> Int = handle { residual(amb.pick[coin]()) } with {\n"
+    ++ "  amb.pick[coin]() resume k -> k(1) + k(2) + k(3) + k(4),\n"
+    ++ "  return x -> x\n"
+    ++ "}\n"
+
+/// A call that does a fixed amount of arithmetic, so a throughput number has an obvious unit.
+pub fn work_source() -> String =
+  "pub fn work(n: Int) -> Int =\n" ++ "  fold(range(0, 200), 0, |acc, x| acc + x * n)\n"
+
+// --- Driving one ------------------------------------------------------------
+
+/// Writes a fixture into a directory of its own under `dir` and hands back the directory.
+fn written(
+  dir: String,
+  name: String,
+  source: String,
+) -> Result<String, String> / {fs.create_dir[cwd], fs.write_file[cwd]} = {
+  // The fs effect is confined to the root the entry was given — the corpus directory — and it
+  // refuses an absolute path outright, so the fixture is named relative to that root. The machine,
+  // which is not confined, is handed the same place spelled absolutely.
+  let here = "measure-" ++ name;
+  if !fs.create_dir[cwd](here) { Err("the fixture directory could not be made: " ++ here) } else if !fs.write_file[cwd](
+      here ++ "/" ++ name ++ ".ply",
+      bytes_of_string(source),
+    ) { Err("the fixture could not be written: " ++ here) }
+  else { Ok(dir ++ "/" ++ here) }
+}
+
+/// One entry of a loaded fixture, measured. The first call is outside the clock: lazy lowering is
+/// not what a caller pays per call, and neither is its accounting.
+fn point_at(
+  n: Int,
+  name: String,
+  args: List<Value>,
+  repeats: Int,
+) -> Result<Point, String> / {time.elapsed_us, machine.call[bench], machine.accounting[bench]} = {
+  match machine.call[bench](name, args) {
+    Err(raised) -> Err("`" ++ name ++ "` raised " ++ raised.code ++ ": " ++ raised.message),
+    Ok(_) -> {
+      let _ = machine.accounting[bench]();
+      let best = fold(range(0, rounds()), -1, |acc: Int, _r: Int| {
+        let started = time.elapsed_us();
+        // Pinned: a tier that can see the answer still has to compute it.
+        let _ = observe(calls(name, args, calls_per_round()));
+        let taken = time.elapsed_us() - started;
+        if acc < 0 { taken } else if taken < acc { taken } else { acc }
+      });
+      // A round of its own for the steps: reading the accounting resets it. A call that raises does
+      // no work, so a failure is reported rather than averaged in as a zero.
+      let failures = observe(calls(name, args, calls_per_round()));
+      let accounting: Accounting = machine.accounting[bench]();
+      if failures > 0 {
+        Err(
+          "`" ++ name ++ "` raised on " ++ int_to_string(failures) ++ " of "
+            ++ int_to_string(calls_per_round())
+            ++ " calls",
+        )
+      } else {
+        Ok({
+          n: n,
+          // Microseconds over two hundred calls is coarse; nanoseconds is the resolution it wants.
+          nanos: best * 1000 / calls_per_round(),
+          steps: accounting.steps / calls_per_round(),
+          marginal_nanos: 0,
+          marginal_steps: 0,
+        })
+      }
+    },
+  }
+}
+
+/// How many of `times` calls raised, with every one of them pinned.
+fn calls(name: String, args: List<Value>, times: Int) -> Int / {machine.call[bench]} =
+  observe(
+    fold(range(0, times), 0, |bad: Int, _i: Int|
+      match machine.call[bench](name, args) { Ok(_) -> bad, Err(_) -> bad + 1 }),
+  )
+
+/// Every point, or the first failure: a curve with a missing row says less than the reason for it.
+fn all_points(rows: List<Result<Point, String>>) -> Result<List<Point>, String> =
+  fold(rows, Ok([]), |acc: Result<List<Point>, String>, row: Result<Point, String>|
+    match acc {
+      Err(why) -> Err(why),
+      Ok(points) -> match row { Err(why) -> Err(why), Ok(p) -> Ok(push(points, p)) },
+    })
+
+/// What each point cost over the one before it, per unit of `n`.
+fn margined(points: List<Point>) -> List<Point> =
+  fold(points, [], |acc: List<Point>, p: Point|
+    match acc {
+      [] -> push(acc, p),
+      _ -> {
+        let previous = at(acc, len(acc) - 1, p);
+        let span = p.n - previous.n;
+        push(acc, {
+          ..p,
+          marginal_nanos: if span == 0 { 0 } else { (p.nanos - previous.nanos) / span },
+          marginal_steps: if span == 0 { 0 } else { (p.steps - previous.steps) / span },
+        })
+      },
+    })
+
+// --- The scenarios ----------------------------------------------------------
+
+/// What one continuation resumption costs, by resuming it a varying number of times.
+pub fn resumptions(
+  dir: String,
+  repeats: Int,
+) -> Result<Curve, String> / {fs.create_dir[cwd], fs.write_file[cwd], fs.list_dir[cwd], fs.remove[cwd], time.elapsed_us, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
+  with_fixture(dir, "multishot", resumption_source(), "multishot.r0", |_dir: String|
+    match all_points(
+        map([0, 1, 2, 4], |n: Int| point_at(n, "multishot.r" ++ int_to_string(n), [], repeats)),
+      ) {
+      Err(why) -> Err(why),
+      Ok(points) -> Ok({ label: "resumptions", unit: "resumption", points: margined(points) }),
+    })
+
+/// The interpreter's throughput on one definition: the unit is a call, and the work inside it is
+/// fixed, so the step count is what the runtime saw.
+pub fn throughput(
+  dir: String,
+  repeats: Int,
+) -> Result<Curve, String> / {fs.create_dir[cwd], fs.write_file[cwd], fs.list_dir[cwd], fs.remove[cwd], time.elapsed_us, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
+  with_fixture(dir, "work", work_source(), "work.work", |_dir: String|
+    match point_at(1, "work.work", [VInt(1)], repeats) {
+      Err(why) -> Err(why),
+      Ok(point) -> Ok({ label: "throughput", unit: "call", points: [point] }),
+    })
+
+/// Take the fixture back out of the corpus: the bench's own scenarios compile this tree, and a
+/// stray `.ply` under it would be read as a module of the program.
+fn removed(name: String) -> Unit / {fs.list_dir[cwd], fs.remove[cwd]} = {
+  // Relative to the root the entry was given, like the write: the fs effect refuses an absolute
+  // path even when it names a place inside that root. The contents go first — `remove` on a
+  // directory is `remove_dir`, which wants it empty — and the same walk as the bench's own
+  // snapshot clearing is what does it.
+  let here = "measure-" ++ name;
+  let _ = match fs.list_dir[cwd](here) {
+    None -> [],
+    Some(names) -> map(names, |entry: String| fs.remove[cwd](here ++ "/" ++ entry)),
+  };
+  let _ = fs.remove[cwd](here);
+  ()
+}
+
+/// Write the fixture, load it, bind it, run `body`, and let go of the machine either way.
+fn with_fixture<a>(
+  dir: String,
+  name: String,
+  source: String,
+  entry: String,
+  body: (String) -> Result<a, String> / {machine.accounting[bench], machine.call[bench], time.elapsed_us},
+) -> Result<a, String> / {fs.create_dir[cwd], fs.write_file[cwd], fs.list_dir[cwd], fs.remove[cwd], time.elapsed_us, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
+  match written(dir, name, source) {
+    Err(why) -> Err(why),
+    Ok(scratch) -> {
+      // Whatever happens below, the corpus is left as it was found.
+      let finish = |outcome: Result<a, String>| -> Result<a, String> {
+        removed(name);
+        outcome
+      };
+      // No cache: a fixture is measured once and thrown away, and a store left behind would have to
+      // be walked out of the corpus with it (the loader caches beside the program it loaded).
+      machine.configure[bench](no_options());
+      match machine.load[bench](scratch) {
+        Err(refusal) -> Err("the " ++ name ++ " fixture would not load: " ++ refusal_text(refusal)),
+        Ok(_) -> match machine.bound[bench](entry) {
+          Err(refusal) ->
+            Err("the " ++ name ++ " fixture would not bind: " ++ refusal_text(refusal)),
+          Ok(_) -> {
+            match body(scratch) {
+              Err(why) -> {
+                machine.drop[bench]();
+                finish(Err(why))
+              },
+              Ok(value) -> {
+                machine.drop[bench]();
+                finish(Ok(value))
+              },
+            }
+          },
+        },
+      }
+    },
+  }
+
+fn refusal_text(refusal: machine::Refusal) -> String =
+  fold(refusal.diags, "", |acc: String, d: Diag|
+    if acc == "" { string_of_bytes_lossy(d.message) }
+    else { acc ++ "; " ++ string_of_bytes_lossy(d.message) })
+
+// --- The report -------------------------------------------------------------
+
+pub fn curve_json(c: Curve) -> Json =
+  object([
+    { key: "label", value: Str(c.label) },
+    { key: "unit", value: Str(c.unit) },
+    {
+      key: "points",
+      value: array(
+        map(c.points, |p: Point|
+          object([
+            { key: "n", value: Number(decimal_of_int(p.n)) },
+            { key: "nanos", value: Number(decimal_of_int(p.nanos)) },
+            { key: "steps", value: Number(decimal_of_int(p.steps)) },
+            { key: "marginal_nanos", value: Number(decimal_of_int(p.marginal_nanos)) },
+            { key: "marginal_steps", value: Number(decimal_of_int(p.marginal_steps)) },
+          ])),
+      ),
+    },
+  ])
+
+/// The whole section, or the reason there is none.
+pub fn measure_json(
+  dir: String,
+  repeats: Int,
+) -> Json / {fs.create_dir[cwd], fs.write_file[cwd], fs.list_dir[cwd], fs.remove[cwd], time.elapsed_us, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.call[bench], machine.accounting[bench], machine.drop[bench]} =
+  match resumptions(dir, repeats) {
+    Err(why) -> object([{ key: "ok", value: Bool(false) }, { key: "why", value: Str(why) }]),
+    Ok(resumed) -> match throughput(dir, repeats) {
+      Err(why) -> object([{ key: "ok", value: Bool(false) }, { key: "why", value: Str(why) }]),
+      Ok(through) ->
+        object([
+          { key: "ok", value: Bool(true) },
+          { key: "resumptions", value: curve_json(resumed) },
+          { key: "throughput", value: curve_json(through) },
+        ]),
+    },
+  }
+
+/// What a curve reads as, one line a point.
+pub fn curve_text(c: Curve) -> String =
+  fold(c.points, c.label ++ " (per " ++ c.unit ++ ")\n", |acc: String, p: Point|
+    acc ++ "  " ++ int_to_string(p.n) ++ " · " ++ int_to_string(p.nanos) ++ "ns · "
+      ++ int_to_string(p.steps)
+      ++ " steps"
+      ++ (if p.marginal_nanos == 0 { "" } else {
+        " · marginal " ++ int_to_string(p.marginal_nanos) ++ "ns, "
+          ++ int_to_string(p.marginal_steps)
+          ++ " steps"
+      })
+      ++ "\n")
+
+// --- Tests ------------------------------------------------------------------
+
+fn at<a>(xs: List<a>, i: Int, spare: a) -> a = match list_at(xs, i) { Some(x) -> x, None -> spare }
+
+test "the marginal cost is what one more resumption added, per resumption" {
+  let zero: Point = { n: 0, nanos: 100, steps: 10, marginal_nanos: 0, marginal_steps: 0 };
+  let points = [
+    zero,
+    { n: 1, nanos: 250, steps: 30, marginal_nanos: 0, marginal_steps: 0 },
+    { n: 2, nanos: 400, steps: 50, marginal_nanos: 0, marginal_steps: 0 },
+    { n: 4, nanos: 700, steps: 90, marginal_nanos: 0, marginal_steps: 0 },
+  ];
+  let rows = margined(points);
+  // The first point has nothing before it, so its marginal is whatever it was given.
+  assert_eq(at(rows, 0, zero).marginal_nanos, 0);
+  assert_eq(at(rows, 1, zero).marginal_nanos, 150);
+  assert_eq(at(rows, 1, zero).marginal_steps, 20);
+  assert_eq(at(rows, 2, zero).marginal_nanos, 150);
+  // Four resumptions against two: the difference is spread over two, not one.
+  assert_eq(at(rows, 3, zero).marginal_nanos, 150);
+  assert_eq(at(rows, 3, zero).marginal_steps, 20)
+}
+
+test "a curve reads as one line a point" {
+  let text = curve_text({
+    label: "work",
+    unit: "call",
+    points: [{ n: 1, nanos: 250, steps: 7, marginal_nanos: 0, marginal_steps: 0 }],
+  });
+  assert(string_contains(text, "work (per call)"));
+  assert(string_contains(text, "1 · 250ns · 7 steps"))
+}
