@@ -648,6 +648,7 @@ fn disagreement(discharge: &Discharge) -> Option<String> {
         Discharge::Unattempted(Gap::Raised {
             bindings,
             diagnostic,
+            ..
         }) => Some(format!(
             "raises `{}` at {}",
             diagnostic.message,

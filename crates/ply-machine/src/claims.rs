@@ -14,9 +14,12 @@ use crate::load::{LoadError, Loaded};
 use crate::payload::{count, ctor, diags_value, option, places_value, record, strings};
 use crate::support::{build_pool, enter_constant, prover_backend};
 use ply_eval::Value as PlyValue;
+use ply_eval::Value;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRequest, HostResource, HostRuntime, Linearity,
 };
+use ply_prove::property::{GenStream, TypeWorld, generate};
+use ply_prove::shrink::Target;
 use ply_prove::{
     Discharge, Evidence, Frame, Gap, Obligation, ObligationKind, ProvePlan, ProveReport, Tier,
     Vacuity, VacuityKind,
@@ -42,13 +45,18 @@ const PAYLOAD: &str = "claims";
 /// need nothing here.
 const SUITE: &str = "suite.obligation";
 
-const OPERATIONS: [(&str, &str); 8] = [
+const OPERATIONS: [(&str, &str); 13] = [
     ("configure", "ply_machine::claims::configure"),
     ("collected", "ply_machine::claims::collected"),
     ("typed", "ply_machine::claims::typed"),
     ("outcomes", "ply_machine::claims::outcomes"),
     ("discharged", "ply_machine::claims::discharged"),
     ("replay", "ply_machine::claims::replay"),
+    ("shrink", "ply_machine::claims::shrink"),
+    ("offers", "ply_machine::claims::offers"),
+    ("would", "ply_machine::claims::would"),
+    ("accept", "ply_machine::claims::accept"),
+    ("settled", "ply_machine::claims::settled"),
     ("reviewed", "ply_machine::claims::reviewed"),
     ("accepted", "ply_machine::claims::accepted"),
 ];
@@ -136,6 +144,21 @@ impl HostHandler for Site {
                 }
                 self.outcomes(&named)?
             }
+            ("shrink", [claim]) => self.shrink(
+                usize::try_from(claim.as_int(span, "the claim's place")?).unwrap_or(usize::MAX),
+            )?,
+            ("offers", [i]) => self.offers(
+                usize::try_from(i.as_int(span, "the value's place")?).unwrap_or(usize::MAX),
+            )?,
+            ("would", [i, position]) => self.would(
+                usize::try_from(i.as_int(span, "the value's place")?).unwrap_or(usize::MAX),
+                position.as_int(span, "the candidate's place")?,
+            )?,
+            ("accept", [i, position]) => self.take(
+                usize::try_from(i.as_int(span, "the value's place")?).unwrap_or(usize::MAX),
+                position.as_int(span, "the candidate's place")?,
+            )?,
+            ("settled", _) => self.settled()?,
             ("replay", [index, root, case]) => self.replay(
                 usize::try_from(index.as_int(span, "the claim's place")?).unwrap_or(usize::MAX),
                 u64::try_from(root.as_int(span, "the generator's root")?).unwrap_or(0),
@@ -186,6 +209,168 @@ fn choice_of(value: &PlyValue, span: Span) -> Result<obligation::Choice, Diagnos
         reasons,
         domains,
     })
+}
+
+/// The tuple a counterexample's draw gives, regenerated: the values a walk needs are the ones the
+/// generator produced, and a draw is reproducible from where it was made.
+fn drawn(obligation: &Obligation, root: u64, case: u32, world: &TypeWorld) -> Option<Vec<Value>> {
+    let mut stream = GenStream::new(root, obligation.key);
+    obligation
+        .generated()
+        .iter()
+        .map(|binder| generate(&binder.ty, world, &mut stream, case).ok())
+        .collect()
+}
+
+/// What a claim's discharge left to walk: a refutation shrinks from the values its draw gives, a
+/// raise from the values it reported. Everything else has nothing to walk — a race is an
+/// interleaving, an enumerated point is already the smallest its search saw, and a claim that held
+/// has no counterexample at all.
+fn walkable(
+    claim: usize,
+    obligations: &[Obligation],
+    report: &Option<ProveReport>,
+    world: &TypeWorld,
+) -> Option<Shrinking> {
+    let obligation = obligations.get(claim)?;
+    let report = report.as_ref()?;
+    let discharge = report
+        .obligations
+        .iter()
+        .find(|(o, _)| o.key == obligation.key)
+        .map(|(_, discharge)| discharge)?;
+    let (values, original, root, case, target) = match discharge {
+        Discharge::Refuted(cx) => (
+            drawn(obligation, cx.root, cx.case, world)?,
+            cx.original.clone(),
+            cx.root,
+            cx.case,
+            Target::Falsifies,
+        ),
+        Discharge::Unattempted(Gap::Raised {
+            root,
+            case,
+            bindings,
+            ..
+        }) => (
+            drawn(obligation, *root, *case, world)?,
+            bindings.clone(),
+            *root,
+            *case,
+            Target::Raises,
+        ),
+        _ => return None,
+    };
+    let _ = (root, case);
+    Some(Shrinking {
+        claim,
+        values,
+        types: obligation
+            .generated()
+            .iter()
+            .map(|b| b.ty.clone())
+            .collect(),
+        target,
+        original,
+    })
+}
+
+/// The value at `i` as it stands, with its candidates and each one's size.
+fn offer(s: &Shrinking, i: usize, world: &TypeWorld) -> Option<Offer> {
+    let value = s.values.get(i)?;
+    let ty = s.types.get(i)?;
+    let here = ply_prove::shrink::size(value, world);
+    let candidates = ply_prove::shrink::candidates(value, ty, world)
+        .iter()
+        .enumerate()
+        .map(|(position, candidate)| (position as u64, ply_prove::shrink::size(candidate, world)))
+        .collect();
+    Some(Offer { here, candidates })
+}
+
+/// The tuple with the candidate at `position` of the value at `i` taken.
+fn candidate_at(s: &Shrinking, i: usize, position: i64, world: &TypeWorld) -> Option<Vec<Value>> {
+    let value = s.values.get(i)?;
+    let ty = s.types.get(i)?;
+    let candidates = ply_prove::shrink::candidates(value, ty, world);
+    let picked = usize::try_from(position)
+        .ok()
+        .and_then(|position| candidates.get(position))
+        .cloned()?;
+    let mut values = s.values.clone();
+    values[i] = picked;
+    Some(values)
+}
+
+/// The counterexample as it now stands: the walk's accepted values, and the ones it started from.
+fn settled_of(s: &Shrinking) -> Settled {
+    let bind = |values: &[Value]| -> Vec<(String, String, String)> {
+        s.types
+            .iter()
+            .zip(values)
+            .enumerate()
+            .map(|(i, (ty, value))| {
+                let name = match s.original.get(i) {
+                    Some(binding) => binding.name.as_str().to_string(),
+                    None => format!("v{i}"),
+                };
+                (name, ty.to_string(), value.render())
+            })
+            .collect()
+    };
+    Settled {
+        bindings: bind(&s.values),
+        original: s
+            .original
+            .iter()
+            .map(|binding| {
+                (
+                    binding.name.as_str().to_string(),
+                    binding.ty.to_string(),
+                    binding.rendered.clone(),
+                )
+            })
+            .collect(),
+    }
+}
+
+/// A counterexample's bindings, as a report prints them: name, type, rendered value.
+fn texts_of_bindings(bindings: &[(String, String, String)]) -> PlyValue {
+    PlyValue::list(
+        bindings
+            .iter()
+            .map(|(name, ty, rendered)| {
+                record(vec![
+                    ("name", PlyValue::str(name)),
+                    ("ty", PlyValue::str(ty)),
+                    ("rendered", PlyValue::str(rendered)),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// What a program needs to walk one value: how big it is, and its candidates with theirs, as
+/// `(position, size)` — the position being what the program hands back to try one.
+struct Offer {
+    here: u64,
+    candidates: Vec<(u64, u64)>,
+}
+
+/// The counterexample as it now stands, in the words a report prints: `(name, type, rendered)`.
+struct Settled {
+    bindings: Vec<(String, String, String)>,
+    original: Vec<(String, String, String)>,
+}
+
+/// One counterexample being walked down. The values live here because a program cannot hold a value
+/// of a type it never named: it decides which candidate to take, and this is where taking it lands.
+struct Shrinking {
+    claim: usize,
+    values: Vec<Value>,
+    types: Vec<ply_ty::Type>,
+    target: Target,
+    original: Vec<ply_prove::Binding>,
 }
 
 /// The types the laws are written over, as the machine's thread hands them over: plain data, because
@@ -413,6 +598,89 @@ impl Site {
         }
     }
 
+    /// Start walking this claim's counterexample down, and answer how many values it has. Nothing is
+    /// a claim with nothing to walk: a race is an interleaving, an enumerated point is already the
+    /// smallest thing its search saw, and a claim that held has no counterexample at all.
+    fn shrink(&self, claim: usize) -> Result<PlyValue, Diagnostic> {
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("shrink"))?;
+        machine.ask(Go::Shrink(claim))?;
+        match machine.step()? {
+            Step::Shrink(answer) => Ok(answered(
+                (*answer).map(|width| crate::payload::option(width.map(count))),
+            )),
+            _ => Err(out_of_step("shrink")),
+        }
+    }
+
+    /// The value at `i` as it stands, with its candidates.
+    fn offers(&self, i: usize) -> Result<PlyValue, Diagnostic> {
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("offers"))?;
+        machine.ask(Go::Offers(i))?;
+        let Step::Offers(answer) = machine.step()? else {
+            return Err(out_of_step("offers"));
+        };
+        let value = (*answer).map(|offer| {
+            crate::payload::option(offer.map(|offer| {
+                let candidates = offer
+                    .candidates
+                    .iter()
+                    .map(|(position, size)| {
+                        record(vec![
+                            ("position", PlyValue::Int(*position as i64)),
+                            ("size", PlyValue::Int(*size as i64)),
+                        ])
+                    })
+                    .collect();
+                record(vec![
+                    ("here", PlyValue::Int(offer.here as i64)),
+                    ("candidates", PlyValue::list(candidates)),
+                ])
+            }))
+        });
+        Ok(answered(value))
+    }
+
+    fn would(&self, i: usize, position: i64) -> Result<PlyValue, Diagnostic> {
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("would"))?;
+        machine.ask(Go::Would { i, position })?;
+        match machine.step()? {
+            Step::Would(answer) => Ok(answered((*answer).map(PlyValue::Bool))),
+            _ => Err(out_of_step("would")),
+        }
+    }
+
+    fn take(&self, i: usize, position: i64) -> Result<PlyValue, Diagnostic> {
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("accept"))?;
+        machine.ask(Go::Take { i, position })?;
+        match machine.step()? {
+            Step::Took(answer) => Ok(answered((*answer).map(|_| PlyValue::Unit))),
+            _ => Err(out_of_step("accept")),
+        }
+    }
+
+    /// The counterexample as it now stands, with the walk's choices taken into account.
+    fn settled(&self) -> Result<PlyValue, Diagnostic> {
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("settled"))?;
+        machine.ask(Go::Settled)?;
+        let Step::Settled(answer) = machine.step()? else {
+            return Err(out_of_step("settled"));
+        };
+        let value = (*answer).map(|settled| {
+            crate::payload::option(settled.map(|settled| {
+                record(vec![
+                    ("bindings", texts_of_bindings(&settled.bindings)),
+                    ("original", texts_of_bindings(&settled.original)),
+                ])
+            }))
+        });
+        Ok(answered(value))
+    }
+
     /// The store's answer under each key, as a report prints one: `passed`, `failed`, or nothing.
     fn outcomes(&self, keys: &[String]) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
@@ -499,6 +767,24 @@ enum Go {
     /// The types the obligations are written over, so a program can measure a binder's domain
     /// rather than sample it. The decision is the program's; the type world is not.
     Typed,
+    /// Start walking this claim's counterexample down. The answer is how many values it has, or
+    /// nothing when there is nothing to walk — a race, an enumerated point, a claim that held.
+    Shrink(usize),
+    /// The value at `i` as it now stands: its size and its candidates with theirs.
+    Offers(usize),
+    /// Whether replacing the value at `i` with that candidate still leaves the counterexample a
+    /// counterexample.
+    Would {
+        i: usize,
+        position: i64,
+    },
+    /// Take that candidate: the program decided it was smaller and still held.
+    Take {
+        i: usize,
+        position: i64,
+    },
+    /// The counterexample as it now stands.
+    Settled,
     /// What the store holds under these keys. The program computes them — a plan key is part of
     /// the obligation's own encoding — so no row could carry the answers.
     Outcomes(Vec<String>),
@@ -517,6 +803,11 @@ enum Go {
 enum Step {
     Collected(Box<Result<Collection, Refused>>),
     Typed(Box<Result<Typed, Refused>>),
+    Shrink(Box<Result<Option<usize>, Refused>>),
+    Offers(Box<Result<Option<Offer>, Refused>>),
+    Would(Box<Result<bool, Refused>>),
+    Took(Box<Result<(), Refused>>),
+    Settled(Box<Result<Option<Settled>, Refused>>),
     /// The store's answer under each key asked about: `passed`, `failed`, or nothing.
     Outcomes(Vec<Option<String>>),
     Discharged(Box<Result<Verdicts, Refused>>),
@@ -626,6 +917,9 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
     }))));
 
     let mut report: Option<ProveReport> = None;
+    // The counterexample being walked down, if a program is walking one: the values live here
+    // because a program cannot hold a value of a type it never named.
+    let mut shrinking: Option<Shrinking> = None;
     // Built by the first step that runs an obligation, and kept: a discharge of many claims and a
     // re-run of one case are the same prover over the same hosts.
     let mut prepared: Option<Result<Prepared, Refused>> = None;
@@ -648,6 +942,62 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
                     })
                     .collect();
                 let _ = told.send(Step::Outcomes(answers));
+            }
+            Ok(Go::Shrink(claim)) => {
+                if prepared.is_none() {
+                    prepared = Some(prepare(&job, &loaded, &mut store));
+                }
+                let start = match prepared.as_ref() {
+                    Some(Ok(ready)) => walkable(claim, &obligations, &report, ready.prover.world()),
+                    Some(Err(refused)) => {
+                        let _ = told.send(Step::Shrink(Box::new(Err(refused.clone()))));
+                        return;
+                    }
+                    None => return,
+                };
+                let width = start.as_ref().map(|s| s.values.len());
+                shrinking = start;
+                let _ = told.send(Step::Shrink(Box::new(Ok(width))));
+            }
+            Ok(Go::Offers(i)) => {
+                let answer = match (&shrinking, prepared.as_ref()) {
+                    (Some(s), Some(Ok(ready))) => offer(s, i, ready.prover.world()),
+                    _ => None,
+                };
+                let _ = told.send(Step::Offers(Box::new(Ok(answer))));
+            }
+            Ok(Go::Would { i, position }) => {
+                let answer = match (&shrinking, prepared.as_ref()) {
+                    (Some(s), Some(Ok(ready))) => {
+                        candidate_at(s, i, position, ready.prover.world()).is_some_and(|values| {
+                            ready
+                                .prover
+                                .judge_at(&obligations[s.claim], &job.plan, &values)
+                                .matches(s.target)
+                        })
+                    }
+                    _ => false,
+                };
+                let _ = told.send(Step::Would(Box::new(Ok(answer))));
+            }
+            Ok(Go::Take { i, position }) => {
+                let picked = match (&shrinking, prepared.as_ref()) {
+                    (Some(s), Some(Ok(ready))) => {
+                        candidate_at(s, i, position, ready.prover.world())
+                            .map(|values| values[i].clone())
+                    }
+                    _ => None,
+                };
+                if let (Some(value), Some(s)) = (picked, shrinking.as_mut())
+                    && i < s.values.len()
+                {
+                    s.values[i] = value;
+                }
+                let _ = told.send(Step::Took(Box::new(Ok(()))));
+            }
+            Ok(Go::Settled) => {
+                let answer = shrinking.as_ref().map(settled_of);
+                let _ = told.send(Step::Settled(Box::new(Ok(answer))));
             }
             Ok(Go::Typed) => {
                 if prepared.is_none() {
@@ -1214,6 +1564,7 @@ fn gap_value(gap: &Gap) -> PlyValue {
         Gap::Raised {
             bindings,
             diagnostic,
+            ..
         } => ctor(
             PAYLOAD,
             "Raised",

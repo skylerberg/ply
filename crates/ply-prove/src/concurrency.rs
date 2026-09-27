@@ -239,6 +239,9 @@ pub fn discharge(
                 Discharge::Unattempted(Gap::Raised {
                     bindings: search.bindings(point),
                     diagnostic: Box::new(diagnostic),
+                    // A race's counterexample is an interleaving: there is no draw to go back to.
+                    root: seed.root,
+                    case: u32::try_from(point).unwrap_or(u32::MAX),
                 })
             } else {
                 Discharge::Refuted(Counterexample {

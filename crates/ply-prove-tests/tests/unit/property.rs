@@ -603,6 +603,7 @@ fn a_raising_case_is_a_gap_with_a_shrunk_input() {
         Discharge::Unattempted(Gap::Raised {
             bindings,
             diagnostic,
+            ..
         }) => {
             assert_eq!(diagnostic.message, "divided by zero");
             let value: i64 = bindings[0].rendered.parse().expect("an Int renders as one");

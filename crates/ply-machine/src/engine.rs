@@ -516,9 +516,13 @@ impl<'a> Prover<'a> {
             Outcome::Rejected => Point::Rejected,
             // A raise at one point is the obligation's own gap, in the same words a whole run
             // reports it in: nothing was refuted and nothing was established.
+            // A point drawn for a replay has no root or case to go back to: it was named, not
+            // drawn, so there is nothing a walk could regenerate.
             Outcome::Raised(diagnostic) => Point::Undrawn(Gap::Raised {
                 bindings,
                 diagnostic: Box::new(diagnostic),
+                root: 0,
+                case: 0,
             }),
         }
     }
@@ -742,6 +746,9 @@ impl<'a> Prover<'a> {
                     return Discharge::Unattempted(Gap::Raised {
                         bindings: bindings_of(obligation.generated(), &values),
                         diagnostic: Box::new(diagnostic),
+                        // The domain's order is the walk's: the index is the case.
+                        root: 0,
+                        case: u32::try_from(point).unwrap_or(u32::MAX),
                     });
                 }
             }
@@ -874,6 +881,9 @@ impl<'a> Prover<'a> {
         cases.guard(values).map_err(|diagnostic| Gap::Raised {
             bindings: bindings_of(&cases.binders, values),
             diagnostic: Box::new(diagnostic),
+            // A guard that raised while values were handed in: nothing here knows the draw.
+            root: 0,
+            case: 0,
         })
     }
 }
