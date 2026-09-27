@@ -3,8 +3,10 @@
 #
 #   ci-shards.sh verify          every crate is a member, every test named here
 #                                exists, every `probes/` directory is run by a
-#                                job the `ci` aggregate requires, and the shards
-#                                run every test exactly once
+#                                job the `ci` aggregate requires, the shards run
+#                                every test exactly once, and every cache key a
+#                                job writes is one a job reads
+#   ci-shards.sh cache-keys      just that last check
 #   ci-shards.sh partitions      the JSON matrix of partitions
 #   ci-shards.sh shard-configs D the nextest config each partition runs under,
 #                                cut from the durations CI measured; 3 when
@@ -340,6 +342,86 @@ shard_configs() {
 
 cmd_shard_configs() { shard_configs "${1:?a directory to write the configs to}" "$TIMINGS"; }
 
+# One job writes each cache key and another reads it. A rename that misses a side leaves a cache
+# nothing restores -- a run that is quietly slow rather than red -- and a restore naming a key
+# nothing writes always misses the same way. Only the literal before the first `${{ ... }}` is
+# compared: it is the part a restore can match on, and the part both sides spell out.
+cmd_cache_keys() {
+  local files=("$root"/.github/workflows/*.yml "$root"/.github/actions/*/action.yml)
+  awk '
+    function literal(s) {
+      sub(/\$\{\{.*/, "", s)
+      gsub(/^[[:space:]"]+|[[:space:]"]+$/, "", s)
+      return s
+    }
+    # `key:` inside a save step is written, inside a restore step or in a `restore-keys` list it
+    # is read. An entry with no literal at all is all expression, and nothing to compare.
+    function note(kind, value, key) {
+      key = literal(value)
+      if (key == "") return
+      if (kind == "save") {
+        if (key in saved) return
+        saved[key] = 1
+        where[key] = FILENAME ":" FNR
+        order[++n] = key
+      } else {
+        read[key] = 1
+      }
+    }
+    FNR == 1 { mode = ""; inkeys = 0; indent = 0 }
+    # A new list item is a new step; the rules below read the one they are in.
+    /^[[:space:]]*-[[:space:]]/ { mode = ""; inkeys = 0 }
+    /uses:[[:space:]]*actions\/cache\/save@/ { mode = "save"; inkeys = 0; next }
+    /uses:[[:space:]]*actions\/cache\/restore@/ { mode = "restore"; inkeys = 0; next }
+    mode == "" { next }
+    inkeys && /^[[:space:]]*$/ { next }
+    inkeys {
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+      if (length($0) - length(line) <= indent) inkeys = 0
+      else { note("read", line); next }
+    }
+    /^[[:space:]]*restore-keys:/ {
+      rest = $0
+      sub(/.*restore-keys:[[:space:]]*/, "", rest)
+      indent = match($0, /[^ ]/) - 1
+      if (rest == "|") { inkeys = 1; next }
+      if (rest != "") note(mode, rest)
+      next
+    }
+    /^[[:space:]]*key:/ {
+      rest = $0
+      sub(/.*key:[[:space:]]*/, "", rest)
+      note(mode, rest)
+    }
+    END {
+      bad = 0
+      if (n == 0 || length(read) == 0) {
+        printf "FAIL: read %d cache key literal(s) written and %d restored -- the check would pass vacuously\n", n, length(read) > "/dev/stderr"
+        exit 1
+      }
+      for (i = 1; i <= n; i++) {
+        ok = 0
+        for (r in read) if (index(order[i], r) == 1) { ok = 1; break }
+        if (!ok) {
+          printf "FAIL: %s writes cache key \"%s\", which no restore matches\n", where[order[i]], order[i] > "/dev/stderr"
+          bad = 1
+        }
+      }
+      for (r in read) {
+        ok = 0
+        for (k in saved) if (index(k, r) == 1) { ok = 1; break }
+        if (!ok) {
+          printf "FAIL: a restore matches cache key \"%s\", which nothing writes\n", r > "/dev/stderr"
+          bad = 1
+        }
+      }
+      if (bad) exit 1
+      printf "cache keys: %d written and %d restored, each side matched by the other\n", n, length(read)
+    }
+  ' "${files[@]}"
+}
+
 cmd_solo_matrix() {
   local id package target test first=1
   printf '{"include":['
@@ -663,6 +745,9 @@ cmd_verify() {
     done
   fi
 
+  # --- cache keys -----------------------------------------------------------
+  cmd_cache_keys || failures=$((failures + 1))
+
   if [[ $failures -gt 0 ]]; then
     echo "$failures problem(s) in the CI tables" >&2
     return 1
@@ -674,6 +759,7 @@ cmd_verify() {
 
 case "${1:-}" in
   verify) cmd_verify ;;
+  cache-keys) cmd_cache_keys ;;
   partitions) cmd_partitions ;;
   shard-configs) cmd_shard_configs "${2:-}" ;;
   durations) cmd_durations "${2:?a nextest JUnit report}" ;;
@@ -685,7 +771,7 @@ case "${1:-}" in
   tree-checks) cmd_tree_checks ;;
   tree-check-filter) cmd_tree_check_filter ;;
   *)
-    echo "usage: ci-shards.sh {verify|partitions|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|exclude-filter|gate-filter|postgres-filter|tree-checks|tree-check-filter}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|partitions|shard-configs DIR|durations FILE|solo-matrix|solo-filter ID|exclude-filter|gate-filter|postgres-filter|tree-checks|tree-check-filter}" >&2
     exit 2
     ;;
 esac
