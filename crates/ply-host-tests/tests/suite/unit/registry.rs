@@ -44,6 +44,7 @@ fn every_repeatable_operation_is_one_that_was_argued_for() {
             "std.random.entropy.below[..]",
             "std.time.time.now_ms[..]",
             "std.time.time.elapsed_ms[..]",
+            "std.time.time.elapsed_us[..]",
             "certgen.issue[..]",
             "std.signal.signal.stopping[..]",
             "std.signal.signal.deadline_ms[..]",
