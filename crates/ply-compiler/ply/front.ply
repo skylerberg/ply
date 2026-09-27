@@ -12,9 +12,9 @@ import patterns (Lit, LInt, LStr, LBytes)
 import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform,
              NLabel, NCell, NLambda, NSim, NHandle, NField, NUpd, CField, CArm, CClause, CStmt,
              CLet, CLetPat, CDo, CPat, CPatField, PxCtor, PxRecord, PxList, lower_fn, dump)
-import tycore (Atom, Resource, RNamed, RSingleton, Scheme, Type, TyFn, atoms_text, atoms_insert,
-               read_atoms, scheme_text, type_text, Printer, printer_new, print_ty, at, append, take,
-               contains_bytes, contains_int)
+import tycore (Atom, Resource, RNamed, RSingleton, Scheme, Type, TyCon, TyFn, atoms_text,
+               atoms_insert, read_atoms, scheme_text, type_text, Printer, printer_new, print_ty, at,
+               append, take, contains_bytes, contains_int)
 import resolve (Source, Mod, Diag, Label, Edit, Fix, Resolved, Resolved_, Failed, Ns, NValue,
                 NEffect, resolve_modules, qualify, lookup, find, is_bare, diag1, backticked,
                 import_module_name, path_span)
@@ -673,6 +673,125 @@ fn root_keys(mods: List<Mod>, c: Front, h: HashOutput) -> List<KeyRow> = {
   }).out
 }
 
+// --- The emitter's roots -----------------------------------------------------
+
+// One root the emitter offers: a definition, a spec clause, a test or a law part, with the arity
+// its body is emitted at and whether every parameter and the answer is `Int` or `Bool`.
+type EmitRoot = { root: Bytes, arity: Int, scalar: Bool }
+
+// The walk's per-module place and its running place; `ordinal` counts tests, `law_ordinal` laws.
+type EmitTables = { fns: List<EmitRoot>, tests: List<EmitRoot>, specs: List<EmitRoot> }
+type EmitWalk = {
+  fns: List<EmitRoot>,
+  tests: List<EmitRoot>,
+  specs: List<EmitRoot>,
+  ordinal: Int,
+  law_ordinal: Int,
+}
+
+fn emit_is_scalar(t: Type) -> Bool =
+  match t { TyCon(c) -> len(c.args) == 0 && (c.name == b"Int" || c.name == b"Bool"), _ -> false }
+
+fn emit_signature(t: Type) -> { params: List<Type>, ret: Type } =
+  match t { TyFn(f) -> { params: f.params, ret: f.ret }, other -> { params: [], ret: other } }
+
+fn emit_scalar_params(ts: List<Type>) -> Bool =
+  fold(ts, true, |ok: Bool, t: Type| ok && emit_is_scalar(t))
+
+// Every root the emitter offers: the functions in source order, then the tests, then the spec
+// clauses and law parts. A label parameter is a trailing `Word` of the emitted body, so an
+// arity counts it.
+fn emit_roots(mods: List<Mod>, c: Front) -> List<EmitRoot> = {
+  let defs = map_of_entries(map(c.defs, |d: DefInfo| { key: d.name, value: d }));
+  let laws = map_of_entries(map(c.laws, |l: LawInfo| { key: l.key, value: l }));
+  let walked = fold(mods, { fns: [], tests: [], specs: [] }, |acc: EmitTables, m: Mod| {
+    let items = fold(
+      m.module.items,
+      { fns: [], tests: [], specs: [], ordinal: 0, law_ordinal: 0 },
+      |a: EmitWalk, it: Item|
+        match it {
+          IFn(d) -> {
+            let name = qualify(m.name, d.name.name);
+            match map_get(defs, name) {
+              None -> a,
+              Some(def) -> {
+                let sig = emit_signature(def.scheme.ty);
+                let scalar_params = emit_scalar_params(sig.params);
+                let fn_row = {
+                  root: name,
+                  arity: len(sig.params) + len(def.scheme.label_vars),
+                  scalar: scalar_params && emit_is_scalar(sig.ret),
+                };
+                let clauses = fold(
+                  range(0, len(d.spec)),
+                  { rows: [], requires: 0, ensures: 0 },
+                  |b: { rows: List<EmitRoot>, requires: Int, ensures: Int }, i: Int| {
+                    match at(d.spec, i).kind {
+                      SRequires ->
+                        {
+                          rows: push(b.rows, {
+                            root: key_clause_root(name, b"requires", b.requires),
+                            arity: len(sig.params),
+                            scalar: scalar_params,
+                          }),
+                          requires: b.requires + 1,
+                          ensures: b.ensures,
+                        },
+                      SEnsures ->
+                        {
+                          rows: push(b.rows, {
+                            root: key_clause_root(name, b"ensures", b.ensures),
+                            // `ensures` also takes `result`.
+                            arity: len(sig.params) + 1,
+                            scalar: scalar_params && emit_is_scalar(sig.ret),
+                          }),
+                          requires: b.requires,
+                          ensures: b.ensures + 1,
+                        },
+                    }
+                  },
+                );
+                { ..a, fns: push(a.fns, fn_row), specs: append(a.specs, clauses.rows) }
+              },
+            }
+          },
+          ITest(d) -> {
+            let row = { root: qualify(m.name, key_test_root(a.ordinal)), arity: 0, scalar: false };
+            { ..a, tests: push(a.tests, row), ordinal: a.ordinal + 1 }
+          },
+          ILaw(d) -> {
+            let name = qualify(m.name, d.name);
+            let law = map_get(laws, name);
+            let guarded = match law { Some(l) -> l.has_guard, None -> false };
+            let binders = match law { Some(l) -> l.binders, None -> [] };
+            let scalar = fold(binders, true, |ok: Bool, b: LawBinder| ok && emit_is_scalar(b.ty));
+            let rows = fold(
+              if guarded { [b"guard", b"body"] } else { [b"body"] },
+              [],
+              |acc2: List<EmitRoot>, part: Bytes|
+                push(acc2, {
+                  root: qualify(m.name, key_law_root(a.law_ordinal, part)),
+                  arity: len(binders),
+                  scalar: scalar,
+                }),
+            );
+            { ..a, specs: append(a.specs, rows), law_ordinal: a.law_ordinal + 1 }
+          },
+          _ -> a,
+        },
+    );
+    {
+      fns: append(acc.fns, items.fns),
+      tests: append(acc.tests, items.tests),
+      specs: append(acc.specs, items.specs),
+    }
+  });
+  append(append(walked.fns, walked.tests), walked.specs)
+}
+
+fn emit_root_frame(r: EmitRoot) -> Bytes =
+  framed(b"emitroot", r.root, [field(b"arity", num(r.arity)), field(b"scalar", flag(r.scalar))])
+
 fn ordinal_row(m: Mod) -> OrdinalRow =
   {
     module: m.name,
@@ -720,6 +839,7 @@ fn tables(
     hashes: hash_rows(index, h),
     hashes_digest: digest(h),
     keys: root_keys(mods, c, h),
+    emit_roots: emit_roots(mods, c),
     ordinals: map(mods, ordinal_row),
     bodies: h.bodies,
     test_bodies: h.test_bodies,
@@ -1018,6 +1138,7 @@ pub fn dump_of(a: Analysis) -> Dump =
         hashes: [],
         hashes_digest: b"",
         keys: [],
+        emit_roots: [],
         ordinals: [],
         bodies: [],
         test_bodies: [],
@@ -1684,6 +1805,7 @@ pub type Dump = {
   hashes: List<HashFrame>,
   hashes_digest: Bytes,
   keys: List<KeyRow>,
+  emit_roots: List<EmitRoot>,
   ordinals: List<OrdinalRow>,
   bodies: List<BodyRow>,
   test_bodies: List<Bytes>,
@@ -1706,6 +1828,7 @@ pub fn empty_dump() -> Dump =
     hashes: [],
     hashes_digest: b"",
     keys: [],
+    emit_roots: [],
     ordinals: [],
     bodies: [],
     test_bodies: [],
@@ -1928,6 +2051,7 @@ fn table_frames(d: Dump) -> List<Bytes> =
     map(d.hashes, hash_frame),
     [framed(b"hashesdigest", b"_", [hex(d.hashes_digest)])],
     map(d.keys, |k: KeyRow| framed(b"key", k.root, [k.key])),
+    map(d.emit_roots, emit_root_frame),
     map(d.ordinals, ordinal_frame),
     map(d.bodies, |b: BodyRow| framed(b"body", b.name, [hex(b.body)])),
     map(range(0, len(d.test_bodies)), |i: Int|
@@ -2816,6 +2940,7 @@ fn frame_kinds() -> List<Bytes> =
     b"modpkg",
     b"hashesdigest",
     b"key",
+    b"emitroot",
   ]
 
 // A kind's tag, or -1 for one this reader does not know. Looked up rather than compared down a
@@ -2878,7 +3003,18 @@ fn bulk_row(d: Dump, tag: Int, name: Bytes, u: Frame, what: Bytes) -> Result<Dum
     let bytes = unhexed(what, u.body)?;
     Ok({ ..d, bodies: push(d.bodies, { name: name, body: bytes }) })
   } else if tag == 16 { Ok({ ..d, hashes_digest: unhexed(what, u.body)? }) }
-  else if tag == 17 { Ok({ ..d, keys: push(d.keys, { root: name, key: u.body }) }) } else {
+  else if tag == 17 { Ok({ ..d, keys: push(d.keys, { root: name, key: u.body }) }) } else if tag
+      == 18 {
+    let fs = fields(what, u.body, [b"arity", b"scalar"])?;
+    Ok({
+      ..d,
+      emit_roots: push(d.emit_roots, {
+        root: name,
+        arity: counted(what, fs, b"arity")?,
+        scalar: flagged(what, fs, b"scalar")?,
+      }),
+    })
+  } else {
     match numbered(what, name, len(d.test_bodies)) {
       Err(e) -> Err(e),
       Ok(_) -> {
