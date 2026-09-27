@@ -1,8 +1,9 @@
-// BLAKE3, written in Ply: the hash content addressing is defined by.
+// BLAKE3 and SHA-256, written in Ply: the hashes content addressing and authentication are
+// defined by.
 
 // Every word is a `U32`, so a sum wraps in its register and nothing needs masking.
 
-import std.bytes (u32_le)
+import std.bytes (u32_le, u32_be, u32_be_at, u64_be)
 
 // Eight words: what a chunk or a parent node hands to the node above it.
 pub type Cv = { w0: U32, w1: U32, w2: U32, w3: U32, w4: U32, w5: U32, w6: U32, w7: U32 }
@@ -693,6 +694,209 @@ pub fn blake3(input: Bytes) -> Bytes = {
   ])
 }
 
+// --- SHA-256 ---------------------------------------------------------------------
+
+// Every word is an `Int` with its low thirty-two bits significant, so a sum is masked down and
+// `rotr32` is the whole of the bit arithmetic.
+
+fn sha_mask(x: Int) -> Int = x & 0xFFFF_FFFF
+
+// The first thirty-two bits of the fractional parts of the cube roots of the first sixty-four
+// primes, as the standard publishes them.
+fn sha_constants() -> List<Int> =
+  [
+    0x428A_2F98,
+    0x7137_4491,
+    0xB5C0_FBCF,
+    0xE9B5_DBA5,
+    0x3956_C25B,
+    0x59F1_11F1,
+    0x923F_82A4,
+    0xAB1C_5ED5,
+    0xD807_AA98,
+    0x1283_5B01,
+    0x2431_85BE,
+    0x550C_7DC3,
+    0x72BE_5D74,
+    0x80DE_B1FE,
+    0x9BDC_06A7,
+    0xC19B_F174,
+    0xE49B_69C1,
+    0xEFBE_4786,
+    0x0FC1_9DC6,
+    0x240C_A1CC,
+    0x2DE9_2C6F,
+    0x4A74_84AA,
+    0x5CB0_A9DC,
+    0x76F9_88DA,
+    0x983E_5152,
+    0xA831_C66D,
+    0xB003_27C8,
+    0xBF59_7FC7,
+    0xC6E0_0BF3,
+    0xD5A7_9147,
+    0x06CA_6351,
+    0x1429_2967,
+    0x27B7_0A85,
+    0x2E1B_2138,
+    0x4D2C_6DFC,
+    0x5338_0D13,
+    0x650A_7354,
+    0x766A_0ABB,
+    0x81C2_C92E,
+    0x9272_2C85,
+    0xA2BF_E8A1,
+    0xA81A_664B,
+    0xC24B_8B70,
+    0xC76C_51A3,
+    0xD192_E819,
+    0xD699_0624,
+    0xF40E_3585,
+    0x106A_A070,
+    0x19A4_C116,
+    0x1E37_6C08,
+    0x2748_774C,
+    0x34B0_BCB5,
+    0x391C_0CB3,
+    0x4ED8_AA4A,
+    0x5B9C_CA4F,
+    0x682E_6FF3,
+    0x748F_82EE,
+    0x78A5_636F,
+    0x84C8_7814,
+    0x8CC7_0208,
+    0x90BE_FFFA,
+    0xA450_6CEB,
+    0xBEF9_A3F7,
+    0xC671_78F2,
+  ]
+
+// The same of the square roots of the first eight.
+fn sha_initial() -> List<Int> =
+  [
+    0x6A09_E667,
+    0xBB67_AE85,
+    0x3C6E_F372,
+    0xA54F_F53A,
+    0x510E_527F,
+    0x9B05_688C,
+    0x1F83_D9AB,
+    0x5BE0_CD19,
+  ]
+
+// `g ^ (e & (f ^ g))`, which is the choice without a complement.
+fn sha_choose(e: Int, f: Int, g: Int) -> Int = g ^ e & (f ^ g)
+
+fn sha_majority(a: Int, b: Int, c: Int) -> Int = a & b ^ a & c ^ b & c
+
+fn sha_big0(a: Int) -> Int = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)
+
+fn sha_big1(e: Int) -> Int = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)
+
+fn sha_small0(x: Int) -> Int = rotr32(x, 7) ^ rotr32(x, 18) ^ x >>> 3
+
+fn sha_small1(x: Int) -> Int = rotr32(x, 17) ^ rotr32(x, 19) ^ x >>> 10
+
+fn sha_word(xs: List<Int>, i: Int) -> Int = match list_at(xs, i) { Some(w) -> w, None -> 0 }
+
+// Sixty-four words: the sixteen a block holds, then the four mixtures of the ones before.
+fn sha_schedule(block: List<Int>, at: Int, acc: List<Int>) -> List<Int> =
+  if at >= 64 { acc }
+  else if at < 16 { sha_schedule(block, at + 1, push(acc, sha_word(block, at))) } else {
+    sha_schedule(
+      block,
+      at + 1,
+      push(
+        acc,
+        sha_mask(
+          sha_small1(sha_word(acc, at - 2)) + sha_word(acc, at - 7)
+            + sha_small0(sha_word(acc, at - 15))
+            + sha_word(acc, at - 16),
+        ),
+      ),
+    )
+  }
+
+fn sha_round(state: List<Int>, k: Int, w: Int) -> List<Int> = {
+  let a = sha_word(state, 0);
+  let b = sha_word(state, 1);
+  let c = sha_word(state, 2);
+  let d = sha_word(state, 3);
+  let e = sha_word(state, 4);
+  let f = sha_word(state, 5);
+  let g = sha_word(state, 6);
+  let h = sha_word(state, 7);
+  let t1 = sha_mask(h + sha_big1(e) + sha_choose(e, f, g) + k + w);
+  let t2 = sha_mask(sha_big0(a) + sha_majority(a, b, c));
+  [sha_mask(t1 + t2), a, b, c, sha_mask(d + t1), e, f, g]
+}
+
+fn sha_compress(state: List<Int>, block: List<Int>) -> List<Int> = {
+  let schedule = sha_schedule(block, 0, []);
+  let constants = sha_constants();
+  let end = fold(range(0, 64), state, |s: List<Int>, i: Int|
+    sha_round(s, sha_word(constants, i), sha_word(schedule, i)));
+  map(range(0, 8), |i: Int| sha_mask(sha_word(state, i) + sha_word(end, i)))
+}
+
+fn sha_zeroes(n: Int) -> Bytes =
+  if n <= 0 { b"" } else {
+    let half = sha_zeroes(n / 2);
+    if n % 2 == 0 { bytes_concat(half, half) }
+    else { bytes_concat(bytes_concat(half, half), b"\x00") }
+  }
+
+fn sha_be_at(b: Bytes, at: Int) -> Int = match u32_be_at(b, at) { Some(w) -> w, None -> 0 }
+
+fn sha_block(input: Bytes, at: Int) -> List<Int> =
+  map(range(0, 16), |i: Int| sha_be_at(input, at + i * 4))
+
+// The message, a one bit, as many zeros as leave the length eight short of a block, then the
+// length in bits as a big-endian word.
+fn sha_padded(input: Bytes) -> Bytes = {
+  let n = bytes_len(input);
+  let total = (n + 9 + 63) / 64 * 64;
+  bytes_concat_all([input, b"\x80", sha_zeroes(total - n - 9), u64_be(n * 8)])
+}
+
+// Thirty-two bytes, of SHA-256 as the standard defines it.
+pub fn sha256(input: Bytes) -> Bytes = {
+  let full = sha_padded(input);
+  let state = fold(range(0, bytes_len(full) / 64), sha_initial(), |acc: List<Int>, i: Int|
+    sha_compress(acc, sha_block(full, i * 64)));
+  bytes_concat_all(map(state, |w: Int| u32_be(w)))
+}
+
+// Every byte of `b` xored with one byte, which is what an HMAC key pad is.
+fn sha_xor(b: Bytes, constant: Int) -> Bytes =
+  bytes_concat_all(map(range(0, bytes_len(b)), |i: Int| byte_of_int(bytes_at(b, i) ^ constant)))
+
+// Two byte strings of one length, xored.
+fn sha_xor_pair(a: Bytes, b: Bytes) -> Bytes =
+  bytes_concat_all(
+    map(range(0, min(bytes_len(a), bytes_len(b))), |i: Int|
+      byte_of_int(bytes_at(a, i) ^ bytes_at(b, i))),
+  )
+
+// HMAC-SHA-256, as RFC 2104 defines it and RFC 4231 publishes vectors for.
+pub fn hmac_sha256(key: Bytes, message: Bytes) -> Bytes = {
+  let short = if bytes_len(key) > 64 { sha256(key) } else { key };
+  let pad = bytes_concat(short, sha_zeroes(64 - bytes_len(short)));
+  sha256(bytes_concat(sha_xor(pad, 0x5C), sha256(bytes_concat(sha_xor(pad, 0x36), message))))
+}
+
+type ShaChain = { block: Bytes, total: Bytes }
+
+// PBKDF2-HMAC-SHA-256 with one output block, which is thirty-two bytes: SCRAM's salted
+// password, and nothing else here needs a longer key.
+pub fn pbkdf2_sha256(password: Bytes, salt: Bytes, iterations: Int) -> Bytes = {
+  let first = hmac_sha256(password, bytes_concat(salt, u32_be(1)));
+  fold(range(1, iterations), { block: first, total: first }, |acc: ShaChain, _i: Int| {
+    let next = hmac_sha256(password, acc.block);
+    { block: next, total: sha_xor_pair(acc.total, next) }
+  }).total
+}
+
 // The published test vectors.
 
 test "the empty input" {
@@ -728,3 +932,65 @@ test "a second chunk is a tree, and a tree is not a longer chunk" {
 }
 
 fn repeat(unit: Bytes, n: Int) -> Bytes = bytes_concat_all(map(range(0, n), |_: Int| unit))
+
+// The published SHA-256, HMAC-SHA-256 and PBKDF2-SHA-256 vectors, read as hex so a
+// transcription shows up as a diff in one line rather than in thirty-two byte escapes.
+
+fn sha_hex(b: Bytes) -> String =
+  fold(range(0, bytes_len(b)), "", |acc: String, i: Int| acc ++ sha_byte_hex(bytes_at(b, i)))
+
+fn sha_byte_hex(v: Int) -> String =
+  string_slice("0123456789abcdef", v >>> 4, (v >>> 4) + 1)
+    ++ string_slice("0123456789abcdef", v & 0xF, (v & 0xF) + 1)
+
+test "sha-256 of the empty input" {
+  assert_eq(
+    sha_hex(sha256(b"")),
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  )
+}
+
+test "sha-256 of abc" {
+  assert_eq(
+    sha_hex(sha256(b"abc")),
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+  )
+}
+
+// Fifty-six bytes is the input whose padding needs a block of its own.
+test "sha-256 where the padding spills into a second block" {
+  assert_eq(
+    sha_hex(sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+    "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+  )
+}
+
+test "hmac-sha-256, against RFC 4231" {
+  assert_eq(
+    sha_hex(hmac_sha256(repeat(b"\x0b", 20), b"Hi There")),
+    "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+  );
+  assert_eq(
+    sha_hex(hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+    "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+  );
+  assert_eq(
+    sha_hex(hmac_sha256(repeat(b"\xaa", 20), repeat(b"\xdd", 50))),
+    "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe",
+  )
+}
+
+test "pbkdf2-hmac-sha-256, one block" {
+  assert_eq(
+    sha_hex(pbkdf2_sha256(b"password", b"salt", 1)),
+    "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b",
+  );
+  assert_eq(
+    sha_hex(pbkdf2_sha256(b"password", b"salt", 2)),
+    "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43",
+  );
+  assert_eq(
+    sha_hex(pbkdf2_sha256(b"password", b"salt", 4096)),
+    "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a",
+  )
+}
