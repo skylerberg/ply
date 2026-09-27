@@ -10,7 +10,7 @@ use ply_prove::{
 use ply_span::{Diagnostic, SourceId, Span, Symbol};
 use ply_ty::DefHash;
 use ply_ty::Mode;
-use ply_ty::prelude;
+use ply_ty::TASK_TYPE;
 use ply_ty::{EffectAtom, LawBinder, Resource, Row, RowVar, TyVar, Type};
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
@@ -290,7 +290,7 @@ fn a_type_no_finite_value_inhabits_is_not_generatable() {
 fn the_types_a_binder_may_not_have_are_named() {
     let world = TypeWorld::default();
     let cell = Type::Con(Symbol::new("Cell"), vec![Type::Var(TyVar(0)), Type::int()]);
-    let task = Type::Con(Symbol::new(prelude::TASK_TYPE), vec![Type::int()]);
+    let task = Type::Con(Symbol::new(TASK_TYPE), vec![Type::int()]);
     assert_eq!(generatable(&cell, &world), Err(Ungeneratable::Cell));
     assert_eq!(generatable(&task, &world), Err(Ungeneratable::Task));
     assert_eq!(
