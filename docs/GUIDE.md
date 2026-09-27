@@ -1393,8 +1393,22 @@ removes a leading `./`, so `./m.ply` and `m.ply` are one key in a set.
 
 ### 13.13 `std.hash`
 
-`pub fn blake3(input: Bytes) -> Bytes` answers 32 bytes. It is written in Ply
-and slow; use it for small inputs.
+```ply
+pub fn blake3(input: Bytes) -> Bytes
+pub fn sha256(input: Bytes) -> Bytes
+pub fn hmac_sha256(key: Bytes, message: Bytes) -> Bytes
+pub fn pbkdf2_sha256(password: Bytes, salt: Bytes, iterations: Int) -> Bytes
+```
+
+`blake3` and `sha256` answer 32 bytes. `hmac_sha256` is HMAC over SHA-256 as RFC
+2104 defines it, and `pbkdf2_sha256` is its single-block PBKDF2: thirty-two
+bytes, which is the salted password SCRAM asks for and the only length anything
+here needs.
+
+All of it is written in Ply, and the vectors the SHA-256 standard and RFC 4231
+publish are the tests. It is slow — a compression round walks a list of words
+rather than living in scalars — so use it for small inputs: a key, a proof, a
+nonce, not a file.
 
 ### 13.14 `std.bytes`
 
