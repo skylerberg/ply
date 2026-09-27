@@ -175,3 +175,177 @@ fn a_dependency_may_not_reach_back_into_the_root_package() {
     assert!(err.contains("E0106"), "{err}");
     assert!(err.contains("no module named `onlyroot`"), "{err}");
 }
+
+/// `manifest` with a version of its own and a dependency carrying a floor, for the version
+/// judgments. Two manifests asking different floors of one package is legal; two *places* holding
+/// one package is not.
+fn manifest_at(name: &str, version: (u64, u64, u64), deps: &str) -> String {
+    format!(
+        "import std.pkg (Manifest)\nfn package() -> Manifest = {{name: \"{name}\", version: {{major: {}, minor: {}, patch: {}}}, prefix: None, runtime: {{major: 0, minor: 0, patch: 1}}, dependencies: [{deps}], entry: None}}\n",
+        version.0, version.1, version.2
+    )
+}
+
+fn dep_at(name: &str, floor: (u64, u64, u64), path: &str) -> String {
+    format!(
+        "{{name: \"{name}\", prefix: None, min: {{major: {}, minor: {}, patch: {}}}, source: Path(\"{path}\")}}",
+        floor.0, floor.1, floor.2
+    )
+}
+
+#[test]
+fn a_dependency_below_the_floor_its_importer_asks_for_is_refused() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let root = dir.path();
+    for pkg in ["app", "lib"] {
+        std::fs::create_dir(root.join(pkg)).unwrap();
+    }
+    std::fs::write(
+        root.join("app/ply.pkg"),
+        manifest_at("app", (0, 1, 0), &dep_at("lib", (0, 2, 0), "../lib")),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app/main.ply"),
+        "import lib.x\nfn main() -> Int = x::x()\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("lib/ply.pkg"), manifest_at("lib", (0, 1, 3), "")).unwrap();
+    std::fs::write(root.join("lib/x.ply"), "pub fn x() -> Int = 1\n").unwrap();
+
+    let out = ply(dir.path()).args(["check", "app"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("E0136"), "{err}");
+    assert!(err.contains("is version 0.1.3"), "{err}");
+    assert!(err.contains("at least 0.2.0"), "{err}");
+
+    // The floor is a floor: the same tree with the dependency at or above it checks.
+    std::fs::write(root.join("lib/ply.pkg"), manifest_at("lib", (0, 2, 0), "")).unwrap();
+    let out = ply(dir.path()).args(["check", "app"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The ordinary diamond: two packages depend on one package, at two floors of it. One version
+/// serves the closure, so this is what a program over a shared dependency looks like.
+#[test]
+fn two_dependents_of_one_package_resolve_to_its_one_version() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let root = dir.path();
+    for pkg in ["app", "left", "right", "shared"] {
+        std::fs::create_dir(root.join(pkg)).unwrap();
+    }
+    std::fs::write(
+        root.join("app/ply.pkg"),
+        manifest_at(
+            "app",
+            (0, 1, 0),
+            &format!(
+                "{}, {}",
+                dep_at("left", (0, 1, 0), "../left"),
+                dep_at("right", (0, 1, 0), "../right")
+            ),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app/main.ply"),
+        "import left.l\nimport right.r\nfn main() -> Int = l::l() + r::r()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("left/ply.pkg"),
+        manifest_at("left", (0, 1, 0), &dep_at("shared", (0, 1, 0), "../shared")),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("left/l.ply"),
+        "import shared.s\npub fn l() -> Int = s::s()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("right/ply.pkg"),
+        manifest_at(
+            "right",
+            (0, 1, 0),
+            &dep_at("shared", (0, 3, 0), "../shared"),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("right/r.ply"),
+        "import shared.s\npub fn r() -> Int = s::s()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("shared/ply.pkg"),
+        manifest_at("shared", (0, 3, 0), ""),
+    )
+    .unwrap();
+    std::fs::write(root.join("shared/s.ply"), "pub fn s() -> Int = 20\n").unwrap();
+
+    let out = ply(dir.path()).args(["run", "app"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("40"), "{err}");
+}
+
+#[test]
+fn one_package_of_one_name_at_two_places_has_no_version_to_pick() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let root = dir.path();
+    for pkg in ["app", "left", "right", "d1", "d2"] {
+        std::fs::create_dir(root.join(pkg)).unwrap();
+    }
+    std::fs::write(
+        root.join("app/ply.pkg"),
+        manifest_at(
+            "app",
+            (0, 1, 0),
+            &format!(
+                "{}, {}",
+                dep_at("left", (0, 1, 0), "../left"),
+                dep_at("right", (0, 1, 0), "../right")
+            ),
+        ),
+    )
+    .unwrap();
+    std::fs::write(root.join("app/main.ply"), "fn main() -> Int = 1\n").unwrap();
+    for (side, other) in [("left", "d1"), ("right", "d2")] {
+        std::fs::write(
+            root.join(side).join("ply.pkg"),
+            manifest_at(
+                side,
+                (0, 1, 0),
+                &dep_at("shared", (0, 1, 0), &format!("../{other}")),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(side).join(format!("{side}.ply")),
+            format!("pub fn {side}() -> Int = 1\n"),
+        )
+        .unwrap();
+    }
+    for (other, version) in [("d1", (0, 1, 0)), ("d2", (0, 2, 0))] {
+        std::fs::write(
+            root.join(other).join("ply.pkg"),
+            manifest_at("shared", version, ""),
+        )
+        .unwrap();
+        std::fs::write(root.join(other).join("s.ply"), "pub fn s() -> Int = 1\n").unwrap();
+    }
+
+    let out = ply(dir.path()).args(["check", "app"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("E0137"), "{err}");
+    assert!(err.contains("`shared` is reached at two places"), "{err}");
+    assert!(err.contains("`left` wants"), "{err}");
+    assert!(err.contains("`right` wants"), "{err}");
+}
