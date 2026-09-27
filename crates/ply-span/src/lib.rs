@@ -348,11 +348,8 @@ pub mod codes {
     pub const TLS_CREDENTIAL_INVALID: &str = "E0430";
     /// Postgres is bound but the database is unnamed, unparseable, unsupported or unreachable.
     pub const DB_NOT_CONFIGURED: &str = "E0431";
-    pub const DB_STATEMENT_REFUSED: &str = "E0432";
     /// The server refused to prepare a statement, or its columns do not fit the row codec.
-    pub const DB_PREPARE_FAILED: &str = "E0433";
     /// A statement touches a table outside its entry point's declared footprint.
-    pub const DB_FOOTPRINT_UNDECLARED: &str = "E0434";
     pub const DB_SCHEMA_MISMATCH: &str = "E0435";
     /// A database operation by a task that does not own the open transaction scope.
     pub const DB_TRANSACTION_SCOPE: &str = "E0436";
@@ -599,9 +596,6 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ("E0429", "`net.listen_tls` named a credential the run lacks"),
     ("E0430", "`--tls` credential that does not load"),
     ("E0431", "no database configured"),
-    ("E0432", "statement text the driver refuses"),
-    ("E0433", "server refused to prepare a statement"),
-    ("E0434", "statement touches a table outside the footprint"),
     ("E0435", "live database differs from the schema (reserved)"),
     (
         "E0436",
@@ -911,13 +905,6 @@ mod tests {
                 "E0430",
             ),
             ("DB_NOT_CONFIGURED", codes::DB_NOT_CONFIGURED, "E0431"),
-            ("DB_STATEMENT_REFUSED", codes::DB_STATEMENT_REFUSED, "E0432"),
-            ("DB_PREPARE_FAILED", codes::DB_PREPARE_FAILED, "E0433"),
-            (
-                "DB_FOOTPRINT_UNDECLARED",
-                codes::DB_FOOTPRINT_UNDECLARED,
-                "E0434",
-            ),
             ("DB_SCHEMA_MISMATCH", codes::DB_SCHEMA_MISMATCH, "E0435"),
             ("DB_TRANSACTION_SCOPE", codes::DB_TRANSACTION_SCOPE, "E0436"),
             ("DB_POOL_EXHAUSTED", codes::DB_POOL_EXHAUSTED, "E0437"),
