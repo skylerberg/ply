@@ -24,7 +24,7 @@ use ply_test::{
     Isolation, Parallelism, Record, RunReport, Selection, Skipped, Status, Suspect, TestResult,
     Verdict,
 };
-use ply_ty::{CheckOutput, Footprint, HashOutput};
+use ply_ty::{CheckOutput, Footprint, HashOutput, Mode};
 use serde_json::{Value, json as jsonlit};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -1133,12 +1133,22 @@ struct CaseView {
     footprint: String,
     shared: String,
     atoms: Vec<String>,
+    /// The same atoms, unprinted: what a scheduler compares is an effect, a resource and whether
+    /// the atom writes. Two atoms conflict when they agree on the first two and one of them writes.
+    contends: Vec<AtomView>,
     region_only: bool,
     seeded: bool,
     isolated: bool,
     reason: &'static str,
     owed: usize,
     group: Option<usize>,
+}
+
+/// One atom of a test's shared footprint, as a scheduler compares them.
+struct AtomView {
+    effect: String,
+    resource: String,
+    writes: bool,
 }
 
 struct Found {
@@ -1324,6 +1334,14 @@ fn found(
                     atoms: ply_test::shared_footprint(&test.footprint)
                         .atoms()
                         .map(|a| a.to_string())
+                        .collect(),
+                    contends: ply_test::shared_footprint(&test.footprint)
+                        .atoms()
+                        .map(|a| AtomView {
+                            effect: a.effect.to_string(),
+                            resource: a.resource.to_string(),
+                            writes: a.mode == Mode::Write,
+                        })
                         .collect(),
                     region_only: ply_test::contends_only_over_regions(&test.footprint),
                     seeded: ply_test::is_seeded(&test.footprint),
@@ -1593,6 +1611,21 @@ fn micros(n: u128) -> PlyValue {
     PlyValue::Int(n as i64)
 }
 
+fn atoms_value(atoms: &[AtomView]) -> PlyValue {
+    PlyValue::list(
+        atoms
+            .iter()
+            .map(|a| {
+                record(vec![
+                    ("effect", PlyValue::str(&a.effect)),
+                    ("resource", PlyValue::str(&a.resource)),
+                    ("writes", PlyValue::Bool(a.writes)),
+                ])
+            })
+            .collect(),
+    )
+}
+
 fn texts(items: &[String]) -> PlyValue {
     strings(items.iter().map(String::as_str))
 }
@@ -1627,6 +1660,7 @@ fn case_value(case: &CaseView) -> PlyValue {
         ("footprint", PlyValue::str(&case.footprint)),
         ("shared", PlyValue::str(&case.shared)),
         ("atoms", texts(&case.atoms)),
+        ("contends", atoms_value(&case.contends)),
         ("region_only", PlyValue::Bool(case.region_only)),
         ("seeded", PlyValue::Bool(case.seeded)),
         ("isolated", PlyValue::Bool(case.isolated)),
