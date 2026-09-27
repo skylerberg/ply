@@ -627,7 +627,17 @@ test "expiry is decided against the deadline, not the wall clock" {
 ```
 
 A clause is `effect.op[resource](params) -> body`; an optional
-`return x -> body` clause maps the result. A handler discharges an
+`return x -> body` clause maps the result. A clause's label may be `[*]`, which
+answers the operation on **every** label: `log.note[*](line) -> …` discharges
+`log.note` wherever it is performed, `log.note[users]` and `log.note[orders]`
+alike. This is what lets a library serve an effect whose atoms are
+per-resource — a database driver over tables, a trace sink over channels —
+where the label is chosen at the call site rather than by the handler. A clause
+that names a label answers that label alone, and clauses are matched in order,
+so a clause naming a label belongs before a `[*]` one that would answer it.
+`[*]` on an operation declared without a label is `E0304`.
+
+A handler discharges an
 **operation**: a clause for `net.send[conn]` removes that atom from the body's
 row, and a clause set covering every operation of a mode (`send`, `recv` and
 `close` for `net.write[conn]`) discharges the mode atom. The `handle`'s row is

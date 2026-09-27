@@ -290,6 +290,8 @@ impl FrameClause {
             && self.op == *op
             && match (&self.resource, resource) {
                 (None, _) => true,
+                // A clause written `[*]` answers every label of the operation it names.
+                (Some(mine), _) if mine.as_str() == "*" => true,
                 (Some(mine), Some(theirs)) => mine == theirs,
                 (Some(_), None) => false,
             }

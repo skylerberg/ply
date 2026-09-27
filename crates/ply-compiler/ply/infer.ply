@@ -13,22 +13,23 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               expr_span)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LInt, LFixed, LBool,
                  LStr, LBytes, LFloat, LDec, LUnit, pat_span)
-import tycore (Resource, RNamed, RSingleton, RVar, Atom, Row, Type, TyVar, TyCon, TyFn, TyRecord,
-               Field, Scheme, Fresh, Subst, TypeEnv, Free, UnifyError, Mismatch, Arity, OccursTy,
-               OccursRow, RowMismatch, Unified, atom_lt, atoms_covered, atoms_insert, atoms_union,
-               atoms_contains, atoms_difference, row_empty, row_open, row_closed, row_singleton,
-               row_is_pure, row_union, row_without, row_without_covered, con, con1, t_int, t_bool,
-               t_string, t_bytes, t_float, t_decimal, t_unit, t_list, t_option, t_map, t_iter,
-               t_secret, t_fn, mono, fields_sorted, field_get, mentions_secret, at, set_at, take,
-               drop, append, contains_int, contains_bytes, ints_insert, ints_union, ints_difference,
-               fresh_new, fresh_ty_var, fresh_ty, fresh_row_var, fresh_row, subst_new,
-               mark_rigid_ty, mark_rigid_row, is_rigid_ty, is_rigid_row, shallow, resolve_ty,
-               resolved_tail, resolve_row, occurs_ty, solve_continuation_row, free_vars, unify,
-               unify_row, env_new, env_push, env_pop, env_bind, env_bind_global, env_remove_global,
-               env_lookup, env_depth_of, env_locals, instantiate_with, instantiate, rename_scheme,
-               generalize, region_prefix, region_of, label_type, label_of, resolve_atom, atom_text,
-               atoms_text, resource_text, scheme_text, type_text, row_text, Printer, printer_new,
-               printer_naming, print_ty, print_row)
+import tycore (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
+               TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Free, UnifyError, Mismatch, Arity,
+               OccursTy, OccursRow, RowMismatch, Unified, atom_lt, atoms_covered, atoms_insert,
+               atoms_union, atoms_contains, atoms_difference, resource_covers, row_empty, row_open,
+               row_closed, row_singleton, row_is_pure, row_union, row_without, row_without_covered,
+               con, con1, t_int, t_bool, t_string, t_bytes, t_float, t_decimal, t_unit, t_list,
+               t_option, t_map, t_iter, t_secret, t_fn, mono, fields_sorted, field_get,
+               mentions_secret, at, set_at, take, drop, append, contains_int, contains_bytes,
+               ints_insert, ints_union, ints_difference, fresh_new, fresh_ty_var, fresh_ty,
+               fresh_row_var, fresh_row, subst_new, mark_rigid_ty, mark_rigid_row, is_rigid_ty,
+               is_rigid_row, shallow, resolve_ty, resolved_tail, resolve_row, occurs_ty,
+               solve_continuation_row, free_vars, unify, unify_row, env_new, env_push, env_pop,
+               env_bind, env_bind_global, env_remove_global, env_lookup, env_depth_of, env_locals,
+               instantiate_with, instantiate, rename_scheme, generalize, region_prefix, region_of,
+               label_type, label_of, resolve_atom, atom_text, atoms_text, resource_text,
+               scheme_text, type_text, row_text, Printer, printer_new, printer_naming, print_ty,
+               print_row)
 import resolve (Mod, Source, Resolved, Scope, Binding, ModBind, Declared, Entry, Diag, Label, Edit,
                 Fix, with_fix, insertion, Ns, NValue, NType, NEffect, resolve_modules, Resolved_,
                 Failed, Expanded, find, lookup, dlookup, space, qualify, default_binder, dump_diags,
@@ -2111,13 +2112,19 @@ fn discharge(cx: Cx, mark: Int, until: Int, handled: List<Atom>) -> Cx = {
   { ..cx, performs: append(append(take(cx.performs, mark), kept), drop(cx.performs, until)) }
 }
 
+// The clause's resource covers the performed one: `[*]` is a clause for every label.
 fn key_named(keys: List<OpKey>, a: Atom) -> Bool =
   fold(keys, false, |acc: Bool, k: OpKey|
-    acc || (k.effect == a.effect && k.res == a.resource && Some(k.op) == a.op))
+    acc || (k.effect == a.effect && resource_covers(k.res, a.resource) && Some(k.op) == a.op))
 
 // The operation atoms a mode atom stands for: the effect's operations of that mode, under the atom's resource.
 fn mode_ops(cx: Cx, a: Atom) -> List<Atom> = {
-  let named = match a.resource { RNamed(_) -> true, RVar(_) -> true, RSingleton -> false };
+  let named = match a.resource {
+    RNamed(_) -> true,
+    RVar(_) -> true,
+    RSingleton -> false,
+    RAny -> true,
+  };
   match effect_of(cx, a.effect) {
     Some(info) ->
       fold(info.ops, [], |acc: List<Atom>, o: OpInfo|
@@ -2129,12 +2136,12 @@ fn mode_ops(cx: Cx, a: Atom) -> List<Atom> = {
 }
 
 // A clause discharges the operation it names; a mode atom is discharged by a clause for each of its operations.
-// `handled` holds the clauses' mode atoms.
+// `handled` holds the clauses' mode atoms, and a clause written `[*]` covers every label.
 fn clause_discharges(cx: Cx, handled: List<Atom>, keys: List<OpKey>, a: Atom) -> Bool =
   match a.op {
     Some(_) -> key_named(keys, a),
     None ->
-      atoms_contains(handled, a)
+      atoms_covered(handled, a)
         && fold(mode_ops(cx, a), true, |acc: Bool, o: Atom| acc && key_named(keys, o)),
   }
 
@@ -3923,6 +3930,41 @@ fn resource_for(
     } else { { cx: cx, res: Some(RSingleton) } },
   }
 
+// A clause's resource: a written label, or `RAny` when the clause is written `[*]` and so
+// answers the operation on every label. A clause that names no label at all and a `[*]` clause
+// are different things, which is why the caller passes the clause rather than its `resource`.
+fn clause_resource_for(
+  cx: Cx,
+  info: EffectInfo,
+  op: OpInfo,
+  clause: HandleClause,
+  span: Span,
+) -> { cx: Cx, res: Option<Resource> } =
+  if !clause.every_label { resource_for(cx, info, op, clause.resource, span) }
+  else if op.resource_param { { cx: cx, res: Some(RAny) } } else {
+    {
+      cx: err2(
+        cx,
+        b"E0304",
+        span,
+        bytes_concat_all([b"`", info.name, b".", op.name, b"` is not resource-parameterized"]),
+        b"`[*]` names no label",
+        op.at,
+        b"declared without `[r]`",
+        [
+          bytes_concat_all([
+            b"drop it, or declare it as `",
+            mode_key(op.mode),
+            b" ",
+            op.name,
+            b"[r](..)`",
+          ]),
+        ],
+      ),
+      res: None,
+    }
+  }
+
 fn op_free_vars(op: OpInfo) -> List<Int> = {
   let fv = fold(op.params, { tys: [], rows: [] }, |acc: Free, p: Type|
     free_vars(subst_new(), p, acc));
@@ -4091,7 +4133,7 @@ fn infer_handle(
       match r.hit {
         None -> { ..acc, cx: r.cx },
         Some(hit) -> {
-          let res: WithRes = resource_for(r.cx, hit.info, hit.op, clause.resource, clause.span);
+          let res: WithRes = clause_resource_for(r.cx, hit.info, hit.op, clause, clause.span);
           match res.res {
             None -> { ..acc, cx: res.cx },
             Some(resource_) -> {
@@ -5533,7 +5575,12 @@ fn check_determinism(cx: Cx, def: TestDef, footprint: List<Atom>) -> Cx =
 // A clause the reader could paste, for the operation the atom names.
 fn example_clause(cx: Cx, info: EffectInfo, atom: Atom) -> Bytes = {
   let written = as_written(cx, info.name);
-  let named = match atom.resource { RNamed(_) -> true, RVar(_) -> true, RSingleton -> false };
+  let named = match atom.resource {
+    RNamed(_) -> true,
+    RVar(_) -> true,
+    RSingleton -> false,
+    RAny -> true,
+  };
   let first = |ok: (OpInfo) -> Bool|
     fold(info.ops, None, |acc: Option<OpInfo>, o: OpInfo|
       match acc { Some(_) -> acc, None -> if ok(o) { Some(o) } else { None } });
@@ -7447,6 +7494,16 @@ test "a clause on a label parameter discharges what the generic body performs" {
       ++ "F;m.quiet;<[l]>(Bytes) -> Unit;;;;1;"
       ++ "E;m.net;0;send:write:1:Bytes:Unit;",
   )
+}
+
+test "`[*]` on an operation that takes no resource is refused" {
+  let dump = check_dump([
+    {
+      name: b"m",
+      src: b"effect log { write note(line: String) -> Unit }\nfn go() -> Unit = handle { log.note(\"x\") } with { log.note[*](line) -> () }",
+    },
+  ]);
+  assert(string_contains(dump, "E0304"))
 }
 
 test "a label a call cannot fill, a count that does not match, and a use as a value" {
