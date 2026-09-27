@@ -355,20 +355,6 @@ impl Type {
     pub fn secret(inner: Type) -> Type {
         Type::Con(Symbol::new(SECRET), vec![inner])
     }
-
-    /// Whether a solved type mentions a `Secret` anywhere.
-    pub fn mentions_secret(&self) -> bool {
-        match self {
-            Type::Con(name, args) => {
-                name.as_str() == SECRET || args.iter().any(Type::mentions_secret)
-            }
-            Type::Fn { params, ret, .. } => {
-                params.iter().any(Type::mentions_secret) || ret.mentions_secret()
-            }
-            Type::Record(fields) => fields.values().any(Type::mentions_secret),
-            Type::Var(_) => false,
-        }
-    }
 }
 
 pub const SECRET: &str = "Secret";

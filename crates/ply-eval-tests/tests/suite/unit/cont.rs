@@ -1,7 +1,7 @@
+use ply_eval::BinOp;
 use ply_eval::Value;
 use ply_eval::cont::*;
 use ply_span::Span;
-use ply_ty::BinOp;
 use std::rc::Rc;
 
 fn frame(n: i64) -> Frame {
