@@ -93,7 +93,7 @@ pub fn discharge(path: &Path, plan: &ProvePlan) -> Result<Discharged> {
     let discharges: Vec<Discharge> = collected
         .obligations
         .iter()
-        .map(|o| prover.discharge_with(o, plan))
+        .map(|o| prover.discharge_with(o, plan, None))
         .collect();
     let discharge_millis = started.elapsed().as_secs_f64() * 1000.0;
 

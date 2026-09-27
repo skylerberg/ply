@@ -38,7 +38,7 @@ fn every_proof_a_generated_corpus_produces_survives_a_wide_sample() {
             .with_backend(Some(backend));
         for obligation in &collected.obligations {
             if prover
-                .discharge_with(obligation, &ProvePlan::default())
+                .discharge_with(obligation, &ProvePlan::default(), None)
                 .tier()
                 != Some(Tier::Proved)
             {

@@ -160,10 +160,29 @@ fn choice_of(value: &PlyValue, span: Span) -> Result<obligation::Choice, Diagnos
             Diagnostic::error(codes::INTERNAL_ERROR, format!("unknown reason `{word}`"))
         })?);
     }
+    let claims = indices(field_of(value, "claims", span)?, span)?;
+    let mut domains = Vec::new();
+    for entry in field_of(value, "domains", span)?.as_list(span, "the measured domains")? {
+        let claim = field_of(entry, "claim", span)?.as_int(span, "a claim's place")? as usize;
+        let sizes = field_of(entry, "sizes", span)?
+            .as_list(span, "a binder's size")?
+            .iter()
+            .map(|size| Ok(u64::try_from(size.as_int(span, "a binder's size")?).unwrap_or(0)))
+            .collect::<Result<Vec<u64>, Diagnostic>>()?;
+        let name = field_of(entry, "name", span)?
+            .as_str(span, "a domain's name")?
+            .to_string();
+        // Keyed by the obligation's position in the run, which is how the discharge reads it back.
+        // A domain for a claim this run does not report on is dropped rather than refused.
+        if let Some(position) = claims.iter().position(|&c| c == claim) {
+            domains.push((position, obligation::Domain { sizes, name }));
+        }
+    }
     Ok(obligation::Choice {
-        claims: indices(field_of(value, "claims", span)?, span)?,
+        claims,
         to_discharge: indices(field_of(value, "runs", span)?, span)?,
         reasons,
+        domains,
     })
 }
 

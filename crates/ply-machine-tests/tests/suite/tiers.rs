@@ -47,7 +47,7 @@ impl Run {
             .obligations
             .into_iter()
             .map(|o| {
-                let discharge = prover.discharge_with(&o, plan);
+                let discharge = prover.discharge_with(&o, plan, None);
                 (o, discharge)
             })
             .collect();
@@ -181,7 +181,7 @@ fn the_differential_tier_audit() {
             ));
         for obligation in &collected.obligations {
             if prover
-                .discharge_with(obligation, &ProvePlan::default())
+                .discharge_with(obligation, &ProvePlan::default(), None)
                 .tier()
                 != Some(Tier::Proved)
             {
