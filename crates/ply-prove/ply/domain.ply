@@ -1,0 +1,276 @@
+// `domain` — how many points a law's binders have, and whether that is a domain at all.
+//
+// A finite domain is the one thing a law can be *proved* over rather than sampled: if every binder
+// is inhabited by finitely many values and the product is small enough to walk, then visiting every
+// point is a proof and missing one is not. Everything here is therefore a rule about coverage, not
+// a search: how many values a type holds, whether a product is still walkable, and what order the
+// points are visited in so that two runs agree.
+//
+// The runtime materialises a point and judges the law at it — a value of a type the program never
+// named is not something a program can build. What it can decide is which points exist, how many
+// there are, and whether asking for all of them is a proof or an enumeration nobody can afford.
+
+// A type, as the runtime publishes one: a variable, a function, a record, or a named type with its
+// arguments. The builtins arrive as names — `Unit`, `Bool`, `U8` — so this module never needs to
+// know which of them the compiler keeps in a table and which it spells out.
+pub type Ty = | Var(Int) | Fn | Record(List<{ name: String, ty: Ty }>) | Con(String, List<Ty>)
+
+// One case of a declared type: its name and its fields, in declaration order.
+pub type Variant = { name: String, fields: List<Ty> }
+
+// A declared type: the variants its constructors belong to.
+pub type Decl = { name: String, variants: List<Variant> }
+
+// What a finite domain came to: each binder's type, how many values it holds, and the product. The
+// sizes are kept because a point is named by index, and only the sizes say what an index means.
+pub type Domain = { types: List<Ty>, sizes: List<Int>, points: Int }
+
+// The largest number of points a proof may walk. Past it the domain is not a proof anyone can pay
+// for, and sampling is the honest answer rather than a long silence.
+pub fn bound() -> Int = 4096
+
+// How many values inhabit a type, or `None` when it is infinite, unknown, or past [`bound`].
+pub fn size(ty: Ty, decls: List<Decl>) -> Option<Int> = sized(ty, decls, [])
+
+// The binders' domain, when every one of them is finite and the product is within [`bound`].
+pub fn finite(binders: List<Ty>, decls: List<Decl>) -> Option<Domain> =
+  match sizes_within(binders, decls) {
+    None -> None,
+    Some(seen) -> Some({ types: binders, sizes: seen.sizes, points: seen.points }),
+  }
+
+// The point an index names, one value index per binder: the last binder varies fastest, so the
+// sequence of points is a function of the domain and nothing else.
+pub fn point_indices(domain: Domain, index: Int) -> Option<List<Int>> =
+  if index < 0 || index >= domain.points { None }
+  else { Some(tuple_at(domain.sizes, len(domain.sizes) - 1, index)) }
+
+// `sizes` right to left, each dividing what is left: the tuple an index names, left to right.
+fn tuple_at(sizes: List<Int>, at: Int, rest: Int) -> List<Int> =
+  if at < 0 { [] } else {
+    match list_at(sizes, at) {
+      None -> [],
+      Some(step) -> push(tuple_at(sizes, at - 1, rest / step), rest % step),
+    }
+  }
+
+// Each binder's size, with the product checked as it grows, so a wide domain is refused before any
+// arithmetic can overflow.
+fn sizes_within(binders: List<Ty>, decls: List<Decl>) -> Option<{ sizes: List<Int>, points: Int }> =
+  fold(
+    binders,
+    Some({ sizes: [], points: 1 }),
+    |acc: Option<{ sizes: List<Int>, points: Int }>, ty: Ty|
+      match acc {
+        None -> None,
+        Some(seen) -> match size(ty, decls) {
+          // A domain of no points is a vacuity, not a proof.
+          None -> None,
+          Some(0) -> None,
+          Some(n) -> {
+            let points = seen.points * n;
+            if points > bound() { None }
+            else { Some({ sizes: push(seen.sizes, n), points: points }) }
+          },
+        },
+      },
+  )
+
+// How many values inhabit a type, with the names whose variants are already being walked: a type
+// that mentions itself has no finite size even when it has a nullary case.
+fn sized(ty: Ty, decls: List<Decl>, open: List<String>) -> Option<Int> =
+  match ty {
+    Var(_) -> None,
+    Fn -> None,
+    Record(fields) -> product_of(map(fields, |f: { name: String, ty: Ty }| f.ty), decls, open),
+    Con(name, args) -> {
+      if name == "Unit" { Some(1) }
+      else if name == "Bool" { Some(2) }
+      // `Float` and `Decimal` are finite but far too large to enumerate, and a 64-bit width does not
+      // fit the arithmetic here.
+      else if is_unbounded(name) { None }
+      else if width_of(name) != 0 { Some(two_to(width_of(name))) }
+      else if contains_text(open, name) { None } else {
+        match find_decl(decls, name) {
+          None -> None,
+          Some(decl) -> sum_of_variants(decl, decls, push(open, name)),
+        }
+      }
+    },
+  }
+
+// A type whose values are too many to walk, or that is not finite at all.
+fn is_unbounded(name: String) -> Bool =
+  name == "Int" || name == "String" || name == "Bytes" || name == "List" || name == "Float"
+    || name == "Decimal"
+    || name == "Map"
+    || name == "I64"
+    || name == "U64"
+
+// The bit width of a fixed-width integer type, or 0 when the name is not one.
+fn width_of(name: String) -> Int =
+  if name == "U8" || name == "I8" { 8 }
+  else if name == "U16" || name == "I16" { 16 }
+  else if name == "U32" || name == "I32" { 32 }
+  else { 0 }
+
+fn two_to(bits: Int) -> Int = fold(range(0, bits), 1, |acc: Int, _i: Int| acc * 2)
+
+// Every case of one declared type, summed: a type with no variants has no values at all.
+fn sum_of_variants(decl: Decl, decls: List<Decl>, open: List<String>) -> Option<Int> =
+  fold(decl.variants, Some(0), |acc: Option<Int>, variant: Variant|
+    match acc {
+      None -> None,
+      Some(total) -> match product_of(variant.fields, decls, open) {
+        None -> None,
+        Some(n) -> {
+          let next = total + n;
+          if next > bound() { None } else { Some(next) }
+        },
+      },
+    })
+
+// A tuple's size is the product of its fields', refused as soon as it is past the bound.
+fn product_of(types: List<Ty>, decls: List<Decl>, open: List<String>) -> Option<Int> =
+  fold(types, Some(1), |acc: Option<Int>, ty: Ty|
+    match acc {
+      None -> None,
+      Some(total) -> match sized(ty, decls, open) {
+        None -> None,
+        Some(n) -> {
+          let next = total * n;
+          if next > bound() { None } else { Some(next) }
+        },
+      },
+    })
+
+fn find_decl(decls: List<Decl>, name: String) -> Option<Decl> =
+  fold(decls, None, |found: Option<Decl>, d: Decl|
+    match found { Some(_) -> found, None -> if d.name == name { Some(d) } else { None } })
+
+fn contains_text(xs: List<String>, x: String) -> Bool =
+  fold(xs, false, |found: Bool, y: String| found || y == x)
+
+// --- Tests ------------------------------------------------------------------
+//
+// The expectations are the runtime's own answers: the same shapes are asserted in
+// `crates/ply-prove-tests/tests/unit/domain.rs`, which is the reference until the runtime hands the
+// types over instead of deciding with them.
+
+fn kinds() -> List<Decl> =
+  [
+    {
+      name: "Kind",
+      variants: [
+        { name: "Asset", fields: [] },
+        { name: "Liability", fields: [] },
+        { name: "Equity", fields: [] },
+      ],
+    },
+  ]
+
+fn nat() -> List<Decl> =
+  [
+    {
+      name: "Nat",
+      variants: [{ name: "Zero", fields: [] }, { name: "Succ", fields: [Con("Nat", [])] }],
+    },
+  ]
+
+fn con(name: String) -> Ty = Con(name, [])
+
+fn appended<a>(head: List<a>, tail: List<a>) -> List<a> =
+  fold(tail, head, |acc: List<a>, x: a| push(acc, x))
+
+test "a nullary enum and Bool are finite and everything unbounded is not" {
+  let decls = kinds();
+  assert_eq(size(con("Bool"), decls), Some(2));
+  assert_eq(size(con("Unit"), decls), Some(1));
+  assert_eq(size(con("Kind"), decls), Some(3));
+  assert_eq(size(con("Int"), decls), None);
+  assert_eq(size(con("String"), decls), None);
+  assert_eq(size(con("Bytes"), decls), None);
+  assert_eq(size(con("Float"), decls), None);
+  assert_eq(size(con("List"), decls), None);
+  // A 64-bit width does not fit the arithmetic here, but a narrower one is a count like any other.
+  assert_eq(size(con("U64"), decls), None);
+  assert_eq(size(con("U8"), decls), Some(256));
+  assert_eq(size(con("I32"), decls), Some(4294967296))
+}
+
+test "a type variable and a function are never finite" {
+  assert_eq(size(Var(0), kinds()), None);
+  assert_eq(size(Fn, kinds()), None)
+}
+
+test "a recursive type is infinite even with a nullary base case" {
+  assert_eq(size(con("Nat"), nat()), None)
+}
+
+test "a record's size is the product of its fields'" {
+  let decls = kinds();
+  assert_eq(
+    size(Record([{ name: "k", ty: con("Kind") }, { name: "b", ty: con("Bool") }]), decls),
+    Some(6),
+  );
+  assert_eq(
+    size(Record([{ name: "k", ty: con("Kind") }, { name: "n", ty: con("Int") }]), decls),
+    None,
+  )
+}
+
+test "a case with fields multiplies them into its type's size" {
+  let declared = appended(kinds(), [
+    {
+      name: "Wrap",
+      variants: [
+        { name: "Nothing", fields: [] },
+        { name: "Held", fields: [Con("Kind", []), Con("Bool", [])] },
+      ],
+    },
+  ]);
+  assert_eq(size(con("Wrap"), declared), Some(7))
+}
+
+test "a product beyond the bound is refused rather than walked" {
+  let decls = kinds();
+  assert_eq(finite(map(range(0, 16), |_i: Int| con("Kind")), decls), None);
+  match finite(map(range(0, 4), |_i: Int| con("Kind")), decls) {
+    None -> assert_eq(false, true),
+    Some(domain) -> assert_eq(domain.points, 81),
+  }
+}
+
+test "a domain with a binder no value inhabits is a vacuity, not a proof" {
+  let declared = [{ name: "Empty", variants: [] }];
+  assert_eq(finite([con("Empty")], declared), None)
+}
+
+test "a ground claim has exactly one point" {
+  match finite([], kinds()) {
+    None -> assert_eq(false, true),
+    Some(domain) -> {
+      assert_eq(domain.points, 1);
+      assert_eq(point_indices(domain, 0), Some([]));
+    },
+  }
+}
+
+test "enumeration covers the domain once each in a fixed order" {
+  let decls = kinds();
+  match finite([con("Bool"), con("Kind")], decls) {
+    None -> assert_eq(false, true),
+    Some(domain) -> {
+      assert_eq(domain.points, 6);
+      assert_eq(point_indices(domain, 0), Some([0, 0]));
+      assert_eq(point_indices(domain, 3), Some([1, 0]));
+      assert_eq(point_indices(domain, 5), Some([1, 2]));
+      assert_eq(point_indices(domain, 6), None);
+      // Every point is named once: a repeated tuple would be a domain walked short.
+      let seen = map(range(0, domain.points), |i: Int| point_indices(domain, i));
+      let tuples = fold(seen, [], |acc: List<List<Int>>, t: Option<List<Int>>|
+        match t { Some(xs) -> push(acc, xs), None -> acc });
+      assert_eq(len(tuples), domain.points)
+    },
+  }
+}

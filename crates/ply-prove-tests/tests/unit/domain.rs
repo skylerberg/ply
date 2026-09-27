@@ -109,3 +109,27 @@ fn enumeration_covers_the_domain_once_each_in_a_fixed_order() {
     rendered.dedup();
     assert_eq!(rendered.len(), 6, "a point was visited twice");
 }
+
+/// The same shapes `crates/ply-prove/ply/domain.ply` asserts in Ply: a case with fields adds the
+/// product of them, a narrow width is a count like any other, and a binder no value inhabits is a
+/// vacuity rather than a proof. Two implementations of one rule agree by these numbers or they
+/// drift.
+#[test]
+fn the_numbers_the_packages_domain_module_pins_in_ply_are_these() {
+    let world = TypeWorld::new(&[
+        ctor("Kind", "Asset", 0, Vec::new()),
+        ctor("Kind", "Liability", 1, Vec::new()),
+        ctor("Kind", "Equity", 2, Vec::new()),
+        ctor("Wrap", "Nothing", 0, Vec::new()),
+        ctor("Wrap", "Held", 1, vec![con("Kind"), con("Bool")]),
+    ]);
+    assert_eq!(cardinality(&con("Wrap"), &world), Some(7));
+    assert_eq!(cardinality(&con("U8"), &world), Some(256));
+    assert_eq!(cardinality(&con("I32"), &world), Some(1 << 32));
+    assert_eq!(cardinality(&con("U64"), &world), None);
+
+    // A declared type with no variants has no values, so it is not a domain.
+    let empty = TypeWorld::new(&[]);
+    assert_eq!(cardinality(&con("Empty"), &empty), None);
+    assert!(finite(&[binder("e", con("Empty"))], &empty).is_none());
+}
