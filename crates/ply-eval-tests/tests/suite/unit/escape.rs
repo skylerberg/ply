@@ -126,8 +126,8 @@ fn the_diagnostic_names_the_boundary_the_handle_and_the_route_and_no_value() {
         args: Arc::new(vec![cell()]),
     };
     let boundary = Boundary::HostArgument {
-        operation: "db.query[users]",
-        path: "ply_host::db",
+        operation: "net.recv[conn]",
+        path: "ply_host::tcp",
         position: 1,
     };
     let d = check(&boundary, &value, Span::DUMMY).expect_err("it is refused");
@@ -137,7 +137,7 @@ fn the_diagnostic_names_the_boundary_the_handle_and_the_route_and_no_value() {
     assert!(d.message.contains("`Cell`"), "{}", d.message);
     assert!(d.message.contains("`m.Just`'s argument 1"), "{}", d.message);
     assert!(
-        d.notes.iter().any(|n| n.contains("ply_host::db")),
+        d.notes.iter().any(|n| n.contains("ply_host::tcp")),
         "the handler is named: {:#?}",
         d.notes
     );

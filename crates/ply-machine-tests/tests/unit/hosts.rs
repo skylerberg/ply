@@ -3,7 +3,6 @@ use ply_codegen::c::producer;
 use ply_eval::host::{HostListing, HostRegistry, HostResource, Linearity};
 use ply_host::tls;
 use ply_machine::config::Configuration;
-use ply_machine::db::DbConfig;
 use ply_machine::hosts::*;
 use ply_span::{SourceId, Symbol};
 use ply_ty::CheckOutput;
@@ -209,7 +208,6 @@ fn the_digest_moves_when_a_flag_alone_moves() {
 fn no_shipped_registration_declares_that_it_may_receive_a_credential() {
     let claiming: Vec<&str> = ply_machine::hosts::registry()
         .ops()
-        .chain(ply_host::registry_with_database().ops())
         .filter(|op| op.secrets)
         .map(|op| op.path)
         .collect();
@@ -264,10 +262,8 @@ fn hermetic_is_the_default_and_reaches_nothing() {
         false,
         &ply_machine::options::TlsOptions::default(),
         &[],
-        None,
         Configuration::default(),
         &ply_machine::trace::TraceOptions::silent(),
-        None,
     )
     .unwrap();
     assert!(hosts.is_hermetic());
@@ -308,10 +304,8 @@ fn a_host_backed_test_leaves_the_trivially_parallel_count() {
         false,
         &ply_machine::options::TlsOptions::default(),
         &[],
-        None,
         Configuration::default(),
         &ply_machine::trace::TraceOptions::silent(),
-        None,
     )
     .unwrap();
     let counts = Counts::of(
@@ -323,133 +317,6 @@ fn a_host_backed_test_leaves_the_trivially_parallel_count() {
     assert_eq!(counts.shared, 1);
 }
 
-/// `db.*` resolve to the postgres driver's paths, which is how a listing row is recognised as one.
-fn postgres(op_name: &'static str, path: &'static str) -> HostRegistry {
-    registry(vec![op(
-        "db",
-        op_name,
-        HostResource::Any,
-        Linearity::AtMostOnce,
-        true,
-        path,
-    )])
-}
-
-fn configured(schema: Option<&str>) -> DbConfig {
-    ply_machine::db::DbOptions {
-        url: Some("postgres://ply:hunter2@127.0.0.1:5433/desk".to_string()),
-        schema: schema.map(str::to_string),
-        ..ply_machine::db::DbOptions::default()
-    }
-    .resolve_with(true, &|_| None)
-    .expect("the fixture URL parses")
-    .expect("--host and a URL yield a configuration")
-}
-
-#[test]
-fn reaching_postgres_with_no_database_configured_is_refused_before_anything_runs() {
-    let program = check(DB);
-    let Err(diagnostics) =
-        Hosts::bind_with(postgres("get", "ply_host::db::query"), &program, true, None)
-    else {
-        panic!("a bound driver with no database must be E0431");
-    };
-    assert_eq!(diagnostics[0].code, ply_span::codes::DB_NOT_CONFIGURED);
-    assert!(
-        diagnostics[0]
-            .notes
-            .iter()
-            .any(|n| n.contains("db.get[orders]")),
-        "the reader is not told which operations bound: {:?}",
-        diagnostics[0].notes
-    );
-}
-
-/// The check keys on the binding: an HTTP-only program under `--host` binds no postgres handler.
-#[test]
-fn a_program_that_reaches_no_database_needs_none_and_discloses_none() {
-    let program = check(DB);
-    let hosts = Hosts::bind(full(), &program, true).expect("net and clock bind without a URL");
-    assert!(hosts.database().is_none());
-    assert!(!hosts.is_live_database());
-    assert!(hosts.disclosures().is_empty());
-    assert_eq!(
-        digest_short(hosts.listing(), &hosts.disclosures()),
-        hosts.listing().digest_short(),
-        "a program with no database in reach must hash what it hashed before W4"
-    );
-}
-
-#[test]
-fn a_configured_run_says_it_reached_a_real_database_and_never_says_the_password() {
-    let program = check(DB);
-    let hosts = Hosts::bind_with(
-        postgres("get", "ply_host::db::query"),
-        &program,
-        true,
-        Some(configured(None)),
-    )
-    .expect("a bound driver with a database binds");
-    assert!(hosts.is_live_database());
-
-    let line = database_line(&hosts).expect("a live database is reported");
-    assert!(
-        line.contains("postgres://ply:****@127.0.0.1:5433/desk"),
-        "{line}"
-    );
-    assert!(line.contains("configured by --db"), "{line}");
-    assert!(!line.contains("hunter2"), "{line}");
-
-    let summary = serde_json::to_string(&hosts.summary_json()).unwrap();
-    assert!(
-        summary.contains("\"connections\":8"),
-        "the pool is not disclosed: {summary}"
-    );
-    assert!(
-        !summary.contains("hunter2"),
-        "the `--json` object carried the password"
-    );
-}
-
-/// `db.rollback` is handled in Ply inside `transaction`, so a bound one would abort nothing and commit what was meant to be discarded.
-#[test]
-fn a_bound_rollback_is_refused_as_a_defect_rather_than_listed() {
-    let program = check(
-        "nondet effect db {\n  write rollback[r](reason: Int) -> Int\n}\n\
-         fn f() -> Int / {db.write[orders]} = db.rollback[orders](1)\n",
-    );
-    let Err(diagnostics) = Hosts::bind_with(
-        postgres("rollback", "ply_host::db::abort"),
-        &program,
-        true,
-        Some(configured(None)),
-    ) else {
-        panic!("a bound rollback must be refused as a defect");
-    };
-    assert_eq!(diagnostics[0].code, ply_span::codes::INTERNAL_ERROR);
-    assert!(diagnostics[0].message.contains("db.rollback"));
-}
-
-#[test]
-fn a_db_schema_naming_nothing_is_refused_with_what_the_program_does_have() {
-    let program = check(DB);
-    let Err(diagnostics) = Hosts::bind_with(
-        postgres("get", "ply_host::db::query"),
-        &program,
-        true,
-        Some(configured(Some("desk.schema"))),
-    ) else {
-        panic!("a schema function that does not exist must be refused");
-    };
-    assert_eq!(diagnostics[0].code, ply_span::codes::DB_NOT_CONFIGURED);
-    assert!(
-        diagnostics[0].notes.iter().any(|n| n.contains("E0433")),
-        "the reader is not told what dropping the flag costs: {:?}",
-        diagnostics[0].notes
-    );
-}
-
-/// `net.listen_tls` resolves to the real TLS handler, so the listing carries the row `Transport::of` keys on.
 fn transport_only(transport: Transport) -> Disclosures {
     Disclosures {
         transport: Some(transport),

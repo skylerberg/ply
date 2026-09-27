@@ -1,6 +1,5 @@
 //! The trusted computing base, as one list.
 
-use crate::db::{self, Postgres};
 use crate::signal::{self, Accepting, Shutdown};
 use crate::{certgen, config, fs, process, random, sched, tcp, time, trace};
 use ply_eval::Value;
@@ -8,14 +7,13 @@ use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownRepo
 use ply_span::{Diagnostic, Span, codes};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// How long a park waits on the socket pool while the database also holds a token.
 const ALTERNATE: Duration = Duration::from_micros(250);
 
 pub struct Host {
     net: Arc<tcp::TcpHost>,
-    db: Option<Arc<Postgres>>,
     /// The run's configuration, read once before this `Host` existed and immutable thereafter.
     config: Arc<config::Snapshot>,
     trace: Arc<trace::Trace>,
@@ -43,7 +41,6 @@ impl Host {
     pub fn with_credentials(credentials: crate::tls::Credentials) -> Host {
         Host {
             net: Arc::new(tcp::TcpHost::with_credentials(credentials)),
-            db: None,
             config: Arc::new(config::Snapshot::unopened()),
             trace: Arc::new(trace::Trace::default()),
             shutdown: None,
@@ -91,26 +88,6 @@ impl Host {
         &self.config
     }
 
-    pub fn with_database(
-        credentials: crate::tls::Credentials,
-        config: db::PoolConfig,
-    ) -> Result<Host, Diagnostic> {
-        Ok(Host {
-            net: Arc::new(tcp::TcpHost::with_credentials(credentials)),
-            db: Some(Arc::new(Postgres::start(config)?)),
-            config: Arc::new(crate::config::Snapshot::unopened()),
-            trace: Arc::new(trace::Trace::default()),
-            shutdown: None,
-            fs: Arc::new(fs::FsHost::new(fs::Roots::new())),
-            process: None,
-            time: Arc::new(time::TimeHost::new()),
-        })
-    }
-
-    pub fn database(&self) -> Option<&Arc<Postgres>> {
-        self.db.as_ref()
-    }
-
     pub fn handshakes(&self) -> crate::tls::HandshakeCounts {
         self.net.handshakes()
     }
@@ -128,9 +105,6 @@ impl Host {
             registry.register(op, handler);
         }
         random::register(&mut registry);
-        if let Some(driver) = &self.db {
-            db::register(&mut registry, Arc::clone(driver) as Arc<dyn db::Driver>);
-        }
         // Registered whatever `--fs` said, so a run that bound no root gets `E0451`, not `E0424`.
         fs::register(&mut registry, Arc::clone(&self.fs));
         time::register(&mut registry, Arc::clone(&self.time));
@@ -144,7 +118,6 @@ impl Host {
     pub fn runtime(&self) -> Rc<dyn HostRuntime> {
         Rc::new(Facilities {
             net: Arc::clone(&self.net),
-            db: self.db.clone(),
             fs: Arc::clone(&self.fs),
             process: self.process.clone(),
             trace: Arc::clone(&self.trace),
@@ -162,9 +135,6 @@ impl Host {
 
     pub fn stopping_on(self, shutdown: Arc<Shutdown>) -> Host {
         shutdown.attach_net(Arc::clone(&self.net) as Arc<dyn signal::Accepting>);
-        if let Some(db) = &self.db {
-            shutdown.attach_db(Arc::clone(db) as Arc<dyn signal::Transactions>);
-        }
         Host {
             shutdown: Some(shutdown),
             ..self
@@ -178,11 +148,11 @@ impl Host {
 
 /// The listing a hermetic run retains.
 pub fn registry() -> HostRegistry {
-    registry_over(Arc::new(trace::Trace::default()), false)
+    registry_over(Arc::new(trace::Trace::default()))
 }
 
-pub fn registry_over(trace: Arc<trace::Trace>, database: bool) -> HostRegistry {
-    let mut registry = Host::new()
+pub fn registry_over(trace: Arc<trace::Trace>) -> HostRegistry {
+    Host::new()
         .traced(trace)
         .stopping_on(Shutdown::new(signal::Bounds::default()))
         .with_process(process::ProcessHost::new(
@@ -191,22 +161,12 @@ pub fn registry_over(trace: Arc<trace::Trace>, database: bool) -> HostRegistry {
                 out: process::Stream::Out,
             },
         ))
-        .registry();
-    if database {
-        db::register(&mut registry, Arc::new(db::postgres::NotConfigured));
-    }
-    registry
-}
-
-/// The hermetic listing plus the `db` operations, served by an implementation that refuses.
-pub fn registry_with_database() -> HostRegistry {
-    registry_over(Arc::new(trace::Trace::default()), true)
+        .registry()
 }
 
 /// The runtime, routing each token to the facility that minted it.
 struct Facilities {
     net: Arc<tcp::TcpHost>,
-    db: Option<Arc<Postgres>>,
     fs: Arc<fs::FsHost>,
     process: Option<Arc<process::ProcessHost>>,
     trace: Arc<trace::Trace>,
@@ -217,11 +177,6 @@ impl HostRuntime for Facilities {
     fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
         if self.net.owns(pending) {
             return self.net.poll(pending);
-        }
-        if let Some(db) = &self.db
-            && db.owns(pending)
-        {
-            return db.poll(pending);
         }
         if self.fs.owns(pending) {
             return self.fs.poll(pending);
@@ -241,12 +196,6 @@ impl HostRuntime for Facilities {
             if self.net.outstanding() > 0 {
                 return self.net.park_until(bound);
             }
-            if let Some(db) = &self.db
-                && db.reactor().outstanding() > 0
-            {
-                db.reactor().park_timeout(bound)?;
-                return Ok(());
-            }
             if self.fs.outstanding() > 0 {
                 return self.fs.park_until(bound);
             }
@@ -262,29 +211,16 @@ impl HostRuntime for Facilities {
         }
         // Separate condition variables cannot be waited on together, so a park blocks on one only
         // when no other facility has work.
-        let database_waiting = self
-            .db
-            .as_ref()
-            .is_some_and(|db| db.reactor().outstanding() > 0);
         let filesystem_waiting = self.fs.outstanding() > 0;
         let spawn_waiting = self
             .process
             .as_ref()
             .is_some_and(|process| process.outstanding() > 0);
         if self.net.outstanding() > 0 {
-            if database_waiting || filesystem_waiting || spawn_waiting {
+            if filesystem_waiting || spawn_waiting {
                 return self.net.park_until(ALTERNATE);
             }
             return self.net.park();
-        }
-        if let Some(db) = &self.db
-            && database_waiting
-        {
-            if filesystem_waiting || spawn_waiting {
-                db.reactor().park_timeout(ALTERNATE)?;
-                return Ok(());
-            }
-            return db.reactor().park();
         }
         if filesystem_waiting {
             if spawn_waiting {
@@ -312,33 +248,20 @@ impl HostRuntime for Facilities {
         Some(err_drain_incomplete(
             shutdown,
             self.net.connections_in_flight(),
-            self.db.as_ref().map_or(0, |db| db.open_scopes()),
         ))
     }
 
     /// The process-level teardown, in a pinned order.
-    fn shutdown(&self, drain_ms: u64) -> ShutdownReport {
+    /// The run's own teardown: the drain deadline governs scheduling and the socket pool, so
+    /// nothing here waits on it.
+    fn shutdown(&self, _drain_ms: u64) -> ShutdownReport {
         let mut report = ShutdownReport {
             spans_abandoned: self.trace.open_spans(),
             ..ShutdownReport::default()
         };
-        let until = Instant::now() + Duration::from_millis(drain_ms);
-        // Every open scope is rolled back, and none committed.
-        if let Some(db) = &self.db {
-            fold(
-                &mut report,
-                db.roll_back_open_scopes(until.saturating_duration_since(Instant::now())),
-            );
-        }
-        // The sink flushes before the pool is gone.
+        // The sink flushes before the run's own state is gone.
         self.trace.flush();
         report.records_flushed = Some(self.trace.counts().events as usize);
-        if let Some(db) = &self.db {
-            fold(
-                &mut report,
-                db.close_pool(until.saturating_duration_since(Instant::now())),
-            );
-        }
         report
     }
 
@@ -347,11 +270,6 @@ impl HostRuntime for Facilities {
         let Some(_) = &self.shutdown else {
             if self.net.owns(&pending) {
                 return self.net.block_on(pending);
-            }
-            if let Some(db) = &self.db
-                && db.owns(&pending)
-            {
-                return db.block_on(pending);
             }
             if self.fs.owns(&pending) {
                 return self.fs.block_on(pending);
@@ -369,13 +287,6 @@ impl HostRuntime for Facilities {
                     return Ok(value);
                 }
                 self.net.park_until(signal::DRAIN_POLL)?;
-            } else if let Some(db) = &self.db
-                && db.owns(&pending)
-            {
-                if let Some(value) = db.poll(&pending)? {
-                    return Ok(value);
-                }
-                db.reactor().park_timeout(signal::DRAIN_POLL)?;
             } else if self.fs.owns(&pending) {
                 if let Some(value) = self.fs.poll(&pending)? {
                     return Ok(value);
@@ -395,70 +306,24 @@ impl HostRuntime for Facilities {
         }
     }
 
-    /// Rolls back the scopes this entry point left open, then closes the spans it left open.
+    /// Closes the spans this entry point left open.
     fn end_entry_point(&self, machine: MachineId) -> Result<(), Diagnostic> {
-        let database = self.close_database(machine);
-        let spans = self.trace.end_entry_point(machine);
-        // Only one diagnostic reaches the machine, so a second travels as a note on the first.
-        match (database, spans) {
-            (Ok(()), None) => Ok(()),
-            (Ok(()), Some(spans)) => Err(spans),
-            (Err(database), None) => Err(database),
-            (Err(database), Some(spans)) => Err(database.note(format!(
-                "and, at the same teardown, `{}`: {}",
-                spans.code, spans.message
-            ))),
-        }
-    }
-}
-
-impl Facilities {
-    fn close_database(&self, machine: MachineId) -> Result<(), Diagnostic> {
-        let Some(db) = &self.db else {
-            return Ok(());
-        };
-        let report = db.end_entry_point(machine)?;
-        match report.describe() {
+        match self.trace.end_entry_point(machine) {
             None => Ok(()),
-            Some(why) => Err(Diagnostic::warning(
-                codes::HOST_TEARDOWN,
-                format!("the database driver could not hand every connection back: {why}"),
-            )
-            .note("the entry point's verdict is unchanged: this is the run's own state rather than the program's")
-            .note("the pool refills, and a connection it closed rather than returned is one that could not be rolled back")),
+            Some(spans) => Err(spans),
         }
-    }
-}
-
-fn fold(report: &mut ShutdownReport, step: Result<db::pool::DrainReport, Diagnostic>) {
-    match step {
-        Ok(drained) => {
-            report.transactions_rolled_back += drained.rolled_back;
-            report
-                .connections_closed
-                .extend(drained.discarded.iter().map(|d| d.reason.clone()));
-            if let Some(why) = drained.describe() {
-                report.problems.push(format!(
-                    "the database driver could not hand every connection back: {why}"
-                ));
-            }
-        }
-        Err(d) => report.problems.push(d.message),
     }
 }
 
 #[cold]
 #[inline(never)]
-fn err_drain_incomplete(shutdown: &Shutdown, connections: usize, scopes: usize) -> Diagnostic {
+fn err_drain_incomplete(shutdown: &Shutdown, connections: usize) -> Diagnostic {
     let bounds = shutdown.bounds();
     let elapsed = shutdown.elapsed().unwrap_or_default();
     Diagnostic::warning(codes::DRAIN_INCOMPLETE, "the drain deadline expired")
         .primary(Span::DUMMY, "this run stopped scheduling here")
         .note(format!(
             "{connections} connection(s) abandoned with no response written"
-        ))
-        .note(format!(
-            "{scopes} transaction(s) still open; every one of them is rolled back at teardown and none is committed"
         ))
         .note(format!(
             "the drain was {}ms and {}ms elapsed since the signal",

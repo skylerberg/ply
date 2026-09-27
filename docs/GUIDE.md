@@ -1244,9 +1244,7 @@ Transaction control is on the singleton resource, so transactions conflict.
 reaches the caller's row through `e`, so a handler around a transaction names
 it too. SQL errors are values; `is_retryable(e)`
 covers serialization failures. `MemDb` is an in-memory twin (`open`, `step`,
-`begin_step`, `commit_step`, `abort_step`). Statement text the driver cannot
-account for is `E0432`.
-
+`begin_step`, `commit_step`, `abort_step`). 
 The driver that runs in Ply reads a statement before it sends it. A statement
 that writes, performed as `db.query`, is refused because the endpoints that
 perform it would be scheduled as if they only read, and text the reader cannot
@@ -1260,9 +1258,9 @@ tables the label never named. The reader is the language's `std.db`, and the
 labels it checks against are the ones the clauses bind (`db.query[*table]`),
 which is why a driver can be written in Ply at all.
 
-Each refusal is raised, so a program cannot ignore it; they carry the
-runtime-error code rather than `E0432`, `E0433` or `E0434`, because a library
-has no raise of its own to name a code with.
+Each refusal is raised, so a program cannot ignore it; it carries the
+runtime-error code, because a library has no raise of its own to name a code
+with.
 
 A `db` effect is served by `serve`: `with_server(url, size, body)` reads a
 connection string (`server_of`), draws a nonce, and answers the six operations
@@ -1710,14 +1708,6 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse |
 | `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` label may start (`ply run` only); `E0457` if it cannot be executed |
-| `--db URL` | database (else `PLY_DB_URL`; password from `PLY_DB_PASSWORD`); `E0431` if absent when used |
-| `--db-pool N` | pool size |
-| `--db-acquire-ms MS` | wait for a connection before `E0437` |
-| `--db-connect-ms MS` | connection timeout |
-| `--db-statement-ms MS` | server `statement_timeout` |
-| `--db-idle-txn-ms MS` | server `idle_in_transaction_session_timeout` |
-| `--db-statement-cache N` | prepared statements per connection |
-| `--db-schema MODULE.FN` | a nullary function returning a `db::Schema`, evaluated at start-up (not compared with the server) |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
 | `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
@@ -1726,8 +1716,9 @@ two for one atom `E0422`, and a determinism mismatch `E0423`.
 | `--drain-lead-ms MS` | after `SIGINT`/`SIGTERM`, keep accepting this long (default 0) |
 | `--drain-ms MS` | then let in-flight requests finish (default 30000); expiry is `W0608`, exit 3 |
 
-An unreadable configuration source is `E0440`. A statement the server rejects is
-`E0433`; one touching a table outside the entry point's footprint is `E0434`.
+An unreadable configuration source is `E0440`. A statement the server rejects
+and one that touches a table outside what the call site labelled are refusals
+from `std.db`, which reads and runs its own statements.
 
 ## 15. Building and shipping
 
@@ -1757,7 +1748,7 @@ leaves it unchanged; a failure raised by a run of it carries no line number. A
 body or closure that fails verification is `E0443`, as is a build whose closure
 holds two identical declarations it cannot tell apart (two effects, or two
 members of one recursive group); an artifact from another version is `E0444`.
-`--config-schema` and `--db-schema` ship those functions too.
+`--config-schema` ships that function too.
 
 ## 16. The `ply` command
 
@@ -1787,7 +1778,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
-| `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--db-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
+| `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | `--show [MODULE]`, `--digest`; no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
@@ -1965,9 +1956,6 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0429` | `net.listen_tls` named a credential the run lacks |
 | `E0430` | `--tls` credential that does not load |
 | `E0431` | no database configured |
-| `E0432` | statement text the driver refuses |
-| `E0433` | server refused to prepare a statement |
-| `E0434` | statement touches a table outside the footprint |
 | `E0435` | live database differs from the schema (reserved) |
 | `E0436` | database operation from a task not owning the transaction |
 | `E0437` | connection pool exhausted |
