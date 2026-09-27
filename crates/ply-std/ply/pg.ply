@@ -6,6 +6,7 @@
 // and a column is the text it printed, which is what makes this layer only about framing.
 
 import std.bytes (u16_be, u32_be, i32_be, u16_be_at, u32_be_at, i32_be_at, slice_at)
+import std.net (net, send_all)
 
 // --- Kinds --------------------------------------------------------------------
 
@@ -210,28 +211,32 @@ pub fn close(statement: Bool, name: String) -> Bytes =
 
 pub fn terminate() -> Bytes = frontend(Terminate, b"")
 
-// What a connection reads: whole frames out of the buffer, the remainder left for the next
-// read. A frame whose length is not yet present, or whose length is not a length, is left as
-// `rest` rather than refused — a read that returns short is not a protocol error.
-pub fn read(buf: Bytes) -> Frames = read_from(buf, 0, [])
+// The first whole frame in `buf`, and the bytes after it. `None` leaves the buffer untouched:
+// a length that is not yet present, or is not a length, is a read that returned short rather
+// than a protocol error.
+pub type Partial = { frame: Option<Message>, rest: Bytes }
 
-fn read_from(buf: Bytes, at: Int, acc: List<Message>) -> Frames = {
+pub fn first(buf: Bytes) -> Partial = {
   let n = bytes_len(buf);
-  if at + 5 > n { { done: acc, rest: bytes_slice(buf, at, n) } } else {
-    match u32_be_at(buf, at + 1) {
-      None -> { done: acc, rest: bytes_slice(buf, at, n) },
-      Some(len) -> if len < 4 || at + 1 + len > n { { done: acc, rest: bytes_slice(buf, at, n) } } else {
-        read_from(
-          buf,
-          at + 1 + len,
-          push(acc, {
-            kind: backend_of(bytes_at(buf, at)),
-            body: bytes_slice(buf, at + 5, at + 1 + len),
-          }),
-        )
+  if n < 5 { { frame: None, rest: buf } } else {
+    match u32_be_at(buf, 1) {
+      None -> { frame: None, rest: buf },
+      Some(len) -> if len < 4 || 1 + len > n { { frame: None, rest: buf } } else {
+        {
+          frame: Some({ kind: backend_of(bytes_at(buf, 0)), body: bytes_slice(buf, 5, 1 + len) }),
+          rest: bytes_slice(buf, 1 + len, n),
+        }
       },
     }
   }
+}
+
+// Every whole frame in `buf`, and the bytes that are not yet one.
+pub fn read(buf: Bytes) -> Frames = read_all(buf, [])
+
+fn read_all(buf: Bytes, acc: List<Message>) -> Frames = {
+  let p = first(buf);
+  match p.frame { None -> { done: acc, rest: p.rest }, Some(m) -> read_all(p.rest, push(acc, m)) }
 }
 
 // --- Reading a body -----------------------------------------------------------
@@ -389,6 +394,260 @@ fn fields_of(b: Bytes, at: Int, acc: List<Field>) -> List<Field> =
 pub fn field_of(m: Message, code: Int) -> Option<String> =
   fold(diagnostic_fields(m), None, |acc: Option<String>, f: Field|
     if f.code == code { Some(f.text) } else { acc })
+
+// --- A connection ---------------------------------------------------------------
+
+pub type Client = { connect_ms: Int, read_ms: Int, write_ms: Int }
+
+pub fn default_client() -> Client = { connect_ms: 5000, read_ms: 30000, write_ms: 30000 }
+
+pub fn read_size() -> Int = 65536
+
+// What the server said when it refused: the SQLSTATE is what a program branches on, and the
+// severity and message are what it prints.
+pub type Server = { severity: String, code: String, message: String }
+
+// A connection with a server, the bytes read from it that are not yet a whole frame, and the
+// parameters it set at start-up.
+pub type Session = { conn: Int, buffer: Bytes, user: String, database: String, settings: List<Set> }
+
+pub type ClientError =
+  | Unreachable
+  | NotSent
+  | TimedOut
+  | Closed
+  // The server refused before it would talk, so there is no connection left to use.
+  | Refused(Server)
+  // A statement was refused. The connection is still usable — the server is waiting for the
+  // next one — so the session comes back with the refusal for the caller to decide about.
+  | Rejected(Session, Server)
+  | Unexpected(String)
+
+// How a refusal reads: the severity, the message, and the SQLSTATE a program branches on.
+pub fn server_text(s: Server) -> String = s.severity ++ ": " ++ s.message ++ " (" ++ s.code ++ ")"
+
+pub fn client_error_text(e: ClientError) -> String =
+  match e {
+    Unreachable -> "the server could not be reached",
+    NotSent -> "a message could not be sent",
+    TimedOut -> "the server did not answer in time",
+    Closed -> "the server closed the connection",
+    Refused(s) -> server_text(s),
+    Rejected(_, s) -> server_text(s),
+    Unexpected(what) -> what,
+  }
+
+pub fn setting(s: Session, name: String) -> Option<String> =
+  fold(s.settings, None, |acc: Option<String>, set: Set|
+    if set.name == name { Some(set.value) } else { acc })
+
+// A message read, and the buffer after it.
+type Got = { message: Message, rest: Bytes }
+
+fn read_message<[l]>(
+  c: Int,
+  buf: Bytes,
+  timeout_ms: Int,
+) -> Result<Got, ClientError> / {net.recv[l]} = {
+  let p = first(buf);
+  match p.frame {
+    Some(m) -> Ok({ message: m, rest: p.rest }),
+    None -> match net.recv[l](c, read_size(), timeout_ms) {
+      None -> Err(TimedOut),
+      Some(bytes) -> if bytes_len(bytes) == 0 { Err(Closed) }
+      else { read_message[l](c, bytes_concat(buf, bytes), timeout_ms) },
+    },
+  }
+}
+
+fn server_of(m: Message) -> Server =
+  { severity: field_or(m, 83, "ERROR"), code: field_or(m, 67, ""), message: field_or(m, 77, "") }
+
+fn field_or(m: Message, code: Int, fallback: String) -> String =
+  match field_of(m, code) { Some(text) -> text, None -> fallback }
+
+// Open a socket and get to where the server will answer a query: start-up, whatever
+// authentication it asks for, its parameters, and `ReadyForQuery`.
+pub fn connect<[l]>(
+  host: String,
+  port: Int,
+  user: String,
+  database: String,
+  password: Option<String>,
+  client: Client,
+) -> Result<Session, ClientError> / {net.connect[l], net.send[l], net.recv[l], net.close[l]} =
+  match net.connect[l](host, port, client.connect_ms) {
+    None -> Err(Unreachable),
+    Some(conn) -> {
+      let opening: Session = {
+        conn: conn,
+        buffer: b"",
+        user: user,
+        database: database,
+        settings: [],
+      };
+      if !send_all[l](conn, startup(user, database), client.write_ms) {
+        net.close[l](conn);
+        Err(NotSent)
+      } else {
+        match greet[l](opening, password, client, []) {
+          Ok(s) -> Ok(s),
+          Err(e) -> {
+            net.close[l](conn);
+            Err(e)
+          },
+        }
+      }
+    },
+  }
+
+fn greet<[l]>(
+  s: Session,
+  password: Option<String>,
+  client: Client,
+  settings: List<Set>,
+) -> Result<Session, ClientError> / {net.send[l], net.recv[l]} =
+  match read_message[l](s.conn, s.buffer, client.read_ms) {
+    Err(e) -> Err(e),
+    Ok(got) -> {
+      let m = got.message;
+      let rest: Session = { ..s, buffer: got.rest };
+      match m.kind {
+        Authentication -> match auth_code(m) {
+          None -> Err(Unexpected("an authentication message with no code")),
+          Some(0) -> greet[l](rest, password, client, settings),
+          Some(3) -> match password {
+            None -> Err(Refused(no_password(s.user, "a clear-text password"))),
+            Some(text) -> if !send_all[l](rest.conn, password_message(text), client.write_ms) {
+              Err(NotSent)
+            } else { greet[l](rest, password, client, settings) },
+          },
+          Some(other) ->
+            Err(
+              Unexpected(
+                "the server asks for " ++ auth_name(other)
+                  ++ ", which this client does not answer yet",
+              ),
+            ),
+        },
+        ParameterStatus -> match parameter_status(m) {
+          Some(set) -> greet[l](rest, password, client, push(settings, set)),
+          None -> greet[l](rest, password, client, settings),
+        },
+        BackendKeyData -> greet[l](rest, password, client, settings),
+        NoticeResponse -> greet[l](rest, password, client, settings),
+        ErrorResponse -> Err(Refused(server_of(m))),
+        ReadyForQuery -> Ok({ ..rest, settings: settings }),
+        _ -> Err(Unexpected("a " ++ backend_name(m.kind) ++ " before the server was ready")),
+      }
+    },
+  }
+
+fn no_password(user: String, what: String) -> Server =
+  {
+    severity: "ERROR",
+    code: "",
+    message: "the server wants " ++ what ++ " for `" ++ user ++ "`, and none was given",
+  }
+
+// `PasswordMessage`, which is also the frame a SASL step travels in.
+pub fn password_message(text: String) -> Bytes =
+  bytes_concat(byte_of_int(112), counted(cstring(text)))
+
+// --- Queries --------------------------------------------------------------------
+
+pub type Answer = { columns: List<Column>, rows: List<List<Option<Bytes>>>, tag: String }
+
+pub type Reply = { session: Session, answer: Answer }
+
+// The simple query protocol: one statement, no parameters.
+pub fn simple_query<[l]>(
+  s: Session,
+  sql: String,
+  client: Client,
+) -> Result<Reply, ClientError> / {net.send[l], net.recv[l]} =
+  if !send_all[l](s.conn, query(sql), client.write_ms) { Err(NotSent) }
+  else { gather[l](s, client, nothing()) }
+
+// The extended query protocol, every parameter and every result in text format, so a parameter
+// is the text the server would have printed. The statement and the portal are unnamed, which is
+// what makes this one exchange at a time.
+pub fn extended_query<[l]>(
+  s: Session,
+  sql: String,
+  params: List<Option<String>>,
+  client: Client,
+) -> Result<Reply, ClientError> / {net.send[l], net.recv[l]} =
+  if !send_all[l](
+      s.conn,
+      bytes_concat_all([
+        parse("", sql, []),
+        bind("", "", params),
+        describe(false, ""),
+        execute("", 0),
+        sync(),
+      ]),
+      client.write_ms,
+    ) { Err(NotSent) }
+  else { gather[l](s, client, nothing()) }
+
+type Reading = {
+  columns: List<Column>,
+  rows: List<List<Option<Bytes>>>,
+  tag: String,
+  refused: Option<Server>,
+}
+
+fn nothing() -> Reading = { columns: [], rows: [], tag: "", refused: None }
+
+// Everything a query answers, up to the `ReadyForQuery` that ends it. A refusal is carried to
+// that point rather than raised where it arrives, so the connection is left usable.
+fn gather<[l]>(
+  s: Session,
+  client: Client,
+  acc: Reading,
+) -> Result<Reply, ClientError> / {net.recv[l]} =
+  match read_message[l](s.conn, s.buffer, client.read_ms) {
+    Err(e) -> Err(e),
+    Ok(got) -> {
+      let m = got.message;
+      let rest: Session = { ..s, buffer: got.rest };
+      match m.kind {
+        RowDescription ->
+          gather[l](rest, client, {
+            ..acc,
+            columns: match row_description(m) { Some(c) -> c, None -> acc.columns },
+          }),
+        DataRow ->
+          gather[l](rest, client, {
+            ..acc,
+            rows: appended(acc.rows, [match data_row(m) { Some(r) -> r, None -> [] }]),
+          }),
+        CommandComplete ->
+          gather[l](rest, client, {
+            ..acc,
+            tag: match command_tag(m) { Some(t) -> t, None -> acc.tag },
+          }),
+        ErrorResponse -> gather[l](rest, client, { ..acc, refused: Some(server_of(m)) }),
+        NoticeResponse -> gather[l](rest, client, acc),
+        ReadyForQuery -> match acc.refused {
+          Some(server) -> Err(Rejected(rest, server)),
+          None ->
+            Ok({ session: rest, answer: { columns: acc.columns, rows: acc.rows, tag: acc.tag } }),
+        },
+        _ -> gather[l](rest, client, acc),
+      }
+    },
+  }
+
+// The connection is done; the server expects nothing more.
+pub fn finish<[l]>(s: Session, client: Client) -> Unit / {net.send[l], net.close[l]} = {
+  send_all[l](s.conn, terminate(), client.write_ms);
+  net.close[l](s.conn)
+}
+
+fn appended<a>(xs: List<a>, ys: List<a>) -> List<a> =
+  fold(ys, xs, |acc: List<a>, x: a| push(acc, x))
 
 // --- Tests --------------------------------------------------------------------
 

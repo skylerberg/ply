@@ -1,0 +1,311 @@
+//! What `std.pg`'s client does with a connection, over a scripted server.
+//!
+//! `SimNet` hands the client the bytes a server would have sent and records what it sent back,
+//! so the framing, the handshake and both query cycles are decided without a socket.
+
+use ply_eval::{Machine, Value};
+use ply_host::tcp::{Net, SimNet};
+use ply_span::Span;
+use std::sync::Arc;
+
+/// The client, entered once. Trust authentication, because the script decides the handshake.
+const CLIENT: &str = r#"
+import std.net (net)
+import std.pg (connect, simple_query, extended_query, finish, default_client, Answer, ClientError, client_error_text, server_text, Rejected)
+
+pub fn ask(host: String, port: Int) -> Result<String, String>
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  match connect[link](host, port, "ply", "ply", None, default_client()) {
+    Err(e) -> Err(client_error_text(e)),
+    Ok(session) -> match simple_query[link](session, "select 1", default_client()) {
+      Err(e) -> Err(client_error_text(e)),
+      Ok(reply) -> {
+        finish[link](reply.session, default_client());
+        Ok(first_text(reply.answer))
+      },
+    },
+  }
+
+pub fn ask_with(host: String, port: Int, value: String) -> Result<String, String>
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  match connect[link](host, port, "ply", "ply", None, default_client()) {
+    Err(e) -> Err(client_error_text(e)),
+    Ok(session) -> match extended_query[link](session, "select $1", [Some(value)], default_client()) {
+      Err(e) -> Err(client_error_text(e)),
+      Ok(reply) -> {
+        finish[link](reply.session, default_client());
+        Ok(first_text(reply.answer))
+      },
+    },
+  }
+
+// A refusal is not the end of the connection: the second query runs on the session the first
+// one came back with.
+pub fn refuse_then_ask(host: String, port: Int) -> Result<String, String>
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  match connect[link](host, port, "ply", "ply", None, default_client()) {
+    Err(e) -> Err(client_error_text(e)),
+    Ok(session) -> match simple_query[link](session, "select nope", default_client()) {
+      Ok(_) -> Err("the server accepted what it should have refused"),
+      Err(Rejected(after, refusal)) ->
+        match simple_query[link](after, "select 1", default_client()) {
+          Err(e) -> Err(client_error_text(e)),
+          Ok(reply) -> {
+            finish[link](reply.session, default_client());
+            Ok(server_text(refusal) ++ " then " ++ first_text(reply.answer))
+          },
+        },
+      Err(e) -> Err(client_error_text(e)),
+    },
+  }
+
+fn first_text(answer: Answer) -> String =
+  match answer.rows {
+    [] -> "no rows",
+    [row, ..tail] -> match row {
+      [] -> "no columns",
+      [value, ..more] -> match value {
+        None -> "null",
+        Some(text) -> string_of_bytes(text),
+      },
+    },
+  }
+"#;
+
+fn tiered(service: &str) -> (ply_ty::Front, &'static ply_codegen::Unit) {
+    let answered =
+        ply_codegen::c::producer::checked_front_with_std(&[("m".to_string(), service.to_string())])
+            .unwrap_or_else(|e| panic!("they check: {e:#}"));
+    let front = answered.front;
+    let unit = ply_codegen::Unit::over_front(&front, answered.modules.into_iter().collect())
+        .expect("this host has a C compiler");
+    (front, unit)
+}
+
+struct Ran {
+    text: String,
+    sent: Vec<u8>,
+}
+
+fn ran(answered: Value, net: Arc<SimNet>) -> Result<Ran, String> {
+    let Value::Ctor { name, args } = &answered else {
+        panic!("the entry answered {answered}, not an `Ok` or an `Err`");
+    };
+    let Value::Str(text) = &args[0] else {
+        panic!("the entry carried {answered}, not text");
+    };
+    match name.as_str() {
+        "Ok" => Ok(Ran {
+            text: text.to_string(),
+            sent: net.sent(1),
+        }),
+        "Err" => Err(text.to_string()),
+        other => panic!("the entry answered `{other}`"),
+    }
+}
+
+/// Enter `entry` with the server's scripted half of the conversation, and answer what the
+/// client said and what the entry returned.
+fn run(entry: &str, args: Vec<Value>, script: Vec<Vec<u8>>) -> Result<Ran, String> {
+    let net = Arc::new(SimNet::new(vec![script]));
+    let (front, unit) = tiered(CLIENT);
+    let binding = ply_host::tcp::registry(Arc::clone(&net) as Arc<dyn Net>)
+        .bind(&front.check)
+        .expect("the declaration and the registration agree");
+
+    let mut machine = Machine::new(&front);
+    machine.set_compiled(ply_eval::Provider::attach(unit));
+    machine.set_host_binding(Arc::new(binding));
+    let simple = entry.rsplit('.').next().expect("an entry has a name");
+    if let Some(declared) = front
+        .check
+        .defs
+        .values()
+        .find(|d| d.simple_name.as_str() == simple)
+        .map(|d| d.footprint.clone())
+    {
+        machine.set_declared_footprint(declared);
+    }
+    let answered = machine
+        .call(entry, args, Span::DUMMY)
+        .unwrap_or_else(|e| panic!("the call answers: {e}"));
+    ran(answered, net)
+}
+
+/// One back-end frame: a kind byte, a length that counts itself, and a body.
+fn message(kind: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![kind];
+    out.extend_from_slice(&(body.len() as i32 + 4).to_be_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+/// A zero-terminated string, which is how the protocol spells a name.
+fn named(text: &str) -> Vec<u8> {
+    let mut out = text.as_bytes().to_vec();
+    out.push(0);
+    out
+}
+
+/// AuthenticationOk, the server's version, its key, and readiness.
+fn greeting() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(message(b'R', &0i32.to_be_bytes()));
+    out.extend(message(
+        b'S',
+        &[named("server_version"), named("16.0")].concat(),
+    ));
+    out.extend(message(
+        b'K',
+        &[7i32.to_be_bytes(), 9i32.to_be_bytes()].concat(),
+    ));
+    out.extend(message(b'Z', b"I"));
+    out
+}
+
+/// One text column named `?column?`, of type `int4`, whatever its value.
+fn one_column() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&1i16.to_be_bytes());
+    out.extend(named("?column?"));
+    out.extend_from_slice(&0i32.to_be_bytes());
+    out.extend_from_slice(&0i16.to_be_bytes());
+    out.extend_from_slice(&23i32.to_be_bytes());
+    out.extend_from_slice(&4i16.to_be_bytes());
+    out.extend_from_slice(&(-1i32).to_be_bytes());
+    out.extend_from_slice(&0i16.to_be_bytes());
+    out
+}
+
+/// A row of one text value.
+fn one_value(value: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&1i16.to_be_bytes());
+    out.extend_from_slice(&(value.len() as i32).to_be_bytes());
+    out.extend(value.as_bytes());
+    out
+}
+
+/// `select 1` answered the simple way: a description, one row, the tag, and readiness.
+fn select_one() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(message(b'T', &one_column()));
+    out.extend(message(b'D', &one_value("1")));
+    out.extend(message(b'C', &named("SELECT 1")));
+    out.extend(message(b'Z', b"I"));
+    out
+}
+
+/// The same answer through the extended cycle, whose only extra is the two completions.
+fn extended_one(value: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(message(b'1', b""));
+    out.extend(message(b'2', b""));
+    out.extend(message(b'T', &one_column()));
+    out.extend(message(b'D', &one_value(value)));
+    out.extend(message(b'C', &named("SELECT 1")));
+    out.extend(message(b'Z', b"I"));
+    out
+}
+
+/// A refusal, and the readiness that says the connection is still good.
+fn refused(code: &str, text: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.push(b'S');
+    body.extend(named("ERROR"));
+    body.push(b'C');
+    body.extend(named(code));
+    body.push(b'M');
+    body.extend(named(text));
+    body.push(0);
+    let mut out = message(b'E', &body);
+    out.extend(message(b'Z', b"I"));
+    out
+}
+
+fn sent_text(sent: &[u8]) -> String {
+    String::from_utf8_lossy(sent).to_string()
+}
+
+#[test]
+fn the_client_shakes_hands_and_runs_a_query_over_a_scripted_server() {
+    let outcome = run(
+        "m.ask",
+        vec![Value::str("127.0.0.1"), Value::Int(5432)],
+        vec![greeting(), select_one()],
+    )
+    .expect("the server refused nothing");
+    assert_eq!(outcome.text, "1");
+
+    // What the client sent: a start-up frame whose length counts itself and whose next word is
+    // protocol 3.0, then the query, then the terminate that ends the connection.
+    let sent = &outcome.sent;
+    assert!(sent.len() > 8, "the client sent {} bytes", sent.len());
+    let declared = u32::from_be_bytes([sent[0], sent[1], sent[2], sent[3]]) as usize;
+    assert_eq!(
+        u32::from_be_bytes([sent[4], sent[5], sent[6], sent[7]]),
+        196608,
+        "the start-up frame names the protocol version"
+    );
+    assert!(
+        declared < sent.len() && sent[declared] == b'Q',
+        "the start-up frame's length does not reach the query that follows it"
+    );
+    let text = sent_text(sent);
+    assert!(
+        text.contains("user\x00ply\x00database\x00ply\x00"),
+        "{text}"
+    );
+    assert!(text.contains("select 1"), "{text}");
+    assert!(
+        sent.ends_with(&[b'X', 0, 0, 0, 4]),
+        "the connection was not terminated: {text}"
+    );
+}
+
+#[test]
+fn the_extended_cycle_carries_its_parameters_as_text() {
+    let outcome = run(
+        "m.ask_with",
+        vec![
+            Value::str("127.0.0.1"),
+            Value::Int(5432),
+            Value::str("hello"),
+        ],
+        vec![greeting(), extended_one("hello")],
+    )
+    .expect("the server refused nothing");
+    assert_eq!(outcome.text, "hello");
+
+    let text = sent_text(&outcome.sent);
+    // Parse names the statement, Bind carries the value as text, and Sync ends the cycle.
+    assert!(text.contains("select $1"), "{text}");
+    assert!(text.contains("hello"), "{text}");
+    assert_eq!(
+        sent_text(&outcome.sent).matches("\x00P").count(),
+        1,
+        "the cycle sends one Parse: {text}"
+    );
+}
+
+#[test]
+fn a_refusal_comes_back_with_its_sqlstate_and_leaves_the_connection_usable() {
+    let outcome = run(
+        "m.refuse_then_ask",
+        vec![Value::str("127.0.0.1"), Value::Int(5432)],
+        vec![
+            greeting(),
+            refused("42P01", "relation \"nope\" does not exist"),
+            select_one(),
+        ],
+    )
+    .expect("the second query succeeded");
+    assert!(
+        outcome.text.contains("42P01") && outcome.text.ends_with("then 1"),
+        "{}",
+        outcome.text
+    );
+    let text = sent_text(&outcome.sent);
+    assert!(text.contains("select nope"), "{text}");
+    assert!(text.contains("select 1"), "{text}");
+}
