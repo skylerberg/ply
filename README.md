@@ -38,7 +38,7 @@ of it next.
 | `examples/`, `tests/lang/`, `tests/fixtures/` | Ply programs the suite runs |
 | `benches/` | benchmark scripts and their recorded output |
 | `probes/` | standalone C probes, each run by a CI job |
-| `.github/` | CI: `workflows/ci.yml` and the job tables in `ci-shards.sh` |
+| `.github/` | CI: `workflows/ci.yml`, the job tables in `ci-shards.sh`, and `ci-timings.sh` to read a run |
 
 ## Building and testing
 
