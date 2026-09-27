@@ -39,7 +39,17 @@ fn the_served_project_typechecks_and_drives_the_twin() {
                 .unwrap();
             let source = std::fs::read_to_string(dir.path().join("desk.ply")).unwrap();
             assert!(source.contains(entry), "{entry} in {variant:?}");
-            assert!(!source.contains("config.get[server]"), "{variant:?}");
+            // The generated entry point is the twin call, which reads no configuration. The module
+            // still names `config.get[server]` for the postgres entry point it stands in for — a
+            // row about a program this project is not — so the check is the entry point itself.
+            let entry_body = source
+                .split_once("fn main()")
+                .expect("the project has an entry point")
+                .1
+                .split_once("\n}\n")
+                .expect("the entry point is closed")
+                .0;
+            assert!(!entry_body.contains("config."), "{variant:?}: {entry_body}");
             Loaded::parse(&source).expect("the served project typechecks");
         }
     }
