@@ -21,8 +21,7 @@ use ply_eval::host::{
 use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
 use ply_store::Store;
 use ply_test::{
-    Isolation, Parallelism, Record, RunReport, Selection, Skipped, Status, Suspect, TestResult,
-    Verdict,
+    Isolation, Record, RunReport, Selection, Skipped, Status, Suspect, TestResult, Verdict,
 };
 use ply_ty::{CheckOutput, Footprint, HashOutput, Mode};
 use serde_json::{Value, json as jsonlit};
@@ -34,7 +33,7 @@ use std::sync::{Arc, Mutex, mpsc};
 /// else: no other command runs a corpus.
 const EFFECT: &str = "tester";
 
-const OPERATIONS: [(&str, &str); 8] = [
+const OPERATIONS: [(&str, &str); 9] = [
     ("configure", "ply_machine::tester::configure"),
     ("loaded", "ply_machine::test::loaded"),
     ("bound", "ply_machine::test::bound"),
@@ -44,6 +43,9 @@ const OPERATIONS: [(&str, &str); 8] = [
     ("keys", "ply_machine::tester::keys"),
     ("hashed", "ply_machine::tester::hashed"),
     ("searched", "ply_machine::tester::searched"),
+    // The printed union of a set of tests' footprints: the program colours the graph, and the
+    // rendering of a colour is the compiler's.
+    ("footprint", "ply_machine::tester::footprint"),
 ];
 
 /// A compiled body honours its call bound on the native stack, where unoptimised frames run to
@@ -144,6 +146,18 @@ impl HostHandler for Site {
             "keys" => self.knowledge(Ask::Keys)?,
             "hashed" => self.knowledge(Ask::Hashed)?,
             "searched" => self.knowledge(Ask::Searched)?,
+            "footprint" => {
+                let list = req
+                    .args
+                    .first()
+                    .ok_or_else(|| unasked("footprint", req.span))?
+                    .as_list(span, "the tests of a group")?;
+                let mut tests = Vec::with_capacity(list.len());
+                for item in list {
+                    tests.push(item.as_int(span, "a test index")? as usize);
+                }
+                self.knowledge(Ask::Footprint(tests))?
+            }
             other => return Err(unasked(other, span)),
         };
         Ok(HostAnswer::Value(value))
@@ -211,10 +225,11 @@ impl Site {
     fn knowledge(&self, asked: Ask) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
         let machine = held.as_ref().ok_or_else(|| unstarted(asked.name()))?;
-        machine.ask(match asked {
+        machine.ask(match &asked {
             Ask::Keys => Go::Keys,
             Ask::Hashed => Go::Hashed,
             Ask::Searched => Go::Searched,
+            Ask::Footprint(tests) => Go::Footprint(tests.clone()),
         })?;
         match machine.step()? {
             Step::Knowledge {
@@ -265,6 +280,9 @@ enum Go {
     Keys,
     Hashed,
     Searched,
+    /// The printed union of these tests' footprints. The program colours the graph; the rendering of
+    /// a colour is the compiler's, since only its printer can keep a label variable off a name.
+    Footprint(Vec<usize>),
 }
 
 enum Step {
@@ -278,19 +296,21 @@ enum Step {
 }
 
 /// Which part of what a selector reads to compute a selection.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum Ask {
     Keys,
     Hashed,
     Searched,
+    Footprint(Vec<usize>),
 }
 
 impl Ask {
-    fn name(self) -> &'static str {
+    fn name(&self) -> &'static str {
         match self {
             Ask::Keys => "keys",
             Ask::Hashed => "hashed",
             Ask::Searched => "searched",
+            Ask::Footprint(_) => "footprint",
         }
     }
 }
@@ -300,6 +320,7 @@ enum KnowledgeValue {
     Keys(Vec<KeyRow>),
     Hashed(Vec<HashedRow>),
     Searched(SearchedRow),
+    Footprint(String),
 }
 
 /// The thread this process's machine lives on. The `ply` program performing these operations is
@@ -454,6 +475,20 @@ struct Knowledge {
     keys: Vec<KeyRow>,
     hashed: Vec<HashedRow>,
     searched: SearchedRow,
+    /// Every test's footprint, in test order: a group's rendering is the union of the ones it names.
+    footprints: Vec<Footprint>,
+}
+
+impl Knowledge {
+    /// The union of the named tests' footprints, printed. An index no test holds contributes
+    /// nothing, so a program that asked about one finds out by the absence rather than a refusal.
+    fn footprint_of(&self, tests: &[usize]) -> String {
+        tests
+            .iter()
+            .filter_map(|&i| self.footprints.get(i))
+            .fold(Footprint::empty(), |acc, f| acc.union(f))
+            .to_string()
+    }
 }
 
 /// One test the loaded tree declares, and what the store has under the key its result is filed
@@ -556,6 +591,12 @@ impl Knowledge {
         Knowledge {
             keys,
             hashed,
+            footprints: loaded
+                .check
+                .tests
+                .iter()
+                .map(|t| t.footprint.clone())
+                .collect(),
             searched: SearchedRow {
                 mode: search.mode.as_str().to_string(),
                 seeds: search.roots.len(),
@@ -593,6 +634,12 @@ fn serve_reads(
                     value: Box::new(KnowledgeValue::Searched(knowledge.searched.clone())),
                 });
             }
+            Ok(Go::Footprint(tests)) => {
+                let _ = told.send(Step::Knowledge {
+                    asked: Ask::Footprint(tests.clone()),
+                    value: Box::new(KnowledgeValue::Footprint(knowledge.footprint_of(&tests))),
+                });
+            }
             Ok(Go::Load) | Ok(Go::Run) | Err(_) => return false,
         }
     }
@@ -623,6 +670,12 @@ fn serve_reads_until_run(
                 let _ = told.send(Step::Knowledge {
                     asked: Ask::Searched,
                     value: Box::new(KnowledgeValue::Searched(knowledge.searched.clone())),
+                });
+            }
+            Ok(Go::Footprint(tests)) => {
+                let _ = told.send(Step::Knowledge {
+                    asked: Ask::Footprint(tests.clone()),
+                    value: Box::new(KnowledgeValue::Footprint(knowledge.footprint_of(&tests))),
                 });
             }
             Ok(Go::Load) | Ok(Go::Bind) | Err(_) => return false,
@@ -946,13 +999,6 @@ impl Plan {
             visible,
         }
     }
-
-    fn group_footprint(&self, group: &[usize], check: &CheckOutput) -> Footprint {
-        group
-            .iter()
-            .filter_map(|&i| check.tests.get(i))
-            .fold(Footprint::empty(), |acc, t| acc.union(&t.footprint))
-    }
 }
 
 /// `--no-cache` points the store at a scratch directory deleted on the way out.
@@ -1141,7 +1187,6 @@ struct CaseView {
     seeded: bool,
     reason: &'static str,
     owed: usize,
-    group: Option<usize>,
 }
 
 /// One atom of a test's shared footprint, as a scheduler compares them.
@@ -1164,8 +1209,6 @@ struct Found {
     selected: usize,
     cached: usize,
     filtered_out: usize,
-    groups: Vec<(Vec<usize>, String)>,
-    parallelism: Parallelism,
     plan: (String, usize, String, String),
     warnings: Vec<Diagnostic>,
     options: Value,
@@ -1209,7 +1252,6 @@ struct OutcomeView {
     index: usize,
     name: String,
     hash: Option<String>,
-    group: usize,
     duration_us: u128,
     status: &'static str,
     diagnostic: Option<Diagnostic>,
@@ -1346,7 +1388,6 @@ fn found(
                     seeded: ply_test::is_seeded(&test.footprint),
                     reason: reason.as_str(),
                     owed: selection.plan_for(index).roots.len(),
-                    group: selection.group_of(index),
                 })
             })
             .collect(),
@@ -1354,17 +1395,6 @@ fn found(
         selected: selection.to_run.len(),
         cached: selection.cached.len(),
         filtered_out: plan.filtered_out,
-        groups: selection
-            .groups
-            .iter()
-            .map(|group| {
-                (
-                    group.clone(),
-                    plan.group_footprint(group, check).to_string(),
-                )
-            })
-            .collect(),
-        parallelism: selection.parallelism,
         plan: (
             selection.plan.mode.as_str().to_string(),
             selection.plan.roots.len(),
@@ -1433,7 +1463,6 @@ fn outcome(result: &TestResult) -> OutcomeView {
         index: result.index,
         name: result.name.clone(),
         hash: result.hash.map(|h| h.to_hex()),
-        group: result.group,
         duration_us: result.duration.as_micros(),
         status: status_str(result.status),
         diagnostic: result.failure.clone(),
@@ -1659,19 +1688,6 @@ fn case_value(case: &CaseView) -> PlyValue {
         ("seeded", PlyValue::Bool(case.seeded)),
         ("reason", PlyValue::str(case.reason)),
         ("owed", count(case.owed)),
-        ("group", option(case.group.map(count))),
-    ])
-}
-
-fn parallelism_value(p: &Parallelism) -> PlyValue {
-    record(vec![
-        ("total", count(p.total)),
-        ("isolated", count(p.isolated)),
-        ("shared", count(p.shared)),
-        ("region_contended", count(p.region_contended)),
-        ("scheduled", count(p.scheduled)),
-        ("groups", count(p.groups)),
-        ("shared_groups", count(p.shared_groups)),
     ])
 }
 
@@ -1723,25 +1739,6 @@ fn found_value(found: Found) -> PlyValue {
         ("cached", count(found.cached)),
         ("filtered_out", count(found.filtered_out)),
         (
-            "groups",
-            PlyValue::list(
-                found
-                    .groups
-                    .iter()
-                    .map(|(tests, footprint)| {
-                        record(vec![
-                            (
-                                "tests",
-                                PlyValue::list(tests.iter().map(|&i| count(i)).collect()),
-                            ),
-                            ("footprint", PlyValue::str(footprint)),
-                        ])
-                    })
-                    .collect(),
-            ),
-        ),
-        ("parallelism", parallelism_value(&found.parallelism)),
-        (
             "plan",
             record(vec![
                 ("mode", PlyValue::str(&found.plan.0)),
@@ -1788,6 +1785,7 @@ fn knowledge_value(value: &KnowledgeValue) -> PlyValue {
                 })
                 .collect(),
         ),
+        KnowledgeValue::Footprint(text) => PlyValue::str(text),
         KnowledgeValue::Searched(row) => record(vec![
             ("mode", PlyValue::str(&row.mode)),
             ("seeds", count(row.seeds)),
@@ -1830,7 +1828,6 @@ fn outcome_value(o: &OutcomeView) -> PlyValue {
         ("index", count(o.index)),
         ("name", PlyValue::str(&o.name)),
         ("hash", option(o.hash.as_deref().map(PlyValue::str))),
-        ("group", count(o.group)),
         ("duration_us", micros(o.duration_us)),
         ("status", PlyValue::str(o.status)),
         ("diagnostic", option(o.diagnostic.as_ref().map(diag_value))),
