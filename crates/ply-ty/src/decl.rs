@@ -95,18 +95,20 @@ impl fmt::Display for ModuleName {
     }
 }
 
-/// The grammar's identifier rule, which module paths are held to as well.
+/// The grammar's identifier rule, which module paths are held to as well. It is ASCII, the rule
+/// the lexer implements (`crates/ply-compiler/ply/lexer.ply`) and the walk repeats
+/// (`crates/ply-cli/ply/sources.ply`).
 pub fn is_ident(s: &str) -> bool {
     let mut chars = s.chars();
     chars.next().is_some_and(is_ident_start) && chars.all(is_ident_continue)
 }
 
 pub fn is_ident_start(c: char) -> bool {
-    c.is_alphabetic() || c == '_'
+    c.is_ascii_alphabetic() || c == '_'
 }
 
 pub fn is_ident_continue(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+    is_ident_start(c) || c.is_ascii_digit()
 }
 
 /// The derivations the language defines.
