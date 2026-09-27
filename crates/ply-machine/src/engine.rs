@@ -23,16 +23,27 @@ use std::sync::Arc;
 /// The discharger this build drives, its claims kept in `store`.
 pub fn of<'a>(
     loaded: &'a Loaded,
-    hosting: Option<Hosting<'a>>,
+    hosting: Option<Hosting>,
     backend: Option<&'static dyn ply_eval::Provider>,
     store: &mut Store,
 ) -> Result<Box<dyn ply_test::obligation::Discharger + 'a>, LoadError> {
+    Ok(Box::new(prover(loaded, hosting, backend, store)?))
+}
+
+/// The same prover, unboxed: a caller that also re-runs points needs the concrete type, and one
+/// built once serves a whole run's discharges and re-runs alike.
+pub fn prover<'a>(
+    loaded: &'a Loaded,
+    hosting: Option<Hosting>,
+    backend: Option<&'static dyn ply_eval::Provider>,
+    store: &mut Store,
+) -> Result<Prover<'a>, LoadError> {
     let prover = Prover::over(loaded, Some(store))?;
     let prover = match hosting {
         Some(hosting) => prover.with_hosting(hosting),
         None => prover,
     };
-    Ok(Box::new(prover.with_backend(backend)))
+    Ok(prover.with_backend(backend))
 }
 
 fn claims_of(loaded: &Loaded, store: Option<&mut Store>) -> Result<Claims, LoadError> {
@@ -100,15 +111,17 @@ pub struct Prover<'a> {
     ctx: prove::Context<'a>,
     laws: HashMap<Symbol, (usize, &'a LawInfo)>,
     /// What a `law/host` is discharged against.
-    hosting: Option<Hosting<'a>>,
+    hosting: Option<Hosting>,
     /// A compiled unit holding the laws' and clauses' roots, where those propositions are entered.
     backend: Option<&'static dyn ply_eval::Provider>,
 }
 
-/// The binding and the reactor a `law/host` runs against.
-pub struct Hosting<'a> {
+/// The binding and the reactor a `law/host` runs against. The factory is owned rather than
+/// borrowed, so a prover holding a hosting borrows the program and nothing else, and a caller can
+/// keep one prover across many steps.
+pub struct Hosting {
     pub binding: Arc<HostBinding>,
-    pub runtime: Option<&'a (dyn Fn() -> Rc<dyn HostRuntime> + Sync)>,
+    pub runtime: Option<Arc<dyn Fn() -> Rc<dyn HostRuntime> + Sync + Send>>,
 }
 
 impl<'a> Prover<'a> {
@@ -195,7 +208,7 @@ impl<'a> Prover<'a> {
     }
 
     /// Bind the host, so that a `law/host` is attempted rather than reported as a gap.
-    pub fn with_hosting(mut self, hosting: Hosting<'a>) -> Prover<'a> {
+    pub fn with_hosting(mut self, hosting: Hosting) -> Prover<'a> {
         self.hosting = Some(hosting);
         self
     }
@@ -239,10 +252,10 @@ impl<'a> Prover<'a> {
     }
 
     /// The machine a `law/host`'s body runs on: the run's binding and a reactor for this thread.
-    fn host_machine(&self, hosting: &Hosting<'a>) -> Machine<'a> {
+    fn host_machine(&self, hosting: &Hosting) -> Machine<'a> {
         let mut machine = self.machine();
         machine.set_host_binding(Arc::clone(&hosting.binding));
-        if let Some(factory) = hosting.runtime {
+        if let Some(factory) = &hosting.runtime {
             machine.set_host_runtime(factory());
         }
         machine
@@ -303,6 +316,20 @@ impl<'a> Prover<'a> {
 pub struct Reach {
     pub decision: Decision,
     pub blockers: Vec<Blocker>,
+}
+
+/// One point of one obligation's guard, as `claims.ply` reads it: what a search over cases is
+/// made of, one case at a time. `Undrawn` is the obligation's own gap — the points are not drawn,
+/// or not drawn one at a time — rather than anything about this draw.
+#[derive(Debug)]
+pub enum Point {
+    Kept(Vec<Binding>),
+    /// The guard admitted the point and the body does not hold there: this point falsifies the
+    /// claim, which is what a shrinker starts from.
+    Falsified(Vec<Binding>),
+    Rejected,
+    /// No point was drawn, and the gap says why.
+    Undrawn(Gap),
 }
 
 /// What the static tier had to say, before anything ran.
@@ -385,6 +412,65 @@ impl<'a> Prover<'a> {
                 None => discharge,
             },
             other => upgrade(other, witness),
+        }
+    }
+
+    /// One point of one obligation's guard, at a root and case the caller chose, or the gap that
+    /// stops the obligation being run a point at a time at all. This is what a search over cases
+    /// is made of, one case at a time: a caller that wants to shrink a refutation, or cover a
+    /// finite domain, drives the draws rather than asking for the whole search.
+    pub fn point_at(
+        &self,
+        obligation: &Obligation,
+        root: u64,
+        case: u32,
+        plan: &ProvePlan,
+    ) -> Point {
+        let Some(claim) = self.claim(obligation) else {
+            return Point::Undrawn(Gap::UnhandledEffect(obligation.footprint.clone()));
+        };
+        if obligation.is_concurrency_law() {
+            return Point::Undrawn(Gap::NotDrawn);
+        }
+        let mut cases = match self.cases(obligation, &claim, plan) {
+            Ok(cases) => cases,
+            Err(gap) => return Point::Undrawn(gap),
+        };
+        if obligation.host {
+            let Some(hosting) = &self.hosting else {
+                return Point::Undrawn(Gap::ReachesHost(obligation.footprint.clone()));
+            };
+            cases.machine = self.host_machine(hosting);
+        } else if let Some(footprint) = self.unhandled(obligation) {
+            return Point::Undrawn(Gap::UnhandledEffect(footprint));
+        }
+
+        // The draw is the generator's, from a stream the caller seeds: the same point a whole
+        // run would have reached at this root and case.
+        let mut stream = GenStream::new(root, obligation.key);
+        let mut values = Vec::with_capacity(obligation.generated().len());
+        for binder in obligation.generated() {
+            match property::generate(&binder.ty, &self.world, &mut stream, case) {
+                Ok(value) => values.push(value),
+                Err(_) => {
+                    return Point::Undrawn(Gap::Ungeneratable {
+                        param: binder.name.clone(),
+                        ty: binder.ty.clone(),
+                    });
+                }
+            }
+        }
+        let bindings = bindings_of(obligation.generated(), &values);
+        match judge_case(&mut cases, &values) {
+            Outcome::Held => Point::Kept(bindings),
+            Outcome::Failed => Point::Falsified(bindings),
+            Outcome::Rejected => Point::Rejected,
+            // A raise at one point is the obligation's own gap, in the same words a whole run
+            // reports it in: nothing was refuted and nothing was established.
+            Outcome::Raised(diagnostic) => Point::Undrawn(Gap::Raised {
+                bindings,
+                diagnostic: Box::new(diagnostic),
+            }),
         }
     }
 
