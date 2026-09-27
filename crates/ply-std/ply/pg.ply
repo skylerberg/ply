@@ -1,0 +1,540 @@
+// std.pg — the postgres wire protocol, framed in Ply.
+//
+// Every message the front end sends after start-up is one byte of kind, an `Int32` length that
+// counts itself, and a body. The start-up message is the exception: no kind byte, the length
+// first. Values travel as text here, so a parameter is the text the server would have printed
+// and a column is the text it printed, which is what makes this layer only about framing.
+
+import std.bytes (u16_be, u32_be, i32_be, u16_be_at, u32_be_at, i32_be_at, slice_at)
+
+// --- Kinds --------------------------------------------------------------------
+
+// What the front end sends.
+pub type Frontend = | Query | Parse | Bind | Describe | Execute | Sync | Close | Flush | Terminate
+
+pub fn frontend_byte(f: Frontend) -> Int =
+  match f {
+    Query -> 81,
+    Parse -> 80,
+    Bind -> 66,
+    Describe -> 68,
+    Execute -> 69,
+    Sync -> 83,
+    Close -> 67,
+    Flush -> 72,
+    Terminate -> 88,
+  }
+
+pub fn frontend_name(f: Frontend) -> String =
+  match f {
+    Query -> "Query",
+    Parse -> "Parse",
+    Bind -> "Bind",
+    Describe -> "Describe",
+    Execute -> "Execute",
+    Sync -> "Sync",
+    Close -> "Close",
+    Flush -> "Flush",
+    Terminate -> "Terminate",
+  }
+
+// What the back end sends. `Other` keeps the byte, so a message this module does not name is
+// still reportable rather than silently dropped.
+pub type Backend =
+  | Authentication
+  | ParameterStatus
+  | BackendKeyData
+  | ReadyForQuery
+  | RowDescription
+  | DataRow
+  | CommandComplete
+  | ErrorResponse
+  | NoticeResponse
+  | ParseComplete
+  | BindComplete
+  | CloseComplete
+  | NoData
+  | ParameterDescription
+  | EmptyQueryResponse
+  | Other(Int)
+
+pub fn backend_byte(k: Backend) -> Int =
+  match k {
+    Authentication -> 82,
+    ParameterStatus -> 83,
+    BackendKeyData -> 75,
+    ReadyForQuery -> 90,
+    RowDescription -> 84,
+    DataRow -> 68,
+    CommandComplete -> 67,
+    ErrorResponse -> 69,
+    NoticeResponse -> 78,
+    ParseComplete -> 49,
+    BindComplete -> 50,
+    CloseComplete -> 51,
+    NoData -> 110,
+    ParameterDescription -> 116,
+    EmptyQueryResponse -> 73,
+    Other(b) -> b,
+  }
+
+pub fn backend_name(k: Backend) -> String =
+  match k {
+    Authentication -> "Authentication",
+    ParameterStatus -> "ParameterStatus",
+    BackendKeyData -> "BackendKeyData",
+    ReadyForQuery -> "ReadyForQuery",
+    RowDescription -> "RowDescription",
+    DataRow -> "DataRow",
+    CommandComplete -> "CommandComplete",
+    ErrorResponse -> "ErrorResponse",
+    NoticeResponse -> "NoticeResponse",
+    ParseComplete -> "ParseComplete",
+    BindComplete -> "BindComplete",
+    CloseComplete -> "CloseComplete",
+    NoData -> "NoData",
+    ParameterDescription -> "ParameterDescription",
+    EmptyQueryResponse -> "EmptyQueryResponse",
+    Other(b) -> "Other(" ++ int_to_string(b) ++ ")",
+  }
+
+pub fn backend_of(b: Int) -> Backend =
+  if b == 82 { Authentication }
+  else if b == 83 { ParameterStatus }
+  else if b == 75 { BackendKeyData }
+  else if b == 90 { ReadyForQuery }
+  else if b == 84 { RowDescription }
+  else if b == 68 { DataRow }
+  else if b == 67 { CommandComplete }
+  else if b == 69 { ErrorResponse }
+  else if b == 78 { NoticeResponse }
+  else if b == 49 { ParseComplete }
+  else if b == 50 { BindComplete }
+  else if b == 51 { CloseComplete }
+  else if b == 110 { NoData }
+  else if b == 116 { ParameterDescription }
+  else if b == 73 { EmptyQueryResponse }
+  else { Other(b) }
+
+// --- Framing ------------------------------------------------------------------
+
+pub type Message = { kind: Backend, body: Bytes }
+
+// A buffer read into whole messages, with whatever trailing bytes are not yet a whole one.
+pub type Frames = { done: List<Message>, rest: Bytes }
+
+fn cstring(s: String) -> Bytes = bytes_concat(bytes_of_string(s), b"\x00")
+
+// A length that counts itself, which is what every frame's header is.
+fn counted(body: Bytes) -> Bytes = bytes_concat(u32_be(bytes_len(body) + 4), body)
+
+fn frontend(f: Frontend, body: Bytes) -> Bytes =
+  bytes_concat(byte_of_int(frontend_byte(f)), counted(body))
+
+// The start-up message: the protocol version, then the parameters, then a zero byte. No kind
+// byte, because the server has no connection to have agreed one on yet.
+pub fn startup(user: String, database: String) -> Bytes =
+  counted(
+    bytes_concat_all([
+      u32_be(196608),
+      cstring("user"),
+      cstring(user),
+      cstring("database"),
+      cstring(database),
+      byte_of_int(0),
+    ]),
+  )
+
+// The byte a server answers a start-up with to say it will speak TLS; 1234 5679, the magic the
+// protocol reserves so that it can never be mistaken for a supported version.
+pub fn ssl_request() -> Bytes = counted(u32_be(80877103))
+
+pub fn ssl_response() -> Bytes = byte_of_int(83)
+
+pub fn cancel_request(pid: Int, secret: Int) -> Bytes =
+  counted(bytes_concat_all([u32_be(80877102), u32_be(pid), u32_be(secret)]))
+
+// The simple query protocol: one statement, answered with rows and a command tag.
+pub fn query(sql: String) -> Bytes = frontend(Query, cstring(sql))
+
+// The extended protocol: `parse` names a statement, `bind` names a portal over it, `execute`
+// runs the portal, and `sync` is what makes the server answer. Text format both ways.
+pub fn parse(statement: String, sql: String, param_types: List<Int>) -> Bytes =
+  frontend(
+    Parse,
+    bytes_concat_all([
+      cstring(statement),
+      cstring(sql),
+      u16_be(len(param_types)),
+      bytes_concat_all(map(param_types, |t: Int| u32_be(t))),
+    ]),
+  )
+
+fn bound_value(p: Option<String>) -> Bytes =
+  match p {
+    None -> i32_be(-1),
+    Some(text) -> {
+      let raw = bytes_of_string(text);
+      bytes_concat(i32_be(bytes_len(raw)), raw)
+    },
+  }
+
+pub fn bind(portal: String, statement: String, params: List<Option<String>>) -> Bytes =
+  frontend(
+    Bind,
+    bytes_concat_all([
+      cstring(portal),
+      cstring(statement),
+      // No parameter format codes and no result format codes: everything is text.
+      u16_be(0),
+      u16_be(len(params)),
+      bytes_concat_all(map(params, |p: Option<String>| bound_value(p))),
+      u16_be(0),
+    ]),
+  )
+
+// `statement` describes the prepared statement, otherwise the portal.
+pub fn describe(statement: Bool, name: String) -> Bytes =
+  frontend(Describe, bytes_concat(byte_of_int(if statement { 83 } else { 80 }), cstring(name)))
+
+// `max_rows` of zero is no limit.
+pub fn execute(portal: String, max_rows: Int) -> Bytes =
+  frontend(Execute, bytes_concat(cstring(portal), u32_be(max_rows)))
+
+pub fn sync() -> Bytes = frontend(Sync, b"")
+
+pub fn flush() -> Bytes = frontend(Flush, b"")
+
+pub fn close(statement: Bool, name: String) -> Bytes =
+  frontend(Close, bytes_concat(byte_of_int(if statement { 83 } else { 80 }), cstring(name)))
+
+pub fn terminate() -> Bytes = frontend(Terminate, b"")
+
+// What a connection reads: whole frames out of the buffer, the remainder left for the next
+// read. A frame whose length is not yet present, or whose length is not a length, is left as
+// `rest` rather than refused — a read that returns short is not a protocol error.
+pub fn read(buf: Bytes) -> Frames = read_from(buf, 0, [])
+
+fn read_from(buf: Bytes, at: Int, acc: List<Message>) -> Frames = {
+  let n = bytes_len(buf);
+  if at + 5 > n { { done: acc, rest: bytes_slice(buf, at, n) } } else {
+    match u32_be_at(buf, at + 1) {
+      None -> { done: acc, rest: bytes_slice(buf, at, n) },
+      Some(len) -> if len < 4 || at + 1 + len > n { { done: acc, rest: bytes_slice(buf, at, n) } } else {
+        read_from(
+          buf,
+          at + 1 + len,
+          push(acc, {
+            kind: backend_of(bytes_at(buf, at)),
+            body: bytes_slice(buf, at + 5, at + 1 + len),
+          }),
+        )
+      },
+    }
+  }
+}
+
+// --- Reading a body -----------------------------------------------------------
+
+// A zero-terminated string starting at `at`, and where the next field begins.
+pub type Cstr = { text: String, next: Int }
+
+pub fn read_cstring(b: Bytes, at: Int) -> Option<Cstr> =
+  if at < 0 || at >= bytes_len(b) { None } else {
+    match bytes_index_of_byte(bytes_slice(b, at, bytes_len(b)), 0) {
+      None -> None,
+      Some(i) -> Some({ text: string_of_bytes(bytes_slice(b, at, at + i)), next: at + i + 1 }),
+    }
+  }
+
+// What the server says before it will talk: 0 is authenticated, 3 wants a clear-text password,
+// 5 wants md5, 10 offers SASL, 11 and 12 are its two SASL steps.
+pub fn auth_code(m: Message) -> Option<Int> = u32_be_at(m.body, 0)
+
+pub fn auth_name(code: Int) -> String =
+  if code == 0 { "AuthenticationOk" }
+  else if code == 3 { "AuthenticationCleartextPassword" }
+  else if code == 5 { "AuthenticationMD5Password" }
+  else if code == 10 { "AuthenticationSASL" }
+  else if code == 11 { "AuthenticationSASLContinue" }
+  else if code == 12 { "AuthenticationSASLFinal" }
+  else { "Authentication(" ++ int_to_string(code) ++ ")" }
+
+// The bytes after the code, which is what a SASL step carries.
+pub fn auth_body(m: Message) -> Option<Bytes> = slice_at(m.body, 4, bytes_len(m.body) - 4)
+
+// 'I' idle, 'T' in a transaction, 'E' in a failed transaction, which refuses everything but
+// `ROLLBACK` until it ends.
+pub fn ready_status(m: Message) -> Option<Int> =
+  if bytes_len(m.body) < 1 { None } else { Some(bytes_at(m.body, 0)) }
+
+pub type Status = | Idle | InTransaction | FailedTransaction | Unknown(Int)
+
+pub fn status_of(b: Int) -> Status =
+  if b == 73 { Idle }
+  else if b == 84 { InTransaction }
+  else if b == 69 { FailedTransaction }
+  else { Unknown(b) }
+
+pub fn status_name(s: Status) -> String =
+  match s {
+    Idle -> "idle",
+    InTransaction -> "in transaction",
+    FailedTransaction -> "in a failed transaction",
+    Unknown(b) -> "unknown(" ++ int_to_string(b) ++ ")",
+  }
+
+pub type BackendKey = { pid: Int, secret: Int }
+
+pub fn backend_key(m: Message) -> Option<BackendKey> =
+  match u32_be_at(m.body, 0) {
+    None -> None,
+    Some(pid) -> match u32_be_at(m.body, 4) {
+      None -> None,
+      Some(secret) -> Some({ pid: pid, secret: secret }),
+    },
+  }
+
+pub type Set = { name: String, value: String }
+
+pub fn parameter_status(m: Message) -> Option<Set> =
+  match read_cstring(m.body, 0) {
+    None -> None,
+    Some(name) -> match read_cstring(m.body, name.next) {
+      None -> None,
+      Some(value) -> Some({ name: name.text, value: value.text }),
+    },
+  }
+
+// A column's name, its type's OID and the format its values arrive in: 0 text, 1 binary.
+pub type Column = { name: String, ty: Int, format: Int }
+
+pub fn row_description(m: Message) -> Option<List<Column>> =
+  match u16_be_at(m.body, 0) { None -> None, Some(count) -> columns(m.body, 2, count, []) }
+
+fn columns(body: Bytes, at: Int, left: Int, acc: List<Column>) -> Option<List<Column>> =
+  if left <= 0 { Some(acc) } else {
+    match read_cstring(body, at) {
+      None -> None,
+      Some(name) -> match u32_be_at(body, name.next + 6) {
+        // Name, table OID, attribute number, type OID, type size, type modifier, format.
+        None -> None,
+        Some(ty) -> match u16_be_at(body, name.next + 16) {
+          None -> None,
+          Some(format) ->
+            columns(
+              body,
+              name.next + 18,
+              left - 1,
+              push(acc, { name: name.text, ty: ty, format: format }),
+            ),
+        },
+      },
+    }
+  }
+
+// One row, with `None` for a NULL column. The length is a count of bytes, and -1 is NULL.
+pub fn data_row(m: Message) -> Option<List<Option<Bytes>>> =
+  match u16_be_at(m.body, 0) { None -> None, Some(count) -> values(m.body, 2, count, []) }
+
+fn values(
+  body: Bytes,
+  at: Int,
+  left: Int,
+  acc: List<Option<Bytes>>,
+) -> Option<List<Option<Bytes>>> =
+  if left <= 0 { Some(acc) } else {
+    match i32_be_at(body, at) {
+      None -> None,
+      Some(len) -> if len < 0 { values(body, at + 4, left - 1, push(acc, None)) } else {
+        match slice_at(body, at + 4, len) {
+          None -> None,
+          Some(raw) -> values(body, at + 4 + len, left - 1, push(acc, Some(raw))),
+        }
+      },
+    }
+  }
+
+// The tag a completed command answers with: `SELECT 3`, `INSERT 0 1`, `BEGIN`.
+pub fn command_tag(m: Message) -> Option<String> =
+  match read_cstring(m.body, 0) { None -> None, Some(tag) -> Some(tag.text) }
+
+pub fn parameter_types(m: Message) -> Option<List<Int>> =
+  match u16_be_at(m.body, 0) { None -> None, Some(count) -> oids(m.body, 2, count, []) }
+
+fn oids(body: Bytes, at: Int, left: Int, acc: List<Int>) -> Option<List<Int>> =
+  if left <= 0 { Some(acc) } else {
+    match u32_be_at(body, at) {
+      None -> None,
+      Some(oid) -> oids(body, at + 4, left - 1, push(acc, oid)),
+    }
+  }
+
+// An `ErrorResponse` and a `NoticeResponse` are the same shape: a field type byte, the field's
+// text, and a zero byte at the end. `S` is severity, `C` the SQLSTATE, `M` the message.
+pub type Field = { code: Int, text: String }
+
+pub fn diagnostic_fields(m: Message) -> List<Field> = fields_of(m.body, 0, [])
+
+fn fields_of(b: Bytes, at: Int, acc: List<Field>) -> List<Field> =
+  if at >= bytes_len(b) { acc }
+  else if bytes_at(b, at) == 0 { acc } else {
+    let code = bytes_at(b, at);
+    match read_cstring(b, at + 1) {
+      None -> acc,
+      Some(field) -> fields_of(b, field.next, push(acc, { code: code, text: field.text })),
+    }
+  }
+
+pub fn field_of(m: Message, code: Int) -> Option<String> =
+  fold(diagnostic_fields(m), None, |acc: Option<String>, f: Field|
+    if f.code == code { Some(f.text) } else { acc })
+
+// --- Tests --------------------------------------------------------------------
+
+test "a start-up message is a length, the version, then the parameters" {
+  let frame = startup("me", "db");
+  assert_eq(u32_be_at(frame, 0), Some(29));
+  assert_eq(u32_be_at(frame, 4), Some(196608));
+  assert_eq(slice_at(frame, 8, 5), Some(b"user\x00"));
+  assert_eq(slice_at(frame, 13, 3), Some(b"me\x00"));
+  assert_eq(slice_at(frame, 16, 9), Some(b"database\x00"));
+  assert_eq(bytes_at(frame, bytes_len(frame) - 1), 0)
+}
+
+test "an ssl request is the magic the protocol reserves" {
+  assert_eq(ssl_request(), bytes_concat(u32_be(8), u32_be(80877103)))
+}
+
+test "a simple query is a kind byte, a length and the text" {
+  assert_eq(query("select 1"), bytes_concat_all([b"Q", u32_be(13), b"select 1", b"\x00"]))
+}
+
+test "a bind carries its values as text, with -1 for null" {
+  let frame = bind("", "", [Some("a"), None]);
+  // 'B', length, portal, statement, no formats, two values, no result formats.
+  let body = bytes_concat_all([
+    b"\x00",
+    b"\x00",
+    u16_be(0),
+    u16_be(2),
+    i32_be(1),
+    b"a",
+    i32_be(-1),
+    u16_be(0),
+  ]);
+  assert_eq(frame, bytes_concat_all([b"B", u32_be(bytes_len(body) + 4), body]))
+}
+
+test "a buffer reads into whole frames and leaves the rest" {
+  let one = bytes_concat_all([byte_of_int(90), u32_be(5), b"I"]);
+  let two = bytes_concat_all([byte_of_int(67), u32_be(13), b"SELECT 1\x00"]);
+  let whole = bytes_concat_all([one, two]);
+  let frames = read(whole);
+  assert_eq(len(frames.done), 2);
+  assert_eq(frames.rest, b"");
+  assert_eq(frames.done, [
+    { kind: ReadyForQuery, body: b"I" },
+    { kind: CommandComplete, body: b"SELECT 1\x00" },
+  ]);
+  // A prefix of the second frame waits rather than half-reading it.
+  let partial = bytes_concat(one, bytes_slice(two, 0, 6));
+  let waiting = read(partial);
+  assert_eq(len(waiting.done), 1);
+  assert_eq(waiting.rest, bytes_slice(two, 0, 6))
+}
+
+test "a frame with a length shorter than its own header is not a frame" {
+  let frames = read(bytes_concat_all([byte_of_int(90), u32_be(3), b"I"]));
+  assert_eq(len(frames.done), 0);
+  assert_eq(frames.rest, bytes_concat_all([byte_of_int(90), u32_be(3), b"I"]))
+}
+
+test "an unnamed message keeps its byte" {
+  let frames = read(bytes_concat_all([byte_of_int(87), u32_be(4)]));
+  assert_eq(frames.done, [{ kind: Other(87), body: b"" }]);
+  assert_eq(backend_name(Other(87)), "Other(87)")
+}
+
+test "authentication says which answer it wants" {
+  let ok = { kind: Authentication, body: bytes_concat(u32_be(0), b"") };
+  assert_eq(auth_code(ok), Some(0));
+  assert_eq(auth_name(0), "AuthenticationOk");
+  let sasl = { kind: Authentication, body: bytes_concat(u32_be(10), b"SCRAM-SHA-256\x00") };
+  assert_eq(auth_code(sasl), Some(10));
+  assert_eq(auth_body(sasl), Some(b"SCRAM-SHA-256\x00"));
+  assert_eq(auth_name(5), "AuthenticationMD5Password");
+  assert_eq(auth_name(99), "Authentication(99)")
+}
+
+test "a ready-for-query says which state the transaction is in" {
+  assert_eq(ready_status({ kind: ReadyForQuery, body: b"I" }), Some(73));
+  assert_eq(status_of(73), Idle);
+  assert_eq(status_of(69), FailedTransaction);
+  assert_eq(status_name(status_of(84)), "in transaction");
+  assert_eq(ready_status({ kind: ReadyForQuery, body: b"" }), None)
+}
+
+test "a data row is its columns, with None for a null" {
+  let body = bytes_concat_all([u16_be(2), i32_be(3), b"abc", i32_be(-1)]);
+  assert_eq(data_row({ kind: DataRow, body: body }), Some([Some(b"abc"), None]));
+  // A column claiming more bytes than the body holds is not a row.
+  let short = bytes_concat_all([u16_be(1), i32_be(9), b"abc"]);
+  assert_eq(data_row({ kind: DataRow, body: short }), None)
+}
+
+test "a row description names its columns and their types" {
+  let body = bytes_concat_all([
+    u16_be(1),
+    b"sku\x00",
+    u32_be(16385),
+    u16_be(1),
+    u32_be(25),
+    u16_be(-1),
+    i32_be(-1),
+    u16_be(0),
+  ]);
+  assert_eq(
+    row_description({ kind: RowDescription, body: body }),
+    Some([{ name: "sku", ty: 25, format: 0 }]),
+  );
+  // An empty description is the empty list, not a refusal.
+  assert_eq(row_description({ kind: RowDescription, body: u16_be(0) }), Some([]))
+}
+
+test "a diagnostic is a list of fields, and one is found by its code" {
+  let body = bytes_concat_all([b"SERROR\x00", b"C42P01\x00", b"Mno such table\x00", b"\x00"]);
+  let m = { kind: ErrorResponse, body: body };
+  assert_eq(diagnostic_fields(m), [
+    { code: 83, text: "ERROR" },
+    { code: 67, text: "42P01" },
+    { code: 77, text: "no such table" },
+  ]);
+  assert_eq(field_of(m, 67), Some("42P01"));
+  assert_eq(field_of(m, 90), None);
+  assert_eq(diagnostic_fields({ kind: ErrorResponse, body: b"\x00" }), [])
+}
+
+test "a command tag and a parameter status read back" {
+  assert_eq(command_tag({ kind: CommandComplete, body: b"SELECT 3\x00" }), Some("SELECT 3"));
+  assert_eq(command_tag({ kind: CommandComplete, body: b"" }), None);
+  assert_eq(
+    parameter_status({ kind: ParameterStatus, body: b"server_version\x00\x31\x36\x00" }),
+    Some({ name: "server_version", value: "16" }),
+  );
+  assert_eq(
+    parameter_types({
+      kind: ParameterDescription,
+      body: bytes_concat_all([u16_be(2), u32_be(23), u32_be(25)]),
+    }),
+    Some([23, 25]),
+  )
+}
+
+test "a back end key is the two words a cancel needs" {
+  assert_eq(
+    backend_key({ kind: BackendKeyData, body: bytes_concat(u32_be(4321), u32_be(8765)) }),
+    Some({ pid: 4321, secret: 8765 }),
+  );
+  assert_eq(backend_key({ kind: BackendKeyData, body: b"abc" }), None)
+}
