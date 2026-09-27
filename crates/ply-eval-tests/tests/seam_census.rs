@@ -92,7 +92,7 @@ struct Declining {
 impl Declining {
     fn over(front: &Front) -> Declining {
         Declining {
-            program: front.hashes.digest(),
+            program: front.hashes_digest,
             offered: Cell::new(0),
         }
     }
