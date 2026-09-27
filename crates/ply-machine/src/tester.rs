@@ -2548,7 +2548,7 @@ fn trial(
     // may be cached — under the mixture's own test hash. The failing test's hash is a different
     // test's, so a red test can never be passed by a mixture of it.
     for hash in hybrid.take_proved() {
-        store.put(hash, ply_store::Outcome::Pass);
+        let _ = store.put(hash, ply_store::Outcome::Pass);
     }
     Ok(trial)
 }
@@ -2702,7 +2702,7 @@ fn skipped_ctor(skipped: ply_test::bisect::Skipped) -> &'static str {
         ply_test::bisect::Skipped::Panicked => "Panicked",
         ply_test::bisect::Skipped::NoChanges => "NoChanges",
         ply_test::bisect::Skipped::NoBodies => "NoBodies",
-        ply_test::bisect::Skipped::NoHybrids => "NoHybrids",
+        ply_test::bisect::Skipped::NoHybrids => "suite.bisect.NoHybrids",
         ply_test::bisect::Skipped::Delegated => "Delegated",
     }
 }
