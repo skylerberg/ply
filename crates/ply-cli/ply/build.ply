@@ -5,6 +5,8 @@
 // the magic, the header and the section table.
 
 import args (Flags, no_flags, style_of)
+import lock
+import paths (Resolved, here)
 import compiler.hash (hex)
 import compiler.plyx (Head, Section, Range, covers, domain, encode, format, off_digest)
 import compiler.resolve (Diag, Label, diag, diag1)
@@ -46,6 +48,8 @@ pub type Loaded = {
   mains: List<Main>,
   modules: List<Module>,
   places: List<Place>,
+  // Each dependency as the front end pinned it: what `ply.lock` records.
+  pins: List<lock::Pinned>,
   // `None` when the running binary cannot be measured, which never fails a build.
   binary_bytes: Option<Int>,
   version: String,
@@ -564,13 +568,52 @@ fn chosen(
 
 pub fn run(
   flags: Flags,
-) -> Answer / {builder.loaded[build], builder.made[build], builder.previous[build], builder.stored[build], env.shipped_digest[sys], fs.write_file[cwd], fs.write_file[abs]} = {
+) -> Answer / {builder.loaded[build], builder.made[build], builder.previous[build], builder.stored[build], env.shipped_digest[sys], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs]} = {
   let s: Style = style_of(flags);
+  let r = resolved_root(flags);
+  let locked: Result<Option<lock::Lock>, String> = lock::read(r);
   match builder.loaded[build](root_of(flags)) {
     Err(why) -> refused(s, "build", why.diags, why.places),
-    Ok(p) -> chosen(s, flags, p),
+    Ok(p) -> match locked {
+      Err(why) -> reported(s, "build", [lock::refused(r, why)], p.places),
+      Ok(existing) -> match pinned_ok(r, existing, p) {
+        Some(d) -> reported(s, "build", [d], p.places),
+        None -> {
+          let answer = chosen(s, flags, p);
+          if answer.code == ok_code() { pinned(r, existing, p) };
+          answer
+        },
+      },
+    },
   }
 }
+
+// Every dependency the lock pins must be the one this load found: a build may not ship what the
+// lockfile does not describe.
+fn pinned_ok(r: Resolved, existing: Option<lock::Lock>, p: Loaded) -> Option<Diag> =
+  match existing {
+    None -> None,
+    Some(lock) -> match lock::verified(r, lock, p.pins) { Ok(_) -> None, Err(d) -> Some(d) },
+  }
+
+fn unchanged(existing: Option<lock::Lock>, pins: List<lock::Pinned>) -> Bool =
+  match existing { None -> false, Some(l) -> l.version == lock::format() && l.packages == pins }
+
+fn pinned(
+  r: Resolved,
+  existing: Option<lock::Lock>,
+  p: Loaded,
+) -> Unit / {fs.write_file[cwd], fs.write_file[abs]} =
+  if unchanged(existing, p.pins) { () } else {
+    let text = bytes_of_string(lock::text(existing, p.pins));
+    if r.label == "cwd" { fs.write_file[cwd](lock::path_of(r), text) }
+    else { fs.write_file[abs](lock::path_of(r), text) };
+    ()
+  }
+
+// The root the command was pointed at, as the resolved path the lockfile is read and written under.
+fn resolved_root(flags: Flags) -> Resolved =
+  match list_at(flags.paths, 0) { Some(r) -> r, None -> here() }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -595,6 +638,7 @@ fn a_load() -> Loaded =
     mains: [a_main()],
     modules: [{ name: "m", path: "m.ply", at: nowhere() }],
     places: [],
+    pins: [],
     binary_bytes: Some(12582912),
     version: "0.16.0",
   }
@@ -768,9 +812,16 @@ fn answered_over(
     builder.previous[build](diff) -> was,
     builder.stored[build](path, body) -> put,
     env.shipped_digest[sys]() -> "b3:shipped",
+    // A test's project has whatever lockfile it says it has, and a build writes the one that
+    // records the load's pins.
+    fs.read_file[cwd](path) -> lockfile(path),
+    fs.read_file[abs](path) -> lockfile(path),
     fs.write_file[cwd](path, body) -> true,
     fs.write_file[abs](path, body) -> true,
   }
+
+// The lockfile a test's project holds: none, so a build pins what it loaded.
+fn lockfile(path: String) -> Option<Bytes> = None
 
 fn nothing() -> Refusal = { diags: [], places: [] }
 

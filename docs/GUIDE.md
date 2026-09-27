@@ -249,8 +249,23 @@ root package squatting on a dependency's prefix — and a cycle of packages is
 `E0134`. `Git` and `Registry` sources are checked and refused for now: only
 path dependencies resolve.
 
-The manifest is checked on every load; the `min` version and the lockfile
-arrive with resolution (a `Path` dependency is exactly what is on disk).
+The manifest is checked on every load. Resolution is minimal version selection:
+two manifests may ask different floors of one package — the highest floor wins —
+and a dependency below its importer's floor is `E0136`. One version of a package
+serves a whole closure, so a package *of one name at two places* is `E0137`,
+naming both requesters and both paths, while a package two others both depend on
+is an ordinary diamond and resolves to the one version they agree on.
+
+`ply build` records what it resolved in `ply.lock`, beside the package's own
+`ply.pkg`: every dependency's name, its version, and the BLAKE3 digest of the
+modules it contributed, sorted by name. A package is pinned by *what* it is and
+never by where it was found, so a moved checkout keeps its pin. A build verifies
+the lock before it writes an artifact — a dependency whose sources moved since it
+was pinned is `E0138`, and a lock this `ply` cannot read is `E0139` — and writes
+one when the closure it resolved is not the one on file. Deleting the lockfile,
+or one package's entry in it, pins what is on disk now: that is how a change to a
+dependency is accepted, deliberately. `Git` and `Registry` sources arrive with
+resolution.
 
 ## 4. Types
 
@@ -1717,7 +1732,7 @@ $ ply run app.plyx --host
 
 A library package — one whose manifest names no entry and which declares no
 `main` — has no closure to ship and is refused (`E0101`); library artifacts
-(`.plyz`) arrive with resolution (§3.3), the way the lockfile does.
+(`.plyz`) arrive with resolution (§3.3).
 
 `ply build` writes the closure of one entry point (default `main`) as a `.plyx`
 file (default `<entry module>.plyx`): its definitions, printed back to source
@@ -1891,6 +1906,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0135` | a dependency that is missing, unmanifested or not a path |
 | `E0136` | a dependency below the version floor its importer asks for |
 | `E0137` | one package reached at two places, where a closure pins one version |
+| `E0138` | a dependency whose sources are not what `ply.lock` pinned |
+| `E0139` | a `ply.lock` that does not decode or is from another format |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |

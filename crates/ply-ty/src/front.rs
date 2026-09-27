@@ -88,6 +88,16 @@ pub enum Literal {
     Bytes(Vec<u8>),
 }
 
+/// One dependency as `ply.lock` pins it: what it calls itself, the version it declares, and the
+/// BLAKE3 digest of the modules it contributed. Read from the front end's answer, whose package
+/// judgments are what make a pin mean one thing rather than a path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pinned {
+    pub name: String,
+    pub version: String,
+    pub digest: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Front {
     pub diagnostics: Vec<Diagnostic>,
@@ -96,6 +106,9 @@ pub struct Front {
     /// The closure's packages as `(prefix, declared dep prefixes)`; empty for a project
     /// without packages.
     pub packages: Vec<(String, Vec<String>)>,
+    /// The closure's dependencies, in package order, as a lockfile pins them. The root package is
+    /// the project's own sources and has no entry.
+    pub pins: Vec<Pinned>,
     /// Each module's package, in program order: an index into `packages`, or one past the end
     /// for a module the toolchain ships.
     pub mod_pkg: Vec<usize>,
@@ -169,6 +182,12 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
             p.field("dep", dep.as_str());
         }
         p.frame(&mut out, "pkg", prefix.as_str());
+    }
+    for pin in &front.pins {
+        let mut p = Payload::default();
+        p.field("version", &pin.version);
+        p.field("digest", &pin.digest);
+        p.frame(&mut out, "pin", &pin.name);
     }
     let mut p = Payload::default();
     for i in &front.mod_pkg {
@@ -644,6 +663,23 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
                     }
                 }
                 front.packages.push((name.to_string(), deps));
+            }
+            "pin" => {
+                let fields = Fields::of(payload, &what)?;
+                let mut version = None;
+                let mut digest = None;
+                for (key, text) in fields.all() {
+                    match key {
+                        "version" => fields.once(&mut version, key, text)?,
+                        "digest" => fields.once(&mut digest, key, text)?,
+                        other => return Err(unknown_field(&what, other)),
+                    }
+                }
+                front.pins.push(Pinned {
+                    name: name.to_string(),
+                    version: fields.required(version, "version")?.to_string(),
+                    digest: fields.required(digest, "digest")?.to_string(),
+                });
             }
             "modpkg" => {
                 let fields = Fields::of(payload, &what)?;
