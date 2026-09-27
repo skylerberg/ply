@@ -285,6 +285,8 @@ pub fn run<F>(
     targets: &[&DefInfo],
     budget: usize,
     search: &ply_eval::sim::Plan,
+    choice: &ply_test::Choice,
+    plan: &crate::tester::Plan,
     hosts: &Hosts,
     runtime: &Option<F>,
 ) -> Report
@@ -326,6 +328,8 @@ where
             &mutant,
             &reached,
             search,
+            choice,
+            plan,
             hosts,
             runtime,
             &mut scratch.store,
@@ -345,6 +349,8 @@ fn judge<F>(
     mutant: &Mutant,
     reached: &[usize],
     search: &ply_eval::sim::Plan,
+    choice: &ply_test::Choice,
+    plan: &crate::tester::Plan,
     hosts: &Hosts,
     runtime: &Option<F>,
     store: &mut ply_store::Store,
@@ -360,7 +366,25 @@ where
     let Ok(provider) = ply_codegen::Unit::over_front(&front, texts) else {
         return Verdict::Unresolved("the C backend could not be built");
     };
-    let mut selection = ply_test::select(&front.check, &front.hashes, store, search);
+    // The mutant's selection is the program's decision over tests whose hashes this store has never
+    // seen, so a test the program found in the cache is new here. Everything else — the classes they
+    // share, the roots a seeded test owes, the reason for a nondet one — is the program's.
+    // Nothing is known about this program yet, so every test the run reports on runs, and the
+    // classes are one: a mutant's verdict is behaviour, and a class is only a way to overlap
+    // behaviour that does not conflict. The reasons stay the program's, with `cached` read as `new`.
+    let mut fresh = choice.clone();
+    fresh.runs = plan.visible.clone();
+    fresh.groups = vec![plan.visible.clone()];
+    fresh.narrowed.clear();
+    fresh.reasons = fresh
+        .reasons
+        .iter()
+        .map(|reason| match reason {
+            ply_test::Reason::Cached => ply_test::Reason::New,
+            other => *other,
+        })
+        .collect();
+    let mut selection = crate::tester::decided(&fresh, plan, &front.check, search);
     let wanted: BTreeSet<usize> = reached.iter().copied().collect();
     selection.to_run.retain(|i| wanted.contains(i));
     selection
