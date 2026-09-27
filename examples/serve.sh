@@ -162,6 +162,12 @@ settings=(
   --drain-ms 30000
 )
 
+# The desk serves its own `db`, so where to reach it is an ordinary setting rather than a flag the
+# host reads: `--db` here is the script's own argument, and this is what carries it into the run.
+if [ -n "$db" ]; then
+  settings+=(--set "DESK_DATABASE=$db")
+fi
+
 # `--locked` for the same reason `same-tests.sh` passes it, and it matters more
 # here: `same-tests.sh` starts this script twice, so this line is on the CI path
 # too, and an unlocked build here would update the `Cargo.lock` that job's own
