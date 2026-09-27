@@ -26,7 +26,7 @@ type Refusal = Unit
 type Ran = Unit
 type Key = {
   index: Int, label: String, name: String, module: String,
-  cache_key: Option<String>, seeded: Bool, cached: Option<String>,
+  cache_key: Option<String>, seeded: Bool, nondet: Bool, cached: Option<String>,
 }
 type Hashed = { name: String, hash: String, test: Bool }
 type Plan = { mode: String, seeds: Int, budget: String, steps: String }
@@ -75,7 +75,9 @@ fn main(root: String) -> Bool / {
       // under it yet, and the key is the test's own hash rather than a search's.
       let one = match list_at(keys, 0) {
         Some(k) -> match k.cache_key {
-          Some(_) -> !k.seeded && k.cached == None && k.name == "p.doubles" && k.label == "doubles",
+          // The test is deterministic, so a selection may trust the store about it.
+          Some(_) -> !k.seeded && !k.nondet && k.cached == None && k.name == "p.doubles"
+            && k.label == "doubles",
           None -> false,
         },
         None -> false,
