@@ -12,8 +12,9 @@ import patterns (Lit, LInt, LStr, LBytes)
 import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform,
              NLabel, NCell, NLambda, NSim, NHandle, NField, NUpd, CField, CArm, CClause, CStmt,
              CLet, CLetPat, CDo, CPat, CPatField, PxCtor, PxRecord, PxList, lower_fn, dump)
-import tycore (Atom, Resource, RNamed, RSingleton, Scheme, atoms_text, atoms_insert, read_atoms,
-               scheme_text, type_text, at, append, take, contains_bytes, contains_int)
+import tycore (Atom, Resource, RNamed, RSingleton, Scheme, Type, TyFn, atoms_text, atoms_insert,
+               read_atoms, scheme_text, type_text, Printer, printer_new, print_ty, at, append, take,
+               contains_bytes, contains_int)
 import resolve (Source, Mod, Diag, Label, Edit, Fix, Resolved, Resolved_, Failed, Ns, NValue,
                 NEffect, resolve_modules, qualify, lookup, find, is_bare, diag1, backticked,
                 import_module_name, path_span)
@@ -505,6 +506,173 @@ fn hash_rows(index: Index, h: HashOutput) -> List<HashFrame> = {
 }
 
 // A `fn` also names its clauses' kinds in order, so each clause's root can be keyed.
+// --- The emitter's root keys -------------------------------------------------
+
+// One root the emitter caches a compiled body under, and the key it caches it by: a digest of
+// what emitting it reads of the rest of the program. `crates/ply-codegen`'s `Source` reads these.
+type KeyRow = { root: Bytes, key: Bytes }
+
+// The walk's place: the rows so far, this module's test and law ordinals, and which law text the
+// next law is keyed by.
+type Keying = { out: List<KeyRow>, ordinal: Int, law_ordinal: Int, law_at: Int }
+
+// What emitting a definition reads of it: its parameter and answer types printed with one printer,
+// and whether it is pure, so a nullary call can come from the constant table.
+fn key_published(d: DefInfo) -> Bytes = {
+  let (params, ret) = match d.scheme.ty { TyFn(f) -> (f.params, f.ret), other -> ([], other) };
+  let printed = fold(
+    params,
+    { p: printer_new(), texts: [] },
+    |acc: { p: Printer, texts: List<Bytes> }, t: Type| {
+      let out = print_ty(acc.p, t);
+      { p: out.p, texts: push(acc.texts, out.s) }
+    },
+  );
+  let pure = if len(d.footprint) == 0 && len(d.constraints) == 0 { b"true" } else { b"false" };
+  bytes_concat_all([
+    b"(",
+    joined(printed.texts, b", "),
+    b") -> ",
+    print_ty(printed.p, ret).s,
+    b" ",
+    pure,
+  ])
+}
+
+fn key_clause_root(owner: Bytes, kind: Bytes, k: Int) -> Bytes =
+  bytes_concat_all([owner, b"#", kind, b"#", num(k)])
+
+fn key_law_root(n: Int, part: Bytes) -> Bytes = bytes_concat_all([b"law#", num(n), b".", part])
+
+fn key_test_root(n: Int) -> Bytes = bytes_concat(b"test#", num(n))
+
+// A digest of what emitting the root hashed under `key` reads of the rest of the program: the
+// signature of `owner` (the root, or a clause's definition), the signature of every definition it
+// references, and every `type` or `effect` declaration it mentions, sorted by name.
+fn key_reads(
+  defs: Map<Bytes, DefInfo>,
+  deps: Map<Bytes, List<Bytes>>,
+  decls: Map<Bytes, Bytes>,
+  key: Bytes,
+  owner: Option<Bytes>,
+) -> Bytes = {
+  let owner_text = match owner {
+    Some(o) -> match map_get(defs, o) { Some(d) -> key_published(d), None -> b"" },
+    None -> b"",
+  };
+  let names = match map_get(deps, key) {
+    Some(ns) -> map_keys(map_of_entries(map(ns, |n: Bytes| { key: n, value: () }))),
+    None -> [],
+  };
+  let each = map(names, |name: Bytes| {
+    let published = match map_get(defs, name) { Some(d) -> key_published(d), None -> b"" };
+    let decl = match map_get(decls, name) { Some(h) -> h, None -> b"" };
+    bytes_concat_all([name, b"\x00", published, decl, b"\x00"])
+  });
+  bytes_slice(hex(blake3(bytes_concat_all(append([owner_text, b"\x00"], each)))), 0, 32)
+}
+
+// One `fn`'s clause keys, then its own.
+fn key_fn(
+  defs: Map<Bytes, DefInfo>,
+  own: Map<Bytes, Bytes>,
+  sentences: Map<Bytes, List<Bytes>>,
+  deps: Map<Bytes, List<Bytes>>,
+  decls: Map<Bytes, Bytes>,
+  a: Keying,
+  name: Bytes,
+  spec: List<SpecClause>,
+) -> Keying =
+  match map_get(own, name) {
+    None -> a,
+    Some(owner) -> {
+      let read = key_reads(defs, deps, decls, name, Some(name));
+      let sents = match map_get(sentences, name) { Some(s) -> s, None -> [] };
+      let clauses = fold(
+        range(0, len(spec)),
+        { out: a.out, requires: 0, ensures: 0 },
+        |b: { out: List<KeyRow>, requires: Int, ensures: Int }, i: Int| {
+          let kind = at(spec, i).kind;
+          let text = match kind { SRequires -> b"requires", SEnsures -> b"ensures" };
+          let k = if kind == SRequires { b.requires } else { b.ensures };
+          let sentence = match list_at(sents, i) { Some(s) -> s, None -> owner };
+          {
+            out: push(b.out, {
+              root: key_clause_root(name, text, k),
+              key: bytes_concat_all([hex(sentence), b"#", text, b"#", num(k), b"+", read]),
+            }),
+            requires: if kind == SRequires { b.requires + 1 } else { b.requires },
+            ensures: if kind == SEnsures { b.ensures + 1 } else { b.ensures },
+          }
+        },
+      );
+      {
+        ..a,
+        out: push(clauses.out, { root: name, key: bytes_concat_all([hex(owner), b"+", read]) }),
+      }
+    },
+  }
+
+fn root_keys(mods: List<Mod>, c: Front, h: HashOutput) -> List<KeyRow> = {
+  let own = by_name_one(h.own);
+  let sentences = by_name_many(h.spec_texts);
+  let deps = by_name_names(h.deps);
+  let decls = by_name_one(h.decls);
+  let defs = map_of_entries(map(c.defs, |d: DefInfo| { key: d.name, value: d }));
+  let laws = c.laws;
+  let law_texts = h.law_texts;
+  fold(mods, { out: [], ordinal: 0, law_ordinal: 0, law_at: 0 }, |acc: Keying, m: Mod| {
+    let walked = fold(
+      m.module.items,
+      { out: acc.out, ordinal: 0, law_ordinal: 0, law_at: acc.law_at },
+      |a: Keying, it: Item|
+        match it {
+          IFn(d) ->
+            key_fn(defs, own, sentences, deps, decls, a, qualify(m.name, d.name.name), d.spec),
+          ITest(d) -> {
+            let name = qualify(m.name, d.name);
+            let read = key_reads(defs, deps, decls, name, None);
+            {
+              ..a,
+              ordinal: a.ordinal + 1,
+              out: push(a.out, {
+                root: qualify(m.name, key_test_root(a.ordinal)),
+                key: bytes_concat(b"test+", read),
+              }),
+            }
+          },
+          ILaw(d) -> {
+            let name = qualify(m.name, d.name);
+            let keyed = match list_at(law_texts, a.law_at) {
+              None -> a,
+              Some(text) -> {
+                let read = key_reads(defs, deps, decls, name, None);
+                let guarded = match list_at(laws, a.law_at) {
+                  Some(l) -> l.has_guard,
+                  None -> false,
+                };
+                fold(
+                  if guarded { [b"guard", b"body"] } else { [b"body"] },
+                  a,
+                  |b: Keying, part: Bytes| {
+                    let row = {
+                      root: qualify(m.name, key_law_root(a.law_ordinal, part)),
+                      key: bytes_concat_all([hex(text), b"#", part, b"+", read]),
+                    };
+                    { ..b, out: push(b.out, row) }
+                  },
+                )
+              },
+            };
+            { ..keyed, law_ordinal: a.law_ordinal + 1, law_at: a.law_at + 1 }
+          },
+          _ -> a,
+        },
+    );
+    { out: walked.out, ordinal: 0, law_ordinal: 0, law_at: walked.law_at }
+  }).out
+}
+
 fn ordinal_row(m: Mod) -> OrdinalRow =
   {
     module: m.name,
@@ -551,6 +719,7 @@ fn tables(
     ctors: map(c.ctors, ctor_row),
     hashes: hash_rows(index, h),
     hashes_digest: digest(h),
+    keys: root_keys(mods, c, h),
     ordinals: map(mods, ordinal_row),
     bodies: h.bodies,
     test_bodies: h.test_bodies,
@@ -848,6 +1017,7 @@ pub fn dump_of(a: Analysis) -> Dump =
         ctors: [],
         hashes: [],
         hashes_digest: b"",
+        keys: [],
         ordinals: [],
         bodies: [],
         test_bodies: [],
@@ -1513,6 +1683,7 @@ pub type Dump = {
   ctors: List<CtorRow>,
   hashes: List<HashFrame>,
   hashes_digest: Bytes,
+  keys: List<KeyRow>,
   ordinals: List<OrdinalRow>,
   bodies: List<BodyRow>,
   test_bodies: List<Bytes>,
@@ -1534,6 +1705,7 @@ pub fn empty_dump() -> Dump =
     ctors: [],
     hashes: [],
     hashes_digest: b"",
+    keys: [],
     ordinals: [],
     bodies: [],
     test_bodies: [],
@@ -1755,6 +1927,7 @@ fn table_frames(d: Dump) -> List<Bytes> =
     map(d.ctors, ctor_frame),
     map(d.hashes, hash_frame),
     [framed(b"hashesdigest", b"_", [hex(d.hashes_digest)])],
+    map(d.keys, |k: KeyRow| framed(b"key", k.root, [k.key])),
     map(d.ordinals, ordinal_frame),
     map(d.bodies, |b: BodyRow| framed(b"body", b.name, [hex(b.body)])),
     map(range(0, len(d.test_bodies)), |i: Int|
@@ -2642,6 +2815,7 @@ fn frame_kinds() -> List<Bytes> =
     b"pkg",
     b"modpkg",
     b"hashesdigest",
+    b"key",
   ]
 
 // A kind's tag, or -1 for one this reader does not know. Looked up rather than compared down a
@@ -2703,7 +2877,8 @@ fn bulk_row(d: Dump, tag: Int, name: Bytes, u: Frame, what: Bytes) -> Result<Dum
   } else if tag == 12 {
     let bytes = unhexed(what, u.body)?;
     Ok({ ..d, bodies: push(d.bodies, { name: name, body: bytes }) })
-  } else if tag == 16 { Ok({ ..d, hashes_digest: unhexed(what, u.body)? }) } else {
+  } else if tag == 16 { Ok({ ..d, hashes_digest: unhexed(what, u.body)? }) }
+  else if tag == 17 { Ok({ ..d, keys: push(d.keys, { root: name, key: u.body }) }) } else {
     match numbered(what, name, len(d.test_bodies)) {
       Err(e) -> Err(e),
       Ok(_) -> {
@@ -2911,6 +3086,27 @@ fn past(d: Bytes, head: Bytes) -> Int =
     Some(i) -> i + bytes_len(head),
     None -> panic("the dump holds the frame"),
   }
+
+test "the emitter's root keys cover every root and no two share one" {
+  let src = b"fn pos(x: Int) -> Bool = x > 0\nfn f(x: Int) -> Int requires pos(x) ensures x >= 0 = x\ntest \"t\" { assert_eq(f(1), 1) }\nlaw \"l\" forall (x: Int) { f(x) == x }";
+  match analyse(parse_all([{ name: b"m", src: src }])) {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) -> {
+      let keys = root_keys(w.mods, w.checked, w.hashes);
+      assert_eq(map(keys, |k: KeyRow| k.root), [
+        b"m.pos",
+        b"m.f#requires#0",
+        b"m.f#ensures#0",
+        b"m.f",
+        b"m.test#0",
+        b"m.law#0.body",
+      ]);
+      // No two roots share a key, or a cache would serve one body for another.
+      let distinct = map_keys(map_of_entries(map(keys, |k: KeyRow| { key: k.key, value: () })));
+      assert_eq(len(distinct), len(keys));
+    },
+  }
+}
 
 test "a diagnostic ends the dump where diag_dump would" {
   assert_eq(

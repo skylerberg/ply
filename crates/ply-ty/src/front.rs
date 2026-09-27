@@ -116,6 +116,8 @@ pub struct Front {
     pub hashes: HashOutput,
     /// The digest of [`hashes`](Front::hashes), as the compiler computed it.
     pub hashes_digest: DefHash,
+    /// The emitter's root cache keys, by root name, as the compiler computed them.
+    pub keys: IndexMap<Symbol, String>,
     /// The hasher's item order: every hashed name, test and law, as the `hash` frames are written.
     pub hash_order: Vec<Hashed>,
     /// Per module in program order, its keyable items in source order.
@@ -369,6 +371,9 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
 
     write_hashes(front, &mut out)?;
     raw_frame(&mut out, "hashesdigest", "_", &front.hashes_digest.to_hex());
+    for (root, key) in &front.keys {
+        raw_frame(&mut out, "key", root.as_str(), key);
+    }
 
     for (module, items) in &front.ordinals {
         let mut p = Payload::default();
@@ -781,6 +786,11 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
                     return Err(format!("{what} is written twice"));
                 }
                 front.hash_order.push(Hashed::Law(i));
+            }
+            "key" => {
+                let text =
+                    std::str::from_utf8(payload).map_err(|e| format!("{what}: not UTF-8: {e}"))?;
+                front.keys.insert(Symbol::new(name), text.to_string());
             }
             "hashesdigest" => {
                 let text =
