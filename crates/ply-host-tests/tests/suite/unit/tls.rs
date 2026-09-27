@@ -25,17 +25,16 @@ struct Material {
 /// Generated, not checked in: a committed certificate is either expired or ships its private key.
 fn material() -> Material {
     let dir = tempfile::tempdir().expect("a temp dir");
-    let issued =
-        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen issues");
+    let issued = ply_host::certgen::issue(&[]).expect("a certificate is issued");
     let certificate = dir.path().join("cert.pem");
     let key = dir.path().join("key.pem");
-    std::fs::write(&certificate, issued.cert.pem()).expect("the certificate is written");
-    std::fs::write(&key, issued.signing_key.serialize_pem()).expect("the key is written");
+    std::fs::write(&certificate, &issued.certificate).expect("the certificate is written");
+    std::fs::write(&key, &issued.key).expect("the key is written");
     Material {
         dir,
         certificate,
         key,
-        der: issued.cert.der().clone(),
+        der: rustls::pki_types::CertificateDer::from(issued.der),
     }
 }
 

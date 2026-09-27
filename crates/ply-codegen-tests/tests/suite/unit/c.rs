@@ -1797,3 +1797,35 @@ pub fn steady() -> Int = 7
         let _ = numbering_support::body(code, &numbering_support::symbol(&first, name));
     }
 }
+
+/// A pure computation whose value is only observed is still run. `observe` goes through a helper
+/// the C compiler cannot see into, so it cannot drop the calls and answer the constant.
+#[test]
+fn an_observed_pure_computation_is_not_optimized_away() {
+    const SOURCE: &str = r#"
+fn step(n: Int) -> Int = n + 1
+
+fn work(n: Int) -> Int = step(step(step(n)))
+
+fn bench(n: Int) -> Int = {
+  let _ = observe(work(n));
+  0
+}
+"#;
+    let Some((_source, native)) = tests_support::unit(SOURCE) else {
+        return;
+    };
+    let entry: ply_codegen::rt::Entry = native.entry("m.bench").expect("`m.bench` compiled");
+    let mut ctx = native.context();
+    ctx.begin(1_000);
+    let args = [ply_codegen::heap::imm(1)];
+    let answer = unsafe { entry(&mut ctx, args.as_ptr()) };
+    let (failed, ticks) = (ctx.failed, ctx.ticks);
+    ctx.end();
+    assert_eq!(failed, 0, "`m.bench` raised");
+    assert_eq!(ply_codegen::heap::imm_value(answer), 0);
+    assert!(
+        ticks >= 4,
+        "the observed call was optimized away: {ticks} calls made"
+    );
+}
