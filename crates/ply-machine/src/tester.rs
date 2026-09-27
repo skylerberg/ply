@@ -33,6 +33,13 @@ use std::sync::{Arc, Mutex, mpsc};
 /// else: no other command runs a corpus.
 const EFFECT: &str = "tester";
 
+/// The modules the change set's and the trial's vocabulary is declared in. A constructor the runtime
+/// builds has to carry the name the program's own spine gives it, and that name is `<module>::<Case>`
+/// — the source's `.` and `payload::ctor`'s `.` are both wrong for a value the program *matches* on.
+/// Getting it wrong is a placeless `no arm of this match matched` the moment the program matches.
+const DELTA: &str = "suite.delta";
+const BISECT: &str = "suite.bisect";
+
 const OPERATIONS: [(&str, &str); 12] = [
     ("configure", "ply_machine::tester::configure"),
     ("loaded", "ply_machine::test::loaded"),
@@ -2557,12 +2564,16 @@ fn trial(
 /// result it already had.
 fn trial_value(trial: &ply_test::bisect::Trial) -> PlyValue {
     let outcome = match trial.outcome {
-        ply_test::bisect::TrialOutcome::Fails => PlyValue::ctor("Fails", Vec::new()),
-        ply_test::bisect::TrialOutcome::Passes => PlyValue::ctor("Passes", Vec::new()),
+        ply_test::bisect::TrialOutcome::Fails => crate::payload::ctor(BISECT, "Fails", Vec::new()),
+        ply_test::bisect::TrialOutcome::Passes => {
+            crate::payload::ctor(BISECT, "Passes", Vec::new())
+        }
         // The case names are the ones `suite.bisect` declares, so the program matches on them.
-        ply_test::bisect::TrialOutcome::Unresolved(why) => PlyValue::ctor(
+        ply_test::bisect::TrialOutcome::Unresolved(why) => crate::payload::ctor(
+            BISECT,
             "Unresolved",
-            vec![PlyValue::ctor(
+            vec![crate::payload::ctor(
+                BISECT,
                 match why {
                     ply_test::bisect::Unresolved::DoesNotCheck => "DoesNotCheck",
                     ply_test::bisect::Unresolved::DifferentFailure => "DifferentFailure",
@@ -2587,7 +2598,7 @@ fn change_set_value(view: &ChangeSetView) -> PlyValue {
         ("test_classified", PlyValue::Bool(view.test_classified)),
         (
             "absent",
-            PlyValue::ctor(skipped_ctor(view.absent), Vec::new()),
+            crate::payload::ctor(BISECT, skipped_ctor(view.absent), Vec::new()),
         ),
         (
             "at",
@@ -2626,7 +2637,10 @@ fn delta_value(delta: &ply_test::bisect::Delta) -> PlyValue {
 fn change_value(change: &ply_test::bisect::Change) -> PlyValue {
     record(vec![
         ("name", PlyValue::str(change.name.as_str())),
-        ("ns", PlyValue::ctor(ns_ctor(change.ns), Vec::new())),
+        (
+            "ns",
+            crate::payload::ctor(DELTA, ns_ctor(change.ns), Vec::new()),
+        ),
         (
             "before",
             option(change.before.map(|h| PlyValue::str(h.to_hex()))),
@@ -2635,7 +2649,10 @@ fn change_value(change: &ply_test::bisect::Change) -> PlyValue {
             "after",
             option(change.after.map(|h| PlyValue::str(h.to_hex()))),
         ),
-        ("kind", PlyValue::ctor(kind_ctor(change.kind), Vec::new())),
+        (
+            "kind",
+            crate::payload::ctor(DELTA, kind_ctor(change.kind), Vec::new()),
+        ),
         ("independent", PlyValue::Bool(change.independent)),
     ])
 }
@@ -2655,7 +2672,7 @@ fn cluster_value(cluster: &ply_test::bisect::Cluster) -> PlyValue {
                     .map(|k| {
                         record(vec![
                             ("name", PlyValue::str(k.name.as_str())),
-                            ("ns", PlyValue::ctor(ns_ctor(k.ns), Vec::new())),
+                            ("ns", crate::payload::ctor(DELTA, ns_ctor(k.ns), Vec::new())),
                         ])
                     })
                     .collect(),
@@ -2663,7 +2680,7 @@ fn cluster_value(cluster: &ply_test::bisect::Cluster) -> PlyValue {
         ),
         (
             "reason",
-            PlyValue::ctor(reason_ctor(cluster.reason), Vec::new()),
+            crate::payload::ctor(DELTA, reason_ctor(cluster.reason), Vec::new()),
         ),
     ])
 }
