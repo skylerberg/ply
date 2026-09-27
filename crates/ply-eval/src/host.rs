@@ -658,7 +658,7 @@ pub fn operation_label(effect: &Symbol, op: &Symbol, resource: Option<&Symbol>) 
 }
 
 /// Codes a host handler may not raise.
-pub const RESERVED_CODES: [&str; 20] = [
+pub const RESERVED_CODES: [&str; 17] = [
     codes::INTERNAL_ERROR,
     codes::SIMULATION_DIVERGENCE,
     codes::DEADLOCK,
@@ -674,9 +674,6 @@ pub const RESERVED_CODES: [&str; 20] = [
     codes::HOST_BLOCKING_ANSWER,
     codes::SECRET_TO_HOST,
     codes::REGION_ESCAPE_AT_BOUNDARY,
-    codes::DB_NOT_CONFIGURED,
-    codes::DB_SCHEMA_MISMATCH,
-    codes::DB_UNMODELLED_SIDE_EFFECT,
     // Raised by the artifact loader before any binding exists.
     codes::ARTIFACT_INVALID,
     codes::ARTIFACT_VERSION,
