@@ -1,15 +1,10 @@
-use crate::harness::{process, repo};
+use crate::harness::{Reservation, connect_when_ready, process, repo};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const STARTUP: Duration = Duration::from_secs(30);
-
-fn reserve_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral port");
-    listener.local_addr().expect("a bound address").port()
-}
 
 /// Plus the `main` the example deliberately lacks: `examples/hello.ply` holds the only one under `examples/`.
 fn project(port: u16, connections: u32) -> tempfile::TempDir {
@@ -59,20 +54,9 @@ impl Server {
     }
 
     fn connect(&mut self) -> TcpStream {
-        let deadline = Instant::now() + STARTUP;
-        loop {
-            if let Some(status) = self.running().try_wait().expect("the child is waitable") {
-                let output = self.take();
-                panic!("`ply run --host` exited {status} before listening:\n{output}");
-            }
-            match TcpStream::connect_timeout(&self.addr, Duration::from_millis(250)) {
-                Ok(stream) => return stream,
-                Err(e) if Instant::now() >= deadline => {
-                    panic!("nothing listening on {} after {STARTUP:?}: {e}", self.addr)
-                }
-                Err(_) => std::thread::sleep(Duration::from_millis(25)),
-            }
-        }
+        let addr = self.addr;
+        connect_when_ready(self.running(), addr, STARTUP, |_| true)
+            .unwrap_or_else(|why| panic!("{why}"))
     }
 
     fn finish(mut self) {
@@ -147,12 +131,15 @@ fn body_of(response: &str) -> &str {
 
 #[test]
 fn a_json_payload_over_a_real_socket_is_decoded_and_answered_by_a_derived_codec() {
-    let port = reserve_port();
+    let reserved = Reservation::take();
+    let port = reserved.port();
     let dir = project(port, 2);
     let mut server = Server::start(dir.path(), port);
 
+    let first = server.connect();
+    reserved.bound();
     let accepted = exchange(
-        server.connect(),
+        first,
         &post(r#"{"customer":"ada","lines":[{"sku":"widget","qty":3,"unit_price":1.05}]}"#),
     );
     assert!(

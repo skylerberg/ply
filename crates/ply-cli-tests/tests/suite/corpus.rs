@@ -1,8 +1,7 @@
-use crate::harness::{ply, process, repo};
+use crate::harness::{Reservation, connect_when_ready, ply, process, repo};
 use serde_json::Value;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn compiler_copy() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -201,12 +200,9 @@ fn the_compiled_tier_judges_the_corpus_specifications() {
 
 #[test]
 fn a_served_example_with_the_tier_holding_its_accept_loop() {
+    let reserved = Reservation::take();
+    let port = reserved.port();
     let dir = tempfile::tempdir().unwrap();
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     let source = std::fs::read_to_string(repo().join("examples/hello.ply")).unwrap();
     assert!(
         source.contains("fn port() -> Int = 8080\n")
@@ -232,27 +228,14 @@ fn a_served_example_with_the_tier_holding_its_accept_loop() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let started = Instant::now();
-    let mut stream = loop {
-        if let Ok(s) = TcpStream::connect_timeout(
-            &format!("127.0.0.1:{port}").parse().unwrap(),
-            Duration::from_millis(200),
-        ) {
-            break s;
-        }
-        if let Some(status) = child.try_wait().unwrap() {
-            let out = child.wait_with_output().unwrap();
-            panic!(
-                "the server exited {status} before listening:\n{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(120),
-            "the server did not listen within two minutes"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    let mut stream = connect_when_ready(
+        &mut child,
+        format!("127.0.0.1:{port}").parse().unwrap(),
+        Duration::from_secs(120),
+        |_| true,
+    )
+    .unwrap_or_else(|why| panic!("{why}"));
+    reserved.bound();
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
