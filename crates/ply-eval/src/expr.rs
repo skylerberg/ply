@@ -1,6 +1,6 @@
 //! Operators and literals, shared by the evaluator, the prover and the code generator.
 
-use ply_ty::IntTy;
+use crate::IntTy;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Lit {

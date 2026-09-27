@@ -15,9 +15,11 @@ pub mod explore;
 pub mod expr;
 pub mod handler;
 pub mod host;
+pub mod intty;
 pub mod limit;
 pub mod list;
 pub use expr::{BinOp, Lit, UnOp, render_float};
+pub use intty::{INT_TYPES, IntTy};
 pub use list::List;
 pub mod evaluator;
 pub mod map;
@@ -66,6 +68,6 @@ pub use sim::{
 };
 pub use trace::Trace;
 pub use value::{
-    Closure, ClosureKind, Decimal, Fields, Fixed, IntTy, Map, SECRET_REDACTED, Synth, Value,
+    Closure, ClosureKind, Decimal, Fields, Fixed, Map, SECRET_REDACTED, Synth, Value,
     constant_time_eq, first_difference, values_equal,
 };

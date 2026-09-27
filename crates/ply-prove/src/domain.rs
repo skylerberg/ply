@@ -2,9 +2,9 @@
 
 use crate::ENUMERATION_BOUND;
 use crate::property::TypeWorld;
+use ply_eval::IntTy;
 use ply_eval::{Fixed, Value};
 use ply_span::Symbol;
-use ply_ty::IntTy;
 use ply_ty::Type;
 use std::collections::BTreeMap;
 

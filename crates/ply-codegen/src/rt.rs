@@ -1212,10 +1212,10 @@ pub unsafe extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
     ctx.fail(d);
 }
 
-/// An `Int` outside the target width; `which` indexes [`ply_ty::INT_TYPES`].
+/// An `Int` outside the target width; `which` indexes [`ply_eval::INT_TYPES`].
 pub unsafe extern "C" fn rt_not_that_width(ctx: *mut Ctx, which: i64, value: i64) {
     let ctx = unsafe { &mut *ctx };
-    let t = ply_ty::INT_TYPES[which as usize];
+    let t = ply_eval::INT_TYPES[which as usize];
     let d = error(format!(
         "`{}` was given {value}: `{t}` holds {} to {}",
         t.of_int_name(),
@@ -2751,12 +2751,12 @@ pub unsafe extern "C" fn rt_not_a_list(ctx: *mut Ctx, which: i64, value: i64) {
     ctx.fail(d);
 }
 
-/// A shift count outside the word; `which` indexes [`ply_ty::INT_TYPES`], or is `-1` for `Int`.
+/// A shift count outside the word; `which` indexes [`ply_eval::INT_TYPES`], or is `-1` for `Int`.
 pub unsafe extern "C" fn rt_shift_count(ctx: *mut Ctx, n: i64, which: i64) {
     let ctx = unsafe { &mut *ctx };
     let (ty, width) = match usize::try_from(which)
         .ok()
-        .and_then(|i| ply_ty::INT_TYPES.get(i))
+        .and_then(|i| ply_eval::INT_TYPES.get(i))
     {
         Some(t) => (t.name(), i64::from(t.bits())),
         None => ("Int", 64),

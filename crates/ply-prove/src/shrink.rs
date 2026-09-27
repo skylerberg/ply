@@ -3,9 +3,9 @@
 use crate::property::{
     HARD_GEN_DEPTH, Judge, Outcome, TypeWorld, Ungeneratable, const_fn, fn_size, judge_case,
 };
+use ply_eval::IntTy;
 use ply_eval::{Decimal, Fixed, List, Value};
 use ply_span::{Diagnostic, Symbol};
-use ply_ty::IntTy;
 use ply_ty::TASK_TYPE;
 use ply_ty::Type;
 use rust_decimal::RoundingStrategy;

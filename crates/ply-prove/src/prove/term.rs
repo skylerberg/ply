@@ -1,7 +1,7 @@
 //! The prover's term language: one hash-consed DAG per obligation.
 
+use ply_eval::IntTy;
 use ply_span::Symbol;
-use ply_ty::IntTy;
 use ply_ty::Type;
 use std::collections::HashMap;
 
