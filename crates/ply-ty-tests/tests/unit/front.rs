@@ -273,6 +273,7 @@ fn sample() -> Front {
         order: vec![sym("std.db"), sym("m")],
         check,
         hashes,
+        hashes_digest: Default::default(),
         hash_order: vec![
             Hashed::Def(sym("std.db.Db")),
             Hashed::Def(sym("std.db.query")),

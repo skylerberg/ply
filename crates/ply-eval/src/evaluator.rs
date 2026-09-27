@@ -143,7 +143,7 @@ impl<'a> Machine<'a> {
     }
 
     pub fn set_compiled(&mut self, compiled: Rc<dyn Compiled>) {
-        if compiled.describes(self.front.hashes.digest()) {
+        if compiled.describes(self.front.hashes_digest) {
             self.compiled = Some(compiled);
             self.share_host();
         }

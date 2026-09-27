@@ -114,6 +114,8 @@ pub struct Front {
     pub mod_pkg: Vec<usize>,
     pub check: CheckOutput,
     pub hashes: HashOutput,
+    /// The digest of [`hashes`](Front::hashes), as the compiler computed it.
+    pub hashes_digest: DefHash,
     /// The hasher's item order: every hashed name, test and law, as the `hash` frames are written.
     pub hash_order: Vec<Hashed>,
     /// Per module in program order, its keyable items in source order.
@@ -366,6 +368,7 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
     }
 
     write_hashes(front, &mut out)?;
+    raw_frame(&mut out, "hashesdigest", "_", &front.hashes_digest.to_hex());
 
     for (module, items) in &front.ordinals {
         let mut p = Payload::default();
@@ -778,6 +781,12 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
                     return Err(format!("{what} is written twice"));
                 }
                 front.hash_order.push(Hashed::Law(i));
+            }
+            "hashesdigest" => {
+                let text =
+                    std::str::from_utf8(payload).map_err(|e| format!("{what}: not UTF-8: {e}"))?;
+                front.hashes_digest = DefHash::from_hex(text)
+                    .ok_or_else(|| format!("{what} holds `{text}`, not a hash"))?;
             }
             "ordinal" => {
                 let mut items = Vec::new();

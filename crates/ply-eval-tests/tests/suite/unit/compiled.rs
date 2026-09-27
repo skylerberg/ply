@@ -165,7 +165,7 @@ fn first_test_under(
 ) -> (Result<(), Diagnostic>, (u64, u64)) {
     let mut machine = c.machine();
     machine.set_compiled(Rc::new(Roots {
-        program: c.front.hashes.digest(),
+        program: c.front.hashes_digest,
         entered: Box::new(entered),
     }));
     let outcome = machine.eval_test(0);
