@@ -34,8 +34,9 @@ pub fn descend<a | e>(
 }
 
 // One pass from `i` on: the first candidate that is smaller *and* still holds is accepted, and the
-// caller starts again from the first value. `None` means the pass changed nothing.
-fn accepted<a | e>(
+// caller starts again from the first value. `stopped` is the budget running out mid-pass, which ends
+// the whole walk rather than the pass — the caller asked for that many re-runs and no more.
+fn pass_over<a | e>(
   width: Int,
   size: (List<Int>, Int) -> Int,
   alts: (List<Int>, Int) -> List<Alt>,
@@ -44,58 +45,49 @@ fn accepted<a | e>(
   choice: List<Int>,
   i: Int,
   evaluations: Int,
-// A pass that accepted nothing still *spent* what it tried, so the count comes back either way:
-// the budget is what the walk did, not only what it kept.
-) -> { chosen: List<Int>, hit: Bool, evaluations: Int } / e =
-  if i >= width {
-    { chosen: choice, hit: false, evaluations: evaluations }
-  } else if evaluations >= budget {
-    { chosen: choice, hit: false, evaluations: evaluations }
-  } else {
+) -> { chosen: List<Int>, hit: Bool, stopped: Bool, evaluations: Int } / e =
+  if i >= width { { chosen: choice, hit: false, stopped: false, evaluations: evaluations } } else {
     let here = size(choice, i);
-    let taken = smaller(alts(choice, i), here, choice, i, holds, evaluations, budget);
-    if taken.hit {
+    let tried = try_alts(alts(choice, i), here, choice, i, holds, budget, evaluations);
+    if tried.stopped {
+      { chosen: choice, hit: false, stopped: true, evaluations: tried.evaluations }
+    } else if tried.hit {
       {
-        chosen: set_at(choice, i, taken.position),
+        chosen: set_at(choice, i, tried.position),
         hit: true,
-        evaluations: taken.evaluations,
+        stopped: false,
+        evaluations: tried.evaluations,
       }
-    } else {
-      accepted(width, size, alts, holds, budget, choice, i + 1, taken.evaluations)
-    }
+    } else { pass_over(width, size, alts, holds, budget, choice, i + 1, tried.evaluations) }
   }
 
-// The candidates at one value, in order: the first one that is smaller than `here` and still holds.
-// A candidate that was *tried* is counted whether or not it was kept, and so is the budget running
-// out: what a caller asked for is the number of re-runs, not the number of improvements.
-fn smaller<a | e>(
+// The candidates at one value, in order. A candidate no smaller than the value is skipped without
+// being counted — nothing was re-run for it — and the budget is checked only for one that would be.
+fn try_alts<a | e>(
   candidates: List<Alt>,
   here: Int,
   choice: List<Int>,
   i: Int,
   holds: (List<Int>) -> Bool / e,
-  evaluations: Int,
   budget: Int,
-) -> { position: Int, hit: Bool, evaluations: Int } / e =
-  if evaluations >= budget {
-    { position: -1, hit: false, evaluations: evaluations }
-  } else {
-    match candidates {
-      [] -> { position: -1, hit: false, evaluations: evaluations },
-      [alt, ..rest] ->
-        if alt.size >= here {
-          smaller(rest, here, choice, i, holds, evaluations, budget)
-        } else {
-          let next = set_at(choice, i, alt.position);
-          if holds(next) {
-            { position: alt.position, hit: true, evaluations: evaluations + 1 }
-          } else {
-            smaller(rest, here, choice, i, holds, evaluations + 1, budget)
-          }
-        },
-    }
+  evaluations: Int,
+) -> { position: Int, hit: Bool, stopped: Bool, evaluations: Int } / e =
+  match candidates {
+    [] -> { position: -1, hit: false, stopped: false, evaluations: evaluations },
+    [alt, ..rest] -> if alt.size >= here {
+      try_alts(rest, here, choice, i, holds, budget, evaluations)
+    } else if evaluations >= budget {
+      { position: -1, hit: false, stopped: true, evaluations: evaluations }
+    } else {
+      let next = set_at(choice, i, alt.position);
+      if holds(next) {
+        { position: alt.position, hit: true, stopped: false, evaluations: evaluations + 1 }
+      } else { try_alts(rest, here, choice, i, holds, budget, evaluations + 1) }
+    },
   }
 
+// The walk: one pass, and if it accepted anything, another from the first value. `steps` is how many
+// candidates were kept; `evaluations` how many were tried.
 fn walk<a | e>(
   width: Int,
   size: (List<Int>, Int) -> Int,
@@ -106,12 +98,13 @@ fn walk<a | e>(
   steps: Int,
   evaluations: Int,
 ) -> Descent / e = {
-  let pass = accepted(width, size, alts, holds, budget, choice, 0, evaluations);
-  if pass.hit {
-    walk(width, size, alts, holds, budget, pass.chosen, steps + 1, pass.evaluations)
-  } else {
+  let pass = pass_over(width, size, alts, holds, budget, choice, 0, evaluations);
+  if pass.stopped {
+    // The budget ran out mid-pass: the walk stops where it is rather than claiming minimality.
     { picked: pass.chosen, steps: steps, evaluations: pass.evaluations }
-  }
+  } else if pass.hit {
+    walk(width, size, alts, holds, budget, pass.chosen, steps + 1, pass.evaluations)
+  } else { { picked: pass.chosen, steps: steps, evaluations: pass.evaluations } }
 }
 
 fn set_at<a>(xs: List<a>, i: Int, x: a) -> List<a> =
@@ -128,19 +121,24 @@ fn at_or<a>(xs: List<a>, i: Int) -> a =
 // A counterexample of one value, whose candidates are 5, 3 and 2 — and which still holds at 3 or 2,
 // but not at 5. Greedy descent takes 3 (the first smaller one), then restarts and takes 2.
 fn sizes_of(choice: List<Int>, i: Int) -> Int =
-  if i == 0 { let p = at_or(choice, 0); if p < 0 { 9 } else { p } } else { 0 }
+  if i == 0 {
+    let p = at_or(choice, 0);
+    if p < 0 { 9 } else { p }
+  } else { 0 }
 
 test "greedy descent takes the first smaller candidate, not the smallest" {
   let out = descend(
     1,
     sizes_of,
-    |_choice: List<Int>, _i: Int| [{ position: 5, size: 5 }, { position: 3, size: 3 }, { position: 2, size: 2 }],
+    |_choice: List<Int>, _i: Int|
+      [{ position: 5, size: 5 }, { position: 3, size: 3 }, { position: 2, size: 2 }],
     |_choice: List<Int>| true,
     64,
   );
-  assert_eq(out.picked, [3]);
-  assert_eq(out.steps, 1);
-  assert_eq(out.evaluations, 1)
+  // 5, then 3, then 2: each is smaller than what it replaced, so each restarts the walk.
+  assert_eq(out.picked, [2]);
+  assert_eq(out.steps, 3);
+  assert_eq(out.evaluations, 3)
 }
 
 test "a candidate that loses the property is skipped, and the next one is tried" {
@@ -161,7 +159,8 @@ test "a budget of re-runs is what stops the walk" {
   let out = descend(
     1,
     sizes_of,
-    |_choice: List<Int>, _i: Int| [{ position: 5, size: 5 }, { position: 3, size: 3 }, { position: 2, size: 2 }],
+    |_choice: List<Int>, _i: Int|
+      [{ position: 5, size: 5 }, { position: 3, size: 3 }, { position: 2, size: 2 }],
     |_choice: List<Int>| true,
     2,
   );
