@@ -458,7 +458,7 @@ test "the regression" { assert_eq(ask(1), expected()) }
 
     let mut sources: Vec<(String, String)> = after.texts.clone().into_iter().collect();
     sources.sort();
-    ply_test::diagnose_failures(&mut report, &sources, &after.port, &mut store);
+    ply_test::diagnose_failures(&mut report, &sources, &after.port, &mut store, true);
 
     // The failure says it reached the host, and no mixture is offered for one: a re-run would
     // repeat whatever was done outside the program.

@@ -954,6 +954,7 @@ pub fn diagnose_failures(
     sources: &[(String, String)],
     front: &ply_ty::Front,
     store: &mut Store,
+    requested: bool,
 ) -> Hybrids {
     let check = &front.check;
     let hashes = &front.hashes;
@@ -1059,7 +1060,10 @@ pub fn diagnose_failures(
         // `nondet`, a host-backed failure and a test that never passed are facts about the record,
         // not conclusions a search reaches. When a change set *is* handed over, the search is the
         // program's and the verdict is its to give.
-        let why = if failure.defect {
+        let why = if !requested {
+            // `--bisect never` is asked before anything else is looked at: the gate's own order.
+            Skipped::NotRequested
+        } else if failure.defect {
             Skipped::Panicked
         } else if nondet {
             Skipped::Nondet
