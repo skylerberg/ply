@@ -3491,7 +3491,7 @@ fn skip_block(b: Bytes, at: Int) -> Int =
   else if bytes_at(b, at) == 42 && bytes_at(b, at + 1) == 47 { at + 2 }
   else { skip_block(b, at + 1) }
 
-fn is_space_byte(c: Int) -> Bool = c == 32 || c == 9 || c == 10 || c == 13
+fn is_space_byte(c: Int) -> Bool = c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
 
 fn is_word_byte(c: Int) -> Bool =
   (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || (c >= 48 && c <= 57)
@@ -3513,6 +3513,285 @@ fn lower_between(b: Bytes, at: Int, end: Int) -> String =
       bytes_concat(acc, byte_of_int(if c >= 65 && c <= 90 { c + 32 } else { c }))
     }),
   )
+
+// What each token of `sql` is, which is what a test of the reader compares and what a refusal
+// quotes back.
+pub fn sql_token_summary(t: SqlTokAt) -> String =
+  match t.tok {
+    SqlWord(w) -> if w.quoted { "quoted:" ++ w.text } else { "word:" ++ w.text },
+    SqlNumber -> "number:" ++ t.text,
+    SqlText -> "text:" ++ t.text,
+    SqlPlaceholder -> "placeholder:" ++ t.text,
+    SqlPunct(p) -> "punct:" ++ p,
+    SqlSemi -> "semi",
+  }
+
+pub fn sql_tokenize_summary(sql: String) -> Result<List<String>, DbError> =
+  match tokenize(sql) {
+    Err(e) -> Err(e),
+    Ok(ts) -> Ok(map(ts, |t: SqlTokAt| sql_token_summary(t))),
+  }
+
+// --- Reading a statement ----------------------------------------------------------
+
+// A statement is read before it is sent: the tables its text reaches are what its endpoints are
+// scheduled on, so a statement whose footprint cannot be computed is refused rather than run with
+// one that under-reports. The reader is a tokenizer and a small parser over it, and it refuses far
+// more than it accepts: `with` is the only admitted construct that can hide a verb.
+
+// What a statement does, which decides the operations that may perform it.
+pub type ScanKind = | KSelect | KInsert | KUpdate | KDelete | KValues
+
+pub fn kind_writes(k: ScanKind) -> Bool =
+  match k { KSelect -> false, KValues -> false, KInsert -> true, KUpdate -> true, KDelete -> true }
+
+pub fn kind_text(k: ScanKind) -> String =
+  match k {
+    KSelect -> "select",
+    KValues -> "values",
+    KInsert -> "insert",
+    KUpdate -> "update",
+    KDelete -> "delete",
+  }
+
+// The tables a statement names, split by what it does to them and deduplicated: one name is one
+// entry, and a table that is written is not also reported as read.
+pub type SqlTables = { written: List<String>, read: List<String> }
+
+pub fn no_sql_tables() -> SqlTables = { written: [], read: [] }
+
+fn sql_note_written(t: SqlTables, name: String) -> SqlTables =
+  { ..t, written: sql_insert_table(t.written, name), read: sql_without_table(t.read, name) }
+
+fn sql_note_read(t: SqlTables, name: String) -> SqlTables =
+  if sql_has_table(t.written, name) { t } else { { ..t, read: sql_insert_table(t.read, name) } }
+
+fn sql_absorb_tables(t: SqlTables, other: SqlTables) -> SqlTables =
+  fold(
+    other.written,
+    fold(other.read, t, |acc: SqlTables, n: String| sql_note_read(acc, n)),
+    |acc: SqlTables, n: String| sql_note_written(acc, n),
+  )
+
+fn sql_has_table(names: List<String>, name: String) -> Bool =
+  fold(names, false, |acc: Bool, n: String| acc || n == name)
+
+fn sql_insert_table(names: List<String>, name: String) -> List<String> =
+  if sql_has_table(names, name) { names } else { push(names, name) }
+
+fn sql_without_table(names: List<String>, name: String) -> List<String> =
+  fold(names, [], |acc: List<String>, n: String| if n == name { acc } else { push(acc, n) })
+
+// --- The tokens --------------------------------------------------------------------
+
+// A token, with the source text it was read from, so a refusal can name it.
+pub type SqlTok =
+  | SqlWord({ text: String, quoted: Bool })
+  | SqlNumber
+  | SqlText
+  | SqlPlaceholder
+  | SqlPunct(String)
+  | SqlSemi
+
+pub type SqlTokAt = { tok: SqlTok, at: Int, text: String }
+
+pub fn sql_is_word(t: SqlTok, word: String) -> Bool =
+  match t { SqlWord(w) -> if w.quoted { false } else { w.text == word }, _ -> false }
+
+pub fn sql_is_punct(t: SqlTok, p: String) -> Bool = match t { SqlPunct(x) -> x == p, _ -> false }
+
+// The tokens of `sql`, in order. Whitespace and comments are dropped, and a quote that is never
+// closed is refused rather than guessed at: past one, the reader cannot tell text from statement.
+pub fn tokenize(sql: String) -> Result<List<SqlTokAt>, DbError> = {
+  let b = bytes_of_string(sql);
+  sql_tokens_from(b, 0, [])
+}
+
+fn sql_tokens_from(b: Bytes, at: Int, acc: List<SqlTokAt>) -> Result<List<SqlTokAt>, DbError> = {
+  let i = sql_skip_trivia(b, at)?;
+  if i >= bytes_len(b) { Ok(acc) } else {
+    let step = sql_next_token(b, i)?;
+    sql_tokens_from(b, step.next, push(acc, step.tok))
+  }
+}
+
+fn sql_skip_trivia(b: Bytes, at: Int) -> Result<Int, DbError> =
+  if at >= bytes_len(b) { Ok(at) }
+  else if is_space_byte(bytes_at(b, at)) { sql_skip_trivia(b, at + 1) } else if bytes_at(b, at)
+      == 45
+      && sql_byte_is(b, at + 1, 45) { sql_skip_trivia(b, sql_past_line(b, at)) } else if bytes_at(
+        b,
+        at,
+      )
+      == 47
+      && sql_byte_is(b, at + 1, 42) {
+    match sql_past_comment(b, at + 2, 1) {
+      Err(_) -> Err(sql_unclosed(b, at, "a block comment")),
+      Ok(e) -> sql_skip_trivia(b, e),
+    }
+  } else { Ok(at) }
+
+fn sql_byte_is(b: Bytes, at: Int, c: Int) -> Bool = at < bytes_len(b) && bytes_at(b, at) == c
+
+fn sql_past_line(b: Bytes, at: Int) -> Int =
+  if sql_byte_is(b, at, 10) { at + 1 } else { sql_past_line(b, at + 1) }
+
+// Postgres nests block comments, so stopping at the first `*/` would leave statement text behind.
+fn sql_past_comment(b: Bytes, at: Int, depth: Int) -> Result<Int, Int> =
+  if at >= bytes_len(b) { Err(at) } else if bytes_at(b, at) == 47 && sql_byte_is(b, at + 1, 42) {
+    sql_past_comment(b, at + 2, depth + 1)
+  } else if bytes_at(b, at) == 42 && sql_byte_is(b, at + 1, 47) {
+    if depth == 1 { Ok(at + 2) } else { sql_past_comment(b, at + 2, depth - 1) }
+  } else { sql_past_comment(b, at + 1, depth) }
+
+fn sql_next_token(b: Bytes, at: Int) -> Result<{ tok: SqlTokAt, next: Int }, DbError> = {
+  let c = bytes_at(b, at);
+  if c == 59 { Ok(sql_filled(b, at, at + 1, SqlSemi)) }
+  else if c == 39 { sql_literal(b, at, at + 1, at, false) } else if (c == 101 || c == 69)
+      && sql_byte_is(b, at + 1, 39) { sql_literal(b, at, at + 2, at + 1, true) } else if (c == 98
+      || c == 66
+      || c == 120
+      || c == 88)
+      && sql_byte_is(b, at + 1, 39) { sql_literal(b, at, at + 2, at + 1, false) } else if (c == 117
+      || c == 85)
+      && sql_byte_is(b, at + 1, 38)
+      && sql_byte_is(b, at + 2, 39) { sql_literal(b, at, at + 3, at + 2, false) }
+  else if c == 34 { sql_quoted_word(b, at, at + 1, at) } else if c == 36 {
+    match sql_digit_end(b, at + 1) {
+      Some(e) -> Ok(sql_filled(b, at, e, SqlPlaceholder)),
+      None -> sql_dollar_quoted(b, at),
+    }
+  } else if sql_is_digit(c) { Ok(sql_filled(b, at, sql_past_number(b, at), SqlNumber)) } else if sql_is_name_byte(
+      c,
+    ) {
+    Ok(
+      sql_filled(
+        b,
+        at,
+        sql_past_word(b, at),
+        SqlWord({ text: sql_lower_bytes(b, at, sql_past_word(b, at)), quoted: false }),
+      ),
+    )
+  } else { Ok(sql_filled(b, at, at + 1, SqlPunct(string_of_bytes(bytes_slice(b, at, at + 1))))) }
+}
+
+fn sql_filled(b: Bytes, at: Int, next: Int, tok: SqlTok) -> { tok: SqlTokAt, next: Int } =
+  { tok: { tok: tok, at: at, text: string_of_bytes(bytes_slice(b, at, next)) }, next: next }
+
+fn sql_unclosed(b: Bytes, at: Int, what: String) -> DbError =
+  db_error(
+    "0A000",
+    "",
+    what ++ " opened at byte " ++ int_to_string(at)
+      ++ " is never closed, and past one the reader cannot tell text from statement",
+  )
+
+fn sql_lower_bytes(b: Bytes, at: Int, end: Int) -> String =
+  string_of_bytes(
+    fold(range(at, end), b"", |acc: Bytes, i: Int| {
+      let c = bytes_at(b, i);
+      bytes_concat(acc, byte_of_int(if c >= 65 && c <= 90 { c + 32 } else { c }))
+    }),
+  )
+
+// The end of a string sql_literal, from just after its opening quote.
+fn sql_end_of_literal(b: Bytes, at: Int, open: Int, escapes: Bool) -> Result<Int, DbError> =
+  if at >= bytes_len(b) { Err(sql_unclosed(b, open, "a string sql_literal")) }
+  else if escapes && bytes_at(b, at) == 92 { sql_end_of_literal(b, at + 2, open, escapes) } else if bytes_at(
+        b,
+        at,
+      )
+      == 39
+      && sql_byte_is(b, at + 1, 39) { sql_end_of_literal(b, at + 2, open, escapes) }
+  else if bytes_at(b, at) == 39 { Ok(at + 1) }
+  else { sql_end_of_literal(b, at + 1, open, escapes) }
+
+fn sql_literal(
+  b: Bytes,
+  start: Int,
+  body: Int,
+  quote: Int,
+  escapes: Bool,
+) -> Result<{ tok: SqlTokAt, next: Int }, DbError> =
+  match sql_end_of_literal(b, body, quote, escapes) {
+    Err(e) -> Err(e),
+    Ok(e) -> Ok(sql_filled(b, start, e, SqlText)),
+  }
+
+fn sql_end_of_quoted(b: Bytes, at: Int, open: Int) -> Result<Int, DbError> =
+  if at >= bytes_len(b) { Err(sql_unclosed(b, open, "a quoted identifier")) }
+  else if bytes_at(b, at) == 34 && sql_byte_is(b, at + 1, 34) { sql_end_of_quoted(b, at + 2, open) }
+  else if bytes_at(b, at) == 34 { Ok(at + 1) }
+  else { sql_end_of_quoted(b, at + 1, open) }
+
+fn sql_quoted_word(
+  b: Bytes,
+  start: Int,
+  body: Int,
+  quote: Int,
+) -> Result<{ tok: SqlTokAt, next: Int }, DbError> =
+  match sql_end_of_quoted(b, body, quote) {
+    Err(e) -> Err(e),
+    Ok(e) ->
+      Ok(
+        sql_filled(b, start, e, SqlWord({ text: sql_unquoted(b, body, e - 1, b""), quoted: true })),
+      ),
+  }
+
+// The name inside `"…"`, with a doubled quote standing for one.
+fn sql_unquoted(b: Bytes, at: Int, end: Int, acc: Bytes) -> String =
+  if at >= end { string_of_bytes(acc) } else if bytes_at(b, at) == 34
+      && sql_byte_is(b, at + 1, 34) {
+    sql_unquoted(b, at + 2, end, bytes_concat(acc, byte_of_int(34)))
+  } else { sql_unquoted(b, at + 1, end, bytes_concat(acc, byte_of_int(bytes_at(b, at)))) }
+
+// `$1` … `$9`: where the digits end, or `None` when this is a dollar quote instead.
+fn sql_digit_end(b: Bytes, at: Int) -> Option<Int> =
+  if at >= bytes_len(b) || !sql_is_digit(bytes_at(b, at)) { None }
+  else { Some(sql_past_number(b, at)) }
+
+// `$tag$ … $tag$`, where the tag may be empty.
+fn sql_dollar_quoted(b: Bytes, at: Int) -> Result<{ tok: SqlTokAt, next: Int }, DbError> = {
+  let tag_end = sql_past_tag(b, at + 1);
+  if !sql_byte_is(b, tag_end, 36) { Err(sql_unclosed(b, at, "a dollar-quoted string")) } else {
+    let tag = bytes_slice(b, at, tag_end + 1);
+    match sql_find_tag(b, tag, tag_end + 1) {
+      None -> Err(sql_unclosed(b, at, "a dollar-quoted string")),
+      Some(e) -> Ok(sql_filled(b, at, e + bytes_len(tag), SqlText)),
+    }
+  }
+}
+
+fn sql_past_tag(b: Bytes, at: Int) -> Int =
+  if at < bytes_len(b) && (sql_is_name_byte(bytes_at(b, at)) || sql_is_digit(bytes_at(b, at))) {
+    sql_past_tag(b, at + 1)
+  } else { at }
+
+fn sql_find_tag(b: Bytes, tag: Bytes, at: Int) -> Option<Int> =
+  if at + bytes_len(tag) > bytes_len(b) { None }
+  else if sql_tag_at(b, tag, at) { Some(at) }
+  else { sql_find_tag(b, tag, at + 1) }
+
+fn sql_tag_at(b: Bytes, tag: Bytes, at: Int) -> Bool =
+  fold(range(0, bytes_len(tag)), true, |acc: Bool, i: Int|
+    acc && bytes_at(b, at + i) == bytes_at(tag, i))
+
+// A number runs to the next byte that is not part of one, as postgres' own lexer reads it.
+fn sql_past_number(b: Bytes, at: Int) -> Int =
+  if at < bytes_len(b) && (is_word_byte(bytes_at(b, at)) || bytes_at(b, at) == 46) {
+    sql_past_number(b, at + 1)
+  } else { at }
+
+fn sql_past_word(b: Bytes, at: Int) -> Int =
+  if at < bytes_len(b)
+      && (sql_is_name_byte(bytes_at(b, at)) || sql_is_digit(bytes_at(b, at))
+      || bytes_at(b, at) == 36) { sql_past_word(b, at + 1) }
+  else { at }
+
+fn sql_is_digit(c: Int) -> Bool = c >= 48 && c <= 57
+
+fn sql_is_name_byte(c: Int) -> Bool =
+  (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || c >= 128
 
 type Ran = { session: pg::Session, answer: Answer }
 
@@ -3924,6 +4203,109 @@ pub fn with_server<a | e>(
   match server_of(url) { Err(why) -> Err(why), Ok(cfg) -> Ok(serve(cfg, size, nonce(), body)) }
 
 // --- Tests ------------------------------------------------------------------
+
+test "a statement's words fold and a quoted identifier keeps its case" {
+  assert_eq(
+    sql_tokenize_summary("SELECT t.Sku FROM parts AS t"),
+    Ok([
+      "word:select",
+      "word:t",
+      "punct:.",
+      "word:sku",
+      "word:from",
+      "word:parts",
+      "word:as",
+      "word:t",
+    ]),
+  );
+  assert_eq(
+    sql_tokenize_summary("select \"MiXeD\" from \"a\"\"b\""),
+    Ok(["word:select", "quoted:MiXeD", "word:from", "quoted:a\"b"]),
+  )
+}
+
+test "a comment is not a token, and a block comment nests" {
+  assert_eq(
+    sql_tokenize_summary("select 1 -- and the rest\nfrom t"),
+    Ok(["word:select", "number:1", "word:from", "word:t"]),
+  );
+  assert_eq(sql_tokenize_summary("select /* a /* b */ c */ 1"), Ok(["word:select", "number:1"]))
+}
+
+test "a semicolon is its own token, and one inside a literal is text" {
+  assert_eq(
+    sql_tokenize_summary("select 1; drop table t"),
+    Ok(["word:select", "number:1", "semi", "word:drop", "word:table", "word:t"]),
+  );
+  assert_eq(sql_tokenize_summary("select ';a'"), Ok(["word:select", "text:';a'"]));
+  assert_eq(
+    sql_tokenize_summary("select $tag$a;b$tag$"),
+    Ok(["word:select", "text:$tag$a;b$tag$"]),
+  );
+  assert_eq(sql_tokenize_summary("select 'it''s'"), Ok(["word:select", "text:'it''s'"]))
+}
+
+test "a placeholder is not a dollar quote, and a string may be escaped" {
+  assert_eq(
+    sql_tokenize_summary("select $1, $23"),
+    Ok(["word:select", "placeholder:$1", "punct:,", "placeholder:$23"]),
+  );
+  assert_eq(sql_tokenize_summary("select e'a b'"), Ok(["word:select", "text:e'a b'"]));
+  assert_eq(
+    sql_tokenize_summary("select b'0110', x'ff'"),
+    Ok(["word:select", "text:b'0110'", "punct:,", "text:x'ff'"]),
+  )
+}
+
+test "a number is one token however it is written" {
+  assert_eq(
+    sql_tokenize_summary("select 1, 1.5, 1e3, 0x1f, 12ab"),
+    Ok([
+      "word:select",
+      "number:1",
+      "punct:,",
+      "number:1.5",
+      "punct:,",
+      "number:1e3",
+      "punct:,",
+      "number:0x1f",
+      "punct:,",
+      "number:12ab",
+    ]),
+  )
+}
+
+test "punctuation is one byte each, and a non-ascii name is one word" {
+  assert_eq(
+    sql_tokenize_summary("a.b::int[] @ 1 <> 2"),
+    Ok([
+      "word:a",
+      "punct:.",
+      "word:b",
+      "punct::",
+      "punct::",
+      "word:int",
+      "punct:[",
+      "punct:]",
+      "punct:@",
+      "number:1",
+      "punct:<",
+      "punct:>",
+      "number:2",
+    ]),
+  );
+  assert_eq(sql_tokenize_summary("select ünïcode"), Ok(["word:select", "word:ünïcode"]))
+}
+
+test "a quote that is never closed is refused, not guessed at" {
+  assert(refused(sql_tokenize_summary("select '")));
+  assert(refused(sql_tokenize_summary("select \"x")));
+  assert(refused(sql_tokenize_summary("select /* never")));
+  assert(refused(sql_tokenize_summary("select $tag$ never")));
+  assert(refused(sql_tokenize_summary("select $ ")))
+}
+
+fn refused<a>(r: Result<List<a>, DbError>) -> Bool = match r { Err(_) -> true, Ok(_) -> false }
 
 test "a statement's verb is what decides whether it reads or writes" {
   assert_eq(writes("select 1"), Ok(false));
