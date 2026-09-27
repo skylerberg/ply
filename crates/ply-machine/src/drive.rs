@@ -42,6 +42,9 @@ pub struct RunOptions {
     pub profile: String,
     /// A project load that reads and writes the store; off for a plain `run`.
     pub cache: bool,
+    /// The privileged families `--allow` granted the program being run, by name. What may drive
+    /// a machine is a decision with a name, and one the program has to have declared.
+    pub allow: Vec<String>,
 }
 
 impl Default for RunOptions {
@@ -62,6 +65,7 @@ impl Default for RunOptions {
             shutdown: crate::options::ShutdownOptions::default(),
             profile: "development".to_string(),
             cache: false,
+            allow: Vec::new(),
         }
     }
 }
@@ -350,6 +354,50 @@ impl Drive {
             Ok(process) => process,
             Err(diagnostic) => return Err(refuse(vec![diagnostic])),
         };
+        // What the program declared: a family it does not declare reaches nothing, and a grant
+        // for one is a mistake worth refusing rather than ignoring.
+        let declared_effects: Vec<&str> = target
+            .check()
+            .effects
+            .values()
+            .map(|e| e.simple_name.as_str())
+            .collect();
+        if let Some(undeclared) = options
+            .allow
+            .iter()
+            .find(|family| !declared_effects.contains(&family.as_str()))
+        {
+            return Err(refuse(vec![Diagnostic::error(
+                codes::CAPABILITY_UNDECLARED,
+                format!(
+                    "`--allow {undeclared}` was granted and the program declares no `{undeclared}` effect"
+                ),
+            )
+            .primary(
+                Span::DUMMY,
+                "a family the program does not declare reaches nothing",
+            )
+            .note("a run lends only what the program it runs can reach")]));
+        }
+        let machine_module = target
+            .check()
+            .effects
+            .values()
+            .find(|e| e.simple_name.as_str() == "machine")
+            .map(|e| e.module.to_string())
+            .unwrap_or_else(|| "machine".to_string());
+        let lent = match crate::policy::lent_for(
+            &options.allow.iter().map(String::as_str).collect::<Vec<_>>(),
+            &machine_module,
+        ) {
+            Ok(lent) => lent,
+            Err(why) => {
+                return Err(refuse(vec![Diagnostic::error(
+                    codes::CAPABILITY_UNDECLARED,
+                    why,
+                )]));
+            }
+        };
         let mut hosts = match Hosts::open_stopping(
             target.check(),
             options.host,
@@ -361,7 +409,7 @@ impl Drive {
             declared.as_ref(),
             shutdown.clone(),
             process,
-            Vec::new(),
+            lent,
         ) {
             Ok(hosts) => hosts,
             Err(diagnostics) => return Err(refuse(diagnostics)),
@@ -1121,6 +1169,7 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
     let trace_v = get("trace")?;
     Ok(RunOptions {
         argv: str_list("argv")?,
+        allow: str_list("allow")?,
         json: bool_at("json")?,
         steps: int_at("steps")?,
         timeout: int_at("timeout")? as u64,

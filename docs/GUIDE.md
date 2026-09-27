@@ -1689,6 +1689,12 @@ needs no project: it reads the shipped modules off a second, read-only root.
 taken out of the line before the program parses it, and the run writes what the
 entry allocated — every thread's allocations, in a window around the entry — as
 `allocations` and `bytes`.
+What a host may lend is a policy with names, one family each:
+`machine` (load, bind, enter and call a nested program), `tester`, `claims`,
+`builder`, `cache`, `bootstrap`, `hosts` and `edit`, each with a summary a
+reviewer can read. The launcher lends its own program every family; another host
+names the ones it means, so `machine` — which drives another machine — is
+granted on purpose and not by accident.
 The first run after `ply` or the program itself changes compiles the program's unit,
 which needs the C toolchain `ply run` needs and takes a few seconds; every later
 run loads the compiled object and the front end it filed beside it. The ones
