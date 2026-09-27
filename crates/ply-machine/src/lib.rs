@@ -50,12 +50,13 @@ use std::sync::{Arc, Mutex};
 /// `machine.enter[m]()`, `machine.reload[m]()`, `machine.drop[m]()`.
 pub const EFFECT: &str = "machine";
 
-const OPERATIONS: [(&str, &str); 6] = [
+const OPERATIONS: [(&str, &str); 7] = [
     ("configure", "ply_machine::configure"),
     ("load", "ply_machine::load"),
     ("reload", "ply_machine::reload"),
     ("bound", "ply_machine::bound"),
     ("enter", "ply_machine::enter"),
+    ("call", "ply_machine::call"),
     ("drop", "ply_machine::drop"),
 ];
 
@@ -63,9 +64,20 @@ const OPERATIONS: [(&str, &str); 6] = [
 const STACK: usize = 256 << 20;
 
 /// The ops and the one handler serving them, configured as the run being lent is configured.
+/// The ops as the CLI's own program declares them: its machine module is `machine`.
 pub fn registrations_with(options: drive::RunOptions) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
+    registrations_for(options, "machine")
+}
+
+/// The ops for a program whose machine module is named `module`: the values a host hands it are
+/// named as its declarations name them.
+pub fn registrations_for(
+    options: drive::RunOptions,
+    module: &str,
+) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
     let site: Arc<dyn HostHandler> = Arc::new(Site {
         options,
+        module: module.to_string(),
         labels: Mutex::new(HashMap::new()),
         configured: Mutex::new(HashMap::new()),
     });
@@ -87,7 +99,12 @@ pub fn register(registry: &mut HostRegistry) {
 }
 
 pub fn register_with(registry: &mut HostRegistry, options: drive::RunOptions) {
-    for (op, handler) in registrations_with(options) {
+    register_with_for(registry, options, "machine");
+}
+
+/// The ops for a program whose machine module is named `module`.
+pub fn register_with_for(registry: &mut HostRegistry, options: drive::RunOptions, module: &str) {
+    for (op, handler) in registrations_for(options, module) {
         registry.register(op, handler);
     }
 }
@@ -125,6 +142,9 @@ fn refused_value(refused: &drive::Refused) -> Value {
 
 struct Site {
     options: drive::RunOptions,
+    /// The name the calling program gives the machine module: the values it is handed are named
+    /// as its declarations name them.
+    module: String,
     labels: Mutex<HashMap<String, Labelled>>,
     /// What a label was configured with before it loaded, if it was.
     configured: Mutex<HashMap<String, drive::RunOptions>>,
@@ -163,6 +183,11 @@ enum Go {
     Enter {
         reply: Sender<drive::Outcome>,
     },
+    Call {
+        name: String,
+        args: Vec<serde_json::Value>,
+        reply: Sender<Result<serde_json::Value, Diagnostic>>,
+    },
     Reload {
         reply: Sender<Result<drive::FoundData, drive::Refused>>,
     },
@@ -196,6 +221,31 @@ impl HostHandler for Site {
                 let outcome: drive::Outcome =
                     self.ask(&label, span, |reply| Go::Enter { reply })?;
                 drive::outcome_value(&outcome)
+            }
+            ("call", [name, args]) => {
+                let name = name.as_str(span, "a definition's name")?.to_string();
+                let Value::List(args) = args else {
+                    return Err(Diagnostic::error(
+                        codes::RUNTIME_ERROR,
+                        "`machine.call`'s arguments are not a list".to_string(),
+                    )
+                    .primary(span, "a `machine.Value` list"));
+                };
+                // The wire, not the value: the answer to the call crosses to the machine's
+                // thread, and values do not cross.
+                let args: Vec<serde_json::Value> = args
+                    .iter()
+                    .map(|a| crate::payload::adt_to_wire(a, span, &self.module))
+                    .collect::<Result<_, _>>()?;
+                let answer: Result<serde_json::Value, Diagnostic> =
+                    self.ask(&label, span, |reply| Go::Call { name, args, reply })?;
+                match answer {
+                    Ok(wire) => ok(crate::payload::wire_to_adt(&wire, span, &self.module)?),
+                    Err(d) => err(crate::payload::record(vec![
+                        ("code", Value::str(d.code)),
+                        ("message", Value::str(d.message)),
+                    ])),
+                }
             }
             ("drop", []) => self.drop(&label),
             (other, _) => {
@@ -370,6 +420,9 @@ fn park(mut drive: drive::Drive, hearing: mpsc::Receiver<Go>) {
             }
             Go::Enter { reply } => {
                 let _ = reply.send(drive.enter());
+            }
+            Go::Call { name, args, reply } => {
+                let _ = reply.send(drive.call(&name, args));
             }
             Go::Reload { reply } => {
                 let answer = drive.reload().map(|()| drive.found_data());

@@ -27,8 +27,12 @@ nondet effect machine {
   read reload[m]() -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
+  read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
   write drop[m]() -> Unit
 }
+
+type Raised = { code: String, message: String }
+type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
 
 type Options = { host: Bool, trace: TraceOpts, cache: Bool }
 type TraceOpts = { sink: String, level: String }
@@ -298,8 +302,12 @@ nondet effect machine {
   read reload[m]() -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
+  read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
   write drop[m]() -> Unit
 }
+
+type Raised = { code: String, message: String }
+type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
 
 type Options = { host: Bool, trace: TraceOpts, cache: Bool }
 type TraceOpts = { sink: String, level: String }
@@ -431,8 +439,12 @@ nondet effect machine {
   read reload[m]() -> Result<Target, Refusal>
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
+  read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
   write drop[m]() -> Unit
 }
+
+type Raised = { code: String, message: String }
+type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
 
 type TlsCred = { name: String, cert: String, key: String }
 type Named = { name: String, path: String }
@@ -586,4 +598,93 @@ fn main(root: String) -> Bool / {machine.configure[m], machine.load[m], machine.
         )
         .expect("the outer main ran");
     assert_eq!(answer.to_string(), "true", "the configured host bound");
+}
+
+// --- `machine.call` ----------------------------------------------------------
+
+/// The outer program: load the root it is handed, bind `inner.main`, and call `inner.double`
+/// with one argument. The machine module here is `m`, so the values it is handed are `m.VInt`
+/// and the like.
+const OUTER_CALL: &str = r#"
+nondet effect machine {
+  write configure[m](options: Options) -> Unit
+  read load[m](root: String) -> Result<Target, Refusal>
+  read reload[m]() -> Result<Target, Refusal>
+  read bound[m](entry: String) -> Result<Bound, Refusal>
+  write enter[m]() -> Ended
+  read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
+  write drop[m]() -> Unit
+}
+
+type Options = Unit
+type Target = Unit
+type Bound = Unit
+type Refusal = Unit
+type Ended = Unit
+type Raised = { code: String, message: String }
+type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
+
+fn main(root: String) -> Int / {machine.load[m], machine.bound[m], machine.call[m], machine.drop[m]} = {
+  match machine.load[m](root) {
+    Ok(_) -> match machine.bound[m]("inner.main") {
+      Ok(_) -> {
+        let doubled = machine.call[m]("inner.double", [VInt(21)]);
+        let raised = machine.call[m]("inner.boom", []);
+        machine.drop[m]();
+        match doubled {
+          Ok(v) -> match v {
+            VInt(i) -> match raised {
+              Err(r) -> if string_contains(r.message, "oh no") { i } else { 0 - 4 },
+              Ok(_) -> 0 - 3,
+            },
+            _ -> 0 - 2,
+          },
+          Err(_) -> 0 - 1,
+        }
+      },
+      Err(_) -> 0 - 5,
+    },
+    Err(_) -> 0 - 6,
+  }
+}
+"#;
+
+const INNER_CALL: &str = r#"
+fn main() -> Int = 0
+
+pub fn double(x: Int) -> Int = x * 2
+
+pub fn boom() -> Int = panic("oh no")
+"#;
+
+#[test]
+fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
+    let project = project(INNER_CALL);
+    let front = front_of(OUTER_CALL);
+    let texts: HashMap<String, String> = [("m".to_string(), OUTER_CALL.to_string())]
+        .into_iter()
+        .collect();
+    let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
+    let mut machine = Machine::new(&front);
+    machine.set_compiled(unit.attach());
+    let mut registry = HostRegistry::new();
+    ply_machine::register_with_for(
+        &mut registry,
+        ply_machine::drive::RunOptions {
+            host: false,
+            cache: false,
+            ..Default::default()
+        },
+        "m",
+    );
+    let binding = registry.bind(&front.check).expect("the machine ops bind");
+    machine.set_host_binding(Arc::new(binding));
+    let answer = machine
+        .call(
+            "m.main",
+            vec![Value::str(project.path().display().to_string())],
+            Span::DUMMY,
+        )
+        .expect("the outer main ran");
+    assert_eq!(answer, Value::Int(42));
 }
