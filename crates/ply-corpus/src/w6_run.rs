@@ -1157,8 +1157,10 @@ fn alternatives(stack: &InProcess, levers: &Levers) -> Vec<w6::Alternative> {
                         alternative.what = format!(
                             "One /health request allocates {allocs:.0} times and {:.3} MB to \
                              produce a {}-byte response, counted with a counting global allocator \
-                             in `w6-alloc`. The size of the lever, not a speedup: nothing was \
-                             changed to move it.",
+                             in `w6-alloc`. That is the slope between two windows, so the startup \
+                             a run pays before it serves anything is not charged to the request. \
+                             The size of the lever, not a speedup: nothing was changed to move \
+                             it.",
                             bytes / 1e6,
                             stack.response_bytes
                         );
