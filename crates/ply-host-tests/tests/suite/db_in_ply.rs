@@ -68,6 +68,19 @@ pub fn sneaky(url: String) -> Result<String, String>
     Ok(answered) -> answered,
   }
 
+// A call site's label is the atom the scheduler records, so a statement that reaches a table the
+// label never named would be scheduled against the wrong table.
+pub fn mislabelled(url: String) -> Result<String, String>
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next} =
+  match with_server(url, 4, || {
+    match db.query[orders](stmt("select name from items where id = $1"), [PInt(7)]) {
+      _ -> Ok("the statement ran under a label it does not touch"),
+    }
+  }) {
+    Err(why) -> Err(why),
+    Ok(answered) -> answered,
+  }
+
 // A transaction commits what it did, through `begin` and `commit` on the same connection.
 pub fn commit_one(url: String) -> Result<String, String>
   / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next} =
@@ -198,6 +211,18 @@ fn a_write_performed_as_a_read_is_refused() {
     assert!(
         why.contains("writes") && why.contains("db.query"),
         "the refusal does not say what is wrong: {why}"
+    );
+}
+
+#[test]
+fn a_label_the_statement_does_not_touch_is_refused() {
+    let Some((_cluster, url)) = cluster() else {
+        return;
+    };
+    let why = call_err("m.mislabelled", &url);
+    assert!(
+        why.contains("names `orders`") && why.contains("items"),
+        "the refusal does not say which label does not fit: {why}"
     );
 }
 
