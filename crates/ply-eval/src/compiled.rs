@@ -231,7 +231,7 @@ impl CarriedTypes {
                 "List" | "Map" => args.iter().all(|t| self.carries(t, decl_vars)),
                 // Refused before this table is asked; excluded to keep the leaf set honest.
                 "Float" | "Decimal" => false,
-                "Cell" | ply_ty::prelude::TASK_TYPE | SECRET => false,
+                "Cell" | ply_ty::TASK_TYPE | SECRET => false,
                 // Compiled code holds these as `Int` immediates, so one crossing back is wrong.
                 n if IntTy::from_name(n).is_some() => false,
                 _ => match self.decls.get(name) {
