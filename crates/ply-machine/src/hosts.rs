@@ -647,8 +647,11 @@ impl Observability {
             .filter(|row| row.effect.as_str() == ply_host::trace::EFFECT)
             .filter_map(|row| match &row.resource {
                 ply_ty::ty::Resource::Named(name) => Some(name.as_str().to_string()),
-                // A host row names a resource or none; nothing holds a label a caller fills.
-                ply_ty::ty::Resource::Var(_) | ply_ty::ty::Resource::Singleton => None,
+                // A host row names a resource or none: nothing holds a label a caller fills,
+                // and a binding that answers every label has no one name to list.
+                ply_ty::ty::Resource::Var(_)
+                | ply_ty::ty::Resource::Singleton
+                | ply_ty::ty::Resource::Every => None,
             })
             .collect();
         channels.sort();
@@ -1176,7 +1179,9 @@ fn row_value(row: &HostRow) -> PlyValue {
             "resource",
             option(match &row.resource {
                 ply_ty::ty::Resource::Named(name) => Some(PlyValue::str(name.as_str())),
-                ply_ty::ty::Resource::Var(_) | ply_ty::ty::Resource::Singleton => None,
+                ply_ty::ty::Resource::Var(_)
+                | ply_ty::ty::Resource::Singleton
+                | ply_ty::ty::Resource::Every => None,
             }),
         ),
         ("triple", PlyValue::str(row.to_string())),
