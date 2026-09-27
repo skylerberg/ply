@@ -18,7 +18,6 @@ mod cache_cli;
 mod cli;
 mod config_cli;
 mod corpus;
-mod db_cli;
 mod derivable;
 mod derivation_determinism_audit;
 mod derive;

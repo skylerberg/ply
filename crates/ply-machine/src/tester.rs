@@ -12,8 +12,7 @@ use crate::load::{Loaded, load, project_root};
 use crate::options::When;
 use crate::payload::{count, diag_value, diags_value, json, option, places_value, record, strings};
 use crate::support::{
-    build_backend_over, build_pool, describe_schema, enter_constant, module_texts, once_each,
-    select_profile,
+    build_backend_over, build_pool, enter_constant, module_texts, once_each, select_profile,
 };
 use ply_eval::Value as PlyValue;
 use ply_eval::host::{
@@ -77,7 +76,6 @@ pub struct TestOptions {
     pub host: bool,
     pub tls: crate::options::TlsOptions,
     pub fs: Vec<ply_host::fs::RootSpec>,
-    pub db: crate::db::DbOptions,
     pub config: crate::config::ConfigOptions,
     pub std: bool,
     pub simulation: crate::simulation::SimOptions,
@@ -652,22 +650,9 @@ fn bind(
     if let Err(diagnostic) = select_profile(&args.profile) {
         return refuse(vec![diagnostic]);
     };
-    // Before anything runs, so no test touches a resource the program does not declare.
-    let db = match args.db.resolve(args.host) {
-        Ok(db) => db,
-        Err(diagnostics) => return refuse(diagnostics),
-    };
-    let reach = Footprint::from_atoms(
-        loaded
-            .check
-            .tests
-            .iter()
-            .flat_map(|t| t.footprint.atoms().cloned()),
-    );
     // One per run, shared by the workers; an empty selection builds nothing a schema does not need.
     let nothing_to_run = plan.selection.to_run.is_empty();
-    let schema_named =
-        args.config.schema.is_some() || db.as_ref().is_some_and(|c| c.schema.is_some());
+    let schema_named = args.config.schema.is_some();
     let wanted = !nothing_to_run || schema_named;
     // The last iteration's unit, moved to this layout, when no definition's text changed.
     let held_unit = if wanted {
@@ -696,21 +681,18 @@ fn bind(
             Ok(resolved) => resolved,
             Err(diagnostics) => return refuse(diagnostics),
         };
-    let mut hosts = match Hosts::open(
+    let hosts = match Hosts::open(
         &loaded.check,
         args.host,
         &args.tls,
         &args.fs,
-        db,
         configuration,
         // `--trace` on this command names the definition trace, so records are discarded.
         &crate::trace::TraceOptions::silent(),
-        Some(&reach),
     ) {
         Ok(hosts) => hosts,
         Err(diagnostics) => return refuse(diagnostics),
     };
-    describe_schema(&mut hosts, &constant);
     let _ = told.send(Step::Bound(Box::new(None)));
     // A selector may still ask what the tree holds between the binding and the run.
     if !serve_reads_until_run(asked, told, knowledge) {
@@ -828,8 +810,6 @@ fn execute(
         label: hosts.label().to_string(),
         operations: hosts.listing().rows.len(),
         digest: hosts::digest_short(hosts.listing(), &hosts.disclosures()),
-        database: hosts::database_line(hosts),
-        live_database: hosts.is_live_database(),
         handshakes: hosts::handshake_lines(&hosts.handshakes()),
         hosts: hosts.summary_json(),
         reaches: plan
@@ -1182,8 +1162,6 @@ struct Over {
     label: String,
     operations: usize,
     digest: String,
-    database: Option<String>,
-    live_database: bool,
     handshakes: Vec<String>,
     hosts: Value,
     reaches: Vec<usize>,
@@ -1930,11 +1908,6 @@ fn ran_value(over: &Over) -> PlyValue {
         ("label", PlyValue::str(&over.label)),
         ("operations", count(over.operations)),
         ("digest", PlyValue::str(&over.digest)),
-        (
-            "database",
-            option(over.database.as_deref().map(PlyValue::str)),
-        ),
-        ("live_database", PlyValue::Bool(over.live_database)),
         ("handshakes", texts(&over.handshakes)),
         ("hosts", json(&over.hosts)),
         (
@@ -2146,7 +2119,6 @@ pub fn test_options_of(v: &PlyValue, span: Span) -> Result<TestOptions, Diagnost
         Ok(out)
     };
     let sim = field_of(v, "sim", span)?;
-    let db = field_of(v, "db", span)?;
     let config = field_of(v, "config", span)?;
     Ok(TestOptions {
         path: std::path::PathBuf::from(str_at("path")?),
@@ -2180,16 +2152,6 @@ pub fn test_options_of(v: &PlyValue, span: Span) -> Result<TestOptions, Diagnost
                 path: std::path::PathBuf::from(path),
             })
             .collect(),
-        db: crate::db::DbOptions {
-            url: opt_str_at(db, "url", span)?,
-            pool: opt_int_at(db, "pool", span)?.map(|n| n as u32),
-            acquire_ms: opt_int_at(db, "acquire_ms", span)?.map(|n| n as u64),
-            statement_ms: opt_int_at(db, "statement_ms", span)?.map(|n| n as u64),
-            idle_txn_ms: opt_int_at(db, "idle_txn_ms", span)?.map(|n| n as u64),
-            connect_ms: opt_int_at(db, "connect_ms", span)?.map(|n| n as u64),
-            statement_cache: opt_int_at(db, "statement_cache", span)?.map(|n| n as u32),
-            schema: opt_str_at(db, "schema", span)?,
-        },
         config: crate::config::ConfigOptions {
             set: str_list_at(config, "set", span)?,
             files: str_list_at(config, "files", span)?
@@ -2242,7 +2204,6 @@ impl Default for TestOptions {
             host: false,
             tls: crate::options::TlsOptions::default(),
             fs: Vec::new(),
-            db: crate::db::DbOptions::default(),
             config: crate::config::ConfigOptions::default(),
             std: false,
             simulation: crate::simulation::SimOptions::default(),

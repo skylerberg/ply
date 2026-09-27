@@ -15,7 +15,6 @@ pub mod cache;
 pub mod claims;
 pub mod config;
 pub mod costs;
-pub mod db;
 pub mod drive;
 pub mod driver;
 pub mod edit;
