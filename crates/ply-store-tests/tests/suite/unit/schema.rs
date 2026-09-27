@@ -22,6 +22,7 @@ mod variant {
             Resource::Named(_) => "Resource::Named",
             Resource::Var(_) => "Resource::Var",
             Resource::Singleton => "Resource::Singleton",
+            Resource::Every => "Resource::Every",
         }
     }
 

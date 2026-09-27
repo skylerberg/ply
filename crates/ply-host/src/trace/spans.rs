@@ -240,5 +240,7 @@ pub fn label(resource: &Resource) -> &str {
     match resource {
         Resource::Named(name) => name.as_str(),
         Resource::Var(_) | Resource::Singleton => "",
+        // Every label, which names no one channel.
+        Resource::Every => "*",
     }
 }
