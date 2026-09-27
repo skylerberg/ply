@@ -257,8 +257,9 @@ struct DepPackage {
 
 /// The modules a package root holds, named relative to it; a root with no readable `ply.pkg`
 /// answers nothing, and the front end's `E0135` says why.
-fn read_package(root: &str) -> DepPackage {
-    let dir = Path::new(root);
+/// One package root as a walk found it: the key it is named by, and the directory its files are in.
+/// They are the same thing for a path dependency, and a fetched tree's directory for a git one.
+fn read_package(root: &str, dir: &Path) -> DepPackage {
     let manifest = std::fs::read_to_string(dir.join("ply.pkg")).ok();
     let files = if manifest.is_some() {
         let mut out = Vec::new();
@@ -322,7 +323,17 @@ fn walk_packages(
         }
         for w in wanted {
             known.push(w.clone());
-            let package = read_package(&w);
+            // A git want is fetched first, and is named by its key rather than by where the fetch
+            // put it: the front end judges roots, and a tree's address is the walker's business.
+            let tree = if w.starts_with("git+") {
+                match crate::vcs::fetch(root, &w) {
+                    Ok(dir) => dir,
+                    Err(diagnostic) => return Err(diagnostic.message.clone()),
+                }
+            } else {
+                PathBuf::from(&w)
+            };
+            let package = read_package(&w, &tree);
             manifests.push(producer::SuppliedPackage {
                 root: w.clone(),
                 manifest: package.manifest.clone(),
