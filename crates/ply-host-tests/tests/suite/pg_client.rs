@@ -60,9 +60,14 @@ pub fn refuse_then_ask(host: String, port: Int) -> Result<String, String>
   }
 
 // SCRAM: the nonce is the one RFC 7677 works out, so the scripted server can be that example.
-pub fn ask_scram(host: String, port: Int, nonce: String) -> Result<String, String>
-  / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
-  match connect[link](host, port, "user", "ply", Some("pencil"), nonce, default_client()) {
+pub fn ask_scram(
+  host: String,
+  port: Int,
+  user: String,
+  password: String,
+  nonce: String,
+) -> Result<String, String> / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  match connect[link](host, port, user, "ply", Some(password), nonce, default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match simple_query[link](session, "select 1", default_client()) {
       Err(e) -> Err(client_error_text(e)),
@@ -101,7 +106,7 @@ struct Ran {
     sent: Vec<u8>,
 }
 
-fn ran(answered: Value, net: Arc<SimNet>) -> Result<Ran, String> {
+fn ran(answered: Value, net: Option<Arc<SimNet>>) -> Result<Ran, String> {
     let Value::Ctor { name, args } = &answered else {
         panic!("the entry answered {answered}, not an `Ok` or an `Err`");
     };
@@ -111,7 +116,7 @@ fn ran(answered: Value, net: Arc<SimNet>) -> Result<Ran, String> {
     match name.as_str() {
         "Ok" => Ok(Ran {
             text: text.to_string(),
-            sent: net.sent(1),
+            sent: net.map(|net| net.sent(1)).unwrap_or_default(),
         }),
         "Err" => Err(text.to_string()),
         other => panic!("the entry answered `{other}`"),
@@ -143,7 +148,38 @@ fn run(entry: &str, args: Vec<Value>, script: Vec<Vec<u8>>) -> Result<Ran, Strin
     let answered = machine
         .call(entry, args, Span::DUMMY)
         .unwrap_or_else(|e| panic!("the call answers: {e}"));
-    ran(answered, net)
+    ran(answered, Some(net))
+}
+
+/// The same entries, but over the real network: a cluster is the only peer that can say whether
+/// the client's SCRAM is a SCRAM a server accepts.
+fn run_over_tcp(entry: &str, args: Vec<Value>) -> Result<Ran, String> {
+    let host = ply_host::Host::new();
+    let (front, unit) = tiered(CLIENT);
+    let binding = host
+        .registry()
+        .bind(&front.check)
+        .expect("the declaration and the registration agree");
+
+    let mut machine = Machine::new(&front);
+    machine.set_compiled(ply_eval::Provider::attach(unit));
+    machine.set_host_binding(Arc::new(binding));
+    // The real socket answers `Pending`, so the machine needs something to wait on.
+    machine.set_host_runtime(host.runtime());
+    let simple = entry.rsplit('.').next().expect("an entry has a name");
+    if let Some(declared) = front
+        .check
+        .defs
+        .values()
+        .find(|d| d.simple_name.as_str() == simple)
+        .map(|d| d.footprint.clone())
+    {
+        machine.set_declared_footprint(declared);
+    }
+    let answered = machine
+        .call(entry, args, Span::DUMMY)
+        .unwrap_or_else(|e| panic!("the call answers: {e}"));
+    ran(answered, None)
 }
 
 /// One back-end frame: a kind byte, a length that counts itself, and a body.
@@ -356,6 +392,8 @@ fn the_client_answers_scram_and_checks_the_servers_proof() {
         vec![
             Value::str("127.0.0.1"),
             Value::Int(5432),
+            Value::str("user"),
+            Value::str("pencil"),
             Value::str("rOprNGfwEbeRWgbNEkqO"),
         ],
         vec![scram_greeting(), select_one()],
@@ -370,4 +408,29 @@ fn the_client_answers_scram_and_checks_the_servers_proof() {
         text.contains("p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="),
         "the proof the client sent is not the one RFC 7677 works out: {text}"
     );
+}
+
+/// A real cluster, whose TCP connections are configured to demand a password, so the handshake
+/// is SCRAM against postgres rather than against a script. Skipped where `initdb` is absent.
+#[test]
+fn the_client_speaks_scram_to_a_real_server() {
+    if !crate::support::cluster::available() {
+        eprintln!("skipping: this machine has no initdb and postgres");
+        return;
+    }
+    let cluster = crate::support::cluster::Cluster::start_with_password("ply", "pencil");
+    let ran = run_over_tcp(
+        "m.ask_scram",
+        vec![
+            Value::str("127.0.0.1"),
+            Value::Int(i64::from(cluster.port())),
+            Value::str("ply"),
+            Value::str("pencil"),
+            Value::str("a-cluster-test-nonce"),
+        ],
+    );
+    match ran {
+        Ok(outcome) => assert_eq!(outcome.text, "1"),
+        Err(why) => panic!("the client could not talk to a real server: {why}"),
+    }
 }
