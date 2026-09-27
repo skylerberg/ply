@@ -1043,6 +1043,7 @@ fn execute(
                 &loaded.texts(),
                 &loaded.front,
                 &mut cache.store,
+                !matches!(args.bisect, When::Never),
             );
             let escapes = hosts_escapes(&report, &loaded.check, hosts);
             let ok = report.is_success() && escapes.is_empty();
