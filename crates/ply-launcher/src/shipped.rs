@@ -20,21 +20,55 @@ const SHELF_MARKER: &str = "SHELF.ok";
 
 // --- The `ply` program -------------------------------------------------------
 
-/// The program's modules as the port takes them: `(name, text)`, which `digest_of` sorts.
-pub fn program_sources() -> Vec<(String, String)> {
-    PROGRAM_SOURCES
+/// Where the CLI package sits inside a stage that carries its closure: the repository's own path,
+/// because the keys below are the repository's own paths.
+pub const ROOT: &str = "crates/ply-cli/ply";
+
+/// Every package this binary ships — the CLI and everything it depends on by path — as
+/// `(repository path, module, text)`.
+pub fn closure() -> Vec<(String, String, String)> {
+    PROGRAM_PACKAGES
         .iter()
-        .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
+        .map(|(dir, name, text)| ((*dir).to_string(), (*name).to_string(), (*text).to_string()))
         .collect()
+}
+
+/// The whole closure as the port takes it: `(path, text)`, which `digest_of` sorts. A package's own
+/// modules and its manifest are keyed by the path they have in the repository, so nothing about the
+/// program is a function of where this binary happens to be.
+pub fn program_sources() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = PROGRAM_PACKAGES
+        .iter()
+        .map(|(dir, name, text)| (format!("{dir}/{name}"), (*text).to_string()))
+        .collect();
+    out.extend(
+        PROGRAM_PACKAGE_MANIFESTS
+            .iter()
+            .map(|(dir, text)| (format!("{dir}/ply.pkg"), (*text).to_string())),
+    );
+    out
+}
+
+/// Lays the shipped closure out under `stage`, keyed by the repository's paths, so a package's
+/// `Path(..)` dependency resolves the way it does in a checkout. A caller that ships more than this
+/// closure — the corpus, which also carries its own package — calls this first and adds itself.
+pub fn lay_out(stage: &Path) -> std::io::Result<()> {
+    for (dir, name, text) in PROGRAM_PACKAGES {
+        let package = stage.join(dir);
+        std::fs::create_dir_all(&package)?;
+        std::fs::write(package.join(format!("{name}.ply")), text)?;
+    }
+    for (dir, text) in PROGRAM_PACKAGE_MANIFESTS {
+        std::fs::write(stage.join(dir).join("ply.pkg"), text)?;
+    }
+    Ok(())
 }
 
 /// What the built program is a function of: its sources, the shelf it is closed over as the shelf
 /// hands it out, the emitter that compiled it, and the three store versions a decode refuses a
 /// mismatch of. The artifact the program is built into carries the same digest as its stamp.
 pub fn identity() -> String {
-    let mut inputs = program_sources();
-    inputs.push(("ply.pkg".to_string(), PROGRAM_MANIFEST.to_string()));
-    ply_machine::artifact::toolchain_stamp(&producer::digest_of(&inputs))
+    ply_machine::artifact::toolchain_stamp(&producer::digest_of(&program_sources()))
 }
 
 /// Where a program built for `identity` is kept between runs, beside the emitter's own stages. The
@@ -58,7 +92,7 @@ pub fn shelf() -> Result<PathBuf, Diagnostic> {
     if dir.join(SHELF_MARKER).exists() {
         return Ok(dir);
     }
-    match lay_out(&dir) {
+    match lay_out_shelf(&dir) {
         Ok(()) => Ok(dir),
         Err(e) => Err(unbuilt(format!(
             "the shipped modules could not be placed in `{}`: {e}",
@@ -67,7 +101,7 @@ pub fn shelf() -> Result<PathBuf, Diagnostic> {
     }
 }
 
-fn lay_out(dir: &Path) -> std::io::Result<()> {
+fn lay_out_shelf(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     for (name, text) in ply_machine::shelf::sources() {
         land_in(dir, &format!("{name}.ply"), text.as_bytes())?;
@@ -113,25 +147,16 @@ pub fn program() -> Result<Vec<u8>, Diagnostic> {
 /// The program built from its sources here and now, as `ply build` would build it: written into a
 /// directory of its own, loaded whole, and closed over its one `main`.
 pub fn build() -> Result<Vec<u8>, Diagnostic> {
-    let dir = stage().join(format!("src.{}", std::process::id()));
-    if let Err(e) = write_sources(&dir) {
+    let stage = stage().join(format!("src.{}", std::process::id()));
+    if let Err(e) = lay_out(&stage) {
         return Err(unbuilt(format!(
             "its sources could not be placed in `{}`: {e}",
-            dir.display()
+            stage.display()
         )));
     }
-    let built = build_in(&dir);
-    let _ = std::fs::remove_dir_all(&dir);
+    let built = build_in(&stage.join(ROOT));
+    let _ = std::fs::remove_dir_all(&stage);
     built
-}
-
-fn write_sources(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    for (name, text) in PROGRAM_SOURCES {
-        std::fs::write(dir.join(format!("{name}.ply")), text)?;
-    }
-    std::fs::write(dir.join("ply.pkg"), PROGRAM_MANIFEST)?;
-    Ok(())
 }
 
 fn build_in(dir: &Path) -> Result<Vec<u8>, Diagnostic> {

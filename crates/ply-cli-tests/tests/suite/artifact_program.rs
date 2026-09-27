@@ -15,11 +15,12 @@ fn the_cli_tree_is_a_package() {
     assert_eq!(
         loaded.front.packages,
         vec![
-            ("cli".to_string(), Vec::new()),
+            ("cli".to_string(), vec!["suite".to_string()]),
+            ("suite".to_string(), Vec::new()),
             ("std".to_string(), Vec::new()),
             ("compiler".to_string(), vec!["std".to_string()]),
         ],
-        "the CLI tree's ply.pkg names it the `cli` package, closed over the two built-ins"
+        "the CLI tree's ply.pkg names it the `cli` package, closed over the suite and the two built-ins"
     );
 }
 
@@ -31,11 +32,12 @@ fn the_corpus_tree_is_a_package_over_the_cli() {
         loaded.front.packages,
         vec![
             ("corpus".to_string(), vec!["cli".to_string()]),
-            ("cli".to_string(), Vec::new()),
+            ("cli".to_string(), vec!["suite".to_string()]),
+            ("suite".to_string(), Vec::new()),
             ("std".to_string(), Vec::new()),
             ("compiler".to_string(), vec!["std".to_string()]),
         ],
-        "the corpus tree's ply.pkg names it the `corpus` package over the CLI's"
+        "the corpus tree's ply.pkg names it the `corpus` package over the CLI's, which is over the suite"
     );
 }
 
@@ -183,12 +185,15 @@ fn a_program_may_import_the_formatter_off_the_shelf() {
 /// filesystem: each runs over a tree and a process the test hands it.
 #[test]
 fn the_programs_own_tests_pass() {
+    // The whole closure, laid out the way a checkout has it: the CLI depends on the suite by path,
+    // so a stage that carried only the CLI's own modules would not load.
     let dir = tempfile::tempdir().unwrap();
-    for (module, text) in shipped::PROGRAM_SOURCES {
-        write(dir.path(), &format!("{module}.ply"), text);
-    }
+    shipped::lay_out(dir.path()).expect("the shipped closure lays out");
 
-    let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
+    let out = ply(&dir.path().join(shipped::ROOT))
+        .args(["test", "--json"])
+        .output()
+        .unwrap();
     let v: Value = serde_json::from_slice(&out.stdout)
         .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
     assert_eq!(v["exit_code"], 0, "{}", red(&v));
