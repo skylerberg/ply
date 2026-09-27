@@ -22,6 +22,13 @@ fn ctor(ty: &str, name: &str, index: usize, fields: Vec<Type>) -> CtorInfo {
     }
 }
 
+/// A case of a type that takes one parameter, so a field can be written in terms of it.
+fn generic_ctor(ty: &str, name: &str, fields: Vec<Type>) -> CtorInfo {
+    let mut info = ctor(ty, name, 0, fields);
+    info.scheme.ty_vars = vec![ply_ty::TyVar(0)];
+    info
+}
+
 fn binder(name: &str, ty: Type) -> LawBinder {
     LawBinder {
         name: Symbol::new(name),
@@ -127,6 +134,24 @@ fn the_numbers_the_packages_domain_module_pins_in_ply_are_these() {
     assert_eq!(cardinality(&con("U8"), &world), Some(256));
     assert_eq!(cardinality(&con("I32"), &world), Some(1 << 32));
     assert_eq!(cardinality(&con("U64"), &world), None);
+
+    // A parameter is the argument the type was applied to, and a type already being walked is
+    // refused whether it nests or recurses.
+    let pair = |inner: Type| Type::Con(Symbol::new("Pair"), vec![inner]);
+    let generic = TypeWorld::new(&[
+        generic_ctor(
+            "Pair",
+            "Both",
+            vec![Type::Var(ply_ty::TyVar(0)), Type::Var(ply_ty::TyVar(0))],
+        ),
+        ctor("Kind", "Asset", 0, Vec::new()),
+        ctor("Kind", "Liability", 1, Vec::new()),
+        ctor("Kind", "Equity", 2, Vec::new()),
+    ]);
+    assert_eq!(cardinality(&pair(con("Bool")), &generic), Some(4));
+    assert_eq!(cardinality(&pair(con("Kind")), &generic), Some(9));
+    assert_eq!(cardinality(&pair(con("Int")), &generic), None);
+    assert_eq!(cardinality(&pair(pair(con("Bool"))), &generic), None);
 
     // A declared type with no variants has no values, so it is not a domain.
     let empty = TypeWorld::new(&[]);
