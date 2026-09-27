@@ -267,7 +267,10 @@ pub fn machine_value(v: &PlyValue, module: &str) -> Result<PlyValue, Diagnostic>
                 )
                 .primary(Span::DUMMY, "the value does not fit an `Int`")
             })?;
-            c("VFixed", vec![PlyValue::str(f.ty.name()), PlyValue::Int(value)])
+            c(
+                "VFixed",
+                vec![PlyValue::str(f.ty.name()), PlyValue::Int(value)],
+            )
         }
         PlyValue::Str(s) => c("VStr", vec![PlyValue::str(s.as_ref())]),
         PlyValue::Bytes(b) => c("VBytes", vec![PlyValue::bytes(b.as_ref())]),
@@ -352,7 +355,8 @@ pub fn value_of_adt(v: &PlyValue, span: Span, module: &str) -> Result<PlyValue, 
             let Some(PlyValue::Str(ty)) = at(0) else {
                 return Err(bad("'s fixed type is not text"));
             };
-            let ty = ply_eval::IntTy::from_name(ty.as_ref()).ok_or_else(|| bad("'s fixed type is unknown"))?;
+            let ty = ply_eval::IntTy::from_name(ty.as_ref())
+                .ok_or_else(|| bad("'s fixed type is unknown"))?;
             let v = at(1)
                 .ok_or_else(|| bad("'s fixed value is missing"))?
                 .as_int(span, "a fixed-width integer")?;
