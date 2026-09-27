@@ -552,7 +552,17 @@ fn iterate(
         return;
     }
     if bind(
-        args, cache, warm, &loaded, &hashes, plan, &search, told, asked, &knowledge, &mut chosen,
+        args,
+        cache,
+        warm,
+        &loaded,
+        &hashes,
+        plan,
+        &search,
+        told,
+        asked,
+        &knowledge,
+        &mut chosen,
     ) {
         // Only over a report that was written: an iteration that returned early leaves nothing held.
         warm.keep(loaded);
@@ -633,8 +643,10 @@ struct HashedRow {
 struct SearchedRow {
     mode: String,
     roots: Vec<u64>,
-    budget: String,
-    steps: String,
+    /// Numbers, not their printed forms: the program's own `Plan` type says `Int`, and a record
+    /// crosses as a *dynamic* value, so nothing checks the two against each other.
+    budget: u32,
+    steps: u32,
 }
 
 impl Knowledge {
@@ -708,8 +720,8 @@ impl Knowledge {
             searched: SearchedRow {
                 mode: search.mode.as_str().to_string(),
                 roots: search.roots.clone(),
-                budget: search.budget.to_string(),
-                steps: search.steps.to_string(),
+                budget: search.budget,
+                steps: search.steps,
             },
         }
     }
@@ -754,26 +766,33 @@ fn serve_reads_loop(
     until: Sig,
 ) -> bool {
     loop {
-        let value = match asked.recv() {
-            Ok(Go::Bind) => return until != Sig::Bind,
-            Ok(Go::Run) => return until != Sig::Run,
+        // The ask travels back with the answer: a step's answer is only its own if the questions
+        // match, and two of these questions carry the caller's arguments.
+        let (asked, value) = match asked.recv() {
+            Ok(Go::Bind) => return until == Sig::Bind,
+            Ok(Go::Run) => return until == Sig::Run,
             Ok(Go::Chosen(choice)) => {
                 *chosen = Some(choice);
                 continue;
             }
-            Ok(Go::Keys) => KnowledgeValue::Keys(knowledge.keys.clone()),
-            Ok(Go::Hashed) => KnowledgeValue::Hashed(knowledge.hashed.clone()),
-            Ok(Go::Searched) => KnowledgeValue::Searched(knowledge.searched.clone()),
-            Ok(Go::Footprint(tests)) => KnowledgeValue::Footprint(knowledge.footprint_of(&tests)),
-            Ok(Go::Outcomes(keys)) => KnowledgeValue::Outcomes(outcomes_of(store, &keys)),
+            Ok(Go::Keys) => (Ask::Keys, KnowledgeValue::Keys(knowledge.keys.clone())),
+            Ok(Go::Hashed) => (
+                Ask::Hashed,
+                KnowledgeValue::Hashed(knowledge.hashed.clone()),
+            ),
+            Ok(Go::Searched) => (
+                Ask::Searched,
+                KnowledgeValue::Searched(knowledge.searched.clone()),
+            ),
+            Ok(Go::Footprint(tests)) => (
+                Ask::Footprint(tests.clone()),
+                KnowledgeValue::Footprint(knowledge.footprint_of(&tests)),
+            ),
+            Ok(Go::Outcomes(keys)) => (
+                Ask::Outcomes(keys.clone()),
+                KnowledgeValue::Outcomes(outcomes_of(store, &keys)),
+            ),
             Ok(Go::Load) | Err(_) => return false,
-        };
-        let asked = match &value {
-            KnowledgeValue::Keys(_) => Ask::Keys,
-            KnowledgeValue::Hashed(_) => Ask::Hashed,
-            KnowledgeValue::Searched(_) => Ask::Searched,
-            KnowledgeValue::Footprint(_) => Ask::Footprint(Vec::new()),
-            KnowledgeValue::Outcomes(_) => Ask::Outcomes(Vec::new()),
         };
         let _ = told.send(Step::Knowledge {
             asked,
@@ -809,10 +828,7 @@ fn bind(
     };
     // One per run, shared by the workers; a run that decided to execute nothing builds no unit
     // unless a schema was named.
-    let nothing_to_run = chosen
-        .as_ref()
-        .map(|c| c.runs.is_empty())
-        .unwrap_or(true);
+    let nothing_to_run = chosen.as_ref().map(|c| c.runs.is_empty()).unwrap_or(true);
     let schema_named = args.config.schema.is_some();
     let wanted = !nothing_to_run || schema_named;
     // The last iteration's unit, moved to this layout, when no definition's text changed.
@@ -859,7 +875,12 @@ fn bind(
     if !serve_reads_until_run(asked, told, knowledge, &cache.store, chosen) {
         return false;
     }
-    let selection = decided(&chosen.clone().unwrap_or_default(), &plan, &loaded.check, search);
+    let selection = decided(
+        &chosen.clone().unwrap_or_default(),
+        &plan,
+        &loaded.check,
+        search,
+    );
     let over = execute(
         args,
         cache,
@@ -890,8 +911,7 @@ fn execute(
     mut warnings: Vec<Diagnostic>,
 ) -> Over {
     let (pool, workers) = build_pool(args.jobs, &mut warnings);
-    let simulation =
-        ply_test::Search::of(selection).measuring(args.simulation.measure_reduction);
+    let simulation = ply_test::Search::of(selection).measuring(args.simulation.measure_reduction);
     // A factory: a reactor belongs to its thread, and each worker builds its own machine.
     let runtime = hosts.runtime_factory();
     // A pooled test is measured on a worker thread of rayon's, which holds no thread-local budget
@@ -1064,7 +1084,12 @@ impl Plan {
 /// The runtime's view of what the program decided, under this run's own filter: the tests it keeps,
 /// the classes filtered to them, and the roots each still owes. `--filter` cannot change which
 /// tests conflict, so a class only loses members.
-fn decided(choice: &ply_test::Choice, plan: &Plan, check: &CheckOutput, search: &ply_eval::Plan) -> Selection {
+fn decided(
+    choice: &ply_test::Choice,
+    plan: &Plan,
+    check: &CheckOutput,
+    search: &ply_eval::Plan,
+) -> Selection {
     let keeps = |i: &usize| plan.visible.binary_search(i).is_ok();
     let filtered = ply_test::Choice {
         runs: choice.runs.iter().copied().filter(keeps).collect(),
@@ -1758,7 +1783,6 @@ fn case_value(case: &CaseView) -> PlyValue {
         ("atoms", texts(&case.atoms)),
         ("contends", atoms_value(&case.contends)),
         ("seeded", PlyValue::Bool(case.seeded)),
-
     ])
 }
 
@@ -1812,7 +1836,14 @@ fn found_value(found: Found) -> PlyValue {
                 ("mode", PlyValue::str(&found.plan.0)),
                 (
                     "roots",
-                    PlyValue::list(found.plan.1.iter().map(|&r| PlyValue::Int(r as i64)).collect()),
+                    PlyValue::list(
+                        found
+                            .plan
+                            .1
+                            .iter()
+                            .map(|&r| PlyValue::Int(r as i64))
+                            .collect(),
+                    ),
                 ),
                 ("seeds", count(found.plan.1.len())),
                 ("budget", count(found.plan.2 as usize)),
@@ -1871,8 +1902,8 @@ fn knowledge_value(value: &KnowledgeValue) -> PlyValue {
             ),
             ("mode", PlyValue::str(&row.mode)),
             ("seeds", count(row.roots.len())),
-            ("budget", PlyValue::str(&row.budget)),
-            ("steps", PlyValue::str(&row.steps)),
+            ("budget", count(row.budget as usize)),
+            ("steps", count(row.steps as usize)),
         ]),
     }
 }

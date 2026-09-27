@@ -127,7 +127,12 @@ impl Selection {
     /// The runtime's view of what the program decided: the same fields `select` used to build, laid
     /// out from the choice. The evidence a cached test is reported with is always a pass — a stored
     /// failure is never `Cached` — so nothing here has to read the store again.
-    pub fn chosen(choice: &Choice, check: &CheckOutput, visible: &[usize], plan: &Plan) -> Selection {
+    pub fn chosen(
+        choice: &Choice,
+        check: &CheckOutput,
+        visible: &[usize],
+        plan: &Plan,
+    ) -> Selection {
         let plan = plan.clone().normalized();
         let total = check.tests.len();
         let cached: Vec<(usize, Outcome)> = (0..total)
@@ -159,10 +164,17 @@ impl Selection {
             to_run: choice.runs.clone(),
             groups: choice.groups.clone(),
             reasons: choice.reasons.clone(),
-            isolation: check.tests.iter().map(|t| Isolation::of(&t.footprint)).collect(),
+            isolation: check
+                .tests
+                .iter()
+                .map(|t| Isolation::of(&t.footprint))
+                .collect(),
             // Over the tests this run reports on, so every count shares one denominator.
             parallelism: parallelism(
-                visible.iter().filter_map(|&i| check.tests.get(i)).map(|t| &t.footprint),
+                visible
+                    .iter()
+                    .filter_map(|&i| check.tests.get(i))
+                    .map(|t| &t.footprint),
                 &footprints,
                 &choice.groups,
             ),
@@ -170,6 +182,25 @@ impl Selection {
             narrowed,
             out_of_scope: BTreeSet::new(),
         }
+    }
+
+    /// The same selection over the tests a filter keeps. `--filter` cannot change which tests
+    /// conflict, so a class only loses members; a cached result or a narrowed plan for a test the
+    /// run does not report on goes with it.
+    pub fn keep(&self, visible: &[usize]) -> Selection {
+        let keeps = |i: &usize| visible.binary_search(i).is_ok();
+        let mut out = self.clone();
+        out.total = visible.len();
+        out.cached.retain(|(i, _)| keeps(i));
+        out.to_run.retain(keeps);
+        out.groups = self
+            .groups
+            .iter()
+            .map(|class| class.iter().copied().filter(keeps).collect::<Vec<usize>>())
+            .filter(|class| !class.is_empty())
+            .collect();
+        out.narrowed.retain(|index, _| keeps(index));
+        out
     }
 
     pub fn reason(&self, index: usize) -> Option<Reason> {
