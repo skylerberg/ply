@@ -2010,6 +2010,7 @@ const BUMP: &str = "the on-disk schema changed. Bump the version constant this \
 fn pin_fingerprint() -> SourceFingerprint {
     SourceFingerprint {
         content_hash: content(1),
+        module: "user.store".to_string(),
         defs: vec![
             DefEntry {
                 name: ply_span::Symbol::new("user.active_users"),
@@ -2133,7 +2134,7 @@ fn the_front_end_entry_encoding_is_pinned() {
     assert_eq!(found, pinned.to_vec(), "{BUMP}");
 }
 
-const PINNED_FINGERPRINT: &str = "300fe8c0ddf5800c064400b08474309dc35cd462cc7543ee6acf4313248b46ed";
+const PINNED_FINGERPRINT: &str = "9404e26239bd0045db7df203c45a7e6d933fad1c8ba4ad0eba31f3e1f1c645b9";
 const PINNED_DEF: &str = "3786bc4de6b1147d63b2eaa56db0ef47bb0201a5133a04c236146d7a5236d9f3";
 const PINNED_TYPE_DECL: &str = "460a925c3059ec0aed17aa1375a0478bad865749d395c75bac605ea4f5c4f18a";
 const PINNED_EFFECT_DECL: &str = "0b5bc11329b83fd823d762923323c2373dfb1e9e985756570dd709013e1a004d";

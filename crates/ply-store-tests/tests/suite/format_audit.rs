@@ -130,6 +130,7 @@ fn decl() -> CachedDecl {
 fn fingerprint() -> SourceFingerprint {
     SourceFingerprint {
         content_hash: ContentHash::of(b"fn active_users() -> Int = 1\n"),
+        module: "user.store".to_string(),
         defs: vec![DefEntry {
             name: Symbol::new("user.active_users"),
             hash: hash(1),
