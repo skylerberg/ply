@@ -135,10 +135,8 @@ fn attribute(before: &Compiled, after: &Compiled, key: &str, independent: bool) 
     attribution
 }
 
-/// ddmin owes only *a* 1-minimal set, so this checks reproduction and 1-minimality, not which set.
-
-/// A kept member still names its partner's baseline hash, so flipping one alone replays the baseline.
-
+/// A chain of  definitions, each calling the one below it, so an edit at the leaf reaches
+/// every caller through the hashes and only the leaf is a candidate.
 fn chain(depth: usize, leaf: &str) -> String {
     let mut src = format!("fn f000(n: Int) -> Int = {leaf}\n");
     for i in 1..depth {
