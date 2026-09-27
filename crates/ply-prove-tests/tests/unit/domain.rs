@@ -111,6 +111,9 @@ fn enumeration_covers_the_domain_once_each_in_a_fixed_order() {
     assert_eq!(show(&points[3]), "true, Asset");
     assert_eq!(show(&points[5]), "true, Equity");
 
+    // The name an artifact carries, which the Ply module computes from the same texts.
+    assert_eq!(domain.name().as_str(), "Bool × Kind");
+
     let mut rendered: Vec<String> = points.iter().map(show).collect();
     rendered.sort();
     rendered.dedup();
