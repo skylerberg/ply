@@ -1732,9 +1732,16 @@ $ ply build . --diff old.plyx       # added, changed, dropped, unchanged
 $ ply run app.plyx --host
 ```
 
-A library package — one whose manifest names no entry and which declares no
-`main` — has no closure to ship and is refused (`E0101`); library artifacts
-(`.plyz`) arrive with resolution (§3.3).
+A **library** — a package whose manifest names no entry and whose own modules
+declare no `main` — is built as the package itself: `ply build` writes a
+`.plyz`, the same container under a magic (`PLYLIB01`) and a digest domain of
+its own, holding every module's source, the package's `ply.pkg` text, and a
+compiled unit of every definition those modules declare (a library has no entry
+to prune against, so nothing is left out). `-o FILE` names it; the default is
+`<name>.plyz`. A consumer compiles those sources — always correct — or reuses
+the unit when the runtime matches, the `E0444` gate. It is a package and never
+a program: `ply run lib.plyz` refuses it (`E0443`) rather than reading a
+container as text.
 
 `ply build` writes the closure of one entry point (default `main`) as a `.plyx`
 file (default `<entry module>.plyx`): its definitions, printed back to source
@@ -1774,7 +1781,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
-| `ply build [path]` | `--entry NAME`, `-o FILE`, `--config-schema`, `--db-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
+| `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--db-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | `--show [MODULE]`, `--digest`; no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
