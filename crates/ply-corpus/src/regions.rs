@@ -307,13 +307,7 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
     let mut store = Store::open(scratch.path()).context("opening a scratch cache")?;
 
     let plan_of = |store: &mut Store| {
-        let bare = ply_test::select(
-            &loaded.check,
-            &hashes,
-            store,
-            &Plan::default(),
-            &ply_test::Engine::Evaluator,
-        );
+        let bare = ply_test::select(&loaded.check, &hashes, store, &Plan::default());
         ply_machine::tester::Plan::new(bare, &loaded.check, None, std_tests)
     };
 

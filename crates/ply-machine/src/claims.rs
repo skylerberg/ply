@@ -55,7 +55,6 @@ pub struct Job {
     /// Also discharge what the shipped modules declare.
     pub std: bool,
     pub jobs: Option<u32>,
-    pub backend: Option<String>,
     pub plan: ProvePlan,
     /// `None` for a command that binds nothing at all, which is every `ply review`.
     pub binding: Option<Binding>,
@@ -414,9 +413,8 @@ fn discharge(
         diagnostics,
         sources: loaded.sources.clone(),
     };
-    let backend = prover_backend(job.backend.as_ref(), loaded).map_err(|d| unbound(vec![d]))?;
-    let constant =
-        |name: &str| enter_constant(backend.as_ref().map(|(provider, _)| *provider), name);
+    let backend = prover_backend(loaded).map_err(|d| unbound(vec![d]))?;
+    let constant = |name: &str| enter_constant(Some(backend), name);
     let mut warnings = Vec::new();
     let hosts = match &job.binding {
         None => None,
@@ -462,7 +460,7 @@ fn discharge(
     let asked = obligation::Asked::new(asked_for, store, &job.plan, job.use_cache);
     // Built only when the cache left something to discharge.
     let engine: Box<dyn obligation::Discharger + '_> = if asked.pending() {
-        match crate::engine::of(loaded, hosting, backend, store) {
+        match crate::engine::of(loaded, hosting, Some(backend), store) {
             Ok(engine) => engine,
             Err(err) => {
                 return Err(Refused {
@@ -1209,7 +1207,6 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
         use_cache: !bool_at("no_cache")?,
         std: bool_at("std")?,
         jobs: opt_int_at(v, "jobs", span)?.map(|n| n as u32),
-        backend: opt_str_at(v, "backend", span)?,
         plan: crate::simulation::prove_plan(&prove_opts, &sim_opts),
         binding,
     })

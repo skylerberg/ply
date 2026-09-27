@@ -1,5 +1,4 @@
 use ply_eval::{Exploration, Naive, Plan, Seed, SimMode};
-use ply_test::key::Engine;
 use ply_test::sim::{Record, SimSummary, record_under, replay_command};
 use ply_ty::DefHash;
 
@@ -19,7 +18,7 @@ fn passing(explored: u32) -> Exploration {
 fn an_unsimulated_test_is_written_under_its_own_hash_and_nothing_else() {
     let plan = Plan::default();
     assert_eq!(
-        record_under(hash(1), false, &plan, &plan, None, &Engine::Evaluator),
+        record_under(hash(1), false, &plan, &plan, None),
         Record::Under(vec![hash(1)])
     );
 }
@@ -27,14 +26,7 @@ fn an_unsimulated_test_is_written_under_its_own_hash_and_nothing_else() {
 #[test]
 fn a_seeded_test_is_never_written_under_its_bare_hash() {
     let plan = Plan::default();
-    let record = record_under(
-        hash(1),
-        true,
-        &plan,
-        &plan,
-        Some(&passing(12)),
-        &Engine::Evaluator,
-    );
+    let record = record_under(hash(1), true, &plan, &plan, Some(&passing(12)));
     assert!(record.is_written());
     assert!(!record.keys().contains(&hash(1)));
     assert_eq!(record.keys(), [ply_test::sim_key(hash(1), &plan)]);
@@ -47,14 +39,7 @@ fn a_dpor_search_writes_no_per_root_key() {
         ..Plan::default()
     };
     assert_eq!(plan.mode, SimMode::Dpor);
-    let record = record_under(
-        hash(1),
-        true,
-        &plan,
-        &plan,
-        Some(&passing(9)),
-        &Engine::Evaluator,
-    );
+    let record = record_under(hash(1), true, &plan, &plan, Some(&passing(9)));
     assert_eq!(record.keys().len(), 1);
 }
 
@@ -65,19 +50,12 @@ fn a_random_search_writes_one_key_per_root_it_ran_plus_the_plan() {
         roots: vec![2, 3],
         ..run.clone()
     };
-    let record = record_under(
-        hash(1),
-        true,
-        &run,
-        &ran,
-        Some(&passing(2)),
-        &Engine::Evaluator,
-    );
+    let record = record_under(hash(1), true, &run, &ran, Some(&passing(2)));
     assert_eq!(
         record.keys(),
         [
-            ply_test::seed_key(hash(1), &Seed::root(2), &Engine::Evaluator),
-            ply_test::seed_key(hash(1), &Seed::root(3), &Engine::Evaluator),
+            ply_test::seed_key(hash(1), &Seed::root(2)),
+            ply_test::seed_key(hash(1), &Seed::root(3)),
             ply_test::sim_key(hash(1), &run),
         ]
     );
@@ -91,14 +69,7 @@ fn a_spent_budget_writes_nothing_under_either_mode() {
         ..Exploration::default()
     };
     for plan in [Plan::default(), Plan::random(4)] {
-        let record = record_under(
-            hash(1),
-            true,
-            &plan,
-            &plan,
-            Some(&spent),
-            &Engine::Evaluator,
-        );
+        let record = record_under(hash(1), true, &plan, &plan, Some(&spent));
         assert_eq!(record, Record::Exhausted);
         assert!(record.keys().is_empty());
     }
@@ -114,14 +85,7 @@ fn a_spent_budget_stops_an_unseeded_test_caching_too() {
         ..Exploration::default()
     };
     assert_eq!(
-        record_under(
-            hash(1),
-            false,
-            &plan,
-            &plan,
-            Some(&spent),
-            &Engine::Evaluator
-        ),
+        record_under(hash(1), false, &plan, &plan, Some(&spent),),
         Record::Exhausted
     );
 }
@@ -130,7 +94,7 @@ fn a_spent_budget_stops_an_unseeded_test_caching_too() {
 fn a_seeded_test_whose_search_was_not_observed_writes_nothing() {
     let plan = Plan::default();
     assert_eq!(
-        record_under(hash(1), true, &plan, &plan, None, &Engine::Evaluator),
+        record_under(hash(1), true, &plan, &plan, None),
         Record::Unobserved
     );
 }
@@ -185,15 +149,7 @@ fn a_measured_reduction_does_not_change_what_is_written() {
         ..passing(12)
     };
     assert_eq!(
-        record_under(
-            hash(1),
-            true,
-            &plan,
-            &plan,
-            Some(&measured),
-            &Engine::Evaluator
-        )
-        .keys(),
+        record_under(hash(1), true, &plan, &plan, Some(&measured),).keys(),
         [ply_test::sim_key(hash(1), &plan)]
     );
 }

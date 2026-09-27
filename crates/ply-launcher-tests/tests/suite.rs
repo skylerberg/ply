@@ -2,7 +2,7 @@
 //! `env.terminal` and `env.binary_version` and the launcher answers.
 
 use ply_eval::host::HostRegistry;
-use ply_eval::{BackendKind, BackendSpec, Machine, Provider};
+use ply_eval::{Machine, Provider};
 use ply_span::{SourceId, Span};
 use ply_ty::Front;
 use std::collections::HashMap;
@@ -42,9 +42,7 @@ fn ask() -> String {
         [("m".to_string(), ASKER.to_string())].into_iter().collect();
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
     let mut machine = Machine::new(&front);
-    machine.set_compiled(unit.attach(&BackendSpec {
-        kind: BackendKind::C,
-    }));
+    machine.set_compiled(unit.attach());
     let mut registry = HostRegistry::new();
     for (op, handler) in ply_launcher::env::registrations("9.9.9-test") {
         registry.register(op, handler);

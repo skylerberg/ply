@@ -2,7 +2,7 @@
 //! `crates/ply-cli/ply/diagnostic.ply`'s `to_text` in Ply. The bytes have to be the same, painted
 //! or plain, so neither shape can drift away from the other.
 
-use ply_eval::{BackendKind, BackendSpec, Machine, Value};
+use ply_eval::{Machine, Value};
 use ply_machine::support::{build_backend_over, module_texts};
 use ply_span::{Diagnostic, Edit, SourceId, SourceMap, Span, codes};
 
@@ -110,14 +110,10 @@ fn the_two_renderers_write_the_same_bytes_for_one_diagnostic() {
     std::fs::write(dir.path().join("probe.ply"), PROBE).unwrap();
     let loaded = ply_machine::load::load(dir.path()).expect("the probe checks against the shelf");
 
-    let spec = BackendSpec {
-        kind: BackendKind::C,
-    };
     let texts = module_texts(&loaded.check, &loaded.sources);
-    let provider =
-        build_backend_over(&spec, &loaded.front, texts).expect("this host has a C compiler");
+    let provider = build_backend_over(&loaded.front, texts).expect("this host has a C compiler");
     let mut machine = Machine::new(&loaded.front);
-    machine.set_compiled(provider.attach(&spec));
+    machine.set_compiled(provider.attach());
 
     let mut sources = SourceMap::new();
     let m = sources.add("m.ply", ASCII);

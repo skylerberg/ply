@@ -18,8 +18,6 @@ pub struct Warm {
 /// A compiled unit and the definitions it was compiled from.
 pub struct HeldUnit {
     provider: &'static dyn ply_eval::Provider,
-    /// Two specs are two different units under one name.
-    spec: ply_eval::BackendSpec,
     /// [`HashOutput::digest`], which a machine checks the unit against before entering it.
     key: DefHash,
 }
@@ -94,26 +92,17 @@ impl Warm {
     /// compile the same one.
     pub fn unit_for(
         &self,
-        spec: &ply_eval::BackendSpec,
         front: &ply_ty::Front,
         sources: &ply_span::SourceMap,
     ) -> Option<&'static dyn ply_eval::Provider> {
         let held = self.unit.as_ref()?;
-        (held.spec == *spec
-            && held.key == front.hashes.digest()
-            && held.provider.relocate(front, sources))
-        .then_some(held.provider)
+        (held.key == front.hashes.digest() && held.provider.relocate(front, sources))
+            .then_some(held.provider)
     }
 
-    pub fn keep_unit(
-        &mut self,
-        spec: &ply_eval::BackendSpec,
-        hashes: &HashOutput,
-        provider: &'static dyn ply_eval::Provider,
-    ) {
+    pub fn keep_unit(&mut self, hashes: &HashOutput, provider: &'static dyn ply_eval::Provider) {
         self.unit = Some(HeldUnit {
             provider,
-            spec: spec.clone(),
             key: hashes.digest(),
         });
     }

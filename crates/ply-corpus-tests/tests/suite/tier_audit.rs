@@ -31,11 +31,11 @@ fn every_proof_a_generated_corpus_produces_survives_a_wide_sample() {
         let loaded = load(&root).expect("a generated corpus compiles");
         let hashes = loaded.hashes.clone();
         let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
-        let backend = ply_machine::support::prover_backend(None, &loaded)
-            .expect("the corpus compiles to a tier");
+        let backend =
+            ply_machine::support::prover_backend(&loaded).expect("the corpus compiles to a tier");
         let prover = Prover::new(&loaded)
             .expect("the port lowers the claims")
-            .with_backend(backend);
+            .with_backend(Some(backend));
         for obligation in &collected.obligations {
             if prover
                 .discharge_with(obligation, &ProvePlan::default())

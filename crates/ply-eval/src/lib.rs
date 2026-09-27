@@ -33,9 +33,7 @@ mod value;
 // `Slot` and `RegionId` stay behind `arena::`: each name means something else here.
 pub use arena::{Arena, RegionKind};
 pub use argv::CLASSES as ARGUMENT_VECTOR_CLASSES;
-pub use backend::{
-    Compilation, Counters, Kind as BackendKind, Offers, Provider, Spec as BackendSpec,
-};
+pub use backend::{Compilation, Counters, Offers, Provider};
 pub use builtins::{Builtin, Step, assert_failure, assertion_failure};
 pub use compiled::{Compiled, Entered, mentions_a_width};
 pub use cont::{Frame, Next, Prompt, Segment, SimId, Stack};

@@ -19,7 +19,7 @@ fn failures(dir: &Path, tier_only: bool) -> Vec<Value> {
     let mut cmd = ply(dir);
     cmd.args(["test", "--json", "--no-cache"]);
     if tier_only {
-        cmd.args(["--backend", "c"]).env(
+        cmd.env(
             "PLY_C_EMITTER",
             format!("ply:{}", repo().join("crates/ply-compiler/ply").display()),
         );

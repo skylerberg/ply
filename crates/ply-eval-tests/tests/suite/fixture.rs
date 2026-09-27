@@ -98,10 +98,7 @@ impl Compiled {
         let mut m = Machine::new(&self.front);
         let unit = ply_codegen::Unit::over_front(&self.front, self.texts.clone())
             .expect("this host has a C compiler");
-        let spec = ply_eval::BackendSpec {
-            kind: ply_eval::BackendKind::C,
-        };
-        m.set_compiled(unit.attach(&spec));
+        m.set_compiled(unit.attach());
         m
     }
 

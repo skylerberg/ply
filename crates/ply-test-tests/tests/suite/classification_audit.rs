@@ -69,13 +69,7 @@ fn report_for(executor: &Answering) -> RunReport {
     let root = TempRoot::new();
     let mut store = root.store();
     let compiled = Compiled::anonymous(CORPUS);
-    let selection = select(
-        &compiled.check,
-        &compiled.hashes,
-        &store,
-        &Plan::default(),
-        &ply_test::Engine::Evaluator,
-    );
+    let selection = select(&compiled.check, &compiled.hashes, &store, &Plan::default());
     run_with(
         &selection,
         &compiled.check,
@@ -167,13 +161,7 @@ fn an_abandoned_run_is_no_verdict_and_is_recorded_nowhere() {
     let root = TempRoot::new();
     let mut store = root.store();
     let compiled = Compiled::anonymous(CORPUS);
-    let selection = select(
-        &compiled.check,
-        &compiled.hashes,
-        &store,
-        &Plan::default(),
-        &ply_test::Engine::Evaluator,
-    );
+    let selection = select(&compiled.check, &compiled.hashes, &store, &Plan::default());
     let report = run_with(
         &selection,
         &compiled.check,

@@ -754,10 +754,9 @@ skipped; `--mutate-budget N` (default 64) caps how many are judged.
 
 ### 8.6 Compiled backend
 
-`--backend c` compiles the program to C and runs it there: compiled code is the
-only evaluator. Its passes share the evaluator's cache.
-`--profile development` (default; fastest compiler) or `release`
-(`cc -O2`) requires `--backend`.
+The program is compiled to C and runs there: compiled code is the only
+evaluator, and every command uses it. `--profile development` (default;
+fastest compiler) or `release` (`cc -O2`) selects the C toolchain.
 
 A definition the backend cannot compile is `E0448`, raised where the program is
 built and naming the construct that refused it, since nothing could ever enter
@@ -893,8 +892,7 @@ values. Flags: `--prove-cases N` (below 25 kept cases only `example`),
 `--prove-roots N`, `--prove-budget N` (spent reports `property`),
 `--shrink-budget N`, `--prove-steps N` (calls per evaluation of a claim, default
 1000000000; an evaluation past it leaves the obligation `unattempted`, and the
-number keys the cached result, so more budget is a stronger claim), and
-`--backend`.
+number keys the cached result, so more budget is a stronger claim).
 
 `ply review` reports, per definition changed since the last
 `ply review --accept`, whether the implementation, the spec and the obligations
@@ -1521,10 +1519,10 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | command | flags |
 | --- | --- |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases; with `--types`, effect sets and provenance) |
-| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--trace auto\|always\|never`, `--backend`, `--profile`, `--std`, host, simulation |
-| `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--backend`, `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
-| `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`, `--backend`, host, trace, prove, simulation |
-| `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, `--backend`, prove, simulation |
+| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--trace auto\|always\|never`, `--profile`, `--std`, host, simulation |
+| `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
+| `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`, host, trace, prove, simulation |
+| `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE`, `--config-schema`, `--db-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | `--show [MODULE]`, `--digest`; no path |

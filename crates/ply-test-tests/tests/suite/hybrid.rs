@@ -73,10 +73,7 @@ impl Compiled {
         let mut machine = ply_eval::Machine::new(&self.port);
         let unit = ply_codegen::Unit::over_front(&self.port, self.texts.clone())
             .expect("this host has a C compiler");
-        let spec = ply_eval::BackendSpec {
-            kind: ply_eval::BackendKind::C,
-        };
-        machine.set_compiled(unit.attach(&spec));
+        machine.set_compiled(unit.attach());
         machine
             .eval_test(index)
             .expect_err("the fixture must fail as written")
@@ -369,7 +366,6 @@ test "doubles" { assert_eq(scale(2) + other(0), 5) }
 
     let index = after.test_index("m.doubles");
     let mut report = ply_test::RunReport {
-        engine: ply_test::Engine::Evaluator,
         passed: 0,
         failed: 1,
         abandoned: 0,
