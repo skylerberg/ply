@@ -10,8 +10,12 @@
 
 use assert_cmd::Command;
 use serde_json::Value;
+use std::fs::{File, OpenOptions};
+use std::io::Read;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Child, Output};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 /// What a `ply` child inherits from the test process.
@@ -105,4 +109,97 @@ pub fn json_of(output: &Output) -> Value {
     let text = stdout_of(output);
     serde_json::from_str(&text)
         .unwrap_or_else(|e| panic!("`--json` writes one document on stdout: {e}\n{text}"))
+}
+
+/// A port for a `ply run --host` server a test is about to start, held against every other test
+/// that reserves this way until the server has answered on it.
+///
+/// `bind(0)` returns a port to the kernel the moment the reserving listener drops, so two tests
+/// that reserve together can be handed one port: the server that starts second dies with `E0502`
+/// while the first answers the second's readiness probe. One lock, held across the
+/// reserve-to-answer window rather than the reserve alone, keeps a sibling out of the gap in which
+/// the port is neither reserved nor bound.
+///
+/// A server that can echo a token of its own -- the shutdown suite's -- proves itself by the answer
+/// instead. The example servers serve a fixed number of connections and cannot spend one on a
+/// probe, so for them the port itself has to be un-shareable.
+pub struct Reservation {
+    port: u16,
+    _lock: File,
+}
+
+impl Reservation {
+    /// Takes the run-wide lock, then a free port. Dropping the value releases both.
+    pub fn take() -> Reservation {
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_file())
+            .expect("the reservation lock opens");
+        lock.lock().expect("the reservation lock is taken");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral port");
+        let port = listener.local_addr().expect("a bound address").port();
+        drop(listener);
+        Reservation { port, _lock: lock }
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The server has answered on the port; the port is the server's now, so the reservation ends.
+    pub fn bound(self) {}
+}
+
+/// Beside the test binary, so every test process in a run shares one lock whatever its `TMPDIR`.
+fn lock_file() -> PathBuf {
+    std::env::current_exe()
+        .expect("the test binary's own path")
+        .parent()
+        .expect("the test binary lives in a directory")
+        .join(".ply-ports.reserve")
+}
+
+/// Connects to `addr`, retrying until `ready` takes a connection or the child exits. `ready` has to
+/// say why the answer is *this* server's: a bare connect can belong to another process that was
+/// handed the same port. A test holding a [`Reservation`] can answer `|_| true`.
+pub fn connect_when_ready(
+    child: &mut Child,
+    addr: SocketAddr,
+    deadline: Duration,
+    mut ready: impl FnMut(&mut TcpStream) -> bool,
+) -> Result<TcpStream, String> {
+    let until = Instant::now() + deadline;
+    loop {
+        if let Some(status) = child.try_wait().expect("the child is waitable") {
+            return Err(format!(
+                "`ply run --host` exited {status} before listening:\n{}",
+                output_of(child)
+            ));
+        }
+        if let Ok(mut probe) = TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
+            let _ = probe.set_read_timeout(Some(Duration::from_secs(10)));
+            if ready(&mut probe) {
+                return Ok(probe);
+            }
+        }
+        if Instant::now() >= until {
+            return Err(format!("nothing listening on {addr} after {deadline:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Everything a child that has exited wrote, for the failure it is about to explain.
+fn output_of(child: &mut Child) -> String {
+    let mut out = String::new();
+    if let Some(stdout) = child.stdout.as_mut() {
+        let _ = stdout.read_to_string(&mut out);
+    }
+    let mut err = String::new();
+    if let Some(stderr) = child.stderr.as_mut() {
+        let _ = stderr.read_to_string(&mut err);
+    }
+    format!("{out}{err}")
 }
