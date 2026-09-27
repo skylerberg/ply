@@ -49,7 +49,11 @@ pub fn head() -> Vec<u8> {
 /// Where `w6-alloc` writes what one request allocates, relative to the repository root.
 pub const ALLOCATION_FILE: &str = "benches/w6-alloc.json";
 
-/// What one served request allocates, in a window of `requests`.
+/// What one served request allocates, and what the window it was read at held.
+///
+/// The per-request figures are the slope between `requests` and a tenth of it, so the startup a
+/// run pays before it serves anything — which is the program's size, not the request's — is not
+/// charged to every request.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Allocation {
     pub route: String,
@@ -1153,8 +1157,10 @@ fn alternatives(stack: &InProcess, levers: &Levers) -> Vec<w6::Alternative> {
                         alternative.what = format!(
                             "One /health request allocates {allocs:.0} times and {:.3} MB to \
                              produce a {}-byte response, counted with a counting global allocator \
-                             in `w6-alloc`. The size of the lever, not a speedup: nothing was \
-                             changed to move it.",
+                             in `w6-alloc`. That is the slope between two windows, so the startup \
+                             a run pays before it serves anything is not charged to the request. \
+                             The size of the lever, not a speedup: nothing was changed to move \
+                             it.",
                             bytes / 1e6,
                             stack.response_bytes
                         );

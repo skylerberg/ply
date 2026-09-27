@@ -1183,6 +1183,14 @@ covers serialization failures. `MemDb` is an in-memory twin (`open`, `step`,
 `begin_step`, `commit_step`, `abort_step`). Statement text the driver cannot
 account for is `E0432`.
 
+The driver that runs in Ply settles the verb before it sends: a statement that
+writes, performed as `db.query`, is refused because the endpoints that perform
+it would be scheduled as if they only read, and text that is not one of the four
+verbs is refused because a `Stmt` carries a statement rather than a schema —
+the run applies that. The refusal is raised, so a program cannot ignore it; it
+carries the runtime-error code rather than `E0432`, because a library has no
+raise of its own to name a code with.
+
 A `db` effect is served by `serve`: `with_server(url, size, body)` reads a
 connection string (`server_of`), draws a nonce, and answers the six operations
 over `std.pg` — the pool, the transaction scope and the text of every value are
