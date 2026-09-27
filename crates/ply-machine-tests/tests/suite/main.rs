@@ -9,6 +9,7 @@ mod fixture;
 mod front_read;
 mod modules_hash_audit;
 mod prover_soundness_audit;
+mod replay;
 mod selector_reads;
 mod tiers;
 

@@ -1,5 +1,5 @@
 use crate::fixture::{project, repo};
-use ply_machine::engine::Prover;
+use ply_machine::engine::{Point, Prover};
 use ply_machine::load::load;
 use ply_machine::obligations;
 use ply_prove::{
@@ -693,4 +693,118 @@ law "a raising index does not"
         None,
         "`Unattempted` is not a tier, and a raising peek must not acquire one"
     );
+}
+
+// --- One point at a time -------------------------------------------------------
+
+/// The prover over a fixture and the obligations it collected, in name order: what a per-point
+/// re-run needs, and the same prover a whole-run discharge is driven with.
+fn points<R>(path: &Path, f: impl FnOnce(&Prover<'_>, &[Obligation]) -> R) -> R {
+    let loaded = match load(path) {
+        Ok(loaded) => loaded,
+        Err(e) => panic!(
+            "`{}` did not compile: {:?}",
+            path.display(),
+            e.diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
+        ),
+    };
+    let hashes = loaded.hashes.clone();
+    let collected = obligations::collect(&loaded.front, &loaded.check, &hashes);
+    let prover = Prover::new(&loaded)
+        .expect("the port lowers the claims")
+        .with_backend(Some(
+            ply_machine::support::prover_backend(&loaded).expect("the program compiles to a tier"),
+        ));
+    f(&prover, &collected.obligations)
+}
+
+/// The point a refutation came from, re-run at its own root and case, draws the same values the
+/// search saw before it shrank them.
+#[test]
+fn a_refutation_is_re_run_at_the_root_and_case_it_came_from() {
+    let dir = project(
+        r#"
+law "doubling is tripling"
+  forall (n: Int) {
+    n + n == n * 3
+  }
+"#,
+    );
+    let run = Run::of(dir.path());
+    let Discharge::Refuted(counterexample) = &run.find("doubling is tripling").1 else {
+        panic!("a false law over `Int` must be refuted, not skipped");
+    };
+    let (root, case) = (counterexample.root, counterexample.case);
+    let original: Vec<String> = counterexample
+        .original
+        .iter()
+        .map(|b| b.rendered.clone())
+        .collect();
+    points(dir.path(), |prover, obligations| {
+        let index = obligations
+            .iter()
+            .position(|o| o.owner.as_str().contains("doubling is tripling"))
+            .expect("the law was collected");
+        match prover.point_at(&obligations[index], root, case, &ProvePlan::default()) {
+            Point::Falsified(bindings) => {
+                let drawn: Vec<String> = bindings.iter().map(|b| b.rendered.clone()).collect();
+                assert_eq!(
+                    drawn, original,
+                    "the point was not the one the counterexample came from"
+                );
+            }
+            other => panic!("case {case} of root {root} re-ran as {other:?}"),
+        }
+    });
+}
+
+/// A law that holds has no point that falsifies it: whatever the draws say, `Falsified` is not
+/// one of them.
+#[test]
+fn a_law_that_holds_has_no_point_that_falsifies_it() {
+    let dir = project(
+        r#"
+law "concatenation preserves length"
+  forall (a: Bytes, b: Bytes) {
+    bytes_len(bytes_concat(a, b)) == bytes_len(a) + bytes_len(b)
+  }
+"#,
+    );
+    points(dir.path(), |prover, obligations| {
+        let obligation = obligations
+            .iter()
+            .find(|o| o.owner.as_str().contains("concatenation preserves length"))
+            .expect("the law was collected");
+        let mut kept = 0;
+        for case in 0..64 {
+            match prover.point_at(obligation, 0, case, &ProvePlan::default()) {
+                Point::Falsified(bindings) => {
+                    panic!("case {case} falsifies a law that holds: {bindings:?}")
+                }
+                Point::Kept(_) => kept += 1,
+                _ => {}
+            }
+        }
+        assert!(kept > 0, "no draw was admitted: the search saw nothing");
+    });
+}
+
+/// A concurrency law's points are interleavings the search chooses, so there is no case to re-run.
+#[test]
+fn a_concurrency_laws_points_are_not_drawn_one_at_a_time() {
+    let path = repo().join("tests/fixtures/concurrency_law_binder.ply");
+    points(&path, |prover, obligations| {
+        let mut drawn = 0;
+        for obligation in obligations {
+            if !obligation.is_concurrency_law() {
+                continue;
+            }
+            drawn += 1;
+            match prover.point_at(obligation, 0, 0, &ProvePlan::default()) {
+                Point::Undrawn(Gap::NotDrawn) => {}
+                other => panic!("`{}` re-ran a point as {other:?}", obligation.owner),
+            }
+        }
+        assert!(drawn > 0, "the fixture carries no concurrency law");
+    });
 }

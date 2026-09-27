@@ -8,6 +8,7 @@
 //! `crates/ply-cli/ply/claims.ply`, `prove.ply` and `review.ply`.
 
 use crate::config::Configuration;
+use crate::engine::Point;
 use crate::hosts::{Hosts, Lent};
 use crate::load::{LoadError, Loaded};
 use crate::payload::{count, ctor, diags_value, option, places_value, record, strings};
@@ -35,10 +36,11 @@ const EFFECT: &str = "prover";
 /// The module the payload's constructors are declared in, as a program-wide name.
 const PAYLOAD: &str = "claims";
 
-const OPERATIONS: [(&str, &str); 5] = [
+const OPERATIONS: [(&str, &str); 6] = [
     ("configure", "ply_machine::claims::configure"),
     ("collected", "ply_machine::claims::collected"),
     ("discharged", "ply_machine::claims::discharged"),
+    ("replay", "ply_machine::claims::replay"),
     ("reviewed", "ply_machine::claims::reviewed"),
     ("accepted", "ply_machine::claims::accepted"),
 ];
@@ -74,6 +76,7 @@ pub fn lent() -> Vec<Lent> {
     let site: Arc<dyn HostHandler> = Arc::new(Site {
         job: Mutex::new(None),
         machine: Mutex::new(None),
+        claims: Mutex::new(0),
     });
     OPERATIONS
         .into_iter()
@@ -102,6 +105,9 @@ struct Site {
     /// Taken by the first operation, which is what starts the machine.
     job: Mutex<Option<Job>>,
     machine: Mutex<Option<Machine>>,
+    /// How many claims the collection held, so a re-run can refuse an index that names none
+    /// before reaching the thread.
+    claims: Mutex<usize>,
 }
 
 impl HostHandler for Site {
@@ -114,6 +120,11 @@ impl HostHandler for Site {
             }
             ("collected", _) => self.collected()?,
             ("discharged", [wanted]) => self.discharged(&indices(wanted, span)?)?,
+            ("replay", [index, root, case]) => self.replay(
+                usize::try_from(index.as_int(span, "the claim's place")?).unwrap_or(usize::MAX),
+                u64::try_from(root.as_int(span, "the generator's root")?).unwrap_or(0),
+                u32::try_from(case.as_int(span, "the case to draw")?).unwrap_or(u32::MAX),
+            )?,
             ("reviewed", _) => self.reviewed()?,
             ("accepted", _) => self.accepted()?,
             (other, _) => return Err(unasked(other, span)),
@@ -151,7 +162,13 @@ impl Site {
         }
         let machine = held.as_ref().ok_or_else(|| unstarted("collected"))?;
         match machine.step()? {
-            Step::Collected(answer) => Ok(answered((*answer).map(collection_value))),
+            Step::Collected(answer) => {
+                if let Ok(collection) = &*answer {
+                    *self.claims.lock().unwrap_or_else(|e| e.into_inner()) =
+                        collection.claims.len();
+                }
+                Ok(answered((*answer).map(collection_value)))
+            }
             _ => Err(out_of_step("collected")),
         }
     }
@@ -163,6 +180,21 @@ impl Site {
         match machine.step()? {
             Step::Discharged(answer) => Ok(answered((*answer).map(|v| verdicts_value(&v)))),
             _ => Err(out_of_step("discharged")),
+        }
+    }
+
+    fn replay(&self, index: usize, root: u64, case: u32) -> Result<PlyValue, Diagnostic> {
+        let held = self.claims.lock().unwrap_or_else(|e| e.into_inner());
+        if index >= *held {
+            return Err(no_such_claim(index, *held));
+        }
+        drop(held);
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("replay"))?;
+        machine.ask(Go::Replay { index, root, case })?;
+        match machine.step()? {
+            Step::Replayed(answer) => Ok(answered((*answer).map(|point| point_value(&point)))),
+            _ => Err(out_of_step("replay")),
         }
     }
 
@@ -209,6 +241,13 @@ fn answered(answer: Result<PlyValue, Refused>) -> PlyValue {
 /// What the program asks the machine for next.
 enum Go {
     Discharge(Vec<usize>),
+    /// One point of one obligation's guard: its place in the collection, the generator's root,
+    /// and which case to draw.
+    Replay {
+        index: usize,
+        root: u64,
+        case: u32,
+    },
     Review,
     Accept,
 }
@@ -216,6 +255,7 @@ enum Go {
 enum Step {
     Collected(Box<Result<Collection, Refused>>),
     Discharged(Box<Result<Verdicts, Refused>>),
+    Replayed(Box<Result<Point, Refused>>),
     Reviewed(Box<Changes>),
     Accepted(Box<Accepted>),
 }
@@ -321,14 +361,28 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
     }))));
 
     let mut report: Option<ProveReport> = None;
+    // Built by the first step that runs an obligation, and kept: a discharge of many claims and a
+    // re-run of one case are the same prover over the same hosts.
+    let mut prepared: Option<Result<Prepared, Refused>> = None;
     loop {
         match asked.recv() {
             Ok(Go::Discharge(wanted)) => {
+                if prepared.is_none() {
+                    prepared = Some(prepare(&job, &loaded, &scoped, &mut store));
+                }
+                let ready = match prepared.as_ref() {
+                    Some(Ok(ready)) => ready,
+                    Some(Err(refused)) => {
+                        let _ = told.send(Step::Discharged(Box::new(Err(refused.clone()))));
+                        return;
+                    }
+                    None => return,
+                };
                 let asked_for: Vec<Obligation> = wanted
                     .iter()
                     .filter_map(|&index| obligations.get(index).cloned())
                     .collect();
-                match discharge(&job, &loaded, &scoped, &laws, asked_for, &mut store) {
+                match discharge(&laws, &job, &scoped, asked_for, ready, &mut store) {
                     Ok(proved) => {
                         let mut warnings = proved.warnings;
                         warnings.extend(flushed(&mut store));
@@ -341,6 +395,21 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
                         return;
                     }
                 }
+            }
+            Ok(Go::Replay { index, root, case }) => {
+                if prepared.is_none() {
+                    prepared = Some(prepare(&job, &loaded, &scoped, &mut store));
+                }
+                let answer = match prepared.as_ref() {
+                    Some(Ok(ready)) => {
+                        Ok(ready
+                            .prover
+                            .point_at(&obligations[index], root, case, &job.plan))
+                    }
+                    Some(Err(refused)) => Err(refused.clone()),
+                    None => return,
+                };
+                let _ = told.send(Step::Replayed(Box::new(answer)));
             }
             Ok(Go::Review) => {
                 let Some(report) = report.as_ref() else {
@@ -400,14 +469,22 @@ fn law_labels(check: &CheckOutput) -> BTreeMap<Symbol, String> {
 
 // --- Discharging ---------------------------------------------------------------
 
-fn discharge(
+/// The prover and the hosts a run discharges and re-runs points with, built when the first step
+/// that needs them asks: a discharge of many claims and a re-run of one case are the same engine.
+struct Prepared<'a> {
+    /// Kept alive for the prover's lifetime, which is the run's.
+    _hosts: Option<Hosts>,
+    prover: crate::engine::Prover<'a>,
+    /// What opening the hosts had to say, reported by the discharge that reads them.
+    warnings: Vec<Diagnostic>,
+}
+
+fn prepare<'a>(
     job: &Job,
-    loaded: &Loaded,
+    loaded: &'a Loaded,
     scoped: &CheckOutput,
-    laws: &Laws,
-    asked_for: Vec<Obligation>,
     store: &mut Store,
-) -> Result<Proved, Refused> {
+) -> Result<Prepared<'a>, Refused> {
     let unbound = |diagnostics: Vec<Diagnostic>| Refused {
         why: Why::Unbound,
         diagnostics,
@@ -447,34 +524,41 @@ fn discharge(
             )
         }
     };
-    let runtime = hosts.as_ref().and_then(Hosts::runtime_factory);
     let hosting = hosts
         .as_ref()
         .filter(|_| job.binding.as_ref().is_some_and(|b| b.host))
         .map(|hosts| crate::engine::Hosting {
             binding: hosts.binding(),
-            runtime: runtime
-                .as_ref()
-                .map(|f| f as &(dyn Fn() -> std::rc::Rc<dyn ply_eval::host::HostRuntime> + Sync)),
+            runtime: hosts.runtime_factory().map(|f| {
+                Arc::new(f)
+                    as Arc<dyn Fn() -> std::rc::Rc<dyn ply_eval::host::HostRuntime> + Sync + Send>
+            }),
         });
+    let prover =
+        crate::engine::prover(loaded, hosting, Some(backend), store).map_err(|err| Refused {
+            why: Why::Broken,
+            diagnostics: err.diagnostics,
+            sources: err.sources,
+        })?;
+    Ok(Prepared {
+        _hosts: hosts,
+        prover,
+        warnings,
+    })
+}
+
+fn discharge(
+    laws: &Laws,
+    job: &Job,
+    scoped: &CheckOutput,
+    asked_for: Vec<Obligation>,
+    prepared: &Prepared<'_>,
+    store: &mut Store,
+) -> Result<Proved, Refused> {
+    let mut warnings = prepared.warnings.clone();
     let asked = obligation::Asked::new(asked_for, store, &job.plan, job.use_cache);
-    // Built only when the cache left something to discharge.
-    let engine: Box<dyn obligation::Discharger + '_> = if asked.pending() {
-        match crate::engine::of(loaded, hosting, Some(backend), store) {
-            Ok(engine) => engine,
-            Err(err) => {
-                return Err(Refused {
-                    why: Why::Broken,
-                    diagnostics: err.diagnostics,
-                    sources: err.sources,
-                });
-            }
-        }
-    } else {
-        Box::new(obligation::Undecided)
-    };
     let (pool, _workers) = build_pool(job.jobs, &mut warnings);
-    let discharge = || asked.discharge(scoped, laws, store, engine.as_ref());
+    let discharge = || asked.discharge(scoped, laws, store, &prepared.prover);
     let mut proved = match &pool {
         Some(pool) => pool.install(discharge),
         None => discharge(),
@@ -486,12 +570,14 @@ fn discharge(
 
 // --- What crosses back ----------------------------------------------------------
 
+#[derive(Clone)]
 enum Why {
     Broken,
     Unbound,
     Trouble,
 }
 
+#[derive(Clone)]
 struct Refused {
     why: Why,
     diagnostics: Vec<Diagnostic>,
@@ -851,6 +937,18 @@ fn gap_value(gap: &Gap) -> PlyValue {
             "ReachesHost",
             vec![PlyValue::str(footprint.to_string())],
         ),
+        Gap::NotDrawn => ctor(PAYLOAD, "NotDrawn", Vec::new()),
+    }
+}
+
+/// One point as `claims.ply` reads it: the same constructors the whole-run outcomes use, minus
+/// the tier, because a case that held says nothing about how the obligation as a whole was shown.
+fn point_value(point: &Point) -> PlyValue {
+    match point {
+        Point::Kept(bindings) => ctor(PAYLOAD, "Kept", vec![bindings_value(bindings)]),
+        Point::Falsified(bindings) => ctor(PAYLOAD, "Falsified", vec![bindings_value(bindings)]),
+        Point::Rejected => ctor(PAYLOAD, "Rejected", Vec::new()),
+        Point::Undrawn(gap) => ctor(PAYLOAD, "Undrawn", vec![gap_value(gap)]),
     }
 }
 
@@ -1068,6 +1166,15 @@ fn twice(op: &str) -> Diagnostic {
         format!("`{EFFECT}.{op}` was performed twice, and one load serves the whole command"),
     )
     .note("the operations are performed in order; this is Ply's fault")
+}
+
+#[cold]
+fn no_such_claim(index: usize, claims: usize) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("there is no claim {index}: the collection holds {claims}"),
+    )
+    .note("a claim is named by its place in the collection the run read; this is Ply's fault")
 }
 
 #[cold]

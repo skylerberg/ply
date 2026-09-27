@@ -189,6 +189,9 @@ pub enum Gap {
     },
     /// A `law/host` under a hermetic run.
     ReachesHost(Footprint),
+    /// The obligation's points are not drawn one at a time, so there is no case to re-run: a
+    /// concurrency law's points are interleavings that the search chooses.
+    NotDrawn,
 }
 
 #[derive(Clone, Debug)]
