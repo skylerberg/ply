@@ -47,7 +47,8 @@ impl Run {
             .obligations
             .into_iter()
             .map(|o| {
-                let discharge = prover.discharge_with(&o, plan, None);
+                let domain = crate::fixture::measured(&prover, &o);
+                let discharge = prover.discharge_with(&o, plan, domain.as_ref());
                 (o, discharge)
             })
             .collect();
@@ -181,7 +182,11 @@ fn the_differential_tier_audit() {
             ));
         for obligation in &collected.obligations {
             if prover
-                .discharge_with(obligation, &ProvePlan::default(), None)
+                .discharge_with(
+                    obligation,
+                    &ProvePlan::default(),
+                    crate::fixture::measured(&prover, obligation).as_ref(),
+                )
                 .tier()
                 != Some(Tier::Proved)
             {

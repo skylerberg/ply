@@ -16,6 +16,7 @@ const REPLAY: &str = r#"
 nondet effect prover {
   write configure[claims](options: Options) -> Unit
   read collected[claims]() -> Result<Collection, Refusal>
+  read typed[claims]() -> Result<Typed, Refusal>
   read outcomes[claims](keys: List<String>) -> List<Option<String>>
   read discharged[claims](choice: Choice) -> Result<Verdicts, Refusal>
   read replay[claims](index: Int, root: Int, case: Int) -> Result<Point, Refusal>
@@ -23,6 +24,12 @@ nondet effect prover {
   read accepted[claims]() -> Accepted
 }
 
+type Binder = { name: String, text: String, ty: Ty }
+type Ty = | Var(Int) | Fn | Record(List<{ name: String, ty: Ty }>) | Con(String, List<Ty>)
+type Variant = { name: String, fields: List<Ty> }
+type Decl = { name: String, variants: List<Variant> }
+type Typed = { decls: List<Decl>, claims: List<{ claim: Int, binders: List<Binder> }> }
+type Measured = { claim: Int, sizes: List<Int>, name: String }
 type Tls = Unit
 type Named = Unit
 type Db = { url: Option<String>, pool: Option<Int>, acquire_ms: Option<Int>, statement_ms: Option<Int>, idle_txn_ms: Option<Int>, connect_ms: Option<Int>, statement_cache: Option<Int>, schema: Option<String> }
