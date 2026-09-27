@@ -71,6 +71,7 @@ pub fn run(
     root: &Path,
     argv: Vec<String>,
     mut binds: Binds,
+    count: Option<PathBuf>,
 ) -> Result<i32, Diagnostic> {
     let shelf = shelf(program)?;
     let path = PathBuf::from(&program.artifact_name);
@@ -111,7 +112,27 @@ pub fn run(
         .name("ply".to_string())
         .stack_size(STACK)
         .spawn(move || {
-            ply_codegen::rt::unbounded(|| artifact::enter(&artifact, &opened, argv, binds))
+            match count {
+                Some(path) => {
+                    let (answer, counted) = crate::count::window(|| {
+                        ply_codegen::rt::unbounded(|| {
+                            artifact::enter(&artifact, &opened, argv, binds)
+                        })
+                    });
+                    // The entry's answer stands: the run happened, and a count that could not
+                    // be written is reported rather than replacing what the program did.
+                    if let Err(e) = crate::count::write(&path, counted) {
+                        eprintln!(
+                            "the allocation count could not be written to {}: {e}",
+                            path.display()
+                        );
+                    }
+                    answer
+                }
+                None => {
+                    ply_codegen::rt::unbounded(|| artifact::enter(&artifact, &opened, argv, binds))
+                }
+            }
         });
     match work {
         Ok(thread) => match thread.join() {
@@ -126,5 +147,6 @@ pub fn run(
     }
 }
 
+pub mod count;
 pub mod env;
 pub mod shipped;

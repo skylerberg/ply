@@ -31,15 +31,12 @@ fn main() -> Int = simulate { spawn { 1 }; 2 }
 
 /// Generated rather than checked in: a private key in a repository leaks.
 fn credential(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
-    let key = rcgen::KeyPair::generate().expect("a key pair");
-    let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-        .expect("certificate parameters")
-        .self_signed(&key)
-        .expect("a self-signed certificate");
+    let issued =
+        ply_host::certgen::issue(&["localhost".to_string()]).expect("a certificate is issued");
     let cert_path = dir.join(format!("{name}.pem"));
     let key_path = dir.join(format!("{name}.key"));
-    std::fs::write(&cert_path, cert.pem()).expect("the certificate is written");
-    std::fs::write(&key_path, key.serialize_pem()).expect("the key is written");
+    std::fs::write(&cert_path, &issued.certificate).expect("the certificate is written");
+    std::fs::write(&key_path, &issued.key).expect("the key is written");
     (cert_path, key_path)
 }
 

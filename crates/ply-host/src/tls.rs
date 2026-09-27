@@ -257,7 +257,7 @@ fn private_key(path: &Path) -> Result<PrivateKeyDer<'static>, Diagnostic> {
 }
 
 /// SHA-256 of the leaf's DER, through the provider's own hash rather than a second implementation.
-fn fingerprint(leaf: &CertificateDer<'_>) -> String {
+pub fn fingerprint(leaf: &CertificateDer<'_>) -> String {
     let Some(sha256) = provider()
         .cipher_suites
         .iter()
