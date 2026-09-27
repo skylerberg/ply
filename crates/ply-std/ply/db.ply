@@ -3423,96 +3423,1372 @@ fn release(session: pg::Session, pool: Pool) -> Pool = { ..pool, idle: push(pool
 fn give_back(session: pg::Session, pool: Pool) -> Pool =
   release(session, { ..pool, opened: pool.opened - 1 })
 
-// --- What a statement is ----------------------------------------------------------
-
-// Whether a statement writes, decided by the verb it leads with. A write performed as `db.query`
-// is published to the scheduler as a read, and two endpoints that both write would then be run
-// beside each other, so the verb is settled before the statement reaches the server.
-pub fn writes(sql: String) -> Result<Bool, DbError> = {
-  let b = bytes_of_string(sql);
-  let at = skip_to_word(b, 0);
-  if at >= bytes_len(b) { Err(unsupported_statement("the statement is empty")) } else {
-    let w = word_at(b, at);
-    match verb_writes(w.word) {
-      Some(answers) -> Ok(answers),
-      None -> if w.word == "with" { writes_after_with(b, w.next) } else {
-        Err(
-          unsupported_statement(
-            "a statement begins `" ++ w.word
-              ++ "`; a `Stmt` is one `select`, `insert`, `update` or `delete`, and a schema is applied by the run rather than through this effect",
-          ),
-        )
-      },
-    }
-  }
-}
-
-fn unsupported_statement(why: String) -> DbError = db_error("0A000", "", why)
-
-fn verb_writes(word: String) -> Option<Bool> =
-  if word == "select" || word == "values" { Some(false) }
-  else if word == "insert" || word == "update" || word == "delete" { Some(true) }
-  else { None }
-
-// The verb after a `with` clause's common table expressions: an `insert` may follow them, and a
-// CTE's own body is inside parentheses, so only a word at depth zero is the statement's verb.
-fn writes_after_with(b: Bytes, at: Int) -> Result<Bool, DbError> = {
-  let i = skip_to_word(b, at);
-  if i >= bytes_len(b) { Err(unsupported_statement("a `with` clause names no statement")) }
-  else if bytes_at(b, i) == 40 { writes_deeper(b, i + 1, 1) } else {
-    let w = word_at(b, i);
-    match verb_writes(w.word) { Some(answers) -> Ok(answers), None -> writes_after_with(b, w.next) }
-  }
-}
-
-fn writes_deeper(b: Bytes, at: Int, depth: Int) -> Result<Bool, DbError> = {
-  let i = skip_to_word(b, at);
-  if i >= bytes_len(b) { Err(unsupported_statement("a `with` clause names no statement")) }
-  else if bytes_at(b, i) == 40 { writes_deeper(b, i + 1, depth + 1) } else if bytes_at(b, i) == 41 {
-    if depth == 1 { writes_after_with(b, i + 1) } else { writes_deeper(b, i + 1, depth - 1) }
-  } else { writes_deeper(b, word_at(b, i).next, depth) }
-}
-
-// The first byte that is not whitespace or a comment.
-fn skip_to_word(b: Bytes, at: Int) -> Int =
-  if at >= bytes_len(b) { at } else if bytes_at(b, at) == 45 && at + 1 < bytes_len(b)
-      && bytes_at(b, at + 1) == 45 { skip_to_word(b, skip_line(b, at)) } else if bytes_at(b, at)
-      == 47
-      && at + 1 < bytes_len(b)
-      && bytes_at(b, at + 1) == 42 { skip_to_word(b, skip_block(b, at + 2)) }
-  else if is_space_byte(bytes_at(b, at)) { skip_to_word(b, at + 1) }
-  else { at }
-
-fn skip_line(b: Bytes, at: Int) -> Int =
-  if at >= bytes_len(b) || bytes_at(b, at) == 10 { at } else { skip_line(b, at + 1) }
-
-fn skip_block(b: Bytes, at: Int) -> Int =
-  if at + 1 >= bytes_len(b) { bytes_len(b) }
-  else if bytes_at(b, at) == 42 && bytes_at(b, at + 1) == 47 { at + 2 }
-  else { skip_block(b, at + 1) }
-
-fn is_space_byte(c: Int) -> Bool = c == 32 || c == 9 || c == 10 || c == 13
+fn is_space_byte(c: Int) -> Bool = c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
 
 fn is_word_byte(c: Int) -> Bool =
   (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || (c >= 48 && c <= 57)
 
-// The word at `at`, folded to lower case, and where it ends.
-fn word_at(b: Bytes, at: Int) -> { word: String, next: Int } = {
-  let end = word_end(b, at);
-  { word: lower_between(b, at, end), next: end }
+// --- Reading a statement ----------------------------------------------------------
+
+// A statement is read before it is sent: the tables its text reaches are what its endpoints are
+// scheduled on, so a statement whose footprint cannot be computed is refused rather than run with
+// one that under-reports. The reader is a tokenizer and a small parser over it, and it refuses far
+// more than it accepts: `with` is the only admitted construct that can hide a verb.
+
+// What a statement does, which decides the operations that may perform it.
+pub type ScanKind = | KSelect | KInsert | KUpdate | KDelete | KValues
+
+pub fn kind_writes(k: ScanKind) -> Bool =
+  match k { KSelect -> false, KValues -> false, KInsert -> true, KUpdate -> true, KDelete -> true }
+
+pub fn kind_text(k: ScanKind) -> String =
+  match k {
+    KSelect -> "select",
+    KValues -> "values",
+    KInsert -> "insert",
+    KUpdate -> "update",
+    KDelete -> "delete",
+  }
+
+// The tables a statement names, split by what it does to them and deduplicated: one name is one
+// entry, and a table that is written is not also reported as read.
+pub type SqlTables = { written: List<String>, read: List<String> }
+
+pub fn no_sql_tables() -> SqlTables = { written: [], read: [] }
+
+fn sql_note_written(t: SqlTables, name: String) -> SqlTables =
+  { ..t, written: sql_insert_table(t.written, name), read: sql_without_table(t.read, name) }
+
+fn sql_note_read(t: SqlTables, name: String) -> SqlTables =
+  if sql_has_table(t.written, name) { t } else { { ..t, read: sql_insert_table(t.read, name) } }
+
+fn sql_absorb_tables(t: SqlTables, other: SqlTables) -> SqlTables =
+  fold(
+    other.written,
+    fold(other.read, t, |acc: SqlTables, n: String| sql_note_read(acc, n)),
+    |acc: SqlTables, n: String| sql_note_written(acc, n),
+  )
+
+fn sql_has_table(names: List<String>, name: String) -> Bool =
+  fold(names, false, |acc: Bool, n: String| acc || n == name)
+
+// Sorted, so one set is one list: two statements that touch the same tables read the same however
+// they were written, and a comparison against a row does not depend on the order of the text.
+fn sql_insert_table(names: List<String>, name: String) -> List<String> =
+  if sql_has_table(names, name) { names } else { sql_in_order(names, name, []) }
+
+fn sql_in_order(names: List<String>, name: String, before: List<String>) -> List<String> =
+  match names {
+    [] -> push(before, name),
+    [h, ..rest] -> if sql_name_before(name, h) { concat_lists(push(before, name), names) }
+    else { sql_in_order(rest, name, push(before, h)) },
+  }
+
+// A name's bytes, compared as postgres compares them: byte by byte, so `"Items"` sorts before
+// `items`.
+fn sql_name_before(a: String, b: String) -> Bool =
+  sql_bytes_cmp(bytes_of_string(a), bytes_of_string(b)) < 0
+
+fn sql_bytes_cmp(a: Bytes, b: Bytes) -> Int =
+  if bytes_len(a) == 0 { if bytes_len(b) == 0 { 0 } else { -1 } }
+  else if bytes_len(b) == 0 { 1 } else {
+    let x = bytes_at(a, 0);
+    let y = bytes_at(b, 0);
+    if x == y { sql_bytes_cmp(bytes_slice(a, 1, bytes_len(a)), bytes_slice(b, 1, bytes_len(b))) }
+    else if x < y { -1 }
+    else { 1 }
+  }
+
+// Every table the statement names, written and read as one sorted list.
+pub fn scan_table_names(t: SqlTables) -> List<String> = sql_merge_names(t.written, t.read)
+
+fn sql_merge_names(a: List<String>, b: List<String>) -> List<String> =
+  match a {
+    [] -> b,
+    [ah, ..at] -> match b {
+      [] -> a,
+      [bh, ..bt] -> if ah == bh { concat_lists([ah], sql_merge_names(at, bt)) }
+      else if sql_name_before(ah, bh) { concat_lists([ah], sql_merge_names(at, b)) }
+      else { concat_lists([bh], sql_merge_names(a, bt)) },
+    },
+  }
+
+fn sql_without_table(names: List<String>, name: String) -> List<String> =
+  fold(names, [], |acc: List<String>, n: String| if n == name { acc } else { push(acc, n) })
+
+// --- The tokens --------------------------------------------------------------------
+
+// A token, with the source text it was read from, so a refusal can name it.
+pub type SqlTok =
+  | SqlWord({ text: String, quoted: Bool })
+  | SqlNumber
+  | SqlText
+  | SqlPlaceholder
+  | SqlPunct(String)
+  | SqlSemi
+
+pub type SqlTokAt = { tok: SqlTok, at: Int, text: String }
+
+pub fn sql_is_word(t: SqlTok, word: String) -> Bool =
+  match t { SqlWord(w) -> if w.quoted { false } else { w.text == word }, _ -> false }
+
+pub fn sql_is_punct(t: SqlTok, p: String) -> Bool = match t { SqlPunct(x) -> x == p, _ -> false }
+
+pub fn sql_is_semi(t: SqlTok) -> Bool = match t { SqlSemi -> true, _ -> false }
+
+// The tokens of `sql`, in order. Whitespace and comments are dropped, and a quote that is never
+// closed is refused rather than guessed at: past one, the reader cannot tell text from statement.
+pub fn tokenize(sql: String) -> Result<List<SqlTokAt>, DbError> = {
+  let b = bytes_of_string(sql);
+  sql_tokens_from(b, 0, [])
 }
 
-// Where the word that begins at `at` ends: the first byte that is not one of its own.
-fn word_end(b: Bytes, at: Int) -> Int =
-  if at < bytes_len(b) && is_word_byte(bytes_at(b, at)) { word_end(b, at + 1) } else { at }
+fn sql_tokens_from(b: Bytes, at: Int, acc: List<SqlTokAt>) -> Result<List<SqlTokAt>, DbError> = {
+  let i = sql_skip_trivia(b, at)?;
+  if i >= bytes_len(b) { Ok(acc) } else {
+    let step = sql_next_token(b, i)?;
+    sql_tokens_from(b, step.next, push(acc, step.tok))
+  }
+}
 
-fn lower_between(b: Bytes, at: Int, end: Int) -> String =
+fn sql_skip_trivia(b: Bytes, at: Int) -> Result<Int, DbError> =
+  if at >= bytes_len(b) { Ok(at) }
+  else if is_space_byte(bytes_at(b, at)) { sql_skip_trivia(b, at + 1) } else if bytes_at(b, at)
+      == 45
+      && sql_byte_is(b, at + 1, 45) { sql_skip_trivia(b, sql_past_line(b, at)) } else if bytes_at(
+        b,
+        at,
+      )
+      == 47
+      && sql_byte_is(b, at + 1, 42) {
+    match sql_past_comment(b, at + 2, 1) {
+      Err(_) -> Err(sql_unclosed(b, at, "a block comment")),
+      Ok(e) -> sql_skip_trivia(b, e),
+    }
+  } else { Ok(at) }
+
+fn sql_byte_is(b: Bytes, at: Int, c: Int) -> Bool = at < bytes_len(b) && bytes_at(b, at) == c
+
+fn sql_past_line(b: Bytes, at: Int) -> Int =
+  if at >= bytes_len(b) { at }
+  else if bytes_at(b, at) == 10 { at + 1 }
+  else { sql_past_line(b, at + 1) }
+
+// Postgres nests block comments, so stopping at the first `*/` would leave statement text behind.
+fn sql_past_comment(b: Bytes, at: Int, depth: Int) -> Result<Int, Int> =
+  if at >= bytes_len(b) { Err(at) } else if bytes_at(b, at) == 47 && sql_byte_is(b, at + 1, 42) {
+    sql_past_comment(b, at + 2, depth + 1)
+  } else if bytes_at(b, at) == 42 && sql_byte_is(b, at + 1, 47) {
+    if depth == 1 { Ok(at + 2) } else { sql_past_comment(b, at + 2, depth - 1) }
+  } else { sql_past_comment(b, at + 1, depth) }
+
+fn sql_next_token(b: Bytes, at: Int) -> Result<{ tok: SqlTokAt, next: Int }, DbError> = {
+  let c = bytes_at(b, at);
+  if c == 59 { Ok(sql_filled(b, at, at + 1, SqlSemi)) }
+  else if c == 39 { sql_literal(b, at, at + 1, at, false) } else if (c == 101 || c == 69)
+      && sql_byte_is(b, at + 1, 39) { sql_literal(b, at, at + 2, at + 1, true) } else if (c == 98
+      || c == 66
+      || c == 120
+      || c == 88)
+      && sql_byte_is(b, at + 1, 39) { sql_literal(b, at, at + 2, at + 1, false) } else if (c == 117
+      || c == 85)
+      && sql_byte_is(b, at + 1, 38)
+      && sql_byte_is(b, at + 2, 39) { sql_literal(b, at, at + 3, at + 2, false) }
+  else if c == 34 { sql_quoted_word(b, at, at + 1, at) } else if c == 36 {
+    match sql_digit_end(b, at + 1) {
+      Some(e) -> Ok(sql_filled(b, at, e, SqlPlaceholder)),
+      None -> sql_dollar_quoted(b, at),
+    }
+  } else if sql_is_digit(c) { Ok(sql_filled(b, at, sql_past_number(b, at), SqlNumber)) } else if sql_is_name_byte(
+      c,
+    ) {
+    Ok(
+      sql_filled(
+        b,
+        at,
+        sql_past_word(b, at),
+        SqlWord({ text: sql_lower_bytes(b, at, sql_past_word(b, at)), quoted: false }),
+      ),
+    )
+  } else { Ok(sql_filled(b, at, at + 1, SqlPunct(string_of_bytes(bytes_slice(b, at, at + 1))))) }
+}
+
+fn sql_filled(b: Bytes, at: Int, next: Int, tok: SqlTok) -> { tok: SqlTokAt, next: Int } =
+  { tok: { tok: tok, at: at, text: string_of_bytes(bytes_slice(b, at, next)) }, next: next }
+
+fn sql_unclosed(b: Bytes, at: Int, what: String) -> DbError =
+  db_error(
+    "0A000",
+    "",
+    what ++ " opened at byte " ++ int_to_string(at)
+      ++ " is never closed, and past one the reader cannot tell text from statement",
+  )
+
+fn sql_lower_bytes(b: Bytes, at: Int, end: Int) -> String =
   string_of_bytes(
     fold(range(at, end), b"", |acc: Bytes, i: Int| {
       let c = bytes_at(b, i);
       bytes_concat(acc, byte_of_int(if c >= 65 && c <= 90 { c + 32 } else { c }))
     }),
   )
+
+// The end of a string sql_literal, from just after its opening quote.
+fn sql_end_of_literal(b: Bytes, at: Int, open: Int, escapes: Bool) -> Result<Int, DbError> =
+  if at >= bytes_len(b) { Err(sql_unclosed(b, open, "a string sql_literal")) }
+  else if escapes && bytes_at(b, at) == 92 { sql_end_of_literal(b, at + 2, open, escapes) } else if bytes_at(
+        b,
+        at,
+      )
+      == 39
+      && sql_byte_is(b, at + 1, 39) { sql_end_of_literal(b, at + 2, open, escapes) }
+  else if bytes_at(b, at) == 39 { Ok(at + 1) }
+  else { sql_end_of_literal(b, at + 1, open, escapes) }
+
+fn sql_literal(
+  b: Bytes,
+  start: Int,
+  body: Int,
+  quote: Int,
+  escapes: Bool,
+) -> Result<{ tok: SqlTokAt, next: Int }, DbError> =
+  match sql_end_of_literal(b, body, quote, escapes) {
+    Err(e) -> Err(e),
+    Ok(e) -> Ok(sql_filled(b, start, e, SqlText)),
+  }
+
+fn sql_end_of_quoted(b: Bytes, at: Int, open: Int) -> Result<Int, DbError> =
+  if at >= bytes_len(b) { Err(sql_unclosed(b, open, "a quoted identifier")) }
+  else if bytes_at(b, at) == 34 && sql_byte_is(b, at + 1, 34) { sql_end_of_quoted(b, at + 2, open) }
+  else if bytes_at(b, at) == 34 { Ok(at + 1) }
+  else { sql_end_of_quoted(b, at + 1, open) }
+
+fn sql_quoted_word(
+  b: Bytes,
+  start: Int,
+  body: Int,
+  quote: Int,
+) -> Result<{ tok: SqlTokAt, next: Int }, DbError> =
+  match sql_end_of_quoted(b, body, quote) {
+    Err(e) -> Err(e),
+    Ok(e) ->
+      Ok(
+        sql_filled(b, start, e, SqlWord({ text: sql_unquoted(b, body, e - 1, b""), quoted: true })),
+      ),
+  }
+
+// The name inside `"…"`, with a doubled quote standing for one.
+fn sql_unquoted(b: Bytes, at: Int, end: Int, acc: Bytes) -> String =
+  if at >= end { string_of_bytes(acc) } else if bytes_at(b, at) == 34
+      && sql_byte_is(b, at + 1, 34) {
+    sql_unquoted(b, at + 2, end, bytes_concat(acc, byte_of_int(34)))
+  } else { sql_unquoted(b, at + 1, end, bytes_concat(acc, byte_of_int(bytes_at(b, at)))) }
+
+// `$1` … `$9`: where the digits end, or `None` when this is a dollar quote instead.
+fn sql_digit_end(b: Bytes, at: Int) -> Option<Int> =
+  if at >= bytes_len(b) || !sql_is_digit(bytes_at(b, at)) { None }
+  else { Some(sql_past_number(b, at)) }
+
+// `$tag$ … $tag$`, where the tag may be empty.
+fn sql_dollar_quoted(b: Bytes, at: Int) -> Result<{ tok: SqlTokAt, next: Int }, DbError> = {
+  let tag_end = sql_past_tag(b, at + 1);
+  if !sql_byte_is(b, tag_end, 36) { Err(sql_unclosed(b, at, "a dollar-quoted string")) } else {
+    let tag = bytes_slice(b, at, tag_end + 1);
+    match sql_find_tag(b, tag, tag_end + 1) {
+      None -> Err(sql_unclosed(b, at, "a dollar-quoted string")),
+      Some(e) -> Ok(sql_filled(b, at, e + bytes_len(tag), SqlText)),
+    }
+  }
+}
+
+fn sql_past_tag(b: Bytes, at: Int) -> Int =
+  if at < bytes_len(b) && (sql_is_name_byte(bytes_at(b, at)) || sql_is_digit(bytes_at(b, at))) {
+    sql_past_tag(b, at + 1)
+  } else { at }
+
+fn sql_find_tag(b: Bytes, tag: Bytes, at: Int) -> Option<Int> =
+  if at + bytes_len(tag) > bytes_len(b) { None }
+  else if sql_tag_at(b, tag, at) { Some(at) }
+  else { sql_find_tag(b, tag, at + 1) }
+
+fn sql_tag_at(b: Bytes, tag: Bytes, at: Int) -> Bool =
+  fold(range(0, bytes_len(tag)), true, |acc: Bool, i: Int|
+    acc && bytes_at(b, at + i) == bytes_at(tag, i))
+
+// A number runs to the next byte that is not part of one, as postgres' own lexer reads it.
+fn sql_past_number(b: Bytes, at: Int) -> Int =
+  if at < bytes_len(b) && (is_word_byte(bytes_at(b, at)) || bytes_at(b, at) == 46) {
+    sql_past_number(b, at + 1)
+  } else { at }
+
+fn sql_past_word(b: Bytes, at: Int) -> Int =
+  if at < bytes_len(b)
+      && (sql_is_name_byte(bytes_at(b, at)) || sql_is_digit(bytes_at(b, at))
+      || bytes_at(b, at) == 36) { sql_past_word(b, at + 1) }
+  else { at }
+
+fn sql_is_digit(c: Int) -> Bool = c >= 48 && c <= 57
+
+fn sql_is_name_byte(c: Int) -> Bool =
+  (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || c >= 128
+
+// What each token of `sql` is, which is what a test of the reader compares and what a refusal
+// quotes back.
+pub fn sql_token_summary(t: SqlTokAt) -> String =
+  match t.tok {
+    SqlWord(w) -> if w.quoted { "quoted:" ++ w.text } else { "word:" ++ w.text },
+    SqlNumber -> "number:" ++ t.text,
+    SqlText -> "text:" ++ t.text,
+    SqlPlaceholder -> "placeholder:" ++ t.text,
+    SqlPunct(p) -> "punct:" ++ p,
+    SqlSemi -> "semi",
+  }
+
+pub fn sql_tokenize_summary(sql: String) -> Result<List<String>, DbError> =
+  match tokenize(sql) {
+    Err(e) -> Err(e),
+    Ok(ts) -> Ok(map(ts, |t: SqlTokAt| sql_token_summary(t))),
+  }
+
+// --- The parser --------------------------------------------------------------------
+
+// What a statement does and which tables its text reaches. `written` and `read` are what the row of
+// the definition that reached the call site is checked against, so a construct the reader cannot
+// account for is refused rather than run with a footprint that under-reports.
+pub type SqlScan = { kind: ScanKind, tables: SqlTables }
+
+// A statement that writes anywhere — including inside a `with` — is a write wherever it leads.
+pub fn scan_writes(s: SqlScan) -> Bool = kind_writes(s.kind) || len(s.tables.written) > 0
+
+// The reader's position: the tokens left, the common table expressions in scope, and how deep the
+// statement has nested.
+type SqlAt = { toks: List<SqlTokAt>, ctes: List<String>, depth: Int, end_pos: Int }
+
+fn sql_nesting() -> Int = 32
+
+fn sql_refuse(where_: String, at: Int, why: String) -> DbError =
+  db_error(
+    "0A000",
+    "",
+    "the database driver refuses this statement: " ++ where_ ++ " at byte " ++ int_to_string(at)
+      ++ ". "
+      ++ why,
+  )
+
+fn sql_refuse_tok(t: SqlTokAt, why: String) -> DbError = sql_refuse("`" ++ t.text ++ "`", t.at, why)
+
+fn sql_here(p: SqlAt, why: String) -> DbError =
+  match sql_head(p.toks) {
+    Some(t) -> sql_refuse_tok(t, why),
+    None -> sql_refuse("the statement ends", p.end_pos, why),
+  }
+
+fn sql_stacked(at: Int) -> DbError =
+  db_error(
+    "0A000",
+    "",
+    "the database driver refuses this statement: `Stmt` holds more than one statement, and a `;` is at byte "
+      ++ int_to_string(at)
+      ++ ". One `Stmt` is one statement, which is what removes the stacked-statement payload an injected fragment would otherwise become",
+  )
+
+fn sql_head(toks: List<SqlTokAt>) -> Option<SqlTokAt> =
+  match toks { [] -> None, [h, ..rest] -> Some(h) }
+
+fn sql_rest(toks: List<SqlTokAt>) -> List<SqlTokAt> = match toks { [] -> [], [h, ..rest] -> rest }
+
+fn sql_nth(toks: List<SqlTokAt>, n: Int) -> Option<SqlTokAt> =
+  if n <= 0 { sql_head(toks) }
+  else { match toks { [] -> None, [h, ..rest] -> sql_nth(rest, n - 1) } }
+
+fn sql_step(p: SqlAt) -> SqlAt = { ..p, toks: sql_rest(p.toks) }
+
+fn sql_at_word(p: SqlAt, word: String) -> Bool =
+  match sql_head(p.toks) { Some(t) -> sql_is_word(t.tok, word), None -> false }
+
+fn sql_at_punct(p: SqlAt, k: String) -> Bool =
+  match sql_head(p.toks) { Some(t) -> sql_is_punct(t.tok, k), None -> false }
+
+fn sql_eat_word(p: SqlAt, word: String) -> { p: SqlAt, ate: Bool } =
+  if sql_at_word(p, word) { { p: sql_step(p), ate: true } } else { { p: p, ate: false } }
+
+fn sql_eat_punct(p: SqlAt, k: String) -> { p: SqlAt, ate: Bool } =
+  if sql_at_punct(p, k) { { p: sql_step(p), ate: true } } else { { p: p, ate: false } }
+
+fn sql_expect_word(p: SqlAt, word: String) -> Result<SqlAt, DbError> =
+  if sql_at_word(p, word) { Ok(sql_step(p)) }
+  else { Err(sql_here(p, "`" ++ word ++ "` was expected here")) }
+
+fn sql_expect_punct(p: SqlAt, k: String) -> Result<SqlAt, DbError> =
+  if sql_at_punct(p, k) { Ok(sql_step(p)) }
+  else { Err(sql_here(p, "`" ++ k ++ "` was expected here")) }
+
+fn sql_identifier(p: SqlAt, what: String) -> Result<{ p: SqlAt, name: String }, DbError> =
+  match sql_head(p.toks) {
+    Some(t) -> match t.tok {
+      SqlWord(w) -> Ok({ p: sql_step(p), name: w.text }),
+      _ -> Err(sql_refuse_tok(t, what ++ " was expected here")),
+    },
+    None -> Err(sql_here(p, what ++ " was expected here")),
+  }
+
+// `[schema.]name`, answering the last segment.
+fn sql_qualified_name(p: SqlAt, rest: Int) -> Result<{ p: SqlAt, name: String }, DbError> = {
+  let first = sql_identifier(p, "a table name")?;
+  sql_more_names(first.p, first.name)
+}
+
+fn sql_more_names(p: SqlAt, name: String) -> Result<{ p: SqlAt, name: String }, DbError> =
+  if !sql_at_punct(p, ".") { Ok({ p: p, name: name }) } else {
+    match sql_nth(p.toks, 1) {
+      Some(next) -> match next.tok {
+        SqlWord(w) -> {
+          let after = sql_step(sql_step(p));
+          sql_more_names(after, w.text)
+        },
+        _ -> Ok({ p: p, name: name }),
+      },
+      None -> Ok({ p: p, name: name }),
+    }
+  }
+
+// `[AS] alias [(columns)]`, if there is one. A word that is reserved cannot be an alias without
+// `AS`, so a statement is not read as though a clause word were a name.
+fn sql_alias(p: SqlAt) -> Result<SqlAt, DbError> = {
+  let as_ = sql_eat_word(p, "as");
+  if as_.ate {
+    let named = sql_identifier(as_.p, "an alias")?;
+    sql_alias_columns(named.p)
+  } else {
+    match sql_head(p.toks) {
+      Some(t) -> match t.tok {
+        SqlWord(w) -> if w.quoted || !sql_reserved(w.text) { sql_alias_columns(sql_step(p)) }
+        else { Ok(p) },
+        _ -> Ok(p),
+      },
+      None -> Ok(p),
+    }
+  }
+}
+
+fn sql_alias_columns(p: SqlAt) -> Result<SqlAt, DbError> = {
+  let open = sql_eat_punct(p, "(");
+  if open.ate { sql_name_list(open.p) } else { Ok(p) }
+}
+
+// A column list, which consumes its own `)`.
+fn sql_name_list(p: SqlAt) -> Result<SqlAt, DbError> = {
+  let first = sql_identifier(p, "a column name")?;
+  let comma = sql_eat_punct(first.p, ",");
+  if comma.ate { sql_name_list(comma.p) } else { sql_expect_punct(first.p, ")") }
+}
+
+// --- What the reader vouches for ----------------------------------------------------
+
+// Words that may precede a `(` without being a call.
+fn sql_syntactic() -> List<String> = ["array", "cast", "exists", "row", "any", "some", "nullif"]
+
+// Functions whose value is not a function of the program's state. Refused inside statement text:
+// a timestamp belongs in the row as a parameter, where the effect system can see it.
+fn sql_nondeterministic() -> List<String> =
+  [
+    "now",
+    "random",
+    "current_timestamp",
+    "current_date",
+    "current_time",
+    "localtime",
+    "localtimestamp",
+    "clock_timestamp",
+    "statement_timestamp",
+    "transaction_timestamp",
+    "timeofday",
+    "gen_random_uuid",
+  ]
+
+// The calls a statement may make. A call is the one place an admitted statement can reach outside
+// its own table set, so the list is closed.
+fn sql_callable() -> List<String> =
+  [
+    "avg",
+    "count",
+    "max",
+    "min",
+    "sum",
+    "coalesce",
+    "greatest",
+    "least",
+    "nullif",
+    "abs",
+    "ceil",
+    "ceiling",
+    "div",
+    "exp",
+    "floor",
+    "ln",
+    "log",
+    "mod",
+    "power",
+    "round",
+    "sign",
+    "sqrt",
+    "trunc",
+    "btrim",
+    "char_length",
+    "character_length",
+    "concat",
+    "concat_ws",
+    "decode",
+    "encode",
+    "left",
+    "length",
+    "lower",
+    "lpad",
+    "ltrim",
+    "md5",
+    "octet_length",
+    "overlay",
+    "position",
+    "repeat",
+    "replace",
+    "reverse",
+    "right",
+    "rpad",
+    "rtrim",
+    "split_part",
+    "starts_with",
+    "strpos",
+    "substr",
+    "substring",
+    "translate",
+    "trim",
+    "upper",
+    "json_build_array",
+    "json_build_object",
+    "jsonb_array_length",
+    "jsonb_build_array",
+    "jsonb_build_object",
+    "jsonb_extract_path",
+    "jsonb_extract_path_text",
+    "jsonb_strip_nulls",
+    "jsonb_typeof",
+    "to_json",
+    "to_jsonb",
+  ]
+
+// Words that end an expression at depth zero.
+fn sql_clause_words() -> List<String> =
+  [
+    "from",
+    "where",
+    "group",
+    "having",
+    "window",
+    "order",
+    "limit",
+    "offset",
+    "fetch",
+    "for",
+    "union",
+    "intersect",
+    "except",
+    "returning",
+    "using",
+    "on",
+    "set",
+    "values",
+    "join",
+    "inner",
+    "left",
+    "right",
+    "full",
+    "cross",
+    "natural",
+    "as",
+  ]
+
+fn sql_reserved(word: String) -> Bool =
+  sql_has_table(sql_clause_words(), word)
+    || sql_has_table(
+      [
+        "select",
+        "insert",
+        "update",
+        "delete",
+        "with",
+        "into",
+        "and",
+        "or",
+        "not",
+        "null",
+        "is",
+        "in",
+        "between",
+        "like",
+        "ilike",
+        "similar",
+        "when",
+        "then",
+        "else",
+        "end",
+        "case",
+        "asc",
+        "desc",
+        "nulls",
+        "first",
+        "last",
+        "all",
+        "distinct",
+        "only",
+        "lateral",
+        "default",
+        "conflict",
+        "do",
+        "nothing",
+        "recursive",
+        "materialized",
+        "by",
+        "outer",
+      ],
+      word,
+    )
+
+// A word followed by `(` is a call unless it is reserved, a syntactic form, or one of the names
+// above. Everything else is refused where it is written.
+fn sql_check_call(p: SqlAt) -> Result<SqlAt, DbError> =
+  match sql_head(p.toks) {
+    None -> Ok(p),
+    Some(t) -> match t.tok {
+      SqlWord(w) -> if w.quoted || !sql_at_punct(sql_step(p), "(") { Ok(p) } else if sql_reserved(
+            w.text,
+          )
+          || sql_has_table(sql_syntactic(), w.text)
+          || sql_has_table(sql_callable(), w.text) { Ok(p) } else {
+        Err(
+          sql_refuse_tok(
+            t,
+            "this call is not one the reader will vouch for: a call is the one place an admitted statement reaches outside its own table set, and it can only report the relations it was selected from",
+          ),
+        )
+      },
+      _ -> Ok(p),
+    },
+  }
+
+fn sql_reject_nondeterministic(p: SqlAt) -> Result<SqlAt, DbError> = sql_reject_in(p.toks, p)
+
+fn sql_reject_in(toks: List<SqlTokAt>, p: SqlAt) -> Result<SqlAt, DbError> =
+  match toks {
+    [] -> Ok(p),
+    [t, ..rest] -> match t.tok {
+      SqlWord(w) -> if !w.quoted && sql_has_table(sql_nondeterministic(), w.text) {
+        Err(
+          sql_refuse_tok(
+            t,
+            "`" ++ w.text
+              ++ "` is not a function of the program's state, so it cannot be hidden in statement text: pass the value as a parameter, where the row the effect system sees says where it came from",
+          ),
+        )
+      } else { sql_reject_in(rest, p) },
+      _ -> sql_reject_in(rest, p),
+    },
+  }
+
+// --- The statement ------------------------------------------------------------------
+
+fn sql_statement(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> = {
+  let deeper = { ..p, depth: p.depth + 1 };
+  if deeper.depth > sql_nesting() {
+    Err(sql_here(p, "this statement nests deeper than the reader will follow"))
+  } else {
+    match sql_reject_nondeterministic(deeper) {
+      Err(e) -> Err(e),
+      Ok(checked) -> sql_with_clause(checked),
+    }
+  }
+}
+
+// `with` is the one admitted construct that can hide a verb: a CTE's body is a whole statement, so
+// a `delete` inside one makes a statement led by `select` a write.
+fn sql_with_clause(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> = {
+  let opening = sql_eat_word(p, "with");
+  if !opening.ate { sql_body(p) } else {
+    let recursive = sql_eat_word(opening.p, "recursive");
+    sql_cte_list(recursive.p, recursive.ate, no_sql_tables())
+  }
+}
+
+fn sql_cte_list(
+  p: SqlAt,
+  recursive: Bool,
+  gathered: SqlTables,
+) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> =
+  match sql_cte(p, recursive) {
+    Err(e) -> Err(e),
+    Ok(one) -> {
+      let absorbed = sql_absorb_tables(gathered, one.tables);
+      let comma = sql_eat_punct(one.p, ",");
+      if comma.ate { sql_cte_list(comma.p, recursive, absorbed) } else {
+        match sql_body(comma.p) {
+          Err(e) -> Err(e),
+          Ok(b) ->
+            Ok({
+              p: b.p,
+              scan: { kind: b.scan.kind, tables: sql_absorb_tables(absorbed, b.scan.tables) },
+            }),
+        }
+      }
+    },
+  }
+
+fn sql_cte(p: SqlAt, recursive: Bool) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+  let named = sql_identifier(p, "a common table expression's name")?;
+  // A `recursive` CTE names itself in its body, so its name is in scope before the body is read.
+  let scope = if recursive { push(named.p.ctes, named.name) } else { named.p.ctes };
+  let in_scope = { ..named.p, ctes: scope };
+  let columns = sql_eat_punct(in_scope, "(");
+  match sql_after_columns(columns) {
+    Err(e) -> Err(e),
+    Ok(listed) -> match sql_expect_word(listed, "as") {
+      Err(e) -> Err(e),
+      Ok(after_as) -> {
+        let not_ = sql_eat_word(after_as, "not");
+        let materialized = sql_eat_word(not_.p, "materialized");
+        match sql_expect_punct(materialized.p, "(") {
+          Err(e) -> Err(e),
+          Ok(inside) -> match sql_statement(inside) {
+            Err(e) -> Err(e),
+            Ok(inner) -> match sql_expect_punct(inner.p, ")") {
+              Err(e) -> Err(e),
+              Ok(after) ->
+                Ok({
+                  p: { ..after, ctes: push(after.ctes, named.name) },
+                  tables: sql_without_names(inner.scan.tables, after.ctes),
+                }),
+            },
+          },
+        }
+      },
+    },
+  }
+}
+
+// The column list after a table name, if there is one.
+fn sql_after_columns(columns: { p: SqlAt, ate: Bool }) -> Result<SqlAt, DbError> =
+  if columns.ate { sql_name_list(columns.p) } else { Ok(columns.p) }
+
+// A nested statement, which inherits the enclosing `WITH`'s names: a reference to a CTE names that
+// expression rather than a table.
+fn sql_without_names(tables: SqlTables, names: List<String>) -> SqlTables =
+  {
+    written: fold(names, tables.written, |acc: List<String>, n: String| sql_without_table(acc, n)),
+    read: fold(names, tables.read, |acc: List<String>, n: String| sql_without_table(acc, n)),
+  }
+
+fn sql_body(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> =
+  match sql_head(p.toks) {
+    None -> Err(sql_here(p, "this statement is empty")),
+    Some(t) -> if sql_is_semi(t.tok) { Err(sql_stacked(t.at)) } else if sql_is_word(t.tok, "select")
+        || sql_is_punct(t.tok, "(") {
+      match sql_select_stmt(p) {
+        Err(e) -> Err(e),
+        Ok(s) -> Ok({ p: s.p, scan: { kind: KSelect, tables: s.tables } }),
+      }
+    } else if sql_is_word(t.tok, "values") {
+      match sql_select_stmt(p) {
+        Err(e) -> Err(e),
+        Ok(s) -> Ok({ p: s.p, scan: { kind: KValues, tables: s.tables } }),
+      }
+    } else if sql_is_word(t.tok, "insert") { sql_insert(p) }
+    else if sql_is_word(t.tok, "update") { sql_update(p) }
+    else if sql_is_word(t.tok, "delete") { sql_delete(p) } else {
+      Err(
+        sql_refuse_tok(
+          t,
+          "a statement begins with one of `select`, `insert`, `update`, `delete` or `values`, with an optional `with`",
+        ),
+      )
+    },
+  }
+
+fn sql_select_stmt(p: SqlAt) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+  match sql_select_core(p) {
+    Err(e) -> Err(e),
+    Ok(core) -> {
+      match sql_select_arms(core.p, core.tables) {
+        Err(e) -> Err(e),
+        Ok(armed) -> sql_select_tail(armed.p, armed.tables),
+      }
+    },
+  }
+
+fn sql_select_arms(
+  p: SqlAt,
+  tables: SqlTables,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+  if sql_at_word(p, "union") || sql_at_word(p, "intersect") || sql_at_word(p, "except") {
+    let opened = sql_step(p);
+    let quantified = sql_eat_word(sql_eat_word(opened, "all").p, "distinct");
+    match sql_select_core(quantified.p) {
+      Err(e) -> Err(e),
+      Ok(inner) -> sql_select_arms(inner.p, sql_absorb_tables(tables, inner.tables)),
+    }
+  } else { Ok({ p: p, tables: tables }) }
+
+fn sql_select_tail(
+  p: SqlAt,
+  tables: SqlTables,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+  let ordered = sql_eat_word(p, "order");
+  let after_order = if ordered.ate {
+    match sql_expect_word(ordered.p, "by") {
+      Err(e) -> Err(e),
+      Ok(after) -> sql_skip_expr(after, tables, ["limit", "offset", "fetch", "for"], false),
+    }
+  } else { Ok({ p: p, tables: tables }) };
+  match after_order { Err(e) -> Err(e), Ok(o) -> sql_select_tails(o.p, o.tables) }
+}
+
+fn sql_select_tails(
+  p: SqlAt,
+  tables: SqlTables,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+  if sql_at_word(p, "limit") || sql_at_word(p, "offset") {
+    let opened = sql_step(p);
+    match sql_skip_expr(opened, tables, ["limit", "offset", "fetch", "for"], false) {
+      Err(e) -> Err(e),
+      Ok(o) -> sql_select_tails(o.p, o.tables),
+    }
+  } else if sql_at_word(p, "fetch") || sql_at_word(p, "for") {
+    match sql_head(p.toks) {
+      Some(t) ->
+        Err(
+          sql_refuse_tok(
+            t,
+            "`fetch` and the row-locking clauses are outside the statements this reader admits: a row lock is a write it cannot express",
+          ),
+        ),
+      None -> Err(sql_here(p, "the statement ends mid-clause")),
+    }
+  } else { Ok({ p: p, tables: tables }) }
+
+fn sql_select_core(p: SqlAt) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+  let open = sql_eat_punct(p, "(");
+  if open.ate {
+    match sql_select_stmt(open.p) {
+      Err(e) -> Err(e),
+      Ok(inner) -> match sql_expect_punct(inner.p, ")") {
+        Err(e) -> Err(e),
+        Ok(after) -> Ok({ p: after, tables: inner.tables }),
+      },
+    }
+  } else if sql_at_word(p, "values") { sql_values_rows(sql_step(p), no_sql_tables()) } else {
+    let opened = sql_expect_word(p, "select");
+    match opened {
+      Err(e) -> Err(e),
+      Ok(after_select) -> {
+        let alls = sql_eat_word(after_select, "all");
+        let distinct = sql_eat_word(alls.p, "distinct");
+        let on_prefix = if distinct.ate { sql_eat_word(distinct.p, "on") }
+        else { { p: distinct.p, ate: false } };
+        let after_prefix = if on_prefix.ate {
+          match sql_expect_punct(on_prefix.p, "(") {
+            Err(e) -> Err(e),
+            Ok(open) -> sql_skip_parens(open, no_sql_tables()),
+          }
+        } else { Ok({ p: distinct.p, tables: no_sql_tables() }) };
+        match after_prefix {
+          Err(e) -> Err(e),
+          Ok(prefixed) -> match sql_target_list(prefixed.p, prefixed.tables) {
+            Err(e) -> Err(e),
+            Ok(targets) -> sql_select_rest(targets),
+          },
+        }
+      },
+    }
+  }
+}
+
+fn sql_select_rest(
+  at: { p: SqlAt, tables: SqlTables },
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+  let from = sql_source_after_from(at)?;
+  let filtered = sql_select_filter(from)?;
+  let grouped = sql_select_grouped(filtered)?;
+  sql_select_having(grouped)
+}
+
+fn sql_source_after_from(
+  at: { p: SqlAt, tables: SqlTables },
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+  let from = sql_eat_word(at.p, "from");
+  if from.ate { sql_source_list(from.p, at.tables) } else { Ok(at) }
+}
+
+fn sql_select_filter(
+  at: { p: SqlAt, tables: SqlTables },
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+  let where_ = sql_eat_word(at.p, "where");
+  if where_.ate { sql_skip_expr(where_.p, at.tables, sql_clause_words(), false) } else { Ok(at) }
+}
+
+fn sql_select_grouped(
+  at: { p: SqlAt, tables: SqlTables },
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+  let group = sql_eat_word(at.p, "group");
+  if group.ate {
+    match sql_expect_word(group.p, "by") {
+      Err(e) -> Err(e),
+      Ok(after) -> sql_skip_expr(after, at.tables, sql_clause_words(), false),
+    }
+  } else { Ok(at) }
+}
+
+fn sql_select_having(
+  at: { p: SqlAt, tables: SqlTables },
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+  let having = sql_eat_word(at.p, "having");
+  let after = if having.ate { sql_skip_expr(having.p, at.tables, sql_clause_words(), false) }
+  else { Ok(at) };
+  match after {
+    Err(e) -> Err(e),
+    Ok(h) -> if sql_at_word(h.p, "window") {
+      match sql_head(h.p.toks) {
+        Some(t) -> Err(sql_refuse_tok(t, "window definitions are not modelled")),
+        None -> Err(sql_here(h.p, "the statement ends mid-clause")),
+      }
+    } else { Ok(h) },
+  }
+}
+
+fn sql_source_list(
+  p: SqlAt,
+  tables: SqlTables,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+  match sql_source_item(p, tables) {
+    Err(e) -> Err(e),
+    Ok(one) -> {
+      let comma = sql_eat_punct(one.p, ",");
+      if comma.ate { sql_source_list(comma.p, one.tables) } else { Ok(one) }
+    },
+  }
+
+fn sql_source_item(
+  p: SqlAt,
+  tables: SqlTables,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+  match sql_source_base(p, tables) { Err(e) -> Err(e), Ok(base) -> sql_joins(base.p, base.tables) }
+
+fn sql_joins(p: SqlAt, tables: SqlTables) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+  let natural = sql_eat_word(p, "natural");
+  let joined = sql_at_word(natural.p, "join") || sql_at_word(natural.p, "inner")
+    || sql_at_word(natural.p, "left")
+    || sql_at_word(natural.p, "right")
+    || sql_at_word(natural.p, "full")
+    || sql_at_word(natural.p, "cross");
+  if !joined {
+    if natural.ate { Err(sql_here(natural.p, "`natural` must be followed by a join")) }
+    else { Ok({ p: p, tables: tables }) }
+  } else {
+    let inner = sql_eat_word(natural.p, "inner");
+    let side = sql_eat_word(inner.p, "left");
+    let side2 = sql_eat_word(side.p, "right");
+    let side3 = sql_eat_word(side2.p, "full");
+    let after_side = if side.ate || side2.ate || side3.ate { sql_eat_word(side3.p, "outer").p }
+    else { side3.p };
+    let cross = sql_eat_word(after_side, "cross");
+    let join = sql_expect_word(cross.p, "join");
+    match join {
+      Err(e) -> Err(e),
+      Ok(after_join) -> match sql_source_base(after_join, tables) {
+        Err(e) -> Err(e),
+        Ok(base) -> {
+          let on = sql_eat_word(base.p, "on");
+          let after_on = if on.ate { sql_skip_expr(on.p, base.tables, sql_clause_words(), true) } else {
+            let using = sql_eat_word(base.p, "using");
+            if using.ate {
+              match sql_expect_punct(using.p, "(") {
+                Err(e) -> Err(e),
+                Ok(open) -> match sql_name_list(open) {
+                  Err(e) -> Err(e),
+                  Ok(after) -> Ok({ p: after, tables: base.tables }),
+                },
+              }
+            } else { Ok({ p: base.p, tables: base.tables }) }
+          };
+          match after_on { Err(e) -> Err(e), Ok(tail) -> sql_joins(tail.p, tail.tables) }
+        },
+      },
+    }
+  }
+}
+
+fn sql_source_base(
+  p: SqlAt,
+  tables: SqlTables,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+  let lateral = sql_eat_word(p, "lateral");
+  let open_at = match sql_head(lateral.p.toks) { Some(t) -> t.at, None -> lateral.p.end_pos };
+  let open = sql_eat_punct(lateral.p, "(");
+  if open.ate {
+    if sql_at_word(open.p, "select") || sql_at_word(open.p, "values")
+        || sql_at_word(open.p, "with") {
+      match sql_statement(open.p) {
+        Err(e) -> Err(e),
+        Ok(inner) -> match sql_expect_punct(inner.p, ")") {
+          Err(e) -> Err(e),
+          Ok(after) -> {
+            let aliased = sql_alias(after);
+            match aliased {
+              Err(e) -> Err(e),
+              Ok(done) -> Ok({ p: done, tables: sql_absorb_tables(tables, inner.scan.tables) }),
+            }
+          },
+        },
+      }
+    } else {
+      Err(sql_refuse("`(`", open_at, "a parenthesised from-item is not a shape the reader models"))
+    }
+  } else {
+    let only = sql_eat_word(lateral.p, "only");
+    match sql_qualified_name(only.p, 0) {
+      Err(e) -> Err(e),
+      Ok(named) -> if sql_at_punct(named.p, "(") {
+        match sql_head(named.p.toks) {
+          Some(t) ->
+            Err(
+              sql_refuse_tok(
+                t,
+                "a set-returning function in `from` reads tables no reader can name",
+              ),
+            ),
+          None -> Err(sql_here(named.p, "the statement ends mid-clause")),
+        }
+      } else {
+        let starred = sql_eat_punct(named.p, "*");
+        let noted = if sql_has_table(named.p.ctes, named.name) { tables }
+        else { sql_note_read(tables, named.name) };
+        match sql_alias(starred.p) {
+          Err(e) -> Err(e),
+          Ok(after) -> Ok({ p: after, tables: noted }),
+        }
+      },
+    }
+  }
+}
+
+fn sql_target_list(
+  p: SqlAt,
+  tables: SqlTables,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+  match sql_skip_expr(p, tables, sql_clause_words(), true) {
+    Err(e) -> Err(e),
+    Ok(item) -> {
+      let as_ = sql_eat_word(item.p, "as");
+      let named = if as_.ate {
+        match sql_identifier(as_.p, "an output column name") { Err(e) -> Err(e), Ok(n) -> Ok(n.p) }
+      } else { Ok(item.p) };
+      match named {
+        Err(e) -> Err(e),
+        Ok(after) -> {
+          let comma = sql_eat_punct(after, ",");
+          if comma.ate { sql_target_list(comma.p, item.tables) }
+          else { Ok({ p: after, tables: item.tables }) }
+        },
+      }
+    },
+  }
+
+// --- The four verbs -----------------------------------------------------------------
+
+fn sql_insert(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> = {
+  let after_insert = sql_expect_word(p, "insert")?;
+  let into = sql_expect_word(after_insert, "into")?;
+  let named = sql_qualified_name(into, 0)?;
+  let written = sql_note_written(no_sql_tables(), named.name);
+  let aliased = sql_alias(named.p)?;
+  let columns = sql_eat_punct(aliased, "(");
+  match sql_after_columns(columns) {
+    Err(e) -> Err(e),
+    Ok(after_columns) -> {
+      let default = sql_eat_word(after_columns, "default");
+      match sql_insert_source(default, after_columns) {
+        Err(e) -> Err(e),
+        Ok(source) -> {
+          let rows = sql_absorb_tables(written, source.tables);
+          if sql_at_word(source.p, "on") {
+            match sql_head(source.p.toks) {
+              Some(t) ->
+                Err(
+                  sql_refuse_tok(
+                    t,
+                    "`on conflict` is not modelled: an upsert is a write whose outcome the engine cannot reproduce",
+                  ),
+                ),
+              None -> Err(sql_here(source.p, "the statement ends mid-clause")),
+            }
+          } else {
+            match sql_returning(source.p, rows) {
+              Err(e) -> Err(e),
+              Ok(done) -> Ok({ p: done.p, scan: { kind: KInsert, tables: done.tables } }),
+            }
+          }
+        },
+      }
+    },
+  }
+}
+
+// `default values`, or a `select` that answers the rows.
+fn sql_insert_source(
+  default: { p: SqlAt, ate: Bool },
+  after_columns: SqlAt,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+  if default.ate {
+    match sql_expect_word(default.p, "values") {
+      Err(e) -> Err(e),
+      Ok(after) -> Ok({ p: after, tables: no_sql_tables() }),
+    }
+  } else { sql_select_stmt(after_columns) }
+
+fn sql_update(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> = {
+  let after_update = sql_expect_word(p, "update")?;
+  let only = sql_eat_word(after_update, "only");
+  let named = sql_qualified_name(only.p, 0)?;
+  let written = sql_note_written(no_sql_tables(), named.name);
+  let aliased = sql_alias(named.p)?;
+  let after_set = sql_expect_word(aliased, "set")?;
+  let assignments = sql_skip_expr(after_set, written, ["from", "where", "returning"], false)?;
+  let from = sql_eat_word(assignments.p, "from");
+  let after_from = if from.ate { sql_source_list(from.p, assignments.tables) }
+  else { Ok(assignments) };
+  let sourced = match after_from { Err(e) -> Err(e), Ok(s) -> Ok(s) };
+  let filtered = match sourced {
+    Err(e) -> Err(e),
+    Ok(s) -> {
+      let where_ = sql_eat_word(s.p, "where");
+      if where_.ate { sql_skip_expr(where_.p, s.tables, ["returning"], false) } else { Ok(s) }
+    },
+  };
+  match filtered {
+    Err(e) -> Err(e),
+    Ok(f) -> match sql_returning(f.p, f.tables) {
+      Err(e) -> Err(e),
+      Ok(done) -> Ok({ p: done.p, scan: { kind: KUpdate, tables: done.tables } }),
+    },
+  }
+}
+
+fn sql_delete(p: SqlAt) -> Result<{ p: SqlAt, scan: SqlScan }, DbError> = {
+  let after_delete = sql_expect_word(p, "delete")?;
+  let from = sql_expect_word(after_delete, "from")?;
+  let only = sql_eat_word(from, "only");
+  let named = sql_qualified_name(only.p, 0)?;
+  let written = sql_note_written(no_sql_tables(), named.name);
+  let aliased = sql_alias(named.p)?;
+  let using = sql_eat_word(aliased, "using");
+  let sourced = if using.ate { sql_source_list(using.p, written) }
+  else { Ok({ p: aliased, tables: written }) };
+  let filtered = match sourced {
+    Err(e) -> Err(e),
+    Ok(s) -> {
+      let where_ = sql_eat_word(s.p, "where");
+      if where_.ate { sql_skip_expr(where_.p, s.tables, ["returning"], false) } else { Ok(s) }
+    },
+  };
+  match filtered {
+    Err(e) -> Err(e),
+    Ok(f) -> match sql_returning(f.p, f.tables) {
+      Err(e) -> Err(e),
+      Ok(done) -> Ok({ p: done.p, scan: { kind: KDelete, tables: done.tables } }),
+    },
+  }
+}
+
+fn sql_returning(p: SqlAt, tables: SqlTables) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+  let returning = sql_eat_word(p, "returning");
+  if returning.ate { sql_skip_expr(returning.p, tables, [], false) }
+  else { Ok({ p: p, tables: tables }) }
+}
+
+// `values (…), (…)`: the rows are expressions, but a subquery inside one is still a statement.
+fn sql_values_rows(
+  p: SqlAt,
+  tables: SqlTables,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+  let open = sql_expect_punct(p, "(");
+  match open {
+    Err(e) -> Err(e),
+    Ok(after) -> match sql_row_body(after, tables, 1) {
+      Err(e) -> Err(e),
+      Ok(row) -> {
+        let comma = sql_eat_punct(row.p, ",");
+        if comma.ate { sql_values_rows(comma.p, row.tables) } else { Ok(row) }
+      },
+    },
+  }
+}
+
+fn sql_row_body(
+  p: SqlAt,
+  tables: SqlTables,
+  depth: Int,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+  match sql_head(p.toks) {
+    None -> Err(sql_here(p, "this row is never closed")),
+    Some(t) -> if sql_is_punct(t.tok, "(") { sql_row_body(sql_step(p), tables, depth + 1) } else if sql_is_punct(
+        t.tok,
+        ")",
+      ) {
+      if depth == 1 { Ok({ p: sql_step(p), tables: tables }) }
+      else { sql_row_body(sql_step(p), tables, depth - 1) }
+    } else if sql_is_semi(t.tok) { Err(sql_stacked(t.at)) } else {
+      match sql_check_call(p) {
+        Err(e) -> Err(e),
+        Ok(_) -> sql_row_body(sql_step(p), tables, depth),
+      }
+    },
+  }
+
+// --- Expressions ----------------------------------------------------------------------
+
+// Walk an expression, following subqueries, up to the next stop word at depth zero. This is where
+// a subquery's tables are absorbed: a `select` inside a `where` reaches tables of its own.
+fn sql_skip_expr(
+  p: SqlAt,
+  tables: SqlTables,
+  stops: List<String>,
+  stop_at_comma: Bool,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+  match sql_head(p.toks) {
+    None -> Ok({ p: p, tables: tables }),
+    Some(t) -> if sql_is_semi(t.tok) { Err(sql_stacked(t.at)) }
+    else if sql_is_punct(t.tok, "(") { sql_skip_paren(p, tables, stops, stop_at_comma) }
+    else if sql_is_punct(t.tok, ")") { Ok({ p: p, tables: tables }) }
+    else if stop_at_comma && sql_is_punct(t.tok, ",") { Ok({ p: p, tables: tables }) }
+    else { sql_skip_word(p, t, tables, stops, stop_at_comma) },
+  }
+
+fn sql_skip_word(
+  p: SqlAt,
+  t: SqlTokAt,
+  tables: SqlTables,
+  stops: List<String>,
+  stop_at_comma: Bool,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+  match t.tok {
+    SqlWord(w) -> if !w.quoted && sql_has_table(stops, w.text) { Ok({ p: p, tables: tables }) } else {
+      match sql_check_call(p) {
+        Err(e) -> Err(e),
+        Ok(_) -> sql_skip_expr(sql_step(p), tables, stops, stop_at_comma),
+      }
+    },
+    _ -> match sql_check_call(p) {
+      Err(e) -> Err(e),
+      Ok(_) -> sql_skip_expr(sql_step(p), tables, stops, stop_at_comma),
+    },
+  }
+
+// A `(` inside an expression opens either a subquery, whose tables count, or a group, whose
+// contents are walked but whose depth the stops do not see into.
+fn sql_skip_paren(
+  p: SqlAt,
+  tables: SqlTables,
+  stops: List<String>,
+  stop_at_comma: Bool,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> = {
+  let opened = sql_step(p);
+  if sql_at_word(opened, "select") || sql_at_word(opened, "values") || sql_at_word(opened, "with") {
+    match sql_statement(opened) {
+      Err(e) -> Err(e),
+      Ok(inner) -> match sql_expect_punct(inner.p, ")") {
+        Err(e) -> Err(e),
+        Ok(after) ->
+          sql_skip_expr(after, sql_absorb_tables(tables, inner.scan.tables), stops, stop_at_comma),
+      },
+    }
+  } else {
+    match sql_skip_group(opened, tables, 1) {
+      Err(e) -> Err(e),
+      Ok(closed) -> sql_skip_expr(closed.p, closed.tables, stops, stop_at_comma),
+    }
+  }
+}
+
+// The body of a group, from just after its `(`, to just past the `)` that closes it.
+fn sql_skip_group(
+  p: SqlAt,
+  tables: SqlTables,
+  depth: Int,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+  match sql_head(p.toks) {
+    None -> Err(sql_here(p, "this group is never closed")),
+    Some(t) -> if sql_is_semi(t.tok) { Err(sql_stacked(t.at)) } else if sql_is_punct(t.tok, "(") {
+      match sql_check_call(p) {
+        Err(e) -> Err(e),
+        Ok(_) -> sql_skip_group(sql_step(p), tables, depth + 1),
+      }
+    } else if sql_is_punct(t.tok, ")") {
+      if depth == 1 { Ok({ p: sql_step(p), tables: tables }) } else {
+        match sql_check_call(p) {
+          Err(e) -> Err(e),
+          Ok(_) -> sql_skip_group(sql_step(p), tables, depth - 1),
+        }
+      }
+    } else if sql_at_word(p, "select") || sql_at_word(p, "values") || sql_at_word(p, "with") {
+      match sql_statement(p) {
+        Err(e) -> Err(e),
+        Ok(inner) -> sql_skip_group(inner.p, sql_absorb_tables(tables, inner.scan.tables), depth),
+      }
+    } else {
+      match sql_check_call(p) {
+        Err(e) -> Err(e),
+        Ok(_) -> sql_skip_group(sql_step(p), tables, depth),
+      }
+    },
+  }
+
+// The body of a parenthesised group whose opening paren is already eaten.
+fn sql_skip_parens(
+  p: SqlAt,
+  tables: SqlTables,
+) -> Result<{ p: SqlAt, tables: SqlTables }, DbError> =
+  match sql_skip_group(p, tables, 1) {
+    Err(e) -> Err(e),
+    Ok(closed) -> Ok({ p: closed.p, tables: closed.tables }),
+  }
+
+// --- The entry point ------------------------------------------------------------------
+
+// What `sql` does and which tables it reaches, or why it is refused. Nothing below the driver's
+// own read of the verb depends on a guess: an unmodelled construct is a table set that would be
+// wrong, and a wrong table set is a scheduler that runs two writers beside each other.
+pub fn scan_statement(sql: String) -> Result<SqlScan, DbError> =
+  match tokenize(sql) {
+    Err(e) -> Err(e),
+    Ok(toks) -> match sql_statement({
+        toks: toks,
+        ctes: [],
+        depth: 0,
+        end_pos: bytes_len(bytes_of_string(sql)),
+      }) {
+      Err(e) -> Err(e),
+      Ok(s) -> match sql_nothing_left(s.p) { Err(e) -> Err(e), Ok(_) -> Ok(s.scan) },
+    },
+  }
+
+// A statement ends where the first one does: a `;` after it is a second statement, and any other
+// token is a construct the reader did not account for.
+fn sql_nothing_left(p: SqlAt) -> Result<(), DbError> =
+  match sql_head(p.toks) {
+    None -> Ok(()),
+    Some(t) -> if sql_is_semi(t.tok) { Err(sql_stacked(t.at)) }
+    else { Err(sql_refuse_tok(t, "the statement ends here")) },
+  }
+
+// Whether a statement writes, which decides the operations that may perform it: a write performed
+// as `db.query` is published to the scheduler as a read.
+pub fn writes(sql: String) -> Result<Bool, DbError> =
+  match scan_statement(sql) { Err(e) -> Err(e), Ok(s) -> Ok(scan_writes(s)) }
 
 type Ran = { session: pg::Session, answer: Answer }
 
@@ -3925,32 +5201,425 @@ pub fn with_server<a | e>(
 
 // --- Tests ------------------------------------------------------------------
 
-test "a statement's verb is what decides whether it reads or writes" {
-  assert_eq(writes("select 1"), Ok(false));
-  assert_eq(writes("  SELECT * from t"), Ok(false));
-  assert_eq(writes("insert into t values (1)"), Ok(true));
-  assert_eq(writes("update t set a = 1"), Ok(true));
-  assert_eq(writes("delete from t"), Ok(true));
-  assert_eq(writes("values (1)"), Ok(false))
+test "a statement's words fold and a quoted identifier keeps its case" {
+  assert_eq(
+    sql_tokenize_summary("SELECT t.Sku FROM parts AS t"),
+    Ok([
+      "word:select",
+      "word:t",
+      "punct:.",
+      "word:sku",
+      "word:from",
+      "word:parts",
+      "word:as",
+      "word:t",
+    ]),
+  );
+  assert_eq(
+    sql_tokenize_summary("select \"MiXeD\" from \"a\"\"b\""),
+    Ok(["word:select", "quoted:MiXeD", "word:from", "quoted:a\"b"]),
+  )
 }
 
-test "a common table expression hides its body, not the statement's verb" {
-  assert_eq(writes("with a as (select 1) select * from a"), Ok(false));
-  assert_eq(writes("with a as (select 1) insert into t select * from a"), Ok(true));
-  // The CTE's own verb is inside parentheses, so it is not the statement's.
-  assert_eq(writes("with a as (delete from t returning 1) select 1"), Ok(false))
+test "a comment is not a token, and a block comment nests" {
+  assert_eq(
+    sql_tokenize_summary("select 1 -- and the rest\nfrom t"),
+    Ok(["word:select", "number:1", "word:from", "word:t"]),
+  );
+  assert_eq(sql_tokenize_summary("select /* a /* b */ c */ 1"), Ok(["word:select", "number:1"]))
 }
 
-test "a comment is not the verb, and an unterminated one is not a statement" {
-  assert_eq(writes("-- a note\nselect 1"), Ok(false));
-  assert_eq(writes("/* a note */ select 1"), Ok(false));
-  assert(match writes("with a as (select 1)") { Err(_) -> true, Ok(_) -> false })
+test "a semicolon is its own token, and one inside a literal is text" {
+  assert_eq(
+    sql_tokenize_summary("select 1; drop table t"),
+    Ok(["word:select", "number:1", "semi", "word:drop", "word:table", "word:t"]),
+  );
+  assert_eq(sql_tokenize_summary("select ';a'"), Ok(["word:select", "text:';a'"]));
+  assert_eq(
+    sql_tokenize_summary("select $tag$a;b$tag$"),
+    Ok(["word:select", "text:$tag$a;b$tag$"]),
+  );
+  assert_eq(sql_tokenize_summary("select 'it''s'"), Ok(["word:select", "text:'it''s'"]))
 }
 
-test "a statement the driver cannot account for is refused rather than sent" {
-  assert(match writes("create table t (a int)") { Err(_) -> true, Ok(_) -> false });
-  assert(match writes("") { Err(_) -> true, Ok(_) -> false });
-  assert(match writes("drop table t") { Err(_) -> true, Ok(_) -> false })
+test "a placeholder is not a dollar quote, and a string may be escaped" {
+  assert_eq(
+    sql_tokenize_summary("select $1, $23"),
+    Ok(["word:select", "placeholder:$1", "punct:,", "placeholder:$23"]),
+  );
+  assert_eq(sql_tokenize_summary("select e'a b'"), Ok(["word:select", "text:e'a b'"]));
+  assert_eq(
+    sql_tokenize_summary("select b'0110', x'ff'"),
+    Ok(["word:select", "text:b'0110'", "punct:,", "text:x'ff'"]),
+  )
+}
+
+test "a number is one token however it is written" {
+  assert_eq(
+    sql_tokenize_summary("select 1, 1.5, 1e3, 0x1f, 12ab"),
+    Ok([
+      "word:select",
+      "number:1",
+      "punct:,",
+      "number:1.5",
+      "punct:,",
+      "number:1e3",
+      "punct:,",
+      "number:0x1f",
+      "punct:,",
+      "number:12ab",
+    ]),
+  )
+}
+
+test "punctuation is one byte each, and a non-ascii name is one word" {
+  assert_eq(
+    sql_tokenize_summary("a.b::int[] @ 1 <> 2"),
+    Ok([
+      "word:a",
+      "punct:.",
+      "word:b",
+      "punct::",
+      "punct::",
+      "word:int",
+      "punct:[",
+      "punct:]",
+      "punct:@",
+      "number:1",
+      "punct:<",
+      "punct:>",
+      "number:2",
+    ]),
+  );
+  assert_eq(sql_tokenize_summary("select ünïcode"), Ok(["word:select", "word:ünïcode"]))
+}
+
+test "a quote that is never closed is refused, not guessed at" {
+  assert(refused(sql_tokenize_summary("select '")));
+  assert(refused(sql_tokenize_summary("select \"x")));
+  assert(refused(sql_tokenize_summary("select /* never")));
+  assert(refused(sql_tokenize_summary("select $tag$ never")));
+  assert(refused(sql_tokenize_summary("select $ ")))
+}
+
+fn refused<a>(r: Result<List<a>, DbError>) -> Bool = match r { Err(_) -> true, Ok(_) -> false }
+
+// --- What the reader accepts and what it refuses ---------------------------------------
+//
+// These are the statements the Rust scanner's own tests name, moved here with it: the same
+// statements, the same tables, and the same refusals. A reader that accepts one of these is a
+// footprint that under-reports, which is the one failure that corrupts scheduling silently.
+
+fn scan_ok(sql: String) -> SqlScan =
+  match scan_statement(sql) { Err(e) -> panic(e.detail), Ok(s) -> s }
+
+fn scan_names(sql: String) -> List<String> = scan_table_names(scan_ok(sql).tables)
+
+fn scan_refused(sql: String) -> Bool = match scan_statement(sql) { Err(_) -> true, Ok(_) -> false }
+
+fn scan_refused_at(sql: String, byte: Int) -> Bool =
+  match scan_statement(sql) {
+    Err(e) -> string_contains(e.detail, "byte " ++ int_to_string(byte)),
+    Ok(_) -> false,
+  }
+
+test "a select names the table it reads" {
+  assert_eq(scan_names("select sku from items"), ["items"]);
+  assert_eq(scan_ok("select sku from items").kind, KSelect);
+  assert_eq(scan_ok("select sku from items").tables.written, [])
+}
+
+test "a join names both tables" {
+  assert_eq(scan_names("select o.id, i.sku from orders o join items i on i.sku = o.sku"), [
+    "items",
+    "orders",
+  ]);
+  assert_eq(scan_names("select * from orders, items where orders.sku = items.sku"), [
+    "items",
+    "orders",
+  ]);
+  assert_eq(
+    scan_names("select * from a left outer join b on a.x = b.x full join c on c.y = a.y"),
+    ["a", "b", "c"],
+  );
+  assert_eq(scan_names("select * from a natural join b"), ["a", "b"]);
+  assert_eq(scan_names("select * from a join b using (x)"), ["a", "b"])
+}
+
+test "a set operation names every arm" {
+  assert_eq(scan_names("select sku from items union all select sku from orders"), [
+    "items",
+    "orders",
+  ]);
+  assert_eq(scan_names("select a from x intersect select a from y except select a from z"), [
+    "x",
+    "y",
+    "z",
+  ]);
+  assert_eq(scan_names("(select a from x) union (select a from y)"), ["x", "y"])
+}
+
+test "a subquery is followed rather than ignored" {
+  assert_eq(scan_names("select sku from items where sku in (select sku from orders)"), [
+    "items",
+    "orders",
+  ]);
+  assert_eq(scan_names("select (select count(*) from orders) from items"), ["items", "orders"]);
+  assert_eq(scan_names("select * from (select sku from orders) o"), ["orders"]);
+  assert_eq(
+    scan_names(
+      "select * from items where exists (select 1 from orders where orders.sku = items.sku)",
+    ),
+    ["items", "orders"],
+  )
+}
+
+test "a common table expression resolves to its own sources" {
+  assert_eq(scan_names("with recent as (select * from orders) select * from recent"), ["orders"]);
+  assert_eq(
+    scan_names(
+      "with a as (select * from x), b as (select * from a join y on true) select * from b",
+    ),
+    ["x", "y"],
+  );
+  assert_eq(
+    scan_names("with recursive t(n) as (select 1 union all select n+1 from t) select n from t"),
+    [],
+  )
+}
+
+test "a data-modifying common table expression reports its write" {
+  let s = scan_ok("with gone as (delete from stale returning id) select id from gone");
+  assert_eq(s.kind, KSelect);
+  assert_eq(s.tables.written, ["stale"]);
+  assert(scan_writes(s))
+}
+
+test "an insert writes its target and reads its source" {
+  let one = scan_ok("insert into items (sku, name) values ($1, $2)");
+  assert_eq(one.kind, KInsert);
+  assert_eq(one.tables.written, ["items"]);
+  assert_eq(one.tables.read, []);
+  let two = scan_ok("insert into archive select * from items where on_hand = 0");
+  assert_eq(two.tables.written, ["archive"]);
+  assert_eq(two.tables.read, ["items"]);
+  assert_eq(scan_names("insert into items default values"), ["items"]);
+  assert_eq(scan_names("insert into items (sku) values ($1) returning sku"), ["items"])
+}
+
+test "an update writes its target and reads its from list" {
+  let s = scan_ok(
+    "update items set on_hand = on_hand - l.qty from lines l where l.sku = items.sku",
+  );
+  assert_eq(s.kind, KUpdate);
+  assert_eq(s.tables.written, ["items"]);
+  assert_eq(s.tables.read, ["lines"])
+}
+
+test "a delete writes its target and reads its using list" {
+  let s = scan_ok(
+    "delete from orders using items where items.sku = orders.sku returning orders.id",
+  );
+  assert_eq(s.kind, KDelete);
+  assert_eq(s.tables.written, ["orders"]);
+  assert_eq(s.tables.read, ["items"])
+}
+
+test "a table read and written by one statement is a write" {
+  let s = scan_ok("update items set n = n + 1 where sku in (select sku from items where n < 3)");
+  assert_eq(s.tables.written, ["items"]);
+  assert_eq(s.tables.read, [])
+}
+
+test "a schema-qualified name is its last segment" {
+  assert_eq(scan_names("select * from public.items"), ["items"]);
+  assert_eq(scan_names("insert into public.items values ($1)"), ["items"])
+}
+
+test "case folding follows postgres rather than the reader" {
+  assert_eq(scan_names("SELECT * FROM Items"), ["items"]);
+  assert_eq(scan_names("select * from \"Items\""), ["Items"]);
+  assert_eq(scan_names("select * from \"has space\""), ["has space"])
+}
+
+test "a second statement is refused and named" {
+  assert(scan_refused_at("select 1 from items; drop table items", 19));
+  assert(scan_refused("insert into items values (1); delete from items"))
+}
+
+test "a semicolon inside a literal is text" {
+  assert_eq(scan_names("select * from items where sku = '; drop table items; --'"), ["items"]);
+  assert_eq(scan_names("select * from items where sku = $tag$; drop table items$tag$"), ["items"]);
+  assert_eq(scan_names("select * from items where sku = $$;$$"), ["items"]);
+  assert_eq(scan_names("select * from items where sku = e'\\'; drop table items; --'"), ["items"]);
+  assert_eq(scan_names("select * from items where name = 'it''s; fine'"), ["items"]);
+  assert_eq(scan_names("select * from \"weird;name\""), ["weird;name"])
+}
+
+test "a comment is not statement text" {
+  assert_eq(scan_names("select 1 from items -- ; drop table items"), ["items"]);
+  assert_eq(scan_names("select 1 /* ; drop table items */ from items"), ["items"]);
+  assert_eq(scan_names("select 1 /* outer /* inner ; */ still comment */ from items"), ["items"]);
+  assert(scan_refused("select 1 /* never closed from items"))
+}
+
+test "an unterminated literal is a refusal rather than a guess" {
+  assert(scan_refused_at("select * from items where sku = 'open", 32));
+  assert(scan_refused_at("select * from \"open", 14));
+  assert(scan_refused_at("select * from items where sku = $tag$open", 32))
+}
+
+test "every statement shape outside the admitted set is refused" {
+  assert(scan_refused("create table t (a int)"));
+  assert(scan_refused("alter table t add column b int"));
+  assert(scan_refused("drop table t"));
+  assert(scan_refused("truncate t"));
+  assert(scan_refused("copy t from stdin"));
+  assert(scan_refused("do $$ begin end $$"));
+  assert(scan_refused("call p()"));
+  assert(scan_refused("lock table t"));
+  assert(scan_refused("listen chan"));
+  assert(scan_refused("notify chan"));
+  assert(scan_refused("set statement_timeout = 0"));
+  assert(scan_refused("show all"));
+  assert(scan_refused("grant select on t to r"));
+  assert(scan_refused("explain select * from t"));
+  assert(scan_refused("begin"));
+  assert(scan_refused("commit"));
+  assert(scan_refused("vacuum"));
+  assert(scan_refused("table items"));
+  assert(scan_refused(""));
+  assert(scan_refused("   "))
+}
+
+test "a construct the reader cannot account for is a named refusal" {
+  // A set-returning function's relations live in a function body.
+  assert(scan_refused("select * from generate_series(1, 10)"));
+  // A row lock is a write the reader has no way to report through a read.
+  assert(scan_refused("select * from items for update"));
+  assert(scan_refused("select * from items limit 1 for share"));
+  // An upsert's outcome is not reproducible by the engine.
+  assert(scan_refused("insert into items values ($1) on conflict do nothing"));
+  assert(scan_refused("select rank() over w from items window w as (order by sku)"));
+  assert(scan_refused("select * from (items join orders on true)"))
+}
+
+test "an alias in the select list is a name and not a clause" {
+  assert_eq(scan_names("select id as ident from items"), ["items"]);
+  assert_eq(scan_names("select count(*) as n from items"), ["items"]);
+  assert_eq(scan_names("select id ident from items"), ["items"]);
+  assert_eq(
+    scan_names("select a.id as a_id, b.id as b_id from items as a join orders as b on a.id = b.id"),
+    ["items", "orders"],
+  );
+  assert_eq(scan_names("select (select max(n) from orders) as top, sku from items"), [
+    "items",
+    "orders",
+  ]);
+  assert_eq(scan_names("select n as v from items where n > $1 order by n limit 3"), ["items"])
+}
+
+test "a function the reader will not vouch for is refused" {
+  assert(scan_refused("select set_config('search_path', 'pg_catalog', false) from items"));
+  assert(scan_refused("select pg_advisory_lock(918) from items"));
+  assert(scan_refused("select pg_read_file('/etc/hosts') from items"));
+  assert(scan_refused("select pg_sleep(0) from items"));
+  assert(scan_refused("select id from items where pg_backend_pid() > 0"));
+  assert(scan_refused("insert into items (id) values (pg_backend_pid())"));
+  assert(scan_refused("update items set n = pg_backend_pid()"));
+  assert(scan_refused("delete from items where id = pg_backend_pid()"));
+  assert_eq(scan_names("select count(*) from items"), ["items"]);
+  assert_eq(scan_names("select sum(n) from items"), ["items"]);
+  assert_eq(scan_names("select coalesce(n, 0) from items"), ["items"]);
+  assert_eq(scan_names("select lower(sku), length(sku) from items"), ["items"]);
+  assert_eq(scan_names("select id from items where id = any($1)"), ["items"]);
+  assert_eq(scan_names("select id from items where sku in (select sku from orders)"), [
+    "items",
+    "orders",
+  ]);
+  assert_eq(scan_names("select cast(n as text) from items"), ["items"]);
+  assert_eq(scan_names("select id from items where not (n > $1)"), ["items"]);
+  assert_eq(scan_names("select case when n > $1 then upper(sku) else sku end from items"), [
+    "items",
+  ]);
+  // Quoted, it is a name and not a call.
+  assert_eq(scan_names("select \"pg_sleep\" from items"), ["items"])
+}
+
+test "a nondeterministic function in statement text is refused" {
+  assert(scan_refused("insert into items (at) values (now())"));
+  assert(scan_refused("select * from items where at < current_timestamp"));
+  assert(scan_refused("select random() from items"));
+  assert(scan_refused("update items set at = clock_timestamp()"));
+  assert(scan_refused("select * from items where d = current_date"));
+  // Quoted, it is a column name and not a call.
+  assert_eq(scan_names("select \"now\" from items"), ["items"])
+}
+
+test "nesting is bounded rather than a stack overflow" { assert(scan_refused(nested_selects(64))) }
+
+fn nested_selects(n: Int) -> String = nested_from("select * from items", n)
+
+fn nested_from(sql: String, n: Int) -> String =
+  if n <= 0 { sql } else { nested_from("select * from (" ++ sql ++ ") t", n - 1) }
+
+test "malformed input is answered and never a panic" {
+  // A panic would fail this test, so calling the reader *is* the assertion: whatever it answers,
+  // it answers, and a program that built the text is not killed by the driver's own check.
+  let _ = scan_statement("select");
+  let _ = scan_statement("select * from");
+  let _ = scan_statement("select * from (");
+  let _ = scan_statement("insert into");
+  let _ = scan_statement("update");
+  let _ = scan_statement("update t");
+  let _ = scan_statement("update t set");
+  let _ = scan_statement("delete");
+  let _ = scan_statement("delete from");
+  let _ = scan_statement("with");
+  let _ = scan_statement("with a");
+  let _ = scan_statement("with a as");
+  let _ = scan_statement("with a as (");
+  let _ = scan_statement("select * from a join");
+  let _ = scan_statement("select * from a join b on");
+  let _ = scan_statement("((((");
+  let _ = scan_statement("))))");
+  let _ = scan_statement("$");
+  let _ = scan_statement("$$");
+  let _ = scan_statement("'");
+  let _ = scan_statement("\"");
+  let _ = scan_statement("select * from items order by");
+  let _ = scan_statement("select * from items group by");
+  let _ = scan_statement("select ,,, from items");
+  let _ = scan_statement("select * from items where (");
+  let _ = scan_statement("натурально");
+  let _ = scan_statement("select * from ünïcode");
+  // A statement cut short may be read as far as it goes; what must not happen is a panic.
+  assert(scan_refused("with a as ("))
+}
+
+test "the payloads that change a statement's shape are refusals" {
+  assert(scan_refused("select * from items where sku = '' ; drop table items --'"));
+  // Kept, not refused here: the injected table is in the scan, so the row is what refuses it.
+  assert_eq(scan_names("select * from items where sku = '' union select * from pg_shadow --'"), [
+    "items",
+    "pg_shadow",
+  ]);
+  // A legal `or` reading no new table; parameters never becoming syntax defends it.
+  assert_eq(scan_names("select * from items where sku = '' or 1=1"), ["items"])
+}
+
+test "a placeholder is a token and never a value" {
+  assert_eq(scan_names("select * from items where sku = $1 and n > $22"), ["items"]);
+  assert_eq(scan_names("insert into items values ($1, $2, $3) returning sku"), ["items"])
+}
+
+test "the statement kind is reported so a read label over a write can be refused" {
+  assert(!kind_writes(scan_ok("select * from items").kind));
+  assert(!kind_writes(scan_ok("values (1), (2)").kind));
+  assert(kind_writes(scan_ok("insert into items values ($1)").kind));
+  assert(kind_writes(scan_ok("update items set a = 1").kind));
+  assert(kind_writes(scan_ok("delete from items").kind));
+  assert(scan_writes(scan_ok("with gone as (delete from items returning id) select * from gone")))
 }
 
 test "a connection string reads into the parts a driver needs" {
