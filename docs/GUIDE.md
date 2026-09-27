@@ -1955,11 +1955,6 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0428` | `blocking` host handler answered inline |
 | `E0429` | `net.listen_tls` named a credential the run lacks |
 | `E0430` | `--tls` credential that does not load |
-| `E0431` | no database configured |
-| `E0435` | live database differs from the schema (reserved) |
-| `E0436` | database operation from a task not owning the transaction |
-| `E0437` | connection pool exhausted |
-| `E0438` | live schema has an unmodellable trigger, rule or cascade (reserved) |
 | `E0439` | `Secret` passed to a host operation not allowed one |
 | `E0440` | configuration source unreadable |
 | `E0441` | required configuration key missing |
@@ -1988,7 +1983,6 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `W0603` | cache from another version |
 | `W0604` | obligation undecided at every tier |
 | `W0605` | standard library changed since the cache was written |
-| `W0606` | host runtime could not release every resource |
 | `W0607` | supplied configuration key the schema does not declare |
 | `W0608` | drain deadline expired with requests in flight |
 | `W0609` | spans still open when an entry point ended |
