@@ -844,18 +844,13 @@ pub fn run_property(
                 Outcome::Rejected => {}
                 Outcome::Held => kept = kept.saturating_add(1),
                 Outcome::Failed => {
-                    let shrunk = shrink::shrink(
-                        &values,
-                        &types,
-                        world,
-                        judge,
-                        Target::Falsifies,
-                        plan.shrink_budget,
-                    );
+                    // Unshrunk: the walk that makes a counterexample small is the program's now, and
+                    // it drives it through the offers/holds operations. The values ride along so
+                    // that something still holds them.
                     return Discharge::Refuted(Counterexample {
-                        bindings: bindings(binders, &shrunk.values),
+                        bindings: bindings(binders, &values),
                         original: bindings(binders, &values),
-                        shrinks: shrunk.steps,
+                        shrinks: 0,
                         root,
                         case,
                         race: None,
@@ -871,17 +866,9 @@ pub fn run_property(
                             diagnostic: Box::new(diagnostic),
                         });
                     }
-                    let shrunk = shrink::shrink(
-                        &values,
-                        &types,
-                        world,
-                        judge,
-                        Target::Raises,
-                        plan.shrink_budget,
-                    );
                     return Discharge::Unattempted(Gap::Raised {
-                        bindings: bindings(binders, &shrunk.values),
-                        diagnostic: Box::new(shrunk.diagnostic.unwrap_or(diagnostic)),
+                        bindings: bindings(binders, &values),
+                        diagnostic: Box::new(diagnostic),
                     });
                 }
             }
