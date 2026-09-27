@@ -34,6 +34,20 @@ pub struct Cluster {
 
 impl Cluster {
     pub fn start(database: &str) -> Cluster {
+        Cluster::launch(database, &["--auth=trust"], None)
+    }
+
+    /// A cluster whose TCP connections have to prove a password, which is what SCRAM is for.
+    /// The local socket stays trust, so the harness can set the password up.
+    pub fn start_with_password(database: &str, password: &str) -> Cluster {
+        Cluster::launch(
+            database,
+            &["--auth-local=trust", "--auth-host=scram-sha-256"],
+            Some(password),
+        )
+    }
+
+    fn launch(database: &str, auth: &[&str], password: Option<&str>) -> Cluster {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let data = directory.path().join("data");
         let initdb = binary("initdb").expect("initdb");
@@ -44,12 +58,12 @@ impl Cluster {
                 data.to_str().expect("a utf-8 path"),
                 "-U",
                 "ply",
-                "--auth=trust",
                 "--no-sync",
                 "-E",
                 "UTF8",
                 "--locale=C",
             ])
+            .args(auth)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .output()
@@ -92,9 +106,16 @@ impl Cluster {
             database: "postgres".to_string(),
         };
         cluster.wait_until_ready();
+        if let Some(secret) = password {
+            cluster.psql("postgres", &format!("alter role ply password '{secret}'"));
+        }
         cluster.psql("postgres", &format!("create database {database}"));
         cluster.database = database.to_string();
         cluster
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     pub fn url(&self) -> String {
