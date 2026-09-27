@@ -49,7 +49,11 @@ pub fn head() -> Vec<u8> {
 /// Where `w6-alloc` writes what one request allocates, relative to the repository root.
 pub const ALLOCATION_FILE: &str = "benches/w6-alloc.json";
 
-/// What one served request allocates, in a window of `requests`.
+/// What one served request allocates, and what the window it was read at held.
+///
+/// The per-request figures are the slope between `requests` and a tenth of it, so the startup a
+/// run pays before it serves anything — which is the program's size, not the request's — is not
+/// charged to every request.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Allocation {
     pub route: String,

@@ -24,7 +24,13 @@ fn number_before(text: &str, after: &str) -> Option<f64> {
     digits.replace(',', "").trim().parse().ok()
 }
 
-fn per_request() -> (f64, f64) {
+/// The window the published figures are read at, and a tenth of it: one window cannot tell a
+/// request from a run, because the run's startup is charged to every request in it.
+const WINDOW: usize = 200;
+const SMALL: usize = 20;
+
+/// What one request costs, and what a run costs before it serves anything.
+fn per_request() -> (f64, f64, f64, f64) {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service compiles");
     let request = ply_corpus::w6_run::head();
     // One warm pass, so lazily-built machine state is not charged to the count.
@@ -32,10 +38,27 @@ fn per_request() -> (f64, f64) {
         .over_sim(vec![vec![request.clone()]])
         .expect("the service serves one connection");
 
-    const N: usize = 200;
-    let script: Vec<Vec<Vec<u8>>> = (0..N).map(|_| vec![request.clone()]).collect();
+    let small = counted(&loaded, &request, SMALL);
+    let large = counted(&loaded, &request, WINDOW);
+    let span = (WINDOW - SMALL) as f64;
+    let (per_request, bytes) = (
+        (large.0 - small.0) as f64 / span,
+        (large.1 - small.1) as f64 / span,
+    );
+    // The same line read back through the small window: the one-off cost of a run.
+    (
+        per_request,
+        bytes,
+        small.0 as f64 - per_request * SMALL as f64,
+        small.1 as f64 - bytes * SMALL as f64,
+    )
+}
+
+/// A window of `n` requests: the allocations and the bytes it makes.
+fn counted(loaded: &ply_corpus::w3::Loaded, request: &[u8], n: usize) -> (usize, usize) {
+    let script: Vec<Vec<Vec<u8>>> = (0..n).map(|_| vec![request.to_vec()]).collect();
     let (_, allocs, bytes) = charge(|| loaded.over_sim(script).expect("the service serves"));
-    (allocs as f64 / N as f64, bytes as f64 / N as f64)
+    (allocs, bytes)
 }
 
 #[test]
@@ -54,7 +77,7 @@ fn the_shipped_allocation_evidence_still_describes_this_request_path() {
     let claimed_mb =
         number_before(&alternative.what, " MB").expect("the lever states a byte count");
 
-    let (per_request, bytes) = per_request();
+    let (per_request, bytes, _startup, _startup_bytes) = per_request();
     let mb_per_request = bytes / 1e6;
 
     println!(
@@ -89,10 +112,11 @@ const RETAKE: &str =
 #[test]
 fn the_shipped_figures_still_describe_this_request_path() {
     let figures = shipped_figures();
-    let (allocs, bytes) = per_request();
+    let (allocs, bytes, startup, startup_bytes) = per_request();
     println!(
         "`{}` says {:.2} allocations and {:.2} bytes per {} request; this tree makes {allocs:.2} \
-         and {bytes:.2}",
+         and {bytes:.2}, off a run that starts at {startup:.0} allocations and {startup_bytes:.0} \
+         bytes",
         ply_corpus::w6_run::ALLOCATION_FILE,
         figures.allocations_per_request,
         figures.bytes_per_request,

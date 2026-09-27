@@ -296,18 +296,16 @@ fn the_two_allocation_harnesses_are_one_measurement_read_at_two_windows() {
         );
     }
 
-    for window in [&small, &large] {
-        let counted = w6_alloc(&counter, window.requests);
-        let spread = (window.per_request() - counted).abs() / counted;
-        assert!(
-            spread <= HARNESS_BAND,
-            "at {} requests the site harness counts {:.1} allocations per request and `w6-alloc` \
-             counts {counted:.1}, a spread of {:.1}%: the two are no longer measuring one call",
-            window.requests,
-            window.per_request(),
-            100.0 * spread
-        );
-    }
+    // The slope, which is what `w6-alloc` publishes: a window's total per request would charge
+    // the intercept to every request, and the intercept is not a request.
+    let counted = w6_alloc(&counter, LARGE);
+    let spread = (marginal_total - counted).abs() / counted.abs().max(1.0);
+    assert!(
+        spread <= HARNESS_BAND,
+        "the site harness reads {marginal_total:.1} allocations per request and `w6-alloc` reads \
+         {counted:.1}, a spread of {:.1}%: the two are no longer measuring one call",
+        100.0 * spread
+    );
 
     assert!(
         fixed_total > 0.0,
@@ -334,6 +332,7 @@ fn w6_alloc_binary() -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
+/// What `w6-alloc` makes of one request, from the file it prints.
 fn w6_alloc(counter: &Path, requests: usize) -> f64 {
     let out = std::process::Command::new(counter)
         .arg("--repo")
