@@ -1006,6 +1006,7 @@ Strings are indexed by character, bytes by byte.
 | `string_find(s: String, needle: String) -> Int` | raises if absent |
 | `string_concat(a: String, b: String) -> String` | `a ++ b` |
 | `int_to_string(n: Int) -> String` | |
+| `float_to_string(f: Float) -> String` | shortest round-trip; `Infinity`, `-Infinity` and `NaN` |
 | `bytes_len(b: Bytes) -> Int` | |
 | `bytes_at(b: Bytes, i: Int) -> Int` | `0..=255` |
 | `bytes_u32_le(b: Bytes, i: Int) -> U32` | four bytes, little-endian |
