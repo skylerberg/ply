@@ -2477,3 +2477,29 @@ fn count_allocations_writes_what_the_entry_allocated() {
     );
     assert!(counted["bytes"].as_u64().unwrap_or(0) > 0, "{text}");
 }
+
+/// `--count-alloc-sites` is the wider record: the same totals, and the `ply_*` frames each
+/// allocation came from.
+#[test]
+fn count_alloc_sites_writes_where_the_entry_allocated() {
+    let dir = project(GREEN);
+    let out_path = dir.path().join("sites.json");
+    let flag = format!("--count-alloc-sites={}", out_path.display());
+    let out = ply(dir.path()).args([&flag, "run"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let text = std::fs::read_to_string(&out_path).expect("the count is written");
+    let counted: Value = serde_json::from_str(&text).expect("the count is JSON");
+    let total = counted["allocations"].as_u64().unwrap_or(0);
+    assert!(total > 0, "nothing was counted: {text}");
+    let sites = counted["sites"].as_array().expect("the sites are there");
+    assert!(!sites.is_empty(), "the sites are empty: {text}");
+    let attributed: u64 = sites
+        .iter()
+        .map(|s| s["allocations"].as_u64().unwrap_or(0))
+        .sum();
+    assert!(
+        attributed > 0 && attributed <= total,
+        "{attributed} of {total} attributed: {text}"
+    );
+}
