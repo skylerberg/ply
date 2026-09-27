@@ -275,6 +275,10 @@ pub mod codes {
     pub const DEPENDENCY_VERSION: &str = "E0136";
     /// One package reached at two places, where a closure pins one version.
     pub const DEPENDENCY_DIAMOND: &str = "E0137";
+    /// A dependency whose sources are not what `ply.lock` pinned.
+    pub const LOCK_MISMATCH: &str = "E0138";
+    /// A `ply.lock` that does not decode or is from another format.
+    pub const LOCK_UNREADABLE: &str = "E0139";
     pub const TYPE_MISMATCH: &str = "E0201";
     pub const ARITY_MISMATCH: &str = "E0202";
     pub const OCCURS_CHECK: &str = "E0203";
@@ -515,6 +519,14 @@ pub const MEANINGS: &[(&str, &str)] = &[
     (
         "E0137",
         "one package reached at two places, where a closure pins one version",
+    ),
+    (
+        "E0138",
+        "a dependency whose sources are not what `ply.lock` pinned",
+    ),
+    (
+        "E0139",
+        "a `ply.lock` that does not decode or is from another format",
     ),
     ("E0201", "type mismatch"),
     ("E0202", "arity mismatch"),
@@ -818,6 +830,8 @@ mod tests {
             ("DEPENDENCY_UNUSABLE", codes::DEPENDENCY_UNUSABLE, "E0135"),
             ("DEPENDENCY_VERSION", codes::DEPENDENCY_VERSION, "E0136"),
             ("DEPENDENCY_DIAMOND", codes::DEPENDENCY_DIAMOND, "E0137"),
+            ("LOCK_MISMATCH", codes::LOCK_MISMATCH, "E0138"),
+            ("LOCK_UNREADABLE", codes::LOCK_UNREADABLE, "E0139"),
             ("TYPE_MISMATCH", codes::TYPE_MISMATCH, "E0201"),
             ("ARITY_MISMATCH", codes::ARITY_MISMATCH, "E0202"),
             ("OCCURS_CHECK", codes::OCCURS_CHECK, "E0203"),

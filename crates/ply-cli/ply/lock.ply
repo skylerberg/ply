@@ -1,0 +1,224 @@
+// `ply.lock` — the closure a build resolved, pinned by each package's own sources. A package is
+// pinned by what it is (its name, its version, and the BLAKE3 digest of the modules it contributed)
+// and never by where it was found, so moving a dependency keeps its pin and editing one breaks it.
+//
+// The digest is the front end's: `pins_of` in `compiler.pkg` reads it off the package judgments
+// that decide what a package *is*, so there is one answer to "what did this build use" and the
+// lockfile only records it. This module reads, checks and writes that record.
+
+import diagnostic (Place)
+import paths (Resolved, address)
+import report (Answer, ok_code, schema_version)
+import compiler.resolve (Diag, diag1)
+import std.fs (fs)
+import std.json (Json, error_to_string, object, parse, to_string)
+import std.path (join)
+
+// One package as the lock records it: the front end's pin, verbatim.
+pub type Pinned = { name: String, version: String, digest: String }
+
+pub type Lock = { version: Int, packages: List<Pinned> }
+
+derive eq for Pinned
+derive eq for Lock
+derive json for Pinned
+derive json for Lock
+
+// The format this file writes. A lock from another version is refused rather than half-read.
+pub fn format() -> Int = 1
+
+pub fn path_of(r: Resolved) -> String = join(address(r), "ply.lock")
+
+// --- Reading -------------------------------------------------------------------
+
+fn decoded(text: String) -> Result<Lock, String> =
+  match parse(bytes_of_string(text)) {
+    Err(e) -> Err(error_to_string(e)),
+    Ok(j) -> match lock_json().decode(j) {
+      Err(e) -> Err(error_to_string(e)),
+      Ok(lock) -> Ok(lock),
+    },
+  }
+
+/// The lock at the root, or `None` when the project has none. `Err` is a lock that cannot be read:
+/// a file the run must not ignore, since what it pins is what it would otherwise trust.
+pub fn read(r: Resolved) -> Result<Option<Lock>, String> / {fs.read_file[cwd], fs.read_file[abs]} =
+  match if r.label == "cwd" { fs.read_file[cwd](path_of(r)) }
+    else { fs.read_file[abs](path_of(r)) } {
+    None -> Ok(None),
+    Some(bytes) -> match decoded(string_of_bytes_lossy(bytes)) {
+      Err(why) -> Err(why),
+      Ok(lock) -> if lock.version != format() {
+        Err(
+          "`ply.lock` is format " ++ int_to_string(lock.version)
+            ++ ", and this `ply` writes format "
+            ++ int_to_string(format()),
+        )
+      } else { Ok(Some(lock)) },
+    },
+  }
+
+/// What the lock says about one package, when it says anything.
+fn entry_of(lock: Lock, name: String) -> Option<Pinned> =
+  fold(lock.packages, None, |found: Option<Pinned>, p: Pinned|
+    match found { Some(_) -> found, None -> if p.name == name { Some(p) } else { None } })
+
+/// Every pin the lock records that the closure no longer holds, by name: a stale entry, which a
+/// write drops.
+fn stale(lock: Lock, pins: List<Pinned>) -> List<String> =
+  filter(map(lock.packages, |p: Pinned| p.name), |name: String|
+    !fold(pins, false, |held: Bool, p: Pinned| held || p.name == name))
+
+// --- The judgment ----------------------------------------------------------------
+
+// What is wrong with the lock, as a diagnostic over the project's root: a pinned package the run
+// found different bytes for, or a lock nothing can read.
+pub fn refused(r: Resolved, why: String) -> Diag =
+  diag1(
+    b"E0139",
+    outside(),
+    { start: 0, end: 0 },
+    bytes_of_string("`ply.lock` could not be read: " ++ why),
+    b"the lockfile is not one this `ply` wrote",
+    [b"delete it to pin what is on disk now, or restore it from version control"],
+  )
+
+pub fn mismatch(r: Resolved, name: String, pinned: Pinned, found: Pinned) -> Diag =
+  diag1(
+    b"E0138",
+    outside(),
+    { start: 0, end: 0 },
+    bytes_of_string(
+      "`" ++ name ++ "` is not what `ply.lock` pins: " ++ pinned.digest
+        ++ " was pinned, and the sources here are "
+        ++ found.digest,
+    ),
+    b"a pinned dependency changed",
+    [
+      bytes_of_string(
+        "`ply.lock` pins " ++ name ++ " " ++ pinned.version ++ "; this tree holds "
+          ++ found.version,
+      ),
+      b"delete its entry from `ply.lock` to pin what is on disk now, once you have checked what changed",
+    ],
+  )
+
+fn outside() -> Int = 4294967295
+
+/// Verifies a build's closure against the lock: every pinned package must be the one this run
+/// found. A package the lock does not mention is not an error — a write records it.
+pub fn verified(r: Resolved, lock: Lock, pins: List<Pinned>) -> Result<(), Diag> =
+  fold(pins, Ok(()), |acc: Result<(), Diag>, found: Pinned|
+    match acc {
+      Err(d) -> Err(d),
+      Ok(_) -> match entry_of(lock, found.name) {
+        None -> Ok(()),
+        Some(pinned) -> if pinned.digest == found.digest { Ok(()) }
+        else { Err(mismatch(r, found.name, pinned, found)) },
+      },
+    })
+
+// --- Writing -----------------------------------------------------------------------
+
+/// The lock a run's closure pins, with every package the closure holds and no stale entries: what
+/// `ply build` writes, so a lock can only ever describe a build that happened.
+pub fn text(lock: Option<Lock>, pins: List<Pinned>) -> String = {
+  let kept = match lock {
+    None -> [],
+    Some(l) -> filter(l.packages, |p: Pinned| !held(stale(l, pins), p.name)),
+  };
+  let added = fold(pins, kept, |acc: List<Pinned>, p: Pinned|
+    match entry_of({ version: format(), packages: acc }, p.name) {
+      Some(_) -> acc,
+      None -> push(acc, p),
+    });
+  to_string(lock_json().encode({ version: format(), packages: sorted(added) })) ++ "\n"
+}
+
+fn held(stale_names: List<String>, name: String) -> Bool =
+  fold(stale_names, false, |found: Bool, s: String| found || s == name)
+
+// By name, so two runs that pinned the same closure write the same file and a diff is a change in
+// the closure rather than in a walk order.
+fn sorted(pins: List<Pinned>) -> List<Pinned> =
+  fold(pins, [], |acc: List<Pinned>, p: Pinned| {
+    let n = len(acc);
+    let i = fold(range(0, n), n, |at_i: Int, j: Int|
+      if at_i < n { at_i } else if name_lt(p.name, at(acc, j).name) { j } else { at_i });
+    inserted(acc, i, p)
+  })
+
+fn inserted(pins: List<Pinned>, i: Int, p: Pinned) -> List<Pinned> = {
+  let before = fold(range(0, i), [], |acc: List<Pinned>, j: Int| push(acc, at(pins, j)));
+  let after = fold(range(i, len(pins)), [], |acc: List<Pinned>, j: Int| push(acc, at(pins, j)));
+  fold(after, push(before, p), |acc: List<Pinned>, x: Pinned| push(acc, x))
+}
+
+// `String` has no ordered comparison: bytes do, and a name's bytes are its order.
+fn name_lt(a: String, b: String) -> Bool =
+  match compare(bytes_of_string(a), bytes_of_string(b)) { Less -> true, _ -> false }
+
+fn at<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list does not hold") }
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_pin(name: String, version: String, digest: String) -> Pinned =
+  { name: name, version: version, digest: digest }
+
+test "a lock is written sorted by name, so a walk order cannot change it" {
+  let pins = [a_pin("zebra", "1.0.0", "b3:z"), a_pin("alpha", "0.2.0", "b3:a")];
+  let text = text(None, pins);
+  assert(string_contains(text, "\"name\":\"alpha\""));
+  // `string_find` raises when the needle is absent, which is itself the failure this test means.
+  assert(string_find(text, "\"alpha\"") < string_find(text, "\"zebra\""))
+}
+
+test "a lock round-trips through the format it writes" {
+  let pins = [a_pin("lib", "0.1.0", "b3:1f2e")];
+  match decoded(text(None, pins)) {
+    Err(why) -> panic(why),
+    Ok(lock) -> {
+      assert_eq(lock.version, 1);
+      assert_eq(lock.packages, pins)
+    },
+  }
+}
+
+test "a pinned package whose sources moved is refused, and one the lock does not hold is not" {
+  let lock: Lock = { version: 1, packages: [a_pin("lib", "0.1.0", "b3:old")] };
+  let r: Resolved = {
+    label: "cwd",
+    spelling: ".",
+    display: ".",
+    inside: ".",
+    absolute: ".",
+    machine: ".",
+  };
+  match verified(r, lock, [a_pin("lib", "0.1.0", "b3:new")]) {
+    Ok(_) -> panic("a changed dependency was trusted"),
+    Err(d) -> assert_eq(d.code, b"E0138"),
+  };
+  match verified(r, lock, [a_pin("lib", "0.1.0", "b3:old")]) {
+    Ok(_) -> (),
+    Err(_) -> panic("the same dependency was refused"),
+  };
+  // A package the lock does not mention is recorded, not refused.
+  match verified(r, lock, [a_pin("other", "0.1.0", "b3:x")]) {
+    Ok(_) -> (),
+    Err(_) -> panic("an unpinned package was refused"),
+  }
+}
+
+test "writing a lock keeps what the closure still holds and drops what it left" {
+  let before: Lock = {
+    version: 1,
+    packages: [a_pin("gone", "0.1.0", "b3:g"), a_pin("lib", "0.1.0", "b3:old")],
+  };
+  let text = text(Some(before), [a_pin("lib", "0.1.0", "b3:old"), a_pin("new", "0.2.0", "b3:n")]);
+  match decoded(text) {
+    Err(why) -> panic(why),
+    Ok(lock) ->
+      assert_eq(lock.packages, [a_pin("lib", "0.1.0", "b3:old"), a_pin("new", "0.2.0", "b3:n")]),
+  }
+}

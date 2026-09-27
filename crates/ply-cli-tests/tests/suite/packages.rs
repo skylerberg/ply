@@ -349,3 +349,83 @@ fn one_package_of_one_name_at_two_places_has_no_version_to_pick() {
     assert!(err.contains("`left` wants"), "{err}");
     assert!(err.contains("`right` wants"), "{err}");
 }
+
+/// A build records what it resolved, and refuses what the record does not describe.
+#[test]
+fn a_build_pins_its_dependencies_and_refuses_what_the_lock_pins_differently() {
+    let dir = graph();
+    let built = |args: &[&str]| ply(dir.path()).args(args).output().unwrap();
+    let lock_path = dir.path().join("app/ply.lock");
+
+    let out = built(&["build", "app", "-o", "app.plyx"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lock = std::fs::read_to_string(&lock_path).expect("the build pins what it resolved");
+    for want in [
+        "\"name\":\"lib\"",
+        "\"name\":\"base\"",
+        "\"version\":\"0.0.1\"",
+        "\"digest\":\"b3:",
+    ] {
+        assert!(lock.contains(want), "`{want}` is not in the lock: {lock}");
+    }
+    // The closure's packages are pinned, and the project's own sources are not.
+    assert!(!lock.contains("\"name\":\"app\""), "{lock}");
+
+    // The same tree builds again without moving the lock: a pin is not rewritten per run.
+    let out = built(&["build", "app", "-o", "app.plyx"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), lock);
+
+    // A dependency whose bytes moved is not the one the lock pins.
+    std::fs::write(
+        dir.path().join("lib/answer.ply"),
+        "import base.deep\npub fn answer() -> Int = deep::deep() + 1\n",
+    )
+    .unwrap();
+    let out = built(&["build", "app", "-o", "app.plyx"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("E0138"), "{err}");
+    assert!(err.contains("`lib` is not what `ply.lock` pins"), "{err}");
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), lock);
+
+    // Pinning what is on disk now is a deliberate act, and the lock says so afterwards.
+    std::fs::remove_file(&lock_path).unwrap();
+    let out = built(&["build", "app", "-o", "app.plyx"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let repinned = std::fs::read_to_string(&lock_path).unwrap();
+    assert_ne!(repinned, lock, "the digest did not move with the sources");
+    let out = built(&["build", "app", "-o", "app.plyx"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the new pin is the one in force"
+    );
+}
+
+#[test]
+fn a_lockfile_nothing_can_read_is_refused_rather_than_ignored() {
+    let dir = graph();
+    std::fs::write(dir.path().join("app/ply.lock"), "{ not json").unwrap();
+    let out = ply(dir.path())
+        .args(["build", "app", "-o", "app.plyx"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("E0139"), "{err}");
+    assert!(
+        !dir.path().join("app.plyx").exists(),
+        "an artifact was written"
+    );
+}
