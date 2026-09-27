@@ -962,18 +962,15 @@ fn bind(
     if !serve_reads_until_run(asked, told, knowledge, &cache.store, chosen) {
         return false;
     }
-    let selection = decided(
-        &chosen.clone().unwrap_or_default(),
-        &plan,
-        &loaded.check,
-        search,
-    );
+    let choice = chosen.clone().unwrap_or_default();
+    let selection = decided(&choice, &plan, &loaded.check, search);
     let (over, mixtures) = execute(
         args,
         cache,
         loaded,
         hashes,
         &plan,
+        &choice,
         &selection,
         search,
         &hosts,
@@ -993,6 +990,7 @@ fn execute(
     loaded: &Loaded,
     hashes: &HashOutput,
     plan: &Plan,
+    choice: &ply_test::Choice,
     selection: &Selection,
     search: &ply_eval::Plan,
     hosts: &Hosts,
@@ -1056,6 +1054,8 @@ fn execute(
                         &targets,
                         args.mutate_budget,
                         search,
+                        choice,
+                        plan,
                         hosts,
                         &runtime,
                     ))),
@@ -1172,7 +1172,7 @@ impl Plan {
 /// The runtime's view of what the program decided, under this run's own filter: the tests it keeps,
 /// the classes filtered to them, and the roots each still owes. `--filter` cannot change which
 /// tests conflict, so a class only loses members.
-fn decided(
+pub(crate) fn decided(
     choice: &ply_test::Choice,
     plan: &Plan,
     check: &CheckOutput,
