@@ -65,6 +65,18 @@ impl Reason {
         !matches!(self, Reason::Cached)
     }
 
+    /// The word a reason crosses as, and back: the program prints these and the runtime reads them.
+    pub fn parse(word: &str) -> Option<Reason> {
+        match word {
+            "new" => Some(Reason::New),
+            "nondet" => Some(Reason::Nondet),
+            "previous failure" => Some(Reason::PreviousFailure),
+            "cached" => Some(Reason::Cached),
+            "unhashed" => Some(Reason::Unhashed),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Reason::New => "new",
@@ -74,6 +86,21 @@ impl Reason {
             Reason::Unhashed => "unhashed",
         }
     }
+}
+
+/// What a run decided, sent by the program that decided it. The runtime applies its own `--filter`
+/// and `--std` to it, executes exactly what is left of `runs`, and schedules by `groups`.
+#[derive(Clone, Debug, Default)]
+pub struct Choice {
+    /// Test indices to execute, ascending.
+    pub runs: Vec<usize>,
+    /// The reason for every test the keys row named, indexed by test index. The program decides for
+    /// all of them, whether or not this run's filter will report on one.
+    pub reasons: Vec<Reason>,
+    /// The roots a seeded test still owes, when the cache already answered some of the plan's.
+    pub narrowed: std::collections::BTreeMap<usize, Vec<u64>>,
+    /// Concurrency classes over `runs`, as the program coloured them.
+    pub groups: Vec<Vec<usize>>,
 }
 
 #[derive(Clone)]
@@ -97,6 +124,85 @@ pub struct Selection {
 }
 
 impl Selection {
+    /// The runtime's view of what the program decided: the same fields `select` used to build, laid
+    /// out from the choice. The evidence a cached test is reported with is always a pass — a stored
+    /// failure is never `Cached` — so nothing here has to read the store again.
+    pub fn chosen(
+        choice: &Choice,
+        check: &CheckOutput,
+        visible: &[usize],
+        plan: &Plan,
+    ) -> Selection {
+        let plan = plan.clone().normalized();
+        let total = check.tests.len();
+        let cached: Vec<(usize, Outcome)> = (0..total)
+            .filter(|i| choice.reasons.get(*i) == Some(&Reason::Cached))
+            .map(|i| (i, Outcome::Pass))
+            .collect();
+        let footprints: Vec<(usize, Footprint)> = choice
+            .runs
+            .iter()
+            .filter_map(|&i| check.tests.get(i).map(|t| (i, t.footprint.clone())))
+            .collect();
+        let narrowed: BTreeMap<usize, Plan> = choice
+            .narrowed
+            .iter()
+            .map(|(&index, roots)| {
+                (
+                    index,
+                    Plan {
+                        roots: roots.clone(),
+                        ..plan.clone()
+                    }
+                    .normalized(),
+                )
+            })
+            .collect();
+        Selection {
+            total,
+            cached,
+            to_run: choice.runs.clone(),
+            groups: choice.groups.clone(),
+            reasons: choice.reasons.clone(),
+            isolation: check
+                .tests
+                .iter()
+                .map(|t| Isolation::of(&t.footprint))
+                .collect(),
+            // Over the tests this run reports on, so every count shares one denominator.
+            parallelism: parallelism(
+                visible
+                    .iter()
+                    .filter_map(|&i| check.tests.get(i))
+                    .map(|t| &t.footprint),
+                &footprints,
+                &choice.groups,
+            ),
+            plan,
+            narrowed,
+            out_of_scope: BTreeSet::new(),
+        }
+    }
+
+    /// The same selection over the tests a filter keeps. `--filter` cannot change which tests
+    /// conflict, so a class only loses members; a cached result or a narrowed plan for a test the
+    /// run does not report on goes with it.
+    pub fn keep(&self, visible: &[usize]) -> Selection {
+        let keeps = |i: &usize| visible.binary_search(i).is_ok();
+        let mut out = self.clone();
+        out.total = visible.len();
+        out.cached.retain(|(i, _)| keeps(i));
+        out.to_run.retain(keeps);
+        out.groups = self
+            .groups
+            .iter()
+            .map(|class| class.iter().copied().filter(keeps).collect::<Vec<usize>>())
+            .filter(|class| !class.is_empty())
+            .collect();
+        out.narrowed.retain(|index, _| keeps(index));
+        out
+    }
+
     pub fn reason(&self, index: usize) -> Option<Reason> {
         self.reasons.get(index).copied()
     }

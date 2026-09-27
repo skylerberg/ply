@@ -308,10 +308,11 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
 
     let plan_of = |store: &mut Store| {
         let bare = ply_test::select(&loaded.check, &hashes, store, &Plan::default());
-        ply_machine::tester::Plan::new(bare, &loaded.check, None, std_tests)
+        let plan = ply_machine::tester::Plan::new(&loaded.check, None, std_tests);
+        (bare.keep(&plan.visible), plan)
     };
 
-    let visible = plan_of(&mut store).visible;
+    let visible = plan_of(&mut store).1.visible;
     if visible.is_empty() {
         bail!("`{}` declares no tests in scope", root.display());
     }
@@ -326,7 +327,7 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
 
     let mut run = |jobs: usize| -> Result<(Vec<f64>, f64)> {
         store.clear()?;
-        let plan = plan_of(&mut store);
+        let (selection, _) = plan_of(&mut store);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(jobs)
             .build()
@@ -335,7 +336,7 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
         let report = pool.install(|| {
             ply_machine::support::run_on_tier(
                 &loaded,
-                &plan.selection,
+                &selection,
                 ply_test::Hosting::hermetic(),
                 &mut store,
             )
@@ -345,7 +346,7 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
             bail!(
                 "{} of {} tests failed while being timed; a suite that is not green times nothing",
                 report.failed,
-                plan.selection.total
+                selection.total
             );
         }
         let mut by_index = vec![0.0f64; loaded.check.tests.len()];

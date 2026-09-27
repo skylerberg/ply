@@ -704,8 +704,8 @@ pub fn run_tests(loaded: &ply_machine::load::Loaded, store: &mut Store) -> Resul
         store,
         &ply_eval::Plan::default(),
     );
-    let plan = ply_machine::tester::Plan::new(selection, &loaded.check, None, false);
-    let selection = plan.selection;
+    let plan = ply_machine::tester::Plan::new(&loaded.check, None, false);
+    let selection = selection.keep(&plan.visible);
     let report =
         ply_machine::support::run_on_tier(loaded, &selection, ply_test::Hosting::hermetic(), store);
     if report.failed > 0 {
