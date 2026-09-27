@@ -156,7 +156,7 @@ fn the_drain_answers_its_remaining_questions() {
         );
         return;
     }
-    let cluster = Cluster::start("w5_drain_audit");
+    let cluster = Cluster::start("drain_audit");
     cluster.psql(&cluster.database, SCHEMA);
 
     a_task_blocked_on_a_host_handler_does_not_outlast_the_drain(&cluster);

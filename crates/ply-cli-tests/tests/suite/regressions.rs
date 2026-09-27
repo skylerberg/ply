@@ -1,17 +1,10 @@
+use crate::harness::{ply, write};
 use ply_machine::driver;
 use ply_machine::load::{Loaded, load};
 use ply_span::{Symbol, codes};
 use ply_store::Store;
 use std::fs;
 use std::path::Path;
-
-fn write(dir: &Path, rel: &str, text: &str) {
-    let path = dir.join(rel);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-    fs::write(path, text).unwrap();
-}
 
 #[track_caller]
 fn incremental(dir: &Path) -> Loaded {
@@ -200,10 +193,8 @@ fn a_failure_is_placed_in_the_text_that_ran_after_its_definition_moved() {
     let dir = tempfile::tempdir().unwrap();
     let run = |text: &str| -> serde_json::Value {
         write(dir.path(), "m.ply", text);
-        let out = assert_cmd::Command::cargo_bin("ply")
-            .unwrap()
-            .args(["--color", "never", "run", "m.ply", "--json"])
-            .current_dir(dir.path())
+        let out = ply(dir.path())
+            .args(["run", "m.ply", "--json"])
             .output()
             .unwrap();
         serde_json::from_slice(&out.stdout)

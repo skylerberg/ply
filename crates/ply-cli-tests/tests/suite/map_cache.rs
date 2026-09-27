@@ -1,6 +1,4 @@
-use assert_cmd::Command;
-use std::path::Path;
-use tempfile::TempDir;
+use crate::harness::{ply, project};
 
 /// The orders are data rather than source, so the second run is a cache read of the same definitions.
 const SOURCE: &str = "\
@@ -18,18 +16,6 @@ test \"insertion order does not change the value\" {
   assert_eq(map_fold(build(descending()), 0, |acc, k, v| acc * 10 + k), 12345)
 }
 ";
-
-fn project(source: &str) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("m.ply"), source).unwrap();
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
 
 fn text_of(out: &std::process::Output) -> String {
     String::from_utf8(out.stdout.clone()).unwrap()

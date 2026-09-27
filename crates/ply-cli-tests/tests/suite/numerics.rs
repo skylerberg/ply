@@ -1,7 +1,5 @@
-use assert_cmd::Command;
+use crate::harness::{ply, project, repo, stdout_of};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
-use tempfile::TempDir;
 
 const BILLING: &str = r#"
 pub type Line = { description: String, unit: Decimal, quantity: Int }
@@ -39,34 +37,12 @@ test "a rounded tax names its mode" {
 pub fn main() -> Decimal = total([coffee(), tea()], 0.0825m)
 "#;
 
-fn project(source: &str) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("m.ply"), source).unwrap();
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
-
-fn stdout_of(output: &std::process::Output) -> String {
-    String::from_utf8(output.stdout.clone()).unwrap()
-}
-
 fn combined(output: &std::process::Output) -> String {
     format!(
         "{}{}",
         stdout_of(output),
         String::from_utf8_lossy(&output.stderr)
     )
-}
-
-fn repo(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(relative)
 }
 
 #[test]
@@ -122,7 +98,7 @@ fn decimal_division_is_e0209_and_names_decimal_div() {
 #[test]
 fn the_decimal_division_fixture_reports_e0209_and_nothing_else() {
     let dir = tempfile::tempdir().unwrap();
-    let source = std::fs::read_to_string(repo("tests/fixtures/decimal_division.ply"))
+    let source = std::fs::read_to_string(repo().join("tests/fixtures/decimal_division.ply"))
         .expect("the fixture is part of the repository");
     std::fs::write(dir.path().join("billing.ply"), source).unwrap();
 

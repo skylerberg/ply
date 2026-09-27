@@ -1,3 +1,4 @@
+use crate::fixture::{project, repo};
 use ply_machine::engine::Prover;
 use ply_machine::load::load;
 use ply_machine::obligations;
@@ -6,19 +7,6 @@ use ply_prove::{
     UNFOLD_DEPTH,
 };
 use std::path::{Path, PathBuf};
-use tempfile::TempDir;
-
-fn repo(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(relative)
-}
-
-fn project(source: &str) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("m.ply"), source).unwrap();
-    dir
-}
 
 struct Run {
     results: Vec<(Obligation, Discharge)>,
@@ -94,14 +82,14 @@ impl Run {
 }
 
 fn corpus() -> Vec<PathBuf> {
-    let mut paths = vec![repo("examples")];
+    let mut paths = vec![repo().join("examples")];
     for fixture in [
         "refuted_law.ply",
         "vacuous_law.ply",
         "obligation_not_discharged.ply",
         "concurrency_law_binder.ply",
     ] {
-        paths.push(repo("tests/fixtures").join(fixture));
+        paths.push(repo().join("tests/fixtures").join(fixture));
     }
     paths
 }
@@ -439,7 +427,7 @@ law "one is below, equal to, or above the other"
 
 #[test]
 fn an_unsatisfiable_guard_is_vacuous_rather_than_proved() {
-    let run = Run::of(&repo("tests/fixtures/vacuous_law.ply"));
+    let run = Run::of(&repo().join("tests/fixtures/vacuous_law.ply"));
     assert!(
         run.results
             .iter()
@@ -456,7 +444,7 @@ fn an_unsatisfiable_guard_is_vacuous_rather_than_proved() {
 /// Checking an `ensures` means calling the definition, and one that performs needs a handler nothing supplies.
 #[test]
 fn an_effectful_definition_is_a_gap_rather_than_a_claim() {
-    let run = Run::of(&repo("tests/fixtures/obligation_not_discharged.ply"));
+    let run = Run::of(&repo().join("tests/fixtures/obligation_not_discharged.ply"));
     let (_, discharge) = run.find("recorded");
     assert!(matches!(
         discharge,
@@ -468,7 +456,7 @@ fn an_effectful_definition_is_a_gap_rather_than_a_claim() {
 /// A spec that raises is not false, so it is neither a refutation nor a hold.
 #[test]
 fn an_evaluation_that_raises_is_a_gap_rather_than_a_refutation() {
-    let run = Run::of(&repo("tests/fixtures/obligation_not_discharged.ply"));
+    let run = Run::of(&repo().join("tests/fixtures/obligation_not_discharged.ply"));
     let (_, discharge) = run.find("share");
     assert!(
         matches!(
@@ -482,7 +470,7 @@ fn an_evaluation_that_raises_is_a_gap_rather_than_a_refutation() {
 /// An exhaustive interleaving search over sampled values proves nothing about the law.
 #[test]
 fn a_concurrency_law_over_a_binder_is_property_however_exhaustive_the_search() {
-    let run = Run::of(&repo("tests/fixtures/concurrency_law_binder.ply"));
+    let run = Run::of(&repo().join("tests/fixtures/concurrency_law_binder.ply"));
     let (obligation, discharge) = run.find("overdraw");
     assert!(!obligation.binders.is_empty(), "the law must have a binder");
     assert_eq!(
@@ -494,7 +482,7 @@ fn a_concurrency_law_over_a_binder_is_property_however_exhaustive_the_search() {
 
 #[test]
 fn a_ground_concurrency_law_whose_search_is_exhaustive_is_proved() {
-    let run = Run::of(&repo("examples"));
+    let run = Run::of(&repo().join("examples"));
     let (obligation, discharge) = run.find("no interleaving of two guarded settlements");
     assert!(obligation.binders.is_empty());
     assert_eq!(discharge.tier(), Some(Tier::Proved));
@@ -517,7 +505,7 @@ fn a_single_interleaving_never_proves_a_concurrency_law() {
         sim: ply_eval::Plan::once(ply_eval::Seed::root(7)),
         ..ProvePlan::default()
     };
-    let run = Run::with(&repo("examples"), &plan);
+    let run = Run::with(&repo().join("examples"), &plan);
     assert_eq!(
         run.tier("no interleaving of two guarded settlements"),
         Some(Tier::Example),
@@ -542,14 +530,14 @@ fn two_runs_over_one_corpus_agree() {
 
 #[test]
 fn a_refutation_shrinks_to_the_same_value_twice() {
-    let run = Run::of(&repo("tests/fixtures/refuted_law.ply"));
+    let run = Run::of(&repo().join("tests/fixtures/refuted_law.ply"));
     let (_, discharge) = run.find("settling a day's payments drops nothing");
     let Discharge::Refuted(first) = discharge else {
         panic!("the fixture exists to be refuted: {discharge:?}");
     };
     assert!(!first.bindings.is_empty());
 
-    let again = Run::of(&repo("tests/fixtures/refuted_law.ply"));
+    let again = Run::of(&repo().join("tests/fixtures/refuted_law.ply"));
     let Discharge::Refuted(second) = &again.find("settling a day's payments drops nothing").1
     else {
         unreachable!("just refuted");
@@ -621,7 +609,7 @@ fn withdraw(balance: Int, amount: Int) -> Int
 
 #[test]
 fn each_postcondition_is_discharged_at_its_own_tier() {
-    let run = Run::of(&repo("examples/ledger.ply"));
+    let run = Run::of(&repo().join("examples/ledger.ply"));
     let tiers: Vec<Option<Tier>> = run
         .results
         .iter()

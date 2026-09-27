@@ -1,7 +1,6 @@
-use assert_cmd::Command;
+use crate::harness::{json_of, ply, project, stderr_of, stdout_of};
 use serde_json::Value;
 use std::path::Path;
-use tempfile::TempDir;
 
 const DESK: &str = "\
 import std.config
@@ -44,36 +43,6 @@ fn main() -> Bool / {config.read[credentials]} =
     Some(key) -> secret_verify(key, \"correct-horse\"),
   }
 ";
-
-fn project(source: &str) -> TempDir {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    std::fs::write(dir.path().join("m.ply"), source).expect("the fixture is written");
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").expect("the binary is built");
-    cmd.arg("--color")
-        .arg("never")
-        .current_dir(dir)
-        // The parent's environment is a source, so an answer must not depend on the machine's.
-        .env_remove("DESK_REGION")
-        .env_remove("DESK_PORT")
-        .env_remove("DESK_API_KEY");
-    cmd
-}
-
-fn stdout_of(output: &std::process::Output) -> String {
-    String::from_utf8(output.stdout.clone()).expect("stdout is utf-8")
-}
-
-fn stderr_of(output: &std::process::Output) -> String {
-    String::from_utf8(output.stderr.clone()).expect("stderr is utf-8")
-}
-
-fn json_of(output: &std::process::Output) -> Value {
-    serde_json::from_str(&stdout_of(output)).expect("`--json` writes one document on stdout")
-}
 
 /// Its whole output is the resolved configuration, so precedence is read from it.
 fn hosts(dir: &Path, extra: &[&str], env: &[(&str, &str)]) -> std::process::Output {

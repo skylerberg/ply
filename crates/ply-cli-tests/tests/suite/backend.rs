@@ -1,7 +1,6 @@
-use assert_cmd::Command;
+use crate::harness::{ply, project};
 use serde_json::Value;
 use std::path::Path;
-use tempfile::TempDir;
 
 /// Ints, bools, containers, strings and a self-handled effect, so the seam carries each kind.
 const CORPUS: &str = r#"
@@ -51,18 +50,6 @@ test "a label is a word" { assert_eq(label(7), "n") }
 test "a grade is a float" { assert(grade(7) == 1.5) }
 test "a self handled effect still answers" { assert_eq(handled(1), 10) }
 "#;
-
-fn project(source: &str) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("m.ply"), source).unwrap();
-    dir
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").unwrap();
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
-}
 
 fn run(dir: &Path) -> Value {
     let mut cmd = ply(dir);

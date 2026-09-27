@@ -1,18 +1,10 @@
-use assert_cmd::Command;
+use crate::harness::{ply, project_files};
 use serde_json::Value;
 use std::path::Path;
 use tempfile::TempDir;
 
-fn project(files: &[(&str, &str)]) -> TempDir {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    for (name, source) in files {
-        std::fs::write(dir.path().join(name), source).expect("a project file");
-    }
-    dir
-}
-
 fn one(source: &str) -> TempDir {
-    project(&[("m.ply", source)])
+    project_files(&[("m.ply", source)])
 }
 
 #[test]
@@ -30,12 +22,6 @@ fn a_derived_definition_is_exempt_from_the_written_signature_rule() {
         "a derived definition must not be asked for an annotation: {text}"
     );
     assert!(out.status.success(), "the project should check: {text}");
-}
-
-fn ply(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("ply").expect("the `ply` binary");
-    cmd.arg("--color").arg("never").current_dir(dir);
-    cmd
 }
 
 struct Run {
@@ -202,7 +188,7 @@ pub fn round(r: Reading) -> Bool =
 
 #[test]
 fn structurally_identical_types_share_a_wire_format_and_cross_decode() {
-    let dir = project(&[
+    let dir = project_files(&[
         (
             "n.ply",
             "import std.json\npub type D = LeftC(Int) | RightC(String)\nderive json for D\n",
@@ -589,7 +575,7 @@ test "a key that is not a string is an array of pairs" {
 
 #[test]
 fn no_route_lets_a_float_become_a_map_key() {
-    let dir = project(&[
+    let dir = project_files(&[
         (
             "n.ply",
             "pub type Wrapper = W(Float)\n\
@@ -662,7 +648,7 @@ fn the_refusals_that_keep_a_codec_total_all_fire() {
         ),
     ];
     for (code, source) in cases {
-        let dir = project(&[
+        let dir = project_files(&[
             ("m.ply", source),
             ("n.ply", "pub type Thing = { id: Int }\n"),
         ]);
