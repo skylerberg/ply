@@ -1012,10 +1012,6 @@ pub fn diagnose_failures(
             .as_ref()
             .is_some_and(|m| hybrid::bodies_available(store, &fresh, m));
         let test_body = test_hash.and_then(|hash| BodyHybrid::test_body(&fresh, hash));
-        let absent = match (&mixture, complete) {
-            (Some(_), false) => Skipped::NoBodies,
-            _ => Skipped::NoHybrids,
-        };
         let seed = failure.seed.clone();
         // A mixture is runnable when the baseline's closure is on record, every body it needs is
         // available, and the test itself reached the world at all.
