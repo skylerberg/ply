@@ -23,7 +23,7 @@ use ply_prove::{
 };
 use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
 use ply_store::Store;
-use ply_test::obligation::{self, Laws, Moved, Proved, Reason, ReviewReport};
+use ply_test::obligation::{self, Laws, Moved, Proved, Reason, ReviewReport, from_cached};
 use ply_ty::CheckOutput;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -42,9 +42,10 @@ const PAYLOAD: &str = "claims";
 /// need nothing here.
 const SUITE: &str = "suite.obligation";
 
-const OPERATIONS: [(&str, &str); 6] = [
+const OPERATIONS: [(&str, &str); 7] = [
     ("configure", "ply_machine::claims::configure"),
     ("collected", "ply_machine::claims::collected"),
+    ("outcomes", "ply_machine::claims::outcomes"),
     ("discharged", "ply_machine::claims::discharged"),
     ("replay", "ply_machine::claims::replay"),
     ("reviewed", "ply_machine::claims::reviewed"),
@@ -124,7 +125,15 @@ impl HostHandler for Site {
                 PlyValue::Unit
             }
             ("collected", _) => self.collected()?,
-            ("discharged", [wanted]) => self.discharged(&indices(wanted, span)?)?,
+            ("discharged", [choice]) => self.discharged(choice_of(choice, span)?)?,
+            ("outcomes", [keys]) => {
+                let list = keys.as_list(span, "the keys to look up")?;
+                let mut named = Vec::with_capacity(list.len());
+                for item in list {
+                    named.push(item.as_str(span, "a key")?.to_string());
+                }
+                self.outcomes(&named)?
+            }
             ("replay", [index, root, case]) => self.replay(
                 usize::try_from(index.as_int(span, "the claim's place")?).unwrap_or(usize::MAX),
                 u64::try_from(root.as_int(span, "the generator's root")?).unwrap_or(0),
@@ -136,6 +145,26 @@ impl HostHandler for Site {
         };
         Ok(HostAnswer::Value(value))
     }
+}
+
+/// The decision, as the program sent it.
+fn choice_of(value: &PlyValue, span: Span) -> Result<obligation::Choice, Diagnostic> {
+    use crate::payload::field_of;
+    let mut reasons = Vec::new();
+    for word in field_of(value, "reasons", span)?
+        .as_list(span, "the reasons")?
+        .iter()
+    {
+        let word = word.as_str(span, "a reason")?;
+        reasons.push(obligation::Reason::parse(word).ok_or_else(|| {
+            Diagnostic::error(codes::INTERNAL_ERROR, format!("unknown reason `{word}`"))
+        })?);
+    }
+    Ok(obligation::Choice {
+        claims: indices(field_of(value, "claims", span)?, span)?,
+        to_discharge: indices(field_of(value, "runs", span)?, span)?,
+        reasons,
+    })
 }
 
 fn indices(value: &PlyValue, span: Span) -> Result<Vec<usize>, Diagnostic> {
@@ -178,10 +207,26 @@ impl Site {
         }
     }
 
-    fn discharged(&self, wanted: &[usize]) -> Result<PlyValue, Diagnostic> {
+    /// The store's answer under each key, as a report prints one: `passed`, `failed`, or nothing.
+    fn outcomes(&self, keys: &[String]) -> Result<PlyValue, Diagnostic> {
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("outcomes"))?;
+        machine.ask(Go::Outcomes(keys.to_vec()))?;
+        match machine.step()? {
+            Step::Outcomes(answers) => Ok(PlyValue::list(
+                answers
+                    .iter()
+                    .map(|answer| crate::payload::option(answer.as_deref().map(PlyValue::str)))
+                    .collect(),
+            )),
+            _ => Err(out_of_step("outcomes")),
+        }
+    }
+
+    fn discharged(&self, choice: obligation::Choice) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
         let machine = held.as_ref().ok_or_else(|| unstarted("discharged"))?;
-        machine.ask(Go::Discharge(wanted.to_vec()))?;
+        machine.ask(Go::Discharge(choice))?;
         match machine.step()? {
             Step::Discharged(answer) => Ok(answered((*answer).map(|v| verdicts_value(&v)))),
             _ => Err(out_of_step("discharged")),
@@ -245,7 +290,10 @@ fn answered(answer: Result<PlyValue, Refused>) -> PlyValue {
 
 /// What the program asks the machine for next.
 enum Go {
-    Discharge(Vec<usize>),
+    /// What the store holds under these keys. The program computes them — a plan key is part of
+    /// the obligation's own encoding — so no row could carry the answers.
+    Outcomes(Vec<String>),
+    Discharge(obligation::Choice),
     /// One point of one obligation's guard: its place in the collection, the generator's root,
     /// and which case to draw.
     Replay {
@@ -259,6 +307,8 @@ enum Go {
 
 enum Step {
     Collected(Box<Result<Collection, Refused>>),
+    /// The store's answer under each key asked about: `passed`, `failed`, or nothing.
+    Outcomes(Vec<Option<String>>),
     Discharged(Box<Result<Verdicts, Refused>>),
     Replayed(Box<Result<Point, Refused>>),
     Reviewed(Box<Changes>),
@@ -359,7 +409,7 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
         warnings: std::mem::take(&mut warnings),
         claims: obligations
             .iter()
-            .map(|o| claim_of(o, &loaded, &labels))
+            .map(|o| claim_of(o, &loaded, &labels, &job.plan))
             .collect(),
         specified,
         plan: job.plan.clone(),
@@ -371,6 +421,24 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
     let mut prepared: Option<Result<Prepared, Refused>> = None;
     loop {
         match asked.recv() {
+            Ok(Go::Outcomes(keys)) => {
+                // What the *obligation* cache holds under each key, as a word: the program applies
+                // the rule (a proof only under the bare key, a sample only under its plan's), and
+                // only the runtime can decode an entry.
+                let answers: Vec<Option<String>> = keys
+                    .iter()
+                    .map(|key| {
+                        let entry = ply_ty::DefHash::from_hex(key)
+                            .and_then(|hash| store.obligation(hash))?;
+                        Some(match from_cached(&entry) {
+                            Ok(Evidence::Proof(_)) => "proof".to_string(),
+                            Ok(Evidence::Cases(_)) => "sample".to_string(),
+                            Err(_) => "other".to_string(),
+                        })
+                    })
+                    .collect();
+                let _ = told.send(Step::Outcomes(answers));
+            }
             Ok(Go::Discharge(wanted)) => {
                 if prepared.is_none() {
                     prepared = Some(prepare(&job, &loaded, &mut store));
@@ -384,10 +452,11 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
                     None => return,
                 };
                 let asked_for: Vec<Obligation> = wanted
+                    .claims
                     .iter()
                     .filter_map(|&index| obligations.get(index).cloned())
                     .collect();
-                match discharge(&laws, &job, &scoped, asked_for, ready, &mut store) {
+                match discharge(&laws, &job, &scoped, asked_for, &wanted, ready, &mut store) {
                     Ok(proved) => {
                         let mut warnings = proved.warnings;
                         warnings.extend(flushed(&mut store));
@@ -541,11 +610,12 @@ fn discharge(
     job: &Job,
     scoped: &CheckOutput,
     asked_for: Vec<Obligation>,
+    choice: &obligation::Choice,
     prepared: &Prepared<'_>,
     store: &mut Store,
 ) -> Result<Proved, Refused> {
     let mut warnings = prepared.warnings.clone();
-    let asked = obligation::Asked::new(asked_for, store, &job.plan, job.use_cache);
+    let asked = obligation::Asked::chosen(asked_for, choice, store, &job.plan, job.use_cache);
     let (pool, _workers) = build_pool(job.jobs, &mut warnings);
     let discharge = || asked.discharge(scoped, laws, store, &prepared.prover);
     let mut proved = match &pool {
@@ -597,6 +667,10 @@ enum Kind {
 
 struct Claim {
     key: String,
+    /// The key a discharge weaker than a proof is filed under. A proof may only sit under `key`.
+    planned: String,
+    /// `law/host`: a verdict against the world, which is never cached.
+    host: bool,
     owner: String,
     kind: Kind,
     guarded: bool,
@@ -644,9 +718,16 @@ struct Accepted {
     warnings: Vec<Diagnostic>,
 }
 
-fn claim_of(o: &Obligation, loaded: &Loaded, labels: &BTreeMap<Symbol, String>) -> Claim {
+fn claim_of(
+    o: &Obligation,
+    loaded: &Loaded,
+    labels: &BTreeMap<Symbol, String>,
+    plan: &ProvePlan,
+) -> Claim {
     Claim {
         key: o.key.to_hex(),
+        planned: ply_prove::key::prove_key(o.key, plan).to_hex(),
+        host: o.host,
         owner: o.owner.as_str().to_string(),
         kind: match o.kind {
             ObligationKind::Ensures { index } => Kind::Ensures(index),
@@ -765,6 +846,8 @@ fn frame_value(frame: &Frame) -> PlyValue {
 fn claim_value(claim: &Claim) -> PlyValue {
     record(vec![
         ("key", PlyValue::str(&claim.key)),
+        ("planned", PlyValue::str(&claim.planned)),
+        ("host", PlyValue::Bool(claim.host)),
         ("owner", PlyValue::str(&claim.owner)),
         ("kind", kind_value(&claim.kind)),
         ("guarded", PlyValue::Bool(claim.guarded)),
