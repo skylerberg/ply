@@ -1,9 +1,7 @@
 //! The trusted computing base, as the CLI reads and reports it.
 
 use crate::config::Configuration;
-use crate::db::{self, Database, DbConfig};
 use crate::payload::{count, diags_value, option, places_value, record, strings};
-use crate::support::plural;
 use ply_eval::Value as PlyValue;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
@@ -25,14 +23,9 @@ pub fn registry() -> HostRegistry {
 /// One host operation and the handler that serves it, as a caller lends it to an entry.
 pub type Lent = (HostOp, Arc<dyn HostHandler>);
 
-fn registry_for(check: &CheckOutput, trace: Option<Arc<ply_host::trace::Trace>>) -> HostRegistry {
-    let database = check
-        .effects
-        .values()
-        .any(|e| e.name.as_str() == ply_host::db::EFFECT);
+fn registry_for(_check: &CheckOutput, trace: Option<Arc<ply_host::trace::Trace>>) -> HostRegistry {
     match trace {
-        Some(trace) => ply_host::registry_over(trace, database),
-        None if database => ply_host::registry_with_database(),
+        Some(trace) => ply_host::registry_over(trace),
         None => ply_host::registry(),
     }
 }
@@ -45,38 +38,31 @@ pub struct Hosts {
     binding: Arc<HostBinding>,
     /// Every triple the registry resolves against this program, whether or not it is bound.
     listing: HostListing,
-    db: Option<DbConfig>,
     /// Read by the `configuration` block, the banner and the digest; never re-derived from flags.
     config: Configuration,
-    /// The `--db-schema` function, resolved against the program at start-up.
-    schema: Option<db::schema::SchemaView>,
     /// Where this run's records go and on which channels, when the program records at all.
     observability: Option<Observability>,
     shutdown: Option<Shutdown>,
 }
 
 impl Hosts {
-    /// The binding a run gets; `reach` is the row it enters, or `None` to let the binding decide.
+    /// The binding a run gets: what this binary compiled in, against this program.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         check: &CheckOutput,
         host: bool,
         credentials: &crate::options::TlsOptions,
         roots: &[ply_host::fs::RootSpec],
-        db: Option<DbConfig>,
         config: Configuration,
         trace: &crate::trace::TraceOptions,
-        reach: Option<&Footprint>,
     ) -> Result<Hosts, Vec<Diagnostic>> {
         Hosts::open_stopping(
             check,
             host,
             credentials,
             roots,
-            db,
             config,
             trace,
-            reach,
             None,
             None,
             Vec::new(),
@@ -92,10 +78,8 @@ impl Hosts {
         host: bool,
         credentials: &crate::options::TlsOptions,
         roots: &[ply_host::fs::RootSpec],
-        db: Option<DbConfig>,
         config: Configuration,
         trace: &crate::trace::TraceOptions,
-        reach: Option<&Footprint>,
         shutdown: Option<Arc<ply_host::signal::Shutdown>>,
         process: Option<ply_host::process::ProcessHost>,
         lent: Vec<Lent>,
@@ -109,9 +93,7 @@ impl Hosts {
                 host: None,
                 binding: Arc::new(HostBinding::hermetic_with(registry)),
                 listing: HostListing::default(),
-                db: None,
                 config: Configuration::default(),
-                schema: None,
                 observability: None,
                 shutdown: None,
             });
@@ -121,25 +103,7 @@ impl Hosts {
         let roots = ply_host::fs::Roots::load(roots, Span::DUMMY).map_err(|d| vec![d])?;
         // Opened only when a `db` operation can reach it, and probed now so an unreachable database
         // fails start-up rather than the first request.
-        let mut facilities = match db.as_ref().filter(|_| reaches_db(check, reach)) {
-            Some(config) => {
-                let (url, bounds) = config.pool_config();
-                ply_host::Host::with_database(
-                    material,
-                    ply_host::db::PoolConfig {
-                        url: url.expose().to_string(),
-                        size: bounds.size,
-                        acquire: bounds.acquire,
-                        statement: bounds.statement,
-                        idle_txn: bounds.idle_txn,
-                        connect: bounds.connect,
-                        statements: bounds.statements,
-                    },
-                )
-                .map_err(|d| vec![d])?
-            }
-            None => ply_host::Host::with_credentials(material),
-        }
+        let mut facilities = ply_host::Host::with_credentials(material)
         .configured(Arc::clone(&config.snapshot))
         .rooted(roots)
         .traced(trace.open());
@@ -156,7 +120,6 @@ impl Hosts {
         }
         let binding = registry.bind(check)?;
         let listing = binding.listing().clone();
-        let schema = db_schema(check, db.as_ref(), &listing, reach)?;
         let observability = Observability::of(&listing, facilities.tracing(), trace.level_name());
         let stopping = facilities
             .stop()
@@ -165,9 +128,7 @@ impl Hosts {
             host: Some(facilities),
             binding: Arc::new(binding),
             listing,
-            db,
             config,
-            schema,
             observability,
             shutdown: stopping,
         })
@@ -183,39 +144,6 @@ impl Hosts {
         self.host.as_ref().map(|host| host.tracing().counts())
     }
 
-    /// The configuration a run was given, for the driver and for the report.
-    pub fn db(&self) -> Option<&DbConfig> {
-        self.db.as_ref()
-    }
-
-    /// The `database` block, or `None` when no database is in reach.
-    pub fn database(&self) -> Option<Database> {
-        Database::of(
-            Database::operations_of(&self.listing),
-            self.db.clone(),
-            // Server facts come only from a live connection.
-            None,
-            self.schema.clone(),
-        )
-    }
-
-    /// Whether this run reached a real database, so a green suite is not read as hermetic.
-    pub fn is_live_database(&self) -> bool {
-        self.database().is_some_and(|d| d.is_live())
-    }
-
-    /// Fill in the `--db-schema` function's table and column counts.
-    pub fn describe_schema(&mut self, shape: Option<db::schema::Shape>) {
-        if let Some(view) = &mut self.schema {
-            view.shape = shape;
-        }
-    }
-
-    /// The name `--db-schema` resolved to, for a command that wants to evaluate it.
-    pub fn schema_function(&self) -> Option<&str> {
-        self.schema.as_ref().map(|view| view.name.as_str())
-    }
-
     /// The TLS stack and configured credentials, or `None` when neither exists.
     pub fn transport(&self) -> Option<Transport> {
         Transport::of(&self.listing, self.host.as_ref().map(|h| h.credentials()))
@@ -226,7 +154,6 @@ impl Hosts {
         Disclosures {
             transport: self.transport(),
             filesystem: Filesystem::of(&self.listing, self.host.as_ref().map(|h| h.roots())),
-            database: self.database(),
             configuration: Some(self.config.clone()).filter(Configuration::is_opened),
             observability: self.observability.clone(),
             shutdown: self.shutdown,
@@ -239,38 +166,23 @@ impl Hosts {
         check: &CheckOutput,
         host: bool,
     ) -> Result<Hosts, Vec<Diagnostic>> {
-        Hosts::bind_with(registry, check, host, None)
-    }
-
-    /// [`Hosts::bind`] with a database configuration, for tests of the checks `open` runs.
-    pub fn bind_with(
-        registry: HostRegistry,
-        check: &CheckOutput,
-        host: bool,
-        db: Option<DbConfig>,
-    ) -> Result<Hosts, Vec<Diagnostic>> {
         if !host {
             return Ok(Hosts {
                 host: None,
                 binding: Arc::new(HostBinding::hermetic_with(registry)),
                 listing: HostListing::default(),
-                db: None,
                 config: Configuration::default(),
-                schema: None,
                 observability: None,
                 shutdown: None,
             });
         }
         let binding = registry.bind(check)?;
         let listing = binding.listing().clone();
-        let schema = db_schema(check, db.as_ref(), &listing, None)?;
         Ok(Hosts {
             host: None,
             binding: Arc::new(binding),
             listing,
-            db,
             config: Configuration::default(),
-            schema,
             observability: None,
             shutdown: None,
         })
@@ -333,9 +245,6 @@ impl Hosts {
         if let Some(filesystem) = &disclosures.filesystem {
             summary["filesystem"] = filesystem.json();
         }
-        if let Some(database) = &disclosures.database {
-            summary["database"] = database.json();
-        }
         summary
     }
 
@@ -346,58 +255,6 @@ impl Hosts {
             .map(|h| h.handshakes())
             .unwrap_or_default()
     }
-}
-
-/// Whether a `db` operation can reach the host boundary in this run.
-fn reaches_db(check: &CheckOutput, reach: Option<&Footprint>) -> bool {
-    let declared = check
-        .effects
-        .values()
-        .any(|e| e.name.as_str() == ply_host::db::EFFECT);
-    declared
-        && reach.is_none_or(|reach| {
-            reach
-                .atoms()
-                .any(|a| a.effect.as_str() == ply_host::db::EFFECT)
-        })
-}
-
-/// The three checks that stand between a binding and the first evaluation, and the `--db-schema`
-/// view they leave behind.
-fn db_schema(
-    check: &CheckOutput,
-    config: Option<&DbConfig>,
-    listing: &HostListing,
-    reach: Option<&Footprint>,
-) -> Result<Option<db::schema::SchemaView>, Vec<Diagnostic>> {
-    if let Some(defect) = Database::rollback_bound(listing) {
-        return Err(vec![defect]);
-    }
-    let operations = Database::operations_of(listing);
-    let Some(config) = config else {
-        // The binding lists what the program can reach, not what this run enters.
-        let reached: Vec<String> = match reach {
-            Some(reach) => reach
-                .atoms()
-                .filter(|a| a.effect.as_str() == ply_host::db::EFFECT)
-                .map(|a| a.to_string())
-                .collect(),
-            None => operations.clone(),
-        };
-        if reached.is_empty() {
-            return Ok(None);
-        }
-        return Err(vec![db::missing(&reached)]);
-    };
-    let Some(name) = &config.schema else {
-        return Ok(None);
-    };
-    let resolved = db::schema::resolve(check, name).map_err(|d| vec![d])?;
-    Ok(Some(db::schema::SchemaView {
-        name: resolved.as_str().to_string(),
-        shape: None,
-        state: db::schema::State::Declared,
-    }))
 }
 
 pub fn handshake_lines(counts: &tls::HandshakeCounts) -> Vec<String> {
@@ -412,22 +269,6 @@ pub fn handshake_lines(counts: &tls::HandshakeCounts) -> Vec<String> {
         lines.push(format!("  {n} {reason}"));
     }
     lines
-}
-
-/// The one line that says a run reached a real database.
-pub fn database_line(hosts: &Hosts) -> Option<String> {
-    let database = hosts.database()?;
-    if !database.is_live() {
-        return None;
-    }
-    let config = database.config.as_ref()?;
-    Some(format!(
-        "database {} · {} {} · configured by {}",
-        config.url.redacted(),
-        database.operations.len(),
-        plural(database.operations.len(), "operation"),
-        config.source.as_str(),
-    ))
 }
 
 pub fn handshakes_json(counts: &tls::HandshakeCounts) -> Value {
@@ -751,7 +592,6 @@ pub struct Disclosures {
     pub transport: Option<Transport>,
     /// `None` when no root is bound and the program performs no `fs` operation.
     pub filesystem: Option<Filesystem>,
-    pub database: Option<Database>,
     /// The run's configuration, when it opened any source.
     pub configuration: Option<Configuration>,
     pub observability: Option<Observability>,
@@ -765,8 +605,6 @@ impl Disclosures {
         listing: &HostListing,
         credentials: Option<&tls::Credentials>,
         roots: Option<&ply_host::fs::Roots>,
-        db: Option<DbConfig>,
-        schema: Option<db::schema::SchemaView>,
         configuration: Option<Configuration>,
         trace: Option<&Arc<ply_host::trace::Trace>>,
         level: &'static str,
@@ -775,7 +613,6 @@ impl Disclosures {
         Disclosures {
             transport: Transport::of(listing, credentials),
             filesystem: Filesystem::of(listing, roots),
-            database: Database::of(Database::operations_of(listing), db, None, schema),
             configuration: configuration.filter(Configuration::is_opened),
             observability: trace.and_then(|trace| Observability::of(listing, trace, level)),
             shutdown: shutdown.and_then(|shutdown| Shutdown::of(listing, shutdown)),
@@ -785,7 +622,6 @@ impl Disclosures {
     pub fn is_empty(&self) -> bool {
         self.transport.is_none()
             && self.filesystem.is_none()
-            && self.database.is_none()
             && self.observability.is_none()
             && self.shutdown.is_none()
             && !self
@@ -808,10 +644,6 @@ pub fn digest_short(listing: &HostListing, disclosures: &Disclosures) -> String 
     }
     if let Some(filesystem) = &disclosures.filesystem {
         filesystem.hash_into(&mut hasher);
-    }
-    if let Some(database) = &disclosures.database {
-        hasher.update(DATABASE_DOMAIN);
-        database.hash_into(&mut hasher);
     }
     // Names and shapes only, never resolved values: a deployment's own settings must not move it.
     if let Some(configuration) = disclosures.configuration.as_ref().filter(|c| c.is_pinned()) {
@@ -843,7 +675,6 @@ const DISCLOSURE_DOMAIN: &[u8] = b"ply.hosts.transport.v1\0";
 
 // One domain per block, so listings with different blocks cannot collide.
 const FILESYSTEM_DOMAIN: &[u8] = b"ply.hosts.filesystem.v1\0";
-const DATABASE_DOMAIN: &[u8] = b"ply.hosts.database.v1\0";
 const CONFIGURATION_DOMAIN: &[u8] = b"ply.hosts.configuration.v1\0";
 const OBSERVABILITY_DOMAIN: &[u8] = b"ply.hosts.observability.v1\0";
 const SHUTDOWN_DOMAIN: &[u8] = b"ply.hosts.shutdown.v1\0";
@@ -872,7 +703,6 @@ pub struct HostsOptions {
     pub digest: bool,
     pub tls: crate::options::TlsOptions,
     pub fs: Vec<ply_host::fs::RootSpec>,
-    pub db: crate::db::DbOptions,
     pub config: crate::config::ConfigOptions,
     pub trace: crate::trace::TraceOptions,
     pub shutdown: crate::options::ShutdownOptions,
@@ -894,7 +724,6 @@ impl HostsOptions {
             digest: false,
             tls: o.tls,
             fs: o.fs,
-            db: o.db,
             config: o.config,
             trace: o.trace,
             shutdown: o.shutdown,
@@ -1056,7 +885,6 @@ impl Assembled {
                 "filesystem",
                 option(d.filesystem.as_ref().map(filesystem_value)),
             ),
-            ("database", option(d.database.as_ref().map(database_value))),
             (
                 "configuration",
                 option(d.configuration.as_ref().map(configuration_value)),
@@ -1114,17 +942,11 @@ fn bind(args: &crate::hosts::HostsOptions, loaded: &crate::load::Loaded) -> Resu
     // Likewise, so an unresolvable root is `E0454` before the listing overstates what is reached.
     let roots = ply_host::fs::Roots::load(&args.fs, Span::DUMMY)
         .map_err(|diagnostic| ("NotBound", vec![diagnostic]))?;
-    let db = args
-        .db
-        .resolve(args.host)
-        .map_err(|diagnostics| ("NotBound", diagnostics))?;
     // Built only for a schema: this command runs nothing else.
     let constant = |name: &str| {
         let backend = crate::support::prover_backend(loaded)?;
         crate::support::enter_constant(Some(backend), name)
     };
-    let schema = schema_view(&loaded.check, db.as_ref(), &constant)
-        .map_err(|diagnostic| ("NotBound", vec![diagnostic]))?;
     let (configuration, warnings) =
         Configuration::open(&loaded.check, args.host, &args.config, &constant)
             .map_err(|diagnostics| ("NotBound", diagnostics))?;
@@ -1133,8 +955,6 @@ fn bind(args: &crate::hosts::HostsOptions, loaded: &crate::load::Loaded) -> Resu
             &listing,
             Some(&credentials),
             Some(&roots),
-            db,
-            schema,
             Some(configuration),
             Some(&trace),
             args.trace.level_name(),
@@ -1144,25 +964,6 @@ fn bind(args: &crate::hosts::HostsOptions, loaded: &crate::load::Loaded) -> Resu
         hermetic: binding.is_hermetic(),
         warnings,
     })
-}
-
-/// The `--db-schema` function as this command reports it: named, and evaluated for its shape.
-fn schema_view(
-    check: &CheckOutput,
-    db: Option<&DbConfig>,
-    constant: &dyn Fn(&str) -> Result<ply_eval::Value, Diagnostic>,
-) -> Result<Option<db::schema::SchemaView>, Diagnostic> {
-    let Some(name) = db.and_then(|c| c.schema.as_deref()) else {
-        return Ok(None);
-    };
-    let resolved = db::schema::resolve(check, name)?;
-    let name = resolved.as_str().to_string();
-    let shape = crate::support::materialise_schema(&name, constant);
-    Ok(Some(db::schema::SchemaView {
-        name,
-        shape,
-        state: db::schema::State::Declared,
-    }))
 }
 
 // --- The payload -------------------------------------------------------------
@@ -1241,61 +1042,6 @@ fn filesystem_value(filesystem: &Filesystem) -> PlyValue {
     )])
 }
 
-fn database_value(database: &Database) -> PlyValue {
-    let config = database.config.as_ref();
-    record(vec![
-        ("live", PlyValue::Bool(database.is_live())),
-        (
-            "operations",
-            strings(database.operations.iter().map(String::as_str)),
-        ),
-        (
-            "url",
-            option(config.map(|c| PlyValue::str(c.url.redacted()))),
-        ),
-        (
-            "source",
-            option(config.map(|c| PlyValue::str(c.source.as_str()))),
-        ),
-        (
-            "pool",
-            option(config.map(|c| {
-                record(vec![
-                    ("connections", PlyValue::Int(c.pool as i64)),
-                    ("acquire_ms", PlyValue::Int(c.acquire_ms as i64)),
-                    ("statement_ms", PlyValue::Int(c.statement_ms as i64)),
-                    ("idle_txn_ms", PlyValue::Int(c.idle_txn_ms as i64)),
-                    ("connect_ms", PlyValue::Int(c.connect_ms as i64)),
-                    ("statement_cache", PlyValue::Int(c.statement_cache as i64)),
-                ])
-            })),
-        ),
-        ("scanner", PlyValue::str(db::SCANNER)),
-        ("accepts", strings(db::ACCEPTED.split_whitespace())),
-        (
-            "server",
-            option(database.server.as_ref().map(|s| {
-                record(vec![
-                    ("version", PlyValue::str(&s.version)),
-                    ("database", PlyValue::str(&s.database)),
-                    ("collation", PlyValue::str(&s.collation)),
-                    ("encoding", PlyValue::str(&s.encoding)),
-                ])
-            })),
-        ),
-        (
-            "schema",
-            option(database.schema.as_ref().map(|s| {
-                record(vec![
-                    ("function", PlyValue::str(&s.name)),
-                    ("tables", option(s.shape.map(|shape| count(shape.tables)))),
-                    ("columns", option(s.shape.map(|shape| count(shape.columns)))),
-                    ("state", PlyValue::str(s.state.as_str())),
-                ])
-            })),
-        ),
-    ])
-}
 
 fn configuration_value(configuration: &Configuration) -> PlyValue {
     let snapshot = &configuration.snapshot;

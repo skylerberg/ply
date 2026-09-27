@@ -97,26 +97,6 @@ pub fn build_backend_over(
         })
 }
 
-pub fn describe_schema(
-    hosts: &mut crate::hosts::Hosts,
-    constant: &dyn Fn(&str) -> Result<ply_eval::Value, Diagnostic>,
-) {
-    let Some(name) = hosts.schema_function().map(str::to_string) else {
-        return;
-    };
-    hosts.describe_schema(materialise_schema(&name, constant));
-}
-
-pub fn materialise_schema(
-    name: &str,
-    constant: &dyn Fn(&str) -> Result<ply_eval::Value, Diagnostic>,
-) -> Option<crate::db::schema::Shape> {
-    constant(name)
-        .ok()
-        .as_ref()
-        .and_then(crate::db::schema::shape_of)
-}
-
 /// A pure nullary definition entered on `provider`'s unit: how a schema function is evaluated.
 pub fn enter_constant(
     provider: Option<&'static dyn ply_eval::Provider>,

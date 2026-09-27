@@ -67,7 +67,6 @@ pub struct Binding {
     pub host: bool,
     pub tls: crate::options::TlsOptions,
     pub fs: Vec<ply_host::fs::RootSpec>,
-    pub db: crate::db::DbOptions,
     pub config: crate::config::ConfigOptions,
     pub trace: crate::trace::TraceOptions,
 }
@@ -368,7 +367,7 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
         match asked.recv() {
             Ok(Go::Discharge(wanted)) => {
                 if prepared.is_none() {
-                    prepared = Some(prepare(&job, &loaded, &scoped, &mut store));
+                    prepared = Some(prepare(&job, &loaded, &mut store));
                 }
                 let ready = match prepared.as_ref() {
                     Some(Ok(ready)) => ready,
@@ -398,7 +397,7 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
             }
             Ok(Go::Replay { index, root, case }) => {
                 if prepared.is_none() {
-                    prepared = Some(prepare(&job, &loaded, &scoped, &mut store));
+                    prepared = Some(prepare(&job, &loaded, &mut store));
                 }
                 let answer = match prepared.as_ref() {
                     Some(Ok(ready)) => {
@@ -482,7 +481,6 @@ struct Prepared<'a> {
 fn prepare<'a>(
     job: &Job,
     loaded: &'a Loaded,
-    scoped: &CheckOutput,
     store: &mut Store,
 ) -> Result<Prepared<'a>, Refused> {
     let unbound = |diagnostics: Vec<Diagnostic>| Refused {
@@ -496,29 +494,18 @@ fn prepare<'a>(
     let hosts = match &job.binding {
         None => None,
         Some(binding) => {
-            let db = binding.db.resolve(binding.host).map_err(&unbound)?;
             let (configuration, opened) =
                 Configuration::open(&loaded.check, binding.host, &binding.config, &constant)
                     .map_err(&unbound)?;
             warnings.extend(opened);
-            // A file whose laws are all hermetic binds nothing.
-            let reach = ply_ty::ty::Footprint::from_atoms(
-                scoped
-                    .laws
-                    .iter()
-                    .filter(|law| law.host)
-                    .flat_map(|law| law.footprint.atoms().cloned()),
-            );
             Some(
                 Hosts::open(
                     &loaded.check,
                     binding.host,
                     &binding.tls,
                     &binding.fs,
-                    db,
                     configuration,
                     &binding.trace,
-                    Some(&reach),
                 )
                 .map_err(&unbound)?,
             )
@@ -1260,7 +1247,6 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
                 path: PathBuf::from(field_of(item, "path", span)?.as_str(span, "a path")?),
             });
         }
-        let db = field_of(v, "db", span)?;
         let config = field_of(v, "config", span)?;
         let trace = field_of(v, "trace", span)?;
         Some(Binding {
@@ -1273,16 +1259,6 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
                     .collect(),
             },
             fs,
-            db: crate::db::DbOptions {
-                url: opt_str_at(db, "url", span)?,
-                pool: opt_int_at(db, "pool", span)?.map(|n| n as u32),
-                acquire_ms: opt_int_at(db, "acquire_ms", span)?.map(|n| n as u64),
-                statement_ms: opt_int_at(db, "statement_ms", span)?.map(|n| n as u64),
-                idle_txn_ms: opt_int_at(db, "idle_txn_ms", span)?.map(|n| n as u64),
-                connect_ms: opt_int_at(db, "connect_ms", span)?.map(|n| n as u64),
-                statement_cache: opt_int_at(db, "statement_cache", span)?.map(|n| n as u32),
-                schema: opt_str_at(db, "schema", span)?,
-            },
             config: crate::config::ConfigOptions {
                 set: str_list_at(config, "set", span)?,
                 files: str_list_at(config, "files", span)?
