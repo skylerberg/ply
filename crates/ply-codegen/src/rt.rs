@@ -9,11 +9,12 @@ use crate::heap::{
 use crate::list;
 use crate::map;
 use crate::stack::{Stack, switch};
+use ply_eval::BinOp;
 use ply_eval::arena::Slot;
 use ply_eval::builtins::{cell_in_update, no_such_cell};
 use ply_eval::{Builtin, Closure, ClosureKind, Step, Value, values_equal};
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::{BinOp, EffectAtom, Mode, Resource};
+use ply_ty::{EffectAtom, Mode, Resource};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;

@@ -859,7 +859,7 @@ fn call_with(
 
         // The language's own float spelling, the one a diagnostic prints: shortest round-trip,
         // and `Infinity`/`NaN` rather than the `inf`/`NaN` Rust would write.
-        Builtin::FloatToString => Ok(Step::Done(Value::str(ply_ty::render_float(
+        Builtin::FloatToString => Ok(Step::Done(Value::str(crate::render_float(
             args[0].as_float(span, "`float_to_string`")?,
         )))),
 
