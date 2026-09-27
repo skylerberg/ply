@@ -2,6 +2,7 @@
 // its place relative to the root, and the shipped modules the run binds as the root `shelf`.
 
 import std.fs (fs)
+import std.path (join)
 import compiler.resolve (Source, Diag, Label, diag1)
 import builder (builder)
 import compiler.pkg (Supplied, wants)
@@ -13,7 +14,18 @@ pub type File = { path: String, module: String, text: Bytes }
 
 // A dependency package the walk read: its manifest text and its modules, as files for
 // placing and as sources for the front end.
-pub type DepPackage = { root: String, manifest: Option<Bytes>, files: List<File> }
+pub type DepPackage = {
+  /// The key the front end judges it by: a directory for a path dependency, a git key for one
+  /// fetched, and the same key either way when it is vendored.
+  root: String,
+  /// Where its files are: the path itself, the fetched tree, or the vendored copy.
+  dir: String,
+  manifest: Option<Bytes>,
+  files: List<File>,
+}
+
+// One vendored package: the want it answers, and the directory `ply vendor` put it in.
+pub type Vendored = { want: String, dir: String }
 
 // The program as the front end takes it, with whatever the walk could not turn into a module.
 pub type Project = {
@@ -235,7 +247,7 @@ fn read_dep_modules(
 
 // `abs` is rooted at the filesystem's root and takes paths relative to it, so an absolute key
 // reads as its own spelling without the leading slash.
-fn under_abs(path: String) -> String =
+pub fn under_abs(path: String) -> String =
   if string_starts_with(path, "/") { string_slice(path, 1, string_len(path)) } else { path }
 
 fn read_dep(
@@ -244,13 +256,48 @@ fn read_dep(
 ) -> DepPackage / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]} = {
   let here = string_of_bytes_lossy(root);
   match read_at("abs", under_abs(dir) ++ "/ply.pkg") {
-    None -> { root: here, manifest: None, files: [] },
-    Some(text) -> { root: here, manifest: Some(text), files: read_dep_modules(dir) },
+    None -> { root: here, dir: dir, manifest: None, files: [] },
+    Some(text) -> { root: here, dir: dir, manifest: Some(text), files: read_dep_modules(dir) },
   }
 }
 
+// --- Vendored packages ----------------------------------------------------------
+// `ply vendor` copies a closure into `vendor/`, one directory per package, and writes an index of
+// which want each answers. A walk that finds the index reads those trees and asks nothing else:
+// that is what makes a vendored checkout build anywhere, with no cache and no git.
+
+pub fn index_path(project: String) -> String = join(project, "vendor/index")
+
+/// The index a project holds, or none: a project that was not vendored reads nothing extra.
+pub fn vendored(
+  project: String,
+) -> List<Vendored> / {builder.git[vcs], fs.read_file[cwd], fs.read_file[abs]} =
+  match read_at("abs", under_abs(index_path(project))) { None -> [], Some(text) -> index_of(text) }
+
+// One line per package: `<want>\t<dir>`, in the order `ply vendor` wrote them.
+fn index_of(text: Bytes) -> List<Vendored> =
+  fold(bytes_split(text, b"\n"), [], |acc: List<Vendored>, line: Bytes|
+    match bytes_index_of(line, b"\t") {
+      None -> acc,
+      Some(tab) ->
+        push(acc, {
+          want: string_of_bytes_lossy(bytes_slice(line, 0, tab)),
+          dir: string_of_bytes_lossy(bytes_slice(line, tab + 1, bytes_len(line))),
+        }),
+    })
+
+// The index holds a directory relative to the project, so it survives the project moving; what the
+// walk needs is where that is *here*, which is why the root is an argument.
+fn from_vendor(project: String, items: List<Vendored>, want: Bytes) -> Option<String> =
+  fold(items, None, |found: Option<String>, v: Vendored|
+    match found {
+      Some(_) -> found,
+      None -> if bytes_of_string(v.want) == want { Some(join(project, v.dir)) } else { None },
+    })
+
 fn walk_round(
   root: String,
+  vendored: List<Vendored>,
   known: List<Bytes>,
   manifests: List<Supplied>,
   supplied: List<DepPackage>,
@@ -262,7 +309,7 @@ fn walk_round(
         wanted,
         { known: known, manifests: manifests, supplied: supplied },
         |acc: { known: List<Bytes>, manifests: List<Supplied>, supplied: List<DepPackage> }, want: Bytes| {
-          match tree_of(root, want) {
+          match tree_of(root, vendored, want) {
             // A fetch that failed contributes no package: the walk has asked, and the front end's
             // judgment says the dependency was not fetched, naming the key it wanted.
             None -> { ..acc, known: push(acc.known, want) },
@@ -281,7 +328,7 @@ fn walk_round(
           }
         },
       );
-      walk_round(root, next.known, next.manifests, next.supplied)
+      walk_round(root, vendored, next.known, next.manifests, next.supplied)
     },
   }
 
@@ -292,6 +339,7 @@ fn walk_packages(
   let root_key = bytes_of_string(root);
   walk_round(
     root,
+    vendored(root),
     [root_key],
     [
       {
@@ -307,7 +355,19 @@ fn walk_packages(
 // Where a want's files are: a path is its own directory, and a git key names a tree the project's
 // cache holds, fetched when it is not there yet. The key is what the package is *named* by, so a
 // fetch that moves a tree changes nothing the front end sees.
-fn tree_of(project: String, want: Bytes) -> Option<String> / {builder.git[vcs]} =
+pub fn tree_of(
+  project: String,
+  vendored: List<Vendored>,
+  want: Bytes,
+) -> Option<String> / {builder.git[vcs]} =
+
+  // A vendored copy answers the want whether it is a path or a git key: that is what it is for.
+  match from_vendor(project, vendored, want) {
+    Some(dir) -> Some(dir),
+    None -> fetched(project, want),
+  }
+
+fn fetched(project: String, want: Bytes) -> Option<String> / {builder.git[vcs]} =
   if bytes_starts_with(want, b"git+") {
     // A fetch that failed has nothing to read: the front end then reports the dependency as one
     // that was not fetched, which is what a reader can act on (`ply check` names the key).
