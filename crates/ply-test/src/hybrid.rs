@@ -1,6 +1,6 @@
 //! Building and running one mixed definition graph.
 
-use crate::bisect::{DefKey, Delta, Hybrid, Trial, Unresolved};
+use crate::bisect::{DefKey, Trial, Unresolved};
 use crate::key::result_key;
 use crate::schedule::is_seeded;
 use crate::sim::seed_run;
@@ -53,7 +53,16 @@ impl Mixture {
         self.after.insert(key, hash);
     }
 
-    fn keys(&self) -> BTreeSet<&DefKey> {
+    /// Every definition the mixture holds a version of, either era: what a trial may flip.
+    pub fn keys(&self) -> BTreeSet<DefKey> {
+        self.before
+            .keys()
+            .chain(self.after.keys())
+            .cloned()
+            .collect()
+    }
+
+    fn key_refs(&self) -> BTreeSet<&DefKey> {
         self.before.keys().chain(self.after.keys()).collect()
     }
 
@@ -155,7 +164,7 @@ impl<'a> BodyHybrid<'a> {
     fn choose(&self, flipped: &BTreeSet<DefKey>) -> Result<Chosen, Unresolved> {
         let mut hashes = Vec::new();
         let mut relink: BTreeMap<DefHash, DefHash> = BTreeMap::new();
-        for key in self.mixture.keys() {
+        for key in self.mixture.key_refs() {
             let picked = if flipped.contains(key) {
                 self.mixture.after.get(key)
             } else {
@@ -182,13 +191,6 @@ impl<'a> BodyHybrid<'a> {
 struct Chosen {
     hashes: Vec<DefHash>,
     relink: BTreeMap<DefHash, DefHash>,
-}
-
-impl Hybrid for BodyHybrid<'_> {
-    fn trial(&mut self, delta: &Delta, flipped: &[usize]) -> Trial {
-        let wanted: BTreeSet<DefKey> = delta.flipped_keys(flipped).into_iter().collect();
-        self.trial_over(wanted)
-    }
 }
 
 impl BodyHybrid<'_> {

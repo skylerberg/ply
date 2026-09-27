@@ -3,8 +3,7 @@ use ply_span::{SourceId, Symbol};
 use ply_store::body::{BodySet, of_front};
 use ply_store::{CachedDef, Outcome, PassRecord, Store};
 use ply_test::bisect::{
-    Baseline, Budget, Confidence, DepEdges, Regression, Rehashed, Skipped, StoreClassify, Verdict,
-    bisect, diff,
+    Baseline, Delta, DepEdges, Regression, Rehashed, Skipped, StoreClassify, TrialOutcome, diff,
 };
 use ply_test::{BodyHybrid, Signature, hybrid};
 use ply_ty::{CheckOutput, HashOutput, ModuleName};
@@ -135,8 +134,16 @@ fn passed(before: &Compiled, key: &str) -> (TempRoot, Store) {
     (root, store)
 }
 
-/// Everything a failing `ply test` does for one failure, with the real hybrid builder in the loop.
-fn narrow(before: &Compiled, after: &Compiled, key: &str) -> ply_test::Bisection {
+/// Everything a failing `ply test` does for one failure, up to the hybrid a program's own search
+/// would ask: the real change set, the real mixture, and a builder that runs a mixture of them.
+///
+/// Choosing which definitions to flip is the program's, so the questions are asked here by name.
+fn asked<R>(
+    before: &Compiled,
+    after: &Compiled,
+    key: &str,
+    ask: impl FnOnce(&mut BodyHybrid<'_>, &Delta, &Store) -> R,
+) -> R {
     let (_root, store) = passed(before, key);
     let baseline = before.baseline(key);
     let rehashed = Rehashed::under(
@@ -178,7 +185,19 @@ fn narrow(before: &Compiled, after: &Compiled, key: &str) -> ply_test::Bisection
         test_body,
         Signature::of(&after.failure(key.as_str())),
     );
-    bisect(&diff.delta, &mut builder, Budget::DEFAULT)
+    ask(&mut builder, &diff.delta, &store)
+}
+
+/// The definitions a trial flips: the programs here are all value definitions.
+fn keys(names: &[&str]) -> std::collections::BTreeSet<ply_test::bisect::DefKey> {
+    names
+        .iter()
+        .map(|n| ply_test::bisect::DefKey::value(sym(n)))
+        .collect()
+}
+
+fn flips(builder: &mut BodyHybrid<'_>, names: &[&str]) -> ply_test::bisect::TrialOutcome {
+    builder.trial_over(keys(names)).outcome
 }
 
 const LEDGER: &str = r#"
@@ -190,7 +209,7 @@ test "balances" { assert_eq(presented(1, 2, 3), 6) }
 "#;
 
 #[test]
-fn two_independent_edits_are_narrowed_to_the_one_that_broke_it() {
+fn flipping_the_definition_that_broke_it_reproduces_the_failure_and_the_other_flip_does_not() {
     let before = Compiled::new(LEDGER);
     let after = Compiled::new(
         &LEDGER
@@ -201,11 +220,28 @@ fn two_independent_edits_are_narrowed_to_the_one_that_broke_it() {
             .replace("(a + b) + c", "a + (b + c)"),
     );
 
-    let out = narrow(&before, &after, "m.balances");
-    assert_eq!(out.verdict, Verdict::Bisected);
-    assert_eq!(out.confidence, Confidence::Minimal);
-    assert_eq!(out.culprits(), vec![sym("m.normal_sign")]);
-    assert!(out.search.evaluated > 0, "{:?}", out.search);
+    let outcomes = asked(&before, &after, "m.balances", |builder, _delta, _store| {
+        [
+            flips(builder, &[]),
+            flips(builder, &["m.normal_sign"]),
+            flips(builder, &["m.presented"]),
+            flips(builder, &["m.normal_sign", "m.presented"]),
+        ]
+    });
+    assert_eq!(
+        outcomes,
+        [
+            // The baseline passed, so the whole set must fail: only then is anything in it a cause.
+            TrialOutcome::Passes,
+            // The culprit alone, with its caller at the baseline the test last passed at.
+            TrialOutcome::Fails,
+            // The innocent edit alone changes nothing the test can see.
+            TrialOutcome::Passes,
+            // And every change at once is the program as it is now.
+            TrialOutcome::Fails,
+        ],
+        "a trial's four answers are what a search reads"
+    );
 }
 
 #[test]
@@ -216,9 +252,14 @@ fn flipping_a_leaf_reaches_the_callers_kept_at_their_baseline() {
         "if n < 0 { 0 - 1 } else { 0 - 1 }",
     ));
 
-    let out = narrow(&before, &after, "m.balances");
-    assert_eq!(out.verdict, Verdict::Sole);
-    assert_eq!(out.culprits(), vec![sym("m.normal_sign")]);
+    let outcome = asked(&before, &after, "m.balances", |builder, _delta, _store| {
+        flips(builder, &["m.normal_sign"])
+    });
+    assert_eq!(
+        outcome,
+        TrialOutcome::Fails,
+        "flipping a leaf reaches the callers kept at their baseline"
+    );
 }
 
 const FIVE: &str = r#"
@@ -233,7 +274,7 @@ test "sums" { assert_eq(all(0), 15) }
 "#;
 
 #[test]
-fn one_culprit_among_five_edits_is_named_within_the_logarithmic_budget() {
+fn only_the_culprit_among_five_edits_makes_the_test_fail() {
     let before = Compiled::new(FIVE);
     let after = Compiled::new(
         &FIVE
@@ -244,10 +285,24 @@ fn one_culprit_among_five_edits_is_named_within_the_logarithmic_budget() {
             .replace("fn e(n: Int) -> Int = n + 5", "fn e(n: Int) -> Int = 5 + n"),
     );
 
-    let out = narrow(&before, &after, "m.sums");
-    assert_eq!(out.culprits(), vec![sym("m.c")]);
-    assert_eq!(out.confidence, Confidence::Minimal);
-    assert!(out.search.evaluated <= 12, "{:?}", out.search);
+    let outcomes = asked(&before, &after, "m.sums", |builder, _delta, _store| {
+        [
+            flips(builder, &["m.a"]),
+            flips(builder, &["m.a", "m.b", "m.d", "m.e"]),
+            flips(builder, &["m.c"]),
+            flips(builder, &["m.a", "m.c"]),
+        ]
+    });
+    assert_eq!(
+        outcomes,
+        [
+            TrialOutcome::Passes,
+            TrialOutcome::Passes,
+            TrialOutcome::Fails,
+            TrialOutcome::Fails,
+        ],
+        "the culprit is decisive with or without the edits that only moved"
+    );
 }
 
 const RECURSION: &str = r#"
@@ -260,7 +315,7 @@ test "terminates" { assert_eq(total(3), 0) }
 "#;
 
 #[test]
-fn a_regression_that_introduces_runaway_recursion_is_bisected_to_its_culprit() {
+fn a_regression_that_introduces_runaway_recursion_fails_alone() {
     let before = Compiled::new(RECURSION);
     let after = Compiled::new(
         &RECURSION
@@ -279,18 +334,21 @@ fn a_regression_that_introduces_runaway_recursion_is_bisected_to_its_culprit() {
         diagnostic.message
     );
 
-    let out = narrow(&before, &after, "m.terminates");
-    assert_eq!(out.verdict, Verdict::Bisected);
-    assert_eq!(out.culprits(), vec![sym("m.step")]);
-    assert!(
-        out.search.evaluated > 0,
-        "the culprit was named without running a mixture: {:?}",
-        out.search
+    let outcomes = asked(
+        &before,
+        &after,
+        "m.terminates",
+        |builder, _delta, _store| [flips(builder, &["m.step"]), flips(builder, &["m.guard"])],
+    );
+    assert_eq!(
+        outcomes,
+        [TrialOutcome::Fails, TrialOutcome::Passes],
+        "a mixture that runs away is the failure, and the guard beside it is not"
     );
 }
 
 #[test]
-fn two_edits_that_only_fail_together_are_both_named() {
+fn two_edits_that_only_fail_together_fail_only_together() {
     let src = r#"
 fn flag() -> Bool = true
 fn left() -> Int = 3 + 4
@@ -305,13 +363,26 @@ test "pick" { assert_eq(pick(), 7) }
             .replace("fn right() -> Int = 7", "fn right() -> Int = 8"),
     );
 
-    let out = narrow(&before, &after, "m.pick");
-    assert_eq!(out.verdict, Verdict::Bisected);
-    assert_eq!(out.culprits(), vec![sym("m.flag"), sym("m.right")]);
+    let outcomes = asked(&before, &after, "m.pick", |builder, _delta, _store| {
+        [
+            flips(builder, &["m.flag"]),
+            flips(builder, &["m.right"]),
+            flips(builder, &["m.flag", "m.right"]),
+        ]
+    });
+    assert_eq!(
+        outcomes,
+        [
+            TrialOutcome::Passes,
+            TrialOutcome::Passes,
+            TrialOutcome::Fails,
+        ],
+        "neither edit alone is a cause, which is why a search may not assume one is"
+    );
 }
 
 #[test]
-fn an_edited_test_beside_an_edited_definition_names_the_test() {
+fn an_edited_test_beside_an_edited_definition_fails_with_the_baseline_definitions() {
     let src = r#"
 fn scale(n: Int) -> Int = n * 2
 fn other(n: Int) -> Int = n + 1
@@ -324,39 +395,58 @@ test "doubles" { assert_eq(scale(2) + other(0), 5) }
         "fn other(n: Int) -> Int = 1 + n",
     ));
 
-    let out = narrow(&before, &after, "m.doubles");
-    assert_eq!(out.verdict, Verdict::TestChanged);
-    assert_eq!(out.culprits(), vec![sym("m.doubles")]);
+    let (outcomes, names_the_test) =
+        asked(&before, &after, "m.doubles", |builder, delta, _store| {
+            (
+                [
+                    // Every definition at the baseline it passed at. What still fails is the
+                    // test's own text, which every mixture carries: no trial can clear it.
+                    flips(builder, &[]),
+                    flips(builder, &["m.other"]),
+                ],
+                // So the change set is what says the test is the cause, not a mixture.
+                delta.test.is_some(),
+            )
+        });
+    assert_eq!(outcomes, [TrialOutcome::Fails, TrialOutcome::Fails]);
     assert!(
-        !out.culprits().contains(&sym("m.other")),
-        "the definition that moved beside it is innocent"
+        names_the_test,
+        "the test's own edit is the failure, and the definition that moved beside it is innocent"
     );
 }
 
 #[test]
-fn a_bisection_records_no_definition_as_seen() {
+fn a_trial_records_no_definition_as_seen() {
     let before = Compiled::new(LEDGER);
     let after = Compiled::new(&LEDGER.replace(
         "if n < 0 { 0 - 1 } else { 1 }",
         "if n < 0 { 0 - 1 } else { 0 - 1 }",
     ));
 
-    let (_root, store) = passed(&before, "m.balances");
-    let seen_before = store.definitions_len();
-    let out = narrow(&before, &after, "m.balances");
-    assert!(out.is_conclusive());
-    assert_eq!(store.definitions_len(), seen_before);
-    for hash in after.hashes.defs.values() {
-        assert!(
-            !store.knows_definition(*hash),
-            "a hybrid vouched for a definition it never proved"
-        );
-    }
+    let (outcome, known) = asked(&before, &after, "m.balances", |builder, _delta, store| {
+        let outcome = flips(builder, &["m.normal_sign"]);
+        // What a mixture proved is the mixture's; a definition it merely *ran* is not a fact
+        // about the program, and nothing may be recorded as though it were.
+        let known: Vec<bool> = after
+            .hashes
+            .defs
+            .values()
+            .map(|h| store.knows_definition(*h))
+            .collect();
+        (outcome, known)
+    });
+    assert_eq!(outcome, TrialOutcome::Fails);
+    assert!(
+        known.iter().all(|k| !k),
+        "a hybrid vouched for a definition it never proved"
+    );
 }
 
-/// `H(all)` *is* the current program, so caching its green replay would pass a red test.
+/// A green mixture is a program whose definitions all pass at once, so what it proved may be
+/// cached — under the *mixture's* own hash. The failing test's hash is a different test's, and
+/// caching a pass for it would turn a red test green.
 #[test]
-fn a_replay_that_goes_green_never_caches_a_pass_for_the_failing_test() {
+fn a_green_mixture_proves_its_own_hash_and_never_the_failing_tests() {
     let src = r#"
 fn scale(n: Int) -> Int = n * 2
 fn other(n: Int) -> Int = n + 1
@@ -364,49 +454,33 @@ fn other(n: Int) -> Int = n + 1
 test "doubles" { assert_eq(scale(2) + other(0), 5) }
 "#;
     let before = Compiled::new(src);
-    let after = Compiled::new(&src.replace(
-        "fn other(n: Int) -> Int = n + 1",
-        "fn other(n: Int) -> Int = n + 3",
-    ));
-
-    let index = after.test_index("m.doubles");
-    let mut report = ply_test::RunReport {
-        passed: 0,
-        failed: 1,
-        abandoned: 0,
-        cached: 0,
-        failures: vec![ply_test::Failure {
-            name: "doubles".to_string(),
-            key: sym("m.doubles"),
-            diagnostic: after.failure("m.doubles"),
-            defect: false,
-            host: false,
-            suspects: vec![sym("m.other")],
-            assertion: None,
-            attribution: Default::default(),
-            seed: None,
-            race: None,
-        }],
-        duration: std::time::Duration::ZERO,
-        parallelism: Default::default(),
-        results: Vec::new(),
-        warnings: Vec::new(),
-        simulation: Default::default(),
-    };
-    let (_root, mut store) = passed(&before, "m.doubles");
-    ply_test::diagnose_failures(
-        &mut report,
-        &after.sources(),
-        &after.port,
-        &mut store,
-        &ply_test::Options::default(),
-        true,
+    // The test's text moves too — a space — so the mixture's own test hash is one no record holds.
+    let after = Compiled::new(
+        &src.replace(
+            "fn other(n: Int) -> Int = n + 1",
+            "fn other(n: Int) -> Int = n + 3",
+        )
+        .replace(
+            "test \"doubles\" { assert_eq",
+            "test \"doubles\" {  assert_eq",
+        ),
     );
 
-    let now = after.hashes.tests[index];
+    let index = after.test_index("m.doubles");
+    let failing = after.hashes.tests[index];
+    let (outcome, proved) = asked(&before, &after, "m.doubles", |builder, _delta, _store| {
+        // Every definition at the baseline it passed at, and the *test* as it is now: a program
+        // no record covers, because that text is new. It has to be run for its hash to be known.
+        let outcome = flips(builder, &[]);
+        (outcome, builder.take_proved())
+    });
+
+    assert_eq!(outcome, TrialOutcome::Passes);
+    // A proof is recorded only for a run that was actually made: a mixture whose hash a record
+    // already covers proves nothing new, and this one may well have been covered.
     assert!(
-        !matches!(store.get(now), Some(Outcome::Pass)),
-        "the failing test's own hash was cached green"
+        !proved.contains(&failing),
+        "the failing test's own hash was offered as a proof"
     );
 }
 
@@ -428,16 +502,4 @@ fn a_pruned_body_store_is_reported_rather_than_guessed_around() {
         "no_bodies",
         "the artifact has to name the fixable cause"
     );
-}
-
-#[test]
-fn two_bisections_of_one_failure_agree() {
-    let before = Compiled::new(FIVE);
-    let after =
-        Compiled::new(&FIVE.replace("fn c(n: Int) -> Int = n + 3", "fn c(n: Int) -> Int = n + 9"));
-    let run = || {
-        let out = narrow(&before, &after, "m.sums");
-        (out.groups, out.search, out.reason)
-    };
-    assert_eq!(run(), run());
 }

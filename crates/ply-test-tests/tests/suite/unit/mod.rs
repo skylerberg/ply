@@ -1,5 +1,4 @@
 mod bisect;
-mod diagnose;
 mod key;
 mod region;
 mod runner;

@@ -589,188 +589,6 @@ pub fn diff(regression: &Regression<'_>, classify: &mut dyn Classify, edges: &De
     }
 }
 
-/// `--bisect`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum Mode {
-    #[default]
-    Auto,
-    /// Ignore the budget, nothing else: waiving a precondition would invent evidence.
-    Always,
-    Never,
-}
-
-impl Mode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Mode::Auto => "auto",
-            Mode::Always => "always",
-            Mode::Never => "never",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Mode> {
-        match s {
-            "auto" => Some(Mode::Auto),
-            "always" => Some(Mode::Always),
-            "never" => Some(Mode::Never),
-            _ => None,
-        }
-    }
-
-    pub fn budget(self, requested: Budget) -> Budget {
-        match self {
-            Mode::Always => Budget::UNLIMITED,
-            _ => requested,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Gate<'a> {
-    pub mode: Mode,
-    pub defect: bool,
-    pub host: bool,
-    pub nondet: bool,
-    pub baseline: Option<&'a Baseline>,
-}
-
-impl<'a> Gate<'a> {
-    /// The hermetic gate: everything a caller with no host binding needs.
-    pub fn new(mode: Mode, defect: bool, nondet: bool, baseline: Option<&'a Baseline>) -> Gate<'a> {
-        Gate {
-            mode,
-            defect,
-            host: false,
-            nondet,
-            baseline,
-        }
-    }
-
-    pub fn hosted(mut self, host: bool) -> Gate<'a> {
-        self.host = host;
-        self
-    }
-}
-
-/// Checked in order of what each answer is worth to a consumer.
-pub fn precheck(gate: Gate<'_>) -> Result<(), Skipped> {
-    if gate.mode == Mode::Never {
-        return Err(Skipped::NotRequested);
-    }
-    if gate.defect {
-        return Err(Skipped::Panicked);
-    }
-    if gate.host {
-        return Err(Skipped::Host);
-    }
-    if gate.nondet {
-        return Err(Skipped::Nondet);
-    }
-    if gate.baseline.is_none() {
-        return Err(Skipped::NeverPassed);
-    }
-    Ok(())
-}
-
-pub struct NoHybrid;
-
-impl Hybrid for NoHybrid {
-    fn trial(&mut self, _: &Delta, _: &[usize]) -> Trial {
-        Trial::unresolved(Unresolved::MissingBody)
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Unresolved {
-    /// Old and new disagree about a signature, so this mixture is ill-typed.
-    DoesNotCheck,
-    /// It failed, but not with the failure being explained.
-    DifferentFailure,
-    MissingBody,
-    BudgetSpent,
-}
-
-impl Unresolved {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Unresolved::DoesNotCheck => "does not typecheck",
-            Unresolved::DifferentFailure => "a different failure",
-            Unresolved::MissingBody => "a body is missing from the store",
-            Unresolved::BudgetSpent => "budget spent",
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TrialOutcome {
-    /// Reproduced the failure being explained, and no other.
-    Fails,
-    Passes,
-    Unresolved(Unresolved),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Trial {
-    pub outcome: TrialOutcome,
-    /// Answered from the result cache rather than by evaluating anything.
-    pub cached: bool,
-}
-
-impl Trial {
-    pub fn fails() -> Trial {
-        Trial {
-            outcome: TrialOutcome::Fails,
-            cached: false,
-        }
-    }
-    pub fn passes() -> Trial {
-        Trial {
-            outcome: TrialOutcome::Passes,
-            cached: false,
-        }
-    }
-    pub fn unresolved(why: Unresolved) -> Trial {
-        Trial {
-            outcome: TrialOutcome::Unresolved(why),
-            cached: false,
-        }
-    }
-    pub fn from_cache(mut self) -> Trial {
-        self.cached = true;
-        self
-    }
-}
-
-pub trait Hybrid {
-    fn trial(&mut self, delta: &Delta, flipped: &[usize]) -> Trial;
-}
-
-/// A cap in hybrid *evaluations*, not seconds, so the artifact does not vary with machine load.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Budget {
-    pub max_trials: usize,
-}
-
-impl Budget {
-    /// Enough for a clean bisection over ~2^30 candidates, small enough not to outlast the run.
-    pub const DEFAULT: Budget = Budget { max_trials: 64 };
-
-    pub fn new(max_trials: usize) -> Budget {
-        Budget { max_trials }
-    }
-
-    /// `--bisect=always` still needs a ceiling; this is one nothing realistic reaches.
-    pub const UNLIMITED: Budget = Budget {
-        max_trials: usize::MAX,
-    };
-}
-
-impl Default for Budget {
-    fn default() -> Budget {
-        Budget::DEFAULT
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct SearchStats {
     pub candidates: usize,
@@ -895,6 +713,67 @@ impl Verdict {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unresolved {
+    /// Old and new disagree about a signature, so this mixture is ill-typed.
+    DoesNotCheck,
+    /// It failed, but not with the failure being explained.
+    DifferentFailure,
+    MissingBody,
+    BudgetSpent,
+}
+
+impl Unresolved {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Unresolved::DoesNotCheck => "does not typecheck",
+            Unresolved::DifferentFailure => "a different failure",
+            Unresolved::MissingBody => "a body is missing from the store",
+            Unresolved::BudgetSpent => "budget spent",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TrialOutcome {
+    /// Reproduced the failure being explained, and no other.
+    Fails,
+    Passes,
+    Unresolved(Unresolved),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Trial {
+    pub outcome: TrialOutcome,
+    /// Answered from the result cache rather than by evaluating anything.
+    pub cached: bool,
+}
+
+impl Trial {
+    pub fn fails() -> Trial {
+        Trial {
+            outcome: TrialOutcome::Fails,
+            cached: false,
+        }
+    }
+    pub fn passes() -> Trial {
+        Trial {
+            outcome: TrialOutcome::Passes,
+            cached: false,
+        }
+    }
+    pub fn unresolved(why: Unresolved) -> Trial {
+        Trial {
+            outcome: TrialOutcome::Unresolved(why),
+            cached: false,
+        }
+    }
+    pub fn from_cache(mut self) -> Trial {
+        self.cached = true;
+        self
+    }
+}
+
 /// How much the culprit set may be trusted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Confidence {
@@ -954,282 +833,5 @@ impl Bisection {
 impl Default for Bisection {
     fn default() -> Bisection {
         Bisection::not_attempted(Skipped::NotRequested)
-    }
-}
-
-/// Finds the smallest set of changes that reproduces the failure.
-pub fn bisect(delta: &Delta, hybrid: &mut dyn Hybrid, budget: Budget) -> Bisection {
-    let mut search = Search {
-        delta,
-        hybrid,
-        budget,
-        stats: SearchStats {
-            candidates: delta.candidates(),
-            clusters: delta.clusters.len(),
-            ..SearchStats::default()
-        },
-        memo: BTreeMap::new(),
-    };
-    search.run()
-}
-
-struct Search<'a> {
-    delta: &'a Delta,
-    hybrid: &'a mut dyn Hybrid,
-    budget: Budget,
-    stats: SearchStats,
-    memo: BTreeMap<Vec<usize>, TrialOutcome>,
-}
-
-impl Search<'_> {
-    fn run(&mut self) -> Bisection {
-        let n = self.delta.clusters.len();
-        if n == 0 {
-            return match &self.delta.test {
-                Some(test) => self.test_changed(test.name.clone()),
-                None => Bisection::not_attempted(Skipped::NoChanges),
-            };
-        }
-        if n == 1 {
-            // One cluster is free unless the test was edited too; then `H(∅)` tells the two apart.
-            let sole = self.delta.test.is_none() || self.ask(&[]) != TrialOutcome::Fails;
-            let cluster = &self.delta.clusters[0];
-            if sole {
-                return self.conclude(
-                    Verdict::Sole,
-                    vec![cluster.members.clone()],
-                    format!(
-                        "only one change could be flipped: {}",
-                        join(&cluster.members)
-                    ),
-                );
-            }
-            let name = self.delta.test.as_ref().map(|t| t.name.clone());
-            return match name {
-                Some(name) => self.test_changed(name),
-                None => Bisection::not_attempted(Skipped::NoChanges),
-            };
-        }
-
-        let all: Vec<usize> = (0..n).collect();
-        match self.ask(&all) {
-            TrialOutcome::Fails => {}
-            TrialOutcome::Passes => {
-                return self.conclude(
-                    Verdict::NotReproduced,
-                    Vec::new(),
-                    "replaying the current program did not reproduce the failure; \
-                     re-run the test before acting on it"
-                        .to_string(),
-                );
-            }
-            TrialOutcome::Unresolved(why) => {
-                return self.conclude(
-                    Verdict::Inconclusive,
-                    Vec::new(),
-                    format!(
-                        "the current program could not be replayed: {}",
-                        why.as_str()
-                    ),
-                );
-            }
-        }
-
-        if self.ask(&[]) == TrialOutcome::Fails {
-            return match &self.delta.test {
-                Some(test) => {
-                    let name = test.name.clone();
-                    self.test_changed(name)
-                }
-                None => self.conclude(
-                    Verdict::NotInTheGraph,
-                    Vec::new(),
-                    "the failure reproduces against the definitions as they were when this test \
-                     last passed, and the test itself did not change — nothing in the definition \
-                     graph explains it. Look for a `nondet` effect, something outside the program, \
-                     or a defect in Ply"
-                        .to_string(),
-                ),
-            };
-        }
-
-        let minimal = self.ddmin(all);
-        let groups: Vec<Vec<Symbol>> = minimal
-            .iter()
-            .map(|&i| self.delta.clusters[i].members.clone())
-            .collect();
-
-        // Narrowing nothing around unanswerable mixtures is not a bisection.
-        if minimal.len() == n && self.stats.unresolved > 0 {
-            return self.conclude(
-                Verdict::Inconclusive,
-                groups,
-                format!(
-                    "no mixture of the {n} changes could be evaluated: {} of them did not \
-                     typecheck or could not be built, so every change is still a candidate",
-                    self.stats.unresolved
-                ),
-            );
-        }
-
-        let reason = format!(
-            "narrowed {} changed {} to {} in {} {} ({} answered from the cache)",
-            self.stats.candidates,
-            plural(self.stats.candidates, "definition"),
-            join(&groups.concat()),
-            self.stats.evaluated,
-            plural(self.stats.evaluated, "run"),
-            self.stats.cached,
-        );
-        self.conclude(Verdict::Bisected, groups, reason)
-    }
-
-    /// The constraint that fused a multi-member group, so it is not read as a failed search.
-    fn fused_because(&self) -> Option<&'static str> {
-        let mut reasons: Vec<FusionReason> = self
-            .delta
-            .clusters
-            .iter()
-            .filter(|c| !c.is_singleton())
-            .map(|c| c.reason)
-            .collect();
-        reasons.sort_by_key(|r| r.as_str());
-        reasons.dedup();
-        match reasons.as_slice() {
-            [only] => Some(only.describe()),
-            _ => None,
-        }
-    }
-
-    fn test_changed(&self, name: Symbol) -> Bisection {
-        self.conclude(
-            Verdict::TestChanged,
-            vec![vec![name.clone()]],
-            format!(
-                "the failure does not turn on any definition that changed, and `{name}` was \
-                 itself edited — the edit to the test is what to look at"
-            ),
-        )
-    }
-
-    /// Zeller's ddmin over cluster indices, three-valued so an unresolved mixture is not evidence.
-    fn ddmin(&mut self, mut set: Vec<usize>) -> Vec<usize> {
-        let mut parts = 2usize;
-        'outer: while set.len() > 1 && !self.stats.exhausted {
-            let chunks = split(&set, parts.min(set.len()));
-
-            for chunk in &chunks {
-                if self.ask(chunk) == TrialOutcome::Fails {
-                    set = chunk.clone();
-                    parts = 2;
-                    continue 'outer;
-                }
-                if self.stats.exhausted {
-                    break 'outer;
-                }
-            }
-
-            for chunk in &chunks {
-                let rest: Vec<usize> = set.iter().copied().filter(|i| !chunk.contains(i)).collect();
-                if rest.is_empty() {
-                    continue;
-                }
-                if self.ask(&rest) == TrialOutcome::Fails {
-                    set = rest;
-                    parts = parts.saturating_sub(1).max(2);
-                    continue 'outer;
-                }
-                if self.stats.exhausted {
-                    break 'outer;
-                }
-            }
-
-            if parts >= set.len() {
-                break;
-            }
-            parts = (parts * 2).min(set.len());
-        }
-        set
-    }
-
-    fn ask(&mut self, set: &[usize]) -> TrialOutcome {
-        let mut key = set.to_vec();
-        key.sort_unstable();
-        key.dedup();
-        if let Some(outcome) = self.memo.get(&key) {
-            self.stats.memoized += 1;
-            return *outcome;
-        }
-        if self.stats.evaluated >= self.budget.max_trials {
-            self.stats.exhausted = true;
-            return TrialOutcome::Unresolved(Unresolved::BudgetSpent);
-        }
-
-        let trial = self.hybrid.trial(self.delta, &key);
-        if trial.cached {
-            self.stats.cached += 1;
-        } else {
-            self.stats.evaluated += 1;
-        }
-        if matches!(trial.outcome, TrialOutcome::Unresolved(_)) {
-            self.stats.unresolved += 1;
-        }
-        self.memo.insert(key, trial.outcome);
-        trial.outcome
-    }
-
-    fn conclude(&self, verdict: Verdict, groups: Vec<Vec<Symbol>>, reason: String) -> Bisection {
-        // Any unresolved trial disqualifies minimality: the search walked around a question.
-        let confidence = if groups.is_empty() {
-            Confidence::None
-        } else if self.stats.exhausted || self.stats.unresolved > 0 || self.delta.unclassified > 0 {
-            Confidence::Partial
-        } else if groups.iter().all(|g| g.len() == 1) {
-            Confidence::Minimal
-        } else {
-            Confidence::Fused
-        };
-        let reason = match self.fused_because() {
-            Some(why) => format!("{reason}; {why}"),
-            None => reason,
-        };
-        Bisection {
-            verdict,
-            confidence,
-            groups,
-            reason,
-            search: self.stats,
-        }
-    }
-}
-
-/// Near-equal chunks in index order, so the trial sequence is reproducible.
-fn split(set: &[usize], parts: usize) -> Vec<Vec<usize>> {
-    let parts = parts.clamp(1, set.len().max(1));
-    let mut chunks = Vec::with_capacity(parts);
-    let mut start = 0usize;
-    for p in 0..parts {
-        let end = set.len() * (p + 1) / parts;
-        if end > start {
-            chunks.push(set[start..end].to_vec());
-            start = end;
-        }
-    }
-    chunks
-}
-
-fn join(names: &[Symbol]) -> String {
-    names
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn plural(n: usize, word: &str) -> String {
-    if n == 1 {
-        word.to_string()
-    } else {
-        format!("{word}s")
     }
 }

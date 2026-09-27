@@ -1,7 +1,6 @@
 //! Selection, scheduling, and running: a test re-runs iff its hash is absent from the cache.
 
 pub mod bisect;
-pub mod diagnose;
 pub mod hybrid;
 pub mod key;
 pub mod obligation;
@@ -29,11 +28,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub use bisect::{
-    Baseline, Bisection, Budget, Change, ChangeKind, Classify, Cluster, Confidence, DefKey, Delta,
-    DepEdges, Diff, FusionReason, Gate, Hybrid, Mode, Ns, Regression, Rehashed, SearchStats,
-    Skipped, StoreClassify, Trial, TrialOutcome, Unresolved, Verdict, bisect, diff, precheck,
+    Baseline, Bisection, Change, ChangeKind, Classify, Cluster, Confidence, DefKey, Delta,
+    DepEdges, Diff, FusionReason, Ns, Regression, Rehashed, SearchStats, Skipped, StoreClassify,
+    Trial, TrialOutcome, Unresolved, Verdict, diff,
 };
-pub use diagnose::{Evidence, Options, diagnose};
 pub use hybrid::{BodyHybrid, Mixture, Signature};
 pub use key::{result_key, seed_key, sim_key, writes_seed_keys};
 pub use region::GroupRegion;
@@ -945,15 +943,17 @@ pub struct HybridInput {
     pub absent: crate::bisect::Skipped,
 }
 
-/// `bisect` false leaves the search to the caller: the delta and the gate are still computed, and
-/// what a mixture would need is handed back in [`Hybrids`] instead of being run here.
+/// How each failure's change set is described, and what the program that reads it needs to search.
+///
+/// The search is the program's: a `ply test` report is read by the entry that declares the effect,
+/// and only it knows which of its own definitions a mixture should try. This side computes what
+/// changed, what a mixture would need, and the reason to give when there is nothing to try, and
+/// hands every failure's answer back in [`Hybrids`].
 pub fn diagnose_failures(
     report: &mut RunReport,
     sources: &[(String, String)],
     front: &ply_ty::Front,
     store: &mut Store,
-    options: &Options,
-    bisect: bool,
 ) -> Hybrids {
     let check = &front.check;
     let hashes = &front.hashes;
@@ -969,9 +969,6 @@ pub fn diagnose_failures(
 
     let fresh = ply_store::body::of_front(front);
 
-    // A green hybrid may be cached, but only after the search's borrow on the store ends.
-    let mut proved: Vec<DefHash> = Vec::new();
-
     for failure in &mut report.failures {
         let baseline = store.pass_record(&failure.key).map(|record| {
             Baseline::with_decls(
@@ -980,30 +977,12 @@ pub fn diagnose_failures(
                 record.decls.clone(),
             )
         });
-        let nondet = check
-            .tests
-            .iter()
-            .find(|t| t.key == failure.key)
-            .is_some_and(|t| t.nondet);
-
         let test_hash = hashes
             .tests
             .iter()
             .zip(check.tests.iter())
             .find(|(_, t)| t.key == failure.key)
             .map(|(hash, _)| *hash);
-
-        let evidence = Evidence {
-            key: &failure.key,
-            test_hash,
-            nondet,
-            defect: failure.defect,
-            host: failure.host,
-            suspects: &failure.suspects,
-            hashes,
-            baseline: baseline.as_ref(),
-            slice: failure.attribution.slice.clone(),
-        };
 
         let mixture = baseline
             .as_ref()
@@ -1023,33 +1002,16 @@ pub fn diagnose_failures(
             Some(mixture) if complete && !failure.host => test_body.map(|test| (mixture, test)),
             _ => None,
         };
-        let mut delta: Option<crate::bisect::Delta> = None;
-        // What a caller needs to retry this failure, kept whether or not this side searches.
+
         let slot = hybrids.per_failure.len();
         hybrids.per_failure.push(None);
-        let mut builder = match (bisect, &runnable) {
-            (true, Some((mixture, test))) => {
-                let hybrid = BodyHybrid::new(
-                    store,
-                    &fresh,
-                    (*mixture).clone(),
-                    (*test).clone(),
-                    Signature::of(&failure.diagnostic),
-                );
-                Some(match &seed {
-                    Some(seed) => hybrid.at_seed(seed),
-                    None => hybrid,
-                })
-            }
-            _ => None,
-        };
 
         // Unclassified, every change stays a candidate: a wider answer, never a wrong one.
-        let mut unknown = bisect::Unknown;
-        let mut store_classify;
         let rehashed = baseline.as_ref().and_then(|baseline| {
             Rehashed::under(sources, baseline, &front.packages, &front.mod_pkg).ok()
         });
+        let mut unknown = bisect::Unknown;
+        let mut store_classify;
         let classify: &mut dyn Classify = match rehashed {
             Some(rehashed) => {
                 store_classify = StoreClassify::new(rehashed, store, check);
@@ -1057,97 +1019,45 @@ pub fn diagnose_failures(
             }
             None => &mut unknown,
         };
-        if !bisect {
-            // The search is the caller's: the change set is computed and handed over, with what a
-            // mixture would need, and the attribution is annotated and left unresolved.
-            let rehashed = baseline.as_ref().and_then(|baseline| {
-                Rehashed::under(sources, baseline, &front.packages, &front.mod_pkg).ok()
-            });
-            let mut unknown2 = bisect::Unknown;
-            let mut store_classify2;
-            let classify2: &mut dyn Classify = match rehashed {
-                Some(rehashed) => {
-                    store_classify2 = StoreClassify::new(rehashed, store, check);
-                    &mut store_classify2
-                }
-                None => &mut unknown2,
+
+        let differences = baseline.as_ref().map(|baseline| {
+            let regression = Regression {
+                key: &failure.key,
+                test_hash,
+                baseline,
+                hashes,
             };
-            let mut differences: Option<crate::Diff> = None;
-            if let Some(baseline) = baseline.as_ref() {
-                let regression = Regression {
-                    key: &failure.key,
-                    test_hash,
-                    baseline,
-                    hashes,
-                };
-                differences = Some(diff(&regression, classify2, &edges));
-            }
-            if let Some(d) = &differences {
-                delta = Some(d.delta.clone());
-            }
-            if let Some(change) = delta.clone() {
-                hybrids.per_failure[slot] = Some(HybridInput {
-                    delta: change,
-                    runnable: if runnable.is_some() {
-                        runnable.clone()
-                    } else {
-                        None
-                    },
-                    signature: Signature::of(&failure.diagnostic),
-                    seed: seed.clone(),
-                    classified: differences
-                        .as_ref()
-                        .map(|d| d.unclassified.len())
-                        .unwrap_or(0),
-                    test_classified: differences
-                        .as_ref()
-                        .map(|d| !d.test_unclassified)
-                        .unwrap_or(true),
-                    absent,
-                });
-            }
-            if let Some(d) = &delta {
-                failure.attribution.annotate(d);
-            }
-            failure.attribution.resolve(
-                crate::Bisection::not_attempted(Skipped::Delegated),
-                failure.attribution.slice.clone(),
-            );
-            continue;
+            diff(&regression, classify, &edges)
+        });
+        let delta = differences.as_ref().map(|d| d.delta.clone());
+        if let Some(change) = delta.clone() {
+            hybrids.per_failure[slot] = Some(HybridInput {
+                delta: change,
+                runnable,
+                signature: Signature::of(&failure.diagnostic),
+                seed,
+                classified: differences
+                    .as_ref()
+                    .map(|d| d.unclassified.len())
+                    .unwrap_or(0),
+                test_classified: differences
+                    .as_ref()
+                    .map(|d| !d.test_unclassified)
+                    .unwrap_or(true),
+                absent,
+            });
         }
-
-        failure.attribution = diagnose(
-            evidence,
-            options,
-            &edges,
-            classify,
-            builder.as_mut().map(|b| b as &mut dyn Hybrid),
-            absent,
+        if let Some(change) = &delta {
+            failure.attribution.annotate(change);
+        }
+        // The verdict is the program's to give: without one, the report says so rather than
+        // claiming a search this side did not run.
+        failure.attribution.resolve(
+            crate::Bisection::not_attempted(Skipped::Delegated),
+            failure.attribution.slice.clone(),
         );
-        if let Some(builder) = &mut builder {
-            let forbidden: Vec<DefHash> = test_hash
-                .into_iter()
-                .flat_map(|hash| {
-                    let plan = match &seed {
-                        Some(seed) => Plan::once(seed.clone()),
-                        None => Plan::once(Seed::default()),
-                    };
-                    [hash, sim_key(hash, &plan)]
-                })
-                .collect();
-            proved.extend(
-                builder
-                    .take_proved()
-                    .into_iter()
-                    .filter(|hash| !forbidden.contains(hash)),
-            );
-        }
     }
 
-    // A hybrid's test hash covers its whole closure, so `Pass` under it is true of exactly that.
-    for hash in proved {
-        store.put(hash, Outcome::Pass);
-    }
     hybrids
 }
 
@@ -1555,4 +1465,27 @@ fn observe_definitions(
             .filter(|(name, _)| !implicated.contains(name))
             .map(|(_, hash)| *hash),
     );
+}
+
+/// What the change set says about the suspects already ranked: their kind and their hash before,
+/// and a candidate the ranking never saw is added so `suspects[0]` stays the best guess.
+impl Attribution {
+    pub fn annotate(&mut self, delta: &Delta) {
+        for suspect in &mut self.suspects {
+            if let Some(change) = delta.change(&suspect.name) {
+                suspect.before = change.before;
+                suspect.change = Some(change.kind);
+            }
+        }
+        // A candidate the search names must be ranked too, or `suspects[0]` is not the best guess.
+        for change in &delta.changes {
+            if !self.suspects.iter().any(|s| s.name == change.name) {
+                let mut extra = Suspect::new(change.name.clone(), change.after);
+                extra.before = change.before;
+                extra.change = Some(change.kind);
+                self.suspects.push(extra);
+            }
+        }
+        self.suspects.sort_by(|a, b| a.rank().cmp(&b.rank()));
+    }
 }
