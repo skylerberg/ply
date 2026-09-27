@@ -274,9 +274,8 @@ fn front_end(src: &Sources) -> Result<&'static Source, String> {
         return Err(placed(error, &modules));
     }
     let front: &'static Front = Box::leak(Box::new(front));
-    let keys = crate::source::emit_keys(front);
     Ok(Box::leak(Box::new(
-        Source::from_front(front, keys).with_texts(texts),
+        Source::from_front(front).with_texts(texts),
     )))
 }
 

@@ -150,7 +150,7 @@ fn emit(args: &BootstrapOptions) -> Result<Emitted, Refused> {
     let modules: Vec<(String, String)> = texts.clone().into_iter().collect();
     let source = ply_codegen::c::producer::digest_of(&modules);
     let src: &'static ply_codegen::Source = Box::leak(Box::new(
-        ply_codegen::Source::from_front(front, ply_codegen::emit_keys(front)).with_texts(texts),
+        ply_codegen::Source::from_front(front).with_texts(texts),
     ));
     let names: Vec<String> = src.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
