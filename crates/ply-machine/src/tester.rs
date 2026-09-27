@@ -1134,11 +1134,11 @@ struct CaseView {
     shared: String,
     atoms: Vec<String>,
     /// The same atoms, unprinted: what a scheduler compares is an effect, a resource and whether
-    /// the atom writes. Two atoms conflict when they agree on the first two and one of them writes.
+    /// the atom writes. Two atoms conflict when they agree on the first two and one of them writes;
+    /// whether a test is isolated, and whether its contention is only over a region label, are
+    /// questions about exactly this list, so the program answers them itself.
     contends: Vec<AtomView>,
-    region_only: bool,
     seeded: bool,
-    isolated: bool,
     reason: &'static str,
     owed: usize,
     group: Option<usize>,
@@ -1343,12 +1343,7 @@ fn found(
                             writes: a.mode == Mode::Write,
                         })
                         .collect(),
-                    region_only: ply_test::contends_only_over_regions(&test.footprint),
                     seeded: ply_test::is_seeded(&test.footprint),
-                    isolated: selection
-                        .isolation_of(index)
-                        .unwrap_or_else(|| Isolation::of(&test.footprint))
-                        .is_isolated(),
                     reason: reason.as_str(),
                     owed: selection.plan_for(index).roots.len(),
                     group: selection.group_of(index),
@@ -1661,9 +1656,7 @@ fn case_value(case: &CaseView) -> PlyValue {
         ("shared", PlyValue::str(&case.shared)),
         ("atoms", texts(&case.atoms)),
         ("contends", atoms_value(&case.contends)),
-        ("region_only", PlyValue::Bool(case.region_only)),
         ("seeded", PlyValue::Bool(case.seeded)),
-        ("isolated", PlyValue::Bool(case.isolated)),
         ("reason", PlyValue::str(case.reason)),
         ("owed", count(case.owed)),
         ("group", option(case.group.map(count))),
