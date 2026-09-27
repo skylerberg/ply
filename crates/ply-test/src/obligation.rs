@@ -94,6 +94,18 @@ pub enum Reason {
 }
 
 impl Reason {
+    /// The word a reason crosses as, and back: the program prints these and the runtime reads them.
+    pub fn parse(word: &str) -> Option<Reason> {
+        match word {
+            "new" => Some(Reason::New),
+            "cached proof" => Some(Reason::Proved),
+            "cached sample" => Some(Reason::Sampled),
+            "uncached" => Some(Reason::Uncached),
+            "cache refused" => Some(Reason::Refused),
+            _ => None,
+        }
+    }
+
     pub fn hit(self) -> bool {
         matches!(self, Reason::Proved | Reason::Sampled)
     }
@@ -291,6 +303,19 @@ fn from_cached_rule(rule: &CachedRule) -> Rule {
 }
 
 /// What the cache answered for each obligation, parallel to the obligation list.
+/// What a program decided about the obligations it asked about: which the cache could not answer
+/// for, and the reason for each, in collection order. The runtime reads the evidence back from the
+/// store for the ones it does not discharge.
+#[derive(Clone, Debug, Default)]
+pub struct Choice {
+    /// Which obligations the run reports on, by collection index, ascending.
+    pub claims: Vec<usize>,
+    /// Positions in `claims` the cache could not answer for, in order.
+    pub to_discharge: Vec<usize>,
+    /// One reason per position in `claims`.
+    pub reasons: Vec<Reason>,
+}
+
 pub struct Selection {
     pub reasons: Vec<Reason>,
     pub cached: Vec<Option<Evidence>>,
@@ -300,6 +325,38 @@ pub struct Selection {
 }
 
 impl Selection {
+    /// The runtime's view of the program's decision. A cached obligation was answered under a key
+    /// the program asked about, so its evidence is read back rather than carried; a `law/host` is
+    /// never cached, and the program says so by not putting it in `to_discharge`.
+    pub fn chosen(
+        choice: &Choice,
+        obligations: &[Obligation],
+        store: &Store,
+        plan: &ProvePlan,
+    ) -> Selection {
+        let mut selection = Selection {
+            reasons: choice.reasons.clone(),
+            cached: Vec::with_capacity(obligations.len()),
+            to_discharge: Vec::new(),
+            warnings: Vec::new(),
+        };
+        for (index, obligation) in obligations.iter().enumerate() {
+            if choice.to_discharge.contains(&index) {
+                selection.to_discharge.push(index);
+                selection.cached.push(None);
+                continue;
+            }
+            let answer = lookup(store, obligation.key, plan);
+            // The program decided *that* this one was refused; the runtime is the only side that can
+            // say what was under the key, so it is what describes the refusal.
+            if choice.reasons.get(index) == Some(&Reason::Refused) {
+                selection.warnings.extend(answer.warning);
+            }
+            selection.cached.push(answer.evidence);
+        }
+        selection
+    }
+
     pub fn hits(&self) -> usize {
         self.reasons.iter().filter(|r| r.hit()).count()
     }
@@ -369,6 +426,27 @@ pub struct Asked {
 }
 
 impl Asked {
+    /// [`Asked::new`], from the decision the program made instead of one this side computes. The
+    /// cache is not consulted again: what the program did not name is what it found.
+    pub fn chosen(
+        obligations: Vec<Obligation>,
+        choice: &Choice,
+        store: &Store,
+        plan: &ProvePlan,
+        use_cache: bool,
+    ) -> Asked {
+        let started = Instant::now();
+        let plan = plan.clone().normalized();
+        let selection = Selection::chosen(choice, &obligations, store, &plan);
+        Asked {
+            obligations,
+            selection,
+            plan,
+            use_cache,
+            started,
+        }
+    }
+
     pub fn new(
         obligations: Vec<Obligation>,
         store: &Store,

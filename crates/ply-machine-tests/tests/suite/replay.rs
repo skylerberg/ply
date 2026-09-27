@@ -16,7 +16,8 @@ const REPLAY: &str = r#"
 nondet effect prover {
   write configure[claims](options: Options) -> Unit
   read collected[claims]() -> Result<Collection, Refusal>
-  read discharged[claims](wanted: List<Int>) -> Result<Verdicts, Refusal>
+  read outcomes[claims](keys: List<String>) -> List<Option<String>>
+  read discharged[claims](choice: Choice) -> Result<Verdicts, Refusal>
   read replay[claims](index: Int, root: Int, case: Int) -> Result<Point, Refusal>
   read reviewed[claims]() -> Changes
   read accepted[claims]() -> Accepted
