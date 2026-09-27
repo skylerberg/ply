@@ -259,6 +259,16 @@ pub fn machine_value(v: &PlyValue, module: &str) -> Result<PlyValue, Diagnostic>
         PlyValue::Int(i) => c("VInt", vec![PlyValue::Int(*i)]),
         PlyValue::Float(f) => c("VFloat", vec![PlyValue::Float(*f)]),
         PlyValue::Decimal(d) => c("VDecimal", vec![PlyValue::Decimal(*d)]),
+        PlyValue::Fixed(f) => {
+            let value = i64::try_from(f.value()).map_err(|_| {
+                Diagnostic::error(
+                    codes::RUNTIME_ERROR,
+                    format!("a `{}` above `Int`'s range cannot cross", f.ty.name()),
+                )
+                .primary(Span::DUMMY, "the value does not fit an `Int`")
+            })?;
+            c("VFixed", vec![PlyValue::str(f.ty.name()), PlyValue::Int(value)])
+        }
         PlyValue::Str(s) => c("VStr", vec![PlyValue::str(s.as_ref())]),
         PlyValue::Bytes(b) => c("VBytes", vec![PlyValue::bytes(b.as_ref())]),
         PlyValue::List(items) => c(
@@ -338,6 +348,19 @@ pub fn value_of_adt(v: &PlyValue, span: Span, module: &str) -> Result<PlyValue, 
         "VInt" => Ok(at(0).cloned().unwrap_or_default()),
         "VFloat" => Ok(at(0).cloned().unwrap_or_default()),
         "VDecimal" => Ok(at(0).cloned().unwrap_or_default()),
+        "VFixed" => {
+            let Some(PlyValue::Str(ty)) = at(0) else {
+                return Err(bad("'s fixed type is not text"));
+            };
+            let ty = ply_eval::IntTy::from_name(ty.as_ref()).ok_or_else(|| bad("'s fixed type is unknown"))?;
+            let v = at(1)
+                .ok_or_else(|| bad("'s fixed value is missing"))?
+                .as_int(span, "a fixed-width integer")?;
+            Ok(PlyValue::Fixed(
+                ply_eval::Fixed::of(ty, i128::from(v))
+                    .ok_or_else(|| bad("'s fixed value does not fit its type"))?,
+            ))
+        }
         "VStr" => Ok(at(0).cloned().unwrap_or_default()),
         "VBytes" => Ok(at(0).cloned().unwrap_or_default()),
         "VList" => {
@@ -418,7 +441,9 @@ pub fn value_of_adt(v: &PlyValue, span: Span, module: &str) -> Result<PlyValue, 
 pub fn value_to_wire(v: &PlyValue) -> serde_json::Value {
     match v {
         PlyValue::Int(i) => serde_json::json!({ "i": i }),
-        PlyValue::Fixed(x) => serde_json::json!({ "d": x.to_string() }),
+        PlyValue::Fixed(x) => serde_json::json!({
+            "x": [x.ty.name(), i64::try_from(x.value()).ok()]
+        }),
         PlyValue::Bool(b) => serde_json::json!({ "b": b }),
         PlyValue::Float(f) => serde_json::json!({ "f": f.to_string() }),
         PlyValue::Decimal(d) => serde_json::json!({ "d": d.to_string() }),
@@ -472,6 +497,22 @@ pub fn value_from_wire(w: &serde_json::Value, span: Span) -> Result<PlyValue, Di
         let text = d.as_str().ok_or_else(|| bad("'s decimal is not text"))?;
         return Ok(PlyValue::Decimal(
             text.parse().map_err(|_| bad("'s decimal does not parse"))?,
+        ));
+    }
+    if let Some(x) = obj.get("x") {
+        let pair = x.as_array().ok_or_else(|| bad("'s fixed is not a pair"))?;
+        let ty = pair
+            .first()
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| bad("'s fixed type is not text"))?;
+        let ty = ply_eval::IntTy::from_name(ty).ok_or_else(|| bad("'s fixed type is unknown"))?;
+        let v = pair
+            .get(1)
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| bad("'s fixed value does not fit an `Int`"))?;
+        return Ok(PlyValue::Fixed(
+            ply_eval::Fixed::of(ty, i128::from(v))
+                .ok_or_else(|| bad("'s fixed value does not fit its type"))?,
         ));
     }
     if let Some(s) = obj.get("s") {

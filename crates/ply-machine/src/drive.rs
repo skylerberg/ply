@@ -381,10 +381,7 @@ impl Drive {
             .map(|w| crate::payload::value_from_wire(w, span))
             .collect::<Result<_, _>>()?;
         let plan = crate::simulation::run_plan(options.seed.as_ref());
-        let compiled = bound
-            .tier
-            .as_ref()
-            .map(|(provider, spec)| provider.attach(spec));
+        let compiled = bound.tier.attach();
         ply_eval::rc::reset();
         let answered = ply_codegen::rt::with_step_budget(options.steps, || {
             ply_codegen::rt::with_time_budget(options.timeout, || {
