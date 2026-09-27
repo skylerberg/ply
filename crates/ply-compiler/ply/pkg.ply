@@ -317,6 +317,90 @@ test "a manifest body that runs is not a value" {
   )
 }
 
+// --- The versions a closure pins -------------------------------------------------
+// Minimal version selection: one version of a package serves a whole closure. Two manifests may
+// ask different floors of the same package (the highest wins), but two *places* holding a package
+// of one name have no one version to pick.
+
+fn a_manifest(name: String, deps: List<String>) -> Bytes =
+  bytes_of_string(
+    "import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"" ++ name
+      ++ "\", version: {major: 0, minor: 1, patch: 0}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: ["
+      ++ joined(deps, ", ")
+      ++ "], entry: None}",
+  )
+
+fn joined(parts: List<String>, sep: String) -> String =
+  fold(range(0, len(parts)), "", |acc: String, i: Int|
+    match list_at(parts, i) { None -> acc, Some(x) -> if i == 0 { x } else { acc ++ sep ++ x } })
+
+fn a_dep(name: String, floor: Int, path: String) -> String =
+  "{name: \"" ++ name ++ "\", prefix: None, min: {major: 0, minor: " ++ int_to_string(floor)
+    ++ ", patch: 0}, source: Path(\""
+    ++ path
+    ++ "\")}"
+
+fn supplied_at(root: String, name: String, deps: List<String>) -> Supplied =
+  { root: bytes_of_string(root), manifest: Some(a_manifest(name, deps)), modules: [] }
+
+test "a package two others depend on is not a cycle" {
+  let edges = [
+    { from: 0, target: 1 },
+    { from: 0, target: 2 },
+    { from: 1, target: 3 },
+    { from: 2, target: 3 },
+  ];
+  assert_eq(find_cycle(4, edges), None)
+}
+
+test "a diamond of one version is what a closure pins: both requesters, one package" {
+  let pkgs: Pkgs = {
+    root: b"/x/app",
+    manifest: Some(a_manifest("app", [a_dep("b", 1, "../b"), a_dep("c", 1, "../c")])),
+    supplied: [
+      supplied_at("/x/b", "b", [a_dep("d", 0, "../d")]),
+      supplied_at("/x/c", "c", [a_dep("d", 1, "../d")]),
+      supplied_at("/x/d", "d", []),
+    ],
+  };
+  let clo = closure(pkgs, []);
+  assert_eq(clo.diags, []);
+  assert_eq(map(clo.packages, |p: Package| p.prefix), [b"app", b"b", b"c", b"d"])
+}
+
+test "a package of one version at two places has no version to pick" {
+  let pkgs: Pkgs = {
+    root: b"/x/app",
+    manifest: Some(a_manifest("app", [a_dep("b", 1, "../b"), a_dep("c", 1, "../c")])),
+    supplied: [
+      supplied_at("/x/b", "b", [a_dep("d", 1, "../d1")]),
+      supplied_at("/x/c", "c", [a_dep("d", 1, "../d2")]),
+      supplied_at("/x/d1", "d", []),
+      supplied_at("/x/d2", "d", []),
+    ],
+  };
+  let clo = closure(pkgs, []);
+  let codes = map(clo.diags, |d: { slot: Int, diag: PDiag }| d.diag.code);
+  assert_eq(codes, [b"E0137"]);
+  let text = string_of_bytes_lossy(at(clo.diags, 0).diag.message);
+  assert(string_contains(text, "`b` wants `/x/d1`"));
+  assert(string_contains(text, "`c` wants `/x/d2`"))
+}
+
+test "a dependency below the floor its importer asks for is named with both versions" {
+  let pkgs: Pkgs = {
+    root: b"/x/app",
+    manifest: Some(a_manifest("app", [a_dep("b", 9, "../b")])),
+    supplied: [supplied_at("/x/b", "b", [])],
+  };
+  let clo = closure(pkgs, []);
+  let codes = map(clo.diags, |d: { slot: Int, diag: PDiag }| d.diag.code);
+  assert_eq(codes, [b"E0136"]);
+  let text = string_of_bytes_lossy(at(clo.diags, 0).diag.message);
+  assert(string_contains(text, "is version 0.1.0"));
+  assert(string_contains(text, "at least 0.9.0"))
+}
+
 test "fields that fail validation are named" {
   let head = b"import std.pkg (Manifest)\nfn package() -> Manifest = ";
   let tail = b", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [], entry: None}";
@@ -552,7 +636,8 @@ fn judge(
           fold(m.dependencies, acc, |a: Pending, d: Dep| one_dep(texts, roots, manifests, i, a, d)),
       },
   );
-  let collided = prefix_judgments(texts, roots, built.packages, root_modules, built.diags);
+  let versioned = version_judgments(texts, roots, built.packages, built.edges, built.diags);
+  let collided = prefix_judgments(texts, roots, built.packages, root_modules, versioned);
   let cycled = match find_cycle(len(roots), built.edges) {
     None -> collided,
     Some(c) ->
@@ -569,6 +654,79 @@ fn judge(
   };
   { packages: built.packages, diags: cycled }
 }
+
+fn version_text(v: Version) -> Bytes =
+  bytes_of_string(
+    int_to_string(v.major) ++ "." ++ int_to_string(v.minor) ++ "." ++ int_to_string(v.patch),
+  )
+
+// Minimal version selection: one version of a package serves a whole closure, so a name reached
+// at two roots has no one version to pick and is refused naming both. Two manifests asking
+// different floors of the *same* package is not an error — the highest floor wins, and the check
+// that the package is at least that high is `one_dep`'s.
+fn version_judgments(
+  texts: List<Option<Bytes>>,
+  roots: List<Bytes>,
+  packages: List<Package>,
+  edges: List<{ from: Int, target: Int }>,
+  diags: List<{ slot: Int, diag: PDiag }>,
+) -> List<{ slot: Int, diag: PDiag }> = {
+  let named = |p: Package| match p.manifest { None -> "", Some(m) -> m.name };
+  fold(range(0, len(packages)), diags, |acc: List<{ slot: Int, diag: PDiag }>, i: Int| {
+    let p = at(packages, i);
+    if p.manifest == None { acc } else {
+      // The packages before this one with the same name: a name is what a closure pins, so a
+      // second one is the ambiguity.
+      let earlier = fold(range(0, i), None, |found: Option<Int>, j: Int|
+        match found {
+          Some(_) -> found,
+          None -> if named(at(packages, j)) == named(p) && at(packages, j).manifest != None {
+            Some(j)
+          } else { None },
+        });
+      match earlier {
+        None -> acc,
+        Some(j) ->
+          push(acc, {
+            slot: slot_of(texts, requester_of(edges, i)),
+            diag: diag1(
+              b"E0137",
+              dummy_span(),
+              bytes_concat_all([
+                b"`",
+                bytes_of_string(named(p)),
+                b"` is reached at two places: `",
+                bytes_of_string(package_name(at(packages, requester_of(edges, j)))),
+                b"` wants `",
+                at(roots, j),
+                b"`, and `",
+                bytes_of_string(package_name(at(packages, requester_of(edges, i)))),
+                b"` wants `",
+                at(roots, i),
+                b"`",
+              ]),
+              b"in this package's manifest",
+              [
+                b"a closure pins one version of a package, and only one of these can be it",
+                b"depend on one of them, or make them the same package",
+              ],
+            ),
+          }),
+      }
+    }
+  })
+}
+
+// The package that declared the dependency reaching `target`: what a judgment about the target
+// points at, since the requester's manifest is where the dependency is written.
+fn requester_of(edges: List<{ from: Int, target: Int }>, target: Int) -> Int =
+  match first_edge(edges, target) { Some(from) -> from, None -> target }
+
+fn first_edge(edges: List<{ from: Int, target: Int }>, target: Int) -> Option<Int> =
+  match edges {
+    [] -> None,
+    [e, ..rest] -> if e.target == target { Some(e.from) } else { first_edge(rest, target) },
+  }
 
 fn cycle_text(roots: List<Bytes>, c: List<Int>) -> Bytes =
   join_bytes(map(push(c, at(c, 0)), |i: Int| at(roots, i)), b" -> ")
@@ -635,7 +793,24 @@ fn one_dep(
             Some(tm) -> {
               let granted = bytes_of_string(prefix_of(tm));
               let aliased = match d.prefix { None -> granted, Some(a) -> bytes_of_string(a) };
-              if aliased != granted {
+              // `derive ord` gives the type a `compare`, not an operator.
+              if compare(tm.version, d.min) == Less {
+                push_diag_text(
+                  acc,
+                  slot,
+                  b"E0136",
+                  bytes_concat_all([
+                    b"the dependency `",
+                    name,
+                    b"` at `",
+                    target,
+                    b"` is version ",
+                    version_text(tm.version),
+                    b", and this manifest asks for at least ",
+                    version_text(d.min),
+                  ]),
+                )
+              } else if aliased != granted {
                 push_diag_text(
                   acc,
                   slot,
@@ -708,7 +883,8 @@ fn prefix_judgments(
           with_reserved,
           |acc2: List<{ slot: Int, diag: PDiag }>, j: Int| {
             let q = at(packages, j);
-            if q.manifest == None || p.prefix != q.prefix { acc2 } else {
+            if q.manifest == None || p.prefix != q.prefix { acc2 }
+            else if package_name(p) == package_name(q) { acc2 } else {
               push(acc2, {
                 slot: slot_of(texts, j),
                 diag: diag1(
@@ -760,6 +936,8 @@ fn prefix_judgments(
   })
 }
 
+fn package_name(p: Package) -> String = match p.manifest { None -> "", Some(m) -> m.name }
+
 fn first_segment(name: Bytes) -> Bytes =
   match bytes_index_of(name, b".") { None -> name, Some(i) -> bytes_slice(name, 0, i) }
 
@@ -805,11 +983,18 @@ fn dfs(
           { colors: acc.colors, cycle: Some(stack_from(stack, e.target)) }
         } else if at(acc.colors, e.target) == 0 {
           match dfs(e.target, edges, list_set(acc.colors, e.target, 1), push(stack, e.target)) {
-            { colors: c2, cycle: c } -> { colors: c2, cycle: c },
+            // Black once its own edges are done: a package two others both depend on is reached
+            // twice, and only a gray target is a back edge.
+            { colors: c2, cycle: c } -> { colors: list_set(c2, e.target, 2), cycle: c },
           }
         } else { acc },
       },
   )
 
+// The path from `u` down to where the walk is: what a back edge closes into a cycle. A gray node
+// is always on the walk's stack, so a call that reaches the end is the walk having lost it.
 fn stack_from(stack: List<Int>, u: Int) -> List<Int> =
-  match stack { [] -> [u], [x, ..rest] -> if x == u { stack } else { stack_from(rest, u) } }
+  match stack {
+    [] -> panic("the walk's stack lost a package it had not finished"),
+    [x, ..rest] -> if x == u { stack } else { stack_from(rest, u) },
+  }
