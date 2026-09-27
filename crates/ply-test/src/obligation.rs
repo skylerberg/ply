@@ -310,10 +310,22 @@ fn from_cached_rule(rule: &CachedRule) -> Rule {
 pub struct Choice {
     /// Which obligations the run reports on, by collection index, ascending.
     pub claims: Vec<usize>,
+    /// The finite domains the program decided, by collection index, for the claims it wants walked
+    /// rather than sampled. A claim without one is sampled, which is the program's decision too.
+    pub domains: Vec<(usize, Domain)>,
     /// Positions in `claims` the cache could not answer for, in order.
     pub to_discharge: Vec<usize>,
     /// One reason per position in `claims`.
     pub reasons: Vec<Reason>,
+}
+
+/// A finite domain, as the program measured it: how many values each binder's type holds, in binder
+/// order, and what the domain is called in an artifact. The runtime materialises a point from these
+/// and walks them itself; whether there are points to walk is not its decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Domain {
+    pub sizes: Vec<u64>,
+    pub name: String,
 }
 
 pub struct Selection {
@@ -394,7 +406,14 @@ pub fn select(
 }
 
 pub trait Discharger: Sync {
-    fn discharge(&self, obligation: &Obligation, plan: &ProvePlan) -> Discharge;
+    /// `domain` is the program's own measurement of the obligation's binders, or `None` when it
+    /// decided to sample instead.
+    fn discharge(
+        &self,
+        obligation: &Obligation,
+        plan: &ProvePlan,
+        domain: Option<&Domain>,
+    ) -> Discharge;
 }
 
 pub struct Proved {
@@ -423,6 +442,10 @@ pub struct Asked {
     plan: ProvePlan,
     use_cache: bool,
     started: Instant,
+    /// What the program measured, keyed by the obligation's position in `obligations` — the same
+    /// index `to_discharge` holds. The discharge of a claim the program measured walks the points it
+    /// measured; a claim it did not is sampled.
+    domains: BTreeMap<usize, Domain>,
 }
 
 impl Asked {
@@ -444,6 +467,7 @@ impl Asked {
             plan,
             use_cache,
             started,
+            domains: choice.domains.iter().cloned().collect(),
         }
     }
 
@@ -462,6 +486,7 @@ impl Asked {
             plan,
             use_cache,
             started,
+            domains: BTreeMap::new(),
         }
     }
 
@@ -483,13 +508,19 @@ impl Asked {
             plan,
             use_cache,
             started,
+            domains,
         } = self;
         let mut warnings = selection.warnings;
 
         let fresh: Vec<(usize, Discharge)> = selection
             .to_discharge
             .par_iter()
-            .map(|&index| (index, discharger.discharge(&obligations[index], &plan)))
+            .map(|&index| {
+                (
+                    index,
+                    discharger.discharge(&obligations[index], &plan, domains.get(&index)),
+                )
+            })
             .collect();
 
         let mut discharges: Vec<Option<Discharge>> = selection
@@ -537,7 +568,12 @@ impl Asked {
 pub struct Undecided;
 
 impl Discharger for Undecided {
-    fn discharge(&self, obligation: &Obligation, _plan: &ProvePlan) -> Discharge {
+    fn discharge(
+        &self,
+        obligation: &Obligation,
+        _plan: &ProvePlan,
+        _domain: Option<&Domain>,
+    ) -> Discharge {
         Discharge::Unattempted(ply_prove::Gap::UnhandledEffect(
             obligation.footprint.clone(),
         ))
