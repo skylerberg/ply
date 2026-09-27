@@ -21,7 +21,7 @@ pub fn run(url: String) -> Result<String, String>
   / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next} =
   match with_server(url, 4, || {
     match db.returning[items](
-      stmt("insert into items (id, name) values ($1, $2) on conflict (id) do update set name = excluded.name returning id"),
+      stmt("insert into items (id, name) values ($1, $2) returning id"),
       [PInt(7), PText("seven")],
     ) {
       Failed(e) -> Err(e.detail),
@@ -73,7 +73,7 @@ pub fn commit_one(url: String) -> Result<String, String>
   / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next} =
   match with_server(url, 4, || {
     match transaction(ReadCommitted, ReadWrite, || {
-      db.execute[items](stmt("insert into items (id, name) values ($1, $2) on conflict (id) do nothing"), [PInt(8), PText("eight")])
+      db.execute[items](stmt("insert into items (id, name) values ($1, $2)"), [PInt(8), PText("eight")])
     }) {
       Err(roll) -> Err(roll.reason),
       Ok(_) -> match db.query[items](stmt("select count(*) as n from items"), []) {
