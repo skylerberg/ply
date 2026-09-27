@@ -1224,13 +1224,22 @@ covers serialization failures. `MemDb` is an in-memory twin (`open`, `step`,
 `begin_step`, `commit_step`, `abort_step`). Statement text the driver cannot
 account for is `E0432`.
 
-The driver that runs in Ply settles the verb before it sends: a statement that
-writes, performed as `db.query`, is refused because the endpoints that perform
-it would be scheduled as if they only read, and text that is not one of the four
-verbs is refused because a `Stmt` carries a statement rather than a schema —
-the run applies that. The refusal is raised, so a program cannot ignore it; it
-carries the runtime-error code rather than `E0432`, because a library has no
-raise of its own to name a code with.
+The driver that runs in Ply reads a statement before it sends it. A statement
+that writes, performed as `db.query`, is refused because the endpoints that
+perform it would be scheduled as if they only read, and text the reader cannot
+account for — a second statement after a `;`, `for update`, `on conflict`, a
+call it will not vouch for, a function whose value is not a function of the
+program's state — is refused because a footprint it guessed at is a scheduler
+that runs two writers beside each other. So is a statement whose tables do not
+include the label the call site named: a label is the atom the scheduler
+records, and a statement's tables are a function of its text, so a join reaches
+tables the label never named. The reader is the language's `std.db`, and the
+labels it checks against are the ones the clauses bind (`db.query[*table]`),
+which is why a driver can be written in Ply at all.
+
+Each refusal is raised, so a program cannot ignore it; they carry the
+runtime-error code rather than `E0432`, `E0433` or `E0434`, because a library
+has no raise of its own to name a code with.
 
 A `db` effect is served by `serve`: `with_server(url, size, body)` reads a
 connection string (`server_of`), draws a nonce, and answers the six operations
