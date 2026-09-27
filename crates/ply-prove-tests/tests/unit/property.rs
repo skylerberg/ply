@@ -561,10 +561,9 @@ fn a_refutation_names_its_root_its_case_and_what_it_started_from() {
     assert_eq!(counterexample.root, 0);
     assert_eq!(counterexample.bindings.len(), 1);
     assert_eq!(counterexample.original.len(), 1);
-    assert!(
-        counterexample.shrinks > 0,
-        "the first hit was already minimal, which this fixture rules out"
-    );
+    // No steps and no smaller tuple: the runtime reports where the failure was drawn, and the walk
+    // that narrows it is the program's (`proof.shrink`'s `descend` over the shrink operations).
+    assert_eq!(counterexample.shrinks, 0);
     assert_eq!(counterexample.bindings[0].name.as_str(), "n");
     assert_eq!(counterexample.bindings[0].ty, Type::int());
 }
@@ -607,13 +606,12 @@ fn a_raising_case_is_a_gap_with_a_shrunk_input() {
         }) => {
             assert_eq!(diagnostic.message, "divided by zero");
             let value: i64 = bindings[0].rendered.parse().expect("an Int renders as one");
+            // The runtime reports the input the body raised at, not a smaller one: the walk that
+            // makes a counterexample small is the program's now, and it is driven through the
+            // shrink operations. What this side owes is that the input still raises.
             assert!(
                 value.unsigned_abs() > 100,
-                "the shrunk input must still raise"
-            );
-            assert!(
-                value.unsigned_abs() <= 128,
-                "{value} is nowhere near minimal for `|n| > 100`"
+                "the input must be one the body raises at"
             );
         }
         other => panic!("expected a raised gap, got {other:?}"),
