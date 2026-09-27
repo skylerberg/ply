@@ -98,6 +98,14 @@ pub struct Pinned {
     pub digest: String,
 }
 
+/// One root the emitter offers: a definition, a spec clause, a test or a law part.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct EmitterRoot {
+    pub root: Symbol,
+    pub arity: usize,
+    pub scalar: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Front {
     pub diagnostics: Vec<Diagnostic>,
@@ -118,6 +126,9 @@ pub struct Front {
     pub hashes_digest: DefHash,
     /// The emitter's root cache keys, by root name, as the compiler computed them.
     pub keys: IndexMap<Symbol, String>,
+    /// Every root the emitter offers, with the arity its body is emitted at and whether its
+    /// parameters and answer are all `Int` or `Bool`.
+    pub emitter_roots: Vec<EmitterRoot>,
     /// The hasher's item order: every hashed name, test and law, as the `hash` frames are written.
     pub hash_order: Vec<Hashed>,
     /// Per module in program order, its keyable items in source order.
@@ -373,6 +384,12 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
     raw_frame(&mut out, "hashesdigest", "_", &front.hashes_digest.to_hex());
     for (root, key) in &front.keys {
         raw_frame(&mut out, "key", root.as_str(), key);
+    }
+    for root in &front.emitter_roots {
+        let mut p = Payload::default();
+        p.field("arity", &root.arity.to_string());
+        p.field("scalar", flag(root.scalar));
+        p.frame(&mut out, "emitroot", root.root.as_str());
     }
 
     for (module, items) in &front.ordinals {
@@ -786,6 +803,22 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
                     return Err(format!("{what} is written twice"));
                 }
                 front.hash_order.push(Hashed::Law(i));
+            }
+            "emitroot" => {
+                let f = Fields::of(payload, &what)?;
+                let (mut arity, mut scalar) = (None, None);
+                for (key, text) in f.all() {
+                    match key {
+                        "arity" => f.once(&mut arity, key, text)?,
+                        "scalar" => f.once(&mut scalar, key, text)?,
+                        other => return Err(unknown_field(&what, other)),
+                    }
+                }
+                front.emitter_roots.push(EmitterRoot {
+                    root: Symbol::new(name),
+                    arity: f.number(f.required(arity, "arity")?, "arity")?,
+                    scalar: f.flag(f.required(scalar, "scalar")?, "scalar")?,
+                });
             }
             "key" => {
                 let text =
