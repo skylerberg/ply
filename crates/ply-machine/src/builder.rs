@@ -25,11 +25,12 @@ use std::sync::{Arc, Mutex};
 /// else: `ply run` and the shipped program open artifacts too, and neither is a program.
 const EFFECT: &str = "builder";
 
-const OPERATIONS: [(&str, &str); 4] = [
+const OPERATIONS: [(&str, &str); 5] = [
     ("loaded", "ply_machine::build::loaded"),
     ("made", "ply_machine::build::made"),
     ("previous", "ply_machine::build::previous"),
     ("stored", "ply_machine::build::stored"),
+    ("unit", "ply_machine::build::unit"),
 ];
 
 /// An entry into a compiled unit does not nest on a thread, and a build enters the emitter's while
@@ -100,6 +101,7 @@ impl HostHandler for Site {
                     Err(diagnostic) => Err(diagnostic.clone()),
                 })
             }
+            ("unit", [names]) => self.unit(&texts(names, span)?),
             ("stored", [path, body]) => answered(
                 stored(
                     Path::new(path.as_str(span, "a file to write")?),
@@ -232,6 +234,41 @@ impl Site {
                 ("binary_bytes", option(binary_bytes().map(size))),
                 ("version", PlyValue::str(env!("CARGO_PKG_VERSION"))),
             ])],
+        )
+    }
+
+    /// The compiled unit for a set of definitions, with no entry: what a library's `.plyz`
+    /// carries. Nothing but the unit comes back — a library has no artifact to open.
+    fn unit(&self, names: &[String]) -> PlyValue {
+        let program = self.program.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(Ok(loaded)) = &*program else {
+            return answered(Err(unloaded()));
+        };
+        // The refusals carry their own diagnostics; a build reports the first, as `made` does.
+        answered(
+            aside(|| {
+                crate::artifact::library_unit(loaded, names)
+                    .map_err(|ds| ds.into_iter().next().unwrap_or_else(unloaded))
+            })
+            .map(|unit| {
+                record(vec![
+                    (
+                        "head",
+                        record(vec![
+                            ("frontend", PlyValue::bytes(unit.frontend)),
+                            ("runtime", PlyValue::bytes(unit.runtime)),
+                            (
+                                "body_encoding",
+                                PlyValue::Int(i64::from(unit.body_encoding)),
+                            ),
+                            ("stdlib", PlyValue::bytes(unit.stdlib)),
+                            ("entry", PlyValue::bytes([])),
+                        ]),
+                    ),
+                    ("count", count(1)),
+                    ("payload", PlyValue::bytes(&unit.payload)),
+                ])
+            }),
         )
     }
 

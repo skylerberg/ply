@@ -525,3 +525,66 @@ fn a_resolve_re_pins_a_dependency_whose_sources_moved() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// A library is a package, not a program: `ply build` writes the package itself — its sources, its
+/// manifest and a compiled unit — under a container of its own.
+#[test]
+fn a_library_builds_as_a_package_and_never_as_a_program() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let built = |args: &[&str]| ply(dir.path()).args(args).output().unwrap();
+
+    let out = built(&["new", "core", "--lib"]);
+    assert_eq!(out.status.code(), Some(0));
+    let out = built(&["build", "core", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = json_of(&out);
+    assert_eq!(v["command"], "build");
+    assert_eq!(v["library"], true);
+    assert_eq!(v["name"], "core");
+    assert_eq!(v["version"], "0.1.0");
+    assert_eq!(v["definitions"], 1, "{v}");
+    assert!(v["digest"].as_str().unwrap().starts_with("b3:"), "{v}");
+    assert_eq!(v["unit"], true);
+
+    let bytes = std::fs::read(dir.path().join("core.plyz")).expect("the library is written");
+    assert_eq!(
+        &bytes[..8],
+        b"PLYLIB01",
+        "a library is not a program container"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&bytes[..8]),
+        "PLYLIB01",
+        "and its magic is not a program's"
+    );
+
+    // A library is never entered: reading it as sources would report a container as text.
+    let out = built(&["run", "core.plyz"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("is a library, and nothing to run"), "{err}");
+    assert!(err.contains("declare it in a `ply.pkg`"), "{err}");
+
+    // A program package still builds a `.plyx`, and the library's own tests still run.
+    let out = built(&["new", "app"]);
+    assert_eq!(out.status.code(), Some(0));
+    let out = built(&["build", "app"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        dir.path().join("main.plyx").exists(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let out = built(&["test", "core"]);
+    assert_eq!(out.status.code(), Some(0));
+}
