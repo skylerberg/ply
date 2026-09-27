@@ -1,0 +1,329 @@
+// `slice` — the dynamic half of a failure: which definitions actually ran, in what order, how often,
+// and on what call stack the failure happened. A slice is a *trace's* reading, so it says when it
+// was not traced rather than pretending nothing ran, and a roster that hit its cap says so rather
+// than answering `false` for a definition a runaway test never got around to recording.
+//
+// The builder is the interpreter's side of this: `record` takes events as they happen and the state
+// is threaded rather than mutated, so a caller can hold it across a run without a lock. Returns move
+// the live stack whether or not a frame is within the cap, because the stack a failure is read
+// against has to be exact. This module also carries the assertion a failure was, since that is the
+// other half of the same artifact.
+
+// One definition a traced run entered, and how many calls it took.
+pub type Entered = { name: String, hash: Option<String>, calls: Int }
+
+// Where a call was made from: a source, and the byte range of the call. Absent when the trace has no
+// place for it, which is not the same as a place at offset zero.
+pub type Site = { source: Int, start: Int, end: Int }
+
+// A call-stack frame as it stood when the test failed.
+pub type Frame = { name: String, hash: Option<String>, call_site: Option<Site> }
+
+pub type CausalSlice = {
+  /// False when nothing was traced; every other field is then empty, not meaningfully absent.
+  traced: Bool,
+  /// Whether the traced execution failed the same way the untraced one did.
+  reproduced: Bool,
+  /// Definitions, in first-entry order.
+  entered: List<Entered>,
+  /// Outermost first, innermost last.
+  stack: List<Frame>,
+  /// The atoms actually performed, printed and deduplicated: what the run touched, as against what
+  /// a test's footprint declares it may touch.
+  observed: List<String>,
+  truncated: Bool,
+}
+
+pub fn untraced() -> CausalSlice =
+  { traced: false, reproduced: false, entered: [], stack: [], observed: [], truncated: false }
+
+pub fn ran(slice: CausalSlice, name: String) -> Bool =
+  some(slice.entered, |e: Entered| e.name == name)
+
+// `ran`, but absent when a truncated roster cannot say.
+pub fn did_run(slice: CausalSlice, name: String) -> Option<Bool> =
+  if ran(slice, name) || some(slice.stack, |f: Frame| f.name == name) { Some(true) }
+  else if slice.truncated { None }
+  else { Some(false) }
+
+// How far above the failure a definition sits, counting the innermost frame as zero.
+pub fn depth_of(slice: CausalSlice, name: String) -> Option<Int> =
+  match innermost(slice.stack, name, len(slice.stack) - 1) {
+    Some(at) -> Some(len(slice.stack) - 1 - at),
+    None -> None,
+  }
+
+// The frames a definition occupies, outermost first.
+fn innermost(stack: List<Frame>, name: String, from: Int) -> Option<Int> =
+  if from < 0 { None }
+  else if at_or(stack, from).name == name { Some(from) }
+  else { innermost(stack, name, from - 1) }
+
+// The stack's definition names, outermost first.
+pub fn path(slice: CausalSlice) -> List<String> = map(slice.stack, |f: Frame| f.name)
+
+// `--trace`.
+pub type Tracing = | TraceAuto | TraceAlways | TraceNever
+
+pub fn tracing_word(t: Tracing) -> String =
+  match t { TraceAuto -> "auto", TraceAlways -> "always", TraceNever -> "never" }
+
+pub fn tracing_parse(s: String) -> Option<Tracing> =
+  if s == "auto" { Some(TraceAuto) }
+  else if s == "always" { Some(TraceAlways) }
+  else if s == "never" { Some(TraceNever) }
+  else { None }
+
+/// Only `always` traces the first execution, so a `test/nondet` that will not reproduce still has a
+/// path to read.
+pub fn traces_first_run(t: Tracing) -> Bool = match t { TraceAlways -> true, _ -> false }
+
+pub fn traces_replay(t: Tracing) -> Bool = match t { TraceNever -> false, _ -> true }
+
+// What the interpreter reports while it runs. A performance carries the atom *printed*, since that
+// is the form the artifact holds and the form the language's own printer gives it.
+pub type Event = | Enter(String, Option<String>, Option<Site>) | Returned | Performed(String)
+
+// The cap is on *distinct definitions*, not calls: a runaway test can generate names without bound,
+// and the roster is what a report prints.
+pub fn default_cap() -> Int = 65536
+
+pub type Builder = {
+  entered: List<Entered>,
+  at: Map<String, Int>,
+  live: List<Frame>,
+  failed: Option<List<Frame>>,
+  observed: List<String>,
+  cap: Int,
+  truncated: Bool,
+}
+
+pub fn new_builder() -> Builder = with_cap(default_cap())
+
+pub fn with_cap(cap: Int) -> Builder =
+  { entered: [], at: map_new(), live: [], failed: None, observed: [], cap: cap, truncated: false }
+
+/// Moves the live stack on every enter and return regardless of the cap, so it stays exact.
+pub fn record(b: Builder, event: Event) -> Builder =
+  match event {
+    Returned -> { ..b, live: dropped_last(b.live) },
+    Enter(name, hash, site) -> {
+      let b1 = { ..b, live: push(b.live, { name: name, hash: hash, call_site: site }) };
+      match map_get(b1.at, name) {
+        Some(at) -> { ..b1, entered: bumped(b1.entered, at) },
+        None -> if len(b1.entered) < b1.cap {
+          {
+            ..b1,
+            at: map_insert(b1.at, name, len(b1.entered)),
+            entered: push(b1.entered, { name: name, hash: hash, calls: 1 }),
+          }
+        } else { { ..b1, truncated: true } },
+      }
+    },
+    Performed(atom) -> { ..b, observed: noted(b.observed, atom) },
+  }
+
+fn dropped_last<a>(xs: List<a>) -> List<a> = slice_list(xs, 0, max(len(xs) - 1, 0))
+
+fn bumped(entered: List<Entered>, at: Int) -> List<Entered> =
+  map(range(0, len(entered)), |i: Int|
+    if i == at { { ..at_or(entered, i), calls: min(at_or(entered, i).calls + 1, 4294967295) } }
+    else { at_or(entered, i) })
+
+// Ascending and deduplicated, because a footprint is a set and the printed order is part of the
+// artifact.
+fn noted(xs: List<String>, x: String) -> List<String> =
+  if contains(xs, x) { xs } else { sorted(push(xs, x)) }
+
+/// Captures the stack at the failure: by the end of a run every frame has unwound.
+pub fn failed(b: Builder) -> Builder =
+  match b.failed { Some(_) -> b, None -> { ..b, failed: Some(b.live) } }
+
+pub fn finish(b: Builder, reproduced: Bool) -> CausalSlice =
+  {
+    traced: true,
+    reproduced: reproduced,
+    entered: b.entered,
+    stack: match b.failed { Some(frames) -> frames, None -> [] },
+    observed: b.observed,
+    truncated: b.truncated,
+  }
+
+// --- The assertion a failure was ---------------------------------------------
+
+pub type AssertionKind =
+  | Equality
+  | Bare
+  | Panicked
+  | Runtime
+  | UnhandledEffect
+  | RecursionLimit
+  | Deadlock
+
+pub fn assertion_word(k: AssertionKind) -> String =
+  match k {
+    Equality -> "eq",
+    Bare -> "bool",
+    Panicked -> "panic",
+    Runtime -> "runtime",
+    UnhandledEffect -> "unhandled_effect",
+    RecursionLimit -> "recursion_limit",
+    Deadlock -> "deadlock",
+  }
+
+// The first place two compared values differ, as a path into them: `.entries[2].amount`.
+pub type Difference = { path: String, expected: String, actual: String }
+
+// Rendered strings rather than a value tree, so this schema is not tied to the evaluator's `Value`.
+pub type Assertion = {
+  kind: AssertionKind,
+  expected: Option<String>,
+  actual: Option<String>,
+  first_difference: Option<Difference>,
+  message: Option<String>,
+}
+
+pub fn an_assertion(kind: AssertionKind) -> Assertion =
+  { kind: kind, expected: None, actual: None, first_difference: None, message: None }
+
+pub fn equality(expected: String, actual: String) -> Assertion =
+  { ..an_assertion(Equality), expected: Some(expected), actual: Some(actual) }
+
+pub fn with_difference(a: Assertion, d: Difference) -> Assertion =
+  { ..a, first_difference: Some(d) }
+
+pub fn with_message(a: Assertion, message: String) -> Assertion = { ..a, message: Some(message) }
+
+// --- Helpers ------------------------------------------------------------------
+
+fn sorted(xs: List<String>) -> List<String> =
+  fold(xs, [], |acc: List<String>, x: String| {
+    let at = fold(range(0, len(acc)), len(acc), |i: Int, j: Int|
+      if i < len(acc) { i } else if compare(x, at_or(acc, j)) == Less { j } else { i });
+    let before = map(range(0, at), |j: Int| at_or(acc, j));
+    fold(range(at, len(acc)), push(before, x), |out: List<String>, j: Int| push(out, at_or(acc, j)))
+  })
+
+fn slice_list<a>(xs: List<a>, from: Int, to: Int) -> List<a> =
+  map(range(max(from, 0), min(to, len(xs))), |i: Int| at_or(xs, i))
+
+fn contains(xs: List<String>, x: String) -> Bool =
+  fold(xs, false, |found: Bool, y: String| found || y == x)
+
+fn some<a>(xs: List<a>, p: (a) -> Bool) -> Bool = fold(xs, false, |hit: Bool, x: a| hit || p(x))
+
+fn at_or<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list holds") }
+
+// --- Tests ------------------------------------------------------------------
+//
+// The expectations are the runtime's own answers for the same fixtures, printed from a scratch run
+// against it: the roster and the stack, the three queries, and what a truncated roster refuses to
+// say.
+
+fn a_site(start: Int, end: Int) -> Option<Site> = Some({ source: 0, start: start, end: end })
+
+// The same trace the scratch run builds: `main` calls `work`, `work` calls itself and performs
+// `fs.write[out]` (the printed atom the interpreter hands over), and then a `deep` frame is entered
+// without unwinding.
+fn a_trace() -> Builder = {
+  let b = new_builder();
+  let b = record(b, Enter("main", Some("h1"), None));
+  let b = record(b, Enter("work", Some("h2"), a_site(4, 9)));
+  let b = record(b, Enter("work", Some("h2"), a_site(12, 14)));
+  let b = record(b, Performed("fs.write[out]"));
+  let b = record(b, Returned);
+  let b = record(b, Enter("deep", None, None));
+  failed(b)
+}
+
+test "a trace remembers the roster, the stack at the failure, and what was performed" {
+  let s = finish(a_trace(), true);
+  assert_eq(s.traced, true);
+  assert_eq(s.reproduced, true);
+  assert_eq(s.truncated, false);
+  // First-entry order, with the calls a re-entered definition took.
+  assert_eq(map(s.entered, |e: Entered| e.name ++ ":" ++ int_to_string(e.calls)), [
+    "main:1",
+    "work:2",
+    "deep:1",
+  ]);
+  assert_eq(map(s.stack, |f: Frame| f.name), ["main", "work", "deep"]);
+  assert_eq(map(s.stack, |f: Frame| f.call_site), [None, a_site(4, 9), None]);
+  assert_eq(s.observed, ["fs.write[out]"])
+}
+
+test "the queries read the stack innermost first" {
+  let s = finish(a_trace(), true);
+  assert_eq(ran(s, "work"), true);
+  assert_eq(ran(s, "nope"), false);
+  assert_eq(did_run(s, "work"), Some(true));
+  assert_eq(did_run(s, "nope"), Some(false));
+  // `deep` never returned, so the stack still holds it; it is in the roster too, since it was
+  // entered well inside the cap.
+  assert_eq(ran(s, "deep"), true);
+  assert_eq(did_run(s, "deep"), Some(true));
+  assert_eq(depth_of(s, "deep"), Some(0));
+  assert_eq(depth_of(s, "work"), Some(1));
+  assert_eq(depth_of(s, "main"), Some(2));
+  // `work` was entered twice; the frame a failure is read against is the innermost one.
+  assert_eq(depth_of(s, "nope"), None);
+  assert_eq(path(s), ["main", "work", "deep"])
+}
+
+test "a roster that hit its cap says so instead of answering `false`" {
+  let b = with_cap(1);
+  let b = record(b, Enter("a", None, None));
+  let b = record(b, Enter("b", None, None));
+  let b = record(b, Enter("c", None, None));
+  let s = finish(failed(b), true);
+  assert_eq(s.truncated, true);
+  assert_eq(map(s.entered, |e: Entered| e.name), ["a"]);
+  // The live stack is exact whether or not a frame is within the cap.
+  assert_eq(map(s.stack, |f: Frame| f.name), ["a", "b", "c"]);
+  // `b` and `c` are on the stack and outside the roster, so they did run — and `z` is unknowable,
+  // which is a different answer from `false`.
+  assert_eq(did_run(s, "b"), Some(true));
+  assert_eq(ran(s, "b"), false);
+  assert_eq(did_run(s, "a"), Some(true));
+  assert_eq(did_run(s, "z"), None)
+}
+
+test "an untraced slice is empty rather than a claim that nothing ran" {
+  let s = untraced();
+  assert_eq(s.traced, false);
+  assert_eq(len(s.entered), 0);
+  assert_eq(len(s.stack), 0);
+  assert_eq(s.observed, [])
+}
+
+test "a trace mode parses, prints, and says which runs it traces" {
+  assert_eq(tracing_parse("auto"), Some(TraceAuto));
+  assert_eq(tracing_parse("always"), Some(TraceAlways));
+  assert_eq(tracing_parse("never"), Some(TraceNever));
+  assert_eq(tracing_parse("sometimes"), None);
+  assert_eq(tracing_word(TraceAuto), "auto");
+  assert_eq(tracing_word(TraceNever), "never");
+  // Only `always` traces the first execution, for a `test/nondet` that will not reproduce.
+  assert_eq(traces_first_run(TraceAlways), true);
+  assert_eq(traces_first_run(TraceAuto), false);
+  assert_eq(traces_replay(TraceNever), false);
+  assert_eq(traces_replay(TraceAuto), true);
+  assert_eq(default_cap(), 65536)
+}
+
+test "an assertion keeps the values it compared and the first place they differ" {
+  let a = with_message(
+    with_difference(equality("3", "4"), { path: ".entries[2].amount", expected: "3", actual: "4" }),
+    "the order did not balance",
+  );
+  assert_eq(assertion_word(a.kind), "eq");
+  assert_eq(a.expected, Some("3"));
+  assert_eq(a.actual, Some("4"));
+  assert_eq(a.first_difference, Some({ path: ".entries[2].amount", expected: "3", actual: "4" }));
+  assert_eq(a.message, Some("the order did not balance"));
+  assert_eq(assertion_word(Panicked), "panic");
+  assert_eq(assertion_word(Bare), "bool");
+  assert_eq(assertion_word(UnhandledEffect), "unhandled_effect");
+  assert_eq(an_assertion(Deadlock).expected, None)
+}
