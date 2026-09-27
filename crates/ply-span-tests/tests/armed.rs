@@ -6,21 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Registered codes no production source constructs, each with the reason it may stay so.
-const UNARMED_CODES: &[(&str, &str)] = &[
-    (
-        "DB_SCHEMA_MISMATCH",
-        "E0435. Reserved for a schema verification that was specified and never \
-         built. This row exists so the gap is asserted rather than remembered; \
-         it is not a decision that the gap is acceptable.",
-    ),
-    (
-        "DB_UNMODELLED_SIDE_EFFECT",
-        "E0438. Same reservation. Both codes are in crates/ply-eval/src/host.rs's \
-         RESERVED_CODES, so a handler cannot answer with either — a real, armed \
-         restriction (is_reserved_code), and not the same thing as the code being \
-         raised.",
-    ),
-];
+const UNARMED_CODES: &[(&str, &str)] = &[];
 
 /// Variants of a covered enum that no production source constructs.
 const UNARMED_VARIANTS: &[(&str, &str)] = &[
