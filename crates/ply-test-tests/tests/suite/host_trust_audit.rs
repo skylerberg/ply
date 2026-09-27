@@ -458,19 +458,15 @@ test "the regression" { assert_eq(ask(1), expected()) }
 
     let mut sources: Vec<(String, String)> = after.texts.clone().into_iter().collect();
     sources.sort();
-    ply_test::diagnose_failures(
-        &mut report,
-        &sources,
-        &after.port,
-        &mut store,
-        &ply_test::Options::default(),
-        true,
-    );
+    ply_test::diagnose_failures(&mut report, &sources, &after.port, &mut store);
 
+    // The failure says it reached the host, and no mixture is offered for one: a re-run would
+    // repeat whatever was done outside the program.
+    assert!(report.failures[0].host);
     let bisection = &report.failures[0].attribution.bisection;
     assert_eq!(
         bisection.verdict,
-        ply_test::Verdict::NotAttempted(ply_test::Skipped::Host),
+        ply_test::Verdict::NotAttempted(ply_test::Skipped::Delegated),
         "a host-backed failure was attributed rather than skipped: {:?} / {}",
         bisection.verdict,
         bisection.reason

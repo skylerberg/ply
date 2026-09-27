@@ -1177,6 +1177,8 @@ fn an_internal_error_is_a_defect_in_ply_rather_than_a_red_test() {
     assert_eq!(result.status, Status::Panicked);
     let failure = &report.failures[0];
     assert!(failure.defect);
+    // The run classifies what it can see how far it can see it: a defect in Ply is never a change
+    // in the program. Whether a search happens at all is the program reading the report's call.
     assert_eq!(
         failure.attribution.bisection.verdict,
         ply_test::Verdict::NotAttempted(ply_test::Skipped::Panicked)

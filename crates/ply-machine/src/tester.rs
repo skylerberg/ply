@@ -106,15 +106,6 @@ impl Session {
     }
 }
 
-/// Whether the program reads the report and searches for itself: its `tester` effect declares
-/// `trial`, which is the operation only a program that decides asks the runtime for.
-fn searches(check: &CheckOutput) -> bool {
-    check
-        .effects
-        .get(&Symbol::new(EFFECT))
-        .is_some_and(|effect| effect.ops.contains_key(&Symbol::new("trial")))
-}
-
 /// The decision, as the program sent it: the same four fields `ply_test::Choice` holds.
 fn choice_of(v: &PlyValue, span: Span) -> Result<ply_test::Choice, Diagnostic> {
     use crate::payload::field_of;
@@ -536,7 +527,7 @@ fn serve(args: &TestOptions, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<G
         } = signal
         {
             let answer = match &mut cache {
-                Ok(cache) => trial(&cache.store, hybrids.as_ref(), failure, &keys),
+                Ok(cache) => trial(&mut cache.store, hybrids.as_ref(), failure, &keys),
                 Err(diagnostic) => Err(diagnostic.clone()),
             };
             let _ = reply.send(answer);
@@ -1038,16 +1029,13 @@ fn execute(
                 None => run(),
             };
             // After the run, since a pass recorded now is a valid baseline for another's failure.
-            // The search is the program's as soon as its effect declares `trial`: the report it
-            // renders carries a verdict, and what that verdict decides is the program's. A program
-            // that declares no `trial` cannot ask, so this side searches for it.
+            // The search is the program's: what changed, what a mixture would need and why nothing
+            // could be tried are handed over, and the program that reads the report decides.
             hybrids = ply_test::diagnose_failures(
                 &mut report,
                 &loaded.texts(),
                 &loaded.front,
                 &mut cache.store,
-                &diagnosis_options(args),
-                !searches(&loaded.check),
             );
             let escapes = hosts_escapes(&report, &loaded.check, hosts);
             let ok = report.is_success() && escapes.is_empty();
@@ -1129,23 +1117,6 @@ fn execute(
             .then(|| crate::mutate::coverage_json(loaded, hashes)),
     };
     (over, hybrids)
-}
-
-/// `--bisect never` still goes through the diagnosis, so the artifact has one shape.
-pub fn diagnosis_options(args: &TestOptions) -> ply_test::Options {
-    ply_test::Options {
-        bisect: match args.bisect {
-            When::Auto => ply_test::Mode::Auto,
-            When::Always => ply_test::Mode::Always,
-            When::Never => ply_test::Mode::Never,
-        },
-        trace: match args.trace {
-            When::Auto => ply_test::Tracing::Auto,
-            When::Always => ply_test::Tracing::Always,
-            When::Never => ply_test::Tracing::Never,
-        },
-        budget: ply_test::Budget::new(args.bisect_budget),
-    }
 }
 
 // --- Counts under `--filter` --------------------------------------------------
@@ -2525,7 +2496,7 @@ impl Default for TestOptions {
 /// One mixture of one failure, tried on this thread: the store and the warm bodies are here, and
 /// the hybrid that swaps definitions is not `Send`.
 fn trial(
-    store: &ply_store::Store,
+    store: &mut ply_store::Store,
     hybrids: Option<&ply_test::Hybrids>,
     failure: usize,
     keys: &[(String, String)],
@@ -2572,7 +2543,14 @@ fn trial(
         Some(seed) => hybrid.at_seed(seed),
         None => hybrid,
     };
-    Ok(hybrid.trial_over(wanted))
+    let trial = hybrid.trial_over(wanted);
+    // A mixture that went green is a program whose definitions all pass at once, so what it proved
+    // may be cached — under the mixture's own test hash. The failing test's hash is a different
+    // test's, so a red test can never be passed by a mixture of it.
+    for hash in hybrid.take_proved() {
+        store.put(hash, ply_store::Outcome::Pass);
+    }
+    Ok(trial)
 }
 
 /// One trial's outcome, as the program reads it: the case, and whether the runtime answered from a
