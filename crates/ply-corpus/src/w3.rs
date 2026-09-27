@@ -178,7 +178,7 @@ impl Service {
         )?;
         // The accept loop and the rows above and below it, each widened by the one atom spawning
         // adds; the twin's entry points too, since this harness drives them.
-        const WIDENED: [&str; 9] = [
+        const WIDENED: [&str; 10] = [
             "serve",
             "listen_and_serve",
             "listen_and_serve_tls",
@@ -187,6 +187,9 @@ impl Service {
             "run_memory",
             "run_memory_tls",
             "memory_serving",
+            // The entry point's own function, which serves the desk from postgres and so performs
+            // whatever the accept loop does.
+            "postgres",
             "main",
         ];
         WIDENED
