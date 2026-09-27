@@ -5,6 +5,7 @@
 // every line and key of both reports, and the code each run exits with are decided here.
 
 import cmdline (Parsed, has, parse_nat, value, values_of)
+import proof.domain (Decl, Ty, finite, name_of, size)
 import machine
 import compiler.resolve (Diag, diag1)
 import diagnostic (Place, Spot, spot_of)
@@ -58,6 +59,10 @@ pub type SimOpts = {
 pub nondet effect prover {
   write configure[claims](options: Options) -> Unit
   read collected[claims]() -> Result<Collection, Refusal>
+  // The types the obligations are written over: what a domain is measured from. Whether the binders
+  // are finite, how many points that is, and whether walking them is a proof is `prove.domain`'s
+  // rule; the runtime only says what the types are.
+  read typed[claims]() -> Result<Typed, Refusal>
   // What the obligation cache holds under each key the program names, spelled out: a proof, a
   // sample, or something the runtime cannot read. The keys are the program's — a plan key is part
   // of an obligation's own encoding — so no row could carry the answers.
@@ -141,7 +146,24 @@ pub type Claim = {
 
 // What the program decided about a run of obligations: which ones it reports on, by collection
 // index, which of those the cache could not answer for, in that order, and the reason for each.
-pub type Choice = { claims: List<Int>, runs: List<Int>, reasons: List<String> }
+pub type Choice = {
+  claims: List<Int>,
+  runs: List<Int>,
+  reasons: List<String>,
+  // The finite domains this side measured for the claims it wants walked. A claim without one is
+  // sampled, which is a decision too.
+  domains: List<Measured>,
+}
+
+// What this side measured about one obligation's binders. The sizes are in binder order; the name is
+// what an artifact calls the domain.
+pub type Measured = { claim: Int, sizes: List<Int>, name: String }
+
+// One binder of one obligation: its name, the type as the runtime prints it, and the type itself.
+pub type Binder = { name: String, text: String, ty: Ty }
+
+// Every obligation's binders, by collection index, and every declared type a size needs.
+pub type Typed = { decls: List<Decl>, claims: List<{ claim: Int, binders: List<Binder> }> }
 
 pub type Sim = { mode: String, roots: List<Int>, budget: Int, steps: Int }
 
@@ -1040,3 +1062,50 @@ pub fn no_options() -> Options =
       measure_reduction: false,
     },
   }
+
+// The domains this side measured for the obligations it will discharge: the binders' types are the
+// runtime's, and what a domain *is* — how many points each binder holds, whether that is a domain at
+// all, and what it is called — is `prove.domain`'s rule. A claim whose binders are not finite, or
+// whose product is past the bound, is left out and sampled instead.
+pub fn measured(
+  c: Collection,
+  wanted: List<Int>,
+  to_discharge: List<Int>,
+) -> List<Measured> / {prover.typed[claims]} = {
+  let typed = match prover.typed[claims]() { Err(_) -> { decls: [], claims: [] }, Ok(t) -> t };
+  fold(to_discharge, [], |acc: List<Measured>, place: Int|
+    appended(acc, measured_one(typed, c.claims, wanted, place)))
+}
+
+fn appended<a>(head: List<a>, tail: List<a>) -> List<a> =
+  fold(tail, head, |acc: List<a>, x: a| push(acc, x))
+
+fn measured_one(typed: Typed, cs: List<Claim>, wanted: List<Int>, place: Int) -> List<Measured> =
+  match list_at(wanted, place) {
+    None -> [],
+    Some(claim) -> match find_entry(typed.claims, claim) {
+      None -> [],
+      Some(entry) -> match finite(map(entry.binders, |b: Binder| b.ty), typed.decls) {
+        None -> [],
+        Some(domain) ->
+          [
+            {
+              claim: claim,
+              sizes: domain.sizes,
+              name: name_of(map(entry.binders, |b: Binder| b.text)),
+            },
+          ],
+      },
+    },
+  }
+
+fn find_entry(
+  entries: List<{ claim: Int, binders: List<Binder> }>,
+  claim: Int,
+) -> Option<{ claim: Int, binders: List<Binder> }> =
+  fold(
+    entries,
+    None,
+    |found: Option<{ claim: Int, binders: List<Binder> }>, e: { claim: Int, binders: List<Binder> }|
+      match found { Some(_) -> found, None -> if e.claim == claim { Some(e) } else { None } },
+  )

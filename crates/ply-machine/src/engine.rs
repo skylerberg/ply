@@ -353,6 +353,11 @@ impl ply_test::obligation::Discharger for Prover<'_> {
 }
 
 impl<'a> Prover<'a> {
+    /// The types the laws are written over: what a program needs to measure a binder's domain.
+    pub fn world(&self) -> &TypeWorld {
+        &self.world
+    }
+
     /// One obligation, at the strongest tier this build can demonstrate. `domain` is the program's
     /// own measurement of its binders, or `None` when it decided to sample: whether the domain is
     /// finite is `domain.ply`'s answer now, and this side materialises the points.
