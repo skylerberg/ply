@@ -1461,6 +1461,16 @@ pub fn execute(portal: String, max_rows: Int) -> Bytes
 pub fn sync() -> Bytes
 pub fn terminate() -> Bytes
 pub fn read(buf: Bytes) -> Frames
+
+pub fn connect<[l]>(
+  host: String, port: Int, user: String, database: String,
+  password: Option<String>, client: Client,
+) -> Result<Session, ClientError> / {net.connect[l], net.send[l], net.recv[l], net.close[l]}
+pub fn simple_query<[l]>(s: Session, sql: String, client: Client)
+  -> Result<Reply, ClientError> / {net.send[l], net.recv[l]}
+pub fn extended_query<[l]>(s: Session, sql: String, params: List<Option<String>>, client: Client)
+  -> Result<Reply, ClientError> / {net.send[l], net.recv[l]}
+pub fn finish<[l]>(s: Session, client: Client) -> Unit / {net.send[l], net.close[l]}
 ```
 
 The protocol as framing and nothing else. Every front-end message after start-up
@@ -1478,6 +1488,18 @@ readers are `auth_code` and `auth_body`, `ready_status`, `parameter_status`,
 and `diagnostic_fields` — the last shared by `ErrorResponse` and
 `NoticeResponse`, with `field_of` for one field such as the SQLSTATE under `C`.
 A kind this module does not name is kept as `Other(byte)` rather than dropped.
+
+`connect` opens the socket and gets to where the server will answer a query:
+start-up, whatever authentication it asks for, its parameters, and
+`ReadyForQuery`; the parameters are left on the session and `setting` reads one.
+Authentication is answered for `AuthenticationOk` and for a clear-text password;
+md5 and SASL are refused with a message naming what was asked for.
+`simple_query` runs one statement, `extended_query` runs one with parameters
+bound as text, and both answer the columns, the rows and the command tag; NULL is
+`None` and every column is `Some` bytes. A statement the server refuses is
+`Rejected(session, server)`, which carries the connection back because it is
+still usable — the SQLSTATE is what a program branches on. `finish` sends
+`Terminate` and closes.
 
 A connection is `std.net`'s: `connect`, `send_all`, `drain`. Which statements to
 send, what a transaction is and when to retry are `std.db`'s.
