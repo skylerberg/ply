@@ -355,6 +355,50 @@ impl Drive {
         Ok(disclosed)
     }
 
+    /// Enter one definition with arguments, the way `call` asks: the value back, or what it
+    /// raised. The binding stays up, so a load may be called any number of times.
+    pub fn call(
+        &mut self,
+        name: &str,
+        args_wire: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, Diagnostic> {
+        let options = &self.options;
+        let target = &self.target;
+        let span = target
+            .check()
+            .defs
+            .get(&Symbol::new(name))
+            .map(|d| d.span)
+            .unwrap_or(Span::DUMMY);
+        let Some((_, bound)) = self.bound.as_ref() else {
+            return Err(Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                "`machine.call` before `machine.bound`: nothing is bound to call into".to_string(),
+            ));
+        };
+        let args: Vec<PlyValue> = args_wire
+            .iter()
+            .map(|w| crate::payload::value_from_wire(w, span))
+            .collect::<Result<_, _>>()?;
+        let plan = crate::simulation::run_plan(options.seed.as_ref());
+        let compiled = bound.tier.attach();
+        ply_eval::rc::reset();
+        let answered = ply_codegen::rt::with_step_budget(options.steps, || {
+            ply_codegen::rt::with_time_budget(options.timeout, || {
+                evaluate(
+                    target.front(),
+                    Call { name, args },
+                    span,
+                    &plan,
+                    &bound.hosts,
+                    bound.declared.as_ref(),
+                    compiled,
+                )
+            })
+        })?;
+        Ok(crate::payload::value_to_wire(&answered))
+    }
+
     /// Enter the bound entry and tear the binding down; the answer an `enter` op hands back.
     pub fn enter(&mut self) -> Outcome {
         let Some((entry, bound)) = self.bound.take() else {
@@ -379,7 +423,10 @@ impl Drive {
             ply_codegen::rt::with_time_budget(options.timeout, || {
                 evaluate(
                     target.front(),
-                    &entry,
+                    Call {
+                        name: &entry,
+                        args: Vec::new(),
+                    },
                     span,
                     &plan,
                     &bound.hosts,
@@ -509,9 +556,15 @@ fn disclosed(
     }
 }
 
+/// The definition a call enters: its program-wide name and the arguments it takes.
+pub struct Call<'a> {
+    pub name: &'a str,
+    pub args: Vec<PlyValue>,
+}
+
 fn evaluate(
     front: &Front,
-    entry: &str,
+    call: Call<'_>,
     span: Span,
     plan: &ply_eval::Plan,
     hosts: &Hosts,
@@ -529,7 +582,7 @@ fn evaluate(
     }
     // Exploration is a test-time activity; a run takes the one interleaving its seed names.
     ply_test::sim::seed_run(&mut machine, &plan.seeds()[0], plan.steps);
-    machine.call(entry, Vec::new(), span)
+    machine.call(call.name, call.args, span)
 }
 
 // --- The values that cross --------------------------------------------------------
