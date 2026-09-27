@@ -1403,13 +1403,28 @@ pub fn u32_le(n: Int) -> Bytes
 pub fn u64_le(n: Int) -> Bytes
 pub fn u32_at(b: Bytes, at: Int) -> Option<Int>
 pub fn u64_at(b: Bytes, at: Int) -> Option<Int>
+pub fn u16_be(n: Int) -> Bytes
+pub fn u32_be(n: Int) -> Bytes
+pub fn u64_be(n: Int) -> Bytes
+pub fn i16_be(n: Int) -> Bytes
+pub fn i32_be(n: Int) -> Bytes
+pub fn i64_be(n: Int) -> Bytes
+pub fn u16_be_at(b: Bytes, at: Int) -> Option<Int>
+pub fn u32_be_at(b: Bytes, at: Int) -> Option<Int>
+pub fn u64_be_at(b: Bytes, at: Int) -> Option<Int>
+pub fn i16_be_at(b: Bytes, at: Int) -> Option<Int>
+pub fn i32_be_at(b: Bytes, at: Int) -> Option<Int>
+pub fn i64_be_at(b: Bytes, at: Int) -> Option<Int>
 pub fn slice_at(b: Bytes, at: Int, n: Int) -> Option<Bytes>
 ```
 
-Little-endian integers in a byte string, which is how a binary format is
-written and read back. The writers take the low four or eight bytes of `n`.
+Integers in a byte string, little-endian and big-endian: how a binary format and
+a network protocol are written and read back. The writers take the low two, four
+or eight bytes of `n`; the `i` writers are the `u` ones' bytes, since two's
+complement is the representation, and exist so a call site says which it meant.
 Nothing here raises: a read past either end is `None`, and so is a `u64` past
-what an `Int` holds, so an answer is never a negative length.
+what an `Int` holds, so an answer is never a negative length. The `i` readers
+carry the sign, and `i64_be_at` answers for every `Int`.
 
 ### 13.15 `std.pkg`
 
