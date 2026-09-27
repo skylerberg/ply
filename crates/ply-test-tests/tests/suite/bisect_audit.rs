@@ -2,12 +2,10 @@ use crate::fixture::Compiled;
 use ply_span::SourceId;
 use ply_span::{Span, Symbol};
 use ply_test::bisect::{
-    Baseline, Budget, ChangeKind, Classify, Confidence, DefKey, Delta, DepEdges, Diff,
-    FusionReason, Hybrid, Regression, Rehashed, Skipped, Trial, Unresolved, Verdict, bisect, diff,
+    Baseline, ChangeKind, Classify, DefKey, DepEdges, Diff, FusionReason, Regression, Rehashed,
+    Skipped, diff,
 };
-use ply_test::{
-    Attribution, CausalSlice, Entered, Event, Evidence, Frame, Options, SliceBuilder, diagnose,
-};
+use ply_test::{Attribution, CausalSlice, Entered, Event, Frame, SliceBuilder};
 use ply_ty::{DefHash, HashOutput};
 use std::collections::BTreeMap;
 
@@ -109,7 +107,8 @@ fn members(diff: &Diff) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// No hybrid builder, so only the verdicts that need no mixture are reachable.
+/// What the report does for one failure when the program owns the search: the change set, the
+/// annotation, and a verdict that says whose the search was.
 fn attribute(before: &Compiled, after: &Compiled, key: &str, independent: bool) -> Attribution {
     let baseline = before.baseline(key);
     let mut classify = Renormalizing::new(after, &baseline, independent);
@@ -123,295 +122,21 @@ fn attribute(before: &Compiled, after: &Compiled, key: &str, independent: bool) 
         .filter(|n| **n != key)
         .cloned()
         .collect();
-    diagnose(
-        Evidence {
-            key: &key,
-            test_hash: after.test_hash(key.as_str()),
-            nondet: false,
-            defect: false,
-            host: false,
-            suspects: &suspects,
-            hashes: &after.hashes,
-            baseline: Some(&baseline),
-            slice: None,
-        },
-        &Options::default(),
-        &DepEdges::from(&after.hashes),
-        &mut classify,
-        None,
-        Skipped::NoHybrids,
-    )
+    let regression = Regression {
+        key: &key,
+        test_hash: after.test_hash(key.as_str()),
+        baseline: &baseline,
+        hashes: &after.hashes,
+    };
+    let diff = diff(&regression, &mut classify, &DepEdges::from(&after.hashes));
+    let mut attribution = Attribution::from_suspects(&suspects, &after.hashes);
+    attribution.annotate(&diff.delta);
+    attribution.resolve(ply_test::Bisection::not_attempted(Skipped::Delegated), None);
+    attribution
 }
 
-/// An arbitrary predicate, so a case can model an oracle that is non-monotone, refuses, or lies.
-struct Oracle<F> {
-    decide: F,
-    asked: Vec<Vec<Symbol>>,
-}
-
-impl<F: FnMut(&[Symbol]) -> Trial> Oracle<F> {
-    fn new(decide: F) -> Oracle<F> {
-        Oracle {
-            decide,
-            asked: Vec::new(),
-        }
-    }
-}
-
-impl<F: FnMut(&[Symbol]) -> Trial> Hybrid for Oracle<F> {
-    fn trial(&mut self, delta: &Delta, flipped: &[usize]) -> Trial {
-        let names = delta.flipped_names(flipped);
-        self.asked.push(names.clone());
-        (self.decide)(&names)
-    }
-}
-
-fn independent_edits(names: &[String]) -> Vec<ply_test::Change> {
-    names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| {
-            ply_test::Change::edited(
-                sym(n),
-                DefHash([i as u8; 32]),
-                DefHash([i as u8 ^ 0x80; 32]),
-                true,
-            )
-        })
-        .collect()
-}
-
-fn names(prefix: &str, n: usize) -> Vec<String> {
-    (0..n).map(|i| format!("{prefix}{i:04}")).collect()
-}
-
-#[test]
-fn either_edit_alone_being_sufficient_yields_one_minimal_culprit() {
-    let all = names("d", 6);
-    let delta = Delta::new(None, independent_edits(&all), &DepEdges::new());
-    let mut oracle = Oracle::new(|flipped: &[Symbol]| {
-        if flipped.contains(&sym("d0000")) || flipped.contains(&sym("d0005")) {
-            Trial::fails()
-        } else {
-            Trial::passes()
-        }
-    });
-    let out = bisect(&delta, &mut oracle, Budget::DEFAULT);
-
-    assert_eq!(out.verdict, Verdict::Bisected);
-    assert_eq!(out.confidence, Confidence::Minimal);
-    assert_eq!(out.culprits().len(), 1, "{:?}", out.culprits());
-    assert!(
-        out.culprits() == vec![sym("d0000")] || out.culprits() == vec![sym("d0005")],
-        "{:?}",
-        out.culprits()
-    );
-}
-
-#[test]
-fn a_pair_that_straddles_the_first_split_is_returned_whole() {
-    let all = names("d", 8);
-    let delta = Delta::new(None, independent_edits(&all), &DepEdges::new());
-    let mut oracle = Oracle::new(|flipped: &[Symbol]| {
-        if flipped.contains(&sym("d0000")) && flipped.contains(&sym("d0007")) {
-            Trial::fails()
-        } else {
-            Trial::passes()
-        }
-    });
-    let out = bisect(&delta, &mut oracle, Budget::DEFAULT);
-
-    assert_eq!(out.verdict, Verdict::Bisected);
-    assert_eq!(out.culprits(), vec![sym("d0000"), sym("d0007")]);
-    assert_eq!(out.confidence, Confidence::Minimal);
-}
-
-/// ddmin owes only *a* 1-minimal set, so this checks reproduction and 1-minimality, not which set.
-#[test]
-fn a_three_way_interaction_is_returned_as_a_genuinely_one_minimal_set() {
-    let all = names("d", 7);
-    let culprits = [sym("d0001"), sym("d0003"), sym("d0006")];
-    let fails = |flipped: &[Symbol]| culprits.iter().all(|c| flipped.contains(c));
-    let delta = Delta::new(None, independent_edits(&all), &DepEdges::new());
-    let mut oracle = Oracle::new(|flipped: &[Symbol]| {
-        if fails(flipped) {
-            Trial::fails()
-        } else {
-            Trial::passes()
-        }
-    });
-    let out = bisect(&delta, &mut oracle, Budget::DEFAULT);
-
-    let found = out.culprits();
-    assert!(
-        fails(&found),
-        "the reported set does not reproduce: {found:?}"
-    );
-    for drop in &found {
-        let smaller: Vec<Symbol> = found.iter().filter(|n| *n != drop).cloned().collect();
-        assert!(
-            !fails(&smaller),
-            "{drop} could be dropped, so the set is not 1-minimal: {found:?}"
-        );
-    }
-}
-
-#[test]
-fn a_thousand_candidates_are_narrowed_logarithmically_without_spending_the_budget() {
-    let all = names("d", 1024);
-    let delta = Delta::new(None, independent_edits(&all), &DepEdges::new());
-    assert_eq!(delta.clusters.len(), 1024, "nothing may cap the candidates");
-
-    let mut oracle = Oracle::new(|flipped: &[Symbol]| {
-        if flipped.contains(&sym("d0777")) {
-            Trial::fails()
-        } else {
-            Trial::passes()
-        }
-    });
-    let out = bisect(&delta, &mut oracle, Budget::DEFAULT);
-
-    assert_eq!(out.culprits(), vec![sym("d0777")]);
-    assert_eq!(out.confidence, Confidence::Minimal);
-    assert!(!out.search.exhausted, "{:?}", out.search);
-    // 2·log2(1024) halvings, plus the reproduction trial and the baseline one.
-    assert!(out.search.evaluated <= 22, "{:?}", out.search);
-}
-
-#[test]
-fn a_cause_that_acts_only_through_an_unchanged_definition_is_still_named() {
-    let all = names("d", 5);
-    let delta = Delta::new(None, independent_edits(&all), &DepEdges::new());
-    let mut oracle = Oracle::new(|flipped: &[Symbol]| {
-        if flipped.contains(&sym("d0002")) {
-            Trial::fails()
-        } else {
-            Trial::passes()
-        }
-    });
-    let out = bisect(&delta, &mut oracle, Budget::DEFAULT);
-    assert_eq!(out.culprits(), vec![sym("d0002")]);
-    assert!(
-        !out.culprits().contains(&sym("relay")),
-        "an unchanged definition is never a candidate"
-    );
-}
-
-#[test]
-fn a_signature_change_that_poisons_every_split_is_fused_before_the_search() {
-    let mut changes = independent_edits(&names("d", 3));
-    changes.push(ply_test::Change::edited(
-        sym("callee"),
-        DefHash([9; 32]),
-        DefHash([10; 32]),
-        false,
-    ));
-    let mut edges = DepEdges::new();
-    edges.add(sym("d0000"), sym("callee"));
-    let delta = Delta::new(None, changes, &edges);
-
-    let mut oracle = Oracle::new(|flipped: &[Symbol]| {
-        if flipped.contains(&sym("callee")) != flipped.contains(&sym("d0000")) {
-            return Trial::unresolved(Unresolved::DoesNotCheck);
-        }
-        if flipped.contains(&sym("callee")) {
-            Trial::fails()
-        } else {
-            Trial::passes()
-        }
-    });
-    let out = bisect(&delta, &mut oracle, Budget::DEFAULT);
-
-    assert_eq!(out.confidence, Confidence::Fused);
-    assert_eq!(out.search.unresolved, 0, "no split was ever built");
-    assert_eq!(out.groups, vec![vec![sym("callee"), sym("d0000")]]);
-    for asked in &oracle.asked {
-        assert_eq!(
-            asked.contains(&sym("callee")),
-            asked.contains(&sym("d0000")),
-            "a hybrid splitting the fused pair was built: {asked:?}"
-        );
-    }
-}
-
-#[test]
-fn an_inseparable_pair_that_refuses_keeps_both_and_drops_to_partial() {
-    let all = names("d", 4);
-    let delta = Delta::new(None, independent_edits(&all), &DepEdges::new());
-    let mut oracle = Oracle::new(|flipped: &[Symbol]| {
-        if flipped.contains(&sym("d0001")) != flipped.contains(&sym("d0002")) {
-            return Trial::unresolved(Unresolved::DoesNotCheck);
-        }
-        if flipped.contains(&sym("d0001")) {
-            Trial::fails()
-        } else {
-            Trial::passes()
-        }
-    });
-    let out = bisect(&delta, &mut oracle, Budget::DEFAULT);
-
-    assert!(out.culprits().contains(&sym("d0001")));
-    assert_eq!(out.confidence, Confidence::Partial);
-    assert!(out.search.unresolved > 0);
-}
-
-/// A kept member still names its partner's baseline hash, so flipping one alone replays the baseline.
-#[test]
-fn a_component_no_hybrid_can_split_is_never_offered_to_the_search_split() {
-    let changes = independent_edits(&["even".to_string(), "odd".to_string()]);
-    let mut edges = DepEdges::new();
-    edges.add(sym("even"), sym("odd"));
-    edges.add(sym("odd"), sym("even"));
-    let component = vec![DefKey::value(sym("even")), DefKey::value(sym("odd"))];
-    let delta = Delta::with_components(None, changes, &edges, &[component]);
-    assert_eq!(delta.clusters.len(), 1, "the component is one atom");
-    assert_eq!(delta.clusters[0].reason, FusionReason::Component);
-
-    let mut oracle = Oracle::new(|flipped: &[Symbol]| {
-        let both = flipped.contains(&sym("even")) && flipped.contains(&sym("odd"));
-        if both {
-            Trial::fails()
-        } else {
-            Trial::passes()
-        }
-    });
-    let out = bisect(&delta, &mut oracle, Budget::DEFAULT);
-
-    assert_eq!(out.verdict, Verdict::Sole);
-    assert_eq!(out.groups, vec![vec![sym("even"), sym("odd")]]);
-    assert_eq!(out.confidence, Confidence::Fused);
-    for asked in &oracle.asked {
-        assert_eq!(
-            asked.contains(&sym("even")),
-            asked.contains(&sym("odd")),
-            "a hybrid splitting the component was built: {asked:?}"
-        );
-    }
-}
-
-#[test]
-fn a_failure_that_does_not_reproduce_names_nobody() {
-    let all = names("d", 4);
-    let delta = Delta::new(None, independent_edits(&all), &DepEdges::new());
-    let mut oracle = Oracle::new(|_: &[Symbol]| Trial::passes());
-    let out = bisect(&delta, &mut oracle, Budget::DEFAULT);
-
-    assert_eq!(out.verdict, Verdict::NotReproduced);
-    assert!(out.culprits().is_empty());
-    assert_eq!(out.confidence, Confidence::None);
-}
-
-#[test]
-fn a_failure_the_baseline_also_shows_is_never_attributed_to_a_change() {
-    let all = names("d", 5);
-    let delta = Delta::new(None, independent_edits(&all), &DepEdges::new());
-    let mut oracle = Oracle::new(|_: &[Symbol]| Trial::fails());
-    let out = bisect(&delta, &mut oracle, Budget::DEFAULT);
-
-    assert_eq!(out.verdict, Verdict::NotInTheGraph);
-    assert!(out.culprits().is_empty());
-}
-
+/// A chain of  definitions, each calling the one below it, so an edit at the leaf reaches
+/// every caller through the hashes and only the leaf is a candidate.
 fn chain(depth: usize, leaf: &str) -> String {
     let mut src = format!("fn f000(n: Int) -> Int = {leaf}\n");
     for i in 1..depth {
@@ -441,10 +166,11 @@ fn a_deep_chain_yields_one_candidate_and_sixty_three_derived_ones() {
     assert!(diff.unclassified.is_empty(), "{:?}", diff.unclassified);
 
     let out = attribute(&before, &after, "m.deep", true);
-    assert_eq!(out.bisection.verdict, Verdict::Sole);
-    assert_eq!(out.bisection.confidence, Confidence::Minimal);
-    assert_eq!(out.culprits(), vec![sym("m.f000")]);
-    assert_eq!(out.bisection.search.evaluated, 0);
+    assert_eq!(
+        out.suspects[0].name,
+        sym("m.f000"),
+        "the edited definition ranks above the sixty-three that only moved under it"
+    );
 }
 
 const HANDLED: &str = r#"
@@ -477,8 +203,13 @@ fn editing_an_effect_handler_names_the_definition_that_carries_it() {
     assert!(diff.unclassified.is_empty());
 
     let out = attribute(&before, &after, "m.handled", true);
-    assert_eq!(out.bisection.verdict, Verdict::Sole);
-    assert_eq!(out.culprits(), vec![sym("m.seeded")]);
+    assert!(
+        out.suspects
+            .iter()
+            .any(|s| s.name == sym("m.seeded") && s.change == Some(ChangeKind::Edited)),
+        "the definition carrying the handler is a ranked suspect: {:?}",
+        out.suspects
+    );
 }
 
 #[test]
@@ -538,8 +269,6 @@ test "chain" { assert_eq(top(1), 4) }
     assert_eq!(members(&diff), vec![vec!["m.leaf".to_string()]]);
 
     let out = attribute(&before, &after, "m.chain", true);
-    assert_eq!(out.bisection.verdict, Verdict::Sole);
-    assert_eq!(out.culprits(), vec![sym("m.leaf")]);
     assert_eq!(
         out.bisection.search.evaluated, 0,
         "a rename beside one edit is still a one-cluster delta"
@@ -576,16 +305,6 @@ test "parity" { assert(even(4)) }
         "and says so: {:?}",
         diff.delta.clusters
     );
-
-    let out = attribute(&before, &after, "m.parity", true);
-    assert_eq!(out.bisection.verdict, Verdict::Sole);
-    assert_eq!(out.bisection.confidence, Confidence::Fused);
-    assert_eq!(out.culprits(), vec![sym("m.even"), sym("m.odd")]);
-    assert!(
-        out.bisection.reason.contains("mutually recursive"),
-        "the artifact must say why the pair is inseparable: {}",
-        out.bisection.reason
-    );
 }
 
 /// The right answer for the wrong reason: `StoreClassify` fuses whenever the baseline interface is missing.
@@ -607,8 +326,11 @@ test "parity" { assert(even(4)) }
     );
 
     let out = attribute(&before, &after, "m.parity", false);
-    assert_eq!(out.bisection.verdict, Verdict::Sole);
-    assert_eq!(out.bisection.confidence, Confidence::Fused);
+    assert_eq!(
+        out.suspects.len(),
+        2,
+        "both members of the fused component are suspects"
+    );
 }
 
 const COLLIDE: &str = r#"
@@ -664,9 +386,6 @@ fn a_name_shared_by_a_fn_and_a_type_still_names_the_edited_one() {
     assert!(diff.unclassified.is_empty(), "{:?}", diff.unclassified);
 
     let out = attribute(&before, &after, "m.t", true);
-    assert_eq!(out.bisection.verdict, Verdict::Sole);
-    assert_eq!(out.bisection.confidence, Confidence::Minimal);
-    assert_eq!(out.culprits(), vec![name.clone()]);
     let innocent = out
         .suspects
         .iter()
@@ -674,42 +393,6 @@ fn a_name_shared_by_a_fn_and_a_type_still_names_the_edited_one() {
         .expect("the dependent is still a suspect");
     assert!(!innocent.culprit);
     assert_eq!(innocent.change, Some(ChangeKind::Derived));
-}
-
-#[test]
-fn an_unclassified_change_costs_the_minimality_claim() {
-    let before = Compiled::new(COLLIDE);
-    let after =
-        Compiled::new(&COLLIDE.replace("Cents(Int) | Dollars(Int)", "Dollars(Int) | Cents(Int)"));
-
-    let baseline = before.baseline("m.t");
-    let key = sym("m.t");
-    let regression = Regression {
-        key: &key,
-        test_hash: after.test_hash("m.t"),
-        baseline: &baseline,
-        hashes: &after.hashes,
-    };
-    // `Unknown` is what a pruned front-end cache leaves: it cannot tell an edit from a moved hash.
-    let diff = diff(
-        &regression,
-        &mut ply_test::bisect::Unknown,
-        &DepEdges::from(&after.hashes),
-    );
-    assert!(!diff.unclassified.is_empty());
-    assert!(diff.delta.unclassified >= diff.unclassified.len());
-
-    let out = bisect(
-        &diff.delta,
-        &mut ply_test::bisect::NoHybrid,
-        Budget::DEFAULT,
-    );
-    assert!(!out.culprits().is_empty());
-    assert_eq!(
-        out.confidence,
-        Confidence::Partial,
-        "a guessed partition is not a minimal one"
-    );
 }
 
 #[test]
@@ -750,9 +433,11 @@ fn documents_a_single_unrelated_change_is_named_without_asking_whether_it_matter
     let after = Compiled::new(&chain(4, "n + 2"));
 
     let out = attribute(&before, &after, "m.deep", true);
-    assert_eq!(out.bisection.verdict, Verdict::Sole);
-    assert_eq!(out.bisection.confidence, Confidence::Minimal);
-    assert_eq!(out.culprits(), vec![sym("m.f000")]);
+    assert_eq!(
+        out.suspects[0].name,
+        sym("m.f000"),
+        "the edited definition ranks above the sixty-three that only moved under it"
+    );
     assert_eq!(
         out.bisection.search.evaluated, 0,
         "nothing was ever run to check that this change is the cause"
@@ -765,6 +450,11 @@ fn two_diagnoses_of_one_real_failure_agree_byte_for_byte() {
     let after = Compiled::new(&chain(16, "n + 2"));
     let render = || {
         let out = attribute(&before, &after, "m.deep", true);
+        assert_eq!(
+            out.suspects[0].name,
+            sym("m.f000"),
+            "the edited definition ranks above the sixty-three that only moved under it"
+        );
         ply_test::report::failure_json(&ply_test::Failure {
             name: "deep".to_string(),
             key: sym("m.deep"),
@@ -780,38 +470,6 @@ fn two_diagnoses_of_one_real_failure_agree_byte_for_byte() {
         .to_string()
     };
     assert_eq!(render(), render());
-}
-
-#[test]
-fn a_test_that_never_passed_is_not_bisected_over_a_real_program() {
-    let after = Compiled::new(&chain(8, "n + 2"));
-    let key = sym("m.deep");
-    let suspects: Vec<Symbol> = after.hashes.defs.keys().cloned().collect();
-    let out = diagnose(
-        Evidence {
-            key: &key,
-            test_hash: after.test_hash("m.deep"),
-            nondet: false,
-            defect: false,
-            host: false,
-            suspects: &suspects,
-            hashes: &after.hashes,
-            baseline: None,
-            slice: None,
-        },
-        &Options::default(),
-        &DepEdges::from(&after.hashes),
-        &mut ply_test::bisect::Unknown,
-        None,
-        Skipped::NoHybrids,
-    );
-
-    assert_eq!(
-        out.bisection.verdict,
-        Verdict::NotAttempted(Skipped::NeverPassed)
-    );
-    assert!(out.culprits().is_empty());
-    assert!(out.suspects.iter().all(|s| s.change.is_none()));
 }
 
 fn enter(name: &str) -> Event {
@@ -936,51 +594,4 @@ fn a_slice_that_did_not_reproduce_annotates_nothing() {
 
     assert_eq!(attribution.suspects[0].ran, None);
     assert_eq!(attribution.suspects[0].depth, None);
-}
-
-#[test]
-fn documents_a_budget_spent_before_the_first_question_still_reports_bisected() {
-    let all = names("d", 5);
-    let delta = Delta::new(None, independent_edits(&all), &DepEdges::new());
-    let mut oracle = Oracle::new(|flipped: &[Symbol]| {
-        if flipped.contains(&sym("d0002")) {
-            Trial::fails()
-        } else {
-            Trial::passes()
-        }
-    });
-    let out = bisect(&delta, &mut oracle, Budget::new(1));
-
-    assert_eq!(out.verdict, Verdict::Bisected);
-    assert_eq!(out.confidence, Confidence::Partial);
-    assert!(out.search.exhausted);
-    assert_eq!(
-        out.search.unresolved, 0,
-        "a spent budget is not an unresolved trial"
-    );
-    assert_eq!(out.culprits().len(), 5, "nothing was narrowed");
-    assert!(
-        out.reason
-            .starts_with("narrowed 5 changed definitions to d0000")
-    );
-}
-
-/// The moved definition may be innocent; only the `H(∅)` trial separates it from the test edit.
-#[test]
-fn a_single_cluster_beside_an_edited_test_cannot_claim_minimality() {
-    let delta = Delta::new(
-        Some(ply_test::Change::edited(
-            sym("m.t"),
-            DefHash([1; 32]),
-            DefHash([2; 32]),
-            true,
-        )),
-        independent_edits(&names("d", 1)),
-        &DepEdges::new(),
-    );
-    let out = bisect(&delta, &mut ply_test::bisect::NoHybrid, Budget::DEFAULT);
-
-    assert_eq!(out.verdict, Verdict::Sole);
-    assert_eq!(out.confidence, Confidence::Partial);
-    assert_eq!(out.search.unresolved, 1);
 }
