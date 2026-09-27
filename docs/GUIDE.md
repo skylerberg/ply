@@ -1449,6 +1449,39 @@ derives `ord`, ordered major, then minor, then patch. `prefix_of` and
 `entry_of` answer the defaults (`name` and `main`), and `render_version`
 writes a version dotted.
 
+### 13.16 `std.pg` — the postgres wire protocol
+
+```ply
+pub fn startup(user: String, database: String) -> Bytes
+pub fn query(sql: String) -> Bytes
+pub fn parse(statement: String, sql: String, param_types: List<Int>) -> Bytes
+pub fn bind(portal: String, statement: String, params: List<Option<String>>) -> Bytes
+pub fn describe(statement: Bool, name: String) -> Bytes
+pub fn execute(portal: String, max_rows: Int) -> Bytes
+pub fn sync() -> Bytes
+pub fn terminate() -> Bytes
+pub fn read(buf: Bytes) -> Frames
+```
+
+The protocol as framing and nothing else. Every front-end message after start-up
+is a kind byte, an `Int32` length that counts itself, and a body; `startup` is
+the exception, its length first, because the server has agreed no protocol
+version yet. `ssl_request` and `cancel_request` are the two other unframed
+messages. Values travel as text in both directions, so a parameter is the text
+the server would have printed and a column is the text it printed: this layer
+never decodes a value.
+
+`read` takes what a socket returned and answers the whole messages in it plus
+the bytes that are not yet one, so a short read is not an error. The back-end
+readers are `auth_code` and `auth_body`, `ready_status`, `parameter_status`,
+`backend_key`, `row_description`, `data_row`, `command_tag`, `parameter_types`
+and `diagnostic_fields` — the last shared by `ErrorResponse` and
+`NoticeResponse`, with `field_of` for one field such as the SQLSTATE under `C`.
+A kind this module does not name is kept as `Other(byte)` rather than dropped.
+
+A connection is `std.net`'s: `connect`, `send_all`, `drain`. Which statements to
+send, what a transaction is and when to retry are `std.db`'s.
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
