@@ -214,7 +214,7 @@ fn the_digest_moves_when_a_stored_value_changes() {
     let after = {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"ply-store schema v1");
-        hasher.update(&serde_json::to_vec(&e.def).unwrap());
+        hasher.update(&ply_store::codec::encode_def(&e.def));
         ContentHash(*hasher.finalize().as_bytes())
     };
     assert_ne!(before, after);
