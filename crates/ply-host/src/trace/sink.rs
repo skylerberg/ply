@@ -422,9 +422,9 @@ fn write_json_field(out: &mut String, field: &Field) {
         Field::Text(s) => write_string(out, s),
         // JSON has no `NaN` or infinity, so those go out as strings.
         Field::Float(f) if f.is_finite() => {
-            let _ = write!(out, "{}", ply_ty::render_float(*f));
+            let _ = write!(out, "{}", ply_eval::render_float(*f));
         }
-        Field::Float(f) => write_string(out, &ply_ty::render_float(*f)),
+        Field::Float(f) => write_string(out, &ply_eval::render_float(*f)),
         Field::Decimal(d) => write_string(out, &d.to_string()),
         Field::Bytes(bytes) => {
             out.push('"');

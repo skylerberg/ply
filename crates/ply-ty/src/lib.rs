@@ -1,7 +1,6 @@
 //! The type vocabulary of a checked program, shared by the checker and everything downstream.
 
 pub mod decl;
-pub mod expr;
 pub mod front;
 pub mod hash;
 pub mod parse;
@@ -14,7 +13,6 @@ use ply_span::{SourceId, Span, Symbol};
 pub use decl::{
     Deriver, ModuleName, SpecKind, Visibility, is_ident, is_ident_continue, is_ident_start,
 };
-pub use expr::{BinOp, Lit, UnOp, render_float};
 pub use front::{
     DefWritten, EffectSet, Front, Hashed, Literal, Ordinal, TypeDecl, WrittenParam, read_front,
     write_front,
@@ -164,14 +162,4 @@ pub struct CheckOutput {
     pub effects: IndexMap<Symbol, EffectInfo>,
     pub ctors: IndexMap<Symbol, CtorInfo>,
     pub modules: IndexMap<Symbol, ModuleInfo>,
-}
-
-impl CheckOutput {
-    pub fn effect_of(&self, atom: &EffectAtom) -> Option<&EffectInfo> {
-        self.effects.get(&atom.effect)
-    }
-
-    pub fn is_nondet(&self, atom: &EffectAtom) -> bool {
-        self.effects.get(&atom.effect).is_some_and(|e| e.nondet)
-    }
 }

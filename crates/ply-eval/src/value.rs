@@ -1,10 +1,10 @@
 use crate::arena::Slot;
 use crate::builtins::Builtin;
 use crate::limit::{self, MAX_VALUE_DEPTH, grow};
+use crate::render_float;
 use crate::sim::TaskId;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 pub use ply_ty::IntTy;
-use ply_ty::render_float;
 use rpds::RedBlackTreeMap;
 pub use rust_decimal::Decimal;
 use std::cell::RefCell;

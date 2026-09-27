@@ -4,8 +4,9 @@ use super::RuleLog;
 use super::claims::{self, Code, Pat, Stmt};
 use super::context::Context;
 use super::term::{self, Arm, ArmTest, CmpOp, Node, TermId, Terms};
+use ply_eval::{BinOp, Lit, UnOp};
 use ply_span::Symbol;
-use ply_ty::{BinOp, CtorInfo, Lit, Scheme, TyVar, Type, UnOp};
+use ply_ty::{CtorInfo, Scheme, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_TERMS: usize = 20_000;
