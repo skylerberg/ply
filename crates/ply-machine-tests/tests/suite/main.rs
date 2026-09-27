@@ -666,9 +666,7 @@ fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
         .collect();
     let unit = ply_codegen::Unit::over_front(&front, texts).expect("this host has a C toolchain");
     let mut machine = Machine::new(&front);
-    machine.set_compiled(unit.attach(&BackendSpec {
-        kind: BackendKind::C,
-    }));
+    machine.set_compiled(unit.attach());
     let mut registry = HostRegistry::new();
     ply_machine::register_with_for(
         &mut registry,

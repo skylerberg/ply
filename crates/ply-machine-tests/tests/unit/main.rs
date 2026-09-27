@@ -7,6 +7,7 @@ mod db;
 mod hosts;
 mod load;
 mod migrate;
+mod payload;
 mod signature;
 mod simulation;
 mod warm;
