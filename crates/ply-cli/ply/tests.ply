@@ -21,6 +21,13 @@ import style (Style, plain, bold, dim, green, red, yellow)
 import suite.schedule (contends_only_over_regions, group_by_conflict, parallelism, region_isolated)
 // What a run decides, and the keys it decides with: the same arithmetic the runtime used to do.
 import suite.keys (writes_seed_keys)
+// What decides a cause: the change set, the search over it, and the verdict it reaches.
+import suite.bisect (Auto, Bisection, Budget, Mode, NotAttempted, NotRequested, Skipped, Trial,
+                     is_conclusive, mode_parse, skipped_parse)
+import suite.delta (Delta, DefKey, flipped_keys, ns_word)
+import suite.diagnose (Attribution, Evidence, diagnose)
+// The tracing side of a plan is the slice's: the trace a re-run keeps is what `--trace` names.
+import suite.slice (TraceAuto, TraceAlways, TraceNever, Tracing, tracing_parse)
 import suite.select (Cached, Decision, New, Nondet, PreviousFailure, Reason, Unhashed, decide,
                      owed_roots, seed_keys, to_run, word)
 
@@ -91,6 +98,9 @@ pub nondet effect tester {
   // share, and the reason for every test. Stated before the binding, because whether a unit has to
   // be built at all is a function of it.
   write chosen[r](choice: Choice) -> Unit
+  // One mixture of one failure, for a program that does the searching itself: the change set comes
+  // back with the report, and each trial is a set of definitions to take from the post-edit side.
+  read trial[r](failure: Int, keys: List<{ name: String, ns: String }>) -> Trial
 }
 
 // One run's decision, as the runtime reads it back.
@@ -297,7 +307,9 @@ fn flattened(classes: List<List<Int>>) -> List<{ index: Int, group: Int }> =
   flat_map(range(0, len(classes)), |i: Int|
     map(at(classes, i, []), |index: Int| { index: index, group: i }))
 
-fn flat_map<a, b>(xs: List<a>, f: (a) -> List<b>) -> List<b> =
+// The callback's row is the caller's: this runs a search that performs the trial operation, so a
+// pure `(a) -> List<b>` would refuse it.
+fn flat_map<a, b | e>(xs: List<a>, f: (a) -> List<b> / e) -> List<b> / e =
   fold(xs, [], |acc: List<b>, x: a| fold_into(acc, f(x)))
 
 fn fold_into<a>(acc: List<a>, xs: List<a>) -> List<a> =
@@ -405,9 +417,24 @@ pub type Site = { task: String, definition: Option<String>, access: String, at: 
 // The two steps whose reordering flipped a passing interleaving to this one.
 pub type Race = { left: Site, right: Site }
 
+// What the runtime hands over so this program can search for the cause itself: the change set, what
+// the classifier could not tell apart, the reason to give when there is nothing to try, and where
+// each name in the change set is.
+pub type Search = {
+  delta: Delta,
+  classified: Int,
+  test_classified: Bool,
+  absent: Skipped,
+  at: List<{ name: String, at: Option<At> }>,
+}
+
 pub type Fault = {
   key: String,
   diagnostic: Diag,
+  // Two of the gate's three answers; the mode is this run's own flag.
+  defect: Bool,
+  host: Bool,
+  search: Option<Search>,
   bisect: Bisect,
   slice: Option<Slice>,
   suspects: List<Suspect>,
@@ -1545,7 +1572,7 @@ fn key_as_case(
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {tester.configure[corpus], tester.loaded[corpus], tester.bound[corpus], tester.ran[corpus], tester.footprint[corpus], tester.outcomes[corpus], tester.chosen[corpus], tester.keys[corpus], tester.searched[corpus]} = {
+) -> Answer / {tester.configure[corpus], tester.loaded[corpus], tester.bound[corpus], tester.ran[corpus], tester.footprint[corpus], tester.outcomes[corpus], tester.chosen[corpus], tester.keys[corpus], tester.searched[corpus], tester.trial[corpus]} = {
   let s: Style = style_of(flags);
   tester.configure[corpus](options);
   match tester.loaded[corpus]() {
@@ -1591,11 +1618,111 @@ pub fn run(
       });
       match tester.bound[corpus]() {
         Err(refusal) -> unbound(s, refusal),
-        Ok(_) -> answered(s, flags, p, tester.ran[corpus](), decided),
+        Ok(_) -> {
+          // The run is over, so the runtime can be asked about mixtures of what it found; every
+          // failure's verdict is decided here, before anything renders one.
+          let r = tester.ran[corpus]();
+          answered(s, flags, p, { ..r, failures: decided_faults(r, options) }, decided)
+        },
       }
     },
   }
 }
+
+// --- What decided each cause -------------------------------------------------
+
+/// One failure's verdict. The runtime hands over the change set and a way to try a mixture of it;
+/// where the search goes is the program's, so `suite.bisect` runs here over a closure that asks the
+/// runtime for one trial at a time.
+fn searched(f: Fault, index: Int, options: Options) -> Bisect / {tester.trial[corpus]} =
+  match f.search {
+    None -> f.bisect,
+    Some(s) -> match diagnosis_of(f, options, s, index) {
+      Err(_) -> f.bisect,
+      Ok(verdict) ->
+        {
+          conclusive: is_conclusive(verdict),
+          // Silent when no bisection was asked for.
+          requested: match verdict.verdict { NotAttempted(NotRequested) -> false, _ -> true },
+          reason: verdict.reason,
+          culprits: map(verdict.groups, |group: List<String>|
+            { names: group, at: first_at(s.at, group) }),
+        },
+    },
+  }
+
+// The gate and the plan, as T4's `diagnose` reads them: the mode and the budget are this run's flags,
+/// and the suspects are the closure the runtime already ranked.
+fn diagnosis_of(
+  f: Fault,
+  options: Options,
+  s: Search,
+  index: Int,
+) -> Result<Bisection, Unit> / {tester.trial[corpus]} = {
+  let evidence: Evidence = {
+    nondet: match f.nondet { Some(x) -> x, None -> false },
+    defect: f.defect,
+    host: f.host,
+    // The runtime ranked the suspects already; this side reads only the verdict.
+    suspects: [],
+    // The change set came with the report, so an earlier passing run is on record by construction.
+    baseline: true,
+    // The slice stays the runtime's: it ranks the suspects, and this decides what to try.
+    slice: None,
+  };
+  let plan = {
+    bisect: match mode_parse(options.bisect) { Some(m) -> m, None -> Auto },
+    trace: match tracing_parse(options.trace) {
+      Some(TraceAuto) -> TraceAuto,
+      Some(TraceNever) -> TraceNever,
+      _ -> TraceNever,
+    },
+    budget: { max_trials: Some(options.bisect_budget) },
+  };
+  Ok(
+    diagnose(
+      evidence,
+      plan,
+      Some(s.delta),
+      s.classified,
+      s.test_classified,
+      Some(|d: Delta, flipped: List<Int>| {
+        let keys = flipped_keys(d, flipped);
+        tester.trial[corpus](index, map(keys, |k: DefKey| { name: k.name, ns: ns_word(k.ns) }))
+      }),
+      s.absent,
+    ).bisection,
+  )
+}
+
+// Where the first of a group's definitions is: the runtime knows the places and this side knows only
+// the names.
+fn first_at(at: List<{ name: String, at: Option<At> }>, names: List<String>) -> Option<At> =
+  fold(names, None, |found: Option<At>, name: String|
+    match found {
+      Some(_) -> found,
+      None -> match filter(at, |e: { name: String, at: Option<At> }| e.name == name) {
+        [] -> None,
+        hits -> at_at(hits, 0),
+      },
+    })
+
+fn at_at(hits: List<{ name: String, at: Option<At> }>, i: Int) -> Option<At> =
+  match list_at(hits, i) { Some(hit) -> hit.at, None -> None }
+
+/// Every failure's verdict, computed before anything renders them: the search is this program's, so
+/// the rows it built carry the runtime's gate and this side's answer.
+fn decided_faults(r: Ran, options: Options) -> List<Fault> / {tester.trial[corpus]} =
+  flat_map(range(0, len(r.failures)), |i: Int| decided_one(r, options, i))
+
+fn decided_one(r: Ran, options: Options, i: Int) -> List<Fault> / {tester.trial[corpus]} =
+  match list_at(r.failures, i) {
+    None -> [],
+    Some(hit) -> {
+      let f: Fault = at(r.failures, i, hit);
+      [{ ..f, bisect: searched(f, i, options) }]
+    },
+  }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -1732,6 +1859,9 @@ fn a_fault() -> Fault =
   {
     key: "m.two is two",
     diagnostic: a_diag(b"E0502", b"assertion failed", [], []),
+    defect: false,
+    host: false,
+    search: None,
     bisect: no_bisect(),
     slice: None,
     suspects: [],

@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex, mpsc};
 /// else: no other command runs a corpus.
 const EFFECT: &str = "tester";
 
-const OPERATIONS: [(&str, &str); 11] = [
+const OPERATIONS: [(&str, &str); 12] = [
     ("configure", "ply_machine::tester::configure"),
     ("loaded", "ply_machine::test::loaded"),
     ("bound", "ply_machine::test::bound"),
@@ -43,6 +43,7 @@ const OPERATIONS: [(&str, &str); 11] = [
     ("keys", "ply_machine::tester::keys"),
     ("hashed", "ply_machine::tester::hashed"),
     ("searched", "ply_machine::tester::searched"),
+    ("trial", "ply_machine::tester::trial"),
     ("chosen", "ply_machine::tester::chosen"),
     ("outcomes", "ply_machine::tester::outcomes"),
     // The printed union of a set of tests' footprints: the program colours the graph, and the
@@ -103,6 +104,15 @@ impl Session {
             .map(|(op, path)| (registration(op, path), Arc::clone(&site)))
             .collect()
     }
+}
+
+/// Whether the program reads the report and searches for itself: its `tester` effect declares
+/// `trial`, which is the operation only a program that decides asks the runtime for.
+fn searches(check: &CheckOutput) -> bool {
+    check
+        .effects
+        .get(&Symbol::new(EFFECT))
+        .is_some_and(|effect| effect.ops.contains_key(&Symbol::new("trial")))
 }
 
 /// The decision, as the program sent it: the same four fields `ply_test::Choice` holds.
@@ -197,6 +207,31 @@ impl HostHandler for Site {
             "keys" => self.knowledge(Ask::Keys)?,
             "hashed" => self.knowledge(Ask::Hashed)?,
             "searched" => self.knowledge(Ask::Searched)?,
+            "trial" => {
+                use crate::payload::field_of;
+                let failure = req
+                    .args
+                    .first()
+                    .ok_or_else(|| unasked("trial", req.span))?
+                    .as_int(span, "a failure's place in the report")?;
+                let keys = req
+                    .args
+                    .get(1)
+                    .ok_or_else(|| unasked("trial", req.span))?
+                    .as_list(span, "the keys to flip")?;
+                let mut named = Vec::with_capacity(keys.len());
+                for key in keys {
+                    named.push((
+                        field_of(key, "name", span)?
+                            .as_str(span, "a definition's name")?
+                            .to_string(),
+                        field_of(key, "ns", span)?
+                            .as_str(span, "a namespace")?
+                            .to_string(),
+                    ));
+                }
+                self.trial(usize::try_from(failure).unwrap_or(usize::MAX), named)?
+            }
             "chosen" => {
                 let value = req
                     .args
@@ -321,6 +356,24 @@ impl Site {
         Ok(ply_eval::Value::Unit)
     }
 
+    /// One mixture the program decided to try. The runtime answers it on its own thread, where the
+    /// store and the warm front end are; this waits for that answer.
+    fn trial(&self, failure: usize, keys: Vec<(String, String)>) -> Result<PlyValue, Diagnostic> {
+        let (reply, answers) = mpsc::channel();
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("trial"))?;
+        machine.ask(Go::Trial {
+            failure,
+            keys,
+            reply,
+        })?;
+        match answers.recv() {
+            Ok(Ok(trial)) => Ok(trial_value(&trial)),
+            Ok(Err(diagnostic)) => Err(diagnostic),
+            Err(_) => Err(unanswered()),
+        }
+    }
+
     fn ran(&self) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
         let machine = held.as_ref().ok_or_else(|| unstarted("ran"))?;
@@ -369,6 +422,13 @@ enum Go {
     /// The printed union of these tests' footprints. The program colours the graph; the rendering of
     /// a colour is the compiler's, since only its printer can keep a label variable off a name.
     Footprint(Vec<usize>),
+    /// One mixture the program decided to try. Answered on this thread, because the store a hybrid
+    /// is built over lives here and a `BodyHybrid` is not `Send`.
+    Trial {
+        failure: usize,
+        keys: Vec<(String, String)>,
+        reply: mpsc::Sender<Result<ply_test::bisect::Trial, Diagnostic>>,
+    },
 }
 
 enum Step {
@@ -465,9 +525,25 @@ impl Drop for Machine {
 fn serve(args: &TestOptions, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
     let mut cache = Cache::open(&project_root(&args.path), args.no_cache);
     let mut warm = crate::warm::Warm::default();
-    while asked.recv().is_ok() {
+    // What the last run kept, so a program can try mixtures of it long after the run finished.
+    let mut hybrids: Option<ply_test::Hybrids> = None;
+    while let Ok(signal) = asked.recv() {
+        // A trial is not an iteration: it asks about the run that just ended.
+        if let Go::Trial {
+            failure,
+            keys,
+            reply,
+        } = signal
+        {
+            let answer = match &mut cache {
+                Ok(cache) => trial(&cache.store, hybrids.as_ref(), failure, &keys),
+                Err(diagnostic) => Err(diagnostic.clone()),
+            };
+            let _ = reply.send(answer);
+            continue;
+        }
         match &mut cache {
-            Ok(cache) => iterate(args, cache, &mut warm, told, asked),
+            Ok(cache) => iterate(args, cache, &mut warm, told, asked, &mut hybrids),
             Err(diagnostic) => {
                 let _ = told.send(Step::Loaded(Box::new(Err(Refused {
                     diagnostics: vec![diagnostic.clone()],
@@ -484,6 +560,7 @@ fn iterate(
     warm: &mut crate::warm::Warm,
     told: &mpsc::Sender<Step>,
     asked: &mpsc::Receiver<Go>,
+    hybrids: &mut Option<ply_test::Hybrids>,
 ) {
     let mut warnings = std::mem::take(&mut cache.warnings);
     let opened = cache.store.take_warnings();
@@ -563,6 +640,7 @@ fn iterate(
         asked,
         &knowledge,
         &mut chosen,
+        hybrids,
     ) {
         // Only over a report that was written: an iteration that returned early leaves nothing held.
         warm.keep(loaded);
@@ -766,9 +844,10 @@ fn serve_reads_loop(
     until: Sig,
 ) -> bool {
     loop {
+        let got = asked.recv();
         // The ask travels back with the answer: a step's answer is only its own if the questions
         // match, and two of these questions carry the caller's arguments.
-        let (asked, value) = match asked.recv() {
+        let (asked, value) = match got {
             Ok(Go::Bind) => return until == Sig::Bind,
             Ok(Go::Run) => return until == Sig::Run,
             Ok(Go::Chosen(choice)) => {
@@ -792,6 +871,15 @@ fn serve_reads_loop(
                 Ask::Outcomes(keys.clone()),
                 KnowledgeValue::Outcomes(outcomes_of(store, &keys)),
             ),
+            // A trial asks about the run that has *finished*; one arriving here is asking too
+            // early, and the honest answer is that there is nothing to try yet.
+            Ok(Go::Trial { reply, .. }) => {
+                let _ = reply.send(Err(Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    "a mixture was asked for before the run it is a mixture of",
+                )));
+                continue;
+            }
             Ok(Go::Load) | Err(_) => return false,
         };
         let _ = told.send(Step::Knowledge {
@@ -815,6 +903,7 @@ fn bind(
     asked: &mpsc::Receiver<Go>,
     knowledge: &Knowledge,
     chosen: &mut Option<ply_test::Choice>,
+    hybrids: &mut Option<ply_test::Hybrids>,
 ) -> bool {
     let refuse = |diagnostics: Vec<Diagnostic>| {
         let _ = told.send(Step::Bound(Box::new(Some(Refused {
@@ -881,7 +970,7 @@ fn bind(
         &loaded.check,
         search,
     );
-    let over = execute(
+    let (over, mixtures) = execute(
         args,
         cache,
         loaded,
@@ -893,6 +982,8 @@ fn bind(
         unit.filter(|_| !nothing_to_run),
         config_warnings,
     );
+    // Kept for whatever the report asks next: a trial is about the run that just finished.
+    *hybrids = Some(mixtures);
     let _ = told.send(Step::Ran(Box::new(over)));
     true
 }
@@ -909,7 +1000,7 @@ fn execute(
     hosts: &Hosts,
     provider: Option<&'static dyn ply_eval::Provider>,
     mut warnings: Vec<Diagnostic>,
-) -> Over {
+) -> (Over, ply_test::Hybrids) {
     let (pool, workers) = build_pool(args.jobs, &mut warnings);
     let simulation = ply_test::Search::of(selection).measuring(args.simulation.measure_reduction);
     // A factory: a reactor belongs to its thread, and each worker builds its own machine.
@@ -921,6 +1012,10 @@ fn execute(
     // thread-local to the process value, so those two need the scope as well as the setters.
     ply_codegen::rt::set_step_budget(args.steps);
     ply_codegen::rt::set_time_budget(args.timeout);
+    let mut hybrids = ply_test::Hybrids {
+        fresh: ply_store::body::of_front(&loaded.front),
+        per_failure: Vec::new(),
+    };
     let (report, mutants) = ply_codegen::rt::with_step_budget(args.steps, || {
         ply_codegen::rt::with_time_budget(args.timeout, || {
             let mut run = || {
@@ -943,12 +1038,16 @@ fn execute(
                 None => run(),
             };
             // After the run, since a pass recorded now is a valid baseline for another's failure.
-            ply_test::diagnose_failures(
+            // The search is the program's as soon as its effect declares `trial`: the report it
+            // renders carries a verdict, and what that verdict decides is the program's. A program
+            // that declares no `trial` cannot ask, so this side searches for it.
+            hybrids = ply_test::diagnose_failures(
                 &mut report,
                 &loaded.texts(),
                 &loaded.front,
                 &mut cache.store,
                 &diagnosis_options(args),
+                !searches(&loaded.check),
             );
             let escapes = hosts_escapes(&report, &loaded.check, hosts);
             let ok = report.is_success() && escapes.is_empty();
@@ -989,7 +1088,7 @@ fn execute(
         }
         None => None,
     };
-    Over {
+    let over = Over {
         hermetic: hosts.is_hermetic(),
         label: hosts.label().to_string(),
         operations: hosts.listing().rows.len(),
@@ -1008,7 +1107,16 @@ fn execute(
         failures: report
             .failures
             .iter()
-            .map(|f| fault(f, loaded, hashes, &report))
+            .enumerate()
+            .map(|(i, f)| {
+                fault(
+                    f,
+                    loaded,
+                    hashes,
+                    &report,
+                    hybrids.per_failure.get(i).and_then(|slot| slot.as_ref()),
+                )
+            })
             .collect(),
         results: report.results.iter().map(outcome).collect(),
         summary: report_summary(&report),
@@ -1019,7 +1127,8 @@ fn execute(
         coverage: args
             .coverage
             .then(|| crate::mutate::coverage_json(loaded, hashes)),
-    }
+    };
+    (over, hybrids)
 }
 
 /// `--bisect never` still goes through the diagnosis, so the artifact has one shape.
@@ -1386,6 +1495,13 @@ struct SuspectView {
 struct FaultView {
     key: String,
     diagnostic: Diagnostic,
+    /// The interpreter failed rather than the program, and the failing run reached a host handler:
+    /// two of the gate's three answers, the third being the program's own `bisect` mode.
+    defect: bool,
+    host: bool,
+    /// What a program that searches for itself needs: the change set, what the classifier could not
+    /// tell apart, the reason to give when there is nothing to try, and where each definition is.
+    search: Option<ChangeSetView>,
     conclusive: bool,
     requested: bool,
     reason: String,
@@ -1403,6 +1519,27 @@ struct FaultView {
     status: Option<&'static str>,
     declared: Option<Vec<String>>,
     observed: Option<Vec<String>>,
+}
+
+/// Every name a change set mentions: its own change, the changes, and the fused groups' members.
+fn delta_names(delta: &ply_test::bisect::Delta) -> Vec<&Symbol> {
+    let mut out: Vec<&Symbol> = Vec::new();
+    if let Some(own) = &delta.test {
+        out.push(&own.name);
+    }
+    out.extend(delta.changes.iter().map(|c| &c.name));
+    out.extend(delta.clusters.iter().flat_map(|c| c.members.iter()));
+    out
+}
+
+/// One failure's change set, as the program reads it. The names are the change set's own, and each
+/// carries the place `ply` would print for it.
+struct ChangeSetView {
+    delta: ply_test::bisect::Delta,
+    classified: usize,
+    test_classified: bool,
+    absent: ply_test::bisect::Skipped,
+    at: Vec<(String, Option<Span>)>,
 }
 
 struct SiteView {
@@ -1595,14 +1732,40 @@ fn fault(
     loaded: &Loaded,
     hashes: &HashOutput,
     report: &RunReport,
+    input: Option<&ply_test::HybridInput>,
 ) -> FaultView {
     let check = &loaded.check;
     let index = check.tests.iter().position(|t| t.key == failure.key);
     let test = index.and_then(|i| check.tests.get(i));
     let bisection = &failure.attribution.bisection;
+    let search = input.map(|input| ChangeSetView {
+        delta: input.delta.clone(),
+        classified: input.classified,
+        test_classified: input.test_classified,
+        absent: input.absent,
+        // Every name the change set mentions, with its place: a verdict that this program searched
+        // has no spans of its own, and a report prints where each culprit is.
+        at: {
+            let mut names: Vec<&Symbol> = delta_names(&input.delta);
+            names.sort();
+            names.dedup();
+            names
+                .into_iter()
+                .map(|name| {
+                    (
+                        name.as_str().to_string(),
+                        check.defs.get(name).map(|def| def.span),
+                    )
+                })
+                .collect()
+        },
+    });
     FaultView {
         key: failure.key.as_str().to_string(),
         diagnostic: failure.diagnostic.clone(),
+        defect: failure.defect,
+        host: failure.host,
+        search,
         conclusive: bisection.is_conclusive(),
         // Silent when no bisection was asked for.
         requested: !matches!(
@@ -1970,6 +2133,12 @@ fn fault_value(f: &FaultView) -> PlyValue {
     record(vec![
         ("key", PlyValue::str(&f.key)),
         ("diagnostic", diag_value(&f.diagnostic)),
+        // Two of the gate's three answers; the mode is the program's own flag.
+        ("defect", PlyValue::Bool(f.defect)),
+        ("host", PlyValue::Bool(f.host)),
+        // What a program that searches for itself reads: the change set, what could not be told
+        // apart, the reason to give when there is nothing to try, and where each name is.
+        ("search", option(f.search.as_ref().map(change_set_value))),
         (
             "bisect",
             record(vec![
@@ -2350,5 +2519,212 @@ impl Default for TestOptions {
             std: false,
             simulation: crate::simulation::SimOptions::default(),
         }
+    }
+}
+
+/// One mixture of one failure, tried on this thread: the store and the warm bodies are here, and
+/// the hybrid that swaps definitions is not `Send`.
+fn trial(
+    store: &ply_store::Store,
+    hybrids: Option<&ply_test::Hybrids>,
+    failure: usize,
+    keys: &[(String, String)],
+) -> Result<ply_test::bisect::Trial, Diagnostic> {
+    let Some(hybrids) = hybrids else {
+        return Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            format!("no mixture was kept for failure {failure}"),
+        ));
+    };
+    let Some(Some(input)) = hybrids.per_failure.get(failure) else {
+        return Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            format!("no mixture was kept for failure {failure}"),
+        ));
+    };
+    let Some((mixture, test)) = &input.runnable else {
+        return Ok(ply_test::bisect::Trial::unresolved(
+            ply_test::bisect::Unresolved::MissingBody,
+        ));
+    };
+    let wanted: std::collections::BTreeSet<ply_test::bisect::DefKey> = keys
+        .iter()
+        .filter_map(|(name, ns)| {
+            let ns = match ns.as_str() {
+                "value" => ply_test::bisect::Ns::Value,
+                "declaration" => ply_test::bisect::Ns::Decl,
+                _ => return None,
+            };
+            Some(ply_test::bisect::DefKey {
+                name: Symbol::new(name.as_str()),
+                ns,
+            })
+        })
+        .collect();
+    let hybrid = ply_test::BodyHybrid::new(
+        store,
+        &hybrids.fresh,
+        mixture.clone(),
+        test.clone(),
+        input.signature.clone(),
+    );
+    let mut hybrid = match &input.seed {
+        Some(seed) => hybrid.at_seed(seed),
+        None => hybrid,
+    };
+    Ok(hybrid.trial_over(wanted))
+}
+
+/// One trial's outcome, as the program reads it: the case, and whether the runtime answered from a
+/// result it already had.
+fn trial_value(trial: &ply_test::bisect::Trial) -> PlyValue {
+    let outcome = match trial.outcome {
+        ply_test::bisect::TrialOutcome::Fails => PlyValue::ctor("Fails", Vec::new()),
+        ply_test::bisect::TrialOutcome::Passes => PlyValue::ctor("Passes", Vec::new()),
+        // The case names are the ones `suite.bisect` declares, so the program matches on them.
+        ply_test::bisect::TrialOutcome::Unresolved(why) => PlyValue::ctor(
+            "Unresolved",
+            vec![PlyValue::ctor(
+                match why {
+                    ply_test::bisect::Unresolved::DoesNotCheck => "DoesNotCheck",
+                    ply_test::bisect::Unresolved::DifferentFailure => "DifferentFailure",
+                    ply_test::bisect::Unresolved::MissingBody => "MissingBody",
+                    ply_test::bisect::Unresolved::BudgetSpent => "BudgetSpent",
+                },
+                Vec::new(),
+            )],
+        ),
+    };
+    record(vec![
+        ("outcome", outcome),
+        ("cached", PlyValue::Bool(trial.cached)),
+    ])
+}
+
+/// One failure's change set, as the program reads it.
+fn change_set_value(view: &ChangeSetView) -> PlyValue {
+    record(vec![
+        ("delta", delta_value(&view.delta)),
+        ("classified", count(view.classified)),
+        ("test_classified", PlyValue::Bool(view.test_classified)),
+        (
+            "absent",
+            PlyValue::ctor(skipped_ctor(view.absent), Vec::new()),
+        ),
+        (
+            "at",
+            PlyValue::list(
+                view.at
+                    .iter()
+                    .map(|(name, span)| {
+                        record(vec![
+                            ("name", PlyValue::str(name)),
+                            ("at", option(span.and_then(placed))),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+/// The change set, in the shapes `suite.delta` declares: the names are the cases of its own ADTs,
+/// because that is how a value crosses.
+fn delta_value(delta: &ply_test::bisect::Delta) -> PlyValue {
+    record(vec![
+        ("own", option(delta.test.as_ref().map(change_value))),
+        (
+            "changes",
+            PlyValue::list(delta.changes.iter().map(change_value).collect()),
+        ),
+        (
+            "clusters",
+            PlyValue::list(delta.clusters.iter().map(cluster_value).collect()),
+        ),
+        ("unclassified", count(delta.unclassified)),
+    ])
+}
+
+fn change_value(change: &ply_test::bisect::Change) -> PlyValue {
+    record(vec![
+        ("name", PlyValue::str(change.name.as_str())),
+        ("ns", PlyValue::ctor(ns_ctor(change.ns), Vec::new())),
+        (
+            "before",
+            option(change.before.map(|h| PlyValue::str(h.to_hex()))),
+        ),
+        (
+            "after",
+            option(change.after.map(|h| PlyValue::str(h.to_hex()))),
+        ),
+        ("kind", PlyValue::ctor(kind_ctor(change.kind), Vec::new())),
+        ("independent", PlyValue::Bool(change.independent)),
+    ])
+}
+
+fn cluster_value(cluster: &ply_test::bisect::Cluster) -> PlyValue {
+    record(vec![
+        (
+            "members",
+            strings(cluster.members.iter().map(|n| n.as_str())),
+        ),
+        (
+            "keys",
+            PlyValue::list(
+                cluster
+                    .keys
+                    .iter()
+                    .map(|k| {
+                        record(vec![
+                            ("name", PlyValue::str(k.name.as_str())),
+                            ("ns", PlyValue::ctor(ns_ctor(k.ns), Vec::new())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "reason",
+            PlyValue::ctor(reason_ctor(cluster.reason), Vec::new()),
+        ),
+    ])
+}
+
+fn ns_ctor(ns: ply_test::bisect::Ns) -> &'static str {
+    match ns {
+        ply_test::bisect::Ns::Value => "Value",
+        ply_test::bisect::Ns::Decl => "Decl",
+    }
+}
+
+fn kind_ctor(kind: ply_test::bisect::ChangeKind) -> &'static str {
+    match kind {
+        ply_test::bisect::ChangeKind::Edited => "Edited",
+        ply_test::bisect::ChangeKind::Derived => "Derived",
+        ply_test::bisect::ChangeKind::Added => "Added",
+        ply_test::bisect::ChangeKind::Removed => "Removed",
+    }
+}
+
+fn reason_ctor(reason: ply_test::bisect::FusionReason) -> &'static str {
+    match reason {
+        ply_test::bisect::FusionReason::Independent => "Independent",
+        ply_test::bisect::FusionReason::InterfaceChanged => "InterfaceChanged",
+        ply_test::bisect::FusionReason::Existence => "Existence",
+        ply_test::bisect::FusionReason::Component => "Component",
+    }
+}
+
+fn skipped_ctor(skipped: ply_test::bisect::Skipped) -> &'static str {
+    match skipped {
+        ply_test::bisect::Skipped::NotRequested => "NotRequested",
+        ply_test::bisect::Skipped::NeverPassed => "NeverPassed",
+        ply_test::bisect::Skipped::Host => "Host",
+        ply_test::bisect::Skipped::Nondet => "Nondet",
+        ply_test::bisect::Skipped::Panicked => "Panicked",
+        ply_test::bisect::Skipped::NoChanges => "NoChanges",
+        ply_test::bisect::Skipped::NoBodies => "NoBodies",
+        ply_test::bisect::Skipped::NoHybrids => "NoHybrids",
+        ply_test::bisect::Skipped::Delegated => "Delegated",
     }
 }

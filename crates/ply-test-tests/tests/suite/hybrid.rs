@@ -400,6 +400,7 @@ test "doubles" { assert_eq(scale(2) + other(0), 5) }
         &after.port,
         &mut store,
         &ply_test::Options::default(),
+        true,
     );
 
     let now = after.hashes.tests[index];

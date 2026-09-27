@@ -921,17 +921,48 @@ pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Pl
 }
 
 /// Turns each failure's suspect list into a ranked attribution; `sources` are what `front` read.
+/// What the runtime keeps so a program can retry a mixture after the run that collected it: the
+/// bodies this run introduced (a definition the run added is not in the store until the flush), and
+/// per failure the mixture, the test's body, the signature the failure has to keep, and the seed.
+pub struct Hybrids {
+    pub fresh: ply_store::body::BodySet,
+    pub per_failure: Vec<Option<HybridInput>>,
+}
+
+pub struct HybridInput {
+    /// The change set this failure is about, as the caller will search it.
+    pub delta: crate::bisect::Delta,
+    /// What a mixture needs, when one can be built at all: a failure whose baseline is missing, or
+    /// whose bodies are not on record, still has a change set to report and nothing to try.
+    pub runnable: Option<(Mixture, ply_store::body::StoredBody)>,
+    pub signature: Signature,
+    pub seed: Option<Seed>,
+    /// What the classifier could not tell apart, and whether the test's own hash was one of them:
+    /// the two sentences a verdict adds are the caller's to add now.
+    pub classified: usize,
+    pub test_classified: bool,
+    /// The reason to give when there is nothing to try, in place of a search that did not happen.
+    pub absent: crate::bisect::Skipped,
+}
+
+/// `bisect` false leaves the search to the caller: the delta and the gate are still computed, and
+/// what a mixture would need is handed back in [`Hybrids`] instead of being run here.
 pub fn diagnose_failures(
     report: &mut RunReport,
     sources: &[(String, String)],
     front: &ply_ty::Front,
     store: &mut Store,
     options: &Options,
-) {
+    bisect: bool,
+) -> Hybrids {
     let check = &front.check;
     let hashes = &front.hashes;
+    let mut hybrids = Hybrids {
+        fresh: ply_store::body::of_front(front),
+        per_failure: Vec::new(),
+    };
     if report.failures.is_empty() {
-        return;
+        return hybrids;
     }
 
     let edges = DepEdges::from(hashes);
@@ -981,19 +1012,28 @@ pub fn diagnose_failures(
             .as_ref()
             .is_some_and(|m| hybrid::bodies_available(store, &fresh, m));
         let test_body = test_hash.and_then(|hash| BodyHybrid::test_body(&fresh, hash));
+        let seed = failure.seed.clone();
+        // A mixture is runnable when the baseline's closure is on record, every body it needs is
+        // available, and the test itself reached the world at all.
         let absent = match (&mixture, complete) {
             (Some(_), false) => Skipped::NoBodies,
             _ => Skipped::NoHybrids,
         };
-        let seed = failure.seed.clone();
-        let mut builder = match (mixture, test_body, complete) {
-            _ if failure.host => None,
-            (Some(mixture), Some(test), true) => {
+        let runnable = match mixture {
+            Some(mixture) if complete && !failure.host => test_body.map(|test| (mixture, test)),
+            _ => None,
+        };
+        let mut delta: Option<crate::bisect::Delta> = None;
+        // What a caller needs to retry this failure, kept whether or not this side searches.
+        let slot = hybrids.per_failure.len();
+        hybrids.per_failure.push(None);
+        let mut builder = match (bisect, &runnable) {
+            (true, Some((mixture, test))) => {
                 let hybrid = BodyHybrid::new(
                     store,
                     &fresh,
-                    mixture,
-                    test,
+                    (*mixture).clone(),
+                    (*test).clone(),
                     Signature::of(&failure.diagnostic),
                 );
                 Some(match &seed {
@@ -1017,6 +1057,64 @@ pub fn diagnose_failures(
             }
             None => &mut unknown,
         };
+        if !bisect {
+            // The search is the caller's: the change set is computed and handed over, with what a
+            // mixture would need, and the attribution is annotated and left unresolved.
+            let rehashed = baseline.as_ref().and_then(|baseline| {
+                Rehashed::under(sources, baseline, &front.packages, &front.mod_pkg).ok()
+            });
+            let mut unknown2 = bisect::Unknown;
+            let mut store_classify2;
+            let classify2: &mut dyn Classify = match rehashed {
+                Some(rehashed) => {
+                    store_classify2 = StoreClassify::new(rehashed, store, check);
+                    &mut store_classify2
+                }
+                None => &mut unknown2,
+            };
+            let mut differences: Option<crate::Diff> = None;
+            if let Some(baseline) = baseline.as_ref() {
+                let regression = Regression {
+                    key: &failure.key,
+                    test_hash,
+                    baseline,
+                    hashes,
+                };
+                differences = Some(diff(&regression, classify2, &edges));
+            }
+            if let Some(d) = &differences {
+                delta = Some(d.delta.clone());
+            }
+            if let Some(change) = delta.clone() {
+                hybrids.per_failure[slot] = Some(HybridInput {
+                    delta: change,
+                    runnable: if runnable.is_some() {
+                        runnable.clone()
+                    } else {
+                        None
+                    },
+                    signature: Signature::of(&failure.diagnostic),
+                    seed: seed.clone(),
+                    classified: differences
+                        .as_ref()
+                        .map(|d| d.unclassified.len())
+                        .unwrap_or(0),
+                    test_classified: differences
+                        .as_ref()
+                        .map(|d| !d.test_unclassified)
+                        .unwrap_or(true),
+                    absent,
+                });
+            }
+            if let Some(d) = &delta {
+                failure.attribution.annotate(d);
+            }
+            failure.attribution.resolve(
+                crate::Bisection::not_attempted(Skipped::Delegated),
+                failure.attribution.slice.clone(),
+            );
+            continue;
+        }
 
         failure.attribution = diagnose(
             evidence,
@@ -1050,6 +1148,7 @@ pub fn diagnose_failures(
     for hash in proved {
         store.put(hash, Outcome::Pass);
     }
+    hybrids
 }
 
 pub fn run_with<E: Executor>(
