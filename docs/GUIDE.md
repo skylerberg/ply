@@ -160,11 +160,13 @@ fn credit(a: Account, amount: Int, note: Option<String> = None) -> Account {
 }
 ```
 
-A body is `= expression`, or a block with no `=`. There is no `return`. Every
-parameter and return type of a top-level `fn` must be written (`E0126`, which
-names the inferred type). A parameter the body never names may be written `_`,
-in a `fn`, a lambda or a handler clause, as in a pattern; it binds nothing and
-may repeat.
+A body is `= expression`, or a block with no `=`. There is no `return`. A body
+that binds is written as a block: `fn f() -> Int = { let x = 1; x }`, never
+`fn f() -> Int = let x = 1; x`, which does not parse — a `let` statement is not
+an expression. Every parameter and return type of a top-level `fn` must be
+written (`E0126`, which names the inferred type). A parameter the body never
+names may be written `_`, in a `fn`, a lambda or a handler clause, as in a
+pattern; it binds nothing and may repeat.
 
 A parameter default lets a call omit the argument. It must be a value — a
 literal, a constructor over literals, a record or a list — and may not name
@@ -185,6 +187,15 @@ import store.orders (place, cancel) // binds those names, no module binder
 
 Reach through a binder with `::` (`orders::place(...)`). `as` and a name list
 cannot be combined; write two imports. Imports precede every item.
+
+The first segment of a module path may be a package: a dependency declared in
+`ply.pkg` (§3.3) grants its own prefix, and `import cli.cmdline` reaches the
+`cmdline` module of the package `cli`. A path whose first segment is neither a
+module of this package, the root of one, nor a granted prefix is `E0106`; a
+dependency's prefix used without the manifest declaring it is `E0132`. A bare
+import is always this package's own: inside a dependency, `import fmt` names
+*its* `fmt`, never the importing package's — a package cannot reach back into
+what imports it.
 
 Items are private unless `pub` (`E0107`). `pub` applies to `fn`, `type` and
 `effect` only. Values (functions and constructors), types, effects and module
@@ -1675,6 +1686,10 @@ $ ply build . --diff old.plyx       # added, changed, dropped, unchanged
 $ ply run app.plyx --host
 ```
 
+A library package — one whose manifest names no entry and which declares no
+`main` — has no closure to ship and is refused (`E0101`); library artifacts
+(`.plyz`) arrive with resolution (§3.3), the way the lockfile does.
+
 `ply build` writes the closure of one entry point (default `main`) as a `.plyx`
 file (default `<entry module>.plyx`): its definitions, printed back to source
 without tests, laws, comments or anything unreached, and the compiled unit. The
@@ -1707,6 +1722,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 
 | command | flags |
 | --- | --- |
+| `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases; with `--types`, effect sets and provenance) |
 | `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--trace auto\|always\|never`, `--profile`, `--std`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
@@ -1727,10 +1743,10 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply cache clear\|stats\|compact [path]` | discard results / report size and reclaimable space / reclaim it |
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 
-`ply check`, `ply fmt`, `ply defs`, `ply hash`, `ply doc`, `ply show`,
-`ply replace`, `ply callers`, `ply std`, `ply explain`, `ply hosts`, `ply cache`
-and `ply bootstrap` are one Ply program (`crates/ply-cli/ply`, entered
-at `ply.main`). The program itself parses the command line, prints help and
+`ply new`, `ply check`, `ply fmt`, `ply defs`, `ply hash`, `ply doc`,
+`ply show`, `ply replace`, `ply callers`, `ply std`, `ply explain`, `ply hosts`,
+`ply cache` and `ply bootstrap` are one Ply program (`crates/ply-cli/ply`,
+entered at `ply.main`). The program itself parses the command line, prints help and
 refusals, and resolves the paths it is given against the working directory — a
 relative path reads under it, an absolute one reads where it points. The binary
 answers with the code the program asked to exit with. What a command needs of
@@ -1840,6 +1856,10 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0129` | a `ply.pkg` that is not exactly one `fn package` returning `Manifest` |
 | `E0130` | a manifest body that runs rather than being a value |
 | `E0131` | a manifest field that does not decode or fails validation |
+| `E0132` | an import of a package the manifest does not declare as a dependency |
+| `E0133` | two packages granting one module prefix |
+| `E0134` | packages depending on one another in a cycle |
+| `E0135` | a dependency that is missing, unmanifested or not a path |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
