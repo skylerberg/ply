@@ -1,8 +1,7 @@
 use ply_machine::load::{Found, Loaded, stamp_of};
 use ply_machine::warm::*;
-use ply_span::Symbol;
 use ply_store::ContentHash;
-use ply_ty::{DefHash, HashOutput};
+use ply_ty::DefHash;
 
 fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -153,7 +152,7 @@ fn a_save_made_after_the_load_is_a_change_and_not_the_baseline() {
 
 /// Keyed on `defs` alone, an edit to a test would reuse a unit holding the old test.
 #[test]
-fn a_held_unit_is_dropped_when_a_test_moves() {
+fn a_held_unit_is_reused_only_for_the_program_it_was_compiled_from() {
     struct Nothing;
     impl ply_eval::Provider for Nothing {
         fn attach(&'static self) -> std::rc::Rc<dyn ply_eval::Compiled> {
@@ -174,36 +173,25 @@ fn a_held_unit_is_dropped_when_a_test_moves() {
     }
     let provider: &'static dyn ply_eval::Provider = Box::leak(Box::new(Nothing));
     let mut warm = Warm::default();
-    let mut hashes = HashOutput::default();
-    hashes.defs.insert(Symbol::new("m.f"), DefHash([1; 32]));
-    hashes.tests.push(DefHash([2; 32]));
-
-    let unit_for = |warm: &Warm, hashes: &HashOutput| {
+    // The digest is the compiler's now: a program that moved is a different digest, so the unit
+    // is kept only under the identity it was compiled from.
+    let unit_for = |warm: &Warm, digest: DefHash| {
         let front = ply_ty::Front {
-            hashes: hashes.clone(),
+            hashes_digest: digest,
             ..Default::default()
         };
         warm.unit_for(&front, &ply_span::SourceMap::new())
     };
 
-    warm.keep_unit(&hashes, provider);
+    let compiled = DefHash([9; 32]);
+    warm.keep_unit(compiled, provider);
     assert!(
-        unit_for(&warm, &hashes).is_some(),
-        "nothing moved, so the unit still answers for this program"
+        unit_for(&warm, compiled).is_some(),
+        "the same program keeps its unit"
     );
-
-    let mut moved = hashes.clone();
-    moved.tests[0] = DefHash([3; 32]);
     assert!(
-        unit_for(&warm, &moved).is_none(),
-        "a test moved, so the unit holds the old one and must not be reused"
-    );
-
-    let mut moved = hashes.clone();
-    moved.defs.insert(Symbol::new("m.f"), DefHash([4; 32]));
-    assert!(
-        unit_for(&warm, &moved).is_none(),
-        "a definition moved, so the unit holds the old one"
+        unit_for(&warm, DefHash([8; 32])).is_none(),
+        "another program does not reuse it"
     );
 }
 

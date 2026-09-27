@@ -587,8 +587,8 @@ fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
     assert_ne!(edited, ARITHMETIC, "the fixture spells `double`'s body");
     let other = load(&edited);
     let backend = unit.attach();
-    assert!(backend.describes(loaded.front.hashes.digest()));
-    assert!(!backend.describes(other.front.hashes.digest()));
+    assert!(backend.describes(loaded.front.hashes_digest));
+    assert!(!backend.describes(other.front.hashes_digest));
 }
 
 #[test]

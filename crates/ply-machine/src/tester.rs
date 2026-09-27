@@ -933,7 +933,7 @@ fn bind(
     } else {
         match build_backend_over(&loaded.front, module_texts(&loaded.check, &loaded.sources)) {
             Ok(provider) => {
-                warm.keep_unit(hashes, provider);
+                warm.keep_unit(loaded.front.hashes_digest, provider);
                 Some(provider)
             }
             Err(diagnostic) => return refuse(vec![diagnostic]),

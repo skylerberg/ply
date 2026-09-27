@@ -72,7 +72,7 @@ impl Unit {
         front: &ply_ty::Front,
         texts: HashMap<String, String>,
     ) -> Result<&'static Unit> {
-        let identity = front.hashes.digest();
+        let identity = front.hashes_digest;
         let front: &'static ply_ty::Front = Box::leak(Box::new(front.clone()));
         let keys = crate::source::emit_keys(front);
         let source: &'static Source =
@@ -106,7 +106,7 @@ impl Unit {
     /// An artifact's unit, produced elsewhere; loaded once here to read its table.
     pub fn embedded(front: &ply_ty::Front, text: String) -> Result<&'static Unit> {
         let exports = crate::c::Exports::read(&crate::c::compile_and_load(&text, "artifact")?)?;
-        let identity = front.hashes.digest();
+        let identity = front.hashes_digest;
         let front: &'static ply_ty::Front = Box::leak(Box::new(front.clone()));
         let source: &'static Source =
             Box::leak(Box::new(Source::from_front(front, HashMap::new())));

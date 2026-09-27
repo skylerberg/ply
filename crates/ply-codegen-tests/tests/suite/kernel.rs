@@ -64,7 +64,7 @@ fn the_whole_kernel_is_inside_the_fragment() {
 fn the_search_answers_through_compiled_code() {
     let (front, unit) = kernel();
     let backend = unit.attach();
-    assert!(backend.describes(front.hashes.digest()));
+    assert!(backend.describes(front.hashes_digest));
     let answer = backend.enter(&Symbol::new("mcts.plan_753"), &[Value::Int(200)], 10_000);
     assert!(
         matches!(answer, Some(Value::Int(_))),
