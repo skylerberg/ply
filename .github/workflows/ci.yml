@@ -30,7 +30,7 @@ env:
 
 jobs:
   plan:
-    name: CI tables are total
+    name: CI tables and cache keys are total
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -51,7 +51,7 @@ jobs:
           key: test-timings-${{ github.run_id }}
           restore-keys: test-timings-
 
-      - name: Every crate is built, every named test exists, the shards are total
+      - name: Every crate is built, every named test exists, the shards are total, every cache key is restored
         run: .github/ci-shards.sh verify
 
       # One job cuts the shards, and every partition runs the cut it left: two that cut their own
@@ -281,26 +281,50 @@ jobs:
         with:
           path: tcc
           key: tcc-${{ runner.os }}-${{ runner.arch }}
-      - name: tcc's packages, for the jobs that run the archive
+      - name: tcc's packages, for this job's self-test and the jobs that run the archive
         if: steps.tcc.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --download-only tcc
-          mkdir -p tcc
-          cp /var/cache/apt/archives/*.deb tcc/
-          ls tcc
+        run: .github/ci-tcc.sh harvest
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.tcc.outputs.cache-hit != 'true'
         with:
           path: tcc
           key: tcc-${{ runner.os }}-${{ runner.arch }}
 
+      # The self-test below is the run's first `ply`, and a first `ply` emits the emitter's own
+      # unit and compiles it with whatever `Profile::Development` finds — `cc -O0` when tcc is
+      # absent. Installed here it is tcc, the compiler every suite job compiles that unit with, so
+      # the emitted stage and the objects this job writes are the ones they read.
+      - name: tcc, the development profile's C compiler
+        run: .github/ci-tcc.sh install
+
+      # The self-test's first `ply` is minutes of emitting and compiling. A tree whose sources
+      # have not moved has both from an earlier run; against any other tree the buckets of emitted
+      # C that did not move are already built, which is most of them.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: stage-cache
+        with:
+          path: |
+            /tmp/ply-c-cache
+            /tmp/ply-c-stage
+          key: ply-c-stage-sources-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/ply-compiler/ply/**', 'crates/ply-std/ply/**', 'crates/ply-cli/ply/**', 'crates/ply-corpus/ply/**') }}
+          restore-keys: ply-c-stage-
+
       # Here rather than in a later job: it compares mtimes, and a later checkout is newer than the binary.
       - name: The freshness check can still go red
         run: .github/binary-is-current.sh --self-test
       - name: The binary is built from this tree
         run: .github/binary-is-current.sh target/release/ply
+
+      # What that first `ply` emitted, for the rest of the run: the shards and `stage` restore it
+      # rather than repeat the emission. Nothing was emitted when the restore above hit the tree's
+      # own key, and `stage` finds that key itself.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.stage-cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            /tmp/ply-c-cache
+            /tmp/ply-c-stage
+          key: ply-c-stage-emitter-${{ github.run_id }}
 
       # examples/same-tests.sh refuses a binary with no dep-info beside it.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -321,11 +345,12 @@ jobs:
           retention-days: 2
           if-no-files-found: error
 
-  # Emitting the compiler's own unit is the same work whichever slice runs next, and it is minutes
-  # of it. One job does it and every suite job restores what it left: the emitted bodies and, from
-  # the same run, the native stage they were built from. It runs the archive's own binary because a
-  # compiled body is keyed by the binary that emitted it, so a stage emitted by any other copy of
-  # `ply` would be restored and never read.
+  # `build-ply`'s self-test is the run's first `ply`, so the emitter's own unit is emitted and
+  # compiled there, under the compiler every suite job compiles it with, and saved under this
+  # run's emitter key. That leaves the corpus's own stage, which only a run of the archive's
+  # binaries can build, and this is the job with the archive: it restores the emission, adds the
+  # corpus to it, and republishes the set under this run's key for the shards and, from main,
+  # under the tree's key for a later run whose sources have not moved.
   stage:
     name: the emitter's stage
     needs: [build, build-ply]
@@ -349,7 +374,7 @@ jobs:
           path: |
             /tmp/ply-c-cache
             /tmp/ply-c-stage
-          key: ply-c-stage-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/ply-compiler/ply/**', 'crates/ply-std/ply/**', 'crates/ply-cli/ply/**', 'crates/ply-corpus/ply/**') }}
+          key: ply-c-stage-sources-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/ply-compiler/ply/**', 'crates/ply-std/ply/**', 'crates/ply-cli/ply/**', 'crates/ply-corpus/ply/**') }}
 
   test:
     name: test ${{ matrix.shard }}/${{ matrix.of }}
