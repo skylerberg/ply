@@ -634,8 +634,8 @@ fn a_polymorphic_binder_is_monomorphised_and_recorded() {
     assert_eq!(
         report.instantiations,
         vec![
-            (Symbol::new("t4"), Type::int()),
-            (Symbol::new("t9"), Type::int()),
+            (Symbol::new("t4"), "Int".to_string()),
+            (Symbol::new("t9"), "Int".to_string()),
         ]
     );
 }

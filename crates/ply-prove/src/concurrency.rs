@@ -6,7 +6,6 @@ use crate::{
 };
 use ply_eval::{Exploration, Interleaving, Plan, Seed, Value, Verdict, explore};
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_ty::Type;
 
 /// How much of a law's value domain the points it was run at cover.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -22,7 +21,7 @@ pub enum ValueDomain {
         generated: u32,
         kept: u32,
         rejected: u32,
-        instantiations: Vec<(Symbol, Type)>,
+        instantiations: Vec<(Symbol, String)>,
     },
 }
 
@@ -54,7 +53,7 @@ impl ValueDomain {
         }
     }
 
-    fn instantiations(&self) -> Vec<(Symbol, Type)> {
+    fn instantiations(&self) -> Vec<(Symbol, String)> {
         match self {
             ValueDomain::Enumerated { .. } => Vec::new(),
             ValueDomain::Sampled { instantiations, .. } => instantiations.clone(),

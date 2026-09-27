@@ -42,7 +42,7 @@ pub const RUNTIME_VERSION: &str = "0.16.0";
 pub const FRONTEND_VERSION: &str = "0.28.0";
 
 /// Bumping this re-attempts every obligation and re-runs no test.
-pub const PROVER_VERSION: &str = "0.7.0";
+pub const PROVER_VERSION: &str = "0.8.0";
 
 /// Bumped when a stored fingerprint gained its module name: a cache from before it holds rows
 /// nothing can file again, and every source is re-checked once.

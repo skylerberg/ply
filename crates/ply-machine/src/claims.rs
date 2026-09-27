@@ -957,7 +957,7 @@ fn evidence_value(evidence: &Evidence) -> PlyValue {
                             .map(|(var, ty)| {
                                 record(vec![
                                     ("var", PlyValue::str(var.as_str())),
-                                    ("ty", PlyValue::str(ty.to_string())),
+                                    ("ty", PlyValue::str(ty)),
                                 ])
                             })
                             .collect(),

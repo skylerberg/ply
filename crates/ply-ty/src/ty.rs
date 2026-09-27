@@ -1,10 +1,8 @@
 use ply_span::Symbol;
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Mode {
     Read,
     Write,
@@ -19,18 +17,18 @@ impl Mode {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct TyVar(pub u32);
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct RowVar(pub u32);
 
 /// A resource label a definition is generic over, filled at each call.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct LabelVar(pub u32);
 
 /// The resource an atom touches; the variant order is the atom order the compiler sorts rows by.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Resource {
     Named(Symbol),
     Var(LabelVar),
@@ -58,13 +56,12 @@ pub fn label_var_name(v: LabelVar) -> String {
 }
 
 /// Ordering is structural so rows are canonical, which content addressing depends on.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct EffectAtom {
     pub effect: Symbol,
     pub resource: Resource,
     pub mode: Mode,
     /// `Some` names one operation, which the mode atom of the same effect and resource covers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op: Option<Symbol>,
 }
 
@@ -140,7 +137,7 @@ impl fmt::Display for EffectAtom {
 }
 
 /// A set of atoms plus an optional tail variable.
-#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Row {
     pub atoms: BTreeSet<EffectAtom>,
     pub tail: Option<RowVar>,
@@ -279,7 +276,7 @@ impl fmt::Display for Footprint {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Type {
     Var(TyVar),
     Con(Symbol, Vec<Type>),
