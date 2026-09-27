@@ -244,19 +244,15 @@ pub fn real_members() -> Result<[(String, PathBuf, String); 2]> {
 /// `crates/ply-cli/ply` under the stage.
 fn lay_out(stage: &Path) -> Result<PathBuf> {
     let corpus = stage.join("crates/ply-corpus/ply");
-    let cli = stage.join("crates/ply-cli/ply");
     let marker = stage.join("LAID.out");
     if marker.exists() {
         return Ok(corpus);
     }
     std::fs::create_dir_all(&corpus)?;
-    std::fs::create_dir_all(&cli)?;
+    // The CLI's whole closure: the corpus depends on the CLI, and the CLI depends on the suite, so
+    // the stage has to carry both or the CLI's own manifest names a directory that is not there.
+    ply_launcher::shipped::lay_out(stage)?;
     write_all(&corpus, CORPUS_SOURCES, CORPUS_MANIFEST)?;
-    write_all(
-        &cli,
-        ply_launcher::shipped::PROGRAM_SOURCES,
-        ply_launcher::shipped::PROGRAM_MANIFEST,
-    )?;
     std::fs::write(&marker, b"")?;
     Ok(corpus)
 }
@@ -277,13 +273,9 @@ fn stage_dir() -> PathBuf {
         .map(|(n, t)| (n.to_string(), t.to_string()))
         .collect();
     inputs.push(("corpus.pkg".to_string(), CORPUS_MANIFEST.to_string()));
-    for (name, text) in ply_launcher::shipped::PROGRAM_SOURCES {
-        inputs.push((format!("cli.{name}"), text.to_string()));
+    for (path, text) in ply_launcher::shipped::program_sources() {
+        inputs.push((format!("cli.{path}"), text));
     }
-    inputs.push((
-        "cli.pkg".to_string(),
-        ply_launcher::shipped::PROGRAM_MANIFEST.to_string(),
-    ));
     ply_codegen::c::bundle::stage_dir(&format!(
         "corpus-{}",
         ply_machine::artifact::toolchain_stamp(&ply_codegen::c::producer::digest_of(&inputs))
