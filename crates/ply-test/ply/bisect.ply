@@ -247,10 +247,13 @@ pub fn is_conclusive(b: Bisection) -> Bool = names_a_culprit(b.verdict) && len(b
 
 // Finds the smallest set of changes that reproduces the failure. `hybrid` builds and runs the
 // mixture the given cluster indices select, and answers what it observed.
-pub fn bisect(delta: Delta, hybrid: (Delta, List<Int>) -> Trial, budget: Budget) -> Bisection = {
+pub fn bisect<a | e>(
+  delta: Delta,
+  hybrid: (Delta, List<Int>) -> Trial / e,
+  budget: Budget,
+) -> Bisection / e = {
   let st = {
     delta: delta,
-    hybrid: hybrid,
     budget: budget,
     stats: {
       candidates: candidates(delta),
@@ -263,19 +266,18 @@ pub fn bisect(delta: Delta, hybrid: (Delta, List<Int>) -> Trial, budget: Budget)
     },
     memo: [],
   };
-  run(st)
+  run(hybrid, st)
 }
 
 // The state the search threads: the trials it has already asked about, and what it has counted.
 type Search = {
   delta: Delta,
-  hybrid: (Delta, List<Int>) -> Trial,
   budget: Budget,
   stats: SearchStats,
   memo: List<{ key: List<Int>, outcome: TrialOutcome }>,
 }
 
-fn run(st: Search) -> Bisection = {
+fn run<a | e>(hybrid: (Delta, List<Int>) -> Trial / e, st: Search) -> Bisection / e = {
   let n = len(st.delta.clusters);
   if n == 0 {
     match st.delta.own {
@@ -290,17 +292,21 @@ fn run(st: Search) -> Bisection = {
     match st.delta.own {
       None -> conclude(st, Sole, [cluster.members], sole),
       Some(own_change) -> {
-        let asked = ask(st, []);
+        let asked = ask(hybrid, st, []);
         if asked.outcome != Fails { conclude(asked.st, Sole, [cluster.members], sole) }
         else { test_changed(asked.st, own_change.name) }
       },
     }
-  } else { narrow(st, n) }
+  } else { narrow(hybrid, st, n) }
 }
 
-fn narrow(st: Search, n: Int) -> Bisection = {
+fn narrow<a | e>(
+  hybrid: (Delta, List<Int>) -> Trial / e,
+  st: Search,
+  n: Int,
+) -> Bisection / e = {
   let all = range(0, n);
-  let whole = ask(st, all);
+  let whole = ask(hybrid, st, all);
   match whole.outcome {
     Passes ->
       conclude(
@@ -317,7 +323,7 @@ fn narrow(st: Search, n: Int) -> Bisection = {
         "the current program could not be replayed: " ++ unresolved_word(why),
       ),
     Fails -> {
-      let none = ask(whole.st, []);
+      let none = ask(hybrid, whole.st, []);
       if none.outcome == Fails {
         match none.st.delta.own {
           Some(own_change) -> test_changed(none.st, own_change.name),
@@ -330,7 +336,7 @@ fn narrow(st: Search, n: Int) -> Bisection = {
             ),
         }
       } else {
-        let narrowed = ddmin(none.st, all, 2);
+        let narrowed = ddmin(hybrid, none.st, all, 2);
         let minimal = narrowed.set;
         let st2 = narrowed.st;
         let groups = map(minimal, |i: Int| at_or(st2.delta.clusters, i).members);
@@ -385,66 +391,80 @@ fn test_changed(st: Search, name: String) -> Bisection =
   )
 
 /// Zeller's ddmin over cluster indices, three-valued so an unresolved mixture is not evidence.
-fn ddmin(st: Search, set: List<Int>, parts: Int) -> { set: List<Int>, st: Search } = {
+fn ddmin<a | e>(hybrid: (Delta, List<Int>) -> Trial / e, st: Search, set: List<Int>, parts: Int) -> { set: List<Int>, st: Search } = {
   if len(set) <= 1 || st.stats.exhausted { { set: set, st: st } } else {
     let chunks = split(set, min(parts, len(set)));
-    let first = failing_chunk(st, chunks);
+    let first = failing_chunk(hybrid, st, chunks);
     match first.hit {
-      Some(chunk) -> ddmin(first.st, chunk, 2),
+      Some(chunk) -> ddmin(hybrid, first.st, chunk, 2),
       None -> if first.st.stats.exhausted { { set: set, st: first.st } } else {
-        let second = failing_rest(first.st, set, chunks);
+        let second = failing_rest(hybrid, first.st, set, chunks);
         match second.hit {
-          Some(rest) -> ddmin(second.st, rest, max(parts - 1, 2)),
+          Some(rest) -> ddmin(hybrid, second.st, rest, max(parts - 1, 2)),
           None -> if second.st.stats.exhausted { { set: set, st: second.st } }
           else if parts >= len(set) { { set: set, st: second.st } }
-          else { ddmin(second.st, set, min(parts * 2, len(set))) },
+          else { ddmin(hybrid, second.st, set, min(parts * 2, len(set))) },
         }
       },
     }
   }
 }
 
-// A chunk that fails on its own is a smaller answer than the whole set.
-fn failing_chunk(st: Search, chunks: List<List<Int>>) -> { hit: Option<List<Int>>, st: Search } =
-  fold(
-    chunks,
-    { hit: None, st: st },
-    |acc: { hit: Option<List<Int>>, st: Search }, chunk: List<Int>|
-      match acc.hit {
-        Some(_) -> acc,
-        None -> if acc.st.stats.exhausted { acc } else {
-          let trial = ask(acc.st, chunk);
-          if trial.outcome == Fails { { hit: Some(chunk), st: trial.st } }
-          else { { hit: None, st: trial.st } }
-        },
+// A chunk that fails on its own is a smaller answer than the whole set. Walked rather than folded:
+// the callback is the caller's, and a closure that performs an effect would have to carry its row.
+fn failing_chunk<a | e>(
+  hybrid: (Delta, List<Int>) -> Trial / e,
+  st: Search,
+  chunks: List<List<Int>>,
+) -> { hit: Option<List<Int>>, st: Search } / e =
+  match chunks {
+    [] -> { hit: None, st: st },
+    [chunk, ..rest] ->
+      if st.stats.exhausted {
+        { hit: None, st: st }
+      } else {
+        let trial = ask(hybrid, st, chunk);
+        if trial.outcome == Fails {
+          { hit: Some(chunk), st: trial.st }
+        } else {
+          failing_chunk(hybrid, trial.st, rest)
+        }
       },
-  )
+  }
 
 // Everything but a chunk, which is the complement ddmin also tries.
-fn failing_rest(
+fn failing_rest<a | e>(
+  hybrid: (Delta, List<Int>) -> Trial / e,
   st: Search,
   set: List<Int>,
   chunks: List<List<Int>>,
-) -> { hit: Option<List<Int>>, st: Search } =
-  fold(
-    chunks,
-    { hit: None, st: st },
-    |acc: { hit: Option<List<Int>>, st: Search }, chunk: List<Int>|
-      match acc.hit {
-        Some(_) -> acc,
-        None -> if acc.st.stats.exhausted { acc } else {
-          let rest = filter(set, |i: Int| !contains_int(chunk, i));
-          if is_empty(rest) { acc } else {
-            let trial = ask(acc.st, rest);
-            if trial.outcome == Fails { { hit: Some(rest), st: trial.st } }
-            else { { hit: None, st: trial.st } }
+) -> { hit: Option<List<Int>>, st: Search } / e =
+  match chunks {
+    [] -> { hit: None, st: st },
+    [chunk, ..rest] ->
+      if st.stats.exhausted {
+        { hit: None, st: st }
+      } else {
+        let without = filter(set, |i: Int| !contains_int(chunk, i));
+        if is_empty(without) {
+          failing_rest(hybrid, st, set, rest)
+        } else {
+          let trial = ask(hybrid, st, without);
+          if trial.outcome == Fails {
+            { hit: Some(without), st: trial.st }
+          } else {
+            failing_rest(hybrid, trial.st, set, rest)
           }
-        },
+        }
       },
-  )
+  }
 
 // The memo is keyed by the set as a sorted, deduplicated list, so the search never asks twice.
-fn ask(st: Search, set: List<Int>) -> { outcome: TrialOutcome, st: Search } = {
+fn ask<a | e>(
+  hybrid: (Delta, List<Int>) -> Trial / e,
+  st: Search,
+  set: List<Int>,
+) -> { outcome: TrialOutcome, st: Search } / e = {
   let key = sorted_ints(set);
   match memo_lookup(st.memo, key) {
     Some(outcome) ->
@@ -453,7 +473,6 @@ fn ask(st: Search, set: List<Int>) -> { outcome: TrialOutcome, st: Search } = {
       { outcome: Unresolved(BudgetSpent), st: { ..st, stats: { ..st.stats, exhausted: true } } }
     } else {
       // A field call would read as a `perform`, so the callback is bound by name first.
-      let hybrid = st.hybrid;
       let trial: Trial = hybrid(st.delta, key);
       {
         outcome: trial.outcome,
