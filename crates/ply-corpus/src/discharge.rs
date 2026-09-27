@@ -242,6 +242,7 @@ fn gap_label(gap: &Gap) -> &'static str {
         Gap::Raised { .. } => "evaluation raised",
         Gap::GuardNotSampled { .. } => "guard not sampled",
         Gap::ReachesHost(_) => "reaches the host",
+        Gap::NotDrawn => "not drawn one point at a time",
     }
 }
 
