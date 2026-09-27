@@ -1,0 +1,531 @@
+// `delta` — what moved in a test's closure since it last passed, grouped into the sets a search may
+// flip. Two changes are fused when flipping one without the other could not be tried: an added or
+// removed definition (nothing that mentions it can be flipped *without* it), two declarations that
+// share a recursive component (one component hash, one stored body), or a pair whose published
+// interface moved together, since a mixture that split them would not typecheck.
+//
+// Fusing is by *name*, because the edges are a name graph — a mention reaches either namespace — so
+// a name that is both a `fn` and a `type` fuses across both, while the cluster keeps the keys apart
+// so the search knows which namespace to swap.
+//
+// Nothing here decides whether a change was *edited* or merely *derived* (its hash moved because a
+// dependency's did). That is a judgment about normalized bodies, so the rehasher makes it and
+// answers a row this module builds on.
+
+// Which namespace a definition is in: a `fn`/`let`, or a `type`/`effect` declaration.
+pub type Ns = | Value | Decl
+
+pub fn ns_word(ns: Ns) -> String = match ns { Value -> "value", Decl -> "declaration" }
+
+// A definition's identity across two configurations: its program-wide name and namespace.
+pub type DefKey = { name: String, ns: Ns }
+
+pub fn value_key(name: String) -> DefKey = { name: name, ns: Value }
+
+pub fn decl_key(name: String) -> DefKey = { name: name, ns: Decl }
+
+pub fn is_decl(k: DefKey) -> Bool = match k.ns { Decl -> true, _ -> false }
+
+// Ascending by name, then by namespace, with `value` before `declaration`: the order the Rust side
+// sorts a `DefKey` in, and part of the artifact.
+pub fn key_before(a: DefKey, b: DefKey) -> Bool =
+  match compare(a.name, b.name) {
+    Less -> true,
+    Greater -> false,
+    Equal -> ns_rank(a.ns) < ns_rank(b.ns),
+  }
+
+fn ns_rank(ns: Ns) -> Int = match ns { Value -> 0, Decl -> 1 }
+
+pub type ChangeKind = | Edited | Derived | Added | Removed
+
+pub fn kind_word(k: ChangeKind) -> String =
+  match k { Edited -> "edited", Derived -> "derived", Added -> "added", Removed -> "removed" }
+
+// A derived change is a hash that moved because something under it did: it is never a candidate,
+// because flipping it alone would be repeating an edit that is already in the set.
+pub fn is_candidate(k: ChangeKind) -> Bool = match k { Derived -> false, _ -> true }
+
+pub type Change = {
+  /// The program-wide name — `store.orders.place`.
+  name: String,
+  ns: Ns,
+  /// Its hash when the test last passed.
+  before: Option<String>,
+  after: Option<String>,
+  kind: ChangeKind,
+  /// Whether its published interface (scheme and footprint) is the same on both sides.
+  independent: Bool,
+}
+
+pub fn edited(name: String, before: String, after: String, independent: Bool) -> Change =
+  {
+    name: name,
+    ns: Value,
+    before: Some(before),
+    after: Some(after),
+    kind: Edited,
+    independent: independent,
+  }
+
+pub fn derived(name: String, before: String, after: String) -> Change =
+  {
+    name: name,
+    ns: Value,
+    before: Some(before),
+    after: Some(after),
+    kind: Derived,
+    independent: true,
+  }
+
+// Never independent: nothing referencing it can be flipped without it.
+pub fn added(name: String, after: String) -> Change =
+  { name: name, ns: Value, before: None, after: Some(after), kind: Added, independent: false }
+
+// Never independent: a baseline body still referencing it cannot be kept while it is deleted.
+pub fn removed(name: String, before: String) -> Change =
+  { name: name, ns: Value, before: Some(before), after: None, kind: Removed, independent: false }
+
+pub fn in_namespace(c: Change, ns: Ns) -> Change = { ..c, ns: ns }
+
+pub fn change_key(c: Change) -> DefKey = { name: c.name, ns: c.ns }
+
+pub fn change_is_candidate(c: Change) -> Bool = is_candidate(c.kind)
+
+pub type FusionReason = | Independent | InterfaceChanged | Existence | Component
+
+pub fn reason_word(r: FusionReason) -> String =
+  match r {
+    Independent -> "independent",
+    InterfaceChanged -> "interface changed",
+    Existence -> "added or removed",
+    Component -> "one recursive component",
+  }
+
+// Says *why* a fused group's members are inseparable.
+pub fn reason_describe(r: FusionReason) -> String =
+  match r {
+    Independent -> "nothing forced these together",
+    InterfaceChanged ->
+      "their published interfaces moved together, so no hybrid that split them would typecheck",
+    Existence ->
+      "one of them exists on only one side, so nothing that mentions it can be flipped without it",
+    Component ->
+      "they are mutually recursive and share one component hash, so no hybrid can flip one without the other",
+  }
+
+pub type Cluster = {
+  /// Program-wide names, ascending: the order is part of the artifact.
+  members: List<String>,
+  /// `members` with namespaces: a name that is both a `fn` and a `type` must say which to swap.
+  keys: List<DefKey>,
+  reason: FusionReason,
+}
+
+pub fn is_singleton(c: Cluster) -> Bool = len(c.members) == 1
+
+// Which definitions mention which, unioned over both configurations. `map_get` answers `None` for
+// a name nothing mentions, so the referrers of an untouched name are the empty list.
+pub type DepEdges = Map<String, List<String>>
+
+pub fn no_edges() -> DepEdges = map_new()
+
+// `from` mentions `to`.
+pub fn add_edge(edges: DepEdges, from: String, to: String) -> DepEdges =
+  map_insert(edges, to, push(edge_referrers(edges, to), from))
+
+pub fn edge_referrers(edges: DepEdges, to: String) -> List<String> =
+  match map_get(edges, to) { Some(rs) -> rs, None -> [] }
+
+pub fn has_edges(edges: DepEdges) -> Bool = map_len(edges) > 0
+
+// What moved since the test last passed, classified and grouped into what the search may flip.
+pub type Delta = {
+  /// The test's own definition, when the test body itself was edited.
+  own: Option<Change>,
+  changes: List<Change>,
+  /// The atoms of the search, in ascending order of first key.
+  clusters: List<Cluster>,
+  /// How many changes could not be told apart from a hash that merely moved.
+  unclassified: Int,
+}
+
+pub fn with_components(
+  own: Option<Change>,
+  changes: List<Change>,
+  edges: DepEdges,
+  components: List<List<DefKey>>,
+) -> Delta = {
+  // Only a candidate has a position: a derived change is never asked about on its own.
+  let candidates = indices_where(len(changes), |i: Int| change_is_candidate(at_or(changes, i)));
+  let positions = len(candidates);
+  let parent = fold(range(0, positions), range(0, positions), |p: List<Int>, i: Int| p);
+  // Fused by name: `DepEdges` is a name graph, and a mention reaches either namespace.
+  let by_name = fold(range(0, positions), map_new(), |m: Map<String, List<Int>>, at: Int| {
+    let name = at_or(changes, at_or(candidates, at)).name;
+    map_insert(m, name, push(by_name_positions(m, name), at))
+  });
+
+  // A change whose interface moved drags in everything that mentions it, transitively.
+  let linked = fold(
+    range(0, positions),
+    { parent: parent, fused: zeros(positions) },
+    |st: { parent: List<Int>, fused: List<Bool> }, at: Int| {
+      let change = at_or(changes, at_or(candidates, at));
+      if change.independent { st } else {
+        fold(
+          edge_referrers(edges, change.name),
+          st,
+          |st2: { parent: List<Int>, fused: List<Bool> }, referrer: String|
+            fold(
+              by_name_positions(by_name, referrer),
+              st2,
+              |st3: { parent: List<Int>, fused: List<Bool> }, other: Int|
+                { ..st3, parent: union(st3.parent, at, other) },
+            ),
+        )
+      }
+    },
+  );
+
+  // A strongly connected component shares one component hash, so its members are one atom.
+  let joined = fold(
+    components,
+    linked,
+    |st: { parent: List<Int>, fused: List<Bool> }, component: List<DefKey>| {
+      let members = filter(
+        map(component, |k: DefKey| slot_of(changes, candidates, k)),
+        |s: Option<Int>| match s { Some(_) -> true, None -> false },
+      );
+      let slots = map(members, |s: Option<Int>| match s { Some(i) -> i, None -> 0 });
+      if len(slots) < 2 { st } else {
+        {
+          let first = at_or(slots, 0);
+          let rest = drop_from(slots, 1);
+          {
+            parent: fold(rest, st.parent, |p: List<Int>, other: Int| union(p, first, other)),
+            fused: fold(rest, set_at(st.fused, first, true), |f: List<Bool>, other: Int|
+              set_at(f, other, true)),
+          }
+        }
+      }
+    },
+  );
+
+  // Positions grouped by their root, in ascending root order, each group in ascending position.
+  let grouped = fold(range(0, positions), map_new(), |m: Map<Int, List<Int>>, at: Int| {
+    let root = find_of(joined.parent, at);
+    map_insert(m, root, push(group_positions(m, root), at))
+  });
+
+  let clusters = map(map_keys(grouped), |root: Int|
+    a_cluster(changes, candidates, joined.fused, group_positions(grouped, root)));
+  { own: own, changes: changes, clusters: sorted_clusters(clusters), unclassified: 0 }
+}
+
+fn a_cluster(
+  changes: List<Change>,
+  candidates: List<Int>,
+  fused: List<Bool>,
+  slots: List<Int>,
+) -> Cluster = {
+  let members = map(slots, |at: Int| at_or(changes, at_or(candidates, at)));
+  let reason = if some(members, |c: Change|
+      match c.kind { Added -> true, Removed -> true, _ -> false }) { Existence }
+  else if some(slots, |at: Int| at_or(fused, at)) { Component }
+  else if every(members, |c: Change| c.independent) { Independent }
+  else { InterfaceChanged };
+  let keys = sorted_keys(map(members, |c: Change| change_key(c)));
+  { members: sorted_names(map(keys, |k: DefKey| k.name)), keys: keys, reason: reason }
+}
+
+// The clusters in ascending order of their key lists, which is the order the Rust side sorts them.
+fn sorted_clusters(clusters: List<Cluster>) -> List<Cluster> =
+  fold(clusters, [], |acc: List<Cluster>, c: Cluster| {
+    let at = fold(range(0, len(acc)), len(acc), |i: Int, j: Int|
+      if i < len(acc) { i } else if keys_before(c.keys, at_or(acc, j).keys) { j } else { i });
+    let before = map(range(0, at), |j: Int| at_or(acc, j));
+    fold(range(at, len(acc)), push(before, c), |out: List<Cluster>, j: Int|
+      push(out, at_or(acc, j)))
+  })
+
+// Lexicographic, like a list of keys compares.
+fn keys_before(a: List<DefKey>, b: List<DefKey>) -> Bool =
+  match a {
+    [] -> match b { [] -> false, _ -> true },
+    _ -> match b {
+      [] -> false,
+      _ -> {
+        let x = at_or(a, 0);
+        let y = at_or(b, 0);
+        if x.name == y.name && ns_rank(x.ns) == ns_rank(y.ns) {
+          keys_before(drop_from(a, 1), drop_from(b, 1))
+        } else { key_before(x, y) }
+      },
+    },
+  }
+
+fn sorted_keys(keys: List<DefKey>) -> List<DefKey> =
+  fold(keys, [], |acc: List<DefKey>, k: DefKey| {
+    let at = fold(range(0, len(acc)), len(acc), |i: Int, j: Int|
+      if i < len(acc) { i } else if key_before(k, at_or(acc, j)) { j } else { i });
+    let before = map(range(0, at), |j: Int| at_or(acc, j));
+    fold(range(at, len(acc)), push(before, k), |out: List<DefKey>, j: Int| push(out, at_or(acc, j)))
+  })
+
+// Ascending and deduplicated, which is how a name list reaches an artifact.
+fn sorted_names(names: List<String>) -> List<String> =
+  fold(names, [], |acc: List<String>, n: String| {
+    if any_text(acc, n) { acc } else {
+      let at = fold(range(0, len(acc)), len(acc), |i: Int, j: Int|
+        if i < len(acc) { i } else if compare(n, at_or(acc, j)) == Less { j } else { i });
+      let before = map(range(0, at), |j: Int| at_or(acc, j));
+      fold(range(at, len(acc)), push(before, n), |out: List<String>, j: Int|
+        push(out, at_or(acc, j)))
+    }
+  })
+
+pub fn candidates(d: Delta) -> Int = len(filter(d.changes, change_is_candidate))
+
+pub fn is_empty(d: Delta) -> Bool = len(d.clusters) == 0
+
+// Prefers a candidate over a derived change sharing its name, so the edit is what shows.
+pub fn change(d: Delta, name: String) -> Option<Change> =
+  match first_of(d.changes, |c: Change| c.name == name && change_is_candidate(c)) {
+    Some(c) -> Some(c),
+    None -> first_of(d.changes, |c: Change| c.name == name),
+  }
+
+pub fn change_of(d: Delta, key: DefKey) -> Option<Change> =
+  first_of(d.changes, |c: Change| c.name == key.name && ns_rank(c.ns) == ns_rank(key.ns))
+
+fn first_of<a>(xs: List<a>, p: (a) -> Bool) -> Option<a> =
+  match filter(xs, p) { [] -> None, hits -> Some(at_or(hits, 0)) }
+
+// The definitions a mixture takes from the post-edit side, given the chosen cluster indices.
+pub fn flipped_names(d: Delta, flipped: List<Int>) -> List<String> =
+  sorted_names(flat(map(flipped, |i: Int| list_at(d.clusters, i)), |c: Cluster| c.members))
+
+// `flipped_names` without the namespace collapse.
+pub fn flipped_keys(d: Delta, flipped: List<Int>) -> List<DefKey> =
+  sorted_keys(flat(map(flipped, |i: Int| list_at(d.clusters, i)), |c: Cluster| c.keys))
+
+// An index past the end answers nothing, so a caller that flips out of range contributes nothing.
+fn flat<a, b>(cs: List<Option<a>>, of: (a) -> List<b>) -> List<b> =
+  fold(cs, [], |acc: List<b>, c: Option<a>|
+    match c { None -> acc, Some(x) -> fold(of(x), acc, |out: List<b>, y: b| push(out, y)) })
+
+// --- Union-find, over an immutable parent list ---------------------------------
+//
+// The Rust implementation compresses paths as it walks; the root it answers is the same either way,
+// and the root is all this uses, so there is nothing to compress.
+
+fn find_of(parent: List<Int>, x: Int) -> Int = {
+  let p = at_or(parent, x);
+  if p == x { x } else { find_of(parent, p) }
+}
+
+fn union(parent: List<Int>, a: Int, b: Int) -> List<Int> = {
+  let ra = find_of(parent, a);
+  let rb = find_of(parent, b);
+  if ra == rb { parent } else { set_at(parent, max(ra, rb), min(ra, rb)) }
+}
+
+fn slot_of(changes: List<Change>, candidates: List<Int>, key: DefKey) -> Option<Int> =
+  match filter(range(0, len(candidates)), |at: Int| {
+      let c = at_or(changes, at_or(candidates, at));
+      c.name == key.name && ns_rank(c.ns) == ns_rank(key.ns)
+    }) {
+    [] -> None,
+    hits -> Some(at_or(hits, 0)),
+  }
+
+// --- Helpers ------------------------------------------------------------------
+
+fn indices_where(n: Int, p: (Int) -> Bool) -> List<Int> =
+  fold(range(0, n), [], |acc: List<Int>, i: Int| if p(i) { push(acc, i) } else { acc })
+
+fn every<a>(xs: List<a>, p: (a) -> Bool) -> Bool = fold(xs, true, |ok: Bool, x: a| ok && p(x))
+
+fn some<a>(xs: List<a>, p: (a) -> Bool) -> Bool = fold(xs, false, |hit: Bool, x: a| hit || p(x))
+
+fn any_text(xs: List<String>, x: String) -> Bool = some(xs, |y: String| y == x)
+
+fn zeros(n: Int) -> List<Bool> = map(range(0, n), |_i: Int| false)
+
+fn by_name_positions(m: Map<String, List<Int>>, name: String) -> List<Int> =
+  match map_get(m, name) { Some(ps) -> ps, None -> [] }
+
+fn group_positions(m: Map<Int, List<Int>>, root: Int) -> List<Int> =
+  match map_get(m, root) { Some(ps) -> ps, None -> [] }
+
+fn set_at<a>(xs: List<a>, k: Int, x: a) -> List<a> =
+  map(range(0, len(xs)), |i: Int| if i == k { x } else { at_or(xs, i) })
+
+fn drop_from<a>(xs: List<a>, from: Int) -> List<a> =
+  map(range(from, len(xs)), |i: Int| at_or(xs, i))
+
+// `list_at` as a total lookup: every caller here asks only for indices it holds.
+fn at_or<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list holds") }
+
+// --- Tests ------------------------------------------------------------------
+//
+// The expectations below are what the runtime's own clustering answers for the same fixtures,
+// printed from a scratch run against it. The cases are where two implementations could differ:
+// what fuses with what, which reason wins, and the order members and keys come out in.
+
+fn c(name: String, before: String, after: String, independent: Bool) -> Change =
+  edited(name, before, after, independent)
+
+fn a_change(name: String, after: String) -> Change = added(name, after)
+
+fn a_derived(name: String) -> Change = derived(name, "h1", "h2")
+
+fn a_delta(changes: List<Change>, edges: DepEdges) -> Delta =
+  with_components(None, changes, edges, [])
+
+test "a non-independent change fuses with everything that mentions it" {
+  // `user` mentions `helper`, and `helper`'s interface moved: no mixture may split them.
+  let edges = add_edge(no_edges(), "user", "helper");
+  let d = a_delta([c("helper", "h1", "h2", false), c("user", "h3", "h4", true)], edges);
+  assert_eq(d.clusters, [
+    {
+      members: ["helper", "user"],
+      keys: [value_key("helper"), value_key("user")],
+      reason: InterfaceChanged,
+    },
+  ]);
+  assert_eq(candidates(d), 2);
+  // An addition never lets its referrers be flipped without it, and says which constraint did it.
+  let d = a_delta([a_change("helper", "h2"), c("user", "h3", "h4", true)], edges);
+  assert_eq(d.clusters, [
+    {
+      members: ["helper", "user"],
+      keys: [value_key("helper"), value_key("user")],
+      reason: Existence,
+    },
+  ])
+}
+
+test "changes nothing mentions stand alone, and a derived change is not a candidate at all" {
+  let d = a_delta([a_change("a", "h1"), a_change("b", "h2")], no_edges());
+  assert_eq(d.clusters, [
+    { members: ["a"], keys: [value_key("a")], reason: Existence },
+    { members: ["b"], keys: [value_key("b")], reason: Existence },
+  ]);
+  assert_eq(candidates(d), 2);
+  // A derived change is a hash that moved because something under it did: the search never sees it.
+  let d = a_delta([a_derived("under"), c("user", "h3", "h4", true)], no_edges());
+  assert_eq(d.clusters, [{ members: ["user"], keys: [value_key("user")], reason: Independent }]);
+  assert_eq(candidates(d), 1);
+  assert_eq(is_empty(d), false);
+  // And a delta with nothing left to search is empty.
+  let d = a_delta([a_derived("under")], no_edges());
+  assert_eq(d.clusters, []);
+  assert_eq(is_empty(d), true)
+}
+
+test "a recursive component is one atom however independent its members look" {
+  let d = with_components(
+    None,
+    [c("even", "h1", "h2", true), c("odd", "h3", "h4", true), c("solo", "h5", "h6", true)],
+    no_edges(),
+    [[value_key("even"), value_key("odd")]],
+  );
+  assert_eq(d.clusters, [
+    { members: ["even", "odd"], keys: [value_key("even"), value_key("odd")], reason: Component },
+    { members: ["solo"], keys: [value_key("solo")], reason: Independent },
+  ]);
+  // A component of one fuses nothing: it would otherwise claim a constraint that is not there.
+  let d = with_components(None, [a_derived("ghost")], no_edges(), [[value_key("ghost")]]);
+  assert_eq(d.clusters, []);
+
+  // A component whose members are all derived contributes nothing either.
+  let d = with_components(None, [a_derived("ghost")], no_edges(), []);
+  assert_eq(d.clusters, [])
+}
+
+test "fusing is by name, so a mention reaches either namespace" {
+  // `x` is mentioned, and it exists as a value and a declaration: both fuse with the
+  // non-independent `helper` that `x` mentions. The cluster keeps the keys apart.
+  let edges = add_edge(no_edges(), "x", "helper");
+  let d = a_delta(
+    [
+      c("helper", "h1", "h2", false),
+      c("x", "h3", "h4", true),
+      in_namespace(c("x", "h5", "h6", true), Decl),
+    ],
+    edges,
+  );
+  assert_eq(d.clusters, [
+    {
+      members: ["helper", "x"],
+      keys: [value_key("helper"), value_key("x"), decl_key("x")],
+      reason: InterfaceChanged,
+    },
+  ]);
+  // Members are names, deduplicated; keys keep both namespaces; both are ascending.
+  assert_eq(flipped_names(d, [0, 1, 9]), ["helper", "x"]);
+  assert_eq(flipped_keys(d, [0, 1, 9]), [value_key("helper"), value_key("x"), decl_key("x")]);
+  // An index nothing holds contributes nothing rather than failing.
+  assert_eq(flipped_names(d, [4]), [])
+}
+
+test "the change a report shows is the edit, not the hash that moved under it" {
+  let d = a_delta([a_derived("x"), c("x", "h1", "h2", false)], no_edges());
+  assert_eq(is_candidate(a_derived("x").kind), false);
+  assert_eq(change_is_candidate(a_derived("x")), false);
+  assert_eq(change_is_candidate(c("x", "h1", "h2", false)), true);
+  assert_eq(map(d.changes, |c2: Change| kind_word(c2.kind)), ["derived", "edited"]);
+  assert_eq(
+    map(filter(d.changes, |c2: Change| c2.name == "x"), |c2: Change| kind_word(c2.kind)),
+    ["derived", "edited"],
+  );
+  assert_eq(
+    map(filter(d.changes, |c2: Change| c2.name == "x" && change_is_candidate(c2)), |c2: Change|
+      kind_word(c2.kind)),
+    ["edited"],
+  );
+  assert_eq(
+    match first_of(d.changes, |c2: Change| change_is_candidate(c2)) {
+      Some(c2) -> kind_word(c2.kind),
+      None -> "none",
+    },
+    "edited",
+  );
+  assert_eq(
+    match first_of(d.changes, |c2: Change| c2.name == "x" && change_is_candidate(c2)) {
+      Some(c2) -> kind_word(c2.kind),
+      None -> "none",
+    },
+    "edited",
+  );
+  assert_eq(match change(d, "x") { Some(c2) -> kind_word(c2.kind), None -> "none" }, "edited");
+  assert_eq(change(d, "nothing"), None);
+  // `change_of` has no candidate preference — it answers the row for that key, and the first row
+  // for `x` in the value namespace is the derived one. Only `change` prefers the edit.
+  assert_eq(
+    match change_of(d, value_key("x")) { Some(c2) -> kind_word(c2.kind), None -> "none" },
+    "derived",
+  );
+  assert_eq(match change_of(d, decl_key("x")) { Some(_) -> "found", None -> "none" }, "none")
+}
+
+test "every word a report prints, as the Rust side prints it" {
+  assert_eq(ns_word(Value), "value");
+  assert_eq(ns_word(Decl), "declaration");
+  assert_eq(kind_word(Edited), "edited");
+  assert_eq(kind_word(Derived), "derived");
+  assert_eq(kind_word(Added), "added");
+  assert_eq(kind_word(Removed), "removed");
+  assert_eq(is_candidate(Derived), false);
+  assert_eq(reason_word(InterfaceChanged), "interface changed");
+  assert_eq(reason_word(Existence), "added or removed");
+  assert_eq(reason_word(Component), "one recursive component");
+  assert_eq(
+    reason_describe(Component),
+    "they are mutually recursive and share one component hash, so no hybrid can flip one without the other",
+  );
+  assert_eq(is_singleton({ members: ["a"], keys: [value_key("a")], reason: Independent }), true)
+}
