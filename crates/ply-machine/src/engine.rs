@@ -358,6 +358,19 @@ impl<'a> Prover<'a> {
         &self.world
     }
 
+    /// Judge one tuple the way a discharge would: the same guard, the same body, the same case
+    /// machinery. Which tuples to ask about is the program's, so the walk that makes a
+    /// counterexample small drives this rather than running here.
+    pub fn judge_at(&self, obligation: &Obligation, plan: &ProvePlan, values: &[Value]) -> Outcome {
+        let Some(claim) = self.claim(obligation) else {
+            return Outcome::Rejected;
+        };
+        match self.cases(obligation, &claim, plan) {
+            Ok(mut cases) => judge_case(&mut cases, values),
+            Err(_) => Outcome::Rejected,
+        }
+    }
+
     /// One obligation, at the strongest tier this build can demonstrate. `domain` is the program's
     /// own measurement of its binders, or `None` when it decided to sample: whether the domain is
     /// finite is `domain.ply`'s answer now, and this side materialises the points.
