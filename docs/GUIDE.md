@@ -1183,6 +1183,14 @@ covers serialization failures. `MemDb` is an in-memory twin (`open`, `step`,
 `begin_step`, `commit_step`, `abort_step`). Statement text the driver cannot
 account for is `E0432`.
 
+A `db` effect is served by `serve`: `with_server(url, size, body)` reads a
+connection string (`server_of`), draws a nonce, and answers the six operations
+over `std.pg` — the pool, the transaction scope and the text of every value are
+the language's, and the host is left with `net`. The effect is nominal, so a
+program that wants a server handles it: `with_server` is how, and
+`{db.read[*], db.write[*] | e}` in its signature is what lets one handler answer
+every table at once.
+
 ### 13.6 `std.config`
 
 `pub nondet effect config` has `read get[k](key: String) -> Option<String>` and
@@ -1574,6 +1582,28 @@ is, so nothing checked in is either expired or shipping its private key.
 client trusts exactly this one by. Each call makes a new key. It is bound under
 `ply run --host`, and a test handles it over `canned(certificate, key, der,
 fingerprint)`.
+
+### 13.17 `std.random`
+
+```ply
+pub nondet effect entropy {
+  read next() -> Int
+  read below(n: Int) -> Int
+}
+pub fn next() -> Int / {entropy.next}
+pub fn below(n: Int) -> Int / {entropy.below}
+pub fn nonce() -> String / {entropy.next}
+```
+
+The randomness a run that is not simulated has: `next` is sixty-three bits and
+never negative, `below` is uniform below a bound above zero (the host draws
+again rather than folding a value into range with a remainder, which would make
+the low values likelier), and `nonce` is two draws, which is what a SASL
+exchange and a cache key want.
+
+`simulate` answers the *prelude's* `random` with values a seed decides, which is
+what makes a simulation reproducible; that is why it is the scheduler's and not
+the host's. A run that is not simulated draws here, and `--host` binds it.
 
 ## 14. The host boundary
 
