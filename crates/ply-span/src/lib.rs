@@ -271,6 +271,10 @@ pub mod codes {
     pub const DEPENDENCY_CYCLE: &str = "E0134";
     /// A dependency whose path is missing, that holds no `ply.pkg`, or that is not a path.
     pub const DEPENDENCY_UNUSABLE: &str = "E0135";
+    /// A dependency below the version floor the manifest importing it asks for.
+    pub const DEPENDENCY_VERSION: &str = "E0136";
+    /// One package reached at two places, where a closure pins one version.
+    pub const DEPENDENCY_DIAMOND: &str = "E0137";
     pub const TYPE_MISMATCH: &str = "E0201";
     pub const ARITY_MISMATCH: &str = "E0202";
     pub const OCCURS_CHECK: &str = "E0203";
@@ -503,6 +507,14 @@ pub const MEANINGS: &[(&str, &str)] = &[
     (
         "E0135",
         "a dependency that is missing, unmanifested or not a path",
+    ),
+    (
+        "E0136",
+        "a dependency below the version floor its importer asks for",
+    ),
+    (
+        "E0137",
+        "one package reached at two places, where a closure pins one version",
     ),
     ("E0201", "type mismatch"),
     ("E0202", "arity mismatch"),
@@ -804,6 +816,8 @@ mod tests {
             ("PREFIX_COLLISION", codes::PREFIX_COLLISION, "E0133"),
             ("DEPENDENCY_CYCLE", codes::DEPENDENCY_CYCLE, "E0134"),
             ("DEPENDENCY_UNUSABLE", codes::DEPENDENCY_UNUSABLE, "E0135"),
+            ("DEPENDENCY_VERSION", codes::DEPENDENCY_VERSION, "E0136"),
+            ("DEPENDENCY_DIAMOND", codes::DEPENDENCY_DIAMOND, "E0137"),
             ("TYPE_MISMATCH", codes::TYPE_MISMATCH, "E0201"),
             ("ARITY_MISMATCH", codes::ARITY_MISMATCH, "E0202"),
             ("OCCURS_CHECK", codes::OCCURS_CHECK, "E0203"),

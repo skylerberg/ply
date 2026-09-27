@@ -1880,6 +1880,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0133` | two packages granting one module prefix |
 | `E0134` | packages depending on one another in a cycle |
 | `E0135` | a dependency that is missing, unmanifested or not a path |
+| `E0136` | a dependency below the version floor its importer asks for |
+| `E0137` | one package reached at two places, where a closure pins one version |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
