@@ -28,9 +28,11 @@ nondet effect machine {
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
   read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
+  read accounting[m]() -> Accounting
   write drop[m]() -> Unit
 }
 
+type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Raised = { code: String, message: String }
 type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
 
@@ -303,9 +305,11 @@ nondet effect machine {
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
   read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
+  read accounting[m]() -> Accounting
   write drop[m]() -> Unit
 }
 
+type Accounting = { steps: Int, micros: Int, counters: Counters }
 type Raised = { code: String, message: String }
 type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
 
@@ -440,9 +444,12 @@ nondet effect machine {
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
   read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
+  read accounting[m]() -> Accounting
   write drop[m]() -> Unit
 }
 
+type Accounting = { steps: Int, micros: Int, counters: Counters }
+type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
 type Raised = { code: String, message: String }
 type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
 
@@ -613,9 +620,12 @@ nondet effect machine {
   read bound[m](entry: String) -> Result<Bound, Refusal>
   write enter[m]() -> Ended
   read call[m](name: String, args: List<Value>) -> Result<Value, Raised>
+  read accounting[m]() -> Accounting
   write drop[m]() -> Unit
 }
 
+type Accounting = { steps: Int, micros: Int, counters: Counters }
+type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal>, cycles: Int }
 type Options = Unit
 type Target = Unit
 type Bound = Unit
@@ -623,28 +633,34 @@ type Refusal = Unit
 type Ended = Unit
 type Raised = { code: String, message: String }
 type Value = | VUnit | VBool(Bool) | VInt(Int) | VStr(String) | VList(List<Value>)
+type Answer = { value: Int, steps: Int, reset: Int, raised_steps: Int }
 
-fn main(root: String) -> Int / {machine.load[m], machine.bound[m], machine.call[m], machine.drop[m]} = {
+fn main(root: String) -> Answer / {machine.load[m], machine.bound[m], machine.call[m], machine.accounting[m], machine.drop[m]} = {
   match machine.load[m](root) {
     Ok(_) -> match machine.bound[m]("inner.main") {
       Ok(_) -> {
         let doubled = machine.call[m]("inner.double", [VInt(21)]);
+        let first = machine.accounting[m]();
+        let again = machine.accounting[m]();
         let raised = machine.call[m]("inner.boom", []);
+        let after_raised = machine.accounting[m]();
         machine.drop[m]();
         match doubled {
           Ok(v) -> match v {
             VInt(i) -> match raised {
-              Err(r) -> if string_contains(r.message, "oh no") { i } else { 0 - 4 },
-              Ok(_) -> 0 - 3,
+              Err(r) -> if string_contains(r.message, "oh no") {
+                { value: i, steps: first.steps, reset: again.steps, raised_steps: after_raised.steps }
+              } else { { value: 0 - 4, steps: 0, reset: 0, raised_steps: 0 } },
+              Ok(_) -> { value: 0 - 3, steps: 0, reset: 0, raised_steps: 0 },
             },
-            _ -> 0 - 2,
+            _ -> { value: 0 - 2, steps: 0, reset: 0, raised_steps: 0 },
           },
-          Err(_) -> 0 - 1,
+          Err(_) -> { value: 0 - 1, steps: 0, reset: 0, raised_steps: 0 },
         }
       },
-      Err(_) -> 0 - 5,
+      Err(_) -> { value: 0 - 5, steps: 0, reset: 0, raised_steps: 0 },
     },
-    Err(_) -> 0 - 6,
+    Err(_) -> { value: 0 - 6, steps: 0, reset: 0, raised_steps: 0 },
   }
 }
 "#;
@@ -686,5 +702,33 @@ fn a_call_enters_a_definition_with_arguments_and_answers_its_value() {
             Span::DUMMY,
         )
         .expect("the outer main ran");
-    assert_eq!(answer, Value::Int(42));
+    let Value::Record(fields) = &answer else {
+        panic!("the outer program answers a record, not {answer}");
+    };
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find(|(key, _)| key.as_str() == name)
+            .map(|(_, value)| value)
+            .unwrap_or_else(|| panic!("the answer carries `{name}`"))
+    };
+    assert_eq!(field("value"), &Value::Int(42));
+    // The runtime counted the calls the definition made, and the read reset the count.
+    let Value::Int(steps) = field("steps") else {
+        panic!("steps is an int");
+    };
+    assert!(*steps > 0, "the call's steps were not counted: {answer}");
+    assert_eq!(
+        field("reset"),
+        &Value::Int(0),
+        "reading the accounting did not reset it"
+    );
+    // A call that raised did work too, and that work is counted.
+    let Value::Int(raised_steps) = field("raised_steps") else {
+        panic!("raised_steps is an int");
+    };
+    assert!(
+        *raised_steps > 0,
+        "the raising call's steps were not counted: {answer}"
+    );
 }

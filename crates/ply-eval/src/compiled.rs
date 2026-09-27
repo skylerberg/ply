@@ -36,6 +36,11 @@ pub trait Compiled {
 
     fn set_seed(&self, _seed: Seed, _steps: u32) {}
 
+    /// The calls the runtime counted in the entry it ran last; 0 for one that counts none.
+    fn steps(&self) -> u64 {
+        0
+    }
+
     fn simulated(&self) -> Option<Record> {
         None
     }

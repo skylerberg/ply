@@ -523,6 +523,14 @@ impl ply_eval::Compiled for Bodies {
         }
     }
 
+    // The entry's own count: `begin` zeroes it, so what stands here is the entry that ran last.
+    fn steps(&self) -> u64 {
+        self.ctx
+            .try_borrow()
+            .map(|ctx| u64::try_from(ctx.ticks).unwrap_or(0))
+            .unwrap_or(0)
+    }
+
     fn simulated(&self) -> Option<ply_eval::region::Record> {
         self.ctx
             .try_borrow()
