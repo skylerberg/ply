@@ -1,0 +1,192 @@
+// `shrink` — counterexample minimisation as pure logic over a re-run the caller owns.
+//
+// The runtime owns what a value *is*: which candidates a value has, how big each of them is, and
+// what happens when one replaces it. What is decided here is the walk. Greedy descent: the first
+// candidate smaller than the value it replaces is accepted, and the whole walk starts again, so the
+// result is minimal in the sense that no single value can be made smaller without losing the
+// property. The number of re-runs is the budget a caller set, counted, not timed.
+//
+// This is why a counterexample is a *witness* rather than a dump: a value that is small enough to
+// read is the difference between a report someone acts on and one they scroll past.
+
+// What the walk came to: the position chosen at each value (`-1` keeps the original), how many
+// candidates were accepted, and how many re-runs were spent against the budget.
+pub type Descent = { picked: List<Int>, steps: Int, evaluations: Int }
+
+// One candidate at one value: the position the runtime offers it under, and how big it is. The size
+// is the runtime's measure, because only it knows what a value contains.
+pub type Alt = { position: Int, size: Int }
+
+// The walk. `width` is how many values the counterexample has; `size(choice, i)` the size of the
+// value at `i` under the choices made so far; `alts(choice, i)` the candidates at `i`, in the order
+// they are tried; `holds(choice)` the runtime replacing each value with the candidate at its
+// position — leaving it alone when the position is negative — and answering whether the result still
+// fails the way the counterexample did.
+pub fn descend<a | e>(
+  width: Int,
+  size: (List<Int>, Int) -> Int,
+  alts: (List<Int>, Int) -> List<Alt>,
+  holds: (List<Int>) -> Bool / e,
+  budget: Int,
+) -> Descent / e = {
+  let start = map(range(0, width), |_i: Int| -1);
+  walk(width, size, alts, holds, budget, start, 0, 0)
+}
+
+// One pass from `i` on: the first candidate that is smaller *and* still holds is accepted, and the
+// caller starts again from the first value. `None` means the pass changed nothing.
+fn accepted<a | e>(
+  width: Int,
+  size: (List<Int>, Int) -> Int,
+  alts: (List<Int>, Int) -> List<Alt>,
+  holds: (List<Int>) -> Bool / e,
+  budget: Int,
+  choice: List<Int>,
+  i: Int,
+  evaluations: Int,
+// A pass that accepted nothing still *spent* what it tried, so the count comes back either way:
+// the budget is what the walk did, not only what it kept.
+) -> { chosen: List<Int>, hit: Bool, evaluations: Int } / e =
+  if i >= width {
+    { chosen: choice, hit: false, evaluations: evaluations }
+  } else if evaluations >= budget {
+    { chosen: choice, hit: false, evaluations: evaluations }
+  } else {
+    let here = size(choice, i);
+    let taken = smaller(alts(choice, i), here, choice, i, holds, evaluations, budget);
+    if taken.hit {
+      {
+        chosen: set_at(choice, i, taken.position),
+        hit: true,
+        evaluations: taken.evaluations,
+      }
+    } else {
+      accepted(width, size, alts, holds, budget, choice, i + 1, taken.evaluations)
+    }
+  }
+
+// The candidates at one value, in order: the first one that is smaller than `here` and still holds.
+// A candidate that was *tried* is counted whether or not it was kept, and so is the budget running
+// out: what a caller asked for is the number of re-runs, not the number of improvements.
+fn smaller<a | e>(
+  candidates: List<Alt>,
+  here: Int,
+  choice: List<Int>,
+  i: Int,
+  holds: (List<Int>) -> Bool / e,
+  evaluations: Int,
+  budget: Int,
+) -> { position: Int, hit: Bool, evaluations: Int } / e =
+  if evaluations >= budget {
+    { position: -1, hit: false, evaluations: evaluations }
+  } else {
+    match candidates {
+      [] -> { position: -1, hit: false, evaluations: evaluations },
+      [alt, ..rest] ->
+        if alt.size >= here {
+          smaller(rest, here, choice, i, holds, evaluations, budget)
+        } else {
+          let next = set_at(choice, i, alt.position);
+          if holds(next) {
+            { position: alt.position, hit: true, evaluations: evaluations + 1 }
+          } else {
+            smaller(rest, here, choice, i, holds, evaluations + 1, budget)
+          }
+        },
+    }
+  }
+
+fn walk<a | e>(
+  width: Int,
+  size: (List<Int>, Int) -> Int,
+  alts: (List<Int>, Int) -> List<Alt>,
+  holds: (List<Int>) -> Bool / e,
+  budget: Int,
+  choice: List<Int>,
+  steps: Int,
+  evaluations: Int,
+) -> Descent / e = {
+  let pass = accepted(width, size, alts, holds, budget, choice, 0, evaluations);
+  if pass.hit {
+    walk(width, size, alts, holds, budget, pass.chosen, steps + 1, pass.evaluations)
+  } else {
+    { picked: pass.chosen, steps: steps, evaluations: pass.evaluations }
+  }
+}
+
+fn set_at<a>(xs: List<a>, i: Int, x: a) -> List<a> =
+  map(range(0, len(xs)), |j: Int| if j == i { x } else { at_or(xs, j) })
+
+fn at_or<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list holds") }
+
+// --- Tests ------------------------------------------------------------------
+//
+// The rules are the runtime's own, mirrored: a candidate is only tried when it is *smaller*, an
+// accepted one restarts the walk from the first value, and the budget counts re-runs.
+
+// A counterexample of one value, whose candidates are 5, 3 and 2 — and which still holds at 3 or 2,
+// but not at 5. Greedy descent takes 3 (the first smaller one), then restarts and takes 2.
+fn sizes_of(choice: List<Int>, i: Int) -> Int =
+  if i == 0 { let p = at_or(choice, 0); if p < 0 { 9 } else { p } } else { 0 }
+
+test "greedy descent takes the first smaller candidate, not the smallest" {
+  let out = descend(
+    1,
+    sizes_of,
+    |_choice: List<Int>, _i: Int| [{ position: 5, size: 5 }, { position: 3, size: 3 }, { position: 2, size: 2 }],
+    |_choice: List<Int>| true,
+    64,
+  );
+  assert_eq(out.picked, [3]);
+  assert_eq(out.steps, 1);
+  assert_eq(out.evaluations, 1)
+}
+
+test "a candidate that loses the property is skipped, and the next one is tried" {
+  // 3 holds only when the second value is at its original, so the walk may only take 7.
+  let out = descend(
+    1,
+    sizes_of,
+    |_choice: List<Int>, _i: Int| [{ position: 3, size: 3 }, { position: 7, size: 7 }],
+    |_choice: List<Int>| false,
+    64,
+  );
+  assert_eq(out.picked, [-1]);
+  assert_eq(out.steps, 0);
+  assert_eq(out.evaluations, 2)
+}
+
+test "a budget of re-runs is what stops the walk" {
+  let out = descend(
+    1,
+    sizes_of,
+    |_choice: List<Int>, _i: Int| [{ position: 5, size: 5 }, { position: 3, size: 3 }, { position: 2, size: 2 }],
+    |_choice: List<Int>| true,
+    2,
+  );
+  // Two re-runs: 5, then 3. The third — 2 — is what the budget refuses, and the walk says so
+  // rather than claiming the value it stopped at is minimal.
+  assert_eq(out.picked, [3]);
+  assert_eq(out.steps, 2);
+  assert_eq(out.evaluations, 2)
+}
+
+test "a candidate no smaller than the value is never tried" {
+  let out = descend(
+    1,
+    sizes_of,
+    |_choice: List<Int>, _i: Int| [{ position: 10, size: 10 }, { position: 11, size: 11 }],
+    |_choice: List<Int>| true,
+    64,
+  );
+  assert_eq(out.picked, [-1]);
+  // Nothing was re-run, so nothing was spent: the budget is counted, not timed.
+  assert_eq(out.evaluations, 0)
+}
+
+test "a width of no values is a walk with nothing to do" {
+  let out = descend(0, sizes_of, |_c: List<Int>, _i: Int| [], |_c: List<Int>| true, 8);
+  assert_eq(out.picked, []);
+  assert_eq(out.steps, 0)
+}
