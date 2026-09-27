@@ -220,7 +220,7 @@ impl fmt::Display for Row {
 }
 
 /// A closed row: exactly what a definition can do.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct Footprint(pub BTreeSet<EffectAtom>);
 
 impl Footprint {
@@ -414,7 +414,7 @@ impl fmt::Display for Type {
 }
 
 /// Row and label variables generalize alongside type variables.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Scheme {
     pub ty_vars: Vec<TyVar>,
     pub row_vars: Vec<RowVar>,
@@ -440,7 +440,7 @@ impl fmt::Display for Scheme {
 }
 
 /// A fixed-width integer type; `Int` is not one. Arithmetic is checked unless `wrap_*` is used.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum IntTy {
     U8,
     U16,
