@@ -2115,17 +2115,12 @@ fn two_candidate_edits_are_narrowed_to_the_culprit_by_running_the_mixture() {
         culprit["search"]["evaluated"].as_u64().unwrap() > 0,
         "a mixture was actually run: {culprit}"
     );
-    // The suspects are what the runtime ranked from the run's own evidence; marking them is the
-    // program's verdict and the runtime does not write it back yet, so a consumer reads the answer
-    // from `culprit` (above) and the suspects as the ranking they are.
-    let names: Vec<&str> = failure["suspects"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|s| s["name"].as_str().unwrap_or_default())
-        .collect();
-    assert!(names.contains(&"m.normal_sign"), "{failure}");
-    assert!(names.contains(&"m.balance"), "{failure}");
+    // The suspects the program's own verdict marked, culprit first: the runtime ranked them from
+    // the run's evidence and the verdict says which of them the failure came from.
+    assert_eq!(failure["suspects"][0]["name"], "m.normal_sign", "{failure}");
+    assert_eq!(failure["suspects"][0]["culprit"], true, "{failure}");
+    assert_eq!(failure["suspects"][1]["name"], "m.balance", "{failure}");
+    assert_eq!(failure["suspects"][1]["culprit"], false, "{failure}");
 }
 
 #[test]
