@@ -475,6 +475,7 @@ type Options = {
   trust: List<String>,
   fs: List<Named>,
   exec: List<Named>,
+  allow: List<String>,
   db: DbOpts,
   config: ConfigOpts,
   trace: TraceOpts,
@@ -542,6 +543,7 @@ fn opts(host: Bool) -> Options =
     trust: [],
     fs: [],
     exec: [],
+    allow: [],
     db: {
       url: None,
       pool: None,

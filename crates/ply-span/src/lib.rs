@@ -387,6 +387,8 @@ pub mod codes {
     pub const PROCESS_EXEC_INVALID: &str = "E0457";
     /// A spawned process wrote more to a stream than one captured value holds.
     pub const PROCESS_OUTPUT_TOO_LARGE: &str = "E0458";
+    /// A `--allow` family the program being run does not declare: nothing would reach it.
+    pub const CAPABILITY_UNDECLARED: &str = "E0459";
     pub const ASSERTION_FAILED: &str = "E0501";
     /// A failure the language defines: `panic`, division by zero, overflow, a resource limit.
     pub const RUNTIME_ERROR: &str = "E0502";
@@ -608,6 +610,7 @@ pub const MEANINGS: &[(&str, &str)] = &[
     ("E0456", "`process.spawn` label with no executable bound"),
     ("E0457", "`--exec` path that cannot be executed"),
     ("E0458", "captured output over the bound"),
+    ("E0459", "`--allow` family the program does not declare"),
     ("E0501", "assertion failed"),
     (
         "E0502",
@@ -915,6 +918,11 @@ mod tests {
             ("FS_FILE_TOO_LARGE", codes::FS_FILE_TOO_LARGE, "E0453"),
             ("FS_ROOT_INVALID", codes::FS_ROOT_INVALID, "E0454"),
             ("PROCESS_EXIT", codes::PROCESS_EXIT, "E0455"),
+            (
+                "CAPABILITY_UNDECLARED",
+                codes::CAPABILITY_UNDECLARED,
+                "E0459",
+            ),
             ("PROCESS_EXEC_UNBOUND", codes::PROCESS_EXEC_UNBOUND, "E0456"),
             ("PROCESS_EXEC_INVALID", codes::PROCESS_EXEC_INVALID, "E0457"),
             (
