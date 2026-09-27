@@ -458,16 +458,14 @@ test "the regression" { assert_eq(ask(1), expected()) }
 
     let mut sources: Vec<(String, String)> = after.texts.clone().into_iter().collect();
     sources.sort();
-    ply_test::diagnose_failures(
-        &mut report,
-        &sources,
-        &after.port,
-        &mut store,
-        &ply_test::Options::default(),
-        true,
-    );
+    ply_test::diagnose_failures(&mut report, &sources, &after.port, &mut store, true);
 
+    // The failure says it reached the host, and no mixture is offered for one: a re-run would
+    // repeat whatever was done outside the program.
+    assert!(report.failures[0].host);
     let bisection = &report.failures[0].attribution.bisection;
+    // A host-backed failure is refused before any mixture: a re-run would repeat whatever the
+    // handler did outside the program, and that is a fact about the run, not the program's decision.
     assert_eq!(
         bisection.verdict,
         ply_test::Verdict::NotAttempted(ply_test::Skipped::Host),

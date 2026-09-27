@@ -469,7 +469,6 @@ fn measure_reduction_re_executes_a_once_plan_and_is_refused() {
 
 #[test]
 fn a_bisection_hybrid_re_evaluates_a_host_test_without_reaching_the_host() {
-    use ply_test::bisect::{Delta, Hybrid};
     use ply_test::hybrid::{BodyHybrid, Mixture, Signature};
 
     let source = r#"
@@ -524,14 +523,10 @@ test "a det test over a deterministic host handler" {
             mixture.current(key, *hash);
         }
     }
+    let wanted = mixture.keys();
     let mut hybrid = BodyHybrid::new(&store, &fresh, mixture, test_body, signature);
-    let delta = Delta {
-        test: None,
-        changes: Vec::new(),
-        clusters: Vec::new(),
-        unclassified: 0,
-    };
-    let trial = hybrid.trial(&delta, &[]);
+    // Every definition at its current hash: the mixture as the program is now.
+    let trial = hybrid.trial_over(wanted);
 
     assert_eq!(
         counter.calls(),

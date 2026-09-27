@@ -33,6 +33,13 @@ use std::sync::{Arc, Mutex, mpsc};
 /// else: no other command runs a corpus.
 const EFFECT: &str = "tester";
 
+/// The modules the change set's and the trial's vocabulary is declared in. A constructor the runtime
+/// builds has to carry the name the program's own spine gives it, and that name is `<module>::<Case>`
+/// — the source's `.` and `payload::ctor`'s `.` are both wrong for a value the program *matches* on.
+/// Getting it wrong is a placeless `no arm of this match matched` the moment the program matches.
+const DELTA: &str = "suite.delta";
+const BISECT: &str = "suite.bisect";
+
 const OPERATIONS: [(&str, &str); 12] = [
     ("configure", "ply_machine::tester::configure"),
     ("loaded", "ply_machine::test::loaded"),
@@ -104,15 +111,6 @@ impl Session {
             .map(|(op, path)| (registration(op, path), Arc::clone(&site)))
             .collect()
     }
-}
-
-/// Whether the program reads the report and searches for itself: its `tester` effect declares
-/// `trial`, which is the operation only a program that decides asks the runtime for.
-fn searches(check: &CheckOutput) -> bool {
-    check
-        .effects
-        .get(&Symbol::new(EFFECT))
-        .is_some_and(|effect| effect.ops.contains_key(&Symbol::new("trial")))
 }
 
 /// The decision, as the program sent it: the same four fields `ply_test::Choice` holds.
@@ -536,7 +534,7 @@ fn serve(args: &TestOptions, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<G
         } = signal
         {
             let answer = match &mut cache {
-                Ok(cache) => trial(&cache.store, hybrids.as_ref(), failure, &keys),
+                Ok(cache) => trial(&mut cache.store, hybrids.as_ref(), failure, &keys),
                 Err(diagnostic) => Err(diagnostic.clone()),
             };
             let _ = reply.send(answer);
@@ -1038,16 +1036,14 @@ fn execute(
                 None => run(),
             };
             // After the run, since a pass recorded now is a valid baseline for another's failure.
-            // The search is the program's as soon as its effect declares `trial`: the report it
-            // renders carries a verdict, and what that verdict decides is the program's. A program
-            // that declares no `trial` cannot ask, so this side searches for it.
+            // The search is the program's: what changed, what a mixture would need and why nothing
+            // could be tried are handed over, and the program that reads the report decides.
             hybrids = ply_test::diagnose_failures(
                 &mut report,
                 &loaded.texts(),
                 &loaded.front,
                 &mut cache.store,
-                &diagnosis_options(args),
-                !searches(&loaded.check),
+                !matches!(args.bisect, When::Never),
             );
             let escapes = hosts_escapes(&report, &loaded.check, hosts);
             let ok = report.is_success() && escapes.is_empty();
@@ -1129,23 +1125,6 @@ fn execute(
             .then(|| crate::mutate::coverage_json(loaded, hashes)),
     };
     (over, hybrids)
-}
-
-/// `--bisect never` still goes through the diagnosis, so the artifact has one shape.
-pub fn diagnosis_options(args: &TestOptions) -> ply_test::Options {
-    ply_test::Options {
-        bisect: match args.bisect {
-            When::Auto => ply_test::Mode::Auto,
-            When::Always => ply_test::Mode::Always,
-            When::Never => ply_test::Mode::Never,
-        },
-        trace: match args.trace {
-            When::Auto => ply_test::Tracing::Auto,
-            When::Always => ply_test::Tracing::Always,
-            When::Never => ply_test::Tracing::Never,
-        },
-        budget: ply_test::Budget::new(args.bisect_budget),
-    }
 }
 
 // --- Counts under `--filter` --------------------------------------------------
@@ -1505,6 +1484,15 @@ struct FaultView {
     conclusive: bool,
     requested: bool,
     reason: String,
+    /// The verdict as the artifact publishes it: the cases by word, the groups, and the counts a
+    /// reader sees beside the answer. A program that searched replaces all of these.
+    verdict: &'static str,
+    skipped: Option<&'static str>,
+    confidence: &'static str,
+    groups: Vec<Vec<String>>,
+    /// The counts the search would have published. Named `stats` because `search` above is the
+    /// change set a program that decides reads.
+    stats: ply_test::SearchStats,
     culprits: Vec<(Vec<String>, Option<Span>)>,
     slice: Option<(bool, bool, Vec<String>)>,
     suspects: Vec<SuspectView>,
@@ -1773,6 +1761,15 @@ fn fault(
             Verdict::NotAttempted(Skipped::NotRequested)
         ),
         reason: bisection.reason.clone(),
+        verdict: bisection.verdict.as_str(),
+        skipped: bisection.verdict.skipped().map(|why| why.as_str()),
+        confidence: bisection.confidence.as_str(),
+        groups: bisection
+            .groups
+            .iter()
+            .map(|group| group.iter().map(|n| n.as_str().to_string()).collect())
+            .collect(),
+        stats: bisection.search,
         culprits: bisection
             .groups
             .iter()
@@ -2145,6 +2142,30 @@ fn fault_value(f: &FaultView) -> PlyValue {
                 ("conclusive", PlyValue::Bool(f.conclusive)),
                 ("requested", PlyValue::Bool(f.requested)),
                 ("reason", PlyValue::str(&f.reason)),
+                ("verdict", PlyValue::str(f.verdict)),
+                ("skipped", option(f.skipped.map(PlyValue::str))),
+                ("confidence", PlyValue::str(f.confidence)),
+                (
+                    "groups",
+                    PlyValue::list(
+                        f.groups
+                            .iter()
+                            .map(|g| PlyValue::list(g.iter().map(PlyValue::str).collect()))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "search",
+                    record(vec![
+                        ("candidates", count(f.stats.candidates)),
+                        ("clusters", count(f.stats.clusters)),
+                        ("evaluated", count(f.stats.evaluated)),
+                        ("cached", count(f.stats.cached)),
+                        ("memoized", count(f.stats.memoized)),
+                        ("unresolved", count(f.stats.unresolved)),
+                        ("exhausted", PlyValue::Bool(f.stats.exhausted)),
+                    ]),
+                ),
                 (
                     "culprits",
                     PlyValue::list(
@@ -2525,7 +2546,7 @@ impl Default for TestOptions {
 /// One mixture of one failure, tried on this thread: the store and the warm bodies are here, and
 /// the hybrid that swaps definitions is not `Send`.
 fn trial(
-    store: &ply_store::Store,
+    store: &mut ply_store::Store,
     hybrids: Option<&ply_test::Hybrids>,
     failure: usize,
     keys: &[(String, String)],
@@ -2572,19 +2593,33 @@ fn trial(
         Some(seed) => hybrid.at_seed(seed),
         None => hybrid,
     };
-    Ok(hybrid.trial_over(wanted))
+    let trial = hybrid.trial_over(wanted);
+    // A mixture that went green is a program whose definitions all pass at once, so what it proved
+    // may be cached — under the mixture's own test hash. The failing test's hash is a different
+    // test's, so a red test can never be passed by a mixture of it.
+    // A mixture that went green is a program whose definitions all pass at once, so what it proved
+    // may be cached — under the mixture's own test hash. The failing test's hash is a different
+    // test's, so a red test can never be passed by a mixture of it.
+    for hash in hybrid.take_proved() {
+        store.put(hash, ply_store::Outcome::Pass);
+    }
+    Ok(trial)
 }
 
 /// One trial's outcome, as the program reads it: the case, and whether the runtime answered from a
 /// result it already had.
 fn trial_value(trial: &ply_test::bisect::Trial) -> PlyValue {
     let outcome = match trial.outcome {
-        ply_test::bisect::TrialOutcome::Fails => PlyValue::ctor("Fails", Vec::new()),
-        ply_test::bisect::TrialOutcome::Passes => PlyValue::ctor("Passes", Vec::new()),
+        ply_test::bisect::TrialOutcome::Fails => crate::payload::ctor(BISECT, "Fails", Vec::new()),
+        ply_test::bisect::TrialOutcome::Passes => {
+            crate::payload::ctor(BISECT, "Passes", Vec::new())
+        }
         // The case names are the ones `suite.bisect` declares, so the program matches on them.
-        ply_test::bisect::TrialOutcome::Unresolved(why) => PlyValue::ctor(
+        ply_test::bisect::TrialOutcome::Unresolved(why) => crate::payload::ctor(
+            BISECT,
             "Unresolved",
-            vec![PlyValue::ctor(
+            vec![crate::payload::ctor(
+                BISECT,
                 match why {
                     ply_test::bisect::Unresolved::DoesNotCheck => "DoesNotCheck",
                     ply_test::bisect::Unresolved::DifferentFailure => "DifferentFailure",
@@ -2609,7 +2644,7 @@ fn change_set_value(view: &ChangeSetView) -> PlyValue {
         ("test_classified", PlyValue::Bool(view.test_classified)),
         (
             "absent",
-            PlyValue::ctor(skipped_ctor(view.absent), Vec::new()),
+            crate::payload::ctor(BISECT, skipped_ctor(view.absent), Vec::new()),
         ),
         (
             "at",
@@ -2648,7 +2683,10 @@ fn delta_value(delta: &ply_test::bisect::Delta) -> PlyValue {
 fn change_value(change: &ply_test::bisect::Change) -> PlyValue {
     record(vec![
         ("name", PlyValue::str(change.name.as_str())),
-        ("ns", PlyValue::ctor(ns_ctor(change.ns), Vec::new())),
+        (
+            "ns",
+            crate::payload::ctor(DELTA, ns_ctor(change.ns), Vec::new()),
+        ),
         (
             "before",
             option(change.before.map(|h| PlyValue::str(h.to_hex()))),
@@ -2657,7 +2695,10 @@ fn change_value(change: &ply_test::bisect::Change) -> PlyValue {
             "after",
             option(change.after.map(|h| PlyValue::str(h.to_hex()))),
         ),
-        ("kind", PlyValue::ctor(kind_ctor(change.kind), Vec::new())),
+        (
+            "kind",
+            crate::payload::ctor(DELTA, kind_ctor(change.kind), Vec::new()),
+        ),
         ("independent", PlyValue::Bool(change.independent)),
     ])
 }
@@ -2677,7 +2718,7 @@ fn cluster_value(cluster: &ply_test::bisect::Cluster) -> PlyValue {
                     .map(|k| {
                         record(vec![
                             ("name", PlyValue::str(k.name.as_str())),
-                            ("ns", PlyValue::ctor(ns_ctor(k.ns), Vec::new())),
+                            ("ns", crate::payload::ctor(DELTA, ns_ctor(k.ns), Vec::new())),
                         ])
                     })
                     .collect(),
@@ -2685,7 +2726,7 @@ fn cluster_value(cluster: &ply_test::bisect::Cluster) -> PlyValue {
         ),
         (
             "reason",
-            PlyValue::ctor(reason_ctor(cluster.reason), Vec::new()),
+            crate::payload::ctor(DELTA, reason_ctor(cluster.reason), Vec::new()),
         ),
     ])
 }
@@ -2724,7 +2765,7 @@ fn skipped_ctor(skipped: ply_test::bisect::Skipped) -> &'static str {
         ply_test::bisect::Skipped::Panicked => "Panicked",
         ply_test::bisect::Skipped::NoChanges => "NoChanges",
         ply_test::bisect::Skipped::NoBodies => "NoBodies",
-        ply_test::bisect::Skipped::NoHybrids => "NoHybrids",
+        ply_test::bisect::Skipped::NoHybrids => "suite.bisect.NoHybrids",
         ply_test::bisect::Skipped::Delegated => "Delegated",
     }
 }

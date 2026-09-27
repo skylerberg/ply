@@ -22,9 +22,11 @@ import suite.schedule (contends_only_over_regions, group_by_conflict, parallelis
 // What a run decides, and the keys it decides with: the same arithmetic the runtime used to do.
 import suite.keys (writes_seed_keys)
 // What decides a cause: the change set, the search over it, and the verdict it reaches.
-import suite.bisect (Auto, Bisection, Budget, Mode, NotAttempted, NotRequested, Skipped, Trial,
-                     is_conclusive, mode_parse, skipped_parse)
-import suite.delta (Delta, DefKey, flipped_keys, ns_word)
+import suite.bisect (Auto, Bisection, Budget, Delegated, Mode, NoHybrids, NotAttempted,
+                     NotRequested, SearchStats, Skipped, Trial, confidence_word, is_conclusive,
+                     mode_parse, skipped_parse, skipped_word, verdict_skipped, verdict_word)
+import suite.delta (Added, Change, ChangeKind, Cluster, Delta, DefKey, Derived, Edited,
+                    FusionReason, Independent, Ns, Removed, Value, flipped_keys, ns_word)
 import suite.diagnose (Attribution, Evidence, diagnose)
 // The tracing side of a plan is the slice's: the trace a re-run keeps is what `--trace` names.
 import suite.slice (TraceAuto, TraceAlways, TraceNever, Tracing, tracing_parse)
@@ -407,7 +409,19 @@ pub type Suspect = {
 
 pub type Culprit = { names: List<String>, at: Option<At> }
 
-pub type Bisect = { conclusive: Bool, requested: Bool, reason: String, culprits: List<Culprit> }
+// What a failure's cause came to. The runtime sends this whole shape — a program that searched
+// answers with its own verdict, and the document publishes whichever side decided.
+pub type Bisect = {
+  conclusive: Bool,
+  requested: Bool,
+  reason: String,
+  culprits: List<Culprit>,
+  verdict: String,
+  skipped: Option<String>,
+  confidence: String,
+  groups: List<List<String>>,
+  search: SearchStats,
+}
 
 // The definitions the failing execution entered, when it was traced.
 pub type Slice = { traced: Bool, reproduced: Bool, path: List<String> }
@@ -1322,6 +1336,7 @@ fn with_members(doc: Json, extra: List<Member>) -> Json =
 
 fn fault_json(p: Program, f: Fault) -> Json =
   with_members(f.artifact, [
+    { key: "culprit", value: culprit_json(f.bisect) },
     { key: "diagnostic", value: one_diagnostic(f.diagnostic, p.places) },
     { key: "module", value: opt_str(f.module) },
     { key: "test_hash", value: opt_str(f.test_hash) },
@@ -1333,6 +1348,34 @@ fn fault_json(p: Program, f: Fault) -> Json =
       value: object([
         { key: "declared", value: opt_strings(f.declared) },
         { key: "observed", value: opt_strings(f.observed) },
+      ]),
+    },
+  ])
+
+// The verdict as the document carries it: what to change, how sure the system is, and how it
+// found out. Built here rather than read from the runtime's copy of the row, because a program
+// that searched is the side that decided.
+fn culprit_json(b: Bisect) -> Json =
+  object([
+    { key: "verdict", value: Str(b.verdict) },
+    { key: "skipped", value: opt_str(b.skipped) },
+    { key: "confidence", value: Str(b.confidence) },
+    { key: "definitions", value: Array(map(b.culprits, |c: Culprit| Str(at(c.names, 0, "")))) },
+    {
+      key: "groups",
+      value: Array(map(b.groups, |g: List<String>| Array(map(g, |n: String| Str(n))))),
+    },
+    { key: "reason", value: Str(b.reason) },
+    {
+      key: "search",
+      value: object([
+        { key: "candidates", value: num(b.search.candidates) },
+        { key: "clusters", value: num(b.search.clusters) },
+        { key: "evaluated", value: num(b.search.evaluated) },
+        { key: "cached", value: num(b.search.cached) },
+        { key: "memoized", value: num(b.search.memoized) },
+        { key: "unresolved", value: num(b.search.unresolved) },
+        { key: "exhausted", value: Bool(b.search.exhausted) },
       ]),
     },
   ])
@@ -1647,6 +1690,14 @@ fn searched(f: Fault, index: Int, options: Options) -> Bisect / {tester.trial[co
           reason: verdict.reason,
           culprits: map(verdict.groups, |group: List<String>|
             { names: group, at: first_at(s.at, group) }),
+          verdict: verdict_word(verdict.verdict),
+          skipped: match verdict_skipped(verdict.verdict) {
+            Some(why) -> Some(skipped_word(why)),
+            None -> None,
+          },
+          confidence: confidence_word(verdict.confidence),
+          groups: verdict.groups,
+          search: verdict.search,
         },
     },
   }
@@ -1853,7 +1904,26 @@ fn a_run(results: List<Outcome>, failures: List<Fault>) -> Ran =
     coverage: None,
   }
 
-fn no_bisect() -> Bisect = { conclusive: false, requested: false, reason: "", culprits: [] }
+fn no_bisect() -> Bisect =
+  {
+    conclusive: false,
+    requested: false,
+    reason: "",
+    culprits: [],
+    verdict: "not_attempted",
+    skipped: Some("not_requested"),
+    confidence: "none",
+    groups: [],
+    search: {
+      candidates: 0,
+      clusters: 0,
+      evaluated: 0,
+      cached: 0,
+      memoized: 0,
+      unresolved: 0,
+      exhausted: false,
+    },
+  }
 
 fn a_fault() -> Fault =
   {
@@ -2199,6 +2269,7 @@ test "a label is bare in a single-module run and qualified across several" {
 }
 
 // A deadlock's cycle lives only in its secondary labels, so each is printed where it points.
+
 test "a failure's other labels are printed under it, each with its own place" {
   let d = a_diag(
     b"E0414",

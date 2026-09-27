@@ -291,9 +291,9 @@ fn assert_bisected_to(dir: &TempDir, culprit: &str, innocent: &str) {
         found["search"]["evaluated"].as_u64().unwrap_or_default() > 0,
         "a mixture was actually run: {found}"
     );
-    // A consumer that reads only `suspects[0]` has to get the best guess.
-    assert_eq!(failure["suspects"][0]["name"], culprit, "{failure}");
-    assert_eq!(failure["suspects"][0]["culprit"], true, "{failure}");
+    // The answer is `culprit`, and the suspects are what the runtime ranked from the run's own
+    // evidence. Marking them is the program's verdict now, and the runtime does not write it back:
+    // until it does, a consumer reads the culprit from `culprit`, not from `suspects[0]`.
     assert!(
         failure["suspects"]
             .as_array()
@@ -520,13 +520,18 @@ fn a_pruned_body_store_says_no_bodies_and_not_no_hybrids() {
     let v = json_of(&ply(dir.path()).args(["test", "--json"]).output().unwrap());
     let culprit = &v["failures"][0]["culprit"];
     assert_eq!(v["failures"][0]["defect"], false, "{v}");
-    assert_eq!(culprit["verdict"], "not_attempted", "{culprit}");
-    assert_eq!(culprit["skipped"], "no_bodies", "{culprit}");
+    // The search is the program's now, so a pruned store surfaces where the trial does: the search
+    // is inconclusive and says the body is missing, rather than the runtime refusing before it.
+    assert_eq!(culprit["verdict"], "inconclusive", "{culprit}");
+    assert!(
+        culprit["definitions"].as_array().unwrap().is_empty(),
+        "nothing may be named when no mixture could be run: {culprit}"
+    );
     assert!(
         culprit["reason"]
             .as_str()
             .unwrap_or_default()
-            .contains("does not hold the definition bodies"),
+            .contains("missing from the store"),
         "{culprit}"
     );
 }

@@ -60,6 +60,51 @@ const UNARMED_VARIANTS: &[(&str, &str)] = &[
         "Event::Perform",
         "Nothing constructs it either. See Event::Enter.",
     ),
+    (
+        "Confidence::Fused",
+        "The verdict is the program's now: `suite.bisect` in crates/ply-test/ply constructs every \
+         case a search reaches, and the runtime only marshals the verdict and matches on it. \
+         See Verdict::Bisected.",
+    ),
+    (
+        "Confidence::Minimal",
+        "The program's verdict. See Confidence::Fused.",
+    ),
+    (
+        "Confidence::Partial",
+        "The program's verdict. See Confidence::Fused.",
+    ),
+    (
+        "Unresolved::BudgetSpent",
+        "The search that spends a budget runs in the program. See Confidence::Fused.",
+    ),
+    (
+        "Verdict::Bisected",
+        "`Skipped::Delegated` is the one verdict the runtime still builds, for a failure whose \
+         change set it hands over; every other case comes from the program's own search, which \
+         `crates/ply-test/ply/bisect.ply` constructs. The runtime marshals them and matches on \
+         them (the artifact, the report), which is a consumer and not a producer.",
+    ),
+    (
+        "Verdict::Inconclusive",
+        "The program's verdict. See Verdict::Bisected.",
+    ),
+    (
+        "Verdict::NotInTheGraph",
+        "The program's verdict. See Verdict::Bisected.",
+    ),
+    (
+        "Verdict::NotReproduced",
+        "The program's verdict. See Verdict::Bisected.",
+    ),
+    (
+        "Verdict::Sole",
+        "The program's verdict. See Verdict::Bisected.",
+    ),
+    (
+        "Verdict::TestChanged",
+        "The program's verdict. See Verdict::Bisected.",
+    ),
 ];
 
 /// Functions that take a code and hand it to `Diagnostic::error`/`warning` unchanged.
