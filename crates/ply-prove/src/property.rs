@@ -910,7 +910,7 @@ fn bindings(binders: &[LawBinder], values: &[Value]) -> Vec<Binding> {
         .collect()
 }
 
-pub fn instantiations(types: &[Type]) -> Vec<(Symbol, Type)> {
+pub fn instantiations(types: &[Type]) -> Vec<(Symbol, String)> {
     let mut seen: BTreeSet<TyVar> = BTreeSet::new();
     let mut out = Vec::new();
     for ty in types {
@@ -919,11 +919,15 @@ pub fn instantiations(types: &[Type]) -> Vec<(Symbol, Type)> {
     out
 }
 
-fn collect_vars(ty: &Type, seen: &mut BTreeSet<TyVar>, out: &mut Vec<(Symbol, Type)>) {
+fn collect_vars(ty: &Type, seen: &mut BTreeSet<TyVar>, out: &mut Vec<(Symbol, String)>) {
     match ty {
         Type::Var(v) => {
             if seen.insert(*v) {
-                out.push((Symbol::new(Type::Var(*v).to_string()), Type::int()));
+                // Monomorphised to `Int`; rendered here, so nothing downstream needs the type.
+                out.push((
+                    Symbol::new(Type::Var(*v).to_string()),
+                    Type::int().to_string(),
+                ));
             }
         }
         Type::Con(_, args) => args.iter().for_each(|a| collect_vars(a, seen, out)),

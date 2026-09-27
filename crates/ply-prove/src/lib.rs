@@ -33,8 +33,7 @@ pub const DEFAULT_CASES: u32 = 200;
 pub const DEFAULT_PROVE_BUDGET: u32 = 10_000;
 pub const DEFAULT_SHRINK_BUDGET: u32 = 500;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Tier {
     /// Concrete cases, and no coverage claim.
     Example,
@@ -103,7 +102,7 @@ impl Rule {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Certificate {
     /// In application order.
     pub rules: Vec<Rule>,
@@ -113,17 +112,16 @@ pub struct Certificate {
     pub sorts: Vec<Symbol>,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CaseReport {
     pub generated: u32,
     pub kept: u32,
     pub rejected: u32,
     pub roots: Vec<u64>,
-    pub instantiations: Vec<(Symbol, Type)>,
+    pub instantiations: Vec<(Symbol, String)>,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
-#[serde(rename_all = "snake_case", tag = "evidence")]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Evidence {
     Proof(Certificate),
     Cases(CaseReport),
@@ -139,7 +137,7 @@ impl Evidence {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Binding {
     pub name: Symbol,
     pub ty: Type,
@@ -157,14 +155,13 @@ pub struct Counterexample {
     pub sim_seed: Option<Seed>,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum VacuityKind {
     ProvedUnsatisfiable,
     NoCaseKept { generated: u32 },
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Vacuity {
     pub guard: Span,
     pub kind: VacuityKind,
@@ -224,8 +221,7 @@ impl Discharge {
 }
 
 /// What a definition leaves alone, from its checked footprint.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
-#[serde(rename_all = "snake_case", tag = "frame")]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Frame {
     /// The `ensures` is a total specification: the result depends only on the arguments.
     Pure,
@@ -246,8 +242,7 @@ pub fn frame_of(footprint: &Footprint) -> Frame {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ObligationKind {
     Ensures { index: usize },
     Law,
@@ -293,7 +288,7 @@ impl Obligation {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default)]
 pub struct Coverage {
     pub definitions: usize,
     /// Carries an `ensures` that holds, or is named directly by a law that holds.
