@@ -125,7 +125,7 @@ pub fn json_of(output: &Output) -> Value {
 /// probe, so for them the port itself has to be un-shareable.
 pub struct Reservation {
     port: u16,
-    _lock: File,
+    lock: Option<File>,
 }
 
 impl Reservation {
@@ -141,15 +141,20 @@ impl Reservation {
         let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral port");
         let port = listener.local_addr().expect("a bound address").port();
         drop(listener);
-        Reservation { port, _lock: lock }
+        Reservation {
+            port,
+            lock: Some(lock),
+        }
     }
 
     pub fn port(&self) -> u16 {
         self.port
     }
 
-    /// The server has answered on the port; the port is the server's now, so the reservation ends.
-    pub fn bound(self) {}
+    /// The server has answered on the port, so the port is the server's and the lock is spent.
+    fn release(&mut self) {
+        self.lock = None;
+    }
 }
 
 /// Beside the test binary, so every test process in a run shares one lock whatever its `TMPDIR`.
@@ -161,15 +166,18 @@ fn lock_file() -> PathBuf {
         .join(".ply-ports.reserve")
 }
 
-/// Connects to `addr`, retrying until `ready` takes a connection or the child exits. `ready` has to
-/// say why the answer is *this* server's: a bare connect can belong to another process that was
-/// handed the same port. A test holding a [`Reservation`] can answer `|_| true`.
+/// Connects to the port `reserved` names, retrying until `ready` takes a connection or the child
+/// exits. Taking the reservation is what ties readiness to the lock: it cannot be reached without
+/// one, and a successful answer releases it, because the port is the server's from then on.
+/// `ready` is the answer's proof that it is *this* server's -- `|_| true` once the reservation has
+/// made the port ours alone.
 pub fn connect_when_ready(
+    reserved: &mut Reservation,
     child: &mut Child,
-    addr: SocketAddr,
     deadline: Duration,
     mut ready: impl FnMut(&mut TcpStream) -> bool,
 ) -> Result<TcpStream, String> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], reserved.port()));
     let until = Instant::now() + deadline;
     loop {
         if let Some(status) = child.try_wait().expect("the child is waitable") {
@@ -181,6 +189,7 @@ pub fn connect_when_ready(
         if let Ok(mut probe) = TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
             let _ = probe.set_read_timeout(Some(Duration::from_secs(10)));
             if ready(&mut probe) {
+                reserved.release();
                 return Ok(probe);
             }
         }

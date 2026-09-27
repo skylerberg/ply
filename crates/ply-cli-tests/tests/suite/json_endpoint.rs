@@ -1,6 +1,6 @@
 use crate::harness::{Reservation, connect_when_ready, process, repo};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::TcpStream;
 use std::process::{Child, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -32,11 +32,11 @@ fn project(port: u16, connections: u32) -> tempfile::TempDir {
 
 struct Server {
     child: Option<Child>,
-    addr: SocketAddr,
+    reserved: Reservation,
 }
 
 impl Server {
-    fn start(dir: &std::path::Path, port: u16) -> Server {
+    fn start(dir: &std::path::Path, reserved: Reservation) -> Server {
         let child = process(dir)
             .args(["run", "--host"])
             .stdout(Stdio::piped())
@@ -45,7 +45,7 @@ impl Server {
             .expect("`ply run --host` starts");
         Server {
             child: Some(child),
-            addr: SocketAddr::from(([127, 0, 0, 1], port)),
+            reserved,
         }
     }
 
@@ -54,9 +54,9 @@ impl Server {
     }
 
     fn connect(&mut self) -> TcpStream {
-        let addr = self.addr;
-        connect_when_ready(self.running(), addr, STARTUP, |_| true)
-            .unwrap_or_else(|why| panic!("{why}"))
+        let Server { child, reserved } = self;
+        let child = child.as_mut().expect("the server has not been reaped");
+        connect_when_ready(reserved, child, STARTUP, |_| true).unwrap_or_else(|why| panic!("{why}"))
     }
 
     fn finish(mut self) {
@@ -132,12 +132,10 @@ fn body_of(response: &str) -> &str {
 #[test]
 fn a_json_payload_over_a_real_socket_is_decoded_and_answered_by_a_derived_codec() {
     let reserved = Reservation::take();
-    let port = reserved.port();
-    let dir = project(port, 2);
-    let mut server = Server::start(dir.path(), port);
+    let dir = project(reserved.port(), 2);
+    let mut server = Server::start(dir.path(), reserved);
 
     let first = server.connect();
-    reserved.bound();
     let accepted = exchange(
         first,
         &post(r#"{"customer":"ada","lines":[{"sku":"widget","qty":3,"unit_price":1.05}]}"#),
