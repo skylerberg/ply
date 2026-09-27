@@ -1478,13 +1478,20 @@ pub fn read(buf: Bytes) -> Frames
 
 pub fn connect<[l]>(
   host: String, port: Int, user: String, database: String,
-  password: Option<String>, client: Client,
+  password: Option<String>, nonce: String, client: Client,
 ) -> Result<Session, ClientError> / {net.connect[l], net.send[l], net.recv[l], net.close[l]}
 pub fn simple_query<[l]>(s: Session, sql: String, client: Client)
   -> Result<Reply, ClientError> / {net.send[l], net.recv[l]}
 pub fn extended_query<[l]>(s: Session, sql: String, params: List<Option<String>>, client: Client)
   -> Result<Reply, ClientError> / {net.send[l], net.recv[l]}
 pub fn finish<[l]>(s: Session, client: Client) -> Unit / {net.send[l], net.close[l]}
+
+pub fn scram_first(user: String, nonce: String) -> String
+pub fn scram_first_bare(user: String, nonce: String) -> String
+pub fn scram_challenge(server_first: String) -> Option<Challenge>
+pub fn scram_final(password: String, first_bare: String, server_first: String, challenge: Challenge)
+  -> Proof
+pub fn scram_verify(server_final: String, expected: Bytes) -> Bool
 ```
 
 The protocol as framing and nothing else. Every front-end message after start-up
@@ -1506,14 +1513,22 @@ A kind this module does not name is kept as `Other(byte)` rather than dropped.
 `connect` opens the socket and gets to where the server will answer a query:
 start-up, whatever authentication it asks for, its parameters, and
 `ReadyForQuery`; the parameters are left on the session and `setting` reads one.
-Authentication is answered for `AuthenticationOk` and for a clear-text password;
-md5 and SASL are refused with a message naming what was asked for.
+The client's SCRAM nonce is the caller's to draw, so a run's `random` seed decides
+it and a test can fix it. Authentication is answered for `AuthenticationOk`, a
+clear-text password, and SCRAM-SHA-256; md5 is refused with a message naming it.
 `simple_query` runs one statement, `extended_query` runs one with parameters
 bound as text, and both answer the columns, the rows and the command tag; NULL is
 `None` and every column is `Some` bytes. A statement the server refuses is
 `Rejected(session, server)`, which carries the connection back because it is
 still usable — the SQLSTATE is what a program branches on. `finish` sends
 `Terminate` and closes.
+
+The SCRAM steps are exposed because they are pure: `scram_first_bare` writes the
+message the client's nonce goes in, `scram_challenge` reads the server's first
+message, `scram_final` answers the reply and the server signature to expect, and
+`scram_verify` checks the signature the server sent. RFC 7677's worked example —
+its nonce, salt, 4096 iterations, client proof and server signature — is the
+test.
 
 A connection is `std.net`'s: `connect`, `send_all`, `drain`. Which statements to
 send, what a transaction is and when to retry are `std.db`'s.
