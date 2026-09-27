@@ -42,9 +42,10 @@ const PAYLOAD: &str = "claims";
 /// need nothing here.
 const SUITE: &str = "suite.obligation";
 
-const OPERATIONS: [(&str, &str); 7] = [
+const OPERATIONS: [(&str, &str); 8] = [
     ("configure", "ply_machine::claims::configure"),
     ("collected", "ply_machine::claims::collected"),
+    ("typed", "ply_machine::claims::typed"),
     ("outcomes", "ply_machine::claims::outcomes"),
     ("discharged", "ply_machine::claims::discharged"),
     ("replay", "ply_machine::claims::replay"),
@@ -125,6 +126,7 @@ impl HostHandler for Site {
                 PlyValue::Unit
             }
             ("collected", _) => self.collected()?,
+            ("typed", _) => self.typed()?,
             ("discharged", [choice]) => self.discharged(choice_of(choice, span)?)?,
             ("outcomes", [keys]) => {
                 let list = keys.as_list(span, "the keys to look up")?;
@@ -186,6 +188,178 @@ fn choice_of(value: &PlyValue, span: Span) -> Result<obligation::Choice, Diagnos
     })
 }
 
+/// The types the laws are written over, as the machine's thread hands them over: plain data, because
+/// a `PlyValue` cannot cross a thread and this side has no need of one.
+struct Typed {
+    decls: Vec<TypedDecl>,
+    claims: Vec<TypedClaim>,
+}
+
+struct TypedDecl {
+    name: String,
+    variants: Vec<TypedVariant>,
+}
+
+struct TypedVariant {
+    name: String,
+    fields: Vec<ply_ty::Type>,
+}
+
+struct TypedClaim {
+    claim: usize,
+    /// Each binder's name, the text the runtime would print for its type, and the type itself.
+    binders: Vec<(String, String, ply_ty::Type)>,
+}
+
+fn typed_of(
+    world: &ply_prove::property::TypeWorld,
+    obligations: &[ply_prove::Obligation],
+) -> Typed {
+    Typed {
+        decls: world
+            .declared()
+            .map(|(name, decl)| TypedDecl {
+                name: name.as_str().to_string(),
+                variants: decl
+                    .variants
+                    .iter()
+                    .map(|variant| TypedVariant {
+                        name: variant.name.as_str().to_string(),
+                        fields: variant.fields.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        claims: obligations
+            .iter()
+            .enumerate()
+            .map(|(claim, obligation)| TypedClaim {
+                claim,
+                binders: obligation
+                    .generated()
+                    .iter()
+                    .map(|binder| {
+                        (
+                            binder.name.as_str().to_string(),
+                            binder.ty.to_string(),
+                            binder.ty.clone(),
+                        )
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+/// The `Ty` vocabulary `prove.domain` reads, marshalled where it is declared: a constructor crosses
+/// the substrate by its program-wide name, so `prove.domain.Con` is the one a program matches.
+const DOMAIN: &str = "proof.domain";
+
+fn typed_value(typed: Typed) -> PlyValue {
+    record(vec![
+        (
+            "decls",
+            PlyValue::list(
+                typed
+                    .decls
+                    .iter()
+                    .map(|decl| {
+                        record(vec![
+                            ("name", PlyValue::str(&decl.name)),
+                            (
+                                "variants",
+                                PlyValue::list(
+                                    decl.variants
+                                        .iter()
+                                        .map(|variant| {
+                                            record(vec![
+                                                ("name", PlyValue::str(&variant.name)),
+                                                (
+                                                    "fields",
+                                                    PlyValue::list(
+                                                        variant
+                                                            .fields
+                                                            .iter()
+                                                            .map(ty_value)
+                                                            .collect(),
+                                                    ),
+                                                ),
+                                            ])
+                                        })
+                                        .collect(),
+                                ),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "claims",
+            PlyValue::list(
+                typed
+                    .claims
+                    .iter()
+                    .map(|claim| {
+                        record(vec![
+                            ("claim", PlyValue::Int(claim.claim as i64)),
+                            (
+                                "binders",
+                                PlyValue::list(
+                                    claim
+                                        .binders
+                                        .iter()
+                                        .map(|(name, text, ty)| {
+                                            record(vec![
+                                                ("name", PlyValue::str(name)),
+                                                ("text", PlyValue::str(text)),
+                                                ("ty", ty_value(ty)),
+                                            ])
+                                        })
+                                        .collect(),
+                                ),
+                            ),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn ty_value(ty: &ply_ty::Type) -> PlyValue {
+    use ply_ty::Type;
+    match ty {
+        Type::Var(var) => {
+            crate::payload::ctor(DOMAIN, "Var", vec![PlyValue::Int(i64::from(var.0))])
+        }
+        Type::Fn { .. } => crate::payload::ctor(DOMAIN, "Fn", Vec::new()),
+        Type::Record(fields) => crate::payload::ctor(
+            DOMAIN,
+            "Record",
+            vec![PlyValue::list(
+                fields
+                    .iter()
+                    .map(|(name, field)| {
+                        record(vec![
+                            ("name", PlyValue::str(name.as_str())),
+                            ("ty", ty_value(field)),
+                        ])
+                    })
+                    .collect(),
+            )],
+        ),
+        Type::Con(name, args) => crate::payload::ctor(
+            DOMAIN,
+            "Con",
+            vec![
+                PlyValue::str(name.as_str()),
+                PlyValue::list(args.iter().map(ty_value).collect()),
+            ],
+        ),
+    }
+}
+
 fn indices(value: &PlyValue, span: Span) -> Result<Vec<usize>, Diagnostic> {
     value
         .as_list(span, "the claims to discharge")?
@@ -223,6 +397,19 @@ impl Site {
                 Ok(answered((*answer).map(collection_value)))
             }
             _ => Err(out_of_step("collected")),
+        }
+    }
+
+    /// The types the laws are written over: every declared type, and each collected obligation's
+    /// binders with the text the runtime would print for them. A program sizes a domain from this
+    /// and never spells a type out, so nothing in Ply can disagree with the compiler about one.
+    fn typed(&self) -> Result<PlyValue, Diagnostic> {
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("typed"))?;
+        machine.ask(Go::Typed)?;
+        match machine.step()? {
+            Step::Typed(answer) => Ok(answered((*answer).map(typed_value))),
+            _ => Err(out_of_step("typed")),
         }
     }
 
@@ -309,6 +496,9 @@ fn answered(answer: Result<PlyValue, Refused>) -> PlyValue {
 
 /// What the program asks the machine for next.
 enum Go {
+    /// The types the obligations are written over, so a program can measure a binder's domain
+    /// rather than sample it. The decision is the program's; the type world is not.
+    Typed,
     /// What the store holds under these keys. The program computes them — a plan key is part of
     /// the obligation's own encoding — so no row could carry the answers.
     Outcomes(Vec<String>),
@@ -326,6 +516,7 @@ enum Go {
 
 enum Step {
     Collected(Box<Result<Collection, Refused>>),
+    Typed(Box<Result<Typed, Refused>>),
     /// The store's answer under each key asked about: `passed`, `failed`, or nothing.
     Outcomes(Vec<Option<String>>),
     Discharged(Box<Result<Verdicts, Refused>>),
@@ -457,6 +648,22 @@ fn serve(job: Job, told: &mpsc::Sender<Step>, asked: &mpsc::Receiver<Go>) {
                     })
                     .collect();
                 let _ = told.send(Step::Outcomes(answers));
+            }
+            Ok(Go::Typed) => {
+                if prepared.is_none() {
+                    prepared = Some(prepare(&job, &loaded, &mut store));
+                }
+                match prepared.as_ref() {
+                    Some(Ok(ready)) => {
+                        let typed = typed_of(ready.prover.world(), &obligations);
+                        let _ = told.send(Step::Typed(Box::new(Ok(typed))));
+                    }
+                    Some(Err(refused)) => {
+                        let _ = told.send(Step::Typed(Box::new(Err(refused.clone()))));
+                        return;
+                    }
+                    None => return,
+                }
             }
             Ok(Go::Discharge(wanted)) => {
                 if prepared.is_none() {
