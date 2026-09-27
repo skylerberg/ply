@@ -1465,6 +1465,9 @@ struct SearchView {
 
 struct SuspectView {
     name: String,
+    /// The definition's current hash, so a program that re-publishes the list loses nothing: the
+    /// artifact's suspects carry it, and the row's did not.
+    hash: Option<String>,
     change: Option<String>,
     ran: Option<bool>,
     depth: Option<usize>,
@@ -1708,6 +1711,7 @@ fn outcome(result: &TestResult) -> OutcomeView {
 fn suspect_view(suspect: &Suspect) -> SuspectView {
     SuspectView {
         name: suspect.name.to_string(),
+        hash: suspect.hash.map(|h| h.to_hex()),
         change: suspect.change.map(|c| c.as_str().to_string()),
         ran: suspect.ran,
         depth: suspect.depth,
@@ -2200,6 +2204,7 @@ fn fault_value(f: &FaultView) -> PlyValue {
                     .map(|x| {
                         record(vec![
                             ("name", PlyValue::str(&x.name)),
+                            ("hash", option(x.hash.as_deref().map(PlyValue::str))),
                             ("change", option(x.change.as_deref().map(PlyValue::str))),
                             ("ran", option(x.ran.map(PlyValue::Bool))),
                             ("depth", option(x.depth.map(count))),
