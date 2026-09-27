@@ -11,6 +11,8 @@ struct Compiled {
     sources: Vec<(String, String)>,
     check: CheckOutput,
     hashes: HashOutput,
+    packages: Vec<(String, Vec<String>)>,
+    mod_pkg: Vec<usize>,
 }
 
 impl Compiled {
@@ -30,11 +32,13 @@ impl Compiled {
             sources,
             check: front.check,
             hashes: front.hashes,
+            packages: front.packages,
+            mod_pkg: front.mod_pkg,
         }
     }
 
     fn rehashed(&self, baseline: &Baseline) -> Rehashed {
-        Rehashed::under(&self.sources, baseline)
+        Rehashed::under(&self.sources, baseline, &self.packages, &self.mod_pkg)
             .unwrap_or_else(|e| panic!("the port re-hashes a checked program: {e}"))
     }
 
