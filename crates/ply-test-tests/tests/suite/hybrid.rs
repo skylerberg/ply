@@ -139,8 +139,13 @@ fn passed(before: &Compiled, key: &str) -> (TempRoot, Store) {
 fn narrow(before: &Compiled, after: &Compiled, key: &str) -> ply_test::Bisection {
     let (_root, store) = passed(before, key);
     let baseline = before.baseline(key);
-    let rehashed = Rehashed::under(&after.sources(), &baseline)
-        .unwrap_or_else(|e| panic!("the port re-hashes a checked program: {e}"));
+    let rehashed = Rehashed::under(
+        &after.sources(),
+        &baseline,
+        &after.port.packages,
+        &after.port.mod_pkg,
+    )
+    .unwrap_or_else(|e| panic!("the port re-hashes a checked program: {e}"));
     let mut classify = StoreClassify::new(rehashed, &store, &after.check);
 
     let key = sym(key);

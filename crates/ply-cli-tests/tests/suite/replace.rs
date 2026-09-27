@@ -182,3 +182,86 @@ fn check_reports_the_file_that_would_change_and_writes_nothing() {
         SOURCE
     );
 }
+
+/// A root package over a dependency whose own module imports a sibling: re-checking a spliced
+/// program has to resolve both the root's `lib.answer` and that module's bare `extra`.
+fn packaged() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let root = dir.path();
+    for pkg in ["app", "lib"] {
+        std::fs::create_dir(root.join(pkg)).unwrap();
+    }
+    let manifest = |name: &str, deps: &str| {
+        format!(
+            "import std.pkg (Manifest)\nfn package() -> Manifest = {{name: \"{name}\", version: {{major: 0, minor: 0, patch: 1}}, prefix: None, runtime: {{major: 0, minor: 0, patch: 1}}, dependencies: [{deps}], entry: None}}\n"
+        )
+    };
+    std::fs::write(
+        root.join("app/ply.pkg"),
+        manifest(
+            "app",
+            "{name: \"lib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Path(\"../lib\")}",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("app/main.ply"),
+        "import lib.answer\n\nfn base() -> Int = 1\n\npub fn twice() -> Int = base() + base()\n\nfn main() -> Int = twice() + answer::answer()\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("lib/ply.pkg"), manifest("lib", "")).unwrap();
+    std::fs::write(
+        root.join("lib/answer.ply"),
+        "import extra\npub fn answer() -> Int = extra::hidden()\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("lib/extra.ply"), "pub fn hidden() -> Int = 7\n").unwrap();
+    dir
+}
+
+#[test]
+fn replace_re_checks_a_packaged_project_with_its_own_closure() {
+    let dir = packaged();
+    let out = ply(dir.path())
+        .args(["replace", "twice", "app", "--with", "new.txt"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a replacement nothing read is refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("new.txt"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = ply(dir.path())
+        .args(["replace", "twice", "app"])
+        .write_stdin("pub fn twice() -> Int = base() * 2\n")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "replaced main.twice in app/main.ply\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("app/main.ply")).unwrap(),
+        "import lib.answer\n\nfn base() -> Int = 1\n\npub fn twice() -> Int = base() * 2\n\nfn main() -> Int = twice() + answer::answer()\n"
+    );
+    assert!(
+        !dir.path().join("main.ply").exists(),
+        "the write went beside the root, not into it"
+    );
+
+    // The program still checks and still runs, so the splice was the whole program's: the root's
+    // own definition and the dependency's both answer.
+    let out = ply(dir.path()).args(["run", "app"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("9"));
+}

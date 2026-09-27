@@ -849,9 +849,13 @@ fn string_answer(entry: &str, answer: Value) -> Result<String> {
 const REHASH: &str = "front.rehash_dump";
 
 /// Every definition and test re-hashed with each reference to a `pins` name written as its pin.
+/// The packages are the ones the program was analysed with: without them a rehash resolves a
+/// dependency's own modules as root ones.
 pub fn rehash_dump(
     sources: &[(String, String)],
     pins: &[(String, bool, DefHash)],
+    packages: &[(String, Vec<String>)],
+    mod_pkg: &[usize],
 ) -> Result<String> {
     let pins = Value::list(
         pins.iter()
@@ -864,7 +868,11 @@ pub fn rehash_dump(
             })
             .collect(),
     );
-    string_answer(REHASH, call(REHASH, &[source_list(sources), pins])?)
+    let (pkgs, mods, shelf) = package_tables(packages, mod_pkg);
+    string_answer(
+        REHASH,
+        call(REHASH, &[source_list(sources), pins, pkgs, mods, shelf])?,
+    )
 }
 
 const PRINT: &str = "front.print_dump";

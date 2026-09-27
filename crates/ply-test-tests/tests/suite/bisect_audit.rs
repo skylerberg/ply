@@ -19,7 +19,7 @@ impl Compiled {
     fn rehashed(&self, baseline: &Baseline) -> Rehashed {
         let mut sources: Vec<(String, String)> = self.texts.clone().into_iter().collect();
         sources.sort();
-        Rehashed::under(&sources, baseline)
+        Rehashed::under(&sources, baseline, &self.port.packages, &self.port.mod_pkg)
             .unwrap_or_else(|e| panic!("the port re-hashes a checked program: {e}"))
     }
 
