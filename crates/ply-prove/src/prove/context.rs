@@ -39,7 +39,7 @@ impl<'a> Context<'a> {
             ctors.sort();
             sums.insert(ty, ctors.into_iter().map(|(_, name)| name).collect());
         }
-        drop_incomplete(&claims, &mut sums);
+        drop_incomplete(check, &claims, &mut sums);
 
         let (recursive, self_recursive) = recursive_definitions(&claims.defs);
         let inhabited_types = inhabited_sum_types(check, &sums);
@@ -155,12 +155,13 @@ impl<'a> Context<'a> {
     }
 }
 
-fn drop_incomplete(claims: &Claims, sums: &mut BTreeMap<Symbol, Vec<Symbol>>) {
-    // The prelude's ADTs have no `type` item, and would otherwise be dropped.
-    let mut declared: BTreeMap<Symbol, usize> = ply_ty::prelude::ADTS
-        .iter()
-        .map(|adt| (Symbol::new(adt.name), adt.variants.len()))
-        .collect();
+fn drop_incomplete(check: &CheckOutput, claims: &Claims, sums: &mut BTreeMap<Symbol, Vec<Symbol>>) {
+    // The prelude's ADTs have no `type` item, so their counts come from its anonymous-module
+    // constructors; `claims.sums` holds every declared one.
+    let mut declared: BTreeMap<Symbol, usize> = BTreeMap::new();
+    for info in check.ctors.values().filter(|c| c.module.is_anonymous()) {
+        *declared.entry(info.type_name.clone()).or_default() += 1;
+    }
     declared.extend(claims.sums.iter().map(|(ty, n)| (ty.clone(), *n)));
     sums.retain(|ty, ctors| declared.get(ty) == Some(&ctors.len()) && !ctors.is_empty());
 }

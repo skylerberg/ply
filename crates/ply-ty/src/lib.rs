@@ -5,7 +5,6 @@ pub mod expr;
 pub mod front;
 pub mod hash;
 pub mod parse;
-pub mod prelude;
 pub mod print;
 pub mod ty;
 
