@@ -1,0 +1,133 @@
+// `select` — which of a run's tests it must execute. A test re-runs iff its result is absent from
+// the store, and every other answer is a reason a report prints: `test/nondet` opts out of the cache
+// in both directions, a test the front end never hashed cannot be keyed at all, and a stored failure
+// is never trusted.
+//
+// The rows are the tester capability's own answer to `keys`: one per test, carrying the key its
+// result is filed under and what the store holds there. Deciding from them is arithmetic, so it is
+// here rather than in the runtime, which is what enters the compiled bodies a run needs.
+//
+// What is *not* here, because the rows do not answer it: a `random` plan keyed per root owes only
+// the roots it has not already answered alone, and narrowing a run to those roots needs a lookup by
+// a key the caller computes. The runtime keeps that until a read answers one.
+
+// One test the tree declares, and what the store holds under the key its result is filed under.
+pub type Case = {
+  index: Int,
+  /// The test's label, as a report prints it.
+  label: String,
+  /// The test's program-wide name, `<module>.<label>`.
+  name: String,
+  module: String,
+  /// The key the result is filed under; `None` when the front end produced no hash.
+  cache_key: Option<String>,
+  /// Whether the key is the search's, rather than the test's own hash.
+  seeded: Bool,
+  /// `test/nondet` opts out of the cache in both directions.
+  nondet: Bool,
+  /// `passed`, `failed`, or nothing, when the store holds no result under that key.
+  cached: Option<String>,
+}
+
+pub type Reason = | New | Nondet | PreviousFailure | Cached | Unhashed
+
+// One test's answer: what was decided, and whether it therefore runs.
+pub type Decision = { case: Case, reason: Reason }
+
+pub fn runs(d: Decision) -> Bool = match d.reason { Cached -> false, _ -> true }
+
+// `test/nondet` answers first: it never consults the store, so a stale result cannot silence a
+// search that has to be re-run. A test with no hash cannot be keyed, so it always runs. A stored
+// failure is never reused — the point of the run is to find out whether it is still a failure.
+pub fn reason_of(c: Case) -> Reason =
+  if c.nondet { Nondet }
+  else if c.cache_key == None { Unhashed } else {
+    match c.cached {
+      None -> New,
+      Some(text) -> if text == "passed" { Cached } else { PreviousFailure },
+    }
+  }
+
+pub fn decide(cases: List<Case>) -> List<Decision> =
+  map(cases, |c: Case| { case: c, reason: reason_of(c) })
+
+// The tests to run, in index order.
+pub fn to_run(decisions: List<Decision>) -> List<Int> =
+  fold(decisions, [], |acc: List<Int>, d: Decision|
+    if runs(d) { push(acc, d.case.index) } else { acc })
+
+// What a report reuses instead of running: a cached test passed, and its index is the one the run
+// would have had.
+pub fn reused(decisions: List<Decision>) -> List<{ index: Int, outcome: String }> =
+  fold(decisions, [], |acc: List<{ index: Int, outcome: String }>, d: Decision|
+    if d.reason == Cached { push(acc, { index: d.case.index, outcome: "passed" }) } else { acc })
+
+// The word `--explain` prints for a reason, which is also the word the JSON carries.
+pub fn word(r: Reason) -> String =
+  match r {
+    New -> "new",
+    Nondet -> "nondet",
+    PreviousFailure -> "previous failure",
+    Cached -> "cached",
+    Unhashed -> "unhashed",
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_case(index: Int, cached: Option<String>) -> Case =
+  {
+    index: index,
+    label: "doubles",
+    name: "m.doubles",
+    module: "m",
+    cache_key: Some("b3:aaaa"),
+    seeded: false,
+    nondet: false,
+    cached: cached,
+  }
+
+fn reason(index: Int, cached: Option<String>) -> Reason = reason_of(a_case(index, cached))
+
+test "a stored pass is the only thing that keeps a test from running" {
+  assert_eq(reason(0, Some("passed")), Cached);
+  assert_eq(reason(0, None), New);
+  assert_eq(reason(0, Some("failed")), PreviousFailure);
+  assert_eq(reason(0, Some("anything else")), PreviousFailure)
+}
+
+test "a test with no hash runs, because there is no key to have an answer under" {
+  assert_eq(reason_of({ ..a_case(0, Some("passed")), cache_key: None }), Unhashed)
+}
+
+test "`test/nondet` opts out of the cache in both directions" {
+  assert_eq(reason_of({ ..a_case(0, Some("passed")), nondet: true }), Nondet);
+  assert_eq(reason_of({ ..a_case(0, Some("failed")), nondet: true }), Nondet);
+  // Even a test with no hash is `nondet` rather than `unhashed`: it opts out first.
+  assert_eq(reason_of({ ..a_case(0, Some("passed")), nondet: true, cache_key: None }), Nondet)
+}
+
+test "only a cached test is left out, and the run's list is in index order" {
+  let cases = [
+    a_case(0, Some("passed")),
+    a_case(1, None),
+    a_case(2, Some("failed")),
+    { ..a_case(3, Some("passed")), nondet: true },
+  ];
+  let decisions = decide(cases);
+  assert_eq(map(decisions, |d: Decision| word(d.reason)), [
+    "cached",
+    "new",
+    "previous failure",
+    "nondet",
+  ]);
+  assert_eq(to_run(decisions), [1, 2, 3]);
+  assert_eq(reused(decisions), [{ index: 0, outcome: "passed" }])
+}
+
+test "every reason has the word the report prints" {
+  assert_eq(word(New), "new");
+  assert_eq(word(Nondet), "nondet");
+  assert_eq(word(PreviousFailure), "previous failure");
+  assert_eq(word(Cached), "cached");
+  assert_eq(word(Unhashed), "unhashed")
+}

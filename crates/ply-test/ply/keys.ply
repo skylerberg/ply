@@ -1,0 +1,146 @@
+// The keys a test's result is filed under. A test's own hash is the key when it is hermetic; a
+// seeded test's key is the *search* that was run, so changing the simulation's shape re-runs it and
+// nothing else moves. A domain tag on each keeps a derived key from colliding with a definition's
+// own untagged hash.
+//
+// These encodings are the Rust side's, byte for byte — a cache written by one is read by the other —
+// which is what the goldens in the tests below pin.
+
+import std.bytes (u32_le, u64_le)
+import std.hash (blake3)
+
+fn sim_domain() -> Bytes = b"ply.sim.key.1"
+fn seed_domain() -> Bytes = b"ply.sim.seed.1"
+fn digest_domain() -> Bytes = b"ply.sim.plan.1"
+
+// The plan's digest: the mode as one byte, the budget and step bounds little-endian, then the roots
+// (as 64-bit) and the fixed choices (as 16-bit), each counted. The roots are the ones the search
+// would be run with: a plan is normalized before it is digested, and this takes that as read.
+pub fn plan_digest(
+  mode: String,
+  budget: Int,
+  steps: Int,
+  roots: List<Int>,
+  path: List<Int>,
+) -> Bytes = {
+  // `budget` and `steps` are 32-bit on the Rust side and the roots are 64-bit; the choices are 16.
+  // A plan is digested normalized, as the Rust side digests it: the roots in one order with none
+  // repeated and never none at all, the bounds at least one, and a path only where a path means
+  // something. Two plans that would be run the same way are one digest.
+  let ropts = match sorted_ints(roots) { [] -> [0], some -> some };
+  let fixed = if mode == "once" { sorted_ints(path) } else { [] };
+  blake3(
+    bytes_concat_all([
+      digest_domain(),
+      mode_byte(mode),
+      u32_le(if budget < 1 { 1 } else { budget }),
+      u32_le(if steps < 1 { 1 } else { steps }),
+      u32_le(len(ropts)),
+      bytes_concat_all(map(ropts, u64_le)),
+      u32_le(len(fixed)),
+      bytes_concat_all(map(fixed, u16_le)),
+    ]),
+  )
+}
+
+// Ascending, with repeats dropped: the order a normalized plan's roots and choices are in.
+fn sorted_ints(xs: List<Int>) -> List<Int> =
+  fold(xs, [], |acc: List<Int>, x: Int| {
+    if contains(acc, x) { acc } else {
+      let n = len(acc);
+      let at = fold(range(0, n), n, |i: Int, j: Int|
+        if i < n { i } else if x < nth(acc, j) { j } else { i });
+      inserted(acc, at, x)
+    }
+  })
+
+fn inserted(xs: List<Int>, at: Int, x: Int) -> List<Int> = {
+  let before = map(range(0, at), |j: Int| nth(xs, j));
+  let after = map(range(at, len(xs)), |j: Int| nth(xs, j));
+  fold(after, push(before, x), |acc: List<Int>, y: Int| push(acc, y))
+}
+
+fn contains(xs: List<Int>, x: Int) -> Bool = fold(xs, false, |found: Bool, y: Int| found || y == x)
+
+fn nth<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list does not hold") }
+
+// A seeded test's key: its definitions and the whole plan that was searched.
+pub fn sim_key(test_hash: Bytes, plan_digest: Bytes) -> Bytes =
+  blake3(bytes_concat_all([sim_domain(), test_hash, plan_digest]))
+
+// The per-root key `random` mode also writes, so widening a root set runs only the new roots.
+pub fn seed_key(test_hash: Bytes, seed: Bytes) -> Bytes =
+  blake3(bytes_concat_all([seed_domain(), test_hash, seed]))
+
+// The key a result is filed under: a seeded test's search, or the test's own hash.
+pub fn result_key(test_hash: Bytes, seeded: Bool, plan_digest: Bytes) -> Bytes =
+  if seeded { sim_key(test_hash, plan_digest) } else { test_hash }
+
+// A seed as the simulation encodes one: the root it starts from, then the choices it fixes.
+pub fn seed_bytes(root: Int, path: List<Int>) -> Bytes =
+  bytes_concat_all([u64_le(root), u32_le(len(path)), bytes_concat_all(map(path, u16_le))])
+
+/// `ply_eval::sim::DEFAULT_STEPS`, which a plan that names no bound is normalized to.
+pub fn default_steps() -> Int = 100000
+
+// `random` mode writes a key per root, and only for the plan it can answer root by root: one seed
+// chosen, no path fixed, and the default bounds. Widening such a plan's roots owes only the new ones.
+pub fn writes_seed_keys(mode: String, budget: Int, steps: Int, path: List<Int>) -> Bool =
+  mode == "random" && budget == 1 && steps == default_steps() && len(path) == 0
+
+// `once` is 0, `random` 1 and `dpor` 2: the Rust enum's own order, and anything else is `dpor`.
+fn mode_byte(mode: String) -> Bytes =
+  if mode == "once" { b"\x00" } else if mode == "random" { b"\x01" } else { b"\x02" }
+
+// The low two bytes of a choice, little-endian: `u32_le` then take the first two.
+fn u16_le(n: Int) -> Bytes = bytes_slice(u32_le(n & 0xFFFF), 0, 2)
+
+// --- Tests ------------------------------------------------------------------
+
+// A digest is opaque, so a golden is a byte literal: the value `ply_eval::Plan::digest` answers for
+// the plan named above it. If one of these moves, the two sides have stopped agreeing and every
+// cache entry keyed by it is invalid.
+// A definition's hash is 32 bytes, so the goldens below are for one that reads `11223344` and
+// then zeros — not for a four-byte value, which is not a hash at all.
+fn a_hash() -> Bytes =
+  bytes_concat(
+    b"\x11\x22\x33\x44",
+    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+  )
+
+test "a plan's digest is the fields the Rust side digests, in its order" {
+  assert_eq(
+    plan_digest("once", 1, 100000, [], []),
+    b"\xbc\x1a\x3b\x85\xbe\x13\x7e\x77\x8c\x4b\x60\xfa\x9e\xbc\xbb\xd5\x49\x67\xf4\x53\x82\xc4\x67\x36\x40\x87\x9f\x3f\x25\xb0\x36\x17",
+  );
+  assert_eq(
+    plan_digest("dpor", 256, 100000, [0, 1], []),
+    b"\xe8\xaa\x1f\x9d\xd0\x88\x94\x75\xed\x1f\xa7\x27\xda\xc0\xed\x48\x81\x02\xfb\x79\x4d\xf3\x27\xa9\xbb\x88\x08\x4b\xac\x33\x42\x44",
+  )
+}
+
+test "a seeded test's key is its hash and its plan, and a hermetic one is its hash" {
+  let hash = a_hash();
+  let digest = plan_digest("dpor", 256, 100000, [0], []);
+  assert_eq(
+    sim_key(hash, digest),
+    b"\x48\x37\x11\x8d\xfc\xd9\xe6\x3b\x95\x62\xfd\xf6\x85\xb6\x7c\x6b\x67\x6b\x9a\xc4\xa8\x9b\xcf\x47\x63\xd4\x08\x3b\xdc\xc6\x5e\x76",
+  );
+  assert_eq(result_key(hash, false, digest), hash)
+}
+
+test "a root's own key is the test's hash, the seed, and nothing else" {
+  assert_eq(
+    seed_key(a_hash(), seed_bytes(0, [])),
+    b"\xfe\xcb\x3e\x1e\xca\x97\x25\x92\xb9\x28\x82\xdd\xa8\x5c\xca\xd3\xb2\xeb\x7f\x57\xc4\xe1\x80\x36\x32\x01\xf1\x14\x50\x89\x64\x61",
+  )
+}
+
+test "only the plan a root can answer alone writes per-root keys" {
+  assert(writes_seed_keys("random", 1, default_steps(), []));
+  assert(!writes_seed_keys("random", 2, default_steps(), []));
+  assert(!writes_seed_keys("random", 1, 5, []));
+  assert(!writes_seed_keys("random", 1, default_steps(), [0]));
+  assert(!writes_seed_keys("dpor", 1, default_steps(), []))
+}
