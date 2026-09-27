@@ -3423,9 +3423,117 @@ fn release(session: pg::Session, pool: Pool) -> Pool = { ..pool, idle: push(pool
 fn give_back(session: pg::Session, pool: Pool) -> Pool =
   release(session, { ..pool, opened: pool.opened - 1 })
 
+// --- What a statement is ----------------------------------------------------------
+
+// Whether a statement writes, decided by the verb it leads with. A write performed as `db.query`
+// is published to the scheduler as a read, and two endpoints that both write would then be run
+// beside each other, so the verb is settled before the statement reaches the server.
+pub fn writes(sql: String) -> Result<Bool, DbError> = {
+  let b = bytes_of_string(sql);
+  let at = skip_to_word(b, 0);
+  if at >= bytes_len(b) { Err(unsupported_statement("the statement is empty")) } else {
+    let w = word_at(b, at);
+    match verb_writes(w.word) {
+      Some(answers) -> Ok(answers),
+      None -> if w.word == "with" { writes_after_with(b, w.next) } else {
+        Err(
+          unsupported_statement(
+            "a statement begins `" ++ w.word
+              ++ "`; a `Stmt` is one `select`, `insert`, `update` or `delete`, and a schema is applied by the run rather than through this effect",
+          ),
+        )
+      },
+    }
+  }
+}
+
+fn unsupported_statement(why: String) -> DbError = db_error("0A000", "", why)
+
+fn verb_writes(word: String) -> Option<Bool> =
+  if word == "select" || word == "values" { Some(false) }
+  else if word == "insert" || word == "update" || word == "delete" { Some(true) }
+  else { None }
+
+// The verb after a `with` clause's common table expressions: an `insert` may follow them, and a
+// CTE's own body is inside parentheses, so only a word at depth zero is the statement's verb.
+fn writes_after_with(b: Bytes, at: Int) -> Result<Bool, DbError> = {
+  let i = skip_to_word(b, at);
+  if i >= bytes_len(b) { Err(unsupported_statement("a `with` clause names no statement")) }
+  else if bytes_at(b, i) == 40 { writes_deeper(b, i + 1, 1) } else {
+    let w = word_at(b, i);
+    match verb_writes(w.word) { Some(answers) -> Ok(answers), None -> writes_after_with(b, w.next) }
+  }
+}
+
+fn writes_deeper(b: Bytes, at: Int, depth: Int) -> Result<Bool, DbError> = {
+  let i = skip_to_word(b, at);
+  if i >= bytes_len(b) { Err(unsupported_statement("a `with` clause names no statement")) }
+  else if bytes_at(b, i) == 40 { writes_deeper(b, i + 1, depth + 1) } else if bytes_at(b, i) == 41 {
+    if depth == 1 { writes_after_with(b, i + 1) } else { writes_deeper(b, i + 1, depth - 1) }
+  } else { writes_deeper(b, word_at(b, i).next, depth) }
+}
+
+// The first byte that is not whitespace or a comment.
+fn skip_to_word(b: Bytes, at: Int) -> Int =
+  if at >= bytes_len(b) { at } else if bytes_at(b, at) == 45 && at + 1 < bytes_len(b)
+      && bytes_at(b, at + 1) == 45 { skip_to_word(b, skip_line(b, at)) } else if bytes_at(b, at)
+      == 47
+      && at + 1 < bytes_len(b)
+      && bytes_at(b, at + 1) == 42 { skip_to_word(b, skip_block(b, at + 2)) }
+  else if is_space_byte(bytes_at(b, at)) { skip_to_word(b, at + 1) }
+  else { at }
+
+fn skip_line(b: Bytes, at: Int) -> Int =
+  if at >= bytes_len(b) || bytes_at(b, at) == 10 { at } else { skip_line(b, at + 1) }
+
+fn skip_block(b: Bytes, at: Int) -> Int =
+  if at + 1 >= bytes_len(b) { bytes_len(b) }
+  else if bytes_at(b, at) == 42 && bytes_at(b, at + 1) == 47 { at + 2 }
+  else { skip_block(b, at + 1) }
+
+fn is_space_byte(c: Int) -> Bool = c == 32 || c == 9 || c == 10 || c == 13
+
+fn is_word_byte(c: Int) -> Bool =
+  (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || (c >= 48 && c <= 57)
+
+// The word at `at`, folded to lower case, and where it ends.
+fn word_at(b: Bytes, at: Int) -> { word: String, next: Int } = {
+  let end = word_end(b, at);
+  { word: lower_between(b, at, end), next: end }
+}
+
+// Where the word that begins at `at` ends: the first byte that is not one of its own.
+fn word_end(b: Bytes, at: Int) -> Int =
+  if at < bytes_len(b) && is_word_byte(bytes_at(b, at)) { word_end(b, at + 1) } else { at }
+
+fn lower_between(b: Bytes, at: Int, end: Int) -> String =
+  string_of_bytes(
+    fold(range(at, end), b"", |acc: Bytes, i: Int| {
+      let c = bytes_at(b, i);
+      bytes_concat(acc, byte_of_int(if c >= 65 && c <= 90 { c + 32 } else { c }))
+    }),
+  )
+
 type Ran = { session: pg::Session, answer: Answer }
 
 fn run_statement(
+  session: pg::Session,
+  s: Stmt,
+  ps: List<Param>,
+  rows: Bool,
+  reads_only: Bool,
+  cfg: Server,
+) -> Result<Ran, pg::ClientError> / {net.send[link], net.recv[link]} = {
+  let writing = match writes(s.sql) { Err(e) -> panic(e.detail), Ok(w) -> w };
+  if writing && reads_only {
+    panic(
+      "this statement writes, and `db.query` is a read: perform it as `db.execute` or `db.returning`, or two endpoints that both write would be run beside each other",
+    )
+  };
+  run_checked(session, s, ps, rows, cfg)
+}
+
+fn run_checked(
   session: pg::Session,
   s: Stmt,
   ps: List<Param>,
@@ -3461,9 +3569,10 @@ fn statement_on(
   s: Stmt,
   ps: List<Param>,
   rows: Bool,
+  reads_only: Bool,
 ) -> { answer: Answer, pool: Pool } / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
   match pool.open {
-    Some(open) -> match run_statement(open.session, s, ps, rows, cfg) {
+    Some(open) -> match run_statement(open.session, s, ps, rows, reads_only, cfg) {
       Err(e) -> { answer: Failed(db_error("", "", pg::client_error_text(e))), pool: pool },
       Ok(ran) -> {
         let held = { ..open, session: ran.session };
@@ -3472,7 +3581,7 @@ fn statement_on(
     },
     None -> match checkout(cfg, size, pool, nonce) {
       Err(e) -> { answer: Failed(e), pool: pool },
-      Ok(taken) -> match run_statement(taken.session, s, ps, rows, cfg) {
+      Ok(taken) -> match run_statement(taken.session, s, ps, rows, reads_only, cfg) {
         Err(e) -> {
           pg::finish[link](taken.session, cfg.client);
           {
@@ -3582,17 +3691,17 @@ pub fn serve<a | e>(
       body()
     } with {
       db.query[*](s, ps) -> {
-        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, true);
+        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, true, true);
         cell_set(pool, ran.pool);
         ran.answer
       },
       db.execute[*](s, ps) -> {
-        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, false);
+        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, false, false);
         cell_set(pool, ran.pool);
         ran.answer
       },
       db.returning[*](s, ps) -> {
-        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, true);
+        let ran = statement_on(cfg, size, nonce, cell_get(pool), s, ps, true, false);
         cell_set(pool, ran.pool);
         ran.answer
       },
@@ -3815,6 +3924,34 @@ pub fn with_server<a | e>(
   match server_of(url) { Err(why) -> Err(why), Ok(cfg) -> Ok(serve(cfg, size, nonce(), body)) }
 
 // --- Tests ------------------------------------------------------------------
+
+test "a statement's verb is what decides whether it reads or writes" {
+  assert_eq(writes("select 1"), Ok(false));
+  assert_eq(writes("  SELECT * from t"), Ok(false));
+  assert_eq(writes("insert into t values (1)"), Ok(true));
+  assert_eq(writes("update t set a = 1"), Ok(true));
+  assert_eq(writes("delete from t"), Ok(true));
+  assert_eq(writes("values (1)"), Ok(false))
+}
+
+test "a common table expression hides its body, not the statement's verb" {
+  assert_eq(writes("with a as (select 1) select * from a"), Ok(false));
+  assert_eq(writes("with a as (select 1) insert into t select * from a"), Ok(true));
+  // The CTE's own verb is inside parentheses, so it is not the statement's.
+  assert_eq(writes("with a as (delete from t returning 1) select 1"), Ok(false))
+}
+
+test "a comment is not the verb, and an unterminated one is not a statement" {
+  assert_eq(writes("-- a note\nselect 1"), Ok(false));
+  assert_eq(writes("/* a note */ select 1"), Ok(false));
+  assert(match writes("with a as (select 1)") { Err(_) -> true, Ok(_) -> false })
+}
+
+test "a statement the driver cannot account for is refused rather than sent" {
+  assert(match writes("create table t (a int)") { Err(_) -> true, Ok(_) -> false });
+  assert(match writes("") { Err(_) -> true, Ok(_) -> false });
+  assert(match writes("drop table t") { Err(_) -> true, Ok(_) -> false })
+}
 
 test "a connection string reads into the parts a driver needs" {
   match server_of(

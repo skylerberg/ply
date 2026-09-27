@@ -20,27 +20,24 @@ import std.db (db, with_server, stmt, transaction, PInt, PText, CInt, CText, Ans
 pub fn run(url: String) -> Result<String, String>
   / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next} =
   match with_server(url, 4, || {
-    match db.execute[items](stmt("create table if not exists items (id int4 primary key, name text)"), []) {
+    match db.returning[items](
+      stmt("insert into items (id, name) values ($1, $2) on conflict (id) do update set name = excluded.name returning id"),
+      [PInt(7), PText("seven")],
+    ) {
       Failed(e) -> Err(e.detail),
-      _ -> match db.returning[items](
-        stmt("insert into items (id, name) values ($1, $2) on conflict (id) do update set name = excluded.name returning id"),
-        [PInt(7), PText("seven")],
-      ) {
-        Failed(e) -> Err(e.detail),
-        Count(_) -> Err("a count where rows were due"),
-        Rows(rows) -> match rows {
-          [] -> Err("no row came back from the insert"),
-          [row, ..rest] -> match map_get(row, "id") {
-            Some(CInt(n)) -> match db.query[items](
-              stmt("select name from items where id = $1"),
-              [PInt(7)],
-            ) {
-              Failed(e) -> Err(e.detail),
-              Count(_) -> Err("a count where rows were due"),
-              Rows(found) -> Ok(int_to_string(n) ++ " " ++ names(found)),
-            },
-            _ -> Err("the id is not an int"),
+      Count(_) -> Err("a count where rows were due"),
+      Rows(rows) -> match rows {
+        [] -> Err("no row came back from the insert"),
+        [row, ..rest] -> match map_get(row, "id") {
+          Some(CInt(n)) -> match db.query[items](
+            stmt("select name from items where id = $1"),
+            [PInt(7)],
+          ) {
+            Failed(e) -> Err(e.detail),
+            Count(_) -> Err("a count where rows were due"),
+            Rows(found) -> Ok(int_to_string(n) ++ " " ++ names(found)),
           },
+          _ -> Err("the id is not an int"),
         },
       },
     }
@@ -56,6 +53,19 @@ fn names(rows: List<Row>) -> String =
       Some(CText(t)) -> t,
       _ -> "the name is not text",
     },
+  }
+
+// A statement that writes, performed as `db.query`: the scheduler would treat two of these as
+// readers, so the driver refuses it before it reaches the server.
+pub fn sneaky(url: String) -> Result<String, String>
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next} =
+  match with_server(url, 4, || {
+    match db.query[items](stmt("insert into items (id, name) values ($1, $2)"), [PInt(1), PText("x")]) {
+      _ -> Ok("the write went through as a read"),
+    }
+  }) {
+    Err(why) -> Err(why),
+    Ok(answered) -> answered,
   }
 
 // A transaction commits what it did, through `begin` and `commit` on the same connection.
@@ -98,8 +108,8 @@ fn tiered(service: &str) -> (ply_ty::Front, &'static ply_codegen::Unit) {
     (front, unit)
 }
 
-/// The entry, over the real network: the host's only part in this is the socket.
-fn call(entry: &str, url: &str) -> Result<String, String> {
+/// The entry, over the real network: the host's only part in this is the socket and the entropy.
+fn call_outcome(entry: &str, url: &str) -> Result<Value, ply_span::Diagnostic> {
     let host = ply_host::Host::new();
     let (front, unit) = tiered(PROGRAM);
     let binding = host
@@ -121,10 +131,12 @@ fn call(entry: &str, url: &str) -> Result<String, String> {
     {
         machine.set_declared_footprint(declared);
     }
+    machine.call(entry, vec![Value::str(url)], Span::DUMMY)
+}
 
-    let answered = machine
-        .call(entry, vec![Value::str(url)], Span::DUMMY)
-        .unwrap_or_else(|e| panic!("the call answers: {e}"));
+/// What the entry answered, as `Ok`'s text or `Err`'s.
+fn call(entry: &str, url: &str) -> Result<String, String> {
+    let answered = call_outcome(entry, url).unwrap_or_else(|e| panic!("the call answers: {e}"));
     let Value::Ctor { name, args } = &answered else {
         panic!("the entry answered {answered}, not an `Ok` or an `Err`");
     };
@@ -135,6 +147,14 @@ fn call(entry: &str, url: &str) -> Result<String, String> {
         "Ok" => Ok(text.to_string()),
         "Err" => Err(text.to_string()),
         other => panic!("the entry answered `{other}`"),
+    }
+}
+
+/// Why the entry would not run, for the refusals that are the driver's rather than the server's.
+fn call_err(entry: &str, url: &str) -> String {
+    match call_outcome(entry, url) {
+        Ok(other) => panic!("the call answered {other}, not a refusal"),
+        Err(why) => format!("{why}"),
     }
 }
 
@@ -154,9 +174,15 @@ fn cluster() -> Option<(crate::support::cluster::Cluster, String)> {
 
 #[test]
 fn the_db_effect_is_served_from_a_real_server() {
-    let Some((_cluster, url)) = cluster() else {
+    let Some((cluster, url)) = cluster() else {
         return;
     };
+    // `db.execute` carries statements, not a schema: a statement that is not one of the four verbs
+    // is refused, which is what the Rust driver does too.
+    cluster.psql(
+        "ply",
+        "create table if not exists items (id int4 primary key, name text)",
+    );
     match call("m.run", &url) {
         Ok(text) => assert_eq!(text, "7 seven"),
         Err(why) => panic!("the driver could not run a statement: {why}"),
@@ -164,11 +190,28 @@ fn the_db_effect_is_served_from_a_real_server() {
 }
 
 #[test]
-fn a_transaction_commits_what_it_did() {
+fn a_write_performed_as_a_read_is_refused() {
     let Some((_cluster, url)) = cluster() else {
         return;
     };
-    // The table is the first test's, and it is created if it is not there.
+    let why = call_err("m.sneaky", &url);
+    assert!(
+        why.contains("writes") && why.contains("db.query"),
+        "the refusal does not say what is wrong: {why}"
+    );
+}
+
+#[test]
+fn a_transaction_commits_what_it_did() {
+    let Some((cluster, url)) = cluster() else {
+        return;
+    };
+    // The schema is the run's, as it is for the Rust driver: `db.execute` carries statements, not
+    // DDL, so the table is made before the program starts.
+    cluster.psql(
+        "ply",
+        "create table if not exists items (id int4 primary key, name text)",
+    );
     match call("m.run", &url) {
         Ok(text) => assert_eq!(text, "7 seven"),
         Err(why) => panic!("the driver could not run a statement: {why}"),
