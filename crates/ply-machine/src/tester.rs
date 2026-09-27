@@ -470,6 +470,9 @@ struct KeyRow {
     cache_key: Option<String>,
     /// Whether the key is the search's, rather than the test's own hash.
     seeded: bool,
+    /// `test/nondet` opts out of the cache in both directions, so a selection never calls it
+    /// cached whatever the store holds.
+    nondet: bool,
     /// `Some("passed")` or `Some("failed")` when the store holds a result under that key.
     cached: Option<&'static str>,
 }
@@ -516,6 +519,7 @@ impl Knowledge {
                     module: test.module.as_str().to_string(),
                     cache_key: key.map(|k| k.to_hex()),
                     seeded,
+                    nondet: test.nondet,
                     cached: key.and_then(|k| store.get(k)).map(|outcome| {
                         if outcome.is_pass() {
                             "passed"
@@ -1740,6 +1744,7 @@ fn knowledge_value(value: &KnowledgeValue) -> PlyValue {
                             option(row.cache_key.as_deref().map(PlyValue::str)),
                         ),
                         ("seeded", PlyValue::Bool(row.seeded)),
+                        ("nondet", PlyValue::Bool(row.nondet)),
                         ("cached", option(row.cached.map(PlyValue::str))),
                     ])
                 })
