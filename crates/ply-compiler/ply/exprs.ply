@@ -61,6 +61,9 @@ pub type HandleClause = {
   // `[*]`: the clause answers the operation on every label, so there is no label to name and
   // `resource` stays `None`. This is what distinguishes it from a clause on a singleton.
   every_label: Bool,
+  // `[*t]`: the same coverage, with the label the call site named bound to `t` in the body. A
+  // clause that answers every label can otherwise answer one it should have refused.
+  label_binder: Option<Ident>,
   resume: Option<Ident>,
   body: Expr,
   span: Span,
@@ -350,21 +353,38 @@ fn opt_resource(c: Ctx, p: P) -> Result<R<Option<Ident>>, P> =
     Ok({ p: p, node: Some(r) })
   }
 
-// A clause's resource: `[name]`, `[*]` for every label, or nothing when the operation takes none.
-// A perform names a label, so only a clause gets the `*` form.
-type ClauseResource = { every: Bool, name: Option<Ident> }
+// A clause's resource: `[name]`, `[*]` for every label, `[*t]` for every label with the one the
+// call site named bound to `t`, or nothing when the operation takes none. A perform names a label,
+// so only a clause gets the `*` forms.
+type ClauseResource = { every: Bool, name: Option<Ident>, binder: Option<Ident> }
 
 fn clause_resource(c: Ctx, p: P) -> Result<R<ClauseResource>, P> =
-  if !at(c, p, t_lbracket()) { Ok({ p: p, node: { every: false, name: None } }) } else {
+  if !at(c, p, t_lbracket()) { Ok({ p: p, node: { every: false, name: None, binder: None } }) } else {
     let o = advance(c, p);
     if at(c, o.p, t_star()) {
       let st = advance(c, o.p);
-      let { p, .. } = expect_close(c, st.p, t_rbracket(), o.node, b"`]`")?;
-      Ok({ p: p, node: { every: true, name: None } })
+      // `[*t]` binds the label: the clause answers every label, and reads the one it answered.
+      let binder = match kind(c, st.p) {
+        TIdent(n) -> {
+          let b = advance(c, st.p);
+          Some({ p: b.p, node: { name: n, span: b.node } })
+        },
+        _ -> None,
+      };
+      let at_after = match binder { Some(b) -> b.p, None -> st.p };
+      let { p, .. } = expect_close(c, at_after, t_rbracket(), o.node, b"`]`")?;
+      Ok({
+        p: p,
+        node: {
+          every: true,
+          name: None,
+          binder: match binder { Some(b) -> Some(b.node), None -> None },
+        },
+      })
     } else {
       let { p, node: r } = expect_ident(c, o.p, b"a resource name or `*` inside `[..]`")?;
       let { p, .. } = expect_close(c, p, t_rbracket(), o.node, b"`]`")?;
-      Ok({ p: p, node: { every: false, name: Some(r) } })
+      Ok({ p: p, node: { every: false, name: Some(r), binder: None } })
     }
   }
 
@@ -1049,6 +1069,7 @@ fn handle_clause(c: Ctx, p: P) -> Result<R<HandleClause>, P> = {
       op: op,
       resource: res.name,
       every_label: res.every,
+      label_binder: res.binder,
       resume: resume,
       body: body,
       span: span_to(eff.span, expr_span(body)),
@@ -1218,6 +1239,7 @@ pub fn dump_clause(h: HandleClause) -> Bytes =
     dump_qname(h.eff),
     dump_ident(h.op),
     dump_opt(h.resource, dump_ident),
+    dump_opt(h.label_binder, dump_ident),
     dump_list(h.params, dump_ident),
     dump_opt(h.resume, dump_ident),
     dump_expr(h.body),
@@ -1631,7 +1653,16 @@ test "a match arm takes a guard and needs a comma unless its body is block-like"
 test "a handler takes clauses, a resume binder and at most one `return`" {
   assert_eq(
     dump_expr_of(b"handle f() with { e.op(a) resume k -> k(a), return v -> v }"),
-    "0:59:ehnd;7:10:eapp;7:8:evar;7:8:qname;?0;7:8:ident;@66;#0;#0;#0;#1;18:42:hcl;18:19:qname;?0;18:19:ident;@65;20:22:ident;@6f70;?0;#1;23:24:ident;@61;?1;33:34:ident;@6b;38:42:eapp;38:39:evar;38:39:qname;?0;38:39:ident;@6b;#1;40:41:evar;40:41:qname;?0;40:41:ident;@61;#0;#0;?1;44:57:rcl;51:52:ident;@76;56:57:evar;56:57:qname;?0;56:57:ident;@76;#0;",
+    "0:59:ehnd;7:10:eapp;7:8:evar;7:8:qname;?0;7:8:ident;@66;#0;#0;#0;#1;18:42:hcl;18:19:qname;?0;18:19:ident;@65;20:22:ident;@6f70;?0;?0;#1;23:24:ident;@61;?1;33:34:ident;@6b;38:42:eapp;38:39:evar;38:39:qname;?0;38:39:ident;@6b;#1;40:41:evar;40:41:qname;?0;40:41:ident;@61;#0;#0;?1;44:57:rcl;51:52:ident;@76;56:57:evar;56:57:qname;?0;56:57:ident;@76;#0;",
+  );
+  // `[*t]` is `[*]` with the label bound: the clause still names no resource, and it reads one.
+  assert_eq(
+    dump_expr_of(b"handle f() with { e.op[*t](a) -> t }"),
+    "0:36:ehnd;7:10:eapp;7:8:evar;7:8:qname;?0;7:8:ident;@66;#0;#0;#0;#1;18:34:hcl;18:19:qname;?0;18:19:ident;@65;20:22:ident;@6f70;?0;?1;24:25:ident;@74;#1;27:28:ident;@61;?0;33:34:evar;33:34:qname;?0;33:34:ident;@74;?0;#0;",
+  );
+  assert_eq(
+    dump_expr_of(b"handle f() with { e.op[a](x) -> x }"),
+    "0:35:ehnd;7:10:eapp;7:8:evar;7:8:qname;?0;7:8:ident;@66;#0;#0;#0;#1;18:33:hcl;18:19:qname;?0;18:19:ident;@65;20:22:ident;@6f70;?1;23:24:ident;@61;?0;#1;26:27:ident;@78;?0;32:33:evar;32:33:qname;?0;32:33:ident;@78;?0;#0;",
   );
   let two = dump_expr_of(b"handle f() with { return a -> a, return b -> b }");
   assert(string_contains(two, "!E0001:33:46:2:0;=33:46:1;=18:31:0;"));

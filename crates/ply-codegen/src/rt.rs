@@ -282,6 +282,8 @@ pub(crate) struct FrameClause {
     closure: Word,
     /// 0: never resumes; 1: resumes in tail position; 2: elsewhere (only in a detached frame).
     resumes: u8,
+    /// `[*t]`: the clause's first slot after the parameters is the label the call site named.
+    binds_label: bool,
 }
 
 impl FrameClause {
@@ -318,6 +320,7 @@ pub(crate) fn clone_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
                         op: cl.op.clone(),
                         closure: cl.closure,
                         resumes: cl.resumes,
+                        binds_label: cl.binds_label,
                     })
                     .collect(),
                 ret: f.ret,
@@ -1992,18 +1995,19 @@ pub unsafe extern "C" fn rt_handle_push(
 }
 
 /// A `handle` site's clause table: per clause the effect, resource (negative for none) and op
-/// as field-table indices, the closure, and its `resumes`.
+/// as field-table indices, the closure, its `resumes`, and whether it binds the label.
 fn clauses_of(c: &Ctx, clauses: *const i64, n: i64) -> Vec<FrameClause> {
-    let words = args_of(clauses, n * 5);
+    let words = args_of(clauses, n * 6);
     let name = |i: i64| c.tables.fields[i as usize].clone();
     words
-        .chunks(5)
+        .chunks(6)
         .map(|w| FrameClause {
             effect: name(w[0]),
             resource: (w[1] >= 0).then(|| name(w[1])),
             op: name(w[2]),
             closure: w[3],
             resumes: w[4] as u8,
+            binds_label: w[5] != 0,
         })
         .collect()
 }
@@ -2127,18 +2131,18 @@ pub unsafe extern "C" fn rt_perform(
                         break 'search;
                     };
                     let closure = cl.closure;
+                    let mut bound: Vec<Word> = args_of(args, n).to_vec();
+                    if cl.binds_label
+                        && let Some(label) = &resource
+                    {
+                        bound.push(c.word(&Value::Str(Arc::from(label.as_str()))));
+                    }
                     // Moved in: a local owning memory across the switch is freed once per restore.
                     return unsafe {
-                        crate::detached::stop(
-                            ctx,
-                            id,
-                            closure,
-                            args_of(args, n),
-                            (effect, op, resource),
-                        )
+                        crate::detached::stop(ctx, id, closure, &bound, (effect, op, resource))
                     };
                 }
-                found = Some((stack, i, cl.closure, cl.resumes != 0));
+                found = Some((stack, i, cl.closure, cl.resumes != 0, cl.binds_label));
                 break 'search;
             }
         }
@@ -2161,7 +2165,7 @@ pub unsafe extern "C" fn rt_perform(
         );
         return c.fail(d);
     }
-    let Some((stack, depth, closure, resumes)) = found else {
+    let Some((stack, depth, closure, resumes, binds_label)) = found else {
         // Inside an open production region a `task` op is the scheduler's; outside, the host's.
         if effect.as_str() == "task"
             && ply_eval::sim::TASK_OPS.contains(&op.as_str())
@@ -2174,6 +2178,10 @@ pub unsafe extern "C" fn rt_perform(
         };
     };
     let mut call_args: Vec<Word> = args_of(args, n).to_vec();
+    // A clause written `[*t]` reads the label its call site named, before the continuation does.
+    if binds_label && let Some(label) = &resource {
+        call_args.push(c.word(&Value::Str(Arc::from(label.as_str()))));
+    }
     // The clause runs outside its handler: that frame and all above it are hidden until it returns.
     let hidden = hide_above(c, stack, depth);
     if resumes {
