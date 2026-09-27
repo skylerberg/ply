@@ -901,9 +901,9 @@ pub fn diagnose_failures(
         // Unclassified, every change stays a candidate: a wider answer, never a wrong one.
         let mut unknown = bisect::Unknown;
         let mut store_classify;
-        let rehashed = baseline
-            .as_ref()
-            .and_then(|baseline| Rehashed::under(sources, baseline).ok());
+        let rehashed = baseline.as_ref().and_then(|baseline| {
+            Rehashed::under(sources, baseline, &front.packages, &front.mod_pkg).ok()
+        });
         let classify: &mut dyn Classify = match rehashed {
             Some(rehashed) => {
                 store_classify = StoreClassify::new(rehashed, store, check);

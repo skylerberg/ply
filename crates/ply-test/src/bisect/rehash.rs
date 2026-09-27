@@ -15,13 +15,20 @@ pub struct Rehashed {
 }
 
 impl Rehashed {
-    pub fn under(sources: &[(String, String)], baseline: &Baseline) -> Result<Rehashed, String> {
+    /// The packages are the ones the run was analysed with: a rehash that resolved without them
+    /// would read a dependency's own modules as root ones.
+    pub fn under(
+        sources: &[(String, String)],
+        baseline: &Baseline,
+        packages: &[(String, Vec<String>)],
+        mod_pkg: &[usize],
+    ) -> Result<Rehashed, String> {
         let pins: Vec<(String, bool, DefHash)> = baseline
             .keys()
             .filter_map(|key| Some((key.name.to_string(), key.is_decl(), baseline.hash_of(&key)?)))
             .collect();
-        let dump =
-            ply_codegen::c::producer::rehash_dump(sources, &pins).map_err(|e| format!("{e:#}"))?;
+        let dump = ply_codegen::c::producer::rehash_dump(sources, &pins, packages, mod_pkg)
+            .map_err(|e| format!("{e:#}"))?;
         read(&dump)
     }
 
