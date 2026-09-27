@@ -497,14 +497,42 @@ pub fn wants(known: List<Bytes>, manifests: List<Supplied>) -> List<Bytes> =
         Some(m) ->
           fold(m.dependencies, acc, |acc2: List<Bytes>, d: Dep|
             match d.source {
-              Path(p) -> {
-                let root = join_normalized(s.root, bytes_of_string(p));
-                if has(known, root) || has(acc2, root) { acc2 } else { push(acc2, root) }
-              },
-              _ -> acc2,
+              Path(p) -> wanted(known, acc2, join_normalized(s.root, bytes_of_string(p))),
+              // A git dependency is wanted by the key its fetch is named under, not by a path: a
+              // walker that has not fetched it yet has nothing to read.
+              Git(url, rev) ->
+                wanted(known, acc2, git_key(bytes_of_string(url), bytes_of_string(rev))),
+              Registry -> acc2,
             }),
       },
     })
+
+fn wanted(known: List<Bytes>, acc: List<Bytes>, root: Bytes) -> List<Bytes> =
+  if has(known, root) || has(acc, root) { acc } else { push(acc, root) }
+
+/// The root key a git dependency is supplied under once it is fetched: `git+<url>@<rev>`. The front
+/// end judges it like any other root, so nothing here needs to know where a fetch puts a tree — and
+/// `rev` is read from the last `@`, since a url may hold one of its own (`git@host:path`).
+pub fn git_key(url: Bytes, rev: Bytes) -> Bytes = bytes_concat_all([b"git+", url, b"@", rev])
+
+/// The url and revision a key names, for the walker that has to fetch it.
+pub fn git_spec(key: Bytes) -> Option<{ url: Bytes, rev: Bytes }> =
+  if !bytes_starts_with(key, b"git+") { None } else {
+    let rest = bytes_slice(key, 4, bytes_len(key));
+    match last_at(rest, 0, 0) {
+      None -> None,
+      Some(at) ->
+        Some({ url: bytes_slice(rest, 0, at), rev: bytes_slice(rest, at + 1, bytes_len(rest)) }),
+    }
+  }
+
+// The last `@` in a key's url: a url may hold one of its own (`git@host:path`), and the revision
+// never does.
+fn last_at(rest: Bytes, from: Int, found: Int) -> Option<Int> =
+  match bytes_index_of_from(rest, b"@", from) {
+    None -> if found == 0 { None } else { Some(found) },
+    Some(at) -> if at + 1 >= bytes_len(rest) { None } else { last_at(rest, at + 1, at) },
+  }
 
 // The walk's next reads as JSON: `{"wants": ["root", ...]}`, for the driver to serve.
 pub fn wants_dump(known: List<Bytes>, manifests: List<Supplied>) -> String =
@@ -778,17 +806,81 @@ fn one_dep(
   let slot = slot_of(texts, i);
   let name = bytes_of_string(d.name);
   match d.source {
-    Git(_, _) ->
-      push_diag_text(
-        acc,
-        slot,
-        b"E0135",
-        bytes_concat_all([
-          b"the dependency `",
-          name,
-          b"` comes from git; only path dependencies resolve today",
-        ]),
-      ),
+    Git(url, rev) -> {
+      let key = git_key(bytes_of_string(url), bytes_of_string(rev));
+      match root_index(roots, key, 0) {
+        None ->
+          push_diag_text(
+            acc,
+            slot,
+            b"E0135",
+            bytes_concat_all([b"the dependency `", name, b"` at `", key, b"` was not fetched"]),
+          ),
+        Some(j) -> match at(manifests, j) {
+          None ->
+            push_diag_text(
+              acc,
+              slot,
+              b"E0135",
+              bytes_concat_all([
+                b"the dependency `",
+                name,
+                b"` at `",
+                key,
+                b"` holds no ply.pkg; a package that is depended on must declare one",
+              ]),
+            ),
+          Some(tm) -> match at(texts, j) {
+            None -> acc,
+            Some(_) -> {
+              let granted = bytes_of_string(prefix_of(tm));
+              let aliased = match d.prefix { None -> granted, Some(a) -> bytes_of_string(a) };
+              if compare(tm.version, d.min) == Less {
+                push_diag_text(
+                  acc,
+                  slot,
+                  b"E0136",
+                  bytes_concat_all([
+                    b"the dependency `",
+                    name,
+                    b"` at `",
+                    key,
+                    b"` is version ",
+                    version_text(tm.version),
+                    b", and this manifest asks for at least ",
+                    version_text(d.min),
+                  ]),
+                )
+              } else if aliased != granted {
+                push_diag_text(
+                  acc,
+                  slot,
+                  b"E0133",
+                  bytes_concat_all([
+                    b"the dependency `",
+                    name,
+                    b"` is granted the prefix `",
+                    aliased,
+                    b"` here, but calls itself `",
+                    granted,
+                    b"`",
+                  ]),
+                )
+              } else {
+                {
+                  packages: set_at(acc.packages, i, {
+                    ..at(acc.packages, i),
+                    deps: push(at(acc.packages, i).deps, granted),
+                  }),
+                  diags: acc.diags,
+                  edges: push(acc.edges, { from: i, target: j }),
+                }
+              }
+            },
+          },
+        },
+      }
+    },
     Registry ->
       push_diag_text(
         acc,
