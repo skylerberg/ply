@@ -50,16 +50,37 @@ fn main() -> anyhow::Result<()> {
     // One warm pass, so lazily built machine state is not charged to the count.
     loaded.over_sim(vec![vec![request.clone()]])?;
 
-    let script: Vec<Vec<Vec<u8>>> = (0..requests).map(|_| vec![request.clone()]).collect();
-    ALLOCS.with(|c| c.set(0));
-    BYTES.with(|c| c.set(0));
-    loaded.over_sim(script)?;
+    // Two windows, because one cannot tell a request from a run: a window's total charges the
+    // Machine's own startup to every request in it, and the startup is the size of the program —
+    // `std`, and whatever the service pulls in — rather than of the request path. The difference
+    // between two windows is the request, and what is left over is the startup.
+    let small_requests = requests / 10;
+    anyhow::ensure!(
+        small_requests >= 10,
+        "a per-request cost is read off two windows, so `--requests` is at least 100, not \
+         {requests}"
+    );
+    let small = counted(&loaded, &request, small_requests)?;
+    let large = counted(&loaded, &request, requests)?;
+    let span = (requests - small_requests) as f64;
+    let allocations_per_request = (large.0 as f64 - small.0 as f64) / span;
+    let bytes_per_request = (large.1 as f64 - small.1 as f64) / span;
+    // The same slope through the small window: what one run costs before it serves anything.
+    eprintln!(
+        "w6-alloc: {} requests {:.1} allocations each, {requests} requests {:.1} each; one request \
+         costs {allocations_per_request:.2} allocations and {bytes_per_request:.1} bytes, and one \
+         run starts at {:.0} allocations",
+        small_requests,
+        small.0 as f64 / small_requests as f64,
+        large.0 as f64 / requests as f64,
+        small.0 as f64 - allocations_per_request * small_requests as f64,
+    );
     let figures = ply_corpus::w6_run::Allocation {
         route: "/health".to_string(),
         requests,
         response_bytes: response.len(),
-        allocations_per_request: ALLOCS.with(Cell::get) as f64 / requests as f64,
-        bytes_per_request: BYTES.with(Cell::get) as f64 / requests as f64,
+        allocations_per_request,
+        bytes_per_request,
     };
 
     let rendered = format!("{}\n", serde_json::to_string_pretty(&figures)?);
@@ -69,4 +90,17 @@ fn main() -> anyhow::Result<()> {
         eprintln!("wrote {}", out.display());
     }
     Ok(())
+}
+
+/// A window of `n` requests: the allocations and the bytes it makes.
+fn counted(
+    loaded: &ply_corpus::w3::Loaded,
+    request: &[u8],
+    n: usize,
+) -> anyhow::Result<(usize, usize)> {
+    let script: Vec<Vec<Vec<u8>>> = (0..n).map(|_| vec![request.to_vec()]).collect();
+    ALLOCS.with(|c| c.set(0));
+    BYTES.with(|c| c.set(0));
+    loaded.over_sim(script)?;
+    Ok((ALLOCS.with(Cell::get), BYTES.with(Cell::get)))
 }
