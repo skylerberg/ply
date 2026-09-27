@@ -21,16 +21,18 @@ pub const EFFECT: &str = "std.time.time";
 pub enum Op {
     NowMs,
     ElapsedMs,
+    ElapsedUs,
     SleepMs,
 }
 
 impl Op {
-    pub const ALL: [Op; 3] = [Op::NowMs, Op::ElapsedMs, Op::SleepMs];
+    pub const ALL: [Op; 4] = [Op::NowMs, Op::ElapsedMs, Op::ElapsedUs, Op::SleepMs];
 
     pub fn name(self) -> &'static str {
         match self {
             Op::NowMs => "now_ms",
             Op::ElapsedMs => "elapsed_ms",
+            Op::ElapsedUs => "elapsed_us",
             Op::SleepMs => "sleep_ms",
         }
     }
@@ -39,6 +41,7 @@ impl Op {
         match self {
             Op::NowMs => "`time.now_ms`",
             Op::ElapsedMs => "`time.elapsed_ms`",
+            Op::ElapsedUs => "`time.elapsed_us`",
             Op::SleepMs => "`time.sleep_ms`",
         }
     }
@@ -47,6 +50,7 @@ impl Op {
         match self {
             Op::NowMs => "ply_host::time::now_ms",
             Op::ElapsedMs => "ply_host::time::elapsed_ms",
+            Op::ElapsedUs => "ply_host::time::elapsed_us",
             Op::SleepMs => "ply_host::time::sleep_ms",
         }
     }
@@ -54,7 +58,7 @@ impl Op {
     /// What the declaration in `std.time` gives the operation, which inference has already checked.
     pub fn arity(self) -> usize {
         match self {
-            Op::NowMs | Op::ElapsedMs => 0,
+            Op::NowMs | Op::ElapsedMs | Op::ElapsedUs => 0,
             Op::SleepMs => 1,
         }
     }
@@ -67,7 +71,7 @@ impl Op {
             determinism: Determinism::Nondeterministic,
             linearity: match self {
                 // A reading consumes nothing, so a continuation may cross one more than once.
-                Op::NowMs | Op::ElapsedMs => Linearity::Repeatable,
+                Op::NowMs | Op::ElapsedMs | Op::ElapsedUs => Linearity::Repeatable,
                 // A wait crossed twice waits twice, as a line written twice is written twice.
                 Op::SleepMs => Linearity::AtMostOnce,
             },
@@ -111,6 +115,13 @@ impl TimeHost {
         i64::try_from(self.started.elapsed().as_millis()).unwrap_or(i64::MAX)
     }
 
+    /// Microseconds since this run's clock was started. A benchmark needs a reading finer than a
+    /// millisecond: an in-process call is measured in microseconds, and 200 of them are still a
+    /// fifth of a millisecond.
+    pub fn elapsed_us(&self) -> i64 {
+        i64::try_from(self.started.elapsed().as_micros()).unwrap_or(i64::MAX)
+    }
+
     /// Parks this thread for `ms`; a span no clock can run backwards over, so a negative one is no
     /// wait at all rather than a refusal.
     pub fn sleep_ms(&self, ms: i64) {
@@ -150,6 +161,7 @@ impl HostHandler for Operation {
         Ok(HostAnswer::Value(match self.op {
             Op::NowMs => Value::Int(self.time.now_ms()),
             Op::ElapsedMs => Value::Int(self.time.elapsed_ms()),
+            Op::ElapsedUs => Value::Int(self.time.elapsed_us()),
             Op::SleepMs => {
                 self.time.sleep_ms(req.args[0].as_int(req.span, "a wait")?);
                 Value::Unit
