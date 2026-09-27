@@ -1,0 +1,181 @@
+// `ply why` — why a package is in this project's closure. Minimal version selection makes this
+// cheap and exact: the closure is a set of declarations, so the answer is a path from the root
+// package to this one, and the version it resolved to is the one the closure pins.
+
+import args (Flags, style_of)
+import lock (Pinned, from_front)
+import program (Program, load_program)
+import report (Answer, ind, ok_code, refused, reported)
+import style (Style)
+import compiler.resolve (Diag, Pkg, diag1)
+import std.fs (fs)
+import std.json (Json, Array, Bool, Null, Number, Str, object, to_string)
+
+fn outside() -> Int = 4294967295
+
+fn unknown(name: String) -> Diag =
+  diag1(
+    b"E0101",
+    outside(),
+    { start: 0, end: 0 },
+    bytes_of_string("`" ++ name ++ "` is not a package in this closure"),
+    b"nothing here depends on it",
+    [b"`ply resolve` lists the packages this project reaches, one line each"],
+  )
+
+fn at<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list does not hold") }
+
+fn joined(parts: List<String>, sep: String) -> String =
+  fold(range(0, len(parts)), "", |acc: String, i: Int|
+    match list_at(parts, i) { None -> acc, Some(x) -> if i == 0 { x } else { acc ++ sep ++ x } })
+
+// The package a name resolves to. A closure lists the prefixes it is reached through, and a prefix
+// is the package's own name unless a manifest aliases it — which `E0133` refuses — so a name is a
+// prefix.
+fn index_of(pkgs: List<Pkg>, name: Bytes) -> Option<Int> = find_prefix(pkgs, name, 0)
+
+fn find_prefix(pkgs: List<Pkg>, name: Bytes, i: Int) -> Option<Int> =
+  if i >= len(pkgs) { None }
+  else if at(pkgs, i).prefix == name { Some(i) }
+  else { find_prefix(pkgs, name, i + 1) }
+
+fn held(xs: List<Int>, x: Int) -> Bool = fold(xs, false, |found: Bool, y: Int| found || y == x)
+
+fn prepended(path: List<Int>, x: Int) -> List<Int> =
+  fold(path, [x], |acc: List<Int>, y: Int| push(acc, y))
+
+// The chain from the root package down to `wanted`, as package indices. `seen` prunes a package
+// whose own reachability was already explored on this walk; the closure is acyclic (`E0134`), so a
+// package that was explored once need not be explored again.
+fn chain(pkgs: List<Pkg>, start: Int, wanted: Int, seen: List<Int>) -> Option<List<Int>> =
+  if start == wanted { Some([start]) }
+  else if held(seen, start) { None } else {
+    let seen = push(seen, start);
+    match searching(pkgs, at(pkgs, start).deps, wanted, seen) {
+      None -> None,
+      Some(path) -> Some(prepended(path, start)),
+    }
+  }
+
+fn searching(
+  pkgs: List<Pkg>,
+  names: List<Bytes>,
+  wanted: Int,
+  seen: List<Int>,
+) -> Option<List<Int>> =
+  match names {
+    [] -> None,
+    [name, ..rest] -> match index_of(pkgs, name) {
+      None -> searching(pkgs, rest, wanted, seen),
+      Some(j) -> match chain(pkgs, j, wanted, seen) {
+        Some(path) -> Some(path),
+        None -> searching(pkgs, rest, wanted, seen),
+      },
+    },
+  }
+
+// --- The answer -------------------------------------------------------------------
+
+fn pin_of(pins: List<Pinned>, name: String) -> Option<Pinned> =
+  fold(pins, None, |found: Option<Pinned>, p: Pinned|
+    match found { Some(_) -> found, None -> if p.name == name { Some(p) } else { None } })
+
+fn names_of(pkgs: List<Pkg>, path: List<Int>) -> List<String> =
+  map(path, |i: Int| string_of_bytes_lossy(at(pkgs, i).prefix))
+
+fn json_of(names: List<String>, pins: List<Pinned>, name: String, root: Bool, code: Int) -> Json = {
+  let pin = pin_of(pins, name);
+  object([
+    { key: "command", value: Str("why") },
+    { key: "ok", value: Bool(code == ok_code()) },
+    { key: "exit_code", value: Number(decimal_of_int(code)) },
+    { key: "package", value: Str(name) },
+    { key: "root", value: Bool(root) },
+    { key: "path", value: Array(map(names, |n: String| Str(n))) },
+    { key: "version", value: match pin { Some(p) -> Str(p.version), None -> Null } },
+    { key: "digest", value: match pin { Some(p) -> Str(p.digest), None -> Null } },
+  ])
+}
+
+// What a person reads: the path, then what the closure pinned for the package it ends at.
+fn why_lines(names: List<String>, pins: List<Pinned>) -> List<String> = {
+  let last = match list_at(names, len(names) - 1) { Some(n) -> n, None -> "" };
+  let path = [ind() ++ joined(names, " -> ")];
+  match pin_of(pins, last) {
+    None -> path,
+    Some(p) -> push(path, ind() ++ "  " ++ p.version ++ " · " ++ p.digest),
+  }
+}
+
+pub fn run(
+  flags: Flags,
+) -> Answer / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf]} = {
+  let s: Style = style_of(flags);
+  let loaded: Program = load_program(flags.paths);
+  match loaded.whole {
+    None -> refused(s, "why", loaded.diags, loaded.places),
+    Some(w) -> {
+      let query = flags.query;
+      match index_of(w.packages, bytes_of_string(query)) {
+        None -> reported(s, "why", [unknown(query)], loaded.places),
+        Some(i) -> {
+          let path = chain(w.packages, 0, i, []);
+          match path {
+            None -> reported(s, "why", [unknown(query)], loaded.places),
+            Some(indices) -> {
+              let names = names_of(w.packages, indices);
+              {
+                json: json_of(names, from_front(w.pins), query, i == 0, ok_code()),
+                lines: if flags.json { [] }
+                else if i == 0 { [ind() ++ "this is the root package: the project's own sources"] }
+                else { why_lines(names, from_front(w.pins)) },
+                errs: [],
+                code: ok_code(),
+              }
+            },
+          }
+        },
+      }
+    },
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+test "a why answer is the path from the root, then what the closure pinned" {
+  let names = ["app", "left", "shared"];
+  let pins = [{ name: "shared", version: "0.3.0", digest: "b3:ab" }];
+  assert_eq(why_lines(names, pins), ["   app -> left -> shared", "     0.3.0 · b3:ab"]);
+  assert_eq(why_lines(["app"], []), ["   app"])
+}
+
+test "the chain is the declared path, and a package nothing reaches has none" {
+  let pkgs: List<Pkg> = [
+    { prefix: b"app", deps: [b"left", b"right"] },
+    { prefix: b"left", deps: [b"shared"] },
+    { prefix: b"right", deps: [] },
+    { prefix: b"shared", deps: [] },
+  ];
+  assert_eq(chain(pkgs, 0, 3, []), Some([0, 1, 3]));
+  assert_eq(chain(pkgs, 0, 2, []), Some([0, 2]));
+  assert_eq(chain(pkgs, 0, 0, []), Some([0]));
+  assert_eq(chain(pkgs, 1, 2, []), None)
+}
+
+test "the json answer carries the path, the pin, and whether it is the root" {
+  let text = to_string(
+    json_of(
+      ["app", "lib"],
+      [{ name: "lib", version: "0.1.0", digest: "b3:1f" }],
+      "lib",
+      false,
+      ok_code(),
+    ),
+  );
+  assert(string_contains(text, "\"command\":\"why\""));
+  assert(string_contains(text, "\"path\":[\"app\",\"lib\"]"));
+  assert(string_contains(text, "\"version\":\"0.1.0\""));
+  assert(string_contains(text, "\"digest\":\"b3:1f\""));
+  assert(string_contains(text, "\"root\":false"))
+}

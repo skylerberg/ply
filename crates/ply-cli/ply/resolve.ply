@@ -1,0 +1,135 @@
+// `ply resolve` — write the lockfile from the manifest closure. This is the deliberate act that
+// accepts a dependency whose sources moved: a build refuses one (`E0138`) and points here, and what
+// this writes is the closure it just read, so a lock can only ever describe a closure that was
+// loaded.
+
+import args (Flags, style_of)
+import lock (Lock, Pinned, from_front, path_of, text)
+import paths (Resolved, here)
+import program (Program, load_program)
+import report (Answer, ind, ok_code, count_of, refused, reported)
+import style (Style, bold, green, plain)
+import compiler.resolve (Diag, diag1)
+import std.fs (fs)
+import std.json (Json, Array, Bool, Number, Str, object, to_string)
+
+// The root the command was pointed at, as the resolved path the lock is written under.
+fn root_of(flags: Flags) -> Resolved =
+  match list_at(flags.paths, 0) { Some(r) -> r, None -> here() }
+
+fn outside() -> Int = 4294967295
+
+fn unwritable(path: String) -> Diag =
+  diag1(
+    b"E0502",
+    outside(),
+    { start: 0, end: 0 },
+    bytes_of_string("could not write `" ++ path ++ "`"),
+    b"the lockfile was not written",
+    [b"check the directory's permissions, or point `ply resolve` at another project"],
+  )
+
+fn written(
+  r: Resolved,
+  path: String,
+  body: Bytes,
+) -> Bool / {fs.write_file[cwd], fs.write_file[abs]} =
+  if r.label == "cwd" { fs.write_file[cwd](path, body) } else { fs.write_file[abs](path, body) }
+
+fn one(p: Pinned) -> String = p.name ++ " " ++ p.version ++ " · " ++ p.digest
+
+// The head names the lock and how many packages it pins. `--json` prints the object instead.
+fn lines(s: Style, pins: List<Pinned>, path: String) -> List<String> =
+  [ind() ++ green(s, "resolved") ++ " " ++ count_of(len(pins), "package") ++ " · " ++ path]
+
+fn json_of(pins: List<Pinned>, path: String, code: Int, wrote: Bool) -> Json =
+  object([
+    { key: "command", value: Str("resolve") },
+    { key: "ok", value: Bool(code == ok_code()) },
+    { key: "exit_code", value: Number(decimal_of_int(code)) },
+    { key: "lockfile", value: Str(path) },
+    { key: "written", value: Bool(wrote) },
+    {
+      key: "packages",
+      value: Array(
+        map(pins, |p: Pinned|
+          object([
+            { key: "name", value: Str(p.name) },
+            { key: "version", value: Str(p.version) },
+            { key: "digest", value: Str(p.digest) },
+          ])),
+      ),
+    },
+  ])
+
+// One line per package under the head: what the lock records, written down where a person can read
+// it without opening the file.
+fn answered(
+  s: Style,
+  pins: List<Pinned>,
+  path: String,
+  code: Int,
+  wrote: Bool,
+  more: Bool,
+) -> Answer = {
+  let body: List<String> = map(pins, |p: Pinned| ind() ++ "  " ++ one(p));
+  {
+    json: json_of(pins, path, code, wrote),
+    lines: append_lines(lines(s, pins, path), if more { body } else { [] }),
+    errs: [],
+    code: code,
+  }
+}
+
+fn append_lines(a: List<String>, b: List<String>) -> List<String> =
+  fold(b, a, |acc: List<String>, x: String| push(acc, x))
+
+pub fn run(
+  flags: Flags,
+) -> Answer / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs]} = {
+  let s = style_of(flags);
+  let r = root_of(flags);
+  let loaded: Program = load_program(flags.paths);
+  match loaded.whole {
+    None -> refused(s, "resolve", loaded.diags, loaded.places),
+    Some(w) -> {
+      let pins = from_front(w.pins);
+      let path = path_of(r);
+      let body = bytes_of_string(text(None, pins));
+      if !written(r, path, body) { reported(s, "resolve", [unwritable(path)], loaded.places) }
+      else { answered(s, pins, path, ok_code(), true, !flags.json) }
+    },
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_pin(name: String, version: String, digest: String) -> Pinned =
+  { name: name, version: version, digest: digest }
+
+test "a resolve names what it pinned, one line per package" {
+  let pins = [a_pin("lib", "0.1.0", "b3:1f2e3d4c5b6a"), a_pin("base", "0.0.1", "b3:99aa")];
+  let answer = answered(plain(), pins, "app/ply.lock", ok_code(), true, true);
+  assert_eq(answer.code, 0);
+  assert_eq(answer.lines, [
+    "   resolved 2 packages · app/ply.lock",
+    "     lib 0.1.0 · b3:1f2e3d4c5b6a",
+    "     base 0.0.1 · b3:99aa",
+  ])
+}
+
+test "the json answer carries every pin, and `--json` prints no lines" {
+  let pins = [a_pin("lib", "0.1.0", "b3:1f2e3d4c5b6a")];
+  let text = to_string(json_of(pins, "app/ply.lock", ok_code(), true));
+  assert(string_contains(text, "\"command\":\"resolve\""));
+  assert(string_contains(text, "\"lockfile\":\"app/ply.lock\""));
+  assert(string_contains(text, "\"written\":true"));
+  assert(string_contains(text, "\"name\":\"lib\""));
+  assert(string_contains(text, "\"digest\":\"b3:1f2e3d4c5b6a\""));
+  assert_eq(lines(plain(), pins, "app/ply.lock"), ["   resolved 1 package · app/ply.lock"])
+}
+
+test "a project with no dependencies resolves to an empty lock" {
+  let answer = answered(plain(), [], "ply.lock", ok_code(), true, false);
+  assert_eq(answer.lines, ["   resolved 0 packages · ply.lock"])
+}

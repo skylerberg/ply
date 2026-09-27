@@ -262,10 +262,12 @@ modules it contributed, sorted by name. A package is pinned by *what* it is and
 never by where it was found, so a moved checkout keeps its pin. A build verifies
 the lock before it writes an artifact — a dependency whose sources moved since it
 was pinned is `E0138`, and a lock this `ply` cannot read is `E0139` — and writes
-one when the closure it resolved is not the one on file. Deleting the lockfile,
-or one package's entry in it, pins what is on disk now: that is how a change to a
-dependency is accepted, deliberately. `Git` and `Registry` sources arrive with
-resolution.
+one when the closure it resolved is not the one on file. `ply resolve` pins what is on
+disk now, and is how a change to a dependency is accepted, deliberately —
+deleting the lockfile, or one package's entry in it, does the same. `ply why
+NAME` says how a package got here: the path from the root package to it through
+the packages that declare it, then the version and digest it resolved to. `Git`
+and `Registry` sources arrive with resolution.
 
 ## 4. Types
 
@@ -1780,6 +1782,8 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change |
 | `ply show NAME [path]` | one `fn` or `type` as its file holds it: the `//` lines above it, `pub`, the body, and a comment ending its last line; `--json` adds the byte range |
 | `ply replace NAME [path]` | rewrite one `fn` or `type` from `--with FILE` or stdin, formatted, every other byte of the file kept; refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash moves; `--check` writes nothing |
+| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest |
+| `ply why NAME [path]` | why a package is in the closure: the path from the root package to it, then the version and digest the closure pins |
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, test and law whose closure reaches it |
@@ -1788,9 +1792,9 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 
 `ply new`, `ply check`, `ply fmt`, `ply defs`, `ply hash`, `ply doc`,
-`ply show`, `ply replace`, `ply callers`, `ply std`, `ply explain`, `ply hosts`,
-`ply cache` and `ply bootstrap` are one Ply program (`crates/ply-cli/ply`,
-entered at `ply.main`). The program itself parses the command line, prints help and
+`ply show`, `ply replace`, `ply resolve`, `ply why`, `ply callers`, `ply std`,
+`ply explain`, `ply hosts`, `ply cache` and `ply bootstrap` are one Ply program
+(`crates/ply-cli/ply`, entered at `ply.main`). The program itself parses the command line, prints help and
 refusals, and resolves the paths it is given against the working directory — a
 relative path reads under it, an absolute one reads where it points. The binary
 answers with the code the program asked to exit with. What a command needs of
