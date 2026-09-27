@@ -25,7 +25,7 @@ fn main() {
         }
     };
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
-    // The launcher's own flag, taken out before the program parses the line.
+    // The launcher's own flags, taken out before the program parses the line.
     let count = match ply_launcher::count::flag(&mut argv) {
         Ok(count) => count,
         Err(why) => {
