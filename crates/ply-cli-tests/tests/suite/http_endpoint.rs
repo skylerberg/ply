@@ -42,11 +42,11 @@ fn replace(source: &str, from: &str, to: &str) -> String {
 /// Kills the server whatever the test does, including panicking out of an assertion.
 struct Server {
     child: Option<Child>,
-    addr: SocketAddr,
+    reserved: Reservation,
 }
 
 impl Server {
-    fn start(dir: &std::path::Path, port: u16) -> Server {
+    fn start(dir: &std::path::Path, reserved: Reservation) -> Server {
         let child = process(dir)
             .args(["run", "--host"])
             .stdout(Stdio::piped())
@@ -55,7 +55,7 @@ impl Server {
             .expect("`ply run --host` starts");
         Server {
             child: Some(child),
-            addr: SocketAddr::from(([127, 0, 0, 1], port)),
+            reserved,
         }
     }
 
@@ -64,9 +64,9 @@ impl Server {
     }
 
     fn connect(&mut self) -> TcpStream {
-        let addr = self.addr;
-        connect_when_ready(self.running(), addr, STARTUP, |_| true)
-            .unwrap_or_else(|why| panic!("{why}"))
+        let Server { child, reserved } = self;
+        let child = child.as_mut().expect("the server has not been reaped");
+        connect_when_ready(reserved, child, STARTUP, |_| true).unwrap_or_else(|why| panic!("{why}"))
     }
 
     /// Asked for a fixed number of connections and given them, the server must return on its own.
@@ -128,11 +128,9 @@ fn exchange(mut stream: TcpStream, request: &[u8]) -> String {
 #[test]
 fn a_request_over_a_real_socket_is_answered_by_a_ply_program() {
     let reserved = Reservation::take();
-    let port = reserved.port();
-    let dir = project(port, 1);
-    let mut server = Server::start(dir.path(), port);
+    let dir = project(reserved.port(), 1);
+    let mut server = Server::start(dir.path(), reserved);
     let stream = server.connect();
-    reserved.bound();
 
     let response = exchange(
         stream,
@@ -162,12 +160,10 @@ fn a_request_over_a_real_socket_is_answered_by_a_ply_program() {
 #[test]
 fn a_malformed_request_is_answered_400_and_the_server_survives_it() {
     let reserved = Reservation::take();
-    let port = reserved.port();
-    let dir = project(port, 2);
-    let mut server = Server::start(dir.path(), port);
+    let dir = project(reserved.port(), 2);
+    let mut server = Server::start(dir.path(), reserved);
 
     let first = server.connect();
-    reserved.bound();
     let response = exchange(first, b"GET /\r\n\r\n");
     assert!(
         response.starts_with("HTTP/1.1 400 Bad Request\r\n"),
@@ -191,11 +187,9 @@ fn a_malformed_request_is_answered_400_and_the_server_survives_it() {
 #[test]
 fn a_request_split_across_writes_is_read_to_its_terminator() {
     let reserved = Reservation::take();
-    let port = reserved.port();
-    let dir = project(port, 1);
-    let mut server = Server::start(dir.path(), port);
+    let dir = project(reserved.port(), 1);
+    let mut server = Server::start(dir.path(), reserved);
     let mut stream = server.connect();
-    reserved.bound();
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
