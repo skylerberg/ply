@@ -937,6 +937,12 @@ pub struct HybridInput {
     pub runnable: Option<(Mixture, ply_store::body::StoredBody)>,
     pub signature: Signature,
     pub seed: Option<Seed>,
+    /// What the classifier could not tell apart, and whether the test's own hash was one of them:
+    /// the two sentences a verdict adds are the caller's to add now.
+    pub classified: usize,
+    pub test_classified: bool,
+    /// The reason to give when there is nothing to try, in place of a search that did not happen.
+    pub absent: crate::bisect::Skipped,
 }
 
 /// `bisect` false leaves the search to the caller: the delta and the gate are still computed, and
@@ -1013,6 +1019,10 @@ pub fn diagnose_failures(
         let seed = failure.seed.clone();
         // A mixture is runnable when the baseline's closure is on record, every body it needs is
         // available, and the test itself reached the world at all.
+        let absent = match (&mixture, complete) {
+            (Some(_), false) => Skipped::NoBodies,
+            _ => Skipped::NoHybrids,
+        };
         let runnable = match mixture {
             Some(mixture) if complete && !failure.host => test_body.map(|test| (mixture, test)),
             _ => None,
@@ -1066,6 +1076,7 @@ pub fn diagnose_failures(
                 }
                 None => &mut unknown2,
             };
+            let mut differences: Option<crate::Diff> = None;
             if let Some(baseline) = baseline.as_ref() {
                 let regression = Regression {
                     key: &failure.key,
@@ -1073,7 +1084,10 @@ pub fn diagnose_failures(
                     baseline,
                     hashes,
                 };
-                delta = Some(diff(&regression, classify2, &edges).delta);
+                differences = Some(diff(&regression, classify2, &edges));
+            }
+            if let Some(d) = &differences {
+                delta = Some(d.delta.clone());
             }
             if let Some(change) = delta.clone() {
                 hybrids.per_failure[slot] = Some(HybridInput {
@@ -1085,6 +1099,15 @@ pub fn diagnose_failures(
                     },
                     signature: Signature::of(&failure.diagnostic),
                     seed: seed.clone(),
+                    classified: differences
+                        .as_ref()
+                        .map(|d| d.unclassified.len())
+                        .unwrap_or(0),
+                    test_classified: differences
+                        .as_ref()
+                        .map(|d| !d.test_unclassified)
+                        .unwrap_or(true),
+                    absent,
                 });
             }
             if let Some(d) = &delta {
