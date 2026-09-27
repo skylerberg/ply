@@ -156,7 +156,7 @@ fn a_save_made_after_the_load_is_a_change_and_not_the_baseline() {
 fn a_held_unit_is_dropped_when_a_test_moves() {
     struct Nothing;
     impl ply_eval::Provider for Nothing {
-        fn attach(&'static self, _: &ply_eval::BackendSpec) -> std::rc::Rc<dyn ply_eval::Compiled> {
+        fn attach(&'static self) -> std::rc::Rc<dyn ply_eval::Compiled> {
             unreachable!("this provider is never attached")
         }
         fn name(&self) -> &'static str {
@@ -173,7 +173,6 @@ fn a_held_unit_is_dropped_when_a_test_moves() {
         }
     }
     let provider: &'static dyn ply_eval::Provider = Box::leak(Box::new(Nothing));
-    let spec = ply_eval::BackendSpec::default();
     let mut warm = Warm::default();
     let mut hashes = HashOutput::default();
     hashes.defs.insert(Symbol::new("m.f"), DefHash([1; 32]));
@@ -184,10 +183,10 @@ fn a_held_unit_is_dropped_when_a_test_moves() {
             hashes: hashes.clone(),
             ..Default::default()
         };
-        warm.unit_for(&spec, &front, &ply_span::SourceMap::new())
+        warm.unit_for(&front, &ply_span::SourceMap::new())
     };
 
-    warm.keep_unit(&spec, &hashes, provider);
+    warm.keep_unit(&hashes, provider);
     assert!(
         unit_for(&warm, &hashes).is_some(),
         "nothing moved, so the unit still answers for this program"

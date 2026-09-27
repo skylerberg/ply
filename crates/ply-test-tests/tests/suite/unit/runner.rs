@@ -72,28 +72,17 @@ impl Program {
     }
 
     fn select_under(&self, store: &Store, plan: &Plan) -> Selection {
-        select(
-            &self.check,
-            &self.hashes,
-            store,
-            plan,
-            &ply_test::Engine::Evaluator,
-        )
+        select(&self.check, &self.hashes, store, plan)
     }
 
     /// Runs on the compiled C tier; `Unit::over_front` leaks a `&'static Unit`.
     fn run(&self, selection: &Selection, store: &mut Store) -> ply_test::RunReport {
         let unit = ply_codegen::Unit::over_front(&self.port, self.texts())
             .expect("this host has a C compiler");
-        let spec = ply_eval::BackendSpec {
-            kind: ply_eval::BackendKind::C,
-        };
-        let executor = TierExecutor(
-            InterpExecutor::new(&self.port)
-                .with_backend(unit, spec)
-                .with_hosts(Hosting::hermetic())
-                .with_search(Search::of(selection)),
-        );
+        let executor = InterpExecutor::new(&self.port)
+            .with_backend(unit)
+            .with_hosts(Hosting::hermetic())
+            .with_search(Search::of(selection));
         run_with(selection, &self.check, &self.hashes, store, &executor)
     }
 
@@ -103,41 +92,6 @@ impl Program {
             .get(&Symbol::new(name))
             .copied()
             .expect("a definition by that name")
-    }
-}
-
-/// Reports `Engine::Evaluator`, the namespace this file's caching assertions read by bare hash.
-struct TierExecutor<'a>(InterpExecutor<'a>);
-
-impl<'a> Executor for TierExecutor<'a> {
-    type Worker = ply_test::Worker<'a>;
-
-    fn worker(&self) -> Self::Worker {
-        self.0.worker()
-    }
-
-    fn execute(&self, worker: &mut Self::Worker, index: usize) -> Result<(), Diagnostic> {
-        self.0.execute(worker, index)
-    }
-
-    fn engine(&self) -> ply_test::Engine {
-        ply_test::Engine::Evaluator
-    }
-
-    fn exploration(&self, worker: &Self::Worker) -> Option<ply_eval::Exploration> {
-        self.0.exploration(worker)
-    }
-
-    fn host_use(&self, worker: &Self::Worker) -> Option<ply_eval::host::HostUse> {
-        self.0.host_use(worker)
-    }
-
-    fn backend_use(&self, worker: &Self::Worker) -> Option<ply_test::BackendUse> {
-        self.0.backend_use(worker)
-    }
-
-    fn teardown(&self, worker: &mut Self::Worker) -> Vec<Diagnostic> {
-        self.0.teardown(worker)
     }
 }
 
@@ -2027,11 +1981,7 @@ fn a_dpor_search_never_narrows_and_writes_no_per_root_key() {
     for root in &plan.roots {
         assert!(
             store
-                .get(ply_test::seed_key(
-                    hash,
-                    &Seed::root(*root),
-                    &ply_test::Engine::Evaluator
-                ))
+                .get(ply_test::seed_key(hash, &Seed::root(*root),))
                 .is_none(),
             "root {root} is not a standalone claim under dpor"
         );
@@ -2113,11 +2063,7 @@ fn a_simulated_failure_is_never_cached_under_any_key() {
     for root in &plan.roots {
         assert!(
             store
-                .get(ply_test::seed_key(
-                    hash,
-                    &Seed::root(*root),
-                    &ply_test::Engine::Evaluator
-                ))
+                .get(ply_test::seed_key(hash, &Seed::root(*root),))
                 .is_none()
         );
     }

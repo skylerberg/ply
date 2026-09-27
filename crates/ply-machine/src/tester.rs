@@ -12,8 +12,8 @@ use crate::load::{Loaded, load, project_root};
 use crate::options::When;
 use crate::payload::{count, diag_value, diags_value, json, option, places_value, record, strings};
 use crate::support::{
-    backend_spec, build_backend_over, build_pool, describe_schema, enter_constant, module_texts,
-    once_each, select_profile,
+    build_backend_over, build_pool, describe_schema, enter_constant, module_texts, once_each,
+    select_profile,
 };
 use ply_eval::Value as PlyValue;
 use ply_eval::host::{
@@ -68,7 +68,6 @@ pub struct TestOptions {
     pub mutate_budget: usize,
     /// This command's `--trace` is the definition trace, never the record sink.
     pub trace: When,
-    pub backend: Option<String>,
     pub profile: String,
     pub watch: bool,
     pub host: bool,
@@ -364,9 +363,8 @@ fn iterate(
 
     // Part of a simulated test's cache key, so decided before selection.
     let search = crate::simulation::plan(&args.simulation);
-    let engine = ply_test::Engine::Evaluator;
     let hashes = loaded.hashes.clone();
-    let selected = ply_test::select(&loaded.check, &hashes, &cache.store, &search, &engine);
+    let selected = ply_test::select(&loaded.check, &hashes, &cache.store, &search);
     let plan = Plan::new(selected, &loaded.check, args.filter.as_deref(), args.std);
 
     if let Some(err) = crate::costs::broken_promises(&loaded) {
@@ -384,7 +382,7 @@ fn iterate(
         return;
     };
     if bind(
-        args, cache, warm, &loaded, &hashes, plan, &search, engine, told, asked,
+        args, cache, warm, &loaded, &hashes, plan, &search, told, asked,
     ) {
         // Only over a report that was written: an iteration that returned early leaves nothing held.
         warm.keep(loaded);
@@ -401,7 +399,6 @@ fn bind(
     hashes: &HashOutput,
     plan: Plan,
     search: &ply_eval::Plan,
-    engine: ply_test::Engine,
     told: &mpsc::Sender<Step>,
     asked: &mpsc::Receiver<Go>,
 ) -> bool {
@@ -412,11 +409,9 @@ fn bind(
         }))));
         false
     };
-    let backend =
-        match select_profile(&args.profile).and_then(|()| backend_spec(args.backend.as_ref())) {
-            Ok(spec) => spec,
-            Err(diagnostic) => return refuse(vec![diagnostic]),
-        };
+    if let Err(diagnostic) = select_profile(&args.profile) {
+        return refuse(vec![diagnostic]);
+    };
     // Before anything runs, so no test touches a resource the program does not declare.
     let db = match args.db.resolve(args.host) {
         Ok(db) => db,
@@ -433,24 +428,25 @@ fn bind(
     let nothing_to_run = plan.selection.to_run.is_empty();
     let schema_named =
         args.config.schema.is_some() || db.as_ref().is_some_and(|c| c.schema.is_some());
-    let wanted = backend.as_ref().filter(|_| !nothing_to_run || schema_named);
+    let wanted = !nothing_to_run || schema_named;
     // The last iteration's unit, moved to this layout, when no definition's text changed.
-    let held_unit = wanted.and_then(|spec| warm.unit_for(spec, &loaded.front, &loaded.sources));
-    let unit = match wanted.filter(|_| held_unit.is_none()).map(|spec| {
-        build_backend_over(
-            spec,
-            &loaded.front,
-            module_texts(&loaded.check, &loaded.sources),
-        )
-    }) {
-        None => held_unit,
-        Some(Ok(provider)) => {
-            if let Some(spec) = backend.as_ref() {
-                warm.keep_unit(spec, hashes, provider);
+    let held_unit = if wanted {
+        warm.unit_for(&loaded.front, &loaded.sources)
+    } else {
+        None
+    };
+    let unit = if !wanted {
+        None
+    } else if let Some(held) = held_unit {
+        Some(held)
+    } else {
+        match build_backend_over(&loaded.front, module_texts(&loaded.check, &loaded.sources)) {
+            Ok(provider) => {
+                warm.keep_unit(hashes, provider);
+                Some(provider)
             }
-            Some(provider)
+            Err(diagnostic) => return refuse(vec![diagnostic]),
         }
-        Some(Err(diagnostic)) => return refuse(vec![diagnostic]),
     };
     let constant = |name: &str| enter_constant(unit, name);
     // Before binding, so a missing required key fails before any host test runs.
@@ -486,9 +482,7 @@ fn bind(
         hashes,
         &plan,
         search,
-        &engine,
         &hosts,
-        backend,
         unit.filter(|_| !nothing_to_run),
         config_warnings,
     );
@@ -504,9 +498,7 @@ fn execute(
     hashes: &HashOutput,
     plan: &Plan,
     search: &ply_eval::Plan,
-    engine: &ply_test::Engine,
     hosts: &Hosts,
-    backend: Option<ply_eval::BackendSpec>,
     provider: Option<&'static dyn ply_eval::Provider>,
     mut warnings: Vec<Diagnostic>,
 ) -> Over {
@@ -528,8 +520,8 @@ fn execute(
                 let mut executor = ply_test::InterpExecutor::new(&loaded.front)
                     .with_search(simulation.clone())
                     .with_hosts(hosting(hosts, &runtime));
-                if let (Some(provider), Some(spec)) = (provider, backend.clone()) {
-                    executor = executor.with_backend(provider, spec);
+                if let Some(provider) = provider {
+                    executor = executor.with_backend(provider);
                 }
                 ply_test::run_with(
                     &plan.selection,
@@ -554,16 +546,14 @@ fn execute(
             let escapes = hosts_escapes(&report, &loaded.check, hosts);
             let ok = report.is_success() && escapes.is_empty();
             // Only over a green program: a survivor of a red one says nothing.
-            let mutants = match (&args.mutate, ok, &backend) {
-                (Some(query), true, Some(spec)) => match crate::mutate::targets(loaded, query) {
+            let mutants = match (&args.mutate, ok) {
+                (Some(query), true) => match crate::mutate::targets(loaded, query) {
                     Ok(targets) => Some(Ok(crate::mutate::run(
                         loaded,
                         hashes,
                         &targets,
                         args.mutate_budget,
                         search,
-                        engine,
-                        spec,
                         hosts,
                         &runtime,
                     ))),
@@ -579,8 +569,7 @@ fn execute(
     warnings.extend(cache.store.take_warnings());
 
     let counts = counts(plan, &loaded.check, hosts);
-    let mut escapes = backend_escapes(&report, engine);
-    escapes.extend(hosts_escapes(&report, &loaded.check, hosts));
+    let mut escapes = hosts_escapes(&report, &loaded.check, hosts);
     if let Some(unbuilt) = unbuilt_backend(provider) {
         escapes.push(unbuilt);
     }
@@ -610,9 +599,7 @@ fn execute(
             .collect(),
         counts,
         workers,
-        backend: backend
-            .as_ref()
-            .map(|spec| backend_view(spec, provider, &report, args)),
+        backend: Some(backend_view(provider, &report)),
         failures: report
             .failures
             .iter()
@@ -878,36 +865,6 @@ pub fn hosts_escapes(report: &RunReport, check: &CheckOutput, hosts: &Hosts) -> 
         .collect()
 }
 
-/// Tests that entered native code and whose passes were cached anyway.
-pub fn backend_escapes(report: &RunReport, selected_under: &ply_test::Engine) -> Vec<Diagnostic> {
-    if &report.engine == selected_under {
-        return Vec::new();
-    }
-    // A run that selected nothing builds no backend and names the evaluator; it wrote nothing,
-    // so it cannot have broken the invariant.
-    if !report
-        .results
-        .iter()
-        .any(|r| r.recorded.as_ref().is_some_and(Record::is_written))
-    {
-        return Vec::new();
-    }
-    vec![
-        Diagnostic::error(
-            codes::INTERNAL_ERROR,
-            format!(
-                "this run selected against `{}` and recorded under `{}`",
-                selected_under.label(),
-                report.engine.label()
-            ),
-        )
-        .note("a `Pass` is a claim about the engine that earned it, so the two must name the same one")
-        .note("the command names the engine before it builds a provider, because selection decides whether building one is worth anything")
-        .note("run `ply cache clear`: this run skipped what one engine proved and recorded it as another's")
-        .note("this is Ply's fault — the command and `Executor::engine` disagree")
-    ]
-}
-
 /// An unbuilt backend declines every call, which would make a green run vacuous.
 fn unbuilt_backend(provider: Option<&'static dyn ply_eval::Provider>) -> Option<Diagnostic> {
     let unbuilt = provider.map_or(0, ply_eval::Provider::unbuilt);
@@ -1004,7 +961,6 @@ struct Over {
 
 struct BackendView {
     name: String,
-    spec: Option<String>,
     fragment: usize,
     offered: u64,
     entered: u64,
@@ -1198,18 +1154,13 @@ fn found(
 }
 
 fn backend_view(
-    spec: &ply_eval::BackendSpec,
     provider: Option<&'static dyn ply_eval::Provider>,
     report: &RunReport,
-    args: &TestOptions,
 ) -> BackendView {
     let offers = provider.map_or_else(Default::default, ply_eval::Provider::offers);
     let compiled = provider.and_then(ply_eval::Provider::compilation);
     BackendView {
-        name: provider
-            .map_or(spec.kind.as_str(), ply_eval::Provider::name)
-            .to_string(),
-        spec: args.backend.clone(),
+        name: provider.map_or("c", ply_eval::Provider::name).to_string(),
         fragment: provider.map_or(0, ply_eval::Provider::len),
         offered: offers.offered,
         entered: report
@@ -1715,7 +1666,6 @@ fn ran_value(over: &Over) -> PlyValue {
             option(over.backend.as_ref().map(|b| {
                 record(vec![
                     ("name", PlyValue::str(&b.name)),
-                    ("spec", option(b.spec.as_deref().map(PlyValue::str))),
                     ("fragment", count(b.fragment)),
                     ("offered", tally(b.offered)),
                     ("entered", tally(b.entered)),
@@ -1931,7 +1881,6 @@ pub fn test_options_of(v: &PlyValue, span: Span) -> Result<TestOptions, Diagnost
         mutate: opt_str_at(v, "mutate", span)?,
         mutate_budget: int_at("mutate_budget")? as usize,
         trace: when_at("trace")?,
-        backend: opt_str_at(v, "backend", span)?,
         profile: str_at("profile")?,
         watch: bool_at("watch")?,
         host: bool_at("host")?,
@@ -2006,7 +1955,6 @@ impl Default for TestOptions {
             mutate: None,
             mutate_budget: 64,
             trace: When::Auto,
-            backend: None,
             profile: "development".to_string(),
             watch: false,
             host: false,

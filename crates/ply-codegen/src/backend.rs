@@ -191,7 +191,7 @@ impl Unit {
 }
 
 impl Provider for Unit {
-    fn attach(&'static self, _spec: &ply_eval::BackendSpec) -> Rc<dyn ply_eval::Compiled> {
+    fn attach(&'static self) -> Rc<dyn ply_eval::Compiled> {
         if self.members.is_empty() {
             return Rc::new(Absent { unit: self });
         }

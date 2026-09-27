@@ -1,6 +1,4 @@
-use ply_eval::{Exploration, host::HostUse};
 use ply_span::{Diagnostic, SourceId};
-use ply_test::{BackendUse, Engine, Executor, InterpExecutor, Worker};
 use ply_ty::{CheckOutput, HashOutput, ModuleName};
 use std::collections::HashMap;
 
@@ -72,47 +70,8 @@ impl Compiled {
     }
 
     /// Leaks the `&'static` unit. A bare machine holds no evaluator, so every run needs this.
-    pub fn tier(&self) -> (&'static ply_codegen::Unit, ply_eval::BackendSpec) {
-        let unit = ply_codegen::Unit::over_front(&self.port, self.texts.clone())
-            .expect("this host has a C compiler");
-        let spec = ply_eval::BackendSpec {
-            kind: ply_eval::BackendKind::C,
-        };
-        (unit, spec)
-    }
-}
-
-/// Reports `Engine::Evaluator`, the cache namespace every `select` and `store.get` here reads.
-pub struct TierExecutor<'a>(pub InterpExecutor<'a>);
-
-impl<'a> Executor for TierExecutor<'a> {
-    type Worker = Worker<'a>;
-
-    fn worker(&self) -> Self::Worker {
-        self.0.worker()
-    }
-
-    fn execute(&self, worker: &mut Self::Worker, index: usize) -> Result<(), Diagnostic> {
-        self.0.execute(worker, index)
-    }
-
-    fn engine(&self) -> Engine {
-        Engine::Evaluator
-    }
-
-    fn exploration(&self, worker: &Self::Worker) -> Option<Exploration> {
-        self.0.exploration(worker)
-    }
-
-    fn host_use(&self, worker: &Self::Worker) -> Option<HostUse> {
-        self.0.host_use(worker)
-    }
-
-    fn backend_use(&self, worker: &Self::Worker) -> Option<BackendUse> {
-        self.0.backend_use(worker)
-    }
-
-    fn teardown(&self, worker: &mut Self::Worker) -> Vec<Diagnostic> {
-        self.0.teardown(worker)
+    pub fn tier(&self) -> &'static ply_codegen::Unit {
+        ply_codegen::Unit::over_front(&self.port, self.texts.clone())
+            .expect("this host has a C compiler")
     }
 }

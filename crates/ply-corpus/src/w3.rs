@@ -333,10 +333,7 @@ impl Loaded {
             ply_codegen::Unit::over_front(&self.port, self.texts.clone())
                 .expect("this host has a C compiler")
         });
-        let spec = ply_eval::BackendSpec {
-            kind: ply_eval::BackendKind::C,
-        };
-        machine.set_compiled(unit.attach(&spec));
+        machine.set_compiled(unit.attach());
         machine
     }
 

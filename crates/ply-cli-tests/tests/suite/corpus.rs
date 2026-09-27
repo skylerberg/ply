@@ -70,7 +70,7 @@ fn entered(report: &Value, what: &str) {
 #[test]
 fn the_code_generator_runs_examples_green_and_enters_the_seam() {
     let out = ply(&repo())
-        .args(["test", "examples", "--backend", "c", "--json"])
+        .args(["test", "examples", "--json"])
         .output()
         .unwrap();
     let report = json(&out);
@@ -90,7 +90,7 @@ fn the_ply_emitter_produces_the_unit_and_examples_runs_green() {
     let out = ply(&repo())
         .env("PLY_C_CACHE", cache.path())
         .env("PLY_C_REFUSALS", "1")
-        .args(["test", "examples", "--backend", "c", "--no-cache", "--json"])
+        .args(["test", "examples", "--no-cache", "--json"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -115,7 +115,7 @@ fn the_ply_emitter_produces_the_unit_and_examples_runs_green() {
 fn the_compiled_tier_runs_the_compilers_own_tests_as_the_only_engine() {
     let dir = compiler_copy();
     let out = ply(dir.path())
-        .args(["test", ".", "--no-cache", "--backend", "c", "--json"])
+        .args(["test", ".", "--no-cache", "--json"])
         .output()
         .unwrap();
     let report = json(&out);
@@ -144,7 +144,7 @@ test "a long array decodes" {
     )
     .unwrap();
     let out = ply(dir.path())
-        .args(["test", ".", "--no-cache", "--backend", "c", "--json"])
+        .args(["test", ".", "--no-cache", "--json"])
         .output()
         .unwrap();
     let report = json(&out);
@@ -159,7 +159,7 @@ fn the_language_corpus_is_green_on_the_default_tier_and_as_the_only_engine() {
         .assert()
         .success();
     ply(&repo())
-        .args(["test", "tests/lang", "--backend", "c", "--no-cache"])
+        .args(["test", "tests/lang", "--no-cache"])
         .assert()
         .success();
 }
@@ -168,7 +168,7 @@ fn the_language_corpus_is_green_on_the_default_tier_and_as_the_only_engine() {
 fn the_compiled_tier_is_the_only_engine_over_examples_and_the_standard_library() {
     for corpus in ["examples", "crates/ply-std/ply"] {
         ply(&repo())
-            .args(["test", corpus, "--backend", "c", "--no-cache"])
+            .args(["test", corpus, "--no-cache"])
             .assert()
             .success();
     }
@@ -180,7 +180,7 @@ fn the_compiled_tier_judges_the_corpus_specifications() {
         let out = ply(&repo())
             .env("PLY_C_REFUSALS", "1")
             .env("PLY_C_PHASES", "1")
-            .args(["prove", corpus, "--no-cache", "--json", "--backend", "c"])
+            .args(["prove", corpus, "--no-cache", "--json"])
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -227,7 +227,7 @@ fn a_served_example_with_the_tier_holding_its_accept_loop() {
     let mut child = process(dir.path())
         .env("PLY_C_CACHE", dir.path().join("cache"))
         .env("PLY_C_REFUSALS", "1")
-        .args(["--color", "never", "run", "--host", "--backend", "c"])
+        .args(["--color", "never", "run", "--host"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -312,7 +312,7 @@ fn the_c_tier_hashes_a_long_input_consistently() {
     )
     .unwrap();
     let out = ply(dir.path())
-        .args(["test", ".", "--no-cache", "--backend", "c", "--json"])
+        .args(["test", ".", "--no-cache", "--json"])
         .output()
         .unwrap();
     green(&json(&out), "the C tier over a long input");

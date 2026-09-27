@@ -81,9 +81,9 @@ pub struct Offers {
 
 /// One per run, shared by every worker; the only way a shipping command installs a backend.
 pub trait Provider: Send + Sync {
-    fn attach(&'static self, spec: &Spec) -> Rc<dyn Compiled>;
+    fn attach(&'static self) -> Rc<dyn Compiled>;
 
-    /// What `--backend` calls this, for a report a user reads.
+    /// The name a report gives this provider.
     fn name(&self) -> &'static str;
 
     /// How many definitions this provider has a body for.
@@ -117,32 +117,4 @@ pub struct Compilation {
     /// Nanoseconds inside the code generator, summed over every backend built.
     pub codegen_nanos: u64,
     pub units: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Kind {
-    /// `ply_codegen::c`: the program emitted as C and compiled by `cc`.
-    #[default]
-    C,
-}
-
-impl Kind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Kind::C => "c",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Spec {
-    pub kind: Kind,
-}
-
-/// Parses a `--backend` argument.
-pub fn parse(spec: &str) -> Result<Spec, String> {
-    match spec {
-        "c" => Ok(Spec { kind: Kind::C }),
-        _ => Err(format!("unknown backend `{spec}`; the only backend is `c`")),
-    }
 }

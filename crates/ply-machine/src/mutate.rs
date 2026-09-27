@@ -2,7 +2,7 @@ use crate::hosts::{Hosts, hosting};
 use crate::load::Loaded;
 use ply_eval::HostRuntime;
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
-use ply_test::{Engine, RunReport};
+use ply_test::RunReport;
 use ply_ty::{DefInfo, HashOutput};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -285,8 +285,6 @@ pub fn run<F>(
     targets: &[&DefInfo],
     budget: usize,
     search: &ply_eval::sim::Plan,
-    engine: &Engine,
-    backend: &ply_eval::BackendSpec,
     hosts: &Hosts,
     runtime: &Option<F>,
 ) -> Report
@@ -328,8 +326,6 @@ where
             &mutant,
             &reached,
             search,
-            engine,
-            backend,
             hosts,
             runtime,
             &mut scratch.store,
@@ -349,8 +345,6 @@ fn judge<F>(
     mutant: &Mutant,
     reached: &[usize],
     search: &ply_eval::sim::Plan,
-    engine: &Engine,
-    backend: &ply_eval::BackendSpec,
     hosts: &Hosts,
     runtime: &Option<F>,
     store: &mut ply_store::Store,
@@ -366,7 +360,7 @@ where
     let Ok(provider) = ply_codegen::Unit::over_front(&front, texts) else {
         return Verdict::Unresolved("the C backend could not be built");
     };
-    let mut selection = ply_test::select(&front.check, &front.hashes, store, search, engine);
+    let mut selection = ply_test::select(&front.check, &front.hashes, store, search);
     let wanted: BTreeSet<usize> = reached.iter().copied().collect();
     selection.to_run.retain(|i| wanted.contains(i));
     selection
@@ -379,7 +373,7 @@ where
         let executor = ply_test::InterpExecutor::new(&front)
             .with_search(ply_test::Search::of(&selection))
             .with_hosts(hosting(hosts, runtime))
-            .with_backend(provider, backend.clone());
+            .with_backend(provider);
         ply_test::run_with(&selection, &front.check, &front.hashes, store, &executor)
     }));
     match outcome {

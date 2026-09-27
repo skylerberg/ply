@@ -35,7 +35,7 @@ pub use bisect::{
 };
 pub use diagnose::{Evidence, Options, diagnose};
 pub use hybrid::{BodyHybrid, Mixture, Signature};
-pub use key::{Engine, result_key, seed_key, sim_key, writes_seed_keys};
+pub use key::{result_key, seed_key, sim_key, writes_seed_keys};
 pub use region::GroupRegion;
 pub use schedule::{
     AMBIENT, Isolation, Parallelism, REGION_SCOPED, SIM_EFFECT, SIMULATED, contends,
@@ -326,8 +326,6 @@ pub struct RunReport {
     /// Problems with the run itself rather than with any test.
     pub warnings: Vec<Diagnostic>,
     pub simulation: SimSummary,
-    /// Which engine answered, and so whose namespace this run's passes went into.
-    pub engine: Engine,
 }
 
 impl RunReport {
@@ -342,16 +340,6 @@ pub trait Executor: Sync {
     fn worker(&self) -> Self::Worker;
 
     fn execute(&self, worker: &mut Self::Worker, index: usize) -> Result<(), Diagnostic>;
-
-    fn engine(&self) -> Engine {
-        Engine::Evaluator
-    }
-
-    /// Whether a pass may stand as the bisection baseline, which is keyed by test name, so only the
-    /// authoritative evaluator may write one.
-    fn writes_baseline(&self) -> bool {
-        self.engine().is_evaluator()
-    }
 
     /// What the search the last [`Executor::execute`] performed did.
     fn exploration(&self, _worker: &Self::Worker) -> Option<Exploration> {
@@ -432,7 +420,7 @@ pub struct InterpExecutor<'a> {
     fixture: Option<&'a (dyn Fn(&mut TaskRegions) -> Value + Sync)>,
     hosts: Hosting<'a>,
     /// The backend this run installs.
-    backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
+    backend: Option<&'static dyn ply_eval::Provider>,
     search: Search,
 }
 
@@ -530,12 +518,8 @@ impl<'a> InterpExecutor<'a> {
         self
     }
 
-    pub fn with_backend(
-        mut self,
-        provider: &'static dyn ply_eval::Provider,
-        spec: ply_eval::BackendSpec,
-    ) -> Self {
-        self.backend = Some((provider, spec));
+    pub fn with_backend(mut self, provider: &'static dyn ply_eval::Provider) -> Self {
+        self.backend = Some(provider);
         self
     }
 
@@ -558,8 +542,7 @@ impl<'a> InterpExecutor<'a> {
     }
 
     fn backend(&self) -> Option<Rc<dyn ply_eval::Compiled>> {
-        let (provider, spec) = self.backend.as_ref()?;
-        Some(provider.attach(spec))
+        Some(self.backend?.attach())
     }
 
     fn machine(&self, backend: Option<Rc<dyn ply_eval::Compiled>>) -> Box<Machine<'a>> {
@@ -737,15 +720,9 @@ fn test_hash(hashes: &HashOutput, index: usize) -> Option<DefHash> {
     hashes.tests.get(index).copied()
 }
 
-/// What this run must execute, read against `engine`'s own history. `plan` keys seeded tests, so
-/// a selection made against one plan says nothing about another.
-pub fn select(
-    check: &CheckOutput,
-    hashes: &HashOutput,
-    store: &Store,
-    plan: &Plan,
-    engine: &Engine,
-) -> Selection {
+/// What this run must execute. `plan` keys seeded tests, so a selection made against one plan
+/// says nothing about another.
+pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Plan) -> Selection {
     let plan = plan.clone().normalized();
     let total = check.tests.len();
     let mut reasons = Vec::with_capacity(total);
@@ -756,7 +733,7 @@ pub fn select(
     for (index, test) in check.tests.iter().enumerate() {
         let seeded = is_seeded(&test.footprint);
         let hash = test_hash(hashes, index);
-        let stored = hash.map(|hash| store.get(result_key(hash, seeded, &plan, engine)));
+        let stored = hash.map(|hash| store.get(result_key(hash, seeded, &plan)));
 
         // A `random` plan is one claim per root, so a widened root set owes only unanswered roots.
         let owed = match (seeded, hash) {
@@ -766,7 +743,7 @@ pub fn select(
                 .copied()
                 .filter(|&root| {
                     !matches!(
-                        store.get(seed_key(hash, &Seed::root(root), engine)),
+                        store.get(seed_key(hash, &Seed::root(root))),
                         Some(Outcome::Pass)
                     )
                 })
@@ -978,8 +955,6 @@ pub fn run_with<E: Executor>(
 ) -> RunReport {
     let started = Instant::now();
     let mut warnings = Vec::new();
-    let engine = executor.engine();
-    let writes_baseline = executor.writes_baseline();
 
     let changed = changed_definitions(hashes, store);
 
@@ -1071,7 +1046,6 @@ pub fn run_with<E: Executor>(
                         &selection.plan,
                         selection.plan_for(index),
                         exploration.as_ref(),
-                        &engine,
                     );
                     if record == Record::Unobserved {
                         warnings.push(unobserved_search(&test.key));
@@ -1080,7 +1054,7 @@ pub fn run_with<E: Executor>(
                         store.put(*key, Outcome::Pass);
                     }
                     // Only the evaluator writes the name-keyed baseline.
-                    if record.is_written() && writes_baseline {
+                    if record.is_written() {
                         let (closure, decls) = closure_hashes(hashes, &test.key);
                         store.put_pass_record(
                             test.key.clone(),
@@ -1135,7 +1109,6 @@ pub fn run_with<E: Executor>(
         results,
         warnings,
         simulation,
-        engine,
     }
 }
 

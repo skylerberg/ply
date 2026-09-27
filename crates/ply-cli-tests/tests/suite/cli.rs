@@ -250,47 +250,6 @@ fn a_second_run_selects_nothing_because_the_cache_is_exact() {
 }
 
 #[test]
-fn a_second_backed_run_selects_nothing() {
-    let dir = project(GREEN);
-    ply(dir.path())
-        .args(["test", "--backend", "c"])
-        .assert()
-        .success();
-
-    let out = ply(dir.path())
-        .args(["test", "--backend", "c"])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(0));
-    let text = stdout_of(&out);
-    assert!(text.contains("selected 0 of 2 (2 cached)"), "got:\n{text}");
-}
-
-#[test]
-fn the_default_tier_and_backend_c_are_one_engine() {
-    let dir = project(GREEN);
-    ply(dir.path()).arg("test").assert().success();
-
-    let out = ply(dir.path())
-        .args(["test", "--backend", "c"])
-        .output()
-        .unwrap();
-    let text = stdout_of(&out);
-    assert!(
-        text.contains("selected 0 of 2 (2 cached)"),
-        "`--backend c` did not read the default tier's passes:\n{text}"
-    );
-
-    // And back the other way, over a cache the backed run has now written to.
-    let out = ply(dir.path()).arg("test").output().unwrap();
-    let text = stdout_of(&out);
-    assert!(
-        text.contains("selected 0 of 2 (2 cached)"),
-        "the evaluator lost its own passes:\n{text}"
-    );
-}
-
-#[test]
 fn watch_reruns_on_a_save_and_keeps_the_front_end_it_already_had() {
     let dir = project(GREEN);
     let mut child = process(dir.path())
@@ -1942,13 +1901,13 @@ fn cache_stats_reports_a_discarded_front_end_cache_too() {
 }
 
 #[test]
-fn test_json_carries_schema_version_four_and_a_ranked_suspect_object() {
+fn test_json_carries_schema_version_five_and_a_ranked_suspect_object() {
     let dir = project(RED);
     let out = ply(dir.path()).args(["test", "--json"]).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     let v = json_of(&out);
 
-    assert_eq!(v["schema_version"], 4);
+    assert_eq!(v["schema_version"], 5);
     let f = &v["failures"][0];
     assert_eq!(f["key"], "m.balance never goes negative");
     assert_eq!(f["name"], "balance never goes negative");
