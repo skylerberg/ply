@@ -352,6 +352,7 @@ fn every_skipped_variant_has_its_own_tag_and_its_own_description() {
         Skipped::NoChanges,
         Skipped::NoBodies,
         Skipped::NoHybrids,
+        Skipped::Delegated,
     ];
 
     // The `match` makes a new variant a compile error; the ordinals make leaving it out of `all` fail.
@@ -364,12 +365,13 @@ fn every_skipped_variant_has_its_own_tag_and_its_own_description() {
         Skipped::NoChanges => 5,
         Skipped::NoBodies => 6,
         Skipped::NoHybrids => 7,
+        Skipped::Delegated => 8,
     };
     let mut seen: Vec<usize> = all.iter().map(|s| ordinal(*s)).collect();
     seen.sort_unstable();
     assert_eq!(
         seen,
-        (0..8).collect::<Vec<_>>(),
+        (0..9).collect::<Vec<_>>(),
         "a `Skipped` variant exists that this audit never sees"
     );
 

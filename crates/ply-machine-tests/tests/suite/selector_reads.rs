@@ -15,6 +15,7 @@ nondet effect tester {
   read loaded[r]() -> Result<Program, Refusal>
   read bound[r]() -> Result<Unit, Refusal>
   read ran[r]() -> Ran
+  read trial[r](failure: Int, keys: List<{ name: String, ns: String }>) -> Trial
   read stamped[r]() -> Option<List<String>>
   read keys[r]() -> List<Key>
   read hashed[r]() -> List<Hashed>
@@ -29,6 +30,9 @@ type Key = {
   cache_key: Option<String>, seeded: Bool, nondet: Bool, cached: Option<String>,
 }
 type Hashed = { name: String, hash: String, test: Bool }
+type Trial = { outcome: TrialOutcome, cached: Bool }
+type TrialOutcome = | Fails | Passes | Unresolved(Unresolved)
+type Unresolved = | DoesNotCheck | DifferentFailure | MissingBody | BudgetSpent
 type Plan = { mode: String, seeds: Int, budget: String, steps: String }
 type Named = { name: String, path: String }
 type TlsCred = { name: String, cert: String, key: String }

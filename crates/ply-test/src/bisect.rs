@@ -800,6 +800,9 @@ pub enum Skipped {
     NoBodies,
     /// The bodies are there, but this build cannot assemble them into a mixed program.
     NoHybrids,
+    /// The program the run is being reported to does the searching, so the runtime did not: a
+    /// caller that reads the delta and a mixture can run every trial itself.
+    Delegated,
 }
 
 impl Skipped {
@@ -813,6 +816,7 @@ impl Skipped {
             Skipped::NoChanges => "no_changes",
             Skipped::NoBodies => "no_bodies",
             Skipped::NoHybrids => "no_hybrids",
+            Skipped::Delegated => "delegated",
         }
     }
 
@@ -839,6 +843,9 @@ impl Skipped {
             }
             Skipped::NoHybrids => {
                 "this build cannot mix two eras of a definition graph, so the change set could not be narrowed by running it"
+            }
+            Skipped::Delegated => {
+                "the program reading this report decides which change sets to try, so the runtime did not search"
             }
         }
     }
