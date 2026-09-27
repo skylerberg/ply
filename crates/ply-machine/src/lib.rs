@@ -33,6 +33,7 @@ pub mod simulation;
 pub mod support;
 pub mod tester;
 pub mod trace;
+pub mod vcs;
 pub mod warm;
 
 use ply_eval::Value;
