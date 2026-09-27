@@ -5,12 +5,14 @@
 import args (Flags, from_argv, style_of)
 import claims
 import proof.domain (finite, name_of)
-import claims (Binder, Measured, Typed, measured, Options, prover, Claim, Choice, Collection,
-               Outcome, Pure, Refusal, Row, Verdicts, Broken, Raised, ReachesHost, Refuted, Trouble,
-               Unattempted, Unbound, a_claim, a_counter, a_place, a_plan, also, at_tier, code_of,
-               coverage_json, coverage_lines, diagnostics_of, frame_summary, held_of, joined, nth,
-               num, obligation_json, once_each, plan_json, proved, quantifier, refusal, refuted_of,
-               rendered, row_head, rows_of, seconds, unattempted_of, under, vacuous_of)
+import proof.shrink (Ask, Descent, Offer, Offered, Reply, Take, Taken, Tries, Would, descend)
+import claims (Binder, Binding, Measured, Settled, Typed, measured, Options, prover, Claim, Choice,
+               Collection, Outcome, Pure, Refusal, Row, Verdicts, Broken, Raised, ReachesHost,
+               Refuted, Trouble, Unattempted, Unbound, a_claim, a_counter, a_place, a_plan, also,
+               at_tier, code_of, coverage_json, coverage_lines, diagnostics_of, frame_summary,
+               held_of, joined, nth, num, obligation_json, once_each, plan_json, proved, quantifier,
+               refusal, refuted_of, rendered, row_head, rows_of, seconds, unattempted_of, under,
+               vacuous_of)
 import suite.obligation (Coverage, Ensures, Example, Fresh, FromProof, Kind, Law, Property, Proved,
                          Tier, reason_word, select, verdict_of)
 import compiler.resolve (Diag)
@@ -210,7 +212,7 @@ fn asked(
   flags: Flags,
   c: Collection,
   use_cache: Bool,
-) -> Answer / {prover.discharged[claims], prover.outcomes[claims], prover.typed[claims]} = {
+) -> Answer / {prover.discharged[claims], prover.outcomes[claims], prover.typed[claims], prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} = {
   let wanted = wanted_of(c.claims, flags);
   // What the cache holds is the runtime's to say; which obligations that answers for, and why, is
   // the program's — a proof only under the bare key, a sample only under its plan's.
@@ -228,9 +230,98 @@ fn asked(
   };
   match prover.discharged[claims](choice) {
     Err(why) -> refusal(s, "prove", why),
-    Ok(v) -> answered(s, flags, c, rows_of(c.claims, wanted, v), v, len(c.claims) - len(wanted)),
+    Ok(v) -> {
+      // A counterexample is not finished when it is found: the walk that makes it small is this
+      // side's, and it runs before anything is read.
+      let v = { ..v, outcomes: walked(c.claims, wanted, v, c.plan.shrink_budget) };
+      answered(s, flags, c, rows_of(c.claims, wanted, v), v, len(c.claims) - len(wanted))
+    },
   }
 }
+
+/// Every counterexample walked down before it is read: a refutation keeps the draw it failed at and
+/// gains the tuple the walk settled on, and a raise keeps its gap and gains its own.
+fn walked(
+  claims: List<Claim>,
+  wanted: List<Int>,
+  v: Verdicts,
+  budget: Int,
+) -> List<Outcome> / {prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} =
+  map(range(0, len(v.outcomes)), |i: Int| sifted_at(claims, wanted, v, i, budget))
+
+fn sifted_at(
+  claims: List<Claim>,
+  wanted: List<Int>,
+  v: Verdicts,
+  i: Int,
+  budget: Int,
+) -> Outcome / {prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} =
+  match list_at(v.outcomes, i) {
+    None -> panic("the runtime answered fewer obligations than were asked"),
+    Some(o) -> sifted(at(wanted, i, 0 - 1), o, budget),
+  }
+
+fn sifted(
+  claim: Int,
+  o: Outcome,
+  budget: Int,
+) -> Outcome / {prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} =
+  match o {
+    Refuted(cx) -> match descended(claim, budget) {
+      None -> o,
+      Some(settled) ->
+        Refuted({
+          ..cx,
+          bindings: settled.bindings,
+          original: settled.original,
+          shrinks: settled.steps,
+        }),
+    },
+    Unattempted(gap) -> match gap {
+      // A raise is a counterexample too: it is the input a body gave up on, and the same walk makes
+      // it readable. A gap with nothing to walk keeps its own words.
+      Raised(raise) -> match descended(claim, budget) {
+        None -> o,
+        Some(settled) -> Unattempted(Raised({ ..raise, bindings: settled.bindings })),
+      },
+      _ -> o,
+    },
+    _ -> o,
+  }
+
+/// One counterexample walked down, when the runtime has one to walk. `None` is a claim with nothing
+/// to shrink — a race, an enumerated point, a claim that held — and it is the runtime's answer, not
+/// a guess this side makes.
+fn descended(
+  claim: Int,
+  budget: Int,
+) -> Option<{ bindings: List<Binding>, original: List<Binding>, steps: Int }> / {prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} =
+  match prover.shrink[claims](claim) {
+    Err(_) -> None,
+    Ok(None) -> None,
+    Ok(Some(width)) -> {
+      let out = descend(width, |q: Ask| converse(q), budget);
+      match prover.settled[claims]() {
+        Err(_) -> None,
+        Ok(None) -> None,
+        Ok(Some(settled)) ->
+          Some({ bindings: settled.bindings, original: settled.original, steps: out.steps }),
+      }
+    },
+  }
+
+/// One turn of the conversation the walk has with the runtime: what the value at `i` is now, whether
+/// a candidate still holds, and taking it. Every operation is asked from here, because a function has
+/// one row and the walk cannot take four callbacks that perform different ones.
+fn converse(
+  q: Ask,
+) -> Reply / {prover.offers[claims], prover.would[claims], prover.accept[claims]} =
+  match q {
+    Offer(i) -> Offered(match prover.offers[claims](i) { Ok(offer) -> offer, Err(_) -> None }),
+    Would(i, position) ->
+      Tries(match prover.would[claims](i, position) { Ok(yes) -> yes, Err(_) -> false }),
+    Take(i, position) -> match prover.accept[claims](i, position) { _ -> Taken(()) },
+  }
 
 // The n-th answer, or the spare when the runtime answered fewer than asked.
 fn at<a>(xs: List<a>, i: Int, spare: a) -> a = match list_at(xs, i) { Some(x) -> x, None -> spare }
@@ -257,7 +348,7 @@ fn no_claim_of(cs: List<Claim>, i: Int) -> Claim =
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.outcomes[claims], prover.typed[claims]} = {
+) -> Answer / {prover.configure[claims], prover.collected[claims], prover.discharged[claims], prover.outcomes[claims], prover.typed[claims], prover.shrink[claims], prover.offers[claims], prover.would[claims], prover.accept[claims], prover.settled[claims]} = {
   prover.configure[claims](options);
   let s: Style = style_of(flags);
   match prover.collected[claims]() {
@@ -296,6 +387,12 @@ fn proved_over(
     prover.outcomes[claims](keys) -> map(keys, |_k: String| None),
     // A fixture's types are not what a report reads: no domain is measured, so every claim samples.
     prover.typed[claims]() -> Ok({ decls: [], claims: [] }),
+    // A fixture's claims have no runtime-held values, so there is nothing to walk.
+    prover.shrink[claims](claim) -> Ok(None),
+    prover.offers[claims](i) -> Ok(None),
+    prover.would[claims](i, position) -> Ok(false),
+    prover.accept[claims](i, position) -> Ok(()),
+    prover.settled[claims]() -> Ok(None),
     prover.discharged[claims](choice) -> v,
   }
 
