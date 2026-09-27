@@ -3,7 +3,6 @@
 mod artifact;
 mod config;
 mod costs;
-mod db;
 mod hosts;
 mod load;
 mod migrate;
