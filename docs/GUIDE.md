@@ -25,6 +25,15 @@ fn main() -> Unit = assert_eq(greeting(), "hello from ply")
 Each takes a `.ply` file or a project root, defaulting to `.`.
 `ply check --types` prints every definition's inferred signature.
 
+**Starting a package.** `ply new demo` writes `demo/ply.pkg` and
+`demo/main.ply` — a manifest (§3.3), a `main` and one test — and `cd demo &&
+ply test` runs that test. The directory's last segment names the package, so
+`ply new store/orders` makes `orders`; `--name` overrides it when the
+directory is not a name (`ply new lib-src --name core`), and `--lib` writes a
+`lib.ply` with a `pub` definition and no `main` instead. A name is what a
+package prefix can be — lower-case letters, digits and `_`, joined by dots —
+and a directory that is already there is refused rather than written into.
+
 **Projects.** Every `*.ply` file under the root, except inside directories whose
 name starts with `.`, is a module named by its relative path with `/` → `.` and
 `.ply` dropped: `store/orders/place.ply` is `store.orders.place`. Every
@@ -204,7 +213,8 @@ The body is data, not code: a literal, a constructor applied to literals, a
 record or a list — the judgment §3.1 states for parameter defaults — refused
 with `E0130` otherwise, as a manifest with any other shape is `E0129` and a
 field that does not decode or fails validation is `E0131`. A project without
-`ply.pkg` is the anonymous package.
+`ply.pkg` is the anonymous package. `ply new` (§1) writes this file, with the
+toolchain it was made by as the `runtime`.
 
 Each dependency grants its package's module prefix, and only what is declared
 may be imported. A package's own modules answer to its sibling names:
