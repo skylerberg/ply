@@ -200,7 +200,7 @@ fn the_compiled_tier_judges_the_corpus_specifications() {
 
 #[test]
 fn a_served_example_with_the_tier_holding_its_accept_loop() {
-    let reserved = Reservation::take();
+    let mut reserved = Reservation::take();
     let port = reserved.port();
     let dir = tempfile::tempdir().unwrap();
     let source = std::fs::read_to_string(repo().join("examples/hello.ply")).unwrap();
@@ -228,14 +228,11 @@ fn a_served_example_with_the_tier_holding_its_accept_loop() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let mut stream = connect_when_ready(
-        &mut child,
-        format!("127.0.0.1:{port}").parse().unwrap(),
-        Duration::from_secs(120),
-        |_| true,
-    )
-    .unwrap_or_else(|why| panic!("{why}"));
-    reserved.bound();
+    let mut stream =
+        connect_when_ready(&mut reserved, &mut child, Duration::from_secs(120), |_| {
+            true
+        })
+        .unwrap_or_else(|why| panic!("{why}"));
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();

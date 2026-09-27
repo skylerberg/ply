@@ -74,8 +74,8 @@ fn ready(answer: &str, nonce: &str) -> bool {
 /// Killed on drop, including during a panic, so a failing test does not leak a server.
 struct Server {
     child: Child,
-    port: u16,
     nonce: String,
+    reserved: Reservation,
     _dir: tempfile::TempDir,
 }
 
@@ -95,13 +95,9 @@ impl Server {
     fn start_with(source: &str, flags: &[&str]) -> Server {
         let mut refused = Vec::new();
         for _ in 0..PORT_ATTEMPTS {
-            let reserved = Reservation::take();
-            let mut server = Server::spawn(source, flags, reserved.port());
+            let mut server = Server::spawn(source, flags, Reservation::take());
             match server.wait_until_listening() {
-                Ok(()) => {
-                    reserved.bound();
-                    return server;
-                }
+                Ok(()) => return server,
                 Err(why) => refused.push(why),
             }
         }
@@ -111,7 +107,7 @@ impl Server {
         );
     }
 
-    fn spawn(source: &str, flags: &[&str], port: u16) -> Server {
+    fn spawn(source: &str, flags: &[&str], reserved: Reservation) -> Server {
         let dir = tempfile::tempdir().expect("a temp dir");
         let nonce = nonce();
         write(
@@ -119,7 +115,7 @@ impl Server {
             "main.ply",
             &source
                 .replace("HEAD", HEAD)
-                .replace("PORT", &port.to_string())
+                .replace("PORT", &reserved.port().to_string())
                 .replace("NONCE", &nonce),
         );
         let child = process(dir.path())
@@ -132,8 +128,8 @@ impl Server {
             .expect("`ply run` starts");
         Server {
             child,
-            port,
             nonce,
+            reserved,
             _dir: dir,
         }
     }
@@ -141,16 +137,18 @@ impl Server {
     /// The probe is a whole request and response, and the answer has to carry this test's token:
     /// a bare connect, or a `200 OK`, can belong to another test's server on the same port.
     fn wait_until_listening(&mut self) -> Result<(), String> {
-        let addr = self.address();
         let nonce = self.nonce.clone();
-        connect_when_ready(&mut self.child, addr, Duration::from_secs(60), |stream| {
-            ready(&request(stream), &nonce)
-        })
+        connect_when_ready(
+            &mut self.reserved,
+            &mut self.child,
+            Duration::from_secs(60),
+            |stream| ready(&request(stream), &nonce),
+        )
         .map(|_| ())
     }
 
     fn address(&self) -> std::net::SocketAddr {
-        format!("127.0.0.1:{}", self.port)
+        format!("127.0.0.1:{}", self.reserved.port())
             .parse()
             .expect("an address")
     }
