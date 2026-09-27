@@ -5,7 +5,7 @@ use crate::property::TypeWorld;
 use ply_eval::{Fixed, Value};
 use ply_span::Symbol;
 use ply_ty::IntTy;
-use ply_ty::{LawBinder, Type};
+use ply_ty::Type;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
