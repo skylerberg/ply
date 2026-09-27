@@ -8,16 +8,21 @@ import args (Flags, no_flags, style_of)
 import lock
 import paths (Resolved, here)
 import compiler.hash (hex)
-import compiler.plyx (Head, Section, Range, covers, domain, encode, format, off_digest)
+import compiler.plyx (Head, Section, Range, covers, domain, encode, encode_named, format,
+                      library_domain, library_magic, off_digest)
 import compiler.resolve (Diag, Label, diag, diag1)
 import diagnostic (Place, all_to_json, all_to_text)
 import entry (At, Main, Module, entry_point, marked, no_module, nowhere)
 import env (env)
+import sources (File)
+import program (Program, load_program)
 import report (Answer, ind, ok_code, count_of, plural, refused, reported, warning_lines)
-import std.fs (fs)
+import std.fs (fs, Missing)
 import std.hash (blake3)
 import std.path (is_absolute)
 import std.json (Json, Null, Str, Bool, Number, Array, object, to_string)
+import std.pkg (Manifest, render_version)
+import compiler.front (Whole)
 import style (Style, plain, bold, green, red)
 
 // What the Rust side loads, builds, hashes and writes. Each answer is what that step did, so the
@@ -28,7 +33,12 @@ pub nondet effect builder {
   // The artifact `--diff` names, read before the program was entered; only `--diff` asks.
   read previous[r](diff: Option<String>) -> Result<Previous, Refusal>
   write stored[r](path: String, body: Bytes) -> Result<Unit, Refusal>
+  // A library's unit: every definition of the package's own modules, compiled with no entry.
+  read unit[r](names: List<String>) -> Result<Compiled, Refusal>
 }
+
+// What the unit op answers: the head fields every container records, and one section's payload.
+pub type Compiled = { head: Head, count: Int, payload: Bytes }
 
 // --- What the Rust side answers with ----------------------------------------
 
@@ -79,7 +89,11 @@ pub type Sealed = { bytes: Bytes, digest: String }
 
 // The digest is the writer's own work: `compiler.plyx` says the domain, the field and the ranges,
 // and the hash is `std.hash`'s. Sealing is hashing and a splice, so the program does it itself.
-fn seal(container: Bytes) -> Result<Sealed, Refusal> =
+fn seal(container: Bytes) -> Result<Sealed, Refusal> = sealed_at(container, domain())
+
+// A library's container is the same file under a domain of its own: a library digest is never read
+// as a program digest, and the ranges `compiler.plyx` covers are the same ones.
+fn sealed_at(container: Bytes, into: Bytes) -> Result<Sealed, Refusal> =
   match covers(bytes_len(container)) {
     None ->
       Err({
@@ -98,7 +112,7 @@ fn seal(container: Bytes) -> Result<Sealed, Refusal> =
       }),
     Some(ranges) -> {
       let parts = map(ranges, |r: Range| bytes_slice(container, r.at, r.at + r.len));
-      let digest = blake3(bytes_concat_all(appended([domain()], parts)));
+      let digest = blake3(bytes_concat_all(appended([into], parts)));
       let at = off_digest();
       Ok({
         bytes: bytes_concat_all([
@@ -551,9 +565,12 @@ fn chosen(
   s: Style,
   flags: Flags,
   p: Loaded,
-) -> Answer / {builder.made[build], builder.previous[build], builder.stored[build], env.shipped_digest[sys], fs.write_file[cwd], fs.write_file[abs]} =
+) -> Answer / {builder.made[build], builder.previous[build], builder.stored[build], builder.unit[build], env.shipped_digest[sys], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs]} =
   match entry_of(p, flags) {
-    Err(d) -> reported(s, "build", [d], p.places),
+    // Nothing to build as a program. A library — a package that names no entry and declares no
+    // `main` — is built as the package itself; anything else keeps the entry point's refusal.
+    Err(d) -> if flags.entry == None && len(p.mains) == 0 { library(s, flags, p, d) }
+    else { reported(s, "build", [d], p.places) },
     Ok(entry) -> match startup_of(p, flags) {
       Err(d) -> reported(s, "build", [d], p.places),
       Ok(startup) -> assembled(s, flags, p, entry, startup),
@@ -562,7 +579,7 @@ fn chosen(
 
 pub fn run(
   flags: Flags,
-) -> Answer / {builder.loaded[build], builder.made[build], builder.previous[build], builder.stored[build], env.shipped_digest[sys], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs]} = {
+) -> Answer / {builder.loaded[build], builder.made[build], builder.previous[build], builder.stored[build], builder.unit[build], env.shipped_digest[sys], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs]} = {
   let s: Style = style_of(flags);
   let r = resolved_root(flags);
   let locked: Result<Option<lock::Lock>, String> = lock::read(r);
@@ -608,6 +625,176 @@ fn pinned(
 // The root the command was pointed at, as the resolved path the lockfile is read and written under.
 fn resolved_root(flags: Flags) -> Resolved =
   match list_at(flags.paths, 0) { Some(r) -> r, None -> here() }
+
+// --- A library ----------------------------------------------------------------------
+
+// One module's source, framed as `module <name> <length>` and its bytes: the front end's own
+// framing, so a reader of the container is a reader of the dump.
+fn source_frame(f: File) -> Bytes =
+  bytes_concat_all([
+    b"module ",
+    bytes_of_string(f.module),
+    b" ",
+    bytes_of_string(int_to_string(bytes_len(f.text))),
+    b"\n",
+    f.text,
+  ])
+
+fn library_sections(files: List<File>, manifest: Bytes, unit: Compiled) -> List<Section> =
+  [
+    { name: b"sources", count: len(files), payload: bytes_concat_all(map(files, source_frame)) },
+    { name: b"manifest", count: 1, payload: manifest },
+    { name: b"unit", count: unit.count, payload: unit.payload },
+  ]
+
+fn member(xs: List<String>, x: String) -> Bool =
+  fold(xs, false, |found: Bool, y: String| found || y == x)
+
+fn library_name(m: Manifest) -> String = m.name ++ " " ++ render_version(m.version)
+
+fn library_output(flags: Flags, name: String) -> String =
+  match flags.out { Some(v) -> v, None -> name ++ ".plyz" }
+
+// A library: a package whose manifest names no entry and whose own modules declare no `main`. It
+// has no closure to ship, so what a build makes of it is the package itself — its sources, its
+// manifest and a unit of every definition they declare — under a container of its own.
+fn library(
+  s: Style,
+  flags: Flags,
+  p: Loaded,
+  refused: Diag,
+) -> Answer / {builder.stored[build], builder.unit[build], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs]} = {
+  let loaded: Program = load_program(flags.paths);
+  match loaded.whole {
+    // The load behind this report found no entry point; a package that cannot be read keeps that.
+    None -> reported(s, "build", [refused], p.places),
+    Some(w) -> match w.manifest {
+      // An anonymous directory is not a library: there is no package to write down.
+      None -> reported(s, "build", [refused], p.places),
+      Some(m) -> if m.entry != None { reported(s, "build", [refused], p.places) }
+      else { library_writing(s, flags, p, loaded, w, m) },
+    },
+  }
+}
+
+fn library_writing(
+  s: Style,
+  flags: Flags,
+  p: Loaded,
+  loaded: Program,
+  w: Whole,
+  m: Manifest,
+) -> Answer / {builder.stored[build], builder.unit[build], fs.write_file[cwd], fs.write_file[abs]} = {
+  let owned = map(loaded.files, |f: File| f.module);
+  let own = filter(p.defs, |d: Def| member(owned, d.module));
+  match builder.unit[build](map(own, |d: Def| d.name)) {
+    Err(why) -> reported(s, "build", why.diags, p.places),
+    Ok(compiled) -> {
+      let container = encode_named(
+        library_magic(),
+        compiled.head,
+        library_sections(
+          loaded.files,
+          match loaded.pkgs.manifest { Some(text) -> text, None -> b"" },
+          compiled,
+        ),
+      );
+      match sealed_at(container, library_domain()) {
+        Err(why) -> refused(s, "build", why.diags, why.places),
+        Ok(x) -> {
+          let out = library_output(flags, m.name);
+          match builder.stored[build](out, x.bytes) {
+            Err(why) -> reported(s, "build", why.diags, p.places),
+            Ok(_) ->
+              {
+                json: library_json(p, m, own, compiled, x, out),
+                lines: library_lines(s, m, len(loaded.files), own, compiled, x, out),
+                errs: [],
+                code: ok_code(),
+              },
+          }
+        },
+      }
+    },
+  }
+}
+
+fn library_lines(
+  s: Style,
+  m: Manifest,
+  modules: Int,
+  own: List<Def>,
+  unit: Compiled,
+  x: Sealed,
+  out: String,
+) -> List<String> =
+  [
+    ind() ++ green(s, "built") ++ " " ++ library_name(m) ++ " · " ++ x.digest,
+    ind() ++ bold(s, "library") ++ " " ++ count_of(modules, "module") ++ " · "
+      ++ count_of(bytes_len(x.bytes), "byte")
+      ++ " · "
+      ++ out,
+    ind() ++ bold(s, "unit") ++ " " ++ count_of(len(own), "definition") ++ " compiled",
+  ]
+
+fn library_json(
+  p: Loaded,
+  m: Manifest,
+  own: List<Def>,
+  unit: Compiled,
+  x: Sealed,
+  out: String,
+) -> Json =
+  object([
+    { key: "command", value: Str("build") },
+    { key: "ok", value: Bool(true) },
+    { key: "exit_code", value: num(ok_code()) },
+    { key: "library", value: Bool(true) },
+    { key: "root", value: Str(p.root) },
+    { key: "name", value: Str(m.name) },
+    { key: "version", value: Str(render_version(m.version)) },
+    { key: "definitions", value: num(len(own)) },
+    { key: "artifact", value: Str(out) },
+    { key: "digest", value: Str(x.digest) },
+    { key: "format", value: num(format()) },
+    { key: "unit", value: Bool(bytes_len(unit.payload) > 0) },
+    { key: "artifact_bytes", value: num(bytes_len(x.bytes)) },
+    { key: "diagnostics", value: all_to_json([], p.places) },
+  ])
+
+/// A library's sources section is each module's own framing: `module <name> <length>` and the
+/// bytes, so a reader of the container reads the same shape the front-end dump writes.
+test "a library frames every module's source under its name" {
+  let first: File = {
+    path: "core.ply",
+    module: "core",
+    text: b"pub fn double(n: Int) -> Int = n * 2\n",
+  };
+  let second: File = {
+    path: "math.ply",
+    module: "math",
+    text: b"pub fn half(n: Int) -> Int = n / 2\n",
+  };
+  assert_eq(
+    source_frame(first),
+    bytes_concat_all([b"module core 37\n", b"pub fn double(n: Int) -> Int = n * 2\n"]),
+  );
+  let sections = library_sections([first, second], b"manifest text", {
+    head: a_head(),
+    count: 1,
+    payload: b"unit",
+  });
+  assert_eq(len(sections), 3);
+  assert_eq(nth(sections, 0).name, b"sources");
+  assert_eq(nth(sections, 0).count, 2);
+  assert_eq(nth(sections, 1).name, b"manifest");
+  assert_eq(nth(sections, 1).payload, b"manifest text");
+  assert_eq(nth(sections, 2).name, b"unit");
+  assert_eq(nth(sections, 2).payload, b"unit")
+}
+
+fn nth<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list does not hold") }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -800,7 +987,19 @@ fn answered_over(
     fs.read_file[abs](path) -> lockfile(path),
     fs.write_file[cwd](path, body) -> true,
     fs.write_file[abs](path, body) -> true,
+    // A library's path is only reached by a test that means it: the fixture is a program.
+    builder.unit[build](names) -> no_unit(names),
+    fs.kind[cwd](path) -> Missing,
+    fs.kind[abs](path) -> Missing,
+    fs.list_dir[cwd](path) -> None,
+    fs.list_dir[abs](path) -> None,
+    fs.list_dir[shelf](path) -> None,
+    fs.read_file[shelf](path) -> None,
   }
+
+// The fixture has no library to compile: a test that asks for a unit is asking about a path the
+// fixture does not take, and the answer says so rather than inventing one.
+fn no_unit(names: List<String>) -> Result<Compiled, Refusal> = Err({ diags: [], places: [] })
 
 // The lockfile a test's project holds: none, so a build pins what it loaded.
 fn lockfile(path: String) -> Option<Bytes> = None

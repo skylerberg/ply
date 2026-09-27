@@ -262,10 +262,12 @@ modules it contributed, sorted by name. A package is pinned by *what* it is and
 never by where it was found, so a moved checkout keeps its pin. A build verifies
 the lock before it writes an artifact — a dependency whose sources moved since it
 was pinned is `E0138`, and a lock this `ply` cannot read is `E0139` — and writes
-one when the closure it resolved is not the one on file. Deleting the lockfile,
-or one package's entry in it, pins what is on disk now: that is how a change to a
-dependency is accepted, deliberately. `Git` and `Registry` sources arrive with
-resolution.
+one when the closure it resolved is not the one on file. `ply resolve` pins what is on
+disk now, and is how a change to a dependency is accepted, deliberately —
+deleting the lockfile, or one package's entry in it, does the same. `ply why
+NAME` says how a package got here: the path from the root package to it through
+the packages that declare it, then the version and digest it resolved to. `Git`
+and `Registry` sources arrive with resolution.
 
 ## 4. Types
 
@@ -1721,9 +1723,16 @@ $ ply build . --diff old.plyx       # added, changed, dropped, unchanged
 $ ply run app.plyx --host
 ```
 
-A library package — one whose manifest names no entry and which declares no
-`main` — has no closure to ship and is refused (`E0101`); library artifacts
-(`.plyz`) arrive with resolution (§3.3).
+A **library** — a package whose manifest names no entry and whose own modules
+declare no `main` — is built as the package itself: `ply build` writes a
+`.plyz`, the same container under a magic (`PLYLIB01`) and a digest domain of
+its own, holding every module's source, the package's `ply.pkg` text, and a
+compiled unit of every definition those modules declare (a library has no entry
+to prune against, so nothing is left out). `-o FILE` names it; the default is
+`<name>.plyz`. A consumer compiles those sources — always correct — or reuses
+the unit when the runtime matches, the `E0444` gate. It is a package and never
+a program: `ply run lib.plyz` refuses it (`E0443`) rather than reading a
+container as text.
 
 `ply build` writes the closure of one entry point (default `main`) as a `.plyx`
 file (default `<entry module>.plyx`): its definitions, printed back to source
@@ -1763,7 +1772,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
-| `ply build [path]` | `--entry NAME`, `-o FILE`, `--config-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
+| `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--stamp FILE` (the digest the launcher gates its shipped artifact on; the CLI's own build) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | `--show [MODULE]`, `--digest`; no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
@@ -1771,6 +1780,8 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change |
 | `ply show NAME [path]` | one `fn` or `type` as its file holds it: the `//` lines above it, `pub`, the body, and a comment ending its last line; `--json` adds the byte range |
 | `ply replace NAME [path]` | rewrite one `fn` or `type` from `--with FILE` or stdin, formatted, every other byte of the file kept; refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash moves; `--check` writes nothing |
+| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest |
+| `ply why NAME [path]` | why a package is in the closure: the path from the root package to it, then the version and digest the closure pins |
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, test and law whose closure reaches it |
@@ -1779,9 +1790,9 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 
 `ply new`, `ply check`, `ply fmt`, `ply defs`, `ply hash`, `ply doc`,
-`ply show`, `ply replace`, `ply callers`, `ply std`, `ply explain`, `ply hosts`,
-`ply cache` and `ply bootstrap` are one Ply program (`crates/ply-cli/ply`,
-entered at `ply.main`). The program itself parses the command line, prints help and
+`ply show`, `ply replace`, `ply resolve`, `ply why`, `ply callers`, `ply std`,
+`ply explain`, `ply hosts`, `ply cache` and `ply bootstrap` are one Ply program
+(`crates/ply-cli/ply`, entered at `ply.main`). The program itself parses the command line, prints help and
 refusals, and resolves the paths it is given against the working directory — a
 relative path reads under it, an absolute one reads where it points. The binary
 answers with the code the program asked to exit with. What a command needs of

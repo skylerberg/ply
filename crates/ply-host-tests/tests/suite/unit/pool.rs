@@ -3,10 +3,7 @@ use ply_host::pool::{FS_FIRST_TOKEN, NET_FIRST_TOKEN};
 /// The first facility to claim a token answers it, so overlapping ranges would hang a poll forever.
 #[test]
 fn no_two_facilities_mint_the_same_token() {
-    let ranges = [
-        ("net", NET_FIRST_TOKEN),
-        ("fs", FS_FIRST_TOKEN),
-    ];
+    let ranges = [("net", NET_FIRST_TOKEN), ("fs", FS_FIRST_TOKEN)];
     for (i, (whose, first)) in ranges.iter().enumerate() {
         assert!(
             *first > 0,

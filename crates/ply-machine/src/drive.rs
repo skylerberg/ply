@@ -102,6 +102,26 @@ impl Target {
         if path.extension().is_some_and(|e| e == artifact::EXTENSION) {
             return deployment(path).map(|d| (Target::Deployed(Box::new(d)), None));
         }
+        // A library is a package to depend on, not a program: reading it as sources would report a
+        // container as text that is not UTF-8.
+        if path
+            .extension()
+            .is_some_and(|e| e == artifact::LIBRARY_EXTENSION)
+        {
+            return Err(Refused {
+                diagnostics: vec![
+                    Diagnostic::error(
+                        codes::ARTIFACT_INVALID,
+                        format!("`{}` is a library, and nothing to run", path.display()),
+                    )
+                    .primary(Span::DUMMY, "not a program")
+                    .note("a `.plyz` is a package: declare it in a `ply.pkg` and depend on it")
+                    .note("`ply build` writes a program's artifact as a `.plyx`"),
+                ],
+                sources: SourceMap::new(),
+                artifact: None,
+            });
+        }
         let loaded = if cache {
             // The store is the project's, so a file path roots at the file's directory.
             let root = crate::load::project_root(path);
