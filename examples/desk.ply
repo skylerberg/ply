@@ -6,7 +6,8 @@ import std.net (net, send_all)
 // perform can both say `db.query[items]`, and the plain import binds the module, so that a type
 // can say `db::Answer` and a call can say `db::transaction`.
 import std.db
-import std.db (db)
+import std.db (db, with_server)
+import std.random (entropy)
 import std.json
 import std.http
 import std.router
@@ -43,6 +44,21 @@ effect set Serving = {
   Desk,
   trace.enter[http], trace.exit[http], trace.event[http],
   config.secret[credentials], signal.stopping,
+}
+
+// What the *entry point* performs, which is `Serving` without the database: a run reads where to
+// reach its database and serves every `db` operation from there, so no row names `db` and a host
+// needs no database of its own.
+effect set Running = {
+  trace.enter[orders], trace.exit[orders], trace.event[orders], trace.count[orders],
+  trace.event[items],
+  trace.enter[http], trace.exit[http], trace.event[http],
+  config.get[server], config.secret[credentials], signal.stopping,
+  net.listen[listener], net.accept[listener], net.close[listener],
+  net.recv[conn], net.send[conn], net.close[conn],
+  // The driver reaches its server over connections of its own, which is what `with_server` performs.
+  net.connect[link], net.send[link], net.recv[link], net.close[link],
+  entropy.next,
 }
 
 // --- What the desk sells --------------------------------------------------------
@@ -197,6 +213,10 @@ pub fn connections_key() -> String = "DESK_CONNECTIONS"
 
 pub fn api_key() -> String = "DESK_API_KEY"
 
+// Where the desk's database is. Required rather than defaulted, so a run without one refuses to
+// start instead of failing a connection inside a request.
+pub fn database_key() -> String = "DESK_DATABASE"
+
 pub fn config() -> config::ConfigSpec =
   config::spec([
     // A default, so a developer runs `ply run --host --config-schema desk.config` and gets a desk
@@ -206,6 +226,7 @@ pub fn config() -> config::ConfigSpec =
     // `SSecret` is the whole of §2's containment for a configured value, and it does two things at
     // once.
     config::required(api_key(), config::SSecret),
+    config::required(database_key(), config::SText),
   ])
 
 // The port a run was told to listen on, or the refusal to start.
@@ -1226,20 +1247,32 @@ fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: In
   } }
   } }
 
-// The entry point, which is the postgres one.
-fn main() -> Int
-  / {Serving, config.get[server], net.listen[listener], net.accept[listener], net.close[listener],
-     net.recv[conn], net.send[conn], net.close[conn]} = {
+// The entry point, which is the postgres one. The database is the program's own: where to reach it
+// is a setting, and every `db` operation is answered from here.
+fn main() -> Int / {Running} = {
   let key = config.secret[credentials](api_key());
   let port = configured(port_of(config.get[server](port_key())));
   let count = configured(connections_of(config.get[server](connections_key())));
+  let url = configured_url(config.get[server](database_key()));
   handle {
-    run(port, count)
+    match with_server(url, count, || run(port, count)) {
+      Ok(served) -> served,
+      Err(why) -> panic("the desk will not start: " ++ why),
+    }
   } with {
     // Answered from the value read above, once.
     config.secret[credentials](k) -> key,
   }
 }
+
+fn configured_url(resolved: Option<String>) -> String =
+  match resolved {
+    Some(url) -> url,
+    None -> panic(
+      "the desk will not start: " ++ database_key()
+        ++ " is unset; pass `--config-schema desk.config` so the run refuses at start-up, or `--set "
+        ++ database_key() ++ "=postgres://user@host/desk`"),
+  }
 
 fn configured(resolved: Result<Int, String>) -> Int =
   match resolved {
@@ -1866,12 +1899,16 @@ fn shown_field(f: Option<trace::Field>) -> String =
 
 // --- Tests: the configuration a run refuses to start without ---------------------------
 
-test "the schema declares the key the desk cannot start without, and defaults the rest" {
+test "the schema declares the keys the desk cannot start without, and defaults the rest" {
   let keys = config().keys;
-  assert_eq(len(keys), 3);
+  assert_eq(len(keys), 4);
   // The credential is `SSecret` and required.
   assert_eq(key_named(keys, api_key()),
     Some({name: "DESK_API_KEY", shape: config::SSecret, required: true, default: None}));
+  // Where to reach the database is required too: the desk serves `db` itself, so a run without a
+  // URL cannot start.
+  assert_eq(key_named(keys, database_key()),
+    Some({name: "DESK_DATABASE", shape: config::SText, required: true, default: None}));
   // The port has a default, so `ply run --host --config-schema desk.config` starts a desk with no
   // configuration written anywhere.
   assert_eq(key_named(keys, port_key()),
