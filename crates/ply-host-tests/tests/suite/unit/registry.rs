@@ -39,6 +39,9 @@ fn every_repeatable_operation_is_one_that_was_argued_for() {
             "task.spawn[..]",
             "task.join[..]",
             "task.yield[..]",
+            // Every draw is independent of every other, so a run may take as many as it likes.
+            "std.random.entropy.next[..]",
+            "std.random.entropy.below[..]",
             "std.time.time.now_ms[..]",
             "std.time.time.elapsed_ms[..]",
             "certgen.issue[..]",

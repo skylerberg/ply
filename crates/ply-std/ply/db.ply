@@ -2,6 +2,7 @@
 
 import std.json
 import std.net (net)
+import std.random (entropy, nonce)
 import std.pg
 
 pub nondet effect db {
@@ -3611,4 +3612,266 @@ pub fn serve<a | e>(
         ran.answer
       },
     }
+  }
+
+// --- Where the server is ---------------------------------------------------------
+
+// `postgres://user[:password]@host[:port]/database[?sslmode=…]`, the form `--db` takes. The
+// language reads it, so a driver needs nothing from the host but `net`.
+
+type Split = { head: String, tail: String }
+
+// Around the first `sep`; the URL grammar needs no regular expressions.
+fn split_at(text: String, sep: String) -> Option<Split> =
+  match bytes_index_of(bytes_of_string(text), bytes_of_string(sep)) {
+    None -> None,
+    Some(i) -> {
+      let whole = bytes_of_string(text);
+      let after = i + bytes_len(bytes_of_string(sep));
+      Some({
+        head: string_of_bytes(bytes_slice(whole, 0, i)),
+        tail: string_of_bytes(bytes_slice(whole, after, bytes_len(whole))),
+      })
+    },
+  }
+
+// Around the last `sep`, which is what separates the userinfo from the host: a password may
+// hold an `@`.
+fn rsplit_at(text: String, sep: String) -> Option<Split> = {
+  let whole = bytes_of_string(text);
+  let needle = bytes_of_string(sep);
+  let last = fold(range(0, bytes_len(whole)), 0 - 1, |acc: Int, i: Int|
+    if i + bytes_len(needle) <= bytes_len(whole)
+        && bytes_slice(whole, i, i + bytes_len(needle)) == needle { i }
+    else { acc });
+  if last < 0 { None } else {
+    Some({
+      head: string_of_bytes(bytes_slice(whole, 0, last)),
+      tail: string_of_bytes(bytes_slice(whole, last + bytes_len(needle), bytes_len(whole))),
+    })
+  }
+}
+
+// `%XX` as the byte it names; anything else is itself, so a password may hold a `:` or a `@`.
+// `%XX` as the byte it names; anything else is itself, so a password may hold a `:` or an `@`.
+fn unpercent(text: String) -> Result<String, String> =
+  match unpercent_from(bytes_of_string(text), 0, b"") {
+    Err(why) -> Err(why),
+    Ok(bytes) -> if bytes_is_utf8(bytes) { Ok(string_of_bytes(bytes)) }
+    else { Err("a `%` escape in the URL is not UTF-8") },
+  }
+
+fn unpercent_from(whole: Bytes, at: Int, acc: Bytes) -> Result<Bytes, String> =
+  if at >= bytes_len(whole) { Ok(acc) } else if bytes_at(whole, at) == 37 {
+    if at + 2 >= bytes_len(whole) || !is_hex(bytes_at(whole, at + 1))
+        || !is_hex(bytes_at(whole, at + 2)) {
+      Err("a `%` in the URL is not followed by two hex digits")
+    } else {
+      unpercent_from(
+        whole,
+        at + 3,
+        bytes_concat(
+          acc,
+          byte_of_int(hex_value(bytes_at(whole, at + 1)) * 16 + hex_value(bytes_at(whole, at + 2))),
+        ),
+      )
+    }
+  } else { unpercent_from(whole, at + 1, bytes_concat(acc, bytes_slice(whole, at, at + 1))) }
+
+fn is_hex(c: Int) -> Bool = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)
+
+fn url_refusal(url: String) -> String =
+  if string_contains(url, "=") && !string_contains(url, "://") {
+    "this is libpq's keyword/value form; the URI form is `postgres://user@host:5432/database`"
+  } else { "a connection string begins `postgres://`, as in `postgres://user@host:5432/database`" }
+
+pub fn server_of(url: String) -> Result<Server, String> =
+  match split_at(url, "://") {
+    None -> Err(url_refusal(url)),
+    Some(scheme) -> if scheme.head != "postgres" && scheme.head != "postgresql" {
+      Err(
+        "`" ++ scheme.head
+          ++ "` is not a database this driver speaks; only `postgres://` and `postgresql://` are",
+      )
+    } else { server_parts(scheme.tail) },
+  }
+
+type Credentials = { user: String, password: Option<String> }
+
+fn credentials_of(userinfo: String) -> Result<Credentials, String> =
+  match split_at(userinfo, ":") {
+    None -> match unpercent(userinfo) {
+      Err(why) -> Err(why),
+      Ok(user) -> checked_user(user, None),
+    },
+    Some(s) -> match unpercent(s.tail) {
+      Err(why) -> Err(why),
+      Ok(password) -> match unpercent(s.head) {
+        Err(why) -> Err(why),
+        Ok(user) -> checked_user(user, Some(password)),
+      },
+    },
+  }
+
+fn checked_user(user: String, password: Option<String>) -> Result<Credentials, String> =
+  if string_len(user) == 0 { Err("the user is empty") }
+  else { Ok({ user: user, password: password }) }
+
+type HostPort = { host: String, port: Int }
+
+fn hostport_of(text: String) -> Result<HostPort, String> =
+  match rsplit_at(text, ":") {
+    None -> checked_host(text, 5432),
+    Some(s) -> match port_of(s.tail) {
+      None -> Err("`" ++ s.tail ++ "` is not a port"),
+      Some(port) -> if port == 0 { Err("port 0 is not a port a server listens on") }
+      else { checked_host(s.head, port) },
+    },
+  }
+
+// A decimal port, and nothing that merely begins with one.
+fn port_of(text: String) -> Option<Int> =
+  if string_len(text) == 0 { None } else {
+    let value = nat_of_text(text);
+    if string_len(int_to_string(value)) == string_len(text) { Some(value) } else { None }
+  }
+
+fn checked_host(host: String, port: Int) -> Result<HostPort, String> =
+  if string_len(host) == 0 { Err("there is no host; a unix socket path is not configurable here") }
+  else { Ok({ host: host, port: port }) }
+
+type Database = { name: String, query: String }
+
+fn database_of(path_and_query: String) -> Result<Database, String> = {
+  let split = match split_at(path_and_query, "?") {
+    Some(s) -> s,
+    None -> { head: path_and_query, tail: "" },
+  };
+  match unpercent(split.head) {
+    Err(why) -> Err(why),
+    Ok(name) -> if string_len(name) == 0 { Err("there is no database name after the host") }
+    else { Ok({ name: name, query: split.tail }) },
+  }
+}
+
+fn server_parts(rest: String) -> Result<Server, String> = {
+  let split = match split_at(rest, "/") { Some(s) -> s, None -> { head: rest, tail: "" } };
+  match rsplit_at(split.head, "@") {
+    None ->
+      Err(
+        "there is no `user@` before the host; a run whose database user comes from the environment is a run whose identity depends on who invoked it",
+      ),
+    Some(who) -> match credentials_of(who.head) {
+      Err(why) -> Err(why),
+      Ok(c) -> match hostport_of(who.tail) {
+        Err(why) -> Err(why),
+        Ok(hp) -> match database_of(split.tail) {
+          Err(why) -> Err(why),
+          Ok(database) -> match query_settings(database.query) {
+            Err(why) -> Err(why),
+            Ok(_) ->
+              Ok({
+                host: hp.host,
+                port: hp.port,
+                user: c.user,
+                database: database.name,
+                password: c.password,
+                client: pg::default_client(),
+              }),
+          },
+        },
+      },
+    },
+  }
+}
+
+fn query_settings(query: String) -> Result<Unit, String> =
+  if string_len(query) == 0 { Ok(()) } else {
+    fold(string_split(query, "&"), Ok(()), |acc: Result<Unit, String>, pair: String|
+      match acc {
+        Err(why) -> Err(why),
+        Ok(_) -> match split_at(pair, "=") {
+          None -> Err("`" ++ pair ++ "` is not a `key=value` parameter"),
+          Some(s) -> if s.head == "sslmode" {
+            if s.tail == "disable" || s.tail == "prefer" { Ok(()) } else {
+              Err(
+                "`sslmode=" ++ s.tail
+                  ++ "` is not configurable: TLS to postgres is not wired up, so only `disable` and `prefer` are read",
+              )
+            }
+          } else if s.head == "application_name" { Ok(()) }
+          else { Err("`" ++ s.head ++ "` is not a parameter this driver reads") },
+        },
+      })
+  }
+
+// The `db` effect served from a connection string: the driver, wrapped for a program that was
+// told where the server is rather than handling the effect's clauses itself.
+pub fn with_server<a | e>(
+  url: String,
+  size: Int,
+  body: () -> a / {db.read[*], db.write[*] | e},
+) -> Result<a, String> / {net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next | e} =
+  match server_of(url) { Err(why) -> Err(why), Ok(cfg) -> Ok(serve(cfg, size, nonce(), body)) }
+
+// --- Tests ------------------------------------------------------------------
+
+test "a connection string reads into the parts a driver needs" {
+  match server_of(
+      "postgres://ply:hunter2@127.0.0.1:5433/app?sslmode=disable&application_name=ply",
+    ) {
+    Err(why) -> panic(why),
+    Ok(s) -> {
+      assert_eq(s.user, "ply");
+      assert_eq(s.password, Some("hunter2"));
+      assert_eq(s.host, "127.0.0.1");
+      assert_eq(s.port, 5433);
+      assert_eq(s.database, "app")
+    },
+  }
+}
+
+test "a connection string may leave out the port, the password and the parameters" {
+  match server_of("postgresql://ply@db/app") {
+    Err(why) -> panic(why),
+    Ok(s) -> {
+      assert_eq(s.port, 5432);
+      assert_eq(s.password, None);
+      assert_eq(s.database, "app")
+    },
+  }
+}
+
+test "a password may hold what separates the fields, escaped" {
+  match server_of("postgres://ply:a%40b%3Ac@db/app") {
+    Err(why) -> panic(why),
+    Ok(s) -> assert_eq(s.password, Some("a@b:c")),
+  }
+}
+
+test "what a connection string cannot mean is refused rather than guessed" {
+  assert_err("host=db user=ply", "keyword");
+  assert_err("mysql://ply@db/app", "not a database");
+  assert_err("postgres://db/app", "user@");
+  assert_err("postgres://@db/app", "user is empty");
+  assert_err("postgres://ply@/app", "no host");
+  assert_err("postgres://ply@db:0/app", "port 0");
+  assert_err("postgres://ply@db:nine/app", "is not a port");
+  assert_err("postgres://ply@db/", "no database name");
+  assert_err("postgres://ply@db/app?sslmode=require", "sslmode=require");
+  assert_err("postgres://ply@db/app?timeout=3", "not a parameter");
+  assert_err("postgres://ply@db/app?sslmode", "key=value")
+}
+
+fn assert_err(url: String, wanted: String) -> Unit =
+  match server_of(url) {
+    Ok(_) -> panic("`" ++ url ++ "` was accepted"),
+    Err(why) ->
+      assert(
+        string_contains(why, wanted),
+        Some(
+          "`" ++ url ++ "` was refused with `" ++ why ++ "`, which does not name `" ++ wanted
+            ++ "`",
+        ),
+      ),
   }

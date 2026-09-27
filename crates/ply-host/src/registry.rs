@@ -2,7 +2,7 @@
 
 use crate::db::{self, Postgres};
 use crate::signal::{self, Accepting, Shutdown};
-use crate::{certgen, config, fs, process, sched, tcp, time, trace};
+use crate::{certgen, config, fs, process, random, sched, tcp, time, trace};
 use ply_eval::Value;
 use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownReport};
 use ply_span::{Diagnostic, Span, codes};
@@ -127,6 +127,7 @@ impl Host {
         for (op, handler) in sched::registrations() {
             registry.register(op, handler);
         }
+        random::register(&mut registry);
         if let Some(driver) = &self.db {
             db::register(&mut registry, Arc::clone(driver) as Arc<dyn db::Driver>);
         }

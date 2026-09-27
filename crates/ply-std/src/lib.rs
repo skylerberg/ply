@@ -36,6 +36,8 @@ pub const PKG: &str = include_str!("../ply/pkg.ply");
 
 pub const PROCESS: &str = include_str!("../ply/process.ply");
 
+pub const RANDOM: &str = include_str!("../ply/random.ply");
+
 pub const ROUTER: &str = include_str!("../ply/router.ply");
 
 pub const TRACE: &str = include_str!("../ply/trace.ply");
@@ -59,6 +61,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("std.pg", PG),
     ("std.pkg", PKG),
     ("std.process", PROCESS),
+    ("std.random", RANDOM),
     ("std.router", ROUTER),
     ("std.signal", SIGNAL),
     ("std.time", TIME),
