@@ -291,9 +291,10 @@ fn assert_bisected_to(dir: &TempDir, culprit: &str, innocent: &str) {
         found["search"]["evaluated"].as_u64().unwrap_or_default() > 0,
         "a mixture was actually run: {found}"
     );
-    // The answer is `culprit`, and the suspects are what the runtime ranked from the run's own
-    // evidence. Marking them is the program's verdict now, and the runtime does not write it back:
-    // until it does, a consumer reads the culprit from `culprit`, not from `suspects[0]`.
+    // A consumer that reads only `suspects[0]` has to get the best guess: the program's verdict
+    // marks the suspects it named, and they come first.
+    assert_eq!(failure["suspects"][0]["name"], culprit, "{failure}");
+    assert_eq!(failure["suspects"][0]["culprit"], true, "{failure}");
     assert!(
         failure["suspects"]
             .as_array()
