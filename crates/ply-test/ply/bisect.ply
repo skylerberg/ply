@@ -1,0 +1,795 @@
+import delta (Change, Cluster, Delta, DefKey, FusionReason, Ns, candidates, edited, is_singleton,
+              no_edges, reason_describe, reason_word, with_components)
+
+// `bisect` — finding the smallest set of changes that reproduces a failure, by asking a caller to
+// build and run a *mixture*: some definitions from before the test last passed, some from now.
+//
+// The search is Zeller's ddmin over the fusion groups `delta` produced, three-valued so that a
+// mixture nobody could answer — a body missing from the store, two eras that do not typecheck
+// together — is *not* evidence. Two questions bracket it: the whole set must fail and the empty set
+// must pass, or the failure is not a function of the definition set and there is nothing to narrow.
+// A trial the caller answered from its own result cache is free, and the cap is in trials rather
+// than seconds so an artifact does not vary with machine load.
+//
+// The caller owns the re-run and the cache: `hybrid` receives the delta and the cluster indices to
+// take from the post-edit side. Because the state is threaded rather than mutated, what the search
+// decided is a function of the trials it was given and nothing else.
+
+// `--bisect`.
+pub type Mode = | Auto | Always | Never
+
+pub fn mode_word(m: Mode) -> String =
+  match m { Auto -> "auto", Always -> "always", Never -> "never" }
+
+pub fn mode_parse(s: String) -> Option<Mode> =
+  if s == "auto" { Some(Auto) }
+  else if s == "always" { Some(Always) }
+  else if s == "never" { Some(Never) }
+  else { None }
+
+// `--bisect=always` ignores the budget and nothing else: waiving a precondition would invent
+// evidence.
+pub fn mode_budget(m: Mode, requested: Budget) -> Budget =
+  match m { Always -> unlimited(), _ -> requested }
+
+// What the caller knows about the run before the search starts.
+pub type Gate = {
+  mode: Mode,
+  /// The interpreter failed rather than the program.
+  defect: Bool,
+  /// The run reached a host handler, so re-running it would repeat whatever it did outside.
+  host: Bool,
+  /// `test/nondet`, whose outcome is not a function of the definition set.
+  nondet: Bool,
+  baseline: Bool,
+}
+
+// The reason to skip, or `None` to go ahead. Checked in order of what each answer is worth to a
+// consumer: a run nobody asked to bisect says so before it says anything else.
+pub fn precheck(g: Gate) -> Option<Skipped> =
+  if g.mode == Never { Some(NotRequested) }
+  else if g.defect { Some(Panicked) }
+  else if g.host { Some(Host) }
+  else if g.nondet { Some(Nondet) }
+  else if !g.baseline { Some(NeverPassed) }
+  else { None }
+
+pub type Unresolved = | DoesNotCheck | DifferentFailure | MissingBody | BudgetSpent
+
+pub fn unresolved_word(u: Unresolved) -> String =
+  match u {
+    DoesNotCheck -> "does not typecheck",
+    DifferentFailure -> "a different failure",
+    MissingBody -> "a body is missing from the store",
+    BudgetSpent -> "budget spent",
+  }
+
+pub type TrialOutcome = | Fails | Passes | Unresolved(Unresolved)
+
+pub type Trial = {
+  outcome: TrialOutcome,
+  /// Answered from the caller's result cache rather than by evaluating anything.
+  cached: Bool,
+}
+
+pub fn a_failure() -> Trial = { outcome: Fails, cached: false }
+
+pub fn a_pass() -> Trial = { outcome: Passes, cached: false }
+
+pub fn unresolved_trial(why: Unresolved) -> Trial = { outcome: Unresolved(why), cached: false }
+
+pub fn from_cache(t: Trial) -> Trial = { ..t, cached: true }
+
+// A cap in hybrid *evaluations*, not seconds, so the artifact does not vary with machine load. No
+// cap at all is `None`: the Rust side spells that `usize::MAX`, which no `Int` here could hold, and
+// a large number would silently become a cap of its own the day a search reached it.
+pub type Budget = { max_trials: Option<Int> }
+
+// Enough for a clean bisection over a large candidate set, small enough not to outlast the run.
+pub fn default_budget() -> Budget = { max_trials: Some(64) }
+
+// `--bisect=always` still needs a ceiling; this is no ceiling at all.
+pub fn unlimited() -> Budget = { max_trials: None }
+
+pub type SearchStats = {
+  candidates: Int,
+  clusters: Int,
+  /// Hybrids actually built and run.
+  evaluated: Int,
+  cached: Int,
+  /// Subsets the search would have asked about twice.
+  memoized: Int,
+  unresolved: Int,
+  /// The budget ran out, so the result is a superset of the cause rather than a minimal set.
+  exhausted: Bool,
+}
+
+pub type Skipped =
+  | NotRequested
+  | NeverPassed
+  | Host
+  | Nondet
+  | Panicked
+  | NoChanges
+  | NoBodies
+  | NoHybrids
+
+pub fn skipped_word(s: Skipped) -> String =
+  match s {
+    NotRequested -> "not_requested",
+    NeverPassed -> "never_passed",
+    Host -> "host",
+    Nondet -> "nondet",
+    Panicked -> "panicked",
+    NoChanges -> "no_changes",
+    NoBodies -> "no_bodies",
+    NoHybrids -> "no_hybrids",
+  }
+
+pub fn skipped_describe(s: Skipped) -> String =
+  match s {
+    NotRequested -> "bisection was not requested for this run",
+    NeverPassed ->
+      "this test has never passed, so there is no earlier definition set to compare against",
+    Host ->
+      "this failure came from a run that reached a host handler, and bisecting it would re-run the test — and repeat whatever it did outside the program — once per candidate definition set",
+    Nondet ->
+      "`test/nondet` is not a function of the definition set, so bisecting it would prove nothing",
+    Panicked ->
+      "the interpreter failed rather than the program; this is a defect in Ply, and no change in the program explains it",
+    NoChanges -> "no definition in this test's closure changed since it last passed",
+    NoBodies -> "the store does not hold the definition bodies a hybrid program would need",
+    NoHybrids ->
+      "this build cannot mix two eras of a definition graph, so the change set could not be narrowed by running it",
+  }
+
+pub type Verdict =
+  | Bisected
+  | Sole
+  /// The baseline definitions with this test's current body already fail: the test edit matters.
+  | TestChanged
+  /// The same, but the test was not edited, so nothing in the definition graph explains it.
+  | NotInTheGraph
+  | NotReproduced
+  /// Every hybrid the search could form was unresolved.
+  | Inconclusive
+  | NotAttempted(Skipped)
+
+pub fn verdict_word(v: Verdict) -> String =
+  match v {
+    Bisected -> "bisected",
+    Sole -> "sole",
+    TestChanged -> "test_changed",
+    NotInTheGraph -> "not_in_the_graph",
+    NotReproduced -> "not_reproduced",
+    Inconclusive -> "inconclusive",
+    NotAttempted(_) -> "not_attempted",
+  }
+
+pub fn verdict_skipped(v: Verdict) -> Option<Skipped> =
+  match v { NotAttempted(s) -> Some(s), _ -> None }
+
+// Whether the culprit set is an answer rather than a fallback.
+pub fn names_a_culprit(v: Verdict) -> Bool =
+  match v { Bisected -> true, Sole -> true, TestChanged -> true, _ -> false }
+
+// How much the culprit set may be trusted.
+pub type Confidence = | Minimal | Fused | Partial | Unproven
+
+pub fn confidence_word(c: Confidence) -> String =
+  match c { Minimal -> "minimal", Fused -> "fused", Partial -> "partial", Unproven -> "none" }
+
+pub type Bisection = {
+  verdict: Verdict,
+  confidence: Confidence,
+  /// The minimal failure-inducing change set, one entry per fused group.
+  groups: List<List<String>>,
+  /// One sentence saying what happened and what to do about it.
+  reason: String,
+  search: SearchStats,
+}
+
+fn no_stats() -> SearchStats =
+  {
+    candidates: 0,
+    clusters: 0,
+    evaluated: 0,
+    cached: 0,
+    memoized: 0,
+    unresolved: 0,
+    exhausted: false,
+  }
+
+pub fn not_attempted(why: Skipped) -> Bisection =
+  {
+    verdict: NotAttempted(why),
+    confidence: Unproven,
+    groups: [],
+    reason: skipped_describe(why),
+    search: no_stats(),
+  }
+
+pub fn culprits(b: Bisection) -> List<String> = sorted_names(flatten_strings(b.groups))
+
+pub fn is_conclusive(b: Bisection) -> Bool = names_a_culprit(b.verdict) && len(b.groups) > 0
+
+// --- The search -------------------------------------------------------------
+
+// Finds the smallest set of changes that reproduces the failure. `hybrid` builds and runs the
+// mixture the given cluster indices select, and answers what it observed.
+pub fn bisect(delta: Delta, hybrid: (Delta, List<Int>) -> Trial, budget: Budget) -> Bisection = {
+  let st = {
+    delta: delta,
+    hybrid: hybrid,
+    budget: budget,
+    stats: {
+      candidates: candidates(delta),
+      clusters: len(delta.clusters),
+      evaluated: 0,
+      cached: 0,
+      memoized: 0,
+      unresolved: 0,
+      exhausted: false,
+    },
+    memo: [],
+  };
+  run(st)
+}
+
+// The state the search threads: the trials it has already asked about, and what it has counted.
+type Search = {
+  delta: Delta,
+  hybrid: (Delta, List<Int>) -> Trial,
+  budget: Budget,
+  stats: SearchStats,
+  memo: List<{ key: List<Int>, outcome: TrialOutcome }>,
+}
+
+fn run(st: Search) -> Bisection = {
+  let n = len(st.delta.clusters);
+  if n == 0 {
+    match st.delta.own {
+      Some(own_change) -> test_changed(st, own_change.name),
+      None -> not_attempted(NoChanges),
+    }
+  } else if n == 1 {
+    // One cluster is free unless the test was edited too; then `H(∅)` tells the two apart. With no
+    // test edit there is nothing to ask, and asking anyway would spend a trial on nothing.
+    let cluster = at_or(st.delta.clusters, 0);
+    let sole = "only one change could be flipped: " ++ join_names(cluster.members);
+    match st.delta.own {
+      None -> conclude(st, Sole, [cluster.members], sole),
+      Some(own_change) -> {
+        let asked = ask(st, []);
+        if asked.outcome != Fails { conclude(asked.st, Sole, [cluster.members], sole) }
+        else { test_changed(asked.st, own_change.name) }
+      },
+    }
+  } else { narrow(st, n) }
+}
+
+fn narrow(st: Search, n: Int) -> Bisection = {
+  let all = range(0, n);
+  let whole = ask(st, all);
+  match whole.outcome {
+    Passes ->
+      conclude(
+        whole.st,
+        NotReproduced,
+        [],
+        "replaying the current program did not reproduce the failure; re-run the test before acting on it",
+      ),
+    Unresolved(why) ->
+      conclude(
+        whole.st,
+        Inconclusive,
+        [],
+        "the current program could not be replayed: " ++ unresolved_word(why),
+      ),
+    Fails -> {
+      let none = ask(whole.st, []);
+      if none.outcome == Fails {
+        match none.st.delta.own {
+          Some(own_change) -> test_changed(none.st, own_change.name),
+          None ->
+            conclude(
+              none.st,
+              NotInTheGraph,
+              [],
+              "the failure reproduces against the definitions as they were when this test last passed, and the test itself did not change — nothing in the definition graph explains it. Look for a `nondet` effect, something outside the program, or a defect in Ply",
+            ),
+        }
+      } else {
+        let narrowed = ddmin(none.st, all, 2);
+        let minimal = narrowed.set;
+        let st2 = narrowed.st;
+        let groups = map(minimal, |i: Int| at_or(st2.delta.clusters, i).members);
+        // Narrowing nothing around unanswerable mixtures is not a bisection.
+        if len(minimal) == n && st2.stats.unresolved > 0 {
+          conclude(
+            st2,
+            Inconclusive,
+            groups,
+            "no mixture of the " ++ int_to_string(n) ++ " changes could be evaluated: "
+              ++ int_to_string(st2.stats.unresolved)
+              ++ " of them did not typecheck or could not be built, so every change is still a candidate",
+          )
+        } else {
+          conclude(
+            st2,
+            Bisected,
+            groups,
+            "narrowed " ++ int_to_string(st2.stats.candidates) ++ " changed "
+              ++ plural(st2.stats.candidates, "definition")
+              ++ " to "
+              ++ join_names(flatten_strings(groups))
+              ++ " in "
+              ++ int_to_string(st2.stats.evaluated)
+              ++ " "
+              ++ plural(st2.stats.evaluated, "run")
+              ++ " ("
+              ++ int_to_string(st2.stats.cached)
+              ++ " answered from the cache)",
+          )
+        }
+      }
+    },
+  }
+}
+
+/// The constraint that fused a multi-member group, so it is not read as a failed search.
+fn fused_because(delta: Delta) -> Option<String> = {
+  let reasons = sorted_reasons(
+    map(filter(delta.clusters, |c: Cluster| !is_singleton(c)), |c: Cluster| c.reason),
+  );
+  match deduped_reasons(reasons) { [only] -> Some(reason_describe(only)), _ -> None }
+}
+
+fn test_changed(st: Search, name: String) -> Bisection =
+  conclude(
+    st,
+    TestChanged,
+    [[name]],
+    "the failure does not turn on any definition that changed, and `" ++ name
+      ++ "` was itself edited — the edit to the test is what to look at",
+  )
+
+/// Zeller's ddmin over cluster indices, three-valued so an unresolved mixture is not evidence.
+fn ddmin(st: Search, set: List<Int>, parts: Int) -> { set: List<Int>, st: Search } = {
+  if len(set) <= 1 || st.stats.exhausted { { set: set, st: st } } else {
+    let chunks = split(set, min(parts, len(set)));
+    let first = failing_chunk(st, chunks);
+    match first.hit {
+      Some(chunk) -> ddmin(first.st, chunk, 2),
+      None -> if first.st.stats.exhausted { { set: set, st: first.st } } else {
+        let second = failing_rest(first.st, set, chunks);
+        match second.hit {
+          Some(rest) -> ddmin(second.st, rest, max(parts - 1, 2)),
+          None -> if second.st.stats.exhausted { { set: set, st: second.st } }
+          else if parts >= len(set) { { set: set, st: second.st } }
+          else { ddmin(second.st, set, min(parts * 2, len(set))) },
+        }
+      },
+    }
+  }
+}
+
+// A chunk that fails on its own is a smaller answer than the whole set.
+fn failing_chunk(st: Search, chunks: List<List<Int>>) -> { hit: Option<List<Int>>, st: Search } =
+  fold(
+    chunks,
+    { hit: None, st: st },
+    |acc: { hit: Option<List<Int>>, st: Search }, chunk: List<Int>|
+      match acc.hit {
+        Some(_) -> acc,
+        None -> if acc.st.stats.exhausted { acc } else {
+          let trial = ask(acc.st, chunk);
+          if trial.outcome == Fails { { hit: Some(chunk), st: trial.st } }
+          else { { hit: None, st: trial.st } }
+        },
+      },
+  )
+
+// Everything but a chunk, which is the complement ddmin also tries.
+fn failing_rest(
+  st: Search,
+  set: List<Int>,
+  chunks: List<List<Int>>,
+) -> { hit: Option<List<Int>>, st: Search } =
+  fold(
+    chunks,
+    { hit: None, st: st },
+    |acc: { hit: Option<List<Int>>, st: Search }, chunk: List<Int>|
+      match acc.hit {
+        Some(_) -> acc,
+        None -> if acc.st.stats.exhausted { acc } else {
+          let rest = filter(set, |i: Int| !contains_int(chunk, i));
+          if is_empty(rest) { acc } else {
+            let trial = ask(acc.st, rest);
+            if trial.outcome == Fails { { hit: Some(rest), st: trial.st } }
+            else { { hit: None, st: trial.st } }
+          }
+        },
+      },
+  )
+
+// The memo is keyed by the set as a sorted, deduplicated list, so the search never asks twice.
+fn ask(st: Search, set: List<Int>) -> { outcome: TrialOutcome, st: Search } = {
+  let key = sorted_ints(set);
+  match memo_lookup(st.memo, key) {
+    Some(outcome) ->
+      { outcome: outcome, st: { ..st, stats: { ..st.stats, memoized: st.stats.memoized + 1 } } },
+    None -> if out_of_budget(st) {
+      { outcome: Unresolved(BudgetSpent), st: { ..st, stats: { ..st.stats, exhausted: true } } }
+    } else {
+      // A field call would read as a `perform`, so the callback is bound by name first.
+      let hybrid = st.hybrid;
+      let trial: Trial = hybrid(st.delta, key);
+      {
+        outcome: trial.outcome,
+        st: {
+          ..st,
+          stats: {
+            ..st.stats,
+            evaluated: st.stats.evaluated + (if trial.cached { 0 } else { 1 }),
+            cached: st.stats.cached + (if trial.cached { 1 } else { 0 }),
+            unresolved: st.stats.unresolved + (match trial.outcome { Unresolved(_) -> 1, _ -> 0 }),
+          },
+          memo: push(st.memo, { key: key, outcome: trial.outcome }),
+        },
+      }
+    },
+  }
+}
+
+fn out_of_budget(st: Search) -> Bool =
+  match st.budget.max_trials { None -> false, Some(max) -> st.stats.evaluated >= max }
+
+fn memo_lookup(
+  memo: List<{ key: List<Int>, outcome: TrialOutcome }>,
+  key: List<Int>,
+) -> Option<TrialOutcome> =
+  match filter(memo, |m: { key: List<Int>, outcome: TrialOutcome }| same_ints(m.key, key)) {
+    [] -> None,
+    hits -> Some(at_or(hits, 0).outcome),
+  }
+
+fn conclude(st: Search, verdict: Verdict, groups: List<List<String>>, reason: String) -> Bisection = {
+  // Any unresolved trial disqualifies minimality: the search walked around a question.
+  let confidence = if is_empty(groups) { Unproven }
+  else if st.stats.exhausted || st.stats.unresolved > 0 || st.delta.unclassified > 0 { Partial }
+  else if every(groups, |g: List<String>| len(g) == 1) { Minimal }
+  else { Fused };
+  let full = match fused_because(st.delta) { Some(why) -> reason ++ "; " ++ why, None -> reason };
+  { verdict: verdict, confidence: confidence, groups: groups, reason: full, search: st.stats }
+}
+
+// Near-equal chunks in index order, so the trial sequence is reproducible.
+fn split(set: List<Int>, parts: Int) -> List<List<Int>> = {
+  let p = min(max(parts, 1), max(len(set), 1));
+  fold(
+    range(0, p),
+    { at: 0, chunks: [] },
+    |st: { at: Int, chunks: List<List<Int>> }, part: Int| {
+      let end = len(set) * (part + 1) / p;
+      if end > st.at { { at: end, chunks: push(st.chunks, slice_ints(set, st.at, end)) } }
+      else { st }
+    },
+  ).chunks
+}
+
+fn slice_ints(xs: List<Int>, from: Int, to: Int) -> List<Int> =
+  map(range(from, to), |i: Int| at_or(xs, i))
+
+// --- Helpers ------------------------------------------------------------------
+
+fn join_names(names: List<String>) -> String =
+  fold(names, "", |acc: String, n: String| if acc == "" { n } else { acc ++ ", " ++ n })
+
+fn plural(n: Int, word: String) -> String = if n == 1 { word } else { word ++ "s" }
+
+fn flatten_strings(groups: List<List<String>>) -> List<String> =
+  fold(groups, [], |acc: List<String>, g: List<String>|
+    fold(g, acc, |out: List<String>, s: String| push(out, s)))
+
+fn sorted_names(names: List<String>) -> List<String> =
+  fold(names, [], |acc: List<String>, n: String| {
+    if contains_text(acc, n) { acc } else {
+      let at = fold(range(0, len(acc)), len(acc), |i: Int, j: Int|
+        if i < len(acc) { i } else if compare(n, at_or(acc, j)) == Less { j } else { i });
+      let before = map(range(0, at), |j: Int| at_or(acc, j));
+      fold(range(at, len(acc)), push(before, n), |out: List<String>, j: Int|
+        push(out, at_or(acc, j)))
+    }
+  })
+
+fn sorted_ints(xs: List<Int>) -> List<Int> =
+  fold(xs, [], |acc: List<Int>, x: Int| {
+    if contains_int(acc, x) { acc } else {
+      let at = fold(range(0, len(acc)), len(acc), |i: Int, j: Int|
+        if i < len(acc) { i } else if x < at_or(acc, j) { j } else { i });
+      let before = map(range(0, at), |j: Int| at_or(acc, j));
+      fold(range(at, len(acc)), push(before, x), |out: List<Int>, j: Int| push(out, at_or(acc, j)))
+    }
+  })
+
+// A reason's own order for a report: by the word it prints, and then deduplicated.
+fn sorted_reasons(rs: List<FusionReason>) -> List<FusionReason> =
+  fold(rs, [], |acc: List<FusionReason>, r: FusionReason| {
+    let at = fold(range(0, len(acc)), len(acc), |i: Int, j: Int|
+      if i < len(acc) { i }
+      else if compare(reason_word(r), reason_word(at_or(acc, j))) == Less { j }
+      else { i });
+    let before = map(range(0, at), |j: Int| at_or(acc, j));
+    fold(range(at, len(acc)), push(before, r), |out: List<FusionReason>, j: Int|
+      push(out, at_or(acc, j)))
+  })
+
+fn deduped_reasons(rs: List<FusionReason>) -> List<FusionReason> =
+  fold(rs, [], |acc: List<FusionReason>, r: FusionReason|
+    match acc {
+      [] -> [r],
+      _ -> if reason_word(at_or(acc, len(acc) - 1)) == reason_word(r) { acc } else { push(acc, r) },
+    })
+
+fn contains_int(xs: List<Int>, x: Int) -> Bool =
+  fold(xs, false, |found: Bool, y: Int| found || y == x)
+
+fn same_ints(a: List<Int>, b: List<Int>) -> Bool =
+  len(a) == len(b)
+    && fold(range(0, len(a)), true, |ok: Bool, i: Int| ok && at_or(a, i) == at_or(b, i))
+
+fn contains_text(xs: List<String>, x: String) -> Bool =
+  fold(xs, false, |found: Bool, y: String| found || y == x)
+
+fn every<a>(xs: List<a>, p: (a) -> Bool) -> Bool = fold(xs, true, |ok: Bool, x: a| ok && p(x))
+
+fn is_empty<a>(xs: List<a>) -> Bool = len(xs) == 0
+
+fn at_or<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list holds") }
+
+// --- Tests ------------------------------------------------------------------
+//
+// The expectations are the runtime's own answers for the same scripted runs, printed from a scratch
+// run against it. A scripted mixture fails exactly when every culprit index is in it — the one rule
+// ddmin is designed for — and the reasons are pinned whole, because the wording and the counts are
+// the artifact a person reads.
+
+// What a scripted mixture answers: unanswerable first, then the culprit rule.
+fn scripted(culprit: List<Int>, unanswerable: List<Int>, flipped: List<Int>) -> Trial =
+  if contains_int_any(unanswerable, flipped) { unresolved_trial(DoesNotCheck) }
+  else if every(culprit, |k: Int| contains_int(flipped, k)) { a_failure() }
+  else { a_pass() }
+
+fn contains_int_any(needles: List<Int>, haystack: List<Int>) -> Bool =
+  fold(needles, false, |found: Bool, n: Int| found || contains_int(haystack, n))
+
+fn delta_of(n: Int) -> Delta =
+  with_components(
+    None,
+    map(range(0, n), |i: Int| edited("d" ++ int_to_string(i), "h1", "h2", true)),
+    no_edges(),
+    [],
+  )
+
+fn capped(n: Int) -> Budget = { max_trials: Some(n) }
+
+fn show(b: Bisection) -> String =
+  verdict_word(b.verdict) ++ " " ++ confidence_word(b.confidence) ++ " " ++ b.reason
+
+fn search_of(b: Bisection) -> List<Int> =
+  [
+    b.search.candidates,
+    b.search.clusters,
+    b.search.evaluated,
+    b.search.cached,
+    b.search.memoized,
+    b.search.unresolved,
+  ]
+
+test "a search narrows four changes to the one that matters" {
+  let culprit = [2];
+  let b = bisect(
+    delta_of(4),
+    |_d: Delta, flipped: List<Int>| scripted(culprit, [], flipped),
+    capped(64),
+  );
+  assert_eq(b.groups, [["d2"]]);
+  assert_eq(b.confidence, Minimal);
+  assert_eq(b.verdict, Bisected);
+  assert_eq(b.reason, "narrowed 4 changed definitions to d2 in 5 runs (0 answered from the cache)");
+  assert_eq(search_of(b), [4, 4, 5, 0, 0, 0]);
+  assert_eq(b.search.exhausted, false);
+  assert_eq(is_conclusive(b), true);
+  assert_eq(culprits(b), ["d2"])
+}
+
+test "two culprits come back as two groups, and the search memoizes what it asked twice" {
+  let culprit = [1, 3];
+  let b = bisect(
+    delta_of(4),
+    |_d: Delta, flipped: List<Int>| scripted(culprit, [], flipped),
+    capped(64),
+  );
+  assert_eq(b.groups, [["d1"], ["d3"]]);
+  assert_eq(b.confidence, Minimal);
+  assert_eq(
+    b.reason,
+    "narrowed 4 changed definitions to d1, d3 in 10 runs (0 answered from the cache)",
+  );
+  // Ten subsets the search would have asked about twice, answered from the memo instead.
+  assert_eq(b.search.memoized, 10)
+}
+
+test "everything failing is not a definition graph at all" {
+  // Every mixture fails, including the baseline definitions with the test's current body: nothing
+  // in the graph explains it, and the reason says where else to look.
+  let b = bisect(
+    delta_of(4),
+    |_d: Delta, flipped: List<Int>| scripted([], [], flipped),
+    capped(64),
+  );
+  assert_eq(b.verdict, NotInTheGraph);
+  assert_eq(b.confidence, Unproven);
+  assert_eq(b.groups, []);
+  assert_eq(
+    b.reason,
+    "the failure reproduces against the definitions as they were when this test last passed, and the test itself did not change — nothing in the definition graph explains it. Look for a `nondet` effect, something outside the program, or a defect in Ply",
+  );
+  assert_eq(search_of(b), [4, 4, 2, 0, 0, 0]);
+  assert_eq(is_conclusive(b), false)
+}
+
+test "a change set nothing can be narrowed out of stays whole" {
+  let culprit = [0, 1, 2, 3];
+  let b = bisect(
+    delta_of(4),
+    |_d: Delta, flipped: List<Int>| scripted(culprit, [], flipped),
+    capped(64),
+  );
+  assert_eq(b.groups, [["d0"], ["d1"], ["d2"], ["d3"]]);
+  assert_eq(b.confidence, Minimal);
+  assert_eq(
+    b.reason,
+    "narrowed 4 changed definitions to d0, d1, d2, d3 in 12 runs (0 answered from the cache)",
+  );
+  assert_eq(search_of(b), [4, 4, 12, 0, 2, 0])
+}
+
+test "the current program not replaying is inconclusive, not a pass" {
+  let b = bisect(
+    delta_of(4),
+    |_d: Delta, flipped: List<Int>| scripted([2], [0], flipped),
+    capped(64),
+  );
+  assert_eq(b.verdict, Inconclusive);
+  assert_eq(b.groups, []);
+  assert_eq(b.reason, "the current program could not be replayed: does not typecheck");
+  assert_eq(b.search.unresolved, 1)
+}
+
+test "a budget that runs out answers with a superset, and says so" {
+  let culprit = [2];
+  let b = bisect(
+    delta_of(4),
+    |_d: Delta, flipped: List<Int>| scripted(culprit, [], flipped),
+    capped(2),
+  );
+  assert_eq(b.groups, [["d0"], ["d1"], ["d2"], ["d3"]]);
+  // Partial: the search walked around a question, so minimality is not claimed.
+  assert_eq(b.confidence, Partial);
+  assert_eq(b.search.exhausted, true);
+  assert_eq(search_of(b), [4, 4, 2, 0, 0, 0])
+}
+
+test "one change is free unless the test was edited too" {
+  // No test edit: the cluster is the answer, and no trial is spent to learn it.
+  let b = bisect(
+    delta_of(1),
+    |_d: Delta, flipped: List<Int>| scripted([0], [], flipped),
+    capped(64),
+  );
+  assert_eq(b.verdict, Sole);
+  assert_eq(b.groups, [["d0"]]);
+  assert_eq(b.reason, "only one change could be flipped: d0");
+  assert_eq(b.search.evaluated, 0);
+  // A test edit too, and the baseline definitions pass: the cluster is still the answer.
+  let d = with_components(
+    Some(edited("m.t", "h1", "h2", true)),
+    [edited("d0", "h1", "h2", true)],
+    no_edges(),
+    [],
+  );
+  let b = bisect(d, |_d: Delta, flipped: List<Int>| scripted([0], [], flipped), capped(64));
+  assert_eq(b.verdict, Sole);
+  assert_eq(b.search.evaluated, 1);
+  // A test edit too, and they fail together: the edit to the test is what to look at.
+  let b = bisect(d, |_d: Delta, flipped: List<Int>| scripted([], [], flipped), capped(64));
+  assert_eq(b.verdict, TestChanged);
+  assert_eq(b.groups, [["m.t"]]);
+  assert_eq(
+    b.reason,
+    "the failure does not turn on any definition that changed, and `m.t` was itself edited — the edit to the test is what to look at",
+  )
+}
+
+test "nothing to search is said plainly, not as a failure to narrow" {
+  // No cluster and a test edit: the edit is the answer with no runs at all.
+  let d = with_components(Some(edited("m.t", "h1", "h2", true)), [], no_edges(), []);
+  let b = bisect(d, |_d: Delta, flipped: List<Int>| scripted([], [], flipped), capped(64));
+  assert_eq(b.verdict, TestChanged);
+  assert_eq(b.search.evaluated, 0);
+  // No cluster and no test edit: there is nothing to explain the failure.
+  let b = bisect(
+    delta_of(0),
+    |_d: Delta, flipped: List<Int>| scripted([], [], flipped),
+    capped(64),
+  );
+  assert_eq(b.verdict, NotAttempted(NoChanges));
+  assert_eq(b.confidence, Unproven);
+  assert_eq(b.reason, "no definition in this test's closure changed since it last passed")
+}
+
+test "every mixture unanswerable is inconclusive with every change still named" {
+  // The script answers `does not typecheck` whenever cluster `0` is in the mixture, so nothing can
+  // be narrowed: the verdict says so rather than claiming a culprit set.
+  let b = bisect(
+    delta_of(4),
+    |_d: Delta, flipped: List<Int>| scripted([2], [0], flipped),
+    capped(64),
+  );
+  assert_eq(b.verdict, Inconclusive)
+}
+
+test "the gate asks in the order of what each answer is worth" {
+  let go = { mode: Auto, defect: false, host: false, nondet: false, baseline: true };
+  assert_eq(precheck(go), None);
+  assert_eq(precheck({ ..go, mode: Never }), Some(NotRequested));
+  // A defect in the interpreter outranks everything below it, and being skipped for a host outranks
+  // a `nondet` outcome.
+  assert_eq(precheck({ ..go, mode: Never, defect: true }), Some(NotRequested));
+  assert_eq(precheck({ ..go, defect: true, host: true }), Some(Panicked));
+  assert_eq(precheck({ ..go, host: true, nondet: true }), Some(Host));
+  assert_eq(precheck({ ..go, nondet: true, baseline: false }), Some(Nondet));
+  assert_eq(precheck({ ..go, baseline: false }), Some(NeverPassed))
+}
+
+test "a mode parses, prints, and says what to do to the budget" {
+  assert_eq(mode_parse("auto"), Some(Auto));
+  assert_eq(mode_parse("always"), Some(Always));
+  assert_eq(mode_parse("never"), Some(Never));
+  assert_eq(mode_parse("sometimes"), None);
+  assert_eq(mode_word(Auto), "auto");
+  // Only `always` ignores the ceiling, and it ignores it entirely.
+  assert_eq(mode_budget(Always, capped(3)), unlimited());
+  assert_eq(mode_budget(Auto, capped(3)), capped(3));
+  assert_eq(mode_budget(Never, capped(3)), capped(3));
+  assert_eq(default_budget(), capped(64))
+}
+
+test "every word a skipped search prints" {
+  assert_eq(skipped_word(NotRequested), "not_requested");
+  assert_eq(skipped_word(NeverPassed), "never_passed");
+  assert_eq(skipped_word(Host), "host");
+  assert_eq(skipped_word(Nondet), "nondet");
+  assert_eq(skipped_word(Panicked), "panicked");
+  assert_eq(skipped_word(NoChanges), "no_changes");
+  assert_eq(skipped_word(NoBodies), "no_bodies");
+  assert_eq(skipped_word(NoHybrids), "no_hybrids");
+  assert_eq(verdict_word(NotAttempted(Host)), "not_attempted");
+  assert_eq(verdict_skipped(NotAttempted(Host)), Some(Host));
+  assert_eq(verdict_skipped(Bisected), None);
+  assert_eq(names_a_culprit(Sole), true);
+  assert_eq(names_a_culprit(Inconclusive), false);
+  assert_eq(unresolved_word(BudgetSpent), "budget spent");
+  assert_eq(unresolved_word(DifferentFailure), "a different failure");
+  assert_eq(
+    not_attempted(Host).reason,
+    "this failure came from a run that reached a host handler, and bisecting it would re-run the test — and repeat whatever it did outside the program — once per candidate definition set",
+  );
+  assert_eq(
+    show(not_attempted(NeverPassed)),
+    "not_attempted none " ++ skipped_describe(NeverPassed),
+  )
+}
