@@ -4,7 +4,7 @@ use crate::load::{LoadError, Loaded};
 use ply_eval::host::{HostBinding, HostRuntime};
 use ply_eval::{DEFAULT_MAX_CALLS, Machine, Seed, Value};
 use ply_prove::concurrency::{self, BodyRun, LawSearch, ValueDomain};
-use ply_prove::domain::{self, Finite};
+use ply_prove::domain::Finite;
 use ply_prove::property::{self, GenStream, Judge, Outcome, TypeWorld, judge_case, run_property};
 use ply_prove::prove::claims::{Clause, Code, Definition, Law};
 use ply_prove::prove::{self, Blocker, Claims, Decision, Goal, Limits, Proof};
@@ -342,20 +342,49 @@ enum Static {
 }
 
 impl ply_test::obligation::Discharger for Prover<'_> {
-    fn discharge(&self, obligation: &Obligation, plan: &ProvePlan) -> Discharge {
-        self.discharge_with(obligation, plan)
+    fn discharge(
+        &self,
+        obligation: &Obligation,
+        plan: &ProvePlan,
+        domain: Option<&ply_test::obligation::Domain>,
+    ) -> Discharge {
+        self.discharge_with(obligation, plan, domain)
     }
 }
 
 impl<'a> Prover<'a> {
-    /// One obligation, at the strongest tier this build can demonstrate.
-    pub fn discharge_with(&self, obligation: &Obligation, plan: &ProvePlan) -> Discharge {
+    /// The types the laws are written over: what a program needs to measure a binder's domain.
+    pub fn world(&self) -> &TypeWorld {
+        &self.world
+    }
+
+    /// One obligation, at the strongest tier this build can demonstrate. `domain` is the program's
+    /// own measurement of its binders, or `None` when it decided to sample: whether the domain is
+    /// finite is `domain.ply`'s answer now, and this side materialises the points.
+    pub fn discharge_with(
+        &self,
+        obligation: &Obligation,
+        plan: &ProvePlan,
+        measured: Option<&ply_test::obligation::Domain>,
+    ) -> Discharge {
+        let measured_domain = measured.and_then(|d| {
+            ply_prove::domain::Finite::of_sizes(
+                obligation
+                    .generated()
+                    .iter()
+                    .map(|b| b.ty.clone())
+                    .collect(),
+                d.sizes.clone(),
+            )
+            .map(|finite| (finite, d.name.clone()))
+        });
+        let measured_domain = measured_domain.as_ref();
         let Some(claim) = self.claim(obligation) else {
             return Discharge::Unattempted(Gap::UnhandledEffect(obligation.footprint.clone()));
         };
 
         if obligation.is_concurrency_law() {
-            return self.search_interleavings(obligation, &claim, plan);
+            return self.search_interleavings(obligation, &claim, plan, measured_domain);
         }
 
         if obligation.host {
@@ -384,8 +413,15 @@ impl<'a> Prover<'a> {
             Err(gap) => return Discharge::Unattempted(gap),
         };
 
-        if let Some(finite) = domain::finite(obligation.generated(), &self.world) {
-            return self.enumerate(obligation, &claim, &finite, &mut cases, witness);
+        if let Some((finite, name)) = measured_domain {
+            return self.enumerate(
+                obligation,
+                &claim,
+                finite,
+                name.as_str(),
+                &mut cases,
+                witness,
+            );
         }
 
         let discharge = run_property(
@@ -595,7 +631,7 @@ impl<'a> Prover<'a> {
             return Discharge::Unattempted(Gap::UnhandledEffect(obligation.footprint.clone()));
         };
         if obligation.is_concurrency_law() {
-            return self.search_interleavings(obligation, &claim, plan);
+            return self.search_interleavings(obligation, &claim, plan, None);
         }
         if let Some(footprint) = self.unhandled(obligation) {
             return Discharge::Unattempted(Gap::UnhandledEffect(footprint));
@@ -660,6 +696,7 @@ impl<'a> Prover<'a> {
         obligation: &Obligation,
         claim: &Claim<'_>,
         finite: &Finite,
+        name: &str,
         cases: &mut Cases<'a>,
         witness: Option<Proof>,
     ) -> Discharge {
@@ -716,7 +753,7 @@ impl<'a> Prover<'a> {
             Rule::GroundEvaluation
         } else {
             Rule::ExhaustiveEnumeration {
-                domain: finite.name(),
+                domain: Symbol::new(name),
                 points: finite.points,
             }
         };
@@ -734,13 +771,15 @@ impl<'a> Prover<'a> {
         obligation: &Obligation,
         claim: &Claim<'_>,
         plan: &ProvePlan,
+        measured_domain: Option<&(Finite, String)>,
     ) -> Discharge {
         let mut cases = match self.cases(obligation, claim, plan) {
             Ok(cases) => cases,
             Err(gap) => return Discharge::Unattempted(gap),
         };
 
-        let (points, domain) = match self.law_domain(obligation, &mut cases, plan) {
+        let (points, domain) = match self.law_domain(obligation, &mut cases, plan, measured_domain)
+        {
             Ok(kept) => kept,
             Err(gap) => return Discharge::Unattempted(gap),
         };
@@ -763,11 +802,12 @@ impl<'a> Prover<'a> {
         obligation: &Obligation,
         cases: &mut Cases<'a>,
         plan: &ProvePlan,
+        measured: Option<&(Finite, String)>,
     ) -> Result<(Vec<Vec<Value>>, ValueDomain), Gap> {
         let binders = obligation.generated();
         let mut kept: Vec<Vec<Value>> = Vec::new();
 
-        if let Some(finite) = domain::finite(binders, &self.world) {
+        if let Some((finite, name)) = measured {
             for point in 0..finite.points {
                 let Some(values) = finite.point(&self.world, point) else {
                     continue;
@@ -777,7 +817,7 @@ impl<'a> Prover<'a> {
                 }
             }
             let domain = ValueDomain::Enumerated {
-                domain: finite.name(),
+                domain: Symbol::new(name.as_str()),
                 points: finite.points,
                 kept: kept.len() as u64,
             };

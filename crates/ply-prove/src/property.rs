@@ -127,10 +127,10 @@ pub struct Variant {
 }
 
 #[derive(Clone, Debug)]
-struct TypeDecl {
-    params: Vec<TyVar>,
-    variants: Vec<Variant>,
-    depth: Option<u64>,
+pub struct TypeDecl {
+    pub params: Vec<TyVar>,
+    pub variants: Vec<Variant>,
+    pub depth: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -140,6 +140,12 @@ pub struct TypeWorld {
 }
 
 impl TypeWorld {
+    /// Every declared type, ascending by name: what a program needs to size a binder it was handed,
+    /// since a type's name alone does not say how many values it holds.
+    pub fn declared(&self) -> impl Iterator<Item = (&Symbol, &TypeDecl)> {
+        self.types.iter()
+    }
+
     pub fn new<'a>(ctors: impl IntoIterator<Item = &'a CtorInfo>) -> TypeWorld {
         let mut world = TypeWorld::default();
         for info in ctors {
