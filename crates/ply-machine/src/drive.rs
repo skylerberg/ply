@@ -16,7 +16,9 @@ use ply_host::process::{Executables, ProcessHost, Sink, Stream};
 use ply_host::signal::{self, Shutdown};
 use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
 use ply_ty::{CheckOutput, Front, ModuleName};
+use std::cell::RefCell;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// What the machine is configured with when it is lent, as plain data: the shell's parsed flags
 /// convert into this.
@@ -236,7 +238,27 @@ pub struct Bound {
     hosts: Hosts,
     declared: Option<ply_ty::ty::Footprint>,
     tier: &'static dyn ply_eval::Provider,
+    /// The tier, attached once and entered any number of times: building it per call would put
+    /// the build in every measurement the call is asked for.
+    compiled: RefCell<Option<std::rc::Rc<dyn ply_eval::Compiled>>>,
     shutdown: Option<Arc<Shutdown>>,
+}
+
+impl Bound {
+    /// This binding's compiled tier, built on the first call that wants it.
+    fn compiled(&self) -> std::rc::Rc<dyn ply_eval::Compiled> {
+        let mut slot = self.compiled.borrow_mut();
+        slot.get_or_insert_with(|| self.tier.attach()).clone()
+    }
+}
+
+/// What one call, or one entry, measured: the calls the runtime counted, the wall clock it took,
+/// and the reuse counters it left behind.
+#[derive(Default)]
+pub struct Measured {
+    pub steps: u64,
+    pub micros: u64,
+    pub counters: ply_eval::rc::Stats,
 }
 
 /// The machine's state on its own thread: the target, the store it was loaded over when it has
@@ -246,6 +268,8 @@ pub struct Drive {
     target: Target,
     store: Option<ply_store::Store>,
     bound: Option<(String, Bound)>,
+    /// What the calls since the last `accounting` read measured, reset by that read.
+    accounting: Measured,
 }
 
 impl Drive {
@@ -258,6 +282,7 @@ impl Drive {
             target,
             store,
             bound: None,
+            accounting: Measured::default(),
         })
     }
 
@@ -349,6 +374,7 @@ impl Drive {
                 hosts,
                 declared,
                 tier,
+                compiled: RefCell::new(None),
                 shutdown,
             },
         ));
@@ -381,9 +407,10 @@ impl Drive {
             .map(|w| crate::payload::value_from_wire(w, span))
             .collect::<Result<_, _>>()?;
         let plan = crate::simulation::run_plan(options.seed.as_ref());
-        let compiled = bound.tier.attach();
+        let compiled = bound.compiled();
         ply_eval::rc::reset();
-        let answered = ply_codegen::rt::with_step_budget(options.steps, || {
+        let started = Instant::now();
+        let outcome = ply_codegen::rt::with_step_budget(options.steps, || {
             ply_codegen::rt::with_time_budget(options.timeout, || {
                 evaluate(
                     target.front(),
@@ -392,11 +419,18 @@ impl Drive {
                     &plan,
                     &bound.hosts,
                     bound.declared.as_ref(),
-                    compiled,
+                    compiled.clone(),
                 )
             })
-        })?;
-        Ok(crate::payload::value_to_wire(&answered))
+        });
+        // A call that raised still did the work its accounting counts.
+        note_measurement(&mut self.accounting, &compiled, started);
+        Ok(crate::payload::value_to_wire(&outcome?))
+    }
+
+    /// What the calls since the last read measured, and the read resets it.
+    pub fn accounting(&mut self) -> Measured {
+        std::mem::take(&mut self.accounting)
     }
 
     /// Enter the bound entry and tear the binding down; the answer an `enter` op hands back.
@@ -413,9 +447,10 @@ impl Drive {
             .map(|d| d.span)
             .unwrap_or(Span::DUMMY);
         let plan = crate::simulation::run_plan(options.seed.as_ref());
-        let compiled = bound.tier.attach();
+        let compiled = bound.compiled();
         // The counters are per thread, and this is the thread the entry runs on.
         ply_eval::rc::reset();
+        let started = Instant::now();
         // The `ply` program performing this is inside a scope that zeroed the thread-local
         // budgets, and the lookup prefers a thread-local to the process value, so the entry's own
         // bounds are set here, on the thread it runs on, and nowhere else.
@@ -431,10 +466,11 @@ impl Drive {
                     &plan,
                     &bound.hosts,
                     bound.declared.as_ref(),
-                    compiled,
+                    compiled.clone(),
                 )
             })
         });
+        note_measurement(&mut self.accounting, &compiled, started);
         let counters = ply_eval::rc::stats();
         // A cycle among escaped values is never collected, so only this run can report it.
         let cycles = ply_eval::rc::take_cycles();
@@ -554,6 +590,21 @@ fn disclosed(
         }),
         warnings,
     }
+}
+
+/// Files one entry's measurement under the accounting an `accounting` read will answer with.
+fn note_measurement(
+    accounting: &mut Measured,
+    compiled: &std::rc::Rc<dyn ply_eval::Compiled>,
+    started: Instant,
+) {
+    accounting.steps += compiled.steps();
+    accounting.micros += u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let seen = ply_eval::rc::stats();
+    accounting.counters.updates += seen.updates;
+    accounting.counters.updates_in_place += seen.updates_in_place;
+    accounting.counters.elements_copied += seen.elements_copied;
+    accounting.counters.cycles += seen.cycles;
 }
 
 /// The definition a call enters: its program-wide name and the arguments it takes.
@@ -943,6 +994,15 @@ pub fn outcome_value(o: &Outcome) -> PlyValue {
         ),
         ("hosts", json(&o.hosts)),
         ("configuration", json(&o.configuration)),
+    ])
+}
+
+/// What an `accounting` read answers with.
+pub fn accounting_value(m: &Measured) -> PlyValue {
+    record(vec![
+        ("steps", tally(m.steps)),
+        ("micros", tally(m.micros)),
+        ("counters", counters_value(&m.counters)),
     ])
 }
 
