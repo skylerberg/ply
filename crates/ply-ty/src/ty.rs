@@ -373,6 +373,9 @@ impl Type {
 
 pub const SECRET: &str = "Secret";
 
+/// The handle `task.spawn` answers with: a type the language declares, not a module's.
+pub const TASK_TYPE: &str = "Task";
+
 /// `Some(n)` when a record's fields are exactly `_0` to `_{n-1}` with `n >= 2`: a tuple.
 pub fn tuple_arity(len: usize, has: impl Fn(&Symbol) -> bool) -> Option<usize> {
     (len >= 2 && (0..len).all(|i| has(&Symbol::new(format!("_{i}"))))).then_some(len)

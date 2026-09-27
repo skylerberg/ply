@@ -291,7 +291,16 @@ impl Tables {
 /// The prelude's constructors, then each module's in program order. Not `CheckOutput::ctors`'
 /// dependency order, or emitted tags would move with the import graph.
 fn ctors_of(front: &Front) -> Vec<(Symbol, usize)> {
-    let mut out: Vec<(Symbol, usize)> = ply_ty::prelude::ctor_arities();
+    // The prelude's constructors come first, in declaration order — the checker seeds them into
+    // `check.ctors` before any module's — so filtering the anonymous module gives both the set and
+    // the order. `CheckOutput::ctors` as a whole is in dependency order, which would move tags.
+    let mut out: Vec<(Symbol, usize)> = front
+        .check
+        .ctors
+        .iter()
+        .filter(|(_, c)| c.module.is_anonymous())
+        .map(|(name, c)| (name.clone(), c.arity))
+        .collect();
     let prelude: HashSet<Symbol> = out.iter().map(|(name, _)| name.clone()).collect();
     for (module, _) in &front.ordinals {
         out.extend(
