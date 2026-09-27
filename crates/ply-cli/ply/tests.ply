@@ -19,6 +19,22 @@ import style (Style, plain, bold, dim, green, red, yellow)
 // The two questions a report asks about a test's contention are questions about the atoms the row
 // already carries, so the suite answers them rather than the runtime computing them twice.
 import suite.schedule (contends_only_over_regions, group_by_conflict, parallelism, region_isolated)
+// What a run decides, and the keys it decides with: the same arithmetic the runtime used to do.
+import suite.keys (writes_seed_keys)
+import suite.select (
+  Cached,
+  Decision,
+  New,
+  Nondet,
+  PreviousFailure,
+  Reason,
+  Unhashed,
+  decide,
+  owed_roots,
+  seed_keys,
+  to_run,
+  word,
+)
 
 // What the Rust side loads, binds and runs, in that order and each once per report. A run that
 // refuses at either of the first two ran nothing, which is why binding and running are two
@@ -80,6 +96,25 @@ pub nondet effect tester {
   // The printed union of a set of tests' footprints. The program colours the graph; rendering a
   // colour is the compiler's, since only its printer can keep a label variable off a name.
   read footprint[r](tests: List<Int>) -> String
+  // What the store holds under each of these keys. The keys are the program's — a per-root
+  // narrowing computes them — so no row could have carried the answers.
+  read outcomes[r](keys: List<String>) -> List<Option<String>>
+  // What the program decided to run: which tests, the roots each still owes, the classes they
+  // share, and the reason for every test. Stated before the binding, because whether a unit has to
+  // be built at all is a function of it.
+  write chosen[r](choice: Choice) -> Unit
+}
+
+// One run's decision, as the runtime reads it back.
+pub type Choice = {
+  // Test indices to execute, ascending.
+  runs: List<Int>,
+  // The reason for every test the keys row named, indexed by test index.
+  reasons: List<String>,
+  // The roots a seeded test still owes.
+  narrowed: List<{ index: Int, roots: List<Int> }>,
+  // Concurrency classes over `runs`.
+  groups: List<List<Int>>,
 }
 
 // One test the loaded tree declares, and what the store holds under the key its result is filed
@@ -164,7 +199,7 @@ pub type Phases = { read_us: Int, front_us: Int, write_back_us: Int }
 // The search every seeded test is keyed on. Each field is in that test's cache key.
 // `budget` and `steps` are the bounds as the search prints them, which is all a report does with
 // them; the document carries the machine's own numbers under `options`.
-pub type Plan = { mode: String, seeds: Int, budget: String, steps: String }
+pub type Plan = { mode: String, roots: List<Int>, seeds: Int, budget: Int, steps: Int }
 
 pub type ModuleView = { name: String, file: String }
 
@@ -186,42 +221,88 @@ pub type Case = {
   // and resource and one of them writes.
   contends: List<Atom>,
   seeded: Bool,
-  // `new`, `nondet`, `previous failure`, `cached` or `unhashed`.
-  reason: String,
-  // Seed roots this test still owes, when the cache already covers part of the plan.
-  owed: Int,
 }
+
+// What the program decided about a run: the reason for each test, the roots a seeded one still owes,
+// which tests run, the classes they share, and the summary over them. The report reads all of it
+// from here rather than from the runtime, which no longer decides any of it.
+pub type Decided = {
+  reasons: List<{ index: Int, reason: Reason }>,
+  owed: List<{ index: Int, owed: Int }>,
+  runs: List<Int>,
+  /// Which class each running test landed in.
+  at: List<{ index: Int, group: Int }>,
+  classes: List<Group>,
+  parallelism: Parallelism,
+}
+
+fn reason_of(d: Decided, index: Int) -> Reason =
+  match filter(d.reasons, |e: { index: Int, reason: Reason }| e.index == index) {
+    [] -> Cached,
+    hits -> at(hits, 0, { index: index, reason: Cached }).reason,
+  }
+
+fn runs_test(d: Decided, index: Int) -> Bool = contains_int(d.runs, index)
+
+fn contains_int(xs: List<Int>, x: Int) -> Bool =
+  fold(xs, false, |found: Bool, y: Int| found || y == x)
+
+// The same over the tests this run reports on, which `--filter` may have narrowed.
+fn selected_count(p: Program, d: Decided) -> Int =
+  len(filter(p.cases, |c: Case| contains_int(d.runs, c.index)))
+
+fn cached_count(p: Program, d: Decided) -> Int = len(p.cases) - selected_count(p, d)
 
 // What the program decided about the conflict graph: the classes it coloured, the summary over
 // them, and which class each test landed in — which is only the tests that run, since a class is
 // what a test *shares a worker* with.
-pub type Colouring = {
-  classes: List<Group>,
-  parallelism: Parallelism,
-  at: List<{ index: Int, group: Int }>,
-}
-
-fn group_of(col: Colouring, index: Int) -> Option<Int> =
-  match filter(col.at, |e: { index: Int, group: Int }| e.index == index) {
+fn group_of(d: Decided, index: Int) -> Option<Int> =
+  match filter(d.at, |e: { index: Int, group: Int }| e.index == index) {
     [] -> None,
     hits -> Some(at(hits, 0, { index: index, group: 0 }).group),
+  }
+
+fn owed_of(d: Decided, index: Int) -> Int =
+  match filter(d.owed, |e: { index: Int, owed: Int }| e.index == index) {
+    [] -> 0,
+    hits -> at(hits, 0, { index: index, owed: 0 }).owed,
   }
 
 // One class's rendering is the printer's, so it is asked for rather than assembled.
 fn with_footprint(acc: List<Group>, class: List<Int>) -> List<Group> / {tester.footprint[corpus]} =
   push(acc, { tests: class, footprint: tester.footprint[corpus](class) })
 
-fn coloured(p: Program, groups: List<Group>, classes: List<List<Int>>) -> Colouring =
+/// The classes the tests that run share, coloured from the atoms each row carries.
+fn classes_of(p: Program, runs: List<Int>) -> List<List<Int>> =
+  group_by_conflict(
+    map(filter(p.cases, |c: Case| contains_int(runs, c.index)), |c: Case|
+      { index: c.index, contends: c.contends }),
+  )
+
+/// The whole decision, as the report reads it: a reason per test, what each seeded one still owes,
+/// which tests run, and the classes they share.
+fn decided_of(
+  p: Program,
+  decisions: List<Decision>,
+  owed: List<{ index: Int, owed: List<Int> }>,
+  groups: List<Group>,
+  classes: List<List<Int>>,
+) -> Decided = {
+  let runs = to_run(decisions);
   {
+    reasons: map(decisions, |x: Decision| { index: x.case.index, reason: x.reason }),
+    owed: map(owed, |e: { index: Int, owed: List<Int> }| { index: e.index, owed: len(e.owed) }),
+    runs: runs,
+    at: flattened(classes),
     classes: groups,
     parallelism: parallelism(
       map(p.cases, |c: Case| c.contends),
-      map(filter(p.cases, |c: Case| runs(c.reason)), |c: Case|
+      map(filter(p.cases, |c: Case| contains_int(runs, c.index)), |c: Case|
         { index: c.index, contends: c.contends }),
       classes,
     ),
-    at: flattened(classes),
   }
+}
 
 // Each class's number, for the members it holds: a class is what a test shares a worker with.
 fn flattened(classes: List<List<Int>>) -> List<{ index: Int, group: Int }> =
@@ -263,9 +344,6 @@ pub type Program = {
   declared: Int,
   // The tests still in scope, in ascending index order.
   cases: List<Case>,
-  total: Int,
-  selected: Int,
-  cached: Int,
   filtered_out: Int,
   plan: Plan,
   warnings: List<Diag>,
@@ -544,8 +622,6 @@ fn one_diagnostic(d: Diag, places: List<Place>) -> Json =
 
 // --- What the selection decided ---------------------------------------------
 
-fn runs(reason: String) -> Bool = reason != "cached"
-
 // The document spells a reason as one word, so the halves of a name are joined rather than spaced.
 fn keyed(reason: String) -> String = joined(string_split(reason, " "), "_")
 
@@ -565,16 +641,16 @@ fn isolation_of(r: Ran, c: Case) -> String =
 
 // --- The head ---------------------------------------------------------------
 
-fn selected_line(s: Style, p: Program) -> String =
-  ind() ++ bold(s, "selected") ++ " " ++ bold(s, int_to_string(p.selected)) ++ " of "
-    ++ int_to_string(p.total)
+fn selected_line(s: Style, p: Program, d: Decided) -> String =
+  ind() ++ bold(s, "selected") ++ " " ++ bold(s, int_to_string(selected_count(p, d))) ++ " of "
+    ++ int_to_string(len(p.cases))
     ++ " ("
-    ++ int_to_string(p.cached)
+    ++ int_to_string(cached_count(p, d))
     ++ " cached)"
 
-fn group_line(col: Colouring, r: Ran) -> List<String> =
-  if len(col.at) == 0 { [] }
-  else { [ind() ++ count_of(len(col.classes), "group") ++ " · " ++ count_of(r.workers, "worker")] }
+fn group_line(d: Decided, r: Ran) -> List<String> =
+  if len(d.classes) == 0 { [] }
+  else { [ind() ++ count_of(len(d.classes), "group") ++ " · " ++ count_of(r.workers, "worker")] }
 
 fn isolated_line(s: Style, r: Ran) -> List<String> =
   if r.counts.total == 0 { [] } else {
@@ -660,13 +736,13 @@ fn filtered_lines(s: Style, p: Program) -> List<String> =
   if p.filtered_out == 0 { [] }
   else { [ind() ++ dim(s, "--filter hid " ++ count_of(p.filtered_out, "test"))] }
 
-fn head_lines(s: Style, flags: Flags, p: Program, r: Ran, col: Colouring) -> List<String> =
+fn head_lines(s: Style, flags: Flags, p: Program, r: Ran, d: Decided) -> List<String> =
   appended(
     appended(
       appended(
         appended(
           appended(
-            appended(appended([selected_line(s, p)], group_line(col, r)), isolated_line(s, r)),
+            appended(appended([selected_line(s, p, d)], group_line(d, r)), isolated_line(s, r)),
             binding_lines(s, r),
           ),
           simulation_line(s, r),
@@ -718,10 +794,11 @@ fn explain_atoms(iso: String, c: Case) -> String =
   else if contends_only_over_regions(c.contends) { " " ++ c.shared ++ " (region labels)" }
   else { " " ++ c.shared }
 
-fn case_line(s: Style, p: Program, r: Ran, c: Case, col: Colouring) -> String = {
+fn case_line(s: Style, p: Program, r: Ran, c: Case, d: Decided) -> String = {
   let iso = isolation_of(r, c);
-  let verb = if runs(c.reason) { bold(s, "run ") } else { dim(s, "skip") };
-  ind() ++ verb ++ " " ++ dim(s, short_of(c.hash)) ++ " " ++ padded(c.reason, 16) ++ " "
+  let reason = word(reason_of(d, c.index));
+  let verb = if runs_test(d, c.index) { bold(s, "run ") } else { dim(s, "skip") };
+  ind() ++ verb ++ " " ++ dim(s, short_of(c.hash)) ++ " " ++ padded(reason, 16) ++ " "
     ++ padded(display_of(p, c), 40)
     ++ " "
     ++ dim(
@@ -730,12 +807,15 @@ fn case_line(s: Style, p: Program, r: Ran, c: Case, col: Colouring) -> String = 
     )
 }
 
-fn reasons_seen(p: Program) -> List<String> =
+fn reasons_seen(p: Program, d: Decided) -> List<String> =
   fold(p.cases, [], |acc: List<String>, c: Case|
-    if said(acc, c.reason) { acc } else { push(acc, c.reason) })
+    {
+      let reason = word(reason_of(d, c.index));
+      if said(acc, reason) { acc } else { push(acc, reason) }
+    })
 
-fn why_lines(s: Style, p: Program) -> List<String> = {
-  let seen = reasons_seen(p);
+fn why_lines(s: Style, p: Program, d: Decided) -> List<String> = {
+  let seen = reasons_seen(p, d);
   if len(seen) == 0 { [] } else {
     appended(
       ["", ind() ++ dim(s, "why")],
@@ -744,21 +824,21 @@ fn why_lines(s: Style, p: Program) -> List<String> = {
   }
 }
 
-fn owed_line(s: Style, p: Program, c: Case) -> List<String> =
-  if c.owed == p.plan.seeds { [] } else {
+fn owed_line(s: Style, p: Program, c: Case, d: Decided) -> List<String> =
+  if owed_of(d, c.index) == len(p.plan.roots) { [] } else {
     [
       ind() ++ "  "
         ++ dim(
           s,
-          display_of(p, c) ++ ": " ++ int_to_string(c.owed) ++ " of "
-            ++ count_of(p.plan.seeds, "seed")
+          display_of(p, c) ++ ": " ++ int_to_string(owed_of(d, c.index)) ++ " of "
+            ++ count_of(len(p.plan.roots), "seed")
             ++ " still owed; the rest already passed on their own",
         ),
     ]
   }
 
 // What the seeded tests will search, and what each of them still owes.
-fn search_lines(s: Style, p: Program) -> List<String> = {
+fn search_lines(s: Style, p: Program, d: Decided) -> List<String> = {
   let seeded = filter(p.cases, |c: Case| c.seeded);
   if len(seeded) == 0 { [] } else {
     let head = [
@@ -767,9 +847,9 @@ fn search_lines(s: Style, p: Program) -> List<String> = {
       ind() ++ "  "
         ++ dim(
           s,
-          p.plan.mode ++ " · " ++ count_of(p.plan.seeds, "seed") ++ " · budget " ++ p.plan.budget
-            ++ " · steps "
-            ++ p.plan.steps,
+          p.plan.mode ++ " · " ++ count_of(p.plan.seeds, "seed") ++ " · budget "
+            ++ int_to_string(p.plan.budget) ++ " · steps "
+            ++ int_to_string(p.plan.steps),
         ),
       ind() ++ "  "
         ++ dim(
@@ -778,23 +858,23 @@ fn search_lines(s: Style, p: Program) -> List<String> = {
             ++ " keyed on this plan and never on their bare hash",
         ),
     ];
-    fold(seeded, head, |acc: List<String>, c: Case| appended(acc, owed_line(s, p, c)))
+    fold(seeded, head, |acc: List<String>, c: Case| appended(acc, owed_line(s, p, c, d)))
   }
 }
 
 // Grouped like any other test, but a host-backed test is never free.
-fn group_tally(s: Style, p: Program, r: Ran, col: Colouring) -> String = {
+fn group_tally(s: Style, p: Program, r: Ran, d: Decided) -> String = {
   let hosted = if r.counts.host == 0 { "" }
   else { " · " ++ int_to_string(r.counts.host) ++ " host-backed and never free" };
-  let regioned = if col.parallelism.region_contended == 0 { "" } else {
-    " · " ++ int_to_string(col.parallelism.region_contended) ++ " of them only over a region label"
+  let regioned = if d.parallelism.region_contended == 0 { "" } else {
+    " · " ++ int_to_string(d.parallelism.region_contended) ++ " of them only over a region label"
   };
   ind() ++ "  "
     ++ dim(
       s,
       int_to_string(r.counts.isolated) ++ " of " ++ int_to_string(r.counts.total)
         ++ " region-isolated and free · "
-        ++ count_of(col.parallelism.shared_groups, "group")
+        ++ count_of(d.parallelism.shared_groups, "group")
         ++ " for the "
         ++ int_to_string(r.counts.shared)
         ++ " shared "
@@ -807,8 +887,8 @@ fn group_tally(s: Style, p: Program, r: Ran, col: Colouring) -> String = {
 fn named_of(p: Program, index: Int) -> String =
   fold(p.cases, "", |acc: String, c: Case| if c.index == index { display_of(p, c) } else { acc })
 
-fn group_block(s: Style, p: Program, col: Colouring, lines: List<String>, i: Int) -> List<String> = {
-  let g: Group = at(col.classes, i, no_group());
+fn group_block(s: Style, p: Program, d: Decided, lines: List<String>, i: Int) -> List<String> = {
+  let g: Group = at(d.classes, i, no_group());
   let head = push(
     lines,
     ind() ++ "  group " ++ int_to_string(i) ++ " · " ++ count_of(len(g.tests), "test") ++ " · "
@@ -820,26 +900,26 @@ fn group_block(s: Style, p: Program, col: Colouring, lines: List<String>, i: Int
   })
 }
 
-fn concurrency_lines(s: Style, p: Program, r: Ran, col: Colouring) -> List<String> =
-  if len(col.classes) == 0 { [] } else {
+fn concurrency_lines(s: Style, p: Program, r: Ran, d: Decided) -> List<String> =
+  if len(d.classes) == 0 { [] } else {
     fold(
-      range(0, len(col.classes)),
-      ["", ind() ++ dim(s, "concurrency groups"), group_tally(s, p, r, col)],
-      |acc: List<String>, i: Int| group_block(s, p, col, acc, i),
+      range(0, len(d.classes)),
+      ["", ind() ++ dim(s, "concurrency groups"), group_tally(s, p, r, d)],
+      |acc: List<String>, i: Int| group_block(s, p, d, acc, i),
     )
   }
 
-fn explain_lines(s: Style, p: Program, r: Ran, col: Colouring) -> List<String> =
+fn explain_lines(s: Style, p: Program, r: Ran, dec: Decided) -> List<String> =
   appended(
     appended(
       appended(
         appended(
-          appended([""], map(p.cases, |c: Case| case_line(s, p, r, c, col))),
-          why_lines(s, p),
+          appended([""], map(p.cases, |c: Case| case_line(s, p, r, c, dec))),
+          why_lines(s, p, dec),
         ),
-        search_lines(s, p),
+        search_lines(s, p, dec),
       ),
-      concurrency_lines(s, p, r, col),
+      concurrency_lines(s, p, r, dec),
     ),
     phase_lines(s, p.phases),
   )
@@ -1138,7 +1218,7 @@ fn no_tests_note(flags: Flags, p: Program) -> String =
 
 // --- The document -----------------------------------------------------------
 
-fn case_json(r: Ran, c: Case, col: Colouring) -> Json =
+fn case_json(r: Ran, c: Case, d: Decided) -> Json =
   object([
     { key: "index", value: num(c.index) },
     { key: "key", value: Str(c.key) },
@@ -1146,10 +1226,10 @@ fn case_json(r: Ran, c: Case, col: Colouring) -> Json =
     { key: "module", value: Str(c.module) },
     { key: "hash", value: opt_str(c.hash) },
     { key: "nondet", value: Bool(c.nondet) },
-    { key: "selected", value: Bool(runs(c.reason)) },
-    { key: "reason", value: Str(keyed(c.reason)) },
-    { key: "why", value: Str(why(c.reason)) },
-    { key: "group", value: opt_num(group_of(col, c.index)) },
+    { key: "selected", value: Bool(runs_test(d, c.index)) },
+    { key: "reason", value: Str(keyed(word(reason_of(d, c.index)))) },
+    { key: "why", value: Str(why(word(reason_of(d, c.index)))) },
+    { key: "group", value: opt_num(group_of(d, c.index)) },
     { key: "footprint", value: Str(c.footprint) },
     { key: "isolation", value: Str(isolation_of(r, c)) },
     // Whether this test reaches the binding, and so always runs uncached.
@@ -1157,8 +1237,8 @@ fn case_json(r: Ran, c: Case, col: Colouring) -> Json =
     { key: "shared_atoms", value: strings(c.atoms) },
   ])
 
-fn group_json(col: Colouring, i: Int) -> Json = {
-  let g: Group = at(col.classes, i, no_group());
+fn group_json(d: Decided, i: Int) -> Json = {
+  let g: Group = at(d.classes, i, no_group());
   object([
     { key: "index", value: num(i) },
     { key: "tests", value: Array(map(g.tests, |x: Int| num(x))) },
@@ -1196,7 +1276,7 @@ fn case_of(p: Program, index: Int) -> Option<Case> =
   fold(p.cases, None, |acc: Option<Case>, c: Case|
     match acc { Some(_) -> acc, None -> if c.index == index { Some(c) } else { None } })
 
-fn outcome_json(p: Program, o: Outcome, col: Colouring) -> Json = {
+fn outcome_json(p: Program, o: Outcome, d: Decided) -> Json = {
   let named = case_of(p, o.index);
   object([
     { key: "index", value: num(o.index) },
@@ -1204,7 +1284,7 @@ fn outcome_json(p: Program, o: Outcome, col: Colouring) -> Json = {
     { key: "name", value: Str(match named { Some(c) -> c.name, None -> o.name }) },
     { key: "module", value: match named { Some(c) -> Str(c.module), None -> Null } },
     { key: "hash", value: opt_str(o.hash) },
-    { key: "group", value: num(match group_of(col, o.index) { Some(g) -> g, None -> 0 }) },
+    { key: "group", value: num(match group_of(d, o.index) { Some(g) -> g, None -> 0 }) },
     { key: "status", value: Str(o.status) },
     { key: "duration_ms", value: millis(o.duration_us) },
     {
@@ -1261,19 +1341,19 @@ fn phases_json(f: Phases) -> Json =
     { key: "total", value: millis(phase_total(f)) },
   ])
 
-fn selection_json(p: Program, r: Ran, col: Colouring) -> Json =
+fn selection_json(p: Program, r: Ran, d: Decided) -> Json =
   object([
-    { key: "total", value: num(p.total) },
-    { key: "selected", value: num(p.selected) },
-    { key: "cached", value: num(p.cached) },
+    { key: "total", value: num(len(p.cases)) },
+    { key: "selected", value: num(selected_count(p, d)) },
+    { key: "cached", value: num(cached_count(p, d)) },
     { key: "filtered_out", value: num(p.filtered_out) },
-    { key: "groups", value: Array(map(range(0, len(col.classes)), |i: Int| group_json(col, i))) },
+    { key: "groups", value: Array(map(range(0, len(d.classes)), |i: Int| group_json(d, i))) },
     // A host-backed test counts only under `host`, since it is not isolated.
     { key: "isolated", value: num(r.counts.isolated) },
     { key: "shared", value: num(r.counts.shared) },
     { key: "host", value: num(r.counts.host) },
-    { key: "parallelism", value: parallelism_json(col.parallelism) },
-    { key: "tests", value: Array(map(p.cases, |c: Case| case_json(r, c, col))) },
+    { key: "parallelism", value: parallelism_json(d.parallelism) },
+    { key: "tests", value: Array(map(p.cases, |c: Case| case_json(r, c, d))) },
   ])
 
 fn summary_json(c: Summary) -> Json =
@@ -1328,7 +1408,7 @@ fn document(
   r: Ran,
   warnings: List<Diag>,
   ok: Bool,
-  col: Colouring,
+  d: Decided,
 ) -> Json =
   object(
     appended(
@@ -1361,9 +1441,9 @@ fn document(
         { key: "options", value: p.options },
         { key: "simulation", value: simulated_json(r.simulation) },
         { key: "backend", value: backend_json(r) },
-        { key: "selection", value: selection_json(p, r, col) },
+        { key: "selection", value: selection_json(p, r, d) },
         { key: "summary", value: summary_json(r.summary) },
-        { key: "results", value: Array(map(r.results, |o: Outcome| outcome_json(p, o, col))) },
+        { key: "results", value: Array(map(r.results, |o: Outcome| outcome_json(p, o, d))) },
         { key: "failures", value: Array(map(r.failures, |f: Fault| fault_json(p, f))) },
         // Not a warning: every later run believes an escaped entry.
         { key: "diagnostics", value: all_to_json(r.escapes, p.places) },
@@ -1386,14 +1466,14 @@ fn green_run(r: Ran) -> Bool =
 fn warned(s: Style, warnings: List<Diag>) -> List<String> =
   if len(warnings) == 0 { [] } else { appended([""], warning_lines(s, warnings)) }
 
-fn explained(s: Style, flags: Flags, p: Program, r: Ran, col: Colouring) -> List<String> =
-  if !flags.explain { [] } else { explain_lines(s, p, r, col) }
+fn explained(s: Style, flags: Flags, p: Program, r: Ran, d: Decided) -> List<String> =
+  if !flags.explain { [] } else { explain_lines(s, p, r, d) }
 
 fn listed(s: Style, p: Program, r: Ran) -> List<String> =
   if len(r.results) == 0 { [] } else { appended([""], result_lines(s, p, r)) }
 
 fn nothing_lines(s: Style, flags: Flags, p: Program) -> List<String> =
-  if p.total > 0 { [] } else { ["", ind() ++ dim(s, no_tests_note(flags, p))] }
+  if len(p.cases) > 0 { [] } else { ["", ind() ++ dim(s, no_tests_note(flags, p))] }
 
 fn lines_of(
   s: Style,
@@ -1401,7 +1481,7 @@ fn lines_of(
   p: Program,
   r: Ran,
   warnings: List<Diag>,
-  col: Colouring,
+  d: Decided,
 ) -> List<String> =
   appended(
     appended(
@@ -1411,7 +1491,7 @@ fn lines_of(
             appended(
               appended(
                 appended(
-                  appended(head_lines(s, flags, p, r, col), explained(s, flags, p, r, col)),
+                  appended(head_lines(s, flags, p, r, d), explained(s, flags, p, r, d)),
                   listed(s, p, r),
                 ),
                 ["", summary_line(s, r)],
@@ -1435,12 +1515,12 @@ fn collected(p: Program, r: Ran) -> List<Diag> =
     if len(filter(acc, |x: Diag| x.code == d.code && x.message == d.message)) > 0 { acc }
     else { push(acc, d) })
 
-fn answered(s: Style, flags: Flags, p: Program, r: Ran, col: Colouring) -> Answer = {
+fn answered(s: Style, flags: Flags, p: Program, r: Ran, d: Decided) -> Answer = {
   let warnings = collected(p, r);
   let ok = green_run(r);
   {
-    json: document(flags, p, r, warnings, ok, col),
-    lines: lines_of(s, flags, p, r, warnings, col),
+    json: document(flags, p, r, warnings, ok, d),
+    lines: lines_of(s, flags, p, r, warnings, d),
     errs: [],
     code: if ok { ok_code() } else { run_failed() },
   }
@@ -1465,26 +1545,91 @@ fn unbound(s: Style, refusal: Refusal) -> Answer = {
   }
 }
 
+// A test the store already holds, as the runtime sends one: exactly the fields the decision is
+// arithmetic over, which is also the shape the suite's `Case` declares.
+fn key_as_case(k: Key) -> {
+  index: Int,
+  label: String,
+  name: String,
+  module: String,
+  cache_key: Option<String>,
+  seeded: Bool,
+  nondet: Bool,
+  cached: Option<String>,
+} =
+  {
+    index: k.index,
+    label: k.label,
+    name: k.name,
+    module: k.module,
+    cache_key: k.cache_key,
+    seeded: k.seeded,
+    nondet: k.nondet,
+    cached: k.cached,
+  }
+
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {tester.configure[corpus], tester.loaded[corpus], tester.bound[corpus], tester.ran[corpus], tester.footprint[corpus]} = {
+) -> Answer / {
+  tester.configure[corpus],
+  tester.loaded[corpus],
+  tester.bound[corpus],
+  tester.ran[corpus],
+  tester.footprint[corpus],
+  tester.outcomes[corpus],
+  tester.chosen[corpus],
+  tester.keys[corpus],
+  tester.searched[corpus],
+} = {
   let s: Style = style_of(flags);
   tester.configure[corpus](options);
   match tester.loaded[corpus]() {
     Err(refusal) -> refused(s, "test", refusal.diags, refusal.places),
-    Ok(p) -> match tester.bound[corpus]() {
-      Err(refusal) -> unbound(s, refusal),
-      Ok(_) -> {
-        // Which tests may share a worker is the program's to say, from the atoms each row carries;
-        // only the rendering of a class is the printer's.
-        let classes = group_by_conflict(
-          map(filter(p.cases, |c: Case| runs(c.reason)), |c: Case|
-            { index: c.index, contends: c.contends }),
-        );
-        let colouring = coloured(p, fold(classes, [], with_footprint), classes);
-        answered(s, flags, p, tester.ran[corpus](), colouring)
-      },
+    Ok(p) -> {
+      // Which tests run is the program's to say: the runtime answers what the store holds and
+      // serves; the decision is arithmetic over those rows, and the report reads it back.
+      let keys = tester.keys[corpus]();
+      let search = tester.searched[corpus]();
+      let decisions = decide(map(keys, key_as_case));
+      let runs = to_run(decisions);
+      let owing = map(filter(keys, |k: Key| k.seeded && k.cache_key != None), |k: Key| {
+        let roots = search.roots;
+        // A `random` plan is one claim per root, so a widened root set owes only the roots the
+        // store has not already answered alone. The path is `[]`: it is empty outside `once`, which
+        // writes no per-root keys at all.
+        let held = match k.cache_key {
+          Some(hash) -> if writes_seed_keys(search.mode, search.budget, search.steps, []) {
+            tester.outcomes[corpus](seed_keys(hash, roots, []))
+          } else {
+            map(roots, |_r: Int| None)
+          },
+          None -> map(roots, |_r: Int| None),
+        };
+        { index: k.index, owed: owed_roots(roots, held) }
+      });
+      // Which tests may share a worker is the program's to say, from the atoms each row carries;
+      // only the rendering of a class is the printer's.
+      let classes = classes_of(p, runs);
+      let decided = decided_of(p, decisions, owing, fold(classes, [], with_footprint), classes);
+      // Only a test whose owed roots are fewer than the plan's is narrowed: the others search the
+      // whole plan.
+      let narrowed = fold(owing, [], |acc: List<{ index: Int, roots: List<Int> }>, e: { index: Int, owed: List<Int> }|
+        if len(e.owed) < len(search.roots) {
+          push(acc, { index: e.index, roots: e.owed })
+        } else {
+          acc
+        });
+      tester.chosen[corpus]({
+        runs: decided.runs,
+        reasons: map(decided.reasons, |e: { index: Int, reason: Reason }| word(e.reason)),
+        narrowed: narrowed,
+        groups: classes,
+      });
+      match tester.bound[corpus]() {
+        Err(refusal) -> unbound(s, refusal),
+        Ok(_) -> answered(s, flags, p, tester.ran[corpus](), decided),
+      }
     },
   }
 }
@@ -1510,7 +1655,19 @@ fn no_phases() -> Phases = { read_us: 0, front_us: 0, write_back_us: 0 }
 
 fn a_hash() -> String = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 
-fn a_case(index: Int, name: String, reason: String) -> Case =
+fn a_key(index: Int, label: String, answered: Bool, seeded: Bool, unstable: Bool) -> Key =
+  {
+    index: index,
+    label: label,
+    name: "m." ++ label,
+    module: "m",
+    cache_key: Some(a_hash()),
+    seeded: seeded,
+    nondet: unstable,
+    cached: if answered { Some("passed") } else { None },
+  }
+
+fn a_case(index: Int, name: String) -> Case =
   {
     index: index,
     key: "m." ++ name,
@@ -1523,16 +1680,11 @@ fn a_case(index: Int, name: String, reason: String) -> Case =
     atoms: [],
     contends: [],
     seeded: false,
-    reason: reason,
-    owed: 1,
   }
 
-// The colouring a program's cases make: one class holding every case that runs, which is what the
-// fixtures below expect to read.
-fn a_colouring(p: Program) -> Colouring = {
-  let classes = [map(filter(p.cases, |c: Case| runs(c.reason)), |c: Case| c.index)];
-  coloured(p, map(classes, |class: List<Int>| { tests: class, footprint: "{}" }), classes)
-}
+/// The decision the fixtures below expect: every test runs, with the reason its row implies.
+fn a_decided(p: Program, decisions: List<Decision>) -> Decided =
+  decided_of(p, decisions, [], [], [])
 
 fn a_program(cases: List<Case>) -> Program =
   {

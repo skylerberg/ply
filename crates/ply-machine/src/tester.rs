@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex, mpsc};
 /// else: no other command runs a corpus.
 const EFFECT: &str = "tester";
 
-const OPERATIONS: [(&str, &str); 9] = [
+const OPERATIONS: [(&str, &str); 11] = [
     ("configure", "ply_machine::tester::configure"),
     ("loaded", "ply_machine::test::loaded"),
     ("bound", "ply_machine::test::bound"),
@@ -43,6 +43,8 @@ const OPERATIONS: [(&str, &str); 9] = [
     ("keys", "ply_machine::tester::keys"),
     ("hashed", "ply_machine::tester::hashed"),
     ("searched", "ply_machine::tester::searched"),
+    ("chosen", "ply_machine::tester::chosen"),
+    ("outcomes", "ply_machine::tester::outcomes"),
     // The printed union of a set of tests' footprints: the program colours the graph, and the
     // rendering of a colour is the compiler's.
     ("footprint", "ply_machine::tester::footprint"),
@@ -103,6 +105,55 @@ impl Session {
     }
 }
 
+/// The decision, as the program sent it: the same four fields `ply_test::Choice` holds.
+fn choice_of(v: &PlyValue, span: Span) -> Result<ply_test::Choice, Diagnostic> {
+    use crate::payload::field_of;
+    let runs = ints_of(field_of(v, "runs", span)?, span, "the tests to run")?;
+    let reasons: Vec<ply_test::Reason> = strs_of(field_of(v, "reasons", span)?, span)?
+        .iter()
+        .map(|word| {
+            ply_test::Reason::parse(word).ok_or_else(|| {
+                Diagnostic::error(codes::INTERNAL_ERROR, format!("unknown reason `{word}`"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut narrowed = std::collections::BTreeMap::new();
+    for entry in field_of(v, "narrowed", span)?.as_list(span, "the narrowed plans")? {
+        let index = field_of(entry, "index", span)?.as_int(span, "a test index")? as usize;
+        let roots = ints_of(field_of(entry, "roots", span)?, span, "the roots owed")?
+            .into_iter()
+            .map(|r| r as u64)
+            .collect();
+        narrowed.insert(index, roots);
+    }
+    let mut groups = Vec::new();
+    for class in field_of(v, "groups", span)?.as_list(span, "the classes")? {
+        groups.push(ints_of(class, span, "a class")?);
+    }
+    Ok(ply_test::Choice {
+        runs,
+        reasons,
+        narrowed,
+        groups,
+    })
+}
+
+fn ints_of(v: &PlyValue, span: Span, what: &str) -> Result<Vec<usize>, Diagnostic> {
+    let mut out = Vec::new();
+    for item in v.as_list(span, what)?.iter() {
+        out.push(item.as_int(span, "a number")? as usize);
+    }
+    Ok(out)
+}
+
+fn strs_of(v: &PlyValue, span: Span) -> Result<Vec<String>, Diagnostic> {
+    let mut out = Vec::new();
+    for item in v.as_list(span, "the reasons")?.iter() {
+        out.push(item.as_str(span, "a reason")?.to_string());
+    }
+    Ok(out)
+}
+
 fn registration(op: &str, path: &'static str) -> HostOp {
     HostOp {
         effect: Symbol::new(EFFECT),
@@ -146,6 +197,25 @@ impl HostHandler for Site {
             "keys" => self.knowledge(Ask::Keys)?,
             "hashed" => self.knowledge(Ask::Hashed)?,
             "searched" => self.knowledge(Ask::Searched)?,
+            "chosen" => {
+                let value = req
+                    .args
+                    .first()
+                    .ok_or_else(|| unasked("chosen", req.span))?;
+                self.chosen(choice_of(value, req.span)?)?
+            }
+            "outcomes" => {
+                let list = req
+                    .args
+                    .first()
+                    .ok_or_else(|| unasked("outcomes", req.span))?
+                    .as_list(span, "the keys to look up")?;
+                let mut keys = Vec::with_capacity(list.len());
+                for item in list {
+                    keys.push(item.as_str(span, "a key")?.to_string());
+                }
+                self.knowledge(Ask::Outcomes(keys))?
+            }
             "footprint" => {
                 let list = req
                     .args
@@ -230,6 +300,7 @@ impl Site {
             Ask::Hashed => Go::Hashed,
             Ask::Searched => Go::Searched,
             Ask::Footprint(tests) => Go::Footprint(tests.clone()),
+            Ask::Outcomes(keys) => Go::Outcomes(keys.clone()),
         })?;
         match machine.step()? {
             Step::Knowledge {
@@ -241,6 +312,15 @@ impl Site {
     }
 
     /// The machine is left running: the next iteration is lent the front end this one built.
+    /// The program states the decision here. Ordered on the same channel as everything else, so it
+    /// arrives before the run that obeys it.
+    fn chosen(&self, choice: ply_test::Choice) -> Result<PlyValue, Diagnostic> {
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted("chosen"))?;
+        machine.ask(Go::Chosen(choice))?;
+        Ok(ply_eval::Value::Unit)
+    }
+
     fn ran(&self) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
         let machine = held.as_ref().ok_or_else(|| unstarted("ran"))?;
@@ -276,10 +356,16 @@ fn answered(answer: Result<PlyValue, Refused>) -> PlyValue {
 enum Go {
     Load,
     Bind,
+    /// What the program decided to run. Sent before the binding, because whether a unit has to be
+    /// built at all is a function of it: a fully cached run builds none.
+    Chosen(ply_test::Choice),
     Run,
     Keys,
     Hashed,
     Searched,
+    /// The store's answer under each key the caller names: the narrowing asks about keys the
+    /// *program* computes, so no row could have carried them.
+    Outcomes(Vec<String>),
     /// The printed union of these tests' footprints. The program colours the graph; the rendering of
     /// a colour is the compiler's, since only its printer can keep a label variable off a name.
     Footprint(Vec<usize>),
@@ -302,6 +388,7 @@ enum Ask {
     Hashed,
     Searched,
     Footprint(Vec<usize>),
+    Outcomes(Vec<String>),
 }
 
 impl Ask {
@@ -311,6 +398,7 @@ impl Ask {
             Ask::Hashed => "hashed",
             Ask::Searched => "searched",
             Ask::Footprint(_) => "footprint",
+            Ask::Outcomes(_) => "outcomes",
         }
     }
 }
@@ -321,6 +409,7 @@ enum KnowledgeValue {
     Hashed(Vec<HashedRow>),
     Searched(SearchedRow),
     Footprint(String),
+    Outcomes(Vec<Option<String>>),
 }
 
 /// The thread this process's machine lives on. The `ply` program performing these operations is
@@ -442,8 +531,7 @@ fn iterate(
     // Part of a simulated test's cache key, so decided before selection.
     let search = crate::simulation::plan(&args.simulation);
     let hashes = loaded.hashes.clone();
-    let selected = ply_test::select(&loaded.check, &hashes, &cache.store, &search);
-    let plan = Plan::new(selected, &loaded.check, args.filter.as_deref(), args.std);
+    let plan = Plan::new(&loaded.check, args.filter.as_deref(), args.std);
 
     if let Some(err) = crate::costs::broken_promises(&loaded) {
         let _ = told.send(Step::Loaded(Box::new(Err(Refused {
@@ -454,15 +542,17 @@ fn iterate(
     }
 
     let _ = told.send(Step::Loaded(Box::new(Ok(found(
-        args, &loaded, &hashes, &plan, warnings,
+        args, &loaded, &hashes, &plan, &search, warnings,
     )))));
-    // What a selector reads, before anything runs.
+    // What a selector reads, before anything runs. It states its decision on the same channel, so
+    // the machine has it by the time the binding decides whether a unit is worth building.
+    let mut chosen = None;
     let knowledge = Knowledge::of(&loaded, &hashes, &cache.store, &search);
-    if !serve_reads(asked, told, &knowledge) {
+    if !serve_reads(asked, told, &knowledge, &cache.store, &mut chosen) {
         return;
     }
     if bind(
-        args, cache, warm, &loaded, &hashes, plan, &search, told, asked, &knowledge,
+        args, cache, warm, &loaded, &hashes, plan, &search, told, asked, &knowledge, &mut chosen,
     ) {
         // Only over a report that was written: an iteration that returned early leaves nothing held.
         warm.keep(loaded);
@@ -477,6 +567,24 @@ struct Knowledge {
     searched: SearchedRow,
     /// Every test's footprint, in test order: a group's rendering is the union of the ones it names.
     footprints: Vec<Footprint>,
+}
+
+/// The store's answer under each key, as a report prints one: `passed`, `failed`, or nothing. The
+/// keys are the caller's — a per-root narrowing computes them — so no row could have carried them.
+fn outcomes_of(store: &ply_store::Store, keys: &[String]) -> Vec<Option<String>> {
+    keys.iter()
+        .map(|key| {
+            ply_ty::DefHash::from_hex(key)
+                .and_then(|hash| store.get(hash))
+                .map(|outcome| {
+                    if outcome.is_pass() {
+                        "passed".to_string()
+                    } else {
+                        "failed".to_string()
+                    }
+                })
+        })
+        .collect()
 }
 
 impl Knowledge {
@@ -524,7 +632,7 @@ struct HashedRow {
 #[derive(Clone)]
 struct SearchedRow {
     mode: String,
-    seeds: usize,
+    roots: Vec<u64>,
     budget: String,
     steps: String,
 }
@@ -599,7 +707,7 @@ impl Knowledge {
                 .collect(),
             searched: SearchedRow {
                 mode: search.mode.as_str().to_string(),
-                seeds: search.roots.len(),
+                roots: search.roots.clone(),
                 budget: search.budget.to_string(),
                 steps: search.steps.to_string(),
             },
@@ -612,74 +720,65 @@ fn serve_reads(
     asked: &mpsc::Receiver<Go>,
     told: &mpsc::Sender<Step>,
     knowledge: &Knowledge,
+    store: &ply_store::Store,
+    chosen: &mut Option<ply_test::Choice>,
 ) -> bool {
-    loop {
-        match asked.recv() {
-            Ok(Go::Bind) => return true,
-            Ok(Go::Keys) => {
-                let _ = told.send(Step::Knowledge {
-                    asked: Ask::Keys,
-                    value: Box::new(KnowledgeValue::Keys(knowledge.keys.clone())),
-                });
-            }
-            Ok(Go::Hashed) => {
-                let _ = told.send(Step::Knowledge {
-                    asked: Ask::Hashed,
-                    value: Box::new(KnowledgeValue::Hashed(knowledge.hashed.clone())),
-                });
-            }
-            Ok(Go::Searched) => {
-                let _ = told.send(Step::Knowledge {
-                    asked: Ask::Searched,
-                    value: Box::new(KnowledgeValue::Searched(knowledge.searched.clone())),
-                });
-            }
-            Ok(Go::Footprint(tests)) => {
-                let _ = told.send(Step::Knowledge {
-                    asked: Ask::Footprint(tests.clone()),
-                    value: Box::new(KnowledgeValue::Footprint(knowledge.footprint_of(&tests))),
-                });
-            }
-            Ok(Go::Load) | Ok(Go::Run) | Err(_) => return false,
-        }
-    }
+    serve_reads_loop(asked, told, knowledge, store, chosen, Sig::Bind)
 }
 
-/// Serves reads until `Run` arrives. `false` when the iteration is over instead.
+/// The same, for the reads a selector makes between the binding and the run.
 fn serve_reads_until_run(
     asked: &mpsc::Receiver<Go>,
     told: &mpsc::Sender<Step>,
     knowledge: &Knowledge,
+    store: &ply_store::Store,
+    chosen: &mut Option<ply_test::Choice>,
+) -> bool {
+    serve_reads_loop(asked, told, knowledge, store, chosen, Sig::Run)
+}
+
+/// Which of `Bind`/`Run` ends the wait.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sig {
+    Bind,
+    Run,
+}
+
+/// Answers reads until the signal arrives. Keeps the decision the program sent, if it sent one.
+fn serve_reads_loop(
+    asked: &mpsc::Receiver<Go>,
+    told: &mpsc::Sender<Step>,
+    knowledge: &Knowledge,
+    store: &ply_store::Store,
+    chosen: &mut Option<ply_test::Choice>,
+    until: Sig,
 ) -> bool {
     loop {
-        match asked.recv() {
-            Ok(Go::Run) => return true,
-            Ok(Go::Keys) => {
-                let _ = told.send(Step::Knowledge {
-                    asked: Ask::Keys,
-                    value: Box::new(KnowledgeValue::Keys(knowledge.keys.clone())),
-                });
+        let value = match asked.recv() {
+            Ok(Go::Bind) => return until != Sig::Bind,
+            Ok(Go::Run) => return until != Sig::Run,
+            Ok(Go::Chosen(choice)) => {
+                *chosen = Some(choice);
+                continue;
             }
-            Ok(Go::Hashed) => {
-                let _ = told.send(Step::Knowledge {
-                    asked: Ask::Hashed,
-                    value: Box::new(KnowledgeValue::Hashed(knowledge.hashed.clone())),
-                });
-            }
-            Ok(Go::Searched) => {
-                let _ = told.send(Step::Knowledge {
-                    asked: Ask::Searched,
-                    value: Box::new(KnowledgeValue::Searched(knowledge.searched.clone())),
-                });
-            }
-            Ok(Go::Footprint(tests)) => {
-                let _ = told.send(Step::Knowledge {
-                    asked: Ask::Footprint(tests.clone()),
-                    value: Box::new(KnowledgeValue::Footprint(knowledge.footprint_of(&tests))),
-                });
-            }
-            Ok(Go::Load) | Ok(Go::Bind) | Err(_) => return false,
-        }
+            Ok(Go::Keys) => KnowledgeValue::Keys(knowledge.keys.clone()),
+            Ok(Go::Hashed) => KnowledgeValue::Hashed(knowledge.hashed.clone()),
+            Ok(Go::Searched) => KnowledgeValue::Searched(knowledge.searched.clone()),
+            Ok(Go::Footprint(tests)) => KnowledgeValue::Footprint(knowledge.footprint_of(&tests)),
+            Ok(Go::Outcomes(keys)) => KnowledgeValue::Outcomes(outcomes_of(store, &keys)),
+            Ok(Go::Load) | Err(_) => return false,
+        };
+        let asked = match &value {
+            KnowledgeValue::Keys(_) => Ask::Keys,
+            KnowledgeValue::Hashed(_) => Ask::Hashed,
+            KnowledgeValue::Searched(_) => Ask::Searched,
+            KnowledgeValue::Footprint(_) => Ask::Footprint(Vec::new()),
+            KnowledgeValue::Outcomes(_) => Ask::Outcomes(Vec::new()),
+        };
+        let _ = told.send(Step::Knowledge {
+            asked,
+            value: Box::new(value),
+        });
     }
 }
 
@@ -696,6 +795,7 @@ fn bind(
     told: &mpsc::Sender<Step>,
     asked: &mpsc::Receiver<Go>,
     knowledge: &Knowledge,
+    chosen: &mut Option<ply_test::Choice>,
 ) -> bool {
     let refuse = |diagnostics: Vec<Diagnostic>| {
         let _ = told.send(Step::Bound(Box::new(Some(Refused {
@@ -707,8 +807,12 @@ fn bind(
     if let Err(diagnostic) = select_profile(&args.profile) {
         return refuse(vec![diagnostic]);
     };
-    // One per run, shared by the workers; an empty selection builds nothing a schema does not need.
-    let nothing_to_run = plan.selection.to_run.is_empty();
+    // One per run, shared by the workers; a run that decided to execute nothing builds no unit
+    // unless a schema was named.
+    let nothing_to_run = chosen
+        .as_ref()
+        .map(|c| c.runs.is_empty())
+        .unwrap_or(true);
     let schema_named = args.config.schema.is_some();
     let wanted = !nothing_to_run || schema_named;
     // The last iteration's unit, moved to this layout, when no definition's text changed.
@@ -752,15 +856,17 @@ fn bind(
     };
     let _ = told.send(Step::Bound(Box::new(None)));
     // A selector may still ask what the tree holds between the binding and the run.
-    if !serve_reads_until_run(asked, told, knowledge) {
+    if !serve_reads_until_run(asked, told, knowledge, &cache.store, chosen) {
         return false;
     }
+    let selection = decided(&chosen.clone().unwrap_or_default(), &plan, &loaded.check, search);
     let over = execute(
         args,
         cache,
         loaded,
         hashes,
         &plan,
+        &selection,
         search,
         &hosts,
         unit.filter(|_| !nothing_to_run),
@@ -777,6 +883,7 @@ fn execute(
     loaded: &Loaded,
     hashes: &HashOutput,
     plan: &Plan,
+    selection: &Selection,
     search: &ply_eval::Plan,
     hosts: &Hosts,
     provider: Option<&'static dyn ply_eval::Provider>,
@@ -784,7 +891,7 @@ fn execute(
 ) -> Over {
     let (pool, workers) = build_pool(args.jobs, &mut warnings);
     let simulation =
-        ply_test::Search::of(&plan.selection).measuring(args.simulation.measure_reduction);
+        ply_test::Search::of(selection).measuring(args.simulation.measure_reduction);
     // A factory: a reactor belongs to its thread, and each worker builds its own machine.
     let runtime = hosts.runtime_factory();
     // A pooled test is measured on a worker thread of rayon's, which holds no thread-local budget
@@ -804,7 +911,7 @@ fn execute(
                     executor = executor.with_backend(provider);
                 }
                 ply_test::run_with(
-                    &plan.selection,
+                    selection,
                     &loaded.check,
                     hashes,
                     &mut cache.store,
@@ -848,7 +955,7 @@ fn execute(
     // Pass records are read lazily, so an unreadable baseline only surfaces here.
     warnings.extend(cache.store.take_warnings());
 
-    let counts = counts(plan, &loaded.check, hosts);
+    let counts = counts(plan, selection, &loaded.check, hosts);
     let mut escapes = hosts_escapes(&report, &loaded.check, hosts);
     if let Some(unbuilt) = unbuilt_backend(provider) {
         escapes.push(unbuilt);
@@ -914,22 +1021,19 @@ pub fn diagnosis_options(args: &TestOptions) -> ply_test::Options {
 
 // --- Counts under `--filter` --------------------------------------------------
 
-/// Counts under `--filter` use the filtered set as their denominator.
+/// Counts under `--filter` use the filtered set as their denominator. What runs is the program's
+/// decision; this is only which tests the run reports on.
 pub struct Plan {
-    pub selection: Selection,
     /// Test indices still in scope, ascending.
     pub visible: Vec<usize>,
     pub filtered_out: usize,
+    /// Test indices this run was never asked to decide: a shipped module's tests without `--std`.
+    pub out_of_scope: BTreeSet<usize>,
 }
 
 impl Plan {
     /// `std_tests` is `--std`.
-    pub fn new(
-        selection: Selection,
-        check: &CheckOutput,
-        filter: Option<&str>,
-        std_tests: bool,
-    ) -> Plan {
+    pub fn new(check: &CheckOutput, filter: Option<&str>, std_tests: bool) -> Plan {
         let in_scope = |t: &ply_ty::TestInfo| std_tests || !crate::shelf::is_shipped(&t.module);
         // Against `<module>.<label>`, so `--filter store.` narrows to a module.
         let matches = |t: &ply_ty::TestInfo| filter.is_none_or(|n| t.key.as_str().contains(n));
@@ -949,56 +1053,38 @@ impl Plan {
             .filter(|(_, t)| in_scope(t) && matches(t))
             .map(|(i, _)| i)
             .collect();
-        if visible.len() == check.tests.len() {
-            return Plan {
-                selection,
-                visible,
-                filtered_out: 0,
-            };
-        }
-
-        let keeps = |i: &usize| visible.binary_search(i).is_ok();
-
-        let cached: Vec<_> = selection
-            .cached
-            .into_iter()
-            .filter(|(i, _)| keeps(i))
-            .collect();
-        let to_run: Vec<usize> = selection.to_run.into_iter().filter(keeps).collect();
-        let footprints: Vec<(usize, Footprint)> = to_run
-            .iter()
-            .map(|&i| (i, check.tests[i].footprint.clone()))
-            .collect();
-        let groups = ply_test::group_by_conflict(&footprints);
-        // Over the visible tests, so every count shares one denominator.
-        let parallelism = ply_test::parallelism(
-            visible
-                .iter()
-                .filter_map(|&i| check.tests.get(i))
-                .map(|t| &t.footprint),
-            &footprints,
-            &groups,
-        );
-
         Plan {
             filtered_out: scoped - visible.len(),
-            selection: Selection {
-                total: visible.len(),
-                cached,
-                to_run,
-                groups,
-                // Indexed by test index, so they stay whole under a narrowed plan.
-                reasons: selection.reasons,
-                isolation: selection.isolation,
-                parallelism,
-                // A filter must not change the search, which is part of the cache key.
-                plan: selection.plan,
-                narrowed: selection.narrowed,
-                out_of_scope,
-            },
             visible,
+            out_of_scope,
         }
     }
+}
+
+/// The runtime's view of what the program decided, under this run's own filter: the tests it keeps,
+/// the classes filtered to them, and the roots each still owes. `--filter` cannot change which
+/// tests conflict, so a class only loses members.
+fn decided(choice: &ply_test::Choice, plan: &Plan, check: &CheckOutput, search: &ply_eval::Plan) -> Selection {
+    let keeps = |i: &usize| plan.visible.binary_search(i).is_ok();
+    let filtered = ply_test::Choice {
+        runs: choice.runs.iter().copied().filter(keeps).collect(),
+        groups: choice
+            .groups
+            .iter()
+            .map(|class| class.iter().copied().filter(keeps).collect::<Vec<usize>>())
+            .filter(|class| !class.is_empty())
+            .collect(),
+        narrowed: choice
+            .narrowed
+            .iter()
+            .filter(|(index, _)| keeps(index))
+            .map(|(index, roots)| (*index, roots.clone()))
+            .collect(),
+        reasons: choice.reasons.clone(),
+    };
+    let mut selection = Selection::chosen(&filtered, check, &plan.visible, search);
+    selection.out_of_scope = plan.out_of_scope.clone();
+    selection
 }
 
 /// `--no-cache` points the store at a scratch directory deleted on the way out.
@@ -1084,8 +1170,8 @@ fn reaches(hosts: &Hosts, check: &CheckOutput, index: usize) -> bool {
 }
 
 /// How the corpus splits once the binding is taken into account.
-fn counts(plan: &Plan, check: &CheckOutput, hosts: &Hosts) -> hosts::Counts {
-    let parallelism = &plan.selection.parallelism;
+fn counts(plan: &Plan, selection: &Selection, check: &CheckOutput, hosts: &Hosts) -> hosts::Counts {
+    let parallelism = &selection.parallelism;
     if hosts.is_hermetic() {
         return hosts::Counts {
             total: parallelism.total,
@@ -1100,8 +1186,7 @@ fn counts(plan: &Plan, check: &CheckOutput, hosts: &Hosts) -> hosts::Counts {
             .iter()
             .filter_map(|&index| Some((index, check.tests.get(index)?)))
             .map(|(index, test)| {
-                let isolated = plan
-                    .selection
+                let isolated = selection
                     .isolation_of(index)
                     .unwrap_or_else(|| Isolation::of(&test.footprint))
                     .is_isolated();
@@ -1185,8 +1270,6 @@ struct CaseView {
     /// questions about exactly this list, so the program answers them itself.
     contends: Vec<AtomView>,
     seeded: bool,
-    reason: &'static str,
-    owed: usize,
 }
 
 /// One atom of a test's shared footprint, as a scheduler compares them.
@@ -1205,11 +1288,8 @@ struct Found {
     phases: crate::driver::Phases,
     declared: usize,
     cases: Vec<CaseView>,
-    total: usize,
-    selected: usize,
-    cached: usize,
     filtered_out: usize,
-    plan: (String, usize, String, String),
+    plan: (String, Vec<u64>, u32, u32),
     warnings: Vec<Diagnostic>,
     options: Value,
 }
@@ -1340,10 +1420,10 @@ fn found(
     loaded: &Loaded,
     hashes: &HashOutput,
     plan: &Plan,
+    search: &ply_eval::Plan,
     warnings: Vec<Diagnostic>,
 ) -> Found {
     let check = &loaded.check;
-    let selection = &plan.selection;
     Found {
         root: loaded.root.display().to_string(),
         files: loaded.file_names(),
@@ -1361,9 +1441,6 @@ fn found(
             .iter()
             .filter_map(|&index| {
                 let test = check.tests.get(index)?;
-                let reason = selection
-                    .reason(index)
-                    .unwrap_or(ply_test::Reason::Unhashed);
                 Some(CaseView {
                     index,
                     key: test.key.to_string(),
@@ -1386,20 +1463,15 @@ fn found(
                         })
                         .collect(),
                     seeded: ply_test::is_seeded(&test.footprint),
-                    reason: reason.as_str(),
-                    owed: selection.plan_for(index).roots.len(),
                 })
             })
             .collect(),
-        total: selection.total,
-        selected: selection.to_run.len(),
-        cached: selection.cached.len(),
         filtered_out: plan.filtered_out,
         plan: (
-            selection.plan.mode.as_str().to_string(),
-            selection.plan.roots.len(),
-            selection.plan.budget.to_string(),
-            selection.plan.steps.to_string(),
+            search.mode.as_str().to_string(),
+            search.roots.clone(),
+            search.budget,
+            search.steps,
         ),
         warnings,
         options: jsonlit!({
@@ -1408,11 +1480,11 @@ fn found(
             "trace": args.trace.as_str(),
             // The whole plan: every field is in a seeded test's cache key.
             "sim": {
-                "mode": selection.plan.mode.as_str(),
+                "mode": search.mode.as_str(),
                 "seed": args.simulation.seed.as_ref().map(|s| s.to_string()),
-                "seeds": selection.plan.roots.len(),
-                "budget": selection.plan.budget,
-                "steps": selection.plan.steps,
+                "seeds": search.roots.len(),
+                "budget": u64::from(search.budget),
+                "steps": u64::from(search.steps),
                 "measure_reduction": args.simulation.measure_reduction,
             },
         }),
@@ -1686,8 +1758,7 @@ fn case_value(case: &CaseView) -> PlyValue {
         ("atoms", texts(&case.atoms)),
         ("contends", atoms_value(&case.contends)),
         ("seeded", PlyValue::Bool(case.seeded)),
-        ("reason", PlyValue::str(case.reason)),
-        ("owed", count(case.owed)),
+
     ])
 }
 
@@ -1734,17 +1805,18 @@ fn found_value(found: Found) -> PlyValue {
             "cases",
             PlyValue::list(found.cases.iter().map(case_value).collect()),
         ),
-        ("total", count(found.total)),
-        ("selected", count(found.selected)),
-        ("cached", count(found.cached)),
         ("filtered_out", count(found.filtered_out)),
         (
             "plan",
             record(vec![
                 ("mode", PlyValue::str(&found.plan.0)),
-                ("seeds", count(found.plan.1)),
-                ("budget", PlyValue::str(&found.plan.2)),
-                ("steps", PlyValue::str(&found.plan.3)),
+                (
+                    "roots",
+                    PlyValue::list(found.plan.1.iter().map(|&r| PlyValue::Int(r as i64)).collect()),
+                ),
+                ("seeds", count(found.plan.1.len())),
+                ("budget", count(found.plan.2 as usize)),
+                ("steps", count(found.plan.3 as usize)),
             ]),
         ),
         ("warnings", diags_value(&found.warnings)),
@@ -1786,9 +1858,19 @@ fn knowledge_value(value: &KnowledgeValue) -> PlyValue {
                 .collect(),
         ),
         KnowledgeValue::Footprint(text) => PlyValue::str(text),
+        KnowledgeValue::Outcomes(answers) => PlyValue::list(
+            answers
+                .iter()
+                .map(|answer| option(answer.as_deref().map(PlyValue::str)))
+                .collect(),
+        ),
         KnowledgeValue::Searched(row) => record(vec![
+            (
+                "roots",
+                PlyValue::list(row.roots.iter().map(|&r| PlyValue::Int(r as i64)).collect()),
+            ),
             ("mode", PlyValue::str(&row.mode)),
-            ("seeds", count(row.seeds)),
+            ("seeds", count(row.roots.len())),
             ("budget", PlyValue::str(&row.budget)),
             ("steps", PlyValue::str(&row.steps)),
         ]),
