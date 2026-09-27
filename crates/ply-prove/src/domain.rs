@@ -17,12 +17,21 @@ pub struct Finite {
 }
 
 impl Finite {
-    pub fn name(&self) -> Symbol {
-        if self.types.is_empty() {
-            return Symbol::new("unit");
+    /// A domain from the sizes a program decided, so the coverage rule lives in one place: the
+    /// runtime materialises a point of a domain someone else measured.
+    pub fn of_sizes(types: Vec<Type>, sizes: Vec<u64>) -> Option<Finite> {
+        if sizes.len() != types.len() {
+            return None;
         }
-        let parts: Vec<String> = self.types.iter().map(|t| t.to_string()).collect();
-        Symbol::new(parts.join(" × "))
+        let points = sizes.iter().try_fold(1u64, |acc, n| acc.checked_mul(*n))?;
+        if points == 0 {
+            return None;
+        }
+        Some(Finite {
+            types,
+            sizes,
+            points,
+        })
     }
 
     /// The `index`-th point, in a fixed order — the first binder varying slowest.
@@ -36,29 +45,6 @@ impl Finite {
         out.reverse();
         Some(out)
     }
-}
-
-/// The binders' domain, when every one of them is finite and the product is within budget.
-pub fn finite(binders: &[LawBinder], world: &TypeWorld) -> Option<Finite> {
-    let mut sizes = Vec::with_capacity(binders.len());
-    let mut points: u64 = 1;
-    for binder in binders {
-        let size = cardinality(&binder.ty, world)?;
-        // A domain of no points is a vacuity, not a proof.
-        if size == 0 {
-            return None;
-        }
-        points = points.checked_mul(size)?;
-        if points > ENUMERATION_BOUND {
-            return None;
-        }
-        sizes.push(size);
-    }
-    Some(Finite {
-        types: binders.iter().map(|b| b.ty.clone()).collect(),
-        sizes,
-        points,
-    })
 }
 
 /// How many values inhabit a type, or `None` when it is infinite, unknown, or larger than
