@@ -1,0 +1,512 @@
+// `obligation` — selecting, and reporting on, the proofs a program owes.
+//
+// An obligation is discharged once and read many times, so the first question is what the cache
+// already answered: a *proof* may only sit under the bare key, and a *sample* only under the key of
+// the plan that produced it, because a sample proved with one search says nothing about another.
+// Anything else is a miss to discharge — including a `law/host`, which is never cached at all, since
+// a verdict against a real database is about that moment.
+//
+// The second question is what a reader still has to read: which definitions any discharge covers,
+// how many are covered and at what tier, and — since the last time a person accepted the program's
+// claims — which definitions moved, whether their *claims* moved with them, and what became of those
+// claims. A definition whose implementation moved but whose spec did not is exactly the case where a
+// green check is worth re-reading.
+//
+// The laws are the vocabulary all of this speaks: a law names definitions, and rewriting the law
+// changes its targets' spec, so a law's text is part of the spec of everything it names.
+
+// What an obligation is about: one of a definition's own `ensures` clauses, or a whole law.
+pub type Kind = | Ensures(Int) | Law(Option<String>)
+
+// How strong a discharge was. `Proved` is the only one that covers every case; a sampled discharge
+// is what it is, and an example is an example.
+pub type Tier = | Proved | Property | Example
+
+pub fn tier_word(t: Tier) -> String =
+  match t { Proved -> "proved", Property -> "property", Example -> "example" }
+
+// The strength order, which is not the declaration order: `Proved` is last, not first.
+pub fn tier_rank(t: Tier) -> Int = match t { Proved -> 2, Property -> 1, Example -> 0 }
+
+// Ascending strength, which is the order a coverage summary reads in.
+pub fn tiers() -> List<Tier> = [Example, Property, Proved]
+
+// What each law speaks about, and the sentence it was written as.
+pub type Laws = {
+  /// Law -> the definitions it names.
+  targets: Map<String, List<String>>,
+  /// Law -> the hash of its text, which is part of its targets' spec.
+  texts: Map<String, String>,
+}
+
+pub fn no_laws() -> Laws = { targets: map_new(), texts: map_new() }
+
+pub fn add_law(laws: Laws, key: String, text: String, targets: List<String>) -> Laws =
+  {
+    targets: map_insert(laws.targets, key, push_all(law_targets(laws, key), targets)),
+    texts: map_insert(laws.texts, key, text),
+  }
+
+pub fn law_targets(laws: Laws, law: String) -> List<String> =
+  match map_get(laws.targets, law) { Some(ts) -> ts, None -> [] }
+
+pub fn law_text(laws: Laws, law: String) -> Option<String> = map_get(laws.texts, law)
+
+pub fn has_laws(laws: Laws) -> Bool = map_len(laws.texts) > 0
+
+/// Every law sentence naming this definition: rewriting a law changes its targets' spec.
+pub fn naming(laws: Laws, name: String) -> List<String> =
+  fold(map_keys(laws.targets), [], |acc: List<String>, law: String|
+    if contains_text(law_targets(laws, law), name) {
+      match law_text(laws, law) { Some(text) -> push(acc, text), None -> acc }
+    } else { acc })
+
+// Whether something moved since the baseline a reader accepted.
+pub type Moved = | Unchanged | Changed | Never
+
+pub fn moved_word(m: Moved) -> String =
+  match m { Unchanged -> "unchanged", Changed -> "changed", Never -> "never" }
+
+// One definition's claims as they stand now, or as they stood when they were accepted.
+pub type Record = { def_hash: String, specs: List<String> }
+
+// Every claim about one definition: its own clause keys and every law naming it directly.
+pub fn spec_hashes(
+  name: String,
+  spec_texts: Map<String, List<String>>,
+  laws: Laws,
+) -> List<String> = push_all(own_specs(spec_texts, name), naming(laws, name))
+
+fn own_specs(spec_texts: Map<String, List<String>>, name: String) -> List<String> =
+  match map_get(spec_texts, name) { Some(xs) -> xs, None -> [] }
+
+// --- What the cache answered --------------------------------------------------
+
+pub type Reason = | Fresh | FromProof | FromSample | Uncached | CacheRefused
+
+// Whether the cache answered, as against answered that it could not.
+pub fn reason_hit(r: Reason) -> Bool = match r { FromProof -> true, FromSample -> true, _ -> false }
+
+pub fn reason_word(r: Reason) -> String =
+  match r {
+    Fresh -> "new",
+    FromProof -> "cached proof",
+    FromSample -> "cached sample",
+    Uncached -> "uncached",
+    CacheRefused -> "cache refused",
+  }
+
+// One obligation's answer from the cache, whatever the caller's lookup made of it. `answered` is
+// whether evidence came back: a refusal is an answer, and not evidence.
+pub type Answer = { reason: Reason, answered: Bool, warning: Option<String> }
+
+pub fn missed(reason: Reason) -> Answer = { reason: reason, answered: false, warning: None }
+
+/// What the cache answered for each obligation, parallel to the obligation list.
+pub type Selection = {
+  reasons: List<Reason>,
+  /// Whether each obligation's evidence came back.
+  answered: List<Bool>,
+  /// Indices the cache could not answer for, in order.
+  to_discharge: List<Int>,
+  warnings: List<String>,
+}
+
+pub fn hits(s: Selection) -> Int = len(filter(s.reasons, reason_hit))
+
+/// `hosted` is whether each obligation reaches the world, and `answers` what the caller's lookup
+/// made of it. A `law/host` is never cached: a verdict against a real database is about that moment.
+pub fn select(hosted: List<Bool>, answers: List<Answer>, use_cache: Bool) -> Selection = {
+  let decided = map(range(0, len(hosted)), |i: Int|
+    if use_cache && !at_or(hosted, i) { at_or(answers, i) } else { missed(Uncached) });
+  {
+    reasons: map(decided, |a: Answer| a.reason),
+    answered: map(decided, |a: Answer| a.answered),
+    to_discharge: indices_where(len(decided), |i: Int| !at_or(decided, i).answered),
+    warnings: fold(decided, [], |acc: List<String>, a: Answer|
+      match a.warning { Some(w) -> push(acc, w), None -> acc }),
+  }
+}
+
+// --- How much of the program a reader still has to read ------------------------
+
+pub type Coverage = {
+  definitions: Int,
+  covered: Int,
+  uncovered: List<String>,
+  by_tier: List<{ tier: Tier, count: Int }>,
+}
+
+// One obligation's result, as everything below needs it: what it is about, how strongly it was
+// discharged, whether the machine established it, and whether it was tried at all. `tier` is present
+// exactly when something held, so a refuted claim has none.
+pub type ClaimRow = { owner: String, kind: Kind, tier: Option<Tier>, holds: Bool, attempted: Bool }
+
+/// The definitions each discharge covers. A clause covers its owner; a law covers everything it
+/// names, which is why a law is worth writing.
+pub fn covered_by(claim: ClaimRow, laws: Laws) -> List<String> = owners(claim, laws)
+
+/// How many definitions each tier covers, so a reader knows whether the check was a proof or a
+/// sample. `uncovered` is in name order, since it is a list to work through.
+pub fn coverage(defs: List<String>, laws: Laws, results: List<ClaimRow>) -> Coverage = {
+  let strongest = fold(results, map_new(), |acc: Map<String, Tier>, r: ClaimRow|
+    match r.tier {
+      None -> acc,
+      Some(tier) ->
+        fold(covered_by(r, laws), acc, |m: Map<String, Tier>, name: String|
+          if contains_text(defs, name) {
+            map_insert(m, name, strongest_tier(map_get(m, name), tier))
+          } else { m }),
+    });
+  let names = map_keys(strongest);
+  {
+    definitions: len(defs),
+    covered: len(names),
+    uncovered: sorted_texts(filter(defs, |name: String| !contains_text(names, name))),
+    by_tier: map(tiers(), |t: Tier|
+      {
+        tier: t,
+        count: len(filter(names, |name: String| tier_of(strongest, name) == tier_word(t))),
+      }),
+  }
+}
+
+fn strongest_tier(held: Option<Tier>, tier: Tier) -> Tier =
+  match held {
+    None -> tier,
+    Some(had) -> if tier_rank(tier) > tier_rank(had) { tier } else { had },
+  }
+
+fn tier_of(strongest: Map<String, Tier>, name: String) -> String =
+  match map_get(strongest, name) { Some(t) -> tier_word(t), None -> "" }
+
+/// How many definitions carry at least one obligation at all, whatever became of it. A definition
+/// named twice by the same law is still one definition.
+pub fn specified(defs: List<String>, laws: Laws, claims: List<ClaimRow>) -> Int = {
+  let named = fold(claims, [], |acc: List<String>, c: ClaimRow|
+    fold(covered_by(c, laws), acc, |out: List<String>, name: String|
+      if contains_text(out, name) { out } else { push(out, name) }));
+  len(filter(named, |name: String| contains_text(defs, name)))
+}
+
+// --- What moved since a reader accepted it ------------------------------------
+
+pub type Change = {
+  name: String,
+  implementation: Moved,
+  spec: Moved,
+  /// Indices into the run's own rows, in report order.
+  obligations: List<Int>,
+  /// How many of them the machine actually established.
+  holding: Int,
+}
+
+pub fn is_specified(c: Change) -> Bool = c.holding > 0
+
+pub fn claimed(c: Change) -> Bool = len(c.obligations) > 0
+
+pub fn changed(c: Change) -> Bool = c.implementation != Unchanged || c.spec != Unchanged
+
+// The coverage and the definition count are the run's own; this is the part the review decides.
+pub type Changes = {
+  /// Definitions with a baseline at all.
+  reviewed: Int,
+  /// Only the definitions that moved, in program order.
+  changed: List<Change>,
+  /// Obligations attached to a changed definition that did **not** hold.
+  broken: Int,
+  /// How many of those were never discharged at all, rather than refuted or found vacuous.
+  undischarged: Int,
+}
+
+pub fn specified_changes(c: Changes) -> Int = len(filter(c.changed, is_specified))
+
+pub fn unspecified_changes(c: Changes) -> Int = len(c.changed) - specified_changes(c)
+
+/// Which definitions moved, whether their claims moved with them, and what became of those claims.
+/// `current` is each definition's hash and spec as they stand now, `baselines` what was accepted, and
+/// `results` the run's own rows: `holds` is whether the machine established the claim, `attempted`
+/// whether it was discharged at all.
+pub fn review(
+  defs: List<String>,
+  laws: Laws,
+  current: Map<String, Record>,
+  baselines: Map<String, Record>,
+  results: List<ClaimRow>,
+) -> Changes = {
+  let owed = fold(range(0, len(results)), map_new(), |acc: Map<String, List<Int>>, i: Int| {
+    let r = at_or(results, i);
+    fold(owners(r, laws), acc, |m: Map<String, List<Int>>, name: String|
+      map_insert(m, name, push(owned(m, name), i)))
+  });
+  let walked = fold(
+    defs,
+    { reviewed: 0, changed: [], broken: 0, undischarged: 0 },
+    |acc: { reviewed: Int, changed: List<Change>, broken: Int, undischarged: Int }, name: String|
+      match map_get(current, name) {
+        None -> acc,
+        Some(now) -> {
+          let baseline = map_get(baselines, name);
+          let checked = {
+            ..acc,
+            reviewed: acc.reviewed + (match baseline { Some(_) -> 1, None -> 0 }),
+          };
+          let entry = {
+            name: name,
+            implementation: match baseline {
+              None -> Never,
+              Some(was) -> moved(was.def_hash == now.def_hash),
+            },
+            spec: match baseline { None -> Never, Some(was) -> moved(was.specs == now.specs) },
+            obligations: owned(owed, name),
+            holding: len(filter(owned(owed, name), |i: Int| at_or(results, i).holds)),
+          };
+          if changed(entry) {
+            {
+              ..checked,
+              changed: push(checked.changed, entry),
+              broken: checked.broken
+                + len(filter(entry.obligations, |i: Int| !at_or(results, i).holds)),
+              undischarged: checked.undischarged
+                + len(filter(entry.obligations, |i: Int| !at_or(results, i).attempted)),
+            }
+          } else { checked }
+        },
+      },
+  );
+  {
+    reviewed: walked.reviewed,
+    changed: walked.changed,
+    broken: walked.broken,
+    undischarged: walked.undischarged,
+  }
+}
+
+// A clause covers its owner; a law covers everything it names, which is why a law is worth writing.
+fn owners(r: ClaimRow, laws: Laws) -> List<String> =
+  match r.kind { Ensures(_) -> [r.owner], Law(_) -> law_targets(laws, r.owner) }
+
+fn owned(m: Map<String, List<Int>>, name: String) -> List<Int> =
+  match map_get(m, name) { Some(xs) -> xs, None -> [] }
+
+fn moved(same: Bool) -> Moved = if same { Unchanged } else { Changed }
+
+// --- Helpers ------------------------------------------------------------------
+
+fn indices_where(n: Int, p: (Int) -> Bool) -> List<Int> =
+  fold(range(0, n), [], |acc: List<Int>, i: Int| if p(i) { push(acc, i) } else { acc })
+
+fn contains_text(xs: List<String>, x: String) -> Bool =
+  fold(xs, false, |found: Bool, y: String| found || y == x)
+
+fn push_all<a>(xs: List<a>, ys: List<a>) -> List<a> =
+  fold(ys, xs, |acc: List<a>, y: a| push(acc, y))
+
+fn sorted_texts(xs: List<String>) -> List<String> =
+  fold(xs, [], |acc: List<String>, x: String| {
+    let at = fold(range(0, len(acc)), len(acc), |i: Int, j: Int|
+      if i < len(acc) { i } else if compare(x, at_or(acc, j)) == Less { j } else { i });
+    let head = map(range(0, at), |j: Int| at_or(acc, j));
+    fold(range(at, len(acc)), push(head, x), |out: List<String>, j: Int| push(out, at_or(acc, j)))
+  })
+
+fn at_or<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list holds") }
+
+// --- Tests ------------------------------------------------------------------
+//
+// The selection is a decision table, and the coverage and review are accounting over rows, so these
+// pin every branch: what the cache answered, which tier wins, which definitions moved, and which
+// claims went with them.
+
+fn a_row(owner: String, kind: Kind, tier: Option<Tier>, holds: Bool, attempted: Bool) -> ClaimRow =
+  { owner: owner, kind: kind, tier: tier, holds: holds, attempted: attempted }
+
+fn a_clause(owner: String, tier: Option<Tier>) -> ClaimRow =
+  a_row(owner, Ensures(0), tier, tier != None, tier != None)
+
+fn a_law(owner: String, tier: Option<Tier>) -> ClaimRow =
+  a_row(owner, Law(None), tier, tier != None, tier != None)
+
+test "the cache answers per obligation, and a host is never cached" {
+  let answers = [
+    { reason: FromProof, answered: true, warning: None },
+    { reason: Fresh, answered: false, warning: None },
+    { reason: FromSample, answered: true, warning: None },
+  ];
+  let hosted = [false, false, true];
+  let s = select(hosted, answers, true);
+  // The third reaches the world, so it is discharged whatever the cache holds.
+  assert_eq(s.reasons, [FromProof, Fresh, Uncached]);
+  assert_eq(s.answered, [true, false, false]);
+  assert_eq(s.to_discharge, [1, 2]);
+  assert_eq(hits(s), 1);
+  assert_eq(s.warnings, []);
+  // `--no-cache` makes every obligation unanswerable, host or not.
+  let s = select(hosted, answers, false);
+  assert_eq(s.reasons, [Uncached, Uncached, Uncached]);
+  assert_eq(s.to_discharge, [0, 1, 2]);
+  assert_eq(hits(s), 0);
+  // A refusal is an answer, and not evidence: it is reported and the obligation runs again.
+  let refused = [
+    {
+      reason: CacheRefused,
+      answered: false,
+      warning: Some("the obligation cache holds something else for `ab`; it was discarded"),
+    },
+  ];
+  let s = select([false], refused, true);
+  assert_eq(s.reasons, [CacheRefused]);
+  assert_eq(s.to_discharge, [0]);
+  assert_eq(s.warnings, ["the obligation cache holds something else for `ab`; it was discarded"])
+}
+
+test "a law names definitions, and the sentence it was written as is part of their spec" {
+  let laws = add_law(
+    add_law(no_laws(), "m.sorted", "h-law", ["m.insert", "m.sort"]),
+    "m.total",
+    "h-other",
+    ["m.sort"],
+  );
+  assert_eq(law_targets(laws, "m.sorted"), ["m.insert", "m.sort"]);
+  assert_eq(law_targets(laws, "nothing"), []);
+  assert_eq(has_laws(laws), true);
+  assert_eq(has_laws(no_laws()), false);
+  // Ascending by law, so the same program always reports its spec the same way.
+  assert_eq(naming(laws, "m.sort"), ["h-law", "h-other"]);
+  assert_eq(naming(laws, "m.insert"), ["h-law"]);
+  assert_eq(naming(laws, "m.nothing"), []);
+  // A law with no text on record contributes nothing, rather than an empty entry.
+  let texts = map_insert(map_new(), "m.insert", ["h-clause"]);
+  assert_eq(spec_hashes("m.insert", texts, laws), ["h-clause", "h-law"]);
+  assert_eq(spec_hashes("m.sort", texts, laws), ["h-law", "h-other"]);
+  assert_eq(spec_hashes("m.nothing", texts, laws), [])
+}
+
+test "the strongest discharge is what a definition is covered by" {
+  let laws = add_law(no_laws(), "m.sorted", "h-law", ["m.sort"]);
+  let defs = ["m.sort", "m.insert", "m.other"];
+  // The same definition at two tiers: the stronger one covers it.
+  let results = [
+    a_clause("m.sort", Some(Example)),
+    a_clause("m.sort", Some(Proved)),
+    a_clause("m.insert", Some(Property)),
+    a_law("m.sorted", Some(Example)),
+  ];
+  let c = coverage(defs, laws, results);
+  assert_eq(c.definitions, 3);
+  assert_eq(c.covered, 2);
+  // In name order, since it is a list to work through.
+  assert_eq(c.uncovered, ["m.other"]);
+  // Ascending strength, and `proved` is last because it is the strongest.
+  assert_eq(c.by_tier, [
+    { tier: Example, count: 0 },
+    { tier: Property, count: 1 },
+    { tier: Proved, count: 1 },
+  ]);
+  // A claim that held nothing covers nothing, whatever it is about.
+  let c = coverage(defs, laws, [a_row("m.sort", Ensures(0), None, false, true)]);
+  assert_eq(c.covered, 0);
+  assert_eq(c.uncovered, ["m.insert", "m.other", "m.sort"]);
+  assert_eq(c.by_tier, [
+    { tier: Example, count: 0 },
+    { tier: Property, count: 0 },
+    { tier: Proved, count: 0 },
+  ])
+}
+
+test "a law covers every definition it names, and a definition named twice is still one" {
+  let laws = add_law(no_laws(), "m.sorted", "h-law", ["m.sort", "m.insert"]);
+  let defs = ["m.sort", "m.insert", "m.other"];
+  let results = [a_law("m.sorted", Some(Proved)), a_clause("m.sort", Some(Example))];
+  assert_eq(specified(defs, laws, results), 2);
+  // A claim about a definition outside the program is not counted, and neither is one that held
+  // nothing.
+  let outside = [a_clause("m.gone", Some(Proved))];
+  assert_eq(specified(defs, laws, outside), 0);
+  assert_eq(specified(defs, laws, [a_row("m.sort", Ensures(0), None, false, true)]), 1)
+}
+
+fn records(
+  xs: List<{ name: String, def_hash: String, specs: List<String> }>,
+) -> Map<String, Record> =
+  fold(
+    xs,
+    map_new(),
+    |m: Map<String, Record>, x: { name: String, def_hash: String, specs: List<String> }|
+      map_insert(m, x.name, { def_hash: x.def_hash, specs: x.specs }),
+  )
+
+test "the review names what moved, and what became of the claims that went with it" {
+  let laws = no_laws();
+  let defs = ["m.moved", "m.spec_moved", "m.same", "m.fresh"];
+  let current = records([
+    { name: "m.moved", def_hash: "h2", specs: ["s1"] },
+    { name: "m.spec_moved", def_hash: "h1", specs: ["s2"] },
+    { name: "m.same", def_hash: "h1", specs: ["s1"] },
+    { name: "m.fresh", def_hash: "h1", specs: ["s1"] },
+  ]);
+  let baselines = records([
+    { name: "m.moved", def_hash: "h1", specs: ["s1"] },
+    { name: "m.spec_moved", def_hash: "h1", specs: ["s1"] },
+    { name: "m.same", def_hash: "h1", specs: ["s1"] },
+  ]);
+  let results = [
+    a_clause("m.moved", Some(Proved)),
+    a_row("m.spec_moved", Ensures(0), None, false, true),
+    a_row("m.fresh", Ensures(0), None, false, false),
+    a_clause("m.same", Some(Proved)),
+  ];
+  let r = review(defs, laws, current, baselines, results);
+  assert_eq(r.reviewed, 3);
+  // In program order, and only what moved: `m.same` is unchanged in both halves.
+  assert_eq(map(r.changed, |c: Change| c.name), ["m.moved", "m.spec_moved", "m.fresh"]);
+  assert_eq(map(r.changed, |c: Change| moved_word(c.implementation)), [
+    "changed",
+    "unchanged",
+    "never",
+  ]);
+  assert_eq(map(r.changed, |c: Change| moved_word(c.spec)), ["unchanged", "changed", "never"]);
+  // `m.moved` held; `m.spec_moved` was refuted; `m.fresh` was never tried at all.
+  assert_eq(map(r.changed, |c: Change| c.holding), [1, 0, 0]);
+  assert_eq(map(r.changed, |c: Change| claimed(c)), [true, true, true]);
+  assert_eq(r.broken, 2);
+  assert_eq(r.undischarged, 1);
+  assert_eq(specified_changes(r), 1);
+  assert_eq(unspecified_changes(r), 2);
+  assert_eq(map(r.changed, |c: Change| c.obligations), [[0], [1], [2]])
+}
+
+test "a law that moved takes its targets' spec with it" {
+  // The law is what makes `m.sort`'s spec different, with `m.sort` itself untouched.
+  let laws = add_law(no_laws(), "m.sorted", "h-law-2", ["m.sort"]);
+  let defs = ["m.sort"];
+  let current = map_insert(map_new(), "m.sort", {
+    def_hash: "h1",
+    specs: spec_hashes("m.sort", map_new(), laws),
+  });
+  let baselines = records([{ name: "m.sort", def_hash: "h1", specs: ["h-law-1"] }]);
+  let r = review(defs, laws, current, baselines, []);
+  assert_eq(map(r.changed, |c: Change| c.name), ["m.sort"]);
+  assert_eq(moved_word(at_or(r.changed, 0).implementation), "unchanged");
+  assert_eq(moved_word(at_or(r.changed, 0).spec), "changed");
+  // With no claims about it, nothing is broken by the move — but it is a list to read.
+  assert_eq(r.broken, 0);
+  assert_eq(r.undischarged, 0)
+}
+
+test "every word a report prints for a reason, a tier, or a move" {
+  assert_eq(reason_word(Fresh), "new");
+  assert_eq(reason_word(FromProof), "cached proof");
+  assert_eq(reason_word(FromSample), "cached sample");
+  assert_eq(reason_word(Uncached), "uncached");
+  assert_eq(reason_word(CacheRefused), "cache refused");
+  assert_eq(reason_hit(FromProof), true);
+  assert_eq(reason_hit(Fresh), false);
+  assert_eq(tier_word(Proved), "proved");
+  assert_eq(tier_word(Example), "example");
+  assert_eq(tier_rank(Proved) > tier_rank(Property), true);
+  assert_eq(tier_rank(Property) > tier_rank(Example), true);
+  assert_eq(tiers(), [Example, Property, Proved]);
+  assert_eq(moved_word(Never), "never")
+}
