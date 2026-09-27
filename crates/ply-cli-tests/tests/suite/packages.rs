@@ -1,4 +1,5 @@
-use crate::harness::ply;
+use crate::harness::{json_of, ply};
+use serde_json::Value;
 use tempfile::TempDir;
 
 fn manifest(name: &str, deps: &str) -> String {
@@ -428,4 +429,162 @@ fn a_lockfile_nothing_can_read_is_refused_rather_than_ignored() {
         !dir.path().join("app.plyx").exists(),
         "an artifact was written"
     );
+}
+
+/// `ply resolve` is how a lockfile is written deliberately — after a dependency changed, or in a
+/// fresh checkout — and `ply why` says how a package got here.
+#[test]
+fn resolve_writes_the_lock_and_why_names_the_path_to_a_package() {
+    let dir = graph();
+    let out = ply(dir.path()).args(["resolve", "app"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("resolved 2 packages"), "{stdout}");
+    let lock = std::fs::read_to_string(dir.path().join("app/ply.lock")).unwrap();
+    assert!(lock.contains("\"name\":\"lib\""), "{lock}");
+    assert!(lock.contains("\"name\":\"base\""), "{lock}");
+
+    // Why: the root's own module reaches `lib`, and `lib`'s reaches `base`.
+    let out = ply(dir.path())
+        .args(["why", "lib", "app"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("app -> lib"), "{stdout}");
+    assert!(stdout.contains("0.0.1"), "{stdout}");
+
+    let out = ply(dir.path())
+        .args(["why", "base", "app", "--json"])
+        .output()
+        .unwrap();
+    let v: Value = json_of(&out);
+    assert_eq!(v["command"], "why");
+    assert_eq!(v["package"], "base");
+    assert_eq!(v["path"], serde_json::json!(["app", "lib", "base"]));
+    assert_eq!(v["root"], false);
+    assert!(v["digest"].as_str().unwrap().starts_with("b3:"), "{v}");
+
+    // The root package is what reaches, so its path is itself.
+    let out = ply(dir.path())
+        .args(["why", "app", "app", "--json"])
+        .output()
+        .unwrap();
+    let v: Value = json_of(&out);
+    assert_eq!(v["root"], true);
+    assert_eq!(v["path"], serde_json::json!(["app"]));
+
+    // A name nothing declares is a query that found nothing, not a build failure.
+    let out = ply(dir.path())
+        .args(["why", "nope", "app"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("E0101"), "{err}");
+    assert!(err.contains("is not a package in this closure"), "{err}");
+}
+
+#[test]
+fn a_resolve_re_pins_a_dependency_whose_sources_moved() {
+    let dir = graph();
+    let out = ply(dir.path()).args(["resolve", "app"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let before = std::fs::read_to_string(dir.path().join("app/ply.lock")).unwrap();
+
+    std::fs::write(
+        dir.path().join("base/deep.ply"),
+        "pub fn deep() -> Int = 8\n",
+    )
+    .unwrap();
+    // The build refuses what the lock pins differently, and `resolve` is what accepts it.
+    let out = ply(dir.path())
+        .args(["build", "app", "-o", "app.plyx"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("E0138"));
+
+    let out = ply(dir.path()).args(["resolve", "app"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let after = std::fs::read_to_string(dir.path().join("app/ply.lock")).unwrap();
+    assert_ne!(after, before, "the pin did not move with the sources");
+    let out = ply(dir.path())
+        .args(["build", "app", "-o", "app.plyx"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A library is a package, not a program: `ply build` writes the package itself — its sources, its
+/// manifest and a compiled unit — under a container of its own.
+#[test]
+fn a_library_builds_as_a_package_and_never_as_a_program() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let built = |args: &[&str]| ply(dir.path()).args(args).output().unwrap();
+
+    let out = built(&["new", "core", "--lib"]);
+    assert_eq!(out.status.code(), Some(0));
+    let out = built(&["build", "core", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = json_of(&out);
+    assert_eq!(v["command"], "build");
+    assert_eq!(v["library"], true);
+    assert_eq!(v["name"], "core");
+    assert_eq!(v["version"], "0.1.0");
+    assert_eq!(v["definitions"], 1, "{v}");
+    assert!(v["digest"].as_str().unwrap().starts_with("b3:"), "{v}");
+    assert_eq!(v["unit"], true);
+
+    let bytes = std::fs::read(dir.path().join("core.plyz")).expect("the library is written");
+    assert_eq!(
+        &bytes[..8],
+        b"PLYLIB01",
+        "a library is not a program container"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&bytes[..8]),
+        "PLYLIB01",
+        "and its magic is not a program's"
+    );
+
+    // A library is never entered: reading it as sources would report a container as text.
+    let out = built(&["run", "core.plyz"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("is a library, and nothing to run"), "{err}");
+    assert!(err.contains("declare it in a `ply.pkg`"), "{err}");
+
+    // A program package still builds a `.plyx`, and the library's own tests still run.
+    let out = built(&["new", "app"]);
+    assert_eq!(out.status.code(), Some(0));
+    let out = built(&["build", "app"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        dir.path().join("main.plyx").exists(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let out = built(&["test", "core"]);
+    assert_eq!(out.status.code(), Some(0));
 }

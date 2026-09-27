@@ -104,9 +104,9 @@ impl Hosts {
         // Opened only when a `db` operation can reach it, and probed now so an unreachable database
         // fails start-up rather than the first request.
         let mut facilities = ply_host::Host::with_credentials(material)
-        .configured(Arc::clone(&config.snapshot))
-        .rooted(roots)
-        .traced(trace.open());
+            .configured(Arc::clone(&config.snapshot))
+            .rooted(roots)
+            .traced(trace.open());
         if let Some(process) = process {
             facilities = facilities.with_process(process);
         }
@@ -1041,7 +1041,6 @@ fn filesystem_value(filesystem: &Filesystem) -> PlyValue {
         ),
     )])
 }
-
 
 fn configuration_value(configuration: &Configuration) -> PlyValue {
     let snapshot = &configuration.snapshot;

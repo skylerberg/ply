@@ -12,8 +12,7 @@ use crate::load::{Loaded, load, project_root};
 use crate::options::When;
 use crate::payload::{count, diag_value, diags_value, json, option, places_value, record, strings};
 use crate::support::{
-    build_backend_over, build_pool, enter_constant, module_texts, once_each,
-    select_profile,
+    build_backend_over, build_pool, enter_constant, module_texts, once_each, select_profile,
 };
 use ply_eval::Value as PlyValue;
 use ply_eval::host::{

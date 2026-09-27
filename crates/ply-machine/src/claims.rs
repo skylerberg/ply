@@ -478,11 +478,7 @@ struct Prepared<'a> {
     warnings: Vec<Diagnostic>,
 }
 
-fn prepare<'a>(
-    job: &Job,
-    loaded: &'a Loaded,
-    store: &mut Store,
-) -> Result<Prepared<'a>, Refused> {
+fn prepare<'a>(job: &Job, loaded: &'a Loaded, store: &mut Store) -> Result<Prepared<'a>, Refused> {
     let unbound = |diagnostics: Vec<Diagnostic>| Refused {
         why: Why::Unbound,
         diagnostics,
