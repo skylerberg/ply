@@ -60,6 +60,7 @@ pub enum Builtin {
     Max,
     ByteOfInt,
     IntToString,
+    FloatToString,
     StringConcat,
     BytesLen,
     BytesAt,
@@ -161,6 +162,7 @@ impl Builtin {
             "rotr" => Builtin::Rotr,
             "byte_of_int" => Builtin::ByteOfInt,
             "int_to_string" => Builtin::IntToString,
+            "float_to_string" => Builtin::FloatToString,
             "string_concat" => Builtin::StringConcat,
             "bytes_len" => Builtin::BytesLen,
             "bytes_at" => Builtin::BytesAt,
@@ -268,6 +270,7 @@ impl Builtin {
             Builtin::IntOfI64 => "int_of_i64",
             Builtin::ByteOfInt => "byte_of_int",
             Builtin::IntToString => "int_to_string",
+            Builtin::FloatToString => "float_to_string",
             Builtin::StringConcat => "string_concat",
             Builtin::BytesLen => "bytes_len",
             Builtin::BytesAt => "bytes_at",
@@ -341,6 +344,7 @@ impl Builtin {
             Builtin::MapNew => (0, 0),
             Builtin::Len
             | Builtin::IntToString
+            | Builtin::FloatToString
             | Builtin::ByteOfInt
             | Builtin::CellGet
             | Builtin::Panic
@@ -511,6 +515,7 @@ impl Builtin {
             Builtin::Max,
             Builtin::ByteOfInt,
             Builtin::IntToString,
+            Builtin::FloatToString,
             Builtin::StringConcat,
             Builtin::BytesLen,
             Builtin::BytesAt,
@@ -851,6 +856,12 @@ fn call_with(
         Builtin::IntToString => Ok(Step::Done(Value::str(
             args[0].as_int(span, "`int_to_string`")?.to_string(),
         ))),
+
+        // The language's own float spelling, the one a diagnostic prints: shortest round-trip,
+        // and `Infinity`/`NaN` rather than the `inf`/`NaN` Rust would write.
+        Builtin::FloatToString => Ok(Step::Done(Value::str(ply_ty::render_float(
+            args[0].as_float(span, "`float_to_string`")?,
+        )))),
 
         Builtin::StringConcat => {
             let a = args[0].as_str(span, "`string_concat`")?;
