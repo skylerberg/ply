@@ -44,6 +44,7 @@ mod map_cache;
 mod map_law;
 mod mutate;
 mod nesting;
+mod new;
 mod numerics;
 mod packages;
 mod process_cli;

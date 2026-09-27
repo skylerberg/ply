@@ -752,9 +752,9 @@ pub fn err_hermetic(span: Span, operation: &str, path: &'static str) -> Diagnost
         format!("`{operation}` reached the host boundary in a hermetic run"),
     )
     .primary(span, "no handler here, and no host handler is bound")
-    .note("`ply test` is hermetic: it binds simulated handlers and refuses real ones")
+    .note("a hermetic run binds simulated handlers and refuses the real ones")
     .note(format!(
-        "handle `{operation}` in the test, or run `ply test --host`"
+        "handle `{operation}` in the program, or run with `--host`"
     ))
     .note(format!("`{path}` would serve this under `--host`"))
 }
