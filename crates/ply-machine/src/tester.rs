@@ -2149,7 +2149,7 @@ fn fault_value(f: &FaultView) -> PlyValue {
                     PlyValue::list(
                         f.groups
                             .iter()
-                            .map(|g| PlyValue::list(g.iter().map(|n| PlyValue::str(n)).collect()))
+                            .map(|g| PlyValue::list(g.iter().map(PlyValue::str).collect()))
                             .collect(),
                     ),
                 ),
@@ -2597,7 +2597,10 @@ fn trial(
     // may be cached — under the mixture's own test hash. The failing test's hash is a different
     // test's, so a red test can never be passed by a mixture of it.
     for hash in hybrid.take_proved() {
-        let _ = store.put(hash, ply_store::Outcome::Pass);
+        // A store that refuses a proof is not a failure: the mixture still answered the trial.
+        if store.put(hash, ply_store::Outcome::Pass).is_err() {
+            continue;
+        }
     }
     Ok(trial)
 }
