@@ -261,12 +261,13 @@ fn first_difference(file: &str, once: &str, twice: &str) -> String {
 /// Every `.ply` source the repository maintains, as against the fixtures written to be malformed
 /// or to pin a golden. `examples` is not here yet: several harnesses rewrite those files by
 /// matching their text, and they have to stop before the formatter may touch them.
-const MAINTAINED: [&str; 7] = [
+const MAINTAINED: [&str; 8] = [
     "crates/ply-compiler/ply",
     "crates/ply-cli/ply",
     "crates/ply-std/ply",
     "crates/ply-corpus/ply",
     "crates/ply-test/ply",
+    "crates/ply-prove/ply",
     "benches",
     "tests/lang",
 ];
