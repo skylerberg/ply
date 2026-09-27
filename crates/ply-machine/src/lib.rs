@@ -50,13 +50,14 @@ use std::sync::{Arc, Mutex};
 /// `machine.enter[m]()`, `machine.reload[m]()`, `machine.drop[m]()`.
 pub const EFFECT: &str = "machine";
 
-const OPERATIONS: [(&str, &str); 7] = [
+const OPERATIONS: [(&str, &str); 8] = [
     ("configure", "ply_machine::configure"),
     ("load", "ply_machine::load"),
     ("reload", "ply_machine::reload"),
     ("bound", "ply_machine::bound"),
     ("enter", "ply_machine::enter"),
     ("call", "ply_machine::call"),
+    ("accounting", "ply_machine::accounting"),
     ("drop", "ply_machine::drop"),
 ];
 
@@ -188,6 +189,9 @@ enum Go {
         args: Vec<serde_json::Value>,
         reply: Sender<Result<serde_json::Value, Diagnostic>>,
     },
+    Accounting {
+        reply: Sender<drive::Measured>,
+    },
     Reload {
         reply: Sender<Result<drive::FoundData, drive::Refused>>,
     },
@@ -246,6 +250,11 @@ impl HostHandler for Site {
                         ("message", Value::str(d.message)),
                     ])),
                 }
+            }
+            ("accounting", []) => {
+                let measured: drive::Measured =
+                    self.ask(&label, span, |reply| Go::Accounting { reply })?;
+                drive::accounting_value(&measured)
             }
             ("drop", []) => self.drop(&label),
             (other, _) => {
@@ -423,6 +432,9 @@ fn park(mut drive: drive::Drive, hearing: mpsc::Receiver<Go>) {
             }
             Go::Call { name, args, reply } => {
                 let _ = reply.send(drive.call(&name, args));
+            }
+            Go::Accounting { reply } => {
+                let _ = reply.send(drive.accounting());
             }
             Go::Reload { reply } => {
                 let answer = drive.reload().map(|()| drive.found_data());
