@@ -212,3 +212,37 @@ fn a_failure_is_placed_in_the_text_that_ran_after_its_definition_moved() {
         "{above}"
     );
 }
+
+/// A constructor is the one its own module declares, even when another imported module declares a
+/// constructor of the same name and is imported first.
+///
+/// `tag_of` resolves a name the import list did not qualify by searching the module that *holds*
+/// it, and the search took the first import whose module declared the simple name — so `Nondet`
+/// here resolved to `second`, whose `Skipped` has a `Nondet` of its own, and `first`'s arm never
+/// matched. The name has to come from the import that bound it, not from any module that happens to
+/// declare it.
+#[test]
+fn a_constructor_name_is_the_module_it_was_imported_from_and_not_any_module_that_declares_it() {
+    let dir = crate::harness::project_files(&[
+        (
+            "first.ply",
+            "pub type Colour = | Nondet | Other\n\npub fn code(c: Colour) -> Int =\n  match c {\n    Nondet -> 11,\n    Other -> 12,\n  }\n",
+        ),
+        (
+            "second.ply",
+            "pub type Skipped = | Nondet | Panicked\n\npub fn skipped_code(s: Skipped) -> Int =\n  match s {\n    Nondet -> 21,\n    Panicked -> 22,\n  }\n",
+        ),
+        (
+            "use.ply",
+            "// `second` comes first and declares a `Nondet` of its own.\nimport second (Panicked, Skipped, skipped_code)\nimport first (Colour, Nondet, Other, code)\n\ntest \"the imported constructor is the one that was imported\" {\n  assert_eq(code(Nondet), 11);\n  assert_eq(code(Other), 12)\n}\n",
+        ),
+    ]);
+    let out = ply(dir.path()).args(["test", "-j", "1"]).output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("1 passed"), "{text}");
+}

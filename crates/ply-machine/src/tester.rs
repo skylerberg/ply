@@ -106,6 +106,15 @@ impl Session {
     }
 }
 
+/// Whether the program reads the report and searches for itself: its `tester` effect declares
+/// `trial`, which is the operation only a program that decides asks the runtime for.
+fn searches(check: &CheckOutput) -> bool {
+    check
+        .effects
+        .get(&Symbol::new(EFFECT))
+        .is_some_and(|effect| effect.ops.contains_key(&Symbol::new("trial")))
+}
+
 /// The decision, as the program sent it: the same four fields `ply_test::Choice` holds.
 fn choice_of(v: &PlyValue, span: Span) -> Result<ply_test::Choice, Diagnostic> {
     use crate::payload::field_of;
@@ -1029,15 +1038,16 @@ fn execute(
                 None => run(),
             };
             // After the run, since a pass recorded now is a valid baseline for another's failure.
-            // The search is the *program's* once its effect declares `trial` and its report renders
-            // a verdict; until then this side searches, and `Hybrids` is what it would hand over.
+            // The search is the program's as soon as its effect declares `trial`: the report it
+            // renders carries a verdict, and what that verdict decides is the program's. A program
+            // that declares no `trial` cannot ask, so this side searches for it.
             hybrids = ply_test::diagnose_failures(
                 &mut report,
                 &loaded.texts(),
                 &loaded.front,
                 &mut cache.store,
                 &diagnosis_options(args),
-                true,
+                !searches(&loaded.check),
             );
             let escapes = hosts_escapes(&report, &loaded.check, hosts);
             let ok = report.is_success() && escapes.is_empty();
@@ -1078,7 +1088,7 @@ fn execute(
         }
         None => None,
     };
-    let mut over = Over {
+    let over = Over {
         hermetic: hosts.is_hermetic(),
         label: hosts.label().to_string(),
         operations: hosts.listing().rows.len(),
@@ -1690,7 +1700,7 @@ fn outcome(result: &TestResult) -> OutcomeView {
         duration_us: result.duration.as_micros(),
         status: status_str(result.status),
         diagnostic: result.failure.clone(),
-search: result.simulation.as_ref().map(|e| SearchView {
+        search: result.simulation.as_ref().map(|e| SearchView {
             explored: u64::from(e.explored),
             exhaustive: e.exhaustive,
             exhausted: e.exhausted,
@@ -2591,14 +2601,16 @@ fn trial_value(trial: &ply_test::bisect::Trial) -> PlyValue {
     ])
 }
 
-
 /// One failure's change set, as the program reads it.
 fn change_set_value(view: &ChangeSetView) -> PlyValue {
     record(vec![
         ("delta", delta_value(&view.delta)),
         ("classified", count(view.classified)),
         ("test_classified", PlyValue::Bool(view.test_classified)),
-        ("absent", PlyValue::ctor(skipped_ctor(view.absent), Vec::new())),
+        (
+            "absent",
+            PlyValue::ctor(skipped_ctor(view.absent), Vec::new()),
+        ),
         (
             "at",
             PlyValue::list(
