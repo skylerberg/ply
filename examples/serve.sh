@@ -127,12 +127,15 @@ cp "$here/desk.ply" "$out/desk.ply"
 # must be carried here.
 if [ "$memory" -eq 1 ]; then
   rewrite "$out/desk.ply" \
-    "  / {Serving, config.get[server], net.listen[listener], net.accept[listener], net.close[listener]," \
-    "  / {config.secret[credentials], config.get[server], net.listen[listener], net.listen_tls[listener], net.accept[listener], net.close[listener],"
-  rewrite "$out/desk.ply" "    run(port, count)" "    run_memory(port, key, count)"
+    "fn main() -> Int / {Running} = {" \
+    "fn main() -> Int / {config.secret[credentials], config.get[server], net.listen[listener], net.listen_tls[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn]} = {"
+  rewrite "$out/desk.ply" \
+    "  postgres(config.get[server](database_key()), port, count, key)" \
+    "  run_memory(port, key, count)"
 elif [ "$tls" -eq 1 ]; then
-  rewrite "$out/desk.ply" "    run(port, count)" \
-    "    run_tls(port, \"$credential\", count)"
+  rewrite "$out/desk.ply" \
+    "    match with_server(configured_url(url), count, || run(port, count)) {" \
+    "    match with_server(configured_url(url), count, || run_tls(port, \"$credential\", count)) {"
 fi
 
 # The credential. A deployment exports one; a development run that did not gets a

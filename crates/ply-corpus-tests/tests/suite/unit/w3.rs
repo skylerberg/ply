@@ -46,9 +46,11 @@ fn the_served_project_typechecks_and_drives_the_twin() {
                 .split_once("fn main()")
                 .expect("the project has an entry point")
                 .1
-                .split_once("\n}\n")
-                .expect("the entry point is closed")
+                // The generated entry point is a header and one call; a blank line ends it.
+                .split_once("\n\n")
+                .expect("the entry point is followed by a blank line")
                 .0;
+            assert!(entry_body.contains(entry), "{variant:?}: {entry_body}");
             assert!(!entry_body.contains("config."), "{variant:?}: {entry_body}");
             Loaded::parse(&source).expect("the served project typechecks");
         }
