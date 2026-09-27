@@ -286,6 +286,21 @@ fn read_package(root: &str) -> DepPackage {
     }
 }
 
+/// Each dependency's root and identity, for the store to key its sources by. A package's identity
+/// is its manifest: that is what names it, grants its prefix and declares what it depends on, so
+/// two checkouts of one package agree and two different packages do not. A package with no readable
+/// manifest contributes no modules and is left unkeyed.
+fn package_roots(packages: &[DepPackage]) -> Vec<(PathBuf, String)> {
+    packages
+        .iter()
+        .filter_map(|package| {
+            let text = package.manifest.as_ref()?;
+            let digest = ply_store::ContentHash::of(text.as_bytes());
+            Some((PathBuf::from(&package.root), digest.to_hex()))
+        })
+        .collect()
+}
+
 /// What the manifests on hand ask for, round by round, until nothing is new: the closure of
 /// the root package's path dependencies.
 fn walk_packages(
@@ -330,7 +345,7 @@ impl<'s> Driver<'s> {
         root: PathBuf,
         discovered: Vec<Discovered>,
         mode: Mode,
-        store: Option<&'s mut Store>,
+        mut store: Option<&'s mut Store>,
         whole_project: bool,
     ) -> Result<Driver<'s>, LoadError> {
         let mut phases = Phases::default();
@@ -405,6 +420,11 @@ impl<'s> Driver<'s> {
                 format!("the package walk could not answer for this project: {e}"),
             )],
         })?;
+        // The store keys a dependency's sources under the package's identity, so the walk's
+        // answer is what tells it which directories those are.
+        if let Some(store) = store.as_deref_mut() {
+            store.set_packages(package_roots(&packages));
+        }
         let mut driver = Driver {
             packages,
             root,
@@ -578,8 +598,30 @@ impl<'s> Driver<'s> {
             });
         }
         let ids: Vec<SourceId> = self.files.iter().map(|f| f.source).collect();
-        ply_ty::read_front(&pulled.dump, &ids)
-            .map_err(|e| self.seam_failed(&format!("the front end's answer does not read: {e}")))
+        let front = ply_ty::read_front(&pulled.dump, &ids)
+            .map_err(|e| self.seam_failed(&format!("the front end's answer does not read: {e}")))?;
+        // What the front end called each file, which for a dependency's is not what the walk called
+        // it: the walk names it relative to its own package, and the prefix that reaches it is the
+        // front end's to decide from the manifest closure. Without this its rows cannot be filed,
+        // and the next run cannot reuse them.
+        self.name_files(&front);
+        Ok(front)
+    }
+
+    /// Every file the front end read is filed under the module the front end gave it. A file it did
+    /// not answer for — a manifest, whose frame is not a module — keeps the name the walk gave it.
+    fn name_files(&mut self, front: &Front) {
+        let named: BTreeMap<SourceId, ModuleName> = front
+            .check
+            .modules
+            .values()
+            .map(|m| (m.source, m.name.clone()))
+            .collect();
+        for file in &mut self.files {
+            if let Some(name) = named.get(&file.source) {
+                file.module = name.clone();
+            }
+        }
     }
 
     /// What the last answer published, definition by definition and test by test. The front end
@@ -593,20 +635,20 @@ impl<'s> Driver<'s> {
         let Some(store) = self.store.as_deref() else {
             return (defs, tests);
         };
-        let filed: Vec<(ModuleName, Arc<SourceFingerprint>)> = self
+        let filed: Vec<Arc<SourceFingerprint>> = self
             .fingerprinted()
             .into_iter()
-            .filter_map(|(path, module)| Some((module, store.fingerprint(&path)?)))
+            .filter_map(|path| store.fingerprint(&path))
             .collect();
         // What each effect hashed to when these rows were filed, which is what witnesses them.
         let recorded: BTreeMap<Symbol, DefHash> = filed
             .iter()
-            .flat_map(|(_, f)| f.defs.iter())
+            .flat_map(|f| f.defs.iter())
             .filter(|e| e.kind == DefKind::Effect)
             .map(|e| (e.name.clone(), e.hash))
             .collect();
 
-        for (module, fingerprint) in &filed {
+        for fingerprint in &filed {
             for entry in &fingerprint.defs {
                 if entry.kind != DefKind::Fn {
                     continue;
@@ -624,7 +666,7 @@ impl<'s> Driver<'s> {
             }
             for test in &fingerprint.tests {
                 tests.push(KnownTest {
-                    key: format!("{module}.{}", test.name),
+                    key: format!("{}.{}", fingerprint.module, test.name),
                     hash: test.hash,
                     witness: witness_for(&recorded, &[&test.footprint]),
                     footprint: ply_ty::print_footprint(&test.footprint),
@@ -635,16 +677,21 @@ impl<'s> Driver<'s> {
     }
 
     /// The files a fingerprint may be on record for, before the port says which are in play: the
-    /// project's own, then every module this binary ships, under the path each is keyed by.
-    fn fingerprinted(&self) -> Vec<(PathBuf, ModuleName)> {
-        let mut out: Vec<(PathBuf, ModuleName)> = self.files[..self.own()]
+    /// project's own, each dependency's, then every module this binary ships, under the path each is
+    /// keyed by.
+    fn fingerprinted(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = self.files[..self.own()]
             .iter()
-            .map(|f| (f.path.clone(), f.module.clone()))
+            .map(|f| f.path.clone())
             .collect();
-        out.extend(crate::shelf::sources().iter().map(|(name, _)| {
-            let module = ModuleName::from_dotted(name);
-            (crate::shelf::pseudo_path(&module), module)
-        }));
+        for package in &self.packages {
+            out.extend(package.files.iter().map(|(path, _, _)| path.clone()));
+        }
+        out.extend(
+            crate::shelf::sources()
+                .iter()
+                .map(|(name, _)| crate::shelf::pseudo_path(&ModuleName::from_dotted(name))),
+        );
         out
     }
 
@@ -818,6 +865,7 @@ impl<'s> Driver<'s> {
         let info = front.check.modules.get(file.module.as_symbol())?;
         let hashes = &front.hashes;
         let mut fingerprint = SourceFingerprint::new(file.content);
+        fingerprint.module = file.module.to_string();
 
         // A name in two namespaces is in `items` twice and gets one entry per namespace.
         let mut seen: BTreeSet<&Symbol> = BTreeSet::new();

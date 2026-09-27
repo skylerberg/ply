@@ -49,7 +49,9 @@ second cache shared between checkouts and machines, a directory on any storage
 they all reach: the passes and discharged obligations found there count here,
 and this run's are published there (`PLY_CACHE_UPSTREAM_READONLY=1` reads
 only). Entries are keyed by content and by the `ply` version, so nothing
-machine-specific is ever shared; `--no-cache` ignores it.
+machine-specific is ever shared; `--no-cache` ignores it. A dependency's own
+modules are keyed by its manifest rather than by where it sits, so moving or
+re-checking-out a dependency keeps what was cached for it.
 
 ## 2. Lexical structure
 
