@@ -3,7 +3,6 @@
 
 mod certgen;
 mod config;
-mod db;
 mod fs;
 mod pool;
 mod process;
