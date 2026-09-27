@@ -4,6 +4,7 @@ use crate::harness::{process, write};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::process::{Child, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const SERVER: &str = r#"
@@ -20,7 +21,7 @@ fn answer(c: Int) -> Unit / {net.write[conn], signal.read} = {
   let _ = net.recv[conn](c, 4096, 20000);
   let payload = body();
   let head = bytes_concat(
-    b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: ",
+    b"HTTP/1.1 200 OK\r\nConnection: close\r\nX-Test-Nonce: NONCE\r\nContent-Length: ",
     bytes_concat(bytes_of_string(int_to_string(bytes_len(payload))), b"\r\n\r\n"));
   let _ = net::send_all[conn](c, bytes_concat(head, payload), 20000);
   net.close[conn](c)
@@ -53,10 +54,30 @@ fn free_port() -> u16 {
     port
 }
 
+/// A token this test's server echoes in its answer, so a probe cannot read another test's server
+/// as this one. The shutdown suite is one binary and its tests start together, and the kernel can
+/// hand two of them the same ephemeral port; the one that loses the bind dies with `E0502`, and
+/// without the token the winner's answer would satisfy the loser's probe.
+fn nonce() -> String {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{:x}-{:x}",
+        std::process::id(),
+        COUNT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Whether the answer on the reserved address is *this* test's server: a `200 OK` on the port is
+/// not proof, because the port is the kernel's to hand out twice.
+fn ready(answer: &str, nonce: &str) -> bool {
+    answer.contains(nonce)
+}
+
 /// Killed on drop, including during a panic, so a failing test does not leak a server.
 struct Server {
     child: Child,
     port: u16,
+    nonce: String,
     _dir: tempfile::TempDir,
 }
 
@@ -91,10 +112,13 @@ impl Server {
     fn spawn(source: &str, flags: &[&str]) -> Server {
         let dir = tempfile::tempdir().expect("a temp dir");
         let port = free_port();
+        let nonce = nonce();
         write(
             dir.path(),
             "main.ply",
-            &source.replace("PORT", &port.to_string()),
+            &source
+                .replace("PORT", &port.to_string())
+                .replace("NONCE", &nonce),
         );
         let child = process(dir.path())
             .arg("run")
@@ -107,11 +131,13 @@ impl Server {
         Server {
             child,
             port,
+            nonce,
             _dir: dir,
         }
     }
 
-    /// The probe is a whole request and response, not a bare connect.
+    /// The probe is a whole request and response, and the answer has to carry this test's token:
+    /// a bare connect, or a `200 OK`, can belong to another test's server on the same port.
     fn wait_until_listening(&mut self) -> Result<(), String> {
         let until = Instant::now() + Duration::from_secs(60);
         while Instant::now() < until {
@@ -122,7 +148,7 @@ impl Server {
                 TcpStream::connect_timeout(&self.address(), Duration::from_millis(200))
             {
                 let _ = probe.set_read_timeout(Some(Duration::from_secs(10)));
-                if request(&mut probe).contains("200 OK") {
+                if ready(&request(&mut probe), &self.nonce) {
                     return Ok(());
                 }
             }
@@ -212,6 +238,33 @@ fn request(stream: &mut TcpStream) -> String {
     let mut answer = Vec::new();
     let _ = stream.read_to_end(&mut answer);
     String::from_utf8_lossy(&answer).to_string()
+}
+
+/// Two tests in this binary can be handed the same port, and the one that loses the bind answers
+/// the winner's probe with what looks like readiness. The token in the answer is what tells them
+/// apart, so this holds `ready` to it rather than to the status line.
+#[test]
+fn a_200_ok_from_another_server_is_not_readiness() {
+    let decoy = TcpListener::bind("127.0.0.1:0").expect("a decoy port");
+    let address = decoy.local_addr().expect("a decoy address");
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = decoy.accept() {
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nok");
+        }
+    });
+
+    let mut probe =
+        TcpStream::connect_timeout(&address, Duration::from_secs(5)).expect("the decoy listens");
+    let _ = probe.set_read_timeout(Some(Duration::from_secs(5)));
+    let answer = request(&mut probe);
+    assert!(
+        answer.contains("200 OK"),
+        "the decoy did not answer the probe, so this test proves nothing: {answer:?}"
+    );
+    assert!(
+        !ready(&answer, "the-token-this-test-asked-for"),
+        "a server that is not this test's read as ready:\n\n{answer}"
+    );
 }
 
 #[test]
@@ -421,7 +474,7 @@ fn answer(c: Int) -> Int / {net.write[conn], signal.read} = {
   let _ = net.recv[conn](c, 4096, 20000);
   let payload = if signal.stopping() { b"draining" } else { b"ok" };
   let head = bytes_concat(
-    b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: ",
+    b"HTTP/1.1 200 OK\r\nConnection: close\r\nX-Test-Nonce: NONCE\r\nContent-Length: ",
     bytes_concat(bytes_of_string(int_to_string(bytes_len(payload))), b"\r\n\r\n"));
   let _ = net::send_all[conn](c, bytes_concat(head, payload), 20000);
   net.close[conn](c);
