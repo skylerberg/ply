@@ -984,6 +984,11 @@ pub fn diagnose_failures(
             .find(|(_, t)| t.key == failure.key)
             .map(|(hash, _)| *hash);
 
+        let nondet = check
+            .tests
+            .iter()
+            .find(|t| t.key == failure.key)
+            .is_some_and(|t| t.nondet);
         let mixture = baseline
             .as_ref()
             .map(|baseline| hybrid::mixture_for(hashes, &failure.key, baseline));
@@ -1050,10 +1055,25 @@ pub fn diagnose_failures(
         if let Some(change) = &delta {
             failure.attribution.annotate(change);
         }
-        // The verdict is the program's to give: without one, the report says so rather than
-        // claiming a search this side did not run.
+        // What this side can say without searching, in the order the gate asks — a defect in Ply,
+        // `nondet`, a host-backed failure and a test that never passed are facts about the record,
+        // not conclusions a search reaches. When a change set *is* handed over, the search is the
+        // program's and the verdict is its to give.
+        let why = if failure.defect {
+            Skipped::Panicked
+        } else if nondet {
+            Skipped::Nondet
+        } else if failure.host {
+            Skipped::Host
+        } else if baseline.is_none() {
+            Skipped::NeverPassed
+        } else if delta.is_none() {
+            Skipped::NoChanges
+        } else {
+            Skipped::Delegated
+        };
         failure.attribution.resolve(
-            crate::Bisection::not_attempted(Skipped::Delegated),
+            crate::Bisection::not_attempted(why),
             failure.attribution.slice.clone(),
         );
     }
