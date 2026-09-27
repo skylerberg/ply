@@ -765,7 +765,7 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    pub(crate) fn matches(&self, target: Target) -> bool {
+    pub fn matches(&self, target: Target) -> bool {
         matches!(
             (self, target),
             (Outcome::Failed, Target::Falsifies) | (Outcome::Raised(_), Target::Raises)
@@ -864,11 +864,15 @@ pub fn run_property(
                         return Discharge::Unattempted(Gap::Raised {
                             bindings: bindings(binders, &values),
                             diagnostic: Box::new(diagnostic),
+                            root,
+                            case,
                         });
                     }
                     return Discharge::Unattempted(Gap::Raised {
                         bindings: bindings(binders, &values),
                         diagnostic: Box::new(diagnostic),
+                        root,
+                        case,
                     });
                 }
             }
