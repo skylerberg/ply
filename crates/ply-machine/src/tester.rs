@@ -2596,11 +2596,11 @@ fn trial(
     // A mixture that went green is a program whose definitions all pass at once, so what it proved
     // may be cached — under the mixture's own test hash. The failing test's hash is a different
     // test's, so a red test can never be passed by a mixture of it.
+    // A mixture that went green is a program whose definitions all pass at once, so what it proved
+    // may be cached — under the mixture's own test hash. The failing test's hash is a different
+    // test's, so a red test can never be passed by a mixture of it.
     for hash in hybrid.take_proved() {
-        // A store that refuses a proof is not a failure: the mixture still answered the trial.
-        if store.put(hash, ply_store::Outcome::Pass).is_err() {
-            continue;
-        }
+        store.put(hash, ply_store::Outcome::Pass);
     }
     Ok(trial)
 }
