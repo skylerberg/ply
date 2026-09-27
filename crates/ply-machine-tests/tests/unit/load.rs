@@ -109,6 +109,19 @@ fn a_directory_segment_that_is_not_an_identifier_is_also_e0111() {
     assert!(err.diagnostics[0].message.contains("not-a-module"));
 }
 
+/// The rule is ASCII, as the lexer implements it; a non-ASCII name is refused here rather than
+/// surviving to be refused later as `X0001` inside an `import`.
+#[test]
+fn a_non_ascii_segment_is_not_an_identifier() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "café.ply", "fn f() -> Int = 1\n");
+
+    let err = load(dir.path()).unwrap_err();
+    assert_eq!(err.diagnostics.len(), 1);
+    assert_eq!(err.diagnostics[0].code, codes::INVALID_MODULE_PATH);
+    assert!(err.diagnostics[0].message.contains("café"));
+}
+
 #[test]
 fn a_missing_path_is_a_diagnostic_rather_than_a_panic() {
     let err = load(Path::new("definitely/not/here.ply")).unwrap_err();

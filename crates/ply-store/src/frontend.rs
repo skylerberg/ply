@@ -11,7 +11,6 @@ use ply_span::{Diagnostic, SourceId, Span, Symbol};
 use ply_ty::DefHash;
 use ply_ty::Mode;
 use ply_ty::{Footprint, Scheme, Type};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -23,7 +22,7 @@ pub(crate) const FRONTEND_DATA_FILE: &str = idx::DATA_FILE;
 pub(crate) const FRONTEND_STEM: &str = "frontend";
 
 /// A byte range within one source file: what a span degrades to outside the process.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FileSpan {
     pub start: u32,
     pub end: u32,
@@ -47,7 +46,7 @@ impl FileSpan {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NameRef {
     pub name: Symbol,
     pub hash: DefHash,
@@ -62,8 +61,7 @@ impl NameRef {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DefKind {
     Fn,
     Type,
@@ -71,24 +69,23 @@ pub enum DefKind {
 }
 
 /// A variant of a `type`, or an operation of an `effect`.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Member {
     pub name: Symbol,
     pub span: FileSpan,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DefEntry {
     pub name: Symbol,
     pub hash: DefHash,
     pub span: FileSpan,
     pub kind: DefKind,
     /// Empty for a `fn`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<Member>,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CachedTest {
     pub name: String,
     pub hash: DefHash,
@@ -103,13 +100,11 @@ pub struct CachedTest {
 /// file: a dependency's module is named under the prefix its manifest grants, and what grants it
 /// is the importing project's manifest closure. It is kept here so a later run can file the rows
 /// again without the front end's answer — the run that reads them has not asked for one yet.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SourceFingerprint {
     pub content_hash: ContentHash,
-    #[serde(default)]
     pub module: String,
     pub defs: Vec<DefEntry>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tests: Vec<CachedTest>,
 }
 
@@ -134,14 +129,13 @@ impl SourceFingerprint {
 
 /// The published interface of one `fn`, keyed by its [`DefHash`]: everything a check that is
 /// handed this entry instead of the body must answer with.
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct CachedDef {
     pub scheme: Scheme,
     /// The published row: the `/ {..}` annotation if written, else the inferred row.
     pub footprint: Footprint,
     /// The row inference computed for the body, which an annotation may widen.
     pub performed: Footprint,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<NameRef>,
 }
 
@@ -178,10 +172,9 @@ fn canonical_names(mut names: Vec<NameRef>) -> Vec<NameRef> {
 }
 
 /// The published interface of one `type` or `effect`, keyed by its [`DefHash`].
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct CachedDecl {
     pub body: DeclBody,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<NameRef>,
 }
 
@@ -206,8 +199,7 @@ impl CachedDecl {
     }
 }
 
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
-#[serde(tag = "decl", rename_all = "snake_case")]
+#[derive(Clone, PartialEq, Debug)]
 pub enum DeclBody {
     Type {
         /// Type parameters, by count: their names are binders and never escape.
@@ -220,14 +212,14 @@ pub enum DeclBody {
     },
 }
 
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct CachedCtor {
     pub fields: Vec<Type>,
     pub scheme: Scheme,
 }
 
 /// Named because normalization reorders ops; pairing them by position would mismatch signatures.
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct CachedOp {
     pub name: Symbol,
     pub mode: Mode,

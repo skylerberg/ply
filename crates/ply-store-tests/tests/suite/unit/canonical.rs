@@ -28,9 +28,13 @@ fn two_runs_of_the_same_definition_canonicalize_to_the_same_bytes() {
     let warm = identity_pair(412, 87, 9);
     assert_ne!(cold, warm, "the counters really did differ");
     assert_eq!(canonicalize_scheme(&cold), canonicalize_scheme(&warm));
+    let bytes = |s: &Scheme| {
+        let empty = ply_ty::Footprint::empty();
+        ply_store::codec::encode_def(&ply_store::CachedDef::new(s.clone(), empty.clone(), empty))
+    };
     assert_eq!(
-        serde_json::to_string(&canonicalize_scheme(&cold)).unwrap(),
-        serde_json::to_string(&canonicalize_scheme(&warm)).unwrap(),
+        bytes(&canonicalize_scheme(&cold)),
+        bytes(&canonicalize_scheme(&warm)),
         "byte-identical, which is what the equivalence test compares"
     );
 }

@@ -62,12 +62,12 @@ re-checking-out a dependency keeps what was cached for it.
 Source is UTF-8; whitespace only separates tokens and there is no layout rule.
 The only comment is `//` to end of line.
 
-An identifier starts with a letter (Unicode allowed) or `_` and continues with
-alphanumerics or `_`; `_` alone is the wildcard. Case matters only in types (a
-bare lowercase name is a type variable, uppercase a type constructor) and
-patterns (lowercase binds, uppercase is a constructor). Convention: `snake_case`
-values, `UpperCamelCase` types and constructors, lowercase effects and resource
-labels.
+An identifier starts with an ASCII letter or `_` and continues with ASCII
+letters, digits or `_`; `_` alone is the wildcard. A non-ASCII character outside
+a literal is `X0001`. Case matters only in types (a bare lowercase name is a
+type variable, uppercase a type constructor) and patterns (lowercase binds,
+uppercase is a constructor). Convention: `snake_case` values, `UpperCamelCase`
+types and constructors, lowercase effects and resource labels.
 
 ### 2.2 Keywords
 
