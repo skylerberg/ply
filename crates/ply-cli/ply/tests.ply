@@ -18,7 +18,7 @@ import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, t
 import style (Style, plain, bold, dim, green, red, yellow)
 // The two questions a report asks about a test's contention are questions about the atoms the row
 // already carries, so the suite answers them rather than the runtime computing them twice.
-import suite.schedule (contends_only_over_regions, region_isolated)
+import suite.schedule (contends_only_over_regions, group_by_conflict, parallelism, region_isolated)
 
 // What the Rust side loads, binds and runs, in that order and each once per report. A run that
 // refuses at either of the first two ran nothing, which is why binding and running are two
@@ -77,6 +77,9 @@ pub nondet effect tester {
   read keys[r]() -> List<Key>
   read hashed[r]() -> List<Hashed>
   read searched[r]() -> Plan
+  // The printed union of a set of tests' footprints. The program colours the graph; rendering a
+  // colour is the compiler's, since only its printer can keep a label variable off a name.
+  read footprint[r](tests: List<Int>) -> String
 }
 
 // One test the loaded tree declares, and what the store holds under the key its result is filed
@@ -187,8 +190,49 @@ pub type Case = {
   reason: String,
   // Seed roots this test still owes, when the cache already covers part of the plan.
   owed: Int,
-  group: Option<Int>,
 }
+
+// What the program decided about the conflict graph: the classes it coloured, the summary over
+// them, and which class each test landed in — which is only the tests that run, since a class is
+// what a test *shares a worker* with.
+pub type Colouring = {
+  classes: List<Group>,
+  parallelism: Parallelism,
+  at: List<{ index: Int, group: Int }>,
+}
+
+fn group_of(col: Colouring, index: Int) -> Option<Int> =
+  match filter(col.at, |e: { index: Int, group: Int }| e.index == index) {
+    [] -> None,
+    hits -> Some(at(hits, 0, { index: index, group: 0 }).group),
+  }
+
+// One class's rendering is the printer's, so it is asked for rather than assembled.
+fn with_footprint(acc: List<Group>, class: List<Int>) -> List<Group> / {tester.footprint[corpus]} =
+  push(acc, { tests: class, footprint: tester.footprint[corpus](class) })
+
+fn coloured(p: Program, groups: List<Group>, classes: List<List<Int>>) -> Colouring =
+  {
+    classes: groups,
+    parallelism: parallelism(
+      map(p.cases, |c: Case| c.contends),
+      map(filter(p.cases, |c: Case| runs(c.reason)), |c: Case|
+        { index: c.index, contends: c.contends }),
+      classes,
+    ),
+    at: flattened(classes),
+  }
+
+// Each class's number, for the members it holds: a class is what a test shares a worker with.
+fn flattened(classes: List<List<Int>>) -> List<{ index: Int, group: Int }> =
+  flat_map(range(0, len(classes)), |i: Int|
+    map(at(classes, i, []), |index: Int| { index: index, group: i }))
+
+fn flat_map<a, b>(xs: List<a>, f: (a) -> List<b>) -> List<b> =
+  fold(xs, [], |acc: List<b>, x: a| fold_into(acc, f(x)))
+
+fn fold_into<a>(acc: List<a>, xs: List<a>) -> List<a> =
+  fold(xs, acc, |out: List<a>, x: a| push(out, x))
 
 pub type Group = { tests: List<Int>, footprint: String }
 
@@ -223,8 +267,6 @@ pub type Program = {
   selected: Int,
   cached: Int,
   filtered_out: Int,
-  groups: List<Group>,
-  parallelism: Parallelism,
   plan: Plan,
   warnings: List<Diag>,
   // What the machine was configured with, placed under the key this report gives it.
@@ -265,7 +307,6 @@ pub type Outcome = {
   index: Int,
   name: String,
   hash: Option<String>,
-  group: Int,
   duration_us: Int,
   // `passed`, `failed`, `panicked` or `abandoned`.
   status: String,
@@ -531,9 +572,9 @@ fn selected_line(s: Style, p: Program) -> String =
     ++ int_to_string(p.cached)
     ++ " cached)"
 
-fn group_line(p: Program, r: Ran) -> List<String> =
-  if p.selected == 0 { [] }
-  else { [ind() ++ count_of(len(p.groups), "group") ++ " · " ++ count_of(r.workers, "worker")] }
+fn group_line(col: Colouring, r: Ran) -> List<String> =
+  if len(col.at) == 0 { [] }
+  else { [ind() ++ count_of(len(col.classes), "group") ++ " · " ++ count_of(r.workers, "worker")] }
 
 fn isolated_line(s: Style, r: Ran) -> List<String> =
   if r.counts.total == 0 { [] } else {
@@ -619,13 +660,13 @@ fn filtered_lines(s: Style, p: Program) -> List<String> =
   if p.filtered_out == 0 { [] }
   else { [ind() ++ dim(s, "--filter hid " ++ count_of(p.filtered_out, "test"))] }
 
-fn head_lines(s: Style, flags: Flags, p: Program, r: Ran) -> List<String> =
+fn head_lines(s: Style, flags: Flags, p: Program, r: Ran, col: Colouring) -> List<String> =
   appended(
     appended(
       appended(
         appended(
           appended(
-            appended(appended([selected_line(s, p)], group_line(p, r)), isolated_line(s, r)),
+            appended(appended([selected_line(s, p)], group_line(col, r)), isolated_line(s, r)),
             binding_lines(s, r),
           ),
           simulation_line(s, r),
@@ -677,7 +718,7 @@ fn explain_atoms(iso: String, c: Case) -> String =
   else if contends_only_over_regions(c.contends) { " " ++ c.shared ++ " (region labels)" }
   else { " " ++ c.shared }
 
-fn case_line(s: Style, p: Program, r: Ran, c: Case) -> String = {
+fn case_line(s: Style, p: Program, r: Ran, c: Case, col: Colouring) -> String = {
   let iso = isolation_of(r, c);
   let verb = if runs(c.reason) { bold(s, "run ") } else { dim(s, "skip") };
   ind() ++ verb ++ " " ++ dim(s, short_of(c.hash)) ++ " " ++ padded(c.reason, 16) ++ " "
@@ -742,18 +783,18 @@ fn search_lines(s: Style, p: Program) -> List<String> = {
 }
 
 // Grouped like any other test, but a host-backed test is never free.
-fn group_tally(s: Style, p: Program, r: Ran) -> String = {
+fn group_tally(s: Style, p: Program, r: Ran, col: Colouring) -> String = {
   let hosted = if r.counts.host == 0 { "" }
   else { " · " ++ int_to_string(r.counts.host) ++ " host-backed and never free" };
-  let regioned = if p.parallelism.region_contended == 0 { "" } else {
-    " · " ++ int_to_string(p.parallelism.region_contended) ++ " of them only over a region label"
+  let regioned = if col.parallelism.region_contended == 0 { "" } else {
+    " · " ++ int_to_string(col.parallelism.region_contended) ++ " of them only over a region label"
   };
   ind() ++ "  "
     ++ dim(
       s,
       int_to_string(r.counts.isolated) ++ " of " ++ int_to_string(r.counts.total)
         ++ " region-isolated and free · "
-        ++ count_of(p.parallelism.shared_groups, "group")
+        ++ count_of(col.parallelism.shared_groups, "group")
         ++ " for the "
         ++ int_to_string(r.counts.shared)
         ++ " shared "
@@ -766,8 +807,8 @@ fn group_tally(s: Style, p: Program, r: Ran) -> String = {
 fn named_of(p: Program, index: Int) -> String =
   fold(p.cases, "", |acc: String, c: Case| if c.index == index { display_of(p, c) } else { acc })
 
-fn group_block(s: Style, p: Program, lines: List<String>, i: Int) -> List<String> = {
-  let g: Group = at(p.groups, i, no_group());
+fn group_block(s: Style, p: Program, col: Colouring, lines: List<String>, i: Int) -> List<String> = {
+  let g: Group = at(col.classes, i, no_group());
   let head = push(
     lines,
     ind() ++ "  group " ++ int_to_string(i) ++ " · " ++ count_of(len(g.tests), "test") ++ " · "
@@ -779,23 +820,26 @@ fn group_block(s: Style, p: Program, lines: List<String>, i: Int) -> List<String
   })
 }
 
-fn concurrency_lines(s: Style, p: Program, r: Ran) -> List<String> =
-  if len(p.groups) == 0 { [] } else {
+fn concurrency_lines(s: Style, p: Program, r: Ran, col: Colouring) -> List<String> =
+  if len(col.classes) == 0 { [] } else {
     fold(
-      range(0, len(p.groups)),
-      ["", ind() ++ dim(s, "concurrency groups"), group_tally(s, p, r)],
-      |acc: List<String>, i: Int| group_block(s, p, acc, i),
+      range(0, len(col.classes)),
+      ["", ind() ++ dim(s, "concurrency groups"), group_tally(s, p, r, col)],
+      |acc: List<String>, i: Int| group_block(s, p, col, acc, i),
     )
   }
 
-fn explain_lines(s: Style, p: Program, r: Ran) -> List<String> =
+fn explain_lines(s: Style, p: Program, r: Ran, col: Colouring) -> List<String> =
   appended(
     appended(
       appended(
-        appended(appended([""], map(p.cases, |c: Case| case_line(s, p, r, c))), why_lines(s, p)),
+        appended(
+          appended([""], map(p.cases, |c: Case| case_line(s, p, r, c, col))),
+          why_lines(s, p),
+        ),
         search_lines(s, p),
       ),
-      concurrency_lines(s, p, r),
+      concurrency_lines(s, p, r, col),
     ),
     phase_lines(s, p.phases),
   )
@@ -1094,7 +1138,7 @@ fn no_tests_note(flags: Flags, p: Program) -> String =
 
 // --- The document -----------------------------------------------------------
 
-fn case_json(r: Ran, c: Case) -> Json =
+fn case_json(r: Ran, c: Case, col: Colouring) -> Json =
   object([
     { key: "index", value: num(c.index) },
     { key: "key", value: Str(c.key) },
@@ -1105,7 +1149,7 @@ fn case_json(r: Ran, c: Case) -> Json =
     { key: "selected", value: Bool(runs(c.reason)) },
     { key: "reason", value: Str(keyed(c.reason)) },
     { key: "why", value: Str(why(c.reason)) },
-    { key: "group", value: opt_num(c.group) },
+    { key: "group", value: opt_num(group_of(col, c.index)) },
     { key: "footprint", value: Str(c.footprint) },
     { key: "isolation", value: Str(isolation_of(r, c)) },
     // Whether this test reaches the binding, and so always runs uncached.
@@ -1113,8 +1157,8 @@ fn case_json(r: Ran, c: Case) -> Json =
     { key: "shared_atoms", value: strings(c.atoms) },
   ])
 
-fn group_json(p: Program, i: Int) -> Json = {
-  let g: Group = at(p.groups, i, no_group());
+fn group_json(col: Colouring, i: Int) -> Json = {
+  let g: Group = at(col.classes, i, no_group());
   object([
     { key: "index", value: num(i) },
     { key: "tests", value: Array(map(g.tests, |x: Int| num(x))) },
@@ -1152,7 +1196,7 @@ fn case_of(p: Program, index: Int) -> Option<Case> =
   fold(p.cases, None, |acc: Option<Case>, c: Case|
     match acc { Some(_) -> acc, None -> if c.index == index { Some(c) } else { None } })
 
-fn outcome_json(p: Program, o: Outcome) -> Json = {
+fn outcome_json(p: Program, o: Outcome, col: Colouring) -> Json = {
   let named = case_of(p, o.index);
   object([
     { key: "index", value: num(o.index) },
@@ -1160,7 +1204,7 @@ fn outcome_json(p: Program, o: Outcome) -> Json = {
     { key: "name", value: Str(match named { Some(c) -> c.name, None -> o.name }) },
     { key: "module", value: match named { Some(c) -> Str(c.module), None -> Null } },
     { key: "hash", value: opt_str(o.hash) },
-    { key: "group", value: num(o.group) },
+    { key: "group", value: num(match group_of(col, o.index) { Some(g) -> g, None -> 0 }) },
     { key: "status", value: Str(o.status) },
     { key: "duration_ms", value: millis(o.duration_us) },
     {
@@ -1217,19 +1261,19 @@ fn phases_json(f: Phases) -> Json =
     { key: "total", value: millis(phase_total(f)) },
   ])
 
-fn selection_json(p: Program, r: Ran) -> Json =
+fn selection_json(p: Program, r: Ran, col: Colouring) -> Json =
   object([
     { key: "total", value: num(p.total) },
     { key: "selected", value: num(p.selected) },
     { key: "cached", value: num(p.cached) },
     { key: "filtered_out", value: num(p.filtered_out) },
-    { key: "groups", value: Array(map(range(0, len(p.groups)), |i: Int| group_json(p, i))) },
+    { key: "groups", value: Array(map(range(0, len(col.classes)), |i: Int| group_json(col, i))) },
     // A host-backed test counts only under `host`, since it is not isolated.
     { key: "isolated", value: num(r.counts.isolated) },
     { key: "shared", value: num(r.counts.shared) },
     { key: "host", value: num(r.counts.host) },
-    { key: "parallelism", value: parallelism_json(p.parallelism) },
-    { key: "tests", value: Array(map(p.cases, |c: Case| case_json(r, c))) },
+    { key: "parallelism", value: parallelism_json(col.parallelism) },
+    { key: "tests", value: Array(map(p.cases, |c: Case| case_json(r, c, col))) },
   ])
 
 fn summary_json(c: Summary) -> Json =
@@ -1278,7 +1322,14 @@ fn extra_documents(r: Ran) -> List<Member> = {
 // Bumped whenever a field in the failure artifact changes meaning or leaves.
 fn artifact_schema() -> Int = 5
 
-fn document(flags: Flags, p: Program, r: Ran, warnings: List<Diag>, ok: Bool) -> Json =
+fn document(
+  flags: Flags,
+  p: Program,
+  r: Ran,
+  warnings: List<Diag>,
+  ok: Bool,
+  col: Colouring,
+) -> Json =
   object(
     appended(
       [
@@ -1310,9 +1361,9 @@ fn document(flags: Flags, p: Program, r: Ran, warnings: List<Diag>, ok: Bool) ->
         { key: "options", value: p.options },
         { key: "simulation", value: simulated_json(r.simulation) },
         { key: "backend", value: backend_json(r) },
-        { key: "selection", value: selection_json(p, r) },
+        { key: "selection", value: selection_json(p, r, col) },
         { key: "summary", value: summary_json(r.summary) },
-        { key: "results", value: Array(map(r.results, |o: Outcome| outcome_json(p, o))) },
+        { key: "results", value: Array(map(r.results, |o: Outcome| outcome_json(p, o, col))) },
         { key: "failures", value: Array(map(r.failures, |f: Fault| fault_json(p, f))) },
         // Not a warning: every later run believes an escaped entry.
         { key: "diagnostics", value: all_to_json(r.escapes, p.places) },
@@ -1335,8 +1386,8 @@ fn green_run(r: Ran) -> Bool =
 fn warned(s: Style, warnings: List<Diag>) -> List<String> =
   if len(warnings) == 0 { [] } else { appended([""], warning_lines(s, warnings)) }
 
-fn explained(s: Style, flags: Flags, p: Program, r: Ran) -> List<String> =
-  if !flags.explain { [] } else { explain_lines(s, p, r) }
+fn explained(s: Style, flags: Flags, p: Program, r: Ran, col: Colouring) -> List<String> =
+  if !flags.explain { [] } else { explain_lines(s, p, r, col) }
 
 fn listed(s: Style, p: Program, r: Ran) -> List<String> =
   if len(r.results) == 0 { [] } else { appended([""], result_lines(s, p, r)) }
@@ -1344,7 +1395,14 @@ fn listed(s: Style, p: Program, r: Ran) -> List<String> =
 fn nothing_lines(s: Style, flags: Flags, p: Program) -> List<String> =
   if p.total > 0 { [] } else { ["", ind() ++ dim(s, no_tests_note(flags, p))] }
 
-fn lines_of(s: Style, flags: Flags, p: Program, r: Ran, warnings: List<Diag>) -> List<String> =
+fn lines_of(
+  s: Style,
+  flags: Flags,
+  p: Program,
+  r: Ran,
+  warnings: List<Diag>,
+  col: Colouring,
+) -> List<String> =
   appended(
     appended(
       appended(
@@ -1353,7 +1411,7 @@ fn lines_of(s: Style, flags: Flags, p: Program, r: Ran, warnings: List<Diag>) ->
             appended(
               appended(
                 appended(
-                  appended(head_lines(s, flags, p, r), explained(s, flags, p, r)),
+                  appended(head_lines(s, flags, p, r, col), explained(s, flags, p, r, col)),
                   listed(s, p, r),
                 ),
                 ["", summary_line(s, r)],
@@ -1377,12 +1435,12 @@ fn collected(p: Program, r: Ran) -> List<Diag> =
     if len(filter(acc, |x: Diag| x.code == d.code && x.message == d.message)) > 0 { acc }
     else { push(acc, d) })
 
-fn answered(s: Style, flags: Flags, p: Program, r: Ran) -> Answer = {
+fn answered(s: Style, flags: Flags, p: Program, r: Ran, col: Colouring) -> Answer = {
   let warnings = collected(p, r);
   let ok = green_run(r);
   {
-    json: document(flags, p, r, warnings, ok),
-    lines: lines_of(s, flags, p, r, warnings),
+    json: document(flags, p, r, warnings, ok, col),
+    lines: lines_of(s, flags, p, r, warnings, col),
     errs: [],
     code: if ok { ok_code() } else { run_failed() },
   }
@@ -1410,14 +1468,23 @@ fn unbound(s: Style, refusal: Refusal) -> Answer = {
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {tester.configure[corpus], tester.loaded[corpus], tester.bound[corpus], tester.ran[corpus]} = {
+) -> Answer / {tester.configure[corpus], tester.loaded[corpus], tester.bound[corpus], tester.ran[corpus], tester.footprint[corpus]} = {
   let s: Style = style_of(flags);
   tester.configure[corpus](options);
   match tester.loaded[corpus]() {
     Err(refusal) -> refused(s, "test", refusal.diags, refusal.places),
     Ok(p) -> match tester.bound[corpus]() {
       Err(refusal) -> unbound(s, refusal),
-      Ok(_) -> answered(s, flags, p, tester.ran[corpus]()),
+      Ok(_) -> {
+        // Which tests may share a worker is the program's to say, from the atoms each row carries;
+        // only the rendering of a class is the printer's.
+        let classes = group_by_conflict(
+          map(filter(p.cases, |c: Case| runs(c.reason)), |c: Case|
+            { index: c.index, contends: c.contends }),
+        );
+        let colouring = coloured(p, fold(classes, [], with_footprint), classes);
+        answered(s, flags, p, tester.ran[corpus](), colouring)
+      },
     },
   }
 }
@@ -1441,17 +1508,6 @@ fn a_place() -> List<Place> =
 
 fn no_phases() -> Phases = { read_us: 0, front_us: 0, write_back_us: 0 }
 
-fn no_parallelism() -> Parallelism =
-  {
-    total: 0,
-    isolated: 0,
-    shared: 0,
-    region_contended: 0,
-    scheduled: 0,
-    groups: 0,
-    shared_groups: 0,
-  }
-
 fn a_hash() -> String = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 
 fn a_case(index: Int, name: String, reason: String) -> Case =
@@ -1469,8 +1525,14 @@ fn a_case(index: Int, name: String, reason: String) -> Case =
     seeded: false,
     reason: reason,
     owed: 1,
-    group: Some(0),
   }
+
+// The colouring a program's cases make: one class holding every case that runs, which is what the
+// fixtures below expect to read.
+fn a_colouring(p: Program) -> Colouring = {
+  let classes = [map(filter(p.cases, |c: Case| runs(c.reason)), |c: Case| c.index)];
+  coloured(p, map(classes, |class: List<Int>| { tests: class, footprint: "{}" }), classes)
+}
 
 fn a_program(cases: List<Case>) -> Program =
   {
@@ -1486,14 +1548,6 @@ fn a_program(cases: List<Case>) -> Program =
     selected: len(filter(cases, |c: Case| runs(c.reason))),
     cached: len(filter(cases, |c: Case| !runs(c.reason))),
     filtered_out: 0,
-    groups: [{ tests: map(cases, |c: Case| c.index), footprint: "{}" }],
-    parallelism: {
-      ..no_parallelism(),
-      total: len(cases),
-      isolated: len(cases),
-      scheduled: len(cases),
-      groups: 1,
-    },
     plan: { mode: "one", seeds: 1, budget: "64", steps: "1000" },
     warnings: [],
     options: Null,
@@ -1504,7 +1558,6 @@ fn an_outcome(index: Int, name: String, status: String) -> Outcome =
     index: index,
     name: name,
     hash: None,
-    group: 0,
     duration_us: 1500,
     status: status,
     diagnostic: None,
@@ -1582,6 +1635,7 @@ test "a green run is exit 0, and the head says what was selected of what" {
     from_argv("test", []),
     p,
     a_run([an_outcome(0, "one", "passed")], []),
+    a_colouring(p),
   );
   assert_eq(answer.code, 0);
   assert_eq(at(answer.lines, 0, ""), "   selected 1 of 2 (1 cached)");
@@ -1606,6 +1660,7 @@ test "a failure is exit 1 and the culprit is printed before the diff" {
     from_argv("test", []),
     p,
     a_run([an_outcome(0, "two is two", "failed")], [culprit]),
+    a_colouring(p),
   );
   assert_eq(answer.code, 1);
   assert(said(answer.lines, "   m.two is two"));
@@ -1632,7 +1687,7 @@ test "a test the clock stopped is abandoned rather than judged, and the run is n
     ..an_outcome(0, "slow", "abandoned"),
     diagnostic: Some(a_diag(b"E0504", b"the run was abandoned", [], [b"raise the clock"])),
   };
-  let answer = answered(plain(), from_argv("test", []), p, a_run([stopped], []));
+  let answer = answered(plain(), from_argv("test", []), p, a_run([stopped], []), a_colouring(p));
   assert_eq(answer.code, 1);
   assert(said(answer.lines, "   slow abandoned"));
   assert(said(answer.lines, "     the run was abandoned"));
@@ -1646,7 +1701,7 @@ test "an escaped cache entry fails the run even with every test green" {
     ..a_run([an_outcome(0, "one", "passed")], []),
     escapes: [a_diag(b"E0001", b"`m.one` can reach the host binding", [], [])],
   };
-  assert_eq(answered(plain(), from_argv("test", []), p, escaped).code, 1)
+  assert_eq(answered(plain(), from_argv("test", []), p, escaped, a_colouring(p)).code, 1)
 }
 
 test "a mutant no test kills fails the run and is named with what it changed" {
@@ -1663,7 +1718,7 @@ test "a mutant no test kills fails the run and is named with what it changed" {
       json: Null,
     }),
   };
-  let answer = answered(plain(), from_argv("test", []), p, mutated);
+  let answer = answered(plain(), from_argv("test", []), p, mutated, a_colouring(p));
   assert_eq(answer.code, 1);
   assert(said(answer.lines, "   mutants 2 killed, 1 survived, 0 skipped"));
   assert(said(answer.lines, "      m.total survives `+` -> `-` at "))
@@ -1709,13 +1764,14 @@ test "a reason is spaced in the line and joined in the document" {
 
 test "`--explain` says why each test ran, once per reason, and how the groups formed" {
   let p = a_program([a_case(0, "one", "new"), a_case(1, "two", "cached")]);
-  let lines = explain_lines(plain(), p, a_run([], []));
+  let lines = explain_lines(plain(), p, a_run([], []), a_colouring(p));
   assert(string_contains(at(lines, 1, ""), "run  abcdef012345 new "));
   assert(string_contains(at(lines, 1, ""), "isolation: region"));
   assert(string_contains(at(lines, 2, ""), "skip abcdef012345 cached "));
   assert(said(lines, "   why"));
   assert(said(lines, "   concurrency groups"));
-  assert(said(lines, "     group 0 · 2 tests · {}"));
+  // One class, holding the one test that runs: a cached test shares a worker with nobody.
+  assert(said(lines, "     group 0 · 1 test · {}"));
   assert(said(lines, "       one"))
 }
 
@@ -1727,6 +1783,7 @@ test "the document keys off `command` and `exit_code` and names the schema it pu
       from_argv("test", ["--json"]),
       p,
       a_run([an_outcome(0, "one", "passed")], []),
+      a_colouring(p),
     ).json,
   );
   assert(string_contains(text, "\"command\":\"test\""));
@@ -1761,14 +1818,20 @@ test "a program with no tests at all says so, and one narrowed to none says that
   let empty = { ..a_program([]), declared: 0 };
   assert(
     said(
-      answered(plain(), from_argv("test", []), empty, a_run([], [])).lines,
+      answered(plain(), from_argv("test", []), empty, a_run([], []), a_colouring(empty)).lines,
       "   no `test` items in this program",
     ),
   );
   let hidden = { ..a_program([]), declared: 3, filtered_out: 3 };
   assert(
     said(
-      answered(plain(), from_argv("test", ["--filter=none"]), hidden, a_run([], [])).lines,
+      answered(
+        plain(),
+        from_argv("test", ["--filter=none"]),
+        hidden,
+        a_run([], []),
+        a_colouring(hidden),
+      ).lines,
       "   no test key contains that substring; nothing was verified",
     ),
   )
