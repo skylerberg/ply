@@ -2,6 +2,11 @@
 
 use ply_launcher::Program;
 
+/// Counts what the entry allocates; nothing but the entry is counted, and only when `--count-allocs`
+/// asked for it.
+#[global_allocator]
+static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
+
 fn main() {
     let program = match ply_launcher::shipped::program() {
         Ok(bytes) => Program {
@@ -19,14 +24,22 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    // The launcher's own flag, taken out before the program parses the line.
+    let count = match ply_launcher::count::flag(&mut argv) {
+        Ok(count) => count,
+        Err(why) => {
+            eprintln!("ply: {why}");
+            std::process::exit(2);
+        }
+    };
     let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     // Every command family's ops are lent unconfigured; the program configures what it drives.
     let binds = ply_machine::artifact::Binds {
         lent: lent_all(),
         ..ply_machine::artifact::Binds::default()
     };
-    let code = match ply_launcher::run(&program, &root, argv, binds) {
+    let code = match ply_launcher::run(&program, &root, argv, binds, count) {
         Ok(code) => code,
         Err(diagnostic) => {
             eprint!(

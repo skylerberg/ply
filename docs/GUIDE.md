@@ -990,6 +990,7 @@ authority when this page and it disagree.
 | `map_merge<k, v>(a: Map<k, v>, b: Map<k, v>) -> Map<k, v>` | `b` wins |
 | `map_fold<k, v, c \| e>(m: Map<k, v>, init: c, f: (c, k, v) -> c / e) -> c / e` | key order |
 | `map_update<k, v \| e>(m: Map<k, v>, key: k, f: (v) -> v / e) -> Map<k, v> / e` | no-op if absent |
+| `observe<a>(v: a) -> a` | the identity, through a call the C tier cannot see into: a pure computation whose value is only observed still runs |
 
 ### 12.2 Strings and bytes
 
@@ -1023,7 +1024,6 @@ Strings are indexed by character, bytes by byte.
 | `bytes_split(b: Bytes, sep: Bytes) -> List<Bytes>` | |
 | `bytes_scan`, `bytes_scan_until` `(hay: Bytes, from: Int, class: Bytes, budget: Int) -> Int` | stop at the first byte not in / in `class`; `from + budget` if none |
 | `bytes_position<\| e>(b: Bytes, from: Int, f: (Int) -> Bool / e) -> Option<Int> / e` | |
-
 ### 12.3 Numbers
 
 | signature | notes |
@@ -1543,6 +1543,30 @@ test.
 A connection is `std.net`'s: `connect`, `send_all`, `drain`. Which statements to
 send, what a transaction is and when to retry are `std.db`'s.
 
+### 13.17 `std.certgen`
+
+```ply
+pub nondet effect certgen {
+  read issue() -> Issued
+}
+
+pub type Issued = {
+  certificate: String,
+  key: String,
+  der: Bytes,
+  fingerprint: String,
+}
+
+pub fn localhost() -> Issued / {certgen.issue}
+```
+
+A throwaway self-signed certificate for `localhost`, generated where the run
+is, so nothing checked in is either expired or shipping its private key.
+`--tls NAME=CERT,KEY` wants the two PEM strings as files, and `der` is what a
+client trusts exactly this one by. Each call makes a new key. It is bound under
+`ply run --host`, and a test handles it over `canned(certificate, key, der,
+fingerprint)`.
+
 ## 14. The host boundary
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
@@ -1659,8 +1683,12 @@ the machine is lent to the program as an effect: `ply run`, `ply test` and
 `ply cache` and `ply bootstrap` are answered what a run would bind, what the
 store holds and the bundle the emitter produced, and `ply replace` is lent the
 text it puts in a definition's place, from `--with FILE` or stdin. `ply std`
-needs no project: it reads the shipped modules off a second, read-only root. The
-first run after `ply` or the program itself changes compiles the program's unit,
+needs no project: it reads the shipped modules off a second, read-only root.
+`--count-allocs=PATH` is the launcher's own flag rather than the program's: it is
+taken out of the line before the program parses it, and the run writes what the
+entry allocated — every thread's allocations, in a window around the entry — as
+`allocations` and `bytes`.
+The first run after `ply` or the program itself changes compiles the program's unit,
 which needs the C toolchain `ply run` needs and takes a few seconds; every later
 run loads the compiled object and the front end it filed beside it. The ones
 that load a program run the whole front end every time: the front-end cache

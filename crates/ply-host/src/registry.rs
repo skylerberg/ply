@@ -2,7 +2,7 @@
 
 use crate::db::{self, Postgres};
 use crate::signal::{self, Accepting, Shutdown};
-use crate::{config, fs, process, sched, tcp, time, trace};
+use crate::{certgen, config, fs, process, sched, tcp, time, trace};
 use ply_eval::Value;
 use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownReport};
 use ply_span::{Diagnostic, Span, codes};
@@ -133,6 +133,7 @@ impl Host {
         // Registered whatever `--fs` said, so a run that bound no root gets `E0451`, not `E0424`.
         fs::register(&mut registry, Arc::clone(&self.fs));
         time::register(&mut registry, Arc::clone(&self.time));
+        certgen::register(&mut registry);
         signal::register(&mut registry, self.shutdown.as_ref());
         process::register(&mut registry, self.process.as_ref());
         registry
