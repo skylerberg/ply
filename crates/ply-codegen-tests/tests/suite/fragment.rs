@@ -594,8 +594,7 @@ fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
 #[test]
 fn the_compiled_set_is_closed_under_calls() {
     let (loaded, unit) = unit(ARITHMETIC);
-    let source = ply_codegen::Source::from_front(loaded.front, HashMap::new())
-        .with_texts(loaded.texts.clone());
+    let source = ply_codegen::Source::from_front(loaded.front).with_texts(loaded.texts.clone());
     let source: &'static ply_codegen::Source = Box::leak(Box::new(source));
     let (_, refusals) = ply_codegen::closure(source, unit.compiled()).expect("the set compiles");
     assert!(
@@ -607,7 +606,7 @@ fn the_compiled_set_is_closed_under_calls() {
 #[test]
 fn the_census_over_the_standard_library() {
     let (loaded, unit) = unit(ARITHMETIC);
-    let functions = ply_codegen::Source::from_front(loaded.front, HashMap::new())
+    let functions = ply_codegen::Source::from_front(loaded.front)
         .functions()
         .len();
     let mut by_construct: std::collections::BTreeMap<&str, usize> = Default::default();

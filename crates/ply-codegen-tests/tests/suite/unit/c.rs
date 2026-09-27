@@ -210,15 +210,16 @@ pub mod tests_support {
 
     /// Keyed on the text, not the name: two tests defining `m.f` would otherwise share an emit-cache entry.
     pub fn keyed(text: &str) -> Option<&'static Source> {
-        let front = front(text);
+        let mut front = front(text).clone();
         let stamp = blake3::hash(text.as_bytes()).to_hex();
-        let keys = Source::from_front(front, HashMap::new())
-            .functions()
-            .into_iter()
+        front.keys = front
+            .keys
+            .keys()
             .map(|n| (n.clone(), format!("h-{n}-{}", &stamp[..16])))
             .collect();
+        let front: &'static ply_ty::Front = Box::leak(Box::new(front));
         Some(Box::leak(Box::new(
-            Source::from_front(front, keys).with_texts(texts(text)),
+            Source::from_front(front).with_texts(texts(text)),
         )))
     }
 
@@ -226,7 +227,7 @@ pub mod tests_support {
         text: &str,
     ) -> Option<(&'static Source, Native, Vec<ply_codegen::c::Refused>)> {
         let source: &'static Source = Box::leak(Box::new(
-            Source::from_front(front(text), HashMap::new()).with_texts(texts(text)),
+            Source::from_front(front(text)).with_texts(texts(text)),
         ));
         let names = source.functions();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -776,19 +777,16 @@ fn nonce() -> u128 {
 fn keyed_by_hash(text: &str, suffix: &str) -> &'static ply_codegen::Source {
     let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
     let id = ply_span::SourceId(0);
-    let front =
+    let mut front =
         ply_codegen::c::producer::checked_front(&[("m".to_string(), owned.to_string())], &[id])
             .expect("checks");
+    for key in front.keys.values_mut() {
+        key.push_str(suffix);
+    }
     let front: &'static ply_ty::Front = Box::leak(Box::new(front));
-    let keys = ply_codegen::emit_keys(front)
-        .into_iter()
-        .map(|(name, key)| (name, format!("{key}{suffix}")))
-        .collect();
-    Box::leak(Box::new(
-        ply_codegen::Source::from_front(front, keys).with_texts(std::collections::HashMap::from([
-            ("m".to_string(), owned.to_string()),
-        ])),
-    ))
+    Box::leak(Box::new(ply_codegen::Source::from_front(front).with_texts(
+        std::collections::HashMap::from([("m".to_string(), owned.to_string())]),
+    )))
 }
 
 /// The unit over every root of `source`, body by body: `produce` never reads a whole unit back.
@@ -1454,9 +1452,8 @@ fn keyed_modules(modules: &[(&str, &str)]) -> &'static ply_codegen::Source {
         .collect();
     let front = ply_codegen::c::producer::checked_front(&owned, &ids).expect("checks");
     let front: &'static ply_ty::Front = Box::leak(Box::new(front));
-    let keys = ply_codegen::emit_keys(front);
     Box::leak(Box::new(
-        ply_codegen::Source::from_front(front, keys).with_texts(owned.into_iter().collect()),
+        ply_codegen::Source::from_front(front).with_texts(owned.into_iter().collect()),
     ))
 }
 

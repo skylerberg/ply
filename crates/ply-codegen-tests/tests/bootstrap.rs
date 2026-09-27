@@ -35,9 +35,7 @@ fn emitter_source() -> (&'static Source, String) {
     );
     let front: &'static ply_ty::Front = Box::leak(Box::new(front));
     let texts: HashMap<String, String> = answered.modules.into_iter().collect();
-    let source: &'static Source = Box::leak(Box::new(
-        Source::from_front(front, ply_codegen::emit_keys(front)).with_texts(texts),
-    ));
+    let source: &'static Source = Box::leak(Box::new(Source::from_front(front).with_texts(texts)));
     (source, identity)
 }
 
