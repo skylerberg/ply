@@ -35,12 +35,16 @@ use std::sync::{Arc, Mutex, mpsc};
 /// else: no other command runs a corpus.
 const EFFECT: &str = "tester";
 
-const OPERATIONS: [(&str, &str); 5] = [
+const OPERATIONS: [(&str, &str); 8] = [
     ("configure", "ply_machine::tester::configure"),
     ("loaded", "ply_machine::test::loaded"),
     ("bound", "ply_machine::test::bound"),
     ("ran", "ply_machine::test::ran"),
     ("stamped", "ply_machine::test::stamped"),
+    // What a selector computes a selection from, before anything runs.
+    ("keys", "ply_machine::tester::keys"),
+    ("hashed", "ply_machine::tester::hashed"),
+    ("searched", "ply_machine::tester::searched"),
 ];
 
 /// A compiled body honours its call bound on the native stack, where unoptimised frames run to
@@ -139,6 +143,9 @@ impl HostHandler for Site {
             "bound" => self.bound()?,
             "ran" => self.ran()?,
             "stamped" => self.stamped(),
+            "keys" => self.knowledge(Ask::Keys)?,
+            "hashed" => self.knowledge(Ask::Hashed)?,
+            "searched" => self.knowledge(Ask::Searched)?,
             other => return Err(unasked(other, span)),
         };
         Ok(HostAnswer::Value(value))
@@ -200,6 +207,26 @@ impl Site {
         )
     }
 
+    /// One part of what the loaded tree tells a selector: the keys its tests' results are filed
+    /// under, the definitions' hashes, or the search a seeded test is keyed on. Nothing is
+    /// selected here; the program computes the selection from these.
+    fn knowledge(&self, asked: Ask) -> Result<PlyValue, Diagnostic> {
+        let held = self.held();
+        let machine = held.as_ref().ok_or_else(|| unstarted(asked.name()))?;
+        machine.ask(match asked {
+            Ask::Keys => Go::Keys,
+            Ask::Hashed => Go::Hashed,
+            Ask::Searched => Go::Searched,
+        })?;
+        match machine.step()? {
+            Step::Knowledge {
+                asked: answered,
+                value,
+            } if answered == asked => Ok(knowledge_value(&value)),
+            _ => Err(out_of_step(asked.name())),
+        }
+    }
+
     /// The machine is left running: the next iteration is lent the front end this one built.
     fn ran(&self) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
@@ -237,12 +264,44 @@ enum Go {
     Load,
     Bind,
     Run,
+    Keys,
+    Hashed,
+    Searched,
 }
 
 enum Step {
     Loaded(Box<Result<Found, Refused>>),
     Bound(Box<Option<Refused>>),
     Ran(Box<Over>),
+    Knowledge {
+        asked: Ask,
+        value: Box<KnowledgeValue>,
+    },
+}
+
+/// Which part of what a selector reads to compute a selection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ask {
+    Keys,
+    Hashed,
+    Searched,
+}
+
+impl Ask {
+    fn name(self) -> &'static str {
+        match self {
+            Ask::Keys => "keys",
+            Ask::Hashed => "hashed",
+            Ask::Searched => "searched",
+        }
+    }
+}
+
+/// One read's answer, as plain data on its way to the caller.
+enum KnowledgeValue {
+    Keys(Vec<KeyRow>),
+    Hashed(Vec<HashedRow>),
+    Searched(SearchedRow),
 }
 
 /// The thread this process's machine lives on. The `ply` program performing these operations is
@@ -378,14 +437,194 @@ fn iterate(
     let _ = told.send(Step::Loaded(Box::new(Ok(found(
         args, &loaded, &hashes, &plan, warnings,
     )))));
-    let Ok(Go::Bind) = asked.recv() else {
+    // What a selector reads, before anything runs.
+    let knowledge = Knowledge::of(&loaded, &hashes, &cache.store, &search);
+    if !serve_reads(asked, told, &knowledge) {
         return;
-    };
+    }
     if bind(
-        args, cache, warm, &loaded, &hashes, plan, &search, told, asked,
+        args, cache, warm, &loaded, &hashes, plan, &search, told, asked, &knowledge,
     ) {
         // Only over a report that was written: an iteration that returned early leaves nothing held.
         warm.keep(loaded);
+    }
+}
+
+/// What a selector reads: computed once per iteration, before anything runs. Plain data, so it
+/// can cross from the machine's thread; the caller value-ifies it.
+struct Knowledge {
+    keys: Vec<KeyRow>,
+    hashed: Vec<HashedRow>,
+    searched: SearchedRow,
+}
+
+/// One test the loaded tree declares, and what the store has under the key its result is filed
+/// under.
+#[derive(Clone)]
+struct KeyRow {
+    index: usize,
+    /// The test's label, as a report prints it.
+    label: String,
+    /// The test's program-wide name: `<module>.<label>`.
+    name: String,
+    module: String,
+    /// The key the result is filed under; `None` when the front end produced no hash.
+    cache_key: Option<String>,
+    /// Whether the key is the search's, rather than the test's own hash.
+    seeded: bool,
+    /// `Some("passed")` or `Some("failed")` when the store holds a result under that key.
+    cached: Option<&'static str>,
+}
+
+/// One definition or test the loaded tree declares, and its hash.
+#[derive(Clone)]
+struct HashedRow {
+    name: String,
+    hash: String,
+    test: bool,
+}
+
+/// The search a seeded test's key is computed against.
+#[derive(Clone)]
+struct SearchedRow {
+    mode: String,
+    seeds: usize,
+    budget: String,
+    steps: String,
+}
+
+impl Knowledge {
+    fn of(
+        loaded: &Loaded,
+        hashes: &HashOutput,
+        store: &ply_store::Store,
+        search: &ply_eval::Plan,
+    ) -> Knowledge {
+        let keys = loaded
+            .check
+            .tests
+            .iter()
+            .enumerate()
+            .map(|(index, test)| {
+                // The same key the selection files a result under: the test's hash, or the
+                // search's key when the test is keyed on the plan.
+                let hash = hashes.tests.get(index).copied();
+                let seeded = ply_test::is_seeded(&test.footprint);
+                let key = hash.map(|h| ply_test::result_key(h, seeded, search));
+                KeyRow {
+                    index,
+                    label: test.name.as_str().to_string(),
+                    name: test.key.as_str().to_string(),
+                    module: test.module.as_str().to_string(),
+                    cache_key: key.map(|k| k.to_hex()),
+                    seeded,
+                    cached: key.and_then(|k| store.get(k)).map(|outcome| {
+                        if outcome.is_pass() {
+                            "passed"
+                        } else {
+                            "failed"
+                        }
+                    }),
+                }
+            })
+            .collect();
+        let mut hashed: Vec<HashedRow> = hashes
+            .defs
+            .iter()
+            .map(|(name, hash)| HashedRow {
+                name: name.as_str().to_string(),
+                hash: hash.to_hex(),
+                test: false,
+            })
+            .collect();
+        hashed.extend(
+            loaded
+                .check
+                .tests
+                .iter()
+                .enumerate()
+                .filter_map(|(index, test)| {
+                    hashes.tests.get(index).map(|hash| HashedRow {
+                        name: test.key.as_str().to_string(),
+                        hash: hash.to_hex(),
+                        test: true,
+                    })
+                }),
+        );
+        Knowledge {
+            keys,
+            hashed,
+            searched: SearchedRow {
+                mode: search.mode.as_str().to_string(),
+                seeds: search.roots.len(),
+                budget: search.budget.to_string(),
+                steps: search.steps.to_string(),
+            },
+        }
+    }
+}
+
+/// Serves reads until `Bind` arrives. `false` when the iteration is over instead.
+fn serve_reads(
+    asked: &mpsc::Receiver<Go>,
+    told: &mpsc::Sender<Step>,
+    knowledge: &Knowledge,
+) -> bool {
+    loop {
+        match asked.recv() {
+            Ok(Go::Bind) => return true,
+            Ok(Go::Keys) => {
+                let _ = told.send(Step::Knowledge {
+                    asked: Ask::Keys,
+                    value: Box::new(KnowledgeValue::Keys(knowledge.keys.clone())),
+                });
+            }
+            Ok(Go::Hashed) => {
+                let _ = told.send(Step::Knowledge {
+                    asked: Ask::Hashed,
+                    value: Box::new(KnowledgeValue::Hashed(knowledge.hashed.clone())),
+                });
+            }
+            Ok(Go::Searched) => {
+                let _ = told.send(Step::Knowledge {
+                    asked: Ask::Searched,
+                    value: Box::new(KnowledgeValue::Searched(knowledge.searched.clone())),
+                });
+            }
+            Ok(Go::Load) | Ok(Go::Run) | Err(_) => return false,
+        }
+    }
+}
+
+/// Serves reads until `Run` arrives. `false` when the iteration is over instead.
+fn serve_reads_until_run(
+    asked: &mpsc::Receiver<Go>,
+    told: &mpsc::Sender<Step>,
+    knowledge: &Knowledge,
+) -> bool {
+    loop {
+        match asked.recv() {
+            Ok(Go::Run) => return true,
+            Ok(Go::Keys) => {
+                let _ = told.send(Step::Knowledge {
+                    asked: Ask::Keys,
+                    value: Box::new(KnowledgeValue::Keys(knowledge.keys.clone())),
+                });
+            }
+            Ok(Go::Hashed) => {
+                let _ = told.send(Step::Knowledge {
+                    asked: Ask::Hashed,
+                    value: Box::new(KnowledgeValue::Hashed(knowledge.hashed.clone())),
+                });
+            }
+            Ok(Go::Searched) => {
+                let _ = told.send(Step::Knowledge {
+                    asked: Ask::Searched,
+                    value: Box::new(KnowledgeValue::Searched(knowledge.searched.clone())),
+                });
+            }
+            Ok(Go::Load) | Ok(Go::Bind) | Err(_) => return false,
+        }
     }
 }
 
@@ -401,6 +640,7 @@ fn bind(
     search: &ply_eval::Plan,
     told: &mpsc::Sender<Step>,
     asked: &mpsc::Receiver<Go>,
+    knowledge: &Knowledge,
 ) -> bool {
     let refuse = |diagnostics: Vec<Diagnostic>| {
         let _ = told.send(Step::Bound(Box::new(Some(Refused {
@@ -472,9 +712,10 @@ fn bind(
     };
     describe_schema(&mut hosts, &constant);
     let _ = told.send(Step::Bound(Box::new(None)));
-    let Ok(Go::Run) = asked.recv() else {
+    // A selector may still ask what the tree holds between the binding and the run.
+    if !serve_reads_until_run(asked, told, knowledge) {
         return false;
-    };
+    }
     let over = execute(
         args,
         cache,
@@ -1503,6 +1744,47 @@ fn found_value(found: Found) -> PlyValue {
         ("warnings", diags_value(&found.warnings)),
         ("options", json(&found.options)),
     ])
+}
+
+/// One read's answer, as the program reads it.
+fn knowledge_value(value: &KnowledgeValue) -> PlyValue {
+    match value {
+        KnowledgeValue::Keys(rows) => PlyValue::list(
+            rows.iter()
+                .map(|row| {
+                    record(vec![
+                        ("index", count(row.index)),
+                        ("label", PlyValue::str(&row.label)),
+                        ("name", PlyValue::str(&row.name)),
+                        ("module", PlyValue::str(&row.module)),
+                        (
+                            "cache_key",
+                            option(row.cache_key.as_deref().map(PlyValue::str)),
+                        ),
+                        ("seeded", PlyValue::Bool(row.seeded)),
+                        ("cached", option(row.cached.map(PlyValue::str))),
+                    ])
+                })
+                .collect(),
+        ),
+        KnowledgeValue::Hashed(rows) => PlyValue::list(
+            rows.iter()
+                .map(|row| {
+                    record(vec![
+                        ("name", PlyValue::str(&row.name)),
+                        ("hash", PlyValue::str(&row.hash)),
+                        ("test", PlyValue::Bool(row.test)),
+                    ])
+                })
+                .collect(),
+        ),
+        KnowledgeValue::Searched(row) => record(vec![
+            ("mode", PlyValue::str(&row.mode)),
+            ("seeds", count(row.seeds)),
+            ("budget", PlyValue::str(&row.budget)),
+            ("steps", PlyValue::str(&row.steps)),
+        ]),
+    }
 }
 
 fn search_value(search: &SearchView) -> PlyValue {
