@@ -1,0 +1,288 @@
+// `ply vendor` — copy this project's closure into `vendor/`, one directory per package, so a
+// checkout builds with no cache, no network and no git. What it writes is an *index*: one line per
+// package, the want it answers and the directory that answers it — exactly what the walk reads back.
+//
+// A vendored tree is the package as it was resolved: its `ply.pkg` and every file it ships, not
+// only the modules a program imports, and not the repository the fetch came from. So a build from
+// `vendor/` compiles the sources the fetch did, and the lockfile's digest still says they are the
+// ones that were pinned.
+
+import args (Flags, style_of)
+import builder (builder)
+import lock
+import paths (Resolved, here)
+import program (Program, load_program)
+import report (Answer, ind, ok_code, count_of, refused, reported)
+import sources (index_path, tree_of, under_abs)
+import style (Style, green)
+import compiler.front (Whole)
+import compiler.resolve (Diag, Pkg, diag1)
+import std.fs (fs, Dir, File)
+import std.json (Json, Array, Bool, Number, Str, object)
+import std.path (join, parent)
+
+// The root the command was pointed at, and the absolute spelling every fs operation here uses.
+fn root_of(flags: Flags) -> Resolved =
+  match list_at(flags.paths, 0) { Some(r) -> r, None -> here() }
+
+fn outside() -> Int = 4294967295
+
+fn trouble(path: String, why: String) -> Diag =
+  diag1(
+    b"E0502",
+    outside(),
+    { start: 0, end: 0 },
+    bytes_of_string(why),
+    bytes_of_string("`" ++ path ++ "` was not vendored"),
+    [
+      b"fix what it names and run `ply vendor` again: a copy is idempotent, and what was copied is still there",
+    ],
+  )
+
+// --- Copying a package -------------------------------------------------------
+
+// Every file under `dir`, as paths relative to it. A package is copied whole — its data files with
+// it, because this is someone else's tree rather than a walk of modules — except the repository's
+// own `.git`, which is what vendoring exists to stop needing.
+fn files_under(
+  dir: String,
+  rel: String,
+  depth: Int,
+) -> List<String> / {fs.kind[abs], fs.list_dir[abs]} =
+  if depth > 16 { [] } else {
+    let at = if rel == "" { dir } else { join(dir, rel) };
+    match fs.list_dir[abs](under_abs(at)) {
+      None -> [],
+      Some(names) ->
+        fold(names, [], |acc: List<String>, name: String| {
+          let child = if rel == "" { name } else { rel ++ "/" ++ name };
+          if name == ".git" { acc } else {
+            match fs.kind[abs](under_abs(join(dir, child))) {
+              File -> push(acc, child),
+              Dir -> appended(acc, files_under(dir, child, depth + 1)),
+              _ -> acc,
+            }
+          }
+        }),
+    }
+  }
+
+fn appended<a>(head: List<a>, tail: List<a>) -> List<a> =
+  fold(tail, head, |acc: List<a>, x: a| push(acc, x))
+
+// One package's tree, written under `vendor/<name>`.
+fn copy(
+  from: String,
+  to: String,
+) -> Result<Unit, String> / {fs.create_dir[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.write_file[abs]} =
+  if !fs.create_dir[abs](under_abs(to)) { Err("could not make `" ++ to ++ "`") }
+  else { copy_all(from, to, files_under(from, "", 0)) }
+
+fn copy_all(
+  from: String,
+  to: String,
+  files: List<String>,
+) -> Result<Unit, String> / {fs.create_dir[abs], fs.read_file[abs], fs.write_file[abs]} =
+  fold(files, Ok(()), |acc: Result<Unit, String>, rel: String|
+    match acc { Err(why) -> Err(why), Ok(_) -> copy_one(from, to, rel) })
+
+fn copy_one(
+  from: String,
+  to: String,
+  rel: String,
+) -> Result<Unit, String> / {fs.create_dir[abs], fs.read_file[abs], fs.write_file[abs]} =
+  match fs.read_file[abs](under_abs(join(from, rel))) {
+    None -> Err("could not read `" ++ join(from, rel) ++ "`"),
+    // A file's directory may be new and several levels deep: `create_dir` makes every missing one,
+    // and one that is already there is not an error.
+    Some(text) -> if !fs.create_dir[abs](under_abs(parent(join(to, rel)))) {
+      Err("could not make the directory of `" ++ join(to, rel) ++ "`")
+    } else if fs.write_file[abs](under_abs(join(to, rel)), text) { Ok(()) }
+    else { Err("could not write `" ++ join(to, rel) ++ "`") },
+  }
+
+// --- The index ----------------------------------------------------------------
+
+// `<want><TAB><dir>`, one line per package, sorted by the want: two runs over one closure write the
+// same file, and a diff is a change in the closure rather than in a walk order. The directory is
+// relative to the project, so a vendored tree survives the project being moved.
+pub fn index_text(rows: List<{ want: String, dir: String }>) -> String =
+  fold(sorted(rows), "", |acc: String, r: { want: String, dir: String }|
+    acc ++ r.want ++ "\t" ++ r.dir ++ "\n")
+
+fn sorted(rows: List<{ want: String, dir: String }>) -> List<{ want: String, dir: String }> =
+  fold(rows, [], |acc: List<{ want: String, dir: String }>, r: { want: String, dir: String }| {
+    let n = len(acc);
+    let at = fold(range(0, n), n, |i: Int, j: Int|
+      if i < n { i } else if want_lt(r.want, nth(acc, j).want) { j } else { i });
+    inserted(acc, at, r)
+  })
+
+fn inserted(
+  rows: List<{ want: String, dir: String }>,
+  at: Int,
+  r: { want: String, dir: String },
+) -> List<{ want: String, dir: String }> = {
+  let before = fold(range(0, at), [], |acc: List<{ want: String, dir: String }>, j: Int|
+    push(acc, nth(rows, j)));
+  let after = fold(range(at, len(rows)), [], |acc: List<{ want: String, dir: String }>, j: Int|
+    push(acc, nth(rows, j)));
+  fold(
+    after,
+    push(before, r),
+    |acc: List<{ want: String, dir: String }>, x: { want: String, dir: String }| push(acc, x),
+  )
+}
+
+// A want is a path or a git key; both are compared as bytes, which is their order.
+fn want_lt(a: String, b: String) -> Bool =
+  match compare(bytes_of_string(a), bytes_of_string(b)) { Less -> true, _ -> false }
+
+fn nth<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list does not hold") }
+
+// --- The command ----------------------------------------------------------------
+
+pub fn run(
+  flags: Flags,
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shelf], fs.read_file[shelf], fs.write_file[cwd], fs.write_file[abs]} = {
+  let s: Style = style_of(flags);
+  let r = root_of(flags);
+  let loaded: Program = load_program(flags.paths);
+  match loaded.whole {
+    None -> refused(s, "vendor", loaded.diags, loaded.places),
+    Some(w) -> match pinned(r, w) {
+      // A closure that is not what the lock pins is refused before anything is copied: vendoring it
+      // would write down sources nobody pinned. The same check `ply build` makes, so a vendored tree
+      // and an artifact are the same closure.
+      Some(d) -> reported(s, "vendor", [d], loaded.places),
+      None -> copied(s, flags, r, loaded, w),
+    },
+  }
+}
+
+fn pinned(r: Resolved, w: Whole) -> Option<Diag> =
+  match lock::read(r) {
+    Err(why) -> Some(lock::refused(r, why)),
+    Ok(None) -> None,
+    Ok(Some(existing)) -> match lock::verified(r, existing, lock::from_front(w.pins)) {
+      Ok(_) -> None,
+      Err(d) -> Some(d),
+    },
+  }
+
+fn copied(
+  s: Style,
+  flags: Flags,
+  r: Resolved,
+  loaded: Program,
+  w: Whole,
+) -> Answer / {builder.git[vcs], fs.create_dir[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.write_file[abs]} =
+  match place(r, layout(w, loaded)) {
+    Err(why) -> reported(s, "vendor", [trouble(r.display, why)], loaded.places),
+    Ok(rows) ->
+      {
+        json: json_of(rows, r.display, ok_code()),
+        lines: if flags.json { [] } else { vendored_lines(s, r, rows) },
+        errs: [],
+        code: ok_code(),
+      },
+  }
+
+// `<want>` to `vendor/<name>`, in package order: the name is the prefix the closure granted, which
+// is the package's own name unless a manifest aliases it — and `E0133` refuses an alias that is not.
+// The closure's table runs on into the toolchain's own packages, and vendoring those would copy the
+// compiler into every project: the dependencies are exactly the packages the walk supplied.
+fn layout(w: Whole, loaded: Program) -> List<{ want: String, dir: String }> =
+  fold(
+    range(1, len(loaded.pkgs.supplied) + 1),
+    [],
+    |acc: List<{ want: String, dir: String }>, i: Int| {
+      let want = match list_at(loaded.pkgs.supplied, i - 1) {
+        None -> "",
+        Some(s) -> string_of_bytes_lossy(s.root),
+      };
+      push(acc, { want: want, dir: join("vendor", prefix_of(nth(w.packages, i))) })
+    },
+  )
+
+fn prefix_of(p: Pkg) -> String = string_of_bytes_lossy(p.prefix)
+
+fn place(
+  r: Resolved,
+  rows: List<{ want: String, dir: String }>,
+) -> Result<List<{ want: String, dir: String }>, String> / {builder.git[vcs], fs.create_dir[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.write_file[abs]} =
+  match each(r, rows) {
+    Err(why) -> Err(why),
+    Ok(_) -> {
+      // The index lives in a directory the copy may have made and a project with no dependencies
+      // has not: `create_dir` makes the vendor directory itself, whatever is in it.
+      let path = index_path(r.absolute);
+      if !fs.create_dir[abs](under_abs(parent(path))) {
+        Err("could not make `" ++ parent(path) ++ "`")
+      } else if fs.write_file[abs](under_abs(path), bytes_of_string(index_text(rows))) { Ok(rows) }
+      else { Err("could not write `" ++ path ++ "`") }
+    },
+  }
+
+fn each(
+  r: Resolved,
+  rows: List<{ want: String, dir: String }>,
+) -> Result<Unit, String> / {builder.git[vcs], fs.create_dir[abs], fs.kind[abs], fs.list_dir[abs], fs.read_file[abs], fs.write_file[abs]} =
+  fold(rows, Ok(()), |acc: Result<Unit, String>, row: { want: String, dir: String }|
+    match acc {
+      Err(why) -> Err(why),
+      // The tree is what the walk reads *without* the index: a project that is already vendored must
+      // not copy its own vendor directory into itself, and re-vendoring must copy what the fetch has
+      // now rather than what the last vendor wrote.
+      Ok(_) -> copy(fresh(r, row.want), join(r.absolute, row.dir)),
+    })
+
+fn fresh(r: Resolved, want: String) -> String =
+  match tree_of(r.absolute, [], bytes_of_string(want)) {
+    Some(dir) -> dir,
+    // A want nothing can read is reported by the copy that follows: it fails on its first file.
+    None -> join(r.absolute, join("vendor", want)),
+  }
+
+fn vendored_lines(
+  s: Style,
+  r: Resolved,
+  rows: List<{ want: String, dir: String }>,
+) -> List<String> = {
+  let head = [
+    ind() ++ green(s, "vendored") ++ " " ++ count_of(len(rows), "package") ++ " · "
+      ++ join(r.display, "vendor"),
+  ];
+  fold(rows, head, |acc: List<String>, row: { want: String, dir: String }|
+    push(acc, ind() ++ "  " ++ row.dir))
+}
+
+fn json_of(rows: List<{ want: String, dir: String }>, root: String, code: Int) -> Json =
+  object([
+    { key: "command", value: Str("vendor") },
+    { key: "ok", value: Bool(code == ok_code()) },
+    { key: "exit_code", value: Number(decimal_of_int(code)) },
+    { key: "root", value: Str(root) },
+    { key: "packages", value: Number(decimal_of_int(len(rows))) },
+    {
+      key: "vendored",
+      value: Array(
+        map(rows, |row: { want: String, dir: String }|
+          object([{ key: "want", value: Str(row.want) }, { key: "dir", value: Str(row.dir) }])),
+      ),
+    },
+  ])
+
+// --- Tests ------------------------------------------------------------------
+
+test "an index is one line per package, sorted by the want it answers" {
+  let rows = [
+    { want: "/x/z", dir: "vendor/z" },
+    { want: "git+https://example.com/a@deadbeef", dir: "vendor/a" },
+  ];
+  // Bytes, so a path sorts before a git key (`/` is below `g`).
+  assert_eq(index_text(rows), "/x/z\tvendor/z\ngit+https://example.com/a@deadbeef\tvendor/a\n")
+}
+
+test "a project with no dependencies vendors nothing, and says so" { assert_eq(index_text([]), "") }
