@@ -15,12 +15,17 @@ fn the_cli_tree_is_a_package() {
     assert_eq!(
         loaded.front.packages,
         vec![
-            ("cli".to_string(), vec!["suite".to_string()]),
+            (
+                "cli".to_string(),
+                vec!["suite".to_string(), "proof".to_string()]
+            ),
             ("suite".to_string(), Vec::new()),
+            ("proof".to_string(), Vec::new()),
             ("std".to_string(), Vec::new()),
             ("compiler".to_string(), vec!["std".to_string()]),
         ],
-        "the CLI tree's ply.pkg names it the `cli` package, closed over the suite and the two built-ins"
+        "the CLI tree's ply.pkg names it the `cli` package, closed over the suite, the prove package \
+         and the two built-ins"
     );
 }
 
@@ -32,12 +37,17 @@ fn the_corpus_tree_is_a_package_over_the_cli() {
         loaded.front.packages,
         vec![
             ("corpus".to_string(), vec!["cli".to_string()]),
-            ("cli".to_string(), vec!["suite".to_string()]),
+            (
+                "cli".to_string(),
+                vec!["suite".to_string(), "proof".to_string()]
+            ),
             ("suite".to_string(), Vec::new()),
+            ("proof".to_string(), Vec::new()),
             ("std".to_string(), Vec::new()),
             ("compiler".to_string(), vec!["std".to_string()]),
         ],
-        "the corpus tree's ply.pkg names it the `corpus` package over the CLI's, which is over the suite"
+        "the corpus tree's ply.pkg names it the `corpus` package over the CLI's, which is over the \
+         suite and the prove package"
     );
 }
 
