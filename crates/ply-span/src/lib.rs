@@ -530,6 +530,7 @@ pub const MEANINGS: &[(&str, &str)] = &[
         "E0139",
         "a `ply.lock` that does not decode or is from another format",
     ),
+    ("E0140", "a git dependency that could not be fetched"),
     ("E0201", "type mismatch"),
     ("E0202", "arity mismatch"),
     ("E0203", "occurs check"),
