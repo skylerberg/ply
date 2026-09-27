@@ -6,7 +6,8 @@ import std.net (net, send_all)
 // perform can both say `db.query[items]`, and the plain import binds the module, so that a type
 // can say `db::Answer` and a call can say `db::transaction`.
 import std.db
-import std.db (db)
+import std.db (db, with_server)
+import std.random (entropy)
 import std.json
 import std.http
 import std.router
@@ -43,6 +44,21 @@ effect set Serving = {
   Desk,
   trace.enter[http], trace.exit[http], trace.event[http],
   config.secret[credentials], signal.stopping,
+}
+
+// What the *entry point* performs, which is `Serving` without the database: a run reads where to
+// reach its database and serves every `db` operation from there, so no row names `db` and a host
+// needs no database of its own.
+effect set Running = {
+  trace.enter[orders], trace.exit[orders], trace.event[orders], trace.count[orders],
+  trace.event[items],
+  trace.enter[http], trace.exit[http], trace.event[http],
+  config.get[server], config.secret[credentials], signal.stopping,
+  net.listen[listener], net.listen_tls[listener], net.accept[listener], net.close[listener],
+  net.recv[conn], net.send[conn], net.close[conn],
+  // The driver reaches its server over connections of its own, which is what `with_server` performs.
+  net.connect[link], net.send[link], net.recv[link], net.close[link],
+  entropy.next,
 }
 
 // --- What the desk sells --------------------------------------------------------
@@ -197,6 +213,10 @@ pub fn connections_key() -> String = "DESK_CONNECTIONS"
 
 pub fn api_key() -> String = "DESK_API_KEY"
 
+// Where the desk's database is. Optional because the twin (`run_memory`) has no database: the
+// postgres entry point refuses to start without it, which is what `configured_url` below is for.
+pub fn database_key() -> String = "DESK_DATABASE"
+
 pub fn config() -> config::ConfigSpec =
   config::spec([
     // A default, so a developer runs `ply run --host --config-schema desk.config` and gets a desk
@@ -206,6 +226,7 @@ pub fn config() -> config::ConfigSpec =
     // `SSecret` is the whole of §2's containment for a configured value, and it does two things at
     // once.
     config::required(api_key(), config::SSecret),
+    config::optional(database_key(), config::SText),
   ])
 
 // The port a run was told to listen on, or the refusal to start.
@@ -1226,20 +1247,39 @@ fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: In
   } }
   } }
 
-// The entry point, which is the postgres one.
-fn main() -> Int
-  / {Serving, config.get[server], net.listen[listener], net.accept[listener], net.close[listener],
-     net.recv[conn], net.send[conn], net.close[conn]} = {
+// The entry point, which is the postgres one. Where to reach the database is a setting, and every
+// `db` operation is answered from here rather than by a host.
+//
+// A harness that stands in for a deployment swaps two lines of this: the row, which says what the
+// run must provide, and the call, which says where the desk is served from (`--memory` calls the
+// twin instead, whose row is narrower because `run_memory` discharges `db` itself).
+fn main() -> Int / {Running} = {
   let key = config.secret[credentials](api_key());
   let port = configured(port_of(config.get[server](port_key())));
   let count = configured(connections_of(config.get[server](connections_key())));
+  postgres(config.get[server](database_key()), port, count, key)
+}
+
+fn postgres(url: Option<String>, port: Int, count: Int, key: Option<Secret<String>>) ->
+  Int / {Running} =
   handle {
-    run(port, count)
+    match with_server(configured_url(url), count, || run(port, count)) {
+      Ok(served) -> served,
+      Err(why) -> panic("the desk will not start: " ++ why),
+    }
   } with {
     // Answered from the value read above, once.
     config.secret[credentials](k) -> key,
   }
-}
+
+fn configured_url(resolved: Option<String>) -> String =
+  match resolved {
+    Some(url) -> url,
+    None -> panic(
+      "the desk will not start: " ++ database_key()
+        ++ " is unset; pass `--config-schema desk.config` so the run refuses at start-up, or `--set "
+        ++ database_key() ++ "=postgres://user@host/desk`"),
+  }
 
 fn configured(resolved: Result<Int, String>) -> Int =
   match resolved {
@@ -1866,12 +1906,16 @@ fn shown_field(f: Option<trace::Field>) -> String =
 
 // --- Tests: the configuration a run refuses to start without ---------------------------
 
-test "the schema declares the key the desk cannot start without, and defaults the rest" {
+test "the schema declares the keys the desk cannot start without, and defaults the rest" {
   let keys = config().keys;
-  assert_eq(len(keys), 3);
+  assert_eq(len(keys), 4);
   // The credential is `SSecret` and required.
   assert_eq(key_named(keys, api_key()),
     Some({name: "DESK_API_KEY", shape: config::SSecret, required: true, default: None}));
+  // Where to reach the database is optional in the schema and required by the postgres entry
+  // point: the twin has no database, so a run of it supplies no URL.
+  assert_eq(key_named(keys, database_key()),
+    Some({name: "DESK_DATABASE", shape: config::SText, required: false, default: None}));
   // The port has a default, so `ply run --host --config-schema desk.config` starts a desk with no
   // configuration written anywhere.
   assert_eq(key_named(keys, port_key()),

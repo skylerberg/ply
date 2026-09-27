@@ -306,6 +306,8 @@ fn the_hosts_digest_moves_with_the_sink_and_the_drain_and_not_with_a_value() {
             "desk.config",
             "--set",
             "DESK_API_KEY=fixture-not-a-credential",
+            "--set",
+            "DESK_DATABASE=postgres://fixture@localhost/desk",
             "--digest",
         ];
         args.extend_from_slice(extra);
@@ -337,6 +339,9 @@ fn the_hosts_digest_moves_with_the_sink_and_the_drain_and_not_with_a_value() {
         "desk.config",
         "--set",
         "DESK_API_KEY=fixture-not-a-credential",
+        // The desk serves `db` itself, so where to reach its database is a setting the run needs.
+        "--set",
+        "DESK_DATABASE=postgres://fixture@localhost/desk",
     ]);
     assert!(listing.ok, "{}", listing.all());
     listing.silent_about("fixture-not-a-credential");
