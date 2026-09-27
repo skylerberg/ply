@@ -15,7 +15,7 @@ import std.pg (connect, simple_query, extended_query, finish, default_client, An
 
 pub fn ask(host: String, port: Int) -> Result<String, String>
   / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
-  match connect[link](host, port, "ply", "ply", None, default_client()) {
+  match connect[link](host, port, "ply", "ply", None, "test-nonce", default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match simple_query[link](session, "select 1", default_client()) {
       Err(e) -> Err(client_error_text(e)),
@@ -28,7 +28,7 @@ pub fn ask(host: String, port: Int) -> Result<String, String>
 
 pub fn ask_with(host: String, port: Int, value: String) -> Result<String, String>
   / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
-  match connect[link](host, port, "ply", "ply", None, default_client()) {
+  match connect[link](host, port, "ply", "ply", None, "test-nonce", default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match extended_query[link](session, "select $1", [Some(value)], default_client()) {
       Err(e) -> Err(client_error_text(e)),
@@ -43,7 +43,7 @@ pub fn ask_with(host: String, port: Int, value: String) -> Result<String, String
 // one came back with.
 pub fn refuse_then_ask(host: String, port: Int) -> Result<String, String>
   / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
-  match connect[link](host, port, "ply", "ply", None, default_client()) {
+  match connect[link](host, port, "ply", "ply", None, "test-nonce", default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match simple_query[link](session, "select nope", default_client()) {
       Ok(_) -> Err("the server accepted what it should have refused"),
@@ -56,6 +56,20 @@ pub fn refuse_then_ask(host: String, port: Int) -> Result<String, String>
           },
         },
       Err(e) -> Err(client_error_text(e)),
+    },
+  }
+
+// SCRAM: the nonce is the one RFC 7677 works out, so the scripted server can be that example.
+pub fn ask_scram(host: String, port: Int, nonce: String) -> Result<String, String>
+  / {net.connect[link], net.send[link], net.recv[link], net.close[link]} =
+  match connect[link](host, port, "user", "ply", Some("pencil"), nonce, default_client()) {
+    Err(e) -> Err(client_error_text(e)),
+    Ok(session) -> match simple_query[link](session, "select 1", default_client()) {
+      Err(e) -> Err(client_error_text(e)),
+      Ok(reply) -> {
+        finish[link](reply.session, default_client());
+        Ok(first_text(reply.answer))
+      },
     },
   }
 
@@ -227,6 +241,31 @@ fn sent_text(sent: &[u8]) -> String {
     String::from_utf8_lossy(sent).to_string()
 }
 
+/// RFC 7677's exchange from the server's side: the mechanisms on offer, its first message, its
+/// final one, then the authentication that completes and the readiness that follows it.
+fn scram_greeting() -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut offered = 10i32.to_be_bytes().to_vec();
+    offered.extend(named("SCRAM-SHA-256"));
+    offered.push(0);
+    out.extend(message(b'R', &offered));
+
+    let mut first = 11i32.to_be_bytes().to_vec();
+    first.extend(
+        "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+            .as_bytes(),
+    );
+    out.extend(message(b'R', &first));
+
+    let mut last = 12i32.to_be_bytes().to_vec();
+    last.extend(b"v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
+    out.extend(message(b'R', &last));
+
+    out.extend(message(b'R', &0i32.to_be_bytes()));
+    out.extend(message(b'Z', b"I"));
+    out
+}
+
 #[test]
 fn the_client_shakes_hands_and_runs_a_query_over_a_scripted_server() {
     let outcome = run(
@@ -308,4 +347,27 @@ fn a_refusal_comes_back_with_its_sqlstate_and_leaves_the_connection_usable() {
     let text = sent_text(&outcome.sent);
     assert!(text.contains("select nope"), "{text}");
     assert!(text.contains("select 1"), "{text}");
+}
+
+#[test]
+fn the_client_answers_scram_and_checks_the_servers_proof() {
+    let outcome = run(
+        "m.ask_scram",
+        vec![
+            Value::str("127.0.0.1"),
+            Value::Int(5432),
+            Value::str("rOprNGfwEbeRWgbNEkqO"),
+        ],
+        vec![scram_greeting(), select_one()],
+    )
+    .expect("SCRAM completed and the server's proof verified");
+    assert_eq!(outcome.text, "1");
+
+    let text = sent_text(&outcome.sent);
+    assert!(text.contains("SCRAM-SHA-256"), "{text}");
+    assert!(text.contains("n=user,r=rOprNGfwEbeRWgbNEkqO"), "{text}");
+    assert!(
+        text.contains("p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="),
+        "the proof the client sent is not the one RFC 7677 works out: {text}"
+    );
 }
