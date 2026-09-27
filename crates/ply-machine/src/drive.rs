@@ -690,7 +690,25 @@ fn evaluate(
     }
     // Exploration is a test-time activity; a run takes the one interleaving its seed names.
     ply_test::sim::seed_run(&mut machine, &plan.seeds()[0], plan.steps);
-    machine.call(call.name, call.args, span)
+    machine
+        .call(call.name, call.args, span)
+        .map_err(|d| place_the_unplaced(d, call.name))
+}
+
+/// A raise with no place says what failed and not what was running, which is
+/// the most confusing shape a runtime error has — it cost a session thirty
+/// tool calls to trace one to a stale compiled stage. Name the entry point.
+fn place_the_unplaced(mut d: Diagnostic, entry: &str) -> Diagnostic {
+    let placed = d.labels.iter().any(|l| l.span != Span::DUMMY);
+    if !placed {
+        d = d.note(format!(
+            "this raise has no place in the source: it happened while `{entry}` was running, in \
+             code with no stored call site (a library definition rather than a body the program \
+             wrote, usually). If a `ply` source you just edited is not the source this run was \
+             compiled from, that is the first thing to check."
+        ));
+    }
+    d
 }
 
 // --- The values that cross --------------------------------------------------------
@@ -1241,4 +1259,32 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
         profile: str_at("profile")?,
         cache: bool_at("cache")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::place_the_unplaced;
+    use ply_span::{Diagnostic, Span, codes};
+
+    #[test]
+    fn a_raise_with_no_place_names_the_entry_point_it_came_from() {
+        let bare = Diagnostic::error(codes::RUNTIME_ERROR, "`len` expects a List or String");
+        let placed = place_the_unplaced(bare, "ply.main");
+        assert!(
+            placed
+                .notes
+                .iter()
+                .any(|n| n.contains("no place in the source") && n.contains("ply.main")),
+            "{:?}",
+            placed.notes
+        );
+    }
+
+    #[test]
+    fn a_raise_that_has_a_place_is_left_alone() {
+        let with_place = Diagnostic::error(codes::RUNTIME_ERROR, "boom")
+            .primary(Span::new(ply_span::SourceId(0), 1, 2), "here");
+        let same = place_the_unplaced(with_place, "ply.main");
+        assert!(same.notes.is_empty(), "{:?}", same.notes);
+    }
 }
