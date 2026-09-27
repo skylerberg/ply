@@ -2,7 +2,7 @@
 //! Every table here is read from a [`Front`].
 
 use ply_span::{SourceId, SourceMap, Span, Symbol};
-use ply_ty::{CheckOutput, Front, LawInfo, Ordinal, SpecKind, Type};
+use ply_ty::{CheckOutput, Front, LawInfo, Ordinal, SpecKind};
 use std::collections::{HashMap, HashSet};
 use std::sync::{PoisonError, RwLock};
 
@@ -65,96 +65,87 @@ struct Tables {
 
 impl Tables {
     fn of(front: &Front) -> Tables {
+        let mut t = Tables {
+            ctors: ctors_of(front),
+            roots: front
+                .emitter_roots
+                .iter()
+                .map(|r| r.root.to_string())
+                .collect(),
+            arities: front
+                .emitter_roots
+                .iter()
+                .map(|r| (r.root.to_string(), r.arity))
+                .collect(),
+            scalars: front
+                .emitter_roots
+                .iter()
+                .filter(|r| r.scalar)
+                .map(|r| r.root.to_string())
+                .collect(),
+            modules: Vec::new(),
+            spans: HashMap::new(),
+        };
+        t.spans_of(front);
+        t
+    }
+
+    /// Each root's definition span and each module's source, by walking the front end's ordinals.
+    fn spans_of(&mut self, front: &Front) {
         let laws: HashMap<&Symbol, &LawInfo> =
             front.check.laws.iter().map(|l| (&l.key, l)).collect();
         let tests_by_key: HashMap<&Symbol, Span> =
             front.check.tests.iter().map(|t| (&t.key, t.span)).collect();
-        let mut t = Tables {
-            ctors: ctors_of(front),
-            roots: Vec::new(),
-            arities: HashMap::new(),
-            scalars: HashSet::new(),
-            modules: Vec::new(),
-            spans: HashMap::new(),
-        };
-        let (mut tests, mut specs) = (Vec::new(), Vec::new());
         for (module, items) in &front.ordinals {
             if let Some(info) = front.check.modules.get(module) {
-                t.modules.push((module.clone(), info.source));
+                self.modules.push((module.clone(), info.source));
             }
             let (mut ordinal, mut law_ordinal) = (0, 0);
             for item in items {
                 match item {
                     Ordinal::Fn(name, kinds) => {
-                        let root = name.to_string();
-                        t.roots.push(root.clone());
                         let Some(def) = front.check.defs.get(name) else {
                             continue;
                         };
-                        t.spans.insert(root.clone(), def.span);
-                        let (params, ret) = signature(&def.scheme.ty);
-                        let scalar_params = params.iter().all(is_scalar);
-                        // A label parameter is a trailing `Word` of the emitted body, so the
-                        // prototype and the entry seam count it too.
-                        let arity = params.len() + def.scheme.label_vars.len();
-                        t.note(root.clone(), arity, scalar_params && is_scalar(ret));
+                        self.spans.insert(name.to_string(), def.span);
                         let (mut requires, mut ensures) = (0, 0);
                         for kind in kinds {
-                            // `ensures` also takes `result`.
-                            let (kind, k, arity, scalar) = match kind {
+                            let (kind, k) = match kind {
                                 SpecKind::Requires => {
                                     requires += 1;
-                                    ("requires", requires - 1, params.len(), scalar_params)
+                                    ("requires", requires - 1)
                                 }
                                 SpecKind::Ensures => {
                                     ensures += 1;
-                                    (
-                                        "ensures",
-                                        ensures - 1,
-                                        params.len() + 1,
-                                        scalar_params && is_scalar(ret),
-                                    )
+                                    ("ensures", ensures - 1)
                                 }
                             };
-                            let clause = clause_root(name, kind, k);
-                            t.note(clause.clone(), arity, scalar);
-                            t.spans.insert(clause.clone(), def.span);
-                            specs.push(clause);
+                            self.spans.insert(clause_root(name, kind, k), def.span);
                         }
                     }
                     Ordinal::Test(key) => {
-                        // A test is a nullary root, never scalar since it answers anything.
                         let root = qualified(module, &test_root_name(ordinal));
-                        t.note(root.clone(), 0, false);
                         if let Some(span) = tests_by_key.get(key) {
-                            t.spans.insert(root.clone(), *span);
+                            self.spans.insert(root, *span);
                         }
-                        tests.push(root);
                         ordinal += 1;
                     }
                     Ordinal::Law(key) => {
                         let law = laws.get(key);
-                        let binders = law.map(|l| l.binders.as_slice()).unwrap_or_default();
                         for part in ["guard", "body"] {
                             if part == "guard" && !law.is_some_and(|l| l.has_guard) {
                                 continue;
                             }
                             let root = qualified(module, &law_root_name(law_ordinal, part));
-                            let scalar = binders.iter().all(|b| is_scalar(&b.ty));
-                            t.note(root.clone(), binders.len(), scalar);
                             if let Some(l) = law {
-                                t.spans.insert(root.clone(), l.span);
+                                self.spans.insert(root, l.span);
                             }
-                            specs.push(root);
                         }
                         law_ordinal += 1;
                     }
                 }
             }
         }
-        t.roots.extend(tests);
-        t.roots.extend(specs);
-        t
     }
 
     /// The text of `root`'s definition in `texts`, which are by module name.
@@ -165,13 +156,6 @@ impl Tables {
             .iter()
             .find(|(_, source)| *source == span.source)?;
         texts.get(module.as_str())?.get(span.range())
-    }
-
-    fn note(&mut self, root: String, arity: usize, scalar: bool) {
-        if scalar {
-            self.scalars.insert(root.clone());
-        }
-        self.arities.insert(root, arity);
     }
 }
 
@@ -200,18 +184,6 @@ fn ctors_of(front: &Front) -> Vec<(Symbol, usize)> {
         );
     }
     out
-}
-
-/// A definition's parameters and its answer, as the checker published them.
-fn signature(ty: &Type) -> (&[Type], &Type) {
-    match ty {
-        Type::Fn { params, ret, .. } => (params, ret),
-        other => (&[], other),
-    }
-}
-
-fn is_scalar(ty: &Type) -> bool {
-    matches!(ty, Type::Con(name, args) if args.is_empty() && matches!(name.as_str(), "Int" | "Bool"))
 }
 
 impl Source {
